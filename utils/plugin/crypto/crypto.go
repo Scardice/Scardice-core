@@ -1,3 +1,4 @@
+//nolint:gosec // WebCrypto legacy compatibility intentionally includes MD5/SHA-1/DES/3DES.
 package sealcrypto
 
 import (
@@ -134,9 +135,7 @@ func ensureCryptoObject(rt *goja.Runtime) *goja.Object {
 	_ = cryptoObj.Set("getRandomValues", func(call goja.FunctionCall) goja.Value {
 		return getRandomValues(rt, call)
 	})
-	_ = cryptoObj.Set("randomUUID", func() string {
-		return randomUUID()
-	})
+	_ = cryptoObj.Set("randomUUID", randomUUID)
 
 	_ = rt.Set("crypto", cryptoObj)
 	return cryptoObj
@@ -523,10 +522,10 @@ func subtleImportKey(rt *goja.Runtime, call goja.FunctionCall) goja.Value {
 		if err != nil {
 			return rejectedPromise(rt, err)
 		}
-		if priv, err := x509.ParsePKCS1PrivateKey(raw); err == nil {
-			handle, err := privateKeyToHandle(rt, priv, algorithm, algObj, extractable, usages)
-			if err != nil {
-				return rejectedPromise(rt, err)
+		if priv, parseErr := x509.ParsePKCS1PrivateKey(raw); parseErr == nil {
+			handle, handleErr := privateKeyToHandle(rt, priv, algorithm, algObj, extractable, usages)
+			if handleErr != nil {
+				return rejectedPromise(rt, handleErr)
 			}
 			return resolvedPromise(rt, newCryptoKeyObject(rt, handle))
 		}
@@ -1221,8 +1220,8 @@ func encryptData(rt *goja.Runtime, algorithm string, algObj *goja.Object, key *c
 				tagLength = int(v.ToInteger())
 			}
 		}
-		if err := validateAESGCMTagLength(tagLength); err != nil {
-			return nil, err
+		if valErr := validateAESGCMTagLength(tagLength); valErr != nil {
+			return nil, valErr
 		}
 		block, err := aes.NewCipher(key.SecretKey)
 		if err != nil {
@@ -1394,8 +1393,8 @@ func decryptData(rt *goja.Runtime, algorithm string, algObj *goja.Object, key *c
 				tagLength = int(v.ToInteger())
 			}
 		}
-		if err := validateAESGCMTagLength(tagLength); err != nil {
-			return nil, err
+		if valErr := validateAESGCMTagLength(tagLength); valErr != nil {
+			return nil, valErr
 		}
 		block, err := aes.NewCipher(key.SecretKey)
 		if err != nil {
@@ -1571,7 +1570,7 @@ func deriveBitsECDH(rt *goja.Runtime, algObj *goja.Object, baseKey *cryptoKeyHan
 	if pub.Curve != priv.Curve {
 		return nil, errors.New("ECDH curve mismatch")
 	}
-	x, _ := pub.Curve.ScalarMult(pub.X, pub.Y, priv.D.Bytes())
+	x, _ := pub.ScalarMult(pub.X, pub.Y, priv.D.Bytes())
 	if x == nil {
 		return nil, errors.New("ECDH derive failed")
 	}
@@ -1762,11 +1761,15 @@ func importRawKey(rt *goja.Runtime, algorithm string, algObj *goja.Object, raw [
 		if len(cpy) != 1+2*size || cpy[0] != 0x04 {
 			return nil, errors.New("EC raw key must be an uncompressed point")
 		}
-		x := new(big.Int).SetBytes(cpy[1 : 1+size])
-		y := new(big.Int).SetBytes(cpy[1+size:])
-		if !curve.IsOnCurve(x, y) {
+		ecdhCurve, err := ecdhCurveByElliptic(curve)
+		if err != nil {
+			return nil, err
+		}
+		if _, err = ecdhCurve.NewPublicKey(cpy); err != nil {
 			return nil, errors.New("invalid EC raw public key")
 		}
+		x := new(big.Int).SetBytes(cpy[1 : 1+size])
+		y := new(big.Int).SetBytes(cpy[1+size:])
 		pub := &ecdsa.PublicKey{Curve: curve, X: x, Y: y}
 		handle := &cryptoKeyHandle{
 			Type:        "public",
@@ -1784,9 +1787,9 @@ func importRawKey(rt *goja.Runtime, algorithm string, algObj *goja.Object, raw [
 		}
 		return handle, nil
 	case "Ed25519":
-		keyType, err := rawKeyTypeHint(algObj)
-		if err != nil {
-			return nil, err
+		keyType, keyTypeErr := rawKeyTypeHint(algObj)
+		if keyTypeErr != nil {
+			return nil, keyTypeErr
 		}
 		isPrivate := keyType == "private"
 		if keyType == "" && len(cpy) == ed25519.PrivateKeySize {
@@ -1833,9 +1836,9 @@ func importRawKey(rt *goja.Runtime, algorithm string, algObj *goja.Object, raw [
 			Ed25519Public: ed25519.PublicKey(pub),
 		}, nil
 	case "X25519":
-		keyType, err := rawKeyTypeHint(algObj)
-		if err != nil {
-			return nil, err
+		keyType, keyTypeErr := rawKeyTypeHint(algObj)
+		if keyTypeErr != nil {
+			return nil, keyTypeErr
 		}
 		if len(cpy) != 32 {
 			if keyType == "private" {
@@ -1844,9 +1847,9 @@ func importRawKey(rt *goja.Runtime, algorithm string, algObj *goja.Object, raw [
 			return nil, errors.New("X25519 raw public key length must be 32 bytes")
 		}
 		if keyType == "private" {
-			priv, err := ecdh.X25519().NewPrivateKey(cpy)
-			if err != nil {
-				return nil, err
+			priv, privErr := ecdh.X25519().NewPrivateKey(cpy)
+			if privErr != nil {
+				return nil, privErr
 			}
 			return &cryptoKeyHandle{
 				Type:          "private",
@@ -1981,10 +1984,19 @@ func importJWK(rt *goja.Runtime, jwk map[string]interface{}, algorithm string, a
 		if err != nil {
 			return nil, err
 		}
-		pub := &ecdsa.PublicKey{Curve: curve, X: x, Y: y}
-		if !curve.IsOnCurve(pub.X, pub.Y) {
+		size := (curve.Params().BitSize + 7) / 8
+		rawPub := make([]byte, 1+2*size)
+		rawPub[0] = 0x04
+		copy(rawPub[1:1+size], leftPad(x.Bytes(), size))
+		copy(rawPub[1+size:], leftPad(y.Bytes(), size))
+		ecdhCurve, err := ecdhCurveByElliptic(curve)
+		if err != nil {
+			return nil, err
+		}
+		if _, err = ecdhCurve.NewPublicKey(rawPub); err != nil {
 			return nil, errors.New("invalid EC JWK point")
 		}
+		pub := &ecdsa.PublicKey{Curve: curve, X: x, Y: y}
 		if hasMapKey(jwk, "d") {
 			d, err := parseJWKBigInt(jwk, "d")
 			if err != nil {
@@ -2581,8 +2593,8 @@ func recoverRSAFactorsFromNED(n *big.Int, e int, d *big.Int) (*big.Int, *big.Int
 		t++
 	}
 
-	max := new(big.Int).Sub(n, two)
-	if max.Sign() <= 0 {
+	maxCandidate := new(big.Int).Sub(n, two)
+	if maxCandidate.Sign() <= 0 {
 		return nil, nil, errors.New("failed to recover RSA factors from n/e/d")
 	}
 
@@ -2602,7 +2614,7 @@ func recoverRSAFactorsFromNED(n *big.Int, e int, d *big.Int) (*big.Int, *big.Int
 			return nil, nil, false
 		}
 
-		for j := 0; j < t; j++ {
+		for range t {
 			x := new(big.Int).Mul(y, y)
 			x.Mod(x, n)
 
@@ -2641,8 +2653,8 @@ func recoverRSAFactorsFromNED(n *big.Int, e int, d *big.Int) (*big.Int, *big.Int
 	}
 
 	// 随机兜底，理论上不应该走到这里
-	for attempt := 0; attempt < 8192; attempt++ {
-		g, err := rand.Int(rand.Reader, max)
+	for range 8192 {
+		g, err := rand.Int(rand.Reader, maxCandidate)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2671,7 +2683,9 @@ func stringFromMap(m map[string]interface{}, k string) string {
 	return s
 }
 
-func splitRSAUsages(algorithm string, usages []string) (pubUsages []string, priUsages []string) {
+func splitRSAUsages(algorithm string, usages []string) ([]string, []string) {
+	var pubUsages []string
+	var priUsages []string
 	pubAllowed := map[string]struct{}{}
 	priAllowed := map[string]struct{}{}
 	switch algorithm {
@@ -2706,10 +2720,12 @@ func splitRSAUsages(algorithm string, usages []string) (pubUsages []string, priU
 			priUsages = append(priUsages, u)
 		}
 	}
-	return
+	return pubUsages, priUsages
 }
 
-func splitECUsages(algorithm string, usages []string) (pubUsages []string, priUsages []string) {
+func splitECUsages(algorithm string, usages []string) ([]string, []string) {
+	var pubUsages []string
+	var priUsages []string
 	pubAllowed := map[string]struct{}{}
 	priAllowed := map[string]struct{}{}
 	switch algorithm {
@@ -2743,10 +2759,12 @@ func splitECUsages(algorithm string, usages []string) (pubUsages []string, priUs
 			priUsages = append(priUsages, u)
 		}
 	}
-	return
+	return pubUsages, priUsages
 }
 
-func splitOKPUsages(algorithm string, usages []string) (pubUsages []string, priUsages []string) {
+func splitOKPUsages(algorithm string, usages []string) ([]string, []string) {
+	var pubUsages []string
+	var priUsages []string
 	pubAllowed := map[string]struct{}{}
 	priAllowed := map[string]struct{}{}
 	switch algorithm {
@@ -2779,7 +2797,7 @@ func splitOKPUsages(algorithm string, usages []string) (pubUsages []string, priU
 			priUsages = append(priUsages, u)
 		}
 	}
-	return
+	return pubUsages, priUsages
 }
 
 func namedCurveByName(name string) (elliptic.Curve, string, error) {
@@ -2793,6 +2811,19 @@ func namedCurveByName(name string) (elliptic.Curve, string, error) {
 		return elliptic.P521(), "P-521", nil
 	default:
 		return nil, "", fmt.Errorf("unsupported namedCurve: %s", name)
+	}
+}
+
+func ecdhCurveByElliptic(curve elliptic.Curve) (ecdh.Curve, error) {
+	switch curve {
+	case elliptic.P256():
+		return ecdh.P256(), nil
+	case elliptic.P384():
+		return ecdh.P384(), nil
+	case elliptic.P521():
+		return ecdh.P521(), nil
+	default:
+		return nil, errors.New("unsupported ECDH curve")
 	}
 }
 
@@ -3178,7 +3209,7 @@ func generateRSAKeyCustomExponent(modulusLength int, exp int) (*rsa.PrivateKey, 
 	bitsP := modulusLength / 2
 	bitsQ := modulusLength - bitsP
 
-	for attempt := 0; attempt < 256; attempt++ {
+	for range 256 {
 		p, err := rand.Prime(rand.Reader, bitsP)
 		if err != nil {
 			return nil, err
@@ -3593,14 +3624,14 @@ func aesKeyWrap(kek []byte, plaintext []byte) ([]byte, error) {
 	n := len(plaintext) / 8
 	a := []byte{0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6}
 	r := make([][]byte, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		r[i] = make([]byte, 8)
 		copy(r[i], plaintext[i*8:(i+1)*8])
 	}
 
 	buf := make([]byte, 16)
-	for j := 0; j < 6; j++ {
-		for i := 0; i < n; i++ {
+	for j := range 6 {
+		for i := range n {
 			copy(buf[:8], a)
 			copy(buf[8:], r[i])
 			block.Encrypt(buf, buf)
@@ -3613,7 +3644,7 @@ func aesKeyWrap(kek []byte, plaintext []byte) ([]byte, error) {
 
 	out := make([]byte, 8+8*n)
 	copy(out[:8], a)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		copy(out[8+i*8:8+(i+1)*8], r[i])
 	}
 	return out, nil
@@ -3631,7 +3662,7 @@ func aesKeyUnwrap(kek []byte, ciphertext []byte) ([]byte, error) {
 	a := make([]byte, 8)
 	copy(a, ciphertext[:8])
 	r := make([][]byte, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		r[i] = make([]byte, 8)
 		copy(r[i], ciphertext[8+i*8:8+(i+1)*8])
 	}
@@ -3654,7 +3685,7 @@ func aesKeyUnwrap(kek []byte, ciphertext []byte) ([]byte, error) {
 	}
 
 	out := make([]byte, 8*n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		copy(out[i*8:(i+1)*8], r[i])
 	}
 	return out, nil

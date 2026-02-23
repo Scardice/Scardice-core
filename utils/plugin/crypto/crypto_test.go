@@ -1,3 +1,4 @@
+//nolint:testpackage // Tests intentionally validate unexported runtime helpers in the same package.
 package sealcrypto
 
 import (
