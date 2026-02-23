@@ -556,6 +556,110 @@ func TestWrapUnwrapKey(t *testing.T) {
 	}
 }
 
+func TestWrapUnwrapKeyJWKRSA(t *testing.T) {
+	vm := goja.New()
+	Enable(vm)
+
+	pair := mustPromiseFulfilled(t, mustRun(t, vm, `
+		crypto.subtle.generateKey(
+			{name:"RSASSA-PKCS1-v1_5", modulusLength:1024, publicExponent:new Uint8Array([1,0,1]), hash:"SHA-256"},
+			true,
+			["sign","verify"]
+		)
+	`))
+	pairObj := pair.ToObject(vm)
+	_ = vm.Set("pub", pairObj.Get("publicKey"))
+	_ = vm.Set("pri", pairObj.Get("privateKey"))
+
+	wrapKey := mustPromiseFulfilled(t, mustRun(t, vm, `
+		crypto.subtle.generateKey({name:"AES-GCM", length:128}, true, ["encrypt","decrypt","wrapKey","unwrapKey"])
+	`))
+	_ = vm.Set("wrapKey", wrapKey)
+	mustRun(t, vm, `globalThis.ivWrapJWK = new Uint8Array(12); crypto.getRandomValues(globalThis.ivWrapJWK);`)
+
+	wrapped := mustPromiseFulfilled(t, mustRun(t, vm, `
+		crypto.subtle.wrapKey("jwk", pri, wrapKey, {name:"AES-GCM", iv: globalThis.ivWrapJWK})
+	`))
+	_ = vm.Set("wrappedJWK", wrapped)
+
+	unwrapped := mustPromiseFulfilled(t, mustRun(t, vm, `
+		crypto.subtle.unwrapKey(
+			"jwk",
+			wrappedJWK,
+			wrapKey,
+			{name:"AES-GCM", iv: globalThis.ivWrapJWK},
+			{name:"RSASSA-PKCS1-v1_5", hash:"SHA-256"},
+			true,
+			["sign"]
+		)
+	`))
+	_ = vm.Set("unwrappedJWK", unwrapped)
+
+	sig := mustPromiseFulfilled(t, mustRun(t, vm, `
+		crypto.subtle.sign("RSASSA-PKCS1-v1_5", unwrappedJWK, new Uint8Array([11,22,33,44]))
+	`))
+	_ = vm.Set("sigJWKWrapped", sig)
+
+	okVal := mustPromiseFulfilled(t, mustRun(t, vm, `
+		crypto.subtle.verify("RSASSA-PKCS1-v1_5", pub, sigJWKWrapped, new Uint8Array([11,22,33,44]))
+	`))
+	if !okVal.ToBoolean() {
+		t.Fatal("jwk wrapped/unwrapped rsa private key verify failed")
+	}
+}
+
+func TestWrapUnwrapKeyPKCS8RSA(t *testing.T) {
+	vm := goja.New()
+	Enable(vm)
+
+	pair := mustPromiseFulfilled(t, mustRun(t, vm, `
+		crypto.subtle.generateKey(
+			{name:"RSASSA-PKCS1-v1_5", modulusLength:1024, publicExponent:new Uint8Array([1,0,1]), hash:"SHA-256"},
+			true,
+			["sign","verify"]
+		)
+	`))
+	pairObj := pair.ToObject(vm)
+	_ = vm.Set("pub", pairObj.Get("publicKey"))
+	_ = vm.Set("pri", pairObj.Get("privateKey"))
+
+	wrapKey := mustPromiseFulfilled(t, mustRun(t, vm, `
+		crypto.subtle.generateKey({name:"AES-GCM", length:128}, true, ["encrypt","decrypt","wrapKey","unwrapKey"])
+	`))
+	_ = vm.Set("wrapKey", wrapKey)
+	mustRun(t, vm, `globalThis.ivWrapPKCS8 = new Uint8Array(12); crypto.getRandomValues(globalThis.ivWrapPKCS8);`)
+
+	wrapped := mustPromiseFulfilled(t, mustRun(t, vm, `
+		crypto.subtle.wrapKey("pkcs8", pri, wrapKey, {name:"AES-GCM", iv: globalThis.ivWrapPKCS8})
+	`))
+	_ = vm.Set("wrappedPKCS8", wrapped)
+
+	unwrapped := mustPromiseFulfilled(t, mustRun(t, vm, `
+		crypto.subtle.unwrapKey(
+			"pkcs8",
+			wrappedPKCS8,
+			wrapKey,
+			{name:"AES-GCM", iv: globalThis.ivWrapPKCS8},
+			{name:"RSASSA-PKCS1-v1_5", hash:"SHA-256"},
+			true,
+			["sign"]
+		)
+	`))
+	_ = vm.Set("unwrappedPKCS8", unwrapped)
+
+	sig := mustPromiseFulfilled(t, mustRun(t, vm, `
+		crypto.subtle.sign("RSASSA-PKCS1-v1_5", unwrappedPKCS8, new Uint8Array([9,8,7,6]))
+	`))
+	_ = vm.Set("sigPKCS8Wrapped", sig)
+
+	okVal := mustPromiseFulfilled(t, mustRun(t, vm, `
+		crypto.subtle.verify("RSASSA-PKCS1-v1_5", pub, sigPKCS8Wrapped, new Uint8Array([9,8,7,6]))
+	`))
+	if !okVal.ToBoolean() {
+		t.Fatal("pkcs8 wrapped/unwrapped rsa private key verify failed")
+	}
+}
+
 func TestECDHDeriveBits(t *testing.T) {
 	vm := goja.New()
 	Enable(vm)
