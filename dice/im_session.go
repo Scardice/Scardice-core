@@ -1833,6 +1833,83 @@ type commandSolveResult struct {
 	DisabledSources  []string
 }
 
+func collectRuleExtNameSetBySystem(ctx *MsgContext) (map[string]struct{}, map[string]struct{}) {
+	ruleExtNames := make(map[string]struct{})
+	preferredRuleExtNames := make(map[string]struct{})
+	if ctx == nil || ctx.Dice == nil || ctx.Dice.GameSystemMap == nil {
+		return ruleExtNames, preferredRuleExtNames
+	}
+
+	currentSystem := ""
+	if ctx.Group != nil {
+		currentSystem = strings.TrimSpace(ctx.Group.System)
+	}
+
+	addRelatedExt := func(system string, relatedExt []string) {
+		isCurrentSystem := currentSystem != "" && strings.EqualFold(currentSystem, system)
+		for _, extName := range relatedExt {
+			name := strings.ToLower(strings.TrimSpace(extName))
+			if name == "" {
+				continue
+			}
+			ruleExtNames[name] = struct{}{}
+			if isCurrentSystem {
+				preferredRuleExtNames[name] = struct{}{}
+			}
+		}
+	}
+
+	ctx.Dice.GameSystemMap.Range(func(system string, tmpl *GameSystemTemplate) bool {
+		if tmpl == nil {
+			return true
+		}
+
+		relatedExt := tmpl.Commands.Set.RelatedExt
+		if len(relatedExt) == 0 {
+			relatedExt = tmpl.SetConfig.RelatedExt
+		}
+		addRelatedExt(system, relatedExt)
+		return true
+	})
+
+	return ruleExtNames, preferredRuleExtNames
+}
+
+func selectRulePluginCandidateByGroupSystem(ctx *MsgContext, candidates []commandSolveCandidate) (commandSolveCandidate, bool) {
+	var empty commandSolveCandidate
+	if len(candidates) < 2 {
+		return empty, false
+	}
+
+	ruleExtNames, preferredRuleExtNames := collectRuleExtNameSetBySystem(ctx)
+	if len(ruleExtNames) == 0 || len(preferredRuleExtNames) == 0 {
+		return empty, false
+	}
+
+	matchedCount := 0
+	selected := empty
+	for _, candidate := range candidates {
+		if candidate.Ext == nil {
+			return empty, false
+		}
+
+		extName := strings.ToLower(candidate.Ext.Name)
+		if _, ok := ruleExtNames[extName]; !ok {
+			return empty, false
+		}
+
+		if _, ok := preferredRuleExtNames[extName]; ok {
+			selected = candidate
+			matchedCount++
+		}
+	}
+
+	if matchedCount != 1 {
+		return empty, false
+	}
+	return selected, true
+}
+
 func commandCandidateSourceName(candidate commandSolveCandidate) string {
 	if candidate.Ext == nil {
 		return "core"
@@ -1878,6 +1955,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 
 		if !item.Raw {
 			if item.DisabledInPrivate && ctx.IsPrivate {
+				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:提示_私聊不可用"))
 				return false, false
 			}
 
@@ -2028,13 +2106,17 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 	}
 
 	if len(available) > 1 {
-		names := make([]string, 0, len(available))
-		for _, candidate := range available {
-			names = append(names, fmt.Sprintf("%s:%s", commandCandidateSourceName(candidate), candidate.Item.Name))
-		}
-		return commandSolveResult{
-			Status:           commandSolveConflict,
-			AvailableSources: names,
+		if selected, ok := selectRulePluginCandidateByGroupSystem(ctx, available); ok {
+			available = []commandSolveCandidate{selected}
+		} else {
+			names := make([]string, 0, len(available))
+			for _, candidate := range available {
+				names = append(names, fmt.Sprintf("%s:%s", commandCandidateSourceName(candidate), candidate.Item.Name))
+			}
+			return commandSolveResult{
+				Status:           commandSolveConflict,
+				AvailableSources: names,
+			}
 		}
 	}
 
