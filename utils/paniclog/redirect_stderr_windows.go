@@ -13,7 +13,7 @@ import (
 	"os"
 	"syscall"
 
-	"sealdice-core/logger"
+	"Scardice-core/logger"
 )
 
 var (

@@ -6,7 +6,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 
-	"sealdice-core/dice"
+	"Scardice-core/dice"
 )
 
 func helpDocStatus(c echo.Context) error {

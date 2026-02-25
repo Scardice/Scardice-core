@@ -16,9 +16,9 @@ import (
 	"github.com/gen2brain/beeep"
 	"github.com/labstack/echo/v4"
 
-	"sealdice-core/dice"
-	"sealdice-core/icon"
-	"sealdice-core/logger"
+	"Scardice-core/dice"
+	"Scardice-core/icon"
+	"Scardice-core/logger"
 )
 
 var theDm *dice.DiceManager
@@ -65,16 +65,16 @@ var systrayQuited bool = false
 
 func onReady() {
 	systray.SetIcon(icon.Data)
-	systray.SetTitle("海豹核心")
-	systray.SetTooltip("海豹TRPG骰点核心")
+	systray.SetTitle("余烬核心")
+	systray.SetTooltip("余烬TRPG骰点核心")
 
 	mOpen := systray.AddMenuItem("打开界面", "开启WebUI")
 	mOpen.SetIcon(icon.Data)
-	mOpenExeDir := systray.AddMenuItem("打开海豹目录", "访达访问程序所在目录")
+	mOpenExeDir := systray.AddMenuItem("打开余烬目录", "访达访问程序所在目录")
 	mQuit := systray.AddMenuItem("退出", "退出程序")
 
 	go func() {
-		_ = beeep.Notify("SealDice", "我藏在托盘区域了，点我的小图标可以快速打开UI", "icon/icon.ico")
+		_ = beeep.Notify("Scardice", "我藏在托盘区域了，点我的小图标可以快速打开UI", "icon/icon.ico")
 	}()
 
 	for {
@@ -108,7 +108,7 @@ func httpServe(e *echo.Echo, dm *dice.DiceManager, hideUI bool) {
 				break
 			}
 			runtime.LockOSThread()
-			systray.SetTooltip("海豹TRPG骰点核心 #" + portStr)
+			systray.SetTooltip("余烬TRPG骰点核心 #" + portStr)
 			runtime.UnlockOSThread()
 		}
 	}()

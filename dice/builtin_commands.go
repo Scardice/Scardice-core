@@ -18,7 +18,7 @@ import (
 	"github.com/samber/lo"
 	ds "github.com/sealdice/dicescript"
 
-	"sealdice-core/dice/docengine"
+	"Scardice-core/dice/docengine"
 )
 
 /** 这几条指令不能移除 */
@@ -429,9 +429,9 @@ func (d *Dice) registerCoreCommands() {
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			arg := cmdArgs.GetArgN(1)
 			if arg == "" {
-				text := "海豹核心 " + VERSION.String() + "\n"
+				text := "余烬核心 " + VERSION.String() + "\n"
 				text += "官网: sealdice.com" + "\n"
-				text += "海豹群: 524364253" + "\n"
+				text += "余烬群: 524364253" + "\n"
 				text += DiceFormatTmpl(ctx, "核心:骰子帮助文本_附加说明")
 				ReplyToSender(ctx, msg, text)
 				return CmdExecuteResult{Matched: true, Solved: true}
@@ -686,7 +686,7 @@ func (d *Dice) registerCoreCommands() {
 			if arch != "386" && arch != "amd64" {
 				ver = fmt.Sprintf("%s %s", ver, arch)
 			}
-			baseText := fmt.Sprintf("SealDice %s%s", ver, onlineVer)
+			baseText := fmt.Sprintf("Scardice %s%s", ver, onlineVer)
 			extText := DiceFormatTmpl(ctx, "核心:骰子状态附加文本")
 			if extText != "" {
 				extText = "\n" + extText
@@ -801,7 +801,7 @@ func (d *Dice) registerCoreCommands() {
 				}
 
 				reply = fmt.Sprintf(
-					"新增标记了%d/%d个帐号，这些账号将被视为机器人。\n因此他们被人@，或主动发出指令时，海豹将不会回复。\n另外对于botlist add/rm，如果群里有多个海豹，只有第一个被@的会回复，其余的执行指令但不回应",
+					"新增标记了%d/%d个帐号，这些账号将被视为机器人。\n因此他们被人@，或主动发出指令时，余烬将不会回复。\n另外对于botlist add/rm，如果群里有多个余烬，只有第一个被@的会回复，其余的执行指令但不回应",
 					newCount, allCount,
 				)
 			case "del", "rm":
@@ -816,7 +816,7 @@ func (d *Dice) registerCoreCommands() {
 				}
 
 				reply = fmt.Sprintf(
-					"删除标记了%d/%d个帐号，这些账号将不再被视为机器人。\n海豹将继续回应他们的命令",
+					"删除标记了%d/%d个帐号，这些账号将不再被视为机器人。\n余烬将继续回应他们的命令",
 					existsCount, allCount,
 				)
 			case "list", "show":
@@ -943,7 +943,7 @@ func (d *Dice) registerCoreCommands() {
 					}
 				}
 				ctx.Dice.Save(false)
-				ReplyToSender(ctx, msg, fmt.Sprintf("海豹将新增%d位master", count))
+				ReplyToSender(ctx, msg, fmt.Sprintf("余烬将新增%d位master", count))
 			case "del", "rm":
 				var count int
 				for _, uid := range readIDList(ctx, msg, cmdArgs) {
@@ -952,7 +952,7 @@ func (d *Dice) registerCoreCommands() {
 					}
 				}
 				ctx.Dice.Save(false)
-				ReplyToSender(ctx, msg, fmt.Sprintf("海豹移除了%d名master", count))
+				ReplyToSender(ctx, msg, fmt.Sprintf("余烬移除了%d名master", count))
 			case "relogin":
 				var kw *Kwarg
 
@@ -1018,7 +1018,7 @@ func (d *Dice) registerCoreCommands() {
 				}
 
 				if runtime.GOOS == "android" {
-					ReplyToSender(ctx, msg, "检测到手机版，手机版海豹不支持指令更新，请手动下载新版本安装包")
+					ReplyToSender(ctx, msg, "检测到手机版，手机版余烬不支持指令更新，请手动下载新版本安装包")
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 
@@ -1990,7 +1990,7 @@ func (d *Dice) registerCoreCommands() {
 		".pc save [<角色名>] // [不绑卡]保存角色，角色名可省略\n" +
 		".pc load (<角色名> | <角色序号>) // [不绑卡]加载角色\n" +
 		".pc del/rm (<角色名> | <角色序号>) // 删除角色 角色序号可用pc list查询\n" +
-		"> 注: 海豹各群数据独立(多张空白卡)，单群游戏不需要存角色。"
+		"> 注: 余烬各群数据独立(多张空白卡)，单群游戏不需要存角色。"
 
 	cmdChar := &CmdItemInfo{
 		Name:      "pc",

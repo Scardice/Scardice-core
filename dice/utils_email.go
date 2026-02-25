@@ -64,7 +64,7 @@ func (d *Dice) SendMail(body string, m MailCode) error {
 func (d *Dice) SendMailRow(subject string, to []string, content string, attachments []string) {
 	m := gomail.NewMessage()
 	// NOTE(Xiangze Li): 按理说应当统一用DiceFotmatTmpl, 但是那样还得有一个MsgContext, 好复杂
-	diceName := "海豹核心"
+	diceName := "余烬核心"
 	if v := d.TextMap["核心:骰子名字"]; v != nil {
 		if s, ok := v.Pick().(string); ok {
 			diceName = s

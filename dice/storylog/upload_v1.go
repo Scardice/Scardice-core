@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"sealdice-core/dice/service"
-	"sealdice-core/utils"
+	"Scardice-core/dice/service"
+	"Scardice-core/utils"
 )
 
 func uploadV1(env UploadEnv) (string, error) {

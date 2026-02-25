@@ -9,10 +9,10 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
-	"sealdice-core/logger"
-	"sealdice-core/model"
-	"sealdice-core/utils/cache"
-	"sealdice-core/utils/constant"
+	"Scardice-core/logger"
+	"Scardice-core/model"
+	"Scardice-core/utils/cache"
+	"Scardice-core/utils/constant"
 )
 
 type MYSQLEngine struct {
@@ -82,7 +82,7 @@ func (s *MYSQLEngine) Init(ctx context.Context) error {
 
 // DBCheck DB检查
 func (s *MYSQLEngine) DBCheck() {
-	fmt.Fprintln(os.Stdout, "MYSQL 海豹不提供检查，请自行检查数据库！")
+	fmt.Fprintln(os.Stdout, "MYSQL 余烬不提供检查，请自行检查数据库！")
 }
 
 // DataDBInit 初始化

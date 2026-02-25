@@ -3,7 +3,7 @@ package dice_test
 import (
 	"testing"
 
-	"sealdice-core/dice"
+	"Scardice-core/dice"
 
 	"gopkg.in/yaml.v3"
 )

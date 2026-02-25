@@ -10,8 +10,8 @@ import (
 	"github.com/Milly/go-base2048"
 	"github.com/vmihailenco/msgpack"
 
-	"sealdice-core/logger"
-	"sealdice-core/utils/crypto"
+	"Scardice-core/logger"
+	"Scardice-core/utils/crypto"
 )
 
 var (
@@ -43,12 +43,12 @@ type data struct {
 	Sign    []byte `msgpack:"sign,omitempty"`
 }
 
-// GenerateVerificationCode 生成海豹校验码
+// GenerateVerificationCode 生成余烬校验码
 func GenerateVerificationCode(platform string, userID string, username string, useBase64 bool) string {
 	if len(SealTrustedClientPrivateKey) == 0 {
 		return ""
 	}
-	// 海豹校验码格式：SEAL<data>
+	// 余烬校验码格式：SEAL<data>
 	p := payload{
 		Version:   VERSION.String(),
 		Timestamp: time.Now().Unix(),

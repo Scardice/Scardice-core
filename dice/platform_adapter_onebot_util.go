@@ -15,9 +15,9 @@ import (
 	"github.com/tidwall/sjson"
 	"go.uber.org/zap"
 
-	"sealdice-core/dice/events"
-	"sealdice-core/dice/imsdk/onebot/schema"
-	"sealdice-core/message"
+	"Scardice-core/dice/events"
+	"Scardice-core/dice/imsdk/onebot/schema"
+	"Scardice-core/message"
 )
 
 // ONEBOT事件对应码表

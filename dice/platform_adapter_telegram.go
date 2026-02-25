@@ -14,8 +14,8 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"go.uber.org/zap"
 
-	"sealdice-core/logger"
-	"sealdice-core/message"
+	"Scardice-core/logger"
+	"Scardice-core/message"
 )
 
 type BotLoggerWrapper struct {

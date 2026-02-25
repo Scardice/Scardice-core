@@ -13,9 +13,9 @@ import (
 	"syscall"
 	"time"
 
-	"sealdice-core/dice"
-	"sealdice-core/logger"
-	"sealdice-core/utils"
+	"Scardice-core/dice"
+	"Scardice-core/logger"
+	"Scardice-core/utils"
 )
 
 const updaterVersion = "0.1.7"
@@ -73,7 +73,7 @@ func CheckUpdater(dm *dice.DiceManager) error {
 	exists := false
 	fn := getUpdaterFn()
 	if _, err := os.Stat(fn); err == nil {
-		log.Info("检测到海豹更新程序")
+		log.Info("检测到余烬更新程序")
 		exists = true
 	}
 

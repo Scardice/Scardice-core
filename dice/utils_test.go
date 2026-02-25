@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"sealdice-core/dice"
+	"Scardice-core/dice"
 )
 
 func TestLimitCommandReasonText(t *testing.T) {

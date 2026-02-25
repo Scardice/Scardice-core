@@ -9,7 +9,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 
-	"sealdice-core/dice"
+	"Scardice-core/dice"
 )
 
 func ImConnections(c echo.Context) error {

@@ -170,8 +170,8 @@ func (group *GroupInfo) ExtInactive(ei *ExtInfo) *ExtInfo {
 
 ```bash
 go test ./dice/...
-# ok  	sealdice-core/dice	0.927s
-# ok  	sealdice-core/dice/censor	0.775s
+# ok  	Scardice-core/dice	0.927s
+# ok  	Scardice-core/dice/censor	0.775s
 ```
 
 ## 总结

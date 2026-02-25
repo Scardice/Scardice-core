@@ -3,7 +3,7 @@ package dice
 import "github.com/Masterminds/semver/v3"
 
 var (
-	APPNAME = "SealDice"
+	APPNAME = "Scardice"
 
 	// VERSION 版本号，按固定格式，action 在构建时可能会自动注入部分信息
 	// 正式：主版本号+yyyyMMdd，如 1.4.5+20240308

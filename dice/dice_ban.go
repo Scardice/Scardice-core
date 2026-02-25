@@ -8,7 +8,7 @@ import (
 
 	"github.com/robfig/cron/v3"
 
-	"sealdice-core/dice/service"
+	"Scardice-core/dice/service"
 )
 
 type BanRankType int

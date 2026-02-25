@@ -2,7 +2,7 @@ package types
 
 // fork from https://github.com/nsxdevx/nsxbot
 
-import "sealdice-core/dice/imsdk/onebot/schema"
+import "Scardice-core/dice/imsdk/onebot/schema"
 
 type SendPrivateMsgReq struct {
 	UserId  int64            `json:"user_id"`

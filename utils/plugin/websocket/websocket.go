@@ -16,7 +16,7 @@ import (
 	"github.com/dop251/goja_nodejs/eventloop"
 	"github.com/gorilla/websocket"
 
-	"sealdice-core/logger"
+	"Scardice-core/logger"
 )
 
 // Logger 日志接口，与helper.go中的Helper方法签名一致

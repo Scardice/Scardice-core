@@ -16,9 +16,9 @@ import (
 	wr "github.com/mroth/weightedrand"
 	"gopkg.in/yaml.v3"
 
-	"sealdice-core/dice/service"
-	"sealdice-core/logger"
-	"sealdice-core/model"
+	"Scardice-core/dice/service"
+	"Scardice-core/logger"
+	"Scardice-core/model"
 )
 
 // type TextTemplateWithWeight = map[string]map[string]uint
@@ -792,10 +792,10 @@ func setupBaseTextTemplate(d *Dice) {
 		},
 		"核心": {
 			"骰子名字": {
-				{"海豹核心", 1},
+				{"余烬核心", 1},
 			},
 			"骰子帮助文本_附加说明": {
-				{"========\n.help 骰点/骰主/协议/娱乐/跑团/扩展/查询/其他\n========\n一只海豹罢了", 1},
+				{"========\n.help 骰点/骰主/协议/娱乐/跑团/扩展/查询/其他\n========\n一只余烬罢了", 1},
 			},
 			"骰子帮助文本_骰主": {
 				{"骰主很神秘，什么都没有说——", 1},
@@ -819,10 +819,10 @@ func setupBaseTextTemplate(d *Dice) {
 				{"<{核心:骰子名字}> 停止服务", 1},
 			},
 			"骰子进群": {
-				{`<{核心:骰子名字}> 已经就绪。可通过.help查看手册\n[图:data/images/sealdice.png]\nCOC/DND玩家可以使用.set coc/dnd在两种模式中切换\n已搭载自动重连，如遇风控不回可稍作等待`, 1},
+				{`<{核心:骰子名字}> 已经就绪。可通过.help查看手册\n[图:data/images/Scardice.png]\nCOC/DND玩家可以使用.set coc/dnd在两种模式中切换\n已搭载自动重连，如遇风控不回可稍作等待`, 1},
 			},
 			"骰子成为好友": {
-				{`<{核心:骰子名字}> 已经就绪。可通过.help查看手册，请拉群测试，私聊容易被企鹅吃掉。\n[图:data/images/sealdice.png]`, 1},
+				{`<{核心:骰子名字}> 已经就绪。可通过.help查看手册，请拉群测试，私聊容易被企鹅吃掉。\n[图:data/images/Scardice.png]`, 1},
 			},
 			"骰子退群预告": {
 				{"收到指令，5s后将退出当前群组", 1},
@@ -1068,7 +1068,7 @@ func setupBaseTextTemplate(d *Dice) {
 				{"pong！这里是{核心:骰子名字}", 1},
 			},
 			"校验_成功": {
-				{"本次生成的神秘海豹码：\n{$t校验码}", 1},
+				{"本次生成的神秘余烬码：\n{$t校验码}", 1},
 			},
 		},
 		"日志": {

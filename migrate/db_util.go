@@ -11,7 +11,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"sealdice-core/utils"
+	"Scardice-core/utils"
 )
 
 func openDB(path string) (*sqlx.DB, error) {

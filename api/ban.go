@@ -12,7 +12,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 
-	"sealdice-core/dice"
+	"Scardice-core/dice"
 )
 
 func banConfigGet(c echo.Context) error {
@@ -104,7 +104,7 @@ func banMapAddOne(c echo.Context) error {
 		platform := strings.Replace(prefix, "-Group", "", 1)
 		for _, i := range myDice.ImSession.EndPoints {
 			if i.Platform == platform && i.Enable {
-				v2 := (&myDice.Config).BanList.AddScoreBase(v.ID, score, "海豹后台", reason, &dice.MsgContext{Dice: myDice, EndPoint: i})
+				v2 := (&myDice.Config).BanList.AddScoreBase(v.ID, score, "余烬后台", reason, &dice.MsgContext{Dice: myDice, EndPoint: i})
 				if v2 != nil {
 					if v.Name != "" {
 						v2.Name = v.Name
@@ -114,7 +114,7 @@ func banMapAddOne(c echo.Context) error {
 		}
 	}
 	if v.Rank == dice.BanRankTrusted {
-		(&myDice.Config).BanList.SetTrustByID(v.ID, "海豹后台", "骰主后台设置")
+		(&myDice.Config).BanList.SetTrustByID(v.ID, "余烬后台", "骰主后台设置")
 	}
 
 	return c.JSON(http.StatusOK, nil)

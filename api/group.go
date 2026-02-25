@@ -8,8 +8,8 @@ import (
 
 	"github.com/labstack/echo/v4"
 
-	"sealdice-core/dice"
-	"sealdice-core/dice/service"
+	"Scardice-core/dice"
+	"Scardice-core/dice/service"
 )
 
 func groupList(c echo.Context) error {

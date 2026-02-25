@@ -24,16 +24,16 @@ import (
 	"github.com/labstack/echo/v4/middleware"
 	"go.uber.org/zap/zapcore"
 
-	"sealdice-core/api"
-	"sealdice-core/dice"
-	"sealdice-core/dice/service"
-	"sealdice-core/logger"
-	v2 "sealdice-core/migrate/v2"
-	"sealdice-core/static"
-	"sealdice-core/utils/crypto"
-	"sealdice-core/utils/dboperator"
-	"sealdice-core/utils/oschecker"
-	"sealdice-core/utils/paniclog"
+	"Scardice-core/api"
+	"Scardice-core/dice"
+	"Scardice-core/dice/service"
+	"Scardice-core/logger"
+	v2 "Scardice-core/migrate/v2"
+	"Scardice-core/static"
+	"Scardice-core/utils/crypto"
+	"Scardice-core/utils/dboperator"
+	"Scardice-core/utils/oschecker"
+	"Scardice-core/utils/paniclog"
 )
 
 /*
@@ -45,7 +45,7 @@ data/logs
 extensions/
 */
 
-var sealLock = flock.New("sealdice-lock.lock")
+var sealLock = flock.New("Scardice-lock.lock")
 
 func cleanupCreate(diceManager *dice.DiceManager) func() {
 	return func() {
@@ -158,8 +158,8 @@ func main() {
 		ShowConsole            bool   `description:"Windows上显示控制台界面"                                                 long:"show-console"`
 		HideUIWhenBoot         bool   `description:"启动时不弹出UI"                                                        long:"hide-ui"`
 		ServiceUser            string `description:"用于启动服务的用户"                                                       long:"service-user"`
-		ServiceName            string `description:"自定义服务名，默认为sealdice"                                              long:"service-name"`
-		MultiInstanceOnWindows bool   `description:"允许在Windows上运行多个海豹"                                               long:"multi-instance"   short:"m"`
+		ServiceName            string `description:"自定义服务名，默认为Scardice"                                              long:"service-name"`
+		MultiInstanceOnWindows bool   `description:"允许在Windows上运行多个余烬"                                               long:"multi-instance"   short:"m"`
 		Address                string `description:"将UI的http服务地址改为此值，例: 0.0.0.0:3211"                                long:"address"`
 		DoUpdateWin            bool   `description:"windows自动升级用，不要在任何情况下主动调用"                                       long:"do-update-win"`
 		DoUpdateOthers         bool   `description:"linux/mac自动升级用，不要在任何情况下主动调用"                                     long:"do-update-others"`
@@ -199,7 +199,7 @@ func main() {
 	paniclog.InitPanicLog()
 
 	// 3. 提示日志打印
-	log.Info("运行日志开始记录，海豹出现故障时可查看 data/main.log 与 data/panic.log 获取更多信息")
+	log.Info("运行日志开始记录，余烬出现故障时可查看 data/main.log 与 data/panic.log 获取更多信息")
 	// 加载env相关
 	err = godotenv.Load()
 	if err != nil {
@@ -211,10 +211,10 @@ func main() {
 	if err != nil || !locked {
 		// 打日志的时候防止打出nil
 		if err == nil {
-			err = errors.New("海豹正在运行中")
+			err = errors.New("余烬正在运行中")
 		}
 		log.Errorf("获取锁文件失败，原因为: %v", err)
-		showMsgBox("获取锁文件失败", "为避免数据损坏，拒绝继续启动。请检查是否启动多份海豹程序！")
+		showMsgBox("获取锁文件失败", "为避免数据损坏，拒绝继续启动。请检查是否启动多份余烬程序！")
 		return
 	}
 	judge, osr := oschecker.OldVersionCheck()
@@ -274,7 +274,7 @@ func main() {
 			serviceName = diceManager.ServiceName
 		}
 		if serviceName == "" {
-			serviceName = "sealdice"
+			serviceName = "Scardice"
 		}
 		if serviceName != diceManager.ServiceName {
 			diceManager.ServiceName = serviceName
@@ -300,18 +300,18 @@ func main() {
 		if doNext {
 			// 只有不同文件才进行校验
 			// windows平台旧版本到1.4.0流程
-			_ = os.WriteFile("./升级失败指引.txt", []byte("如果升级成功不用理会此文档，直接删除即可。\r\n\r\n如果升级后无法启动，或再次启动后恢复到旧版本，先不要紧张。\r\n你升级前的数据备份在backups目录。\r\n如果无法启动，请删除海豹目录中的\"update\"、\"auto_update.exe\"并手动进行升级。\n如果升级成功但在再次重启后回退版本，同上。\n\n如有其他问题可以加企鹅群询问：524364253 562897832"), 0o644)
+			_ = os.WriteFile("./升级失败指引.txt", []byte("如果升级成功不用理会此文档，直接删除即可。\r\n\r\n如果升级后无法启动，或再次启动后恢复到旧版本，先不要紧张。\r\n你升级前的数据备份在backups目录。\r\n如果无法启动，请删除余烬目录中的\"update\"、\"auto_update.exe\"并手动进行升级。\n如果升级成功但在再次重启后回退版本，同上。\n\n如有其他问题可以加企鹅群询问：524364253 562897832"), 0o644)
 			log.Warn("检测到 auto_update.exe，即将自动退出当前程序并进行升级")
 			log.Warn("程序目录下会出现“升级日志.log”，这代表升级正在进行中，如果失败了请检查此文件。")
 
-			err = CheckUpdater(diceManager)
+			err = errors.New("update disabled") // 更新功能已禁用，原调用: CheckUpdater(diceManager)
 			if err != nil {
 				log.Error("升级程序检查失败: ", err.Error())
 			} else {
 				_ = os.Remove("./auto_update.exe")
 				// ui资源已经内置，删除旧的ui文件，这里有点风险，但是此时已经不考虑升级失败的情况
 				_ = os.RemoveAll("./frontend")
-				UpdateByFile(diceManager, "./update/update.zip", true)
+				// UpdateByFile(diceManager, "./update/update.zip", true) // 更新功能已禁用
 			}
 			return
 		}
@@ -326,14 +326,14 @@ func main() {
 		}
 
 		if doNext {
-			err = CheckUpdater(diceManager)
+			err = errors.New("update disabled") // 更新功能已禁用，原调用: CheckUpdater(diceManager)
 			if err != nil {
 				log.Error("升级程序检查失败: ", err.Error())
 			} else {
 				_ = os.Remove("./auto_update")
 				// ui资源已经内置，删除旧的ui文件，这里有点风险，但是此时已经不考虑升级失败的情况
 				_ = os.RemoveAll("./frontend")
-				UpdateByFile(diceManager, "./update/update.tar.gz", true)
+				// UpdateByFile(diceManager, "./update/update.tar.gz", true) // 更新功能已禁用
 			}
 			return
 		}
@@ -341,22 +341,23 @@ func main() {
 	removeUpdateFiles()
 
 	if opts.UpdateTest {
-		err = CheckUpdater(diceManager)
+		err = errors.New("update disabled") // 更新功能已禁用，原调用: CheckUpdater(diceManager)
 		if err != nil {
 			log.Error("升级程序检查失败: ", err.Error())
 		} else {
-			UpdateByFile(diceManager, "./xx.zip", true)
+			// UpdateByFile(diceManager, "./xx.zip", true) // 更新功能已禁用
 		}
 	}
 
 	// 先临时放这里，后面再整理一下升级模块
 	diceManager.UpdateSealdiceByFile = func(packName string) bool {
-		err = CheckUpdater(diceManager)
+		err = errors.New("update disabled") // 更新功能已禁用，原调用: CheckUpdater(diceManager)
 		if err != nil {
 			log.Error("升级程序检查失败: ", err.Error())
 			return false
 		} else {
-			return UpdateByFile(diceManager, packName, false)
+			// return UpdateByFile(diceManager, packName, false) // 更新功能已禁用
+			return false
 		}
 	}
 
@@ -437,13 +438,13 @@ func main() {
 	go func() {
 		// 每5分钟做一次新版本检查
 		for {
-			go CheckVersion(diceManager)
+			// go CheckVersion(diceManager) // 更新功能已禁用
 			time.Sleep(5 * time.Minute)
 		}
 	}()
 	go RebootRequestListen(diceManager)
-	go UpdateRequestListen(diceManager)
-	go UpdateCheckRequestListen(diceManager)
+	// go UpdateRequestListen(diceManager) // 更新功能已禁用
+	// go UpdateCheckRequestListen(diceManager) // 更新功能已禁用
 
 	// 强制清理机制
 	go (func() {

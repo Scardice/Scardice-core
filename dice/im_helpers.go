@@ -12,8 +12,8 @@ import (
 
 	ds "github.com/sealdice/dicescript"
 
-	"sealdice-core/logger"
-	"sealdice-core/utils/panicHandler"
+	"Scardice-core/logger"
+	"Scardice-core/utils/panicHandler"
 )
 
 var (
@@ -402,7 +402,7 @@ func ReplyGroupRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 		d.Logger.Infof("发给(群%s): %s", msg.GroupID, text)
 		// 敏感词拦截：回复（群）
 		if d.Config.EnableCensor && d.Config.CensorMode == OnlyOutputReply {
-			// 先拿掉海豹码和CQ码再检查敏感词
+			// 先拿掉余烬码和CQ码再检查敏感词
 			checkText := sealCodeRe.ReplaceAllString(text, "")
 			checkText = cqCodeRe.ReplaceAllString(checkText, "")
 
@@ -474,7 +474,7 @@ func ReplyPersonRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 		d.Logger.Infof("发给(帐号%s): %s", msg.Sender.UserID, text)
 		// 敏感词拦截：回复（个人）
 		if d.Config.EnableCensor && d.Config.CensorMode == OnlyOutputReply {
-			// 先拿掉海豹码和CQ码再检查敏感词
+			// 先拿掉余烬码和CQ码再检查敏感词
 			checkText := sealCodeRe.ReplaceAllString(text, "")
 			checkText = cqCodeRe.ReplaceAllString(checkText, "")
 

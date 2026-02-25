@@ -21,9 +21,9 @@ import (
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 
-	"sealdice-core/dice/events"
-	"sealdice-core/message"
-	"sealdice-core/utils/procs"
+	"Scardice-core/dice/events"
+	"Scardice-core/message"
+	"Scardice-core/utils/procs"
 
 	"github.com/gorilla/websocket"
 	"github.com/sacOO7/gowebsocket"
@@ -585,7 +585,7 @@ func (pa *PlatformAdapterGocq) Serve() int {
 						if banInfo.Rank == BanRankBanned && ctx.Dice.Config.BanList.BanBehaviorRefuseInvite {
 							// 如果是被ban之后拉群，判定为强制拉群
 							if groupInfo.EnteredTime > 0 && groupInfo.EnteredTime > banInfo.BanTime {
-								text := fmt.Sprintf("本次入群为遭遇强制邀请，即将主动退群，因为邀请人%s正处于黑名单上。打扰各位还请见谅。感谢使用海豹核心。", groupInfo.InviteUserID)
+								text := fmt.Sprintf("本次入群为遭遇强制邀请，即将主动退群，因为邀请人%s正处于黑名单上。打扰各位还请见谅。感谢使用余烬核心。", groupInfo.InviteUserID)
 								ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
 								time.Sleep(1 * time.Second)
 								pa.QuitGroup(ctx, groupID)
@@ -600,7 +600,7 @@ func (pa *PlatformAdapterGocq) Serve() int {
 						if banInfo.Rank == BanRankBanned {
 							// 如果是被ban之后拉群，判定为强制拉群
 							if groupInfo.EnteredTime > 0 && groupInfo.EnteredTime > banInfo.BanTime {
-								text := fmt.Sprintf("被群已被拉黑，即将自动退出，解封请联系骰主。打扰各位还请见谅。感谢使用海豹核心:\n当前情况: %s", banInfo.toText(ctx.Dice))
+								text := fmt.Sprintf("被群已被拉黑，即将自动退出，解封请联系骰主。打扰各位还请见谅。感谢使用余烬核心:\n当前情况: %s", banInfo.toText(ctx.Dice))
 								ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
 								time.Sleep(1 * time.Second)
 								pa.QuitGroup(ctx, groupID)
@@ -1058,7 +1058,7 @@ func (pa *PlatformAdapterGocq) Serve() int {
 				// 这里的私聊消息可能是自己发送的
 				// 要是群发也可以被记录就好了
 				// XXXX {"font":0,"message":"\u003c木落\u003e的今日人品为83","message_id":-358748624,"message_type":"private","post_type":"message_sent","raw_message":"\u003c木落\u003e的今日人
-				// 品为83","self_id":2589922907,"sender":{"age":0,"nickname":"海豹一号机","sex":"unknown","user_id":2589922907},"sub_type":"friend","target_id":222,"time":1647760835,"use
+				// 品为83","self_id":2589922907,"sender":{"age":0,"nickname":"余烬一号机","sex":"unknown","user_id":2589922907},"sub_type":"friend","target_id":222,"time":1647760835,"use
 				// r_id":2589922907}
 				return
 			}

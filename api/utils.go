@@ -17,7 +17,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/samber/lo"
 
-	"sealdice-core/dice"
+	"Scardice-core/dice"
 )
 
 type Response map[string]interface{}

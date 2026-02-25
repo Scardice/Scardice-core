@@ -16,12 +16,12 @@ import (
 
 	"go.uber.org/zap"
 
-	"sealdice-core/dice/events"
-	"sealdice-core/dice/service"
-	"sealdice-core/logger"
-	"sealdice-core/message"
-	"sealdice-core/model"
-	"sealdice-core/utils/dboperator/engine"
+	"Scardice-core/dice/events"
+	"Scardice-core/dice/service"
+	"Scardice-core/logger"
+	"Scardice-core/message"
+	"Scardice-core/model"
+	"Scardice-core/utils/dboperator/engine"
 
 	"github.com/golang-module/carbon"
 	ds "github.com/sealdice/dicescript"

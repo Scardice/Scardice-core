@@ -11,7 +11,7 @@ import (
 	se "github.com/slack-go/slack/slackevents"
 	sm "github.com/slack-go/slack/socketmode"
 
-	"sealdice-core/message"
+	"Scardice-core/message"
 )
 
 type PlatformAdapterSlack struct {

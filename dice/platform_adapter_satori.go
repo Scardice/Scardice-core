@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"sealdice-core/message"
-	"sealdice-core/utils/satori"
+	"Scardice-core/message"
+	"Scardice-core/utils/satori"
 
 	"github.com/gorilla/websocket"
 

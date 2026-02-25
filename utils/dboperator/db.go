@@ -7,12 +7,12 @@ import (
 
 	"go.uber.org/zap"
 
-	"sealdice-core/logger"
-	"sealdice-core/utils/constant"
-	operator "sealdice-core/utils/dboperator/engine"
-	"sealdice-core/utils/dboperator/engine/mysql"
-	"sealdice-core/utils/dboperator/engine/pgsql"
-	"sealdice-core/utils/dboperator/engine/sqlite"
+	"Scardice-core/logger"
+	"Scardice-core/utils/constant"
+	operator "Scardice-core/utils/dboperator/engine"
+	"Scardice-core/utils/dboperator/engine/mysql"
+	"Scardice-core/utils/dboperator/engine/pgsql"
+	"Scardice-core/utils/dboperator/engine/sqlite"
 )
 
 var (

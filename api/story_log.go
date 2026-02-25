@@ -7,9 +7,9 @@ import (
 
 	"github.com/labstack/echo/v4"
 
-	"sealdice-core/dice"
-	"sealdice-core/dice/service"
-	"sealdice-core/model"
+	"Scardice-core/dice"
+	"Scardice-core/dice/service"
+	"Scardice-core/model"
 )
 
 func storyGetInfo(c echo.Context) error {
@@ -134,7 +134,7 @@ func storyUploadLog(c echo.Context) error {
 	}
 	ret := fmt.Sprintf("跑团日志已上传服务器，链接如下：<br/>%s", url)
 	if unofficial {
-		ret += "<br/>[注意：该链接非海豹官方染色器]"
+		ret += "<br/>[注意：该链接非余烬官方染色器]"
 	}
 	return c.JSON(http.StatusOK, ret)
 }

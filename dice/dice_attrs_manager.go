@@ -10,11 +10,11 @@ import (
 	ds "github.com/sealdice/dicescript"
 	"go.uber.org/zap"
 
-	"sealdice-core/dice/service"
-	"sealdice-core/logger"
-	"sealdice-core/model"
-	"sealdice-core/utils/constant"
-	"sealdice-core/utils/dboperator/engine"
+	"Scardice-core/dice/service"
+	"Scardice-core/logger"
+	"Scardice-core/model"
+	"Scardice-core/utils/constant"
+	"Scardice-core/utils/dboperator/engine"
 )
 
 type AttrsManager struct {

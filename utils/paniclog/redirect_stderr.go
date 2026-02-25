@@ -8,7 +8,7 @@ package paniclog
 import (
 	"os"
 
-	"sealdice-core/logger"
+	"Scardice-core/logger"
 )
 
 // redirectStderr to the file passed in

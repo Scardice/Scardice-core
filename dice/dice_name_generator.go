@@ -10,7 +10,7 @@ import (
 	wr "github.com/mroth/weightedrand"
 	"github.com/xuri/excelize/v2"
 
-	"sealdice-core/logger"
+	"Scardice-core/logger"
 )
 
 type NamesGenerator struct {

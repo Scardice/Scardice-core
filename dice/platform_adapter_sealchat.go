@@ -16,8 +16,8 @@ import (
 	"github.com/sacOO7/gowebsocket"
 	"golang.org/x/time/rate"
 
-	"sealdice-core/message"
-	"sealdice-core/utils/satori"
+	"Scardice-core/message"
+	"Scardice-core/utils/satori"
 )
 
 type PlatformAdapterSealChat struct {

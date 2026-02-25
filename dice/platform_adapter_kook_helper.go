@@ -6,7 +6,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	"sealdice-core/logger"
+	"Scardice-core/logger"
 )
 
 func NewKookConnItem(token string) *EndPointInfo {

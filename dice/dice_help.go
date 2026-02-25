@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"sealdice-core/dice/docengine"
-	"sealdice-core/logger"
+	"Scardice-core/dice/docengine"
+	"Scardice-core/logger"
 
 	"gopkg.in/yaml.v3"
 

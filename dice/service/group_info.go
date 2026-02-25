@@ -4,10 +4,10 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm/clause"
 
-	"sealdice-core/logger"
-	"sealdice-core/model"
-	"sealdice-core/utils/constant"
-	engine2 "sealdice-core/utils/dboperator/engine"
+	"Scardice-core/logger"
+	"Scardice-core/model"
+	"Scardice-core/utils/constant"
+	engine2 "Scardice-core/utils/dboperator/engine"
 )
 
 // GroupInfoListGet 使用 GORM 实现，遍历 group_info 表中的数据并调用回调函数

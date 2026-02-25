@@ -3,7 +3,7 @@ package upgrade
 import (
 	"time"
 
-	"sealdice-core/utils/dboperator/engine"
+	"Scardice-core/utils/dboperator/engine"
 )
 
 type Upgrade struct {

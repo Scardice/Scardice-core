@@ -1,4 +1,4 @@
-module sealdice-core
+module Scardice-core
 
 go 1.24.6
 

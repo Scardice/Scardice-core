@@ -17,7 +17,7 @@ import (
 	qqtoken "github.com/sealdice/botgo/token"
 	qqws "github.com/sealdice/botgo/websocket"
 
-	"sealdice-core/message"
+	"Scardice-core/message"
 )
 
 type PlatformAdapterOfficialQQ struct {

@@ -1,4 +1,4 @@
-# SealDice 商店接口文档
+# Scardice 商店接口文档
 
 ## 接口基础信息
 

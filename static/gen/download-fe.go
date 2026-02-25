@@ -11,18 +11,18 @@ import (
 	"strings"
 )
 
-const uiResourcesURL = "https://github.com/sealdice/sealdice-ui/releases/download/pre-release/sealdice-ui.zip"
+const uiResourcesURL = "https://github.com/Scardice/Scardice-ui/releases/download/pre-release/Scardice-ui.zip"
 
 func main() {
 	defer func() {
-		_, err := os.Stat("sealdice-ui.zip")
+		_, err := os.Stat("Scardice-ui.zip")
 		if os.IsNotExist(err) {
 			return
 		}
 		if err != nil {
 			panic("清理ui资源失败: " + err.Error())
 		}
-		err = os.Remove("sealdice-ui.zip")
+		err = os.Remove("Scardice-ui.zip")
 		if err != nil {
 			panic("清理ui资源失败: " + err.Error())
 		}
@@ -31,7 +31,7 @@ func main() {
 	if err != nil {
 		panic("下载ui资源失败: " + err.Error())
 	}
-	err = unzip("sealdice-ui.zip", "frontend")
+	err = unzip("Scardice-ui.zip", "frontend")
 	if err != nil {
 		panic("解压ui资源失败: " + err.Error())
 	}
@@ -47,7 +47,7 @@ func downloadFrontendZip() error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	file, err := os.Create("sealdice-ui.zip")
+	file, err := os.Create("Scardice-ui.zip")
 	if err != nil {
 		return err
 	}

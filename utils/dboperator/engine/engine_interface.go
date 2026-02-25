@@ -5,10 +5,10 @@ import (
 
 	"gorm.io/gorm"
 
-	"sealdice-core/utils/constant"
-	"sealdice-core/utils/dboperator/engine/mysql"
-	"sealdice-core/utils/dboperator/engine/pgsql"
-	"sealdice-core/utils/dboperator/engine/sqlite"
+	"Scardice-core/utils/constant"
+	"Scardice-core/utils/dboperator/engine/mysql"
+	"Scardice-core/utils/dboperator/engine/pgsql"
+	"Scardice-core/utils/dboperator/engine/sqlite"
 )
 
 // DatabaseOperator 本来是单独放了个文件夹的，但是由于现在所有的model都和处理逻辑在一起，如果放在单独文件夹必然会循环依赖

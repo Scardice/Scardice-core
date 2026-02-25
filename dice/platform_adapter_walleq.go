@@ -16,9 +16,9 @@ import (
 
 	"github.com/sacOO7/gowebsocket"
 
-	"sealdice-core/dice/service"
-	"sealdice-core/message"
-	"sealdice-core/utils/procs"
+	"Scardice-core/dice/service"
+	"Scardice-core/message"
+	"Scardice-core/utils/procs"
 )
 
 /* 定义结构体 */
@@ -650,7 +650,7 @@ func (pa *PlatformAdapterWalleQ) Serve() int {
 						if banInfo.Rank == BanRankBanned && ctx.Dice.Config.BanList.BanBehaviorRefuseInvite {
 							// 如果是被ban之后拉群，判定为强制拉群
 							if groupInfo.EnteredTime > 0 && groupInfo.EnteredTime > banInfo.BanTime {
-								text := fmt.Sprintf("本次入群为遭遇强制邀请，即将主动退群，因为邀请人%s正处于黑名单上。打扰各位还请见谅。感谢使用海豹核心。", groupInfo.InviteUserID)
+								text := fmt.Sprintf("本次入群为遭遇强制邀请，即将主动退群，因为邀请人%s正处于黑名单上。打扰各位还请见谅。感谢使用余烬核心。", groupInfo.InviteUserID)
 								ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
 								time.Sleep(1 * time.Second)
 								pa.QuitGroup(ctx, groupID)
@@ -665,7 +665,7 @@ func (pa *PlatformAdapterWalleQ) Serve() int {
 						if banInfo.Rank == BanRankBanned {
 							// 如果是被ban之后拉群，判定为强制拉群
 							if groupInfo.EnteredTime > 0 && groupInfo.EnteredTime > banInfo.BanTime {
-								text := fmt.Sprintf("被群已被拉黑，即将自动退出，解封请联系骰主。打扰各位还请见谅。感谢使用海豹核心:\n当前情况: %s", banInfo.toText(ctx.Dice))
+								text := fmt.Sprintf("被群已被拉黑，即将自动退出，解封请联系骰主。打扰各位还请见谅。感谢使用余烬核心:\n当前情况: %s", banInfo.toText(ctx.Dice))
 								ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
 								time.Sleep(1 * time.Second)
 								pa.QuitGroup(ctx, groupID)
@@ -1213,7 +1213,7 @@ func (pa *PlatformAdapterWalleQ) TextToMessageSegment(text string) []MessageSegm
 		}
 		return pa2
 	}
-	// 海豹码 转 cq 码 // 有点麻
+	// 余烬码 转 cq 码 // 有点麻
 	for _, i := range arr {
 		if strings.HasPrefix(i, "[") { // 是 [ 开头的就转一下
 			i = message.SealCodeToCqCode(i)
@@ -1271,7 +1271,7 @@ func (event *EventWalleQBase) toMessageBase() *Message {
 	case "channel": // wq 未实现
 		msg.Sender.UserID = FormatDiceIDQQCh(event.UserID)
 		msg.Sender.Nickname = event.UserName
-		msg.GroupID = FormatDiceIDQQChGroup(event.ChannelID, event.GuildID) // v12 与海豹标准相反，好别扭啊
+		msg.GroupID = FormatDiceIDQQChGroup(event.ChannelID, event.GuildID) // v12 与余烬标准相反，好别扭啊
 	}
 	return msg
 }

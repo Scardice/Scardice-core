@@ -15,7 +15,7 @@ import (
 	"github.com/Szzrain/dodo-open-go/model"
 	"github.com/Szzrain/dodo-open-go/websocket"
 
-	"sealdice-core/message"
+	"Scardice-core/message"
 )
 
 type PlatformAdapterDodo struct {

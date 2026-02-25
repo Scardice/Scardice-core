@@ -7,8 +7,8 @@ import (
 
 	ds "github.com/sealdice/dicescript"
 
-	"sealdice-core/dice/service"
-	"sealdice-core/utils/satori"
+	"Scardice-core/dice/service"
+	"Scardice-core/utils/satori"
 )
 
 // 哨兵错误
