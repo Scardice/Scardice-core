@@ -322,8 +322,6 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 	(&d.Config).BanList = &BanListInfo{Parent: d}
 	(&d.Config).BanList.Init()
 
-	initVerify()
-
 	d.BaseConfig.CommandCompatibleMode = true
 	// Pinenutn: 预先初始化对应的SyncMap
 	d.ImSession = &IMSession{}
@@ -931,7 +929,7 @@ func (d *Dice) PublicDiceEndpointRefresh() {
 	_, code := d.PublicDice.EndpointUpdate(&public_dice.EndpointUpdateRequest{
 		DiceID:    cfg.ID,
 		Endpoints: endpointItems,
-	}, GenerateVerificationKeyForPublicDice)
+	}, nil)
 	if code != 200 {
 		d.Logger.Warn("[公骰]无法通过服务器校验，不再进行更新")
 		return
@@ -945,7 +943,7 @@ func (d *Dice) PublicDiceInfoRegister() {
 		Name:  cfg.Name,
 		Brief: cfg.Brief,
 		Note:  cfg.Note,
-	}, GenerateVerificationKeyForPublicDice)
+	}, nil)
 	if code != 200 {
 		d.Logger.Warn("[公骰]无法通过服务器校验，不再进行骰号注册")
 		return
@@ -977,7 +975,7 @@ func (d *Dice) PublicDiceSetupTick() {
 		d.PublicDice.TickUpdate(&public_dice.TickUpdateRequest{
 			ID:        cfg.ID,
 			Endpoints: tickEndpointItems,
-		}, GenerateVerificationKeyForPublicDice)
+		}, nil)
 	}
 
 	if d.PublicDiceTimerId != 0 {
