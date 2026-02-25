@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	wr "github.com/mroth/weightedrand"
@@ -2450,6 +2451,42 @@ func (d *Dice) ApplyExtDefaultSettings() {
 
 	// 新扩展激活已改为延迟模式：在 GetActivatedExtList 中按需激活
 	// 不再遍历所有群组，避免大量群组被标记为 dirty 导致 Save 耗时过长
+	//
+	// 但当默认设置从关闭改为开启（AutoActive=true）时，需要清理群组中的关闭记录，
+	// 并重置群组扩展应用版本，让后续消息触发的延迟同步按新默认配置生效。
+	if d.ImSession != nil && d.ImSession.ServiceAtNew != nil {
+		autoActiveNames := make(map[string]struct{}, len(exts1))
+		for name, setting := range exts1 {
+			if setting != nil && setting.AutoActive {
+				autoActiveNames[name] = struct{}{}
+			}
+		}
+
+		if len(autoActiveNames) > 0 {
+			d.ImSession.ServiceAtNew.Range(func(_ string, group *GroupInfo) bool {
+				if group == nil {
+					return true
+				}
+				group.extInitMu.Lock()
+				group.ensureInactivatedSet()
+				changed := false
+				for name := range autoActiveNames {
+					if _, exists := group.InactivatedExtSet[name]; exists {
+						delete(group.InactivatedExtSet, name)
+						changed = true
+					}
+				}
+				// 触发下一次消息时重新按新默认配置同步扩展状态
+				group.ExtAppliedVersion = 0
+				atomic.StoreInt64(&group.ExtAppliedTime, 0)
+				group.extInitMu.Unlock()
+				if changed {
+					group.MarkDirty(d)
+				}
+				return true
+			})
+		}
+	}
 
 	// 不好分辨，直接标记
 	d.MarkModified()

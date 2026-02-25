@@ -18,7 +18,7 @@ info.db
 record.log
 .idea
 !/.idea/**/Project.xml
-sealdice-core
+Scardice-core
 data/save.yaml
 configs/
 data/
@@ -43,7 +43,7 @@ _help_cache
 .vscode/
 !.vscode/settings.json
 !.vscode/extensions.json
-sealdice-lock.lock
+Scardice-lock.lock
 upgrade_metadata.json
 
 /signature/**/*
