@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"sealdice-core/message"
-	"sealdice-core/utils"
+	"Scardice-core/message"
+	"Scardice-core/utils"
 
 	"github.com/sacOO7/gowebsocket"
 	"github.com/samber/lo"

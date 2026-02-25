@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"sealdice-core/logger"
+	"Scardice-core/logger"
 )
 
 func Base64ToImageFunc() func(string) (string, error) {

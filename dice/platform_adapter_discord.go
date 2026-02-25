@@ -13,8 +13,8 @@ import (
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 
-	"sealdice-core/logger"
-	"sealdice-core/message"
+	"Scardice-core/logger"
+	"Scardice-core/message"
 )
 
 // PlatformAdapterDiscord 只有token需要记录，别的是生成的
@@ -250,8 +250,8 @@ func (pa *PlatformAdapterDiscord) Serve() int {
 		pa.Session.Parent.Logger.Errorf("与Discord服务进行连接时出错:%s", err.Error())
 		return 1
 	}
-	// 把bot的状态改成正在玩SealDice，这一行可以删掉，但是他很cool欸
-	_ = pa.IntentSession.UpdateGameStatus(0, "SealDice")
+	// 把bot的状态改成正在玩Scardice，这一行可以删掉，但是他很cool欸
+	_ = pa.IntentSession.UpdateGameStatus(0, "Scardice")
 	pa.EndPoint.UserID = FormatDiceIDDiscord(pa.IntentSession.State.User.ID)
 	pa.EndPoint.Nickname = pa.IntentSession.State.User.Username
 	pa.EndPoint.State = 1
@@ -277,7 +277,7 @@ func (pa *PlatformAdapterDiscord) DoRelogin() bool {
 		pa.EndPoint.State = 0
 		return false
 	}
-	_ = pa.IntentSession.UpdateGameStatus(0, "SealDice")
+	_ = pa.IntentSession.UpdateGameStatus(0, "Scardice")
 	pa.EndPoint.State = 1
 	pa.EndPoint.Enable = true
 	d := pa.Session.Parent
@@ -301,7 +301,7 @@ func (pa *PlatformAdapterDiscord) SetEnable(enable bool) {
 			pa.EndPoint.Enable = false
 			return
 		}
-		_ = pa.IntentSession.UpdateGameStatus(0, "SealDice")
+		_ = pa.IntentSession.UpdateGameStatus(0, "Scardice")
 		pa.Session.Parent.Logger.Infof("Discord 服务连接成功，账号<%s>(%s)", pa.IntentSession.State.User.Username, FormatDiceIDDiscord(pa.IntentSession.State.User.ID))
 		pa.EndPoint.State = 1
 		pa.EndPoint.Enable = true

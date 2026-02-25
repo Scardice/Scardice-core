@@ -5,7 +5,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"sealdice-core/utils/cache"
+	"Scardice-core/utils/cache"
 )
 
 func PostgresDBInit(dsn string) (*gorm.DB, error) {

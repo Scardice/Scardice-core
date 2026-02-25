@@ -11,8 +11,8 @@ import (
 
 	"go.uber.org/zap"
 
-	"sealdice-core/model"
-	"sealdice-core/utils/dboperator/engine"
+	"Scardice-core/model"
+	"Scardice-core/utils/dboperator/engine"
 )
 
 type UploadEnv struct {
@@ -58,7 +58,7 @@ func uploadToBackend(env UploadEnv, backend string, data io.Reader) string {
 
 	field, err = writer.CreateFormField("client")
 	if err == nil {
-		_, _ = field.Write([]byte("SealDice"))
+		_, _ = field.Write([]byte("Scardice"))
 	}
 
 	field, err = writer.CreateFormField("version")

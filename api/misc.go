@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"sealdice-core/dice"
+	"Scardice-core/dice"
 
 	"github.com/labstack/echo/v4"
 	cp "github.com/otiai10/copy"

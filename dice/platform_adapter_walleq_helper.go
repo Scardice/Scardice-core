@@ -13,7 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pelletier/go-toml/v2"
 
-	"sealdice-core/utils/procs"
+	"Scardice-core/utils/procs"
 )
 
 const (

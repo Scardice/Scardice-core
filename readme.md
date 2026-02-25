@@ -1,9 +1,9 @@
-# SealDice
+# Scardice
 
 ![Software License](https://img.shields.io/badge/license-MIT-brightgreen.svg?style=flat-square)
-![Core](https://img.shields.io/badge/SealDice-Core-blue)
+![Core](https://img.shields.io/badge/Scardice-Core-blue)
 
-海豹 TRPG 骰点核心，开源跑团辅助工具，支持 QQ/Kook/Discord 等。
+余烬 TRPG 骰点核心，开源跑团辅助工具，支持 QQ/Kook/Discord 等。
 
 轻量 · 易用 · 全能
 
@@ -11,12 +11,12 @@
 
 见 [使用手册](https://sealdice.github.io/sealdice-manual-next/)。
 
-## SealDice Project
+## Scardice Project
 
-- [核心](https://github.com/sealdice/sealdice-core)（本仓库）：Go 后端代码仓库，也作为海豹的主仓库，Bug 可反馈在该仓库的 issue 中；
-- [UI](https://github.com/sealdice/sealdice-ui)：前端代码，基于 Vue3 + ElementPlus 开发；
+- [核心](https://github.com/Scardice/Scardice-core)（本仓库）：Go 后端代码仓库，也作为余烬的主仓库，Bug 可反馈在该仓库的 issue 中；
+- [UI](https://github.com/Scardice/Scardice-ui)：前端代码，基于 Vue3 + ElementPlus 开发；
 - [手册](https://github.com/sealdice/sealdice-manual-next)：官方手册源码，由 VitePress 驱动；
-- [构建](https://github.com/sealdice/sealdice-build)：自动构建仓库，用于自动化发布海豹的每日构建包与 Release；
+- [构建](https://github.com/sealdice/sealdice-build)：自动构建仓库，用于自动化发布余烬的每日构建包与 Release；
 - [Android](https://github.com/sealdice/sealdice-android)：Android 应用源码；
 - ……
 
@@ -74,7 +74,7 @@ task run
 
 使用 git 拉取项目代码
 
-从已发布的海豹二进制包中，解压 `data`、`lagrange` 两个目录到代码目录下。
+从已发布的余烬二进制包中，解压 `data`、`lagrange` 两个目录到代码目录下。
 
 同时需要在项目的 `static/frontend` 下放置用于打包进 core 的 ui 静态资源文件，可手动提供，也可通过命令自动从 github 拉取：
 
@@ -117,9 +117,9 @@ go run .
 
 ### 从哪开始看
 
-从 `main.go` 开始，这里海豹分出了几个线程，一个启动核心并提供服务，另一个提供 ui 的 http 服务。
+从 `main.go` 开始，这里余烬分出了几个线程，一个启动核心并提供服务，另一个提供 ui 的 http 服务。
 
-可以顺藤摸瓜了解海豹如何启动，如何提供服务，如何响应指令。指令响应的部分写在 `im_session.go` 中
+可以顺藤摸瓜了解余烬如何启动，如何提供服务，如何响应指令。指令响应的部分写在 `im_session.go` 中
 
 注意有部分代码还在构思中，实际并未使用，例如 `CharacterTemplate`，请阅读时先 Find Usage 加以区分
 
@@ -135,9 +135,9 @@ go run .
 
 `GroupPlayerInfo` 是玩家信息
 
-### 为海豹添加更多平台支持
+### 为余烬添加更多平台支持
 
-海豹使用叫做 `PlatformAdapter` 的接口来接入平台，只需将接口全部实现，再创建一个 `EndPointInfo` 塞入当前用户的 `IMSession` 对象之中即可。
+余烬使用叫做 `PlatformAdapter` 的接口来接入平台，只需将接口全部实现，再创建一个 `EndPointInfo` 塞入当前用户的 `IMSession` 对象之中即可。
 
 注：每次在 UI 上添加 QQ 账号，其实就是创建了一个 `EndPointInfo` 对象，并制定 Adapter 为 `PlatformAdapterQQOnebot`
 
@@ -155,7 +155,7 @@ go run .
 
 #### 表达式解析器
 
-`dice/roll.peg` 是海豹的骰点指令文法文件
+`dice/roll.peg` 是余烬的骰点指令文法文件
 
 `dice/rollvm.go` 是骰点指令虚拟机
 

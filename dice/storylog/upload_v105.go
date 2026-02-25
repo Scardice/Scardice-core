@@ -19,9 +19,9 @@ import (
 	"github.com/parquet-go/parquet-go/compress/zstd"
 	"github.com/pilagod/gorm-cursor-paginator/v2/paginator"
 
-	"sealdice-core/dice/service"
-	"sealdice-core/model"
-	"sealdice-core/utils"
+	"Scardice-core/dice/service"
+	"Scardice-core/model"
+	"Scardice-core/utils"
 )
 
 func GetLogTxtAndParquetFile(env UploadEnv) (*os.File, *bytes.Buffer, error) {
@@ -36,7 +36,7 @@ func GetLogTxtAndParquetFile(env UploadEnv) (*os.File, *bytes.Buffer, error) {
 	buf := new(bytes.Buffer)
 	tempLog, err := os.CreateTemp("", fmt.Sprintf(
 		"%s(*).txt",
-		utils.FilenameClean("sealdice_v105_prefix_"),
+		utils.FilenameClean("Scardice_v105_prefix_"),
 	))
 	if err != nil {
 		return nil, nil, errors.New("log导出出现未知错误")

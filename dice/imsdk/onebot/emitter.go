@@ -15,8 +15,8 @@ import (
 
 	socketio "github.com/PaienNate/pineutil/evsocket"
 
-	"sealdice-core/dice/imsdk/onebot/schema"
-	"sealdice-core/dice/imsdk/onebot/types"
+	"Scardice-core/dice/imsdk/onebot/schema"
+	"Scardice-core/dice/imsdk/onebot/types"
 )
 
 // EchoTimeOut ws onebot await echo message time out

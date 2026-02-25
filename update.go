@@ -16,9 +16,9 @@ import (
 
 	"go.uber.org/zap"
 
-	"sealdice-core/dice"
-	"sealdice-core/logger"
-	"sealdice-core/utils"
+	"Scardice-core/dice"
+	"Scardice-core/logger"
+	"Scardice-core/utils"
 )
 
 var binPrefix = "https://sealdice.coding.net/p/sealdice/d/sealdice-binaries/git/raw/master"
@@ -50,7 +50,7 @@ func downloadUpdate(dm *dice.DiceManager, log *zap.SugaredLogger) (string, error
 				arch = "i386"
 			}
 
-			fn := fmt.Sprintf("sealdice-core_%s_%s_%s.%s", version, platform, arch, ext)
+			fn := fmt.Sprintf("Scardice-core_%s_%s_%s.%s", version, platform, arch, ext)
 			fileUrl := binPrefix + "/" + fn
 
 			if ver.NewVersionURLPrefix != "" {

@@ -11,7 +11,7 @@ import (
 	ds "github.com/sealdice/dicescript"
 	"github.com/tidwall/gjson"
 
-	"sealdice-core/message"
+	"Scardice-core/message"
 )
 
 type Kwarg struct {

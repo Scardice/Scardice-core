@@ -7,7 +7,7 @@ import (
 
 	"github.com/jmoiron/sqlx"
 
-	"sealdice-core/utils/spinner"
+	"Scardice-core/utils/spinner"
 )
 
 var sqls = []string{
@@ -57,7 +57,7 @@ func LogItemFixDatatype(db *sqlx.DB) error {
 	}
 
 	fmt.Fprintln(os.Stdout, "开始修复log_items表message字段类型")
-	fmt.Fprintln(os.Stdout, "【不要关闭海豹程序！】")
+	fmt.Fprintln(os.Stdout, "【不要关闭余烬程序！】")
 
 	done := make(chan interface{}, 1)
 
@@ -85,6 +85,6 @@ func LogItemFixDatatype(db *sqlx.DB) error {
 	_, _ = db.Exec(`VACUUM;`)
 
 	fmt.Fprintln(os.Stdout, "\n修复log_items表message字段类型成功")
-	fmt.Fprintln(os.Stdout, "您现在可以正常使用海豹程序了")
+	fmt.Fprintln(os.Stdout, "您现在可以正常使用余烬程序了")
 	return nil
 }

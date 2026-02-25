@@ -19,10 +19,10 @@ import (
 	"github.com/panjf2000/ants/v2"
 	"go.uber.org/zap"
 
-	emitter "sealdice-core/dice/imsdk/onebot"
-	emitter_types "sealdice-core/dice/imsdk/onebot/types"
-	"sealdice-core/logger"
-	"sealdice-core/message"
+	emitter "Scardice-core/dice/imsdk/onebot"
+	emitter_types "Scardice-core/dice/imsdk/onebot/types"
+	"Scardice-core/logger"
+	"Scardice-core/message"
 )
 
 type PlatformAdapterOnebot struct {
@@ -450,7 +450,7 @@ func (p *PlatformAdapterOnebot) GetGroupInfoSync(diceGroupID string) *GroupCache
 	userResult := checkBlackList(uid, "user", ctx)
 	if !userResult.Passed {
 		if groupInfo.EnteredTime > 0 && groupInfo.EnteredTime > userResult.BanInfo.BanTime {
-			text := fmt.Sprintf("本次入群为遭遇强制邀请，即将主动退群，因为邀请人%s正处于黑名单上。打扰各位还请见谅。感谢使用海豹核心。", groupInfo.InviteUserID)
+			text := fmt.Sprintf("本次入群为遭遇强制邀请，即将主动退群，因为邀请人%s正处于黑名单上。打扰各位还请见谅。感谢使用余烬核心。", groupInfo.InviteUserID)
 			ReplyGroupRaw(ctx, &Message{GroupID: diceGroupID}, text, "")
 			time.Sleep(1 * time.Second)
 			p.QuitGroup(ctx, diceGroupID)
@@ -461,7 +461,7 @@ func (p *PlatformAdapterOnebot) GetGroupInfoSync(diceGroupID string) *GroupCache
 	if !groupResult.Passed {
 		// 如果是被ban之后拉群，判定为强制拉群
 		if groupInfo.EnteredTime > 0 && groupInfo.EnteredTime > userResult.BanInfo.BanTime {
-			text := fmt.Sprintf("该群已被拉黑，即将自动退出，解封请联系骰主。打扰各位还请见谅。感谢使用海豹核心:\n当前情况: %s", userResult.BanInfo.toText(ctx.Dice))
+			text := fmt.Sprintf("该群已被拉黑，即将自动退出，解封请联系骰主。打扰各位还请见谅。感谢使用余烬核心:\n当前情况: %s", userResult.BanInfo.toText(ctx.Dice))
 			ReplyGroupRaw(ctx, &Message{GroupID: diceGroupID}, text, "")
 			time.Sleep(1 * time.Second)
 			p.QuitGroup(ctx, diceGroupID)

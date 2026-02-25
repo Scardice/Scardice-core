@@ -3,9 +3,9 @@ package v151
 import (
 	"fmt"
 
-	"sealdice-core/model"
-	"sealdice-core/utils/constant"
-	operator "sealdice-core/utils/dboperator/engine"
+	"Scardice-core/model"
+	"Scardice-core/utils/constant"
+	operator "Scardice-core/utils/dboperator/engine"
 )
 
 // V151GORMCleanMigrate 删除包含NULL的数据

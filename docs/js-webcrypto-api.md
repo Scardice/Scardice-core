@@ -1,10 +1,10 @@
 # JS Web Crypto API
 
-本文档说明 `sealdice-core` 在 Goja 中暴露的 `crypto` / `crypto.subtle` API。
+本文档说明 `Scardice-core` 在 Goja 中暴露的 `crypto` / `crypto.subtle` API。
 
 应该写手册里面的，咳咳。
 
-另外鄙人鞭策 AI 写了个 [测试脚本](https://raw.githubusercontent.com/lyjjl/SealDice-Plugins/main/%E7%A4%BA%E4%BE%8B/CryptoAPI%E6%B5%8B%E8%AF%95.js)
+另外鄙人鞭策 AI 写了个 [测试脚本](https://raw.githubusercontent.com/lyjjl/Scardice-Plugins/main/%E7%A4%BA%E4%BE%8B/CryptoAPI%E6%B5%8B%E8%AF%95.js)
 
 ## 对外入口
 

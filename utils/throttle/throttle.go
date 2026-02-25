@@ -3,7 +3,7 @@ package throttle
 import (
 	"time"
 
-	"sealdice-core/utils"
+	"Scardice-core/utils"
 )
 
 var (

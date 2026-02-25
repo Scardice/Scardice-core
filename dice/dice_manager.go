@@ -9,8 +9,8 @@ import (
 	"github.com/robfig/cron/v3"
 	"gopkg.in/yaml.v3"
 
-	"sealdice-core/logger"
-	"sealdice-core/utils/dboperator/engine"
+	"Scardice-core/logger"
+	"Scardice-core/utils/dboperator/engine"
 )
 
 type VersionInfo struct {
@@ -77,7 +77,7 @@ type DiceManager struct { //nolint:revive
 	ServiceName          string
 	JustForTest          bool
 	JsRegistry           *require.Registry
-	UpdateSealdiceByFile func(packName string) bool // 使用指定压缩包升级海豹，如果出错返回false，如果成功进程会自动结束
+	UpdateSealdiceByFile func(packName string) bool // 使用指定压缩包升级余烬，如果出错返回false，如果成功进程会自动结束
 
 	ContainerMode bool          // 容器模式：禁用内置适配器，不允许使用内置Lagrange和旧的内置Gocq
 	CleanupFlag   atomic.Uint32 // 1 为正在清理，0为普通状态
@@ -134,7 +134,7 @@ func (dm *DiceManager) LoadDice() {
 	_ = os.MkdirAll("./data/images", 0755)
 	_ = os.MkdirAll("./data/decks", 0755)
 	_ = os.MkdirAll("./data/names", 0755)
-	_ = os.WriteFile("./data/images/sealdice.png", IconPNG, 0644)
+	_ = os.WriteFile("./data/images/Scardice.png", IconPNG, 0644)
 
 	// this can be shared by multiple runtimes
 	dm.JsRegistry = new(require.Registry)

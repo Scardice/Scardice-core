@@ -14,7 +14,7 @@ import (
 	"github.com/tidwall/buntdb"
 	"go.uber.org/zap"
 
-	"sealdice-core/dice/events"
+	"Scardice-core/dice/events"
 )
 
 const (

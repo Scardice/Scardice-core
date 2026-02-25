@@ -31,12 +31,12 @@ func serviceInstall(isInstall bool, serviceName string, user string) {
 	wd, _ := filepath.Abs(cwd)
 
 	if serviceName == "" {
-		serviceName = "sealdice"
+		serviceName = "Scardice"
 	}
 	svcConfig := &service.Config{
 		Name:             serviceName,
-		DisplayName:      "SealDice Service",
-		Description:      "SealDice: A TRPG Dice Bot Service.",
+		DisplayName:      "Scardice Service",
+		Description:      "Scardice: A TRPG Dice Bot Service.",
 		WorkingDirectory: wd,
 	}
 
@@ -49,7 +49,7 @@ func serviceInstall(isInstall bool, serviceName string, user string) {
 	s, err := service.New(prg, svcConfig)
 
 	if isInstall {
-		fmt.Fprintln(os.Stdout, "正在安装系统服务，安装完成后，SealDice将自动随系统启动")
+		fmt.Fprintln(os.Stdout, "正在安装系统服务，安装完成后，Scardice将自动随系统启动")
 		if err != nil {
 			fmt.Fprintf(os.Stdout, "安装失败: %s\n", err.Error())
 		}

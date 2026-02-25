@@ -5,7 +5,7 @@ import (
 
 	"golang.org/x/time/rate"
 
-	"sealdice-core/dice/censor"
+	"Scardice-core/dice/censor"
 )
 
 var DefaultConfig = Config{

@@ -12,8 +12,8 @@ import (
 	"strings"
 	"sync"
 
-	"sealdice-core/static"
-	"sealdice-core/utils/crypto"
+	"Scardice-core/static"
+	"Scardice-core/utils/crypto"
 )
 
 var (

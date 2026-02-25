@@ -8,11 +8,11 @@ import (
 	ds "github.com/sealdice/dicescript"
 	"gorm.io/gorm/clause"
 
-	"sealdice-core/model"
-	"sealdice-core/utils"
-	"sealdice-core/utils/constant"
-	"sealdice-core/utils/dboperator/dbutil"
-	engine2 "sealdice-core/utils/dboperator/engine"
+	"Scardice-core/model"
+	"Scardice-core/utils"
+	"Scardice-core/utils/constant"
+	"Scardice-core/utils/dboperator/dbutil"
+	engine2 "Scardice-core/utils/dboperator/engine"
 )
 
 const (

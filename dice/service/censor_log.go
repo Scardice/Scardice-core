@@ -4,11 +4,11 @@ import (
 	"encoding/json"
 	"time"
 
-	"sealdice-core/dice/censor"
-	"sealdice-core/logger"
-	"sealdice-core/model"
-	"sealdice-core/utils/constant"
-	engine2 "sealdice-core/utils/dboperator/engine"
+	"Scardice-core/dice/censor"
+	"Scardice-core/logger"
+	"Scardice-core/model"
+	"Scardice-core/utils/constant"
+	engine2 "Scardice-core/utils/dboperator/engine"
 )
 
 // 添加一个敏感词记录

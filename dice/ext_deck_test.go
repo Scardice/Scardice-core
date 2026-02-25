@@ -6,7 +6,7 @@ import (
 	"math"
 	"testing"
 
-	"sealdice-core/dice"
+	"Scardice-core/dice"
 )
 
 func TestDeck(t *testing.T) {

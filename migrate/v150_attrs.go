@@ -13,11 +13,11 @@ import (
 	ds "github.com/sealdice/dicescript"
 	"go.uber.org/zap"
 
-	"sealdice-core/dice"
-	"sealdice-core/dice/service"
-	"sealdice-core/logger"
-	"sealdice-core/model"
-	"sealdice-core/utils"
+	"Scardice-core/dice"
+	"Scardice-core/dice/service"
+	"Scardice-core/logger"
+	"Scardice-core/model"
+	"Scardice-core/utils"
 )
 
 func convertToNew(name string, ownerId string, data []byte, updatedAt int64) (*model.AttributesItemModel, error) {
@@ -423,7 +423,7 @@ func V150Upgrade() error {
 	log := zap.S().Named(logger.LogKeyDatabase)
 	dbDataPath, _ := filepath.Abs("./data/default/data.db")
 	if _, err := os.Stat(dbDataPath); errors.Is(err, os.ErrNotExist) {
-		log.Error("未找到旧版本数据库，若您启动全新海豹，可安全忽略。")
+		log.Error("未找到旧版本数据库，若您启动全新余烬，可安全忽略。")
 		return nil
 	}
 

@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"sealdice-core/message"
+	"Scardice-core/message"
 
 	"github.com/gorilla/websocket"
 	"github.com/samber/lo"
@@ -944,7 +944,7 @@ func (pa *PlatformAdapterRed) encodeMessage( /* ctx */ _ *MsgContext, content st
 	return redElems
 }
 
-// decodeMessage 将 red 格式的信息解析成海豹所需格式
+// decodeMessage 将 red 格式的信息解析成余烬所需格式
 func (pa *PlatformAdapterRed) decodeMessage(message *RedMessage) *Message {
 	log := pa.Session.Parent.Logger
 	msg := new(Message)

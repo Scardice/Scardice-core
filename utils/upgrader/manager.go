@@ -6,7 +6,7 @@ import (
 	"sort"
 	"time"
 
-	"sealdice-core/utils/dboperator/engine"
+	"Scardice-core/utils/dboperator/engine"
 )
 
 type Manager struct {
@@ -57,7 +57,7 @@ func (m *Manager) ApplyAll() error {
 		}
 
 		if err != nil {
-			return fmt.Errorf("因无法忽略的错误，升级 %s 失败: %w，请联系海豹开发者", up.ID, err)
+			return fmt.Errorf("因无法忽略的错误，升级 %s 失败: %w，请联系余烬开发者", up.ID, err)
 		}
 	}
 	return nil

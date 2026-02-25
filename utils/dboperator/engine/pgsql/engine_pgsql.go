@@ -9,9 +9,9 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
-	"sealdice-core/logger"
-	"sealdice-core/utils/cache"
-	"sealdice-core/utils/constant"
+	"Scardice-core/logger"
+	"Scardice-core/utils/cache"
+	"Scardice-core/utils/constant"
 )
 
 type PGSQLEngine struct {
@@ -81,7 +81,7 @@ func (s *PGSQLEngine) Init(ctx context.Context) error {
 
 // DBCheck DB检查
 func (s *PGSQLEngine) DBCheck() {
-	fmt.Fprintln(os.Stdout, "PostGRESQL 海豹不提供检查，请自行检查数据库！")
+	fmt.Fprintln(os.Stdout, "PostGRESQL 余烬不提供检查，请自行检查数据库！")
 }
 
 // DataDBInit 初始化

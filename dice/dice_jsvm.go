@@ -31,11 +31,11 @@ import (
 	"go.uber.org/zap"
 	"gopkg.in/elazarl/goproxy.v1"
 
-	"sealdice-core/static"
-	"sealdice-core/utils/crypto"
+	"Scardice-core/static"
+	"Scardice-core/utils/crypto"
 
-	sealcrypto "sealdice-core/utils/plugin/crypto"
-	sealws "sealdice-core/utils/plugin/websocket"
+	sealcrypto "Scardice-core/utils/plugin/crypto"
+	sealws "Scardice-core/utils/plugin/websocket"
 )
 
 var (
@@ -1077,7 +1077,7 @@ func (d *Dice) JsParseMeta(s string, installTime time.Time, rawData []byte, buil
 			case "sealVersion":
 				vc, err := semver.NewConstraint(v)
 				if err != nil {
-					errMsg = append(errMsg, fmt.Sprintf("插件「%s」限制海豹版本的格式不正确，应满足semver版本范围语法，例如「1.4.0, >=1.4.0, 1.4.5-dev」等，当前为「%s」", jsInfo.Name, v))
+					errMsg = append(errMsg, fmt.Sprintf("插件「%s」限制余烬版本的格式不正确，应满足semver版本范围语法，例如「1.4.0, >=1.4.0, 1.4.5-dev」等，当前为「%s」", jsInfo.Name, v))
 					continue
 				}
 
@@ -1092,7 +1092,7 @@ func (d *Dice) JsParseMeta(s string, installTime time.Time, rawData []byte, buil
 				}
 
 				if !verOK {
-					errMsg = append(errMsg, fmt.Sprintf("插件「%s」依赖的海豹版本限制在 %s，与海豹版本(%s)的JSAPI不兼容", jsInfo.Name, v, VERSION.String()))
+					errMsg = append(errMsg, fmt.Sprintf("插件「%s」依赖的余烬版本限制在 %s，与余烬版本(%s)的JSAPI不兼容", jsInfo.Name, v, VERSION.String()))
 				}
 			case "needCompiled":
 				jsInfo.needCompiled = true

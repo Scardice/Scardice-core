@@ -21,8 +21,8 @@ import (
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 
-	logger "sealdice-core/logger"
-	"sealdice-core/utils/procs"
+	logger "Scardice-core/logger"
+	"Scardice-core/utils/procs"
 )
 
 type LagrangeLoginInfo struct {
@@ -587,7 +587,7 @@ var signInfoJson string = `
     },
     "servers": [
       {
-        "name": "海豹",
+        "name": "余烬",
         "url": "https://lwxmagic.sealdice.com/api/sign/25765"
       },
 	  {
@@ -618,7 +618,7 @@ var signInfoJson string = `
     },
     "servers": [
       {
-        "name": "海豹",
+        "name": "余烬",
         "url": "https://lwxmagic.sealdice.com/api/sign/30366",
 		"selected": true,
 		"note": "部分地区用户可能无法连接"
@@ -651,7 +651,7 @@ var signInfoJson string = `
     },
 	"servers": [
       {
-        "name": "海豹V2",
+        "name": "余烬V2",
         "url": "https://lwxmagic3.sealdice.com/api/sign/39038"
       },
 	  {

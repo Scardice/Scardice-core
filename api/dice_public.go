@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"time"
 
-	"sealdice-core/dice"
+	"Scardice-core/dice"
 
 	"github.com/labstack/echo/v4"
 )

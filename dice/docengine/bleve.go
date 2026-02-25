@@ -12,7 +12,7 @@ import (
 	"github.com/blevesearch/bleve/v2/search/query"
 	index "github.com/blevesearch/bleve_index_api"
 
-	"sealdice-core/logger"
+	"Scardice-core/logger"
 )
 
 type BleveSearchEngine struct {

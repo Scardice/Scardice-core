@@ -9,7 +9,7 @@ import (
 
 	"github.com/fyrchik/go-shlex"
 
-	"sealdice-core/logger"
+	"Scardice-core/logger"
 )
 
 type OutHandler func(string, string) string

@@ -11,9 +11,9 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
-	"sealdice-core/logger"
-	"sealdice-core/utils/cache"
-	"sealdice-core/utils/constant"
+	"Scardice-core/logger"
+	"Scardice-core/utils/cache"
+	"Scardice-core/utils/constant"
 )
 
 type SQLiteEngine struct {

@@ -18,8 +18,8 @@ import (
 	"github.com/yuin/goldmark"
 	"go.uber.org/zap"
 
-	"sealdice-core/logger"
-	"sealdice-core/message"
+	"Scardice-core/logger"
+	"Scardice-core/message"
 )
 
 // ConsoleWriterShutUp Kook go的作者要求必须使用他们自己的logger用于构造Intent Session，并且该logger不可缺省，因此这里重新实现一个不干活的logger以保证控制台log的干净整洁
@@ -173,11 +173,11 @@ func (pa *PlatformAdapterKook) updateChannelNum() {
 
 func (pa *PlatformAdapterKook) updateGameStatus() {
 	logger := pa.Session.Parent.Logger
-	// 注释掉的部分是遗留代码，用于在kook中注册一个叫做SealDice的GameStatus，只需要执行一次因此注释掉
+	// 注释掉的部分是遗留代码，用于在kook中注册一个叫做Scardice的GameStatus，只需要执行一次因此注释掉
 	// gameupdate := new(kook.GameUpdate)
 	// gameupdate.ID = int64(768222)
 	// gameupdate.Icon = "https://img.kookapp.cn/assets/2022-12/DfYli1buyO0e80c0.png"
-	// gameupdate.Name = "SealDice"
+	// gameupdate.Name = "Scardice"
 	// _, _ = pa.IntentSession.GameUpdate(gameupdate)
 	err := pa.IntentSession.GameActivity(int64(768222))
 	if err != nil {

@@ -12,8 +12,8 @@ import (
 
 	"github.com/labstack/echo/v4"
 
-	"sealdice-core/dice"
-	"sealdice-core/logger"
+	"Scardice-core/dice"
+	"Scardice-core/logger"
 )
 
 func trayInit(dm *dice.DiceManager) {

@@ -5,9 +5,9 @@ import (
 
 	"gorm.io/gorm"
 
-	"sealdice-core/model"
-	"sealdice-core/utils/constant"
-	engine2 "sealdice-core/utils/dboperator/engine"
+	"Scardice-core/model"
+	"Scardice-core/utils/constant"
+	engine2 "Scardice-core/utils/dboperator/engine"
 )
 
 var ErrEndpointInfoUIDEmpty = errors.New("user id is empty")

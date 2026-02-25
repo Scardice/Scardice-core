@@ -6,9 +6,9 @@ import (
 
 	"go.uber.org/zap"
 
-	"sealdice-core/logger"
-	"sealdice-core/utils/dboperator/engine/sqlite"
-	"sealdice-core/utils/spinner"
+	"Scardice-core/logger"
+	"Scardice-core/utils/dboperator/engine/sqlite"
+	"Scardice-core/utils/spinner"
 )
 
 var log = zap.S().Named(logger.LogKeyDatabase)

@@ -8,7 +8,7 @@ import (
 
 	"github.com/sacOO7/gowebsocket"
 
-	"sealdice-core/message"
+	"Scardice-core/message"
 )
 
 type PlatformAdapterMinecraft struct {

@@ -3,7 +3,7 @@ package dice
 import (
 	"fmt"
 
-	"sealdice-core/dice/events"
+	"Scardice-core/dice/events"
 )
 
 func RegisterBuiltinExtCore(dice *Dice) {
@@ -11,7 +11,7 @@ func RegisterBuiltinExtCore(dice *Dice) {
 		Name:        "core",
 		Version:     "1.0.0",
 		Brief:       "核心逻辑模块，该扩展即使被关闭也会依然生效",
-		Author:      "SealDice-Team",
+		Author:      "Scardice-Team",
 		AutoActive:  true, // 是否自动开启
 		Official:    true,
 		GetDescText: GetExtensionDesc,

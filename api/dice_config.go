@@ -10,8 +10,8 @@ import (
 	"github.com/labstack/echo/v4"
 	"golang.org/x/time/rate"
 
-	"sealdice-core/dice"
-	"sealdice-core/utils"
+	"Scardice-core/dice"
+	"Scardice-core/utils"
 )
 
 type DiceConfigInfo struct {

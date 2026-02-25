@@ -64,7 +64,7 @@ func CustomReplyConfigNew(dice *Dice, filename string) *ReplyConfig {
 		Items:           []*ReplyItem{},
 		UpdateTimestamp: nowTime,
 		CreateTimestamp: nowTime,
-		Author:          []string{"无名海豹"},
+		Author:          []string{"无名余烬"},
 		Conditions:      []ReplyConditionBase{},
 	}
 	dice.CustomReplyConfig = append(dice.CustomReplyConfig, rc)

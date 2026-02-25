@@ -12,9 +12,9 @@ import (
 	milky "github.com/Szzrain/Milky-go-sdk"
 	"go.uber.org/zap"
 
-	"sealdice-core/dice/events"
-	logger "sealdice-core/logger"
-	"sealdice-core/message"
+	"Scardice-core/dice/events"
+	logger "Scardice-core/logger"
+	"Scardice-core/message"
 )
 
 type PlatformAdapterMilky struct {

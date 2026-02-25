@@ -15,13 +15,13 @@ import (
 	"gorm.io/gorm"
 	gormLogger "gorm.io/gorm/logger"
 
-	"sealdice-core/dice"
-	"sealdice-core/dice/service"
-	"sealdice-core/logger"
-	"sealdice-core/model"
-	"sealdice-core/utils"
-	"sealdice-core/utils/constant"
-	operator "sealdice-core/utils/dboperator/engine"
+	"Scardice-core/dice"
+	"Scardice-core/dice/service"
+	"Scardice-core/logger"
+	"Scardice-core/model"
+	"Scardice-core/utils"
+	"Scardice-core/utils/constant"
+	operator "Scardice-core/utils/dboperator/engine"
 )
 
 func convertToNew(name string, ownerId string, data []byte, updatedAt int64) (*model.AttributesItemModel, error) {
