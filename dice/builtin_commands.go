@@ -426,16 +426,12 @@ func (d *Dice) registerCoreCommands() {
 		Name:      "help",
 		ShortHelp: helpForHelp,
 		Help:      "帮助指令，用于查看指令帮助和helpdoc中录入的信息:\n" + helpForHelp,
-		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
-			arg := cmdArgs.GetArgN(1)
-			if arg == "" {
-				text := "余烬核心 " + VERSION.String() + "\n"
-				text += "官网: sealdice.com" + "\n"
-				text += "余烬群: 524364253" + "\n"
-				text += DiceFormatTmpl(ctx, "核心:骰子帮助文本_附加说明")
-				ReplyToSender(ctx, msg, text)
-				return CmdExecuteResult{Matched: true, Solved: true}
-			}
+			Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
+				arg := cmdArgs.GetArgN(1)
+				if arg == "" {
+					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰子帮助文本"))
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 
 			if strings.EqualFold(arg, "reload") {
 				if ctx.PrivilegeLevel < 100 {
