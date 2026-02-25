@@ -119,6 +119,11 @@ func cleanupCreate(diceManager *dice.DiceManager) func() {
 	}
 }
 
+func init() {
+	// 尽可能保留完整panic堆栈（含其他goroutine），便于定位线上崩溃。
+	debug.SetTraceback("all")
+}
+
 func deleteOldWrongFile() {
 	_ = os.Remove("./data/names/data-logs.db")
 	_ = os.Remove("./data/names/names.zip")

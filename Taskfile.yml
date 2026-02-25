@@ -34,3 +34,6 @@ tasks:
   build-only:
     cmds:
       - go build .
+  quickjs-build-check:
+    cmds:
+      - bash ./scripts/quickjs_build_check.sh native

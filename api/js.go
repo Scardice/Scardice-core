@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -14,6 +15,16 @@ import (
 
 	"Scardice-core/dice"
 )
+
+func normalizeJsEngineName(name string) string {
+	engine := strings.ToLower(strings.TrimSpace(name))
+	switch engine {
+	case "goja", "quickjs":
+		return engine
+	default:
+		return ""
+	}
+}
 
 func jsExec(c echo.Context) error {
 	if !doAuth(c) {
@@ -40,34 +51,79 @@ func jsExec(c echo.Context) error {
 		return c.String(430, err.Error())
 	}
 
-	source := "(function(exports, require, module) {" + v.Value + "\n})()"
-	loop := myDice.ExtLoopManager.GetWebLoop()
-	waitRun := make(chan int, 1)
-
-	var ret goja.Value
-	myDice.JsPrinter.RecordStart()
-	loop.RunOnLoop(func(vm *goja.Runtime) {
-		defer func() {
-			// 防止崩掉进程
-			if r := recover(); r != nil {
-				// fmt.Println("xx", r.(goja.Exception))
-				myDice.JsPrinter.Error(fmt.Sprintf("JS脚本报错: %v", r))
-			}
-			waitRun <- 1
-		}()
-		ret, err = vm.RunString(source)
-	})
-	<-waitRun
-	outputs := myDice.JsPrinter.RecordEnd()
-
 	var retFinal interface{}
-	if ret != nil {
-		retFinal = ret.Export()
+	var errText interface{}
+	source := "(function(exports, require, module) {" + v.Value + "\n})()"
+	codeJSON, _ := json.Marshal(v.Value)
+	// QuickJS 使用局部作用域注入 CommonJS 变量，避免污染共享 VM 的全局对象。
+	// 先用 direct eval 保留脚本 completion value（如 async IIFE Promise），
+	// 若命中“顶层 return”语法错误，再回退到 Function 包装兼容旧控制台写法。
+	quickJSSource := `(function(){
+	const exports = {};
+	const module = { exports: exports };
+	const require = function(_name){ throw new Error("require is not available in js/exec sandbox"); };
+	const __sd_code = ` + string(codeJSON) + `;
+	try {
+		return eval(__sd_code);
+	} catch (e) {
+		const isReturnSyntaxError = e && e.name === "SyntaxError" && /return/i.test(String(e.message || ""));
+		if (!isReturnSyntaxError) {
+			throw e;
+		}
+		const fn = new Function("exports", "require", "module", __sd_code);
+		return fn(exports, require, module);
+	}
+	})()`
+	if myDice.JsPrinter != nil {
+		myDice.JsPrinter.RecordStart()
 	}
 
-	var errText interface{}
-	if err != nil {
-		errText = err.Error()
+	if myDice.JsEngineEffective == "quickjs" {
+		// QuickJS 走统一脚本引擎接口，避免依赖 Goja 的 eventloop。
+		if myDice.ScriptEngine == nil {
+			errText = "QuickJS引擎未初始化"
+		} else if evalWithRet, ok := myDice.ScriptEngine.(interface {
+			EvalWithResult(code string) (any, error)
+		}); ok {
+			retFinal, err = evalWithRet.EvalWithResult(quickJSSource)
+			if err != nil {
+				errText = err.Error()
+			}
+		} else if err = myDice.ScriptEngine.Eval(quickJSSource); err != nil {
+			errText = err.Error()
+		}
+	} else {
+		if myDice.ExtLoopManager == nil || myDice.ExtLoopManager.GetWebLoop() == nil {
+			errText = "Goja事件循环未初始化"
+		} else {
+			loop := myDice.ExtLoopManager.GetWebLoop()
+			waitRun := make(chan int, 1)
+			var ret goja.Value
+			loop.RunOnLoop(func(vm *goja.Runtime) {
+				defer func() {
+					// 防止崩掉进程
+					if r := recover(); r != nil {
+						if myDice.JsPrinter != nil {
+							myDice.JsPrinter.InternalError(fmt.Sprintf("JS脚本报错: %v", r))
+						}
+					}
+					waitRun <- 1
+				}()
+				ret, err = vm.RunString(source)
+			})
+			<-waitRun
+			if ret != nil {
+				retFinal = ret.Export()
+			}
+			if err != nil {
+				errText = err.Error()
+			}
+		}
+	}
+
+	outputs := []string{}
+	if myDice.JsPrinter != nil {
+		outputs = myDice.JsPrinter.RecordEnd()
 	}
 
 	resp := c.JSON(200, map[string]interface{}{
@@ -247,6 +303,88 @@ func jsStatus(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]interface{}{
 		"result": true,
 		"status": myDice.Config.JsEnable,
+	})
+}
+
+func jsEngineGet(c echo.Context) error {
+	current := normalizeJsEngineName(myDice.Config.JsEngine)
+	if current == "" {
+		current = "goja"
+	}
+
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"result":          true,
+		"engine":          current,
+		"effectiveEngine": myDice.JsEngineEffective,
+		"fallbackReason":  myDice.JsEngineFallback,
+		"options":         []string{"goja", "quickjs"},
+	})
+}
+
+func jsEngineSet(c echo.Context) error {
+	if !doAuth(c) {
+		return c.JSON(http.StatusForbidden, nil)
+	}
+	if dm.JustForTest {
+		return c.JSON(200, map[string]interface{}{
+			"testMode": true,
+		})
+	}
+
+	req := struct {
+		Engine string `json:"engine"`
+	}{}
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]interface{}{
+			"result": false,
+			"err":    err.Error(),
+		})
+	}
+
+	engine := normalizeJsEngineName(req.Engine)
+	if engine == "" {
+		return c.JSON(http.StatusBadRequest, map[string]interface{}{
+			"result": false,
+			"err":    "engine仅支持 goja 或 quickjs",
+		})
+	}
+
+	currentCfgEngine := normalizeJsEngineName(myDice.Config.JsEngine)
+	currentEffective := normalizeJsEngineName(myDice.JsEngineEffective)
+	if currentCfgEngine == engine && currentEffective == engine {
+		return c.JSON(http.StatusOK, map[string]interface{}{
+			"result":  true,
+			"engine":  engine,
+			"changed": false,
+		})
+	}
+
+	reloaded := false
+	if myDice.Config.JsEnable {
+		locked := myDice.JsReloadLock.TryLock()
+		if !locked {
+			return c.JSON(http.StatusConflict, map[string]interface{}{
+				"result": false,
+				"err":    "当前有其他JS重载任务正在执行，请稍后重试",
+			})
+		}
+		defer myDice.JsReloadLock.Unlock()
+	}
+
+	myDice.Config.JsEngine = engine
+	myDice.MarkModified()
+	myDice.Save(false)
+
+	if myDice.Config.JsEnable {
+		myDice.JsReload()
+		reloaded = true
+	}
+
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"result":   true,
+		"engine":   engine,
+		"changed":  true,
+		"reloaded": reloaded,
 	})
 }
 

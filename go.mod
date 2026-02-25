@@ -4,7 +4,6 @@ go 1.24.6
 
 require (
 	github.com/Masterminds/semver/v3 v3.4.0
-	github.com/Milly/go-base2048 v0.1.0
 	github.com/PaienNate/pineutil v0.0.0-20251018153346-e4acff10b752
 	github.com/ShiraazMoollatjie/goluhn v0.0.0-20211017190329-0d86158c056a
 	github.com/Szzrain/DingTalk-go v0.0.8-alpha
@@ -17,6 +16,7 @@ require (
 	github.com/avast/retry-go v3.0.0+incompatible
 	github.com/blevesearch/bleve/v2 v2.5.2
 	github.com/blevesearch/bleve_index_api v1.2.10
+	github.com/buke/quickjs-go v0.6.10
 	github.com/bwmarrin/discordgo v0.29.0
 	github.com/bytedance/sonic v1.14.1
 	github.com/danielgtaylor/huma/v2 v2.34.1
@@ -77,13 +77,12 @@ require (
 	github.com/tidwall/buntdb v1.3.2
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5
-	github.com/vmihailenco/msgpack v4.0.4+incompatible
 	github.com/xuri/excelize/v2 v2.10.0
 	github.com/yuin/goldmark v1.7.13
 	go.etcd.io/bbolt v1.4.3
 	go.uber.org/zap v1.27.0
 	golang.org/x/crypto v0.45.0
-	golang.org/x/exp v0.0.0-20250911091902-df9299821621
+	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546
 	golang.org/x/sys v0.38.0
 	golang.org/x/text v0.34.0
 	golang.org/x/time v0.14.0
@@ -213,7 +212,6 @@ require (
 	golang.org/x/net v0.47.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/term v0.37.0 // indirect
-	google.golang.org/appengine v1.6.8 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
 	gopkg.in/alexcesaro/quotedprintable.v3 v3.0.0-20150716171945-2caba252f4dc // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect

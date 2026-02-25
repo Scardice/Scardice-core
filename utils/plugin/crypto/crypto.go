@@ -442,7 +442,8 @@ func encryptData(rt *goja.Runtime, algorithm string, algObj *goja.Object, key *c
 				}
 			}
 		}
-		return gcm.Seal(nil, iv, data, aad), nil
+		out := gcm.Seal(nil, iv, data, aad)
+		return out, nil
 	case "AES-CTR":
 		if len(key.SecretKey) == 0 {
 			return nil, errors.New("AES-CTR requires a secret key")
@@ -509,7 +510,11 @@ func encryptData(rt *goja.Runtime, algorithm string, algObj *goja.Object, key *c
 		if pub == nil {
 			return nil, errors.New("RSAES-PKCS1-v1_5 requires an RSA key")
 		}
-		return rsa.EncryptPKCS1v15(rand.Reader, pub, data)
+		out, encErr := rsa.EncryptPKCS1v15(rand.Reader, pub, data)
+		if encErr != nil {
+			return nil, encErr
+		}
+		return out, nil
 	default:
 		return nil, fmt.Errorf("unsupported encrypt algorithm: %s", algorithm)
 	}
@@ -615,7 +620,11 @@ func decryptData(rt *goja.Runtime, algorithm string, algObj *goja.Object, key *c
 				}
 			}
 		}
-		return gcm.Open(nil, iv, data, aad)
+		out, decErr := gcm.Open(nil, iv, data, aad)
+		if decErr != nil {
+			return nil, decErr
+		}
+		return out, nil
 	case "AES-CTR":
 		if len(key.SecretKey) == 0 {
 			return nil, errors.New("AES-CTR requires a secret key")
@@ -674,7 +683,11 @@ func decryptData(rt *goja.Runtime, algorithm string, algObj *goja.Object, key *c
 		if key.RSAPrivate == nil {
 			return nil, errors.New("RSAES-PKCS1-v1_5 requires a private RSA key")
 		}
-		return rsa.DecryptPKCS1v15(rand.Reader, key.RSAPrivate, data)
+		out, decErr := rsa.DecryptPKCS1v15(rand.Reader, key.RSAPrivate, data)
+		if decErr != nil {
+			return nil, decErr
+		}
+		return out, nil
 	default:
 		return nil, fmt.Errorf("unsupported decrypt algorithm: %s", algorithm)
 	}

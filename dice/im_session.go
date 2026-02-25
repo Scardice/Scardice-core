@@ -1013,6 +1013,15 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 						if i.OnNotCommandReceived != nil {
 							notCommandReceiveCall := func() {
 								if i.IsJsExt {
+									if s.Parent.JsEngineEffective == "quickjs" {
+										defer func() {
+											if r := recover(); r != nil {
+												mctx.Dice.Logger.Errorf("扩展<%s>处理非指令消息异常: %v 堆栈: %v", i.Name, r, string(debug.Stack()))
+											}
+										}()
+										i.OnNotCommandReceived(mctx, msg)
+										return
+									}
 									// 先判断运行环境
 									loop, err := d.ExtLoopManager.GetLoop(i.JSLoopVersion)
 									if err != nil {
@@ -1302,6 +1311,15 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 					if i.OnNotCommandReceived != nil {
 						notCommandReceiveCall := func() {
 							if i.IsJsExt {
+								if s.Parent.JsEngineEffective == "quickjs" {
+									defer func() {
+										if r := recover(); r != nil {
+											mctx.Dice.Logger.Errorf("扩展<%s>处理非指令消息异常: %v 堆栈: %v", i.Name, r, string(debug.Stack()))
+										}
+									}()
+									i.OnNotCommandReceived(mctx, msg)
+									return
+								}
 								loop, err := d.ExtLoopManager.GetLoop(i.JSLoopVersion)
 								if err != nil {
 									// 打个DEBUG日志？
@@ -2021,27 +2039,39 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 		}
 
 		var ret CmdExecuteResult
-		// 如果是js命令，那么加锁
+		// 如果是 JS 命令：Goja 走旧 loop，QuickJS 直接走桥接 Solve。
 		if item.IsJsSolveFunc {
-			loop, err := s.Parent.ExtLoopManager.GetLoop(item.JSLoopVersion)
-			if err != nil {
-				// 打个DEBUG日志？
-				s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境已经过期: %v", item.Name, err)
-				return false
-			}
-			waitRun := make(chan int, 1)
-			loop.RunOnLoop(func(vm *goja.Runtime) {
-				defer func() {
-					if r := recover(); r != nil {
-						// log.Errorf("异常: %v 堆栈: %v", r, string(debug.Stack()))
-						ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", r))
-					}
-					waitRun <- 1
+			if s.Parent.JsEngineEffective == "quickjs" {
+				// QuickJS 命令 solve 已在 item.Solve 内通过 ScriptEngine 桥接，不再依赖 Goja loop。
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", r))
+						}
+					}()
+					ret = item.Solve(ctx, msg, cmdArgs)
 				}()
+			} else {
+				loop, err := s.Parent.ExtLoopManager.GetLoop(item.JSLoopVersion)
+				if err != nil {
+					// 打个DEBUG日志？
+					s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境已经过期: %v", item.Name, err)
+					return false
+				}
+				waitRun := make(chan int, 1)
+				loop.RunOnLoop(func(vm *goja.Runtime) {
+					defer func() {
+						if r := recover(); r != nil {
+							// log.Errorf("异常: %v 堆栈: %v", r, string(debug.Stack()))
+							ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", r))
+						}
+						waitRun <- 1
+					}()
 
-				ret = item.Solve(ctx, msg, cmdArgs)
-			})
-			<-waitRun
+					ret = item.Solve(ctx, msg, cmdArgs)
+				})
+				<-waitRun
+			}
 		} else {
 			ret = item.Solve(ctx, msg, cmdArgs)
 		}

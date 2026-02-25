@@ -324,6 +324,11 @@ func (i *ExtInfo) CallOnGroupLeave(d *Dice, ctx *MsgContext, event *events.Group
 func (i *ExtInfo) callWithJsCheck(d *Dice, f func()) {
 	if i.IsJsExt {
 		if d.Config.JsEnable {
+			// QuickJS 路径不使用 goja eventloop，直接执行回调。
+			if d.JsEngineEffective == "quickjs" {
+				f()
+				return
+			}
 			loop, err := d.ExtLoopManager.GetLoop(i.JSLoopVersion)
 			if err != nil {
 				i.dice.Logger.Errorf("扩展<%s>运行环境已经过期: %v", i.Name, err)

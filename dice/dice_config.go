@@ -210,6 +210,7 @@ type BanConfig struct {
 
 type JsConfig struct {
 	JsEnable          bool            `json:"jsEnable"          yaml:"jsEnable"`
+	JsEngine          string          `json:"jsEngine"          yaml:"jsEngine"`          // 插件脚本引擎类型: goja/quickjs
 	DisabledJsScripts map[string]bool `json:"disabledJsScripts" yaml:"disabledJsScripts"` // 作为set
 }
 

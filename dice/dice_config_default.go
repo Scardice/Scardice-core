@@ -74,6 +74,7 @@ var DefaultConfig = Config{
 	},
 	JsConfig{
 		JsEnable:          true,
+		JsEngine:          "goja",
 		DisabledJsScripts: make(map[string]bool),
 	},
 	StoryLogConfig{
