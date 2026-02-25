@@ -795,8 +795,8 @@ func setupBaseTextTemplate(d *Dice) {
 			"骰子名字": {
 				{"余烬核心", 1},
 			},
-			"骰子帮助文本_附加说明": {
-				{"========\n.help 骰点/骰主/协议/娱乐/跑团/扩展/查询/其他\n========\n一只余烬罢了", 1},
+			"骰子帮助文本": {
+				{"余烬核心 {常量:VERSION}\n暂时没有官网\n也暂时没有群\n========\n.help 骰点/骰主/协议/娱乐/跑团/扩展/查询/其他\n========\n只是余烬罢了", 1},
 			},
 			"骰子帮助文本_骰主": {
 				{"骰主很神秘，什么都没有说——", 1},
@@ -1516,7 +1516,7 @@ func setupBaseTextTemplate(d *Dice) {
 				SubType:  "通用",
 				TopOrder: 1,
 			},
-			"骰子帮助文本_附加说明": {
+			"骰子帮助文本": {
 				SubType:  ".help",
 				TopOrder: 1,
 			},
@@ -2028,12 +2028,38 @@ func loadTextTemplate(d *Dice, fn string) {
 	}
 }
 
+func migrateHelpTextKey(d *Dice) bool {
+	coreTexts, exists := d.TextMapRaw["核心"]
+	if !exists || coreTexts == nil {
+		return false
+	}
+
+	const oldKey = "骰子帮助文本_附加说明"
+	const newKey = "骰子帮助文本"
+
+	oldVal, oldExists := coreTexts[oldKey]
+	if !oldExists || len(oldVal) == 0 {
+		return false
+	}
+	if _, newExists := coreTexts[newKey]; newExists {
+		delete(coreTexts, oldKey)
+		return true
+	}
+
+	coreTexts[newKey] = oldVal
+	delete(coreTexts, oldKey)
+	return true
+}
+
 func setupTextTemplate(d *Dice) {
 	// 加载预设
 	setupBaseTextTemplate(d)
 
 	// 加载硬盘设置
 	loadTextTemplate(d, "configs/text-template.yaml")
+	if migrateHelpTextKey(d) {
+		d.Logger.Info("检测到旧文案键“核心:骰子帮助文本_附加说明”，已自动迁移为“核心:骰子帮助文本”")
+	}
 
 	d.SaveText()
 	d.GenerateTextMap()
