@@ -436,6 +436,7 @@ func (d *Dice) JsInit() {
 					// Stop old task
 					if config.task != nil {
 						config.task.Off()
+						ei.taskList = removeTaskFromList(ei.taskList, config.task)
 					}
 				}
 			}
@@ -520,17 +521,74 @@ func (d *Dice) JsInit() {
 				d.ConfigManager.RegisterPluginConfig(ei.Name, config)
 			}
 
-			if key == "" || taskType == "once" {
-				// once 任务始终只保留内存引用；其他任务在无 key 时也需要保留引用
-				if ei.taskList == nil {
-					ei.taskList = make([]*JsScriptTask, 0)
-					ei.taskList = append(ei.taskList, &task)
-				} else {
-					ei.taskList = append(ei.taskList, &task)
+			if ei.taskList == nil {
+				ei.taskList = make([]*JsScriptTask, 0)
+			}
+			ei.taskList = append(ei.taskList, &task)
+
+			return &task
+		})
+		_ = ext.Set("removeTask", func(ei *ExtInfo, taskType string, key string) int {
+			if ei.dice == nil {
+				panic(errors.New("请先完成此扩展的注册"))
+			}
+
+			taskType, key = normalizeTaskSelector(taskType, key)
+			taskSet := make(map[*JsScriptTask]struct{})
+			configKeySet := make(map[string]struct{})
+
+			for _, task := range ei.taskList {
+				if matchTaskSelector(task, taskType, key) {
+					taskSet[task] = struct{}{}
+					if task.key != "" && task.taskType != "once" {
+						configKeySet[task.key] = struct{}{}
+					}
 				}
 			}
 
-			return &task
+			cm := d.ConfigManager
+			cm.lock.RLock()
+			pluginConfig := cm.Plugins[ei.Name]
+			if pluginConfig != nil {
+				for cfgKey, cfgItem := range pluginConfig.Configs {
+					if cfgItem == nil {
+						continue
+					}
+					cfgTaskType, isTask := configTypeToTaskType(cfgItem.Type)
+					if !isTask || !taskTypeMatched(taskType, cfgTaskType) || !keyMatched(key, cfgKey) {
+						continue
+					}
+					configKeySet[cfgKey] = struct{}{}
+					if cfgItem.task != nil {
+						taskSet[cfgItem.task] = struct{}{}
+					}
+				}
+			}
+			cm.lock.RUnlock()
+
+			for task := range taskSet {
+				_ = task.Off()
+			}
+
+			if len(taskSet) > 0 {
+				filtered := make([]*JsScriptTask, 0, len(ei.taskList))
+				for _, task := range ei.taskList {
+					if _, hit := taskSet[task]; !hit {
+						filtered = append(filtered, task)
+					}
+				}
+				ei.taskList = filtered
+			}
+
+			if len(configKeySet) > 0 {
+				keys := make([]string, 0, len(configKeySet))
+				for cfgKey := range configKeySet {
+					keys = append(keys, cfgKey)
+				}
+				d.ConfigManager.UnregisterConfig(ei.Name, keys...)
+			}
+
+			return len(taskSet)
 		})
 
 		// COC规则自定义
@@ -1710,6 +1768,59 @@ func parseTaskOnceExpr(expr string) (time.Time, string, error) {
 		executeAt = now.Add(time.Duration(delayOrTs) * time.Millisecond)
 	}
 	return executeAt, strconv.FormatInt(executeAt.UnixMilli(), 10), nil
+}
+
+func normalizeTaskSelector(taskType string, key string) (string, string) {
+	taskType = strings.ToLower(strings.TrimSpace(taskType))
+	if taskType == "" {
+		taskType = "*"
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		key = "*"
+	}
+	return taskType, key
+}
+
+func taskTypeMatched(selector string, taskType string) bool {
+	return selector == "*" || selector == strings.ToLower(taskType)
+}
+
+func keyMatched(selector string, key string) bool {
+	return selector == "*" || selector == key
+}
+
+func matchTaskSelector(task *JsScriptTask, taskType string, key string) bool {
+	if task == nil {
+		return false
+	}
+	return taskTypeMatched(taskType, task.taskType) && keyMatched(key, task.key)
+}
+
+func configTypeToTaskType(configType string) (string, bool) {
+	switch configType {
+	case "task:cron":
+		return "cron", true
+	case "task:daily":
+		return "daily", true
+	case "task:once":
+		return "once", true
+	default:
+		return "", false
+	}
+}
+
+func removeTaskFromList(taskList []*JsScriptTask, target *JsScriptTask) []*JsScriptTask {
+	if len(taskList) == 0 || target == nil {
+		return taskList
+	}
+	filtered := make([]*JsScriptTask, 0, len(taskList))
+	for _, task := range taskList {
+		if task != target {
+			filtered = append(filtered, task)
+		}
+	}
+	return filtered
 }
 
 // parseTaskTime 将 24 小时时间转换为 cron 表达式
