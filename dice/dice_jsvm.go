@@ -430,7 +430,7 @@ func (d *Dice) JsInit() {
 
 			task := JsScriptTask{cron: scriptCron, key: key, task: fn, lock: ei.dice.JsScriptCronLock, logger: ei.dice.Logger}
 			expr := value
-			if key != "" {
+			if key != "" && taskType != "once" {
 				if config := d.ConfigManager.getConfig(ei.Name, key); config != nil {
 					expr = config.Value.(string)
 					// Stop old task
@@ -477,11 +477,24 @@ func (d *Dice) JsInit() {
 				task.cronExpr = cronExpr
 				task.entryID = &entryID
 				ei.dice.Logger.Infof("插件注册定时任务：daily=%s", expr)
+			case "once":
+				onceAt, normalizedExpr, err := parseTaskOnceExpr(expr)
+				if err != nil {
+					panic("插件注册定时任务失败：" + err.Error())
+				}
+				task.taskType = taskType
+				task.rawValue = expr
+				task.onceAt = onceAt
+				expr = normalizedExpr // 保存为绝对执行时间戳，避免重载后延迟重复计算
+				if !task.On() {
+					panic("插件注册定时任务失败：一次任务注册失败")
+				}
+				ei.dice.Logger.Infof("插件注册定时任务：once=%s", expr)
 			default:
-				panic(fmt.Sprintf("错误的任务类型：%s，当前仅支持 cron|daily", taskType))
+				panic(fmt.Sprintf("错误的任务类型：%s，当前仅支持 cron|daily|once", taskType))
 			}
 
-			if key != "" {
+			if key != "" && taskType != "once" {
 				config := d.ConfigManager.getConfig(ei.Name, key)
 
 				switch taskType {
@@ -507,8 +520,8 @@ func (d *Dice) JsInit() {
 				d.ConfigManager.RegisterPluginConfig(ei.Name, config)
 			}
 
-			if key == "" {
-				// 如果不提供 key，手动避免 task 失去引用
+			if key == "" || taskType == "once" {
+				// once 任务始终只保留内存引用；其他任务在无 key 时也需要保留引用
 				if ei.taskList == nil {
 					ei.taskList = make([]*JsScriptTask, 0)
 					ei.taskList = append(ei.taskList, &task)
@@ -1476,11 +1489,14 @@ type JsScriptTask struct {
 
 	cron     *cron.Cron
 	cronExpr string
+	onceAt   time.Time
+	timer    *time.Timer
 	task     func(JsScriptTaskCtx)
 	entryID  *cron.EntryID
 	lock     *sync.Mutex
 
-	logger *zap.SugaredLogger
+	stateLock sync.Mutex
+	logger    *zap.SugaredLogger
 }
 
 type JsScriptTaskCtx struct {
@@ -1504,35 +1520,86 @@ func (t *JsScriptTask) run() {
 }
 
 func (t *JsScriptTask) On() bool {
-	if t.entryID != nil {
+	t.stateLock.Lock()
+	defer t.stateLock.Unlock()
+
+	switch t.taskType {
+	case "once":
+		if t.timer != nil {
+			return true
+		}
+		delay := time.Until(t.onceAt)
+		if delay < 0 {
+			delay = 0
+		}
+		var timer *time.Timer
+		timer = time.AfterFunc(delay, func() {
+			t.run()
+			t.stateLock.Lock()
+			if t.timer == timer {
+				t.timer = nil
+			}
+			t.stateLock.Unlock()
+		})
+		t.timer = timer
 		return true
-	}
-	entryID, err := t.cron.AddFunc(t.cronExpr, func() {
-		t.run()
-	})
-	if err != nil {
+	case "cron", "daily":
+		if t.entryID != nil {
+			return true
+		}
+		entryID, err := t.cron.AddFunc(t.cronExpr, func() {
+			t.run()
+		})
+		if err != nil {
+			return false
+		}
+		t.entryID = &entryID
+		return true
+	default:
 		return false
 	}
-	t.entryID = &entryID
-	return true
 }
 
 func (t *JsScriptTask) Off() bool {
-	if t.entryID == nil {
+	t.stateLock.Lock()
+	defer t.stateLock.Unlock()
+
+	switch t.taskType {
+	case "once":
+		if t.timer == nil {
+			return true
+		}
+		t.timer.Stop()
+		t.timer = nil
 		return true
+	case "cron", "daily":
+		if t.entryID == nil {
+			return true
+		}
+		t.cron.Remove(*t.entryID)
+		t.entryID = nil
+		return true
+	default:
+		return false
 	}
-	t.cron.Remove(*t.entryID)
-	t.entryID = nil
-	return true
 }
 
 func (t *JsScriptTask) reset(expr string) error {
-	if t.entryID != nil {
+	var wasScheduled bool
+	t.stateLock.Lock()
+	if t.taskType == "once" {
+		wasScheduled = t.timer != nil
+	} else {
+		wasScheduled = t.entryID != nil
+	}
+	t.stateLock.Unlock()
+
+	if wasScheduled {
 		t.Off()
-		defer t.On()
 	}
 
 	t.rawValue = expr
+	shouldOn := wasScheduled
 	switch t.taskType {
 	case "cron":
 		cronExpr, err := parseTaskCronExpr(expr)
@@ -1546,8 +1613,20 @@ func (t *JsScriptTask) reset(expr string) error {
 			return err
 		}
 		t.cronExpr = cronExpr
+	case "once":
+		onceAt, normalizedExpr, err := parseTaskOnceExpr(expr)
+		if err != nil {
+			return err
+		}
+		t.onceAt = onceAt
+		t.rawValue = normalizedExpr
+		shouldOn = true // once 任务重置后应重新挂载一次执行
 	default:
 		return fmt.Errorf("unknown task type %s", t.taskType)
+	}
+
+	if shouldOn && !t.On() {
+		return errors.New("重新注册任务失败")
 	}
 	return nil
 }
@@ -1591,6 +1670,46 @@ func parseTaskCronExpr(expr string) (string, error) {
 	}
 
 	return normalized, nil
+}
+
+func parseTaskOnceExpr(expr string) (time.Time, string, error) {
+	const maxDelayMs int64 = int64(365*24*time.Hour) / int64(time.Millisecond)
+	const maxPastDuration = 365 * 24 * time.Hour
+
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return time.Time{}, "", errors.New("once 表达式不能为空")
+	}
+
+	delayOrTs, err := strconv.ParseInt(expr, 10, 64)
+	if err != nil {
+		return time.Time{}, "", errors.New("once 仅支持毫秒延迟或 13 位毫秒时间戳")
+	}
+	if delayOrTs < 0 {
+		return time.Time{}, "", errors.New("once 不支持负数")
+	}
+
+	now := time.Now()
+	digitLen := len(strings.TrimLeft(expr, "+-"))
+	isTimestamp := digitLen == 13
+
+	// 智能判断：非13位但超过1年延迟时，优先尝试按时间戳解释。
+	if !isTimestamp && delayOrTs > maxDelayMs {
+		ts := time.UnixMilli(delayOrTs)
+		if ts.After(now.Add(-maxPastDuration)) {
+			isTimestamp = true
+		} else {
+			return time.Time{}, "", errors.New("once 延迟超过1年，请使用13位毫秒时间戳")
+		}
+	}
+
+	var executeAt time.Time
+	if isTimestamp {
+		executeAt = time.UnixMilli(delayOrTs)
+	} else {
+		executeAt = now.Add(time.Duration(delayOrTs) * time.Millisecond)
+	}
+	return executeAt, strconv.FormatInt(executeAt.UnixMilli(), 10), nil
 }
 
 // parseTaskTime 将 24 小时时间转换为 cron 表达式
