@@ -47,6 +47,16 @@ var (
 
 var taskTimeRe = regexp.MustCompile(`^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$`)
 
+var taskCronParser = cron.NewParser(
+	cron.SecondOptional |
+		cron.Minute |
+		cron.Hour |
+		cron.Dom |
+		cron.Month |
+		cron.Dow |
+		cron.Descriptor,
+)
+
 type PrinterFunc struct {
 	d        *Dice
 	isRecord bool
@@ -103,7 +113,7 @@ func (d *Dice) JsInit() {
 	reg.RegisterNativeModule("console", console.RequireWithPrinter(printer))
 	reg.RegisterNativeModule("crypto", sealcrypto.Require)
 
-	d.JsScriptCron = cron.New()
+	d.JsScriptCron = cron.New(cron.WithParser(taskCronParser))
 	d.JsScriptCronLock = &sync.Mutex{}
 	d.JsScriptCron.Start()
 	// 单独给WebSocket一个Logger
@@ -432,7 +442,12 @@ func (d *Dice) JsInit() {
 
 			switch taskType {
 			case "cron":
-				entryID, err := scriptCron.AddFunc(expr, func() {
+				cronExpr, err := parseTaskCronExpr(expr)
+				if err != nil {
+					panic("插件注册定时任务失败：" + err.Error())
+				}
+
+				entryID, err := scriptCron.AddFunc(cronExpr, func() {
 					task.run()
 				})
 				if err != nil {
@@ -440,9 +455,10 @@ func (d *Dice) JsInit() {
 				}
 				task.taskType = taskType
 				task.rawValue = expr
-				task.cronExpr = expr
+				task.cronExpr = cronExpr
+				expr = cronExpr // 保持配置值为规范化后的有效表达式
 				task.entryID = &entryID
-				ei.dice.Logger.Infof("插件注册定时任务：cron=%s", expr)
+				ei.dice.Logger.Infof("插件注册定时任务：cron=%s", cronExpr)
 			case "daily":
 				// 支持每天定时触发，24 小时表示
 				cronExpr, err := parseTaskTime(expr)
@@ -1519,7 +1535,11 @@ func (t *JsScriptTask) reset(expr string) error {
 	t.rawValue = expr
 	switch t.taskType {
 	case "cron":
-		t.cronExpr = expr
+		cronExpr, err := parseTaskCronExpr(expr)
+		if err != nil {
+			return err
+		}
+		t.cronExpr = cronExpr
 	case "daily":
 		cronExpr, err := parseTaskTime(expr)
 		if err != nil {
@@ -1530,6 +1550,47 @@ func (t *JsScriptTask) reset(expr string) error {
 		return fmt.Errorf("unknown task type %s", t.taskType)
 	}
 	return nil
+}
+
+func parseTaskCronExpr(expr string) (string, error) {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return "", errors.New("cron 表达式不能为空")
+	}
+
+	if strings.HasPrefix(expr, "@") {
+		lowerExpr := strings.ToLower(expr)
+		switch lowerExpr {
+		case "@yearly", "@annually", "@monthly", "@weekly", "@daily", "@midnight", "@hourly":
+			if _, err := taskCronParser.Parse(lowerExpr); err != nil {
+				return "", fmt.Errorf("cron 描述符解析失败: %w", err)
+			}
+			return lowerExpr, nil
+		default:
+			// 向后兼容 @every 语法
+			fields := strings.Fields(lowerExpr)
+			if len(fields) == 2 && fields[0] == "@every" {
+				normalized := strings.Join(fields, " ")
+				if _, err := taskCronParser.Parse(normalized); err != nil {
+					return "", fmt.Errorf("cron 描述符解析失败: %w", err)
+				}
+				return normalized, nil
+			}
+			return "", errors.New("仅支持 @yearly/@annually/@monthly/@weekly/@daily/@midnight/@hourly（以及兼容 @every）")
+		}
+	}
+
+	fields := strings.Fields(expr)
+	if len(fields) != 5 && len(fields) != 6 {
+		return "", fmt.Errorf("cron 表达式仅支持 5 位或 6 位(含秒)，当前为 %d 位", len(fields))
+	}
+
+	normalized := strings.Join(fields, " ")
+	if _, err := taskCronParser.Parse(normalized); err != nil {
+		return "", fmt.Errorf("cron 表达式解析失败: %w", err)
+	}
+
+	return normalized, nil
 }
 
 // parseTaskTime 将 24 小时时间转换为 cron 表达式
