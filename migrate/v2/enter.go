@@ -9,6 +9,7 @@ import (
 	v144 "Scardice-core/migrate/v2/v144"
 	v150 "Scardice-core/migrate/v2/v150"
 	v151 "Scardice-core/migrate/v2/v151"
+	v160 "Scardice-core/migrate/v2/v160"
 	operator "Scardice-core/utils/dboperator/engine"
 	upgrade "Scardice-core/utils/upgrader"
 	"Scardice-core/utils/upgrader/store"
@@ -31,6 +32,8 @@ func InitUpgrader(operator operator.DatabaseOperator) error {
 	mgr.Register(v150.V150FixGroupInfoMigration)
 	// v151注册
 	mgr.Register(v151.V151GORMCleanMigration)
+	// v160注册
+	mgr.Register(v160.V160LogIDZeroCleanMigration)
 	err := mgr.ApplyAll()
 	if err != nil {
 		return err
