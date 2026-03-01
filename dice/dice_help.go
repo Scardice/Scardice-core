@@ -1,6 +1,8 @@
 package dice
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -76,6 +79,8 @@ const (
 )
 
 const HelpConfigFilename = "help_config.yaml"
+const helpIndexManifestPath = "./data/_index/manifest.json"
+const helpIndexManifestVersion = 1
 
 type HelpConfig struct {
 	Aliases map[string][]string `json:"aliases" yaml:"aliases"`
@@ -89,29 +94,31 @@ type HelpDocFormat struct {
 	Helpdoc map[string]string `json:"helpdoc"`
 }
 
-func (m *HelpManager) loadSearchEngine() {
+func (m *HelpManager) loadSearchEngineWithMode(reuse bool) error {
 	if runtime.GOARCH == "arm64" {
 		// 等木落测试，测试之前先不实现这个Clover模式，如果直接就能用，那也不必再实现他了
 		m.EngineType = BleveSearch
 	}
-	// 删除旧版本数据，这里先不改，先集中精力测试BleveSearch
-	indexDir := "./data/_index"
-	_ = os.RemoveAll(indexDir)
-	indexDir = "./_help_cache"
-	_ = os.RemoveAll(indexDir)
+	if !reuse {
+		// 删除旧版本数据，这里先不改，先集中精力测试BleveSearch
+		indexDir := "./data/_index"
+		_ = os.RemoveAll(indexDir)
+		indexDir = "./_help_cache"
+		_ = os.RemoveAll(indexDir)
+	}
 	switch m.EngineType {
 	case Clover:
 	case BleveSearch:
-		engine, err := docengine.NewBleveSearchEngine()
+		engine, err := docengine.NewBleveSearchEngine(reuse)
 		if err != nil {
-			logger.M().Errorf("初始化帮助文档失败，帮助文档不可用!")
-			return
+			return err
 		}
 		m.searchEngine = engine
 	default:
 		// 如果BleveSearch兼容性差，到时候全部回退到Clover查询
-		panic("unhandled default case")
+		return errors.New("unhandled default case")
 	}
+	return nil
 }
 
 func (m *HelpManager) Close() {
@@ -123,7 +130,26 @@ func (m *HelpManager) Close() {
 
 func (m *HelpManager) Load(internalCmdMap CmdMapCls, extList []*ExtInfo) {
 	log := logger.M()
-	m.loadSearchEngine()
+	reuse, manifest := m.shouldReuseHelpIndex(internalCmdMap, extList)
+	if err := m.loadSearchEngineWithMode(reuse); err != nil && reuse {
+		log.Warnf("[帮助文档] 索引复用失败，改为重建: %v", err)
+		reuse = false
+		if err2 := m.loadSearchEngineWithMode(false); err2 != nil {
+			log.Errorf("初始化帮助文档失败，帮助文档不可用! %v", err2)
+			return
+		}
+	} else if err != nil {
+		log.Errorf("初始化帮助文档失败，帮助文档不可用! %v", err)
+		return
+	}
+
+	if reuse {
+		m.HelpDocTree = m.buildHelpDocTreeOnly()
+		m.loadHelpConfigIfExists()
+		m.CurID = m.searchEngine.GetTotalID()
+		log.Infof("[帮助文档] 复用现有索引完成，共计加载条目:%d", m.CurID)
+		return
+	}
 
 	_ = m.AddItem(docengine.HelpTextItem{
 		Group: HelpBuiltinGroup,
@@ -245,6 +271,10 @@ func (m *HelpManager) Load(internalCmdMap CmdMapCls, extList []*ExtInfo) {
 	m.CurID = m.searchEngine.GetTotalID()
 	elapsed := time.Since(start) // 计算执行时间
 	log.Infof("帮助文档加载完毕，共耗费时间: %s 共计加载条目:%d\n", elapsed, m.CurID)
+	manifest.TotalID = m.CurID
+	if err := m.writeHelpIndexManifest(manifest); err != nil {
+		log.Warnf("[帮助文档] 写入索引清单失败: %v", err)
+	}
 }
 
 func (m *HelpManager) loadHelpConfig() {
@@ -259,6 +289,249 @@ func (m *HelpManager) loadHelpConfig() {
 	}
 	m.Config = &config
 	m.refreshHelpGroupAliases(config)
+}
+
+func (m *HelpManager) loadHelpConfigIfExists() {
+	data, err := os.ReadFile(filepath.Join("./data/helpdoc", HelpConfigFilename))
+	if err != nil {
+		return
+	}
+	var config HelpConfig
+	err = yaml.Unmarshal(data, &config)
+	if err != nil {
+		logger.M().Errorf("读取 help_config.yaml 发生错误: %v", err)
+		return
+	}
+	m.Config = &config
+	m.refreshHelpGroupAliases(config)
+}
+
+type helpDocFileInfo struct {
+	Path    string `json:"path"`
+	Size    int64  `json:"size"`
+	ModTime int64  `json:"modTime"`
+}
+
+type helpIndexManifest struct {
+	Version     int               `json:"version"`
+	EngineType  EngineType        `json:"engineType"`
+	VersionCode int64             `json:"versionCode"`
+	Fingerprint string            `json:"fingerprint"`
+	Files       []helpDocFileInfo `json:"files"`
+	TotalID     uint64            `json:"totalId"`
+}
+
+func (m *HelpManager) shouldReuseHelpIndex(internalCmdMap CmdMapCls, extList []*ExtInfo) (bool, helpIndexManifest) {
+	manifest := helpIndexManifest{}
+	curFiles, err := collectHelpDocFiles("./data/helpdoc")
+	if err != nil {
+		return false, manifest
+	}
+	fingerprint := buildHelpIndexFingerprint(internalCmdMap, extList)
+	manifest = helpIndexManifest{
+		Version:     helpIndexManifestVersion,
+		EngineType:  m.EngineType,
+		VersionCode: VERSION_CODE,
+		Fingerprint: fingerprint,
+		Files:       curFiles,
+	}
+
+	data, err := os.ReadFile(helpIndexManifestPath)
+	if err != nil {
+		return false, manifest
+	}
+	var old helpIndexManifest
+	if err := json.Unmarshal(data, &old); err != nil {
+		return false, manifest
+	}
+	if old.Version != helpIndexManifestVersion {
+		return false, manifest
+	}
+	if old.EngineType != m.EngineType {
+		return false, manifest
+	}
+	if old.VersionCode != VERSION_CODE {
+		return false, manifest
+	}
+	if old.Fingerprint != fingerprint {
+		return false, manifest
+	}
+	if !helpDocFilesEqual(old.Files, curFiles) {
+		return false, manifest
+	}
+	manifest.TotalID = old.TotalID
+	return true, manifest
+}
+
+func (m *HelpManager) writeHelpIndexManifest(manifest helpIndexManifest) error {
+	_ = os.MkdirAll(filepath.Dir(helpIndexManifestPath), 0o755)
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(helpIndexManifestPath, data, 0o644)
+}
+
+func helpDocFilesEqual(a, b []helpDocFileInfo) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	am := map[string]helpDocFileInfo{}
+	for _, i := range a {
+		am[i.Path] = i
+	}
+	for _, i := range b {
+		j, ok := am[i.Path]
+		if !ok {
+			return false
+		}
+		if j.Size != i.Size || j.ModTime != i.ModTime {
+			return false
+		}
+	}
+	return true
+}
+
+func collectHelpDocFiles(root string) ([]helpDocFileInfo, error) {
+	var files []helpDocFileInfo
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if strings.HasPrefix(d.Name(), ".") {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if d.Name() == HelpConfigFilename {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(d.Name()))
+		if ext != ".json" && ext != ".xlsx" {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return err
+		}
+		files = append(files, helpDocFileInfo{
+			Path:    filepath.ToSlash(rel),
+			Size:    info.Size(),
+			ModTime: info.ModTime().Unix(),
+		})
+		return nil
+	})
+	if err != nil && os.IsNotExist(err) {
+		return []helpDocFileInfo{}, nil
+	}
+	return files, err
+}
+
+func buildHelpIndexFingerprint(internalCmdMap CmdMapCls, extList []*ExtInfo) string {
+	h := sha256.New()
+	write := func(s string) {
+		_, _ = h.Write([]byte(s))
+		_, _ = h.Write([]byte{0})
+	}
+
+	cmdKeys := make([]string, 0, len(internalCmdMap))
+	for k := range internalCmdMap {
+		cmdKeys = append(cmdKeys, k)
+	}
+	sort.Strings(cmdKeys)
+	for _, k := range cmdKeys {
+		v := internalCmdMap[k]
+		write("cmd:" + k)
+		write(v.ShortHelp)
+		write(v.Help)
+	}
+
+	sort.Slice(extList, func(i, j int) bool {
+		var a, b string
+		if extList[i] != nil {
+			a = extList[i].Name
+		}
+		if extList[j] != nil {
+			b = extList[j].Name
+		}
+		return a < b
+	})
+	for _, ext := range extList {
+		if ext == nil {
+			continue
+		}
+		write("ext:" + ext.Name)
+		write(ext.Version)
+		if ext.GetDescText != nil {
+			write(ext.GetDescText(ext))
+		}
+		cmdMap := ext.GetCmdMap()
+		extCmdKeys := make([]string, 0, len(cmdMap))
+		for k := range cmdMap {
+			extCmdKeys = append(extCmdKeys, k)
+		}
+		sort.Strings(extCmdKeys)
+		for _, k := range extCmdKeys {
+			v := cmdMap[k]
+			write("extcmd:" + k)
+			write(v.ShortHelp)
+			write(v.Help)
+		}
+	}
+
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func (m *HelpManager) buildHelpDocTreeOnly() []*HelpDoc {
+	log := logger.M()
+	tree := make([]*HelpDoc, 0)
+	entries, err := os.ReadDir("data/helpdoc")
+	if err != nil {
+		log.Errorf("unable to read helpdoc folder: %v", err)
+		return tree
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		if filepath.Base(entry.Name()) == HelpConfigFilename {
+			continue
+		}
+		var child HelpDoc
+		child.Key = generateHelpDocKey()
+		child.Name = entry.Name()
+		child.Path = path.Join("data/helpdoc", entry.Name())
+		child.IsDir = entry.IsDir()
+		if child.IsDir {
+			child.Group = entry.Name()
+			child.Type = "dir"
+			child.Children = make([]*HelpDoc, 0)
+		} else {
+			child.Group = "default"
+			child.Type = filepath.Ext(child.Path)
+		}
+		buildHelpDocTree(&child, func(d *HelpDoc) {
+			if d.IsDir {
+				return
+			}
+			ext := strings.ToLower(filepath.Ext(d.Path))
+			if ext == ".json" || ext == ".xlsx" {
+				d.LoadStatus = Loaded
+			} else {
+				d.LoadStatus = Unload
+			}
+		})
+		tree = append(tree, &child)
+	}
+	return tree
 }
 
 func (m *HelpManager) refreshHelpGroupAliases(config HelpConfig) {
