@@ -187,7 +187,7 @@ func UpdateByFile(dm *dice.DiceManager, packName string, syncMode bool) bool {
 				}
 
 				time.Sleep(5 * time.Second)
-				cleanupCreate(dm)()
+				cleanupCreate(dm, nil)()
 				os.Exit(0)
 			}
 			if syncMode {
