@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"runtime/pprof"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -22,6 +24,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
 	"Scardice-core/api"
@@ -47,10 +50,13 @@ extensions/
 
 var sealLock = flock.New("Scardice-lock.lock")
 
-func cleanupCreate(diceManager *dice.DiceManager) func() {
+func cleanupCreate(diceManager *dice.DiceManager, extraCleanup func()) func() {
 	return func() {
 		log := logger.M()
 		log.Info("程序即将退出，进行清理……")
+		if extraCleanup != nil {
+			extraCleanup()
+		}
 		err := recover()
 		if err != nil {
 			showWindow()
@@ -119,6 +125,75 @@ func cleanupCreate(diceManager *dice.DiceManager) func() {
 	}
 }
 
+type pprofRecorder struct {
+	dir     string
+	cpuFile *os.File
+}
+
+func startPprofRecord(log *zap.SugaredLogger, bootTime int64) (*pprofRecorder, error) {
+	dir := filepath.Join("./data/pprof", strconv.FormatInt(bootTime, 10))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+
+	// 启用锁相关的采样
+	runtime.SetBlockProfileRate(1)
+	runtime.SetMutexProfileFraction(1)
+
+	cpuPath := filepath.Join(dir, "cpu.pprof")
+	cpuFile, err := os.Create(cpuPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := pprof.StartCPUProfile(cpuFile); err != nil {
+		_ = cpuFile.Close()
+		return nil, err
+	}
+	log.Infof("pprof 记录已启用，输出目录: %s", dir)
+
+	return &pprofRecorder{
+		dir:     dir,
+		cpuFile: cpuFile,
+	}, nil
+}
+
+func (r *pprofRecorder) stop(log *zap.SugaredLogger) {
+	if r == nil {
+		return
+	}
+	pprof.StopCPUProfile()
+	if r.cpuFile != nil {
+		_ = r.cpuFile.Close()
+	}
+
+	writeProfile := func(name string) {
+		profile := pprof.Lookup(name)
+		if profile == nil {
+			return
+		}
+		path := filepath.Join(r.dir, name+".pprof")
+		f, err := os.Create(path)
+		if err != nil {
+			log.Warnf("写入pprof失败(%s): %v", name, err)
+			return
+		}
+		defer func() { _ = f.Close() }()
+		if name == "heap" {
+			runtime.GC()
+		}
+		if err := profile.WriteTo(f, 0); err != nil {
+			log.Warnf("写入pprof失败(%s): %v", name, err)
+		}
+	}
+
+	writeProfile("goroutine")
+	writeProfile("heap")
+	writeProfile("allocs")
+	writeProfile("threadcreate")
+	writeProfile("block")
+	writeProfile("mutex")
+}
+
 func deleteOldWrongFile() {
 	_ = os.Remove("./data/names/data-logs.db")
 	_ = os.Remove("./data/names/names.zip")
@@ -171,6 +246,7 @@ func main() {
 		UpdateTest             bool   `description:"更新测试"                                                            long:"update-test"`
 		LogLevel               int8   `choice:"-1"                                                                   choice:"0"              choice:"1" choice:"2" choice:"3" choice:"4" choice:"5" default:"0" description:"设置日志等级"             long:"log-level"`
 		ContainerMode          bool   `description:"容器模式，该模式下禁用内置客户端"                                                long:"container-mode"`
+		PprofRecord            bool   `description:"启用pprof记录，写入data/pprof/<启动时间戳>"                                      long:"pprof-record"`
 	}
 	// pprof
 	// go func() {
@@ -263,6 +339,18 @@ func main() {
 	diceManager.LoadDice()
 	diceManager.IsReady = true
 
+	var pprofStop func()
+	if opts.PprofRecord {
+		rec, recErr := startPprofRecord(log, diceManager.AppBootTime)
+		if recErr != nil {
+			log.Warnf("pprof 记录启动失败: %v", recErr)
+		} else {
+			pprofStop = func() {
+				rec.stop(log)
+			}
+		}
+	}
+
 	if opts.Address != "" {
 		log.Infof("由参数输入了服务地址: %s", opts.Address)
 		diceManager.ServeAddress = opts.Address
@@ -344,8 +432,6 @@ func main() {
 		err = errors.New("update disabled") // 更新功能已禁用，原调用: CheckUpdater(diceManager)
 		if err != nil {
 			log.Error("升级程序检查失败: ", err.Error())
-		} else {
-			// UpdateByFile(diceManager, "./xx.zip", true) // 更新功能已禁用
 		}
 	}
 
@@ -423,7 +509,7 @@ func main() {
 
 	go dice.TryGetBackendURL()
 
-	cleanUp := cleanupCreate(diceManager)
+	cleanUp := cleanupCreate(diceManager, pprofStop)
 	defer dice.CrashLog()
 	defer cleanUp()
 

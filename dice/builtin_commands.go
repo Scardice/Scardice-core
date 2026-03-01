@@ -426,12 +426,12 @@ func (d *Dice) registerCoreCommands() {
 		Name:      "help",
 		ShortHelp: helpForHelp,
 		Help:      "帮助指令，用于查看指令帮助和helpdoc中录入的信息:\n" + helpForHelp,
-			Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
-				arg := cmdArgs.GetArgN(1)
-				if arg == "" {
-					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰子帮助文本"))
-					return CmdExecuteResult{Matched: true, Solved: true}
-				}
+		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
+			arg := cmdArgs.GetArgN(1)
+			if arg == "" {
+				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰子帮助文本"))
+				return CmdExecuteResult{Matched: true, Solved: true}
+			}
 
 			if strings.EqualFold(arg, "reload") {
 				if ctx.PrivilegeLevel < 100 {
@@ -895,9 +895,9 @@ func (d *Dice) registerCoreCommands() {
 
 			// 单独处理解锁指令
 			if subCmd == "unlock" {
-				//NOTE(lyjjl): master unlock 已禁用，避免绕过 master 列表的权限检查。
+				// NOTE(lyjjl): master unlock 已禁用，避免绕过 master 列表的权限检查。
 				ReplyToSender(ctx, msg, "该指令已禁用")
-				if false { //NOTE(lyjjl): 保留旧逻辑以便后续审计
+				if false { // NOTE(lyjjl): 保留旧逻辑以便后续审计
 					code := cmdArgs.GetArgN(2)
 					if ctx.Dice.UnlockCodeVerify(code) {
 						ctx.Dice.MasterRefresh()
