@@ -858,10 +858,8 @@ func (d *Dice) registerCoreCommands() {
 		updateCode      = "0000"
 	)
 
-	var masterListHelp = `.master add me // 将自己标记为骰主
-.master add @A @B // 将别人标记为骰主
+	var masterListHelp = `.master add @A @B // 将别人标记为骰主
 .master del @A @B @C // 去除骰主标记
-.master unlock <密码(在UI中查看)> // (当Master被人抢占时)清空骰主列表，并使自己成为骰主
 .master list // 查看当前骰主列表
 .master reboot // 重新启动(需要二次确认)
 .master checkupdate // 检查更新(需要二次确认)
@@ -893,33 +891,23 @@ func (d *Dice) registerCoreCommands() {
 				}
 			}
 
-			var pRequired int
-			if len(ctx.Dice.DiceMasters) >= 1 {
-				// 如果帐号没有UI:1001以外的master，所有人都是master
-				count := 0
-				for _, uid := range ctx.Dice.DiceMasters {
-					if uid != "UI:1001" {
-						count += 1
-					}
-				}
-
-				if count >= 1 {
-					pRequired = 100
-				}
-			}
+			pRequired := 100
 
 			// 单独处理解锁指令
 			if subCmd == "unlock" {
-				// 特殊解锁指令
-				code := cmdArgs.GetArgN(2)
-				if ctx.Dice.UnlockCodeVerify(code) {
-					ctx.Dice.MasterRefresh()
-					ctx.Dice.MasterAdd(ctx.Player.UserID)
+				//NOTE(lyjjl): master unlock 已禁用，避免绕过 master 列表的权限检查。
+				ReplyToSender(ctx, msg, "该指令已禁用")
+				if false { //NOTE(lyjjl): 保留旧逻辑以便后续审计
+					code := cmdArgs.GetArgN(2)
+					if ctx.Dice.UnlockCodeVerify(code) {
+						ctx.Dice.MasterRefresh()
+						ctx.Dice.MasterAdd(ctx.Player.UserID)
 
-					ctx.Dice.UnlockCodeUpdate(true) // 强制刷新解锁码
-					ReplyToSender(ctx, msg, "你已成为Master")
-				} else {
-					ReplyToSender(ctx, msg, "错误的解锁码")
+						ctx.Dice.UnlockCodeUpdate(true) // 强制刷新解锁码
+						ReplyToSender(ctx, msg, "你已成为Master")
+					} else {
+						ReplyToSender(ctx, msg, "错误的解锁码")
+					}
 				}
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
@@ -931,6 +919,12 @@ func (d *Dice) registerCoreCommands() {
 
 			switch subCmd {
 			case "add":
+				for _, arg := range cmdArgs.Args[1:] {
+					if arg == "me" {
+						ReplyToSender(ctx, msg, "该指令已禁用")
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
+				}
 				var count int
 				for _, uid := range readIDList(ctx, msg, cmdArgs) {
 					if uid != ctx.EndPoint.UserID {
