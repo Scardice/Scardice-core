@@ -51,4 +51,6 @@ type SearchEngine interface {
 	PaginateDocuments(pageSize, pageNum int, group, from, title string) (uint64, []*HelpTextItem, error)
 	// GetTotalID 获取当前ID总数，注意，ID必须是顺序排列的
 	GetTotalID() uint64
+	// SetTotalID 设置当前ID总数，用于复用索引时避免ID冲突
+	SetTotalID(total uint64)
 }
