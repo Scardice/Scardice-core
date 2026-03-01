@@ -3,7 +3,10 @@ package dice
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/gob"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
@@ -55,6 +58,14 @@ var taskCronParser = cron.NewParser(
 		cron.Month |
 		cron.Dow |
 		cron.Descriptor,
+)
+
+const (
+	jsCacheDir         = "./data/.cache/js"
+	jsMetaCacheFile    = "meta.gob"
+	jsMetaCacheVersion = 1
+	tsCacheDir         = "./data/.cache/js/ts"
+	tsCacheVersion     = 1
 )
 
 type PrinterFunc struct {
@@ -799,11 +810,146 @@ func isScriptFile(filename string) bool {
 	return temp == ".js" || temp == ".ts"
 }
 
+func jsCacheKey(path string) string {
+	return filepath.ToSlash(path)
+}
+
+func loadJsMetaCache() *jsMetaCache {
+	cachePath := filepath.Join(jsCacheDir, jsMetaCacheFile)
+	f, err := os.Open(cachePath)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var cache jsMetaCache
+	dec := gob.NewDecoder(f)
+	if err := dec.Decode(&cache); err != nil {
+		return nil
+	}
+	if cache.Version != jsMetaCacheVersion {
+		return nil
+	}
+	if cache.Files == nil {
+		cache.Files = map[string]jsMetaCacheEntry{}
+	}
+	return &cache
+}
+
+func saveJsMetaCache(cache *jsMetaCache) {
+	if cache == nil {
+		return
+	}
+	_ = os.MkdirAll(jsCacheDir, 0o755)
+	cachePath := filepath.Join(jsCacheDir, jsMetaCacheFile)
+	tmpPath := cachePath + ".tmp"
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return
+	}
+	enc := gob.NewEncoder(f)
+	if err := enc.Encode(cache); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return
+	}
+	_ = os.Rename(tmpPath, cachePath)
+}
+
+func buildJsScriptInfoFromCache(d *Dice, path string, entry jsMetaCacheEntry) (*JsScriptInfo, error) {
+	if entry.ParseErr != "" {
+		return nil, errors.New(entry.ParseErr)
+	}
+	jsInfo := &JsScriptInfo{
+		Name:         entry.Meta.Name,
+		Filename:     path,
+		InstallTime:  entry.InstallTime,
+		Version:      entry.Meta.Version,
+		Author:       entry.Meta.Author,
+		License:      entry.Meta.License,
+		HomePage:     entry.Meta.HomePage,
+		Desc:         entry.Meta.Desc,
+		UpdateTime:   entry.Meta.UpdateTime,
+		UpdateUrls:   entry.Meta.UpdateUrls,
+		Etag:         entry.Meta.Etag,
+		Official:     entry.Meta.Official,
+		signStatus:   entry.Meta.SignStatus,
+		Builtin:      entry.Builtin,
+		needCompiled: entry.Meta.NeedCompiled,
+		StoreID:      entry.Meta.StoreID,
+	}
+	if jsInfo.Name == "" {
+		jsInfo.Name = filepath.Base(path)
+	}
+	for _, dep := range entry.Meta.Depends {
+		c, err := semver.NewConstraint(dep.Constraint)
+		if err != nil {
+			return nil, err
+		}
+		jsInfo.Depends = append(jsInfo.Depends, JsScriptDepends{
+			Author:     dep.Author,
+			Name:       dep.Name,
+			Constraint: c,
+			RawKey:     dep.RawKey,
+		})
+	}
+	jsInfo.Enable = !(&d.Config).DisabledJsScripts[jsInfo.Name]
+	d.JsScriptList = append(d.JsScriptList, jsInfo)
+	return jsInfo, nil
+}
+
+func buildJsMetaCacheEntry(path string, info fs.FileInfo, jsInfo *JsScriptInfo, builtin bool, parseErr error) jsMetaCacheEntry {
+	entry := jsMetaCacheEntry{
+		Path:        filepath.ToSlash(path),
+		Size:        info.Size(),
+		ModTime:     info.ModTime().Unix(),
+		Builtin:     builtin,
+		InstallTime: info.ModTime().Unix(),
+	}
+	if parseErr != nil {
+		entry.ParseErr = parseErr.Error()
+		return entry
+	}
+	if jsInfo == nil {
+		return entry
+	}
+	entry.Meta = jsMetaInfo{
+		Name:         jsInfo.Name,
+		Version:      jsInfo.Version,
+		Author:       jsInfo.Author,
+		License:      jsInfo.License,
+		HomePage:     jsInfo.HomePage,
+		Desc:         jsInfo.Desc,
+		UpdateTime:   jsInfo.UpdateTime,
+		UpdateUrls:   jsInfo.UpdateUrls,
+		Etag:         jsInfo.Etag,
+		Official:     jsInfo.Official,
+		SignStatus:   jsInfo.signStatus,
+		NeedCompiled: jsInfo.needCompiled,
+		StoreID:      jsInfo.StoreID,
+	}
+	for _, dep := range jsInfo.Depends {
+		entry.Meta.Depends = append(entry.Meta.Depends, jsMetaDepends{
+			Author:     dep.Author,
+			Name:       dep.Name,
+			Constraint: dep.Constraint.String(),
+			RawKey:     dep.RawKey,
+		})
+	}
+	return entry
+}
+
 func (d *Dice) JsLoadScripts() {
 	d.JsScriptList = []*JsScriptInfo{}
 
 	path := filepath.Join(d.BaseConfig.DataDir, "scripts")
 	builtinPath := filepath.Join(path, "_builtin")
+
+	metaCache := loadJsMetaCache()
+	newCache := &jsMetaCache{Version: jsMetaCacheVersion, Files: map[string]jsMetaCacheEntry{}}
 
 	// 导出内置脚本数据
 	builtinScripts, _ := fs.ReadDir(static.Scripts, "scripts")
@@ -833,25 +979,53 @@ func (d *Dice) JsLoadScripts() {
 	_ = filepath.Walk(builtinPath, func(path string, info fs.FileInfo, err error) error {
 		if isScriptFile(path) {
 			d.Logger.Info("正在读取内置脚本: ", path)
+			key := jsCacheKey(path)
+			if metaCache != nil {
+				if entry, ok := metaCache.Files[key]; ok &&
+					entry.Builtin && entry.Size == info.Size() && entry.ModTime == info.ModTime().Unix() {
+					if entry.Meta.SignStatus != OfficialSign {
+						d.Logger.Warnf("内置脚本「%s」校验未通过，拒绝加载", path)
+						newCache.Files[key] = entry
+						return nil
+					}
+					jsInfo, err := buildJsScriptInfoFromCache(d, "./"+path, entry)
+					if err == nil {
+						jsInfos = append(jsInfos, jsInfo)
+						if len(jsInfo.StoreID) > 0 {
+							d.StoreManager.InstalledPlugins[jsInfo.StoreID] = true
+						}
+						newCache.Files[key] = entry
+						return nil
+					}
+					entry.ParseErr = err.Error()
+					newCache.Files[key] = entry
+					d.Logger.Error("读取内置脚本失败(错误依赖)", err.Error())
+					return nil
+				}
+			}
+
 			data, err := os.ReadFile(path)
 			if err != nil {
 				d.Logger.Error("读取内置脚本失败(无法访问): ", err.Error())
 				return nil
 			}
-			// 检查内置脚本签名，检查不通过则拒绝加载
-			scriptData, _ := os.ReadFile(path)
-			if ok, _ := CheckJsSign(scriptData); ok {
-				jsInfo, err := d.JsParseMeta("./"+path, info.ModTime(), data, true)
-				if err != nil {
-					d.Logger.Error("读取内置脚本失败(错误依赖)", err.Error())
-					return nil
-				}
-				jsInfos = append(jsInfos, jsInfo)
-				if len(jsInfo.StoreID) > 0 {
-					d.StoreManager.InstalledPlugins[jsInfo.StoreID] = true
-				}
-			} else {
+			ok, signStatus := CheckJsSign(data)
+			if !ok {
 				d.Logger.Warnf("内置脚本「%s」校验未通过，拒绝加载", path)
+				entry := buildJsMetaCacheEntry(path, info, nil, true, errors.New("signature invalid"))
+				entry.Meta.SignStatus = signStatus
+				newCache.Files[key] = entry
+				return nil
+			}
+			jsInfo, err := d.JsParseMeta("./"+path, info.ModTime(), data, true)
+			newCache.Files[key] = buildJsMetaCacheEntry(path, info, jsInfo, true, err)
+			if err != nil {
+				d.Logger.Error("读取内置脚本失败(错误依赖)", err.Error())
+				return nil
+			}
+			jsInfos = append(jsInfos, jsInfo)
+			if len(jsInfo.StoreID) > 0 {
+				d.StoreManager.InstalledPlugins[jsInfo.StoreID] = true
 			}
 		}
 		return nil
@@ -864,12 +1038,33 @@ func (d *Dice) JsLoadScripts() {
 		}
 		if isScriptFile(path) {
 			d.Logger.Info("正在读取脚本: ", path)
+			key := jsCacheKey(path)
+			if metaCache != nil {
+				if entry, ok := metaCache.Files[key]; ok &&
+					!entry.Builtin && entry.Size == info.Size() && entry.ModTime == info.ModTime().Unix() {
+					jsInfo, err := buildJsScriptInfoFromCache(d, "./"+path, entry)
+					if err == nil {
+						jsInfos = append(jsInfos, jsInfo)
+						if len(jsInfo.StoreID) > 0 {
+							d.StoreManager.InstalledPlugins[jsInfo.StoreID] = true
+						}
+						newCache.Files[key] = entry
+						return nil
+					}
+					entry.ParseErr = err.Error()
+					newCache.Files[key] = entry
+					d.Logger.Error("读取脚本失败(错误依赖)", err.Error())
+					return nil
+				}
+			}
+
 			data, err := os.ReadFile(path)
 			if err != nil {
 				d.Logger.Error("读取脚本失败(无法访问): ", err.Error())
 				return nil
 			}
 			jsInfo, err := d.JsParseMeta("./"+path, info.ModTime(), data, false)
+			newCache.Files[key] = buildJsMetaCacheEntry(path, info, jsInfo, false, err)
 			if err != nil {
 				d.Logger.Error("读取脚本失败(错误依赖)", err.Error())
 				return nil
@@ -881,6 +1076,8 @@ func (d *Dice) JsLoadScripts() {
 		}
 		return nil
 	})
+
+	saveJsMetaCache(newCache)
 
 	// 检查依赖是否满足
 	unloadKeySet := make(map[string]bool)
@@ -1076,6 +1273,45 @@ type JsScriptDepends struct {
 	RawKey string `json:"rawKey"`
 }
 
+type jsMetaDepends struct {
+	Author     string `json:"author"`
+	Name       string `json:"name"`
+	Constraint string `json:"constraint"`
+	RawKey     string `json:"rawKey"`
+}
+
+type jsMetaInfo struct {
+	Name         string          `json:"name"`
+	Version      string          `json:"version"`
+	Author       string          `json:"author"`
+	License      string          `json:"license"`
+	HomePage     string          `json:"homepage"`
+	Desc         string          `json:"desc"`
+	UpdateTime   int64           `json:"updateTime"`
+	UpdateUrls   []string        `json:"updateUrls"`
+	Etag         string          `json:"etag"`
+	Official     bool            `json:"official"`
+	SignStatus   SignStatus      `json:"signStatus"`
+	Depends      []jsMetaDepends `json:"depends"`
+	NeedCompiled bool            `json:"needCompiled"`
+	StoreID      string          `json:"storeId"`
+}
+
+type jsMetaCacheEntry struct {
+	Path        string     `json:"path"`
+	Size        int64      `json:"size"`
+	ModTime     int64      `json:"modTime"`
+	Builtin     bool       `json:"builtin"`
+	InstallTime int64      `json:"installTime"`
+	ParseErr    string     `json:"parseErr"`
+	Meta        jsMetaInfo `json:"meta"`
+}
+
+type jsMetaCache struct {
+	Version int                         `json:"version"`
+	Files   map[string]jsMetaCacheEntry `json:"files"`
+}
+
 func (d *Dice) JsParseMeta(s string, installTime time.Time, rawData []byte, builtin bool) (*JsScriptInfo, error) {
 	// 读取文件内容填空，类似油猴脚本那种形式
 	jsInfo := &JsScriptInfo{
@@ -1204,12 +1440,15 @@ func (d *Dice) JsLoadScriptRaw(jsInfo *JsScriptInfo) {
 	if jsInfo.Enable {
 		d.JsLoadingScript = jsInfo
 		var targetPath string
+		var cleanup bool
 		if jsInfo.needCompiled {
 			d.Logger.Infof("脚本<%s>正在经过编译处理……", jsInfo.Name)
-			targetPath, err = tsScriptCompile(jsInfo.Filename)
-			defer func(name string) {
-				_ = os.Remove(name)
-			}(targetPath)
+			targetPath, cleanup, err = tsScriptCompile(jsInfo.Filename)
+			if cleanup {
+				defer func(name string) {
+					_ = os.Remove(name)
+				}(targetPath)
+			}
 		} else {
 			targetPath = jsInfo.Filename
 		}
@@ -1229,10 +1468,10 @@ func (d *Dice) JsLoadScriptRaw(jsInfo *JsScriptInfo) {
 	}
 }
 
-func tsScriptCompile(path string) (string, error) {
+func tsScriptCompile(path string) (string, bool, error) {
 	script, err := os.ReadFile(path)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	compiled := esbuild.Transform(string(script), esbuild.TransformOptions{
 		Loader: esbuild.LoaderTS,
@@ -1242,20 +1481,35 @@ func tsScriptCompile(path string) (string, error) {
 		for _, e := range compiled.Errors {
 			msg.WriteString(e.Text) // FIXME 优化错误信息展示
 		}
-		return "", errors.New(msg.String())
+		return "", false, errors.New(msg.String())
 	}
-	compiledPath, err := os.CreateTemp("", "compiled-*-"+filepath.Base(path))
+	sum := sha256.Sum256(append([]byte(fmt.Sprintf("ts-cache:%d;", tsCacheVersion)), script...))
+	filename := hex.EncodeToString(sum[:]) + ".js"
+	cachePath := filepath.Join(tsCacheDir, filename)
+	if _, statErr := os.Stat(cachePath); statErr == nil {
+		return cachePath, false, nil
+	}
+	if mkErr := os.MkdirAll(tsCacheDir, 0o755); mkErr != nil {
+		return "", false, mkErr
+	}
+	tmpFile, err := os.CreateTemp(tsCacheDir, "compiled-*.js")
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	defer func(compiledPath *os.File) {
-		_ = compiledPath.Close()
-	}(compiledPath)
-	_, err = compiledPath.Write(compiled.Code)
-	if err != nil {
-		return "", err
+	if _, err := tmpFile.Write(compiled.Code); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name()) //nolint:gosec // temp file path is controlled
+		return "", false, err
 	}
-	return compiledPath.Name(), nil
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpFile.Name()) //nolint:gosec // temp file path is controlled
+		return "", false, err
+	}
+	if err := os.Rename(tmpFile.Name(), cachePath); err != nil { //nolint:gosec // temp file path is controlled
+		//nolint:nilerr // fallback to temp file path if rename fails
+		return tmpFile.Name(), true, nil
+	}
+	return cachePath, false, nil
 }
 
 func CheckJsSign(rawData []byte) (bool, SignStatus) {

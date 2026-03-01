@@ -2,6 +2,7 @@ package dice
 
 import (
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -41,6 +42,7 @@ type DiceManager struct { //nolint:revive
 	IsNamesReloading bool
 	NamesGenerator   *NamesGenerator
 	NamesInfo        map[string]map[string][]string
+	namesLoadWG      sync.WaitGroup
 
 	UIPasswordHash string
 	UIPasswordSalt string
@@ -120,8 +122,13 @@ func (dm *DiceManager) InitHelp() {
 		log.Fatalf("Dice实例不存在!")
 		return
 	}
+	log.Info("帮助文档开始异步加载")
+	for _, d := range dm.Dice {
+		d.WaitStartupJsLoaded()
+	}
 	dm.Help.Load(dm.Dice[0].CmdMap, dm.Dice[0].ExtList)
 	dm.IsHelpReloading = false
+	log.Info("帮助文档异步加载结束")
 }
 
 // LoadDice 初始化函数
@@ -236,12 +243,13 @@ func (dm *DiceManager) Save() {
 
 func (dm *DiceManager) InitDice(writer *logger.UIWriter) {
 	log := logger.M()
+	startTime := time.Now()
 	dm.UpdateRequestChan = make(chan *Dice, 1)
 	dm.RebootRequestChan = make(chan int, 1)
 	dm.UpdateCheckRequestChan = make(chan int, 1)
 	dm.UpdateDownloadedChan = make(chan string, 1)
 
-	dm.LoadNames()
+	dm.LoadNamesAsync()
 
 	g, err := NewProcessExitGroup()
 	if err != nil {
@@ -270,6 +278,7 @@ func (dm *DiceManager) InitDice(writer *logger.UIWriter) {
 
 	dm.ResetAutoBackup()
 	dm.ResetBackupClean()
+	log.Infof("启动同步初始化完成，耗时 %dms（不含 names/deck/js/helpdoc 异步加载）", time.Since(startTime).Milliseconds())
 }
 
 func (dm *DiceManager) ResetAutoBackup() {
@@ -337,9 +346,27 @@ func (dm *DiceManager) TryCreateDefault() {
 
 func (dm *DiceManager) LoadNames() {
 	dm.IsNamesReloading = true
-	dm.NamesGenerator = &NamesGenerator{}
-	dm.NamesGenerator.Load()
+	ng := &NamesGenerator{}
+	ng.Load()
+	dm.NamesGenerator = ng
+	dm.NamesInfo = ng.NamesInfo
 	dm.IsNamesReloading = false
+}
+
+func (dm *DiceManager) LoadNamesAsync() {
+	dm.namesLoadWG.Add(1)
+	go func() {
+		defer dm.namesLoadWG.Done()
+		logger.M().Info("随机名字资源开始异步加载")
+		dm.LoadNames()
+		logger.M().Info("随机名字资源异步加载完成")
+	}()
+}
+
+func (dm *DiceManager) WaitNamesLoaded() {
+	if dm.IsNamesReloading {
+		dm.namesLoadWG.Wait()
+	}
 }
 
 func (dm *DiceManager) TryGetGroupName(id string) string {

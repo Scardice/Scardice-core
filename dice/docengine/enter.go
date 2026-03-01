@@ -41,6 +41,8 @@ type SearchEngine interface {
 	AddItem(item HelpTextItem) (string, error)
 	// AddItemApply 提交文档条目
 	AddItemApply(end bool) error
+	// DeleteByFrom 删除指定来源路径的文档
+	DeleteByFrom(from string) error
 	// Search 搜索文档条目
 	Search(helpPackages []string, text string, titleOnly bool, pageSize, pageNum int, group string) (*GeneralSearchResult, int, int, int, error)
 	// GetHelpTextItemByTermTitle 精确查询title，用于嵌套获取数据的情形

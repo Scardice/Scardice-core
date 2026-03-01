@@ -276,9 +276,10 @@ type Dice struct {
 	StoreManager *StoreManager `json:"-" yaml:"-"`
 
 	/* Wrapper 架构 */
-	JsExtRegistry *SyncMap[string, *ExtInfo] `json:"-" yaml:"-"` // JS 扩展真实 ExtInfo 注册表
-	ExtUpdateTime int64                      `json:"-" yaml:"-"` // 扩展变更时间戳，用于触发群组延迟更新
-	JsReloading   bool                       `json:"-" yaml:"-"` // JS 扩展正在重载中
+	JsExtRegistry   *SyncMap[string, *ExtInfo] `json:"-" yaml:"-"` // JS 扩展真实 ExtInfo 注册表
+	ExtUpdateTime   int64                      `json:"-" yaml:"-"` // 扩展变更时间戳，用于触发群组延迟更新
+	JsReloading     bool                       `json:"-" yaml:"-"` // JS 扩展正在重载中
+	startupJsLoadWG sync.WaitGroup             `json:"-" yaml:"-"`
 
 	/* 保存优化 */
 	DirtyGroups *SyncMap[string, int64] `json:"-" yaml:"-"` // 脏群组列表：groupID -> UpdatedAtTime
@@ -286,6 +287,28 @@ type Dice struct {
 
 func (d *Dice) MarkModified() {
 	d.LastUpdatedTime = time.Now().Unix()
+}
+
+func (d *Dice) StartStartupJsLoad() {
+	if !d.Config.JsEnable {
+		return
+	}
+	d.startupJsLoadWG.Add(1)
+	d.JsReloading = true
+	go func() {
+		defer d.startupJsLoadWG.Done()
+		defer func() { d.JsReloading = false }()
+		d.Logger.Info("JS 扩展脚本开始异步加载")
+		d.JsBuiltinDigestSet = make(map[string]bool)
+		d.JsLoadScripts()
+		d.Logger.Info("JS 扩展脚本异步加载完成")
+	}()
+}
+
+func (d *Dice) WaitStartupJsLoaded() {
+	if d.Config.JsEnable {
+		d.startupJsLoadWG.Wait()
+	}
 }
 
 func (d *Dice) CocExtraRulesAdd(ruleInfo *CocRuleInfo) bool {
@@ -449,8 +472,7 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 
 	d.ApplyAliveNotice()
 	if d.Config.JsEnable {
-		d.JsBuiltinDigestSet = make(map[string]bool)
-		d.JsLoadScripts()
+		d.StartStartupJsLoad()
 	} else {
 		loggerInstance.Info("js扩展支持已关闭，跳过js脚本的加载")
 	}
