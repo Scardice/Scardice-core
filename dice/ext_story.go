@@ -79,6 +79,11 @@ func cmdRandomName(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs, cmdsList [][
 	}
 
 	// 开始抽取
+	ctx.Dice.Parent.WaitNamesLoaded()
+	if ctx.Dice.Parent.NamesGenerator == nil {
+		ReplyToSender(ctx, msg, "随机名字资源尚未就绪，请稍后再试")
+		return CmdExecuteResult{Matched: true, Solved: true}
+	}
 	for range num {
 		rule := rules[rand.Int()%len(rules)]
 		names = append(names, ctx.Dice.Parent.NamesGenerator.NameGenerate(rule))

@@ -24,7 +24,7 @@ type BleveSearchEngine struct {
 	reuse     bool
 }
 
-var indexDir = "./data/_index"
+var indexDir = "./data/.cache/helpdoc/index"
 var reSpace = regexp.MustCompile(`\s+`)
 
 // getNextID 使用原子操作，避免并发问题
@@ -165,6 +165,32 @@ func (d *BleveSearchEngine) AddItemApply(end bool) error {
 			d.batch.Reset()
 		}
 		return err
+	}
+	return nil
+}
+
+func (d *BleveSearchEngine) DeleteByFrom(from string) error {
+	if d.Index == nil {
+		return nil
+	}
+	q := bleve.NewTermQuery(from)
+	q.SetField("from")
+	for {
+		req := bleve.NewSearchRequestOptions(q, 200, 0, false)
+		res, err := d.Index.Search(req)
+		if err != nil {
+			return err
+		}
+		if len(res.Hits) == 0 {
+			break
+		}
+		batch := d.Index.NewBatch()
+		for _, hit := range res.Hits {
+			batch.Delete(hit.ID)
+		}
+		if err := d.Index.Batch(batch); err != nil {
+			return err
+		}
 	}
 	return nil
 }
