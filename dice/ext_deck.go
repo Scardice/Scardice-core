@@ -569,11 +569,7 @@ func (e DeckCommandListItems) Len() int {
 	return len(e)
 }
 
-func DeckReload(d *Dice) {
-	if d.IsDeckLoading {
-		return
-	}
-	d.IsDeckLoading = true
+func deckReloadRun(d *Dice) {
 	d.DeckList = d.DeckList[:0]
 	if d.StoreManager != nil {
 		d.StoreManager.InstalledDecks = map[string]bool{}
@@ -581,8 +577,6 @@ func DeckReload(d *Dice) {
 	d.Logger.Infof("从此目录加载牌堆: %s", "data/decks")
 	DecksDetect(d)
 	d.Logger.Infof("加载完成，现有牌堆 %d 个", len(d.DeckList))
-	d.IsDeckLoading = false
-	d.MarkModified()
 
 	lst := DeckCommandListItems{}
 	for _, i := range d.DeckList {
@@ -595,6 +589,28 @@ func DeckReload(d *Dice) {
 		}
 	}
 	d.deckCommandItemsList = lst
+	d.IsDeckLoading = false
+	d.MarkModified()
+}
+
+func DeckReload(d *Dice) {
+	if d.IsDeckLoading {
+		return
+	}
+	d.IsDeckLoading = true
+	deckReloadRun(d)
+}
+
+func DeckReloadAsync(d *Dice) {
+	if d.IsDeckLoading {
+		return
+	}
+	d.IsDeckLoading = true
+	go func() {
+		d.Logger.Info("牌堆开始异步加载")
+		deckReloadRun(d)
+		d.Logger.Info("牌堆异步加载完成")
+	}()
 }
 
 func deckDraw(ctx *MsgContext, deckName string, shufflePool bool) (bool, string, error) {
@@ -824,7 +840,7 @@ func RegisterBuiltinExtDeck(d *Dice) {
 		OnCommandReceived: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) {
 		},
 		OnLoad: func() {
-			DeckReload(d)
+			DeckReloadAsync(d)
 		},
 		GetDescText: GetExtensionDesc,
 		CmdMap: CmdMapCls{

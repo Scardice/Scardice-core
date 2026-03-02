@@ -1,8 +1,10 @@
 package dice
 
 import (
+	"encoding/gob"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,13 +19,38 @@ type NamesGenerator struct {
 	NamesInfo map[string]map[string][]string
 }
 
+const (
+	namesCacheDir      = "./data/.cache/names"
+	namesCacheFilename = "names_cache.gob"
+	namesCacheVersion  = 1
+)
+
+type namesCacheFileInfo struct {
+	Path    string `json:"path"`
+	Size    int64  `json:"size"`
+	ModTime int64  `json:"modTime"`
+}
+
+type namesCache struct {
+	Version   int                            `json:"version"`
+	Files     []namesCacheFileInfo           `json:"files"`
+	NamesInfo map[string]map[string][]string `json:"namesInfo"`
+}
+
 func (ng *NamesGenerator) Load() {
 	_ = os.MkdirAll("./data/names", 0755)
+	_ = os.MkdirAll(namesCacheDir, 0755)
 
 	nameInfo := map[string]map[string][]string{}
 	ng.NamesInfo = nameInfo
 
-	for _, fn := range []string{"./data/names/names.xlsx", "./data/names/names-dnd.xlsx"} {
+	files := []string{"./data/names/names.xlsx", "./data/names/names-dnd.xlsx"}
+	if cached, ok := loadNamesCache(files); ok {
+		ng.NamesInfo = cached
+		return
+	}
+
+	for _, fn := range files {
 		f, err := excelize.OpenFile(fn)
 		if err != nil {
 			logger.M().Warn("加载names信息出错", fn, err)
@@ -58,6 +85,103 @@ func (ng *NamesGenerator) Load() {
 			logger.M().Error("NamesGenerator.Load", err)
 		}
 	}
+
+	if err := saveNamesCache(files, ng.NamesInfo); err != nil {
+		logger.M().Warn("写入names缓存失败", err)
+	}
+}
+
+func loadNamesCache(files []string) (map[string]map[string][]string, bool) {
+	cachePath := filepath.Join(namesCacheDir, namesCacheFilename)
+	f, err := os.Open(cachePath)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+	var cache namesCache
+	dec := gob.NewDecoder(f)
+	if err2 := dec.Decode(&cache); err2 != nil {
+		return nil, false
+	}
+	if cache.Version != namesCacheVersion {
+		return nil, false
+	}
+	curFiles, err := collectNamesFiles(files)
+	if err != nil {
+		return nil, false
+	}
+	if !namesFilesEqual(cache.Files, curFiles) {
+		return nil, false
+	}
+	return cache.NamesInfo, true
+}
+
+func saveNamesCache(files []string, names map[string]map[string][]string) error {
+	curFiles, err := collectNamesFiles(files)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	cache := namesCache{
+		Version:   namesCacheVersion,
+		Files:     curFiles,
+		NamesInfo: names,
+	}
+	cachePath := filepath.Join(namesCacheDir, namesCacheFilename)
+	tmpPath := cachePath + ".tmp"
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return err
+	}
+	enc := gob.NewEncoder(f)
+	if err := enc.Encode(&cache); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return os.Rename(tmpPath, cachePath)
+}
+
+func collectNamesFiles(files []string) ([]namesCacheFileInfo, error) {
+	var infos []namesCacheFileInfo
+	for _, fn := range files {
+		st, err := os.Stat(fn)
+		if err != nil {
+			return nil, err
+		}
+		infos = append(infos, namesCacheFileInfo{
+			Path:    filepath.ToSlash(fn),
+			Size:    st.Size(),
+			ModTime: st.ModTime().Unix(),
+		})
+	}
+	return infos, nil
+}
+
+func namesFilesEqual(a, b []namesCacheFileInfo) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	am := map[string]namesCacheFileInfo{}
+	for _, i := range a {
+		am[i.Path] = i
+	}
+	for _, i := range b {
+		j, ok := am[i.Path]
+		if !ok {
+			return false
+		}
+		if j.Size != i.Size || j.ModTime != i.ModTime {
+			return false
+		}
+	}
+	return true
 }
 
 func (ng *NamesGenerator) NameGenerate(rule string) string {

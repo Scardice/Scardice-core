@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/gob"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -43,7 +46,16 @@ import (
 	sealws "Scardice-core/utils/plugin/websocket"
 )
 
-var jsTaskCronParser = cron.NewParser(
+var (
+	// OfficialModPublicKey 官方 Mod 公钥
+	OfficialModPublicKey = ``
+
+	signRe = regexp.MustCompile(`^// sign\s+([^\r\n]+)?[\r\n]+$`)
+)
+
+var taskTimeRe = regexp.MustCompile(`^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$`)
+
+var taskCronParser = cron.NewParser(
 	cron.SecondOptional |
 		cron.Minute |
 		cron.Hour |
@@ -53,14 +65,13 @@ var jsTaskCronParser = cron.NewParser(
 		cron.Descriptor,
 )
 
-var (
-	// OfficialModPublicKey 官方 Mod 公钥
-	OfficialModPublicKey = ``
-
-	signRe = regexp.MustCompile(`^// sign\s+([^\r\n]+)?[\r\n]+$`)
+const (
+	jsCacheDir         = "./data/.cache/js"
+	jsMetaCacheFile    = "meta.gob"
+	jsMetaCacheVersion = 1
+	tsCacheDir         = "./data/.cache/js/ts"
+	tsCacheVersion     = 1
 )
-
-var taskTimeRe = regexp.MustCompile(`^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$`)
 
 type PrinterFunc struct {
 	d        *Dice
@@ -144,7 +155,7 @@ func (d *Dice) jsInitGojaCore() {
 	reg.RegisterNativeModule("console", console.RequireWithPrinter(printer))
 	reg.RegisterNativeModule("crypto", sealcrypto.Require)
 
-	d.JsScriptCron = cron.New(cron.WithParser(jsTaskCronParser))
+	d.JsScriptCron = cron.New(cron.WithParser(taskCronParser))
 	d.JsScriptCronLock = &sync.Mutex{}
 	d.JsScriptCron.Start()
 	// 单独给WebSocket一个Logger
@@ -459,19 +470,25 @@ func (d *Dice) jsInitGojaCore() {
 
 			task := JsScriptTask{cron: scriptCron, key: key, task: fn, lock: ei.dice.JsScriptCronLock, logger: ei.dice.Logger}
 			expr := value
-			if key != "" {
+			if key != "" && taskType != "once" {
 				if config := d.ConfigManager.getConfig(ei.Name, key); config != nil {
 					expr = config.Value.(string)
 					// Stop old task
 					if config.task != nil {
 						config.task.Off()
+						ei.taskList = removeTaskFromList(ei.taskList, config.task)
 					}
 				}
 			}
 
 			switch taskType {
 			case "cron":
-				entryID, err := scriptCron.AddFunc(expr, func() {
+				cronExpr, err := parseTaskCronExpr(expr)
+				if err != nil {
+					panic("插件注册定时任务失败：" + err.Error())
+				}
+
+				entryID, err := scriptCron.AddFunc(cronExpr, func() {
 					task.run()
 				})
 				if err != nil {
@@ -480,9 +497,10 @@ func (d *Dice) jsInitGojaCore() {
 				}
 				task.taskType = taskType
 				task.rawValue = expr
-				task.cronExpr = expr
+				task.cronExpr = cronExpr
+				expr = cronExpr // 保持配置值为规范化后的有效表达式
 				task.entryID = &entryID
-				ei.dice.Logger.Infof("插件注册定时任务：cron=%s", expr)
+				ei.dice.Logger.Infof("插件注册定时任务：cron=%s", cronExpr)
 			case "daily":
 				// 支持每天定时触发，24 小时表示
 				cronExpr, err := parseTaskTime(expr)
@@ -502,12 +520,25 @@ func (d *Dice) jsInitGojaCore() {
 				task.cronExpr = cronExpr
 				task.entryID = &entryID
 				ei.dice.Logger.Infof("插件注册定时任务：daily=%s", expr)
+			case "once":
+				onceAt, normalizedExpr, err := parseTaskOnceExpr(expr)
+				if err != nil {
+					panic("插件注册定时任务失败：" + err.Error())
+				}
+				task.taskType = taskType
+				task.rawValue = expr
+				task.onceAt = onceAt
+				expr = normalizedExpr // 保存为绝对执行时间戳，避免重载后延迟重复计算
+				if !task.On() {
+					panic("插件注册定时任务失败：一次任务注册失败")
+				}
+				ei.dice.Logger.Infof("插件注册定时任务：once=%s", expr)
 			default:
-				d.Logger.Errorf("插件注册定时任务失败：错误的任务类型：%s，当前仅支持 cron|daily", taskType)
+				d.Logger.Errorf("插件注册定时任务失败：错误的任务类型：%s，当前仅支持 cron|daily|once", taskType)
 				return nil
 			}
 
-			if key != "" {
+			if key != "" && taskType != "once" {
 				config := d.ConfigManager.getConfig(ei.Name, key)
 
 				switch taskType {
@@ -533,17 +564,74 @@ func (d *Dice) jsInitGojaCore() {
 				d.ConfigManager.RegisterPluginConfig(ei.Name, config)
 			}
 
-			if key == "" {
-				// 如果不提供 key，手动避免 task 失去引用
-				if ei.taskList == nil {
-					ei.taskList = make([]*JsScriptTask, 0)
-					ei.taskList = append(ei.taskList, &task)
-				} else {
-					ei.taskList = append(ei.taskList, &task)
+			if ei.taskList == nil {
+				ei.taskList = make([]*JsScriptTask, 0)
+			}
+			ei.taskList = append(ei.taskList, &task)
+
+			return &task
+		})
+		_ = ext.Set("removeTask", func(ei *ExtInfo, taskType string, key string) int {
+			if ei.dice == nil {
+				panic(errors.New("请先完成此扩展的注册"))
+			}
+
+			taskType, key = normalizeTaskSelector(taskType, key)
+			taskSet := make(map[*JsScriptTask]struct{})
+			configKeySet := make(map[string]struct{})
+
+			for _, task := range ei.taskList {
+				if matchTaskSelector(task, taskType, key) {
+					taskSet[task] = struct{}{}
+					if task.key != "" && task.taskType != "once" {
+						configKeySet[task.key] = struct{}{}
+					}
 				}
 			}
 
-			return &task
+			cm := d.ConfigManager
+			cm.lock.RLock()
+			pluginConfig := cm.Plugins[ei.Name]
+			if pluginConfig != nil {
+				for cfgKey, cfgItem := range pluginConfig.Configs {
+					if cfgItem == nil {
+						continue
+					}
+					cfgTaskType, isTask := configTypeToTaskType(cfgItem.Type)
+					if !isTask || !taskTypeMatched(taskType, cfgTaskType) || !keyMatched(key, cfgKey) {
+						continue
+					}
+					configKeySet[cfgKey] = struct{}{}
+					if cfgItem.task != nil {
+						taskSet[cfgItem.task] = struct{}{}
+					}
+				}
+			}
+			cm.lock.RUnlock()
+
+			for task := range taskSet {
+				_ = task.Off()
+			}
+
+			if len(taskSet) > 0 {
+				filtered := make([]*JsScriptTask, 0, len(ei.taskList))
+				for _, task := range ei.taskList {
+					if _, hit := taskSet[task]; !hit {
+						filtered = append(filtered, task)
+					}
+				}
+				ei.taskList = filtered
+			}
+
+			if len(configKeySet) > 0 {
+				keys := make([]string, 0, len(configKeySet))
+				for cfgKey := range configKeySet {
+					keys = append(keys, cfgKey)
+				}
+				d.ConfigManager.UnregisterConfig(ei.Name, keys...)
+			}
+
+			return len(taskSet)
 		})
 
 		// COC规则自定义
@@ -710,7 +798,7 @@ func (d *Dice) jsInitGojaCore() {
 
 func (d *Dice) ensureJsScriptCron() *cron.Cron {
 	if d.JsScriptCron == nil {
-		d.JsScriptCron = cron.New(cron.WithParser(jsTaskCronParser))
+		d.JsScriptCron = cron.New(cron.WithParser(taskCronParser))
 		d.JsScriptCron.Start()
 	}
 	if d.JsScriptCronLock == nil {
@@ -1891,11 +1979,146 @@ func isScriptFile(filename string) bool {
 	return temp == ".js" || temp == ".ts"
 }
 
+func jsCacheKey(path string) string {
+	return filepath.ToSlash(path)
+}
+
+func loadJsMetaCache() *jsMetaCache {
+	cachePath := filepath.Join(jsCacheDir, jsMetaCacheFile)
+	f, err := os.Open(cachePath)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var cache jsMetaCache
+	dec := gob.NewDecoder(f)
+	if err := dec.Decode(&cache); err != nil {
+		return nil
+	}
+	if cache.Version != jsMetaCacheVersion {
+		return nil
+	}
+	if cache.Files == nil {
+		cache.Files = map[string]jsMetaCacheEntry{}
+	}
+	return &cache
+}
+
+func saveJsMetaCache(cache *jsMetaCache) {
+	if cache == nil {
+		return
+	}
+	_ = os.MkdirAll(jsCacheDir, 0o755)
+	cachePath := filepath.Join(jsCacheDir, jsMetaCacheFile)
+	tmpPath := cachePath + ".tmp"
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return
+	}
+	enc := gob.NewEncoder(f)
+	if err := enc.Encode(cache); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return
+	}
+	_ = os.Rename(tmpPath, cachePath)
+}
+
+func buildJsScriptInfoFromCache(d *Dice, path string, entry jsMetaCacheEntry) (*JsScriptInfo, error) {
+	if entry.ParseErr != "" {
+		return nil, errors.New(entry.ParseErr)
+	}
+	jsInfo := &JsScriptInfo{
+		Name:         entry.Meta.Name,
+		Filename:     path,
+		InstallTime:  entry.InstallTime,
+		Version:      entry.Meta.Version,
+		Author:       entry.Meta.Author,
+		License:      entry.Meta.License,
+		HomePage:     entry.Meta.HomePage,
+		Desc:         entry.Meta.Desc,
+		UpdateTime:   entry.Meta.UpdateTime,
+		UpdateUrls:   entry.Meta.UpdateUrls,
+		Etag:         entry.Meta.Etag,
+		Official:     entry.Meta.Official,
+		signStatus:   entry.Meta.SignStatus,
+		Builtin:      entry.Builtin,
+		needCompiled: entry.Meta.NeedCompiled,
+		StoreID:      entry.Meta.StoreID,
+	}
+	if jsInfo.Name == "" {
+		jsInfo.Name = filepath.Base(path)
+	}
+	for _, dep := range entry.Meta.Depends {
+		c, err := semver.NewConstraint(dep.Constraint)
+		if err != nil {
+			return nil, err
+		}
+		jsInfo.Depends = append(jsInfo.Depends, JsScriptDepends{
+			Author:     dep.Author,
+			Name:       dep.Name,
+			Constraint: c,
+			RawKey:     dep.RawKey,
+		})
+	}
+	jsInfo.Enable = !(&d.Config).DisabledJsScripts[jsInfo.Name]
+	d.JsScriptList = append(d.JsScriptList, jsInfo)
+	return jsInfo, nil
+}
+
+func buildJsMetaCacheEntry(path string, info fs.FileInfo, jsInfo *JsScriptInfo, builtin bool, parseErr error) jsMetaCacheEntry {
+	entry := jsMetaCacheEntry{
+		Path:        filepath.ToSlash(path),
+		Size:        info.Size(),
+		ModTime:     info.ModTime().Unix(),
+		Builtin:     builtin,
+		InstallTime: info.ModTime().Unix(),
+	}
+	if parseErr != nil {
+		entry.ParseErr = parseErr.Error()
+		return entry
+	}
+	if jsInfo == nil {
+		return entry
+	}
+	entry.Meta = jsMetaInfo{
+		Name:         jsInfo.Name,
+		Version:      jsInfo.Version,
+		Author:       jsInfo.Author,
+		License:      jsInfo.License,
+		HomePage:     jsInfo.HomePage,
+		Desc:         jsInfo.Desc,
+		UpdateTime:   jsInfo.UpdateTime,
+		UpdateUrls:   jsInfo.UpdateUrls,
+		Etag:         jsInfo.Etag,
+		Official:     jsInfo.Official,
+		SignStatus:   jsInfo.signStatus,
+		NeedCompiled: jsInfo.needCompiled,
+		StoreID:      jsInfo.StoreID,
+	}
+	for _, dep := range jsInfo.Depends {
+		entry.Meta.Depends = append(entry.Meta.Depends, jsMetaDepends{
+			Author:     dep.Author,
+			Name:       dep.Name,
+			Constraint: dep.Constraint.String(),
+			RawKey:     dep.RawKey,
+		})
+	}
+	return entry
+}
+
 func (d *Dice) JsLoadScripts() {
 	d.JsScriptList = []*JsScriptInfo{}
 
 	path := filepath.Join(d.BaseConfig.DataDir, "scripts")
 	builtinPath := filepath.Join(path, "_builtin")
+
+	metaCache := loadJsMetaCache()
+	newCache := &jsMetaCache{Version: jsMetaCacheVersion, Files: map[string]jsMetaCacheEntry{}}
 
 	// 导出内置脚本数据
 	builtinScripts, _ := fs.ReadDir(static.Scripts, "scripts")
@@ -1925,25 +2148,53 @@ func (d *Dice) JsLoadScripts() {
 	_ = filepath.Walk(builtinPath, func(path string, info fs.FileInfo, err error) error {
 		if isScriptFile(path) {
 			d.Logger.Info("正在读取内置脚本: ", path)
+			key := jsCacheKey(path)
+			if metaCache != nil {
+				if entry, ok := metaCache.Files[key]; ok &&
+					entry.Builtin && entry.Size == info.Size() && entry.ModTime == info.ModTime().Unix() {
+					if entry.Meta.SignStatus != OfficialSign {
+						d.Logger.Warnf("内置脚本「%s」校验未通过，拒绝加载", path)
+						newCache.Files[key] = entry
+						return nil
+					}
+					jsInfo, err := buildJsScriptInfoFromCache(d, "./"+path, entry)
+					if err == nil {
+						jsInfos = append(jsInfos, jsInfo)
+						if len(jsInfo.StoreID) > 0 {
+							d.StoreManager.InstalledPlugins[jsInfo.StoreID] = true
+						}
+						newCache.Files[key] = entry
+						return nil
+					}
+					entry.ParseErr = err.Error()
+					newCache.Files[key] = entry
+					d.Logger.Error("读取内置脚本失败(错误依赖)", err.Error())
+					return nil
+				}
+			}
+
 			data, err := os.ReadFile(path)
 			if err != nil {
 				d.Logger.Error("读取内置脚本失败(无法访问): ", err.Error())
 				return nil
 			}
-			// 检查内置脚本签名，检查不通过则拒绝加载
-			scriptData, _ := os.ReadFile(path)
-			if ok, _ := CheckJsSign(scriptData); ok {
-				jsInfo, err := d.JsParseMeta("./"+path, info.ModTime(), data, true)
-				if err != nil {
-					d.Logger.Error("读取内置脚本失败(错误依赖)", err.Error())
-					return nil
-				}
-				jsInfos = append(jsInfos, jsInfo)
-				if len(jsInfo.StoreID) > 0 {
-					d.StoreManager.InstalledPlugins[jsInfo.StoreID] = true
-				}
-			} else {
+			ok, signStatus := CheckJsSign(data)
+			if !ok {
 				d.Logger.Warnf("内置脚本「%s」校验未通过，拒绝加载", path)
+				entry := buildJsMetaCacheEntry(path, info, nil, true, errors.New("signature invalid"))
+				entry.Meta.SignStatus = signStatus
+				newCache.Files[key] = entry
+				return nil
+			}
+			jsInfo, err := d.JsParseMeta("./"+path, info.ModTime(), data, true)
+			newCache.Files[key] = buildJsMetaCacheEntry(path, info, jsInfo, true, err)
+			if err != nil {
+				d.Logger.Error("读取内置脚本失败(错误依赖)", err.Error())
+				return nil
+			}
+			jsInfos = append(jsInfos, jsInfo)
+			if len(jsInfo.StoreID) > 0 {
+				d.StoreManager.InstalledPlugins[jsInfo.StoreID] = true
 			}
 		}
 		return nil
@@ -1956,12 +2207,33 @@ func (d *Dice) JsLoadScripts() {
 		}
 		if isScriptFile(path) {
 			d.Logger.Info("正在读取脚本: ", path)
+			key := jsCacheKey(path)
+			if metaCache != nil {
+				if entry, ok := metaCache.Files[key]; ok &&
+					!entry.Builtin && entry.Size == info.Size() && entry.ModTime == info.ModTime().Unix() {
+					jsInfo, err := buildJsScriptInfoFromCache(d, "./"+path, entry)
+					if err == nil {
+						jsInfos = append(jsInfos, jsInfo)
+						if len(jsInfo.StoreID) > 0 {
+							d.StoreManager.InstalledPlugins[jsInfo.StoreID] = true
+						}
+						newCache.Files[key] = entry
+						return nil
+					}
+					entry.ParseErr = err.Error()
+					newCache.Files[key] = entry
+					d.Logger.Error("读取脚本失败(错误依赖)", err.Error())
+					return nil
+				}
+			}
+
 			data, err := os.ReadFile(path)
 			if err != nil {
 				d.Logger.Error("读取脚本失败(无法访问): ", err.Error())
 				return nil
 			}
 			jsInfo, err := d.JsParseMeta("./"+path, info.ModTime(), data, false)
+			newCache.Files[key] = buildJsMetaCacheEntry(path, info, jsInfo, false, err)
 			if err != nil {
 				d.Logger.Error("读取脚本失败(错误依赖)", err.Error())
 				return nil
@@ -1973,6 +2245,8 @@ func (d *Dice) JsLoadScripts() {
 		}
 		return nil
 	})
+
+	saveJsMetaCache(newCache)
 
 	// 检查依赖是否满足
 	unloadKeySet := make(map[string]bool)
@@ -2188,6 +2462,45 @@ type JsScriptDepends struct {
 	RawKey string `json:"rawKey"`
 }
 
+type jsMetaDepends struct {
+	Author     string `json:"author"`
+	Name       string `json:"name"`
+	Constraint string `json:"constraint"`
+	RawKey     string `json:"rawKey"`
+}
+
+type jsMetaInfo struct {
+	Name         string          `json:"name"`
+	Version      string          `json:"version"`
+	Author       string          `json:"author"`
+	License      string          `json:"license"`
+	HomePage     string          `json:"homepage"`
+	Desc         string          `json:"desc"`
+	UpdateTime   int64           `json:"updateTime"`
+	UpdateUrls   []string        `json:"updateUrls"`
+	Etag         string          `json:"etag"`
+	Official     bool            `json:"official"`
+	SignStatus   SignStatus      `json:"signStatus"`
+	Depends      []jsMetaDepends `json:"depends"`
+	NeedCompiled bool            `json:"needCompiled"`
+	StoreID      string          `json:"storeId"`
+}
+
+type jsMetaCacheEntry struct {
+	Path        string     `json:"path"`
+	Size        int64      `json:"size"`
+	ModTime     int64      `json:"modTime"`
+	Builtin     bool       `json:"builtin"`
+	InstallTime int64      `json:"installTime"`
+	ParseErr    string     `json:"parseErr"`
+	Meta        jsMetaInfo `json:"meta"`
+}
+
+type jsMetaCache struct {
+	Version int                         `json:"version"`
+	Files   map[string]jsMetaCacheEntry `json:"files"`
+}
+
 func (d *Dice) JsParseMeta(s string, installTime time.Time, rawData []byte, builtin bool) (*JsScriptInfo, error) {
 	// 读取文件内容填空，类似油猴脚本那种形式
 	jsInfo := &JsScriptInfo{
@@ -2316,12 +2629,15 @@ func (d *Dice) JsLoadScriptRaw(jsInfo *JsScriptInfo) {
 	if jsInfo.Enable {
 		d.JsLoadingScript = jsInfo
 		var targetPath string
+		var cleanup bool
 		if jsInfo.needCompiled {
 			d.Logger.Infof("脚本<%s>正在经过编译处理……", jsInfo.Name)
-			targetPath, err = tsScriptCompile(jsInfo.Filename)
-			defer func(name string) {
-				_ = os.Remove(name)
-			}(targetPath)
+			targetPath, cleanup, err = tsScriptCompile(jsInfo.Filename)
+			if cleanup {
+				defer func(name string) {
+					_ = os.Remove(name)
+				}(targetPath)
+			}
 		} else {
 			targetPath = jsInfo.Filename
 		}
@@ -2366,10 +2682,10 @@ func (d *Dice) jsRequireModule(targetPath string) error {
 	return err
 }
 
-func tsScriptCompile(path string) (string, error) {
+func tsScriptCompile(path string) (string, bool, error) {
 	script, err := os.ReadFile(path)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	compiled := esbuild.Transform(string(script), esbuild.TransformOptions{
 		Loader: esbuild.LoaderTS,
@@ -2379,20 +2695,35 @@ func tsScriptCompile(path string) (string, error) {
 		for _, e := range compiled.Errors {
 			msg.WriteString(e.Text) // FIXME 优化错误信息展示
 		}
-		return "", errors.New(msg.String())
+		return "", false, errors.New(msg.String())
 	}
-	compiledPath, err := os.CreateTemp("", "compiled-*-"+filepath.Base(path))
+	sum := sha256.Sum256(append([]byte(fmt.Sprintf("ts-cache:%d;", tsCacheVersion)), script...))
+	filename := hex.EncodeToString(sum[:]) + ".js"
+	cachePath := filepath.Join(tsCacheDir, filename)
+	if _, statErr := os.Stat(cachePath); statErr == nil {
+		return cachePath, false, nil
+	}
+	if mkErr := os.MkdirAll(tsCacheDir, 0o755); mkErr != nil {
+		return "", false, mkErr
+	}
+	tmpFile, err := os.CreateTemp(tsCacheDir, "compiled-*.js")
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	defer func(compiledPath *os.File) {
-		_ = compiledPath.Close()
-	}(compiledPath)
-	_, err = compiledPath.Write(compiled.Code)
-	if err != nil {
-		return "", err
+	if _, err := tmpFile.Write(compiled.Code); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name()) //nolint:gosec // temp file path is controlled
+		return "", false, err
 	}
-	return compiledPath.Name(), nil
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpFile.Name()) //nolint:gosec // temp file path is controlled
+		return "", false, err
+	}
+	if err := os.Rename(tmpFile.Name(), cachePath); err != nil { //nolint:gosec // temp file path is controlled
+		//nolint:nilerr // fallback to temp file path if rename fails
+		return tmpFile.Name(), true, nil
+	}
+	return cachePath, false, nil
 }
 
 func CheckJsSign(rawData []byte) (bool, SignStatus) {
@@ -2684,11 +3015,14 @@ type JsScriptTask struct {
 
 	cron     *cron.Cron
 	cronExpr string
+	onceAt   time.Time
+	timer    *time.Timer
 	task     func(JsScriptTaskCtx)
 	entryID  *cron.EntryID
 	lock     *sync.Mutex
 
-	logger *zap.SugaredLogger
+	stateLock sync.Mutex
+	logger    *zap.SugaredLogger
 }
 
 type JsScriptTaskCtx struct {
@@ -2712,48 +3046,249 @@ func (t *JsScriptTask) run() {
 }
 
 func (t *JsScriptTask) On() bool {
-	if t.entryID != nil {
+	t.stateLock.Lock()
+	defer t.stateLock.Unlock()
+
+	switch t.taskType {
+	case "once":
+		if t.timer != nil {
+			return true
+		}
+		delay := time.Until(t.onceAt)
+		if delay < 0 {
+			delay = 0
+		}
+		var timer *time.Timer
+		timer = time.AfterFunc(delay, func() {
+			t.run()
+			t.stateLock.Lock()
+			if t.timer == timer {
+				t.timer = nil
+			}
+			t.stateLock.Unlock()
+		})
+		t.timer = timer
 		return true
-	}
-	entryID, err := t.cron.AddFunc(t.cronExpr, func() {
-		t.run()
-	})
-	if err != nil {
+	case "cron", "daily":
+		if t.entryID != nil {
+			return true
+		}
+		entryID, err := t.cron.AddFunc(t.cronExpr, func() {
+			t.run()
+		})
+		if err != nil {
+			return false
+		}
+		t.entryID = &entryID
+		return true
+	default:
 		return false
 	}
-	t.entryID = &entryID
-	return true
 }
 
 func (t *JsScriptTask) Off() bool {
-	if t.entryID == nil {
+	t.stateLock.Lock()
+	defer t.stateLock.Unlock()
+
+	switch t.taskType {
+	case "once":
+		if t.timer == nil {
+			return true
+		}
+		t.timer.Stop()
+		t.timer = nil
 		return true
+	case "cron", "daily":
+		if t.entryID == nil {
+			return true
+		}
+		t.cron.Remove(*t.entryID)
+		t.entryID = nil
+		return true
+	default:
+		return false
 	}
-	t.cron.Remove(*t.entryID)
-	t.entryID = nil
-	return true
 }
 
 func (t *JsScriptTask) reset(expr string) error {
-	if t.entryID != nil {
+	var wasScheduled bool
+	t.stateLock.Lock()
+	if t.taskType == "once" {
+		wasScheduled = t.timer != nil
+	} else {
+		wasScheduled = t.entryID != nil
+	}
+	t.stateLock.Unlock()
+
+	if wasScheduled {
 		t.Off()
-		defer t.On()
 	}
 
 	t.rawValue = expr
+	shouldOn := wasScheduled
 	switch t.taskType {
 	case "cron":
-		t.cronExpr = expr
+		cronExpr, err := parseTaskCronExpr(expr)
+		if err != nil {
+			return err
+		}
+		t.cronExpr = cronExpr
 	case "daily":
 		cronExpr, err := parseTaskTime(expr)
 		if err != nil {
 			return err
 		}
 		t.cronExpr = cronExpr
+	case "once":
+		onceAt, normalizedExpr, err := parseTaskOnceExpr(expr)
+		if err != nil {
+			return err
+		}
+		t.onceAt = onceAt
+		t.rawValue = normalizedExpr
+		shouldOn = true // once 任务重置后应重新挂载一次执行
 	default:
 		return fmt.Errorf("unknown task type %s", t.taskType)
 	}
+
+	if shouldOn && !t.On() {
+		return errors.New("重新注册任务失败")
+	}
 	return nil
+}
+
+func parseTaskCronExpr(expr string) (string, error) {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return "", errors.New("cron 表达式不能为空")
+	}
+
+	if strings.HasPrefix(expr, "@") {
+		lowerExpr := strings.ToLower(expr)
+		switch lowerExpr {
+		case "@yearly", "@annually", "@monthly", "@weekly", "@daily", "@midnight", "@hourly":
+			if _, err := taskCronParser.Parse(lowerExpr); err != nil {
+				return "", fmt.Errorf("cron 描述符解析失败: %w", err)
+			}
+			return lowerExpr, nil
+		default:
+			// 向后兼容 @every 语法
+			fields := strings.Fields(lowerExpr)
+			if len(fields) == 2 && fields[0] == "@every" {
+				normalized := strings.Join(fields, " ")
+				if _, err := taskCronParser.Parse(normalized); err != nil {
+					return "", fmt.Errorf("cron 描述符解析失败: %w", err)
+				}
+				return normalized, nil
+			}
+			return "", errors.New("仅支持 @yearly/@annually/@monthly/@weekly/@daily/@midnight/@hourly（以及兼容 @every）")
+		}
+	}
+
+	fields := strings.Fields(expr)
+	if len(fields) != 5 && len(fields) != 6 {
+		return "", fmt.Errorf("cron 表达式仅支持 5 位或 6 位(含秒)，当前为 %d 位", len(fields))
+	}
+
+	normalized := strings.Join(fields, " ")
+	if _, err := taskCronParser.Parse(normalized); err != nil {
+		return "", fmt.Errorf("cron 表达式解析失败: %w", err)
+	}
+
+	return normalized, nil
+}
+
+func parseTaskOnceExpr(expr string) (time.Time, string, error) {
+	const maxDelayMs int64 = int64(365*24*time.Hour) / int64(time.Millisecond)
+	const maxPastDuration = 365 * 24 * time.Hour
+
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return time.Time{}, "", errors.New("once 表达式不能为空")
+	}
+
+	delayOrTs, err := strconv.ParseInt(expr, 10, 64)
+	if err != nil {
+		return time.Time{}, "", errors.New("once 仅支持毫秒延迟或 13 位毫秒时间戳")
+	}
+	if delayOrTs < 0 {
+		return time.Time{}, "", errors.New("once 不支持负数")
+	}
+
+	now := time.Now()
+	digitLen := len(strings.TrimLeft(expr, "+-"))
+	isTimestamp := digitLen == 13
+
+	// 智能判断：非13位但超过1年延迟时，优先尝试按时间戳解释。
+	if !isTimestamp && delayOrTs > maxDelayMs {
+		ts := time.UnixMilli(delayOrTs)
+		if ts.After(now.Add(-maxPastDuration)) {
+			isTimestamp = true
+		} else {
+			return time.Time{}, "", errors.New("once 延迟超过1年，请使用13位毫秒时间戳")
+		}
+	}
+
+	var executeAt time.Time
+	if isTimestamp {
+		executeAt = time.UnixMilli(delayOrTs)
+	} else {
+		executeAt = now.Add(time.Duration(delayOrTs) * time.Millisecond)
+	}
+	return executeAt, strconv.FormatInt(executeAt.UnixMilli(), 10), nil
+}
+
+func normalizeTaskSelector(taskType string, key string) (string, string) {
+	taskType = strings.ToLower(strings.TrimSpace(taskType))
+	if taskType == "" {
+		taskType = "*"
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		key = "*"
+	}
+	return taskType, key
+}
+
+func taskTypeMatched(selector string, taskType string) bool {
+	return selector == "*" || selector == strings.ToLower(taskType)
+}
+
+func keyMatched(selector string, key string) bool {
+	return selector == "*" || selector == key
+}
+
+func matchTaskSelector(task *JsScriptTask, taskType string, key string) bool {
+	if task == nil {
+		return false
+	}
+	return taskTypeMatched(taskType, task.taskType) && keyMatched(key, task.key)
+}
+
+func configTypeToTaskType(configType string) (string, bool) {
+	switch configType {
+	case "task:cron":
+		return "cron", true
+	case "task:daily":
+		return "daily", true
+	case "task:once":
+		return "once", true
+	default:
+		return "", false
+	}
+}
+
+func removeTaskFromList(taskList []*JsScriptTask, target *JsScriptTask) []*JsScriptTask {
+	if len(taskList) == 0 || target == nil {
+		return taskList
+	}
+	filtered := make([]*JsScriptTask, 0, len(taskList))
+	for _, task := range taskList {
+		if task != target {
+			filtered = append(filtered, task)
+		}
+	}
+	return filtered
 }
 
 // parseTaskTime 将 24 小时时间转换为 cron 表达式

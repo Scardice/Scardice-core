@@ -99,7 +99,7 @@ func (i *ConfigItem) UnmarshalJSON(data []byte) error {
 	}
 
 	switch i.Type {
-	case "string", "task:cron", "task:daily":
+	case "string", "task:cron", "task:daily", "task:once":
 		var stringVal string
 		if err := json.Unmarshal(raw["defaultValue"], &stringVal); err != nil {
 			return fmt.Errorf("ConfigItem (%s-%s): unmarshal 'defaultValue' failed as %w", i.Key, i.Type, err)
@@ -308,8 +308,15 @@ func (cm *ConfigManager) SetConfig(pluginName, key string, value interface{}) er
 	configItem, exists := plugin.Configs[key]
 	if exists {
 		switch configItem.Type {
-		case "task:cron", "task:daily":
+		case "task:cron", "task:daily", "task:once":
 			val := value.(string)
+			if configItem.Type == "task:once" {
+				_, normalized, err := parseTaskOnceExpr(val)
+				if err != nil {
+					return err
+				}
+				val = normalized
+			}
 			configItem.Value = val
 			// 立即生效
 			if configItem.task != nil {
@@ -359,12 +366,20 @@ func (cm *ConfigManager) ResetConfigToDefault(pluginName, key string) {
 	if exists {
 		log.Debug("reset config to default", pluginName, key)
 		configItem.Value = configItem.DefaultValue
-		plugin.Configs[key] = configItem
 		if strings.HasPrefix(configItem.Type, "task:") {
+			taskVal := configItem.Value.(string)
+			if configItem.Type == "task:once" {
+				_, normalized, err := parseTaskOnceExpr(taskVal)
+				if err == nil {
+					taskVal = normalized
+					configItem.Value = normalized
+				}
+			}
 			if configItem.task != nil {
-				_ = configItem.task.reset(configItem.Value.(string))
+				_ = configItem.task.reset(taskVal)
 			}
 		}
+		plugin.Configs[key] = configItem
 		cm.Plugins[pluginName] = plugin
 	}
 	_ = cm.save()

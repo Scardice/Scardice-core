@@ -41,6 +41,8 @@ type SearchEngine interface {
 	AddItem(item HelpTextItem) (string, error)
 	// AddItemApply 提交文档条目
 	AddItemApply(end bool) error
+	// DeleteByFrom 删除指定来源路径的文档
+	DeleteByFrom(from string) error
 	// Search 搜索文档条目
 	Search(helpPackages []string, text string, titleOnly bool, pageSize, pageNum int, group string) (*GeneralSearchResult, int, int, int, error)
 	// GetHelpTextItemByTermTitle 精确查询title，用于嵌套获取数据的情形
@@ -51,4 +53,6 @@ type SearchEngine interface {
 	PaginateDocuments(pageSize, pageNum int, group, from, title string) (uint64, []*HelpTextItem, error)
 	// GetTotalID 获取当前ID总数，注意，ID必须是顺序排列的
 	GetTotalID() uint64
+	// SetTotalID 设置当前ID总数，用于复用索引时避免ID冲突
+	SetTotalID(total uint64)
 }

@@ -3,6 +3,7 @@ package docengine
 import (
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"strconv"
 	"sync/atomic"
@@ -20,9 +21,10 @@ type BleveSearchEngine struct {
 	batch     *bleve.Batch
 	batchSize int
 	CurID     uint64
+	reuse     bool
 }
 
-var indexDir = "./data/_index"
+var indexDir = "./data/.cache/helpdoc/index"
 var reSpace = regexp.MustCompile(`\s+`)
 
 // getNextID 使用原子操作，避免并发问题
@@ -33,8 +35,8 @@ func (d *BleveSearchEngine) getNextID() string {
 }
 
 // NewEngine 创建并初始化 BleveSearchEngine
-func NewBleveSearchEngine() (*BleveSearchEngine, error) {
-	engine := &BleveSearchEngine{}
+func NewBleveSearchEngine(reuse bool) (*BleveSearchEngine, error) {
+	engine := &BleveSearchEngine{reuse: reuse}
 	err := engine.Init()
 	if err != nil {
 		return nil, err
@@ -55,33 +57,48 @@ func (d *BleveSearchEngine) GetShowBestOffset() int {
 }
 
 func (d *BleveSearchEngine) Init() error {
-	mapping := bleve.NewIndexMapping()
-	docMapping := bleve.NewDocumentMapping()
-	contentFieldMapping := bleve.NewTextFieldMapping()
-	titleFieldMapping := bleve.NewTextFieldMapping()
-	keywordMapping := bleve.NewKeywordFieldMapping()
-	// 试图：不区分大小写的搜索方案
-	keywordMapping.Analyzer = simple.Name
-	// 注意： 这里group,from,package都是keywordMapping
-	// title既要做分词匹配，又要做精确匹配，需要特殊配置它
-	// 下面这些GPT说的，如果不对，随便改。
-	// 不需要分词，只需要支持模糊匹配（类似 SQL 中的 LIKE），那么 keyword 类型的字段 是最合适的选择。
-	// keyword 类型的字段会将整个字段值作为一个整体存储，适合精确匹配和通配符匹配（如 NewWildcardQuery）。
-	docMapping.AddFieldMappingsAt("group", keywordMapping)
-	docMapping.AddFieldMappingsAt("from", keywordMapping)
-	docMapping.AddFieldMappingsAt("title", titleFieldMapping)
-	// Content才是真正的文档
-	docMapping.AddFieldMappingsAt("content", contentFieldMapping)
-	docMapping.AddFieldMappingsAt("package", keywordMapping)
-	mapping.AddDocumentMapping("helpdoc", docMapping)
-	mapping.TypeField = "_type"
-	i, err := bleve.New(indexDir, mapping)
-	if err != nil {
-		return err
+	if d.reuse {
+		if _, err := os.Stat(indexDir); err != nil {
+			return err
+		}
+		i, err := bleve.Open(indexDir)
+		if err != nil {
+			return err
+		}
+		d.Index = i
+		// 初始化ID列表（复用索引时以文档数为准）
+		if count, err := d.Index.DocCount(); err == nil {
+			d.CurID = count
+		}
+	} else {
+		mapping := bleve.NewIndexMapping()
+		docMapping := bleve.NewDocumentMapping()
+		contentFieldMapping := bleve.NewTextFieldMapping()
+		titleFieldMapping := bleve.NewTextFieldMapping()
+		keywordMapping := bleve.NewKeywordFieldMapping()
+		// 试图：不区分大小写的搜索方案
+		keywordMapping.Analyzer = simple.Name
+		// 注意： 这里group,from,package都是keywordMapping
+		// title既要做分词匹配，又要做精确匹配，需要特殊配置它
+		// 下面这些GPT说的，如果不对，随便改。
+		// 不需要分词，只需要支持模糊匹配（类似 SQL 中的 LIKE），那么 keyword 类型的字段 是最合适的选择。
+		// keyword 类型的字段会将整个字段值作为一个整体存储，适合精确匹配和通配符匹配（如 NewWildcardQuery）。
+		docMapping.AddFieldMappingsAt("group", keywordMapping)
+		docMapping.AddFieldMappingsAt("from", keywordMapping)
+		docMapping.AddFieldMappingsAt("title", titleFieldMapping)
+		// Content才是真正的文档
+		docMapping.AddFieldMappingsAt("content", contentFieldMapping)
+		docMapping.AddFieldMappingsAt("package", keywordMapping)
+		mapping.AddDocumentMapping("helpdoc", docMapping)
+		mapping.TypeField = "_type"
+		i, err := bleve.New(indexDir, mapping)
+		if err != nil {
+			return err
+		}
+		d.Index = i
+		// 初始化ID列表
+		d.CurID = 0
 	}
-	d.Index = i
-	// 初始化ID列表
-	d.CurID = 0
 	// 初始化新的batch
 	d.batch = d.Index.NewBatch()
 	return nil
@@ -96,6 +113,10 @@ func (d *BleveSearchEngine) Close() {
 
 func (d *BleveSearchEngine) GetTotalID() uint64 {
 	return d.CurID
+}
+
+func (d *BleveSearchEngine) SetTotalID(total uint64) {
+	d.CurID = total
 }
 
 // AddItem 这里引用了dice，其实不妥，应该将它单独拆出来的。
@@ -144,6 +165,32 @@ func (d *BleveSearchEngine) AddItemApply(end bool) error {
 			d.batch.Reset()
 		}
 		return err
+	}
+	return nil
+}
+
+func (d *BleveSearchEngine) DeleteByFrom(from string) error {
+	if d.Index == nil {
+		return nil
+	}
+	q := bleve.NewTermQuery(from)
+	q.SetField("from")
+	for {
+		req := bleve.NewSearchRequestOptions(q, 200, 0, false)
+		res, err := d.Index.Search(req)
+		if err != nil {
+			return err
+		}
+		if len(res.Hits) == 0 {
+			break
+		}
+		batch := d.Index.NewBatch()
+		for _, hit := range res.Hits {
+			batch.Delete(hit.ID)
+		}
+		if err := d.Index.Batch(batch); err != nil {
+			return err
+		}
 	}
 	return nil
 }
