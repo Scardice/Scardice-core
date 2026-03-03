@@ -16,6 +16,7 @@ type fakeBackend struct {
 }
 
 func (f *fakeBackend) Dispose() error      { return nil }
+func (f *fakeBackend) Quiesce() error      { return nil }
 func (f *fakeBackend) Eval(_ string) error { return f.evalErr }
 func (f *fakeBackend) EvalWithResult(_ string) (any, error) {
 	return "ok", f.evalErr
@@ -28,6 +29,12 @@ func (f *fakeBackend) RegisterHostAPI(api jsengine.HostAPI) error {
 func (f *fakeBackend) Reset() error { return f.resetErr }
 func (f *fakeBackend) InvokeStoredSolve(_ string, _ string, _ map[string]any) (map[string]any, error) {
 	return map[string]any{"matched": true, "solved": true}, nil
+}
+func (f *fakeBackend) InvokeStoredCmdHelp(_ string, _ string, _ bool) (string, error) {
+	return "help", nil
+}
+func (f *fakeBackend) InvokeStoredExtCallback(_ string, _ string, _ map[string]any) error {
+	return nil
 }
 func (f *fakeBackend) InvokeStoredOnNotCommand(_ string, _ map[string]any) error { return nil }
 func (f *fakeBackend) InvokeStoredTask(_ string, _ map[string]any) error         { return nil }
@@ -140,6 +147,27 @@ func TestAdapterRegisterHostAPI(t *testing.T) {
 	}
 	if len(b.apis) != 2 || b.apis[1] != "test2" {
 		t.Fatalf("运行期未向后端注入 API: %+v", b.apis)
+	}
+}
+
+func TestAdapterQuiesceKeepsDisposePathAvailable(t *testing.T) {
+	oldFactory := newRuntimeBackend
+	newRuntimeBackend = func(_ jsengine.Config, _ Options) (runtimeBackend, error) {
+		return &fakeBackend{}, nil
+	}
+	defer func() {
+		newRuntimeBackend = oldFactory
+	}()
+
+	a := NewAdapter()
+	if err := a.Init(context.Background(), jsengine.Config{Name: jsengine.EngineQuickJS}); err != nil {
+		t.Fatalf("Init 失败: %v", err)
+	}
+	if err := a.Quiesce(); err != nil {
+		t.Fatalf("Quiesce 失败: %v", err)
+	}
+	if err := a.Dispose(); err != nil {
+		t.Fatalf("Quiesce 后仍应允许 Dispose: %v", err)
 	}
 }
 

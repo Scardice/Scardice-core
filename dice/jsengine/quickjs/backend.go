@@ -6,12 +6,15 @@ import "Scardice-core/dice/jsengine"
 // 后续接入真实 QuickJS 绑定时，只需要实现该接口。
 type runtimeBackend interface {
 	Dispose() error
+	Quiesce() error
 	Eval(code string) error
 	EvalWithResult(code string) (any, error)
 	Require(moduleID string) error
 	RegisterHostAPI(api jsengine.HostAPI) error
 	Reset() error
 	InvokeStoredSolve(extName string, cmdName string, runtime map[string]any) (map[string]any, error)
+	InvokeStoredCmdHelp(extName string, cmdName string, isShort bool) (string, error)
+	InvokeStoredExtCallback(extName string, callbackName string, runtime map[string]any) error
 	InvokeStoredOnNotCommand(extName string, runtime map[string]any) error
 	InvokeStoredTask(fnRef string, taskCtx map[string]any) error
 }

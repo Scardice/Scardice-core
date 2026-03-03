@@ -44,10 +44,14 @@ type nativeBackend struct {
 	// QuickJS Context 非线程安全，所有 Eval/JS 调用必须串行。
 	vmMu sync.Mutex
 
-	runtimeMu        sync.Mutex
-	runtimePrivilege int64
-	runtimeGetArgN   func(int64) string
-	runtimeReply     func(string)
+	runtimeMu              sync.Mutex
+	runtimeGetArgN         func(int64) string
+	runtimeIsArgEqual      func(int64, []string) bool
+	runtimeGetKwargJSON    func(string) string
+	runtimeGetRestArgsFrom func(int64) string
+	runtimeReply           func(string)
+	runtimeValuesMu        sync.RWMutex
+	runtimeValues          map[string]any
 
 	httpClient *http.Client
 	wsMu       sync.Mutex
@@ -91,15 +95,16 @@ func newNativeBackend(cfg jsengine.Config, opt Options) (*nativeBackend, error) 
 	}
 
 	n := &nativeBackend{
-		runtime:    rt,
-		ctx:        ctx,
-		moduleDir:  cfg.ModuleDir,
-		opt:        opt,
-		apis:       make([]jsengine.HostAPI, 0, 8),
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-		wsConns:    map[int64]*wsBridgeConn{},
-		wsPumpStop: make(chan struct{}),
-		wsPumpDone: make(chan struct{}),
+		runtime:       rt,
+		ctx:           ctx,
+		moduleDir:     cfg.ModuleDir,
+		opt:           opt,
+		apis:          make([]jsengine.HostAPI, 0, 8),
+		runtimeValues: map[string]any{},
+		httpClient:    &http.Client{Timeout: 30 * time.Second},
+		wsConns:       map[int64]*wsBridgeConn{},
+		wsPumpStop:    make(chan struct{}),
+		wsPumpDone:    make(chan struct{}),
 	}
 	n.installBaseGlobals()
 	if err := n.initCryptoBridge(); err != nil {
@@ -282,6 +287,28 @@ func (n *nativeBackend) installBaseGlobals() {
 			return ctx.String("")
 		}
 		return ctx.String(n.runtimeGetArgN(args[0].ToInt64()))
+	}))
+	n.ctx.Globals().Set("__sd_runtime_isArgEqual", n.ctx.NewFunction(func(ctx *bq.Context, this *bq.Value, args []*bq.Value) *bq.Value {
+		if n.runtimeIsArgEqual == nil || len(args) == 0 {
+			return ctx.Bool(false)
+		}
+		items := make([]string, 0, len(args)-1)
+		for _, arg := range args[1:] {
+			items = append(items, arg.ToString())
+		}
+		return ctx.Bool(n.runtimeIsArgEqual(args[0].ToInt64(), items))
+	}))
+	n.ctx.Globals().Set("__sd_runtime_getKwarg", n.ctx.NewFunction(func(ctx *bq.Context, this *bq.Value, args []*bq.Value) *bq.Value {
+		if n.runtimeGetKwargJSON == nil || len(args) == 0 {
+			return ctx.String("null")
+		}
+		return ctx.String(n.runtimeGetKwargJSON(args[0].ToString()))
+	}))
+	n.ctx.Globals().Set("__sd_runtime_getRestArgsFrom", n.ctx.NewFunction(func(ctx *bq.Context, this *bq.Value, args []*bq.Value) *bq.Value {
+		if n.runtimeGetRestArgsFrom == nil || len(args) == 0 {
+			return ctx.String("")
+		}
+		return ctx.String(n.runtimeGetRestArgsFrom(args[0].ToInt64()))
 	}))
 	n.ctx.Globals().Set("__sd_runtime_reply", n.ctx.NewFunction(func(ctx *bq.Context, this *bq.Value, args []*bq.Value) *bq.Value {
 		if n.runtimeReply != nil && len(args) > 0 {
@@ -591,28 +618,94 @@ func gjsonGetString(raw string, key string) string {
 	return ""
 }
 
-func (n *nativeBackend) resolveScriptPath(moduleID string) (string, error) {
+func (n *nativeBackend) setRuntimeValue(name string, value any) {
+	n.runtimeValuesMu.Lock()
+	defer n.runtimeValuesMu.Unlock()
+	if value == nil {
+		delete(n.runtimeValues, name)
+		return
+	}
+	n.runtimeValues[name] = value
+}
+
+func (n *nativeBackend) clearRuntimeValues(names ...string) {
+	n.runtimeValuesMu.Lock()
+	defer n.runtimeValuesMu.Unlock()
+	for _, name := range names {
+		delete(n.runtimeValues, name)
+	}
+}
+
+func (n *nativeBackend) runtimeValue(name string) (any, bool) {
+	n.runtimeValuesMu.RLock()
+	defer n.runtimeValuesMu.RUnlock()
+	v, ok := n.runtimeValues[name]
+	return v, ok
+}
+
+func (n *nativeBackend) resolveScriptPath(moduleID string, parentID string) (string, error) {
 	target := strings.TrimSpace(moduleID)
 	if target == "" {
 		return "", fmt.Errorf("module id 为空")
 	}
-	if filepath.IsAbs(target) {
-		return target, nil
+	if parentID != "" && strings.HasPrefix(target, ".") {
+		parentDir := filepath.Dir(parentID)
+		candidate := filepath.Join(parentDir, target)
+		if abs, err := n.resolveScriptPath(candidate, ""); err == nil {
+			return abs, nil
+		}
 	}
-	if info, err := os.Stat(target); err == nil && !info.IsDir() {
-		return filepath.Abs(target)
+	if filepath.IsAbs(target) {
+		return n.resolveExistingPath(target)
+	}
+	if abs, err := n.resolveExistingPath(target); err == nil {
+		return abs, nil
 	}
 	trimmed := strings.TrimPrefix(target, "./")
-	if info, err := os.Stat(trimmed); err == nil && !info.IsDir() {
-		return filepath.Abs(trimmed)
+	if abs, err := n.resolveExistingPath(trimmed); err == nil {
+		return abs, nil
 	}
 	if n.moduleDir != "" {
 		joined := filepath.Join(n.moduleDir, target)
-		if info, err := os.Stat(joined); err == nil && !info.IsDir() {
-			return filepath.Abs(joined)
+		if abs, err := n.resolveExistingPath(joined); err == nil {
+			return abs, nil
 		}
 	}
 	return "", fmt.Errorf("无法定位脚本文件: %s", moduleID)
+}
+
+func (n *nativeBackend) resolveExistingPath(path string) (string, error) {
+	candidates := []string{path}
+	if filepath.Ext(path) == "" {
+		candidates = append(candidates, path+".js", filepath.Join(path, "index.js"))
+	}
+	for _, candidate := range candidates {
+		info, err := os.Stat(candidate)
+		if err == nil && !info.IsDir() {
+			return filepath.Abs(candidate)
+		}
+	}
+	return "", fmt.Errorf("无法定位脚本文件: %s", path)
+}
+
+func (n *nativeBackend) readModule(moduleID string, parentID string) (string, error) {
+	absPath, err := n.resolveScriptPath(moduleID, parentID)
+	if err != nil {
+		return "", err
+	}
+	code, err := os.ReadFile(absPath)
+	if err != nil {
+		return "", fmt.Errorf("读取脚本失败: %w", err)
+	}
+	out := map[string]string{
+		"id":   filepath.ToSlash(absPath),
+		"code": string(code),
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
 }
 
 func (n *nativeBackend) evalGlobal(code string) error {
@@ -753,7 +846,9 @@ func buildAssignPathScriptRegister(path []string, binding string) (string, error
 	var b strings.Builder
 	b.WriteString(base)
 	b.WriteString("globalThis.__sd_cmd_solve_map = globalThis.__sd_cmd_solve_map || {};")
+	b.WriteString("globalThis.__sd_cmd_help_func_map = globalThis.__sd_cmd_help_func_map || {};")
 	b.WriteString("globalThis.__sd_ext_on_not_cmd_map = globalThis.__sd_ext_on_not_cmd_map || {};")
+	b.WriteString("globalThis.__sd_ext_callback_map = globalThis.__sd_ext_callback_map || {};")
 	b.WriteString("if (!globalThis.__sd_wrap_ext_register) {")
 	b.WriteString("const __sd_reg_orig = ")
 	b.WriteString(parentExpr)
@@ -764,8 +859,11 @@ func buildAssignPathScriptRegister(path []string, binding string) (string, error
 	b.WriteString("if (!name || !cmdName) { return; }")
 	b.WriteString("if (cmdObj && typeof cmdObj.solve === 'function') { globalThis.__sd_cmd_solve_map[name + ':' + cmdName] = cmdObj.solve; }")
 	b.WriteString("else { delete globalThis.__sd_cmd_solve_map[name + ':' + cmdName]; }")
+	b.WriteString("if (cmdObj && typeof cmdObj.helpFunc === 'function') { globalThis.__sd_cmd_help_func_map[name + ':' + cmdName] = cmdObj.helpFunc; }")
+	b.WriteString("else { delete globalThis.__sd_cmd_help_func_map[name + ':' + cmdName]; }")
 	b.WriteString("if (typeof globalThis.seal === 'object' && globalThis.seal && globalThis.seal.ext && typeof globalThis.seal.ext._syncCmd === 'function') {")
 	b.WriteString("const cleanCmd = (cmdObj && typeof cmdObj === 'object') ? JSON.parse(JSON.stringify(cmdObj, (_k, v) => (typeof v === 'function' ? undefined : v))) : null;")
+	b.WriteString("if (cleanCmd && cmdObj && typeof cmdObj.helpFunc === 'function') { cleanCmd.__sdHasHelpFunc = true; }")
 	b.WriteString("globalThis.seal.ext._syncCmd(name, cmdName, cleanCmd);")
 	b.WriteString("}")
 	b.WriteString("};")
@@ -789,11 +887,20 @@ func buildAssignPathScriptRegister(path []string, binding string) (string, error
 	b.WriteString("if (!one || typeof one !== 'object') { return; }")
 	b.WriteString("const name = one && one.name ? String(one.name) : '';")
 	b.WriteString("if (!name) { return; }")
+	b.WriteString("const callbacks = [];")
+	b.WriteString("const __sd_store_cb = (cbName) => {")
+	b.WriteString("const key = name + ':' + cbName;")
+	b.WriteString("if (typeof one[cbName] === 'function') { globalThis.__sd_ext_callback_map[key] = one[cbName]; callbacks.push(cbName); }")
+	b.WriteString("else { delete globalThis.__sd_ext_callback_map[key]; }")
+	b.WriteString("};")
+	b.WriteString("for (const cbName of ['onLoad','onNotCommandReceived','onCommandReceived','onMessageReceived','onMessageSend','onMessageDeleted','onMessageEdit','onGroupJoined','onGroupMemberJoined','onGuildJoined','onBecomeFriend','onPoke','onGroupLeave']) { __sd_store_cb(cbName); }")
 	b.WriteString("if (typeof one.onNotCommandReceived === 'function') { globalThis.__sd_ext_on_not_cmd_map[name] = one.onNotCommandReceived; }")
 	b.WriteString("else { delete globalThis.__sd_ext_on_not_cmd_map[name]; }")
 	b.WriteString("__sd_wrap_cmd_map(one);")
 	b.WriteString("const clean = JSON.parse(JSON.stringify(one, (_k, v) => (typeof v === 'function' ? undefined : v)));")
+	b.WriteString("clean.__sdCallbacks = callbacks;")
 	b.WriteString("__sd_reg_orig(JSON.stringify(clean));")
+	b.WriteString("if (typeof one.onLoad === 'function') { try { one.onLoad(); } catch (e) { if (globalThis.console && typeof globalThis.console.error === 'function') { globalThis.console.error(e); } } }")
 	b.WriteString("};")
 	b.WriteString(parentExpr)
 	b.WriteString("[")
@@ -877,7 +984,58 @@ func (n *nativeBackend) marshalResult(v any) *bq.Value {
 	}
 }
 
+func (n *nativeBackend) runtimeRefValue(arg *bq.Value, t reflect.Type) (reflect.Value, bool, error) {
+	if arg == nil || arg.IsUndefined() || arg.IsNull() {
+		return reflect.Value{}, false, nil
+	}
+	refVal := arg.Get("__sdRuntimeRef")
+	if refVal == nil {
+		return reflect.Value{}, false, nil
+	}
+	defer refVal.Free()
+	if refVal.IsUndefined() || refVal.IsNull() {
+		return reflect.Value{}, false, nil
+	}
+	marker := refVal.ToString()
+	if strings.TrimSpace(marker) == "" {
+		return reflect.Value{}, false, nil
+	}
+	stored, ok := n.runtimeValue(marker)
+	if !ok || stored == nil {
+		return reflect.Value{}, true, fmt.Errorf("runtime ref not found: %s", marker)
+	}
+	sv := reflect.ValueOf(stored)
+	if t.Kind() == reflect.Interface {
+		if sv.Type().AssignableTo(t) {
+			return sv, true, nil
+		}
+		if sv.Type().ConvertibleTo(t) {
+			return sv.Convert(t), true, nil
+		}
+		return reflect.ValueOf(stored), true, nil
+	}
+	if sv.Type().AssignableTo(t) {
+		return sv, true, nil
+	}
+	if sv.Type().ConvertibleTo(t) {
+		return sv.Convert(t), true, nil
+	}
+	if sv.Kind() == reflect.Pointer && t.Kind() != reflect.Pointer && sv.Elem().IsValid() {
+		ev := sv.Elem()
+		if ev.Type().AssignableTo(t) {
+			return ev, true, nil
+		}
+		if ev.Type().ConvertibleTo(t) {
+			return ev.Convert(t), true, nil
+		}
+	}
+	return reflect.Value{}, true, fmt.Errorf("runtime ref type mismatch: have %s want %s", sv.Type(), t)
+}
+
 func (n *nativeBackend) unmarshalArg(arg *bq.Value, t reflect.Type) (reflect.Value, error) {
+	if v, ok, err := n.runtimeRefValue(arg, t); ok {
+		return v, err
+	}
 	if t.Kind() == reflect.Interface {
 		if arg.IsUndefined() || arg.IsNull() {
 			return reflect.Zero(t), nil
@@ -1004,20 +1162,8 @@ func (n *nativeBackend) registerAllAPIs() error {
 }
 
 func (n *nativeBackend) Dispose() error {
-	n.wsMu.Lock()
-	for _, c := range n.wsConns {
-		if c != nil && c.conn != nil {
-			_ = c.conn.Close()
-		}
-	}
-	n.wsConns = map[int64]*wsBridgeConn{}
-	n.wsMu.Unlock()
-	select {
-	case <-n.wsPumpDone:
-		// 已结束
-	default:
-		close(n.wsPumpStop)
-		<-n.wsPumpDone
+	if err := n.Quiesce(); err != nil {
+		return err
 	}
 	n.vmMu.Lock()
 	defer n.vmMu.Unlock()
@@ -1035,7 +1181,43 @@ func (n *nativeBackend) Dispose() error {
 	return nil
 }
 
+func (n *nativeBackend) Quiesce() error {
+	n.wsMu.Lock()
+	for _, c := range n.wsConns {
+		if c != nil && c.conn != nil {
+			_ = c.conn.Close()
+		}
+	}
+	n.wsConns = map[int64]*wsBridgeConn{}
+	n.wsMu.Unlock()
+	select {
+	case <-n.wsPumpDone:
+		// 已结束
+	default:
+		close(n.wsPumpStop)
+		<-n.wsPumpDone
+	}
+	n.runtimeMu.Lock()
+	n.runtimeGetArgN = nil
+	n.runtimeIsArgEqual = nil
+	n.runtimeGetKwargJSON = nil
+	n.runtimeGetRestArgsFrom = nil
+	n.runtimeReply = nil
+	n.runtimeMu.Unlock()
+	n.runtimeValuesMu.Lock()
+	n.runtimeValues = map[string]any{}
+	n.runtimeValuesMu.Unlock()
+	return nil
+}
+
 const quickJSPolyfillScript = `(function(){
+// Intentionally do not install a global require.
+// /js/exec relies on require being unavailable in its sandbox, and exposing
+// a global module loader here would let scripts bypass that by calling
+// globalThis.require(...).
+if (typeof globalThis.__dirname === 'undefined') globalThis.__dirname = '';
+if (typeof globalThis.__filename === 'undefined') globalThis.__filename = '';
+
 if (typeof globalThis.fetch !== 'function') {
   globalThis.fetch = function(input, init) {
     const url = typeof input === 'string' ? input : String(input && input.url ? input.url : input);
@@ -1264,16 +1446,19 @@ return JSON.stringify(out, (_k, v) => {
 }
 
 func (n *nativeBackend) Require(moduleID string) error {
-	absPath, err := n.resolveScriptPath(moduleID)
+	payload, err := n.readModule(moduleID, "")
 	if err != nil {
 		return err
 	}
-	code, err := os.ReadFile(absPath)
-	if err != nil {
-		return fmt.Errorf("读取脚本失败: %w", err)
+	var data struct {
+		ID   string `json:"id"`
+		Code string `json:"code"`
 	}
-	if err := n.evalGlobal(string(code)); err != nil {
-		return fmt.Errorf("执行脚本失败(%s): %w", filepath.ToSlash(absPath), err)
+	if err := json.Unmarshal([]byte(payload), &data); err != nil {
+		return fmt.Errorf("解析脚本失败: %w", err)
+	}
+	if err := n.evalGlobal(data.Code); err != nil {
+		return fmt.Errorf("执行脚本失败(%s): %w", moduleID, err)
 	}
 	_ = n.evalGlobal(`if (typeof globalThis.__sd_ws_pump === 'function') { globalThis.__sd_ws_pump(); }`)
 	return nil
@@ -1336,6 +1521,53 @@ func (n *nativeBackend) Reset() error {
 	return n.registerAllAPIs()
 }
 
+func jsonLiteral(v any) string {
+	if v == nil {
+		return "null"
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return "null"
+	}
+	return string(raw)
+}
+
+func buildRuntimeVarScript(varName string, refName string, data any) string {
+	if refName == "" {
+		return fmt.Sprintf("const %s = %s;\n", varName, jsonLiteral(data))
+	}
+	return fmt.Sprintf(`const %s = (() => {
+const data = %s;
+if (data && typeof data === 'object' && !Array.isArray(data)) {
+  try { Object.defineProperty(data, '__sdRuntimeRef', { value: %q, configurable: true, enumerable: false }); } catch (_e) { data.__sdRuntimeRef = %q; }
+  return data;
+}
+const holder = {};
+try { Object.defineProperty(holder, '__sdRuntimeRef', { value: %q, configurable: true, enumerable: false }); } catch (_e) { holder.__sdRuntimeRef = %q; }
+return holder;
+})();
+`, varName, jsonLiteral(data), refName, refName, refName, refName)
+}
+
+func (n *nativeBackend) applyRuntime(runtime map[string]any) func() {
+	n.runtimeGetArgN, _ = runtime["getArgN"].(func(int64) string)
+	n.runtimeIsArgEqual, _ = runtime["isArgEqual"].(func(int64, []string) bool)
+	n.runtimeGetKwargJSON, _ = runtime["getKwargJSON"].(func(string) string)
+	n.runtimeGetRestArgsFrom, _ = runtime["getRestArgsFrom"].(func(int64) string)
+	n.runtimeReply, _ = runtime["replyToSender"].(func(string))
+	for _, key := range []string{"ctx", "msg", "cmdArgs", "event"} {
+		n.setRuntimeValue(key, runtime[key])
+	}
+	return func() {
+		n.runtimeGetArgN = nil
+		n.runtimeIsArgEqual = nil
+		n.runtimeGetKwargJSON = nil
+		n.runtimeGetRestArgsFrom = nil
+		n.runtimeReply = nil
+		n.clearRuntimeValues("ctx", "msg", "cmdArgs", "event")
+	}
+}
+
 func (n *nativeBackend) InvokeStoredSolve(extName string, cmdName string, runtime map[string]any) (map[string]any, error) {
 	if n.ctx == nil {
 		return nil, fmt.Errorf("QuickJS VM 未初始化")
@@ -1343,41 +1575,35 @@ func (n *nativeBackend) InvokeStoredSolve(extName string, cmdName string, runtim
 	key := extName + ":" + cmdName
 	n.runtimeMu.Lock()
 	defer n.runtimeMu.Unlock()
-
-	var privilege int64
-	if v, ok := runtime["privilegeLevel"]; ok {
-		switch vv := v.(type) {
-		case int:
-			privilege = int64(vv)
-		case int64:
-			privilege = vv
-		case float64:
-			privilege = int64(vv)
-		}
+	cleanup := n.applyRuntime(runtime)
+	defer cleanup()
+	replySetup := ""
+	replyRestore := ""
+	if n.runtimeReply != nil {
+		replySetup = "const sealObj = globalThis.seal || {};\nconst oldReply = sealObj.replyToSender;\nsealObj.replyToSender = (_ctx, _msg, text) => __sd_runtime_reply(String(text));\n"
+		replyRestore = "sealObj.replyToSender = oldReply;\n"
 	}
-	getArgN, _ := runtime["getArgN"].(func(int64) string)
-	replyToSender, _ := runtime["replyToSender"].(func(string))
-	n.runtimePrivilege = privilege
-	n.runtimeGetArgN = getArgN
-	n.runtimeReply = replyToSender
 
 	callScript := fmt.Sprintf(`(function() {
+%s%sconst cmdArgs = (() => {
+%s
+cmdArgs.getArgN = (n) => __sd_runtime_getArgN(Number(n));
+cmdArgs.isArgEqual = (n, ...ss) => __sd_runtime_isArgEqual(Number(n), ...ss.map((v) => String(v)));
+cmdArgs.getKwarg = (name) => JSON.parse(String(__sd_runtime_getKwarg(String(name))));
+cmdArgs.getRestArgsFrom = (index) => __sd_runtime_getRestArgsFrom(Number(index));
+return cmdArgs;
+})();
 const solve = globalThis.__sd_cmd_solve_map && globalThis.__sd_cmd_solve_map[%q];
 if (typeof solve !== 'function') { throw new Error('未找到命令solve: %s'); }
-const ctx = { privilegeLevel: %d };
-const msg = {};
-const cmdArgs = { getArgN: (n) => __sd_runtime_getArgN(n) };
-const sealObj = globalThis.seal || {};
-const oldReply = sealObj.replyToSender;
-sealObj.replyToSender = (_ctx, _msg, text) => __sd_runtime_reply(String(text));
+%s
 try {
   const ret = solve(ctx, msg, cmdArgs);
   globalThis.__sd_last_solve_ret = ret;
   return 1;
 } finally {
-  sealObj.replyToSender = oldReply;
+  %s
 }
-})()`, key, key, privilege)
+})()`, buildRuntimeVarScript("ctx", "ctx", runtime["ctxData"]), buildRuntimeVarScript("msg", "msg", runtime["msgData"]), buildRuntimeVarScript("cmdArgs", "cmdArgs", runtime["cmdArgsData"]), key, key, replySetup, replyRestore)
 	if err := n.evalGlobal(callScript); err != nil {
 		return nil, err
 	}
@@ -1418,49 +1644,102 @@ return JSON.stringify(out);
 	return retMap, nil
 }
 
-func (n *nativeBackend) InvokeStoredOnNotCommand(extName string, runtime map[string]any) error {
+func (n *nativeBackend) InvokeStoredCmdHelp(extName string, cmdName string, isShort bool) (string, error) {
+	n.vmMu.Lock()
+	defer n.vmMu.Unlock()
+	if n.ctx == nil {
+		return "", fmt.Errorf("QuickJS VM 未初始化")
+	}
+	keyJSON, _ := json.Marshal(extName + ":" + cmdName)
+	boolJSON := "false"
+	if isShort {
+		boolJSON = "true"
+	}
+	script := fmt.Sprintf(`(function() {
+const fn = globalThis.__sd_cmd_help_func_map && globalThis.__sd_cmd_help_func_map[%s];
+if (typeof fn !== 'function') { return ''; }
+const ret = fn(%s);
+return ret == null ? '' : String(ret);
+})()`, string(keyJSON), boolJSON)
+	v := n.ctx.Eval(script, bq.EvalFlagGlobal(true))
+	defer v.Free()
+	if v.IsException() {
+		if err := n.ctx.Exception(); err != nil {
+			return "", err
+		}
+		return "", fmt.Errorf("quickjs eval exception")
+	}
+	return v.String(), nil
+}
+
+func (n *nativeBackend) InvokeStoredExtCallback(extName string, callbackName string, runtime map[string]any) error {
 	if n.ctx == nil {
 		return fmt.Errorf("QuickJS VM 未初始化")
 	}
 	n.runtimeMu.Lock()
 	defer n.runtimeMu.Unlock()
-
-	var privilege int64
-	if v, ok := runtime["privilegeLevel"]; ok {
-		switch vv := v.(type) {
-		case int:
-			privilege = int64(vv)
-		case int64:
-			privilege = vv
-		case float64:
-			privilege = int64(vv)
-		}
+	cleanup := n.applyRuntime(runtime)
+	defer cleanup()
+	replySetup := ""
+	replyRestore := ""
+	if n.runtimeReply != nil {
+		replySetup = "const sealObj = globalThis.seal || {};\nconst oldReply = sealObj.replyToSender;\nsealObj.replyToSender = (_ctx, _msg, text) => __sd_runtime_reply(String(text));\n"
+		replyRestore = "sealObj.replyToSender = oldReply;\n"
 	}
-	replyToSender, _ := runtime["replyToSender"].(func(string))
-	n.runtimePrivilege = privilege
-	n.runtimeGetArgN = nil
-	n.runtimeReply = replyToSender
 
-	msgJSON, _ := json.Marshal(runtime["msg"])
-	callScript := fmt.Sprintf(`(function() {
-const cb = globalThis.__sd_ext_on_not_cmd_map && globalThis.__sd_ext_on_not_cmd_map[%q];
-if (typeof cb !== 'function') { return; }
-const ctx = { privilegeLevel: %d };
-const msg = %s || {};
-const sealObj = globalThis.seal || {};
-const oldReply = sealObj.replyToSender;
-sealObj.replyToSender = (_ctx, _msg, text) => __sd_runtime_reply(String(text));
+	var setup strings.Builder
+	var callExpr string
+	switch callbackName {
+	case "onLoad":
+		callExpr = "fn();"
+	case "onNotCommandReceived", "onMessageReceived", "onMessageDeleted", "onMessageEdit",
+		"onGroupJoined", "onGroupMemberJoined", "onGuildJoined", "onBecomeFriend":
+		setup.WriteString(buildRuntimeVarScript("ctx", "ctx", runtime["ctxData"]))
+		setup.WriteString(buildRuntimeVarScript("msg", "msg", runtime["msgData"]))
+		callExpr = "fn(ctx, msg);"
+	case "onCommandReceived":
+		setup.WriteString(buildRuntimeVarScript("ctx", "ctx", runtime["ctxData"]))
+		setup.WriteString(buildRuntimeVarScript("msg", "msg", runtime["msgData"]))
+		setup.WriteString(buildRuntimeVarScript("cmdArgs", "cmdArgs", runtime["cmdArgsData"]))
+		setup.WriteString("cmdArgs.getArgN = (n) => __sd_runtime_getArgN(Number(n));\n")
+		setup.WriteString("cmdArgs.isArgEqual = (n, ...ss) => __sd_runtime_isArgEqual(Number(n), ...ss.map((v) => String(v)));\n")
+		setup.WriteString("cmdArgs.getKwarg = (name) => JSON.parse(String(__sd_runtime_getKwarg(String(name))));\n")
+		setup.WriteString("cmdArgs.getRestArgsFrom = (index) => __sd_runtime_getRestArgsFrom(Number(index));\n")
+		callExpr = "fn(ctx, msg, cmdArgs);"
+	case "onMessageSend":
+		setup.WriteString(buildRuntimeVarScript("ctx", "ctx", runtime["ctxData"]))
+		setup.WriteString(buildRuntimeVarScript("msg", "msg", runtime["msgData"]))
+		setup.WriteString(fmt.Sprintf("const flag = %s;\n", jsonLiteral(runtime["flag"])))
+		callExpr = "fn(ctx, msg, flag);"
+	case "onPoke", "onGroupLeave":
+		setup.WriteString(buildRuntimeVarScript("ctx", "ctx", runtime["ctxData"]))
+		setup.WriteString(buildRuntimeVarScript("event", "event", runtime["eventData"]))
+		callExpr = "fn(ctx, event);"
+	default:
+		return fmt.Errorf("不支持的扩展回调: %s", callbackName)
+	}
+
+	keyJSON, _ := json.Marshal(extName + ":" + callbackName)
+	script := fmt.Sprintf(`(function() {
+const fn = globalThis.__sd_ext_callback_map && globalThis.__sd_ext_callback_map[%s];
+if (typeof fn !== 'function') { return; }
+%s
+%s
 try {
-  cb(ctx, msg);
+  %s
 } finally {
-  sealObj.replyToSender = oldReply;
+  %s
 }
-})()`, extName, privilege, string(msgJSON))
-	if err := n.evalGlobal(callScript); err != nil {
+})()`, string(keyJSON), setup.String(), replySetup, callExpr, replyRestore)
+	if err := n.evalGlobal(script); err != nil {
 		return err
 	}
 	_ = n.evalGlobal(`if (typeof globalThis.__sd_ws_pump === 'function') { globalThis.__sd_ws_pump(); }`)
 	return nil
+}
+
+func (n *nativeBackend) InvokeStoredOnNotCommand(extName string, runtime map[string]any) error {
+	return n.InvokeStoredExtCallback(extName, "onNotCommandReceived", runtime)
 }
 
 func (n *nativeBackend) InvokeStoredTask(fnRef string, taskCtx map[string]any) error {

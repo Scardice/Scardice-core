@@ -234,13 +234,14 @@ type Dice struct {
 	JsPrinter        *PrinterFunc         `json:"-"             yaml:"-"`
 
 	// JsLoop           *eventloop.EventLoop `yaml:"-" json:"-"`
-	ExtLoopManager    *JsLoopManager  `json:"-" yaml:"-"`
-	ScriptEngine      jsengine.Engine `json:"-" yaml:"-"` // 新引擎抽象实例（QuickJS替代路径）
-	JsEngineEffective string          `json:"-" yaml:"-"` // 当前实际生效的插件引擎
-	JsEngineFallback  string          `json:"-" yaml:"-"` // 回退原因（为空表示未回退）
-	JsScriptList      []*JsScriptInfo `json:"-" yaml:"-"`
-	JsScriptCron      *cron.Cron      `json:"-" yaml:"-"`
-	JsScriptCronLock  *sync.Mutex     `json:"-" yaml:"-"`
+	ExtLoopManager    *JsLoopManager    `json:"-" yaml:"-"`
+	ScriptEngine      jsengine.Engine   `json:"-" yaml:"-"` // 新引擎抽象实例（QuickJS替代路径）
+	RetiredJSEngines  []jsengine.Engine `json:"-" yaml:"-"` // 已退役但因底层崩溃风险暂不销毁的引擎实例
+	JsEngineEffective string            `json:"-" yaml:"-"` // 当前实际生效的插件引擎
+	JsEngineFallback  string            `json:"-" yaml:"-"` // 回退原因（为空表示未回退）
+	JsScriptList      []*JsScriptInfo   `json:"-" yaml:"-"`
+	JsScriptCron      *cron.Cron        `json:"-" yaml:"-"`
+	JsScriptCronLock  *sync.Mutex       `json:"-" yaml:"-"`
 	// 重载使用的互斥锁
 	JsReloadLock sync.Mutex `json:"-" yaml:"-"`
 	// 内置脚本摘要表，用于判断内置脚本是否有更新

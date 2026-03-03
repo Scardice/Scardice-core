@@ -56,23 +56,14 @@ func jsExec(c echo.Context) error {
 	source := "(function(exports, require, module) {" + v.Value + "\n})()"
 	codeJSON, _ := json.Marshal(v.Value)
 	// QuickJS 使用局部作用域注入 CommonJS 变量，避免污染共享 VM 的全局对象。
-	// 先用 direct eval 保留脚本 completion value（如 async IIFE Promise），
-	// 若命中“顶层 return”语法错误，再回退到 Function 包装兼容旧控制台写法。
+	// 这里刻意保持与 Goja 控制台一致：只有显式 return 才会产生返回值
 	quickJSSource := `(function(){
 	const exports = {};
 	const module = { exports: exports };
 	const require = function(_name){ throw new Error("require is not available in js/exec sandbox"); };
 	const __sd_code = ` + string(codeJSON) + `;
-	try {
-		return eval(__sd_code);
-	} catch (e) {
-		const isReturnSyntaxError = e && e.name === "SyntaxError" && /return/i.test(String(e.message || ""));
-		if (!isReturnSyntaxError) {
-			throw e;
-		}
-		const fn = new Function("exports", "require", "module", __sd_code);
-		return fn(exports, require, module);
-	}
+	const fn = new Function("exports", "require", "module", __sd_code);
+	return fn(exports, require, module);
 	})()`
 	if myDice.JsPrinter != nil {
 		myDice.JsPrinter.RecordStart()

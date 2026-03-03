@@ -114,6 +114,27 @@ func (a *Adapter) Dispose() error {
 	return nil
 }
 
+// Quiesce 停止 QuickJS 后台活动，但不销毁底层 runtime。
+// 这是切换到 Goja 时的保护性路径，用于绕开部分 quickjs-go 在 teardown 时的进程级崩溃。
+func (a *Adapter) Quiesce() error {
+	st := a.lc.State()
+	if st == jsengine.StateClosed {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.backend != nil {
+		if err := a.backend.Quiesce(); err != nil {
+			return &jsengine.EngineError{
+				Kind:    jsengine.ErrRuntime,
+				Message: "QuickJS 后端静默退役失败",
+				Cause:   err,
+			}
+		}
+	}
+	return nil
+}
+
 func (a *Adapter) Eval(code string) error {
 	if a.lc.State() != jsengine.StateReady {
 		return &jsengine.EngineError{
@@ -215,8 +236,8 @@ func (a *Adapter) Reset() error {
 			Message: "引擎未初始化完成",
 		}
 	}
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.backend == nil {
 		return &jsengine.EngineError{
 			Kind:    jsengine.ErrInternal,
@@ -231,6 +252,59 @@ func (a *Adapter) Reset() error {
 		}
 	}
 	return nil
+}
+
+// InvokeStoredExtCallback 调用在 JS 侧缓存的扩展生命周期回调。
+func (a *Adapter) InvokeStoredExtCallback(extName string, callbackName string, runtime map[string]any) error {
+	if a.lc.State() != jsengine.StateReady {
+		return &jsengine.EngineError{
+			Kind:    jsengine.ErrRuntime,
+			Message: "引擎未初始化完成",
+		}
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.backend == nil {
+		return &jsengine.EngineError{
+			Kind:    jsengine.ErrInternal,
+			Message: "QuickJS 后端不可用",
+		}
+	}
+	if err := a.backend.InvokeStoredExtCallback(extName, callbackName, runtime); err != nil {
+		return &jsengine.EngineError{
+			Kind:    jsengine.ErrRuntime,
+			Message: "QuickJS 调用扩展回调失败: " + err.Error(),
+			Cause:   err,
+		}
+	}
+	return nil
+}
+
+// InvokeStoredCmdHelp 调用在 JS 侧缓存的命令 helpFunc。
+func (a *Adapter) InvokeStoredCmdHelp(extName string, cmdName string, isShort bool) (string, error) {
+	if a.lc.State() != jsengine.StateReady {
+		return "", &jsengine.EngineError{
+			Kind:    jsengine.ErrRuntime,
+			Message: "引擎未初始化完成",
+		}
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.backend == nil {
+		return "", &jsengine.EngineError{
+			Kind:    jsengine.ErrInternal,
+			Message: "QuickJS 后端不可用",
+		}
+	}
+	ret, err := a.backend.InvokeStoredCmdHelp(extName, cmdName, isShort)
+	if err != nil {
+		return "", &jsengine.EngineError{
+			Kind:    jsengine.ErrRuntime,
+			Message: "QuickJS 调用命令 helpFunc 失败: " + err.Error(),
+			Cause:   err,
+		}
+	}
+	return ret, nil
 }
 
 // InvokeStoredSolve 调用在 JS 侧缓存的命令 solve 函数。
@@ -262,28 +336,7 @@ func (a *Adapter) InvokeStoredSolve(extName string, cmdName string, runtime map[
 
 // InvokeStoredOnNotCommand 调用在 JS 侧缓存的 onNotCommandReceived 回调。
 func (a *Adapter) InvokeStoredOnNotCommand(extName string, runtime map[string]any) error {
-	if a.lc.State() != jsengine.StateReady {
-		return &jsengine.EngineError{
-			Kind:    jsengine.ErrRuntime,
-			Message: "引擎未初始化完成",
-		}
-	}
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	if a.backend == nil {
-		return &jsengine.EngineError{
-			Kind:    jsengine.ErrInternal,
-			Message: "QuickJS 后端不可用",
-		}
-	}
-	if err := a.backend.InvokeStoredOnNotCommand(extName, runtime); err != nil {
-		return &jsengine.EngineError{
-			Kind:    jsengine.ErrRuntime,
-			Message: "QuickJS 调用 onNotCommandReceived 失败: " + err.Error(),
-			Cause:   err,
-		}
-	}
-	return nil
+	return a.InvokeStoredExtCallback(extName, "onNotCommandReceived", runtime)
 }
 
 // InvokeStoredTask 调用在 JS 侧缓存的任务回调函数。

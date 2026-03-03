@@ -38,6 +38,7 @@ import (
 	"go.uber.org/zap/zapcore"
 	"gopkg.in/elazarl/goproxy.v1"
 
+	"Scardice-core/dice/events"
 	"Scardice-core/dice/jsengine"
 	_ "Scardice-core/dice/jsengine/quickjs"
 	"Scardice-core/static"
@@ -113,7 +114,44 @@ func (p *PrinterFunc) Error(s string) {
 // InternalError 表示引擎内部异常，保留 error 级别与调用栈。
 func (p *PrinterFunc) InternalError(s string) { p.doRecord("error", s); p.d.Logger.Error(s) }
 
+func (d *Dice) recoverJSPanic(scope string, resetState bool) {
+	if r := recover(); r != nil {
+		d.Logger.Errorf("%s 发生panic: %v\n堆栈:\n%s", scope, r, string(debug.Stack()))
+		if resetState {
+			d.safeJSClearStateOnly(scope + " 清理")
+		}
+	}
+}
+
+func (d *Dice) safeJSClearStateOnly(scope string) {
+	defer d.recoverJSPanic(scope, false)
+	d.jsClearStateOnly()
+}
+
+func (d *Dice) disposeRetiredJSEngines(scope string) {
+	if len(d.RetiredJSEngines) == 0 {
+		return
+	}
+	for _, engine := range d.RetiredJSEngines {
+		if engine == nil {
+			continue
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					d.Logger.Errorf("%s 释放退役JS引擎发生panic: %v\n堆栈:\n%s", scope, r, string(debug.Stack()))
+				}
+			}()
+			if err := engine.Dispose(); err != nil {
+				d.Logger.Warnf("%s 释放退役JS引擎失败: %v", scope, err)
+			}
+		}()
+	}
+	d.RetiredJSEngines = nil
+}
+
 func (d *Dice) JsInit() {
+	defer d.recoverJSPanic("JsInit", true)
 	// 读取官方 Mod 公钥
 	if pub, err := static.Scripts.ReadFile("scripts/seal_mod.public.pem"); err == nil && len(pub) > 0 {
 		OfficialModPublicKey = string(pub)
@@ -1431,18 +1469,26 @@ func (d *Dice) jsRegisterQuickJSHostAPIs(engine jsengine.Engine) error {
 			logger: d.Logger,
 		}
 		expr := value
-		if key != "" {
+		if key != "" && taskType != "once" {
 			if config := d.ConfigManager.getConfig(extName, key); config != nil {
 				expr = config.Value.(string)
 				if config.task != nil {
 					config.task.Off()
+					if ei != nil {
+						ei.taskList = removeTaskFromList(ei.taskList, config.task)
+					}
 				}
 			}
 		}
 
 		switch taskType {
 		case "cron":
-			entryID, err := scriptCron.AddFunc(expr, func() {
+			cronExpr, err := parseTaskCronExpr(expr)
+			if err != nil {
+				d.Logger.Errorf("插件注册定时任务失败：%v", err)
+				return nil
+			}
+			entryID, err := scriptCron.AddFunc(cronExpr, func() {
 				task.run()
 			})
 			if err != nil {
@@ -1451,9 +1497,10 @@ func (d *Dice) jsRegisterQuickJSHostAPIs(engine jsengine.Engine) error {
 			}
 			task.taskType = taskType
 			task.rawValue = expr
-			task.cronExpr = expr
+			task.cronExpr = cronExpr
+			expr = cronExpr
 			task.entryID = &entryID
-			d.Logger.Infof("插件注册定时任务：cron=%s", expr)
+			d.Logger.Infof("插件注册定时任务：cron=%s", cronExpr)
 		case "daily":
 			cronExpr, err := parseTaskTime(expr)
 			if err != nil {
@@ -1473,12 +1520,27 @@ func (d *Dice) jsRegisterQuickJSHostAPIs(engine jsengine.Engine) error {
 			task.cronExpr = cronExpr
 			task.entryID = &entryID
 			d.Logger.Infof("插件注册定时任务：daily=%s", expr)
+		case "once":
+			onceAt, normalizedExpr, err := parseTaskOnceExpr(expr)
+			if err != nil {
+				d.Logger.Errorf("插件注册定时任务失败：%v", err)
+				return nil
+			}
+			task.taskType = taskType
+			task.rawValue = expr
+			task.onceAt = onceAt
+			expr = normalizedExpr
+			if !task.On() {
+				d.Logger.Errorf("插件注册定时任务失败：一次任务注册失败")
+				return nil
+			}
+			d.Logger.Infof("插件注册定时任务：once=%s", expr)
 		default:
-			d.Logger.Errorf("插件注册定时任务失败：错误的任务类型：%s，当前仅支持 cron|daily", taskType)
+			d.Logger.Errorf("插件注册定时任务失败：错误的任务类型：%s，当前仅支持 cron|daily|once", taskType)
 			return nil
 		}
 
-		if key != "" {
+		if key != "" && taskType != "once" {
 			config := d.ConfigManager.getConfig(extName, key)
 
 			switch taskType {
@@ -1504,20 +1566,81 @@ func (d *Dice) jsRegisterQuickJSHostAPIs(engine jsengine.Engine) error {
 			d.ConfigManager.RegisterPluginConfig(extName, config)
 		}
 
-		if key == "" {
-			if ei != nil {
-				if ei.taskList == nil {
-					ei.taskList = make([]*JsScriptTask, 0)
-					ei.taskList = append(ei.taskList, &task)
-				} else {
-					ei.taskList = append(ei.taskList, &task)
-				}
-			} else {
-				// 未携带扩展对象时无法持久挂载到 taskList，但任务仍可通过配置项管理。
+		if ei != nil {
+			if ei.taskList == nil {
+				ei.taskList = make([]*JsScriptTask, 0)
 			}
+			ei.taskList = append(ei.taskList, &task)
 		}
 
 		return &task
+	}); err != nil {
+		return err
+	}
+	if err := register("seal.ext.removeTask", func(ei *ExtInfo, taskType string, key string) int {
+		extName, err := resolveExtName(ei)
+		if err != nil {
+			panic(err)
+		}
+		taskType, key = normalizeTaskSelector(taskType, key)
+		taskSet := make(map[*JsScriptTask]struct{})
+		configKeySet := make(map[string]struct{})
+
+		if ei != nil {
+			for _, task := range ei.taskList {
+				if matchTaskSelector(task, taskType, key) {
+					taskSet[task] = struct{}{}
+					if task.key != "" && task.taskType != "once" {
+						configKeySet[task.key] = struct{}{}
+					}
+				}
+			}
+		}
+
+		cm := d.ConfigManager
+		cm.lock.RLock()
+		pluginConfig := cm.Plugins[extName]
+		if pluginConfig != nil {
+			for cfgKey, cfgItem := range pluginConfig.Configs {
+				if cfgItem == nil {
+					continue
+				}
+				cfgTaskType, isTask := configTypeToTaskType(cfgItem.Type)
+				if !isTask || !taskTypeMatched(taskType, cfgTaskType) || !keyMatched(key, cfgKey) {
+					continue
+				}
+				configKeySet[cfgKey] = struct{}{}
+				if cfgItem.task != nil {
+					taskSet[cfgItem.task] = struct{}{}
+				}
+			}
+		}
+		cm.lock.RUnlock()
+
+		for task := range taskSet {
+			_ = task.Off()
+		}
+
+		if ei != nil && len(taskSet) > 0 {
+			filtered := make([]*JsScriptTask, 0, len(ei.taskList))
+			for _, task := range ei.taskList {
+				if _, ok := taskSet[task]; ok {
+					continue
+				}
+				filtered = append(filtered, task)
+			}
+			ei.taskList = filtered
+		}
+
+		if len(configKeySet) > 0 {
+			keys := make([]string, 0, len(configKeySet))
+			for cfgKey := range configKeySet {
+				keys = append(keys, cfgKey)
+			}
+			d.ConfigManager.UnregisterConfig(extName, keys...)
+		}
+
+		return len(taskSet)
 	}); err != nil {
 		return err
 	}
@@ -1663,6 +1786,264 @@ func (d *Dice) jsRegisterQuickJSHostAPIs(engine jsengine.Engine) error {
 	return nil
 }
 
+func quickJSJSONValue(v any) any {
+	if v == nil {
+		return nil
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	var out any
+	if err = json.Unmarshal(raw, &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+func quickJSGroupSnapshot(group *GroupInfo) map[string]any {
+	if group == nil {
+		return nil
+	}
+	return map[string]any{
+		"active":              group.Active,
+		"groupId":             group.GroupID,
+		"guildId":             group.GuildID,
+		"channelId":           group.ChannelID,
+		"groupName":           group.GroupName,
+		"diceSideNum":         group.DiceSideNum,
+		"diceSideExpr":        group.DiceSideExpr,
+		"system":              group.System,
+		"cocRuleIndex":        group.CocRuleIndex,
+		"logCurName":          group.LogCurName,
+		"logOn":               group.LogOn,
+		"recentDiceSendTime":  group.RecentDiceSendTime,
+		"showGroupWelcome":    group.ShowGroupWelcome,
+		"groupWelcomeMessage": group.GroupWelcomeMessage,
+		"enteredTime":         group.EnteredTime,
+		"inviteUserId":        group.InviteUserID,
+		"tmpPlayerNum":        group.TmpPlayerNum,
+		"tmpExtList":          append([]string(nil), group.TmpExtList...),
+		"defaultHelpGroup":    group.DefaultHelpGroup,
+	}
+}
+
+func quickJSMessageSnapshot(msg *Message) map[string]any {
+	if msg == nil {
+		return nil
+	}
+	return map[string]any{
+		"time":        msg.Time,
+		"messageType": msg.MessageType,
+		"groupId":     msg.GroupID,
+		"guildId":     msg.GuildID,
+		"channelId":   msg.ChannelID,
+		"sender": map[string]any{
+			"nickname": msg.Sender.Nickname,
+			"userId":   msg.Sender.UserID,
+		},
+		"message":   msg.Message,
+		"rawId":     quickJSJSONValue(msg.RawID),
+		"platform":  msg.Platform,
+		"groupName": msg.GroupName,
+	}
+}
+
+func quickJSEndPointSnapshot(ep *EndPointInfo) any {
+	if ep == nil {
+		return nil
+	}
+	return quickJSJSONValue(ep.EndPointInfoBase)
+}
+
+func quickJSCmdArgsSnapshot(cmdArgs *CmdArgs) map[string]any {
+	if cmdArgs == nil {
+		return nil
+	}
+	return map[string]any{
+		"command":                    cmdArgs.Command,
+		"args":                       append([]string(nil), cmdArgs.Args...),
+		"kwargs":                     quickJSJSONValue(cmdArgs.Kwargs),
+		"atInfo":                     quickJSJSONValue(cmdArgs.At),
+		"rawArgs":                    cmdArgs.RawArgs,
+		"amIBeMentioned":             cmdArgs.AmIBeMentioned,
+		"amIBeMentionedFirst":        cmdArgs.AmIBeMentionedFirst,
+		"someoneBeMentionedButNotMe": cmdArgs.SomeoneBeMentionedButNotMe,
+		"isSpaceBeforeArgs":          cmdArgs.IsSpaceBeforeArgs,
+		"cleanArgs":                  cmdArgs.CleanArgs,
+		"specialExecuteTimes":        cmdArgs.SpecialExecuteTimes,
+		"rawText":                    cmdArgs.RawText,
+	}
+}
+
+func quickJSCtxSnapshot(ctx *MsgContext) map[string]any {
+	if ctx == nil {
+		return nil
+	}
+	return map[string]any{
+		"messageType":     ctx.MessageType,
+		"group":           quickJSGroupSnapshot(ctx.Group),
+		"player":          quickJSJSONValue(ctx.Player),
+		"endPoint":        quickJSEndPointSnapshot(ctx.EndPoint),
+		"isCurGroupBotOn": ctx.IsCurGroupBotOn,
+		"isPrivate":       ctx.IsPrivate,
+		"commandHideFlag": ctx.CommandHideFlag,
+		"privilegeLevel":  ctx.PrivilegeLevel,
+		"groupRoleLevel":  ctx.GroupRoleLevel,
+		"delegateText":    ctx.DelegateText,
+		"aliasPrefixText": ctx.AliasPrefixText,
+	}
+}
+
+func quickJSBaseRuntime(ctx *MsgContext, msg *Message) map[string]any {
+	runtime := map[string]any{
+		"ctx":     ctx,
+		"ctxData": quickJSCtxSnapshot(ctx),
+		"msg":     msg,
+		"msgData": quickJSMessageSnapshot(msg),
+	}
+	runtime["replyToSender"] = func(text string) {
+		if ctx == nil || msg == nil {
+			return
+		}
+		ReplyToSender(ctx, msg, text)
+	}
+	return runtime
+}
+
+func quickJSStringSliceValue(v any) []string {
+	out := make([]string, 0)
+	switch vv := v.(type) {
+	case []string:
+		for _, item := range vv {
+			item = strings.TrimSpace(item)
+			if item != "" {
+				out = append(out, item)
+			}
+		}
+	case []any:
+		for _, item := range vv {
+			if s, ok := item.(string); ok {
+				s = strings.TrimSpace(s)
+				if s != "" {
+					out = append(out, s)
+				}
+			}
+		}
+	}
+	return out
+}
+
+func quickJSCallbackNames(v any) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, item := range quickJSStringSliceValue(v) {
+		out[item] = struct{}{}
+	}
+	return out
+}
+
+func bindQuickJSExtCallbacks(d *Dice, ext *ExtInfo, callbackSet map[string]struct{}) {
+	if d == nil || ext == nil || len(callbackSet) == 0 {
+		return
+	}
+	invoke := func(callbackName string, runtime map[string]any) {
+		invoker, ok := d.ScriptEngine.(interface {
+			InvokeStoredExtCallback(extName string, callbackName string, runtime map[string]any) error
+		})
+		if !ok {
+			d.Logger.Errorf("QuickJS 扩展回调执行器不可用: %s.%s", ext.Name, callbackName)
+			return
+		}
+		if err := invoker.InvokeStoredExtCallback(ext.Name, callbackName, runtime); err != nil {
+			d.Logger.Errorf("QuickJS 扩展回调执行失败 %s.%s: %v", ext.Name, callbackName, err)
+		}
+	}
+	if _, ok := callbackSet["onNotCommandReceived"]; ok {
+		ext.OnNotCommandReceived = func(ctx *MsgContext, msg *Message) {
+			invoke("onNotCommandReceived", quickJSBaseRuntime(ctx, msg))
+		}
+	}
+	if _, ok := callbackSet["onCommandReceived"]; ok {
+		ext.OnCommandReceived = func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) {
+			runtime := quickJSBaseRuntime(ctx, msg)
+			runtime["cmdArgs"] = cmdArgs
+			runtime["cmdArgsData"] = quickJSCmdArgsSnapshot(cmdArgs)
+			if cmdArgs != nil {
+				runtime["getArgN"] = func(n int64) string { return cmdArgs.GetArgN(int(n)) }
+				runtime["isArgEqual"] = func(n int64, ss []string) bool { return cmdArgs.IsArgEqual(int(n), ss...) }
+				runtime["getKwargJSON"] = func(name string) string {
+					raw, _ := json.Marshal(cmdArgs.GetKwarg(name))
+					return string(raw)
+				}
+				runtime["getRestArgsFrom"] = func(index int64) string { return cmdArgs.GetRestArgsFrom(int(index)) }
+			}
+			invoke("onCommandReceived", runtime)
+		}
+	}
+	if _, ok := callbackSet["onMessageReceived"]; ok {
+		ext.OnMessageReceived = func(ctx *MsgContext, msg *Message) {
+			invoke("onMessageReceived", quickJSBaseRuntime(ctx, msg))
+		}
+	}
+	if _, ok := callbackSet["onMessageSend"]; ok {
+		// Intentionally leave onMessageSend unbound for QuickJS.
+		// ReplyToSender can synchronously fire OnMessageSend while QuickJS is
+		// already executing under runtimeMu, and re-entering here would deadlock.
+	}
+	if _, ok := callbackSet["onMessageDeleted"]; ok {
+		ext.OnMessageDeleted = func(ctx *MsgContext, msg *Message) {
+			invoke("onMessageDeleted", quickJSBaseRuntime(ctx, msg))
+		}
+	}
+	if _, ok := callbackSet["onMessageEdit"]; ok {
+		ext.OnMessageEdit = func(ctx *MsgContext, msg *Message) {
+			invoke("onMessageEdit", quickJSBaseRuntime(ctx, msg))
+		}
+	}
+	if _, ok := callbackSet["onGroupJoined"]; ok {
+		ext.OnGroupJoined = func(ctx *MsgContext, msg *Message) {
+			invoke("onGroupJoined", quickJSBaseRuntime(ctx, msg))
+		}
+	}
+	if _, ok := callbackSet["onGroupMemberJoined"]; ok {
+		ext.OnGroupMemberJoined = func(ctx *MsgContext, msg *Message) {
+			invoke("onGroupMemberJoined", quickJSBaseRuntime(ctx, msg))
+		}
+	}
+	if _, ok := callbackSet["onGuildJoined"]; ok {
+		ext.OnGuildJoined = func(ctx *MsgContext, msg *Message) {
+			invoke("onGuildJoined", quickJSBaseRuntime(ctx, msg))
+		}
+	}
+	if _, ok := callbackSet["onBecomeFriend"]; ok {
+		ext.OnBecomeFriend = func(ctx *MsgContext, msg *Message) {
+			invoke("onBecomeFriend", quickJSBaseRuntime(ctx, msg))
+		}
+	}
+	if _, ok := callbackSet["onPoke"]; ok {
+		ext.OnPoke = func(ctx *MsgContext, event *events.PokeEvent) {
+			runtime := map[string]any{
+				"ctx":       ctx,
+				"ctxData":   quickJSCtxSnapshot(ctx),
+				"event":     event,
+				"eventData": quickJSJSONValue(event),
+			}
+			invoke("onPoke", runtime)
+		}
+	}
+	if _, ok := callbackSet["onGroupLeave"]; ok {
+		ext.OnGroupLeave = func(ctx *MsgContext, event *events.GroupLeaveEvent) {
+			runtime := map[string]any{
+				"ctx":       ctx,
+				"ctxData":   quickJSCtxSnapshot(ctx),
+				"event":     event,
+				"eventData": quickJSJSONValue(event),
+			}
+			invoke("onGroupLeave", runtime)
+		}
+	}
+}
+
 func convertJsExtInfo(d *Dice, v any) (*ExtInfo, error) {
 	if v == nil {
 		return nil, nil
@@ -1727,6 +2108,7 @@ func convertJsExtInfo(d *Dice, v any) (*ExtInfo, error) {
 	}
 	ext := &ExtInfo{
 		Name:        name,
+		Aliases:     quickJSStringSliceValue(data["aliases"]),
 		Author:      getString("author"),
 		Version:     getString("version"),
 		GetDescText: GetExtensionDesc,
@@ -1734,6 +2116,7 @@ func convertJsExtInfo(d *Dice, v any) (*ExtInfo, error) {
 		IsJsExt:     true,
 		Brief:       "一个JS自定义扩展",
 		Official:    getBool("official", false),
+		ActiveWith:  quickJSStringSliceValue(data["activeWith"]),
 		CmdMap:      CmdMapCls{},
 	}
 	if brief := getString("brief"); brief != "" {
@@ -1778,42 +2161,7 @@ func convertJsExtInfo(d *Dice, v any) (*ExtInfo, error) {
 			}
 		}
 	}
-	extNameCopy := ext.Name
-	ext.OnNotCommandReceived = func(ctx *MsgContext, msg *Message) {
-		invoker, ok := d.ScriptEngine.(interface {
-			InvokeStoredOnNotCommand(extName string, runtime map[string]any) error
-		})
-		if !ok {
-			d.Logger.Errorf("QuickJS 非指令回调执行器不可用: %s", extNameCopy)
-			return
-		}
-		msgObj := map[string]any{}
-		if msg != nil {
-			msgObj["message"] = msg.Message
-			msgObj["messageType"] = msg.MessageType
-			msgObj["platform"] = msg.Platform
-			msgObj["groupID"] = msg.GroupID
-			msgObj["guildID"] = msg.GuildID
-			msgObj["channelID"] = msg.ChannelID
-			msgObj["senderUserID"] = msg.Sender.UserID
-			msgObj["senderNickname"] = msg.Sender.Nickname
-		}
-		runtime := map[string]any{
-			"msg": msgObj,
-		}
-		if ctx != nil {
-			runtime["privilegeLevel"] = ctx.PrivilegeLevel
-		}
-		runtime["replyToSender"] = func(text string) {
-			if ctx == nil || msg == nil {
-				return
-			}
-			ReplyToSender(ctx, msg, text)
-		}
-		if err := invoker.InvokeStoredOnNotCommand(extNameCopy, runtime); err != nil {
-			d.Logger.Errorf("QuickJS 非指令回调执行失败 %s: %v", extNameCopy, err)
-		}
-	}
+	bindQuickJSExtCallbacks(d, ext, quickJSCallbackNames(data["__sdCallbacks"]))
 	return ext, nil
 }
 
@@ -1823,8 +2171,20 @@ func buildQuickJSCmdInfo(d *Dice, extName string, cmdName string, rawCmd map[str
 		IsJsSolveFunc: true,
 	}
 	if rawCmd != nil {
+		if shortHelp, ok := rawCmd["shortHelp"].(string); ok {
+			cmdInfo.ShortHelp = shortHelp
+		}
 		if help, ok := rawCmd["help"].(string); ok {
 			cmdInfo.Help = help
+		}
+		if allowDelegate, ok := rawCmd["allowDelegate"].(bool); ok {
+			cmdInfo.AllowDelegate = allowDelegate
+		}
+		if disabledInPrivate, ok := rawCmd["disabledInPrivate"].(bool); ok {
+			cmdInfo.DisabledInPrivate = disabledInPrivate
+		}
+		if enableExecuteTimesParse, ok := rawCmd["enableExecuteTimesParse"].(bool); ok {
+			cmdInfo.EnableExecuteTimesParse = enableExecuteTimesParse
 		}
 		if raw, ok := rawCmd["raw"].(bool); ok {
 			cmdInfo.Raw = raw
@@ -1834,6 +2194,23 @@ func buildQuickJSCmdInfo(d *Dice, extName string, cmdName string, rawCmd map[str
 		}
 		if checkMentionOthers, ok := rawCmd["checkMentionOthers"].(bool); ok {
 			cmdInfo.CheckMentionOthers = checkMentionOthers
+		}
+		if hasHelpFunc, ok := rawCmd["__sdHasHelpFunc"].(bool); ok && hasHelpFunc {
+			cmdInfo.HelpFunc = func(isShort bool) string {
+				invoker, ok := d.ScriptEngine.(interface {
+					InvokeStoredCmdHelp(extName string, cmdName string, isShort bool) (string, error)
+				})
+				if !ok {
+					d.Logger.Errorf("QuickJS 命令帮助执行器不可用: %s.%s", extName, cmdName)
+					return ""
+				}
+				ret, err := invoker.InvokeStoredCmdHelp(extName, cmdName, isShort)
+				if err != nil {
+					d.Logger.Errorf("QuickJS 命令帮助执行失败 %s.%s: %v", extName, cmdName, err)
+					return ""
+				}
+				return ret
+			}
 		}
 	}
 
@@ -1847,9 +2224,36 @@ func buildQuickJSCmdInfo(d *Dice, extName string, cmdName string, rawCmd map[str
 			return CmdExecuteResult{Matched: true, Solved: false}
 		}
 		ret, err := invoker.InvokeStoredSolve(extName, cmdNameCopy, map[string]any{
-			"privilegeLevel": ctx.PrivilegeLevel,
+			"ctx":         ctx,
+			"ctxData":     quickJSCtxSnapshot(ctx),
+			"msg":         msg,
+			"msgData":     quickJSMessageSnapshot(msg),
+			"cmdArgs":     cmdArgs,
+			"cmdArgsData": quickJSCmdArgsSnapshot(cmdArgs),
 			"getArgN": func(n int64) string {
+				if cmdArgs == nil {
+					return ""
+				}
 				return cmdArgs.GetArgN(int(n))
+			},
+			"isArgEqual": func(n int64, ss []string) bool {
+				if cmdArgs == nil {
+					return false
+				}
+				return cmdArgs.IsArgEqual(int(n), ss...)
+			},
+			"getKwargJSON": func(name string) string {
+				if cmdArgs == nil {
+					return "null"
+				}
+				raw, _ := json.Marshal(cmdArgs.GetKwarg(name))
+				return string(raw)
+			},
+			"getRestArgsFrom": func(index int64) string {
+				if cmdArgs == nil {
+					return ""
+				}
+				return cmdArgs.GetRestArgsFrom(int(index))
 			},
 			"replyToSender": func(text string) {
 				ReplyToSender(ctx, msg, text)
@@ -1882,12 +2286,14 @@ func extInfoToJSMap(ext *ExtInfo) map[string]any {
 	}
 	m := map[string]any{
 		"name":       ext.Name,
+		"aliases":    append([]string(nil), ext.Aliases...),
 		"author":     ext.Author,
 		"version":    ext.Version,
 		"autoActive": ext.AutoActive,
 		"isJsExt":    ext.IsJsExt,
 		"brief":      ext.Brief,
 		"official":   ext.Official,
+		"activeWith": append([]string(nil), ext.ActiveWith...),
 		"cmdMap":     map[string]any{},
 	}
 	// 兼容脚本中可能使用的 Source.Official 判断。
@@ -1942,8 +2348,32 @@ func (d *Dice) JsShutdown() {
 }
 
 func (d *Dice) jsClear() {
+	defer func() {
+		if r := recover(); r != nil {
+			d.ScriptEngine = nil
+			d.Logger.Errorf("jsClear 发生panic: %v\n堆栈:\n%s", r, string(debug.Stack()))
+			d.safeJSClearStateOnly("jsClear 清理")
+		}
+	}()
+	d.disposeRetiredJSEngines("jsClear")
 	if d.ScriptEngine != nil {
-		_ = d.ScriptEngine.Dispose()
+		if d.ScriptEngine.Name() == jsengine.EngineQuickJS {
+			if quiescer, ok := d.ScriptEngine.(interface{ Quiesce() error }); ok {
+				if err := quiescer.Quiesce(); err != nil {
+					d.Logger.Warnf("QuickJS 引擎退役失败，尝试常规释放: %v", err)
+					_ = d.ScriptEngine.Dispose()
+				} else {
+					// quickjs-go 在部分 teardown 路径上会直接导致进程退出。
+					// 切换引擎时先静默退役并保留一个实例，延迟到下一次清理时再释放，
+					// 避免在同一 teardown 路径上立即触发底层崩溃。
+					d.RetiredJSEngines = []jsengine.Engine{d.ScriptEngine}
+				}
+			} else {
+				_ = d.ScriptEngine.Dispose()
+			}
+		} else {
+			_ = d.ScriptEngine.Dispose()
+		}
 		d.ScriptEngine = nil
 	}
 	d.jsClearStateOnly()

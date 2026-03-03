@@ -248,8 +248,8 @@ func TestJsExecQuickJSDoesNotMutateGlobalCommonJS(t *testing.T) {
 		strings.Contains(engine.lastCode, "globalThis.require") {
 		t.Fatalf("QuickJS jsExec 不应修改 globalThis CommonJS 符号，实际脚本: %s", engine.lastCode)
 	}
-	if !strings.Contains(engine.lastCode, "return eval(__sd_code);") {
-		t.Fatalf("QuickJS jsExec 应保留 eval completion value，实际脚本: %s", engine.lastCode)
+	if strings.Contains(engine.lastCode, "return eval(__sd_code);") {
+		t.Fatalf("QuickJS jsExec 不应暴露 completion value，实际脚本: %s", engine.lastCode)
 	}
 	if !strings.Contains(engine.lastCode, "new Function(\"exports\", \"require\", \"module\", __sd_code)") {
 		t.Fatalf("QuickJS jsExec 应兼容顶层 return 脚本，实际脚本: %s", engine.lastCode)

@@ -11,6 +11,7 @@ import (
 type unavailableBackend struct{}
 
 func (b *unavailableBackend) Dispose() error { return nil }
+func (b *unavailableBackend) Quiesce() error { return nil }
 
 func (b *unavailableBackend) Eval(_ string) error { return fmt.Errorf("QuickJS backend 不可用") }
 func (b *unavailableBackend) EvalWithResult(_ string) (any, error) {
@@ -27,6 +28,12 @@ func (b *unavailableBackend) Reset() error { return fmt.Errorf("QuickJS backend 
 
 func (b *unavailableBackend) InvokeStoredSolve(_ string, _ string, _ map[string]any) (map[string]any, error) {
 	return nil, fmt.Errorf("QuickJS backend 不可用")
+}
+func (b *unavailableBackend) InvokeStoredCmdHelp(_ string, _ string, _ bool) (string, error) {
+	return "", fmt.Errorf("QuickJS backend 不可用")
+}
+func (b *unavailableBackend) InvokeStoredExtCallback(_ string, _ string, _ map[string]any) error {
+	return fmt.Errorf("QuickJS backend 不可用")
 }
 func (b *unavailableBackend) InvokeStoredOnNotCommand(_ string, _ map[string]any) error {
 	return fmt.Errorf("QuickJS backend 不可用")
