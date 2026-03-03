@@ -35,6 +35,7 @@ import (
 	"github.com/robfig/cron/v3"
 	"github.com/samber/lo"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"gopkg.in/elazarl/goproxy.v1"
 
 	"Scardice-core/dice/jsengine"
@@ -100,7 +101,14 @@ func (p *PrinterFunc) Log(s string) {
 func (p *PrinterFunc) Warn(s string) { p.doRecord("warn", s); p.d.Logger.Warn(s) }
 
 // Error 表示插件业务侧的错误输出（例如 console.error），不打印 Go 运行栈。
-func (p *PrinterFunc) Error(s string) { p.doRecord("error", s); p.d.Logger.Error("[JS] " + s) }
+func (p *PrinterFunc) Error(s string) {
+	p.doRecord("error", s)
+	if p.d == nil || p.d.Logger == nil {
+		return
+	}
+	// 避免 Error 级别触发全局堆栈打印
+	p.d.Logger.Desugar().WithOptions(zap.AddStacktrace(zapcore.FatalLevel)).Sugar().Error("[JS] " + s)
+}
 
 // InternalError 表示引擎内部异常，保留 error 级别与调用栈。
 func (p *PrinterFunc) InternalError(s string) { p.doRecord("error", s); p.d.Logger.Error(s) }

@@ -1456,6 +1456,8 @@ func (ep *EndPointInfo) TriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *
 		case commandSolveBlocked:
 			handled = true
 			log.Infof("指令[%s]可用扩展均被禁用: %s", cmdArgs.Command, strings.Join(solveResult.DisabledSources, ", "))
+		case commandSolveHandled:
+			handled = true
 		case commandSolveUnmatched:
 		}
 	}
@@ -1838,6 +1840,7 @@ const (
 	commandSolveSolved
 	commandSolveConflict
 	commandSolveBlocked
+	commandSolveHandled
 )
 
 type commandSolveCandidate struct {
@@ -2171,6 +2174,10 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 
 	if len(available) == 1 && solved {
 		return commandSolveResult{Status: commandSolveSolved}
+	}
+	if len(available) == 1 {
+		// 已进入 solve，但未标记 solved，仍视为已处理，避免误报“忽略指令”。
+		return commandSolveResult{Status: commandSolveHandled}
 	}
 
 	if len(disabled) > 0 {
