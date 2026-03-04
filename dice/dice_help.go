@@ -2,7 +2,6 @@ package dice
 
 import (
 	"crypto/sha256"
-	"encoding/gob"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -857,16 +856,9 @@ func (m *HelpManager) loadHelpDocItemsFromCache(group string, path string) ([]do
 	if err != nil {
 		return nil, false
 	}
-	_ = os.MkdirAll(helpDocParsedCacheDir, 0o755)
 	cachePath := filepath.Join(helpDocParsedCacheDir, helpDocCacheKey(path)+".gob")
-	f, err := os.Open(cachePath)
-	if err != nil {
-		return nil, false
-	}
-	defer f.Close()
 	var cache helpDocParsedCache
-	dec := gob.NewDecoder(f)
-	if decErr := dec.Decode(&cache); decErr != nil {
+	if err := loadGobCacheFile(cachePath, &cache); err != nil {
 		return nil, false
 	}
 	if cache.Version != helpDocParsedCacheVersion {
@@ -904,24 +896,8 @@ func (m *HelpManager) saveHelpDocItemsToCache(path string, items []docengine.Hel
 		ModTime: st.ModTime().Unix(),
 		Items:   items,
 	}
-	_ = os.MkdirAll(helpDocParsedCacheDir, 0o755)
 	cachePath := filepath.Join(helpDocParsedCacheDir, helpDocCacheKey(path)+".gob")
-	tmpPath := cachePath + ".tmp"
-	f, err := os.Create(tmpPath)
-	if err != nil {
-		return
-	}
-	enc := gob.NewEncoder(f)
-	if err := enc.Encode(&cache); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmpPath)
-		return
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return
-	}
-	_ = os.Rename(tmpPath, cachePath)
+	_ = saveGobCacheFile(cachePath, &cache)
 }
 
 // validateXlsxHeaders 验证 xlsx 格式 helpdoc 的表头是否是 Key Synonym（可能有多列） Content Description Catalogue Tag

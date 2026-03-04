@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/gob"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -816,14 +815,8 @@ func jsCacheKey(path string) string {
 
 func loadJsMetaCache() *jsMetaCache {
 	cachePath := filepath.Join(jsCacheDir, jsMetaCacheFile)
-	f, err := os.Open(cachePath)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
 	var cache jsMetaCache
-	dec := gob.NewDecoder(f)
-	if err := dec.Decode(&cache); err != nil {
+	if err := loadGobCacheFile(cachePath, &cache); err != nil {
 		return nil
 	}
 	if cache.Version != jsMetaCacheVersion {
@@ -839,24 +832,8 @@ func saveJsMetaCache(cache *jsMetaCache) {
 	if cache == nil {
 		return
 	}
-	_ = os.MkdirAll(jsCacheDir, 0o755)
 	cachePath := filepath.Join(jsCacheDir, jsMetaCacheFile)
-	tmpPath := cachePath + ".tmp"
-	f, err := os.Create(tmpPath)
-	if err != nil {
-		return
-	}
-	enc := gob.NewEncoder(f)
-	if err := enc.Encode(cache); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmpPath)
-		return
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return
-	}
-	_ = os.Rename(tmpPath, cachePath)
+	_ = saveGobCacheFile(cachePath, cache)
 }
 
 func buildJsScriptInfoFromCache(d *Dice, path string, entry jsMetaCacheEntry) (*JsScriptInfo, error) {
