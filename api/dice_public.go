@@ -39,8 +39,10 @@ func dicePublicSet(c echo.Context) error {
 			}
 		}
 	}
-	myDice.PublicDiceInfoRegister()
-	myDice.PublicDiceEndpointRefresh()
+	if myDice.Config.PublicDiceConfig.Enable {
+		myDice.PublicDiceInfoRegister()
+		myDice.PublicDiceEndpointRefresh()
+	}
 	myDice.PublicDiceSetupTick()
 	myDice.LastUpdatedTime = time.Now().Unix()
 	myDice.Save(false)
