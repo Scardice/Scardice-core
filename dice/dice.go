@@ -935,6 +935,9 @@ func (d *Dice) ResetQuitInactiveCron() {
 
 func (d *Dice) PublicDiceEndpointRefresh() {
 	cfg := &d.Config.PublicDiceConfig
+	if !cfg.Enable {
+		return
+	}
 
 	var endpointItems []*public_dice.Endpoint
 	for _, i := range d.ImSession.EndPoints {
@@ -953,13 +956,16 @@ func (d *Dice) PublicDiceEndpointRefresh() {
 		Endpoints: endpointItems,
 	}, nil)
 	if code != 200 {
-		d.Logger.Warn("[公骰]无法通过服务器校验，不再进行更新")
+		d.logPublicDiceStatus("端点更新失败", code)
 		return
 	}
 }
 
 func (d *Dice) PublicDiceInfoRegister() {
 	cfg := &d.Config.PublicDiceConfig
+	if !cfg.Enable {
+		return
+	}
 	pd, code := d.PublicDice.Register(&public_dice.RegisterRequest{
 		ID:    cfg.ID,
 		Name:  cfg.Name,
@@ -967,7 +973,7 @@ func (d *Dice) PublicDiceInfoRegister() {
 		Note:  cfg.Note,
 	}, nil)
 	if code != 200 {
-		d.Logger.Warn("[公骰]无法通过服务器校验，不再进行骰号注册")
+		d.logPublicDiceStatus("骰号注册失败", code)
 		return
 	}
 	// ID为空时才将注册好的ID覆写配置
@@ -978,10 +984,18 @@ func (d *Dice) PublicDiceInfoRegister() {
 
 func (d *Dice) PublicDiceSetupTick() {
 	cfg := &d.Config.PublicDiceConfig
+	if !cfg.Enable {
+		if d.PublicDiceTimerId != 0 {
+			d.Cron.Remove(d.PublicDiceTimerId)
+			d.PublicDiceTimerId = 0
+		}
+		return
+	}
 
 	doTickUpdate := func() {
 		if !cfg.Enable {
 			d.Cron.Remove(d.PublicDiceTimerId)
+			d.PublicDiceTimerId = 0
 			return
 		}
 		var tickEndpointItems []*public_dice.TickEndpoint
@@ -994,10 +1008,13 @@ func (d *Dice) PublicDiceSetupTick() {
 				IsOnline: i.State == 1,
 			})
 		}
-		d.PublicDice.TickUpdate(&public_dice.TickUpdateRequest{
+		_, code := d.PublicDice.TickUpdate(&public_dice.TickUpdateRequest{
 			ID:        cfg.ID,
 			Endpoints: tickEndpointItems,
 		}, nil)
+		if code != 200 {
+			d.logPublicDiceStatus("心跳更新失败", code)
+		}
 	}
 
 	if d.PublicDiceTimerId != 0 {
@@ -1023,6 +1040,35 @@ func (d *Dice) PublicDiceSetup() {
 	d.PublicDiceInfoRegister()
 	d.PublicDiceEndpointRefresh()
 	d.PublicDiceSetupTick()
+}
+
+func publicDiceStatusReason(code int) string {
+	switch {
+	case code == 0:
+		return "网络错误或请求未到达服务端"
+	case code == 400:
+		return "请求参数不合法"
+	case code == 401:
+		return "鉴权失败（未授权）"
+	case code == 403:
+		return "鉴权失败（无权限）"
+	case code == 404:
+		return "接口不存在或路径错误"
+	case code == 409:
+		return "资源冲突（可能ID冲突）"
+	case code == 429:
+		return "请求过于频繁（限流）"
+	case code >= 500:
+		return "服务端错误"
+	case code >= 200 && code < 300:
+		return "成功"
+	default:
+		return "未知错误"
+	}
+}
+
+func (d *Dice) logPublicDiceStatus(action string, code int) {
+	d.Logger.Warnf("[公骰]%s: status=%d, reason=%s", action, code, publicDiceStatusReason(code))
 }
 
 func (d *Dice) StoreSetup() {
