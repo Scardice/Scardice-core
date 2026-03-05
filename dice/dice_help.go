@@ -862,7 +862,7 @@ func (m *HelpManager) loadHelpDocItemsFromCache(group string, path string) ([]do
 	if err != nil {
 		return nil, false
 	}
-	cachePath := filepath.Join(helpDocParsedCacheDir, helpDocCacheKey(path)+".gob")
+	cachePath := filepath.Join(helpDocParsedCacheDir, helpDocCacheKey(path)+".gob.zst")
 	var cache helpDocParsedCache
 	if err := loadGobCacheFile(cachePath, &cache); err != nil {
 		return nil, false
@@ -902,7 +902,7 @@ func (m *HelpManager) saveHelpDocItemsToCache(path string, items []docengine.Hel
 		ModTime: st.ModTime().Unix(),
 		Items:   items,
 	}
-	cachePath := filepath.Join(helpDocParsedCacheDir, helpDocCacheKey(path)+".gob")
+	cachePath := filepath.Join(helpDocParsedCacheDir, helpDocCacheKey(path)+".gob.zst")
 	_ = saveGobCacheFile(cachePath, &cache)
 }
 

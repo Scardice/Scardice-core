@@ -5,6 +5,8 @@ package dice
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +28,21 @@ import (
 	"github.com/tailscale/hujson"
 	"gopkg.in/yaml.v3"
 )
+
+const (
+	deckParseCacheDir        = "./data/.cache/decks"
+	deckParseCacheVersion    = 1
+	deckParseSchemaVersion   = 1
+	deckParseCacheFileSuffix = ".gob.zst"
+)
+
+type deckParseCache struct {
+	Version       int      `json:"version"`
+	SchemaVersion int      `json:"schemaVersion"`
+	Size          int64    `json:"size"`
+	ModTime       int64    `json:"modTime"`
+	DeckInfo      DeckInfo `json:"deckInfo"`
+}
 
 type DeckDiceEFormat struct {
 	Title      []string `json:"_title"`
@@ -413,13 +430,74 @@ func isPrefixWithUtf8Bom(buf []byte) bool {
 	return len(buf) >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF
 }
 
+func deckParseCachePath(fn string) string {
+	sum := sha256.Sum256([]byte(filepath.ToSlash(fn)))
+	return filepath.Join(deckParseCacheDir, hex.EncodeToString(sum[:])+deckParseCacheFileSuffix)
+}
+
+func loadDeckParseCache(fn string, st fs.FileInfo) (*DeckInfo, bool) {
+	if st == nil {
+		return nil, false
+	}
+	cachePath := deckParseCachePath(fn)
+	var cache deckParseCache
+	if err := loadGobCacheFile(cachePath, &cache); err != nil {
+		return nil, false
+	}
+	if cache.Version != deckParseCacheVersion || cache.SchemaVersion != deckParseSchemaVersion {
+		return nil, false
+	}
+	if cache.Size != st.Size() || cache.ModTime != st.ModTime().Unix() {
+		return nil, false
+	}
+	return &cache.DeckInfo, true
+}
+
+func saveDeckParseCache(fn string, st fs.FileInfo, deckInfo *DeckInfo) {
+	if st == nil || deckInfo == nil || !deckInfo.Enable {
+		return
+	}
+	cache := &deckParseCache{
+		Version:       deckParseCacheVersion,
+		SchemaVersion: deckParseSchemaVersion,
+		Size:          st.Size(),
+		ModTime:       st.ModTime().Unix(),
+		DeckInfo:      *deckInfo,
+	}
+	cachePath := deckParseCachePath(fn)
+	_ = saveGobCacheFile(cachePath, cache)
+}
+
 func DeckTryParse(d *Dice, fn string) {
-	content, err := os.ReadFile(fn)
-	if err != nil {
+	st, statErr := os.Stat(fn)
+	if statErr != nil {
 		d.Logger.Infof("牌堆文件“%s”加载失败", fn)
 		return
 	}
+
 	deckInfo := new(DeckInfo)
+
+	if cached, ok := loadDeckParseCache(fn, st); ok {
+		*deckInfo = *cached
+	} else {
+		content, err := os.ReadFile(fn)
+		if err != nil {
+			d.Logger.Infof("牌堆文件“%s”加载失败", fn)
+			return
+		}
+		if deckInfo.DeckItems == nil {
+			deckInfo.DeckItems = map[string][]string{}
+		}
+		if deckInfo.Command == nil {
+			deckInfo.Command = map[string]bool{}
+		}
+		if deckInfo.CloudDeckItemInfos == nil {
+			deckInfo.CloudDeckItemInfos = map[string]*CloudDeckItemInfo{}
+		}
+		_ = parseDeck(d, fn, content, deckInfo)
+		saveDeckParseCache(fn, st, deckInfo)
+	}
+
 	if deckInfo.DeckItems == nil {
 		deckInfo.DeckItems = map[string][]string{}
 	}
@@ -429,7 +507,7 @@ func DeckTryParse(d *Dice, fn string) {
 	if deckInfo.CloudDeckItemInfos == nil {
 		deckInfo.CloudDeckItemInfos = map[string]*CloudDeckItemInfo{}
 	}
-	_ = parseDeck(d, fn, content, deckInfo)
+
 	deckInfo.Filename = fn
 
 	if deckInfo.Name == "" {
