@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -1091,15 +1092,11 @@ func executeDeck(ctx *MsgContext, deckInfo *DeckInfo, deckName string, shufflePo
 		if len(deckGroup) == 0 {
 			return "", errors.New("牌组为空，请检查格式是否正确")
 		}
-		if ctx.DeckPools[deckInfo][deckName] == nil {
-			ctx.DeckPools[deckInfo][deckName] = DeckToShuffleRandomPool(deckGroup)
-		}
-
-		if len(ctx.DeckPools[deckInfo][deckName].data) == 0 {
-			ctx.DeckPools[deckInfo][deckName] = DeckToShuffleRandomPool(deckGroup)
-		}
-
 		pool = ctx.DeckPools[deckInfo][deckName]
+		if pool == nil || len(pool.data) == 0 {
+			pool = DeckToShuffleRandomPool(deckGroup)
+			ctx.DeckPools[deckInfo][deckName] = pool
+		}
 		if pool == nil {
 			return "", errors.New("牌组为空，可能尚未加载完成")
 		}
@@ -1157,21 +1154,66 @@ func getDeckGroup(deckInfo *DeckInfo, deckName string) (deckGroup []string) {
 }
 
 func extractWeight(s string) (uint, string) {
-	weight := int64(1)
-	re := regexp.MustCompile(`^::(\d+)::`)
-	m := re.FindStringSubmatch(s)
+	weight := int64(100)
+	m := deckWeightPrefixRe.FindStringSubmatch(s)
 	if m != nil {
-		weight, _ = strconv.ParseInt(m[1], 10, 64)
+		value, err := strconv.ParseFloat(m[1], 64)
+		if err == nil {
+			// 权重允许浮点，统一按四舍五入到小数点后两位后参与计算。
+			scaled := math.Round(value * 100)
+			if math.IsNaN(scaled) || math.IsInf(scaled, 0) {
+				scaled = 0
+			}
+			if scaled > float64(math.MaxInt64) {
+				scaled = float64(math.MaxInt64)
+			}
+			weight = int64(scaled)
+			if weight < 0 {
+				weight = 0
+			}
+		}
 		s = s[len(m[0]):]
 	}
 	return uint(weight), s
 }
 
-func DeckToRandomPool(deck []string) *wr.Chooser {
-	choices := []wr.Choice{}
-	for _, i := range deck {
-		weight, text := extractWeight(i)
+func gcdUint(a, b uint) uint {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+func buildNormalizedWeightedChoices(deck []string) []wr.Choice {
+	choices := make([]wr.Choice, 0, len(deck))
+	var divisor uint
+	for _, item := range deck {
+		weight, text := extractWeight(item)
+		if weight == 0 {
+			continue
+		}
+		if divisor == 0 {
+			divisor = weight
+		} else {
+			divisor = gcdUint(divisor, weight)
+		}
 		choices = append(choices, wr.Choice{Item: text, Weight: weight})
+	}
+	if len(choices) == 0 {
+		return nil
+	}
+	if divisor > 1 {
+		for i := range choices {
+			choices[i].Weight /= divisor
+		}
+	}
+	return choices
+}
+
+func DeckToRandomPool(deck []string) *wr.Chooser {
+	choices := buildNormalizedWeightedChoices(deck)
+	if len(choices) == 0 {
+		return nil
 	}
 	randomPool, _ := wr.NewChooser(choices...)
 	return randomPool
@@ -1208,6 +1250,7 @@ func NewChooser(choices ...wr.Choice) (*ShuffleRandomPool, error) {
 }
 
 var randSourceDrawAndTmplSelect = rand.New(rand.NewSource(time.Now().UnixMilli()))
+var deckWeightPrefixRe = regexp.MustCompile(`^::([+-]?\d+(?:\.\d+)?)::`)
 
 // Pick returns a single weighted random Choice.Item from the Chooser.
 //
@@ -1239,10 +1282,9 @@ func searchInts(a []int, x int) int {
 }
 
 func DeckToShuffleRandomPool(deck []string) *ShuffleRandomPool {
-	var choices []wr.Choice
-	for _, i := range deck {
-		weight, text := extractWeight(i)
-		choices = append(choices, wr.Choice{Item: text, Weight: weight})
+	choices := buildNormalizedWeightedChoices(deck)
+	if len(choices) == 0 {
+		return nil
 	}
 	randomPool, _ := NewChooser(choices...)
 	return randomPool
