@@ -20,7 +20,7 @@ type NamesGenerator struct {
 
 const (
 	namesCacheDir      = "./data/.cache/names"
-	namesCacheFilename = "names_cache.gob"
+	namesCacheFilename = "names_cache.gob.zst"
 	namesCacheVersion  = 1
 )
 

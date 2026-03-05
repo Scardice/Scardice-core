@@ -61,7 +61,7 @@ var taskCronParser = cron.NewParser(
 
 const (
 	jsCacheDir         = "./data/.cache/js"
-	jsMetaCacheFile    = "meta.gob"
+	jsMetaCacheFile    = "meta.gob.zst"
 	jsMetaCacheVersion = 1
 	tsCacheDir         = "./data/.cache/js/ts"
 	tsCacheVersion     = 1
