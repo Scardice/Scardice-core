@@ -72,10 +72,23 @@ func (d *BleveSearchEngine) Init() error {
 		}
 	} else {
 		mapping := bleve.NewIndexMapping()
+		// 不依赖 helpdoc 索引的动态字段，并禁用了动态 doc_values，以减小索引体积
+		mapping.DocValuesDynamic = false
+		mapping.StoreDynamic = false
 		docMapping := bleve.NewDocumentMapping()
+		docMapping.Dynamic = false
+		// 禁用隐式 _all 复合字段
+		docMapping.AddSubDocumentMapping("_all", bleve.NewDocumentDisabledMapping())
+
 		contentFieldMapping := bleve.NewTextFieldMapping()
 		titleFieldMapping := bleve.NewTextFieldMapping()
 		keywordMapping := bleve.NewKeywordFieldMapping()
+		contentFieldMapping.DocValues = false
+		contentFieldMapping.IncludeInAll = false
+		titleFieldMapping.DocValues = false
+		titleFieldMapping.IncludeInAll = false
+		keywordMapping.DocValues = false
+		keywordMapping.IncludeInAll = false
 		// 试图：不区分大小写的搜索方案
 		keywordMapping.Analyzer = simple.Name
 		// 注意： 这里group,from,package都是keywordMapping
