@@ -85,6 +85,7 @@ const (
 const HelpConfigFilename = "help_config.yaml"
 const helpIndexManifestPath = "./data/.cache/helpdoc/index_manifest.json"
 const helpIndexManifestVersion = 1
+const helpIndexSchemaVersion = 2
 const helpDocParsedCacheDir = "./data/.cache/helpdoc/parsed"
 const helpDocParsedCacheVersion = 1
 
@@ -394,12 +395,13 @@ type helpDocFileInfo struct {
 }
 
 type helpIndexManifest struct {
-	Version     int               `json:"version"`
-	EngineType  EngineType        `json:"engineType"`
-	VersionCode int64             `json:"versionCode"`
-	Fingerprint string            `json:"fingerprint"`
-	Files       []helpDocFileInfo `json:"files"`
-	TotalID     uint64            `json:"totalId"`
+	Version       int               `json:"version"`
+	SchemaVersion int               `json:"schemaVersion"`
+	EngineType    EngineType        `json:"engineType"`
+	VersionCode   int64             `json:"versionCode"`
+	Fingerprint   string            `json:"fingerprint"`
+	Files         []helpDocFileInfo `json:"files"`
+	TotalID       uint64            `json:"totalId"`
 }
 
 func loadHelpIndexManifest() (*helpIndexManifest, error) {
@@ -418,11 +420,12 @@ func buildHelpIndexManifest(engineType EngineType, internalCmdMap CmdMapCls, ext
 	curFiles, _ := collectHelpDocFiles("./data/helpdoc")
 	fingerprint := buildHelpIndexFingerprint(internalCmdMap, extList)
 	return helpIndexManifest{
-		Version:     helpIndexManifestVersion,
-		EngineType:  engineType,
-		VersionCode: VERSION_CODE,
-		Fingerprint: fingerprint,
-		Files:       curFiles,
+		Version:       helpIndexManifestVersion,
+		SchemaVersion: helpIndexSchemaVersion,
+		EngineType:    engineType,
+		VersionCode:   VERSION_CODE,
+		Fingerprint:   fingerprint,
+		Files:         curFiles,
 	}
 }
 
@@ -431,6 +434,9 @@ func canReuseHelpIndex(old *helpIndexManifest, cur *helpIndexManifest) bool {
 		return false
 	}
 	if old.Version != helpIndexManifestVersion {
+		return false
+	}
+	if old.SchemaVersion != helpIndexSchemaVersion {
 		return false
 	}
 	if old.EngineType != cur.EngineType {
