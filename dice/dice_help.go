@@ -807,7 +807,7 @@ func parseHelpDocXLSX(group string, path string) ([]docengine.HelpTextItem, erro
 	}()
 
 	for index, s := range f.GetSheetList() {
-		rows, err := f.GetRows(s)
+		rows, err := f.GetRows(s, excelize.Options{RawCellValue: true})
 		if err == nil {
 			var synonymCount int
 			for i, row := range rows {
