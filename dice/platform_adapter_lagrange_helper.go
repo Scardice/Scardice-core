@@ -566,43 +566,103 @@ func lagrangeGetAppinfoFromSignServer(serverName string) ([]byte, error) {
 var signInfoJson string = `
 [
   {
-    "version": "25765",
+    "version": "39038",
     "appinfo": {
-      "AppClientVersion": 25765,
-      "AppId": 1600001615,
-      "AppIdQrCode": 13697054,
-      "CurrentVersion": "3.2.10-25765",
-      "Kernel": "Linux",
-      "MainSigMap": 169742560,
-      "MiscBitmap": 32764,
-      "NTLoginType": 1,
       "Os": "Linux",
-      "PackageName": "com.tencent.qq",
+      "VendorOs": "linux",
+      "Kernel": "Linux",
+      "MiscBitmap": 32764,
       "PtVersion": "2.0.0",
       "SsoVersion": 19,
-      "SubAppId": 537234773,
+      "PackageName": "com.tencent.qq",
+      "WtLoginSdk": "nt.wtlogin.0.0.1",
+      "AppId": 1600001615,
+      "MainSigMap": 169742560,
       "SubSigMap": 0,
-      "VendorOs": "linux",
-      "WtLoginSdk": "nt.wtlogin.0.0.1"
+      "NTLoginType": 1,
+      "CurrentVersion": "3.2.19-39038",
+      "AppClientVersion": 39038,
+      "SubAppId": 537313942,
+      "AppIdQrCode": 537313942
     },
     "servers": [
       {
-        "name": "余烬",
-        "url": "https://lwxmagic.sealdice.com/api/sign/25765"
+        "name": "海豹V2",
+        "url": "https://lwxmagic3.sealdice.com/api/sign/39038"
       },
-	  {
-        "name": "Lagrange",
-        "url": "https://sign.lagrangecore.org/api/sign/25765"
+      {
+        "name": "aaa1",
+        "url": "http://milkymagic.cblkseal.tech/api/sign/39038",
+        "selected": true
+      },
+      {
+        "name": "雪桃-莱茵主环",
+        "url": "https://de.seal-sign.xuetao.host/39038",
+        "note": "德国法兰克福：稳、抗压，大陆基本稳定可用但延迟偏高。能用时优先选它。（运行代价轻）"
+      },
+      {
+        "name": "雪桃-云界律域",
+        "url": "https://cf-seal-sign.xuetao.host/39038",
+        "note": "Cloudflare反代：海外很快，大陆转圈圈，适合备用。（运行代价轻）"
+      },
+      {
+        "name": "雪桃-寰网引路",
+        "url": "https://seal-sign.xuetao.host/39038",
+        "note": "【其他稳请优先用其他】全球CDN入口：亚太CDN对华，Cloudflare对国际。低延迟，稳定。（运行代价高）"
       }
     ]
   },
   {
-    "version": "30366",
+    "version": "40768",
     "appinfo": {
-      "AppClientVersion": 30366,
+      "Os": "Linux",
+      "Kernel": "Linux",
+      "VendorOs": "linux",
+      "CurrentVersion": "3.2.20-40768",
+      "PtVersion": "2.0.0",
+      "MiscBitmap": 32764,
+      "SsoVersion": 19,
+      "PackageName": "com.tencent.qq",
+      "WtLoginSdk": "nt.wtlogin.0.0.1",
+      "AppId": 1600001615,
+      "SubAppId": 537313942,
+      "AppIdQrCode": 13697054,
+      "AppClientVersion": 39038,
+      "MainSigMap": 169742560,
+      "SubSigMap": 0,
+      "NTLoginType": 1
+    },
+    "servers": [
+      {
+        "name": "RSign",
+        "url": "https://kic.cblkseal.tech/api/sign/40768"
+      },
+      {
+        "name": "雪桃-莱茵主环",
+        "url": "https://de.seal-sign.xuetao.host/40768",
+        "note": "德国法兰克福：稳、抗压，大陆基本稳定可用但延迟偏高。能用时优先选它。（运行代价轻）",
+        "selected": true
+      },
+      {
+        "name": "雪桃-云界律域",
+        "url": "https://cf-seal-sign.xuetao.host/40768",
+        "note": "Cloudflare反代：海外很快，大陆转圈圈，适合备用。（运行代价轻）"
+      },
+      {
+        "name": "雪桃-寰网引路",
+        "url": "https://seal-sign.xuetao.host/40768",
+        "note": "【其他稳请优先用其他】全球CDN入口：亚太CDN对华，Cloudflare对国际。低延迟，稳定。（运行代价高）"
+      }
+    ],
+    "note": "如果39038能登录就不要选"
+  },
+  {
+    "version": "41857",
+    "appinfo": {
+      "AppClientVersion": 41857,
       "AppId": 1600001615,
       "AppIdQrCode": 13697054,
-      "CurrentVersion": "3.2.15-30366",
+      "CurrentVersion": "3.2.21-41857",
       "Kernel": "Linux",
       "MainSigMap": 169742560,
       "MiscBitmap": 32764,
@@ -611,58 +671,105 @@ var signInfoJson string = `
       "PackageName": "com.tencent.qq",
       "PtVersion": "2.0.0",
       "SsoVersion": 19,
-      "SubAppId": 537258424,
+      "SubAppId": 537320197,
       "SubSigMap": 0,
       "VendorOs": "linux",
       "WtLoginSdk": "nt.wtlogin.0.0.1"
     },
     "servers": [
       {
-        "name": "余烬",
-        "url": "https://lwxmagic.sealdice.com/api/sign/30366",
-		"selected": true,
-		"note": "部分地区用户可能无法连接"
+        "name": "海豹V2",
+        "url": "https://lwxmagic3.sealdice.com/api/sign/41857"
       },
-	  {
-        "name": "Lagrange",
-        "url": "https://sign.lagrangecore.org/api/sign/30366"
+      {
+        "name": "RSign",
+        "url": "https://kic.cblkseal.tech/api/sign/41857",
+        "selected": true
       }
     ],
+    "note": "如果39038或40768能登录就不要选"
   },
   {
-    "version": "39038",
+    "version": "44343",
     "appinfo": {
-      "AppClientVersion": 309038,
-      "AppId": 1600001615,
-      "AppIdQrCode": 537313942,
-      "CurrentVersion": "3.2.19-39038",
-      "Kernel": "Linux",
-      "MainSigMap": 169742560,
-      "MiscBitmap": 32764,
-      "NTLoginType": 1,
       "Os": "Linux",
-      "PackageName": "com.tencent.qq",
+      "VendorOs": "linux",
+      "Kernel": "Linux",
+      "MiscBitmap": 32764,
       "PtVersion": "2.0.0",
       "SsoVersion": 19,
-      "SubAppId": 537313942,
+      "PackageName": "com.tencent.qq",
+      "WtLoginSdk": "nt.wtlogin.0.0.1",
+      "AppId": 1600001615,
+      "MainSigMap": 169742560,
       "SubSigMap": 0,
-      "VendorOs": "linux",
-      "WtLoginSdk": "nt.wtlogin.0.0.1"
+      "NTLoginType": 1,
+      "CurrentVersion": "3.2.23-44343",
+      "AppClientVersion": 44343,
+      "SubAppId": 537336639,
+      "AppIdQrCode": 537336639
     },
-	"servers": [
+    "servers": [
       {
-        "name": "余烬V2",
-        "url": "https://lwxmagic3.sealdice.com/api/sign/39038"
+        "name": "雪桃-莱茵主环",
+        "url": "https://de.seal-sign.xuetao.host/44343",
+        "note": "德国法兰克福：稳、抗压，大陆基本稳定可用但延迟偏高。能用时优先选它。（运行代价轻）",
+        "selected": true
       },
-	  {
-        "name": "Lagrange",
-        "url": "https://sign.lagrangecore.org/api/sign/39038"
+      {
+        "name": "雪桃-云界律域",
+        "url": "https://cf-seal-sign.xuetao.host/44343",
+        "note": "Cloudflare反代：海外很快，大陆转圈圈，适合备用。（运行代价轻）"
+      },
+      {
+        "name": "雪桃-寰网引路",
+        "url": "https://seal-sign.xuetao.host/44343",
+        "note": "【其他稳请优先用其他】全球CDN入口：亚太CDN对华，Cloudflare对国际。低延迟，稳定。（运行代价高）"
+      }
+    ]
+  },
+  {
+    "version": "45758",
+    "appinfo": {
+      "Os": "Linux",
+      "VendorOs": "linux",
+      "Kernel": "Linux",
+      "MiscBitmap": 32764,
+      "PtVersion": "2.0.0",
+      "SsoVersion": 19,
+      "PackageName": "com.tencent.qq",
+      "WtLoginSdk": "nt.wtlogin.0.0.1",
+      "AppId": 1600001615,
+      "MainSigMap": 169742560,
+      "SubSigMap": 0,
+      "NTLoginType": 1,
+      "CurrentVersion": "3.2.25-45758",
+      "AppClientVersion": 45758,
+      "SubAppId": 537340249,
+      "AppIdQrCode": 537340249
+    },
+    "servers": [
+      {
+        "name": "雪桃-莱茵主环",
+        "url": "https://de.seal-sign.xuetao.host/45758",
+        "note": "德国法兰克福：稳、抗压，大陆基本稳定可用但延迟偏高。能用时优先选它。（运行代价轻）",
+        "selected": true
+      },
+      {
+        "name": "雪桃-云界律域",
+        "url": "https://cf-seal-sign.xuetao.host/45758",
+        "note": "Cloudflare反代：海外很快，大陆转圈圈，适合备用。（运行代价轻）"
+      },
+      {
+        "name": "雪桃-寰网引路",
+        "url": "https://seal-sign.xuetao.host/45758",
+        "note": "【其他稳请优先用其他】全球CDN入口：亚太CDN对华，Cloudflare对国际。低延迟，稳定。（运行代价高）"
       }
     ],
     "selected": true
   }
 ]
-	`
+`
 
 var defaultLagrangeConfig = `
 	{
@@ -708,7 +815,7 @@ account:
   relogin:
     delay: 3
     interval: 3
-    max-times: 0 
+    max-times: 0
   use-sso-address: true
   allow-temp-session: false
   sign-servers:
