@@ -61,7 +61,7 @@ func (ng *NamesGenerator) Load() {
 			columns, err := f.Cols(sheetName)
 			if err == nil {
 				for columns.Next() {
-					column, _ := columns.Rows()
+					column, _ := columns.Rows(excelize.Options{RawCellValue: true})
 					if len(column) > 0 {
 						// 首行为标题，如“男性名” 其他行为内容，如”济民 珍祥“
 						name := column[0]
