@@ -27,7 +27,6 @@ func TestExtractWeight(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			weight, text := extractWeight(tt.input)
@@ -60,17 +59,19 @@ func TestDeckPoolPickWithNonPositiveWeightEntries(t *testing.T) {
 	randomPool := DeckToRandomPool(deck)
 	if randomPool == nil {
 		t.Fatal("random pool should not be nil")
-	}
-	if got := randomPool.Pick().(string); got != "ok" {
-		t.Fatalf("unexpected random pick: got=%q want=%q", got, "ok")
+	} else {
+		if got := randomPool.Pick().(string); got != "ok" {
+			t.Fatalf("unexpected random pick: got=%q want=%q", got, "ok")
+		}
 	}
 
 	shufflePool := DeckToShuffleRandomPool(deck)
 	if shufflePool == nil {
 		t.Fatal("shuffle pool should not be nil")
-	}
-	if got := shufflePool.Pick().(string); got != "ok" {
-		t.Fatalf("unexpected shuffle pick: got=%q want=%q", got, "ok")
+	} else {
+		if got := shufflePool.Pick().(string); got != "ok" {
+			t.Fatalf("unexpected shuffle pick: got=%q want=%q", got, "ok")
+		}
 	}
 }
 
@@ -108,7 +109,6 @@ func TestBuildNormalizedWeightedChoices(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			got := toWeights(buildNormalizedWeightedChoices(tt.deck))

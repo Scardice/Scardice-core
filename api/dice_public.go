@@ -39,6 +39,7 @@ func dicePublicSet(c echo.Context) error {
 			}
 		}
 	}
+	//nolint:staticcheck // keep explicit gate on PublicDiceConfig to avoid semantic ambiguity
 	if myDice.Config.PublicDiceConfig.Enable {
 		if myDice.PublicDiceInfoRegister() {
 			myDice.PublicDiceEndpointRefresh()

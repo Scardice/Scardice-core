@@ -92,8 +92,8 @@ type ExtInfo struct {
 	// 定时任务列表，用于避免 task 失去引用
 	taskList []*JsScriptTask `json:"-" yaml:"-"`
 
-	OnNotCommandReceived func(ctx *MsgContext, msg *Message)                        `jsbind:"onNotCommandReceived" json:"-" yaml:"-"` // 指令过滤后剩下的
-	OnCommandOverride    func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) bool `jsbind:"onCommandOverride"    json:"-"                      yaml:"-"`          // 覆盖指令行为
+	OnNotCommandReceived func(ctx *MsgContext, msg *Message)                        `jsbind:"onNotCommandReceived" json:"-" yaml:"-"`                      // 指令过滤后剩下的
+	OnCommandOverride    func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) bool `jsbind:"onCommandOverride"    json:"-"                      yaml:"-"` // 覆盖指令行为
 	// NOTE(lyjjl): 尚不清楚海豹开发组为什么禁用这个 API
 
 	OnCommandReceived   func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) `jsbind:"onCommandReceived"   json:"-" yaml:"-"`
@@ -974,10 +974,10 @@ func (d *Dice) PublicDiceInfoRegister() bool {
 	}
 	oldID := cfg.ID
 	req := &public_dice.RegisterRequest{
-		ID:     cfg.ID,
-		Name:   cfg.Name,
-		Brief:  cfg.Brief,
-		Note:   cfg.Note,
+		ID:    cfg.ID,
+		Name:  cfg.Name,
+		Brief: cfg.Brief,
+		Note:  cfg.Note,
 		// Avatar: cfg.Avatar, // NOTE(lyjjl): 尚不确定服务端是否支持
 	}
 	pd, code := d.PublicDice.Register(req, GenerateVerificationKeyForPublicDice)

@@ -10,6 +10,7 @@ import (
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 
 	"Scardice-core/model"
 	"Scardice-core/utils/constant"
@@ -38,7 +39,9 @@ func (m *mockDBOperator) GetCensorDB(constant.DBMode) *gorm.DB {
 
 func TestEndpointInfoSaveConcurrentRace(t *testing.T) {
 	dsn := fmt.Sprintf("file:endpoint_info_race_%d?mode=memory&cache=shared&_busy_timeout=5000", time.Now().UnixNano())
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
+		Logger: gormlogger.Default.LogMode(gormlogger.Silent),
+	})
 	if err != nil {
 		t.Fatalf("open sqlite failed: %v", err)
 	}
@@ -60,7 +63,7 @@ func TestEndpointInfoSaveConcurrentRace(t *testing.T) {
 		workers = 32
 	)
 
-	for r := 0; r < rounds; r++ {
+	for r := range rounds {
 		if err := db.Exec("DELETE FROM endpoint_info").Error; err != nil {
 			t.Fatalf("cleanup failed: %v", err)
 		}
@@ -69,7 +72,7 @@ func TestEndpointInfoSaveConcurrentRace(t *testing.T) {
 		errCh := make(chan error, workers)
 		var wg sync.WaitGroup
 
-		for i := 0; i < workers; i++ {
+		for i := range workers {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
