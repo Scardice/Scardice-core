@@ -93,7 +93,8 @@ type ExtInfo struct {
 	taskList []*JsScriptTask `json:"-" yaml:"-"`
 
 	OnNotCommandReceived func(ctx *MsgContext, msg *Message)                        `jsbind:"onNotCommandReceived" json:"-" yaml:"-"` // 指令过滤后剩下的
-	OnCommandOverride    func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) bool `json:"-"                      yaml:"-"`          // 覆盖指令行为
+	OnCommandOverride    func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) bool `jsbind:"onCommandOverride"    json:"-"                      yaml:"-"`          // 覆盖指令行为
+	// NOTE(lyjjl): 尚不清楚海豹开发组为什么禁用这个 API
 
 	OnCommandReceived   func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) `jsbind:"onCommandReceived"   json:"-" yaml:"-"`
 	OnMessageReceived   func(ctx *MsgContext, msg *Message)                   `jsbind:"onMessageReceived"   json:"-" yaml:"-"`
