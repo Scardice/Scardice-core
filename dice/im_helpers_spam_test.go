@@ -32,7 +32,7 @@ func TestCalcSpamRecoveryMultiplier_BasicProgressionAndReset(t *testing.T) {
 		t.Fatalf("expected different command to reset count, got cmd=%q count=%d mul=%d", cmd, count, mul)
 	}
 
-	cmd, at, count, mul = calcSpamRecoveryMultiplier(cmd, at, count, "rb", now+40, 30, 5)
+	_, _, count, mul = calcSpamRecoveryMultiplier(cmd, at, count, "rb", now+40, 30, 5)
 	if count != 1 || mul != 1 {
 		t.Fatalf("expected timeout to reset count, got count=%d mul=%d", count, mul)
 	}

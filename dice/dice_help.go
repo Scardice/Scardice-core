@@ -864,7 +864,7 @@ func (m *HelpManager) loadHelpDocItemsFromCache(group string, path string) ([]do
 	}
 	cachePath := filepath.Join(helpDocParsedCacheDir, helpDocCacheKey(path)+".gob.zst")
 	var cache helpDocParsedCache
-	if err := loadGobCacheFile(cachePath, &cache); err != nil {
+	if loadErr := loadGobCacheFile(cachePath, &cache); loadErr != nil {
 		return nil, false
 	}
 	if cache.Version != helpDocParsedCacheVersion {
