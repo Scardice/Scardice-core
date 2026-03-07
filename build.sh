@@ -7,6 +7,8 @@ cd "$ROOT_DIR"
 DEFAULT_VERSION_PRERELEASE="-dev"
 DEFAULT_APP_CHANNEL="dev"
 DEFAULT_APPNAME="Scardice"
+DEFAULT_VERSION_MAIN="$(sed -n 's/^[[:space:]]*VERSION_MAIN = \"\\([^\"]*\\)\".*/\\1/p' dice/version.go | head -n1)"
+DEFAULT_VERSION_MAIN="${DEFAULT_VERSION_MAIN:-1.5.1}"
 PRIVATE_KEY_FILE="./signature/seal_trusted_private_key.pem"
 DEFAULT_TARGET_GOOS="$(go env GOOS)"
 DEFAULT_TARGET_GOARCH="$(go env GOARCH)"
@@ -43,6 +45,9 @@ choose_from_menu() {
     echo "输入无效，请输入 1-${count} 的数字。" >&2
   done
 }
+
+read -r -p "请输入 VERSION_MAIN（默认：${DEFAULT_VERSION_MAIN}）: " VERSION_MAIN
+VERSION_MAIN="${VERSION_MAIN:-$DEFAULT_VERSION_MAIN}"
 
 read -r -p "请输入 VERSION_PRERELEASE（默认：${DEFAULT_VERSION_PRERELEASE}）: " VERSION_PRERELEASE
 VERSION_PRERELEASE="${VERSION_PRERELEASE:-$DEFAULT_VERSION_PRERELEASE}"
@@ -89,6 +94,7 @@ else
 fi
 
 LDFLAGS="-s -w"
+LDFLAGS+=" -X Scardice-core/dice.VERSION_MAIN=${VERSION_MAIN}"
 LDFLAGS+=" -X Scardice-core/dice.VERSION_PRERELEASE=${VERSION_PRERELEASE}"
 LDFLAGS+=" -X Scardice-core/dice.VERSION_BUILD_METADATA=${VERSION_BUILD_METADATA}"
 LDFLAGS+=" -X Scardice-core/dice.APP_CHANNEL=${APP_CHANNEL}"
@@ -101,6 +107,7 @@ else
   echo "[Build] 警告：未找到 SealTrustedClientPrivateKey 符号，跳过 ldflags 私钥注入"
 fi
 
+echo "[Build] VERSION_MAIN=${VERSION_MAIN}"
 echo "[Build] VERSION_PRERELEASE=${VERSION_PRERELEASE}"
 echo "[Build] VERSION_BUILD_METADATA=${VERSION_BUILD_METADATA}"
 echo "[Build] APP_CHANNEL=${APP_CHANNEL}"
