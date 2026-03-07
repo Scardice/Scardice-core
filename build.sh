@@ -8,6 +8,41 @@ DEFAULT_VERSION_PRERELEASE="-dev"
 DEFAULT_APP_CHANNEL="dev"
 DEFAULT_APPNAME="Scardice"
 PRIVATE_KEY_FILE="./signature/seal_trusted_private_key.pem"
+DEFAULT_TARGET_GOOS="$(go env GOOS)"
+DEFAULT_TARGET_GOARCH="$(go env GOARCH)"
+
+choose_from_menu() {
+  local prompt="$1"
+  local default_value="$2"
+  shift 2
+  local options=("$@")
+  local count="${#options[@]}"
+  local idx=1
+
+  echo "${prompt}" >&2
+  while [[ $idx -le $count ]]; do
+    local val="${options[$((idx - 1))]}"
+    if [[ "$val" == "$default_value" ]]; then
+      echo "  ${idx}) ${val} (本机)" >&2
+    else
+      echo "  ${idx}) ${val}" >&2
+    fi
+    idx=$((idx + 1))
+  done
+
+  while true; do
+    read -r -p "请选择 [1-${count}]（默认：${default_value}）: " selected
+    if [[ -z "$selected" ]]; then
+      echo "$default_value"
+      return 0
+    fi
+    if [[ "$selected" =~ ^[0-9]+$ ]] && (( selected >= 1 && selected <= count )); then
+      echo "${options[$((selected - 1))]}"
+      return 0
+    fi
+    echo "输入无效，请输入 1-${count} 的数字。" >&2
+  done
+}
 
 read -r -p "请输入 VERSION_PRERELEASE（默认：${DEFAULT_VERSION_PRERELEASE}）: " VERSION_PRERELEASE
 VERSION_PRERELEASE="${VERSION_PRERELEASE:-$DEFAULT_VERSION_PRERELEASE}"
@@ -17,6 +52,11 @@ APP_CHANNEL="${APP_CHANNEL:-$DEFAULT_APP_CHANNEL}"
 
 read -r -p "请输入 APPNAME（默认：${DEFAULT_APPNAME}）: " APPNAME
 APPNAME="${APPNAME:-$DEFAULT_APPNAME}"
+
+TARGET_GOOS="$(choose_from_menu "请选择目标 GOOS:" "${DEFAULT_TARGET_GOOS}" \
+  linux windows darwin freebsd openbsd netbsd)"
+TARGET_GOARCH="$(choose_from_menu "请选择目标 GOARCH:" "${DEFAULT_TARGET_GOARCH}" \
+  amd64 arm64 386 arm ppc64le riscv64 s390x)"
 
 read -r -p "是否启用 CGO？[y/N]: " ENABLE_CGO_INPUT
 if [[ "${ENABLE_CGO_INPUT}" =~ ^[Yy]$ ]]; then
@@ -42,10 +82,10 @@ fi
 PRIVATE_KEY_CONTENT="$(cat "$PRIVATE_KEY_FILE")"
 PRIVATE_KEY_CONTENT_ESCAPED="${PRIVATE_KEY_CONTENT//$'\n'/\\n}"
 
-if [[ "$(uname -s)" == "MINGW"* || "$(uname -s)" == "MSYS"* || "$(uname -s)" == "CYGWIN"* ]]; then
-  BINARY_PATH="./Scardice-core.exe"
+if [[ "${TARGET_GOOS}" == "windows" ]]; then
+  BINARY_PATH="./Scardice-core-${TARGET_GOOS}-${TARGET_GOARCH}.exe"
 else
-  BINARY_PATH="./Scardice-core"
+  BINARY_PATH="./Scardice-core-${TARGET_GOOS}-${TARGET_GOARCH}"
 fi
 
 LDFLAGS="-s -w"
@@ -65,9 +105,12 @@ echo "[Build] VERSION_PRERELEASE=${VERSION_PRERELEASE}"
 echo "[Build] VERSION_BUILD_METADATA=${VERSION_BUILD_METADATA}"
 echo "[Build] APP_CHANNEL=${APP_CHANNEL}"
 echo "[Build] APPNAME=${APPNAME}"
+echo "[Build] TARGET_GOOS=${TARGET_GOOS}"
+echo "[Build] TARGET_GOARCH=${TARGET_GOARCH}"
 echo "[Build] CGO_ENABLED=${CGO_ENABLED_VALUE}"
 echo "[Build] 输出文件：${BINARY_PATH}"
 
-CGO_ENABLED="${CGO_ENABLED_VALUE}" go build -trimpath -ldflags "$LDFLAGS" -o "${BINARY_PATH}" .
+GOOS="${TARGET_GOOS}" GOARCH="${TARGET_GOARCH}" CGO_ENABLED="${CGO_ENABLED_VALUE}" \
+  go build -trimpath -ldflags "$LDFLAGS" -o "${BINARY_PATH}" .
 
 echo "[Build] 完成"
