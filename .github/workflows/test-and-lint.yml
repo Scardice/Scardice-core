@@ -5,12 +5,12 @@ on:
     paths:
       - '**.go'
       - 'go.mod'
-      - 'test-and-lint.yml'
+      - '.github/workflows/test-and-lint.yml'
   pull_request:
     paths:
       - '**.go'
       - 'go.mod'
-      - 'test-and-lint.yml'
+      - '.github/workflows/test-and-lint.yml'
 
 jobs:
   test-and-lint:
@@ -19,6 +19,31 @@ jobs:
     steps:
       - name: Code
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: Scardice-ui/pnpm-lock.yaml
+
+      - name: Build Frontend
+        run: |
+          cd Scardice-ui
+          pnpm install --frozen-lockfile
+          pnpm build
+          cd ..
+          rm -rf static/frontend
+          mkdir -p static/frontend
+          cp -r Scardice-ui/dist/. static/frontend/
+
       - name: Install Go
         uses: actions/setup-go@v5
         with:
