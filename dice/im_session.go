@@ -101,6 +101,10 @@ type GroupInfo struct {
 
 	RateLimiter     *rate.Limiter `json:"-" yaml:"-"`
 	RateLimitWarned bool          `json:"-" yaml:"-"`
+	// 连续相同指令时动态调整群组限速恢复速度（运行时字段）
+	SpamLastCommand      string `json:"-" yaml:"-"`
+	SpamLastCommandAt    int64  `json:"-" yaml:"-"`
+	SpamSameCommandCount int    `json:"-" yaml:"-"`
 
 	EnteredTime  int64  `jsbind:"enteredTime"  json:"enteredTime"  yaml:"enteredTime"`  // 入群时间
 	InviteUserID string `jsbind:"inviteUserId" json:"inviteUserId" yaml:"inviteUserId"` // 邀请人
@@ -616,6 +620,7 @@ type MsgContext struct {
 
 	IsPrivate       bool        `jsbind:"isPrivate"` // 是否私聊
 	CommandID       int64       // 指令ID
+	CurrentCommand  string      // 当前解析到的指令名(小写)
 	CommandHideFlag string      `jsbind:"commandHideFlag"` // 暗骰来源群号
 	CommandInfo     interface{} // 命令信息
 	PrivilegeLevel  int         `jsbind:"privilegeLevel"` // 权限等级 -30ban 40邀请者 50管理 60群主 70信任 100master
@@ -1375,6 +1380,10 @@ func (s *IMSession) PreTriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *C
 			}
 			return
 		}
+	}
+
+	if cmdArgs != nil {
+		mctx.CurrentCommand = strings.ToLower(strings.TrimSpace(cmdArgs.Command))
 	}
 
 	if cmdArgs.Command != "botlist" && !cmdArgs.AmIBeMentioned {
