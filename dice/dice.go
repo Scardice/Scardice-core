@@ -939,6 +939,10 @@ func (d *Dice) PublicDiceEndpointRefresh() {
 	if !cfg.Enable {
 		return
 	}
+	if strings.TrimSpace(cfg.ID) == "" {
+		d.logPublicDiceStatus("端点更新跳过：缺少公骰ID", 400)
+		return
+	}
 
 	var endpointItems []*public_dice.Endpoint
 	for _, i := range d.ImSession.EndPoints {
@@ -951,36 +955,47 @@ func (d *Dice) PublicDiceEndpointRefresh() {
 			IsOnline: i.State == 1,
 		})
 	}
-
-	_, code := d.PublicDice.EndpointUpdate(&public_dice.EndpointUpdateRequest{
+	req := &public_dice.EndpointUpdateRequest{
 		DiceID:    cfg.ID,
 		Endpoints: endpointItems,
-	}, nil)
+	}
+
+	_, code := d.PublicDice.EndpointUpdate(req, GenerateVerificationKeyForPublicDice)
 	if code != 200 {
 		d.logPublicDiceStatus("端点更新失败", code)
 		return
 	}
 }
 
-func (d *Dice) PublicDiceInfoRegister() {
+func (d *Dice) PublicDiceInfoRegister() bool {
 	cfg := &d.Config.PublicDiceConfig
 	if !cfg.Enable {
-		return
+		return false
 	}
-	pd, code := d.PublicDice.Register(&public_dice.RegisterRequest{
-		ID:    cfg.ID,
-		Name:  cfg.Name,
-		Brief: cfg.Brief,
-		Note:  cfg.Note,
-	}, nil)
+	oldID := cfg.ID
+	req := &public_dice.RegisterRequest{
+		ID:     cfg.ID,
+		Name:   cfg.Name,
+		Brief:  cfg.Brief,
+		Note:   cfg.Note,
+		// Avatar: cfg.Avatar, // NOTE(lyjjl): 尚不确定服务端是否支持
+	}
+	pd, code := d.PublicDice.Register(req, GenerateVerificationKeyForPublicDice)
 	if code != 200 {
 		d.logPublicDiceStatus("骰号注册失败", code)
-		return
+		return false
 	}
 	// ID为空时才将注册好的ID覆写配置
 	if pd.Item.ID != "" && cfg.ID == "" {
 		cfg.ID = pd.Item.ID
+		d.MarkModified()
+		d.Save(false)
+		d.Logger.Infof("[公骰]已自动注册并写入公骰ID: %s", cfg.ID)
+	} else if oldID != cfg.ID {
+		d.MarkModified()
+		d.Save(false)
 	}
+	return true
 }
 
 func (d *Dice) PublicDiceSetupTick() {
@@ -992,11 +1007,23 @@ func (d *Dice) PublicDiceSetupTick() {
 		}
 		return
 	}
+	if strings.TrimSpace(cfg.ID) == "" {
+		if d.PublicDiceTimerId != 0 {
+			d.Cron.Remove(d.PublicDiceTimerId)
+			d.PublicDiceTimerId = 0
+		}
+		d.logPublicDiceStatus("心跳更新跳过：缺少公骰ID", 400)
+		return
+	}
 
 	doTickUpdate := func() {
 		if !cfg.Enable {
 			d.Cron.Remove(d.PublicDiceTimerId)
 			d.PublicDiceTimerId = 0
+			return
+		}
+		if strings.TrimSpace(cfg.ID) == "" {
+			d.logPublicDiceStatus("心跳更新跳过：缺少公骰ID", 400)
 			return
 		}
 		var tickEndpointItems []*public_dice.TickEndpoint
@@ -1009,10 +1036,11 @@ func (d *Dice) PublicDiceSetupTick() {
 				IsOnline: i.State == 1,
 			})
 		}
-		_, code := d.PublicDice.TickUpdate(&public_dice.TickUpdateRequest{
+		req := &public_dice.TickUpdateRequest{
 			ID:        cfg.ID,
 			Endpoints: tickEndpointItems,
-		}, nil)
+		}
+		_, code := d.PublicDice.TickUpdate(req, GenerateVerificationKeyForPublicDice)
 		if code != 200 {
 			d.logPublicDiceStatus("心跳更新失败", code)
 		}
@@ -1038,7 +1066,10 @@ func (d *Dice) PublicDiceSetup() {
 	if !cfg.Enable {
 		return
 	}
-	d.PublicDiceInfoRegister()
+	if !d.PublicDiceInfoRegister() {
+		d.PublicDiceSetupTick()
+		return
+	}
 	d.PublicDiceEndpointRefresh()
 	d.PublicDiceSetupTick()
 }
