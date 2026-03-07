@@ -232,6 +232,26 @@ func DiceConfigSet(c echo.Context) error {
 		}
 	}
 
+	if val, ok := jsonMap["spamSameCommandWindowSec"]; ok {
+		valNum, ok2 := val.(float64)
+		if ok2 {
+			window := int64(valNum)
+			if window >= 1 {
+				config.SpamSameCommandWindowSec = window
+			}
+		}
+	}
+
+	if val, ok := jsonMap["spamRecoveryMultiplierMax"]; ok {
+		valNum, ok2 := val.(float64)
+		if ok2 {
+			maxMul := int64(valNum)
+			if maxMul >= 1 {
+				config.SpamRecoveryMultiplierMax = maxMul
+			}
+		}
+	}
+
 	if val, ok := jsonMap["onlyLogCommandInGroup"]; ok {
 		config.OnlyLogCommandInGroup = val.(bool)
 	}

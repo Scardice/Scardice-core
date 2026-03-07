@@ -642,6 +642,44 @@ func FormatDiceID(ctx *MsgContext, id interface{}, isGroup bool) string {
 	return fmt.Sprintf("%s:%v", prefix, id)
 }
 
+func calcSpamRecoveryMultiplier(lastCommand string, lastAt int64, sameCount int, currentCommand string, now int64, windowSec int64, maxMultiplier int) (string, int64, int, int) {
+	if currentCommand == "" {
+		return "", 0, 0, 1
+	}
+	if windowSec <= 0 {
+		windowSec = DefaultConfig.SpamSameCommandWindowSec
+	}
+	if maxMultiplier <= 0 {
+		maxMultiplier = int(DefaultConfig.SpamRecoveryMultiplierMax)
+	}
+
+	nextCount := 1
+	if lastCommand == currentCommand && now-lastAt <= windowSec {
+		nextCount = sameCount + 1
+	}
+
+	multiplier := nextCount
+	if multiplier < 1 {
+		multiplier = 1
+	}
+	if multiplier > maxMultiplier {
+		multiplier = maxMultiplier
+	}
+	return currentCommand, now, nextCount, multiplier
+}
+
+func applyRateLimiterPenalty(limiter *rate.Limiter, base rate.Limit, multiplier int) {
+	if limiter == nil || base <= 0 {
+		return
+	}
+
+	target := base
+	if multiplier > 1 {
+		target = base / rate.Limit(multiplier)
+	}
+	limiter.SetLimit(target)
+}
+
 func spamCheckPerson(ctx *MsgContext, msg *Message) bool {
 	if ctx.SpamCheckedPerson {
 		return false
@@ -670,6 +708,21 @@ func spamCheckPerson(ctx *MsgContext, msg *Message) bool {
 			int(ctx.Dice.Config.PersonalBurst),
 		)
 	}
+
+	now := time.Now().Unix()
+	lastCmd, lastAt, sameCount, recoveryMultiplier := calcSpamRecoveryMultiplier(
+		ctx.Player.SpamLastCommand,
+		ctx.Player.SpamLastCommandAt,
+		ctx.Player.SpamSameCommandCount,
+		ctx.CurrentCommand,
+		now,
+		ctx.Dice.Config.SpamSameCommandWindowSec,
+		int(ctx.Dice.Config.SpamRecoveryMultiplierMax),
+	)
+	ctx.Player.SpamLastCommand = lastCmd
+	ctx.Player.SpamLastCommandAt = lastAt
+	ctx.Player.SpamSameCommandCount = sameCount
+	applyRateLimiterPenalty(ctx.Player.RateLimiter, ctx.Dice.Config.PersonalReplenishRate, recoveryMultiplier)
 
 	if ctx.Player.RateLimiter.Allow() {
 		ctx.Player.RateLimitWarned = false
@@ -726,6 +779,21 @@ func spamCheckGroup(ctx *MsgContext, msg *Message) bool {
 			int(ctx.Dice.Config.GroupBurst),
 		)
 	}
+
+	now := time.Now().Unix()
+	lastCmd, lastAt, sameCount, recoveryMultiplier := calcSpamRecoveryMultiplier(
+		ctx.Group.SpamLastCommand,
+		ctx.Group.SpamLastCommandAt,
+		ctx.Group.SpamSameCommandCount,
+		ctx.CurrentCommand,
+		now,
+		ctx.Dice.Config.SpamSameCommandWindowSec,
+		int(ctx.Dice.Config.SpamRecoveryMultiplierMax),
+	)
+	ctx.Group.SpamLastCommand = lastCmd
+	ctx.Group.SpamLastCommandAt = lastAt
+	ctx.Group.SpamSameCommandCount = sameCount
+	applyRateLimiterPenalty(ctx.Group.RateLimiter, ctx.Dice.Config.GroupReplenishRate, recoveryMultiplier)
 
 	if ctx.Group.RateLimiter.Allow() {
 		ctx.Group.RateLimitWarned = false

@@ -120,6 +120,14 @@ func (c *Config) migrateOld2Version1() {
 		c.GroupBurst = DefaultConfig.GroupBurst
 	}
 
+	if c.SpamSameCommandWindowSec <= 0 {
+		c.SpamSameCommandWindowSec = DefaultConfig.SpamSameCommandWindowSec
+	}
+
+	if c.SpamRecoveryMultiplierMax <= 0 {
+		c.SpamRecoveryMultiplierMax = DefaultConfig.SpamRecoveryMultiplierMax
+	}
+
 	if c.VersionCode != 0 && c.VersionCode < 10001 {
 		c.AliveNoticeValue = DefaultConfig.AliveNoticeValue
 	}
@@ -176,13 +184,15 @@ type BaseConfig struct {
 }
 
 type RateLimitConfig struct {
-	RateLimitEnabled         bool       `json:"rateLimitEnabled"      yaml:"rateLimitEnabled"`      // 启用频率限制 (刷屏限制)
-	PersonalReplenishRateStr string     `json:"personalReplenishRate" yaml:"personalReplenishRate"` // 个人刷屏警告速率，字符串格式
-	PersonalReplenishRate    rate.Limit `json:"-"                     yaml:"-"`                     // 个人刷屏警告速率
-	GroupReplenishRateStr    string     `json:"groupReplenishRate"    yaml:"groupReplenishRate"`    // 群组刷屏警告速率，字符串格式
-	GroupReplenishRate       rate.Limit `json:"-"                     yaml:"-"`                     // 群组刷屏警告速率
-	PersonalBurst            int64      `json:"personalBurst"         yaml:"personalBurst"`         // 个人自定义上限
-	GroupBurst               int64      `json:"groupBurst"            yaml:"groupBurst"`            // 群组自定义上限
+	RateLimitEnabled          bool       `json:"rateLimitEnabled"      yaml:"rateLimitEnabled"`              // 启用频率限制 (刷屏限制)
+	PersonalReplenishRateStr  string     `json:"personalReplenishRate" yaml:"personalReplenishRate"`         // 个人刷屏警告速率，字符串格式
+	PersonalReplenishRate     rate.Limit `json:"-"                     yaml:"-"`                             // 个人刷屏警告速率
+	GroupReplenishRateStr     string     `json:"groupReplenishRate"    yaml:"groupReplenishRate"`            // 群组刷屏警告速率，字符串格式
+	GroupReplenishRate        rate.Limit `json:"-"                     yaml:"-"`                             // 群组刷屏警告速率
+	PersonalBurst             int64      `json:"personalBurst"         yaml:"personalBurst"`                 // 个人自定义上限
+	GroupBurst                int64      `json:"groupBurst"            yaml:"groupBurst"`                    // 群组自定义上限
+	SpamSameCommandWindowSec  int64      `json:"spamSameCommandWindowSec" yaml:"spamSameCommandWindowSec"`   // 连续相同指令判定窗口（秒）
+	SpamRecoveryMultiplierMax int64      `json:"spamRecoveryMultiplierMax" yaml:"spamRecoveryMultiplierMax"` // 连续相同指令恢复倍率上限
 }
 
 type QuitInactiveConfig struct {
