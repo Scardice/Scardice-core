@@ -10,6 +10,9 @@ import (
 // EcdsaSign Ecdsa 签名
 func EcdsaSign(data []byte, privateKey string) (string, error) {
 	key := ReadPrivateKey[ecdsa.PrivateKey](privateKey)
+	if key == nil {
+		return "", errors.New("invalid ecdsa private key")
+	}
 	hashed := CalculateSHA1(data)
 	sign, err := ecdsa.SignASN1(rand.Reader, key, hashed)
 	if err != nil {
@@ -20,6 +23,9 @@ func EcdsaSign(data []byte, privateKey string) (string, error) {
 
 func EcdsaSignRow(data []byte, privateKey string) ([]byte, error) {
 	key := ReadPrivateKey[ecdsa.PrivateKey](privateKey)
+	if key == nil {
+		return nil, errors.New("invalid ecdsa private key")
+	}
 	hashed := CalculateSHA1(data)
 	sign, err := ecdsa.SignASN1(rand.Reader, key, hashed)
 	if err != nil {
