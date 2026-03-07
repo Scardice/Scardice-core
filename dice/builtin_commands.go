@@ -655,15 +655,6 @@ func (d *Dice) registerCoreCommands() {
 				return true
 			})
 
-			onlineVer := ""
-			if d.Parent.AppVersionOnline != nil {
-				ver := d.Parent.AppVersionOnline
-				// 如果当前不是最新版，那么提示
-				if ver.VersionLatestCode != VERSION_CODE {
-					onlineVer = "\n最新版本: " + ver.VersionLatestDetail + "\n"
-				}
-			}
-
 			var groupWorkInfo, activeText string
 			if inGroup {
 				activeText = "关闭"
@@ -677,17 +668,7 @@ func (d *Dice) registerCoreCommands() {
 			VarSetValueInt64(ctx, "$t启用群数", int64(activeCount))
 			VarSetValueStr(ctx, "$t群内工作状态", groupWorkInfo)
 			VarSetValueStr(ctx, "$t群内工作状态_仅状态", activeText)
-			ver := VERSION.String()
-			arch := runtime.GOARCH
-			if arch != "386" && arch != "amd64" {
-				ver = fmt.Sprintf("%s %s", ver, arch)
-			}
-			baseText := fmt.Sprintf("Scardice %s%s", ver, onlineVer)
-			extText := DiceFormatTmpl(ctx, "核心:骰子状态附加文本")
-			if extText != "" {
-				extText = "\n" + extText
-			}
-			text := baseText + extText
+			text := DiceFormatTmpl(ctx, "核心:骰子状态文本")
 
 			ReplyToSender(ctx, msg, text)
 

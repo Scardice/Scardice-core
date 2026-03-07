@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -811,7 +812,7 @@ func setupBaseTextTemplate(d *Dice) {
 				{"余烬核心", 1},
 			},
 			"骰子帮助文本": {
-				{"余烬核心 {常量:VERSION}\n暂时没有官网\n也暂时没有群\n========\n.help 骰点/骰主/协议/娱乐/跑团/扩展/查询/其他\n========\n只是余烬罢了", 1},
+				{"{常量:APPNAME} {常量:VERSION} {常量:ARCH}\n官方一群: 1084726031\n========\n.help 骰点/骰主/协议/娱乐/跑团/扩展/查询/其他\n========\n只是余烬罢了", 1},
 			},
 			"骰子帮助文本_骰主": {
 				{"骰主很神秘，什么都没有说——", 1},
@@ -849,8 +850,8 @@ func setupBaseTextTemplate(d *Dice) {
 			"骰子保存设置": {
 				{"数据已保存", 1},
 			},
-			"骰子状态附加文本": {
-				{"供职于{$t供职群数}个群，其中{$t启用群数}个处于开启状态。{$t群内工作状态}", 1},
+			"骰子状态文本": {
+				{"{常量:APPNAME} {常量:VERSION} {常量:ARCH}\n供职于{$t供职群数}个群，其中{$t启用群数}个处于开启状态。{$t群内工作状态}", 1},
 			},
 			// -------------------- roll --------------------------
 			"骰点_原因": {
@@ -1578,7 +1579,7 @@ func setupBaseTextTemplate(d *Dice) {
 			"骰子保存设置": {
 				SubType: ".bot save",
 			},
-			"骰子状态附加文本": {
+			"骰子状态文本": {
 				SubType: ".bot about",
 				Vars:    []string{"$t供职群数", "$t启用群数", "$t群内工作状态", "$t群内工作状态_仅状态"},
 			},
@@ -2056,11 +2057,23 @@ func migrateHelpTextKey(d *Dice) bool {
 	if !oldExists || len(oldVal) == 0 {
 		return false
 	}
-	if _, newExists := coreTexts[newKey]; newExists {
-		delete(coreTexts, oldKey)
-		return true
+	// 迁移时优先保留旧键内容，避免被预设新键默认值覆盖
+	coreTexts[newKey] = oldVal
+	delete(coreTexts, oldKey)
+	return true
+}
+
+func migrateCoreTextKey(d *Dice, oldKey string, newKey string) bool {
+	coreTexts, exists := d.TextMapRaw["核心"]
+	if !exists || coreTexts == nil {
+		return false
 	}
 
+	oldVal, oldExists := coreTexts[oldKey]
+	if !oldExists || len(oldVal) == 0 {
+		return false
+	}
+	// 迁移时优先保留旧键内容，避免被预设新键默认值覆盖
 	coreTexts[newKey] = oldVal
 	delete(coreTexts, oldKey)
 	return true
@@ -2074,6 +2087,12 @@ func setupTextTemplate(d *Dice) {
 	loadTextTemplate(d, "configs/text-template.yaml")
 	if migrateHelpTextKey(d) {
 		d.Logger.Info("检测到旧文案键“核心:骰子帮助文本_附加说明”，已自动迁移为“核心:骰子帮助文本”")
+	}
+	if migrateCoreTextKey(d, "骰子状态附加文本", "骰子状态文本") {
+		d.Logger.Info("检测到旧文案键“核心:骰子状态附加文本”，已自动迁移为“核心:骰子状态文本”")
+	}
+	if migrateCoreTextKey(d, "投掷状态附加文本", "骰子状态文本") {
+		d.Logger.Info("检测到旧文案键“核心:投掷状态附加文本”，已自动迁移为“核心:骰子状态文本”")
 	}
 
 	d.SaveText()
@@ -2101,6 +2120,9 @@ func (d *Dice) GenerateTextMap() {
 
 	picker, _ = wr.NewChooser(wr.Choice{Item: VERSION.String(), Weight: 1})
 	newTextMap["常量:VERSION"] = picker
+
+	picker, _ = wr.NewChooser(wr.Choice{Item: runtime.GOARCH, Weight: 1})
+	newTextMap["常量:ARCH"] = picker
 
 	d.TextMap = newTextMap
 }
