@@ -7,14 +7,14 @@ github.com/HugoSmits86/nativewebp v1.2.0 h1:XJtXeTg7FsOi9VB1elQYZy3n6VjYLqofSr3g
 github.com/HugoSmits86/nativewebp v1.2.0/go.mod h1:YNQuWenlVmSUUASVNhTDwf4d7FwYQGbGhklC8p72Vr8=
 github.com/Masterminds/semver/v3 v3.4.0 h1:Zog+i5UMtVoCU8oKka5P7i9q9HgrJeGzI9SA1Xbatp0=
 github.com/Masterminds/semver/v3 v3.4.0/go.mod h1:4V+yj/TJE1HU9XfppCwVMZq3I84lprf4nC11bSS5beM=
-github.com/Milly/go-base2048 v0.1.0 h1:7ZgpCR3cjcAAVqIo+B8Q3P1+VFHRS8zilzAq062rUUk=
-github.com/Milly/go-base2048 v0.1.0/go.mod h1:kl6eYBwGnoIjv8k9UmgS+bekm6870ojptcVnT11e3jE=
 github.com/PaienNate/goja_nodejs v0.0.0-20250924024212-bac2e5ba5231 h1:t9hBFiDTfo4OfIpphUe/VNLOq55AaBf8g7X2bEfwaf4=
 github.com/PaienNate/goja_nodejs v0.0.0-20250924024212-bac2e5ba5231/go.mod h1:wQTmPSYoaXtXfBysiJ9XiLwVnoCdlNHwuxYfxO4I4uo=
 github.com/PaienNate/pineutil v0.0.0-20251018153346-e4acff10b752 h1:LVVPZE5kFejqoTSzZGxXYF0Y+l1DjUX+RWb/uA2PllA=
 github.com/PaienNate/pineutil v0.0.0-20251018153346-e4acff10b752/go.mod h1:cg9EQoyBMyDIdRp9b5DuuJo8KBCjHL5JiDpJesIEsZw=
 github.com/RoaringBitmap/roaring/v2 v2.8.0 h1:y1rdtixfXvaITKzkfiKvScI0hlBJHe9sfzJp8cgeM7w=
 github.com/RoaringBitmap/roaring/v2 v2.8.0/go.mod h1:FiJcsfkGje/nZBZgCu0ZxCPOKD/hVXDS2dXi7/eUFE0=
+github.com/Scardice/dicescript v0.0.0-20260103130502-bd5621347a4e h1:bwLzcVaszrSTQNxwLmOU/GiLbZL9rknECuyM471V2tg=
+github.com/Scardice/dicescript v0.0.0-20260103130502-bd5621347a4e/go.mod h1:uof752qJvEQ4Kze+NVag+RKGgj5C4K3kMHoK3e2vOLg=
 github.com/ShiraazMoollatjie/goluhn v0.0.0-20211017190329-0d86158c056a h1:NPnGVqpua4c1iEFVdxnBJA9viP5bo2Zp2jfflbcjdto=
 github.com/ShiraazMoollatjie/goluhn v0.0.0-20211017190329-0d86158c056a/go.mod h1:5LI6VqIHoGmWsR0EJLbct5bBrtM/0pTonaAyGKmFk9U=
 github.com/Szzrain/DingTalk-go v0.0.8-alpha h1:mSR/ORDDjtndoR12WrEdd3hdxxXXm9VMQ/r75NJkkkE=
@@ -485,8 +485,6 @@ github.com/schollz/progressbar/v3 v3.18.0 h1:uXdoHABRFmNIjUfte/Ex7WtuyVslrw2wVPQ
 github.com/schollz/progressbar/v3 v3.18.0/go.mod h1:IsO3lpbaGuzh8zIMzgY3+J8l4C8GjO0Y9S69eFvNsec=
 github.com/sealdice/botgo v0.0.0-20240102160217-e61d5bdfe083 h1:s/jzCGYlM/0+TYTXwva5574EFnIv/ggPCoXHFpdbSUw=
 github.com/sealdice/botgo v0.0.0-20240102160217-e61d5bdfe083/go.mod h1:MGtR0REQDslBwQE+Rln4P9iDjH/ZInlu5qzOLdvBWJU=
-github.com/sealdice/dicescript v0.0.0-20260103130502-bd5621347a4e h1:Skv3TeB0vmvWN9SDhBmRWfsgudvXDkMyFhTgYpnQUoQ=
-github.com/sealdice/dicescript v0.0.0-20260103130502-bd5621347a4e/go.mod h1:uof752qJvEQ4Kze+NVag+RKGgj5C4K3kMHoK3e2vOLg=
 github.com/sealdice/kook v0.0.3 h1:STMtiKRMFjhSFmUxi0BU5ktNkCQ8qi7Y5EEfrmYKvWY=
 github.com/sealdice/kook v0.0.3/go.mod h1:WjHC7AmbmNjInT/U/etBVOmAw7T6EqdCwApceRGs1sk=
 github.com/sergeymakinen/go-bmp v1.0.0 h1:SdGTzp9WvCV0A1V0mBeaS7kQAwNLdVJbmHlqNWq0R+M=
@@ -579,7 +577,6 @@ github.com/valyala/fasttemplate v1.2.2 h1:lxLXG0uE3Qnshl9QyaK6XJxMXlQZELvChBOCmQ
 github.com/valyala/fasttemplate v1.2.2/go.mod h1:KHLXt3tVN2HBp8eijSv/kGJopbvo7S+qRAEEKiv+SiQ=
 github.com/vmihailenco/msgpack v4.0.4+incompatible h1:dSLoQfGFAo3F6OoNhwUmLwVgaUXK79GlxNBwueZn0xI=
 github.com/vmihailenco/msgpack v4.0.4+incompatible/go.mod h1:fy3FlTQTDXWkZ7Bh6AcGMlsjHatGryHQYUTf1ShIgkk=
-github.com/vmihailenco/msgpack v4.0.4/go.mod h1:fy3FlTQTDXWkZ7Bh6AcGMlsjHatGryHQYUTf1ShIgkk=
 github.com/xordataexchange/crypt v0.0.3-0.20170626215501-b2862e3d0a77/go.mod h1:aYKd//L2LvnjZzWKhF00oedf4jCCReLcmhLdhm1A27Q=
 github.com/xuri/efp v0.0.1 h1:fws5Rv3myXyYni8uwj2qKjVaRP30PdjeYe2Y6FDsCL8=
 github.com/xuri/efp v0.0.1/go.mod h1:ybY/Jr0T0GTCnYjKqmdwxyxn2BQf2RcQIIvex5QldPI=
