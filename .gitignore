@@ -47,3 +47,7 @@ Scardice-lock.lock
 upgrade_metadata.json
 
 /signature/**/*
+
+# build cache & output
+output/
+.build-cache/
