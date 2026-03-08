@@ -1842,6 +1842,99 @@ type commandSolveResult struct {
 	DisabledSources  []string
 }
 
+func normalizeRuleIdentity(raw string) string {
+	return strings.ToLower(strings.TrimSpace(raw))
+}
+
+func addRuleIdentity(set map[string]struct{}, raw string) {
+	if set == nil {
+		return
+	}
+	name := normalizeRuleIdentity(raw)
+	if name == "" {
+		return
+	}
+	set[name] = struct{}{}
+}
+
+func hasRuleIdentityIntersection(left map[string]struct{}, right map[string]struct{}) bool {
+	if len(left) == 0 || len(right) == 0 {
+		return false
+	}
+	for name := range left {
+		if _, ok := right[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// collectTemplateSelfRuleIdentities 仅收集模板“本体”标识，不包含依赖标识。
+// 这里我们认为 relatedExt 中除本模板自身外的项视为本体的依赖依赖，不参与本体识别。
+func collectTemplateSelfRuleIdentities(system string, tmpl *GameSystemTemplate) map[string]struct{} {
+	ids := make(map[string]struct{})
+	if tmpl == nil {
+		return ids
+	}
+
+	addRuleIdentity(ids, system)
+	addRuleIdentity(ids, tmpl.Name)
+	addRuleIdentity(ids, tmpl.FullName)
+
+	keys := tmpl.Commands.Set.Keys
+	if len(keys) == 0 {
+		keys = tmpl.SetConfig.Keys
+	}
+	for _, key := range keys {
+		addRuleIdentity(ids, key)
+	}
+
+	relatedExt := tmpl.Commands.Set.RelatedExt
+	if len(relatedExt) == 0 {
+		relatedExt = tmpl.SetConfig.RelatedExt
+	}
+
+	matchedSelfInRelated := 0
+	for _, extName := range relatedExt {
+		name := normalizeRuleIdentity(extName)
+		if name == "" {
+			continue
+		}
+		if _, ok := ids[name]; ok {
+			matchedSelfInRelated++
+		}
+	}
+
+	// 如果 relatedExt 只有一个项且未与已有本体标识对齐，仍视为本体标识。
+	if matchedSelfInRelated == 0 && len(relatedExt) == 1 {
+		addRuleIdentity(ids, relatedExt[0])
+	}
+
+	return ids
+}
+
+func collectCandidateRuleIdentities(candidate commandSolveCandidate) map[string]struct{} {
+	ids := make(map[string]struct{})
+	if candidate.Ext == nil {
+		return ids
+	}
+
+	addRuleIdentity(ids, candidate.Ext.Name)
+	for _, alias := range candidate.Ext.Aliases {
+		addRuleIdentity(ids, alias)
+	}
+	addRuleIdentity(ids, candidate.Ext.TargetName)
+
+	realExt := candidate.Ext.GetRealExt()
+	if realExt != nil {
+		addRuleIdentity(ids, realExt.Name)
+		for _, alias := range realExt.Aliases {
+			addRuleIdentity(ids, alias)
+		}
+	}
+	return ids
+}
+
 func collectRuleExtNameSetBySystem(ctx *MsgContext) (map[string]struct{}, map[string]struct{}) {
 	ruleExtNames := make(map[string]struct{})
 	preferredRuleExtNames := make(map[string]struct{})
@@ -1854,13 +1947,9 @@ func collectRuleExtNameSetBySystem(ctx *MsgContext) (map[string]struct{}, map[st
 		currentSystem = strings.TrimSpace(ctx.Group.System)
 	}
 
-	addRelatedExt := func(system string, relatedExt []string) {
+	addSystemRuleIDs := func(system string, ids map[string]struct{}) {
 		isCurrentSystem := currentSystem != "" && strings.EqualFold(currentSystem, system)
-		for _, extName := range relatedExt {
-			name := strings.ToLower(strings.TrimSpace(extName))
-			if name == "" {
-				continue
-			}
+		for name := range ids {
 			ruleExtNames[name] = struct{}{}
 			if isCurrentSystem {
 				preferredRuleExtNames[name] = struct{}{}
@@ -1872,12 +1961,7 @@ func collectRuleExtNameSetBySystem(ctx *MsgContext) (map[string]struct{}, map[st
 		if tmpl == nil {
 			return true
 		}
-
-		relatedExt := tmpl.Commands.Set.RelatedExt
-		if len(relatedExt) == 0 {
-			relatedExt = tmpl.SetConfig.RelatedExt
-		}
-		addRelatedExt(system, relatedExt)
+		addSystemRuleIDs(system, collectTemplateSelfRuleIdentities(system, tmpl))
 		return true
 	})
 
@@ -1902,12 +1986,12 @@ func selectRulePluginCandidateByGroupSystem(ctx *MsgContext, candidates []comman
 			return empty, false
 		}
 
-		extName := strings.ToLower(candidate.Ext.Name)
-		if _, ok := ruleExtNames[extName]; !ok {
+		candidateIDs := collectCandidateRuleIdentities(candidate)
+		if !hasRuleIdentityIntersection(candidateIDs, ruleExtNames) {
 			return empty, false
 		}
 
-		if _, ok := preferredRuleExtNames[extName]; ok {
+		if hasRuleIdentityIntersection(candidateIDs, preferredRuleExtNames) {
 			selected = candidate
 			matchedCount++
 		}
