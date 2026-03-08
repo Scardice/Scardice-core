@@ -4,7 +4,6 @@ go 1.24.6
 
 require (
 	github.com/Masterminds/semver/v3 v3.4.0
-	github.com/Milly/go-base2048 v0.1.0
 	github.com/PaienNate/pineutil v0.0.0-20251018153346-e4acff10b752
 	github.com/ShiraazMoollatjie/goluhn v0.0.0-20211017190329-0d86158c056a
 	github.com/Szzrain/DingTalk-go v0.0.8-alpha
@@ -41,6 +40,7 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/juliangruber/go-intersect v1.1.0
 	github.com/kardianos/service v1.2.4
+	github.com/klauspost/compress v1.18.0
 	github.com/labstack/echo/v4 v4.13.4
 	github.com/lonelyevil/kook v0.0.31
 	github.com/lonelyevil/kook/log_adapter/plog v0.0.31
@@ -162,7 +162,6 @@ require (
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/jinzhu/now v1.1.5 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/labstack/gommon v0.4.2 // indirect
@@ -228,5 +227,6 @@ replace (
 	github.com/dop251/goja_nodejs v0.0.0-20250409162600-f7acab6894b0 => github.com/PaienNate/goja_nodejs v0.0.0-20250924024212-bac2e5ba5231
 	github.com/lonelyevil/kook v0.0.31 => github.com/sealdice/kook v0.0.3
 	github.com/sacOO7/gowebsocket v0.0.0-20221109081133-70ac927be105 => github.com/fy0/GoWebsocket v0.0.0-20231128163937-aa5c110b25c6
+	github.com/sealdice/dicescript v0.0.0-20260103130502-bd5621347a4e => github.com/Scardice/dicescript v0.0.0-20260103130502-bd5621347a4e
 // github.com/PaienNate/pineutil v0.0.0-20251014070632-4c5ebfdc92e5 => C:\Users\11018\Documents\goutil
 )

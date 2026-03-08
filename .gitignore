@@ -51,3 +51,5 @@ upgrade_metadata.json
 # build cache & output
 output/
 .build-cache/
+.gomodcache/
+.gocache/
