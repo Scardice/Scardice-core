@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,7 +61,7 @@ func uploadV1(env UploadEnv) (string, error) {
 	_, _ = w.Write(*env.data)
 	_ = w.Close()
 
-	url = uploadToSealBackends(env, &zlibBuffer)
+	url = uploadToSealBackends(env, zlibBuffer.Bytes())
 	if errDB := service.LogSetUploadInfo(env.Db, env.GroupID, env.LogName, url); errDB != nil {
 		env.Log.Errorf("记录Log上传信息失败: %v", errDB)
 	}
@@ -115,13 +114,13 @@ func formatAndBackup(env *UploadEnv) error {
 	return err
 }
 
-func uploadToSealBackends(env UploadEnv, data io.Reader) string {
+func uploadToSealBackends(env UploadEnv, payload []byte) string {
 	// 逐个尝试所有后端地址
 	for _, backend := range env.Backends {
 		if backend == "" {
 			continue
 		}
-		ret := uploadToBackend(env, backend, data)
+		ret := uploadToBackend(env, backend, bytes.NewReader(payload))
 		if ret != "" {
 			return ret
 		}

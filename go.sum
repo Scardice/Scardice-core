@@ -13,8 +13,8 @@ github.com/PaienNate/pineutil v0.0.0-20251018153346-e4acff10b752 h1:LVVPZE5kFejq
 github.com/PaienNate/pineutil v0.0.0-20251018153346-e4acff10b752/go.mod h1:cg9EQoyBMyDIdRp9b5DuuJo8KBCjHL5JiDpJesIEsZw=
 github.com/RoaringBitmap/roaring/v2 v2.8.0 h1:y1rdtixfXvaITKzkfiKvScI0hlBJHe9sfzJp8cgeM7w=
 github.com/RoaringBitmap/roaring/v2 v2.8.0/go.mod h1:FiJcsfkGje/nZBZgCu0ZxCPOKD/hVXDS2dXi7/eUFE0=
-github.com/Scardice/dicescript v0.0.0-20260103130502-bd5621347a4e h1:bwLzcVaszrSTQNxwLmOU/GiLbZL9rknECuyM471V2tg=
-github.com/Scardice/dicescript v0.0.0-20260103130502-bd5621347a4e/go.mod h1:uof752qJvEQ4Kze+NVag+RKGgj5C4K3kMHoK3e2vOLg=
+github.com/Scardice/dicescript v0.0.0-20260308044903-97cde91a0493 h1:SVWSJxAEjxZeNF+FhxJqbhvkWROS0Pb7hHrppW8ktu4=
+github.com/Scardice/dicescript v0.0.0-20260308044903-97cde91a0493/go.mod h1:uof752qJvEQ4Kze+NVag+RKGgj5C4K3kMHoK3e2vOLg=
 github.com/ShiraazMoollatjie/goluhn v0.0.0-20211017190329-0d86158c056a h1:NPnGVqpua4c1iEFVdxnBJA9viP5bo2Zp2jfflbcjdto=
 github.com/ShiraazMoollatjie/goluhn v0.0.0-20211017190329-0d86158c056a/go.mod h1:5LI6VqIHoGmWsR0EJLbct5bBrtM/0pTonaAyGKmFk9U=
 github.com/Szzrain/DingTalk-go v0.0.8-alpha h1:mSR/ORDDjtndoR12WrEdd3hdxxXXm9VMQ/r75NJkkkE=

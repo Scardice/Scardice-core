@@ -8,12 +8,23 @@ import (
 	"mime/multipart"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
 	"Scardice-core/model"
 	"Scardice-core/utils/dboperator/engine"
 )
+
+const (
+	storylogHTTPTimeout    = 12 * time.Second
+	maxBackendRespLogBytes = 512
+)
+
+var storylogHTTPClient = &http.Client{
+	Timeout: storylogHTTPTimeout,
+}
 
 type UploadEnv struct {
 	Dir      string
@@ -41,9 +52,15 @@ func Upload(env UploadEnv) (string, error) {
 	return "", errors.New("未指定日志版本")
 }
 
-func uploadToBackend(env UploadEnv, backend string, data io.Reader) string {
-	client := &http.Client{}
+func compactBackendRespForLog(body []byte) string {
+	s := strings.TrimSpace(string(body))
+	if len(s) <= maxBackendRespLogBytes {
+		return s
+	}
+	return s[:maxBackendRespLogBytes] + "...(truncated)"
+}
 
+func uploadToBackend(env UploadEnv, backend string, data io.Reader) string {
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 	field, err := writer.CreateFormField("name")
@@ -58,7 +75,8 @@ func uploadToBackend(env UploadEnv, backend string, data io.Reader) string {
 
 	field, err = writer.CreateFormField("client")
 	if err == nil {
-		_, _ = field.Write([]byte("Scardice"))
+		// NOTE(lyjjl): 海豹染色器后端似乎只接受 client=SealDice 的请求。
+		_, _ = field.Write([]byte("SealDice"))
 	}
 
 	field, err = writer.CreateFormField("version")
@@ -67,7 +85,10 @@ func uploadToBackend(env UploadEnv, backend string, data io.Reader) string {
 	}
 
 	part, _ := writer.CreateFormFile("file", "log-zlib-compressed")
-	_, _ = io.Copy(part, data)
+	if _, err = io.Copy(part, data); err != nil {
+		env.Log.Errorf("日志上传构造请求体失败: %v", err)
+		return ""
+	}
 	_ = writer.Close()
 
 	req, err := http.NewRequest(http.MethodPut, backend, body)
@@ -81,7 +102,7 @@ func uploadToBackend(env UploadEnv, backend string, data io.Reader) string {
 		req.Header.Set("Authorization", "Bearer "+env.Token)
 	}
 
-	resp, err := client.Do(req) //nolint:gosec
+	resp, err := storylogHTTPClient.Do(req) //nolint:gosec
 	if err != nil {
 		env.Log.Errorf(err.Error())
 		return ""
@@ -93,13 +114,36 @@ func uploadToBackend(env UploadEnv, backend string, data io.Reader) string {
 		env.Log.Errorf(err.Error())
 		return ""
 	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		env.Log.Errorf(
+			"日志上传请求失败: backend=%s status=%d body=%s",
+			backend,
+			resp.StatusCode,
+			compactBackendRespForLog(bodyText),
+		)
+		return ""
+	}
 
 	var ret struct {
 		URL string `json:"url"`
 	}
-	_ = json.Unmarshal(bodyText, &ret)
+	if err = json.Unmarshal(bodyText, &ret); err != nil {
+		env.Log.Errorf(
+			"日志上传返回解析失败: backend=%s status=%d body=%s err=%v",
+			backend,
+			resp.StatusCode,
+			compactBackendRespForLog(bodyText),
+			err,
+		)
+		return ""
+	}
 	if ret.URL == "" {
-		env.Log.Error("日志上传的返回结果异常:", string(bodyText))
+		env.Log.Errorf(
+			"日志上传的返回结果异常: backend=%s status=%d body=%s",
+			backend,
+			resp.StatusCode,
+			compactBackendRespForLog(bodyText),
+		)
 	}
 	return ret.URL
 }
