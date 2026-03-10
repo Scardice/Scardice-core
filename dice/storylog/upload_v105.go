@@ -167,7 +167,7 @@ func uploadV105(env UploadEnv) (string, error) {
 		return "", err
 	}
 
-	url = parquetUploadToSealBackends(env, b)
+	url = parquetUploadToSealBackends(env, b.Bytes())
 	if errDB := service.LogSetUploadInfo(env.Db, env.GroupID, env.LogName, url); errDB != nil {
 		env.Log.Errorf("记录Log上传信息失败: %v", errDB)
 	}
@@ -216,13 +216,13 @@ func formatAndBackupV105(env *UploadEnv, tempLog *os.File, parquetFile *bytes.Bu
 	return err
 }
 
-func parquetUploadToSealBackends(env UploadEnv, data io.Reader) string {
+func parquetUploadToSealBackends(env UploadEnv, payload []byte) string {
 	// 逐个尝试所有后端地址
 	for _, backend := range env.Backends {
 		if backend == "" {
 			continue
 		}
-		ret := uploadToBackendParquet(env, backend, data)
+		ret := uploadToBackendParquet(env, backend, bytes.NewReader(payload))
 		if ret != "" {
 			return ret
 		}
@@ -231,8 +231,6 @@ func parquetUploadToSealBackends(env UploadEnv, data io.Reader) string {
 }
 
 func uploadToBackendParquet(env UploadEnv, backend string, data io.Reader) string {
-	client := &http.Client{}
-
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 	field, err := writer.CreateFormField("name")
@@ -256,7 +254,10 @@ func uploadToBackendParquet(env UploadEnv, backend string, data io.Reader) strin
 	}
 
 	part, _ := writer.CreateFormFile("file", "log-zlib-compressed")
-	_, _ = io.Copy(part, data)
+	if _, err = io.Copy(part, data); err != nil {
+		env.Log.Errorf("日志上传构造请求体失败: %v", err)
+		return ""
+	}
 	_ = writer.Close()
 
 	req, err := http.NewRequest(http.MethodPut, backend, body)
@@ -270,7 +271,7 @@ func uploadToBackendParquet(env UploadEnv, backend string, data io.Reader) strin
 		req.Header.Set("Authorization", "Bearer "+env.Token)
 	}
 
-	resp, err := client.Do(req) //nolint:gosec
+	resp, err := storylogHTTPClient.Do(req) //nolint:gosec
 	if err != nil {
 		env.Log.Errorf(err.Error())
 		return ""
@@ -282,13 +283,36 @@ func uploadToBackendParquet(env UploadEnv, backend string, data io.Reader) strin
 		env.Log.Errorf(err.Error())
 		return ""
 	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		env.Log.Errorf(
+			"日志上传请求失败: backend=%s status=%d body=%s",
+			backend,
+			resp.StatusCode,
+			compactBackendRespForLog(bodyText),
+		)
+		return ""
+	}
 
 	var ret struct {
 		URL string `json:"url"`
 	}
-	_ = json.Unmarshal(bodyText, &ret)
+	if err = json.Unmarshal(bodyText, &ret); err != nil {
+		env.Log.Errorf(
+			"日志上传返回解析失败: backend=%s status=%d body=%s err=%v",
+			backend,
+			resp.StatusCode,
+			compactBackendRespForLog(bodyText),
+			err,
+		)
+		return ""
+	}
 	if ret.URL == "" {
-		env.Log.Error("日志上传的返回结果异常:", string(bodyText))
+		env.Log.Errorf(
+			"日志上传的返回结果异常: backend=%s status=%d body=%s",
+			backend,
+			resp.StatusCode,
+			compactBackendRespForLog(bodyText),
+		)
 	}
 	return ret.URL
 }
