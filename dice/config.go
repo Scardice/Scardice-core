@@ -2417,7 +2417,7 @@ func (d *Dice) loads() {
 	}
 	d.warnIfNoPlatformEndpoint(missingPlatformConfigInServe)
 
-	d.LogWriter.LogLimit = int(d.Config.UILogLimit)
+	d.LogWriter.SetLogLimit(int(d.Config.UILogLimit))
 
 	// 设置扩展选项（新扩展激活采用延迟模式）
 	d.ApplyExtDefaultSettings()
