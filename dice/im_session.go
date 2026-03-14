@@ -28,6 +28,7 @@ import (
 	rand2 "golang.org/x/exp/rand" //nolint:staticcheck // against my better judgment, but this was mandated due to a strongly held opinion from you know who
 
 	"github.com/dop251/goja"
+	"github.com/dop251/goja_nodejs/eventloop"
 	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v3"
 )
@@ -37,6 +38,8 @@ type SenderBase struct {
 	UserID    string `jsbind:"userId"   json:"userId"`
 	GroupRole string `json:"-"` // 群内角色 admin管理员 owner群主
 }
+
+const jsSolveAwaitTimeout = 10 * time.Second
 
 // Message 消息的重要信息
 // 时间
@@ -1447,6 +1450,9 @@ func (ep *EndPointInfo) TriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *
 		case commandSolveBlocked:
 			handled = true
 			log.Infof("指令[%s]可用扩展均被禁用: %s", cmdArgs.Command, strings.Join(solveResult.DisabledSources, ", "))
+		case commandSolveFailed:
+			handled = true
+			log.Infof("指令[%s]执行失败", cmdArgs.Command)
 		case commandSolveUnmatched:
 		}
 	}
@@ -1876,6 +1882,7 @@ const (
 	commandSolveSolved
 	commandSolveConflict
 	commandSolveBlocked
+	commandSolveFailed
 )
 
 type commandSolveCandidate struct {
@@ -2057,6 +2064,126 @@ func commandCandidateSourceName(candidate commandSolveCandidate) string {
 	return candidate.Ext.Name
 }
 
+func parseJSSolveResult(vm *goja.Runtime, value goja.Value) (CmdExecuteResult, error) {
+	if goja.IsUndefined(value) || goja.IsNull(value) {
+		return CmdExecuteResult{}, fmt.Errorf("solve returned empty result")
+	}
+
+	if ret, ok := value.Export().(CmdExecuteResult); ok {
+		return ret, nil
+	}
+	if retPtr, ok := value.Export().(*CmdExecuteResult); ok && retPtr != nil {
+		return *retPtr, nil
+	}
+	if m, ok := value.Export().(map[string]interface{}); ok {
+		_, hasMatched := m["matched"]
+		_, hasSolved := m["solved"]
+		_, hasShowHelp := m["showHelp"]
+		if !hasMatched && !hasSolved && !hasShowHelp {
+			return CmdExecuteResult{}, fmt.Errorf("invalid solve result: missing matched/solved/showHelp")
+		}
+		toBool := func(v interface{}) bool {
+			if v == nil {
+				return false
+			}
+			return vm.ToValue(v).ToBoolean()
+		}
+		return CmdExecuteResult{
+			Matched:  toBool(m["matched"]),
+			Solved:   toBool(m["solved"]),
+			ShowHelp: toBool(m["showHelp"]),
+		}, nil
+	}
+
+	obj := value.ToObject(vm)
+	if obj == nil {
+		return CmdExecuteResult{}, fmt.Errorf("invalid solve result")
+	}
+	safeBool := func(v goja.Value) bool {
+		if v == nil || goja.IsUndefined(v) || goja.IsNull(v) {
+			return false
+		}
+		return v.ToBoolean()
+	}
+	matchedVal := obj.Get("matched")
+	solvedVal := obj.Get("solved")
+	showHelpVal := obj.Get("showHelp")
+	if (matchedVal == nil || goja.IsUndefined(matchedVal) || goja.IsNull(matchedVal)) &&
+		(solvedVal == nil || goja.IsUndefined(solvedVal) || goja.IsNull(solvedVal)) &&
+		(showHelpVal == nil || goja.IsUndefined(showHelpVal) || goja.IsNull(showHelpVal)) {
+		return CmdExecuteResult{}, fmt.Errorf("invalid solve result: missing matched/solved/showHelp")
+	}
+	return CmdExecuteResult{
+		Matched:  safeBool(matchedVal),
+		Solved:   safeBool(solvedVal),
+		ShowHelp: safeBool(showHelpVal),
+	}, nil
+}
+
+func resolveJSSolveValue(vm *goja.Runtime, value goja.Value, done chan<- CmdExecuteResult, fail chan<- error) {
+	promise, ok := value.Export().(*goja.Promise)
+	if !ok {
+		ret, err := parseJSSolveResult(vm, value)
+		if err != nil {
+			fail <- err
+			return
+		}
+		done <- ret
+		return
+	}
+
+	switch promise.State() {
+	case goja.PromiseStateFulfilled:
+		ret, err := parseJSSolveResult(vm, promise.Result())
+		if err != nil {
+			fail <- err
+			return
+		}
+		done <- ret
+	case goja.PromiseStateRejected:
+		fail <- fmt.Errorf("promise rejected: %v", promise.Result())
+	case goja.PromiseStatePending:
+		obj := value.ToObject(vm)
+		thenVal := obj.Get("then")
+		thenFn, isFunc := goja.AssertFunction(thenVal)
+		if !isFunc {
+			fail <- fmt.Errorf("invalid promise object: missing then")
+			return
+		}
+
+		onFulfilled := vm.ToValue(func(call goja.FunctionCall) goja.Value {
+			ret, err := parseJSSolveResult(vm, call.Argument(0))
+			if err != nil {
+				fail <- err
+				return goja.Undefined()
+			}
+			done <- ret
+			return goja.Undefined()
+		})
+		onRejected := vm.ToValue(func(call goja.FunctionCall) goja.Value {
+			fail <- fmt.Errorf("promise rejected: %v", call.Argument(0))
+			return goja.Undefined()
+		})
+
+		if _, err := thenFn(value, onFulfilled, onRejected); err != nil {
+			fail <- err
+		}
+	default:
+		fail <- fmt.Errorf("unknown promise state")
+	}
+}
+
+func waitJSSolveResult(done <-chan CmdExecuteResult, fail <-chan error, timeout time.Duration) (CmdExecuteResult, error) {
+	select {
+	case ret := <-done:
+		return ret, nil
+	case err := <-fail:
+		return CmdExecuteResult{}, err
+	case <-time.After(timeout):
+		return CmdExecuteResult{}, fmt.Errorf("timeout")
+	}
+}
+
 func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) commandSolveResult {
 	// 设置临时变量
 	if ctx.Player != nil {
@@ -2161,27 +2288,65 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 		}
 
 		var ret CmdExecuteResult
-		// 如果是js命令，那么加锁
-		if item.IsJsSolveFunc {
-			loop, err := s.Parent.ExtLoopManager.GetLoop(item.JSLoopVersion)
-			if err != nil {
-				// 打个DEBUG日志？
-				s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境已经过期: %v", item.Name, err)
+		// JS 兼容执行路径：
+		// 1. 原生 JS 命令(IsJsSolveFunc=true)
+		// 2. 非 JS 命令但被脚本通过 cmd.solve 覆写（SolveRaw!=nil）
+		if item.IsJsSolveFunc || item.SolveRaw != nil {
+			var (
+				loop *eventloop.EventLoop
+				err  error
+			)
+			if s.Parent.ExtLoopManager == nil {
+				s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境不可用: loop manager is nil", item.Name)
 				return false
 			}
-			waitRun := make(chan int, 1)
+
+			loop, err = s.Parent.ExtLoopManager.GetLoop(item.JSLoopVersion)
+			if err != nil {
+				// 兼容非 JS 命令被覆写 solve 的场景：
+				// 这类命令通常没有有效 JSLoopVersion（如 ext.find 复制官方命令后赋值 cmd.solve）。
+				if !item.IsJsSolveFunc && item.SolveRaw != nil {
+					loop = s.Parent.ExtLoopManager.GetWebLoop()
+				}
+				if loop == nil {
+					// 打个DEBUG日志？
+					s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境已经过期: %v", item.Name, err)
+					return false
+				}
+			}
+			done := make(chan CmdExecuteResult, 1)
+			fail := make(chan error, 1)
 			loop.RunOnLoop(func(vm *goja.Runtime) {
+				if item.SolveRaw == nil {
+					// 兼容少量旧对象：没有 solveRaw 时回退同步 solve
+					defer func() {
+						if r := recover(); r != nil {
+							fail <- fmt.Errorf("panic: %v", r)
+							return
+						}
+						done <- item.Solve(ctx, msg, cmdArgs)
+					}()
+					return
+				}
+
 				defer func() {
 					if r := recover(); r != nil {
-						// log.Errorf("异常: %v 堆栈: %v", r, string(debug.Stack()))
-						ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", r))
+						fail <- fmt.Errorf("panic: %v", r)
 					}
-					waitRun <- 1
 				}()
 
-				ret = item.Solve(ctx, msg, cmdArgs)
+				resolveJSSolveValue(vm, item.SolveRaw(ctx, msg, cmdArgs), done, fail)
 			})
-			<-waitRun
+
+			ret, err = waitJSSolveResult(done, fail, jsSolveAwaitTimeout)
+			if err != nil {
+				if err.Error() == "timeout" {
+					ReplyToSender(ctx, msg, fmt.Sprintf("JS执行超时（>%s），请检查扩展逻辑", jsSolveAwaitTimeout))
+					return false
+				}
+				ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", err))
+				return false
+			}
 		} else {
 			ret = item.Solve(ctx, msg, cmdArgs)
 		}
@@ -2279,8 +2444,11 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 		}
 	}
 
-	if len(available) == 1 && solved {
-		return commandSolveResult{Status: commandSolveSolved}
+	if len(available) == 1 {
+		if solved {
+			return commandSolveResult{Status: commandSolveSolved}
+		}
+		return commandSolveResult{Status: commandSolveFailed}
 	}
 
 	if len(disabled) > 0 {
