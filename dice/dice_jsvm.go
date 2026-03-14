@@ -1289,67 +1289,74 @@ func (d *Dice) jsRegisterQuickJSHostAPIs(engine jsengine.Engine) error {
 		}
 		return "", errors.New("请先完成此扩展的注册")
 	}
-	if err := register("seal.ext.registerStringConfig", func(ei *ExtInfo, key string, defaultValue string, description string) error {
+	resolveExtByName := func(extName string) *ExtInfo {
+		if strings.TrimSpace(extName) == "" || d.JsExtRegistry == nil {
+			return nil
+		}
+		ext, _ := d.JsExtRegistry.Load(extName)
+		return ext
+	}
+	if err := register("seal.ext.registerStringConfig", func(ei *ExtInfo, key string, defaultValue string, description string, group string) error {
 		extName, err := resolveExtName(ei)
 		if err != nil {
 			return err
 		}
-		config := &ConfigItem{Key: key, Type: "string", Value: defaultValue, DefaultValue: defaultValue, Description: description}
+		config := &ConfigItem{Key: key, Type: "string", Group: group, Value: defaultValue, DefaultValue: defaultValue, Description: description}
 		d.ConfigManager.RegisterPluginConfig(extName, config)
 		return nil
 	}); err != nil {
 		return err
 	}
-	if err := register("seal.ext.registerIntConfig", func(ei *ExtInfo, key string, defaultValue int64, description string) error {
+	if err := register("seal.ext.registerIntConfig", func(ei *ExtInfo, key string, defaultValue int64, description string, group string) error {
 		extName, err := resolveExtName(ei)
 		if err != nil {
 			return err
 		}
-		config := &ConfigItem{Key: key, Type: "int", Value: defaultValue, DefaultValue: defaultValue, Description: description}
+		config := &ConfigItem{Key: key, Type: "int", Group: group, Value: defaultValue, DefaultValue: defaultValue, Description: description}
 		d.ConfigManager.RegisterPluginConfig(extName, config)
 		return nil
 	}); err != nil {
 		return err
 	}
-	if err := register("seal.ext.registerBoolConfig", func(ei *ExtInfo, key string, defaultValue bool, description string) error {
+	if err := register("seal.ext.registerBoolConfig", func(ei *ExtInfo, key string, defaultValue bool, description string, group string) error {
 		extName, err := resolveExtName(ei)
 		if err != nil {
 			return err
 		}
-		config := &ConfigItem{Key: key, Type: "bool", Value: defaultValue, DefaultValue: defaultValue, Description: description}
+		config := &ConfigItem{Key: key, Type: "bool", Group: group, Value: defaultValue, DefaultValue: defaultValue, Description: description}
 		d.ConfigManager.RegisterPluginConfig(extName, config)
 		return nil
 	}); err != nil {
 		return err
 	}
-	if err := register("seal.ext.registerFloatConfig", func(ei *ExtInfo, key string, defaultValue float64, description string) error {
+	if err := register("seal.ext.registerFloatConfig", func(ei *ExtInfo, key string, defaultValue float64, description string, group string) error {
 		extName, err := resolveExtName(ei)
 		if err != nil {
 			return err
 		}
-		config := &ConfigItem{Key: key, Type: "float", Value: defaultValue, DefaultValue: defaultValue, Description: description}
+		config := &ConfigItem{Key: key, Type: "float", Group: group, Value: defaultValue, DefaultValue: defaultValue, Description: description}
 		d.ConfigManager.RegisterPluginConfig(extName, config)
 		return nil
 	}); err != nil {
 		return err
 	}
-	if err := register("seal.ext.registerTemplateConfig", func(ei *ExtInfo, key string, defaultValue []string, description string) error {
+	if err := register("seal.ext.registerTemplateConfig", func(ei *ExtInfo, key string, defaultValue []string, description string, group string) error {
 		extName, err := resolveExtName(ei)
 		if err != nil {
 			return err
 		}
-		config := &ConfigItem{Key: key, Type: "template", Value: defaultValue, DefaultValue: defaultValue, Description: description}
+		config := &ConfigItem{Key: key, Type: "template", Group: group, Value: defaultValue, DefaultValue: defaultValue, Description: description}
 		d.ConfigManager.RegisterPluginConfig(extName, config)
 		return nil
 	}); err != nil {
 		return err
 	}
-	if err := register("seal.ext.registerOptionConfig", func(ei *ExtInfo, key string, defaultValue string, option []string, description string) error {
+	if err := register("seal.ext.registerOptionConfig", func(ei *ExtInfo, key string, defaultValue string, option []string, description string, group string) error {
 		extName, err := resolveExtName(ei)
 		if err != nil {
 			return err
 		}
-		config := &ConfigItem{Key: key, Type: "option", Value: defaultValue, DefaultValue: defaultValue, Option: option, Description: description}
+		config := &ConfigItem{Key: key, Type: "option", Group: group, Value: defaultValue, DefaultValue: defaultValue, Option: option, Description: description}
 		d.ConfigManager.RegisterPluginConfig(extName, config)
 		return nil
 	}); err != nil {
@@ -1469,7 +1476,107 @@ func (d *Dice) jsRegisterQuickJSHostAPIs(engine jsengine.Engine) error {
 	}); err != nil {
 		return err
 	}
-	if err := register("seal.ext.registerTask", func(ei *ExtInfo, taskType string, value string, fnRef string, key string, desc string) *JsScriptTask {
+	if err := register("seal.ext.storageList", func(ei *ExtInfo) []string {
+		extName, err := resolveExtName(ei)
+		if err != nil {
+			panic(err)
+		}
+		targetExt := resolveExtByName(extName)
+		if targetExt == nil {
+			panic(errors.New("请先完成此扩展的注册"))
+		}
+		keys, listErr := targetExt.StorageList()
+		if listErr != nil {
+			panic(listErr)
+		}
+		return keys
+	}); err != nil {
+		return err
+	}
+	if err := register("seal.ext.listTasks", func(ei *ExtInfo) []*JsScriptTaskInfo {
+		extName, err := resolveExtName(ei)
+		if err != nil {
+			panic(err)
+		}
+		targetExt := resolveExtByName(extName)
+		if targetExt == nil {
+			panic(errors.New("请先完成此扩展的注册"))
+		}
+		tasks := make([]*JsScriptTaskInfo, 0, len(targetExt.taskList))
+		for _, task := range targetExt.taskList {
+			if task == nil {
+				continue
+			}
+			tasks = append(tasks, &JsScriptTaskInfo{
+				TaskType: task.taskType,
+				Key:      task.key,
+				Value:    task.rawValue,
+				Active:   task.IsActive(),
+			})
+		}
+		return tasks
+	}); err != nil {
+		return err
+	}
+	if err := register("seal.ext._invokeCmdSolve", func(extName string, cmdName string, ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) map[string]any {
+		if runtimeProvider, ok := d.ScriptEngine.(interface{ CurrentRuntimeValues() map[string]any }); ok {
+			runtime := runtimeProvider.CurrentRuntimeValues()
+			if v, ok := runtime["ctx"].(*MsgContext); ok && v != nil {
+				ctx = v
+			}
+			if v, ok := runtime["msg"].(*Message); ok && v != nil {
+				msg = v
+			}
+			if v, ok := runtime["cmdArgs"].(*CmdArgs); ok && v != nil {
+				cmdArgs = v
+			}
+		}
+		ext := d.ExtFind(extName, false)
+		if ext == nil {
+			return cmdExecuteResultToMap(CmdExecuteResult{Matched: true, Solved: false})
+		}
+		item := ext.GetCmdMap()[strings.ToLower(strings.TrimSpace(cmdName))]
+		if item == nil {
+			item = ext.GetCmdMap()[cmdName]
+		}
+		if item == nil {
+			return cmdExecuteResultToMap(CmdExecuteResult{Matched: true, Solved: false})
+		}
+		ret, solveErr := invokeCmdItemWithJSEngine(d, item, ctx, msg, cmdArgs)
+		if solveErr != nil {
+			d.Logger.Errorf("QuickJS 调用 ext.find 命令失败 %s.%s: %v", extName, cmdName, solveErr)
+			return cmdExecuteResultToMap(CmdExecuteResult{Matched: true, Solved: false})
+		}
+		return cmdExecuteResultToMap(ret)
+	}); err != nil {
+		return err
+	}
+	if err := register("seal.ext._invokeCmdHelp", func(extName string, cmdName string, isShort bool) string {
+		ext := d.ExtFind(extName, false)
+		if ext == nil {
+			return ""
+		}
+		item := ext.GetCmdMap()[strings.ToLower(strings.TrimSpace(cmdName))]
+		if item == nil {
+			item = ext.GetCmdMap()[cmdName]
+		}
+		if item == nil {
+			return ""
+		}
+		if item.HelpFunc != nil {
+			return item.HelpFunc(isShort)
+		}
+		if item.Help != "" {
+			return item.Help
+		}
+		if item.ShortHelp != "" {
+			return item.Name + ":\n" + item.ShortHelp
+		}
+		return ""
+	}); err != nil {
+		return err
+	}
+	if err := register("seal.ext.registerTask", func(ei *ExtInfo, taskType string, value string, fnRef string, key string, desc string, group string) *JsScriptTask {
 		extName, err := resolveExtName(ei)
 		if err != nil {
 			d.Logger.Errorf("插件注册定时任务失败：%v", err)
@@ -1581,6 +1688,7 @@ func (d *Dice) jsRegisterQuickJSHostAPIs(engine jsengine.Engine) error {
 				config = &ConfigItem{
 					Key:          key,
 					Type:         "task:cron",
+					Group:        group,
 					Value:        expr,
 					DefaultValue: value,
 					Description:  desc,
@@ -1590,6 +1698,7 @@ func (d *Dice) jsRegisterQuickJSHostAPIs(engine jsengine.Engine) error {
 				config = &ConfigItem{
 					Key:          key,
 					Type:         "task:daily",
+					Group:        group,
 					Value:        expr,
 					DefaultValue: value,
 					Description:  desc,
@@ -2013,15 +2122,46 @@ func bindQuickJSExtCallbacks(d *Dice, ext *ExtInfo, callbackSet map[string]struc
 			invoke("onCommandReceived", runtime)
 		}
 	}
+	if _, ok := callbackSet["onCommandOverride"]; ok {
+		ext.OnCommandOverride = func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) bool {
+			invoker, ok := d.ScriptEngine.(interface {
+				InvokeStoredCommandOverride(extName string, runtime map[string]any) (bool, error)
+			})
+			if !ok {
+				d.Logger.Errorf("QuickJS 指令覆盖执行器不可用: %s.onCommandOverride", ext.Name)
+				return false
+			}
+			runtime := quickJSBaseRuntime(ctx, msg)
+			runtime["cmdArgs"] = cmdArgs
+			runtime["cmdArgsData"] = quickJSCmdArgsSnapshot(cmdArgs)
+			if cmdArgs != nil {
+				runtime["getArgN"] = func(n int64) string { return cmdArgs.GetArgN(int(n)) }
+				runtime["isArgEqual"] = func(n int64, ss []string) bool { return cmdArgs.IsArgEqual(int(n), ss...) }
+				runtime["getKwargJSON"] = func(name string) string {
+					raw, _ := json.Marshal(cmdArgs.GetKwarg(name))
+					return string(raw)
+				}
+				runtime["getRestArgsFrom"] = func(index int64) string { return cmdArgs.GetRestArgsFrom(int(index)) }
+			}
+			ret, err := invoker.InvokeStoredCommandOverride(ext.Name, runtime)
+			if err != nil {
+				d.Logger.Errorf("QuickJS 指令覆盖执行失败 %s.onCommandOverride: %v", ext.Name, err)
+				return false
+			}
+			return ret
+		}
+	}
 	if _, ok := callbackSet["onMessageReceived"]; ok {
 		ext.OnMessageReceived = func(ctx *MsgContext, msg *Message) {
 			invoke("onMessageReceived", quickJSBaseRuntime(ctx, msg))
 		}
 	}
 	if _, ok := callbackSet["onMessageSend"]; ok {
-		// Intentionally leave onMessageSend unbound for QuickJS.
-		// ReplyToSender can synchronously fire OnMessageSend while QuickJS is
-		// already executing under runtimeMu, and re-entering here would deadlock.
+		ext.OnMessageSend = func(ctx *MsgContext, msg *Message, flag string) {
+			runtime := quickJSBaseRuntime(ctx, msg)
+			runtime["flag"] = flag
+			invoke("onMessageSend", runtime)
+		}
 	}
 	if _, ok := callbackSet["onMessageDeleted"]; ok {
 		ext.OnMessageDeleted = func(ctx *MsgContext, msg *Message) {
@@ -2073,6 +2213,25 @@ func bindQuickJSExtCallbacks(d *Dice, ext *ExtInfo, callbackSet map[string]struc
 				"eventData": quickJSJSONValue(event),
 			}
 			invoke("onGroupLeave", runtime)
+		}
+	}
+	if _, ok := callbackSet["getDescText"]; ok {
+		ext.GetDescText = func(i *ExtInfo) string {
+			invoker, ok := d.ScriptEngine.(interface {
+				InvokeStoredGetDescText(extName string, extData map[string]any) (string, error)
+			})
+			if !ok {
+				return GetExtensionDesc(i)
+			}
+			text, err := invoker.InvokeStoredGetDescText(ext.Name, extInfoToJSMap(i))
+			if err != nil {
+				d.Logger.Errorf("QuickJS 扩展描述回调执行失败 %s.getDescText: %v", ext.Name, err)
+				return GetExtensionDesc(i)
+			}
+			if strings.TrimSpace(text) == "" {
+				return GetExtensionDesc(i)
+			}
+			return text
 		}
 	}
 }
@@ -2198,6 +2357,105 @@ func convertJsExtInfo(d *Dice, v any) (*ExtInfo, error) {
 	return ext, nil
 }
 
+func quickJSBoolLike(v any, defaultValue bool) bool {
+	if v == nil {
+		return defaultValue
+	}
+	switch vv := v.(type) {
+	case bool:
+		return vv
+	case string:
+		return strings.TrimSpace(vv) != ""
+	case int:
+		return vv != 0
+	case int8:
+		return vv != 0
+	case int16:
+		return vv != 0
+	case int32:
+		return vv != 0
+	case int64:
+		return vv != 0
+	case uint:
+		return vv != 0
+	case uint8:
+		return vv != 0
+	case uint16:
+		return vv != 0
+	case uint32:
+		return vv != 0
+	case uint64:
+		return vv != 0
+	case float32:
+		return vv != 0
+	case float64:
+		return vv != 0
+	default:
+		return true
+	}
+}
+
+func invokeCmdItemWithJSEngine(d *Dice, item *CmdItemInfo, ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) (CmdExecuteResult, error) {
+	if item == nil {
+		return CmdExecuteResult{}, fmt.Errorf("nil command item")
+	}
+
+	if d != nil && d.JsEngineEffective == "quickjs" && item.IsJsSolveFunc {
+		return item.Solve(ctx, msg, cmdArgs), nil
+	}
+	if item.IsJsSolveFunc || item.SolveRaw != nil {
+		if d == nil || d.ExtLoopManager == nil {
+			return CmdExecuteResult{}, fmt.Errorf("js loop manager unavailable")
+		}
+		loop, err := d.ExtLoopManager.GetLoop(item.JSLoopVersion)
+		if err != nil {
+			if !item.IsJsSolveFunc && item.SolveRaw != nil {
+				loop = d.ExtLoopManager.GetWebLoop()
+			}
+			if loop == nil {
+				return CmdExecuteResult{}, err
+			}
+		}
+
+		done := make(chan CmdExecuteResult, 1)
+		fail := make(chan error, 1)
+		loop.RunOnLoop(func(vm *goja.Runtime) {
+			if item.SolveRaw == nil {
+				defer func() {
+					if r := recover(); r != nil {
+						fail <- fmt.Errorf("panic: %v", r)
+						return
+					}
+					done <- item.Solve(ctx, msg, cmdArgs)
+				}()
+				return
+			}
+			defer func() {
+				if r := recover(); r != nil {
+					fail <- fmt.Errorf("panic: %v", r)
+				}
+			}()
+			resolveJSSolveValue(vm, item.SolveRaw(ctx, msg, cmdArgs), done, fail)
+		})
+
+		ret, err := waitJSSolveResult(done, fail, jsSolveAwaitTimeout)
+		if err != nil {
+			return CmdExecuteResult{}, err
+		}
+		return ret, nil
+	}
+
+	return item.Solve(ctx, msg, cmdArgs), nil
+}
+
+func cmdExecuteResultToMap(ret CmdExecuteResult) map[string]any {
+	return map[string]any{
+		"matched":  ret.Matched,
+		"solved":   ret.Solved,
+		"showHelp": ret.ShowHelp,
+	}
+}
+
 func buildQuickJSCmdInfo(d *Dice, extName string, cmdName string, rawCmd map[string]any) *CmdItemInfo {
 	cmdInfo := &CmdItemInfo{
 		Name:          cmdName,
@@ -2298,14 +2556,14 @@ func buildQuickJSCmdInfo(d *Dice, extName string, cmdName string, rawCmd map[str
 		}
 		result := CmdExecuteResult{Matched: true, Solved: true}
 		if ret != nil {
-			if matched, ok := ret["matched"].(bool); ok {
-				result.Matched = matched
+			if matched, ok := ret["matched"]; ok {
+				result.Matched = quickJSBoolLike(matched, false)
 			}
-			if solved, ok := ret["solved"].(bool); ok {
-				result.Solved = solved
+			if solved, ok := ret["solved"]; ok {
+				result.Solved = quickJSBoolLike(solved, false)
 			}
-			if showHelp, ok := ret["showHelp"].(bool); ok {
-				result.ShowHelp = showHelp
+			if showHelp, ok := ret["showHelp"]; ok {
+				result.ShowHelp = quickJSBoolLike(showHelp, false)
 			}
 		}
 		return result
@@ -2317,6 +2575,16 @@ func extInfoToJSMap(ext *ExtInfo) map[string]any {
 	if ext == nil {
 		return nil
 	}
+	cmdMap := map[string]any{}
+	for cmdName, cmd := range ext.GetCmdMap() {
+		if cmd == nil {
+			continue
+		}
+		cmdObj := cmdItemInfoToJSMap(cmd)
+		cmdObj["__sdHasSolve"] = cmd.Solve != nil || cmd.SolveRaw != nil
+		cmdObj["__sdHasHelpFunc"] = cmd.HelpFunc != nil
+		cmdMap[cmdName] = cmdObj
+	}
 	m := map[string]any{
 		"name":       ext.Name,
 		"aliases":    append([]string(nil), ext.Aliases...),
@@ -2327,7 +2595,7 @@ func extInfoToJSMap(ext *ExtInfo) map[string]any {
 		"brief":      ext.Brief,
 		"official":   ext.Official,
 		"activeWith": append([]string(nil), ext.ActiveWith...),
-		"cmdMap":     map[string]any{},
+		"cmdMap":     cmdMap,
 	}
 	// 兼容脚本中可能使用的 Source.Official 判断。
 	if ext.Source != nil {
@@ -2350,11 +2618,11 @@ func extInfoToJSONString(ext *ExtInfo) string {
 	return string(b)
 }
 
-func cmdItemInfoToJSONString(ci *CmdItemInfo) string {
+func cmdItemInfoToJSMap(ci *CmdItemInfo) map[string]any {
 	if ci == nil {
-		return "null"
+		return nil
 	}
-	m := map[string]any{
+	return map[string]any{
 		"name":                    ci.Name,
 		"shortHelp":               ci.ShortHelp,
 		"help":                    ci.Help,
@@ -2365,6 +2633,13 @@ func cmdItemInfoToJSONString(ci *CmdItemInfo) string {
 		"checkCurrentBotOn":       ci.CheckCurrentBotOn,
 		"checkMentionOthers":      ci.CheckMentionOthers,
 	}
+}
+
+func cmdItemInfoToJSONString(ci *CmdItemInfo) string {
+	if ci == nil {
+		return "null"
+	}
+	m := cmdItemInfoToJSMap(ci)
 	b, err := json.Marshal(m)
 	if err != nil {
 		return "null"

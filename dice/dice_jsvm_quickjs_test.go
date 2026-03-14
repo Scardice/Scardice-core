@@ -48,6 +48,18 @@ func (m *mockQuickJSScriptEngine) InvokeStoredExtCallback(extName string, callba
 	m.lastRuntime = runtime
 	return nil
 }
+func (m *mockQuickJSScriptEngine) InvokeStoredCommandOverride(extName string, runtime map[string]any) (bool, error) {
+	m.lastExtName = extName
+	m.lastCallbackName = "onCommandOverride"
+	m.lastRuntime = runtime
+	return true, nil
+}
+func (m *mockQuickJSScriptEngine) InvokeStoredGetDescText(extName string, extData map[string]any) (string, error) {
+	m.lastExtName = extName
+	m.lastCallbackName = "getDescText"
+	m.lastRuntime = map[string]any{"extData": extData}
+	return "quickjs-desc", nil
+}
 func (m *mockQuickJSScriptEngine) Quiesce() error { return nil }
 
 type mockClearEngine struct {
@@ -153,6 +165,40 @@ func TestBuildQuickJSCmdInfoRestoresMetadataAndRuntime(t *testing.T) {
 	}
 }
 
+func TestExtInfoToJSMapIncludesCmdMetadata(t *testing.T) {
+	ext := &ExtInfo{
+		Name: "demo",
+		CmdMap: CmdMapCls{
+			"ping": {
+				Name: "ping",
+				Help: ".ping",
+				HelpFunc: func(bool) string {
+					return "help"
+				},
+				Solve: func(_ *MsgContext, _ *Message, _ *CmdArgs) CmdExecuteResult {
+					return CmdExecuteResult{Matched: true, Solved: true}
+				},
+			},
+		},
+	}
+
+	out := extInfoToJSMap(ext)
+	cmdMap, ok := out["cmdMap"].(map[string]any)
+	if !ok {
+		t.Fatalf("cmdMap 类型异常: %#v", out["cmdMap"])
+	}
+	cmd, ok := cmdMap["ping"].(map[string]any)
+	if !ok {
+		t.Fatalf("命令元数据缺失: %#v", cmdMap)
+	}
+	if !quickJSBoolLike(cmd["__sdHasSolve"], false) {
+		t.Fatalf("__sdHasSolve 未设置: %#v", cmd)
+	}
+	if !quickJSBoolLike(cmd["__sdHasHelpFunc"], false) {
+		t.Fatalf("__sdHasHelpFunc 未设置: %#v", cmd)
+	}
+}
+
 func TestConvertJsExtInfoBindsQuickJSCallbacks(t *testing.T) {
 	engine := &mockQuickJSScriptEngine{}
 	d := &Dice{
@@ -164,7 +210,7 @@ func TestConvertJsExtInfoBindsQuickJSCallbacks(t *testing.T) {
 		"name":          "demo",
 		"aliases":       []any{"alias1"},
 		"activeWith":    []any{"base"},
-		"__sdCallbacks": []any{"onLoad", "onMessageReceived", "onMessageSend"},
+		"__sdCallbacks": []any{"onLoad", "onMessageReceived", "onMessageSend", "onCommandOverride", "getDescText"},
 	})
 	if err != nil {
 		t.Fatalf("convertJsExtInfo 返回错误: %v", err)
@@ -184,8 +230,11 @@ func TestConvertJsExtInfoBindsQuickJSCallbacks(t *testing.T) {
 	if ext.OnMessageReceived == nil {
 		t.Fatalf("QuickJS 回调未正确桥接: %+v", ext)
 	}
-	if ext.OnMessageSend != nil {
-		t.Fatalf("OnMessageSend 不应通过 Go 侧桥接，避免 runtimeMu 重入死锁: %+v", ext)
+	if ext.OnMessageSend == nil {
+		t.Fatalf("OnMessageSend 应通过 Go 侧桥接: %+v", ext)
+	}
+	if ext.OnCommandOverride == nil {
+		t.Fatalf("OnCommandOverride 应通过 Go 侧桥接: %+v", ext)
 	}
 
 	msg := &Message{Message: "hello", MessageType: "group"}
@@ -201,6 +250,22 @@ func TestConvertJsExtInfoBindsQuickJSCallbacks(t *testing.T) {
 	msgData, ok := engine.lastRuntime["msgData"].(map[string]any)
 	if !ok || msgData["message"] != "hello" {
 		t.Fatalf("回调 msgData 快照异常: %#v", engine.lastRuntime["msgData"])
+	}
+
+	ext.OnMessageSend(ctx, msg, "group")
+	if engine.lastCallbackName != "onMessageSend" {
+		t.Fatalf("OnMessageSend 未桥接到 QuickJS: %s", engine.lastCallbackName)
+	}
+
+	if ret := ext.OnCommandOverride(ctx, msg, &CmdArgs{Command: "ping"}); !ret {
+		t.Fatal("OnCommandOverride 返回值未透传")
+	}
+	if engine.lastCallbackName != "onCommandOverride" {
+		t.Fatalf("OnCommandOverride 未桥接到 QuickJS: %s", engine.lastCallbackName)
+	}
+
+	if got := ext.GetDescText(ext); got != "quickjs-desc" {
+		t.Fatalf("getDescText 返回值异常: %q", got)
 	}
 }
 
