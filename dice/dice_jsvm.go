@@ -434,6 +434,13 @@ func (d *Dice) JsInit() {
 			}
 			d.ConfigManager.UnregisterConfig(ei.Name, key...)
 		})
+		_ = ext.Set("storageList", func(ei *ExtInfo) []string {
+			keys, err := ei.StorageList()
+			if err != nil {
+				panic(err)
+			}
+			return keys
+		})
 
 		_ = ext.Set("registerTask", func(ei *ExtInfo, taskType string, value string, fn func(taskCtx JsScriptTaskCtx), key string, desc string, group string) *JsScriptTask {
 			if ei.dice == nil {
