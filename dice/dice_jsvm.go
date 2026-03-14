@@ -615,6 +615,25 @@ func (d *Dice) JsInit() {
 
 			return len(taskSet)
 		})
+		_ = ext.Set("listTasks", func(ei *ExtInfo) []*JsScriptTaskInfo {
+			if ei.dice == nil {
+				panic(errors.New("请先完成此扩展的注册"))
+			}
+
+			tasks := make([]*JsScriptTaskInfo, 0, len(ei.taskList))
+			for _, task := range ei.taskList {
+				if task == nil {
+					continue
+				}
+				tasks = append(tasks, &JsScriptTaskInfo{
+					TaskType: task.taskType,
+					Key:      task.key,
+					Value:    task.rawValue,
+					Active:   task.IsActive(),
+				})
+			}
+			return tasks
+		})
 
 		// COC规则自定义
 		coc := vm.NewObject()
@@ -1819,6 +1838,13 @@ type JsScriptTaskCtx struct {
 	Key string `jsbind:"key"`
 }
 
+type JsScriptTaskInfo struct {
+	TaskType string `jsbind:"taskType"`
+	Key      string `jsbind:"key"`
+	Value    string `jsbind:"value"`
+	Active   bool   `jsbind:"active"`
+}
+
 func (t *JsScriptTask) run() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1894,6 +1920,20 @@ func (t *JsScriptTask) Off() bool {
 		t.cron.Remove(*t.entryID)
 		t.entryID = nil
 		return true
+	default:
+		return false
+	}
+}
+
+func (t *JsScriptTask) IsActive() bool {
+	t.stateLock.Lock()
+	defer t.stateLock.Unlock()
+
+	switch t.taskType {
+	case "once":
+		return t.timer != nil
+	case "cron", "daily":
+		return t.entryID != nil
 	default:
 		return false
 	}
