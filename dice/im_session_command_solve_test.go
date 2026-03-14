@@ -3,7 +3,10 @@ package dice //nolint:testpackage // tests rely on unexported helpers
 
 import (
 	"testing"
+	"time"
 
+	"github.com/dop251/goja"
+	"github.com/dop251/goja_nodejs/eventloop"
 	"go.uber.org/zap"
 )
 
@@ -287,4 +290,101 @@ func TestCommandSolveRuleConflictResolution(t *testing.T) {
 			t.Fatalf("expected only coc7 command to run, got coc=%d dnd=%d dg=%d", cocHit, dndHit, dgHit)
 		}
 	})
+}
+
+func TestCommandSolveReturnsFailedWhenSingleCandidateNotSolved(t *testing.T) {
+	commandName := "rolltest"
+	hit := 0
+
+	ext := &ExtInfo{
+		Name: "dnd5e",
+		CmdMap: CmdMapCls{
+			commandName: {
+				Name: commandName,
+				Raw:  true,
+				Solve: func(_ *MsgContext, _ *Message, _ *CmdArgs) CmdExecuteResult {
+					hit++
+					return CmdExecuteResult{Matched: true, Solved: false}
+				},
+			},
+		},
+		DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
+	}
+
+	session, ctx := newCommandSolveTestSessionAndContext("dnd5e", []*ExtInfo{ext})
+	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})
+
+	if result.Status != commandSolveFailed {
+		t.Fatalf("expected failed status, got %v", result.Status)
+	}
+	if hit != 1 {
+		t.Fatalf("expected command to execute once, got %d", hit)
+	}
+}
+
+func startCommandSolveTestLoop(t *testing.T) (*eventloop.EventLoop, *goja.Runtime) {
+	t.Helper()
+	loop := eventloop.NewEventLoop(eventloop.EnableConsole(false))
+	go loop.StartInForeground()
+	time.Sleep(20 * time.Millisecond)
+	t.Cleanup(func() {
+		loop.Stop()
+	})
+
+	var vm *goja.Runtime
+	ready := make(chan struct{})
+	loop.RunOnLoop(func(runtime *goja.Runtime) {
+		vm = runtime
+		close(ready)
+	})
+	<-ready
+
+	return loop, vm
+}
+
+func TestCommandSolve_UsesSolveRawOverrideForNonJsCommand(t *testing.T) {
+	commandName := "rolltest"
+	solveHit := 0
+	overrideHit := 0
+
+	loop, vm := startCommandSolveTestLoop(t)
+
+	ext := &ExtInfo{
+		Name: "dnd5e",
+		CmdMap: CmdMapCls{
+			commandName: {
+				Name:          commandName,
+				Raw:           true,
+				IsJsSolveFunc: false,
+				// 模拟 ext.find 复制出来的官方命令
+				Solve: func(_ *MsgContext, _ *Message, _ *CmdArgs) CmdExecuteResult {
+					solveHit++
+					return CmdExecuteResult{Matched: true, Solved: false}
+				},
+				SolveRaw: func(_ *MsgContext, _ *Message, _ *CmdArgs) goja.Value {
+					overrideHit++
+					return vm.ToValue(map[string]interface{}{
+						"matched": true,
+						"solved":  true,
+					})
+				},
+			},
+		},
+		DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
+	}
+
+	session, ctx := newCommandSolveTestSessionAndContext("dnd5e", []*ExtInfo{ext})
+	ctx.Dice.ExtLoopManager = NewJsLoopManager()
+	_ = ctx.Dice.ExtLoopManager.SetLoop(loop)
+
+	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})
+	if result.Status != commandSolveSolved {
+		t.Fatalf("expected solved status, got %v", result.Status)
+	}
+	if overrideHit != 1 {
+		t.Fatalf("expected SolveRaw override to execute once, got %d", overrideHit)
+	}
+	if solveHit != 0 {
+		t.Fatalf("expected legacy Solve not to execute when SolveRaw override exists, got %d", solveHit)
+	}
 }

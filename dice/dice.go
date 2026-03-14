@@ -17,6 +17,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/dop251/goja"
 	"github.com/dop251/goja_nodejs/eventloop"
 	"github.com/go-creed/sat"
 	wr "github.com/mroth/weightedrand"
@@ -49,7 +50,8 @@ type CmdItemInfo struct {
 
 	IsJsSolveFunc bool
 	JSLoopVersion int64                                                                  // Loop版本号
-	Solve         func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult `jsbind:"solve"`
+	Solve         func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult
+	SolveRaw      func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) goja.Value `jsbind:"solve"`
 
 	Raw                bool `jsbind:"raw"`                // 高级模式。默认模式下行为是：需要在当前群/私聊开启，或@自己时生效(需要为第一个@目标)
 	CheckCurrentBotOn  bool `jsbind:"checkCurrentBotOn"`  // 是否检查当前可用状况，包括群内可用和是私聊两种方式，如失败不进入solve
@@ -663,6 +665,7 @@ func (d *Dice) ExtFind(s string, fromJS bool) *ExtInfo {
 				EnableExecuteTimesParse: info.EnableExecuteTimesParse,
 				IsJsSolveFunc:           info.IsJsSolveFunc,
 				Solve:                   info.Solve,
+				SolveRaw:                info.SolveRaw,
 				Raw:                     info.Raw,
 				CheckCurrentBotOn:       info.CheckCurrentBotOn,
 				CheckMentionOthers:      info.CheckMentionOthers,
