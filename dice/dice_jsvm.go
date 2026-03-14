@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/gob"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -69,7 +68,7 @@ var taskCronParser = cron.NewParser(
 
 const (
 	jsCacheDir         = "./data/.cache/js"
-	jsMetaCacheFile    = "meta.gob"
+	jsMetaCacheFile    = "meta.gob.zst"
 	jsMetaCacheVersion = 1
 	tsCacheDir         = "./data/.cache/js/ts"
 	tsCacheVersion     = 1
@@ -360,13 +359,14 @@ func (d *Dice) jsInitGojaCore() {
 				realExt.OnLoad()
 			}
 		})
-		_ = ext.Set("registerStringConfig", func(ei *ExtInfo, key string, defaultValue string, description string) error {
+		_ = ext.Set("registerStringConfig", func(ei *ExtInfo, key string, defaultValue string, description string, group string) error {
 			if ei.dice == nil {
 				return errors.New("请先完成此扩展的注册")
 			}
 			config := &ConfigItem{
 				Key:          key,
 				Type:         "string",
+				Group:        group,
 				Value:        defaultValue,
 				DefaultValue: defaultValue,
 				Description:  description,
@@ -374,13 +374,14 @@ func (d *Dice) jsInitGojaCore() {
 			d.ConfigManager.RegisterPluginConfig(ei.Name, config)
 			return nil
 		})
-		_ = ext.Set("registerIntConfig", func(ei *ExtInfo, key string, defaultValue int64, description string) error {
+		_ = ext.Set("registerIntConfig", func(ei *ExtInfo, key string, defaultValue int64, description string, group string) error {
 			if ei.dice == nil {
 				return errors.New("请先完成此扩展的注册")
 			}
 			config := &ConfigItem{
 				Key:          key,
 				Type:         "int",
+				Group:        group,
 				Value:        defaultValue,
 				DefaultValue: defaultValue,
 				Description:  description,
@@ -388,13 +389,14 @@ func (d *Dice) jsInitGojaCore() {
 			d.ConfigManager.RegisterPluginConfig(ei.Name, config)
 			return nil
 		})
-		_ = ext.Set("registerBoolConfig", func(ei *ExtInfo, key string, defaultValue bool, description string) error {
+		_ = ext.Set("registerBoolConfig", func(ei *ExtInfo, key string, defaultValue bool, description string, group string) error {
 			if ei.dice == nil {
 				return errors.New("请先完成此扩展的注册")
 			}
 			config := &ConfigItem{
 				Key:          key,
 				Type:         "bool",
+				Group:        group,
 				Value:        defaultValue,
 				DefaultValue: defaultValue,
 				Description:  description,
@@ -402,13 +404,14 @@ func (d *Dice) jsInitGojaCore() {
 			d.ConfigManager.RegisterPluginConfig(ei.Name, config)
 			return nil
 		})
-		_ = ext.Set("registerFloatConfig", func(ei *ExtInfo, key string, defaultValue float64, description string) error {
+		_ = ext.Set("registerFloatConfig", func(ei *ExtInfo, key string, defaultValue float64, description string, group string) error {
 			if ei.dice == nil {
 				return errors.New("请先完成此扩展的注册")
 			}
 			config := &ConfigItem{
 				Key:          key,
 				Type:         "float",
+				Group:        group,
 				Value:        defaultValue,
 				DefaultValue: defaultValue,
 				Description:  description,
@@ -416,13 +419,14 @@ func (d *Dice) jsInitGojaCore() {
 			d.ConfigManager.RegisterPluginConfig(ei.Name, config)
 			return nil
 		})
-		_ = ext.Set("registerTemplateConfig", func(ei *ExtInfo, key string, defaultValue []string, description string) error {
+		_ = ext.Set("registerTemplateConfig", func(ei *ExtInfo, key string, defaultValue []string, description string, group string) error {
 			if ei.dice == nil {
 				return errors.New("请先完成此扩展的注册")
 			}
 			config := &ConfigItem{
 				Key:          key,
 				Type:         "template",
+				Group:        group,
 				Value:        defaultValue,
 				DefaultValue: defaultValue,
 				Description:  description,
@@ -430,13 +434,14 @@ func (d *Dice) jsInitGojaCore() {
 			d.ConfigManager.RegisterPluginConfig(ei.Name, config)
 			return nil
 		})
-		_ = ext.Set("registerOptionConfig", func(ei *ExtInfo, key string, defaultValue string, option []string, description string) error {
+		_ = ext.Set("registerOptionConfig", func(ei *ExtInfo, key string, defaultValue string, option []string, description string, group string) error {
 			if ei.dice == nil {
 				return errors.New("请先完成此扩展的注册")
 			}
 			config := &ConfigItem{
 				Key:          key,
 				Type:         "option",
+				Group:        group,
 				Value:        defaultValue,
 				DefaultValue: defaultValue,
 				Option:       option,
@@ -506,8 +511,15 @@ func (d *Dice) jsInitGojaCore() {
 			}
 			d.ConfigManager.UnregisterConfig(ei.Name, key...)
 		})
+		_ = ext.Set("storageList", func(ei *ExtInfo) []string {
+			keys, err := ei.StorageList()
+			if err != nil {
+				panic(err)
+			}
+			return keys
+		})
 
-		_ = ext.Set("registerTask", func(ei *ExtInfo, taskType string, value string, fn func(taskCtx JsScriptTaskCtx), key string, desc string) *JsScriptTask {
+		_ = ext.Set("registerTask", func(ei *ExtInfo, taskType string, value string, fn func(taskCtx JsScriptTaskCtx), key string, desc string, group string) *JsScriptTask {
 			if ei.dice == nil {
 				d.Logger.Errorf("插件注册定时任务失败：请先完成此扩展的注册")
 				return nil
@@ -592,6 +604,7 @@ func (d *Dice) jsInitGojaCore() {
 					config = &ConfigItem{
 						Key:          key,
 						Type:         "task:cron",
+						Group:        group,
 						Value:        expr,
 						DefaultValue: value,
 						Description:  desc,
@@ -601,6 +614,7 @@ func (d *Dice) jsInitGojaCore() {
 					config = &ConfigItem{
 						Key:          key,
 						Type:         "task:daily",
+						Group:        group,
 						Value:        expr,
 						DefaultValue: value,
 						Description:  desc,
@@ -678,6 +692,25 @@ func (d *Dice) jsInitGojaCore() {
 			}
 
 			return len(taskSet)
+		})
+		_ = ext.Set("listTasks", func(ei *ExtInfo) []*JsScriptTaskInfo {
+			if ei.dice == nil {
+				panic(errors.New("请先完成此扩展的注册"))
+			}
+
+			tasks := make([]*JsScriptTaskInfo, 0, len(ei.taskList))
+			for _, task := range ei.taskList {
+				if task == nil {
+					continue
+				}
+				tasks = append(tasks, &JsScriptTaskInfo{
+					TaskType: task.taskType,
+					Key:      task.key,
+					Value:    task.rawValue,
+					Active:   task.IsActive(),
+				})
+			}
+			return tasks
 		})
 
 		// COC规则自定义
@@ -2423,14 +2456,8 @@ func jsCacheKey(path string) string {
 
 func loadJsMetaCache() *jsMetaCache {
 	cachePath := filepath.Join(jsCacheDir, jsMetaCacheFile)
-	f, err := os.Open(cachePath)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
 	var cache jsMetaCache
-	dec := gob.NewDecoder(f)
-	if err := dec.Decode(&cache); err != nil {
+	if err := loadGobCacheFile(cachePath, &cache); err != nil {
 		return nil
 	}
 	if cache.Version != jsMetaCacheVersion {
@@ -2446,24 +2473,8 @@ func saveJsMetaCache(cache *jsMetaCache) {
 	if cache == nil {
 		return
 	}
-	_ = os.MkdirAll(jsCacheDir, 0o755)
 	cachePath := filepath.Join(jsCacheDir, jsMetaCacheFile)
-	tmpPath := cachePath + ".tmp"
-	f, err := os.Create(tmpPath)
-	if err != nil {
-		return
-	}
-	enc := gob.NewEncoder(f)
-	if err := enc.Encode(cache); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmpPath)
-		return
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return
-	}
-	_ = os.Rename(tmpPath, cachePath)
+	_ = saveGobCacheFile(cachePath, cache)
 }
 
 func buildJsScriptInfoFromCache(d *Dice, path string, entry jsMetaCacheEntry) (*JsScriptInfo, error) {
@@ -2575,7 +2586,7 @@ func (d *Dice) JsLoadScripts() {
 				scriptData, _ := os.ReadFile(target)
 				if ok, _ := CheckJsSign(scriptData); !ok {
 					d.Logger.Warnf("已存在的内置脚本「%s」未通过校验，进行覆盖", script.Name())
-					_ = os.WriteFile(target, scriptData, 0o644)
+					_ = os.WriteFile(target, scriptData, 0o644) //nolint:gosec
 				}
 			}
 		}
@@ -2611,7 +2622,7 @@ func (d *Dice) JsLoadScripts() {
 				}
 			}
 
-			data, err := os.ReadFile(path)
+			data, err := os.ReadFile(path) //nolint:gosec
 			if err != nil {
 				d.Logger.Error("读取内置脚本失败(无法访问): ", err.Error())
 				return nil
@@ -2665,7 +2676,7 @@ func (d *Dice) JsLoadScripts() {
 				}
 			}
 
-			data, err := os.ReadFile(path)
+			data, err := os.ReadFile(path) //nolint:gosec
 			if err != nil {
 				d.Logger.Error("读取脚本失败(无法访问): ", err.Error())
 				return nil
@@ -3303,8 +3314,19 @@ func (d *Dice) JsUpdate(jsScriptInfo *JsScriptInfo, tempFileName string) error {
 	if len(newData) == 0 {
 		return errors.New("new data is empty")
 	}
-	// 更新插件
-	err = os.WriteFile(jsScriptInfo.Filename, newData, 0o755)
+	// 更新插件，验证文件路径在脚本目录内以防止路径穿越
+	scriptsDirAbs, err := filepath.Abs(filepath.Join(d.BaseConfig.DataDir, "scripts"))
+	if err != nil {
+		return fmt.Errorf("获取脚本目录绝对路径失败: %w", err)
+	}
+	filenameAbs, err := filepath.Abs(jsScriptInfo.Filename)
+	if err != nil {
+		return fmt.Errorf("获取脚本文件绝对路径失败: %w", err)
+	}
+	if !strings.HasPrefix(filenameAbs, scriptsDirAbs+string(filepath.Separator)) {
+		return fmt.Errorf("script filename %q is outside scripts directory", jsScriptInfo.Filename)
+	}
+	err = os.WriteFile(filenameAbs, newData, 0o755) //nolint:gosec
 	if err != nil {
 		d.Logger.Errorf("插件“%s”更新时保存文件出错，%s", jsScriptInfo.Name, err.Error())
 		return err
@@ -3468,6 +3490,13 @@ type JsScriptTaskCtx struct {
 	Key string `jsbind:"key"`
 }
 
+type JsScriptTaskInfo struct {
+	TaskType string `jsbind:"taskType"`
+	Key      string `jsbind:"key"`
+	Value    string `jsbind:"value"`
+	Active   bool   `jsbind:"active"`
+}
+
 func (t *JsScriptTask) run() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -3543,6 +3572,20 @@ func (t *JsScriptTask) Off() bool {
 		t.cron.Remove(*t.entryID)
 		t.entryID = nil
 		return true
+	default:
+		return false
+	}
+}
+
+func (t *JsScriptTask) IsActive() bool {
+	t.stateLock.Lock()
+	defer t.stateLock.Unlock()
+
+	switch t.taskType {
+	case "once":
+		return t.timer != nil
+	case "cron", "daily":
+		return t.entryID != nil
 	default:
 		return false
 	}

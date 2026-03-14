@@ -18,7 +18,7 @@ info.db
 record.log
 .idea
 !/.idea/**/Project.xml
-Scardice-core
+Scardice-core*
 data/save.yaml
 configs/
 data/
@@ -47,3 +47,9 @@ Scardice-lock.lock
 upgrade_metadata.json
 
 /signature/**/*
+
+# cache & output
+output/
+.build-cache/
+.gomodcache/
+.gocache/

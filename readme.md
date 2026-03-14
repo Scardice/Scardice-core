@@ -28,7 +28,7 @@
 
 编译的 golang 版本为 1.25.0。在 [构建](https://github.com/sealdice/sealdice-build) 仓库中采用对 go 进行修补的方式以支持 Windows 7 等低版本系统。
 
-因部分依赖库的需求，可能需要配置国内镜像，个人使用 <https://goproxy.cn/> 镜像。
+因部分依赖库的需求，可能需要配置国内镜像，个人使用 [https://goproxy.cn/](https://goproxy.cn/) 镜像。
 
 #### 代码格式化
 
@@ -53,6 +53,30 @@
 > 以上配置没有写入项目的统一设置，以允许开发者不本地使用 golangci-lint
 
 ### 编译运行
+
+#### 使用 `build.sh` 打包（Linux 环境推荐）
+
+仓库根目录提供了交互式打包脚本：
+
+```bash
+./build.sh
+```
+
+脚本会自动执行以下流程：
+
+1. 更新 submodule（`Scardice-ui`、`sealdice-builtins`）到最新提交
+2. 构建 UI（若 `dist` 已匹配当前 UI 提交与 lockfile 指纹，则自动跳过）
+3. 编译 core
+4. 用 `sealdice-builtins/data` 组装并打包
+5. 在 `output/` 输出压缩包（过程文件在 `.build-cache`）
+
+脚本支持两种构建模式：
+
+- `single`（默认，也可输入 `s`）：构建单个 `GOOS/GOARCH` 目标
+- `multi`（也可输入 `m`）：一次输入多个目标，格式为 `goos/goarch,...`，例如：
+  `linux/amd64,windows/amd64,linux/arm64`
+
+注意：如果启用 CGO 且为跨平台编译，需预先安装对应交叉编译器。
 
 #### 使用 `go-task`
 
@@ -161,6 +185,6 @@ go run .
 
 1.5 后，已经替换使用 dicescript (RollVM V2) 作为表达式解释器，现有版本不宜轻动。
 
-关于 dicescript 的信息，请移步 <https://github.com/sealdice/dicescript>
+关于 dicescript 的信息，请移步 [https://github.com/sealdice/dicescript](https://github.com/sealdice/dicescript)
 
 而出于兼容性的考虑，V1 版本的解释器将继续保留，直到 2.0 版本。

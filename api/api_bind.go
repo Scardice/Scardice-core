@@ -270,9 +270,75 @@ func logFetchAndClear(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
 	}
-	info := c.JSON(http.StatusOK, myDice.LogWriter.Items)
-	// myDice.LogWriter.Items = myDice.LogWriter.Items[:0]
-	return info
+	return c.JSON(http.StatusOK, myDice.LogWriter.Snapshot())
+}
+
+func logStream(c echo.Context) error {
+	if !doAuth(c) {
+		return c.JSON(http.StatusForbidden, nil)
+	}
+
+	flusher, ok := c.Response().Writer.(http.Flusher)
+	if !ok {
+		return c.String(http.StatusInternalServerError, "streaming unsupported")
+	}
+
+	header := c.Response().Header()
+	header.Set(echo.HeaderContentType, "text/event-stream; charset=utf-8")
+	header.Set(echo.HeaderCacheControl, "no-cache")
+	header.Set(echo.HeaderConnection, "keep-alive")
+	header.Set("X-Accel-Buffering", "no")
+	c.Response().WriteHeader(http.StatusOK)
+
+	writeEvent := func(event string, payload interface{}) error {
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		if _, err = fmt.Fprintf(c.Response(), "event: %s\n", event); err != nil {
+			return err
+		}
+		if _, err = fmt.Fprintf(c.Response(), "data: %s\n\n", data); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	if _, err := fmt.Fprint(c.Response(), "retry: 3000\n\n"); err != nil {
+		return nil
+	}
+	flusher.Flush()
+
+	subID, logCh, snapshot := myDice.LogWriter.Subscribe(256)
+	defer myDice.LogWriter.Unsubscribe(subID)
+
+	if err := writeEvent("snapshot", snapshot); err != nil {
+		return nil
+	}
+
+	heartbeat := time.NewTicker(20 * time.Second)
+	defer heartbeat.Stop()
+
+	ctx := c.Request().Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-heartbeat.C:
+			if _, err := fmt.Fprint(c.Response(), ": ping\n\n"); err != nil {
+				return nil
+			}
+			flusher.Flush()
+		case item, ok := <-logCh:
+			if !ok {
+				return nil
+			}
+			if err := writeEvent("log", item); err != nil {
+				return nil
+			}
+		}
+	}
 }
 
 var (
@@ -546,6 +612,7 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 	e.GET(prefix+"/baseInfo", baseInfo)
 	e.GET(prefix+"/hello", hello2)
 	e.GET(prefix+"/log/fetchAndClear", logFetchAndClear)
+	e.GET(prefix+"/log/stream", logStream)
 	e.GET(prefix+"/im_connections/list", ImConnections)
 	e.GET(prefix+"/im_connections/get", ImConnectionsGet)
 

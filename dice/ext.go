@@ -440,6 +440,30 @@ func (i *ExtInfo) StorageGet(k string) (string, error) {
 	return val, err
 }
 
+// StorageList 列出扩展存储中的所有 key。
+func (i *ExtInfo) StorageList() ([]string, error) {
+	target := i.GetRealExt()
+	if target == nil {
+		return nil, errors.New("[扩展]:目标扩展不存在")
+	}
+	if err := target.StorageInit(); err != nil {
+		return nil, err
+	}
+
+	keys := make([]string, 0)
+	db := target.Storage
+	err := db.View(func(tx *buntdb.Tx) error {
+		return tx.AscendKeys("*", func(k, _ string) bool {
+			keys = append(keys, k)
+			return true
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
 // -------------------- 群扩展状态管理 --------------------
 
 func (group *GroupInfo) ensureInactivatedSet() {

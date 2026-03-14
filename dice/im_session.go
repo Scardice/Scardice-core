@@ -28,6 +28,7 @@ import (
 	rand2 "golang.org/x/exp/rand" //nolint:staticcheck // against my better judgment, but this was mandated due to a strongly held opinion from you know who
 
 	"github.com/dop251/goja"
+	"github.com/dop251/goja_nodejs/eventloop"
 	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v3"
 )
@@ -37,6 +38,8 @@ type SenderBase struct {
 	UserID    string `jsbind:"userId"   json:"userId"`
 	GroupRole string `json:"-"` // 群内角色 admin管理员 owner群主
 }
+
+const jsSolveAwaitTimeout = 10 * time.Second
 
 // Message 消息的重要信息
 // 时间
@@ -101,6 +104,10 @@ type GroupInfo struct {
 
 	RateLimiter     *rate.Limiter `json:"-" yaml:"-"`
 	RateLimitWarned bool          `json:"-" yaml:"-"`
+	// 连续相同指令时动态调整群组限速恢复速度（运行时字段）
+	SpamLastCommand      string `json:"-" yaml:"-"`
+	SpamLastCommandAt    int64  `json:"-" yaml:"-"`
+	SpamSameCommandCount int    `json:"-" yaml:"-"`
 
 	EnteredTime  int64  `jsbind:"enteredTime"  json:"enteredTime"  yaml:"enteredTime"`  // 入群时间
 	InviteUserID string `jsbind:"inviteUserId" json:"inviteUserId" yaml:"inviteUserId"` // 邀请人
@@ -276,7 +283,7 @@ func (g *GroupInfo) UnmarshalJSON(data []byte) error {
 // 同时将群组 ID 加入脏列表，Save 时只遍历脏列表
 func (g *GroupInfo) MarkDirty(d *Dice) {
 	now := time.Now().Unix()
-	g.UpdatedAtTime = now
+	atomic.StoreInt64(&g.UpdatedAtTime, now)
 	if d != nil && d.DirtyGroups != nil {
 		d.DirtyGroups.Store(g.GroupID, now)
 	}
@@ -616,6 +623,7 @@ type MsgContext struct {
 
 	IsPrivate       bool        `jsbind:"isPrivate"` // 是否私聊
 	CommandID       int64       // 指令ID
+	CurrentCommand  string      // 当前解析到的指令名(小写)
 	CommandHideFlag string      `jsbind:"commandHideFlag"` // 暗骰来源群号
 	CommandInfo     interface{} // 命令信息
 	PrivilegeLevel  int         `jsbind:"privilegeLevel"` // 权限等级 -30ban 40邀请者 50管理 60群主 70信任 100master
@@ -1395,6 +1403,10 @@ func (s *IMSession) PreTriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *C
 		}
 	}
 
+	if cmdArgs != nil {
+		mctx.CurrentCommand = strings.ToLower(strings.TrimSpace(cmdArgs.Command))
+	}
+
 	if cmdArgs.Command != "botlist" && !cmdArgs.AmIBeMentioned {
 		myuid := ep.UserID
 		// 屏蔽机器人发送的消息
@@ -1456,8 +1468,9 @@ func (ep *EndPointInfo) TriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *
 		case commandSolveBlocked:
 			handled = true
 			log.Infof("指令[%s]可用扩展均被禁用: %s", cmdArgs.Command, strings.Join(solveResult.DisabledSources, ", "))
-		case commandSolveHandled:
+		case commandSolveFailed:
 			handled = true
+			log.Infof("指令[%s]执行失败", cmdArgs.Command)
 		case commandSolveUnmatched:
 		}
 	}
@@ -1604,6 +1617,43 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 		Endpoint *EndPointInfo
 		Last     time.Time
 	}
+	isAutoQuitEndpointReady := func(grp *GroupInfo, ep *EndPointInfo, platform string, phase string) bool {
+		groupID := "<nil>"
+		if grp != nil {
+			groupID = grp.GroupID
+		}
+		if grp == nil {
+			s.Parent.Logger.Debugf("自动退群已跳过: 找不到群信息，暂时无法处理该群。phase=%s group=%s platform=%s", phase, groupID, platform)
+			return false
+		}
+		if ep == nil {
+			s.Parent.Logger.Debugf("自动退群已跳过: 找不到对应账号连接，暂时无法处理该群。phase=%s group=%s platform=%s", phase, groupID, platform)
+			return false
+		}
+		if ep.Adapter == nil || ep.Session == nil {
+			s.Parent.Logger.Debugf(
+				"自动退群已跳过: 账号连接尚未准备完成，暂时无法处理该群。phase=%s group=%s platform=%s endpoint=%s adapter_nil=%t session_nil=%t",
+				phase,
+				groupID,
+				platform,
+				ep.UserID,
+				ep.Adapter == nil,
+				ep.Session == nil,
+			)
+			return false
+		}
+		if grp.DiceIDExistsMap == nil {
+			s.Parent.Logger.Debugf("自动退群已跳过: 群内账号记录缺失，暂时无法确认是否可退群。phase=%s group=%s platform=%s endpoint=%s", phase, groupID, platform, ep.UserID)
+			return false
+		}
+		if ep.Platform != platform || !grp.DiceIDExistsMap.Exists(ep.UserID) {
+			return false
+		}
+		if !ep.Enable || ep.State != StateConnected {
+			return false
+		}
+		return true
+	}
 	var selectedGroupEndpoints = make([]*GroupEndpointPair, 0)
 	var groupCount int
 	s.ServiceAtNew.Range(func(key string, grp *GroupInfo) bool {
@@ -1628,7 +1678,7 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 			return true
 		}
 		// 获取上次骰子活动时间
-		last := time.Unix(grp.RecentDiceSendTime, 0)
+		last := time.Unix(atomic.LoadInt64(&grp.RecentDiceSendTime), 0)
 		// 如果enter是进入时间，它比活动时间更晚（说明骰子刚进去，但是骰子还没有说话），那么上次骰子活动时间=进入时间
 		if enter := time.Unix(grp.EnteredTime, 0); enter.After(last) {
 			last = enter
@@ -1643,7 +1693,7 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 		if last.Before(threshold) {
 			for _, ep := range s.EndPoints {
 				// 找到对应的endpoints，并准备退掉它的群
-				if ep.Platform != platform || !grp.DiceIDExistsMap.Exists(ep.UserID) {
+				if !isAutoQuitEndpointReady(grp, ep, platform, "select") {
 					continue
 				}
 				selectedGroupEndpoints = append(selectedGroupEndpoints, &GroupEndpointPair{Group: grp, Endpoint: ep, Last: last})
@@ -1659,13 +1709,19 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 	})
 	// 循环完毕，要不然是因为够了要退的数量，要不就是遍历完毕了，但是不够，总之要进行退群活动了
 	go func() {
-		if r := recover(); r != nil {
-			log := zap.S().Named(logger.LogKeyAdapter)
-			log.Errorf("自动退群异常: %v 堆栈: %v", r, string(debug.Stack()))
-		}
+		defer func() {
+			if r := recover(); r != nil {
+				log := zap.S().Named(logger.LogKeyAdapter)
+				log.Errorf("自动退群异常: %v 堆栈: %v", r, string(debug.Stack()))
+			}
+		}()
 		for i, pair := range selectedGroupEndpoints {
 			grp := pair.Group
 			ep := pair.Endpoint
+			if !isAutoQuitEndpointReady(grp, ep, "QQ", "send") {
+				s.Parent.Logger.Infof("自动退群已跳过: 当前账号已离线或不可用，暂不对该群执行退群。group=%s endpoint=%s", grp.GroupID, ep.UserID)
+				continue
+			}
 			last := pair.Last
 			hint := fmt.Sprintf("检测到群 %s 上次活动时间为 %s，尝试退出,当前为本轮第 %d 个", grp.GroupID, last.Format(time.RFC3339), i+1)
 			s.Parent.Logger.Info(hint)
@@ -1680,6 +1736,10 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 			ep.Adapter.SendToGroup(msgCtx, grp.GroupID, msgText, "")
 			// 退群在退群消息延迟两秒后发送，确保消息发送完成
 			time.Sleep(2 * time.Second)
+			if !isAutoQuitEndpointReady(grp, ep, "QQ", "quit") {
+				s.Parent.Logger.Infof("自动退群已取消: 当前账号状态发生变化，本次不再继续退群。group=%s endpoint=%s", grp.GroupID, ep.UserID)
+				continue
+			}
 			// 删除群聊绑定信息，更新群处理时间
 			grp.DiceIDExistsMap.Delete(ep.UserID)
 			grp.MarkDirty(msgCtx.Dice)
@@ -1840,7 +1900,7 @@ const (
 	commandSolveSolved
 	commandSolveConflict
 	commandSolveBlocked
-	commandSolveHandled
+	commandSolveFailed
 )
 
 type commandSolveCandidate struct {
@@ -1852,6 +1912,99 @@ type commandSolveResult struct {
 	Status           commandSolveStatus
 	AvailableSources []string
 	DisabledSources  []string
+}
+
+func normalizeRuleIdentity(raw string) string {
+	return strings.ToLower(strings.TrimSpace(raw))
+}
+
+func addRuleIdentity(set map[string]struct{}, raw string) {
+	if set == nil {
+		return
+	}
+	name := normalizeRuleIdentity(raw)
+	if name == "" {
+		return
+	}
+	set[name] = struct{}{}
+}
+
+func hasRuleIdentityIntersection(left map[string]struct{}, right map[string]struct{}) bool {
+	if len(left) == 0 || len(right) == 0 {
+		return false
+	}
+	for name := range left {
+		if _, ok := right[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// collectTemplateSelfRuleIdentities 仅收集模板“本体”标识，不包含依赖标识。
+// 这里我们认为 relatedExt 中除本模板自身外的项视为本体的依赖依赖，不参与本体识别。
+func collectTemplateSelfRuleIdentities(system string, tmpl *GameSystemTemplate) map[string]struct{} {
+	ids := make(map[string]struct{})
+	if tmpl == nil {
+		return ids
+	}
+
+	addRuleIdentity(ids, system)
+	addRuleIdentity(ids, tmpl.Name)
+	addRuleIdentity(ids, tmpl.FullName)
+
+	keys := tmpl.Commands.Set.Keys
+	if len(keys) == 0 {
+		keys = tmpl.SetConfig.Keys
+	}
+	for _, key := range keys {
+		addRuleIdentity(ids, key)
+	}
+
+	relatedExt := tmpl.Commands.Set.RelatedExt
+	if len(relatedExt) == 0 {
+		relatedExt = tmpl.SetConfig.RelatedExt
+	}
+
+	matchedSelfInRelated := 0
+	for _, extName := range relatedExt {
+		name := normalizeRuleIdentity(extName)
+		if name == "" {
+			continue
+		}
+		if _, ok := ids[name]; ok {
+			matchedSelfInRelated++
+		}
+	}
+
+	// 如果 relatedExt 只有一个项且未与已有本体标识对齐，仍视为本体标识。
+	if matchedSelfInRelated == 0 && len(relatedExt) == 1 {
+		addRuleIdentity(ids, relatedExt[0])
+	}
+
+	return ids
+}
+
+func collectCandidateRuleIdentities(candidate commandSolveCandidate) map[string]struct{} {
+	ids := make(map[string]struct{})
+	if candidate.Ext == nil {
+		return ids
+	}
+
+	addRuleIdentity(ids, candidate.Ext.Name)
+	for _, alias := range candidate.Ext.Aliases {
+		addRuleIdentity(ids, alias)
+	}
+	addRuleIdentity(ids, candidate.Ext.TargetName)
+
+	realExt := candidate.Ext.GetRealExt()
+	if realExt != nil {
+		addRuleIdentity(ids, realExt.Name)
+		for _, alias := range realExt.Aliases {
+			addRuleIdentity(ids, alias)
+		}
+	}
+	return ids
 }
 
 func collectRuleExtNameSetBySystem(ctx *MsgContext) (map[string]struct{}, map[string]struct{}) {
@@ -1866,13 +2019,9 @@ func collectRuleExtNameSetBySystem(ctx *MsgContext) (map[string]struct{}, map[st
 		currentSystem = strings.TrimSpace(ctx.Group.System)
 	}
 
-	addRelatedExt := func(system string, relatedExt []string) {
+	addSystemRuleIDs := func(system string, ids map[string]struct{}) {
 		isCurrentSystem := currentSystem != "" && strings.EqualFold(currentSystem, system)
-		for _, extName := range relatedExt {
-			name := strings.ToLower(strings.TrimSpace(extName))
-			if name == "" {
-				continue
-			}
+		for name := range ids {
 			ruleExtNames[name] = struct{}{}
 			if isCurrentSystem {
 				preferredRuleExtNames[name] = struct{}{}
@@ -1884,12 +2033,7 @@ func collectRuleExtNameSetBySystem(ctx *MsgContext) (map[string]struct{}, map[st
 		if tmpl == nil {
 			return true
 		}
-
-		relatedExt := tmpl.Commands.Set.RelatedExt
-		if len(relatedExt) == 0 {
-			relatedExt = tmpl.SetConfig.RelatedExt
-		}
-		addRelatedExt(system, relatedExt)
+		addSystemRuleIDs(system, collectTemplateSelfRuleIdentities(system, tmpl))
 		return true
 	})
 
@@ -1914,12 +2058,12 @@ func selectRulePluginCandidateByGroupSystem(ctx *MsgContext, candidates []comman
 			return empty, false
 		}
 
-		extName := strings.ToLower(candidate.Ext.Name)
-		if _, ok := ruleExtNames[extName]; !ok {
+		candidateIDs := collectCandidateRuleIdentities(candidate)
+		if !hasRuleIdentityIntersection(candidateIDs, ruleExtNames) {
 			return empty, false
 		}
 
-		if _, ok := preferredRuleExtNames[extName]; ok {
+		if hasRuleIdentityIntersection(candidateIDs, preferredRuleExtNames) {
 			selected = candidate
 			matchedCount++
 		}
@@ -1936,6 +2080,126 @@ func commandCandidateSourceName(candidate commandSolveCandidate) string {
 		return "core"
 	}
 	return candidate.Ext.Name
+}
+
+func parseJSSolveResult(vm *goja.Runtime, value goja.Value) (CmdExecuteResult, error) {
+	if goja.IsUndefined(value) || goja.IsNull(value) {
+		return CmdExecuteResult{}, fmt.Errorf("solve returned empty result")
+	}
+
+	if ret, ok := value.Export().(CmdExecuteResult); ok {
+		return ret, nil
+	}
+	if retPtr, ok := value.Export().(*CmdExecuteResult); ok && retPtr != nil {
+		return *retPtr, nil
+	}
+	if m, ok := value.Export().(map[string]interface{}); ok {
+		_, hasMatched := m["matched"]
+		_, hasSolved := m["solved"]
+		_, hasShowHelp := m["showHelp"]
+		if !hasMatched && !hasSolved && !hasShowHelp {
+			return CmdExecuteResult{}, fmt.Errorf("invalid solve result: missing matched/solved/showHelp")
+		}
+		toBool := func(v interface{}) bool {
+			if v == nil {
+				return false
+			}
+			return vm.ToValue(v).ToBoolean()
+		}
+		return CmdExecuteResult{
+			Matched:  toBool(m["matched"]),
+			Solved:   toBool(m["solved"]),
+			ShowHelp: toBool(m["showHelp"]),
+		}, nil
+	}
+
+	obj := value.ToObject(vm)
+	if obj == nil {
+		return CmdExecuteResult{}, fmt.Errorf("invalid solve result")
+	}
+	safeBool := func(v goja.Value) bool {
+		if v == nil || goja.IsUndefined(v) || goja.IsNull(v) {
+			return false
+		}
+		return v.ToBoolean()
+	}
+	matchedVal := obj.Get("matched")
+	solvedVal := obj.Get("solved")
+	showHelpVal := obj.Get("showHelp")
+	if (matchedVal == nil || goja.IsUndefined(matchedVal) || goja.IsNull(matchedVal)) &&
+		(solvedVal == nil || goja.IsUndefined(solvedVal) || goja.IsNull(solvedVal)) &&
+		(showHelpVal == nil || goja.IsUndefined(showHelpVal) || goja.IsNull(showHelpVal)) {
+		return CmdExecuteResult{}, fmt.Errorf("invalid solve result: missing matched/solved/showHelp")
+	}
+	return CmdExecuteResult{
+		Matched:  safeBool(matchedVal),
+		Solved:   safeBool(solvedVal),
+		ShowHelp: safeBool(showHelpVal),
+	}, nil
+}
+
+func resolveJSSolveValue(vm *goja.Runtime, value goja.Value, done chan<- CmdExecuteResult, fail chan<- error) {
+	promise, ok := value.Export().(*goja.Promise)
+	if !ok {
+		ret, err := parseJSSolveResult(vm, value)
+		if err != nil {
+			fail <- err
+			return
+		}
+		done <- ret
+		return
+	}
+
+	switch promise.State() {
+	case goja.PromiseStateFulfilled:
+		ret, err := parseJSSolveResult(vm, promise.Result())
+		if err != nil {
+			fail <- err
+			return
+		}
+		done <- ret
+	case goja.PromiseStateRejected:
+		fail <- fmt.Errorf("promise rejected: %v", promise.Result())
+	case goja.PromiseStatePending:
+		obj := value.ToObject(vm)
+		thenVal := obj.Get("then")
+		thenFn, isFunc := goja.AssertFunction(thenVal)
+		if !isFunc {
+			fail <- fmt.Errorf("invalid promise object: missing then")
+			return
+		}
+
+		onFulfilled := vm.ToValue(func(call goja.FunctionCall) goja.Value {
+			ret, err := parseJSSolveResult(vm, call.Argument(0))
+			if err != nil {
+				fail <- err
+				return goja.Undefined()
+			}
+			done <- ret
+			return goja.Undefined()
+		})
+		onRejected := vm.ToValue(func(call goja.FunctionCall) goja.Value {
+			fail <- fmt.Errorf("promise rejected: %v", call.Argument(0))
+			return goja.Undefined()
+		})
+
+		if _, err := thenFn(value, onFulfilled, onRejected); err != nil {
+			fail <- err
+		}
+	default:
+		fail <- fmt.Errorf("unknown promise state")
+	}
+}
+
+func waitJSSolveResult(done <-chan CmdExecuteResult, fail <-chan error, timeout time.Duration) (CmdExecuteResult, error) {
+	select {
+	case ret := <-done:
+		return ret, nil
+	case err := <-fail:
+		return CmdExecuteResult{}, err
+	case <-time.After(timeout):
+		return CmdExecuteResult{}, fmt.Errorf("timeout")
+	}
 }
 
 func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) commandSolveResult {
@@ -2042,38 +2306,73 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 		}
 
 		var ret CmdExecuteResult
-		// 如果是 JS 命令：Goja 走旧 loop，QuickJS 直接走桥接 Solve。
-		if item.IsJsSolveFunc {
-			if s.Parent.JsEngineEffective == "quickjs" {
-				// QuickJS 命令 solve 已在 item.Solve 内通过 ScriptEngine 桥接，不再依赖 Goja loop。
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", r))
-						}
-					}()
-					ret = item.Solve(ctx, msg, cmdArgs)
+		// QuickJS 的 solve 通过 ScriptEngine 桥接，直接调用 item.Solve。
+		if item.IsJsSolveFunc && s.Parent.JsEngineEffective == "quickjs" {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", r))
+					}
 				}()
-			} else {
-				loop, err := s.Parent.ExtLoopManager.GetLoop(item.JSLoopVersion)
-				if err != nil {
-					// 打个DEBUG日志？
+				ret = item.Solve(ctx, msg, cmdArgs)
+			}()
+		} else if item.IsJsSolveFunc || item.SolveRaw != nil {
+			// Goja 兼容执行路径：
+			// 1. 原生 JS 命令(IsJsSolveFunc=true)
+			// 2. 非 JS 命令但被脚本通过 cmd.solve 覆写（SolveRaw!=nil）
+			var (
+				loop *eventloop.EventLoop
+				err  error
+			)
+			if s.Parent.ExtLoopManager == nil {
+				s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境不可用: loop manager is nil", item.Name)
+				return false
+			}
+
+			loop, err = s.Parent.ExtLoopManager.GetLoop(item.JSLoopVersion)
+			if err != nil {
+				// 兼容非 JS 命令被覆写 solve 的场景：
+				// 这类命令通常没有有效 JSLoopVersion（如 ext.find 复制官方命令后赋值 cmd.solve）。
+				if !item.IsJsSolveFunc && item.SolveRaw != nil {
+					loop = s.Parent.ExtLoopManager.GetWebLoop()
+				}
+				if loop == nil {
 					s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境已经过期: %v", item.Name, err)
 					return false
 				}
-				waitRun := make(chan int, 1)
-				loop.RunOnLoop(func(vm *goja.Runtime) {
+			}
+			done := make(chan CmdExecuteResult, 1)
+			fail := make(chan error, 1)
+			loop.RunOnLoop(func(vm *goja.Runtime) {
+				if item.SolveRaw == nil {
+					// 兼容少量旧对象：没有 solveRaw 时回退同步 solve
 					defer func() {
 						if r := recover(); r != nil {
-							// log.Errorf("异常: %v 堆栈: %v", r, string(debug.Stack()))
-							ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", r))
+							fail <- fmt.Errorf("panic: %v", r)
+							return
 						}
-						waitRun <- 1
+						done <- item.Solve(ctx, msg, cmdArgs)
 					}()
+					return
+				}
 
-					ret = item.Solve(ctx, msg, cmdArgs)
-				})
-				<-waitRun
+				defer func() {
+					if r := recover(); r != nil {
+						fail <- fmt.Errorf("panic: %v", r)
+					}
+				}()
+
+				resolveJSSolveValue(vm, item.SolveRaw(ctx, msg, cmdArgs), done, fail)
+			})
+
+			ret, err = waitJSSolveResult(done, fail, jsSolveAwaitTimeout)
+			if err != nil {
+				if err.Error() == "timeout" {
+					ReplyToSender(ctx, msg, fmt.Sprintf("JS执行超时（>%s），请检查扩展逻辑", jsSolveAwaitTimeout))
+					return false
+				}
+				ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", err))
+				return false
 			}
 		} else {
 			ret = item.Solve(ctx, msg, cmdArgs)
@@ -2172,12 +2471,11 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 		}
 	}
 
-	if len(available) == 1 && solved {
-		return commandSolveResult{Status: commandSolveSolved}
-	}
 	if len(available) == 1 {
-		// 已进入 solve，但未标记 solved，仍视为已处理，避免误报“忽略指令”。
-		return commandSolveResult{Status: commandSolveHandled}
+		if solved {
+			return commandSolveResult{Status: commandSolveSolved}
+		}
+		return commandSolveResult{Status: commandSolveFailed}
 	}
 
 	if len(disabled) > 0 {

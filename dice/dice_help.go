@@ -2,7 +2,6 @@ package dice
 
 import (
 	"crypto/sha256"
-	"encoding/gob"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -86,6 +85,7 @@ const (
 const HelpConfigFilename = "help_config.yaml"
 const helpIndexManifestPath = "./data/.cache/helpdoc/index_manifest.json"
 const helpIndexManifestVersion = 1
+const helpIndexSchemaVersion = 2
 const helpDocParsedCacheDir = "./data/.cache/helpdoc/parsed"
 const helpDocParsedCacheVersion = 1
 
@@ -395,12 +395,13 @@ type helpDocFileInfo struct {
 }
 
 type helpIndexManifest struct {
-	Version     int               `json:"version"`
-	EngineType  EngineType        `json:"engineType"`
-	VersionCode int64             `json:"versionCode"`
-	Fingerprint string            `json:"fingerprint"`
-	Files       []helpDocFileInfo `json:"files"`
-	TotalID     uint64            `json:"totalId"`
+	Version       int               `json:"version"`
+	SchemaVersion int               `json:"schemaVersion"`
+	EngineType    EngineType        `json:"engineType"`
+	VersionCode   int64             `json:"versionCode"`
+	Fingerprint   string            `json:"fingerprint"`
+	Files         []helpDocFileInfo `json:"files"`
+	TotalID       uint64            `json:"totalId"`
 }
 
 func loadHelpIndexManifest() (*helpIndexManifest, error) {
@@ -419,11 +420,12 @@ func buildHelpIndexManifest(engineType EngineType, internalCmdMap CmdMapCls, ext
 	curFiles, _ := collectHelpDocFiles("./data/helpdoc")
 	fingerprint := buildHelpIndexFingerprint(internalCmdMap, extList)
 	return helpIndexManifest{
-		Version:     helpIndexManifestVersion,
-		EngineType:  engineType,
-		VersionCode: VERSION_CODE,
-		Fingerprint: fingerprint,
-		Files:       curFiles,
+		Version:       helpIndexManifestVersion,
+		SchemaVersion: helpIndexSchemaVersion,
+		EngineType:    engineType,
+		VersionCode:   VERSION_CODE,
+		Fingerprint:   fingerprint,
+		Files:         curFiles,
 	}
 }
 
@@ -432,6 +434,9 @@ func canReuseHelpIndex(old *helpIndexManifest, cur *helpIndexManifest) bool {
 		return false
 	}
 	if old.Version != helpIndexManifestVersion {
+		return false
+	}
+	if old.SchemaVersion != helpIndexSchemaVersion {
 		return false
 	}
 	if old.EngineType != cur.EngineType {
@@ -802,7 +807,7 @@ func parseHelpDocXLSX(group string, path string) ([]docengine.HelpTextItem, erro
 	}()
 
 	for index, s := range f.GetSheetList() {
-		rows, err := f.GetRows(s)
+		rows, err := f.GetRows(s, excelize.Options{RawCellValue: true})
 		if err == nil {
 			var synonymCount int
 			for i, row := range rows {
@@ -857,16 +862,9 @@ func (m *HelpManager) loadHelpDocItemsFromCache(group string, path string) ([]do
 	if err != nil {
 		return nil, false
 	}
-	_ = os.MkdirAll(helpDocParsedCacheDir, 0o755)
-	cachePath := filepath.Join(helpDocParsedCacheDir, helpDocCacheKey(path)+".gob")
-	f, err := os.Open(cachePath)
-	if err != nil {
-		return nil, false
-	}
-	defer f.Close()
+	cachePath := filepath.Join(helpDocParsedCacheDir, helpDocCacheKey(path)+".gob.zst")
 	var cache helpDocParsedCache
-	dec := gob.NewDecoder(f)
-	if decErr := dec.Decode(&cache); decErr != nil {
+	if loadErr := loadGobCacheFile(cachePath, &cache); loadErr != nil {
 		return nil, false
 	}
 	if cache.Version != helpDocParsedCacheVersion {
@@ -904,24 +902,8 @@ func (m *HelpManager) saveHelpDocItemsToCache(path string, items []docengine.Hel
 		ModTime: st.ModTime().Unix(),
 		Items:   items,
 	}
-	_ = os.MkdirAll(helpDocParsedCacheDir, 0o755)
-	cachePath := filepath.Join(helpDocParsedCacheDir, helpDocCacheKey(path)+".gob")
-	tmpPath := cachePath + ".tmp"
-	f, err := os.Create(tmpPath)
-	if err != nil {
-		return
-	}
-	enc := gob.NewEncoder(f)
-	if err := enc.Encode(&cache); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmpPath)
-		return
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return
-	}
-	_ = os.Rename(tmpPath, cachePath)
+	cachePath := filepath.Join(helpDocParsedCacheDir, helpDocCacheKey(path)+".gob.zst")
+	_ = saveGobCacheFile(cachePath, &cache)
 }
 
 // validateXlsxHeaders 验证 xlsx 格式 helpdoc 的表头是否是 Key Synonym（可能有多列） Content Description Catalogue Tag

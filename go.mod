@@ -22,7 +22,7 @@ require (
 	github.com/danielgtaylor/huma/v2 v2.34.1
 	github.com/dop251/goja v0.0.0-20260216154549-8b74ce4618c5
 	github.com/dop251/goja_nodejs v0.0.0-20250409162600-f7acab6894b0
-	github.com/evanw/esbuild v0.25.11
+	github.com/evanw/esbuild v0.27.1
 	github.com/fy0/go-autostart v0.0.0-20220515100644-a25d81ed766b
 	github.com/fy0/gojax v0.0.0-20221225152702-4140cf8509bd
 	github.com/fy0/systray v1.2.2
@@ -41,6 +41,7 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/juliangruber/go-intersect v1.1.0
 	github.com/kardianos/service v1.2.4
+	github.com/klauspost/compress v1.18.0
 	github.com/labstack/echo/v4 v4.13.4
 	github.com/lonelyevil/kook v0.0.31
 	github.com/lonelyevil/kook/log_adapter/plog v0.0.31
@@ -73,13 +74,14 @@ require (
 	github.com/slack-go/slack v0.17.3
 	github.com/sunshineplan/imgconv v1.1.14
 	github.com/tailscale/hujson v0.0.0-20250605163823-992244df8c5a
-	github.com/tdewolff/minify/v2 v2.24.3
+	github.com/tdewolff/minify/v2 v2.24.8
 	github.com/tidwall/buntdb v1.3.2
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5
 	github.com/xuri/excelize/v2 v2.10.0
 	github.com/yuin/goldmark v1.7.13
 	go.etcd.io/bbolt v1.4.3
+	go.uber.org/goleak v1.3.0
 	go.uber.org/zap v1.27.0
 	golang.org/x/crypto v0.45.0
 	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546
@@ -161,7 +163,6 @@ require (
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/jinzhu/now v1.1.5 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/labstack/gommon v0.4.2 // indirect
@@ -187,7 +188,7 @@ require (
 	github.com/sergeymakinen/go-ico v1.0.0-beta.0 // indirect
 	github.com/sunshineplan/pdf v1.0.8 // indirect
 	github.com/tadvi/systray v0.0.0-20190226123456-11a2b8fa57af // indirect
-	github.com/tdewolff/parse/v2 v2.8.3 // indirect
+	github.com/tdewolff/parse/v2 v2.8.5 // indirect
 	github.com/tetratelabs/wazero v1.9.0 // indirect
 	github.com/tidwall/btree v1.8.0 // indirect
 	github.com/tidwall/grect v0.1.4 // indirect
@@ -226,5 +227,6 @@ replace (
 	github.com/dop251/goja_nodejs v0.0.0-20250409162600-f7acab6894b0 => github.com/PaienNate/goja_nodejs v0.0.0-20250924024212-bac2e5ba5231
 	github.com/lonelyevil/kook v0.0.31 => github.com/sealdice/kook v0.0.3
 	github.com/sacOO7/gowebsocket v0.0.0-20221109081133-70ac927be105 => github.com/fy0/GoWebsocket v0.0.0-20231128163937-aa5c110b25c6
+	github.com/sealdice/dicescript v0.0.0-20260103130502-bd5621347a4e => github.com/Scardice/dicescript v0.0.0-20260308044903-97cde91a0493
 // github.com/PaienNate/pineutil v0.0.0-20251014070632-4c5ebfdc92e5 => C:\Users\11018\Documents\goutil
 )

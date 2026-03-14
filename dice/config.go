@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,6 +69,7 @@ type (
 type ConfigItem struct {
 	Key          string      `jsbind:"key"          json:"key"`
 	Type         string      `jsbind:"type"         json:"type"`
+	Group        string      `jsbind:"group"        json:"group,omitempty"`
 	DefaultValue interface{} `jsbind:"defaultValue" json:"defaultValue"`
 	Value        interface{} `jsbind:"value"        json:"value,omitempty"`
 	Option       interface{} `jsbind:"option"       json:"option,omitempty"`
@@ -91,6 +93,11 @@ func (i *ConfigItem) UnmarshalJSON(data []byte) error {
 	}
 	if err := json.Unmarshal(raw["description"], &i.Description); err != nil {
 		return fmt.Errorf("ConfigItem (%s): unmarshal 'description' failed as %w", i.Key, err)
+	}
+	if v, ok := raw["group"]; ok {
+		if err := json.Unmarshal(v, &i.Group); err != nil {
+			return fmt.Errorf("ConfigItem (%s): unmarshal 'group' failed as %w", i.Key, err)
+		}
 	}
 	if v, ok := raw["deprecated"]; ok {
 		if err := json.Unmarshal(v, &i.Deprecated); err != nil {
@@ -227,11 +234,21 @@ func (cm *ConfigManager) RegisterPluginConfig(pluginName string, configItems ...
 		for _, newItem := range configItems {
 			// if isValidType(newItem.Type) {
 			if existingItem, itemExists := existingPlugin.Configs[newItem.Key]; itemExists {
+				typeChanged := newItem.Type != "" && existingItem.Type != newItem.Type
+				if newItem.Type != "" {
+					existingItem.Type = newItem.Type
+				}
+				if newItem.Group != "" {
+					existingItem.Group = newItem.Group
+				}
 				existingItem.DefaultValue = newItem.DefaultValue
 				existingItem.Option = newItem.Option
 				existingItem.Description = newItem.Description
 				existingItem.Deprecated = false // Reset deprecated flag
 				existingItem.task = newItem.task
+				if typeChanged {
+					existingItem.Value = newItem.DefaultValue
+				}
 				existingPlugin.Configs[newItem.Key] = existingItem
 				// Extension can reorder config by re-registering it
 				// Time complexity of removing the old position is O(1) if the order doesn't change
@@ -811,7 +828,7 @@ func setupBaseTextTemplate(d *Dice) {
 				{"余烬核心", 1},
 			},
 			"骰子帮助文本": {
-				{"余烬核心 {常量:VERSION}\n官方群: 1084726031\n========\n.help 骰点/骰主/协议/娱乐/跑团/扩展/查询/其他\n========\n只是余烬罢了", 1},
+				{"余烬核心 {常量:VERSION} {常量:ARCH}\n官方群: 1084726031\n========\n.help 骰点/骰主/协议/娱乐/跑团/扩展/查询/其他\n========\n只是余烬罢了", 1},
 			},
 			"骰子帮助文本_骰主": {
 				{"骰主很神秘，什么都没有说——", 1},
@@ -849,8 +866,8 @@ func setupBaseTextTemplate(d *Dice) {
 			"骰子保存设置": {
 				{"数据已保存", 1},
 			},
-			"骰子状态附加文本": {
-				{"供职于{$t供职群数}个群，其中{$t启用群数}个处于开启状态。{$t群内工作状态}", 1},
+			"骰子状态文本": {
+				{"{常量:APPNAME} {常量:VERSION} {常量:ARCH}\n供职于{$t供职群数}个群，其中{$t启用群数}个处于开启状态。{$t群内工作状态}", 1},
 			},
 			// -------------------- roll --------------------------
 			"骰点_原因": {
@@ -1578,7 +1595,7 @@ func setupBaseTextTemplate(d *Dice) {
 			"骰子保存设置": {
 				SubType: ".bot save",
 			},
-			"骰子状态附加文本": {
+			"骰子状态文本": {
 				SubType: ".bot about",
 				Vars:    []string{"$t供职群数", "$t启用群数", "$t群内工作状态", "$t群内工作状态_仅状态"},
 			},
@@ -2056,11 +2073,23 @@ func migrateHelpTextKey(d *Dice) bool {
 	if !oldExists || len(oldVal) == 0 {
 		return false
 	}
-	if _, newExists := coreTexts[newKey]; newExists {
-		delete(coreTexts, oldKey)
-		return true
+	// 迁移时优先保留旧键内容，避免被预设新键默认值覆盖
+	coreTexts[newKey] = oldVal
+	delete(coreTexts, oldKey)
+	return true
+}
+
+func migrateCoreTextKey(d *Dice, oldKey string, newKey string) bool {
+	coreTexts, exists := d.TextMapRaw["核心"]
+	if !exists || coreTexts == nil {
+		return false
 	}
 
+	oldVal, oldExists := coreTexts[oldKey]
+	if !oldExists || len(oldVal) == 0 {
+		return false
+	}
+	// 迁移时优先保留旧键内容，避免被预设新键默认值覆盖
 	coreTexts[newKey] = oldVal
 	delete(coreTexts, oldKey)
 	return true
@@ -2074,6 +2103,12 @@ func setupTextTemplate(d *Dice) {
 	loadTextTemplate(d, "configs/text-template.yaml")
 	if migrateHelpTextKey(d) {
 		d.Logger.Info("检测到旧文案键“核心:骰子帮助文本_附加说明”，已自动迁移为“核心:骰子帮助文本”")
+	}
+	if migrateCoreTextKey(d, "骰子状态附加文本", "骰子状态文本") {
+		d.Logger.Info("检测到旧文案键“核心:骰子状态附加文本”，已自动迁移为“核心:骰子状态文本”")
+	}
+	if migrateCoreTextKey(d, "投掷状态附加文本", "骰子状态文本") {
+		d.Logger.Info("检测到旧文案键“核心:投掷状态附加文本”，已自动迁移为“核心:骰子状态文本”")
 	}
 
 	d.SaveText()
@@ -2101,6 +2136,9 @@ func (d *Dice) GenerateTextMap() {
 
 	picker, _ = wr.NewChooser(wr.Choice{Item: VERSION.String(), Weight: 1})
 	newTextMap["常量:VERSION"] = picker
+
+	picker, _ = wr.NewChooser(wr.Choice{Item: runtime.GOARCH, Weight: 1})
+	newTextMap["常量:ARCH"] = picker
 
 	d.TextMap = newTextMap
 }
@@ -2143,6 +2181,7 @@ func getNumVal(i interface{}) uint {
 
 func (d *Dice) loads() {
 	config := NewConfig(d)
+	missingPlatformConfigInServe := false
 	data, err := os.ReadFile(filepath.Join(d.BaseConfig.DataDir, "serve.yaml"))
 	if err == nil { //nolint:nestif
 		err3 := config.LoadYamlConfig(data)
@@ -2158,7 +2197,7 @@ func (d *Dice) loads() {
 			d.Logger.Error("serve.yaml parse failed")
 			panic(err2)
 		}
-		d.ImSession.EndPoints = dNew.ImSession.EndPoints
+		missingPlatformConfigInServe = d.loadIMSessionEndpoints(dNew.ImSession)
 		d.DiceMasters = dNew.DiceMasters
 		if len(d.DiceMasters) == 0 {
 			d.DiceMasters = DefaultConfig.DiceMasters
@@ -2376,8 +2415,9 @@ func (d *Dice) loads() {
 		i.Session = d.ImSession
 		i.AdapterSetup()
 	}
+	d.warnIfNoPlatformEndpoint(missingPlatformConfigInServe)
 
-	d.LogWriter.LogLimit = int(d.Config.UILogLimit)
+	d.LogWriter.SetLogLimit(int(d.Config.UILogLimit))
 
 	// 设置扩展选项（新扩展激活采用延迟模式）
 	d.ApplyExtDefaultSettings()
@@ -2387,6 +2427,28 @@ func (d *Dice) loads() {
 	d.MarkModified()
 }
 
+func (d *Dice) loadIMSessionEndpoints(imSession *IMSession) bool {
+	if imSession == nil || imSession.EndPoints == nil {
+		d.ImSession.EndPoints = make([]*EndPointInfo, 0)
+		return true
+	}
+
+	d.ImSession.EndPoints = imSession.EndPoints
+	return false
+}
+
+func (d *Dice) warnIfNoPlatformEndpoint(missingPlatformConfigInServe bool) {
+	if len(d.ImSession.EndPoints) != 0 {
+		return
+	}
+
+	if missingPlatformConfigInServe {
+		d.Logger.Warn("serve.yaml 中未找到平台账号配置，海豹将不会连接聊天平台。请检查 serve.yaml，或在界面中重新添加账号。")
+		return
+	}
+
+	d.Logger.Warn("当前没有可用的平台账号，海豹将不会连接聊天平台，也无法收发消息。请检查账号设置或 serve.yaml 配置。")
+}
 func (d *Dice) loadAdvanced() {
 	d.Logger.Info("开始读取 advanced.yaml")
 	advancedConfig := AdvancedConfig{
@@ -2422,7 +2484,7 @@ func (d *Dice) SaveText() {
 		// ioutil.WriteFile(filepath.Join(d.BaseConfig.DataDir, "configs/text-template.yaml"), buf, 0644)
 		current, err := os.ReadFile(newFn)
 		if err != nil {
-			_ = os.WriteFile(bakFn, current, 0o644)
+			_ = os.WriteFile(bakFn, current, 0o644) //nolint:gosec
 		}
 
 		_ = os.WriteFile(newFn, buf, 0o644)

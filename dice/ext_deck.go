@@ -5,10 +5,13 @@ package dice
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -26,6 +29,21 @@ import (
 	"github.com/tailscale/hujson"
 	"gopkg.in/yaml.v3"
 )
+
+const (
+	deckParseCacheDir        = "./data/.cache/decks"
+	deckParseCacheVersion    = 1
+	deckParseSchemaVersion   = 1
+	deckParseCacheFileSuffix = ".gob.zst"
+)
+
+type deckParseCache struct {
+	Version       int      `json:"version"`
+	SchemaVersion int      `json:"schemaVersion"`
+	Size          int64    `json:"size"`
+	ModTime       int64    `json:"modTime"`
+	DeckInfo      DeckInfo `json:"deckInfo"`
+}
 
 type DeckDiceEFormat struct {
 	Title      []string `json:"_title"`
@@ -413,13 +431,74 @@ func isPrefixWithUtf8Bom(buf []byte) bool {
 	return len(buf) >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF
 }
 
+func deckParseCachePath(fn string) string {
+	sum := sha256.Sum256([]byte(filepath.ToSlash(fn)))
+	return filepath.Join(deckParseCacheDir, hex.EncodeToString(sum[:])+deckParseCacheFileSuffix)
+}
+
+func loadDeckParseCache(fn string, st fs.FileInfo) (*DeckInfo, bool) {
+	if st == nil {
+		return nil, false
+	}
+	cachePath := deckParseCachePath(fn)
+	var cache deckParseCache
+	if err := loadGobCacheFile(cachePath, &cache); err != nil {
+		return nil, false
+	}
+	if cache.Version != deckParseCacheVersion || cache.SchemaVersion != deckParseSchemaVersion {
+		return nil, false
+	}
+	if cache.Size != st.Size() || cache.ModTime != st.ModTime().Unix() {
+		return nil, false
+	}
+	return &cache.DeckInfo, true
+}
+
+func saveDeckParseCache(fn string, st fs.FileInfo, deckInfo *DeckInfo) {
+	if st == nil || deckInfo == nil || !deckInfo.Enable {
+		return
+	}
+	cache := &deckParseCache{
+		Version:       deckParseCacheVersion,
+		SchemaVersion: deckParseSchemaVersion,
+		Size:          st.Size(),
+		ModTime:       st.ModTime().Unix(),
+		DeckInfo:      *deckInfo,
+	}
+	cachePath := deckParseCachePath(fn)
+	_ = saveGobCacheFile(cachePath, cache)
+}
+
 func DeckTryParse(d *Dice, fn string) {
-	content, err := os.ReadFile(fn)
-	if err != nil {
+	st, statErr := os.Stat(fn)
+	if statErr != nil {
 		d.Logger.Infof("牌堆文件“%s”加载失败", fn)
 		return
 	}
+
 	deckInfo := new(DeckInfo)
+
+	if cached, ok := loadDeckParseCache(fn, st); ok {
+		*deckInfo = *cached
+	} else {
+		content, err := os.ReadFile(fn)
+		if err != nil {
+			d.Logger.Infof("牌堆文件“%s”加载失败", fn)
+			return
+		}
+		if deckInfo.DeckItems == nil {
+			deckInfo.DeckItems = map[string][]string{}
+		}
+		if deckInfo.Command == nil {
+			deckInfo.Command = map[string]bool{}
+		}
+		if deckInfo.CloudDeckItemInfos == nil {
+			deckInfo.CloudDeckItemInfos = map[string]*CloudDeckItemInfo{}
+		}
+		_ = parseDeck(d, fn, content, deckInfo)
+		saveDeckParseCache(fn, st, deckInfo)
+	}
+
 	if deckInfo.DeckItems == nil {
 		deckInfo.DeckItems = map[string][]string{}
 	}
@@ -429,7 +508,7 @@ func DeckTryParse(d *Dice, fn string) {
 	if deckInfo.CloudDeckItemInfos == nil {
 		deckInfo.CloudDeckItemInfos = map[string]*CloudDeckItemInfo{}
 	}
-	_ = parseDeck(d, fn, content, deckInfo)
+
 	deckInfo.Filename = fn
 
 	if deckInfo.Name == "" {
@@ -1013,15 +1092,11 @@ func executeDeck(ctx *MsgContext, deckInfo *DeckInfo, deckName string, shufflePo
 		if len(deckGroup) == 0 {
 			return "", errors.New("牌组为空，请检查格式是否正确")
 		}
-		if ctx.DeckPools[deckInfo][deckName] == nil {
-			ctx.DeckPools[deckInfo][deckName] = DeckToShuffleRandomPool(deckGroup)
-		}
-
-		if len(ctx.DeckPools[deckInfo][deckName].data) == 0 {
-			ctx.DeckPools[deckInfo][deckName] = DeckToShuffleRandomPool(deckGroup)
-		}
-
 		pool = ctx.DeckPools[deckInfo][deckName]
+		if pool == nil || len(pool.data) == 0 {
+			pool = DeckToShuffleRandomPool(deckGroup)
+			ctx.DeckPools[deckInfo][deckName] = pool
+		}
 		if pool == nil {
 			return "", errors.New("牌组为空，可能尚未加载完成")
 		}
@@ -1079,21 +1154,66 @@ func getDeckGroup(deckInfo *DeckInfo, deckName string) (deckGroup []string) {
 }
 
 func extractWeight(s string) (uint, string) {
-	weight := int64(1)
-	re := regexp.MustCompile(`^::(\d+)::`)
-	m := re.FindStringSubmatch(s)
+	weight := int64(100)
+	m := deckWeightPrefixRe.FindStringSubmatch(s)
 	if m != nil {
-		weight, _ = strconv.ParseInt(m[1], 10, 64)
+		value, err := strconv.ParseFloat(m[1], 64)
+		if err == nil {
+			// 权重允许浮点，统一按四舍五入到小数点后两位后参与计算。
+			scaled := math.Round(value * 100)
+			if math.IsNaN(scaled) || math.IsInf(scaled, 0) {
+				scaled = 0
+			}
+			if scaled > float64(math.MaxInt64) {
+				scaled = float64(math.MaxInt64)
+			}
+			weight = int64(scaled)
+			if weight < 0 {
+				weight = 0
+			}
+		}
 		s = s[len(m[0]):]
 	}
 	return uint(weight), s
 }
 
-func DeckToRandomPool(deck []string) *wr.Chooser {
-	choices := []wr.Choice{}
-	for _, i := range deck {
-		weight, text := extractWeight(i)
+func gcdUint(a, b uint) uint {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+func buildNormalizedWeightedChoices(deck []string) []wr.Choice {
+	choices := make([]wr.Choice, 0, len(deck))
+	var divisor uint
+	for _, item := range deck {
+		weight, text := extractWeight(item)
+		if weight == 0 {
+			continue
+		}
+		if divisor == 0 {
+			divisor = weight
+		} else {
+			divisor = gcdUint(divisor, weight)
+		}
 		choices = append(choices, wr.Choice{Item: text, Weight: weight})
+	}
+	if len(choices) == 0 {
+		return nil
+	}
+	if divisor > 1 {
+		for i := range choices {
+			choices[i].Weight /= divisor
+		}
+	}
+	return choices
+}
+
+func DeckToRandomPool(deck []string) *wr.Chooser {
+	choices := buildNormalizedWeightedChoices(deck)
+	if len(choices) == 0 {
+		return nil
 	}
 	randomPool, _ := wr.NewChooser(choices...)
 	return randomPool
@@ -1130,6 +1250,7 @@ func NewChooser(choices ...wr.Choice) (*ShuffleRandomPool, error) {
 }
 
 var randSourceDrawAndTmplSelect = rand.New(rand.NewSource(time.Now().UnixMilli()))
+var deckWeightPrefixRe = regexp.MustCompile(`^::([+-]?\d+(?:\.\d+)?)::`)
 
 // Pick returns a single weighted random Choice.Item from the Chooser.
 //
@@ -1161,10 +1282,9 @@ func searchInts(a []int, x int) int {
 }
 
 func DeckToShuffleRandomPool(deck []string) *ShuffleRandomPool {
-	var choices []wr.Choice
-	for _, i := range deck {
-		weight, text := extractWeight(i)
-		choices = append(choices, wr.Choice{Item: text, Weight: weight})
+	choices := buildNormalizedWeightedChoices(deck)
+	if len(choices) == 0 {
+		return nil
 	}
 	randomPool, _ := NewChooser(choices...)
 	return randomPool
@@ -1258,7 +1378,19 @@ func (d *Dice) DeckUpdate(deckInfo *DeckInfo, tempFileName string) error {
 		return errors.New("无法解析获取到的牌堆数据")
 	}
 
-	err = os.WriteFile(deckInfo.Filename, newData, 0755)
+	// 更新牌堆，验证文件路径在牌堆目录内以防止路径穿越
+	decksDirAbs, err := filepath.Abs("data/decks")
+	if err != nil {
+		return fmt.Errorf("获取牌堆目录绝对路径失败: %w", err)
+	}
+	filenameAbs, err := filepath.Abs(deckInfo.Filename)
+	if err != nil {
+		return fmt.Errorf("获取牌堆文件绝对路径失败: %w", err)
+	}
+	if !strings.HasPrefix(filenameAbs, decksDirAbs+string(filepath.Separator)) {
+		return fmt.Errorf("deck filename %q is outside decks directory", deckInfo.Filename)
+	}
+	err = os.WriteFile(filenameAbs, newData, 0755) //nolint:gosec
 	if err != nil {
 		d.Logger.Errorf("牌堆“%s”更新时保存文件出错，%s", deckInfo.Name, err.Error())
 		return err

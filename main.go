@@ -48,7 +48,9 @@ data/logs
 extensions/
 */
 
-var sealLock = flock.New("Scardice-lock.lock")
+// LockFileName can be overridden via -ldflags "-X main.LockFileName=...".
+var LockFileName = "Scardice-lock.lock"
+var sealLock = flock.New(LockFileName)
 
 func cleanupCreate(diceManager *dice.DiceManager, extraCleanup func()) func() {
 	return func() {

@@ -1,7 +1,6 @@
 package dice
 
 import (
-	"encoding/gob"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,7 +20,7 @@ type NamesGenerator struct {
 
 const (
 	namesCacheDir      = "./data/.cache/names"
-	namesCacheFilename = "names_cache.gob"
+	namesCacheFilename = "names_cache.gob.zst"
 	namesCacheVersion  = 1
 )
 
@@ -62,7 +61,7 @@ func (ng *NamesGenerator) Load() {
 			columns, err := f.Cols(sheetName)
 			if err == nil {
 				for columns.Next() {
-					column, _ := columns.Rows()
+					column, _ := columns.Rows(excelize.Options{RawCellValue: true})
 					if len(column) > 0 {
 						// 首行为标题，如“男性名” 其他行为内容，如”济民 珍祥“
 						name := column[0]
@@ -93,14 +92,8 @@ func (ng *NamesGenerator) Load() {
 
 func loadNamesCache(files []string) (map[string]map[string][]string, bool) {
 	cachePath := filepath.Join(namesCacheDir, namesCacheFilename)
-	f, err := os.Open(cachePath)
-	if err != nil {
-		return nil, false
-	}
-	defer f.Close()
 	var cache namesCache
-	dec := gob.NewDecoder(f)
-	if err2 := dec.Decode(&cache); err2 != nil {
+	if err := loadGobCacheFile(cachePath, &cache); err != nil {
 		return nil, false
 	}
 	if cache.Version != namesCacheVersion {
@@ -130,22 +123,7 @@ func saveNamesCache(files []string, names map[string]map[string][]string) error 
 		NamesInfo: names,
 	}
 	cachePath := filepath.Join(namesCacheDir, namesCacheFilename)
-	tmpPath := cachePath + ".tmp"
-	f, err := os.Create(tmpPath)
-	if err != nil {
-		return err
-	}
-	enc := gob.NewEncoder(f)
-	if err := enc.Encode(&cache); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	return os.Rename(tmpPath, cachePath)
+	return saveGobCacheFile(cachePath, &cache)
 }
 
 func collectNamesFiles(files []string) ([]namesCacheFileInfo, error) {

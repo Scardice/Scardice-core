@@ -13,9 +13,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
+	"github.com/dop251/goja"
 	"github.com/dop251/goja_nodejs/eventloop"
 	"github.com/go-creed/sat"
 	wr "github.com/mroth/weightedrand"
@@ -49,7 +51,8 @@ type CmdItemInfo struct {
 
 	IsJsSolveFunc bool
 	JSLoopVersion int64                                                                  // Loop版本号
-	Solve         func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult `jsbind:"solve"`
+	Solve         func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult
+	SolveRaw      func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) goja.Value `jsbind:"solve"`
 
 	Raw                bool `jsbind:"raw"`                // 高级模式。默认模式下行为是：需要在当前群/私聊开启，或@自己时生效(需要为第一个@目标)
 	CheckCurrentBotOn  bool `jsbind:"checkCurrentBotOn"`  // 是否检查当前可用状况，包括群内可用和是私聊两种方式，如失败不进入solve
@@ -93,8 +96,9 @@ type ExtInfo struct {
 	// 定时任务列表，用于避免 task 失去引用
 	taskList []*JsScriptTask `json:"-" yaml:"-"`
 
-	OnNotCommandReceived func(ctx *MsgContext, msg *Message)                        `jsbind:"onNotCommandReceived" json:"-" yaml:"-"` // 指令过滤后剩下的
-	OnCommandOverride    func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) bool `json:"-"                      yaml:"-"`          // 覆盖指令行为
+	OnNotCommandReceived func(ctx *MsgContext, msg *Message)                        `jsbind:"onNotCommandReceived" json:"-" yaml:"-"`                      // 指令过滤后剩下的
+	OnCommandOverride    func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) bool `jsbind:"onCommandOverride"    json:"-"                      yaml:"-"` // 覆盖指令行为
+	// NOTE(lyjjl): 尚不清楚海豹开发组为什么禁用这个 API
 
 	OnCommandReceived   func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) `jsbind:"onCommandReceived"   json:"-" yaml:"-"`
 	OnMessageReceived   func(ctx *MsgContext, msg *Message)                   `jsbind:"onMessageReceived"   json:"-" yaml:"-"`
@@ -460,7 +464,7 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 							now := time.Now().Unix()
 
 							// 上次被人使用小于60s
-							if now-groupInfo.RecentDiceSendTime < 60 {
+							if now-atomic.LoadInt64(&groupInfo.RecentDiceSendTime) < 60 {
 								// 在群内存在，且开启时，且不在刷新CD中
 								if groupInfo.DiceIDExistsMap.Exists(diceID) && groupInfo.DiceIDActiveMap.Exists(diceID) && d.Parent.ShouldRefreshGroupInfo(key) {
 									i.Adapter.GetGroupInfoAsync(key)
@@ -666,6 +670,7 @@ func (d *Dice) ExtFind(s string, fromJS bool) *ExtInfo {
 				EnableExecuteTimesParse: info.EnableExecuteTimesParse,
 				IsJsSolveFunc:           info.IsJsSolveFunc,
 				Solve:                   info.Solve,
+				SolveRaw:                info.SolveRaw,
 				Raw:                     info.Raw,
 				CheckCurrentBotOn:       info.CheckCurrentBotOn,
 				CheckMentionOthers:      info.CheckMentionOthers,
@@ -940,6 +945,13 @@ func (d *Dice) ResetQuitInactiveCron() {
 
 func (d *Dice) PublicDiceEndpointRefresh() {
 	cfg := &d.Config.PublicDiceConfig
+	if !cfg.Enable {
+		return
+	}
+	if strings.TrimSpace(cfg.ID) == "" {
+		d.logPublicDiceStatus("端点更新跳过：缺少公骰ID", 400)
+		return
+	}
 
 	var endpointItems []*public_dice.Endpoint
 	for _, i := range d.ImSession.EndPoints {
@@ -952,41 +964,75 @@ func (d *Dice) PublicDiceEndpointRefresh() {
 			IsOnline: i.State == 1,
 		})
 	}
-
-	_, code := d.PublicDice.EndpointUpdate(&public_dice.EndpointUpdateRequest{
+	req := &public_dice.EndpointUpdateRequest{
 		DiceID:    cfg.ID,
 		Endpoints: endpointItems,
-	}, nil)
+	}
+
+	_, code := d.PublicDice.EndpointUpdate(req, GenerateVerificationKeyForPublicDice)
 	if code != 200 {
-		d.Logger.Warn("[公骰]无法通过服务器校验，不再进行更新")
+		d.logPublicDiceStatus("端点更新失败", code)
 		return
 	}
 }
 
-func (d *Dice) PublicDiceInfoRegister() {
+func (d *Dice) PublicDiceInfoRegister() bool {
 	cfg := &d.Config.PublicDiceConfig
-	pd, code := d.PublicDice.Register(&public_dice.RegisterRequest{
+	if !cfg.Enable {
+		return false
+	}
+	oldID := cfg.ID
+	req := &public_dice.RegisterRequest{
 		ID:    cfg.ID,
 		Name:  cfg.Name,
 		Brief: cfg.Brief,
 		Note:  cfg.Note,
-	}, nil)
+		// Avatar: cfg.Avatar, // NOTE(lyjjl): 尚不确定服务端是否支持
+	}
+	pd, code := d.PublicDice.Register(req, GenerateVerificationKeyForPublicDice)
 	if code != 200 {
-		d.Logger.Warn("[公骰]无法通过服务器校验，不再进行骰号注册")
-		return
+		d.logPublicDiceStatus("骰号注册失败", code)
+		return false
 	}
 	// ID为空时才将注册好的ID覆写配置
 	if pd.Item.ID != "" && cfg.ID == "" {
 		cfg.ID = pd.Item.ID
+		d.MarkModified()
+		d.Save(false)
+		d.Logger.Infof("[公骰]已自动注册并写入公骰ID: %s", cfg.ID)
+	} else if oldID != cfg.ID {
+		d.MarkModified()
+		d.Save(false)
 	}
+	return true
 }
 
 func (d *Dice) PublicDiceSetupTick() {
 	cfg := &d.Config.PublicDiceConfig
+	if !cfg.Enable {
+		if d.PublicDiceTimerId != 0 {
+			d.Cron.Remove(d.PublicDiceTimerId)
+			d.PublicDiceTimerId = 0
+		}
+		return
+	}
+	if strings.TrimSpace(cfg.ID) == "" {
+		if d.PublicDiceTimerId != 0 {
+			d.Cron.Remove(d.PublicDiceTimerId)
+			d.PublicDiceTimerId = 0
+		}
+		d.logPublicDiceStatus("心跳更新跳过：缺少公骰ID", 400)
+		return
+	}
 
 	doTickUpdate := func() {
 		if !cfg.Enable {
 			d.Cron.Remove(d.PublicDiceTimerId)
+			d.PublicDiceTimerId = 0
+			return
+		}
+		if strings.TrimSpace(cfg.ID) == "" {
+			d.logPublicDiceStatus("心跳更新跳过：缺少公骰ID", 400)
 			return
 		}
 		var tickEndpointItems []*public_dice.TickEndpoint
@@ -999,10 +1045,14 @@ func (d *Dice) PublicDiceSetupTick() {
 				IsOnline: i.State == 1,
 			})
 		}
-		d.PublicDice.TickUpdate(&public_dice.TickUpdateRequest{
+		req := &public_dice.TickUpdateRequest{
 			ID:        cfg.ID,
 			Endpoints: tickEndpointItems,
-		}, nil)
+		}
+		_, code := d.PublicDice.TickUpdate(req, GenerateVerificationKeyForPublicDice)
+		if code != 200 {
+			d.logPublicDiceStatus("心跳更新失败", code)
+		}
 	}
 
 	if d.PublicDiceTimerId != 0 {
@@ -1025,9 +1075,41 @@ func (d *Dice) PublicDiceSetup() {
 	if !cfg.Enable {
 		return
 	}
-	d.PublicDiceInfoRegister()
+	if !d.PublicDiceInfoRegister() {
+		d.PublicDiceSetupTick()
+		return
+	}
 	d.PublicDiceEndpointRefresh()
 	d.PublicDiceSetupTick()
+}
+
+func publicDiceStatusReason(code int) string {
+	switch {
+	case code == 0:
+		return "网络错误或请求未到达服务端"
+	case code == 400:
+		return "请求参数不合法"
+	case code == 401:
+		return "鉴权失败（未授权）"
+	case code == 403:
+		return "鉴权失败（无权限）"
+	case code == 404:
+		return "接口不存在或路径错误"
+	case code == 409:
+		return "资源冲突（可能ID冲突）"
+	case code == 429:
+		return "请求过于频繁（限流）"
+	case code >= 500:
+		return "服务端错误"
+	case code >= 200 && code < 300:
+		return "成功"
+	default:
+		return "未知错误"
+	}
+}
+
+func (d *Dice) logPublicDiceStatus(action string, code int) {
+	d.Logger.Warnf("[公骰]%s: status=%d, reason=%s", action, code, publicDiceStatusReason(code))
 }
 
 func (d *Dice) StoreSetup() {

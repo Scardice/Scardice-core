@@ -17,7 +17,10 @@ func ReadPublicKey[T any](publicKey string) *T {
 	if err != nil {
 		return nil
 	}
-	key := publicKeyInterface.(*T)
+	key, ok := publicKeyInterface.(*T)
+	if !ok {
+		return nil
+	}
 	return key
 }
 
@@ -40,6 +43,9 @@ func ReadPrivateKey[T any](privateKey string) *T {
 	if err != nil {
 		return nil
 	}
-	key := privateKeyInterface.(*T)
+	key, ok := privateKeyInterface.(*T)
+	if !ok {
+		return nil
+	}
 	return key
 }

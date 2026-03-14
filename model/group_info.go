@@ -29,8 +29,11 @@ type GroupPlayerInfoBase struct {
 	// 非数据库信息
 	RateLimiter *rate.Limiter `gorm:"-" yaml:"-"` // 限速器
 	// 非数据库信息
-	RateLimitWarned     bool   `gorm:"-"                             yaml:"-"`                                                // 是否已经警告过限速
-	AutoSetNameTemplate string `gorm:"column:auto_set_name_template" jsbind:"autoSetNameTemplate" yaml:"autoSetNameTemplate"` // 名片模板
+	RateLimitWarned      bool   `gorm:"-"                             yaml:"-"`                                                // 是否已经警告过限速
+	SpamLastCommand      string `gorm:"-"                             yaml:"-"`                                                // 最近一次用于刷屏检测的指令名
+	SpamLastCommandAt    int64  `gorm:"-"                             yaml:"-"`                                                // 最近一次用于刷屏检测的指令时间
+	SpamSameCommandCount int    `gorm:"-"                             yaml:"-"`                                                // 连续相同指令计数
+	AutoSetNameTemplate  string `gorm:"column:auto_set_name_template" jsbind:"autoSetNameTemplate" yaml:"autoSetNameTemplate"` // 名片模板
 
 	// level int 权限
 	DiceSideNum int `gorm:"column:dice_side_num" yaml:"diceSideNum"` // 面数，为0时等同于d100
