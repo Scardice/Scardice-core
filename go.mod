@@ -78,6 +78,7 @@ require (
 	github.com/tidwall/buntdb v1.3.2
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5
+	github.com/vmihailenco/msgpack v4.0.4+incompatible
 	github.com/xuri/excelize/v2 v2.10.0
 	github.com/yuin/goldmark v1.7.13
 	go.etcd.io/bbolt v1.4.3
