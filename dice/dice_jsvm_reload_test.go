@@ -25,25 +25,25 @@ func TestShouldQuickJSSoftResetOnReload(t *testing.T) {
 			want:            false,
 		},
 		{
-			name:            "switch_from_quickjs_to_goja",
-			configEngine:    "goja",
+			name:            "config_not_quickjs",
+			configEngine:    "legacy",
 			effectiveEngine: "quickjs",
 			hasScriptEngine: true,
 			want:            false,
 		},
 		{
-			name:            "quickjs_config_but_effective_goja",
+			name:            "quickjs_config_but_effective_empty",
 			configEngine:    "quickjs",
-			effectiveEngine: "goja",
+			effectiveEngine: "",
 			hasScriptEngine: true,
 			want:            false,
 		},
 		{
-			name:            "empty_config_defaults_to_goja",
+			name:            "empty_config_defaults_to_quickjs",
 			configEngine:    "",
 			effectiveEngine: "quickjs",
 			hasScriptEngine: true,
-			want:            false,
+			want:            true,
 		},
 	}
 

@@ -4,22 +4,16 @@ package quickjs
 
 import (
 	"bytes"
-	"crypto/md5"
 	"crypto/rand"
-	"crypto/sha1"
-	"crypto/sha256"
-	"crypto/sha512"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,7 +23,6 @@ import (
 	sealcrypto "Scardice-core/utils/plugin/crypto"
 
 	bq "github.com/buke/quickjs-go"
-	"github.com/dop251/goja"
 	"github.com/gorilla/websocket"
 )
 
@@ -56,17 +49,16 @@ type nativeBackend struct {
 	deferredCallbacksMu    sync.Mutex
 	deferredCallbacks      []deferredExtCallback
 
-	httpClient *http.Client
-	wsMu       sync.Mutex
-	wsSeq      int64
-	wsConns    map[int64]*wsBridgeConn
+	httpClient  *http.Client
+	cryptoStore *sealcrypto.KeyStore
+
+	wsMu    sync.Mutex
+	wsSeq   int64
+	wsConns map[int64]*wsBridgeConn
 
 	// WebSocket 后台泵：提升空闲期事件实时性。
 	wsPumpStop chan struct{}
 	wsPumpDone chan struct{}
-
-	cryptoBridgeMu sync.Mutex
-	cryptoBridge   *goja.Runtime
 }
 
 type deferredExtCallback struct {
@@ -111,166 +103,15 @@ func newNativeBackend(cfg jsengine.Config, opt Options) (*nativeBackend, error) 
 		apis:          make([]jsengine.HostAPI, 0, 8),
 		runtimeValues: map[string]any{},
 		httpClient:    &http.Client{Timeout: 30 * time.Second},
+		cryptoStore:   sealcrypto.NewKeyStore(),
 		wsConns:       map[int64]*wsBridgeConn{},
 		wsPumpStop:    make(chan struct{}),
 		wsPumpDone:    make(chan struct{}),
 	}
 	n.installBaseGlobals()
-	if err := n.initCryptoBridge(); err != nil {
-		if n.ctx != nil {
-			n.ctx.Close()
-			n.ctx = nil
-		}
-		if n.runtime != nil {
-			n.runtime.Close()
-			n.runtime = nil
-		}
-		return nil, err
-	}
 	_ = n.evalGlobalLocked(quickJSPolyfillScript)
 	n.startWSPump()
 	return n, nil
-}
-
-func (n *nativeBackend) initCryptoBridge() error {
-	rt := goja.New()
-	sealcrypto.Enable(rt)
-	initScript := `(function(){
-if (globalThis.__sd_crypto_bridge_ready) return;
-globalThis.__sd_bridge_key_store = new Map();
-globalThis.__sd_bridge_key_seq = 1;
-globalThis.__sd_crypto_bridge_encode = function(v) {
-  if (v instanceof ArrayBuffer) return {t:"bin", v:Array.from(new Uint8Array(v))};
-  if (ArrayBuffer.isView(v)) return {t:"bin", v:Array.from(new Uint8Array(v.buffer, v.byteOffset, v.byteLength))};
-  if (v && typeof v === "object" && typeof v.type === "string" && v.algorithm && Array.isArray(v.usages)) {
-    let id = v.__sd_bridge_id;
-    if (!id) {
-      id = "k" + (globalThis.__sd_bridge_key_seq++);
-      try { Object.defineProperty(v, "__sd_bridge_id", {value:id, configurable:true}); } catch (_e) { v.__sd_bridge_id = id; }
-    }
-    globalThis.__sd_bridge_key_store.set(id, v);
-    return {t:"key", v:{id:id, type:v.type, extractable:!!v.extractable, algorithm:v.algorithm, usages:v.usages}};
-  }
-  if (Array.isArray(v)) return {t:"arr", v:v.map(globalThis.__sd_crypto_bridge_encode)};
-  if (v && typeof v === "object") {
-    const out = {};
-    for (const k of Object.keys(v)) out[k] = globalThis.__sd_crypto_bridge_encode(v[k]);
-    return {t:"obj", v:out};
-  }
-  return {t:"prim", v:v};
-};
-globalThis.__sd_crypto_bridge_decode = function(node) {
-  if (!node || typeof node !== "object") return node;
-  switch (node.t) {
-    case "bin": return new Uint8Array(Array.isArray(node.v) ? node.v : []);
-    case "key": {
-      const id = node.v && node.v.id ? String(node.v.id) : "";
-      if (!id || !globalThis.__sd_bridge_key_store.has(id)) throw new Error("crypto key not found: " + id);
-      return globalThis.__sd_bridge_key_store.get(id);
-    }
-    case "arr": return (Array.isArray(node.v) ? node.v : []).map(globalThis.__sd_crypto_bridge_decode);
-    case "obj": {
-      const out = {};
-      const src = node.v && typeof node.v === "object" ? node.v : {};
-      for (const k of Object.keys(src)) out[k] = globalThis.__sd_crypto_bridge_decode(src[k]);
-      return out;
-    }
-    default: return node.v;
-  }
-};
-globalThis.__sd_crypto_bridge_call_raw = function(reqJSON) {
-  const req = JSON.parse(String(reqJSON || "{}"));
-  const op = String(req.op || "");
-  const argsNode = Array.isArray(req.args) ? req.args : [];
-  const args = argsNode.map(globalThis.__sd_crypto_bridge_decode);
-  if (op === "randomUUID") return crypto.randomUUID();
-  if (op === "getRandomValues") {
-    const len = Number(args[0] || 0);
-    const arr = new Uint8Array(len);
-    crypto.getRandomValues(arr);
-    return arr;
-  }
-  if (op.startsWith("subtle.")) {
-    const fn = op.slice("subtle.".length);
-    const method = crypto.subtle && crypto.subtle[fn];
-    if (typeof method !== "function") throw new Error("unsupported subtle method: " + fn);
-    return method.apply(crypto.subtle, args);
-  }
-  throw new Error("unsupported op: " + op);
-};
-globalThis.__sd_crypto_bridge_pack = function(v) {
-  return JSON.stringify({ok:true, data:globalThis.__sd_crypto_bridge_encode(v)});
-};
-globalThis.__sd_crypto_bridge_ready = true;
-})();`
-	if _, err := rt.RunString(initScript); err != nil {
-		return fmt.Errorf("初始化 Goja CryptoBridge 失败: %w", err)
-	}
-	n.cryptoBridge = rt
-	return nil
-}
-
-func (n *nativeBackend) cryptoBridgeCall(reqJSON string) (string, error) {
-	n.cryptoBridgeMu.Lock()
-	defer n.cryptoBridgeMu.Unlock()
-	if n.cryptoBridge == nil {
-		return "", errors.New("crypto bridge 未初始化")
-	}
-	start := time.Now()
-	op := ""
-	if req := gjsonGetString(reqJSON, "op"); req != "" {
-		op = req
-	}
-	needTrace := op == "subtle.generateKey" || op == "subtle.encrypt" || op == "subtle.decrypt"
-	if needTrace {
-		log.Printf("[quickjs-crypto-trace] begin op=%s payload_len=%d", op, len(reqJSON))
-	}
-	v, err := n.cryptoBridge.RunString("__sd_crypto_bridge_call_raw(" + strconv.Quote(reqJSON) + ")")
-	if err != nil {
-		if needTrace {
-			log.Printf("[quickjs-crypto-trace] runstring error op=%s cost=%s err=%v", op, time.Since(start), err)
-		}
-		return "", err
-	}
-	valueForPack := v
-	if p, ok := v.Export().(*goja.Promise); ok {
-		switch p.State() {
-		case goja.PromiseStateRejected:
-			err = fmt.Errorf("%v", p.Result())
-			if needTrace {
-				log.Printf("[quickjs-crypto-trace] rejected op=%s cost=%s err=%v", op, time.Since(start), err)
-			}
-			return "", err
-		case goja.PromiseStateFulfilled:
-			valueForPack = p.Result()
-		default:
-			err = errors.New("crypto bridge promise pending")
-			if needTrace {
-				log.Printf("[quickjs-crypto-trace] pending op=%s cost=%s", op, time.Since(start))
-			}
-			return "", err
-		}
-	}
-	packFn, ok := goja.AssertFunction(n.cryptoBridge.Get("__sd_crypto_bridge_pack"))
-	if !ok {
-		err = errors.New("crypto bridge pack function missing")
-		if needTrace {
-			log.Printf("[quickjs-crypto-trace] pack missing op=%s cost=%s", op, time.Since(start))
-		}
-		return "", err
-	}
-	packed, err := packFn(goja.Undefined(), valueForPack)
-	if err != nil {
-		if needTrace {
-			log.Printf("[quickjs-crypto-trace] pack error op=%s cost=%s err=%v", op, time.Since(start), err)
-		}
-		return "", err
-	}
-	out := packed.String()
-	if needTrace {
-		log.Printf("[quickjs-crypto-trace] done op=%s cost=%s resp_len=%d", op, time.Since(start), len(out))
-	}
-	return out, nil
 }
 
 func (n *nativeBackend) startWSPump() {
@@ -407,16 +248,6 @@ func (n *nativeBackend) installBaseGlobals() {
 		}
 		return ctx.String(string(data))
 	}))
-	n.ctx.Globals().Set("__sd_crypto_bridge_call", n.ctx.NewFunction(func(ctx *bq.Context, this *bq.Value, args []*bq.Value) *bq.Value {
-		if len(args) < 1 {
-			return ctx.ThrowError(errors.New("missing crypto request payload"))
-		}
-		out, err := n.cryptoBridgeCall(args[0].ToString())
-		if err != nil {
-			return ctx.ThrowError(err)
-		}
-		return ctx.String(out)
-	}))
 	n.ctx.Globals().Set("__sd_crypto_random_uuid", n.ctx.NewFunction(func(ctx *bq.Context, this *bq.Value, args []*bq.Value) *bq.Value {
 		uuid, err := randomUUID()
 		if err != nil {
@@ -439,37 +270,18 @@ func (n *nativeBackend) installBaseGlobals() {
 		raw, _ := json.Marshal(b)
 		return ctx.String(string(raw))
 	}))
-	n.ctx.Globals().Set("__sd_crypto_subtle_digest", n.ctx.NewFunction(func(ctx *bq.Context, this *bq.Value, args []*bq.Value) *bq.Value {
+	n.ctx.Globals().Set("__sd_crypto_subtle_call", n.ctx.NewFunction(func(ctx *bq.Context, this *bq.Value, args []*bq.Value) *bq.Value {
 		if len(args) < 2 {
-			return ctx.ThrowError(errors.New("missing digest args"))
+			return ctx.ThrowError(errors.New("missing subtle args"))
 		}
-		alg := strings.ToUpper(strings.TrimSpace(args[0].ToString()))
-		var data []byte
-		if err := json.Unmarshal([]byte(args[1].ToString()), &data); err != nil {
+		if n.cryptoStore == nil {
+			n.cryptoStore = sealcrypto.NewKeyStore()
+		}
+		raw, err := n.cryptoStore.CallJSON(args[0].ToString(), args[1].ToString())
+		if err != nil {
 			return ctx.ThrowError(err)
 		}
-		var out []byte
-		switch alg {
-		case "MD5":
-			sum := md5.Sum(data)
-			out = sum[:]
-		case "SHA-1", "SHA1":
-			sum := sha1.Sum(data)
-			out = sum[:]
-		case "SHA-256", "SHA256":
-			sum := sha256.Sum256(data)
-			out = sum[:]
-		case "SHA-384", "SHA384":
-			sum := sha512.Sum384(data)
-			out = sum[:]
-		case "SHA-512", "SHA512":
-			sum := sha512.Sum512(data)
-			out = sum[:]
-		default:
-			return ctx.ThrowError(fmt.Errorf("unsupported digest algorithm: %s", alg))
-		}
-		raw, _ := json.Marshal(out)
-		return ctx.String(string(raw))
+		return ctx.String(raw)
 	}))
 }
 
@@ -614,17 +426,6 @@ func (n *nativeBackend) wsPoll(id int64) string {
 	out := map[string]any{"state": state, "events": ev}
 	b, _ := json.Marshal(out)
 	return string(b)
-}
-
-func gjsonGetString(raw string, key string) string {
-	var m map[string]any
-	if err := json.Unmarshal([]byte(raw), &m); err != nil {
-		return ""
-	}
-	if v, ok := m[key].(string); ok {
-		return v
-	}
-	return ""
 }
 
 func (n *nativeBackend) setRuntimeValue(name string, value any) {
@@ -1275,9 +1076,6 @@ func (n *nativeBackend) Dispose() error {
 		n.runtime.Close()
 		n.runtime = nil
 	}
-	n.cryptoBridgeMu.Lock()
-	n.cryptoBridge = nil
-	n.cryptoBridgeMu.Unlock()
 	return nil
 }
 
@@ -1307,6 +1105,11 @@ func (n *nativeBackend) Quiesce() error {
 	n.runtimeValuesMu.Lock()
 	n.runtimeValues = map[string]any{}
 	n.runtimeValuesMu.Unlock()
+	if n.cryptoStore == nil {
+		n.cryptoStore = sealcrypto.NewKeyStore()
+	} else {
+		n.cryptoStore.Reset()
+	}
 	return nil
 }
 
@@ -1489,20 +1292,45 @@ globalThis.__sd_qjs_crypto_decode = function(node) {
   }
 };
 globalThis.__sd_qjs_crypto_call = function(op, args) {
-  const encArgs = (Array.isArray(args) ? args : []).map(globalThis.__sd_qjs_crypto_encode);
-  const req = JSON.stringify({op:String(op || ''), args:encArgs});
-  const raw = __sd_crypto_bridge_call(req);
-  const resp = JSON.parse(String(raw || '{}'));
-  if (!resp.ok) {
-    throw new Error(String(resp.err || 'crypto bridge failed'));
+  const opText = String(op || '');
+  const callArgs = Array.isArray(args) ? args : [];
+  if (opText === 'randomUUID') {
+    return __sd_crypto_random_uuid();
   }
-  return globalThis.__sd_qjs_crypto_decode(resp.data);
+  if (opText === 'getRandomValues') {
+    const len = Number(callArgs[0] || 0);
+    const raw = __sd_crypto_get_random_bytes(len);
+    const nums = JSON.parse(String(raw || '[]'));
+    return Uint8Array.from(Array.isArray(nums) ? nums : []).buffer;
+  }
+  if (opText.startsWith('subtle.')) {
+    const subtleOp = opText.slice('subtle.'.length);
+    const encodedArgs = callArgs.map((one) => globalThis.__sd_qjs_crypto_encode(one));
+    const raw = __sd_crypto_subtle_call(subtleOp, JSON.stringify(encodedArgs));
+    const node = JSON.parse(String(raw || '{"t":"prim","v":null}'));
+    return globalThis.__sd_qjs_crypto_decode(node);
+  }
+  throw new Error('unsupported subtle method: ' + opText);
 };
 globalThis.crypto.randomUUID = function() {
   return globalThis.__sd_qjs_crypto_call('randomUUID', []);
 };
 globalThis.crypto.getRandomValues = function(target) {
-  if (!target || typeof target.byteLength !== 'number') throw new TypeError('crypto.getRandomValues: invalid target');
+  const ctor = target && target.constructor && typeof target.constructor.name === 'string' ? target.constructor.name : '';
+  const allow = {
+    Int8Array: true,
+    Uint8Array: true,
+    Uint8ClampedArray: true,
+    Int16Array: true,
+    Uint16Array: true,
+    Int32Array: true,
+    Uint32Array: true,
+    BigInt64Array: true,
+    BigUint64Array: true
+  };
+  if (!target || typeof target.byteLength !== 'number' || !allow[ctor]) {
+    throw new TypeError('crypto.getRandomValues: input must be an integer TypedArray');
+  }
   if (target.byteLength > 65536) throw new TypeError('crypto.getRandomValues: byteLength exceeds 65536');
   const buf = globalThis.__sd_qjs_crypto_call('getRandomValues', [Number(target.byteLength)]);
   const arr = new Uint8Array(buf);
@@ -1511,7 +1339,13 @@ globalThis.crypto.getRandomValues = function(target) {
 };
 if (typeof globalThis.crypto.subtle !== 'object' || globalThis.crypto.subtle === null) globalThis.crypto.subtle = {};
 for (const fn of ['digest','generateKey','importKey','exportKey','sign','verify','encrypt','decrypt','deriveBits','deriveKey','wrapKey','unwrapKey']) {
-  globalThis.crypto.subtle[fn] = (...args) => Promise.resolve(globalThis.__sd_qjs_crypto_call('subtle.' + fn, args));
+  globalThis.crypto.subtle[fn] = (...args) => {
+    try {
+      return Promise.resolve(globalThis.__sd_qjs_crypto_call('subtle.' + fn, args));
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  };
 }
 })();`
 
@@ -1612,6 +1446,11 @@ func (n *nativeBackend) Reset() error {
 		close(n.wsPumpStop)
 		<-n.wsPumpDone
 	}
+	if n.cryptoStore == nil {
+		n.cryptoStore = sealcrypto.NewKeyStore()
+	} else {
+		n.cryptoStore.Reset()
+	}
 	if n.ctx != nil {
 		n.ctx.Close()
 		n.ctx = nil
@@ -1631,13 +1470,7 @@ func (n *nativeBackend) Reset() error {
 		return fmt.Errorf("创建 QuickJS Context 失败")
 	}
 	n.ctx = ctx
-	n.cryptoBridgeMu.Lock()
-	n.cryptoBridge = nil
-	n.cryptoBridgeMu.Unlock()
 	n.installBaseGlobals()
-	if err := n.initCryptoBridge(); err != nil {
-		return err
-	}
 	_ = n.evalGlobalLocked(quickJSPolyfillScript)
 	n.wsPumpStop = make(chan struct{})
 	n.wsPumpDone = make(chan struct{})

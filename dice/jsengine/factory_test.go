@@ -21,7 +21,7 @@ func TestNewFactoryQuickJS(t *testing.T) {
 }
 
 func TestNewFactoryUnsupportedEngine(t *testing.T) {
-	engine, err := jsengine.New(jsengine.Config{Name: jsengine.EngineGoja})
+	engine, err := jsengine.New(jsengine.Config{Name: "legacy-js"})
 	if err == nil {
 		t.Fatal("不支持的引擎类型应返回错误")
 	}

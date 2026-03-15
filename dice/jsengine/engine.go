@@ -7,7 +7,6 @@ type EngineName string
 
 const (
 	EngineQuickJS EngineName = "quickjs"
-	EngineGoja    EngineName = "goja"
 )
 
 // Config 是引擎实现使用的最小运行配置。

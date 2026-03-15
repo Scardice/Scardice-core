@@ -6,7 +6,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dop251/goja_nodejs/require"
 	"github.com/robfig/cron/v3"
 	"gopkg.in/yaml.v3"
 
@@ -78,7 +77,6 @@ type DiceManager struct { //nolint:revive
 	Cron                 *cron.Cron
 	ServiceName          string
 	JustForTest          bool
-	JsRegistry           *require.Registry
 	UpdateSealdiceByFile func(packName string) bool // 使用指定压缩包升级余烬，如果出错返回false，如果成功进程会自动结束
 
 	ContainerMode bool          // 容器模式：禁用内置适配器，不允许使用内置Lagrange和旧的内置Gocq
@@ -142,9 +140,6 @@ func (dm *DiceManager) LoadDice() {
 	_ = os.MkdirAll("./data/decks", 0755)
 	_ = os.MkdirAll("./data/names", 0755)
 	_ = os.WriteFile("./data/images/Scardice.png", IconPNG, 0644)
-
-	// this can be shared by multiple runtimes
-	dm.JsRegistry = new(require.Registry)
 
 	dm.Cron = cron.New()
 	dm.Cron.Start()

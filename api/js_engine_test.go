@@ -74,7 +74,7 @@ func newJSONContext(e *echo.Echo, method string, path string, token string, body
 	return e.NewContext(req, rec), rec
 }
 
-func TestJsEngineGetDefaultToGoja(t *testing.T) {
+func TestJsEngineGetDefaultToQuickJS(t *testing.T) {
 	token, cleanup := setupJsEngineAPITest(t)
 	defer cleanup()
 
@@ -93,8 +93,8 @@ func TestJsEngineGetDefaultToGoja(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("响应解析失败: %v", err)
 	}
-	if resp["engine"] != "goja" {
-		t.Fatalf("默认引擎应为 goja，实际为: %v", resp["engine"])
+	if resp["engine"] != "quickjs" {
+		t.Fatalf("默认引擎应为 quickjs，实际为: %v", resp["engine"])
 	}
 	if _, ok := resp["effectiveEngine"]; !ok {
 		t.Fatalf("缺少字段 effectiveEngine")
@@ -151,11 +151,11 @@ func TestJsEngineSetSuccessNoReloadWhenJsDisabled(t *testing.T) {
 func TestJsEngineSetNoChange(t *testing.T) {
 	token, cleanup := setupJsEngineAPITest(t)
 	defer cleanup()
-	myDice.Config.JsEngine = "goja"
-	myDice.JsEngineEffective = "goja"
+	myDice.Config.JsEngine = "quickjs"
+	myDice.JsEngineEffective = "quickjs"
 
 	e := echo.New()
-	ctx, rec := newJSONContext(e, http.MethodPost, "/sd-api/js/engine", token, `{"engine":"goja"}`)
+	ctx, rec := newJSONContext(e, http.MethodPost, "/sd-api/js/engine", token, `{"engine":"quickjs"}`)
 
 	err := jsEngineSet(ctx)
 	if err != nil {
@@ -178,7 +178,7 @@ func TestJsEngineSetRetryWhenConfigMatchesButEffectiveDiffers(t *testing.T) {
 	token, cleanup := setupJsEngineAPITest(t)
 	defer cleanup()
 	myDice.Config.JsEngine = "quickjs"
-	myDice.JsEngineEffective = "goja"
+	myDice.JsEngineEffective = ""
 
 	e := echo.New()
 	ctx, rec := newJSONContext(e, http.MethodPost, "/sd-api/js/engine", token, `{"engine":"quickjs"}`)

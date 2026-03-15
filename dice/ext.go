@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/dop251/goja"
 	"github.com/tidwall/buntdb"
 	"go.uber.org/zap"
 
@@ -320,32 +319,11 @@ func (i *ExtInfo) CallOnGroupLeave(d *Dice, ctx *MsgContext, event *events.Group
 	})
 }
 
-// callWithJsCheck 保留旧行为：JS 扩展需要切回事件循环，避免并发问题。
+// callWithJsCheck 在 QuickJS-only 模式下直接执行回调。
 func (i *ExtInfo) callWithJsCheck(d *Dice, f func()) {
 	if i.IsJsExt {
 		if d.Config.JsEnable {
-			// QuickJS 路径不使用 goja eventloop，直接执行回调。
-			if d.JsEngineEffective == "quickjs" {
-				f()
-				return
-			}
-			loop, err := d.ExtLoopManager.GetLoop(i.JSLoopVersion)
-			if err != nil {
-				i.dice.Logger.Errorf("扩展<%s>运行环境已经过期: %v", i.Name, err)
-				return
-			}
-			waitRun := make(chan int, 1)
-			loop.RunOnLoop(func(vm *goja.Runtime) {
-				defer func() {
-					if r := recover(); r != nil {
-						d.Logger.Error("JS脚本异常:", r)
-					}
-					waitRun <- 1
-				}()
-
-				f()
-			})
-			<-waitRun
+			f()
 		} else {
 			d.Logger.Infof("当前已关闭js扩展<%v>", i.Name)
 		}

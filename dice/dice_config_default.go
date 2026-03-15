@@ -76,7 +76,7 @@ var DefaultConfig = Config{
 	},
 	JsConfig{
 		JsEnable:          true,
-		JsEngine:          "goja",
+		JsEngine:          "quickjs",
 		DisabledJsScripts: make(map[string]bool),
 	},
 	StoryLogConfig{

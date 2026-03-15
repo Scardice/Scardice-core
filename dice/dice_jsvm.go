@@ -23,28 +23,19 @@ import (
 	"time"
 
 	"github.com/Masterminds/semver/v3"
-	"github.com/dop251/goja"
-	"github.com/dop251/goja_nodejs/console"
-	"github.com/dop251/goja_nodejs/eventloop"
-	"github.com/dop251/goja_nodejs/require"
 	esbuild "github.com/evanw/esbuild/pkg/api"
-	fetch "github.com/fy0/gojax/fetch"
 	"github.com/golang-module/carbon"
 	"github.com/pkg/errors"
 	"github.com/robfig/cron/v3"
 	"github.com/samber/lo"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"gopkg.in/elazarl/goproxy.v1"
 
 	"Scardice-core/dice/events"
 	"Scardice-core/dice/jsengine"
 	_ "Scardice-core/dice/jsengine/quickjs"
 	"Scardice-core/static"
 	"Scardice-core/utils/crypto"
-
-	sealcrypto "Scardice-core/utils/plugin/crypto"
-	sealws "Scardice-core/utils/plugin/websocket"
 )
 
 var (
@@ -155,724 +146,24 @@ func (d *Dice) JsInit() {
 	if pub, err := static.Scripts.ReadFile("scripts/seal_mod.public.pem"); err == nil && len(pub) > 0 {
 		OfficialModPublicKey = string(pub)
 	}
-	engineName := strings.ToLower(strings.TrimSpace(d.Config.JsEngine))
-	if engineName == "" {
-		engineName = "goja"
-		d.Config.JsEngine = engineName
-	}
+	d.Config.JsEngine = "quickjs"
 	d.JsEngineEffective = ""
 	d.JsEngineFallback = ""
-	if engineName == "quickjs" {
-		d.Logger.Infof("JS引擎: quickjs（迁移阶段）")
-		if err := d.jsInitQuickJSCore(); err != nil {
-			d.JsEngineEffective = "goja"
-			d.JsEngineFallback = err.Error()
-			d.Logger.Warnf("QuickJS核心链路未就绪，回退Goja执行链路: %v", err)
-			d.jsInitGojaCore()
-		}
-		return
+	d.Logger.Info("JS引擎: quickjs")
+	if err := d.jsInitQuickJSCore(); err != nil {
+		d.JsEngineEffective = ""
+		d.JsEngineFallback = err.Error()
+		d.Logger.Errorf("QuickJS 初始化失败: %v", err)
 	}
-	d.JsEngineEffective = "goja"
-	d.jsInitGojaCore()
 }
 
 func (d *Dice) jsInitGojaCore() {
-	// 允许在 JsEnable=false 的启动状态下通过 API 重启 JS：
-	// 此时 ExtLoopManager 尚未初始化，需要在这里补齐。
-	if d.ExtLoopManager == nil {
-		d.ExtLoopManager = NewJsLoopManager()
+	d.Logger.Warn("Goja 执行链已移除，自动切换到 QuickJS")
+	if err := d.jsInitQuickJSCore(); err != nil {
+		d.JsEngineEffective = ""
+		d.JsEngineFallback = err.Error()
+		d.Logger.Errorf("QuickJS 初始化失败: %v", err)
 	}
-	// 清理目前的js相关
-	d.jsClear()
-
-	// 重建js vm
-	reg := new(require.Registry)
-
-	loop := eventloop.NewEventLoop(eventloop.EnableConsole(false),
-		eventloop.WithRegistry(reg),
-		eventloop.WithDebugLog(true),
-		eventloop.WithLogger(d.Logger))
-	_ = fetch.Enable(loop, goproxy.NewProxyHttpServer())
-	versionID := d.ExtLoopManager.SetLoop(loop)
-
-	printer := &PrinterFunc{d, false, []string{}}
-	d.JsPrinter = printer
-	reg.RegisterNativeModule("console", console.RequireWithPrinter(printer))
-	reg.RegisterNativeModule("crypto", sealcrypto.Require)
-
-	d.JsScriptCron = cron.New(cron.WithParser(taskCronParser))
-	d.JsScriptCronLock = &sync.Mutex{}
-	d.JsScriptCron.Start()
-	// 单独给WebSocket一个Logger
-	sealws.SetLogger(d.Logger)
-	// 关闭之前的所有WebSocket
-	sealws.GlobalConnManager.CloseAll()
-	// 初始化
-	loop.Run(func(vm *goja.Runtime) {
-		vm.SetFieldNameMapper(goja.TagFieldNameMapper("jsbind", true))
-
-		// console 模块
-		console.Enable(vm)
-
-		sealws.Enable(vm, loop)
-		// require 模块
-		reg.Enable(vm)
-		sealcrypto.Enable(vm)
-
-		seal := vm.NewObject()
-
-		vars := vm.NewObject()
-		_ = seal.Set("vars", vars)
-		_ = vars.Set("intGet", VarGetValueInt64)
-		_ = vars.Set("intSet", VarSetValueInt64)
-		_ = vars.Set("strGet", VarGetValueStr)
-		_ = vars.Set("strSet", VarSetValueStr)
-		_ = vars.Set("computedSet", VarSetValueComputed)
-		_ = vars.Set("computedGet", VarGetValueComputed)
-
-		ban := vm.NewObject()
-		_ = seal.Set("ban", ban)
-		_ = ban.Set("addBan", func(ctx *MsgContext, id string, place string, reason string) {
-			(&d.Config).BanList.AddScoreBase(id, d.Config.BanList.ThresholdBan, place, reason, ctx)
-			(&d.Config).BanList.SaveChanged(d)
-		})
-		_ = ban.Set("addTrust", func(ctx *MsgContext, id string, place string, reason string) {
-			(&d.Config).BanList.SetTrustByID(id, place, reason)
-			(&d.Config).BanList.SaveChanged(d)
-		})
-		_ = ban.Set("remove", func(ctx *MsgContext, id string) {
-			_, ok := (&d.Config).BanList.GetByID(id)
-			if !ok {
-				return
-			}
-			(&d.Config).BanList.DeleteByID(d, id)
-		})
-		_ = ban.Set("getList", func() []BanListInfoItem {
-			var list []BanListInfoItem
-			(&d.Config).BanList.Map.Range(func(key string, value *BanListInfoItem) bool {
-				list = append(list, *value)
-				return true
-			})
-			return list
-		})
-		_ = ban.Set("getUser", func(id string) *BanListInfoItem {
-			i, ok := (&d.Config).BanList.GetByID(id)
-			if !ok {
-				return nil
-			}
-			cp := *i
-			return &cp
-		})
-
-		ext := vm.NewObject()
-		_ = seal.Set("ext", ext)
-		_ = ext.Set("newCmdItemInfo", func() *CmdItemInfo {
-			return &CmdItemInfo{IsJsSolveFunc: true, JSLoopVersion: versionID}
-		})
-		_ = ext.Set("newCmdExecuteResult", func(solved bool) CmdExecuteResult {
-			return CmdExecuteResult{
-				Matched: true,
-				Solved:  solved,
-			}
-		})
-		_ = ext.Set("new", func(name, author, version string) *ExtInfo {
-			var official bool
-			if d.JsLoadingScript != nil {
-				official = d.JsLoadingScript.Official
-			}
-			return &ExtInfo{
-				Name: name, Author: author, Version: version,
-				GetDescText:   GetExtensionDesc,
-				AutoActive:    true,
-				IsJsExt:       true,
-				Brief:         "一个JS自定义扩展",
-				Official:      official,
-				CmdMap:        CmdMapCls{},
-				Source:        d.JsLoadingScript,
-				JSLoopVersion: versionID,
-			}
-		})
-		_ = ext.Set("find", func(name string) *ExtInfo {
-			return d.ExtFind(name, true)
-		})
-		_ = ext.Set("register", func(realExt *ExtInfo) {
-			defer func() {
-				// 增加recover, 以免在scripts目录中存在名字冲突扩展时导致启动崩溃
-				if e := recover(); e != nil {
-					d.Logger.Error(e)
-				}
-			}()
-
-			if strings.ToLower(realExt.Name) == "help" || strings.ToLower(realExt.Name) == "all" {
-				panic("help 和 all 为保留关键字，无法作为插件名使用")
-			}
-
-			extName := realExt.Name
-
-			// 1. 查找或创建 wrapper
-			var wrapper *ExtInfo
-			if existingWrapper, ok := d.ExtRegistry.Load(extName); ok && existingWrapper != nil && existingWrapper.IsWrapper {
-				// 重载：复用已有 wrapper
-				wrapper = existingWrapper
-				wrapper.Author = realExt.Author
-				wrapper.Version = realExt.Version
-				wrapper.IsDeleted = false         // 重新激活（清除删除标记）
-				wrapper.dice = d                  // 确保 dice 引用正确（可能从配置恢复时为 nil）
-				wrapper.JSLoopVersion = versionID // 同步新的 loop 版本号，避免 callWithJsCheck 时版本不匹配
-			} else {
-				// 首次加载：创建新 wrapper
-				wrapper = &ExtInfo{
-					Name:          extName,
-					Author:        realExt.Author,
-					Version:       realExt.Version,
-					IsWrapper:     true,
-					TargetName:    extName,
-					IsDeleted:     false,
-					GetDescText:   GetExtensionDesc,
-					AutoActive:    realExt.AutoActive, // 复制真实扩展的 AutoActive 设置
-					IsJsExt:       true,               // 标记为 JS 扩展
-					Brief:         "一个JS自定义扩展",
-					Official:      realExt.Official,
-					CmdMap:        CmdMapCls{},
-					JSLoopVersion: versionID,
-					dice:          d,
-				}
-				// 注册 wrapper 到 ExtRegistry 和 ExtList
-				d.RegisterExtension(wrapper)
-			}
-
-			// 2. 注册真实 ExtInfo 到 JsExtRegistry
-			if d.JsExtRegistry == nil {
-				d.JsExtRegistry = new(SyncMap[string, *ExtInfo])
-			}
-			d.JsExtRegistry.Store(extName, realExt)
-
-			// 3. 设置真实 ExtInfo 的属性
-			realExt.dice = d
-			realExt.JSLoopVersion = versionID
-
-			// 4. 更新全局扩展变更时间戳
-			d.ExtUpdateTime = time.Now().Unix()
-
-			// 5. 触发 OnLoad 回调
-			if realExt.OnLoad != nil {
-				realExt.OnLoad()
-			}
-		})
-		_ = ext.Set("registerStringConfig", func(ei *ExtInfo, key string, defaultValue string, description string, group string) error {
-			if ei.dice == nil {
-				return errors.New("请先完成此扩展的注册")
-			}
-			config := &ConfigItem{
-				Key:          key,
-				Type:         "string",
-				Group:        group,
-				Value:        defaultValue,
-				DefaultValue: defaultValue,
-				Description:  description,
-			}
-			d.ConfigManager.RegisterPluginConfig(ei.Name, config)
-			return nil
-		})
-		_ = ext.Set("registerIntConfig", func(ei *ExtInfo, key string, defaultValue int64, description string, group string) error {
-			if ei.dice == nil {
-				return errors.New("请先完成此扩展的注册")
-			}
-			config := &ConfigItem{
-				Key:          key,
-				Type:         "int",
-				Group:        group,
-				Value:        defaultValue,
-				DefaultValue: defaultValue,
-				Description:  description,
-			}
-			d.ConfigManager.RegisterPluginConfig(ei.Name, config)
-			return nil
-		})
-		_ = ext.Set("registerBoolConfig", func(ei *ExtInfo, key string, defaultValue bool, description string, group string) error {
-			if ei.dice == nil {
-				return errors.New("请先完成此扩展的注册")
-			}
-			config := &ConfigItem{
-				Key:          key,
-				Type:         "bool",
-				Group:        group,
-				Value:        defaultValue,
-				DefaultValue: defaultValue,
-				Description:  description,
-			}
-			d.ConfigManager.RegisterPluginConfig(ei.Name, config)
-			return nil
-		})
-		_ = ext.Set("registerFloatConfig", func(ei *ExtInfo, key string, defaultValue float64, description string, group string) error {
-			if ei.dice == nil {
-				return errors.New("请先完成此扩展的注册")
-			}
-			config := &ConfigItem{
-				Key:          key,
-				Type:         "float",
-				Group:        group,
-				Value:        defaultValue,
-				DefaultValue: defaultValue,
-				Description:  description,
-			}
-			d.ConfigManager.RegisterPluginConfig(ei.Name, config)
-			return nil
-		})
-		_ = ext.Set("registerTemplateConfig", func(ei *ExtInfo, key string, defaultValue []string, description string, group string) error {
-			if ei.dice == nil {
-				return errors.New("请先完成此扩展的注册")
-			}
-			config := &ConfigItem{
-				Key:          key,
-				Type:         "template",
-				Group:        group,
-				Value:        defaultValue,
-				DefaultValue: defaultValue,
-				Description:  description,
-			}
-			d.ConfigManager.RegisterPluginConfig(ei.Name, config)
-			return nil
-		})
-		_ = ext.Set("registerOptionConfig", func(ei *ExtInfo, key string, defaultValue string, option []string, description string, group string) error {
-			if ei.dice == nil {
-				return errors.New("请先完成此扩展的注册")
-			}
-			config := &ConfigItem{
-				Key:          key,
-				Type:         "option",
-				Group:        group,
-				Value:        defaultValue,
-				DefaultValue: defaultValue,
-				Option:       option,
-				Description:  description,
-			}
-			d.ConfigManager.RegisterPluginConfig(ei.Name, config)
-			return nil
-		})
-		_ = ext.Set("newConfigItem", func(ei *ExtInfo, key string, defaultValue interface{}, description string) *ConfigItem {
-			if ei.dice == nil {
-				panic(errors.New("请先完成此扩展的注册"))
-			}
-			return d.ConfigManager.NewConfigItem(key, defaultValue, description)
-		})
-		_ = ext.Set("registerConfig", func(ei *ExtInfo, config ...*ConfigItem) error {
-			if ei.dice == nil {
-				return errors.New("请先完成此扩展的注册")
-			}
-			d.ConfigManager.RegisterPluginConfig(ei.Name, config...)
-			return nil
-		})
-		_ = ext.Set("getConfig", func(ei *ExtInfo, key string) *ConfigItem {
-			if ei.dice == nil {
-				return nil
-			}
-			return d.ConfigManager.getConfig(ei.Name, key)
-		})
-		_ = ext.Set("getStringConfig", func(ei *ExtInfo, key string) string {
-			if ei.dice == nil || d.ConfigManager.getConfig(ei.Name, key).Type != "string" {
-				panic("配置不存在或类型不匹配")
-			}
-			return d.ConfigManager.getConfig(ei.Name, key).Value.(string)
-		})
-		_ = ext.Set("getIntConfig", func(ei *ExtInfo, key string) int64 {
-			if ei.dice == nil || d.ConfigManager.getConfig(ei.Name, key).Type != "int" {
-				panic("配置不存在或类型不匹配")
-			}
-			return d.ConfigManager.getConfig(ei.Name, key).Value.(int64)
-		})
-		_ = ext.Set("getBoolConfig", func(ei *ExtInfo, key string) bool {
-			if ei.dice == nil || d.ConfigManager.getConfig(ei.Name, key).Type != "bool" {
-				panic("配置不存在或类型不匹配")
-			}
-			return d.ConfigManager.getConfig(ei.Name, key).Value.(bool)
-		})
-		_ = ext.Set("getFloatConfig", func(ei *ExtInfo, key string) float64 {
-			if ei.dice == nil || d.ConfigManager.getConfig(ei.Name, key).Type != "float" {
-				panic("配置不存在或类型不匹配")
-			}
-			return d.ConfigManager.getConfig(ei.Name, key).Value.(float64)
-		})
-		_ = ext.Set("getTemplateConfig", func(ei *ExtInfo, key string) []string {
-			if ei.dice == nil || d.ConfigManager.getConfig(ei.Name, key).Type != "template" {
-				panic("配置不存在或类型不匹配")
-			}
-			return d.ConfigManager.getConfig(ei.Name, key).Value.([]string)
-		})
-		_ = ext.Set("getOptionConfig", func(ei *ExtInfo, key string) string {
-			if ei.dice == nil || d.ConfigManager.getConfig(ei.Name, key).Type != "option" {
-				panic("配置不存在或类型不匹配")
-			}
-			return d.ConfigManager.getConfig(ei.Name, key).Value.(string)
-		})
-		_ = ext.Set("unregisterConfig", func(ei *ExtInfo, key ...string) {
-			if ei.dice == nil {
-				return
-			}
-			d.ConfigManager.UnregisterConfig(ei.Name, key...)
-		})
-		_ = ext.Set("storageList", func(ei *ExtInfo) []string {
-			keys, err := ei.StorageList()
-			if err != nil {
-				panic(err)
-			}
-			return keys
-		})
-
-		_ = ext.Set("registerTask", func(ei *ExtInfo, taskType string, value string, fn func(taskCtx JsScriptTaskCtx), key string, desc string, group string) *JsScriptTask {
-			if ei.dice == nil {
-				d.Logger.Errorf("插件注册定时任务失败：请先完成此扩展的注册")
-				return nil
-			}
-			scriptCron := ei.dice.ensureJsScriptCron()
-
-			task := JsScriptTask{cron: scriptCron, key: key, task: fn, lock: ei.dice.JsScriptCronLock, logger: ei.dice.Logger}
-			expr := value
-			if key != "" && taskType != "once" {
-				if config := d.ConfigManager.getConfig(ei.Name, key); config != nil {
-					expr = config.Value.(string)
-					// Stop old task
-					if config.task != nil {
-						config.task.Off()
-						ei.taskList = removeTaskFromList(ei.taskList, config.task)
-					}
-				}
-			}
-
-			switch taskType {
-			case "cron":
-				cronExpr, err := parseTaskCronExpr(expr)
-				if err != nil {
-					panic("插件注册定时任务失败：" + err.Error())
-				}
-
-				entryID, err := scriptCron.AddFunc(cronExpr, func() {
-					task.run()
-				})
-				if err != nil {
-					d.Logger.Errorf("插件注册定时任务失败：%v", err)
-					return nil
-				}
-				task.taskType = taskType
-				task.rawValue = expr
-				task.cronExpr = cronExpr
-				expr = cronExpr // 保持配置值为规范化后的有效表达式
-				task.entryID = &entryID
-				ei.dice.Logger.Infof("插件注册定时任务：cron=%s", cronExpr)
-			case "daily":
-				// 支持每天定时触发，24 小时表示
-				cronExpr, err := parseTaskTime(expr)
-				if err != nil {
-					panic("插件注册定时任务失败：" + err.Error())
-				}
-
-				entryID, err := scriptCron.AddFunc(cronExpr, func() {
-					task.run()
-				})
-				if err != nil {
-					d.Logger.Errorf("插件注册定时任务失败：%v", err)
-					return nil
-				}
-				task.taskType = taskType
-				task.rawValue = expr
-				task.cronExpr = cronExpr
-				task.entryID = &entryID
-				ei.dice.Logger.Infof("插件注册定时任务：daily=%s", expr)
-			case "once":
-				onceAt, normalizedExpr, err := parseTaskOnceExpr(expr)
-				if err != nil {
-					panic("插件注册定时任务失败：" + err.Error())
-				}
-				task.taskType = taskType
-				task.rawValue = expr
-				task.onceAt = onceAt
-				expr = normalizedExpr // 保存为绝对执行时间戳，避免重载后延迟重复计算
-				if !task.On() {
-					panic("插件注册定时任务失败：一次任务注册失败")
-				}
-				ei.dice.Logger.Infof("插件注册定时任务：once=%s", expr)
-			default:
-				d.Logger.Errorf("插件注册定时任务失败：错误的任务类型：%s，当前仅支持 cron|daily|once", taskType)
-				return nil
-			}
-
-			if key != "" && taskType != "once" {
-				config := d.ConfigManager.getConfig(ei.Name, key)
-
-				switch taskType {
-				case "cron":
-					config = &ConfigItem{
-						Key:          key,
-						Type:         "task:cron",
-						Group:        group,
-						Value:        expr,
-						DefaultValue: value,
-						Description:  desc,
-						task:         &task,
-					}
-				case "daily":
-					config = &ConfigItem{
-						Key:          key,
-						Type:         "task:daily",
-						Group:        group,
-						Value:        expr,
-						DefaultValue: value,
-						Description:  desc,
-						task:         &task,
-					}
-				}
-				d.ConfigManager.RegisterPluginConfig(ei.Name, config)
-			}
-
-			if ei.taskList == nil {
-				ei.taskList = make([]*JsScriptTask, 0)
-			}
-			ei.taskList = append(ei.taskList, &task)
-
-			return &task
-		})
-		_ = ext.Set("removeTask", func(ei *ExtInfo, taskType string, key string) int {
-			if ei.dice == nil {
-				panic(errors.New("请先完成此扩展的注册"))
-			}
-
-			taskType, key = normalizeTaskSelector(taskType, key)
-			taskSet := make(map[*JsScriptTask]struct{})
-			configKeySet := make(map[string]struct{})
-
-			for _, task := range ei.taskList {
-				if matchTaskSelector(task, taskType, key) {
-					taskSet[task] = struct{}{}
-					if task.key != "" && task.taskType != "once" {
-						configKeySet[task.key] = struct{}{}
-					}
-				}
-			}
-
-			cm := d.ConfigManager
-			cm.lock.RLock()
-			pluginConfig := cm.Plugins[ei.Name]
-			if pluginConfig != nil {
-				for cfgKey, cfgItem := range pluginConfig.Configs {
-					if cfgItem == nil {
-						continue
-					}
-					cfgTaskType, isTask := configTypeToTaskType(cfgItem.Type)
-					if !isTask || !taskTypeMatched(taskType, cfgTaskType) || !keyMatched(key, cfgKey) {
-						continue
-					}
-					configKeySet[cfgKey] = struct{}{}
-					if cfgItem.task != nil {
-						taskSet[cfgItem.task] = struct{}{}
-					}
-				}
-			}
-			cm.lock.RUnlock()
-
-			for task := range taskSet {
-				_ = task.Off()
-			}
-
-			if len(taskSet) > 0 {
-				filtered := make([]*JsScriptTask, 0, len(ei.taskList))
-				for _, task := range ei.taskList {
-					if _, hit := taskSet[task]; !hit {
-						filtered = append(filtered, task)
-					}
-				}
-				ei.taskList = filtered
-			}
-
-			if len(configKeySet) > 0 {
-				keys := make([]string, 0, len(configKeySet))
-				for cfgKey := range configKeySet {
-					keys = append(keys, cfgKey)
-				}
-				d.ConfigManager.UnregisterConfig(ei.Name, keys...)
-			}
-
-			return len(taskSet)
-		})
-		_ = ext.Set("listTasks", func(ei *ExtInfo) []*JsScriptTaskInfo {
-			if ei.dice == nil {
-				panic(errors.New("请先完成此扩展的注册"))
-			}
-
-			tasks := make([]*JsScriptTaskInfo, 0, len(ei.taskList))
-			for _, task := range ei.taskList {
-				if task == nil {
-					continue
-				}
-				tasks = append(tasks, &JsScriptTaskInfo{
-					TaskType: task.taskType,
-					Key:      task.key,
-					Value:    task.rawValue,
-					Active:   task.IsActive(),
-				})
-			}
-			return tasks
-		})
-
-		// COC规则自定义
-		coc := vm.NewObject()
-		_ = coc.Set("newRule", func() *CocRuleInfo {
-			return &CocRuleInfo{}
-		})
-		_ = coc.Set("newRuleCheckResult", func() *CocRuleCheckRet {
-			return &CocRuleCheckRet{}
-		})
-		_ = coc.Set("registerRule", func(rule *CocRuleInfo) bool {
-			return d.CocExtraRulesAdd(rule)
-		})
-		_ = seal.Set("coc", coc)
-
-		deck := vm.NewObject()
-		_ = deck.Set("draw", func(ctx *MsgContext, deckName string, isShuffle bool) map[string]interface{} {
-			exists, result, err := deckDraw(ctx, deckName, isShuffle)
-			var errText string
-			if err != nil {
-				errText = err.Error()
-			}
-			return map[string]interface{}{
-				"exists": exists,
-				"err":    errText,
-				"result": result,
-			}
-		})
-		_ = deck.Set("reload", func() {
-			DeckReload(d)
-		})
-		_ = seal.Set("deck", deck)
-
-		_ = seal.Set("replyGroup", ReplyGroup)
-		_ = seal.Set("replyPerson", ReplyPerson)
-		_ = seal.Set("replyToSender", ReplyToSender)
-		_ = seal.Set("memberBan", MemberBan)
-		_ = seal.Set("memberKick", MemberKick)
-		_ = seal.Set("format", DiceFormat)
-		_ = seal.Set("formatTmpl", DiceFormatTmpl)
-		_ = seal.Set("getCtxProxyFirst", GetCtxProxyFirst)
-
-		// 1.2新增
-		_ = seal.Set("newMessage", func() *Message {
-			return &Message{}
-		})
-		_ = seal.Set("createTempCtx", CreateTempCtx)
-		_ = seal.Set("applyPlayerGroupCardByTemplate", func(ctx *MsgContext, tmpl string) string {
-			if tmpl != "" {
-				ctx.Player.AutoSetNameTemplate = tmpl
-			}
-			if ctx.Player.AutoSetNameTemplate != "" {
-				text, _ := SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
-				return text
-			}
-			return ""
-		})
-		gameSystem := vm.NewObject()
-		_ = gameSystem.Set("newTemplate", func(data string) error {
-			tmpl, err := loadGameSystemTemplateFromData([]byte(data), "json")
-			if err != nil {
-				return errors.New("解析失败:" + err.Error())
-			}
-			ret := d.GameSystemTemplateAddEx(tmpl, true)
-			if !ret {
-				return errors.New("已存在同名模板")
-			}
-			return nil
-		})
-		_ = gameSystem.Set("newTemplateByYaml", func(data string) error {
-			tmpl, err := loadGameSystemTemplateFromData([]byte(data), "yaml")
-			if err != nil {
-				return errors.New("解析失败:" + err.Error())
-			}
-			ret := d.GameSystemTemplateAddEx(tmpl, true)
-			if !ret {
-				return errors.New("已存在同名模板")
-			}
-			return nil
-		})
-		_ = seal.Set("gameSystem", gameSystem)
-		_ = seal.Set("getCtxProxyAtPos", GetCtxProxyAtPos)
-		_ = seal.Set("getVersion", func() map[string]interface{} {
-			return map[string]interface{}{
-				"versionCode":   VERSION_CODE,
-				"version":       VERSION.String(),
-				"versionSimple": VERSION_MAIN + VERSION_PRERELEASE,
-				"versionDetail": map[string]interface{}{
-					"major":         VERSION.Major(),
-					"minor":         VERSION.Minor(),
-					"patch":         VERSION.Patch(),
-					"prerelease":    VERSION.Prerelease(),
-					"buildMetaData": VERSION.Metadata(),
-				},
-			}
-		})
-		_ = seal.Set("getEndPoints", func() []*EndPointInfo {
-			return d.ImSession.EndPoints
-		})
-
-		_ = vm.Set("atob", func(s string) (string, error) {
-			// Remove data URI scheme and any whitespace from the string.
-			s = strings.ReplaceAll(s, "data:text/plain;base64,", "")
-			s = strings.ReplaceAll(s, " ", "")
-
-			// Decode the base64-encoded string.
-			b, err := base64.StdEncoding.DecodeString(s)
-			if err != nil {
-				return "", errors.New("atob: 不合法的base64字串")
-			}
-			return string(b), nil
-		})
-		_ = vm.Set("btoa", func(s string) string {
-			// 编码
-			return base64.StdEncoding.EncodeToString([]byte(s))
-		})
-		// 1.2新增结束
-		_ = seal.Set("setPlayerGroupCard", SetPlayerGroupCardByTemplate)
-		_ = seal.Set("base64ToImage", Base64ToImageFunc())
-
-		// Note: Szzrain 暴露dice对象给js会导致js可以调用dice的所有Export的方法
-		// 这是不安全的, 所有需要用到dice实例的函数都可以以传入ctx作为替代
-		// _ = seal.Set("inst", d)
-		_ = vm.Set("__dirname", "")
-		_ = vm.Set("seal", seal)
-
-		// Note(Szzrain): 不要修改原型链, 会导致一些奇怪的问题，比如无法使用某些 TS 库
-		//		_, _ = vm.RunString(`
-		// let e = seal.ext.new('_', '', '');
-		// e.__proto__.storageSet = function(k, v) {
-		//  try {
-		//    // 这里goja会强行抛出异常，等于是将返回error的函数转写成throw形式
-		//    this.storageSetRaw(k, v)
-		//  } catch (error) {
-		//    throw error;
-		//  }
-		// }
-		// e.__proto__.storageGet = function(k, v) {
-		//  try {
-		//    return this.storageGetRaw(k, v);
-		//  } catch (error) {
-		//    if (error.value.toString() !== 'not found') {
-		//      throw error;
-		//    }
-		//  }
-		// }
-		// `)
-		_, _ = vm.RunString(`Object.freeze(seal);Object.freeze(seal.deck);Object.freeze(seal.coc);Object.freeze(seal.ext);Object.freeze(seal.vars);`)
-	})
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				d.Logger.Errorf("JS核心执行异常: %v 堆栈: %v", r, string(debug.Stack()))
-			}
-		}()
-		loop.StartInForeground()
-	}()
-	// loop.Start()
-	(&d.Config).JsEnable = true
-	d.Logger.Info("已加载JS环境，当前JS引擎: goja")
-	d.MarkModified()
-	d.Save(false)
 }
 
 func (d *Dice) ensureJsScriptCron() *cron.Cron {
@@ -2395,57 +1686,20 @@ func quickJSBoolLike(v any, defaultValue bool) bool {
 	}
 }
 
-func invokeCmdItemWithJSEngine(d *Dice, item *CmdItemInfo, ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) (CmdExecuteResult, error) {
+func invokeCmdItemWithJSEngine(d *Dice, item *CmdItemInfo, ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) (result CmdExecuteResult, err error) {
 	if item == nil {
 		return CmdExecuteResult{}, fmt.Errorf("nil command item")
 	}
-
-	if d != nil && d.JsEngineEffective == "quickjs" && item.IsJsSolveFunc {
-		return item.Solve(ctx, msg, cmdArgs), nil
+	if item.Solve == nil {
+		return CmdExecuteResult{}, fmt.Errorf("command solve is nil: %s", item.Name)
 	}
-	if item.IsJsSolveFunc || item.SolveRaw != nil {
-		if d == nil || d.ExtLoopManager == nil {
-			return CmdExecuteResult{}, fmt.Errorf("js loop manager unavailable")
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
 		}
-		loop, err := d.ExtLoopManager.GetLoop(item.JSLoopVersion)
-		if err != nil {
-			if !item.IsJsSolveFunc && item.SolveRaw != nil {
-				loop = d.ExtLoopManager.GetWebLoop()
-			}
-			if loop == nil {
-				return CmdExecuteResult{}, err
-			}
-		}
-
-		done := make(chan CmdExecuteResult, 1)
-		fail := make(chan error, 1)
-		loop.RunOnLoop(func(vm *goja.Runtime) {
-			if item.SolveRaw == nil {
-				defer func() {
-					if r := recover(); r != nil {
-						fail <- fmt.Errorf("panic: %v", r)
-						return
-					}
-					done <- item.Solve(ctx, msg, cmdArgs)
-				}()
-				return
-			}
-			defer func() {
-				if r := recover(); r != nil {
-					fail <- fmt.Errorf("panic: %v", r)
-				}
-			}()
-			resolveJSSolveValue(vm, item.SolveRaw(ctx, msg, cmdArgs), done, fail)
-		})
-
-		ret, err := waitJSSolveResult(done, fail, jsSolveAwaitTimeout)
-		if err != nil {
-			return CmdExecuteResult{}, err
-		}
-		return ret, nil
-	}
-
-	return item.Solve(ctx, msg, cmdArgs), nil
+	}()
+	result = item.Solve(ctx, msg, cmdArgs)
+	return result, nil
 }
 
 func cmdExecuteResultToMap(ret CmdExecuteResult) map[string]any {
@@ -2581,7 +1835,7 @@ func extInfoToJSMap(ext *ExtInfo) map[string]any {
 			continue
 		}
 		cmdObj := cmdItemInfoToJSMap(cmd)
-		cmdObj["__sdHasSolve"] = cmd.Solve != nil || cmd.SolveRaw != nil
+		cmdObj["__sdHasSolve"] = cmd.Solve != nil
 		cmdObj["__sdHasHelpFunc"] = cmd.HelpFunc != nil
 		cmdMap[cmdName] = cmdObj
 	}
@@ -2713,10 +1967,6 @@ func (d *Dice) jsClearStateOnly() {
 	d.RegisterBuiltinSystemTemplate()
 	if d.StoreManager != nil {
 		d.StoreManager.InstalledPlugins = map[string]bool{}
-	}
-	// JsEnable=false 的启动状态下 ExtLoopManager 可能尚未初始化
-	if d.ExtLoopManager != nil {
-		d.ExtLoopManager.SetLoop(nil)
 	}
 }
 
@@ -3045,8 +2295,8 @@ func (d *Dice) JsReload() {
 	d.JsReloading = true
 	defer func() { d.JsReloading = false }()
 
-	// 仅在“目标引擎仍是 quickjs 且当前也在 quickjs”时走软重置；
-	// 如果目标已切到 goja，必须走 JsInit 完整重建，确保引擎切换立即生效。
+	// 仅在“配置与当前都为 quickjs 且已有引擎实例”时走软重置；
+	// 其余情况走 JsInit 完整重建。
 	if shouldQuickJSSoftResetOnReload(d.Config.JsEngine, d.JsEngineEffective, d.ScriptEngine != nil) {
 		d.jsClearStateOnly()
 		if err := d.ScriptEngine.Reset(); err != nil {
@@ -3071,7 +2321,7 @@ func (d *Dice) JsReload() {
 func shouldQuickJSSoftResetOnReload(configEngine string, effectiveEngine string, hasScriptEngine bool) bool {
 	desired := strings.ToLower(strings.TrimSpace(configEngine))
 	if desired == "" {
-		desired = "goja"
+		desired = "quickjs"
 	}
 	return desired == "quickjs" && effectiveEngine == "quickjs" && hasScriptEngine
 }
@@ -3398,12 +2648,10 @@ func (d *Dice) JsLoadScriptRaw(jsInfo *JsScriptInfo) {
 }
 
 func (d *Dice) jsRequireModule(targetPath string) error {
-	// QuickJS 生效时走统一抽象层；未生效或未接入时回退 Goja 路径。
-	if d.JsEngineEffective == "quickjs" && d.ScriptEngine != nil {
-		return d.ScriptEngine.Require(targetPath)
+	if d.ScriptEngine == nil {
+		return errors.New("QuickJS 引擎未初始化")
 	}
-	_, err := d.ExtLoopManager.GetWebLoop().RequireModule(targetPath)
-	return err
+	return d.ScriptEngine.Require(targetPath)
 }
 
 func tsScriptCompile(path string) (string, bool, error) {

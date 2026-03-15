@@ -2609,7 +2609,7 @@ func (d *Dice) Save(isAuto bool) {
 
 			Config `yaml:",inline"`
 		}{
-			// 这些都是由于导出到 goja 无法拆分的字段
+			// 这些是历史上为了脚本导出保留的聚合字段
 			d.ImSession,
 			d.DeckList,
 			d.CommandPrefix,

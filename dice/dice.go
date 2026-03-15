@@ -17,8 +17,6 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/dop251/goja"
-	"github.com/dop251/goja_nodejs/eventloop"
 	"github.com/go-creed/sat"
 	wr "github.com/mroth/weightedrand"
 	"github.com/robfig/cron/v3"
@@ -50,9 +48,8 @@ type CmdItemInfo struct {
 	EnableExecuteTimesParse bool                      `jsbind:"enableExecuteTimesParse"` // 启用执行次数解析，也就是解析3#这样的文本
 
 	IsJsSolveFunc bool
-	JSLoopVersion int64                                                                  // Loop版本号
+	JSLoopVersion int64 // Loop版本号
 	Solve         func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult
-	SolveRaw      func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) goja.Value `jsbind:"solve"`
 
 	Raw                bool `jsbind:"raw"`                // 高级模式。默认模式下行为是：需要在当前群/私聊开启，或@自己时生效(需要为第一个@目标)
 	CheckCurrentBotOn  bool `jsbind:"checkCurrentBotOn"`  // 是否检查当前可用状况，包括群内可用和是私聊两种方式，如失败不进入solve
@@ -137,55 +134,6 @@ type ExtDefaultSettingItem struct {
 
 type ExtDefaultSettingItemSlice []*ExtDefaultSettingItem
 
-type JsLoopManager struct {
-	loop     *eventloop.EventLoop
-	loopLock sync.RWMutex
-	version  int64
-}
-
-func NewJsLoopManager() *JsLoopManager {
-	return &JsLoopManager{
-		loop:     nil,
-		loopLock: sync.RWMutex{},
-		version:  0,
-	}
-}
-
-// GetLoop 通过版本号获取 loop，如果版本号不匹配则返回错误
-func (m *JsLoopManager) GetLoop(expectedVersion int64) (*eventloop.EventLoop, error) {
-	m.loopLock.RLock()
-	defer m.loopLock.RUnlock()
-
-	if m.version != expectedVersion {
-		return nil, fmt.Errorf("version mismatch: expected %d, current %d", expectedVersion, m.version)
-	}
-
-	return m.loop, nil
-}
-
-func (m *JsLoopManager) GetWebLoop() *eventloop.EventLoop {
-	m.loopLock.RLock()
-	defer m.loopLock.RUnlock()
-	// 给WEB用，不需要管是哪个版本的Loop，是最新的就行
-	return m.loop
-}
-
-// SetLoop 写入新的 loop 并自动递增版本号
-func (m *JsLoopManager) SetLoop(newLoop *eventloop.EventLoop) int64 {
-	m.loopLock.Lock()
-	defer m.loopLock.Unlock()
-
-	// 停止旧的 loop（如果存在）
-	if m.loop != nil {
-		m.loop.Terminate()
-	}
-
-	// 设置新的 loop 并递增版本号
-	m.loop = newLoop
-	m.version++
-	return m.version
-}
-
 // 强制coc7排序在较前位置
 
 func (x ExtDefaultSettingItemSlice) Len() int           { return len(x) }
@@ -237,12 +185,10 @@ type Dice struct {
 	AliveNoticeEntry cron.EntryID         `json:"-"             yaml:"-"`
 	JsPrinter        *PrinterFunc         `json:"-"             yaml:"-"`
 
-	// JsLoop           *eventloop.EventLoop `yaml:"-" json:"-"`
-	ExtLoopManager    *JsLoopManager    `json:"-" yaml:"-"`
-	ScriptEngine      jsengine.Engine   `json:"-" yaml:"-"` // 新引擎抽象实例（QuickJS替代路径）
+	ScriptEngine      jsengine.Engine   `json:"-" yaml:"-"` // JS 引擎实例（QuickJS）
 	RetiredJSEngines  []jsengine.Engine `json:"-" yaml:"-"` // 已退役但因底层崩溃风险暂不销毁的引擎实例
 	JsEngineEffective string            `json:"-" yaml:"-"` // 当前实际生效的插件引擎
-	JsEngineFallback  string            `json:"-" yaml:"-"` // 回退原因（为空表示未回退）
+	JsEngineFallback  string            `json:"-" yaml:"-"` // 引擎初始化失败原因
 	JsScriptList      []*JsScriptInfo   `json:"-" yaml:"-"`
 	JsScriptCron      *cron.Cron        `json:"-" yaml:"-"`
 	JsScriptCronLock  *sync.Mutex       `json:"-" yaml:"-"`
@@ -389,7 +335,6 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 	// 创建js运行时
 	if d.Config.JsEnable {
 		loggerInstance.Info("js扩展支持：开启")
-		d.ExtLoopManager = NewJsLoopManager() // 此时不初始化loop，Init才初始化哦
 		d.JsInit()
 	} else {
 		loggerInstance.Info("js扩展支持：关闭")
@@ -670,7 +615,6 @@ func (d *Dice) ExtFind(s string, fromJS bool) *ExtInfo {
 				EnableExecuteTimesParse: info.EnableExecuteTimesParse,
 				IsJsSolveFunc:           info.IsJsSolveFunc,
 				Solve:                   info.Solve,
-				SolveRaw:                info.SolveRaw,
 				Raw:                     info.Raw,
 				CheckCurrentBotOn:       info.CheckCurrentBotOn,
 				CheckMentionOthers:      info.CheckMentionOthers,

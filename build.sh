@@ -81,6 +81,31 @@ join_by_comma() {
   echo "$*"
 }
 
+discover_build_tags() {
+  # 从仓库 go:build 约束中提取候选 tags（包含平台/架构约束）。
+  # 该列表用于交互提示，不做强约束校验。
+  rg --no-filename "^//go:build " --glob "*.go" . 2>/dev/null \
+    | sed 's#^//go:build[[:space:]]*##' \
+    | tr '()!&|,' ' ' \
+    | tr -s '[:space:]' '\n' \
+    | sed '/^$/d' \
+    | sort -u \
+    | paste -sd ',' -
+}
+
+normalize_build_tags() {
+  local raw="$1"
+  # 允许用户输入逗号或空格分隔，最终统一成 go build 兼容的逗号分隔格式。
+  raw="$(printf "%s" "$raw" | tr ',' ' ' | tr -s '[:space:]' ' ')"
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+  if [[ -z "$raw" ]]; then
+    echo ""
+    return 0
+  fi
+  echo "${raw// /,}"
+}
+
 print_multi_target_guide() {
   echo "------ Multi Target Guide ------"
   echo "理论支持的平台: $(join_by_comma "${ALL_GOOS[@]}")"
@@ -327,6 +352,15 @@ else
   USE_COMPATIBLE_NAMES=0
 fi
 
+AVAILABLE_TAGS="$(discover_build_tags)"
+if [[ -n "$AVAILABLE_TAGS" ]]; then
+  echo "[Build] 自动检测到可用 build tags: ${AVAILABLE_TAGS}"
+else
+  echo "[Build] 未检测到可用 build tags"
+fi
+read -r -p "请输入 build tags（可选，逗号或空格分隔，默认：不带）: " BUILD_TAGS_INPUT
+BUILD_TAGS="$(normalize_build_tags "${BUILD_TAGS_INPUT:-}")"
+
 if [[ "${CGO_ENABLED_VALUE}" -eq 1 ]]; then
   echo "[Build] 预检查 CGO 依赖..."
   for target in "${TARGETS[@]}"; do
@@ -379,6 +413,11 @@ echo "[Build] BUILD_MODE=${BUILD_MODE_INPUT}"
 echo "[Build] TARGETS=$(join_by_comma "${TARGETS[@]}")"
 echo "[Build] CGO_ENABLED=${CGO_ENABLED_VALUE}"
 echo "[Build] USE_COMPATIBLE_NAMES=${USE_COMPATIBLE_NAMES}"
+if [[ -n "$BUILD_TAGS" ]]; then
+  echo "[Build] BUILD_TAGS=${BUILD_TAGS}"
+else
+  echo "[Build] BUILD_TAGS=<none>"
+fi
 if [[ $USE_COMPATIBLE_NAMES -eq 1 ]]; then
   echo "[Build] LOCK_FILE_NAME=sealdice-core.lock"
 else
@@ -479,13 +518,18 @@ for target in "${TARGETS[@]}"; do
   echo "[Build] 开始 go build: ${target}"
   rm -rf "$TARGET_WORK_DIR"
   mkdir -p "$TARGET_WORK_DIR"
+  GO_BUILD_ARGS=(go build -trimpath -ldflags "$LDFLAGS")
+  if [[ -n "$BUILD_TAGS" ]]; then
+    GO_BUILD_ARGS+=(-tags "$BUILD_TAGS")
+  fi
+  GO_BUILD_ARGS+=(-o "${BINARY_PATH}" .)
   if [[ -n "$CC_VALUE" ]]; then
     echo "[Build] 使用交叉编译器 CC=${CC_VALUE}"
     GOOS="${TARGET_GOOS}" GOARCH="${TARGET_GOARCH}" CGO_ENABLED="${CGO_ENABLED_VALUE}" CC="${CC_VALUE}" \
-      go build -trimpath -ldflags "$LDFLAGS" -o "${BINARY_PATH}" .
+      "${GO_BUILD_ARGS[@]}"
   else
     GOOS="${TARGET_GOOS}" GOARCH="${TARGET_GOARCH}" CGO_ENABLED="${CGO_ENABLED_VALUE}" \
-      go build -trimpath -ldflags "$LDFLAGS" -o "${BINARY_PATH}" .
+      "${GO_BUILD_ARGS[@]}"
   fi
 
   echo "[Build] 组装发布目录：${PACKAGE_DIR}"
