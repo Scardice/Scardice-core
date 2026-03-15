@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -398,7 +397,6 @@ type helpIndexManifest struct {
 	Version       int               `json:"version"`
 	SchemaVersion int               `json:"schemaVersion"`
 	EngineType    EngineType        `json:"engineType"`
-	VersionCode   int64             `json:"versionCode"`
 	Fingerprint   string            `json:"fingerprint"`
 	Files         []helpDocFileInfo `json:"files"`
 	TotalID       uint64            `json:"totalId"`
@@ -416,14 +414,13 @@ func loadHelpIndexManifest() (*helpIndexManifest, error) {
 	return &manifest, nil
 }
 
-func buildHelpIndexManifest(engineType EngineType, internalCmdMap CmdMapCls, extList []*ExtInfo) helpIndexManifest {
+func buildHelpIndexManifest(engineType EngineType, _ CmdMapCls, _ []*ExtInfo) helpIndexManifest {
 	curFiles, _ := collectHelpDocFiles("./data/helpdoc")
-	fingerprint := buildHelpIndexFingerprint(internalCmdMap, extList)
+	fingerprint := buildHelpIndexFingerprint()
 	return helpIndexManifest{
 		Version:       helpIndexManifestVersion,
 		SchemaVersion: helpIndexSchemaVersion,
 		EngineType:    engineType,
-		VersionCode:   VERSION_CODE,
 		Fingerprint:   fingerprint,
 		Files:         curFiles,
 	}
@@ -440,9 +437,6 @@ func canReuseHelpIndex(old *helpIndexManifest, cur *helpIndexManifest) bool {
 		return false
 	}
 	if old.EngineType != cur.EngineType {
-		return false
-	}
-	if old.VersionCode != VERSION_CODE {
 		return false
 	}
 	if old.Fingerprint != cur.Fingerprint {
@@ -602,57 +596,17 @@ func collectHelpDocFiles(root string) ([]helpDocFileInfo, error) {
 	return files, err
 }
 
-func buildHelpIndexFingerprint(internalCmdMap CmdMapCls, extList []*ExtInfo) string {
+func buildHelpIndexFingerprint() string {
 	h := sha256.New()
 	write := func(s string) {
 		_, _ = h.Write([]byte(s))
 		_, _ = h.Write([]byte{0})
 	}
-
-	cmdKeys := make([]string, 0, len(internalCmdMap))
-	for k := range internalCmdMap {
-		cmdKeys = append(cmdKeys, k)
-	}
-	sort.Strings(cmdKeys)
-	for _, k := range cmdKeys {
-		v := internalCmdMap[k]
-		write("cmd:" + k)
-		write(v.ShortHelp)
-		write(v.Help)
-	}
-
-	sort.Slice(extList, func(i, j int) bool {
-		var a, b string
-		if extList[i] != nil {
-			a = extList[i].Name
-		}
-		if extList[j] != nil {
-			b = extList[j].Name
-		}
-		return a < b
-	})
-	for _, ext := range extList {
-		if ext == nil {
-			continue
-		}
-		write("ext:" + ext.Name)
-		write(ext.Version)
-		if ext.GetDescText != nil {
-			write(ext.GetDescText(ext))
-		}
-		cmdMap := ext.GetCmdMap()
-		extCmdKeys := make([]string, 0, len(cmdMap))
-		for k := range cmdMap {
-			extCmdKeys = append(extCmdKeys, k)
-		}
-		sort.Strings(extCmdKeys)
-		for _, k := range extCmdKeys {
-			v := cmdMap[k]
-			write("extcmd:" + k)
-			write(v.ShortHelp)
-			write(v.Help)
-		}
-	}
+	// Fingerprint 仅用于 helpdoc 索引机制自身版本识别，不再绑定内置/扩展命令文本。
+	write(fmt.Sprintf("manifest:%d", helpIndexManifestVersion))
+	write(fmt.Sprintf("schema:%d", helpIndexSchemaVersion))
+	write(fmt.Sprintf("parsed-cache:%d", helpDocParsedCacheVersion))
+	write(fmt.Sprintf("engine:%d", BleveSearch))
 
 	return hex.EncodeToString(h.Sum(nil))
 }
