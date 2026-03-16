@@ -571,6 +571,56 @@ func (d *Dice) jsRegisterQuickJSHostAPIs(engine jsengine.Engine) error {
 	}); err != nil {
 		return err
 	}
+	if err := register("seal.ext._syncField", func(extName string, field string, value any) {
+		extName = strings.TrimSpace(extName)
+		field = strings.TrimSpace(field)
+		if extName == "" || field == "" {
+			return
+		}
+		apply := func(ext *ExtInfo) {
+			if ext == nil {
+				return
+			}
+			switch field {
+			case "author":
+				if s, ok := value.(string); ok {
+					ext.Author = s
+				}
+			case "version":
+				if s, ok := value.(string); ok {
+					ext.Version = s
+				}
+			case "brief":
+				if s, ok := value.(string); ok {
+					ext.Brief = s
+				}
+			case "autoActive":
+				ext.AutoActive = quickJSBoolLike(value, ext.AutoActive)
+			case "official":
+				ext.Official = quickJSBoolLike(value, ext.Official)
+			case "isLoaded":
+				ext.IsLoaded = quickJSBoolLike(value, ext.IsLoaded)
+			case "aliases":
+				ext.Aliases = quickJSStringSliceValue(value)
+			case "activeWith":
+				ext.ActiveWith = quickJSStringSliceValue(value)
+			}
+		}
+		if d.JsExtRegistry != nil {
+			if ext, ok := d.JsExtRegistry.Load(extName); ok {
+				apply(ext)
+			}
+		}
+		if wrapper, ok := d.ExtRegistry.Load(extName); ok {
+			apply(wrapper)
+		}
+		if field == "activeWith" {
+			d.rebuildActiveWithGraph()
+		}
+		d.ExtUpdateTime = time.Now().Unix()
+	}); err != nil {
+		return err
+	}
 	resolveExtName := func(ei *ExtInfo) (string, error) {
 		if ei != nil && strings.TrimSpace(ei.Name) != "" {
 			return ei.Name, nil
@@ -764,6 +814,86 @@ func (d *Dice) jsRegisterQuickJSHostAPIs(engine jsengine.Engine) error {
 			return
 		}
 		d.ConfigManager.UnregisterConfig(extName, key...)
+	}); err != nil {
+		return err
+	}
+	if err := register("seal.ext.storageSet", func(ei *ExtInfo, key string, value string) {
+		extName, err := resolveExtName(ei)
+		if err != nil {
+			panic(err)
+		}
+		targetExt := resolveExtByName(extName)
+		if targetExt == nil {
+			panic(errors.New("请先完成此扩展的注册"))
+		}
+		if setErr := targetExt.StorageSet(key, value); setErr != nil {
+			panic(setErr)
+		}
+	}); err != nil {
+		return err
+	}
+	if err := register("seal.ext.storageInit", func(ei *ExtInfo) bool {
+		extName, err := resolveExtName(ei)
+		if err != nil {
+			panic(err)
+		}
+		targetExt := resolveExtByName(extName)
+		if targetExt == nil {
+			panic(errors.New("请先完成此扩展的注册"))
+		}
+		if initErr := targetExt.StorageInit(); initErr != nil {
+			panic(initErr)
+		}
+		return true
+	}); err != nil {
+		return err
+	}
+	if err := register("seal.ext.storageClose", func(ei *ExtInfo) bool {
+		extName, err := resolveExtName(ei)
+		if err != nil {
+			panic(err)
+		}
+		targetExt := resolveExtByName(extName)
+		if targetExt == nil {
+			panic(errors.New("请先完成此扩展的注册"))
+		}
+		if closeErr := targetExt.StorageClose(); closeErr != nil {
+			panic(closeErr)
+		}
+		return true
+	}); err != nil {
+		return err
+	}
+	if err := register("seal.ext.storageGet", func(ei *ExtInfo, key string) string {
+		extName, err := resolveExtName(ei)
+		if err != nil {
+			panic(err)
+		}
+		targetExt := resolveExtByName(extName)
+		if targetExt == nil {
+			panic(errors.New("请先完成此扩展的注册"))
+		}
+		v, getErr := targetExt.StorageGet(key)
+		if getErr != nil {
+			panic(getErr)
+		}
+		return v
+	}); err != nil {
+		return err
+	}
+	if err := register("seal.ext.storageDel", func(ei *ExtInfo, key string) bool {
+		extName, err := resolveExtName(ei)
+		if err != nil {
+			panic(err)
+		}
+		targetExt := resolveExtByName(extName)
+		if targetExt == nil {
+			panic(errors.New("请先完成此扩展的注册"))
+		}
+		if delErr := targetExt.StorageDel(key); delErr != nil {
+			panic(delErr)
+		}
+		return true
 	}); err != nil {
 		return err
 	}
@@ -2086,6 +2216,17 @@ func buildJsMetaCacheEntry(path string, info fs.FileInfo, jsInfo *JsScriptInfo, 
 }
 
 func (d *Dice) JsLoadScripts() {
+	defer func() {
+		if r := recover(); r != nil {
+			d.Logger.Errorf("JsLoadScripts 发生panic: %v\n堆栈:\n%s", r, string(debug.Stack()))
+			if d.JsLoadingScript != nil {
+				d.JsLoadingScript.ErrText = fmt.Sprintf("panic: %v", r)
+				d.JsLoadingScript.Enable = false
+			}
+			d.JsLoadingScript = nil
+		}
+	}()
+
 	d.JsScriptList = []*JsScriptInfo{}
 
 	path := filepath.Join(d.BaseConfig.DataDir, "scripts")
@@ -2120,6 +2261,14 @@ func (d *Dice) JsLoadScripts() {
 	var jsInfos []*JsScriptInfo
 	// 解析内置脚本
 	_ = filepath.Walk(builtinPath, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			d.Logger.Errorf("读取内置脚本目录失败(%s): %v", path, err)
+			return nil
+		}
+		if info == nil {
+			d.Logger.Warnf("读取内置脚本目录得到空文件信息: %s", path)
+			return nil
+		}
 		if isScriptFile(path) {
 			d.Logger.Info("正在读取内置脚本: ", path)
 			key := jsCacheKey(path)
@@ -2176,6 +2325,14 @@ func (d *Dice) JsLoadScripts() {
 
 	// 解析第三方脚本
 	_ = filepath.Walk(path, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			d.Logger.Errorf("读取脚本目录失败(%s): %v", path, err)
+			return nil
+		}
+		if info == nil {
+			d.Logger.Warnf("读取脚本目录得到空文件信息: %s", path)
+			return nil
+		}
 		if info.IsDir() && info.Name() == "_builtin" {
 			return fs.SkipDir
 		}
@@ -2270,7 +2427,20 @@ func (d *Dice) JsLoadScripts() {
 			jsInfo.needCompiled = true
 		}
 
-		d.JsLoadScriptRaw(jsInfo)
+		func(info *JsScriptInfo) {
+			defer func() {
+				if r := recover(); r != nil {
+					errText := fmt.Sprintf("panic: %v", r)
+					if info != nil {
+						info.ErrText = errText
+						info.Enable = false
+					}
+					d.JsLoadingScript = nil
+					d.Logger.Errorf("脚本加载异常(已隔离): %s\n堆栈:\n%s", errText, string(debug.Stack()))
+				}
+			}()
+			d.JsLoadScriptRaw(info)
+		}(jsInfo)
 	}
 	// 统一在所有脚本加载完后应用扩展默认设置
 	// 新扩展激活采用延迟模式，在群组收到消息时通过 GetActivatedExtList 按需激活
@@ -2599,9 +2769,29 @@ func (d *Dice) JsParseMeta(s string, installTime time.Time, rawData []byte, buil
 }
 
 func (d *Dice) JsLoadScriptRaw(jsInfo *JsScriptInfo) {
+	defer func() {
+		if r := recover(); r != nil {
+			errText := fmt.Sprintf("panic: %v", r)
+			scriptName := "<nil>"
+			if jsInfo != nil {
+				scriptName = jsInfo.Filename
+				jsInfo.ErrText = errText
+				jsInfo.Enable = false
+			}
+			d.JsLoadingScript = nil
+			d.Logger.Errorf("读取脚本失败(运行崩溃): %s: %s\n堆栈:\n%s", scriptName, errText, string(debug.Stack()))
+		}
+	}()
+
+	if jsInfo == nil {
+		d.Logger.Error("读取脚本失败: jsInfo 为 nil")
+		return
+	}
+
 	var err error
 	if jsInfo.Enable {
 		d.JsLoadingScript = jsInfo
+		defer func() { d.JsLoadingScript = nil }()
 		var targetPath string
 		var cleanup bool
 		if jsInfo.needCompiled {
@@ -2618,7 +2808,6 @@ func (d *Dice) JsLoadScriptRaw(jsInfo *JsScriptInfo) {
 		if err == nil {
 			err = d.jsRequireModule(targetPath)
 		}
-		d.JsLoadingScript = nil
 	} else {
 		d.Logger.Infof("脚本<%s>已被禁用，跳过加载", jsInfo.Name)
 	}
@@ -2647,10 +2836,15 @@ func (d *Dice) JsLoadScriptRaw(jsInfo *JsScriptInfo) {
 	}
 }
 
-func (d *Dice) jsRequireModule(targetPath string) error {
+func (d *Dice) jsRequireModule(targetPath string) (err error) {
 	if d.ScriptEngine == nil {
 		return errors.New("QuickJS 引擎未初始化")
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("QuickJS Require 执行panic(%s): %v", targetPath, r)
+		}
+	}()
 	return d.ScriptEngine.Require(targetPath)
 }
 

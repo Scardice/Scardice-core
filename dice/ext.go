@@ -418,6 +418,25 @@ func (i *ExtInfo) StorageGet(k string) (string, error) {
 	return val, err
 }
 
+// StorageDel 删除扩展存储中的某个 key，若 key 不存在则视为成功。
+func (i *ExtInfo) StorageDel(k string) error {
+	target := i.GetRealExt()
+	if target == nil {
+		return errors.New("[扩展]:目标扩展不存在")
+	}
+	if err := target.StorageInit(); err != nil {
+		return err
+	}
+	db := target.Storage
+	return db.Update(func(tx *buntdb.Tx) error {
+		_, err := tx.Delete(k)
+		if err != nil && !errors.Is(err, buntdb.ErrNotFound) {
+			return err
+		}
+		return nil
+	})
+}
+
 // StorageList 列出扩展存储中的所有 key。
 func (i *ExtInfo) StorageList() ([]string, error) {
 	target := i.GetRealExt()

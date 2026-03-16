@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,8 +35,11 @@ type nativeBackend struct {
 	moduleDir string
 	opt       Options
 	apis      []jsengine.HostAPI
-	// QuickJS Context 非线程安全，所有 Eval/JS 调用必须串行。
-	vmMu sync.Mutex
+	// QuickJS 不是线程安全的：所有 VM 访问必须在同一个锁定 OS 线程执行。
+	vmThreadMu     sync.RWMutex
+	vmJobs         chan vmThreadJob
+	vmDone         chan struct{}
+	vmThreadClosed atomic.Bool
 
 	runtimeMu              sync.Mutex
 	runtimeGetArgN         func(int64) string
@@ -61,6 +65,11 @@ type nativeBackend struct {
 	wsPumpDone chan struct{}
 }
 
+type vmThreadJob struct {
+	fn  func() error
+	ret chan error
+}
+
 type deferredExtCallback struct {
 	extName      string
 	callbackName string
@@ -81,23 +90,64 @@ type wsBridgeConn struct {
 	mu     sync.Mutex
 }
 
-func newNativeBackend(cfg jsengine.Config, opt Options) (*nativeBackend, error) {
-	rt := bq.NewRuntime()
-	if rt == nil {
-		return nil, fmt.Errorf("创建 QuickJS Runtime 失败")
-	}
-	if opt.MemoryLimitBytes > 0 {
-		rt.SetMemoryLimit(uint64(opt.MemoryLimitBytes))
-	}
-	ctx := rt.NewContext()
-	if ctx == nil {
-		rt.Close()
-		return nil, fmt.Errorf("创建 QuickJS Context 失败")
-	}
+func (n *nativeBackend) startVMThread() {
+	go func() {
+		goruntime.LockOSThread()
+		defer goruntime.UnlockOSThread()
+		defer close(n.vmDone)
+		for job := range n.vmJobs {
+			if job.fn == nil {
+				job.ret <- nil
+				continue
+			}
+			var err error
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						err = fmt.Errorf("vm thread panic: %v", r)
+					}
+				}()
+				err = job.fn()
+			}()
+			job.ret <- err
+		}
+	}()
+}
 
+func (n *nativeBackend) runOnVMThread(fn func() error) error {
+	n.vmThreadMu.RLock()
+	if n.vmThreadClosed.Load() || n.vmJobs == nil {
+		n.vmThreadMu.RUnlock()
+		return fmt.Errorf("QuickJS VM 线程未初始化或已关闭")
+	}
+	job := vmThreadJob{
+		fn:  fn,
+		ret: make(chan error, 1),
+	}
+	n.vmJobs <- job
+	n.vmThreadMu.RUnlock()
+	return <-job.ret
+}
+
+func (n *nativeBackend) closeVMThread() {
+	n.vmThreadMu.Lock()
+	if n.vmThreadClosed.Load() {
+		n.vmThreadMu.Unlock()
+		return
+	}
+	n.vmThreadClosed.Store(true)
+	if n.vmJobs != nil {
+		close(n.vmJobs)
+		n.vmJobs = nil
+	}
+	n.vmThreadMu.Unlock()
+	if n.vmDone != nil {
+		<-n.vmDone
+	}
+}
+
+func newNativeBackend(cfg jsengine.Config, opt Options) (*nativeBackend, error) {
 	n := &nativeBackend{
-		runtime:       rt,
-		ctx:           ctx,
 		moduleDir:     cfg.ModuleDir,
 		opt:           opt,
 		apis:          make([]jsengine.HostAPI, 0, 8),
@@ -107,9 +157,34 @@ func newNativeBackend(cfg jsengine.Config, opt Options) (*nativeBackend, error) 
 		wsConns:       map[int64]*wsBridgeConn{},
 		wsPumpStop:    make(chan struct{}),
 		wsPumpDone:    make(chan struct{}),
+		vmJobs:        make(chan vmThreadJob, 128),
+		vmDone:        make(chan struct{}),
 	}
-	n.installBaseGlobals()
-	_ = n.evalGlobalLocked(quickJSPolyfillScript)
+	n.startVMThread()
+	if err := n.runOnVMThread(func() error {
+		rt := bq.NewRuntime()
+		if rt == nil {
+			return fmt.Errorf("创建 QuickJS Runtime 失败")
+		}
+		if opt.MemoryLimitBytes > 0 {
+			rt.SetMemoryLimit(uint64(opt.MemoryLimitBytes))
+		}
+		ctx := rt.NewContext()
+		if ctx == nil {
+			rt.Close()
+			return fmt.Errorf("创建 QuickJS Context 失败")
+		}
+		n.runtime = rt
+		n.ctx = ctx
+		n.installBaseGlobals()
+		if err := n.evalGlobalLocked(quickJSPolyfillScript); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		n.closeVMThread()
+		return nil, err
+	}
 	n.startWSPump()
 	return n, nil
 }
@@ -528,22 +603,37 @@ func (n *nativeBackend) readModule(moduleID string, parentID string) (string, er
 	return string(raw), nil
 }
 
+func wrapModuleForGlobalEval(code string, moduleID string) string {
+	source := strings.ReplaceAll(moduleID, "\n", "")
+	source = strings.ReplaceAll(source, "\r", "")
+	return fmt.Sprintf("(function(){\n%s\n})();\n//# sourceURL=%s", code, source)
+}
+
 func (n *nativeBackend) evalGlobal(code string) error {
-	n.vmMu.Lock()
-	defer n.vmMu.Unlock()
-	return n.evalGlobalLocked(code)
+	return n.runOnVMThread(func() error {
+		return n.evalGlobalLocked(code)
+	})
 }
 
 func (n *nativeBackend) evalGlobalValue(code string) (string, error) {
-	n.vmMu.Lock()
-	defer n.vmMu.Unlock()
-	return n.evalGlobalValueLocked(code)
+	var ret string
+	err := n.runOnVMThread(func() error {
+		var innerErr error
+		ret, innerErr = n.evalGlobalValueLocked(code)
+		return innerErr
+	})
+	return ret, err
 }
 
-func (n *nativeBackend) evalGlobalLocked(code string) error {
+func (n *nativeBackend) evalGlobalLocked(code string) (err error) {
 	if n.ctx == nil {
 		return fmt.Errorf("QuickJS VM 未初始化")
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("quickjs eval panic: %v", r)
+		}
+	}()
 	v := n.ctx.Eval(code, bq.EvalFlagGlobal(true))
 	defer v.Free()
 	// 若脚本返回 Promise（例如 async IIFE），需要主动驱动 QuickJS pending jobs，否则会表现为“执行无响应”。
@@ -566,10 +656,16 @@ func (n *nativeBackend) evalGlobalLocked(code string) error {
 	return nil
 }
 
-func (n *nativeBackend) evalGlobalValueLocked(code string) (string, error) {
+func (n *nativeBackend) evalGlobalValueLocked(code string) (ret string, err error) {
 	if n.ctx == nil {
 		return "", fmt.Errorf("QuickJS VM 未初始化")
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			ret = ""
+			err = fmt.Errorf("quickjs eval panic: %v", r)
+		}
+	}()
 	v := n.ctx.Eval(code, bq.EvalFlagGlobal(true))
 	defer v.Free()
 	if v.IsPromise() {
@@ -677,6 +773,42 @@ func buildAssignPathScriptJSON(path []string, binding string) (string, error) {
 	return b.String(), nil
 }
 
+func buildAssignPathScriptExtNew(path []string, binding string) (string, error) {
+	base, err := buildAssignPathScript(path, binding)
+	if err != nil {
+		return "", err
+	}
+	last := path[len(path)-1]
+	lastJSON, err := json.Marshal(last)
+	if err != nil {
+		return "", err
+	}
+	parentExpr := "globalThis"
+	for _, seg := range path[:len(path)-1] {
+		segJSON, err := json.Marshal(seg)
+		if err != nil {
+			return "", err
+		}
+		parentExpr += "[" + string(segJSON) + "]"
+	}
+	var b strings.Builder
+	b.WriteString(base)
+	b.WriteString(parentExpr)
+	b.WriteString("[")
+	b.Write(lastJSON)
+	b.WriteString("] = ((f) => (...args) => {")
+	b.WriteString("const r = f(...args);")
+	b.WriteString("const ext = r == null ? null : JSON.parse(r);")
+	b.WriteString("if (typeof globalThis.__sd_bind_ext_helpers === 'function') { return globalThis.__sd_bind_ext_helpers(ext); }")
+	b.WriteString("return ext;")
+	b.WriteString("})(")
+	b.WriteString(parentExpr)
+	b.WriteString("[")
+	b.Write(lastJSON)
+	b.WriteString("]);")
+	return b.String(), nil
+}
+
 func buildAssignPathScriptFind(path []string, binding string) (string, error) {
 	base, err := buildAssignPathScript(path, binding)
 	if err != nil {
@@ -716,6 +848,7 @@ func buildAssignPathScriptFind(path []string, binding string) (string, error) {
 	b.WriteString("cmd.helpFunc = (isShort) => globalThis.seal.ext._invokeCmdHelp(extName, String(cmdName), !!isShort);")
 	b.WriteString("}")
 	b.WriteString("}")
+	b.WriteString("if (typeof globalThis.__sd_bind_ext_helpers === 'function') { return globalThis.__sd_bind_ext_helpers(ext); }")
 	b.WriteString("return ext;")
 	b.WriteString("})(")
 	b.WriteString(parentExpr)
@@ -755,7 +888,7 @@ func buildAssignPathScriptRegister(path []string, binding string) (string, error
 	b.WriteString("[")
 	b.Write(lastJSON)
 	b.WriteString("];")
-	b.WriteString("const __sd_sync_cmd = (name, cmdName, cmdObj) => {")
+	b.WriteString("globalThis.__sd_sync_cmd = globalThis.__sd_sync_cmd || ((name, cmdName, cmdObj) => {")
 	b.WriteString("if (!name || !cmdName) { return; }")
 	b.WriteString("if (cmdObj && typeof cmdObj.solve === 'function') { globalThis.__sd_cmd_solve_map[name + ':' + cmdName] = cmdObj.solve; }")
 	b.WriteString("else { delete globalThis.__sd_cmd_solve_map[name + ':' + cmdName]; }")
@@ -766,23 +899,23 @@ func buildAssignPathScriptRegister(path []string, binding string) (string, error
 	b.WriteString("if (cleanCmd && cmdObj && typeof cmdObj.helpFunc === 'function') { cleanCmd.__sdHasHelpFunc = true; }")
 	b.WriteString("globalThis.seal.ext._syncCmd(name, cmdName, cleanCmd);")
 	b.WriteString("}")
-	b.WriteString("};")
-	b.WriteString("const __sd_wrap_cmd_map = (ext) => {")
+	b.WriteString("});")
+	b.WriteString("globalThis.__sd_wrap_cmd_map = globalThis.__sd_wrap_cmd_map || ((ext) => {")
 	b.WriteString("if (!ext || typeof ext !== 'object') { return; }")
 	b.WriteString("const name = ext && ext.name ? String(ext.name) : '';")
 	b.WriteString("if (!name) { return; }")
 	b.WriteString("let map = (ext.cmdMap && typeof ext.cmdMap === 'object') ? ext.cmdMap : {};")
 	b.WriteString("if (!map.__sd_cmd_proxy) {")
 	b.WriteString("const p = new Proxy(map, {")
-	b.WriteString("set(target, prop, value) { target[prop] = value; if (typeof prop === 'string' && prop) { __sd_sync_cmd(name, prop, value); } return true; },")
-	b.WriteString("deleteProperty(target, prop) { if (typeof prop === 'string' && prop) { __sd_sync_cmd(name, prop, null); } return delete target[prop]; }")
+	b.WriteString("set(target, prop, value) { target[prop] = value; if (typeof prop === 'string' && prop) { globalThis.__sd_sync_cmd(name, prop, value); } return true; },")
+	b.WriteString("deleteProperty(target, prop) { if (typeof prop === 'string' && prop) { globalThis.__sd_sync_cmd(name, prop, null); } return delete target[prop]; }")
 	b.WriteString("});")
 	b.WriteString("Object.defineProperty(p, '__sd_cmd_proxy', { value: true, configurable: false, enumerable: false, writable: false });")
 	b.WriteString("map = p;")
 	b.WriteString("ext.cmdMap = map;")
 	b.WriteString("}")
-	b.WriteString("for (const k of Object.keys(map)) { __sd_sync_cmd(name, k, map[k]); }")
-	b.WriteString("};")
+	b.WriteString("for (const k of Object.keys(map)) { globalThis.__sd_sync_cmd(name, k, map[k]); }")
+	b.WriteString("});")
 	b.WriteString("const __sd_reg_now = (one) => {")
 	b.WriteString("if (!one || typeof one !== 'object') { return; }")
 	b.WriteString("const name = one && one.name ? String(one.name) : '';")
@@ -796,7 +929,7 @@ func buildAssignPathScriptRegister(path []string, binding string) (string, error
 	b.WriteString("for (const cbName of ['onLoad','onNotCommandReceived','onCommandOverride','onCommandReceived','onMessageReceived','onMessageSend','onMessageDeleted','onMessageEdit','onGroupJoined','onGroupMemberJoined','onGuildJoined','onBecomeFriend','onPoke','onGroupLeave','getDescText']) { __sd_store_cb(cbName); }")
 	b.WriteString("if (typeof one.onNotCommandReceived === 'function') { globalThis.__sd_ext_on_not_cmd_map[name] = one.onNotCommandReceived; }")
 	b.WriteString("else { delete globalThis.__sd_ext_on_not_cmd_map[name]; }")
-	b.WriteString("__sd_wrap_cmd_map(one);")
+	b.WriteString("globalThis.__sd_wrap_cmd_map(one);")
 	b.WriteString("const clean = JSON.parse(JSON.stringify(one, (_k, v) => (typeof v === 'function' ? undefined : v)));")
 	b.WriteString("clean.__sdCallbacks = callbacks;")
 	b.WriteString("__sd_reg_orig(JSON.stringify(clean));")
@@ -977,8 +1110,12 @@ func (n *nativeBackend) unmarshalArg(arg *bq.Value, t reflect.Type) (reflect.Val
 }
 
 func (n *nativeBackend) registerAPI(api jsengine.HostAPI) error {
-	n.vmMu.Lock()
-	defer n.vmMu.Unlock()
+	return n.runOnVMThread(func() error {
+		return n.registerAPIOnVM(api)
+	})
+}
+
+func (n *nativeBackend) registerAPIOnVM(api jsengine.HostAPI) error {
 	if strings.TrimSpace(api.Name) == "" {
 		return fmt.Errorf("host api 名称为空")
 	}
@@ -1025,6 +1162,15 @@ func (n *nativeBackend) registerAPI(api jsengine.HostAPI) error {
 		if len(out) == 0 {
 			return ctx.Undefined()
 		}
+		if len(out) == 1 {
+			if out[0].Type().Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+				if !out[0].IsNil() {
+					return ctx.ThrowError(out[0].Interface().(error))
+				}
+				return ctx.Undefined()
+			}
+			return n.marshalResult(out[0].Interface())
+		}
 		if len(out) >= 2 {
 			if errV := out[len(out)-1]; errV.Type().Implements(reflect.TypeOf((*error)(nil)).Elem()) && !errV.IsNil() {
 				return ctx.ThrowError(errV.Interface().(error))
@@ -1037,7 +1183,9 @@ func (n *nativeBackend) registerAPI(api jsengine.HostAPI) error {
 
 	path := strings.Split(api.Name, ".")
 	scriptBuilder := buildAssignPathScript
-	if api.Name == "seal.ext.new" || api.Name == "seal.ext.newCmdItemInfo" || api.Name == "seal.ext.newCmdExecuteResult" {
+	if api.Name == "seal.ext.new" {
+		scriptBuilder = buildAssignPathScriptExtNew
+	} else if api.Name == "seal.ext.newCmdItemInfo" || api.Name == "seal.ext.newCmdExecuteResult" {
 		scriptBuilder = buildAssignPathScriptJSON
 	} else if api.Name == "seal.ext.find" {
 		scriptBuilder = buildAssignPathScriptFind
@@ -1054,29 +1202,33 @@ func (n *nativeBackend) registerAPI(api jsengine.HostAPI) error {
 }
 
 func (n *nativeBackend) registerAllAPIs() error {
-	for _, api := range n.apis {
-		if err := n.registerAPI(api); err != nil {
-			return err
+	return n.runOnVMThread(func() error {
+		for _, api := range n.apis {
+			if err := n.registerAPIOnVM(api); err != nil {
+				return err
+			}
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 func (n *nativeBackend) Dispose() error {
 	if err := n.Quiesce(); err != nil {
 		return err
 	}
-	n.vmMu.Lock()
-	defer n.vmMu.Unlock()
-	if n.ctx != nil {
-		n.ctx.Close()
-		n.ctx = nil
-	}
-	if n.runtime != nil {
-		n.runtime.Close()
-		n.runtime = nil
-	}
-	return nil
+	err := n.runOnVMThread(func() error {
+		if n.ctx != nil {
+			n.ctx.Close()
+			n.ctx = nil
+		}
+		if n.runtime != nil {
+			n.runtime.Close()
+			n.runtime = nil
+		}
+		return nil
+	})
+	n.closeVMThread()
+	return err
 }
 
 func (n *nativeBackend) Quiesce() error {
@@ -1120,6 +1272,118 @@ const quickJSPolyfillScript = `(function(){
 // globalThis.require(...).
 if (typeof globalThis.__dirname === 'undefined') globalThis.__dirname = '';
 if (typeof globalThis.__filename === 'undefined') globalThis.__filename = '';
+if (typeof globalThis.__sd_bind_ext_helpers !== 'function') {
+  globalThis.__sd_bind_ext_helpers = function(ext) {
+    if (!ext || typeof ext !== 'object') return ext;
+    if (ext.__sd_ext_proxy && typeof ext.__sd_ext_proxy === 'object') return ext.__sd_ext_proxy;
+    const extName = ext && ext.name ? String(ext.name) : '';
+    const callbackMap = (globalThis.__sd_ext_callback_map && typeof globalThis.__sd_ext_callback_map === 'object') ? globalThis.__sd_ext_callback_map : {};
+    const onNotCommandMap = (globalThis.__sd_ext_on_not_cmd_map && typeof globalThis.__sd_ext_on_not_cmd_map === 'object') ? globalThis.__sd_ext_on_not_cmd_map : {};
+    const callbackNames = new Set(['onLoad','onNotCommandReceived','onCommandOverride','onCommandReceived','onMessageReceived','onMessageSend','onMessageDeleted','onMessageEdit','onGroupJoined','onGroupMemberJoined','onGuildJoined','onBecomeFriend','onPoke','onGroupLeave','getDescText']);
+    const syncFields = new Set(['author','version','brief','autoActive','official','aliases','activeWith','isLoaded']);
+    const syncField = (field, value) => {
+      if (!extName) return;
+      const api = globalThis.seal && globalThis.seal.ext && globalThis.seal.ext._syncField;
+      if (typeof api !== 'function') return;
+      try { api(extName, String(field), value); } catch (_e) {}
+    };
+    const syncCallback = (callbackName, value) => {
+      if (!extName) return;
+      const key = extName + ':' + callbackName;
+      if (typeof value === 'function') {
+        callbackMap[key] = value;
+        if (callbackName === 'onNotCommandReceived') onNotCommandMap[extName] = value;
+      } else {
+        delete callbackMap[key];
+        if (callbackName === 'onNotCommandReceived') delete onNotCommandMap[extName];
+      }
+    };
+    const bind = (methodName, apiName) => {
+      if (typeof ext[methodName] === 'function') return;
+      ext[methodName] = (...args) => {
+        const api = globalThis.seal && globalThis.seal.ext && globalThis.seal.ext[apiName];
+        if (typeof api !== 'function') {
+          throw new TypeError('seal.ext.' + apiName + ' is not a function');
+        }
+        return api(ext, ...args);
+      };
+    };
+    const bindCallback = (propName, callbackName, fallback) => {
+      if (typeof ext[propName] === 'function') return;
+      ext[propName] = (...args) => {
+        if (!extName) return fallback;
+        const key = extName + ':' + callbackName;
+        let fn = callbackMap[key];
+        if (typeof fn !== 'function' && callbackName === 'onNotCommandReceived') {
+          fn = onNotCommandMap[extName];
+        }
+        if (typeof fn === 'function') {
+          return fn(...args);
+        }
+        return fallback;
+      };
+    };
+    bind('storageSet', 'storageSet');
+    bind('storageInit', 'storageInit');
+    bind('storageClose', 'storageClose');
+    bind('storageGet', 'storageGet');
+    bind('storageDel', 'storageDel');
+    bind('storageDelete', 'storageDel');
+    bindCallback('onNotCommandReceived', 'onNotCommandReceived', undefined);
+    bindCallback('onCommandOverride', 'onCommandOverride', false);
+    bindCallback('onCommandReceived', 'onCommandReceived', undefined);
+    bindCallback('onMessageReceived', 'onMessageReceived', undefined);
+    bindCallback('onMessageSend', 'onMessageSend', undefined);
+    bindCallback('onMessageDeleted', 'onMessageDeleted', undefined);
+    bindCallback('onMessageEdit', 'onMessageEdit', undefined);
+    bindCallback('onGroupJoined', 'onGroupJoined', undefined);
+    bindCallback('onGroupMemberJoined', 'onGroupMemberJoined', undefined);
+    bindCallback('onGuildJoined', 'onGuildJoined', undefined);
+    bindCallback('onBecomeFriend', 'onBecomeFriend', undefined);
+    bindCallback('onPoke', 'onPoke', undefined);
+    bindCallback('onGroupLeave', 'onGroupLeave', undefined);
+    bindCallback('getDescText', 'getDescText', '');
+    bindCallback('onLoad', 'onLoad', undefined);
+    if (typeof ext.isLoaded !== 'boolean') {
+      ext.isLoaded = true;
+    }
+    if (typeof globalThis.__sd_wrap_cmd_map === 'function') {
+      try { globalThis.__sd_wrap_cmd_map(ext); } catch (_e) {}
+    }
+    const proxied = new Proxy(ext, {
+      set(target, prop, value) {
+        const key = String(prop || '');
+        target[prop] = value;
+        if (!key) return true;
+        if (callbackNames.has(key)) {
+          syncCallback(key, value);
+          return true;
+        }
+        if (key === 'cmdMap') {
+          if (typeof globalThis.__sd_wrap_cmd_map === 'function') {
+            try { globalThis.__sd_wrap_cmd_map(target); } catch (_e) {}
+          }
+          return true;
+        }
+        if (syncFields.has(key)) {
+          syncField(key, value);
+        }
+        return true;
+      },
+      deleteProperty(target, prop) {
+        const key = String(prop || '');
+        if (callbackNames.has(key)) {
+          syncCallback(key, undefined);
+        }
+        return delete target[prop];
+      }
+    });
+    try {
+      Object.defineProperty(ext, '__sd_ext_proxy', { value: proxied, configurable: false, enumerable: false, writable: false });
+    } catch (_e) {}
+    return proxied;
+  };
+}
 
 if (typeof globalThis.fetch !== 'function') {
   globalThis.fetch = function(input, init) {
@@ -1368,31 +1632,11 @@ return JSON.stringify(out, (_k, v) => {
   return v;
 });
 })()`, string(codeJSON))
-	n.vmMu.Lock()
-	defer n.vmMu.Unlock()
-	if n.ctx == nil {
-		return nil, fmt.Errorf("QuickJS VM 未初始化")
+	raw, err := n.evalGlobalValue(script)
+	if err != nil {
+		return nil, err
 	}
-	v := n.ctx.Eval(script, bq.EvalFlagGlobal(true))
-	defer v.Free()
-	if v.IsPromise() {
-		ret := n.ctx.Await(v)
-		defer ret.Free()
-		if ret.IsException() {
-			if err := n.ctx.Exception(); err != nil {
-				return nil, err
-			}
-			return nil, fmt.Errorf("quickjs await exception")
-		}
-		v = ret
-	}
-	if v.IsException() {
-		if err := n.ctx.Exception(); err != nil {
-			return nil, err
-		}
-		return nil, fmt.Errorf("quickjs eval exception")
-	}
-	raw := strings.TrimSpace(v.String())
+	raw = strings.TrimSpace(raw)
 	if raw == "" || raw == "undefined" || raw == "null" {
 		return nil, nil
 	}
@@ -1403,7 +1647,12 @@ return JSON.stringify(out, (_k, v) => {
 	return out, nil
 }
 
-func (n *nativeBackend) Require(moduleID string) error {
+func (n *nativeBackend) Require(moduleID string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("QuickJS Require panic(%s): %v", moduleID, r)
+		}
+	}()
 	payload, err := n.readModule(moduleID, "")
 	if err != nil {
 		return err
@@ -1415,7 +1664,8 @@ func (n *nativeBackend) Require(moduleID string) error {
 	if err := json.Unmarshal([]byte(payload), &data); err != nil {
 		return fmt.Errorf("解析脚本失败: %w", err)
 	}
-	if err := n.evalGlobal(data.Code); err != nil {
+	code := wrapModuleForGlobalEval(data.Code, data.ID)
+	if err := n.evalGlobal(code); err != nil {
 		return fmt.Errorf("执行脚本失败(%s): %w", moduleID, err)
 	}
 	_ = n.evalGlobal(`if (typeof globalThis.__sd_ws_pump === 'function') { globalThis.__sd_ws_pump(); }`)
@@ -1451,31 +1701,43 @@ func (n *nativeBackend) Reset() error {
 	} else {
 		n.cryptoStore.Reset()
 	}
-	if n.ctx != nil {
-		n.ctx.Close()
-		n.ctx = nil
-	}
-	if n.runtime == nil {
-		rt := bq.NewRuntime()
-		if rt == nil {
-			return fmt.Errorf("创建 QuickJS Runtime 失败")
+	if err := n.runOnVMThread(func() error {
+		if n.ctx != nil {
+			n.ctx.Close()
+			n.ctx = nil
 		}
-		if n.opt.MemoryLimitBytes > 0 {
-			rt.SetMemoryLimit(uint64(n.opt.MemoryLimitBytes))
+		if n.runtime == nil {
+			rt := bq.NewRuntime()
+			if rt == nil {
+				return fmt.Errorf("创建 QuickJS Runtime 失败")
+			}
+			if n.opt.MemoryLimitBytes > 0 {
+				rt.SetMemoryLimit(uint64(n.opt.MemoryLimitBytes))
+			}
+			n.runtime = rt
 		}
-		n.runtime = rt
+		ctx := n.runtime.NewContext()
+		if ctx == nil {
+			return fmt.Errorf("创建 QuickJS Context 失败")
+		}
+		n.ctx = ctx
+		n.installBaseGlobals()
+		if err := n.evalGlobalLocked(quickJSPolyfillScript); err != nil {
+			return err
+		}
+		for _, api := range n.apis {
+			if err := n.registerAPIOnVM(api); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
-	ctx := n.runtime.NewContext()
-	if ctx == nil {
-		return fmt.Errorf("创建 QuickJS Context 失败")
-	}
-	n.ctx = ctx
-	n.installBaseGlobals()
-	_ = n.evalGlobalLocked(quickJSPolyfillScript)
 	n.wsPumpStop = make(chan struct{})
 	n.wsPumpDone = make(chan struct{})
 	n.startWSPump()
-	return n.registerAllAPIs()
+	return nil
 }
 
 func jsonLiteral(v any) string {
@@ -1630,23 +1892,10 @@ if (hasSolved) { out.solved = !!ret.solved; }
 if (hasShowHelp) { out.showHelp = !!ret.showHelp; }
 return JSON.stringify(out);
 })()`
-	n.vmMu.Lock()
-	if n.ctx == nil {
-		n.vmMu.Unlock()
-		return nil, fmt.Errorf("QuickJS VM 未初始化")
+	retJSON, err := n.evalGlobalValue(retScript)
+	if err != nil {
+		return nil, err
 	}
-	retVal := n.ctx.Eval(retScript, bq.EvalFlagGlobal(true))
-	if retVal.IsException() {
-		retVal.Free()
-		n.vmMu.Unlock()
-		if err := n.ctx.Exception(); err != nil {
-			return nil, err
-		}
-		return nil, fmt.Errorf("quickjs eval exception")
-	}
-	retJSON := retVal.String()
-	retVal.Free()
-	n.vmMu.Unlock()
 	_ = n.evalGlobal(`if (typeof globalThis.__sd_ws_pump === 'function') { globalThis.__sd_ws_pump(); }`)
 	if strings.TrimSpace(retJSON) == "" {
 		return map[string]any{}, nil
@@ -1659,11 +1908,6 @@ return JSON.stringify(out);
 }
 
 func (n *nativeBackend) InvokeStoredCmdHelp(extName string, cmdName string, isShort bool) (string, error) {
-	n.vmMu.Lock()
-	defer n.vmMu.Unlock()
-	if n.ctx == nil {
-		return "", fmt.Errorf("QuickJS VM 未初始化")
-	}
 	keyJSON, _ := json.Marshal(extName + ":" + cmdName)
 	boolJSON := "false"
 	if isShort {
@@ -1672,18 +1916,10 @@ func (n *nativeBackend) InvokeStoredCmdHelp(extName string, cmdName string, isSh
 	script := fmt.Sprintf(`(function() {
 const fn = globalThis.__sd_cmd_help_func_map && globalThis.__sd_cmd_help_func_map[%s];
 if (typeof fn !== 'function') { return ''; }
-const ret = fn(%s);
-return ret == null ? '' : String(ret);
+	const ret = fn(%s);
+	return ret == null ? '' : String(ret);
 })()`, string(keyJSON), boolJSON)
-	v := n.ctx.Eval(script, bq.EvalFlagGlobal(true))
-	defer v.Free()
-	if v.IsException() {
-		if err := n.ctx.Exception(); err != nil {
-			return "", err
-		}
-		return "", fmt.Errorf("quickjs eval exception")
-	}
-	return v.String(), nil
+	return n.evalGlobalValue(script)
 }
 
 func (n *nativeBackend) invokeStoredExtCallbackNow(extName string, callbackName string, runtime map[string]any) error {
@@ -1843,11 +2079,6 @@ func (n *nativeBackend) InvokeStoredOnNotCommand(extName string, runtime map[str
 }
 
 func (n *nativeBackend) InvokeStoredTask(fnRef string, taskCtx map[string]any) error {
-	n.vmMu.Lock()
-	defer n.vmMu.Unlock()
-	if n.ctx == nil {
-		return fmt.Errorf("QuickJS VM 未初始化")
-	}
 	refJSON, _ := json.Marshal(fnRef)
 	ctxJSON, _ := json.Marshal(taskCtx)
 	ctxStrJSON, _ := json.Marshal(string(ctxJSON))
@@ -1857,10 +2088,8 @@ if (typeof fn !== 'function') { throw new Error("task callback not found: " + %s
 const arg = JSON.parse(%s);
 fn(arg);
 })();`, string(refJSON), string(refJSON), string(ctxStrJSON))
-	v := n.ctx.Eval(script, bq.EvalFlagGlobal(true))
-	defer v.Free()
-	if v.IsException() {
-		return fmt.Errorf("QuickJS 调用任务回调失败: %s", v.Error())
+	if err := n.evalGlobal(script); err != nil {
+		return fmt.Errorf("QuickJS 调用任务回调失败: %w", err)
 	}
 	return nil
 }
