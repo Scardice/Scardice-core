@@ -6,6 +6,10 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
+func shouldReloadDangerousAPIState(jsEnabled bool, runtimeSealInstExposed bool, desiredExposeDangerousSealInst bool) bool {
+	return jsEnabled && runtimeSealInstExposed != desiredExposeDangerousSealInst
+}
+
 func DiceAdvancedConfigGet(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
@@ -18,7 +22,8 @@ func DiceAdvancedConfigSet(c echo.Context) error {
 		return c.JSON(http.StatusForbidden, nil)
 	}
 
-	advancedConfig := myDice.AdvancedConfig
+	prevAdvancedConfig := myDice.AdvancedConfig
+	advancedConfig := prevAdvancedConfig
 	err := c.Bind(&advancedConfig)
 	if err != nil {
 		return Error(&c, err.Error(), nil)
@@ -29,5 +34,17 @@ func DiceAdvancedConfigSet(c echo.Context) error {
 	// 统一标记为修改
 	myDice.MarkModified()
 	myDice.Parent.Save()
-	return Success(&c, Response{})
+
+	reloadTriggered := false
+	if shouldReloadDangerousAPIState(myDice.Config.JsEnable, myDice.JsSealInstExposed, advancedConfig.ExposeDangerousSealInst) {
+		myDice.JsReloadLock.Lock()
+		myDice.JsReload()
+		myDice.JsReloadLock.Unlock()
+		reloadTriggered = true
+	}
+
+	return c.JSON(http.StatusOK, map[string]any{
+		"result":            true,
+		"jsReloadTriggered": reloadTriggered,
+	})
 }
