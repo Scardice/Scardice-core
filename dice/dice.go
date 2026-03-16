@@ -49,7 +49,7 @@ type CmdItemInfo struct {
 	EnableExecuteTimesParse bool                      `jsbind:"enableExecuteTimesParse"` // 启用执行次数解析，也就是解析3#这样的文本
 
 	IsJsSolveFunc bool
-	JSLoopVersion int64                                                                  // Loop版本号
+	JSLoopVersion int64 // Loop版本号
 	Solve         func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult
 	SolveRaw      func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) goja.Value `jsbind:"solve"`
 
@@ -280,10 +280,13 @@ type Dice struct {
 	StoreManager *StoreManager `json:"-" yaml:"-"`
 
 	/* Wrapper 架构 */
-	JsExtRegistry   *SyncMap[string, *ExtInfo] `json:"-" yaml:"-"` // JS 扩展真实 ExtInfo 注册表
-	ExtUpdateTime   int64                      `json:"-" yaml:"-"` // 扩展变更时间戳，用于触发群组延迟更新
-	JsReloading     bool                       `json:"-" yaml:"-"` // JS 扩展正在重载中
-	startupJsLoadWG sync.WaitGroup             `json:"-" yaml:"-"`
+	JsExtRegistry *SyncMap[string, *ExtInfo] `json:"-" yaml:"-"` // JS 扩展真实 ExtInfo 注册表
+	ExtUpdateTime int64                      `json:"-" yaml:"-"` // 扩展变更时间戳，用于触发群组延迟更新
+	JsReloading   bool                       `json:"-" yaml:"-"` // JS 扩展正在重载中
+	// 记录当前运行中的 VM 是否实际暴露了 seal.inst。不能只看 AdvancedConfig，
+	// 因为脚本本身就可以通过 seal.inst 改写这份配置，但那不会立刻改变已经构建完成的 VM。
+	JsSealInstExposed bool           `json:"-" yaml:"-"`
+	startupJsLoadWG   sync.WaitGroup `json:"-" yaml:"-"`
 
 	/* 保存优化 */
 	DirtyGroups *SyncMap[string, int64] `json:"-" yaml:"-"` // 脏群组列表：groupID -> UpdatedAtTime

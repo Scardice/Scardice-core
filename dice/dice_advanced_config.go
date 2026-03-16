@@ -9,4 +9,6 @@ type AdvancedConfig struct {
 	StoryLogBackendUrl   string `json:"storyLogBackendUrl"   yaml:"storyLogBackendUrl"`   // 自定义后端地址
 	StoryLogApiVersion   string `json:"storyLogApiVersion"   yaml:"storyLogApiVersion"`   // 后端 api 版本
 	StoryLogBackendToken string `json:"storyLogBackendToken" yaml:"storyLogBackendToken"` // 自定义后端 token
+
+	ExposeDangerousSealInst bool `json:"exposeDangerousSealInst" yaml:"exposeDangerousSealInst"` // 向 JS 暴露 seal.inst 危险接口
 }

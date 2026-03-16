@@ -67,6 +67,199 @@ const (
 	tsCacheVersion     = 1
 )
 
+type JsDangerousAPIUsage struct {
+	ID                string                     `json:"id"`
+	Name              string                     `json:"name"`
+	Description       string                     `json:"description"`
+	Risk              string                     `json:"risk"`
+	Occurrences       []JsDangerousAPIOccurrence `json:"occurrences"`
+	ReferencedMembers []string                   `json:"referencedMembers"`
+}
+
+type JsDangerousAPIOccurrence struct {
+	Line              int    `json:"line"`
+	Column            int    `json:"column"`
+	Kind              string `json:"kind"`
+	Member            string `json:"member"`
+	Access            string `json:"access"`
+	MemberDescription string `json:"memberDescription"`
+}
+
+type jsDangerousAPIRule struct {
+	ID          string
+	Name        string
+	Description string
+	Risk        string
+	Pattern     *regexp.Regexp
+}
+
+func normalizeDangerousAPIOccurrences(items []JsDangerousAPIOccurrence) []JsDangerousAPIOccurrence {
+	if len(items) == 0 {
+		return []JsDangerousAPIOccurrence{}
+	}
+	out := make([]JsDangerousAPIOccurrence, 0, len(items))
+	for _, item := range items {
+		out = append(out, JsDangerousAPIOccurrence{
+			Line:              item.Line,
+			Column:            item.Column,
+			Kind:              item.Kind,
+			Member:            item.Member,
+			Access:            item.Access,
+			MemberDescription: item.MemberDescription,
+		})
+	}
+	return out
+}
+
+func normalizeDangerousAPIUsages(items []JsDangerousAPIUsage) []JsDangerousAPIUsage {
+	if len(items) == 0 {
+		return []JsDangerousAPIUsage{}
+	}
+	out := make([]JsDangerousAPIUsage, 0, len(items))
+	for _, item := range items {
+		usage := JsDangerousAPIUsage{
+			ID:                item.ID,
+			Name:              item.Name,
+			Description:       item.Description,
+			Risk:              item.Risk,
+			Occurrences:       normalizeDangerousAPIOccurrences(item.Occurrences),
+			ReferencedMembers: []string{},
+		}
+		if len(item.ReferencedMembers) > 0 {
+			usage.ReferencedMembers = append(usage.ReferencedMembers, item.ReferencedMembers...)
+		}
+		out = append(out, usage)
+	}
+	return out
+}
+
+var jsDangerousAPIRules = []jsDangerousAPIRule{
+	{
+		ID:          "seal.inst",
+		Name:        "seal.inst",
+		Description: "向脚本暴露核心 Dice 实例。",
+		Risk:        "可直接访问核心导出方法，可能修改配置、增删骰主、重载或关闭 JS 环境，并读写运行时状态。",
+		Pattern:     regexp.MustCompile(`\bseal(?:\s*\?\s*\.\s*|\s*\.\s*)inst\b|\bseal(?:\s*\?\s*\.\s*|\s*)\[\s*["']inst["']\s*\]`),
+	},
+}
+
+var sealInstMemberDescriptions = map[string]string{
+	"ImSession":                      "当前 IM 会话对象，包含端点、群组会话和消息处理运行态。",
+	"imSession":                      "当前 IM 会话对象，包含端点、群组会话和消息处理运行态。",
+	"CmdMap":                         "核心命令映射表，包含已注册的命令项。",
+	"ExtList":                        "当前扩展列表，包含已注册扩展对象。",
+	"ExtRegistry":                    "扩展注册表，用于按名称或别名索引扩展。",
+	"ActiveWithGraph":                "扩展开关联动图，用于处理 ActiveWith 依赖关系。",
+	"ActiveWithGraphMu":              "保护扩展开关联动图的读写锁。",
+	"ExtRegistryVersion":             "扩展注册表版本号，扩展变更时递增。",
+	"RollParser":                     "骰点表达式解析器实例。",
+	"LastUpdatedTime":                "最近一次标记为已修改的时间戳。",
+	"TextMap":                        "当前文本模板映射表。",
+	"BaseConfig":                     "基础配置对象，包含实例名和数据目录等基础信息。",
+	"DBOperator":                     "数据库操作器，用于访问底层数据库。",
+	"Logger":                         "核心日志记录器。",
+	"LogWriter":                      "供 UI 使用的日志写入器。",
+	"IsDeckLoading":                  "当前是否正在加载牌堆。",
+	"DeckList":                       "当前牌堆列表。",
+	"deckList":                       "当前牌堆列表。",
+	"CommandPrefix":                  "当前命令前缀列表，例如 .、。等，会影响命令解析入口。",
+	"commandPrefix":                  "当前命令前缀列表，例如 .、。等，会影响命令解析入口。",
+	"DiceMasters":                    "当前骰主列表。改写后可直接影响管理权限。",
+	"diceMasters":                    "当前骰主列表。改写后可直接影响管理权限。",
+	"MasterUnlockCode":               "当前骰主解锁码。",
+	"MasterUnlockCodeTime":           "当前骰主解锁码的更新时间。",
+	"CustomReplyConfig":              "自定义回复配置列表。",
+	"TextMapRaw":                     "原始文本模板配置。",
+	"TextMapHelpInfo":                "文本模板帮助信息映射。",
+	"TextMapCompatible":              "文本模板兼容层映射。",
+	"ConfigManager":                  "插件配置管理器。",
+	"Parent":                         "所属 DiceManager 实例。",
+	"CocExtraRules":                  "COC 额外规则映射。",
+	"Cron":                           "核心 cron 调度器。",
+	"AliveNoticeEntry":               "存活通知任务的 cron 条目 ID。",
+	"JsPrinter":                      "JS 控制台输出记录器。",
+	"ExtLoopManager":                 "JS 事件循环管理器。",
+	"JsScriptList":                   "当前加载的 JS 脚本元数据列表。",
+	"JsScriptCron":                   "JS 脚本专用 cron 调度器。",
+	"JsScriptCronLock":               "JS 脚本 cron 调度器的互斥锁。",
+	"JsReloadLock":                   "JS 重载锁，用于避免并发重载。",
+	"JsBuiltinDigestSet":             "内置脚本摘要表，用于判断内置脚本是否被更新。",
+	"JsLoadingScript":                "当前正在加载的脚本元数据。",
+	"GameSystemMap":                  "游戏系统模板映射。",
+	"RunAfterLoaded":                 "核心加载完成后待执行的回调列表。",
+	"UIEndpoint":                     "UI 使用的端点信息。",
+	"CensorManager":                  "敏感词审查管理器。",
+	"AttrsManager":                   "属性管理器。",
+	"Config":                         "核心配置对象，包含 JS 开关、邮件、日志、风控等大量运行配置。",
+	"AdvancedConfig":                 "高级配置对象，包含危险开关和跑团日志后端等高级设置。",
+	"PublicDice":                     "公骰客户端对象，用于与公骰服务端通信。",
+	"PublicDiceTimerId":              "公骰心跳任务的 cron 条目 ID。",
+	"ContainerMode":                  "当前是否处于容器模式。",
+	"IsAlreadyLoadConfig":            "核心配置是否已完成加载。",
+	"SaveDatabaseInsertCheckMapFlag": "数据库插入检查表的初始化标记。",
+	"SaveDatabaseInsertCheckMap":     "数据库插入检查映射。",
+	"StoreManager":                   "扩展商店管理器。",
+	"JsExtRegistry":                  "JS 扩展真实注册表。",
+	"ExtUpdateTime":                  "扩展变更时间戳，用于触发延迟更新。",
+	"JsReloading":                    "当前是否正在重载 JS 扩展。",
+	"DirtyGroups":                    "脏群组列表，用于保存优化。",
+
+	"MarkModified":                  "标记核心状态已修改，更新时间戳以触发后续保存。",
+	"StartStartupJsLoad":            "在启动阶段异步开始加载 JS 脚本。",
+	"WaitStartupJsLoaded":           "等待启动阶段的 JS 脚本加载完成。",
+	"CocExtraRulesAdd":              "添加一条 COC 额外规则。",
+	"Init":                          "初始化核心实例，包括配置、扩展、调度器和各类管理器。",
+	"ExtFind":                       "按名称或别名查找扩展。",
+	"ExtAliasToName":                "将扩展别名转换成主扩展名。",
+	"ExtRemove":                     "移除一个扩展。",
+	"MasterRefresh":                 "整理骰主列表并去重。",
+	"MasterAdd":                     "向骰主列表中新增一项，可能直接提升管理权限。",
+	"MasterCheck":                   "检查某个群组 ID 或用户 ID 是否拥有骰主权限。",
+	"MasterRemove":                  "从骰主列表中移除一项。",
+	"UnlockCodeUpdate":              "刷新或生成骰主解锁码。",
+	"UnlockCodeVerify":              "校验给定解锁码是否有效。",
+	"IsMaster":                      "检查某个统一 ID 是否属于骰主。",
+	"ApplyAliveNotice":              "重建并应用存活通知定时任务。",
+	"GameSystemTemplateAddEx":       "添加或覆盖一个游戏系统模板。",
+	"GameSystemTemplateAdd":         "添加一个游戏系统模板，已存在时不会覆盖。",
+	"ResetQuitInactiveCron":         "重建退群判定的定时任务。",
+	"PublicDiceEndpointRefresh":     "向公骰服务刷新端点在线信息。",
+	"PublicDiceInfoRegister":        "向公骰服务注册或更新公骰信息。",
+	"PublicDiceSetupTick":           "重建公骰心跳定时更新。",
+	"PublicDiceSetup":               "初始化公骰客户端并完成注册、端点刷新与心跳配置。",
+	"StoreSetup":                    "初始化扩展商店管理器。",
+	"NoticeForEveryEndpoint":        "向各端点发送通知消息。",
+	"RegisterBuiltinExt":            "注册内置扩展。",
+	"RegisterBuiltinSystemTemplate": "注册内置游戏系统模板。",
+	"RegisterExtension":             "向核心注册新的扩展对象，直接影响扩展系统。",
+	"GetExtDataDir":                 "返回指定扩展的数据目录路径，并在必要时创建目录。",
+	"GetDiceDataPath":               "返回核心数据目录下指定名称对应的路径。",
+	"GetExtConfigFilePath":          "返回指定扩展配置文件的完整路径。",
+	"JsInit":                        "初始化并重建整个 JS 运行环境。",
+	"JsShutdown":                    "关闭 JS 环境。",
+	"JsLoadScripts":                 "扫描脚本目录并加载脚本元数据与脚本内容。",
+	"JsReload":                      "重建并重载整个 JS 环境。",
+	"JsExtSettingVacuum":            "清理已删除脚本对应的插件配置。该方法已标记为弃用且存在已知问题。",
+	"JsParseMeta":                   "解析脚本文件的元数据头和签名信息。",
+	"JsLoadScriptRaw":               "加载并执行单个脚本文件。",
+	"JsCheckUpdate":                 "检查某个 JS 脚本是否存在更新。",
+	"JsUpdate":                      "应用某个 JS 脚本的更新文件。",
+	"JsDownload":                    "下载 JS 脚本或其更新文件。",
+	"GenerateTextMap":               "根据原始配置重建文本模板映射。",
+	"SaveText":                      "将文本模板配置落盘保存。",
+	"ApplyExtDefaultSettings":       "应用扩展默认设置。",
+	"Save":                          "将当前配置和高级配置落盘保存。",
+	"CanSendMail":                   "检查邮件配置是否完整可用。",
+	"SendMail":                      "按当前邮件配置发送通知邮件。",
+	"SendMailRow":                   "直接发送邮件，可指定主题、收件人、正文和附件。",
+	"GetBanList":                    "获取当前黑名单/信任列表。",
+	"NewCensorManager":              "初始化敏感词审查管理器。",
+	"CensorMsg":                     "执行一条消息的敏感词审查。",
+	"DeckCheckUpdate":               "检查某个牌堆是否存在更新。",
+	"DeckUpdate":                    "应用某个牌堆更新文件。",
+	"DeckDownload":                  "下载牌堆或其更新文件。",
+}
+
 type PrinterFunc struct {
 	d        *Dice
 	isRecord bool
@@ -753,9 +946,11 @@ func (d *Dice) JsInit() {
 		_ = seal.Set("setPlayerGroupCard", SetPlayerGroupCardByTemplate)
 		_ = seal.Set("base64ToImage", Base64ToImageFunc())
 
-		// Note: Szzrain 暴露dice对象给js会导致js可以调用dice的所有Export的方法
-		// 这是不安全的, 所有需要用到dice实例的函数都可以以传入ctx作为替代
-		// _ = seal.Set("inst", d)
+		// 暴露 Dice 实例会让脚本直接访问大量核心导出方法，因此必须由显式危险开关控制。
+		if d.AdvancedConfig.ExposeDangerousSealInst {
+			_ = seal.Set("inst", exposeDangerousJSValue(vm, d))
+			d.JsSealInstExposed = true
+		}
 		_ = vm.Set("__dirname", "")
 		_ = vm.Set("seal", seal)
 
@@ -809,6 +1004,7 @@ func (d *Dice) jsClear() {
 	// Wrapper 架构：不再调用 ExtRemove，只清空 JsExtRegistry
 	// 注意：不标记 wrapper 为 IsDeleted，否则重载期间消息到达会导致 wrapper 被移除
 	// IsDeleted 只在 JsDelete/ExtRemove（永久删除脚本）时设置
+	d.JsSealInstExposed = false
 
 	// 清空/初始化 JsExtRegistry
 	if d.JsExtRegistry != nil {
@@ -843,6 +1039,336 @@ func isScriptFile(filename string) bool {
 	return temp == ".js" || temp == ".ts"
 }
 
+func sanitizeSourceForDangerousAPIAnalysis(source string) string {
+	buf := make([]byte, len(source))
+	for i := range buf {
+		buf[i] = ' '
+	}
+
+	inLineComment := false
+	inBlockComment := false
+	inSingleQuote := false
+	inDoubleQuote := false
+	inBacktick := false
+	templateExprDepth := 0
+	templateResumeDepths := []int{}
+	escaped := false
+
+	for i := 0; i < len(source); i++ {
+		ch := source[i]
+
+		if inLineComment {
+			if ch == '\n' {
+				inLineComment = false
+				buf[i] = ch
+			}
+			continue
+		}
+		if inBlockComment {
+			if ch == '*' && i+1 < len(source) && source[i+1] == '/' {
+				buf[i] = ' '
+				buf[i+1] = ' '
+				inBlockComment = false
+				i++
+				continue
+			}
+			if ch == '\n' || ch == '\r' {
+				buf[i] = ch
+			}
+			continue
+		}
+
+		if inSingleQuote || inDoubleQuote || inBacktick {
+			if ch == '\n' || ch == '\r' {
+				buf[i] = ch
+			}
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if inSingleQuote && ch == '\'' {
+				inSingleQuote = false
+			} else if inDoubleQuote && ch == '"' {
+				inDoubleQuote = false
+			} else if inBacktick {
+				if ch == '`' {
+					inBacktick = false
+				} else if ch == '$' && i+1 < len(source) && source[i+1] == '{' {
+					buf[i] = ch
+					buf[i+1] = '{'
+					templateExprDepth++
+					templateResumeDepths = append(templateResumeDepths, templateExprDepth)
+					inBacktick = false
+					i++
+				}
+			}
+			continue
+		}
+
+		if ch == '/' && i+1 < len(source) {
+			next := source[i+1]
+			if next == '/' {
+				inLineComment = true
+				i++
+				continue
+			}
+			if next == '*' {
+				inBlockComment = true
+				i++
+				continue
+			}
+		}
+
+		if templateExprDepth > 0 {
+			switch ch {
+			case '{':
+				templateExprDepth++
+			case '}':
+				templateExprDepth--
+				if n := len(templateResumeDepths); n > 0 && templateExprDepth == templateResumeDepths[n-1]-1 {
+					templateResumeDepths = templateResumeDepths[:n-1]
+					inBacktick = true
+				}
+			}
+			buf[i] = ch
+			continue
+		}
+
+		switch ch {
+		case '\'':
+			inSingleQuote = true
+		case '"':
+			inDoubleQuote = true
+		case '`':
+			inBacktick = true
+		}
+
+		buf[i] = ch
+	}
+
+	return string(buf)
+}
+
+func jsIdentifierLength(source string, offset int) int {
+	if offset >= len(source) {
+		return 0
+	}
+	isIdentStart := func(ch byte) bool {
+		return ch == '_' || ch == '$' || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
+	}
+	isIdentChar := func(ch byte) bool {
+		return isIdentStart(ch) || (ch >= '0' && ch <= '9')
+	}
+	if !isIdentStart(source[offset]) {
+		return 0
+	}
+	length := 1
+	for i := offset + 1; i < len(source); i++ {
+		if !isIdentChar(source[i]) {
+			break
+		}
+		length++
+	}
+	return length
+}
+
+func lineColumnFromOffset(source string, offset int) (int, int) {
+	line := 1
+	column := 1
+	for i := 0; i < offset && i < len(source); i++ {
+		if source[i] == '\n' {
+			line++
+			column = 1
+		} else {
+			column++
+		}
+	}
+	return line, column
+}
+
+func describeDangerousAPIMember(apiID string, member string, kind string) string {
+	if apiID != "seal.inst" {
+		return ""
+	}
+
+	if member == "" {
+		return "直接获取高权限 API 本体。后续可继续读取字段、调用方法或转存到其它变量。"
+	}
+
+	if desc, ok := sealInstMemberDescriptions[member]; ok {
+		return desc
+	}
+	if len(member) > 0 {
+		lowerFirst := strings.ToLower(member[:1]) + member[1:]
+		if desc, ok := sealInstMemberDescriptions[lowerFirst]; ok {
+			return desc
+		}
+		upperFirst := strings.ToUpper(member[:1]) + member[1:]
+		if desc, ok := sealInstMemberDescriptions[upperFirst]; ok {
+			return desc
+		}
+	}
+
+	if kind == "method" {
+		return "检测到对核心实例方法的直接调用，但当前没有预置说明。"
+	}
+	return "检测到对核心实例字段或属性的直接访问，但当前没有预置说明。"
+}
+
+func buildDangerousAPIOccurrence(source string, rule jsDangerousAPIRule, start int, end int) JsDangerousAPIOccurrence {
+	line, column := lineColumnFromOffset(source, start)
+	occurrence := JsDangerousAPIOccurrence{
+		Line:   line,
+		Column: column,
+		Kind:   "direct",
+		Access: rule.Name,
+	}
+
+	index := end
+	for index < len(source) && (source[index] == ' ' || source[index] == '\t' || source[index] == '\n' || source[index] == '\r') {
+		index++
+	}
+
+	member, kind, accessSuffix, nextIndex, ok := parseDangerousAPIMemberAccess(source, index)
+	if !ok {
+		occurrence.MemberDescription = describeDangerousAPIMember(rule.ID, occurrence.Member, occurrence.Kind)
+		return occurrence
+	}
+	occurrence.Member = member
+	occurrence.Kind = kind
+	occurrence.Access = rule.Name + accessSuffix
+	_ = nextIndex
+	occurrence.MemberDescription = describeDangerousAPIMember(rule.ID, occurrence.Member, occurrence.Kind)
+
+	return occurrence
+}
+
+func parseDangerousAPIMemberAccess(source string, index int) (member string, kind string, accessSuffix string, nextIndex int, ok bool) {
+	for index < len(source) && (source[index] == ' ' || source[index] == '\t' || source[index] == '\n' || source[index] == '\r') {
+		index++
+	}
+
+	originalIndex := index
+	bracketSyntax := false
+	if index < len(source)-1 && source[index] == '?' && source[index+1] == '.' {
+		index += 2
+	} else if index < len(source) && source[index] == '.' {
+		index++
+	} else if index < len(source) && source[index] == '[' {
+		bracketSyntax = true
+	} else {
+		return "", "", "", originalIndex, false
+	}
+
+	for index < len(source) && (source[index] == ' ' || source[index] == '\t' || source[index] == '\n' || source[index] == '\r') {
+		index++
+	}
+
+	if bracketSyntax || (index < len(source) && source[index] == '[') {
+		bracketSyntax = true
+		if source[index] == '[' {
+			index++
+		}
+		for index < len(source) && (source[index] == ' ' || source[index] == '\t' || source[index] == '\n' || source[index] == '\r') {
+			index++
+		}
+		if index >= len(source) || (source[index] != '"' && source[index] != '\'') {
+			return "", "", "", originalIndex, false
+		}
+		quote := source[index]
+		index++
+		start := index
+		for index < len(source) && source[index] != quote {
+			index++
+		}
+		if index >= len(source) {
+			return "", "", "", originalIndex, false
+		}
+		member = source[start:index]
+		index++
+		for index < len(source) && (source[index] == ' ' || source[index] == '\t' || source[index] == '\n' || source[index] == '\r') {
+			index++
+		}
+		if index >= len(source) || source[index] != ']' {
+			return "", "", "", originalIndex, false
+		}
+		index++
+	} else {
+		length := jsIdentifierLength(source, index)
+		if length == 0 {
+			return "", "", "", originalIndex, false
+		}
+		member = source[index : index+length]
+		index += length
+	}
+
+	kind = "property"
+	if bracketSyntax {
+		accessSuffix = `["` + member + `"]`
+	} else {
+		accessSuffix = "." + member
+	}
+
+	nextIndex = index
+	for nextIndex < len(source) && (source[nextIndex] == ' ' || source[nextIndex] == '\t' || source[nextIndex] == '\n' || source[nextIndex] == '\r') {
+		nextIndex++
+	}
+	if nextIndex < len(source) && source[nextIndex] == '(' {
+		kind = "method"
+		accessSuffix += "()"
+	}
+	return member, kind, accessSuffix, nextIndex, true
+}
+
+func detectDangerousAPIUsages(rawSource []byte) []JsDangerousAPIUsage {
+	source := string(rawSource)
+	sanitized := sanitizeSourceForDangerousAPIAnalysis(source)
+	usages := make([]JsDangerousAPIUsage, 0, len(jsDangerousAPIRules))
+	for _, rule := range jsDangerousAPIRules {
+		rawMatches := rule.Pattern.FindAllStringIndex(source, -1)
+		matches := make([][]int, 0, len(rawMatches))
+		for _, match := range rawMatches {
+			if len(match) < 2 {
+				continue
+			}
+			start := match[0]
+			if start < 0 || start >= len(sanitized) || sanitized[start] != source[start] {
+				continue
+			}
+			matches = append(matches, match)
+		}
+		if len(matches) == 0 {
+			continue
+		}
+
+		usage := JsDangerousAPIUsage{
+			ID:                rule.ID,
+			Name:              rule.Name,
+			Description:       rule.Description,
+			Risk:              rule.Risk,
+			Occurrences:       make([]JsDangerousAPIOccurrence, 0, len(matches)),
+			ReferencedMembers: []string{},
+		}
+		memberSet := map[string]bool{}
+
+		for _, match := range matches {
+			occurrence := buildDangerousAPIOccurrence(source, rule, match[0], match[1])
+			usage.Occurrences = append(usage.Occurrences, occurrence)
+			if occurrence.Member != "" && !memberSet[occurrence.Member] {
+				memberSet[occurrence.Member] = true
+				usage.ReferencedMembers = append(usage.ReferencedMembers, occurrence.Member)
+			}
+		}
+
+		usages = append(usages, usage)
+	}
+	return normalizeDangerousAPIUsages(usages)
+}
+
 func jsCacheKey(path string) string {
 	return filepath.ToSlash(path)
 }
@@ -870,31 +1396,37 @@ func saveJsMetaCache(cache *jsMetaCache) {
 	_ = saveGobCacheFile(cachePath, cache)
 }
 
+func isCompatibleJsMetaCacheEntry(entry jsMetaCacheEntry) bool {
+	return entry.Meta.DangerousAPIUsages != nil
+}
+
 func buildJsScriptInfoFromCache(d *Dice, path string, entry jsMetaCacheEntry) (*JsScriptInfo, error) {
 	if entry.ParseErr != "" {
 		return nil, errors.New(entry.ParseErr)
 	}
 	jsInfo := &JsScriptInfo{
-		Name:         entry.Meta.Name,
-		Filename:     path,
-		InstallTime:  entry.InstallTime,
-		Version:      entry.Meta.Version,
-		Author:       entry.Meta.Author,
-		License:      entry.Meta.License,
-		HomePage:     entry.Meta.HomePage,
-		Desc:         entry.Meta.Desc,
-		UpdateTime:   entry.Meta.UpdateTime,
-		UpdateUrls:   entry.Meta.UpdateUrls,
-		Etag:         entry.Meta.Etag,
-		Official:     entry.Meta.Official,
-		signStatus:   entry.Meta.SignStatus,
-		Builtin:      entry.Builtin,
-		needCompiled: entry.Meta.NeedCompiled,
-		StoreID:      entry.Meta.StoreID,
+		Name:               entry.Meta.Name,
+		Filename:           path,
+		InstallTime:        entry.InstallTime,
+		Version:            entry.Meta.Version,
+		Author:             entry.Meta.Author,
+		License:            entry.Meta.License,
+		HomePage:           entry.Meta.HomePage,
+		Desc:               entry.Meta.Desc,
+		UpdateTime:         entry.Meta.UpdateTime,
+		UpdateUrls:         entry.Meta.UpdateUrls,
+		Etag:               entry.Meta.Etag,
+		Official:           entry.Meta.Official,
+		signStatus:         entry.Meta.SignStatus,
+		Builtin:            entry.Builtin,
+		needCompiled:       entry.Meta.NeedCompiled,
+		StoreID:            entry.Meta.StoreID,
+		DangerousAPIUsages: normalizeDangerousAPIUsages(entry.Meta.DangerousAPIUsages),
 	}
 	if jsInfo.Name == "" {
 		jsInfo.Name = filepath.Base(path)
 	}
+	jsInfo.HasDangerousAPIUsage = len(jsInfo.DangerousAPIUsages) > 0
 	for _, dep := range entry.Meta.Depends {
 		c, err := semver.NewConstraint(dep.Constraint)
 		if err != nil {
@@ -928,19 +1460,20 @@ func buildJsMetaCacheEntry(path string, info fs.FileInfo, jsInfo *JsScriptInfo, 
 		return entry
 	}
 	entry.Meta = jsMetaInfo{
-		Name:         jsInfo.Name,
-		Version:      jsInfo.Version,
-		Author:       jsInfo.Author,
-		License:      jsInfo.License,
-		HomePage:     jsInfo.HomePage,
-		Desc:         jsInfo.Desc,
-		UpdateTime:   jsInfo.UpdateTime,
-		UpdateUrls:   jsInfo.UpdateUrls,
-		Etag:         jsInfo.Etag,
-		Official:     jsInfo.Official,
-		SignStatus:   jsInfo.signStatus,
-		NeedCompiled: jsInfo.needCompiled,
-		StoreID:      jsInfo.StoreID,
+		Name:               jsInfo.Name,
+		Version:            jsInfo.Version,
+		Author:             jsInfo.Author,
+		License:            jsInfo.License,
+		HomePage:           jsInfo.HomePage,
+		Desc:               jsInfo.Desc,
+		UpdateTime:         jsInfo.UpdateTime,
+		UpdateUrls:         jsInfo.UpdateUrls,
+		Etag:               jsInfo.Etag,
+		Official:           jsInfo.Official,
+		SignStatus:         jsInfo.signStatus,
+		NeedCompiled:       jsInfo.needCompiled,
+		StoreID:            jsInfo.StoreID,
+		DangerousAPIUsages: normalizeDangerousAPIUsages(jsInfo.DangerousAPIUsages),
 	}
 	for _, dep := range jsInfo.Depends {
 		entry.Meta.Depends = append(entry.Meta.Depends, jsMetaDepends{
@@ -993,7 +1526,8 @@ func (d *Dice) JsLoadScripts() {
 			key := jsCacheKey(path)
 			if metaCache != nil {
 				if entry, ok := metaCache.Files[key]; ok &&
-					entry.Builtin && entry.Size == info.Size() && entry.ModTime == info.ModTime().Unix() {
+					entry.Builtin && entry.Size == info.Size() && entry.ModTime == info.ModTime().Unix() &&
+					isCompatibleJsMetaCacheEntry(entry) {
 					if entry.Meta.SignStatus != OfficialSign {
 						d.Logger.Warnf("内置脚本「%s」校验未通过，拒绝加载", path)
 						newCache.Files[key] = entry
@@ -1052,7 +1586,8 @@ func (d *Dice) JsLoadScripts() {
 			key := jsCacheKey(path)
 			if metaCache != nil {
 				if entry, ok := metaCache.Files[key]; ok &&
-					!entry.Builtin && entry.Size == info.Size() && entry.ModTime == info.ModTime().Unix() {
+					!entry.Builtin && entry.Size == info.Size() && entry.ModTime == info.ModTime().Unix() &&
+					isCompatibleJsMetaCacheEntry(entry) {
 					jsInfo, err := buildJsScriptInfoFromCache(d, "./"+path, entry)
 					if err == nil {
 						jsInfos = append(jsInfos, jsInfo)
@@ -1271,6 +1806,10 @@ type JsScriptInfo struct {
 	needCompiled bool
 	/** 扩展商店唯一 ID */
 	StoreID string `json:"storeID"`
+	/** 是否包含危险 API 调用 */
+	HasDangerousAPIUsage bool `json:"hasDangerousApiUsage"`
+	/** 命中的危险 API 列表 */
+	DangerousAPIUsages []JsDangerousAPIUsage `json:"dangerousApiUsages"`
 }
 
 type JsScriptDepends struct {
@@ -1292,20 +1831,21 @@ type jsMetaDepends struct {
 }
 
 type jsMetaInfo struct {
-	Name         string          `json:"name"`
-	Version      string          `json:"version"`
-	Author       string          `json:"author"`
-	License      string          `json:"license"`
-	HomePage     string          `json:"homepage"`
-	Desc         string          `json:"desc"`
-	UpdateTime   int64           `json:"updateTime"`
-	UpdateUrls   []string        `json:"updateUrls"`
-	Etag         string          `json:"etag"`
-	Official     bool            `json:"official"`
-	SignStatus   SignStatus      `json:"signStatus"`
-	Depends      []jsMetaDepends `json:"depends"`
-	NeedCompiled bool            `json:"needCompiled"`
-	StoreID      string          `json:"storeId"`
+	Name               string                `json:"name"`
+	Version            string                `json:"version"`
+	Author             string                `json:"author"`
+	License            string                `json:"license"`
+	HomePage           string                `json:"homepage"`
+	Desc               string                `json:"desc"`
+	UpdateTime         int64                 `json:"updateTime"`
+	UpdateUrls         []string              `json:"updateUrls"`
+	Etag               string                `json:"etag"`
+	Official           bool                  `json:"official"`
+	SignStatus         SignStatus            `json:"signStatus"`
+	Depends            []jsMetaDepends       `json:"depends"`
+	NeedCompiled       bool                  `json:"needCompiled"`
+	StoreID            string                `json:"storeId"`
+	DangerousAPIUsages []JsDangerousAPIUsage `json:"dangerousApiUsages"`
 }
 
 type jsMetaCacheEntry struct {
@@ -1334,6 +1874,8 @@ func (d *Dice) JsParseMeta(s string, installTime time.Time, rawData []byte, buil
 
 	jsInfo.Builtin = builtin
 	jsInfo.Digest = crypto.CalculateSHA512Str(rawData)
+	jsInfo.DangerousAPIUsages = normalizeDangerousAPIUsages(detectDangerousAPIUsages(rawData))
+	jsInfo.HasDangerousAPIUsage = len(jsInfo.DangerousAPIUsages) > 0
 
 	// 解析签名
 	official, signStatus := CheckJsSign(rawData)
