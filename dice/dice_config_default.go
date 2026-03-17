@@ -59,10 +59,11 @@ var DefaultConfig = Config{
 		SpamRecoveryMultiplierMax: 5,
 	},
 	QuitInactiveConfig{
-		QuitInactiveThreshold: 0,
-		quitInactiveCronEntry: 0,
-		QuitInactiveBatchSize: 10,
-		QuitInactiveBatchWait: 30,
+		QuitInactiveThreshold:         0,
+		quitInactiveCronEntry:         0,
+		QuitInactiveNoticeSummaryMode: false,
+		QuitInactiveBatchSize:         10,
+		QuitInactiveBatchWait:         30,
 	},
 	ExtConfig{
 		DefaultCocRuleIndex: 0,
