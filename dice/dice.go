@@ -304,10 +304,13 @@ func (d *Dice) StartStartupJsLoad() {
 	d.JsReloading = true
 	go func() {
 		defer d.startupJsLoadWG.Done()
-		defer func() { d.JsReloading = false }()
 		d.Logger.Info("JS 扩展脚本开始异步加载")
 		d.JsBuiltinDigestSet = make(map[string]bool)
 		d.JsLoadScripts()
+		// 需要在退出 JsReloading 状态后再应用默认扩展设置，
+		// 否则 JS wrapper 的 GetCmdMap() 会在重载保护下返回空映射，导致第三方 JS 扩展的指令列表丢失。
+		d.JsReloading = false
+		d.ApplyExtDefaultSettings()
 		d.Logger.Info("JS 扩展脚本异步加载完成")
 	}()
 }

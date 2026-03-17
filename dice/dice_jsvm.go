@@ -1675,9 +1675,6 @@ func (d *Dice) JsLoadScripts() {
 
 		d.JsLoadScriptRaw(jsInfo)
 	}
-	// 统一在所有脚本加载完后应用扩展默认设置
-	// 新扩展激活采用延迟模式，在群组收到消息时通过 GetActivatedExtList 按需激活
-	d.ApplyExtDefaultSettings()
 }
 
 func (d *Dice) JsReload() {
@@ -1691,7 +1688,6 @@ func (d *Dice) JsReload() {
 
 	// Wrapper 架构：设置重载标志，避免重载期间访问无效的 CmdMap
 	d.JsReloading = true
-	defer func() { d.JsReloading = false }()
 
 	// Wrapper 架构：不再需要记录快照，wrapper 保留在群组中
 	// jsClear 清空 JsExtRegistry，seal.ext.register 会复用 wrapper 并注册新的真实扩展
@@ -1699,6 +1695,14 @@ func (d *Dice) JsReload() {
 	d.JsInit()
 	_ = d.ConfigManager.Load()
 	d.JsLoadScripts()
+
+	// ApplyExtDefaultSettings 会遍历扩展的 GetCmdMap() 来重建 disabledCommand。
+	// JS 扩展在重载期间通过 wrapper 暴露，而 wrapper 的 GetCmdMap() 在 JsReloading=true 时会主动返回空映射，
+	// 以避免半重载状态下读取到失效 CmdMap。原先在 JsLoadScripts() 末尾应用默认设置，会导致第三方 JS 扩展
+	// 的指令列表被错误置空，WebUI 综合设置 - 基本设置 - 扩展及扩展指令 里只能看到官方扩展命令。
+	// 因此这里改为先结束重载状态，再统一应用默认设置，让 JS wrapper 能解析到命令表。
+	d.JsReloading = false
+	d.ApplyExtDefaultSettings()
 
 	// 更新扩展变更时间戳，触发延迟更新
 	d.ExtUpdateTime = time.Now().Unix()
