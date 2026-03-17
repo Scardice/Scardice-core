@@ -381,11 +381,14 @@ func main() {
 	}
 
 	if _, err1 := os.Stat("./auto_update.exe"); err1 == nil {
-		doNext := true
+		// NOTE(lyjjl): 目前没有半自动更新需求，禁用对海豹更新程序的检查。
+		// NOTE(lyjjl): 这里通过让 doNext 恒为 false 来短路后续更新流程；
+		// 如果未来需要恢复，改回 doNext := true 并保留后面的哈希差异判断即可。
+		doNext := false
 		if filepath.Base(os.Args[0]) != "auto_update.exe" {
 			a := crypto.Sha256Checksum("./auto_update.exe")
 			b := crypto.Sha256Checksum(os.Args[0])
-			doNext = a != b
+			doNext = doNext && a != b
 		}
 		if doNext {
 			// 只有不同文件才进行校验
@@ -408,11 +411,14 @@ func main() {
 	}
 
 	if _, err2 := os.Stat("./auto_update"); err2 == nil {
-		doNext := true
+		// NOTE(lyjjl): 目前没有半自动更新需求，禁用对海豹更新程序的检查。
+		// NOTE(lyjjl): 这里通过让 doNext 恒为 false 来短路后续更新流程；
+		// 如果未来需要恢复，改回 doNext := true 并保留后面的哈希差异判断即可。
+		doNext := false
 		if filepath.Base(os.Args[0]) != "auto_update" {
 			a := crypto.Sha256Checksum("./auto_update")
 			b := crypto.Sha256Checksum(os.Args[0])
-			doNext = a != b
+			doNext = doNext && a != b
 		}
 
 		if doNext {
@@ -428,6 +434,7 @@ func main() {
 			return
 		}
 	}
+
 	removeUpdateFiles()
 
 	if opts.UpdateTest {
