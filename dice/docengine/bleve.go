@@ -186,10 +186,15 @@ func (d *BleveSearchEngine) DeleteByFrom(from string) error {
 	if d.Index == nil {
 		return nil
 	}
-	q := bleve.NewTermQuery(from)
-	q.SetField("from")
+
+	// "from" 字段当前使用 simple analyzer，路径会被切词；直接 TermQuery 整个路径
+	// 无法稳定命中旧文档。删除时退回为全量扫描命中字段值后再批量删除，
+	// 这样可以兼容已存在的索引数据。
+	var ids []string
+	offset := 0
 	for {
-		req := bleve.NewSearchRequestOptions(q, 200, 0, false)
+		req := bleve.NewSearchRequestOptions(bleve.NewMatchAllQuery(), 200, offset, false)
+		req.Fields = []string{"from"}
 		res, err := d.Index.Search(req)
 		if err != nil {
 			return err
@@ -197,13 +202,27 @@ func (d *BleveSearchEngine) DeleteByFrom(from string) error {
 		if len(res.Hits) == 0 {
 			break
 		}
-		batch := d.Index.NewBatch()
 		for _, hit := range res.Hits {
-			batch.Delete(hit.ID)
+			if fmt.Sprintf("%v", hit.Fields["from"]) == from {
+				ids = append(ids, hit.ID)
+			}
 		}
-		if err := d.Index.Batch(batch); err != nil {
-			return err
+		offset += len(res.Hits)
+		if uint64(offset) >= res.Total {
+			break
 		}
+	}
+
+	if len(ids) == 0 {
+		return nil
+	}
+
+	batch := d.Index.NewBatch()
+	for _, id := range ids {
+		batch.Delete(id)
+	}
+	if err := d.Index.Batch(batch); err != nil {
+		return err
 	}
 	return nil
 }
