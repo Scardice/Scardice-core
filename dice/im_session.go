@@ -1469,7 +1469,11 @@ func (ep *EndPointInfo) TriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *
 				continue
 			}
 			if ext.OnCommandOverride != nil {
-				handled = ext.OnCommandOverride(mctx, msg, cmdArgs)
+				overrideHandled := false
+				ext.callWithJsCheck(mctx.Dice, func() {
+					overrideHandled = ext.OnCommandOverride(mctx, msg, cmdArgs)
+				})
+				handled = overrideHandled
 				if handled {
 					break
 				}
