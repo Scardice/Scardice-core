@@ -10,6 +10,7 @@ DEFAULT_APPNAME="Scardice"
 DEFAULT_VERSION_MAIN="$(sed -n 's/^[[:space:]]*VERSION_MAIN = \"\\([^\"]*\\)\".*/\\1/p' dice/version.go | head -n1)"
 DEFAULT_VERSION_MAIN="${DEFAULT_VERSION_MAIN:-1.5.1}"
 PRIVATE_KEY_FILE="./signature/seal_trusted_private_key.pem"
+SIGN_KEY_FILE="./signature/seal_sign_private_key.bin"
 DEFAULT_TARGET_GOOS="$(go env GOOS)"
 DEFAULT_TARGET_GOARCH="$(go env GOARCH)"
 OUTPUT_DIR="$ROOT_DIR/output"
@@ -25,6 +26,7 @@ ALL_GOOS=(linux windows darwin freebsd openbsd netbsd)
 ALL_GOARCH=(amd64 arm64 386 arm ppc64le riscv64 s390x)
 HOST_GOOS="$DEFAULT_TARGET_GOOS"
 HOST_GOARCH="$DEFAULT_TARGET_GOARCH"
+UPX_CMD="$(command -v upx || echo "")"
 
 choose_from_menu() {
   local prompt="$1"
@@ -327,6 +329,18 @@ else
   USE_COMPATIBLE_NAMES=0
 fi
 
+if [[ -n "$UPX_CMD" ]]; then
+  read -r -p "是否使用 UPX 压缩二进制文件？[Y/n]: " ENABLE_UPX_INPUT
+  if [[ "${ENABLE_UPX_INPUT}" =~ ^[Nn]$ ]]; then
+    USE_UPX=0
+  else
+    USE_UPX=1
+  fi
+else
+  echo "[Build] 未在系统中找到 upx 命令，将跳过压缩步骤询问。"
+  USE_UPX=0
+fi
+
 if [[ "${CGO_ENABLED_VALUE}" -eq 1 ]]; then
   echo "[Build] 预检查 CGO 依赖..."
   for target in "${TARGETS[@]}"; do
@@ -343,15 +357,23 @@ else
   VERSION_BUILD_METADATA="+${CUR_TIME}.nogit"
 fi
 
+# 处理可信客户端私钥 (SealTrustedClientPrivateKey)
 if [[ -s "$PRIVATE_KEY_FILE" ]]; then
-  echo "[Build] 已找到私钥文件：$PRIVATE_KEY_FILE"
+  echo "[Build] 已找到可信私钥文件：$PRIVATE_KEY_FILE"
+  PRIVATE_KEY_CONTENT="$(cat "$PRIVATE_KEY_FILE")"
+  PRIVATE_KEY_CONTENT_ESCAPED="${PRIVATE_KEY_CONTENT//$'\n'/\\n}"
 else
-  echo "[Build] 错误：私钥文件不存在或为空：$PRIVATE_KEY_FILE"
+  echo "[Build] 错误：可信私钥文件不存在：$PRIVATE_KEY_FILE"
   exit 1
 fi
 
-PRIVATE_KEY_CONTENT="$(cat "$PRIVATE_KEY_FILE")"
-PRIVATE_KEY_CONTENT_ESCAPED="${PRIVATE_KEY_CONTENT//$'\n'/\\n}"
+# 处理签名客户端私钥 (SealSignClientPrivateKey)
+if [[ -s "$SIGN_KEY_FILE" ]]; then
+  echo "[Build] 已找到签名私钥文件：$SIGN_KEY_FILE"
+  SIGN_KEY_CONTENT_ESCAPED="$(tr -d '[:space:]' < "$SIGN_KEY_FILE")"
+else
+  echo "[Build] 警告：签名私钥文件不存在或为空，跳过注入：$SIGN_KEY_FILE"
+fi
 
 LDFLAGS="-s -w"
 LDFLAGS+=" -X Scardice-core/dice.VERSION_MAIN=${VERSION_MAIN}"
@@ -363,11 +385,18 @@ if [[ $USE_COMPATIBLE_NAMES -eq 1 ]]; then
   LDFLAGS+=" -X main.LockFileName=sealdice-core.lock"
 fi
 
-if rg -q "SealTrustedClientPrivateKey" ./dice ./main.go 2>/dev/null; then
+if [[ -n "$PRIVATE_KEY_CONTENT_ESCAPED" ]] && rg -q "SealTrustedClientPrivateKey" ./dice ./main.go 2>/dev/null; then
   LDFLAGS+=" -X 'Scardice-core/dice.SealTrustedClientPrivateKey=${PRIVATE_KEY_CONTENT_ESCAPED}'"
-  echo "[Build] 已通过 ldflags 注入私钥"
+  echo "[Build] 已通过 ldflags 注入 SealTrustedClientPrivateKey"
 else
-  echo "[Build] 警告：未找到 SealTrustedClientPrivateKey 符号，跳过 ldflags 私钥注入"
+  echo "[Build] 警告：未找到 SealTrustedClientPrivateKey 符号或内容为空，跳过 ldflags 私钥注入"
+fi
+
+if [[ -n "$SIGN_KEY_CONTENT_ESCAPED" ]] && rg -q "SealSignClientPrivateKey" ./dice ./main.go 2>/dev/null; then
+  LDFLAGS+=" -X 'Scardice-core/dice.SealSignClientPrivateKey=${SIGN_KEY_CONTENT_ESCAPED}'"
+  echo "[Build] 已通过 ldflags 注入 SealSignClientPrivateKey"
+else
+  echo "[Build] 警告：未找到 SealSignClientPrivateKey 符号或内容为空，跳过注入"
 fi
 
 echo "[Build] VERSION_MAIN=${VERSION_MAIN}"
@@ -486,6 +515,12 @@ for target in "${TARGETS[@]}"; do
   else
     GOOS="${TARGET_GOOS}" GOARCH="${TARGET_GOARCH}" CGO_ENABLED="${CGO_ENABLED_VALUE}" \
       go build -trimpath -ldflags "$LDFLAGS" -o "${BINARY_PATH}" .
+  fi
+
+  if [[ $USE_UPX -eq 1 ]]; then
+    echo "[Build] 正在对 ${BINARY_NAME} 进行 UPX 压缩..."
+    # --best 太慢了, -q 静默模式
+    "$UPX_CMD" -q "$BINARY_PATH" || echo "[Build] 警告：UPX 压缩失败，跳过压缩"
   fi
 
   echo "[Build] 组装发布目录：${PACKAGE_DIR}"
