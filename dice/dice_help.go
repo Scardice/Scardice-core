@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -356,6 +357,7 @@ func (m *HelpManager) Load(internalCmdMap CmdMapCls, extList []*ExtInfo) {
 	if err := writeHelpIndexManifest(curManifest); err != nil {
 		log.Warnf("[帮助文档] 写入索引清单失败: %v", err)
 	}
+	cleanupStaleHelpDocParsedCaches(curManifest.Files)
 }
 
 func (m *HelpManager) loadHelpConfig() {
@@ -414,9 +416,9 @@ func loadHelpIndexManifest() (*helpIndexManifest, error) {
 	return &manifest, nil
 }
 
-func buildHelpIndexManifest(engineType EngineType, _ CmdMapCls, _ []*ExtInfo) helpIndexManifest {
+func buildHelpIndexManifest(engineType EngineType, internalCmdMap CmdMapCls, extList []*ExtInfo) helpIndexManifest {
 	curFiles, _ := collectHelpDocFiles("./data/helpdoc")
-	fingerprint := buildHelpIndexFingerprint()
+	fingerprint := buildHelpIndexFingerprint(internalCmdMap, extList)
 	return helpIndexManifest{
 		Version:       helpIndexManifestVersion,
 		SchemaVersion: helpIndexSchemaVersion,
@@ -468,43 +470,69 @@ func (m *HelpManager) updateHelpIndexIncremental(oldFiles, curFiles []helpDocFil
 		curMap[i.Path] = i
 	}
 
+	var deletedPaths []string
 	for path := range oldMap {
+		if _, ok := curMap[path]; !ok {
+			deletedPaths = append(deletedPaths, path)
+		}
+	}
+	sort.Strings(deletedPaths)
+
+	var changedPaths []string
+	for path, cur := range curMap {
+		old, exists := oldMap[path]
+		if !exists || old.Size != cur.Size || old.ModTime != cur.ModTime {
+			changedPaths = append(changedPaths, path)
+		}
+	}
+	sort.Strings(changedPaths)
+
+	totalOps := len(deletedPaths) + len(changedPaths)
+	progress := 0
+	logStep := func(action, relPath string) {
+		progress++
+		percent := 100.0
+		if totalOps > 0 {
+			percent = float64(progress) / float64(totalOps) * 100
+		}
+		logger.M().Infof("[帮助文档] 增量更新进度: %s %s %.2f%% (%d/%d)", action, relPath, percent, progress, totalOps)
+	}
+
+	for _, path := range deletedPaths {
 		if m.shouldStop() {
 			return false, nil
 		}
-		if _, ok := curMap[path]; !ok {
-			changed = true
-			fullPath := helpDocFullPathFromRel(path)
+		changed = true
+		logStep("删除", path)
+		fullPath := helpDocFullPathFromRel(path)
+		if m.searchEngine != nil {
+			if err := m.searchEngine.DeleteByFrom(fullPath); err != nil {
+				return changed, err
+			}
+		}
+		removeHelpDocParsedCache(path)
+	}
+
+	added := false
+	for _, path := range changedPaths {
+		if m.shouldStop() {
+			return false, nil
+		}
+		changed = true
+		logStep("更新", path)
+		fullPath := helpDocFullPathFromRel(path)
+		if _, exists := oldMap[path]; exists {
 			if m.searchEngine != nil {
 				if err := m.searchEngine.DeleteByFrom(fullPath); err != nil {
 					return changed, err
 				}
 			}
 		}
-	}
-
-	added := false
-	for path, cur := range curMap {
-		if m.shouldStop() {
-			return false, nil
+		group := helpDocGroupFromRel(path)
+		if ok := m.loadHelpDoc(group, fullPath); !ok {
+			return changed, fmt.Errorf("load helpdoc failed: %s", fullPath)
 		}
-		old, exists := oldMap[path]
-		if !exists || old.Size != cur.Size || old.ModTime != cur.ModTime {
-			changed = true
-			fullPath := helpDocFullPathFromRel(path)
-			if exists {
-				if m.searchEngine != nil {
-					if err := m.searchEngine.DeleteByFrom(fullPath); err != nil {
-						return changed, err
-					}
-				}
-			}
-			group := helpDocGroupFromRel(path)
-			if ok := m.loadHelpDoc(group, fullPath); !ok {
-				return changed, fmt.Errorf("load helpdoc failed: %s", fullPath)
-			}
-			added = true
-		}
+		added = true
 	}
 
 	if added {
@@ -512,6 +540,7 @@ func (m *HelpManager) updateHelpIndexIncremental(oldFiles, curFiles []helpDocFil
 			return changed, err
 		}
 	}
+	cleanupStaleHelpDocParsedCaches(curFiles)
 	return changed, nil
 }
 
@@ -596,7 +625,7 @@ func collectHelpDocFiles(root string) ([]helpDocFileInfo, error) {
 	return files, err
 }
 
-func buildHelpIndexFingerprint() string {
+func buildHelpIndexFingerprint(internalCmdMap CmdMapCls, extList []*ExtInfo) string {
 	h := sha256.New()
 	write := func(s string) {
 		_, _ = h.Write([]byte(s))
@@ -607,8 +636,74 @@ func buildHelpIndexFingerprint() string {
 	write(fmt.Sprintf("schema:%d", helpIndexSchemaVersion))
 	write(fmt.Sprintf("parsed-cache:%d", helpDocParsedCacheVersion))
 	write(fmt.Sprintf("engine:%d", BleveSearch))
+	writeHelpCmdMapFingerprint(write, "builtin", internalCmdMap)
+	writeHelpExtListFingerprint(write, extList)
 
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func writeHelpCmdMapFingerprint(write func(string), prefix string, cmdMap CmdMapCls) {
+	if cmdMap == nil {
+		write(prefix + ":nil")
+		return
+	}
+	keys := make([]string, 0, len(cmdMap))
+	for key := range cmdMap {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	write(fmt.Sprintf("%s:count:%d", prefix, len(keys)))
+	for _, key := range keys {
+		item := cmdMap[key]
+		write(prefix + ":cmd:" + key)
+		if item == nil {
+			write(prefix + ":cmd:nil")
+			continue
+		}
+		help := item.Help
+		if help == "" {
+			help = item.ShortHelp
+		}
+		if help == "" && item.HelpFunc != nil {
+			help = item.HelpFunc(false)
+		}
+		write(prefix + ":help:" + help)
+	}
+}
+
+func writeHelpExtListFingerprint(write func(string), extList []*ExtInfo) {
+	if extList == nil {
+		write("ext:nil")
+		return
+	}
+	exts := make([]*ExtInfo, 0, len(extList))
+	for _, ext := range extList {
+		if ext != nil {
+			exts = append(exts, ext)
+		}
+	}
+	sort.Slice(exts, func(i, j int) bool {
+		left := exts[i]
+		right := exts[j]
+		if left.Name != right.Name {
+			return left.Name < right.Name
+		}
+		if left.Author != right.Author {
+			return left.Author < right.Author
+		}
+		return left.Version < right.Version
+	})
+	write(fmt.Sprintf("ext:count:%d", len(exts)))
+	for _, ext := range exts {
+		write("ext:name:" + ext.Name)
+		write("ext:author:" + ext.Author)
+		write("ext:version:" + ext.Version)
+		write("ext:brief:" + ext.Brief)
+		if ext.GetDescText != nil {
+			write("ext:desc:" + ext.GetDescText(ext))
+		}
+		writeHelpCmdMapFingerprint(write, "ext:"+ext.Name, ext.GetCmdMap())
+	}
 }
 
 func (m *HelpManager) buildHelpDocTreeOnly() []*HelpDoc {
@@ -809,6 +904,31 @@ func helpDocCacheKey(path string) string {
 	rel = filepath.ToSlash(rel)
 	sum := sha256.Sum256([]byte(rel))
 	return hex.EncodeToString(sum[:])
+}
+
+func removeHelpDocParsedCache(rel string) {
+	cachePath := filepath.Join(helpDocParsedCacheDir, helpDocCacheKey(helpDocFullPathFromRel(rel))+".gob.zst")
+	_ = os.Remove(cachePath)
+}
+
+func cleanupStaleHelpDocParsedCaches(files []helpDocFileInfo) {
+	entries, err := os.ReadDir(helpDocParsedCacheDir)
+	if err != nil {
+		return
+	}
+	expected := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		expected[helpDocCacheKey(helpDocFullPathFromRel(file.Path))+".gob.zst"] = struct{}{}
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if _, ok := expected[entry.Name()]; ok {
+			continue
+		}
+		_ = os.Remove(filepath.Join(helpDocParsedCacheDir, entry.Name()))
+	}
 }
 
 func (m *HelpManager) loadHelpDocItemsFromCache(group string, path string) ([]docengine.HelpTextItem, bool) {

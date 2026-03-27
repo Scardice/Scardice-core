@@ -73,6 +73,66 @@ func TestHelpManagerStartupReloadRemovesDeletedHelpDocFromExistingIndex(t *testi
 	if !manifestHasPath(manifest.Files, keepRelPath) {
 		t.Fatalf("reloaded manifest should still contain %q", keepRelPath)
 	}
+
+	cachePath := filepath.Join(root, helpDocParsedCacheDir, helpDocCacheKey(filepath.Join("data/helpdoc", filepath.FromSlash(removeRelPath)))+".gob.zst")
+	if _, err := os.Stat(cachePath); !os.IsNotExist(err) {
+		t.Fatalf("reloaded parsed cache should remove deleted file cache %q, err=%v", cachePath, err)
+	}
+}
+
+func TestBuildHelpIndexManifestFingerprintIncludesBuiltinAndExtHelp(t *testing.T) {
+	root := switchToTempWorkdir(t)
+	_ = root
+
+	builtin1 := CmdMapCls{
+		"foo": {
+			Help: "foo help v1",
+		},
+	}
+	builtin2 := CmdMapCls{
+		"foo": {
+			Help: "foo help v2",
+		},
+	}
+
+	ext1 := []*ExtInfo{{
+		Name:    "sample",
+		Author:  "tester",
+		Version: "1.0.0",
+		CmdMap: CmdMapCls{
+			"bar": {
+				Help: "bar help v1",
+			},
+		},
+		GetDescText: func(i *ExtInfo) string {
+			return "desc v1"
+		},
+	}}
+	ext2 := []*ExtInfo{{
+		Name:    "sample",
+		Author:  "tester",
+		Version: "1.0.0",
+		CmdMap: CmdMapCls{
+			"bar": {
+				Help: "bar help v2",
+			},
+		},
+		GetDescText: func(i *ExtInfo) string {
+			return "desc v2"
+		},
+	}}
+
+	manifestBuiltinV1 := buildHelpIndexManifest(BleveSearch, builtin1, ext1)
+	manifestBuiltinV2 := buildHelpIndexManifest(BleveSearch, builtin2, ext1)
+	if manifestBuiltinV1.Fingerprint == manifestBuiltinV2.Fingerprint {
+		t.Fatalf("builtin help changes should change help index fingerprint")
+	}
+
+	manifestExtV1 := buildHelpIndexManifest(BleveSearch, builtin1, ext1)
+	manifestExtV2 := buildHelpIndexManifest(BleveSearch, builtin1, ext2)
+	if manifestExtV1.Fingerprint == manifestExtV2.Fingerprint {
+		t.Fatalf("ext help changes should change help index fingerprint")
+	}
 }
 
 func switchToTempWorkdir(t *testing.T) string {
