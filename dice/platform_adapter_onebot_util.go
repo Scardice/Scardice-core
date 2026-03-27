@@ -609,11 +609,23 @@ type MessageOBQQ struct {
 	MessageQQOBBase
 }
 
+func formatOnebotMessageID(id int64) string {
+	return strconv.FormatInt(id, 10)
+}
+
+func parseOnebotMessageID(msgID string) (int64, error) {
+	msgID = strings.TrimSpace(msgID)
+	if msgID == "" {
+		return 0, fmt.Errorf("empty message id")
+	}
+	return strconv.ParseInt(msgID, 10, 64)
+}
+
 func (msgQQ *MessageOBQQ) toStdMessage() *Message {
 	msg := new(Message)
 	msg.Time = msgQQ.Time
 	msg.MessageType = msgQQ.MessageType
-	msg.RawID = msgQQ.MessageID
+	msg.RawID = formatOnebotMessageID(msgQQ.MessageID)
 	msg.Platform = "QQ"
 
 	if msg.MessageType == "" {
@@ -931,6 +943,9 @@ func convertSealMsgToMessageChain(msg []message.IMessageElement) (schema.Message
 				Data: marshal,
 			})
 			_, _ = fmt.Fprintf(&cqMessage, "[CQ:poke,qq=%v]", res.Target)
+		case message.Recall:
+			// recall 是发送控制指令，不进入 OneBot 消息链。
+			continue
 		default:
 			res, ok := v.(*message.DefaultElement)
 			if !ok {

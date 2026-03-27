@@ -20,7 +20,6 @@ import (
 	"go.uber.org/zap"
 
 	emitter "Scardice-core/dice/imsdk/onebot"
-	emitter_types "Scardice-core/dice/imsdk/onebot/types"
 	"Scardice-core/logger"
 	"Scardice-core/message"
 )
@@ -229,14 +228,16 @@ func (p *PlatformAdapterOnebot) SendSegmentToGroup(ctx *MsgContext, groupID stri
 		return
 	}
 
-	var rawID *emitter_types.SendMsgRes
+	var rawID string
 	rawGroupID := ExtractQQEmitterGroupID(groupID)
 	pendingMsg := make([]message.IMessageElement, 0, len(msg))
+	recalls := make([]*message.RecallElement, 0, len(msg))
 	sentAnything := false
 	sentSegments := make([]message.IMessageElement, 0, len(msg))
+	emitted := false
 
-	defer func() {
-		if !sentAnything || p.Session == nil || p.EndPoint == nil {
+	emitSentSegments := func() {
+		if emitted || !sentAnything || p.Session == nil || p.EndPoint == nil {
 			return
 		}
 		_, sentMsgText := convertSealMsgToMessageChain(sentSegments)
@@ -252,7 +253,9 @@ func (p *PlatformAdapterOnebot) SendSegmentToGroup(ctx *MsgContext, groupID stri
 			},
 			RawID: rawID,
 		}, flag)
-	}()
+		emitted = true
+	}
+	defer emitSentSegments()
 
 	flushPending := func() bool {
 		if len(pendingMsg) == 0 {
@@ -262,7 +265,7 @@ func (p *PlatformAdapterOnebot) SendSegmentToGroup(ctx *MsgContext, groupID stri
 		copy(batch, pendingMsg)
 		rawMsg, _ := convertSealMsgToMessageChain(batch)
 		var err error
-		rawID, err = p.sendEmitter.SendGrMsg(p.ctx, ExtractQQEmitterGroupID(groupID), rawMsg) // 这里可以获取到发送消息的ID
+		sendRes, err := p.sendEmitter.SendGrMsg(p.ctx, ExtractQQEmitterGroupID(groupID), rawMsg) // 这里可以获取到发送消息的ID
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
 				p.logger.Warnf("SendGrMsg 超时: group=%s err=%v", groupID, err)
@@ -271,6 +274,7 @@ func (p *PlatformAdapterOnebot) SendSegmentToGroup(ctx *MsgContext, groupID stri
 			}
 			return false
 		}
+		rawID = formatOnebotMessageID(sendRes.MessageId)
 		sentSegments = append(sentSegments, batch...)
 		pendingMsg = pendingMsg[:0]
 		sentAnything = true
@@ -278,42 +282,50 @@ func (p *PlatformAdapterOnebot) SendSegmentToGroup(ctx *MsgContext, groupID stri
 	}
 
 	for _, item := range msg {
-		if item.Type() != message.Poke {
+		switch item.Type() {
+		case message.Poke:
+			if !flushPending() {
+				return
+			}
+
+			poke, ok := item.(*message.PokeElement)
+			if !ok || poke.Target == "" {
+				continue
+			}
+			pokeTarget, parseErr := strconv.ParseInt(poke.Target, 10, 64)
+			if parseErr != nil {
+				p.logger.Warnf("GroupPoke target parse failed: group=%s target=%s err=%v", groupID, poke.Target, parseErr)
+				continue
+			}
+			_, actionErr := p.sendEmitter.Raw(p.ctx, "group_poke", struct {
+				GroupID int64 `json:"group_id"`
+				UserID  int64 `json:"user_id"`
+			}{
+				GroupID: rawGroupID,
+				UserID:  pokeTarget,
+			})
+			if actionErr != nil {
+				p.logger.Warnf("GroupPoke failed: group=%s target=%s err=%v", groupID, poke.Target, actionErr)
+				continue
+			}
+			sentSegments = append(sentSegments, &message.PokeElement{Target: poke.Target})
+			sentAnything = true
+		case message.Recall:
+			recall, ok := item.(*message.RecallElement)
+			if !ok {
+				continue
+			}
+			recalls = append(recalls, recall)
+		default:
 			pendingMsg = append(pendingMsg, item)
-			continue
 		}
-
-		if !flushPending() {
-			return
-		}
-
-		poke, ok := item.(*message.PokeElement)
-		if !ok || poke.Target == "" {
-			continue
-		}
-		pokeTarget, parseErr := strconv.ParseInt(poke.Target, 10, 64)
-		if parseErr != nil {
-			p.logger.Warnf("GroupPoke target parse failed: group=%s target=%s err=%v", groupID, poke.Target, parseErr)
-			continue
-		}
-		_, actionErr := p.sendEmitter.Raw(p.ctx, "group_poke", struct {
-			GroupID int64 `json:"group_id"`
-			UserID  int64 `json:"user_id"`
-		}{
-			GroupID: rawGroupID,
-			UserID:  pokeTarget,
-		})
-		if actionErr != nil {
-			p.logger.Warnf("GroupPoke failed: group=%s target=%s err=%v", groupID, poke.Target, actionErr)
-			continue
-		}
-		sentSegments = append(sentSegments, &message.PokeElement{Target: poke.Target})
-		sentAnything = true
 	}
 
 	if !flushPending() {
 		return
 	}
+	emitSentSegments()
+	p.dispatchOnebotRecalls(recalls, rawID)
 }
 
 func (p *PlatformAdapterOnebot) SendSegmentToPerson(ctx *MsgContext, userID string, msg []message.IMessageElement, flag string) {
@@ -329,13 +341,15 @@ func (p *PlatformAdapterOnebot) SendSegmentToPerson(ctx *MsgContext, userID stri
 		return
 	}
 
-	var rawID *emitter_types.SendMsgRes
+	var rawID string
 	pendingMsg := make([]message.IMessageElement, 0, len(msg))
+	recalls := make([]*message.RecallElement, 0, len(msg))
 	sentAnything := false
 	sentSegments := make([]message.IMessageElement, 0, len(msg))
+	emitted := false
 
-	defer func() {
-		if !sentAnything || p.Session == nil || p.EndPoint == nil {
+	emitSentSegments := func() {
+		if emitted || !sentAnything || p.Session == nil || p.EndPoint == nil {
 			return
 		}
 		_, sentMsgText := convertSealMsgToMessageChain(sentSegments)
@@ -350,7 +364,9 @@ func (p *PlatformAdapterOnebot) SendSegmentToPerson(ctx *MsgContext, userID stri
 			},
 			RawID: rawID,
 		}, flag)
-	}()
+		emitted = true
+	}
+	defer emitSentSegments()
 
 	flushPending := func() bool {
 		if len(pendingMsg) == 0 {
@@ -360,11 +376,12 @@ func (p *PlatformAdapterOnebot) SendSegmentToPerson(ctx *MsgContext, userID stri
 		copy(batch, pendingMsg)
 		rawMsg, _ := convertSealMsgToMessageChain(batch)
 		var err error
-		rawID, err = p.sendEmitter.SendPvtMsg(p.ctx, ExtractQQEmitterUserID(userID), rawMsg) // 这里可以获取到发送消息的ID
+		sendRes, err := p.sendEmitter.SendPvtMsg(p.ctx, ExtractQQEmitterUserID(userID), rawMsg) // 这里可以获取到发送消息的ID
 		if err != nil {
 			p.logger.Errorf("发送消息异常 %v", err)
 			return false
 		}
+		rawID = formatOnebotMessageID(sendRes.MessageId)
 		sentSegments = append(sentSegments, batch...)
 		pendingMsg = pendingMsg[:0]
 		sentAnything = true
@@ -372,40 +389,48 @@ func (p *PlatformAdapterOnebot) SendSegmentToPerson(ctx *MsgContext, userID stri
 	}
 
 	for _, item := range msg {
-		if item.Type() != message.Poke {
+		switch item.Type() {
+		case message.Poke:
+			if !flushPending() {
+				return
+			}
+
+			poke, ok := item.(*message.PokeElement)
+			if !ok || poke.Target == "" {
+				continue
+			}
+			pokeTarget, parseErr := strconv.ParseInt(poke.Target, 10, 64)
+			if parseErr != nil {
+				p.logger.Warnf("FriendPoke target parse failed: user=%s target=%s err=%v", userID, poke.Target, parseErr)
+				continue
+			}
+			_, actionErr := p.sendEmitter.Raw(p.ctx, "friend_poke", struct {
+				UserID int64 `json:"user_id"`
+			}{
+				UserID: pokeTarget,
+			})
+			if actionErr != nil {
+				p.logger.Warnf("FriendPoke failed: user=%s target=%s err=%v", userID, poke.Target, actionErr)
+				continue
+			}
+			sentSegments = append(sentSegments, &message.PokeElement{Target: poke.Target})
+			sentAnything = true
+		case message.Recall:
+			recall, ok := item.(*message.RecallElement)
+			if !ok {
+				continue
+			}
+			recalls = append(recalls, recall)
+		default:
 			pendingMsg = append(pendingMsg, item)
-			continue
 		}
-
-		if !flushPending() {
-			return
-		}
-
-		poke, ok := item.(*message.PokeElement)
-		if !ok || poke.Target == "" {
-			continue
-		}
-		pokeTarget, parseErr := strconv.ParseInt(poke.Target, 10, 64)
-		if parseErr != nil {
-			p.logger.Warnf("FriendPoke target parse failed: user=%s target=%s err=%v", userID, poke.Target, parseErr)
-			continue
-		}
-		_, actionErr := p.sendEmitter.Raw(p.ctx, "friend_poke", struct {
-			UserID int64 `json:"user_id"`
-		}{
-			UserID: pokeTarget,
-		})
-		if actionErr != nil {
-			p.logger.Warnf("FriendPoke failed: user=%s target=%s err=%v", userID, poke.Target, actionErr)
-			continue
-		}
-		sentSegments = append(sentSegments, &message.PokeElement{Target: poke.Target})
-		sentAnything = true
 	}
 
 	if !flushPending() {
 		return
 	}
+	emitSentSegments()
+	p.dispatchOnebotRecalls(recalls, rawID)
 }
 
 func (p *PlatformAdapterOnebot) SendFileToPerson(ctx *MsgContext, userID string, path string, flag string) {
@@ -506,7 +531,79 @@ func (p *PlatformAdapterOnebot) GetGroupCacheInfo(groupID string) *GroupCache {
 
 func (p *PlatformAdapterOnebot) EditMessage(_ *MsgContext, _, _ string) {}
 
-func (p *PlatformAdapterOnebot) RecallMessage(_ *MsgContext, _ string) {
+func (p *PlatformAdapterOnebot) dispatchOnebotRecalls(recalls []*message.RecallElement, fallbackMsgID string) {
+	for _, recall := range recalls {
+		if recall == nil {
+			continue
+		}
+		targetMsgID := strings.TrimSpace(recall.MessageID)
+		if targetMsgID == "" {
+			targetMsgID = fallbackMsgID
+		}
+		if targetMsgID == "" {
+			p.logger.Warn("撤回消息已跳过: recall CQ 未提供 id，且当前发送动作没有可撤回的消息ID")
+			continue
+		}
+		p.executeOnebotRecall(targetMsgID, recall.DelayMS)
+	}
+}
+
+func (p *PlatformAdapterOnebot) executeOnebotRecall(msgID string, delayMS int64) {
+	msgID = strings.TrimSpace(msgID)
+	if msgID == "" {
+		return
+	}
+
+	doRecall := func() {
+		p.RecallMessage(nil, msgID)
+	}
+
+	if delayMS <= 0 {
+		doRecall()
+		return
+	}
+
+	go func() {
+		timer := time.NewTimer(time.Duration(delayMS) * time.Millisecond)
+		defer timer.Stop()
+
+		if p != nil && p.ctx != nil {
+			select {
+			case <-timer.C:
+				doRecall()
+			case <-p.ctx.Done():
+			}
+			return
+		}
+
+		<-timer.C
+		doRecall()
+	}()
+}
+
+func (p *PlatformAdapterOnebot) RecallMessage(_ *MsgContext, msgID string) {
+	if p == nil || p.sendEmitter == nil {
+		log := zap.S().Named(logger.LogKeyAdapter)
+		if p != nil && p.logger != nil {
+			log = p.logger
+		}
+		log.Warnf("撤回消息失败: 当前账号连接不可用。msgID=%q", msgID)
+		return
+	}
+
+	parsedMsgID, err := parseOnebotMessageID(msgID)
+	if err != nil {
+		p.logger.Warnf("撤回消息失败: message_id 无效。msgID=%q err=%v", msgID, err)
+		return
+	}
+
+	if err := p.sendEmitter.DelMsg(p.ctx, parsedMsgID); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			p.logger.Warnf("撤回消息超时: message_id=%s err=%v", msgID, err)
+		} else {
+			p.logger.Warnf("撤回消息失败: message_id=%s err=%v", msgID, err)
+		}
+	}
 }
 
 func (p *PlatformAdapterOnebot) MemberBan(_ string, _ string, _ int64) {

@@ -20,11 +20,11 @@ type GetStrangerInfo struct {
 }
 
 type GetMsgReq struct {
-	MessageId int `json:"message_id"`
+	MessageId int64 `json:"message_id"`
 }
 
 type DelMsgReq struct {
-	MessageId int `json:"message_id"`
+	MessageId int64 `json:"message_id"`
 }
 
 type FriendAddReq struct {

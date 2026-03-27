@@ -33,3 +33,35 @@ func TestConvertSealMsgToMessageChain_AtElement(t *testing.T) {
 		t.Fatalf("expected qq=2930699167, got %s", at.QQ)
 	}
 }
+
+func TestFormatAndParseOnebotMessageID(t *testing.T) {
+	formatted := formatOnebotMessageID(123456789)
+	if formatted != "123456789" {
+		t.Fatalf("unexpected formatted message id: %q", formatted)
+	}
+
+	parsed, err := parseOnebotMessageID(formatted)
+	if err != nil {
+		t.Fatalf("parseOnebotMessageID returned error: %v", err)
+	}
+	if parsed != 123456789 {
+		t.Fatalf("unexpected parsed message id: %d", parsed)
+	}
+}
+
+func TestMessageOBQQToStdMessageUsesStringRawID(t *testing.T) {
+	msg := (&MessageOBQQ{
+		MessageQQOBBase: MessageQQOBBase{
+			MessageID:   778899,
+			MessageType: "private",
+		},
+	}).toStdMessage()
+
+	rawID, ok := msg.RawID.(string)
+	if !ok {
+		t.Fatalf("expected RawID to be string, got %T", msg.RawID)
+	}
+	if rawID != "778899" {
+		t.Fatalf("unexpected RawID: %q", rawID)
+	}
+}
