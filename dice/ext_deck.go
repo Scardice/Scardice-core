@@ -559,7 +559,10 @@ func parseDeck(d *Dice, fn string, content []byte, deckInfo *DeckInfo) bool {
 func collectDeckSourceFiles(root string) []string {
 	files := make([]string, 0)
 	_ = filepath.Walk(root, func(path string, info fs.FileInfo, err error) error {
-		if err != nil || info == nil {
+		if err != nil {
+			return err
+		}
+		if info == nil {
 			return nil
 		}
 		if info.IsDir() && strings.EqualFold(info.Name(), "assets") {
@@ -611,7 +614,10 @@ func cleanupStaleDeckParseCaches(files []string) {
 func DecksDetect(d *Dice) {
 	// 先进行zip解压
 	_ = filepath.Walk("data/decks", func(path string, info fs.FileInfo, err error) error {
-		if err != nil || info == nil {
+		if err != nil {
+			return err
+		}
+		if info == nil {
 			return nil
 		}
 		if info.IsDir() && strings.EqualFold(info.Name(), "assets") {

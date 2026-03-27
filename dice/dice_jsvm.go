@@ -1490,7 +1490,10 @@ func buildJsMetaCacheEntry(path string, info fs.FileInfo, jsInfo *JsScriptInfo, 
 func collectJsScriptPaths(root string, skipBuiltin bool) []string {
 	files := make([]string, 0)
 	_ = filepath.Walk(root, func(path string, info fs.FileInfo, err error) error {
-		if err != nil || info == nil {
+		if err != nil {
+			return err
+		}
+		if info == nil {
 			return nil
 		}
 		if info.IsDir() && skipBuiltin && info.Name() == "_builtin" {
@@ -1571,8 +1574,8 @@ func (d *Dice) JsLoadScripts() {
 					newCache.Files[key] = entry
 					continue
 				}
-				jsInfo, err := buildJsScriptInfoFromCache(d, "./"+path, entry)
-				if err == nil {
+				jsInfo, buildErr := buildJsScriptInfoFromCache(d, "./"+path, entry)
+				if buildErr == nil {
 					jsInfos = append(jsInfos, jsInfo)
 					if len(jsInfo.StoreID) > 0 {
 						d.StoreManager.InstalledPlugins[jsInfo.StoreID] = true
@@ -1580,9 +1583,9 @@ func (d *Dice) JsLoadScripts() {
 					newCache.Files[key] = entry
 					continue
 				}
-				entry.ParseErr = err.Error()
+				entry.ParseErr = buildErr.Error()
 				newCache.Files[key] = entry
-				d.Logger.Error("读取内置脚本失败(错误依赖)", err.Error())
+				d.Logger.Error("读取内置脚本失败(错误依赖)", buildErr.Error())
 				continue
 			}
 		}
@@ -1624,8 +1627,8 @@ func (d *Dice) JsLoadScripts() {
 			if entry, ok := metaCache.Files[key]; ok &&
 				!entry.Builtin && entry.Size == info.Size() && entry.ModTime == info.ModTime().Unix() &&
 				isCompatibleJsMetaCacheEntry(entry) {
-				jsInfo, err := buildJsScriptInfoFromCache(d, "./"+path, entry)
-				if err == nil {
+				jsInfo, buildErr := buildJsScriptInfoFromCache(d, "./"+path, entry)
+				if buildErr == nil {
 					jsInfos = append(jsInfos, jsInfo)
 					if len(jsInfo.StoreID) > 0 {
 						d.StoreManager.InstalledPlugins[jsInfo.StoreID] = true
@@ -1633,9 +1636,9 @@ func (d *Dice) JsLoadScripts() {
 					newCache.Files[key] = entry
 					continue
 				}
-				entry.ParseErr = err.Error()
+				entry.ParseErr = buildErr.Error()
 				newCache.Files[key] = entry
-				d.Logger.Error("读取脚本失败(错误依赖)", err.Error())
+				d.Logger.Error("读取脚本失败(错误依赖)", buildErr.Error())
 				continue
 			}
 		}

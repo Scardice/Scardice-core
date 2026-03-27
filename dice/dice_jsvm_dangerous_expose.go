@@ -52,6 +52,8 @@ func (ctx *dangerousExposeContext) toValue(value reflect.Value) goja.Value {
 			if value.Elem().Type().Key().Kind() == reflect.String {
 				return ctx.wrapMap(value)
 			}
+		default:
+			// 其他指针类型直接走默认导出
 		}
 	case reflect.Struct:
 		return ctx.wrapStruct(value)
@@ -61,6 +63,8 @@ func (ctx *dangerousExposeContext) toValue(value reflect.Value) goja.Value {
 		if value.Type().Key().Kind() == reflect.String {
 			return ctx.wrapMap(value)
 		}
+	default:
+		// 其他类型直接走默认导出
 	}
 
 	if value.CanInterface() {
@@ -147,7 +151,7 @@ func newDangerousStructObject(ctx *dangerousExposeContext, value reflect.Value) 
 	methodTarget := dangerousMethodTarget(value)
 	if methodTarget.IsValid() {
 		methodType := methodTarget.Type()
-		for i := 0; i < methodType.NumMethod(); i++ {
+		for i := range methodType.NumMethod() {
 			method := methodType.Method(i)
 			if method.PkgPath != "" {
 				continue
