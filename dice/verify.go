@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Milly/go-base2048"
@@ -23,6 +24,7 @@ var (
 	SealTrustedClientPrivateKey = ``
 	// SealSignClientPrivateKey 拉起 海豹v3 签名用私钥
 	SealSignClientPrivateKey = ``
+	verifyInitOnce           sync.Once
 )
 
 func initVerify() {
@@ -42,6 +44,10 @@ func initVerify() {
 	}
 }
 
+func ensureVerifyInitialized() {
+	verifyInitOnce.Do(initVerify)
+}
+
 type payload struct {
 	Version   string `msgpack:"version,omitempty"`
 	Timestamp int64  `msgpack:"timestamp,omitempty"`
@@ -57,6 +63,7 @@ type data struct {
 
 // GenerateVerificationCode 生成海豹校验码
 func GenerateVerificationCode(platform string, userID string, username string, useBase64 bool) string {
+	ensureVerifyInitialized()
 	if len(SealTrustedClientPrivateKey) == 0 {
 		return ""
 	}
@@ -92,6 +99,7 @@ type payloadPublicDice struct {
 }
 
 func GenerateVerificationKeyForPublicDice(data any) string {
+	ensureVerifyInitialized()
 	doEcdsaSign := len(SealTrustedClientPrivateKey) > 0
 	pp, _ := msgpack.Marshal(data)
 
@@ -121,6 +129,7 @@ func GenerateVerificationKeyForPublicDice(data any) string {
 }
 
 func BuildSignature(uin uint64) string {
+	ensureVerifyInitialized()
 	decoded, err2 := hex.DecodeString(strings.TrimSpace(SealSignClientPrivateKey))
 	if err2 != nil {
 		return ""

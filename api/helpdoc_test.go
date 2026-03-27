@@ -60,7 +60,7 @@ func TestHelpDocReloadAPIReflectsDeletedHelpDoc(t *testing.T) {
 	e := echo.New()
 
 	reloadReq := httptest.NewRequest(http.MethodPost, "/helpdoc/reload", nil)
-	reloadReq.Header.Set("token", token)
+	reloadReq.Header.Set("Token", token)
 	reloadRec := httptest.NewRecorder()
 	if err := helpDocReload(e.NewContext(reloadReq, reloadRec)); err != nil {
 		t.Fatalf("helpDocReload returned error: %v", err)
@@ -80,7 +80,7 @@ func TestHelpDocReloadAPIReflectsDeletedHelpDoc(t *testing.T) {
 	}
 
 	treeReq := httptest.NewRequest(http.MethodGet, "/helpdoc/tree", nil)
-	treeReq.Header.Set("token", token)
+	treeReq.Header.Set("Token", token)
 	treeRec := httptest.NewRecorder()
 	if err := helpDocTree(e.NewContext(treeReq, treeRec)); err != nil {
 		t.Fatalf("helpDocTree returned error: %v", err)
@@ -119,20 +119,8 @@ func TestHelpDocReloadAPIReflectsDeletedHelpDoc(t *testing.T) {
 func switchAPIToTempWorkdir(t *testing.T) string {
 	t.Helper()
 
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
-
 	root := t.TempDir()
-	if err := os.Chdir(root); err != nil {
-		t.Fatalf("chdir to temp dir: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := os.Chdir(wd); err != nil {
-			t.Fatalf("restore workdir: %v", err)
-		}
-	})
+	t.Chdir(root)
 
 	if err := os.MkdirAll(filepath.Join(root, "data", "helpdoc"), 0o755); err != nil {
 		t.Fatalf("mkdir data/helpdoc: %v", err)

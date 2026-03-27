@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"regexp"
@@ -2135,7 +2136,7 @@ func commandCandidateSourceName(candidate commandSolveCandidate) string {
 
 func parseJSSolveResult(vm *goja.Runtime, value goja.Value) (CmdExecuteResult, error) {
 	if goja.IsUndefined(value) || goja.IsNull(value) {
-		return CmdExecuteResult{}, fmt.Errorf("solve returned empty result")
+		return CmdExecuteResult{}, errors.New("solve returned empty result")
 	}
 
 	if ret, ok := value.Export().(CmdExecuteResult); ok {
@@ -2149,7 +2150,7 @@ func parseJSSolveResult(vm *goja.Runtime, value goja.Value) (CmdExecuteResult, e
 		_, hasSolved := m["solved"]
 		_, hasShowHelp := m["showHelp"]
 		if !hasMatched && !hasSolved && !hasShowHelp {
-			return CmdExecuteResult{}, fmt.Errorf("invalid solve result: missing matched/solved/showHelp")
+			return CmdExecuteResult{}, errors.New("invalid solve result: missing matched/solved/showHelp")
 		}
 		toBool := func(v interface{}) bool {
 			if v == nil {
@@ -2166,7 +2167,7 @@ func parseJSSolveResult(vm *goja.Runtime, value goja.Value) (CmdExecuteResult, e
 
 	obj := value.ToObject(vm)
 	if obj == nil {
-		return CmdExecuteResult{}, fmt.Errorf("invalid solve result")
+		return CmdExecuteResult{}, errors.New("invalid solve result")
 	}
 	safeBool := func(v goja.Value) bool {
 		if v == nil || goja.IsUndefined(v) || goja.IsNull(v) {
@@ -2180,7 +2181,7 @@ func parseJSSolveResult(vm *goja.Runtime, value goja.Value) (CmdExecuteResult, e
 	if (matchedVal == nil || goja.IsUndefined(matchedVal) || goja.IsNull(matchedVal)) &&
 		(solvedVal == nil || goja.IsUndefined(solvedVal) || goja.IsNull(solvedVal)) &&
 		(showHelpVal == nil || goja.IsUndefined(showHelpVal) || goja.IsNull(showHelpVal)) {
-		return CmdExecuteResult{}, fmt.Errorf("invalid solve result: missing matched/solved/showHelp")
+		return CmdExecuteResult{}, errors.New("invalid solve result: missing matched/solved/showHelp")
 	}
 	return CmdExecuteResult{
 		Matched:  safeBool(matchedVal),
@@ -2216,7 +2217,7 @@ func resolveJSSolveValue(vm *goja.Runtime, value goja.Value, done chan<- CmdExec
 		thenVal := obj.Get("then")
 		thenFn, isFunc := goja.AssertFunction(thenVal)
 		if !isFunc {
-			fail <- fmt.Errorf("invalid promise object: missing then")
+			fail <- errors.New("invalid promise object: missing then")
 			return
 		}
 
@@ -2238,7 +2239,7 @@ func resolveJSSolveValue(vm *goja.Runtime, value goja.Value, done chan<- CmdExec
 			fail <- err
 		}
 	default:
-		fail <- fmt.Errorf("unknown promise state")
+		fail <- errors.New("unknown promise state")
 	}
 }
 
@@ -2249,7 +2250,7 @@ func waitJSSolveResult(done <-chan CmdExecuteResult, fail <-chan error, timeout 
 	case err := <-fail:
 		return CmdExecuteResult{}, err
 	case <-time.After(timeout):
-		return CmdExecuteResult{}, fmt.Errorf("timeout")
+		return CmdExecuteResult{}, errors.New("timeout")
 	}
 }
 

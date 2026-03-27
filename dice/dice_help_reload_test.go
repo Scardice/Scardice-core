@@ -39,8 +39,8 @@ func TestHelpManagerStartupReloadRemovesDeletedHelpDocFromExistingIndex(t *testi
 
 	manager1.Close()
 
-	if err := os.Remove(removePath); err != nil {
-		t.Fatalf("remove helpdoc %q: %v", removePath, err)
+	if removeErr := os.Remove(removePath); removeErr != nil {
+		t.Fatalf("remove helpdoc %q: %v", removePath, removeErr)
 	}
 
 	manager2 := &HelpManager{EngineType: BleveSearch}
@@ -138,20 +138,8 @@ func TestBuildHelpIndexManifestFingerprintIncludesBuiltinAndExtHelp(t *testing.T
 func switchToTempWorkdir(t *testing.T) string {
 	t.Helper()
 
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
-
 	root := t.TempDir()
-	if err := os.Chdir(root); err != nil {
-		t.Fatalf("chdir to temp dir: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := os.Chdir(wd); err != nil {
-			t.Fatalf("restore workdir: %v", err)
-		}
-	})
+	t.Chdir(root)
 
 	if err := os.MkdirAll(filepath.Join(root, "data", "helpdoc"), 0o755); err != nil {
 		t.Fatalf("mkdir data/helpdoc: %v", err)
