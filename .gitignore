@@ -47,6 +47,10 @@ Scardice-lock.lock
 upgrade_metadata.json
 
 /signature/**/*
+/signature/*.jks
+/signature/*.keystore
+/signature/*.base64
+/signature/github-secrets.env
 
 # cache & output
 output/
