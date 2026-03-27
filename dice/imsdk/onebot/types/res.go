@@ -5,14 +5,14 @@ package types
 import "Scardice-core/dice/imsdk/onebot/schema"
 
 type SendMsgRes struct {
-	MessageId int `json:"message_id"`
+	MessageId int64 `json:"message_id"`
 }
 
 type GetMsgRes struct {
 	Time        int              `json:"time"`
 	MessageType string           `json:"message_type"`
-	MessageId   int              `json:"message_id"`
-	RealId      int              `json:"real_id"`
+	MessageId   int64            `json:"message_id"`
+	RealId      int64            `json:"real_id"`
 	Sender      schema.Sender    `json:"sender"`
 	Message     []schema.Message `json:"message"`
 }

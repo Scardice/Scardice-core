@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/bytedance/sonic"
@@ -106,6 +107,7 @@ const (
 	Record                     // 语音
 	Face                       // 表情
 	Poke                       // 戳一戳
+	Recall                     // 撤回控制动作
 	Default = -1               // 一个兜底的情况，兜底所有不认识的类型
 )
 
@@ -120,6 +122,7 @@ var elementRegistry = map[string]ElementFactory{
 	"tts":    func() IMessageElement { return &TTSElement{} },
 	"reply":  func() IMessageElement { return &ReplyElement{} },
 	"poke":   func() IMessageElement { return &PokeElement{} },
+	"recall": func() IMessageElement { return &RecallElement{} },
 	"face":   func() IMessageElement { return &FaceElement{} },
 	"file":   func() IMessageElement { return &FileElement{} },
 	"image":  func() IMessageElement { return &ImageElement{} },
@@ -304,6 +307,34 @@ func (p *PokeElement) Type() ElementType {
 
 func (p *PokeElement) FromCQData(dMap map[string]string) error {
 	p.Target = dMap["qq"]
+	return nil
+}
+
+type RecallElement struct {
+	MessageID string `jsbind:"messageID"`
+	DelayMS   int64  `jsbind:"delayMS"`
+}
+
+func (r *RecallElement) Type() ElementType {
+	return Recall
+}
+
+func (r *RecallElement) FromCQData(dMap map[string]string) error {
+	r.MessageID = strings.TrimSpace(dMap["id"])
+
+	delayRaw := strings.TrimSpace(dMap["delay"])
+	if delayRaw == "" {
+		return nil
+	}
+
+	delayMS, err := strconv.ParseInt(delayRaw, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid recall delay: %w", err)
+	}
+	if delayMS < 0 {
+		return errors.New("recall delay must be >= 0")
+	}
+	r.DelayMS = delayMS
 	return nil
 }
 

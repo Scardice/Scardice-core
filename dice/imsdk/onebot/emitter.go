@@ -25,8 +25,8 @@ var EchoTimeOut = 10 * time.Second
 type Emitter interface {
 	SendPvtMsg(ctx context.Context, userId int64, msg schema.MessageChain) (*types.SendMsgRes, error)
 	SendGrMsg(ctx context.Context, groupId int64, msg schema.MessageChain) (*types.SendMsgRes, error)
-	GetMsg(ctx context.Context, msgId int) (*types.GetMsgRes, error)
-	DelMsg(ctx context.Context, msgId int) error
+	GetMsg(ctx context.Context, msgId int64) (*types.GetMsgRes, error)
+	DelMsg(ctx context.Context, msgId int64) error
 	GetLoginInfo(ctx context.Context) (*types.LoginInfo, error)
 	GetStrangerInfo(ctx context.Context, userId int64, noCache bool) (*types.StrangerInfo, error)
 	GetStatus(ctx context.Context) (*types.Status, error)
@@ -169,7 +169,7 @@ func (e *emitterSocket) SendGrMsg(ctx context.Context, groupId int64, msg schema
 	return decodeResponse[types.SendMsgRes](resp)
 }
 
-func (e *emitterSocket) GetMsg(ctx context.Context, msgId int) (*types.GetMsgRes, error) {
+func (e *emitterSocket) GetMsg(ctx context.Context, msgId int64) (*types.GetMsgRes, error) {
 	resp, err := doAction(ctx, e, ACTION_GET_MSG, types.GetMsgReq{
 		MessageId: msgId,
 	})
@@ -179,7 +179,7 @@ func (e *emitterSocket) GetMsg(ctx context.Context, msgId int) (*types.GetMsgRes
 	return decodeResponse[types.GetMsgRes](resp)
 }
 
-func (e *emitterSocket) DelMsg(ctx context.Context, msgId int) error {
+func (e *emitterSocket) DelMsg(ctx context.Context, msgId int64) error {
 	resp, err := doAction(ctx, e, ACTION_DELETE_MSG, types.DelMsgReq{
 		MessageId: msgId,
 	})
