@@ -18,6 +18,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -555,9 +556,64 @@ func parseDeck(d *Dice, fn string, content []byte, deckInfo *DeckInfo) bool {
 }
 
 // DecksDetect 检查牌堆
+func collectDeckSourceFiles(root string) []string {
+	files := make([]string, 0)
+	_ = filepath.Walk(root, func(path string, info fs.FileInfo, err error) error {
+		if err != nil || info == nil {
+			return nil
+		}
+		if info.IsDir() && strings.EqualFold(info.Name(), "assets") {
+			return fs.SkipDir
+		}
+		if info.IsDir() && strings.EqualFold(info.Name(), "images") {
+			return fs.SkipDir
+		}
+		if !info.IsDir() && strings.HasPrefix(info.Name(), ".deck") {
+			return nil
+		}
+		if info.Name() == "info.yaml" {
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		ext := filepath.Ext(path)
+		if ext == ".json" || ext == ".jsonc" || ext == ".yml" || ext == ".yaml" || ext == ".toml" || ext == "" {
+			files = append(files, path)
+		}
+		return nil
+	})
+	sort.Strings(files)
+	return files
+}
+
+func cleanupStaleDeckParseCaches(files []string) {
+	entries, err := os.ReadDir(deckParseCacheDir)
+	if err != nil {
+		return
+	}
+	expected := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		expected[filepath.Base(deckParseCachePath(file))] = struct{}{}
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if _, ok := expected[entry.Name()]; ok {
+			continue
+		}
+		_ = os.Remove(filepath.Join(deckParseCacheDir, entry.Name()))
+	}
+}
+
 func DecksDetect(d *Dice) {
 	// 先进行zip解压
 	_ = filepath.Walk("data/decks", func(path string, info fs.FileInfo, err error) error {
+		if err != nil || info == nil {
+			return nil
+		}
 		if info.IsDir() && strings.EqualFold(info.Name(), "assets") {
 			return fs.SkipDir
 		}
@@ -582,28 +638,17 @@ func DecksDetect(d *Dice) {
 		return nil
 	})
 
-	_ = filepath.Walk("data/decks", func(path string, info fs.FileInfo, err error) error {
-		if info.IsDir() && strings.EqualFold(info.Name(), "assets") {
-			return fs.SkipDir
+	files := collectDeckSourceFiles("data/decks")
+	cleanupStaleDeckParseCaches(files)
+	total := len(files)
+	for idx, path := range files {
+		progress := 100.0
+		if total > 0 {
+			progress = float64(idx+1) / float64(total) * 100
 		}
-		if info.IsDir() && strings.EqualFold(info.Name(), "images") {
-			return fs.SkipDir
-		}
-		if !info.IsDir() && strings.HasPrefix(info.Name(), ".deck") {
-			return nil
-		}
-		if info.Name() == "info.yaml" {
-			return nil
-		}
-
-		if !info.IsDir() {
-			ext := filepath.Ext(path)
-			if ext == ".json" || ext == ".jsonc" || ext == ".yml" || ext == ".yaml" || ext == ".toml" || ext == "" {
-				DeckTryParse(d, path)
-			}
-		}
-		return nil
-	})
+		d.Logger.Infof("牌堆加载进度: %s %.2f%% (%d/%d)", path, progress, idx+1, total)
+		DeckTryParse(d, path)
+	}
 }
 
 func DeckDelete(_ *Dice, deck *DeckInfo) {
