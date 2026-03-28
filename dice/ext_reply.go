@@ -198,9 +198,11 @@ func RegisterBuiltinExtReply(dice *Dice) {
 				checkInCoolDown := func() bool {
 					lastTime := ctx.Group.LastCustomReplyTime
 					now := float64(time.Now().UnixMilli()) / 1000
-					interval := rc.Interval
-					if interval < 2 {
-						interval = 2
+					// 自定义回复作为内建能力，统一使用高级设置中的全局冷却时间，不再混用文件内 interval。
+					// 这是有意修改语义以换取全局一致性；若配置非法，则回退到默认冷却时间。
+					interval := ctx.Dice.AdvancedConfig.CustomReplyCooldown
+					if interval <= 0 {
+						interval = DefaultCustomReplyCooldown
 					}
 
 					if now-lastTime < interval {

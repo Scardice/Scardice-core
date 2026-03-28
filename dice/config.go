@@ -2452,8 +2452,9 @@ func (d *Dice) warnIfNoPlatformEndpoint(missingPlatformConfigInServe bool) {
 func (d *Dice) loadAdvanced() {
 	d.Logger.Info("开始读取 advanced.yaml")
 	advancedConfig := AdvancedConfig{
-		Show:   false,
-		Enable: false,
+		Show:                false,
+		Enable:              false,
+		CustomReplyCooldown: DefaultCustomReplyCooldown,
 	} // default value
 
 	data, err := os.ReadFile(filepath.Join(d.BaseConfig.DataDir, "advanced.yaml"))
@@ -2469,6 +2470,9 @@ func (d *Dice) loadAdvanced() {
 	if err != nil {
 		d.Logger.Error("解析 advanced.yaml 失败 ", err.Error())
 		return
+	}
+	if advancedConfig.CustomReplyCooldown <= 0 {
+		advancedConfig.CustomReplyCooldown = DefaultCustomReplyCooldown
 	}
 
 	d.AdvancedConfig = advancedConfig
