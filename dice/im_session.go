@@ -672,6 +672,7 @@ type MsgContext struct {
 	GroupRoleLevel  int         // 群内权限 40邀请者 50管理 60群主 70信任 100master，相当于不考虑ban的权限等级
 	DelegateText    string      `jsbind:"delegateText"`  // 代骰附加文本
 	AliasPrefixText string      `json:"aliasPrefixText"` // 快捷指令回复前缀文本
+	CommandReplied  bool        `json:"-"`               // 当前命令是否已通过统一回复路径发出消息
 
 	deckDepth         int                                         // 抽牌递归深度
 	DeckPools         map[*DeckInfo]map[string]*ShuffleRandomPool // 不放回抽取的缓存
@@ -2134,8 +2135,14 @@ func commandCandidateSourceName(candidate commandSolveCandidate) string {
 	return candidate.Ext.Name
 }
 
-func parseJSSolveResult(vm *goja.Runtime, value goja.Value) (CmdExecuteResult, error) {
+func parseJSSolveResult(vm *goja.Runtime, ctx *MsgContext, solveName string, value goja.Value) (CmdExecuteResult, error) {
 	if goja.IsUndefined(value) || goja.IsNull(value) {
+		// 兼容旧插件：很多 JS solve 只 reply，不显式返回结果。
+		// 仅当本次命令已通过统一回复路径发过消息时，才把空返回视为成功，避免吞掉真实插件错误。
+		if ctx != nil && ctx.CommandReplied {
+			logger.M().Debugf("JS solve 返回空结果，且已回复消息，按兼容模式处理: %s", solveName)
+			return CmdExecuteResult{Matched: true, Solved: true}, nil
+		}
 		return CmdExecuteResult{}, errors.New("solve returned empty result")
 	}
 
@@ -2190,10 +2197,10 @@ func parseJSSolveResult(vm *goja.Runtime, value goja.Value) (CmdExecuteResult, e
 	}, nil
 }
 
-func resolveJSSolveValue(vm *goja.Runtime, value goja.Value, done chan<- CmdExecuteResult, fail chan<- error) {
+func resolveJSSolveValue(vm *goja.Runtime, ctx *MsgContext, solveName string, value goja.Value, done chan<- CmdExecuteResult, fail chan<- error) {
 	promise, ok := value.Export().(*goja.Promise)
 	if !ok {
-		ret, err := parseJSSolveResult(vm, value)
+		ret, err := parseJSSolveResult(vm, ctx, solveName, value)
 		if err != nil {
 			fail <- err
 			return
@@ -2204,7 +2211,7 @@ func resolveJSSolveValue(vm *goja.Runtime, value goja.Value, done chan<- CmdExec
 
 	switch promise.State() {
 	case goja.PromiseStateFulfilled:
-		ret, err := parseJSSolveResult(vm, promise.Result())
+		ret, err := parseJSSolveResult(vm, ctx, solveName, promise.Result())
 		if err != nil {
 			fail <- err
 			return
@@ -2222,7 +2229,7 @@ func resolveJSSolveValue(vm *goja.Runtime, value goja.Value, done chan<- CmdExec
 		}
 
 		onFulfilled := vm.ToValue(func(call goja.FunctionCall) goja.Value {
-			ret, err := parseJSSolveResult(vm, call.Argument(0))
+			ret, err := parseJSSolveResult(vm, ctx, solveName, call.Argument(0))
 			if err != nil {
 				fail <- err
 				return goja.Undefined()
@@ -2319,6 +2326,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 		if ctx.Player != nil {
 			VarSetValueInt64(ctx, "$t轮数", int64(cmdArgs.SpecialExecuteTimes))
 		}
+		ctx.CommandReplied = false
 
 		if !item.Raw && item.AllowDelegate {
 			// 允许代骰时，发一句话
@@ -2405,7 +2413,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 					}
 				}()
 
-				resolveJSSolveValue(vm, item.SolveRaw(ctx, msg, cmdArgs), done, fail)
+				resolveJSSolveValue(vm, ctx, item.Name, item.SolveRaw(ctx, msg, cmdArgs), done, fail)
 			})
 
 			ret, err = waitJSSolveResult(done, fail, jsSolveAwaitTimeout)

@@ -18,7 +18,7 @@ func TestResolveJSSolveValue_SyncObject(t *testing.T) {
 
 	done := make(chan CmdExecuteResult, 1)
 	fail := make(chan error, 1)
-	resolveJSSolveValue(vm, v, done, fail)
+	resolveJSSolveValue(vm, nil, "test", v, done, fail)
 
 	select {
 	case ret := <-done:
@@ -41,7 +41,7 @@ func TestResolveJSSolveValue_FulfilledPromise(t *testing.T) {
 
 	done := make(chan CmdExecuteResult, 1)
 	fail := make(chan error, 1)
-	resolveJSSolveValue(vm, v, done, fail)
+	resolveJSSolveValue(vm, nil, "test", v, done, fail)
 
 	select {
 	case ret := <-done:
@@ -64,12 +64,58 @@ func TestResolveJSSolveValue_MapUsesJSTruthiness(t *testing.T) {
 
 	done := make(chan CmdExecuteResult, 1)
 	fail := make(chan error, 1)
-	resolveJSSolveValue(vm, v, done, fail)
+	resolveJSSolveValue(vm, nil, "test", v, done, fail)
 
 	select {
 	case ret := <-done:
 		if !ret.Matched || !ret.Solved || ret.ShowHelp {
 			t.Fatalf("unexpected solve result with JS truthiness: %#v", ret)
+		}
+	case err := <-fail:
+		t.Fatalf("unexpected error: %v", err)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for solve result")
+	}
+}
+
+func TestResolveJSSolveValue_EmptyResultWithoutReplyFails(t *testing.T) {
+	vm := goja.New()
+	v, err := vm.RunString(`undefined`)
+	if err != nil {
+		t.Fatalf("run js failed: %v", err)
+	}
+
+	done := make(chan CmdExecuteResult, 1)
+	fail := make(chan error, 1)
+	resolveJSSolveValue(vm, nil, "test", v, done, fail)
+
+	select {
+	case <-done:
+		t.Fatal("unexpected done for empty result without reply")
+	case err := <-fail:
+		if err == nil || err.Error() != "solve returned empty result" {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for solve result")
+	}
+}
+
+func TestResolveJSSolveValue_EmptyResultAfterReplyIsCompatible(t *testing.T) {
+	vm := goja.New()
+	v, err := vm.RunString(`undefined`)
+	if err != nil {
+		t.Fatalf("run js failed: %v", err)
+	}
+
+	done := make(chan CmdExecuteResult, 1)
+	fail := make(chan error, 1)
+	resolveJSSolveValue(vm, &MsgContext{CommandReplied: true}, "test", v, done, fail)
+
+	select {
+	case ret := <-done:
+		if !ret.Matched || !ret.Solved || ret.ShowHelp {
+			t.Fatalf("unexpected solve result: %#v", ret)
 		}
 	case err := <-fail:
 		t.Fatalf("unexpected error: %v", err)
@@ -87,7 +133,7 @@ func TestResolveJSSolveValue_RejectedPromise(t *testing.T) {
 
 	done := make(chan CmdExecuteResult, 1)
 	fail := make(chan error, 1)
-	resolveJSSolveValue(vm, v, done, fail)
+	resolveJSSolveValue(vm, nil, "test", v, done, fail)
 
 	select {
 	case <-done:
@@ -101,6 +147,52 @@ func TestResolveJSSolveValue_RejectedPromise(t *testing.T) {
 	}
 }
 
+func TestResolveJSSolveValue_FulfilledEmptyResultWithoutReplyFails(t *testing.T) {
+	vm := goja.New()
+	v, err := vm.RunString(`Promise.resolve(undefined)`)
+	if err != nil {
+		t.Fatalf("run js failed: %v", err)
+	}
+
+	done := make(chan CmdExecuteResult, 1)
+	fail := make(chan error, 1)
+	resolveJSSolveValue(vm, nil, "test", v, done, fail)
+
+	select {
+	case <-done:
+		t.Fatal("unexpected done for fulfilled empty result without reply")
+	case err := <-fail:
+		if err == nil || err.Error() != "solve returned empty result" {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for solve result")
+	}
+}
+
+func TestResolveJSSolveValue_FulfilledEmptyResultAfterReplyIsCompatible(t *testing.T) {
+	vm := goja.New()
+	v, err := vm.RunString(`Promise.resolve(undefined)`)
+	if err != nil {
+		t.Fatalf("run js failed: %v", err)
+	}
+
+	done := make(chan CmdExecuteResult, 1)
+	fail := make(chan error, 1)
+	resolveJSSolveValue(vm, &MsgContext{CommandReplied: true}, "test", v, done, fail)
+
+	select {
+	case ret := <-done:
+		if !ret.Matched || !ret.Solved || ret.ShowHelp {
+			t.Fatalf("unexpected solve result: %#v", ret)
+		}
+	case err := <-fail:
+		t.Fatalf("unexpected error: %v", err)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for solve result")
+	}
+}
+
 func TestResolveJSSolveValue_PendingPromiseTimeout(t *testing.T) {
 	vm := goja.New()
 	v, err := vm.RunString(`new Promise(() => {})`)
@@ -110,7 +202,7 @@ func TestResolveJSSolveValue_PendingPromiseTimeout(t *testing.T) {
 
 	done := make(chan CmdExecuteResult, 1)
 	fail := make(chan error, 1)
-	resolveJSSolveValue(vm, v, done, fail)
+	resolveJSSolveValue(vm, nil, "test", v, done, fail)
 
 	_, err = waitJSSolveResult(done, fail, 30*time.Millisecond)
 	if err == nil || err.Error() != "timeout" {
@@ -127,7 +219,7 @@ func TestResolveJSSolveValue_FulfilledInvalidResult(t *testing.T) {
 
 	done := make(chan CmdExecuteResult, 1)
 	fail := make(chan error, 1)
-	resolveJSSolveValue(vm, v, done, fail)
+	resolveJSSolveValue(vm, nil, "test", v, done, fail)
 
 	select {
 	case <-done:

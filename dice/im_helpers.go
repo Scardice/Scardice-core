@@ -444,6 +444,9 @@ func ReplyGroupRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 }
 
 func replyGroupRawNoCheck(ctx *MsgContext, msg *Message, text string, flag string) {
+	if ctx != nil {
+		ctx.CommandReplied = true
+	}
 	if ctx.AliasPrefixText != "" {
 		text = ctx.AliasPrefixText + text
 		ctx.AliasPrefixText = ""
@@ -515,6 +518,9 @@ func ReplyPersonRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 }
 
 func replyPersonRawNoCheck(ctx *MsgContext, msg *Message, text string, flag string) {
+	if ctx != nil {
+		ctx.CommandReplied = true
+	}
 	if ctx.AliasPrefixText != "" {
 		text = ctx.AliasPrefixText + text
 		ctx.AliasPrefixText = ""
