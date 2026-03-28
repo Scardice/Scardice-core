@@ -4,6 +4,8 @@ import (
 	"net/http"
 
 	"github.com/labstack/echo/v4"
+
+	"Scardice-core/dice"
 )
 
 func shouldReloadDangerousAPIState(jsEnabled bool, runtimeSealInstExposed bool, desiredExposeDangerousSealInst bool) bool {
@@ -27,6 +29,9 @@ func DiceAdvancedConfigSet(c echo.Context) error {
 	err := c.Bind(&advancedConfig)
 	if err != nil {
 		return Error(&c, err.Error(), nil)
+	}
+	if advancedConfig.CustomReplyCooldown <= 0 {
+		advancedConfig.CustomReplyCooldown = dice.DefaultCustomReplyCooldown
 	}
 
 	myDice.AdvancedConfig = advancedConfig
