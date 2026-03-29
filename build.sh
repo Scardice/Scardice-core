@@ -360,8 +360,7 @@ fi
 # 处理可信客户端私钥 (SealTrustedClientPrivateKey)
 if [[ -s "$PRIVATE_KEY_FILE" ]]; then
 	echo "[Build] 已找到可信私钥文件：$PRIVATE_KEY_FILE"
-	PRIVATE_KEY_CONTENT="$(cat "$PRIVATE_KEY_FILE")"
-	PRIVATE_KEY_CONTENT_ESCAPED="${PRIVATE_KEY_CONTENT//$'\n'/\\n}"
+	PRIVATE_KEY_CONTENT_B64="$(base64 <"$PRIVATE_KEY_FILE" | tr -d '\n')"
 else
 	echo "[Build] 错误：可信私钥文件不存在：$PRIVATE_KEY_FILE"
 	exit 1
@@ -385,9 +384,9 @@ if [[ $USE_COMPATIBLE_NAMES -eq 1 ]]; then
 	LDFLAGS+=" -X main.LockFileName=sealdice-core.lock"
 fi
 
-if [[ -n "${PRIVATE_KEY_CONTENT:-}" ]] && rg -q "SealTrustedClientPrivateKey" ./dice ./main.go 2>/dev/null; then
-	LDFLAGS+=" -X 'Scardice-core/dice.SealTrustedClientPrivateKey=${PRIVATE_KEY_CONTENT_ESCAPED}'"
-	echo "[Build] 已通过 ldflags 注入 SealTrustedClientPrivateKey"
+if [[ -n "${PRIVATE_KEY_CONTENT_B64:-}" ]] && rg -q "SealTrustedClientPrivateKey" ./dice ./main.go 2>/dev/null; then
+	LDFLAGS+=" -X 'Scardice-core/dice.SealTrustedClientPrivateKey=base64:${PRIVATE_KEY_CONTENT_B64}'"
+	echo "[Build] 已通过 ldflags 以 base64 形式注入 SealTrustedClientPrivateKey"
 else
 	echo "[Build] 警告：未找到 SealTrustedClientPrivateKey 符号或内容为空，跳过私钥注入"
 fi
