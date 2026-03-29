@@ -19,7 +19,7 @@ func NewClient(baseURL string, token string) *PublicDiceClient {
 }
 
 // doReq 发送HTTP请求
-func doReq[T any](c *PublicDiceClient, method string, path string, data any, params map[string]string) (*T, int) {
+func doReq[T any](c *PublicDiceClient, method string, path string, data any, params map[string]string) (*T, int, string) {
 	req := request.Client{
 		URL:    c.baseURL + path,
 		Method: method,
@@ -29,9 +29,10 @@ func doReq[T any](c *PublicDiceClient, method string, path string, data any, par
 
 	var result T
 	resp := req.Send()
+	body := resp.String()
 	resp.Scan(&result)
 
-	return &result, resp.Code()
+	return &result, resp.Code(), body
 }
 
 // Endpoint 公骰终端信息
@@ -69,7 +70,7 @@ type ListResponse struct {
 }
 
 // ListGet 获取公骰列表
-func (c *PublicDiceClient) ListGet(keyFunc func(data any) string) (*ListResponse, int) {
+func (c *PublicDiceClient) ListGet(keyFunc func(data any) string) (*ListResponse, int, string) {
 	if keyFunc != nil {
 		data := keyFunc(nil)
 		return doReq[ListResponse](c, "GET", "/dice/api/public-dice/list", data, nil)
@@ -93,7 +94,7 @@ type RegisterResponse struct {
 }
 
 // Register 注册公骰
-func (c *PublicDiceClient) Register(req *RegisterRequest, keyFunc func(data any) string) (*RegisterResponse, int) {
+func (c *PublicDiceClient) Register(req *RegisterRequest, keyFunc func(data any) string) (*RegisterResponse, int, string) {
 	if keyFunc != nil {
 		req.Key = keyFunc(req)
 	}
@@ -115,7 +116,7 @@ type DiceUpdateResponse struct {
 }
 
 // DiceUpdate 更新公骰
-func (c *PublicDiceClient) DiceUpdate(req *DiceUpdateRequest, keyFunc func(data any) string) (*DiceUpdateResponse, int) {
+func (c *PublicDiceClient) DiceUpdate(req *DiceUpdateRequest, keyFunc func(data any) string) (*DiceUpdateResponse, int, string) {
 	if keyFunc != nil {
 		req.Key = keyFunc(req)
 	}
@@ -133,7 +134,7 @@ type EndpointUpdateRequest struct {
 type EndpointUpdateResponse struct{}
 
 // EndpointUpdate 更新公骰SNS账号信息
-func (c *PublicDiceClient) EndpointUpdate(req *EndpointUpdateRequest, keyFunc func(data any) string) (*EndpointUpdateResponse, int) {
+func (c *PublicDiceClient) EndpointUpdate(req *EndpointUpdateRequest, keyFunc func(data any) string) (*EndpointUpdateResponse, int, string) {
 	if keyFunc != nil {
 		req.Key = keyFunc(req)
 	}
@@ -157,7 +158,7 @@ type TickEndpoint struct {
 type TickUpdateResponse struct{}
 
 // TickUpdate 更新公骰心跳
-func (c *PublicDiceClient) TickUpdate(req *TickUpdateRequest, keyFunc func(data any) string) (*TickUpdateResponse, int) {
+func (c *PublicDiceClient) TickUpdate(req *TickUpdateRequest, keyFunc func(data any) string) (*TickUpdateResponse, int, string) {
 	if keyFunc != nil {
 		req.Key = keyFunc(req)
 	}

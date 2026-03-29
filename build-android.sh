@@ -345,16 +345,16 @@ download_android_java_home() {
 	host_arch="$(uname -m)"
 
 	case "$host_arch" in
-		x86_64|amd64)
-			host_arch="x64"
-			;;
-		aarch64|arm64)
-			host_arch="aarch64"
-			;;
-		*)
-			echo "[Build] 错误：Android 构建暂不支持自动下载 JDK 的架构：$host_arch" >&2
-			return 1
-			;;
+	x86_64 | amd64)
+		host_arch="x64"
+		;;
+	aarch64 | arm64)
+		host_arch="aarch64"
+		;;
+	*)
+		echo "[Build] 错误：Android 构建暂不支持自动下载 JDK 的架构：$host_arch" >&2
+		return 1
+		;;
 	esac
 
 	if [[ "$host_os" != "linux" ]]; then
@@ -567,33 +567,33 @@ resolve_android_ndk_package_info() {
 	host_arch="$(uname -m)"
 
 	case "$host_os" in
-		linux)
-			host_os="linux"
-			;;
-		*)
-			echo "[Build] 错误：Android NDK 自动下载暂不支持当前系统：$host_os" >&2
-			return 1
-			;;
+	linux)
+		host_os="linux"
+		;;
+	*)
+		echo "[Build] 错误：Android NDK 自动下载暂不支持当前系统：$host_os" >&2
+		return 1
+		;;
 	esac
 
 	case "$host_arch" in
-		x86_64|amd64)
-			host_arch="linux"
-			;;
-		*)
-			echo "[Build] 错误：Android NDK 自动下载暂不支持当前架构：$host_arch" >&2
-			return 1
-			;;
+	x86_64 | amd64)
+		host_arch="linux"
+		;;
+	*)
+		echo "[Build] 错误：Android NDK 自动下载暂不支持当前架构：$host_arch" >&2
+		return 1
+		;;
 	esac
 
 	case "$ndk_version" in
-		25.2.9519653)
-			release_name="r25c"
-			;;
-		*)
-			echo "[Build] 错误：暂未内置 Android NDK $ndk_version 的下载映射。" >&2
-			return 1
-			;;
+	25.2.9519653)
+		release_name="r25c"
+		;;
+	*)
+		echo "[Build] 错误：暂未内置 Android NDK $ndk_version 的下载映射。" >&2
+		return 1
+		;;
 	esac
 
 	archive_name="android-ndk-${release_name}-${host_os}.zip"
@@ -835,9 +835,9 @@ build_android_apk() {
 	mkdir -p "$sealdice_data_dir" "$sealdice_lagrange_dir" "$sealdice_milky_dir"
 	ensure_android_auth_source "$project_dir"
 	write_android_local_properties "$project_dir" "$android_sdk_dir"
-	if ! ensure_android_sdk_licenses "$android_sdk_dir" \
-		|| [[ ! -e "$android_sdk_dir/platforms/android-33" ]] \
-		|| [[ ! -e "$android_sdk_dir/build-tools/33.0.1" ]]; then
+	if ! ensure_android_sdk_licenses "$android_sdk_dir" ||
+		[[ ! -e "$android_sdk_dir/platforms/android-33" ]] ||
+		[[ ! -e "$android_sdk_dir/build-tools/33.0.1" ]]; then
 		prepare_android_sdk "$android_sdk_dir" "$android_sdkmanager_bin" || return 1
 	fi
 	ensure_android_sdk_licenses "$android_sdk_dir" || return 1
@@ -1259,8 +1259,7 @@ fi
 # 处理可信客户端私钥 (SealTrustedClientPrivateKey)
 if [[ -s "$PRIVATE_KEY_FILE" ]]; then
 	echo "[Build] 已找到可信私钥文件：$PRIVATE_KEY_FILE"
-	PRIVATE_KEY_CONTENT="$(cat "$PRIVATE_KEY_FILE")"
-	PRIVATE_KEY_CONTENT_ESCAPED="${PRIVATE_KEY_CONTENT//$'\n'/\\n}"
+	PRIVATE_KEY_CONTENT_B64="$(base64 <"$PRIVATE_KEY_FILE" | tr -d '\n')"
 else
 	echo "[Build] 错误：可信私钥文件不存在：$PRIVATE_KEY_FILE"
 	exit 1
@@ -1284,9 +1283,9 @@ if [[ $USE_COMPATIBLE_NAMES -eq 1 ]]; then
 	LDFLAGS+=" -X main.LockFileName=sealdice-core.lock"
 fi
 
-if [[ -n "${PRIVATE_KEY_CONTENT:-}" ]] && rg -q "SealTrustedClientPrivateKey" ./dice ./main.go 2>/dev/null; then
-	LDFLAGS+=" -X 'Scardice-core/dice.SealTrustedClientPrivateKey=${PRIVATE_KEY_CONTENT_ESCAPED}'"
-	echo "[Build] 已通过 ldflags 注入 SealTrustedClientPrivateKey"
+if [[ -n "${PRIVATE_KEY_CONTENT_B64:-}" ]] && rg -q "SealTrustedClientPrivateKey" ./dice ./main.go 2>/dev/null; then
+	LDFLAGS+=" -X 'Scardice-core/dice.SealTrustedClientPrivateKey=base64:${PRIVATE_KEY_CONTENT_B64}'"
+	echo "[Build] 已通过 ldflags 以 base64 形式注入 SealTrustedClientPrivateKey"
 else
 	echo "[Build] 警告：未找到 SealTrustedClientPrivateKey 符号或内容为空，跳过私钥注入"
 fi

@@ -971,9 +971,9 @@ func (d *Dice) PublicDiceEndpointRefresh() {
 		Endpoints: endpointItems,
 	}
 
-	_, code := d.PublicDice.EndpointUpdate(req, GenerateVerificationKeyForPublicDice)
+	_, code, body := d.PublicDice.EndpointUpdate(req, GenerateVerificationKeyForPublicDice)
 	if code != 200 {
-		d.logPublicDiceStatus("端点更新失败", code)
+		d.logPublicDiceStatus("端点更新失败", code, body)
 		return
 	}
 }
@@ -991,9 +991,9 @@ func (d *Dice) PublicDiceInfoRegister() bool {
 		Note:  cfg.Note,
 		// Avatar: cfg.Avatar, // NOTE(lyjjl): 尚不确定服务端是否支持
 	}
-	pd, code := d.PublicDice.Register(req, GenerateVerificationKeyForPublicDice)
+	pd, code, body := d.PublicDice.Register(req, GenerateVerificationKeyForPublicDice)
 	if code != 200 {
-		d.logPublicDiceStatus("骰号注册失败", code)
+		d.logPublicDiceStatus("骰号注册失败", code, body)
 		return false
 	}
 	// ID为空时才将注册好的ID覆写配置
@@ -1051,9 +1051,9 @@ func (d *Dice) PublicDiceSetupTick() {
 			ID:        cfg.ID,
 			Endpoints: tickEndpointItems,
 		}
-		_, code := d.PublicDice.TickUpdate(req, GenerateVerificationKeyForPublicDice)
+		_, code, body := d.PublicDice.TickUpdate(req, GenerateVerificationKeyForPublicDice)
 		if code != 200 {
-			d.logPublicDiceStatus("心跳更新失败", code)
+			d.logPublicDiceStatus("心跳更新失败", code, body)
 		}
 	}
 
@@ -1110,8 +1110,15 @@ func publicDiceStatusReason(code int) string {
 	}
 }
 
-func (d *Dice) logPublicDiceStatus(action string, code int) {
-	d.Logger.Warnf("[公骰]%s: status=%d, reason=%s", action, code, publicDiceStatusReason(code))
+func (d *Dice) logPublicDiceStatus(action string, code int, details ...string) {
+	reason := publicDiceStatusReason(code)
+	if len(details) > 0 {
+		if body := strings.TrimSpace(details[0]); body != "" {
+			d.Logger.Warnf("[公骰]%s: status=%d, reason=%s, response=%s", action, code, reason, body)
+			return
+		}
+	}
+	d.Logger.Warnf("[公骰]%s: status=%d, reason=%s", action, code, reason)
 }
 
 func (d *Dice) StoreSetup() {
