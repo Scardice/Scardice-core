@@ -41,6 +41,10 @@ type SenderBase struct {
 }
 
 const jsSolveAwaitTimeout = 10 * time.Second
+const jsSolveEmptyResultGraceWindow = 150 * time.Millisecond
+
+var errJSSolveEmptyResult = errors.New("solve returned empty result")
+var errJSSolveTimeout = errors.New("timeout")
 
 // Message 消息的重要信息
 // 时间
@@ -2143,7 +2147,7 @@ func parseJSSolveResult(vm *goja.Runtime, ctx *MsgContext, solveName string, val
 			logger.M().Debugf("JS solve 返回空结果，且已回复消息，按兼容模式处理: %s", solveName)
 			return CmdExecuteResult{Matched: true, Solved: true}, nil
 		}
-		return CmdExecuteResult{}, errors.New("solve returned empty result")
+		return CmdExecuteResult{}, errJSSolveEmptyResult
 	}
 
 	if ret, ok := value.Export().(CmdExecuteResult); ok {
@@ -2257,8 +2261,71 @@ func waitJSSolveResult(done <-chan CmdExecuteResult, fail <-chan error, timeout 
 	case err := <-fail:
 		return CmdExecuteResult{}, err
 	case <-time.After(timeout):
-		return CmdExecuteResult{}, errors.New("timeout")
+		return CmdExecuteResult{}, errJSSolveTimeout
 	}
+}
+
+func waitForCommandReply(ctx *MsgContext, timeout time.Duration) bool {
+	if ctx == nil || timeout <= 0 {
+		return false
+	}
+	if ctx.CommandReplied {
+		return true
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timer.C:
+			return ctx.CommandReplied
+		case <-ticker.C:
+			if ctx.CommandReplied {
+				return true
+			}
+		}
+	}
+}
+
+func logJSSolveEmptyResultWarning(log *zap.SugaredLogger, candidate commandSolveCandidate, solveName string, ctx *MsgContext, msg *Message) {
+	if log == nil || msg == nil {
+		return
+	}
+
+	source := commandCandidateSourceName(candidate)
+	commandName := solveName
+	if candidate.Item != nil && candidate.Item.Name != "" {
+		commandName = candidate.Item.Name
+	}
+
+	platform := ""
+	messageType := ""
+	groupID := ""
+	senderID := ""
+	commandReplied := false
+	if ctx != nil {
+		if ctx.EndPoint != nil {
+			platform = ctx.EndPoint.Platform
+		}
+		commandReplied = ctx.CommandReplied
+	}
+	messageType = msg.MessageType
+	groupID = msg.GroupID
+	senderID = msg.Sender.UserID
+
+	log.Warnw("JS solve returned empty result after grace window; suppressed user-facing exception",
+		"source", source,
+		"command", commandName,
+		"solveName", solveName,
+		"commandReplied", commandReplied,
+		"platform", platform,
+		"messageType", messageType,
+		"groupID", groupID,
+		"senderID", senderID,
+	)
 }
 
 func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) commandSolveResult {
@@ -2313,7 +2380,8 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 		return true, false
 	}
 
-	executeCandidate := func(item *CmdItemInfo) bool {
+	executeCandidate := func(candidate commandSolveCandidate) bool {
+		item := candidate.Item
 		if item == nil {
 			return false
 		}
@@ -2418,12 +2486,21 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 
 			ret, err = waitJSSolveResult(done, fail, jsSolveAwaitTimeout)
 			if err != nil {
-				if err.Error() == "timeout" {
+				if errors.Is(err, errJSSolveTimeout) {
 					ReplyToSender(ctx, msg, fmt.Sprintf("JS执行超时（>%s），请检查扩展逻辑", jsSolveAwaitTimeout))
 					return false
 				}
-				ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", err))
-				return false
+				if errors.Is(err, errJSSolveEmptyResult) {
+					if waitForCommandReply(ctx, jsSolveEmptyResultGraceWindow) {
+						ret = CmdExecuteResult{Matched: true, Solved: true}
+					} else {
+						logJSSolveEmptyResultWarning(s.Parent.Logger, candidate, item.Name, ctx, msg)
+						return false
+					}
+				} else {
+					ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", err))
+					return false
+				}
 			}
 		} else {
 			ret = item.Solve(ctx, msg, cmdArgs)
@@ -2505,7 +2582,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 
 	var solved bool
 	if len(available) == 1 {
-		solved = executeCandidate(available[0].Item)
+		solved = executeCandidate(available[0])
 	}
 
 	if group != nil && (group.Active || ctx.IsCurGroupBotOn) {
