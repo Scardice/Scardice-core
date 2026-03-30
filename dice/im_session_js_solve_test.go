@@ -205,7 +205,7 @@ func TestResolveJSSolveValue_PendingPromiseTimeout(t *testing.T) {
 	resolveJSSolveValue(vm, nil, "test", v, done, fail)
 
 	_, err = waitJSSolveResult(done, fail, 30*time.Millisecond)
-	if err == nil || err.Error() != "timeout" {
+	if !errors.Is(err, errJSSolveTimeout) {
 		t.Fatalf("expected timeout error, got: %v", err)
 	}
 }
@@ -261,8 +261,29 @@ func TestWaitJSSolveResult(t *testing.T) {
 		done := make(chan CmdExecuteResult, 1)
 		fail := make(chan error, 1)
 		_, err := waitJSSolveResult(done, fail, 20*time.Millisecond)
-		if err == nil || err.Error() != "timeout" {
+		if !errors.Is(err, errJSSolveTimeout) {
 			t.Fatalf("expected timeout error, got: %v", err)
+		}
+	})
+}
+
+func TestWaitForCommandReply(t *testing.T) {
+	t.Run("reply arrives within grace window", func(t *testing.T) {
+		ctx := &MsgContext{}
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			ctx.CommandReplied = true
+		}()
+
+		if !waitForCommandReply(ctx, 80*time.Millisecond) {
+			t.Fatal("expected grace window to observe late reply")
+		}
+	})
+
+	t.Run("reply does not arrive within grace window", func(t *testing.T) {
+		ctx := &MsgContext{}
+		if waitForCommandReply(ctx, 30*time.Millisecond) {
+			t.Fatal("expected grace window to expire without reply")
 		}
 	})
 }
