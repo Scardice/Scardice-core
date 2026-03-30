@@ -2,6 +2,7 @@ package dice
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -15,6 +16,8 @@ import (
 	emitterTypes "Scardice-core/dice/imsdk/onebot/types"
 	"Scardice-core/message"
 )
+
+var errOnebotRecallTestUnsupported = errors.New("unsupported in onebot recall test emitter")
 
 type onebotRecallTestEmitter struct {
 	mu             sync.Mutex
@@ -37,7 +40,7 @@ func (m *onebotRecallTestEmitter) SendGrMsg(_ context.Context, _ int64, msg sche
 }
 
 func (m *onebotRecallTestEmitter) GetMsg(_ context.Context, _ int64) (*emitterTypes.GetMsgRes, error) {
-	return nil, nil
+	return nil, errOnebotRecallTestUnsupported
 }
 
 func (m *onebotRecallTestEmitter) DelMsg(_ context.Context, msgId int64) error {
@@ -53,19 +56,19 @@ func (m *onebotRecallTestEmitter) DelMsg(_ context.Context, msgId int64) error {
 }
 
 func (m *onebotRecallTestEmitter) GetLoginInfo(_ context.Context) (*emitterTypes.LoginInfo, error) {
-	return nil, nil
+	return nil, errOnebotRecallTestUnsupported
 }
 
 func (m *onebotRecallTestEmitter) GetStrangerInfo(_ context.Context, _ int64, _ bool) (*emitterTypes.StrangerInfo, error) {
-	return nil, nil
+	return nil, errOnebotRecallTestUnsupported
 }
 
 func (m *onebotRecallTestEmitter) GetStatus(_ context.Context) (*emitterTypes.Status, error) {
-	return nil, nil
+	return nil, errOnebotRecallTestUnsupported
 }
 
 func (m *onebotRecallTestEmitter) GetVersionInfo(_ context.Context) (*emitterTypes.VersionInfo, error) {
-	return nil, nil
+	return nil, errOnebotRecallTestUnsupported
 }
 
 func (m *onebotRecallTestEmitter) GetSelfId(_ context.Context) (int64, error) {
@@ -97,11 +100,11 @@ func (m *onebotRecallTestEmitter) SetGroupCard(_ context.Context, _ int64, _ int
 }
 
 func (m *onebotRecallTestEmitter) GetGroupInfo(_ context.Context, _ int64, _ bool) (*emitterTypes.GroupInfo, error) {
-	return nil, nil
+	return nil, errOnebotRecallTestUnsupported
 }
 
 func (m *onebotRecallTestEmitter) GetGroupMemberInfo(_ context.Context, _ int64, _ int64, _ bool) (*emitterTypes.GroupMemberInfo, error) {
-	return nil, nil
+	return nil, errOnebotRecallTestUnsupported
 }
 
 func (m *onebotRecallTestEmitter) Raw(_ context.Context, _ emitter.Action, _ any) ([]byte, error) {
