@@ -26,8 +26,8 @@ const trustedKeyBase64Prefix = "base64:"
 
 type verifyLogger interface {
 	Warn(...any)
-	Warnf(string, ...any)
-	Infof(string, ...any)
+	Warnf(format string, args ...any)
+	Infof(format string, args ...any)
 }
 
 type keyLoadStatus int

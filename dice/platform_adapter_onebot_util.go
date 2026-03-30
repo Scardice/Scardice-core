@@ -616,7 +616,7 @@ func formatOnebotMessageID(id int64) string {
 func parseOnebotMessageID(msgID string) (int64, error) {
 	msgID = strings.TrimSpace(msgID)
 	if msgID == "" {
-		return 0, fmt.Errorf("empty message id")
+		return 0, errors.New("empty message id")
 	}
 	return strconv.ParseInt(msgID, 10, 64)
 }

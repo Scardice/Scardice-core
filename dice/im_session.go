@@ -2302,9 +2302,9 @@ func logJSSolveEmptyResultWarning(log *zap.SugaredLogger, candidate commandSolve
 	}
 
 	platform := ""
-	messageType := ""
-	groupID := ""
-	senderID := ""
+	messageType := msg.MessageType
+	groupID := msg.GroupID
+	senderID := msg.Sender.UserID
 	commandReplied := false
 	if ctx != nil {
 		if ctx.EndPoint != nil {
@@ -2312,9 +2312,6 @@ func logJSSolveEmptyResultWarning(log *zap.SugaredLogger, candidate commandSolve
 		}
 		commandReplied = ctx.CommandReplied
 	}
-	messageType = msg.MessageType
-	groupID = msg.GroupID
-	senderID = msg.Sender.UserID
 
 	log.Warnw("JS solve returned empty result after grace window; suppressed user-facing exception",
 		"source", source,
