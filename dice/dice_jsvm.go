@@ -587,40 +587,46 @@ func (d *Dice) JsInit() {
 			return d.ConfigManager.getConfig(ei.Name, key)
 		})
 		_ = ext.Set("getStringConfig", func(ei *ExtInfo, key string) string {
-			if ei.dice == nil || d.ConfigManager.getConfig(ei.Name, key).Type != "string" {
+			cfg := d.ConfigManager.getConfig(ei.Name, key)
+			if ei.dice == nil || cfg == nil || cfg.Type != "string" {
 				panic("配置不存在或类型不匹配")
 			}
-			return d.ConfigManager.getConfig(ei.Name, key).Value.(string)
+			return cfg.Value.(string)
 		})
 		_ = ext.Set("getIntConfig", func(ei *ExtInfo, key string) int64 {
-			if ei.dice == nil || d.ConfigManager.getConfig(ei.Name, key).Type != "int" {
+			cfg := d.ConfigManager.getConfig(ei.Name, key)
+			if ei.dice == nil || cfg == nil || cfg.Type != "int" {
 				panic("配置不存在或类型不匹配")
 			}
-			return d.ConfigManager.getConfig(ei.Name, key).Value.(int64)
+			return cfg.Value.(int64)
 		})
 		_ = ext.Set("getBoolConfig", func(ei *ExtInfo, key string) bool {
-			if ei.dice == nil || d.ConfigManager.getConfig(ei.Name, key).Type != "bool" {
+			cfg := d.ConfigManager.getConfig(ei.Name, key)
+			if ei.dice == nil || cfg == nil || cfg.Type != "bool" {
 				panic("配置不存在或类型不匹配")
 			}
-			return d.ConfigManager.getConfig(ei.Name, key).Value.(bool)
+			return cfg.Value.(bool)
 		})
 		_ = ext.Set("getFloatConfig", func(ei *ExtInfo, key string) float64 {
-			if ei.dice == nil || d.ConfigManager.getConfig(ei.Name, key).Type != "float" {
+			cfg := d.ConfigManager.getConfig(ei.Name, key)
+			if ei.dice == nil || cfg == nil || cfg.Type != "float" {
 				panic("配置不存在或类型不匹配")
 			}
-			return d.ConfigManager.getConfig(ei.Name, key).Value.(float64)
+			return cfg.Value.(float64)
 		})
 		_ = ext.Set("getTemplateConfig", func(ei *ExtInfo, key string) []string {
-			if ei.dice == nil || d.ConfigManager.getConfig(ei.Name, key).Type != "template" {
+			cfg := d.ConfigManager.getConfig(ei.Name, key)
+			if ei.dice == nil || cfg == nil || cfg.Type != "template" {
 				panic("配置不存在或类型不匹配")
 			}
-			return d.ConfigManager.getConfig(ei.Name, key).Value.([]string)
+			return cfg.Value.([]string)
 		})
 		_ = ext.Set("getOptionConfig", func(ei *ExtInfo, key string) string {
-			if ei.dice == nil || d.ConfigManager.getConfig(ei.Name, key).Type != "option" {
+			cfg := d.ConfigManager.getConfig(ei.Name, key)
+			if ei.dice == nil || cfg == nil || cfg.Type != "option" {
 				panic("配置不存在或类型不匹配")
 			}
-			return d.ConfigManager.getConfig(ei.Name, key).Value.(string)
+			return cfg.Value.(string)
 		})
 		_ = ext.Set("unregisterConfig", func(ei *ExtInfo, key ...string) {
 			if ei.dice == nil {
