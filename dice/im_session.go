@@ -2484,7 +2484,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 			ret, err = waitJSSolveResult(done, fail, jsSolveAwaitTimeout)
 			if err != nil {
 				if errors.Is(err, errJSSolveTimeout) {
-					ReplyToSender(ctx, msg, fmt.Sprintf("JS执行超时（>%s），请检查扩展逻辑", jsSolveAwaitTimeout))
+					s.Parent.Logger.Warnf("扩展注册的指令<%s>执行超时（>%s），建议检查扩展逻辑", item.Name, jsSolveAwaitTimeout)
 					return false
 				}
 				if errors.Is(err, errJSSolveEmptyResult) {
