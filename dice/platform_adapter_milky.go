@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"path/filepath"
@@ -24,7 +25,7 @@ type PlatformAdapterMilky struct {
 	IntentSession       *milky.Session `json:"-"                     yaml:"-"`
 	WsGateway           string         `json:"ws_gateway"            yaml:"ws_gateway"`
 	RestGateway         string         `json:"rest_gateway"          yaml:"rest_gateway"`
-	Token               string         `json:"token"                 yaml:"token"`
+	Token               string         `json:"-"                     yaml:"token"`
 	IgnoreFriendRequest bool           `json:"ignore_friend_request" yaml:"ignore_friend_request"`
 	// 内置
 	// BuiltInMode 留空则视为分离，目前支持的字段为 lagrangeV2
@@ -455,8 +456,7 @@ func (pa *PlatformAdapterMilky) handelFriendRequest(ctx *MsgContext, event *milk
 	log := zap.S().Named(logger.LogKeyAdapter)
 	var comment string
 	if event.Comment != "" {
-		comment = strings.TrimSpace(event.Comment)
-		comment = strings.ReplaceAll(comment, "\u00a0", "")
+		comment = normalizeMilkyFriendRequestComment(event.Comment)
 	}
 
 	toMatch := strings.TrimSpace(pa.Session.Parent.Config.FriendAddComment)
@@ -466,34 +466,13 @@ func (pa *PlatformAdapterMilky) handelFriendRequest(ctx *MsgContext, event *milk
 	}
 
 	if !willAccept {
-		// 如果是问题校验，只填写回答即可
-		re := regexp.MustCompile(`\n回答:([^\n]+)`)
-		m := re.FindAllStringSubmatch(comment, -1)
-
-		var items []string
-		for _, i := range m {
-			items = append(items, i[1])
-		}
-
-		re2 := regexp.MustCompile(`\s+`)
-		m2 := re2.Split(toMatch, -1)
-
-		if len(m2) == len(items) {
-			ok := true
-			for i := range m2 {
-				if m2[i] != items[i] {
-					ok = false
-					break
-				}
-			}
-			willAccept = ok
-		}
+		willAccept = checkMilkyFriendAddVerify(comment, toMatch)
 	}
 
 	if comment == "" {
 		comment = "(无)"
 	} else {
-		comment = strconv.Quote(comment)
+		comment = formatMilkyFriendRequestCommentForLog(comment)
 	}
 
 	// 检查黑名单
@@ -531,6 +510,51 @@ func (pa *PlatformAdapterMilky) handelFriendRequest(ctx *MsgContext, event *milk
 	} else {
 		pa.SetFriendAddRequest(event.InitiatorUID, false, "验证信息不符")
 	}
+}
+
+var milkyFriendRequestAnswerPattern = regexp.MustCompile(`\n回答:([^\n]+)`)
+var milkyFriendRequestExpectedItemPattern = regexp.MustCompile(`\s+`)
+
+func normalizeMilkyFriendRequestComment(comment string) string {
+	comment = strings.TrimSpace(comment)
+	comment = strings.ReplaceAll(comment, "\u00a0", " ")
+	comment = strings.ReplaceAll(comment, "\r\n", "\n")
+	comment = strings.ReplaceAll(comment, `\r\n`, "\n")
+	comment = strings.ReplaceAll(comment, `\n`, "\n")
+	return comment
+}
+
+func formatMilkyFriendRequestCommentForLog(comment string) string {
+	comment = strings.ReplaceAll(comment, `\`, `\\`)
+	comment = strings.ReplaceAll(comment, `"`, `\"`)
+	return `"` + comment + `"`
+}
+
+func checkMilkyFriendAddVerify(comment string, toMatch string) bool {
+	if toMatch == "" {
+		return true
+	}
+
+	matches := milkyFriendRequestAnswerPattern.FindAllStringSubmatch(comment, -1)
+	answers := make([]string, 0, len(matches))
+	for _, match := range matches {
+		answer := strings.TrimSpace(strings.ReplaceAll(match[1], "\u00a0", " "))
+		answers = append(answers, answer)
+	}
+
+	expectedItems := milkyFriendRequestExpectedItemPattern.Split(toMatch, -1)
+	if len(expectedItems) != len(answers) {
+		return false
+	}
+
+	for i, item := range expectedItems {
+		expected := strings.TrimSpace(strings.ReplaceAll(item, "\u00a0", " "))
+		if expected != answers[i] {
+			return false
+		}
+	}
+
+	return true
 }
 
 func (pa *PlatformAdapterMilky) SetFriendAddRequest(initiatorUid string, approve bool, reason string) {
@@ -772,6 +796,29 @@ func (pa *PlatformAdapterMilky) QuitGroup(ctx *MsgContext, groupID string) {
 		return
 	}
 	log.Infof("Successfully quit group %s", groupID)
+}
+
+func (pa *PlatformAdapterMilky) GetGroupMemberInfo(groupID string, userID string) (*milky.GroupMemberInfo, error) {
+	if pa == nil || pa.IntentSession == nil {
+		return nil, errors.New("milky session unavailable")
+	}
+
+	rawGroupID := strings.TrimSpace(ExtractQQGroupID(groupID))
+	rawUserID := strings.TrimSpace(ExtractQQUserID(userID))
+	if rawGroupID == "" || rawUserID == "" {
+		return nil, errors.New("cannot resolve milky group/user id")
+	}
+
+	groupIDInt, err := strconv.ParseInt(rawGroupID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid milky group id %q: %w", groupID, err)
+	}
+	userIDInt, err := strconv.ParseInt(rawUserID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid milky user id %q: %w", userID, err)
+	}
+
+	return pa.IntentSession.GetGroupMemberInfo(groupIDInt, userIDInt, false)
 }
 
 func (pa *PlatformAdapterMilky) SetGroupCardName(ctx *MsgContext, cardName string) {

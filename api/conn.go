@@ -3,7 +3,6 @@ package api
 import (
 	"encoding/base64"
 	"net/http"
-	"runtime"
 	"sort"
 	"strconv"
 	"time"
@@ -173,6 +172,10 @@ func ImConnectionsDel(c echo.Context) error {
 	}{}
 	err := c.Bind(&v)
 	if err == nil {
+		defer func() {
+			myDice.LastUpdatedTime = time.Now().Unix()
+			myDice.Save(false)
+		}()
 		for index, i := range myDice.ImSession.EndPoints {
 			if i.ID == v.ID {
 				// 禁用该endpoint防止出问题
@@ -725,10 +728,6 @@ func ImConnectionsAddMilkyInternal(c echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]interface{}{
 			"testMode": true,
 		})
-	}
-
-	if runtime.GOOS == "android" {
-		return c.String(430, "Milky 内置版本暂不支持 Android")
 	}
 
 	v := struct {
