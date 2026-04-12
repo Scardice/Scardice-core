@@ -95,7 +95,6 @@ func getGithubAvatar(c echo.Context) error {
 }
 
 func packGocqConfig(relWorkDir string) *bytes.Buffer {
-	// workDir := "extra/go-cqhttp-qq" + account
 	rootPath := filepath.Join(myDice.BaseConfig.DataDir, relWorkDir)
 
 	// 创建一个内存缓冲区，用于保存 Zip 文件内容
@@ -144,11 +143,8 @@ func checkUidExists(c echo.Context, uid string) bool {
 			switch pa.BuiltinMode {
 			case "lagrange":
 				relWorkDir = "extra/lagrange-qq" + uid
-			case "lagrange-gocq":
-				relWorkDir = "extra/lagrange-gocq-qq" + uid
 			default:
-				// 默认为gocq
-				relWorkDir = "extra/go-cqhttp-qq" + uid
+				continue
 			}
 			if relWorkDir == i.RelWorkDir {
 				// 不允许工作路径重复

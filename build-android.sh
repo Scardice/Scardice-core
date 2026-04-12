@@ -20,7 +20,6 @@ ANDROID_PACKAGE_BASENAME=""
 ANDROID_APP_RUNNER_ARCHIVE="${ANDROID_APP_RUNNER_ARCHIVE:-}"
 ANDROID_LAGRANGE_DIR="${ANDROID_LAGRANGE_DIR:-}"
 ANDROID_MILKY_DIR="${ANDROID_MILKY_DIR:-}"
-ANDROID_GOCQ_LAGRANGE_DIR="${ANDROID_GOCQ_LAGRANGE_DIR:-}"
 ANDROID_RUNTIME_CACHE_DIR=""
 ANDROID_RUNTIME_CACHE_TTL_SECONDS="${ANDROID_RUNTIME_CACHE_TTL_SECONDS:-86400}"
 ANDROID_AXEL_CONNECTIONS="${ANDROID_AXEL_CONNECTIONS:-8}"
@@ -34,7 +33,6 @@ ANDROID_ACRA_LOGIN_PASS="${ANDROID_ACRA_LOGIN_PASS:-}"
 ANDROID_APP_RUNNER_URL="https://d1.sealdice.com/lagrange/app-runner-std-arm64.tar.gz"
 ANDROID_LAGRANGE_URL="https://d1.sealdice.com/lagrange/0.0.6/Lagrange.OneBot_linux-musl-arm64_8.0.zip?v=3"
 ANDROID_MILKY_URL="https://github.com/sealdice/LagrangeV2/releases/download/nightly/Lagrange.Milky-linux-arm64"
-ANDROID_GOCQ_LAGRANGE_URL="https://d1.sealdice.com/go-cqhttp-largrange/0.0.3/lagrange-gocq_android_arm64.zip"
 DEFAULT_TARGET_GOOS="$(go env GOOS)"
 DEFAULT_TARGET_GOARCH="$(go env GOARCH)"
 OUTPUT_DIR="$ROOT_DIR/output"
@@ -265,13 +263,6 @@ prepare_android_optional_runtime_assets() {
 		fi
 	fi
 
-	if [[ -z "$ANDROID_GOCQ_LAGRANGE_DIR" ]]; then
-		local gocq_zip="$ANDROID_RUNTIME_CACHE_DIR/lagrange-gocq.android-arm64.zip"
-		local gocq_dir="$ANDROID_RUNTIME_CACHE_DIR/lagrange-gocq.android-arm64"
-		if download_file_with_cache "$ANDROID_GOCQ_LAGRANGE_URL" "$gocq_zip" "Android Gocq-Lagrange" && sync_cached_archive_dir "$gocq_zip" "$gocq_dir" "Android Gocq-Lagrange"; then
-			ANDROID_GOCQ_LAGRANGE_DIR="$gocq_dir"
-		fi
-	fi
 }
 
 resolve_android_project_dir() {
@@ -854,7 +845,6 @@ build_android_apk() {
 	copy_android_tree_if_present "$ANDROID_APP_RUNNER_ARCHIVE" "$assets_root" "Android App Runner"
 	copy_android_tree_if_present "$ANDROID_LAGRANGE_DIR" "$sealdice_lagrange_dir" "Android Lagrange"
 	copy_android_tree_if_present "$ANDROID_MILKY_DIR" "$sealdice_milky_dir" "Android Milky"
-	copy_android_tree_if_present "$ANDROID_GOCQ_LAGRANGE_DIR" "$sealdice_lagrange_dir" "Android Gocq-Lagrange"
 
 	chmod +x "$project_dir/gradlew"
 	if (

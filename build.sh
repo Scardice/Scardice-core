@@ -22,6 +22,11 @@ GO_CACHE_DIR="$BUILD_CACHE_DIR/go-cache"
 GO_TMP_DIR="$BUILD_CACHE_DIR/tmp"
 UI_BUILD_MARKER="$UI_SUBMODULE_DIR/dist/.build-meta"
 PACKAGE_WORK_DIR="$BUILD_CACHE_DIR/package-work"
+RUNTIME_CACHE_DIR="$BUILD_CACHE_DIR/runtime"
+RUNTIME_CACHE_TTL_SECONDS="${RUNTIME_CACHE_TTL_SECONDS:-86400}"
+RUNTIME_AXEL_CONNECTIONS="${RUNTIME_AXEL_CONNECTIONS:-8}"
+PACK_RUNTIME_ASSETS="${PACK_RUNTIME_ASSETS:-1}"
+RUNTIME_ASSETS_STRICT="${RUNTIME_ASSETS_STRICT:-1}"
 ALL_GOOS=(linux windows darwin freebsd openbsd netbsd)
 ALL_GOARCH=(amd64 arm64 386 arm ppc64le riscv64 s390x)
 HOST_GOOS="$DEFAULT_TARGET_GOOS"
@@ -76,6 +81,261 @@ calc_file_hash() {
 		return 0
 	fi
 	echo "nohash"
+}
+
+mark_cache_entry_fresh() {
+	local stamp_file="$1"
+	mkdir -p "$(dirname "$stamp_file")"
+	: >"$stamp_file"
+}
+
+cache_entry_is_fresh() {
+	local cache_path="$1"
+	local stamp_file="$2"
+	local ttl="${RUNTIME_CACHE_TTL_SECONDS:-86400}"
+	local now_ts stamp_ts
+
+	if [[ ! -s "$cache_path" || ! -f "$stamp_file" ]]; then
+		return 1
+	fi
+	if [[ ! "$ttl" =~ ^[0-9]+$ ]]; then
+		return 1
+	fi
+	if ((ttl <= 0)); then
+		return 1
+	fi
+	now_ts="$(date +%s)"
+	stamp_ts="$(date -r "$stamp_file" +%s 2>/dev/null || echo 0)"
+	((now_ts - stamp_ts < ttl))
+}
+
+download_file_with_cache() {
+	local url="$1"
+	local destination="$2"
+	local label="$3"
+	local stamp_file="${destination}.stamp"
+	local temp_path="${destination}.tmp.$$"
+	local download_success=1
+
+	mkdir -p "$(dirname "$destination")"
+	if [[ -s "$destination" ]] && cache_entry_is_fresh "$destination" "$stamp_file"; then
+		echo "[Build] 使用缓存的 ${label}：$destination"
+		return 0
+	fi
+
+	rm -f "$temp_path"
+	if command -v axel >/dev/null 2>&1; then
+		echo "[Build] 下载 ${label}（axel 优先）：$url"
+		if axel -q -a -n "$RUNTIME_AXEL_CONNECTIONS" -o "$temp_path" "$url" >/dev/null 2>&1; then
+			download_success=0
+		else
+			rm -f "$temp_path"
+			echo "[Build] 警告：axel 下载 ${label} 失败，回退到 curl。"
+		fi
+	fi
+
+	if [[ $download_success -ne 0 ]]; then
+		if command -v curl >/dev/null 2>&1; then
+			echo "[Build] 下载 ${label}（curl 回退）：$url"
+			if curl -fsSL --retry 2 --connect-timeout 15 "$url" -o "$temp_path"; then
+				download_success=0
+			else
+				rm -f "$temp_path"
+			fi
+		else
+			echo "[Build] 警告：未找到 curl，无法下载 ${label}。"
+		fi
+	fi
+
+	if [[ $download_success -eq 0 ]]; then
+		mv -f "$temp_path" "$destination"
+		mark_cache_entry_fresh "$stamp_file"
+		return 0
+	fi
+
+	rm -f "$temp_path"
+	if [[ -s "$destination" ]]; then
+		echo "[Build] 警告：刷新 ${label} 失败，继续使用旧缓存：$destination"
+		return 0
+	fi
+	echo "[Build] 警告：下载 ${label} 失败。"
+	return 1
+}
+
+extract_archive_to_dir() {
+	local archive_path="$1"
+	local destination_dir="$2"
+	local label="$3"
+
+	rm -rf "$destination_dir"
+	mkdir -p "$destination_dir"
+	if command -v unzip >/dev/null 2>&1; then
+		if unzip -oq "$archive_path" -d "$destination_dir"; then
+			return 0
+		fi
+	fi
+	if command -v bsdtar >/dev/null 2>&1; then
+		if bsdtar -xf "$archive_path" -C "$destination_dir"; then
+			return 0
+		fi
+	fi
+	echo "[Build] 警告：解压 ${label} 失败，需要 unzip 或 bsdtar。"
+	return 1
+}
+
+sync_cached_archive_dir() {
+	local archive_path="$1"
+	local destination_dir="$2"
+	local label="$3"
+	local stamp_file="${destination_dir}.stamp"
+
+	if [[ -d "$destination_dir" ]] && [[ -f "$stamp_file" ]] && [[ "$archive_path" -ot "$stamp_file" ]]; then
+		return 0
+	fi
+	if extract_archive_to_dir "$archive_path" "$destination_dir" "$label"; then
+		mark_cache_entry_fresh "$stamp_file"
+		return 0
+	fi
+	return 1
+}
+
+sync_cached_file_dir() {
+	local source_file="$1"
+	local destination_dir="$2"
+	local destination_name="$3"
+	local label="$4"
+	local stamp_file="${destination_dir}.stamp"
+
+	if [[ -d "$destination_dir" ]] && [[ -f "$destination_dir/$destination_name" ]] && [[ -f "$stamp_file" ]] && [[ "$source_file" -ot "$stamp_file" ]]; then
+		return 0
+	fi
+	rm -rf "$destination_dir"
+	mkdir -p "$destination_dir"
+	cp -f "$source_file" "$destination_dir/$destination_name"
+	mark_cache_entry_fresh "$stamp_file"
+	echo "[Build] 已准备 ${label}：$destination_dir/$destination_name"
+}
+
+resolve_lagrange_url() {
+	local goos="$1"
+	local goarch="$2"
+
+	case "${goos}/${goarch}" in
+	linux/arm64)
+		echo "https://d1.sealdice.com/lagrange/0.0.6/Lagrange.OneBot_linux-arm64_8.0.zip?v=3"
+		;;
+	linux/amd64)
+		echo "https://d1.sealdice.com/lagrange/0.0.6/Lagrange.OneBot_linux-x64_8.0.zip?v=3"
+		;;
+	windows/amd64)
+		echo "https://d1.sealdice.com/lagrange/0.0.6/Lagrange.OneBot_win-x64_8.0.zip?v=3"
+		;;
+	windows/386)
+		echo "https://d1.sealdice.com/lagrange/0.0.6/Lagrange.OneBot_win-x86_8.0.zip?v=3"
+		;;
+	darwin/arm64)
+		echo "https://d1.sealdice.com/lagrange/0.0.6/Lagrange.OneBot_osx-arm64_8.0.zip?v=3"
+		;;
+	darwin/amd64)
+		echo "https://d1.sealdice.com/lagrange/0.0.6/Lagrange.OneBot_osx-x64_8.0.zip?v=3"
+		;;
+	*)
+		echo ""
+		;;
+	esac
+}
+
+resolve_milky_url() {
+	local goos="$1"
+	local goarch="$2"
+
+	case "${goos}/${goarch}" in
+	linux/arm64)
+		echo "https://github.com/sealdice/LagrangeV2/releases/download/nightly/Lagrange.Milky-linux-arm64"
+		;;
+	linux/amd64)
+		echo "https://github.com/sealdice/LagrangeV2/releases/download/nightly/Lagrange.Milky-linux-x64"
+		;;
+	darwin/arm64)
+		echo "https://github.com/sealdice/LagrangeV2/releases/download/nightly/Lagrange.Milky-osx-arm64"
+		;;
+	windows/amd64)
+		echo "https://github.com/sealdice/LagrangeV2/releases/download/nightly/Lagrange.Milky-win-x64.exe"
+		;;
+	*)
+		echo ""
+		;;
+	esac
+}
+
+prepare_target_runtime_assets() {
+	local goos="$1"
+	local goarch="$2"
+	local target="${goos}-${goarch}"
+	local lagrange_url milky_url
+	TARGET_LAGRANGE_DIR=""
+	TARGET_MILKY_DIR=""
+
+	if [[ "$PACK_RUNTIME_ASSETS" != "1" ]]; then
+		return 0
+	fi
+
+	mkdir -p "$RUNTIME_CACHE_DIR"
+	lagrange_url="$(resolve_lagrange_url "$goos" "$goarch")"
+	if [[ -n "$lagrange_url" ]]; then
+		local lagrange_zip="$RUNTIME_CACHE_DIR/Lagrange.OneBot.${target}.zip"
+		local lagrange_dir="$RUNTIME_CACHE_DIR/lagrange.${target}"
+		if download_file_with_cache "$lagrange_url" "$lagrange_zip" "Lagrange ${goos}/${goarch}" &&
+			sync_cached_archive_dir "$lagrange_zip" "$lagrange_dir" "Lagrange ${goos}/${goarch}"; then
+			TARGET_LAGRANGE_DIR="$lagrange_dir"
+		elif [[ "$RUNTIME_ASSETS_STRICT" == "1" ]]; then
+			echo "[Build] 错误：无法准备 Lagrange ${goos}/${goarch}"
+			exit 1
+		fi
+	else
+		echo "[Build] 提示：${goos}/${goarch} 没有可用的 Lagrange 打包资源，跳过。"
+	fi
+
+	milky_url="$(resolve_milky_url "$goos" "$goarch")"
+	if [[ -n "$milky_url" ]]; then
+		local milky_source_name="lagrangeV2"
+		local milky_cache_file="$RUNTIME_CACHE_DIR/lagrangeV2.${target}"
+		local milky_dir="$RUNTIME_CACHE_DIR/milky.${target}"
+		if [[ "$goos" == "windows" ]]; then
+			milky_source_name="lagrangeV2.exe"
+			milky_cache_file="${milky_cache_file}.exe"
+		fi
+		if download_file_with_cache "$milky_url" "$milky_cache_file" "Milky ${goos}/${goarch}" &&
+			sync_cached_file_dir "$milky_cache_file" "$milky_dir" "$milky_source_name" "Milky ${goos}/${goarch}"; then
+			TARGET_MILKY_DIR="$milky_dir"
+		elif [[ "$RUNTIME_ASSETS_STRICT" == "1" ]]; then
+			echo "[Build] 错误：无法准备 Milky ${goos}/${goarch}"
+			exit 1
+		fi
+	else
+		echo "[Build] 提示：${goos}/${goarch} 没有可用的 Milky 打包资源，跳过。"
+	fi
+}
+
+copy_runtime_tree_if_present() {
+	local source_path="$1"
+	local destination_path="$2"
+	local label="$3"
+
+	if [[ -z "$source_path" ]]; then
+		return 0
+	fi
+	if [[ ! -e "$source_path" ]]; then
+		echo "[Build] 警告：${label} 资源不存在，跳过：$source_path"
+		return 0
+	fi
+	mkdir -p "$destination_path"
+	if [[ -d "$source_path" ]]; then
+		cp -a "$source_path"/. "$destination_path"/
+	else
+		cp -a "$source_path" "$destination_path"/
+	fi
+	echo "[Build] 已打包 ${label}：$destination_path"
 }
 
 join_by_comma() {
@@ -527,6 +787,18 @@ for target in "${TARGETS[@]}"; do
 	mkdir -p "$PACKAGE_DIR/data"
 	cp -a "$BINARY_PATH" "$PACKAGE_DIR/$BINARY_NAME"
 	cp -a "$BUILTINS_SUBMODULE_DIR/data/." "$PACKAGE_DIR/data/"
+	prepare_target_runtime_assets "$TARGET_GOOS" "$TARGET_GOARCH"
+	copy_runtime_tree_if_present "$TARGET_LAGRANGE_DIR" "$PACKAGE_DIR/lagrange" "Lagrange ${TARGET_GOOS}/${TARGET_GOARCH}"
+	copy_runtime_tree_if_present "$TARGET_MILKY_DIR" "$PACKAGE_DIR/milky" "Milky ${TARGET_GOOS}/${TARGET_GOARCH}"
+	if [[ "${TARGET_GOOS}" != "windows" ]]; then
+		chmod +x "$PACKAGE_DIR/$BINARY_NAME"
+		if [[ -f "$PACKAGE_DIR/lagrange/Lagrange.OneBot" ]]; then
+			chmod +x "$PACKAGE_DIR/lagrange/Lagrange.OneBot"
+		fi
+		if [[ -f "$PACKAGE_DIR/milky/lagrangeV2" ]]; then
+			chmod +x "$PACKAGE_DIR/milky/lagrangeV2"
+		fi
+	fi
 
 	if [[ "${TARGET_GOOS}" == "windows" ]]; then
 		ARCHIVE_PATH="$OUTPUT_DIR/${PACKAGE_BASENAME}.zip"
