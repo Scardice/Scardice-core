@@ -1223,26 +1223,9 @@ func (pa *PlatformAdapterGocq) DoRelogin() bool {
 				IsAsyncRun: true,
 			})
 			return true
-		} else {
-			myDice.Logger.Infof("重新启动go-cqhttp进程，对应账号: <%s>(%s)", ep.Nickname, ep.UserID)
-			pa.CurLoginIndex++
-			pa.GoCqhttpState = StateCodeInit
-			go BuiltinQQServeProcessKill(myDice, ep)
-			time.Sleep(10 * time.Second)                // 上面那个清理有概率卡住，具体不懂，改成等5s -> 10s 超过一次重试间隔
-			GoCqhttpServeRemoveSessionToken(myDice, ep) // 删除session.token
-			pa.GoCqhttpLastRestrictedTime = 0           // 重置风控时间
-			myDice.LastUpdatedTime = time.Now().Unix()
-			myDice.Save(false)
-			GoCqhttpServe(myDice, ep, GoCqhttpLoginInfo{
-				Password:         pa.InPackGoCqhttpPassword,
-				Protocol:         pa.InPackGoCqhttpProtocol,
-				AppVersion:       pa.InPackGoCqhttpAppVersion,
-				IsAsyncRun:       true,
-				UseSignServer:    pa.UseSignServer,
-				SignServerConfig: pa.SignServerConfig,
-			})
-			return true
 		}
+		myDice.Logger.Warnf("不支持或已经废弃的内置适配器模式: %s", pa.BuiltinMode)
+		return false
 	}
 	return false
 }
@@ -1261,17 +1244,7 @@ func (pa *PlatformAdapterGocq) SetEnable(enable bool) {
 					IsAsyncRun: true,
 				})
 			} else {
-				BuiltinQQServeProcessKill(d, c)
-				time.Sleep(1 * time.Second)
-				GoCqhttpServe(d, c, GoCqhttpLoginInfo{
-					Password:         pa.InPackGoCqhttpPassword,
-					Protocol:         pa.InPackGoCqhttpProtocol,
-					AppVersion:       pa.InPackGoCqhttpAppVersion,
-					IsAsyncRun:       true,
-					UseSignServer:    pa.UseSignServer,
-					SignServerConfig: pa.SignServerConfig,
-				})
-				go ServeQQ(d, c)
+				d.Logger.Warnf("不支持或已经废弃的内置适配器模式: %s", pa.BuiltinMode)
 			}
 		} else {
 			pa.GoCqhttpState = StateCodeLoginSuccessed

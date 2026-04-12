@@ -190,7 +190,7 @@ func ImConnectionsDel(c echo.Context) error {
 					switch i.ProtocolType {
 					case "onebot":
 						pa := i.Adapter.(*dice.PlatformAdapterGocq)
-						if pa.BuiltinMode == "lagrange" || pa.BuiltinMode == "lagrange-gocq" {
+						if pa.BuiltinMode == "lagrange" {
 							dice.BuiltinQQServeProcessKillBase(myDice, i, true)
 							// 经测试，若不延时，可能导致清理对应目录失败（原因：文件被占用）
 							time.Sleep(1 * time.Second)
@@ -760,67 +760,6 @@ func ImConnectionsAddMilkyInternal(c echo.Context) error {
 		myDice.LastUpdatedTime = time.Now().Unix()
 		myDice.Save(false)
 		go dice.ServeMilkyBuiltIn(myDice, conn)
-		return c.JSON(http.StatusOK, conn)
-	}
-	return c.String(430, "")
-}
-
-func ImConnectionsAddBuiltinGocq(c echo.Context) error {
-	if !doAuth(c) {
-		return c.JSON(http.StatusForbidden, nil)
-	}
-	if dm.JustForTest {
-		return c.JSON(http.StatusOK, map[string]interface{}{
-			"testMode": true,
-		})
-	}
-
-	v := struct {
-		Account string `json:"account"          yaml:"account"`
-		//nolint:gosec
-		Password         string                 `json:"password"         yaml:"password"`
-		Protocol         int                    `json:"protocol"`
-		AppVersion       string                 `json:"appVersion"`
-		UseSignServer    bool                   `json:"useSignServer"`
-		SignServerConfig *dice.SignServerConfig `json:"signServerConfig"`
-		// ConnectUrl        string `yaml:"connectUrl" json:"connectUrl"`               // 连接地址
-		// Platform          string `yaml:"platform" json:"platform"`                   // 平台，如QQ、QQ频道
-		// Enable            bool   `yaml:"enable" json:"enable"`                       // 是否启用
-		// Type              string `yaml:"type" json:"type"`                           // 协议类型，如onebot、koishi等
-		// UseInPackGoCqhttp bool   `yaml:"useInPackGoCqhttp" json:"useInPackGoCqhttp"` // 是否使用内置的gocqhttp
-	}{}
-
-	err := c.Bind(&v)
-	if err == nil {
-		uid := v.Account
-		if checkUidExists(c, uid) {
-			return nil
-		}
-
-		conn := dice.NewGoCqhttpConnectInfoItem(v.Account)
-		conn.UserID = dice.FormatDiceIDQQ(uid)
-		conn.Session = myDice.ImSession
-		pa := conn.Adapter.(*dice.PlatformAdapterGocq)
-		pa.InPackGoCqhttpProtocol = v.Protocol
-		pa.InPackGoCqhttpPassword = v.Password
-		pa.InPackGoCqhttpAppVersion = v.AppVersion
-		pa.Session = myDice.ImSession
-		pa.UseSignServer = v.UseSignServer
-		pa.SignServerConfig = v.SignServerConfig
-
-		myDice.ImSession.EndPoints = append(myDice.ImSession.EndPoints, conn)
-		myDice.LastUpdatedTime = time.Now().Unix()
-
-		dice.GoCqhttpServe(myDice, conn, dice.GoCqhttpLoginInfo{
-			Password:         v.Password,
-			Protocol:         v.Protocol,
-			AppVersion:       v.AppVersion,
-			IsAsyncRun:       true,
-			UseSignServer:    v.UseSignServer,
-			SignServerConfig: v.SignServerConfig,
-		})
-		myDice.LastUpdatedTime = time.Now().Unix()
-		myDice.Save(false)
 		return c.JSON(http.StatusOK, conn)
 	}
 	return c.String(430, "")

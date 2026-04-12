@@ -623,8 +623,6 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 	e.POST(prefix+"/im_connections/gocq_captcha_set", ImConnectionsCaptchaSet)
 
 	// 这些都是与QQ/OneBot直接相关
-	e.POST(prefix+"/im_connections/add", ImConnectionsAddBuiltinGocq) // 逐步弃用此链接
-	e.POST(prefix+"/im_connections/addGocq", ImConnectionsAddBuiltinGocq)
 	e.POST(prefix+"/im_connections/addOnebot11ReverseWs", ImConnectionsAddReverseWs)
 	e.POST(prefix+"/im_connections/addGocqSeparate", ImConnectionsAddGocqSeparate)
 	e.POST(prefix+"/im_connections/addLagrange", ImConnectionsAddBuiltinLagrange)

@@ -353,12 +353,8 @@ func GenerateLagrangeConfig(port int, signServerName string, signServerVersion s
 
 // 该函数后续考虑优化掉
 func LagrangeServeRemoveSession(dice *Dice, conn *EndPointInfo) {
-	workDir := gocqGetWorkDir(dice, conn)
+	workDir := lagrangeGetWorkDir(dice, conn)
 	file := filepath.Join(workDir, "keystore.json")
-	pa := conn.Adapter.(*PlatformAdapterGocq)
-	if pa.BuiltinMode == "lagrange-gocq" {
-		file = filepath.Join(workDir, "session.token")
-	}
 	if _, err := os.Stat(file); err == nil {
 		_ = os.Remove(file)
 	}
