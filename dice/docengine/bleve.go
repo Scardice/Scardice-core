@@ -66,8 +66,10 @@ func (d *BleveSearchEngine) Init() error {
 			return err
 		}
 		d.Index = i
-		// 初始化ID列表（复用索引时以文档数为准）
-		if count, err := d.Index.DocCount(); err == nil {
+		if maxID, err := d.MaxDocumentID(); err == nil {
+			d.CurID = maxID
+		} else if count, err := d.Index.DocCount(); err == nil {
+			// 旧索引扫描失败时至少避免从 0 开始覆盖。
 			d.CurID = count
 		}
 	} else {
@@ -130,6 +132,35 @@ func (d *BleveSearchEngine) GetTotalID() uint64 {
 
 func (d *BleveSearchEngine) SetTotalID(total uint64) {
 	d.CurID = total
+}
+
+func (d *BleveSearchEngine) MaxDocumentID() (uint64, error) {
+	if d.Index == nil {
+		return 0, nil
+	}
+	var maxID uint64
+	offset := 0
+	for {
+		req := bleve.NewSearchRequestOptions(bleve.NewMatchAllQuery(), 500, offset, false)
+		res, err := d.Index.Search(req)
+		if err != nil {
+			return 0, err
+		}
+		if len(res.Hits) == 0 {
+			break
+		}
+		for _, hit := range res.Hits {
+			id, err := strconv.ParseUint(hit.ID, 10, 64)
+			if err == nil && id > maxID {
+				maxID = id
+			}
+		}
+		offset += len(res.Hits)
+		if uint64(offset) >= res.Total {
+			break
+		}
+	}
+	return maxID, nil
 }
 
 // AddItem 这里引用了dice，其实不妥，应该将它单独拆出来的。

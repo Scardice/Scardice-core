@@ -87,7 +87,7 @@ const helpIndexManifestPath = "./data/.cache/helpdoc/index_manifest.json"
 const helpIndexManifestVersion = 1
 const helpIndexSchemaVersion = 2
 const helpDocParsedCacheDir = "./data/.cache/helpdoc/parsed"
-const helpDocParsedCacheVersion = 1
+const helpDocParsedCacheVersion = 2
 
 type HelpConfig struct {
 	Aliases map[string][]string `json:"aliases" yaml:"aliases"`
@@ -106,6 +106,7 @@ type helpDocParsedCache struct {
 	RelPath string                   `json:"relPath"`
 	Size    int64                    `json:"size"`
 	ModTime int64                    `json:"modTime"`
+	Hash    string                   `json:"hash"`
 	Items   []docengine.HelpTextItem `json:"items"`
 }
 
@@ -159,7 +160,11 @@ func (m *HelpManager) Load(internalCmdMap CmdMapCls, extList []*ExtInfo) {
 		return
 	}
 	oldManifest, _ := loadHelpIndexManifest()
-	curManifest := buildHelpIndexManifest(m.EngineType, internalCmdMap, extList)
+	curManifest, err := buildHelpIndexManifest(m.EngineType)
+	if err != nil {
+		log.Errorf("[帮助文档] 扫描帮助文档失败: %v", err)
+		return
+	}
 	reuse := canReuseHelpIndex(oldManifest, &curManifest)
 	if reuse {
 		log.Infof("[帮助文档] 尝试复用索引并进行增量更新")
@@ -198,7 +203,7 @@ func (m *HelpManager) Load(internalCmdMap CmdMapCls, extList []*ExtInfo) {
 		if m.shouldStop() {
 			return
 		}
-		if oldManifest != nil {
+		if oldManifest != nil && oldManifest.TotalID > m.searchEngine.GetTotalID() {
 			m.searchEngine.SetTotalID(oldManifest.TotalID)
 		}
 		m.HelpDocTree = m.buildHelpDocTreeOnly()
@@ -215,73 +220,35 @@ func (m *HelpManager) Load(internalCmdMap CmdMapCls, extList []*ExtInfo) {
 			if m.shouldStop() {
 				return
 			}
-			log.Infof("[帮助文档] 增量更新完成，变更: %v", changed)
-			m.CurID = m.searchEngine.GetTotalID()
-			if oldManifest != nil && !changed {
-				curManifest.TotalID = oldManifest.TotalID
+			if err := m.refreshGeneratedHelpDocs(internalCmdMap, extList); err != nil {
+				log.Warnf("[帮助文档] 刷新生成帮助失败，改为重建: %v", err)
+				m.searchEngine.Close()
+				if err2 := m.loadSearchEngineWithMode(false); err2 != nil {
+					log.Errorf("初始化帮助文档失败，帮助文档不可用! %v", err2)
+					return
+				}
 			} else {
+				if m.shouldStop() {
+					return
+				}
+				log.Infof("[帮助文档] 增量更新完成，变更: %v", changed)
+				m.CurID = m.searchEngine.GetTotalID()
 				curManifest.TotalID = m.CurID
+				if err := writeHelpIndexManifest(curManifest); err != nil {
+					log.Warnf("[帮助文档] 写入索引清单失败: %v", err)
+				}
+				log.Infof("[帮助文档] 复用现有索引完成，共计加载条目:%d", m.CurID)
+				return
 			}
-			if err := writeHelpIndexManifest(curManifest); err != nil {
-				log.Warnf("[帮助文档] 写入索引清单失败: %v", err)
-			}
-			log.Infof("[帮助文档] 复用现有索引完成，共计加载条目:%d", m.CurID)
-			return
 		}
 	}
 
 	if m.shouldStop() {
 		return
 	}
-	_ = m.AddItem(docengine.HelpTextItem{
-		Group: HelpBuiltinGroup,
-		Title: "骰点",
-		Content: `.help 骰点：
- .r  //丢一个100面骰
-.r d10 //丢一个10面骰(数字可改)
-.r 3d6 //丢3个6面骰(数字可改)
-.ra 侦查 //侦查技能检定
-.ra 侦查+10 //技能临时加值检定
-.ra 3#p 射击 // 连续射击三次`,
-		PackageName: "帮助",
-	})
-
-	_ = m.AddItem(docengine.HelpTextItem{
-		Group: HelpBuiltinGroup,
-		Title: "扩展",
-		Content: `.help 扩展：
-扩展功能可以让你开关部分指令。
-例如你希望你的骰子是纯TRPG骰，那么可以通过.ext xxx off关闭一系列娱乐模块。
-或者目前正在进行dnd5e游戏，你可以通过如下指令开关dnd特化扩展。COC亦然。
-注意一点，不同扩展允许存在同名指令，例如dnd和coc都有st和rc，但他们本质上不是同一个指令，并不通用，还请注意。
-
-.ext coc7 on // 打开coc7版扩展
-.ext dnd5e off // 关闭dnd5版扩展
-
-.ext dnd5e on // 打开dnd5版扩展
-.ext coc7 off // 关闭coc7版扩展
-`,
-		PackageName: "帮助",
-	})
-
-	_ = m.AddItem(docengine.HelpTextItem{
-		Group: HelpBuiltinGroup,
-		Title: "跑团",
-		Content: `.help 跑团：
-.st 力量50 //载入技能/属性
-.coc // coc7版人物做成
-.dnd // dnd5版任务做成
-.pc new <角色名> // 创建角色并自动绑卡，无角色名则为当前
-.pc tag <角色名> // 当前群绑卡/解除绑卡(不填角色名)
-.pc save <角色名> // 保存角色[不绑卡时需要手动保存]，无角色名则为当前
-.pc load <角色名> // 加载角色[不绑卡]，无角色名则为当前
-.pc list //列出当前角色
-.pc del <角色名> //删除角色
-.setcoc 2 //设置为coc2版房规
-.nn 张三 //将自己的角色名设置为张三
-`,
-		PackageName: "帮助",
-	})
+	if err := m.addGeneratedBuiltinHelp(); err != nil {
+		log.Errorf("加载内置帮助文档出现异常: %v", err)
+	}
 
 	m.HelpDocTree = make([]*HelpDoc, 0)
 	entries, err := os.ReadDir("data/helpdoc")
@@ -315,7 +282,7 @@ func (m *HelpManager) Load(internalCmdMap CmdMapCls, extList []*ExtInfo) {
 		}
 		buildHelpDocTree(&child, func(d *HelpDoc) {
 			if !d.IsDir {
-				ok := m.loadHelpDoc(d.Group, d.Path)
+				ok := m.loadHelpDoc(d.Group, d.Path, true)
 				// TODO: Batch过大好像不会释放……
 				err = m.AddItemApply(false)
 				if ok && err == nil {
@@ -360,6 +327,65 @@ func (m *HelpManager) Load(internalCmdMap CmdMapCls, extList []*ExtInfo) {
 	cleanupStaleHelpDocParsedCaches(curManifest.Files)
 }
 
+func (m *HelpManager) addGeneratedBuiltinHelp() error {
+	if err := m.AddItem(docengine.HelpTextItem{
+		Group: HelpBuiltinGroup,
+		Title: "骰点",
+		Content: `.help 骰点：
+ .r  //丢一个100面骰
+.r d10 //丢一个10面骰(数字可改)
+.r 3d6 //丢3个6面骰(数字可改)
+.ra 侦查 //侦查技能检定
+.ra 侦查+10 //技能临时加值检定
+.ra 3#p 射击 // 连续射击三次`,
+		PackageName: "帮助",
+	}); err != nil {
+		return err
+	}
+
+	if err := m.AddItem(docengine.HelpTextItem{
+		Group: HelpBuiltinGroup,
+		Title: "扩展",
+		Content: `.help 扩展：
+扩展功能可以让你开关部分指令。
+例如你希望你的骰子是纯TRPG骰，那么可以通过.ext xxx off关闭一系列娱乐模块。
+或者目前正在进行dnd5e游戏，你可以通过如下指令开关dnd特化扩展。COC亦然。
+注意一点，不同扩展允许存在同名指令，例如dnd和coc都有st和rc，但他们本质上不是同一个指令，并不通用，还请注意。
+
+.ext coc7 on // 打开coc7版扩展
+.ext dnd5e off // 关闭dnd5版扩展
+
+.ext dnd5e on // 打开dnd5版扩展
+.ext coc7 off // 关闭coc7版扩展
+`,
+		PackageName: "帮助",
+	}); err != nil {
+		return err
+	}
+
+	if err := m.AddItem(docengine.HelpTextItem{
+		Group: HelpBuiltinGroup,
+		Title: "跑团",
+		Content: `.help 跑团：
+.st 力量50 //载入技能/属性
+.coc // coc7版人物做成
+.dnd // dnd5版任务做成
+.pc new <角色名> // 创建角色并自动绑卡，无角色名则为当前
+.pc tag <角色名> // 当前群绑卡/解除绑卡(不填角色名)
+.pc save <角色名> // 保存角色[不绑卡时需要手动保存]，无角色名则为当前
+.pc load <角色名> // 加载角色[不绑卡]，无角色名则为当前
+.pc list //列出当前角色
+.pc del <角色名> //删除角色
+.setcoc 2 //设置为coc2版房规
+.nn 张三 //将自己的角色名设置为张三
+`,
+		PackageName: "帮助",
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (m *HelpManager) loadHelpConfig() {
 	data, err := os.ReadFile(filepath.Join("./data/helpdoc", HelpConfigFilename))
 	if err != nil {
@@ -393,6 +419,7 @@ type helpDocFileInfo struct {
 	Path    string `json:"path"`
 	Size    int64  `json:"size"`
 	ModTime int64  `json:"modTime"`
+	Hash    string `json:"hash"`
 }
 
 type helpIndexManifest struct {
@@ -416,16 +443,19 @@ func loadHelpIndexManifest() (*helpIndexManifest, error) {
 	return &manifest, nil
 }
 
-func buildHelpIndexManifest(engineType EngineType, internalCmdMap CmdMapCls, extList []*ExtInfo) helpIndexManifest {
-	curFiles, _ := collectHelpDocFiles("./data/helpdoc")
-	fingerprint := buildHelpIndexFingerprint(internalCmdMap, extList)
+func buildHelpIndexManifest(engineType EngineType) (helpIndexManifest, error) {
+	curFiles, err := collectHelpDocFiles("./data/helpdoc")
+	if err != nil {
+		return helpIndexManifest{}, err
+	}
+	fingerprint := buildHelpIndexFingerprint()
 	return helpIndexManifest{
 		Version:       helpIndexManifestVersion,
 		SchemaVersion: helpIndexSchemaVersion,
 		EngineType:    engineType,
 		Fingerprint:   fingerprint,
 		Files:         curFiles,
-	}
+	}, nil
 }
 
 func canReuseHelpIndex(old *helpIndexManifest, cur *helpIndexManifest) bool {
@@ -439,9 +469,6 @@ func canReuseHelpIndex(old *helpIndexManifest, cur *helpIndexManifest) bool {
 		return false
 	}
 	if old.EngineType != cur.EngineType {
-		return false
-	}
-	if old.Fingerprint != cur.Fingerprint {
 		return false
 	}
 	return true
@@ -481,7 +508,7 @@ func (m *HelpManager) updateHelpIndexIncremental(oldFiles, curFiles []helpDocFil
 	var changedPaths []string
 	for path, cur := range curMap {
 		old, exists := oldMap[path]
-		if !exists || old.Size != cur.Size || old.ModTime != cur.ModTime {
+		if !exists || old.Hash == "" || old.Hash != cur.Hash {
 			changedPaths = append(changedPaths, path)
 		}
 	}
@@ -529,7 +556,8 @@ func (m *HelpManager) updateHelpIndexIncremental(oldFiles, curFiles []helpDocFil
 			}
 		}
 		group := helpDocGroupFromRel(path)
-		if ok := m.loadHelpDoc(group, fullPath); !ok {
+		removeHelpDocParsedCache(path)
+		if ok := m.loadHelpDoc(group, fullPath, false); !ok {
 			return changed, fmt.Errorf("load helpdoc failed: %s", fullPath)
 		}
 		added = true
@@ -542,6 +570,30 @@ func (m *HelpManager) updateHelpIndexIncremental(oldFiles, curFiles []helpDocFil
 	}
 	cleanupStaleHelpDocParsedCaches(curFiles)
 	return changed, nil
+}
+
+func (m *HelpManager) refreshGeneratedHelpDocs(internalCmdMap CmdMapCls, extList []*ExtInfo) error {
+	if m.searchEngine != nil {
+		if err := m.searchEngine.DeleteByFrom(""); err != nil {
+			return err
+		}
+	}
+	if err := m.addGeneratedBuiltinHelp(); err != nil {
+		return err
+	}
+	if err := m.AddItemApply(false); err != nil {
+		return err
+	}
+	if err := m.addInternalCmdHelp(internalCmdMap); err != nil {
+		return err
+	}
+	if err := m.AddItemApply(false); err != nil {
+		return err
+	}
+	if err := m.addExternalCmdHelp(extList); err != nil {
+		return err
+	}
+	return m.AddItemApply(true)
 }
 
 func helpDocGroupFromRel(rel string) string {
@@ -608,6 +660,10 @@ func collectHelpDocFiles(root string) ([]helpDocFileInfo, error) {
 		if err != nil {
 			return err
 		}
+		hash, err := helpDocFileHash(p)
+		if err != nil {
+			return err
+		}
 		rel, err := filepath.Rel(root, p)
 		if err != nil {
 			return err
@@ -616,6 +672,7 @@ func collectHelpDocFiles(root string) ([]helpDocFileInfo, error) {
 			Path:    filepath.ToSlash(rel),
 			Size:    info.Size(),
 			ModTime: info.ModTime().Unix(),
+			Hash:    hash,
 		})
 		return nil
 	})
@@ -625,7 +682,22 @@ func collectHelpDocFiles(root string) ([]helpDocFileInfo, error) {
 	return files, err
 }
 
-func buildHelpIndexFingerprint(internalCmdMap CmdMapCls, extList []*ExtInfo) string {
+func helpDocFileHash(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func buildHelpIndexFingerprint() string {
 	h := sha256.New()
 	write := func(s string) {
 		_, _ = h.Write([]byte(s))
@@ -636,74 +708,8 @@ func buildHelpIndexFingerprint(internalCmdMap CmdMapCls, extList []*ExtInfo) str
 	write(fmt.Sprintf("schema:%d", helpIndexSchemaVersion))
 	write(fmt.Sprintf("parsed-cache:%d", helpDocParsedCacheVersion))
 	write(fmt.Sprintf("engine:%d", BleveSearch))
-	writeHelpCmdMapFingerprint(write, "builtin", internalCmdMap)
-	writeHelpExtListFingerprint(write, extList)
 
 	return hex.EncodeToString(h.Sum(nil))
-}
-
-func writeHelpCmdMapFingerprint(write func(string), prefix string, cmdMap CmdMapCls) {
-	if cmdMap == nil {
-		write(prefix + ":nil")
-		return
-	}
-	keys := make([]string, 0, len(cmdMap))
-	for key := range cmdMap {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	write(fmt.Sprintf("%s:count:%d", prefix, len(keys)))
-	for _, key := range keys {
-		item := cmdMap[key]
-		write(prefix + ":cmd:" + key)
-		if item == nil {
-			write(prefix + ":cmd:nil")
-			continue
-		}
-		help := item.Help
-		if help == "" {
-			help = item.ShortHelp
-		}
-		if help == "" && item.HelpFunc != nil {
-			help = item.HelpFunc(false)
-		}
-		write(prefix + ":help:" + help)
-	}
-}
-
-func writeHelpExtListFingerprint(write func(string), extList []*ExtInfo) {
-	if extList == nil {
-		write("ext:nil")
-		return
-	}
-	exts := make([]*ExtInfo, 0, len(extList))
-	for _, ext := range extList {
-		if ext != nil {
-			exts = append(exts, ext)
-		}
-	}
-	sort.Slice(exts, func(i, j int) bool {
-		left := exts[i]
-		right := exts[j]
-		if left.Name != right.Name {
-			return left.Name < right.Name
-		}
-		if left.Author != right.Author {
-			return left.Author < right.Author
-		}
-		return left.Version < right.Version
-	})
-	write(fmt.Sprintf("ext:count:%d", len(exts)))
-	for _, ext := range exts {
-		write("ext:name:" + ext.Name)
-		write("ext:author:" + ext.Author)
-		write("ext:version:" + ext.Version)
-		write("ext:brief:" + ext.Brief)
-		if ext.GetDescText != nil {
-			write("ext:desc:" + ext.GetDescText(ext))
-		}
-		writeHelpCmdMapFingerprint(write, "ext:"+ext.Name, ext.GetCmdMap())
-	}
 }
 
 func (m *HelpManager) buildHelpDocTreeOnly() []*HelpDoc {
@@ -777,12 +783,14 @@ func (m *HelpManager) SaveHelpConfig(config *HelpConfig) error {
 	return nil
 }
 
-func (m *HelpManager) loadHelpDoc(group string, path string) bool {
+func (m *HelpManager) loadHelpDoc(group string, path string, logLoad bool) bool {
 	log := logger.M()
 	if m.shouldStop() {
 		return false
 	}
-	log.Infof("[帮助文档] 加载: %s", path)
+	if logLoad {
+		log.Infof("[帮助文档] 加载: %s", path)
+	}
 	fileExt := filepath.Ext(path)
 
 	switch fileExt {
@@ -932,7 +940,7 @@ func cleanupStaleHelpDocParsedCaches(files []helpDocFileInfo) {
 }
 
 func (m *HelpManager) loadHelpDocItemsFromCache(group string, path string) ([]docengine.HelpTextItem, bool) {
-	st, err := os.Stat(path)
+	hash, err := helpDocFileHash(path)
 	if err != nil {
 		return nil, false
 	}
@@ -949,7 +957,7 @@ func (m *HelpManager) loadHelpDocItemsFromCache(group string, path string) ([]do
 		rel = path
 	}
 	rel = filepath.ToSlash(rel)
-	if cache.RelPath != rel || cache.Size != st.Size() || cache.ModTime != st.ModTime().Unix() {
+	if cache.RelPath != rel || cache.Hash == "" || cache.Hash != hash {
 		return nil, false
 	}
 	for i := range cache.Items {
@@ -964,6 +972,10 @@ func (m *HelpManager) saveHelpDocItemsToCache(path string, items []docengine.Hel
 	if err != nil {
 		return
 	}
+	hash, err := helpDocFileHash(path)
+	if err != nil {
+		return
+	}
 	rel, err := filepath.Rel("data/helpdoc", path)
 	if err != nil {
 		rel = path
@@ -974,6 +986,7 @@ func (m *HelpManager) saveHelpDocItemsToCache(path string, items []docengine.Hel
 		RelPath: rel,
 		Size:    st.Size(),
 		ModTime: st.ModTime().Unix(),
+		Hash:    hash,
 		Items:   items,
 	}
 	cachePath := filepath.Join(helpDocParsedCacheDir, helpDocCacheKey(path)+".gob.zst")

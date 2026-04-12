@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"math"
 	"math/rand"
@@ -33,7 +34,9 @@ import (
 
 const (
 	deckParseCacheDir        = "./data/.cache/decks"
-	deckParseCacheVersion    = 1
+	deckIndexManifestPath    = "./data/.cache/decks/index_manifest.json"
+	deckIndexManifestVersion = 1
+	deckParseCacheVersion    = 2
 	deckParseSchemaVersion   = 1
 	deckParseCacheFileSuffix = ".gob.zst"
 )
@@ -43,7 +46,22 @@ type deckParseCache struct {
 	SchemaVersion int      `json:"schemaVersion"`
 	Size          int64    `json:"size"`
 	ModTime       int64    `json:"modTime"`
+	Hash          string   `json:"hash"`
 	DeckInfo      DeckInfo `json:"deckInfo"`
+}
+
+type deckSourceFileInfo struct {
+	Path    string `json:"path"`
+	Size    int64  `json:"size"`
+	ModTime int64  `json:"modTime"`
+	Hash    string `json:"hash"`
+}
+
+type deckIndexManifest struct {
+	Version            int                  `json:"version"`
+	ParseCacheVersion  int                  `json:"parseCacheVersion"`
+	ParseSchemaVersion int                  `json:"parseSchemaVersion"`
+	Files              []deckSourceFileInfo `json:"files"`
 }
 
 type DeckDiceEFormat struct {
@@ -437,8 +455,31 @@ func deckParseCachePath(fn string) string {
 	return filepath.Join(deckParseCacheDir, hex.EncodeToString(sum[:])+deckParseCacheFileSuffix)
 }
 
+func deckSourceFileHash(fn string) (string, error) {
+	f, err := os.Open(fn)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func removeDeckParseCache(fn string) {
+	_ = os.Remove(deckParseCachePath(fn))
+}
+
 func loadDeckParseCache(fn string, st fs.FileInfo) (*DeckInfo, bool) {
 	if st == nil {
+		return nil, false
+	}
+	hash, err := deckSourceFileHash(fn)
+	if err != nil {
 		return nil, false
 	}
 	cachePath := deckParseCachePath(fn)
@@ -447,9 +488,11 @@ func loadDeckParseCache(fn string, st fs.FileInfo) (*DeckInfo, bool) {
 		return nil, false
 	}
 	if cache.Version != deckParseCacheVersion || cache.SchemaVersion != deckParseSchemaVersion {
+		_ = os.Remove(cachePath)
 		return nil, false
 	}
-	if cache.Size != st.Size() || cache.ModTime != st.ModTime().Unix() {
+	if cache.Hash == "" || cache.Hash != hash {
+		_ = os.Remove(cachePath)
 		return nil, false
 	}
 	return &cache.DeckInfo, true
@@ -459,11 +502,16 @@ func saveDeckParseCache(fn string, st fs.FileInfo, deckInfo *DeckInfo) {
 	if st == nil || deckInfo == nil || !deckInfo.Enable {
 		return
 	}
+	hash, err := deckSourceFileHash(fn)
+	if err != nil {
+		return
+	}
 	cache := &deckParseCache{
 		Version:       deckParseCacheVersion,
 		SchemaVersion: deckParseSchemaVersion,
 		Size:          st.Size(),
 		ModTime:       st.ModTime().Unix(),
+		Hash:          hash,
 		DeckInfo:      *deckInfo,
 	}
 	cachePath := deckParseCachePath(fn)
@@ -496,6 +544,7 @@ func DeckTryParse(d *Dice, fn string) {
 		if deckInfo.CloudDeckItemInfos == nil {
 			deckInfo.CloudDeckItemInfos = map[string]*CloudDeckItemInfo{}
 		}
+		removeDeckParseCache(fn)
 		_ = parseDeck(d, fn, content, deckInfo)
 		saveDeckParseCache(fn, st, deckInfo)
 	}
@@ -591,6 +640,99 @@ func collectDeckSourceFiles(root string) []string {
 	return files
 }
 
+func collectDeckSourceFileInfos(root string) ([]deckSourceFileInfo, error) {
+	files := collectDeckSourceFiles(root)
+	infos := make([]deckSourceFileInfo, 0, len(files))
+	for _, file := range files {
+		st, err := os.Stat(file)
+		if err != nil {
+			return nil, err
+		}
+		hash, err := deckSourceFileHash(file)
+		if err != nil {
+			return nil, err
+		}
+		infos = append(infos, deckSourceFileInfo{
+			Path:    filepath.ToSlash(file),
+			Size:    st.Size(),
+			ModTime: st.ModTime().Unix(),
+			Hash:    hash,
+		})
+	}
+	return infos, nil
+}
+
+func loadDeckIndexManifest() (*deckIndexManifest, error) {
+	data, err := os.ReadFile(deckIndexManifestPath)
+	if err != nil {
+		return nil, err
+	}
+	var manifest deckIndexManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil, err
+	}
+	return &manifest, nil
+}
+
+func buildDeckIndexManifest(files []deckSourceFileInfo) deckIndexManifest {
+	return deckIndexManifest{
+		Version:            deckIndexManifestVersion,
+		ParseCacheVersion:  deckParseCacheVersion,
+		ParseSchemaVersion: deckParseSchemaVersion,
+		Files:              files,
+	}
+}
+
+func canReuseDeckIndexManifest(old *deckIndexManifest, cur *deckIndexManifest) bool {
+	if old == nil || cur == nil {
+		return false
+	}
+	if old.Version != deckIndexManifestVersion {
+		return false
+	}
+	if old.ParseCacheVersion != deckParseCacheVersion {
+		return false
+	}
+	if old.ParseSchemaVersion != deckParseSchemaVersion {
+		return false
+	}
+	return true
+}
+
+func writeDeckIndexManifest(manifest deckIndexManifest) error {
+	_ = os.MkdirAll(filepath.Dir(deckIndexManifestPath), 0o755)
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(deckIndexManifestPath, data, 0o644)
+}
+
+func diffDeckSourceFiles(oldFiles, curFiles []deckSourceFileInfo) (deletedPaths []string, changedPaths []string) {
+	oldMap := map[string]deckSourceFileInfo{}
+	for _, file := range oldFiles {
+		oldMap[file.Path] = file
+	}
+	curMap := map[string]deckSourceFileInfo{}
+	for _, file := range curFiles {
+		curMap[file.Path] = file
+	}
+	for path := range oldMap {
+		if _, ok := curMap[path]; !ok {
+			deletedPaths = append(deletedPaths, path)
+		}
+	}
+	for path, cur := range curMap {
+		old, exists := oldMap[path]
+		if !exists || old.Hash == "" || old.Hash != cur.Hash {
+			changedPaths = append(changedPaths, path)
+		}
+	}
+	sort.Strings(deletedPaths)
+	sort.Strings(changedPaths)
+	return deletedPaths, changedPaths
+}
+
 func cleanupStaleDeckParseCaches(files []string) {
 	entries, err := os.ReadDir(deckParseCacheDir)
 	if err != nil {
@@ -611,7 +753,7 @@ func cleanupStaleDeckParseCaches(files []string) {
 	}
 }
 
-func DecksDetect(d *Dice) {
+func DecksDetect(d *Dice) bool {
 	// 先进行zip解压
 	_ = filepath.Walk("data/decks", func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
@@ -644,17 +786,86 @@ func DecksDetect(d *Dice) {
 		return nil
 	})
 
-	files := collectDeckSourceFiles("data/decks")
+	fileInfos, err := collectDeckSourceFileInfos("data/decks")
+	if err != nil {
+		d.Logger.Warnf("[牌堆] 扫描牌堆文件失败，改为普通加载: %v", err)
+		fileInfos = nil
+	}
+	curManifest := buildDeckIndexManifest(fileInfos)
+	oldManifest, _ := loadDeckIndexManifest()
+	reuse := err == nil && canReuseDeckIndexManifest(oldManifest, &curManifest)
+	if reuse {
+		d.Logger.Infof("[牌堆] 尝试复用索引并进行增量更新")
+	} else {
+		d.Logger.Infof("从此目录加载牌堆: %s", "data/decks")
+	}
+
+	files := make([]string, 0, len(fileInfos))
+	for _, file := range fileInfos {
+		files = append(files, file.Path)
+	}
+	if err != nil {
+		files = collectDeckSourceFiles("data/decks")
+	}
 	cleanupStaleDeckParseCaches(files)
+	deletedPaths, changedPaths := []string{}, []string{}
+	changedSet := map[string]struct{}{}
+	if reuse {
+		deletedPaths, changedPaths = diffDeckSourceFiles(oldManifest.Files, curManifest.Files)
+		for _, path := range changedPaths {
+			changedSet[path] = struct{}{}
+		}
+	}
+	totalOps := len(deletedPaths) + len(changedPaths)
+	progress := 0
+	logStep := func(action, path string) {
+		progress++
+		percent := 100.0
+		if totalOps > 0 {
+			percent = float64(progress) / float64(totalOps) * 100
+		}
+		d.Logger.Infof("[牌堆] 增量更新进度: %s %s %.2f%% (%d/%d)", action, path, percent, progress, totalOps)
+	}
+	for _, path := range deletedPaths {
+		logStep("删除", path)
+		removeDeckParseCache(path)
+	}
 	total := len(files)
 	for idx, path := range files {
-		progress := 100.0
-		if total > 0 {
-			progress = float64(idx+1) / float64(total) * 100
+		if reuse {
+			if _, ok := changedSet[path]; ok {
+				logStep("更新", path)
+				removeDeckParseCache(path)
+			}
+		} else {
+			progress := 100.0
+			if total > 0 {
+				progress = float64(idx+1) / float64(total) * 100
+			}
+			d.Logger.Infof("牌堆加载进度: %s %.2f%% (%d/%d)", path, progress, idx+1, total)
 		}
-		d.Logger.Infof("牌堆加载进度: %s %.2f%% (%d/%d)", path, progress, idx+1, total)
 		DeckTryParse(d, path)
 	}
+	if err == nil {
+		if writeErr := writeDeckIndexManifest(curManifest); writeErr != nil {
+			d.Logger.Warnf("[牌堆] 写入索引清单失败: %v", writeErr)
+		}
+	}
+	if reuse {
+		d.Logger.Infof("[牌堆] 增量更新完成，变更: %v", totalOps > 0)
+		d.Logger.Infof("[牌堆] 复用现有索引完成，共计加载牌堆数量:%d 条目数量:%d", len(d.DeckList), countDeckItemEntries(d.DeckList))
+	}
+	return reuse
+}
+
+func countDeckItemEntries(decks []*DeckInfo) int {
+	total := 0
+	for _, deck := range decks {
+		for _, items := range deck.DeckItems {
+			total += len(items)
+		}
+	}
+	return total
 }
 
 func DeckDelete(_ *Dice, deck *DeckInfo) {
@@ -704,9 +915,10 @@ func deckReloadRun(d *Dice) {
 	if d.StoreManager != nil {
 		d.StoreManager.InstalledDecks = map[string]bool{}
 	}
-	d.Logger.Infof("从此目录加载牌堆: %s", "data/decks")
-	DecksDetect(d)
-	d.Logger.Infof("加载完成，现有牌堆 %d 个", len(d.DeckList))
+	reuse := DecksDetect(d)
+	if !reuse {
+		d.Logger.Infof("加载完成，现有牌堆 %d 个", len(d.DeckList))
+	}
 
 	lst := DeckCommandListItems{}
 	for _, i := range d.DeckList {
