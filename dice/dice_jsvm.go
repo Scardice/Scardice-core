@@ -1553,35 +1553,42 @@ func (d *Dice) JsLoadScripts() {
 	builtinFiles := collectJsScriptPaths(builtinPath, false)
 	userFiles := collectJsScriptPaths(path, true)
 	totalFiles := len(builtinFiles) + len(userFiles)
-	progress := 0
-	logProgress := func(kind, path string) {
-		progress++
-		percent := 100.0
-		if totalFiles > 0 {
-			percent = float64(progress) / float64(totalFiles) * 100
-		}
-		d.Logger.Infof("JS 脚本扫描进度: %s %s %.2f%% (%d/%d)", kind, path, percent, progress, totalFiles)
+	scannedFiles := 0
+	cacheHits := 0
+	failedFiles := 0
+	d.Logger.Infof("JS 脚本开始扫描，共计 %d 个", totalFiles)
+	recordScanned := func() {
+		scannedFiles++
+	}
+	recordCacheHit := func() {
+		cacheHits++
+	}
+	recordFailure := func() {
+		failedFiles++
 	}
 
 	// 解析内置脚本
 	for _, path := range builtinFiles {
+		recordScanned()
 		info, err := os.Stat(path)
 		if err != nil {
+			recordFailure()
 			continue
 		}
-		logProgress("内置", path)
 		key := jsCacheKey(path)
 		if metaCache != nil {
 			if entry, ok := metaCache.Files[key]; ok &&
 				entry.Builtin && entry.Size == info.Size() && entry.ModTime == info.ModTime().Unix() &&
 				isCompatibleJsMetaCacheEntry(entry) {
 				if entry.Meta.SignStatus != OfficialSign {
+					recordFailure()
 					d.Logger.Warnf("内置脚本「%s」校验未通过，拒绝加载", path)
 					newCache.Files[key] = entry
 					continue
 				}
 				jsInfo, buildErr := buildJsScriptInfoFromCache(d, "./"+path, entry)
 				if buildErr == nil {
+					recordCacheHit()
 					jsInfos = append(jsInfos, jsInfo)
 					if len(jsInfo.StoreID) > 0 {
 						d.StoreManager.InstalledPlugins[jsInfo.StoreID] = true
@@ -1589,6 +1596,7 @@ func (d *Dice) JsLoadScripts() {
 					newCache.Files[key] = entry
 					continue
 				}
+				recordFailure()
 				entry.ParseErr = buildErr.Error()
 				newCache.Files[key] = entry
 				d.Logger.Error("读取内置脚本失败(错误依赖)", buildErr.Error())
@@ -1598,11 +1606,13 @@ func (d *Dice) JsLoadScripts() {
 
 		data, err := os.ReadFile(path) //nolint:gosec
 		if err != nil {
+			recordFailure()
 			d.Logger.Error("读取内置脚本失败(无法访问): ", err.Error())
 			continue
 		}
 		ok, signStatus := CheckJsSign(data)
 		if !ok {
+			recordFailure()
 			d.Logger.Warnf("内置脚本「%s」校验未通过，拒绝加载", path)
 			entry := buildJsMetaCacheEntry(path, info, nil, true, errors.New("signature invalid"))
 			entry.Meta.SignStatus = signStatus
@@ -1612,6 +1622,7 @@ func (d *Dice) JsLoadScripts() {
 		jsInfo, err := d.JsParseMeta("./"+path, info.ModTime(), data, true)
 		newCache.Files[key] = buildJsMetaCacheEntry(path, info, jsInfo, true, err)
 		if err != nil {
+			recordFailure()
 			d.Logger.Error("读取内置脚本失败(错误依赖)", err.Error())
 			continue
 		}
@@ -1623,11 +1634,12 @@ func (d *Dice) JsLoadScripts() {
 
 	// 解析第三方脚本
 	for _, path := range userFiles {
+		recordScanned()
 		info, err := os.Stat(path)
 		if err != nil {
+			recordFailure()
 			continue
 		}
-		logProgress("用户", path)
 		key := jsCacheKey(path)
 		if metaCache != nil {
 			if entry, ok := metaCache.Files[key]; ok &&
@@ -1635,6 +1647,7 @@ func (d *Dice) JsLoadScripts() {
 				isCompatibleJsMetaCacheEntry(entry) {
 				jsInfo, buildErr := buildJsScriptInfoFromCache(d, "./"+path, entry)
 				if buildErr == nil {
+					recordCacheHit()
 					jsInfos = append(jsInfos, jsInfo)
 					if len(jsInfo.StoreID) > 0 {
 						d.StoreManager.InstalledPlugins[jsInfo.StoreID] = true
@@ -1642,6 +1655,7 @@ func (d *Dice) JsLoadScripts() {
 					newCache.Files[key] = entry
 					continue
 				}
+				recordFailure()
 				entry.ParseErr = buildErr.Error()
 				newCache.Files[key] = entry
 				d.Logger.Error("读取脚本失败(错误依赖)", buildErr.Error())
@@ -1651,12 +1665,14 @@ func (d *Dice) JsLoadScripts() {
 
 		data, err := os.ReadFile(path) //nolint:gosec
 		if err != nil {
+			recordFailure()
 			d.Logger.Error("读取脚本失败(无法访问): ", err.Error())
 			continue
 		}
 		jsInfo, err := d.JsParseMeta("./"+path, info.ModTime(), data, false)
 		newCache.Files[key] = buildJsMetaCacheEntry(path, info, jsInfo, false, err)
 		if err != nil {
+			recordFailure()
 			d.Logger.Error("读取脚本失败(错误依赖)", err.Error())
 			continue
 		}
@@ -1667,6 +1683,7 @@ func (d *Dice) JsLoadScripts() {
 	}
 
 	saveJsMetaCache(newCache)
+	d.Logger.Infof("JS 脚本扫描结束，扫描 %d 个，命中 %d 个，失败 %d 个", scannedFiles, cacheHits, failedFiles)
 	if metaCache != nil {
 		removed := 0
 		for key := range metaCache.Files {

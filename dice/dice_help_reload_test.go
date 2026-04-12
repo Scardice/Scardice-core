@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestHelpManagerStartupReloadRemovesDeletedHelpDocFromExistingIndex(t *testing.T) {
@@ -80,58 +81,147 @@ func TestHelpManagerStartupReloadRemovesDeletedHelpDocFromExistingIndex(t *testi
 	}
 }
 
-func TestBuildHelpIndexManifestFingerprintIncludesBuiltinAndExtHelp(t *testing.T) {
+func TestHelpIndexReuseIgnoresGeneratedHelpFingerprint(t *testing.T) {
+	root := switchToTempWorkdir(t)
+	_ = root
+
+	manifestV1, err := buildHelpIndexManifest(BleveSearch)
+	if err != nil {
+		t.Fatalf("build manifest v1: %v", err)
+	}
+	manifestV2, err := buildHelpIndexManifest(BleveSearch)
+	if err != nil {
+		t.Fatalf("build manifest v2: %v", err)
+	}
+	if manifestV1.Fingerprint != manifestV2.Fingerprint {
+		t.Fatalf("stable index mechanism should produce stable fingerprint")
+	}
+	manifestV1.Fingerprint = "legacy-dynamic-fingerprint"
+	if !canReuseHelpIndex(&manifestV1, &manifestV2) {
+		t.Fatalf("help index reuse should not depend on generated help fingerprint")
+	}
+}
+
+func TestHelpManagerReuseRefreshesGeneratedHelpDocs(t *testing.T) {
 	root := switchToTempWorkdir(t)
 	_ = root
 
 	builtin1 := CmdMapCls{
-		"foo": {
-			Help: "foo help v1",
+		"generated-refresh-test": {
+			Help: "generated help v1",
 		},
 	}
 	builtin2 := CmdMapCls{
-		"foo": {
-			Help: "foo help v2",
+		"generated-refresh-test": {
+			Help: "generated help v2",
 		},
 	}
 
-	ext1 := []*ExtInfo{{
-		Name:    "sample",
-		Author:  "tester",
-		Version: "1.0.0",
-		CmdMap: CmdMapCls{
-			"bar": {
-				Help: "bar help v1",
-			},
-		},
-		GetDescText: func(i *ExtInfo) string {
-			return "desc v1"
-		},
-	}}
-	ext2 := []*ExtInfo{{
-		Name:    "sample",
-		Author:  "tester",
-		Version: "1.0.0",
-		CmdMap: CmdMapCls{
-			"bar": {
-				Help: "bar help v2",
-			},
-		},
-		GetDescText: func(i *ExtInfo) string {
-			return "desc v2"
-		},
-	}}
+	manager1 := &HelpManager{EngineType: BleveSearch}
+	manager1.Load(builtin1, nil)
+	manager1.Close()
 
-	manifestBuiltinV1 := buildHelpIndexManifest(BleveSearch, builtin1, ext1)
-	manifestBuiltinV2 := buildHelpIndexManifest(BleveSearch, builtin2, ext1)
-	if manifestBuiltinV1.Fingerprint == manifestBuiltinV2.Fingerprint {
-		t.Fatalf("builtin help changes should change help index fingerprint")
+	manager2 := &HelpManager{EngineType: BleveSearch}
+	manager2.Load(builtin2, nil)
+	t.Cleanup(manager2.Close)
+
+	_, items := manager2.GetHelpItemPage(1, 200, "", HelpBuiltinGroup, "", "")
+	var matches []HelpTextVo
+	for _, item := range items {
+		if item.Title == "generated-refresh-test" {
+			matches = append(matches, item)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("generated help should be refreshed without duplicates, count=%d items=%v", len(matches), matches)
+	}
+	if matches[0].Content != "generated help v2" {
+		t.Fatalf("generated help content = %q, want updated content", matches[0].Content)
+	}
+}
+
+func TestHelpManagerIncrementalRefreshUsesContentHash(t *testing.T) {
+	root := switchToTempWorkdir(t)
+
+	const (
+		relPath = "hashgroup/same-size.json"
+		title   = "hash-refresh-entry"
+	)
+	fixedTime := time.Unix(1700000000, 0)
+	fullPath := writeRawTestHelpDocFile(t, root, relPath, `{"mod":"test-pack","helpdoc":{"hash-refresh-entry":"alpha"}}`)
+	if err := os.Chtimes(fullPath, fixedTime, fixedTime); err != nil {
+		t.Fatalf("set initial mtime: %v", err)
 	}
 
-	manifestExtV1 := buildHelpIndexManifest(BleveSearch, builtin1, ext1)
-	manifestExtV2 := buildHelpIndexManifest(BleveSearch, builtin1, ext2)
-	if manifestExtV1.Fingerprint == manifestExtV2.Fingerprint {
-		t.Fatalf("ext help changes should change help index fingerprint")
+	manager1 := &HelpManager{EngineType: BleveSearch}
+	manager1.Load(CmdMapCls{}, nil)
+	manager1.Close()
+
+	fullPath = writeRawTestHelpDocFile(t, root, relPath, `{"mod":"test-pack","helpdoc":{"hash-refresh-entry":"bravo"}}`)
+	if err := os.Chtimes(fullPath, fixedTime, fixedTime); err != nil {
+		t.Fatalf("set updated mtime: %v", err)
+	}
+
+	manager2 := &HelpManager{EngineType: BleveSearch}
+	manager2.Load(CmdMapCls{}, nil)
+	t.Cleanup(manager2.Close)
+
+	_, items := manager2.GetHelpItemPage(1, 200, "", "hashgroup", "", "")
+	var matches []HelpTextVo
+	for _, item := range items {
+		if item.Title == title {
+			matches = append(matches, item)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("hash-refreshed helpdoc should have one item, count=%d items=%v", len(matches), matches)
+	}
+	if matches[0].Content != "bravo" {
+		t.Fatalf("hash-refreshed content = %q, want bravo", matches[0].Content)
+	}
+}
+
+func TestHelpManagerReuseDoesNotTrustLowerManifestTotalID(t *testing.T) {
+	root := switchToTempWorkdir(t)
+
+	const (
+		relPath = "idgroup/keep.json"
+		title   = "id-stable-entry"
+	)
+	writeTestHelpDocFile(t, root, relPath, map[string]string{title: "stable content"})
+
+	manager1 := &HelpManager{EngineType: BleveSearch}
+	manager1.Load(CmdMapCls{"generated-id-test": {Help: "generated v1"}}, nil)
+	manager1.Close()
+
+	manifest, err := loadHelpIndexManifest()
+	if err != nil {
+		t.Fatalf("load manifest: %v", err)
+	}
+	manifest.TotalID = 0
+	if err := writeHelpIndexManifest(*manifest); err != nil {
+		t.Fatalf("write manifest with lower total id: %v", err)
+	}
+
+	manager2 := &HelpManager{EngineType: BleveSearch}
+	manager2.Load(CmdMapCls{"generated-id-test": {Help: "generated v2"}}, nil)
+	t.Cleanup(manager2.Close)
+
+	_, items := manager2.GetHelpItemPage(1, 200, "", "", "", "")
+	if countHelpItemsFromFile(items, "keep.json") != 1 {
+		t.Fatalf("reused index should not overwrite existing helpdoc file item, items=%v", items)
+	}
+	generatedCount := 0
+	for _, item := range items {
+		if item.Title == "generated-id-test" {
+			generatedCount++
+			if item.Content != "generated v2" {
+				t.Fatalf("generated content = %q, want generated v2", item.Content)
+			}
+		}
+	}
+	if generatedCount != 1 {
+		t.Fatalf("generated help should be refreshed once, count=%d items=%v", generatedCount, items)
 	}
 }
 
@@ -169,6 +259,19 @@ func writeTestHelpDocFile(t *testing.T, root, relPath string, items map[string]s
 	}
 	if err := os.WriteFile(fullPath, data, 0o644); err != nil {
 		t.Fatalf("write helpdoc %s: %v", relPath, err)
+	}
+	return fullPath
+}
+
+func writeRawTestHelpDocFile(t *testing.T, root, relPath, payload string) string {
+	t.Helper()
+
+	fullPath := filepath.Join(root, "data", "helpdoc", filepath.FromSlash(relPath))
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(fullPath), err)
+	}
+	if err := os.WriteFile(fullPath, []byte(payload), 0o644); err != nil {
+		t.Fatalf("write raw helpdoc %s: %v", relPath, err)
 	}
 	return fullPath
 }
