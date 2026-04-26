@@ -58,21 +58,40 @@ func (pa *PlatformAdapterMinecraft) Serve() int {
 	return 0
 }
 
-func (pa *PlatformAdapterMinecraft) tryReconnect(socket gowebsocket.Socket) bool {
+func (pa *PlatformAdapterMinecraft) reconnectDelay(attempt int) time.Duration {
+	switch {
+	case attempt <= 5:
+		return 5 * time.Second
+	case attempt <= 10:
+		return 1 * time.Minute
+	case attempt <= 15:
+		return 5 * time.Minute
+	default:
+		return 10 * time.Minute
+	}
+}
+
+func (pa *PlatformAdapterMinecraft) tryReconnect(socket gowebsocket.Socket) {
 	log := pa.Session.Parent.Logger
 	if pa.Reconnecting {
-		return false
+		return
 	}
 	pa.Reconnecting = true
-	if pa.RetryTimes <= 5 && !socket.IsConnected {
-		pa.RetryTimes++
-		log.Infof("MC server 尝试重新连接中[%d/5]", pa.RetryTimes)
+	defer func() {
+		pa.Reconnecting = false
+	}()
+
+	if !socket.IsConnected {
+		nextAttempt := pa.RetryTimes + 1
+		delay := pa.reconnectDelay(nextAttempt)
+		log.Infof("MC server 将在 %s 后进行第 %d 次重连", delay, nextAttempt)
+		time.Sleep(delay)
+		pa.RetryTimes = nextAttempt
 		socket = gowebsocket.New(pa.ConnectURL)
 		pa.Socket = &socket
 		pa.socketSetup()
 		socket.Connect()
 	}
-	return true
 }
 
 func (pa *PlatformAdapterMinecraft) socketSetup() {
@@ -80,7 +99,6 @@ func (pa *PlatformAdapterMinecraft) socketSetup() {
 	log := pa.Session.Parent.Logger
 	socket := pa.Socket
 	socket.OnConnected = func(socket gowebsocket.Socket) {
-		pa.Reconnecting = true
 		ep.State = 1
 		ep.Enable = true
 		pa.RetryTimes = 0
@@ -90,8 +108,6 @@ func (pa *PlatformAdapterMinecraft) socketSetup() {
 		d.Save(false)
 
 		log.Info("Minecraft 连接成功")
-		time.Sleep(time.Duration(5) * time.Second)
-		pa.Reconnecting = false
 	}
 	socket.OnTextMessage = func(message string, socket gowebsocket.Socket) {
 		msgMC := new(MessageMinecraft)
@@ -103,22 +119,12 @@ func (pa *PlatformAdapterMinecraft) socketSetup() {
 	socket.OnConnectError = func(err error, socket gowebsocket.Socket) {
 		log.Errorf("MC websocket出现错误: %s", err)
 		if !socket.IsConnected {
-			// socket.Close()
-			if !pa.tryReconnect(*pa.Socket) {
-				log.Errorf("短时间内连接失败次数过多，不再进行重连")
-				ep.State = 3
-				ep.Enable = false
-			}
+			pa.tryReconnect(*pa.Socket)
 		}
 	}
 	socket.OnDisconnected = func(err error, socket gowebsocket.Socket) {
 		log.Errorf("与MC服务器断开连接")
-		time.Sleep(time.Duration(2) * time.Second)
-		if !pa.tryReconnect(*pa.Socket) {
-			log.Errorf("短时间内连接失败次数过多，不再进行重连")
-			ep.State = 3
-			ep.Enable = false
-		}
+		pa.tryReconnect(*pa.Socket)
 	}
 	pa.Socket = socket
 }
