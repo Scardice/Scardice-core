@@ -163,6 +163,7 @@ type DeckInfo struct {
 	Cloud              bool                          `json:"cloud"         yaml:"cloud"` // 含有云端内容
 	CloudDeckItemInfos map[string]*CloudDeckItemInfo `json:"-"             yaml:"-"`
 	StoreID            string                        `json:"storeID"       yaml:"storeID"`
+	PackageID          string                        `json:"packageID"     yaml:"packageID"` // 所属扩展包ID
 }
 
 func tryParseDiceE(content []byte, deckInfo *DeckInfo, jsoncDirectly bool) error {
@@ -572,6 +573,34 @@ func DeckTryParse(d *Dice, fn string) {
 	d.MarkModified()
 }
 
+func DeckTryParseWithPackage(d *Dice, fn string, packageID string) {
+	content, err := os.ReadFile(fn)
+	if err != nil {
+		d.Logger.Infof("牌堆文件 %s 加载失败", fn)
+		return
+	}
+	deckInfo := new(DeckInfo)
+	if deckInfo.DeckItems == nil {
+		deckInfo.DeckItems = map[string][]string{}
+	}
+	if deckInfo.Command == nil {
+		deckInfo.Command = map[string]bool{}
+	}
+	if deckInfo.CloudDeckItemInfos == nil {
+		deckInfo.CloudDeckItemInfos = map[string]*CloudDeckItemInfo{}
+	}
+	_ = parseDeck(d, fn, content, deckInfo)
+	deckInfo.Filename = fn
+	deckInfo.PackageID = packageID
+
+	if deckInfo.Name == "" {
+		deckInfo.Name = filepath.Base(fn)
+	}
+
+	d.DeckList = append(d.DeckList, deckInfo)
+	d.MarkModified()
+}
+
 func parseDeck(d *Dice, fn string, content []byte, deckInfo *DeckInfo) bool {
 	if isPrefixWithUtf8Bom(content) {
 		content = content[3:]
@@ -855,6 +884,17 @@ func DecksDetect(d *Dice) bool {
 		d.Logger.Infof("[牌堆] 增量更新完成，变更: %v", totalOps > 0)
 		d.Logger.Infof("[牌堆] 复用现有索引完成，共计加载牌堆数量:%d 条目数量:%d", len(d.DeckList), countDeckItemEntries(d.DeckList))
 	}
+
+	if d.PackageManager != nil {
+		for _, deckFile := range d.PackageManager.GetEnabledContentFiles("decks") {
+			ext := filepath.Ext(deckFile.Path)
+			if ext == ".json" || ext == ".jsonc" || ext == ".yml" || ext == ".yaml" || ext == ".toml" {
+				d.Logger.Infof("正在加载扩展包 %s 的牌堆: %s", deckFile.PackageID, deckFile.Path)
+				DeckTryParseWithPackage(d, deckFile.Path, deckFile.PackageID)
+			}
+		}
+	}
+
 	return reuse
 }
 

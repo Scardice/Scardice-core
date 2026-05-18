@@ -268,5 +268,6 @@ type DirtyConfig struct {
 }
 
 type StoreConfig struct {
-	BackendUrls []string `json:"backendUrls" yaml:"backendUrls"`
+	BackendUrls         []string `json:"backendUrls" yaml:"backendUrls"`
+	DisabledBackendUrls []string `json:"disabledBackendUrls" yaml:"disabledBackendUrls"`
 }

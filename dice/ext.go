@@ -459,6 +459,28 @@ func (i *ExtInfo) StorageList() ([]string, error) {
 	return keys, nil
 }
 
+func (i *ExtInfo) GetPackageConfig() map[string]interface{} {
+	target := i.GetRealExt()
+	if target == nil {
+		return map[string]interface{}{}
+	}
+
+	if target.Source == nil || target.Source.PackageID == "" {
+		return map[string]interface{}{}
+	}
+
+	if target.dice == nil || target.dice.PackageManager == nil {
+		return map[string]interface{}{}
+	}
+
+	config, err := target.dice.PackageManager.GetConfig(target.Source.PackageID)
+	if err != nil {
+		return map[string]interface{}{}
+	}
+
+	return config
+}
+
 // -------------------- 群扩展状态管理 --------------------
 
 func (group *GroupInfo) ensureInactivatedSet() {
