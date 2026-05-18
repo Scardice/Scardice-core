@@ -1696,6 +1696,31 @@ func (d *Dice) JsLoadScripts() {
 		}
 	}
 
+	if d.PackageManager != nil {
+		for _, scriptFile := range d.PackageManager.GetEnabledContentFiles("scripts") {
+			if !isScriptFile(scriptFile.Path) {
+				continue
+			}
+			info, err := os.Stat(scriptFile.Path)
+			if err != nil {
+				continue
+			}
+			d.Logger.Infof("正在加载扩展包脚本: %s", scriptFile.Path)
+			data, err := os.ReadFile(scriptFile.Path)
+			if err != nil {
+				d.Logger.Error("读取扩展包脚本失败: ", err.Error())
+				continue
+			}
+			jsInfo, err := d.JsParseMeta("./"+scriptFile.Path, info.ModTime(), data, false)
+			if err != nil {
+				d.Logger.Error("解析扩展包脚本失败: ", err.Error())
+				continue
+			}
+			jsInfo.PackageID = scriptFile.PackageID
+			jsInfos = append(jsInfos, jsInfo)
+		}
+	}
+
 	// 检查依赖是否满足
 	unloadKeySet := make(map[string]bool)
 	var unloadInfos []string
@@ -1885,6 +1910,8 @@ type JsScriptInfo struct {
 	HasDangerousAPIUsage bool `json:"hasDangerousApiUsage"`
 	/** 命中的危险 API 列表 */
 	DangerousAPIUsages []JsDangerousAPIUsage `json:"dangerousApiUsages"`
+	/** 所属扩展包 ID（如果来自扩展包）*/
+	PackageID string `json:"packageId,omitempty"`
 }
 
 type JsScriptDepends struct {
