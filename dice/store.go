@@ -23,6 +23,8 @@ import (
 var (
 	// OfficialStorePublicKey 官方商店公钥。
 	OfficialStorePublicKey = ``
+
+	officialStoreBackendBaseURL = "https://repo-test.sealdice.com"
 )
 
 type StoreBackendType string
@@ -187,6 +189,20 @@ func decodeJSONStrict(data []byte, target interface{}) error {
 	return nil
 }
 
+func decodeJSONCompatible(data []byte, target interface{}) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return errors.New("JSON 中存在多余内容")
+		}
+		return err
+	}
+	return nil
+}
+
 func fetchStoreJSON[T any](requestURL string) (*T, error) {
 	// #nosec G107 -- store backend URLs are user/admin-configured extension repository endpoints.
 	resp, err := http.Get(requestURL)
@@ -204,8 +220,8 @@ func fetchStoreJSON[T any](requestURL string) (*T, error) {
 	}
 
 	var result T
-	if err := decodeJSONStrict(respData, &result); err != nil {
-		return nil, err
+	if err := decodeJSONCompatible(respData, &result); err != nil {
+		return nil, fmt.Errorf("decode store response from %s: %w", requestURL, err)
 	}
 	return &result, nil
 }
@@ -260,10 +276,7 @@ func removeStoreBackendURL(urls []string, rawURL string) []string {
 }
 
 func officialStoreBackendURL() (string, error) {
-	if len(BackendUrls) == 0 {
-		return "", errors.New("未配置官方扩展商店后端")
-	}
-	baseURL := strings.TrimRight(strings.TrimSpace(BackendUrls[0]), "/")
+	baseURL := strings.TrimRight(strings.TrimSpace(officialStoreBackendBaseURL), "/")
 	if baseURL == "" {
 		return "", errors.New("官方扩展商店后端地址为空")
 	}
