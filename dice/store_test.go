@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,42 @@ import (
 
 	"Scardice-core/dice/sealpack"
 )
+
+func withOfficialStoreBackendBaseURL(t *testing.T, rawURL string) {
+	t.Helper()
+	oldURL := officialStoreBackendBaseURL
+	officialStoreBackendBaseURL = rawURL
+	t.Cleanup(func() { officialStoreBackendBaseURL = oldURL })
+}
+
+func TestCoreBackendUrlsDefaultRestored(t *testing.T) {
+	want := []string{
+		"http://api.weizaima.com",
+		"http://dice.weizaima.com",
+		"http://api.sealdice.com",
+	}
+	if !reflect.DeepEqual(BackendUrls, want) {
+		t.Fatalf("BackendUrls = %#v, want %#v", BackendUrls, want)
+	}
+}
+
+func TestOfficialStoreBackendURLUsesDedicatedStoreBaseURL(t *testing.T) {
+	oldBackendURLs := BackendUrls
+	BackendUrls = []string{"https://core-backend.example"}
+	t.Cleanup(func() { BackendUrls = oldBackendURLs })
+	withOfficialStoreBackendBaseURL(t, "https://store-backend.example/")
+
+	got, err := officialStoreBackendURL()
+	if err != nil {
+		t.Fatalf("officialStoreBackendURL() error = %v", err)
+	}
+	if got != "https://store-backend.example/dice/api/store" {
+		t.Fatalf("officialStoreBackendURL() = %q", got)
+	}
+	if !reflect.DeepEqual(BackendUrls, []string{"https://core-backend.example"}) {
+		t.Fatalf("BackendUrls changed unexpectedly: %#v", BackendUrls)
+	}
+}
 
 func TestParseStorePackageFullID(t *testing.T) {
 	pkgID, version, err := ParseStorePackageFullID("alice/demo@1.2.3")
@@ -173,9 +210,7 @@ func TestStoreQueryPageUsesSingleResolvedBackend(t *testing.T) {
 	}))
 	defer server.Close()
 
-	oldBackendURLs := BackendUrls
-	BackendUrls = []string{server.URL}
-	defer func() { BackendUrls = oldBackendURLs }()
+	withOfficialStoreBackendBaseURL(t, server.URL)
 
 	manager := NewStoreManager(&Dice{})
 	page, err := manager.StoreQueryPage(StoreQueryPageParams{PageNum: 1, PageSize: 20})
@@ -206,9 +241,7 @@ func TestStoreManagerFindPackageMatchesByIDAndVersionAfterRefreshInstalled(t *te
 	}))
 	defer server.Close()
 
-	oldBackendURLs := BackendUrls
-	BackendUrls = []string{server.URL}
-	defer func() { BackendUrls = oldBackendURLs }()
+	withOfficialStoreBackendBaseURL(t, server.URL)
 
 	manager := NewStoreManager(&Dice{})
 	page, err := manager.StoreQueryPage(StoreQueryPageParams{PageNum: 1, PageSize: 20})
@@ -241,9 +274,7 @@ func TestStoreQueryRecommendCachesBackendInfo(t *testing.T) {
 	}))
 	defer server.Close()
 
-	oldBackendURLs := BackendUrls
-	BackendUrls = []string{server.URL}
-	defer func() { BackendUrls = oldBackendURLs }()
+	withOfficialStoreBackendBaseURL(t, server.URL)
 
 	manager := NewStoreManager(&Dice{})
 	if _, err := manager.StoreQueryRecommend(); err != nil {
@@ -268,6 +299,31 @@ func TestStoreQueryRecommendCachesBackendInfo(t *testing.T) {
 	}
 }
 
+func TestStoreQueryUploadInfoAllowsExtensionFields(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dice/api/store/info":
+			_, _ = w.Write([]byte(`{"formatVersion":"2.0","name":"Official Store","protocolVersions":["2.0"],"announcement":"ready","sign":"","extraInfo":"ignored"}`))
+		case "/dice/api/store/upload/info":
+			_, _ = w.Write([]byte(`{"uploadNotice":"ready","uploadForm":[{"key":"category","desc":"Category","required":true,"default":"tool","options":[{"key":"tool","desc":"Tool","extraOption":"ignored"}],"extraElem":"ignored"}],"extraUpload":"ignored"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	withOfficialStoreBackendBaseURL(t, server.URL)
+
+	manager := NewStoreManager(&Dice{})
+	info, err := manager.StoreQueryUploadInfo()
+	if err != nil {
+		t.Fatalf("StoreQueryUploadInfo() error = %v", err)
+	}
+	if info.UploadNotice != "ready" || len(info.UploadForm) != 1 {
+		t.Fatalf("unexpected upload info: %#v", info)
+	}
+}
+
 func TestStoreBackendListReturnsEnabledAndDisabledBackends(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -279,9 +335,7 @@ func TestStoreBackendListReturnsEnabledAndDisabledBackends(t *testing.T) {
 	}))
 	defer server.Close()
 
-	oldBackendURLs := BackendUrls
-	BackendUrls = []string{server.URL}
-	defer func() { BackendUrls = oldBackendURLs }()
+	withOfficialStoreBackendBaseURL(t, server.URL)
 
 	enabledURL := server.URL + "/dice/api/store"
 	disabledURL := server.URL + "/disabled/dice/api/store"
@@ -347,9 +401,7 @@ func TestStoreSetBackendEnabledRejectsDisablingOnlyCustomBackendWithoutOfficial(
 	defer server.Close()
 	customURL := server.URL + "/dice/api/store"
 
-	oldBackendURLs := BackendUrls
-	BackendUrls = nil
-	defer func() { BackendUrls = oldBackendURLs }()
+	withOfficialStoreBackendBaseURL(t, "")
 
 	manager := NewStoreManager(&Dice{Config: Config{StoreConfig: StoreConfig{
 		BackendUrls: []string{customURL},
@@ -375,9 +427,7 @@ func TestStoreSetBackendEnabledAllowsDisablingOnlyCustomBackendWithOfficial(t *t
 	defer server.Close()
 	customURL := server.URL + "/dice/api/store"
 
-	oldBackendURLs := BackendUrls
-	BackendUrls = []string{"https://official.example"}
-	defer func() { BackendUrls = oldBackendURLs }()
+	withOfficialStoreBackendBaseURL(t, "https://official.example")
 
 	manager := NewStoreManager(&Dice{Config: Config{StoreConfig: StoreConfig{
 		BackendUrls: []string{customURL},
