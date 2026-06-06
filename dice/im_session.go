@@ -678,6 +678,7 @@ type MsgContext struct {
 	AliasPrefixText string      `json:"aliasPrefixText"` // 快捷指令回复前缀文本
 	CommandReplied  bool        `json:"-"`               // 当前命令是否已通过统一回复路径发出消息
 
+	commandRepliedMu  sync.RWMutex
 	deckDepth         int                                         // 抽牌递归深度
 	DeckPools         map[*DeckInfo]map[string]*ShuffleRandomPool // 不放回抽取的缓存
 	diceExprOverwrite string                                      // 默认骰表达式覆盖
@@ -690,6 +691,24 @@ type MsgContext struct {
 	splitKey   string
 	vm         *ds.Context
 	_v1Rand    *rand2.PCGSource
+}
+
+func (ctx *MsgContext) SetCommandReplied(replied bool) {
+	if ctx == nil {
+		return
+	}
+	ctx.commandRepliedMu.Lock()
+	defer ctx.commandRepliedMu.Unlock()
+	ctx.CommandReplied = replied
+}
+
+func (ctx *MsgContext) IsCommandReplied() bool {
+	if ctx == nil {
+		return false
+	}
+	ctx.commandRepliedMu.RLock()
+	defer ctx.commandRepliedMu.RUnlock()
+	return ctx.CommandReplied
 }
 
 // fillPrivilege 填写MsgContext中的权限字段, 并返回填写的权限等级
@@ -2142,7 +2161,7 @@ func parseJSSolveResult(vm *goja.Runtime, ctx *MsgContext, solveName string, val
 	if goja.IsUndefined(value) || goja.IsNull(value) {
 		// 兼容旧插件：很多 JS solve 只 reply，不显式返回结果。
 		// 仅当本次命令已通过统一回复路径发过消息时，才把空返回视为成功，避免吞掉真实插件错误。
-		if ctx != nil && ctx.CommandReplied {
+		if ctx != nil && ctx.IsCommandReplied() {
 			logger.M().Debugf("JS solve 返回空结果，且已回复消息，按兼容模式处理: %s", solveName)
 			return CmdExecuteResult{Matched: true, Solved: true}, nil
 		}
@@ -2268,7 +2287,7 @@ func waitForCommandReply(ctx *MsgContext, timeout time.Duration) bool {
 	if ctx == nil || timeout <= 0 {
 		return false
 	}
-	if ctx.CommandReplied {
+	if ctx.IsCommandReplied() {
 		return true
 	}
 
@@ -2280,9 +2299,9 @@ func waitForCommandReply(ctx *MsgContext, timeout time.Duration) bool {
 	for {
 		select {
 		case <-timer.C:
-			return ctx.CommandReplied
+			return ctx.IsCommandReplied()
 		case <-ticker.C:
-			if ctx.CommandReplied {
+			if ctx.IsCommandReplied() {
 				return true
 			}
 		}
@@ -2309,7 +2328,7 @@ func logJSSolveEmptyResultWarning(log *zap.SugaredLogger, candidate commandSolve
 		if ctx.EndPoint != nil {
 			platform = ctx.EndPoint.Platform
 		}
-		commandReplied = ctx.CommandReplied
+		commandReplied = ctx.IsCommandReplied()
 	}
 
 	log.Warnw("JS solve returned empty result after grace window; suppressed user-facing exception",
@@ -2390,7 +2409,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 		if ctx.Player != nil {
 			VarSetValueInt64(ctx, "$t轮数", int64(cmdArgs.SpecialExecuteTimes))
 		}
-		ctx.CommandReplied = false
+		ctx.SetCommandReplied(false)
 
 		if !item.Raw && item.AllowDelegate {
 			// 允许代骰时，发一句话

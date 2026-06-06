@@ -272,7 +272,7 @@ func TestWaitForCommandReply(t *testing.T) {
 		ctx := &MsgContext{}
 		go func() {
 			time.Sleep(20 * time.Millisecond)
-			ctx.CommandReplied = true
+			ctx.SetCommandReplied(true)
 		}()
 
 		if !waitForCommandReply(ctx, 80*time.Millisecond) {
