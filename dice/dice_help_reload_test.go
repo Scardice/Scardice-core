@@ -22,7 +22,7 @@ func TestHelpManagerStartupReloadRemovesDeletedHelpDocFromExistingIndex(t *testi
 	removePath := writeTestHelpDocFile(t, root, removeRelPath, map[string]string{removeTitle: "remove content"})
 
 	manager1 := &HelpManager{EngineType: BleveSearch}
-	manager1.Load(CmdMapCls{}, nil)
+	manager1.Load(nil, CmdMapCls{}, nil)
 	t.Cleanup(manager1.Close)
 
 	total, items := manager1.GetHelpItemPage(1, 200, "", "", "", "")
@@ -45,7 +45,7 @@ func TestHelpManagerStartupReloadRemovesDeletedHelpDocFromExistingIndex(t *testi
 	}
 
 	manager2 := &HelpManager{EngineType: BleveSearch}
-	manager2.Load(CmdMapCls{}, nil)
+	manager2.Load(nil, CmdMapCls{}, nil)
 	t.Cleanup(manager2.Close)
 
 	total, items = manager2.GetHelpItemPage(1, 200, "", "", "", "")
@@ -118,11 +118,11 @@ func TestHelpManagerReuseRefreshesGeneratedHelpDocs(t *testing.T) {
 	}
 
 	manager1 := &HelpManager{EngineType: BleveSearch}
-	manager1.Load(builtin1, nil)
+	manager1.Load(nil, builtin1, nil)
 	manager1.Close()
 
 	manager2 := &HelpManager{EngineType: BleveSearch}
-	manager2.Load(builtin2, nil)
+	manager2.Load(nil, builtin2, nil)
 	t.Cleanup(manager2.Close)
 
 	_, items := manager2.GetHelpItemPage(1, 200, "", HelpBuiltinGroup, "", "")
@@ -154,7 +154,7 @@ func TestHelpManagerIncrementalRefreshUsesContentHash(t *testing.T) {
 	}
 
 	manager1 := &HelpManager{EngineType: BleveSearch}
-	manager1.Load(CmdMapCls{}, nil)
+	manager1.Load(nil, CmdMapCls{}, nil)
 	manager1.Close()
 
 	fullPath = writeRawTestHelpDocFile(t, root, relPath, `{"mod":"test-pack","helpdoc":{"hash-refresh-entry":"bravo"}}`)
@@ -163,7 +163,7 @@ func TestHelpManagerIncrementalRefreshUsesContentHash(t *testing.T) {
 	}
 
 	manager2 := &HelpManager{EngineType: BleveSearch}
-	manager2.Load(CmdMapCls{}, nil)
+	manager2.Load(nil, CmdMapCls{}, nil)
 	t.Cleanup(manager2.Close)
 
 	_, items := manager2.GetHelpItemPage(1, 200, "", "hashgroup", "", "")
@@ -191,7 +191,7 @@ func TestHelpManagerReuseDoesNotTrustLowerManifestTotalID(t *testing.T) {
 	writeTestHelpDocFile(t, root, relPath, map[string]string{title: "stable content"})
 
 	manager1 := &HelpManager{EngineType: BleveSearch}
-	manager1.Load(CmdMapCls{"generated-id-test": {Help: "generated v1"}}, nil)
+	manager1.Load(nil, CmdMapCls{"generated-id-test": {Help: "generated v1"}}, nil)
 	manager1.Close()
 
 	manifest, err := loadHelpIndexManifest()
@@ -204,7 +204,7 @@ func TestHelpManagerReuseDoesNotTrustLowerManifestTotalID(t *testing.T) {
 	}
 
 	manager2 := &HelpManager{EngineType: BleveSearch}
-	manager2.Load(CmdMapCls{"generated-id-test": {Help: "generated v2"}}, nil)
+	manager2.Load(nil, CmdMapCls{"generated-id-test": {Help: "generated v2"}}, nil)
 	t.Cleanup(manager2.Close)
 
 	_, items := manager2.GetHelpItemPage(1, 200, "", "", "", "")
