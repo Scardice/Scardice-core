@@ -52,6 +52,28 @@
 >
 > 以上配置没有写入项目的统一设置，以允许开发者不本地使用 golangci-lint
 
+#### 提交前 lint hook
+
+仓库提供 `.githooks/pre-commit`，用于在本地提交前检查已暂存的 Go 文件格式，并运行低成本的 `golangci-lint` 增量检查。启用方式：
+
+```bash
+task install
+```
+
+如果已经完成依赖安装，也可以只启用 Git hook：
+
+```bash
+task install-hooks
+```
+
+该配置会写入当前仓库的本地 Git 配置：
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Git 不会从远端仓库自动启用客户端 hook；每个本地 checkout 都需要执行一次上述配置。
+
 ### 编译运行
 
 #### 使用 `build.sh` 打包（Linux 环境推荐）
