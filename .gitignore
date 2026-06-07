@@ -29,6 +29,7 @@ temp/
 dist/
 go-cqhttp/
 lagrange/
+milky/
 frontend/
 frontend_overwrite/
 backups/

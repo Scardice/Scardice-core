@@ -711,6 +711,60 @@ func (ctx *MsgContext) IsCommandReplied() bool {
 	return ctx.CommandReplied
 }
 
+func ensureMessageTextFromSegments(msg *Message) {
+	if msg == nil || msg.Message != "" || len(msg.Segment) == 0 {
+		return
+	}
+	msg.Message = message.ConvertMessageElementsToString(msg.Segment)
+}
+
+func normalizeIncomingMessageText(d *Dice, msg *Message, text string) {
+	normalized := message.ImageRewrite(text, message.SealCodeToCqCode)
+	msg.Message = normalized
+	msg.Segment = message.ConvertStringMessage(
+		normalized,
+		message.WithLogger(d.Logger.Named("message-preprocess")),
+	)
+}
+
+func isBotMentionedInSegments(msg *Message, botUserID string) bool {
+	if msg == nil {
+		return false
+	}
+	for _, elem := range msg.Segment {
+		if e, ok := elem.(*message.AtElement); ok && msg.Platform+":"+e.Target == botUserID {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *IMSession) runMessagePreprocessHooks(mctx *MsgContext, msg *Message) bool {
+	if mctx == nil || msg == nil || mctx.Group == nil || !mctx.Group.IsActive(mctx) || mctx.PrivilegeLevel == -30 {
+		return false
+	}
+	for _, wrapper := range mctx.Group.GetActivatedExtList(mctx.Dice) {
+		ext := wrapper.GetRealExt()
+		if ext == nil || ext.OnMessagePreprocess == nil {
+			continue
+		}
+		decision := wrapper.CallOnMessagePreprocess(mctx.Dice, mctx, msg)
+		switch decision.action {
+		case messagePreprocessRewrite:
+			normalizeIncomingMessageText(mctx.Dice, msg, decision.message)
+		case messagePreprocessIntercept:
+			if decision.reason != "" {
+				mctx.Dice.Logger.Infof("扩展<%s>在解析前拦截消息: %s", ext.Name, decision.reason)
+			} else {
+				mctx.Dice.Logger.Infof("扩展<%s>在解析前拦截消息", ext.Name)
+			}
+			return true
+		case messagePreprocessNoop:
+		}
+	}
+	return false
+}
+
 // fillPrivilege 填写MsgContext中的权限字段, 并返回填写的权限等级
 //   - msg 使用其中的msg.Sender.GroupRole
 //
@@ -768,6 +822,8 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 
 	// 处理命令
 	if msg.MessageType == "group" || msg.MessageType == "private" { //nolint:nestif
+		ensureMessageTextFromSegments(msg)
+
 		// GroupEnableCheck TODO: 后续看看是否需要
 		groupInfo, ok := s.ServiceAtNew.Load(msg.GroupID)
 		if !ok && msg.GroupID != "" {
@@ -814,34 +870,6 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 			}
 		}
 
-		// 当文本可能是在发送命令时，必须加载信息
-		maybeCommand := CommandCheckPrefix(msg.Message, d.CommandPrefix, msg.Platform)
-
-		amIBeMentioned := false
-		if true {
-			// 被@时，必须加载信息
-			// 这段代码重复了，以后重构
-			_, ats := AtParse(msg.Message, msg.Platform)
-			tmpUID := ep.UserID
-			if msg.TmpUID != "" {
-				tmpUID = msg.TmpUID
-			}
-			for _, i := range ats {
-				// 特殊处理 OpenQQ 和 OpenQQCH
-				if i.UserID == tmpUID {
-					amIBeMentioned = true
-					break
-				} else if strings.HasPrefix(i.UserID, "OpenQQ:") ||
-					strings.HasPrefix(i.UserID, "OpenQQCH:") {
-					uid := strings.TrimPrefix(tmpUID, "OpenQQ:")
-					if i.UserID == "OpenQQ:"+uid || i.UserID == "OpenQQCH:"+uid {
-						amIBeMentioned = true
-						break
-					}
-				}
-			}
-		}
-
 		mctx.Group, mctx.Player = GetPlayerInfoBySender(mctx, msg)
 		mctx.IsCurGroupBotOn = msg.MessageType == "group" && mctx.Group.IsActive(mctx)
 
@@ -873,6 +901,38 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 						ext.callWithJsCheck(mctx.Dice, func() {
 							ext.OnMessageReceived(mctx, msg)
 						})
+					}
+				}
+			}
+		}
+
+		if s.runMessagePreprocessHooks(mctx, msg) {
+			return
+		}
+
+		// 当文本可能是在发送命令时，必须加载信息。消息预处理可能改写前缀或@，这里必须使用改写后的内容。
+		maybeCommand := CommandCheckPrefix(msg.Message, d.CommandPrefix, msg.Platform)
+
+		amIBeMentioned := false
+		if true {
+			// 被@时，必须加载信息
+			// 这段代码重复了，以后重构
+			_, ats := AtParse(msg.Message, msg.Platform)
+			tmpUID := ep.UserID
+			if msg.TmpUID != "" {
+				tmpUID = msg.TmpUID
+			}
+			for _, i := range ats {
+				// 特殊处理 OpenQQ 和 OpenQQCH
+				if i.UserID == tmpUID {
+					amIBeMentioned = true
+					break
+				} else if strings.HasPrefix(i.UserID, "OpenQQ:") ||
+					strings.HasPrefix(i.UserID, "OpenQQCH:") {
+					uid := strings.TrimPrefix(tmpUID, "OpenQQ:")
+					if i.UserID == "OpenQQ:"+uid || i.UserID == "OpenQQCH:"+uid {
+						amIBeMentioned = true
+						break
 					}
 				}
 			}
@@ -1140,14 +1200,7 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 	log := d.Logger
 
 	// 处理消息段，如果 2.0 要完全抛弃依赖 Message.Message 的字符串解析，把这里删掉
-	if msg.Message == "" {
-		for _, elem := range msg.Segment {
-			// 类型断言
-			if e, ok := elem.(*message.TextElement); ok {
-				msg.Message += e.Content
-			}
-		}
-	}
+	ensureMessageTextFromSegments(msg)
 
 	if msg.MessageType != "group" && msg.MessageType != "private" {
 		return
@@ -1203,18 +1256,6 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 		groupInfo.GroupName = msg.GroupName
 	}
 
-	// Note(Szzrain): 判断是否被@
-	amIBeMentioned := false
-	for _, elem := range msg.Segment {
-		// 类型断言
-		if e, ok := elem.(*message.AtElement); ok {
-			if msg.Platform+":"+e.Target == ep.UserID {
-				amIBeMentioned = true
-				break
-			}
-		}
-	}
-
 	mctx.Group, mctx.Player = GetPlayerInfoBySender(mctx, msg)
 	mctx.IsCurGroupBotOn = msg.MessageType == "group" && mctx.Group.IsActive(mctx)
 
@@ -1250,6 +1291,13 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 			}
 		}
 	}
+
+	if s.runMessagePreprocessHooks(mctx, msg) {
+		return
+	}
+
+	// Note(Szzrain): 判断是否被@。消息预处理可能重建 Segment，必须在 hook 后计算。
+	amIBeMentioned := isBotMentionedInSegments(msg, ep.UserID)
 
 	// Note(Szzrain): 兼容模式相关的代码被挪到了 cmdArgs.commandParseNew 里面
 

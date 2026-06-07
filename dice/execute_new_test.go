@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dop251/goja"
 	"github.com/panjf2000/ants/v2"
 	"github.com/robfig/cron/v3"
 	"gorm.io/gorm"
@@ -296,6 +297,15 @@ func newPrivateMsg(senderID, text string) *Message {
 	}
 }
 
+func registerAutoActivePreprocessExt(d *Dice, name string, fn func(ctx *MsgContext, msg *Message) goja.Value) {
+	d.RegisterExtension(&ExtInfo{
+		Name:                name,
+		AutoActive:          true,
+		OnMessagePreprocess: fn,
+	})
+	d.ApplyExtDefaultSettings()
+}
+
 // ---------------------------------------------------------------------------
 // Smoke Tests
 // ---------------------------------------------------------------------------
@@ -407,6 +417,75 @@ func TestExecuteNew_Segment_TextReconstructed(t *testing.T) {
 	_, ok := adapter.waitForMsg(2 * time.Second)
 	if !ok {
 		t.Fatal("timeout: command in text segment was not processed")
+	}
+}
+
+func TestExecuteNew_MessagePreprocess_RewritesBeforeCommandParse(t *testing.T) {
+	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+
+	vm := goja.New()
+	registerAutoActivePreprocessExt(d, "preprocess-rewrite-test", func(_ *MsgContext, msg *Message) goja.Value {
+		if msg.Message != "roll-alias" {
+			return goja.Undefined()
+		}
+		return vm.ToValue(map[string]interface{}{"message": ".r 1d6"})
+	})
+
+	msg := newGroupMsg("QQ-Group:rewrite", "QQ:999", "roll-alias")
+	d.ImSession.ExecuteNew(ep, msg)
+
+	_, ok := adapter.waitForMsg(2 * time.Second)
+	if !ok {
+		t.Fatal("timeout: expected rewritten command to produce a reply")
+	}
+	if msg.Message != ".r 1d6" {
+		t.Fatalf("message was not rewritten, got %q", msg.Message)
+	}
+}
+
+func TestExecuteNew_MessagePreprocess_RebuildsSegmentFromCQCode(t *testing.T) {
+	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+
+	vm := goja.New()
+	registerAutoActivePreprocessExt(d, "preprocess-cq-test", func(_ *MsgContext, msg *Message) goja.Value {
+		if msg.Message != "mention-roll" {
+			return goja.Undefined()
+		}
+		return vm.ToValue(map[string]interface{}{"message": "[CQ:at,qq=100000] .r 1d6"})
+	})
+
+	msg := newGroupMsg("QQ-Group:cq", "QQ:999", "mention-roll")
+	d.ImSession.ExecuteNew(ep, msg)
+
+	_, ok := adapter.waitForMsg(2 * time.Second)
+	if !ok {
+		t.Fatal("timeout: expected rewritten CQ-at command to produce a reply")
+	}
+	if len(msg.Segment) < 2 {
+		t.Fatalf("expected rewritten message to rebuild segments, got %d segment(s)", len(msg.Segment))
+	}
+	if _, ok := msg.Segment[0].(*message.AtElement); !ok {
+		t.Fatalf("first segment = %T, want *message.AtElement", msg.Segment[0])
+	}
+}
+
+func TestExecuteNew_MessagePreprocess_EmptyMessageIntercepts(t *testing.T) {
+	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+
+	vm := goja.New()
+	registerAutoActivePreprocessExt(d, "preprocess-empty-intercept-test", func(_ *MsgContext, _ *Message) goja.Value {
+		return vm.ToValue(map[string]interface{}{"message": ""})
+	})
+
+	d.ImSession.ExecuteNew(ep, newGroupMsg("QQ-Group:intercept-empty", "QQ:999", ".r 1d6"))
+
+	select {
+	case got := <-adapter.msgCh:
+		t.Fatalf("unexpected reply after empty-message intercept: %q", got)
+	case <-time.After(400 * time.Millisecond):
 	}
 }
 

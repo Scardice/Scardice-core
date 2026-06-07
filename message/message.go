@@ -338,6 +338,98 @@ func (r *RecallElement) FromCQData(dMap map[string]string) error {
 	return nil
 }
 
+func ConvertMessageElementsToString(elems []IMessageElement) string {
+	var text strings.Builder
+	for _, elem := range elems {
+		text.WriteString(MessageElementToString(elem))
+	}
+	return text.String()
+}
+
+func MessageElementToString(elem IMessageElement) string {
+	switch e := elem.(type) {
+	case *TextElement:
+		return e.Content
+	case *AtElement:
+		return compileCQCommand("at", map[string]string{"qq": e.Target})
+	case *ReplyElement:
+		return compileCQCommand("reply", map[string]string{"id": e.ReplySeq})
+	case *TTSElement:
+		return compileCQCommand("tts", map[string]string{"text": e.Content})
+	case *FileElement:
+		fileVal := fileElementValue(e)
+		if fileVal == "" {
+			return ""
+		}
+		return compileCQCommand("file", map[string]string{"file": fileVal})
+	case *ImageElement:
+		fileVal := e.URL
+		if fileVal == "" && e.File != nil {
+			fileVal = fileElementValue(e.File)
+		}
+		if fileVal == "" {
+			return ""
+		}
+		return compileCQCommand("image", map[string]string{"file": fileVal})
+	case *RecordElement:
+		fileVal := ""
+		if e.File != nil {
+			fileVal = fileElementValue(e.File)
+		}
+		if fileVal == "" {
+			return ""
+		}
+		return compileCQCommand("record", map[string]string{"file": fileVal})
+	case *FaceElement:
+		return compileCQCommand("face", map[string]string{"id": e.FaceID})
+	case *PokeElement:
+		args := map[string]string{}
+		if e.Target != "" {
+			args["qq"] = e.Target
+		}
+		return compileCQCommand("poke", args)
+	case *RecallElement:
+		args := map[string]string{}
+		if e.MessageID != "" {
+			args["id"] = e.MessageID
+		}
+		if e.DelayMS > 0 {
+			args["delay"] = strconv.FormatInt(e.DelayMS, 10)
+		}
+		return compileCQCommand("recall", args)
+	case *DefaultElement:
+		if e.RawType == "" {
+			return ""
+		}
+		args := map[string]string{}
+		if len(e.Data) > 0 {
+			var rawArgs map[string]interface{}
+			if err := sonic.Unmarshal(e.Data, &rawArgs); err == nil {
+				for k, v := range rawArgs {
+					args[k] = fmt.Sprint(v)
+				}
+			}
+		}
+		return compileCQCommand(e.RawType, args)
+	default:
+		return ""
+	}
+}
+
+func fileElementValue(file *FileElement) string {
+	if file == nil {
+		return ""
+	}
+	if file.URL != "" {
+		return file.URL
+	}
+	return file.File
+}
+
+func compileCQCommand(cqType string, args map[string]string) string {
+	return (&CQCommand{Type: cqType, Args: args}).Compile()
+}
+
 func newText(s string) *TextElement {
 	return &TextElement{Content: s}
 }
