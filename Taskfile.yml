@@ -10,6 +10,11 @@ tasks:
       - go install golang.org/x/tools/cmd/goimports@latest
       - go install github.com/pointlander/peg@v1.0.1
       - go generate ./...
+      - task: install-hooks
+
+  install-hooks:
+    cmds:
+      - git config core.hooksPath .githooks
 
   run:
     deps: ['test-and-lint']
