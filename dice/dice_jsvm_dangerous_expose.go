@@ -39,7 +39,7 @@ func (ctx *dangerousExposeContext) toValue(value reflect.Value) goja.Value {
 	}
 
 	switch value.Kind() {
-	case reflect.Ptr:
+	case reflect.Pointer:
 		if value.IsNil() {
 			return goja.Null()
 		}
@@ -408,7 +408,7 @@ func dangerousExposeValueCacheKey(value reflect.Value) (dangerousExposeCacheKey,
 		return dangerousExposeCacheKey{}, false
 	}
 	switch value.Kind() {
-	case reflect.Ptr:
+	case reflect.Pointer:
 		if value.IsNil() {
 			return dangerousExposeCacheKey{}, false
 		}
@@ -440,7 +440,7 @@ func unwrapDangerousReflectValue(value reflect.Value) reflect.Value {
 
 func dangerousStructValue(value reflect.Value) reflect.Value {
 	value = unwrapDangerousReflectValue(value)
-	if value.Kind() == reflect.Ptr {
+	if value.Kind() == reflect.Pointer {
 		if value.IsNil() {
 			return reflect.Value{}
 		}
@@ -454,7 +454,7 @@ func dangerousMethodTarget(value reflect.Value) reflect.Value {
 	if !value.IsValid() {
 		return reflect.Value{}
 	}
-	if value.Kind() == reflect.Ptr {
+	if value.Kind() == reflect.Pointer {
 		if value.IsNil() {
 			return reflect.Value{}
 		}
@@ -471,7 +471,7 @@ func dangerousMapValue(value reflect.Value) reflect.Value {
 	if !value.IsValid() {
 		return reflect.Value{}
 	}
-	if value.Kind() == reflect.Ptr {
+	if value.Kind() == reflect.Pointer {
 		if value.IsNil() {
 			return reflect.Value{}
 		}
@@ -488,7 +488,7 @@ func dangerousArrayValue(value reflect.Value) reflect.Value {
 	if !value.IsValid() {
 		return reflect.Value{}
 	}
-	if value.Kind() == reflect.Ptr {
+	if value.Kind() == reflect.Pointer {
 		if value.IsNil() {
 			return reflect.Value{}
 		}
@@ -506,7 +506,7 @@ func dangerousLookupField(value reflect.Value, index []int) reflect.Value {
 		return reflect.Value{}
 	}
 	for _, item := range index {
-		if current.Kind() == reflect.Ptr {
+		if current.Kind() == reflect.Pointer {
 			if current.IsNil() {
 				return reflect.Value{}
 			}

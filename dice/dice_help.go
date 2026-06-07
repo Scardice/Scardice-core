@@ -171,8 +171,8 @@ func (m *HelpManager) Load(dice *Dice, internalCmdMap CmdMapCls, extList []*ExtI
 	} else {
 		log.Infof("[帮助文档] 重建索引")
 	}
-	if err := m.loadSearchEngineWithMode(reuse); err != nil && reuse {
-		log.Warnf("[帮助文档] 索引复用失败，改为重建: %v", err)
+	if loadErr := m.loadSearchEngineWithMode(reuse); loadErr != nil && reuse {
+		log.Warnf("[帮助文档] 索引复用失败，改为重建: %v", loadErr)
 		reuse = false
 		if m.searchEngine != nil {
 			m.searchEngine.Close()
@@ -181,8 +181,8 @@ func (m *HelpManager) Load(dice *Dice, internalCmdMap CmdMapCls, extList []*ExtI
 			log.Errorf("初始化帮助文档失败，帮助文档不可用! %v", err2)
 			return
 		}
-	} else if err != nil {
-		log.Errorf("初始化帮助文档失败，帮助文档不可用! %v", err)
+	} else if loadErr != nil {
+		log.Errorf("初始化帮助文档失败，帮助文档不可用! %v", loadErr)
 		return
 	}
 
@@ -208,9 +208,9 @@ func (m *HelpManager) Load(dice *Dice, internalCmdMap CmdMapCls, extList []*ExtI
 		}
 		m.HelpDocTree = m.buildHelpDocTreeOnly()
 		m.loadHelpConfigIfExists()
-		changed, err := m.updateHelpIndexIncremental(oldManifest.Files, curManifest.Files)
-		if err != nil {
-			log.Warnf("[帮助文档] 增量更新失败，改为重建: %v", err)
+		changed, updateErr := m.updateHelpIndexIncremental(oldManifest.Files, curManifest.Files)
+		if updateErr != nil {
+			log.Warnf("[帮助文档] 增量更新失败，改为重建: %v", updateErr)
 			m.searchEngine.Close()
 			if err2 := m.loadSearchEngineWithMode(false); err2 != nil {
 				log.Errorf("初始化帮助文档失败，帮助文档不可用! %v", err2)
@@ -220,8 +220,8 @@ func (m *HelpManager) Load(dice *Dice, internalCmdMap CmdMapCls, extList []*ExtI
 			if m.shouldStop() {
 				return
 			}
-			if err := m.refreshGeneratedHelpDocs(internalCmdMap, extList); err != nil {
-				log.Warnf("[帮助文档] 刷新生成帮助失败，改为重建: %v", err)
+			if refreshErr := m.refreshGeneratedHelpDocs(internalCmdMap, extList); refreshErr != nil {
+				log.Warnf("[帮助文档] 刷新生成帮助失败，改为重建: %v", refreshErr)
 				m.searchEngine.Close()
 				if err2 := m.loadSearchEngineWithMode(false); err2 != nil {
 					log.Errorf("初始化帮助文档失败，帮助文档不可用! %v", err2)
@@ -234,8 +234,8 @@ func (m *HelpManager) Load(dice *Dice, internalCmdMap CmdMapCls, extList []*ExtI
 				log.Infof("[帮助文档] 增量更新完成，变更: %v", changed)
 				m.CurID = m.searchEngine.GetTotalID()
 				curManifest.TotalID = m.CurID
-				if err := writeHelpIndexManifest(curManifest); err != nil {
-					log.Warnf("[帮助文档] 写入索引清单失败: %v", err)
+				if writeErr := writeHelpIndexManifest(curManifest); writeErr != nil {
+					log.Warnf("[帮助文档] 写入索引清单失败: %v", writeErr)
 				}
 				log.Infof("[帮助文档] 复用现有索引完成，共计加载条目:%d", m.CurID)
 				return
@@ -246,8 +246,8 @@ func (m *HelpManager) Load(dice *Dice, internalCmdMap CmdMapCls, extList []*ExtI
 	if m.shouldStop() {
 		return
 	}
-	if err := m.addGeneratedBuiltinHelp(); err != nil {
-		log.Errorf("加载内置帮助文档出现异常: %v", err)
+	if addErr := m.addGeneratedBuiltinHelp(); addErr != nil {
+		log.Errorf("加载内置帮助文档出现异常: %v", addErr)
 	}
 
 	m.HelpDocTree = make([]*HelpDoc, 0)
