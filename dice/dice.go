@@ -100,6 +100,7 @@ type ExtInfo struct {
 	// NOTE(lyjjl): 尚不清楚海豹开发组为什么禁用这个 API
 
 	OnCommandReceived   func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) `jsbind:"onCommandReceived"   json:"-" yaml:"-"`
+	OnMessagePreprocess func(ctx *MsgContext, msg *Message) goja.Value        `jsbind:"onMessagePreprocess" json:"-" yaml:"-"`
 	OnMessageReceived   func(ctx *MsgContext, msg *Message)                   `jsbind:"onMessageReceived"   json:"-" yaml:"-"`
 	OnMessageSend       func(ctx *MsgContext, msg *Message, flag string)      `jsbind:"onMessageSend"       json:"-" yaml:"-"`
 	OnMessageDeleted    func(ctx *MsgContext, msg *Message)                   `jsbind:"onMessageDeleted"    json:"-" yaml:"-"`
