@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -419,7 +420,7 @@ func cloneMessageForPreprocess(msg *Message) *Message {
 	}
 	cloned := *msg
 	if msg.Segment != nil {
-		cloned.Segment = append(msg.Segment[:0:0], msg.Segment...)
+		cloned.Segment = slices.Clone(msg.Segment)
 	}
 	return &cloned
 }
