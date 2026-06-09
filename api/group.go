@@ -1,8 +1,10 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -11,6 +13,103 @@ import (
 	"Scardice-core/dice"
 	"Scardice-core/dice/service"
 )
+
+const (
+	groupLocalDataScopeGroupRecord = "group_record"
+	groupLocalDataScopePlayers     = "players"
+	groupLocalDataScopeAttrs       = "attrs"
+)
+
+var groupLocalDataScopeOrder = []string{
+	groupLocalDataScopeGroupRecord,
+	groupLocalDataScopePlayers,
+	groupLocalDataScopeAttrs,
+}
+
+type groupLocalDataDeleteRequest struct {
+	GroupID     string   `json:"groupId"     yaml:"groupId"`
+	Scopes      []string `json:"scopes"      yaml:"scopes"`
+	AllowActive bool     `json:"allowActive" yaml:"allowActive"`
+	DryRun      bool     `json:"dryRun"      yaml:"dryRun"`
+}
+
+type groupLocalDataDeleteDeleted struct {
+	GroupRecord       bool  `json:"groupRecord"`
+	GroupInfoRows     int64 `json:"groupInfoRows"`
+	PlayerRows        int64 `json:"playerRows"`
+	GroupAttrRows     int64 `json:"groupAttrRows"`
+	GroupUserAttrRows int64 `json:"groupUserAttrRows"`
+}
+
+type groupLocalDataDeleteResult struct {
+	GroupID         string                      `json:"groupId"`
+	Scopes          []string                    `json:"scopes"`
+	DryRun          bool                        `json:"dryRun"`
+	ExistedInMemory bool                        `json:"existedInMemory"`
+	ActiveDiceIDs   []string                    `json:"activeDiceIds"`
+	ExistingDiceIDs []string                    `json:"existingDiceIds"`
+	Deleted         groupLocalDataDeleteDeleted `json:"deleted"`
+}
+
+func normalizeGroupLocalDataDeleteScopes(scopes []string) ([]string, error) {
+	requested := map[string]bool{}
+	if len(scopes) == 0 {
+		requested[groupLocalDataScopeGroupRecord] = true
+	} else {
+		for _, rawScope := range scopes {
+			scope := strings.TrimSpace(rawScope)
+			switch scope {
+			case groupLocalDataScopeGroupRecord, groupLocalDataScopePlayers, groupLocalDataScopeAttrs:
+				requested[scope] = true
+			case "":
+				return nil, errors.New("scope 不能为空")
+			default:
+				return nil, fmt.Errorf("未知 scope: %s", scope)
+			}
+		}
+	}
+
+	result := make([]string, 0, len(requested))
+	for _, scope := range groupLocalDataScopeOrder {
+		if requested[scope] {
+			result = append(result, scope)
+		}
+	}
+	return result, nil
+}
+
+func groupLocalDataScopeSelected(scopes []string, scope string) bool {
+	for _, item := range scopes {
+		if item == scope {
+			return true
+		}
+	}
+	return false
+}
+
+func groupLocalDataTrueDiceIDs(items *dice.SyncMap[string, bool]) []string {
+	result := []string{}
+	if items == nil {
+		return result
+	}
+	items.Range(func(diceID string, exists bool) bool {
+		if exists {
+			result = append(result, diceID)
+		}
+		return true
+	})
+	sort.Strings(result)
+	return result
+}
+
+func groupLocalDataDiceIDs(group *dice.GroupInfo) ([]string, []string) {
+	if group == nil {
+		return []string{}, []string{}
+	}
+	activeDiceIDs := groupLocalDataTrueDiceIDs(group.DiceIDActiveMap)
+	existingDiceIDs := groupLocalDataTrueDiceIDs(group.DiceIDExistsMap)
+	return activeDiceIDs, existingDiceIDs
+}
 
 func groupList(c echo.Context) error {
 	var items []*dice.GroupInfo
@@ -77,6 +176,109 @@ func groupSetOne(c echo.Context) error {
 		return c.String(http.StatusOK, "")
 	}
 	return c.String(430, "")
+}
+
+func groupLocalDataDelete(c echo.Context) error {
+	if !doAuth(c) {
+		return c.JSON(http.StatusForbidden, nil)
+	}
+
+	v := groupLocalDataDeleteRequest{}
+	if err := c.Bind(&v); err != nil {
+		return Error(&c, "请求格式错误", Response{})
+	}
+
+	v.GroupID = strings.TrimSpace(v.GroupID)
+	if v.GroupID == "" {
+		return Error(&c, "groupId 不能为空", Response{})
+	}
+
+	scopes, err := normalizeGroupLocalDataDeleteScopes(v.Scopes)
+	if err != nil {
+		return Error(&c, err.Error(), Response{
+			"supportedScopes": groupLocalDataScopeOrder,
+		})
+	}
+
+	group, existedInMemory := myDice.ImSession.ServiceAtNew.Load(v.GroupID)
+	activeDiceIDs, existingDiceIDs := groupLocalDataDiceIDs(group)
+	data := groupLocalDataDeleteResult{
+		GroupID:         v.GroupID,
+		Scopes:          scopes,
+		DryRun:          v.DryRun,
+		ExistedInMemory: existedInMemory,
+		ActiveDiceIDs:   activeDiceIDs,
+		ExistingDiceIDs: existingDiceIDs,
+	}
+
+	if len(activeDiceIDs) > 0 && !v.AllowActive {
+		return Error(&c, "群组当前仍有启用中的骰号，删除本地数据需要 allowActive=true", Response{
+			"data": data,
+		})
+	}
+
+	if dm.JustForTest {
+		return Success(&c, Response{
+			"testMode": true,
+			"data":     data,
+		})
+	}
+
+	if v.DryRun {
+		return Success(&c, Response{
+			"data": data,
+		})
+	}
+
+	if groupLocalDataScopeSelected(scopes, groupLocalDataScopeGroupRecord) {
+		if myDice.DirtyGroups != nil {
+			myDice.DirtyGroups.Delete(v.GroupID)
+		}
+		myDice.ImSession.ServiceAtNew.Delete(v.GroupID)
+		if dm != nil {
+			dm.GroupNameCache.Delete(v.GroupID)
+		}
+
+		rows, err := service.GroupInfoDelete(myDice.DBOperator, v.GroupID)
+		if err != nil {
+			return Error(&c, fmt.Sprintf("删除群组本地记录失败: %v", err), Response{
+				"data": data,
+			})
+		}
+		data.Deleted.GroupInfoRows = rows
+		data.Deleted.GroupRecord = existedInMemory || rows > 0
+	}
+
+	if groupLocalDataScopeSelected(scopes, groupLocalDataScopePlayers) {
+		if group != nil {
+			group.Players = new(dice.SyncMap[string, *dice.GroupPlayerInfo])
+		}
+		rows, err := service.GroupPlayerInfoDeleteByGroup(myDice.DBOperator, v.GroupID)
+		if err != nil {
+			return Error(&c, fmt.Sprintf("删除群组玩家本地记录失败: %v", err), Response{
+				"data": data,
+			})
+		}
+		data.Deleted.PlayerRows = rows
+	}
+
+	if groupLocalDataScopeSelected(scopes, groupLocalDataScopeAttrs) {
+		groupAttrRows, groupUserAttrRows, err := service.AttrsDeleteByGroupScope(myDice.DBOperator, v.GroupID)
+		if err != nil {
+			return Error(&c, fmt.Sprintf("删除群组属性本地记录失败: %v", err), Response{
+				"data": data,
+			})
+		}
+		if myDice.AttrsManager != nil {
+			myDice.AttrsManager.DeleteCachedGroupData(v.GroupID, true, true)
+		}
+		data.Deleted.GroupAttrRows = groupAttrRows
+		data.Deleted.GroupUserAttrRows = groupUserAttrRows
+	}
+
+	return Success(&c, Response{
+		"data": data,
+	})
 }
 
 func groupQuit(c echo.Context) error {

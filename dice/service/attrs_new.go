@@ -3,9 +3,11 @@ package service
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	ds "github.com/sealdice/dicescript"
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
 	"Scardice-core/model"
@@ -167,6 +169,41 @@ func AttrsDeleteById(operator engine2.DatabaseOperator, id string) error {
 		return err // 返回错误
 	}
 	return nil // 操作成功，返回 nil
+}
+
+func escapeSQLLikePattern(s string) string {
+	replacer := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return replacer.Replace(s)
+}
+
+// AttrsDeleteByGroupScope 删除指定群组的本地群属性和群内用户属性。
+//
+// 群属性使用 id = groupID；群内用户属性使用 groupID-userID 的组合 id。
+// attrs_type 在历史数据中不总是可靠写入，因此这里按 id 语义删除。
+func AttrsDeleteByGroupScope(operator engine2.DatabaseOperator, groupID string) (int64, int64, error) {
+	db := operator.GetDataDB(constant.WRITE)
+	var groupAttrRows int64
+	var groupUserAttrRows int64
+
+	err := db.Transaction(func(tx *gorm.DB) error {
+		result := tx.Where("id = ?", groupID).Delete(&model.AttributesItemModel{})
+		if result.Error != nil {
+			return result.Error
+		}
+		groupAttrRows = result.RowsAffected
+
+		groupUserIDPrefix := escapeSQLLikePattern(groupID+"-") + "%"
+		result = tx.Where("id LIKE ? ESCAPE '\\'", groupUserIDPrefix).Delete(&model.AttributesItemModel{})
+		if result.Error != nil {
+			return result.Error
+		}
+		groupUserAttrRows = result.RowsAffected
+		return nil
+	})
+	if err != nil {
+		return groupAttrRows, groupUserAttrRows, err
+	}
+	return groupAttrRows, groupUserAttrRows, nil
 }
 
 func AttrsCharGetBindingList(operator engine2.DatabaseOperator, id string) ([]string, error) {

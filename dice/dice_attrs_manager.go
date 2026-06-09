@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -108,6 +109,24 @@ func (am *AttrsManager) CharDelete(id string) error {
 	// 从缓存中删除
 	am.m.Delete(id)
 	return nil
+}
+
+func (am *AttrsManager) DeleteCachedGroupData(groupID string, includeGroupAttrs bool, includeGroupUserAttrs bool) {
+	if am == nil {
+		return
+	}
+	if includeGroupAttrs {
+		am.m.Delete(groupID)
+	}
+	if includeGroupUserAttrs {
+		prefix := groupID + "-"
+		am.m.Range(func(key string, _ *AttributesItem) bool {
+			if strings.HasPrefix(key, prefix) {
+				am.m.Delete(key)
+			}
+			return true
+		})
+	}
 }
 
 // LoadById 数据加载，负责以下数据

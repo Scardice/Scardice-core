@@ -61,6 +61,16 @@ func GroupInfoSave(operator engine2.DatabaseOperator, groupID string, updatedAt 
 	return result.Error
 }
 
+// GroupInfoDelete 删除指定群组的本地群组记录。
+func GroupInfoDelete(operator engine2.DatabaseOperator, groupID string) (int64, error) {
+	db := operator.GetDataDB(constant.WRITE)
+	result := db.Where("id = ?", groupID).Delete(&model.GroupInfo{})
+	if result.Error != nil {
+		return 0, result.Error
+	}
+	return result.RowsAffected, nil
+}
+
 // GroupPlayerNumGet 获取指定群组的玩家数量
 func GroupPlayerNumGet(operator engine2.DatabaseOperator, groupID string) (int64, error) {
 	// 使用读数据库
@@ -144,4 +154,14 @@ func GroupPlayerInfoSave(operator engine2.DatabaseOperator, info *model.GroupPla
 
 	// 返回 nil 表示操作成功
 	return nil
+}
+
+// GroupPlayerInfoDeleteByGroup 删除指定群组下所有本地玩家记录。
+func GroupPlayerInfoDeleteByGroup(operator engine2.DatabaseOperator, groupID string) (int64, error) {
+	db := operator.GetDataDB(constant.WRITE)
+	result := db.Where("group_id = ?", groupID).Delete(&model.GroupPlayerInfoBase{})
+	if result.Error != nil {
+		return 0, result.Error
+	}
+	return result.RowsAffected, nil
 }
