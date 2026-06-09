@@ -694,6 +694,7 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 	e.GET(prefix+"/group/list", groupList)
 	e.POST(prefix+"/group/set_one", groupSetOne)
 	e.POST(prefix+"/group/quit_one", groupQuit)
+	e.POST(prefix+"/group/local_data/delete", groupLocalDataDelete)
 
 	e.GET(prefix+"/banconfig/list", banMapList)
 	e.GET(prefix+"/banconfig/get", banConfigGet)
