@@ -48,10 +48,11 @@ type CmdItemInfo struct {
 	DisabledInPrivate       bool                      `jsbind:"disabledInPrivate"`       // 私聊不可用
 	EnableExecuteTimesParse bool                      `jsbind:"enableExecuteTimesParse"` // 启用执行次数解析，也就是解析3#这样的文本
 
-	IsJsSolveFunc bool
-	JSLoopVersion int64 // Loop版本号
-	Solve         func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult
-	SolveRaw      func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) goja.Value `jsbind:"solve"`
+	IsJsSolveFunc  bool
+	JSLoopVersion  int64  // Loop版本号
+	SourceLocation string `json:"-" yaml:"-"` // JS 命令注册位置，用于诊断日志
+	Solve          func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult
+	SolveRaw       func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) goja.Value `jsbind:"solve"`
 
 	Raw                bool `jsbind:"raw"`                // 高级模式。默认模式下行为是：需要在当前群/私聊开启，或@自己时生效(需要为第一个@目标)
 	CheckCurrentBotOn  bool `jsbind:"checkCurrentBotOn"`  // 是否检查当前可用状况，包括群内可用和是私聊两种方式，如失败不进入solve
@@ -759,6 +760,7 @@ func (d *Dice) extFindPostProcess(ext *ExtInfo, fromJS bool) *ExtInfo {
 				DisabledInPrivate:       info.DisabledInPrivate,
 				EnableExecuteTimesParse: info.EnableExecuteTimesParse,
 				IsJsSolveFunc:           info.IsJsSolveFunc,
+				SourceLocation:          info.SourceLocation,
 				Solve:                   info.Solve,
 				SolveRaw:                info.SolveRaw,
 				Raw:                     info.Raw,

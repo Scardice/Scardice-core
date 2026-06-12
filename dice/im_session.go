@@ -1534,6 +1534,28 @@ func (ep *EndPointInfo) TriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *
 	log := d.Logger
 
 	handled := false
+	logIgnoredCommand := func(result commandSolveResult) {
+		reasonText := formatCommandIgnoreReasonForInfo(result)
+		log.Debugw("command ignored detail",
+			"reason", result.IgnoreReason,
+			"command", cmdArgs.Command,
+			"disabledSources", result.DisabledSources,
+			"unavailableSources", result.UnavailableSources,
+			"inactiveSources", result.InactiveSources,
+			"executeMatched", result.ExecuteMatched,
+			"executeSolved", result.ExecuteSolved,
+			"executeLocation", result.ExecuteLocation,
+			"executeError", result.ExecuteError,
+		)
+		if msg.MessageType == "group" {
+			log.Infof("忽略指令(%s): 来自群(%s)内<%s>(%s): %s", reasonText, msg.GroupID, msg.Sender.Nickname, msg.Sender.UserID, msg.Message)
+		}
+
+		if msg.MessageType == "private" {
+			log.Infof("忽略指令(%s): 来自<%s>(%s)的私聊: %s", reasonText, msg.Sender.Nickname, msg.Sender.UserID, msg.Message)
+		}
+	}
+
 	// 试图匹配自定义指令
 	if mctx.Group != nil && mctx.Group.IsActive(mctx) {
 		for _, wrapper := range mctx.Group.GetActivatedExtList(mctx.Dice) {
@@ -1567,10 +1589,10 @@ func (ep *EndPointInfo) TriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *
 			log.Infof("指令冲突: 群(%s) 指令[%s] 可用扩展: %s", msg.GroupID, cmdArgs.Command, strings.Join(solveResult.AvailableSources, ", "))
 		case commandSolveBlocked:
 			handled = true
-			log.Infof("指令[%s]可用扩展均被禁用: %s", cmdArgs.Command, strings.Join(solveResult.DisabledSources, ", "))
+			logIgnoredCommand(solveResult)
 		case commandSolveFailed:
 			handled = true
-			log.Infof("指令[%s]执行失败", cmdArgs.Command)
+			log.Info(formatCommandFailureForInfo(cmdArgs.Command, solveResult))
 		case commandSolveUnmatched:
 		}
 	}
@@ -1587,13 +1609,7 @@ func (ep *EndPointInfo) TriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *
 			}
 		}
 	} else {
-		if msg.MessageType == "group" {
-			log.Infof("忽略指令(骰子关闭/扩展关闭/未知指令): 来自群(%s)内<%s>(%s): %s", msg.GroupID, msg.Sender.Nickname, msg.Sender.UserID, msg.Message)
-		}
-
-		if msg.MessageType == "private" {
-			log.Infof("忽略指令(骰子关闭/扩展关闭/未知指令): 来自<%s>(%s)的私聊: %s", msg.Sender.Nickname, msg.Sender.UserID, msg.Message)
-		}
+		logIgnoredCommand(solveResult)
 	}
 	return handled
 }
@@ -2026,15 +2042,41 @@ const (
 	commandSolveFailed
 )
 
+type commandIgnoreReason string
+
+const (
+	commandIgnoreReasonNone               commandIgnoreReason = ""
+	commandIgnoreReasonUnknownCommand     commandIgnoreReason = "unknown_command"
+	commandIgnoreReasonBotOff             commandIgnoreReason = "bot_off"
+	commandIgnoreReasonExtensionInactive  commandIgnoreReason = "extension_inactive"
+	commandIgnoreReasonCommandDisabled    commandIgnoreReason = "command_disabled"
+	commandIgnoreReasonMentionOther       commandIgnoreReason = "mention_other"
+	commandIgnoreReasonPrivateUnavailable commandIgnoreReason = "private_unavailable"
+	commandIgnoreReasonNoAvailable        commandIgnoreReason = "no_available_candidate"
+	commandIgnoreReasonCandidateDeclined  commandIgnoreReason = "candidate_declined"
+)
+
 type commandSolveCandidate struct {
 	Ext  *ExtInfo
 	Item *CmdItemInfo
 }
 
+type commandUnavailableSource struct {
+	Reason commandIgnoreReason
+	Source string
+}
+
 type commandSolveResult struct {
-	Status           commandSolveStatus
-	AvailableSources []string
-	DisabledSources  []string
+	Status             commandSolveStatus
+	AvailableSources   []string
+	DisabledSources    []string
+	UnavailableSources []commandUnavailableSource
+	InactiveSources    []string
+	IgnoreReason       commandIgnoreReason
+	ExecuteMatched     bool
+	ExecuteSolved      bool
+	ExecuteLocation    string
+	ExecuteError       string
 }
 
 func normalizeRuleIdentity(raw string) string {
@@ -2205,6 +2247,233 @@ func commandCandidateSourceName(candidate commandSolveCandidate) string {
 	return candidate.Ext.Name
 }
 
+func commandCandidateDisplayName(candidate commandSolveCandidate) string {
+	source := commandCandidateSourceName(candidate)
+	if source == "core" {
+		source = "核心"
+	}
+	if candidate.Item == nil || candidate.Item.Name == "" {
+		return source
+	}
+	return source + "." + candidate.Item.Name
+}
+
+func commandCandidateSourceLocation(candidate commandSolveCandidate) string {
+	if candidate.Item != nil {
+		if location := strings.TrimSpace(candidate.Item.SourceLocation); location != "" {
+			return location
+		}
+	}
+	ext := candidate.Ext
+	if ext == nil {
+		return ""
+	}
+	if realExt := ext.GetRealExt(); realExt != nil {
+		ext = realExt
+	}
+	if ext.Source == nil {
+		return ""
+	}
+	return formatSourceLocationForLog(ext.Source.Filename, 0, 0)
+}
+
+func commandIgnoreReasonPriority(reason commandIgnoreReason) int {
+	switch reason {
+	case commandIgnoreReasonBotOff:
+		return 10
+	case commandIgnoreReasonCommandDisabled:
+		return 20
+	case commandIgnoreReasonExtensionInactive:
+		return 30
+	case commandIgnoreReasonPrivateUnavailable:
+		return 40
+	case commandIgnoreReasonMentionOther:
+		return 50
+	case commandIgnoreReasonUnknownCommand:
+		return 60
+	case commandIgnoreReasonCandidateDeclined:
+		return 65
+	case commandIgnoreReasonNoAvailable:
+		return 70
+	default:
+		return 100
+	}
+}
+
+func selectCommandIgnoreReason(sources []commandUnavailableSource, inactiveSources []string, fallback commandIgnoreReason) commandIgnoreReason {
+	selected := commandIgnoreReasonNone
+	selectedPriority := commandIgnoreReasonPriority(commandIgnoreReasonNone)
+	for _, source := range sources {
+		if source.Reason == commandIgnoreReasonNone {
+			continue
+		}
+		if priority := commandIgnoreReasonPriority(source.Reason); priority < selectedPriority {
+			selected = source.Reason
+			selectedPriority = priority
+		}
+	}
+	if selected != commandIgnoreReasonNone {
+		return selected
+	}
+	if len(inactiveSources) > 0 {
+		return commandIgnoreReasonExtensionInactive
+	}
+	if fallback != commandIgnoreReasonNone {
+		return fallback
+	}
+	return commandIgnoreReasonUnknownCommand
+}
+
+func commandUnavailableSourceNamesByReason(sources []commandUnavailableSource, reason commandIgnoreReason) []string {
+	names := make([]string, 0, len(sources))
+	seen := map[string]struct{}{}
+	for _, source := range sources {
+		if source.Reason != reason || source.Source == "" {
+			continue
+		}
+		if _, ok := seen[source.Source]; ok {
+			continue
+		}
+		seen[source.Source] = struct{}{}
+		names = append(names, source.Source)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func formatCommandIgnoreReasonForInfo(result commandSolveResult) string {
+	reason := result.IgnoreReason
+	if reason == commandIgnoreReasonNone {
+		reason = selectCommandIgnoreReason(result.UnavailableSources, result.InactiveSources, commandIgnoreReasonUnknownCommand)
+	}
+
+	switch reason {
+	case commandIgnoreReasonBotOff:
+		return "骰子未在当前群开启"
+	case commandIgnoreReasonExtensionInactive:
+		if len(result.InactiveSources) > 0 {
+			sources := append([]string{}, result.InactiveSources...)
+			sort.Strings(sources)
+			return "相关扩展未开启: " + strings.Join(sources, ", ")
+		}
+		return "相关扩展未开启"
+	case commandIgnoreReasonCommandDisabled:
+		sources := commandUnavailableSourceNamesByReason(result.UnavailableSources, commandIgnoreReasonCommandDisabled)
+		if len(sources) == 0 {
+			sources = append([]string{}, result.DisabledSources...)
+			sort.Strings(sources)
+		}
+		if len(sources) > 0 {
+			return "扩展指令已禁用: " + strings.Join(sources, ", ")
+		}
+		return "扩展指令已禁用"
+	case commandIgnoreReasonMentionOther:
+		return "指令目标不是当前骰子"
+	case commandIgnoreReasonPrivateUnavailable:
+		return "该指令不能在私聊使用"
+	case commandIgnoreReasonNoAvailable:
+		return "指令当前不可用"
+	case commandIgnoreReasonCandidateDeclined:
+		return "指令已匹配但本次不响应"
+	case commandIgnoreReasonUnknownCommand:
+		return "指令不存在"
+	default:
+		return "指令当前不可用"
+	}
+}
+
+func formatCommandFailureForInfo(command string, result commandSolveResult) string {
+	base := fmt.Sprintf("指令[%s]执行失败 Match:%t Solved:%t", command, result.ExecuteMatched, result.ExecuteSolved)
+	switch {
+	case result.ExecuteLocation != "" && result.ExecuteError != "":
+		return fmt.Sprintf("%s Location:%s\nError:%s", base, result.ExecuteLocation, result.ExecuteError)
+	case result.ExecuteLocation != "":
+		return fmt.Sprintf("%s Location:%s", base, result.ExecuteLocation)
+	case result.ExecuteError != "":
+		return fmt.Sprintf("%s Error:%s", base, result.ExecuteError)
+	default:
+		return base
+	}
+}
+
+func extCommandExists(ext *ExtInfo, command string) bool {
+	if ext == nil || command == "" {
+		return false
+	}
+	for key, item := range ext.GetCmdMap() {
+		if strings.EqualFold(key, command) {
+			return true
+		}
+		if item != nil && strings.EqualFold(item.Name, command) {
+			return true
+		}
+	}
+	return false
+}
+
+func findActivatedExtensionCommandSources(ctx *MsgContext, command string) []string {
+	if ctx == nil || ctx.Group == nil || ctx.Dice == nil {
+		return nil
+	}
+	var sources []string
+	for _, ext := range ctx.Group.GetActivatedExtList(ctx.Dice) {
+		if extCommandExists(ext, command) {
+			sources = append(sources, ext.Name)
+		}
+	}
+	sort.Strings(sources)
+	return sources
+}
+
+func findInactiveExtensionCommandSources(ctx *MsgContext, command string) []string {
+	if ctx == nil || ctx.Group == nil || ctx.Dice == nil {
+		return nil
+	}
+	active := map[string]struct{}{}
+	for _, ext := range ctx.Group.GetActivatedExtList(ctx.Dice) {
+		if ext != nil {
+			active[ext.Name] = struct{}{}
+		}
+	}
+
+	var sources []string
+	for _, ext := range ctx.Dice.ExtList {
+		if ext == nil {
+			continue
+		}
+		if _, ok := active[ext.Name]; ok {
+			continue
+		}
+		if extCommandExists(ext, command) {
+			sources = append(sources, ext.Name)
+		}
+	}
+	sort.Strings(sources)
+	return sources
+}
+
+func formatJSSolveError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var exception *goja.Exception
+	if errors.As(err, &exception) && exception != nil {
+		return errors.New(exception.Error())
+	}
+	return err
+}
+
+func formatJSSolveRecoveredError(recovered any) error {
+	switch v := recovered.(type) {
+	case *goja.Exception:
+		return errors.New(v.Error())
+	case error:
+		return formatJSSolveError(v)
+	default:
+		return fmt.Errorf("panic: %v", recovered)
+	}
+}
+
 func parseJSSolveResult(vm *goja.Runtime, ctx *MsgContext, solveName string, value goja.Value) (CmdExecuteResult, error) {
 	if goja.IsUndefined(value) || goja.IsNull(value) {
 		// 兼容旧插件：很多 JS solve 只 reply，不显式返回结果。
@@ -2272,7 +2541,7 @@ func resolveJSSolveValue(vm *goja.Runtime, ctx *MsgContext, solveName string, va
 	if !ok {
 		ret, err := parseJSSolveResult(vm, ctx, solveName, value)
 		if err != nil {
-			fail <- err
+			fail <- formatJSSolveError(err)
 			return
 		}
 		done <- ret
@@ -2283,7 +2552,7 @@ func resolveJSSolveValue(vm *goja.Runtime, ctx *MsgContext, solveName string, va
 	case goja.PromiseStateFulfilled:
 		ret, err := parseJSSolveResult(vm, ctx, solveName, promise.Result())
 		if err != nil {
-			fail <- err
+			fail <- formatJSSolveError(err)
 			return
 		}
 		done <- ret
@@ -2301,7 +2570,7 @@ func resolveJSSolveValue(vm *goja.Runtime, ctx *MsgContext, solveName string, va
 		onFulfilled := vm.ToValue(func(call goja.FunctionCall) goja.Value {
 			ret, err := parseJSSolveResult(vm, ctx, solveName, call.Argument(0))
 			if err != nil {
-				fail <- err
+				fail <- formatJSSolveError(err)
 				return goja.Undefined()
 			}
 			done <- ret
@@ -2313,7 +2582,7 @@ func resolveJSSolveValue(vm *goja.Runtime, ctx *MsgContext, solveName string, va
 		})
 
 		if _, err := thenFn(value, onFulfilled, onRejected); err != nil {
-			fail <- err
+			fail <- formatJSSolveError(err)
 		}
 	default:
 		fail <- errors.New("unknown promise state")
@@ -2399,54 +2668,55 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 		VarSetValueInt64(ctx, "$t轮数", int64(cmdArgs.SpecialExecuteTimes))
 	}
 
-	checkCandidateAvailable := func(ext *ExtInfo, item *CmdItemInfo) (available bool, disabled bool) {
+	checkCandidateAvailable := func(ext *ExtInfo, item *CmdItemInfo) (available bool, reason commandIgnoreReason) {
 		if item == nil {
-			return false, false
+			return false, commandIgnoreReasonUnknownCommand
 		}
 
 		if item.Raw { //nolint:nestif
 			if item.CheckCurrentBotOn {
 				if !ctx.IsCurGroupBotOn && !ctx.IsPrivate {
-					return false, false
+					return false, commandIgnoreReasonBotOff
 				}
 			}
 
 			if item.CheckMentionOthers {
 				if cmdArgs.SomeoneBeMentionedButNotMe {
-					return false, false
+					return false, commandIgnoreReasonMentionOther
 				}
 			}
 		} else { //nolint:gocritic
 			// 默认模式行为：需要在当前群/私聊开启，或@自己时生效(需要为第一个@目标)
 			if !ctx.IsCurGroupBotOn && !ctx.IsPrivate {
-				return false, false
+				return false, commandIgnoreReasonBotOff
 			}
 		}
 
-		if ext != nil && ext.DefaultSetting.DisabledCommand[item.Name] {
-			return false, true
+		if ext != nil && ext.DefaultSetting != nil && ext.DefaultSetting.DisabledCommand[item.Name] {
+			return false, commandIgnoreReasonCommandDisabled
 		}
 
 		if !item.Raw {
 			if item.DisabledInPrivate && ctx.IsPrivate {
 				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:提示_私聊不可用"))
-				return false, false
+				return false, commandIgnoreReasonPrivateUnavailable
 			}
 
 			if !item.AllowDelegate && cmdArgs.SomeoneBeMentionedButNotMe {
 				// 如果其他人被@了就不管
 				// 注: 如果被@的对象在botlist列表，那么不会走到这一步
-				return false, false
+				return false, commandIgnoreReasonMentionOther
 			}
 		}
 
-		return true, false
+		return true, commandIgnoreReasonNone
 	}
 
-	executeCandidate := func(candidate commandSolveCandidate) bool {
+	var executeErr error
+	executeCandidate := func(candidate commandSolveCandidate) CmdExecuteResult {
 		item := candidate.Item
 		if item == nil {
-			return false
+			return CmdExecuteResult{}
 		}
 
 		// Note(Szzrain): TODO: 意义不明，需要想办法干掉
@@ -2506,8 +2776,9 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 				err  error
 			)
 			if s.Parent.ExtLoopManager == nil {
-				s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境不可用: loop manager is nil", item.Name)
-				return false
+				executeErr = errors.New("loop manager is nil")
+				s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境不可用: %v", item.Name, executeErr)
+				return CmdExecuteResult{Matched: true, Solved: false}
 			}
 
 			loop, err = s.Parent.ExtLoopManager.GetLoop(item.JSLoopVersion)
@@ -2519,8 +2790,9 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 				}
 				if loop == nil {
 					// 打个DEBUG日志？
+					executeErr = err
 					s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境已经过期: %v", item.Name, err)
-					return false
+					return CmdExecuteResult{Matched: true, Solved: false}
 				}
 			}
 			done := make(chan CmdExecuteResult, 1)
@@ -2530,7 +2802,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 					// 兼容少量旧对象：没有 solveRaw 时回退同步 solve
 					defer func() {
 						if r := recover(); r != nil {
-							fail <- fmt.Errorf("panic: %v", r)
+							fail <- formatJSSolveRecoveredError(r)
 							return
 						}
 						done <- item.Solve(ctx, msg, cmdArgs)
@@ -2540,7 +2812,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 
 				defer func() {
 					if r := recover(); r != nil {
-						fail <- fmt.Errorf("panic: %v", r)
+						fail <- formatJSSolveRecoveredError(r)
 					}
 				}()
 
@@ -2550,19 +2822,22 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 			ret, err = waitJSSolveResult(done, fail, jsSolveAwaitTimeout)
 			if err != nil {
 				if errors.Is(err, errJSSolveTimeout) {
+					executeErr = err
 					s.Parent.Logger.Warnf("扩展注册的指令<%s>执行超时（>%s），建议检查扩展逻辑", item.Name, jsSolveAwaitTimeout)
-					return false
+					return CmdExecuteResult{Matched: true, Solved: false}
 				}
 				if errors.Is(err, errJSSolveEmptyResult) {
 					if waitForCommandReply(ctx, jsSolveEmptyResultGraceWindow) {
 						ret = CmdExecuteResult{Matched: true, Solved: true}
 					} else {
+						executeErr = err
 						logJSSolveEmptyResultWarning(s.Parent.Logger, candidate, item.Name, ctx, msg)
-						return false
+						return CmdExecuteResult{Matched: true, Solved: false}
 					}
 				} else {
+					executeErr = err
 					ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", err))
-					return false
+					return CmdExecuteResult{Matched: true, Solved: false}
 				}
 			}
 		} else {
@@ -2588,9 +2863,9 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 				ReplyToSender(ctx, msg, help)
 			}
 
-			return true
+			return ret
 		}
-		return false
+		return ret
 	}
 
 	group := ctx.Group
@@ -2612,18 +2887,42 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 	}
 
 	if len(candidates) == 0 {
-		return commandSolveResult{Status: commandSolveUnmatched}
+		inactiveSources := findInactiveExtensionCommandSources(ctx, cmdArgs.Command)
+		if !ctx.IsPrivate && !ctx.IsCurGroupBotOn && len(findActivatedExtensionCommandSources(ctx, cmdArgs.Command)) > 0 {
+			return commandSolveResult{
+				Status:       commandSolveUnmatched,
+				IgnoreReason: commandIgnoreReasonBotOff,
+			}
+		}
+		if len(inactiveSources) > 0 {
+			return commandSolveResult{
+				Status:          commandSolveUnmatched,
+				InactiveSources: inactiveSources,
+				IgnoreReason:    commandIgnoreReasonExtensionInactive,
+			}
+		}
+		return commandSolveResult{
+			Status:       commandSolveUnmatched,
+			IgnoreReason: commandIgnoreReasonUnknownCommand,
+		}
 	}
 
 	var available []commandSolveCandidate
 	var disabled []commandSolveCandidate
+	var unavailable []commandUnavailableSource
 	for _, candidate := range candidates {
-		ok, isDisabled := checkCandidateAvailable(candidate.Ext, candidate.Item)
+		ok, reason := checkCandidateAvailable(candidate.Ext, candidate.Item)
 		if ok {
 			available = append(available, candidate)
 			continue
 		}
-		if isDisabled {
+		if reason != commandIgnoreReasonNone {
+			unavailable = append(unavailable, commandUnavailableSource{
+				Reason: reason,
+				Source: commandCandidateDisplayName(candidate),
+			})
+		}
+		if reason == commandIgnoreReasonCommandDisabled {
 			disabled = append(disabled, candidate)
 		}
 	}
@@ -2643,9 +2942,15 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 		}
 	}
 
-	var solved bool
+	var executeResult CmdExecuteResult
+	var executeLocation string
+	var executeErrorText string
 	if len(available) == 1 {
-		solved = executeCandidate(available[0])
+		executeLocation = commandCandidateSourceLocation(available[0])
+		executeResult = executeCandidate(available[0])
+		if executeErr != nil {
+			executeErrorText = executeErr.Error()
+		}
 	}
 
 	if group != nil && (group.Active || ctx.IsCurGroupBotOn) {
@@ -2663,24 +2968,57 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 	}
 
 	if len(available) == 1 {
-		if solved {
-			return commandSolveResult{Status: commandSolveSolved}
+		if executeResult.Solved {
+			return commandSolveResult{
+				Status:          commandSolveSolved,
+				ExecuteMatched:  executeResult.Matched,
+				ExecuteSolved:   executeResult.Solved,
+				ExecuteLocation: executeLocation,
+				ExecuteError:    executeErrorText,
+			}
 		}
-		return commandSolveResult{Status: commandSolveFailed}
+		if !executeResult.Matched {
+			inactiveSources := findInactiveExtensionCommandSources(ctx, cmdArgs.Command)
+			return commandSolveResult{
+				Status:             commandSolveUnmatched,
+				UnavailableSources: unavailable,
+				InactiveSources:    inactiveSources,
+				IgnoreReason:       commandIgnoreReasonCandidateDeclined,
+				ExecuteMatched:     executeResult.Matched,
+				ExecuteSolved:      executeResult.Solved,
+				ExecuteLocation:    executeLocation,
+				ExecuteError:       executeErrorText,
+			}
+		}
+		return commandSolveResult{
+			Status:          commandSolveFailed,
+			ExecuteMatched:  executeResult.Matched,
+			ExecuteSolved:   executeResult.Solved,
+			ExecuteLocation: executeLocation,
+			ExecuteError:    executeErrorText,
+		}
 	}
 
 	if len(disabled) > 0 {
 		names := make([]string, 0, len(disabled))
 		for _, candidate := range disabled {
-			names = append(names, fmt.Sprintf("%s:%s", commandCandidateSourceName(candidate), candidate.Item.Name))
+			names = append(names, commandCandidateDisplayName(candidate))
 		}
 		return commandSolveResult{
-			Status:          commandSolveBlocked,
-			DisabledSources: names,
+			Status:             commandSolveBlocked,
+			DisabledSources:    names,
+			UnavailableSources: unavailable,
+			IgnoreReason:       commandIgnoreReasonCommandDisabled,
 		}
 	}
 
-	return commandSolveResult{Status: commandSolveUnmatched}
+	inactiveSources := findInactiveExtensionCommandSources(ctx, cmdArgs.Command)
+	return commandSolveResult{
+		Status:             commandSolveUnmatched,
+		UnavailableSources: unavailable,
+		InactiveSources:    inactiveSources,
+		IgnoreReason:       selectCommandIgnoreReason(unavailable, inactiveSources, commandIgnoreReasonNoAvailable),
+	}
 }
 
 func (s *IMSession) OnMessageDeleted(mctx *MsgContext, msg *Message) {
