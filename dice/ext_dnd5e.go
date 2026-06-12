@@ -977,7 +977,7 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 					return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 				}
 			}
-			return CmdExecuteResult{Matched: true, Solved: false}
+			return CmdExecuteResult{Matched: true, Solved: true}
 		},
 	}
 
