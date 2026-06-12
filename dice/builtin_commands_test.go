@@ -181,6 +181,19 @@ func newQuitCommandTestContext(t *testing.T, d *Dice, ep *EndPointInfo, senderID
 	return ctx, msg
 }
 
+func TestBotCommandDeclinesUnaddressedGroupWhenConfigured(t *testing.T) {
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+
+	d.Config.IgnoreUnaddressedBotCmd = true
+	ctx, msg := newQuitCommandTestContext(t, d, ep, "QQ:9000", "QQ-Group:2000", "CommandGroup")
+
+	result := d.CmdMap["bot"].Solve(ctx, msg, &CmdArgs{Args: []string{"off"}})
+	if result.Matched || result.Solved {
+		t.Fatalf("expected unaddressed bot command to decline match, got %#v", result)
+	}
+}
+
 func TestBotByeWithoutConfirmQuitsCurrentGroup(t *testing.T) {
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
