@@ -788,17 +788,17 @@ func (d *Dice) registerCoreCommands() {
 			if inGroup {
 				// 不响应裸指令选项
 				if len(cmdArgs.At) < 1 && ctx.Dice.Config.IgnoreUnaddressedBotCmd {
-					return CmdExecuteResult{Matched: true, Solved: false}
+					return CmdExecuteResult{Matched: false, Solved: false}
 				}
 				// 不响应at其他人
 				if cmdArgs.SomeoneBeMentionedButNotMe {
-					return CmdExecuteResult{Matched: true, Solved: false}
+					return CmdExecuteResult{Matched: false, Solved: false}
 				}
 			}
 
 			if len(cmdArgs.Args) > 0 && !cmdArgs.IsArgEqual(1, "about") { //nolint:nestif
 				if cmdArgs.SomeoneBeMentionedButNotMe {
-					return CmdExecuteResult{Matched: true, Solved: false}
+					return CmdExecuteResult{Matched: false, Solved: false}
 				}
 
 				cmdArgs.ChopPrefixToArgsWith("on", "off")
@@ -816,7 +816,7 @@ func (d *Dice) registerCoreCommands() {
 
 					isMe, exists := matchNumber()
 					if exists && !isMe {
-						return CmdExecuteResult{Matched: true, Solved: false}
+						return CmdExecuteResult{Matched: false, Solved: false}
 					}
 				}
 
