@@ -11,6 +11,7 @@ DEFAULT_VERSION_MAIN="$(sed -n 's/^[[:space:]]*VERSION_MAIN = \"\\([^\"]*\\)\".*
 DEFAULT_VERSION_MAIN="${DEFAULT_VERSION_MAIN:-1.5.1}"
 PRIVATE_KEY_FILE="./signature/seal_trusted_private_key.pem"
 SIGN_KEY_FILE="./signature/seal_sign_private_key.bin"
+SIGN_V3_URL_FILE="./signature/SealSignV3Url"
 DEFAULT_TARGET_GOOS="$(go env GOOS)"
 DEFAULT_TARGET_GOARCH="$(go env GOARCH)"
 OUTPUT_DIR="$ROOT_DIR/output"
@@ -27,6 +28,7 @@ RUNTIME_CACHE_TTL_SECONDS="${RUNTIME_CACHE_TTL_SECONDS:-86400}"
 RUNTIME_AXEL_CONNECTIONS="${RUNTIME_AXEL_CONNECTIONS:-8}"
 PACK_RUNTIME_ASSETS="${PACK_RUNTIME_ASSETS:-1}"
 RUNTIME_ASSETS_STRICT="${RUNTIME_ASSETS_STRICT:-1}"
+REDOWNLOAD_RUNTIME_ASSETS=0
 ALL_GOOS=(linux windows darwin freebsd openbsd netbsd)
 ALL_GOARCH=(amd64 arm64 386 arm ppc64le riscv64 s390x)
 HOST_GOOS="$DEFAULT_TARGET_GOOS"
@@ -118,9 +120,12 @@ download_file_with_cache() {
 	local download_success=1
 
 	mkdir -p "$(dirname "$destination")"
-	if [[ -s "$destination" ]] && cache_entry_is_fresh "$destination" "$stamp_file"; then
+	if [[ "${REDOWNLOAD_RUNTIME_ASSETS:-0}" != "1" && -s "$destination" ]]; then
 		echo "[Build] 使用缓存的 ${label}：$destination"
 		return 0
+	fi
+	if [[ "${REDOWNLOAD_RUNTIME_ASSETS:-0}" == "1" && -s "$destination" ]]; then
+		echo "[Build] 已选择重新下载 ${label}，忽略缓存：$destination"
 	fi
 
 	rm -f "$temp_path"
@@ -159,6 +164,54 @@ download_file_with_cache() {
 		return 0
 	fi
 	echo "[Build] 警告：下载 ${label} 失败。"
+	return 1
+}
+
+lagrange_cache_file_for_target() {
+	local goos="$1"
+	local goarch="$2"
+	local target="${goos}-${goarch}"
+	echo "$RUNTIME_CACHE_DIR/Lagrange.OneBot.${target}.zip"
+}
+
+milky_cache_file_for_target() {
+	local goos="$1"
+	local goarch="$2"
+	local target="${goos}-${goarch}"
+	local cache_file="$RUNTIME_CACHE_DIR/lagrangeV2.${target}"
+	if [[ "$goos" == "windows" ]]; then
+		cache_file="${cache_file}.exe"
+	fi
+	echo "$cache_file"
+}
+
+runtime_asset_cache_exists_for_target() {
+	local goos="$1"
+	local goarch="$2"
+	local lagrange_url milky_url
+
+	lagrange_url="$(resolve_lagrange_url "$goos" "$goarch")"
+	if [[ -n "$lagrange_url" && -s "$(lagrange_cache_file_for_target "$goos" "$goarch")" ]]; then
+		return 0
+	fi
+
+	milky_url="$(resolve_milky_url "$goos" "$goarch")"
+	if [[ -n "$milky_url" && -s "$(milky_cache_file_for_target "$goos" "$goarch")" ]]; then
+		return 0
+	fi
+
+	return 1
+}
+
+runtime_asset_cache_exists_for_targets() {
+	local target goos goarch
+	for target in "$@"; do
+		goos="${target%%/*}"
+		goarch="${target##*/}"
+		if runtime_asset_cache_exists_for_target "$goos" "$goarch"; then
+			return 0
+		fi
+	done
 	return 1
 }
 
@@ -283,8 +336,9 @@ prepare_target_runtime_assets() {
 	mkdir -p "$RUNTIME_CACHE_DIR"
 	lagrange_url="$(resolve_lagrange_url "$goos" "$goarch")"
 	if [[ -n "$lagrange_url" ]]; then
-		local lagrange_zip="$RUNTIME_CACHE_DIR/Lagrange.OneBot.${target}.zip"
+		local lagrange_zip
 		local lagrange_dir="$RUNTIME_CACHE_DIR/lagrange.${target}"
+		lagrange_zip="$(lagrange_cache_file_for_target "$goos" "$goarch")"
 		if download_file_with_cache "$lagrange_url" "$lagrange_zip" "Lagrange ${goos}/${goarch}" &&
 			sync_cached_archive_dir "$lagrange_zip" "$lagrange_dir" "Lagrange ${goos}/${goarch}"; then
 			TARGET_LAGRANGE_DIR="$lagrange_dir"
@@ -299,11 +353,11 @@ prepare_target_runtime_assets() {
 	milky_url="$(resolve_milky_url "$goos" "$goarch")"
 	if [[ -n "$milky_url" ]]; then
 		local milky_source_name="lagrangeV2"
-		local milky_cache_file="$RUNTIME_CACHE_DIR/lagrangeV2.${target}"
+		local milky_cache_file
 		local milky_dir="$RUNTIME_CACHE_DIR/milky.${target}"
+		milky_cache_file="$(milky_cache_file_for_target "$goos" "$goarch")"
 		if [[ "$goos" == "windows" ]]; then
 			milky_source_name="lagrangeV2.exe"
-			milky_cache_file="${milky_cache_file}.exe"
 		fi
 		if download_file_with_cache "$milky_url" "$milky_cache_file" "Milky ${goos}/${goarch}" &&
 			sync_cached_file_dir "$milky_cache_file" "$milky_dir" "$milky_source_name" "Milky ${goos}/${goarch}"; then
@@ -575,6 +629,17 @@ else
 	done
 fi
 
+if [[ "$PACK_RUNTIME_ASSETS" == "1" ]] && runtime_asset_cache_exists_for_targets "${TARGETS[@]}"; then
+	read -r -p "是否重新下载内置客户端文件 [y/N]: " REDOWNLOAD_RUNTIME_ASSETS_INPUT
+	if [[ "${REDOWNLOAD_RUNTIME_ASSETS_INPUT}" =~ ^[Yy]$ ]]; then
+		REDOWNLOAD_RUNTIME_ASSETS=1
+	else
+		REDOWNLOAD_RUNTIME_ASSETS=0
+	fi
+else
+	REDOWNLOAD_RUNTIME_ASSETS=1
+fi
+
 read -r -p "是否启用 CGO？[y/N]: " ENABLE_CGO_INPUT
 if [[ "${ENABLE_CGO_INPUT}" =~ ^[Yy]$ ]]; then
 	CGO_ENABLED_VALUE=1
@@ -634,6 +699,14 @@ else
 	echo "[Build] 警告：签名私钥文件不存在或为空，跳过注入：$SIGN_KEY_FILE"
 fi
 
+# 处理签名服务 V3 URL (SealSignV3Url)
+if [[ -s "$SIGN_V3_URL_FILE" ]]; then
+	echo "[Build] 已找到签名服务 V3 URL 文件：$SIGN_V3_URL_FILE"
+	SIGN_V3_URL_CONTENT="$(tr -d '[:space:]' <"$SIGN_V3_URL_FILE")"
+else
+	echo "[Build] 警告：签名服务 V3 URL 文件不存在或为空，跳过注入：$SIGN_V3_URL_FILE"
+fi
+
 LDFLAGS="-s -w"
 LDFLAGS+=" -X Scardice-core/dice.VERSION_MAIN=${VERSION_MAIN}"
 LDFLAGS+=" -X Scardice-core/dice.VERSION_PRERELEASE=${VERSION_PRERELEASE}"
@@ -656,6 +729,13 @@ if [[ -n "${SIGN_KEY_CONTENT:-}" ]] && rg -q "SealSignClientPrivateKey" ./dice .
 	echo "[Build] 已通过 ldflags 注入 SealSignClientPrivateKey"
 else
 	echo "[Build] 警告：未找到 SealSignClientPrivateKey 符号或内容为空，跳过注入"
+fi
+
+if [[ -n "${SIGN_V3_URL_CONTENT:-}" ]] && rg -q "SealSignV3Url" ./dice ./main.go 2>/dev/null; then
+	LDFLAGS+=" -X 'Scardice-core/dice.SealSignV3Url=${SIGN_V3_URL_CONTENT}'"
+	echo "[Build] 已通过 ldflags 注入 SealSignV3Url"
+else
+	echo "[Build] 警告：未找到 SealSignV3Url 符号或内容为空，跳过注入"
 fi
 
 echo "[Build] VERSION_MAIN=${VERSION_MAIN}"
