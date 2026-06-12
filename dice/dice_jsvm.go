@@ -50,6 +50,44 @@ var (
 
 var taskTimeRe = regexp.MustCompile(`^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$`)
 
+func formatSourceLocationForLog(filename string, line int, column int) string {
+	filename = strings.TrimSpace(filepath.ToSlash(filename))
+	if filename == "" {
+		return ""
+	}
+	if line <= 0 {
+		return filename
+	}
+	if column <= 0 {
+		return fmt.Sprintf("%s:%d", filename, line)
+	}
+	return fmt.Sprintf("%s:%d:%d", filename, line, column)
+}
+
+func formatGojaStackFrameLocation(frame goja.StackFrame) string {
+	pos := frame.Position()
+	filename := pos.Filename
+	if filename == "" {
+		filename = frame.SrcName()
+	}
+	if filename == "" || filename == "<native>" {
+		return ""
+	}
+	return formatSourceLocationForLog(filename, pos.Line, pos.Column)
+}
+
+func captureJSCallSourceLocation(vm *goja.Runtime) string {
+	if vm == nil {
+		return ""
+	}
+	for _, frame := range vm.CaptureCallStack(16, nil) {
+		if location := formatGojaStackFrameLocation(frame); location != "" {
+			return location
+		}
+	}
+	return ""
+}
+
 var taskCronParser = cron.NewParser(
 	cron.SecondOptional |
 		cron.Minute |
@@ -384,7 +422,11 @@ func (d *Dice) JsInit() {
 		ext := vm.NewObject()
 		_ = seal.Set("ext", ext)
 		_ = ext.Set("newCmdItemInfo", func() *CmdItemInfo {
-			return &CmdItemInfo{IsJsSolveFunc: true, JSLoopVersion: versionID}
+			return &CmdItemInfo{
+				IsJsSolveFunc:  true,
+				JSLoopVersion:  versionID,
+				SourceLocation: captureJSCallSourceLocation(vm),
+			}
 		})
 		_ = ext.Set("newCmdExecuteResult", func(solved bool) CmdExecuteResult {
 			return CmdExecuteResult{
@@ -425,6 +467,9 @@ func (d *Dice) JsInit() {
 			}
 
 			extName := realExt.Name
+			if realExt.Source == nil {
+				realExt.Source = d.JsLoadingScript
+			}
 
 			// 1. 查找或创建 wrapper
 			var wrapper *ExtInfo
@@ -436,6 +481,7 @@ func (d *Dice) JsInit() {
 				wrapper.IsDeleted = false         // 重新激活（清除删除标记）
 				wrapper.dice = d                  // 确保 dice 引用正确（可能从配置恢复时为 nil）
 				wrapper.JSLoopVersion = versionID // 同步新的 loop 版本号，避免 callWithJsCheck 时版本不匹配
+				wrapper.Source = realExt.Source
 			} else {
 				// 首次加载：创建新 wrapper
 				wrapper = &ExtInfo{
@@ -451,6 +497,7 @@ func (d *Dice) JsInit() {
 					Brief:         "一个JS自定义扩展",
 					Official:      realExt.Official,
 					CmdMap:        CmdMapCls{},
+					Source:        realExt.Source,
 					JSLoopVersion: versionID,
 					dice:          d,
 				}

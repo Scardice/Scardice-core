@@ -300,8 +300,9 @@ func TestCommandSolveReturnsFailedWhenSingleCandidateNotSolved(t *testing.T) {
 		Name: "dnd5e",
 		CmdMap: CmdMapCls{
 			commandName: {
-				Name: commandName,
-				Raw:  true,
+				Name:           commandName,
+				Raw:            true,
+				SourceLocation: "scripts/test-plugin.js:12:3",
 				Solve: func(_ *MsgContext, _ *Message, _ *CmdArgs) CmdExecuteResult {
 					hit++
 					return CmdExecuteResult{Matched: true, Solved: false}
@@ -317,8 +318,181 @@ func TestCommandSolveReturnsFailedWhenSingleCandidateNotSolved(t *testing.T) {
 	if result.Status != commandSolveFailed {
 		t.Fatalf("expected failed status, got %v", result.Status)
 	}
+	if !result.ExecuteMatched || result.ExecuteSolved {
+		t.Fatalf("expected execute result Match=true Solved=false, got Match=%v Solved=%v", result.ExecuteMatched, result.ExecuteSolved)
+	}
+	if result.ExecuteLocation != "scripts/test-plugin.js:12:3" {
+		t.Fatalf("expected execute location to be preserved, got %q", result.ExecuteLocation)
+	}
 	if hit != 1 {
 		t.Fatalf("expected command to execute once, got %d", hit)
+	}
+}
+
+func TestCommandSolveReturnsUnmatchedWhenSingleCandidateDeclinesMatch(t *testing.T) {
+	commandName := "rolltest"
+	hit := 0
+
+	session, ctx := newCommandSolveTestSessionAndContext("", nil)
+	session.Parent.CmdMap[commandName] = &CmdItemInfo{
+		Name: commandName,
+		Raw:  true,
+		Solve: func(_ *MsgContext, _ *Message, _ *CmdArgs) CmdExecuteResult {
+			hit++
+			return CmdExecuteResult{Matched: false, Solved: false}
+		},
+	}
+
+	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})
+
+	if result.Status != commandSolveUnmatched {
+		t.Fatalf("expected unmatched status, got %v", result.Status)
+	}
+	if result.IgnoreReason != commandIgnoreReasonCandidateDeclined {
+		t.Fatalf("expected candidate declined reason, got %q", result.IgnoreReason)
+	}
+	if got := formatCommandIgnoreReasonForInfo(result); got != "指令已匹配但本次不响应" {
+		t.Fatalf("expected candidate declined info text, got %q", got)
+	}
+	if result.ExecuteMatched || result.ExecuteSolved {
+		t.Fatalf("expected execute result Match=false Solved=false, got Match=%v Solved=%v", result.ExecuteMatched, result.ExecuteSolved)
+	}
+	if hit != 1 {
+		t.Fatalf("expected command to execute once, got %d", hit)
+	}
+}
+
+func TestFormatCommandFailureForInfoPutsErrorOnNewLineAfterLocation(t *testing.T) {
+	result := commandSolveResult{
+		ExecuteMatched:  true,
+		ExecuteSolved:   false,
+		ExecuteLocation: "data/default/scripts/command_enhance_coverage_test.js:36:38",
+		ExecuteError:    "invalid solve result: missing matched/solved/showHelp",
+	}
+
+	got := formatCommandFailureForInfo("cmdenh", result)
+	want := "指令[cmdenh]执行失败 Match:true Solved:false Location:data/default/scripts/command_enhance_coverage_test.js:36:38\nError:invalid solve result: missing matched/solved/showHelp"
+	if got != want {
+		t.Fatalf("expected formatted failure log %q, got %q", want, got)
+	}
+}
+
+func TestCommandSolveIgnoreReasonBotOffForCoreCommand(t *testing.T) {
+	commandName := "rolltest"
+	session, ctx := newCommandSolveTestSessionAndContext("", nil)
+	ctx.IsCurGroupBotOn = false
+	ctx.Group.Active = false
+	session.Parent.CmdMap[commandName] = &CmdItemInfo{Name: commandName}
+
+	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})
+
+	if result.Status != commandSolveUnmatched {
+		t.Fatalf("expected unmatched status, got %v", result.Status)
+	}
+	if result.IgnoreReason != commandIgnoreReasonBotOff {
+		t.Fatalf("expected bot off reason, got %q", result.IgnoreReason)
+	}
+	if got := formatCommandIgnoreReasonForInfo(result); got != "骰子未在当前群开启" {
+		t.Fatalf("unexpected info reason: %s", got)
+	}
+}
+
+func TestCommandSolveIgnoreReasonInactiveExtension(t *testing.T) {
+	commandName := "rolltest"
+	ext := &ExtInfo{
+		Name: "coc7",
+		CmdMap: CmdMapCls{
+			commandName: {Name: commandName},
+		},
+		DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
+	}
+
+	session, ctx := newCommandSolveTestSessionAndContext("", nil)
+	ctx.Dice.ExtList = []*ExtInfo{ext}
+
+	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})
+
+	if result.Status != commandSolveUnmatched {
+		t.Fatalf("expected unmatched status, got %v", result.Status)
+	}
+	if result.IgnoreReason != commandIgnoreReasonExtensionInactive {
+		t.Fatalf("expected inactive extension reason, got %q", result.IgnoreReason)
+	}
+	if len(result.InactiveSources) != 1 || result.InactiveSources[0] != "coc7" {
+		t.Fatalf("expected inactive source coc7, got %v", result.InactiveSources)
+	}
+	if got := formatCommandIgnoreReasonForInfo(result); got != "相关扩展未开启: coc7" {
+		t.Fatalf("unexpected info reason: %s", got)
+	}
+}
+
+func TestCommandSolveIgnoreReasonDisabledExtensionCommand(t *testing.T) {
+	commandName := "rolltest"
+	ext := &ExtInfo{
+		Name: "coc7",
+		CmdMap: CmdMapCls{
+			commandName: {Name: commandName},
+		},
+		DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{commandName: true}},
+	}
+
+	session, ctx := newCommandSolveTestSessionAndContext("", []*ExtInfo{ext})
+	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})
+
+	if result.Status != commandSolveBlocked {
+		t.Fatalf("expected blocked status, got %v", result.Status)
+	}
+	if result.IgnoreReason != commandIgnoreReasonCommandDisabled {
+		t.Fatalf("expected command disabled reason, got %q", result.IgnoreReason)
+	}
+	if len(result.DisabledSources) != 1 || result.DisabledSources[0] != "coc7.rolltest" {
+		t.Fatalf("expected disabled source coc7.rolltest, got %v", result.DisabledSources)
+	}
+	if got := formatCommandIgnoreReasonForInfo(result); got != "扩展指令已禁用: coc7.rolltest" {
+		t.Fatalf("unexpected info reason: %s", got)
+	}
+}
+
+func TestCommandSolveIgnoreReasonUnknownCommand(t *testing.T) {
+	session, ctx := newCommandSolveTestSessionAndContext("", nil)
+	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: "missing"})
+
+	if result.Status != commandSolveUnmatched {
+		t.Fatalf("expected unmatched status, got %v", result.Status)
+	}
+	if result.IgnoreReason != commandIgnoreReasonUnknownCommand {
+		t.Fatalf("expected unknown command reason, got %q", result.IgnoreReason)
+	}
+	if got := formatCommandIgnoreReasonForInfo(result); got != "指令不存在" {
+		t.Fatalf("unexpected info reason: %s", got)
+	}
+}
+
+func TestCommandSolveIgnoreReasonMentionOther(t *testing.T) {
+	commandName := "rolltest"
+	session, ctx := newCommandSolveTestSessionAndContext("", nil)
+	session.Parent.CmdMap[commandName] = &CmdItemInfo{Name: commandName}
+
+	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{
+		Command:                    commandName,
+		SomeoneBeMentionedButNotMe: true,
+	})
+
+	if result.Status != commandSolveUnmatched {
+		t.Fatalf("expected unmatched status, got %v", result.Status)
+	}
+	if result.IgnoreReason != commandIgnoreReasonMentionOther {
+		t.Fatalf("expected mention other reason, got %q", result.IgnoreReason)
+	}
+	if got := formatCommandIgnoreReasonForInfo(result); got != "指令目标不是当前骰子" {
+		t.Fatalf("unexpected info reason: %s", got)
+	}
+}
+
+func TestFormatCommandIgnoreReasonForPrivateUnavailable(t *testing.T) {
+	result := commandSolveResult{IgnoreReason: commandIgnoreReasonPrivateUnavailable}
+	if got := formatCommandIgnoreReasonForInfo(result); got != "该指令不能在私聊使用" {
+		t.Fatalf("unexpected info reason: %s", got)
 	}
 }
 

@@ -15,7 +15,7 @@ func RegisterBuiltinExtTemple(dice *Dice) {
 				Name: "command",
 				Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 					// do something
-					return CmdExecuteResult{Matched: true, Solved: false}
+					return CmdExecuteResult{Matched: true, Solved: true}
 				},
 			},
 		},
