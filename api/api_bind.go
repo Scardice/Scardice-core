@@ -480,12 +480,22 @@ type getConfigResp map[string]*apiPluginConfig
 
 type setConfigReq map[string]*apiPluginConfig
 
+type setConfigSingleReq struct {
+	PluginName string      `json:"pluginName"`
+	Key        string      `json:"key"`
+	Value      interface{} `json:"value"`
+}
+
 func handleGetConfigs(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
 	}
+	pluginName := c.QueryParam("pluginName")
 	resp := getConfigResp{}
 	for k, v := range myDice.ConfigManager.Plugins {
+		if pluginName != "" && k != pluginName {
+			continue
+		}
 		configs := make([]*dice.ConfigItem, 0, len(v.OrderedConfigKeys))
 		for _, key := range v.OrderedConfigKeys {
 			configs = append(configs, v.Configs[key])
@@ -526,6 +536,22 @@ func handleSetConfigs(c echo.Context) error {
 			return e.Error()
 		}), "\n")
 		return c.JSON(http.StatusInternalServerError, errMsg)
+	}
+	return c.JSON(http.StatusOK, nil)
+}
+
+func handleSetConfig(c echo.Context) error {
+	if !doAuth(c) {
+		return c.JSON(http.StatusForbidden, nil)
+	}
+	var data setConfigSingleReq
+	err := c.Bind(&data)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "Failed to parse data")
+	}
+	err = myDice.ConfigManager.SetConfig(data.PluginName, data.Key, data.Value)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(http.StatusOK, nil)
 }
@@ -732,6 +758,7 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 	e.POST(prefix+"/js/update", jsUpdate)
 	e.GET(prefix+"/js/get_configs", handleGetConfigs)
 	e.POST(prefix+"/js/set_configs", handleSetConfigs)
+	e.POST(prefix+"/js/set_config", handleSetConfig)
 	e.POST(prefix+"/js/delete_unused_configs", handleDeleteUnusedConfigs)
 	e.POST(prefix+"/js/reset_config", handleResetConfig)
 
