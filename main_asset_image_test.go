@@ -18,9 +18,7 @@ import (
 func runAssetImageHandler(t *testing.T, token string, reqPath string) (int, string) {
 	t.Helper()
 	dir := t.TempDir()
-	origWd, _ := os.Getwd()
-	t.Cleanup(func() { _ = os.Chdir(origWd) })
-	_ = os.Chdir(dir)
+	t.Chdir(dir)
 
 	imgDir := filepath.Join("data", "images")
 	_ = os.MkdirAll(imgDir, 0o755)
