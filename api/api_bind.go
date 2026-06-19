@@ -671,6 +671,7 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 	e.POST(prefix+"/im_connections/del", ImConnectionsDel)
 	e.POST(prefix+"/im_connections/set_enable", ImConnectionsSetEnable)
 	e.POST(prefix+"/im_connections/set_data", ImConnectionsSetData)
+	e.GET(prefix+"/im_connections/asset_base_url", ImConnectionsGetAssetBaseURL)
 	e.GET(prefix+"/im_connections/get_lgr_signinfo", ImConnectionsGetSignInfo)
 	e.POST(prefix+"/im_connections/gocqhttpRelogin", ImConnectionsGocqhttpRelogin)
 	e.POST(prefix+"/im_connections/walleQRelogin", ImConnectionsWalleQRelogin)

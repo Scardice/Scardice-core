@@ -14,7 +14,8 @@ func TestConvertSealMsgToMessageChain_AtElement(t *testing.T) {
 		&message.AtElement{Target: "2930699167"},
 	}
 
-	chain, cq := convertSealMsgToMessageChain(input)
+	p := &PlatformAdapterOnebot{}
+	chain, cq := p.convertSealMsgToMessageChain(input)
 	if cq != "[CQ:at,qq=2930699167]" {
 		t.Fatalf("unexpected cq output: %q", cq)
 	}

@@ -7,11 +7,12 @@ import (
 )
 
 type AddOnebotEcho struct {
-	Token         string
-	ConnectURL    string
-	ReverseURL    string
-	ReverseSuffix string
-	Mode          string
+	Token             string
+	ConnectURL        string
+	ReverseURL        string
+	ReverseSuffix     string
+	Mode              string
+	ImageAssetBaseURL string
 }
 
 func NewOnebotConnItem(v AddOnebotEcho) *EndPointInfo {
@@ -25,12 +26,13 @@ func NewOnebotConnItem(v AddOnebotEcho) *EndPointInfo {
 		v.ReverseSuffix = "/ws"
 	}
 	conn.Adapter = &PlatformAdapterOnebot{
-		EndPoint:      conn,
-		Token:         v.Token,
-		ConnectURL:    v.ConnectURL,
-		ReverseSuffix: v.ReverseSuffix,
-		ReverseUrl:    v.ReverseURL,
-		Mode:          v.Mode,
+		EndPoint:          conn,
+		Token:             v.Token,
+		ConnectURL:        v.ConnectURL,
+		ReverseSuffix:     v.ReverseSuffix,
+		ReverseUrl:        v.ReverseURL,
+		Mode:              v.Mode,
+		ImageAssetBaseURL: v.ImageAssetBaseURL,
 	}
 	return conn
 }

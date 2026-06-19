@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/labstack/echo/v4"
@@ -100,6 +101,9 @@ func ImConnectionsSetData(c echo.Context) error {
 		UseSignServer       bool   `json:"useSignServer"`
 		ExtraArgs           string `json:"extraArgs"`
 		SignServerConfig    *dice.SignServerConfig
+		// ImageAssetBaseURL 仅 pureonebot 适配器使用。
+		// 未传(nil)不改，传空字符串清空回自动推导
+		ImageAssetBaseURL *string `json:"imageAssetBaseUrl"`
 	}{}
 
 	err := c.Bind(&v)
@@ -122,6 +126,16 @@ func ImConnectionsSetData(c echo.Context) error {
 		case "pureonebot":
 			ad := i.Adapter.(*dice.PlatformAdapterOnebot)
 			ad.IgnoreFriendRequest = v.IgnoreFriendRequest
+			if v.ImageAssetBaseURL != nil {
+				url := strings.TrimSpace(*v.ImageAssetBaseURL)
+				if url != "" && !isValidAssetBaseURL(url) {
+					return c.JSON(http.StatusBadRequest, map[string]string{
+						"error": "imageAssetBaseUrl must start with http:// or https://",
+					})
+				}
+				ad.ImageAssetBaseURL = url
+				ad.InvalidateDerivedBaseURL()
+			}
 		default:
 			ad := i.Adapter.(*dice.PlatformAdapterGocq)
 			if i.ProtocolType != "onebot" {
@@ -141,6 +155,40 @@ func ImConnectionsSetData(c echo.Context) error {
 	}
 	myDice.Save(false)
 	return c.JSON(http.StatusNotFound, nil)
+}
+
+// ImConnectionsGetAssetBaseURL 返回 OneBot 适配器的图片资源 base URL（自动推导或用户配置）。
+// 响应：{imageAssetBaseUrl, auto, candidates?}
+func ImConnectionsGetAssetBaseURL(c echo.Context) error {
+	if !doAuth(c) {
+		return c.JSON(http.StatusForbidden, nil)
+	}
+	id := c.QueryParam("id")
+	for _, ep := range myDice.ImSession.EndPoints {
+		if ep.ID != id || ep.ProtocolType != "pureonebot" {
+			continue
+		}
+		ad, ok := ep.Adapter.(*dice.PlatformAdapterOnebot)
+		if !ok {
+			return c.JSON(http.StatusNotFound, nil)
+		}
+		url, candidates := ad.DeriveImageAssetBaseURLForDisplay()
+		auto := ad.ImageAssetBaseURL == ""
+		return c.JSON(http.StatusOK, map[string]interface{}{
+			"imageAssetBaseUrl": url,
+			"auto":              auto,
+			"candidates":        candidates,
+		})
+	}
+	return c.JSON(http.StatusNotFound, nil)
+}
+
+// isValidAssetBaseURL 校验 base URL 必须是 http/https scheme，拒绝 file:// javascript: 等。
+func isValidAssetBaseURL(s string) bool {
+	if !strings.HasPrefix(s, "http://") && !strings.HasPrefix(s, "https://") {
+		return false
+	}
+	return true
 }
 
 func ImConnectionsGetSignInfo(c echo.Context) error {

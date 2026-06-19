@@ -283,11 +283,12 @@ func FormatDiceIDQQChGroup(guildID, channelID string) string {
 	return fmt.Sprintf("QQ-CH-Group:%s-%s", guildID, channelID)
 }
 
+// urlSchemeRegexp 匹配 URI scheme 前缀（如 http://、file://、base64://、HTTP://）
+// 大小写不敏感（RFC 3986 scheme 生产式: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )）
+var urlSchemeRegexp = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+\-.]*://`)
+
 func hasURLScheme(text string) bool {
-	// 正则表达式匹配三种情况：file URI、http(s) URL 和 base64 URI
-	regex := `^[a-z]+://`
-	match, _ := regexp.MatchString(regex, text)
-	return match
+	return urlSchemeRegexp.MatchString(text)
 }
 
 func tryParseOneBot11ArrayMessage(log *zap.SugaredLogger, message string, writeTo *MessageQQ) error {

@@ -61,6 +61,17 @@ type PlatformAdapterOnebot struct {
 
 	sm             *loopfsm.FSM
 	desiredEnabled bool
+
+	// ImageAssetBaseURL 是 OneBot 协议端访问本端静态资源的 base URL。
+	// 留空则自动推导（见 deriveImageAssetBaseURL）。
+	// 示例: "http://172.21.0.1:3211" 或 "http://scardice-core:3211"
+	// 鉴权 token 不在此字段，运行时由 DiceManager.AssetImageToken 提供。
+	ImageAssetBaseURL string `json:"imageAssetBaseUrl" yaml:"imageAssetBaseUrl"`
+
+	// 自动推导缓存：ImageAssetBaseURL 为空时用一次推导结果复用，避免每次发图枚举网卡
+	// 用 sync.Mutex 保护（而非 sync.Once），便于 invalidate 时安全重置。
+	cachedDerivedBaseURL string
+	derivedURLMu         sync.Mutex
 }
 
 func (p *PlatformAdapterOnebot) Serve() int {
@@ -72,12 +83,14 @@ func (p *PlatformAdapterOnebot) Serve() int {
 
 // DoRelogin 重新登录/重连
 func (p *PlatformAdapterOnebot) DoRelogin() bool {
+	p.invalidateDerivedBaseURL()
 	p.logger.Warn("因协议端不支持所谓重新登录，重新登录功能无实际用途。")
 	return true
 }
 
 // SetEnable 启用或禁用适配器
 func (p *PlatformAdapterOnebot) SetEnable(enable bool) {
+	p.invalidateDerivedBaseURL()
 	p.ensureFSM()
 	if enable {
 		p.logger.Info("正在启用 OneBot 适配器...")
@@ -240,7 +253,7 @@ func (p *PlatformAdapterOnebot) SendSegmentToGroup(ctx *MsgContext, groupID stri
 		if emitted || !sentAnything || p.Session == nil || p.EndPoint == nil {
 			return
 		}
-		_, sentMsgText := convertSealMsgToMessageChain(sentSegments)
+		_, sentMsgText := p.convertSealMsgToMessageChain(sentSegments)
 		p.Session.OnMessageSend(ctx, &Message{
 			Platform:    "QQ",
 			MessageType: "group",
@@ -263,7 +276,7 @@ func (p *PlatformAdapterOnebot) SendSegmentToGroup(ctx *MsgContext, groupID stri
 		}
 		batch := make([]message.IMessageElement, len(pendingMsg))
 		copy(batch, pendingMsg)
-		rawMsg, _ := convertSealMsgToMessageChain(batch)
+		rawMsg, _ := p.convertSealMsgToMessageChain(batch)
 		var err error
 		sendRes, err := p.sendEmitter.SendGrMsg(p.ctx, ExtractQQEmitterGroupID(groupID), rawMsg) // 这里可以获取到发送消息的ID
 		if err != nil {
@@ -352,7 +365,7 @@ func (p *PlatformAdapterOnebot) SendSegmentToPerson(ctx *MsgContext, userID stri
 		if emitted || !sentAnything || p.Session == nil || p.EndPoint == nil {
 			return
 		}
-		_, sentMsgText := convertSealMsgToMessageChain(sentSegments)
+		_, sentMsgText := p.convertSealMsgToMessageChain(sentSegments)
 		p.Session.OnMessageSend(ctx, &Message{
 			Platform:    "QQ",
 			MessageType: "private",
@@ -374,7 +387,7 @@ func (p *PlatformAdapterOnebot) SendSegmentToPerson(ctx *MsgContext, userID stri
 		}
 		batch := make([]message.IMessageElement, len(pendingMsg))
 		copy(batch, pendingMsg)
-		rawMsg, _ := convertSealMsgToMessageChain(batch)
+		rawMsg, _ := p.convertSealMsgToMessageChain(batch)
 		var err error
 		sendRes, err := p.sendEmitter.SendPvtMsg(p.ctx, ExtractQQEmitterUserID(userID), rawMsg) // 这里可以获取到发送消息的ID
 		if err != nil {

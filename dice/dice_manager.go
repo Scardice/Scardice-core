@@ -51,6 +51,10 @@ type DiceManager struct { //nolint:revive
 	AccessTokens   SyncMap[string, bool]
 	IsReady        bool
 
+	// AssetImageToken 是 /assets-img/:token/* 静态路由的鉴权 token。
+	// 启动时生成一次，进程生命周期内固定
+	AssetImageToken string `yaml:"-" json:"-"`
+
 	AutoBackupEnable    bool
 	AutoBackupTime      string
 	AutoBackupSelection BackupSelection
@@ -181,6 +185,12 @@ func (dm *DiceManager) LoadDice() {
 	if dm.UIPasswordSalt == "" {
 		// 旧版本升级，或新用户
 		dm.UIPasswordSalt = RandStringBytesMaskImprSrcSB2(32)
+	}
+	if dm.AssetImageToken == "" {
+		// 静态资源路由鉴权 token，crypto/rand 生成，不写日志/配置
+		if tok, err := generateCryptoToken(32); err == nil {
+			dm.AssetImageToken = tok
+		}
 	}
 	dm.AutoBackupEnable = true
 	dm.AutoBackupTime = "@every 12h" // 每12小时一次
