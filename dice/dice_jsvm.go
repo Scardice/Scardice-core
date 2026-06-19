@@ -43,6 +43,7 @@ import (
 	sealabort "Scardice-core/utils/plugin/abort"
 	sealcrypto "Scardice-core/utils/plugin/crypto"
 	sealhttp "Scardice-core/utils/plugin/httpextra"
+	sealsclone "Scardice-core/utils/plugin/structuredclone"
 	sealutil "Scardice-core/utils/plugin/utilinspect"
 	sealws "Scardice-core/utils/plugin/websocket"
 )
@@ -362,6 +363,7 @@ func (d *Dice) JsInit() {
 	reg.RegisterNativeModule("crypto", sealcrypto.Require)
 	reg.RegisterNativeModule("@seal/abort", sealabort.Require)
 	reg.RegisterNativeModule("@seal/http", sealhttp.Require)
+	reg.RegisterNativeModule("@seal/structuredclone", sealsclone.Require)
 	reg.RegisterNativeModule("@seal/utilinspect", sealutil.Require)
 
 	d.JsScriptCron = cron.New(cron.WithParser(taskCronParser))
@@ -387,6 +389,7 @@ func (d *Dice) JsInit() {
 		url.Enable(vm)
 		sealabort.Enable(vm)
 		sealhttp.Enable(vm)
+		sealsclone.Enable(vm)
 		sealutil.Enable(vm)
 		utilMod := vm.NewObject()
 		utilExports := vm.NewObject()
