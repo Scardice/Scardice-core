@@ -1,8 +1,13 @@
 package dice
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -857,7 +862,208 @@ func string2array(parseContent gjson.Result) (gjson.Result, error) {
 	return gjson.Parse(tempStr), nil
 }
 
-func convertSealMsgToMessageChain(msg []message.IMessageElement) (schema.MessageChain, string) {
+const (
+	OnebotAssetInlineThreshold = 200 * 1024       // 200KB，小于此值 base64 内嵌
+	OnebotAssetMaxSize         = 10 * 1024 * 1024 // 10MB 硬上限，拒绝超大文件防 OOM
+)
+
+// onebotAssetInlineThreshold / onebotAssetMaxSize 为包内兼容别名。
+const onebotAssetInlineThreshold = OnebotAssetInlineThreshold
+const onebotAssetMaxSize = OnebotAssetMaxSize
+
+// deriveImageAssetBaseURL 在用户未显式配置 ImageAssetBaseURL 时，
+// 从本端 ServeAddress 提取端口 + 枚举非 loopback IPv4，自动推导出协议端可访问的 base URL。
+// 结果缓存到 p.cachedDerivedBaseURL
+// 返回值不含末尾斜杠，形如 "http://172.21.0.5:3211"。
+func (p *PlatformAdapterOnebot) deriveImageAssetBaseURL() string {
+	p.derivedURLMu.Lock()
+	defer p.derivedURLMu.Unlock()
+	if p.cachedDerivedBaseURL != "" {
+		return p.cachedDerivedBaseURL
+	}
+	url, _ := p.computeDerivedBaseURL(true)
+	p.cachedDerivedBaseURL = url
+	return url
+}
+
+// DeriveImageAssetBaseURLForDisplay 仅供 API/UI 展示用，不写缓存，额外返回候选 IP 列表。
+// 当用户已显式配置 ImageAssetBaseURL 时，返回 (用户配置值, nil)。
+func (p *PlatformAdapterOnebot) DeriveImageAssetBaseURLForDisplay() (string, []string) {
+	if p.ImageAssetBaseURL != "" {
+		return p.ImageAssetBaseURL, nil
+	}
+	url, candidates := p.computeDerivedBaseURL(false)
+	return url, candidates
+}
+
+// invalidateDerivedBaseURL 清空自动推导缓存。
+// 在 SetData / DoRelogin / SetEnable 等可能影响推导结果的时机调用。
+func (p *PlatformAdapterOnebot) invalidateDerivedBaseURL() {
+	p.derivedURLMu.Lock()
+	defer p.derivedURLMu.Unlock()
+	p.cachedDerivedBaseURL = ""
+}
+
+// InvalidateDerivedBaseURL 是 invalidateDerivedBaseURL 的 exported 版本，供 api 包调用。
+func (p *PlatformAdapterOnebot) InvalidateDerivedBaseURL() {
+	p.invalidateDerivedBaseURL()
+}
+
+// computeDerivedBaseURL 是底层推导逻辑。
+// 参数 withWarn：首次推导时是否打 warn 日志（列出候选+选中+提示）。
+// 返回 (选中的 baseURL, 候选 IP 列表)。
+func (p *PlatformAdapterOnebot) computeDerivedBaseURL(withWarn bool) (string, []string) {
+	port := p.extractServePort()
+	candidates := enumNonLoopbackIPv4()
+	if len(candidates) == 0 {
+		if withWarn {
+			p.logger.Warnf("OneBot 自动推导 ImageAssetBaseURL: 未找到非 loopback IPv4，使用 127.0.0.1 兜底（跨容器场景需手动配置 imageAssetBaseUrl）")
+		}
+		return "http://127.0.0.1:" + port, nil
+	}
+	chosen := candidates[0]
+	if withWarn {
+		p.logger.Warnf("OneBot 自动推导 ImageAssetBaseURL: 选中 http://%s:%s（候选: %s）。如协议端无法访问请手动配置 imageAssetBaseUrl",
+			chosen, port, strings.Join(candidates, ", "))
+	}
+	return "http://" + chosen + ":" + port, candidates
+}
+
+// extractServePort 从 DiceManager.ServeAddress 提取端口，默认 3211。
+func (p *PlatformAdapterOnebot) extractServePort() string {
+	addr := ""
+	if p.Session != nil && p.Session.Parent != nil && p.Session.Parent.Parent != nil {
+		addr = p.Session.Parent.Parent.ServeAddress
+	}
+	if addr == "" {
+		return "3211"
+	}
+	// 形如 0.0.0.0:3211 / 127.0.0.1:3211 / :3211 / 0.0.0.0:3211
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil || port == "" {
+		return "3211"
+	}
+	// SplitHostPort 对 "1.2.3.4:notaport" 会返回 port="notaport"，需校验数字
+	if n, err := strconv.Atoi(port); err != nil || n <= 0 || n > 65535 {
+		return "3211"
+	}
+	return port
+}
+
+// enumNonLoopbackIPv4 枚举当前容器内所有非 loopback、非 link-local 的 IPv4 地址。
+// 过滤 docker0 默认网关 172.17.0.1 返回排序稳定的 IP 字符串列表
+func enumNonLoopbackIPv4() []string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok || ipNet.IP.IsLoopback() {
+			continue
+		}
+		v4 := ipNet.IP.To4()
+		if v4 == nil {
+			continue
+		}
+		// 过滤 link-local 169.254.0.0/16
+		if v4[0] == 169 && v4[1] == 254 {
+			continue
+		}
+		// 过滤 docker0 默认网关 172.17.0.1（非容器自身 IP）
+		if v4[0] == 172 && v4[1] == 17 && v4[2] == 0 && v4[3] == 1 {
+			continue
+		}
+		out = append(out, v4.String())
+	}
+	return out
+}
+
+// resolveLocalAsset 将本地相对路径（如 "images/foo.png"）解析为 OneBot 协议端可访问的形式：
+//   - ≤ 200KB: base64 内嵌
+//   - > 200KB 且配置了 ImageAssetBaseURL: HTTP URL
+//   - > 200KB 未配置: 降级 base64（warn 日志）
+//
+// 路径必须落在 data/ 下，拒绝绝对路径、穿越和符号链接逃逸。
+func (p *PlatformAdapterOnebot) resolveLocalAsset(rel string) (string, error) {
+	rel = strings.TrimPrefix(rel, "./")
+	rel = filepath.Clean(rel)
+	rel = filepath.FromSlash(rel)
+	if filepath.IsAbs(rel) {
+		return "", fmt.Errorf("refuse absolute path: %s", rel)
+	}
+	// 防止裸 data/ 自身被当作文件访问
+	if rel == "data" || strings.HasPrefix(rel, "data/..") || strings.HasPrefix(rel, "..") {
+		return "", fmt.Errorf("path outside data: %s", rel)
+	}
+	absPath := filepath.Join(".", "data", rel)
+
+	// 符号链接防御：解析 absPath 的真实路径，验证仍落在 data/ 内。
+	absFile, errEval := filepath.EvalSymlinks(absPath)
+	if errEval != nil {
+		return "", fmt.Errorf("eval symlinks failed: %w", errEval)
+	}
+	absRootData, errData := filepath.EvalSymlinks(filepath.Join(".", "data"))
+	if errData != nil {
+		return "", fmt.Errorf("resolve data root failed: %w", errData)
+	}
+	if !strings.HasPrefix(absFile, absRootData+string(filepath.Separator)) {
+		return "", fmt.Errorf("path escapes data after symlink resolution: %s -> %s", absPath, absFile)
+	}
+
+	info, errStat := os.Stat(absFile)
+	if errStat != nil {
+		return "", fmt.Errorf("stat failed: %w", errStat)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("is directory: %s", rel)
+	}
+	if info.Size() > onebotAssetMaxSize {
+		return "", fmt.Errorf("file too large: %d bytes (max %d)", info.Size(), onebotAssetMaxSize)
+	}
+
+	if info.Size() <= onebotAssetInlineThreshold {
+		data, err := os.ReadFile(absFile)
+		if err != nil {
+			return "", fmt.Errorf("read failed: %w", err)
+		}
+		return "base64://" + base64.StdEncoding.EncodeToString(data), nil
+	}
+
+	baseURL := p.ImageAssetBaseURL
+	if baseURL == "" {
+		baseURL = p.deriveImageAssetBaseURL()
+	}
+
+	token := ""
+	if p.Session != nil && p.Session.Parent != nil && p.Session.Parent.Parent != nil {
+		token = p.Session.Parent.Parent.AssetImageToken
+	}
+
+	// baseURL 或 token 任一缺失 → 降级 base64
+	if baseURL == "" || token == "" {
+		p.logger.Warnf("OneBot 资源 %s 大小 %d 超阈值但 baseURL/token 不可用（baseURL=%q token=%d），使用 base64",
+			rel, info.Size(), baseURL, len(token))
+		data, err := os.ReadFile(absFile)
+		if err != nil {
+			return "", fmt.Errorf("read failed: %w", err)
+		}
+		return "base64://" + base64.StdEncoding.EncodeToString(data), nil
+	}
+	u, err := url.JoinPath(
+		strings.TrimRight(baseURL, "/"),
+		"assets-img",
+		token,
+		rel,
+	)
+	if err != nil {
+		return "", fmt.Errorf("build asset URL failed: %w", err)
+	}
+	return u, nil
+}
+
+func (p *PlatformAdapterOnebot) convertSealMsgToMessageChain(msg []message.IMessageElement) (schema.MessageChain, string) {
 	cqMessage := strings.Builder{}
 	rawMsg := schema.MessageChain{}
 	for _, v := range msg {
@@ -895,6 +1101,14 @@ func convertSealMsgToMessageChain(msg []message.IMessageElement) (schema.Message
 			if fileVal == "" {
 				continue
 			}
+			if !hasURLScheme(fileVal) {
+				if resolved, err := p.resolveLocalAsset(fileVal); err == nil {
+					fileVal = resolved
+				} else {
+					p.logger.Warnf("OneBot 发文件失败，跳过: %s err=%v", fileVal, err)
+					continue
+				}
+			}
 			rawMsg = rawMsg.File(fileVal)
 			_, _ = fmt.Fprintf(&cqMessage, "[CQ:file,file=%v]", fileVal)
 		case message.Image:
@@ -905,6 +1119,14 @@ func convertSealMsgToMessageChain(msg []message.IMessageElement) (schema.Message
 			url := res.URL
 			if res.URL == "" {
 				url = res.File.URL
+			}
+			if !hasURLScheme(url) {
+				if resolved, err := p.resolveLocalAsset(url); err == nil {
+					url = resolved
+				} else {
+					p.logger.Warnf("OneBot 发图失败，跳过: %s err=%v", url, err)
+					continue
+				}
 			}
 			rawMsg = rawMsg.Image(url)
 			_, _ = fmt.Fprintf(&cqMessage, "[CQ:image,file=%v]", url)
@@ -922,6 +1144,14 @@ func convertSealMsgToMessageChain(msg []message.IMessageElement) (schema.Message
 			}
 			if recordFile == "" {
 				continue
+			}
+			if !hasURLScheme(recordFile) {
+				if resolved, err := p.resolveLocalAsset(recordFile); err == nil {
+					recordFile = resolved
+				} else {
+					p.logger.Warnf("OneBot 发语音失败，跳过: %s err=%v", recordFile, err)
+					continue
+				}
 			}
 			rawMsg = rawMsg.Record(recordFile)
 			_, _ = fmt.Fprintf(&cqMessage, "[CQ:record,file=%v]", recordFile)

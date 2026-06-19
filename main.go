@@ -2,6 +2,7 @@ package main
 
 // _ "net/http/pprof"
 import (
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -739,9 +740,58 @@ func uiServe(dm *dice.DiceManager, hideUI bool, useBuiltin bool) {
 	}
 
 	api.Bind(e, dm)
+	if dm.AssetImageToken != "" {
+		registerAssetImageRoute(e, dm)
+	}
 	e.HideBanner = true // 关闭banner，原因是banner图案会改变终端光标位置
 
 	httpServe(e, dm, hideUI)
+}
+
+// onebotAssetMaxSize 与 dice 包常量保持一致，用于 HTTP handler 拒绝超大文件。
+const onebotAssetMaxSize = dice.OnebotAssetMaxSize
+
+// registerAssetImageRoute 注册 /assets-img/:token/* 静态资源路由，供 OneBot 协议端拉取本地图片/语音等。
+//   - token 鉴权（crypto/subtle.ConstantTimeCompare）
+//   - EvalSymlinks 防符号链接穿越
+//   - 10MB 硬上限防 OOM
+func registerAssetImageRoute(e *echo.Echo, dm *dice.DiceManager) {
+	expectedToken := dm.AssetImageToken
+	absRootData, errData := filepath.EvalSymlinks(filepath.Join(".", "data"))
+
+	e.GET("/assets-img/:token/*", func(c echo.Context) error {
+		if errData != nil || absRootData == "" {
+			return c.NoContent(http.StatusNotFound)
+		}
+		token := c.Param("token")
+		if subtle.ConstantTimeCompare([]byte(token), []byte(expectedToken)) != 1 {
+			return c.NoContent(http.StatusNotFound)
+		}
+		rel := filepath.Clean("/" + c.Param("*"))
+		rel = strings.TrimPrefix(rel, "/")
+		rel = filepath.FromSlash(rel)
+
+		if strings.HasPrefix(rel, "..") {
+			return c.NoContent(http.StatusNotFound)
+		}
+
+		absPath := filepath.Join(".", "data", rel)
+		absFile, err := filepath.EvalSymlinks(absPath)
+		if err != nil {
+			return c.NoContent(http.StatusNotFound)
+		}
+		if !strings.HasPrefix(absFile, absRootData+string(filepath.Separator)) {
+			return c.NoContent(http.StatusNotFound)
+		}
+		fi, err := os.Stat(absFile)
+		if err != nil || fi.IsDir() {
+			return c.NoContent(http.StatusNotFound)
+		}
+		if fi.Size() > onebotAssetMaxSize {
+			return c.NoContent(http.StatusRequestEntityTooLarge)
+		}
+		return c.File(absFile)
+	})
 }
 
 //

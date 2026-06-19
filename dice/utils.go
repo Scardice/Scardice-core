@@ -3,6 +3,8 @@ package dice
 import (
 	"archive/zip"
 	"bytes"
+	cryptorand "crypto/rand"
+	"encoding/base32"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -123,6 +125,16 @@ func RandStringBytesMaskImprSrcSB2(n int) string {
 	}
 
 	return sb.String()
+}
+
+// generateCryptoToken 生成 n 字节密码学安全随机字符串（base32 无填充，URL-safe）
+// 用于 AssetImageToken 等
+func generateCryptoToken(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := cryptorand.Read(b); err != nil {
+		return "", err
+	}
+	return base32.HexEncoding.WithPadding(base32.NoPadding).EncodeToString(b), nil
 }
 
 func JSONNumberUnmarshal(data []byte, v interface{}) error {
