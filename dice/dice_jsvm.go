@@ -22,9 +22,12 @@ import (
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/dop251/goja"
+	"github.com/dop251/goja_nodejs/buffer"
 	"github.com/dop251/goja_nodejs/console"
 	"github.com/dop251/goja_nodejs/eventloop"
 	"github.com/dop251/goja_nodejs/require"
+	"github.com/dop251/goja_nodejs/url"
+	"github.com/dop251/goja_nodejs/util"
 	esbuild "github.com/evanw/esbuild/pkg/api"
 	fetch "github.com/fy0/gojax/fetch"
 	"github.com/golang-module/carbon"
@@ -38,6 +41,7 @@ import (
 	"Scardice-core/utils/crypto"
 
 	sealcrypto "Scardice-core/utils/plugin/crypto"
+	sealutil "Scardice-core/utils/plugin/utilinspect"
 	sealws "Scardice-core/utils/plugin/websocket"
 )
 
@@ -354,6 +358,7 @@ func (d *Dice) JsInit() {
 	d.JsPrinter = printer
 	reg.RegisterNativeModule("console", console.RequireWithPrinter(printer))
 	reg.RegisterNativeModule("crypto", sealcrypto.Require)
+	reg.RegisterNativeModule("@seal/utilinspect", sealutil.Require)
 
 	d.JsScriptCron = cron.New(cron.WithParser(taskCronParser))
 	d.JsScriptCronLock = &sync.Mutex{}
@@ -373,6 +378,16 @@ func (d *Dice) JsInit() {
 		// require 模块
 		reg.Enable(vm)
 		sealcrypto.Enable(vm)
+
+		buffer.Enable(vm)
+		url.Enable(vm)
+		sealutil.Enable(vm)
+		utilMod := vm.NewObject()
+		utilExports := vm.NewObject()
+		_ = utilMod.Set("exports", utilExports)
+		util.Require(vm, utilMod)
+		_ = utilExports.Set("inspect", sealutil.Inspect(vm))
+		_ = vm.Set("util", utilExports)
 
 		seal := vm.NewObject()
 
