@@ -1156,7 +1156,10 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 									}
 									waitRun := make(chan int, 1)
 									loop.RunOnLoop(func(runtime *goja.Runtime) {
+										prev := mctx.Dice.JsCurrentPlugin
+										mctx.Dice.JsCurrentPlugin = i
 										defer func() {
+											mctx.Dice.JsCurrentPlugin = prev
 											if r := recover(); r != nil {
 												mctx.Dice.Logger.Errorf("扩展<%s>处理非指令消息异常: %v 堆栈: %v", i.Name, r, string(debug.Stack()))
 											}
@@ -1432,7 +1435,10 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 								}
 								waitRun := make(chan int, 1)
 								loop.RunOnLoop(func(runtime *goja.Runtime) {
+									prev := mctx.Dice.JsCurrentPlugin
+									mctx.Dice.JsCurrentPlugin = i
 									defer func() {
+										mctx.Dice.JsCurrentPlugin = prev
 										if r := recover(); r != nil {
 											mctx.Dice.Logger.Errorf("扩展<%s>处理非指令消息异常: %v 堆栈: %v", i.Name, r, string(debug.Stack()))
 										}
@@ -2798,9 +2804,14 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 			done := make(chan CmdExecuteResult, 1)
 			fail := make(chan error, 1)
 			loop.RunOnLoop(func(vm *goja.Runtime) {
+				prev := s.Parent.JsCurrentPlugin
+				if candidate.Ext != nil {
+					s.Parent.JsCurrentPlugin = candidate.Ext.GetRealExt()
+				}
 				if item.SolveRaw == nil {
 					// 兼容少量旧对象：没有 solveRaw 时回退同步 solve
 					defer func() {
+						s.Parent.JsCurrentPlugin = prev
 						if r := recover(); r != nil {
 							fail <- formatJSSolveRecoveredError(r)
 							return
@@ -2811,6 +2822,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 				}
 
 				defer func() {
+					s.Parent.JsCurrentPlugin = prev
 					if r := recover(); r != nil {
 						fail <- formatJSSolveRecoveredError(r)
 					}
