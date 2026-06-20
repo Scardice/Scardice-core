@@ -15,4 +15,6 @@ type AdvancedConfig struct {
 	// 自定义回复属于内建能力而非 ext 配置项，因此统一冷却时间放在高级设置中集中管理。
 	CustomReplyCooldown     float64 `json:"customReplyCooldown"   yaml:"customReplyCooldown"`       // 自定义回复全局统一冷却时间（秒）
 	ExposeDangerousSealInst bool    `json:"exposeDangerousSealInst" yaml:"exposeDangerousSealInst"` // 向 JS 暴露 seal.inst 危险接口
+
+	AllowFilesystemUnrestrictedAccess bool `json:"allowFilesystemUnrestrictedAccess" yaml:"allowFilesystemUnrestrictedAccess"` // 允许 JS fs 模块访问绝对路径与核心可执行文件相对路径（危险）
 }

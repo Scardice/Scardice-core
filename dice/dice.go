@@ -249,6 +249,10 @@ type Dice struct {
 	JsBuiltinDigestSet map[string]bool `json:"-" yaml:"-"`
 	// 当前在加载的脚本路径，用于关联 jsScriptInfo 和 ExtInfo
 	JsLoadingScript *JsScriptInfo `json:"-" yaml:"-"`
+	// 当前正在事件循环 goroutine 上执行回调的 JS 扩展。
+	// 注意：仅在 RunOnLoop 回调内部（事件循环 goroutine 上）设置/清除，外部 goroutine 不要读写。
+	// 用途：在 JS 原生模块（如 fs）内据此定位调用插件的沙箱权限。
+	JsCurrentPlugin *ExtInfo `json:"-" yaml:"-"`
 
 	// 游戏系统规则模板
 	GameSystemMap *SyncMap[string, *GameSystemTemplate] `json:"-" yaml:"-"`

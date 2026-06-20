@@ -449,7 +449,10 @@ func (i *ExtInfo) CallOnMessagePreprocess(d *Dice, ctx *MsgContext, msg *Message
 		}
 		waitRun := make(chan int, 1)
 		loop.RunOnLoop(func(vm *goja.Runtime) {
+			prev := d.JsCurrentPlugin
+			d.JsCurrentPlugin = ext
 			defer func() {
+				d.JsCurrentPlugin = prev
 				if r := recover(); r != nil {
 					d.Logger.Error("JS脚本异常:", r)
 				}
@@ -509,7 +512,10 @@ func (i *ExtInfo) callWithJsCheck(d *Dice, f func()) {
 			}
 			waitRun := make(chan int, 1)
 			loop.RunOnLoop(func(vm *goja.Runtime) {
+				prev := d.JsCurrentPlugin
+				d.JsCurrentPlugin = i
 				defer func() {
+					d.JsCurrentPlugin = prev
 					if r := recover(); r != nil {
 						d.Logger.Error("JS脚本异常:", r)
 					}

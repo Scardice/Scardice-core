@@ -365,6 +365,9 @@ func (d *Dice) JsInit() {
 	reg.RegisterNativeModule("@seal/http", sealhttp.Require)
 	reg.RegisterNativeModule("@seal/structuredclone", sealsclone.Require)
 	reg.RegisterNativeModule("@seal/utilinspect", sealutil.Require)
+	reg.RegisterNativeModule("fs", func(rt *goja.Runtime, module *goja.Object) {
+		jsFsRequire(rt, module, d)
+	})
 
 	d.JsScriptCron = cron.New(cron.WithParser(taskCronParser))
 	d.JsScriptCronLock = &sync.Mutex{}
@@ -391,6 +394,7 @@ func (d *Dice) JsInit() {
 		sealhttp.Enable(vm)
 		sealsclone.Enable(vm)
 		sealutil.Enable(vm)
+		jsFsEnable(vm, d)
 		utilMod := vm.NewObject()
 		utilExports := vm.NewObject()
 		_ = utilMod.Set("exports", utilExports)
@@ -722,7 +726,7 @@ func (d *Dice) JsInit() {
 				panic(errors.New("插件cron未成功初始化")) // 按理是不会发生的
 			}
 
-			task := JsScriptTask{cron: scriptCron, key: key, task: fn, lock: ei.dice.JsScriptCronLock, logger: ei.dice.Logger}
+			task := JsScriptTask{cron: scriptCron, key: key, task: fn, lock: ei.dice.JsScriptCronLock, logger: ei.dice.Logger, dice: ei.dice, ext: ei}
 			expr := value
 			if key != "" && taskType != "once" {
 				if config := d.ConfigManager.getConfig(ei.Name, key); config != nil {
@@ -2546,6 +2550,9 @@ type JsScriptTask struct {
 
 	stateLock sync.Mutex
 	logger    *zap.SugaredLogger
+
+	dice *Dice
+	ext  *ExtInfo
 }
 
 type JsScriptTaskCtx struct {
@@ -2572,6 +2579,13 @@ func (t *JsScriptTask) run() {
 	}
 	defer t.lock.Unlock()
 	t.lock.Lock()
+	if t.dice != nil {
+		prev := t.dice.JsCurrentPlugin
+		t.dice.JsCurrentPlugin = t.ext
+		defer func() {
+			t.dice.JsCurrentPlugin = prev
+		}()
+	}
 	t.task(taskCtx)
 }
 
