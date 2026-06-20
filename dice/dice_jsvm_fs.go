@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/dop251/goja"
+	"github.com/dop251/goja_nodejs/eventloop"
 )
 
 const (
@@ -21,15 +22,15 @@ type jsFsResolvedPath struct {
 	isData bool
 }
 
-func jsFsEnable(vm *goja.Runtime, d *Dice) {
-	_ = vm.Set(fsModuleName, jsFsEnsureObject(vm, d))
+func jsFsEnable(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) {
+	_ = vm.Set(fsModuleName, jsFsEnsureObject(vm, d, loop))
 }
 
-func jsFsRequire(vm *goja.Runtime, module *goja.Object, d *Dice) {
-	_ = module.Set("exports", jsFsEnsureObject(vm, d))
+func jsFsRequire(vm *goja.Runtime, module *goja.Object, d *Dice, loop *eventloop.EventLoop) {
+	_ = module.Set("exports", jsFsEnsureObject(vm, d, loop))
 }
 
-func jsFsEnsureObject(vm *goja.Runtime, d *Dice) *goja.Object {
+func jsFsEnsureObject(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) *goja.Object {
 	if current := vm.Get(fsModuleName); !goja.IsUndefined(current) && !goja.IsNull(current) {
 		if obj, ok := current.(*goja.Object); ok {
 			return obj
@@ -43,6 +44,21 @@ func jsFsEnsureObject(vm *goja.Runtime, d *Dice) *goja.Object {
 	_ = fsObj.Set("readDir", jsFsReadDir(vm, d))
 	_ = fsObj.Set("mkdir", jsFsMkdir(vm, d))
 	_ = fsObj.Set("remove", jsFsRemove(vm, d))
+	_ = fsObj.Set("readFileAsync", jsFsReadFileAsync(vm, d, loop))
+	_ = fsObj.Set("writeFileAsync", jsFsWriteFileAsync(vm, d, loop))
+	_ = fsObj.Set("statAsync", jsFsStatAsync(vm, d, loop))
+	_ = fsObj.Set("readDirAsync", jsFsReadDirAsync(vm, d, loop))
+	_ = fsObj.Set("mkdirAsync", jsFsMkdirAsync(vm, d, loop))
+	_ = fsObj.Set("removeAsync", jsFsRemoveAsync(vm, d, loop))
+
+	promisesObj := vm.NewObject()
+	_ = promisesObj.Set("readFile", jsFsReadFileAsync(vm, d, loop))
+	_ = promisesObj.Set("writeFile", jsFsWriteFileAsync(vm, d, loop))
+	_ = promisesObj.Set("stat", jsFsStatAsync(vm, d, loop))
+	_ = promisesObj.Set("readDir", jsFsReadDirAsync(vm, d, loop))
+	_ = promisesObj.Set("mkdir", jsFsMkdirAsync(vm, d, loop))
+	_ = promisesObj.Set("remove", jsFsRemoveAsync(vm, d, loop))
+	_ = fsObj.Set("promises", promisesObj)
 	_ = vm.Set(fsModuleName, fsObj)
 	return fsObj
 }
@@ -181,6 +197,44 @@ func jsFsThrow(vm *goja.Runtime, err error) {
 	panic(vm.NewGoError(err))
 }
 
+func jsFsRejectedPromise(vm *goja.Runtime, err error) goja.Value {
+	promise, _, reject := vm.NewPromise()
+	_ = reject(vm.NewGoError(err))
+	return vm.ToValue(promise)
+}
+
+func jsFsRunAsync(vm *goja.Runtime, loop *eventloop.EventLoop, work func() (func(*goja.Runtime) goja.Value, error)) goja.Value {
+	if loop == nil {
+		return jsFsRejectedPromise(vm, errors.New("JS event loop 未初始化,无法执行异步 fs 操作"))
+	}
+	promise, resolve, reject := vm.NewPromise()
+	go func() {
+		value, err := work()
+		loop.RunOnLoop(func(loopVM *goja.Runtime) {
+			if err != nil {
+				_ = reject(loopVM.NewGoError(err))
+				return
+			}
+			if value == nil {
+				_ = resolve(goja.Undefined())
+				return
+			}
+			_ = resolve(value(loopVM))
+		})
+	}()
+	return vm.ToValue(promise)
+}
+
+func jsFsStatValue(vm *goja.Runtime, info os.FileInfo) goja.Value {
+	result := vm.NewObject()
+	_ = result.Set("name", info.Name())
+	_ = result.Set("size", info.Size())
+	_ = result.Set("mode", uint32(info.Mode()))
+	_ = result.Set("modTime", info.ModTime().Unix())
+	_ = result.Set("isDir", info.IsDir())
+	return result
+}
+
 func jsFsReadFile(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
@@ -237,13 +291,150 @@ func jsFsStat(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
 		if err != nil {
 			jsFsThrow(vm, err)
 		}
-		result := vm.NewObject()
-		_ = result.Set("name", info.Name())
-		_ = result.Set("size", info.Size())
-		_ = result.Set("mode", uint32(info.Mode()))
-		_ = result.Set("modTime", info.ModTime().Unix())
-		_ = result.Set("isDir", info.IsDir())
-		return result
+		return jsFsStatValue(vm, info)
+	}
+}
+
+func jsFsReadFileAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		if err != nil {
+			return jsFsRejectedPromise(vm, err)
+		}
+		return jsFsRunAsync(vm, loop, func() (func(*goja.Runtime) goja.Value, error) {
+			if err := jsFsEnsureExistingDataTargetInside(resolved); err != nil {
+				return nil, err
+			}
+			data, err := os.ReadFile(resolved.abs)
+			if err != nil {
+				return nil, err
+			}
+			return func(loopVM *goja.Runtime) goja.Value {
+				return loopVM.ToValue(loopVM.NewArrayBuffer(data))
+			}, nil
+		})
+	}
+}
+
+func jsFsWriteFileAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		if err != nil {
+			return jsFsRejectedPromise(vm, err)
+		}
+		data, err := jsFsBytesFrom(call.Argument(1))
+		if err != nil {
+			return jsFsRejectedPromise(vm, err)
+		}
+		mode := os.FileMode(0644)
+		if len(call.Arguments) >= 3 {
+			if v := call.Argument(2); !goja.IsUndefined(v) && !goja.IsNull(v) {
+				mode = os.FileMode(v.ToInteger())
+			}
+		}
+		return jsFsRunAsync(vm, loop, func() (func(*goja.Runtime) goja.Value, error) {
+			if err := jsFsEnsureParent(resolved); err != nil {
+				return nil, err
+			}
+			if err := os.WriteFile(resolved.abs, data, mode); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		})
+	}
+}
+
+func jsFsStatAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		if err != nil {
+			return jsFsRejectedPromise(vm, err)
+		}
+		return jsFsRunAsync(vm, loop, func() (func(*goja.Runtime) goja.Value, error) {
+			if err := jsFsEnsureExistingDataTargetInside(resolved); err != nil {
+				return nil, err
+			}
+			info, err := os.Stat(resolved.abs)
+			if err != nil {
+				return nil, err
+			}
+			return func(loopVM *goja.Runtime) goja.Value {
+				return jsFsStatValue(loopVM, info)
+			}, nil
+		})
+	}
+}
+
+func jsFsReadDirAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		if err != nil {
+			return jsFsRejectedPromise(vm, err)
+		}
+		return jsFsRunAsync(vm, loop, func() (func(*goja.Runtime) goja.Value, error) {
+			if err := jsFsEnsureExistingDataTargetInside(resolved); err != nil {
+				return nil, err
+			}
+			entries, err := os.ReadDir(resolved.abs)
+			if err != nil {
+				return nil, err
+			}
+			arr := make([]map[string]interface{}, 0, len(entries))
+			for _, e := range entries {
+				arr = append(arr, map[string]interface{}{
+					"name":  e.Name(),
+					"isDir": e.IsDir(),
+				})
+			}
+			return func(loopVM *goja.Runtime) goja.Value {
+				return loopVM.ToValue(arr)
+			}, nil
+		})
+	}
+}
+
+func jsFsMkdirAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		if err != nil {
+			return jsFsRejectedPromise(vm, err)
+		}
+		mode := os.FileMode(0755)
+		if len(call.Arguments) >= 2 {
+			if v := call.Argument(1); !goja.IsUndefined(v) && !goja.IsNull(v) {
+				mode = os.FileMode(v.ToInteger())
+			}
+		}
+		return jsFsRunAsync(vm, loop, func() (func(*goja.Runtime) goja.Value, error) {
+			if err := jsFsEnsureDataParentInside(resolved); err != nil {
+				return nil, err
+			}
+			if err := os.MkdirAll(resolved.abs, mode); err != nil {
+				return nil, err
+			}
+			if err := jsFsEnsureExistingDataTargetInside(resolved); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		})
+	}
+}
+
+func jsFsRemoveAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		if err != nil {
+			return jsFsRejectedPromise(vm, err)
+		}
+		return jsFsRunAsync(vm, loop, func() (func(*goja.Runtime) goja.Value, error) {
+			if err := jsFsEnsureExistingDataTargetInside(resolved); err != nil {
+				return nil, err
+			}
+			if err := os.Remove(resolved.abs); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		})
 	}
 }
 

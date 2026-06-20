@@ -366,7 +366,7 @@ func (d *Dice) JsInit() {
 	reg.RegisterNativeModule("@seal/structuredclone", sealsclone.Require)
 	reg.RegisterNativeModule("@seal/utilinspect", sealutil.Require)
 	reg.RegisterNativeModule("fs", func(rt *goja.Runtime, module *goja.Object) {
-		jsFsRequire(rt, module, d)
+		jsFsRequire(rt, module, d, loop)
 	})
 
 	d.JsScriptCron = cron.New(cron.WithParser(taskCronParser))
@@ -394,7 +394,7 @@ func (d *Dice) JsInit() {
 		sealhttp.Enable(vm)
 		sealsclone.Enable(vm)
 		sealutil.Enable(vm)
-		jsFsEnable(vm, d)
+		jsFsEnable(vm, d, loop)
 		utilMod := vm.NewObject()
 		utilExports := vm.NewObject()
 		_ = utilMod.Set("exports", utilExports)
@@ -2568,25 +2568,47 @@ type JsScriptTaskInfo struct {
 }
 
 func (t *JsScriptTask) run() {
-	defer func() {
-		if r := recover(); r != nil {
-			t.logger.Errorf("插件定时任务异常: %v", r)
-		}
-	}()
 	taskCtx := JsScriptTaskCtx{
 		Now: time.Now().Unix(),
 		Key: t.key,
 	}
 	defer t.lock.Unlock()
 	t.lock.Lock()
-	if t.dice != nil {
+	if t.dice == nil || t.ext == nil {
+		defer func() {
+			if r := recover(); r != nil {
+				t.logger.Errorf("插件定时任务异常: %v", r)
+			}
+		}()
+		t.task(taskCtx)
+		return
+	}
+	loop, err := t.dice.ExtLoopManager.GetLoop(t.ext.JSLoopVersion)
+	if err != nil {
+		t.logger.Errorf("插件定时任务获取JS事件循环失败: %v", err)
+		return
+	}
+	done := make(chan struct{})
+	var recovered interface{}
+	if ok := loop.RunOnLoop(func(_ *goja.Runtime) {
+		defer close(done)
+		defer func() {
+			recovered = recover()
+		}()
 		prev := t.dice.JsCurrentPlugin
 		t.dice.JsCurrentPlugin = t.ext
 		defer func() {
 			t.dice.JsCurrentPlugin = prev
 		}()
+		t.task(taskCtx)
+	}); !ok {
+		t.logger.Error("插件定时任务调度到JS事件循环失败")
+		return
 	}
-	t.task(taskCtx)
+	<-done
+	if recovered != nil {
+		t.logger.Errorf("插件定时任务异常: %v", recovered)
+	}
 }
 
 func (t *JsScriptTask) On() bool {
