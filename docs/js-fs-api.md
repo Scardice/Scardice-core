@@ -59,7 +59,13 @@
 
 ## API 方法
 
-所有方法均同步,失败时**抛出异常**。
+`fs` 同时提供同步与 Promise 风格异步接口:
+
+- 同步接口失败时**抛出异常**。
+- 异步接口返回 `Promise`,失败时进入 rejected 状态,可用 `await` + `try/catch` 捕获。
+- `fs.promises.*` 与 `fs.*Async` 是同一组异步能力的两种命名入口。
+
+### 同步接口
 
 ### `fs.readFile(path: string): Uint8Array`
 
@@ -85,6 +91,23 @@
 
 删除文件或空目录。
 
+### 异步接口
+
+以下接口均返回 `Promise`:
+
+| `fs.*Async`                           | `fs.promises.*`                     | 说明             |
+| ------------------------------------- | ----------------------------------- | ---------------- |
+| `fs.readFileAsync(path)`              | `fs.promises.readFile(path)`        | 读取文件字节     |
+| `fs.writeFileAsync(path, data, mode)` | `fs.promises.writeFile(path, data)` | 写入文件         |
+| `fs.statAsync(path)`                  | `fs.promises.stat(path)`            | 获取文件信息     |
+| `fs.readDirAsync(path)`               | `fs.promises.readDir(path)`         | 读取目录         |
+| `fs.mkdirAsync(path, mode)`           | `fs.promises.mkdir(path, mode)`     | 递归创建目录     |
+| `fs.removeAsync(path)`                | `fs.promises.remove(path)`          | 删除文件或空目录 |
+
+异步接口与同步接口共享完全相同的路径规则与安全限制。`data://` 沙箱、路径穿越拒绝、symlink escape 防护、以及 `allowFilesystemUnrestrictedAccess` 门控均一致生效。
+
+异步接口会在调用当下完成路径解析与权限检查。若操作已经开始,之后再修改 `allowFilesystemUnrestrictedAccess` 不会影响该次已发起的文件操作。
+
 ---
 
 ## 简短示例:扩展私有数据存储
@@ -108,6 +131,35 @@ ext.cmdMap["weather-count"].solve = (ctx, msg, cmdArgs) => {
 
   data.count++;
   fs.writeFile(path, JSON.stringify(data));
+
+  seal.replyToSender(ctx, msg, `共查询 ${data.count} 次天气`);
+  return seal.ext.newCmdExecuteResult(true);
+};
+
+seal.ext.register(ext);
+```
+
+异步写法:
+
+```javascript
+const fs = require("fs");
+
+let ext = seal.ext.new("fetchWeather", "某人", "1.0.1");
+
+ext.cmdMap["weather-count-async"] = seal.ext.newCmdItemInfo();
+ext.cmdMap["weather-count-async"].solve = async (ctx, msg, cmdArgs) => {
+  const path = "data://count.json";
+
+  let data = { count: 0 };
+  try {
+    const bytes = await fs.promises.readFile(path);
+    data = JSON.parse(new TextDecoder().decode(bytes));
+  } catch (e) {
+    // 首次调用文件不存在,使用默认值
+  }
+
+  data.count++;
+  await fs.promises.writeFile(path, JSON.stringify(data));
 
   seal.replyToSender(ctx, msg, `共查询 ${data.count} 次天气`);
   return seal.ext.newCmdExecuteResult(true);
