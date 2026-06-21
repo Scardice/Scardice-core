@@ -2487,11 +2487,17 @@ func (d *Dice) SaveText() {
 		bakFn := filepath.Join(d.BaseConfig.DataDir, "configs/text-template.yaml.bak")
 		// ioutil.WriteFile(filepath.Join(d.BaseConfig.DataDir, "configs/text-template.yaml"), buf, 0644)
 		current, err := os.ReadFile(newFn)
-		if err != nil {
-			_ = os.WriteFile(bakFn, current, 0o644) //nolint:gosec
+		if err == nil {
+			if writeErr := os.WriteFile(bakFn, current, 0o644); writeErr != nil { //nolint:gosec
+				d.Logger.Error("Dice.SaveText backup", writeErr)
+			}
+		} else if !os.IsNotExist(err) {
+			d.Logger.Error("Dice.SaveText read current", err)
 		}
 
-		_ = os.WriteFile(newFn, buf, 0o644)
+		if writeErr := os.WriteFile(newFn, buf, 0o644); writeErr != nil {
+			d.Logger.Error("Dice.SaveText write", writeErr)
+		}
 	}
 }
 
