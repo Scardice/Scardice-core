@@ -23,4 +23,16 @@ if ! command -v golangci-lint >/dev/null 2>&1; then
   exit 1
 fi
 
-golangci-lint run --new-from-rev=HEAD --timeout 2m
+lint_targets=$(echo "$go_files" | xargs -I{} dirname {} | sort -u | while IFS= read -r dir; do
+  if [ "$dir" = "." ]; then
+    echo "."
+  else
+    echo "./$dir"
+  fi
+done)
+
+patch_file="${TMPDIR:-/tmp}/golangci-lint-staged-$$.patch"
+trap 'rm -f "$patch_file"' EXIT HUP INT TERM
+git diff --cached -- '*.go' > "$patch_file"
+
+golangci-lint run --new-from-patch="$patch_file" --timeout 2m $lint_targets
