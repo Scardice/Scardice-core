@@ -228,6 +228,58 @@ func TestStoreQueryPageUsesSingleResolvedBackend(t *testing.T) {
 	}
 }
 
+func TestStoreQueryPageResolvesRelativeDownloadURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dice/api/store/info":
+			_, _ = w.Write([]byte(`{"formatVersion":"2.0","name":"Official Store","protocolVersions":["2.0"],"announcement":"ready","sign":""}`))
+		case "/dice/api/store/page":
+			_, _ = w.Write([]byte(`{"formatVersion":"2.0","result":true,"data":{"formatVersion":"2.0","data":[{"id":"alice/demo","formatVersion":"1.0.0","version":"1.2.3","name":"Demo","contents":["scripts"],"download":{"url":"/dice/api/store/packages/alice/demo/1.2.3/demo.sealpack"}}],"pageNum":1,"pageSize":20,"next":false},"err":""}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	withOfficialStoreBackendBaseURL(t, server.URL)
+
+	manager := NewStoreManager(&Dice{})
+	page, err := manager.StoreQueryPage(StoreQueryPageParams{PageNum: 1, PageSize: 20})
+	if err != nil {
+		t.Fatalf("StoreQueryPage() error = %v", err)
+	}
+	wantURL := server.URL + "/dice/api/store/packages/alice/demo/1.2.3/demo.sealpack"
+	if page.Data[0].Download.URL != wantURL {
+		t.Fatalf("Download.URL = %q, want %q", page.Data[0].Download.URL, wantURL)
+	}
+}
+
+func TestStoreQueryRecommendResolvesRelativeDownloadURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dice/api/store/info":
+			_, _ = w.Write([]byte(`{"formatVersion":"2.0","name":"Official Store","protocolVersions":["2.0"],"announcement":"ready","sign":""}`))
+		case "/dice/api/store/recommend":
+			_, _ = w.Write([]byte(`{"formatVersion":"2.0","result":true,"data":[{"id":"alice/demo","formatVersion":"1.0.0","version":"1.2.3","name":"Demo","contents":["scripts"],"download":{"url":"/dice/api/store/packages/alice/demo/1.2.3/demo.sealpack"}}],"err":""}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	withOfficialStoreBackendBaseURL(t, server.URL)
+
+	manager := NewStoreManager(&Dice{})
+	packages, err := manager.StoreQueryRecommend()
+	if err != nil {
+		t.Fatalf("StoreQueryRecommend() error = %v", err)
+	}
+	wantURL := server.URL + "/dice/api/store/packages/alice/demo/1.2.3/demo.sealpack"
+	if packages[0].Download.URL != wantURL {
+		t.Fatalf("Download.URL = %q, want %q", packages[0].Download.URL, wantURL)
+	}
+}
+
 func TestStoreManagerFindPackageMatchesByIDAndVersionAfterRefreshInstalled(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -454,7 +506,7 @@ func TestSanitizeStorePackageRejectsMismatchedFullID(t *testing.T) {
 		Download: StorePackageDownload{
 			URL: "https://example.com/demo-1.2.3.sealpack",
 		},
-	})
+	}, nil)
 	if err == nil {
 		t.Fatal("expected error for mismatched fullId")
 	}
@@ -469,7 +521,7 @@ func TestSanitizeStorePackageMarksCanonicalFields(t *testing.T) {
 		Download: StorePackageDownload{
 			URL: "https://example.com/demo-1.2.3.sealpack",
 		},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("sanitizeStorePackage returned error: %v", err)
 	}

@@ -503,7 +503,11 @@ func (m *StoreManager) StoreQueryRecommend() ([]*StorePackage, error) {
 	if !respResult.Result {
 		return nil, fmt.Errorf("%s", respResult.Err)
 	}
-	return sanitizeStorePackages(respResult.Data)
+	backendURL, err := url.Parse(backend.Url)
+	if err != nil {
+		return nil, err
+	}
+	return sanitizeStorePackages(respResult.Data, backendURL)
 }
 
 func (m *StoreManager) StoreBackendList() []*StoreBackend {
@@ -716,7 +720,11 @@ func (m *StoreManager) StoreQueryPage(params StoreQueryPageParams) (*StorePackag
 		return nil, errors.New("扩展商店返回了空分页数据")
 	}
 
-	sanitized, err := sanitizeStorePackages(respResult.Data.Data)
+	backendURL, err := url.Parse(backend.Url)
+	if err != nil {
+		return nil, err
+	}
+	sanitized, err := sanitizeStorePackages(respResult.Data.Data, backendURL)
 	if err != nil {
 		return nil, err
 	}
@@ -803,14 +811,14 @@ func (m *StoreManager) StoreQueryUploadInfo() (StoreUploadInfo, error) {
 	return *result, nil
 }
 
-func sanitizeStorePackages(packages []*StorePackage) ([]*StorePackage, error) {
+func sanitizeStorePackages(packages []*StorePackage, backendURL *url.URL) ([]*StorePackage, error) {
 	if len(packages) == 0 {
 		return []*StorePackage{}, nil
 	}
 
 	result := make([]*StorePackage, 0, len(packages))
 	for _, pkg := range packages {
-		sanitized, err := sanitizeStorePackage(pkg)
+		sanitized, err := sanitizeStorePackage(pkg, backendURL)
 		if err != nil {
 			return nil, err
 		}
@@ -819,7 +827,7 @@ func sanitizeStorePackages(packages []*StorePackage) ([]*StorePackage, error) {
 	return result, nil
 }
 
-func sanitizeStorePackage(pkg *StorePackage) (*StorePackage, error) {
+func sanitizeStorePackage(pkg *StorePackage, backendURL *url.URL) (*StorePackage, error) {
 	if pkg == nil {
 		return nil, errors.New("商店返回了空包数据")
 	}
@@ -848,6 +856,14 @@ func sanitizeStorePackage(pkg *StorePackage) (*StorePackage, error) {
 		return nil, errors.New("商店包缺少 download.url")
 	}
 	parsedDownloadURL, err := url.Parse(copyPkg.Download.URL)
+	if err == nil && parsedDownloadURL.Scheme == "" && parsedDownloadURL.Host == "" && backendURL != nil {
+		baseURL := *backendURL
+		if !strings.HasSuffix(baseURL.Path, "/") {
+			baseURL.Path += "/"
+		}
+		parsedDownloadURL = baseURL.ResolveReference(parsedDownloadURL)
+		copyPkg.Download.URL = parsedDownloadURL.String()
+	}
 	if err != nil || parsedDownloadURL.Scheme == "" || parsedDownloadURL.Host == "" {
 		return nil, errors.New("download.url 必须是绝对 URL")
 	}
