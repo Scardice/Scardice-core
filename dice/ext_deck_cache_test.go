@@ -122,6 +122,183 @@ func TestDeckParseCacheStoresAndReusesHash(t *testing.T) {
 	}
 }
 
+func TestParseDeckJSONUsesStandardJSONWhenValid(t *testing.T) {
+	d := &Dice{Logger: zap.NewNop().Sugar()}
+	deckInfo := &DeckInfo{
+		DeckItems:          map[string][]string{},
+		Command:            map[string]bool{},
+		CloudDeckItemInfos: map[string]*CloudDeckItemInfo{},
+	}
+
+	content := []byte(`{"_title":["standard"],"table":["alpha"]}`)
+	if !parseDeck(d, "standard.json", content, deckInfo) {
+		t.Fatalf("standard json deck should parse: %s", deckInfo.ErrText)
+	}
+	if deckInfo.FileFormat != "json" {
+		t.Fatalf("FileFormat = %q, want json", deckInfo.FileFormat)
+	}
+	if got := deckInfo.DeckItems["table"]; len(got) != 1 || got[0] != "alpha" {
+		t.Fatalf("deck items = %#v, want alpha", got)
+	}
+}
+
+func TestParseDeckJSONFallsBackToHuJSON(t *testing.T) {
+	d := &Dice{Logger: zap.NewNop().Sugar()}
+	deckInfo := &DeckInfo{
+		DeckItems:          map[string][]string{},
+		Command:            map[string]bool{},
+		CloudDeckItemInfos: map[string]*CloudDeckItemInfo{},
+	}
+
+	content := []byte(`{
+		// allow JSONC-style comments in .json only after standard parsing fails
+		"_title": ["fallback"],
+		"table": ["bravo"],
+	}`)
+	if !parseDeck(d, "fallback.json", content, deckInfo) {
+		t.Fatalf("json deck should fall back to hujson: %s", deckInfo.ErrText)
+	}
+	if deckInfo.FileFormat != "jsonc" {
+		t.Fatalf("FileFormat = %q, want jsonc", deckInfo.FileFormat)
+	}
+	if got := deckInfo.DeckItems["table"]; len(got) != 1 || got[0] != "bravo" {
+		t.Fatalf("deck items = %#v, want bravo", got)
+	}
+}
+
+func TestDeckTryParseJSONFileFallsBackToJSONCContent(t *testing.T) {
+	root := switchToTempWorkdir(t)
+	deckPath := filepath.Join(root, "data", "decks", "json-suffix-jsonc-content.json")
+	if err := os.MkdirAll(filepath.Dir(deckPath), 0o755); err != nil {
+		t.Fatalf("mkdir decks dir: %v", err)
+	}
+	writeRawDeckFile(t, deckPath, `{
+		// This file intentionally keeps the .json suffix while using JWCC/HuJSON syntax.
+		"_title": ["json suffix"],
+		"table": ["jsonc content"],
+	}`)
+
+	d := &Dice{Logger: zap.NewNop().Sugar()}
+	DeckTryParse(d, filepath.ToSlash(filepath.Join("data", "decks", "json-suffix-jsonc-content.json")))
+
+	if len(d.DeckList) != 1 {
+		t.Fatalf("DeckTryParse deck count = %d, want 1", len(d.DeckList))
+	}
+	deckInfo := d.DeckList[0]
+	if !deckInfo.Enable {
+		t.Fatalf("json suffix deck with jsonc content should be enabled, err=%s", deckInfo.ErrText)
+	}
+	if deckInfo.FileFormat != "jsonc" {
+		t.Fatalf("FileFormat = %q, want jsonc", deckInfo.FileFormat)
+	}
+	if got := deckInfo.DeckItems["table"]; len(got) != 1 || got[0] != "jsonc content" {
+		t.Fatalf("deck items = %#v, want jsonc content", got)
+	}
+}
+
+func TestParseDeckJSONFallsBackToTrueHJSON(t *testing.T) {
+	d := &Dice{Logger: zap.NewNop().Sugar()}
+	deckInfo := &DeckInfo{
+		DeckItems:          map[string][]string{},
+		Command:            map[string]bool{},
+		CloudDeckItemInfos: map[string]*CloudDeckItemInfo{},
+	}
+
+	content := []byte(`{
+		# This is true Hjson syntax: no commas between object members or array values.
+		"集团军净化版": [
+			"第一条"
+			"第二条"
+		]
+		"集团军": [
+			"第三条"
+		]
+	}`)
+	if !parseDeck(d, "json-suffix-true-hjson.json", content, deckInfo) {
+		t.Fatalf("json deck should fall back to true hjson: %s", deckInfo.ErrText)
+	}
+	if deckInfo.FileFormat != "hjson" {
+		t.Fatalf("FileFormat = %q, want hjson", deckInfo.FileFormat)
+	}
+	if got := deckInfo.DeckItems["集团军净化版"]; len(got) != 2 || got[0] != "第一条" || got[1] != "第二条" {
+		t.Fatalf("deck items = %#v, want two hjson items", got)
+	}
+}
+
+func TestDeckTryParseJSONFileFallsBackToTrueHJSONContent(t *testing.T) {
+	root := switchToTempWorkdir(t)
+	deckPath := filepath.Join(root, "data", "decks", "json-suffix-true-hjson-content.json")
+	if err := os.MkdirAll(filepath.Dir(deckPath), 0o755); err != nil {
+		t.Fatalf("mkdir decks dir: %v", err)
+	}
+	writeRawDeckFile(t, deckPath, `{
+		# This file intentionally keeps the .json suffix while using true Hjson syntax.
+		"集团军净化版": [
+			"第一条"
+			"第二条"
+		]
+		"集团军": [
+			"第三条"
+		]
+	}`)
+
+	d := &Dice{Logger: zap.NewNop().Sugar()}
+	DeckTryParse(d, filepath.ToSlash(filepath.Join("data", "decks", "json-suffix-true-hjson-content.json")))
+
+	if len(d.DeckList) != 1 {
+		t.Fatalf("DeckTryParse deck count = %d, want 1", len(d.DeckList))
+	}
+	deckInfo := d.DeckList[0]
+	if !deckInfo.Enable {
+		t.Fatalf("json suffix deck with true hjson content should be enabled, err=%s", deckInfo.ErrText)
+	}
+	if deckInfo.FileFormat != "hjson" {
+		t.Fatalf("FileFormat = %q, want hjson", deckInfo.FileFormat)
+	}
+	if got := deckInfo.DeckItems["集团军"]; len(got) != 1 || got[0] != "第三条" {
+		t.Fatalf("deck items = %#v, want 第三条", got)
+	}
+}
+
+func TestParseDeckHJSONFileWithTrueHJSONContent(t *testing.T) {
+	d := &Dice{Logger: zap.NewNop().Sugar()}
+	deckInfo := &DeckInfo{
+		DeckItems:          map[string][]string{},
+		Command:            map[string]bool{},
+		CloudDeckItemInfos: map[string]*CloudDeckItemInfo{},
+	}
+
+	content := []byte(`{
+		_title: ["true hjson"]
+		table: [
+			"unquoted key works"
+		]
+	}`)
+	if !parseDeck(d, "true.hjson", content, deckInfo) {
+		t.Fatalf("hjson deck should parse: %s", deckInfo.ErrText)
+	}
+	if deckInfo.FileFormat != "hjson" {
+		t.Fatalf("FileFormat = %q, want hjson", deckInfo.FileFormat)
+	}
+	if got := deckInfo.DeckItems["table"]; len(got) != 1 || got[0] != "unquoted key works" {
+		t.Fatalf("deck items = %#v, want unquoted key works", got)
+	}
+}
+
+func TestCollectDeckSourceFilesIncludesHJSON(t *testing.T) {
+	root := switchToTempWorkdir(t)
+	deckPath := filepath.Join(root, "data", "decks", "loose.hjson")
+	if err := os.MkdirAll(filepath.Dir(deckPath), 0o755); err != nil {
+		t.Fatalf("mkdir decks dir: %v", err)
+	}
+	writeRawDeckFile(t, deckPath, `{"_title":["hjson"],"table":["item"]}`)
+
+	files := collectDeckSourceFiles(filepath.Join(root, "data", "decks"))
+	if len(files) != 1 || filepath.Base(files[0]) != "loose.hjson" {
+		t.Fatalf("collectDeckSourceFiles = %#v, want loose.hjson", files)
+	}
+}
+
 func TestDecksDetectReuseLogsOnlyChangedFiles(t *testing.T) {
 	root := switchToTempWorkdir(t)
 	keepPath := filepath.Join(root, "data", "decks", "keep.json")

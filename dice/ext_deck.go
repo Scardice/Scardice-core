@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	hjson "github.com/hjson/hjson-go/v4"
 	"github.com/mitchellh/mapstructure"
 	wr "github.com/mroth/weightedrand"
 	"github.com/pelletier/go-toml/v2"
@@ -146,7 +147,7 @@ type DeckInfo struct {
 	Filename           string                        `json:"filename"      yaml:"filename"`
 	Format             string                        `json:"format"        yaml:"format"`        // 几种：“SinaNya” ”Dice!“ "Seal"
 	FormatVersion      int64                         `json:"formatVersion" yaml:"formatVersion"` // 格式版本，默认都是1
-	FileFormat         string                        `json:"fileFormat"    yaml:"-"`             // json / yaml / toml / jsonc
+	FileFormat         string                        `json:"fileFormat"    yaml:"-"`             // json / yaml / toml / jsonc / hjson
 	Name               string                        `json:"name"          yaml:"name"`
 	Version            string                        `json:"version"       yaml:"-"`
 	Author             string                        `json:"author"        yaml:"-"`
@@ -167,15 +168,34 @@ type DeckInfo struct {
 }
 
 func tryParseDiceE(content []byte, deckInfo *DeckInfo, jsoncDirectly bool) error {
-	// 移除注释
-	standardJson, isRFC, err := standardizeJson(content)
-	if err != nil {
-		return err
+	var jsonErr error
+	if !jsoncDirectly {
+		if err := parseDiceEJSON(content, deckInfo, "json"); err == nil {
+			return nil
+		} else {
+			jsonErr = err
+		}
 	}
 
+	standardJson, _, jsoncErr := standardizeJson(content)
+	if jsoncErr == nil {
+		return parseDiceEJSON(standardJson, deckInfo, "jsonc")
+	}
+
+	hjsonJSON, hjsonErr := hjsonToStandardJSON(content)
+	if hjsonErr != nil {
+		if jsonErr != nil {
+			return fmt.Errorf("json parse failed: %w; jsonc parse failed: %w; hjson parse failed: %w", jsonErr, jsoncErr, hjsonErr)
+		}
+		return fmt.Errorf("jsonc parse failed: %w; hjson parse failed: %w", jsoncErr, hjsonErr)
+	}
+	return parseDiceEJSON(hjsonJSON, deckInfo, "hjson")
+}
+
+func parseDiceEJSON(standardJson []byte, deckInfo *DeckInfo, fileFormat string) error {
 	jsonData := map[string][]string{}
 	rawJsonData := map[string]any{}
-	err = json.Unmarshal(standardJson, &rawJsonData)
+	err := json.Unmarshal(standardJson, &rawJsonData)
 	if err != nil {
 		return err
 	}
@@ -258,11 +278,7 @@ func tryParseDiceE(content []byte, deckInfo *DeckInfo, jsoncDirectly bool) error
 	deckInfo.Desc = strings.Join(jsonData2.Brief, "\n")
 	deckInfo.Format = "Dice!"
 	deckInfo.FormatVersion = 1
-	if !jsoncDirectly && isRFC {
-		deckInfo.FileFormat = "json"
-	} else {
-		deckInfo.FileFormat = "jsonc"
-	}
+	deckInfo.FileFormat = fileFormat
 	deckInfo.Enable = true
 	if len(jsonData2.StoreID) > 0 {
 		deckInfo.StoreID = jsonData2.StoreID[0]
@@ -285,6 +301,48 @@ func standardizeJson(src []byte) (converted []byte, isRFC bool, err error) {
 		jsonValue.Standardize()
 	}
 	return jsonValue.Pack(), isRFC, nil
+}
+
+func hjsonToStandardJSON(src []byte) ([]byte, error) {
+	var value any
+	if err := hjson.Unmarshal(src, &value); err != nil {
+		return nil, err
+	}
+	return json.Marshal(value)
+}
+
+func unmarshalJSONLike(src []byte, dst any, jsoncDirectly bool) error {
+	var jsonErr error
+	if !jsoncDirectly {
+		if err := json.Unmarshal(src, dst); err == nil {
+			return nil
+		} else {
+			jsonErr = err
+		}
+	}
+
+	standardJSON, _, jsoncErr := standardizeJson(src)
+	if jsoncErr == nil {
+		if err := json.Unmarshal(standardJSON, dst); err == nil {
+			return nil
+		} else {
+			jsoncErr = err
+		}
+	}
+
+	hjsonJSON, hjsonErr := hjsonToStandardJSON(src)
+	if hjsonErr == nil {
+		if err := json.Unmarshal(hjsonJSON, dst); err == nil {
+			return nil
+		} else {
+			hjsonErr = err
+		}
+	}
+
+	if jsonErr != nil {
+		return fmt.Errorf("json parse failed: %w; jsonc parse failed: %w; hjson parse failed: %w", jsonErr, jsoncErr, hjsonErr)
+	}
+	return fmt.Errorf("jsonc parse failed: %w; hjson parse failed: %w", jsoncErr, hjsonErr)
 }
 
 func tryParseSinaNya(content []byte, deckInfo *DeckInfo) error {
@@ -611,7 +669,7 @@ func parseDeck(d *Dice, fn string, content []byte, deckInfo *DeckInfo) bool {
 	switch ext {
 	case ".json":
 		err = tryParseDiceE(content, deckInfo, false)
-	case ".jsonc":
+	case ".jsonc", ".hjson":
 		err = tryParseDiceE(content, deckInfo, true)
 	case ".yaml", ".yml":
 		err = tryParseSinaNya(content, deckInfo)
@@ -660,7 +718,7 @@ func collectDeckSourceFiles(root string) []string {
 		}
 
 		ext := filepath.Ext(path)
-		if ext == ".json" || ext == ".jsonc" || ext == ".yml" || ext == ".yaml" || ext == ".toml" || ext == "" {
+		if ext == ".json" || ext == ".jsonc" || ext == ".hjson" || ext == ".yml" || ext == ".yaml" || ext == ".toml" || ext == "" {
 			files = append(files, path)
 		}
 		return nil
@@ -888,7 +946,7 @@ func DecksDetect(d *Dice) bool {
 	if d.PackageManager != nil {
 		for _, deckFile := range d.PackageManager.GetEnabledContentFiles("decks") {
 			ext := filepath.Ext(deckFile.Path)
-			if ext == ".json" || ext == ".jsonc" || ext == ".yml" || ext == ".yaml" || ext == ".toml" {
+			if ext == ".json" || ext == ".jsonc" || ext == ".hjson" || ext == ".yml" || ext == ".yaml" || ext == ".toml" {
 				d.Logger.Infof("正在加载扩展包 %s 的牌堆: %s", deckFile.PackageID, deckFile.Path)
 				DeckTryParseWithPackage(d, deckFile.Path, deckFile.PackageID)
 			}

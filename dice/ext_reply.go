@@ -25,7 +25,13 @@ func CustomReplyConfigReadFromPath(dice *Dice, filePath string, filename string)
 		// 如果文件存在，那么读取
 		af, err := os.ReadFile(filePath)
 		if err == nil {
-			err = yaml.Unmarshal(af, rc)
+			ext := strings.ToLower(filepath.Ext(filePath))
+			switch ext {
+			case ".json", ".jsonc", ".hjson":
+				err = unmarshalJSONLike(af, rc, ext != ".json")
+			default:
+				err = yaml.Unmarshal(af, rc)
+			}
 			if err != nil {
 				dice.Logger.Error("读取自定义回复配置文件发生异常，请检查格式是否正确")
 				return nil, err
@@ -119,8 +125,8 @@ func ReplyReload(dice *Dice) {
 		}
 
 		if !info.IsDir() {
-			ext := filepath.Ext(path)
-			if ext == ".yaml" || ext == "" {
+			ext := strings.ToLower(filepath.Ext(path))
+			if ext == ".yaml" || ext == ".yml" || ext == ".json" || ext == ".jsonc" || ext == ".hjson" || ext == "" {
 				if info.Name() != "reply.yaml" {
 					filenames = append(filenames, info.Name())
 				}
@@ -144,8 +150,8 @@ func ReplyReload(dice *Dice) {
 	// 2. 从已启用扩展包加载自定义回复配置
 	if dice.PackageManager != nil {
 		for _, replyFile := range dice.PackageManager.GetEnabledContentFiles("reply") {
-			ext := filepath.Ext(replyFile.Path)
-			if ext != ".yaml" && ext != ".yml" {
+			ext := strings.ToLower(filepath.Ext(replyFile.Path))
+			if ext != ".yaml" && ext != ".yml" && ext != ".json" && ext != ".jsonc" && ext != ".hjson" {
 				continue
 			}
 			rc, err := CustomReplyConfigReadFromPath(dice, replyFile.Path, filepath.Base(replyFile.Path))

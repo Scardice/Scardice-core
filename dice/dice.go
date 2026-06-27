@@ -1009,8 +1009,8 @@ func collectGameSystemTemplateFiles(templateDir string) ([]string, error) {
 		if entry.IsDir() {
 			continue
 		}
-		ext := filepath.Ext(entry.Name())
-		if ext != ".yaml" && ext != ".yml" && ext != ".json" {
+		ext := strings.ToLower(filepath.Ext(entry.Name()))
+		if ext != ".yaml" && ext != ".yml" && ext != ".json" && ext != ".jsonc" && ext != ".hjson" {
 			continue
 		}
 		files = append(files, filepath.Join(templateDir, entry.Name()))

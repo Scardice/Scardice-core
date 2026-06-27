@@ -1,7 +1,6 @@
 package dice
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -596,9 +595,9 @@ func loadGameSystemTemplateFromData(data []byte, format string) (*GameSystemTemp
 		if err := yaml.Unmarshal(data, tmpl); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal YAML: %w", err)
 		}
-	case "json":
-		if err := json.Unmarshal(data, tmpl); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal JSON: %w", err)
+	case "json", "jsonc", "hjson":
+		if err := unmarshalJSONLike(data, tmpl, format != "json"); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal JSON-like template: %w", err)
 		}
 	default:
 		return nil, fmt.Errorf("unsupported template format: %s", format)
@@ -619,7 +618,9 @@ func isLegacyTemplateData(data []byte) bool {
 		DefaultsComputed map[string]any `json:"defaultsComputed" yaml:"defaultsComputed"`
 	}
 	if err := yaml.Unmarshal(data, &probe); err != nil {
-		return false
+		if err := unmarshalJSONLike(data, &probe, false); err != nil {
+			return false
+		}
 	}
 	ver := strings.TrimSpace(strings.ToLower(probe.TemplateVer))
 	if ver != "" {
