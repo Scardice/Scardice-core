@@ -675,7 +675,7 @@ func collectHelpDocFiles(root string) ([]helpDocFileInfo, error) {
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(d.Name()))
-		if ext != ".json" && ext != ".xlsx" {
+		if ext != ".json" && ext != ".jsonc" && ext != ".hjson" && ext != ".xlsx" {
 			return nil
 		}
 		info, err := d.Info()
@@ -813,10 +813,10 @@ func (m *HelpManager) loadHelpDoc(group string, path string, logLoad bool) bool 
 	if logLoad {
 		log.Infof("[帮助文档] 加载: %s", path)
 	}
-	fileExt := filepath.Ext(path)
+	fileExt := strings.ToLower(filepath.Ext(path))
 
 	switch fileExt {
-	case ".json":
+	case ".json", ".jsonc", ".hjson":
 		m.LoadingFn = path
 		items, ok := m.loadHelpDocItemsFromCache(group, path)
 		if !ok {
@@ -860,7 +860,8 @@ func parseHelpDocJSON(group string, path string) ([]docengine.HelpTextItem, erro
 		return nil, err
 	}
 	data := HelpDocFormat{}
-	if err := json.Unmarshal(pack, &data); err != nil {
+	ext := strings.ToLower(filepath.Ext(path))
+	if err := unmarshalJSONLike(pack, &data, ext == ".jsonc" || ext == ".hjson"); err != nil {
 		return nil, err
 	}
 	for k, v := range data.Helpdoc {

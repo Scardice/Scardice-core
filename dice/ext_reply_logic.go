@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -338,7 +339,14 @@ func (c *ReplyConfig) Save(dice *Dice) {
 }
 
 func (c *ReplyConfig) SaveToPath(filePath string) error {
-	buf, err := yaml.Marshal(c)
+	var buf []byte
+	var err error
+	switch strings.ToLower(filepath.Ext(filePath)) {
+	case ".json", ".jsonc", ".hjson":
+		buf, err = json.MarshalIndent(c, "", "  ")
+	default:
+		buf, err = yaml.Marshal(c)
+	}
 	if err != nil {
 		return err
 	}

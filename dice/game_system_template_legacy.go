@@ -1,7 +1,6 @@
 package dice
 
 import (
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -58,8 +57,8 @@ func parseLegacyTemplate(data []byte, format string) (*legacyTemplate, error) {
 	var tmpl legacyTemplate
 	var err error
 	switch strings.ToLower(format) {
-	case "json":
-		err = json.Unmarshal(data, &tmpl)
+	case "json", "jsonc", "hjson":
+		err = unmarshalJSONLike(data, &tmpl, strings.ToLower(format) != "json")
 	case "yaml", "yml":
 		err = yaml.Unmarshal(data, &tmpl)
 	default:
