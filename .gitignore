@@ -45,6 +45,7 @@ _help_cache
 !.vscode/settings.json
 !.vscode/extensions.json
 Scardice-lock.lock
+.worktrees/
 upgrade_metadata.json
 
 /signature/**/*
