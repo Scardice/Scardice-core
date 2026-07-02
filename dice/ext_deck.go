@@ -31,6 +31,8 @@ import (
 	"github.com/sahilm/fuzzy"
 	"github.com/tailscale/hujson"
 	"gopkg.in/yaml.v3"
+
+	"Scardice-core/utils"
 )
 
 const (
@@ -792,7 +794,7 @@ func writeDeckIndexManifest(manifest deckIndexManifest) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(deckIndexManifestPath, data, 0o644)
+	return utils.AtomicWriteFile(deckIndexManifestPath, data, 0o644)
 }
 
 func diffDeckSourceFiles(oldFiles, curFiles []deckSourceFileInfo) (deletedPaths []string, changedPaths []string) {
@@ -1751,7 +1753,7 @@ func (d *Dice) DeckUpdate(deckInfo *DeckInfo, tempFileName string) error {
 	if !strings.HasPrefix(filenameAbs, decksDirAbs+string(filepath.Separator)) {
 		return fmt.Errorf("deck filename %q is outside decks directory", deckInfo.Filename)
 	}
-	err = os.WriteFile(filenameAbs, newData, 0755) //nolint:gosec
+	err = utils.AtomicWriteFile(filenameAbs, newData, 0755)
 	if err != nil {
 		d.Logger.Errorf("牌堆“%s”更新时保存文件出错，%s", deckInfo.Name, err.Error())
 		return err
@@ -1788,7 +1790,7 @@ func (d *Dice) DeckDownload(name string, ext string, url string, hash map[string
 		d.Logger.Errorf("牌堆“%s”下载时检查到同名文件", name)
 		return errors.New("存在文件名相同的牌堆")
 	}
-	err = os.WriteFile(target, deck, 0755)
+	err = utils.AtomicWriteFile(target, deck, 0755)
 	if err != nil {
 		d.Logger.Errorf("牌堆“%s”下载时保存文件出错，%s", name, err.Error())
 		return err

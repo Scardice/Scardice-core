@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"Scardice-core/logger"
+	"Scardice-core/utils"
 )
 
 func Base64ToImageFunc() func(string) (string, error) {
@@ -28,18 +29,7 @@ func Base64ToImageFunc() func(string) (string, error) {
 		imageurlPath := filepath.Join(tempDir, filename)
 		imageurlPath = filepath.ToSlash(imageurlPath)
 		// 将数据写入文件
-		fi, err := os.OpenFile(imageurlPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0664)
-		if err != nil {
-			return "", errors.New("创建文件出错:" + err.Error())
-		}
-		defer func(fi *os.File) {
-			errClose := fi.Close()
-			if errClose != nil {
-				log.Errorf("关闭文件出错:%s", errClose.Error())
-			}
-		}(fi)
-		_, err = fi.Write(data)
-		if err != nil {
+		if err := utils.AtomicWriteFile(imageurlPath, data, 0o664); err != nil {
 			return "", errors.New("写入文件出错:" + err.Error())
 		}
 		log.Info("File saved to:", imageurlPath)

@@ -20,6 +20,7 @@ import (
 	"github.com/Masterminds/semver/v3"
 
 	"Scardice-core/dice/sealpack"
+	"Scardice-core/utils"
 )
 
 const maxPackageArchiveSize int64 = 128 << 20
@@ -668,7 +669,7 @@ func (pm *PackageManager) saveState() error {
 		return err
 	}
 
-	return os.WriteFile(pm.getStatePath(), data, 0644)
+	return utils.AtomicWriteFile(pm.getStatePath(), data, 0644)
 }
 
 func loadPackageConfigFromUserData(userDataPath string) (map[string]interface{}, error) {
@@ -1387,7 +1388,7 @@ func (pm *PackageManager) SetConfig(pkgID string, config map[string]interface{})
 		return err
 	}
 
-	if err := os.WriteFile(configPath, data, 0644); err != nil {
+	if err := utils.AtomicWriteFile(configPath, data, 0644); err != nil {
 		return err
 	}
 
@@ -2020,17 +2021,7 @@ func (pm *PackageManager) copyFile(src, dst string) error {
 	}
 	defer srcFile.Close()
 
-	dstFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer dstFile.Close()
-
-	if _, err := io.Copy(dstFile, srcFile); err != nil {
-		return err
-	}
-
-	return dstFile.Sync()
+	return utils.AtomicWriteReader(dst, srcFile, 0o644)
 }
 
 func downloadPackageArchive(url string) (int, []byte, error) {

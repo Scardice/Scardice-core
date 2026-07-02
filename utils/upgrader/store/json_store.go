@@ -6,6 +6,7 @@ import (
 	"os"
 	"sync"
 
+	"Scardice-core/utils"
 	upgrade "Scardice-core/utils/upgrader"
 )
 
@@ -49,15 +50,13 @@ func (js *JSONStore) save() error {
 	js.mutex.Lock()
 	defer js.mutex.Unlock()
 
-	f, err := os.Create(js.Path)
+	data, err := json.MarshalIndent(js.data, "", "  ")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	data = append(data, '\n')
 
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	return enc.Encode(js.data)
+	return utils.AtomicWriteFile(js.Path, data, 0o644)
 }
 
 func (js *JSONStore) IsApplied(id string) (bool, error) {

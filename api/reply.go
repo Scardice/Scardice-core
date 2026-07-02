@@ -1,7 +1,6 @@
 package api
 
 import (
-	"io"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -11,6 +10,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"Scardice-core/dice"
+	"Scardice-core/utils"
 )
 
 const customReplyPackageWarning = "此文件来自扩展包运行时缓存，重装、刷新缓存或升级扩展包时可能被覆盖"
@@ -339,17 +339,7 @@ func customReplyFileUpload(c echo.Context) error {
 
 	if !dice.CustomReplyConfigCheckExists(myDice, file.Filename) {
 		myDice.Logger.Infof("上传自定义文件: %s", thePath)
-		var dst *os.File
-		dst, err = os.Create(thePath)
-		if err != nil {
-			return err
-		}
-		defer func(dst *os.File) {
-			_ = dst.Close()
-		}(dst)
-
-		// Copy
-		if _, err = io.Copy(dst, src); err != nil {
+		if err = utils.AtomicWriteReader(thePath, src, 0o644); err != nil {
 			return err
 		}
 		dice.ReplyReload(myDice)

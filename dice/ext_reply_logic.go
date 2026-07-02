@@ -3,7 +3,6 @@ package dice
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -13,6 +12,8 @@ import (
 
 	"github.com/antlabs/strsim"
 	"gopkg.in/yaml.v3"
+
+	"Scardice-core/utils"
 )
 
 type ReplyConditionBase interface {
@@ -350,7 +351,7 @@ func (c *ReplyConfig) SaveToPath(filePath string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filePath, buf, 0644)
+	return utils.AtomicWriteFile(filePath, buf, 0644)
 }
 
 func (c *ReplyConfig) Clean() {

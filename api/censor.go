@@ -3,7 +3,6 @@ package api
 import (
 	"bufio"
 	"encoding/json"
-	"io"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -19,6 +18,7 @@ import (
 	"Scardice-core/dice"
 	"Scardice-core/dice/censor"
 	"Scardice-core/dice/service"
+	"Scardice-core/utils"
 )
 
 func check(c echo.Context) (bool, error) {
@@ -419,15 +419,7 @@ func censorUploadWordFiles(c echo.Context) error {
 
 	file.Filename = strings.ReplaceAll(file.Filename, "/", "_")
 	file.Filename = strings.ReplaceAll(file.Filename, "\\", "_")
-	dst, err := os.Create(filepath.Join("./data/censor", file.Filename))
-	if err != nil {
-		return err
-	}
-	defer func(dst *os.File) {
-		_ = dst.Close()
-	}(dst)
-
-	if _, err = io.Copy(dst, src); err != nil {
+	if err = utils.AtomicWriteReader(filepath.Join("./data/censor", file.Filename), src, 0o644); err != nil {
 		return err
 	}
 

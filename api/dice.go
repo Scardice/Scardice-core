@@ -1,13 +1,13 @@
 package api
 
 import (
-	"io"
 	"mime/multipart"
 	"net/http"
-	"os"
 	"runtime"
 
 	"github.com/labstack/echo/v4"
+
+	"Scardice-core/utils"
 )
 
 func DiceNewVersionUpload(c echo.Context) error {
@@ -56,16 +56,9 @@ func DiceNewVersionUpload(c echo.Context) error {
 		fn += ".tar.gz"
 	}
 
-	f2, err := os.OpenFile(fn, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
+	if err = utils.AtomicWriteReader(fn, src, 0o644); err != nil {
 		return Error(&c, err.Error(), Response{})
 	}
-	_, err = io.Copy(f2, src)
-	if err != nil {
-		return Error(&c, err.Error(), Response{})
-	}
-
-	f2.Close()
 
 	myDice.Logger.Info("新版本骰子上传成功")
 

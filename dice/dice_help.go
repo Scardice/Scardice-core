@@ -21,6 +21,7 @@ import (
 
 	"Scardice-core/dice/docengine"
 	"Scardice-core/logger"
+	"Scardice-core/utils"
 
 	"gopkg.in/yaml.v3"
 
@@ -502,7 +503,7 @@ func writeHelpIndexManifest(manifest helpIndexManifest) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(helpIndexManifestPath, data, 0o644)
+	return utils.AtomicWriteFile(helpIndexManifestPath, data, 0o644)
 }
 
 func (m *HelpManager) updateHelpIndexIncremental(oldFiles, curFiles []helpDocFileInfo) (bool, error) {
@@ -798,7 +799,7 @@ func (m *HelpManager) SaveHelpConfig(config *HelpConfig) error {
 	if err != nil {
 		return err
 	}
-	err = os.WriteFile(filepath.Join("./data/helpdoc", HelpConfigFilename), data, 0644)
+	err = utils.AtomicWriteFile(filepath.Join("./data/helpdoc", HelpConfigFilename), data, 0644)
 	if err != nil {
 		return err
 	}
@@ -1296,15 +1297,7 @@ func (m *HelpManager) UploadHelpDoc(src io.Reader, group string, name string) er
 	}
 
 	filePath := filepath.Join(dirPath, name)
-	dst, err := os.Create(filePath)
-	if err != nil {
-		return err
-	}
-	defer func(dst *os.File) {
-		_ = dst.Close()
-	}(dst)
-
-	if _, err = io.Copy(dst, src); err != nil {
+	if err = utils.AtomicWriteReader(filePath, src, 0o644); err != nil {
 		return err
 	}
 

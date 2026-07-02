@@ -38,6 +38,7 @@ import (
 	"gopkg.in/elazarl/goproxy.v1"
 
 	"Scardice-core/static"
+	"Scardice-core/utils"
 	"Scardice-core/utils/crypto"
 
 	sealabort "Scardice-core/utils/plugin/abort"
@@ -1612,13 +1613,13 @@ func (d *Dice) JsLoadScripts() {
 			// 判断是否有更新后的内置脚本
 			_, err := os.Stat(target)
 			if errors.Is(err, os.ErrNotExist) {
-				_ = os.WriteFile(target, data, 0o644)
+				_ = utils.AtomicWriteFile(target, data, 0o644)
 			} else {
 				// 检查同名内置脚本的签名，检查不通过则覆盖
 				scriptData, _ := os.ReadFile(target)
 				if ok, _ := CheckJsSign(scriptData); !ok {
 					d.Logger.Warnf("已存在的内置脚本「%s」未通过校验，进行覆盖", script.Name())
-					_ = os.WriteFile(target, scriptData, 0o644) //nolint:gosec
+					_ = utils.AtomicWriteFile(target, scriptData, 0o644)
 				}
 			}
 		}
@@ -2393,7 +2394,7 @@ func (d *Dice) JsUpdate(jsScriptInfo *JsScriptInfo, tempFileName string) error {
 	if !strings.HasPrefix(filenameAbs, scriptsDirAbs+string(filepath.Separator)) {
 		return fmt.Errorf("script filename %q is outside scripts directory", jsScriptInfo.Filename)
 	}
-	err = os.WriteFile(filenameAbs, newData, 0o755) //nolint:gosec
+	err = utils.AtomicWriteFile(filenameAbs, newData, 0o755)
 	if err != nil {
 		d.Logger.Errorf("插件“%s”更新时保存文件出错，%s", jsScriptInfo.Name, err.Error())
 		return err
@@ -2913,7 +2914,7 @@ func (d *Dice) JsDownload(name string, url string, hash map[string]string) error
 		d.Logger.Errorf("JS 插件“%s”下载时检查到同名文件", name)
 		return errors.New("存在文件名相同的 JS 插件")
 	}
-	err = os.WriteFile(target, deck, 0755)
+	err = utils.AtomicWriteFile(target, deck, 0755)
 	if err != nil {
 		d.Logger.Errorf("JS 插件“%s”下载时保存文件出错，%s", name, err.Error())
 		return err

@@ -2,10 +2,8 @@ package api
 
 import (
 	"fmt"
-	"io"
 	"mime/multipart"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -13,6 +11,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"Scardice-core/dice"
+	"Scardice-core/utils"
 )
 
 func jsExec(c echo.Context) error {
@@ -183,16 +182,7 @@ func jsUpload(c echo.Context) error {
 	// fmt.Println("????", filepath.Join("./data/decks", file.Filename))
 	file.Filename = strings.ReplaceAll(file.Filename, "/", "_")
 	file.Filename = strings.ReplaceAll(file.Filename, "\\", "_")
-	dst, err := os.Create(filepath.Join(myDice.BaseConfig.DataDir, "scripts", file.Filename))
-	if err != nil {
-		return err
-	}
-	defer func(dst *os.File) {
-		_ = dst.Close()
-	}(dst)
-
-	// Copy
-	if _, err = io.Copy(dst, src); err != nil {
+	if err = utils.AtomicWriteReader(filepath.Join(myDice.BaseConfig.DataDir, "scripts", file.Filename), src, 0o644); err != nil {
 		return err
 	}
 
