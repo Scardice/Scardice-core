@@ -8,6 +8,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	"Scardice-core/utils"
 )
 
 var allowedArchiveRoots = map[string]struct{}{
@@ -84,22 +86,12 @@ func ExtractArchive(pkgPath, destDir string) (*ArchiveInfo, error) {
 		if mode.Perm() == 0 {
 			mode = 0o644
 		}
-		out, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
-		if err != nil {
-			rc.Close()
-			return nil, err
+		writeErr := utils.AtomicWriteReader(targetPath, rc, mode.Perm())
+		if closeErr := rc.Close(); closeErr != nil && writeErr == nil {
+			writeErr = closeErr
 		}
-		if _, err := io.Copy(out, rc); err != nil {
-			out.Close()
-			rc.Close()
-			return nil, err
-		}
-		if err := out.Close(); err != nil {
-			rc.Close()
-			return nil, err
-		}
-		if err := rc.Close(); err != nil {
-			return nil, err
+		if writeErr != nil {
+			return nil, writeErr
 		}
 	}
 

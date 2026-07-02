@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pelletier/go-toml/v2"
 
+	"Scardice-core/utils"
 	"Scardice-core/utils/procs"
 )
 
@@ -166,7 +167,7 @@ func WalleQServe(dice *Dice, conn *EndPointInfo, password string, protocol int, 
 		wqc.Onebot.HTTPWebhook = make([]interface{}, 0)
 		b := new(bytes.Buffer)
 		_ = toml.NewEncoder(b).Encode(wqc)
-		_ = os.WriteFile(configFilePath, b.Bytes(), 0o644)
+		_ = utils.AtomicWriteFile(configFilePath, b.Bytes(), 0o644)
 	} else { //nolint
 		// 如果决定使用单进程 wq
 		/*
@@ -182,7 +183,7 @@ func WalleQServe(dice *Dice, conn *EndPointInfo, password string, protocol int, 
 			}
 			b := new(bytes.Buffer)
 			err = toml.NewEncoder(b).Encode(wqc)
-			_ = os.WriteFile(configFilePath, []byte(b.String()), 0644)
+			_ = utils.AtomicWriteFile(configFilePath, []byte(b.String()), 0644)
 		*/
 	}
 	wd, _ := os.Getwd()
@@ -310,7 +311,7 @@ func (pa *PlatformAdapterWalleQ) SetQQProtocol(protocol int) bool {
 	}
 	b := new(bytes.Buffer)
 	_ = toml.NewEncoder(b).Encode(wqc)
-	_ = os.WriteFile(wd, b.Bytes(), 0o644)
+	_ = utils.AtomicWriteFile(wd, b.Bytes(), 0o644)
 	return true
 }
 

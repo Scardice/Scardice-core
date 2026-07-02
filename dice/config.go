@@ -21,6 +21,7 @@ import (
 	"Scardice-core/dice/service"
 	"Scardice-core/logger"
 	"Scardice-core/model"
+	"Scardice-core/utils"
 )
 
 // type TextTemplateWithWeight = map[string]map[string]uint
@@ -403,22 +404,13 @@ func (cm *ConfigManager) ResetConfigToDefault(pluginName, key string) {
 }
 
 func (cm *ConfigManager) save() error {
-	file, err := os.OpenFile(cm.filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	data, err := json.MarshalIndent(cm.Plugins, "", "\t")
 	if err != nil {
 		return err
 	}
-	defer func(file *os.File) {
-		_ = file.Close()
-	}(file)
+	data = append(data, '\n')
 
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "\t")
-	err = encoder.Encode(cm.Plugins)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return utils.AtomicWriteFile(cm.filename, data, 0o644)
 }
 
 func (cm *ConfigManager) Load() error {
@@ -2488,14 +2480,14 @@ func (d *Dice) SaveText() {
 		// ioutil.WriteFile(filepath.Join(d.BaseConfig.DataDir, "configs/text-template.yaml"), buf, 0644)
 		current, err := os.ReadFile(newFn)
 		if err == nil {
-			if writeErr := os.WriteFile(bakFn, current, 0o644); writeErr != nil { //nolint:gosec
+			if writeErr := utils.AtomicWriteFile(bakFn, current, 0o644); writeErr != nil {
 				d.Logger.Error("Dice.SaveText backup", writeErr)
 			}
 		} else if !os.IsNotExist(err) {
 			d.Logger.Error("Dice.SaveText read current", err)
 		}
 
-		if writeErr := os.WriteFile(newFn, buf, 0o644); writeErr != nil {
+		if writeErr := utils.AtomicWriteFile(newFn, buf, 0o644); writeErr != nil {
 			d.Logger.Error("Dice.SaveText write", writeErr)
 		}
 	}
@@ -2631,8 +2623,8 @@ func (d *Dice) Save(isAuto bool) {
 		advancedData, err2 := yaml.Marshal(d.AdvancedConfig)
 
 		if err1 == nil && err2 == nil {
-			err1 := os.WriteFile(filepath.Join(d.BaseConfig.DataDir, "serve.yaml"), a, 0o644)
-			err2 := os.WriteFile(filepath.Join(d.BaseConfig.DataDir, "advanced.yaml"), advancedData, 0o644)
+			err1 := utils.AtomicWriteFile(filepath.Join(d.BaseConfig.DataDir, "serve.yaml"), a, 0o644)
+			err2 := utils.AtomicWriteFile(filepath.Join(d.BaseConfig.DataDir, "advanced.yaml"), advancedData, 0o644)
 			if err1 == nil && err2 == nil {
 				now := time.Now()
 				d.Config.LastSavedTime = &now

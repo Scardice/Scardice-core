@@ -12,6 +12,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"Scardice-core/logger"
+	"Scardice-core/utils"
 	"Scardice-core/utils/dboperator/engine"
 )
 
@@ -275,7 +276,7 @@ func (dm *DiceManager) Save() {
 
 	data, err := yaml.Marshal(dc) //nolint:gosec
 	if err == nil {
-		_ = os.WriteFile("./data/dice.yaml", data, 0644)
+		_ = utils.AtomicWriteFile("./data/dice.yaml", data, 0644)
 	}
 }
 

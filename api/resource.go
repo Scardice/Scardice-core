@@ -3,7 +3,6 @@ package api
 import (
 	"bytes"
 	"errors"
-	"io"
 	"io/fs"
 	"mime/multipart"
 	"net/http"
@@ -13,6 +12,8 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/sunshineplan/imgconv"
+
+	"Scardice-core/utils"
 )
 
 type resourceType string
@@ -149,17 +150,7 @@ func resourceUpload(c echo.Context) error {
 		}
 
 		myDice.Logger.Infof("保存资源文件: %s", path)
-		var dst *os.File
-		dst, err = os.Create(path)
-		if err != nil {
-			errors = append(errors, file.Filename)
-			continue
-		}
-		defer func(dst *os.File) {
-			_ = dst.Close()
-		}(dst)
-
-		if _, err = io.Copy(dst, src); err != nil {
+		if err = utils.AtomicWriteReader(path, src, 0o644); err != nil {
 			errors = append(errors, file.Filename)
 			continue
 		}

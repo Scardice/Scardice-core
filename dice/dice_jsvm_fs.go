@@ -9,6 +9,8 @@ import (
 
 	"github.com/dop251/goja"
 	"github.com/dop251/goja_nodejs/eventloop"
+
+	"Scardice-core/utils"
 )
 
 const (
@@ -271,7 +273,7 @@ func jsFsWriteFile(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value
 		if err := jsFsEnsureParent(resolved); err != nil {
 			jsFsThrow(vm, err)
 		}
-		if err := os.WriteFile(resolved.abs, data, mode); err != nil {
+		if err := utils.AtomicWriteFile(resolved.abs, data, mode); err != nil {
 			jsFsThrow(vm, err)
 		}
 		return goja.Undefined()
@@ -336,7 +338,7 @@ func jsFsWriteFileAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) fu
 			if err := jsFsEnsureParent(resolved); err != nil {
 				return nil, err
 			}
-			if err := os.WriteFile(resolved.abs, data, mode); err != nil {
+			if err := utils.AtomicWriteFile(resolved.abs, data, mode); err != nil {
 				return nil, err
 			}
 			return nil, nil

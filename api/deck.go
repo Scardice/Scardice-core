@@ -1,16 +1,15 @@
 package api
 
 import (
-	"io"
 	"mime/multipart"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/labstack/echo/v4"
 
 	"Scardice-core/dice"
+	"Scardice-core/utils"
 )
 
 func deckList(c echo.Context) error {
@@ -70,16 +69,7 @@ func deckUpload(c echo.Context) error {
 
 	file.Filename = strings.ReplaceAll(file.Filename, "/", "_")
 	file.Filename = strings.ReplaceAll(file.Filename, "\\", "_")
-	dst, err := os.Create(filepath.Join("./data/decks", file.Filename))
-	if err != nil {
-		return err
-	}
-	defer func(dst *os.File) {
-		_ = dst.Close()
-	}(dst)
-
-	// Copy
-	if _, err = io.Copy(dst, src); err != nil {
+	if err = utils.AtomicWriteReader(filepath.Join("./data/decks", file.Filename), src, 0o644); err != nil {
 		return err
 	}
 

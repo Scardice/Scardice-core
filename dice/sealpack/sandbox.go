@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"Scardice-core/utils"
 )
 
 // PermissionError 权限违规错误
@@ -314,7 +316,7 @@ func (fs *SandboxedFS) WriteFile(path string, data []byte, perm os.FileMode) err
 		return err
 	}
 
-	return os.WriteFile(fullPath, data, perm)
+	return utils.AtomicWriteFile(fullPath, data, perm)
 }
 
 // Stat 沙箱化的文件状态查询

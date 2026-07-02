@@ -19,6 +19,7 @@ import (
 	"go.uber.org/zap"
 
 	"Scardice-core/logger"
+	"Scardice-core/utils"
 	"Scardice-core/utils/procs"
 )
 
@@ -254,7 +255,7 @@ func ServeMilkyBuiltIn(d *Dice, ep *EndPointInfo) {
 		accessToken := uuid.NewString()
 		pa.Token = accessToken
 		c := GenerateMilkyConfig(p, SealSignV3Url, accessToken, ep)
-		err = os.WriteFile(configFilePath, c, 0o644)
+		err = utils.AtomicWriteFile(configFilePath, c, 0o644)
 		if err != nil {
 			log.Errorf("写入 Milky 配置文件失败: %s", err)
 		}

@@ -22,6 +22,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	logger "Scardice-core/logger"
+	"Scardice-core/utils"
 	"Scardice-core/utils/procs"
 )
 
@@ -124,9 +125,9 @@ func LagrangeServe(dice *Dice, conn *EndPointInfo, loginInfo LagrangeLoginInfo) 
 				if _, err := os.Stat(dir); err != nil {
 					_ = os.MkdirAll(dir, 0o755)
 				}
-				_ = os.WriteFile(appinfoFilePath, a, 0o644)
+				_ = utils.AtomicWriteFile(appinfoFilePath, a, 0o644)
 			}
-			_ = os.WriteFile(configFilePath, c, 0o644)
+			_ = utils.AtomicWriteFile(configFilePath, c, 0o644)
 		}
 
 		if pa.GoCqhttpProcess != nil {
@@ -443,7 +444,7 @@ func lagrangeGetSignInfoFromCloud(cachePath string) ([]SignInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	_ = os.WriteFile(cachePath, body, 0o644)
+	_ = utils.AtomicWriteFile(cachePath, body, 0o644)
 	lagrangeGetSignServerLatency(signInfo)
 	return signInfo, nil
 }

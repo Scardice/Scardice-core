@@ -23,6 +23,7 @@ import (
 
 	"Scardice-core/dice/events"
 	"Scardice-core/message"
+	"Scardice-core/utils"
 	"Scardice-core/utils/procs"
 
 	"github.com/gorilla/websocket"
@@ -1282,7 +1283,7 @@ func (pa *PlatformAdapterGocq) SetQQProtocol(protocol int) bool {
 			info["protocol"] = protocol
 			data, err := json.Marshal(info)
 			if err == nil {
-				_ = os.WriteFile(deviceFilePath, data, 0644)
+				_ = utils.AtomicWriteFile(deviceFilePath, data, 0644)
 				return true
 			}
 		}
@@ -1313,7 +1314,7 @@ func (pa *PlatformAdapterGocq) SetSignServer(signServerConfig *SignServerConfig)
 			}
 			data, err := yaml.Marshal(info)
 			if err == nil {
-				_ = os.WriteFile(configFilePath, data, 0644)
+				_ = utils.AtomicWriteFile(configFilePath, data, 0644)
 				return true
 			}
 		}

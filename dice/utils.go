@@ -22,6 +22,8 @@ import (
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
 	"gopkg.in/yaml.v3"
+
+	"Scardice-core/utils"
 )
 
 type Int64SliceDesc []int64
@@ -492,16 +494,7 @@ func unzipFile(f *zip.File, destination string) error {
 		return err
 	}
 
-	// 6. Create a destination file for unzipped content
-	destinationFile, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
-	if err != nil {
-		return err
-	}
-	defer func(destinationFile *os.File) {
-		_ = destinationFile.Close()
-	}(destinationFile)
-
-	// 7. Unzip the content of a file and copy it to the destination file
+	// 6. Unzip the content of a file and copy it to the destination file
 	zippedFile, err := f.Open()
 	if err != nil {
 		return err
@@ -510,7 +503,7 @@ func unzipFile(f *zip.File, destination string) error {
 		_ = zippedFile.Close()
 	}(zippedFile)
 
-	if _, err := io.Copy(destinationFile, zippedFile); err != nil {
+	if err := utils.AtomicWriteReader(filePath, zippedFile, f.Mode().Perm()); err != nil {
 		return err
 	}
 	return nil
