@@ -135,8 +135,6 @@ github.com/fy0/GoWebsocket v0.0.0-20231128163937-aa5c110b25c6 h1:bOi4XAJ2MQ1HWl9
 github.com/fy0/GoWebsocket v0.0.0-20231128163937-aa5c110b25c6/go.mod h1:h00QywbM5Le22ESUiI8Yz2/9TVGD8eAz/cAk55Kcz/E=
 github.com/fy0/go-autostart v0.0.0-20220515100644-a25d81ed766b h1:oYFzJ7T4EtnnFABiwxxfaKaiSpcqnzIKtEO5u9c3hjY=
 github.com/fy0/go-autostart v0.0.0-20220515100644-a25d81ed766b/go.mod h1:aj2gFh4bN+TVFjaA7Rawb3FHPL9YWNipWWf2rq1+79o=
-github.com/fy0/gojax v0.0.0-20221225152702-4140cf8509bd h1:ZVKtGnfRxmpTTG88wgEl1I6MafxwweizlKBj5GB9iDQ=
-github.com/fy0/gojax v0.0.0-20221225152702-4140cf8509bd/go.mod h1:tp39103NQBALCrB1zDwNVlhsd6dVce4Xq2TT0urctqQ=
 github.com/fy0/systray v1.2.2 h1:WUF+1ktzx5Ly0VsD8lC3ZXC/6gJS1QYwaDGZcwH/kcE=
 github.com/fy0/systray v1.2.2/go.mod h1:MS9IFfZENC18mgf9sQh6WHIH/DX2KEjGrTSB2KMiuJ0=
 github.com/fyrchik/go-shlex v0.0.0-20210215145004-cd7f49bfd959 h1:vRVfi8lpnfa/kKTyUbIY+NYXJTFJm/At55QPjVUO958=
