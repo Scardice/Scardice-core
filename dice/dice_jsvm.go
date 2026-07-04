@@ -29,7 +29,6 @@ import (
 	"github.com/dop251/goja_nodejs/url"
 	"github.com/dop251/goja_nodejs/util"
 	esbuild "github.com/evanw/esbuild/pkg/api"
-	fetch "github.com/fy0/gojax/fetch"
 	"github.com/golang-module/carbon"
 	"github.com/pkg/errors"
 	"github.com/robfig/cron/v3"
@@ -355,8 +354,8 @@ func (d *Dice) JsInit() {
 		eventloop.WithRegistry(reg),
 		eventloop.WithDebugLog(true),
 		eventloop.WithLogger(d.Logger))
-	_ = fetch.Enable(loop, goproxy.NewProxyHttpServer())
 	versionID := d.ExtLoopManager.SetLoop(loop)
+	proxy := goproxy.NewProxyHttpServer()
 
 	printer := &PrinterFunc{d, false, []string{}}
 	d.JsPrinter = printer
@@ -393,6 +392,9 @@ func (d *Dice) JsInit() {
 		url.Enable(vm)
 		sealabort.Enable(vm)
 		sealhttp.Enable(vm)
+		if err := sealhttp.EnableFetch(vm, loop, proxy); err != nil {
+			panic(err)
+		}
 		sealsclone.Enable(vm)
 		sealutil.Enable(vm)
 		jsFsEnable(vm, d, loop)
