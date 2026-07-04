@@ -331,9 +331,9 @@ func newMilkyQuitCommandTestContext(t *testing.T, d *Dice, senderID, groupID, gr
 		EndPointInfoBase: EndPointInfoBase{UserID: testMilkyBotUserID, Platform: "QQ", ProtocolType: "milky", Nickname: "MilkyBot"},
 	}
 	pa.EndPoint = ep
-	pa.Session = d.ImSession
 	pa.IntentSession = session
 	ep.Adapter = pa
+	ep.BindRuntime(d.ImSession)
 
 	d.Config.BotExitWithoutAt = true
 	ctx, msg := newQuitCommandTestContext(t, d, ep, senderID, groupID, groupName)
@@ -381,9 +381,9 @@ func TestDismissMilkyLookupErrorFallsBackToSafetyConfirmation(t *testing.T) {
 	pa := &PlatformAdapterMilky{}
 	ep := &EndPointInfo{EndPointInfoBase: EndPointInfoBase{UserID: "QQ:10020", Platform: "QQ", ProtocolType: "milky", Nickname: "MilkyBot"}}
 	pa.EndPoint = ep
-	pa.Session = d.ImSession
 	pa.IntentSession = session
 	ep.Adapter = pa
+	ep.BindRuntime(d.ImSession)
 
 	d.Config.BotExitWithoutAt = true
 	ctx, msg := newQuitCommandTestContext(t, d, ep, "QQ:9020", testMilkyFallbackGroupID, "MilkyFallbackGroup")

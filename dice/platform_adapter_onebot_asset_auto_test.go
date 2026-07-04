@@ -54,11 +54,11 @@ func TestExtractServePort_DefaultAndParsed(t *testing.T) {
 	}
 	for _, c := range cases {
 		p := &PlatformAdapterOnebot{
-			Session: &IMSession{
+			EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Session: &IMSession{
 				Parent: &Dice{
 					Parent: &DiceManager{ServeAddress: c.addr},
 				},
-			},
+			}}},
 			logger: zap.NewNop().Sugar(),
 		}
 		got := p.extractServePort()
@@ -71,9 +71,9 @@ func TestExtractServePort_DefaultAndParsed(t *testing.T) {
 func TestDeriveImageAssetBaseURL_UserConfigWins(t *testing.T) {
 	p := &PlatformAdapterOnebot{
 		ImageAssetBaseURL: "http://user-configured:9999",
-		Session: &IMSession{
+		EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Session: &IMSession{
 			Parent: &Dice{Parent: &DiceManager{ServeAddress: "0.0.0.0:3211"}},
-		},
+		}}},
 		logger: zap.NewNop().Sugar(),
 	}
 	url, candidates := p.DeriveImageAssetBaseURLForDisplay()
@@ -88,9 +88,9 @@ func TestDeriveImageAssetBaseURL_UserConfigWins(t *testing.T) {
 func TestDeriveImageAssetBaseURL_AutoFallbackToLoopback(t *testing.T) {
 	// 在无网卡或仅有 loopback 的测试环境，自动推导应兜底 127.0.0.1
 	p := &PlatformAdapterOnebot{
-		Session: &IMSession{
+		EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Session: &IMSession{
 			Parent: &Dice{Parent: &DiceManager{ServeAddress: "0.0.0.0:3211"}},
-		},
+		}}},
 		logger: zap.NewNop().Sugar(),
 	}
 	url, candidates := p.DeriveImageAssetBaseURLForDisplay()
@@ -109,9 +109,9 @@ func TestDeriveImageAssetBaseURL_AutoFallbackToLoopback(t *testing.T) {
 
 func TestInvalidateDerivedBaseURL_ResetsCache(t *testing.T) {
 	p := &PlatformAdapterOnebot{
-		Session: &IMSession{
+		EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Session: &IMSession{
 			Parent: &Dice{Parent: &DiceManager{ServeAddress: "0.0.0.0:3211"}},
-		},
+		}}},
 		logger: zap.NewNop().Sugar(),
 	}
 	// 第一次推导，写入缓存
@@ -143,9 +143,9 @@ func TestInvalidateDerivedBaseURL_ResetsCache(t *testing.T) {
 // 与并发 deriveImageAssetBaseURL 的 Do 调用访问同一字段会产生 DATA RACE。
 func TestDeriveImageAssetBaseURL_ConcurrentWithInvalidate(t *testing.T) {
 	p := &PlatformAdapterOnebot{
-		Session: &IMSession{
+		EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Session: &IMSession{
 			Parent: &Dice{Parent: &DiceManager{ServeAddress: "0.0.0.0:3211"}},
-		},
+		}}},
 		logger: zap.NewNop().Sugar(),
 	}
 
@@ -175,9 +175,9 @@ func TestDeriveImageAssetBaseURL_ConcurrentWithInvalidate(t *testing.T) {
 // enumNonLoopbackIPv4 顺序不稳定导致 url 和 candidates 可能不匹配）。
 func TestDeriveImageAssetBaseURLForDisplay_UrlConsistentWithCandidates(t *testing.T) {
 	p := &PlatformAdapterOnebot{
-		Session: &IMSession{
+		EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Session: &IMSession{
 			Parent: &Dice{Parent: &DiceManager{ServeAddress: "0.0.0.0:3211"}},
-		},
+		}}},
 		logger: zap.NewNop().Sugar(),
 	}
 	url, candidates := p.DeriveImageAssetBaseURLForDisplay()
