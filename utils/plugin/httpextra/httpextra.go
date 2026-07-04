@@ -26,6 +26,8 @@ type headersData struct {
 	store map[string][]string
 }
 
+const sealHeadersDataKey = "__sealHeadersData"
+
 func newHeadersData() *headersData {
 	return &headersData{store: make(map[string][]string)}
 }
@@ -109,6 +111,7 @@ func newHeadersCtor(rt *goja.Runtime) func(call goja.ConstructorCall) *goja.Obje
 }
 
 func bindHeaders(rt *goja.Runtime, obj *goja.Object, data *headersData) {
+	_ = obj.Set(sealHeadersDataKey, data)
 	_ = obj.Set("get", func(call goja.FunctionCall) goja.Value {
 		return rt.ToValue(data.get(call.Argument(0).String()))
 	})
@@ -149,6 +152,14 @@ func bindHeaders(rt *goja.Runtime, obj *goja.Object, data *headersData) {
 
 func fillHeaders(rt *goja.Runtime, data *headersData, init goja.Value) {
 	if obj, ok := init.(*goja.Object); ok {
+		if internal := obj.Get(sealHeadersDataKey); internal != nil && !goja.IsUndefined(internal) && !goja.IsNull(internal) {
+			if existing, ok := internal.Export().(*headersData); ok {
+				for key, values := range existing.store {
+					data.store[key] = append([]string(nil), values...)
+				}
+				return
+			}
+		}
 		if obj.ClassName() == "Array" {
 			n := int(obj.Get("length").ToInteger())
 			for i := range n {
@@ -176,6 +187,8 @@ type formDataData struct {
 	entries []formDataEntry
 }
 
+const sealFormDataDataKey = "__sealFormDataData"
+
 func newFormDataCtor(rt *goja.Runtime) func(call goja.ConstructorCall) *goja.Object {
 	return func(call goja.ConstructorCall) *goja.Object {
 		data := &formDataData{}
@@ -186,6 +199,7 @@ func newFormDataCtor(rt *goja.Runtime) func(call goja.ConstructorCall) *goja.Obj
 }
 
 func bindFormData(rt *goja.Runtime, obj *goja.Object, data *formDataData) {
+	_ = obj.Set(sealFormDataDataKey, data)
 	_ = obj.Set("append", func(call goja.FunctionCall) goja.Value {
 		name := call.Argument(0).String()
 		value := call.Argument(1).String()
@@ -360,7 +374,9 @@ type responseData struct {
 	status     int
 	statusText string
 	headers    *headersData
-	body       goja.Value
+	bodyBytes  []byte
+	url        string
+	method     string
 }
 
 func newResponseCtor(rt *goja.Runtime) func(call goja.ConstructorCall) *goja.Object {
@@ -373,7 +389,7 @@ func newResponseCtor(rt *goja.Runtime) func(call goja.ConstructorCall) *goja.Obj
 		obj := call.This
 
 		if body := call.Argument(0); !goja.IsUndefined(body) && !goja.IsNull(body) {
-			data.body = body
+			data.bodyBytes = bytesFromValue(body)
 		}
 		if init := call.Argument(1); !goja.IsUndefined(init) && !goja.IsNull(init) {
 			if initObj, ok := init.(*goja.Object); ok {
@@ -389,50 +405,99 @@ func newResponseCtor(rt *goja.Runtime) func(call goja.ConstructorCall) *goja.Obj
 			}
 		}
 
-		_ = obj.Set("status", data.status)
-		_ = obj.Set("statusText", data.statusText)
-		_ = obj.Set("ok", data.status >= 200 && data.status < 300)
-		headersObj := rt.NewObject()
-		bindHeaders(rt, headersObj, data.headers)
-		_ = obj.Set("headers", headersObj)
-
-		_ = obj.Set("text", func(call goja.FunctionCall) goja.Value {
-			p, resolve, _ := rt.NewPromise()
-			body := ""
-			if data.body != nil {
-				body = data.body.String()
-			}
-			_ = resolve(rt.ToValue(body))
-			return rt.ToValue(p)
-		})
-
-		_ = obj.Set("json", func(call goja.FunctionCall) goja.Value {
-			p, resolve, reject := rt.NewPromise()
-			if data.body == nil {
-				_ = reject(rt.NewTypeError("no body"))
-				return rt.ToValue(p)
-			}
-			raw := data.body.String()
-			jsonObj := rt.Get("JSON").ToObject(rt)
-			parse, _ := goja.AssertFunction(jsonObj.Get("parse"))
-			if parsed, err := parse(goja.Undefined(), rt.ToValue(raw)); err == nil {
-				_ = resolve(parsed)
-			} else {
-				_ = reject(err)
-			}
-			return rt.ToValue(p)
-		})
-
-		_ = obj.Set("arrayBuffer", func(call goja.FunctionCall) goja.Value {
-			p, resolve, _ := rt.NewPromise()
-			var bytes []byte
-			if data.body != nil {
-				bytes = []byte(data.body.String())
-			}
-			_ = resolve(rt.ToValue(rt.NewArrayBuffer(bytes)))
-			return rt.ToValue(p)
-		})
-
+		bindResponse(rt, obj, data)
 		return obj
 	}
+}
+
+func bindResponse(rt *goja.Runtime, obj *goja.Object, data *responseData) {
+	_ = obj.Set("status", data.status)
+	_ = obj.Set("statusText", data.statusText)
+	_ = obj.Set("ok", data.status >= 200 && data.status < 300)
+	_ = obj.Set("body", string(data.bodyBytes))
+	if data.url != "" {
+		_ = obj.Set("url", data.url)
+	}
+	if data.method != "" {
+		_ = obj.Set("method", data.method)
+	}
+	headersObj := rt.NewObject()
+	bindHeaders(rt, headersObj, data.headers)
+	_ = obj.Set("headers", headersObj)
+
+	_ = obj.Set("text", func(call goja.FunctionCall) goja.Value {
+		p, resolve, _ := rt.NewPromise()
+		_ = resolve(rt.ToValue(string(data.bodyBytes)))
+		return rt.ToValue(p)
+	})
+
+	_ = obj.Set("json", func(call goja.FunctionCall) goja.Value {
+		p, resolve, reject := rt.NewPromise()
+		if data.bodyBytes == nil {
+			_ = reject(rt.NewTypeError("no body"))
+			return rt.ToValue(p)
+		}
+		raw := string(data.bodyBytes)
+		jsonObj := rt.Get("JSON").ToObject(rt)
+		parse, _ := goja.AssertFunction(jsonObj.Get("parse"))
+		if parsed, err := parse(goja.Undefined(), rt.ToValue(raw)); err == nil {
+			_ = resolve(parsed)
+		} else {
+			_ = reject(err)
+		}
+		return rt.ToValue(p)
+	})
+
+	_ = obj.Set("arrayBuffer", func(call goja.FunctionCall) goja.Value {
+		p, resolve, _ := rt.NewPromise()
+		_ = resolve(rt.ToValue(rt.NewArrayBuffer(append([]byte(nil), data.bodyBytes...))))
+		return rt.ToValue(p)
+	})
+}
+
+func bytesFromValue(v goja.Value) []byte {
+	if goja.IsUndefined(v) || goja.IsNull(v) {
+		return nil
+	}
+	if obj, ok := v.(*goja.Object); ok {
+		if bytes, ok := bytesFromArrayBufferView(obj); ok {
+			return bytes
+		}
+	}
+	switch x := v.Export().(type) {
+	case string:
+		return []byte(x)
+	case []byte:
+		return append([]byte(nil), x...)
+	case goja.ArrayBuffer:
+		return append([]byte(nil), x.Bytes()...)
+	default:
+		return []byte(v.String())
+	}
+}
+
+func bytesFromArrayBufferView(obj *goja.Object) ([]byte, bool) {
+	bufferValue := obj.Get("buffer")
+	if bufferValue == nil || goja.IsUndefined(bufferValue) || goja.IsNull(bufferValue) {
+		return nil, false
+	}
+	arrayBuffer, ok := bufferValue.Export().(goja.ArrayBuffer)
+	if !ok {
+		return nil, false
+	}
+	byteLengthValue := obj.Get("byteLength")
+	if byteLengthValue == nil || goja.IsUndefined(byteLengthValue) || goja.IsNull(byteLengthValue) {
+		return nil, false
+	}
+	byteOffsetValue := obj.Get("byteOffset")
+	byteOffset := 0
+	if byteOffsetValue != nil && !goja.IsUndefined(byteOffsetValue) && !goja.IsNull(byteOffsetValue) {
+		byteOffset = int(byteOffsetValue.ToInteger())
+	}
+	byteLength := int(byteLengthValue.ToInteger())
+	bufferBytes := arrayBuffer.Bytes()
+	if byteOffset < 0 || byteLength < 0 || byteOffset > len(bufferBytes) || byteOffset+byteLength > len(bufferBytes) {
+		return nil, false
+	}
+	return append([]byte(nil), bufferBytes[byteOffset:byteOffset+byteLength]...), true
 }
