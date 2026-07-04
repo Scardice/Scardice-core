@@ -245,6 +245,8 @@ type Dice struct {
 	JsScriptCronLock *sync.Mutex     `json:"-" yaml:"-"`
 	// 重载使用的互斥锁
 	JsReloadLock sync.Mutex `json:"-" yaml:"-"`
+	// JS 重载进度，用于 WebUI 查询当前真实重载阶段。
+	JsReloadProgress JsReloadProgressTracker `json:"-" yaml:"-"`
 	// 内置脚本摘要表，用于判断内置脚本是否有更新
 	JsBuiltinDigestSet map[string]bool `json:"-" yaml:"-"`
 	// 当前在加载的脚本路径，用于关联 jsScriptInfo 和 ExtInfo
@@ -311,15 +313,20 @@ func (d *Dice) StartStartupJsLoad() {
 	}
 	d.startupJsLoadWG.Add(1)
 	d.JsReloading = true
+	d.JsReloadLock.Lock()
 	go func() {
+		defer d.JsReloadLock.Unlock()
 		defer d.startupJsLoadWG.Done()
 		d.Logger.Info("JS 扩展脚本开始异步加载")
+		d.BeginJsReloadProgress("开始异步加载 JS 扩展脚本")
 		d.JsBuiltinDigestSet = make(map[string]bool)
 		d.JsLoadScripts()
 		// 需要在退出 JsReloading 状态后再应用默认扩展设置，
 		// 否则 JS wrapper 的 GetCmdMap() 会在重载保护下返回空映射，导致第三方 JS 扩展的指令列表丢失。
 		d.JsReloading = false
+		d.UpdateJsReloadProgress("apply_settings", "正在应用扩展默认设置", 0, 0, 94, "")
 		d.ApplyExtDefaultSettings()
+		d.FinishJsReloadProgress("JS 扩展脚本异步加载完成")
 		d.Logger.Info("JS 扩展脚本异步加载完成")
 	}()
 }

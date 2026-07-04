@@ -746,6 +746,7 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 	e.POST(prefix+"/force_stop", forceStop)
 
 	e.POST(prefix+"/js/reload", jsReload)
+	e.GET(prefix+"/js/reload/status", jsReloadStatus)
 	e.POST(prefix+"/js/execute", jsExec)
 	e.POST(prefix+"/js/upload", jsUpload)
 	e.GET(prefix+"/js/list", jsList)

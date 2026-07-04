@@ -1597,6 +1597,7 @@ func collectJsScriptPaths(root string, skipBuiltin bool) []string {
 
 func (d *Dice) JsLoadScripts() {
 	d.JsScriptList = []*JsScriptInfo{}
+	d.UpdateJsReloadProgress("scan_prepare", "正在准备扫描 JS 脚本", 0, 0, 12, "")
 
 	path := filepath.Join(d.BaseConfig.DataDir, "scripts")
 	builtinPath := filepath.Join(path, "_builtin")
@@ -1635,8 +1636,17 @@ func (d *Dice) JsLoadScripts() {
 	cacheHits := 0
 	failedFiles := 0
 	d.Logger.Infof("JS 脚本开始扫描，共计 %d 个", totalFiles)
+	d.UpdateJsReloadProgress("scanning", fmt.Sprintf("正在扫描 JS 脚本，共计 %d 个", totalFiles), 0, totalFiles, 15, "")
 	recordScanned := func() {
 		scannedFiles++
+		d.UpdateJsReloadProgress(
+			"scanning",
+			fmt.Sprintf("正在扫描 JS 脚本：%d/%d", scannedFiles, totalFiles),
+			scannedFiles,
+			totalFiles,
+			jsReloadProgressPercent(15, 45, scannedFiles, totalFiles),
+			"",
+		)
 	}
 	recordCacheHit := func() {
 		cacheHits++
@@ -1762,6 +1772,14 @@ func (d *Dice) JsLoadScripts() {
 
 	saveJsMetaCache(newCache)
 	d.Logger.Infof("JS 脚本扫描结束，扫描 %d 个，命中 %d 个，失败 %d 个", scannedFiles, cacheHits, failedFiles)
+	d.UpdateJsReloadProgress(
+		"scan_done",
+		fmt.Sprintf("JS 脚本扫描完成：扫描 %d 个，命中 %d 个，失败 %d 个", scannedFiles, cacheHits, failedFiles),
+		scannedFiles,
+		totalFiles,
+		45,
+		"",
+	)
 	if metaCache != nil {
 		removed := 0
 		for key := range metaCache.Files {
@@ -1800,6 +1818,7 @@ func (d *Dice) JsLoadScripts() {
 	}
 
 	// 检查依赖是否满足
+	d.UpdateJsReloadProgress("dependency_check", "正在检查 JS 插件依赖", 0, len(jsInfos), 50, "")
 	unloadKeySet := make(map[string]bool)
 	var unloadInfos []string
 	scripts, invalidInfoMap := checkJsScriptsDeps(jsInfos)
@@ -1813,6 +1832,7 @@ func (d *Dice) JsLoadScripts() {
 		unloadInfos = append(unloadInfos, infos...)
 	}
 	// 分析加载顺序
+	d.UpdateJsReloadProgress("dependency_sort", "正在分析 JS 插件加载顺序", 0, len(scripts), 52, "")
 	sortedJsInfos, invalidInfoMap := sortJsScripts(scripts)
 	if len(invalidInfoMap) != 0 {
 		// 部分插件存在循环依赖，不进行加载
@@ -1832,7 +1852,17 @@ func (d *Dice) JsLoadScripts() {
 	}
 
 	// 按顺序加载
-	for _, jsInfo := range sortedJsInfos {
+	d.UpdateJsReloadProgress("loading", fmt.Sprintf("正在加载 JS 插件：0/%d", len(sortedJsInfos)), 0, len(sortedJsInfos), 55, "")
+	for index, jsInfo := range sortedJsInfos {
+		current := index + 1
+		d.UpdateJsReloadProgress(
+			"loading",
+			fmt.Sprintf("正在加载 JS 插件：%d/%d", current, len(sortedJsInfos)),
+			current,
+			len(sortedJsInfos),
+			jsReloadProgressPercent(55, 90, current, len(sortedJsInfos)),
+			jsInfo.Name,
+		)
 		if len(jsInfo.Depends) == 0 {
 			d.Logger.Infof("正在加载脚本「%s:%s:%s」", jsInfo.Author, jsInfo.Name, jsInfo.Version)
 		} else {
@@ -1849,13 +1879,22 @@ func (d *Dice) JsLoadScripts() {
 
 		d.JsLoadScriptRaw(jsInfo)
 	}
+	d.UpdateJsReloadProgress("load_done", fmt.Sprintf("JS 插件加载完成，共 %d 个", len(sortedJsInfos)), len(sortedJsInfos), len(sortedJsInfos), 90, "")
 }
 
 func (d *Dice) JsReload() {
 	startTime := time.Now()
 	d.Logger.Infof("JsReload: 开始重载")
+	d.BeginJsReloadProgress("开始重载 JS 环境")
+	defer func() {
+		if r := recover(); r != nil {
+			d.FailJsReloadProgress(fmt.Sprintf("JS 重载失败：%v", r))
+			panic(r)
+		}
+	}()
 
 	if d.JsScriptCron != nil {
+		d.UpdateJsReloadProgress("cron_stop", "正在停止 JS 定时任务", 0, 0, 5, "")
 		d.JsScriptCron.Stop()
 		d.JsScriptCron = nil
 	}
@@ -1866,7 +1905,9 @@ func (d *Dice) JsReload() {
 	// Wrapper 架构：不再需要记录快照，wrapper 保留在群组中
 	// jsClear 清空 JsExtRegistry，seal.ext.register 会复用 wrapper 并注册新的真实扩展
 
+	d.UpdateJsReloadProgress("init", "正在初始化 JS 运行环境", 0, 0, 8, "")
 	d.JsInit()
+	d.UpdateJsReloadProgress("config", "正在加载 JS 插件配置", 0, 0, 10, "")
 	_ = d.ConfigManager.Load()
 	d.JsLoadScripts()
 
@@ -1876,15 +1917,18 @@ func (d *Dice) JsReload() {
 	// 的指令列表被错误置空，WebUI 综合设置 - 基本设置 - 扩展及扩展指令 里只能看到官方扩展命令。
 	// 因此这里改为先结束重载状态，再统一应用默认设置，让 JS wrapper 能解析到命令表。
 	d.JsReloading = false
+	d.UpdateJsReloadProgress("apply_settings", "正在应用扩展默认设置", 0, 0, 94, "")
 	d.ApplyExtDefaultSettings()
 
 	// 更新扩展变更时间戳，触发延迟更新
+	d.UpdateJsReloadProgress("finalizing", "正在保存 JS 重载结果", 0, 0, 97, "")
 	d.ExtUpdateTime = time.Now().Unix()
 
 	d.MarkModified()
 	d.Save(false)
 
 	d.Logger.Infof("JsReload: 重载完成，耗时 %dms", time.Since(startTime).Milliseconds())
+	d.FinishJsReloadProgress(fmt.Sprintf("JS 重载完成，耗时 %dms", time.Since(startTime).Milliseconds()))
 }
 
 // JsExtSettingVacuum 清理已被删除的脚本对应的插件配置

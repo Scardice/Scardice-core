@@ -151,6 +151,19 @@ func jsReload(c echo.Context) error {
 	return c.NoContent(200)
 }
 
+func jsReloadStatus(c echo.Context) error {
+	if !doAuth(c) {
+		return c.JSON(http.StatusForbidden, nil)
+	}
+	if dm.JustForTest {
+		return c.JSON(200, map[string]interface{}{
+			"testMode": true,
+		})
+	}
+	progress := myDice.JsReloadProgressSnapshot()
+	return c.JSON(http.StatusOK, progress)
+}
+
 func jsUpload(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
