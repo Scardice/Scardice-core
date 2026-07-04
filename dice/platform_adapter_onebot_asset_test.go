@@ -13,8 +13,10 @@ import (
 
 func newTestAdapter(t *testing.T) *PlatformAdapterOnebot {
 	t.Helper()
+	session := &IMSession{Parent: &Dice{Parent: &DiceManager{}}}
 	return &PlatformAdapterOnebot{
-		logger: zap.NewNop().Sugar(),
+		EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Session: session}},
+		logger:   zap.NewNop().Sugar(),
 	}
 }
 
@@ -100,7 +102,7 @@ func TestResolveLocalAsset_LargeFileHTTPURL(t *testing.T) {
 
 	p := newTestAdapter(t)
 	p.ImageAssetBaseURL = "http://scardice-core:3211"
-	p.Session = &IMSession{Parent: &Dice{Parent: &DiceManager{AssetImageToken: "testtoken123"}}}
+	p.EndPoint.Session = &IMSession{Parent: &Dice{Parent: &DiceManager{AssetImageToken: "testtoken123"}}}
 
 	got, err := p.resolveLocalAsset("images/large.bin")
 	if err != nil {

@@ -28,7 +28,6 @@ import (
 )
 
 type PlatformAdapterOnebot struct {
-	Session             *IMSession    `json:"-"                     yaml:"-"`
 	EndPoint            *EndPointInfo `json:"-"                     yaml:"-"`
 	Token               string        `json:"token"                 yaml:"token"`                 // 正向或者反向时，使用的Token
 	ConnectURL          string        `json:"connectUrl"            yaml:"connectUrl"`            // 正向时 连接地址
@@ -167,9 +166,10 @@ func (p *PlatformAdapterOnebot) SendGroupForwardMsg(ctx *MsgContext, groupID str
 		GroupID:  rawGroupID,
 		Messages: nodes,
 	})
-	if err == nil && p.Session != nil {
+	session := p.EndPoint.Session
+	if err == nil && session != nil {
 		sendText := forwardNodesToText(nodes)
-		p.Session.OnMessageSend(ctx, &Message{
+		session.OnMessageSend(ctx, &Message{
 			Platform:    "QQ",
 			MessageType: "group",
 			GroupID:     groupID,
@@ -208,9 +208,10 @@ func (p *PlatformAdapterOnebot) SendPrivateForwardMsg(ctx *MsgContext, userID st
 		UserID:   rawUserID,
 		Messages: nodes,
 	})
-	if err == nil && p.Session != nil {
+	session := p.EndPoint.Session
+	if err == nil && session != nil {
 		sendText := forwardNodesToText(nodes)
-		p.Session.OnMessageSend(ctx, &Message{
+		session.OnMessageSend(ctx, &Message{
 			Platform:    "QQ",
 			MessageType: "private",
 			Message:     sendText,
@@ -255,11 +256,15 @@ func (p *PlatformAdapterOnebot) SendSegmentToGroup(ctx *MsgContext, groupID stri
 	emitted := false
 
 	emitSentSegments := func() {
-		if emitted || !sentAnything || p.Session == nil || p.EndPoint == nil {
+		if emitted || !sentAnything || p.EndPoint == nil {
+			return
+		}
+		session := p.EndPoint.Session
+		if session == nil {
 			return
 		}
 		_, sentMsgText := p.convertSealMsgToMessageChain(sentSegments)
-		p.Session.OnMessageSend(ctx, &Message{
+		session.OnMessageSend(ctx, &Message{
 			Platform:    "QQ",
 			MessageType: "group",
 			GroupID:     groupID,
@@ -367,11 +372,15 @@ func (p *PlatformAdapterOnebot) SendSegmentToPerson(ctx *MsgContext, userID stri
 	emitted := false
 
 	emitSentSegments := func() {
-		if emitted || !sentAnything || p.Session == nil || p.EndPoint == nil {
+		if emitted || !sentAnything || p.EndPoint == nil {
+			return
+		}
+		session := p.EndPoint.Session
+		if session == nil {
 			return
 		}
 		_, sentMsgText := p.convertSealMsgToMessageChain(sentSegments)
-		p.Session.OnMessageSend(ctx, &Message{
+		session.OnMessageSend(ctx, &Message{
 			Platform:    "QQ",
 			MessageType: "private",
 			Segment:     sentSegments,
@@ -473,7 +482,8 @@ func (p *PlatformAdapterOnebot) GetGroupInfoAsync(groupID string) {
 
 func (p *PlatformAdapterOnebot) GetGroupInfoSync(diceGroupID string) *GroupCache {
 	// TODO：去掉这个MsgContext的需求 以及这个函数设计的一坨
-	ctx := &MsgContext{EndPoint: p.EndPoint, Session: p.Session, Dice: p.Session.Parent}
+	session := p.EndPoint.Session
+	ctx := &MsgContext{EndPoint: p.EndPoint, Session: session, Dice: session.Parent}
 	rawGroupID := ExtractQQEmitterGroupID(diceGroupID)
 	groupInfoResp, err := p.sendEmitter.GetGroupInfo(p.ctx, rawGroupID, true)
 	if err != nil {
@@ -490,25 +500,25 @@ func (p *PlatformAdapterOnebot) GetGroupInfoSync(diceGroupID string) *GroupCache
 		MaxMemberCount: groupInfoResp.MaxMemberCount,
 	}
 	_ = p.groupCache.Set(diceGroupID, result)
-	p.Session.Parent.Parent.GroupNameCache.Store(diceGroupID, &GroupNameCacheItem{
+	session.Parent.Parent.GroupNameCache.Store(diceGroupID, &GroupNameCacheItem{
 		Name: result.GroupName,
 		time: time.Now().Unix(),
 	})
 	// 存储群组相关信息
-	groupInfo, ok := p.Session.ServiceAtNew.Load(diceGroupID)
+	groupInfo, ok := session.ServiceAtNew.Load(diceGroupID)
 	if !ok {
 		return result
 	}
 	// 群名有更新的情况
 	if result.GroupName != groupInfo.GroupName {
 		groupInfo.GroupName = result.GroupName
-		groupInfo.MarkDirty(p.Session.Parent)
+		groupInfo.MarkDirty(session.Parent)
 	}
 	// 群信息获取不到，可能退群的情况，删除群信息
 	if result.MaxMemberCount == 0 {
 		if _, exists := groupInfo.DiceIDExistsMap.Load(p.EndPoint.UserID); exists {
 			groupInfo.DiceIDExistsMap.Delete(p.EndPoint.UserID)
-			groupInfo.MarkDirty(p.Session.Parent)
+			groupInfo.MarkDirty(session.Parent)
 		}
 	}
 	// 发现群情况不对，可能要退群的情况。 放在这里是因为可能这个群已经被邀请进入了
@@ -1014,10 +1024,11 @@ func (p *PlatformAdapterOnebot) retryConnect() {
 }
 
 func (p *PlatformAdapterOnebot) updateAndSave() {
-	if p.Session == nil || p.Session.Parent == nil {
+	session := p.EndPoint.Session
+	if session == nil || session.Parent == nil {
 		return
 	}
-	d := p.Session.Parent
+	d := session.Parent
 	d.LastUpdatedTime = time.Now().Unix()
 	d.Save(false)
 }

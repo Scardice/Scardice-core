@@ -41,8 +41,7 @@ func ServePureOnebot(d *Dice, ep *EndPointInfo) {
 	defer CrashLog()
 	if ep.Platform == "QQ" {
 		conn := ep.Adapter.(*PlatformAdapterOnebot)
-		conn.EndPoint = ep
-		conn.Session = d.ImSession
+		ep.BindRuntime(d.ImSession)
 		d.Logger.Infof("Pure Onebot V11尝试连接")
 		if conn.Serve() != 0 {
 			d.Logger.Errorf("连接Pure Onebot V11失败")
