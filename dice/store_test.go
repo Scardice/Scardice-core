@@ -32,6 +32,26 @@ func TestCoreBackendUrlsDefaultRestored(t *testing.T) {
 	}
 }
 
+func TestBackendURLsWithPreferredPrependsAndDeduplicates(t *testing.T) {
+	defaultURLs := []string{
+		"http://api.weizaima.com",
+		"http://dice.weizaima.com",
+	}
+
+	got := backendURLsWithPreferred(" http://dice.weizaima.com/ ", defaultURLs)
+	want := []string{
+		"http://dice.weizaima.com",
+		"http://api.weizaima.com",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("backendURLsWithPreferred() = %#v, want %#v", got, want)
+	}
+
+	if !reflect.DeepEqual(defaultURLs, []string{"http://api.weizaima.com", "http://dice.weizaima.com"}) {
+		t.Fatalf("defaultURLs changed unexpectedly: %#v", defaultURLs)
+	}
+}
+
 func TestOfficialStoreBackendURLUsesDedicatedStoreBaseURL(t *testing.T) {
 	oldBackendURLs := BackendUrls
 	BackendUrls = []string{"https://core-backend.example"}
