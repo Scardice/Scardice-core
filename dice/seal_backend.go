@@ -21,30 +21,26 @@ func _tryGetBackendBase(url string) string {
 	return ""
 }
 
-var BackendUrls = []string{
-	"http://api.weizaima.com",
-	"http://dice.weizaima.com",
-	"http://api.sealdice.com",
-}
-
 // PreferredBackendURL 可在编译时通过以下方式注入：
 // go build -ldflags "-X 'Scardice-core/dice.PreferredBackendURL=https://example.com'"
 var PreferredBackendURL string
 
-func init() {
-	prependPreferredBackendURL()
-}
+var BackendUrls = backendURLsWithPreferred(PreferredBackendURL, []string{
+	"http://api.weizaima.com",
+	"http://dice.weizaima.com",
+	"http://api.sealdice.com",
+})
 
-func prependPreferredBackendURL() {
-	preferred, ok := normalizeBackendURL(PreferredBackendURL)
+func backendURLsWithPreferred(rawPreferred string, defaultURLs []string) []string {
+	preferred, ok := normalizeBackendURL(rawPreferred)
 	if !ok {
-		return
+		return append([]string(nil), defaultURLs...)
 	}
 
-	urls := make([]string, 0, len(BackendUrls)+1)
+	urls := make([]string, 0, len(defaultURLs)+1)
 	urls = append(urls, preferred)
 
-	for _, backendURL := range BackendUrls {
+	for _, backendURL := range defaultURLs {
 		normalized, ok := normalizeBackendURL(backendURL)
 		if ok && normalized == preferred {
 			continue
@@ -52,7 +48,7 @@ func prependPreferredBackendURL() {
 		urls = append(urls, backendURL)
 	}
 
-	BackendUrls = urls
+	return urls
 }
 
 func normalizeBackendURL(raw string) (string, bool) {
@@ -86,8 +82,7 @@ func TryGetBackendURL() {
 		ret = _tryGetBackendBase("http://test1.sealdice.com/list.txt")
 	}
 	if ret != "" {
-		splits := strings.Split(ret, "\n")
-		for _, s := range splits {
+		for s := range strings.SplitSeq(ret, "\n") {
 			normalized, ok := normalizeBackendURL(s)
 			if !ok {
 				continue
