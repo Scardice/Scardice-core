@@ -27,6 +27,34 @@ var BackendUrls = []string{
 	"http://api.sealdice.com",
 }
 
+// PreferredBackendURL 可在编译时通过以下方式注入：
+// go build -ldflags "-X 'Scardice-core/dice.PreferredBackendURL=https://example.com'"
+var PreferredBackendURL string
+
+func init() {
+	prependPreferredBackendURL()
+}
+
+func prependPreferredBackendURL() {
+	preferred, ok := normalizeBackendURL(PreferredBackendURL)
+	if !ok {
+		return
+	}
+
+	urls := make([]string, 0, len(BackendUrls)+1)
+	urls = append(urls, preferred)
+
+	for _, backendURL := range BackendUrls {
+		normalized, ok := normalizeBackendURL(backendURL)
+		if ok && normalized == preferred {
+			continue
+		}
+		urls = append(urls, backendURL)
+	}
+
+	BackendUrls = urls
+}
+
 func normalizeBackendURL(raw string) (string, bool) {
 	s := strings.TrimSpace(raw)
 	if s == "" || strings.HasPrefix(s, "#") {
