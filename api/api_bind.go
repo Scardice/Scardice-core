@@ -651,6 +651,8 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 	// 这些都是与QQ/OneBot直接相关
 	e.POST(prefix+"/im_connections/addOnebot11ReverseWs", ImConnectionsAddReverseWs)
 	e.POST(prefix+"/im_connections/addGocqSeparate", ImConnectionsAddGocqSeparate)
+	// NOTE(lyjjl): 当前项目已经移除 gocq 支持，没有 对应 NewGoCqhttpConnectInfoItem。
+	// e.POST(prefix+"/im_connections/addBuiltinGocq", ImConnectionsAddBuiltinGocq)
 	e.POST(prefix+"/im_connections/addLagrange", ImConnectionsAddBuiltinLagrange)
 	// e.POST(prefix+"/im_connections/addLagrangeGo", ImConnectionsAddLagrangeGO)
 	e.POST(prefix+"/im_connections/addRed", ImConnectionsAddRed)
