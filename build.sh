@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+DEV_MODE=0
+for arg in "$@"; do
+	case "$arg" in
+	--dev)
+		DEV_MODE=1
+		;;
+	*)
+		echo "[Build] 错误：未知参数 $arg"
+		exit 1
+		;;
+	esac
+done
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
@@ -634,95 +647,109 @@ pick_binary_name() {
 	fi
 }
 
-read -r -p "请输入 VERSION_MAIN（默认：${DEFAULT_VERSION_MAIN}）: " VERSION_MAIN
-VERSION_MAIN="${VERSION_MAIN:-$DEFAULT_VERSION_MAIN}"
-
-read -r -p "请输入 VERSION_PRERELEASE（默认：${DEFAULT_VERSION_PRERELEASE}）: " VERSION_PRERELEASE
-VERSION_PRERELEASE="${VERSION_PRERELEASE:-$DEFAULT_VERSION_PRERELEASE}"
-
-read -r -p "请输入 APP_CHANNEL（默认：${DEFAULT_APP_CHANNEL}）: " APP_CHANNEL
-APP_CHANNEL="${APP_CHANNEL:-$DEFAULT_APP_CHANNEL}"
-
-read -r -p "请输入 APPNAME（默认：${DEFAULT_APPNAME}）: " APPNAME
-APPNAME="${APPNAME:-$DEFAULT_APPNAME}"
-
-read -r -p "请选择构建模式 [single/multi]（默认：single，可输入 s/m）: " BUILD_MODE_INPUT
-BUILD_MODE_INPUT="${BUILD_MODE_INPUT:-single}"
-case "${BUILD_MODE_INPUT}" in
-s | S)
-	BUILD_MODE_INPUT="single"
-	;;
-m | M)
-	BUILD_MODE_INPUT="multi"
-	;;
-esac
-if [[ "$BUILD_MODE_INPUT" != "single" && "$BUILD_MODE_INPUT" != "multi" ]]; then
-	echo "[Build] 错误：构建模式必须是 single 或 multi"
-	exit 1
-fi
-
 TARGETS=()
-if [[ "$BUILD_MODE_INPUT" == "single" ]]; then
-	TARGET_GOOS="$(choose_from_menu "请选择目标 GOOS:" "${DEFAULT_TARGET_GOOS}" "${ALL_GOOS[@]}")"
-	TARGET_GOARCH="$(choose_from_menu "请选择目标 GOARCH:" "${DEFAULT_TARGET_GOARCH}" "${ALL_GOARCH[@]}")"
-	TARGETS+=("${TARGET_GOOS}/${TARGET_GOARCH}")
+if [[ $DEV_MODE -eq 1 ]]; then
+	echo "[Build] 开发构建模式（--dev）：跳过交互式提示，使用本机默认值"
+	VERSION_MAIN="$DEFAULT_VERSION_MAIN"
+	VERSION_PRERELEASE="$DEFAULT_VERSION_PRERELEASE"
+	APP_CHANNEL="$DEFAULT_APP_CHANNEL"
+	APPNAME="$DEFAULT_APPNAME"
+	BUILD_MODE_INPUT="single"
+	TARGETS+=("${HOST_GOOS}/${HOST_GOARCH}")
+	REDOWNLOAD_RUNTIME_ASSETS=0
+	CGO_ENABLED_VALUE=0
+	USE_COMPATIBLE_NAMES=0
+	USE_UPX=0
 else
-	print_multi_target_guide
-	read -r -p "请输入 multi 目标（goos/goarch,...）: " MULTI_TARGET_INPUT
-	MULTI_TARGET_INPUT="${MULTI_TARGET_INPUT//[[:space:]]/}"
-	if [[ -z "$MULTI_TARGET_INPUT" ]]; then
-		echo "[Build] 错误：multi 模式至少需要一个目标"
+	read -r -p "请输入 VERSION_MAIN（默认：${DEFAULT_VERSION_MAIN}）: " VERSION_MAIN
+	VERSION_MAIN="${VERSION_MAIN:-$DEFAULT_VERSION_MAIN}"
+
+	read -r -p "请输入 VERSION_PRERELEASE（默认：${DEFAULT_VERSION_PRERELEASE}）: " VERSION_PRERELEASE
+	VERSION_PRERELEASE="${VERSION_PRERELEASE:-$DEFAULT_VERSION_PRERELEASE}"
+
+	read -r -p "请输入 APP_CHANNEL（默认：${DEFAULT_APP_CHANNEL}）: " APP_CHANNEL
+	APP_CHANNEL="${APP_CHANNEL:-$DEFAULT_APP_CHANNEL}"
+
+	read -r -p "请输入 APPNAME（默认：${DEFAULT_APPNAME}）: " APPNAME
+	APPNAME="${APPNAME:-$DEFAULT_APPNAME}"
+
+	read -r -p "请选择构建模式 [single/multi]（默认：single，可输入 s/m）: " BUILD_MODE_INPUT
+	BUILD_MODE_INPUT="${BUILD_MODE_INPUT:-single}"
+	case "${BUILD_MODE_INPUT}" in
+	s | S)
+		BUILD_MODE_INPUT="single"
+		;;
+	m | M)
+		BUILD_MODE_INPUT="multi"
+		;;
+	esac
+	if [[ "$BUILD_MODE_INPUT" != "single" && "$BUILD_MODE_INPUT" != "multi" ]]; then
+		echo "[Build] 错误：构建模式必须是 single 或 multi"
 		exit 1
 	fi
-	IFS=',' read -r -a RAW_TARGETS <<<"$MULTI_TARGET_INPUT"
-	for target in "${RAW_TARGETS[@]}"; do
-		if [[ "$target" != */* ]]; then
-			echo "[Build] 错误：目标格式无效: $target（应为 goos/goarch）"
-			exit 1
-		fi
-		if ! validate_target_format "$target"; then
-			echo "[Build] 错误：目标不在理论支持列表内: $target"
-			exit 1
-		fi
-		TARGETS+=("$target")
-	done
-fi
 
-if [[ "$PACK_RUNTIME_ASSETS" == "1" ]] && runtime_asset_cache_exists_for_targets "${TARGETS[@]}"; then
-	read -r -p "是否重新下载内置客户端文件 [y/N]: " REDOWNLOAD_RUNTIME_ASSETS_INPUT
-	if [[ "${REDOWNLOAD_RUNTIME_ASSETS_INPUT}" =~ ^[Yy]$ ]]; then
+	if [[ "$BUILD_MODE_INPUT" == "single" ]]; then
+		TARGET_GOOS="$(choose_from_menu "请选择目标 GOOS:" "${DEFAULT_TARGET_GOOS}" "${ALL_GOOS[@]}")"
+		TARGET_GOARCH="$(choose_from_menu "请选择目标 GOARCH:" "${DEFAULT_TARGET_GOARCH}" "${ALL_GOARCH[@]}")"
+		TARGETS+=("${TARGET_GOOS}/${TARGET_GOARCH}")
+	else
+		print_multi_target_guide
+		read -r -p "请输入 multi 目标（goos/goarch,...）: " MULTI_TARGET_INPUT
+		MULTI_TARGET_INPUT="${MULTI_TARGET_INPUT//[[:space:]]/}"
+		if [[ -z "$MULTI_TARGET_INPUT" ]]; then
+			echo "[Build] 错误：multi 模式至少需要一个目标"
+			exit 1
+		fi
+		IFS=',' read -r -a RAW_TARGETS <<<"$MULTI_TARGET_INPUT"
+		for target in "${RAW_TARGETS[@]}"; do
+			if [[ "$target" != */* ]]; then
+				echo "[Build] 错误：目标格式无效: $target（应为 goos/goarch）"
+				exit 1
+			fi
+			if ! validate_target_format "$target"; then
+				echo "[Build] 错误：目标不在理论支持列表内: $target"
+				exit 1
+			fi
+			TARGETS+=("$target")
+		done
+	fi
+
+	if [[ "$PACK_RUNTIME_ASSETS" == "1" ]] && runtime_asset_cache_exists_for_targets "${TARGETS[@]}"; then
+		read -r -p "是否重新下载内置客户端文件 [y/N]: " REDOWNLOAD_RUNTIME_ASSETS_INPUT
+		if [[ "${REDOWNLOAD_RUNTIME_ASSETS_INPUT}" =~ ^[Yy]$ ]]; then
+			REDOWNLOAD_RUNTIME_ASSETS=1
+		else
+			REDOWNLOAD_RUNTIME_ASSETS=0
+		fi
+	else
 		REDOWNLOAD_RUNTIME_ASSETS=1
-	else
-		REDOWNLOAD_RUNTIME_ASSETS=0
 	fi
-else
-	REDOWNLOAD_RUNTIME_ASSETS=1
-fi
 
-read -r -p "是否启用 CGO？[y/N]: " ENABLE_CGO_INPUT
-if [[ "${ENABLE_CGO_INPUT}" =~ ^[Yy]$ ]]; then
-	CGO_ENABLED_VALUE=1
-else
-	CGO_ENABLED_VALUE=0
-fi
+	read -r -p "是否启用 CGO？[y/N]: " ENABLE_CGO_INPUT
+	if [[ "${ENABLE_CGO_INPUT}" =~ ^[Yy]$ ]]; then
+		CGO_ENABLED_VALUE=1
+	else
+		CGO_ENABLED_VALUE=0
+	fi
 
-read -r -p "使用兼容的lock和可执行文件文件名？[y/N]: " COMPATIBLE_NAMES_INPUT
-if [[ "${COMPATIBLE_NAMES_INPUT}" =~ ^[Yy]$ ]]; then
-	USE_COMPATIBLE_NAMES=1
-else
-	USE_COMPATIBLE_NAMES=0
-fi
+	read -r -p "使用兼容的lock和可执行文件文件名？[y/N]: " COMPATIBLE_NAMES_INPUT
+	if [[ "${COMPATIBLE_NAMES_INPUT}" =~ ^[Yy]$ ]]; then
+		USE_COMPATIBLE_NAMES=1
+	else
+		USE_COMPATIBLE_NAMES=0
+	fi
 
-if [[ -n "$UPX_CMD" ]]; then
-	read -r -p "是否使用 UPX 压缩二进制文件？[Y/n]: " ENABLE_UPX_INPUT
-	if [[ "${ENABLE_UPX_INPUT}" =~ ^[Nn]$ ]]; then
+	if [[ -n "$UPX_CMD" ]]; then
+		read -r -p "是否使用 UPX 压缩二进制文件？[Y/n]: " ENABLE_UPX_INPUT
+		if [[ "${ENABLE_UPX_INPUT}" =~ ^[Nn]$ ]]; then
+			USE_UPX=0
+		else
+			USE_UPX=1
+		fi
+	else
+		echo "[Build] 未在系统中找到 upx 命令，将跳过压缩步骤询问。"
 		USE_UPX=0
-	else
-		USE_UPX=1
 	fi
-else
-	echo "[Build] 未在系统中找到 upx 命令，将跳过压缩步骤询问。"
-	USE_UPX=0
 fi
 
 if [[ "${CGO_ENABLED_VALUE}" -eq 1 ]]; then
@@ -817,6 +844,17 @@ export GOCACHE="${GOCACHE:-$GO_CACHE_DIR}"
 export TMPDIR="${TMPDIR:-$GO_TMP_DIR}"
 echo "[Build] GOCACHE=${GOCACHE}"
 echo "[Build] TMPDIR=${TMPDIR}"
+
+if [[ $DEV_MODE -eq 1 ]]; then
+	DEV_BINARY_NAME="$(pick_binary_name "$HOST_GOOS")"
+	DEV_BINARY_PATH="$ROOT_DIR/$DEV_BINARY_NAME"
+	echo "[Build] --dev 仅构建本机可执行文件：${DEV_BINARY_PATH}"
+	GOOS="$HOST_GOOS" GOARCH="$HOST_GOARCH" CGO_ENABLED="$CGO_ENABLED_VALUE" \
+		go build -trimpath -ldflags "$LDFLAGS" -o "$DEV_BINARY_PATH" .
+	chmod +x "$DEV_BINARY_PATH" 2>/dev/null || true
+	ls -lh "$DEV_BINARY_PATH"
+	exit 0
+fi
 
 echo "[Build] 更新 submodule 到远端最新提交"
 git submodule update --init --recursive --remote
