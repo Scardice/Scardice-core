@@ -185,6 +185,13 @@ milky_cache_file_for_target() {
 	echo "$cache_file"
 }
 
+yogurt_cache_file_for_target() {
+	local goos="$1"
+	local goarch="$2"
+	local target="${goos}-${goarch}"
+	echo "$RUNTIME_CACHE_DIR/yogurt.${target}.zip"
+}
+
 runtime_asset_cache_exists_for_target() {
 	local goos="$1"
 	local goarch="$2"
@@ -321,13 +328,40 @@ resolve_milky_url() {
 	esac
 }
 
+resolve_yogurt_url() {
+	local goos="$1"
+	local goarch="$2"
+
+	case "${goos}/${goarch}" in
+	linux/arm64)
+		echo "https://github.com/sealdice/acidify/releases/download/dev/yogurt-linux-arm64.zip"
+		;;
+	linux/amd64)
+		echo "https://github.com/sealdice/acidify/releases/download/dev/yogurt-linux-x64.zip"
+		;;
+	darwin/arm64)
+		echo "https://github.com/sealdice/acidify/releases/download/dev/yogurt-macos-arm64.zip"
+		;;
+	windows/amd64)
+		echo "https://github.com/sealdice/acidify/releases/download/dev/yogurt-windows-x64.zip"
+		;;
+	android/arm64)
+		echo "https://github.com/sealdice/acidify/releases/download/dev/yogurt-android-arm64.zip"
+		;;
+	*)
+		echo ""
+		;;
+	esac
+}
+
 prepare_target_runtime_assets() {
 	local goos="$1"
 	local goarch="$2"
 	local target="${goos}-${goarch}"
-	local lagrange_url milky_url
+	local lagrange_url milky_url yogurt_url
 	TARGET_LAGRANGE_DIR=""
 	TARGET_MILKY_DIR=""
+	TARGET_YOGURT_DIR=""
 
 	if [[ "$PACK_RUNTIME_ASSETS" != "1" ]]; then
 		return 0
@@ -368,6 +402,31 @@ prepare_target_runtime_assets() {
 		fi
 	else
 		echo "[Build] 提示：${goos}/${goarch} 没有可用的 Milky 打包资源，跳过。"
+	fi
+
+	yogurt_url="$(resolve_yogurt_url "$goos" "$goarch")"
+	if [[ -n "$yogurt_url" ]]; then
+		local yogurt_zip
+		local yogurt_dir="$RUNTIME_CACHE_DIR/yogurt.${target}"
+		yogurt_zip="$(yogurt_cache_file_for_target "$goos" "$goarch")"
+		if download_file_with_cache "$yogurt_url" "$yogurt_zip" "Yogurt ${goos}/${goarch}" &&
+			sync_cached_archive_dir "$yogurt_zip" "$yogurt_dir" "Yogurt ${goos}/${goarch}"; then
+			if [[ "$goos" == "windows" ]]; then
+				if [[ ! -f "$yogurt_dir/yogurt.exe" && -f "$yogurt_dir/yogurt.kexe" ]]; then
+					mv -f "$yogurt_dir/yogurt.kexe" "$yogurt_dir/yogurt.exe"
+				fi
+			else
+				if [[ -f "$yogurt_dir/yogurt.kexe" ]]; then
+					mv -f "$yogurt_dir/yogurt.kexe" "$yogurt_dir/yogurt"
+				fi
+			fi
+			TARGET_YOGURT_DIR="$yogurt_dir"
+		elif [[ "$RUNTIME_ASSETS_STRICT" == "1" ]]; then
+			echo "[Build] 错误：无法准备 Yogurt ${goos}/${goarch}"
+			exit 1
+		fi
+	else
+		echo "[Build] 提示：${goos}/${goarch} 没有可用的 Yogurt 打包资源，跳过。"
 	fi
 }
 
@@ -870,6 +929,7 @@ for target in "${TARGETS[@]}"; do
 	prepare_target_runtime_assets "$TARGET_GOOS" "$TARGET_GOARCH"
 	copy_runtime_tree_if_present "$TARGET_LAGRANGE_DIR" "$PACKAGE_DIR/lagrange" "Lagrange ${TARGET_GOOS}/${TARGET_GOARCH}"
 	copy_runtime_tree_if_present "$TARGET_MILKY_DIR" "$PACKAGE_DIR/milky" "Milky ${TARGET_GOOS}/${TARGET_GOARCH}"
+	copy_runtime_tree_if_present "$TARGET_YOGURT_DIR" "$PACKAGE_DIR/milky" "Yogurt ${TARGET_GOOS}/${TARGET_GOARCH}"
 	if [[ "${TARGET_GOOS}" != "windows" ]]; then
 		chmod +x "$PACKAGE_DIR/$BINARY_NAME"
 		if [[ -f "$PACKAGE_DIR/lagrange/Lagrange.OneBot" ]]; then
@@ -877,6 +937,9 @@ for target in "${TARGETS[@]}"; do
 		fi
 		if [[ -f "$PACKAGE_DIR/milky/lagrangeV2" ]]; then
 			chmod +x "$PACKAGE_DIR/milky/lagrangeV2"
+		fi
+		if [[ -f "$PACKAGE_DIR/milky/yogurt" ]]; then
+			chmod +x "$PACKAGE_DIR/milky/yogurt"
 		fi
 	fi
 
