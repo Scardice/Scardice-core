@@ -332,19 +332,25 @@ func ImConnectionsQrcodeGet(c echo.Context) error {
 					"img": "data:image/png;base64," + base64.StdEncoding.EncodeToString(pa.WalleQQrcodeData),
 				})
 			}
-			// case "LagrangeGo":
-			//	pa := i.Adapter.(*dice.PlatformAdapterLagrangeGo)
-			//	if pa.CurState == dice.StateCodeInLoginQrCode {
-			//		return c.JSON(http.StatusOK, map[string]string{
-			//			"img": "data:image/png;base64," + base64.StdEncoding.EncodeToString(pa.QrcodeData),
-			//		})
-			//	}
+		// case "LagrangeGo":
+		//	pa := i.Adapter.(*dice.PlatformAdapterLagrangeGo)
+		//	if pa.CurState == dice.StateCodeInLoginQrCode {
+		//		return c.JSON(http.StatusOK, map[string]string{
+		//			"img": "data:image/png;base64," + base64.StdEncoding.EncodeToString(pa.QrcodeData),
+		//		})
+		//	}
 		case "milky":
 			pa := i.Adapter.(*dice.PlatformAdapterMilky)
-			if pa.BuiltInLoginState == dice.MilkyLoginStateQRWaitingForScan {
+			if pa.BuiltInLoginState == dice.MilkyLoginStateQRWaitingForScan || pa.BuiltInLoginState == dice.MilkyLoginStateQRWaitingForConfirm {
 				return c.JSON(http.StatusOK, map[string]string{
 					"img": "data:image/png;base64," + base64.StdEncoding.EncodeToString(pa.QrCodeData),
 				})
+			}
+			if pa.BuiltInLoginState == dice.MilkyLoginStateCancelled {
+				return c.JSON(http.StatusOK, map[string]string{"img": "", "reason": "cancelled"})
+			}
+			if pa.BuiltInLoginState == dice.MilkyLoginStateCodeExpired {
+				return c.JSON(http.StatusOK, map[string]string{"img": "", "reason": "expired"})
 			}
 		}
 		return c.JSON(http.StatusOK, i)
