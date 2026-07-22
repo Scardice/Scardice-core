@@ -44,6 +44,9 @@ const (
 	MilkyLoginStateConnecting
 	MilkyLoginStateQRConnected
 	MilkyLoginStateFailed
+	MilkyLoginStateQRWaitingForConfirm MilkyLoginState = 8
+	MilkyLoginStateCancelled           MilkyLoginState = 9
+	MilkyLoginStateCodeExpired         MilkyLoginState = 12
 )
 
 func (pa *PlatformAdapterMilky) SendSegmentToGroup(ctx *MsgContext, groupID string, msg []message.IMessageElement, flag string) {

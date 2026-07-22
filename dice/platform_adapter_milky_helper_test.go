@@ -79,18 +79,24 @@ func Test_getMilkyBuiltInSignals_returns_mode_specific_signals(t *testing.T) {
 			name: "lagrangeV2 preserves existing signals",
 			mode: "lagrangeV2",
 			want: milkyBuiltInSignals{
-				qrcode:        "Fetch QrCode Success",
-				online:        "successfully logged in",
-				qrcodeExpired: "QrCode State: 17",
+				qrcode:                  "Fetch QrCode Success",
+				qrcodeWaitingForScan:    "Fetch QrCode Success",
+				qrcodeWaitingForConfirm: "QrCode State: 53",
+				qrcodeCancelled:         "QrCode State: 54",
+				online:                  "successfully logged in",
+				qrcodeExpired:           "QrCode State: 17",
 			},
 		},
 		{
 			name: "yogurt uses yogurt stdout signals",
 			mode: "yogurt",
 			want: milkyBuiltInSignals{
-				qrcode:        "二维码文件已保存",
-				online:        "已上线",
-				qrcodeExpired: "二维码已过期",
+				qrcode:                  "二维码文件已保存",
+				qrcodeWaitingForScan:    "二维码状态：WAITING_FOR_SCAN",
+				qrcodeWaitingForConfirm: "二维码状态：WAITING_FOR_CONFIRMATION",
+				qrcodeCancelled:         "用户取消了登录",
+				online:                  "已上线",
+				qrcodeExpired:           "二维码已过期",
 			},
 		},
 	}
@@ -105,6 +111,91 @@ func Test_getMilkyBuiltInSignals_returns_mode_specific_signals(t *testing.T) {
 				t.Fatalf("expected %#v, got %#v", tt.want, got)
 			}
 		})
+	}
+}
+
+func Test_getMilkyBuiltInLoginStateFromLine_returns_qrcode_state(t *testing.T) {
+	tests := []struct {
+		name string
+		mode string
+		line string
+		want MilkyLoginState
+	}{
+		{
+			name: "yogurt waiting for scan",
+			mode: "yogurt",
+			line: "23:34:10 DEBUG o.n.a.Bot 二维码状态：WAITING_FOR_SCAN (48)",
+			want: MilkyLoginStateQRWaitingForScan,
+		},
+		{
+			name: "yogurt waiting for confirmation",
+			mode: "yogurt",
+			line: "23:35:20 DEBUG o.n.a.Bot 二维码状态：WAITING_FOR_CONFIRMATION (53)",
+			want: MilkyLoginStateQRWaitingForConfirm,
+		},
+		{
+			name: "yogurt cancelled status",
+			mode: "yogurt",
+			line: "23:35:27 DEBUG o.n.a.Bot 二维码状态：CANCELLED (54)",
+			want: MilkyLoginStateCancelled,
+		},
+		{
+			name: "yogurt cancelled exception",
+			mode: "yogurt",
+			line: "kotlin.IllegalStateException: 用户取消了登录",
+			want: MilkyLoginStateCancelled,
+		},
+		{
+			name: "yogurt code expired status",
+			mode: "yogurt",
+			line: "01:00:38 DEBUG o.n.a.Bot 二维码状态：CODE_EXPIRED (17)",
+			want: MilkyLoginStateCodeExpired,
+		},
+		{
+			name: "lagrange expired code",
+			mode: "lagrangeV2",
+			line: "QrCode State: 17",
+			want: MilkyLoginStateCodeExpired,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := getMilkyBuiltInLoginStateFromLine(tt.line, getMilkyBuiltInSignals(tt.mode))
+
+			if got != tt.want {
+				t.Fatalf("expected %d, got %d", tt.want, got)
+			}
+		})
+	}
+}
+
+func Test_applyMilkyBuiltInLoginTerminalState_disables_endpoint(t *testing.T) {
+	pa := &PlatformAdapterMilky{
+		BuiltInLoginState: MilkyLoginStateQRWaitingForConfirm,
+		QrCodeData:        []byte("qr"),
+	}
+	ep := &EndPointInfo{
+		EndPointInfoBase: EndPointInfoBase{
+			Enable: true,
+			State:  StateConnecting,
+		},
+		Adapter: pa,
+	}
+
+	applyMilkyBuiltInLoginTerminalState(nil, ep, MilkyLoginStateCancelled)
+
+	if pa.BuiltInLoginState != MilkyLoginStateCancelled {
+		t.Fatalf("expected cancelled state, got %d", pa.BuiltInLoginState)
+	}
+	if pa.QrCodeData != nil {
+		t.Fatal("expected QR data to be cleared")
+	}
+	if ep.Enable {
+		t.Fatal("expected endpoint to be disabled")
+	}
+	if ep.State != StateDisconnected {
+		t.Fatalf("expected endpoint disconnected, got %d", ep.State)
 	}
 }
 

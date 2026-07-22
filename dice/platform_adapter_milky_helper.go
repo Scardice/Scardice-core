@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -155,9 +156,12 @@ var defaultYogurtConfig = `{
 var SealSignV3Url = ``
 
 type milkyBuiltInSignals struct {
-	qrcode        string
-	online        string
-	qrcodeExpired string
+	qrcode                  string
+	qrcodeWaitingForScan    string
+	qrcodeWaitingForConfirm string
+	qrcodeCancelled         string
+	online                  string
+	qrcodeExpired           string
 }
 
 func milkyBuiltInConfigFileName(mode string) string {
@@ -175,18 +179,57 @@ func getMilkyBuiltInSignals(mode string) milkyBuiltInSignals {
 	switch mode {
 	case "lagrangeV2":
 		return milkyBuiltInSignals{
-			qrcode:        "Fetch QrCode Success",
-			online:        "successfully logged in",
-			qrcodeExpired: "QrCode State: 17",
+			qrcode:                  "Fetch QrCode Success",
+			qrcodeWaitingForScan:    "Fetch QrCode Success",
+			qrcodeWaitingForConfirm: "QrCode State: 53",
+			qrcodeCancelled:         "QrCode State: 54",
+			online:                  "successfully logged in",
+			qrcodeExpired:           "QrCode State: 17",
 		}
 	case "yogurt":
 		return milkyBuiltInSignals{
-			qrcode:        "二维码文件已保存",
-			online:        "已上线",
-			qrcodeExpired: "二维码已过期",
+			qrcode:                  "二维码文件已保存",
+			qrcodeWaitingForScan:    "二维码状态：WAITING_FOR_SCAN",
+			qrcodeWaitingForConfirm: "二维码状态：WAITING_FOR_CONFIRMATION",
+			qrcodeCancelled:         "用户取消了登录",
+			online:                  "已上线",
+			qrcodeExpired:           "二维码已过期",
 		}
 	default:
 		return milkyBuiltInSignals{}
+	}
+}
+
+func containsMilkyBuiltInSignal(line string, signal string) bool {
+	return signal != "" && strings.Contains(line, signal)
+}
+
+func getMilkyBuiltInLoginStateFromLine(line string, signals milkyBuiltInSignals) MilkyLoginState {
+	switch {
+	case containsMilkyBuiltInSignal(line, signals.online):
+		return MilkyLoginStateQRConnected
+	case containsMilkyBuiltInSignal(line, signals.qrcodeWaitingForConfirm) || strings.Contains(line, "WAITING_FOR_CONFIRMATION") || strings.Contains(line, "QrCode State: 53"):
+		return MilkyLoginStateQRWaitingForConfirm
+	case containsMilkyBuiltInSignal(line, signals.qrcodeCancelled) || strings.Contains(line, "CANCELLED") || strings.Contains(line, "QrCode State: 54"):
+		return MilkyLoginStateCancelled
+	case containsMilkyBuiltInSignal(line, signals.qrcodeExpired) || strings.Contains(line, "CODE_EXPIRED") || strings.Contains(line, "QrCode State: 17"):
+		return MilkyLoginStateCodeExpired
+	case containsMilkyBuiltInSignal(line, signals.qrcodeWaitingForScan) || strings.Contains(line, "WAITING_FOR_SCAN"):
+		return MilkyLoginStateQRWaitingForScan
+	default:
+		return MilkyLoginStateInit
+	}
+}
+
+func applyMilkyBuiltInLoginTerminalState(d *Dice, ep *EndPointInfo, state MilkyLoginState) {
+	pa := ep.Adapter.(*PlatformAdapterMilky)
+	pa.BuiltInLoginState = state
+	pa.QrCodeData = nil
+	ep.Enable = false
+	ep.State = StateDisconnected
+	if d != nil {
+		d.LastUpdatedTime = time.Now().Unix()
+		d.Save(false)
 	}
 }
 
@@ -339,35 +382,79 @@ func ServeMilkyBuiltIn(d *Dice, ep *EndPointInfo) {
 	chQrCode := make(chan int, 1)
 	qrSignalCalled := atomic.Bool{}
 	qrSignalCalled.Store(false)
+	var loginStateMu sync.Mutex
+	var qrTimeout *time.Timer
+	stopQrTimeout := func() {
+		loginStateMu.Lock()
+		defer loginStateMu.Unlock()
+		if qrTimeout != nil {
+			qrTimeout.Stop()
+			qrTimeout = nil
+		}
+	}
+	setLoginState := func(state MilkyLoginState) {
+		loginStateMu.Lock()
+		if pa.BuiltInLoginState == state || pa.BuiltInLoginState == MilkyLoginStateCancelled || pa.BuiltInLoginState == MilkyLoginStateCodeExpired {
+			loginStateMu.Unlock()
+			return
+		}
+		pa.BuiltInLoginState = state
+		loginStateMu.Unlock()
+		d.LastUpdatedTime = time.Now().Unix()
+		d.Save(false)
+	}
+	finishLogin := func(state MilkyLoginState, message string) {
+		loginStateMu.Lock()
+		if pa.BuiltInLoginState == MilkyLoginStateQRConnected || pa.BuiltInLoginState == MilkyLoginStateCancelled || pa.BuiltInLoginState == MilkyLoginStateCodeExpired {
+			loginStateMu.Unlock()
+			return
+		}
+		applyMilkyBuiltInLoginTerminalState(nil, ep, state)
+		d.LastUpdatedTime = time.Now().Unix()
+		if qrTimeout != nil {
+			qrTimeout.Stop()
+			qrTimeout = nil
+		}
+		loginStateMu.Unlock()
+		d.Save(false)
+		log.Infof("Milky %s，已禁用账号：%s", message, ep.UserID)
+		BuiltinMilkyClientKill(d, ep)
+	}
+	startQrTimeout := func() {
+		loginStateMu.Lock()
+		if qrTimeout != nil {
+			qrTimeout.Stop()
+		}
+		qrTimeout = time.AfterFunc(120*time.Second, func() {
+			finishLogin(MilkyLoginStateCodeExpired, "二维码超时")
+		})
+		loginStateMu.Unlock()
+	}
 	pa.BuiltInLoginState = MilkyLoginStateInit
 	p.OutputHandler = func(line string, _type string) string {
-		// 登录中
-		if pa.BuiltInLoginState < MilkyLoginStateConnecting {
-			signals := getMilkyBuiltInSignals(pa.BuiltInMode)
-			// 读取二维码
-			if strings.Contains(line, signals.qrcode) && !qrSignalCalled.Load() {
-				qrSignalCalled.Store(true)
-				chQrCode <- 1
-			}
+		signals := getMilkyBuiltInSignals(pa.BuiltInMode)
+		if containsMilkyBuiltInSignal(line, signals.qrcode) && !qrSignalCalled.Load() {
+			qrSignalCalled.Store(true)
+			chQrCode <- 1
+		}
 
-			// 登录成功
-			if strings.Contains(line, signals.online) {
-				pa.BuiltInLoginState = MilkyLoginStateQRConnected
-				log.Infof("Milky 登录成功，账号：<%s>(%s)", ep.Nickname, ep.UserID)
-				d.LastUpdatedTime = time.Now().Unix()
-				d.Save(false)
-
-				// 经测试，若不延时，登录成功的同一时刻进行ws正向连接有几率导致第一次连接失败
-				time.Sleep(1 * time.Second)
-				go doServe()
-			}
-
-			if strings.Contains(line, signals.qrcodeExpired) {
-				// 二维码过期，登录失败，杀掉进程
-				pa.BuiltInLoginState = MilkyLoginStateFailed
-				log.Infof("Milky 二维码过期，登录失败，账号：%s", ep.UserID)
-				BuiltinMilkyClientKill(d, ep)
-			}
+		switch getMilkyBuiltInLoginStateFromLine(line, signals) {
+		case MilkyLoginStateQRWaitingForScan:
+			setLoginState(MilkyLoginStateQRWaitingForScan)
+		case MilkyLoginStateQRWaitingForConfirm:
+			setLoginState(MilkyLoginStateQRWaitingForConfirm)
+		case MilkyLoginStateQRConnected:
+			stopQrTimeout()
+			setLoginState(MilkyLoginStateQRConnected)
+			log.Infof("Milky 登录成功，账号：<%s>(%s)", ep.Nickname, ep.UserID)
+			// 经测试，若不延时，登录成功的同一时刻进行ws正向连接有几率导致第一次连接失败
+			time.Sleep(1 * time.Second)
+			go doServe()
+		case MilkyLoginStateCancelled:
+			finishLogin(MilkyLoginStateCancelled, "用户取消登录")
+		case MilkyLoginStateCodeExpired:
+			finishLogin(MilkyLoginStateCodeExpired, "二维码过期")
+		case MilkyLoginStateInit, MilkyLoginStatePlaceholder, MilkyLoginStateConnecting, MilkyLoginStateFailed:
 		}
 
 		if _type == "stderr" {
@@ -390,8 +477,11 @@ func ServeMilkyBuiltIn(d *Dice, ep *EndPointInfo) {
 			log.Info("Milky 二维码已就绪")
 			qrdata, err := os.ReadFile(qrcodeFilePath)
 			if err == nil {
+				loginStateMu.Lock()
 				pa.BuiltInLoginState = MilkyLoginStateQRWaitingForScan
 				pa.QrCodeData = qrdata
+				loginStateMu.Unlock()
+				startQrTimeout()
 				log.Info("Milky 读取二维码成功")
 				d.LastUpdatedTime = time.Now().Unix()
 				d.Save(false)
