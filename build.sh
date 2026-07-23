@@ -773,8 +773,7 @@ if [[ -s "$PRIVATE_KEY_FILE" ]]; then
 	echo "[Build] 已找到可信私钥文件：$PRIVATE_KEY_FILE"
 	PRIVATE_KEY_CONTENT_B64="$(base64 <"$PRIVATE_KEY_FILE" | tr -d '\n')"
 else
-	echo "[Build] 错误：可信私钥文件不存在：$PRIVATE_KEY_FILE"
-	exit 1
+	echo "[Build] 警告：可信私钥文件不存在或为空，跳过注入：$PRIVATE_KEY_FILE"
 fi
 
 # 处理签名客户端私钥 (SealSignClientPrivateKey)
