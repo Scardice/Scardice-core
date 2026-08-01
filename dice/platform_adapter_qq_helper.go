@@ -218,6 +218,9 @@ func serverSatori(d *Dice, ep *EndPointInfo, conn *PlatformAdapterSatori) {
 }
 
 func serverOfficialQQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterOfficialQQ) {
+	if conn.Ctx != nil {
+		return
+	}
 	if conn.DiceServing {
 		return
 	}
@@ -235,6 +238,10 @@ func serverOfficialQQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterOfficialQQ
 		ret := ep.Adapter.Serve()
 
 		if ret == 0 {
+			if conn.QRLoginState == OfficialQQQRWaitingForScan {
+				ep.Enable = false
+				ep.State = StateConnecting
+			}
 			break
 		}
 

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/base64"
 	"net/http"
 	"sort"
@@ -9,6 +10,9 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v4"
+	qqbot "github.com/sealdice/botgo"
+	"github.com/sealdice/botgo/dto"
+	qqtoken "github.com/sealdice/botgo/token"
 
 	"Scardice-core/dice"
 )
@@ -351,6 +355,15 @@ func ImConnectionsQrcodeGet(c echo.Context) error {
 			}
 			if pa.BuiltInLoginState == dice.MilkyLoginStateCodeExpired {
 				return c.JSON(http.StatusOK, map[string]string{"img": "", "reason": "expired"})
+			}
+		case "official":
+			pa := i.Adapter.(*dice.PlatformAdapterOfficialQQ)
+			if pa.QRLoginState == dice.OfficialQQQRWaitingForScan {
+				result := map[string]string{"url": pa.QRURL}
+				if len(pa.QRCodeData) != 0 {
+					result["img"] = "data:image/png;base64," + base64.StdEncoding.EncodeToString(pa.QRCodeData)
+				}
+				return c.JSON(http.StatusOK, result)
 			}
 		}
 		return c.JSON(http.StatusOK, i)
@@ -979,6 +992,31 @@ func ImConnectionsAddRed(c echo.Context) error {
 	return c.String(430, "")
 }
 
+type imConnectionsAddOfficialQQRequest struct {
+	AppID       uint64 `json:"appID"       yaml:"appID"`
+	Token       string `json:"token"       yaml:"token"`
+	AppSecret   string `json:"appSecret"   yaml:"appSecret"`
+	OnlyQQGuild bool   `json:"onlyQQGuild" yaml:"onlyQQGuild"`
+	TestOnly    bool   `json:"testOnly"    yaml:"testOnly"`
+}
+
+var (
+	officialQQMe = func(ctx context.Context, state *dice.PlatformAdapterOfficialQQ) (*dto.User, error) {
+		appID := strconv.FormatUint(state.AppID, 10)
+		tokenSource := qqtoken.NewQQBotTokenSource(&qqtoken.QQBotCredentials{
+			AppID:     appID,
+			AppSecret: state.AppSecret,
+		})
+		return qqbot.NewOpenAPI(appID, tokenSource).WithTimeout(3 * time.Second).Me(ctx)
+	}
+	officialQQSave = func(d *dice.Dice) {
+		d.Save(false)
+	}
+	officialQQStart = func(d *dice.Dice, conn *dice.EndPointInfo) {
+		go dice.ServerOfficialQQ(d, conn)
+	}
+)
+
 func ImConnectionsAddOfficialQQ(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
@@ -987,20 +1025,46 @@ func ImConnectionsAddOfficialQQ(c echo.Context) error {
 		return Success(&c, Response{"testMode": true})
 	}
 
-	v := struct {
-		AppID       uint64 `json:"appID"       yaml:"appID"`
-		Token       string `json:"token"       yaml:"token"`
-		AppSecret   string `json:"appSecret"   yaml:"appSecret"`
-		OnlyQQGuild bool   `json:"onlyQQGuild" yaml:"onlyQQGuild"`
-	}{}
+	v := imConnectionsAddOfficialQQRequest{}
 	err := c.Bind(&v)
 	if err == nil {
+		if v.TestOnly {
+			state := &dice.PlatformAdapterOfficialQQ{
+				AppID:       v.AppID,
+				Token:       v.Token,
+				AppSecret:   v.AppSecret,
+				OnlyQQGuild: v.OnlyQQGuild,
+			}
+			ctx, cancel := context.WithTimeout(c.Request().Context(), 5*time.Second)
+			defer cancel()
+			identity, meErr := officialQQMe(ctx, state)
+			if meErr != nil || identity == nil || identity.ID == "" {
+				return Error(&c, "official QQ connection test failed", Response{})
+			}
+
+			userID := "OpenQQ:" + identity.ID
+			exists := false
+			for _, endpoint := range myDice.ImSession.EndPoints {
+				if endpoint != nil && endpoint.Platform == "QQ" && endpoint.ProtocolType == "official" && endpoint.UserID == userID {
+					exists = true
+					break
+				}
+			}
+			return Success(&c, Response{
+				"testOnly": true,
+				"userId":   userID,
+				"uin":      identity.ID,
+				"nickname": identity.Username,
+				"exists":   exists,
+			})
+		}
+
 		conn := dice.NewOfficialQQConnItem(v.AppID, v.Token, v.AppSecret, v.OnlyQQGuild)
 		conn.BindRuntime(myDice.ImSession)
 		myDice.ImSession.EndPoints = append(myDice.ImSession.EndPoints, conn)
 		myDice.LastUpdatedTime = time.Now().Unix()
-		myDice.Save(false)
-		go dice.ServerOfficialQQ(myDice, conn)
+		officialQQSave(myDice)
+		officialQQStart(myDice, conn)
 		return Success(&c, Response{})
 	}
 	return c.String(430, "")

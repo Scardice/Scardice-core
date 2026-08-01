@@ -7,15 +7,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
-
-	"github.com/sealdice/botgo/event"
 
 	qqbot "github.com/sealdice/botgo"
 	"github.com/sealdice/botgo/dto"
 	qqapi "github.com/sealdice/botgo/openapi"
 	qqtoken "github.com/sealdice/botgo/token"
-	qqws "github.com/sealdice/botgo/websocket"
 
 	"Scardice-core/message"
 )
@@ -29,10 +27,20 @@ type PlatformAdapterOfficialQQ struct {
 	Token       string `json:"token"       yaml:"token"`
 	OnlyQQGuild bool   `json:"onlyQQGuild" yaml:"onlyQQGuild"`
 
-	Api            qqapi.OpenAPI        `json:"-" yaml:"-"`
-	SessionManager qqbot.SessionManager `json:"-" yaml:"-"`
-	Ctx            context.Context      `json:"-" yaml:"-"`
-	CancelFunc     context.CancelFunc   `json:"-" yaml:"-"`
+	Api            qqapi.OpenAPI          `json:"-" yaml:"-"`
+	SessionManager qqbot.SessionManager   `json:"-" yaml:"-"`
+	Ctx            context.Context        `json:"-" yaml:"-"`
+	CancelFunc     context.CancelFunc     `json:"-" yaml:"-"`
+	QRLoginState   OfficialQQQRLoginState `json:"qrLoginState" yaml:"-"`
+	QRURL          string                 `json:"qrURL"        yaml:"-"`
+	QRCodeData     []byte                 `json:"-"            yaml:"-"`
+
+	eventQueueMu        sync.Mutex
+	eventQueue          *officialQQEventQueue
+	eventQueueAccepting bool
+	memberEventSink     func(officialQQGroupMemberEvent)
+	qrClient            officialQQQRClient
+	qrEncoder           officialQQQREncoder
 }
 
 func (pa *PlatformAdapterOfficialQQ) Serve() int {
@@ -45,13 +53,25 @@ func (pa *PlatformAdapterOfficialQQ) Serve() int {
 		log.Info("official qq session already running, skip Serve")
 		return 0
 	}
-
 	log.Debug("official qq server")
 	qqbot.SetLogger(NewDummyLogger())
-	token := qqtoken.BotToken(pa.AppID, pa.Token)
-	pa.Api = qqbot.NewOpenAPI(token).WithTimeout(3 * time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	pa.Ctx, pa.CancelFunc = ctx, cancel
+	if pa.AppID == 0 {
+		ep.State = StateConnecting
+		if err := pa.beginQRLogin(ctx, "scardice"); err != nil {
+			ep.State = StateConnectionFailed
+			cancel()
+			pa.Ctx = nil
+			pa.CancelFunc = nil
+			return 1
+		}
+		return 0
+	}
+
+	pa.startOfficialQQEventQueue()
+	token := qqtoken.BotToken(pa.AppID, pa.Token)
+	pa.Api = qqbot.NewOpenAPI(token).WithTimeout(3 * time.Second)
 	pa.SessionManager = qqbot.NewSessionManager()
 
 	ep.State = 2
@@ -68,18 +88,11 @@ func (pa *PlatformAdapterOfficialQQ) Serve() int {
 		pa.SessionManager = nil
 		pa.Ctx = nil
 		pa.CancelFunc = nil
+		pa.closeOfficialQQEventQueue()
 		return 1
 	}
-	// 极端情况下 shards 为 0 会导致 session manager 阻塞在 channel range 上
-	if ws.Shards == 0 {
-		ws.Shards = 1
-	}
-	// 频控不满足时，botgo 会直接返回错误；这里提前检查避免在 goroutine 内“静默失败”
-	if ws.Shards > ws.SessionStartLimit.Remaining {
-		log.Errorf(
-			"official qq session limited: shards=%d remaining=%d resetAfter=%d maxConcurrency=%d",
-			ws.Shards, ws.SessionStartLimit.Remaining, ws.SessionStartLimit.ResetAfter, ws.SessionStartLimit.MaxConcurrency,
-		)
+	if err := validateOfficialQQWebsocketAP(ws); err != nil {
+		log.Error("official qq websocket access point invalid: ", err)
 		ep.State = 3
 		if pa.CancelFunc != nil {
 			pa.CancelFunc()
@@ -88,28 +101,11 @@ func (pa *PlatformAdapterOfficialQQ) Serve() int {
 		pa.SessionManager = nil
 		pa.Ctx = nil
 		pa.CancelFunc = nil
+		pa.closeOfficialQQEventQueue()
 		return 1
 	}
 
-	var intent dto.Intent
-	// 文字子频道at消息
-	var channelAtMessage event.ATMessageEventHandler = pa.ChannelAtMessageReceive
-	// 频道私聊消息
-	var guildDirectMessage event.DirectMessageEventHandler = pa.GuildDirectMessageReceive
-	// 群聊at消息
-	var groupAtMessage event.GroupATMessageEventHandler = pa.GroupAtMessageReceive
-	if pa.OnlyQQGuild {
-		intent = qqws.RegisterHandlers(
-			channelAtMessage, guildDirectMessage,
-		)
-	} else {
-		intent = qqws.RegisterHandlers(
-			channelAtMessage,
-			guildDirectMessage,
-			groupAtMessage,
-		)
-	}
-
+	intent := pa.registerOfficialQQHandlers()
 	go func() {
 		currentCtx := ctx
 		defer func() {
@@ -119,20 +115,21 @@ func (pa *PlatformAdapterOfficialQQ) Serve() int {
 				log.Error("official qq 启动失败: ", r)
 				if isCurrent {
 					ep.State = 3
-					ep.Enable = false
 				}
 			}
 			if isCurrent {
+				pa.closeOfficialQQEventQueue()
 				pa.Ctx = nil
 				pa.CancelFunc = nil
 				pa.SessionManager = nil
 			}
 		}()
-		if startErr := pa.SessionManager.Start(currentCtx, ws, token, &intent); startErr != nil {
+		if startErr := runOfficialQQSession(currentCtx, func(runCtx context.Context) error {
+			return pa.SessionManager.Start(runCtx, ws, token, &intent)
+		}); startErr != nil {
 			log.Error("official qq session manager 启动失败: ", startErr)
 			if pa.Ctx == currentCtx {
 				ep.State = 3
-				ep.Enable = false
 			}
 		}
 	}()
@@ -144,8 +141,14 @@ func (pa *PlatformAdapterOfficialQQ) Serve() int {
 
 	botInfo, err := pa.Api.Me(ctx)
 	if err == nil {
-		ep.UserID = formatDiceIDOfficialQQ(botInfo.ID)
-		ep.Nickname = botInfo.Username
+		if acceptErr := pa.acceptVerifiedAccount(ctx, d, botInfo); acceptErr != nil {
+			if errors.Is(acceptErr, ErrOfficialQQDuplicateAccount) {
+				cancel()
+				ep.State = StateConnectionFailed
+				return 1
+			}
+			log.Warnf("official qq verified identity migration deferred after failure: %v", acceptErr)
+		}
 	}
 
 	return 0
@@ -155,8 +158,14 @@ func (pa *PlatformAdapterOfficialQQ) ChannelAtMessageReceive(event *dto.WSPayloa
 	s := pa.EndPoint.Session
 	log := s.Parent.Logger
 	log.Debugf("official qq: 收到文字频道消息：%v, %v", event, data)
+	if pa.detectBotAccount(data.Author) {
+		return nil
+	}
 
-	s.Execute(pa.EndPoint, pa.channelMsgToStdMsg(data), false)
+	msg := pa.channelMsgToStdMsg(data)
+	pa.enqueueOfficialQQEvent(func() {
+		s.Execute(pa.EndPoint, msg, false)
+	})
 	return nil
 }
 
@@ -183,8 +192,14 @@ func (pa *PlatformAdapterOfficialQQ) GuildDirectMessageReceive(event *dto.WSPayl
 	s := pa.EndPoint.Session
 	log := s.Parent.Logger
 	log.Debugf("official qq: 收到频道私信消息：%v, %v", event, data)
+	if pa.detectBotAccount(data.Author) {
+		return nil
+	}
 
-	s.Execute(pa.EndPoint, pa.guildDirectMsgToStdMsg(data), false)
+	msg := pa.guildDirectMsgToStdMsg(data)
+	pa.enqueueOfficialQQEvent(func() {
+		s.Execute(pa.EndPoint, msg, false)
+	})
 	return nil
 }
 
@@ -211,8 +226,14 @@ func (pa *PlatformAdapterOfficialQQ) GroupAtMessageReceive(event *dto.WSPayload,
 	s := pa.EndPoint.Session
 	log := s.Parent.Logger
 	log.Debugf("official qq: 收到群聊消息：%v, %v", event, data)
+	if pa.detectBotAccount(data.Author) {
+		return nil
+	}
 
-	s.Execute(pa.EndPoint, pa.groupMsgToStdMsg(data), false)
+	msg := pa.groupMsgToStdMsg(data)
+	pa.enqueueOfficialQQEvent(func() {
+		s.Execute(pa.EndPoint, msg, false)
+	})
 	return nil
 }
 
@@ -233,15 +254,29 @@ func (pa *PlatformAdapterOfficialQQ) groupMsgToStdMsg(msgQQ *dto.WSGroupATMessag
 	}
 	return msg
 }
+
+func (pa *PlatformAdapterOfficialQQ) detectBotAccount(author *dto.User) bool {
+	if author == nil || author.ID == "" || pa.EndPoint == nil {
+		return false
+	}
+	trustedID, ok := strings.CutPrefix(pa.EndPoint.UserID, "OpenQQ:")
+	return ok && trustedID != "" && author.ID == trustedID
+}
+
 func (pa *PlatformAdapterOfficialQQ) DoRelogin() bool {
-	pa.CancelFunc()
+	if pa.CancelFunc != nil {
+		pa.CancelFunc()
+	}
+	pa.closeOfficialQQEventQueue()
 	pa.EndPoint.Session.Parent.Logger.Infof("正在启用 official qq 服务")
 	pa.EndPoint.State = 0
-	pa.EndPoint.Enable = false
 	pa.Api = nil
 	pa.SessionManager = nil
 	pa.Ctx = nil
 	pa.CancelFunc = nil
+	pa.QRLoginState = OfficialQQQRInitial
+	pa.QRURL = ""
+	pa.QRCodeData = nil
 	return pa.Serve() == 0
 }
 
@@ -255,8 +290,13 @@ func (pa *PlatformAdapterOfficialQQ) SetEnable(enable bool) {
 			ep.State = 2
 			ServerOfficialQQ(d, ep)
 		} else {
-			ep.Enable = true
-			ep.State = 1
+			if pa.QRLoginState == OfficialQQQRWaitingForScan {
+				ep.Enable = false
+				ep.State = StateConnecting
+			} else {
+				ep.Enable = true
+				ep.State = StateConnected
+			}
 		}
 	} else {
 		ep.State = 0
@@ -264,8 +304,12 @@ func (pa *PlatformAdapterOfficialQQ) SetEnable(enable bool) {
 		if pa.CancelFunc != nil {
 			pa.CancelFunc()
 		}
+		pa.closeOfficialQQEventQueue()
 		pa.CancelFunc = nil
 		pa.Ctx = nil
+		pa.QRLoginState = OfficialQQQRInitial
+		pa.QRURL = ""
+		pa.QRCodeData = nil
 	}
 	d.LastUpdatedTime = time.Now().Unix()
 }
