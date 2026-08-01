@@ -3,6 +3,7 @@ package upgrade
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -32,6 +33,17 @@ func (m *Manager) ApplyAll() error {
 		if applied {
 			continue
 		}
+		if !up.Idempotent {
+			records, err := m.Store.LoadRecords()
+			if err != nil {
+				return err
+			}
+			for _, rec := range slices.Backward(records) {
+				if rec.ID == up.ID {
+					return fmt.Errorf("升级 %s 有失败记录且未声明为幂等操作，拒绝重试", up.ID)
+				}
+			}
+		}
 
 		logs := []string{}
 		logf := func(msg string) {
@@ -53,7 +65,7 @@ func (m *Manager) ApplyAll() error {
 		}
 
 		if err2 := m.Store.SaveRecord(rec); err2 != nil {
-			return fmt.Errorf("保存升级记录失败: %w", err)
+			return fmt.Errorf("保存升级记录失败: %w", err2)
 		}
 
 		if err != nil {
