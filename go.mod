@@ -15,8 +15,6 @@ require (
 	github.com/antlabs/strsim v0.0.3
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
 	github.com/avast/retry-go v3.0.0+incompatible
-	github.com/blevesearch/bleve/v2 v2.5.2
-	github.com/blevesearch/bleve_index_api v1.2.10
 	github.com/bwmarrin/discordgo v0.29.0
 	github.com/bytedance/sonic v1.15.2
 	github.com/cespare/xxhash/v2 v2.3.0
@@ -24,6 +22,7 @@ require (
 	github.com/dop251/goja v0.0.0-20260216154549-8b74ce4618c5
 	github.com/dop251/goja_nodejs v0.0.0-20250409162600-f7acab6894b0
 	github.com/evanw/esbuild v0.27.1
+	github.com/fy0/bluge v0.0.0-20260713113642-38c63a5ebb28
 	github.com/fy0/go-autostart v0.0.0-20220515100644-a25d81ed766b
 	github.com/fy0/systray v1.2.2
 	github.com/fyrchik/go-shlex v0.0.0-20210215145004-cd7f49bfd959
@@ -57,6 +56,7 @@ require (
 	github.com/mroth/weightedrand v1.0.0
 	github.com/ncruces/go-sqlite3 v0.32.0
 	github.com/ncruces/go-sqlite3/gormlite v0.24.0
+	github.com/oklog/ulid/v2 v2.1.2
 	github.com/open-dingtalk/dingtalk-stream-sdk-go v0.9.1
 	github.com/otiai10/copy v1.14.1
 	github.com/panjf2000/ants/v2 v2.11.3
@@ -101,29 +101,27 @@ require (
 )
 
 require (
+	github.com/axiomhq/hyperloglog v0.2.6 // indirect
+	github.com/blevesearch/bleve_index_api v1.4.0 // indirect
+	github.com/caio/go-tdigest/v4 v4.1.0 // indirect
+	github.com/dgryski/go-metro v0.0.0-20250106013310-edb8663e5e33 // indirect
+	github.com/kamstrup/intmap v0.5.2 // indirect
+)
+
+require (
 	filippo.io/edwards25519 v1.1.0 // indirect
 	git.sr.ht/~jackmordaunt/go-toast v1.1.2 // indirect
 	github.com/HugoSmits86/nativewebp v1.2.0 // indirect
-	github.com/RoaringBitmap/roaring/v2 v2.8.0 // indirect
+	github.com/RoaringBitmap/roaring/v2 v2.14.5 // indirect
 	github.com/andybalholm/brotli v1.2.0 // indirect
-	github.com/bits-and-blooms/bitset v1.22.0 // indirect
+	github.com/bits-and-blooms/bitset v1.24.2 // indirect
 	github.com/bits-and-blooms/bloom/v3 v3.7.0 // indirect
-	github.com/blevesearch/geo v0.2.3 // indirect
-	github.com/blevesearch/go-faiss v1.0.25 // indirect
 	github.com/blevesearch/go-porterstemmer v1.0.3 // indirect
-	github.com/blevesearch/gtreap v0.1.1 // indirect
-	github.com/blevesearch/mmap-go v1.0.4 // indirect
-	github.com/blevesearch/scorch_segment_api/v2 v2.3.10 // indirect
+	github.com/blevesearch/mmap-go v1.2.0 // indirect
+	github.com/blevesearch/scorch_segment_api/v2 v2.4.8 // indirect
 	github.com/blevesearch/segment v0.9.1 // indirect
 	github.com/blevesearch/snowballstem v0.9.0 // indirect
-	github.com/blevesearch/upsidedown_store_api v1.0.2 // indirect
-	github.com/blevesearch/vellum v1.1.0 // indirect
-	github.com/blevesearch/zapx/v11 v11.4.2 // indirect
-	github.com/blevesearch/zapx/v12 v12.4.2 // indirect
-	github.com/blevesearch/zapx/v13 v13.4.2 // indirect
-	github.com/blevesearch/zapx/v14 v14.4.2 // indirect
-	github.com/blevesearch/zapx/v15 v15.4.2 // indirect
-	github.com/blevesearch/zapx/v16 v16.2.4 // indirect
+	github.com/blevesearch/vellum v1.2.0 // indirect
 	github.com/bytedance/gopkg v0.1.3 // indirect
 	github.com/bytedance/sonic/loader v0.5.1 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
@@ -218,7 +216,7 @@ require (
 	golang.org/x/image v0.32.0 // indirect
 	golang.org/x/mod v0.32.0 // indirect
 	golang.org/x/net v0.49.0 // indirect
-	golang.org/x/sync v0.19.0 // indirect
+	golang.org/x/sync v0.19.0
 	golang.org/x/term v0.40.0 // indirect
 	google.golang.org/appengine v1.6.8 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
@@ -232,8 +230,6 @@ require (
 
 replace (
 	github.com/Szzrain/dodo-open-go v0.2.7 => github.com/sealdice/dodo-open-go v0.2.8
-	// Try to fix arm64 bug with better snappy.
-	github.com/blevesearch/zapx/v16 v16.1.8 => github.com/PaienNate/zapx/v16 v16.1.9
 	// Try to fix sqlite in cgofree
 	// github.com/glebarez/sqlite v1.11.0 => github.com/PaienNate/sqlite v0.0.0-20241102151933-067d82f14685
 	github.com/dop251/goja_nodejs v0.0.0-20250409162600-f7acab6894b0 => github.com/PaienNate/goja_nodejs v0.0.0-20250924024212-bac2e5ba5231
