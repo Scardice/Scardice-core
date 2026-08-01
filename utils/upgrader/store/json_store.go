@@ -4,6 +4,7 @@ package store
 import (
 	"encoding/json"
 	"os"
+	"slices"
 	"sync"
 
 	"Scardice-core/utils"
@@ -63,9 +64,9 @@ func (js *JSONStore) IsApplied(id string) (bool, error) {
 	if err := js.load(); err != nil {
 		return false, err
 	}
-	for _, rec := range js.data {
+	for _, rec := range slices.Backward(js.data) {
 		if rec.ID == id {
-			return true, nil
+			return rec.Success, nil
 		}
 	}
 	return false, nil
