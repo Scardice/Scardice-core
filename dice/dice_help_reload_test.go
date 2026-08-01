@@ -21,7 +21,7 @@ func TestHelpManagerStartupReloadRemovesDeletedHelpDocFromExistingIndex(t *testi
 	writeTestHelpDocFile(t, root, keepRelPath, map[string]string{keepTitle: "keep content"})
 	removePath := writeTestHelpDocFile(t, root, removeRelPath, map[string]string{removeTitle: "remove content"})
 
-	manager1 := &HelpManager{EngineType: BleveSearch}
+	manager1 := &HelpManager{EngineType: BlugeSearch}
 	manager1.Load(nil, CmdMapCls{}, nil)
 	t.Cleanup(manager1.Close)
 
@@ -44,7 +44,7 @@ func TestHelpManagerStartupReloadRemovesDeletedHelpDocFromExistingIndex(t *testi
 		t.Fatalf("remove helpdoc %q: %v", removePath, removeErr)
 	}
 
-	manager2 := &HelpManager{EngineType: BleveSearch}
+	manager2 := &HelpManager{EngineType: BlugeSearch}
 	manager2.Load(nil, CmdMapCls{}, nil)
 	t.Cleanup(manager2.Close)
 
@@ -85,11 +85,11 @@ func TestHelpIndexReuseIgnoresGeneratedHelpFingerprint(t *testing.T) {
 	root := switchToTempWorkdir(t)
 	_ = root
 
-	manifestV1, err := buildHelpIndexManifest(BleveSearch)
+	manifestV1, err := buildHelpIndexManifest(BlugeSearch)
 	if err != nil {
 		t.Fatalf("build manifest v1: %v", err)
 	}
-	manifestV2, err := buildHelpIndexManifest(BleveSearch)
+	manifestV2, err := buildHelpIndexManifest(BlugeSearch)
 	if err != nil {
 		t.Fatalf("build manifest v2: %v", err)
 	}
@@ -117,11 +117,11 @@ func TestHelpManagerReuseRefreshesGeneratedHelpDocs(t *testing.T) {
 		},
 	}
 
-	manager1 := &HelpManager{EngineType: BleveSearch}
+	manager1 := &HelpManager{EngineType: BlugeSearch}
 	manager1.Load(nil, builtin1, nil)
 	manager1.Close()
 
-	manager2 := &HelpManager{EngineType: BleveSearch}
+	manager2 := &HelpManager{EngineType: BlugeSearch}
 	manager2.Load(nil, builtin2, nil)
 	t.Cleanup(manager2.Close)
 
@@ -153,7 +153,7 @@ func TestHelpManagerIncrementalRefreshUsesContentHash(t *testing.T) {
 		t.Fatalf("set initial mtime: %v", err)
 	}
 
-	manager1 := &HelpManager{EngineType: BleveSearch}
+	manager1 := &HelpManager{EngineType: BlugeSearch}
 	manager1.Load(nil, CmdMapCls{}, nil)
 	manager1.Close()
 
@@ -162,7 +162,7 @@ func TestHelpManagerIncrementalRefreshUsesContentHash(t *testing.T) {
 		t.Fatalf("set updated mtime: %v", err)
 	}
 
-	manager2 := &HelpManager{EngineType: BleveSearch}
+	manager2 := &HelpManager{EngineType: BlugeSearch}
 	manager2.Load(nil, CmdMapCls{}, nil)
 	t.Cleanup(manager2.Close)
 
@@ -190,7 +190,7 @@ func TestHelpManagerReuseDoesNotTrustLowerManifestTotalID(t *testing.T) {
 	)
 	writeTestHelpDocFile(t, root, relPath, map[string]string{title: "stable content"})
 
-	manager1 := &HelpManager{EngineType: BleveSearch}
+	manager1 := &HelpManager{EngineType: BlugeSearch}
 	manager1.Load(nil, CmdMapCls{"generated-id-test": {Help: "generated v1"}}, nil)
 	manager1.Close()
 
@@ -203,7 +203,7 @@ func TestHelpManagerReuseDoesNotTrustLowerManifestTotalID(t *testing.T) {
 		t.Fatalf("write manifest with lower total id: %v", err)
 	}
 
-	manager2 := &HelpManager{EngineType: BleveSearch}
+	manager2 := &HelpManager{EngineType: BlugeSearch}
 	manager2.Load(nil, CmdMapCls{"generated-id-test": {Help: "generated v2"}}, nil)
 	t.Cleanup(manager2.Close)
 

@@ -11,7 +11,6 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -69,6 +68,7 @@ type HelpManager struct {
 	GroupAliases map[string]string
 	// SearchEngine
 	searchEngine docengine.SearchEngine
+	docIDs       []string
 
 	Config *HelpConfig
 	stop   atomic.Bool
@@ -78,7 +78,7 @@ type HelpManager struct {
 type EngineType int
 
 const (
-	BleveSearch EngineType = iota // 0
+	BlugeSearch EngineType = iota // 0
 	Clover                        // 1
 	MeiliSearch                   // 2
 )
@@ -86,9 +86,9 @@ const (
 const HelpConfigFilename = "help_config.yaml"
 const helpIndexManifestPath = "./data/.cache/helpdoc/index_manifest.json"
 const helpIndexManifestVersion = 1
-const helpIndexSchemaVersion = 2
+const helpIndexSchemaVersion = 4
 const helpDocParsedCacheDir = "./data/.cache/helpdoc/parsed"
-const helpDocParsedCacheVersion = 2
+const helpDocParsedCacheVersion = 4
 
 type HelpConfig struct {
 	Aliases map[string][]string `json:"aliases" yaml:"aliases"`
@@ -112,30 +112,21 @@ type helpDocParsedCache struct {
 }
 
 func (m *HelpManager) loadSearchEngineWithMode(reuse bool) error {
-	if runtime.GOARCH == "arm64" {
-		// 等木落测试，测试之前先不实现这个Clover模式，如果直接就能用，那也不必再实现他了
-		m.EngineType = BleveSearch
-	}
+	_ = os.RemoveAll("./data/_index")
+	_ = os.RemoveAll("./data/_help_cache")
+	_ = os.RemoveAll("./_help_cache")
 	if !reuse {
-		// 删除旧版本数据，这里先不改，先集中精力测试BleveSearch
-		_ = os.RemoveAll("./data/.cache/helpdoc/index")
-		_ = os.RemoveAll("./data/_index")
-		_ = os.RemoveAll("./_help_cache")
-	} else {
-		if err := migrateHelpIndexDir(); err != nil {
-			logger.M().Warnf("[帮助文档] 索引迁移失败: %v", err)
-		}
+		_ = os.RemoveAll(docengine.DefaultIndexDir)
 	}
 	switch m.EngineType {
 	case Clover:
-	case BleveSearch:
-		engine, err := docengine.NewBleveSearchEngine(reuse)
+	case BlugeSearch:
+		engine, err := docengine.NewBlugeSearchEngine()
 		if err != nil {
 			return err
 		}
 		m.searchEngine = engine
 	default:
-		// 如果BleveSearch兼容性差，到时候全部回退到Clover查询
 		return errors.New("unhandled default case")
 	}
 	return nil
@@ -204,9 +195,6 @@ func (m *HelpManager) Load(dice *Dice, internalCmdMap CmdMapCls, extList []*ExtI
 		if m.shouldStop() {
 			return
 		}
-		if oldManifest != nil && oldManifest.TotalID > m.searchEngine.GetTotalID() {
-			m.searchEngine.SetTotalID(oldManifest.TotalID)
-		}
 		m.HelpDocTree = m.buildHelpDocTreeOnly()
 		m.loadHelpConfigIfExists()
 		changed, updateErr := m.updateHelpIndexIncremental(oldManifest.Files, curManifest.Files)
@@ -233,7 +221,10 @@ func (m *HelpManager) Load(dice *Dice, internalCmdMap CmdMapCls, extList []*ExtI
 					return
 				}
 				log.Infof("[帮助文档] 增量更新完成，变更: %v", changed)
-				m.CurID = m.searchEngine.GetTotalID()
+				if rebuildErr := m.rebuildDocIDs(); rebuildErr != nil {
+					log.Errorf("[帮助文档] 重建数字 ID 映射失败: %v", rebuildErr)
+					return
+				}
 				curManifest.TotalID = m.CurID
 				if writeErr := writeHelpIndexManifest(curManifest); writeErr != nil {
 					log.Warnf("[帮助文档] 写入索引清单失败: %v", writeErr)
@@ -340,7 +331,10 @@ func (m *HelpManager) Load(dice *Dice, internalCmdMap CmdMapCls, extList []*ExtI
 		log.Errorf("加载插件指令帮助文档出现异常: %v", err)
 	}
 	log.Infof("[帮助文档] 指令相关（含插件）帮助文档组已加载完成!")
-	m.CurID = m.searchEngine.GetTotalID()
+	if err := m.rebuildDocIDs(); err != nil {
+		log.Errorf("[帮助文档] 重建数字 ID 映射失败: %v", err)
+		return
+	}
 	elapsed := time.Since(start) // 计算执行时间
 	log.Infof("帮助文档加载完毕，共耗费时间: %s 共计加载条目:%d\n", elapsed, m.CurID)
 	curManifest.TotalID = m.CurID
@@ -636,27 +630,6 @@ func (m *HelpManager) shouldStop() bool {
 	return m.stop.Load()
 }
 
-func migrateHelpIndexDir() error {
-	newDir := "./data/.cache/helpdoc/index"
-	oldDir := "./data/_index"
-	if _, err := os.Stat(newDir); err == nil {
-		return nil
-	}
-	if _, err := os.Stat(oldDir); err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(newDir), 0o755); err != nil {
-		return err
-	}
-	if err := os.Rename(oldDir, newDir); err != nil {
-		return err
-	}
-	return nil
-}
-
 func collectHelpDocFiles(root string) ([]helpDocFileInfo, error) {
 	var files []helpDocFileInfo
 	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
@@ -730,7 +703,7 @@ func buildHelpIndexFingerprint() string {
 	write(fmt.Sprintf("manifest:%d", helpIndexManifestVersion))
 	write(fmt.Sprintf("schema:%d", helpIndexSchemaVersion))
 	write(fmt.Sprintf("parsed-cache:%d", helpDocParsedCacheVersion))
-	write(fmt.Sprintf("engine:%d", BleveSearch))
+	write(fmt.Sprintf("engine:%d", BlugeSearch))
 
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -913,7 +886,7 @@ func parseHelpDocXLSX(group string, path string) ([]docengine.HelpTextItem, erro
 					}
 				}
 				key := keyBuilder.String()
-				content := row[synonymCount+1]
+				content := unescapeXlsxHelpContent(row[synonymCount+1])
 
 				items = append(items, docengine.HelpTextItem{
 					Group:       group,
@@ -1153,8 +1126,8 @@ func (m *HelpManager) IsAvailable() bool {
 	if m == nil || m.searchEngine == nil {
 		return false
 	}
-	if engine, ok := m.searchEngine.(*docengine.BleveSearchEngine); ok {
-		return engine.Index != nil
+	if engine, ok := m.searchEngine.(*docengine.BlugeSearchEngine); ok {
+		return engine.Writer != nil
 	}
 	return true
 }
@@ -1171,8 +1144,8 @@ func (m *HelpManager) GetPrefixText() string {
 	return m.searchEngine.GetPrefixText()
 }
 
-func (m *HelpManager) GetShowBestOffset() int {
-	return m.searchEngine.GetShowBestOffset()
+func (m *HelpManager) GetShowBestRelativeGap() float64 {
+	return m.searchEngine.GetShowBestRelativeGap()
 }
 
 func (m *HelpManager) GetContent(item *docengine.HelpTextItem, depth int) string {
@@ -1560,8 +1533,11 @@ func (m *HelpManager) GetHelpItemPage(pageNum, pageSize int, id, group, from, ti
 
 	// 如果ID不为空
 	if id != "" {
-		// 加载对应ID的数据
-		item, err := m.searchEngine.GetItemByID(id)
+		numericID, err := strconv.Atoi(id)
+		if err != nil {
+			return 0, HelpTextVos{}
+		}
+		item, err := m.GetItemByNumericID(numericID)
 		// 若成功
 		if err == nil {
 			// 返回这条数据
@@ -1573,7 +1549,7 @@ func (m *HelpManager) GetHelpItemPage(pageNum, pageSize int, id, group, from, ti
 				PackageName: item.PackageName,
 				KeyWords:    item.KeyWords,
 			}
-			vo.ID, _ = strconv.Atoi(id)
+			vo.ID = numericID
 			return 1, HelpTextVos{vo}
 		}
 		return 0, HelpTextVos{}
@@ -1585,7 +1561,13 @@ func (m *HelpManager) GetHelpItemPage(pageNum, pageSize int, id, group, from, ti
 	}
 	var items = make(HelpTextVos, 0)
 	for _, item := range result {
+		numericID, ok := m.getNumericIDByInternalID(item.InternalID)
+		if !ok {
+			logger.M().Warnf("帮助文档内部 ID 不在数字 ID 映射中: %s", item.InternalID)
+			continue
+		}
 		vo := HelpTextVo{
+			ID:          numericID,
 			Group:       item.Group,
 			From:        item.From,
 			Title:       item.Title,
@@ -1593,7 +1575,6 @@ func (m *HelpManager) GetHelpItemPage(pageNum, pageSize int, id, group, from, ti
 			PackageName: item.PackageName,
 			KeyWords:    item.KeyWords,
 		}
-		vo.ID, _ = strconv.Atoi(id)
 		items = append(items, vo)
 	}
 	return int(total), items

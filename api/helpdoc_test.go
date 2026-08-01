@@ -27,7 +27,7 @@ func TestHelpDocReloadAPIReflectsDeletedHelpDoc(t *testing.T) {
 	writeAPIHelpDocFile(t, root, keepRelPath, map[string]string{keepTitle: "keep content"})
 	removePath := writeAPIHelpDocFile(t, root, removeRelPath, map[string]string{removeTitle: "remove content"})
 
-	manager := &dice.DiceManager{HelpDocEngineType: int(dice.BleveSearch)}
+	manager := &dice.DiceManager{HelpDocEngineType: int(dice.BlugeSearch)}
 	manager.AccessTokens.Store(token, true)
 	testDice := &dice.Dice{
 		Parent: manager,
