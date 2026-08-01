@@ -342,16 +342,9 @@ func main() {
 	diceManager.LoadDice()
 	diceManager.IsReady = true
 
-	var pprofStop func()
-	if opts.PprofRecord {
-		rec, recErr := startPprofRecord(log, diceManager.AppBootTime)
-		if recErr != nil {
-			log.Warnf("pprof 记录启动失败: %v", recErr)
-		} else {
-			pprofStop = func() {
-				rec.stop(log)
-			}
-		}
+	pprofStop, recErr := startPprofRecordIfEnabled(opts.PprofRecord, log, diceManager.AppBootTime)
+	if recErr != nil {
+		log.Warnf("pprof 记录启动失败: %v", recErr)
 	}
 
 	if opts.Address != "" {
@@ -639,6 +632,7 @@ func diceServe(d *dice.Dice) {
 					}
 					if conn.ProtocolType == "official" {
 						dice.ServerOfficialQQ(d, conn)
+						return
 					}
 					if conn.ProtocolType == "satori" {
 						dice.ServeSatori(d, conn)
