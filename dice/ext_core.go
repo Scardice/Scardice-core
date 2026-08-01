@@ -17,6 +17,10 @@ func RegisterBuiltinExtCore(dice *Dice) {
 		GetDescText: GetExtensionDesc,
 		OnGroupLeave: func(ctx *MsgContext, event *events.GroupLeaveEvent) {
 			if event.UserID == ctx.EndPoint.UserID {
+				if event.OperatorID == ctx.EndPoint.UserID {
+					return
+				}
+
 				opUID := event.OperatorID
 				groupName := ctx.Dice.Parent.TryGetGroupName(event.GroupID)
 				userName := ctx.Dice.Parent.TryGetUserName(opUID)
