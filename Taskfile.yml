@@ -1,12 +1,12 @@
 # https://taskfile.dev
 
-version: '3'
+version: "3"
 
 tasks:
   install:
     cmds:
       - go mod download
-      - go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.61.0
+      - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.4.0
       - go install golang.org/x/tools/cmd/goimports@latest
       - go install github.com/pointlander/peg@v1.0.1
       - go generate ./...
@@ -17,16 +17,16 @@ tasks:
       - git config core.hooksPath .githooks
 
   run:
-    deps: ['test-and-lint']
+    deps: ["test-and-lint"]
     cmds:
       - go run .
   build:
-    deps: ['test-and-lint']
+    deps: ["test-and-lint"]
     cmds:
       - task: build-only
-  
+
   test-and-lint:
-    deps: ['test', 'lint']
+    deps: ["test", "lint"]
   test:
     cmds:
       - go test ./...
