@@ -35,15 +35,18 @@ const (
 	BanInviter
 	// AddScore 增加怒气值
 	AddScore
+	// SendEncodedDetails 向当前会话发送 Base64 编码的命中词和上下文片段
+	SendEncodedDetails
 )
 
 var CensorHandlerText = map[CensorHandler]string{
-	SendWarning: "SendWarning",
-	SendNotice:  "SendNotice",
-	BanUser:     "BanUser",
-	BanGroup:    "BanGroup",
-	BanInviter:  "BanInviter",
-	AddScore:    "AddScore",
+	SendWarning:        "SendWarning",
+	SendNotice:         "SendNotice",
+	BanUser:            "BanUser",
+	BanGroup:           "BanGroup",
+	BanInviter:         "BanInviter",
+	AddScore:           "AddScore",
+	SendEncodedDetails: "SendEncodedDetails",
 }
 
 type CensorHandler int
@@ -122,6 +125,7 @@ func (cm *CensorManager) Check(ctx *MsgContext, msg *Message, checkContent strin
 	for word := range res.SensitiveWords {
 		words = append(words, word)
 	}
+	sort.Strings(words)
 	return &MsgCheckResult{
 		UserID:            msg.Sender.UserID,
 		Level:             res.HighestLevel,
@@ -192,6 +196,9 @@ func (d *Dice) CensorMsg(mctx *MsgContext, msg *Message, checkContent string, se
 				tmplText := fmt.Sprintf("核心:拦截_警告内容_%s级", censor.LevelText[level])
 				ReplyToSenderNoCheck(mctx, msg, DiceFormatTmpl(mctx, tmplText))
 			}
+			if handler&(1<<SendEncodedDetails) != 0 {
+				ReplyToSenderNoCheck(mctx, msg, formatCensorHitDetails(levelText, checkResult.CurSensitiveWords, checkContent))
+			}
 			if handler&(1<<SendNotice) != 0 {
 				// 向通知列表/邮件发送通知
 				var text string
@@ -212,7 +219,7 @@ func (d *Dice) CensorMsg(mctx *MsgContext, msg *Message, checkContent string, se
 						levelText,
 					)
 				}
-				mctx.Notice(text)
+				mctx.Notice(text, NoticeTypeCensor)
 			}
 			if handler&(1<<BanUser) != 0 {
 				// 拉黑用户
