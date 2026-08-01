@@ -802,6 +802,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 		},
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			val := cmdArgs.GetArgN(1)
+			valLower := strings.ToLower(val)
 
 			handleOverlong := func(ctx *MsgContext, msg *Message, card string) CmdExecuteResult {
 				ReplyToSender(ctx, msg, fmt.Sprintf(
@@ -811,7 +812,14 @@ func RegisterBuiltinExtLog(self *Dice) {
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
 
-			switch strings.ToLower(val) {
+			if valLower != "help" && ctx.Group != nil {
+				if detail, ok := checkBotGroupRole(ctx, ctx.Group.GroupID); ok && detail != "owner" && detail != "admin" {
+					ReplyToSender(ctx, msg, "设置群名片需要骰子具有群管理员权限，请在群内将骰子设为管理员后重试 .sn 指令。")
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
+			}
+
+			switch valLower {
 			case "help":
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 			case "coc", "coc7":
