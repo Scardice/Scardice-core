@@ -35,6 +35,32 @@ func TestConvertSealMsgToMessageChain_AtElement(t *testing.T) {
 	}
 }
 
+func TestConvertSealMsgToMessageChainPreservesAtBetweenTextElements(t *testing.T) {
+	// Given
+	input := []message.IMessageElement{
+		&message.TextElement{Content: "before"},
+		&message.AtElement{Target: "2930699167"},
+		&message.TextElement{Content: "after"},
+	}
+	p := &PlatformAdapterOnebot{}
+
+	// When
+	chain, cq := p.convertSealMsgToMessageChain(input)
+
+	// Then
+	if cq != "before[CQ:at,qq=2930699167]after" {
+		t.Fatalf("message CQ output = %q, want ordered text-at-text", cq)
+	}
+	if len(chain) != 3 {
+		t.Fatalf("message chain length = %d, want 3", len(chain))
+	}
+	for index, wantType := range []string{"text", "at", "text"} {
+		if chain[index].Type != wantType {
+			t.Fatalf("message chain element %d type = %q, want %q", index, chain[index].Type, wantType)
+		}
+	}
+}
+
 func TestFormatAndParseOnebotMessageID(t *testing.T) {
 	formatted := formatOnebotMessageID(123456789)
 	if formatted != "123456789" {
