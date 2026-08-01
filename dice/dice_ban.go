@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -65,15 +66,18 @@ type BanListInfo struct {
 	ThresholdBan                           int64                              `json:"thresholdBan"                           yaml:"thresholdBan"`                           // 错误阈值
 	AutoBanMinutes                         int64                              `json:"autoBanMinutes"                         yaml:"autoBanMinutes"`                         // 自动禁止时长
 
-	ScoreReducePerMinute int64 `json:"scoreReducePerMinute" yaml:"scoreReducePerMinute"` // 每分钟下降
-	ScoreGroupMuted      int64 `json:"scoreGroupMuted"      yaml:"scoreGroupMuted"`      // 群组禁言
-	ScoreGroupKicked     int64 `json:"scoreGroupKicked"     yaml:"scoreGroupKicked"`     // 群组踢出
-	ScoreTooManyCommand  int64 `json:"scoreTooManyCommand"  yaml:"scoreTooManyCommand"`  // 刷指令
+	ScoreReducePerMinute     int64 `json:"scoreReducePerMinute" yaml:"scoreReducePerMinute"`         // 每分钟下降
+	ScoreGroupMuted          int64 `json:"scoreGroupMuted"      yaml:"scoreGroupMuted"`              // 群组禁言
+	ScoreGroupKicked         int64 `json:"scoreGroupKicked"     yaml:"scoreGroupKicked"`             // 群组踢出
+	ScoreTooManyCommand      int64 `json:"scoreTooManyCommand"  yaml:"scoreTooManyCommand"`          // 刷指令
+	BanNotifyIntervalMinutes int64 `json:"banNotifyIntervalMinutes" yaml:"banNotifyIntervalMinutes"` // 同一用户同一群内通报间隔；0 为默认 20 分钟，负数表示每次通报
 
 	JointScorePercentOfGroup   float64 `json:"jointScorePercentOfGroup"   yaml:"jointScorePercentOfGroup"`   // 群组连带责任
 	JointScorePercentOfInviter float64 `json:"jointScorePercentOfInviter" yaml:"jointScorePercentOfInviter"` // 邀请人连带责任
 
-	cronID cron.EntryID
+	banNoticeMu sync.Mutex                             `json:"-" yaml:"-"`
+	banNoticeAt map[blacklistedUserNoticeKey]time.Time `json:"-" yaml:"-"`
+	cronID      cron.EntryID                           `json:"-" yaml:"-"`
 }
 
 func (i *BanListInfo) Init() {
@@ -89,10 +93,12 @@ func (i *BanListInfo) Init() {
 	i.ScoreGroupMuted = 100
 	i.ScoreGroupKicked = 200
 	i.ScoreTooManyCommand = 100
+	i.BanNotifyIntervalMinutes = int64(defaultBlacklistedUserNoticeCooldown / time.Minute)
 
 	i.JointScorePercentOfGroup = 0.5
 	i.JointScorePercentOfInviter = 0.3
 	i.Map = new(SyncMap[string, *BanListInfoItem])
+	i.banNoticeAt = map[blacklistedUserNoticeKey]time.Time{}
 }
 
 func (i *BanListInfo) Loads() {
@@ -102,6 +108,7 @@ func (i *BanListInfo) AfterLoads() {
 	// 加载完成了
 	d := i.Parent
 	i.cronID, _ = d.Parent.Cron.AddFunc("@every 1m", func() {
+		i.cleanupBlacklistedUserNotices(time.Now())
 		if d.DBOperator == nil {
 			return
 		}
@@ -270,7 +277,7 @@ func (i *BanListInfo) NoticeCheck(uid string, place string, oldRank BanRankType,
 
 	if ctx != nil {
 		// 做出通知
-		ctx.Notice(txt)
+		ctx.Notice(txt, NoticeTypeBan)
 
 		if ctx.Player == nil {
 			ctx.Player = &GroupPlayerInfo{} // 为了能存 $t 变量，God bless this design
