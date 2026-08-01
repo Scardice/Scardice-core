@@ -133,63 +133,72 @@ func parseQQGroupRole(role string) (string, bool) {
 	return normalized, true
 }
 
-func shouldDismissRequireOwnerConfirm(ctx *MsgContext, groupID string) (bool, bool, string) {
+func checkBotGroupRole(ctx *MsgContext, groupID string) (string, bool) {
 	if ctx == nil || ctx.EndPoint == nil || ctx.EndPoint.Adapter == nil {
-		return false, false, "context invalid"
+		return "context invalid", false
 	}
+	const bypassCache = true
 
 	switch pa := ctx.EndPoint.Adapter.(type) {
 	case *PlatformAdapterOnebot:
 		if pa.sendEmitter == nil {
-			return false, false, "onebot emitter unavailable"
+			return "onebot emitter unavailable", false
 		}
 		botID, ok := getOnebotBotQQID(ctx)
 		if !ok {
-			return false, false, "cannot resolve bot qq id"
+			return "cannot resolve bot qq id", false
 		}
-		memberInfo, err := pa.sendEmitter.GetGroupMemberInfo(pa.ctx, ExtractQQEmitterGroupID(groupID), botID, false)
+		memberInfo, err := pa.sendEmitter.GetGroupMemberInfo(pa.ctx, ExtractQQEmitterGroupID(groupID), botID, bypassCache)
 		if err != nil || memberInfo == nil {
 			if err != nil {
-				return false, false, fmt.Sprintf("get_group_member_info failed: %v", err)
+				return fmt.Sprintf("get_group_member_info failed: %v", err), false
 			}
-			return false, false, errGetGroupMemberInfoNil
+			return errGetGroupMemberInfoNil, false
 		}
 		role, ok := parseQQGroupRole(memberInfo.Role)
 		if !ok {
-			return false, false, errGetGroupMemberInfoEmptyRole
+			return errGetGroupMemberInfoEmptyRole, false
 		}
-		return role == "owner", true, role
+		return role, true
 	case *PlatformAdapterGocq:
 		botIDRaw := strings.TrimSpace(UserIDExtract(ctx.EndPoint.UserID))
 		groupIDRaw := strings.TrimSpace(UserIDExtract(groupID))
 		if botIDRaw == "" || groupIDRaw == "" {
-			return false, false, "cannot resolve bot/group id"
+			return "cannot resolve bot/group id", false
 		}
-		memberInfo := pa.GetGroupMemberInfo(groupIDRaw, botIDRaw)
+		memberInfo := pa.getGroupMemberInfo(groupIDRaw, botIDRaw, bypassCache)
 		if memberInfo == nil {
-			return false, false, errGetGroupMemberInfoNil
+			return errGetGroupMemberInfoNil, false
 		}
 		role, ok := parseQQGroupRole(memberInfo.Role)
 		if !ok {
-			return false, false, errGetGroupMemberInfoEmptyRole
+			return errGetGroupMemberInfoEmptyRole, false
 		}
-		return role == "owner", true, role
+		return role, true
 	case *PlatformAdapterMilky:
-		memberInfo, err := pa.GetGroupMemberInfo(groupID, ctx.EndPoint.UserID)
+		memberInfo, err := pa.getGroupMemberInfo(groupID, ctx.EndPoint.UserID, bypassCache)
 		if err != nil {
-			return false, false, fmt.Sprintf("get_group_member_info failed: %v", err)
+			return fmt.Sprintf("get_group_member_info failed: %v", err), false
 		}
 		if memberInfo == nil {
-			return false, false, errGetGroupMemberInfoNil
+			return errGetGroupMemberInfoNil, false
 		}
 		role, ok := parseQQGroupRole(memberInfo.Role)
 		if !ok {
-			return false, false, errGetGroupMemberInfoEmptyRole
+			return errGetGroupMemberInfoEmptyRole, false
 		}
-		return role == "owner", true, role
+		return role, true
 	default:
-		return false, false, "adapter does not support group role check"
+		return "adapter does not support group role check", false
 	}
+}
+
+func shouldDismissRequireOwnerConfirm(ctx *MsgContext, groupID string) (bool, bool, string) {
+	detail, ok := checkBotGroupRole(ctx, groupID)
+	if !ok {
+		return false, false, detail
+	}
+	return detail == "owner", true, detail
 }
 
 func normalizeDismissTargetGroupID(ctx *MsgContext, rawGroupID string) string {
@@ -228,7 +237,7 @@ func (d *Dice) executeDismissOperation(ctx *MsgContext, msg *Message, targetGrou
 	txt := fmt.Sprintf("指令退群: 于群组<%s>(%s)中告别，操作者:<%s>(%s)",
 		groupName, targetGroupID, userName, msg.Sender.UserID)
 	d.Logger.Info(txt)
-	ctx.Notice(txt)
+	ctx.Notice(txt, NoticeTypeGroup)
 
 	time.Sleep(3 * time.Second)
 	if targetGroup != nil {
@@ -550,7 +559,7 @@ func (d *Dice) registerCoreCommands() {
 			}
 
 			if id != "" {
-				text, err := d.Parent.Help.searchEngine.GetItemByID(id)
+				text, err := d.Parent.Help.GetItemByNumericIDString(id)
 				if err == nil {
 					// Copied from 支援换行符 By Fripine #963
 					text.Content = ctx.TranslateSplit(text.Content)
@@ -618,7 +627,6 @@ func (d *Dice) registerCoreCommands() {
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
 
-			hasSecond := len(search.Hits) >= 2
 			// 准备接下来读取这里面的Fields
 			bestRaw := search.Hits[0].Fields
 			best := &docengine.HelpTextItem{
@@ -646,22 +654,7 @@ func (d *Dice) registerCoreCommands() {
 				}
 			}
 
-			var showBest bool
-			if hasSecond {
-				offset := d.Parent.Help.GetShowBestOffset()
-				val := search.Hits[1].Score - search.Hits[0].Score
-				if val < 0 {
-					val = -val
-				}
-				if val > float64(offset) {
-					showBest = true
-				}
-				if best.Title == text {
-					showBest = true
-				}
-			} else {
-				showBest = true
-			}
+			showBest := shouldShowBestHelpResult(search.Hits, text != "" && best.Title == text, d.Parent.Help.GetShowBestRelativeGap())
 
 			var bestResult string
 			if showBest {

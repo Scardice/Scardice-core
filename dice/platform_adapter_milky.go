@@ -333,7 +333,7 @@ func (pa *PlatformAdapterMilky) Serve() int {
 			ctx.Dice.Config.BanList.AddScoreByGroupMuted(opUID, groupId, ctx)
 			txt := fmt.Sprintf("被禁言: 在群组<%s>(%s)中被禁言，时长%d秒，操作者:<%s>(%d)", groupName, groupId, m.Duration, userName, m.OperatorID)
 			log.Info(txt)
-			ctx.Notice(txt)
+			ctx.Notice(txt, NoticeTypeGroup)
 		}
 	})
 	session.AddHandler(func(session2 *milky.Session, m *milky.FriendRequest) {
@@ -354,7 +354,7 @@ func (pa *PlatformAdapterMilky) Serve() int {
 		userName := dm.TryGetUserName(uid)
 		txt := fmt.Sprintf("收到QQ加群邀请: 群组<%s>(%s) 邀请人:<%s>(%d)", groupName, groupId, userName, m.InitiatorID)
 		log.Info(txt)
-		ctx.Notice(txt)
+		ctx.Notice(txt, NoticeTypeInvite)
 
 		// 邀请人在黑名单上
 		banInfo, ok := ctx.Dice.Config.BanList.GetByID(uid)
@@ -508,7 +508,7 @@ func (pa *PlatformAdapterMilky) handelFriendRequest(ctx *MsgContext, event *milk
 
 	txt := fmt.Sprintf("收到QQ好友邀请: 邀请人:%s, 验证信息: %s, 是否自动同意: %t%s", strconv.FormatInt(event.InitiatorID, 10), comment, willAccept, extra)
 	log.Info(txt)
-	ctx.Notice(txt)
+	ctx.Notice(txt, NoticeTypeInvite)
 
 	// 忽略邀请
 	if pa.IgnoreFriendRequest {
@@ -867,6 +867,10 @@ func (pa *PlatformAdapterMilky) QuitGroup(ctx *MsgContext, groupID string) {
 }
 
 func (pa *PlatformAdapterMilky) GetGroupMemberInfo(groupID string, userID string) (*milky.GroupMemberInfo, error) {
+	return pa.getGroupMemberInfo(groupID, userID, false)
+}
+
+func (pa *PlatformAdapterMilky) getGroupMemberInfo(groupID string, userID string, noCache bool) (*milky.GroupMemberInfo, error) {
 	if pa == nil || pa.IntentSession == nil {
 		return nil, errors.New("milky session unavailable")
 	}
@@ -886,7 +890,7 @@ func (pa *PlatformAdapterMilky) GetGroupMemberInfo(groupID string, userID string
 		return nil, fmt.Errorf("invalid milky user id %q: %w", userID, err)
 	}
 
-	return pa.IntentSession.GetGroupMemberInfo(groupIDInt, userIDInt, false)
+	return pa.IntentSession.GetGroupMemberInfo(groupIDInt, userIDInt, noCache)
 }
 
 func (pa *PlatformAdapterMilky) SetGroupCardName(ctx *MsgContext, cardName string) {
