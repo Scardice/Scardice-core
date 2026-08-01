@@ -1,16 +1,19 @@
 package dice
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	ds "github.com/sealdice/dicescript"
 	"github.com/tidwall/gjson"
 
+	"Scardice-core/dice/service"
 	"Scardice-core/message"
 )
 
@@ -39,22 +42,36 @@ func (i *AtInfo) CopyCtx(ctx *MsgContext) (*MsgContext, bool) {
 	mctx := ctx.ShallowCopy() // 复制一个ctx，用于其他用途
 	mctx.vm = nil
 	if ctx.Group != nil {
-		p := ctx.Group.PlayerGet(ctx.Dice.DBOperator, i.UserID)
+		playerUserID := i.UserID
+		if pa, ok := ctx.EndPoint.Adapter.(*PlatformAdapterOfficialQQ); ok && ctx.Dice.DBOperator != nil {
+			key := service.OfficialQQIdentityMappingKey{
+				MigrationID: service.OfficialQQExplicitIdentityMigrationID,
+				Account:     strconv.FormatUint(pa.AppID, 10),
+				Store:       service.OfficialQQIdentityStoreDelegate,
+				Keyspace:    service.OfficialQQIdentityKeyspacePlayerUserID,
+				OldID:       i.UserID,
+			}
+			journal := service.NewOfficialQQIdentityJournal(ctx.Dice.DBOperator, time.Now)
+			if resolvedID, applied, err := journal.ResolveApplied(context.Background(), key); err == nil && applied {
+				playerUserID = resolvedID
+			}
+		}
+		p := ctx.Group.PlayerGet(ctx.Dice.DBOperator, playerUserID)
 		if p != nil {
 			mctx.Player = p
 		} else {
 			// TODO: 主动获取用户名
 			mctx.Player = &GroupPlayerInfo{
 				Name:          "",
-				UserID:        i.UserID,
+				UserID:        playerUserID,
 				ValueMapTemp:  &ds.ValueMap{},
 				UpdatedAtTime: 0,
 			}
 			// 特殊处理 official qq
-			if strings.HasPrefix(i.UserID, "OpenQQCH:") {
-				mctx.Player.Name = "<@!" + strings.TrimPrefix(i.UserID, "OpenQQCH:") + ">"
-			} else if strings.HasPrefix(i.UserID, "OpenQQ-Member-T:") {
-				mctx.Player.Name = i.UserID[len(i.UserID)-4:]
+			if strings.HasPrefix(playerUserID, "OpenQQCH:") {
+				mctx.Player.Name = "<@!" + strings.TrimPrefix(playerUserID, "OpenQQCH:") + ">"
+			} else if strings.HasPrefix(playerUserID, "OpenQQ-Member-T:") {
+				mctx.Player.Name = playerUserID[len(playerUserID)-4:]
 			}
 		}
 		return mctx, p != nil
