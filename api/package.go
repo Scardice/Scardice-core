@@ -108,7 +108,7 @@ func packageInstallFromUpload(c echo.Context) error {
 	}
 	defer req.Body.Close()
 
-	if err := myDice.PackageManager.InstallFromStream(req.Body); err != nil {
+	if err := myDice.PackageManager.InstallFromStreamContext(req.Context(), req.Body); err != nil {
 		return Error(&c, err.Error(), Response{})
 	}
 
@@ -137,7 +137,7 @@ func packagePreviewFromUpload(c echo.Context) error {
 	}
 	defer req.Body.Close()
 
-	preview, err := myDice.PackageManager.PreviewFromStream(req.Body)
+	preview, err := myDice.PackageManager.PreviewFromStreamContext(req.Context(), req.Body)
 	if err != nil {
 		return Error(&c, err.Error(), Response{})
 	}
@@ -169,7 +169,7 @@ func packageInstallFromURL(c echo.Context) error {
 		return Error(&c, err.Error(), Response{})
 	}
 
-	err = myDice.PackageManager.InstallFromURL(params.URL, nil)
+	err = myDice.PackageManager.InstallFromURLContext(c.Request().Context(), params.URL, nil)
 	if err != nil {
 		return Error(&c, err.Error(), Response{})
 	}

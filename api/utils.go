@@ -15,6 +15,8 @@ import (
 	"Scardice-core/dice"
 )
 
+const filePreviewContentSecurityPolicy = "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'"
+
 type Response map[string]interface{}
 
 func Success(c *echo.Context, res Response) error {
