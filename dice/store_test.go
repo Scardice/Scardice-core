@@ -134,13 +134,16 @@ func TestDecodeJSONStrictAllowsStoreFormatVersionMetadata(t *testing.T) {
 		t.Fatalf("FormatVersion = %q, want 2.0", recommend.FormatVersion)
 	}
 
-	packageRaw := `{"id":"alice/demo","formatVersion":"1.0.0","version":"1.2.3","name":"Demo","contents":["scripts"],"download":{"url":"https://example.com/demo.sealpack"}}`
+	packageRaw := `{"id":"alice/demo","formatVersion":"1.0.0","version":"1.2.3","name":"Demo","contents":["scripts"],"download":{"url":"https://example.com/demo.sealpack","zipUrl":"https://example.com/demo.zip"}}`
 	var pkg StorePackage
 	if err := decodeJSONStrict([]byte(packageRaw), &pkg); err != nil {
 		t.Fatalf("decode package with formatVersion returned error: %v", err)
 	}
 	if pkg.FormatVersion != "1.0.0" {
 		t.Fatalf("FormatVersion = %q, want 1.0.0", pkg.FormatVersion)
+	}
+	if pkg.Download.ZipURL != "https://example.com/demo.zip" {
+		t.Fatalf("Download.ZipURL = %q", pkg.Download.ZipURL)
 	}
 }
 
@@ -413,6 +416,109 @@ func TestStoreManagerFindPackageMatchesByIDAndVersionAfterRefreshInstalled(t *te
 	}
 }
 
+func TestStoreManagerResolvePackageBuildsCanonicalDownloadURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dice/api/store/info":
+			_, _ = w.Write([]byte(`{"formatVersion":"2.0","name":"Official Store","protocolVersions":["2.0"]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	withOfficialStoreBackendBaseURL(t, server.URL)
+
+	manager := NewStoreManager(&Dice{})
+	pkg, err := manager.ResolvePackage("alice/demo", "1.2.3")
+	if err != nil {
+		t.Fatalf("ResolvePackage() error = %v", err)
+	}
+	if got, want := pkg.Download.URL, server.URL+"/dice/api/store/packages/alice/demo/1.2.3/demo@1.2.3.sealpack"; got != want {
+		t.Fatalf("Download.URL = %q, want %q", got, want)
+	}
+	if pkg.ID != "alice/demo" || pkg.Version != "1.2.3" {
+		t.Fatalf("resolved package = %#v", pkg)
+	}
+}
+
+func TestStoreManagerResolvePackageRejectsInvalidCoordinate(t *testing.T) {
+	manager := &StoreManager{lock: new(sync.RWMutex), packageCache: make(map[string]*StorePackage)}
+	if _, err := manager.ResolvePackage("invalid", "1.2.3"); err == nil {
+		t.Fatal("ResolvePackage() accepted invalid package ID")
+	}
+	if _, err := manager.ResolvePackage("alice/demo", "latest"); err == nil {
+		t.Fatal("ResolvePackage() accepted invalid version")
+	}
+}
+
+func TestStoreQueryPageResolvesSealrepoRelativeDownloadURLs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dice/api/store/info":
+			_, _ = w.Write([]byte(`{"formatVersion":"2.0","name":"Official Store","protocolVersions":["2.0"],"announcement":"ready","sign":""}`))
+		case "/dice/api/store/page":
+			_, _ = w.Write([]byte(`{"formatVersion":"2.0","result":true,"data":{"formatVersion":"2.0","data":[{"id":"alice/demo","formatVersion":"1.0.0","version":"1.2.3","name":"Demo","authors":["Alice"],"description":"demo","license":"MIT","homepage":"","repository":"","keywords":[],"contents":["scripts"],"seal":{},"dependencies":{},"storeAssets":{"category":"rules","screenshots":[]},"download":{"url":"/dice/api/store/packages/alice/demo/1.2.3/demo@1.2.3.sealpack","zipUrl":"/dice/api/store/packages/alice/demo/1.2.3/demo@1.2.3.zip","hash":{},"size":123,"releaseTime":1,"updateTime":2,"downloadCount":3}}],"pageNum":1,"pageSize":20,"next":false},"err":""}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	withOfficialStoreBackendBaseURL(t, server.URL)
+
+	manager := NewStoreManager(&Dice{})
+	page, err := manager.StoreQueryPage(StoreQueryPageParams{PageNum: 1, PageSize: 20})
+	if err != nil {
+		t.Fatalf("StoreQueryPage() error = %v", err)
+	}
+	pkg := page.Data[0]
+	if got, want := pkg.Download.URL, server.URL+"/dice/api/store/packages/alice/demo/1.2.3/demo@1.2.3.sealpack"; got != want {
+		t.Fatalf("Download.URL = %q, want %q", got, want)
+	}
+	if got, want := pkg.Download.ZipURL, server.URL+"/dice/api/store/packages/alice/demo/1.2.3/demo@1.2.3.zip"; got != want {
+		t.Fatalf("Download.ZipURL = %q, want %q", got, want)
+	}
+	if pkg.Download.Size != 123 {
+		t.Fatalf("Download.Size = %d, want 123", pkg.Download.Size)
+	}
+}
+
+func TestStoreQueryPackageManifestReadsExactPackageName(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dice/api/store/info":
+			_, _ = w.Write([]byte(`{"formatVersion":"2.0","name":"Official Store","protocolVersions":["2.0"]}`))
+		case "/dice/api/store/file/alice/demo/1.2.3":
+			if got := r.URL.Query().Get("path"); got != "info.toml" {
+				http.Error(w, "unexpected path: "+got, http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte(`
+format_version = "1.0.0"
+
+[package]
+id = "alice/demo"
+name = "Readable Extension Name"
+version = "1.2.3"
+`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	withOfficialStoreBackendBaseURL(t, server.URL)
+	manager := NewStoreManager(&Dice{})
+	manifest, err := manager.StoreQueryPackageManifest(context.Background(), "alice/demo", "1.2.3")
+	if err != nil {
+		t.Fatalf("StoreQueryPackageManifest() error = %v", err)
+	}
+	if got, want := manifest.Package.Name, "Readable Extension Name"; got != want {
+		t.Fatalf("Package.Name = %q, want %q", got, want)
+	}
+}
+
 func TestStoreQueryRecommendCachesBackendInfo(t *testing.T) {
 	var infoRequests int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -608,9 +714,60 @@ func TestSanitizeStorePackageRejectsMismatchedFullID(t *testing.T) {
 		Download: StorePackageDownload{
 			URL: "https://example.com/demo-1.2.3.sealpack",
 		},
-	}, nil)
+	}, "")
 	if err == nil {
 		t.Fatal("expected error for mismatched fullId")
+	}
+}
+
+func TestSanitizeStorePackageRejectsInvalidDownloadURLs(t *testing.T) {
+	tests := []struct {
+		name           string
+		download       StorePackageDownload
+		backendBaseURL string
+		wantErr        string
+	}{
+		{
+			name: "relative download URL without backend base URL",
+			download: StorePackageDownload{
+				URL: "/dice/api/store/packages/alice/demo/1.2.3/demo@1.2.3.sealpack",
+			},
+			wantErr: "download.url 无效: download.url 必须是绝对 URL",
+		},
+		{
+			name: "download URL without sealpack extension",
+			download: StorePackageDownload{
+				URL: "https://example.com/demo-1.2.3",
+			},
+			wantErr: "download.url 必须指向 .sealpack 文件",
+		},
+		{
+			name: "invalid zip URL",
+			download: StorePackageDownload{
+				URL:    "https://example.com/demo-1.2.3.sealpack",
+				ZipURL: "%zz",
+			},
+			backendBaseURL: "https://example.com",
+			wantErr:        "download.zipUrl 无效",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := sanitizeStorePackage(&StorePackage{
+				ID:       "alice/demo",
+				Version:  "1.2.3",
+				Name:     "Demo",
+				Contents: []string{"scripts"},
+				Download: tt.download,
+			}, tt.backendBaseURL)
+			if err == nil {
+				t.Fatal("sanitizeStorePackage() accepted invalid download URL")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("sanitizeStorePackage() error = %q, want error containing %q", err, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -623,7 +780,7 @@ func TestSanitizeStorePackageMarksCanonicalFields(t *testing.T) {
 		Download: StorePackageDownload{
 			URL: "https://example.com/demo-1.2.3.sealpack",
 		},
-	}, nil)
+	}, "")
 	if err != nil {
 		t.Fatalf("sanitizeStorePackage returned error: %v", err)
 	}
