@@ -20,9 +20,9 @@ import (
 	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 
-	"sealdice-core/dice/service"
-	"sealdice-core/dice/storylog"
-	"sealdice-core/model"
+	"Scardice-core/dice/service"
+	"Scardice-core/dice/storylog"
+	"Scardice-core/model"
 )
 
 var ErrGroupCardOverlong = errors.New("群名片长度超过限制")
@@ -272,7 +272,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 					VarSetValueStr(ctx, "$t日志链接", fn)
 					tmpl := DiceFormatTmpl(ctx, "日志:记录_上传_成功")
 					if unofficial {
-						tmpl += "\n[注意：该链接非海豹官方染色器]"
+						tmpl += "\n[注意：该链接非余烬官方染色器]"
 					}
 					if notice != "" {
 						tmpl += "\n" + notice
