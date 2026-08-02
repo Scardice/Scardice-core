@@ -47,6 +47,9 @@ func V160LogIDZeroCleanMigrate(dboperator operator.DatabaseOperator, logf func(s
 		return logResult.Error
 	}
 
+	// log_id=0 清理后，回填剩余日志 (size 仅需更新 id>0 的有效日志行)
+	// 注意：若 size 列不存在（V150 历史升级失误的遗留情况），这里跳过重算，
+	// 由后续的 V160LogSizeRepairMigration 负责“建列 + 全量重算”，避免在此处因列缺失而报错。
 	var recountRows int64
 	if migrator.HasColumn(&model.LogInfo{}, "size") {
 		recountResult := db.Model(&model.LogInfo{}).Where("id > 0").Update("size", gorm.Expr(
