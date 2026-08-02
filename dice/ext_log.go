@@ -20,9 +20,9 @@ import (
 	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 
-	"Scardice-core/dice/service"
-	"Scardice-core/dice/storylog"
-	"Scardice-core/model"
+	"sealdice-core/dice/service"
+	"sealdice-core/dice/storylog"
+	"sealdice-core/model"
 )
 
 var ErrGroupCardOverlong = errors.New("群名片长度超过限制")
@@ -272,7 +272,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 					VarSetValueStr(ctx, "$t日志链接", fn)
 					tmpl := DiceFormatTmpl(ctx, "日志:记录_上传_成功")
 					if unofficial {
-						tmpl += "\n[注意：该链接非余烬官方染色器]"
+						tmpl += "\n[注意：该链接非海豹官方染色器]"
 					}
 					if notice != "" {
 						tmpl += "\n" + notice
@@ -812,10 +812,12 @@ func RegisterBuiltinExtLog(self *Dice) {
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
 
+			// sn 指令(除 help 外)需要骰子具有群管理员权限。提前检测 bot 在群中的角色,
+			// 若明确无管理权限则给出明确提示, 由于协议端问题，目前只能做提示。不支持角色检查的适配器
+			// 返回 ok=false, 此时保持原有行为(直接尝试设置)不做阻断。
 			if valLower != "help" && ctx.Group != nil {
 				if detail, ok := checkBotGroupRole(ctx, ctx.Group.GroupID); ok && detail != "owner" && detail != "admin" {
-					ReplyToSender(ctx, msg, "设置群名片需要骰子具有群管理员权限，请在群内将骰子设为管理员后重试 .sn 指令。")
-					return CmdExecuteResult{Matched: true, Solved: true}
+					ReplyToSender(ctx, msg, "【警告】骰子当前可能不具备管理员权限，请检查，若确认具备管理员权限可无视此误报。")
 				}
 			}
 
