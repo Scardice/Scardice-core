@@ -28,7 +28,7 @@ func TestSNRolePolicyAllowsManagersAndFallsBackWhenRoleUnavailable(t *testing.T)
 	}{
 		{name: "owner passes", role: "owner", wantAllowed: true},
 		{name: "admin passes", role: "admin", wantAllowed: true},
-		{name: "member fails", role: "member", wantAllowed: false},
+		{name: "member warns but continues", role: "member", wantAllowed: true},
 		{name: "unsupported adapter keeps fallback", unsupported: true, wantAllowed: true},
 		{name: "role read failure keeps fallback", apiError: "role lookup failed", wantAllowed: true},
 	}
