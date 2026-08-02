@@ -97,7 +97,7 @@ func UpdateRequestListen(dm *dice.DiceManager) {
 		time.Sleep(2 * time.Second)
 		log.Info("进行升级准备工作")
 
-		dm.UpdateSealdiceByFile(updatePackFn)
+		dm.UpdateScardiceByFile(updatePackFn)
 		// 旧版本行为: 将新升级包里的主程序复制到当前目录，命名为 auto_update.exe 或 auto_update
 		// 然后重启主程序
 	} else {

@@ -2515,7 +2515,7 @@ func sortJsScripts(jsScripts []*JsScriptInfo) ([]*JsScriptInfo, map[string][]str
 	inDegrees := make(map[string]int)
 	vertices := make(map[string]*boxedScript)
 	// 为了方便计算，添加一个 builtin 节点作为所有外置插件的依赖，其依赖所有内置插件
-	dummy := "sealdice:_builtin"
+	dummy := "scardice:_builtin"
 	vertices[dummy] = &boxedScript{
 		key: dummy,
 	}

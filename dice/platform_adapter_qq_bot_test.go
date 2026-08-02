@@ -120,9 +120,9 @@ func TestOneBotConversionPopulatesRobotMentionInfo(t *testing.T) {
 		]
 	}`)
 
-	msg, err := arrayByte2SealdiceMessage(zap.NewNop().Sugar(), raw)
+	msg, err := arrayByte2ScardiceMessage(zap.NewNop().Sugar(), raw)
 	if err != nil {
-		t.Fatalf("arrayByte2SealdiceMessage returned error: %v", err)
+		t.Fatalf("arrayByte2ScardiceMessage returned error: %v", err)
 	}
 	if len(msg.Segment) != 2 {
 		t.Fatalf("converted segment count = %d, want 2", len(msg.Segment))
