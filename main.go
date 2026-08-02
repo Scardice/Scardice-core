@@ -439,7 +439,7 @@ func main() {
 	}
 
 	// 先临时放这里，后面再整理一下升级模块
-	diceManager.UpdateSealdiceByFile = func(packName string) bool {
+	diceManager.UpdateScardiceByFile = func(packName string) bool {
 		err = errors.New("update disabled") // 更新功能已禁用，原调用: CheckUpdater(diceManager)
 		if err != nil {
 			log.Error("升级程序检查失败: ", err.Error())

@@ -202,7 +202,7 @@ func ValidateManifest(manifest *Manifest) []string {
 	return issues
 }
 
-// CheckSealVersion checks whether the current SealDice version satisfies the package requirement.
+// CheckSealVersion checks whether the current core version satisfies the package requirement.
 func CheckSealVersion(manifest *Manifest, currentVersion string) error {
 	if manifest.Package.Seal.MinVersion == "" && manifest.Package.Seal.MaxVersion == "" {
 		return nil
@@ -210,20 +210,20 @@ func CheckSealVersion(manifest *Manifest, currentVersion string) error {
 
 	current, err := semver.NewVersion(currentVersion)
 	if err != nil {
-		return fmt.Errorf("当前海豹版本号无效: %w", err)
+		return fmt.Errorf("当前余烬版本号无效: %w", err)
 	}
 
 	if manifest.Package.Seal.MinVersion != "" {
 		minVer, err := semver.NewVersion(manifest.Package.Seal.MinVersion)
 		if err == nil && current.LessThan(minVer) {
-			return errors.New("此扩展包需要海豹版本 >= " + manifest.Package.Seal.MinVersion)
+			return errors.New("此扩展包需要余烬版本 >= " + manifest.Package.Seal.MinVersion)
 		}
 	}
 
 	if manifest.Package.Seal.MaxVersion != "" {
 		maxVer, err := semver.NewVersion(manifest.Package.Seal.MaxVersion)
 		if err == nil && current.GreaterThan(maxVer) {
-			return errors.New("此扩展包需要海豹版本 <= " + manifest.Package.Seal.MaxVersion)
+			return errors.New("此扩展包需要余烬版本 <= " + manifest.Package.Seal.MaxVersion)
 		}
 	}
 

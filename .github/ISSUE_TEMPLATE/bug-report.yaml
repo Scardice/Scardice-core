@@ -1,7 +1,7 @@
 name: Bug Report
-description: 反馈一个海豹的bug
+description: 反馈一个余烬的bug
 title: "[Bug]: "
-labels: ['bug']
+labels: ["bug"]
 body:
   - type: checkboxes
     id: checks
@@ -60,15 +60,15 @@ body:
     attributes:
       label: 截图
       description: |
-        如果有，添加屏幕截图以帮助解释你的问题，包括但不限于海豹日志截图、聊天窗口截图等等
+        如果有，添加屏幕截图以帮助解释你的问题，包括但不限于余烬日志截图、聊天窗口截图等等
     validations:
       required: false
   - type: textarea
     id: core-version
     attributes:
-      label: 海豹核心版本
+      label: 余烬核心版本
       description: |
-        出现问题的海豹的版本，例如：1.0.2 v20221212
+        出现问题的余烬的版本，例如：1.0.2 v20221212
     validations:
       required: true
   - type: textarea
@@ -76,7 +76,7 @@ body:
     attributes:
       label: 操作系统
       description: |
-        出现问题的海豹运行在什么操作系统上
+        出现问题的余烬运行在什么操作系统上
     validations:
       required: true
   - type: textarea
@@ -84,7 +84,7 @@ body:
     attributes:
       label: 帐号类型
       description: |
-        错误发生时海豹搭载了哪些帐号（并请说明是在什么账号上出了问题）例如：QQ Discord KOOK 等
+        错误发生时余烬搭载了哪些帐号（并请说明是在什么账号上出了问题）例如：QQ Discord KOOK 等
     validations:
       required: true
   - type: textarea
@@ -92,7 +92,7 @@ body:
     attributes:
       label: 使用协议
       description: |
-        错误发生时海豹所使用的帐号协议（如果有） 例如：Android, ipad
+        错误发生时余烬所使用的帐号协议（如果有） 例如：Android, ipad
     validations:
       required: false
   - type: textarea

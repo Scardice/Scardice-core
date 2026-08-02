@@ -1,7 +1,7 @@
 {
   "go.useLanguageServer": true,
   "gopls": {
-    "formatting.local": "sealdice-core",
+    "formatting.local": "Scardice-core",
   },
   "go.lintTool": "golangci-lint-v2",
   "go.lintFlags": [

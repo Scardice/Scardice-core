@@ -87,7 +87,7 @@ func (p *PlatformAdapterOnebot) serveOnebotEvent(ep *evsocket.EventPayload) {
 
 func (p *PlatformAdapterOnebot) onOnebotMessageEvent(ep *evsocket.EventPayload) {
 	// 收到普通消息的时候：执行ExecuteNew函数
-	msg, err := arrayByte2SealdiceMessage(p.logger, ep.Data)
+	msg, err := arrayByte2ScardiceMessage(p.logger, ep.Data)
 	if err != nil {
 		p.logger.Errorf("收到消息但无法进行处理，原因为 %s", err)
 		return
@@ -202,7 +202,7 @@ func (p *PlatformAdapterOnebot) handleGroupPokeAction(req gjson.Result, _ *evsoc
 func (p *PlatformAdapterOnebot) handleGroupRecallAction(_ gjson.Result, ep *evsocket.EventPayload) error {
 	session := p.EndPoint.Session
 	ctx := &MsgContext{EndPoint: p.EndPoint, Session: session, Dice: session.Parent}
-	msg, err := arrayByte2SealdiceMessage(p.logger, ep.Data)
+	msg, err := arrayByte2ScardiceMessage(p.logger, ep.Data)
 	if err != nil {
 		return err
 	}
@@ -237,7 +237,7 @@ func (p *PlatformAdapterOnebot) handleGroupBanAction(req gjson.Result, _ *evsock
 func (p *PlatformAdapterOnebot) handleAddFriendAction(req gjson.Result, _ *evsocket.EventPayload) error {
 	session := p.EndPoint.Session
 	ctx := &MsgContext{EndPoint: p.EndPoint, Session: session, Dice: session.Parent}
-	msg, err := arrayByte2SealdiceMessage(p.logger, []byte(req.String()))
+	msg, err := arrayByte2ScardiceMessage(p.logger, []byte(req.String()))
 	if err != nil {
 		return err
 	}
@@ -272,7 +272,7 @@ func (p *PlatformAdapterOnebot) handleJoinGroupAction(req gjson.Result, _ *evsoc
 	// 2. 如果发现进群的不是自己，对他进行节流的迎新
 	session := p.EndPoint.Session
 	ctx := &MsgContext{EndPoint: p.EndPoint, Session: session, Dice: session.Parent}
-	msg, err := arrayByte2SealdiceMessage(p.logger, []byte(req.String()))
+	msg, err := arrayByte2ScardiceMessage(p.logger, []byte(req.String()))
 	if err != nil {
 		return err
 	}
@@ -726,7 +726,7 @@ func (msgQQ *MessageOBQQ) toStdMessage() *Message {
 	return msg
 }
 
-func arrayByte2SealdiceMessage(log *zap.SugaredLogger, raw []byte) (*Message, error) {
+func arrayByte2ScardiceMessage(log *zap.SugaredLogger, raw []byte) (*Message, error) {
 	// 不合法的信息体
 	if !gjson.ValidBytes(raw) {
 		log.Warn("无法解析 onebot11 字段:", raw)

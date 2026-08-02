@@ -2434,11 +2434,11 @@ func (d *Dice) warnIfNoPlatformEndpoint(missingPlatformConfigInServe bool) {
 	}
 
 	if missingPlatformConfigInServe {
-		d.Logger.Warn("serve.yaml 中未找到平台账号配置，海豹将不会连接聊天平台。请检查 serve.yaml，或在界面中重新添加账号。")
+		d.Logger.Warn("serve.yaml 中未找到平台账号配置，余烬将不会连接聊天平台。请检查 serve.yaml，或在界面中重新添加账号。")
 		return
 	}
 
-	d.Logger.Warn("当前没有可用的平台账号，海豹将不会连接聊天平台，也无法收发消息。请检查账号设置或 serve.yaml 配置。")
+	d.Logger.Warn("当前没有可用的平台账号，余烬将不会连接聊天平台，也无法收发消息。请检查账号设置或 serve.yaml 配置。")
 }
 func (d *Dice) loadAdvanced() {
 	d.Logger.Info("开始读取 advanced.yaml")

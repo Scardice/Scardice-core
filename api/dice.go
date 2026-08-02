@@ -20,7 +20,7 @@ func DiceNewVersionUpload(c echo.Context) error {
 		})
 	}
 
-	if dm.UpdateSealdiceByFile == nil {
+	if dm.UpdateScardiceByFile == nil {
 		return Error(&c, "骰子没有正确初始化，无法使用此功能", Response{})
 	}
 
@@ -64,7 +64,7 @@ func DiceNewVersionUpload(c echo.Context) error {
 
 	_ = Success(&c, Response{"result": true})
 
-	if !dm.UpdateSealdiceByFile(fn) {
+	if !dm.UpdateScardiceByFile(fn) {
 		myDice.Logger.Error("更新骰子失败")
 	}
 
