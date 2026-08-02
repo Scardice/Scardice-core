@@ -856,7 +856,35 @@ if [[ $DEV_MODE -eq 1 ]]; then
 fi
 
 echo "[Build] 更新 submodule 到远端最新提交"
-git submodule update --init --recursive --remote
+if ! git submodule update --init --recursive --remote; then
+	echo "[Build] 警告：远端 submodule 更新失败（网络/SSL），回退到本地已有提交"
+	git submodule update --init --recursive || true
+
+	for local_ui in "$ROOT_DIR/../Scardice-ui" "$HOME/Scardice-ui"; do
+		if [[ -f "$local_ui/package.json" && -d "$local_ui/.git" ]]; then
+			local_ui_head="$(git -C "$local_ui" rev-parse HEAD 2>/dev/null || true)"
+			if [[ -n "$local_ui_head" ]]; then
+				echo "[Build] 使用本地 UI 仓库同步 Scardice-ui：$local_ui @ ${local_ui_head:0:7}"
+				mkdir -p "$UI_SUBMODULE_DIR"
+				if [[ ! -e "$UI_SUBMODULE_DIR/.git" ]]; then
+					git clone --no-checkout "$local_ui" "$UI_SUBMODULE_DIR" || true
+				fi
+				if git -C "$UI_SUBMODULE_DIR" fetch --no-tags "$local_ui" "+HEAD:refs/remotes/local-ui/HEAD" 2>/dev/null ||
+					git -C "$UI_SUBMODULE_DIR" fetch --no-tags "$local_ui" HEAD 2>/dev/null; then
+					git -C "$UI_SUBMODULE_DIR" checkout --force "$local_ui_head" || true
+				else
+					rsync -a --delete \
+						--exclude '.git' \
+						--exclude 'node_modules' \
+						--exclude 'dist' \
+						"$local_ui"/ "$UI_SUBMODULE_DIR"/ || true
+					git -C "$UI_SUBMODULE_DIR" checkout --force "$local_ui_head" 2>/dev/null || true
+				fi
+			fi
+			break
+		fi
+	done
+fi
 
 if [[ ! -f "$UI_SUBMODULE_DIR/package.json" ]]; then
 	echo "[Build] 错误：未找到 UI 子模块目录或 package.json：$UI_SUBMODULE_DIR"
