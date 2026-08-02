@@ -34,7 +34,8 @@ func (kwa *Kwarg) String() string {
 
 // [CQ:at,qq=22]
 type AtInfo struct {
-	UserID string `jsbind:"userId" json:"userId"`
+	UserID  string `jsbind:"userId"  json:"userId"`
+	IsRobot bool   `jsbind:"isRobot" json:"isRobot"`
 	// UID    string `json:"uid"`
 }
 
@@ -519,8 +520,9 @@ func parseAtInfo(cmdArgs *CmdArgs, msg *Message, botUserID string) {
 	var atInfo []*AtInfo
 	for _, elem := range msg.Segment {
 		if e, ok := elem.(*message.AtElement); ok {
+			userID := msg.Platform + ":" + e.Target
 			// 检查是否@了机器人
-			if msg.Platform+":"+e.Target == botUserID {
+			if userID == botUserID {
 				cmdArgs.AmIBeMentioned = true
 				cmdArgs.SomeoneBeMentionedButNotMe = false
 				if len(atInfo) == 0 {
@@ -532,7 +534,8 @@ func parseAtInfo(cmdArgs *CmdArgs, msg *Message, botUserID string) {
 
 			// 记录@信息
 			atInfo = append(atInfo, &AtInfo{
-				UserID: msg.Platform + ":" + e.Target,
+				UserID:  userID,
+				IsRobot: e.IsRobot,
 			})
 		}
 	}
@@ -760,6 +763,7 @@ func AtParse(cmd string, prefix string) (string, []*AtInfo) {
 		if len(i) == 2 {
 			at := new(AtInfo)
 			at.UserID = prefix + ":" + i[1]
+			at.IsRobot = prefix == "QQ" && isQQBotUserID(at.UserID)
 			ret = append(ret, at)
 		}
 	}
