@@ -1,7 +1,10 @@
 package api
 
 import (
+	"context"
+	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/labstack/echo/v4"
@@ -187,33 +190,229 @@ func storeDownload(c echo.Context) error {
 		return Error(&c, err.Error(), Response{})
 	}
 
-	target, ok := myDice.StoreManager.FindPackage(params.ID, params.Version)
-	if !ok {
-		return Error(&c, "未找到已缓存的商店包，请先刷新商店列表后重试", Response{})
+	target, err := myDice.StoreManager.ResolvePackage(params.ID, params.Version)
+	if err != nil {
+		return Error(&c, err.Error(), Response{})
 	}
 
+	if _, err := installStorePackage(c.Request().Context(), target, true); err != nil {
+		return Error(&c, err.Error(), Response{})
+	}
+
+	return Success(&c, Response{})
+}
+
+const maxStoreInstallListPackages = 200
+
+type storeInstallListPackage struct {
+	ID      string `json:"id"`
+	Version string `json:"version"`
+}
+
+type storeInstallListItemResult struct {
+	ID      string `json:"id"`
+	Version string `json:"version"`
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+}
+
+type storePackageInfoItemResult struct {
+	ID      string `json:"id"`
+	Version string `json:"version"`
+	Name    string `json:"name,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+type pendingStoreInstall struct {
+	target      *dice.StorePackage
+	resultIndex int
+	lastError   error
+}
+
+func sameStorePackageVersion(left, right string) bool {
+	leftVersion, leftErr := semver.NewVersion(strings.TrimSpace(left))
+	rightVersion, rightErr := semver.NewVersion(strings.TrimSpace(right))
+	return leftErr == nil && rightErr == nil && leftVersion.Equal(rightVersion)
+}
+
+func storePackageInfoList(c echo.Context) error {
+	if !doAuth(c) {
+		return c.JSON(http.StatusForbidden, "auth")
+	}
+	var params struct {
+		Packages []storeInstallListPackage `json:"packages"`
+	}
+	if err := c.Bind(&params); err != nil {
+		return Error(&c, err.Error(), Response{})
+	}
+	if len(params.Packages) == 0 {
+		return Error(&c, "清单中没有可查询的扩展包", Response{})
+	}
+	if len(params.Packages) > maxStoreInstallListPackages {
+		return Error(&c, "清单中的扩展包不能超过 200 个", Response{})
+	}
+
+	results := make([]storePackageInfoItemResult, 0, len(params.Packages))
+	seen := make(map[string]struct{}, len(params.Packages))
+	for _, item := range params.Packages {
+		result := storePackageInfoItemResult{ID: item.ID, Version: item.Version}
+		coordinate := dice.BuildStorePackageFullID(strings.TrimSpace(item.ID), strings.TrimSpace(item.Version))
+		if _, exists := seen[coordinate]; exists {
+			return Error(&c, "清单中存在重复的扩展包版本: "+coordinate, Response{})
+		}
+		seen[coordinate] = struct{}{}
+
+		if installed, exists := myDice.PackageManager.Get(strings.TrimSpace(item.ID)); exists && installed != nil && installed.Manifest != nil &&
+			sameStorePackageVersion(installed.Manifest.Package.Version, item.Version) {
+			result.Name = installed.Manifest.Package.Name
+			results = append(results, result)
+			continue
+		}
+
+		manifest, err := myDice.StoreManager.StoreQueryPackageManifest(c.Request().Context(), item.ID, item.Version)
+		if err != nil {
+			result.Error = err.Error()
+		} else {
+			result.ID = manifest.Package.ID
+			result.Version = manifest.Package.Version
+			result.Name = manifest.Package.Name
+		}
+		results = append(results, result)
+	}
+
+	return Success(&c, Response{"data": results})
+}
+
+func storeInstallList(c echo.Context) error {
+	if !doAuth(c) {
+		return c.JSON(http.StatusForbidden, "auth")
+	}
+	var params struct {
+		Packages []storeInstallListPackage `json:"packages"`
+	}
+	if err := c.Bind(&params); err != nil {
+		return Error(&c, err.Error(), Response{})
+	}
+	if len(params.Packages) == 0 {
+		return Error(&c, "清单中没有可安装的扩展包", Response{})
+	}
+	if len(params.Packages) > maxStoreInstallListPackages {
+		return Error(&c, "清单中的扩展包不能超过 200 个", Response{})
+	}
+
+	results := make([]storeInstallListItemResult, len(params.Packages))
+	pending := make([]pendingStoreInstall, 0, len(params.Packages))
+	seen := make(map[string]struct{}, len(params.Packages))
+	for index, item := range params.Packages {
+		target, err := myDice.StoreManager.ResolvePackage(item.ID, item.Version)
+		if err != nil {
+			return Error(&c, err.Error(), Response{})
+		}
+		if _, exists := seen[target.ID]; exists {
+			return Error(&c, "清单中存在重复的扩展包: "+target.ID, Response{})
+		}
+		seen[target.ID] = struct{}{}
+		results[index] = storeInstallListItemResult{ID: target.ID, Version: target.Version}
+		pending = append(pending, pendingStoreInstall{target: target, resultIndex: index})
+	}
+
+	installStorePackageBatch(results, pending, func(target *dice.StorePackage, reinstallExactVersion bool) (string, error) {
+		return installStorePackage(c.Request().Context(), target, reinstallExactVersion)
+	})
+
+	installedCount := 0
+	skippedCount := 0
+	failedCount := 0
+	for _, item := range results {
+		switch item.Status {
+		case "installed":
+			installedCount++
+		case "skipped":
+			skippedCount++
+		case "failed":
+			failedCount++
+		}
+	}
+
+	return Success(&c, Response{
+		"data": Response{
+			"items":     results,
+			"installed": installedCount,
+			"skipped":   skippedCount,
+			"failed":    failedCount,
+		},
+	})
+}
+
+func installStorePackageBatch(
+	results []storeInstallListItemResult,
+	pending []pendingStoreInstall,
+	installer func(*dice.StorePackage, bool) (string, error),
+) {
+	for len(pending) > 0 {
+		nextPending := make([]pendingStoreInstall, 0, len(pending))
+		installedThisPass := 0
+		for _, item := range pending {
+			status, err := installer(item.target, false)
+			if err == nil {
+				results[item.resultIndex].Status = status
+				if status == "skipped" {
+					results[item.resultIndex].Message = "已安装目标版本"
+				} else {
+					installedThisPass++
+				}
+				continue
+			}
+
+			var dependencyErr *dice.DependencyError
+			if errors.As(err, &dependencyErr) {
+				item.lastError = err
+				nextPending = append(nextPending, item)
+				continue
+			}
+			results[item.resultIndex].Status = "failed"
+			results[item.resultIndex].Message = err.Error()
+		}
+
+		if len(nextPending) == 0 {
+			break
+		}
+		if installedThisPass == 0 {
+			for _, item := range nextPending {
+				results[item.resultIndex].Status = "failed"
+				results[item.resultIndex].Message = item.lastError.Error()
+			}
+			break
+		}
+		pending = nextPending
+	}
+}
+
+func installStorePackage(ctx context.Context, target *dice.StorePackage, reinstallExactVersion bool) (string, error) {
 	if installedPkg, exists := myDice.PackageManager.Get(target.ID); exists && installedPkg != nil && installedPkg.Manifest != nil {
 		existingVer, existingErr := semver.NewVersion(installedPkg.Manifest.Package.Version)
 		targetVer, targetErr := semver.NewVersion(target.Version)
 		if existingErr == nil && targetErr == nil && targetVer.LessThan(existingVer) {
-			return Error(&c, "当前已安装更高版本的扩展包", Response{})
+			return "", errors.New("当前已安装更高版本的扩展包")
 		}
 		if existingErr == nil && targetErr == nil && targetVer.Equal(existingVer) {
+			if !reinstallExactVersion {
+				return "skipped", nil
+			}
 			if err := myDice.PackageManager.Uninstall(target.ID, dicesealpack.UninstallModeKeepData); err != nil {
-				return Error(&c, err.Error(), Response{})
+				return "", err
 			}
 		}
 	}
 
-	if err := myDice.PackageManager.InstallFromURLWithOptionsContext(c.Request().Context(), target.Download.URL, dice.PackageDownloadOptions{
+	if err := myDice.PackageManager.InstallFromURLWithOptionsContext(ctx, target.Download.URL, dice.PackageDownloadOptions{
 		Hashes:       target.Download.Hash,
 		ExpectedSize: target.Download.Size,
 	}); err != nil {
-		return Error(&c, err.Error(), Response{})
+		return "", err
 	}
-
 	myDice.StoreManager.RefreshInstalled([]*dice.StorePackage{target})
-	return Success(&c, Response{})
+	return "installed", nil
 }
 
 func storePreviewDownload(c echo.Context) error {

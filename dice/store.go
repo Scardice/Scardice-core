@@ -26,7 +26,7 @@ var (
 	// OfficialStorePublicKey 官方商店公钥。
 	OfficialStorePublicKey = ``
 
-	officialStoreBackendBaseURL = "https://repo-test.sealdice.com"
+	officialStoreBackendBaseURL = "https://repo.sealdice.com"
 )
 
 type StoreBackendType string
@@ -68,6 +68,7 @@ type StoreBackend struct {
 
 type StorePackageDownload struct {
 	URL           string            `json:"url"`
+	ZipURL        string            `json:"zipUrl"`
 	Hash          map[string]string `json:"hash"`
 	Size          uint64            `json:"size"`
 	ReleaseTime   uint64            `json:"releaseTime"`
@@ -143,13 +144,6 @@ type StorePackageFileEntry struct {
 	Size uint64 `json:"size"`
 }
 
-type storePackageFilesResponse struct {
-	FormatVersion string                  `json:"formatVersion"`
-	Result        bool                    `json:"result"`
-	Data          []StorePackageFileEntry `json:"data"`
-	Err           string                  `json:"err"`
-}
-
 type StoreManager struct {
 	lock              *sync.RWMutex
 	parent            *Dice
@@ -162,6 +156,13 @@ type StoreManager struct {
 	InstalledPlugins map[string]bool `json:"-" yaml:"-"`
 	InstalledDecks   map[string]bool `json:"-" yaml:"-"`
 	InstalledReplies map[string]bool `json:"-" yaml:"-"`
+}
+
+type storePackageFilesResponse struct {
+	FormatVersion string                  `json:"formatVersion"`
+	Result        bool                    `json:"result"`
+	Data          []StorePackageFileEntry `json:"data"`
+	Err           string                  `json:"err"`
 }
 
 type storeBackendTarget struct {
@@ -354,7 +355,6 @@ func validateStoreBackendURL(rawURL string) (string, error) {
 	return rawURL, nil
 }
 
-
 func buildStoreBackendResourceURL(baseURL string, segments ...string) (string, error) {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if _, err := validateStoreBackendURL(baseURL); err != nil {
@@ -372,6 +372,34 @@ func buildStoreBackendResourceURL(baseURL string, segments ...string) (string, e
 		builder.WriteString(url.PathEscape(segment))
 	}
 	return builder.String(), nil
+}
+
+func resolveStoreDownloadURL(rawURL string, backendBaseURL string) (string, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return "", errors.New("下载地址不能为空")
+	}
+
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	if parsedURL.IsAbs() && parsedURL.Host != "" {
+		return parsedURL.String(), nil
+	}
+	if backendBaseURL == "" {
+		return "", errors.New("download.url 必须是绝对 URL")
+	}
+
+	baseURL, err := url.Parse(strings.TrimRight(strings.TrimSpace(backendBaseURL), "/") + "/")
+	if err != nil || baseURL.Scheme == "" || baseURL.Host == "" {
+		return "", errors.New("商店后端地址无效，无法解析相对下载地址")
+	}
+	resolved := baseURL.ResolveReference(parsedURL)
+	if resolved.Scheme == "" || resolved.Host == "" {
+		return "", errors.New("download.url 必须是绝对 URL")
+	}
+	return resolved.String(), nil
 }
 
 func normalizeStorePackageLocator(namespace, packageName, version string) (string, string, string, error) {
@@ -603,11 +631,7 @@ func (m *StoreManager) StoreQueryRecommendContext(ctx context.Context) ([]*Store
 	if !respResult.Result {
 		return nil, fmt.Errorf("%s", respResult.Err)
 	}
-	backendURL, err := url.Parse(backend.Url)
-	if err != nil {
-		return nil, err
-	}
-	return sanitizeStorePackages(respResult.Data, backendURL)
+	return sanitizeStorePackages(respResult.Data, backend.Url)
 }
 
 func (m *StoreManager) StoreBackendList() []*StoreBackend {
@@ -831,11 +855,7 @@ func (m *StoreManager) StoreQueryPageContext(ctx context.Context, params StoreQu
 		return nil, errors.New("扩展商店返回了空分页数据")
 	}
 
-	backendURL, err := url.Parse(backend.Url)
-	if err != nil {
-		return nil, err
-	}
-	sanitized, err := sanitizeStorePackages(respResult.Data.Data, backendURL)
+	sanitized, err := sanitizeStorePackages(respResult.Data.Data, backend.Url)
 	if err != nil {
 		return nil, err
 	}
@@ -872,7 +892,6 @@ func (m *StoreManager) StoreQueryPackageFilesContext(ctx context.Context, namesp
 	if err != nil {
 		return nil, err
 	}
-
 	respResult, err := fetchStoreJSONContext[storePackageFilesResponse](ctx, requestURL)
 	if err != nil {
 		m.refreshStoreBackend()
@@ -1038,6 +1057,60 @@ func (m *StoreManager) FindPackage(id, version string) (*StorePackage, bool) {
 	return pkg, true
 }
 
+// ResolvePackage resolves an exact package coordinate against the active store.
+// List queries populate richer metadata in the cache, while list installation can
+// still use the protocol's canonical artifact URL for versions outside those pages.
+func (m *StoreManager) ResolvePackage(id, version string) (*StorePackage, error) {
+	id = strings.TrimSpace(id)
+	version = strings.TrimSpace(version)
+	if cached, ok := m.FindPackage(id, version); ok {
+		return cached, nil
+	}
+
+	namespace, packageName, err := sealpack.ParsePackageID(id)
+	if err != nil {
+		return nil, err
+	}
+	if _, versionErr := semver.NewVersion(version); versionErr != nil {
+		return nil, fmt.Errorf("无效的版本号: %w", versionErr)
+	}
+
+	backend, err := m.currentBackend()
+	if err != nil {
+		return nil, err
+	}
+	if !backend.Health {
+		m.refreshStoreBackend()
+		backend, err = m.currentBackend()
+		if err != nil {
+			return nil, err
+		}
+		if !backend.Health {
+			return nil, fmt.Errorf("当前扩展商店后端不可用: %s", backend.Url)
+		}
+	}
+
+	downloadURL, err := buildStoreBackendResourceURL(
+		backend.Url,
+		"packages",
+		namespace,
+		packageName,
+		version,
+		sealpack.PackageSourceFileName(id, version),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &StorePackage{
+		ID:      id,
+		Version: version,
+		FullID:  BuildStorePackageFullID(id, version),
+		Download: StorePackageDownload{
+			URL: downloadURL,
+		},
+	}, nil
+}
+
 type StoreUploadFormOption struct {
 	Key  string `json:"key"`
 	Desc string `json:"desc"`
@@ -1079,14 +1152,14 @@ func (m *StoreManager) StoreQueryUploadInfo() (StoreUploadInfo, error) {
 	return *result, nil
 }
 
-func sanitizeStorePackages(packages []*StorePackage, backendURL *url.URL) ([]*StorePackage, error) {
+func sanitizeStorePackages(packages []*StorePackage, backendBaseURL string) ([]*StorePackage, error) {
 	if len(packages) == 0 {
 		return []*StorePackage{}, nil
 	}
 
 	result := make([]*StorePackage, 0, len(packages))
 	for _, pkg := range packages {
-		sanitized, err := sanitizeStorePackage(pkg, backendURL)
+		sanitized, err := sanitizeStorePackage(pkg, backendBaseURL)
 		if err != nil {
 			return nil, err
 		}
@@ -1095,7 +1168,7 @@ func sanitizeStorePackages(packages []*StorePackage, backendURL *url.URL) ([]*St
 	return result, nil
 }
 
-func sanitizeStorePackage(pkg *StorePackage, backendURL *url.URL) (*StorePackage, error) {
+func sanitizeStorePackage(pkg *StorePackage, backendBaseURL string) (*StorePackage, error) {
 	if pkg == nil {
 		return nil, errors.New("商店返回了空包数据")
 	}
@@ -1107,6 +1180,7 @@ func sanitizeStorePackage(pkg *StorePackage, backendURL *url.URL) (*StorePackage
 	copyPkg.FullID = strings.TrimSpace(copyPkg.FullID)
 	copyPkg.Name = strings.TrimSpace(copyPkg.Name)
 	copyPkg.Download.URL = strings.TrimSpace(copyPkg.Download.URL)
+	copyPkg.Download.ZipURL = strings.TrimSpace(copyPkg.Download.ZipURL)
 
 	if err := sealpack.ValidatePackageID(copyPkg.ID); err != nil {
 		return nil, fmt.Errorf("无效的包 ID: %w", err)
@@ -1123,20 +1197,25 @@ func sanitizeStorePackage(pkg *StorePackage, backendURL *url.URL) (*StorePackage
 	if copyPkg.Download.URL == "" {
 		return nil, errors.New("商店包缺少 download.url")
 	}
-	parsedDownloadURL, err := url.Parse(copyPkg.Download.URL)
-	if err == nil && parsedDownloadURL.Scheme == "" && parsedDownloadURL.Host == "" && backendURL != nil {
-		baseURL := *backendURL
-		if !strings.HasSuffix(baseURL.Path, "/") {
-			baseURL.Path += "/"
-		}
-		parsedDownloadURL = baseURL.ResolveReference(parsedDownloadURL)
-		copyPkg.Download.URL = parsedDownloadURL.String()
+
+	resolvedDownloadURL, err := resolveStoreDownloadURL(copyPkg.Download.URL, backendBaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("download.url 无效: %w", err)
 	}
-	if err != nil || parsedDownloadURL.Scheme == "" || parsedDownloadURL.Host == "" {
-		return nil, errors.New("download.url 必须是绝对 URL")
+	copyPkg.Download.URL = resolvedDownloadURL
+	parsedDownloadURL, err := url.Parse(copyPkg.Download.URL)
+	if err != nil {
+		return nil, fmt.Errorf("download.url 无效: %w", err)
 	}
 	if !strings.HasSuffix(strings.ToLower(parsedDownloadURL.Path), sealpack.Extension) {
 		return nil, fmt.Errorf("download.url 必须指向 %s 文件", sealpack.Extension)
+	}
+	if copyPkg.Download.ZipURL != "" {
+		resolvedZipURL, zipErr := resolveStoreDownloadURL(copyPkg.Download.ZipURL, backendBaseURL)
+		if zipErr != nil {
+			return nil, fmt.Errorf("download.zipUrl 无效: %w", zipErr)
+		}
+		copyPkg.Download.ZipURL = resolvedZipURL
 	}
 
 	expectedFullID := BuildStorePackageFullID(copyPkg.ID, copyPkg.Version)
@@ -1175,7 +1254,6 @@ func sanitizeStorePackage(pkg *StorePackage, backendURL *url.URL) (*StorePackage
 
 	return &copyPkg, nil
 }
-
 
 func sanitizeStorePackageFileEntries(entries []StorePackageFileEntry) ([]StorePackageFileEntry, error) {
 	if len(entries) == 0 {

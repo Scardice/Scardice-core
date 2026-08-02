@@ -301,11 +301,6 @@ func validateStoreInfo(store StoreInfo) error {
 	return nil
 }
 
-// ValidateRelativePackagePath validates a package-internal relative path.
-func ValidateRelativePackagePath(path string) error {
-	return validateRelativePackagePath(path)
-}
-
 func validateRelativePackagePath(path string) error {
 	normalized := filepath.ToSlash(strings.TrimSpace(path))
 	if normalized == "" {
@@ -329,4 +324,9 @@ func validateRelativePackagePath(path string) error {
 		}
 	}
 	return nil
+}
+
+// ValidateRelativePackagePath validates a package-internal relative path.
+func ValidateRelativePackagePath(path string) error {
+	return validateRelativePackagePath(path)
 }

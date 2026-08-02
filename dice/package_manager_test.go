@@ -260,6 +260,9 @@ func TestPackageManagerRefreshAddsOrphanCacheAsCacheOnly(t *testing.T) {
 	if pkg.SourceStatus != sealpack.PackageSourceStatusCacheOnly {
 		t.Fatalf("SourceStatus = %q, want %q", pkg.SourceStatus, sealpack.PackageSourceStatusCacheOnly)
 	}
+	if got, want := strings.Join(pkg.Files, ","), "info.toml,reply/main.yaml"; got != want {
+		t.Fatalf("Files = %q, want %q", got, want)
+	}
 }
 
 func TestPackageManagerRefreshRemovesMissingSourceAndCache(t *testing.T) {
@@ -363,6 +366,9 @@ func TestPackageManagerInstallFromStream(t *testing.T) {
 	}
 	if len(staged) != 0 {
 		t.Fatalf("staging directory contains %d files after install", len(staged))
+	}
+	if got, want := strings.Join(pkg.Files, ","), "info.toml,scripts/main.js"; got != want {
+		t.Fatalf("Files = %q, want %q", got, want)
 	}
 }
 
