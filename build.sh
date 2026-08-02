@@ -39,9 +39,16 @@ PACKAGE_WORK_DIR="$BUILD_CACHE_DIR/package-work"
 RUNTIME_CACHE_DIR="$BUILD_CACHE_DIR/runtime"
 RUNTIME_CACHE_TTL_SECONDS="${RUNTIME_CACHE_TTL_SECONDS:-86400}"
 RUNTIME_AXEL_CONNECTIONS="${RUNTIME_AXEL_CONNECTIONS:-8}"
+DOWNLOAD_MAX_TIME="${DOWNLOAD_MAX_TIME:-600}"
+DOWNLOAD_CONNECT_TIMEOUT="${DOWNLOAD_CONNECT_TIMEOUT:-15}"
+DOWNLOAD_RETRIES="${DOWNLOAD_RETRIES:-3}"
+DOWNLOAD_SPEED_LIMIT="${DOWNLOAD_SPEED_LIMIT:-10240}"
+DOWNLOAD_SPEED_TIME="${DOWNLOAD_SPEED_TIME:-30}"
+DOWNLOAD_AXEL_TIMEOUT="${DOWNLOAD_AXEL_TIMEOUT:-300}"
 PACK_RUNTIME_ASSETS="${PACK_RUNTIME_ASSETS:-1}"
 RUNTIME_ASSETS_STRICT="${RUNTIME_ASSETS_STRICT:-1}"
 REDOWNLOAD_RUNTIME_ASSETS=0
+DOWNLOAD_PROXY=""
 ALL_GOOS=(linux windows darwin freebsd openbsd netbsd)
 ALL_GOARCH=(amd64 arm64 386 arm ppc64le riscv64 s390x)
 HOST_GOOS="$DEFAULT_TARGET_GOOS"
@@ -124,6 +131,106 @@ cache_entry_is_fresh() {
 	((now_ts - stamp_ts < ttl))
 }
 
+# 解析下载代理：BUILD_PROXY / 标准代理环境变量 > GNOME 系统代理（优先 SOCKS）
+resolve_download_proxy() {
+	local proxy=""
+	local var mode
+	local socks_host socks_port https_host https_port http_host http_port
+
+	for var in BUILD_PROXY ALL_PROXY HTTPS_PROXY HTTP_PROXY all_proxy https_proxy http_proxy; do
+		proxy="${!var:-}"
+		if [[ -n "$proxy" ]]; then
+			echo "$proxy"
+			return 0
+		fi
+	done
+
+	if command -v gsettings >/dev/null 2>&1; then
+		mode="$(gsettings get org.gnome.system.proxy mode 2>/dev/null | tr -d "'" || true)"
+		if [[ "$mode" == "manual" ]]; then
+			socks_host="$(gsettings get org.gnome.system.proxy.socks host 2>/dev/null | tr -d "'" || true)"
+			socks_port="$(gsettings get org.gnome.system.proxy.socks port 2>/dev/null | tr -d "'" || true)"
+			https_host="$(gsettings get org.gnome.system.proxy.https host 2>/dev/null | tr -d "'" || true)"
+			https_port="$(gsettings get org.gnome.system.proxy.https port 2>/dev/null | tr -d "'" || true)"
+			http_host="$(gsettings get org.gnome.system.proxy.http host 2>/dev/null | tr -d "'" || true)"
+			http_port="$(gsettings get org.gnome.system.proxy.http port 2>/dev/null | tr -d "'" || true)"
+
+			if [[ -n "$socks_host" && -n "$socks_port" && "$socks_port" != "0" ]]; then
+				# socks5h：DNS 也走代理，避免直连解析污染/慢解析
+				echo "socks5h://${socks_host}:${socks_port}"
+				return 0
+			fi
+			if [[ -n "$https_host" && -n "$https_port" && "$https_port" != "0" ]]; then
+				echo "http://${https_host}:${https_port}"
+				return 0
+			fi
+			if [[ -n "$http_host" && -n "$http_port" && "$http_port" != "0" ]]; then
+				echo "http://${http_host}:${http_port}"
+				return 0
+			fi
+		fi
+	fi
+
+	echo ""
+}
+
+download_via_curl() {
+	local url="$1"
+	local temp_path="$2"
+	local label="$3"
+	local attempt max_attempts force_ipv4
+	local curl_cmd curl_rc
+	local force_note
+
+	if ! command -v curl >/dev/null 2>&1; then
+		echo "[Build] 警告：未找到 curl，无法下载 ${label}。"
+		return 1
+	fi
+
+	max_attempts="${DOWNLOAD_RETRIES:-3}"
+	for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+		force_ipv4=0
+		force_note=""
+		if ((attempt > 1)); then
+			force_ipv4=1
+			force_note="，强制 IPv4"
+		fi
+
+		echo "[Build] 下载 ${label}（curl 第 ${attempt}/${max_attempts} 次${force_note}）：$url"
+		rm -f "$temp_path"
+
+		curl_cmd=(
+			curl -fsSL
+			--retry 1
+			--connect-timeout "${DOWNLOAD_CONNECT_TIMEOUT:-15}"
+			--max-time "${DOWNLOAD_MAX_TIME:-600}"
+			--speed-limit "${DOWNLOAD_SPEED_LIMIT:-10240}"
+			--speed-time "${DOWNLOAD_SPEED_TIME:-30}"
+			-o "$temp_path"
+		)
+		if [[ -n "${DOWNLOAD_PROXY:-}" ]]; then
+			curl_cmd+=(-x "$DOWNLOAD_PROXY")
+		fi
+		if [[ $force_ipv4 -eq 1 ]]; then
+			curl_cmd+=(--ipv4)
+		fi
+		curl_cmd+=("$url")
+
+		curl_rc=0
+		"${curl_cmd[@]}" || curl_rc=$?
+		if [[ $curl_rc -eq 0 && -s "$temp_path" ]]; then
+			return 0
+		fi
+
+		rm -f "$temp_path"
+		echo "[Build] 警告：curl 下载 ${label} 第 ${attempt} 次失败（exit=${curl_rc}）。"
+		if ((attempt < max_attempts)); then
+			sleep $((attempt * 2))
+		fi
+	done
+	return 1
+}
+
 download_file_with_cache() {
 	local url="$1"
 	local destination="$2"
@@ -131,6 +238,7 @@ download_file_with_cache() {
 	local stamp_file="${destination}.stamp"
 	local temp_path="${destination}.tmp.$$"
 	local download_success=1
+	local axel_rc
 
 	mkdir -p "$(dirname "$destination")"
 	if [[ "${REDOWNLOAD_RUNTIME_ASSETS:-0}" != "1" && -s "$destination" ]]; then
@@ -141,37 +249,45 @@ download_file_with_cache() {
 		echo "[Build] 已选择重新下载 ${label}，忽略缓存：$destination"
 	fi
 
-	rm -f "$temp_path"
-	if command -v axel >/dev/null 2>&1; then
-		echo "[Build] 下载 ${label}（axel 优先）：$url"
-		if axel -q -a -n "$RUNTIME_AXEL_CONNECTIONS" -o "$temp_path" "$url" >/dev/null 2>&1; then
+	rm -f "$temp_path" "${temp_path}.st"
+
+	# 有代理时跳过 axel：axel 不支持 SOCKS5，且会忽略代理环境变量
+	if [[ -z "${DOWNLOAD_PROXY:-}" ]] && command -v axel >/dev/null 2>&1; then
+		echo "[Build] 下载 ${label}（axel 优先，超时 ${DOWNLOAD_AXEL_TIMEOUT:-300}s）：$url"
+		axel_rc=0
+		if command -v timeout >/dev/null 2>&1; then
+			timeout "${DOWNLOAD_AXEL_TIMEOUT:-300}" axel -q -a -n "$RUNTIME_AXEL_CONNECTIONS" -o "$temp_path" "$url" >/dev/null 2>&1 || axel_rc=$?
+		else
+			axel -q -a -n "$RUNTIME_AXEL_CONNECTIONS" -o "$temp_path" "$url" >/dev/null 2>&1 || axel_rc=$?
+		fi
+		if [[ $axel_rc -eq 0 && -s "$temp_path" ]]; then
 			download_success=0
 		else
-			rm -f "$temp_path"
-			echo "[Build] 警告：axel 下载 ${label} 失败，回退到 curl。"
+			rm -f "$temp_path" "${temp_path}.st"
+			if [[ $axel_rc -eq 124 ]]; then
+				echo "[Build] 警告：axel 下载 ${label} 超时，回退到 curl。"
+			else
+				echo "[Build] 警告：axel 下载 ${label} 失败，回退到 curl。"
+			fi
 		fi
+	elif [[ -n "${DOWNLOAD_PROXY:-}" ]]; then
+		echo "[Build] 检测到代理，跳过 axel，使用 curl：$url"
 	fi
 
 	if [[ $download_success -ne 0 ]]; then
-		if command -v curl >/dev/null 2>&1; then
-			echo "[Build] 下载 ${label}（curl 回退）：$url"
-			if curl -fsSL --retry 2 --connect-timeout 15 "$url" -o "$temp_path"; then
-				download_success=0
-			else
-				rm -f "$temp_path"
-			fi
-		else
-			echo "[Build] 警告：未找到 curl，无法下载 ${label}。"
+		if download_via_curl "$url" "$temp_path" "$label"; then
+			download_success=0
 		fi
 	fi
 
 	if [[ $download_success -eq 0 ]]; then
 		mv -f "$temp_path" "$destination"
+		rm -f "${temp_path}.st"
 		mark_cache_entry_fresh "$stamp_file"
 		return 0
 	fi
 
-	rm -f "$temp_path"
+	rm -f "$temp_path" "${temp_path}.st"
 	if [[ -s "$destination" ]]; then
 		echo "[Build] 警告：刷新 ${label} 失败，继续使用旧缓存：$destination"
 		return 0
@@ -646,6 +762,13 @@ pick_binary_name() {
 		fi
 	fi
 }
+
+DOWNLOAD_PROXY="$(resolve_download_proxy)"
+if [[ -n "$DOWNLOAD_PROXY" ]]; then
+	echo "[Build] 下载代理：$DOWNLOAD_PROXY"
+else
+	echo "[Build] 未检测到下载代理，直连下载（axel 优先，失败回退 curl）"
+fi
 
 TARGETS=()
 if [[ $DEV_MODE -eq 1 ]]; then
