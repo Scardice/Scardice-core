@@ -2,6 +2,7 @@ package dice
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -41,6 +42,9 @@ type PlatformAdapterOfficialQQ struct {
 	memberEventSink     func(officialQQGroupMemberEvent)
 	qrClient            officialQQQRClient
 	qrEncoder           officialQQQREncoder
+	c2cSendQuota        *OfficialQQSendQuota
+	groupSendQuota      *OfficialQQSendQuota
+	sendQuotaOnce       sync.Once
 }
 
 func (pa *PlatformAdapterOfficialQQ) Serve() int {
@@ -70,8 +74,12 @@ func (pa *PlatformAdapterOfficialQQ) Serve() int {
 	}
 
 	pa.startOfficialQQEventQueue()
-	token := qqtoken.BotToken(pa.AppID, pa.Token)
-	pa.Api = qqbot.NewOpenAPI(token).WithTimeout(3 * time.Second)
+	appID := strconv.FormatUint(pa.AppID, 10)
+	tokenSource := qqtoken.NewQQBotTokenSource(&qqtoken.QQBotCredentials{
+		AppID:     appID,
+		AppSecret: pa.AppSecret,
+	})
+	pa.Api = qqbot.NewOpenAPI(appID, tokenSource).WithTimeout(3 * time.Second)
 	pa.SessionManager = qqbot.NewSessionManager()
 
 	ep.State = 2
@@ -125,7 +133,7 @@ func (pa *PlatformAdapterOfficialQQ) Serve() int {
 			}
 		}()
 		if startErr := runOfficialQQSession(currentCtx, func(runCtx context.Context) error {
-			return pa.SessionManager.Start(runCtx, ws, token, &intent)
+			return pa.SessionManager.Start(runCtx, ws, tokenSource, &intent)
 		}); startErr != nil {
 			log.Error("official qq session manager 启动失败: ", startErr)
 			if pa.Ctx == currentCtx {
@@ -251,6 +259,7 @@ func (pa *PlatformAdapterOfficialQQ) groupMsgToStdMsg(msgQQ *dto.WSGroupATMessag
 		// FIXME: 我要用户名啊kora
 		msg.Sender.Nickname = "用户" + msgQQ.Author.MemberOpenID[len(msgQQ.Author.MemberOpenID)-4:]
 		msg.Sender.UserID = formatDiceIDOfficialQQMemberOpenID(appID, msgQQ.GroupOpenID, msgQQ.Author.MemberOpenID)
+		msg.Sender.GroupRole = msgQQ.Author.MemberRole
 	}
 	return msg
 }
@@ -393,16 +402,22 @@ func (pa *PlatformAdapterOfficialQQ) sendQQGuildDirectMsgRaw( /* ctx */ _ *MsgCo
 
 func (pa *PlatformAdapterOfficialQQ) SendToGroup(ctx *MsgContext, uid string, text string, flag string) {
 	rowID, ok := VarGetValueStr(ctx, "$tMsgID")
-	if !ok {
-		// TODO：允许主动消息发送，并校验频率
-		pa.EndPoint.Session.Parent.Logger.Error("official qq 发送群聊消息失败：无法直接发送消息")
-		return
-	}
+	eventID, hasEventID := VarGetValueStr(ctx, "$tEventID")
 	groupId, idType := pa.mustExtractID(uid)
 	switch idType {
 	case OpenQQGroupOpenid:
-		pa.sendQQGroupMsgRaw(ctx, rowID, groupId, text)
+		if !ok {
+			rowID = ""
+		}
+		if !hasEventID {
+			eventID = ""
+		}
+		pa.sendQQGroupMsgRaw(ctx, rowID, eventID, groupId, text)
 	case OpenQQCHChannel:
+		if !ok {
+			pa.EndPoint.Session.Parent.Logger.Error("official qq 发送频道消息失败：无法直接发送消息")
+			return
+		}
 		pa.sendQQChannelMsgRaw(ctx, rowID, groupId, text)
 	default:
 		pa.EndPoint.Session.Parent.Logger.Errorf("official qq 发送群聊消息失败：错误的群聊id[%s]类型-%d", uid, idType)
@@ -410,7 +425,7 @@ func (pa *PlatformAdapterOfficialQQ) SendToGroup(ctx *MsgContext, uid string, te
 	}
 }
 
-func (pa *PlatformAdapterOfficialQQ) sendQQGroupMsgRaw( /* ctx */ _ *MsgContext, rowMsgID, groupID string, text string) {
+func (pa *PlatformAdapterOfficialQQ) sendQQGroupMsgRaw( /* ctx */ _ *MsgContext, rowMsgID, eventID, groupID string, text string) {
 	qctx := context.Background()
 	elems := message.ConvertStringMessage(text)
 	var (
@@ -419,7 +434,8 @@ func (pa *PlatformAdapterOfficialQQ) sendQQGroupMsgRaw( /* ctx */ _ *MsgContext,
 	)
 
 	toCreate = &dto.MessageToCreate{
-		MsgID: rowMsgID,
+		MsgID:   rowMsgID,
+		EventID: eventID,
 	}
 
 	for _, element := range elems {
@@ -448,10 +464,8 @@ func (pa *PlatformAdapterOfficialQQ) sendQQGroupMsgRaw( /* ctx */ _ *MsgContext,
 				continue
 			}
 
-			toCreate.MsgType = 7
-			toCreate.Media = &dto.Media{
-				FileInfo: media.FileInfo,
-			}
+			toCreate.MsgType = dto.RichMediaMsg
+			toCreate.Media = newOfficialQQMediaInfo(media.FileInfo)
 		case *message.RecordElement:
 			url := elem.File.URL
 			// 目前不支持本地发送，检查一下url
@@ -471,18 +485,30 @@ func (pa *PlatformAdapterOfficialQQ) sendQQGroupMsgRaw( /* ctx */ _ *MsgContext,
 				continue
 			}
 
-			toCreate.MsgType = 7
-			toCreate.Media = &dto.Media{
-				FileInfo: media.FileInfo,
-			}
+			toCreate.MsgType = dto.RichMediaMsg
+			toCreate.Media = newOfficialQQMediaInfo(media.FileInfo)
 		}
 	}
 
 	toCreate.Content = content
+	if toCreate.MsgID == "" && toCreate.EventID == "" {
+		if err := pa.waitGroupActiveQuota(qctx, groupID); err != nil {
+			pa.EndPoint.Session.Parent.Logger.Error("official qq 主动发送群聊消息失败：" + err.Error())
+			return
+		}
+	}
 
 	if _, err := pa.Api.PostGroupMessage(qctx, groupID, toCreate); err != nil {
 		pa.EndPoint.Session.Parent.Logger.Error("official qq 发送群聊消息失败：" + err.Error())
 	}
+}
+
+func newOfficialQQMediaInfo(fileInfo string) *dto.MediaInfo {
+	decoded, err := base64.StdEncoding.DecodeString(fileInfo)
+	if err != nil {
+		decoded = []byte(fileInfo)
+	}
+	return &dto.MediaInfo{FileInfo: decoded}
 }
 
 func (pa *PlatformAdapterOfficialQQ) sendQQChannelMsgRaw( /* ctx */ _ *MsgContext, rowMsgID, channelID string, text string) {

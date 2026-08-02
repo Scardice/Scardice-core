@@ -1,7 +1,6 @@
 package dice
 
 import (
-	"encoding/json"
 	"errors"
 	"strconv"
 
@@ -26,35 +25,29 @@ func (pa *PlatformAdapterOfficialQQ) registerOfficialQQHandlers() dto.Intent {
 	var channelAtMessage qqevent.ATMessageEventHandler = pa.ChannelAtMessageReceive
 	var guildDirectMessage qqevent.DirectMessageEventHandler = pa.GuildDirectMessageReceive
 	var groupAtMessage qqevent.GroupATMessageEventHandler = pa.GroupAtMessageReceive
-	var plain qqevent.PlainEventHandler = pa.officialQQPlainEventReceive
 	if pa.OnlyQQGuild {
-		return qqws.RegisterHandlers(channelAtMessage, guildDirectMessage, plain)
+		return qqws.RegisterHandlers(channelAtMessage, guildDirectMessage)
 	}
-	return qqws.RegisterHandlers(channelAtMessage, guildDirectMessage, groupAtMessage, plain) |
-		officialQQGroupMembersIntent
+	var groupMemberAdd qqevent.GroupMemberAddEventHandler = pa.officialQQGroupMemberAddReceive
+	var groupMemberRemove qqevent.GroupMemberRemoveEventHandler = pa.officialQQGroupMemberRemoveReceive
+	return qqws.RegisterHandlers(channelAtMessage, guildDirectMessage, groupAtMessage, groupMemberAdd, groupMemberRemove)
 }
 
-func (pa *PlatformAdapterOfficialQQ) officialQQPlainEventReceive(payload *dto.WSPayload, raw []byte) error {
-	if payload == nil || (payload.Type != "GROUP_MEMBER_ADD" && payload.Type != "GROUP_MEMBER_REMOVE") {
-		return nil
-	}
-	var envelope struct {
-		Data struct {
-			GroupOpenID    string `json:"group_openid"`
-			MemberOpenID   string `json:"member_openid"`
-			OperatorOpenID string `json:"op_member_openid"`
-			Timestamp      int64  `json:"timestamp"`
-		} `json:"d"`
-	}
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return err
-	}
+func (pa *PlatformAdapterOfficialQQ) officialQQGroupMemberAddReceive(_ *dto.WSPayload, data *dto.WSGroupMemberAddData) error {
+	return pa.enqueueOfficialQQGroupMemberEvent("GROUP_MEMBER_ADD", data.GroupOpenID, data.MemberOpenID, data.OpMemberOpenID, data.Timestamp)
+}
+
+func (pa *PlatformAdapterOfficialQQ) officialQQGroupMemberRemoveReceive(_ *dto.WSPayload, data *dto.WSGroupMemberRemoveData) error {
+	return pa.enqueueOfficialQQGroupMemberEvent("GROUP_MEMBER_REMOVE", data.GroupOpenID, data.MemberOpenID, data.OpMemberOpenID, data.Timestamp)
+}
+
+func (pa *PlatformAdapterOfficialQQ) enqueueOfficialQQGroupMemberEvent(eventType, groupOpenID, memberOpenID, operatorOpenID string, timestamp int64) error {
 	memberEvent := officialQQGroupMemberEvent{
-		Type:           string(payload.Type),
-		GroupOpenID:    envelope.Data.GroupOpenID,
-		MemberOpenID:   envelope.Data.MemberOpenID,
-		OperatorOpenID: envelope.Data.OperatorOpenID,
-		Timestamp:      envelope.Data.Timestamp,
+		Type:           eventType,
+		GroupOpenID:    groupOpenID,
+		MemberOpenID:   memberOpenID,
+		OperatorOpenID: operatorOpenID,
+		Timestamp:      timestamp,
 	}
 	if !pa.enqueueOfficialQQEvent(func() { pa.dispatchOfficialQQGroupMemberEvent(memberEvent) }) {
 		return ErrOfficialQQEventQueueClosed
