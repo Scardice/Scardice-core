@@ -107,6 +107,10 @@ func (m *onebotRecallTestEmitter) GetGroupMemberInfo(_ context.Context, _ int64,
 	return nil, errOnebotRecallTestUnsupported
 }
 
+func (m *onebotRecallTestEmitter) GetGroupMsgHistory(_ context.Context, _ int64, _ int64, _ int) (*emitterTypes.GetGroupMsgHistoryRes, error) {
+	return nil, errOnebotRecallTestUnsupported
+}
+
 func (m *onebotRecallTestEmitter) Raw(_ context.Context, _ emitter.Action, _ any) ([]byte, error) {
 	return nil, nil
 }

@@ -1091,3 +1091,44 @@ func (p *PlatformAdapterOnebot) cbEnterDisconnected(_ context.Context, _ *loopfs
 func (p *PlatformAdapterOnebot) cbAfterDisable(_ context.Context, _ *loopfsm.Event) {
 	p.cleanupResources()
 }
+
+// FetchGroupMsgHistory 实现 HistoryFetcher 接口，拉取群历史消息用于日志断层补全
+func (p *PlatformAdapterOnebot) FetchGroupMsgHistory(ctx context.Context, groupID string, fromSeq int64, count int) ([]*Message, error) {
+	if p.sendEmitter == nil {
+		p.logger.Warn("FetchGroupMsgHistory: sendEmitter 未初始化")
+		return nil, errors.New("emitter 未初始化")
+	}
+
+	gid := ExtractQQEmitterGroupID(groupID)
+	if gid == 0 {
+		return nil, fmt.Errorf("无效的群ID: %s", groupID)
+	}
+
+	// get_group_msg_history 拿到的返回包含该 seq
+	// 故传入 fromSeq+1 作为起点，拉取 count 条
+	res, err := p.sendEmitter.GetGroupMsgHistory(ctx, gid, fromSeq+1, count)
+	if err != nil {
+		return nil, fmt.Errorf("调用 GetGroupMsgHistory 失败: %w", err)
+	}
+
+	if res == nil || len(res.Messages) == 0 {
+		return []*Message{}, nil
+	}
+
+	messages := make([]*Message, 0, len(res.Messages))
+	for _, raw := range res.Messages {
+		msg, err := arrayByte2ScardiceMessage(p.logger, raw)
+		if err != nil {
+			p.logger.Warnf("历史消息解析失败: %v", err)
+			continue
+		}
+		// 历史消息不携带 group_id，需按请求的群号回填
+		if msg.GroupID == "" {
+			msg.GroupID = canonicalOnebotGroupID(groupID)
+			msg.MessageType = "group"
+		}
+		messages = append(messages, msg)
+	}
+
+	return messages, nil
+}

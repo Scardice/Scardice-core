@@ -157,6 +157,10 @@ func (m *onebotTestEmitter) GetGroupMemberInfo(_ context.Context, groupID int64,
 	return &emitterTypes.GroupMemberInfo{}, nil
 }
 
+func (m *onebotTestEmitter) GetGroupMsgHistory(context.Context, int64, int64, int) (*emitterTypes.GetGroupMsgHistoryRes, error) {
+	return &emitterTypes.GetGroupMsgHistoryRes{}, nil
+}
+
 func (m *onebotTestEmitter) Raw(context.Context, emitter.Action, any) ([]byte, error) {
 	return []byte{}, nil
 }

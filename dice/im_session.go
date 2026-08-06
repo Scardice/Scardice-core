@@ -64,6 +64,7 @@ type Message struct {
 	Platform    string      `jsbind:"platform"    json:"platform"` // 当前平台
 	GroupName   string      `json:"groupName"`
 	TmpUID      string      `json:"-"             yaml:"-"`
+	Seq         int64       `jsbind:"seq"         json:"seq"` // 平台消息序号，0=不可用/不支持
 	// Note(Szzrain): 这里是消息段，为了支持多种消息类型，目前只有 Milky 支持，其他平台也应该尽快迁移支持，并使用 Session.ExecuteNew 方法
 	Segment []message.IMessageElement `jsbind:"segment" json:"-" yaml:"-"`
 }
@@ -132,6 +133,36 @@ type GroupInfo struct {
 
 	/* Wrapper 架构 */
 	ExtAppliedTime int64 `json:"-" yaml:"-"` // 群组应用扩展的时间戳，运行时使用，不序列化（强制每次启动重新初始化）
+
+	/* 日志seq断层检测 - 运行时字段 */
+	logSeqMu     sync.Mutex  `json:"-" yaml:"-"` // 保护以下三个seq追踪字段的原子读写
+	logLastSeq   int64       `json:"-" yaml:"-"` // 上条已记录消息的seq，0=未初始化
+	logLastMsgID interface{} `json:"-" yaml:"-"` // 上条已记录消息的RawID，用于断层通知的引用回复
+	logSelfSent  int64       `json:"-" yaml:"-"` // 自 logLastSeq 以来骰子自身的群内发言数
+	logGapFillMu sync.Mutex  `json:"-" yaml:"-"` // 补全防重入
+}
+
+// noteLogSelfSent 记录一条骰子自身的群内发言。
+// QQ的seq由群内所有消息共享，骰子发言同样占号，不计数就会把自己的回复误判成掉线遗漏。
+func (g *GroupInfo) noteLogSelfSent() {
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	g.logSelfSent++
+}
+
+// updateLogSeq 记录本条消息的seq，仅当 seq > 当前值时才推进，返回推进前的 seq、rawID，
+// 以及两条消息之间骰子自身的发言数（推进时一并清零，由调用方从断层数中扣除）。
+// 补录的历史消息 seq 必然小于当前值，既不会让指针回退，也不会误清自身发言计数。
+func (g *GroupInfo) updateLogSeq(seq int64, rawID interface{}) (lastSeq int64, lastMsgID interface{}, selfSent int64) {
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	lastSeq, lastMsgID, selfSent = g.logLastSeq, g.logLastMsgID, g.logSelfSent
+	if seq > g.logLastSeq {
+		g.logLastSeq = seq
+		g.logLastMsgID = rawID
+		g.logSelfSent = 0
+	}
+	return lastSeq, lastMsgID, selfSent
 }
 
 // GetActivatedExtList 获取激活的扩展列表，自动处理延迟初始化

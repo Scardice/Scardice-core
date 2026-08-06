@@ -23,6 +23,7 @@ import (
 	"Scardice-core/dice/service"
 	"Scardice-core/dice/storylog"
 	"Scardice-core/model"
+	"Scardice-core/utils/panicHandler"
 )
 
 var ErrGroupCardOverlong = errors.New("群名片长度超过限制")
@@ -961,6 +962,13 @@ func RegisterBuiltinExtLog(self *Dice) {
 			_ = os.MkdirAll(filepath.Join(self.BaseConfig.DataDir, "log-exports"), 0o755)
 		},
 		OnMessageSend: func(ctx *MsgContext, msg *Message, flag string) {
+			// 无论是否入日志，群内发言都会占用一个seq，故计数要在 skip 之前
+			if msg.MessageType == "group" && msg.GroupID != "" {
+				if groupInfo, ok := ctx.Session.ServiceAtNew.Load(msg.GroupID); ok {
+					groupInfo.noteLogSelfSent()
+				}
+			}
+
 			// 记录骰子发言
 			if flag == "skip" {
 				return
@@ -1029,6 +1037,37 @@ func RegisterBuiltinExtLog(self *Dice) {
 			if ctx.Group != nil {
 				logState := ensureGroupLogState(ctx, ctx.Group)
 				if logState.On && logState.Name != "" {
+					if msg.Seq > 0 {
+						lastSeq, lastMsgID, selfSent := ctx.Group.updateLogSeq(msg.Seq, msg.RawID)
+
+						if lastSeq == 0 && logState.ID > 0 {
+							if seq, err := service.LogGetLastSeq(ctx.Dice.DBOperator, logState.ID); err == nil && seq > 0 {
+								lastSeq = seq
+							}
+						}
+
+						if lastSeq > 0 {
+							// 骰子自身发言同样占seq，扣除后剩下的才是真正遗漏的他人消息
+							gap := msg.Seq - lastSeq - 1 - selfSent
+							if gap > 0 {
+								task := logGapFillTask{
+									dice:      ctx.Dice,
+									endpoint:  ctx.EndPoint,
+									group:     ctx.Group,
+									logID:     logState.ID,
+									logName:   logState.Name,
+									fromSeq:   lastSeq,
+									toSeq:     msg.Seq,
+									gap:       gap,
+									lastMsgID: lastMsgID,
+								}
+								// 补全内部会调用 CreateTempCtx，它以 panic 报告端点未就绪；
+								// 断层补全恰好运行在刚重连之后，裸 goroutine 里的 panic 会直接终止进程
+								panicHandler.Once(ctx.Dice.Logger, task.run)
+							}
+						}
+					}
+
 					// 去重，用于同群多骰情况
 					if !groupMsgInfoCheckOk(msg.RawID) {
 						return
@@ -1045,6 +1084,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 						IsDice:    false,
 						CommandID: ctx.CommandID,
 						RawMsgID:  msg.RawID,
+						Seq:       ptrInt64(msg.Seq),
 					}
 
 					LogAppend(ctx, ctx.Group.GroupID, logState.ID, logState.Name, &a)
@@ -1134,6 +1174,209 @@ func LogAppend(ctx *MsgContext, groupID string, logID uint64, logName string, lo
 		}
 	}
 	return ok
+}
+
+// 缺失条数不超过该阈值时静默补全并照常执行指令，超过则只补录日志并汇报未执行的指令
+const logGapFillSilentThreshold = 5
+
+const logGapFillTimeout = 30 * time.Second
+
+type logGapFillTask struct {
+	dice      *Dice
+	endpoint  *EndPointInfo
+	group     *GroupInfo
+	logID     uint64
+	logName   string
+	fromSeq   int64
+	toSeq     int64
+	gap       int64 // 已扣除骰子自身发言的净遗漏条数，仅用于阈值判定，不可当作拉取条数
+	lastMsgID interface{}
+}
+
+func (t logGapFillTask) run() {
+	if !t.group.logGapFillMu.TryLock() {
+		// 已有补全在进行时直接跳过：logLastSeq 此时已推进到本条消息
+		// 若补全的这数秒窗口内再次掉线并产生新断层，该新断层不会被再次补全而永久丢失
+		t.dice.Logger.Infof("日志补全已在进行，跳过本次: 群=%s", t.group.GroupID)
+		return
+	}
+	defer t.group.logGapFillMu.Unlock()
+
+	fetcher, ok := t.endpoint.Adapter.(HistoryFetcher)
+	if !ok {
+		return
+	}
+
+	t.dice.Logger.Infof("检测到日志seq断层: 群=%s 上条seq=%d 本条seq=%d 缺失=%d",
+		t.group.GroupID, t.fromSeq, t.toSeq, t.gap)
+
+	fetchCtx, cancel := context.WithTimeout(context.Background(), logGapFillTimeout)
+	defer cancel()
+
+	// 按整个区间宽度拉取而非按 gap，因为 gap 已扣除骰子自身发言，直接用会漏掉区间尾部的消息
+	msgs, err := fetcher.FetchGroupMsgHistory(fetchCtx, t.group.GroupID, t.fromSeq, int(t.toSeq-t.fromSeq-1))
+	if err != nil {
+		t.dice.Logger.Errorf("日志补全拉取历史消息失败: 群=%s 起始seq=%d err=%v", t.group.GroupID, t.fromSeq, err)
+		return
+	}
+
+	missing := t.filterMissing(msgs)
+	if len(missing) == 0 {
+		t.dice.Logger.Infof("日志补全无需处理: 群=%s 缺失区间内没有他人发言", t.group.GroupID)
+		return
+	}
+
+	if t.gap <= logGapFillSilentThreshold {
+		t.replaySilently(missing)
+		return
+	}
+	t.backfillWithNotice(missing)
+}
+
+// filterMissing 保留断层区间内的他人发言。
+// 骰子自身发言已由 OnMessageSend 记录，重复入库或被当成玩家指令执行都是错的；
+// 自身发言计数虽已在断层估算时扣除，但计数可能因重启丢失，故这里仍按发送者兜底剔除。
+func (t logGapFillTask) filterMissing(msgs []*Message) []*Message {
+	missing := make([]*Message, 0, len(msgs))
+	for _, m := range msgs {
+		if m == nil || m.Seq <= t.fromSeq || m.Seq >= t.toSeq {
+			continue
+		}
+		if m.Sender.UserID == t.endpoint.UserID {
+			continue
+		}
+		missing = append(missing, m)
+	}
+	return missing
+}
+
+// replaySilently 让缺失消息重走完整消息流程，日志记录与指令执行都由 ExecuteNew 内部完成
+func (t logGapFillTask) replaySilently(missing []*Message) {
+	session := t.endpoint.Session
+	if session == nil {
+		t.dice.Logger.Warnf("日志补全无法重放: 群=%s 端点会话未绑定", t.group.GroupID)
+		return
+	}
+	for _, m := range missing {
+		session.ExecuteNew(t.endpoint, m)
+	}
+	t.dice.Logger.Infof("日志补全完成(静默重放): 群=%s 补录=%d条", t.group.GroupID, len(missing))
+}
+
+// backfillWithNotice 只补录日志并统计其中的指令，随后引用断层前最后一条消息汇报
+func (t logGapFillTask) backfillWithNotice(missing []*Message) {
+	mctx := CreateTempCtx(t.endpoint, &Message{
+		MessageType: "group",
+		Sender:      SenderBase{UserID: t.endpoint.UserID},
+		GroupID:     t.group.GroupID,
+		Platform:    t.endpoint.Platform,
+	})
+
+	stats := map[string]map[string]int{}
+	nicknames := map[string]string{}
+	appended := 0
+
+	for _, m := range missing {
+		item := model.LogOneItem{
+			Nickname:  m.Sender.Nickname,
+			IMUserID:  UserIDExtract(m.Sender.UserID),
+			UniformID: m.Sender.UserID,
+			Time:      m.Time,
+			Message:   m.Message,
+			IsDice:    false,
+			RawMsgID:  m.RawID,
+			Seq:       ptrInt64(m.Seq),
+		}
+		if LogAppend(mctx, t.group.GroupID, t.logID, t.logName, &item) {
+			appended++
+		}
+
+		cmd := extractCommandName(t.dice.CommandPrefix, m.Platform, m.Message)
+		if cmd == "" {
+			continue
+		}
+		if stats[m.Sender.UserID] == nil {
+			stats[m.Sender.UserID] = map[string]int{}
+		}
+		stats[m.Sender.UserID][cmd]++
+		nicknames[m.Sender.UserID] = m.Sender.Nickname
+	}
+
+	t.dice.Logger.Infof("日志补全完成(指令未执行): 群=%s 补录=%d条 涉及指令用户=%d",
+		t.group.GroupID, appended, len(stats))
+
+	if appended == 0 {
+		return
+	}
+	ReplyToSenderRaw(mctx, &Message{
+		MessageType: "group",
+		GroupID:     t.group.GroupID,
+		Platform:    t.endpoint.Platform,
+	}, t.buildNotice(appended, stats, nicknames), "skip")
+}
+
+func (t logGapFillTask) buildNotice(appended int, stats map[string]map[string]int, nicknames map[string]string) string {
+	var buf strings.Builder
+	if t.lastMsgID != nil {
+		_, _ = fmt.Fprintf(&buf, "[CQ:reply,id=%v]", t.lastMsgID)
+	}
+	_, _ = fmt.Fprintf(&buf, "检测到seq不连贯，已异步补全 %d 条遗漏消息，引用的是断层前最后一条有记录的消息。", appended)
+
+	if len(stats) == 0 {
+		return buf.String()
+	}
+
+	buf.WriteString("\n断层期间出现过以下指令：")
+	userIDs := make([]string, 0, len(stats))
+	for uid := range stats {
+		userIDs = append(userIDs, uid)
+	}
+	sort.Strings(userIDs)
+	for _, uid := range userIDs {
+		_, _ = fmt.Fprintf(&buf, "\n%s(%s)", nicknames[uid], UserIDExtract(uid))
+		cmds := make([]string, 0, len(stats[uid]))
+		for cmd := range stats[uid] {
+			cmds = append(cmds, cmd)
+		}
+		sort.Strings(cmds)
+		for _, cmd := range cmds {
+			_, _ = fmt.Fprintf(&buf, "\n  |- %s %d次", cmd, stats[uid][cmd])
+		}
+	}
+	buf.WriteString("\n这些指令均未实际执行，如有必要请重新发送。")
+	return buf.String()
+}
+
+// extractCommandName 提取消息中的指令名用于统计，非指令返回空串。
+// 仅做前导符与首个词的粗粒度识别，不解析参数，因此不依赖也不触发指令注册表。
+func extractCommandName(prefixes []string, platform string, text string) string {
+	rest, _ := AtParse(text, platform)
+	rest, _ = SpecialExecuteTimesParse(strings.TrimSpace(rest))
+
+	matched := ""
+	for _, p := range prefixes {
+		if p != "" && strings.HasPrefix(strings.TrimSpace(rest), p) {
+			matched = p
+			break
+		}
+	}
+	if matched == "" {
+		return ""
+	}
+
+	fields := strings.Fields(strings.TrimPrefix(strings.TrimSpace(rest), matched))
+	if len(fields) == 0 {
+		return ""
+	}
+	return matched + fields[0]
+}
+
+// ptrInt64 把seq转为可空列的值，0表示平台未提供，需要转化成NULL以区分
+func ptrInt64(v int64) *int64 {
+	if v == 0 {
+		return nil
+	}
+	return &v
 }
 
 func LogDeleteByID(ctx *MsgContext, groupID string, messageID interface{}) bool {

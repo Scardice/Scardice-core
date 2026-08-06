@@ -518,6 +518,26 @@ func LogLinesCountGet(operator engine2.DatabaseOperator, groupID string, logName
 	return count, true
 }
 
+// LogGetLastSeq 查询指定log中已记录的最大消息序号，用于跨进程重启恢复断层检测基线。
+// MAX 天然忽略 NULL，故返回 0 表示该log中没有任何带seq的记录（全新log、旧版本数据或不支持seq的平台）。
+func LogGetLastSeq(operator engine2.DatabaseOperator, logID uint64) (int64, error) {
+	if logID == 0 {
+		return 0, nil
+	}
+	db := operator.GetLogDB(constant.READ)
+
+	var maxSeq sql.NullInt64
+	err := db.Model(&model.LogOneItem{}).
+		Where("log_id = ?", logID).
+		Select("MAX(seq)").
+		Scan(&maxSeq).Error
+	if err != nil {
+		return 0, err
+	}
+
+	return maxSeq.Int64, nil
+}
+
 // LogDelete 删除log
 func LogDelete(operator engine2.DatabaseOperator, groupID string, logName string) error {
 	db := operator.GetLogDB(constant.WRITE)
@@ -545,7 +565,6 @@ func LogDelete(operator engine2.DatabaseOperator, groupID string, logName string
 // LogAppend 向指定的log中添加一条信息
 func LogAppend(operator engine2.DatabaseOperator, groupID string, logName string, logItem *model.LogOneItem) bool {
 	db := operator.GetLogDB(constant.WRITE)
-	// 获取 log ID
 	logID, err := getIDByGroupIDAndName(db, groupID, logName)
 	if err != nil {
 		if errors.Is(err, ErrLogNotFound) {
@@ -555,21 +574,27 @@ func LogAppend(operator engine2.DatabaseOperator, groupID string, logName string
 		}
 	}
 
-	// 获取当前时间戳
 	now := time.Now()
 	nowTimestamp := now.Unix()
+
+	timestamp := nowTimestamp
+	if logItem.Time != 0 {
+		timestamp = logItem.Time
+	}
+
 	newLogItem := model.LogOneItem{
 		LogID:       logID,
 		GroupID:     groupID,
 		Nickname:    logItem.Nickname,
 		IMUserID:    logItem.IMUserID,
-		Time:        nowTimestamp,
+		Time:        timestamp,
 		Message:     logItem.Message,
 		IsDice:      logItem.IsDice,
 		CommandID:   logItem.CommandID,
 		CommandInfo: logItem.CommandInfo,
 		RawMsgID:    logItem.RawMsgID,
 		UniformID:   logItem.UniformID,
+		Seq:         logItem.Seq,
 	}
 	err = db.Transaction(func(tx *gorm.DB) error {
 		if logID == 0 {
@@ -614,18 +639,25 @@ func LogAppendByID(operator engine2.DatabaseOperator, logID uint64, groupID stri
 
 	now := time.Now()
 	nowTimestamp := now.Unix()
+
+	timestamp := nowTimestamp
+	if logItem.Time != 0 {
+		timestamp = logItem.Time
+	}
+
 	newLogItem := model.LogOneItem{
 		LogID:       logID,
 		GroupID:     groupID,
 		Nickname:    logItem.Nickname,
 		IMUserID:    logItem.IMUserID,
-		Time:        nowTimestamp,
+		Time:        timestamp,
 		Message:     logItem.Message,
 		IsDice:      logItem.IsDice,
 		CommandID:   logItem.CommandID,
 		CommandInfo: logItem.CommandInfo,
 		RawMsgID:    logItem.RawMsgID,
 		UniformID:   logItem.UniformID,
+		Seq:         logItem.Seq,
 	}
 
 	err := db.Transaction(func(tx *gorm.DB) error {
