@@ -43,6 +43,7 @@ type Emitter interface {
 	SetGroupCard(ctx context.Context, groupId int64, userId int64, card string) error
 	GetGroupInfo(ctx context.Context, groupId int64, noCache bool) (*types.GroupInfo, error)
 	GetGroupMemberInfo(ctx context.Context, groupId int64, userId int64, noCache bool) (*types.GroupMemberInfo, error)
+	GetGroupMsgHistory(ctx context.Context, groupId int64, messageSeq int64, count int) (*types.GetGroupMsgHistoryRes, error)
 	Raw(ctx context.Context, action Action, params any) ([]byte, error)
 
 	HandleEcho(resp Response[sonic.NoCopyRawMessage])
@@ -315,6 +316,18 @@ func (e *emitterSocket) GetGroupMemberInfo(ctx context.Context, groupId int64, u
 		return nil, err
 	}
 	return decodeResponse[types.GroupMemberInfo](resp)
+}
+
+func (e *emitterSocket) GetGroupMsgHistory(ctx context.Context, groupId int64, messageSeq int64, count int) (*types.GetGroupMsgHistoryRes, error) {
+	resp, err := doAction(ctx, e, ACTION_GET_GROUP_MSG_HISTORY, types.GetGroupMsgHistoryReq{
+		GroupID:    groupId,
+		MessageSeq: messageSeq,
+		Count:      count,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return decodeResponse[types.GetGroupMsgHistoryRes](resp)
 }
 
 func (e *emitterSocket) Raw(ctx context.Context, action Action, params any) ([]byte, error) {

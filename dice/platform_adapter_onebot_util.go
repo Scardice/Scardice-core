@@ -636,6 +636,7 @@ func canonicalOnebotGroupID(raw string) string {
 
 type MessageQQOBBase struct {
 	MessageID     int64                  `json:"message_id"`   // QQ信息此类型为int64，频道中为string
+	MessageSeq    int64                  `json:"message_seq"`  // 群内消息序号，同一群内连续递增，部分实现不提供
 	MessageType   string                 `json:"message_type"` // Group
 	Sender        *Sender                `json:"sender"`       // 发送者
 	RawMessage    string                 `json:"raw_message"`
@@ -699,6 +700,7 @@ func (msgQQ *MessageOBQQ) toStdMessage() *Message {
 	msg.Time = msgQQ.Time
 	msg.MessageType = msgQQ.MessageType
 	msg.RawID = formatOnebotMessageID(msgQQ.MessageID)
+	msg.Seq = msgQQ.MessageSeq
 	msg.Platform = "QQ"
 
 	if msg.MessageType == "" {

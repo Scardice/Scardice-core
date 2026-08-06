@@ -46,6 +46,9 @@ type LogOneItem struct {
 	// 允许default=NULL
 	Removed  *int `gorm:"column:removed"   json:"-"`
 	ParentID *int `gorm:"column:parent_id" json:"-"`
+	// Seq 平台消息序号，用于掉线期间的日志断层检测与补全
+	// 允许default=NULL，历史记录与不支持seq的平台均为NULL
+	Seq *int64 `gorm:"column:seq" json:"seq,omitempty"`
 }
 
 // 兼容旧版本的数据库设计
@@ -150,6 +153,7 @@ type LogOneItemHookMySQL struct {
 	Channel        string      `gorm:"-"                                  json:"channel"`
 	Removed        *int        `gorm:"column:removed"                     json:"-"`
 	ParentID       *int        `gorm:"column:parent_id"                   json:"-"`
+	Seq            *int64      `gorm:"column:seq"                         json:"seq,omitempty"`
 }
 
 func (*LogOneItemHookMySQL) TableName() string {

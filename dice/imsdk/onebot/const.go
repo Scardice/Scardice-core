@@ -24,4 +24,5 @@ const (
 	ACTION_SET_GROUP_CARD        Action = "set_group_card"        // 设置群名片
 	ACTION_GET_GROUP_INFO        Action = "get_group_info"        // 获取群信息
 	ACTION_GET_GROUP_MEMBER_INFO Action = "get_group_member_info" // 获取群成员信息
+	ACTION_GET_GROUP_MSG_HISTORY Action = "get_group_msg_history" // 获取群历史消息
 )
