@@ -23,9 +23,10 @@ func TestPProfRecorderCreatesNoOutputWhenDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start disabled recorder: %v", err)
 	}
-	if stop != nil {
-		t.Fatal("disabled recorder returned a shutdown callback")
+	if stop == nil {
+		t.Fatal("disabled recorder must return a no-op shutdown callback")
 	}
+	stop()
 	_, statErr := os.Stat(filepath.Join("data", "pprof", "1722528000"))
 	if !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("disabled recorder output stat error = %v, want not exist", statErr)

@@ -122,10 +122,10 @@ func TestBlugeDocEngineReopensCurrentIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create first Bluge search engine: %v", err)
 	}
-	if _, err := first.AddItem(HelpTextItem{Title: "persisted-entry", Content: "persisted"}); err != nil {
+	if _, err = first.AddItem(HelpTextItem{Title: "persisted-entry", Content: "persisted"}); err != nil {
 		t.Fatalf("add persisted help item: %v", err)
 	}
-	if err := first.AddItemApply(true); err != nil {
+	if err = first.AddItemApply(true); err != nil {
 		t.Fatalf("apply persisted help item: %v", err)
 	}
 	wantIDs, err := first.ListAllDocumentIDs()
@@ -165,14 +165,14 @@ func TestBlugeDocEngineRebuildsOldSchemaWithoutTranslatingDocuments(t *testing.T
 	if err != nil {
 		t.Fatalf("create first Bluge search engine: %v", err)
 	}
-	if _, err := first.AddItem(HelpTextItem{Title: "old-schema-entry", Content: "old"}); err != nil {
+	if _, err = first.AddItem(HelpTextItem{Title: "old-schema-entry", Content: "old"}); err != nil {
 		t.Fatalf("add old-schema help item: %v", err)
 	}
-	if err := first.AddItemApply(true); err != nil {
+	if err = first.AddItemApply(true); err != nil {
 		t.Fatalf("apply old-schema help item: %v", err)
 	}
 	first.Close()
-	if err := os.WriteFile(filepath.Join(indexDir, indexSchemaFile), []byte("0"), 0o600); err != nil {
+	if err = os.WriteFile(filepath.Join(indexDir, indexSchemaFile), []byte("0"), 0o600); err != nil {
 		t.Fatalf("write old schema marker: %v", err)
 	}
 

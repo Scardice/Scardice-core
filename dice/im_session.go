@@ -2059,6 +2059,68 @@ func FormatBlacklistReasons(v *BanListInfoItem) string {
 	return reasontext
 }
 
+func checkBanBlacklistedUser(ctx *MsgContext, msg *Message, isWhiteGroup bool, banQuitGroup func()) bool {
+	d := ctx.Dice
+	log := d.Logger
+	groupLevel := ctx.GroupRoleLevel
+	if (d.Config.BanList.BanBehaviorQuitIfAdmin || d.Config.BanList.BanBehaviorQuitIfAdminSilentIfNotAdmin) && msg.MessageType == "group" {
+		// 黑名单用户 - 立即退出所在群
+		banListInfoItem, _ := ctx.Dice.Config.BanList.GetByID(msg.Sender.UserID)
+		reasontext := FormatBlacklistReasons(banListInfoItem)
+		groupID := msg.GroupID
+		if groupLevel >= 40 {
+			if isWhiteGroup {
+				log.Infof("收到群(%s)内邀请者以上权限黑名单用户<%s>(%s)的消息，但在信任群所以不尝试退群", groupID, msg.Sender.Nickname, msg.Sender.UserID)
+			} else {
+				text := fmt.Sprintf("警告: <%s>(%s)是黑名单用户，将对骰主进行通知并退群。", msg.Sender.Nickname, msg.Sender.UserID)
+				ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
+
+				noticeMsg := fmt.Sprintf("检测到群(%s)内黑名单用户<%s>(%s)，因是管理以上权限，执行通告后自动退群\n%s", groupID, msg.Sender.Nickname, msg.Sender.UserID, reasontext)
+				log.Info(noticeMsg)
+				ctx.Notice(noticeMsg, NoticeTypeBan)
+				banQuitGroup()
+			}
+			return true
+		}
+		if isWhiteGroup {
+			log.Infof("收到群(%s)内普通群员黑名单用户<%s>(%s)的消息，但在信任群所以不做其他操作", groupID, msg.Sender.Nickname, msg.Sender.UserID)
+			return true
+		}
+		if d.Config.BanList.BanBehaviorQuitIfAdmin {
+			if !d.Config.BanList.CanNotifyBlacklistedUser(groupID, msg.Sender.UserID, time.Now()) {
+				return true
+			}
+			noticeMsg := fmt.Sprintf("检测到群(%s)内黑名单用户<%s>(%s)，因是普通群员，进行群内通告\n%s", groupID, msg.Sender.Nickname, msg.Sender.UserID, reasontext)
+			log.Info(noticeMsg)
+
+			text := fmt.Sprintf("警告: <%s>(%s)是黑名单用户，将对骰主进行通知。\n%s", msg.Sender.Nickname, msg.Sender.UserID, reasontext)
+			ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
+
+			ctx.Notice(noticeMsg, NoticeTypeBan)
+		} else {
+			noticeMsg := fmt.Sprintf("检测到群(%s)内黑名单用户<%s>(%s)，因是普通群员，忽略黑名单用户信息，不做其他操作\n%s", groupID, msg.Sender.Nickname, msg.Sender.UserID, reasontext)
+			log.Info(noticeMsg)
+		}
+		return true
+	}
+	if d.Config.BanList.BanBehaviorQuitPlaceImmediately && msg.MessageType == "group" {
+		// 黑名单用户 - 立即退出所在群
+		groupID := msg.GroupID
+		if isWhiteGroup {
+			log.Infof("收到群(%s)内黑名单用户<%s>(%s)的消息，但在信任群所以不尝试退群", groupID, msg.Sender.Nickname, msg.Sender.UserID)
+		} else {
+			banQuitGroup()
+		}
+		return true
+	}
+	if d.Config.BanList.BanBehaviorRefuseReply {
+		// 黑名单用户 - 拒绝回复
+		log.Infof("忽略黑名单用户信息: 来自群(%s)内<%s>(%s): %s", msg.GroupID, msg.Sender.Nickname, msg.Sender.UserID, msg.Message)
+		return true
+	}
+	return false
+}
+
 // checkBan 黑名单拦截
 func checkBan(ctx *MsgContext, msg *Message) (notReply bool) {
 	d := ctx.Dice
@@ -2094,62 +2156,9 @@ func checkBan(ctx *MsgContext, msg *Message) (notReply bool) {
 	}
 
 	if ctx.PrivilegeLevel == -30 {
-		groupLevel := ctx.GroupRoleLevel
-		if (d.Config.BanList.BanBehaviorQuitIfAdmin || d.Config.BanList.BanBehaviorQuitIfAdminSilentIfNotAdmin) && msg.MessageType == "group" {
-			// 黑名单用户 - 立即退出所在群
-			banListInfoItem, _ := ctx.Dice.Config.BanList.GetByID(msg.Sender.UserID)
-			reasontext := FormatBlacklistReasons(banListInfoItem)
-			groupID := msg.GroupID
-			notReply = true
-			if groupLevel >= 40 {
-				if isWhiteGroup {
-					log.Infof("收到群(%s)内邀请者以上权限黑名单用户<%s>(%s)的消息，但在信任群所以不尝试退群", groupID, msg.Sender.Nickname, msg.Sender.UserID)
-				} else {
-					text := fmt.Sprintf("警告: <%s>(%s)是黑名单用户，将对骰主进行通知并退群。", msg.Sender.Nickname, msg.Sender.UserID)
-					ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
-
-					noticeMsg := fmt.Sprintf("检测到群(%s)内黑名单用户<%s>(%s)，因是管理以上权限，执行通告后自动退群\n%s", groupID, msg.Sender.Nickname, msg.Sender.UserID, reasontext)
-					log.Info(noticeMsg)
-					ctx.Notice(noticeMsg, NoticeTypeBan)
-					banQuitGroup()
-				}
-			} else {
-				if isWhiteGroup {
-					log.Infof("收到群(%s)内普通群员黑名单用户<%s>(%s)的消息，但在信任群所以不做其他操作", groupID, msg.Sender.Nickname, msg.Sender.UserID)
-				} else {
-					notReply = true
-					if d.Config.BanList.BanBehaviorQuitIfAdmin {
-						if !d.Config.BanList.CanNotifyBlacklistedUser(groupID, msg.Sender.UserID, time.Now()) {
-							return true
-						}
-						noticeMsg := fmt.Sprintf("检测到群(%s)内黑名单用户<%s>(%s)，因是普通群员，进行群内通告\n%s", groupID, msg.Sender.Nickname, msg.Sender.UserID, reasontext)
-						log.Info(noticeMsg)
-
-						text := fmt.Sprintf("警告: <%s>(%s)是黑名单用户，将对骰主进行通知。\n%s", msg.Sender.Nickname, msg.Sender.UserID, reasontext)
-						ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
-
-						ctx.Notice(noticeMsg, NoticeTypeBan)
-					} else {
-						noticeMsg := fmt.Sprintf("检测到群(%s)内黑名单用户<%s>(%s)，因是普通群员，忽略黑名单用户信息，不做其他操作\n%s", groupID, msg.Sender.Nickname, msg.Sender.UserID, reasontext)
-						log.Info(noticeMsg)
-					}
-				}
-			}
-		} else if d.Config.BanList.BanBehaviorQuitPlaceImmediately && msg.MessageType == "group" {
-			notReply = true
-			// 黑名单用户 - 立即退出所在群
-			groupID := msg.GroupID
-			if isWhiteGroup {
-				log.Infof("收到群(%s)内黑名单用户<%s>(%s)的消息，但在信任群所以不尝试退群", groupID, msg.Sender.Nickname, msg.Sender.UserID)
-			} else {
-				banQuitGroup()
-			}
-		} else if d.Config.BanList.BanBehaviorRefuseReply {
-			notReply = true
-			// 黑名单用户 - 拒绝回复
-			log.Infof("忽略黑名单用户信息: 来自群(%s)内<%s>(%s): %s", msg.GroupID, msg.Sender.Nickname, msg.Sender.UserID, msg.Message)
-		}
-	} else if isBanGroup {
+		return checkBanBlacklistedUser(ctx, msg, isWhiteGroup, banQuitGroup)
+	}
+	if isBanGroup {
 		if d.Config.BanList.BanBehaviorQuitPlaceImmediately && !isWhiteGroup {
 			notReply = true
 			// 黑名单群 - 立即退出

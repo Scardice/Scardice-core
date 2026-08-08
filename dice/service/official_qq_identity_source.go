@@ -50,19 +50,21 @@ func (m *OfficialQQIdentityMigrator) MigrateVerifiedSource(
 	if err != nil {
 		return OfficialQQIdentityMigrationResult{}, err
 	}
-	if err := m.journal.Init(ctx); err != nil {
+	if err = m.journal.Init(ctx); err != nil {
 		return OfficialQQIdentityMigrationResult{}, err
 	}
 	declared := 0
 	for start := 0; start < len(specs); start += batchSize {
 		end := min(start+batchSize, len(specs))
-		created, err := m.journal.createPendingIfAbsent(ctx, specs[start:end])
+		var created int
+		created, err = m.journal.createPendingIfAbsent(ctx, specs[start:end])
 		if err != nil {
 			return OfficialQQIdentityMigrationResult{}, err
 		}
 		declared += created
 	}
-	processed, err := m.ApplyPending(ctx, strconv.FormatUint(source.AppID, 10), batchSize)
+	var processed int
+	processed, err = m.ApplyPending(ctx, strconv.FormatUint(source.AppID, 10), batchSize)
 	if err != nil {
 		return OfficialQQIdentityMigrationResult{}, err
 	}

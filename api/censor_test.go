@@ -19,9 +19,21 @@ func TestCensorEncodedDetailsHandlerConfigRoundTrip(t *testing.T) {
 	setLevelHandlers(censor.Warning, []string{"SendWarning", "SendEncodedDetails"})
 	got := getLevelConfig(
 		censor.Warning,
-		map[censor.Level]int{censor.Warning: 1},
+		map[censor.Level]int{
+			censor.Ignore:  0,
+			censor.Notice:  0,
+			censor.Caution: 0,
+			censor.Warning: 1,
+			censor.Danger:  0,
+		},
 		myDice.Config.CensorHandlers,
-		map[censor.Level]int{censor.Warning: 100},
+		map[censor.Level]int{
+			censor.Ignore:  0,
+			censor.Notice:  0,
+			censor.Caution: 0,
+			censor.Warning: 100,
+			censor.Danger:  0,
+		},
 	)
 
 	// Then

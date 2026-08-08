@@ -105,7 +105,7 @@ func TestOfficialQQIdentityJournal_Transition_blocksAndRequeuesMapping(t *testin
 		t.Fatalf("blocked mapping = state %q, error %q, updated %d", blocked.State, blocked.Error, blocked.UpdatedAt)
 	}
 	clock.Advance(time.Minute)
-	if err := journal.Transition(context.Background(), OfficialQQIdentityMappingTransition{Key: spec.Key, State: model.OfficialQQIdentityMappingPending}); err != nil {
+	if err = journal.Transition(context.Background(), OfficialQQIdentityMappingTransition{Key: spec.Key, State: model.OfficialQQIdentityMappingPending}); err != nil {
 		t.Fatalf("pending Transition() error = %v", err)
 	}
 	pending, err := journal.Get(context.Background(), spec.Key)

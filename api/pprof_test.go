@@ -73,7 +73,7 @@ func TestPProfRoutesServeIndexAndNamedProfileWhenAuthenticated(t *testing.T) {
 	for _, path := range paths {
 		t.Run(path, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, path, nil)
-			req.Header.Set("token", token)
+			req.Header.Set("Token", token)
 			rec := httptest.NewRecorder()
 
 			// When

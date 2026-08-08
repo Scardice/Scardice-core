@@ -26,7 +26,7 @@ func V161MigrateNoticeTargets(configPath string) error {
 	}
 
 	var document yaml.Node
-	if err := yaml.Unmarshal(content, &document); err != nil {
+	if err = yaml.Unmarshal(content, &document); err != nil {
 		return fmt.Errorf("解析配置: %w", err)
 	}
 	if len(document.Content) == 0 || document.Content[0].Kind != yaml.MappingNode {

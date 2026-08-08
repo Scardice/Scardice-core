@@ -73,7 +73,7 @@ func openBlugeWriter(path string) (*bluge.Writer, bool, error) {
 	}
 	freshlyCreated := !compatible
 	if exists && !compatible {
-		if err := os.RemoveAll(path); err != nil {
+		if err = os.RemoveAll(path); err != nil {
 			return nil, false, fmt.Errorf("remove incompatible search index: %w", err)
 		}
 	}

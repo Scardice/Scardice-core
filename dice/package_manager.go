@@ -1275,26 +1275,6 @@ func (pm *PackageManager) cleanupPackageStagingDir() error {
 	return os.MkdirAll(stagingDir, 0o755)
 }
 
-func (pm *PackageManager) cleanupLegacyPackageTempDir() error {
-	if pm == nil || pm.parent == nil || pm.parent.BaseConfig.Name == "" || pm.parent.BaseConfig.DataDir == "" {
-		return nil
-	}
-	legacyDir := filepath.Join(pm.parent.BaseConfig.DataDir, "temp")
-	newDir := pm.getPackageTempDir()
-	legacyAbs, err := filepath.Abs(legacyDir)
-	if err != nil {
-		return err
-	}
-	newAbs, err := filepath.Abs(newDir)
-	if err != nil {
-		return err
-	}
-	if legacyAbs == newAbs {
-		return nil
-	}
-	return os.RemoveAll(legacyAbs)
-}
-
 func (pm *PackageManager) validateManagedPackageSource(pkgPath string) (string, error) {
 	if strings.TrimSpace(pkgPath) == "" {
 		return "", errors.New("扩展包路径不能为空")
@@ -2343,7 +2323,6 @@ func unsupportedPackageHashAlgorithms(hashes map[string]string) []string {
 	sort.Strings(result)
 	return result
 }
-
 
 // PreviewFromURL 从 URL 下载扩展包并返回包内容预览。
 func (pm *PackageManager) PreviewFromURL(url string, hashes map[string]string) (*PackageUploadPreview, error) {

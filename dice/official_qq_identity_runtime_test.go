@@ -18,12 +18,12 @@ func TestOfficialQQIdentityRuntime_defersTemporaryGroupsWithoutVerifiedUIN(t *te
 		t.Fatalf("newMockDatabaseOperator() error = %v", err)
 	}
 	t.Cleanup(operator.Close)
-	if err := operator.db.AutoMigrate(&model.GroupInfo{}); err != nil {
+	if err = operator.db.AutoMigrate(&model.GroupInfo{}); err != nil {
 		t.Fatalf("migrate group_info: %v", err)
 	}
 	const oldGroupID = "OpenQQ-Group-T:123456789-group-open-id"
 	updatedAt := int64(1)
-	if err := operator.db.Create(&model.GroupInfo{ID: oldGroupID, CreatedAt: 1, UpdatedAt: &updatedAt, Data: []byte("source")}).Error; err != nil {
+	if err = operator.db.Create(&model.GroupInfo{ID: oldGroupID, CreatedAt: 1, UpdatedAt: &updatedAt, Data: []byte("source")}).Error; err != nil {
 		t.Fatalf("seed group_info: %v", err)
 	}
 	groups := new(SyncMap[string, *GroupInfo])
@@ -43,7 +43,7 @@ func TestOfficialQQIdentityRuntime_defersTemporaryGroupsWithoutVerifiedUIN(t *te
 		t.Fatal("missing verified UIN created an identity journal table")
 	}
 	var targetCount int64
-	if err := operator.db.Model(&model.GroupInfo{}).Where("id = ?", "OpenQQ-Group:1-group-open-id").Count(&targetCount).Error; err != nil {
+	if err = operator.db.Model(&model.GroupInfo{}).Where("id = ?", "OpenQQ-Group:1-group-open-id").Count(&targetCount).Error; err != nil {
 		t.Fatalf("count target group: %v", err)
 	}
 	if targetCount != 0 {
@@ -57,7 +57,7 @@ func TestOfficialQQIdentityRuntime_appliesCurrentSourcesAfterSDKIdentityAvailabl
 		t.Fatalf("newMockDatabaseOperator() error = %v", err)
 	}
 	t.Cleanup(operator.Close)
-	if err := operator.db.AutoMigrate(&model.GroupInfo{}); err != nil {
+	if err = operator.db.AutoMigrate(&model.GroupInfo{}); err != nil {
 		t.Fatalf("migrate group_info: %v", err)
 	}
 	const groupOpenID = "group-open-id"
@@ -66,7 +66,7 @@ func TestOfficialQQIdentityRuntime_appliesCurrentSourcesAfterSDKIdentityAvailabl
 	newGroupID := "OpenQQ-Group:1-" + groupOpenID
 	oldMemberID := formatDiceIDOfficialQQMemberOpenID("123456789", groupOpenID, memberOpenID)
 	updatedAt := int64(1)
-	if err := operator.db.Create(&model.GroupInfo{ID: oldGroupID, CreatedAt: 1, UpdatedAt: &updatedAt, Data: []byte("source")}).Error; err != nil {
+	if err = operator.db.Create(&model.GroupInfo{ID: oldGroupID, CreatedAt: 1, UpdatedAt: &updatedAt, Data: []byte("source")}).Error; err != nil {
 		t.Fatalf("seed group_info: %v", err)
 	}
 	players := new(SyncMap[string, *GroupPlayerInfo])
@@ -85,11 +85,11 @@ func TestOfficialQQIdentityRuntime_appliesCurrentSourcesAfterSDKIdentityAvailabl
 		t.Fatalf("migrateVerifiedIdentityAfterMe() result = %#v", result)
 	}
 	var sourceRow model.GroupInfo
-	if err := operator.db.Where("id = ?", oldGroupID).Take(&sourceRow).Error; err != nil || string(sourceRow.Data) != "source" {
+	if err = operator.db.Where("id = ?", oldGroupID).Take(&sourceRow).Error; err != nil || string(sourceRow.Data) != "source" {
 		t.Fatalf("source group = %#v, %v", sourceRow, err)
 	}
 	var targetRow model.GroupInfo
-	if err := operator.db.Where("id = ?", newGroupID).Take(&targetRow).Error; err != nil || string(targetRow.Data) != "source" {
+	if err = operator.db.Where("id = ?", newGroupID).Take(&targetRow).Error; err != nil || string(targetRow.Data) != "source" {
 		t.Fatalf("target group = %#v, %v", targetRow, err)
 	}
 	journal := service.NewOfficialQQIdentityJournal(operator, time.Now)
