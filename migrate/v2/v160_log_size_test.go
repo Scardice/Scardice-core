@@ -12,6 +12,8 @@ import (
 func TestV160LogSizeRepair_AddsMissingColumnAndRecounts(t *testing.T) {
 	op, _ := v2test.NewTestSQLiteEngine(t)
 	logDB := op.GetLogDB(constant.WRITE)
+	// Init 已 EnsureLogSchema；先清掉再按升级前旧结构建表
+	v2test.DropLogTables(t, logDB)
 
 	v2test.MustExec(t, logDB, `CREATE TABLE logs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,6 +54,7 @@ func TestV160LogSizeRepair_AddsMissingColumnAndRecounts(t *testing.T) {
 func TestV160LogSizeRepair_ExistingColumnGetsRecounted(t *testing.T) {
 	op, _ := v2test.NewTestSQLiteEngine(t)
 	logDB := op.GetLogDB(constant.WRITE)
+	v2test.DropLogTables(t, logDB)
 
 	v2test.MustExec(t, logDB, `CREATE TABLE logs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,6 +84,10 @@ func TestV160LogSizeRepair_ExistingColumnGetsRecounted(t *testing.T) {
 
 func TestV160LogSizeRepair_NoLogsTableIsNoOp(t *testing.T) {
 	op, _ := v2test.NewTestSQLiteEngine(t)
+	logDB := op.GetLogDB(constant.WRITE)
+	// Init 会建表；无表场景需要主动 drop
+	v2test.DropLogTables(t, logDB)
+
 	if err := v160.V160LogSizeRepairMigrate(op, v2test.SilentLogf); err != nil {
 		t.Fatalf("无 logs 表时不应报错: %v", err)
 	}
@@ -89,6 +96,7 @@ func TestV160LogSizeRepair_NoLogsTableIsNoOp(t *testing.T) {
 func TestV160LogSizeRepair_MissingLogItemsTableErrors(t *testing.T) {
 	op, _ := v2test.NewTestSQLiteEngine(t)
 	logDB := op.GetLogDB(constant.WRITE)
+	v2test.DropLogTables(t, logDB)
 
 	// 仅创建 logs 表，不创建 log_items，模拟“logs 存在而 log_items 缺失”的异常状态
 	v2test.MustExec(t, logDB, `CREATE TABLE logs (
