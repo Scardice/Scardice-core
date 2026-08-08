@@ -10,9 +10,9 @@ import (
 	"gorm.io/gorm"
 
 	"Scardice-core/logger"
-	"Scardice-core/model"
 	"Scardice-core/utils/cache"
 	"Scardice-core/utils/constant"
+	"Scardice-core/utils/dboperator/schema"
 )
 
 type MYSQLEngine struct {
@@ -89,6 +89,9 @@ func (s *MYSQLEngine) DBCheck() {
 func (s *MYSQLEngine) dataDBInit() (*gorm.DB, error) {
 	dataContext := context.WithValue(s.ctx, cache.CacheKey, cache.DataDBCacheKey)
 	dataDB := s.DB.WithContext(dataContext)
+	if err := schema.EnsureDataSchema(dataDB); err != nil {
+		return nil, err
+	}
 	return dataDB, nil
 }
 
@@ -96,13 +99,16 @@ func (s *MYSQLEngine) logDBInit() (*gorm.DB, error) {
 	// logs特殊建表
 	logsContext := context.WithValue(s.ctx, cache.CacheKey, cache.LogsDBCacheKey)
 	logDB := s.DB.WithContext(logsContext)
+	if err := schema.EnsureLogSchema(logDB, s.Type()); err != nil {
+		return nil, err
+	}
 	return logDB, nil
 }
 
 func (s *MYSQLEngine) censorDBInit() (*gorm.DB, error) {
 	censorContext := context.WithValue(s.ctx, cache.CacheKey, cache.CensorsDBCacheKey)
 	censorDB := s.DB.WithContext(censorContext)
-	if err := censorDB.AutoMigrate(&model.CensorLog{}); err != nil {
+	if err := schema.EnsureCensorSchema(censorDB); err != nil {
 		return nil, err
 	}
 	return censorDB, nil
