@@ -14,6 +14,7 @@ import (
 	"Scardice-core/logger"
 	"Scardice-core/utils/cache"
 	"Scardice-core/utils/constant"
+	"Scardice-core/utils/dboperator/schema"
 )
 
 type SQLiteEngine struct {
@@ -218,6 +219,9 @@ func (s *SQLiteEngine) dataDBInit() error {
 	dataContext := context.WithValue(s.ctx, cache.CacheKey, cache.DataDBCacheKey)
 	readDB = readDB.WithContext(dataContext)
 	writeDB = writeDB.WithContext(dataContext)
+	if err := schema.EnsureDataSchema(writeDB); err != nil {
+		return err
+	}
 	s.readList[DataDBKey] = readDB
 	s.writeList[DataDBKey] = writeDB
 	return nil
@@ -233,6 +237,9 @@ func (s *SQLiteEngine) LogDBInit() error {
 	logsContext := context.WithValue(s.ctx, cache.CacheKey, cache.LogsDBCacheKey)
 	readDB = readDB.WithContext(logsContext)
 	writeDB = writeDB.WithContext(logsContext)
+	if err := schema.EnsureLogSchema(writeDB, s.Type()); err != nil {
+		return err
+	}
 	s.readList[LogsDBKey] = readDB
 	s.writeList[LogsDBKey] = writeDB
 	return nil
@@ -251,6 +258,9 @@ func (s *SQLiteEngine) CensorDBInit() error {
 	censorContext := context.WithValue(s.ctx, cache.CacheKey, cache.CensorsDBCacheKey)
 	readDB = readDB.WithContext(censorContext)
 	writeDB = writeDB.WithContext(censorContext)
+	if err := schema.EnsureCensorSchema(writeDB); err != nil {
+		return err
+	}
 	s.readList[CensorsDBKey] = readDB
 	s.writeList[CensorsDBKey] = writeDB
 	return nil

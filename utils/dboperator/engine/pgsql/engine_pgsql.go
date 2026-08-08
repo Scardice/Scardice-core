@@ -12,6 +12,7 @@ import (
 	"Scardice-core/logger"
 	"Scardice-core/utils/cache"
 	"Scardice-core/utils/constant"
+	"Scardice-core/utils/dboperator/schema"
 )
 
 type PGSQLEngine struct {
@@ -89,6 +90,9 @@ func (s *PGSQLEngine) dataDBInit() (*gorm.DB, error) {
 	// data建表
 	dataContext := context.WithValue(s.ctx, cache.CacheKey, cache.DataDBCacheKey)
 	dataDB := s.DB.WithContext(dataContext)
+	if err := schema.EnsureDataSchema(dataDB); err != nil {
+		return nil, err
+	}
 	return dataDB, nil
 }
 
@@ -96,12 +100,18 @@ func (s *PGSQLEngine) logDBInit() (*gorm.DB, error) {
 	// logs建表
 	logsContext := context.WithValue(s.ctx, cache.CacheKey, cache.LogsDBCacheKey)
 	logDB := s.DB.WithContext(logsContext)
+	if err := schema.EnsureLogSchema(logDB, s.Type()); err != nil {
+		return nil, err
+	}
 	return logDB, nil
 }
 
 func (s *PGSQLEngine) censorDBInit() (*gorm.DB, error) {
 	censorContext := context.WithValue(s.ctx, cache.CacheKey, cache.CensorsDBCacheKey)
 	censorDB := s.DB.WithContext(censorContext)
+	if err := schema.EnsureCensorSchema(censorDB); err != nil {
+		return nil, err
+	}
 	return censorDB, nil
 }
 func (s *PGSQLEngine) Type() string {
