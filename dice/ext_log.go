@@ -1150,6 +1150,13 @@ func FilenameReplace(name string) string {
 	return re.ReplaceAllString(name, "")
 }
 
+const logAppendFailNoticeInterval = 5 * time.Minute
+
+var (
+	logAppendFailMu   sync.Mutex
+	logAppendFailLast = map[string]time.Time{}
+)
+
 func LogAppend(ctx *MsgContext, groupID string, logID uint64, logName string, logItem *model.LogOneItem) bool {
 	ok := false
 	if logID > 0 {
@@ -1157,23 +1164,47 @@ func LogAppend(ctx *MsgContext, groupID string, logID uint64, logName string, lo
 	} else if logName != "" {
 		ok = service.LogAppend(ctx.Dice.DBOperator, groupID, logName, logItem)
 	}
-	if ok {
-		if size, okCount := service.LogLinesCountGet(ctx.Dice.DBOperator, groupID, logName); okCount {
-			// 默认每记录500条发出提示
-			if ctx.Dice.Config.LogSizeNoticeEnable {
-				if ctx.Dice.Config.LogSizeNoticeCount == 0 {
-					ctx.Dice.Config.LogSizeNoticeCount = DefaultConfig.LogSizeNoticeCount
-				}
-				if size > 0 && int(size)%ctx.Dice.Config.LogSizeNoticeCount == 0 {
-					VarSetValueInt64(ctx, "$t条数", size)
-					text := DiceFormatTmpl(ctx, "日志:记录_条数提醒")
-					// text := fmt.Sprintf("提示: 当前故事的文本已经记录了 %d 条", size)
-					ReplyToSenderRaw(ctx, &Message{MessageType: "group", GroupID: groupID}, text, "skip")
-				}
+	if !ok {
+		reportLogAppendFailure(ctx, groupID, logID, logName)
+		return false
+	}
+	if size, okCount := service.LogLinesCountGet(ctx.Dice.DBOperator, groupID, logName); okCount {
+		// 默认每记录500条发出提示
+		if ctx.Dice.Config.LogSizeNoticeEnable {
+			if ctx.Dice.Config.LogSizeNoticeCount == 0 {
+				ctx.Dice.Config.LogSizeNoticeCount = DefaultConfig.LogSizeNoticeCount
+			}
+			if size > 0 && int(size)%ctx.Dice.Config.LogSizeNoticeCount == 0 {
+				VarSetValueInt64(ctx, "$t条数", size)
+				text := DiceFormatTmpl(ctx, "日志:记录_条数提醒")
+				ReplyToSenderRaw(ctx, &Message{MessageType: "group", GroupID: groupID}, text, "skip")
 			}
 		}
 	}
-	return ok
+	return true
+}
+
+func reportLogAppendFailure(ctx *MsgContext, groupID string, logID uint64, logName string) {
+	if ctx == nil || ctx.Dice == nil {
+		return
+	}
+	if ctx.Dice.Logger != nil {
+		ctx.Dice.Logger.Errorf("日志写入失败: group=%s logID=%d name=%s", groupID, logID, logName)
+	}
+	if groupID == "" {
+		return
+	}
+	now := time.Now()
+	logAppendFailMu.Lock()
+	last := logAppendFailLast[groupID]
+	if !last.IsZero() && now.Sub(last) < logAppendFailNoticeInterval {
+		logAppendFailMu.Unlock()
+		return
+	}
+	logAppendFailLast[groupID] = now
+	logAppendFailMu.Unlock()
+	ReplyToSenderRaw(ctx, &Message{MessageType: "group", GroupID: groupID},
+		"日志写入失败，请联系骰主检查后台错误日志（可能是数据库结构未升级）", "skip")
 }
 
 // 缺失条数不超过该阈值时静默补全并照常执行指令，超过则只补录日志并汇报未执行的指令

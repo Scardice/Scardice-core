@@ -503,7 +503,7 @@ func main() {
 	// }
 	err = v2.InitUpgrader(operator)
 	if err != nil {
-		log.Warnf("升级流程出现问题，请检查，问题为: %v", err)
+		log.Errorf("升级流程出现问题，请检查，问题为: %v", err)
 	}
 
 	if !opts.ShowConsole || opts.MultiInstanceOnWindows {

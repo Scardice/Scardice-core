@@ -35,15 +35,21 @@ func EnsureLogSchema(db *gorm.DB, engineType string) error {
 	if db == nil {
 		return errors.New("log db is nil")
 	}
-	var err error
-	switch engineType {
-	case constant.MYSQL:
-		err = db.AutoMigrate(&model.LogInfoHookMySQL{}, &model.LogOneItemHookMySQL{})
-	default:
-		err = db.AutoMigrate(&model.LogInfo{}, &model.LogOneItem{})
+	var (
+		logModel  any = &model.LogInfo{}
+		itemModel any = &model.LogOneItem{}
+	)
+	if engineType == constant.MYSQL {
+		logModel = &model.LogInfoHookMySQL{}
+		itemModel = &model.LogOneItemHookMySQL{}
 	}
-	if err != nil {
+	if err := db.AutoMigrate(logModel, itemModel); err != nil {
 		return fmt.Errorf("ensure log schema: %w", err)
+	}
+	if db.Migrator().HasTable(itemModel) && !db.Migrator().HasColumn(itemModel, "seq") {
+		if err := db.Migrator().AddColumn(itemModel, "Seq"); err != nil {
+			return fmt.Errorf("ensure log schema seq column: %w", err)
+		}
 	}
 	return nil
 }

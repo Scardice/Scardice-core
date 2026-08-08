@@ -106,6 +106,69 @@ func TestEnsureRejectsNilDB(t *testing.T) {
 	}
 }
 
+func TestEnsureLogSchemaAddsMissingSeqColumn(t *testing.T) {
+	t.Parallel()
+
+	db := openSchemaTestDB(t)
+
+	// Given: pre-V162 log_items without seq
+	if err := db.Exec(`
+CREATE TABLE logs (
+  id INTEGER PRIMARY KEY,
+  name TEXT,
+  group_id TEXT,
+  created_at INTEGER,
+  updated_at INTEGER,
+  size INTEGER,
+  extra TEXT
+)`).Error; err != nil {
+		t.Fatalf("create logs: %v", err)
+	}
+	if err := db.Exec(`
+CREATE TABLE log_items (
+  id INTEGER PRIMARY KEY,
+  log_id INTEGER,
+  group_id TEXT,
+  nickname TEXT,
+  im_userid TEXT,
+  time INTEGER,
+  message TEXT,
+  is_dice INTEGER,
+  command_id INTEGER,
+  command_info TEXT,
+  raw_msg_id TEXT,
+  user_uniform_id TEXT,
+  removed INTEGER,
+  parent_id INTEGER
+)`).Error; err != nil {
+		t.Fatalf("create log_items: %v", err)
+	}
+	if db.Migrator().HasColumn(&model.LogOneItem{}, "seq") {
+		t.Fatal("precondition: seq must be absent")
+	}
+
+	// When
+	if err := schema.EnsureLogSchema(db, constant.SQLITE); err != nil {
+		t.Fatalf("EnsureLogSchema: %v", err)
+	}
+
+	// Then
+	if !db.Migrator().HasColumn(&model.LogOneItem{}, "seq") {
+		t.Fatal("expected seq column after EnsureLogSchema")
+	}
+	seq := int64(42)
+	item := model.LogOneItem{
+		LogID:    1,
+		GroupID:  "g",
+		Nickname: "n",
+		Message:  "m",
+		Seq:      &seq,
+	}
+	if err := db.Create(&item).Error; err != nil {
+		t.Fatalf("insert with seq: %v", err)
+	}
+}
+
 func openSchemaTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 

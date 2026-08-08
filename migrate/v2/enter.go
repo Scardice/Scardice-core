@@ -1,6 +1,8 @@
 package v2
 
 import (
+	"os"
+	"path/filepath"
 	_ "time"
 
 	v120 "Scardice-core/migrate/v2/v120"
@@ -17,8 +19,24 @@ import (
 	"Scardice-core/utils/upgrader/store"
 )
 
+func upgradeMetadataPath() string {
+	const name = "upgrade_metadata.json"
+	dataDir := os.Getenv("DATADIR")
+	if dataDir == "" {
+		return name
+	}
+	underData := filepath.Join(dataDir, name)
+	if _, err := os.Stat(underData); err == nil {
+		return underData
+	}
+	if _, err := os.Stat(name); err == nil {
+		return name
+	}
+	return underData
+}
+
 func InitUpgrader(operator operator.DatabaseOperator) error {
-	storer := store.NewJSONStore("upgrade_metadata.json")
+	storer := store.NewJSONStore(upgradeMetadataPath())
 	mgr := &upgrade.Manager{Store: storer, Database: operator}
 	// V120注册
 	mgr.Register(v120.V120Migration)
