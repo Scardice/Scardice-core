@@ -4,6 +4,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pilagod/gorm-cursor-paginator/v2/paginator"
@@ -14,6 +17,7 @@ import (
 	"Scardice-core/model"
 	"Scardice-core/utils/constant"
 	engine2 "Scardice-core/utils/dboperator/engine"
+	"Scardice-core/utils/dboperator/schema"
 )
 
 type LogOne struct {
@@ -562,15 +566,69 @@ func LogDelete(operator engine2.DatabaseOperator, groupID string, logName string
 	return err
 }
 
+var (
+	logSchemaHealed atomic.Bool
+	logSchemaHealMu sync.Mutex
+)
+
+func isMissingColumnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no such column") ||
+		strings.Contains(msg, "has no column") ||
+		strings.Contains(msg, "unknown column")
+}
+
+func maybeHealLogSchema(operator engine2.DatabaseOperator, err error) bool {
+	if !isMissingColumnErr(err) || logSchemaHealed.Load() {
+		return false
+	}
+	logSchemaHealMu.Lock()
+	defer logSchemaHealMu.Unlock()
+	if logSchemaHealed.Load() {
+		return false
+	}
+	dbLog := zap.S().Named(logger.LogKeyDatabase)
+	healErr := schema.EnsureLogSchema(operator.GetLogDB(constant.WRITE), operator.Type())
+	if healErr != nil {
+		dbLog.Errorf("log schema self-heal failed: %v (cause: %v)", healErr, err)
+		return false
+	}
+	logSchemaHealed.Store(true)
+	dbLog.Warnf("log schema self-heal completed after write error: %v", err)
+	return true
+}
+
+func logAppendDBErr(op string, groupID, logName string, logID uint64, err error) {
+	zap.S().Named(logger.LogKeyDatabase).Errorf(
+		"%s failed group=%s name=%s logID=%d err=%v",
+		op, groupID, logName, logID, err,
+	)
+}
+
 // LogAppend 向指定的log中添加一条信息
 func LogAppend(operator engine2.DatabaseOperator, groupID string, logName string, logItem *model.LogOneItem) bool {
+	err := logAppendOnce(operator, groupID, logName, logItem)
+	if err != nil && maybeHealLogSchema(operator, err) {
+		err = logAppendOnce(operator, groupID, logName, logItem)
+	}
+	if err != nil {
+		logAppendDBErr("LogAppend", groupID, logName, 0, err)
+		return false
+	}
+	return true
+}
+
+func logAppendOnce(operator engine2.DatabaseOperator, groupID string, logName string, logItem *model.LogOneItem) error {
 	db := operator.GetLogDB(constant.WRITE)
 	logID, err := getIDByGroupIDAndName(db, groupID, logName)
 	if err != nil {
 		if errors.Is(err, ErrLogNotFound) {
 			logID = 0
 		} else {
-			return false
+			return err
 		}
 	}
 
@@ -596,15 +654,13 @@ func LogAppend(operator engine2.DatabaseOperator, groupID string, logName string
 		UniformID:   logItem.UniformID,
 		Seq:         logItem.Seq,
 	}
-	err = db.Transaction(func(tx *gorm.DB) error {
+	return db.Transaction(func(tx *gorm.DB) error {
 		if logID == 0 {
-			// 创建一个新的 log
 			newLog := model.LogInfo{Name: logName, GroupID: groupID, CreatedAt: nowTimestamp, UpdatedAt: nowTimestamp}
-			if err = tx.Create(&newLog).Error; err != nil {
-				// 并发场景下可能被其他事务先创建，回查既有log并继续写入
+			if createErr := tx.Create(&newLog).Error; createErr != nil {
 				existedLogID, findErr := getIDByGroupIDAndName(tx, groupID, logName)
 				if findErr != nil {
-					return err
+					return createErr
 				}
 				logID = existedLogID
 			} else {
@@ -612,30 +668,39 @@ func LogAppend(operator engine2.DatabaseOperator, groupID string, logName string
 			}
 		}
 		newLogItem.LogID = logID
-		if err = tx.Create(&newLogItem).Error; err != nil {
-			return err
+		if createErr := tx.Create(&newLogItem).Error; createErr != nil {
+			return createErr
 		}
-		// 更新 logs 表中的 updated_at 字段 和 size 字段
-		if err = tx.Model(&model.LogInfo{}).
+		if updateErr := tx.Model(&model.LogInfo{}).
 			Where("id = ?", logID).
 			Updates(map[string]interface{}{
 				"updated_at": nowTimestamp,
 				"size":       gorm.Expr("COALESCE(size, 0) + ?", 1),
-			}).Error; err != nil {
-			return err
+			}).Error; updateErr != nil {
+			return updateErr
 		}
 		return nil
 	})
-
-	return err == nil
 }
 
 // LogAppendByID 向指定 log_id 的日志中追加一条消息。
 func LogAppendByID(operator engine2.DatabaseOperator, logID uint64, groupID string, logItem *model.LogOneItem) bool {
-	db := operator.GetLogDB(constant.WRITE)
 	if logID == 0 {
 		return false
 	}
+	err := logAppendByIDOnce(operator, logID, groupID, logItem)
+	if err != nil && maybeHealLogSchema(operator, err) {
+		err = logAppendByIDOnce(operator, logID, groupID, logItem)
+	}
+	if err != nil {
+		logAppendDBErr("LogAppendByID", groupID, "", logID, err)
+		return false
+	}
+	return true
+}
+
+func logAppendByIDOnce(operator engine2.DatabaseOperator, logID uint64, groupID string, logItem *model.LogOneItem) error {
+	db := operator.GetLogDB(constant.WRITE)
 
 	now := time.Now()
 	nowTimestamp := now.Unix()
@@ -660,7 +725,7 @@ func LogAppendByID(operator engine2.DatabaseOperator, logID uint64, groupID stri
 		Seq:         logItem.Seq,
 	}
 
-	err := db.Transaction(func(tx *gorm.DB) error {
+	return db.Transaction(func(tx *gorm.DB) error {
 		logInfo, getErr := getLogInfoByID(tx, logID)
 		if getErr != nil {
 			return getErr
@@ -681,8 +746,6 @@ func LogAppendByID(operator engine2.DatabaseOperator, logID uint64, groupID stri
 		}
 		return nil
 	})
-
-	return err == nil
 }
 
 // LogMarkDeleteByMsgID 撤回删除
