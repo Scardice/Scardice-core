@@ -17,7 +17,7 @@ func TestOfficialQQVerifiedAccountAdmission_rejectsDuplicateWithoutChangingBlock
 		t.Fatalf("newMockDatabaseOperator() error = %v", err)
 	}
 	t.Cleanup(operator.Close)
-	if err := operator.db.AutoMigrate(&model.OfficialQQIdentityMapping{}); err != nil {
+	if err = operator.db.AutoMigrate(&model.OfficialQQIdentityMapping{}); err != nil {
 		t.Fatalf("migrate identity journal: %v", err)
 	}
 	blocked := model.OfficialQQIdentityMapping{
@@ -33,7 +33,7 @@ func TestOfficialQQVerifiedAccountAdmission_rejectsDuplicateWithoutChangingBlock
 		UpdatedAt:   1,
 		Error:       "target exists",
 	}
-	if err := operator.db.Create(&blocked).Error; err != nil {
+	if err = operator.db.Create(&blocked).Error; err != nil {
 		t.Fatalf("seed blocked mapping: %v", err)
 	}
 

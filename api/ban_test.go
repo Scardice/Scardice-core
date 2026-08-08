@@ -24,7 +24,7 @@ func TestBanConfigSetPersistsNotificationInterval(t *testing.T) {
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/ban/config", strings.NewReader(`{"banNotifyIntervalMinutes":-1}`))
 	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
-	req.Header.Set("token", "task5-token")
+	req.Header.Set("Token", "task5-token")
 	rec := httptest.NewRecorder()
 
 	// When

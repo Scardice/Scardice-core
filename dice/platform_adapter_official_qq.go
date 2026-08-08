@@ -99,7 +99,7 @@ func (pa *PlatformAdapterOfficialQQ) Serve() int {
 		pa.closeOfficialQQEventQueue()
 		return 1
 	}
-	if err := validateOfficialQQWebsocketAP(ws); err != nil {
+	if err = validateOfficialQQWebsocketAP(ws); err != nil {
 		log.Error("official qq websocket access point invalid: ", err)
 		ep.State = 3
 		if pa.CancelFunc != nil {

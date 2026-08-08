@@ -120,11 +120,6 @@ func (pa *PlatformAdapterOfficialQQ) initSendQuota() {
 	})
 }
 
-func (pa *PlatformAdapterOfficialQQ) waitC2CActiveQuota(ctx context.Context, userOpenID string) error {
-	pa.initSendQuota()
-	return pa.c2cSendQuota.acquire(ctx, userOpenID)
-}
-
 func (pa *PlatformAdapterOfficialQQ) waitGroupActiveQuota(ctx context.Context, groupOpenID string) error {
 	pa.initSendQuota()
 	return pa.groupSendQuota.acquire(ctx, groupOpenID)

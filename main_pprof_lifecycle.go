@@ -12,7 +12,7 @@ func oncePprofStop(stop func()) func() {
 
 func startPprofRecordIfEnabled(enabled bool, log *zap.SugaredLogger, bootTime int64) (func(), error) {
 	if !enabled {
-		return nil, nil
+		return func() {}, nil
 	}
 
 	recorder, err := startPprofRecord(log, bootTime)

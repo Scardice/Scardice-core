@@ -70,7 +70,7 @@ func requestAddOfficialQQ(t *testing.T, body string) (*httptest.ResponseRecorder
 	e := echo.New()
 	request := httptest.NewRequest(http.MethodPost, "/sd-api/im_connections/addOfficialQQ", strings.NewReader(body))
 	request.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
-	request.Header.Set("token", "official-qq-test-token")
+	request.Header.Set("Token", "official-qq-test-token")
 	recorder := httptest.NewRecorder()
 
 	if err := ImConnectionsAddOfficialQQ(e.NewContext(request, recorder)); err != nil {
@@ -157,7 +157,7 @@ func Test_ImConnectionsAddOfficialQQ_preserves_add_save_and_start_when_not_test_
 	testDice, effects := setupOfficialQQHandlerTest(t, nil)
 	officialQQMe = func(context.Context, *dice.PlatformAdapterOfficialQQ) (*dto.User, error) {
 		t.Fatal("non-test add called Me synchronously")
-		return nil, nil
+		return nil, errors.New("non-test add must not call Me")
 	}
 
 	// When

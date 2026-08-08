@@ -24,8 +24,8 @@ func TestManager_ApplyAll_Resumes_idempotent_upgrade_after_interruption_without_
 			attempts++
 			_, err := os.ReadFile(durableRowsPath)
 			if os.IsNotExist(err) {
-				if err := os.WriteFile(durableRowsPath, []byte("row\n"), 0o644); err != nil {
-					return err
+				if writeErr := os.WriteFile(durableRowsPath, []byte("row\n"), 0o644); writeErr != nil {
+					return writeErr
 				}
 				logf("durably wrote row")
 				return interrupted

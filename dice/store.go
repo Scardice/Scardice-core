@@ -218,10 +218,6 @@ func decodeJSONStrict(data []byte, target interface{}) error {
 	return nil
 }
 
-func decodeJSONCompatible(data []byte, target interface{}) error {
-	return decodeJSONCompatibleReader(bytes.NewReader(data), target)
-}
-
 func decodeJSONCompatibleReader(reader io.Reader, target interface{}) error {
 	decoder := json.NewDecoder(reader)
 	if err := decoder.Decode(target); err != nil {
@@ -248,10 +244,6 @@ func decodeStoreJSONResponse(reader io.Reader, limit int64, target interface{}) 
 		return errStoreResponseTooLarge
 	}
 	return nil
-}
-
-func fetchStoreJSON[T any](requestURL string) (*T, error) {
-	return fetchStoreJSONContext[T](context.Background(), requestURL)
 }
 
 func fetchStoreJSONContext[T any](ctx context.Context, requestURL string) (*T, error) {

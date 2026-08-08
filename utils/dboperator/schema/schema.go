@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"errors"
 	"fmt"
 
 	"gorm.io/gorm"
@@ -13,7 +14,7 @@ import (
 // Safe to call on every startup; GORM AutoMigrate is additive.
 func EnsureDataSchema(db *gorm.DB) error {
 	if db == nil {
-		return fmt.Errorf("data db is nil")
+		return errors.New("data db is nil")
 	}
 	if err := db.AutoMigrate(
 		&model.GroupPlayerInfoBase{},
@@ -32,7 +33,7 @@ func EnsureDataSchema(db *gorm.DB) error {
 // MySQL uses hook models to avoid full-length indexes that require prefix indexes.
 func EnsureLogSchema(db *gorm.DB, engineType string) error {
 	if db == nil {
-		return fmt.Errorf("log db is nil")
+		return errors.New("log db is nil")
 	}
 	var err error
 	switch engineType {
@@ -50,7 +51,7 @@ func EnsureLogSchema(db *gorm.DB, engineType string) error {
 // EnsureCensorSchema creates censor_log if missing.
 func EnsureCensorSchema(db *gorm.DB) error {
 	if db == nil {
-		return fmt.Errorf("censor db is nil")
+		return errors.New("censor db is nil")
 	}
 	if err := db.AutoMigrate(&model.CensorLog{}); err != nil {
 		return fmt.Errorf("ensure censor schema: %w", err)

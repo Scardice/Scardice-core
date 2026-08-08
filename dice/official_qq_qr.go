@@ -25,7 +25,7 @@ const (
 type officialQQQREncoder func(string) ([]byte, error)
 
 type officialQQQRClient interface {
-	Create(context.Context, string) (string, error)
+	Create(ctx context.Context, key string) (string, error)
 }
 
 type officialQQQRHTTPClient struct {

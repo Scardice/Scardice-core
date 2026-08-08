@@ -34,7 +34,8 @@ func (m *Manager) ApplyAll() error {
 			continue
 		}
 		if !up.Idempotent {
-			records, err := m.Store.LoadRecords()
+			var records []UpgradeRecord
+			records, err = m.Store.LoadRecords()
 			if err != nil {
 				return err
 			}

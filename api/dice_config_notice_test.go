@@ -33,7 +33,7 @@ func Test_DiceConfig_notice_targets_round_trip_without_changing_masters(t *testi
 	requestBody := `{"noticeIds":[" QQ:1001:only=ban,group,ban ","QQ:1002:disable:only=send",""]}`
 	setRequest := httptest.NewRequest(http.MethodPost, "/sd-api/dice/config", strings.NewReader(requestBody))
 	setRequest.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
-	setRequest.Header.Set("token", "task10-token")
+	setRequest.Header.Set("Token", "task10-token")
 	setRecorder := httptest.NewRecorder()
 
 	// When
@@ -41,7 +41,7 @@ func Test_DiceConfig_notice_targets_round_trip_without_changing_masters(t *testi
 		t.Fatalf("set notice targets: %v", err)
 	}
 	getRequest := httptest.NewRequest(http.MethodGet, "/sd-api/dice/config", nil)
-	getRequest.Header.Set("token", "task10-token")
+	getRequest.Header.Set("Token", "task10-token")
 	getRecorder := httptest.NewRecorder()
 	if err := DiceConfig(e.NewContext(getRequest, getRecorder)); err != nil {
 		t.Fatalf("get notice targets: %v", err)
