@@ -102,6 +102,15 @@ func MustExec(t *testing.T, db *gorm.DB, sql string, args ...interface{}) {
 	}
 }
 
+// DropLogTables 删除 logs / log_items。
+// SQLiteEngine.Init 会 EnsureLogSchema 自动建表；V160 等迁移用例需要先清空，
+// 再按升级前旧 schema 手工建表。
+func DropLogTables(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	MustExec(t, db, `DROP TABLE IF EXISTS log_items`)
+	MustExec(t, db, `DROP TABLE IF EXISTS logs`)
+}
+
 // ScanLogSizes 扫描 logs 表返回 id -> size 的映射。
 func ScanLogSizes(t *testing.T, db *gorm.DB) map[int]int {
 	t.Helper()

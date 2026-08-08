@@ -11,6 +11,8 @@ import (
 func TestV160LogIDZeroClean_DeletesAndRecounts(t *testing.T) {
 	op, _ := v2test.NewTestSQLiteEngine(t)
 	logDB := op.GetLogDB(constant.WRITE)
+	// Init 已 EnsureLogSchema；先清掉再按升级前旧结构建表
+	v2test.DropLogTables(t, logDB)
 
 	v2test.MustExec(t, logDB, `CREATE TABLE logs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,6 +51,7 @@ func TestV160LogIDZeroClean_DeletesAndRecounts(t *testing.T) {
 func TestV160LogIDZeroClean_TolerantOfMissingSizeColumn(t *testing.T) {
 	op, _ := v2test.NewTestSQLiteEngine(t)
 	logDB := op.GetLogDB(constant.WRITE)
+	v2test.DropLogTables(t, logDB)
 
 	v2test.MustExec(t, logDB, `CREATE TABLE logs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,6 +83,7 @@ func TestV160LogIDZeroClean_TolerantOfMissingSizeColumn(t *testing.T) {
 func TestV160LogIDZeroClean_NothingToDoIsNoOp(t *testing.T) {
 	op, _ := v2test.NewTestSQLiteEngine(t)
 	logDB := op.GetLogDB(constant.WRITE)
+	v2test.DropLogTables(t, logDB)
 
 	v2test.MustExec(t, logDB, `CREATE TABLE logs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, group_id TEXT,
