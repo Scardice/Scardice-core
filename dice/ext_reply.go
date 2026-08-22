@@ -36,6 +36,11 @@ func CustomReplyConfigReadFromPath(dice *Dice, filePath string, filename string)
 				dice.Logger.Error("读取自定义回复配置文件发生异常，请检查格式是否正确")
 				return nil, err
 			}
+			if normalizeReplyVMVersion(rc.VMVersion) == ReplyVMVersionV2 || hasReplyVMVersionV2Marker(af) {
+				rc.VMVersion = ReplyVMVersionV2
+			} else {
+				rc.VMVersion = ""
+			}
 		}
 	}
 
@@ -57,7 +62,24 @@ func CustomReplyConfigCheckExists(dice *Dice, filename string) bool {
 	return false
 }
 
+func hasReplyVMVersionV2Marker(data []byte) bool {
+	text := strings.TrimPrefix(string(data), "\ufeff")
+	firstLine, _, _ := strings.Cut(text, "\n")
+	return strings.TrimSpace(firstLine) == ReplyVMVersionV2Marker
+}
+
+func (c *ReplyConfig) vmVersionForExecution(dice *Dice) string {
+	if normalizeReplyVMVersion(c.VMVersion) == ReplyVMVersionV2 {
+		return ReplyVMVersionV2
+	}
+	return dice.getTargetVmEngineVersion(VMVersionReply)
+}
+
 func CustomReplyConfigNew(dice *Dice, filename string) *ReplyConfig {
+	return CustomReplyConfigNewWithVMVersion(dice, filename, ReplyVMVersionV2)
+}
+
+func CustomReplyConfigNewWithVMVersion(dice *Dice, filename string, vmVersion string) *ReplyConfig {
 	for _, i := range dice.CustomReplyConfig {
 		if i.PackageID == "" && strings.EqualFold(i.Filename, filename) {
 			return nil
@@ -66,6 +88,7 @@ func CustomReplyConfigNew(dice *Dice, filename string) *ReplyConfig {
 
 	nowTime := time.Now().Unix()
 	rc := &ReplyConfig{
+		VMVersion:       normalizeReplyVMVersion(vmVersion),
 		Enable:          true,
 		Filename:        filename,
 		Name:            filename,
@@ -206,6 +229,7 @@ func RegisterBuiltinExtReply(dice *Dice) {
 				if !rc.Enable {
 					continue
 				}
+				vmVersion := rc.vmVersionForExecution(ctx.Dice)
 				condIndex := -1
 				defer func() {
 					if r := recover(); r != nil {
@@ -221,7 +245,7 @@ func RegisterBuiltinExtReply(dice *Dice) {
 				{
 					commonCondOK := true
 					for _, cond := range rc.Conditions {
-						if !cond.Check(ctx, msg, nil, cleanText) {
+						if !cond.Check(ctx, msg, nil, cleanText, vmVersion) {
 							commonCondOK = false
 							break
 						}
@@ -255,7 +279,7 @@ func RegisterBuiltinExtReply(dice *Dice) {
 
 					checkTrue := true
 					for _, i := range i.Conditions {
-						if !i.Check(ctx, msg, nil, cleanText) {
+						if !i.Check(ctx, msg, nil, cleanText, vmVersion) {
 							checkTrue = false
 							break
 						}
@@ -276,7 +300,7 @@ func RegisterBuiltinExtReply(dice *Dice) {
 					SetTempVars(ctx, msg.Sender.Nickname)
 					VarSetValueStr(ctx, "$tMsgID", fmt.Sprintf("%v", msg.RawID))
 					for _, j := range i.Results {
-						j.Execute(ctx, msg, nil)
+						j.Execute(ctx, msg, nil, vmVersion)
 					}
 					executed = true
 					break
