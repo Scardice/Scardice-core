@@ -30,8 +30,10 @@ dist/
 go-cqhttp/
 lagrange/
 milky/
-frontend/
-frontend_overwrite/
+/frontend/
+/frontend_overwrite/
+/static/frontend/*
+!/static/frontend/index.html
 backups/
 update/
 walle-q/

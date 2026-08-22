@@ -58,6 +58,7 @@ func InitUpgrader(operator operator.DatabaseOperator) error {
 	mgr.Register(v160.V160LogSizeRepairMigration)
 	mgr.Register(v161.V161NoticeIDsMigration)
 	mgr.Register(v161.V161CopyDiceMastersToNoticeIDsMigration)
+	mgr.Register(v161.V161LogUpdatedAtRepairMigration)
 	mgr.Register(v162.V162AddLogSeqMigration)
 	err := mgr.ApplyAll()
 	if err != nil {
