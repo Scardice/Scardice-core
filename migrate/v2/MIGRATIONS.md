@@ -27,6 +27,10 @@
 | `008_V160LogIDZeroCleanMigration`    | v1.6.0       | log_id=0 清理      | 删除 log_items.log_id=0 与 logs.id=0 的残留并重算 size                            |
 | `008a_V160LogRawMsgIDIndexMigration` | v1.6.0       | 日志复合索引       | 为 log_items 建 `(group_id, raw_msg_id, id)` 复合索引                             |
 | `010_V160LogSizeRepairMigration`     | v1.6.0       | logs.size 兜底修复 | 补建缺失的 size 列并全量重算（兜底 V150 失误）                                    |
+| `011_V161NoticeIDsMigration`         | v1.6.1       | 通知目标规范化     | 将旧通知目标规范化为可按分类筛选的格式                                     |
+| `012_V162AddLogSeqMigration`         | v1.6.2       | 日志 seq 列补全    | 为 log_items 补齐 seq 列，历史记录保持 NULL                             |
+| `013_V161CopyDiceMastersToNoticeIDsMigration` | v1.6.1 | 骰主通知补全       | 将旧骰主 ID 补入 noticeIds，仅开启 send 通知                            |
+| `014_V161LogUpdatedAtRepairMigration` | v1.6.1       | logs.updated_at 修复 | 按最后一条日志时间回填 updated_at，无条目时回退 created_at                |
 
 > ⚠️ ID 冲突提醒：`007_` 前缀同时被 `V150FixGroupInfoMigration` 与 `V151GORMCleanMigration` 使用，靠后缀字典序保证 V150 先于 V151 执行。代码内多处 `TODO` 标注“需要合理的生成逻辑”，建议后续改为更稳健的编号方案。
 
@@ -115,6 +119,7 @@
 - **幂等**：是。
 - **失败**：返回错误 → 中断升级。
 - **本轮加固**：重算前增加 `HasColumn(logs, size)` 判断——若 size 列不存在（V150 失误遗留），则**跳过重算**（不报错），改由 010 负责“建列+重算”。此前缺少此判断时，一旦“无 size 列 + 存在 log_id=0 数据”同时出现，本迁移会因 `UPDATE … SET size …` 列缺失而报错、阻塞后续迁移。
+- **本轮修复**：重算 size 使用 `UpdateColumn("size", ...)`，避免 GORM 自动把 `logs.updated_at` 刷成迁移执行时间。
 
 ### 008a — V160LogRawMsgIDIndexMigration（日志复合索引）
 
@@ -132,6 +137,35 @@
 - **幂等**：是（列存在则只重算；重算是覆盖式，重复执行结果一致）。
 - **失败**：返回错误 → 中断升级。
 - **设计说明**：用裸 `db.Exec` 而非 `db.Model().Update()`，以绕开 GORM “无 WHERE 的批量更新”保护——这里确实需要更新全部行；相关子查询与 008 重算口径完全一致，三种数据库均支持。
+
+### 011 — V161NoticeIDsMigration（通知目标规范化）
+
+- **触发条件**：`data/default/serve.yaml` 存在且包含 `noticeIds`。
+- **行为**：把旧通知目标规范化为可按 `only=` 分类筛选的形式，保留骰主列表用于权限判断。
+- **幂等**：是；已规范化的目标不会重复改写。
+
+### 012 — V162AddLogSeqMigration（日志 seq 列补全）
+
+- **触发条件**：存在 `log_items` 表且缺少 `seq` 列。
+- **行为**：为日志条目添加 `seq` 列，历史记录默认保持 NULL。
+- **幂等**：是（列已存在时跳过）。
+
+### 013 — V161CopyDiceMastersToNoticeIDsMigration（骰主通知补全）
+
+- **触发条件**：`serve.yaml` 存在且存在未出现在 `noticeIds` 的骰主 ID。
+- **行为**：将缺失骰主 ID 追加为 `<id>:only=send`，保留既有通知目标并去重。
+- **幂等**：是；用于补救已执行 011 的旧安装。
+
+### 014 — V161LogUpdatedAtRepairMigration（logs.updated_at 修复）
+
+- **触发条件**：存在 `logs` 表；否则跳过。
+- **行为**：
+  1. 要求 `log_items` 表存在，否则返回错误；
+  2. 将 `updated_at` 回填为该日志最后一条条目的 `MAX(time)`；
+  3. 无条目时回退到 `created_at`。
+- **幂等**：是（重复执行结果一致）。
+- **失败**：返回错误并中断升级。
+- **设计目的**：修复历史迁移更新日志元数据时错误刷新 `updated_at` 的问题。
 
 ---
 
