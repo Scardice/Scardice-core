@@ -3,6 +3,7 @@ package dice
 import (
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,6 +27,9 @@ type VersionInfo struct {
 	UpdaterURLPrefix        string `json:"updaterUrlPrefix"        yaml:"updaterUrlPrefix"`
 }
 
+// MaxTrayTooltipPrefixLength 自定义托盘提示前缀的最大字符数。
+const MaxTrayTooltipPrefixLength = 10
+
 type GroupNameCacheItem struct {
 	Name string
 	time int64
@@ -33,8 +37,11 @@ type GroupNameCacheItem struct {
 
 type DiceManager struct { //nolint:revive
 	Dice                 []*Dice
+	diceLock             sync.RWMutex
 	Operator             engine.DatabaseOperator
 	ServeAddress         string
+	trayTooltip          string
+	trayTooltipLock      sync.RWMutex
 	Help                 *HelpManager
 	IsHelpReloading      bool
 	helpReloadLock       sync.Mutex
@@ -95,6 +102,7 @@ type DiceManager struct { //nolint:revive
 type Configs struct { //nolint:revive
 	DiceConfigs       []BaseConfig `yaml:"diceConfigs"`
 	ServeAddress      string       `yaml:"serveAddress"`
+	TrayTooltip       string       `yaml:"trayTooltip"`
 	WebUIAddress      string       `yaml:"webUIAddress"`
 	HelpDocEngineType int          `yaml:"helpDocEngineType"`
 
@@ -215,6 +223,7 @@ func (dm *DiceManager) LoadDice() {
 	}
 
 	dm.ServeAddress = dc.ServeAddress
+	dm.SetTrayTooltip(dc.TrayTooltip)
 	dm.HelpDocEngineType = dc.HelpDocEngineType
 	dm.UIPasswordHash = dc.UIPasswordHash
 	dm.UIPasswordSalt = dc.UIPasswordSalt
@@ -243,13 +252,14 @@ func (dm *DiceManager) LoadDice() {
 		newDice := new(Dice)
 		newDice.BaseConfig = i
 		newDice.ContainerMode = dm.ContainerMode
-		dm.Dice = append(dm.Dice, newDice)
+		dm.appendDice(newDice)
 	}
 }
 
 func (dm *DiceManager) Save() {
 	var dc Configs
 	dc.ServeAddress = dm.ServeAddress
+	dc.TrayTooltip = dm.GetTrayTooltip()
 	dc.HelpDocEngineType = dm.HelpDocEngineType
 	dc.UIPasswordSalt = dm.UIPasswordSalt
 	dc.UIPasswordHash = dm.UIPasswordHash
@@ -278,6 +288,41 @@ func (dm *DiceManager) Save() {
 	if err == nil {
 		_ = utils.AtomicWriteFile("./data/dice.yaml", data, 0644)
 	}
+}
+
+func (dm *DiceManager) GetTrayTooltip() string {
+	dm.trayTooltipLock.RLock()
+	defer dm.trayTooltipLock.RUnlock()
+	return dm.trayTooltip
+}
+
+// NormalizeTrayTooltipPrefix 规范化托盘提示前缀，并按 Unicode 字符数限制长度。
+func NormalizeTrayTooltipPrefix(tooltip string) string {
+	tooltip = strings.TrimSpace(tooltip)
+	runes := []rune(tooltip)
+	if len(runes) > MaxTrayTooltipPrefixLength {
+		return string(runes[:MaxTrayTooltipPrefixLength])
+	}
+	return tooltip
+}
+
+func (dm *DiceManager) SetTrayTooltip(tooltip string) {
+	dm.trayTooltipLock.Lock()
+	defer dm.trayTooltipLock.Unlock()
+	dm.trayTooltip = NormalizeTrayTooltipPrefix(tooltip)
+}
+
+// DiceSnapshot 返回当前 Dice 实例切片的副本。
+func (dm *DiceManager) DiceSnapshot() []*Dice {
+	dm.diceLock.RLock()
+	defer dm.diceLock.RUnlock()
+	return append([]*Dice(nil), dm.Dice...)
+}
+
+func (dm *DiceManager) appendDice(instance *Dice) {
+	dm.diceLock.Lock()
+	defer dm.diceLock.Unlock()
+	dm.Dice = append(dm.Dice, instance)
 }
 
 func (dm *DiceManager) InitDice(writer *logger.UIWriter) {
@@ -372,6 +417,8 @@ func (dm *DiceManager) TryCreateDefault() {
 		dm.ServeAddress = "0.0.0.0:3211"
 	}
 
+	dm.diceLock.Lock()
+	defer dm.diceLock.Unlock()
 	if len(dm.Dice) == 0 {
 		defaultDice := new(Dice)
 		defaultDice.BaseConfig.Name = "default"
