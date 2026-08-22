@@ -121,3 +121,71 @@ func Test_V161NoticeTargetsMigration_runs_once_with_JSON_records(t *testing.T) {
 		t.Fatalf("migration records = %#v, want one successful 011 record", records)
 	}
 }
+
+func Test_V161CopyDiceMastersToNoticeIDs_appends_missing_masters_as_send_only(t *testing.T) {
+	// Given
+	configPath := filepath.Join(t.TempDir(), "serve.yaml")
+	original := []byte(`diceMasters:
+  - QQ:10001
+  - QQ:20002
+noticeIds:
+  - QQ:20002:only=ban,group
+commandPrefix:
+  - .
+`)
+	if err := os.WriteFile(configPath, original, 0o644); err != nil {
+		t.Fatalf("write legacy serve config: %v", err)
+	}
+
+	// When
+	added, err := V161CopyDiceMastersToNoticeIDs(configPath)
+	if err != nil {
+		t.Fatalf("copy dice masters: %v", err)
+	}
+
+	// Then
+	if added != 1 {
+		t.Fatalf("added = %d, want 1 (QQ:20002 already present, only QQ:10001 copied)", added)
+	}
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read migrated serve config: %v", err)
+	}
+	var got struct {
+		DiceMasters   []string `yaml:"diceMasters"`
+		NoticeIDs     []string `yaml:"noticeIds"`
+		CommandPrefix []string `yaml:"commandPrefix"`
+	}
+	if err := yaml.Unmarshal(content, &got); err != nil {
+		t.Fatalf("decode migrated serve config: %v", err)
+	}
+	wantNoticeIDs := []string{
+		"QQ:20002:only=ban,group",
+		"QQ:10001:only=send",
+	}
+	if !reflect.DeepEqual(got.NoticeIDs, wantNoticeIDs) {
+		t.Fatalf("noticeIds = %#v, want %#v", got.NoticeIDs, wantNoticeIDs)
+	}
+	if !reflect.DeepEqual(got.DiceMasters, []string{"QQ:10001", "QQ:20002"}) {
+		t.Fatalf("diceMasters = %#v, want permission-only list unchanged", got.DiceMasters)
+	}
+	if !reflect.DeepEqual(got.CommandPrefix, []string{"."}) {
+		t.Fatalf("commandPrefix = %#v, want unrelated config unchanged", got.CommandPrefix)
+	}
+}
+
+func Test_V161CopyDiceMastersToNoticeIDs_missing_config_is_noop(t *testing.T) {
+	// Given
+	configPath := filepath.Join(t.TempDir(), "serve.yaml")
+
+	// When
+	added, err := V161CopyDiceMastersToNoticeIDs(configPath)
+
+	// Then
+	if err != nil {
+		t.Fatalf("missing config migration error = %v, want nil", err)
+	}
+	if added != 0 {
+		t.Fatalf("added = %d, want 0 for missing config", added)
+	}
+}
