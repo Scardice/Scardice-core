@@ -83,7 +83,7 @@ func (m *onebotRecallTestEmitter) SetFriendAddRequest(_ context.Context, _ strin
 	return nil
 }
 
-func (m *onebotRecallTestEmitter) SetGroupAddRequest(_ context.Context, _ string, _ bool, _ string) error {
+func (m *onebotRecallTestEmitter) SetGroupAddRequest(_ context.Context, _ string, _ string, _ bool, _ string) error {
 	return nil
 }
 
