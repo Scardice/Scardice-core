@@ -2421,10 +2421,12 @@ func (d *Dice) loads() {
 func (d *Dice) loadIMSessionEndpoints(imSession *IMSession) bool {
 	if imSession == nil || imSession.EndPoints == nil {
 		d.ImSession.EndPoints = make([]*EndPointInfo, 0)
+		d.ImSession.RefreshEndPointsSnapshot()
 		return true
 	}
 
 	d.ImSession.EndPoints = imSession.EndPoints
+	d.ImSession.RefreshEndPointsSnapshot()
 	return false
 }
 
@@ -2597,6 +2599,7 @@ func (d *Dice) ApplyExtDefaultSettings() {
 }
 
 func (d *Dice) Save(isAuto bool) {
+	d.ImSession.RefreshEndPointsSnapshot()
 	saveStartTime := time.Now()
 
 	configStartTime := time.Now()
