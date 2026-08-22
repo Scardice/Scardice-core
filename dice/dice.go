@@ -416,6 +416,10 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 	// 在 JS 初始化重建规则模板注册表后恢复扩展包及其模板。
 	d.PackageSetup()
 
+	// 群组数据在扩展注册表就绪（内置/JS/扩展包）后加载，
+	// 反序列化时将 activatedExtList 解析为全局共享 ExtInfo 指针。
+	d.loadGroups()
+
 	for _, i := range d.ExtList {
 		if i.OnLoad != nil {
 			i.callWithJsCheck(d, func() {
