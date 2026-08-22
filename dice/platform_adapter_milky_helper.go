@@ -353,32 +353,49 @@ func ServeMilkyBuiltIn(d *Dice, ep *EndPointInfo) {
 	if pa.MilkyProcess != nil {
 		BuiltinMilkyClientKill(d, ep)
 	}
-	if pa.WsGateway == "" {
-		p, err := GetRandomFreePort()
-		if err != nil {
-			log.Errorf("获取随机端口失败: %s", err)
-			ep.State = 3
-			d.LastUpdatedTime = time.Now().Unix()
-			d.Save(false)
-			return
-		}
-		pa.WsGateway = fmt.Sprintf("ws://127.0.0.1:%d/event", p)
-		pa.RestGateway = fmt.Sprintf("http://127.0.0.1:%d/api", p)
-		// 生成配置写入文件
-		accessToken := uuid.NewString()
-		pa.Token = accessToken
-		c := GenerateMilkyConfig(p, SealSignV3Url, accessToken, ep)
-		err = utils.AtomicWriteFile(configFilePath, c, 0o644)
-		if err != nil {
-			log.Errorf("写入 Milky 配置文件失败: %s", err)
-		}
+	// 临时监听器在子进程绑定前已释放，重登时必须重新申请端口，
+	// 否则旧端口可能已被其他进程占用。
+	port, err := GetRandomFreePort()
+	if err != nil {
+		log.Errorf("获取随机端口失败: %s", err)
+		ep.State = 3
+		d.LastUpdatedTime = time.Now().Unix()
+		d.Save(false)
+		return
 	}
+	wsGateway := fmt.Sprintf("ws://127.0.0.1:%d/event", port)
+	restGateway := fmt.Sprintf("http://127.0.0.1:%d/api", port)
+	accessToken := pa.Token
+	if accessToken == "" {
+		accessToken = uuid.NewString()
+	}
+	config := GenerateMilkyConfig(port, SealSignV3Url, accessToken, ep)
+	if len(config) == 0 {
+		log.Errorf("不支持的内置 Milky 模式: %s", pa.BuiltInMode)
+		ep.State = 3
+		d.LastUpdatedTime = time.Now().Unix()
+		d.Save(false)
+		return
+	}
+	if err := utils.AtomicWriteFile(configFilePath, config, 0o644); err != nil {
+		log.Errorf("写入 Milky 配置文件失败: %s", err)
+		ep.State = 3
+		d.LastUpdatedTime = time.Now().Unix()
+		d.Save(false)
+		return
+	}
+	pa.WsGateway = wsGateway
+	pa.RestGateway = restGateway
+	pa.Token = accessToken
 	command := fmt.Sprintf(`"%s"`, milkyExePath)
 	p := procs.NewProcess(command)
 	p.Dir = workDir
 	p.Env = []string{
 		fmt.Sprintf("APP_LAUNCHER_SIG=%s", BuildSignature(uint64(uin))),
 	}
+	// OutputHandler 可能在 Start 返回前收到二维码过期信号；
+	// 进程注册完成前不能调用停止逻辑。
+	processRegistered := make(chan struct{})
 	chQrCode := make(chan int, 1)
 	qrSignalCalled := atomic.Bool{}
 	qrSignalCalled.Store(false)
@@ -418,6 +435,9 @@ func ServeMilkyBuiltIn(d *Dice, ep *EndPointInfo) {
 		loginStateMu.Unlock()
 		d.Save(false)
 		log.Infof("Milky %s，已禁用账号：%s", message, ep.UserID)
+		if state == MilkyLoginStateCodeExpired {
+			<-processRegistered
+		}
 		BuiltinMilkyClientKill(d, ep)
 	}
 	startQrTimeout := func() {
@@ -502,19 +522,26 @@ func ServeMilkyBuiltIn(d *Dice, ep *EndPointInfo) {
 			}
 		}()
 
-		conn.MilkyProcess = p
-		// processStartTime := time.Now().Unix()
 		errRun := p.Start()
-
-		if errRun == nil {
-			if d.Parent.progressExitGroupWin != 0 && p.Cmd != nil {
-				errAdd := d.Parent.progressExitGroupWin.AddProcess(p.Cmd.Process)
-				if errAdd != nil {
-					log.Warn("添加到进程组失败，若主进程崩溃，Milky 进程可能需要手动结束")
-				}
-			}
-			errRun = p.Wait() //nolint:ineffassign
+		if errRun != nil {
+			log.Info("Milky 进程启动失败: ", errRun)
+			ep.State = 3
+			d.LastUpdatedTime = time.Now().Unix()
+			d.Save(false)
+			close(processRegistered)
+			return
 		}
+
+		conn.MilkyProcess = p
+		close(processRegistered)
+
+		if d.Parent.progressExitGroupWin != 0 && p.Cmd != nil {
+			errAdd := d.Parent.progressExitGroupWin.AddProcess(p.Cmd.Process)
+			if errAdd != nil {
+				log.Warn("添加到进程组失败，若主进程崩溃，Milky 进程可能需要手动结束")
+			}
+		}
+		errRun = p.Wait() //nolint:ineffassign
 
 		if errRun != nil {
 			log.Info("Milky 进程异常退出: ", errRun)
