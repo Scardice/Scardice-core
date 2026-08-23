@@ -3,7 +3,7 @@ package dice
 import (
 	"testing"
 
-	wr "github.com/mroth/weightedrand"
+	wr "github.com/mroth/weightedrand/v3"
 )
 
 func TestExtractWeight(t *testing.T) {
@@ -60,7 +60,7 @@ func TestDeckPoolPickWithNonPositiveWeightEntries(t *testing.T) {
 	if randomPool == nil {
 		t.Fatal("random pool should not be nil")
 	} else {
-		if got := randomPool.Pick().(string); got != "ok" {
+		if got := randomPool.Pick(); got != "ok" {
 			t.Fatalf("unexpected random pick: got=%q want=%q", got, "ok")
 		}
 	}
@@ -78,7 +78,7 @@ func TestDeckPoolPickWithNonPositiveWeightEntries(t *testing.T) {
 func TestBuildNormalizedWeightedChoices(t *testing.T) {
 	t.Parallel()
 
-	toWeights := func(choices []wr.Choice) []uint {
+	toWeights := func(choices []wr.Choice[string, uint]) []uint {
 		weights := make([]uint, 0, len(choices))
 		for _, c := range choices {
 			weights = append(weights, c.Weight)

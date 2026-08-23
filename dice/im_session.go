@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
+	randv2 "math/rand/v2"
 	"regexp"
 	"runtime/debug"
 	"sort"
@@ -922,10 +922,13 @@ type MsgContext struct {
 	SpamCheckedGroup  bool
 	SpamCheckedPerson bool
 
-	splitKeyMu sync.RWMutex
-	splitKey   string
-	vm         *ds.Context
-	_v1Rand    *rand2.PCGSource
+	splitKeyMu  sync.RWMutex
+	splitKey    string
+	vm          *ds.Context
+	_v1Rand     ds.DiceSource
+	diceRandSrc ds.DiceSource
+	chooserRand *randv2.Rand
+	chooserSrc  ds.DiceSource
 }
 
 func (ctx *MsgContext) SetCommandReplied(replied bool) {
@@ -2145,7 +2148,7 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 				msgCtx.Notice(hint, NoticeTypeInactive)
 			}
 			// 生成一个随机值（8~11秒随机）
-			randomSleep := time.Duration(rand.Intn(3000)+8000) * time.Millisecond
+			randomSleep := time.Duration(randv2.IntN(3000)+8000) * time.Millisecond
 			logger.M().Infof("退群等待，等待 %f 秒后继续", randomSleep.Seconds())
 			time.Sleep(randomSleep)
 		}
@@ -3777,6 +3780,9 @@ func (ctx *MsgContext) ShallowCopy() *MsgContext {
 		SpamCheckedGroup:    ctx.SpamCheckedGroup,
 		SpamCheckedPerson:   ctx.SpamCheckedPerson,
 		vm:                  ctx.vm,
+		diceRandSrc:         ctx.diceRandSrc,
+		chooserRand:         ctx.chooserRand,
+		chooserSrc:          ctx.chooserSrc,
 		_v1Rand:             ctx._v1Rand,
 	}
 	copyCtx.SetSplitKey(ctx.getSplitKey())

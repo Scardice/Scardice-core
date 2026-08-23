@@ -18,8 +18,8 @@ github.com/PaienNate/pineutil v1.1.1 h1:Qt1OWuU2eXgRR/TryI9im9a2/Bl8kLzCdURn+Z6U
 github.com/PaienNate/pineutil v1.1.1/go.mod h1:8SL3Atzmso0aDXyCX1w7HDyEXT5LIG1MIPhHabtEWFE=
 github.com/RoaringBitmap/roaring/v2 v2.14.5 h1:ckd0o545JqDPeVJDgeFoaM21eBixUnlWfYgjE5VnyWw=
 github.com/RoaringBitmap/roaring/v2 v2.14.5/go.mod h1:eq4wdNXxtJIS/oikeCzdX1rBzek7ANzbth041hrU8Q4=
-github.com/Scardice/dicescript v0.0.0-20260308044903-97cde91a0493 h1:SVWSJxAEjxZeNF+FhxJqbhvkWROS0Pb7hHrppW8ktu4=
-github.com/Scardice/dicescript v0.0.0-20260308044903-97cde91a0493/go.mod h1:uof752qJvEQ4Kze+NVag+RKGgj5C4K3kMHoK3e2vOLg=
+github.com/Scardice/dicescript v0.0.0-20260823043109-d47a01e66db9 h1:UusfR5+8gLMy8OSwBTL/X2uf5SL7asrnpHGrDc8sdK4=
+github.com/Scardice/dicescript v0.0.0-20260823043109-d47a01e66db9/go.mod h1:cjBy9hhhUWy8A3LT8OOu9TkkLebx31hrkxv0KCbOve0=
 github.com/ShiraazMoollatjie/goluhn v0.0.0-20211017190329-0d86158c056a h1:NPnGVqpua4c1iEFVdxnBJA9viP5bo2Zp2jfflbcjdto=
 github.com/ShiraazMoollatjie/goluhn v0.0.0-20211017190329-0d86158c056a/go.mod h1:5LI6VqIHoGmWsR0EJLbct5bBrtM/0pTonaAyGKmFk9U=
 github.com/Szzrain/DingTalk-go v0.0.8-alpha h1:mSR/ORDDjtndoR12WrEdd3hdxxXXm9VMQ/r75NJkkkE=
@@ -116,6 +116,8 @@ github.com/elazarl/goproxy v0.0.0-20230808193330-2592e75ae04a/go.mod h1:Ro8st/El
 github.com/elazarl/goproxy/ext v0.0.0-20190711103511-473e67f1d7d2/go.mod h1:gNh8nYJoAm43RfaxurUnxr+N1PwuFV3ZMl/efxlIlY8=
 github.com/elazarl/goproxy/ext v0.0.0-20230808193330-2592e75ae04a h1:6hp3+W5oJSkbk/m2XquFdhih2H4wxxR0Nl6GfPL8kss=
 github.com/elazarl/goproxy/ext v0.0.0-20230808193330-2592e75ae04a/go.mod h1:gNh8nYJoAm43RfaxurUnxr+N1PwuFV3ZMl/efxlIlY8=
+github.com/emmansun/gmsm v0.44.1 h1:zDTkdtLWFG0vCbhPV+k9pte14tix/eK71At9Iai9fP4=
+github.com/emmansun/gmsm v0.44.1/go.mod h1:p6RIUta0/KboFHrOxr1x8q+pd8RZtdaTO7XNp0RmMQM=
 github.com/esiqveland/notify v0.13.3 h1:QCMw6o1n+6rl+oLUfg8P1IIDSFsDEb2WlXvVvIJbI/o=
 github.com/esiqveland/notify v0.13.3/go.mod h1:hesw/IRYTO0x99u1JPweAl4+5mwXJibQVUcP0Iu5ORE=
 github.com/evanw/esbuild v0.27.1 h1:SkYgb1wrwJkJYwBp5hjmQGm3riUHbCdfViyEvjAA/KA=
@@ -407,8 +409,8 @@ github.com/monaco-io/request v1.0.16 h1:3jpKXaP5urKJTl2b2ZgVtWPQTRxMP5b9tSe/qabs
 github.com/monaco-io/request v1.0.16/go.mod h1:t0XPCmOgHf/hZ5MUSajwlFE/Hir2o/4N9hb/vgfPT1A=
 github.com/mozillazg/go-pinyin v0.21.0 h1:Wo8/NT45z7P3er/9YSLHA3/kjZzbLz5hR7i+jGeIGao=
 github.com/mozillazg/go-pinyin v0.21.0/go.mod h1:iR4EnMMRXkfpFVV5FMi4FNB6wGq9NV6uDWbUuPhP4Yc=
-github.com/mroth/weightedrand v1.0.0 h1:V8JeHChvl2MP1sAoXq4brElOcza+jxLkRuwvtQu8L3E=
-github.com/mroth/weightedrand v1.0.0/go.mod h1:3p2SIcC8al1YMzGhAIoXD+r9olo/g/cdJgAD905gyNE=
+github.com/mroth/weightedrand/v3 v3.0.0 h1:FPPz/Xpri6qOzZTj8gEA1i6YBSlwLjkDQ+WaZpNHiiI=
+github.com/mroth/weightedrand/v3 v3.0.0/go.mod h1:Qfpt3At9/pYtQOzy9c2iHVWiHBPL+gvMY7mIN5WRlGg=
 github.com/mschoch/smat v0.2.0 h1:8imxQsjDm8yFEAVBe7azKmKSgzSkZXDuKkSq9374khM=
 github.com/mschoch/smat v0.2.0/go.mod h1:kc9mz7DoBKqDyiRL7VZN8KvXQMWeTaVnttLRXOlotKw=
 github.com/ncruces/go-sqlite3 v0.32.0 h1:hNBUXp88LrfQCsuyXLqWTbTUG35sUuktDsqhhgHvU20=
@@ -506,6 +508,8 @@ github.com/shopspring/decimal v0.0.0-20180709203117-cd690d0c9e24/go.mod h1:M+9Nz
 github.com/shopspring/decimal v0.0.0-20200227202807-02e2044944cc/go.mod h1:DKyhrW/HYNuLGql+MJL6WCR6knT2jwCFRcu2hWCYk4o=
 github.com/sirupsen/logrus v1.4.1/go.mod h1:ni0Sbl8bgC9z8RoU9G6nDWqqs/fq4eDPysMBDgk/93Q=
 github.com/sirupsen/logrus v1.4.2/go.mod h1:tLMulIdttU9McNUspp0xgXVQah82FyeX6MwdIuYE2rE=
+github.com/sixafter/aes-ctr-drbg v1.16.0 h1:i8m9jTzsc5GvHAC92jjkxHN77DWz9lkkAezKoSs/D3g=
+github.com/sixafter/aes-ctr-drbg v1.16.0/go.mod h1:t+tWe3uDNCitQbcmv8E0gcyrzZJU5UyluVW+6Xh6M2Y=
 github.com/skratchdot/open-golang v0.0.0-20200116055534-eef842397966/go.mod h1:sUM3LWHvSMaG192sy56D9F7CNvL7jUJVXoqM1QKLnog=
 github.com/slack-go/slack v0.17.3 h1:zV5qO3Q+WJAQ/XwbGfNFrRMaJ5T/naqaonyPV/1TP4g=
 github.com/slack-go/slack v0.17.3/go.mod h1:X+UqOufi3LYQHDnMG1vxf0J8asC6+WllXrVrhl8/Prk=
