@@ -11,29 +11,7 @@ func commandExtensionOrder(group *GroupInfo, d *Dice) []*ExtInfo {
 	}
 
 	activated := group.GetActivatedExtList(d)
-	if group.System == "" || d.GameSystemMap == nil {
-		return activated
-	}
-
-	tmpl, ok := d.GameSystemMap.Load(group.System)
-	if !ok || tmpl == nil || len(tmpl.SetConfig.RelatedExt) == 0 {
-		return activated
-	}
-
-	preferred := make(map[string]struct{})
-	graph := d.activeWithGraph()
-	for _, related := range tmpl.SetConfig.RelatedExt {
-		related = strings.TrimSpace(related)
-		if related == "" {
-			continue
-		}
-
-		name := d.ExtAliasToName(related)
-		preferred[strings.ToLower(name)] = struct{}{}
-		for _, chained := range collectChainedNames(d.Logger, graph, name, maxChainDepth) {
-			preferred[strings.ToLower(chained)] = struct{}{}
-		}
-	}
+	preferred := commandPreferredExtNames(group, d)
 	if len(preferred) == 0 {
 		return activated
 	}
@@ -56,4 +34,43 @@ func commandExtensionOrder(group *GroupInfo, d *Dice) []*ExtInfo {
 		}
 	}
 	return ordered
+}
+
+// commandPreferredExtNames 返回当前规则模板关联的扩展名集合（含链式关联，全部小写）。
+// 该集合即 commandExtensionOrder 提升到前列的那一层，同时用于指令候选择优。
+func commandPreferredExtNames(group *GroupInfo, d *Dice) map[string]struct{} {
+	if group == nil || d == nil || group.System == "" || d.GameSystemMap == nil {
+		return nil
+	}
+
+	tmpl, ok := d.GameSystemMap.Load(group.System)
+	if !ok || tmpl == nil {
+		return nil
+	}
+	relatedExt := tmpl.Commands.Set.RelatedExt
+	if len(relatedExt) == 0 {
+		relatedExt = tmpl.SetConfig.RelatedExt
+	}
+	if len(relatedExt) == 0 {
+		return nil
+	}
+
+	preferred := make(map[string]struct{}, len(relatedExt))
+	graph := d.activeWithGraph()
+	for _, related := range relatedExt {
+		related = strings.TrimSpace(related)
+		if related == "" {
+			continue
+		}
+
+		name := d.ExtAliasToName(related)
+		preferred[strings.ToLower(name)] = struct{}{}
+		for _, chained := range collectChainedNames(d.Logger, graph, name, maxChainDepth) {
+			preferred[strings.ToLower(chained)] = struct{}{}
+		}
+	}
+	if len(preferred) == 0 {
+		return nil
+	}
+	return preferred
 }
