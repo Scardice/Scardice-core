@@ -2516,6 +2516,37 @@ func selectRulePluginCandidateByGroupSystem(ctx *MsgContext, candidates []comman
 	return selected, true
 }
 
+// selectPreferredTierCandidate 在当前规则模板关联层级内择优（REFS #1769）。
+// 仅当恰有一个候选属于该层级时选中，避免同层歧义被静默裁决。
+func selectPreferredTierCandidate(ctx *MsgContext, candidates []commandSolveCandidate) (commandSolveCandidate, bool) {
+	var empty commandSolveCandidate
+	if ctx == nil || len(candidates) < 2 {
+		return empty, false
+	}
+
+	preferred := commandPreferredExtNames(ctx.Group, ctx.Dice)
+	if len(preferred) == 0 {
+		return empty, false
+	}
+
+	matchedCount := 0
+	selected := empty
+	for _, candidate := range candidates {
+		if candidate.Ext == nil {
+			continue
+		}
+		if !hasRuleIdentityIntersection(collectCandidateRuleIdentities(candidate), preferred) {
+			continue
+		}
+		selected = candidate
+		matchedCount++
+	}
+	if matchedCount != 1 {
+		return empty, false
+	}
+	return selected, true
+}
+
 func commandCandidateSourceName(candidate commandSolveCandidate) string {
 	if candidate.Ext == nil {
 		return "core"
@@ -3210,7 +3241,13 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 	}
 
 	if len(available) > 1 {
-		if selected, ok := selectRulePluginCandidateByGroupSystem(ctx, available); ok {
+		selected, ok := selectRulePluginCandidateByGroupSystem(ctx, available)
+		if !ok {
+			// 规则模板关联层级择优（REFS #1769）：当前规则关联的扩展优先于无关扩展，
+			// 仅在层级内唯一时选中，同层多个候选仍按冲突提示交由用户处置。
+			selected, ok = selectPreferredTierCandidate(ctx, available)
+		}
+		if ok {
 			available = []commandSolveCandidate{selected}
 		} else {
 			names := make([]string, 0, len(available))

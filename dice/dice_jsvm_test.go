@@ -2,6 +2,7 @@ package dice //nolint:testpackage
 
 import (
 	"testing"
+	"time"
 
 	"github.com/dop251/goja"
 	"go.uber.org/zap"
@@ -52,6 +53,20 @@ func TestJsInit_WhenExtLoopManagerNil_DoesNotPanic(t *testing.T) {
 			d.JsScriptCron = nil
 		}
 		if d.ExtLoopManager != nil {
+			// JsInit 在独立 goroutine 里调用 StartInForeground，running 标记要等该
+			// goroutine 实际跑起来才置位；若此时直接 Terminate，Stop 会因 running=false
+			// 立即返回，随后启动的循环便再也不会退出。先等循环执行一个任务，确保
+			// Terminate 能真正等待其结束。
+			if loop := d.ExtLoopManager.GetWebLoop(); loop != nil {
+				started := make(chan struct{})
+				if loop.RunOnLoop(func(*goja.Runtime) { close(started) }) {
+					select {
+					case <-started:
+					case <-time.After(10 * time.Second):
+						t.Error("JS 事件循环未在预期时间内启动")
+					}
+				}
+			}
 			d.ExtLoopManager.SetLoop(nil)
 		}
 	}()

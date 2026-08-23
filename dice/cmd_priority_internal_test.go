@@ -94,6 +94,117 @@ func TestCommandExtensionOrder(t *testing.T) {
 	}
 }
 
+func TestCommandPriorityFollowsSelectedGameSystem(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		system        string
+		relatedExt    []string
+		activated     []string
+		command       string
+		wantExtension string
+	}{
+		{
+			name:          "coc ra wins over cpr",
+			system:        "coc7",
+			relatedExt:    []string{"coc7"},
+			activated:     []string{"cpr", "coc7", "dnd5e"},
+			command:       "ra",
+			wantExtension: "coc7",
+		},
+		{
+			name:          "cpr ra wins inside cpr tier",
+			system:        "cpr",
+			relatedExt:    []string{"coc7", "cpr"},
+			activated:     []string{"cpr", "coc7", "dnd5e"},
+			command:       "ra",
+			wantExtension: "cpr",
+		},
+		{
+			name:          "dnd st wins over generic coc st",
+			system:        "dnd5e",
+			relatedExt:    []string{"dnd5e"},
+			activated:     []string{"coc7", "dnd5e", "cpr"},
+			command:       "st",
+			wantExtension: "dnd5e",
+		},
+		{
+			name:          "cpr falls back to generic coc st in its tier",
+			system:        "cpr",
+			relatedExt:    []string{"coc7", "cpr"},
+			activated:     []string{"dnd5e", "cpr", "coc7"},
+			command:       "st",
+			wantExtension: "coc7",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			calls := map[string]int{}
+			exts := make([]*ExtInfo, 0, 3)
+			for _, name := range []string{"coc7", "dnd5e", "cpr"} {
+				extName := name
+				cmdMap := CmdMapCls{}
+				if tt.command != "st" || name != "cpr" {
+					cmdMap[tt.command] = &CmdItemInfo{
+						Name: tt.command,
+						Solve: func(_ *MsgContext, _ *Message, _ *CmdArgs) CmdExecuteResult {
+							calls[extName]++
+							return CmdExecuteResult{Matched: true, Solved: true}
+						},
+					}
+				}
+				exts = append(exts, &ExtInfo{
+					Name:           name,
+					CmdMap:         cmdMap,
+					DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
+				})
+			}
+
+			d := newTestDice(exts)
+			d.CmdMap = CmdMapCls{}
+			// 真实运行期三套规则模板都会注册，仅当前规则由 group.System 选定。
+			for _, name := range []string{"coc7", "dnd5e", "cpr"} {
+				if name == tt.system {
+					addTestGameSystem(d, name, tt.relatedExt...)
+					continue
+				}
+				addTestGameSystem(d, name, name)
+			}
+			group := newTestGroupInfo()
+			activated := make([]*ExtInfo, 0, len(tt.activated))
+			for _, name := range tt.activated {
+				activated = append(activated, d.ExtFind(name, false))
+			}
+			group.SetActivatedExtList(activated, d)
+			group.Active = true
+			group.System = tt.system
+			session := &IMSession{Parent: d}
+			ctx := &MsgContext{
+				Dice:      d,
+				Session:   session,
+				Group:     group,
+				IsPrivate: true,
+			}
+
+			if session.commandSolve(ctx, &Message{}, &CmdArgs{Command: tt.command}).Status != commandSolveSolved {
+				t.Fatal("expected command to be solved")
+			}
+			if calls[tt.wantExtension] != 1 {
+				t.Fatalf("calls = %v, want only %s", calls, tt.wantExtension)
+			}
+			for name, count := range calls {
+				if name != tt.wantExtension && count != 0 {
+					t.Fatalf("calls = %v, unexpected execution by %s", calls, name)
+				}
+			}
+		})
+	}
+}
+
 func TestCommandPrioritySurvivesGroupReload(t *testing.T) {
 	t.Parallel()
 
