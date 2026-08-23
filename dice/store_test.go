@@ -1,7 +1,6 @@
 package dice //nolint:testpackage
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -368,7 +367,7 @@ func TestStorePackageFilesAndPreviewProxy(t *testing.T) {
 		t.Fatalf("files = %#v", files)
 	}
 
-	preview, err := manager.StorePreviewPackageFile(context.Background(), "alice", "demo", "1.2.3", "assets/icon.png")
+	preview, err := manager.StorePreviewPackageFile(t.Context(), "alice", "demo", "1.2.3", "assets/icon.png")
 	if err != nil {
 		t.Fatalf("StorePreviewPackageFile() error = %v", err)
 	}
@@ -510,7 +509,7 @@ version = "1.2.3"
 
 	withOfficialStoreBackendBaseURL(t, server.URL)
 	manager := NewStoreManager(&Dice{})
-	manifest, err := manager.StoreQueryPackageManifest(context.Background(), "alice/demo", "1.2.3")
+	manifest, err := manager.StoreQueryPackageManifest(t.Context(), "alice/demo", "1.2.3")
 	if err != nil {
 		t.Fatalf("StoreQueryPackageManifest() error = %v", err)
 	}
@@ -800,7 +799,7 @@ func TestSanitizeStorePackageMarksCanonicalFields(t *testing.T) {
 
 func TestStoreQueryPageRejectsOversizedPageBeforeBackendRequest(t *testing.T) {
 	manager := &StoreManager{}
-	_, err := manager.StoreQueryPageContext(context.Background(), StoreQueryPageParams{PageSize: maxStorePageSize + 1})
+	_, err := manager.StoreQueryPageContext(t.Context(), StoreQueryPageParams{PageSize: maxStorePageSize + 1})
 	if err == nil || !strings.Contains(err.Error(), "pageSize") {
 		t.Fatalf("StoreQueryPageContext() error = %v, want page size rejection", err)
 	}
