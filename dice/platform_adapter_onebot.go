@@ -147,7 +147,7 @@ func (p *PlatformAdapterOnebot) SendToGroup(ctx *MsgContext, groupID string, tex
 }
 
 type onebotForwardNodeData struct {
-	UserID   int64               `json:"user_id"`
+	UserID   string              `json:"user_id"`
 	Nickname string              `json:"nickname"`
 	Content  schema.MessageChain `json:"content"`
 }
@@ -169,7 +169,7 @@ func (p *PlatformAdapterOnebot) buildForwardNodes(nodes []message.ForwardNode) (
 			return nil, false
 		}
 		ret = append(ret, onebotForwardNode{Type: "node", Data: onebotForwardNodeData{
-			UserID: userID, Nickname: node.SenderName, Content: content,
+			UserID: strconv.FormatInt(userID, 10), Nickname: node.SenderName, Content: content,
 		}})
 	}
 	return ret, len(ret) > 0

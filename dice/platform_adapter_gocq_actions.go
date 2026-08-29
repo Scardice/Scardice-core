@@ -342,7 +342,7 @@ func (pa *PlatformAdapterGocq) SendToGroup(ctx *MsgContext, groupID string, text
 type gocqForwardNode struct {
 	Type string `json:"type"`
 	Data struct {
-		UserID   int64         `json:"user_id"`
+		UserID   string        `json:"user_id"`
 		Nickname string        `json:"nickname"`
 		Content  []interface{} `json:"content"`
 	} `json:"data"`
@@ -360,7 +360,7 @@ func buildGocqForwardNodes(nodes []message.ForwardNode) []gocqForwardNode {
 			continue
 		}
 		n := gocqForwardNode{Type: "node"}
-		n.Data.UserID = userID
+		n.Data.UserID = strconv.FormatInt(userID, 10)
 		n.Data.Nickname = node.SenderName
 		n.Data.Content = content
 		ret = append(ret, n)
