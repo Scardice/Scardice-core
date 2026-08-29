@@ -1,6 +1,8 @@
 package dice
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -221,6 +223,9 @@ func (pa *PlatformAdapterMilky) Serve() int {
 					msg.Segment = append(msg.Segment, &message.ReplyElement{
 						ReplySeq: strconv.FormatInt(seg.MessageSeq, 10),
 					})
+				case *milky.ForwardElement:
+					forward := pa.loadMilkyForward(seg.ForwardID, 0)
+					msg.Segment = append(msg.Segment, forward)
 				default:
 					log.Debugf("Unknown segment type: %T", segment)
 				}
@@ -454,6 +459,89 @@ func (pa *PlatformAdapterMilky) Serve() int {
 	d.LastUpdatedTime = time.Now().Unix()
 	d.Save(false)
 	return 0
+}
+
+func (pa *PlatformAdapterMilky) convertMilkyReceivedSegments(segments []milky.IMessageElement, depth int) []message.IMessageElement {
+	ret := make([]message.IMessageElement, 0, len(segments))
+	for _, segment := range segments {
+		switch seg := segment.(type) {
+		case *milky.TextElement:
+			ret = append(ret, &message.TextElement{Content: seg.Text})
+		case *milky.ImageElement:
+			ret = append(ret, &message.ImageElement{URL: seg.TempURL})
+		case *milky.AtElement:
+			ret = append(ret, &message.AtElement{Target: strconv.FormatInt(seg.UserID, 10), IsRobot: isQQBotUIN(seg.UserID)})
+		case *milky.ReplyElement:
+			ret = append(ret, &message.ReplyElement{ReplySeq: strconv.FormatInt(seg.MessageSeq, 10)})
+		case *milky.ForwardElement:
+			ret = append(ret, pa.loadMilkyForward(seg.ForwardID, depth))
+		}
+	}
+	return ret
+}
+
+func (pa *PlatformAdapterMilky) loadMilkyForward(forwardID string, depth int) *message.ForwardElement {
+	ret := &message.ForwardElement{Kind: "forward", ForwardID: forwardID}
+	if depth >= maxForwardExpandDepth {
+		ret.LoadError = "forward nesting limit reached"
+		return ret
+	}
+	if pa == nil || pa.IntentSession == nil || forwardID == "" {
+		ret.LoadError = "Milky session or forward ID unavailable"
+		return ret
+	}
+	requestCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	raw, err := pa.IntentSession.Request("POST", milky.EndpointGetForwardedMessages, map[string]interface{}{"forward_id": forwardID}, milky.WithContext(requestCtx))
+	if err != nil {
+		ret.LoadError = err.Error()
+		return ret
+	}
+	var response struct {
+		Status  string `json:"status"`
+		RetCode int    `json:"retcode"`
+		Message string `json:"message"`
+		Data    struct {
+			Messages []struct {
+				MessageSeq int64           `json:"message_seq"`
+				SenderID   int64           `json:"sender_id"`
+				UserID     int64           `json:"user_id"`
+				SenderName string          `json:"sender_name"`
+				AvatarURL  string          `json:"avatar_url"`
+				Time       int64           `json:"time"`
+				Segments   json.RawMessage `json:"segments"`
+			} `json:"messages"`
+		} `json:"data"`
+	}
+	if err = json.Unmarshal(raw, &response); err != nil {
+		ret.LoadError = err.Error()
+		return ret
+	}
+	if response.RetCode != 0 || response.Status != "ok" {
+		ret.LoadError = response.Message
+		return ret
+	}
+	for index, node := range response.Data.Messages {
+		if index >= maxForwardNodeCount {
+			break
+		}
+		senderID := node.SenderID
+		if senderID == 0 {
+			senderID = node.UserID
+		}
+		segments, parseErr := milky.UnmarshalIMessageElements(node.Segments)
+		if parseErr != nil {
+			ret.LoadError = parseErr.Error()
+			continue
+		}
+		ret.Nodes = append(ret.Nodes, message.ForwardNode{
+			MessageID: strconv.FormatInt(node.MessageSeq, 10), SenderID: strconv.FormatInt(senderID, 10),
+			SenderName: node.SenderName, AvatarURL: node.AvatarURL, Time: node.Time,
+			Elements: pa.convertMilkyReceivedSegments(segments, depth+1),
+		})
+	}
+	ret.Loaded = true
+	return ret
 }
 
 func (pa *PlatformAdapterMilky) SetGroupAddRequest(groupId int64, invitationSeq int64, approve bool) {

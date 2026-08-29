@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -92,6 +93,7 @@ func (p *PlatformAdapterOnebot) onOnebotMessageEvent(ep *evsocket.EventPayload) 
 		p.logger.Errorf("收到消息但无法进行处理，原因为 %s", err)
 		return
 	}
+	p.expandOnebotForwards(msg)
 	session := p.EndPoint.Session
 	// 注册消息发送人的缓存，以兼容dice_manager
 	if msg.Sender.UserID != "" && msg.Sender.Nickname != "" {
@@ -706,7 +708,16 @@ func (msgQQ *MessageOBQQ) toStdMessage() *Message {
 	return msg
 }
 
+const (
+	maxForwardExpandDepth = 3
+	maxForwardNodeCount   = 100
+)
+
 func arrayByte2ScardiceMessage(log *zap.SugaredLogger, raw []byte) (*Message, error) {
+	return arrayByte2ScardiceMessageDepth(log, raw, 0)
+}
+
+func arrayByte2ScardiceMessageDepth(log *zap.SugaredLogger, raw []byte, depth int) (*Message, error) {
 	// 不合法的信息体
 	if !gjson.ValidBytes(raw) {
 		log.Warn("无法解析 onebot11 字段:", raw)
@@ -780,6 +791,28 @@ func arrayByte2ScardiceMessage(log *zap.SugaredLogger, raw []byte) (*Message, er
 			seg = append(seg, &message.ReplyElement{
 				ReplySeq: dataObj.Get("id").String(),
 			})
+		case "forward":
+			forward := &message.ForwardElement{
+				Kind:      "forward",
+				ForwardID: dataObj.Get("id").String(),
+				Title:     dataObj.Get("title").String(),
+				Summary:   dataObj.Get("summary").String(),
+			}
+			for _, preview := range dataObj.Get("preview").Array() {
+				forward.Preview = append(forward.Preview, preview.String())
+			}
+			if content := dataObj.Get("content"); content.Exists() && content.IsArray() && depth < maxForwardExpandDepth {
+				forward.Nodes = parseOnebotForwardNodes(log, content, depth+1)
+				forward.Loaded = true
+			} else if depth >= maxForwardExpandDepth {
+				forward.LoadError = "forward nesting limit reached"
+			}
+			seg = append(seg, forward)
+			if forward.ForwardID != "" {
+				_, _ = fmt.Fprintf(&cqMessage, "[CQ:forward,id=%s]", forward.ForwardID)
+			} else {
+				cqMessage.WriteString("[合并转发]")
+			}
 		default:
 			// 转换为CQ码
 			var params []string
@@ -800,6 +833,91 @@ func arrayByte2ScardiceMessage(log *zap.SugaredLogger, raw []byte) (*Message, er
 	// 获取Segment
 	m.Segment = seg
 	return m, nil
+}
+
+func parseOnebotForwardNodes(log *zap.SugaredLogger, raw gjson.Result, depth int) []message.ForwardNode {
+	items := raw.Array()
+	if len(items) > maxForwardNodeCount {
+		items = items[:maxForwardNodeCount]
+	}
+	ret := make([]message.ForwardNode, 0, len(items))
+	for _, item := range items {
+		data := item
+		if item.Get("type").String() == "node" {
+			data = item.Get("data")
+		}
+		content := data.Get("content")
+		if !content.Exists() {
+			content = data.Get("message")
+		}
+		var elements []message.IMessageElement
+		if content.IsArray() {
+			wrapped := `{"message":` + content.Raw + `}`
+			if parsed, err := arrayByte2ScardiceMessageDepth(log, []byte(wrapped), depth); err == nil {
+				elements = parsed.Segment
+			}
+		} else if content.String() != "" {
+			elements = message.ConvertStringMessage(content.String())
+		}
+		senderID := data.Get("user_id").String()
+		if senderID == "" {
+			senderID = data.Get("uin").String()
+		}
+		senderName := data.Get("nickname").String()
+		if senderName == "" {
+			senderName = data.Get("name").String()
+		}
+		if senderName == "" {
+			senderName = data.Get("sender.nickname").String()
+		}
+		if senderID == "" {
+			senderID = data.Get("sender.user_id").String()
+		}
+		ret = append(ret, message.ForwardNode{
+			MessageID: data.Get("message_id").String(), SenderID: senderID,
+			SenderName: senderName, Time: data.Get("time").Int(), Elements: elements,
+		})
+	}
+	return ret
+}
+
+func (p *PlatformAdapterOnebot) expandOnebotForwards(msg *Message) {
+	if p == nil || p.sendEmitter == nil || msg == nil {
+		return
+	}
+	for _, element := range msg.Segment {
+		forward, ok := element.(*message.ForwardElement)
+		if !ok || forward.Loaded || forward.ForwardID == "" {
+			continue
+		}
+		base := p.ctx
+		if base == nil {
+			base = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(base, 8*time.Second)
+		raw, err := p.sendEmitter.Raw(ctx, "get_forward_msg", struct {
+			ID string `json:"id"`
+		}{forward.ForwardID})
+		cancel()
+		if err != nil {
+			forward.LoadError = err.Error()
+			continue
+		}
+		parsed := gjson.ParseBytes(raw)
+		content := parsed.Get("data.message")
+		if !content.Exists() {
+			content = parsed.Get("data.messages")
+		}
+		if !content.Exists() {
+			content = parsed.Get("data.content")
+		}
+		if !content.Exists() || !content.IsArray() {
+			forward.LoadError = "get_forward_msg response contains no message array"
+			continue
+		}
+		forward.Nodes = parseOnebotForwardNodes(p.logger, content, 1)
+		forward.Loaded = true
+	}
 }
 
 // 将OB11的Array数据转换为string字符串 确实没在使用，但备份一下这个实用函数
