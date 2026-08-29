@@ -108,7 +108,7 @@ func TestOnebotForwardSendAndExpandProtocolPayloads(t *testing.T) {
 		Messages []struct {
 			Type string `json:"type"`
 			Data struct {
-				UserID   int64  `json:"user_id"`
+				UserID   string `json:"user_id"`
 				Nickname string `json:"nickname"`
 				Content  []struct {
 					Type string `json:"type"`
@@ -119,7 +119,7 @@ func TestOnebotForwardSendAndExpandProtocolPayloads(t *testing.T) {
 	if err = json.Unmarshal(payload, &sent); err != nil {
 		t.Fatal(err)
 	}
-	if sent.GroupID != 9000 || len(sent.Messages) != 1 || sent.Messages[0].Type != "node" || sent.Messages[0].Data.UserID != 4242 || sent.Messages[0].Data.Nickname != "SelfBot" || len(sent.Messages[0].Data.Content) != 1 || sent.Messages[0].Data.Content[0].Type != "text" {
+	if sent.GroupID != 9000 || len(sent.Messages) != 1 || sent.Messages[0].Type != "node" || sent.Messages[0].Data.UserID != "4242" || sent.Messages[0].Data.Nickname != "SelfBot" || len(sent.Messages[0].Data.Content) != 1 || sent.Messages[0].Data.Content[0].Type != "text" {
 		t.Fatalf("unexpected OneBot payload: %s", payload)
 	}
 
@@ -133,6 +133,30 @@ func TestOnebotForwardSendAndExpandProtocolPayloads(t *testing.T) {
 	ensureMessageTextFromSegments(msg)
 	if msg.Message == ".r 9d9" {
 		t.Fatalf("expanded command leaked into routing text")
+	}
+}
+
+func TestGocqForwardCustomNodeUsesOneBotStringUserID(t *testing.T) {
+	nodes := buildGocqForwardNodes([]message.ForwardNode{{
+		SenderID: "4242", SenderName: "SelfBot", Elements: message.ConvertStringMessage("hello"),
+	}})
+	if len(nodes) != 1 {
+		t.Fatalf("forward nodes = %#v", nodes)
+	}
+	payload, err := json.Marshal(nodes[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Data struct {
+			UserID string `json:"user_id"`
+		} `json:"data"`
+	}
+	if err = json.Unmarshal(payload, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire.Data.UserID != "4242" {
+		t.Fatalf("unexpected OneBot custom-node payload: %s", payload)
 	}
 }
 
@@ -176,6 +200,44 @@ func TestExpandedForwardCommandDoesNotReachExecuteNewCommandRouter(t *testing.T)
 	}
 	if endpoint.CmdExecutedNum != before {
 		t.Fatalf("command counter changed from %d to %d", before, endpoint.CmdExecutedNum)
+	}
+}
+
+func TestReplyForwardFallsBackToOneOrdinaryMessage(t *testing.T) {
+	adapter := newMockPlatformAdapter()
+	ctx := &MsgContext{EndPoint: &EndPointInfo{
+		EndPointInfoBase: EndPointInfoBase{Platform: "Discord", Nickname: "bot", UserID: "QQ:9"},
+		Adapter:          adapter,
+	}}
+	msg := &Message{MessageType: "group", GroupID: "Discord-Channel:1", Sender: SenderBase{UserID: "Discord:2"}}
+	nodes := []message.ForwardNode{
+		{Elements: message.ConvertStringMessage("first")},
+		{Elements: message.ConvertStringMessage("second")},
+	}
+	if !ReplyForward(ctx, msg, nodes) {
+		t.Fatal("fallback forward reply failed")
+	}
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	if len(adapter.groupMsgs) != 1 || adapter.groupMsgs[0] != "first\nsecond" {
+		t.Fatalf("fallback messages = %#v", adapter.groupMsgs)
+	}
+}
+
+func TestDiceScriptForwardFallbackIgnoresInternalSplit(t *testing.T) {
+	adapter := newMockPlatformAdapter()
+	ctx := &MsgContext{EndPoint: &EndPointInfo{
+		EndPointInfoBase: EndPointInfoBase{Platform: "KOOK"},
+		Adapter:          adapter,
+	}}
+	msg := &Message{MessageType: "group", GroupID: "KOOK-Channel:1"}
+	ctx.InitSplitKey()
+	inside := "first\n" + ctx.getSplitKey() + "\nsecond"
+	deliverReplyPlan(ctx, msg, ctx.wrapForward(inside), "", true)
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	if len(adapter.groupMsgs) != 1 || adapter.groupMsgs[0] != "first\n\nsecond" {
+		t.Fatalf("fallback messages = %#v", adapter.groupMsgs)
 	}
 }
 

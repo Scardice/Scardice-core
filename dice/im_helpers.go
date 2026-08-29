@@ -194,6 +194,21 @@ func ReplyForward(ctx *MsgContext, msg *Message, nodes []message.ForwardNode) bo
 	}
 	sender, ok := ctx.EndPoint.Adapter.(forwardMsgSender)
 	if !ok {
+		// Platforms such as Discord and Kook have no merged-forward primitive.
+		// Flatten all nodes into one ordinary message instead of dropping the
+		// reply or unexpectedly turning node boundaries into message splits.
+		text := forwardNodesToText(nodes)
+		if text == "" {
+			return false
+		}
+		if msg.MessageType == "group" {
+			ctx.EndPoint.Adapter.SendToGroup(ctx, msg.GroupID, text, "")
+			return true
+		}
+		if msg.MessageType == "private" {
+			ctx.EndPoint.Adapter.SendToPerson(ctx, msg.Sender.UserID, text, "")
+			return true
+		}
 		return false
 	}
 	if msg.MessageType == "group" {
@@ -545,8 +560,8 @@ func deliverReplyPlan(ctx *MsgContext, msg *Message, text string, flag string, g
 		return
 	}
 	for _, item := range ctx.compileReplyPlan(text) {
-		parts := ctx.SplitText(item.Text)
 		if item.Forward {
+			parts := ctx.SplitText(item.Text)
 			contents := make([]string, 0, len(parts))
 			for _, part := range parts {
 				if part = strings.TrimSpace(part); part != "" {
@@ -565,7 +580,21 @@ func deliverReplyPlan(ctx *MsgContext, msg *Message, text string, flag string, g
 				}
 				continue
 			}
+			// Unsupported platforms receive the whole block as one ordinary
+			// message. SPLIT only controls forward nodes, so remove its marker
+			// without splitting the fallback message.
+			fallbackText := strings.TrimSpace(strings.ReplaceAll(item.Text, ctx.getSplitKey(), ""))
+			if fallbackText == "" {
+				continue
+			}
+			if group {
+				ctx.EndPoint.Adapter.SendToGroup(ctx, msg.GroupID, fallbackText, flag)
+			} else {
+				ctx.EndPoint.Adapter.SendToPerson(ctx, msg.Sender.UserID, fallbackText, flag)
+			}
+			continue
 		}
+		parts := ctx.SplitText(item.Text)
 		for _, part := range parts {
 			part = strings.TrimSpace(part)
 			if part == "" {
