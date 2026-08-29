@@ -339,7 +339,36 @@ func (pa *PlatformAdapterGocq) SendToGroup(ctx *MsgContext, groupID string, text
 	}
 }
 
-func (pa *PlatformAdapterGocq) SendGroupForwardMsg(ctx *MsgContext, groupID string, nodes []forwardNode) bool {
+type gocqForwardNode struct {
+	Type string `json:"type"`
+	Data struct {
+		UserID   int64         `json:"user_id"`
+		Nickname string        `json:"nickname"`
+		Content  []interface{} `json:"content"`
+	} `json:"data"`
+}
+
+func buildGocqForwardNodes(nodes []message.ForwardNode) []gocqForwardNode {
+	ret := make([]gocqForwardNode, 0, len(nodes))
+	for _, node := range nodes {
+		userID, err := strconv.ParseInt(strings.TrimSpace(node.SenderID), 10, 64)
+		if err != nil || userID <= 0 {
+			continue
+		}
+		content := OneBot11CqMessageToArrayMessage(message.ConvertMessageElementsToString(node.Elements))
+		if len(content) == 0 {
+			continue
+		}
+		n := gocqForwardNode{Type: "node"}
+		n.Data.UserID = userID
+		n.Data.Nickname = node.SenderName
+		n.Data.Content = content
+		ret = append(ret, n)
+	}
+	return ret
+}
+
+func (pa *PlatformAdapterGocq) SendGroupForwardMsg(ctx *MsgContext, groupID string, nodes []message.ForwardNode) bool {
 	if groupID == "" || len(nodes) == 0 {
 		return false
 	}
@@ -352,9 +381,13 @@ func (pa *PlatformAdapterGocq) SendGroupForwardMsg(ctx *MsgContext, groupID stri
 		return false
 	}
 
+	wireNodes := buildGocqForwardNodes(nodes)
+	if len(wireNodes) == 0 {
+		return false
+	}
 	type sendGroupForwardParams struct {
-		GroupID  int64         `json:"group_id"`
-		Messages []forwardNode `json:"messages"`
+		GroupID  int64             `json:"group_id"`
+		Messages []gocqForwardNode `json:"messages"`
 	}
 
 	sendText := forwardNodesToText(nodes)
@@ -383,7 +416,7 @@ func (pa *PlatformAdapterGocq) SendGroupForwardMsg(ctx *MsgContext, groupID stri
 		Action: "send_group_forward_msg",
 		Params: sendGroupForwardParams{
 			GroupID:  rawGroupID,
-			Messages: nodes,
+			Messages: wireNodes,
 		},
 	})
 	if ctx != nil && ctx.EndPoint != nil && ctx.EndPoint.Platform == "QQ" {
@@ -393,7 +426,7 @@ func (pa *PlatformAdapterGocq) SendGroupForwardMsg(ctx *MsgContext, groupID stri
 	return true
 }
 
-func (pa *PlatformAdapterGocq) SendPrivateForwardMsg(ctx *MsgContext, userID string, nodes []forwardNode) bool {
+func (pa *PlatformAdapterGocq) SendPrivateForwardMsg(ctx *MsgContext, userID string, nodes []message.ForwardNode) bool {
 	if userID == "" || len(nodes) == 0 {
 		return false
 	}
@@ -402,9 +435,13 @@ func (pa *PlatformAdapterGocq) SendPrivateForwardMsg(ctx *MsgContext, userID str
 		return false
 	}
 
+	wireNodes := buildGocqForwardNodes(nodes)
+	if len(wireNodes) == 0 {
+		return false
+	}
 	type sendPrivateForwardParams struct {
-		UserID   int64         `json:"user_id"`
-		Messages []forwardNode `json:"messages"`
+		UserID   int64             `json:"user_id"`
+		Messages []gocqForwardNode `json:"messages"`
 	}
 
 	sendText := forwardNodesToText(nodes)
@@ -430,7 +467,7 @@ func (pa *PlatformAdapterGocq) SendPrivateForwardMsg(ctx *MsgContext, userID str
 		Action: "send_private_forward_msg",
 		Params: sendPrivateForwardParams{
 			UserID:   rawUserID,
-			Messages: nodes,
+			Messages: wireNodes,
 		},
 	})
 	if ctx != nil && ctx.EndPoint != nil && ctx.EndPoint.Platform == "QQ" {

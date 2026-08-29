@@ -29,7 +29,7 @@ type milkyForwardElement struct {
 type milkyForwardDelivery struct {
 	MessageType string
 	TargetID    string
-	Nodes       []forwardNode
+	Nodes       []message.ForwardNode
 	MessageSeq  int64
 }
 
@@ -55,31 +55,31 @@ func (element *milkyForwardElement) MarshalJSON() ([]byte, error) {
 	return data, nil
 }
 
-func buildMilkyForwardElement(nodes []forwardNode) (*milkyForwardElement, error) {
+func buildMilkyForwardElement(nodes []message.ForwardNode) (*milkyForwardElement, error) {
 	if len(nodes) == 0 {
 		return nil, errors.New("forward message has no nodes")
 	}
 
 	messages := make([]milkyOutgoingForwardedMessage, 0, len(nodes))
 	for index, node := range nodes {
-		userID, err := strconv.ParseInt(strings.TrimSpace(node.Data.Uin), 10, 64)
+		userID, err := strconv.ParseInt(strings.TrimSpace(node.SenderID), 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("forward node %d has invalid user ID %q: %w", index, node.Data.Uin, err)
+			return nil, fmt.Errorf("forward node %d has invalid user ID %q: %w", index, node.SenderID, err)
 		}
 		if userID <= 0 {
-			return nil, fmt.Errorf("forward node %d has invalid user ID %q", index, node.Data.Uin)
+			return nil, fmt.Errorf("forward node %d has invalid user ID %q", index, node.SenderID)
 		}
-		if strings.TrimSpace(node.Data.Content) == "" {
+		if len(node.Elements) == 0 {
 			return nil, fmt.Errorf("forward node %d has empty content", index)
 		}
 
-		segments := ParseMessageToMilky(message.ConvertStringMessage(node.Data.Content))
+		segments := ParseMessageToMilky(node.Elements)
 		if len(segments) == 0 {
 			return nil, fmt.Errorf("forward node %d has no supported message segments", index)
 		}
 		messages = append(messages, milkyOutgoingForwardedMessage{
 			UserID:     userID,
-			SenderName: node.Data.Name,
+			SenderName: node.SenderName,
 			Segments:   segments,
 		})
 	}
@@ -108,7 +108,7 @@ func (pa *PlatformAdapterMilky) recordForwardMessageSent(ctx *MsgContext, delive
 	pa.EndPoint.Session.OnMessageSend(ctx, msg, "")
 }
 
-func (pa *PlatformAdapterMilky) SendGroupForwardMsg(ctx *MsgContext, groupID string, nodes []forwardNode) bool {
+func (pa *PlatformAdapterMilky) SendGroupForwardMsg(ctx *MsgContext, groupID string, nodes []message.ForwardNode) bool {
 	log := zap.S().Named(logger.LogKeyAdapter)
 	if pa == nil || pa.IntentSession == nil {
 		log.Error("Failed to send Milky group forward message: session unavailable")
@@ -145,7 +145,7 @@ func (pa *PlatformAdapterMilky) SendGroupForwardMsg(ctx *MsgContext, groupID str
 	return true
 }
 
-func (pa *PlatformAdapterMilky) SendPrivateForwardMsg(ctx *MsgContext, userID string, nodes []forwardNode) bool {
+func (pa *PlatformAdapterMilky) SendPrivateForwardMsg(ctx *MsgContext, userID string, nodes []message.ForwardNode) bool {
 	log := zap.S().Named(logger.LogKeyAdapter)
 	if pa == nil || pa.IntentSession == nil {
 		log.Error("Failed to send Milky private forward message: session unavailable")

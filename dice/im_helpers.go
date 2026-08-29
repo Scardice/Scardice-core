@@ -14,6 +14,7 @@ import (
 	ds "github.com/sealdice/dicescript"
 
 	"Scardice-core/logger"
+	"Scardice-core/message"
 	"Scardice-core/utils/panicHandler"
 )
 
@@ -23,31 +24,17 @@ var (
 )
 
 type forwardMsgSender interface {
-	SendGroupForwardMsg(ctx *MsgContext, groupID string, nodes []forwardNode) bool
-	SendPrivateForwardMsg(ctx *MsgContext, userID string, nodes []forwardNode) bool
+	SendGroupForwardMsg(ctx *MsgContext, groupID string, nodes []message.ForwardNode) bool
+	SendPrivateForwardMsg(ctx *MsgContext, userID string, nodes []message.ForwardNode) bool
 }
 
-type forwardNodeData struct {
-	Name    string `json:"name"`
-	Uin     string `json:"uin"`
-	Content string `json:"content"`
-}
-
-type forwardNode struct {
-	Type string          `json:"type"`
-	Data forwardNodeData `json:"data"`
-}
-
-func buildForwardNodes(senderName string, senderUin string, title string, contents []string) []forwardNode {
-	nodes := make([]forwardNode, 0, len(contents)+1)
+func buildForwardNodes(senderName string, senderUin string, title string, contents []string) []message.ForwardNode {
+	nodes := make([]message.ForwardNode, 0, len(contents)+1)
 	if title != "" {
-		nodes = append(nodes, forwardNode{
-			Type: "node",
-			Data: forwardNodeData{
-				Name:    senderName,
-				Uin:     senderUin,
-				Content: title,
-			},
+		nodes = append(nodes, message.ForwardNode{
+			SenderName: senderName,
+			SenderID:   senderUin,
+			Elements:   message.ConvertStringMessage(title),
 		})
 	}
 
@@ -57,26 +44,20 @@ func buildForwardNodes(senderName string, senderUin string, title string, conten
 			continue
 		}
 
-		nodes = append(nodes, forwardNode{
-			Type: "node",
-			Data: forwardNodeData{
-				Name:    senderName,
-				Uin:     senderUin,
-				Content: c,
-			},
+		nodes = append(nodes, message.ForwardNode{
+			SenderName: senderName,
+			SenderID:   senderUin,
+			Elements:   message.ConvertStringMessage(c),
 		})
 	}
 	return nodes
 }
 
-func BuildForwardNodesFromContext(ctx *MsgContext, title string, contents []string) []forwardNode {
+func BuildForwardNodesFromContext(ctx *MsgContext, title string, contents []string) []message.ForwardNode {
 	if ctx == nil || ctx.EndPoint == nil || ctx.EndPoint.Adapter == nil {
 		return nil
 	}
 	name := ctx.EndPoint.Nickname
-	if diceName := strings.TrimSpace(DiceFormatTmpl(ctx, "核心:骰子名字")); diceName != "" {
-		name = diceName
-	}
 
 	var uin string
 	switch a := ctx.EndPoint.Adapter.(type) {
@@ -106,10 +87,10 @@ func BuildForwardNodesFromContext(ctx *MsgContext, title string, contents []stri
 	return buildForwardNodes(name, uin, title, contents)
 }
 
-func forwardNodesToText(nodes []forwardNode) string {
+func forwardNodesToText(nodes []message.ForwardNode) string {
 	parts := make([]string, 0, len(nodes))
 	for _, n := range nodes {
-		text := strings.TrimSpace(n.Data.Content)
+		text := strings.TrimSpace(message.ConvertMessageElementsToString(n.Elements))
 		if text != "" {
 			parts = append(parts, text)
 		}
@@ -192,6 +173,36 @@ func TryReplyToSenderMergedForward(ctx *MsgContext, msg *Message, title string, 
 	default:
 		return false
 	}
+}
+
+// ReplyForward lets extensions resend received structured nodes or construct
+// their own. Missing sender identity is normalized to the current endpoint.
+func ReplyForward(ctx *MsgContext, msg *Message, nodes []message.ForwardNode) bool {
+	if ctx == nil || msg == nil || ctx.EndPoint == nil || ctx.EndPoint.Adapter == nil || len(nodes) == 0 {
+		return false
+	}
+	for i := range nodes {
+		if nodes[i].SenderName == "" {
+			nodes[i].SenderName = ctx.EndPoint.Nickname
+		}
+		if nodes[i].SenderID == "" {
+			normalized := BuildForwardNodesFromContext(ctx, "", []string{"placeholder"})
+			if len(normalized) > 0 {
+				nodes[i].SenderID = normalized[0].SenderID
+			}
+		}
+	}
+	sender, ok := ctx.EndPoint.Adapter.(forwardMsgSender)
+	if !ok {
+		return false
+	}
+	if msg.MessageType == "group" {
+		return sender.SendGroupForwardMsg(ctx, msg.GroupID, nodes)
+	}
+	if msg.MessageType == "private" {
+		return sender.SendPrivateForwardMsg(ctx, msg.Sender.UserID, nodes)
+	}
+	return false
 }
 
 func IsCurGroupBotOnByID(session *IMSession, ep *EndPointInfo, messageType string, groupID string) bool {
@@ -414,11 +425,12 @@ func ReplyGroupRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 
 	d := ctx.Dice
 	if d != nil {
-		d.Logger.Infof("发给(群%s): %s", msg.GroupID, text)
+		visibleText := visibleReplyText(ctx, text)
+		d.Logger.Infof("发给(群%s): %s", msg.GroupID, visibleText)
 		// 敏感词拦截：回复（群）
 		if d.Config.EnableCensor && d.Config.CensorMode == OnlyOutputReply {
 			// 先拿掉余烬码和CQ码再检查敏感词
-			checkText := sealCodeRe.ReplaceAllString(text, "")
+			checkText := sealCodeRe.ReplaceAllString(visibleText, "")
 			checkText = cqCodeRe.ReplaceAllString(checkText, "")
 
 			hit, words, needToTerminate, _ := d.CensorMsg(ctx, msg, checkText, text)
@@ -460,13 +472,7 @@ func replyGroupRawNoCheck(ctx *MsgContext, msg *Message, text string, flag strin
 		atomic.StoreInt64(&ctx.Group.RecentDiceSendTime, time.Now().Unix())
 		ctx.Group.MarkDirty(ctx.Dice)
 	}
-	text = strings.TrimSpace(text)
-	for _, i := range ctx.SplitText(text) {
-		if ctx.EndPoint != nil && ctx.EndPoint.Platform == "QQ" {
-			doSleepQQ(ctx)
-		}
-		ctx.EndPoint.Adapter.SendToGroup(ctx, msg.GroupID, strings.TrimSpace(i), flag)
-	}
+	deliverReplyPlan(ctx, msg, strings.TrimSpace(text), flag, true)
 }
 
 func ReplyGroup(ctx *MsgContext, msg *Message, text string) {
@@ -489,11 +495,12 @@ func ReplyPersonRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 
 	d := ctx.Dice
 	if d != nil {
-		d.Logger.Infof("发给(帐号%s): %s", msg.Sender.UserID, text)
+		visibleText := visibleReplyText(ctx, text)
+		d.Logger.Infof("发给(帐号%s): %s", msg.Sender.UserID, visibleText)
 		// 敏感词拦截：回复（个人）
 		if d.Config.EnableCensor && d.Config.CensorMode == OnlyOutputReply {
 			// 先拿掉余烬码和CQ码再检查敏感词
-			checkText := sealCodeRe.ReplaceAllString(text, "")
+			checkText := sealCodeRe.ReplaceAllString(visibleText, "")
 			checkText = cqCodeRe.ReplaceAllString(checkText, "")
 
 			hit, words, needToTerminate, _ := d.CensorMsg(ctx, msg, checkText, text)
@@ -530,13 +537,61 @@ func replyPersonRawNoCheck(ctx *MsgContext, msg *Message, text string, flag stri
 	if lenWithoutBase64(text) > 15000 {
 		text = "要发送的文本过长"
 	}
-	text = strings.TrimSpace(text)
-	for _, i := range ctx.SplitText(text) {
-		if ctx.EndPoint != nil && ctx.EndPoint.Platform == "QQ" {
-			doSleepQQ(ctx)
-		}
-		ctx.EndPoint.Adapter.SendToPerson(ctx, msg.Sender.UserID, strings.TrimSpace(i), flag)
+	deliverReplyPlan(ctx, msg, strings.TrimSpace(text), flag, false)
+}
+
+func deliverReplyPlan(ctx *MsgContext, msg *Message, text string, flag string, group bool) {
+	if ctx == nil || ctx.EndPoint == nil || ctx.EndPoint.Adapter == nil {
+		return
 	}
+	for _, item := range ctx.compileReplyPlan(text) {
+		parts := ctx.SplitText(item.Text)
+		if item.Forward {
+			contents := make([]string, 0, len(parts))
+			for _, part := range parts {
+				if part = strings.TrimSpace(part); part != "" {
+					contents = append(contents, part)
+				}
+			}
+			if len(contents) == 0 {
+				continue
+			}
+			if sender, ok := ctx.EndPoint.Adapter.(forwardMsgSender); ok {
+				nodes := BuildForwardNodesFromContext(ctx, "", contents)
+				if group {
+					sender.SendGroupForwardMsg(ctx, msg.GroupID, nodes)
+				} else {
+					sender.SendPrivateForwardMsg(ctx, msg.Sender.UserID, nodes)
+				}
+				continue
+			}
+		}
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if ctx.EndPoint.Platform == "QQ" {
+				doSleepQQ(ctx)
+			}
+			if group {
+				ctx.EndPoint.Adapter.SendToGroup(ctx, msg.GroupID, part, flag)
+			} else {
+				ctx.EndPoint.Adapter.SendToPerson(ctx, msg.Sender.UserID, part, flag)
+			}
+		}
+	}
+}
+
+func visibleReplyText(ctx *MsgContext, text string) string {
+	if ctx == nil {
+		return text
+	}
+	var builder strings.Builder
+	for _, item := range ctx.compileReplyPlan(text) {
+		builder.WriteString(item.Text)
+	}
+	return builder.String()
 }
 
 // CrossMsgBySearch

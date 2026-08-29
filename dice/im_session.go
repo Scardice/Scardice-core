@@ -922,13 +922,15 @@ type MsgContext struct {
 	SpamCheckedGroup  bool
 	SpamCheckedPerson bool
 
-	splitKeyMu  sync.RWMutex
-	splitKey    string
-	vm          *ds.Context
-	_v1Rand     ds.DiceSource
-	diceRandSrc ds.DiceSource
-	chooserRand *randv2.Rand
-	chooserSrc  ds.DiceSource
+	splitKeyMu   sync.RWMutex
+	splitKey     string
+	forwardStart string
+	forwardEnd   string
+	vm           *ds.Context
+	_v1Rand      ds.DiceSource
+	diceRandSrc  ds.DiceSource
+	chooserRand  *randv2.Rand
+	chooserSrc   ds.DiceSource
 }
 
 func (ctx *MsgContext) SetCommandReplied(replied bool) {
@@ -3774,12 +3776,58 @@ func (ctx *MsgContext) InitSplitKey() {
 
 	s := base64.StdEncoding.EncodeToString(bArray)
 	ctx.splitKey = "###" + s + "###"
+	ctx.forwardStart = "\x1dFORWARD-BEGIN:" + s + "\x1d"
+	ctx.forwardEnd = "\x1dFORWARD-END:" + s + "\x1d"
 }
 
 func (ctx *MsgContext) SetSplitKey(key string) {
 	ctx.splitKeyMu.Lock()
 	ctx.splitKey = key
+	markerKey := strings.TrimSuffix(strings.TrimPrefix(key, "###"), "###")
+	ctx.forwardStart = "\x1dFORWARD-BEGIN:" + markerKey + "\x1d"
+	ctx.forwardEnd = "\x1dFORWARD-END:" + markerKey + "\x1d"
 	ctx.splitKeyMu.Unlock()
+}
+
+func (ctx *MsgContext) wrapForward(text string) string {
+	ctx.InitSplitKey()
+	ctx.splitKeyMu.RLock()
+	defer ctx.splitKeyMu.RUnlock()
+	return ctx.forwardStart + text + ctx.forwardEnd
+}
+
+type replyPlanItem struct {
+	Forward bool
+	Text    string
+}
+
+func (ctx *MsgContext) compileReplyPlan(text string) []replyPlanItem {
+	ctx.InitSplitKey()
+	ctx.splitKeyMu.RLock()
+	start, end := ctx.forwardStart, ctx.forwardEnd
+	ctx.splitKeyMu.RUnlock()
+	ret := make([]replyPlanItem, 0, 3)
+	for len(text) > 0 {
+		i := strings.Index(text, start)
+		if i < 0 {
+			if text != "" {
+				ret = append(ret, replyPlanItem{Text: text})
+			}
+			break
+		}
+		if i > 0 {
+			ret = append(ret, replyPlanItem{Text: text[:i]})
+		}
+		text = text[i+len(start):]
+		j := strings.Index(text, end)
+		if j < 0 {
+			ret = append(ret, replyPlanItem{Text: start + text})
+			break
+		}
+		ret = append(ret, replyPlanItem{Forward: true, Text: text[:j]})
+		text = text[j+len(end):]
+	}
+	return ret
 }
 
 func (ctx *MsgContext) getSplitKey() string {

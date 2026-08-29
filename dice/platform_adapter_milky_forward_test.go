@@ -10,6 +10,8 @@ import (
 
 	milky "github.com/Szzrain/Milky-go-sdk"
 	"go.uber.org/zap"
+
+	"Scardice-core/message"
 )
 
 type milkyForwardRequest struct {
@@ -126,9 +128,9 @@ func newMilkyForwardTestContext(session *milky.Session, onMessageSend func(*MsgC
 
 func Test_PlatformAdapterMilky_SendForwardMessage_preserves_ordered_nodes(t *testing.T) {
 	// Given
-	nodes := []forwardNode{
-		{Data: forwardNodeData{Uin: "10010", Name: "first", Content: "one"}},
-		{Data: forwardNodeData{Uin: "10011", Name: "second", Content: "two"}},
+	nodes := []message.ForwardNode{
+		{SenderID: "10010", SenderName: "first", Elements: message.ConvertStringMessage("one")},
+		{SenderID: "10011", SenderName: "second", Elements: message.ConvertStringMessage("two")},
 	}
 	tests := []struct {
 		name            string
@@ -191,14 +193,15 @@ func Test_PlatformAdapterMilky_SendForwardMessage_preserves_ordered_nodes(t *tes
 				t.Fatalf("forward node count = %d, want %d", len(messages), len(nodes))
 			}
 			for index, node := range messages {
-				if node.UserID != int64(10010+index) || node.SenderName != nodes[index].Data.Name {
-					t.Errorf("node %d sender = (%d, %q), want (%d, %q)", index, node.UserID, node.SenderName, 10010+index, nodes[index].Data.Name)
+				if node.UserID != int64(10010+index) || node.SenderName != nodes[index].SenderName {
+					t.Errorf("node %d sender = (%d, %q), want (%d, %q)", index, node.UserID, node.SenderName, 10010+index, nodes[index].SenderName)
 				}
 				if node.LegacyName != "" {
 					t.Errorf("node %d contains deprecated name field %q", index, node.LegacyName)
 				}
-				if len(node.Segments) != 1 || node.Segments[0].Type != string(milky.Text) || node.Segments[0].Data.Text != nodes[index].Data.Content {
-					t.Errorf("node %d segments = %#v, want text %q", index, node.Segments, nodes[index].Data.Content)
+				wantText := message.ConvertMessageElementsToString(nodes[index].Elements)
+				if len(node.Segments) != 1 || node.Segments[0].Type != string(milky.Text) || node.Segments[0].Data.Text != wantText {
+					t.Errorf("node %d segments = %#v, want text %q", index, node.Segments, wantText)
 				}
 			}
 			if hookCalls != 1 || hookMessage == nil {
@@ -213,7 +216,7 @@ func Test_PlatformAdapterMilky_SendForwardMessage_preserves_ordered_nodes(t *tes
 
 func Test_PlatformAdapterMilky_SendForwardMessage_returns_false_without_hook_on_failure(t *testing.T) {
 	// Given
-	validNodes := []forwardNode{{Data: forwardNodeData{Uin: "10010", Name: "sender", Content: "content"}}}
+	validNodes := []message.ForwardNode{{SenderID: "10010", SenderName: "sender", Elements: message.ConvertStringMessage("content")}}
 	session, _ := newMilkyForwardHarness(t, "forward rejected")
 	var hookCalls int
 	adapter, ctx := newMilkyForwardTestContext(session, func(_ *MsgContext, _ *Message, _ string) {
@@ -228,10 +231,10 @@ func Test_PlatformAdapterMilky_SendForwardMessage_returns_false_without_hook_on_
 		{name: "invalid group ID", send: func() bool { return adapter.SendGroupForwardMsg(ctx, "QQ-Group:invalid", validNodes) }},
 		{name: "invalid private ID", send: func() bool { return adapter.SendPrivateForwardMsg(ctx, "QQ:invalid", validNodes) }},
 		{name: "invalid node user ID", send: func() bool {
-			return adapter.SendGroupForwardMsg(ctx, "QQ-Group:20020", []forwardNode{{Data: forwardNodeData{Uin: "invalid", Name: "sender", Content: "content"}}})
+			return adapter.SendGroupForwardMsg(ctx, "QQ-Group:20020", []message.ForwardNode{{SenderID: "invalid", SenderName: "sender", Elements: message.ConvertStringMessage("content")}})
 		}},
 		{name: "empty node content", send: func() bool {
-			return adapter.SendGroupForwardMsg(ctx, "QQ-Group:20020", []forwardNode{{Data: forwardNodeData{Uin: "10010", Name: "sender"}}})
+			return adapter.SendGroupForwardMsg(ctx, "QQ-Group:20020", []message.ForwardNode{{SenderID: "10010", SenderName: "sender"}})
 		}},
 		{name: "missing session", send: func() bool {
 			return (&PlatformAdapterMilky{}).SendGroupForwardMsg(ctx, "QQ-Group:20020", validNodes)

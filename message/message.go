@@ -118,6 +118,7 @@ const (
 	Face                       // 表情
 	Poke                       // 戳一戳
 	Recall                     // 撤回控制动作
+	Forward                    // 合并转发
 	Default = -1               // 一个兜底的情况，兜底所有不认识的类型
 )
 
@@ -128,15 +129,16 @@ type ElementFactory func() IMessageElement
 
 // elementRegistry 全局注册表，存储类型名到工厂函数的映射
 var elementRegistry = map[string]ElementFactory{
-	"at":     func() IMessageElement { return &AtElement{} },
-	"tts":    func() IMessageElement { return &TTSElement{} },
-	"reply":  func() IMessageElement { return &ReplyElement{} },
-	"poke":   func() IMessageElement { return &PokeElement{} },
-	"recall": func() IMessageElement { return &RecallElement{} },
-	"face":   func() IMessageElement { return &FaceElement{} },
-	"file":   func() IMessageElement { return &FileElement{} },
-	"image":  func() IMessageElement { return &ImageElement{} },
-	"record": func() IMessageElement { return &RecordElement{} },
+	"at":      func() IMessageElement { return &AtElement{} },
+	"tts":     func() IMessageElement { return &TTSElement{} },
+	"reply":   func() IMessageElement { return &ReplyElement{} },
+	"poke":    func() IMessageElement { return &PokeElement{} },
+	"recall":  func() IMessageElement { return &RecallElement{} },
+	"face":    func() IMessageElement { return &FaceElement{} },
+	"file":    func() IMessageElement { return &FileElement{} },
+	"image":   func() IMessageElement { return &ImageElement{} },
+	"record":  func() IMessageElement { return &RecordElement{} },
+	"forward": func() IMessageElement { return &ForwardElement{} },
 }
 
 // GetElementFactory 获取指定类型的元素工厂函数
@@ -221,6 +223,43 @@ type ReplyElement struct {
 	Sender   string            `jsbind:"sender"`   // 回复的目标消息发送者ID
 	GroupID  string            `jsbind:"groupID"`  // 回复群聊消息时的群号
 	Elements []IMessageElement `jsbind:"elements"` // 回复的消息内容
+}
+
+// ForwardNode is one visible chat record inside a merged-forward message.
+// SenderID is optional because Milky does not expose it for received nodes.
+type ForwardNode struct {
+	MessageID  string            `jsbind:"messageId"  json:"messageId,omitempty"`
+	SenderID   string            `jsbind:"senderId"   json:"senderId,omitempty"`
+	SenderName string            `jsbind:"senderName" json:"senderName"`
+	AvatarURL  string            `jsbind:"avatarUrl"  json:"avatarUrl,omitempty"`
+	Time       int64             `jsbind:"time"       json:"time,omitempty"`
+	Elements   []IMessageElement `jsbind:"elements"   json:"-"`
+}
+
+// ForwardElement is the protocol-neutral representation of a merged-forward
+// message. Loaded is false when the adapter only has the resource ID or when
+// expansion failed; LoadError is deliberately exposed to plugins so they can
+// distinguish an empty forward from a failed lookup.
+type ForwardElement struct {
+	Kind      string        `jsbind:"type"      json:"type"`
+	ForwardID string        `jsbind:"forwardId" json:"forwardId,omitempty"`
+	Title     string        `jsbind:"title"     json:"title,omitempty"`
+	Preview   []string      `jsbind:"preview"   json:"preview,omitempty"`
+	Summary   string        `jsbind:"summary"   json:"summary,omitempty"`
+	Loaded    bool          `jsbind:"loaded"    json:"loaded"`
+	LoadError string        `jsbind:"loadError" json:"loadError,omitempty"`
+	Nodes     []ForwardNode `jsbind:"nodes"     json:"nodes,omitempty"`
+}
+
+func (t *ForwardElement) Type() ElementType { return Forward }
+
+func (t *ForwardElement) FromCQData(dMap map[string]string) error {
+	t.Kind = "forward"
+	t.ForwardID = strings.TrimSpace(dMap["id"])
+	if t.ForwardID == "" {
+		t.ForwardID = strings.TrimSpace(dMap["forward_id"])
+	}
+	return nil
 }
 
 func (t *ReplyElement) Type() ElementType {
@@ -424,6 +463,11 @@ func MessageElementToString(elem IMessageElement) string {
 			args["delay"] = strconv.FormatInt(e.DelayMS, 10)
 		}
 		return compileCQCommand("recall", args)
+	case *ForwardElement:
+		if e.ForwardID == "" {
+			return "[合并转发]"
+		}
+		return compileCQCommand("forward", map[string]string{"id": e.ForwardID})
 	case *DefaultElement:
 		if e.RawType == "" {
 			return ""

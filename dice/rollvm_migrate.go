@@ -770,6 +770,17 @@ func (ctx *MsgContext) CreateVmIfNotExists() {
 	ctx.vm.RandSrc = ctx.getDiceSource()
 
 	ctx.vm.Config = *ctx.GenDefaultRollVmConfig()
+	forwardFn := ds.NewNativeFunctionVal(&ds.NativeFunctionData{
+		Name: "forward", Params: []string{"text"},
+		NativeFunc: func(_ *ds.Context, _ *ds.VMValue, params []*ds.VMValue) *ds.VMValue {
+			if len(params) == 0 || params[0] == nil {
+				return ds.NewStrVal("")
+			}
+			return ds.NewStrVal(ctx.wrapForward(params[0].ToString()))
+		},
+	})
+	ctx.vm.Attrs.Store("forward", forwardFn)
+	ctx.vm.Attrs.Store("合并转发", forwardFn)
 
 	am := ctx.Dice.AttrsManager
 	ctx.vm.GlobalValueLoadOverwriteFunc = func(name string, curVal *ds.VMValue) *ds.VMValue {

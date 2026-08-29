@@ -36,6 +36,7 @@ import (
 	"go.uber.org/zap"
 	"gopkg.in/elazarl/goproxy.v1"
 
+	"Scardice-core/message"
 	"Scardice-core/static"
 	"Scardice-core/utils"
 	"Scardice-core/utils/crypto"
@@ -956,6 +957,13 @@ func (d *Dice) JsInit() {
 		_ = seal.Set("replyGroup", ReplyGroup)
 		_ = seal.Set("replyPerson", ReplyPerson)
 		_ = seal.Set("replyToSender", ReplyToSender)
+		_ = seal.Set("replyForward", ReplyForward)
+		_ = seal.Set("newForwardNode", func(senderID string, senderName string, text string) *message.ForwardNode {
+			return &message.ForwardNode{SenderID: senderID, SenderName: senderName, Elements: message.ConvertStringMessage(text)}
+		})
+		_ = seal.Set("newForwardElement", func() *message.ForwardElement {
+			return &message.ForwardElement{Kind: "forward"}
+		})
 		_ = seal.Set("memberBan", MemberBan)
 		_ = seal.Set("memberKick", MemberKick)
 		_ = seal.Set("format", DiceFormat)

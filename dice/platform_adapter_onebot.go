@@ -23,6 +23,7 @@ import (
 	"go.uber.org/zap"
 
 	emitter "Scardice-core/dice/imsdk/onebot"
+	"Scardice-core/dice/imsdk/onebot/schema"
 	"Scardice-core/logger"
 	"Scardice-core/message"
 )
@@ -145,7 +146,36 @@ func (p *PlatformAdapterOnebot) SendToGroup(ctx *MsgContext, groupID string, tex
 	p.SendSegmentToGroup(ctx, groupID, msgElement, flag)
 }
 
-func (p *PlatformAdapterOnebot) SendGroupForwardMsg(ctx *MsgContext, groupID string, nodes []forwardNode) bool {
+type onebotForwardNodeData struct {
+	UserID   int64               `json:"user_id"`
+	Nickname string              `json:"nickname"`
+	Content  schema.MessageChain `json:"content"`
+}
+
+type onebotForwardNode struct {
+	Type string                `json:"type"`
+	Data onebotForwardNodeData `json:"data"`
+}
+
+func (p *PlatformAdapterOnebot) buildForwardNodes(nodes []message.ForwardNode) ([]onebotForwardNode, bool) {
+	ret := make([]onebotForwardNode, 0, len(nodes))
+	for _, node := range nodes {
+		userID, err := strconv.ParseInt(strings.TrimSpace(node.SenderID), 10, 64)
+		if err != nil || userID <= 0 {
+			return nil, false
+		}
+		content, _ := p.convertSealMsgToMessageChain(node.Elements)
+		if len(content) == 0 {
+			return nil, false
+		}
+		ret = append(ret, onebotForwardNode{Type: "node", Data: onebotForwardNodeData{
+			UserID: userID, Nickname: node.SenderName, Content: content,
+		}})
+	}
+	return ret, len(ret) > 0
+}
+
+func (p *PlatformAdapterOnebot) SendGroupForwardMsg(ctx *MsgContext, groupID string, nodes []message.ForwardNode) bool {
 	if p == nil || p.sendEmitter == nil {
 		return false
 	}
@@ -157,9 +187,13 @@ func (p *PlatformAdapterOnebot) SendGroupForwardMsg(ctx *MsgContext, groupID str
 		return false
 	}
 
+	wireNodes, ok := p.buildForwardNodes(nodes)
+	if !ok {
+		return false
+	}
 	type sendGroupForwardParams struct {
-		GroupID  int64         `json:"group_id"`
-		Messages []forwardNode `json:"messages"`
+		GroupID  int64               `json:"group_id"`
+		Messages []onebotForwardNode `json:"messages"`
 	}
 
 	if ctx != nil && ctx.EndPoint != nil && ctx.EndPoint.Platform == "QQ" {
@@ -168,7 +202,7 @@ func (p *PlatformAdapterOnebot) SendGroupForwardMsg(ctx *MsgContext, groupID str
 
 	_, err := p.sendEmitter.Raw(p.ctx, "send_group_forward_msg", sendGroupForwardParams{
 		GroupID:  rawGroupID,
-		Messages: nodes,
+		Messages: wireNodes,
 	})
 	session := p.EndPoint.Session
 	if err == nil && session != nil {
@@ -187,7 +221,7 @@ func (p *PlatformAdapterOnebot) SendGroupForwardMsg(ctx *MsgContext, groupID str
 	return err == nil
 }
 
-func (p *PlatformAdapterOnebot) SendPrivateForwardMsg(ctx *MsgContext, userID string, nodes []forwardNode) bool {
+func (p *PlatformAdapterOnebot) SendPrivateForwardMsg(ctx *MsgContext, userID string, nodes []message.ForwardNode) bool {
 	if p == nil || p.sendEmitter == nil {
 		return false
 	}
@@ -199,9 +233,13 @@ func (p *PlatformAdapterOnebot) SendPrivateForwardMsg(ctx *MsgContext, userID st
 		return false
 	}
 
+	wireNodes, ok := p.buildForwardNodes(nodes)
+	if !ok {
+		return false
+	}
 	type sendPrivateForwardParams struct {
-		UserID   int64         `json:"user_id"`
-		Messages []forwardNode `json:"messages"`
+		UserID   int64               `json:"user_id"`
+		Messages []onebotForwardNode `json:"messages"`
 	}
 
 	if ctx != nil && ctx.EndPoint != nil && ctx.EndPoint.Platform == "QQ" {
@@ -210,7 +248,7 @@ func (p *PlatformAdapterOnebot) SendPrivateForwardMsg(ctx *MsgContext, userID st
 
 	_, err := p.sendEmitter.Raw(p.ctx, "send_private_forward_msg", sendPrivateForwardParams{
 		UserID:   rawUserID,
-		Messages: nodes,
+		Messages: wireNodes,
 	})
 	session := p.EndPoint.Session
 	if err == nil && session != nil {
