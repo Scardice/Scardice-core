@@ -200,9 +200,7 @@ func (pa *PlatformAdapterDingTalk) OnGroupJoined(_ *dingtalk.Session, data *ding
 	ctx.Player = &GroupPlayerInfo{}
 	logger.Infof("发送入群致辞，群: <%s>(%d)", "%未知群名%", data.OpenConversationId)
 	text := DiceFormatTmpl(ctx, "核心:骰子进群")
-	for _, i := range ctx.SplitText(text) {
-		pa.SendToGroup(ctx, msg.GroupID, strings.TrimSpace(i), "")
-	}
+	ReplyGroup(ctx, msg, text)
 	// 触发扩展钩子
 	if groupInfo, ok := ctx.Session.ServiceAtNew.Load(msg.GroupID); ok {
 		groupInfo.TriggerExtHook(ctx.Dice, func(ext *ExtInfo) func() {
