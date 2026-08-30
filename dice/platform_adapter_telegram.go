@@ -216,9 +216,7 @@ func (pa *PlatformAdapterTelegram) groupAdded(msg *Message, msgRaw *tgbotapi.Mes
 	ctx.Player = &GroupPlayerInfo{}
 	logger.Infof("发送入群致辞，群: <%s>(%d)", groupName, msgRaw.Chat.ID)
 	text := DiceFormatTmpl(ctx, "核心:骰子进群")
-	for _, i := range ctx.SplitText(text) {
-		pa.SendToGroup(ctx, msg.GroupID, strings.TrimSpace(i), "")
-	}
+	ReplyGroup(ctx, msg, text)
 	// 触发扩展钩子
 	if groupInfo, ok := ctx.Session.ServiceAtNew.Load(msg.GroupID); ok {
 		groupInfo.TriggerExtHook(ctx.Dice, func(ext *ExtInfo) func() {
@@ -238,9 +236,7 @@ func (pa *PlatformAdapterTelegram) friendAdded(msg *Message) {
 	uid := msg.Sender.UserID
 	welcome := DiceFormatTmpl(ctx, "核心:骰子成为好友")
 	logger.Infof("与 %s 成为好友，发送好友致辞: %s", uid, welcome)
-	for _, i := range ctx.SplitText(welcome) {
-		pa.SendToPerson(ctx, uid, strings.TrimSpace(i), "")
-	}
+	ReplyPerson(ctx, msg, welcome)
 	if groupInfo, ok := ctx.Session.ServiceAtNew.Load(msg.GroupID); ok {
 		groupInfo.TriggerExtHook(ctx.Dice, func(ext *ExtInfo) func() {
 			if ext.OnBecomeFriend == nil {

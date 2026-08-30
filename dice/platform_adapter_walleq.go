@@ -258,10 +258,7 @@ func (pa *PlatformAdapterWalleQ) Serve() int {
 				ctx.Player = &GroupPlayerInfo{}
 				log.Infof("发送入群致辞，群: <%s>(%s)", groupName, event.GroupID)
 				text := DiceFormatTmpl(ctx, "核心:骰子进群")
-				for _, i := range ctx.SplitText(text) {
-					doSleepQQ(ctx)
-					pa.SendToGroup(ctx, msg.GroupID, strings.TrimSpace(i), "")
-				}
+				ReplyGroup(ctx, msg, text)
 				// 触发扩展钩子
 				if groupInfo, ok := ctx.Session.ServiceAtNew.Load(msg.GroupID); ok {
 					groupInfo.TriggerExtHook(ctx.Dice, func(ext *ExtInfo) func() {

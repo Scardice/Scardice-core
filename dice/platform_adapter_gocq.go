@@ -823,10 +823,7 @@ func (pa *PlatformAdapterGocq) Serve() int {
 					// 因此略作延迟，等上游修复后可以移除
 					time.Sleep(5 * time.Second)
 
-					for _, i := range ctx.SplitText(welcome) {
-						doSleepQQ(ctx)
-						pa.SendToPerson(ctx, uid, strings.TrimSpace(i), "")
-					}
+					ReplyPerson(ctx, msg, welcome)
 					if groupInfo, ok := ctx.Session.ServiceAtNew.Load(msg.GroupID); ok {
 						groupInfo.TriggerExtHook(ctx.Dice, func(ext *ExtInfo) func() {
 							if ext.OnBecomeFriend == nil {
@@ -889,10 +886,7 @@ func (pa *PlatformAdapterGocq) Serve() int {
 				ctx.Player = &GroupPlayerInfo{}
 				log.Infof("发送入群致辞，群: <%s>(%d)", groupName, msgQQ.GroupID)
 				text := DiceFormatTmpl(ctx, "核心:骰子进群")
-				for _, i := range ctx.SplitText(text) {
-					doSleepQQ(ctx)
-					pa.SendToGroup(ctx, msg.GroupID, strings.TrimSpace(i), "")
-				}
+				ReplyGroup(ctx, msg, text)
 			}()
 			txt := fmt.Sprintf("加入QQ群组: <%s>(%s)", groupName, msgQQ.GroupID)
 			log.Info(txt)
