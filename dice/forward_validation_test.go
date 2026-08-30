@@ -80,6 +80,68 @@ type onebotForwardRawEmitter struct {
 	responseErr error
 }
 
+func TestOnebotForwardQueueIsAsyncAndFIFO(t *testing.T) {
+	adapter := &PlatformAdapterOnebot{logger: zap.NewNop().Sugar()}
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	order := make(chan int, 2)
+
+	if !adapter.enqueueOnebotForwardJob(func() {
+		close(firstStarted)
+		<-releaseFirst
+		order <- 1
+	}) {
+		t.Fatal("first forward job was not queued")
+	}
+
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("forward queue worker did not start")
+	}
+
+	queued := make(chan bool, 1)
+	go func() {
+		queued <- adapter.enqueueOnebotForwardJob(func() { order <- 2 })
+	}()
+	select {
+	case ok := <-queued:
+		if !ok {
+			t.Fatal("second forward job was not queued")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("enqueue blocked behind the running forward request")
+	}
+
+	select {
+	case got := <-order:
+		t.Fatalf("job %d completed before the first job was released", got)
+	default:
+	}
+
+	close(releaseFirst)
+	for want := 1; want <= 2; want++ {
+		select {
+		case got := <-order:
+			if got != want {
+				t.Fatalf("completion order = %d, want %d", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for job %d", want)
+		}
+	}
+}
+
+func TestOnebotForwardQueueRejectsOverflow(t *testing.T) {
+	adapter := &PlatformAdapterOnebot{
+		forwardQueue:        make([]func(), maxOnebotForwardQueueSize),
+		forwardQueueRunning: true,
+	}
+	if adapter.enqueueOnebotForwardJob(func() {}) {
+		t.Fatal("full forward queue accepted another job")
+	}
+}
+
 func (e *onebotForwardRawEmitter) Raw(_ context.Context, action emitter.Action, params any) ([]byte, error) {
 	e.muRaw.Lock()
 	e.action, e.params = action, params

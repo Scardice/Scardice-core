@@ -81,6 +81,13 @@ type PlatformAdapterOnebot struct {
 	// 用 sync.Mutex 保护（而非 sync.Once），便于 invalidate 时安全重置。
 	cachedDerivedBaseURL string
 	derivedURLMu         sync.Mutex
+
+	// 收到合并转发事件时，不能在 WebSocket 读回调中同步等待 get_forward_msg：
+	// echo 回包也依赖同一个读循环，否则会自锁直到超时。用有界 FIFO 队列异步展开，
+	// 同时维持同一账号收到多条合并转发时的处理顺序。
+	forwardQueueMu      sync.Mutex
+	forwardQueue        []func()
+	forwardQueueRunning bool
 }
 
 func (p *PlatformAdapterOnebot) Serve() int {
