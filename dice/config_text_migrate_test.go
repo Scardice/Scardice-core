@@ -110,3 +110,33 @@ func TestMigrateSpecialFeatureHelpTextToFeaturedFeature(t *testing.T) {
 		t.Fatalf("migrated featured feature help = %v", got)
 	}
 }
+
+func TestRestoreMissingBuiltinTextEntriesAfterOldUIReplacement(t *testing.T) {
+	d := &Dice{}
+	setupBaseTextTemplate(d)
+
+	// Simulate an older WebUI saving the whole core category without fields
+	// introduced by a newer backend.
+	d.TextMapRaw["核心"] = TextTemplateWithWeight{
+		"骰子帮助文本": {{"旧页面保留的帮助", 1}},
+	}
+
+	if !RestoreMissingBuiltinTextEntries(d, "核心") {
+		t.Fatal("expected missing builtin entries to be restored")
+	}
+	for _, key := range []string{
+		"骰子帮助文本_骰点",
+		"骰子帮助文本_房规",
+		"骰子帮助文本_特色功能",
+	} {
+		if _, exists := d.TextMapRaw["核心"][key]; !exists {
+			t.Fatalf("missing restored builtin entry %q", key)
+		}
+		if got := d.TextMapHelpInfo["核心"][key].SubType; got != ".help" {
+			t.Fatalf("restored builtin entry %q subtype = %q, want .help", key, got)
+		}
+	}
+	if got := d.TextMapRaw["核心"]["骰子帮助文本"][0][0]; got != "旧页面保留的帮助" {
+		t.Fatalf("existing text was overwritten: %v", got)
+	}
+}
