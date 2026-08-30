@@ -317,7 +317,6 @@ func (p *PlatformAdapterOnebot) handleAddFriendAction(req gjson.Result, _ *evsoc
 	if err != nil {
 		return err
 	}
-	userId := canonicalOnebotUserID(req.Get("user_id").String())
 	// 先查看
 	ctx.Group, ctx.Player = GetPlayerInfoBySender(ctx, msg)
 	welcomeStr := DiceFormatTmpl(ctx, "核心:骰子成为好友")
@@ -325,10 +324,7 @@ func (p *PlatformAdapterOnebot) handleAddFriendAction(req gjson.Result, _ *evsoc
 	_ = p.submitAsync(func() {
 		// 与旧 onebot 链保持一致：上游可能先发 friend_add，再真正建立好友关系。
 		time.Sleep(5 * time.Second)
-		for _, i := range ctx.SplitText(welcomeStr) {
-			doSleepQQ(ctx)
-			p.SendToPerson(ctx, userId, strings.TrimSpace(i), "")
-		}
+		ReplyPerson(ctx, msg, welcomeStr)
 		if groupInfo, ok := ctx.Session.ServiceAtNew.Load(msg.GroupID); ok {
 			groupInfo.TriggerExtHook(ctx.Dice, func(ext *ExtInfo) func() {
 				if ext.OnBecomeFriend == nil {

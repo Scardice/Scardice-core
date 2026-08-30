@@ -71,6 +71,36 @@ func TestForwardMixedDeliveryUsesSelfIdentityAndInternalSplit(t *testing.T) {
 	}
 }
 
+func TestWelcomeReplyKeepsForwardBoundariesUntilDelivery(t *testing.T) {
+	adapter := newForwardCaptureAdapter()
+	endpoint := &EndPointInfo{EndPointInfoBase: EndPointInfoBase{
+		UserID: "QQ:4242", Nickname: "SelfBot", Platform: "TEST",
+	}, Adapter: adapter}
+	ctx := &MsgContext{EndPoint: endpoint, Dice: &Dice{Logger: zap.NewNop().Sugar()}}
+	msg := &Message{MessageType: "group", GroupID: "QQ-Group:9000"}
+	inside := ctx.TranslateSplit("notice one#{SPLIT}\nnotice two#{SPLIT}\nnotice three")
+
+	ReplyGroup(ctx, msg, "ordinary welcome\n"+ctx.wrapForward(inside))
+
+	adapter.mu.Lock()
+	ordinary := append([]string(nil), adapter.groupMsgs...)
+	adapter.mu.Unlock()
+	if len(ordinary) != 1 || ordinary[0] != "ordinary welcome" {
+		t.Fatalf("ordinary welcome deliveries = %#v", ordinary)
+	}
+	adapter.muForward.Lock()
+	defer adapter.muForward.Unlock()
+	if len(adapter.groupForwards) != 1 || len(adapter.groupForwards[0]) != 3 {
+		t.Fatalf("welcome forward deliveries = %#v", adapter.groupForwards)
+	}
+	for _, node := range adapter.groupForwards[0] {
+		text := message.ConvertMessageElementsToString(node.Elements)
+		if strings.Contains(text, "FORWARD-BEGIN") || strings.Contains(text, "FORWARD-END") {
+			t.Fatalf("forward control marker leaked into welcome node: %q", text)
+		}
+	}
+}
+
 type onebotForwardRawEmitter struct {
 	*onebotRecallTestEmitter
 	muRaw       sync.Mutex

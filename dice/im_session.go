@@ -1926,10 +1926,9 @@ func (s *IMSession) OnGroupJoined(ctx *MsgContext, msg *Message) {
 		ctx.Player = &GroupPlayerInfo{}
 		log.Infof("发送入群致辞，群: <%s>(%s)", groupName, msg.GroupID)
 		text := DiceFormatTmpl(ctx, "核心:骰子进群")
-		for _, i := range ctx.SplitText(text) {
-			doSleepQQ(ctx)
-			ReplyGroup(ctx, msg, strings.TrimSpace(i))
-		}
+		// forward() 的边界必须先由统一回复规划器解析；提前按 SPLIT
+		// 切分会把起止边界拆到不同消息并泄漏 FORWARD-END 标记。
+		ReplyGroup(ctx, msg, text)
 	}()
 	txt := fmt.Sprintf("加入群组: <%s>(%s)", groupName, msg.GroupID)
 	log.Info(txt)
