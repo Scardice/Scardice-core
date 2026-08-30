@@ -169,7 +169,7 @@ The values remain deliberately operator-selected; no hard-coded deadline, respon
 `dice.JsConfig` gains these JSON/YAML-compatible fields:
 
 ```go
-QuickJSExecuteTimeoutMillis      uint64 `json:"quickJSExecuteTimeoutMillis" yaml:"quickJSExecuteTimeoutMillis"`
+QuickJSExecuteTimeoutSeconds     uint64 `json:"quickJSExecuteTimeoutSeconds" yaml:"quickJSExecuteTimeoutSeconds"`
 QuickJSMaxFetchConcurrent        uint64 `json:"quickJSMaxFetchConcurrent" yaml:"quickJSMaxFetchConcurrent"`
 QuickJSMaxFetchResponseMiB       uint64 `json:"quickJSMaxFetchResponseMiB" yaml:"quickJSMaxFetchResponseMiB"`
 QuickJSMaxWebSocketConnections   uint64 `json:"quickJSMaxWebSocketConnections" yaml:"quickJSMaxWebSocketConnections"`
@@ -179,7 +179,7 @@ QuickJSMaxPBKDF2Iterations       uint64 `json:"quickJSMaxPBKDF2Iterations" yaml:
 QuickJSMaxPBKDF2OutputBytes      uint64 `json:"quickJSMaxPBKDF2OutputBytes" yaml:"quickJSMaxPBKDF2OutputBytes"`
 ```
 
-`Dice.quickJSNodeResourceLimits()` converts positive unsigned settings into the qnode signed/int/time values, rejects overflow at initialization, and leaves a zero setting unlimited. The existing memory, GC, and stack limits keep their current non-zero fallback policy; these new optional limits do not reuse `quickJSConfigLimitBytes`.
+`Dice.quickJSNodeResourceLimits()` converts positive unsigned seconds, MiB, and byte settings into the qnode signed/int/time values, rejects overflow at initialization, and leaves a zero setting unlimited. The existing memory, GC, and stack limits keep their current non-zero fallback policy; these new optional limits do not reuse `quickJSConfigLimitBytes`.
 
 `newQuickJSNodeEnvironment` creates one `*limits.Runtime` from the validated configuration and passes it to the relevant `fetch`, `websocket`, `fs`, and `crypto` module options. `utils/jsengine/quickjs` adds `WithNodeResourceLimits(limits.Config)` and forwards it to `eventloop.WithResourceLimits` when constructing its qnode owner loop. The core does not duplicate qnode's semaphore, byte-accounting, or crypto validation logic.
 
