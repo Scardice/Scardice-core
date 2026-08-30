@@ -354,31 +354,40 @@ func TestExecuteNew_PrivateCommand_Roll(t *testing.T) {
 	}
 }
 
-func TestExecuteNew_HelpSpecialFeatureUsesCustomText(t *testing.T) {
+func TestExecuteNew_CustomHelpSections(t *testing.T) {
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 
-	const placeholder = "骰主可以在这里写骰子的额外功能命令的使用教程"
-	items := d.TextMapRaw["核心"]["骰子帮助文本_特殊功能"]
-	if len(items) != 1 || items[0][0] != placeholder {
-		t.Fatalf("default special feature help = %#v, want %q", items, placeholder)
+	tests := []struct {
+		arg         string
+		key         string
+		placeholder string
+		custom      string
+	}{
+		{"骰点", "骰子帮助文本_骰点", "骰主可以在这里写骰子的骰点命令使用教程", "自定义骰点教程"},
+		{"房规", "骰子帮助文本_房规", "骰主可以在这里写骰子的房规说明", "自定义房规"},
+		{"特色功能", "骰子帮助文本_特色功能", "骰主可以在这里写骰子的额外功能命令的使用教程", "自定义额外功能教程"},
 	}
 
-	const customHelp = "自定义额外功能教程"
-	d.TextMapRaw["核心"]["骰子帮助文本_特殊功能"] = TextTemplateItemList{{customHelp, 1}}
-	d.GenerateTextMap()
+	for _, test := range tests {
+		items := d.TextMapRaw["核心"][test.key]
+		if len(items) != 1 || items[0][0] != test.placeholder {
+			t.Fatalf("default %s help = %#v, want %q", test.arg, items, test.placeholder)
+		}
+		d.TextMapRaw["核心"][test.key] = TextTemplateItemList{{test.custom, 1}}
+		d.GenerateTextMap()
+		d.ImSession.ExecuteNew(ep, newPrivateMsg("QQ:999", ".help "+test.arg))
 
-	d.ImSession.ExecuteNew(ep, newPrivateMsg("QQ:999", ".help 特殊功能"))
-
-	reply, ok := adapter.waitForMsg(2 * time.Second)
-	if !ok {
-		t.Fatal("timeout: expected a reply to '.help 特殊功能'")
-	}
-	if reply != customHelp {
-		t.Fatalf("reply = %q, want %q", reply, customHelp)
-	}
-	if got := d.TextMapHelpInfo["核心"]["骰子帮助文本_特殊功能"].SubType; got != ".help" {
-		t.Fatalf("help subtype = %q, want .help", got)
+		reply, ok := adapter.waitForMsg(2 * time.Second)
+		if !ok {
+			t.Fatalf("timeout: expected a reply to '.help %s'", test.arg)
+		}
+		if reply != test.custom {
+			t.Fatalf(".help %s reply = %q, want %q", test.arg, reply, test.custom)
+		}
+		if got := d.TextMapHelpInfo["核心"][test.key].SubType; got != ".help" {
+			t.Fatalf("%s help subtype = %q, want .help", test.arg, got)
+		}
 	}
 }
 

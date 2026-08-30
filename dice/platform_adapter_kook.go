@@ -291,9 +291,7 @@ func (pa *PlatformAdapterKook) Serve() int {
 			mctx.Player = &GroupPlayerInfo{}
 			log.Infof("发送入群致辞，群: <%s>(%s)", guild.Name, msg.GuildID)
 			text := DiceFormatTmpl(mctx, "核心:骰子进群")
-			for _, i := range mctx.SplitText(text) {
-				pa.SendToGroup(mctx, msg.GroupID, strings.TrimSpace(i), "")
-			}
+			ReplyGroup(mctx, msg, text)
 		}()
 
 		// 此时 ServiceAtNew 中这个频道一般为空，照 im_session.go 中的方法处理
