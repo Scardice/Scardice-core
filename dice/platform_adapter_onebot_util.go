@@ -93,7 +93,81 @@ func (p *PlatformAdapterOnebot) onOnebotMessageEvent(ep *evsocket.EventPayload) 
 		p.logger.Errorf("收到消息但无法进行处理，原因为 %s", err)
 		return
 	}
-	p.expandOnebotForwards(msg)
+	if messageHasUnloadedForward(msg) {
+		queued := p.enqueueOnebotForwardJob(func() {
+			p.expandOnebotForwards(msg)
+			p.finishOnebotMessage(msg)
+		})
+		if queued {
+			return
+		}
+		markUnloadedForwardError(msg, "OneBot 合并转发展开队列已满")
+	}
+	p.finishOnebotMessage(msg)
+}
+
+const maxOnebotForwardQueueSize = 256
+
+func markUnloadedForwardError(msg *Message, loadError string) {
+	if msg == nil {
+		return
+	}
+	for _, element := range msg.Segment {
+		if forward, ok := element.(*message.ForwardElement); ok && !forward.Loaded && forward.ForwardID != "" {
+			forward.LoadError = loadError
+		}
+	}
+}
+
+// enqueueOnebotForwardJob 将会等待 OneBot echo 的工作移出 WebSocket 读回调。
+// 队列由单一 worker 按入队顺序处理，避免多个合并转发因网络响应先后不同而乱序。
+func (p *PlatformAdapterOnebot) enqueueOnebotForwardJob(job func()) bool {
+	if p == nil || job == nil {
+		return false
+	}
+	p.forwardQueueMu.Lock()
+	if len(p.forwardQueue) >= maxOnebotForwardQueueSize {
+		p.forwardQueueMu.Unlock()
+		return false
+	}
+	p.forwardQueue = append(p.forwardQueue, job)
+	if p.forwardQueueRunning {
+		p.forwardQueueMu.Unlock()
+		return true
+	}
+	p.forwardQueueRunning = true
+	p.forwardQueueMu.Unlock()
+
+	go p.runOnebotForwardQueue()
+	return true
+}
+
+func (p *PlatformAdapterOnebot) runOnebotForwardQueue() {
+	for {
+		p.forwardQueueMu.Lock()
+		if len(p.forwardQueue) == 0 {
+			p.forwardQueue = nil
+			p.forwardQueueRunning = false
+			p.forwardQueueMu.Unlock()
+			return
+		}
+		job := p.forwardQueue[0]
+		p.forwardQueue[0] = nil
+		p.forwardQueue = p.forwardQueue[1:]
+		p.forwardQueueMu.Unlock()
+
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil && p.logger != nil {
+					p.logger.Errorf("处理 OneBot 合并转发队列异常: %v", recovered)
+				}
+			}()
+			job()
+		}()
+	}
+}
+
+func (p *PlatformAdapterOnebot) finishOnebotMessage(msg *Message) {
 	session := p.EndPoint.Session
 	// 注册消息发送人的缓存，以兼容dice_manager
 	if msg.Sender.UserID != "" && msg.Sender.Nickname != "" {
