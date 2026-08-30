@@ -821,7 +821,13 @@ func setupBaseTextTemplate(d *Dice) {
 				{"余烬核心", 1},
 			},
 			"骰子帮助文本": {
-				{"{常量:APPNAME} {常量:VERSION} {常量:ARCH}\n官方一群: 1084726031\n========\n.help 骰点/骰主/协议/娱乐/特殊功能/跑团/扩展/查询/其他\n========\n只是余烬罢了", 1},
+				{"{常量:APPNAME} {常量:VERSION} {常量:ARCH}\n官方一群: 1084726031\n========\n.help 骰点/房规/骰主/协议/娱乐/特色功能/跑团/扩展/查询/其他\n========\n只是余烬罢了", 1},
+			},
+			"骰子帮助文本_骰点": {
+				{"骰主可以在这里写骰子的骰点命令使用教程", 1},
+			},
+			"骰子帮助文本_房规": {
+				{"骰主可以在这里写骰子的房规说明", 1},
 			},
 			"骰子帮助文本_骰主": {
 				{"骰主很神秘，什么都没有说——", 1},
@@ -832,7 +838,7 @@ func setupBaseTextTemplate(d *Dice) {
 			"骰子帮助文本_娱乐": {
 				{"帮助:娱乐\n.gugu // 随机召唤一只鸽子\n.jrrp 今日人品", 1},
 			},
-			"骰子帮助文本_特殊功能": {
+			"骰子帮助文本_特色功能": {
 				{"骰主可以在这里写骰子的额外功能命令的使用教程", 1},
 			},
 			"骰子帮助文本_其他": {
@@ -1548,6 +1554,12 @@ func setupBaseTextTemplate(d *Dice) {
 				SubType:  ".help",
 				TopOrder: 1,
 			},
+			"骰子帮助文本_骰点": {
+				SubType: ".help",
+			},
+			"骰子帮助文本_房规": {
+				SubType: ".help",
+			},
 			"骰子帮助文本_骰主": {
 				SubType: ".help",
 			},
@@ -1557,7 +1569,7 @@ func setupBaseTextTemplate(d *Dice) {
 			"骰子帮助文本_娱乐": {
 				SubType: ".help",
 			},
-			"骰子帮助文本_特殊功能": {
+			"骰子帮助文本_特色功能": {
 				SubType: ".help",
 			},
 			"骰子帮助文本_其他": {
@@ -2075,6 +2087,9 @@ func migrateHelpTextKey(d *Dice) bool {
 	// 迁移时优先保留旧键内容，避免被预设新键默认值覆盖
 	coreTexts[newKey] = oldVal
 	delete(coreTexts, oldKey)
+	if coreHelpInfo, ok := d.TextMapHelpInfo["核心"]; ok {
+		delete(coreHelpInfo, oldKey)
+	}
 	return true
 }
 
@@ -2091,6 +2106,9 @@ func migrateCoreTextKey(d *Dice, oldKey string, newKey string) bool {
 	// 迁移时优先保留旧键内容，避免被预设新键默认值覆盖
 	coreTexts[newKey] = oldVal
 	delete(coreTexts, oldKey)
+	if coreHelpInfo, ok := d.TextMapHelpInfo["核心"]; ok {
+		delete(coreHelpInfo, oldKey)
+	}
 	return true
 }
 
@@ -2102,6 +2120,9 @@ func setupTextTemplate(d *Dice) {
 	loadTextTemplate(d, "configs/text-template.yaml")
 	if migrateHelpTextKey(d) {
 		d.Logger.Info("检测到旧文案键“核心:骰子帮助文本_附加说明”，已自动迁移为“核心:骰子帮助文本”")
+	}
+	if migrateCoreTextKey(d, "骰子帮助文本_特殊功能", "骰子帮助文本_特色功能") {
+		d.Logger.Info("检测到旧文案键“核心:骰子帮助文本_特殊功能”，已自动迁移为“核心:骰子帮助文本_特色功能”")
 	}
 	if migrateCoreTextKey(d, "骰子状态附加文本", "骰子状态文本") {
 		d.Logger.Info("检测到旧文案键“核心:骰子状态附加文本”，已自动迁移为“核心:骰子状态文本”")

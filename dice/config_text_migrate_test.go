@@ -80,3 +80,33 @@ func TestMigrateHelpTextKey_NewKeyExists_OldWins(t *testing.T) {
 		t.Fatalf("expected legacy help content preserved, got %v", got)
 	}
 }
+
+func TestMigrateSpecialFeatureHelpTextToFeaturedFeature(t *testing.T) {
+	d := &Dice{
+		TextMapRaw: TextTemplateWithWeightDict{
+			"核心": {
+				"骰子帮助文本_特殊功能": {{"骰主已填写的教程", 1}},
+				"骰子帮助文本_特色功能": {{"新默认文本", 1}},
+			},
+		},
+		TextMapHelpInfo: TextTemplateWithHelpDict{
+			"核心": {
+				"骰子帮助文本_特殊功能": {SubType: ".help"},
+			},
+		},
+	}
+
+	if !migrateCoreTextKey(d, "骰子帮助文本_特殊功能", "骰子帮助文本_特色功能") {
+		t.Fatal("expected special feature help text migration")
+	}
+	coreTexts := d.TextMapRaw["核心"]
+	if _, exists := coreTexts["骰子帮助文本_特殊功能"]; exists {
+		t.Fatal("old special feature help key still exists")
+	}
+	if _, exists := d.TextMapHelpInfo["核心"]["骰子帮助文本_特殊功能"]; exists {
+		t.Fatal("old special feature UI help metadata still exists")
+	}
+	if got := coreTexts["骰子帮助文本_特色功能"][0][0]; got != "骰主已填写的教程" {
+		t.Fatalf("migrated featured feature help = %v", got)
+	}
+}
