@@ -42,7 +42,7 @@ $script:DEFAULT_APP_CHANNEL = 'dev'
 $script:DEFAULT_APPNAME = 'Scardice'
 
 # 从 dice/version.go 解析 VERSION_MAIN
-$script:DEFAULT_VERSION_MAIN = '1.5.1'
+$script:DEFAULT_VERSION_MAIN = '1.6.1'
 $versionGoPath = Join-Path $script:ROOT_DIR 'dice/version.go'
 if (Test-Path $versionGoPath) {
     $vmLine = Select-String -Path $versionGoPath -Pattern "^\s*VERSION_MAIN\s*=\s*""([^""]*)""" -ErrorAction SilentlyContinue
