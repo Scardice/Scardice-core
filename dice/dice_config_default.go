@@ -77,8 +77,12 @@ var DefaultConfig = Config{
 		BanList: nil,
 	},
 	JsConfig{
-		JsEnable:          true,
-		DisabledJsScripts: make(map[string]bool),
+		JsEnable:               true,
+		JsEngine:               "goja",
+		QuickJSMemoryLimitMiB:  256,
+		QuickJSGCThresholdMiB:  64,
+		QuickJSMaxStackSizeKiB: 1024,
+		DisabledJsScripts:      make(map[string]bool),
 	},
 	StoryLogConfig{
 		LogSizeNoticeEnable: true,

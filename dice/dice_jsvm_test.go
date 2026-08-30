@@ -1,9 +1,12 @@
 package dice //nolint:testpackage
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"Scardice-core/utils/jsengine"
 	"github.com/dop251/goja"
 	"go.uber.org/zap"
 )
@@ -78,6 +81,151 @@ func TestJsInit_WhenExtLoopManagerNil_DoesNotPanic(t *testing.T) {
 	}
 	if !d.Config.JsEnable {
 		t.Fatalf("expected JsEnable to be true after JsInit")
+	}
+}
+
+func TestJsInit_QuickJSStartsExperimentalHost(t *testing.T) {
+	d := &Dice{
+		Logger: zap.NewNop().Sugar(),
+		BaseConfig: BaseConfig{
+			DataDir: t.TempDir(),
+		},
+		ImSession: &IMSession{
+			ServiceAtNew: new(SyncMap[string, *GroupInfo]),
+			EndPoints:    []*EndPointInfo{},
+		},
+		DirtyGroups:  new(SyncMap[string, int64]),
+		AttrsManager: &AttrsManager{},
+	}
+	d.Config.JsEngine = "quickjs"
+	t.Cleanup(func() {
+		if d.ExtLoopManager != nil {
+			d.ExtLoopManager.SetEngineLoop(nil)
+		}
+	})
+
+	d.JsInit()
+
+	if !d.Config.JsEnable {
+		t.Fatal("QuickJS-Go initialization left JS disabled")
+	}
+	if d.ExtLoopManager == nil {
+		t.Fatal("QuickJS-Go initialization did not create a loop manager")
+	}
+	loop, err := d.ExtLoopManager.GetEngineLoop(d.ExtLoopManager.version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loop == nil || loop.Engine() != jsengine.EngineQuickJS {
+		t.Fatalf("engine loop = %#v", loop)
+	}
+
+	if err := loop.Run(func(runtime jsengine.Runtime) error {
+		value, err := runtime.RunString("quickjs-init-test.js", `
+			const result = seal.ext.newCmdExecuteResult(true);
+			typeof seal.getVersion === "function" &&
+			typeof seal.ext.new === "function" &&
+			typeof seal.ext.registerStringConfig === "function" &&
+			seal.ext.new("QuickJS Host Test", "test", "1.0.0").name === "QuickJS Host Test" &&
+			result.solved === true
+		`)
+		if err != nil {
+			return err
+		}
+		if !value.ToBoolean() {
+			t.Fatal("QuickJS-Go Host API is incomplete")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestJsLoadScriptRaw_QuickJSExecutesAndRegistersPlugin(t *testing.T) {
+	dataDir := t.TempDir()
+	scriptPath := filepath.Join(dataDir, "quickjs-plugin.js")
+	if err := os.WriteFile(scriptPath, []byte(`
+		import { Buffer } from "buffer";
+		import { subtle } from "crypto";
+		const util = await import("util");
+		const fs = require("fs");
+		if (Buffer.from("ok").toString() !== "ok") throw new Error("buffer unavailable");
+		if (typeof subtle.digest !== "function") throw new Error("crypto unavailable");
+		if (util.format("%s:%d", "ok", 7) !== "ok:7") throw new Error("util unavailable");
+		if (typeof fs.promises.readFile !== "function") throw new Error("fs unavailable");
+		const ext = seal.ext.new("QuickJS Plugin Test", "test", "1.0.0");
+		seal.ext.register(ext);
+	`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Dice{
+		Logger: zap.NewNop().Sugar(),
+		BaseConfig: BaseConfig{
+			DataDir: dataDir,
+		},
+		ImSession: &IMSession{
+			ServiceAtNew: new(SyncMap[string, *GroupInfo]),
+			EndPoints:    []*EndPointInfo{},
+		},
+		DirtyGroups:  new(SyncMap[string, int64]),
+		AttrsManager: &AttrsManager{},
+		ExtRegistry:  new(SyncMap[string, *ExtInfo]),
+	}
+	d.Config.JsEngine = "quickjs"
+	t.Cleanup(func() {
+		if d.ExtLoopManager != nil {
+			d.ExtLoopManager.SetEngineLoop(nil)
+		}
+	})
+
+	d.JsInit()
+	script := &JsScriptInfo{
+		Name:     "QuickJS Plugin Test",
+		Author:   "test",
+		Version:  "1.0.0",
+		Enable:   true,
+		Filename: scriptPath,
+	}
+	d.JsLoadScriptRaw(script)
+
+	if script.ErrText != "" {
+		t.Fatalf("QuickJS-Go rejected plugin: %s", script.ErrText)
+	}
+	ext, ok := d.JsExtRegistry.Load("QuickJS Plugin Test")
+	if !ok || ext == nil {
+		t.Fatal("QuickJS-Go plugin did not register its extension")
+	}
+	if ext.Name != "QuickJS Plugin Test" {
+		t.Fatalf("extension name = %q", ext.Name)
+	}
+}
+
+func TestJsLoadScriptRaw_QuickJSRejectsPathESMImport(t *testing.T) {
+	dataDir := t.TempDir()
+	scriptPath := filepath.Join(dataDir, "quickjs-blocked-import.js")
+	if err := os.WriteFile(scriptPath, []byte(`import "./blocked-helper.js";`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	d := newQuickJSNodeTestDice(t)
+	d.BaseConfig.DataDir = dataDir
+	d.JsInit()
+	script := &JsScriptInfo{
+		Name:     "QuickJS Blocked Import",
+		Enable:   true,
+		Filename: scriptPath,
+	}
+	d.JsLoadScriptRaw(script)
+
+	if script.ErrText == "" {
+		t.Fatal("path-backed ESM import unexpectedly succeeded")
+	}
+	if script.Enable {
+		t.Fatal("path-backed ESM import remained enabled")
+	}
+	if _, ok := d.JsExtRegistry.Load(script.Name); ok {
+		t.Fatal("path-backed ESM import registered an extension")
 	}
 }
 
