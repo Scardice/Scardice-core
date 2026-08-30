@@ -15,6 +15,7 @@ require (
 	github.com/antlabs/strsim v0.0.3
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
 	github.com/avast/retry-go v3.0.0+incompatible
+	github.com/buke/quickjs-go v0.7.7
 	github.com/bwmarrin/discordgo v0.29.0
 	github.com/bytedance/sonic v1.15.2
 	github.com/cespare/xxhash/v2 v2.3.0
@@ -103,6 +104,7 @@ require (
 	github.com/caio/go-tdigest/v4 v4.1.0 // indirect
 	github.com/dgryski/go-metro v0.0.0-20250106013310-edb8663e5e33 // indirect
 	github.com/kamstrup/intmap v0.5.2 // indirect
+	github.com/nlnwa/whatwg-url v0.6.2 // indirect
 	golang.org/x/oauth2 v0.23.0 // indirect
 )
 
@@ -111,6 +113,7 @@ require (
 	git.sr.ht/~jackmordaunt/go-toast v1.1.2 // indirect
 	github.com/HugoSmits86/nativewebp v1.2.0 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.14.5 // indirect
+	github.com/Scardice/quickjs_nodejs v0.0.0-20260830130520-cc1f00d58a48
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/bits-and-blooms/bitset v1.24.2 // indirect
 	github.com/bits-and-blooms/bloom/v3 v3.7.0 // indirect
