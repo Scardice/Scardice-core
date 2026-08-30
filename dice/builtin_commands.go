@@ -680,6 +680,7 @@ func (d *Dice) registerCoreCommands() {
 
 	helpForHelp := ".help // 查看本帮助\n" +
 		".help 指令 // 查看某指令信息\n" +
+		".help 特殊功能 // 查看骰主配置的额外功能教程\n" +
 		".help 扩展模块 // 查看扩展信息，如.help coc7\n" +
 		".help 关键字 // 查看任意帮助，同.find\n" +
 		".help reload // 重新加载帮助文档，需要Master权限"
@@ -731,6 +732,10 @@ func (d *Dice) registerCoreCommands() {
 			}
 			if cmdArgs.IsArgEqual(1, "娱乐") {
 				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰子帮助文本_娱乐"))
+				return CmdExecuteResult{Matched: true, Solved: true}
+			}
+			if cmdArgs.IsArgEqual(1, "特殊功能") {
+				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰子帮助文本_特殊功能"))
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
 			if cmdArgs.IsArgEqual(1, "其他", "其它") {

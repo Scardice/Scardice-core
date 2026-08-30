@@ -354,6 +354,34 @@ func TestExecuteNew_PrivateCommand_Roll(t *testing.T) {
 	}
 }
 
+func TestExecuteNew_HelpSpecialFeatureUsesCustomText(t *testing.T) {
+	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+
+	const placeholder = "骰主可以在这里写骰子的额外功能命令的使用教程"
+	items := d.TextMapRaw["核心"]["骰子帮助文本_特殊功能"]
+	if len(items) != 1 || items[0][0] != placeholder {
+		t.Fatalf("default special feature help = %#v, want %q", items, placeholder)
+	}
+
+	const customHelp = "自定义额外功能教程"
+	d.TextMapRaw["核心"]["骰子帮助文本_特殊功能"] = TextTemplateItemList{{customHelp, 1}}
+	d.GenerateTextMap()
+
+	d.ImSession.ExecuteNew(ep, newPrivateMsg("QQ:999", ".help 特殊功能"))
+
+	reply, ok := adapter.waitForMsg(2 * time.Second)
+	if !ok {
+		t.Fatal("timeout: expected a reply to '.help 特殊功能'")
+	}
+	if reply != customHelp {
+		t.Fatalf("reply = %q, want %q", reply, customHelp)
+	}
+	if got := d.TextMapHelpInfo["核心"]["骰子帮助文本_特殊功能"].SubType; got != ".help" {
+		t.Fatalf("help subtype = %q, want .help", got)
+	}
+}
+
 // TestExecuteNew_GroupMessage_NonCommand verifies that a plain chat message
 // (no command prefix) does NOT produce a bot reply.
 func TestExecuteNew_GroupMessage_NonCommand(t *testing.T) {
