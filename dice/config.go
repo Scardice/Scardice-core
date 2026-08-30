@@ -2046,6 +2046,51 @@ func SetupTextHelpInfo(d *Dice, helpInfo TextTemplateWithHelpDict, texts TextTem
 	}
 }
 
+// RestoreMissingBuiltinTextEntries restores builtin text entries that were
+// omitted by an older WebUI payload or an imported text-template category.
+// Builtin entries cannot be deleted in the WebUI, so treating their absence as
+// an outdated partial payload is safe. Custom/deprecated entries are left
+// untouched so users can still remove them deliberately.
+func RestoreMissingBuiltinTextEntries(d *Dice, category string) bool {
+	helpGroup, exists := d.TextMapHelpInfo[category]
+	if !exists {
+		return false
+	}
+
+	textGroup, exists := d.TextMapRaw[category]
+	if !exists || textGroup == nil {
+		textGroup = TextTemplateWithWeight{}
+		d.TextMapRaw[category] = textGroup
+	}
+
+	changed := false
+	for key, item := range helpGroup {
+		if item == nil || item.NotBuiltin || len(item.Origin) == 0 {
+			continue
+		}
+		if _, exists := textGroup[key]; exists {
+			continue
+		}
+
+		textGroup[key] = append([]TextTemplateItem{}, item.Origin...)
+		item.Modified = false
+		changed = true
+	}
+	return changed
+}
+
+// RestoreAllMissingBuiltinTextEntries applies RestoreMissingBuiltinTextEntries
+// to every builtin text category.
+func RestoreAllMissingBuiltinTextEntries(d *Dice) bool {
+	changed := false
+	for category := range d.TextMapHelpInfo {
+		if RestoreMissingBuiltinTextEntries(d, category) {
+			changed = true
+		}
+	}
+	return changed
+}
+
 func loadTextTemplate(d *Dice, fn string) {
 	textPath := filepath.Join(d.BaseConfig.DataDir, fn)
 
