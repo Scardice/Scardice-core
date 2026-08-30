@@ -881,6 +881,21 @@ func parseOnebotForwardNodes(log *zap.SugaredLogger, raw gjson.Result, depth int
 	return ret
 }
 
+func parseOnebotForwardResponse(log *zap.SugaredLogger, raw []byte) ([]message.ForwardNode, error) {
+	parsed := gjson.ParseBytes(raw)
+	content := parsed.Get("data.message")
+	if !content.Exists() {
+		content = parsed.Get("data.messages")
+	}
+	if !content.Exists() {
+		content = parsed.Get("data.content")
+	}
+	if !content.Exists() || !content.IsArray() {
+		return nil, errors.New("get_forward_msg response contains no message array")
+	}
+	return parseOnebotForwardNodes(log, content, 1), nil
+}
+
 func (p *PlatformAdapterOnebot) expandOnebotForwards(msg *Message) {
 	if p == nil || p.sendEmitter == nil || msg == nil {
 		return
@@ -903,19 +918,12 @@ func (p *PlatformAdapterOnebot) expandOnebotForwards(msg *Message) {
 			forward.LoadError = err.Error()
 			continue
 		}
-		parsed := gjson.ParseBytes(raw)
-		content := parsed.Get("data.message")
-		if !content.Exists() {
-			content = parsed.Get("data.messages")
-		}
-		if !content.Exists() {
-			content = parsed.Get("data.content")
-		}
-		if !content.Exists() || !content.IsArray() {
-			forward.LoadError = "get_forward_msg response contains no message array"
+		nodes, parseErr := parseOnebotForwardResponse(p.logger, raw)
+		if parseErr != nil {
+			forward.LoadError = parseErr.Error()
 			continue
 		}
-		forward.Nodes = parseOnebotForwardNodes(p.logger, content, 1)
+		forward.Nodes = nodes
 		forward.Loaded = true
 	}
 }

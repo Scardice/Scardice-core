@@ -98,6 +98,24 @@ func forwardNodesToText(nodes []message.ForwardNode) string {
 	return strings.TrimSpace(strings.Join(parts, "\n"))
 }
 
+func stripForwardSplitMarkers(text string, splitKey string) string {
+	if splitKey == "" {
+		return text
+	}
+	quoted := regexp.QuoteMeta(splitKey)
+	// A marker placed on its own line owns that line ending. Removing only the
+	// marker would leave two adjacent newlines and produce a blank line.
+	text = regexp.MustCompile(`(?m)^[\t ]*`+quoted+`[\t ]*(?:\r?\n|$)`).ReplaceAllString(text, "")
+	// If the template already has a line break after SPLIT, preserve that one
+	// break and consume only the marker plus horizontal spacing.
+	text = regexp.MustCompile(`[\t ]*`+quoted+`[\t ]*(\r?\n)`).ReplaceAllString(text, "$1")
+	// A marker at the beginning of a non-empty line already has the preceding
+	// line break as its separator.
+	text = regexp.MustCompile(`(?m)^[\t ]*`+quoted+`[\t ]*`).ReplaceAllString(text, "")
+	// With no adjacent line break, SPLIT itself becomes exactly one line break.
+	return regexp.MustCompile(`[\t ]*`+quoted+`[\t ]*`).ReplaceAllString(text, "\n")
+}
+
 // TryReplyToSenderMergedForward 尝试用“合并转发”发送多条内容。
 //
 // 返回值含义：
@@ -583,7 +601,7 @@ func deliverReplyPlan(ctx *MsgContext, msg *Message, text string, flag string, g
 			// Unsupported platforms receive the whole block as one ordinary
 			// message. SPLIT only controls forward nodes, so remove its marker
 			// without splitting the fallback message.
-			fallbackText := strings.TrimSpace(strings.ReplaceAll(item.Text, ctx.getSplitKey(), ""))
+			fallbackText := strings.TrimSpace(stripForwardSplitMarkers(item.Text, ctx.getSplitKey()))
 			if fallbackText == "" {
 				continue
 			}

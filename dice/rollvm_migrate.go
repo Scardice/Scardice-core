@@ -761,15 +761,7 @@ func (ctx *MsgContext) loadAttrValueByName(name string) *ds.VMValue {
 	return nil
 }
 
-func (ctx *MsgContext) CreateVmIfNotExists() {
-	if ctx.vm != nil {
-		return
-	}
-	// 初始化骰子
-	ctx.vm = ds.NewVM()
-	ctx.vm.RandSrc = ctx.getDiceSource()
-
-	ctx.vm.Config = *ctx.GenDefaultRollVmConfig()
+func (ctx *MsgContext) registerForwardFunctions() {
 	forwardFn := ds.NewNativeFunctionVal(&ds.NativeFunctionData{
 		Name: "forward", Params: []string{"text"},
 		NativeFunc: func(_ *ds.Context, _ *ds.VMValue, params []*ds.VMValue) *ds.VMValue {
@@ -781,6 +773,18 @@ func (ctx *MsgContext) CreateVmIfNotExists() {
 	})
 	ctx.vm.Attrs.Store("forward", forwardFn)
 	ctx.vm.Attrs.Store("合并转发", forwardFn)
+}
+
+func (ctx *MsgContext) CreateVmIfNotExists() {
+	if ctx.vm != nil {
+		return
+	}
+	// 初始化骰子
+	ctx.vm = ds.NewVM()
+	ctx.vm.RandSrc = ctx.getDiceSource()
+
+	ctx.vm.Config = *ctx.GenDefaultRollVmConfig()
+	ctx.registerForwardFunctions()
 
 	am := ctx.Dice.AttrsManager
 	ctx.vm.GlobalValueLoadOverwriteFunc = func(name string, curVal *ds.VMValue) *ds.VMValue {
@@ -951,6 +955,7 @@ func TextMapCompatibleCheck(d *Dice, category, k string, textItems []TextTemplat
 		for k, v := range _textMapBuiltin {
 			ctx.vm.Attrs.Store(k, v.Clone())
 		}
+		ctx.registerForwardFunctions()
 
 		text2, err2 := DiceFormatV2(ctx, formatExpr)
 

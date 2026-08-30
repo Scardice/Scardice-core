@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"Scardice-core/message"
@@ -344,6 +345,8 @@ type gocqForwardNode struct {
 	Data struct {
 		UserID   string        `json:"user_id"`
 		Nickname string        `json:"nickname"`
+		Uin      string        `json:"uin"`
+		Name     string        `json:"name"`
 		Content  []interface{} `json:"content"`
 	} `json:"data"`
 }
@@ -362,10 +365,65 @@ func buildGocqForwardNodes(nodes []message.ForwardNode) []gocqForwardNode {
 		n := gocqForwardNode{Type: "node"}
 		n.Data.UserID = strconv.FormatInt(userID, 10)
 		n.Data.Nickname = node.SenderName
+		n.Data.Uin = n.Data.UserID
+		n.Data.Name = n.Data.Nickname
 		n.Data.Content = content
 		ret = append(ret, n)
 	}
 	return ret
+}
+
+func messageHasUnloadedForward(msg *Message) bool {
+	if msg == nil {
+		return false
+	}
+	for _, element := range msg.Segment {
+		if forward, ok := element.(*message.ForwardElement); ok && !forward.Loaded && forward.ForwardID != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (pa *PlatformAdapterGocq) expandGocqForwards(msg *Message) {
+	if pa == nil || pa.Socket == nil || pa.EndPoint == nil || pa.EndPoint.Session == nil || pa.EndPoint.Session.Parent == nil || msg == nil {
+		return
+	}
+	log := pa.EndPoint.Session.Parent.Logger.Named("onebot-forward")
+	for _, element := range msg.Segment {
+		forward, ok := element.(*message.ForwardElement)
+		if !ok || forward.Loaded || forward.ForwardID == "" {
+			continue
+		}
+		echo := pa.getCustomEcho()
+		command, err := json.Marshal(oneBotCommand{
+			Action: "get_forward_msg",
+			Params: struct {
+				ID string `json:"id"`
+			}{ID: forward.ForwardID},
+			Echo: echo,
+		})
+		if err != nil {
+			forward.LoadError = err.Error()
+			continue
+		}
+		var response json.RawMessage
+		err = pa.waitEcho2(echo, &response, func(emi *echoMapInfo) {
+			emi.timeout = time.Now().Add(8 * time.Second).Unix()
+			socketSendText(pa.Socket, string(command))
+		})
+		if err != nil {
+			forward.LoadError = err.Error()
+			continue
+		}
+		nodes, err := parseOnebotForwardResponse(log, response)
+		if err != nil {
+			forward.LoadError = err.Error()
+			continue
+		}
+		forward.Nodes = nodes
+		forward.Loaded = true
+	}
 }
 
 func (pa *PlatformAdapterGocq) SendGroupForwardMsg(ctx *MsgContext, groupID string, nodes []message.ForwardNode) bool {
@@ -579,11 +637,16 @@ func (pa *PlatformAdapterGocq) SetGroupAddRequest(flag string, subType string, a
 }
 
 func (pa *PlatformAdapterGocq) getCustomEcho() string {
-	if pa.customEcho > -10 {
-		pa.customEcho = -10
+	for {
+		current := atomic.LoadInt64(&pa.customEcho)
+		if current <= -10 {
+			break
+		}
+		if atomic.CompareAndSwapInt64(&pa.customEcho, current, -10) {
+			break
+		}
 	}
-	pa.customEcho--
-	return strconv.FormatInt(pa.customEcho, 10)
+	return strconv.FormatInt(atomic.AddInt64(&pa.customEcho, -1), 10)
 }
 
 func (pa *PlatformAdapterGocq) waitEcho(echo any, beforeWait func()) *MessageQQ {
@@ -608,15 +671,21 @@ func (pa *PlatformAdapterGocq) waitEcho2(echo any, value interface{}, beforeWait
 	}
 
 	emi := &echoMapInfo{ch: make(chan string, 1)}
-	beforeWait(emi)
 	// 注: 之所以这样是因为echo是json.RawMessage
 	e := lo.Must(json.Marshal(echo))
-	pa.echoMap2.Store(string(e), emi)
-	val := <-emi.ch
-	if val == "" {
+	key := string(e)
+	pa.echoMap2.Store(key, emi)
+	defer pa.echoMap2.Delete(key)
+	beforeWait(emi)
+	select {
+	case val := <-emi.ch:
+		if val == "" {
+			return errors.New("超时")
+		}
+		return json.Unmarshal([]byte(val), value)
+	case <-time.After(8 * time.Second):
 		return errors.New("超时")
 	}
-	return json.Unmarshal([]byte(val), value)
 }
 
 // GetGroupMemberInfo 获取群成员信息

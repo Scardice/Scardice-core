@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -110,6 +111,8 @@ func TestOnebotForwardSendAndExpandProtocolPayloads(t *testing.T) {
 			Data struct {
 				UserID   string `json:"user_id"`
 				Nickname string `json:"nickname"`
+				Uin      string `json:"uin"`
+				Name     string `json:"name"`
 				Content  []struct {
 					Type string `json:"type"`
 				} `json:"content"`
@@ -119,7 +122,7 @@ func TestOnebotForwardSendAndExpandProtocolPayloads(t *testing.T) {
 	if err = json.Unmarshal(payload, &sent); err != nil {
 		t.Fatal(err)
 	}
-	if sent.GroupID != 9000 || len(sent.Messages) != 1 || sent.Messages[0].Type != "node" || sent.Messages[0].Data.UserID != "4242" || sent.Messages[0].Data.Nickname != "SelfBot" || len(sent.Messages[0].Data.Content) != 1 || sent.Messages[0].Data.Content[0].Type != "text" {
+	if sent.GroupID != 9000 || len(sent.Messages) != 1 || sent.Messages[0].Type != "node" || sent.Messages[0].Data.UserID != "4242" || sent.Messages[0].Data.Uin != "4242" || sent.Messages[0].Data.Nickname != "SelfBot" || sent.Messages[0].Data.Name != "SelfBot" || len(sent.Messages[0].Data.Content) != 1 || sent.Messages[0].Data.Content[0].Type != "text" {
 		t.Fatalf("unexpected OneBot payload: %s", payload)
 	}
 
@@ -149,14 +152,70 @@ func TestGocqForwardCustomNodeUsesOneBotStringUserID(t *testing.T) {
 	}
 	var wire struct {
 		Data struct {
-			UserID string `json:"user_id"`
+			UserID   string `json:"user_id"`
+			Nickname string `json:"nickname"`
+			Uin      string `json:"uin"`
+			Name     string `json:"name"`
 		} `json:"data"`
 	}
 	if err = json.Unmarshal(payload, &wire); err != nil {
 		t.Fatal(err)
 	}
-	if wire.Data.UserID != "4242" {
+	if wire.Data.UserID != "4242" || wire.Data.Uin != "4242" || wire.Data.Nickname != "SelfBot" || wire.Data.Name != "SelfBot" {
 		t.Fatalf("unexpected OneBot custom-node payload: %s", payload)
+	}
+}
+
+func TestOnebotForwardResponseSupportsNapCatMessageShapeAndLogsNodes(t *testing.T) {
+	raw := []byte(`{"status":"ok","retcode":0,"data":{"messages":[{"message_id":7,"time":123,"sender":{"user_id":10001,"nickname":"nested"},"message":[{"type":"text","data":{"text":"inside text"}}]}]}}`)
+	nodes, err := parseOnebotForwardResponse(zap.NewNop().Sugar(), raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := &Message{
+		Message: "[CQ:forward,id=forward-1]",
+		Segment: []message.IMessageElement{&message.ForwardElement{
+			Kind: "forward", ForwardID: "forward-1", Loaded: true, Nodes: nodes,
+		}},
+	}
+	logged := incomingMessageLogText(msg)
+	if !strings.Contains(logged, "[合并转发解析]") || !strings.Contains(logged, "<nested>(10001): inside text") {
+		t.Fatalf("forward log text = %q", logged)
+	}
+	if strings.Contains(msg.Message, "inside text") {
+		t.Fatalf("expanded forward leaked into routing text: %q", msg.Message)
+	}
+}
+
+func TestGocqArrayMessagePreservesForwardID(t *testing.T) {
+	raw := `{"message_type":"group","message_id":1,"message":[{"type":"forward","data":{"id":"forward-1"}}]}`
+	msg := new(MessageQQ)
+	if err := tryParseOneBot11ArrayMessage(zap.NewNop().Sugar(), raw, msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.Message != "[CQ:forward,id=forward-1]" {
+		t.Fatalf("converted message = %q", msg.Message)
+	}
+}
+
+func TestGocqWaitEchoRegistersBeforeRequest(t *testing.T) {
+	adapter := &PlatformAdapterGocq{}
+	echo := adapter.getCustomEcho()
+	var response struct {
+		Status string `json:"status"`
+	}
+	err := adapter.waitEcho2(echo, &response, func(emi *echoMapInfo) {
+		keyBytes, marshalErr := json.Marshal(echo)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		if _, ok := adapter.echoMap2.Load(string(keyBytes)); !ok {
+			t.Fatal("echo was not registered before request dispatch")
+		}
+		emi.ch <- `{"status":"ok"}`
+	})
+	if err != nil || response.Status != "ok" {
+		t.Fatalf("waitEcho2 response=%#v err=%v", response, err)
 	}
 }
 
@@ -236,8 +295,51 @@ func TestDiceScriptForwardFallbackIgnoresInternalSplit(t *testing.T) {
 	deliverReplyPlan(ctx, msg, ctx.wrapForward(inside), "", true)
 	adapter.mu.Lock()
 	defer adapter.mu.Unlock()
-	if len(adapter.groupMsgs) != 1 || adapter.groupMsgs[0] != "first\n\nsecond" {
+	if len(adapter.groupMsgs) != 1 || adapter.groupMsgs[0] != "first\nsecond" {
 		t.Fatalf("fallback messages = %#v", adapter.groupMsgs)
+	}
+}
+
+func TestTextMapCompatibilityAcceptsMultilineForward(t *testing.T) {
+	d, endpoint, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	d.UIEndpoint = endpoint
+	const expr = "帮助:娱乐\n{forward(`.gugu // 一 #{SPLIT}\n.jrrp // 二`)}"
+	TextMapCompatibleCheck(d, "测试", "合并转发", []TextTemplateItem{{expr, 1}})
+	items, ok := d.TextMapCompatible.Load("测试:合并转发")
+	if !ok {
+		t.Fatal("compatibility result missing")
+	}
+	info, ok := items.Load(expr)
+	if !ok {
+		t.Fatal("compatibility item missing")
+	}
+	if info.Version != "v2" || info.ErrV2 != "" {
+		t.Fatalf("compatibility result = %#v", info)
+	}
+	adapter := newMockPlatformAdapter()
+	fallbackCtx := &MsgContext{EndPoint: &EndPointInfo{
+		EndPointInfoBase: EndPointInfoBase{Platform: "DISCORD"}, Adapter: adapter,
+	}}
+	fallbackCtx.SetSplitKey("###SPLIT-KEY###")
+	deliverReplyPlan(fallbackCtx, &Message{MessageType: "group", GroupID: "Discord-Channel:1"}, info.TextV2, "", true)
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	if len(adapter.groupMsgs) != 2 || adapter.groupMsgs[0] != "帮助:娱乐" || adapter.groupMsgs[1] != ".gugu // 一\n.jrrp // 二" {
+		t.Fatalf("Discord fallback messages = %#v", adapter.groupMsgs)
+	}
+}
+
+func TestForwardFallbackPreservesInlineSplitLayout(t *testing.T) {
+	const key = "###SPLIT-KEY###"
+	if got := stripForwardSplitMarkers("first "+key+" second", key); got != "first\nsecond" {
+		t.Fatalf("inline fallback = %q", got)
+	}
+	if got := stripForwardSplitMarkers("first "+key+"\nsecond", key); got != "first\nsecond" {
+		t.Fatalf("line-end fallback = %q", got)
+	}
+	if got := stripForwardSplitMarkers("first\r\n  "+key+"  \r\nsecond", key); got != "first\r\nsecond" {
+		t.Fatalf("CRLF fallback = %q", got)
 	}
 }
 
