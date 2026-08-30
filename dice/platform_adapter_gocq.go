@@ -334,6 +334,8 @@ func tryParseOneBot11ArrayMessage(log *zap.SugaredLogger, message string, writeT
 			cqMessage.WriteString("[CQ:poke]")
 		case "reply":
 			_, _ = fmt.Fprintf(&cqMessage, "[CQ:reply,id=%v]", dataObj.Get("id").String())
+		case "forward":
+			_, _ = fmt.Fprintf(&cqMessage, "[CQ:forward,id=%v]", dataObj.Get("id").String())
 		}
 	}
 	// 赋值对应的Message
@@ -1082,6 +1084,15 @@ func (pa *PlatformAdapterGocq) Serve() int {
 				if msg.Sender.Nickname == "" {
 					msg.Sender.Nickname = "未知用户"
 				}
+			}
+			normalizeIncomingMessageText(session.Parent, msg, msg.Message)
+			if messageHasUnloadedForward(msg) {
+				go func() {
+					defer ErrorLogAndContinue(pa.EndPoint.Session.Parent)
+					pa.expandGocqForwards(msg)
+					session.Execute(ep, msg, false)
+				}()
+				return
 			}
 			session.Execute(ep, msg, false)
 		} else {

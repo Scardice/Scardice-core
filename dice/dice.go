@@ -615,7 +615,7 @@ func (d *Dice) _ExprTextBaseV1(buffer string, ctx *MsgContext, flags RollExtraFl
 
 	// 隐藏的内置字符串符号 \x1e
 	val, detail, err := d._ExprEvalBaseV1("\x1e"+buffer+"\x1e", ctx, flags)
-	if err != nil {
+	if err != nil && (ctx == nil || !ctx.IsCompatibilityTest) {
 		d.Logger.Warnf("脚本执行出错: %s -> %v", buffer, err)
 	}
 

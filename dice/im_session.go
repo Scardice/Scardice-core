@@ -958,6 +958,39 @@ func ensureMessageTextFromSegments(msg *Message) {
 	msg.Message = message.ConvertMessageElementsToString(msg.Segment)
 }
 
+func incomingMessageLogText(msg *Message) string {
+	if msg == nil {
+		return ""
+	}
+	var builder strings.Builder
+	builder.WriteString(msg.Message)
+	var appendNodes func([]message.ForwardNode, string)
+	appendNodes = func(nodes []message.ForwardNode, indent string) {
+		for index, node := range nodes {
+			content := strings.TrimSpace(message.ConvertMessageElementsToString(node.Elements))
+			_, _ = fmt.Fprintf(&builder, "\n%s[%d] <%s>(%s): %s", indent, index+1, node.SenderName, node.SenderID, content)
+			for _, element := range node.Elements {
+				if nested, ok := element.(*message.ForwardElement); ok && nested.Loaded {
+					appendNodes(nested.Nodes, indent+"  ")
+				}
+			}
+		}
+	}
+	for _, element := range msg.Segment {
+		forward, ok := element.(*message.ForwardElement)
+		if !ok {
+			continue
+		}
+		if forward.Loaded {
+			builder.WriteString("\n[合并转发解析]")
+			appendNodes(forward.Nodes, "  ")
+		} else if forward.LoadError != "" {
+			_, _ = fmt.Fprintf(&builder, "\n[合并转发解析失败: %s]", forward.LoadError)
+		}
+	}
+	return builder.String()
+}
+
 func normalizeIncomingMessageText(d *Dice, msg *Message, text string) {
 	normalized := message.ImageRewrite(text, message.SealCodeToCqCode)
 	msg.Message = normalized
@@ -1229,7 +1262,7 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 					mctx.IsCurGroupBotOn = true
 				}
 
-				log.Infof("收到群(%s)内<%s>(%s)的指令: %s", msg.GroupID, msg.Sender.Nickname, msg.Sender.UserID, msg.Message)
+				log.Infof("收到群(%s)内<%s>(%s)的指令: %s", msg.GroupID, msg.Sender.Nickname, msg.Sender.UserID, incomingMessageLogText(msg))
 			} else {
 				doLog := true
 				if d.Config.OnlyLogCommandInGroup {
@@ -1243,7 +1276,7 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 					}
 				}
 				if doLog {
-					log.Infof("收到群(%s)内<%s>(%s)的消息: %s", msg.GroupID, msg.Sender.Nickname, msg.Sender.UserID, msg.Message)
+					log.Infof("收到群(%s)内<%s>(%s)的消息: %s", msg.GroupID, msg.Sender.Nickname, msg.Sender.UserID, incomingMessageLogText(msg))
 					// fmt.Printf("消息长度 %v 内容 %v \n", len(msg.Message), []byte(msg.Message))
 				}
 			}
@@ -1281,9 +1314,9 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 
 		if msg.MessageType == "private" {
 			if mctx.CommandID != 0 {
-				log.Infof("收到<%s>(%s)的私聊指令: %s", msg.Sender.Nickname, msg.Sender.UserID, msg.Message)
+				log.Infof("收到<%s>(%s)的私聊指令: %s", msg.Sender.Nickname, msg.Sender.UserID, incomingMessageLogText(msg))
 			} else if !d.Config.OnlyLogCommandInPrivate {
-				log.Infof("收到<%s>(%s)的私聊消息: %s", msg.Sender.Nickname, msg.Sender.UserID, msg.Message)
+				log.Infof("收到<%s>(%s)的私聊消息: %s", msg.Sender.Nickname, msg.Sender.UserID, incomingMessageLogText(msg))
 			}
 		}
 		// Note(Szzrain): 赋值临时变量，不然有些地方没法用
@@ -1578,7 +1611,7 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 				mctx.IsCurGroupBotOn = true
 			}
 
-			log.Infof("收到群(%s)内<%s>(%s)的指令: %s", msg.GroupID, msg.Sender.Nickname, msg.Sender.UserID, msg.Message)
+			log.Infof("收到群(%s)内<%s>(%s)的指令: %s", msg.GroupID, msg.Sender.Nickname, msg.Sender.UserID, incomingMessageLogText(msg))
 		} else {
 			doLog := true
 			if d.Config.OnlyLogCommandInGroup {
@@ -1592,7 +1625,7 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 				}
 			}
 			if doLog {
-				log.Infof("收到群(%s)内<%s>(%s)的消息: %s", msg.GroupID, msg.Sender.Nickname, msg.Sender.UserID, msg.Message)
+				log.Infof("收到群(%s)内<%s>(%s)的消息: %s", msg.GroupID, msg.Sender.Nickname, msg.Sender.UserID, incomingMessageLogText(msg))
 				// fmt.Printf("消息长度 %v 内容 %v \n", len(msg.Message), []byte(msg.Message))
 			}
 		}
@@ -1602,9 +1635,9 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 	if msg.MessageType == "private" {
 		// TODO(Szzrain): 需要优化的写法，不应根据 CommandID 来判断是否是指令，而应该根据 cmdArgs 是否 match 到指令来判断，同上
 		if mctx.CommandID != 0 {
-			log.Infof("收到<%s>(%s)的私聊指令: %s", msg.Sender.Nickname, msg.Sender.UserID, msg.Message)
+			log.Infof("收到<%s>(%s)的私聊指令: %s", msg.Sender.Nickname, msg.Sender.UserID, incomingMessageLogText(msg))
 		} else if !d.Config.OnlyLogCommandInPrivate {
-			log.Infof("收到<%s>(%s)的私聊消息: %s", msg.Sender.Nickname, msg.Sender.UserID, msg.Message)
+			log.Infof("收到<%s>(%s)的私聊消息: %s", msg.Sender.Nickname, msg.Sender.UserID, incomingMessageLogText(msg))
 		}
 	}
 
