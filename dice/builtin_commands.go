@@ -680,7 +680,9 @@ func (d *Dice) registerCoreCommands() {
 
 	helpForHelp := ".help // 查看本帮助\n" +
 		".help 指令 // 查看某指令信息\n" +
-		".help 特殊功能 // 查看骰主配置的额外功能教程\n" +
+		".help 骰点 // 查看骰主配置的骰点教程\n" +
+		".help 房规 // 查看骰主配置的房规\n" +
+		".help 特色功能 // 查看骰主配置的额外功能教程\n" +
 		".help 扩展模块 // 查看扩展信息，如.help coc7\n" +
 		".help 关键字 // 查看任意帮助，同.find\n" +
 		".help reload // 重新加载帮助文档，需要Master权限"
@@ -720,6 +722,14 @@ func (d *Dice) registerCoreCommands() {
 			if cmdArgs.IsArgEqual(1, "help") {
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 			}
+			if cmdArgs.IsArgEqual(1, "骰点") {
+				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰子帮助文本_骰点"))
+				return CmdExecuteResult{Matched: true, Solved: true}
+			}
+			if cmdArgs.IsArgEqual(1, "房规") {
+				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰子帮助文本_房规"))
+				return CmdExecuteResult{Matched: true, Solved: true}
+			}
 			if cmdArgs.IsArgEqual(1, "骰主", "骰主信息") {
 				masterMsg := DiceFormatTmpl(ctx, "核心:骰子帮助文本_骰主")
 				ReplyToSender(ctx, msg, masterMsg)
@@ -734,8 +744,8 @@ func (d *Dice) registerCoreCommands() {
 				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰子帮助文本_娱乐"))
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
-			if cmdArgs.IsArgEqual(1, "特殊功能") {
-				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰子帮助文本_特殊功能"))
+			if cmdArgs.IsArgEqual(1, "特色功能") {
+				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰子帮助文本_特色功能"))
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
 			if cmdArgs.IsArgEqual(1, "其他", "其它") {
