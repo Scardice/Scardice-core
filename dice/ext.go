@@ -16,6 +16,7 @@ import (
 	"go.uber.org/zap"
 
 	"Scardice-core/dice/events"
+	"Scardice-core/utils/jsengine"
 )
 
 const (
@@ -303,115 +304,49 @@ type messagePreprocessDecision struct {
 }
 
 func parseMessagePreprocessValue(vm *goja.Runtime, value goja.Value) messagePreprocessDecision {
-	if value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
+	return parseMessagePreprocessEngineValue(gojaEngineValue{vm: vm, value: value})
+}
+
+func parseMessagePreprocessEngineValue(value jsengine.Value) messagePreprocessDecision {
+	if value == nil || value.Export() == nil {
 		return messagePreprocessDecision{action: messagePreprocessNoop}
 	}
 
-	if text, ok := value.Export().(string); ok {
-		if text == "" {
-			return messagePreprocessDecision{action: messagePreprocessIntercept}
+	object := value.Object()
+	if object == nil {
+		if text, ok := value.Export().(string); ok {
+			if text == "" {
+				return messagePreprocessDecision{action: messagePreprocessIntercept}
+			}
+			return messagePreprocessDecision{action: messagePreprocessRewrite, message: text}
 		}
-		return messagePreprocessDecision{action: messagePreprocessRewrite, message: text}
-	}
-
-	if vm == nil {
-		if exported, ok := value.Export().(map[string]interface{}); ok {
-			return parseMessagePreprocessExportedObject(exported)
-		}
 		return messagePreprocessDecision{action: messagePreprocessNoop}
 	}
-
-	obj := value.ToObject(vm)
-	if obj == nil {
-		return messagePreprocessDecision{action: messagePreprocessNoop}
-	}
-
-	if !objectHasOwnProperty(obj, "message") {
+	if !object.Has("message") {
 		return messagePreprocessDecision{action: messagePreprocessNoop}
 	}
 
 	reason := ""
-	reasonValue := obj.Get("reason")
-	if reasonValue != nil && !goja.IsUndefined(reasonValue) && !goja.IsNull(reasonValue) {
-		reason = reasonValue.String()
+	if reasonValue := object.Get("reason"); reasonValue != nil && reasonValue.Export() != nil {
+		if text, ok := reasonValue.Export().(string); ok {
+			reason = text
+		}
 	}
 
-	msgValue := obj.Get("message")
-	if msgValue == nil {
+	messageValue := object.Get("message")
+	if messageValue == nil || messageValue.Export() == nil {
 		return messagePreprocessDecision{action: messagePreprocessIntercept, reason: reason}
 	}
-	if text, ok := msgValue.Export().(string); ok {
+	if text, ok := messageValue.Export().(string); ok {
 		if text == "" {
 			return messagePreprocessDecision{action: messagePreprocessIntercept, reason: reason}
 		}
 		return messagePreprocessDecision{action: messagePreprocessRewrite, message: text, reason: reason}
 	}
-	if !msgValue.ToBoolean() {
+	if !messageValue.ToBoolean() {
 		return messagePreprocessDecision{action: messagePreprocessIntercept, reason: reason}
 	}
 	return messagePreprocessDecision{action: messagePreprocessNoop, reason: reason}
-}
-
-func objectHasOwnProperty(obj *goja.Object, key string) bool {
-	for _, name := range obj.GetOwnPropertyNames() {
-		if name == key {
-			return true
-		}
-	}
-	return false
-}
-
-func parseMessagePreprocessExportedObject(obj map[string]interface{}) messagePreprocessDecision {
-	msgValue, exists := obj["message"]
-	if !exists {
-		return messagePreprocessDecision{action: messagePreprocessNoop}
-	}
-	reason, _ := obj["reason"].(string)
-	if text, ok := msgValue.(string); ok {
-		if text == "" {
-			return messagePreprocessDecision{action: messagePreprocessIntercept, reason: reason}
-		}
-		return messagePreprocessDecision{action: messagePreprocessRewrite, message: text, reason: reason}
-	}
-	if !isExportedValueTruthy(msgValue) {
-		return messagePreprocessDecision{action: messagePreprocessIntercept, reason: reason}
-	}
-	return messagePreprocessDecision{action: messagePreprocessNoop, reason: reason}
-}
-
-func isExportedValueTruthy(value interface{}) bool {
-	switch v := value.(type) {
-	case nil:
-		return false
-	case bool:
-		return v
-	case int:
-		return v != 0
-	case int8:
-		return v != 0
-	case int16:
-		return v != 0
-	case int32:
-		return v != 0
-	case int64:
-		return v != 0
-	case uint:
-		return v != 0
-	case uint8:
-		return v != 0
-	case uint16:
-		return v != 0
-	case uint32:
-		return v != 0
-	case uint64:
-		return v != 0
-	case float32:
-		return v != 0
-	case float64:
-		return v != 0
-	default:
-		return true
-	}
 }
 
 func cloneMessageForPreprocess(msg *Message) *Message {
@@ -428,11 +363,34 @@ func cloneMessageForPreprocess(msg *Message) *Message {
 // CallOnMessagePreprocess 调用 OnMessagePreprocess 回调（处理 wrapper 代理）。
 func (i *ExtInfo) CallOnMessagePreprocess(d *Dice, ctx *MsgContext, msg *Message) messagePreprocessDecision {
 	ext := i.GetRealExt()
-	if ext == nil || ext.OnMessagePreprocess == nil {
+	var decision messagePreprocessDecision
+	if ext == nil || (ext.OnMessagePreprocess == nil && ext.OnMessagePreprocessEngine == nil) {
 		return messagePreprocessDecision{action: messagePreprocessNoop}
 	}
 
-	var decision messagePreprocessDecision
+	if ext.OnMessagePreprocessEngine != nil {
+		if !ext.IsJsExt || d.ExtLoopManager == nil {
+			return messagePreprocessDecision{action: messagePreprocessNoop}
+		}
+		loop, err := d.ExtLoopManager.GetEngineLoop(ext.JSLoopVersion)
+		if err != nil {
+			d.Logger.Errorf("扩展<%s>运行环境已经过期: %v", ext.Name, err)
+			return messagePreprocessDecision{action: messagePreprocessNoop}
+		}
+		err = loop.Run(func(runtime jsengine.Runtime) error {
+			value, err := ext.OnMessagePreprocessEngine(runtime, ctx, cloneMessageForPreprocess(msg))
+			if err != nil {
+				return err
+			}
+			decision = parseMessagePreprocessEngineValue(value)
+			return nil
+		})
+		if err != nil {
+			d.Logger.Errorf("扩展<%s>预处理异常: %v", ext.Name, err)
+		}
+		return decision
+	}
+
 	run := func(vm *goja.Runtime) {
 		decision = parseMessagePreprocessValue(vm, ext.OnMessagePreprocess(ctx, cloneMessageForPreprocess(msg)))
 	}

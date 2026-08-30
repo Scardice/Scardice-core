@@ -23,6 +23,7 @@ import (
 	"Scardice-core/message"
 	"Scardice-core/model"
 	"Scardice-core/utils/dboperator/engine"
+	"Scardice-core/utils/jsengine"
 
 	"github.com/golang-module/carbon"
 	ds "github.com/sealdice/dicescript"
@@ -2816,7 +2817,11 @@ func formatJSSolveRecoveredError(recovered any) error {
 }
 
 func parseJSSolveResult(vm *goja.Runtime, ctx *MsgContext, solveName string, value goja.Value) (CmdExecuteResult, error) {
-	if goja.IsUndefined(value) || goja.IsNull(value) {
+	return parseJSSolveEngineResult(ctx, solveName, gojaEngineValue{vm: vm, value: value})
+}
+
+func parseJSSolveEngineResult(ctx *MsgContext, solveName string, value jsengine.Value) (CmdExecuteResult, error) {
+	if value == nil || value.Export() == nil {
 		// 兼容旧插件：很多 JS solve 只 reply，不显式返回结果。
 		// 仅当本次命令已通过统一回复路径发过消息时，才把空返回视为成功，避免吞掉真实插件错误。
 		if ctx != nil && ctx.IsCommandReplied() {
@@ -2832,48 +2837,19 @@ func parseJSSolveResult(vm *goja.Runtime, ctx *MsgContext, solveName string, val
 	if retPtr, ok := value.Export().(*CmdExecuteResult); ok && retPtr != nil {
 		return *retPtr, nil
 	}
-	if m, ok := value.Export().(map[string]interface{}); ok {
-		_, hasMatched := m["matched"]
-		_, hasSolved := m["solved"]
-		_, hasShowHelp := m["showHelp"]
-		if !hasMatched && !hasSolved && !hasShowHelp {
-			return CmdExecuteResult{}, errors.New("invalid solve result: missing matched/solved/showHelp")
-		}
-		toBool := func(v interface{}) bool {
-			if v == nil {
-				return false
-			}
-			return vm.ToValue(v).ToBoolean()
-		}
-		return CmdExecuteResult{
-			Matched:  toBool(m["matched"]),
-			Solved:   toBool(m["solved"]),
-			ShowHelp: toBool(m["showHelp"]),
-		}, nil
-	}
 
-	obj := value.ToObject(vm)
-	if obj == nil {
+	object := value.Object()
+	if object == nil {
 		return CmdExecuteResult{}, errors.New("invalid solve result")
 	}
-	safeBool := func(v goja.Value) bool {
-		if v == nil || goja.IsUndefined(v) || goja.IsNull(v) {
-			return false
-		}
-		return v.ToBoolean()
-	}
-	matchedVal := obj.Get("matched")
-	solvedVal := obj.Get("solved")
-	showHelpVal := obj.Get("showHelp")
-	if (matchedVal == nil || goja.IsUndefined(matchedVal) || goja.IsNull(matchedVal)) &&
-		(solvedVal == nil || goja.IsUndefined(solvedVal) || goja.IsNull(solvedVal)) &&
-		(showHelpVal == nil || goja.IsUndefined(showHelpVal) || goja.IsNull(showHelpVal)) {
+	if !object.Has("matched") && !object.Has("solved") && !object.Has("showHelp") {
 		return CmdExecuteResult{}, errors.New("invalid solve result: missing matched/solved/showHelp")
 	}
+
 	return CmdExecuteResult{
-		Matched:  safeBool(matchedVal),
-		Solved:   safeBool(solvedVal),
-		ShowHelp: safeBool(showHelpVal),
+		Matched:  object.Get("matched").ToBoolean(),
+		Solved:   object.Get("solved").ToBoolean(),
+		ShowHelp: object.Get("showHelp").ToBoolean(),
 	}, nil
 }
 
@@ -3109,9 +3085,39 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 
 		var ret CmdExecuteResult
 		// JS 兼容执行路径：
-		// 1. 原生 JS 命令(IsJsSolveFunc=true)
-		// 2. 非 JS 命令但被脚本通过 cmd.solve 覆写（SolveRaw!=nil）
-		if item.IsJsSolveFunc || item.SolveRaw != nil {
+		// 1. 引擎无关命令回调（SolveEngine）
+		// 2. 原生 Goja JS 命令(IsJsSolveFunc=true)
+		// 3. 非 JS 命令但被脚本通过 cmd.solve 覆写（SolveRaw!=nil）
+		if item.SolveEngine != nil {
+			if s.Parent.ExtLoopManager == nil {
+				executeErr = errors.New("loop manager is nil")
+				s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境不可用: %v", item.Name, executeErr)
+				return CmdExecuteResult{Matched: true, Solved: false}
+			}
+			loop, err := s.Parent.ExtLoopManager.GetEngineLoop(item.JSLoopVersion)
+			if err != nil {
+				executeErr = err
+				s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境已经过期: %v", item.Name, err)
+				return CmdExecuteResult{Matched: true, Solved: false}
+			}
+			err = loop.Run(func(runtime jsengine.Runtime) error {
+				value, err := item.SolveEngine(runtime, ctx, msg, cmdArgs)
+				if err != nil {
+					return err
+				}
+				ret, err = parseJSSolveEngineResult(ctx, item.Name, value)
+				return err
+			})
+			if err != nil {
+				if errors.Is(err, errJSSolveEmptyResult) && waitForCommandReply(ctx, jsSolveEmptyResultGraceWindow) {
+					ret = CmdExecuteResult{Matched: true, Solved: true}
+				} else {
+					executeErr = err
+					ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", err))
+					return CmdExecuteResult{Matched: true, Solved: false}
+				}
+			}
+		} else if item.IsJsSolveFunc || item.SolveRaw != nil {
 			var (
 				loop *eventloop.EventLoop
 				err  error
