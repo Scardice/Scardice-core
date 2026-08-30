@@ -104,9 +104,8 @@ func (transport proxyRoundTripper) RoundTrip(request *http.Request) (*http.Respo
 
 func snapshotProcessEnv() map[string]string {
 	snapshot := make(map[string]string)
-	for _, entry := range os.Environ() {
-		key, value, ok := strings.Cut(entry, "=")
-		if ok {
+	for _, key := range []string{"LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_TIME", "TZ"} {
+		if value, ok := os.LookupEnv(key); ok {
 			snapshot[key] = value
 		}
 	}
