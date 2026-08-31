@@ -78,8 +78,8 @@ func (d *Dice) installJSHostAPI(runtime jsengine.Runtime) error {
 			if !ok {
 				return nil
 			}
-			copy := *i
-			return &copy
+			itemCopy := *i
+			return &itemCopy
 		}},
 	} {
 		if err := setJSHostObject(ban, binding.name, binding.value); err != nil {

@@ -109,19 +109,19 @@ func (d *Dice) jsInitQuickJS() {
 	versionID := d.ExtLoopManager.SetEngineLoop(loop)
 
 	err = loop.Run(func(runtime jsengine.Runtime) error {
-		if err := d.installJSHostAPI(runtime); err != nil {
-			return err
+		if installErr := d.installJSHostAPI(runtime); installErr != nil {
+			return installErr
 		}
-		if err := d.installJSExtHostAPI(runtime, runtime.Get("seal").Object(), versionID, nil); err != nil {
-			return err
+		if installErr := d.installJSExtHostAPI(runtime, runtime.Get("seal").Object(), versionID, nil); installErr != nil {
+			return installErr
 		}
-		if err := d.installDangerousJSInstance(runtime, runtime.Get("seal").Object()); err != nil {
-			return err
+		if installErr := d.installDangerousJSInstance(runtime, runtime.Get("seal").Object()); installErr != nil {
+			return installErr
 		}
-		if err := runtime.Set("__dirname", ""); err != nil {
-			return err
+		if setErr := runtime.Set("__dirname", ""); setErr != nil {
+			return setErr
 		}
-		_, err := runtime.RunString("quickjs-bootstrap.js", `
+		_, runErr := runtime.RunString("quickjs-bootstrap.js", `
 			Object.freeze(seal);
 			Object.freeze(seal.deck);
 			Object.freeze(seal.coc);
@@ -136,7 +136,7 @@ func (d *Dice) jsInitQuickJS() {
 				}
 			}
 		`)
-		return err
+		return runErr
 	})
 	if err != nil {
 		d.ExtLoopManager.SetEngineLoop(nil)

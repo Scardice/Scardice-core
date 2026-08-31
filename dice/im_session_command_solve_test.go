@@ -5,11 +5,12 @@ import (
 	"testing"
 	"time"
 
-	"Scardice-core/utils/jsengine"
-	quickjs "Scardice-core/utils/jsengine/quickjs"
 	"github.com/dop251/goja"
 	"github.com/dop251/goja_nodejs/eventloop"
 	"go.uber.org/zap"
+
+	"Scardice-core/utils/jsengine"
+	quickjs "Scardice-core/utils/jsengine/quickjs"
 )
 
 func newGameSystemTemplateForTest(relatedExt ...string) *GameSystemTemplate {

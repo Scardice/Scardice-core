@@ -180,10 +180,10 @@ func (s *diceRollShaper) rollStable(src ds.DiceSource, dicePoints int64) int64 {
 		first, second = second, first
 	}
 	if second > third {
-		second, third = third, second
+		second = third
 	}
 	if first > second {
-		first, second = second, first
+		second = first
 	}
 	return unitToInt(second, dicePoints)
 }
@@ -245,16 +245,16 @@ func unitToInt(unit float64, dicePoints int64) int64 {
 	return result
 }
 
-func uniformInt64(src ds.DiceSource, min, max int64) int64 {
-	if min >= max {
-		return min
+func uniformInt64(src ds.DiceSource, minimum, maximum int64) int64 {
+	if minimum >= maximum {
+		return minimum
 	}
-	size := uint64(max - min + 1)
-	limit := uint64(math.MaxUint64 - (math.MaxUint64 % size))
+	size := uint64(maximum - minimum + 1)
+	limit := math.MaxUint64 - (math.MaxUint64 % size)
 	for {
 		value := src.Uint64()
 		if value < limit {
-			return min + int64(value%size)
+			return minimum + int64(value%size)
 		}
 	}
 }

@@ -7,9 +7,10 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"go.uber.org/zap"
+
 	"Scardice-core/utils/jsengine"
 	quickjsadapter "Scardice-core/utils/jsengine/quickjs"
-	"go.uber.org/zap"
 )
 
 func newQuickJSNodeTestDice(t *testing.T) *Dice {

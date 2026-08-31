@@ -6,9 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"Scardice-core/utils/jsengine"
 	"github.com/dop251/goja"
 	"go.uber.org/zap"
+
+	"Scardice-core/utils/jsengine"
 )
 
 type countingDiceSource struct {

@@ -35,24 +35,24 @@ func TestExposeDangerousPreservesMutableNestedObjects(t *testing.T) {
 		},
 		NestedItems: []dangerousNested{{Value: "slice-before"}},
 	}
-	if err := loop.Run(func(runtime jsengine.Runtime) error {
-		value, err := quickjs.ExposeDangerous(runtime, host)
-		if err != nil {
-			return err
+	if runErr := loop.Run(func(runtime jsengine.Runtime) error {
+		value, exposeErr := quickjs.ExposeDangerous(runtime, host)
+		if exposeErr != nil {
+			return exposeErr
 		}
-		if err := runtime.Set("host", value); err != nil {
-			return err
+		if setErr := runtime.Set("host", value); setErr != nil {
+			return setErr
 		}
-		_, err = runtime.RunString("dangerous.js", `
+		_, scriptErr := runtime.RunString("dangerous.js", `
 			host.name = "after";
 			host.nested.value = "nested-after";
 			host.values.entry = "map-after";
 			host.children.first.value = "child-after";
 			host.nestedItems[0].value = "slice-after";
 		`)
-		return err
-	}); err != nil {
-		t.Fatal(err)
+		return scriptErr
+	}); runErr != nil {
+		t.Fatal(runErr)
 	}
 	if host.Name != "after" || host.Nested.Value != "nested-after" || host.Values["entry"] != "map-after" ||
 		host.Children["first"].Value != "child-after" || host.NestedItems[0].Value != "slice-after" {
@@ -95,9 +95,9 @@ func TestRuntimeEvaluatesScript(t *testing.T) {
 
 	var got interface{}
 	err = loop.Run(func(runtime jsengine.Runtime) error {
-		value, err := runtime.RunString("plugin.js", "'scardice'")
-		if err != nil {
-			return err
+		value, runErr := runtime.RunString("plugin.js", "'scardice'")
+		if runErr != nil {
+			return runErr
 		}
 		got = value.Export()
 		return nil
