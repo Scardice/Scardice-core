@@ -217,12 +217,7 @@ func defineFieldWithMode(ctx *quickjs.Context, object *quickjs.Value, name strin
 }
 
 func defineMethod(ctx *quickjs.Context, object *quickjs.Value, name string, method reflect.Value) error {
-	function := ctx.NewFunction(func(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) (result *quickjs.Value) {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				result = ctx.ThrowError(fmt.Errorf("%v", recovered))
-			}
-		}()
+	function := ctx.NewFunction(func(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
 		methodType := method.Type()
 		inputs, err := convertCallArguments(args, methodType)
 		if err != nil {
@@ -306,12 +301,7 @@ func (r *runtime) coerce(raw interface{}) (*quickjs.Value, bool, error) {
 }
 
 func bindFunction(ctx *quickjs.Context, function reflect.Value) *quickjs.Value {
-	return ctx.NewFunction(func(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) (result *quickjs.Value) {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				result = ctx.ThrowError(fmt.Errorf("%v", recovered))
-			}
-		}()
+	return ctx.NewFunction(func(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
 		functionType := function.Type()
 		inputs, err := convertCallArguments(args, functionType)
 		if err != nil {
