@@ -177,5 +177,5 @@ func (l *Loader) RegisterCandidates(registry jsengine.Registry) error {
 }
 
 func wrapNoCgo(path string) error {
-	return fmt.Errorf("%w: cgo is required to load %s", ErrNativeUnavailable, path)
+	return fmt.Errorf("%w: cgo is required to load %s", ErrNativeRuntimeUnsupported, path)
 }

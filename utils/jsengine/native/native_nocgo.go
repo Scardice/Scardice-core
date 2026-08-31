@@ -16,7 +16,7 @@ type LoadedProvider = Provider
 func Load(candidate Candidate) (*Provider, error) { return candidate.Load() }
 func loadNative(candidate Candidate) (*Provider, error) {
 	if _, err := os.Stat(candidate.LibraryPath); errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("%w: %s", ErrMissingLibrary, candidate.LibraryPath)
+		return nil, fmt.Errorf("%w: %w: %s", ErrMissingLibrary, ErrNativeRuntimeUnsupported, candidate.LibraryPath)
 	}
 	return nil, wrapNoCgo(candidate.LibraryPath)
 }

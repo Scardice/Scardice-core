@@ -17,4 +17,7 @@ var (
 	ErrCorruptVTable           = errors.New("native runtime corrupt vtable")
 	ErrTooSmallStruct          = errors.New("native runtime struct too small")
 	ErrNativeUnavailable       = errors.New("native runtime unavailable")
+	// ErrNativeRuntimeUnsupported indicates that native runtimes cannot be loaded
+	// in this build because cgo support is unavailable.
+	ErrNativeRuntimeUnsupported = errors.New("native runtime unsupported without cgo")
 )

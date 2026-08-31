@@ -66,6 +66,9 @@ func TestMissingQuerySymbolIsDiagnosable(t *testing.T) {
 	}
 	candidate := Candidate{LibraryPath: library, Manifest: Manifest{ID: "libc", Version: "1.0.0"}}
 	_, err := candidate.Load()
+	if errors.Is(err, ErrNativeRuntimeUnsupported) {
+		t.Skip("native loading requires cgo")
+	}
 	if !errors.Is(err, ErrMissingQuerySymbol) {
 		t.Fatalf("Load() error = %v, want ErrMissingQuerySymbol", err)
 	}
