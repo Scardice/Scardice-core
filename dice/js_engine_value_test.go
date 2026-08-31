@@ -197,6 +197,35 @@ func TestCallOnMessagePreprocessEngineReportsCallbackErrorAndPanicAsNoop(t *test
 	}
 }
 
+
+func TestCallOnMessagePreprocessEngineHonorsJsEnableForJSProvider(t *testing.T) {
+	loop := gojaengine.New()
+	t.Cleanup(func() { _ = loop.Close() })
+
+	called := false
+	d := &Dice{
+		Config:          Config{JsConfig: JsConfig{JsEnable: false}},
+		ExtLoopManager: NewJsLoopManager(),
+		Logger:          zap.NewNop().Sugar(),
+	}
+	version := d.ExtLoopManager.SetLoop(loop)
+	ext := &ExtInfo{
+		Name:          "disabled-js-provider",
+		IsJsExt:       true,
+		JSLoopVersion: version,
+		OnMessagePreprocessEngine: func(jsengine.Runtime, *MsgContext, *Message) (jsengine.Value, error) {
+			called = true
+			return nil, nil
+		},
+	}
+
+	if decision := ext.CallOnMessagePreprocess(d, &MsgContext{}, &Message{}); decision.action != messagePreprocessNoop {
+		t.Fatalf("decision = %#v, want noop", decision)
+	}
+	if called {
+		t.Fatal("disabled JS provider callback was invoked")
+	}
+}
 type fakeEngineObject struct {
 	values map[string]jsengine.Value
 }

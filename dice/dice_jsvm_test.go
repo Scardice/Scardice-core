@@ -3,6 +3,7 @@ package dice //nolint:testpackage
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/dop251/goja"
@@ -76,6 +77,45 @@ func TestJsInit_WhenExtLoopManagerNil_DoesNotPanic(t *testing.T) {
 	}
 	if !d.Config.JsEnable {
 		t.Fatalf("expected JsEnable to be true after JsInit")
+	}
+}
+
+func TestJsScriptTaskRunWithoutActiveLoopReturnsWithoutPanic(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		manager *JsLoopManager
+	}{
+		{name: "nil manager"},
+		{name: "nil loop", manager: NewJsLoopManager()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.name == "nil loop" {
+				test.manager.SetLoop(nil)
+			}
+			d := &Dice{
+				ExtLoopManager: test.manager,
+				Logger:         zap.NewNop().Sugar(),
+			}
+			called := false
+			task := &JsScriptTask{
+				dice:   d,
+				ext:    &ExtInfo{Name: "task-test"},
+				lock:   &sync.Mutex{},
+				logger: d.Logger,
+				task: func(JsScriptTaskCtx) {
+					called = true
+				},
+			}
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					t.Fatalf("JsScriptTask.run panicked: %v", recovered)
+				}
+			}()
+			task.run()
+			if called {
+				t.Fatal("task callback ran without an active loop")
+			}
+		})
 	}
 }
 

@@ -412,10 +412,15 @@ func (i *ExtInfo) CallOnMessagePreprocess(d *Dice, ctx *MsgContext, msg *Message
 	if ext == nil || (ext.OnMessagePreprocess == nil && ext.OnMessagePreprocessEngine == nil) {
 		return messagePreprocessDecision{action: messagePreprocessNoop}
 	}
-
 	if ext.OnMessagePreprocessEngine != nil {
-		if d == nil || d.ExtLoopManager == nil {
+		if d == nil || (ext.IsJsExt && !d.Config.JsEnable) {
 			if d != nil && d.Logger != nil {
+				d.Logger.Infof("当前已关闭js扩展<%v>", ext.Name)
+			}
+			return messagePreprocessDecision{action: messagePreprocessNoop}
+		}
+		if d.ExtLoopManager == nil {
+			if d.Logger != nil {
 				d.Logger.Errorf("扩展<%s>运行环境不可用", ext.Name)
 			}
 			return messagePreprocessDecision{action: messagePreprocessNoop}

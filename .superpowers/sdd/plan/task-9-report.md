@@ -96,3 +96,44 @@ These are intentional and outside the generic dispatcher cutover:
 - `utils/jsengine/goja/runtime.go`: adapter internals use Goja's `RunOnLoop` to implement neutral `Loop.Run`; this is not a dice generic dispatcher path.
 
 No QuickJS C++/ABI/event-loop implementation was changed.
+
+## Follow-up fixes
+
+### RED
+
+Added `TestJsScriptTaskRunWithoutActiveLoopReturnsWithoutPanic` before the task guard implementation.
+
+```text
+go test ./dice -run TestJsScriptTaskRunWithoutActiveLoopReturnsWithoutPanic -count=1
+WARNING: sonic/ast only supports (go1.17~1.26 and amd64 CPU) or (go1.20~1.26 and arm64 CPU), but your environment is not suitable and will fallback to encoding/json
+--- FAIL: TestJsScriptTaskRunWithoutActiveLoopReturnsWithoutPanic (0.00s)
+    --- FAIL: TestJsScriptTaskRunWithoutActiveLoopReturnsWithoutPanic/nil_manager (0.00s)
+        dice_jsvm_test.go:111: JsScriptTask.run panicked: runtime error: invalid memory address or nil pointer dereference
+FAIL
+FAIL    Scardice-core/dice    0.045s
+FAIL
+```
+
+Added `TestCallOnMessagePreprocessEngineHonorsJsEnableForJSProvider` before adding the JS-provider gate.
+
+```text
+go test ./dice -run TestCallOnMessagePreprocessEngineHonorsJsEnableForJSProvider -count=1
+WARNING: sonic/ast only supports (go1.17~1.26 and amd64 CPU) or (go1.20~1.26 and arm64 CPU), but your environment is not suitable and will fallback to encoding/json
+--- FAIL: TestCallOnMessagePreprocessEngineHonorsJsEnableForJSProvider (0.00s)
+    js_engine_value_test.go:226: disabled JS provider callback was invoked
+FAIL
+FAIL    Scardice-core/dice    0.039s
+FAIL
+```
+
+### GREEN
+
+```text
+go test ./dice -run 'TestJsScriptTaskRunWithoutActiveLoopReturnsWithoutPanic' -count=1
+ok      Scardice-core/dice    0.040s
+
+go test ./dice -run 'TestCallOnMessagePreprocessEngine(HonorsJsEnableForJSProvider|SupportsNonJSProviderAndRestoresContext|ReportsCallbackErrorAndPanicAsNoop)' -count=1
+ok      Scardice-core/dice    0.054s
+```
+
+Follow-up changes are included in commit `FOLLOW_UP_HASH` (replace with the commit hash after committing).

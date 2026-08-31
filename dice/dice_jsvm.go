@@ -2063,7 +2063,14 @@ func (t *JsScriptTask) run() {
 		t.task(taskCtx)
 		return
 	}
+	if t.dice.ExtLoopManager == nil {
+		t.logger.Errorf("插件定时任务获取JS事件循环失败: runtime manager is nil")
+		return
+	}
 	loop, err := t.dice.ExtLoopManager.GetLoop(t.ext.JSLoopVersion)
+	if err == nil && loop == nil {
+		err = errors.New("JavaScript runtime is unavailable")
+	}
 	if err != nil {
 		t.logger.Errorf("插件定时任务获取JS事件循环失败: %v", err)
 		return
