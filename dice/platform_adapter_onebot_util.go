@@ -317,10 +317,11 @@ func (p *PlatformAdapterOnebot) handleAddFriendAction(req gjson.Result, _ *evsoc
 	if err != nil {
 		return err
 	}
+	userID := prepareOnebotFriendAddMessage(req, msg)
 	// 先查看
 	ctx.Group, ctx.Player = GetPlayerInfoBySender(ctx, msg)
 	welcomeStr := DiceFormatTmpl(ctx, "核心:骰子成为好友")
-	p.logger.Infof("与 %s 成为好友，发送好友致辞: %s", req.Get("user_id").String(), welcomeStr)
+	p.logger.Infof("与 %s 成为好友，发送好友致辞: %s", userID, welcomeStr)
 	_ = p.submitAsync(func() {
 		// 与旧 onebot 链保持一致：上游可能先发 friend_add，再真正建立好友关系。
 		time.Sleep(5 * time.Second)
@@ -335,6 +336,16 @@ func (p *PlatformAdapterOnebot) handleAddFriendAction(req gjson.Result, _ *evsoc
 		}
 	})
 	return nil
+}
+
+// friend_add 是 notice 事件，没有普通消息中的 sender 字段。发送好友致辞和
+// OnBecomeFriend 钩子都需要明确的私聊发送者，因此从事件顶层 user_id 补齐。
+func prepareOnebotFriendAddMessage(req gjson.Result, msg *Message) string {
+	userID := canonicalOnebotUserID(req.Get("user_id").String())
+	msg.MessageType = "private"
+	msg.Platform = "QQ"
+	msg.Sender.UserID = userID
+	return userID
 }
 
 func (p *PlatformAdapterOnebot) handleJoinGroupAction(req gjson.Result, _ *evsocket.EventPayload) error {

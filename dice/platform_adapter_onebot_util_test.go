@@ -4,10 +4,34 @@ import (
 	"testing"
 
 	"github.com/bytedance/sonic"
+	"github.com/tidwall/gjson"
+	"go.uber.org/zap"
 
 	"Scardice-core/dice/imsdk/onebot/schema"
 	"Scardice-core/message"
 )
+
+func TestPrepareOnebotFriendAddMessageUsesTopLevelUserID(t *testing.T) {
+	req := gjson.Parse(`{"post_type":"notice","notice_type":"friend_add","self_id":1494707536,"user_id":732899935}`)
+	msg, err := arrayByte2ScardiceMessage(zap.NewNop().Sugar(), []byte(req.Raw))
+	if err != nil {
+		t.Fatalf("arrayByte2ScardiceMessage returned error: %v", err)
+	}
+	if msg.Sender.UserID != "" {
+		t.Fatalf("friend_add notice unexpectedly supplied sender user id: %q", msg.Sender.UserID)
+	}
+
+	userID := prepareOnebotFriendAddMessage(req, msg)
+	if userID != "QQ:732899935" {
+		t.Fatalf("recipient = %q, want QQ:732899935", userID)
+	}
+	if msg.Sender.UserID != userID {
+		t.Fatalf("message sender = %q, want recipient %q", msg.Sender.UserID, userID)
+	}
+	if msg.MessageType != "private" || msg.Platform != "QQ" {
+		t.Fatalf("message routing = %q/%q, want private/QQ", msg.MessageType, msg.Platform)
+	}
+}
 
 func TestConvertSealMsgToMessageChain_AtElement(t *testing.T) {
 	input := []message.IMessageElement{
