@@ -66,9 +66,11 @@ type (
 
 	// WebSocket 表示WebSocket模块的一个实例
 	WebSocket struct {
-		rt   *goja.Runtime
-		loop *eventloop.EventLoop
+		rt        *goja.Runtime
+		loop      *eventloop.EventLoop
+		authorize func(string) error
 	}
+
 	WebSocketManager struct {
 		connections []*WebSocketConnection
 		mutex       sync.Mutex
@@ -121,9 +123,16 @@ func New() *WebSocketModule {
 
 // NewInstance 为给定的goja运行时创建一个新的WebSocket实例
 func (m *WebSocketModule) NewInstance(rt *goja.Runtime, loop *eventloop.EventLoop) *WebSocket {
+	return m.NewInstanceWithPolicy(rt, loop, nil)
+}
+
+// NewInstanceWithPolicy creates a WebSocket adapter with a pre-dial policy
+// check. The hook runs on the Goja owner thread before any network goroutine.
+func (m *WebSocketModule) NewInstanceWithPolicy(rt *goja.Runtime, loop *eventloop.EventLoop, authorize func(string) error) *WebSocket {
 	return &WebSocket{
-		rt:   rt,
-		loop: loop,
+		rt:        rt,
+		loop:      loop,
+		authorize: authorize,
 	}
 }
 
@@ -252,6 +261,11 @@ func (ws *WebSocket) NewWebSocketConnection(call goja.FunctionCall) goja.Value {
 	}
 
 	url := args[0].String()
+	if ws.authorize != nil {
+		if err := ws.authorize(url); err != nil {
+			panic(rt.NewGoError(err))
+		}
+	}
 	var options *webSocketOptions
 
 	// 第二个参数是 protocols (可选)
@@ -635,8 +649,14 @@ func (conn *WebSocketConnection) webSocketCloseConnection() {
 // Enable 为给定的goja运行时启用WebSocket模块
 // 这是一个便利函数，用于快速设置WebSocket模块
 func Enable(rt *goja.Runtime, loop *eventloop.EventLoop) {
+	EnableWithPolicy(rt, loop, nil)
+}
+
+// EnableWithPolicy installs WebSocket with an authorization hook that runs
+// before dialing. A denied URL never starts a connection goroutine.
+func EnableWithPolicy(rt *goja.Runtime, loop *eventloop.EventLoop, authorize func(string) error) {
 	module := New()
-	instance := module.NewInstance(rt, loop)
+	instance := module.NewInstanceWithPolicy(rt, loop, authorize)
 	_ = rt.Set("WebSocket", instance.Exports())
 }
 

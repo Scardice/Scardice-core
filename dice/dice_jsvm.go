@@ -21,12 +21,8 @@ import (
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/dop251/goja"
-	"github.com/dop251/goja_nodejs/buffer"
-	"github.com/dop251/goja_nodejs/console"
 	"github.com/dop251/goja_nodejs/eventloop"
 	"github.com/dop251/goja_nodejs/require"
-	"github.com/dop251/goja_nodejs/url"
-	"github.com/dop251/goja_nodejs/util"
 	esbuild "github.com/evanw/esbuild/pkg/api"
 	"github.com/golang-module/carbon"
 	"github.com/pkg/errors"
@@ -39,13 +35,9 @@ import (
 	"Scardice-core/utils"
 	"Scardice-core/utils/crypto"
 	"Scardice-core/utils/jsengine"
+	jsservices "Scardice-core/utils/jsengine/services"
+	gojaservices "Scardice-core/utils/jsengine/services/goja"
 	gojaengine "Scardice-core/utils/jsengine/goja"
-	sealabort "Scardice-core/utils/plugin/abort"
-	sealcrypto "Scardice-core/utils/plugin/crypto"
-	sealhttp "Scardice-core/utils/plugin/httpextra"
-	sealsclone "Scardice-core/utils/plugin/structuredclone"
-	sealutil "Scardice-core/utils/plugin/utilinspect"
-	sealws "Scardice-core/utils/plugin/websocket"
 )
 
 var (
@@ -376,53 +368,35 @@ func (d *Dice) jsInitGoja() {
 
 	printer := &PrinterFunc{d, false, []string{}}
 	d.JsPrinter = printer
-	reg.RegisterNativeModule("console", console.RequireWithPrinter(printer))
-	reg.RegisterNativeModule("crypto", sealcrypto.Require)
-	reg.RegisterNativeModule("@seal/abort", sealabort.Require)
-	reg.RegisterNativeModule("@seal/http", sealhttp.Require)
-	reg.RegisterNativeModule("@seal/structuredclone", sealsclone.Require)
-	reg.RegisterNativeModule("@seal/utilinspect", sealutil.Require)
-	reg.RegisterNativeModule("fs", func(rt *goja.Runtime, module *goja.Object) {
-		jsFsRequire(rt, module, d, loop)
+	serviceRegistry := jsservices.NewRegistry()
+	gojaInstaller := gojaservices.NewInstaller(gojaservices.Options{
+		Registry: reg,
+		Loop:     loop,
+		Proxy:    proxy,
+		Printer:  printer,
+		Logger:   d.Logger,
+		NetworkAuthorize: func(target string) error { return jsNetworkAuthorize(d, target) },
+		Filesystem: gojaservices.FilesystemHooks{
+			Require: func(rt *goja.Runtime, module *goja.Object) {
+				jsFsRequire(rt, module, d, loop)
+			},
+			Enable: func(rt *goja.Runtime) {
+				jsFsEnable(rt, d, loop)
+			},
+		},
 	})
-
-	d.JsScriptCron = cron.New(cron.WithParser(taskCronParser))
-	d.JsScriptCronLock = &sync.Mutex{}
-	d.JsScriptCron.Start()
-	// 单独给WebSocket一个Logger
-	sealws.SetLogger(d.Logger)
-	// 关闭之前的所有WebSocket
-	sealws.GlobalConnManager.CloseAll()
+	if _, err := serviceRegistry.Install(gojaInstaller); err != nil {
+		panic(err)
+	}
 	// 初始化
 	loop.Run(func(vm *goja.Runtime) {
 		vm.SetFieldNameMapper(goja.TagFieldNameMapper("jsbind", true))
 		// 直接绑定进程内唯一全局随机源，避免再包一层无意义的适配。
 		vm.SetRandSource(DiceRandFloat64)
 
-		// console 模块
-		console.Enable(vm)
-
-		sealws.Enable(vm, loop)
-		// require 模块
-		reg.Enable(vm)
-		sealcrypto.Enable(vm)
-
-		buffer.Enable(vm)
-		url.Enable(vm)
-		sealabort.Enable(vm)
-		sealhttp.Enable(vm)
-		if err := sealhttp.EnableFetch(vm, loop, proxy); err != nil {
+		if err := gojaInstaller.Enable(vm); err != nil {
 			panic(err)
 		}
-		sealsclone.Enable(vm)
-		sealutil.Enable(vm)
-		jsFsEnable(vm, d, loop)
-		utilMod := vm.NewObject()
-		utilExports := vm.NewObject()
-		_ = utilMod.Set("exports", utilExports)
-		util.Require(vm, utilMod)
-		_ = utilExports.Set("inspect", sealutil.Inspect(vm))
-		_ = vm.Set("util", utilExports)
 		runtime := gojaengine.Wrap(vm)
 		if err := d.installJSHostAPI(runtime); err != nil {
 			panic(err)
@@ -494,6 +468,10 @@ func (d *Dice) jsClear() {
 	// 注意：不标记 wrapper 为 IsDeleted，否则重载期间消息到达会导致 wrapper 被移除
 	// IsDeleted 只在 JsDelete/ExtRemove（永久删除脚本）时设置
 	d.JsSealInstExposed = false
+	if d.JsServices != nil {
+		_ = d.JsServices.Close()
+		d.JsServices = nil
+	}
 
 	// 清空/初始化 JsExtRegistry
 	if d.JsExtRegistry != nil {

@@ -25,6 +25,7 @@ import (
 	"Scardice-core/logger"
 	"Scardice-core/utils/dboperator/engine"
 	"Scardice-core/utils/jsengine"
+	jsservices "Scardice-core/utils/jsengine/services"
 	"Scardice-core/utils/public_dice"
 	randcore "Scardice-core/utils/random"
 )
@@ -238,6 +239,7 @@ type Dice struct {
 	Cron             *cron.Cron           `json:"-"             yaml:"-"`
 	AliveNoticeEntry cron.EntryID         `json:"-"             yaml:"-"`
 	JsPrinter        *PrinterFunc         `json:"-"             yaml:"-"`
+	JsServices       *jsservices.Registry `json:"-"             yaml:"-"`
 
 	// JsLoop           *eventloop.EventLoop `yaml:"-" json:"-"`
 	ExtLoopManager   *JsLoopManager  `json:"-" yaml:"-"`

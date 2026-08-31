@@ -187,6 +187,55 @@ func jsFsCurrentExtName(d *Dice) (string, error) {
 	}
 	return "", errors.New("无法确定当前扩展身份,data:// 路径不可用")
 }
+// jsNetworkAuthorize enforces the current SealPack network policy before the
+// fetch adapter starts any network work. Core scripts without a package
+// identity retain the historical host behavior; package scripts must resolve
+// an installed sandbox and never fall back to unrestricted access.
+func jsNetworkAuthorize(d *Dice, target string) error {
+	if d == nil || d.JsCurrentPlugin == nil || d.JsCurrentPlugin.Source == nil {
+		return nil
+	}
+	packageID := d.JsCurrentPlugin.Source.PackageID
+	if packageID == "" {
+		return nil
+	}
+	if d.PackageManager == nil {
+		return errors.New("扩展包沙箱未初始化,拒绝网络访问")
+	}
+	sandbox, err := d.PackageManager.GetSandbox(packageID)
+	if err != nil {
+		return err
+	}
+	return sandbox.CheckNetworkPermission(target)
+}
+// jsFilesystemAuthorize enforces package file permissions before an operation
+// resolves or starts IO. data:// is represented as the package's logical
+// data/ path for permission matching while its existing isolated storage path
+// remains unchanged.
+func jsFilesystemAuthorize(d *Dice, raw string, write bool) error {
+	if d == nil || d.JsCurrentPlugin == nil || d.JsCurrentPlugin.Source == nil {
+		return nil
+	}
+	packageID := d.JsCurrentPlugin.Source.PackageID
+	if packageID == "" {
+		return nil
+	}
+	if d.PackageManager == nil {
+		return errors.New("扩展包沙箱未初始化,拒绝文件访问")
+	}
+	sandbox, err := d.PackageManager.GetSandbox(packageID)
+	if err != nil {
+		return err
+	}
+	target := raw
+	if rest, ok := strings.CutPrefix(raw, fsDataURIPrefix); ok {
+		target = filepath.Join("data", rest)
+	}
+	if write {
+		return sandbox.CheckFileWritePermission(target)
+	}
+	return sandbox.CheckFileReadPermission(target)
+}
 
 func jsFsEnsureParent(p jsFsResolvedPath) error {
 	if p.isData {
@@ -239,7 +288,11 @@ func jsFsStatValue(vm *goja.Runtime, info os.FileInfo) goja.Value {
 
 func jsFsReadFile(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
-		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		raw := call.Argument(0).String()
+		if err := jsFilesystemAuthorize(d, raw, false); err != nil {
+			jsFsThrow(vm, err)
+		}
+		resolved, err := jsFsResolveAbsolute(d, raw)
 		if err != nil {
 			jsFsThrow(vm, err)
 		}
@@ -256,7 +309,11 @@ func jsFsReadFile(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value 
 
 func jsFsWriteFile(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
-		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		raw := call.Argument(0).String()
+		if err := jsFilesystemAuthorize(d, raw, true); err != nil {
+			jsFsThrow(vm, err)
+		}
+		resolved, err := jsFsResolveAbsolute(d, raw)
 		if err != nil {
 			jsFsThrow(vm, err)
 		}
@@ -282,7 +339,11 @@ func jsFsWriteFile(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value
 
 func jsFsStat(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
-		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		raw := call.Argument(0).String()
+		if err := jsFilesystemAuthorize(d, raw, false); err != nil {
+			jsFsThrow(vm, err)
+		}
+		resolved, err := jsFsResolveAbsolute(d, raw)
 		if err != nil {
 			jsFsThrow(vm, err)
 		}
@@ -299,7 +360,11 @@ func jsFsStat(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
 
 func jsFsReadFileAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
-		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		raw := call.Argument(0).String()
+		if err := jsFilesystemAuthorize(d, raw, false); err != nil {
+			return jsFsRejectedPromise(vm, err)
+		}
+		resolved, err := jsFsResolveAbsolute(d, raw)
 		if err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
@@ -320,7 +385,11 @@ func jsFsReadFileAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) fun
 
 func jsFsWriteFileAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
-		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		raw := call.Argument(0).String()
+		if err := jsFilesystemAuthorize(d, raw, true); err != nil {
+			return jsFsRejectedPromise(vm, err)
+		}
+		resolved, err := jsFsResolveAbsolute(d, raw)
 		if err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
@@ -348,7 +417,11 @@ func jsFsWriteFileAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) fu
 
 func jsFsStatAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
-		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		raw := call.Argument(0).String()
+		if err := jsFilesystemAuthorize(d, raw, false); err != nil {
+			return jsFsRejectedPromise(vm, err)
+		}
+		resolved, err := jsFsResolveAbsolute(d, raw)
 		if err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
@@ -369,7 +442,11 @@ func jsFsStatAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(go
 
 func jsFsReadDirAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
-		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		raw := call.Argument(0).String()
+		if err := jsFilesystemAuthorize(d, raw, false); err != nil {
+			return jsFsRejectedPromise(vm, err)
+		}
+		resolved, err := jsFsResolveAbsolute(d, raw)
 		if err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
@@ -397,7 +474,11 @@ func jsFsReadDirAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func
 
 func jsFsMkdirAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
-		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		raw := call.Argument(0).String()
+		if err := jsFilesystemAuthorize(d, raw, true); err != nil {
+			return jsFsRejectedPromise(vm, err)
+		}
+		resolved, err := jsFsResolveAbsolute(d, raw)
 		if err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
@@ -424,7 +505,11 @@ func jsFsMkdirAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(g
 
 func jsFsRemoveAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
-		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		raw := call.Argument(0).String()
+		if err := jsFilesystemAuthorize(d, raw, true); err != nil {
+			return jsFsRejectedPromise(vm, err)
+		}
+		resolved, err := jsFsResolveAbsolute(d, raw)
 		if err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
@@ -442,7 +527,11 @@ func jsFsRemoveAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(
 
 func jsFsReadDir(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
-		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		raw := call.Argument(0).String()
+		if err := jsFilesystemAuthorize(d, raw, false); err != nil {
+			jsFsThrow(vm, err)
+		}
+		resolved, err := jsFsResolveAbsolute(d, raw)
 		if err != nil {
 			jsFsThrow(vm, err)
 		}
@@ -466,7 +555,11 @@ func jsFsReadDir(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
 
 func jsFsMkdir(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
-		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		raw := call.Argument(0).String()
+		if err := jsFilesystemAuthorize(d, raw, true); err != nil {
+			jsFsThrow(vm, err)
+		}
+		resolved, err := jsFsResolveAbsolute(d, raw)
 		if err != nil {
 			jsFsThrow(vm, err)
 		}
@@ -491,7 +584,11 @@ func jsFsMkdir(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
 
 func jsFsRemove(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
-		resolved, err := jsFsResolveAbsolute(d, call.Argument(0).String())
+		raw := call.Argument(0).String()
+		if err := jsFilesystemAuthorize(d, raw, true); err != nil {
+			jsFsThrow(vm, err)
+		}
+		resolved, err := jsFsResolveAbsolute(d, raw)
 		if err != nil {
 			jsFsThrow(vm, err)
 		}

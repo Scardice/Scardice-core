@@ -13,6 +13,10 @@ type Descriptor struct {
 	HostABIMinor uint32
 
 	Capabilities CapabilitySet
+	// Services lists explicitly supported host-service names. Native ABI-v1
+	// descriptors leave this empty because the frozen ABI has no service-name
+	// field.
+	Services []string
 	Builtin      bool
 	Path         string
 }
@@ -32,6 +36,7 @@ type RuntimeManifest struct {
 	HostABIMinor uint32
 
 	Capabilities CapabilitySet
+	Services     []string
 	Path         string
 
 	// Descriptor permits callers that already have manifest-shaped metadata to
@@ -67,6 +72,9 @@ func (m RuntimeManifest) descriptor() Descriptor {
 	}
 	if m.Capabilities != 0 {
 		d.Capabilities = m.Capabilities
+	}
+	if m.Services != nil {
+		d.Services = append([]string(nil), m.Services...)
 	}
 	if m.Path != "" {
 		d.Path = m.Path

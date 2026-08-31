@@ -32,6 +32,64 @@ type fetchAbortState struct {
 	reason goja.Value
 }
 
+// FetchLifecycle tracks adapter-owned requests so runtime shutdown can cancel
+// them before the event loop is released. It never starts a goroutine.
+type FetchLifecycle struct {
+	mu     sync.Mutex
+	active map[*fetchRequestData]struct{}
+	closed bool
+}
+
+func NewFetchLifecycle() *FetchLifecycle {
+	return &FetchLifecycle{active: make(map[*fetchRequestData]struct{})}
+}
+
+func (l *FetchLifecycle) Start(request *fetchRequestData) error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return errors.New("fetch lifecycle is closed")
+	}
+	l.active[request] = struct{}{}
+	return nil
+}
+
+func (l *FetchLifecycle) Done(request *fetchRequestData) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	delete(l.active, request)
+	l.mu.Unlock()
+}
+
+func (l *FetchLifecycle) Close() error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return nil
+	}
+	l.closed = true
+	active := make([]*fetchRequestData, 0, len(l.active))
+	for request := range l.active {
+		active = append(active, request)
+	}
+	l.active = make(map[*fetchRequestData]struct{})
+	l.mu.Unlock()
+	for _, request := range active {
+		if request != nil && request.cancel != nil {
+			request.cancel()
+		}
+	}
+	return nil
+}
+
 func (s *fetchAbortState) set(reason goja.Value) {
 	s.mu.Lock()
 	s.reason = reason
@@ -44,17 +102,32 @@ func (s *fetchAbortState) get() goja.Value {
 	return s.reason
 }
 
+// EnableFetch installs fetch without an authorization hook for compatibility
+// with existing direct Goja callers.
 func EnableFetch(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler) error {
+	return EnableFetchWithPolicyAndLifecycle(rt, loop, proxy, nil, nil)
+}
+
+// EnableFetchWithPolicy installs fetch with an adapter-owned policy check.
+// The hook runs before any network goroutine starts, so denied requests cannot
+// leak IO past the SealPack boundary.
+func EnableFetchWithPolicy(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler, authorize func(string) error) error {
+	return EnableFetchWithPolicyAndLifecycle(rt, loop, proxy, authorize, nil)
+}
+
+// EnableFetchWithPolicyAndLifecycle additionally attaches requests to a
+// lifecycle owner, allowing shutdown to cancel in-flight network work.
+func EnableFetchWithPolicyAndLifecycle(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler, authorize func(string) error, lifecycle *FetchLifecycle) error {
 	if loop == nil {
 		return errors.New("JS event loop is required for fetch")
 	}
 	if proxy == nil {
 		return errors.New("proxy handler cannot be nil")
 	}
-	return rt.Set("fetch", newFetchFn(rt, loop, proxy))
+	return rt.Set("fetch", newFetchFn(rt, loop, proxy, authorize, lifecycle))
 }
 
-func newFetchFn(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler) func(goja.FunctionCall) goja.Value {
+func newFetchFn(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler, authorize func(string) error, lifecycle *FetchLifecycle) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		promise, resolve, reject := rt.NewPromise()
 
@@ -63,8 +136,22 @@ func newFetchFn(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler)
 			_ = reject(rt.NewTypeError(err.Error()))
 			return rt.ToValue(promise)
 		}
-
+		if authorize != nil {
+			if err := authorize(requestData.url); err != nil {
+				_ = reject(rt.NewGoError(err))
+				return rt.ToValue(promise)
+			}
+		}
+		if lifecycle != nil {
+			if err := lifecycle.Start(requestData); err != nil {
+				_ = reject(rt.NewGoError(err))
+				return rt.ToValue(promise)
+			}
+		}
 		go func() {
+			if lifecycle != nil {
+				defer lifecycle.Done(requestData)
+			}
 			responseData, err := doFetchRequest(requestData, proxy)
 			loop.RunOnLoop(func(loopRT *goja.Runtime) {
 				if requestData.ctx != nil && requestData.ctx.Err() != nil {
