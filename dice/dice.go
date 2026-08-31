@@ -25,7 +25,6 @@ import (
 	"Scardice-core/dice/events"
 	"Scardice-core/logger"
 	"Scardice-core/utils/dboperator/engine"
-	"Scardice-core/utils/jsengine"
 	"Scardice-core/utils/public_dice"
 	randcore "Scardice-core/utils/random"
 )
@@ -50,9 +49,6 @@ type CmdItemInfo struct {
 	SourceLocation string `json:"-" yaml:"-"` // JS 命令注册位置，用于诊断日志
 	Solve          func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult
 	SolveRaw       func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) goja.Value `jsbind:"solve"`
-	// SolveEngine is an engine-neutral callback. It is invoked on JSLoopVersion's
-	// owner loop and therefore its returned Value MUST be consumed before return.
-	SolveEngine func(runtime jsengine.Runtime, ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) (jsengine.Value, error) `json:"-" yaml:"-"`
 
 	Raw                bool `jsbind:"raw"`                // 高级模式。默认模式下行为是：需要在当前群/私聊开启，或@自己时生效(需要为第一个@目标)
 	CheckCurrentBotOn  bool `jsbind:"checkCurrentBotOn"`  // 是否检查当前可用状况，包括群内可用和是私聊两种方式，如失败不进入solve
@@ -102,22 +98,19 @@ type ExtInfo struct {
 
 	OnCommandReceived   func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) `jsbind:"onCommandReceived"   json:"-" yaml:"-"`
 	OnMessagePreprocess func(ctx *MsgContext, msg *Message) goja.Value        `jsbind:"onMessagePreprocess" json:"-" yaml:"-"`
-	// OnMessagePreprocessEngine is the engine-neutral counterpart of
-	// OnMessagePreprocess. Its returned Value MUST remain inside the owner loop.
-	OnMessagePreprocessEngine func(runtime jsengine.Runtime, ctx *MsgContext, msg *Message) (jsengine.Value, error) `json:"-" yaml:"-"`
-	OnMessageReceived         func(ctx *MsgContext, msg *Message)                                                   `jsbind:"onMessageReceived"   json:"-" yaml:"-"`
-	OnMessageSend             func(ctx *MsgContext, msg *Message, flag string)                                      `jsbind:"onMessageSend"       json:"-" yaml:"-"`
-	OnMessageDeleted          func(ctx *MsgContext, msg *Message)                                                   `jsbind:"onMessageDeleted"    json:"-" yaml:"-"`
-	OnMessageEdit             func(ctx *MsgContext, msg *Message)                                                   `jsbind:"onMessageEdit"       json:"-" yaml:"-"`
-	OnGroupJoined             func(ctx *MsgContext, msg *Message)                                                   `jsbind:"onGroupJoined"       json:"-" yaml:"-"`
-	OnGroupMemberJoined       func(ctx *MsgContext, msg *Message)                                                   `jsbind:"onGroupMemberJoined" json:"-" yaml:"-"`
-	OnGuildJoined             func(ctx *MsgContext, msg *Message)                                                   `jsbind:"onGuildJoined"       json:"-" yaml:"-"`
-	OnBecomeFriend            func(ctx *MsgContext, msg *Message)                                                   `jsbind:"onBecomeFriend"      json:"-" yaml:"-"`
-	OnPoke                    func(ctx *MsgContext, event *events.PokeEvent)                                        `jsbind:"onPoke"              json:"-" yaml:"-"` // 戳一戳
-	OnGroupLeave              func(ctx *MsgContext, event *events.GroupLeaveEvent)                                  `jsbind:"onGroupLeave"        json:"-" yaml:"-"` // 群成员被踢出
-	GetDescText               func(i *ExtInfo) string                                                               `jsbind:"getDescText"         json:"-" yaml:"-"`
-	IsLoaded                  bool                                                                                  `jsbind:"isLoaded"            json:"-" yaml:"-"`
-	OnLoad                    func()                                                                                `jsbind:"onLoad"              json:"-" yaml:"-"`
+	OnMessageReceived   func(ctx *MsgContext, msg *Message)                   `jsbind:"onMessageReceived"   json:"-" yaml:"-"`
+	OnMessageSend       func(ctx *MsgContext, msg *Message, flag string)      `jsbind:"onMessageSend"       json:"-" yaml:"-"`
+	OnMessageDeleted    func(ctx *MsgContext, msg *Message)                   `jsbind:"onMessageDeleted"    json:"-" yaml:"-"`
+	OnMessageEdit       func(ctx *MsgContext, msg *Message)                   `jsbind:"onMessageEdit"       json:"-" yaml:"-"`
+	OnGroupJoined       func(ctx *MsgContext, msg *Message)                   `jsbind:"onGroupJoined"       json:"-" yaml:"-"`
+	OnGroupMemberJoined func(ctx *MsgContext, msg *Message)                   `jsbind:"onGroupMemberJoined" json:"-" yaml:"-"`
+	OnGuildJoined       func(ctx *MsgContext, msg *Message)                   `jsbind:"onGuildJoined"       json:"-" yaml:"-"`
+	OnBecomeFriend      func(ctx *MsgContext, msg *Message)                   `jsbind:"onBecomeFriend"      json:"-" yaml:"-"`
+	OnPoke              func(ctx *MsgContext, event *events.PokeEvent)        `jsbind:"onPoke"              json:"-" yaml:"-"` // 戳一戳
+	OnGroupLeave        func(ctx *MsgContext, event *events.GroupLeaveEvent)  `jsbind:"onGroupLeave"        json:"-" yaml:"-"` // 群成员被踢出
+	GetDescText         func(i *ExtInfo) string                               `jsbind:"getDescText"         json:"-" yaml:"-"`
+	IsLoaded            bool                                                  `jsbind:"isLoaded"            json:"-" yaml:"-"`
+	OnLoad              func()                                                `jsbind:"onLoad"              json:"-" yaml:"-"`
 
 	// Wrapper 相关字段
 	IsWrapper  bool   `json:"-" yaml:"-"` // 是否为 Wrapper ExtInfo (代理对象)
@@ -142,10 +135,9 @@ type ExtDefaultSettingItem struct {
 type ExtDefaultSettingItemSlice []*ExtDefaultSettingItem
 
 type JsLoopManager struct {
-	loop       *eventloop.EventLoop
-	engineLoop jsengine.Loop
-	loopLock   sync.RWMutex
-	version    int64
+	loop     *eventloop.EventLoop
+	loopLock sync.RWMutex
+	version  int64
 }
 
 func NewJsLoopManager() *JsLoopManager {
@@ -184,51 +176,9 @@ func (m *JsLoopManager) SetLoop(newLoop *eventloop.EventLoop) int64 {
 	if m.loop != nil {
 		m.loop.Terminate()
 	}
-	if m.engineLoop != nil {
-		m.engineLoop.Close()
-		m.engineLoop = nil
-	}
 
 	// 设置新的 loop 并递增版本号
 	m.loop = newLoop
-	m.version++
-	return m.version
-}
-
-// GetEngineLoop returns the engine-neutral loop for a matching runtime
-// generation. Callers must not mix it with GetLoop.
-func (m *JsLoopManager) GetEngineLoop(expectedVersion int64) (jsengine.Loop, error) {
-	m.loopLock.RLock()
-	defer m.loopLock.RUnlock()
-
-	if m.version != expectedVersion {
-		return nil, fmt.Errorf("version mismatch: expected %d, current %d", expectedVersion, m.version)
-	}
-	return m.engineLoop, nil
-}
-
-// GetActiveEngineLoop returns the current engine-neutral loop without
-// exposing the generation counter to callers that only need to execute work.
-func (m *JsLoopManager) GetActiveEngineLoop() jsengine.Loop {
-	m.loopLock.RLock()
-	defer m.loopLock.RUnlock()
-	return m.engineLoop
-}
-
-// SetEngineLoop replaces the active engine-neutral loop and invalidates all
-// callbacks registered against the previous runtime generation.
-func (m *JsLoopManager) SetEngineLoop(newLoop jsengine.Loop) int64 {
-	m.loopLock.Lock()
-	defer m.loopLock.Unlock()
-
-	if m.loop != nil {
-		m.loop.Terminate()
-		m.loop = nil
-	}
-	if m.engineLoop != nil {
-		m.engineLoop.Close()
-	}
-	m.engineLoop = newLoop
 	m.version++
 	return m.version
 }
@@ -826,11 +776,9 @@ func (d *Dice) extFindPostProcess(ext *ExtInfo, fromJS bool) *ExtInfo {
 				DisabledInPrivate:       info.DisabledInPrivate,
 				EnableExecuteTimesParse: info.EnableExecuteTimesParse,
 				IsJsSolveFunc:           info.IsJsSolveFunc,
-				JSLoopVersion:           info.JSLoopVersion,
 				SourceLocation:          info.SourceLocation,
 				Solve:                   info.Solve,
 				SolveRaw:                info.SolveRaw,
-				SolveEngine:             info.SolveEngine,
 				Raw:                     info.Raw,
 				CheckCurrentBotOn:       info.CheckCurrentBotOn,
 				CheckMentionOthers:      info.CheckMentionOthers,

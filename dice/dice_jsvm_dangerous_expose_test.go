@@ -3,8 +3,6 @@ package dice
 import (
 	"testing"
 
-	"Scardice-core/utils/jsengine"
-	"Scardice-core/utils/jsengine/quickjs"
 	"github.com/dop251/goja"
 )
 
@@ -94,58 +92,6 @@ func TestExposeDangerousJSValueRecursivelyExposesAndMutatesSealInst(t *testing.T
 	}
 	if result["diceMastersLen"] != int64(2) {
 		t.Fatalf("unexpected diceMasters length: %#v", result["diceMastersLen"])
-	}
-
-	if d.CommandPrefix[0] != "!" || d.CommandPrefix[2] != "/" {
-		t.Fatalf("Go CommandPrefix was not updated: %#v", d.CommandPrefix)
-	}
-	if !d.Config.MailEnable || d.Config.JsEnable {
-		t.Fatalf("Go Config was not updated: %#v", d.Config.MailConfig)
-	}
-	if d.AdvancedConfig.ExposeDangerousSealInst {
-		t.Fatalf("Go AdvancedConfig was not updated: %#v", d.AdvancedConfig)
-	}
-	if len(d.DiceMasters) != 2 || d.DiceMasters[1] != "QQ:2002" {
-		t.Fatalf("Go DiceMasters was not updated: %#v", d.DiceMasters)
-	}
-}
-
-func TestInstallDangerousJSInstanceQuickJSMatchesGojaMutationContract(t *testing.T) {
-	d := &Dice{
-		CommandPrefix: []string{".", "。"},
-		DiceMasters:   []string{"QQ:1001"},
-		Config: Config{
-			JsConfig:   JsConfig{JsEnable: true},
-			MailConfig: MailConfig{MailEnable: false},
-		},
-		AdvancedConfig: AdvancedConfig{ExposeDangerousSealInst: true},
-	}
-	loop, err := quickjs.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer loop.Close()
-
-	if err := loop.Run(func(runtime jsengine.Runtime) error {
-		if err := d.installJSHostAPI(runtime); err != nil {
-			return err
-		}
-		if err := d.installDangerousJSInstance(runtime, runtime.Get("seal").Object()); err != nil {
-			return err
-		}
-		_, err := runtime.RunString("dangerous-quickjs.js", `
-			if (typeof seal.inst.getDiceDataPath !== "function") throw new Error("missing method");
-			if (typeof seal.inst.jsSealInstExposed !== "undefined") throw new Error("leaked internal field");
-			seal.inst.commandPrefix[0] = "!";
-			seal.inst.commandPrefix.push("/");
-			seal.inst.config.jsEnable = false;
-			seal.inst.Config.mailEnable = true;
-			seal.inst.advancedConfig.exposeDangerousSealInst = false;
-			seal.inst.diceMasters.push("QQ:2002");
-		`)
-		return err
-	}); err != nil {
-		t.Fatal(err)
 	}
 
 	if d.CommandPrefix[0] != "!" || d.CommandPrefix[2] != "/" {
