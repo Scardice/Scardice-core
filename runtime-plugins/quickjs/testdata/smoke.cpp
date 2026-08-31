@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <map>
 #include <string>
 #include <thread>
@@ -238,7 +239,7 @@ int main(int argc, char **argv) {
         !expect(std::strcmp(plugin->descriptor.id, "quickjs") == 0 &&
                     std::strcmp(plugin->descriptor.version, "0.7.7") == 0 &&
                     plugin->descriptor.capabilities ==
-                        (SC_CAP_SCRIPT | SC_CAP_COMMONJS | SC_CAP_ESM | SC_CAP_PROMISE |
+                        (SC_CAP_SCRIPT | SC_CAP_COMMONJS | SC_CAP_ESM | SC_CAP_PROMISE | SC_CAP_TIMERS |
                          SC_CAP_HOST_OBJECT | SC_CAP_HOST_FUNCTION | SC_CAP_SOURCE_LOCATION),
                 "descriptor identity and capabilities")) {
         return 1;
@@ -352,6 +353,81 @@ int main(int argc, char **argv) {
     }
     api->value_release(runtime, value);
 
+    sc_value_t event_value = 0;
+    if (!expect_status(api->eval(runtime, view("events.js"),
+                                 view("globalThis.eventOrder=[];"
+                                      "globalThis.timerA=setTimeout(()=>eventOrder.push('late'),20);"
+                                      "globalThis.timerB=setTimeout(()=>eventOrder.push('early'),5);"
+                                      "globalThis.cancelledHandle=setTimeout(()=>eventOrder.push('cancelled'),0);"
+                                      "clearTimeout(cancelledHandle);"
+                                      "if (!(timerA > 0 && timerB > 0 && timerA !== timerB)) throw new Error('unstable timer handles');"
+                                      "Promise.resolve().then(()=>eventOrder.push('promise'));"
+                                      "queueMicrotask(()=>eventOrder.push('microtask'));"
+                                      "setTimeout(()=>eventOrder.push('zero'),0);"
+                                      "0"),
+                                 &event_value),
+                       SC_OK,
+                       "event loop ordering") ||
+        !read_i64(api, runtime, event_value, 0, "event setup result")) {
+        return 1;
+    }
+    api->value_release(runtime, event_value);
+    if (!expect_status(api->eval(runtime, view("events-observe.js"), view("eventOrder.join(',')"), &event_value),
+                       SC_OK,
+                       "microtask ordering") ||
+        !read_utf8(api, runtime, event_value, "promise,microtask,zero", "promise/microtask/timer order")) {
+        return 1;
+    }
+    api->value_release(runtime, event_value);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    if (!expect_status(api->eval(runtime, view("events-due-pump.js"), view("0"), &event_value),
+                       SC_OK,
+                       "due timer pumping") ||
+        !read_i64(api, runtime, event_value, 0, "due timer pump result")) {
+        return 1;
+    }
+    api->value_release(runtime, event_value);
+    if (!expect_status(api->eval(runtime, view("events-due-observe.js"), view("eventOrder.join(',')"), &event_value),
+                       SC_OK,
+                       "deterministic timer order") ||
+        !read_utf8(api, runtime, event_value, "promise,microtask,zero,early,late", "deterministic timer order")) {
+        return 1;
+    }
+    api->value_release(runtime, event_value);
+
+    if (!expect_status(api->eval(runtime, view("timer-error.js"),
+                                 view("setTimeout(()=>{ throw new Error('timer-boom') },0)"), &event_value),
+                       SC_EEXCEPTION,
+                       "timer exception")) {
+        return 1;
+    }
+    if (!expect_status(api->last_error_copy(runtime, nullptr, 0, &required), SC_EINVAL, "timer error size") ||
+        required == 0) {
+        return 1;
+    }
+    error.assign(static_cast<size_t>(required), '\0');
+    if (!expect_status(api->last_error_copy(runtime, error.data(), required, &required), SC_OK, "timer error text") ||
+        !expect(error.find("timer-boom") != std::string::npos, "timer error detail")) {
+        return 1;
+    }
+
+    if (!expect_status(api->eval(runtime, view("microtask-error.js"),
+                                 view("queueMicrotask(()=>{ throw new Error('microtask-boom') })"), &event_value),
+                       SC_EEXCEPTION,
+                       "microtask exception")) {
+        return 1;
+    }
+    if (!expect_status(api->last_error_copy(runtime, nullptr, 0, &required), SC_EINVAL, "microtask error size") ||
+        required == 0) {
+        return 1;
+    }
+    error.assign(static_cast<size_t>(required), '\0');
+    if (!expect_status(api->last_error_copy(runtime, error.data(), required, &required), SC_OK, "microtask error text") ||
+        !expect(error.find("microtask-boom") != std::string::npos, "microtask error detail")) {
+        return 1;
+    }
+
+
     const struct {
         uint32_t kind;
         const char *name;
@@ -379,8 +455,36 @@ int main(int argc, char **argv) {
     sc_status_t thread_status = SC_OK;
     std::thread wrong_thread([&]() { thread_status = api->value_new_i64(runtime, 1, &value); });
     wrong_thread.join();
-    if (!expect_status(thread_status, SC_ESTATE, "thread affinity") ||
-        !expect_status(api->stop(runtime), SC_OK, "stop succeeds")) {
+    if (!expect_status(thread_status, SC_ESTATE, "thread affinity")) {
+        return 1;
+    }
+
+    if (!expect_status(api->eval(runtime, view("bounded-loop.js"),
+                                 view("setTimeout(()=>host.answer=999,1);"
+                                      "globalThis.remaining=2048;"
+                                      "queueMicrotask(function tick(){"
+                                      "  if (--remaining > 0) queueMicrotask(tick);"
+                                      "});"),
+                                 &event_value),
+                       SC_ETIMEOUT,
+                       "microtask convergence threshold")) {
+        return 1;
+    }
+    if (!expect_status(api->last_error_copy(runtime, nullptr, 0, &required), SC_EINVAL, "timeout error size") ||
+        required == 0) {
+        return 1;
+    }
+    error.assign(static_cast<size_t>(required), '\0');
+    if (!expect_status(api->last_error_copy(runtime, error.data(), required, &required), SC_OK, "timeout error text") ||
+        !expect(error.find("converge") != std::string::npos, "timeout error detail")) {
+        return 1;
+    }
+    if (!expect_status(api->stop(runtime), SC_OK, "stop aborts pending jobs") ||
+        !expect(!host_state.answer_present || host_state.answer != 999, "timer callback after stop")) {
+        return 1;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!expect(!host_state.answer_present || host_state.answer != 999, "timer callback after shutdown")) {
         return 1;
     }
     if (!expect_status(api->eval(runtime, view("closed.js"), view("1"), &value), SC_ESTATE,

@@ -6,7 +6,7 @@
   "language": "C++",
   "runtimeAbi": { "major": 1, "minMinor": 0 },
   "hostAbi": { "major": 1, "minMinor": 0 },
-  "capabilities": 367,
+  "capabilities": 383,
   "libraries": {
     "linux-amd64": "libscardice-runtime-quickjs.so",
     "linux-arm64": "libscardice-runtime-quickjs.so",

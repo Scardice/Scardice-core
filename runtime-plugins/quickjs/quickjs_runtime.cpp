@@ -2,6 +2,7 @@
 #include "scardice_runtime_v1.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdlib>
@@ -55,6 +56,10 @@ static char *module_normalize(JSContext *, const char *, const char *, void *);
 static JSModuleDef *module_loader(JSContext *, const char *, void *);
 static JSValue require_call(JSContext *, JSValueConst, int, JSValueConst *);
 
+static JSValue timer_set_timeout(JSContext *, JSValueConst, int, JSValueConst *);
+static JSValue timer_clear_timeout(JSContext *, JSValueConst, int, JSValueConst *);
+static JSValue queue_microtask_call(JSContext *, JSValueConst, int, JSValueConst *);
+static JSValue microtask_job(JSContext *, int, JSValueConst *);
 static JSClassExoticMethods g_host_exotic = {
     host_get_own_property,
     host_get_own_property_names,
@@ -161,6 +166,11 @@ static std::string join_module_name(const char *base_name, const char *name) {
     return result;
 }
 struct Runtime {
+    struct Timer {
+        uint64_t id = 0;
+        std::chrono::steady_clock::time_point deadline;
+        JSValue callback = JS_UNDEFINED;
+    };
 
     JSRuntime *js_runtime = nullptr;
     JSContext *context = nullptr;
@@ -169,11 +179,16 @@ struct Runtime {
     std::thread::id owner;
     bool started = false;
     bool stopped = false;
+    bool stopping = false;
     bool destroying = false;
+    bool pumping_events = false;
     std::string last_error;
     sc_status_t pending_host_status = SC_OK;
     std::unordered_set<Value *> values;
     std::map<std::string, std::string> modules;
+    std::vector<Timer> timers;
+    uint64_t next_timer_id = 1;
+
     ~Runtime() { destroy(); }
 
     void clear_error() {
@@ -417,6 +432,35 @@ struct Runtime {
                 return fail(SC_EINTERNAL, "register QuickJS host object class");
             }
         }
+        return install_event_loop_api();
+    }
+
+    sc_status_t install_event_loop_api() {
+        JSValue global = JS_GetGlobalObject(context);
+        if (JS_IsException(global)) {
+            capture_exception();
+            return SC_EEXCEPTION;
+        }
+        struct EventFunction {
+            const char *name;
+            JSCFunction *function;
+            int length;
+        };
+        const EventFunction functions[] = {
+            {"setTimeout", timer_set_timeout, 2},
+            {"clearTimeout", timer_clear_timeout, 1},
+            {"queueMicrotask", queue_microtask_call, 1},
+        };
+        for (const EventFunction &definition : functions) {
+            JSValue function = JS_NewCFunction(context, definition.function, definition.name, definition.length);
+            if (JS_IsException(function) ||
+                JS_SetPropertyStr(context, global, definition.name, function) < 0) {
+                JS_FreeValue(context, global);
+                capture_exception();
+                return SC_EEXCEPTION;
+            }
+        }
+        JS_FreeValue(context, global);
         return SC_OK;
     }
 
@@ -437,7 +481,13 @@ struct Runtime {
     }
 
     sc_status_t drain_jobs() {
+        if (stopping || stopped) {
+            return SC_OK;
+        }
         for (size_t count = 0; count < kMaxPendingJobs; ++count) {
+            if (stopping || stopped) {
+                return SC_OK;
+            }
             JSContext *job_context = nullptr;
             int status = JS_ExecutePendingJob(js_runtime, &job_context);
             if (status < 0) {
@@ -448,19 +498,142 @@ struct Runtime {
                 return SC_OK;
             }
         }
+        if (stopping || stopped) {
+            return SC_OK;
+        }
+        if (!JS_IsJobPending(js_runtime)) {
+            return SC_OK;
+        }
         return fail(SC_ETIMEOUT, "pending JavaScript jobs did not converge");
     }
+    uint64_t allocate_timer_id() const {
+        uint64_t candidate = next_timer_id;
+        if (candidate == 0 || candidate > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+            candidate = 1;
+        }
+        const uint64_t first = candidate;
+        do {
+            const bool used = std::any_of(timers.begin(), timers.end(), [candidate](const Timer &timer) {
+                return timer.id == candidate;
+            });
+            if (!used) {
+                return candidate;
+            }
+            candidate = candidate == static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ? 1 : candidate + 1;
+        } while (candidate != first);
+        return 0;
+    }
 
+    uint64_t schedule_timer(JSValueConst callback, int64_t delay_ms) {
+        if (!JS_IsFunction(context, callback)) {
+            return 0;
+        }
+        uint64_t id = allocate_timer_id();
+        if (id == 0) {
+            return 0;
+        }
+        next_timer_id = id == static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ? 1 : id + 1;
+        int64_t bounded_delay = std::max<int64_t>(delay_ms, 0);
+        const auto now = std::chrono::steady_clock::now();
+        std::chrono::milliseconds requested(bounded_delay);
+        const auto max_delay =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::time_point::max() - now);
+        if (requested > max_delay) {
+            requested = max_delay;
+        }
+        Timer timer;
+        timer.id = id;
+        timer.deadline = now + requested;
+        timer.callback = JS_DupValue(context, callback);
+        try {
+            timers.push_back(timer);
+        } catch (...) {
+            JS_FreeValue(context, timer.callback);
+            throw;
+        }
+        return id;
+    }
+
+    void cancel_timer(uint64_t id) noexcept {
+        for (auto it = timers.begin(); it != timers.end(); ++it) {
+            if (it->id == id) {
+                JS_FreeValue(context, it->callback);
+                timers.erase(it);
+                return;
+            }
+        }
+    }
+
+    void cancel_timers() noexcept {
+        if (context != nullptr) {
+            for (const Timer &timer : timers) {
+                JS_FreeValue(context, timer.callback);
+            }
+        }
+        timers.clear();
+    }
+
+    sc_status_t pump_events() {
+        if (pumping_events) {
+            return SC_OK;
+        }
+        pumping_events = true;
+        for (size_t step = 0; step < kMaxPendingJobs; ++step) {
+            if (stopping || stopped) {
+                pumping_events = false;
+                return SC_OK;
+            }
+            sc_status_t status = drain_jobs();
+            if (status != SC_OK) {
+                pumping_events = false;
+                return status;
+            }
+            auto now = std::chrono::steady_clock::now();
+            auto it = std::min_element(timers.begin(), timers.end(), [](const Timer &left, const Timer &right) {
+                if (left.deadline != right.deadline) {
+                    return left.deadline < right.deadline;
+                }
+                return left.id < right.id;
+            });
+            if (it == timers.end() || it->deadline > now) {
+                pumping_events = false;
+                return SC_OK;
+            }
+            JSValue callback = it->callback;
+            timers.erase(it);
+            JSValue result = JS_Call(context, callback, JS_UNDEFINED, 0, nullptr);
+            JS_FreeValue(context, callback);
+            if (JS_IsException(result)) {
+                capture_exception();
+                pumping_events = false;
+                return pending_host_status != SC_OK ? pending_host_status : SC_EEXCEPTION;
+            }
+            JS_FreeValue(context, result);
+        }
+        if (!stopping && !stopped && !JS_IsJobPending(js_runtime)) {
+            const auto now = std::chrono::steady_clock::now();
+            const bool has_due_timer = std::any_of(timers.begin(), timers.end(), [now](const Timer &timer) {
+                return timer.deadline <= now;
+            });
+            if (!has_due_timer) {
+                pumping_events = false;
+                return SC_OK;
+            }
+        }
+        pumping_events = false;
+        return fail(SC_ETIMEOUT, "QuickJS event queue did not converge");
+    }
 
     sc_status_t stop() {
         sc_status_t status = check_started();
         if (status != SC_OK) {
             return status;
         }
-        sc_status_t jobs = drain_jobs();
+        stopping = true;
+        cancel_timers();
         started = false;
         stopped = true;
-        return jobs;
+        return SC_OK;
     }
 
     void destroy() noexcept {
@@ -468,6 +641,7 @@ struct Runtime {
             return;
         }
         destroying = true;
+        cancel_timers();
         if (context != nullptr) {
             for (Value *value : values) {
                 value->alive = false;
@@ -501,7 +675,7 @@ struct Runtime {
             capture_exception();
             return pending_host_status != SC_OK ? pending_host_status : SC_EEXCEPTION;
         }
-        status = drain_jobs();
+        status = pump_events();
         if (status != SC_OK) {
             JS_FreeValue(context, result);
             return status;
@@ -596,7 +770,7 @@ struct Runtime {
             if (JS_IsException(result)) {
                 return SC_EEXCEPTION;
             }
-            status = drain_jobs();
+            status = pump_events();
             if (status != SC_OK) {
                 JS_FreeValue(context, result);
                 return status;
@@ -614,7 +788,7 @@ struct Runtime {
             if (JS_IsException(result)) {
                 return SC_EEXCEPTION;
             }
-            status = drain_jobs();
+            status = pump_events();
             if (status != SC_OK) {
                 JS_FreeValue(context, result);
                 return status;
@@ -1219,7 +1393,7 @@ struct Runtime {
             capture_exception();
             return pending_host_status != SC_OK ? pending_host_status : SC_EEXCEPTION;
         }
-        status = drain_jobs();
+        status = pump_events();
         if (status != SC_OK) {
             JS_FreeValue(context, result);
             return status;
@@ -1229,6 +1403,91 @@ struct Runtime {
 };
 
 
+static Runtime *runtime_from_context(JSContext *context) noexcept {
+    if (context == nullptr) {
+        return nullptr;
+    }
+    Runtime *runtime = static_cast<Runtime *>(JS_GetContextOpaque(context));
+    if (runtime == nullptr || runtime->context != context) {
+        return nullptr;
+    }
+    return runtime;
+}
+
+static JSValue timer_set_timeout(JSContext *context, JSValueConst, int argc,
+                                 JSValueConst *argv) {
+    Runtime *runtime = runtime_from_context(context);
+    if (runtime == nullptr || !runtime->started || runtime->stopping) {
+        return JS_ThrowInternalError(context, "QuickJS runtime is stopping");
+    }
+    if (argc < 1 || !JS_IsFunction(context, argv[0])) {
+        return JS_ThrowTypeError(context, "setTimeout callback must be a function");
+    }
+    int64_t delay = 0;
+    if (argc > 1 && JS_ToInt64(context, &delay, argv[1]) < 0) {
+        return JS_EXCEPTION;
+    }
+    try {
+        uint64_t id = runtime->schedule_timer(argv[0], delay);
+        if (id == 0) {
+            return JS_ThrowTypeError(context, "setTimeout callback must be a function");
+        }
+        return JS_NewInt64(context, static_cast<int64_t>(id));
+    } catch (const std::bad_alloc &) {
+        return JS_ThrowOutOfMemory(context);
+    } catch (...) {
+        return JS_ThrowInternalError(context, "schedule QuickJS timer failed");
+    }
+}
+
+static JSValue timer_clear_timeout(JSContext *context, JSValueConst, int argc,
+                                   JSValueConst *argv) {
+    Runtime *runtime = runtime_from_context(context);
+    if (runtime == nullptr || !runtime->started || runtime->stopping) {
+        return JS_ThrowInternalError(context, "QuickJS runtime is stopping");
+    }
+    if (argc < 1) {
+        return JS_UNDEFINED;
+    }
+    int64_t id = 0;
+    if (JS_ToInt64(context, &id, argv[0]) < 0) {
+        return JS_EXCEPTION;
+    }
+    if (id > 0) {
+        runtime->cancel_timer(static_cast<uint64_t>(id));
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue microtask_job(JSContext *context, int argc, JSValueConst *argv) {
+    if (argc < 1 || !JS_IsFunction(context, argv[0])) {
+        return JS_ThrowTypeError(context, "queued microtask is not callable");
+    }
+    JSValue result = JS_Call(context, argv[0], JS_UNDEFINED, 0, nullptr);
+    if (JS_IsException(result)) {
+        return result;
+    }
+    JS_FreeValue(context, result);
+    return JS_UNDEFINED;
+}
+
+static JSValue queue_microtask_call(JSContext *context, JSValueConst, int argc,
+                                    JSValueConst *argv) {
+    Runtime *runtime = runtime_from_context(context);
+    if (runtime == nullptr || !runtime->started || runtime->stopping) {
+        return JS_ThrowInternalError(context, "QuickJS runtime is stopping");
+    }
+    if (argc < 1 || !JS_IsFunction(context, argv[0])) {
+        return JS_ThrowTypeError(context, "queueMicrotask callback must be a function");
+    }
+    JSValue callback = JS_DupValue(context, argv[0]);
+    if (JS_EnqueueJob(context, microtask_job, 1, &callback) < 0) {
+        JS_FreeValue(context, callback);
+        return JS_ThrowOutOfMemory(context);
+    }
+    JS_FreeValue(context, callback);
+    return JS_UNDEFINED;
+}
 static Runtime *runtime_from(sc_runtime_t handle) noexcept {
     if (handle == 0) {
         return nullptr;
@@ -1902,7 +2161,7 @@ static const sc_runtime_descriptor_v1 kDescriptor = {
     SC_RUNTIME_ABI_MINOR,
     SC_HOST_ABI_MAJOR,
     SC_HOST_ABI_MINOR,
-    SC_CAP_SCRIPT | SC_CAP_COMMONJS | SC_CAP_ESM | SC_CAP_PROMISE |
+    SC_CAP_SCRIPT | SC_CAP_COMMONJS | SC_CAP_ESM | SC_CAP_PROMISE | SC_CAP_TIMERS |
         SC_CAP_HOST_OBJECT | SC_CAP_HOST_FUNCTION | SC_CAP_SOURCE_LOCATION,
     "quickjs",
     "QuickJS-NG native provider",
