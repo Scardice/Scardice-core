@@ -21,4 +21,4 @@
 
 ## Commit
 
-Implementation commit: `fe37e0c9` (`feat: add engine-neutral host bridge`).
+Implementation commits: `fe37e0c9` (`feat: add engine-neutral host bridge`), `f2421730` (`fix: return undefined for missing host properties`).
