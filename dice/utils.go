@@ -6,6 +6,7 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/base32"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -85,7 +86,7 @@ func generateRandomString(reader io.Reader, n int, alphabet string) (string, err
 		return "", fmt.Errorf("invalid random string length: %d", n)
 	}
 	if len(alphabet) == 0 {
-		return "", fmt.Errorf("random string alphabet is empty")
+		return "", errors.New("random string alphabet is empty")
 	}
 	if len(alphabet) > 256 {
 		return "", fmt.Errorf("random string alphabet is too large: %d", len(alphabet))

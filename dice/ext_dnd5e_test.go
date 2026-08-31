@@ -32,6 +32,7 @@ func TestDnd5eSpellSlotStatusReturnsSolved(t *testing.T) {
 	cmd := dndExt.GetCmdMap()["ss"]
 	if cmd == nil {
 		t.Fatal("ss command not registered")
+		return
 	}
 
 	ctx, msg := newQuitCommandTestContext(t, d, ep, "QQ:9100", "QQ-Group:2100", "DNDGroup")

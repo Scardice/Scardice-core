@@ -2,6 +2,7 @@ package quickjs
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -61,9 +62,9 @@ func bindStructWithMode(ctx *quickjs.Context, target reflect.Value, dangerous bo
 	}
 
 	id := registerHostValue(ctx, target)
-	if object, err := cachedHostObject(ctx, id); err != nil {
+	if object, ok, err := cachedHostObject(ctx, id); err != nil {
 		return nil, err
-	} else if object != nil {
+	} else if ok {
 		return object, nil
 	}
 
@@ -90,15 +91,15 @@ func bindStructWithMode(ctx *quickjs.Context, target reflect.Value, dangerous bo
 		} else if name, ok := jsBindName(fieldDef); ok {
 			names = []string{name}
 		}
-		lock, err := jsBindLock(target, fieldDef)
+		lockInfo, err := jsBindLock(target, fieldDef)
 		if err != nil {
 			object.Free()
 			return nil, err
 		}
 		for _, name := range names {
-			if err := defineFieldWithMode(ctx, object, name, field, dangerous, lock); err != nil {
+			if defineErr := defineFieldWithMode(ctx, object, name, field, dangerous, lockInfo.lock); defineErr != nil {
 				object.Free()
-				return nil, err
+				return nil, defineErr
 			}
 			definedNames[name] = struct{}{}
 		}
@@ -167,21 +168,25 @@ func jsBindName(field reflect.StructField) (string, bool) {
 	return name, isIdentifier(name)
 }
 
-func jsBindLock(target reflect.Value, field reflect.StructField) (*sync.RWMutex, error) {
+type jsBindLockResult struct {
+	lock *sync.RWMutex
+}
+
+func jsBindLock(target reflect.Value, field reflect.StructField) (jsBindLockResult, error) {
 	name := field.Tag.Get("jsbindlock")
 	if name == "" {
-		return nil, nil
+		return jsBindLockResult{}, nil
 	}
 	method := target.MethodByName(name)
 	if !method.IsValid() || method.Type().NumIn() != 0 || method.Type().NumOut() != 1 {
-		return nil, fmt.Errorf("invalid jsbindlock %q on %s", name, field.Name)
+		return jsBindLockResult{}, fmt.Errorf("invalid jsbindlock %q on %s", name, field.Name)
 	}
 	value := method.Call(nil)[0]
 	lock, ok := value.Interface().(*sync.RWMutex)
 	if !ok || lock == nil {
-		return nil, fmt.Errorf("jsbindlock %q on %s must return *sync.RWMutex", name, field.Name)
+		return jsBindLockResult{}, fmt.Errorf("jsbindlock %q on %s must return *sync.RWMutex", name, field.Name)
 	}
-	return lock, nil
+	return jsBindLockResult{lock: lock}, nil
 }
 func dangerousBindNames(field reflect.StructField) []string {
 	if field.PkgPath != "" || field.Name == "JsSealInstExposed" {
@@ -210,9 +215,6 @@ func uniqueHostNames(names []string) []string {
 		result = append(result, name)
 	}
 	return result
-}
-func defineField(ctx *quickjs.Context, object *quickjs.Value, name string, field reflect.Value) error {
-	return defineFieldWithMode(ctx, object, name, field, false)
 }
 
 func defineFieldWithMode(ctx *quickjs.Context, object *quickjs.Value, name string, field reflect.Value, dangerous bool, locks ...*sync.RWMutex) error {
@@ -320,13 +322,13 @@ func setProperty(object *quickjs.Value, name string, value *quickjs.Value) error
 func (r *runtime) coerce(raw interface{}) (*quickjs.Value, bool, error) {
 	if value, ok := raw.(value); ok {
 		if value.runtime != r {
-			return nil, false, fmt.Errorf("cannot mix QuickJS-Go realms")
+			return nil, false, errors.New("cannot mix QuickJS-Go realms")
 		}
 		return value.value, false, nil
 	}
 	if object, ok := raw.(*object); ok {
 		if object.runtime != r {
-			return nil, false, fmt.Errorf("cannot mix QuickJS-Go realms")
+			return nil, false, errors.New("cannot mix QuickJS-Go realms")
 		}
 		return object.value, false, nil
 	}
@@ -371,7 +373,7 @@ func bindFunction(ctx *quickjs.Context, function reflect.Value) *quickjs.Value {
 func ExposeDangerous(engine jsengine.Runtime, target interface{}) (jsengine.Value, error) {
 	r, ok := engine.(*runtime)
 	if !ok {
-		return nil, fmt.Errorf("QuickJS-Go runtime is required")
+		return nil, errors.New("QuickJS-Go runtime is required")
 	}
 	object, err := bindStructWithMode(r.ctx, reflect.ValueOf(target), true)
 	if err != nil {
@@ -437,10 +439,6 @@ func toJSWithMode(ctx *quickjs.Context, value reflect.Value, dangerous bool) *qu
 	default:
 		return ctx.NewUndefined()
 	}
-}
-
-func mapProxy(ctx *quickjs.Context, source reflect.Value) *quickjs.Value {
-	return mapProxyWithMode(ctx, source, false)
 }
 
 func mapProxyWithMode(ctx *quickjs.Context, source reflect.Value, dangerous bool) *quickjs.Value {
@@ -584,10 +582,6 @@ func mapKeys(source reflect.Value) []string {
 	return keys
 }
 
-func sliceProxy(ctx *quickjs.Context, source reflect.Value) *quickjs.Value {
-	return sliceProxyWithMode(ctx, source, false)
-}
-
 func sliceProxyWithMode(ctx *quickjs.Context, source reflect.Value, dangerous bool) *quickjs.Value {
 	target := ctx.NewObject()
 	handler := ctx.NewObject()
@@ -667,7 +661,7 @@ func sliceProxyWithMode(ctx *quickjs.Context, source reflect.Value, dangerous bo
 
 func assignJS(destination reflect.Value, source *quickjs.Value) error {
 	if !destination.CanSet() {
-		return fmt.Errorf("read-only")
+		return errors.New("read-only")
 	}
 
 	switch destination.Kind() {
@@ -723,15 +717,15 @@ func attachHostValue(ctx *quickjs.Context, object *quickjs.Value, id uint64) err
 	value := ctx.NewInt64(int64(id))
 	defer value.Free()
 	if ok := object.DefinePropertyValue(hostValueIDKey, value, quickjs.PropHasValue); !ok {
-		return fmt.Errorf("define Host API identity")
+		return errors.New("define Host API identity")
 	}
 	return nil
 }
 
-func cachedHostObject(ctx *quickjs.Context, id uint64) (*quickjs.Value, error) {
+func cachedHostObject(ctx *quickjs.Context, id uint64) (*quickjs.Value, bool, error) {
 	store, err := hostObjectStore(ctx)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer store.Free()
 	object := store.Get(strconv.FormatUint(id, 10))
@@ -739,9 +733,9 @@ func cachedHostObject(ctx *quickjs.Context, id uint64) (*quickjs.Value, error) {
 		if object != nil {
 			object.Free()
 		}
-		return nil, nil
+		return nil, false, nil
 	}
-	return object, nil
+	return object, true, nil
 }
 
 func cacheHostObject(ctx *quickjs.Context, id uint64, object *quickjs.Value) error {
@@ -804,11 +798,11 @@ func releaseHostValues(ctx *quickjs.Context) {
 
 func newCallback(source *quickjs.Value, target reflect.Type) (reflect.Value, error) {
 	if source == nil || !source.IsFunction() {
-		return reflect.Value{}, fmt.Errorf("expected JavaScript function")
+		return reflect.Value{}, errors.New("expected JavaScript function")
 	}
 	loop, ok := loopsByContext.Load(source.Context())
 	if !ok {
-		return reflect.Value{}, fmt.Errorf("QuickJS-Go callback context is closed")
+		return reflect.Value{}, errors.New("QuickJS-Go callback context is closed")
 	}
 	callbackLoop := loop.(*runtimeLoop)
 	id, err := callbackLoop.registerCallback(source)

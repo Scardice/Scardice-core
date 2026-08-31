@@ -3,9 +3,6 @@ package dice
 import (
 	"errors"
 	"fmt"
-	"github.com/dop251/goja"
-	"github.com/tidwall/buntdb"
-	"go.uber.org/zap"
 	"os"
 	"path"
 	"path/filepath"
@@ -14,6 +11,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/dop251/goja"
+	"github.com/tidwall/buntdb"
+	"go.uber.org/zap"
 
 	"Scardice-core/dice/events"
 	"Scardice-core/utils/jsengine"
@@ -397,9 +398,9 @@ func (i *ExtInfo) CallOnMessagePreprocess(d *Dice, ctx *MsgContext, msg *Message
 			return messagePreprocessDecision{action: messagePreprocessNoop}
 		}
 		err = loop.Run(func(runtime jsengine.Runtime) error {
-			value, err := ext.OnMessagePreprocessEngine(runtime, ctx, cloneMessageForPreprocess(msg))
-			if err != nil {
-				return err
+			value, callErr := ext.OnMessagePreprocessEngine(runtime, ctx, cloneMessageForPreprocess(msg))
+			if callErr != nil {
+				return callErr
 			}
 			decision = parseMessagePreprocessEngineValue(value)
 			return nil

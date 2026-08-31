@@ -5,8 +5,9 @@ import (
 	"net/http"
 	"testing"
 
-	"Scardice-core/dice"
 	"go.uber.org/zap"
+
+	"Scardice-core/dice"
 )
 
 func newJSExecQuickJSDice(t *testing.T) (*dice.Dice, string) {

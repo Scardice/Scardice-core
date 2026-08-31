@@ -6,9 +6,10 @@ import (
 
 	nodelimits "github.com/Scardice/quickjs_nodejs/limits"
 
+	"gopkg.in/yaml.v3"
+
 	"Scardice-core/utils/jsengine"
 	quickjsadapter "Scardice-core/utils/jsengine/quickjs"
-	"gopkg.in/yaml.v3"
 )
 
 func TestConfiguredJSEngine(t *testing.T) {

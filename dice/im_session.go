@@ -2988,6 +2988,40 @@ func logJSSolveEmptyResultWarning(log *zap.SugaredLogger, candidate commandSolve
 	)
 }
 
+func (s *IMSession) executeSolveEngine(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs, item *CmdItemInfo) (CmdExecuteResult, error) {
+	if s.Parent.ExtLoopManager == nil {
+		executeErr := errors.New("loop manager is nil")
+		s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境不可用: %v", item.Name, executeErr)
+		return CmdExecuteResult{Matched: true, Solved: false}, executeErr
+	}
+
+	loop, err := s.Parent.ExtLoopManager.GetEngineLoop(item.JSLoopVersion)
+	if err != nil {
+		s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境已经过期: %v", item.Name, err)
+		return CmdExecuteResult{Matched: true, Solved: false}, err
+	}
+
+	var result CmdExecuteResult
+	err = loop.Run(func(runtime jsengine.Runtime) error {
+		value, solveErr := item.SolveEngine(runtime, ctx, msg, cmdArgs)
+		if solveErr != nil {
+			return solveErr
+		}
+		var parseErr error
+		result, parseErr = parseJSSolveEngineResult(ctx, item.Name, value)
+		return parseErr
+	})
+	if err == nil {
+		return result, nil
+	}
+	if errors.Is(err, errJSSolveEmptyResult) && waitForCommandReply(ctx, jsSolveEmptyResultGraceWindow) {
+		return CmdExecuteResult{Matched: true, Solved: true}, nil
+	}
+
+	ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", err))
+	return CmdExecuteResult{Matched: true, Solved: false}, err
+}
+
 func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) commandSolveResult {
 	// 设置临时变量
 	if ctx.Player != nil {
@@ -3100,33 +3134,9 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 		// 2. 原生 Goja JS 命令(IsJsSolveFunc=true)
 		// 3. 非 JS 命令但被脚本通过 cmd.solve 覆写（SolveRaw!=nil）
 		if item.SolveEngine != nil {
-			if s.Parent.ExtLoopManager == nil {
-				executeErr = errors.New("loop manager is nil")
-				s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境不可用: %v", item.Name, executeErr)
-				return CmdExecuteResult{Matched: true, Solved: false}
-			}
-			loop, err := s.Parent.ExtLoopManager.GetEngineLoop(item.JSLoopVersion)
-			if err != nil {
-				executeErr = err
-				s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境已经过期: %v", item.Name, err)
-				return CmdExecuteResult{Matched: true, Solved: false}
-			}
-			err = loop.Run(func(runtime jsengine.Runtime) error {
-				value, err := item.SolveEngine(runtime, ctx, msg, cmdArgs)
-				if err != nil {
-					return err
-				}
-				ret, err = parseJSSolveEngineResult(ctx, item.Name, value)
-				return err
-			})
-			if err != nil {
-				if errors.Is(err, errJSSolveEmptyResult) && waitForCommandReply(ctx, jsSolveEmptyResultGraceWindow) {
-					ret = CmdExecuteResult{Matched: true, Solved: true}
-				} else {
-					executeErr = err
-					ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", err))
-					return CmdExecuteResult{Matched: true, Solved: false}
-				}
+			ret, executeErr = s.executeSolveEngine(ctx, msg, cmdArgs, item)
+			if executeErr != nil {
+				return ret
 			}
 		} else if item.IsJsSolveFunc || item.SolveRaw != nil {
 			var (

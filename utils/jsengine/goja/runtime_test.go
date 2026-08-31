@@ -10,7 +10,7 @@ import (
 func TestRuntimeEvaluatesScript(t *testing.T) {
 	t.Parallel()
 
-	var loop jsengine.Loop = gojaengine.New()
+	var loop = gojaengine.New()
 	defer loop.Close()
 
 	var got interface{}

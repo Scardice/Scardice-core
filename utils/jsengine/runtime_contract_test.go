@@ -569,15 +569,15 @@ func TestQuickJSCallbackReturnsLiveValueOnOwnerLoop(t *testing.T) {
 
 	target := &callbackTarget{}
 	err = loop.Run(func(runtime jsengine.Runtime) error {
-		if err := runtime.Bind("target", target); err != nil {
-			return err
+		if bindErr := runtime.Bind("target", target); bindErr != nil {
+			return bindErr
 		}
-		if _, err := runtime.RunString("callback.js", `target.solve = value => ({ value })`); err != nil {
-			return err
+		if _, runErr := runtime.RunString("callback.js", `target.solve = value => ({ value })`); runErr != nil {
+			return runErr
 		}
-		result, err := target.Solve(runtime, 42)
-		if err != nil {
-			return err
+		result, solveErr := target.Solve(runtime, 42)
+		if solveErr != nil {
+			return solveErr
 		}
 		if result.Object() == nil || result.Object().Get("value").Export() != float64(42) {
 			t.Fatal("callback did not return a live JavaScript value")

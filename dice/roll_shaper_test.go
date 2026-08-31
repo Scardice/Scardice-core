@@ -164,7 +164,7 @@ func TestDiceRollShaperFlowsThroughV2VM(t *testing.T) {
 		if result == nil || result.vm == nil || result.vm.Error != nil {
 			t.Fatalf("V2 eval failed: %#v", result)
 		}
-		value := int(result.VMValue.MustReadInt())
+		value := int(result.MustReadInt())
 		if seen[value] {
 			t.Fatalf("V2 shaped result %d repeated before bag refill", value)
 		}
@@ -189,7 +189,7 @@ func TestDiceRollShaperFlowsThroughV1VM(t *testing.T) {
 		if err != nil {
 			t.Fatalf("V1 eval error = %v", err)
 		}
-		value := int(result.VMValue.MustReadInt())
+		value := int(result.MustReadInt())
 		if seen[value] {
 			t.Fatalf("V1 shaped result %d repeated before bag refill", value)
 		}

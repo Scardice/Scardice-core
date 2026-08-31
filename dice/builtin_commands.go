@@ -1305,13 +1305,12 @@ func (d *Dice) registerCoreCommands() {
 					if dm.AppVersionOnline != nil {
 						text = fmt.Sprintf("当前本地版本为: %s\n当前线上版本为: %s", VERSION.String(), dm.AppVersionOnline.VersionLatestDetail)
 						if dm.AppVersionCode != dm.AppVersionOnline.VersionLatestCode {
-							code, err := generateFourDigitCode()
+							generatedCode, err := generateFourDigitCode()
 							if err != nil {
 								updateCode = "0000"
-								d.Logger.Errorf("生成升级确认码失败: %v", err)
 								text += "\n无法生成安全确认码，请稍后重试"
 							} else {
-								updateCode = code
+								updateCode = generatedCode
 								text += fmt.Sprintf("\n如需升级，请输入.master checkupdate %s 确认进行升级\n升级将花费约2分钟，升级失败可能导致进程关闭，建议在接触服务器情况下操作。\n当前进程启动时间: %s", updateCode, time.Unix(dm.AppBootTime, 0).Format("2006-01-02 15:04:05"))
 							}
 						}
@@ -1361,14 +1360,13 @@ func (d *Dice) registerCoreCommands() {
 
 				code := cmdArgs.GetArgN(2)
 				if code == "" {
-					code, err := generateFourDigitCode()
+					generatedCode, err := generateFourDigitCode()
 					if err != nil {
 						updateCode = "0000"
-						d.Logger.Errorf("生成重启确认码失败: %v", err)
 						ReplyToSender(ctx, msg, "无法生成安全确认码，请稍后重试")
 						break
 					}
-					updateCode = code
+					updateCode = generatedCode
 					text := fmt.Sprintf("进程重启:\n如需重启，请输入.master reboot %s 确认进行重启\n升级将花费约2分钟，失败可能导致进程关闭，建议在接触服务器情况下操作。\n当前进程启动时间: %s", updateCode, time.Unix(dm.AppBootTime, 0).Format("2006-01-02 15:04:05"))
 					ReplyToSender(ctx, msg, text)
 					break

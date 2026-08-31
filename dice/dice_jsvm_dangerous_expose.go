@@ -47,7 +47,7 @@ func (d *Dice) installDangerousJSInstance(runtime jsengine.Runtime, seal jsengin
 	case jsengine.EngineGoja:
 		vm, ok := gojaengine.Raw(runtime)
 		if !ok {
-			return errors.New("Goja runtime adapter is unavailable")
+			return errors.New("goja runtime adapter is unavailable")
 		}
 		value = gojaengine.WrapValue(vm, exposeDangerousJSValue(vm, d))
 	case jsengine.EngineQuickJS:

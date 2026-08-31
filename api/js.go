@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"mime/multipart"
 	"net/http"
@@ -61,11 +62,11 @@ func jsExec(c echo.Context) error {
 	case jsengine.EngineQuickJS:
 		loop := myDice.ExtLoopManager.GetActiveEngineLoop()
 		if loop == nil {
-			err = fmt.Errorf("QuickJS运行时不可用")
+			err = errors.New("QuickJS运行时不可用")
 			break
 		}
 		if loop.Engine() != engine {
-			err = fmt.Errorf("JS运行时与配置不匹配")
+			err = errors.New("JS运行时与配置不匹配")
 			break
 		}
 		err = loop.Run(func(runtime jsengine.Runtime) error {
@@ -79,7 +80,7 @@ func jsExec(c echo.Context) error {
 	case jsengine.EngineGoja:
 		loop := myDice.ExtLoopManager.GetWebLoop()
 		if loop == nil {
-			err = fmt.Errorf("Goja运行时不可用")
+			err = errors.New("Goja运行时不可用")
 			break
 		}
 		waitRun := make(chan int, 1)
@@ -95,7 +96,7 @@ func jsExec(c echo.Context) error {
 			}()
 			ret, err = vm.RunString(source)
 		}) {
-			err = fmt.Errorf("Goja运行时已停止")
+			err = errors.New("Goja运行时已停止")
 			break
 		}
 		<-waitRun

@@ -3,9 +3,10 @@ package dice
 import (
 	"testing"
 
+	"github.com/dop251/goja"
+
 	"Scardice-core/utils/jsengine"
 	"Scardice-core/utils/jsengine/quickjs"
-	"github.com/dop251/goja"
 )
 
 func TestExposeDangerousJSValueRecursivelyExposesAndMutatesSealInst(t *testing.T) {
