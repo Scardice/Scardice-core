@@ -17,8 +17,10 @@ type Object interface {
 // Loop serializes all access to one JavaScript realm.
 type Loop interface {
 	Engine() EngineID
+	Descriptor() Descriptor
 	Run(func(Runtime) error) error
-	Close()
+	LoadEntry(Entry) error
+	Close() error
 }
 
 // Runtime accesses a JavaScript realm while its owning Loop is executing the

@@ -45,9 +45,15 @@ ok  Scardice-core/utils/jsengine/native  1.010s
 - `utils/jsengine/native/bridge.c`: C-owned safe wrapper implementation and HostBridge callback table. Go never invokes a provider vtable pointer directly; the C shim does so with fixed-width/opaque ABI values.
 - `utils/jsengine/native/native_cgo.go`: worker-thread native loop, descriptor and entry forwarding, deterministic scope/persistent ownership, same-runtime checks, primitive/object adaptation, host binding, and native function call support.
 - `utils/jsengine/native/host_cgo.go`: cgo-handle host context and status-returning HostBridge callbacks for property and function operations, explicit primitive/host-ref conversion, callback error capture, and panic containment.
-- `utils/jsengine/native/errors.go`: stable closed/stale/timeout/exception/host error categories.
+- `utils/jsengine/runtime.go`: upgraded engine-neutral Loop lifecycle/descriptor/entry contract (`Descriptor`, `LoadEntry`, `Close() error`).
+- `utils/jsengine/goja/runtime.go` and `utils/jsengine/quickjs/runtime.go`: compatibility implementations preserving existing Goja-default and legacy QuickJS behavior under the upgraded Loop contract.
 - `utils/jsengine/native/adapter_test.go`: real `/tmp` echo-provider tests covering descriptor, eval, primitive state, object state, host property roundtrip, host function invocation, errors, retention, shutdown, closed rejection, and all four entry kinds.
 - `runtimeabi/testdata/echo-runtime/echo_runtime.c`: real `load_entry` forwarding for Script/CommonJS/ESModule/Extension kinds using the fixture grammar; invalid kinds are rejected by the Go adapter before the ABI call.
+
+## Commits
+
+- `161865d6` — Implement native runtime adapter (native bridge, host callbacks, fixture, focused tests, and this report).
+- Follow-up contract compatibility commit is created with the three Loop contract files and this report.
 
 ## Lifecycle and residency
 

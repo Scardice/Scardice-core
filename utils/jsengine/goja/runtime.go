@@ -2,6 +2,8 @@
 package goja
 
 import (
+	"errors"
+
 	"github.com/dop251/goja"
 
 	"Scardice-core/utils/jsengine"
@@ -38,6 +40,34 @@ func (r *runtime) Engine() jsengine.EngineID {
 
 func (r *runtime) Run(run func(jsengine.Runtime) error) error {
 	return run(r)
+}
+
+func (r *runtime) Descriptor() jsengine.Descriptor {
+	return jsengine.Descriptor{
+		ID:           jsengine.EngineGoja,
+		Name:         "Goja",
+		Version:      "builtin",
+		Language:     "Go",
+		Capabilities: jsengine.CapabilityScript.With(jsengine.CapabilityCommonJS, jsengine.CapabilityHostObject, jsengine.CapabilityHostFunction),
+		Builtin:      true,
+	}
+}
+
+func (r *runtime) LoadEntry(entry jsengine.Entry) error {
+	return r.Run(func(runtime jsengine.Runtime) error {
+		switch entry.Kind {
+		case jsengine.EntryScript, jsengine.EntryExtension:
+			_, err := runtime.RunString(entry.Filename, entry.Source)
+			return err
+		case jsengine.EntryCommonJS:
+			_, err := runtime.LoadCommonJS(entry.Filename, entry.Source)
+			return err
+		case jsengine.EntryESModule:
+			return errors.New("goja: ESM entries are unsupported")
+		default:
+			return errors.New("goja: unknown entry kind")
+		}
+	})
 }
 
 // Raw returns the underlying Goja runtime for legacy Goja-only integrations.
@@ -115,7 +145,7 @@ func (r *runtime) Bind(name string, value interface{}) error {
 	return r.vm.Set(name, value)
 }
 
-func (r *runtime) Close() {}
+func (r *runtime) Close() error { return nil }
 
 func (v value) Export() interface{} {
 	return v.value.Export()

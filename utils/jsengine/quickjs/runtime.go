@@ -172,6 +172,42 @@ func (r *runtimeLoop) Engine() jsengine.EngineID {
 	return jsengine.EngineQuickJS
 }
 
+func (r *runtimeLoop) Descriptor() jsengine.Descriptor {
+	return jsengine.Descriptor{
+		ID:       jsengine.EngineQuickJS,
+		Name:     "QuickJS",
+		Version:  "legacy",
+		Language: "C",
+		Capabilities: jsengine.CapabilityScript.With(
+			jsengine.CapabilityCommonJS,
+			jsengine.CapabilityESM,
+			jsengine.CapabilityPromise,
+			jsengine.CapabilityTimers,
+			jsengine.CapabilityHostObject,
+			jsengine.CapabilityHostFunction,
+		),
+		Builtin: true,
+	}
+}
+
+func (r *runtimeLoop) LoadEntry(entry jsengine.Entry) error {
+	return r.Run(func(runtime jsengine.Runtime) error {
+		switch entry.Kind {
+		case jsengine.EntryScript:
+			_, err := runtime.RunString(entry.Filename, entry.Source)
+			return err
+		case jsengine.EntryCommonJS:
+			_, err := runtime.LoadCommonJS(entry.Filename, entry.Source)
+			return err
+		case jsengine.EntryESModule, jsengine.EntryExtension:
+			_, err := LoadModule(runtime, entry.Filename, entry.Source)
+			return err
+		default:
+			return errors.New("QuickJS-Go: unknown entry kind")
+		}
+	})
+}
+
 func (r *runtimeLoop) Run(run func(jsengine.Runtime) error) error {
 	execute := func(ctx *nodeeventloop.Context) error {
 		realm := &runtime{ctx: ctx.Raw(), loop: r}
@@ -282,9 +318,10 @@ func (r *runtime) Bind(name string, value interface{}) error {
 	return bind(r.ctx, name, value)
 }
 
-func (r *runtimeLoop) Close() {
+func (r *runtimeLoop) Close() error {
+	var closeErr error
 	r.once.Do(func() {
-		_ = r.eventLoop.ContextTask(func(ctx *nodeeventloop.Context) error {
+		closeErr = r.eventLoop.ContextTask(func(ctx *nodeeventloop.Context) error {
 			raw := ctx.Raw()
 			if raw != nil {
 				releaseHostValues(raw)
@@ -292,8 +329,11 @@ func (r *runtimeLoop) Close() {
 			}
 			return nil
 		})
-		_ = r.eventLoop.Close()
+		if err := r.eventLoop.Close(); closeErr == nil {
+			closeErr = err
+		}
 	})
+	return closeErr
 }
 
 // Start enables continuous Promise, timer, and asynchronous-resource pumping.
