@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	nodeeventloop "github.com/Scardice/quickjs_nodejs/eventloop"
+	nodelimits "github.com/Scardice/quickjs_nodejs/limits"
 	nodemodule "github.com/Scardice/quickjs_nodejs/module"
 	quickjs "github.com/buke/quickjs-go"
 
@@ -14,10 +15,11 @@ import (
 )
 
 type config struct {
-	registry      *nodemodule.Registry
-	globals       []nodeeventloop.GlobalInstaller
-	logger        nodeeventloop.Logger
-	runtimeLimits RuntimeLimits
+	registry           *nodemodule.Registry
+	globals            []nodeeventloop.GlobalInstaller
+	logger             nodeeventloop.Logger
+	runtimeLimits      RuntimeLimits
+	nodeResourceLimits nodelimits.Config
 }
 
 // Option configures one qnode-backed QuickJS realm.
@@ -64,6 +66,13 @@ func WithRuntimeLimits(limits RuntimeLimits) Option {
 	}
 }
 
+// WithNodeResourceLimits applies qnode resource boundaries to the event loop.
+func WithNodeResourceLimits(limits nodelimits.Config) Option {
+	return func(cfg *config) {
+		cfg.nodeResourceLimits = limits
+	}
+}
+
 type runtimeLoop struct {
 	eventLoop    *nodeeventloop.EventLoop
 	nextCallback uint64
@@ -103,6 +112,7 @@ func New(options ...Option) (jsengine.Loop, error) {
 	eventLoopOptions := []nodeeventloop.Option{
 		nodeeventloop.WithModuleImport(false),
 	}
+	eventLoopOptions = append(eventLoopOptions, nodeeventloop.WithResourceLimits(cfg.nodeResourceLimits))
 	if cfg.registry != nil {
 		eventLoopOptions = append(eventLoopOptions, nodeeventloop.WithRegistry(cfg.registry))
 	}
