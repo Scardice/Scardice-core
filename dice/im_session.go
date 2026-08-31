@@ -2847,10 +2847,14 @@ func parseJSSolveEngineResult(ctx *MsgContext, solveName string, value jsengine.
 	}
 
 	return CmdExecuteResult{
-		Matched:  object.Get("matched").ToBoolean(),
-		Solved:   object.Get("solved").ToBoolean(),
-		ShowHelp: object.Get("showHelp").ToBoolean(),
+		Matched:  engineValueToBoolean(object.Get("matched")),
+		Solved:   engineValueToBoolean(object.Get("solved")),
+		ShowHelp: engineValueToBoolean(object.Get("showHelp")),
 	}, nil
+}
+
+func engineValueToBoolean(value jsengine.Value) bool {
+	return value != nil && value.ToBoolean()
 }
 
 func resolveJSSolveValue(vm *goja.Runtime, ctx *MsgContext, solveName string, value goja.Value, done chan<- CmdExecuteResult, fail chan<- error) {
