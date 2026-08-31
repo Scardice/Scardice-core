@@ -765,7 +765,8 @@ func (v *nativeValue) Export() interface{} {
 		}
 		return float64(output)
 	case nativeTypeString:
-		return v.stringValue()
+		text, _ := v.stringValue()
+		return text
 	case nativeTypeObject, nativeTypeHostObject:
 		return &nativeObject{loop: v.loop, runtime: v.runtime, handle: v.handle, scope: v.scope}
 	case nativeTypeHostFunction:
@@ -811,7 +812,7 @@ func (v *nativeValue) ExportPrimitive() (any, error) {
 		}
 		return float64(output), nil
 	case nativeTypeString:
-		return v.stringValue(), nil
+		return v.stringValue()
 	case nativeTypeObject:
 		return nil, fmt.Errorf("%w: object", jsengine.ErrPrimitiveExportUnsupported)
 	case nativeTypeHostObject:
@@ -873,31 +874,34 @@ func (v *nativeValue) callConversion(call func(*C.char, C.uint64_t) C.int) error
 	errorBuffer := make([]byte, 512)
 	return v.loop.operation(call((*C.char)(unsafe.Pointer(&errorBuffer[0])), C.uint64_t(len(errorBuffer))), cError(errorBuffer))
 }
-func (v *nativeValue) stringValue() string {
+func (v *nativeValue) stringValue() (string, error) {
 	var required C.uint64_t
 	errorBuffer := make([]byte, 512)
 	status := C.sc_native_value_to_utf8_copy(C.uint64_t(v.loop.provider.library), C.uint64_t(v.runtime), C.uint64_t(v.handle), nil, 0, &required,
 		(*C.char)(unsafe.Pointer(&errorBuffer[0])), C.uint64_t(len(errorBuffer)))
 	if status != C.SC_NATIVE_OK && required == 0 {
-		return ""
+		return "", v.loop.operation(status, cError(errorBuffer))
 	}
 	if required == 0 {
-		return ""
+		return "", nil
 	}
 	if uint64(required) > uint64(^uint(0)>>1) {
-		return ""
+		return "", errors.New("native string is too large")
 	}
 	buffer := make([]byte, int(required))
 	status = C.sc_native_value_to_utf8_copy(C.uint64_t(v.loop.provider.library), C.uint64_t(v.runtime), C.uint64_t(v.handle),
 		(*C.char)(unsafe.Pointer(&buffer[0])), C.uint64_t(len(buffer)), &required,
 		(*C.char)(unsafe.Pointer(&errorBuffer[0])), C.uint64_t(len(errorBuffer)))
-	if v.loop.operation(status, cError(errorBuffer)) != nil {
-		return ""
+	if err := v.loop.operation(status, cError(errorBuffer)); err != nil {
+		return "", err
+	}
+	if uint64(required) < uint64(len(buffer)) {
+		buffer = buffer[:int(required)]
 	}
 	if len(buffer) > 0 && buffer[len(buffer)-1] == 0 {
 		buffer = buffer[:len(buffer)-1]
 	}
-	return string(buffer)
+	return string(buffer), nil
 }
 func (v *nativeValue) retain() error {
 	if !v.usable() {
