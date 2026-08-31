@@ -28,6 +28,32 @@ cmake --build /tmp/scardice-echo-green
 ctest --test-dir /tmp/scardice-echo-green --output-on-failure
 ```
 
+Configure output:
+
+```text
+-- The C compiler identification is GNU 16.2.1
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Configuring done (0.1s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/scardice-echo-green
+```
+
+Build output:
+
+```text
+[ 25%] Building C object CMakeFiles/echo_runtime.dir/echo_runtime.c.o
+[ 50%] Linking C shared library libecho_runtime.so
+[ 50%] Built target echo_runtime
+[ 75%] Building C object CMakeFiles/echo_runtime_harness.dir/harness.c.o
+[100%] Linking C executable echo_runtime_harness
+[100%] Built target echo_runtime_harness
+```
+ 
+
 The final focused run passed:
 
 ```text
