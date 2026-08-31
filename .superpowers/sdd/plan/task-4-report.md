@@ -30,7 +30,7 @@ cmake -S runtimeabi/testdata/echo-runtime -B /tmp/scardice-echo-phase4 && cmake 
 [100%] Built target echo_runtime_harness
 ```
 
-Focused native tests, including manifest discovery, unsupported architecture, missing library, missing query symbol, builtin/candidate separation, identity mismatch, valid echo descriptor, create/start/stop/destroy, and resident-library behavior:
+Focused native tests, including manifest discovery, unsupported architecture, missing library, missing query symbol, builtin/candidate separation, identity mismatch, repeated-load transient path ownership, valid echo descriptor, create/start/stop/destroy, and resident-library behavior:
 
 ```text
 SCARDICE_ECHO_RUNTIME=/tmp/scardice-echo-phase4/libecho_runtime.so go test ./utils/jsengine/native -count=1
@@ -40,8 +40,7 @@ ok   Scardice-core/utils/jsengine/native 0.003s
 No-cgo fallback focused check:
 
 ```text
-CGO_ENABLED=0 go test ./utils/jsengine/native -run 'TestDiscover|TestMissingLibrary' -count=1
-ok   Scardice-core/utils/jsengine/native 0.003s
+ok   Scardice-core/utils/jsengine/native 0.002s
 ```
 
 ## Implementation
@@ -60,6 +59,7 @@ ok   Scardice-core/utils/jsengine/native 0.003s
 - Baseline: `3ff0fa42b3a76cf8727f9680943c53418b2b4afe`
 - Task implementation commit: `41052437` (`feat(jsengine): add lazy native runtime loader`)
 - Focused test commit: `fe5cbc4c` (`test(jsengine): cover native create diagnostics`)
+- Leak regression: `9710c913` (`fix(jsengine): release transient native load path`)
 
 ## Concerns
 
