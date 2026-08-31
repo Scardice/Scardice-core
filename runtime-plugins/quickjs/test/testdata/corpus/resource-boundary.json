@@ -1,0 +1,12 @@
+{
+  "name": "resource-boundary-capability",
+  "entries": [
+    {
+      "filename": "resource.js",
+      "kind": "script",
+      "source": "globalThis.resourceValue = 1"
+    }
+  ],
+  "requiresCapability": "resource-limits",
+  "observe": "JSON.stringify({resourceValue: globalThis.resourceValue})"
+}

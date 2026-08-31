@@ -1,0 +1,11 @@
+{
+  "name": "script-evaluation",
+  "entries": [
+    {
+      "filename": "script-evaluation.js",
+      "kind": "script",
+      "source": "globalThis.trace = ['script']; globalThis.answer = 6 * 7; answer"
+    }
+  ],
+  "observe": "JSON.stringify({answer: globalThis.answer, trace: globalThis.trace})"
+}

@@ -186,6 +186,9 @@ struct Runtime {
     sc_status_t pending_host_status = SC_OK;
     std::unordered_set<Value *> values;
     std::map<std::string, std::string> modules;
+    // CommonJS modules are evaluated once per runtime, matching the legacy
+    // adapter's module cache contract.
+    std::map<std::string, JSValue> commonjs_cache;
     std::vector<Timer> timers;
     uint64_t next_timer_id = 1;
 
@@ -648,8 +651,13 @@ struct Runtime {
                 JS_FreeValue(context, value->value);
                 delete value;
             }
+            for (auto &[filename, cached] : commonjs_cache) {
+                (void)filename;
+                JS_FreeValue(context, cached);
+            }
         }
         values.clear();
+        commonjs_cache.clear();
         modules.clear();
         if (context != nullptr) {
             JS_FreeContext(context);
@@ -692,6 +700,10 @@ struct Runtime {
     }
 
     JSValue eval_commonjs_raw(const std::string &filename, const std::string &source) {
+        auto cached = commonjs_cache.find(filename);
+        if (cached != commonjs_cache.end()) {
+            return JS_DupValue(context, cached->second);
+        }
         std::string wrapped;
         wrapped.reserve(source.size() + 64);
         wrapped = "(function(module, exports, require) {\n";
@@ -739,6 +751,9 @@ struct Runtime {
         JS_FreeValue(context, module);
         if (JS_IsException(result)) {
             capture_exception();
+        }
+        if (!JS_IsException(result)) {
+            commonjs_cache.emplace(filename, JS_DupValue(context, result));
         }
         return result;
     }

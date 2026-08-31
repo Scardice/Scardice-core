@@ -1,0 +1,11 @@
+{
+  "name": "esm-module-load",
+  "entries": [
+    {
+      "filename": "entry.mjs",
+      "kind": "esm",
+      "source": "export const answer = 42; globalThis.esmAnswer = answer"
+    }
+  ],
+  "observe": "JSON.stringify({answer: globalThis.esmAnswer, type: typeof globalThis.esmAnswer})"
+}

@@ -1,0 +1,13 @@
+{
+  "name": "timer-order-cancellation-delay",
+  "entries": [
+    {
+      "filename": "timers.js",
+      "kind": "script",
+      "source": "globalThis.timers = []; const cancelled = setTimeout(() => timers.push('cancelled'), 0); clearTimeout(cancelled); setTimeout(() => timers.push('zero'), 0); setTimeout(() => timers.push('delayed'), 10)"
+    }
+  ],
+  "pump": "0",
+  "waitMS": 25,
+  "observe": "JSON.stringify(globalThis.timers)"
+}
