@@ -12,7 +12,6 @@ import (
 
 	"Scardice-core/dice"
 	"Scardice-core/utils"
-	"Scardice-core/utils/jsengine"
 )
 
 func jsExec(c echo.Context) error {
@@ -40,72 +39,30 @@ func jsExec(c echo.Context) error {
 		return c.String(430, err.Error())
 	}
 
-	source := "(function(exports, require, module) {" + v.Value + "\n})({}, globalThis.require, {exports: {}})"
-	engine, configErr := jsengine.ParseEngineID(myDice.Config.JsEngine)
-	if configErr != nil {
-		return c.JSON(http.StatusOK, map[string]interface{}{
-			"result": false,
-			"err":    fmt.Sprintf("JS引擎配置无效: %v", configErr),
-		})
-	}
-	if myDice.ExtLoopManager == nil || myDice.JsPrinter == nil {
-		return c.JSON(http.StatusOK, map[string]interface{}{
-			"result": false,
-			"err":    "JS运行时不可用",
-		})
-	}
+	source := "(function(exports, require, module) {" + v.Value + "\n})()"
+	loop := myDice.ExtLoopManager.GetWebLoop()
+	waitRun := make(chan int, 1)
 
+	var ret goja.Value
 	myDice.JsPrinter.RecordStart()
-	var retFinal interface{}
-	switch engine {
-	case jsengine.EngineQuickJS:
-		loop := myDice.ExtLoopManager.GetActiveEngineLoop()
-		if loop == nil {
-			err = fmt.Errorf("QuickJS运行时不可用")
-			break
-		}
-		if loop.Engine() != engine {
-			err = fmt.Errorf("JS运行时与配置不匹配")
-			break
-		}
-		err = loop.Run(func(runtime jsengine.Runtime) error {
-			ret, runErr := runtime.RunString("api-js-exec.js", source)
-			if runErr != nil {
-				return runErr
+	loop.RunOnLoop(func(vm *goja.Runtime) {
+		defer func() {
+			// 防止崩掉进程
+			if r := recover(); r != nil {
+				// fmt.Println("xx", r.(goja.Exception))
+				myDice.JsPrinter.Error(fmt.Sprintf("JS脚本报错: %v", r))
 			}
-			retFinal = ret.Export()
-			return nil
-		})
-	case jsengine.EngineGoja:
-		loop := myDice.ExtLoopManager.GetWebLoop()
-		if loop == nil {
-			err = fmt.Errorf("Goja运行时不可用")
-			break
-		}
-		waitRun := make(chan int, 1)
-		var ret goja.Value
-		if !loop.RunOnLoop(func(vm *goja.Runtime) {
-			defer func() {
-				// 防止崩掉进程
-				if r := recover(); r != nil {
-					// fmt.Println("xx", r.(goja.Exception))
-					myDice.JsPrinter.Error(fmt.Sprintf("JS脚本报错: %v", r))
-				}
-				waitRun <- 1
-			}()
-			ret, err = vm.RunString(source)
-		}) {
-			err = fmt.Errorf("Goja运行时已停止")
-			break
-		}
-		<-waitRun
-		if ret != nil {
-			retFinal = ret.Export()
-		}
-	default:
-		err = fmt.Errorf("不支持的JS引擎: %s", engine)
-	}
+			waitRun <- 1
+		}()
+		ret, err = vm.RunString(source)
+	})
+	<-waitRun
 	outputs := myDice.JsPrinter.RecordEnd()
+
+	var retFinal interface{}
+	if ret != nil {
+		retFinal = ret.Export()
+	}
 
 	var errText interface{}
 	if err != nil {

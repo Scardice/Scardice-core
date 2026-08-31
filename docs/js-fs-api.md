@@ -2,43 +2,6 @@
 
 本文档说明 `Scardice-core` 在 Goja 中暴露的文件系统 `fs` API。
 
-## QuickJS 实验运行时
-
-选择 QuickJS 时，脚本通过 Node 风格模块访问文件系统。本文后续章节描述 Goja 的旧接口；不要把其中的全局对象或同步方法用于 QuickJS。
-
-| 项目 | QuickJS 行为 |
-| --- | --- |
-| 导入 | `require("fs")`、`import ... from "fs/promises"`，以及对应的 `node:` 别名。 |
-| 全局对象 | 不安装 `globalThis.fs`。 |
-| 操作 | `readFile`、`writeFile`、`mkdir`、`readdir`、`stat`、`lstat`、`unlink`、`rename` 均为 Promise API。 |
-| 路径 | 默认仅接受 `data://`，映射到 `<DataDir>/extensions/<extName>/data/`。 |
-| 授权 | 默认拒绝绝对路径、相对主机路径、路径穿越和 root 外符号链接。启用 `allowFilesystemUnrestrictedAccess` 后，QuickJS 与 Goja 一致：允许绝对路径、核心可执行文件相对路径及其符号链接，并以进程权限访问主机文件；`data://` 仍拒绝符号链接越界。 |
-
-
-运行时在 JS 重载时读取 `allowFilesystemUnrestrictedAccess`。修改开关后重载 JS 才会生效；启用前必须信任所有已加载的 QuickJS 插件。
-
-QuickJS 的资源上限配置位于 `serve.yaml`，仅在 `jsEngine: quickjs` 时生效：
-
-```yaml
-quickJSMemoryLimitMiB: 256
-quickJSGCThresholdMiB: 64
-quickJSMaxStackSizeKiB: 1024
-```
-
-这些值分别限制一个 Dice 的全部 QuickJS 扩展共享的 native heap、自动 GC 起点和 JS 调用栈。缺失或设为 `0` 时回退到上述默认值；GC 阈值不允许达到内存上限。
-首次访问某个扩展时，运行时创建它的 `data` 根目录。`writeFile` 不创建更深的父目录；需要子目录时，先调用 `await mkdir("data://cache")`。
-
-```javascript
-import { readFile, writeFile } from "node:fs/promises";
-
-const path = "data://settings.json";
-const settings = { enabled: true };
-await writeFile(path, JSON.stringify(settings));
-const saved = JSON.parse(await readFile(path, "utf8"));
-```
-
-QuickJS `fs` 默认不公开同步调用。使用 `fs/promises`，或从 `require("fs")` 返回对象的 `promises` 字段调用相同 API。
-
 ## 对外入口
 
 - **全局对象**：`fs`

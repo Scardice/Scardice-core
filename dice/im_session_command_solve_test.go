@@ -5,8 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"Scardice-core/utils/jsengine"
-	quickjs "Scardice-core/utils/jsengine/quickjs"
 	"github.com/dop251/goja"
 	"github.com/dop251/goja_nodejs/eventloop"
 	"go.uber.org/zap"
@@ -562,45 +560,5 @@ func TestCommandSolve_UsesSolveRawOverrideForNonJsCommand(t *testing.T) {
 	}
 	if solveHit != 0 {
 		t.Fatalf("expected legacy Solve not to execute when SolveRaw override exists, got %d", solveHit)
-	}
-}
-
-func TestCommandSolve_UsesEngineNeutralCallback(t *testing.T) {
-	commandName := "engine-test"
-	callbackHit := 0
-	loop, err := quickjs.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(loop.Close)
-
-	ext := &ExtInfo{
-		Name:    "dnd5e",
-		IsJsExt: true,
-		CmdMap: CmdMapCls{
-			commandName: {
-				Name:          commandName,
-				Raw:           true,
-				IsJsSolveFunc: true,
-				SolveEngine: func(runtime jsengine.Runtime, _ *MsgContext, _ *Message, _ *CmdArgs) (jsengine.Value, error) {
-					callbackHit++
-					return runtime.RunString("engine-solve.js", "({ matched: true, solved: true })")
-				},
-			},
-		},
-		DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
-	}
-
-	session, ctx := newCommandSolveTestSessionAndContext("dnd5e", []*ExtInfo{ext})
-	ctx.Dice.ExtLoopManager = NewJsLoopManager()
-	ext.JSLoopVersion = ctx.Dice.ExtLoopManager.SetEngineLoop(loop)
-	ext.CmdMap[commandName].JSLoopVersion = ext.JSLoopVersion
-
-	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})
-	if result.Status != commandSolveSolved {
-		t.Fatalf("expected solved status, got %v", result.Status)
-	}
-	if callbackHit != 1 {
-		t.Fatalf("expected engine callback once, got %d", callbackHit)
 	}
 }

@@ -355,6 +355,9 @@ func TestExecuteNew_PrivateCommand_Roll(t *testing.T) {
 }
 
 func TestExecuteNew_CustomHelpSections(t *testing.T) {
+	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+
 	tests := []struct {
 		arg         string
 		key         string
@@ -367,29 +370,24 @@ func TestExecuteNew_CustomHelpSections(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		t.Run(test.arg, func(t *testing.T) {
-			d, ep, adapter, cleanup := newExecuteNewTestDice(t)
-			defer cleanup()
+		items := d.TextMapRaw["核心"][test.key]
+		if len(items) != 1 || items[0][0] != test.placeholder {
+			t.Fatalf("default %s help = %#v, want %q", test.arg, items, test.placeholder)
+		}
+		d.TextMapRaw["核心"][test.key] = TextTemplateItemList{{test.custom, 1}}
+		d.GenerateTextMap()
+		d.ImSession.ExecuteNew(ep, newPrivateMsg("QQ:999", ".help "+test.arg))
 
-			items := d.TextMapRaw["核心"][test.key]
-			if len(items) != 1 || items[0][0] != test.placeholder {
-				t.Fatalf("default %s help = %#v, want %q", test.arg, items, test.placeholder)
-			}
-			d.TextMapRaw["核心"][test.key] = TextTemplateItemList{{test.custom, 1}}
-			d.GenerateTextMap()
-			d.ImSession.ExecuteNew(ep, newPrivateMsg("QQ:999", ".help "+test.arg))
-
-			reply, ok := adapter.waitForMsg(2 * time.Second)
-			if !ok {
-				t.Fatalf("timeout: expected a reply to '.help %s'", test.arg)
-			}
-			if reply != test.custom {
-				t.Fatalf(".help %s reply = %q, want %q", test.arg, reply, test.custom)
-			}
-			if got := d.TextMapHelpInfo["核心"][test.key].SubType; got != ".help" {
-				t.Fatalf("%s help subtype = %q, want .help", test.arg, got)
-			}
-		})
+		reply, ok := adapter.waitForMsg(2 * time.Second)
+		if !ok {
+			t.Fatalf("timeout: expected a reply to '.help %s'", test.arg)
+		}
+		if reply != test.custom {
+			t.Fatalf(".help %s reply = %q, want %q", test.arg, reply, test.custom)
+		}
+		if got := d.TextMapHelpInfo["核心"][test.key].SubType; got != ".help" {
+			t.Fatalf("%s help subtype = %q, want .help", test.arg, got)
+		}
 	}
 }
 

@@ -1,16 +1,11 @@
 package dice
 
 import (
-	"errors"
 	"reflect"
 	"sort"
 	"strings"
 
 	"github.com/dop251/goja"
-
-	"Scardice-core/utils/jsengine"
-	gojaengine "Scardice-core/utils/jsengine/goja"
-	"Scardice-core/utils/jsengine/quickjs"
 )
 
 type dangerousExposeCacheKey struct {
@@ -29,40 +24,6 @@ func exposeDangerousJSValue(vm *goja.Runtime, value interface{}) goja.Value {
 		cache: map[dangerousExposeCacheKey]goja.Value{},
 	}
 	return ctx.toValue(reflect.ValueOf(value))
-}
-
-// installDangerousJSInstance exposes seal.inst only when explicitly enabled.
-// Goja retains its compatibility proxy; QuickJS-Go uses the equivalent
-// reflection-backed mutable Host proxy.
-func (d *Dice) installDangerousJSInstance(runtime jsengine.Runtime, seal jsengine.Object) error {
-	if !d.AdvancedConfig.ExposeDangerousSealInst {
-		return nil
-	}
-
-	var (
-		value jsengine.Value
-		err   error
-	)
-	switch runtime.Engine() {
-	case jsengine.EngineGoja:
-		vm, ok := gojaengine.Raw(runtime)
-		if !ok {
-			return errors.New("Goja runtime adapter is unavailable")
-		}
-		value = gojaengine.WrapValue(vm, exposeDangerousJSValue(vm, d))
-	case jsengine.EngineQuickJS:
-		value, err = quickjs.ExposeDangerous(runtime, d)
-	default:
-		return errors.New("unsupported JavaScript runtime")
-	}
-	if err != nil {
-		return err
-	}
-	if err := seal.Set("inst", value); err != nil {
-		return err
-	}
-	d.JsSealInstExposed = true
-	return nil
 }
 
 func (ctx *dangerousExposeContext) toValue(value reflect.Value) goja.Value {
