@@ -162,11 +162,14 @@ func (m *JsLoopManager) GetLoop(expectedVersion int64) (jsengine.Loop, error) {
 	return m.loop, nil
 }
 
-// GetWebLoop returns the active loop. It does not bypass the neutral contract.
-func (m *JsLoopManager) GetWebLoop() jsengine.Loop {
+// CurrentLoop returns the active loop and its generation as one snapshot.
+// Callers that dispatch callbacks should prefer GetLoop with the callback's
+// captured generation; this method is only for loading new script entries and
+// compatibility callbacks that have no generation metadata.
+func (m *JsLoopManager) CurrentLoop() (jsengine.Loop, int64) {
 	m.loopLock.RLock()
 	defer m.loopLock.RUnlock()
-	return m.loop
+	return m.loop, m.version
 }
 
 // SetLoop replaces the active loop, closes the previous loop, and increments
@@ -179,7 +182,7 @@ func (m *JsLoopManager) SetLoop(newLoop jsengine.Loop) int64 {
 	version := m.version
 	m.loopLock.Unlock()
 
-	if oldLoop != nil {
+	if oldLoop != nil && oldLoop != newLoop {
 		_ = oldLoop.Close()
 	}
 	return version
@@ -249,8 +252,9 @@ type Dice struct {
 	JsBuiltinDigestSet map[string]bool `json:"-" yaml:"-"`
 	// 当前在加载的脚本路径，用于关联 jsScriptInfo 和 ExtInfo
 	JsLoadingScript *JsScriptInfo `json:"-" yaml:"-"`
-	// 当前正在事件循环 goroutine 上执行回调的 JS 扩展。
-	// 注意：仅在 RunOnLoop 回调内部（事件循环 goroutine 上）设置/清除，外部 goroutine 不要读写。
+	// 当前在 jsengine.Loop.Run 回调内执行的 JS 扩展。
+	// 注意：仅在 jsengine.Loop.Run 回调内部（事件循环 goroutine 上）设置/清除，
+	// 外部 goroutine 不要读写。
 	// 用途：在 JS 原生模块（如 fs）内据此定位调用插件的沙箱权限。
 	JsCurrentPlugin *ExtInfo `json:"-" yaml:"-"`
 

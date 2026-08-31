@@ -1649,7 +1649,7 @@ func (d *Dice) JsLoadScriptRaw(jsInfo *JsScriptInfo) {
 			targetPath = jsInfo.Filename
 		}
 		if err == nil {
-			loop := d.ExtLoopManager.GetWebLoop()
+			loop, _ := d.ExtLoopManager.CurrentLoop()
 			if loop == nil {
 				err = errors.New("JavaScript runtime is unavailable")
 			} else {

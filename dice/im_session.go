@@ -1030,7 +1030,7 @@ func (s *IMSession) runMessagePreprocessHooks(mctx *MsgContext, msg *Message) bo
 	}
 	for _, wrapper := range mctx.Group.GetActivatedExtList(mctx.Dice) {
 		ext := wrapper.GetRealExt()
-		if ext == nil || ext.OnMessagePreprocess == nil {
+		if ext == nil || (ext.OnMessagePreprocess == nil && ext.OnMessagePreprocessEngine == nil) {
 			continue
 		}
 		decision := wrapper.CallOnMessagePreprocess(mctx.Dice, mctx, msg)
@@ -1431,25 +1431,9 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 						i := ext // 保留引用
 						if i.OnNotCommandReceived != nil {
 							notCommandReceiveCall := func() {
-								if i.IsJsExt {
-									loop, err := d.ExtLoopManager.GetLoop(i.JSLoopVersion)
-									if err != nil {
-										mctx.Dice.Logger.Errorf("扩展<%s>运行环境已经过期: %v", i.Name, err)
-										return
-									}
-									err = loop.Run(func(jsengine.Runtime) error {
-										prev := mctx.Dice.JsCurrentPlugin
-										mctx.Dice.JsCurrentPlugin = i
-										defer func() { mctx.Dice.JsCurrentPlugin = prev }()
-										i.OnNotCommandReceived(mctx, msg)
-										return nil
-									})
-									if err != nil {
-										mctx.Dice.Logger.Errorf("扩展<%s>处理非指令消息异常: %v", i.Name, err)
-									}
-								} else {
+								i.callWithJsCheck(d, func() {
 									i.OnNotCommandReceived(mctx, msg)
-								}
+								})
 							}
 
 							if runInSync {
@@ -1704,25 +1688,9 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 					i := ext // 保留引用
 					if i.OnNotCommandReceived != nil {
 						notCommandReceiveCall := func() {
-							if i.IsJsExt {
-								loop, err := d.ExtLoopManager.GetLoop(i.JSLoopVersion)
-								if err != nil {
-									i.dice.Logger.Errorf("扩展<%s>运行环境已经过期: %v", i.Name, err)
-									return
-								}
-								err = loop.Run(func(jsengine.Runtime) error {
-									prev := mctx.Dice.JsCurrentPlugin
-									mctx.Dice.JsCurrentPlugin = i
-									defer func() { mctx.Dice.JsCurrentPlugin = prev }()
-									i.OnNotCommandReceived(mctx, msg)
-									return nil
-								})
-								if err != nil {
-									mctx.Dice.Logger.Errorf("扩展<%s>处理非指令消息异常: %v", i.Name, err)
-								}
-							} else {
+							i.callWithJsCheck(d, func() {
 								i.OnNotCommandReceived(mctx, msg)
-							}
+							})
 						}
 
 						go notCommandReceiveCall()
@@ -2981,7 +2949,7 @@ func logJSSolveEmptyResultWarning(log *zap.SugaredLogger, candidate commandSolve
 	)
 }
 
-func (s *IMSession) executeSolveEngine(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs, item *CmdItemInfo) (CmdExecuteResult, error) {
+func (s *IMSession) executeSolveEngine(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs, item *CmdItemInfo, plugin *ExtInfo) (CmdExecuteResult, error) {
 	if s.Parent.ExtLoopManager == nil {
 		executeErr := errors.New("loop manager is nil")
 		s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境不可用: %v", item.Name, executeErr)
@@ -2989,6 +2957,9 @@ func (s *IMSession) executeSolveEngine(ctx *MsgContext, msg *Message, cmdArgs *C
 	}
 
 	loop, err := s.Parent.ExtLoopManager.GetLoop(item.JSLoopVersion)
+	if err == nil && loop == nil {
+		err = errors.New("JavaScript runtime is unavailable")
+	}
 	if err != nil {
 		s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境已经过期: %v", item.Name, err)
 		return CmdExecuteResult{Matched: true, Solved: false}, err
@@ -2996,13 +2967,20 @@ func (s *IMSession) executeSolveEngine(ctx *MsgContext, msg *Message, cmdArgs *C
 
 	var result CmdExecuteResult
 	err = loop.Run(func(runtime jsengine.Runtime) error {
-		value, solveErr := item.SolveEngine(runtime, ctx, msg, cmdArgs)
-		if solveErr != nil {
-			return solveErr
-		}
-		var parseErr error
-		result, parseErr = parseJSSolveEngineResult(ctx, item.Name, value)
-		return parseErr
+		return runEngineCallback(func() error {
+			prev := s.Parent.JsCurrentPlugin
+			if plugin != nil {
+				s.Parent.JsCurrentPlugin = plugin.GetRealExt()
+			}
+			defer func() { s.Parent.JsCurrentPlugin = prev }()
+			value, solveErr := item.SolveEngine(runtime, ctx, msg, cmdArgs)
+			if solveErr != nil {
+				return solveErr
+			}
+			var parseErr error
+			result, parseErr = parseJSSolveEngineResult(ctx, item.Name, value)
+			return parseErr
+		})
 	})
 	if err == nil {
 		return result, nil
@@ -3127,7 +3105,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 		// 2. 原生 Goja JS 命令(IsJsSolveFunc=true)
 		// 3. 非 JS 命令但被脚本通过 cmd.solve 覆写（SolveRaw!=nil）
 		if item.SolveEngine != nil {
-			ret, executeErr = s.executeSolveEngine(ctx, msg, cmdArgs, item)
+			ret, executeErr = s.executeSolveEngine(ctx, msg, cmdArgs, item, candidate.Ext)
 			if executeErr != nil {
 				return ret
 			}
@@ -3144,10 +3122,13 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 
 			loop, err = s.Parent.ExtLoopManager.GetLoop(item.JSLoopVersion)
 			if err != nil {
-				// 兼容非 JS 命令被覆写 solve 的场景：
-				// 这类命令通常没有有效 JSLoopVersion（如 ext.find 复制官方命令后赋值 cmd.solve）。
+				// Compatibility branch for non-JS commands overwritten by a
+				// legacy Goja SolveRaw callback with no generation metadata.
 				if !item.IsJsSolveFunc && item.SolveRaw != nil {
-					loop = s.Parent.ExtLoopManager.GetWebLoop()
+					loop, _ = s.Parent.ExtLoopManager.CurrentLoop()
+					if loop != nil {
+						err = nil
+					}
 				}
 				if loop == nil {
 					executeErr = err
@@ -3173,6 +3154,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 					ret = item.Solve(ctx, msg, cmdArgs)
 					return nil
 				}
+				// Compatibility branch: legacy Goja SolveRaw requires Raw.
 				vm, ok := gojaengine.Raw(runtime)
 				if !ok {
 					return errors.New("legacy Goja solve callback requires a Goja runtime")

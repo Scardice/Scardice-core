@@ -395,6 +395,16 @@ func cloneMessageForPreprocess(msg *Message) *Message {
 	return &cloned
 }
 
+// runEngineCallback converts callback panics into errors for dispatcher logging.
+func runEngineCallback(callback func() error) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("JavaScript callback panic: %v", recovered)
+		}
+	}()
+	return callback()
+}
+
 // CallOnMessagePreprocess 调用 OnMessagePreprocess 回调（处理 wrapper 代理）。
 func (i *ExtInfo) CallOnMessagePreprocess(d *Dice, ctx *MsgContext, msg *Message) messagePreprocessDecision {
 	ext := i.GetRealExt()
@@ -404,60 +414,91 @@ func (i *ExtInfo) CallOnMessagePreprocess(d *Dice, ctx *MsgContext, msg *Message
 	}
 
 	if ext.OnMessagePreprocessEngine != nil {
-		if !ext.IsJsExt || d.ExtLoopManager == nil {
+		if d == nil || d.ExtLoopManager == nil {
+			if d != nil && d.Logger != nil {
+				d.Logger.Errorf("扩展<%s>运行环境不可用", ext.Name)
+			}
 			return messagePreprocessDecision{action: messagePreprocessNoop}
 		}
 		loop, err := d.ExtLoopManager.GetLoop(ext.JSLoopVersion)
+		if err == nil && loop == nil {
+			err = errors.New("JavaScript runtime is unavailable")
+		}
 		if err != nil {
-			d.Logger.Errorf("扩展<%s>运行环境已经过期: %v", ext.Name, err)
+			if d.Logger != nil {
+				d.Logger.Errorf("扩展<%s>运行环境已经过期: %v", ext.Name, err)
+			}
 			return messagePreprocessDecision{action: messagePreprocessNoop}
 		}
 		err = loop.Run(func(runtime jsengine.Runtime) error {
-			value, callErr := ext.OnMessagePreprocessEngine(runtime, ctx, cloneMessageForPreprocess(msg))
-			if callErr != nil {
-				return callErr
-			}
-			decision = parseMessagePreprocessEngineValue(value)
-			return nil
+			return runEngineCallback(func() error {
+				prev := d.JsCurrentPlugin
+				d.JsCurrentPlugin = ext
+				defer func() { d.JsCurrentPlugin = prev }()
+				value, callErr := ext.OnMessagePreprocessEngine(runtime, ctx, cloneMessageForPreprocess(msg))
+				if callErr != nil {
+					return callErr
+				}
+				decision = parseMessagePreprocessEngineValue(value)
+				return nil
+			})
 		})
-		if err != nil {
+		if err != nil && d.Logger != nil {
 			d.Logger.Errorf("扩展<%s>预处理异常: %v", ext.Name, err)
 		}
 		return decision
 	}
 
-	run := func(vm *goja.Runtime) {
+	// Compatibility branch: legacy Goja callbacks expose goja.Value and cannot
+	// be invoked without the Goja adapter. Neutral callbacks above always win.
+	runLegacy := func(vm *goja.Runtime) {
 		decision = parseMessagePreprocessValue(vm, ext.OnMessagePreprocess(ctx, cloneMessageForPreprocess(msg)))
 	}
 
 	if ext.IsJsExt {
-		if !d.Config.JsEnable {
-			d.Logger.Infof("当前已关闭js扩展<%v>", ext.Name)
+		if d == nil || !d.Config.JsEnable {
+			if d != nil && d.Logger != nil {
+				d.Logger.Infof("当前已关闭js扩展<%v>", ext.Name)
+			}
+			return messagePreprocessDecision{action: messagePreprocessNoop}
+		}
+		if d.ExtLoopManager == nil {
+			if d.Logger != nil {
+				d.Logger.Errorf("扩展<%s>运行环境不可用", ext.Name)
+			}
 			return messagePreprocessDecision{action: messagePreprocessNoop}
 		}
 		loop, err := d.ExtLoopManager.GetLoop(ext.JSLoopVersion)
+		if err == nil && loop == nil {
+			err = errors.New("JavaScript runtime is unavailable")
+		}
 		if err != nil {
-			d.Logger.Errorf("扩展<%s>运行环境已经过期: %v", ext.Name, err)
+			if d.Logger != nil {
+				d.Logger.Errorf("扩展<%s>运行环境已经过期: %v", ext.Name, err)
+			}
 			return messagePreprocessDecision{action: messagePreprocessNoop}
 		}
 		err = loop.Run(func(runtime jsengine.Runtime) error {
-			vm, ok := gojaengine.Raw(runtime)
-			if !ok {
-				return errors.New("legacy Goja message preprocess callback requires a Goja runtime")
-			}
-			prev := d.JsCurrentPlugin
-			d.JsCurrentPlugin = ext
-			defer func() { d.JsCurrentPlugin = prev }()
-			run(vm)
-			return nil
+			return runEngineCallback(func() error {
+				// Compatibility branch: only legacy Goja callbacks use Raw.
+				vm, ok := gojaengine.Raw(runtime)
+				if !ok {
+					return errors.New("legacy Goja message preprocess callback requires a Goja runtime")
+				}
+				prev := d.JsCurrentPlugin
+				d.JsCurrentPlugin = ext
+				defer func() { d.JsCurrentPlugin = prev }()
+				runLegacy(vm)
+				return nil
+			})
 		})
-		if err != nil {
+		if err != nil && d.Logger != nil {
 			d.Logger.Errorf("扩展<%s>预处理异常: %v", ext.Name, err)
 		}
 		return decision
 	}
 
-	run(nil)
+	runLegacy(nil)
 	return decision
 }
 
@@ -471,7 +512,6 @@ func (i *ExtInfo) CallOnMessageSend(d *Dice, ctx *MsgContext, msg *Message, flag
 		ext.OnMessageSend(ctx, msg, flag)
 	})
 }
-
 // CallOnMessageDeleted 调用 OnMessageDeleted 回调（处理 wrapper 代理）
 func (i *ExtInfo) CallOnMessageDeleted(d *Dice, ctx *MsgContext, msg *Message) {
 	ext := i.GetRealExt()
@@ -496,29 +536,47 @@ func (i *ExtInfo) CallOnGroupLeave(d *Dice, ctx *MsgContext, event *events.Group
 
 // callWithJsCheck 保留旧行为：JS 扩展需要切回事件循环，避免并发问题。
 func (i *ExtInfo) callWithJsCheck(d *Dice, f func()) {
-	if i.IsJsExt {
-		if !d.Config.JsEnable {
+	if f == nil {
+		return
+	}
+	if !i.IsJsExt {
+		f()
+		return
+	}
+	if d == nil || !d.Config.JsEnable {
+		if d != nil && d.Logger != nil {
 			d.Logger.Infof("当前已关闭js扩展<%v>", i.Name)
-			return
 		}
-		loop, err := d.ExtLoopManager.GetLoop(i.JSLoopVersion)
-		if err != nil {
-			i.dice.Logger.Errorf("扩展<%s>运行环境已经过期: %v", i.Name, err)
-			return
+		return
+	}
+	if d.ExtLoopManager == nil {
+		if d.Logger != nil {
+			d.Logger.Errorf("扩展<%s>运行环境不可用", i.Name)
 		}
-		err = loop.Run(func(jsengine.Runtime) error {
+		return
+	}
+	loop, err := d.ExtLoopManager.GetLoop(i.JSLoopVersion)
+	if err == nil && loop == nil {
+		err = errors.New("JavaScript runtime is unavailable")
+	}
+	if err != nil {
+		if d.Logger != nil {
+			d.Logger.Errorf("扩展<%s>运行环境已经过期: %v", i.Name, err)
+		}
+		return
+	}
+	err = loop.Run(func(jsengine.Runtime) error {
+		return runEngineCallback(func() error {
 			prev := d.JsCurrentPlugin
 			d.JsCurrentPlugin = i
 			defer func() { d.JsCurrentPlugin = prev }()
 			f()
 			return nil
 		})
-		if err != nil {
-			d.Logger.Errorf("JS脚本异常: %v", err)
-		}
-		return
+	})
+	if err != nil && d.Logger != nil {
+		d.Logger.Errorf("JS脚本异常: %v", err)
 	}
-	f()
 }
 
 // StorageInit 与旧版一致：使用互斥锁确保只初始化一次。

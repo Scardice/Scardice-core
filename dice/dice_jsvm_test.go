@@ -60,7 +60,7 @@ func TestJsInit_WhenExtLoopManagerNil_DoesNotPanic(t *testing.T) {
 			// goroutine 实际跑起来才置位；若此时直接 Terminate，Stop 会因 running=false
 			// 立即返回，随后启动的循环便再也不会退出。先等循环执行一个任务，确保
 			// Terminate 能真正等待其结束。
-			if loop := d.ExtLoopManager.GetWebLoop(); loop != nil {
+			if loop, _ := d.ExtLoopManager.CurrentLoop(); loop != nil {
 				if err := loop.Run(func(jsengine.Runtime) error { return nil }); err != nil {
 					t.Errorf("JS 事件循环未在预期时间内启动: %v", err)
 				}

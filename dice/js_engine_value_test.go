@@ -4,6 +4,8 @@ import (
 	"errors"
 	"testing"
 
+	"go.uber.org/zap"
+
 	"Scardice-core/utils/jsengine"
 	gojaengine "Scardice-core/utils/jsengine/goja"
 	quickjs "Scardice-core/utils/jsengine/quickjs"
@@ -121,6 +123,77 @@ func TestCallOnMessagePreprocess_UsesEngineNeutralCallback(t *testing.T) {
 		reason:  "engine",
 	}) {
 		t.Fatalf("decision = %#v", decision)
+	}
+}
+func TestCallOnMessagePreprocessEngineSupportsNonJSProviderAndRestoresContext(t *testing.T) {
+	loop := gojaengine.New()
+	d := &Dice{
+		Config:          Config{JsConfig: JsConfig{JsEnable: true}},
+		ExtLoopManager: NewJsLoopManager(),
+		Logger:          zap.NewNop().Sugar(),
+	}
+	version := d.ExtLoopManager.SetLoop(loop)
+	previous := &ExtInfo{Name: "previous"}
+	d.JsCurrentPlugin = previous
+	ext := &ExtInfo{
+		Name:          "neutral-provider",
+		JSLoopVersion: version,
+		OnMessagePreprocessEngine: func(runtime jsengine.Runtime, _ *MsgContext, _ *Message) (jsengine.Value, error) {
+			if d.JsCurrentPlugin == nil || d.JsCurrentPlugin.Name != "neutral-provider" {
+				return nil, errors.New("callback context was not installed")
+			}
+			return runtime.RunString("preprocess.js", "({ message: 'rewritten' })")
+		},
+	}
+
+	decision := ext.CallOnMessagePreprocess(d, &MsgContext{}, &Message{Message: "original"})
+	if decision.action != messagePreprocessRewrite || decision.message != "rewritten" {
+		t.Fatalf("decision = %#v", decision)
+	}
+	if d.JsCurrentPlugin != previous {
+		t.Fatalf("JsCurrentPlugin = %p, want previous %p", d.JsCurrentPlugin, previous)
+	}
+}
+
+func TestCallOnMessagePreprocessEngineReportsCallbackErrorAndPanicAsNoop(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		fn   func(jsengine.Runtime, *MsgContext, *Message) (jsengine.Value, error)
+	}{
+		{
+			name: "error",
+			fn: func(jsengine.Runtime, *MsgContext, *Message) (jsengine.Value, error) {
+				return nil, errors.New("callback failed")
+			},
+		},
+		{
+			name: "panic",
+			fn: func(jsengine.Runtime, *MsgContext, *Message) (jsengine.Value, error) {
+				panic("callback panicked")
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			loop, err := quickjs.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = loop.Close() })
+
+			d := &Dice{
+				ExtLoopManager: NewJsLoopManager(),
+				Logger:         zap.NewNop().Sugar(),
+			}
+			version := d.ExtLoopManager.SetLoop(loop)
+			ext := &ExtInfo{
+				Name:                       "callback-failure",
+				JSLoopVersion:              version,
+				OnMessagePreprocessEngine: test.fn,
+			}
+			if decision := ext.CallOnMessagePreprocess(d, &MsgContext{}, &Message{}); decision.action != messagePreprocessNoop {
+				t.Fatalf("decision = %#v, want noop", decision)
+			}
+		})
 	}
 }
 

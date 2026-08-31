@@ -454,7 +454,7 @@ func TestPluginForwardAPIBindingsCanConstructAndSend(t *testing.T) {
 			d.ExtLoopManager.SetLoop(nil)
 		}
 	}()
-	loop := d.ExtLoopManager.GetWebLoop()
+	loop, _ := d.ExtLoopManager.CurrentLoop()
 	if loop == nil {
 		t.Fatal("JS loop unavailable")
 	}
