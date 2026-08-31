@@ -124,7 +124,7 @@ func (s *Session) callReflect(fn reflect.Value, args []Value, label string, code
 	inputs := make([]reflect.Value, 0, len(args)-offset)
 	required := ft.NumIn() - offset
 	if ft.IsVariadic() { if len(args)-offset < required-1 { return UndefinedValue(), fmt.Errorf("%s expects at least %d arguments", label, required-1) } } else if len(args)-offset != required { return UndefinedValue(), fmt.Errorf("%s expects %d arguments", label, required) }
-	for i := offset; i < len(args); i++ { idx := i-offset; target := ft.In(offset+idx); if ft.IsVariadic() && offset+idx >= ft.NumIn()-1 { target = ft.In(ft.NumIn()-1).Elem() }; in, e := s.toGo(args[i], target, codec); if e != nil { return UndefinedValue(), fmt.Errorf("argument %d: %w", idx+1, e) }; inputs = append(inputs, in) }
+	for i := offset; i < len(args); i++ { idx := i-offset; var target reflect.Type; if ft.IsVariadic() && offset+idx >= ft.NumIn()-1 { target = ft.In(ft.NumIn()-1).Elem() } else { target = ft.In(offset+idx) }; in, e := s.toGo(args[i], target, codec); if e != nil { return UndefinedValue(), fmt.Errorf("argument %d: %w", idx+1, e) }; inputs = append(inputs, in) }
 	callInputs := inputs; if offset > 0 { callInputs = append([]reflect.Value{argsToReceiver(args[0], ft.In(0), s)}, inputs...) }
 	outs := fn.Call(callInputs); return s.outputs(outs)
 }
@@ -176,6 +176,7 @@ func (s *Session) toValue(v reflect.Value) (Value, error) {
 	for v.IsValid() && v.Kind() == reflect.Interface { if v.IsNil() { return NullValue(), nil }; v = v.Elem() }
 	if !v.IsValid() { return UndefinedValue(), nil }
 	if (v.Kind() == reflect.Pointer || v.Kind() == reflect.Map || v.Kind() == reflect.Slice) && v.IsNil() { return NullValue(), nil }
+	if v.Kind() == reflect.Func && v.IsNil() { return UndefinedValue(), nil }
 	switch v.Kind() {
 	case reflect.Bool: return BoolValue(v.Bool()), nil
 	case reflect.String: return StringValue(v.String()), nil
@@ -231,6 +232,13 @@ func (s *Session) sliceSet(obj reflect.Value, name string, v Value, codec Runtim
 	item, err := s.toGo(v, obj.Type().Elem(), codec); if err != nil { return err }; obj.Index(i).Set(item); return nil
 }
 
+// DecodeValue converts an engine value through the session-owned codec.
+func (s *Session) DecodeValue(value Value, target reflect.Type, codec RuntimeValueCodec) (reflect.Value, error) {
+	if s == nil {
+		return reflect.Value{}, ErrSessionClosed
+	}
+	return s.toGo(value, target, codec)
+}
 // Callback creates a generation-checked reflect trampoline from an explicit
 // runtime codec. Calls after Teardown return the declared error or panic when
 // the function has no error result, matching normal Go callback conventions.

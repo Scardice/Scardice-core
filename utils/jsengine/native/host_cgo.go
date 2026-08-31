@@ -21,14 +21,19 @@ import (
 )
 
 type nativeHostState struct {
-	loop    *nativeLoop
-	session *hostbridge.Session
-	mu      sync.Mutex
-	lastErr string
+	loop         *nativeLoop
+	session      *hostbridge.Session
+	mu           sync.Mutex
+	lastErr      string
+	callbacks    map[uint64]uint64
+	nextCallback uint64
+	closed       bool
 }
 
 func newNativeHostState(loop *nativeLoop) *nativeHostState {
-	return &nativeHostState{loop: loop, session: hostbridge.NewSession()}
+	return &nativeHostState{
+		loop: loop, session: hostbridge.NewSession(), callbacks: make(map[uint64]uint64),
+	}
 }
 
 func (s *nativeHostState) setError(err error) {
@@ -67,6 +72,76 @@ func hostStateFromContext(ctx C.sc_host_ctx_t) (state *nativeHostState, err erro
 		return nil, errors.New("invalid native host context")
 	}
 	return state, nil
+}
+func (s *nativeHostState) registerCallback(runtimeHandle, valueHandle uint64) (hostbridge.CallbackRef, error) {
+	if s == nil || s.loop == nil || s.loop.closed.Load() {
+		return 0, ErrNativeClosed
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return 0, hostbridge.ErrStaleRuntimeCallback
+	}
+	if s.nextCallback == 0 {
+		s.nextCallback = 1
+	}
+	token := s.nextCallback
+	s.nextCallback++
+	s.mu.Unlock()
+	errorBuffer := make([]byte, 512)
+	status := C.sc_native_value_retain(
+		C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), C.uint64_t(valueHandle),
+		(*C.char)(unsafe.Pointer(&errorBuffer[0])), C.uint64_t(len(errorBuffer)),
+	)
+	if err := s.loop.operation(status, cError(errorBuffer)); err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		C.sc_native_value_release(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), C.uint64_t(valueHandle))
+		return 0, hostbridge.ErrStaleRuntimeCallback
+	}
+	s.callbacks[token] = valueHandle
+	s.mu.Unlock()
+	return hostbridge.CallbackRef(token), nil
+}
+
+func (s *nativeHostState) callbackHandle(token hostbridge.CallbackRef) (uint64, error) {
+	if s == nil || s.loop == nil || s.loop.closed.Load() {
+		return 0, ErrNativeClosed
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, hostbridge.ErrStaleRuntimeCallback
+	}
+	handle, ok := s.callbacks[uint64(token)]
+	if !ok {
+		return 0, hostbridge.ErrStaleRuntimeCallback
+	}
+	return handle, nil
+}
+
+func (s *nativeHostState) closeCallbacks() {
+	if s == nil || s.loop == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	handles := make([]uint64, 0, len(s.callbacks))
+	for _, handle := range s.callbacks {
+		handles = append(handles, handle)
+	}
+	s.callbacks = nil
+	s.mu.Unlock()
+	for _, handle := range handles {
+		C.sc_native_value_release(C.uint64_t(s.loop.provider.library), C.uint64_t(s.loop.runtime), C.uint64_t(handle))
+	}
 }
 
 func withHostState(ctx C.sc_host_ctx_t, fn func(*nativeHostState) C.sc_status_t) (status C.sc_status_t) {
@@ -310,7 +385,94 @@ func (c nativeCodec) Decode(value hostbridge.Value, target reflect.Type) (reflec
 	if target.Kind() != reflect.Func {
 		return reflect.Value{}, fmt.Errorf("native codec callback target must be a function")
 	}
-	return reflect.Value{}, errors.New("native runtime cannot decode a JavaScript callback without a callback value ABI")
+	if value.Kind != hostbridge.KindCallback {
+		return reflect.Value{}, errors.New("expected JavaScript callback value")
+	}
+	token := hostbridge.CallbackRef(value.Callback)
+	if _, err := c.state.callbackHandle(token); err != nil {
+		return reflect.Value{}, err
+	}
+	return reflect.MakeFunc(target, func(inputs []reflect.Value) []reflect.Value {
+		outputs, err := c.callCallback(token, target, inputs)
+		if err != nil {
+			results := make([]reflect.Value, target.NumOut())
+			if len(results) > 0 && target.Out(len(results)-1) == reflect.TypeOf((*error)(nil)).Elem() {
+				results[len(results)-1] = reflect.ValueOf(err)
+				return results
+			}
+			panic(err)
+		}
+		return outputs
+	}), nil
+}
+
+func (c nativeCodec) callCallback(token hostbridge.CallbackRef, target reflect.Type, inputs []reflect.Value) ([]reflect.Value, error) {
+	handle, err := c.state.callbackHandle(token)
+	if err != nil {
+		return nil, err
+	}
+	arguments := make([]uint64, len(inputs))
+	for i, input := range inputs {
+		value, err := c.state.reflectValue(input)
+		if err != nil {
+			return nil, err
+		}
+		arguments[i], err = c.state.encodeValue(c.runtime, value)
+		if err != nil {
+			return nil, err
+		}
+	}
+	defer func() {
+		for _, argument := range arguments {
+			if argument != 0 {
+				C.sc_native_value_release(C.uint64_t(c.state.loop.provider.library), C.uint64_t(c.runtime), C.uint64_t(argument))
+			}
+		}
+	}()
+	var output C.uint64_t
+	errorBuffer := make([]byte, 512)
+	status := C.sc_native_function_call(
+		C.uint64_t(c.state.loop.provider.library), C.uint64_t(c.runtime), C.uint64_t(handle), 0,
+		pointerToUint64(arguments), C.uint64_t(len(arguments)), &output,
+		(*C.char)(unsafe.Pointer(&errorBuffer[0])), C.uint64_t(len(errorBuffer)),
+	)
+	if err := c.state.loop.operation(status, cError(errorBuffer)); err != nil {
+		return nil, err
+	}
+	if output == 0 {
+		return nil, errors.New("native callback returned an empty value")
+	}
+	defer C.sc_native_value_release(C.uint64_t(c.state.loop.provider.library), C.uint64_t(c.runtime), output)
+	value, err := c.state.decodeValue(c.runtime, uint64(output))
+	if err != nil {
+		return nil, err
+	}
+	resultCount := target.NumOut()
+	hasError := resultCount > 0 && target.Out(resultCount-1) == reflect.TypeOf((*error)(nil)).Elem()
+	if hasError {
+		resultCount--
+	}
+	if resultCount > 1 {
+		return nil, errors.New("native callback supports one result plus error")
+	}
+	results := make([]reflect.Value, target.NumOut())
+	if resultCount == 1 {
+		results[0], err = c.state.session.DecodeValue(value, target.Out(0), c)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if hasError {
+		results[len(results)-1] = reflect.Zero(target.Out(len(results)-1))
+	}
+	return results, nil
+}
+
+func pointerToUint64(values []uint64) *C.uint64_t {
+	if len(values) == 0 {
+		return nil
+	}
+	return (*C.uint64_t)(unsafe.Pointer(&values[0]))
 }
 
 func (c nativeCodec) Encode(value reflect.Value) (hostbridge.Value, error) {
@@ -399,6 +561,12 @@ func (s *nativeHostState) decodeValue(runtimeHandle, handle uint64) (hostbridge.
 			return hostbridge.HostFunctionValue(hostbridge.HostFuncRef(ref)), nil
 		}
 		return hostbridge.HostObjectValue(hostbridge.HostRef(ref)), nil
+	case nativeTypeFunction:
+		token, err := s.registerCallback(runtimeHandle, handle)
+		if err != nil {
+			return hostbridge.UndefinedValue(), err
+		}
+		return hostbridge.CallbackValue(token), nil
 	default:
 		return hostbridge.UndefinedValue(), fmt.Errorf("unsupported native value type %d", typ)
 	}

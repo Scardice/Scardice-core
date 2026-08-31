@@ -22,4 +22,7 @@ func loadNative(candidate Candidate) (*Provider, error) {
 }
 func (p *Provider) Descriptor() jsengine.Descriptor { return jsengine.Descriptor{ID: jsengine.NormalizeEngineID(p.candidate.Manifest.ID), Name: p.candidate.Manifest.Name, Version: p.candidate.Manifest.Version, Language: p.candidate.Manifest.Language, Path: p.candidate.LibraryPath} }
 func (p *Provider) Open(context.Context, jsengine.RuntimeOptions) (jsengine.Loop, error) { return nil, wrapNoCgo(p.candidate.LibraryPath) }
+func ExposeDangerous(jsengine.Runtime, interface{}) (jsengine.Value, error) {
+	return nil, wrapNoCgo("native runtime")
+}
 func ResidentLibraryCount() uint64 { return 0 }

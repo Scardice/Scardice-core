@@ -43,6 +43,7 @@ const (
 	nativeTypeObject       = 7
 	nativeTypeHostObject   = 8
 	nativeTypeHostFunction = 9
+	nativeTypeFunction     = 10
 )
 
 type Provider struct {
@@ -334,12 +335,13 @@ func (l *nativeLoop) shutdown() error {
 	}
 	l.persistent = make(map[uint64]uint32)
 	l.persistentMu.Unlock()
+	if l.host != nil {
+		l.host.closeCallbacks()
+		l.host.session.Teardown()
+	}
 	if status := C.sc_native_destroy(C.uint64_t(l.provider.library), C.uint64_t(l.runtime),
 		(*C.char)(unsafe.Pointer(&errorBuffer[0])), C.uint64_t(len(errorBuffer))); status != C.SC_NATIVE_OK && first == nil {
 		first = wrapOperationError(status, l.provider.candidate.LibraryPath, cError(errorBuffer))
-	}
-	if l.host != nil {
-		l.host.session.Teardown()
 	}
 	l.hostHandle.Delete()
 	close(l.done)
@@ -488,6 +490,18 @@ func (r *nativeRuntime) Set(name string, raw interface{}) error {
 }
 
 func (r *nativeRuntime) Bind(name string, raw interface{}) error { return r.Set(name, raw) }
+// ExposeDangerous mirrors the explicit seal.inst escape hatch for native runtimes.
+func ExposeDangerous(engine jsengine.Runtime, target interface{}) (jsengine.Value, error) {
+	r, ok := engine.(*nativeRuntime)
+	if !ok || r == nil || r.loop == nil || r.loop.host == nil {
+		return nil, errors.New("native runtime is required")
+	}
+	ref, err := r.loop.host.session.ExposeDangerous(target)
+	if err != nil {
+		return nil, err
+	}
+	return r.newHostObject(ref, uint32(hostbridge.KindHostObject))
+}
 
 func (r *nativeRuntime) getGlobal(name string) (jsengine.Value, error) {
 	nameBytes := []byte(name)
