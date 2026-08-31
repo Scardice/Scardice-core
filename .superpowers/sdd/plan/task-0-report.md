@@ -63,4 +63,4 @@ ok  Scardice-core/dice/storylog  (cached)
 
 - `Scardice-ui` 仍是用户修改状态，`plan.md` 仍未跟踪；两者均有意保持原状。
 - 三个基线命令输出使用了缓存结果（输出中的 `(cached)`）；这是本地 checkout 的实际结果。
-- 提交 ID：`fd969155`（`docs: record runtime ABI baseline`）。
+- 提交 ID：`abad4774`（`docs: record runtime ABI baseline`）。
