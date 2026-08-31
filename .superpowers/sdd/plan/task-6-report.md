@@ -19,6 +19,18 @@
 - `RuntimeValueCodec` is an explicit Go adapter seam; callback invocation remains owned by the later runtime adapter and must enforce its own runtime-thread/realm rules.
 - Teardown closes a session permanently; callers must create a new session for a new runtime generation.
 
-## Commit
+## Fix TDD evidence
 
-Implementation commits: `fe37e0c9` (`feat: add engine-neutral host bridge`), `f2421730` (`fix: return undefined for missing host properties`).
+- RED command: `go test ./utils/jsengine/hostbridge -count=1`
+- RED result: failed first on the new uint contract (`KindUint`/`Value.Uint` absent), then on the new callable-handle behavior (method/slice property values were zero markers), before the implementation changes.
+- GREEN command: `go test ./utils/jsengine/hostbridge -count=1`
+- GREEN result: `ok Scardice-core/utils/jsengine/hostbridge 0.002s`
+- Fix files: `utils/jsengine/hostbridge/registry.go`, `utils/jsengine/hostbridge/bridge.go`, `utils/jsengine/hostbridge/hostbridge_test.go`.
+
+## Fix concerns
+
+- Method and `slice.push` properties now allocate session-scoped non-zero `HostFuncRef` operation entries carrying owner/operation metadata; adapters must call `CallFunctionWithCodec` rather than infer ownership from a zero marker.
+- `Value` now distinguishes signed `int64`, unsigned `uint64`, and `float64`; adapters must preserve these explicit cases when encoding runtime values.
+
+## Commit
+Implementation commits: `fe37e0c9` (`feat: add engine-neutral host bridge`), `f2421730` (`fix: return undefined for missing host properties`), `d47d5e6c` (`fix: expose callable host operation handles`).
