@@ -49,6 +49,7 @@ The final focused run passed:
 - Baseline: `ab09ee852380990c9f576c978453f9fafa309c13`
 - Fixture implementation: `52bec245` (`test(runtimeabi): add echo fake runtime fixture`)
 - Report: `268b4a62` (`docs(sdd): record fake runtime fixture verification`)
+- Property lifetime fix: `09266e90` (`fix(runtimeabi): retain replacement property before release`)
 - Harness assertion cleanup: `24040f38` (`test(runtimeabi): tighten object has assertion`)
 
 ## Concerns
