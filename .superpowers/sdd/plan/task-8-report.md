@@ -151,7 +151,7 @@ No formatter, linter, or project-wide suite was run.
 
 ## Commit
 
-Task-scoped implementation commits: `71208be6` (`Define explicit JavaScript export contract`) and `a15c49c3` (`Guard missing solve result fields`). Report metadata commits are `389673ef` and this update. They exclude `Scardice-ui` and root `plan.md`.
+Task-scoped implementation commits: `71208be6` (`Define explicit JavaScript export contract`), `a15c49c3` (`Guard missing solve result fields`), and `25ea1929` (`Propagate native string export errors`). Report metadata commits are `389673ef`, `7cb69780`, and this update. They exclude `Scardice-ui` and root `plan.md`.
 
 ## Concerns
 
