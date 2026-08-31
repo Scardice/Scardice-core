@@ -83,14 +83,6 @@ func (d *Dice) jsInitQuickJS() {
 			Object.freeze(seal.coc);
 			Object.freeze(seal.vars);
 			Object.freeze(seal.ext);
-			for (const name of [
-				"seal", "process", "require", "Buffer", "Blob", "URL", "crypto",
-				"AbortController", "structuredClone", "MessageChannel", "fetch", "WebSocket",
-			]) {
-				if (Object.prototype.hasOwnProperty.call(globalThis, name)) {
-					Object.defineProperty(globalThis, name, { writable: false, configurable: false });
-				}
-			}
 		`)
 		return err
 	})

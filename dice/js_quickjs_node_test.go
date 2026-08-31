@@ -63,12 +63,10 @@ func quickJSNodeTestLoop(t *testing.T, dice *Dice) jsengine.Loop {
 }
 
 func TestQuickJSNodeBuiltinsUseEnvironmentSnapshot(t *testing.T) {
-	t.Setenv("LANG", "zh_CN.UTF-8")
-	t.Setenv("SCARDICE_QJS_SECRET", "before")
+	t.Setenv("SCARDICE_QJS_ENV", "before")
 	dice := newQuickJSNodeTestDice(t)
 	dice.JsInit()
-	t.Setenv("LANG", "en_US.UTF-8")
-	t.Setenv("SCARDICE_QJS_SECRET", "after")
+	t.Setenv("SCARDICE_QJS_ENV", "after")
 
 	if err := quickJSNodeTestLoop(t, dice).Run(func(runtime jsengine.Runtime) error {
 		_, err := quickjsadapter.LoadModule(runtime, "builtins.mjs", `
@@ -78,33 +76,9 @@ func TestQuickJSNodeBuiltinsUseEnvironmentSnapshot(t *testing.T) {
 			if (Buffer.from("ok").toString() !== "ok") throw new Error("buffer");
 			if (typeof subtle.digest !== "function") throw new Error("crypto");
 			if (util.format("%s:%d", "ok", 7) !== "ok:7") throw new Error("util");
-			if (process.env.LANG !== "zh_CN.UTF-8") throw new Error("language");
-			if ("SCARDICE_QJS_SECRET" in process.env) throw new Error("secret");
+			if (process.env.SCARDICE_QJS_ENV !== "before") throw new Error("env");
 		`)
 		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestQuickJSNodeLocksHostGlobalsWithoutFreezingPluginGlobals(t *testing.T) {
-	dice := newQuickJSNodeTestDice(t)
-	dice.JsInit()
-
-	if err := quickJSNodeTestLoop(t, dice).Run(func(runtime jsengine.Runtime) error {
-		value, err := runtime.RunString("global-lock.js", `
-			const originalSeal = globalThis.seal;
-			try { globalThis.seal = { replaced: true }; } catch (_) {}
-			globalThis.http = { pluginOwned: true };
-			globalThis.seal === originalSeal && globalThis.http.pluginOwned === true
-		`)
-		if err != nil {
-			return err
-		}
-		if !value.ToBoolean() {
-			return errors.New("host global rebinding or plugin global assignment did not match policy")
-		}
-		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}

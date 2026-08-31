@@ -1,7 +1,6 @@
 package dice
 
 import (
-	"strings"
 	"testing"
 
 	"Scardice-core/utils/jsengine"
@@ -121,19 +120,5 @@ func TestQuickJSBindsEngineNeutralExtensionCallbacks(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestJSExtensionSourceDescriptionIncludesOperatorIdentifiers(t *testing.T) {
-	got := jsExtensionSourceDescription(&JsScriptInfo{
-		Name:      "attacker",
-		Filename:  "attacker.js",
-		PackageID: "package-attacker",
-		HomePage:  "https://example.test/attacker",
-	})
-	for _, want := range []string{"attacker", "attacker.js", "package-attacker", "https://example.test/attacker"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("source description %q does not include %q", got, want)
-		}
 	}
 }

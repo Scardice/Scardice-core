@@ -11,13 +11,6 @@ import (
 	"Scardice-core/utils/jsengine"
 )
 
-func jsExtensionSourceDescription(source *JsScriptInfo) string {
-	if source == nil {
-		return "<unknown>"
-	}
-	return fmt.Sprintf("name=%q filename=%q packageID=%q homepage=%q", source.Name, source.Filename, source.PackageID, source.HomePage)
-}
-
 // installJSHostAPI exposes the engine-neutral base of the seal host object.
 // installJSExtHostAPI adds extension registration and callbacks once the
 // runtime generation is known.
@@ -297,10 +290,6 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, seal jsengine.Objec
 		// 2. 注册真实 ExtInfo 到 JsExtRegistry
 		if d.JsExtRegistry == nil {
 			d.JsExtRegistry = new(SyncMap[string, *ExtInfo])
-		}
-		if incumbent, ok := d.JsExtRegistry.Load(extName); ok && incumbent != nil && incumbent != realExt && d.Logger != nil {
-			d.Logger.Warnf("JS 扩展 %q 正在替换同名扩展；请确认来源：现有[%s]，替换[%s]",
-				extName, jsExtensionSourceDescription(incumbent.Source), jsExtensionSourceDescription(realExt.Source))
 		}
 		d.JsExtRegistry.Store(extName, realExt)
 
