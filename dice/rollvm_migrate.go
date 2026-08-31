@@ -776,13 +776,14 @@ func (ctx *MsgContext) registerForwardFunctions() {
 }
 
 func (ctx *MsgContext) CreateVmIfNotExists() {
+	diceRollSource := ctx.getDiceRollSource()
 	if ctx.vm != nil {
+		ctx.vm.RandSrc = diceRollSource
 		return
 	}
 	// 初始化骰子
 	ctx.vm = ds.NewVM()
-	ctx.vm.RandSrc = ctx.getDiceSource()
-
+	ctx.vm.RandSrc = diceRollSource
 	ctx.vm.Config = *ctx.GenDefaultRollVmConfig()
 	ctx.registerForwardFunctions()
 

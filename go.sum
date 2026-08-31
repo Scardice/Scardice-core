@@ -20,6 +20,8 @@ github.com/RoaringBitmap/roaring/v2 v2.14.5 h1:ckd0o545JqDPeVJDgeFoaM21eBixUnlWf
 github.com/RoaringBitmap/roaring/v2 v2.14.5/go.mod h1:eq4wdNXxtJIS/oikeCzdX1rBzek7ANzbth041hrU8Q4=
 github.com/Scardice/dicescript v0.0.0-20260823043109-d47a01e66db9 h1:UusfR5+8gLMy8OSwBTL/X2uf5SL7asrnpHGrDc8sdK4=
 github.com/Scardice/dicescript v0.0.0-20260823043109-d47a01e66db9/go.mod h1:cjBy9hhhUWy8A3LT8OOu9TkkLebx31hrkxv0KCbOve0=
+github.com/Scardice/dicescript v0.0.0-20260831163208-8490f8ecba3a h1:YZOHdZg21ahvmK4BieL5C53cs1/nLhm4hH5qH7+9sUo=
+github.com/Scardice/dicescript v0.0.0-20260831163208-8490f8ecba3a/go.mod h1:cjBy9hhhUWy8A3LT8OOu9TkkLebx31hrkxv0KCbOve0=
 github.com/Scardice/quickjs_nodejs v0.0.0-20260829175530-533cae14e98d h1:daEvGQIcLW9VIIVRu01lvQE/RS5ehpIT7GRl9gU2aT0=
 github.com/Scardice/quickjs_nodejs v0.0.0-20260829175530-533cae14e98d/go.mod h1:OAJ2JxhxGtgsrFjZiU+6Cs1CVFk/AyKtEiGEMLq4C7Y=
 github.com/Scardice/quickjs_nodejs v0.0.0-20260830120151-2b84191ba5e0 h1:qanqoAz0M5C1NQ961WX/+FQq8QP90MSOOolUci7Aasc=

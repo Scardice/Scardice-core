@@ -326,6 +326,40 @@ func TestExecuteNew_GroupCommand_Roll(t *testing.T) {
 	}
 }
 
+func TestExecuteNew_GroupCommand_RollShapeStatus(t *testing.T) {
+	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+
+	d.ImSession.ExecuteNew(ep, newGroupMsg("QQ-Group:112", "QQ:999", ".rollshape"))
+
+	reply, ok := adapter.waitForMsg(2 * time.Second)
+	if !ok {
+		t.Fatal("timeout: expected a reply to '.rollshape'")
+	}
+	if !strings.Contains(reply, "Raw / Uniform") {
+		t.Fatalf("rollshape reply = %q, want default Raw / Uniform", reply)
+	}
+}
+
+func TestExecuteNew_PrivateCommand_RollShapeSet(t *testing.T) {
+	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+
+	d.ImSession.ExecuteNew(ep, newPrivateMsg("QQ:999", ".rollshape set soft"))
+
+	reply, ok := adapter.waitForMsg(2 * time.Second)
+	if !ok {
+		t.Fatal("timeout: expected a reply to '.rollshape set soft'")
+	}
+	if !strings.Contains(reply, "Soft / Beta(1.35,1.35)") {
+		t.Fatalf("rollshape reply = %q, want Soft mode", reply)
+	}
+	group, ok := d.ImSession.ServiceAtNew.Load("PG-QQ:999")
+	if !ok || group.RollShaperMode != string(DiceRollShaperModeSoft) {
+		t.Fatalf("private rollshape mode = %#v, want soft", group)
+	}
+}
+
 // TestExecuteNew_GroupCommand_Roll_NoArgs verifies a bare .r command still
 // produces a reply (uses the group's default dice expression).
 func TestExecuteNew_GroupCommand_Roll_NoArgs(t *testing.T) {

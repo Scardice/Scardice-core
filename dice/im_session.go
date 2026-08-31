@@ -113,6 +113,7 @@ type GroupInfo struct {
 	DiceSideNum     int64                  `json:"diceSideNum"     yaml:"diceSideNum"`  // 以后可能会支持 1d4 这种默认面数，暂不开放给js
 	DiceSideExpr    string                 `json:"diceSideExpr"    yaml:"diceSideExpr"` //
 	System          string                 `json:"system"          yaml:"system"`       // 规则系统，概念同bcdice的gamesystem，距离如dnd5e coc7
+	RollShaperMode  string                 `json:"rollShaperMode" yaml:"rollShaperMode"`
 
 	HelpPackages []string      `json:"helpPackages"   yaml:"-"`
 	CocRuleIndex int           `jsbind:"cocRuleIndex" json:"cocRuleIndex" yaml:"cocRuleIndex"`
@@ -142,7 +143,9 @@ type GroupInfo struct {
 	TmpPlayerNum int64    `json:"tmpPlayerNum" yaml:"-"`
 	TmpExtList   []string `json:"tmpExtList"   yaml:"-"`
 
-	UpdatedAtTime int64 `json:"-" yaml:"-"`
+	UpdatedAtTime int64           `json:"-" yaml:"-"`
+	rollShaperMu  sync.Mutex      `json:"-" yaml:"-"`
+	rollShaper    *diceRollShaper `json:"-" yaml:"-"`
 
 	DefaultHelpGroup string `json:"defaultHelpGroup" yaml:"defaultHelpGroup"` // 当前群默认的帮助条目
 
@@ -325,6 +328,8 @@ type extNameRefsJSON struct {
 // MarshalJSON 自定义序列化，处理私有字段 activatedExtList。
 // 已删除 wrapper 的名字同样保留：群开启状态不因插件删除而丢失。
 func (g *GroupInfo) MarshalJSON() ([]byte, error) {
+	g.rollShaperMu.Lock()
+	defer g.rollShaperMu.Unlock()
 	g.extInitMu.Lock()
 	// 过滤掉已删除的 wrapper
 	var filteredList []*ExtInfo
@@ -343,6 +348,8 @@ func (g *GroupInfo) MarshalJSON() ([]byte, error) {
 
 // UnmarshalJSON 自定义反序列化，处理私有字段 activatedExtList
 func (g *GroupInfo) UnmarshalJSON(data []byte) error {
+	g.rollShaperMu.Lock()
+	defer g.rollShaperMu.Unlock()
 	if err := sonic.Unmarshal(data, &groupInfoDecodeJSON{groupInfoAlias: (*groupInfoAlias)(g)}); err != nil {
 		return err
 	}
@@ -365,6 +372,7 @@ func (g *GroupInfo) UnmarshalJSON(data []byte) error {
 		list = append(list, extNamePlaceholder(ref.Name))
 	}
 
+	g.rollShaper = nil
 	g.extInitMu.Lock()
 	g.activatedExtList = list
 	g.extInitMu.Unlock()
@@ -923,15 +931,18 @@ type MsgContext struct {
 	SpamCheckedGroup  bool
 	SpamCheckedPerson bool
 
-	splitKeyMu   sync.RWMutex
-	splitKey     string
-	forwardStart string
-	forwardEnd   string
-	vm           *ds.Context
-	_v1Rand      ds.DiceSource
-	diceRandSrc  ds.DiceSource
-	chooserRand  *randv2.Rand
-	chooserSrc   ds.DiceSource
+	splitKeyMu     sync.RWMutex
+	splitKey       string
+	forwardStart   string
+	forwardEnd     string
+	vm             *ds.Context
+	_v1Rand        ds.DiceSource
+	diceRandSrc    ds.DiceSource
+	diceRollSource ds.DiceSource
+	diceRollRaw    ds.DiceSource
+	diceRollGroup  *GroupInfo
+	chooserRand    *randv2.Rand
+	chooserSrc     ds.DiceSource
 }
 
 func (ctx *MsgContext) SetCommandReplied(replied bool) {
@@ -3904,6 +3915,9 @@ func (ctx *MsgContext) ShallowCopy() *MsgContext {
 		SpamCheckedPerson:   ctx.SpamCheckedPerson,
 		vm:                  ctx.vm,
 		diceRandSrc:         ctx.diceRandSrc,
+		diceRollSource:      ctx.diceRollSource,
+		diceRollRaw:         ctx.diceRollRaw,
+		diceRollGroup:       ctx.diceRollGroup,
 		chooserRand:         ctx.chooserRand,
 		chooserSrc:          ctx.chooserSrc,
 		_v1Rand:             ctx._v1Rand,
