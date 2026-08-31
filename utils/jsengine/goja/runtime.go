@@ -3,14 +3,25 @@ package goja
 
 import (
 	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
 
 	"github.com/dop251/goja"
+	"github.com/dop251/goja_nodejs/eventloop"
 
 	"Scardice-core/utils/jsengine"
 )
 
 type runtime struct {
 	vm *goja.Runtime
+}
+
+type eventLoop struct {
+	loop    *eventloop.EventLoop
+	closed  atomic.Bool
+	running atomic.Bool
+	once    sync.Once
 }
 
 type value struct {
@@ -32,6 +43,103 @@ func New() jsengine.Loop {
 // The caller retains ownership of the runtime and its event loop.
 func Wrap(vm *goja.Runtime) jsengine.Runtime {
 	return &runtime{vm: vm}
+}
+
+// WrapEventLoop adapts the legacy Goja event loop to jsengine.Loop.
+// The event loop remains owned by the caller until Close is invoked.
+func WrapEventLoop(loop *eventloop.EventLoop) jsengine.Loop {
+	return &eventLoop{loop: loop}
+}
+
+// StartInForeground runs a wrapped event loop until it is closed.
+func StartInForeground(loop jsengine.Loop) error {
+	adapter, ok := loop.(*eventLoop)
+	if !ok || adapter.loop == nil {
+		return errors.New("goja event loop is required")
+	}
+	if adapter.closed.Load() {
+		return errors.New("goja event loop is closed")
+	}
+	if !adapter.running.CompareAndSwap(false, true) {
+		return errors.New("goja event loop is already running")
+	}
+	defer adapter.running.Store(false)
+	var runErr error
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				runErr = fmt.Errorf("goja event loop panic: %v", recovered)
+			}
+		}()
+		adapter.loop.StartInForeground()
+	}()
+	return runErr
+}
+
+func (l *eventLoop) Engine() jsengine.EngineID { return jsengine.EngineGoja }
+
+func (l *eventLoop) Descriptor() jsengine.Descriptor {
+	return (&runtime{}).Descriptor()
+}
+
+func (l *eventLoop) Run(run func(jsengine.Runtime) error) (err error) {
+	if run == nil {
+		return errors.New("goja runtime callback is nil")
+	}
+	if l == nil || l.loop == nil || l.closed.Load() {
+		return errors.New("goja event loop is closed")
+	}
+	if l.running.Load() {
+		done := make(chan error, 1)
+		if !l.loop.RunOnLoop(func(vm *goja.Runtime) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					done <- fmt.Errorf("goja runtime callback panic: %v", recovered)
+				}
+			}()
+			done <- run(&runtime{vm: vm})
+		}) {
+			return errors.New("goja event loop is closed")
+		}
+		return <-done
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("goja runtime callback panic: %v", recovered)
+		}
+	}()
+	l.loop.Run(func(vm *goja.Runtime) {
+		err = run(&runtime{vm: vm})
+	})
+	return err
+}
+
+func (l *eventLoop) LoadEntry(entry jsengine.Entry) error {
+	return l.Run(func(runtime jsengine.Runtime) error {
+		switch entry.Kind {
+		case jsengine.EntryScript, jsengine.EntryExtension:
+			_, err := runtime.RunString(entry.Filename, entry.Source)
+			return err
+		case jsengine.EntryCommonJS:
+			_, err := runtime.LoadCommonJS(entry.Filename, entry.Source)
+			return err
+		case jsengine.EntryESModule:
+			return errors.New("goja: ESM entries are unsupported")
+		default:
+			return errors.New("goja: unknown entry kind")
+		}
+	})
+}
+
+func (l *eventLoop) Close() error {
+	if l == nil || l.loop == nil {
+		return nil
+	}
+	l.once.Do(func() {
+		l.closed.Store(true)
+		l.loop.Terminate()
+	})
+	return nil
 }
 
 func (r *runtime) Engine() jsengine.EngineID {
@@ -149,6 +257,21 @@ func (r *runtime) Close() error { return nil }
 
 func (v value) Export() interface{} {
 	return v.value.Export()
+}
+
+func (v value) ExportPrimitive() (any, error) {
+	if v.value == nil || goja.IsUndefined(v.value) || goja.IsNull(v.value) {
+		return nil, nil
+	}
+	if _, ok := v.value.(*goja.Object); ok {
+		return nil, fmt.Errorf("%w: object", jsengine.ErrPrimitiveExportUnsupported)
+	}
+	switch exported := v.value.Export().(type) {
+	case bool, string, int64, uint64, float64:
+		return exported, nil
+	default:
+		return nil, fmt.Errorf("%w: %T", jsengine.ErrPrimitiveExportUnsupported, exported)
+	}
 }
 
 func (v value) ToBoolean() bool {

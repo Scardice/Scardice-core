@@ -8,13 +8,19 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/dop251/goja"
 	"github.com/labstack/echo/v4"
 
 	"Scardice-core/dice"
 	"Scardice-core/utils"
 	"Scardice-core/utils/jsengine"
 )
+
+func exportJSAPIValue(value jsengine.Value) (interface{}, error) {
+	if value == nil {
+		return nil, nil
+	}
+	return value.ExportPrimitive()
+}
 
 func jsExec(c echo.Context) error {
 	if !doAuth(c) {
@@ -60,7 +66,7 @@ func jsExec(c echo.Context) error {
 	var retFinal interface{}
 	switch engine {
 	case jsengine.EngineQuickJS:
-		loop := myDice.ExtLoopManager.GetActiveEngineLoop()
+		loop := myDice.ExtLoopManager.GetWebLoop()
 		if loop == nil {
 			err = errors.New("QuickJS运行时不可用")
 			break
@@ -83,28 +89,14 @@ func jsExec(c echo.Context) error {
 			err = errors.New("Goja运行时不可用")
 			break
 		}
-		waitRun := make(chan int, 1)
-		var ret goja.Value
-		if !loop.RunOnLoop(func(vm *goja.Runtime) {
-			defer func() {
-				// 防止崩掉进程
-				if r := recover(); r != nil {
-					// fmt.Println("xx", r.(goja.Exception))
-					myDice.JsPrinter.Error(fmt.Sprintf("JS脚本报错: %v", r))
-				}
-				waitRun <- 1
-			}()
-			ret, err = vm.RunString(source)
-		}) {
-			err = errors.New("Goja运行时已停止")
-			break
-		}
-		<-waitRun
-		if ret != nil {
-			retFinal = ret.Export()
-		}
-	default:
-		err = fmt.Errorf("不支持的JS引擎: %s", engine)
+		err = loop.Run(func(runtime jsengine.Runtime) error {
+			ret, runErr := runtime.RunString("api-js-exec.js", source)
+			if runErr != nil {
+				return runErr
+			}
+			retFinal, runErr = exportJSAPIValue(ret)
+			return runErr
+		})
 	}
 	outputs := myDice.JsPrinter.RecordEnd()
 

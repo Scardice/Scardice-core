@@ -1,5 +1,6 @@
 #include "bridge.h"
 #include <stddef.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +18,7 @@ typedef struct sc_native_state {
     sc_host_ctx_t host_ctx;
 } sc_native_state;
 
-static uint64_t resident_count = 0;
+static _Atomic uint64_t resident_count = 0;
 
 static void set_error(char *error, uint64_t capacity, const char *message) {
     if (error == NULL || capacity == 0) return;
@@ -54,7 +55,7 @@ int sc_native_open(const char *path, uint64_t *out_library, char *error, uint64_
         return SC_NATIVE_MISSING_LIBRARY;
     }
     *out_library = (uint64_t)(uintptr_t)state;
-    resident_count++;
+    atomic_fetch_add_explicit(&resident_count, 1, memory_order_relaxed);
     return SC_NATIVE_OK;
 }
 
@@ -91,7 +92,7 @@ int sc_native_query(uint64_t library, uint32_t runtime_major, uint32_t runtime_m
         set_error(error, capacity, "runtime query returned a null plugin");
         return SC_NATIVE_CORRUPT_VTABLE;
     }
-    if (plugin->struct_size < offsetof(sc_runtime_plugin_v1, descriptor) + sizeof(plugin->descriptor)) {
+    if (plugin->struct_size < sizeof(sc_runtime_plugin_v1)) {
         set_error(error, capacity, "runtime plugin struct_size is too small");
         return SC_NATIVE_TOO_SMALL;
     }
@@ -250,7 +251,7 @@ int sc_native_destroy(uint64_t library, uint64_t runtime, char *error, uint64_t 
 
 uint64_t sc_native_resident_count(void) {
     /* There is deliberately no close entry point in v1. */
-    return resident_count;
+    return atomic_load_explicit(&resident_count, memory_order_relaxed);
 }
 static sc_native_state *checked_state(uint64_t library, char *error, uint64_t capacity) {
     sc_native_state *state = state_from_id(library);

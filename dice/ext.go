@@ -18,6 +18,7 @@ import (
 
 	"Scardice-core/dice/events"
 	"Scardice-core/utils/jsengine"
+	gojaengine "Scardice-core/utils/jsengine/goja"
 )
 
 const (
@@ -328,40 +329,54 @@ func parseMessagePreprocessValue(vm *goja.Runtime, value goja.Value) messagePrep
 }
 
 func parseMessagePreprocessEngineValue(value jsengine.Value) messagePreprocessDecision {
-	if value == nil || value.Export() == nil {
+	if value == nil {
 		return messagePreprocessDecision{action: messagePreprocessNoop}
 	}
 
 	object := value.Object()
 	if object == nil {
-		if text, ok := value.Export().(string); ok {
-			if text == "" {
-				return messagePreprocessDecision{action: messagePreprocessIntercept}
-			}
-			return messagePreprocessDecision{action: messagePreprocessRewrite, message: text}
+		primitive, err := value.ExportPrimitive()
+		if err != nil || primitive == nil {
+			return messagePreprocessDecision{action: messagePreprocessNoop}
 		}
-		return messagePreprocessDecision{action: messagePreprocessNoop}
+		text, ok := primitive.(string)
+		if !ok {
+			return messagePreprocessDecision{action: messagePreprocessNoop}
+		}
+		if text == "" {
+			return messagePreprocessDecision{action: messagePreprocessIntercept}
+		}
+		return messagePreprocessDecision{action: messagePreprocessRewrite, message: text}
 	}
 	if !object.Has("message") {
 		return messagePreprocessDecision{action: messagePreprocessNoop}
 	}
 
 	reason := ""
-	if reasonValue := object.Get("reason"); reasonValue != nil && reasonValue.Export() != nil {
-		if text, ok := reasonValue.Export().(string); ok {
-			reason = text
+	if reasonValue := object.Get("reason"); reasonValue != nil {
+		if primitive, err := reasonValue.ExportPrimitive(); err == nil {
+			if text, ok := primitive.(string); ok {
+				reason = text
+			}
 		}
 	}
 
 	messageValue := object.Get("message")
-	if messageValue == nil || messageValue.Export() == nil {
+	if messageValue == nil {
 		return messagePreprocessDecision{action: messagePreprocessIntercept, reason: reason}
 	}
-	if text, ok := messageValue.Export().(string); ok {
-		if text == "" {
+	primitive, err := messageValue.ExportPrimitive()
+	if err == nil {
+		if text, ok := primitive.(string); ok {
+			if text == "" {
+				return messagePreprocessDecision{action: messagePreprocessIntercept, reason: reason}
+			}
+			return messagePreprocessDecision{action: messagePreprocessRewrite, message: text, reason: reason}
+		}
+		if primitive == nil || !messageValue.ToBoolean() {
 			return messagePreprocessDecision{action: messagePreprocessIntercept, reason: reason}
 		}
-		return messagePreprocessDecision{action: messagePreprocessRewrite, message: text, reason: reason}
+		return messagePreprocessDecision{action: messagePreprocessNoop, reason: reason}
 	}
 	if !messageValue.ToBoolean() {
 		return messagePreprocessDecision{action: messagePreprocessIntercept, reason: reason}
@@ -392,7 +407,7 @@ func (i *ExtInfo) CallOnMessagePreprocess(d *Dice, ctx *MsgContext, msg *Message
 		if !ext.IsJsExt || d.ExtLoopManager == nil {
 			return messagePreprocessDecision{action: messagePreprocessNoop}
 		}
-		loop, err := d.ExtLoopManager.GetEngineLoop(ext.JSLoopVersion)
+		loop, err := d.ExtLoopManager.GetLoop(ext.JSLoopVersion)
 		if err != nil {
 			d.Logger.Errorf("扩展<%s>运行环境已经过期: %v", ext.Name, err)
 			return messagePreprocessDecision{action: messagePreprocessNoop}
@@ -425,20 +440,20 @@ func (i *ExtInfo) CallOnMessagePreprocess(d *Dice, ctx *MsgContext, msg *Message
 			d.Logger.Errorf("扩展<%s>运行环境已经过期: %v", ext.Name, err)
 			return messagePreprocessDecision{action: messagePreprocessNoop}
 		}
-		waitRun := make(chan int, 1)
-		loop.RunOnLoop(func(vm *goja.Runtime) {
+		err = loop.Run(func(runtime jsengine.Runtime) error {
+			vm, ok := gojaengine.Raw(runtime)
+			if !ok {
+				return errors.New("legacy Goja message preprocess callback requires a Goja runtime")
+			}
 			prev := d.JsCurrentPlugin
 			d.JsCurrentPlugin = ext
-			defer func() {
-				d.JsCurrentPlugin = prev
-				if r := recover(); r != nil {
-					d.Logger.Error("JS脚本异常:", r)
-				}
-				waitRun <- 1
-			}()
+			defer func() { d.JsCurrentPlugin = prev }()
 			run(vm)
+			return nil
 		})
-		<-waitRun
+		if err != nil {
+			d.Logger.Errorf("扩展<%s>预处理异常: %v", ext.Name, err)
+		}
 		return decision
 	}
 
@@ -482,33 +497,28 @@ func (i *ExtInfo) CallOnGroupLeave(d *Dice, ctx *MsgContext, event *events.Group
 // callWithJsCheck 保留旧行为：JS 扩展需要切回事件循环，避免并发问题。
 func (i *ExtInfo) callWithJsCheck(d *Dice, f func()) {
 	if i.IsJsExt {
-		if d.Config.JsEnable {
-			loop, err := d.ExtLoopManager.GetLoop(i.JSLoopVersion)
-			if err != nil {
-				i.dice.Logger.Errorf("扩展<%s>运行环境已经过期: %v", i.Name, err)
-				return
-			}
-			waitRun := make(chan int, 1)
-			loop.RunOnLoop(func(vm *goja.Runtime) {
-				prev := d.JsCurrentPlugin
-				d.JsCurrentPlugin = i
-				defer func() {
-					d.JsCurrentPlugin = prev
-					if r := recover(); r != nil {
-						d.Logger.Error("JS脚本异常:", r)
-					}
-					waitRun <- 1
-				}()
-
-				f()
-			})
-			<-waitRun
-		} else {
+		if !d.Config.JsEnable {
 			d.Logger.Infof("当前已关闭js扩展<%v>", i.Name)
+			return
 		}
-	} else {
-		f()
+		loop, err := d.ExtLoopManager.GetLoop(i.JSLoopVersion)
+		if err != nil {
+			i.dice.Logger.Errorf("扩展<%s>运行环境已经过期: %v", i.Name, err)
+			return
+		}
+		err = loop.Run(func(jsengine.Runtime) error {
+			prev := d.JsCurrentPlugin
+			d.JsCurrentPlugin = i
+			defer func() { d.JsCurrentPlugin = prev }()
+			f()
+			return nil
+		})
+		if err != nil {
+			d.Logger.Errorf("JS脚本异常: %v", err)
+		}
+		return
 	}
+	f()
 }
 
 // StorageInit 与旧版一致：使用互斥锁确保只初始化一次。

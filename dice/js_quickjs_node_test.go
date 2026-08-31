@@ -31,7 +31,7 @@ func newQuickJSNodeTestDice(t *testing.T) *Dice {
 	dice.Config.JsEngine = string(jsengine.EngineQuickJS)
 	t.Cleanup(func() {
 		if dice.ExtLoopManager != nil {
-			dice.ExtLoopManager.SetEngineLoop(nil)
+			dice.ExtLoopManager.SetLoop(nil)
 		}
 	})
 	return dice
@@ -56,7 +56,7 @@ func TestQuickJSNodeEnforcesConfiguredMemoryLimit(t *testing.T) {
 
 func quickJSNodeTestLoop(t *testing.T, dice *Dice) jsengine.Loop {
 	t.Helper()
-	loop, err := dice.ExtLoopManager.GetEngineLoop(dice.ExtLoopManager.version)
+	loop, err := dice.ExtLoopManager.GetLoop(dice.ExtLoopManager.version)
 	if err != nil || loop == nil {
 		t.Fatalf("active QuickJS loop = %v, %v", loop, err)
 	}
@@ -187,7 +187,7 @@ func TestQuickJSReinitializationClosesPreviousRealm(t *testing.T) {
 	dice.JsInit()
 	oldLoop := quickJSNodeTestLoop(t, dice)
 
-	dice.ExtLoopManager.SetEngineLoop(nil)
+	dice.ExtLoopManager.SetLoop(nil)
 	if err := oldLoop.Run(func(jsengine.Runtime) error { return nil }); err == nil {
 		t.Fatal("closed QuickJS loop accepted a new task")
 	}

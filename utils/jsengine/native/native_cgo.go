@@ -381,7 +381,7 @@ type nativeScope struct {
 func newNativeScope(loop *nativeLoop) *nativeScope { return &nativeScope{loop: loop} }
 
 func (s *nativeScope) value(handle uint64) *nativeValue {
-	if handle == 0 {
+	if s == nil || s.released.Load() || handle == 0 {
 		return nil
 	}
 	v := &nativeValue{loop: s.loop, runtime: s.loop.runtime, handle: handle, scope: s}
@@ -700,6 +700,9 @@ func (r *nativeRuntime) newHostFunction(ref hostbridge.HostFuncRef) (*nativeValu
 	})
 }
 func (r *nativeRuntime) makeValue(call func(*C.uint64_t, *C.char, C.uint64_t) C.int) (*nativeValue, error) {
+	if r == nil || r.loop == nil || r.scope == nil || r.scope.released.Load() {
+		return nil, ErrNativeClosed
+	}
 	var output C.uint64_t
 	errorBuffer := make([]byte, 512)
 	status := call(&output, (*C.char)(unsafe.Pointer(&errorBuffer[0])), C.uint64_t(len(errorBuffer)))
@@ -722,8 +725,12 @@ func (v *nativeValue) released() bool {
 	return v == nil || v.gone.Load() || v.scope == nil || (v.scope.released.Load() && !v.persistent.Load())
 }
 
+func (v *nativeValue) usable() bool {
+	return v != nil && v.loop != nil && !v.released() && !v.loop.closed.Load()
+}
+
 func (v *nativeValue) Export() interface{} {
-	if v == nil || v.released() || v.loop.closed.Load() {
+	if !v.usable() {
 		return nil
 	}
 	typ, err := v.typeOf()
@@ -768,8 +775,56 @@ func (v *nativeValue) Export() interface{} {
 	}
 }
 
+func (v *nativeValue) ExportPrimitive() (any, error) {
+	if !v.usable() {
+		return nil, ErrNativeStaleValue
+	}
+	typ, err := v.typeOf()
+	if err != nil {
+		return nil, err
+	}
+	switch typ {
+	case nativeTypeUndefined, nativeTypeNull:
+		return nil, nil
+	case nativeTypeBool:
+		var output C.uint32_t
+		if err := v.valueCallBool(&output); err != nil {
+			return nil, err
+		}
+		return output != 0, nil
+	case nativeTypeI64:
+		var output C.int64_t
+		if err := v.valueCallI64(&output); err != nil {
+			return nil, err
+		}
+		return int64(output), nil
+	case nativeTypeU64:
+		var output C.uint64_t
+		if err := v.valueCallU64(&output); err != nil {
+			return nil, err
+		}
+		return uint64(output), nil
+	case nativeTypeF64:
+		var output C.double
+		if err := v.valueCallF64(&output); err != nil {
+			return nil, err
+		}
+		return float64(output), nil
+	case nativeTypeString:
+		return v.stringValue(), nil
+	case nativeTypeObject:
+		return nil, fmt.Errorf("%w: object", jsengine.ErrPrimitiveExportUnsupported)
+	case nativeTypeHostObject:
+		return nil, fmt.Errorf("%w: host object", jsengine.ErrPrimitiveExportUnsupported)
+	case nativeTypeHostFunction:
+		return nil, fmt.Errorf("%w: host function", jsengine.ErrPrimitiveExportUnsupported)
+	default:
+		return nil, fmt.Errorf("%w: native type %d", jsengine.ErrPrimitiveExportUnsupported, typ)
+	}
+}
+
 func (v *nativeValue) ToBoolean() bool {
-	if v == nil || v.released() || v.loop.closed.Load() {
+	if !v.usable() {
 		return false
 	}
 	var output C.uint32_t
@@ -777,7 +832,7 @@ func (v *nativeValue) ToBoolean() bool {
 }
 
 func (v *nativeValue) Object() jsengine.Object {
-	if v == nil || v.released() || v.loop.closed.Load() {
+	if !v.usable() {
 		return nil
 	}
 	typ, err := v.typeOf()
@@ -829,6 +884,9 @@ func (v *nativeValue) stringValue() string {
 	if required == 0 {
 		return ""
 	}
+	if uint64(required) > uint64(^uint(0)>>1) {
+		return ""
+	}
 	buffer := make([]byte, int(required))
 	status = C.sc_native_value_to_utf8_copy(C.uint64_t(v.loop.provider.library), C.uint64_t(v.runtime), C.uint64_t(v.handle),
 		(*C.char)(unsafe.Pointer(&buffer[0])), C.uint64_t(len(buffer)), &required,
@@ -842,7 +900,7 @@ func (v *nativeValue) stringValue() string {
 	return string(buffer)
 }
 func (v *nativeValue) retain() error {
-	if v == nil || v.released() || v.loop.closed.Load() {
+	if !v.usable() {
 		return ErrNativeClosed
 	}
 	if v.persistent.Load() {
@@ -860,7 +918,7 @@ func (v *nativeValue) retain() error {
 }
 
 func (v *nativeValue) releasePersistent() error {
-	if v == nil || v.loop.closed.Load() || !v.persistent.Swap(false) {
+	if v == nil || v.loop == nil || v.scope == nil || v.loop.closed.Load() || !v.persistent.Swap(false) {
 		return ErrNativeClosed
 	}
 	v.loop.unregisterPersistent(v.handle)
@@ -878,8 +936,13 @@ type nativeObject struct {
 	scope   *nativeScope
 }
 
+func (o *nativeObject) usable() bool {
+	return o != nil && o.loop != nil && !o.loop.closed.Load() &&
+		o.scope != nil && !o.scope.released.Load() && o.handle != 0
+}
+
 func (o *nativeObject) Set(name string, raw interface{}) error {
-	if o == nil || o.loop.closed.Load() {
+	if !o.usable() {
 		return ErrNativeClosed
 	}
 	value, err := (&nativeRuntime{loop: o.loop, scope: o.scope}).coerce(raw)
@@ -899,7 +962,7 @@ func (o *nativeObject) Set(name string, raw interface{}) error {
 }
 
 func (o *nativeObject) Get(name string) jsengine.Value {
-	if o == nil || o.loop.closed.Load() {
+	if !o.usable() {
 		return nil
 	}
 	key := []byte(name)
@@ -919,7 +982,7 @@ func (o *nativeObject) Get(name string) jsengine.Value {
 }
 
 func (o *nativeObject) Has(name string) bool {
-	if o == nil || o.loop.closed.Load() {
+	if !o.usable() {
 		return false
 	}
 	key := []byte(name)
@@ -938,7 +1001,7 @@ func (o *nativeObject) Has(name string) bool {
 type nativeFunction struct{ value *nativeValue }
 
 func (f *nativeFunction) Call(thisValue jsengine.Value, args ...interface{}) (jsengine.Value, error) {
-	if f == nil || f.value == nil || f.value.loop == nil || f.value.loop.closed.Load() || f.value.released() {
+	if f == nil || f.value == nil || !f.value.usable() || f.value.scope == nil || f.value.scope.released.Load() {
 		return nil, ErrNativeStaleValue
 	}
 	rt := &nativeRuntime{loop: f.value.loop, scope: f.value.scope}

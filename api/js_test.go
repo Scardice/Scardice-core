@@ -2,12 +2,15 @@ package api //nolint:testpackage
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"testing"
 
 	"go.uber.org/zap"
 
 	"Scardice-core/dice"
+	"Scardice-core/utils/jsengine"
+	gojaengine "Scardice-core/utils/jsengine/goja"
 )
 
 func newJSExecQuickJSDice(t *testing.T) (*dice.Dice, string) {
@@ -35,7 +38,7 @@ func newJSExecQuickJSDice(t *testing.T) (*dice.Dice, string) {
 	myDice, dm = testDice, manager
 	t.Cleanup(func() {
 		if testDice.ExtLoopManager != nil {
-			testDice.ExtLoopManager.SetEngineLoop(nil)
+			testDice.ExtLoopManager.SetLoop(nil)
 		}
 		myDice, dm = oldMyDice, oldDM
 	})
@@ -102,5 +105,25 @@ func TestJSExecDoesNotUseQuickJSForGojaConfiguration(t *testing.T) {
 	}
 	if response.Err == nil {
 		t.Fatalf("response = %s", rec.Body.String())
+	}
+}
+
+func TestExportJSAPIValueRejectsObjects(t *testing.T) {
+	loop := gojaengine.New()
+	defer loop.Close()
+
+	err := loop.Run(func(runtime jsengine.Runtime) error {
+		value, err := runtime.RunString("api.js", "({ answer: 42 })")
+		if err != nil {
+			return err
+		}
+		_, err = exportJSAPIValue(value)
+		if !errors.Is(err, jsengine.ErrPrimitiveExportUnsupported) {
+			t.Fatalf("error = %v, want unsupported primitive export", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }

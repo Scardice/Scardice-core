@@ -24,6 +24,7 @@ import (
 	"Scardice-core/model"
 	"Scardice-core/utils/dboperator/engine"
 	"Scardice-core/utils/jsengine"
+	gojaengine "Scardice-core/utils/jsengine/goja"
 
 	"github.com/golang-module/carbon"
 	ds "github.com/sealdice/dicescript"
@@ -31,7 +32,6 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/dop251/goja"
-	"github.com/dop251/goja_nodejs/eventloop"
 	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v3"
 )
@@ -1432,28 +1432,21 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 						if i.OnNotCommandReceived != nil {
 							notCommandReceiveCall := func() {
 								if i.IsJsExt {
-									// 先判断运行环境
 									loop, err := d.ExtLoopManager.GetLoop(i.JSLoopVersion)
 									if err != nil {
-										// 打个DEBUG日志？
 										mctx.Dice.Logger.Errorf("扩展<%s>运行环境已经过期: %v", i.Name, err)
 										return
 									}
-									waitRun := make(chan int, 1)
-									loop.RunOnLoop(func(runtime *goja.Runtime) {
+									err = loop.Run(func(jsengine.Runtime) error {
 										prev := mctx.Dice.JsCurrentPlugin
 										mctx.Dice.JsCurrentPlugin = i
-										defer func() {
-											mctx.Dice.JsCurrentPlugin = prev
-											if r := recover(); r != nil {
-												mctx.Dice.Logger.Errorf("扩展<%s>处理非指令消息异常: %v 堆栈: %v", i.Name, r, string(debug.Stack()))
-											}
-											waitRun <- 1
-										}()
-
+										defer func() { mctx.Dice.JsCurrentPlugin = prev }()
 										i.OnNotCommandReceived(mctx, msg)
+										return nil
 									})
-									<-waitRun
+									if err != nil {
+										mctx.Dice.Logger.Errorf("扩展<%s>处理非指令消息异常: %v", i.Name, err)
+									}
 								} else {
 									i.OnNotCommandReceived(mctx, msg)
 								}
@@ -1714,24 +1707,19 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 							if i.IsJsExt {
 								loop, err := d.ExtLoopManager.GetLoop(i.JSLoopVersion)
 								if err != nil {
-									// 打个DEBUG日志？
 									i.dice.Logger.Errorf("扩展<%s>运行环境已经过期: %v", i.Name, err)
 									return
 								}
-								waitRun := make(chan int, 1)
-								loop.RunOnLoop(func(runtime *goja.Runtime) {
+								err = loop.Run(func(jsengine.Runtime) error {
 									prev := mctx.Dice.JsCurrentPlugin
 									mctx.Dice.JsCurrentPlugin = i
-									defer func() {
-										mctx.Dice.JsCurrentPlugin = prev
-										if r := recover(); r != nil {
-											mctx.Dice.Logger.Errorf("扩展<%s>处理非指令消息异常: %v 堆栈: %v", i.Name, r, string(debug.Stack()))
-										}
-										waitRun <- 1
-									}()
+									defer func() { mctx.Dice.JsCurrentPlugin = prev }()
 									i.OnNotCommandReceived(mctx, msg)
+									return nil
 								})
-								<-waitRun
+								if err != nil {
+									mctx.Dice.Logger.Errorf("扩展<%s>处理非指令消息异常: %v", i.Name, err)
+								}
 							} else {
 								i.OnNotCommandReceived(mctx, msg)
 							}
@@ -2832,7 +2820,7 @@ func parseJSSolveResult(vm *goja.Runtime, ctx *MsgContext, solveName string, val
 }
 
 func parseJSSolveEngineResult(ctx *MsgContext, solveName string, value jsengine.Value) (CmdExecuteResult, error) {
-	if value == nil || value.Export() == nil {
+	if value == nil {
 		// 兼容旧插件：很多 JS solve 只 reply，不显式返回结果。
 		// 仅当本次命令已通过统一回复路径发过消息时，才把空返回视为成功，避免吞掉真实插件错误。
 		if ctx != nil && ctx.IsCommandReplied() {
@@ -2842,15 +2830,16 @@ func parseJSSolveEngineResult(ctx *MsgContext, solveName string, value jsengine.
 		return CmdExecuteResult{}, errJSSolveEmptyResult
 	}
 
-	if ret, ok := value.Export().(CmdExecuteResult); ok {
-		return ret, nil
-	}
-	if retPtr, ok := value.Export().(*CmdExecuteResult); ok && retPtr != nil {
-		return *retPtr, nil
-	}
-
 	object := value.Object()
 	if object == nil {
+		primitive, err := value.ExportPrimitive()
+		if err == nil && primitive == nil {
+			if ctx != nil && ctx.IsCommandReplied() {
+				logger.M().Debugf("JS solve 返回空结果，且已回复消息，按兼容模式处理: %s", solveName)
+				return CmdExecuteResult{Matched: true, Solved: true}, nil
+			}
+			return CmdExecuteResult{}, errJSSolveEmptyResult
+		}
 		return CmdExecuteResult{}, errors.New("invalid solve result")
 	}
 	if !object.Has("matched") && !object.Has("solved") && !object.Has("showHelp") {
@@ -2995,7 +2984,7 @@ func (s *IMSession) executeSolveEngine(ctx *MsgContext, msg *Message, cmdArgs *C
 		return CmdExecuteResult{Matched: true, Solved: false}, executeErr
 	}
 
-	loop, err := s.Parent.ExtLoopManager.GetEngineLoop(item.JSLoopVersion)
+	loop, err := s.Parent.ExtLoopManager.GetLoop(item.JSLoopVersion)
 	if err != nil {
 		s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境已经过期: %v", item.Name, err)
 		return CmdExecuteResult{Matched: true, Solved: false}, err
@@ -3140,7 +3129,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 			}
 		} else if item.IsJsSolveFunc || item.SolveRaw != nil {
 			var (
-				loop *eventloop.EventLoop
+				loop jsengine.Loop
 				err  error
 			)
 			if s.Parent.ExtLoopManager == nil {
@@ -3157,7 +3146,6 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 					loop = s.Parent.ExtLoopManager.GetWebLoop()
 				}
 				if loop == nil {
-					// 打个DEBUG日志？
 					executeErr = err
 					s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境已经过期: %v", item.Name, err)
 					return CmdExecuteResult{Matched: true, Solved: false}
@@ -3165,35 +3153,37 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 			}
 			done := make(chan CmdExecuteResult, 1)
 			fail := make(chan error, 1)
-			loop.RunOnLoop(func(vm *goja.Runtime) {
+			err = loop.Run(func(runtime jsengine.Runtime) (runErr error) {
 				prev := s.Parent.JsCurrentPlugin
 				if candidate.Ext != nil {
 					s.Parent.JsCurrentPlugin = candidate.Ext.GetRealExt()
 				}
-				if item.SolveRaw == nil {
-					// 兼容少量旧对象：没有 solveRaw 时回退同步 solve
-					defer func() {
-						s.Parent.JsCurrentPlugin = prev
-						if r := recover(); r != nil {
-							fail <- formatJSSolveRecoveredError(r)
-							return
-						}
-						done <- item.Solve(ctx, msg, cmdArgs)
-					}()
-					return
-				}
-
 				defer func() {
 					s.Parent.JsCurrentPlugin = prev
-					if r := recover(); r != nil {
-						fail <- formatJSSolveRecoveredError(r)
+					if recovered := recover(); recovered != nil {
+						runErr = formatJSSolveRecoveredError(recovered)
 					}
 				}()
-
+				if item.SolveRaw == nil {
+					// 兼容少量旧对象：没有 solveRaw 时回退同步 solve
+					ret = item.Solve(ctx, msg, cmdArgs)
+					return nil
+				}
+				vm, ok := gojaengine.Raw(runtime)
+				if !ok {
+					return errors.New("legacy Goja solve callback requires a Goja runtime")
+				}
 				resolveJSSolveValue(vm, ctx, item.Name, item.SolveRaw(ctx, msg, cmdArgs), done, fail)
+				return nil
 			})
-
-			ret, err = waitJSSolveResult(done, fail, jsSolveAwaitTimeout)
+			if err != nil {
+				executeErr = err
+				ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", err))
+				return CmdExecuteResult{Matched: true, Solved: false}
+			}
+			if item.SolveRaw != nil {
+				ret, err = waitJSSolveResult(done, fail, jsSolveAwaitTimeout)
+			}
 			if err != nil {
 				if errors.Is(err, errJSSolveTimeout) {
 					executeErr = err

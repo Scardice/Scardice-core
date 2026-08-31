@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/dop251/goja"
 	"go.uber.org/zap"
@@ -62,13 +61,8 @@ func TestJsInit_WhenExtLoopManagerNil_DoesNotPanic(t *testing.T) {
 			// 立即返回，随后启动的循环便再也不会退出。先等循环执行一个任务，确保
 			// Terminate 能真正等待其结束。
 			if loop := d.ExtLoopManager.GetWebLoop(); loop != nil {
-				started := make(chan struct{})
-				if loop.RunOnLoop(func(*goja.Runtime) { close(started) }) {
-					select {
-					case <-started:
-					case <-time.After(10 * time.Second):
-						t.Error("JS 事件循环未在预期时间内启动")
-					}
+				if err := loop.Run(func(jsengine.Runtime) error { return nil }); err != nil {
+					t.Errorf("JS 事件循环未在预期时间内启动: %v", err)
 				}
 			}
 			d.ExtLoopManager.SetLoop(nil)
@@ -101,7 +95,7 @@ func TestJsInit_QuickJSStartsExperimentalHost(t *testing.T) {
 	d.Config.JsEngine = "quickjs"
 	t.Cleanup(func() {
 		if d.ExtLoopManager != nil {
-			d.ExtLoopManager.SetEngineLoop(nil)
+			d.ExtLoopManager.SetLoop(nil)
 		}
 	})
 
@@ -113,7 +107,7 @@ func TestJsInit_QuickJSStartsExperimentalHost(t *testing.T) {
 	if d.ExtLoopManager == nil {
 		t.Fatal("QuickJS-Go initialization did not create a loop manager")
 	}
-	loop, err := d.ExtLoopManager.GetEngineLoop(d.ExtLoopManager.version)
+	loop, err := d.ExtLoopManager.GetLoop(d.ExtLoopManager.version)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +170,7 @@ func TestJsLoadScriptRaw_QuickJSExecutesAndRegistersPlugin(t *testing.T) {
 	d.Config.JsEngine = "quickjs"
 	t.Cleanup(func() {
 		if d.ExtLoopManager != nil {
-			d.ExtLoopManager.SetEngineLoop(nil)
+			d.ExtLoopManager.SetLoop(nil)
 		}
 	})
 

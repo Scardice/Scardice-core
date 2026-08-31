@@ -11,11 +11,11 @@ import (
 	"time"
 
 	milky "github.com/Szzrain/Milky-go-sdk"
-	"github.com/dop251/goja"
 	"go.uber.org/zap"
 
 	emitter "Scardice-core/dice/imsdk/onebot"
 	"Scardice-core/message"
+	"Scardice-core/utils/jsengine"
 )
 
 type forwardCaptureAdapter struct {
@@ -455,22 +455,20 @@ func TestPluginForwardAPIBindingsCanConstructAndSend(t *testing.T) {
 		}
 	}()
 	loop := d.ExtLoopManager.GetWebLoop()
-	done := make(chan error, 1)
-	if !loop.RunOnLoop(func(vm *goja.Runtime) {
-		_ = vm.Set("testCtx", ctx)
-		_ = vm.Set("testMsg", msg)
-		_, runErr := vm.RunString(`seal.replyForward(testCtx, testMsg, [seal.newForwardNode("", "", "plugin text")])`)
-		done <- runErr
-	}) {
-		t.Fatal("JS loop rejected validation task")
+	if loop == nil {
+		t.Fatal("JS loop unavailable")
 	}
-	select {
-	case runErr := <-done:
-		if runErr != nil {
-			t.Fatal(runErr)
+	if err := loop.Run(func(runtime jsengine.Runtime) error {
+		if err := runtime.Set("testCtx", ctx); err != nil {
+			return err
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("plugin forward API validation timed out")
+		if err := runtime.Set("testMsg", msg); err != nil {
+			return err
+		}
+		_, err := runtime.RunString("forward-test.js", `seal.replyForward(testCtx, testMsg, [seal.newForwardNode("", "", "plugin text")])`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
 	}
 	adapter.muForward.Lock()
 	defer adapter.muForward.Unlock()

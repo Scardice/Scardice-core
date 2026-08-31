@@ -40,7 +40,6 @@ import (
 	"Scardice-core/utils/crypto"
 	"Scardice-core/utils/jsengine"
 	gojaengine "Scardice-core/utils/jsengine/goja"
-	quickjsadapter "Scardice-core/utils/jsengine/quickjs"
 	sealabort "Scardice-core/utils/plugin/abort"
 	sealcrypto "Scardice-core/utils/plugin/crypto"
 	sealhttp "Scardice-core/utils/plugin/httpextra"
@@ -106,7 +105,7 @@ var taskCronParser = cron.NewParser(
 		cron.Descriptor,
 )
 
-const (
+var (
 	jsCacheDir         = "./data/.cache/js"
 	jsMetaCacheFile    = "meta.gob.zst"
 	jsMetaCacheVersion = 1
@@ -371,7 +370,8 @@ func (d *Dice) jsInitGoja() {
 		eventloop.WithRegistry(reg),
 		eventloop.WithDebugLog(true),
 		eventloop.WithLogger(d.Logger))
-	versionID := d.ExtLoopManager.SetLoop(loop)
+	engineLoop := gojaengine.WrapEventLoop(loop)
+	versionID := d.ExtLoopManager.SetLoop(engineLoop)
 	proxy := goproxy.NewProxyHttpServer()
 
 	printer := &PrinterFunc{d, false, []string{}}
@@ -470,7 +470,9 @@ func (d *Dice) jsInitGoja() {
 				d.Logger.Errorf("JS核心执行异常: %v 堆栈: %v", r, string(debug.Stack()))
 			}
 		}()
-		loop.StartInForeground()
+		if err := gojaengine.StartInForeground(engineLoop); err != nil {
+			d.Logger.Errorf("JS事件循环启动失败: %v", err)
+		}
 	}()
 	// loop.Start()
 	(&d.Config).JsEnable = true
@@ -1647,23 +1649,20 @@ func (d *Dice) JsLoadScriptRaw(jsInfo *JsScriptInfo) {
 			targetPath = jsInfo.Filename
 		}
 		if err == nil {
-			if d.isQuickJSExperiment() {
-				loop := d.ExtLoopManager.GetActiveEngineLoop()
-				if loop == nil {
-					err = errors.New("QuickJS-Go runtime is unavailable")
-				} else {
-					data, readErr := os.ReadFile(targetPath)
-					if readErr != nil {
-						err = readErr
-					} else {
-						err = loop.Run(func(runtime jsengine.Runtime) error {
-							_, runErr := quickjsadapter.LoadModule(runtime, targetPath, string(data))
-							return runErr
-						})
-					}
-				}
+			loop := d.ExtLoopManager.GetWebLoop()
+			if loop == nil {
+				err = errors.New("JavaScript runtime is unavailable")
 			} else {
-				_, err = d.ExtLoopManager.GetWebLoop().RequireModule(targetPath)
+				data, readErr := os.ReadFile(targetPath)
+				if readErr != nil {
+					err = readErr
+				} else {
+					err = loop.LoadEntry(jsengine.Entry{
+						Filename: targetPath,
+						Source:   string(data),
+						Kind:     jsengine.EntryExtension,
+					})
+				}
 			}
 		}
 		d.JsLoadingScript = nil
@@ -2069,26 +2068,15 @@ func (t *JsScriptTask) run() {
 		t.logger.Errorf("插件定时任务获取JS事件循环失败: %v", err)
 		return
 	}
-	done := make(chan struct{})
-	var recovered interface{}
-	if ok := loop.RunOnLoop(func(_ *goja.Runtime) {
-		defer close(done)
-		defer func() {
-			recovered = recover()
-		}()
+	err = loop.Run(func(jsengine.Runtime) error {
 		prev := t.dice.JsCurrentPlugin
 		t.dice.JsCurrentPlugin = t.ext
-		defer func() {
-			t.dice.JsCurrentPlugin = prev
-		}()
+		defer func() { t.dice.JsCurrentPlugin = prev }()
 		t.task(taskCtx)
-	}); !ok {
-		t.logger.Error("插件定时任务调度到JS事件循环失败")
-		return
-	}
-	<-done
-	if recovered != nil {
-		t.logger.Errorf("插件定时任务异常: %v", recovered)
+		return nil
+	})
+	if err != nil {
+		t.logger.Errorf("插件定时任务异常: %v", err)
 	}
 }
 

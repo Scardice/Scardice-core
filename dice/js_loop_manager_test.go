@@ -15,15 +15,15 @@ func TestJsLoopManagerStoresEngineLoopByVersion(t *testing.T) {
 	}
 	defer loop.Close()
 
-	version := manager.SetEngineLoop(loop)
-	got, err := manager.GetEngineLoop(version)
+	version := manager.SetLoop(loop)
+	got, err := manager.GetLoop(version)
 	if err != nil {
-		t.Fatalf("GetEngineLoop() error = %v", err)
+		t.Fatalf("GetLoop() error = %v", err)
 	}
 	if got != loop {
-		t.Fatal("GetEngineLoop() returned a different loop")
+		t.Fatal("GetLoop() returned a different loop")
 	}
 	if got.Engine() != jsengine.EngineQuickJS {
-		t.Fatalf("GetEngineLoop().Engine() = %q, want %q", got.Engine(), jsengine.EngineQuickJS)
+		t.Fatalf("GetLoop().Engine() = %q, want %q", got.Engine(), jsengine.EngineQuickJS)
 	}
 }

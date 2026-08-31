@@ -1,8 +1,20 @@
 package jsengine
 
+import "errors"
+
+// ErrPrimitiveExportUnsupported indicates that a value is not a JavaScript
+// primitive and therefore cannot cross the engine-neutral conversion boundary.
+var ErrPrimitiveExportUnsupported = errors.New("JavaScript value is not a primitive")
+
 // Value is a JavaScript value scoped to a Runtime callback.
 type Value interface {
+	// Export is a legacy, engine-specific escape hatch. Generic callers MUST
+	// use Object or ExportPrimitive instead.
 	Export() interface{}
+	// ExportPrimitive returns nil for both JavaScript undefined and null. It
+	// returns booleans, strings, and numeric primitives unchanged. Objects,
+	// functions, and host references return ErrPrimitiveExportUnsupported.
+	ExportPrimitive() (any, error)
 	ToBoolean() bool
 	Object() Object
 }

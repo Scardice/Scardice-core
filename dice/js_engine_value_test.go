@@ -101,10 +101,10 @@ func TestCallOnMessagePreprocess_UsesEngineNeutralCallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(loop.Close)
+	t.Cleanup(func() { _ = loop.Close() })
 
 	d := &Dice{ExtLoopManager: NewJsLoopManager()}
-	version := d.ExtLoopManager.SetEngineLoop(loop)
+	version := d.ExtLoopManager.SetLoop(loop)
 	ext := &ExtInfo{
 		Name:          "engine-preprocess",
 		IsJsExt:       true,
@@ -121,5 +121,62 @@ func TestCallOnMessagePreprocess_UsesEngineNeutralCallback(t *testing.T) {
 		reason:  "engine",
 	}) {
 		t.Fatalf("decision = %#v", decision)
+	}
+}
+
+type fakeEngineObject struct {
+	values map[string]jsengine.Value
+}
+
+func (o fakeEngineObject) Set(string, interface{}) error { return nil }
+
+func (o fakeEngineObject) Get(name string) jsengine.Value {
+	return o.values[name]
+}
+
+func (o fakeEngineObject) Has(name string) bool {
+	_, ok := o.values[name]
+	return ok
+}
+
+type fakeEngineValue struct {
+	object jsengine.Object
+	prim   any
+}
+
+func (v fakeEngineValue) Export() interface{} { return nil }
+func (v fakeEngineValue) ExportPrimitive() (any, error) {
+	return v.prim, nil
+}
+func (v fakeEngineValue) ToBoolean() bool         { return v.prim != nil && v.prim != false }
+func (v fakeEngineValue) Object() jsengine.Object { return v.object }
+
+func TestParseEngineValuesReadsObjectWithoutLegacyExport(t *testing.T) {
+	object := fakeEngineObject{values: map[string]jsengine.Value{
+		"message": fakeEngineValue{prim: "rewritten"},
+		"reason":  fakeEngineValue{prim: "from-native-object"},
+	}}
+	decision := parseMessagePreprocessEngineValue(fakeEngineValue{object: object})
+	if decision != (messagePreprocessDecision{
+		action:  messagePreprocessRewrite,
+		message: "rewritten",
+		reason:  "from-native-object",
+	}) {
+		t.Fatalf("decision = %#v", decision)
+	}
+}
+
+func TestParseSolveEngineValueReadsObjectWithoutLegacyExport(t *testing.T) {
+	object := fakeEngineObject{values: map[string]jsengine.Value{
+		"matched":  fakeEngineValue{prim: true},
+		"solved":   fakeEngineValue{prim: true},
+		"showHelp": fakeEngineValue{prim: false},
+	}}
+	result, err := parseJSSolveEngineResult(nil, "native-object", fakeEngineValue{object: object})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != (CmdExecuteResult{Matched: true, Solved: true}) {
+		t.Fatalf("result = %#v", result)
 	}
 }

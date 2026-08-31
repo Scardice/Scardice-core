@@ -2,14 +2,15 @@
 package dice //nolint:testpackage // tests rely on unexported helpers
 
 import (
-	"testing"
-	"time"
-
+	"errors"
 	"github.com/dop251/goja"
 	"github.com/dop251/goja_nodejs/eventloop"
 	"go.uber.org/zap"
+	"testing"
+	"time"
 
 	"Scardice-core/utils/jsengine"
+	gojaengine "Scardice-core/utils/jsengine/goja"
 	quickjs "Scardice-core/utils/jsengine/quickjs"
 )
 
@@ -499,23 +500,29 @@ func TestFormatCommandIgnoreReasonForPrivateUnavailable(t *testing.T) {
 	}
 }
 
-func startCommandSolveTestLoop(t *testing.T) (*eventloop.EventLoop, *goja.Runtime) {
+func startCommandSolveTestLoop(t *testing.T) (jsengine.Loop, *goja.Runtime) {
 	t.Helper()
-	loop := eventloop.NewEventLoop(eventloop.EnableConsole(false))
-	go loop.StartInForeground()
+	rawLoop := eventloop.NewEventLoop(eventloop.EnableConsole(false))
+	loop := gojaengine.WrapEventLoop(rawLoop)
+	go func() {
+		if err := gojaengine.StartInForeground(loop); err != nil {
+			t.Errorf("start Goja event loop: %v", err)
+		}
+	}()
 	time.Sleep(20 * time.Millisecond)
-	t.Cleanup(func() {
-		loop.Stop()
-	})
+	t.Cleanup(func() { _ = loop.Close() })
 
 	var vm *goja.Runtime
-	ready := make(chan struct{})
-	loop.RunOnLoop(func(runtime *goja.Runtime) {
-		vm = runtime
-		close(ready)
-	})
-	<-ready
-
+	if err := loop.Run(func(runtime jsengine.Runtime) error {
+		var ok bool
+		vm, ok = gojaengine.Raw(runtime)
+		if !ok {
+			return errors.New("wrapped Goja runtime is unavailable")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("initialize Goja event loop: %v", err)
+	}
 	return loop, vm
 }
 
@@ -573,7 +580,7 @@ func TestCommandSolve_UsesEngineNeutralCallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(loop.Close)
+	t.Cleanup(func() { _ = loop.Close() })
 
 	ext := &ExtInfo{
 		Name:    "dnd5e",
@@ -594,7 +601,7 @@ func TestCommandSolve_UsesEngineNeutralCallback(t *testing.T) {
 
 	session, ctx := newCommandSolveTestSessionAndContext("dnd5e", []*ExtInfo{ext})
 	ctx.Dice.ExtLoopManager = NewJsLoopManager()
-	ext.JSLoopVersion = ctx.Dice.ExtLoopManager.SetEngineLoop(loop)
+	ext.JSLoopVersion = ctx.Dice.ExtLoopManager.SetLoop(loop)
 	ext.CmdMap[commandName].JSLoopVersion = ext.JSLoopVersion
 
 	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})

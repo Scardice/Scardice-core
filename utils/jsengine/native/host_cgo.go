@@ -88,14 +88,14 @@ func hostString(view C.sc_string_view) (string, error) {
 	if view.len == 0 {
 		return "", nil
 	}
-	if uint64(view.len) > uint64(^uint(0)>>1) {
+	if view.data == nil || uint64(view.len) > uint64(^uint(0)>>1) {
 		return "", errors.New("invalid native string view")
 	}
 	return string(unsafe.Slice((*byte)(unsafe.Pointer(view.data)), int(view.len))), nil
 }
 
 func copyHostBytes(buffer *C.char, capacity C.uint64_t, data []byte) C.sc_status_t {
-	if uint64(capacity) < uint64(len(data)) {
+	if uint64(capacity) > uint64(^uint(0)>>1) || uint64(capacity) < uint64(len(data)) {
 		return C.sc_status_t(-1)
 	}
 	if len(data) != 0 {

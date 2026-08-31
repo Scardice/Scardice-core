@@ -106,7 +106,7 @@ func (d *Dice) jsInitQuickJS() {
 		d.disableQuickJS(err)
 		return
 	}
-	versionID := d.ExtLoopManager.SetEngineLoop(loop)
+	versionID := d.ExtLoopManager.SetLoop(loop)
 
 	err = loop.Run(func(runtime jsengine.Runtime) error {
 		if installErr := d.installJSHostAPI(runtime); installErr != nil {
@@ -139,12 +139,12 @@ func (d *Dice) jsInitQuickJS() {
 		return runErr
 	})
 	if err != nil {
-		d.ExtLoopManager.SetEngineLoop(nil)
+		d.ExtLoopManager.SetLoop(nil)
 		d.disableQuickJS(err)
 		return
 	}
 	if err := quickjs.Start(loop); err != nil {
-		d.ExtLoopManager.SetEngineLoop(nil)
+		d.ExtLoopManager.SetLoop(nil)
 		d.disableQuickJS(err)
 		return
 	}

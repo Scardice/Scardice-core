@@ -1,8 +1,8 @@
 // Package quickjs adapts buke/quickjs-go to the engine-neutral runtime contract.
 package quickjs
-
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -380,6 +380,22 @@ func eval(r *runtime, filename, source string) struct {
 
 func (v value) Export() interface{} {
 	return export(v.value)
+}
+
+func (v value) ExportPrimitive() (any, error) {
+	if v.value == nil || v.value.IsUndefined() || v.value.IsNull() {
+		return nil, nil
+	}
+	switch {
+	case v.value.IsBool():
+		return v.value.ToBool(), nil
+	case v.value.IsString():
+		return v.value.ToString(), nil
+	case v.value.IsNumber():
+		return v.value.ToFloat64(), nil
+	default:
+		return nil, fmt.Errorf("%w: object or function", jsengine.ErrPrimitiveExportUnsupported)
+	}
 }
 
 func (v value) ToBoolean() bool {

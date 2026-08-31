@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
-	"github.com/dop251/goja_nodejs/eventloop"
 	"github.com/go-creed/sat"
 	wr "github.com/mroth/weightedrand/v3"
 	"github.com/robfig/cron/v3"
@@ -143,95 +142,47 @@ type ExtDefaultSettingItem struct {
 type ExtDefaultSettingItemSlice []*ExtDefaultSettingItem
 
 type JsLoopManager struct {
-	loop       *eventloop.EventLoop
-	engineLoop jsengine.Loop
-	loopLock   sync.RWMutex
-	version    int64
+	loop     jsengine.Loop
+	loopLock sync.RWMutex
+	version  int64
 }
 
 func NewJsLoopManager() *JsLoopManager {
-	return &JsLoopManager{
-		loop:     nil,
-		loopLock: sync.RWMutex{},
-		version:  0,
-	}
+	return &JsLoopManager{version: 0}
 }
 
-// GetLoop 通过版本号获取 loop，如果版本号不匹配则返回错误
-func (m *JsLoopManager) GetLoop(expectedVersion int64) (*eventloop.EventLoop, error) {
+// GetLoop returns the loop for a matching runtime generation.
+func (m *JsLoopManager) GetLoop(expectedVersion int64) (jsengine.Loop, error) {
 	m.loopLock.RLock()
 	defer m.loopLock.RUnlock()
 
 	if m.version != expectedVersion {
 		return nil, fmt.Errorf("version mismatch: expected %d, current %d", expectedVersion, m.version)
 	}
-
 	return m.loop, nil
 }
 
-func (m *JsLoopManager) GetWebLoop() *eventloop.EventLoop {
+// GetWebLoop returns the active loop. It does not bypass the neutral contract.
+func (m *JsLoopManager) GetWebLoop() jsengine.Loop {
 	m.loopLock.RLock()
 	defer m.loopLock.RUnlock()
-	// 给WEB用，不需要管是哪个版本的Loop，是最新的就行
 	return m.loop
 }
 
-// SetLoop 写入新的 loop 并自动递增版本号
-func (m *JsLoopManager) SetLoop(newLoop *eventloop.EventLoop) int64 {
+// SetLoop replaces the active loop, closes the previous loop, and increments
+// the generation so callbacks registered against it become stale.
+func (m *JsLoopManager) SetLoop(newLoop jsengine.Loop) int64 {
 	m.loopLock.Lock()
-	defer m.loopLock.Unlock()
-
-	// 停止旧的 loop（如果存在）
-	if m.loop != nil {
-		m.loop.Terminate()
-	}
-	if m.engineLoop != nil {
-		m.engineLoop.Close()
-		m.engineLoop = nil
-	}
-
-	// 设置新的 loop 并递增版本号
+	oldLoop := m.loop
 	m.loop = newLoop
 	m.version++
-	return m.version
-}
+	version := m.version
+	m.loopLock.Unlock()
 
-// GetEngineLoop returns the engine-neutral loop for a matching runtime
-// generation. Callers must not mix it with GetLoop.
-func (m *JsLoopManager) GetEngineLoop(expectedVersion int64) (jsengine.Loop, error) {
-	m.loopLock.RLock()
-	defer m.loopLock.RUnlock()
-
-	if m.version != expectedVersion {
-		return nil, fmt.Errorf("version mismatch: expected %d, current %d", expectedVersion, m.version)
+	if oldLoop != nil {
+		_ = oldLoop.Close()
 	}
-	return m.engineLoop, nil
-}
-
-// GetActiveEngineLoop returns the current engine-neutral loop without
-// exposing the generation counter to callers that only need to execute work.
-func (m *JsLoopManager) GetActiveEngineLoop() jsengine.Loop {
-	m.loopLock.RLock()
-	defer m.loopLock.RUnlock()
-	return m.engineLoop
-}
-
-// SetEngineLoop replaces the active engine-neutral loop and invalidates all
-// callbacks registered against the previous runtime generation.
-func (m *JsLoopManager) SetEngineLoop(newLoop jsengine.Loop) int64 {
-	m.loopLock.Lock()
-	defer m.loopLock.Unlock()
-
-	if m.loop != nil {
-		m.loop.Terminate()
-		m.loop = nil
-	}
-	if m.engineLoop != nil {
-		m.engineLoop.Close()
-	}
-	m.engineLoop = newLoop
-	m.version++
-	return m.version
+	return version
 }
 
 // 强制coc7排序在较前位置

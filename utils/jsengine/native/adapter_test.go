@@ -67,6 +67,9 @@ func TestNativeAdapterEchoContract(t *testing.T) {
 		if got := value.Export(); got != int64(3) {
 			return fmt.Errorf("eval export = %#v", got)
 		}
+		if got, err := value.ExportPrimitive(); err != nil || got != int64(3) {
+			return fmt.Errorf("eval primitive export = %#v, %v", got, err)
+		}
 		if err := runtime.Set("u64", uint64(math.MaxUint64)); err != nil {
 			return err
 		}
@@ -94,6 +97,13 @@ func TestNativeAdapterEchoContract(t *testing.T) {
 		}
 		if got := object.Get("missing").Export(); got != nil {
 			return fmt.Errorf("missing object property = %#v, want undefined", got)
+		}
+		objectValue, err := runtime.RunString("object.js", "({ answer: 42 })")
+		if err != nil {
+			return err
+		}
+		if _, err := objectValue.ExportPrimitive(); !errors.Is(err, jsengine.ErrPrimitiveExportUnsupported) {
+			return fmt.Errorf("object primitive export error = %v", err)
 		}
 		if err := runtime.Bind("host", &host); err != nil {
 			return err
@@ -135,6 +145,65 @@ func TestNativeAdapterEchoContract(t *testing.T) {
 	}
 }
 
+func TestNativeAdapterSerializesConcurrentRuns(t *testing.T) {
+	loop := openEcho(t)
+	defer func() { _ = loop.Close() }()
+
+	const workers = 16
+	errs := make(chan error, workers)
+	var wait sync.WaitGroup
+	wait.Add(workers)
+	for range workers {
+		go func() {
+			defer wait.Done()
+			errs <- loop.Run(func(runtime jsengine.Runtime) error {
+				value, err := runtime.RunString("concurrent.js", "1 + 2")
+				if err != nil {
+					return err
+				}
+				if got := value.Export(); got != int64(3) {
+					return fmt.Errorf("concurrent eval export = %#v", got)
+				}
+				return nil
+			})
+		}()
+	}
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestNativeAdapterRejectsStaleScopedValue(t *testing.T) {
+	loop := openEcho(t)
+	defer func() { _ = loop.Close() }()
+
+	var stale *nativeValue
+	if err := loop.Run(func(runtime jsengine.Runtime) error {
+		value, err := runtime.RunString("stale.js", "1 + 2")
+		if err != nil {
+			return err
+		}
+		var ok bool
+		stale, ok = value.(*nativeValue)
+		if !ok {
+			return errors.New("native eval returned a non-native value")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if stale.Export() != nil {
+		t.Fatal("scoped value survived its owning callback")
+	}
+	if err := stale.retain(); !errors.Is(err, ErrNativeClosed) {
+		t.Fatalf("retain on stale value error = %v, want ErrNativeClosed", err)
+	}
+}
+
 func TestNativeAdapterRetainedValueAndClose(t *testing.T) {
 	loop := openEcho(t)
 	defer func() { _ = loop.Close() }()
@@ -153,11 +222,18 @@ func TestNativeAdapterRetainedValueAndClose(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := retained.Export(); got != int64(3) {
-		t.Fatalf("retained export = %#v", got)
-	}
-	if err := retained.releasePersistent(); err != nil {
+	var exported interface{}
+	if err := loop.Run(func(jsengine.Runtime) error {
+		exported = retained.Export()
+		return retained.releasePersistent()
+	}); err != nil {
 		t.Fatal(err)
+	}
+	if exported != int64(3) {
+		t.Fatalf("retained export = %#v", exported)
+	}
+	if ResidentLibraryCount() == 0 {
+		t.Fatal("native library was not kept resident")
 	}
 	if err := loop.Close(); err != nil {
 		t.Fatal(err)

@@ -1,6 +1,8 @@
 package dice
 
 import (
+	"fmt"
+
 	"Scardice-core/utils/jsengine"
 
 	"github.com/dop251/goja"
@@ -16,6 +18,21 @@ func (v gojaEngineValue) Export() interface{} {
 		return nil
 	}
 	return v.value.Export()
+}
+
+func (v gojaEngineValue) ExportPrimitive() (any, error) {
+	if v.value == nil || goja.IsUndefined(v.value) || goja.IsNull(v.value) {
+		return nil, nil
+	}
+	if _, ok := v.value.(*goja.Object); ok {
+		return nil, fmt.Errorf("%w: object", jsengine.ErrPrimitiveExportUnsupported)
+	}
+	switch exported := v.value.Export().(type) {
+	case bool, string, int64, uint64, float64:
+		return exported, nil
+	default:
+		return nil, fmt.Errorf("%w: %T", jsengine.ErrPrimitiveExportUnsupported, exported)
+	}
 }
 
 func (v gojaEngineValue) ToBoolean() bool {
