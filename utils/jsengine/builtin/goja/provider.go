@@ -2,7 +2,10 @@
 package goja
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 
 	"Scardice-core/utils/jsengine"
 	adapter "Scardice-core/utils/jsengine/goja"
@@ -31,6 +34,28 @@ func (provider) Descriptor() jsengine.Descriptor {
 	}
 }
 
-func (provider) Open(_ context.Context, _ jsengine.RuntimeOptions) (jsengine.Loop, error) {
+func (provider) Open(_ context.Context, options jsengine.RuntimeOptions) (jsengine.Loop, error) {
+	if err := validateOptions(options.OptionsJSON); err != nil {
+		return nil, err
+	}
 	return adapter.New(), nil
+}
+
+func validateOptions(raw json.RawMessage) error {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return nil
+	}
+	if raw[0] != '{' {
+		return fmt.Errorf("goja: unsupported runtime options: expected a JSON object")
+	}
+
+	var options map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &options); err != nil {
+		return fmt.Errorf("goja: unsupported runtime options: invalid JSON: %w", err)
+	}
+	if len(options) != 0 {
+		return fmt.Errorf("goja: unsupported runtime options: Goja has no provider-specific options")
+	}
+	return nil
 }

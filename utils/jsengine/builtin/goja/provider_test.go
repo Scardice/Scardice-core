@@ -2,6 +2,8 @@ package goja_test
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"Scardice-core/utils/jsengine"
@@ -42,5 +44,27 @@ func TestProviderOpensExistingGojaAdapter(t *testing.T) {
 	}
 	if loop.Engine() != jsengine.EngineGoja {
 		t.Fatalf("Loop.Engine() = %q, want %q", loop.Engine(), jsengine.EngineGoja)
+	}
+}
+
+func TestProviderRejectsUnsupportedOptionsWithoutDroppingThem(t *testing.T) {
+	_, err := builtin.Provider().Open(context.Background(), jsengine.RuntimeOptions{
+		OptionsJSON: json.RawMessage(`{"unsupported":true}`),
+	})
+	if err == nil {
+		t.Fatal("Open() error = nil, want unsupported-options error")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "unsupported") {
+		t.Fatalf("Open() error = %q, want unsupported-options diagnostic", err)
+	}
+}
+
+func TestProviderAcceptsEmptyOptions(t *testing.T) {
+	for _, optionsJSON := range []json.RawMessage{nil, []byte(" \n\t"), []byte("{}")} {
+		loop, err := builtin.Provider().Open(context.Background(), jsengine.RuntimeOptions{OptionsJSON: optionsJSON})
+		if err != nil {
+			t.Fatalf("Open(%q) error = %v, want success", optionsJSON, err)
+		}
+		loop.Close()
 	}
 }

@@ -54,7 +54,7 @@ func (r *registry) RegisterBuiltin(provider Provider) error {
 		return fmt.Errorf("%w: provider ID is empty", ErrInvalidProvider)
 	}
 	if _, exists := r.descriptors[descriptor.ID]; exists {
-		return fmt.Errorf("%w: engine ID %q", ErrDuplicateProvider, descriptor.ID)
+		return fmt.Errorf("%w: duplicate provider ID %q", ErrDuplicateProvider, descriptor.ID)
 	}
 	descriptor.Builtin = true
 	r.providers[descriptor.ID] = provider
@@ -70,7 +70,7 @@ func (r *registry) RegisterCandidate(manifest RuntimeManifest) error {
 		return fmt.Errorf("%w: runtime ID is empty", ErrInvalidManifest)
 	}
 	if _, exists := r.descriptors[descriptor.ID]; exists {
-		return fmt.Errorf("%w: engine ID %q", ErrDuplicateProvider, descriptor.ID)
+		return fmt.Errorf("%w: duplicate provider ID %q", ErrDuplicateProvider, descriptor.ID)
 	}
 	descriptor.Builtin = false
 	r.descriptors[descriptor.ID] = descriptor

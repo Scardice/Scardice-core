@@ -41,34 +41,34 @@ type RuntimeManifest struct {
 
 func (m RuntimeManifest) descriptor() Descriptor {
 	d := m.Descriptor
-	if d.ID == "" {
+	if m.ID != "" {
 		d.ID = m.ID
 	}
-	if d.Name == "" {
+	if m.Name != "" {
 		d.Name = m.Name
 	}
-	if d.Version == "" {
+	if m.Version != "" {
 		d.Version = m.Version
 	}
-	if d.Language == "" {
+	if m.Language != "" {
 		d.Language = m.Language
 	}
-	if d.ABIMajor == 0 {
+	if m.ABIMajor != 0 {
 		d.ABIMajor = m.ABIMajor
 	}
-	if d.ABIMinor == 0 {
+	if m.ABIMinor != 0 {
 		d.ABIMinor = m.ABIMinor
 	}
-	if d.HostABIMajor == 0 {
+	if m.HostABIMajor != 0 {
 		d.HostABIMajor = m.HostABIMajor
 	}
-	if d.HostABIMinor == 0 {
+	if m.HostABIMinor != 0 {
 		d.HostABIMinor = m.HostABIMinor
 	}
-	if d.Capabilities == 0 {
+	if m.Capabilities != 0 {
 		d.Capabilities = m.Capabilities
 	}
-	if d.Path == "" {
+	if m.Path != "" {
 		d.Path = m.Path
 	}
 	d.Builtin = false

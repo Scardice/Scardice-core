@@ -3,6 +3,7 @@ package jsengine_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"Scardice-core/utils/jsengine"
@@ -68,16 +69,24 @@ func TestRegistryRejectsDuplicateCandidateAndBuiltinIDs(t *testing.T) {
 	if err := registry.RegisterCandidate(manifest); err != nil {
 		t.Fatalf("first RegisterCandidate() error = %v", err)
 	}
-	if err := registry.RegisterCandidate(manifest); !errors.Is(err, jsengine.ErrDuplicateProvider) {
+	err := registry.RegisterCandidate(manifest)
+	if !errors.Is(err, jsengine.ErrDuplicateProvider) {
 		t.Fatalf("second RegisterCandidate() error = %v, want ErrDuplicateProvider", err)
+	}
+	if !strings.Contains(err.Error(), `duplicate provider ID "native.runtime"`) {
+		t.Fatalf("second RegisterCandidate() error = %q, want normalized conflicting ID", err)
 	}
 
 	if err := registry.RegisterBuiltin(builtin.Provider()); err != nil {
 		t.Fatalf("RegisterBuiltin() error = %v", err)
 	}
 	builtinManifest := jsengine.RuntimeManifest{ID: jsengine.EngineGoja, Name: "candidate"}
-	if err := registry.RegisterCandidate(builtinManifest); !errors.Is(err, jsengine.ErrDuplicateProvider) {
+	err = registry.RegisterCandidate(builtinManifest)
+	if !errors.Is(err, jsengine.ErrDuplicateProvider) {
 		t.Fatalf("builtin/candidate RegisterCandidate() error = %v, want ErrDuplicateProvider", err)
+	}
+	if !strings.Contains(err.Error(), `duplicate provider ID "goja"`) {
+		t.Fatalf("builtin/candidate error = %q, want conflicting builtin ID", err)
 	}
 }
 
@@ -130,6 +139,35 @@ func TestRegistryDescriptorsAreStableSnapshots(t *testing.T) {
 	}
 	if second[0].ID != jsengine.EngineGoja || second[1].ID != "native" {
 		t.Fatalf("Descriptors() order/IDs = %#v, want goja then native", second)
+	}
+}
+
+func TestRegistryManifestABIFieldsOverrideEmbeddedDescriptor(t *testing.T) {
+	registry := jsengine.NewRegistry()
+	manifest := jsengine.RuntimeManifest{
+		ID: "native",
+		Descriptor: jsengine.Descriptor{
+			ID:           "embedded",
+			ABIMajor:     1,
+			ABIMinor:     1,
+			HostABIMajor: 1,
+			HostABIMinor: 1,
+		},
+		ABIMajor:     2,
+		ABIMinor:     3,
+		HostABIMajor: 4,
+		HostABIMinor: 5,
+	}
+	if err := registry.RegisterCandidate(manifest); err != nil {
+		t.Fatalf("RegisterCandidate() error = %v", err)
+	}
+	descriptor, found := registry.Descriptor(manifest.ID)
+	if !found {
+		t.Fatal("Descriptor() did not find candidate")
+	}
+	if descriptor.ID != manifest.ID || descriptor.ABIMajor != 2 || descriptor.ABIMinor != 3 ||
+		descriptor.HostABIMajor != 4 || descriptor.HostABIMinor != 5 {
+		t.Fatalf("candidate descriptor ABI = %#v, want manifest ABI 2.3 host 4.5", descriptor)
 	}
 }
 
