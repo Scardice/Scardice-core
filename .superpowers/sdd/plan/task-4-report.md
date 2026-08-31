@@ -58,7 +58,7 @@ ok   Scardice-core/utils/jsengine/native 0.003s
 ## Commits
 
 - Baseline: `3ff0fa42b3a76cf8727f9680943c53418b2b4afe`
-- Task implementation and report: `0310c3a0` (`feat(jsengine): add lazy native runtime loader`)
+- Task implementation commit: `41052437` (`feat(jsengine): add lazy native runtime loader`)
 
 ## Concerns
 
