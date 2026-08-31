@@ -14,6 +14,7 @@ typedef struct sc_native_state {
     sc_platform_library library;
     const sc_runtime_plugin_v1 *plugin;
     uint64_t runtime_count;
+    sc_host_ctx_t host_ctx;
 } sc_native_state;
 
 static uint64_t resident_count = 0;
@@ -146,21 +147,42 @@ int sc_native_query(uint64_t library, uint32_t runtime_major, uint32_t runtime_m
     return SC_NATIVE_OK;
 }
 
-static sc_status_t SC_CALL host_unavailable(void) { return SC_ENOTSUP; }
-static sc_status_t SC_CALL host_get(sc_host_ctx_t c, sc_runtime_t r, sc_host_ref_t h, sc_string_view k, sc_value_t *o) { (void)c;(void)r;(void)h;(void)k;(void)o; return host_unavailable(); }
-static sc_status_t SC_CALL host_set(sc_host_ctx_t c, sc_runtime_t r, sc_host_ref_t h, sc_string_view k, sc_value_t v) { (void)c;(void)r;(void)h;(void)k;(void)v; return host_unavailable(); }
-static sc_status_t SC_CALL host_has(sc_host_ctx_t c, sc_host_ref_t h, sc_string_view k, uint32_t *o) { (void)c;(void)h;(void)k;(void)o; return host_unavailable(); }
-static sc_status_t SC_CALL host_delete(sc_host_ctx_t c, sc_host_ref_t h, sc_string_view k, uint32_t *o) { (void)c;(void)h;(void)k;(void)o; return host_unavailable(); }
-static sc_status_t SC_CALL host_keys(sc_host_ctx_t c, sc_runtime_t r, char *b, uint64_t n, uint64_t *o) { (void)c;(void)r;(void)b;(void)n;(void)o; return host_unavailable(); }
-static sc_status_t SC_CALL host_call(sc_host_ctx_t c, sc_runtime_t r, sc_host_func_t f, sc_value_t t, const sc_value_t *a, uint64_t n, sc_value_t *o) { (void)c;(void)r;(void)f;(void)t;(void)a;(void)n;(void)o; return host_unavailable(); }
-static sc_status_t SC_CALL host_last(sc_host_ctx_t c, char *b, uint64_t n, uint64_t *o) { (void)c;(void)b;(void)n;(void)o; return host_unavailable(); }
+extern sc_status_t SC_CALL sc_native_go_host_get(sc_host_ctx_t, sc_runtime_t, sc_host_ref_t, sc_string_view, sc_value_t *);
+extern sc_status_t SC_CALL sc_native_go_host_set(sc_host_ctx_t, sc_runtime_t, sc_host_ref_t, sc_string_view, sc_value_t);
+extern sc_status_t SC_CALL sc_native_go_host_has(sc_host_ctx_t, sc_host_ref_t, sc_string_view, uint32_t *);
+extern sc_status_t SC_CALL sc_native_go_host_delete(sc_host_ctx_t, sc_host_ref_t, sc_string_view, uint32_t *);
+extern sc_status_t SC_CALL sc_native_go_host_keys(sc_host_ctx_t, sc_host_ref_t, char *, uint64_t, uint64_t *);
+extern sc_status_t SC_CALL sc_native_go_host_call(sc_host_ctx_t, sc_runtime_t, sc_host_func_t, sc_value_t, const sc_value_t *, uint64_t, sc_value_t *);
+extern sc_status_t SC_CALL sc_native_go_host_last(sc_host_ctx_t, char *, uint64_t, uint64_t *);
+
+static sc_status_t SC_CALL host_get(sc_host_ctx_t c, sc_runtime_t r, sc_host_ref_t h, sc_string_view k, sc_value_t *o) {
+    return sc_native_go_host_get(c, r, h, k, o);
+}
+static sc_status_t SC_CALL host_set(sc_host_ctx_t c, sc_runtime_t r, sc_host_ref_t h, sc_string_view k, sc_value_t v) {
+    return sc_native_go_host_set(c, r, h, k, v);
+}
+static sc_status_t SC_CALL host_has(sc_host_ctx_t c, sc_host_ref_t h, sc_string_view k, uint32_t *o) {
+    return sc_native_go_host_has(c, h, k, o);
+}
+static sc_status_t SC_CALL host_delete(sc_host_ctx_t c, sc_host_ref_t h, sc_string_view k, uint32_t *o) {
+    return sc_native_go_host_delete(c, h, k, o);
+}
+static sc_status_t SC_CALL host_keys(sc_host_ctx_t c, sc_host_ref_t h, char *b, uint64_t n, uint64_t *o) {
+    return sc_native_go_host_keys(c, h, b, n, o);
+}
+static sc_status_t SC_CALL host_call(sc_host_ctx_t c, sc_runtime_t r, sc_host_func_t f, sc_value_t t, const sc_value_t *a, uint64_t n, sc_value_t *o) {
+    return sc_native_go_host_call(c, r, f, t, a, n, o);
+}
+static sc_status_t SC_CALL host_last(sc_host_ctx_t c, char *b, uint64_t n, uint64_t *o) {
+    return sc_native_go_host_last(c, b, n, o);
+}
 
 static const sc_host_api_v1 host_api = {
     sizeof(sc_host_api_v1), SC_HOST_ABI_MAJOR, SC_HOST_ABI_MINOR,
     host_get, host_set, host_has, host_delete, host_keys, host_call, host_last
 };
 
-int sc_native_create(uint64_t library, const char *options, uint64_t options_len,
+int sc_native_create(uint64_t library, uint64_t host_ctx, const char *options, uint64_t options_len,
                      uint64_t *out_runtime, char *error, uint64_t capacity) {
     sc_native_state *state = state_from_id(library);
     sc_runtime_create_info_v1 info;
@@ -176,12 +198,13 @@ int sc_native_create(uint64_t library, const char *options, uint64_t options_len
     memset(&info, 0, sizeof(info));
     info.struct_size = (uint32_t)sizeof(info);
     info.options_json = options_view;
-    status = state->plugin->api.create(&host_api, 0, &info, &runtime);
+    status = state->plugin->api.create(&host_api, (sc_host_ctx_t)host_ctx, &info, &runtime);
     if (status != SC_OK) {
         set_error(error, capacity, "runtime create failed");
         return SC_NATIVE_CREATE;
     }
     state->runtime_count++;
+    state->host_ctx = (sc_host_ctx_t)host_ctx;
     *out_runtime = runtime;
     return SC_NATIVE_OK;
 }
@@ -189,18 +212,30 @@ int sc_native_create(uint64_t library, const char *options, uint64_t options_len
 int sc_native_start(uint64_t library, uint64_t runtime, char *error, uint64_t capacity) {
     sc_native_state *state = state_from_id(library);
     sc_status_t status;
-    if (state == NULL || state->plugin == NULL) return SC_NATIVE_INTERNAL;
+    if (state == NULL || state->plugin == NULL) {
+        set_error(error, capacity, "invalid native library handle");
+        return SC_NATIVE_INTERNAL;
+    }
     status = state->plugin->api.start((sc_runtime_t)runtime);
-    if (status != SC_OK) { set_error(error, capacity, "runtime start failed"); return SC_NATIVE_CREATE; }
+    if (status != SC_OK) {
+        set_error(error, capacity, "runtime start failed");
+        return (int)status;
+    }
     return SC_NATIVE_OK;
 }
 
 int sc_native_stop(uint64_t library, uint64_t runtime, char *error, uint64_t capacity) {
     sc_native_state *state = state_from_id(library);
     sc_status_t status;
-    if (state == NULL || state->plugin == NULL) return SC_NATIVE_INTERNAL;
+    if (state == NULL || state->plugin == NULL) {
+        set_error(error, capacity, "invalid native library handle");
+        return SC_NATIVE_INTERNAL;
+    }
     status = state->plugin->api.stop((sc_runtime_t)runtime);
-    if (status != SC_OK) { set_error(error, capacity, "runtime stop failed"); return SC_NATIVE_CREATE; }
+    if (status != SC_OK) {
+        set_error(error, capacity, "runtime stop failed");
+        return (int)status;
+    }
     return SC_NATIVE_OK;
 }
 
@@ -216,4 +251,303 @@ int sc_native_destroy(uint64_t library, uint64_t runtime, char *error, uint64_t 
 uint64_t sc_native_resident_count(void) {
     /* There is deliberately no close entry point in v1. */
     return resident_count;
+}
+static sc_native_state *checked_state(uint64_t library, char *error, uint64_t capacity) {
+    sc_native_state *state = state_from_id(library);
+    if (state == NULL || state->plugin == NULL) {
+        set_error(error, capacity, "invalid native library handle");
+        return NULL;
+    }
+    return state;
+}
+
+static int operation_status(sc_native_state *state, sc_runtime_t runtime,
+                            sc_status_t status, char *error, uint64_t capacity) {
+    uint64_t required = 0;
+    if (status == SC_OK) return SC_NATIVE_OK;
+    if (status == SC_EHOST && state != NULL && state->host_ctx != 0 &&
+        host_api.last_error_copy != NULL &&
+        host_api.last_error_copy(state->host_ctx, error, capacity, &required) == SC_OK) {
+        return (int)status;
+    }
+    if (state != NULL && state->plugin != NULL && runtime != 0 &&
+        state->plugin->api.last_error_copy != NULL &&
+        state->plugin->api.last_error_copy(runtime, error, capacity, &required) == SC_OK) {
+        return (int)status;
+    }
+    set_error(error, capacity, "native runtime operation failed");
+    return (int)status;
+}
+
+int sc_native_eval(uint64_t library, uint64_t runtime, const char *filename, uint64_t filename_len,
+                   const char *source, uint64_t source_len, uint64_t *out,
+                   char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    sc_string_view filename_view = {filename, filename_len};
+    sc_string_view source_view = {source, source_len};
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.eval((sc_runtime_t)runtime, filename_view, source_view, (sc_value_t *)out),
+        error, capacity);
+}
+
+int sc_native_load_entry(uint64_t library, uint64_t runtime, uint32_t kind,
+                         const char *filename, uint64_t filename_len,
+                         const char *source, uint64_t source_len, uint64_t *out,
+                         char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    sc_string_view filename_view = {filename, filename_len};
+    sc_string_view source_view = {source, source_len};
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.load_entry((sc_runtime_t)runtime, kind, filename_view, source_view,
+            (sc_value_t *)out), error, capacity);
+}
+
+int sc_native_global_get(uint64_t library, uint64_t runtime, const char *name, uint64_t name_len,
+                         uint64_t *out, char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    sc_string_view name_view = {name, name_len};
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.global_get((sc_runtime_t)runtime, name_view, (sc_value_t *)out),
+        error, capacity);
+}
+
+int sc_native_global_set(uint64_t library, uint64_t runtime, const char *name, uint64_t name_len,
+                         uint64_t value, char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    sc_string_view name_view = {name, name_len};
+    if (state == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.global_set((sc_runtime_t)runtime, name_view, (sc_value_t)value),
+        error, capacity);
+}
+
+int sc_native_object_new(uint64_t library, uint64_t runtime, uint64_t *out,
+                         char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.object_new((sc_runtime_t)runtime, (sc_value_t *)out),
+        error, capacity);
+}
+
+int sc_native_object_get(uint64_t library, uint64_t runtime, uint64_t object,
+                         const char *key, uint64_t key_len, uint64_t *out,
+                         char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    sc_string_view key_view = {key, key_len};
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.object_get((sc_runtime_t)runtime, (sc_value_t)object, key_view,
+            (sc_value_t *)out), error, capacity);
+}
+
+int sc_native_object_set(uint64_t library, uint64_t runtime, uint64_t object,
+                         const char *key, uint64_t key_len, uint64_t value,
+                         char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    sc_string_view key_view = {key, key_len};
+    if (state == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.object_set((sc_runtime_t)runtime, (sc_value_t)object, key_view,
+            (sc_value_t)value), error, capacity);
+}
+
+int sc_native_object_has(uint64_t library, uint64_t runtime, uint64_t object,
+                         const char *key, uint64_t key_len, uint32_t *out,
+                         char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    sc_string_view key_view = {key, key_len};
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.object_has((sc_runtime_t)runtime, (sc_value_t)object, key_view, out),
+        error, capacity);
+}
+
+int sc_native_value_new_undefined(uint64_t library, uint64_t runtime, uint64_t *out,
+                                  char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.value_new_undefined((sc_runtime_t)runtime, (sc_value_t *)out),
+        error, capacity);
+}
+
+int sc_native_value_new_null(uint64_t library, uint64_t runtime, uint64_t *out,
+                             char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.value_new_null((sc_runtime_t)runtime, (sc_value_t *)out),
+        error, capacity);
+}
+
+int sc_native_value_new_bool(uint64_t library, uint64_t runtime, uint32_t value,
+                             uint64_t *out, char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.value_new_bool((sc_runtime_t)runtime, value, (sc_value_t *)out),
+        error, capacity);
+}
+
+int sc_native_value_new_i64(uint64_t library, uint64_t runtime, int64_t value,
+                            uint64_t *out, char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.value_new_i64((sc_runtime_t)runtime, value, (sc_value_t *)out),
+        error, capacity);
+}
+
+int sc_native_value_new_u64(uint64_t library, uint64_t runtime, uint64_t value,
+                            uint64_t *out, char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.value_new_u64((sc_runtime_t)runtime, value, (sc_value_t *)out),
+        error, capacity);
+}
+
+int sc_native_value_new_f64(uint64_t library, uint64_t runtime, double value,
+                            uint64_t *out, char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.value_new_f64((sc_runtime_t)runtime, value, (sc_value_t *)out),
+        error, capacity);
+}
+
+int sc_native_value_new_string(uint64_t library, uint64_t runtime, const char *value,
+                               uint64_t value_len, uint64_t *out, char *error,
+                               uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    sc_string_view value_view = {value, value_len};
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.value_new_string((sc_runtime_t)runtime, value_view, (sc_value_t *)out),
+        error, capacity);
+}
+
+int sc_native_value_type(uint64_t library, uint64_t runtime, uint64_t value, uint32_t *out,
+                         char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.value_type((sc_runtime_t)runtime, (sc_value_t)value, out),
+        error, capacity);
+}
+
+int sc_native_value_to_bool(uint64_t library, uint64_t runtime, uint64_t value, uint32_t *out,
+                            char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.value_to_bool((sc_runtime_t)runtime, (sc_value_t)value, out),
+        error, capacity);
+}
+
+int sc_native_value_to_i64(uint64_t library, uint64_t runtime, uint64_t value, int64_t *out,
+                           char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.value_to_i64((sc_runtime_t)runtime, (sc_value_t)value, out),
+        error, capacity);
+}
+
+int sc_native_value_to_u64(uint64_t library, uint64_t runtime, uint64_t value, uint64_t *out,
+                           char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.value_to_u64((sc_runtime_t)runtime, (sc_value_t)value, out),
+        error, capacity);
+}
+
+int sc_native_value_to_f64(uint64_t library, uint64_t runtime, uint64_t value, double *out,
+                           char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.value_to_f64((sc_runtime_t)runtime, (sc_value_t)value, out),
+        error, capacity);
+}
+
+int sc_native_value_to_utf8_copy(uint64_t library, uint64_t runtime, uint64_t value,
+                                char *buffer, uint64_t buffer_capacity, uint64_t *required,
+                                char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || required == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.value_to_utf8_copy((sc_runtime_t)runtime, (sc_value_t)value,
+            buffer, buffer_capacity, required), error, capacity);
+}
+
+int sc_native_value_get_host_ref(uint64_t library, uint64_t runtime, uint64_t value,
+                                 uint64_t *host_ref, uint32_t *host_kind,
+                                 char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || host_ref == NULL || host_kind == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.value_get_host_ref((sc_runtime_t)runtime, (sc_value_t)value,
+            (sc_host_ref_t *)host_ref, host_kind), error, capacity);
+}
+
+int sc_native_host_object_new(uint64_t library, uint64_t runtime, uint64_t host_ref,
+                              uint32_t host_kind, uint64_t *out, char *error,
+                              uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.host_object_new((sc_runtime_t)runtime, (sc_host_ref_t)host_ref,
+            host_kind, (sc_value_t *)out), error, capacity);
+}
+
+int sc_native_host_function_new(uint64_t library, uint64_t runtime, uint64_t host_function,
+                                uint64_t *out, char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.host_function_new((sc_runtime_t)runtime,
+            (sc_host_func_t)host_function, (sc_value_t *)out), error, capacity);
+}
+
+int sc_native_function_call(uint64_t library, uint64_t runtime, uint64_t function,
+                            uint64_t this_value, const uint64_t *argv, uint64_t argc,
+                            uint64_t *out, char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || out == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.function_call((sc_runtime_t)runtime, (sc_value_t)function,
+            (sc_value_t)this_value, (const sc_value_t *)argv, argc, (sc_value_t *)out),
+        error, capacity);
+}
+
+int sc_native_value_retain(uint64_t library, uint64_t runtime, uint64_t value,
+                           char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.value_retain((sc_runtime_t)runtime, (sc_value_t)value),
+        error, capacity);
+}
+
+void sc_native_value_release(uint64_t library, uint64_t runtime, uint64_t value) {
+    sc_native_state *state = state_from_id(library);
+    if (state != NULL && state->plugin != NULL && runtime != 0 && value != 0) {
+        state->plugin->api.value_release((sc_runtime_t)runtime, (sc_value_t)value);
+    }
+}
+
+int sc_native_last_error_copy(uint64_t library, uint64_t runtime, char *buffer,
+                              uint64_t buffer_capacity, uint64_t *required,
+                              char *error, uint64_t capacity) {
+    sc_native_state *state = checked_state(library, error, capacity);
+    if (state == NULL || required == NULL) return SC_NATIVE_INTERNAL;
+    return operation_status(state, (sc_runtime_t)runtime,
+        state->plugin->api.last_error_copy((sc_runtime_t)runtime, buffer, buffer_capacity,
+            required), error, capacity);
 }

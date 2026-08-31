@@ -4,20 +4,24 @@ import "errors"
 
 var (
 	// Stable categories are intentionally independent of platform loader text.
-	ErrMissingLibrary          = errors.New("native runtime library missing")
-	ErrMissingQuerySymbol      = errors.New("native runtime query symbol missing")
-	ErrRuntimeABIMismatch      = errors.New("native runtime ABI mismatch")
-	ErrHostABIMismatch         = errors.New("native host ABI mismatch")
-	ErrManifestIDVersionMismatch = errors.New("native manifest id/version mismatch")
+	ErrMissingLibrary              = errors.New("native runtime library missing")
+	ErrMissingQuerySymbol          = errors.New("native runtime query symbol missing")
+	ErrRuntimeABIMismatch          = errors.New("native runtime ABI mismatch")
+	ErrHostABIMismatch             = errors.New("native host ABI mismatch")
+	ErrManifestIDVersionMismatch   = errors.New("native manifest id/version mismatch")
 	ErrDescriptorIDVersionMismatch = errors.New("native descriptor id/version mismatch")
-	ErrManifestMismatch        = ErrManifestIDVersionMismatch
-	ErrDescriptorMismatch      = ErrDescriptorIDVersionMismatch
-	ErrUnsupportedArchitecture = errors.New("native runtime architecture unsupported")
-	ErrPluginCreateFailure     = errors.New("native runtime create failed")
-	ErrCorruptVTable           = errors.New("native runtime corrupt vtable")
-	ErrTooSmallStruct          = errors.New("native runtime struct too small")
-	ErrNativeUnavailable       = errors.New("native runtime unavailable")
-	// ErrNativeRuntimeUnsupported indicates that native runtimes cannot be loaded
-	// in this build because cgo support is unavailable.
-	ErrNativeRuntimeUnsupported = errors.New("native runtime unsupported without cgo")
+	ErrManifestMismatch            = ErrManifestIDVersionMismatch
+	ErrDescriptorMismatch          = ErrDescriptorIDVersionMismatch
+	ErrUnsupportedArchitecture     = errors.New("native runtime architecture unsupported")
+	ErrPluginCreateFailure         = errors.New("native runtime create failed")
+	ErrCorruptVTable               = errors.New("native runtime corrupt vtable")
+	ErrTooSmallStruct              = errors.New("native runtime struct too small")
+	ErrNativeUnavailable           = errors.New("native runtime unavailable")
+	ErrNativeClosed                = errors.New("native runtime closed")
+	ErrNativeRuntimeClosed         = ErrNativeClosed
+	ErrNativeStaleValue            = errors.New("native stale value")
+	ErrNativeTimeout               = errors.New("native runtime timeout")
+	ErrNativeException             = errors.New("native runtime exception")
+	ErrNativeHost                  = errors.New("native host callback failed")
+	ErrNativeRuntimeUnsupported    = errors.New("native runtime unsupported without cgo")
 )

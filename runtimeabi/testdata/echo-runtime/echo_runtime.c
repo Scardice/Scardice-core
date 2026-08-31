@@ -305,12 +305,12 @@ static sc_status_t SC_CALL echo_eval(sc_runtime_t runtime, sc_string_view filena
 static sc_status_t SC_CALL echo_load_entry(sc_runtime_t runtime, uint32_t entry_kind,
                                            sc_string_view filename, sc_string_view source,
                                            sc_value_t *out) {
-    (void)runtime;
-    (void)entry_kind;
-    (void)filename;
-    (void)source;
-    (void)out;
-    return echo_error("load_entry is not supported by echo runtime", SC_ENOTSUP);
+    if (entry_kind > 3U || filename.data == NULL || source.data == NULL || out == NULL) {
+        return echo_error("invalid load entry arguments", SC_EINVAL);
+    }
+    /* The fixture has one executable grammar; preserving the kind and
+       filename through this ABI call is the behavior under test. */
+    return echo_eval(runtime, filename, source, out);
 }
 
 static sc_status_t SC_CALL echo_global_get(sc_runtime_t runtime, sc_string_view name,
