@@ -70,6 +70,22 @@ func TestMissingQuerySymbolIsDiagnosable(t *testing.T) {
 		t.Fatalf("Load() error = %v, want ErrMissingQuerySymbol", err)
 	}
 }
+func TestRepeatedLoadKeepsTransientPathOwnershipBounded(t *testing.T) {
+	library := os.Getenv("SCARDICE_ECHO_RUNTIME")
+	if library == "" {
+		t.Skip("SCARDICE_ECHO_RUNTIME is not set")
+	}
+	candidate := Candidate{LibraryPath: library, Manifest: Manifest{
+		Schema: 1, ID: "echo-runtime", Name: "Echo Runtime", Version: "1.0.0", Language: "javascript",
+		RuntimeABI: ABIRequirement{Major: 1}, HostABI: ABIRequirement{Major: 1},
+	}}
+	for i := 0; i < 8; i++ {
+		if _, err := candidate.Load(); err != nil {
+			t.Fatalf("Load() iteration %d error = %v", i, err)
+		}
+	}
+}
+
 
 func TestRegisterCandidatesKeepsCandidateMetadataSeparateFromBuiltin(t *testing.T) {
 	root := t.TempDir()

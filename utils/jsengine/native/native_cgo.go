@@ -44,6 +44,7 @@ func loadNative(candidate Candidate) (*Provider, error) {
 	}
 	candidate.LibraryPath = absolutePath
 	path := C.CString(absolutePath)
+	defer C.free(unsafe.Pointer(path))
 	errorBuffer := make([]byte, 512)
 	var library C.uint64_t
 	status := C.sc_native_open(path, &library, (*C.char)(unsafe.Pointer(&errorBuffer[0])), C.uint64_t(len(errorBuffer)))
