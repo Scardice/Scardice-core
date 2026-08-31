@@ -1381,7 +1381,7 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 					name = strings.ReplaceAll(name, "\n", "_")
 					// 情况2，名字是自己，没有加值
 					if !exprExists {
-						val = int64(ds.Roll(nil, 20, 0))
+						val = int64(mctx.Roll(20))
 					}
 					uid = mctx.Player.UserID
 					return 0, name, val, detail, uid
@@ -1394,7 +1394,7 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 					name = m[1]
 					text = text[len(m[0]):]
 					if !exprExists {
-						val = int64(ds.Roll(nil, 20, 0))
+						val = int64(mctx.Roll(20))
 					}
 				} else {
 					// 不知道是啥，报错

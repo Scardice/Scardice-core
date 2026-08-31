@@ -58,12 +58,12 @@ func cleanupExpiredDismissConfirmCodes() {
 	})
 }
 
-func generateFourDigitCode() string {
+func generateFourDigitCode() (string, error) {
 	n, err := crand.Int(crand.Reader, big.NewInt(9000))
 	if err != nil {
-		return strconv.FormatInt(time.Now().UnixNano()%9000+1000, 10)
+		return "", fmt.Errorf("generate confirmation code: %w", err)
 	}
-	return strconv.FormatInt(n.Int64()+1000, 10)
+	return strconv.FormatInt(n.Int64()+1000, 10), nil
 }
 
 func storeDismissConfirmCode(key string, code string) {
@@ -252,7 +252,12 @@ func (d *Dice) executeDismissWithConfirm(ctx *MsgContext, msg *Message, targetGr
 	processDismissConfirmation := func(roleDetail string, issueLogTpl string, issueReplyTpl string, successLogTpl string) CmdExecuteResult {
 		confirmKey := getDismissConfirmKeyForGroup(ctx, msg.Sender.UserID, targetGroupID)
 		if inputCode == "" || hasExtraArgs {
-			confirmCode := generateFourDigitCode()
+			confirmCode, err := generateFourDigitCode()
+			if err != nil {
+				d.Logger.Errorf("生成退群确认码失败: %v", err)
+				ReplyToSender(ctx, msg, "无法生成安全确认码，请稍后重试")
+				return CmdExecuteResult{Matched: true, Solved: true}
+			}
 			confirmCmdWithCode := fmt.Sprintf("%s %s", confirmCommand, confirmCode)
 			storeDismissConfirmCode(confirmKey, confirmCode)
 			d.Logger.Infof(issueLogTpl, targetGroupID, msg.Sender.UserID, ctx.EndPoint.UserID, roleDetail)
@@ -1300,8 +1305,15 @@ func (d *Dice) registerCoreCommands() {
 					if dm.AppVersionOnline != nil {
 						text = fmt.Sprintf("当前本地版本为: %s\n当前线上版本为: %s", VERSION.String(), dm.AppVersionOnline.VersionLatestDetail)
 						if dm.AppVersionCode != dm.AppVersionOnline.VersionLatestCode {
-							updateCode = generateFourDigitCode()
-							text += fmt.Sprintf("\n如需升级，请输入.master checkupdate %s 确认进行升级\n升级将花费约2分钟，升级失败可能导致进程关闭，建议在接触服务器情况下操作。\n当前进程启动时间: %s", updateCode, time.Unix(dm.AppBootTime, 0).Format("2006-01-02 15:04:05"))
+							code, err := generateFourDigitCode()
+							if err != nil {
+								updateCode = "0000"
+								d.Logger.Errorf("生成升级确认码失败: %v", err)
+								text += "\n无法生成安全确认码，请稍后重试"
+							} else {
+								updateCode = code
+								text += fmt.Sprintf("\n如需升级，请输入.master checkupdate %s 确认进行升级\n升级将花费约2分钟，升级失败可能导致进程关闭，建议在接触服务器情况下操作。\n当前进程启动时间: %s", updateCode, time.Unix(dm.AppBootTime, 0).Format("2006-01-02 15:04:05"))
+							}
 						}
 					} else {
 						text = fmt.Sprintf("当前本地版本为: %s\n当前线上版本为: %s", VERSION.String(), "未知")
@@ -1349,8 +1361,15 @@ func (d *Dice) registerCoreCommands() {
 
 				code := cmdArgs.GetArgN(2)
 				if code == "" {
-					updateCode = generateFourDigitCode()
-					text := fmt.Sprintf("进程重启:\n如需重启，请输入.master reboot %s 确认进行重启\n重启将花费约2分钟，失败可能导致进程关闭，建议在接触服务器情况下操作。\n当前进程启动时间: %s", updateCode, time.Unix(dm.AppBootTime, 0).Format("2006-01-02 15:04:05"))
+					code, err := generateFourDigitCode()
+					if err != nil {
+						updateCode = "0000"
+						d.Logger.Errorf("生成重启确认码失败: %v", err)
+						ReplyToSender(ctx, msg, "无法生成安全确认码，请稍后重试")
+						break
+					}
+					updateCode = code
+					text := fmt.Sprintf("进程重启:\n如需重启，请输入.master reboot %s 确认进行重启\n升级将花费约2分钟，失败可能导致进程关闭，建议在接触服务器情况下操作。\n当前进程启动时间: %s", updateCode, time.Unix(dm.AppBootTime, 0).Format("2006-01-02 15:04:05"))
 					ReplyToSender(ctx, msg, text)
 					break
 				}
@@ -2139,20 +2158,30 @@ func (d *Dice) registerCoreCommands() {
 					ReplyToSender(ctx, msg, formatDiceRandomModeSetInvalidModeText(rawMode))
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-				if err := globalRandSource.InitError(mode); err != nil {
-					ReplyToSender(ctx, msg, formatDiceRandomModeSetUnavailableText(mode, err))
+				manager := ctx.Dice.Parent
+				if manager == nil {
+					ReplyToSender(ctx, msg, "随机模式配置不可用：DiceManager 未初始化")
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
+				effectiveMode, err := manager.SetDiceRandomMode(mode)
+				if err != nil {
+					if effectiveMode != "" && effectiveMode != mode {
+						ReplyToSender(ctx, msg, fmt.Sprintf("随机模式 %s 当前不可用，仍使用 %s: %v", mode, effectiveMode, err))
+					} else {
+						ReplyToSender(ctx, msg, formatDiceRandomModeSetUnavailableText(mode, err))
+					}
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 
-				ctx.Dice.Config.DiceRandomMode = string(mode)
-				_ = ctx.Dice.ActivateDiceRandomMode()
-				ctx.Dice.MarkModified()
-				ctx.Dice.Save(false)
+				manager.Save()
 				ReplyToSender(ctx, msg, formatDiceRandomModeSetSuccessText(mode))
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
 
-			mode := ctx.Dice.getDiceRandomMode()
+			mode := DiceRandomModePCG
+			if ctx.Dice.Parent != nil {
+				mode = ctx.Dice.Parent.GetDiceRandomMode()
+			}
 			ReplyToSender(ctx, msg, globalRandSource.ReportStatusText(mode))
 			return CmdExecuteResult{Matched: true, Solved: true}
 		},

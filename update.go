@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
@@ -141,7 +140,7 @@ func doReboot(dm *dice.DiceManager) {
 }
 
 func checkVersionBase(backendUrl string, dm *dice.DiceManager) *dice.VersionInfo {
-	resp, err := http.Get(backendUrl + "/dice/api/version?versionCode=" + strconv.FormatInt(dm.AppVersionCode, 10) + "&v=" + strconv.FormatInt(rand.Int63(), 10))
+	resp, err := http.Get(backendUrl + "/dice/api/version?versionCode=" + strconv.FormatInt(dm.AppVersionCode, 10) + "&v=" + strconv.FormatUint(dice.DiceRandUint64(), 10))
 	if err != nil {
 		// logger.Errorf("获取新版本失败: %s", err.Error())
 		return nil

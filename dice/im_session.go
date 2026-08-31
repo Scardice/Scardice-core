@@ -2183,7 +2183,7 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 				msgCtx.Notice(hint, NoticeTypeInactive)
 			}
 			// 生成一个随机值（8~11秒随机）
-			randomSleep := time.Duration(randv2.IntN(3000)+8000) * time.Millisecond
+			randomSleep := time.Duration(msgCtx.RandIntn(3000)+8000) * time.Millisecond
 			logger.M().Infof("退群等待，等待 %f 秒后继续", randomSleep.Seconds())
 			time.Sleep(randomSleep)
 		}

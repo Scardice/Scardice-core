@@ -251,13 +251,95 @@ func (g *GlobalRand) snapshotSources() (map[Mode]ds.DiceSource, map[Mode]error, 
 }
 
 func (g *GlobalRand) Uint64() uint64 {
-	g.mu.Lock()
-	_, src := g.currentSourceLocked()
-	g.mu.Unlock()
-	if src == nil {
-		panic("global random source owner has no active source")
+	for {
+		g.mu.Lock()
+		_, src := g.currentSourceLocked()
+		g.mu.Unlock()
+		if src == nil {
+			panic("global random source owner has no active source")
+		}
+
+		value := src.Uint64()
+		if checker, ok := src.(sourceAvailability); ok && !checker.Available() {
+			continue
+		}
+		return value
 	}
-	return src.Uint64()
+}
+func (g *GlobalRand) Uint64N(n uint64) uint64 {
+	if n == 0 {
+		panic("invalid bound")
+	}
+	if n&(n-1) == 0 {
+		return g.Uint64() & (n - 1)
+	}
+
+	threshold := -n % n
+	for {
+		value := g.Uint64()
+		if value >= threshold {
+			return value % n
+		}
+	}
+}
+
+func (g *GlobalRand) IntN(n int) int {
+	if n <= 0 {
+		panic("invalid bound")
+	}
+	return int(g.Uint64N(uint64(n)))
+}
+
+func (g *GlobalRand) Int63N(n int64) int64 {
+	if n <= 0 {
+		panic("invalid bound")
+	}
+	return int64(g.Uint64N(uint64(n)))
+}
+
+func (g *GlobalRand) Float64() float64 {
+	return float64(g.Uint64()>>11) / (1 << 53)
+}
+
+func (g *GlobalRand) String(n int, alphabet string) string {
+	if n < 0 {
+		panic("invalid length")
+	}
+	if n == 0 {
+		return ""
+	}
+	if len(alphabet) == 0 {
+		panic("empty alphabet")
+	}
+
+	result := make([]byte, n)
+	for i := range result {
+		result[i] = alphabet[g.Uint64N(uint64(len(alphabet)))]
+	}
+	return string(result)
+}
+
+func newReportSource(mode Mode, sources map[Mode]ds.DiceSource) (ds.DiceSource, error) {
+	if mode != ModeHybrid {
+		return NewSourceForMode(mode, nil)
+	}
+
+	available := make(map[Mode]ds.DiceSource, len(sources))
+	for _, baseMode := range HybridBaseModes() {
+		src := sources[baseMode]
+		if src == nil {
+			continue
+		}
+		if checker, ok := src.(sourceAvailability); ok && !checker.Available() {
+			continue
+		}
+		fresh, err := NewSourceForMode(baseMode, nil)
+		if err != nil {
+			return nil, err
+		}
+		available[baseMode] = fresh
+	}
+	return buildHybridSourceFromAvailable(available)
 }
 
 func (g *GlobalRand) ReportGetText(points int64) string {
@@ -282,8 +364,13 @@ func (g *GlobalRand) ReportGetText(points int64) string {
 			continue
 		}
 
+		reportSrc, err := newReportSource(mode, sources)
+		if err != nil {
+			lines = append(lines, fmt.Sprintf("%s: 不可用 (%v)", mode, err))
+			continue
+		}
 		start := time.Now()
-		value := ds.Roll(src, ds.IntType(points), 0)
+		value := ds.Roll(reportSrc, ds.IntType(points), 0)
 		elapsed := time.Since(start)
 		lines = append(lines, fmt.Sprintf("%s: 出目=%d 耗时=%s", mode, value, elapsed))
 	}
