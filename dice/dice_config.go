@@ -222,12 +222,21 @@ type BanConfig struct {
 }
 
 type JsConfig struct {
-	JsEnable               bool            `json:"jsEnable"                 yaml:"jsEnable"`
-	JsEngine               string          `json:"jsEngine"                 yaml:"jsEngine"` // goja | quickjs；空值兼容旧配置
-	QuickJSMemoryLimitMiB  uint64          `json:"quickJSMemoryLimitMiB"    yaml:"quickJSMemoryLimitMiB"`
-	QuickJSGCThresholdMiB  uint64          `json:"quickJSGCThresholdMiB"    yaml:"quickJSGCThresholdMiB"`
-	QuickJSMaxStackSizeKiB uint64          `json:"quickJSMaxStackSizeKiB"   yaml:"quickJSMaxStackSizeKiB"`
-	DisabledJsScripts      map[string]bool `json:"disabledJsScripts"        yaml:"disabledJsScripts"` // 作为set
+	JsEnable                       bool            `json:"jsEnable"                         yaml:"jsEnable"`
+	JsEngine                       string          `json:"jsEngine"                         yaml:"jsEngine"` // goja | quickjs；空值兼容旧配置
+	QuickJSMemoryLimitMiB          uint64          `json:"quickJSMemoryLimitMiB"            yaml:"quickJSMemoryLimitMiB"`
+	QuickJSGCThresholdMiB          uint64          `json:"quickJSGCThresholdMiB"            yaml:"quickJSGCThresholdMiB"`
+	QuickJSMaxStackSizeKiB         uint64          `json:"quickJSMaxStackSizeKiB"           yaml:"quickJSMaxStackSizeKiB"`
+	QuickJSExecuteTimeoutSeconds   uint64          `json:"quickJSExecuteTimeoutSeconds"     yaml:"quickJSExecuteTimeoutSeconds"`
+	QuickJSMaxFetchConcurrent      uint64          `json:"quickJSMaxFetchConcurrent"        yaml:"quickJSMaxFetchConcurrent"`
+	QuickJSMaxFetchResponseMiB     uint64          `json:"quickJSMaxFetchResponseMiB"       yaml:"quickJSMaxFetchResponseMiB"`
+	QuickJSMaxWebSocketConnections uint64          `json:"quickJSMaxWebSocketConnections"   yaml:"quickJSMaxWebSocketConnections"`
+	QuickJSMaxWebSocketMessageMiB  uint64          `json:"quickJSMaxWebSocketMessageMiB"    yaml:"quickJSMaxWebSocketMessageMiB"`
+	QuickJSMaxFilesystemReadMiB    uint64          `json:"quickJSMaxFilesystemReadMiB"      yaml:"quickJSMaxFilesystemReadMiB"`
+	QuickJSMaxFilesystemWriteMiB   uint64          `json:"quickJSMaxFilesystemWriteMiB"     yaml:"quickJSMaxFilesystemWriteMiB"`
+	QuickJSMaxPBKDF2Iterations     uint64          `json:"quickJSMaxPBKDF2Iterations"       yaml:"quickJSMaxPBKDF2Iterations"`
+	QuickJSMaxPBKDF2OutputBytes    uint64          `json:"quickJSMaxPBKDF2OutputBytes"      yaml:"quickJSMaxPBKDF2OutputBytes"`
+	DisabledJsScripts              map[string]bool `json:"disabledJsScripts"                yaml:"disabledJsScripts"` // 作为set
 }
 
 type StoryLogConfig struct {

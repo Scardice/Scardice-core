@@ -2,6 +2,9 @@ package dice
 
 import (
 	"testing"
+	"time"
+
+	nodelimits "github.com/Scardice/quickjs_nodejs/limits"
 
 	"Scardice-core/utils/jsengine"
 	quickjsadapter "Scardice-core/utils/jsengine/quickjs"
@@ -99,5 +102,34 @@ func TestQuickJSRuntimeLimitsKeepsGCBelowMemoryLimit(t *testing.T) {
 	}
 	if got.GCThreshold != 2*1024*1024 {
 		t.Fatalf("GCThreshold = %d, want %d", got.GCThreshold, 2*1024*1024)
+	}
+}
+
+func TestQuickJSNodeResourceLimitsConvertConfiguredUnits(t *testing.T) {
+	dice := &Dice{Config: Config{JsConfig: JsConfig{
+		QuickJSExecuteTimeoutSeconds:   3,
+		QuickJSMaxFetchConcurrent:      2,
+		QuickJSMaxFetchResponseMiB:     4,
+		QuickJSMaxWebSocketConnections: 5,
+		QuickJSMaxWebSocketMessageMiB:  6,
+		QuickJSMaxFilesystemReadMiB:    7,
+		QuickJSMaxFilesystemWriteMiB:   8,
+		QuickJSMaxPBKDF2Iterations:     9,
+		QuickJSMaxPBKDF2OutputBytes:    10,
+	}}}
+
+	want := nodelimits.Config{
+		ExecuteTimeout:           3 * time.Second,
+		MaxFetchConcurrent:       2,
+		MaxFetchResponseBytes:    4 * 1024 * 1024,
+		MaxWebSocketConnections:  5,
+		MaxWebSocketMessageBytes: 6 * 1024 * 1024,
+		MaxFilesystemReadBytes:   7 * 1024 * 1024,
+		MaxFilesystemWriteBytes:  8 * 1024 * 1024,
+		MaxPBKDF2Iterations:      9,
+		MaxPBKDF2OutputBytes:     10,
+	}
+	if got := dice.quickJSNodeResourceLimits(); got != want {
+		t.Fatalf("quickJSNodeResourceLimits() = %#v, want %#v", got, want)
 	}
 }

@@ -17,6 +17,7 @@ import (
 	nodeeventloop "github.com/Scardice/quickjs_nodejs/eventloop"
 	nodefetch "github.com/Scardice/quickjs_nodejs/fetch"
 	nodefs "github.com/Scardice/quickjs_nodejs/fs"
+	nodelimits "github.com/Scardice/quickjs_nodejs/limits"
 	nodemessagechannel "github.com/Scardice/quickjs_nodejs/messagechannel"
 	nodemodule "github.com/Scardice/quickjs_nodejs/module"
 	nodeprocess "github.com/Scardice/quickjs_nodejs/process"
@@ -241,18 +242,29 @@ func (d *Dice) isQuickJSFSDataPath(path string) bool {
 }
 
 func (d *Dice) newQuickJSNodeEnvironment(printer *PrinterFunc) (quickJSNodeEnvironment, error) {
+	resourceLimits, err := nodelimits.NewRuntime(d.quickJSNodeResourceLimits())
+	if err != nil {
+		return quickJSNodeEnvironment{}, err
+	}
 	environment := snapshotProcessEnv()
 	transport := proxyRoundTripper{handler: goproxy.NewProxyHttpServer()}
 	dialer := nodewebsocket.DialerFunc(func(ctx context.Context, target string, header http.Header) (nodewebsocket.Conn, *http.Response, error) {
 		return (&gorilla.Dialer{}).DialContext(ctx, target, header)
 	})
-	fetchOptions := []nodefetch.Option{nodefetch.WithTransport(transport)}
-	websocketOptions := []nodewebsocket.Option{nodewebsocket.WithDialer(dialer)}
+	fetchOptions := []nodefetch.Option{
+		nodefetch.WithTransport(transport),
+		nodefetch.WithResourceLimits(resourceLimits),
+	}
+	websocketOptions := []nodewebsocket.Option{
+		nodewebsocket.WithDialer(dialer),
+		nodewebsocket.WithResourceLimits(resourceLimits),
+	}
 
 	fsOptions, err := d.quickJSFSOptions()
 	if err != nil {
 		return quickJSNodeEnvironment{}, err
 	}
+	fsOptions = append(fsOptions, nodefs.WithResourceLimits(resourceLimits))
 
 	registry := nodemodule.NewRegistry()
 	for _, definition := range []nodemodule.Definition{
@@ -287,7 +299,9 @@ func (d *Dice) newQuickJSNodeEnvironment(printer *PrinterFunc) (quickJSNodeEnvir
 			return nodeprocess.InstallGlobal(ctx, nodeprocess.WithEnvSnapshot(environment))
 		},
 		nodeurl.InstallGlobal,
-		nodecrypto.InstallGlobal,
+		func(ctx *quickjs.Context) error {
+			return nodecrypto.InstallGlobal(ctx, nodecrypto.WithResourceLimits(resourceLimits))
+		},
 		nodeabort.InstallGlobal,
 		nodestructuredclone.InstallGlobal,
 		nodemessagechannel.InstallGlobal,

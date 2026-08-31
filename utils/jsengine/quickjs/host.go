@@ -90,8 +90,13 @@ func bindStructWithMode(ctx *quickjs.Context, target reflect.Value, dangerous bo
 		} else if name, ok := jsBindName(fieldDef); ok {
 			names = []string{name}
 		}
+		lock, err := jsBindLock(target, fieldDef)
+		if err != nil {
+			object.Free()
+			return nil, err
+		}
 		for _, name := range names {
-			if err := defineFieldWithMode(ctx, object, name, field, dangerous); err != nil {
+			if err := defineFieldWithMode(ctx, object, name, field, dangerous, lock); err != nil {
 				object.Free()
 				return nil, err
 			}
@@ -161,6 +166,23 @@ func jsBindName(field reflect.StructField) (string, bool) {
 	name := strings.Split(tag, ",")[0]
 	return name, isIdentifier(name)
 }
+
+func jsBindLock(target reflect.Value, field reflect.StructField) (*sync.RWMutex, error) {
+	name := field.Tag.Get("jsbindlock")
+	if name == "" {
+		return nil, nil
+	}
+	method := target.MethodByName(name)
+	if !method.IsValid() || method.Type().NumIn() != 0 || method.Type().NumOut() != 1 {
+		return nil, fmt.Errorf("invalid jsbindlock %q on %s", name, field.Name)
+	}
+	value := method.Call(nil)[0]
+	lock, ok := value.Interface().(*sync.RWMutex)
+	if !ok || lock == nil {
+		return nil, fmt.Errorf("jsbindlock %q on %s must return *sync.RWMutex", name, field.Name)
+	}
+	return lock, nil
+}
 func dangerousBindNames(field reflect.StructField) []string {
 	if field.PkgPath != "" || field.Name == "JsSealInstExposed" {
 		return nil
@@ -193,13 +215,24 @@ func defineField(ctx *quickjs.Context, object *quickjs.Value, name string, field
 	return defineFieldWithMode(ctx, object, name, field, false)
 }
 
-func defineFieldWithMode(ctx *quickjs.Context, object *quickjs.Value, name string, field reflect.Value, dangerous bool) error {
+func defineFieldWithMode(ctx *quickjs.Context, object *quickjs.Value, name string, field reflect.Value, dangerous bool, locks ...*sync.RWMutex) error {
+	var lock *sync.RWMutex
+	if len(locks) > 0 {
+		lock = locks[0]
+	}
 	getter := ctx.NewFunction(func(ctx *quickjs.Context, _ *quickjs.Value, _ []*quickjs.Value) *quickjs.Value {
+		if lock != nil && field.Kind() == reflect.Map {
+			return mapProxyWithModeAndLock(ctx, field, dangerous, lock)
+		}
 		return toJSWithMode(ctx, field, dangerous)
 	})
 	setter := ctx.NewFunction(func(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
 		if len(args) != 1 {
 			return ctx.ThrowTypeError("%s requires one value", name)
+		}
+		if lock != nil {
+			lock.Lock()
+			defer lock.Unlock()
 		}
 		if err := assignJS(field, args[0]); err != nil {
 			return ctx.ThrowTypeError("%s: %v", name, err)
@@ -411,6 +444,10 @@ func mapProxy(ctx *quickjs.Context, source reflect.Value) *quickjs.Value {
 }
 
 func mapProxyWithMode(ctx *quickjs.Context, source reflect.Value, dangerous bool) *quickjs.Value {
+	return mapProxyWithModeAndLock(ctx, source, dangerous, nil)
+}
+
+func mapProxyWithModeAndLock(ctx *quickjs.Context, source reflect.Value, dangerous bool, lock *sync.RWMutex) *quickjs.Value {
 	target := ctx.NewObject()
 	handler := ctx.NewObject()
 	if target == nil || handler == nil {
@@ -429,6 +466,10 @@ func mapProxyWithMode(ctx *quickjs.Context, source reflect.Value, dangerous bool
 		if len(args) < 2 || args[1].IsSymbol() {
 			return ctx.NewUndefined()
 		}
+		if lock != nil {
+			lock.RLock()
+			defer lock.RUnlock()
+		}
 		item := source.MapIndex(reflect.ValueOf(args[1].ToString()).Convert(source.Type().Key()))
 		if !item.IsValid() {
 			return ctx.NewUndefined()
@@ -444,6 +485,10 @@ func mapProxyWithMode(ctx *quickjs.Context, source reflect.Value, dangerous bool
 		if len(args) < 3 || args[1].IsSymbol() {
 			return ctx.NewBool(false)
 		}
+		if lock != nil {
+			lock.Lock()
+			defer lock.Unlock()
+		}
 		item, err := toGo(args[2], source.Type().Elem())
 		if err != nil {
 			return ctx.ThrowTypeError("map value: %v", err)
@@ -457,7 +502,28 @@ func mapProxyWithMode(ctx *quickjs.Context, source reflect.Value, dangerous bool
 		return ctx.NewUndefined()
 	}
 
+	deleteProperty := ctx.NewFunction(func(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
+		if len(args) < 2 || args[1].IsSymbol() {
+			return ctx.NewBool(false)
+		}
+		if lock != nil {
+			lock.Lock()
+			defer lock.Unlock()
+		}
+		key := reflect.ValueOf(args[1].ToString()).Convert(source.Type().Key())
+		source.SetMapIndex(key, reflect.Value{})
+		return ctx.NewBool(true)
+	})
+	defer deleteProperty.Free()
+	if err := setProperty(handler, "deleteProperty", deleteProperty); err != nil {
+		return ctx.NewUndefined()
+	}
+
 	ownKeys := ctx.NewFunction(func(ctx *quickjs.Context, _ *quickjs.Value, _ []*quickjs.Value) *quickjs.Value {
+		if lock != nil {
+			lock.RLock()
+			defer lock.RUnlock()
+		}
 		encoded, err := json.Marshal(mapKeys(source))
 		if err != nil {
 			return ctx.ThrowError(err)
@@ -472,6 +538,10 @@ func mapProxyWithMode(ctx *quickjs.Context, source reflect.Value, dangerous bool
 	descriptor := ctx.NewFunction(func(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
 		if len(args) < 2 || args[1].IsSymbol() {
 			return ctx.NewUndefined()
+		}
+		if lock != nil {
+			lock.RLock()
+			defer lock.RUnlock()
 		}
 		key := reflect.ValueOf(args[1].ToString()).Convert(source.Type().Key())
 		if !source.MapIndex(key).IsValid() {

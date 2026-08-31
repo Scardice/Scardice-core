@@ -3,17 +3,17 @@ package dice
 import (
 	"errors"
 	"fmt"
+	"github.com/dop251/goja"
+	"github.com/tidwall/buntdb"
+	"go.uber.org/zap"
 	"os"
 	"path"
 	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
-
-	"github.com/dop251/goja"
-	"github.com/tidwall/buntdb"
-	"go.uber.org/zap"
 
 	"Scardice-core/dice/events"
 	"Scardice-core/utils/jsengine"
@@ -272,6 +272,25 @@ func (i *ExtInfo) GetRealExt() *ExtInfo {
 	return nil // 找不到真实扩展
 }
 
+// CmdMapLock guards dynamic JavaScript command-map mutations.
+func (i *ExtInfo) CmdMapLock() *sync.RWMutex {
+	return &i.cmdMapMu
+}
+
+// CmdMapSnapshot returns a stable command-map view for concurrent command resolution.
+func (i *ExtInfo) CmdMapSnapshot() CmdMapCls {
+	if i == nil {
+		return CmdMapCls{}
+	}
+	i.cmdMapMu.RLock()
+	defer i.cmdMapMu.RUnlock()
+	result := make(CmdMapCls, len(i.CmdMap))
+	for name, command := range i.CmdMap {
+		result[name] = command
+	}
+	return result
+}
+
 // GetCmdMap 获取命令映射（处理 wrapper 代理）
 // 如果是 wrapper，返回真实扩展的 CmdMap
 // 如果正在重载或无法获取真实扩展，返回空 CmdMap
@@ -286,7 +305,7 @@ func (i *ExtInfo) GetCmdMap() CmdMapCls {
 	if ext == nil {
 		return CmdMapCls{}
 	}
-	return ext.CmdMap
+	return ext.CmdMapSnapshot()
 }
 
 type messagePreprocessAction int
