@@ -136,4 +136,4 @@ go test ./dice -run 'TestCallOnMessagePreprocessEngine(HonorsJsEnableForJSProvid
 ok      Scardice-core/dice    0.054s
 ```
 
-Follow-up changes are included in commit `FOLLOW_UP_HASH` (replace with the commit hash after committing).
+Follow-up changes are included in commit `a16a4696`.
