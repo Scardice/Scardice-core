@@ -117,6 +117,30 @@ func TestLoadRejectsManifestDescriptorIdentityMismatch(t *testing.T) {
 		t.Fatalf("Load() error = %v, want manifest and descriptor mismatch categories", err)
 	}
 }
+func TestCreateFailureRetainsDiagnosticCategory(t *testing.T) {
+	library := os.Getenv("SCARDICE_ECHO_RUNTIME")
+	if library == "" {
+		t.Skip("SCARDICE_ECHO_RUNTIME is not set")
+	}
+	candidate := Candidate{LibraryPath: library, Manifest: Manifest{
+		Schema: 1, ID: "echo-runtime", Name: "Echo Runtime", Version: "1.0.0", Language: "javascript",
+		RuntimeABI: ABIRequirement{Major: 1}, HostABI: ABIRequirement{Major: 1},
+	}}
+	provider, err := candidate.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := provider.Open(t.Context(), jsengine.RuntimeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	_, err = provider.Open(t.Context(), jsengine.RuntimeOptions{})
+	if !errors.Is(err, ErrPluginCreateFailure) {
+		t.Fatalf("second Open() error = %v, want ErrPluginCreateFailure", err)
+	}
+}
+
 func TestLoadEchoProviderDescriptorAndResidentLifecycle(t *testing.T) {
 	library := os.Getenv("SCARDICE_ECHO_RUNTIME")
 	if library == "" {
