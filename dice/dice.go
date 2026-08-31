@@ -71,11 +71,10 @@ type ExtInfo struct {
 	Version string   `jsbind:"version" json:"version" yaml:"-"`    // 版本
 	// 作者
 	// 更新时间
-	AutoActive      bool         `jsbind:"autoActive" json:"-" yaml:"-"`                     // 是否自动开启
-	CmdMap          CmdMapCls    `jsbind:"cmdMap" jsbindlock:"CmdMapLock" json:"-" yaml:"-"` // 指令集合
-	cmdMapMu        sync.RWMutex `json:"-" yaml:"-"`
-	Brief           string       `json:"-"            yaml:"-"`
-	ActiveOnPrivate bool         `json:"-"            yaml:"-"`
+	AutoActive      bool      `jsbind:"autoActive" json:"-" yaml:"-"` // 是否自动开启
+	CmdMap          CmdMapCls `jsbind:"cmdMap"     json:"-" yaml:"-"` // 指令集合
+	Brief           string    `json:"-"            yaml:"-"`
+	ActiveOnPrivate bool      `json:"-"            yaml:"-"`
 
 	DefaultSetting *ExtDefaultSettingItem `json:"-" yaml:"-"` // 默认配置
 
@@ -816,9 +815,8 @@ func (d *Dice) extFindPostProcess(ext *ExtInfo, fromJS bool) *ExtInfo {
 
 	if ext != nil && ext.Official && fromJS {
 		// return a copy of the official extension
-		sourceCmdMap := ext.CmdMapSnapshot()
-		cmdMap := make(CmdMapCls, len(sourceCmdMap))
-		for s2, info := range sourceCmdMap {
+		cmdMap := make(CmdMapCls, len(ext.CmdMap))
+		for s2, info := range ext.CmdMap {
 			cmdMap[s2] = &CmdItemInfo{
 				Name:                    info.Name,
 				ShortHelp:               info.ShortHelp,

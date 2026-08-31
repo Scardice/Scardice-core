@@ -113,7 +113,7 @@ require (
 	git.sr.ht/~jackmordaunt/go-toast v1.1.2 // indirect
 	github.com/HugoSmits86/nativewebp v1.2.0 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.14.5 // indirect
-	github.com/Scardice/quickjs_nodejs v0.0.0-20260831081333-e62627f19406
+	github.com/Scardice/quickjs_nodejs v0.0.0-20260830130520-cc1f00d58a48
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/bits-and-blooms/bitset v1.24.2 // indirect
 	github.com/bits-and-blooms/bloom/v3 v3.7.0 // indirect
