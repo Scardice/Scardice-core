@@ -53,7 +53,7 @@ ok  Scardice-core/utils/jsengine/native  1.010s
 ## Commits
 
 - `161865d6` — Implement native runtime adapter (native bridge, host callbacks, fixture, focused tests, and this report).
-- Follow-up contract compatibility commit is created with the three Loop contract files and this report.
+- `b2d48399` — Upgrade engine-neutral loop contract (runtime, Goja, and legacy QuickJS compatibility implementations).
 
 ## Lifecycle and residency
 
