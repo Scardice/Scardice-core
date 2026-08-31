@@ -53,7 +53,71 @@ ok  Scardice-core/dice/storylog  (cached)
 
 ### `go test -race ./...`
 
-观察到的工具汇总：`go test: 28 packages ok, 35 no tests`；退出码为 `0`，race 检测未报告问题。完整逐包输出记录在 `docs/runtime-abi/baseline.md` 的同名小节中。
+观察到的工具汇总：`go test: 28 packages ok, 35 no tests`；退出码为 `0`，race 检测未报告问题。原始逐包输出如下：
+
+```text
+ok  	Scardice-core	1.210s
+ok  	Scardice-core/api	(cached)
+ok  	Scardice-core/dice	(cached)
+ok  	Scardice-core/dice/censor	(cached)
+ok  	Scardice-core/dice/docengine	(cached)
+?   	Scardice-core/dice/events	[no test files]
+ok  	Scardice-core/dice/imsdk/onebot	(cached)
+?   	Scardice-core/dice/imsdk/onebot/schema	[no test files]
+?   	Scardice-core/dice/imsdk/onebot/types	[no test files]
+ok  	Scardice-core/dice/sealpack	(cached)
+ok  	Scardice-core/dice/service	(cached)
+ok  	Scardice-core/dice/storylog	(cached)
+?   	Scardice-core/icon	[no test files]
+ok  	Scardice-core/logger	(cached)
+ok  	Scardice-core/message	(cached)
+?   	Scardice-core/migrate	[no test files]
+ok  	Scardice-core/migrate/v2	(cached)
+?   	Scardice-core/migrate/v2/v120	[no test files]
+?   	Scardice-core/migrate/v2/v131	[no test files]
+?   	Scardice-core/migrate/v2/v141	[no test files]
+?   	Scardice-core/migrate/v2/v144	[no test files]
+?   	Scardice-core/migrate/v2/v150	[no test files]
+?   	Scardice-core/migrate/v2/v151	[no test files]
+?   	Scardice-core/migrate/v2/v162	[no test files]
+?   	Scardice-core/migrate/v2/v2test	[no test files]
+?   	Scardice-core/model	[no test files]
+?   	Scardice-core/scripts/randomness	[no test files]
+?   	Scardice-core/signature	[no test files]
+?   	Scardice-core/signature/gen	[no test files]
+?   	Scardice-core/static	[no test files]
+?   	Scardice-core/static/gen	[no test files]
+ok  	Scardice-core/utils	(cached)
+?   	Scardice-core/utils/constant	[no test files]
+?   	Scardice-core/utils/crypto	[no test files]
+?   	Scardice-core/utils/dboperator	[no test files]
+?   	Scardice-core/utils/dboperator/dbutil	[no test files]
+?   	Scardice-core/utils/dboperator/engine	[no test files]
+?   	Scardice-core/utils/dboperator/engine/mysql	[no test files]
+ok  	Scardice-core/utils/dboperator/engine/pgsql	(cached)
+ok  	Scardice-core/utils/dboperator/engine/sqlite	(cached)
+ok  	Scardice-core/utils/dboperator/schema	(cached)
+ok  	Scardice-core/utils/jsengine	(cached)
+ok  	Scardice-core/utils/jsengine/goja	(cached)
+ok  	Scardice-core/utils/jsengine/quickjs	(cached)
+?   	Scardice-core/utils/oschecker	[no test files]
+?   	Scardice-core/utils/panicHandler	[no test files]
+?   	Scardice-core/utils/paniclog	[no test files]
+?   	Scardice-core/utils/plugin/abort	[no test files]
+ok  	Scardice-core/utils/plugin/crypto	(cached)
+ok  	Scardice-core/utils/plugin/httpextra	(cached)
+?   	Scardice-core/utils/plugin/structuredclone	[no test files]
+?   	Scardice-core/utils/plugin/utilinspect	[no test files]
+ok  	Scardice-core/utils/plugin/websocket	(cached)
+?   	Scardice-core/utils/procs	[no test files]
+?   	Scardice-core/utils/public_dice	[no test files]
+?   	Scardice-core/utils/random	(cached)
+?   	Scardice-core/utils/satori	[no test files]
+?   	Scardice-core/utils/spinner	[no test files]
+ok  	Scardice-core/utils/throttle	(cached)
+ok  	Scardice-core/utils/upgrader	(cached)
+ok  	Scardice-core/utils/upgrader/store	(cached)
+```
 
 ## 区分现状与未来失败
 
