@@ -165,12 +165,15 @@ static sc_status_t echo_property_set(echo_runtime *runtime, echo_property *prope
     }
     for (uint32_t i = 0; i < ECHO_MAX_PROPERTIES; ++i) {
         if (properties[i].used && echo_key_matches(properties[i].key, key)) {
-            echo_value *old = echo_value_lookup(runtime, properties[i].value);
-            if (old != NULL) {
-                echo_value_release_internal(runtime, properties[i].value);
+            if (properties[i].value == value) {
+                return SC_OK;
             }
             echo_value *entry = echo_value_lookup(runtime, value);
+            if (entry == NULL) {
+                return echo_error("invalid property value", SC_EINVAL);
+            }
             entry->refs++;
+            echo_value_release_internal(runtime, properties[i].value);
             properties[i].value = value;
             return SC_OK;
         }
