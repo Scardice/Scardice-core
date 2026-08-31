@@ -81,3 +81,60 @@ No formatter, linter, or project-wide test suite was run.
 - Candidate manifests intentionally retain discovery metadata only. Since native loading is out of scope for Phase 1, resolving a registered candidate returns an `ErrProviderNotFound`-wrapped diagnostic stating that the candidate is not loadable yet.
 - `Loop` and the legacy QuickJS implementation remain unchanged for compatibility and for later cutover work.
 - The user-modified `Scardice-ui` submodule and untracked `plan.md` remain untouched.
+
+## Review fixes
+
+The task review identified three issues; each was addressed with a test-first
+regression test:
+
+1. `TestRegistryManifestABIFieldsOverrideEmbeddedDescriptor` first failed with
+   the old merge behavior (the embedded descriptor ID won and the candidate
+   could not be found). Manifest-declared ID and ABI fields now override
+   embedded metadata when present, while unspecified fields remain available
+   from the embedded descriptor.
+2. `TestRegistryRejectsDuplicateCandidateAndBuiltinIDs` now requires the
+   diagnostic to contain `duplicate provider ID "native.runtime"` and
+   `duplicate provider ID "goja"`. Before the fix, the wrapped error only said
+   `duplicate provider: engine ID "native.runtime"`, so the focused test failed.
+3. `TestProviderRejectsUnsupportedOptionsWithoutDroppingThem` first failed to
+   compile because `RuntimeOptions` had no options payload. `RuntimeOptions`
+   now carries engine-neutral `json.RawMessage` in `OptionsJSON`; Goja accepts
+   nil/blank/`{}` and explicitly rejects non-empty or malformed options rather
+   than silently discarding them. `TestProviderAcceptsEmptyOptions` covers the
+   accepted empty forms.
+
+Review-fix red command and output:
+
+```text
+go test ./utils/jsengine -run 'TestRegistryRejectsDuplicateCandidateAndBuiltinIDs|TestRegistryManifestABIFieldsOverrideEmbeddedDescriptor' -count=1
+
+--- FAIL: TestRegistryRejectsDuplicateCandidateAndBuiltinIDs (0.00s)
+    registry_test.go:77: second RegisterCandidate() error = "duplicate provider: engine ID \"native.runtime\"", want normalized conflicting ID
+--- FAIL: TestRegistryManifestABIFieldsOverrideEmbeddedDescriptor (0.00s)
+    registry_test.go:166: Descriptor() did not find candidate
+FAIL
+```
+
+Options red command and output:
+
+```text
+go test ./utils/jsengine/builtin/goja -run 'TestProviderRejectsUnsupportedOptionsWithoutDroppingThem' -count=1
+
+utils/jsengine/builtin/goja/provider_test.go:52:3: unknown field OptionsJSON in struct literal of type jsengine.RuntimeOptions
+FAIL
+```
+
+Review-fix green command and output:
+
+```text
+go test ./utils/jsengine/... 
+
+ok  \tScardice-core/utils/jsengine\t0.023s
+ok  \tScardice-core/utils/jsengine/builtin/goja\t0.003s
+ok  \tScardice-core/utils/jsengine/goja\t0.002s
+ok  \tScardice-core/utils/jsengine/quickjs\t0.013s
+```
+
+Review-fix commit:
+
+- `f48682e5` — `fix(jsengine): tighten registry metadata and options`
