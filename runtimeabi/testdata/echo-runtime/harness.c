@@ -172,9 +172,10 @@ int main(int argc, char **argv) {
     STATUS(g_api->object_set(runtime, object, sv("name"), persistent), SC_OK,
            "object set retains value");
     g_api->value_release(runtime, persistent);
-    STATUS(g_api->object_has(runtime, object, sv("name"), (uint32_t *)&integer), SC_OK,
+    uint32_t object_has_name = 0;
+    STATUS(g_api->object_has(runtime, object, sv("name"), &object_has_name), SC_OK,
            "object has succeeds");
-    CHECK(integer == 1, "object has finds name");
+    CHECK(object_has_name == 1, "object has finds name");
     STATUS(g_api->object_get(runtime, object, sv("name"), &value), SC_OK, "object get succeeds");
     required = 0;
     STATUS(g_api->value_to_utf8_copy(runtime, value, NULL, 0, &required), SC_EINVAL,
