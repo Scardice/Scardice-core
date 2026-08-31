@@ -2186,6 +2186,12 @@ func (d *Dice) registerCoreCommands() {
 			return CmdExecuteResult{Matched: true, Solved: true}
 		},
 	}
+	d.CmdMap["rollshape"] = &CmdItemInfo{
+		Name:      "rollshape",
+		ShortHelp: ".rollshape // 查看当前生效范围和模式\n.rollshape set <模式> // 设置模式；群聊需管理员，私聊由发送者本人设置\n.rollshape off // 恢复 Raw / Uniform",
+		Help:      formatDiceRollShaperHelpText(),
+		Solve:     solveDiceRollShaper,
+	}
 
 	helpSet := ".set info// 查看当前面数设置\n" +
 		".set dnd/coc // 设置群内骰子面数为20/100，并自动开启对应扩展 \n" +

@@ -242,4 +242,4 @@ replace (
 	github.com/sacOO7/gowebsocket v0.0.0-20221109081133-70ac927be105 => github.com/fy0/GoWebsocket v0.0.0-20231128163937-aa5c110b25c6
 )
 
-replace github.com/sealdice/dicescript v0.0.0-20260103130502-bd5621347a4e => github.com/Scardice/dicescript v0.0.0-20260823043109-d47a01e66db9
+replace github.com/sealdice/dicescript v0.0.0-20260103130502-bd5621347a4e => github.com/Scardice/dicescript v0.0.0-20260831163208-8490f8ecba3a

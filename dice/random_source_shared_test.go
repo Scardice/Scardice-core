@@ -93,8 +93,11 @@ func TestGlobalRandSourceUsesSingleSharedOwner(t *testing.T) {
 	if got := ctx.getDiceSource(); got != globalRandSource {
 		t.Fatalf("getDiceSource() = %T, want globalRandSource", got)
 	}
-	if ctx._v1Rand != globalRandSource {
-		t.Fatalf("expected _v1Rand to cache globalRandSource")
+	if ctx._v1Rand != nil {
+		t.Fatalf("getDiceSource() changed _v1Rand to %T", ctx._v1Rand)
+	}
+	if got := ctx.getDiceRollSource(); got != globalRandSource {
+		t.Fatalf("getDiceRollSource() = %T, want globalRandSource", got)
 	}
 
 	if mode, err := globalRandSource.SetActive(DiceRandomModePCG); err != nil || mode != DiceRandomModePCG {
