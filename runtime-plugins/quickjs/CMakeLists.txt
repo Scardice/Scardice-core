@@ -52,4 +52,13 @@ if(SCARDICE_QUICKJS_BUILD_TESTS)
     target_link_libraries(scardice-runtime-quickjs-smoke PRIVATE ${CMAKE_DL_LIBS})
     add_test(NAME scardice-runtime-quickjs-smoke
         COMMAND scardice-runtime-quickjs-smoke $<TARGET_FILE:scardice-runtime-quickjs>)
+    add_executable(scardice-runtime-quickjs-options-smoke testdata/options_smoke.cpp)
+    target_compile_features(scardice-runtime-quickjs-options-smoke PRIVATE cxx_std_17)
+    target_include_directories(scardice-runtime-quickjs-options-smoke PRIVATE "${SCARDICE_RUNTIMEABI_INCLUDE}")
+    target_link_libraries(scardice-runtime-quickjs-options-smoke PRIVATE ${CMAKE_DL_LIBS})
+    foreach(option_case IN ITEMS malformed unknown out-of-range timeout memory stack full)
+        add_test(NAME scardice-runtime-quickjs-options-${option_case}
+            COMMAND scardice-runtime-quickjs-options-smoke $<TARGET_FILE:scardice-runtime-quickjs> ${option_case})
+        set_tests_properties(scardice-runtime-quickjs-options-${option_case} PROPERTIES TIMEOUT 5)
+    endforeach()
 endif()

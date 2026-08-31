@@ -55,6 +55,7 @@ static JSValue host_function_call(JSContext *, JSValueConst, int, JSValueConst *
 static char *module_normalize(JSContext *, const char *, const char *, void *);
 static JSModuleDef *module_loader(JSContext *, const char *, void *);
 static JSValue require_call(JSContext *, JSValueConst, int, JSValueConst *);
+static int runtime_interrupt(JSRuntime *, void *);
 
 static JSValue timer_set_timeout(JSContext *, JSValueConst, int, JSValueConst *);
 static JSValue timer_clear_timeout(JSContext *, JSValueConst, int, JSValueConst *);
@@ -165,6 +166,309 @@ static std::string join_module_name(const char *base_name, const char *name) {
     }
     return result;
 }
+constexpr size_t kMaxOptionsBytes = 64 * 1024;
+constexpr uint64_t kMaxMemoryBytes = UINT64_C(1) << 40;
+constexpr uint64_t kMaxStackBytes = UINT64_C(1) << 30;
+constexpr uint64_t kMaxTimeoutMillis = UINT64_C(24) * 60 * 60 * 1000;
+
+struct ParsedOptions {
+    uint64_t memory_limit = 0;
+    uint64_t gc_threshold = 0;
+    uint64_t stack_size = 0;
+    uint64_t timeout_millis = 0;
+};
+
+class OptionsParser {
+  public:
+    OptionsParser(const char *data, size_t length) : begin_(data), current_(data), end_(data + length) {}
+
+    bool parse(ParsedOptions *options, std::string *error) {
+        skip_space();
+        if (current_ == end_) {
+            return true;
+        }
+        if (!parse_top_object(options, error)) {
+            return false;
+        }
+        skip_space();
+        if (current_ != end_) {
+            return fail(error, "trailing runtime options");
+        }
+        return true;
+    }
+
+  private:
+    const char *begin_;
+    const char *current_;
+    const char *end_;
+
+    void skip_space() {
+        while (current_ != end_ && (*current_ == ' ' || *current_ == '\n' || *current_ == '\r' ||
+                                    *current_ == '\t')) {
+            ++current_;
+        }
+    }
+
+    bool fail(std::string *error, const char *message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        return false;
+    }
+
+    bool expect(char value, std::string *error) {
+        skip_space();
+        if (current_ == end_ || *current_ != value) {
+            return fail(error, "malformed runtime options");
+        }
+        ++current_;
+        return true;
+    }
+
+    bool parse_key(std::string *key, std::string *error) {
+        skip_space();
+        if (current_ == end_ || *current_ != '"') {
+            return fail(error, "runtime option key must be a string");
+        }
+        ++current_;
+        key->clear();
+        while (current_ != end_ && *current_ != '"') {
+            if (*current_ == '\\') {
+                return fail(error, "escaped runtime option keys are not supported");
+            }
+            if (static_cast<unsigned char>(*current_) < 0x20) {
+                return fail(error, "control character in runtime option key");
+            }
+            key->push_back(*current_++);
+        }
+        if (current_ == end_) {
+            return fail(error, "unterminated runtime option key");
+        }
+        ++current_;
+        return true;
+    }
+
+    bool parse_uint(uint64_t *value, std::string *error) {
+        skip_space();
+        if (current_ == end_ || *current_ < '0' || *current_ > '9') {
+            return fail(error, "runtime option must be an unsigned integer");
+        }
+        if (*current_ == '0' && current_ + 1 != end_ && current_[1] >= '0' && current_[1] <= '9') {
+            return fail(error, "leading zero in runtime option");
+        }
+        uint64_t result = 0;
+        while (current_ != end_ && *current_ >= '0' && *current_ <= '9') {
+            const uint64_t digit = static_cast<uint64_t>(*current_ - '0');
+            if (result > (std::numeric_limits<uint64_t>::max() - digit) / 10) {
+                return fail(error, "runtime option integer overflow");
+            }
+            result = result * 10 + digit;
+            ++current_;
+        }
+        *value = result;
+        return true;
+    }
+
+    bool parse_runtime_field(const std::string &key, ParsedOptions *options,
+                             std::unordered_set<std::string> *seen, std::string *error) {
+        if (seen->find(key) != seen->end()) {
+            return fail(error, "duplicate runtime option");
+        }
+        seen->insert(key);
+        uint64_t value = 0;
+        if (!parse_uint(&value, error)) {
+            return false;
+        }
+        if (key == "memoryLimitBytes") {
+            options->memory_limit = value;
+        } else if (key == "gcThresholdBytes") {
+            options->gc_threshold = value;
+        } else if (key == "maxStackSizeBytes") {
+            options->stack_size = value;
+        } else if (key == "executionTimeoutMillis") {
+            options->timeout_millis = value;
+        } else {
+            return fail(error, "unknown runtime option");
+        }
+        return true;
+    }
+
+    bool parse_runtime_object(ParsedOptions *options, std::string *error) {
+        if (!expect('{', error)) {
+            return false;
+        }
+        std::unordered_set<std::string> seen;
+        skip_space();
+        if (current_ != end_ && *current_ == '}') {
+            ++current_;
+            return true;
+        }
+        for (;;) {
+            std::string key;
+            if (!parse_key(&key, error) || !expect(':', error) ||
+                !parse_runtime_field(key, options, &seen, error)) {
+                return false;
+            }
+            skip_space();
+            if (current_ != end_ && *current_ == '}') {
+                ++current_;
+                return true;
+            }
+            if (!expect(',', error)) {
+                return false;
+            }
+        }
+    }
+
+    bool parse_policy_field(const std::string &service, const std::string &key,
+                            std::unordered_set<std::string> *seen, std::string *error) {
+        if (seen->find(key) != seen->end()) {
+            return fail(error, "duplicate service option");
+        }
+        const bool allowed =
+            (service == "fetch" && (key == "maxConcurrent" || key == "maxResponseBytes")) ||
+            (service == "websocket" && (key == "maxConnections" || key == "maxMessageBytes")) ||
+            (service == "filesystem" && (key == "maxReadBytes" || key == "maxWriteBytes")) ||
+            (service == "pbkdf2" && (key == "maxIterations" || key == "maxOutputBytes"));
+        if (!allowed) {
+            return fail(error, "unknown service option");
+        }
+        seen->insert(key);
+        uint64_t value = 0;
+        if (!parse_uint(&value, error)) {
+            return false;
+        }
+        if (value > kMaxMemoryBytes) {
+            return fail(error, "service option is out of range");
+        }
+        return true;
+    }
+
+    bool parse_policy_object(const std::string &service, std::string *error) {
+        if (!expect('{', error)) {
+            return false;
+        }
+        std::unordered_set<std::string> seen;
+        skip_space();
+        if (current_ != end_ && *current_ == '}') {
+            ++current_;
+            return true;
+        }
+        for (;;) {
+            std::string key;
+            if (!parse_key(&key, error) || !expect(':', error) ||
+                !parse_policy_field(service, key, &seen, error)) {
+                return false;
+            }
+            skip_space();
+            if (current_ != end_ && *current_ == '}') {
+                ++current_;
+                return true;
+            }
+            if (!expect(',', error)) {
+                return false;
+            }
+        }
+    }
+
+    bool parse_services_object(std::string *error) {
+        if (!expect('{', error)) {
+            return false;
+        }
+        std::unordered_set<std::string> seen;
+        skip_space();
+        if (current_ != end_ && *current_ == '}') {
+            ++current_;
+            return true;
+        }
+        for (;;) {
+            std::string key;
+            if (!parse_key(&key, error)) {
+                return false;
+            }
+            if (seen.find(key) != seen.end()) {
+                return fail(error, "duplicate service");
+            }
+            seen.insert(key);
+            if (key != "fetch" && key != "websocket" && key != "filesystem" && key != "pbkdf2") {
+                return fail(error, "unknown service option");
+            }
+            if (!expect(':', error) || !parse_policy_object(key, error)) {
+                return false;
+            }
+            skip_space();
+            if (current_ != end_ && *current_ == '}') {
+                ++current_;
+                return true;
+            }
+            if (!expect(',', error)) {
+                return false;
+            }
+        }
+    }
+
+    bool parse_top_object(ParsedOptions *options, std::string *error) {
+        if (!expect('{', error)) {
+            return false;
+        }
+        std::unordered_set<std::string> seen;
+        bool has_version = false;
+        skip_space();
+        if (current_ != end_ && *current_ == '}') {
+            ++current_;
+            return true;
+        }
+        for (;;) {
+            std::string key;
+            if (!parse_key(&key, error)) {
+                return false;
+            }
+            if (seen.find(key) != seen.end()) {
+                return fail(error, "duplicate top-level runtime option");
+            }
+            seen.insert(key);
+            if (key == "version") {
+                uint64_t version = 0;
+                if (!expect(':', error) || !parse_uint(&version, error)) {
+                    return false;
+                }
+                if (version != 1) {
+                    return fail(error, "unsupported runtime options version");
+                }
+                has_version = true;
+            } else if (key == "runtime") {
+                if (!expect(':', error) || !parse_runtime_object(options, error)) {
+                    return false;
+                }
+            } else if (key == "services") {
+                if (!expect(':', error) || !parse_services_object(error)) {
+                    return false;
+                }
+            } else {
+                return fail(error, "unknown top-level runtime option");
+            }
+            skip_space();
+            if (current_ != end_ && *current_ == '}') {
+                ++current_;
+                if (!has_version) {
+                    return fail(error, "runtime options version is required");
+                }
+                if (options->memory_limit > kMaxMemoryBytes || options->gc_threshold > kMaxMemoryBytes ||
+                    options->stack_size > kMaxStackBytes || options->timeout_millis > kMaxTimeoutMillis) {
+                    return fail(error, "runtime option is out of range");
+                }
+                if (options->memory_limit != 0 && options->gc_threshold > options->memory_limit) {
+                    return fail(error, "GC threshold exceeds memory limit");
+                }
+                return true;
+            }
+            if (!expect(',', error)) {
+                return false;
+            }
+        }
+    }
+};
+
 struct Runtime {
     struct Timer {
         uint64_t id = 0;
@@ -191,6 +495,9 @@ struct Runtime {
     std::map<std::string, JSValue> commonjs_cache;
     std::vector<Timer> timers;
     uint64_t next_timer_id = 1;
+    ParsedOptions options;
+    bool deadline_active = false;
+    std::chrono::steady_clock::time_point deadline;
 
     ~Runtime() { destroy(); }
 
@@ -198,6 +505,16 @@ struct Runtime {
         last_error.clear();
         pending_host_status = SC_OK;
     }
+    void begin_execution() {
+        if (options.timeout_millis == 0) {
+            deadline_active = false;
+            return;
+        }
+        deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(options.timeout_millis);
+        deadline_active = true;
+    }
+
+    void end_execution() { deadline_active = false; }
 
     sc_status_t fail(sc_status_t status, const char *message) noexcept {
         try {
@@ -390,9 +707,7 @@ struct Runtime {
         return output(value, out);
     }
 
-    JSValue to_js(sc_value_t handle) {
-        return duplicate(handle);
-    }
+    JSValue to_js(sc_value_t handle) { return duplicate(handle); }
 
     JSValue take_js(sc_value_t handle) {
         JSValue raw = duplicate(handle);
@@ -403,22 +718,45 @@ struct Runtime {
     }
 
     sc_status_t initialize(const sc_host_api_v1 *host_api, sc_host_ctx_t context_handle,
-                           sc_string_view options) {
+                           sc_string_view options_view) {
         if (host_api == nullptr || host_api->struct_size < sizeof(sc_host_api_v1) ||
             host_api->abi_major != SC_HOST_ABI_MAJOR || host_api->abi_minor > SC_HOST_ABI_MINOR) {
             return fail(SC_EABI, "unsupported host ABI");
         }
-        if (!view_valid(options)) {
+        if (!view_valid(options_view) ||
+            options_view.len > static_cast<uint64_t>(kMaxOptionsBytes)) {
             return fail(SC_EINVAL, "invalid runtime options");
+        }
+        ParsedOptions parsed_options;
+        std::string options_error;
+        try {
+            if (options_view.len != 0) {
+                OptionsParser parser(options_view.data, static_cast<size_t>(options_view.len));
+                if (!parser.parse(&parsed_options, &options_error)) {
+                    return fail_string(SC_EINVAL, "invalid runtime options: " + options_error);
+                }
+            }
+        } catch (const std::bad_alloc &) {
+            return fail(SC_EOOM, "parse runtime options");
         }
         host = host_api;
         host_ctx = context_handle;
+        options = parsed_options;
         owner = std::this_thread::get_id();
         js_runtime = JS_NewRuntime();
         if (js_runtime == nullptr) {
             return fail(SC_EOOM, "create QuickJS runtime");
         }
-        (void)options;
+        if (options.memory_limit != 0) {
+            JS_SetMemoryLimit(js_runtime, static_cast<size_t>(options.memory_limit));
+        }
+        if (options.gc_threshold != 0) {
+            JS_SetGCThreshold(js_runtime, static_cast<size_t>(options.gc_threshold));
+        }
+        if (options.stack_size != 0) {
+            JS_SetMaxStackSize(js_runtime, static_cast<size_t>(options.stack_size));
+        }
+        JS_SetInterruptHandler(js_runtime, runtime_interrupt, this);
         context = JS_NewContext(js_runtime);
         if (context == nullptr) {
             return fail(SC_EOOM, "create QuickJS context");
@@ -608,6 +946,9 @@ struct Runtime {
             JS_FreeValue(context, callback);
             if (JS_IsException(result)) {
                 capture_exception();
+                if (pending_host_status == SC_ETIMEOUT) {
+                    last_error = "QuickJS execution timeout";
+                }
                 pumping_events = false;
                 return pending_host_status != SC_OK ? pending_host_status : SC_EEXCEPTION;
             }
@@ -678,12 +1019,18 @@ struct Runtime {
             return status;
         }
         clear_error();
+        begin_execution();
         JSValue result = JS_Eval(context, source.c_str(), source.size(), filename.c_str(), flags);
         if (JS_IsException(result)) {
             capture_exception();
+            if (pending_host_status == SC_ETIMEOUT) {
+                last_error = "QuickJS execution timeout";
+            }
+            end_execution();
             return pending_host_status != SC_OK ? pending_host_status : SC_EEXCEPTION;
         }
         status = pump_events();
+        end_execution();
         if (status != SC_OK) {
             JS_FreeValue(context, result);
             return status;
@@ -2225,6 +2572,22 @@ static const sc_runtime_plugin_v1 kPlugin = {
     kApi,
 };
 
+
+static int runtime_interrupt(JSRuntime *, void *opaque) {
+    Runtime *runtime = static_cast<Runtime *>(opaque);
+    if (runtime == nullptr) {
+        return 0;
+    }
+    if (runtime->pending_host_status != SC_OK) {
+        return 1;
+    }
+    if (runtime->deadline_active && std::chrono::steady_clock::now() >= runtime->deadline) {
+        runtime->pending_host_status = SC_ETIMEOUT;
+        runtime->last_error = "QuickJS execution timeout";
+        return 1;
+    }
+    return 0;
+}
 
 } // namespace
 

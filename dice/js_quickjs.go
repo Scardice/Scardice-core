@@ -86,6 +86,10 @@ func (d *Dice) jsInitQuickJS() {
 		d.ExtLoopManager = NewJsLoopManager()
 	}
 	d.jsClear()
+	if _, err := d.quickJSRuntimeOptions(); err != nil {
+		d.disableQuickJS(err)
+		return
+	}
 
 	printer := &PrinterFunc{d: d, recorder: []string{}}
 	environment, err := d.newQuickJSNodeEnvironment(printer)
