@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -240,7 +239,7 @@ func httpServe(e *echo.Echo, dm *dice.DiceManager, hideUI bool) {
 			s2, _ := syscall.UTF16PtrFromString(fmt.Sprintf("端口 %s 已被占用，点“是”随机换一个端口，点“否”退出\n注意，此端口将被自动写入配置，后续可用启动参数改回", portStr))
 			ret := win.MessageBox(0, s2, s1, win.MB_YESNO|win.MB_ICONWARNING|win.MB_DEFBUTTON2)
 			if ret == win.IDYES {
-				newPort := 3000 + rand.Int()%4000
+				newPort := 3000 + dice.DiceRandIntn(4000)
 				dm.ServeAddress = fmt.Sprintf("0.0.0.0:%d", newPort)
 				continue
 			} else {

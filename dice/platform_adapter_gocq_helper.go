@@ -4,10 +4,8 @@ import (
 	crand "crypto/rand"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/ShiraazMoollatjie/goluhn"
 	"github.com/google/uuid"
@@ -60,14 +58,7 @@ func randomMacAddress() string {
 }
 
 func RandString(n int) string {
-	r := rand.New(rand.NewSource(time.Now().Unix()))
-
-	bytes := make([]byte, n)
-	for i := range n {
-		b := r.Intn(26) + 65
-		bytes[i] = byte(b)
-	}
-	return string(bytes)
+	return DiceRandString(n, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 }
 
 // model	设备
@@ -83,7 +74,7 @@ func RandString(n int) string {
 func GenerateDeviceJSONIos(protocol int) (string, []byte, error) {
 	bootID := uuid.New()
 	imei := goluhn.Generate(15) // 注意，这个imei是完全胡乱创建的，并不符合imei规则
-	androidID := fmt.Sprintf("%X", rand.Uint64())
+	androidID := fmt.Sprintf("%X", DiceRandUint64())
 
 	deviceJSON := deviceFile{
 		Display:      "iPhone",      // Rom的名字 比如 Flyme 1.1.2（魅族rom）  JWR66V（Android nexus系列原生4.3rom）
@@ -100,7 +91,7 @@ func GenerateDeviceJSONIos(protocol int) (string, []byte, error) {
 		SimInfo:      "",
 		OSType:       "iOS",
 		MacAddress:   randomMacAddress(),
-		IPAddress:    []int32{192, 168, rand.Int31() % 255, rand.Int31()%253 + 2}, // 192.168.x.x
+		IPAddress:    []int32{192, 168, int32(DiceRandIntn(255)), int32(DiceRandIntn(253) + 2)}, // 192.168.x.x
 		WifiBSSID:    randomMacAddress(),
 		WifiSSID:     "<unknown ssid>",
 		IMEI:         imei,
@@ -132,7 +123,7 @@ func GenerateDeviceJSONIos(protocol int) (string, []byte, error) {
 func GenerateDeviceJSONAndroidWatch(protocol int) (string, []byte, error) {
 	bootID := uuid.New()
 	imei := goluhn.Generate(15) // 注意，这个imei是完全胡乱创建的，并不符合imei规则
-	androidID := fmt.Sprintf("%X", rand.Uint64())
+	androidID := fmt.Sprintf("%X", DiceRandUint64())
 
 	deviceJSON := deviceFile{
 		Display:      "MIRAI.142521.001", // Rom的名字 比如 Flyme 1.1.2（魅族rom）  JWR66V（Android nexus系列原生4.3rom）
@@ -149,7 +140,7 @@ func GenerateDeviceJSONAndroidWatch(protocol int) (string, []byte, error) {
 		SimInfo:      "T-Mobile",
 		OSType:       "android",
 		MacAddress:   randomMacAddress(),
-		IPAddress:    []int32{192, 168, rand.Int31() % 255, rand.Int31()%253 + 2}, // 192.168.x.x
+		IPAddress:    []int32{192, 168, int32(DiceRandIntn(255)), int32(DiceRandIntn(253) + 2)}, // 192.168.x.x
 		WifiBSSID:    randomMacAddress(),
 		WifiSSID:     "<unknown ssid>",
 		IMEI:         imei,
@@ -173,7 +164,7 @@ func GenerateDeviceJSONAndroidWatch(protocol int) (string, []byte, error) {
 func GenerateDeviceJSONAllRandom(protocol int) (string, []byte, error) {
 	bootID := uuid.New()
 	imei := goluhn.Generate(15) // 注意，这个imei是完全胡乱创建的，并不符合imei规则
-	androidID := fmt.Sprintf("%X", rand.Uint64())
+	androidID := fmt.Sprintf("%X", DiceRandUint64())
 
 	deviceJSON := deviceFile{
 		Display:      RandString(6), // Rom的名字 比如 Flyme 1.1.2（魅族rom）  JWR66V（Android nexus系列原生4.3rom）
@@ -190,7 +181,7 @@ func GenerateDeviceJSONAllRandom(protocol int) (string, []byte, error) {
 		SimInfo:      "",
 		OSType:       "android",
 		MacAddress:   randomMacAddress(),
-		IPAddress:    []int32{192, 168, rand.Int31() % 255, rand.Int31()%253 + 2}, // 192.168.x.x
+		IPAddress:    []int32{192, 168, int32(DiceRandIntn(255)), int32(DiceRandIntn(253) + 2)}, // 192.168.x.x
 		WifiBSSID:    randomMacAddress(),
 		WifiSSID:     "<unknown ssid>",
 		IMEI:         imei,
@@ -245,13 +236,13 @@ func GenerateDeviceJSONAndroid(dice *Dice, protocol int) (string, []byte, error)
 
 	pool := androidDevicePool
 	imei := goluhn.Generate(15) // 注意，这个imei是完全胡乱创建的，并不符合imei规则
-	androidID := fmt.Sprintf("%X", rand.Uint64())
+	androidID := fmt.Sprintf("%X", DiceRandUint64())
 
-	m := pool[rand.Int()%len(pool)]
+	m := pool[DiceRandIntn(len(pool))]
 	deviceJSON := m.data
 
 	deviceJSON.MacAddress = randomMacAddress()
-	deviceJSON.IPAddress = []int32{192, 168, rand.Int31() % 255, rand.Int31()%253 + 2} // 192.168.x.x
+	deviceJSON.IPAddress = []int32{192, 168, int32(DiceRandIntn(255)), int32(DiceRandIntn(253) + 2)} // 192.168.x.x
 	deviceJSON.IMEI = imei
 	deviceJSON.AndroidID = androidID
 	deviceJSON.Protocol = protocol

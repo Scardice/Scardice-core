@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand/v2"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
@@ -613,7 +612,7 @@ func (pa *PlatformAdapterMilky) handelFriendRequest(ctx *MsgContext, event *milk
 		return
 	}
 
-	time.Sleep(time.Duration((0.8 + rand.Float64()) * float64(time.Second)))
+	time.Sleep(time.Duration((0.8 + DiceRandFloat64()) * float64(time.Second)))
 
 	if willAccept {
 		pa.SetFriendAddRequest(event.InitiatorUID, true, "")

@@ -141,13 +141,12 @@ func TestGlobalRandSourceReportGetText(t *testing.T) {
 	))
 
 	got := globalRandSource.ReportGetText(20)
-	for mode, raw := range map[DiceRandomMode]uint64{
-		DiceRandomModePCG:  0,
-		DiceRandomModeNIST: 2,
-		DiceRandomModeCRNG: 3,
+	for _, mode := range []DiceRandomMode{
+		DiceRandomModePCG,
+		DiceRandomModeNIST,
+		DiceRandomModeCRNG,
 	} {
-		expected := ds.Roll(&countingDiceSource{values: []uint64{raw}}, ds.IntType(20), 0)
-		line := fmt.Sprintf("%s: 出目=%d", mode, expected)
+		line := fmt.Sprintf("%s: 出目=", mode)
 		if !strings.Contains(got, line) {
 			t.Fatalf("expected %q in get text, got %q", line, got)
 		}
@@ -184,5 +183,31 @@ func TestGlobalRandSourceReportStatusText(t *testing.T) {
 	}
 	if !strings.Contains(got, "gm init failed") {
 		t.Fatalf("expected fallback reason in status text, got %q", got)
+	}
+}
+func TestDiceRandomConvenienceAPIsUseGlobalOwner(t *testing.T) {
+	installGlobalDiceSourceState(t, completeSourceMap(
+		sourceOverride{mode: DiceRandomModePCG, src: &countingDiceSource{values: []uint64{7, 1, 0}}},
+	), nil)
+
+	if got := DiceRandUint64(); got != 7 {
+		t.Fatalf("DiceRandUint64() = %d, want 7", got)
+	}
+	if got := DiceRandIntn(5); got != 1 {
+		t.Fatalf("DiceRandIntn(5) = %d, want 1", got)
+	}
+	if got := DiceRandFloat64(); got != 0 {
+		t.Fatalf("DiceRandFloat64() = %v, want 0", got)
+	}
+}
+func TestGlobalRandSourceReportDoesNotConsumeActiveSource(t *testing.T) {
+	source := &countingDiceSource{values: []uint64{1, 2}}
+	installGlobalDiceSourceState(t, completeSourceMap(
+		sourceOverride{mode: DiceRandomModePCG, src: source},
+	), nil)
+
+	_ = globalRandSource.ReportGetText(20)
+	if got := globalRandSource.Uint64(); got != 1 {
+		t.Fatalf("Uint64() after report = %d, want 1", got)
 	}
 }

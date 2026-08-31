@@ -14,6 +14,9 @@ const (
 
 var supportedDiceRandomModes = randcore.SupportedModes()
 
-func parseDiceRandomModeStrict(raw string) (DiceRandomMode, bool) {
+func ParseDiceRandomMode(raw string) (DiceRandomMode, bool) {
 	return randcore.ParseModeStrict(raw)
+}
+func parseDiceRandomModeStrict(raw string) (DiceRandomMode, bool) {
+	return ParseDiceRandomMode(raw)
 }

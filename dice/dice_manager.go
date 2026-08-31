@@ -54,6 +54,7 @@ type DiceManager struct { //nolint:revive
 	NamesInfo        map[string]map[string][]string
 	namesLoadWG      sync.WaitGroup
 
+	DiceRandomMode string
 	UIPasswordHash string
 	UIPasswordSalt string
 	AccessTokens   SyncMap[string, bool]
@@ -105,6 +106,7 @@ type Configs struct { //nolint:revive
 	TrayTooltip       string       `yaml:"trayTooltip"`
 	WebUIAddress      string       `yaml:"webUIAddress"`
 	HelpDocEngineType int          `yaml:"helpDocEngineType"`
+	DiceRandomMode    string       `yaml:"diceRandomMode"`
 
 	UIPasswordSalt string   `yaml:"UIPasswordFrontendSalt"`
 	UIPasswordHash string   `yaml:"uiPasswordHash"`
@@ -193,13 +195,21 @@ func (dm *DiceManager) LoadDice() {
 	dm.AccessTokens = SyncMap[string, bool]{}
 	if dm.UIPasswordSalt == "" {
 		// 旧版本升级，或新用户
-		dm.UIPasswordSalt = RandStringBytesMaskImprSrcSB2(32)
+		salt, err := GenerateCryptoToken(32)
+		if err != nil {
+			log.Errorf("生成 UI 密码盐失败: %v", err)
+			return
+		}
+		dm.UIPasswordSalt = salt
 	}
 	if dm.AssetImageToken == "" {
 		// 静态资源路由鉴权 token，crypto/rand 生成，不写日志/配置
-		if tok, err := generateCryptoToken(32); err == nil {
-			dm.AssetImageToken = tok
+		tok, err := GenerateCryptoToken(32)
+		if err != nil {
+			log.Errorf("生成静态资源鉴权 token 失败: %v", err)
+			return
 		}
+		dm.AssetImageToken = tok
 	}
 	dm.AutoBackupEnable = true
 	dm.AutoBackupTime = "@every 12h" // 每12小时一次
@@ -216,6 +226,7 @@ func (dm *DiceManager) LoadDice() {
 		log.Error("读取 data/dice.yaml 发生错误: 配置文件格式不正确", err)
 		panic(err)
 	}
+	dm.DiceRandomMode = dc.DiceRandomMode
 
 	if dc.UIPasswordSalt == "" {
 		// 旧版本升级
@@ -263,6 +274,7 @@ func (dm *DiceManager) Save() {
 	dc.HelpDocEngineType = dm.HelpDocEngineType
 	dc.UIPasswordSalt = dm.UIPasswordSalt
 	dc.UIPasswordHash = dm.UIPasswordHash
+	dc.DiceRandomMode = string(dm.GetDiceRandomMode())
 	dc.AccessTokens = []string{}
 	dc.AutoBackupTime = dm.AutoBackupTime
 	dc.AutoBackupEnable = dm.AutoBackupEnable
@@ -346,6 +358,31 @@ func (dm *DiceManager) InitDice(writer *logger.UIWriter) {
 		i.Parent = dm
 		i.Init(dm.Operator, writer)
 	}
+	legacyModes := make([]BaseConfig, 0, len(dm.Dice))
+	for _, d := range dm.Dice {
+		if d != nil {
+			legacyModes = append(legacyModes, d.Config.BaseConfig)
+		}
+	}
+	configuredMode := strings.TrimSpace(dm.DiceRandomMode)
+	dm.DiceRandomMode = string(normalizeGlobalDiceRandomMode(dm.DiceRandomMode, legacyModes))
+	for _, legacy := range legacyModes {
+		if strings.TrimSpace(legacy.DiceRandomMode) == "" {
+			continue
+		}
+		legacyMode := normalizeGlobalDiceRandomMode(legacy.DiceRandomMode, nil)
+		if legacyMode != dm.GetDiceRandomMode() {
+			log.Warnf("[随机源] 忽略 Dice 级随机模式 %s，使用全局模式 %s", legacyMode, dm.GetDiceRandomMode())
+		}
+	}
+	if configuredMode == "" {
+		log.Infof("[随机源] 已从旧版 Dice 配置迁移全局模式: %s", dm.GetDiceRandomMode())
+	}
+	dm.syncDiceRandomMode()
+	if err := dm.ActivateDiceRandomMode(); err != nil {
+		log.Warnf("[随机源] 激活全局配置模式 %s 失败，当前生效模式为 %s: %v", dm.GetDiceRandomMode(), globalRandSource.CurrentMode(), err)
+	}
+	globalRandSource.LogActiveMode(log)
 
 	go func() {
 		defer func() {

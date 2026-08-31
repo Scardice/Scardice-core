@@ -28,8 +28,9 @@ func TestDiceConfigSetAcceptsCRNGRandomMode(t *testing.T) {
 		Logger:     zap.NewNop().Sugar(),
 	}
 	manager := &dice.DiceManager{
-		Dice:        []*dice.Dice{testDice},
-		JustForTest: true,
+		Dice:           []*dice.Dice{testDice},
+		DiceRandomMode: string(dice.DiceRandomModePCG),
+		JustForTest:    true,
 	}
 	token := "test-token"
 	manager.AccessTokens.Store(token, true)
@@ -49,7 +50,10 @@ func TestDiceConfigSetAcceptsCRNGRandomMode(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
+	if got := manager.DiceRandomMode; got != string(dice.DiceRandomModeCRNG) {
+		t.Fatalf("manager DiceRandomMode = %q, want %q", got, dice.DiceRandomModeCRNG)
+	}
 	if got := testDice.Config.DiceRandomMode; got != string(dice.DiceRandomModeCRNG) {
-		t.Fatalf("DiceRandomMode = %q, want %q", got, dice.DiceRandomModeCRNG)
+		t.Fatalf("Dice mirror DiceRandomMode = %q, want %q", got, dice.DiceRandomModeCRNG)
 	}
 }

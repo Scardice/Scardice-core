@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -28,6 +29,7 @@ type DiceConfigInfo struct {
 	ServerAddress       string   `form:"serveAddress"        json:"serveAddress"`
 	TrayTooltip         string   `json:"trayTooltip"`
 	HelpDocEngineType   int      `json:"helpDocEngineType"`
+	DiceRandomMode      string   `json:"diceRandomMode"`
 }
 
 func DiceConfig(c echo.Context) error {
@@ -80,6 +82,7 @@ func DiceConfig(c echo.Context) error {
 		ServerAddress:       myDice.Parent.ServeAddress,
 		TrayTooltip:         myDice.Parent.GetTrayTooltip(),
 		HelpDocEngineType:   myDice.Parent.HelpDocEngineType,
+		DiceRandomMode:      string(myDice.Parent.GetDiceRandomMode()),
 		MaxExecuteTime:      maxExec,
 		MaxCocCardGen:       maxCard,
 	}
@@ -98,7 +101,6 @@ func DiceConfigSet(c echo.Context) error {
 
 	jsonMap := make(map[string]interface{})
 	err := json.NewDecoder(c.Request().Body).Decode(&jsonMap)
-	randomModeModified := false
 
 	stringConvert := func(val interface{}) []string {
 		var lst []string
@@ -301,20 +303,31 @@ func DiceConfigSet(c echo.Context) error {
 	}
 
 	if val, ok := jsonMap["diceRandomMode"]; ok {
-		if v, ok := val.(string); ok {
-			switch strings.ToLower(strings.TrimSpace(v)) {
-			case string(dice.DiceRandomModeGM):
-				config.DiceRandomMode = string(dice.DiceRandomModeGM)
-			case string(dice.DiceRandomModeNIST):
-				config.DiceRandomMode = string(dice.DiceRandomModeNIST)
-			case string(dice.DiceRandomModeCRNG):
-				config.DiceRandomMode = string(dice.DiceRandomModeCRNG)
-			case string(dice.DiceRandomModeHybrid):
-				config.DiceRandomMode = string(dice.DiceRandomModeHybrid)
-			default:
-				config.DiceRandomMode = string(dice.DiceRandomModePCG)
-			}
-			randomModeModified = true
+		v, ok := val.(string)
+		if !ok {
+			return c.JSON(http.StatusBadRequest, Response{
+				"result": false,
+				"err":    "随机模式必须是字符串",
+			})
+		}
+		mode, ok := dice.ParseDiceRandomMode(v)
+		if !ok {
+			return c.JSON(http.StatusBadRequest, Response{
+				"result": false,
+				"err":    fmt.Sprintf("不支持的随机模式: %s", v),
+			})
+		}
+		if myDice.Parent == nil {
+			return c.JSON(http.StatusInternalServerError, Response{
+				"result": false,
+				"err":    "DiceManager 未初始化",
+			})
+		}
+		if effectiveMode, err := myDice.Parent.SetDiceRandomMode(mode); err != nil {
+			return c.JSON(http.StatusBadRequest, Response{
+				"result": false,
+				"err":    fmt.Sprintf("随机模式 %s 当前不可用，当前生效模式为 %s: %v", mode, effectiveMode, err),
+			})
 		}
 	}
 
@@ -531,12 +544,6 @@ func DiceConfigSet(c echo.Context) error {
 		}
 	}
 
-	// 统一标记为修改
-	if randomModeModified {
-		if err := myDice.ActivateDiceRandomMode(); err != nil {
-			myDice.Logger.Warnf("[随机源] 应用管理界面随机模式失败，已使用 PCG 回退: %v", err)
-		}
-	}
 	myDice.MarkModified()
 	myDice.Parent.Save()
 	return c.JSON(http.StatusOK, nil)

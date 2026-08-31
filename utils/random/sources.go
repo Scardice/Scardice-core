@@ -1,6 +1,7 @@
 package random
 
 import (
+	crand "crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -146,9 +147,24 @@ func (s *hybridSource) Uint64() uint64 {
 		if src == nil {
 			continue
 		}
+		if checker, ok := src.(sourceAvailability); ok && !checker.Available() {
+			continue
+		}
 		value ^= src.Uint64()
 	}
 	return value
+}
+
+func (s *hybridSource) Available() bool {
+	for _, src := range s.sources {
+		if src == nil {
+			continue
+		}
+		if checker, ok := src.(sourceAvailability); !ok || checker.Available() {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *hybridSource) RuntimeNote() string {
@@ -261,7 +277,11 @@ func NewSourceForMode(mode Mode, logger *zap.SugaredLogger) (ds.DiceSource, erro
 			},
 		}, nil
 	case ModeCRNG:
-		return ds.NewCryptoDiceSource(), nil
+		return &readerSourceState{
+			reader: crand.Reader,
+			spec:   spec,
+			logger: logger,
+		}, nil
 	case ModePCG:
 		fallthrough
 	default:

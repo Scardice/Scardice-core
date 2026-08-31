@@ -245,7 +245,13 @@ func doSignIn(c echo.Context) error {
 	generateToken := func() error {
 		now := time.Now().Unix()
 		head := hex.EncodeToString(Int64ToBytes(now))
-		token := dice.RandStringBytesMaskImprSrcSB2(64) + ":" + head
+		randomPart, err := dice.GenerateCryptoToken(32)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{
+				"error": "failed to generate authentication token",
+			})
+		}
+		token := randomPart + ":" + head
 
 		myDice.Parent.AccessTokens.Store(token, true)
 		myDice.LastUpdatedTime = time.Now().Unix()

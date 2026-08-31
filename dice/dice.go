@@ -439,10 +439,6 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 
 	d.registerCoreCommands()
 	d.RegisterBuiltinExt()
-	d.loads()
-	if err := d.ActivateDiceRandomMode(); err != nil && d.Logger != nil {
-		d.Logger.Warnf("[随机源] 激活配置模式失败，已使用 PCG 回退: %v", err)
-	}
 	d.loadAdvanced()
 	(&d.Config).BanList.Loads()
 	(&d.Config).BanList.AfterLoads()
@@ -946,7 +942,15 @@ func (d *Dice) UnlockCodeUpdate(force bool) {
 		d.MasterUnlockCode = ""
 	}
 	if d.MasterUnlockCode == "" {
-		d.MasterUnlockCode = RandStringBytesMaskImprSrcSB(8)
+		code, err := generateCryptoString(8, letterBytes)
+		if err != nil {
+			d.MasterUnlockCode = ""
+			if d.Logger != nil {
+				d.Logger.Errorf("生成 Master 解锁码失败: %v", err)
+			}
+			return
+		}
+		d.MasterUnlockCode = code
 		d.MasterUnlockCodeTime = now
 	}
 }

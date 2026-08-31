@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -162,9 +161,9 @@ func doSleepQQ(ctx *MsgContext) {
 	if ctx.Dice != nil {
 		d := ctx.Dice
 		offset := d.Config.MessageDelayRangeEnd - d.Config.MessageDelayRangeStart
-		time.Sleep(time.Duration((d.Config.MessageDelayRangeStart + rand.Float64()*offset) * float64(time.Second)))
+		time.Sleep(time.Duration((d.Config.MessageDelayRangeStart + DiceRandFloat64()*offset) * float64(time.Second)))
 	} else {
-		time.Sleep(time.Duration((0.4 + rand.Float64()/2) * float64(time.Second)))
+		time.Sleep(time.Duration((0.4 + DiceRandFloat64()/2) * float64(time.Second)))
 	}
 }
 

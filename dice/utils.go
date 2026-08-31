@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
@@ -16,7 +15,6 @@ import (
 	"sort"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/samber/lo"
 	"golang.org/x/text/encoding/simplifiedchinese"
@@ -81,57 +79,53 @@ func LimitCommandReasonText(text string) string {
 }
 
 const letterBytes = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ123456789"
-const letterBytes2 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKMNOPQRSTUVWXYZ1234567890!@#$%^&*()_+=-"
 
-const (
-	letterIdxBits = 6                    // 6 bits to represent a letter index
-	letterIdxMask = 1<<letterIdxBits - 1 // All 1-bits, as many as letterIdxBits
-	letterIdxMax  = 63 / letterIdxBits   // # of letter indices fitting in 63 bits
-)
-
-var randSrc = rand.NewSource(time.Now().UnixNano())
-
-func RandStringBytesMaskImprSrcSB(n int) string {
-	sb := strings.Builder{}
-	sb.Grow(n)
-	// A randSrc.Int63() generates 63 random bits, enough for letterIdxMax characters!
-	for i, cache, remain := n-1, randSrc.Int63(), letterIdxMax; i >= 0; {
-		if remain == 0 {
-			cache, remain = randSrc.Int63(), letterIdxMax
-		}
-		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
-			sb.WriteByte(letterBytes[idx])
-			i--
-		}
-		cache >>= letterIdxBits
-		remain--
+func generateRandomString(reader io.Reader, n int, alphabet string) (string, error) {
+	if n < 0 {
+		return "", fmt.Errorf("invalid random string length: %d", n)
+	}
+	if len(alphabet) == 0 {
+		return "", fmt.Errorf("random string alphabet is empty")
+	}
+	if len(alphabet) > 256 {
+		return "", fmt.Errorf("random string alphabet is too large: %d", len(alphabet))
+	}
+	if n == 0 {
+		return "", nil
 	}
 
-	return sb.String()
+	result := make([]byte, n)
+	limit := 256 - 256%len(alphabet)
+	var raw [1]byte
+	for i := range result {
+		for {
+			if _, err := io.ReadFull(reader, raw[:]); err != nil {
+				return "", err
+			}
+			if int(raw[0]) < limit {
+				result[i] = alphabet[int(raw[0])%len(alphabet)]
+				break
+			}
+		}
+	}
+	return string(result), nil
+}
+
+func generateCryptoString(n int, alphabet string) (string, error) {
+	return generateRandomString(cryptorand.Reader, n, alphabet)
+}
+
+func RandStringBytesMaskImprSrcSB(n int) string {
+	return DiceRandString(n, letterBytes)
 }
 
 func RandStringBytesMaskImprSrcSB2(n int) string {
-	sb := strings.Builder{}
-	sb.Grow(n)
-	// A randSrc.Int63() generates 63 random bits, enough for letterIdxMax characters!
-	for i, cache, remain := n-1, randSrc.Int63(), letterIdxMax; i >= 0; {
-		if remain == 0 {
-			cache, remain = randSrc.Int63(), letterIdxMax
-		}
-		if idx := int(cache & letterIdxMask); idx < len(letterBytes2) {
-			sb.WriteByte(letterBytes2[idx])
-			i--
-		}
-		cache >>= letterIdxBits
-		remain--
-	}
-
-	return sb.String()
+	return DiceRandString(n, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKMNOPQRSTUVWXYZ1234567890!@#$%^&*()_+=-")
 }
 
-// generateCryptoToken 生成 n 字节密码学安全随机字符串（base32 无填充，URL-safe）
-// 用于 AssetImageToken 等
-func generateCryptoToken(n int) (string, error) {
+// GenerateCryptoToken 生成 n 字节密码学安全随机字符串（base32 无填充，URL-safe）
+// 用于认证 token 和 AssetImageToken。
+func GenerateCryptoToken(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := cryptorand.Read(b); err != nil {
 		return "", err

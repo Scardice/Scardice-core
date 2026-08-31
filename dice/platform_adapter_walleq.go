@@ -3,7 +3,6 @@ package dice
 import (
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -533,7 +532,7 @@ func (pa *PlatformAdapterWalleQ) Serve() int {
 					return
 				}
 
-				time.Sleep(time.Duration((0.8 + rand.Float64()) * float64(time.Second)))
+				time.Sleep(time.Duration((0.8 + DiceRandFloat64()) * float64(time.Second)))
 
 				if willAccept {
 					pa.SetFriendAddRequest(req.RequestID, event.UserID, true)
@@ -549,7 +548,7 @@ func (pa *PlatformAdapterWalleQ) Serve() int {
 				// {"comment":"","flag":"111","group_id":222,"post_type":"request","request_type":"group","self_id":333,"sub_type":"invite","time":1646782195,"user_id":444}
 				ep.RefreshGroupNum()
 				pa.GetGroupInfoAsync(event.GroupID)
-				time.Sleep(time.Duration((1.8 + rand.Float64()) * float64(time.Second))) // 稍作等待，也许能拿到群名
+				time.Sleep(time.Duration((1.8 + DiceRandFloat64()) * float64(time.Second))) // 稍作等待，也许能拿到群名
 
 				uid := FormatDiceIDQQV12(event.UserID)
 				gid := FormatDiceIDQQGroupV12(event.GroupID)
