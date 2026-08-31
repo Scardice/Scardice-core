@@ -19,6 +19,7 @@ const (
 	KindBool
 	KindString
 	KindInt
+	KindUint
 	KindFloat
 	KindHostObject
 	KindHostFunction
@@ -30,6 +31,7 @@ type Value struct {
 	Bool bool
 	String string
 	Int int64
+	Uint uint64
 	Float float64
 	Host HostRef
 	Function HostFuncRef
@@ -41,6 +43,7 @@ func NullValue() Value { return Value{Kind: KindNull} }
 func BoolValue(v bool) Value { return Value{Kind: KindBool, Bool: v} }
 func StringValue(v string) Value { return Value{Kind: KindString, String: v} }
 func IntValue(v int64) Value { return Value{Kind: KindInt, Int: v} }
+func UintValue(v uint64) Value { return Value{Kind: KindUint, Uint: v} }
 func FloatValue(v float64) Value { return Value{Kind: KindFloat, Float: v} }
 func HostObjectValue(v HostRef) Value { return Value{Kind: KindHostObject, Host: v} }
 func HostFunctionValue(v HostFuncRef) Value { return Value{Kind: KindHostFunction, Function: v} }
@@ -63,7 +66,11 @@ type objectEntry struct {
 	value reflect.Value
 	dangerous bool
 }
-type functionEntry struct { value reflect.Value }
+type functionEntry struct {
+	value reflect.Value
+	owner HostRef
+	operation string
+}
 type identity struct { typ reflect.Type; pointer string }
 
 // Session owns host identities and a callback generation. Registry operations
@@ -158,11 +165,28 @@ func (s *Session) RegisterFunction(fn any) (HostFuncRef, error) {
 	s.functions[ref] = functionEntry{value: v}
 	return ref, nil
 }
+func (s *Session) registerOperation(owner HostRef, operation string) (HostFuncRef, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed { return 0, ErrSessionClosed }
+	if _, ok := s.objects[owner]; !ok { return 0, fmt.Errorf("invalid HostRef %d", owner) }
+	s.nextFunc++
+	ref := s.nextFunc
+	s.functions[ref] = functionEntry{owner: owner, operation: operation}
+	return ref, nil
+}
 func (s *Session) LookupObject(ref HostRef) (reflect.Value, error) { s.mu.RLock(); defer s.mu.RUnlock(); entry, ok := s.objects[ref]; if !ok { return reflect.Value{}, fmt.Errorf("invalid HostRef %d", ref) }; return entry.value, nil }
 func (s *Session) LookupFunction(ref HostFuncRef) (reflect.Value, error) { s.mu.RLock(); defer s.mu.RUnlock(); entry, ok := s.functions[ref]; if !ok { return reflect.Value{}, fmt.Errorf("invalid HostFuncRef %d", ref) }; return entry.value, nil }
 func (s *Session) ReleaseObject(ref HostRef) error { s.mu.Lock(); defer s.mu.Unlock(); if _, ok := s.objects[ref]; !ok { return fmt.Errorf("invalid HostRef %d", ref) }; delete(s.objects, ref); for key, value := range s.identities { if value == ref { delete(s.identities, key) } }; return nil }
 func (s *Session) ReleaseFunction(ref HostFuncRef) error { s.mu.Lock(); defer s.mu.Unlock(); if _, ok := s.functions[ref]; !ok { return fmt.Errorf("invalid HostFuncRef %d", ref) }; delete(s.functions, ref); return nil }
 func (s *Session) Teardown() { s.mu.Lock(); defer s.mu.Unlock(); s.objects = make(map[HostRef]objectEntry); s.functions = make(map[HostFuncRef]functionEntry); s.identities = make(map[identity]HostRef); s.generation++; s.closed = true }
+func (s *Session) lookupFunctionEntry(ref HostFuncRef) (functionEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	entry, ok := s.functions[ref]
+	if !ok { return functionEntry{}, fmt.Errorf("invalid HostFuncRef %d", ref) }
+	return entry, nil
+}
 func (s *Session) ObjectCount() int { s.mu.RLock(); defer s.mu.RUnlock(); return len(s.objects) }
 func (s *Session) FunctionCount() int { s.mu.RLock(); defer s.mu.RUnlock(); return len(s.functions) }
 func (s *Session) lookupEntry(ref HostRef) (objectEntry, error) {

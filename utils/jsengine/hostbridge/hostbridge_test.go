@@ -2,6 +2,7 @@ package hostbridge
 
 import (
 	"errors"
+	"math"
 	"reflect"
 	"strings"
 	"sync"
@@ -108,4 +109,24 @@ func TestHostBridgeRejectsInvalidObjectTypes(t *testing.T) {
 	s := NewSession(); for _, value := range []any{nil, 4, map[int]int{1: 2}, (*demoHost)(nil)} {
 		if _, err := s.RegisterObject(value); err == nil { t.Fatalf("accepted invalid object %#v", value) }
 	}
+}
+func TestHostBridgeGetReturnsCallableFunctionHandles(t *testing.T) {
+	s := NewSession(); h := &demoHost{Locked: 2}; ref, _ := s.RegisterObject(h)
+	method, err := s.Get(ref, "add"); if err != nil || method.Kind != KindHostFunction || method.Function == 0 { t.Fatalf("method handle=%#v err=%v", method, err) }
+	result, err := s.CallFunction(method.Function, []Value{IntValue(3)}); if err != nil || result.Int != 5 { t.Fatalf("method call=%#v err=%v", result, err) }
+	items := []int{1}; sr, _ := s.RegisterObject(&items); push, err := s.Get(sr, "push")
+	if err != nil || push.Kind != KindHostFunction || push.Function == 0 { t.Fatalf("push handle=%#v err=%v", push, err) }
+	result, err = s.CallFunction(push.Function, []Value{IntValue(4)}); if err != nil || result.Int != 2 || !reflect.DeepEqual(items, []int{1, 4}) { t.Fatalf("push call=%#v err=%v items=%v", result, err, items) }
+}
+
+func TestHostBridgeReadOnlySliceRejectsWrites(t *testing.T) {
+	s := NewSession(); items := []int{1}; ref, _ := s.RegisterObject(items)
+	if err := s.Set(ref, "0", IntValue(2)); err == nil || !strings.Contains(err.Error(), "read-only") { t.Fatalf("read-only slice set: %v", err) }
+}
+
+func TestHostBridgePreservesUint64Values(t *testing.T) {
+	s := NewSession(); values := map[string]uint64{"max": ^uint64(0)}; ref, _ := s.RegisterObject(values)
+	got, err := s.Get(ref, "max"); if err != nil || got.Kind != KindUint || got.Uint != ^uint64(0) { t.Fatalf("uint64 value=%#v err=%v", got, err) }
+	floatValues := map[string]float64{"small": math.SmallestNonzeroFloat64}; floatRef, _ := s.RegisterObject(floatValues)
+	floatValue, err := s.Get(floatRef, "small"); if err != nil || floatValue.Kind != KindFloat || floatValue.Float != math.SmallestNonzeroFloat64 { t.Fatalf("float64 value=%#v err=%v", floatValue, err) }
 }

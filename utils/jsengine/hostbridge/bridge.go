@@ -22,7 +22,7 @@ func (s *Session) Get(ref HostRef, name string) (Value, error) {
 	if err != nil { return UndefinedValue(), err }
 	obj := entry.value
 	if obj.Kind() == reflect.Map { return s.mapGet(obj, name) }
-	if obj.Kind() == reflect.Slice { return s.sliceGet(obj, name) }
+	if obj.Kind() == reflect.Slice { return s.sliceGet(ref, obj, name) }
 	if obj.Kind() == reflect.Pointer && obj.Elem().Kind() == reflect.Struct {
 		field, lock, ok, err := s.structFieldMode(obj, name, entry.dangerous)
 		if err != nil { return UndefinedValue(), err }
@@ -31,7 +31,8 @@ func (s *Session) Get(ref HostRef, name string) (Value, error) {
 			return s.toValue(field)
 		}
 		if method, ok := obj.Type().MethodByName(exportedMethod(name)); ok {
-			return HostFunctionValueForMethod(ref, method.Name), nil
+			function, err := s.registerOperation(ref, method.Name); if err != nil { return UndefinedValue(), err }
+			return HostFunctionValue(function), nil
 		}
 	}
 	return UndefinedValue(), nil
@@ -110,8 +111,12 @@ func (s *Session) call(ref HostRef, name string, args []Value, codec RuntimeValu
 }
 
 func (s *Session) CallFunction(ref HostFuncRef, args []Value) (Value, error) { return s.CallFunctionWithCodec(ref, args, nil) }
-func (s *Session) CallFunctionWithCodec(ref HostFuncRef, args []Value, codec RuntimeValueCodec) (Value, error) { fn, err := s.LookupFunction(ref); if err != nil { return UndefinedValue(), err }; return s.callReflect(fn, args, "function", codec, false) }
-
+func (s *Session) CallFunctionWithCodec(ref HostFuncRef, args []Value, codec RuntimeValueCodec) (Value, error) {
+	entry, err := s.lookupFunctionEntry(ref); if err != nil { return UndefinedValue(), err }
+	if entry.operation != "" { return s.call(entry.owner, entry.operation, args, codec) }
+	if !entry.value.IsValid() { return s.call(entry.owner, "push", args, codec) }
+	return s.callReflect(entry.value, args, "function", codec, false)
+}
 func (s *Session) callReflect(fn reflect.Value, args []Value, label string, codec RuntimeValueCodec, receiver bool) (result Value, err error) {
 
 	defer func() { if p := recover(); p != nil { result = UndefinedValue(); err = fmt.Errorf("%s panic: %v", label, p) } }()
@@ -177,7 +182,8 @@ func (s *Session) toValue(v reflect.Value) (Value, error) {
 	case reflect.Func:
 		ref, err := s.RegisterFunction(v.Interface()); if err != nil { return UndefinedValue(), err }; return HostFunctionValue(ref), nil
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64: return IntValue(v.Int()), nil
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr: return IntValue(int64(v.Uint())), nil
+	case reflect.Float32, reflect.Float64: return FloatValue(v.Float()), nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr: return UintValue(v.Uint()), nil
 	case reflect.Pointer, reflect.Struct, reflect.Map, reflect.Slice:
 		ref, err := s.RegisterObject(v.Interface()); if err != nil { return UndefinedValue(), err }; return HostObjectValue(ref), nil
 	default: return UndefinedValue(), fmt.Errorf("unsupported %s", v.Type())
@@ -201,17 +207,29 @@ func (s *Session) toGo(v Value, target reflect.Type, codec RuntimeValueCodec) (r
 	out := reflect.New(target).Elem(); switch target.Kind() {
 	case reflect.Bool: if v.Kind != KindBool { return reflect.Value{}, fmt.Errorf("expected bool") }; out.SetBool(v.Bool)
 	case reflect.String: if v.Kind != KindString { return reflect.Value{}, fmt.Errorf("expected string") }; out.SetString(v.String)
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64: if v.Kind != KindInt { return reflect.Value{}, fmt.Errorf("expected integer") }; out.SetInt(v.Int)
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr: if v.Kind != KindInt { return reflect.Value{}, fmt.Errorf("expected integer") }; out.SetUint(uint64(v.Int))
-	case reflect.Float32, reflect.Float64: if v.Kind != KindFloat && v.Kind != KindInt { return reflect.Value{}, fmt.Errorf("expected number") }; if v.Kind == KindFloat { out.SetFloat(v.Float) } else { out.SetFloat(float64(v.Int)) }
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if v.Kind == KindInt { out.SetInt(v.Int) } else if v.Kind == KindUint && v.Uint <= uint64(1)<<(target.Bits()-1)-1 { out.SetInt(int64(v.Uint)) } else { return reflect.Value{}, fmt.Errorf("expected integer") }
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		if v.Kind == KindUint { out.SetUint(v.Uint) } else if v.Kind == KindInt && v.Int >= 0 { out.SetUint(uint64(v.Int)) } else { return reflect.Value{}, fmt.Errorf("expected unsigned integer") }
+	case reflect.Float32, reflect.Float64:
+		if v.Kind == KindFloat { out.SetFloat(v.Float) } else if v.Kind == KindInt { out.SetFloat(float64(v.Int)) } else if v.Kind == KindUint { out.SetFloat(float64(v.Uint)) } else { return reflect.Value{}, fmt.Errorf("expected number") }
 	default: return reflect.Value{}, fmt.Errorf("unsupported %s", target)
 	}; return out, nil
 }
-func (s *Session) valuePrimitive(v Value) (any, error) { switch v.Kind { case KindBool: return v.Bool, nil; case KindString: return v.String, nil; case KindInt: return v.Int, nil; case KindFloat: return v.Float, nil; case KindNull, KindUndefined: return nil, nil; default: return nil, fmt.Errorf("cannot convert kind %d", v.Kind) } }
+func (s *Session) valuePrimitive(v Value) (any, error) { switch v.Kind { case KindBool: return v.Bool, nil; case KindString: return v.String, nil; case KindInt: return v.Int, nil; case KindUint: return v.Uint, nil; case KindFloat: return v.Float, nil; case KindNull, KindUndefined: return nil, nil; default: return nil, fmt.Errorf("cannot convert kind %d", v.Kind) } }
 
 func (s *Session) mapGet(obj reflect.Value, name string) (Value, error) { item := obj.MapIndex(reflect.ValueOf(name).Convert(obj.Type().Key())); if !item.IsValid() { return UndefinedValue(), nil }; return s.toValue(item) }
-func (s *Session) sliceGet(obj reflect.Value, name string) (Value, error) { if name == "length" { return IntValue(int64(obj.Len())), nil }; if name == "push" { return HostFunctionValue(0), nil }; i, err := strconv.Atoi(name); if err != nil || i < 0 || i >= obj.Len() { return UndefinedValue(), nil }; return s.toValue(obj.Index(i)) }
-func (s *Session) sliceSet(obj reflect.Value, name string, v Value, codec RuntimeValueCodec) error { i, err := strconv.Atoi(name); if err != nil || i < 0 { return fmt.Errorf("invalid slice index %q", name) }; if !obj.CanSet() { return errors.New("slice is read-only") }; for obj.Len() <= i { obj.Set(reflect.Append(obj, reflect.Zero(obj.Type().Elem()))) }; item, err := s.toGo(v, obj.Type().Elem(), codec); if err != nil { return err }; obj.Index(i).Set(item); return nil }
+func (s *Session) sliceGet(ref HostRef, obj reflect.Value, name string) (Value, error) {
+	if name == "length" { return IntValue(int64(obj.Len())), nil }
+	if name == "push" { function, err := s.registerOperation(ref, "push"); if err != nil { return UndefinedValue(), err }; return HostFunctionValue(function), nil }
+	i, err := strconv.Atoi(name); if err != nil || i < 0 || i >= obj.Len() { return UndefinedValue(), nil }; return s.toValue(obj.Index(i))
+}
+func (s *Session) sliceSet(obj reflect.Value, name string, v Value, codec RuntimeValueCodec) error {
+	if !obj.CanSet() { return errors.New("slice is read-only") }
+	i, err := strconv.Atoi(name); if err != nil || i < 0 { return fmt.Errorf("invalid slice index %q", name) }
+	for obj.Len() <= i { obj.Set(reflect.Append(obj, reflect.Zero(obj.Type().Elem()))) }
+	item, err := s.toGo(v, obj.Type().Elem(), codec); if err != nil { return err }; obj.Index(i).Set(item); return nil
+}
 
 // Callback creates a generation-checked reflect trampoline from an explicit
 // runtime codec. Calls after Teardown return the declared error or panic when
