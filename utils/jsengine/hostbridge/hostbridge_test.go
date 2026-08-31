@@ -47,6 +47,7 @@ func TestHostBridgeStructFieldsTagsMethodsAndCopy(t *testing.T) {
 	if ok, _ := s.Has(ref, "add"); !ok { t.Fatal("lower-camel method missing") }
 	result, err := s.Call(ref, "add", []Value{IntValue(3)}); if err != nil || result.Int != 5 { t.Fatalf("method = %#v, %v", result, err) }
 	child, err := s.Get(ref, "child"); if err != nil || child.Kind != KindHostObject { t.Fatalf("child = %#v, %v", child, err) }
+	missing, err := s.Get(ref, "missing"); if err != nil || missing.Kind != KindUndefined { t.Fatalf("missing property = %#v, %v", missing, err) }
 	copyRef, err := s.RegisterObject(demoHost{Name: "copy"}); if err != nil { t.Fatal(err) }
 	copyName, _ := s.Get(copyRef, "name"); if copyName.String != "copy" { t.Fatalf("copy = %#v", copyName) }
 }

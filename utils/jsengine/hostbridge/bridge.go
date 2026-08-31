@@ -34,7 +34,7 @@ func (s *Session) Get(ref HostRef, name string) (Value, error) {
 			return HostFunctionValueForMethod(ref, method.Name), nil
 		}
 	}
-	return UndefinedValue(), fmt.Errorf("HostRef %d has no property %q", ref, name)
+	return UndefinedValue(), nil
 }
 
 // HostFunctionValueForMethod is a marker useful to adapters inspecting a
