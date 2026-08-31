@@ -83,3 +83,24 @@ No runtime skip was taken: both explicit runtime environments were available. No
 - QuickJS-Go and native providers expose different host-side primitive representation through `ExportPrimitive` (`float64` versus integer-preserving values); the suite compares values, not Go representation types.
 - Reentrant callback coverage remains represented by each provider's existing focused test because invoking a QuickJS-Go callback from a Go host method while the event loop task is active is not engine-neutral. No callback dispatcher, event-loop, fetch, or websocket code was changed.
 - Build warnings originate in the pinned QuickJS-NG source and are not provider warnings.
+
+## Follow-up regressions
+
+- `nativeCodec.Decode` now rejects a nil callback target before any `reflect.Type` or `reflect.MakeFunc` operation, returning the deterministic `native codec callback target is nil` error instead of allowing a Go panic to cross the host callback boundary.
+- The no-cgo `ExposeDangerous` stub returns the exact `ErrNativeRuntimeUnsupported` sentinel. An isolated no-cgo test invocation passed because the package's existing cgo-only adapter tests cannot compile under `CGO_ENABLED=0`.
+
+Follow-up commands:
+
+```text
+go test ./utils/jsengine/native -run TestNativeCodecRejectsNilCallbackTarget -count=1
+ok   Scardice-core/utils/jsengine/native  0.003s
+
+CGO_ENABLED=0 go test ./utils/jsengine/native/native_nocgo.go ./utils/jsengine/native/native_nocgo_test.go ./utils/jsengine/native/loader.go ./utils/jsengine/native/errors.go -run TestNoCgoExposeDangerousReturnsUnsupported -count=1
+ok   command-line-arguments  0.002s
+
+go test ./utils/jsengine/hostbridge -run 'TestHostBridge(ReadOnlySliceRejectsWrites|GetReturnsCallableFunctionHandles)$' -count=1
+ok   Scardice-core/utils/jsengine/hostbridge  0.003s
+
+SCARDICE_QUICKJS_PACKAGE=/tmp/scardice-quickjs-root go test ./runtime-plugins/quickjs/test -count=1
+ok   Scardice-core/runtime-plugins/quickjs/test  0.030s
+```

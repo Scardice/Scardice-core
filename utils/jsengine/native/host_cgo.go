@@ -382,6 +382,9 @@ type nativeCodec struct {
 }
 
 func (c nativeCodec) Decode(value hostbridge.Value, target reflect.Type) (reflect.Value, error) {
+	if target == nil {
+		return reflect.Value{}, errors.New("native codec callback target is nil")
+	}
 	if target.Kind() != reflect.Func {
 		return reflect.Value{}, fmt.Errorf("native codec callback target must be a function")
 	}

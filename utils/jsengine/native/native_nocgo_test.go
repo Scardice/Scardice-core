@@ -50,3 +50,12 @@ func TestNoCgoMissingLibraryKeepsSpecificDiagnostic(t *testing.T) {
 		t.Fatalf("Load() error = %v, want ErrNativeRuntimeUnsupported", err)
 	}
 }
+func TestNoCgoExposeDangerousReturnsUnsupported(t *testing.T) {
+	value, err := ExposeDangerous(nil, struct{}{})
+	if value != nil {
+		t.Fatal("ExposeDangerous returned a value without cgo")
+	}
+	if err != ErrNativeRuntimeUnsupported {
+		t.Fatalf("ExposeDangerous() error = %v, want ErrNativeRuntimeUnsupported", err)
+	}
+}
