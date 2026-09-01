@@ -50,17 +50,17 @@ static int host_delete_property(JSContext *, JSValueConst, JSAtom);
 static int host_get_own_property(JSContext *, JSPropertyDescriptor *, JSValueConst, JSAtom);
 static int host_get_own_property_names(JSContext *, JSPropertyEnum **, uint32_t *, JSValueConst);
 static int host_define_own_property(JSContext *, JSValueConst, JSAtom, JSValueConst, JSValueConst, JSValueConst, int);
-static void host_finalizer(JSRuntime *, JSValueConst);
-static JSValue host_function_call(JSContext *, JSValueConst, int, JSValueConst *, int, JSValueConst *);
-static char *module_normalize(JSContext *, const char *, const char *, void *);
-static JSModuleDef *module_loader(JSContext *, const char *, void *);
-static JSValue require_call(JSContext *, JSValueConst, int, JSValueConst *);
-static int runtime_interrupt(JSRuntime *, void *);
+static void host_finalizer(JSRuntime *, JSValueConst) noexcept;
+static JSValue host_function_call(JSContext *, JSValueConst, int, JSValueConst *, int, JSValueConst *) noexcept;
+static char *module_normalize(JSContext *, const char *, const char *, void *) noexcept;
+static JSModuleDef *module_loader(JSContext *, const char *, void *) noexcept;
+static JSValue require_call(JSContext *, JSValueConst, int, JSValueConst *) noexcept;
+static int runtime_interrupt(JSRuntime *, void *) noexcept;
 
-static JSValue timer_set_timeout(JSContext *, JSValueConst, int, JSValueConst *);
-static JSValue timer_clear_timeout(JSContext *, JSValueConst, int, JSValueConst *);
-static JSValue queue_microtask_call(JSContext *, JSValueConst, int, JSValueConst *);
-static JSValue microtask_job(JSContext *, int, JSValueConst *);
+static JSValue timer_set_timeout(JSContext *, JSValueConst, int, JSValueConst *) noexcept;
+static JSValue timer_clear_timeout(JSContext *, JSValueConst, int, JSValueConst *) noexcept;
+static JSValue queue_microtask_call(JSContext *, JSValueConst, int, JSValueConst *) noexcept;
+static JSValue microtask_job(JSContext *, int, JSValueConst *) noexcept;
 static JSClassExoticMethods g_host_exotic = {
     host_get_own_property,
     host_get_own_property_names,
@@ -606,6 +606,9 @@ struct Runtime {
             return kTypeString;
         }
         if (JS_IsObject(raw)) {
+            if (g_host_class_id != JS_INVALID_CLASS_ID && JS_GetOpaque(raw, g_host_class_id) != nullptr) {
+                return kTypeHostObject;
+            }
             return JS_IsFunction(context, raw) ? kTypeFunction : kTypeObject;
         }
         if (JS_VALUE_GET_NORM_TAG(raw) == JS_TAG_INT) {
@@ -624,7 +627,15 @@ struct Runtime {
         }
         Value *value = nullptr;
         try {
-            value = new Value{this, raw, forced_type == 0 ? detect_type(raw) : forced_type};
+            const uint32_t type = forced_type == 0 ? detect_type(raw) : forced_type;
+            value = new Value{this, raw, type};
+            if (type == kTypeHostObject && g_host_class_id != JS_INVALID_CLASS_ID) {
+                HostProxy *proxy = static_cast<HostProxy *>(JS_GetOpaque(raw, g_host_class_id));
+                if (proxy != nullptr) {
+                    value->host_ref = proxy->ref;
+                    value->host_kind = proxy->kind;
+                }
+            }
             values.insert(value);
         } catch (...) {
             if (value != nullptr) {
@@ -1777,7 +1788,7 @@ static Runtime *runtime_from_context(JSContext *context) noexcept {
 }
 
 static JSValue timer_set_timeout(JSContext *context, JSValueConst, int argc,
-                                 JSValueConst *argv) {
+                                 JSValueConst *argv) noexcept {
     Runtime *runtime = runtime_from_context(context);
     if (runtime == nullptr || !runtime->started || runtime->stopping) {
         return JS_ThrowInternalError(context, "QuickJS runtime is stopping");
@@ -1803,7 +1814,7 @@ static JSValue timer_set_timeout(JSContext *context, JSValueConst, int argc,
 }
 
 static JSValue timer_clear_timeout(JSContext *context, JSValueConst, int argc,
-                                   JSValueConst *argv) {
+                                   JSValueConst *argv) noexcept {
     Runtime *runtime = runtime_from_context(context);
     if (runtime == nullptr || !runtime->started || runtime->stopping) {
         return JS_ThrowInternalError(context, "QuickJS runtime is stopping");
@@ -1821,7 +1832,7 @@ static JSValue timer_clear_timeout(JSContext *context, JSValueConst, int argc,
     return JS_UNDEFINED;
 }
 
-static JSValue microtask_job(JSContext *context, int argc, JSValueConst *argv) {
+static JSValue microtask_job(JSContext *context, int argc, JSValueConst *argv) noexcept {
     if (argc < 1 || !JS_IsFunction(context, argv[0])) {
         return JS_ThrowTypeError(context, "queued microtask is not callable");
     }
@@ -1834,7 +1845,7 @@ static JSValue microtask_job(JSContext *context, int argc, JSValueConst *argv) {
 }
 
 static JSValue queue_microtask_call(JSContext *context, JSValueConst, int argc,
-                                    JSValueConst *argv) {
+                                    JSValueConst *argv) noexcept {
     Runtime *runtime = runtime_from_context(context);
     if (runtime == nullptr || !runtime->started || runtime->stopping) {
         return JS_ThrowInternalError(context, "QuickJS runtime is stopping");
@@ -1850,6 +1861,7 @@ static JSValue queue_microtask_call(JSContext *context, JSValueConst, int argc,
     JS_FreeValue(context, callback);
     return JS_UNDEFINED;
 }
+
 static Runtime *runtime_from(sc_runtime_t handle) noexcept {
     if (handle == 0) {
         return nullptr;
@@ -1873,12 +1885,15 @@ static sc_status_t boundary(Runtime *runtime, Function &&function) noexcept {
     }
 }
 
-static JSValue throw_runtime_error(JSContext *context, Runtime *runtime, sc_status_t status) {
-    const std::string &message = runtime->last_error.empty() ? std::string("host callback failed") : runtime->last_error;
-    if (status == SC_EEXCEPTION) {
-        return JS_ThrowInternalError(context, "%s", message.c_str());
+static JSValue throw_runtime_error(JSContext *context, Runtime *runtime, sc_status_t status) noexcept {
+    if (runtime == nullptr) {
+        return JS_ThrowInternalError(context, "native QuickJS runtime is unavailable");
     }
-    return JS_ThrowTypeError(context, "%s", message.c_str());
+    const char *message = runtime->last_error.empty() ? "host callback failed" : runtime->last_error.c_str();
+    if (status == SC_EEXCEPTION) {
+        return JS_ThrowInternalError(context, "%s", message);
+    }
+    return JS_ThrowTypeError(context, "%s", message);
 }
 
 static HostProxy *proxy_from(JSValueConst object) {
@@ -2093,34 +2108,40 @@ static int host_define_own_property(JSContext *context, JSValueConst object, JSA
     }
 }
 
-static void host_finalizer(JSRuntime *, JSValueConst object) {
+static void host_finalizer(JSRuntime *, JSValueConst object) noexcept {
     HostProxy *proxy = proxy_from(object);
     delete proxy;
 }
 
 static JSValue host_function_call(JSContext *context, JSValueConst this_value, int argc,
-                                  JSValueConst *argv, int, JSValueConst *function_data) {
-    Runtime *runtime = static_cast<Runtime *>(JS_GetContextOpaque(context));
-    if (runtime == nullptr || function_data == nullptr || argc < 0) {
-        return JS_ThrowInternalError(context, "invalid Scardice host function");
+                                  JSValueConst *argv, int, JSValueConst *function_data) noexcept {
+    try {
+        Runtime *runtime = static_cast<Runtime *>(JS_GetContextOpaque(context));
+        if (runtime == nullptr || function_data == nullptr || argc < 0) {
+            return JS_ThrowInternalError(context, "invalid Scardice host function");
+        }
+        uint64_t function = 0;
+        if (JS_ToBigUint64(context, &function, function_data[0]) < 0 || function == 0) {
+            runtime->capture_exception();
+            return JS_ThrowTypeError(context, "%s", runtime->last_error.c_str());
+        }
+        JSValue result = JS_UNDEFINED;
+        if (runtime->host_call(function, this_value, argc, argv, &result) < 0) {
+            return throw_runtime_error(context, runtime, SC_EHOST);
+        }
+        return result;
+    } catch (const std::bad_alloc &) {
+        return JS_ThrowOutOfMemory(context);
+    } catch (...) {
+        return JS_ThrowInternalError(context, "host function call failed");
     }
-    uint64_t function = 0;
-    if (JS_ToBigUint64(context, &function, function_data[0]) < 0 || function == 0) {
-        runtime->capture_exception();
-        return JS_ThrowTypeError(context, "%s", runtime->last_error.c_str());
-    }
-    JSValue result = JS_UNDEFINED;
-    if (runtime->host_call(function, this_value, argc, argv, &result) < 0) {
-        return throw_runtime_error(context, runtime, SC_EHOST);
-    }
-    return result;
 }
 
 static std::string module_name_for(const char *base_name, const char *name) {
     return join_module_name(base_name, name);
 }
 
-static char *module_normalize(JSContext *context, const char *base_name, const char *name, void *) {
+static char *module_normalize(JSContext *context, const char *base_name, const char *name, void *) noexcept {
     try {
         std::string normalized = module_name_for(base_name, name);
         return js_strdup(context, normalized.c_str());
@@ -2133,54 +2154,68 @@ static char *module_normalize(JSContext *context, const char *base_name, const c
     }
 }
 
-static JSModuleDef *module_loader(JSContext *context, const char *module_name, void *opaque) {
-    Runtime *runtime = static_cast<Runtime *>(opaque);
-    if (runtime == nullptr || module_name == nullptr) {
-        JS_ThrowReferenceError(context, "invalid JavaScript module");
+static JSModuleDef *module_loader(JSContext *context, const char *module_name, void *opaque) noexcept {
+    try {
+        Runtime *runtime = static_cast<Runtime *>(opaque);
+        if (runtime == nullptr || module_name == nullptr) {
+            JS_ThrowReferenceError(context, "invalid JavaScript module");
+            return nullptr;
+        }
+        auto it = runtime->modules.find(module_name);
+        if (it == runtime->modules.end()) {
+            JS_ThrowReferenceError(context, "module '%s' was not loaded", module_name);
+            return nullptr;
+        }
+        JSValue compiled = JS_Eval(context, it->second.c_str(), it->second.size(), module_name,
+                                   JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (JS_IsException(compiled)) {
+            runtime->capture_exception();
+            return nullptr;
+        }
+        return reinterpret_cast<JSModuleDef *>(JS_VALUE_GET_PTR(compiled));
+    } catch (const std::bad_alloc &) {
+        JS_ThrowOutOfMemory(context);
+        return nullptr;
+    } catch (...) {
+        JS_ThrowInternalError(context, "module loading failed");
         return nullptr;
     }
-    auto it = runtime->modules.find(module_name);
-    if (it == runtime->modules.end()) {
-        JS_ThrowReferenceError(context, "module '%s' was not loaded", module_name);
-        return nullptr;
-    }
-    JSValue compiled = JS_Eval(context, it->second.c_str(), it->second.size(), module_name,
-                               JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-    if (JS_IsException(compiled)) {
-        runtime->capture_exception();
-        return nullptr;
-    }
-    return reinterpret_cast<JSModuleDef *>(JS_VALUE_GET_PTR(compiled));
 }
 
-static JSValue require_call(JSContext *context, JSValueConst, int argc, JSValueConst *argv) {
-    Runtime *runtime = static_cast<Runtime *>(JS_GetContextOpaque(context));
-    if (runtime == nullptr || argc != 1) {
-        return JS_ThrowTypeError(context, "require expects one module name");
-    }
-    size_t length = 0;
-    const char *name = JS_ToCStringLen(context, &length, argv[0]);
-    if (name == nullptr) {
-        runtime->capture_exception();
-        return JS_EXCEPTION;
-    }
-    std::string module_name;
+static JSValue require_call(JSContext *context, JSValueConst, int argc, JSValueConst *argv) noexcept {
     try {
-        module_name.assign(name, length);
-    } catch (...) {
+        Runtime *runtime = static_cast<Runtime *>(JS_GetContextOpaque(context));
+        if (runtime == nullptr || argc != 1) {
+            return JS_ThrowTypeError(context, "require expects one module name");
+        }
+        size_t length = 0;
+        const char *name = JS_ToCStringLen(context, &length, argv[0]);
+        if (name == nullptr) {
+            runtime->capture_exception();
+            return JS_EXCEPTION;
+        }
+        std::string module_name;
+        try {
+            module_name.assign(name, length);
+        } catch (...) {
+            JS_FreeCString(context, name);
+            return JS_ThrowOutOfMemory(context);
+        }
         JS_FreeCString(context, name);
+        auto it = runtime->modules.find(module_name);
+        if (it == runtime->modules.end()) {
+            return JS_ThrowReferenceError(context, "module '%s' was not loaded", module_name.c_str());
+        }
+        JSValue result = runtime->eval_commonjs_raw(module_name, it->second);
+        if (JS_IsException(result)) {
+            return JS_EXCEPTION;
+        }
+        return result;
+    } catch (const std::bad_alloc &) {
         return JS_ThrowOutOfMemory(context);
+    } catch (...) {
+        return JS_ThrowInternalError(context, "require failed");
     }
-    JS_FreeCString(context, name);
-    auto it = runtime->modules.find(module_name);
-    if (it == runtime->modules.end()) {
-        return JS_ThrowReferenceError(context, "module '%s' was not loaded", module_name.c_str());
-    }
-    JSValue result = runtime->eval_commonjs_raw(module_name, it->second);
-    if (JS_IsException(result)) {
-        return JS_EXCEPTION;
-    }
-    return result;
 }
 
 static sc_status_t SC_CALL api_create(const sc_host_api_v1 *host, sc_host_ctx_t host_ctx,
@@ -2224,7 +2259,12 @@ static sc_status_t SC_CALL api_stop(sc_runtime_t handle) noexcept {
 
 static void SC_CALL api_destroy(sc_runtime_t handle) noexcept {
     Runtime *runtime = runtime_from(handle);
-    delete runtime;
+    try {
+        delete runtime;
+    } catch (...) {
+        // The Runtime destructor is noexcept; keep this boundary defensive
+        // if its implementation changes in a future provider revision.
+    }
 }
 
 static sc_status_t SC_CALL api_eval(sc_runtime_t handle, sc_string_view filename,
@@ -2573,7 +2613,7 @@ static const sc_runtime_plugin_v1 kPlugin = {
 };
 
 
-static int runtime_interrupt(JSRuntime *, void *opaque) {
+static int runtime_interrupt(JSRuntime *, void *opaque) noexcept {
     Runtime *runtime = static_cast<Runtime *>(opaque);
     if (runtime == nullptr) {
         return 0;
@@ -2583,7 +2623,7 @@ static int runtime_interrupt(JSRuntime *, void *opaque) {
     }
     if (runtime->deadline_active && std::chrono::steady_clock::now() >= runtime->deadline) {
         runtime->pending_host_status = SC_ETIMEOUT;
-        runtime->last_error = "QuickJS execution timeout";
+        runtime->fail(SC_ETIMEOUT, "QuickJS execution timeout");
         return 1;
     }
     return 0;
@@ -2593,15 +2633,21 @@ static int runtime_interrupt(JSRuntime *, void *opaque) {
 
 extern "C" SC_EXPORT sc_status_t SC_CALL scardice_runtime_query_v1(
     const sc_runtime_query_v1 *query, const sc_runtime_plugin_v1 **out_plugin) {
-    if (query == nullptr || out_plugin == nullptr || query->struct_size < sizeof(sc_runtime_query_v1)) {
-        return SC_EINVAL;
+    try {
+        if (query == nullptr || out_plugin == nullptr || query->struct_size < sizeof(sc_runtime_query_v1)) {
+            return SC_EINVAL;
+        }
+        if (query->runtime_abi_major != SC_RUNTIME_ABI_MAJOR || query->runtime_abi_minor > SC_RUNTIME_ABI_MINOR) {
+            return SC_EABI;
+        }
+        if (query->host_abi_major != SC_HOST_ABI_MAJOR || query->host_abi_minor > SC_HOST_ABI_MINOR) {
+            return SC_EABI;
+        }
+        *out_plugin = reinterpret_cast<const sc_runtime_plugin_v1 *>(&kPlugin);
+        return SC_OK;
+    } catch (const std::bad_alloc &) {
+        return SC_EOOM;
+    } catch (...) {
+        return SC_EINTERNAL;
     }
-    if (query->runtime_abi_major != SC_RUNTIME_ABI_MAJOR || query->runtime_abi_minor > SC_RUNTIME_ABI_MINOR) {
-        return SC_EABI;
-    }
-    if (query->host_abi_major != SC_HOST_ABI_MAJOR || query->host_abi_minor > SC_HOST_ABI_MINOR) {
-        return SC_EABI;
-    }
-    *out_plugin = reinterpret_cast<const sc_runtime_plugin_v1 *>(&kPlugin);
-    return SC_OK;
 }

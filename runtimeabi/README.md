@@ -6,11 +6,12 @@ This directory freezes the C ABI used by Scardice Core to discover and drive a n
 
 Runtime ABI v1.0 and Host ABI v1.0 are frozen. Existing fields and function-pointer slots are append-only. A v1 implementation must not reorder or reinterpret an existing field. ABI v2 will use a new query symbol rather than changing this contract.
 
-This phase defines the contract and compile/layout fixtures only. It does **not** implement a loader, native runtime, QuickJS integration, or Go adapter.
+The ABI directory contains the contract, compile/layout fixtures, and the frozen v1 compatibility header used by native-provider smoke tests. Native runtime loading and QuickJS integration live under [`runtime-plugins/quickjs`](../runtime-plugins/quickjs).
 
 ## Contents
 
-- [`include/scardice_runtime_v1.h`](include/scardice_runtime_v1.h) — the public C header.
+- [`include/scardice_runtime_v1.h`](include/scardice_runtime_v1.h) — the current public C header.
+- [`compat/v1/scardice_runtime_v1.h`](compat/v1/scardice_runtime_v1.h) — the byte-for-byte frozen v1 compatibility fixture.
 - [`ABI.md`](ABI.md) — field order, call semantics, lifetime, threading, errors, and negotiation rules.
 - [`CHANGELOG.md`](CHANGELOG.md) — changes to the frozen ABI.
 - [`tests/layout.c`](tests/layout.c) and [`tests/layout.cc`](tests/layout.cc) — C and C++ compile/layout smoke fixtures.

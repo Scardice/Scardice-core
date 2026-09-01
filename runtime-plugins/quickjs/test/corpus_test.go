@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"Scardice-core/utils/jsengine"
-	legacyquickjs "Scardice-core/utils/jsengine/quickjs"
 	"Scardice-core/utils/jsengine/native"
 )
 
@@ -26,7 +25,7 @@ type corpusEntry struct {
 
 type corpusFixture struct {
 	Name               string        `json:"name"`
-	Entries            []corpusEntry  `json:"entries"`
+	Entries            []corpusEntry `json:"entries"`
 	Observe            string        `json:"observe"`
 	Pump               string        `json:"pump"`
 	WaitMS             int           `json:"waitMS"`
@@ -66,7 +65,7 @@ func (h *corpusExtensionHost) Dispatch(callback func(string) string, value strin
 }
 
 type corpusSealHost struct {
-	Version string             `jsbind:"version"`
+	Version string               `jsbind:"version"`
 	Ext     *corpusExtensionHost `jsbind:"ext"`
 }
 
@@ -149,11 +148,6 @@ func runCorpusFixture(t *testing.T, fixture corpusFixture, open func(*testing.T)
 		return corpusObservation{Status: "unsupported", Note: fmt.Sprintf("capability %q is not advertised by %s (%d)", fixture.RequiresCapability, descriptor.ID, descriptor.Capabilities)}
 	}
 	defer loop.Close()
-	if start {
-		if err := legacyquickjs.Start(loop); err != nil {
-			return corpusObservation{Status: "error", ErrorCategory: corpusErrorCategory(err), Note: err.Error()}
-		}
-	}
 	var host *corpusExtensionHost
 	if fixture.Host {
 		host = &corpusExtensionHost{}
@@ -238,15 +232,6 @@ func runCorpusFixture(t *testing.T, fixture corpusFixture, open func(*testing.T)
 	return observation
 }
 
-func openLegacyCorpus(t *testing.T) (jsengine.Loop, jsengine.Descriptor) {
-	t.Helper()
-	loop, err := legacyquickjs.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return loop, loop.Descriptor()
-}
-
 func openNativeCorpus(t *testing.T) (jsengine.Loop, jsengine.Descriptor) {
 	t.Helper()
 	root := os.Getenv("SCARDICE_QUICKJS_PACKAGE")
@@ -271,33 +256,58 @@ func openNativeCorpus(t *testing.T) (jsengine.Loop, jsengine.Descriptor) {
 	return loop, loop.Descriptor()
 }
 
-func TestQuickJSBlackBoxCorpusParity(t *testing.T) {
+func TestQuickJSNativeCorpus(t *testing.T) {
 	fixtures := loadCorpus(t)
 	if os.Getenv("SCARDICE_QUICKJS_PACKAGE") == "" {
 		t.Skip("SCARDICE_QUICKJS_PACKAGE is not set; native parity provider is unavailable")
 	}
+	want := map[string]corpusObservation{
+		"commonjs-module-cache": {
+			Status: "ok", Result: `{"same":true,"loads":1,"value":"dep"}`,
+		},
+		"esm-module-load": {
+			Status: "ok", Result: `{"answer":42,"type":"number"}`,
+		},
+		"promise-microtask-order": {
+			Status: "ok", Result: `["sync","promise","microtask"]`,
+		},
+		"resource-boundary-capability": {
+			Status: "unsupported",
+		},
+		"script-evaluation": {
+			Status: "ok", Result: `{"answer":42,"trace":["script"]}`,
+		},
+		"seal-version-extension-callback": {
+			Status:     "ok",
+			Result:     `{"version":"14.0.0","registered":true,"callback":"callback:event"}`,
+			HostCalls:  1,
+			HostEvents: "register:parity-extension,dispatch:start,dispatch:end",
+		},
+		"thrown-error-source-location": {
+			Status: "error", Result: `{"beforeError":"set"}`, ErrorCategory: "javascript",
+			ErrorMessage: "parity boom", StackPresent: true, Filename: "errors/source.js",
+		},
+		"timer-order-cancellation-delay": {
+			Status: "ok", Result: `["zero","delayed"]`,
+		},
+	}
 	for _, fixture := range fixtures {
 		t.Run(fixture.Name, func(t *testing.T) {
-			legacy := runCorpusFixture(t, fixture, openLegacyCorpus, true)
-			native := runCorpusFixture(t, fixture, openNativeCorpus, false)
-			t.Logf("matrix fixture=%s legacy=%+v native=%+v", fixture.Name, legacy, native)
-			if legacy.Status != native.Status ||
-				legacy.Result != native.Result ||
-				legacy.ErrorCategory != native.ErrorCategory ||
-				legacy.ErrorMessage != native.ErrorMessage ||
-				legacy.StackPresent != native.StackPresent ||
-				legacy.Filename != native.Filename ||
-				legacy.HostCalls != native.HostCalls ||
-				legacy.HostEvents != native.HostEvents {
-				t.Fatalf("observable divergence: legacy=%+v native=%+v", legacy, native)
+			observation := runCorpusFixture(t, fixture, openNativeCorpus, false)
+			t.Logf("native fixture=%s observation=%+v", fixture.Name, observation)
+			expected, ok := want[fixture.Name]
+			if !ok {
+				t.Fatalf("fixture %q has no expected native observation", fixture.Name)
 			}
-			if fixture.ExpectError {
-				filename := fixture.Entries[len(fixture.Entries)-1].Filename
-				for provider, observation := range map[string]corpusObservation{"legacy": legacy, "native": native} {
-					if observation.Status != "error" || observation.ErrorCategory != "javascript" || !observation.StackPresent || !strings.Contains(observation.Note, filename) {
-						t.Fatalf("%s missing source-located JavaScript error %q: %+v", provider, filename, observation)
-					}
-				}
+			if observation.Status != expected.Status ||
+				observation.Result != expected.Result ||
+				observation.ErrorCategory != expected.ErrorCategory ||
+				observation.ErrorMessage != expected.ErrorMessage ||
+				observation.StackPresent != expected.StackPresent ||
+				observation.Filename != expected.Filename ||
+				observation.HostCalls != expected.HostCalls ||
+				observation.HostEvents != expected.HostEvents {
+				t.Fatalf("native observation = %+v, want %+v", observation, expected)
 			}
 		})
 	}

@@ -119,7 +119,10 @@ func TestJsScriptTaskRunWithoutActiveLoopReturnsWithoutPanic(t *testing.T) {
 	}
 }
 
-func TestJsInit_QuickJSStartsExperimentalHost(t *testing.T) {
+func TestJsInit_QuickJSStartsNativeHost(t *testing.T) {
+	if os.Getenv("SCARDICE_RUNTIME_ROOT") == "" && os.Getenv("SCARDICE_QUICKJS_PACKAGE") == "" {
+		t.Skip("native QuickJS package is not configured")
+	}
 	d := &Dice{
 		Logger: zap.NewNop().Sugar(),
 		BaseConfig: BaseConfig{
@@ -142,16 +145,20 @@ func TestJsInit_QuickJSStartsExperimentalHost(t *testing.T) {
 	d.JsInit()
 
 	if !d.Config.JsEnable {
-		t.Fatal("QuickJS-Go initialization left JS disabled")
+		if d.jsRuntimeManager != nil {
+			status, ok := d.jsRuntimeManager.Status("quickjs")
+			t.Fatalf("native QuickJS initialization left JS disabled: status=%+v ok=%v", status, ok)
+		}
+		t.Fatal("QuickJS initialization left JS disabled")
 	}
 	if d.ExtLoopManager == nil {
-		t.Fatal("QuickJS-Go initialization did not create a loop manager")
+		t.Fatalf("native QuickJS initialization did not create a loop manager")
 	}
 	loop, err := d.ExtLoopManager.GetLoop(d.ExtLoopManager.version)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loop == nil || loop.Engine() != jsengine.EngineQuickJS {
+	if loop == nil || loop.Engine() != "quickjs" {
 		t.Fatalf("engine loop = %#v", loop)
 	}
 
@@ -168,32 +175,26 @@ func TestJsInit_QuickJSStartsExperimentalHost(t *testing.T) {
 			return err
 		}
 		if !value.ToBoolean() {
-			t.Fatal("QuickJS-Go Host API is incomplete")
+			t.Fatal("native QuickJS Host API is incomplete")
 		}
 		return nil
 	}); err != nil {
+
 		t.Fatal(err)
 	}
 }
-
-func TestJsLoadScriptRaw_QuickJSExecutesAndRegistersPlugin(t *testing.T) {
+func TestJsLoadScriptRaw_NativeQuickJSExecutesAndRegistersPlugin(t *testing.T) {
+	if os.Getenv("SCARDICE_RUNTIME_ROOT") == "" && os.Getenv("SCARDICE_QUICKJS_PACKAGE") == "" {
+		t.Skip("native QuickJS package is not configured")
+	}
 	dataDir := t.TempDir()
-	scriptPath := filepath.Join(dataDir, "quickjs-plugin.js")
+	scriptPath := filepath.Join(dataDir, "native-quickjs-plugin.js")
 	if err := os.WriteFile(scriptPath, []byte(`
-		import { Buffer } from "buffer";
-		import { subtle } from "crypto";
-		const util = await import("util");
-		const fs = require("fs");
-		if (Buffer.from("ok").toString() !== "ok") throw new Error("buffer unavailable");
-		if (typeof subtle.digest !== "function") throw new Error("crypto unavailable");
-		if (util.format("%s:%d", "ok", 7) !== "ok:7") throw new Error("util unavailable");
-		if (typeof fs.promises.readFile !== "function") throw new Error("fs unavailable");
-		const ext = seal.ext.new("QuickJS Plugin Test", "test", "1.0.0");
+		const ext = seal.ext.new("Native QuickJS Plugin Test", "test", "1.0.0");
 		seal.ext.register(ext);
 	`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-
 	d := &Dice{
 		Logger: zap.NewNop().Sugar(),
 		BaseConfig: BaseConfig{
@@ -213,39 +214,92 @@ func TestJsLoadScriptRaw_QuickJSExecutesAndRegistersPlugin(t *testing.T) {
 			d.ExtLoopManager.SetLoop(nil)
 		}
 	})
-
 	d.JsInit()
+	if !d.Config.JsEnable {
+		t.Fatal("native QuickJS initialization failed")
+	}
+
 	script := &JsScriptInfo{
-		Name:     "QuickJS Plugin Test",
+		Name:     "Native QuickJS Plugin Test",
 		Author:   "test",
 		Version:  "1.0.0",
 		Enable:   true,
 		Filename: scriptPath,
 	}
 	d.JsLoadScriptRaw(script)
-
 	if script.ErrText != "" {
-		t.Fatalf("QuickJS-Go rejected plugin: %s", script.ErrText)
+		t.Fatalf("native QuickJS rejected plugin: %s", script.ErrText)
 	}
-	ext, ok := d.JsExtRegistry.Load("QuickJS Plugin Test")
-	if !ok || ext == nil {
-		t.Fatal("QuickJS-Go plugin did not register its extension")
-	}
-	if ext.Name != "QuickJS Plugin Test" {
-		t.Fatalf("extension name = %q", ext.Name)
+	if ext, ok := d.JsExtRegistry.Load(script.Name); !ok || ext == nil {
+		t.Fatal("native QuickJS did not register its extension")
 	}
 }
 
-func TestJsLoadScriptRaw_QuickJSRejectsPathESMImport(t *testing.T) {
+func TestJsInit_QuickJSDoesNotFallbackWithoutNativePackage(t *testing.T) {
+	if os.Getenv("SCARDICE_RUNTIME_ROOT") != "" || os.Getenv("SCARDICE_QUICKJS_PACKAGE") != "" {
+		t.Skip("native QuickJS package is configured")
+	}
+	d := &Dice{
+		Logger: zap.NewNop().Sugar(),
+		BaseConfig: BaseConfig{
+			DataDir: t.TempDir(),
+		},
+		ImSession: &IMSession{
+			ServiceAtNew: new(SyncMap[string, *GroupInfo]),
+			EndPoints:    []*EndPointInfo{},
+		},
+		DirtyGroups:  new(SyncMap[string, int64]),
+		AttrsManager: &AttrsManager{},
+	}
+	d.Config.JsEngine = "quickjs"
+
+	d.JsInit()
+
+	if d.Config.JsEnable {
+		t.Fatal("QuickJS was enabled without an installed native provider")
+	}
+	if d.ExtLoopManager == nil {
+		t.Fatal("QuickJS initialization did not create a loop manager")
+	}
+	if loop, _ := d.ExtLoopManager.CurrentLoop(); loop != nil {
+		t.Fatal("QuickJS initialization retained a loop after provider failure")
+	}
+}
+
+func TestJsLoadScriptRaw_NativeQuickJSRejectsPathESMImport(t *testing.T) {
+	if os.Getenv("SCARDICE_RUNTIME_ROOT") == "" && os.Getenv("SCARDICE_QUICKJS_PACKAGE") == "" {
+		t.Skip("native QuickJS package is not configured")
+	}
 	dataDir := t.TempDir()
 	scriptPath := filepath.Join(dataDir, "quickjs-blocked-import.js")
 	if err := os.WriteFile(scriptPath, []byte(`import "./blocked-helper.js";`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	d := newQuickJSNodeTestDice(t)
-	d.BaseConfig.DataDir = dataDir
+	d := &Dice{
+		Logger: zap.NewNop().Sugar(),
+		BaseConfig: BaseConfig{
+			DataDir: dataDir,
+		},
+		ImSession: &IMSession{
+			ServiceAtNew: new(SyncMap[string, *GroupInfo]),
+			EndPoints:    []*EndPointInfo{},
+		},
+		DirtyGroups:  new(SyncMap[string, int64]),
+		AttrsManager: &AttrsManager{},
+		ExtRegistry:  new(SyncMap[string, *ExtInfo]),
+	}
+	d.Config.JsEngine = "quickjs"
 	d.JsInit()
+	t.Cleanup(func() {
+		if d.ExtLoopManager != nil {
+			d.ExtLoopManager.SetLoop(nil)
+		}
+	})
+	if !d.Config.JsEnable {
+		t.Fatal("native QuickJS initialization failed")
+	}
+
 	script := &JsScriptInfo{
 		Name:     "QuickJS Blocked Import",
 		Enable:   true,

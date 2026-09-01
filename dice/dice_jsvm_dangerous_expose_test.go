@@ -1,12 +1,13 @@
 package dice
 
 import (
+	"os"
 	"testing"
 
 	"github.com/dop251/goja"
+	"go.uber.org/zap"
 
 	"Scardice-core/utils/jsengine"
-	"Scardice-core/utils/jsengine/quickjs"
 )
 
 func TestExposeDangerousJSValueRecursivelyExposesAndMutatesSealInst(t *testing.T) {
@@ -111,29 +112,44 @@ func TestExposeDangerousJSValueRecursivelyExposesAndMutatesSealInst(t *testing.T
 	}
 }
 
-func TestInstallDangerousJSInstanceQuickJSMatchesGojaMutationContract(t *testing.T) {
+func TestInstallDangerousJSInstanceNativeQuickJSMatchesGojaMutationContract(t *testing.T) {
+	if os.Getenv("SCARDICE_RUNTIME_ROOT") == "" && os.Getenv("SCARDICE_QUICKJS_PACKAGE") == "" {
+		t.Skip("native QuickJS package is not configured")
+	}
 	d := &Dice{
+		Logger: zap.NewNop().Sugar(),
+		BaseConfig: BaseConfig{
+			DataDir: t.TempDir(),
+		},
+		ImSession: &IMSession{
+			ServiceAtNew: new(SyncMap[string, *GroupInfo]),
+			EndPoints:    []*EndPointInfo{},
+		},
+		DirtyGroups:   new(SyncMap[string, int64]),
+		AttrsManager:  &AttrsManager{},
+		ExtRegistry:   new(SyncMap[string, *ExtInfo]),
 		CommandPrefix: []string{".", "。"},
 		DiceMasters:   []string{"QQ:1001"},
 		Config: Config{
-			JsConfig:   JsConfig{JsEnable: true},
+			JsConfig:   JsConfig{JsEnable: true, JsEngine: "quickjs"},
 			MailConfig: MailConfig{MailEnable: false},
 		},
 		AdvancedConfig: AdvancedConfig{ExposeDangerousSealInst: true},
 	}
-	loop, err := quickjs.New()
+	d.JsInit()
+	t.Cleanup(func() {
+		if d.ExtLoopManager != nil {
+			d.ExtLoopManager.SetLoop(nil)
+		}
+	})
+	if !d.Config.JsEnable {
+		t.Fatal("native QuickJS initialization failed")
+	}
+	loop, err := d.ExtLoopManager.GetLoop(d.ExtLoopManager.version)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer loop.Close()
-
 	if err := loop.Run(func(runtime jsengine.Runtime) error {
-		if err := d.installJSHostAPI(runtime); err != nil {
-			return err
-		}
-		if err := d.installDangerousJSInstance(runtime, runtime.Get("seal").Object()); err != nil {
-			return err
-		}
 		_, err := runtime.RunString("dangerous-quickjs.js", `
 			if (typeof seal.inst.getDiceDataPath !== "function") throw new Error("missing method");
 			if (typeof seal.inst.jsSealInstExposed !== "undefined") throw new Error("leaked internal field");
@@ -148,7 +164,6 @@ func TestInstallDangerousJSInstanceQuickJSMatchesGojaMutationContract(t *testing
 	}); err != nil {
 		t.Fatal(err)
 	}
-
 	if d.CommandPrefix[0] != "!" || d.CommandPrefix[2] != "/" {
 		t.Fatalf("Go CommandPrefix was not updated: %#v", d.CommandPrefix)
 	}

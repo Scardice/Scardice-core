@@ -240,6 +240,7 @@ type Dice struct {
 	AliveNoticeEntry cron.EntryID         `json:"-"             yaml:"-"`
 	JsPrinter        *PrinterFunc         `json:"-"             yaml:"-"`
 	JsServices       *jsservices.Registry `json:"-"             yaml:"-"`
+	jsRuntimeManager *JSRuntimeManager    `json:"-" yaml:"-"`
 
 	// JsLoop           *eventloop.EventLoop `yaml:"-" json:"-"`
 	ExtLoopManager   *JsLoopManager  `json:"-" yaml:"-"`

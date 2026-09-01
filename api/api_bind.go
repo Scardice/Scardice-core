@@ -755,6 +755,7 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 
 	e.POST(prefix+"/js/reload", jsReload)
 	e.GET(prefix+"/js/reload/status", jsReloadStatus)
+	e.GET(prefix+"/js/runtime/status", jsRuntimeStatus)
 	e.POST(prefix+"/js/execute", jsExec)
 	e.POST(prefix+"/js/upload", jsUpload)
 	e.GET(prefix+"/js/list", jsList)

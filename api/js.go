@@ -1,7 +1,6 @@
 package api
 
 import (
-	"errors"
 	"fmt"
 	"mime/multipart"
 	"net/http"
@@ -48,12 +47,9 @@ func jsExec(c echo.Context) error {
 	}
 
 	source := "(function(exports, require, module) {" + v.Value + "\n})({}, globalThis.require, {exports: {}})"
-	engine, configErr := jsengine.ParseEngineID(myDice.Config.JsEngine)
-	if configErr != nil {
-		return c.JSON(http.StatusOK, map[string]interface{}{
-			"result": false,
-			"err":    fmt.Sprintf("JS引擎配置无效: %v", configErr),
-		})
+	engine := jsengine.NormalizeEngineID(myDice.Config.JsEngine)
+	if engine == "" {
+		engine = jsengine.EngineGoja
 	}
 	if myDice.ExtLoopManager == nil || myDice.JsPrinter == nil {
 		return c.JSON(http.StatusOK, map[string]interface{}{
@@ -64,31 +60,12 @@ func jsExec(c echo.Context) error {
 
 	myDice.JsPrinter.RecordStart()
 	var retFinal interface{}
-	switch engine {
-	case jsengine.EngineQuickJS:
-		loop := myDice.ExtLoopManager.GetWebLoop()
-		if loop == nil {
-			err = errors.New("QuickJS运行时不可用")
-			break
-		}
-		if loop.Engine() != engine {
-			err = errors.New("JS运行时与配置不匹配")
-			break
-		}
-		err = loop.Run(func(runtime jsengine.Runtime) error {
-			ret, runErr := runtime.RunString("api-js-exec.js", source)
-			if runErr != nil {
-				return runErr
-			}
-			retFinal = ret.Export()
-			return nil
-		})
-	case jsengine.EngineGoja:
-		loop := myDice.ExtLoopManager.GetWebLoop()
-		if loop == nil {
-			err = errors.New("Goja运行时不可用")
-			break
-		}
+	loop, _ := myDice.ExtLoopManager.CurrentLoop()
+	if loop == nil {
+		err = fmt.Errorf("JS运行时不可用: %s", engine)
+	} else if loop.Engine() != engine {
+		err = fmt.Errorf("JS运行时与配置不匹配: configured=%s active=%s", engine, loop.Engine())
+	} else {
 		err = loop.Run(func(runtime jsengine.Runtime) error {
 			ret, runErr := runtime.RunString("api-js-exec.js", source)
 			if runErr != nil {
@@ -198,6 +175,19 @@ func jsReloadStatus(c echo.Context) error {
 	}
 	progress := myDice.JsReloadProgressSnapshot()
 	return c.JSON(http.StatusOK, progress)
+}
+func jsRuntimeStatus(c echo.Context) error {
+	if !doAuth(c) {
+		return c.JSON(http.StatusForbidden, nil)
+	}
+	if dm.JustForTest {
+		return c.JSON(http.StatusOK, map[string]interface{}{
+			"testMode": true,
+		})
+	}
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"runtimes": myDice.JSRuntimeStatuses(),
+	})
 }
 
 func jsUpload(c echo.Context) error {

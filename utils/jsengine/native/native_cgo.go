@@ -5,8 +5,16 @@ package native
 /*
 #cgo linux LDFLAGS: -ldl
 #cgo freebsd LDFLAGS: -ldl
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#include <windows.h>
+static uint64_t sc_native_thread_id(void) { return (uint64_t)GetCurrentThreadId(); }
+#else
+#include <pthread.h>
+static uint64_t sc_native_thread_id(void) { return (uint64_t)(uintptr_t)pthread_self(); }
+#endif
 #include "bridge.h"
 */
 import "C"
@@ -188,8 +196,9 @@ type nativeTask struct {
 }
 
 type nativeLoop struct {
-	provider *Provider
-	runtime  uint64
+	provider    *Provider
+	runtime     uint64
+	ownerThread atomic.Uint64
 
 	tasks  chan nativeTask
 	done   chan struct{}
@@ -199,6 +208,10 @@ type nativeLoop struct {
 	closeMu  sync.Mutex
 	closeErr error
 
+	// runMu closes the admission window before shutdown enqueues its stop
+	// task. Calls already admitted finish before provider.stop runs.
+	runMu sync.RWMutex
+
 	host       *nativeHostState
 	hostHandle cgo.Handle
 
@@ -206,12 +219,20 @@ type nativeLoop struct {
 	persistent   map[uint64]uint32
 }
 
-func (l *nativeLoop) Engine() jsengine.EngineID       { return l.provider.descriptor.ID }
+func (l *nativeLoop) Engine() jsengine.EngineID { return l.provider.descriptor.ID }
+func (l *nativeLoop) onOwnerThread() bool {
+	if l == nil {
+		return false
+	}
+	owner := l.ownerThread.Load()
+	return owner != 0 && owner == uint64(C.sc_native_thread_id())
+}
 func (l *nativeLoop) Descriptor() jsengine.Descriptor { return l.provider.descriptor }
 
 func (l *nativeLoop) worker(options jsengine.RuntimeOptions, ready chan<- error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	l.ownerThread.Store(uint64(C.sc_native_thread_id()))
 
 	host := newNativeHostState(l)
 	l.host = host
@@ -279,6 +300,8 @@ func (l *nativeLoop) Run(run func(jsengine.Runtime) error) error {
 	if run == nil {
 		return errors.New("native runtime callback is nil")
 	}
+	l.runMu.RLock()
+	defer l.runMu.RUnlock()
 	if l.closed.Load() {
 		return ErrNativeClosed
 	}
@@ -304,6 +327,7 @@ func (l *nativeLoop) LoadEntry(entry jsengine.Entry) error {
 
 func (l *nativeLoop) Close() error {
 	l.once.Do(func() {
+		l.runMu.Lock()
 		l.closed.Store(true)
 		closeTask := nativeTask{stop: true, done: make(chan error, 1)}
 		select {
@@ -314,6 +338,7 @@ func (l *nativeLoop) Close() error {
 			l.closeMu.Unlock()
 		case <-l.done:
 		}
+		l.runMu.Unlock()
 	})
 	l.closeMu.Lock()
 	defer l.closeMu.Unlock()
@@ -323,6 +348,9 @@ func (l *nativeLoop) Close() error {
 func (l *nativeLoop) shutdown() error {
 	errorBuffer := make([]byte, 512)
 	var first error
+
+	// provider.stop must run while the runtime and all persistent values are
+	// still valid. Host callbacks are then released before provider.destroy.
 	if status := C.sc_native_stop(C.uint64_t(l.provider.library), C.uint64_t(l.runtime),
 		(*C.char)(unsafe.Pointer(&errorBuffer[0])), C.uint64_t(len(errorBuffer))); status != C.SC_NATIVE_OK {
 		first = wrapOperationError(status, l.provider.candidate.LibraryPath, cError(errorBuffer))
@@ -337,12 +365,17 @@ func (l *nativeLoop) shutdown() error {
 	l.persistentMu.Unlock()
 	if l.host != nil {
 		l.host.closeCallbacks()
-		l.host.session.Teardown()
 	}
 	if status := C.sc_native_destroy(C.uint64_t(l.provider.library), C.uint64_t(l.runtime),
 		(*C.char)(unsafe.Pointer(&errorBuffer[0])), C.uint64_t(len(errorBuffer))); status != C.SC_NATIVE_OK && first == nil {
 		first = wrapOperationError(status, l.provider.candidate.LibraryPath, cError(errorBuffer))
 	}
+	if l.host != nil {
+		// HostRef/HostFunc registries are invalid after provider.destroy. The
+		// teardown also advances the generation used by stale callbacks.
+		l.host.session.Teardown()
+	}
+	l.runtime = 0
 	l.hostHandle.Delete()
 	close(l.done)
 	l.closeMu.Lock()
@@ -490,10 +523,12 @@ func (r *nativeRuntime) Set(name string, raw interface{}) error {
 }
 
 func (r *nativeRuntime) Bind(name string, raw interface{}) error { return r.Set(name, raw) }
-// ExposeDangerous mirrors the explicit seal.inst escape hatch for native runtimes.
-func ExposeDangerous(engine jsengine.Runtime, target interface{}) (jsengine.Value, error) {
-	r, ok := engine.(*nativeRuntime)
-	if !ok || r == nil || r.loop == nil || r.loop.host == nil {
+
+// ExposeDangerous implements the optional engine-neutral dangerous exposure
+// capability. It is only reachable when the caller explicitly enables
+// seal.inst.
+func (r *nativeRuntime) ExposeDangerous(target interface{}) (jsengine.Value, error) {
+	if r == nil || r.loop == nil || r.loop.host == nil {
 		return nil, errors.New("native runtime is required")
 	}
 	ref, err := r.loop.host.session.ExposeDangerous(target)
@@ -501,6 +536,16 @@ func ExposeDangerous(engine jsengine.Runtime, target interface{}) (jsengine.Valu
 		return nil, err
 	}
 	return r.newHostObject(ref, uint32(hostbridge.KindHostObject))
+}
+
+// ExposeDangerous is retained as a compatibility helper for native callers;
+// core execution uses the engine-neutral runtime capability above.
+func ExposeDangerous(engine jsengine.Runtime, target interface{}) (jsengine.Value, error) {
+	exposer, ok := engine.(jsengine.DangerousExposer)
+	if !ok {
+		return nil, errors.New("native runtime is required")
+	}
+	return exposer.ExposeDangerous(target)
 }
 
 func (r *nativeRuntime) getGlobal(name string) (jsengine.Value, error) {
@@ -549,11 +594,18 @@ func (r *nativeRuntime) coerce(raw interface{}) (*nativeValue, error) {
 	if raw == nil {
 		return r.newNull()
 	}
+	if object, ok := raw.(*nativeObject); ok {
+		return r.objectValue(object)
+	}
+	if object, ok := raw.(jsengine.Object); ok {
+		nativeObject, ok := object.(*nativeObject)
+		if !ok {
+			return nil, errors.New("native runtime cannot consume an object from another engine")
+		}
+		return r.objectValue(nativeObject)
+	}
 	if value, ok := raw.(*nativeValue); ok {
 		return r.sameValue(value)
-	}
-	if value, ok := raw.(nativeValue); ok {
-		return r.sameValue(&value)
 	}
 	if value, ok := raw.(jsengine.Value); ok {
 		if native, ok := value.(*nativeValue); ok {
@@ -573,6 +625,19 @@ func (r *nativeRuntime) sameValue(value *nativeValue) (*nativeValue, error) {
 		return nil, errors.New("native value belongs to another or closed runtime")
 	}
 	return value, nil
+}
+func (r *nativeRuntime) objectValue(object *nativeObject) (*nativeValue, error) {
+	if object == nil || r == nil || r.loop == nil || r.loop.closed.Load() ||
+		object.loop != r.loop || object.runtime != r.loop.runtime ||
+		object.scope == nil || object.scope.released.Load() || object.handle == 0 {
+		return nil, errors.New("native object belongs to another or closed runtime")
+	}
+	return &nativeValue{
+		loop:    r.loop,
+		runtime: r.loop.runtime,
+		handle:  object.handle,
+		scope:   object.scope,
+	}, nil
 }
 
 func (r *nativeRuntime) coerceHostBridgeValue(value hostbridge.Value) (*nativeValue, error) {

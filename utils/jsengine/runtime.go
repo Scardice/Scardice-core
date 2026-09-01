@@ -19,6 +19,13 @@ type Value interface {
 	Object() Object
 }
 
+// DangerousExposer is an optional runtime capability for the explicitly
+// enabled seal.inst escape hatch. Engines that do not support reflective host
+// exposure must not silently fall back to another implementation.
+type DangerousExposer interface {
+	ExposeDangerous(target interface{}) (Value, error)
+}
+
 // Object is a mutable JavaScript object scoped to a Runtime callback.
 type Object interface {
 	Set(name string, value interface{}) error

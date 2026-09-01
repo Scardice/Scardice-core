@@ -6,7 +6,6 @@ import (
 
 	"Scardice-core/utils/jsengine"
 	gojaengine "Scardice-core/utils/jsengine/goja"
-	"Scardice-core/utils/jsengine/quickjs"
 )
 
 type bindCounter struct {
@@ -28,16 +27,6 @@ func TestRuntimeBindUsesGojaHostNamingAndMutatesTarget(t *testing.T) {
 			name: "goja",
 			new: func(t *testing.T) jsengine.Loop {
 				return gojaengine.New()
-			},
-		},
-		{
-			name: "quickjs",
-			new: func(t *testing.T) jsengine.Loop {
-				loop, err := quickjs.New()
-				if err != nil {
-					t.Fatalf("New() error = %v", err)
-				}
-				return loop
 			},
 		},
 	}
@@ -83,16 +72,6 @@ func TestRuntimeBindMutatesLiveStringMap(t *testing.T) {
 		new  func(t *testing.T) jsengine.Loop
 	}{
 		{name: "goja", new: func(t *testing.T) jsengine.Loop { return gojaengine.New() }},
-		{
-			name: "quickjs",
-			new: func(t *testing.T) jsengine.Loop {
-				loop, err := quickjs.New()
-				if err != nil {
-					t.Fatalf("New() error = %v", err)
-				}
-				return loop
-			},
-		},
 	}
 
 	for _, engine := range engines {
@@ -135,16 +114,6 @@ func TestRuntimeLoadsCachedCommonJSModule(t *testing.T) {
 		new  func(t *testing.T) jsengine.Loop
 	}{
 		{name: "goja", new: func(t *testing.T) jsengine.Loop { return gojaengine.New() }},
-		{
-			name: "quickjs",
-			new: func(t *testing.T) jsengine.Loop {
-				loop, err := quickjs.New()
-				if err != nil {
-					t.Fatalf("New() error = %v", err)
-				}
-				return loop
-			},
-		},
 	}
 
 	for _, engine := range engines {
@@ -190,16 +159,6 @@ func TestRuntimeResolvesRelativeCommonJSModules(t *testing.T) {
 		new  func(t *testing.T) jsengine.Loop
 	}{
 		{name: "goja", new: func(t *testing.T) jsengine.Loop { return gojaengine.New() }},
-		{
-			name: "quickjs",
-			new: func(t *testing.T) jsengine.Loop {
-				loop, err := quickjs.New()
-				if err != nil {
-					t.Fatalf("New() error = %v", err)
-				}
-				return loop
-			},
-		},
 	}
 
 	for _, engine := range engines {
@@ -245,16 +204,6 @@ func TestRuntimeBindExposesNestedStructPointers(t *testing.T) {
 		new  func(t *testing.T) jsengine.Loop
 	}{
 		{name: "goja", new: func(t *testing.T) jsengine.Loop { return gojaengine.New() }},
-		{
-			name: "quickjs",
-			new: func(t *testing.T) jsengine.Loop {
-				loop, err := quickjs.New()
-				if err != nil {
-					t.Fatalf("New() error = %v", err)
-				}
-				return loop
-			},
-		},
 	}
 
 	for _, engine := range engines {
@@ -301,16 +250,6 @@ func TestRuntimeBindMutatesLiveSlice(t *testing.T) {
 		new  func(t *testing.T) jsengine.Loop
 	}{
 		{name: "goja", new: func(t *testing.T) jsengine.Loop { return gojaengine.New() }},
-		{
-			name: "quickjs",
-			new: func(t *testing.T) jsengine.Loop {
-				loop, err := quickjs.New()
-				if err != nil {
-					t.Fatalf("New() error = %v", err)
-				}
-				return loop
-			},
-		},
 	}
 
 	for _, engine := range engines {
@@ -361,16 +300,6 @@ func TestRuntimeBindAssignsReturnedHostObjectToMap(t *testing.T) {
 		new  func(t *testing.T) jsengine.Loop
 	}{
 		{name: "goja", new: func(t *testing.T) jsengine.Loop { return gojaengine.New() }},
-		{
-			name: "quickjs",
-			new: func(t *testing.T) jsengine.Loop {
-				loop, err := quickjs.New()
-				if err != nil {
-					t.Fatalf("New() error = %v", err)
-				}
-				return loop
-			},
-		},
 	}
 
 	for _, engine := range engines {
@@ -417,16 +346,6 @@ func TestRuntimeBindAssignsJavaScriptFunctionToGoCallback(t *testing.T) {
 		new  func(t *testing.T) jsengine.Loop
 	}{
 		{name: "goja", new: func(t *testing.T) jsengine.Loop { return gojaengine.New() }},
-		{
-			name: "quickjs",
-			new: func(t *testing.T) jsengine.Loop {
-				loop, err := quickjs.New()
-				if err != nil {
-					t.Fatalf("New() error = %v", err)
-				}
-				return loop
-			},
-		},
 	}
 
 	for _, engine := range engines {
@@ -460,16 +379,6 @@ func TestRuntimeBuildsObjectsFromGoFunctions(t *testing.T) {
 		new  func(t *testing.T) jsengine.Loop
 	}{
 		{name: "goja", new: func(t *testing.T) jsengine.Loop { return gojaengine.New() }},
-		{
-			name: "quickjs",
-			new: func(t *testing.T) jsengine.Loop {
-				loop, err := quickjs.New()
-				if err != nil {
-					t.Fatalf("New() error = %v", err)
-				}
-				return loop
-			},
-		},
 	}
 
 	for _, engine := range engines {
@@ -515,16 +424,6 @@ func TestRuntimeReadsObjectValuesInsideOwnerLoop(t *testing.T) {
 		new  func(t *testing.T) jsengine.Loop
 	}{
 		{name: "goja", new: func(t *testing.T) jsengine.Loop { return gojaengine.New() }},
-		{
-			name: "quickjs",
-			new: func(t *testing.T) jsengine.Loop {
-				loop, err := quickjs.New()
-				if err != nil {
-					t.Fatalf("New() error = %v", err)
-				}
-				return loop
-			},
-		},
 	}
 
 	for _, engine := range engines {
@@ -553,38 +452,5 @@ func TestRuntimeReadsObjectValuesInsideOwnerLoop(t *testing.T) {
 				t.Fatalf("Run() error = %v", err)
 			}
 		})
-	}
-}
-
-func TestQuickJSCallbackReturnsLiveValueOnOwnerLoop(t *testing.T) {
-	type callbackTarget struct {
-		Solve func(jsengine.Runtime, int) (jsengine.Value, error) `jsbind:"solve"`
-	}
-
-	loop, err := quickjs.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer loop.Close()
-
-	target := &callbackTarget{}
-	err = loop.Run(func(runtime jsengine.Runtime) error {
-		if bindErr := runtime.Bind("target", target); bindErr != nil {
-			return bindErr
-		}
-		if _, runErr := runtime.RunString("callback.js", `target.solve = value => ({ value })`); runErr != nil {
-			return runErr
-		}
-		result, solveErr := target.Solve(runtime, 42)
-		if solveErr != nil {
-			return solveErr
-		}
-		if result.Object() == nil || result.Object().Get("value").Export() != float64(42) {
-			t.Fatal("callback did not return a live JavaScript value")
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
 }

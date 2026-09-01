@@ -10,7 +10,6 @@ import (
 
 	"Scardice-core/utils/jsengine"
 	gojaengine "Scardice-core/utils/jsengine/goja"
-	"Scardice-core/utils/jsengine/quickjs"
 )
 
 func TestInstallJSHostAPI(t *testing.T) {
@@ -19,16 +18,6 @@ func TestInstallJSHostAPI(t *testing.T) {
 		new  func(t *testing.T) jsengine.Loop
 	}{
 		{name: "goja", new: func(t *testing.T) jsengine.Loop { return gojaengine.New() }},
-		{
-			name: "quickjs",
-			new: func(t *testing.T) jsengine.Loop {
-				loop, err := quickjs.New()
-				if err != nil {
-					t.Fatal(err)
-				}
-				return loop
-			},
-		},
 	}
 
 	for _, engine := range engines {
@@ -79,60 +68,8 @@ func TestInstallJSHostAPI(t *testing.T) {
 	}
 }
 
-func TestQuickJSBindsEngineNeutralExtensionCallbacks(t *testing.T) {
-	loop, err := quickjs.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer loop.Close()
-
-	command := &CmdItemInfo{}
-	extension := &ExtInfo{}
-	if err := loop.Run(func(runtime jsengine.Runtime) error {
-		if err := runtime.Bind("command", command); err != nil {
-			return err
-		}
-		if err := runtime.Bind("extension", extension); err != nil {
-			return err
-		}
-		if _, err := runtime.RunString("callbacks.js", `
-			command.solve = () => ({ matched: true, solved: true });
-			extension.onMessagePreprocess = () => ({ message: "rewritten" });
-		`); err != nil {
-			return err
-		}
-
-		solveValue, err := command.SolveEngine(runtime, nil, nil, nil)
-		if err != nil {
-			return err
-		}
-		solve, err := parseJSSolveEngineResult(nil, "test", solveValue)
-		if err != nil {
-			return err
-		}
-		if solve != (CmdExecuteResult{Matched: true, Solved: true}) {
-			t.Fatalf("solve = %#v", solve)
-		}
-
-		preprocessValue, err := extension.OnMessagePreprocessEngine(runtime, nil, nil)
-		if err != nil {
-			return err
-		}
-		decision := parseMessagePreprocessEngineValue(preprocessValue)
-		if decision.action != messagePreprocessRewrite || decision.message != "rewritten" {
-			t.Fatalf("decision = %#v", decision)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestQuickJSExtensionCommandMapSupportsDeletion(t *testing.T) {
-	loop, err := quickjs.New()
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestJSExtensionCommandMapSupportsDeletion(t *testing.T) {
+	loop := gojaengine.New()
 	defer loop.Close()
 
 	extension := &ExtInfo{CmdMap: CmdMapCls{"legacy": {Name: "legacy"}}}
@@ -156,10 +93,7 @@ func TestJSExtensionReplacementWarnsWithBothSources(t *testing.T) {
 		Logger:      zap.New(core).Sugar(),
 		ExtRegistry: new(SyncMap[string, *ExtInfo]),
 	}
-	loop, err := quickjs.New()
-	if err != nil {
-		t.Fatal(err)
-	}
+	loop := gojaengine.New()
 	defer loop.Close()
 
 	if err := loop.Run(func(runtime jsengine.Runtime) error {

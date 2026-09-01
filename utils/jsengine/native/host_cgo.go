@@ -17,6 +17,7 @@ import (
 	"sync"
 	"unsafe"
 
+	"Scardice-core/utils/jsengine"
 	"Scardice-core/utils/jsengine/hostbridge"
 )
 
@@ -396,9 +397,23 @@ func (c nativeCodec) Decode(value hostbridge.Value, target reflect.Type) (reflec
 		return reflect.Value{}, err
 	}
 	return reflect.MakeFunc(target, func(inputs []reflect.Value) []reflect.Value {
-		outputs, err := c.callCallback(token, target, inputs)
+		var (
+			outputs []reflect.Value
+			err     error
+		)
+		if c.state.loop.onOwnerThread() {
+			outputs, err = c.callCallback(token, target, inputs)
+		} else {
+			err = c.state.loop.Run(func(jsengine.Runtime) error {
+				outputs, err = c.callCallback(token, target, inputs)
+				return err
+			})
+		}
 		if err != nil {
 			results := make([]reflect.Value, target.NumOut())
+			for i := range results {
+				results[i] = reflect.Zero(target.Out(i))
+			}
 			if len(results) > 0 && target.Out(len(results)-1) == reflect.TypeOf((*error)(nil)).Elem() {
 				results[len(results)-1] = reflect.ValueOf(err)
 				return results
@@ -466,7 +481,7 @@ func (c nativeCodec) callCallback(token hostbridge.CallbackRef, target reflect.T
 		}
 	}
 	if hasError {
-		results[len(results)-1] = reflect.Zero(target.Out(len(results)-1))
+		results[len(results)-1] = reflect.Zero(target.Out(len(results) - 1))
 	}
 	return results, nil
 }

@@ -9,6 +9,12 @@ import (
 	"Scardice-core/utils/jsengine"
 )
 
+const (
+	defaultQuickJSMemoryLimitMiB  uint64 = 256
+	defaultQuickJSGCThresholdMiB  uint64 = 64
+	defaultQuickJSMaxStackSizeKiB uint64 = 1024
+)
+
 const quickJSOptionsVersion uint32 = 1
 const (
 	quickJSMaxMemoryBytes   uint64 = 1 << 40
@@ -17,16 +23,16 @@ const (
 )
 
 var (
-	ErrQuickJSOptionsOverflow  = errors.New("QuickJS options value overflows its serialized unit")
+	ErrQuickJSOptionsOverflow   = errors.New("QuickJS options value overflows its serialized unit")
 	ErrQuickJSOptionsOutOfRange = errors.New("QuickJS options value is out of range")
 )
 
 // QuickJSRuntimeOptionsPayload is the stable, provider-neutral runtime payload.
 // Byte values are serialized after converting the user-facing MiB/KiB units.
 type QuickJSRuntimeOptionsPayload struct {
-	MemoryLimitBytes      uint64 `json:"memoryLimitBytes"`
-	GCThresholdBytes      uint64 `json:"gcThresholdBytes"`
-	MaxStackSizeBytes     uint64 `json:"maxStackSizeBytes"`
+	MemoryLimitBytes       uint64 `json:"memoryLimitBytes"`
+	GCThresholdBytes       uint64 `json:"gcThresholdBytes"`
+	MaxStackSizeBytes      uint64 `json:"maxStackSizeBytes"`
 	ExecutionTimeoutMillis uint64 `json:"executionTimeoutMillis"`
 }
 
@@ -63,7 +69,7 @@ type QuickJSPolicyOptionsPayload struct {
 // QuickJSOptionsPayload is the versioned JSON contract passed to native
 // providers. Its field order is intentional so serialized payloads are stable.
 type QuickJSOptionsPayload struct {
-	Version  uint32                      `json:"version"`
+	Version  uint32                       `json:"version"`
 	Runtime  QuickJSRuntimeOptionsPayload `json:"runtime"`
 	Services QuickJSPolicyOptionsPayload  `json:"services"`
 }
@@ -156,19 +162,19 @@ func BuildQuickJSOptionsPayload(config JsConfig) (QuickJSOptionsPayload, error) 
 		},
 		Services: QuickJSPolicyOptionsPayload{
 			Fetch: QuickJSFetchPolicyOptions{
-				MaxConcurrent: config.QuickJSMaxFetchConcurrent,
+				MaxConcurrent:    config.QuickJSMaxFetchConcurrent,
 				MaxResponseBytes: fetchResponse,
 			},
 			WebSocket: QuickJSWebSocketPolicyOptions{
-				MaxConnections: config.QuickJSMaxWebSocketConnections,
+				MaxConnections:  config.QuickJSMaxWebSocketConnections,
 				MaxMessageBytes: websocketMessage,
 			},
 			Filesystem: QuickJSFilesystemPolicyOptions{
-				MaxReadBytes: filesystemRead,
+				MaxReadBytes:  filesystemRead,
 				MaxWriteBytes: filesystemWrite,
 			},
 			PBKDF2: QuickJSPBKDF2PolicyOptions{
-				MaxIterations: config.QuickJSMaxPBKDF2Iterations,
+				MaxIterations:  config.QuickJSMaxPBKDF2Iterations,
 				MaxOutputBytes: config.QuickJSMaxPBKDF2OutputBytes,
 			},
 		},
@@ -198,7 +204,6 @@ func BuildQuickJSRuntimeOptions(config JsConfig) (jsengine.RuntimeOptions, error
 	}
 	return jsengine.RuntimeOptions{OptionsJSON: encoded}, nil
 }
-
 
 func (d *Dice) quickJSRuntimeOptions() (jsengine.RuntimeOptions, error) {
 	return BuildQuickJSRuntimeOptions(d.Config.JsConfig)

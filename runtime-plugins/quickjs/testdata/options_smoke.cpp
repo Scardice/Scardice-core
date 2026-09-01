@@ -1,6 +1,6 @@
 #include "scardice_runtime_v1.h"
 
-#include <dlfcn.h>
+#include "dynamic_loader.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -39,9 +39,10 @@ bool expect(bool condition, const char *message) {
 }
 
 int run(const char *library_path, const char *mode) {
-    void *library = dlopen(library_path, RTLD_NOW | RTLD_LOCAL);
-    if (!expect(library != nullptr, "dlopen provider")) return 1;
-    auto query = reinterpret_cast<decltype(&scardice_runtime_query_v1)>(dlsym(library, "scardice_runtime_query_v1"));
+    scardice_test::library_handle library = scardice_test::open_library(library_path);
+    if (!expect(scardice_test::library_is_open(library), "open provider")) return 1;
+    auto query = reinterpret_cast<decltype(&scardice_runtime_query_v1)>(
+        scardice_test::lookup_symbol(library, "scardice_runtime_query_v1"));
     if (!expect(query != nullptr, "query symbol")) return 1;
     sc_runtime_query_v1 query_request{sizeof(query_request), SC_RUNTIME_ABI_MAJOR, SC_RUNTIME_ABI_MINOR,
                                        SC_HOST_ABI_MAJOR, SC_HOST_ABI_MINOR};

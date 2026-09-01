@@ -4,9 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+
 	"Scardice-core/utils/jsengine"
 	gojaengine "Scardice-core/utils/jsengine/goja"
-	quickjsengine "Scardice-core/utils/jsengine/quickjs"
 )
 
 func TestExportPrimitiveSupportsPrimitiveValuesAndNullishValues(t *testing.T) {
@@ -15,16 +15,6 @@ func TestExportPrimitiveSupportsPrimitiveValuesAndNullishValues(t *testing.T) {
 		new  func(t *testing.T) jsengine.Loop
 	}{
 		{name: "goja", new: func(*testing.T) jsengine.Loop { return gojaengine.New() }},
-		{
-			name: "quickjs",
-			new: func(t *testing.T) jsengine.Loop {
-				loop, err := quickjsengine.New()
-				if err != nil {
-					t.Fatal(err)
-				}
-				return loop
-			},
-		},
 	}
 
 	for _, engine := range engines {
@@ -83,16 +73,6 @@ func TestExportPrimitiveRejectsObjectsAndFunctions(t *testing.T) {
 		new  func(t *testing.T) jsengine.Loop
 	}{
 		{name: "goja", new: func(*testing.T) jsengine.Loop { return gojaengine.New() }},
-		{
-			name: "quickjs",
-			new: func(t *testing.T) jsengine.Loop {
-				loop, err := quickjsengine.New()
-				if err != nil {
-					t.Fatal(err)
-				}
-				return loop
-			},
-		},
 	}
 
 	for _, engine := range engines {

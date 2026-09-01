@@ -8,7 +8,6 @@ import (
 
 	"Scardice-core/utils/jsengine"
 	gojaengine "Scardice-core/utils/jsengine/goja"
-	quickjs "Scardice-core/utils/jsengine/quickjs"
 )
 
 func TestParseJSSolveEngineResult(t *testing.T) {
@@ -17,16 +16,6 @@ func TestParseJSSolveEngineResult(t *testing.T) {
 		new  func(t *testing.T) jsengine.Loop
 	}{
 		{name: "goja", new: func(t *testing.T) jsengine.Loop { return gojaengine.New() }},
-		{
-			name: "quickjs",
-			new: func(t *testing.T) jsengine.Loop {
-				loop, err := quickjs.New()
-				if err != nil {
-					t.Fatal(err)
-				}
-				return loop
-			},
-		},
 	}
 
 	for _, engine := range engines {
@@ -60,16 +49,6 @@ func TestParseMessagePreprocessEngineValue(t *testing.T) {
 		new  func(t *testing.T) jsengine.Loop
 	}{
 		{name: "goja", new: func(t *testing.T) jsengine.Loop { return gojaengine.New() }},
-		{
-			name: "quickjs",
-			new: func(t *testing.T) jsengine.Loop {
-				loop, err := quickjs.New()
-				if err != nil {
-					t.Fatal(err)
-				}
-				return loop
-			},
-		},
 	}
 
 	for _, engine := range engines {
@@ -99,13 +78,13 @@ func TestParseMessagePreprocessEngineValue(t *testing.T) {
 }
 
 func TestCallOnMessagePreprocess_UsesEngineNeutralCallback(t *testing.T) {
-	loop, err := quickjs.New()
-	if err != nil {
-		t.Fatal(err)
-	}
+	loop := gojaengine.New()
 	t.Cleanup(func() { _ = loop.Close() })
 
-	d := &Dice{ExtLoopManager: NewJsLoopManager()}
+	d := &Dice{
+		Config:         Config{JsConfig: JsConfig{JsEnable: true}},
+		ExtLoopManager: NewJsLoopManager(),
+	}
 	version := d.ExtLoopManager.SetLoop(loop)
 	ext := &ExtInfo{
 		Name:          "engine-preprocess",
@@ -128,9 +107,9 @@ func TestCallOnMessagePreprocess_UsesEngineNeutralCallback(t *testing.T) {
 func TestCallOnMessagePreprocessEngineSupportsNonJSProviderAndRestoresContext(t *testing.T) {
 	loop := gojaengine.New()
 	d := &Dice{
-		Config:          Config{JsConfig: JsConfig{JsEnable: true}},
+		Config:         Config{JsConfig: JsConfig{JsEnable: true}},
 		ExtLoopManager: NewJsLoopManager(),
-		Logger:          zap.NewNop().Sugar(),
+		Logger:         zap.NewNop().Sugar(),
 	}
 	version := d.ExtLoopManager.SetLoop(loop)
 	previous := &ExtInfo{Name: "previous"}
@@ -174,10 +153,7 @@ func TestCallOnMessagePreprocessEngineReportsCallbackErrorAndPanicAsNoop(t *test
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			loop, err := quickjs.New()
-			if err != nil {
-				t.Fatal(err)
-			}
+			loop := gojaengine.New()
 			t.Cleanup(func() { _ = loop.Close() })
 
 			d := &Dice{
@@ -186,8 +162,8 @@ func TestCallOnMessagePreprocessEngineReportsCallbackErrorAndPanicAsNoop(t *test
 			}
 			version := d.ExtLoopManager.SetLoop(loop)
 			ext := &ExtInfo{
-				Name:                       "callback-failure",
-				JSLoopVersion:              version,
+				Name:                      "callback-failure",
+				JSLoopVersion:             version,
 				OnMessagePreprocessEngine: test.fn,
 			}
 			if decision := ext.CallOnMessagePreprocess(d, &MsgContext{}, &Message{}); decision.action != messagePreprocessNoop {
@@ -197,16 +173,15 @@ func TestCallOnMessagePreprocessEngineReportsCallbackErrorAndPanicAsNoop(t *test
 	}
 }
 
-
 func TestCallOnMessagePreprocessEngineHonorsJsEnableForJSProvider(t *testing.T) {
 	loop := gojaengine.New()
 	t.Cleanup(func() { _ = loop.Close() })
 
 	called := false
 	d := &Dice{
-		Config:          Config{JsConfig: JsConfig{JsEnable: false}},
+		Config:         Config{JsConfig: JsConfig{JsEnable: false}},
 		ExtLoopManager: NewJsLoopManager(),
-		Logger:          zap.NewNop().Sugar(),
+		Logger:         zap.NewNop().Sugar(),
 	}
 	version := d.ExtLoopManager.SetLoop(loop)
 	ext := &ExtInfo{
@@ -226,6 +201,7 @@ func TestCallOnMessagePreprocessEngineHonorsJsEnableForJSProvider(t *testing.T) 
 		t.Fatal("disabled JS provider callback was invoked")
 	}
 }
+
 type fakeEngineObject struct {
 	values map[string]jsengine.Value
 }

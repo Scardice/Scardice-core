@@ -12,33 +12,19 @@ import (
 
 	"Scardice-core/utils/jsengine"
 	"Scardice-core/utils/jsengine/native"
-	legacyquickjs "Scardice-core/utils/jsengine/quickjs"
 )
 
 const reentrantCaseTimeout = 2 * time.Second
 
 type reentrantEngine struct {
-	name          string
+	name           string
 	requiresNative bool
-	open          func() (jsengine.Loop, error)
+	open           func() (jsengine.Loop, error)
 }
 
 func reentrantEngines(t *testing.T) []reentrantEngine {
 	t.Helper()
-	engines := []reentrantEngine{{
-		name: "legacy-quickjs",
-		open: func() (jsengine.Loop, error) {
-			loop, err := legacyquickjs.New()
-			if err != nil {
-				return nil, err
-			}
-			if err := legacyquickjs.Start(loop); err != nil {
-				_ = loop.Close()
-				return nil, err
-			}
-			return loop, nil
-		},
-	}}
+	engines := []reentrantEngine{}
 	engines = append(engines, reentrantEngine{
 		name:           "native-quickjs",
 		requiresNative: true,
@@ -283,6 +269,7 @@ func TestReentrantMatrixC_GoToJSToGo(t *testing.T) {
 		return nil
 	})
 }
+
 // D: JavaScript enters Go, which invokes a JavaScript callback before returning.
 func TestReentrantMatrixD_JSToGoToJS(t *testing.T) {
 	forEachReentrantEngine(t, func(loop jsengine.Loop, host *reentrantHost) error {

@@ -4,15 +4,12 @@ import (
 	"testing"
 
 	"Scardice-core/utils/jsengine"
-	"Scardice-core/utils/jsengine/quickjs"
+	gojaengine "Scardice-core/utils/jsengine/goja"
 )
 
 func TestJsLoopManagerStoresEngineLoopByVersion(t *testing.T) {
 	manager := NewJsLoopManager()
-	loop, err := quickjs.New()
-	if err != nil {
-		t.Fatalf("quickjs.New() error = %v", err)
-	}
+	loop := gojaengine.New()
 	defer loop.Close()
 
 	version := manager.SetLoop(loop)
@@ -23,10 +20,11 @@ func TestJsLoopManagerStoresEngineLoopByVersion(t *testing.T) {
 	if got != loop {
 		t.Fatal("GetLoop() returned a different loop")
 	}
-	if got.Engine() != jsengine.EngineQuickJS {
-		t.Fatalf("GetLoop().Engine() = %q, want %q", got.Engine(), jsengine.EngineQuickJS)
+	if got.Engine() != jsengine.EngineGoja {
+		t.Fatalf("GetLoop().Engine() = %q, want %q", got.Engine(), jsengine.EngineGoja)
 	}
 }
+
 type closeCountingLoop struct {
 	closeCount int
 }

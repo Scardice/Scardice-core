@@ -11,7 +11,6 @@ import (
 
 	"Scardice-core/utils/jsengine"
 	gojaengine "Scardice-core/utils/jsengine/goja"
-	quickjs "Scardice-core/utils/jsengine/quickjs"
 )
 
 func newGameSystemTemplateForTest(relatedExt ...string) *GameSystemTemplate {
@@ -576,10 +575,7 @@ func TestCommandSolve_UsesSolveRawOverrideForNonJsCommand(t *testing.T) {
 func TestCommandSolve_UsesEngineNeutralCallback(t *testing.T) {
 	commandName := "engine-test"
 	callbackHit := 0
-	loop, err := quickjs.New()
-	if err != nil {
-		t.Fatal(err)
-	}
+	loop := gojaengine.New()
 	t.Cleanup(func() { _ = loop.Close() })
 
 	var ext *ExtInfo

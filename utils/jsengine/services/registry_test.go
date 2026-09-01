@@ -22,16 +22,16 @@ func (s *testService) Invoke(call services.Call) (services.Response, error) {
 }
 
 type testInstaller struct {
-	owner      string
-	defs       []services.Definition
-	installed  bool
-	closed     int
+	owner     string
+	defs      []services.Definition
+	installed bool
+	closed    int
 }
 
-func (i *testInstaller) Owner() string { return i.owner }
+func (i *testInstaller) Owner() string                      { return i.owner }
 func (i *testInstaller) Definitions() []services.Definition { return i.defs }
-func (i *testInstaller) Install() error { i.installed = true; return nil }
-func (i *testInstaller) Close() error { i.closed++; return nil }
+func (i *testInstaller) Install() error                     { i.installed = true; return nil }
+func (i *testInstaller) Close() error                       { i.closed++; return nil }
 
 func TestRegistryRejectsDuplicateAndReportsMissingService(t *testing.T) {
 	registry := services.NewRegistry()
@@ -66,7 +66,7 @@ func TestRegistryEnforcesPermissionDeadlineAndCancellation(t *testing.T) {
 	denied, err := registry.Invoke(services.Call{Request: services.Request{
 		Service:   services.Filesystem,
 		Operation: services.OpFilesystemReadFile,
-		String:     "secret.txt",
+		String:    "secret.txt",
 	}})
 	if !errors.Is(err, services.ErrPermissionDenied) || denied.Status != services.StatusPermissionDenied {
 		t.Fatalf("Invoke(denied) = %#v, %v; want permission denied", denied, err)
@@ -77,7 +77,7 @@ func TestRegistryEnforcesPermissionDeadlineAndCancellation(t *testing.T) {
 	if _, err := registry.Invoke(services.Call{Request: services.Request{
 		Service:   services.Filesystem,
 		Operation: services.OpFilesystemReadFile,
-		String:     "secret.txt",
+		String:    "secret.txt",
 	}, Policy: policy}); err != nil {
 		t.Fatalf("Invoke(permission) error = %v", err)
 	}
@@ -86,7 +86,7 @@ func TestRegistryEnforcesPermissionDeadlineAndCancellation(t *testing.T) {
 	}
 	deadline := time.Now().Add(-time.Second)
 	if _, err := registry.Invoke(services.Call{Request: services.Request{
-		Service:  services.Filesystem,
+		Service:   services.Filesystem,
 		Operation: services.OpFilesystemReadFile,
 	}, Policy: policy, Deadline: deadline}); !errors.Is(err, services.ErrDeadlineExceeded) {
 		t.Fatalf("Invoke(deadline) error = %v, want ErrDeadlineExceeded", err)
@@ -94,7 +94,7 @@ func TestRegistryEnforcesPermissionDeadlineAndCancellation(t *testing.T) {
 	cancel := make(chan struct{})
 	close(cancel)
 	if _, err := registry.Invoke(services.Call{Request: services.Request{
-		Service:  services.Filesystem,
+		Service:   services.Filesystem,
 		Operation: services.OpFilesystemReadFile,
 	}, Policy: policy, Cancellation: cancel}); !errors.Is(err, services.ErrCancelled) {
 		t.Fatalf("Invoke(cancel) error = %v, want ErrCancelled", err)
@@ -157,7 +157,7 @@ func TestRegistryReturnsUnsupportedForAdapterOnlyService(t *testing.T) {
 }
 
 func TestNativeDescriptorDoesNotAdvertiseServices(t *testing.T) {
-	descriptor := jsengine.Descriptor{ID: jsengine.EngineQuickJS}
+	descriptor := jsengine.Descriptor{ID: "quickjs"}
 	if got := services.Advertised(descriptor); len(got) != 0 {
 		t.Fatalf("Advertised(native) = %#v, want empty", got)
 	}

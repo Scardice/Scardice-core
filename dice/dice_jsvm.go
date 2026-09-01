@@ -3,6 +3,7 @@ package dice
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -12,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,24 +20,17 @@ import (
 	"time"
 
 	"github.com/Masterminds/semver/v3"
-	"github.com/dop251/goja"
-	"github.com/dop251/goja_nodejs/eventloop"
-	"github.com/dop251/goja_nodejs/require"
 	esbuild "github.com/evanw/esbuild/pkg/api"
 	"github.com/golang-module/carbon"
 	"github.com/pkg/errors"
 	"github.com/robfig/cron/v3"
 	"github.com/samber/lo"
 	"go.uber.org/zap"
-	"gopkg.in/elazarl/goproxy.v1"
 
 	"Scardice-core/static"
 	"Scardice-core/utils"
 	"Scardice-core/utils/crypto"
 	"Scardice-core/utils/jsengine"
-	jsservices "Scardice-core/utils/jsengine/services"
-	gojaservices "Scardice-core/utils/jsengine/services/goja"
-	gojaengine "Scardice-core/utils/jsengine/goja"
 )
 
 var (
@@ -61,30 +54,6 @@ func formatSourceLocationForLog(filename string, line int, column int) string {
 		return fmt.Sprintf("%s:%d", filename, line)
 	}
 	return fmt.Sprintf("%s:%d:%d", filename, line, column)
-}
-
-func formatGojaStackFrameLocation(frame goja.StackFrame) string {
-	pos := frame.Position()
-	filename := pos.Filename
-	if filename == "" {
-		filename = frame.SrcName()
-	}
-	if filename == "" || filename == "<native>" {
-		return ""
-	}
-	return formatSourceLocationForLog(filename, pos.Line, pos.Column)
-}
-
-func captureJSCallSourceLocation(vm *goja.Runtime) string {
-	if vm == nil {
-		return ""
-	}
-	for _, frame := range vm.CaptureCallStack(16, nil) {
-		if location := formatGojaStackFrameLocation(frame); location != "" {
-			return location
-		}
-	}
-	return ""
 }
 
 var taskCronParser = cron.NewParser(
@@ -327,130 +296,55 @@ func (p *PrinterFunc) Warn(s string) { p.doRecord("warn", s); p.d.Logger.Warn(s)
 func (p *PrinterFunc) Error(s string) { p.doRecord("error", s); p.d.Logger.Error(s) }
 
 func (d *Dice) JsInit() {
-	engine, err := d.configuredJSEngine()
-	if err != nil {
-		(&d.Config).JsEnable = false
-		if d.Logger != nil {
-			d.Logger.Errorf("JS 引擎配置无效: %v", err)
-		}
-		return
-	}
-	if engine == jsengine.EngineQuickJS {
-		d.jsInitQuickJS()
-		return
-	}
-	d.jsInitGoja()
-}
-
-func (d *Dice) jsInitGoja() {
-	// 读取官方 Mod 公钥
-	if pub, err := static.Scripts.ReadFile("scripts/seal_mod.public.pem"); err == nil && len(pub) > 0 {
-		OfficialModPublicKey = string(pub)
-	}
-	// 允许在 JsEnable=false 的启动状态下通过 API 重启 JS：
-	// 此时 ExtLoopManager 尚未初始化，需要在这里补齐。
+	engine := d.configuredJSEngine()
 	if d.ExtLoopManager == nil {
 		d.ExtLoopManager = NewJsLoopManager()
 	}
-	// 清理目前的js相关
 	d.jsClear()
-
-	// 重建js vm
-	reg := new(require.Registry)
-
-	loop := eventloop.NewEventLoop(eventloop.EnableConsole(false),
-		eventloop.WithRegistry(reg),
-		eventloop.WithDebugLog(true),
-		eventloop.WithLogger(d.Logger))
-	engineLoop := gojaengine.WrapEventLoop(loop)
-	versionID := d.ExtLoopManager.SetLoop(engineLoop)
-	proxy := goproxy.NewProxyHttpServer()
-
-	printer := &PrinterFunc{d, false, []string{}}
-	d.JsPrinter = printer
-	serviceRegistry := jsservices.NewRegistry()
-	gojaInstaller := gojaservices.NewInstaller(gojaservices.Options{
-		Registry: reg,
-		Loop:     loop,
-		Proxy:    proxy,
-		Printer:  printer,
-		Logger:   d.Logger,
-		NetworkAuthorize: func(target string) error { return jsNetworkAuthorize(d, target) },
-		Filesystem: gojaservices.FilesystemHooks{
-			Require: func(rt *goja.Runtime, module *goja.Object) {
-				jsFsRequire(rt, module, d, loop)
-			},
-			Enable: func(rt *goja.Runtime) {
-				jsFsEnable(rt, d, loop)
-			},
-		},
-	})
-	if _, err := serviceRegistry.Install(gojaInstaller); err != nil {
-		panic(err)
+	if d.JsPrinter == nil {
+		d.JsPrinter = &PrinterFunc{d: d, isRecord: false, recorder: []string{}}
 	}
-	// 初始化
-	loop.Run(func(vm *goja.Runtime) {
-		vm.SetFieldNameMapper(goja.TagFieldNameMapper("jsbind", true))
-		// 直接绑定进程内唯一全局随机源，避免再包一层无意义的适配。
-		vm.SetRandSource(DiceRandFloat64)
 
-		if err := gojaInstaller.Enable(vm); err != nil {
-			panic(err)
-		}
-		runtime := gojaengine.Wrap(vm)
+	options, err := d.quickJSRuntimeOptions()
+	if err != nil {
+		d.disableJSRuntime(err)
+		return
+	}
+	loop, err := d.jsRuntimeManagerInstance().Resolve(context.Background(), engine, options)
+	if err != nil {
+		d.disableJSRuntime(err)
+		return
+	}
+	versionID := d.ExtLoopManager.SetLoop(loop)
+	err = loop.Run(func(runtime jsengine.Runtime) error {
 		if err := d.installJSHostAPI(runtime); err != nil {
-			panic(err)
+			return fmt.Errorf("install JS host API: %w", err)
 		}
 		seal := runtime.Get("seal").Object()
-		if err := d.installJSExtHostAPI(runtime, seal, versionID, func() string {
-			return captureJSCallSourceLocation(vm)
-		}); err != nil {
-			panic(err)
+		if seal == nil {
+			return errors.New("JS runtime did not install seal host object")
 		}
-
+		if err := d.installJSExtHostAPI(runtime, seal, versionID, nil); err != nil {
+			return fmt.Errorf("install JS extension host API: %w", err)
+		}
 		if err := d.installDangerousJSInstance(runtime, seal); err != nil {
-			panic(err)
+			return fmt.Errorf("install dangerous JS host API: %w", err)
 		}
 		if err := runtime.Set("__dirname", ""); err != nil {
-			panic(err)
+			return fmt.Errorf("set JS __dirname: %w", err)
 		}
-
-		// Note(Szzrain): 不要修改原型链, 会导致一些奇怪的问题，比如无法使用某些 TS 库
-		//		_, _ = vm.RunString(`
-		// let e = seal.ext.new('_', '', '');
-		// e.__proto__.storageSet = function(k, v) {
-		//  try {
-		//    // 这里goja会强行抛出异常，等于是将返回error的函数转写成throw形式
-		//    this.storageSetRaw(k, v)
-		//  } catch (error) {
-		//    throw error;
-		//  }
-		// }
-		// e.__proto__.storageGet = function(k, v) {
-		//  try {
-		//    return this.storageGetRaw(k, v);
-		//  } catch (error) {
-		//    if (error.value.toString() !== 'not found') {
-		//      throw error;
-		//    }
-		//  }
-		// }
-		// `)
-		_, _ = vm.RunString(`Object.freeze(seal);Object.freeze(seal.deck);Object.freeze(seal.coc);Object.freeze(seal.ext);Object.freeze(seal.vars);`)
+		return nil
 	})
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				d.Logger.Errorf("JS核心执行异常: %v 堆栈: %v", r, string(debug.Stack()))
-			}
-		}()
-		if err := gojaengine.StartInForeground(engineLoop); err != nil {
-			d.Logger.Errorf("JS事件循环启动失败: %v", err)
-		}
-	}()
-	// loop.Start()
+	if err != nil {
+		d.ExtLoopManager.SetLoop(nil)
+		d.disableJSRuntime(err)
+		return
+	}
+
 	(&d.Config).JsEnable = true
-	d.Logger.Info("已加载JS环境")
+	if d.Logger != nil {
+		d.Logger.Infof("已加载 JS runtime (%s)", engine)
+	}
 	d.MarkModified()
 	d.Save(false)
 }

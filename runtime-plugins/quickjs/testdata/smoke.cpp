@@ -1,6 +1,6 @@
 #include "scardice_runtime_v1.h"
 
-#include <dlfcn.h>
+#include "dynamic_loader.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -215,11 +215,12 @@ int main(int argc, char **argv) {
     if (!expect(argc == 2, "provider path argument")) {
         return 1;
     }
-    void *library = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
-    if (!expect(library != nullptr, "dlopen provider")) {
+    scardice_test::library_handle library = scardice_test::open_library(argv[1]);
+    if (!expect(scardice_test::library_is_open(library), "open provider")) {
         return 1;
     }
-    auto query = reinterpret_cast<decltype(&scardice_runtime_query_v1)>(dlsym(library, "scardice_runtime_query_v1"));
+    auto query = reinterpret_cast<decltype(&scardice_runtime_query_v1)>(
+        scardice_test::lookup_symbol(library, "scardice_runtime_query_v1"));
     if (!expect(query != nullptr, "query symbol")) {
         return 1;
     }

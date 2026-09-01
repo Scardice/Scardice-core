@@ -223,7 +223,7 @@ type BanConfig struct {
 
 type JsConfig struct {
 	JsEnable                       bool            `json:"jsEnable"                         yaml:"jsEnable"`
-	JsEngine                       string          `json:"jsEngine"                         yaml:"jsEngine"` // goja | quickjs；空值兼容旧配置
+	JsEngine                       string          `json:"jsEngine"                         yaml:"jsEngine"` // runtime provider ID；空值兼容旧配置
 	QuickJSMemoryLimitMiB          uint64          `json:"quickJSMemoryLimitMiB"            yaml:"quickJSMemoryLimitMiB"`
 	QuickJSGCThresholdMiB          uint64          `json:"quickJSGCThresholdMiB"            yaml:"quickJSGCThresholdMiB"`
 	QuickJSMaxStackSizeKiB         uint64          `json:"quickJSMaxStackSizeKiB"           yaml:"quickJSMaxStackSizeKiB"`

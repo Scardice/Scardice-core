@@ -1,3 +1,5 @@
+//go:build cgo
+
 package native
 
 import (
@@ -11,6 +13,13 @@ import (
 
 	"Scardice-core/utils/jsengine"
 )
+
+func TestNativeRuntimeProvidesEngineNeutralDangerousExposure(t *testing.T) {
+	var runtime jsengine.DangerousExposer = (*nativeRuntime)(nil)
+	if runtime == nil {
+		t.Fatal("native runtime does not implement dangerous exposure")
+	}
+}
 
 type adapterHost struct {
 	Answer int `jsbind:"answer"`

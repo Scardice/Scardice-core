@@ -7,6 +7,9 @@ on:
       - "go.mod"
       - "go.sum"
       - ".golangci.toml"
+      - "runtime-plugins/**"
+      - "runtimeabi/**"
+      - "docs/runtime-plugins.md"
       - ".github/workflows/test-and-lint.yml"
   pull_request:
     paths:
@@ -14,6 +17,9 @@ on:
       - "go.mod"
       - "go.sum"
       - ".golangci.toml"
+      - "runtime-plugins/**"
+      - "runtimeabi/**"
+      - "docs/runtime-plugins.md"
       - ".github/workflows/test-and-lint.yml"
 
 permissions:
@@ -68,3 +74,132 @@ jobs:
         with:
           version: v2.12.2
           args: "--timeout 10m"
+
+  core-no-cgo:
+    name: Core no-cgo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Test without cgo
+        run: CGO_ENABLED=0 go test ./...
+
+  module-graph:
+    name: Module graph
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Reject legacy QuickJS dependencies
+        shell: bash
+        run: |
+          if go list -deps ./... | grep -Eq 'github\.com/(buke/quickjs-go|Scardice/quickjs_nodejs)'; then
+            echo "legacy QuickJS dependency leaked into the Core module graph"
+            exit 1
+          fi
+
+  native-runtime:
+    name: Native runtime (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            tests: "ON"
+          - name: macOS
+            os: macos-latest
+            tests: "ON"
+          - name: Windows
+            os: windows-latest
+            tests: "ON"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Core
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: QuickJS-NG
+        uses: actions/checkout@v4
+        with:
+          repository: quickjs-ng/quickjs
+          ref: v0.15.1
+          path: .ci/quickjs-ng
+          persist-credentials: false
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Configure native runtime
+        shell: bash
+        run: >
+          cmake -S runtime-plugins/quickjs -B build/native-runtime
+          -DQUICKJS_ROOT="$GITHUB_WORKSPACE/.ci/quickjs-ng"
+          -DSCARDICE_QUICKJS_BUILD_TESTS=${{ matrix.tests }}
+      - name: Build native runtime
+        shell: bash
+        run: cmake --build build/native-runtime --config Release --parallel
+      - name: Run ABI smoke tests
+        if: matrix.tests == 'ON'
+        shell: bash
+        run: ctest --test-dir build/native-runtime -C Release --output-on-failure
+      - name: Install runtime package
+        shell: bash
+        run: cmake --install build/native-runtime --config Release --prefix "$GITHUB_WORKSPACE/build/runtime-root"
+      - name: Run native Go integration
+        shell: bash
+        env:
+          SCARDICE_QUICKJS_PACKAGE: ${{ github.workspace }}/build/runtime-root
+        run: go test ./utils/jsengine/native ./runtime-plugins/quickjs/test -count=1
+      - name: Create runtime archive
+        shell: bash
+        run: cpack --config build/native-runtime/CPackConfig.cmake -C Release
+      - name: Upload runtime archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-quickjs-${{ matrix.name }}
+          path: Scardice-runtime-quickjs-*
+
+  native-runtime-sanitizers:
+    name: Native runtime (ASan/UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Core
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: QuickJS-NG
+        uses: actions/checkout@v4
+        with:
+          repository: quickjs-ng/quickjs
+          ref: v0.15.1
+          path: .ci/quickjs-ng
+          persist-credentials: false
+      - name: Configure sanitizers
+        shell: bash
+        run: >
+          cmake -S runtime-plugins/quickjs -B build/native-runtime-sanitizers
+          -DQUICKJS_ROOT="$GITHUB_WORKSPACE/.ci/quickjs-ng"
+          -DSCARDICE_QUICKJS_BUILD_TESTS=ON
+          -DCMAKE_C_FLAGS="-fsanitize=address,undefined"
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"
+      - name: Build sanitised runtime
+        shell: bash
+        run: cmake --build build/native-runtime-sanitizers --parallel
+      - name: Run sanitised ABI tests
+        shell: bash
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+        run: ctest --test-dir build/native-runtime-sanitizers --output-on-failure

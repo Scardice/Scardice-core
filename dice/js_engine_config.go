@@ -2,6 +2,10 @@ package dice
 
 import "Scardice-core/utils/jsengine"
 
-func (d *Dice) configuredJSEngine() (jsengine.EngineID, error) {
-	return jsengine.ParseEngineID(d.Config.JsEngine)
+func (d *Dice) configuredJSEngine() jsengine.EngineID {
+	id := jsengine.NormalizeEngineID(d.Config.JsEngine)
+	if id == "" {
+		return jsengine.EngineGoja
+	}
+	return id
 }
