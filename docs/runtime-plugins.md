@@ -28,7 +28,7 @@ runtime plugin 不能由普通 JavaScript 扩展自动安装。管理员应在�
 └── libscardice-runtime-quickjs.so  # Windows/macOS 使用对应平台文件名
 ```
 
-归档由 `runtime-plugins/quickjs` 的 CMake/CPack 配置生成，例如 `Scardice-runtime-quickjs-linux-amd64.tar.gz`。解压归档后保留其中的 `quickjs/` 目录，再通过配置选择 runtime ID：
+归档由 [Scardice Runtime QuickJS](https://github.com/Scardice/scardice-runtime-quickjs) 的 CMake/CPack 配置生成，例如 `Scardice-runtime-quickjs-linux-amd64.tar.gz`。Core 通过 `runtime-plugins/quickjs` submodule 固定构建源码；独立构建或更新 submodule 后，再通过配置选择 runtime ID：
 
 ```yaml
 jsEngine: quickjs

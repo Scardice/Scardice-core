@@ -4,3 +4,6 @@
 [submodule "sealdice-builtins"]
 	path = sealdice-builtins
 	url = https://github.com/sealdice/sealdice-builtins
+[submodule "runtime-plugins/quickjs"]
+	path = runtime-plugins/quickjs
+	url = https://github.com/Scardice/scardice-runtime-quickjs.git

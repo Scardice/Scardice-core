@@ -1,6 +1,0 @@
-SCARDICE_RUNTIME {
-    global:
-        scardice_runtime_query_v1;
-    local:
-        *;
-};
