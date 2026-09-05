@@ -11,6 +11,8 @@ import (
 	"github.com/dop251/goja_nodejs/eventloop"
 
 	"Scardice-core/utils"
+	"Scardice-core/utils/jsengine"
+	gojaengine "Scardice-core/utils/jsengine/goja"
 )
 
 const (
@@ -24,15 +26,15 @@ type jsFsResolvedPath struct {
 	isData bool
 }
 
-func jsFsEnable(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) {
-	_ = vm.Set(fsModuleName, jsFsEnsureObject(vm, d, loop))
+func jsFsEnable(vm *goja.Runtime, d *Dice, rawLoop *eventloop.EventLoop, engineLoop jsengine.Loop) {
+	_ = vm.Set(fsModuleName, jsFsEnsureObject(vm, d, rawLoop, engineLoop))
 }
 
-func jsFsRequire(vm *goja.Runtime, module *goja.Object, d *Dice, loop *eventloop.EventLoop) {
-	_ = module.Set("exports", jsFsEnsureObject(vm, d, loop))
+func jsFsRequire(vm *goja.Runtime, module *goja.Object, d *Dice, rawLoop *eventloop.EventLoop, engineLoop jsengine.Loop) {
+	_ = module.Set("exports", jsFsEnsureObject(vm, d, rawLoop, engineLoop))
 }
 
-func jsFsEnsureObject(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) *goja.Object {
+func jsFsEnsureObject(vm *goja.Runtime, d *Dice, rawLoop *eventloop.EventLoop, engineLoop jsengine.Loop) *goja.Object {
 	if current := vm.Get(fsModuleName); !goja.IsUndefined(current) && !goja.IsNull(current) {
 		if obj, ok := current.(*goja.Object); ok {
 			return obj
@@ -40,26 +42,26 @@ func jsFsEnsureObject(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) *goj
 	}
 
 	fsObj := vm.NewObject()
-	_ = fsObj.Set("readFile", jsFsReadFile(vm, d))
-	_ = fsObj.Set("writeFile", jsFsWriteFile(vm, d))
-	_ = fsObj.Set("stat", jsFsStat(vm, d))
-	_ = fsObj.Set("readDir", jsFsReadDir(vm, d))
-	_ = fsObj.Set("mkdir", jsFsMkdir(vm, d))
-	_ = fsObj.Set("remove", jsFsRemove(vm, d))
-	_ = fsObj.Set("readFileAsync", jsFsReadFileAsync(vm, d, loop))
-	_ = fsObj.Set("writeFileAsync", jsFsWriteFileAsync(vm, d, loop))
-	_ = fsObj.Set("statAsync", jsFsStatAsync(vm, d, loop))
-	_ = fsObj.Set("readDirAsync", jsFsReadDirAsync(vm, d, loop))
-	_ = fsObj.Set("mkdirAsync", jsFsMkdirAsync(vm, d, loop))
-	_ = fsObj.Set("removeAsync", jsFsRemoveAsync(vm, d, loop))
+	_ = fsObj.Set("readFile", jsFsReadFile(vm, d, engineLoop))
+	_ = fsObj.Set("writeFile", jsFsWriteFile(vm, d, engineLoop))
+	_ = fsObj.Set("stat", jsFsStat(vm, d, engineLoop))
+	_ = fsObj.Set("readDir", jsFsReadDir(vm, d, engineLoop))
+	_ = fsObj.Set("mkdir", jsFsMkdir(vm, d, engineLoop))
+	_ = fsObj.Set("remove", jsFsRemove(vm, d, engineLoop))
+	_ = fsObj.Set("readFileAsync", jsFsReadFileAsync(vm, d, rawLoop, engineLoop))
+	_ = fsObj.Set("writeFileAsync", jsFsWriteFileAsync(vm, d, rawLoop, engineLoop))
+	_ = fsObj.Set("statAsync", jsFsStatAsync(vm, d, rawLoop, engineLoop))
+	_ = fsObj.Set("readDirAsync", jsFsReadDirAsync(vm, d, rawLoop, engineLoop))
+	_ = fsObj.Set("mkdirAsync", jsFsMkdirAsync(vm, d, rawLoop, engineLoop))
+	_ = fsObj.Set("removeAsync", jsFsRemoveAsync(vm, d, rawLoop, engineLoop))
 
 	promisesObj := vm.NewObject()
-	_ = promisesObj.Set("readFile", jsFsReadFileAsync(vm, d, loop))
-	_ = promisesObj.Set("writeFile", jsFsWriteFileAsync(vm, d, loop))
-	_ = promisesObj.Set("stat", jsFsStatAsync(vm, d, loop))
-	_ = promisesObj.Set("readDir", jsFsReadDirAsync(vm, d, loop))
-	_ = promisesObj.Set("mkdir", jsFsMkdirAsync(vm, d, loop))
-	_ = promisesObj.Set("remove", jsFsRemoveAsync(vm, d, loop))
+	_ = promisesObj.Set("readFile", jsFsReadFileAsync(vm, d, rawLoop, engineLoop))
+	_ = promisesObj.Set("writeFile", jsFsWriteFileAsync(vm, d, rawLoop, engineLoop))
+	_ = promisesObj.Set("stat", jsFsStatAsync(vm, d, rawLoop, engineLoop))
+	_ = promisesObj.Set("readDir", jsFsReadDirAsync(vm, d, rawLoop, engineLoop))
+	_ = promisesObj.Set("mkdir", jsFsMkdirAsync(vm, d, rawLoop, engineLoop))
+	_ = promisesObj.Set("remove", jsFsRemoveAsync(vm, d, rawLoop, engineLoop))
 	_ = fsObj.Set("promises", promisesObj)
 	_ = vm.Set(fsModuleName, fsObj)
 	return fsObj
@@ -70,14 +72,17 @@ func jsFsEnsureObject(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) *goj
 // 三种路径风格:
 //   - "data://X"  -> data/<dice-name>/extensions/<currentExtName>/data/X (按扩展隔离的用户数据)
 //   - 绝对路径     -> 直传 (仅 AllowFilesystemUnrestrictedAccess=true)
-//   - 普通相对路径 -> 相对核心可执行文件解析 (仅 AllowFilesystemUnrestrictedAccess=true)
 func jsFsResolveAbsolute(d *Dice, raw string) (jsFsResolvedPath, error) {
+	return jsFsResolveAbsoluteWithContext(d, raw, nil)
+}
+
+func jsFsResolveAbsoluteWithContext(d *Dice, raw string, context *jsExecutionContext) (jsFsResolvedPath, error) {
 	if raw == "" {
 		return jsFsResolvedPath{}, errors.New("路径不能为空")
 	}
 
 	if rest, ok := strings.CutPrefix(raw, fsDataURIPrefix); ok {
-		extName, err := jsFsCurrentExtName(d)
+		extName, err := jsFsCurrentExtNameWithContext(d, context)
 		if err != nil {
 			return jsFsResolvedPath{}, err
 		}
@@ -179,23 +184,34 @@ func jsFsEnsureDataParentInside(p jsFsResolvedPath) error {
 }
 
 func jsFsCurrentExtName(d *Dice) (string, error) {
-	if d.JsCurrentPlugin != nil && d.JsCurrentPlugin.Name != "" {
-		return d.JsCurrentPlugin.Name, nil
+	return jsFsCurrentExtNameWithContext(d, nil)
+}
+
+func jsFsCurrentExtNameWithContext(d *Dice, context *jsExecutionContext) (string, error) {
+	if d == nil {
+		return "", errors.New("无法确定当前扩展身份,data:// 路径不可用")
 	}
-	if d.JsLoadingScript != nil && d.JsLoadingScript.Name != "" {
-		return d.JsLoadingScript.Name, nil
+	if plugin := jsContextPlugin(context); plugin != nil && plugin.Name != "" {
+		return plugin.Name, nil
+	}
+	if script := jsContextScript(context); script != nil && script.Name != "" {
+		return script.Name, nil
 	}
 	return "", errors.New("无法确定当前扩展身份,data:// 路径不可用")
 }
-// jsNetworkAuthorize enforces the current SealPack network policy before the
-// fetch adapter starts any network work. Core scripts without a package
-// identity retain the historical host behavior; package scripts must resolve
-// an installed sandbox and never fall back to unrestricted access.
+
+// jsNetworkAuthorize enforces the current package policy for a core call that
+// has no execution context. Context-aware callers must use the suffixed form.
 func jsNetworkAuthorize(d *Dice, target string) error {
-	if d == nil || d.JsCurrentPlugin == nil || d.JsCurrentPlugin.Source == nil {
+	return jsNetworkAuthorizeWithContext(d, nil, target)
+}
+
+func jsNetworkAuthorizeWithContext(d *Dice, context *jsExecutionContext, target string) error {
+	source := jsContextSource(context)
+	if d == nil || source == nil {
 		return nil
 	}
-	packageID := d.JsCurrentPlugin.Source.PackageID
+	packageID := source.PackageID
 	if packageID == "" {
 		return nil
 	}
@@ -208,15 +224,20 @@ func jsNetworkAuthorize(d *Dice, target string) error {
 	}
 	return sandbox.CheckNetworkPermission(target)
 }
-// jsFilesystemAuthorize enforces package file permissions before an operation
-// resolves or starts IO. data:// is represented as the package's logical
-// data/ path for permission matching while its existing isolated storage path
-// remains unchanged.
+
+// jsFilesystemAuthorize enforces package file permissions for a core call
+// that has no execution context. Context-aware callers must use the suffixed
+// form.
 func jsFilesystemAuthorize(d *Dice, raw string, write bool) error {
-	if d == nil || d.JsCurrentPlugin == nil || d.JsCurrentPlugin.Source == nil {
+	return jsFilesystemAuthorizeWithContext(d, nil, raw, write)
+}
+
+func jsFilesystemAuthorizeWithContext(d *Dice, context *jsExecutionContext, raw string, write bool) error {
+	source := jsContextSource(context)
+	if d == nil || source == nil {
 		return nil
 	}
-	packageID := d.JsCurrentPlugin.Source.PackageID
+	packageID := source.PackageID
 	if packageID == "" {
 		return nil
 	}
@@ -254,23 +275,29 @@ func jsFsRejectedPromise(vm *goja.Runtime, err error) goja.Value {
 	return vm.ToValue(promise)
 }
 
-func jsFsRunAsync(vm *goja.Runtime, loop *eventloop.EventLoop, work func() (func(*goja.Runtime) goja.Value, error)) goja.Value {
-	if loop == nil {
+func jsFsRunAsync(vm *goja.Runtime, rawLoop *eventloop.EventLoop, engineLoop jsengine.Loop, work func() (func(*goja.Runtime) goja.Value, error)) goja.Value {
+	if rawLoop == nil || engineLoop == nil {
 		return jsFsRejectedPromise(vm, errors.New("JS event loop 未初始化,无法执行异步 fs 操作"))
 	}
 	promise, resolve, reject := vm.NewPromise()
+	executionContext := jsExecutionContextFor(engineLoop)
 	go func() {
 		value, err := work()
-		loop.RunOnLoop(func(loopVM *goja.Runtime) {
+		_ = jsengine.ScheduleWithContext(engineLoop, executionContext, func(runtime jsengine.Runtime) error {
+			loopVM, ok := gojaengine.Raw(runtime)
+			if !ok {
+				return errors.New("Goja runtime adapter unavailable")
+			}
 			if err != nil {
 				_ = reject(loopVM.NewGoError(err))
-				return
+				return nil
 			}
 			if value == nil {
 				_ = resolve(goja.Undefined())
-				return
+				return nil
 			}
 			_ = resolve(value(loopVM))
+			return nil
 		})
 	}()
 	return vm.ToValue(promise)
@@ -286,13 +313,13 @@ func jsFsStatValue(vm *goja.Runtime, info os.FileInfo) goja.Value {
 	return result
 }
 
-func jsFsReadFile(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
+func jsFsReadFile(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		raw := call.Argument(0).String()
-		if err := jsFilesystemAuthorize(d, raw, false); err != nil {
+		if err := jsFilesystemAuthorizeWithContext(d, jsExecutionContextFor(engineLoop), raw, false); err != nil {
 			jsFsThrow(vm, err)
 		}
-		resolved, err := jsFsResolveAbsolute(d, raw)
+		resolved, err := jsFsResolveAbsoluteWithContext(d, raw, jsExecutionContextFor(engineLoop))
 		if err != nil {
 			jsFsThrow(vm, err)
 		}
@@ -307,13 +334,13 @@ func jsFsReadFile(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value 
 	}
 }
 
-func jsFsWriteFile(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
+func jsFsWriteFile(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		raw := call.Argument(0).String()
-		if err := jsFilesystemAuthorize(d, raw, true); err != nil {
+		if err := jsFilesystemAuthorizeWithContext(d, jsExecutionContextFor(engineLoop), raw, true); err != nil {
 			jsFsThrow(vm, err)
 		}
-		resolved, err := jsFsResolveAbsolute(d, raw)
+		resolved, err := jsFsResolveAbsoluteWithContext(d, raw, jsExecutionContextFor(engineLoop))
 		if err != nil {
 			jsFsThrow(vm, err)
 		}
@@ -337,13 +364,13 @@ func jsFsWriteFile(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value
 	}
 }
 
-func jsFsStat(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
+func jsFsStat(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		raw := call.Argument(0).String()
-		if err := jsFilesystemAuthorize(d, raw, false); err != nil {
+		if err := jsFilesystemAuthorizeWithContext(d, jsExecutionContextFor(engineLoop), raw, false); err != nil {
 			jsFsThrow(vm, err)
 		}
-		resolved, err := jsFsResolveAbsolute(d, raw)
+		resolved, err := jsFsResolveAbsoluteWithContext(d, raw, jsExecutionContextFor(engineLoop))
 		if err != nil {
 			jsFsThrow(vm, err)
 		}
@@ -358,17 +385,17 @@ func jsFsStat(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
 	}
 }
 
-func jsFsReadFileAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
+func jsFsReadFileAsync(vm *goja.Runtime, d *Dice, rawLoop *eventloop.EventLoop, engineLoop jsengine.Loop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		raw := call.Argument(0).String()
-		if err := jsFilesystemAuthorize(d, raw, false); err != nil {
+		if err := jsFilesystemAuthorizeWithContext(d, jsExecutionContextFor(engineLoop), raw, false); err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
-		resolved, err := jsFsResolveAbsolute(d, raw)
+		resolved, err := jsFsResolveAbsoluteWithContext(d, raw, jsExecutionContextFor(engineLoop))
 		if err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
-		return jsFsRunAsync(vm, loop, func() (func(*goja.Runtime) goja.Value, error) {
+		return jsFsRunAsync(vm, rawLoop, engineLoop, func() (func(*goja.Runtime) goja.Value, error) {
 			if err := jsFsEnsureExistingDataTargetInside(resolved); err != nil {
 				return nil, err
 			}
@@ -383,13 +410,13 @@ func jsFsReadFileAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) fun
 	}
 }
 
-func jsFsWriteFileAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
+func jsFsWriteFileAsync(vm *goja.Runtime, d *Dice, rawLoop *eventloop.EventLoop, engineLoop jsengine.Loop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		raw := call.Argument(0).String()
-		if err := jsFilesystemAuthorize(d, raw, true); err != nil {
+		if err := jsFilesystemAuthorizeWithContext(d, jsExecutionContextFor(engineLoop), raw, true); err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
-		resolved, err := jsFsResolveAbsolute(d, raw)
+		resolved, err := jsFsResolveAbsoluteWithContext(d, raw, jsExecutionContextFor(engineLoop))
 		if err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
@@ -403,7 +430,7 @@ func jsFsWriteFileAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) fu
 				mode = os.FileMode(v.ToInteger())
 			}
 		}
-		return jsFsRunAsync(vm, loop, func() (func(*goja.Runtime) goja.Value, error) {
+		return jsFsRunAsync(vm, rawLoop, engineLoop, func() (func(*goja.Runtime) goja.Value, error) {
 			if err := jsFsEnsureParent(resolved); err != nil {
 				return nil, err
 			}
@@ -415,17 +442,17 @@ func jsFsWriteFileAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) fu
 	}
 }
 
-func jsFsStatAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
+func jsFsStatAsync(vm *goja.Runtime, d *Dice, rawLoop *eventloop.EventLoop, engineLoop jsengine.Loop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		raw := call.Argument(0).String()
-		if err := jsFilesystemAuthorize(d, raw, false); err != nil {
+		if err := jsFilesystemAuthorizeWithContext(d, jsExecutionContextFor(engineLoop), raw, false); err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
-		resolved, err := jsFsResolveAbsolute(d, raw)
+		resolved, err := jsFsResolveAbsoluteWithContext(d, raw, jsExecutionContextFor(engineLoop))
 		if err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
-		return jsFsRunAsync(vm, loop, func() (func(*goja.Runtime) goja.Value, error) {
+		return jsFsRunAsync(vm, rawLoop, engineLoop, func() (func(*goja.Runtime) goja.Value, error) {
 			if err := jsFsEnsureExistingDataTargetInside(resolved); err != nil {
 				return nil, err
 			}
@@ -440,17 +467,17 @@ func jsFsStatAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(go
 	}
 }
 
-func jsFsReadDirAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
+func jsFsReadDirAsync(vm *goja.Runtime, d *Dice, rawLoop *eventloop.EventLoop, engineLoop jsengine.Loop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		raw := call.Argument(0).String()
-		if err := jsFilesystemAuthorize(d, raw, false); err != nil {
+		if err := jsFilesystemAuthorizeWithContext(d, jsExecutionContextFor(engineLoop), raw, false); err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
-		resolved, err := jsFsResolveAbsolute(d, raw)
+		resolved, err := jsFsResolveAbsoluteWithContext(d, raw, jsExecutionContextFor(engineLoop))
 		if err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
-		return jsFsRunAsync(vm, loop, func() (func(*goja.Runtime) goja.Value, error) {
+		return jsFsRunAsync(vm, rawLoop, engineLoop, func() (func(*goja.Runtime) goja.Value, error) {
 			if err := jsFsEnsureExistingDataTargetInside(resolved); err != nil {
 				return nil, err
 			}
@@ -472,13 +499,13 @@ func jsFsReadDirAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func
 	}
 }
 
-func jsFsMkdirAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
+func jsFsMkdirAsync(vm *goja.Runtime, d *Dice, rawLoop *eventloop.EventLoop, engineLoop jsengine.Loop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		raw := call.Argument(0).String()
-		if err := jsFilesystemAuthorize(d, raw, true); err != nil {
+		if err := jsFilesystemAuthorizeWithContext(d, jsExecutionContextFor(engineLoop), raw, true); err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
-		resolved, err := jsFsResolveAbsolute(d, raw)
+		resolved, err := jsFsResolveAbsoluteWithContext(d, raw, jsExecutionContextFor(engineLoop))
 		if err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
@@ -488,7 +515,7 @@ func jsFsMkdirAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(g
 				mode = os.FileMode(v.ToInteger())
 			}
 		}
-		return jsFsRunAsync(vm, loop, func() (func(*goja.Runtime) goja.Value, error) {
+		return jsFsRunAsync(vm, rawLoop, engineLoop, func() (func(*goja.Runtime) goja.Value, error) {
 			if err := jsFsEnsureDataParentInside(resolved); err != nil {
 				return nil, err
 			}
@@ -503,17 +530,17 @@ func jsFsMkdirAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(g
 	}
 }
 
-func jsFsRemoveAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(goja.FunctionCall) goja.Value {
+func jsFsRemoveAsync(vm *goja.Runtime, d *Dice, rawLoop *eventloop.EventLoop, engineLoop jsengine.Loop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		raw := call.Argument(0).String()
-		if err := jsFilesystemAuthorize(d, raw, true); err != nil {
+		if err := jsFilesystemAuthorizeWithContext(d, jsExecutionContextFor(engineLoop), raw, true); err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
-		resolved, err := jsFsResolveAbsolute(d, raw)
+		resolved, err := jsFsResolveAbsoluteWithContext(d, raw, jsExecutionContextFor(engineLoop))
 		if err != nil {
 			return jsFsRejectedPromise(vm, err)
 		}
-		return jsFsRunAsync(vm, loop, func() (func(*goja.Runtime) goja.Value, error) {
+		return jsFsRunAsync(vm, rawLoop, engineLoop, func() (func(*goja.Runtime) goja.Value, error) {
 			if err := jsFsEnsureExistingDataTargetInside(resolved); err != nil {
 				return nil, err
 			}
@@ -525,13 +552,13 @@ func jsFsRemoveAsync(vm *goja.Runtime, d *Dice, loop *eventloop.EventLoop) func(
 	}
 }
 
-func jsFsReadDir(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
+func jsFsReadDir(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		raw := call.Argument(0).String()
-		if err := jsFilesystemAuthorize(d, raw, false); err != nil {
+		if err := jsFilesystemAuthorizeWithContext(d, jsExecutionContextFor(engineLoop), raw, false); err != nil {
 			jsFsThrow(vm, err)
 		}
-		resolved, err := jsFsResolveAbsolute(d, raw)
+		resolved, err := jsFsResolveAbsoluteWithContext(d, raw, jsExecutionContextFor(engineLoop))
 		if err != nil {
 			jsFsThrow(vm, err)
 		}
@@ -553,13 +580,13 @@ func jsFsReadDir(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
 	}
 }
 
-func jsFsMkdir(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
+func jsFsMkdir(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		raw := call.Argument(0).String()
-		if err := jsFilesystemAuthorize(d, raw, true); err != nil {
+		if err := jsFilesystemAuthorizeWithContext(d, jsExecutionContextFor(engineLoop), raw, true); err != nil {
 			jsFsThrow(vm, err)
 		}
-		resolved, err := jsFsResolveAbsolute(d, raw)
+		resolved, err := jsFsResolveAbsoluteWithContext(d, raw, jsExecutionContextFor(engineLoop))
 		if err != nil {
 			jsFsThrow(vm, err)
 		}
@@ -582,13 +609,13 @@ func jsFsMkdir(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
 	}
 }
 
-func jsFsRemove(vm *goja.Runtime, d *Dice) func(goja.FunctionCall) goja.Value {
+func jsFsRemove(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		raw := call.Argument(0).String()
-		if err := jsFilesystemAuthorize(d, raw, true); err != nil {
+		if err := jsFilesystemAuthorizeWithContext(d, jsExecutionContextFor(engineLoop), raw, true); err != nil {
 			jsFsThrow(vm, err)
 		}
-		resolved, err := jsFsResolveAbsolute(d, raw)
+		resolved, err := jsFsResolveAbsoluteWithContext(d, raw, jsExecutionContextFor(engineLoop))
 		if err != nil {
 			jsFsThrow(vm, err)
 		}

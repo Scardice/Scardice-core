@@ -5,11 +5,18 @@ import (
 	"encoding/json"
 )
 
-// RuntimeOptions controls creation of a runtime loop. OptionsJSON is an
-// optional engine-neutral JSON payload forwarded to the selected provider.
-// Providers decide which options they support.
+// RuntimeOptions carries provider-specific creation payloads in namespaces.
+// Providers must read only the payload under their normalized EngineID.
 type RuntimeOptions struct {
-	OptionsJSON json.RawMessage
+	Providers map[EngineID]json.RawMessage
+}
+
+// PayloadFor returns the payload owned by provider id.
+func (o RuntimeOptions) PayloadFor(id EngineID) json.RawMessage {
+	if len(o.Providers) == 0 {
+		return nil
+	}
+	return o.Providers[NormalizeEngineID(string(id))]
 }
 
 // Provider describes and opens one JavaScript runtime implementation.

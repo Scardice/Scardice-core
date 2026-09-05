@@ -24,4 +24,5 @@ var (
 	ErrNativeException             = errors.New("native runtime exception")
 	ErrNativeHost                  = errors.New("native host callback failed")
 	ErrNativeRuntimeUnsupported    = errors.New("native runtime unsupported without cgo")
+	ErrNativeContextUnsupported    = errors.New("native runtime lacks execution context extension")
 )

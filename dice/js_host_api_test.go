@@ -96,18 +96,21 @@ func TestJSExtensionReplacementWarnsWithBothSources(t *testing.T) {
 	loop := gojaengine.New()
 	defer loop.Close()
 
-	if err := loop.Run(func(runtime jsengine.Runtime) error {
+	first := &JsScriptInfo{Name: "first", Filename: "first.js"}
+	if err := jsengine.RunWithContext(loop, &jsExecutionContext{Script: first}, func(runtime jsengine.Runtime) error {
 		if err := dice.installJSHostAPI(runtime); err != nil {
 			return err
 		}
-		if err := dice.installJSExtHostAPI(runtime, runtime.Get("seal").Object(), 1, nil); err != nil {
+		if err := dice.installJSExtHostAPI(runtime, loop, runtime.Get("seal").Object(), 1, nil); err != nil {
 			return err
 		}
-		dice.JsLoadingScript = &JsScriptInfo{Name: "first", Filename: "first.js"}
-		if _, err := runtime.RunString("first.js", `seal.ext.register(seal.ext.new("same-name", "first", "1"))`); err != nil {
-			return err
-		}
-		dice.JsLoadingScript = &JsScriptInfo{Name: "second", Filename: "second.js"}
+		_, err := runtime.RunString("first.js", `seal.ext.register(seal.ext.new("same-name", "first", "1"))`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	second := &JsScriptInfo{Name: "second", Filename: "second.js"}
+	if err := jsengine.RunWithContext(loop, &jsExecutionContext{Script: second}, func(runtime jsengine.Runtime) error {
 		_, err := runtime.RunString("second.js", `seal.ext.register(seal.ext.new("same-name", "second", "1"))`)
 		return err
 	}); err != nil {

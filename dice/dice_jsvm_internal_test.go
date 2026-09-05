@@ -491,3 +491,81 @@ func TestIsCompatibleJsMetaCacheEntry(t *testing.T) {
 		t.Fatalf("expected cache entry with dangerous api data field to be compatible")
 	}
 }
+
+func TestCheckJsScriptsDepsRejectsCrossRuntimeDependency(t *testing.T) {
+	constraint, err := semver.NewConstraint("*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dependency := &JsScriptInfo{
+		Author:    "runtime-two",
+		Name:      "dependency",
+		Version:   "1.0.0",
+		RuntimeID: "runtime-two",
+	}
+	dependent := &JsScriptInfo{
+		Author:    "runtime-one",
+		Name:      "dependent",
+		Version:   "1.0.0",
+		RuntimeID: "runtime-one",
+		Depends: []JsScriptDepends{
+			{
+				Author:     dependency.Author,
+				Name:       dependency.Name,
+				Constraint: constraint,
+			},
+		},
+	}
+
+	canLoad, invalid := checkJsScriptsDeps([]*JsScriptInfo{dependent, dependency})
+	if len(canLoad) != 1 || canLoad[0] != dependency {
+		t.Fatalf("canLoad = %v, want only cross-runtime dependency", showScriptInfos(canLoad))
+	}
+	reasons := invalid[dependent.Author+":"+dependent.Name]
+	if len(reasons) == 0 || !strings.Contains(reasons[0], "runtime") {
+		t.Fatalf("invalid reasons = %v, want cross-runtime dependency rejection", invalid)
+	}
+
+	t.Run("same runtime dependency remains valid", func(t *testing.T) {
+		sameRuntimeDependency := &JsScriptInfo{
+			Author:    "runtime-one",
+			Name:      "dependency",
+			Version:   "1.0.0",
+			RuntimeID: "runtime-one",
+		}
+		sameRuntimeDependent := &JsScriptInfo{
+			Author:    "runtime-one",
+			Name:      "dependent",
+			Version:   "1.0.0",
+			RuntimeID: "runtime-one",
+			Depends: []JsScriptDepends{{
+				Author:     sameRuntimeDependency.Author,
+				Name:       sameRuntimeDependency.Name,
+				Constraint: constraint,
+			}},
+		}
+		canLoad, invalid := checkJsScriptsDeps([]*JsScriptInfo{sameRuntimeDependent, sameRuntimeDependency})
+		if len(invalid) != 0 || len(canLoad) != 2 {
+			t.Fatalf("same-runtime dependency result = canLoad:%v invalid:%v", showScriptInfos(canLoad), invalid)
+		}
+	})
+}
+
+func TestJsParseMetaAllowsDependencyWithoutConstraint(t *testing.T) {
+	d := &Dice{}
+	info, err := d.JsParseMeta(
+		"./data/scripts/dependent.js",
+		time.Unix(1700000000, 0),
+		[]byte("// ==UserScript==\n// @name dependent\n// @depends author:dependency\n// ==/UserScript==\n"),
+		false,
+	)
+	if err != nil {
+		t.Fatalf("JsParseMeta returned error: %v", err)
+	}
+	if len(info.Depends) != 1 {
+		t.Fatalf("dependencies = %#v, want one dependency", info.Depends)
+	}
+	if !info.Depends[0].Constraint.Check(semver.MustParse("1.0.0")) {
+		t.Fatalf("dependency constraint = %s, want wildcard", info.Depends[0].Constraint)
+	}
+}

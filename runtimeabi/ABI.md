@@ -13,11 +13,15 @@ Scardice keeps these versions independent:
 | Seal JS API | Compatibility of the user-facing `seal.*` JavaScript API. |
 | Runtime Version | The implementation/version of a runtime provider (for example, QuickJS). |
 
-The Scardice product version does not imply any of these versions. The header declares `SC_RUNTIME_ABI_MAJOR 1`, `SC_RUNTIME_ABI_MINOR 0`, `SC_HOST_ABI_MAJOR 1`, and `SC_HOST_ABI_MINOR 0`.
+The header currently declares `SC_RUNTIME_ABI_MAJOR 1`, `SC_RUNTIME_ABI_MINOR 0`, `SC_HOST_ABI_MAJOR 1`, and `SC_HOST_ABI_MINOR 1`. Core and provider are a paired development contract: these numbers and the v1 header/query names remain unchanged, and do not promise compatibility with older consumers or providers. The current bridge requires matching Runtime and Host major/minor values; this is not a released minor-version negotiation policy.
 
-A host fills `sc_runtime_query_v1` with the versions it supports. A major-version mismatch rejects the plugin. With the same major, negotiation accepts a plugin when its required minor is less than or equal to the host minor. A minor release may only append fields, function-pointer slots, or capability bits. ABI v2 uses a new `scardice_runtime_query_v2` symbol.
+The runtime plugin table keeps its original `struct_size`, descriptor, and API
+prefix. `extension_count` and `extensions` are append-only optional tail
+fields: a provider that reports only the original prefix is accepted with an
+empty extension table. Providers that report a partial tail or malformed
+extension descriptors are rejected before `create`.
 
-Every v1 struct begins with `uint32_t struct_size`. A producer sets it to the byte size of the prefix it provides. A consumer checks that the received size covers a field before reading it and treats omitted tail fields as unavailable. Existing fields and slots must never be reordered, removed, or assigned new semantics. Unknown appended fields are ignored.
+Every v1 struct begins with `uint32_t struct_size`. Producers set it to the byte size of the fields they provide. Consumers validate that the received size covers every field they read. This protects diagnostics and layout validation; optional tail fields are read only when covered by `struct_size`.
 
 ## Scalar types and constants
 
@@ -30,7 +34,27 @@ typedef uint64_t sc_value_t;
 typedef uint64_t sc_host_ref_t;
 typedef uint64_t sc_host_func_t;
 typedef uint64_t sc_host_ctx_t;
+typedef uint64_t sc_service_request_t;
 ```
+
+The public entry-kind constants are:
+
+| Macro | Value | Meaning |
+| --- | ---: | --- |
+| `SC_ENTRY_SCRIPT` | 0 | Evaluate a global script. |
+| `SC_ENTRY_COMMONJS` | 1 | Evaluate a CommonJS module and return its exports. |
+| `SC_ENTRY_ESMODULE` | 2 | Evaluate an ES module entry. |
+| `SC_ENTRY_EXTENSION` | 3 | Evaluate an extension script. |
+
+The public value-type constants are fixed-width numeric tags:
+`SC_VALUE_TYPE_UNDEFINED` (0), `SC_VALUE_TYPE_NULL` (1),
+`SC_VALUE_TYPE_BOOL` (2), `SC_VALUE_TYPE_I64` (3),
+`SC_VALUE_TYPE_U64` (4), `SC_VALUE_TYPE_F64` (5),
+`SC_VALUE_TYPE_STRING` (6), `SC_VALUE_TYPE_OBJECT` (7),
+`SC_VALUE_TYPE_HOST_OBJECT` (8), `SC_VALUE_TYPE_HOST_FUNCTION` (9),
+and `SC_VALUE_TYPE_FUNCTION` (10). These tags are returned by
+`value_type`; they are not C enum types and therefore do not depend on
+compiler enum width.
 
 All handle values are opaque; `0` is invalid/null. The status constants are:
 
@@ -48,7 +72,7 @@ All handle values are opaque; `0` is invalid/null. The status constants are:
 | `SC_EHOST` | -20 | Host callback failed. |
 | `SC_EINTERNAL` | -100 | Unexpected provider/internal failure. |
 
-The capability masks are fixed-width `UINT64_C(1) << n` values: `SC_CAP_SCRIPT` (0), `SC_CAP_COMMONJS` (1), `SC_CAP_ESM` (2), `SC_CAP_PROMISE` (3), `SC_CAP_TIMERS` (4), `SC_CAP_HOST_OBJECT` (5), `SC_CAP_HOST_FUNCTION` (6), `SC_CAP_ASYNC_HOST_SERVICE` (7), and `SC_CAP_SOURCE_LOCATION` (8).
+The capability masks are fixed-width `UINT64_C(1) << n` values: `SC_CAP_SCRIPT` (0), `SC_CAP_COMMONJS` (1), `SC_CAP_ESM` (2), `SC_CAP_PROMISE` (3), `SC_CAP_TIMERS` (4), `SC_CAP_HOST_OBJECT` (5), `SC_CAP_HOST_FUNCTION` (6), `SC_CAP_ASYNC_HOST_SERVICE` (7), `SC_CAP_SOURCE_LOCATION` (8), `SC_CAP_HOST_SERVICE` (9), and `SC_CAP_CONTEXT_PROPAGATION` (10).
 
 ## Strings and caller-provided buffers
 
@@ -131,8 +155,11 @@ typedef struct sc_runtime_query_v1 {
 30. `value_retain(sc_runtime_t runtime, sc_value_t value)`
 31. `value_release(sc_runtime_t runtime, sc_value_t value)`
 32. `last_error_copy(sc_runtime_t runtime, char *buffer, uint64_t capacity, uint64_t *required)`
+33. `service_event(sc_runtime_t runtime, const sc_service_event_v1 *event)`
+34. `tick(sc_runtime_t runtime)`
 
 The constructors, conversion functions, object functions, and invocation functions write results only through caller-provided output pointers. `destroy` is the sole v1 lifecycle function with no status return; it must be safe to call after a successful `create` and the host must not use the runtime handle afterward.
+`tick` is the host-driven event-loop progression hook. It executes pending Promise jobs and due timers on the runtime owner thread, and returns `SC_OK` when the queue is idle. Hosts should call it while the loop is alive; it is safe to call when no timer or job is pending.
 
 ## Host API table
 
@@ -145,8 +172,69 @@ The constructors, conversion functions, object functions, and invocation functio
 5. `host_keys_json(sc_host_ctx_t, sc_host_ref_t, char *buffer, uint64_t capacity, uint64_t *required)`
 6. `host_call(sc_host_ctx_t, sc_runtime_t, sc_host_func_t, sc_value_t this_value, const sc_value_t *argv, uint64_t argc, sc_value_t *out)`
 7. `last_error_copy(sc_host_ctx_t, char *buffer, uint64_t capacity, uint64_t *required)`
+8. `service_call(sc_host_ctx_t, sc_runtime_t, sc_string_view service, const sc_host_service_request_v1 *request, sc_host_service_response_v1 *response)`
+9. `service_start(sc_host_ctx_t, sc_runtime_t, sc_string_view service, const sc_host_service_request_v1 *request, sc_service_request_t *out_request)`
+10. `service_cancel(sc_host_ctx_t, sc_runtime_t, sc_service_request_t request)`
 
 Host references and host function references are opaque session handles, not addresses. A host reference is valid for its runtime session and is released when that session closes; v1 does not require cross-session reference counting. A callback must not retain borrowed key/argument data after it returns. The host keeps the callback table and `host_ctx` valid until every runtime using them has been destroyed.
+
+The host-service request and response envelopes are fixed-width and contain no language-runtime pointers beyond borrowed string/byte views:
+
+```c
+typedef struct sc_host_service_request_v1 {
+    uint32_t struct_size;
+    uint32_t operation;
+    sc_string_view string;
+    const uint8_t *bytes;
+    uint64_t bytes_len;
+    uint32_t bool_value;
+    int64_t int64_value;
+    uint64_t uint64_value;
+    double float64_value;
+} sc_host_service_request_v1;
+
+typedef struct sc_host_service_response_v1 {
+    uint32_t struct_size;
+    uint32_t status;
+    char *string_buffer;
+    uint64_t string_capacity;
+    uint64_t string_required;
+    uint8_t *bytes_buffer;
+    uint64_t bytes_capacity;
+    uint64_t bytes_required;
+    uint32_t bool_value;
+    int64_t int64_value;
+    uint64_t uint64_value;
+    double float64_value;
+} sc_host_service_response_v1;
+```
+
+`service_call(sc_host_ctx_t, sc_runtime_t, sc_string_view service, const sc_host_service_request_v1 *request, sc_host_service_response_v1 *response)` is synchronous. The service name, request views, and response buffers are borrowed for the duration of the callback. A successful callback transport returns `SC_OK` even when `response.status` contains a typed non-OK `SC_SERVICE_*` result. `SC_CAP_HOST_SERVICE` identifies providers that can invoke this callback.
+
+`service_start(sc_host_ctx_t, sc_runtime_t, sc_string_view service, const sc_host_service_request_v1 *request, sc_service_request_t *out_request)` starts an asynchronous operation and returns a non-zero opaque request ID. The host copies all request data needed after the callback returns. `service_cancel(sc_host_ctx_t, sc_runtime_t, sc_service_request_t request)` requests cancellation and is idempotent for a request that is already terminal. `SC_CAP_ASYNC_HOST_SERVICE` identifies providers that use these slots.
+
+The runtime receives asynchronous results through:
+
+```c
+typedef struct sc_service_event_v1 {
+    uint32_t struct_size;
+    uint32_t kind;
+    uint32_t status;
+    uint32_t reserved;
+    sc_service_request_t request;
+    sc_string_view string;
+    const uint8_t *bytes;
+    uint64_t bytes_len;
+    uint32_t bool_value;
+    int64_t int64_value;
+    uint64_t uint64_value;
+    double float64_value;
+} sc_service_event_v1;
+```
+
+`kind` is one of `SC_SERVICE_EVENT_DATA`, `SC_SERVICE_EVENT_COMPLETE`, or `SC_SERVICE_EVENT_CLOSE`. Data events are non-terminal. Complete and close events are terminal; each request accepts exactly one terminal event, and providers must reject unknown requests or events delivered after termination. Event payload views are borrowed only for the `service_event` call and must be copied by a provider if retained. Request IDs, event payloads, Go values, and QuickJS values never share ownership across the ABI boundary.
+
+The QuickJS provider currently advertises the `console`, `crypto`, `fetch`, and `filesystem` services. Console operations are `0x0101` (`log`), `0x0102` (`info`), `0x0103` (`warn`), and `0x0104` (`error`). Crypto operations are `0x0201` (`digest`) and `0x0202` (`randomBytes`). Fetch uses asynchronous operation `0x0301` (`request`): the request metadata is JSON in `request.string`, request content is in `request.bytes`, and a successful terminal event returns JSON response metadata in `event.string` plus response content in `event.bytes`; HTTP status is carried in `event.int64_value`. Filesystem operations are `0x0601`/`0x0602` (`readFile`/`writeFile`) for asynchronous calls and `0x0607`/`0x0608` (`readFileSync`/`writeFileSync`) for synchronous calls. Console arguments are converted to JavaScript strings and joined with one space before dispatch. Filesystem requests carry the path in `request.string` and file contents in `request.bytes`; providers must apply the host's package authorization and configured size limits.
 
 ## Plugin query and lifecycle
 
@@ -158,7 +246,61 @@ SC_EXPORT sc_status_t SC_CALL scardice_runtime_query_v1(
     const sc_runtime_plugin_v1 **out_plugin);
 ```
 
-`sc_runtime_plugin_v1` is append-only and contains `struct_size`, then the embedded `sc_runtime_descriptor_v1 descriptor`, then the embedded `sc_runtime_api_v1 api`. A successful query returns a pointer to plugin-owned static storage. The host validates the returned prefix, version fields, capabilities, and function pointers before calling `create`.
+`sc_runtime_plugin_v1` is append-only and contains `struct_size`, then the embedded `sc_runtime_descriptor_v1 descriptor`, the embedded `sc_runtime_api_v1 api`, and the optional extension tail. A successful query returns a pointer to plugin-owned static storage. The host validates the required prefix, version fields, capabilities, and function pointers before calling `create`; it reads the extension tail only when its fields are covered by `struct_size`.
+
+The active plugin table appends an extension descriptor array after the
+runtime API:
+
+```c
+typedef struct sc_runtime_extension_v1 {
+    uint32_t struct_size;
+    const char *name;
+    uint32_t abi_major;
+    uint32_t abi_minor;
+    const void *table;
+} sc_runtime_extension_v1;
+
+typedef struct sc_runtime_plugin_v1 {
+    uint32_t struct_size;
+    sc_runtime_descriptor_v1 descriptor;
+    sc_runtime_api_v1 api;
+    uint32_t extension_count;
+    const sc_runtime_extension_v1 *extensions;
+} sc_runtime_plugin_v1;
+```
+
+The host validates every extension descriptor before use. `extension_count`
+may be zero, but a non-zero count requires a non-null array; each descriptor
+requires a complete descriptor-sized prefix, a non-null name, and a non-null
+table. Extension names and tables are provider-owned static storage.
+
+The current context extension is named
+`SC_RUNTIME_EXTENSION_CONTEXT_V1` (`scardice.runtime.context.v1`) and has
+ABI `1.0`:
+
+```c
+typedef struct sc_runtime_context_extension_v1 {
+    uint32_t struct_size;
+    sc_status_t (SC_CALL *set_current_context)(
+        sc_runtime_t runtime, uint64_t token);
+    uint64_t (SC_CALL *get_current_context)(sc_runtime_t runtime);
+} sc_runtime_context_extension_v1;
+```
+
+The host supplies opaque non-zero tokens while entering a script, timer,
+Promise job, or asynchronous service completion. The provider stores the
+token on its owner thread and returns it to host callbacks through
+`get_current_context`; token values have no meaning outside that runtime
+instance. Providers without this optional extension cannot promise context
+propagation.
+
+A provider advertising `SC_CAP_CONTEXT_PROPAGATION` must expose this extension
+with the supported major, at least the required extension minor, a complete
+context table, and non-null set/get callbacks. The Core bridge rejects a false
+declaration before accepting the plugin or calling `create`. QuickJS advertises
+the bit in both its manifest and native descriptor. A generic provider may omit
+the capability and continue ordinary execution; callers requiring contextual
+execution must explicitly require the capability.
 
 The lifecycle is `query → create → start → calls → stop → destroy`. `start` and `stop` are explicit and may return a status. `destroy` invalidates the runtime and all non-retained values. v1 never unloads a native library: the host must not call `dlclose` on POSIX or `FreeLibrary` on Windows; the library remains loaded through process exit.
 

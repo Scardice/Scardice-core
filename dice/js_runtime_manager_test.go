@@ -68,6 +68,8 @@ func TestJSRuntimeManagerReportsDiscoveredMetadataWithoutLoading(t *testing.T) {
 		"name": "QuickJS native provider",
 		"version": "0.7.7",
 		"language": "C++",
+		"author": "Scardice",
+		"extensions": [".js", ".ts"],
 		"runtimeAbi": {"major": 1, "minMinor": 0},
 		"hostAbi": {"major": 1, "minMinor": 0},
 		"libraries": {"%s": "libquickjs.so"},
@@ -87,6 +89,9 @@ func TestJSRuntimeManagerReportsDiscoveredMetadataWithoutLoading(t *testing.T) {
 	}
 	if status.Version != "0.7.7" || status.ABI != "1.0" {
 		t.Fatalf("metadata status = %+v", status)
+	}
+	if status.Author != "Scardice" || len(status.Extensions) != 2 || status.Extensions[0] != ".js" || status.Extensions[1] != ".ts" {
+		t.Fatalf("runtime metadata = %+v", status)
 	}
 	if status.Path != filepath.Join(packageDir, "libquickjs.so") {
 		t.Fatalf("library path = %q", status.Path)

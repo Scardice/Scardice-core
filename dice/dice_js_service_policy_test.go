@@ -17,24 +17,23 @@ func TestJSNetworkAuthorizeUsesCurrentSealPackPermissions(t *testing.T) {
 		InstallPath:  t.TempDir(),
 		UserDataPath: t.TempDir(),
 	}
+	context := &jsExecutionContext{Plugin: &ExtInfo{Source: &JsScriptInfo{PackageID: pkgID}}}
 	d := &Dice{
-		JsCurrentPlugin: &ExtInfo{Source: &JsScriptInfo{PackageID: pkgID}},
 		PackageManager: &PackageManager{
 			lock:     &sync.RWMutex{},
 			packages: map[string]*sealpack.Instance{pkgID: instance},
 		},
 	}
-	if err := jsNetworkAuthorize(d, "https://example.test"); err == nil {
+	if err := jsNetworkAuthorizeWithContext(d, context, "https://example.test"); err == nil {
 		t.Fatal("jsNetworkAuthorize() error = nil, want permission denial")
 	}
 
 	instance.Manifest.Permissions.Network = true
-	if err := jsNetworkAuthorize(d, "https://example.test"); err != nil {
+	if err := jsNetworkAuthorizeWithContext(d, context, "https://example.test"); err != nil {
 		t.Fatalf("jsNetworkAuthorize(allowed) error = %v", err)
 	}
 
-	d.JsCurrentPlugin = nil
-	if err := jsNetworkAuthorize(d, "https://example.test"); err != nil {
+	if err := jsNetworkAuthorizeWithContext(d, nil, "https://example.test"); err != nil {
 		t.Fatalf("jsNetworkAuthorize(core) error = %v", err)
 	}
 }
@@ -49,20 +48,20 @@ func TestJSFilesystemAuthorizeUsesCurrentSealPackPermissions(t *testing.T) {
 		InstallPath:  t.TempDir(),
 		UserDataPath: t.TempDir(),
 	}
+	context := &jsExecutionContext{Plugin: &ExtInfo{Source: &JsScriptInfo{PackageID: pkgID}}}
 	d := &Dice{
-		JsCurrentPlugin: &ExtInfo{Source: &JsScriptInfo{PackageID: pkgID}},
 		PackageManager: &PackageManager{
 			lock:     &sync.RWMutex{},
 			packages: map[string]*sealpack.Instance{pkgID: instance},
 		},
 	}
-	if err := jsFilesystemAuthorize(d, "data://ok.txt", false); err != nil {
+	if err := jsFilesystemAuthorizeWithContext(d, context, "data://ok.txt", false); err != nil {
 		t.Fatalf("jsFilesystemAuthorize(read) error = %v", err)
 	}
-	if err := jsFilesystemAuthorize(d, "data://ok.txt", true); err == nil {
+	if err := jsFilesystemAuthorizeWithContext(d, context, "data://ok.txt", true); err == nil {
 		t.Fatal("jsFilesystemAuthorize(write data) error = nil, want permission denial")
 	}
-	if err := jsFilesystemAuthorize(d, "_userdata/ok.txt", true); err != nil {
+	if err := jsFilesystemAuthorizeWithContext(d, context, "_userdata/ok.txt", true); err != nil {
 		t.Fatalf("jsFilesystemAuthorize(write userdata) error = %v", err)
 	}
 }

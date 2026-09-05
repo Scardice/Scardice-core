@@ -2,6 +2,9 @@ package dice
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -22,15 +25,17 @@ type JSRuntimeStatus struct {
 	Loaded       bool     `json:"loaded"`
 	Builtin      bool     `json:"builtin"`
 	Version      string   `json:"version"`
+	Author       string   `json:"author"`
 	ABI          string   `json:"abi"`
 	Path         string   `json:"path"`
 	Capabilities []string `json:"capabilities"`
+	Extensions   []string `json:"extensions"`
 	Error        string   `json:"error,omitempty"`
 }
 
 // JSRuntimeManager owns provider discovery and lazy loading for one Dice.
-// Builtin Goja is always registered; external providers are discovered from
-// runtime packages and are never loaded unless explicitly selected.
+// Builtin Goja is always registered; external providers are loaded on explicit
+// selection or when their declared suffix wins automatic script routing.
 type JSRuntimeManager struct {
 	mu       sync.RWMutex
 	registry jsengine.Registry
@@ -39,6 +44,7 @@ type JSRuntimeManager struct {
 	providers      map[jsengine.EngineID]jsengine.Provider
 	statuses       map[jsengine.EngineID]JSRuntimeStatus
 	discoveryError string
+	requirements   jsengine.RuntimeRequirements
 }
 
 // NewJSRuntimeManager creates a manager rooted at root. An empty root uses
@@ -78,10 +84,17 @@ func NewJSRuntimeManager(root string) *JSRuntimeManager {
 
 // NewJSRuntimeManagerForDice installs the application-aware builtin Goja
 // provider while keeping external provider discovery identical to the generic
-// manager.
+// manager. It also installs Dice's host admission profile, which is stricter
+// than the generic engine-neutral provider contract.
 func NewJSRuntimeManagerForDice(d *Dice) *JSRuntimeManager {
 	manager := NewJSRuntimeManager("")
 	manager.providers[jsengine.EngineGoja] = &diceGojaProvider{dice: d}
+	manager.requirements = jsengine.RuntimeRequirements{
+		RequiredCapabilities: jsengine.CapabilityScript |
+			jsengine.CapabilityHostObject |
+			jsengine.CapabilityHostFunction,
+		RequireContextPropagation: true,
+	}
 	return manager
 }
 func (d *Dice) jsRuntimeManagerInstance() *JSRuntimeManager {
@@ -89,6 +102,28 @@ func (d *Dice) jsRuntimeManagerInstance() *JSRuntimeManager {
 		d.jsRuntimeManager = NewJSRuntimeManagerForDice(d)
 	}
 	return d.jsRuntimeManager
+}
+
+// scriptMetadataCacheKey binds parsed metadata to provider order, identity and
+// library availability. Installing a previously missing library also invalidates
+// metadata parsed by a fallback provider.
+func (m *JSRuntimeManager) scriptMetadataCacheKey() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	digest := sha256.New()
+	encoder := json.NewEncoder(digest)
+	for _, descriptor := range m.registry.Descriptors() {
+		_ = encoder.Encode(descriptor)
+		if descriptor.Path == "" {
+			continue
+		}
+		if info, err := os.Stat(descriptor.Path); err == nil {
+			_ = encoder.Encode([]int64{info.Size(), info.ModTime().UnixNano(), int64(info.Mode())})
+		} else {
+			_ = encoder.Encode(err.Error())
+		}
+	}
+	return hex.EncodeToString(digest.Sum(nil))
 }
 
 func (d *Dice) disableJSRuntime(err error) {
@@ -133,10 +168,20 @@ func (m *JSRuntimeManager) Resolve(ctx context.Context, id jsengine.EngineID, op
 		m.recordError(id, err)
 		return nil, fmt.Errorf("resolve JavaScript runtime %q: %w", id, err)
 	}
+	descriptor := provider.Descriptor()
+	if err := m.requirements.ValidateDescriptor(descriptor); err != nil {
+		m.recordError(id, err)
+		return nil, fmt.Errorf("admit JavaScript runtime %q: %w", id, err)
+	}
 	loop, err := provider.Open(ctx, options)
 	if err != nil {
 		m.recordError(id, err)
 		return nil, fmt.Errorf("open JavaScript runtime %q: %w", id, err)
+	}
+	if err := m.requirements.ValidateLoop(loop); err != nil {
+		_ = loop.Close()
+		m.recordError(id, err)
+		return nil, fmt.Errorf("admit JavaScript runtime %q loop: %w", id, err)
 	}
 	status := m.statuses[id]
 	status.Loaded = true
@@ -151,6 +196,185 @@ func normalizeRequestedEngine(id jsengine.EngineID) jsengine.EngineID {
 		return jsengine.EngineGoja
 	}
 	return id
+}
+
+type scriptRuntimePlan struct {
+	explicit    bool
+	explicitIDs []jsengine.EngineID
+	suffixID    jsengine.EngineID
+	extension   string
+}
+
+func (m *JSRuntimeManager) buildScriptRuntimePlan(filename, source string) (scriptRuntimePlan, error) {
+	if m == nil {
+		return scriptRuntimePlan{}, fmt.Errorf("JavaScript runtime manager is unavailable")
+	}
+	descriptors := m.registry.Descriptors()
+	plan := scriptRuntimePlan{
+		extension: jsengine.NormalizeExtension(filepath.Ext(filename)),
+	}
+	hint, hasHint := jsengine.UserScriptRuntimeHint(source)
+	if hasHint {
+		plan.explicit = true
+		if strings.TrimSpace(hint) == "" {
+			return plan, fmt.Errorf("script %q declares an empty @runtime", filename)
+		}
+		selectors, err := jsengine.ParseRuntimeSelectors(hint)
+		if err != nil {
+			return plan, fmt.Errorf("script %q: %w", filename, err)
+		}
+		for _, selector := range selectors {
+			for _, descriptor := range descriptors {
+				id := normalizeRequestedEngine(descriptor.ID)
+				if id != selector.ID || descriptor.Author != selector.Author {
+					continue
+				}
+				if !containsRuntimeID(plan.explicitIDs, id) {
+					plan.explicitIDs = append(plan.explicitIDs, id)
+				}
+				break
+			}
+		}
+	}
+	if plan.extension != "" {
+		for _, descriptor := range descriptors {
+			id := normalizeRequestedEngine(descriptor.ID)
+			for _, extension := range descriptor.Extensions {
+				if jsengine.NormalizeExtension(extension) == plan.extension {
+					plan.suffixID = id
+					return plan, nil
+				}
+			}
+		}
+	}
+	return plan, nil
+}
+
+func containsRuntimeID(ids []jsengine.EngineID, want jsengine.EngineID) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
+}
+
+// SelectScriptRuntime selects a runtime from @runtime and then from the
+// filename suffix. Suffix collisions use registration/discovery order.
+func (m *JSRuntimeManager) SelectScriptRuntime(filename, source string) (jsengine.EngineID, error) {
+	if m == nil {
+		return "", fmt.Errorf("JavaScript runtime manager is unavailable")
+	}
+	m.mu.RLock()
+	plan, err := m.buildScriptRuntimePlan(filename, source)
+	m.mu.RUnlock()
+	if err != nil {
+		return "", err
+	}
+	if len(plan.explicitIDs) > 0 {
+		return plan.explicitIDs[0], nil
+	}
+	if plan.suffixID != "" {
+		return plan.suffixID, nil
+	}
+	if plan.explicit {
+		return "", fmt.Errorf("script %q: no declared runtime is available and suffix %q is unsupported", filename, plan.extension)
+	}
+	return "", fmt.Errorf("script %q: no runtime declares suffix %q", filename, plan.extension)
+}
+
+// SupportsScriptExtension reports whether at least one registered runtime
+// declares the filename suffix.
+func (m *JSRuntimeManager) SupportsScriptExtension(filename string) bool {
+	if m == nil {
+		return false
+	}
+	extension := jsengine.NormalizeExtension(filepath.Ext(filename))
+	if extension == "" {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, descriptor := range m.registry.Descriptors() {
+		for _, supported := range descriptor.Extensions {
+			if jsengine.NormalizeExtension(supported) == extension {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ParseUserScript parses the common UserScript metadata format and selects a
+// registered runtime independently of provider implementation details.
+func (m *JSRuntimeManager) ParseUserScript(filename, source string) (jsengine.EngineID, jsengine.UserScriptMetadata, error) {
+	if m == nil {
+		return "", jsengine.UserScriptMetadata{}, fmt.Errorf("JavaScript runtime manager is unavailable")
+	}
+	metadata, err := jsengine.ParseUserScript(source)
+	if err != nil {
+		return "", jsengine.UserScriptMetadata{}, fmt.Errorf("script %q: parse UserScript metadata: %w", filename, err)
+	}
+	id, err := m.SelectScriptRuntime(filename, source)
+	if err != nil {
+		return "", jsengine.UserScriptMetadata{}, err
+	}
+	return id, metadata, nil
+}
+
+// ResolveScript opens the first usable explicit runtime and falls back to the
+// suffix-selected runtime when all explicit candidates are unavailable.
+func (m *JSRuntimeManager) ResolveScript(
+	ctx context.Context,
+	filename string,
+	source string,
+	options jsengine.RuntimeOptions,
+) (jsengine.EngineID, jsengine.Loop, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return m.resolveScript(filename, source, func(id jsengine.EngineID) (jsengine.Loop, error) {
+		return m.Resolve(ctx, id, options)
+	})
+}
+
+// resolveScript applies routing order while letting the owner reuse live loops.
+func (m *JSRuntimeManager) resolveScript(filename, source string, resolve func(jsengine.EngineID) (jsengine.Loop, error)) (jsengine.EngineID, jsengine.Loop, error) {
+	if m == nil {
+		return "", nil, fmt.Errorf("JavaScript runtime manager is unavailable")
+	}
+	m.mu.RLock()
+	plan, err := m.buildScriptRuntimePlan(filename, source)
+	m.mu.RUnlock()
+	if err != nil {
+		return "", nil, err
+	}
+	var lastErr error
+	attempted := make(map[jsengine.EngineID]struct{})
+	for _, id := range plan.explicitIDs {
+		attempted[id] = struct{}{}
+		loop, resolveErr := resolve(id)
+		if resolveErr == nil {
+			return id, loop, nil
+		}
+		lastErr = resolveErr
+	}
+	if plan.suffixID != "" {
+		if _, alreadyTried := attempted[plan.suffixID]; !alreadyTried {
+			loop, resolveErr := resolve(plan.suffixID)
+			if resolveErr == nil {
+				return plan.suffixID, loop, nil
+			}
+			lastErr = resolveErr
+		}
+	}
+	if lastErr != nil {
+		return "", nil, fmt.Errorf("script %q: no usable runtime: %w", filename, lastErr)
+	}
+	if plan.explicit {
+		return "", nil, fmt.Errorf("script %q: no declared runtime is available and suffix %q is unsupported", filename, plan.extension)
+	}
+	return "", nil, fmt.Errorf("script %q: no runtime declares suffix %q", filename, plan.extension)
 }
 
 func (m *JSRuntimeManager) resolveProvider(id jsengine.EngineID) (jsengine.Provider, error) {
@@ -184,6 +408,7 @@ func (m *JSRuntimeManager) Status(id jsengine.EngineID) (JSRuntimeStatus, bool) 
 		return JSRuntimeStatus{ID: string(id)}, false
 	}
 	status.Capabilities = append([]string(nil), status.Capabilities...)
+	status.Extensions = append([]string(nil), status.Extensions...)
 	return status, true
 }
 
@@ -194,13 +419,13 @@ func (m *JSRuntimeManager) Statuses() []JSRuntimeStatus {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-
 	descriptors := m.registry.Descriptors()
 	statuses := make([]JSRuntimeStatus, 0, len(descriptors))
 	for _, descriptor := range descriptors {
 		id := normalizeRequestedEngine(descriptor.ID)
 		status := m.statuses[id]
 		status.Capabilities = append([]string(nil), status.Capabilities...)
+		status.Extensions = append([]string(nil), status.Extensions...)
 		statuses = append(statuses, status)
 	}
 	return statuses
@@ -228,9 +453,11 @@ func (m *JSRuntimeManager) updateDescriptor(descriptor jsengine.Descriptor, load
 	status.Loaded = status.Loaded || loaded
 	status.Builtin = descriptor.Builtin
 	status.Version = descriptor.Version
+	status.Author = descriptor.Author
 	status.ABI = fmt.Sprintf("%d.%d", descriptor.ABIMajor, descriptor.ABIMinor)
 	status.Path = descriptor.Path
 	status.Capabilities = capabilityNames(descriptor.Capabilities)
+	status.Extensions = append([]string(nil), descriptor.Extensions...)
 	m.statuses[id] = status
 }
 
@@ -258,6 +485,8 @@ func capabilityNames(set jsengine.CapabilitySet) []string {
 		{"hostFunction", jsengine.CapabilityHostFunction},
 		{"asyncHostService", jsengine.CapabilityAsyncHostService},
 		{"sourceLocation", jsengine.CapabilitySourceLocation},
+		{"hostService", jsengine.CapabilityHostService},
+		{"contextPropagation", jsengine.CapabilityContextPropagation},
 	}
 	result := make([]string, 0, len(capabilities))
 	for _, capability := range capabilities {

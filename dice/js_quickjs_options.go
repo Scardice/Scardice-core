@@ -151,7 +151,7 @@ func BuildQuickJSOptionsPayload(config JsConfig) (QuickJSOptionsPayload, error) 
 		config.QuickJSMaxPBKDF2Iterations > quickJSMaxMemoryBytes ||
 		config.QuickJSMaxPBKDF2OutputBytes > quickJSMaxMemoryBytes ||
 		fetchResponse > quickJSMaxMemoryBytes || websocketMessage > quickJSMaxMemoryBytes ||
-		filesystemRead > quickJSMaxMemoryBytes || filesystemWrite > quickJSMaxMemoryBytes {
+		filesystemRead > 16*1024*1024 || filesystemWrite > 16*1024*1024 {
 		return QuickJSOptionsPayload{}, ErrQuickJSOptionsOutOfRange
 	}
 	return QuickJSOptionsPayload{
@@ -191,8 +191,7 @@ func quickJSPolicyMiBBytes(value uint64) (uint64, error) {
 	return value * 1024 * 1024, nil
 }
 
-// BuildQuickJSRuntimeOptions serializes JsConfig into the stable native
-// provider payload.
+// BuildQuickJSRuntimeOptions serializes JsConfig into the provider namespace.
 func BuildQuickJSRuntimeOptions(config JsConfig) (jsengine.RuntimeOptions, error) {
 	payload, err := BuildQuickJSOptionsPayload(config)
 	if err != nil {
@@ -202,9 +201,20 @@ func BuildQuickJSRuntimeOptions(config JsConfig) (jsengine.RuntimeOptions, error
 	if err != nil {
 		return jsengine.RuntimeOptions{}, fmt.Errorf("marshal QuickJS options: %w", err)
 	}
-	return jsengine.RuntimeOptions{OptionsJSON: encoded}, nil
+	return jsengine.RuntimeOptions{
+		Providers: map[jsengine.EngineID]json.RawMessage{
+			jsengine.EngineID("quickjs"): encoded,
+		},
+	}, nil
 }
 
+func BuildRuntimeOptionsForEngine(engine jsengine.EngineID, config JsConfig) (jsengine.RuntimeOptions, error) {
+	engine = jsengine.NormalizeEngineID(string(engine))
+	if engine != jsengine.EngineID("quickjs") {
+		return jsengine.RuntimeOptions{}, nil
+	}
+	return BuildQuickJSRuntimeOptions(config)
+}
 func (d *Dice) quickJSRuntimeOptions() (jsengine.RuntimeOptions, error) {
 	return BuildQuickJSRuntimeOptions(d.Config.JsConfig)
 }

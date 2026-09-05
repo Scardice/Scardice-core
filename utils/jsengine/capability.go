@@ -13,6 +13,8 @@ const (
 	CapabilityHostFunction
 	CapabilityAsyncHostService
 	CapabilitySourceLocation
+	CapabilityHostService
+	CapabilityContextPropagation
 )
 
 // Has reports whether all requested capabilities are present.

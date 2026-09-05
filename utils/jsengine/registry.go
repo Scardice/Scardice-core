@@ -53,6 +53,8 @@ func (r *registry) RegisterBuiltin(provider Provider) error {
 	if descriptor.ID == "" {
 		return fmt.Errorf("%w: provider ID is empty", ErrInvalidProvider)
 	}
+	descriptor.Extensions = NormalizeExtensions(descriptor.Extensions)
+	descriptor.Services = append([]string(nil), descriptor.Services...)
 	if _, exists := r.descriptors[descriptor.ID]; exists {
 		return fmt.Errorf("%w: duplicate provider ID %q", ErrDuplicateProvider, descriptor.ID)
 	}
@@ -69,6 +71,8 @@ func (r *registry) RegisterCandidate(manifest RuntimeManifest) error {
 	if descriptor.ID == "" {
 		return fmt.Errorf("%w: runtime ID is empty", ErrInvalidManifest)
 	}
+	descriptor.Extensions = NormalizeExtensions(descriptor.Extensions)
+	descriptor.Services = append([]string(nil), descriptor.Services...)
 	if _, exists := r.descriptors[descriptor.ID]; exists {
 		return fmt.Errorf("%w: duplicate provider ID %q", ErrDuplicateProvider, descriptor.ID)
 	}
@@ -98,7 +102,10 @@ func (r *registry) Resolve(id EngineID) (Provider, error) {
 func (r *registry) Descriptors() []Descriptor {
 	descriptors := make([]Descriptor, 0, len(r.order))
 	for _, id := range r.order {
-		descriptors = append(descriptors, r.descriptors[id])
+		descriptor := r.descriptors[id]
+		descriptor.Services = append([]string(nil), descriptor.Services...)
+		descriptor.Extensions = append([]string(nil), descriptor.Extensions...)
+		descriptors = append(descriptors, descriptor)
 	}
 	return descriptors
 }
@@ -110,7 +117,12 @@ func (r *registry) Descriptor(id EngineID) (Descriptor, bool) {
 		id = EngineGoja
 	}
 	descriptor, ok := r.descriptors[id]
-	return descriptor, ok
+	if !ok {
+		return Descriptor{}, false
+	}
+	descriptor.Services = append([]string(nil), descriptor.Services...)
+	descriptor.Extensions = append([]string(nil), descriptor.Extensions...)
+	return descriptor, true
 }
 
 // Lookup is an alias for Descriptor for callers that prefer lookup semantics.

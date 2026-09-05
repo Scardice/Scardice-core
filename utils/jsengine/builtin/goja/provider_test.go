@@ -47,9 +47,11 @@ func TestProviderOpensExistingGojaAdapter(t *testing.T) {
 	}
 }
 
-func TestProviderRejectsUnsupportedOptionsWithoutDroppingThem(t *testing.T) {
+func TestProviderRejectsUnsupportedOptionsInItsNamespace(t *testing.T) {
 	_, err := builtin.Provider().Open(context.Background(), jsengine.RuntimeOptions{
-		OptionsJSON: json.RawMessage(`{"unsupported":true}`),
+		Providers: map[jsengine.EngineID]json.RawMessage{
+			jsengine.EngineGoja: json.RawMessage(`{"unsupported":true}`),
+		},
 	})
 	if err == nil {
 		t.Fatal("Open() error = nil, want unsupported-options error")
@@ -59,9 +61,23 @@ func TestProviderRejectsUnsupportedOptionsWithoutDroppingThem(t *testing.T) {
 	}
 }
 
+func TestProviderIgnoresOptionsOwnedByAnotherNamespace(t *testing.T) {
+	loop, err := builtin.Provider().Open(context.Background(), jsengine.RuntimeOptions{
+		Providers: map[jsengine.EngineID]json.RawMessage{
+			"quickjs": json.RawMessage(`{"unsupported":true}`),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open() error = %v, want namespace isolation", err)
+	}
+	loop.Close()
+}
+
 func TestProviderAcceptsEmptyOptions(t *testing.T) {
 	for _, optionsJSON := range []json.RawMessage{nil, []byte(" \n\t"), []byte("{}")} {
-		loop, err := builtin.Provider().Open(context.Background(), jsengine.RuntimeOptions{OptionsJSON: optionsJSON})
+		loop, err := builtin.Provider().Open(context.Background(), jsengine.RuntimeOptions{
+			Providers: map[jsengine.EngineID]json.RawMessage{jsengine.EngineGoja: optionsJSON},
+		})
 		if err != nil {
 			t.Fatalf("Open(%q) error = %v, want success", optionsJSON, err)
 		}

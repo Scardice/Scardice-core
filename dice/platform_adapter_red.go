@@ -545,7 +545,7 @@ func (pa *PlatformAdapterRed) SendToPerson(ctx *MsgContext, uid string, text str
 
 	for _, i := range ctx.Dice.ExtList {
 		if i.OnMessageSend != nil {
-			i.callWithJsCheck(ctx.Dice, func() {
+			i.notifyWithJsCheck(ctx.Dice, func() {
 				i.OnMessageSend(ctx, &Message{
 					Message:     text,
 					MessageType: "private",
@@ -590,7 +590,7 @@ func (pa *PlatformAdapterRed) SendToGroup(ctx *MsgContext, groupId string, text 
 				UserID:   pa.EndPoint.UserID,
 			},
 		}
-		groupInfo.TriggerExtHook(ctx.Dice, func(ext *ExtInfo) func() {
+		groupInfo.TriggerExtNotifyHook(ctx.Dice, func(ext *ExtInfo) func() {
 			if ext.OnMessageSend == nil {
 				return nil
 			}

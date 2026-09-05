@@ -5,18 +5,20 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 
 	"Scardice-core/utils/jsengine"
 )
+
 func TestDiscoverManifestIsLazyAndResolvesArchitectureLibrary(t *testing.T) {
 	root := t.TempDir()
 	pkg := filepath.Join(root, "echo")
 	if err := os.MkdirAll(pkg, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	manifest := `{"schema":1,"id":"echo","name":"Echo","version":"1.0.0","language":"javascript","runtimeAbi":{"major":1,"minMinor":0},"hostAbi":{"major":1,"minMinor":0},"libraries":{"` + runtime.GOOS + `-` + runtime.GOARCH + `":"libecho.so"}}`
+	manifest := `{"schema":1,"id":"echo","name":"Echo","version":"1.0.0","language":"javascript","author":"Scardice","extensions":[".echo"],"runtimeAbi":{"major":1,"minMinor":0},"hostAbi":{"major":1,"minMinor":0},"services":["console"],"libraries":{"` + runtime.GOOS + `-` + runtime.GOARCH + `":"libecho.so"}}`
 	if err := os.WriteFile(filepath.Join(pkg, "runtime.json"), []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -29,6 +31,15 @@ func TestDiscoverManifestIsLazyAndResolvesArchitectureLibrary(t *testing.T) {
 	}
 	if got, want := candidates[0].LibraryPath, filepath.Join(pkg, "libecho.so"); got != want {
 		t.Fatalf("library path = %q, want %q", got, want)
+	}
+	if got, want := candidates[0].Manifest.Services, []string{"console"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("manifest services = %#v, want %#v", got, want)
+	}
+	if candidates[0].Manifest.Author != "Scardice" {
+		t.Fatalf("manifest author = %q", candidates[0].Manifest.Author)
+	}
+	if got, want := candidates[0].Manifest.Extensions, []string{".echo"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("manifest extensions = %#v, want %#v", got, want)
 	}
 	if candidates[0].Loaded() {
 		t.Fatal("discovery eagerly loaded native library")
@@ -89,7 +100,6 @@ func TestRepeatedLoadKeepsTransientPathOwnershipBounded(t *testing.T) {
 	}
 }
 
-
 func TestRegisterCandidatesKeepsCandidateMetadataSeparateFromBuiltin(t *testing.T) {
 	root := t.TempDir()
 	pkg := filepath.Join(root, "echo")
@@ -116,11 +126,12 @@ func TestRegisterCandidatesKeepsCandidateMetadataSeparateFromBuiltin(t *testing.
 
 type testProvider struct{}
 
-func (testProvider) Descriptor() jsengine.Descriptor { return jsengine.Descriptor{ID: jsengine.EngineGoja, Builtin: true} }
+func (testProvider) Descriptor() jsengine.Descriptor {
+	return jsengine.Descriptor{ID: jsengine.EngineGoja, Builtin: true}
+}
 func (testProvider) Open(context.Context, jsengine.RuntimeOptions) (jsengine.Loop, error) {
 	return nil, errors.New("test provider cannot open")
 }
-
 
 func TestLoadRejectsManifestDescriptorIdentityMismatch(t *testing.T) {
 	library := os.Getenv("SCARDICE_ECHO_RUNTIME")
@@ -170,7 +181,7 @@ func TestLoadEchoProviderDescriptorAndResidentLifecycle(t *testing.T) {
 		Manifest: Manifest{
 			Schema: 1, ID: "echo-runtime", Name: "Echo Runtime", Version: "1.0.0", Language: "javascript",
 			RuntimeABI: ABIRequirement{Major: 1, MinMinor: 0},
-			HostABI: ABIRequirement{Major: 1, MinMinor: 0},
+			HostABI:    ABIRequirement{Major: 1, MinMinor: 0},
 		},
 	}
 	provider, err := candidate.Load()

@@ -1,12 +1,12 @@
 package native
 
 import (
+	"Scardice-core/utils/jsengine"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
-	"Scardice-core/utils/jsengine"
 
 	"strings"
 )
@@ -17,22 +17,25 @@ type ABIRequirement struct {
 }
 
 type Manifest struct {
-	Schema     uint32                 `json:"schema"`
-	ID         string                 `json:"id"`
-	Name       string                 `json:"name"`
-	Version    string                 `json:"version"`
-	Language   string                 `json:"language"`
-	RuntimeABI ABIRequirement         `json:"runtimeAbi"`
-	HostABI    ABIRequirement         `json:"hostAbi"`
-	Libraries  map[string]string      `json:"libraries"`
-	Capabilities uint64               `json:"capabilities,omitempty"`
-	ManifestPath string               `json:"-"`
+	Schema       uint32            `json:"schema"`
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	Version      string            `json:"version"`
+	Language     string            `json:"language"`
+	Author       string            `json:"author"`
+	RuntimeABI   ABIRequirement    `json:"runtimeAbi"`
+	HostABI      ABIRequirement    `json:"hostAbi"`
+	Libraries    map[string]string `json:"libraries"`
+	Capabilities uint64            `json:"capabilities,omitempty"`
+	Services     []string          `json:"services,omitempty"`
+	Extensions   []string          `json:"extensions,omitempty"`
+	ManifestPath string            `json:"-"`
 }
 
 type Candidate struct {
-	Manifest   Manifest
+	Manifest    Manifest
 	LibraryPath string
-	loaded     bool
+	loaded      bool
 }
 
 func (c Candidate) Loaded() bool { return c.loaded }
@@ -165,10 +168,12 @@ func (l *Loader) RegisterCandidates(registry jsengine.Registry) error {
 		manifest := candidate.Manifest
 		if err := registry.RegisterCandidate(jsengine.RuntimeManifest{
 			ID: jsengine.EngineID(manifest.ID), Name: manifest.Name, Version: manifest.Version,
-			Language: manifest.Language, ABIMajor: manifest.RuntimeABI.Major,
+			Language: manifest.Language, Author: manifest.Author, ABIMajor: manifest.RuntimeABI.Major,
 			ABIMinor: manifest.RuntimeABI.MinMinor, HostABIMajor: manifest.HostABI.Major,
 			HostABIMinor: manifest.HostABI.MinMinor, Capabilities: jsengine.CapabilitySet(manifest.Capabilities),
-			Path: candidate.LibraryPath,
+			Services:   append([]string(nil), manifest.Services...),
+			Extensions: append([]string(nil), manifest.Extensions...),
+			Path:       candidate.LibraryPath,
 		}); err != nil {
 			return err
 		}

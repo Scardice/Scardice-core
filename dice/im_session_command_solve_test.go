@@ -589,7 +589,7 @@ func TestCommandSolve_UsesEngineNeutralCallback(t *testing.T) {
 				IsJsSolveFunc: true,
 				SolveEngine: func(runtime jsengine.Runtime, ctx *MsgContext, _ *Message, _ *CmdArgs) (jsengine.Value, error) {
 					callbackHit++
-					if ctx.Dice.JsCurrentPlugin != ext {
+					if jsContextPlugin(jsExecutionContextFor(loop)) != ext {
 						return nil, errors.New("callback context was not installed")
 					}
 					return runtime.RunString("engine-solve.js", "({ matched: true, solved: true })")
@@ -600,8 +600,6 @@ func TestCommandSolve_UsesEngineNeutralCallback(t *testing.T) {
 	}
 
 	session, ctx := newCommandSolveTestSessionAndContext("dnd5e", []*ExtInfo{ext})
-	previous := &ExtInfo{Name: "previous"}
-	ctx.Dice.JsCurrentPlugin = previous
 	ctx.Dice.ExtLoopManager = NewJsLoopManager()
 	ext.JSLoopVersion = ctx.Dice.ExtLoopManager.SetLoop(loop)
 	ext.CmdMap[commandName].JSLoopVersion = ext.JSLoopVersion
@@ -613,7 +611,7 @@ func TestCommandSolve_UsesEngineNeutralCallback(t *testing.T) {
 	if callbackHit != 1 {
 		t.Fatalf("expected engine callback once, got %d", callbackHit)
 	}
-	if ctx.Dice.JsCurrentPlugin != previous {
-		t.Fatalf("JsCurrentPlugin = %p, want previous %p", ctx.Dice.JsCurrentPlugin, previous)
+	if jsengine.CurrentContext(loop) != nil {
+		t.Fatalf("loop context was not restored: %v", jsengine.CurrentContext(loop))
 	}
 }

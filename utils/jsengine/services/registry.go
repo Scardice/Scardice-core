@@ -15,7 +15,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"Scardice-core/dice/sealpack"
 	"Scardice-core/utils/jsengine"
 )
 
@@ -53,13 +52,25 @@ func NormalizeName(name Name) Name { return Name(strings.ToLower(strings.TrimSpa
 // service so an adapter can validate the operation without parsing JSON.
 type OperationID uint32
 
+// RequestID identifies one asynchronous service operation.
+type RequestID uint64
+
+// EventKind identifies the lifecycle phase delivered to an AsyncSink.
+type EventKind uint32
+
+const (
+	EventData EventKind = iota + 1
+	EventComplete
+	EventClose
+)
+
 const (
 	OpConsoleLog   OperationID = 0x0101
 	OpConsoleInfo  OperationID = 0x0102
 	OpConsoleWarn  OperationID = 0x0103
 	OpConsoleError OperationID = 0x0104
 
-	OpCryptoDigest     OperationID = 0x0201
+	OpCryptoDigest      OperationID = 0x0201
 	OpCryptoRandomBytes OperationID = 0x0202
 
 	OpFetchRequest OperationID = 0x0301
@@ -69,12 +80,14 @@ const (
 	OpWebSocketSend    OperationID = 0x0502
 	OpWebSocketClose   OperationID = 0x0503
 
-	OpFilesystemReadFile  OperationID = 0x0601
-	OpFilesystemWriteFile OperationID = 0x0602
-	OpFilesystemStat      OperationID = 0x0603
-	OpFilesystemReadDir   OperationID = 0x0604
-	OpFilesystemMkdir     OperationID = 0x0605
-	OpFilesystemRemove    OperationID = 0x0606
+	OpFilesystemReadFile      OperationID = 0x0601
+	OpFilesystemWriteFile     OperationID = 0x0602
+	OpFilesystemStat          OperationID = 0x0603
+	OpFilesystemReadDir       OperationID = 0x0604
+	OpFilesystemMkdir         OperationID = 0x0605
+	OpFilesystemRemove        OperationID = 0x0606
+	OpFilesystemReadFileSync  OperationID = 0x0607
+	OpFilesystemWriteFileSync OperationID = 0x0608
 
 	OpAbortCreate OperationID = 0x0701
 	OpAbortCancel OperationID = 0x0702
@@ -130,6 +143,8 @@ var (
 	ErrDeadlineExceeded = errors.New("service call deadline exceeded")
 	ErrUnsupported      = errors.New("service unsupported")
 	ErrRegistryClosed   = errors.New("service registry closed")
+	ErrRequestNotFound  = errors.New("service request not found")
+	ErrRequestCompleted = errors.New("service request completed")
 )
 
 // Request is the scalar/bytes request union. The operation determines which
@@ -139,6 +154,7 @@ type Request struct {
 	Service   Name
 	Operation OperationID
 	String    string
+	Target    string // policy target; empty falls back to String
 	Bytes     []byte
 	Bool      bool
 	Int64     int64
@@ -158,11 +174,17 @@ type Response struct {
 	Float64 float64
 }
 
+// Authorizer evaluates one policy-governed service operation. It intentionally
+// accepts only engine-neutral metadata; the owner may attach any execution
+// context through a Registry PolicyProvider.
+type Authorizer interface {
+	Authorize(service Name, operation OperationID, target string) error
+}
+
 // Policy is the authorization context supplied for one service operation.
-// A nil Sandbox intentionally denies filesystem/network operations; there is
-// no unrestricted fallback.
+// A zero Policy permits services that do not install an authorizer.
 type Policy struct {
-	Sandbox *sealpack.Sandbox
+	Authorizer Authorizer
 }
 
 // PolicyError keeps service and operation information while retaining
@@ -185,43 +207,24 @@ func (e *PolicyError) Error() string {
 }
 func (e *PolicyError) Unwrap() error { return ErrPermissionDenied }
 
-// Authorize checks the SealPack sandbox for operations that can access the
-// network or filesystem. Local pure services do not need a sandbox.
 func (p Policy) Authorize(service Name, operation OperationID, target string) error {
-	service = NormalizeName(service)
-	requiresSandbox := service == Fetch || service == HTTP || service == WebSocket || service == Filesystem
-	if !requiresSandbox {
+	if p.Authorizer == nil {
 		return nil
 	}
-	if p.Sandbox == nil {
-		return &PolicyError{Service: service, Operation: operation, Target: target}
-	}
-	var err error
-	switch service {
-	case Fetch, HTTP, WebSocket:
-		err = p.Sandbox.CheckNetworkPermission(target)
-	case Filesystem:
-		switch operation {
-		case OpFilesystemReadFile, OpFilesystemReadDir, OpFilesystemStat:
-			err = p.Sandbox.CheckFileReadPermission(target)
-		case OpFilesystemWriteFile, OpFilesystemMkdir, OpFilesystemRemove:
-			err = p.Sandbox.CheckFileWritePermission(target)
-		default:
-			err = fmt.Errorf("unknown filesystem operation %d", operation)
-		}
-	}
-	if err != nil {
+	service = NormalizeName(service)
+	if err := p.Authorizer.Authorize(service, operation, target); err != nil {
 		return &PolicyError{Service: service, Operation: operation, Target: target, Cause: err}
 	}
 	return nil
 }
 
 // Call carries cancellation/deadline/policy metadata without exposing an
-// engine value or reflection object. Cancellation is observed before dispatch
-// and should also be observed by long-running providers.
+// engine value or reflection object. Context is opaque to this package and is
+// copied by the adapter boundary before asynchronous work starts.
 type Call struct {
 	Request      Request
 	Policy       Policy
+	Context      any
 	Deadline     time.Time
 	Cancellation <-chan struct{}
 }
@@ -230,9 +233,10 @@ type Call struct {
 // runtime-specific installer; a non-empty Adapter means generic Invoke returns
 // ErrUnsupported instead of pretending to execute the operation.
 type Definition struct {
-	Name       Name
-	Operations []OperationID
-	Adapter    string
+	Name            Name
+	Operations      []OperationID
+	AsyncOperations []OperationID
+	Adapter         string
 }
 
 func (d Definition) normalized() (Definition, error) {
@@ -240,22 +244,31 @@ func (d Definition) normalized() (Definition, error) {
 	if d.Name == "" {
 		return Definition{}, fmt.Errorf("%w: service name is empty", ErrInvalidService)
 	}
-	if len(d.Operations) == 0 {
+	if len(d.Operations) == 0 && len(d.AsyncOperations) == 0 {
 		return Definition{}, fmt.Errorf("%w: service %q has no operations", ErrInvalidService, d.Name)
 	}
-	seen := make(map[OperationID]struct{}, len(d.Operations))
-	ops := make([]OperationID, len(d.Operations))
-	copy(ops, d.Operations)
-	for _, op := range ops {
-		if op == 0 {
-			return Definition{}, fmt.Errorf("%w: service %q has operation 0", ErrInvalidService, d.Name)
+	seen := make(map[OperationID]struct{}, len(d.Operations)+len(d.AsyncOperations))
+	normalize := func(operations []OperationID) ([]OperationID, error) {
+		out := make([]OperationID, len(operations))
+		copy(out, operations)
+		for _, op := range out {
+			if op == 0 {
+				return nil, fmt.Errorf("%w: service %q has operation 0", ErrInvalidService, d.Name)
+			}
+			if _, exists := seen[op]; exists {
+				return nil, fmt.Errorf("%w: service %q operation %d", ErrInvalidService, d.Name, op)
+			}
+			seen[op] = struct{}{}
 		}
-		if _, exists := seen[op]; exists {
-			return Definition{}, fmt.Errorf("%w: service %q operation %d", ErrInvalidService, d.Name, op)
-		}
-		seen[op] = struct{}{}
+		return out, nil
 	}
-	d.Operations = ops
+	var err error
+	if d.Operations, err = normalize(d.Operations); err != nil {
+		return Definition{}, err
+	}
+	if d.AsyncOperations, err = normalize(d.AsyncOperations); err != nil {
+		return Definition{}, err
+	}
 	return d, nil
 }
 
@@ -268,11 +281,42 @@ func (d Definition) supports(operation OperationID) bool {
 	return false
 }
 
+func (d Definition) supportsAsync(operation OperationID) bool {
+	for _, op := range d.AsyncOperations {
+		if op == operation {
+			return true
+		}
+	}
+	return false
+}
+
 // Service is a concrete engine-neutral provider. Adapter-only services are
 // represented by Installer definitions and have no Service implementation.
 type Service interface {
 	Definition() Definition
 	Invoke(Call) (Response, error)
+}
+
+// AsyncCall is the copied engine-neutral input passed to an asynchronous
+// service. The service may retain it only through its scalar/byte fields.
+type AsyncCall struct {
+	ID   RequestID
+	Call Call
+	Sink AsyncSink
+}
+
+// AsyncSink receives asynchronous service data and terminal notifications.
+type AsyncSink interface {
+	Event(RequestID, Response) error
+	Complete(RequestID, Response) error
+	Close(RequestID, Response) error
+}
+
+// AsyncService extends Service with a request lifecycle.
+type AsyncService interface {
+	Service
+	Start(AsyncCall) error
+	Cancel(RequestID) error
 }
 
 // Installer owns one or more adapter bindings. Install is called exactly once
@@ -291,18 +335,206 @@ type registryEntry struct {
 	owner      *Installation
 }
 
+type discardAsyncSink struct{}
+
+func (discardAsyncSink) Event(RequestID, Response) error    { return nil }
+func (discardAsyncSink) Complete(RequestID, Response) error { return nil }
+func (discardAsyncSink) Close(RequestID, Response) error    { return nil }
+
+type asyncRequest struct {
+	registry    *Registry
+	id          RequestID
+	serviceName Name
+	operation   OperationID
+	service     AsyncService
+	sink        AsyncSink
+
+	mu            sync.Mutex
+	terminal      bool
+	terminalKind  EventKind
+	terminalError error
+}
+
+func cloneResponse(response Response) Response {
+	response.Bytes = append([]byte(nil), response.Bytes...)
+	return response
+}
+func (p *asyncRequest) deliver(kind EventKind, response Response) error {
+	if kind != EventData && kind != EventComplete && kind != EventClose {
+		return fmt.Errorf("%w: event kind %d", ErrInvalidService, kind)
+	}
+	response = cloneResponse(response)
+	if response.Status == 0 {
+		response.Status = StatusOK
+	}
+
+	p.mu.Lock()
+	if p.terminal {
+		err := p.terminalError
+		terminalKind := p.terminalKind
+		p.mu.Unlock()
+		if kind == terminalKind && kind != EventData {
+			return nil
+		}
+		return err
+	}
+	terminal := kind == EventComplete || kind == EventClose
+	if terminal {
+		p.terminal = true
+		p.terminalKind = kind
+		p.terminalError = asyncTerminalError(p, response.Status)
+	}
+	sink := p.sink
+	p.mu.Unlock()
+
+	var err error
+	switch kind {
+	case EventData:
+		err = sink.Event(p.id, response)
+	case EventComplete:
+		err = sink.Complete(p.id, response)
+	case EventClose:
+		err = sink.Close(p.id, response)
+	}
+	if terminal && p.registry != nil {
+		p.registry.finishRequest(p)
+	}
+	return err
+}
+func (p *asyncRequest) Event(id RequestID, response Response) error {
+	if id != p.id {
+		return fmt.Errorf("%w: %d", ErrRequestNotFound, id)
+	}
+	return p.deliver(EventData, response)
+}
+
+func (p *asyncRequest) Complete(id RequestID, response Response) error {
+	if id != p.id {
+		return fmt.Errorf("%w: %d", ErrRequestNotFound, id)
+	}
+	return p.deliver(EventComplete, response)
+}
+
+func (p *asyncRequest) Close(id RequestID, response Response) error {
+	if id != p.id {
+		return fmt.Errorf("%w: %d", ErrRequestNotFound, id)
+	}
+	return p.deliver(EventClose, response)
+}
+
+func (p *asyncRequest) cancel(status Status) (bool, error) {
+	p.mu.Lock()
+	if p.terminal {
+		p.mu.Unlock()
+		return false, nil
+	}
+	p.terminal = true
+	p.terminalKind = EventClose
+	p.terminalError = asyncTerminalError(p, status)
+	sink := p.sink
+	p.mu.Unlock()
+
+	err := sink.Close(p.id, Response{Status: status})
+	if p.registry != nil {
+		p.registry.finishRequest(p)
+	}
+	return true, err
+}
+
+func (p *asyncRequest) fail(err error) {
+	p.mu.Lock()
+	p.terminal = true
+	p.terminalKind = EventClose
+	p.terminalError = err
+	p.mu.Unlock()
+}
+
+func asyncTerminalError(request *asyncRequest, status Status) error {
+	var cause error
+	switch status {
+	case StatusOK:
+		cause = ErrRequestCompleted
+	case StatusCancelled:
+		cause = ErrCancelled
+	case StatusDeadlineExceeded:
+		cause = ErrDeadlineExceeded
+	case StatusPermissionDenied:
+		cause = ErrPermissionDenied
+
+	case StatusUnsupported:
+		cause = ErrUnsupported
+	case StatusClosed:
+		cause = ErrRegistryClosed
+	default:
+		cause = fmt.Errorf("service request terminated with status %s", status)
+	}
+	return &CallError{
+		Status:    status,
+		Service:   request.serviceName,
+		Operation: request.operation,
+		Cause:     cause,
+	}
+}
+func (r *Registry) finishRequest(request *asyncRequest) {
+	if r == nil || request == nil {
+		return
+	}
+	request.mu.Lock()
+	// Keep the service reference for the in-flight Cancel call that may follow
+	// a terminal transition; release the callback sink once no more callbacks
+	// can be delivered.
+	request.sink = discardAsyncSink{}
+	request.mu.Unlock()
+}
+
+// PolicyProvider supplies the default policy for a call when the caller did
+// not provide one explicitly. It runs outside the registry lock.
+type PolicyProvider func(Call) Policy
+
 // Registry stores stable named services and adapter-owned bindings.
 type Registry struct {
-	mu            sync.RWMutex
-	entries       map[Name]registryEntry
-	order         []Name
-	owners        map[string]*Installation
-	installations []*Installation
-	closed        bool
+	mu             sync.RWMutex
+	lifecycleMu    sync.Mutex
+	entries        map[Name]registryEntry
+	order          []Name
+	owners         map[string]*Installation
+	installations  []*Installation
+	requests       map[RequestID]*asyncRequest
+	nextRequest    RequestID
+	policyProvider PolicyProvider
+	closed         bool
 }
 
 func NewRegistry() *Registry {
-	return &Registry{entries: make(map[Name]registryEntry), owners: make(map[string]*Installation)}
+	return &Registry{
+		entries:  make(map[Name]registryEntry),
+		owners:   make(map[string]*Installation),
+		requests: make(map[RequestID]*asyncRequest),
+	}
+}
+
+// SetPolicyProvider supplies default authorization for calls that do not carry
+// an explicit Policy. The provider is consulted outside the registry lock.
+func (r *Registry) SetPolicyProvider(provider PolicyProvider) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.policyProvider = provider
+	r.mu.Unlock()
+}
+
+func (r *Registry) policyFor(call Call) Policy {
+	if call.Policy.Authorizer != nil || r == nil {
+		return call.Policy
+	}
+	r.mu.RLock()
+	provider := r.policyProvider
+	r.mu.RUnlock()
+	if provider == nil {
+		return call.Policy
+	}
+	return provider(call)
 }
 
 // Register adds a concrete engine-neutral service.
@@ -440,12 +672,15 @@ func (r *Registry) removeInstallation(installation *Installation) {
 	}
 }
 
-// Close shuts down every installation exactly once. It is safe to call from a
-// Loop.Close hook and does not start goroutines or wait on provider goroutines.
+// Close shuts down every installation and pending asynchronous request exactly
+// once. It is safe to call from a Loop.Close hook and does not wait on provider
+// goroutines.
 func (r *Registry) Close() error {
 	if r == nil {
 		return nil
 	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -453,13 +688,35 @@ func (r *Registry) Close() error {
 	}
 	r.closed = true
 	installations := append([]*Installation(nil), r.installations...)
+	requests := make([]*asyncRequest, 0, len(r.requests))
+	for _, request := range r.requests {
+		requests = append(requests, request)
+	}
 	r.entries = make(map[Name]registryEntry)
 	r.order = nil
 	r.owners = make(map[string]*Installation)
 	r.installations = nil
+	r.requests = nil
 	r.mu.Unlock()
 
 	var firstErr error
+	for _, request := range requests {
+		active, sinkErr := request.cancel(StatusClosed)
+		if !active {
+			continue
+		}
+		if sinkErr != nil && firstErr == nil {
+			firstErr = sinkErr
+		}
+		if err := request.service.Cancel(request.id); err != nil && firstErr == nil {
+			firstErr = &CallError{
+				Status:    StatusInternal,
+				Service:   request.serviceName,
+				Operation: request.operation,
+				Cause:     err,
+			}
+		}
+	}
 	for _, installation := range installations {
 		if err := installation.closeFromRegistry(); err != nil && firstErr == nil {
 			firstErr = err
@@ -482,6 +739,7 @@ func (r *Registry) Lookup(name Name) (Definition, error) {
 	}
 	definition := entry.definition
 	definition.Operations = append([]OperationID(nil), definition.Operations...)
+	definition.AsyncOperations = append([]OperationID(nil), definition.AsyncOperations...)
 	return definition, nil
 }
 
@@ -498,9 +756,210 @@ func (r *Registry) Names() []Name {
 	return append([]Name(nil), r.order...)
 }
 
+func (r *Registry) Start(call Call, sink AsyncSink) (RequestID, error) {
+	return r.start(call, sink)
+}
+
+// StartNative dispatches a request originating at the native ABI boundary.
+// The registry applies its configured PolicyProvider just like Goja calls.
+func (r *Registry) StartNative(call Call, sink AsyncSink) (RequestID, error) {
+	return r.start(call, sink)
+}
+
+// Start dispatches one asynchronous service operation. The registry wraps the
+// supplied sink so providers cannot bypass request lifecycle validation.
+func (r *Registry) start(call Call, sink AsyncSink) (RequestID, error) {
+	if r == nil {
+		return 0, ErrRegistryClosed
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	serviceName := NormalizeName(call.Request.Service)
+	call.Request.Service = serviceName
+	r.mu.RLock()
+	if r.closed {
+		r.mu.RUnlock()
+		return 0, ErrRegistryClosed
+	}
+	entry, ok := r.entries[serviceName]
+	r.mu.RUnlock()
+	if !ok {
+		return 0, fmt.Errorf("%w: %q", ErrServiceNotFound, serviceName)
+	}
+	if !entry.definition.supportsAsync(call.Request.Operation) {
+		return 0, &CallError{
+			Status:    StatusUnsupported,
+			Service:   serviceName,
+			Operation: call.Request.Operation,
+			Cause:     ErrUnsupported,
+		}
+	}
+	if !call.Deadline.IsZero() && !time.Now().Before(call.Deadline) {
+		return 0, &CallError{
+			Status:    StatusDeadlineExceeded,
+			Service:   serviceName,
+			Operation: call.Request.Operation,
+			Cause:     ErrDeadlineExceeded,
+		}
+	}
+	if call.Cancellation != nil {
+		select {
+		case <-call.Cancellation:
+			return 0, &CallError{
+				Status:    StatusCancelled,
+				Service:   serviceName,
+				Operation: call.Request.Operation,
+				Cause:     ErrCancelled,
+			}
+		default:
+		}
+	}
+	call.Policy = r.policyFor(call)
+	target := call.Request.Target
+	if target == "" {
+		target = call.Request.String
+	}
+	if err := call.Policy.Authorize(serviceName, call.Request.Operation, target); err != nil {
+		return 0, &CallError{
+			Status:    StatusPermissionDenied,
+			Service:   serviceName,
+			Operation: call.Request.Operation,
+			Cause:     err,
+		}
+	}
+	asyncService, ok := entry.service.(AsyncService)
+	if !ok || asyncService == nil {
+		return 0, &CallError{
+			Status:    StatusUnsupported,
+			Service:   serviceName,
+			Operation: call.Request.Operation,
+			Cause:     ErrUnsupported,
+		}
+	}
+	if sink == nil {
+		sink = discardAsyncSink{}
+	}
+	call.Request.Bytes = append([]byte(nil), call.Request.Bytes...)
+
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return 0, ErrRegistryClosed
+	}
+	if r.requests == nil {
+		r.requests = make(map[RequestID]*asyncRequest)
+	}
+	var id RequestID
+	for {
+		r.nextRequest++
+		if r.nextRequest == 0 {
+			continue
+		}
+		if _, exists := r.requests[r.nextRequest]; !exists {
+			id = r.nextRequest
+			break
+		}
+	}
+	request := &asyncRequest{
+		registry:    r,
+		id:          id,
+		serviceName: serviceName,
+		operation:   call.Request.Operation,
+		service:     asyncService,
+		sink:        sink,
+	}
+	r.requests[id] = request
+	r.mu.Unlock()
+
+	if err := asyncService.Start(AsyncCall{ID: id, Call: call, Sink: request}); err != nil {
+		callErr := &CallError{
+			Status:    statusForError(err),
+			Service:   serviceName,
+			Operation: call.Request.Operation,
+			Cause:     err,
+		}
+		request.fail(callErr)
+		r.mu.Lock()
+		if r.requests[id] == request {
+			delete(r.requests, id)
+		}
+		r.mu.Unlock()
+		return 0, callErr
+	}
+	return id, nil
+}
+
+// Deliver routes one provider event to a pending request.
+func (r *Registry) Deliver(id RequestID, kind EventKind, response Response) error {
+	if r == nil {
+		return ErrRegistryClosed
+	}
+	if id == 0 {
+		return ErrRequestNotFound
+	}
+	r.mu.RLock()
+	if r.closed {
+		r.mu.RUnlock()
+		return ErrRegistryClosed
+	}
+	request, ok := r.requests[id]
+	r.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("%w: %d", ErrRequestNotFound, id)
+	}
+	return request.deliver(kind, response)
+}
+
+// Cancel requests termination and closes the request sink exactly once.
+func (r *Registry) Cancel(id RequestID) error {
+	if r == nil {
+		return ErrRegistryClosed
+	}
+	if id == 0 {
+		return ErrRequestNotFound
+	}
+	r.mu.RLock()
+	if r.closed {
+		r.mu.RUnlock()
+		return ErrRegistryClosed
+	}
+	request, ok := r.requests[id]
+	r.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("%w: %d", ErrRequestNotFound, id)
+	}
+	active, sinkErr := request.cancel(StatusCancelled)
+	if !active {
+		return nil
+	}
+	cancelErr := request.service.Cancel(id)
+	if sinkErr != nil {
+		return sinkErr
+	}
+	if cancelErr != nil {
+		return &CallError{
+			Status:    StatusInternal,
+			Service:   request.serviceName,
+			Operation: request.operation,
+			Cause:     cancelErr,
+		}
+	}
+	return nil
+}
+
 // Invoke dispatches a concrete service or returns deterministic unsupported
 // status for an adapter-owned binding.
 func (r *Registry) Invoke(call Call) (Response, error) {
+	return r.invoke(call)
+}
+
+// InvokeNative dispatches a request originating at the native ABI boundary.
+// The registry applies its configured PolicyProvider just like Goja calls.
+func (r *Registry) InvokeNative(call Call) (Response, error) {
+	return r.invoke(call)
+}
+
+func (r *Registry) invoke(call Call) (Response, error) {
 	if r == nil {
 		return Response{Status: StatusClosed}, ErrRegistryClosed
 	}
@@ -529,6 +988,7 @@ func (r *Registry) Invoke(call Call) (Response, error) {
 		default:
 		}
 	}
+	call.Policy = r.policyFor(call)
 	if err := call.Policy.Authorize(serviceName, call.Request.Operation, call.Request.String); err != nil {
 		return Response{Status: StatusPermissionDenied}, &CallError{Status: StatusPermissionDenied, Service: serviceName, Operation: call.Request.Operation, Cause: err}
 	}
@@ -586,7 +1046,8 @@ func statusForError(err error) Status {
 }
 
 // Advertised reads the optional service names attached to an engine descriptor.
-// ABI-v1 native descriptors cannot carry this field, so they advertise none.
+// Native ABI descriptors carry capability bits but not service names; the
+// native loader supplies names from the package manifest.
 func Advertised(descriptor jsengine.Descriptor) []Name {
 	services := make([]Name, 0, len(descriptor.Services))
 	for _, raw := range descriptor.Services {

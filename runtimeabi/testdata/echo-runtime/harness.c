@@ -1,6 +1,7 @@
 #include "scardice_runtime_v1.h"
 
 #include <dlfcn.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -112,8 +113,8 @@ int main(int argc, char **argv) {
     sc_runtime_query_v1 query = {sizeof(query), SC_RUNTIME_ABI_MAJOR, SC_RUNTIME_ABI_MINOR,
                                  SC_HOST_ABI_MAJOR, SC_HOST_ABI_MINOR};
     STATUS(query_fn(&query, &plugin), SC_OK, "ABI query succeeds");
-    CHECK(plugin != NULL, "query returns plugin");
-    CHECK(plugin->struct_size == sizeof(*plugin), "plugin struct size is exact");
+    CHECK(plugin->struct_size >= offsetof(sc_runtime_plugin_v1, extension_count),
+          "plugin preserves the original table prefix");
     CHECK(plugin->descriptor.struct_size == sizeof(plugin->descriptor), "descriptor struct size is exact");
     CHECK(plugin->descriptor.abi_major == SC_RUNTIME_ABI_MAJOR &&
               plugin->descriptor.host_abi_major == SC_HOST_ABI_MAJOR,
@@ -125,12 +126,13 @@ int main(int argc, char **argv) {
     g_api = &plugin->api;
 
     sc_host_api_v1 host = {sizeof(host), SC_HOST_ABI_MAJOR, SC_HOST_ABI_MINOR,
-                           host_get, host_set, host_has, NULL, NULL, host_call, NULL};
+                           host_get, host_set, host_has, NULL, NULL, host_call, NULL, NULL, NULL};
     sc_runtime_create_info_v1 info = {sizeof(info), sv("{}")};
     sc_runtime_t runtime = 0;
     STATUS(g_api->create(&host, 123, &info, &runtime), SC_OK, "create succeeds");
     CHECK(runtime != 0, "runtime handle is nonzero");
     STATUS(g_api->start(runtime), SC_OK, "start succeeds");
+    STATUS(g_api->tick(runtime), SC_OK, "tick succeeds");
 
     sc_value_t value = 0;
     STATUS(g_api->eval(runtime, sv("fixture.echo"), sv("1 + 2"), &value), SC_OK,

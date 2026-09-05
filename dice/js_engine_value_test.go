@@ -112,13 +112,12 @@ func TestCallOnMessagePreprocessEngineSupportsNonJSProviderAndRestoresContext(t 
 		Logger:         zap.NewNop().Sugar(),
 	}
 	version := d.ExtLoopManager.SetLoop(loop)
-	previous := &ExtInfo{Name: "previous"}
-	d.JsCurrentPlugin = previous
-	ext := &ExtInfo{
+	var ext *ExtInfo
+	ext = &ExtInfo{
 		Name:          "neutral-provider",
 		JSLoopVersion: version,
 		OnMessagePreprocessEngine: func(runtime jsengine.Runtime, _ *MsgContext, _ *Message) (jsengine.Value, error) {
-			if d.JsCurrentPlugin == nil || d.JsCurrentPlugin.Name != "neutral-provider" {
+			if jsContextPlugin(jsExecutionContextFor(loop)) != ext {
 				return nil, errors.New("callback context was not installed")
 			}
 			return runtime.RunString("preprocess.js", "({ message: 'rewritten' })")
@@ -129,8 +128,8 @@ func TestCallOnMessagePreprocessEngineSupportsNonJSProviderAndRestoresContext(t 
 	if decision.action != messagePreprocessRewrite || decision.message != "rewritten" {
 		t.Fatalf("decision = %#v", decision)
 	}
-	if d.JsCurrentPlugin != previous {
-		t.Fatalf("JsCurrentPlugin = %p, want previous %p", d.JsCurrentPlugin, previous)
+	if jsengine.CurrentContext(loop) != nil {
+		t.Fatalf("loop context was not restored: %v", jsengine.CurrentContext(loop))
 	}
 }
 

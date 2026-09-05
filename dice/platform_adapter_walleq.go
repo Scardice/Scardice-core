@@ -808,7 +808,7 @@ func (pa *PlatformAdapterWalleQ) SendToPerson(ctx *MsgContext, userID string, te
 
 	for _, i := range ctx.Dice.ExtList {
 		if i.OnMessageSend != nil {
-			i.callWithJsCheck(ctx.Dice, func() {
+			i.notifyWithJsCheck(ctx.Dice, func() {
 				i.OnMessageSend(ctx, &Message{
 					Platform:    "QQ",
 					Message:     text,
@@ -852,7 +852,7 @@ func (pa *PlatformAdapterWalleQ) SendToGroup(ctx *MsgContext, groupID string, te
 				Nickname: pa.EndPoint.Nickname,
 			},
 		}
-		groupInfo.TriggerExtHook(ctx.Dice, func(ext *ExtInfo) func() {
+		groupInfo.TriggerExtNotifyHook(ctx.Dice, func(ext *ExtInfo) func() {
 			if ext.OnMessageSend == nil {
 				return nil
 			}

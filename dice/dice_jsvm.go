@@ -21,7 +21,6 @@ import (
 
 	"github.com/Masterminds/semver/v3"
 	esbuild "github.com/evanw/esbuild/pkg/api"
-	"github.com/golang-module/carbon"
 	"github.com/pkg/errors"
 	"github.com/robfig/cron/v3"
 	"github.com/samber/lo"
@@ -69,7 +68,7 @@ var taskCronParser = cron.NewParser(
 var (
 	jsCacheDir         = "./data/.cache/js"
 	jsMetaCacheFile    = "meta.gob.zst"
-	jsMetaCacheVersion = 1
+	jsMetaCacheVersion = 2
 	tsCacheDir         = "./data/.cache/js/ts"
 	tsCacheVersion     = 1
 )
@@ -191,7 +190,6 @@ var sealInstMemberDescriptions = map[string]string{
 	"JsScriptCronLock":               "JS 脚本 cron 调度器的互斥锁。",
 	"JsReloadLock":                   "JS 重载锁，用于避免并发重载。",
 	"JsBuiltinDigestSet":             "内置脚本摘要表，用于判断内置脚本是否被更新。",
-	"JsLoadingScript":                "当前正在加载的脚本元数据。",
 	"GameSystemMap":                  "游戏系统模板映射。",
 	"RunAfterLoaded":                 "核心加载完成后待执行的回调列表。",
 	"UIEndpoint":                     "UI 使用的端点信息。",
@@ -295,28 +293,11 @@ func (p *PrinterFunc) Warn(s string) { p.doRecord("warn", s); p.d.Logger.Warn(s)
 
 func (p *PrinterFunc) Error(s string) { p.doRecord("error", s); p.d.Logger.Error(s) }
 
-func (d *Dice) JsInit() {
-	engine := d.configuredJSEngine()
-	if d.ExtLoopManager == nil {
-		d.ExtLoopManager = NewJsLoopManager()
+func (d *Dice) initializeJSLoop(loop jsengine.Loop, versionID int64) error {
+	if loop == nil {
+		return errors.New("JavaScript runtime is unavailable")
 	}
-	d.jsClear()
-	if d.JsPrinter == nil {
-		d.JsPrinter = &PrinterFunc{d: d, isRecord: false, recorder: []string{}}
-	}
-
-	options, err := d.quickJSRuntimeOptions()
-	if err != nil {
-		d.disableJSRuntime(err)
-		return
-	}
-	loop, err := d.jsRuntimeManagerInstance().Resolve(context.Background(), engine, options)
-	if err != nil {
-		d.disableJSRuntime(err)
-		return
-	}
-	versionID := d.ExtLoopManager.SetLoop(loop)
-	err = loop.Run(func(runtime jsengine.Runtime) error {
+	return loop.Run(func(runtime jsengine.Runtime) error {
 		if err := d.installJSHostAPI(runtime); err != nil {
 			return fmt.Errorf("install JS host API: %w", err)
 		}
@@ -324,7 +305,7 @@ func (d *Dice) JsInit() {
 		if seal == nil {
 			return errors.New("JS runtime did not install seal host object")
 		}
-		if err := d.installJSExtHostAPI(runtime, seal, versionID, nil); err != nil {
+		if err := d.installJSExtHostAPI(runtime, loop, seal, versionID, nil); err != nil {
 			return fmt.Errorf("install JS extension host API: %w", err)
 		}
 		if err := d.installDangerousJSInstance(runtime, seal); err != nil {
@@ -335,8 +316,38 @@ func (d *Dice) JsInit() {
 		}
 		return nil
 	})
+}
+
+func (d *Dice) JsInit() {
+	engine := d.configuredJSEngine()
+	if d.ExtLoopManager == nil {
+		d.ExtLoopManager = NewJsLoopManager()
+	}
+	d.jsClear()
+	if d.JsPrinter == nil {
+		d.JsPrinter = &PrinterFunc{d: d, isRecord: false, recorder: []string{}}
+	}
+
+	options, err := BuildRuntimeOptionsForEngine(engine, d.Config.JsConfig)
 	if err != nil {
-		d.ExtLoopManager.SetLoop(nil)
+		d.disableJSRuntime(err)
+		return
+	}
+	loop, err := d.jsRuntimeManagerInstance().Resolve(context.Background(), engine, options)
+	if err != nil {
+		d.disableJSRuntime(err)
+		return
+	}
+	registry, err := d.installNativeJSServices(loop)
+	if err != nil {
+		_ = loop.Close()
+		d.disableJSRuntime(err)
+		return
+	}
+	instance := newJSRuntimeInstance(loop, registry)
+	versionID := d.ExtLoopManager.SetInstance(instance)
+	if err := d.initializeJSLoop(loop, versionID); err != nil {
+		d.ExtLoopManager.SetInstance(nil)
 		d.disableJSRuntime(err)
 		return
 	}
@@ -362,10 +373,6 @@ func (d *Dice) jsClear() {
 	// 注意：不标记 wrapper 为 IsDeleted，否则重载期间消息到达会导致 wrapper 被移除
 	// IsDeleted 只在 JsDelete/ExtRemove（永久删除脚本）时设置
 	d.JsSealInstExposed = false
-	if d.JsServices != nil {
-		_ = d.JsServices.Close()
-		d.JsServices = nil
-	}
 
 	// 清空/初始化 JsExtRegistry
 	if d.JsExtRegistry != nil {
@@ -403,6 +410,13 @@ func (d *Dice) jsClear() {
 func isScriptFile(filename string) bool {
 	temp := strings.ToLower(filepath.Ext(filename))
 	return temp == ".js" || temp == ".ts"
+}
+
+func (d *Dice) isJSScriptFile(filename string) bool {
+	if d != nil && d.jsRuntimeManagerInstance().SupportsScriptExtension(filename) {
+		return true
+	}
+	return isScriptFile(filename)
 }
 
 func sanitizeSourceForDangerousAPIAnalysis(source string) string {
@@ -739,13 +753,13 @@ func jsCacheKey(path string) string {
 	return filepath.ToSlash(path)
 }
 
-func loadJsMetaCache() *jsMetaCache {
+func loadJsMetaCache(runtimeKey string) *jsMetaCache {
 	cachePath := filepath.Join(jsCacheDir, jsMetaCacheFile)
 	var cache jsMetaCache
 	if err := loadGobCacheFile(cachePath, &cache); err != nil {
 		return nil
 	}
-	if cache.Version != jsMetaCacheVersion {
+	if cache.Version != jsMetaCacheVersion || cache.RuntimeKey != runtimeKey {
 		return nil
 	}
 	if cache.Files == nil {
@@ -787,6 +801,8 @@ func buildJsScriptInfoFromCache(d *Dice, path string, entry jsMetaCacheEntry) (*
 		Builtin:            entry.Builtin,
 		needCompiled:       entry.Meta.NeedCompiled,
 		StoreID:            entry.Meta.StoreID,
+		Runtime:            entry.Meta.Runtime,
+		RuntimeID:          entry.Meta.RuntimeID,
 		DangerousAPIUsages: normalizeDangerousAPIUsages(entry.Meta.DangerousAPIUsages),
 	}
 	if jsInfo.Name == "" {
@@ -839,6 +855,8 @@ func buildJsMetaCacheEntry(path string, info fs.FileInfo, jsInfo *JsScriptInfo, 
 		SignStatus:         jsInfo.signStatus,
 		NeedCompiled:       jsInfo.needCompiled,
 		StoreID:            jsInfo.StoreID,
+		Runtime:            jsInfo.Runtime,
+		RuntimeID:          jsInfo.RuntimeID,
 		DangerousAPIUsages: normalizeDangerousAPIUsages(jsInfo.DangerousAPIUsages),
 	}
 	for _, dep := range jsInfo.Depends {
@@ -852,7 +870,7 @@ func buildJsMetaCacheEntry(path string, info fs.FileInfo, jsInfo *JsScriptInfo, 
 	return entry
 }
 
-func collectJsScriptPaths(root string, skipBuiltin bool) []string {
+func collectJsScriptPaths(root string, skipBuiltin bool, isScript func(string) bool) []string {
 	files := make([]string, 0)
 	_ = filepath.Walk(root, func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
@@ -867,7 +885,7 @@ func collectJsScriptPaths(root string, skipBuiltin bool) []string {
 		if info.IsDir() {
 			return nil
 		}
-		if isScriptFile(path) {
+		if isScript(path) {
 			files = append(files, path)
 		}
 		return nil
@@ -883,8 +901,9 @@ func (d *Dice) JsLoadScripts() {
 	path := filepath.Join(d.BaseConfig.DataDir, "scripts")
 	builtinPath := filepath.Join(path, "_builtin")
 
-	metaCache := loadJsMetaCache()
-	newCache := &jsMetaCache{Version: jsMetaCacheVersion, Files: map[string]jsMetaCacheEntry{}}
+	runtimeKey := d.jsRuntimeManagerInstance().scriptMetadataCacheKey()
+	metaCache := loadJsMetaCache(runtimeKey)
+	newCache := &jsMetaCache{Version: jsMetaCacheVersion, RuntimeKey: runtimeKey, Files: map[string]jsMetaCacheEntry{}}
 
 	// 导出内置脚本数据
 	builtinScripts, _ := fs.ReadDir(static.Scripts, "scripts")
@@ -910,8 +929,8 @@ func (d *Dice) JsLoadScripts() {
 	}
 
 	var jsInfos []*JsScriptInfo
-	builtinFiles := collectJsScriptPaths(builtinPath, false)
-	userFiles := collectJsScriptPaths(path, true)
+	builtinFiles := collectJsScriptPaths(builtinPath, false, d.isJSScriptFile)
+	userFiles := collectJsScriptPaths(path, true, d.isJSScriptFile)
 	totalFiles := len(builtinFiles) + len(userFiles)
 	scannedFiles := 0
 	cacheHits := 0
@@ -1075,7 +1094,7 @@ func (d *Dice) JsLoadScripts() {
 
 	if d.PackageManager != nil {
 		for _, scriptFile := range d.PackageManager.GetEnabledContentFiles("scripts") {
-			if !isScriptFile(scriptFile.Path) {
+			if !d.isJSScriptFile(scriptFile.Path) {
 				continue
 			}
 			info, err := os.Stat(scriptFile.Path)
@@ -1097,6 +1116,11 @@ func (d *Dice) JsLoadScripts() {
 			jsInfos = append(jsInfos, jsInfo)
 		}
 	}
+
+	// 先完成所有启用脚本的 runtime 打开、准入和实例绑定，再检查跨脚本依赖。
+	// 这样 RuntimeID 代表最终执行实例，而不是仍可能回退的候选 provider。
+	d.UpdateJsReloadProgress("runtime_prepare", "正在准备 JS runtime 实例", 0, len(jsInfos), 48, "")
+	jsInfos = d.prepareJSScriptRuntimes(jsInfos)
 
 	// 检查依赖是否满足
 	d.UpdateJsReloadProgress("dependency_check", "正在检查 JS 插件依赖", 0, len(jsInfos), 50, "")
@@ -1315,6 +1339,12 @@ type JsScriptInfo struct {
 	DangerousAPIUsages []JsDangerousAPIUsage `json:"dangerousApiUsages"`
 	/** 所属扩展包 ID（如果来自扩展包）*/
 	PackageID string `json:"packageId,omitempty"`
+	/** UserScript 显式 runtime 候选串 */
+	Runtime string `json:"runtime,omitempty"`
+	/** 实际选择的 runtime ID */
+	RuntimeID string `json:"runtimeId,omitempty"`
+	/** 当前重载中已固定的 runtime generation */
+	runtimeGeneration int64 `json:"-"`
 }
 
 type JsScriptDepends struct {
@@ -1370,6 +1400,8 @@ type jsMetaInfo struct {
 	Depends            []jsMetaDepends       `json:"depends"`
 	NeedCompiled       bool                  `json:"needCompiled"`
 	StoreID            string                `json:"storeId"`
+	Runtime            string                `json:"runtime"`
+	RuntimeID          string                `json:"runtimeId"`
 	DangerousAPIUsages []JsDangerousAPIUsage `json:"dangerousApiUsages"`
 }
 
@@ -1384,12 +1416,12 @@ type jsMetaCacheEntry struct {
 }
 
 type jsMetaCache struct {
-	Version int                         `json:"version"`
-	Files   map[string]jsMetaCacheEntry `json:"files"`
+	Version    int                         `json:"version"`
+	RuntimeKey string                      `json:"runtimeKey"`
+	Files      map[string]jsMetaCacheEntry `json:"files"`
 }
 
 func (d *Dice) JsParseMeta(s string, installTime time.Time, rawData []byte, builtin bool) (*JsScriptInfo, error) {
-	// 读取文件内容填空，类似油猴脚本那种形式
 	jsInfo := &JsScriptInfo{
 		Name:        filepath.Base(s),
 		Filename:    s,
@@ -1402,98 +1434,56 @@ func (d *Dice) JsParseMeta(s string, installTime time.Time, rawData []byte, buil
 	jsInfo.DangerousAPIUsages = normalizeDangerousAPIUsages(detectDangerousAPIUsages(rawData))
 	jsInfo.HasDangerousAPIUsage = len(jsInfo.DangerousAPIUsages) > 0
 
-	// 解析签名
 	official, signStatus := CheckJsSign(rawData)
 	jsInfo.Official = official
 	jsInfo.signStatus = signStatus
 
-	// 解析信息
-	fileText := string(rawData)
-	re := regexp.MustCompile(`(?s)//[ \t]*==UserScript==[ \t]*\r?\n(.*)//[ \t]*==/UserScript==`)
-	m := re.FindStringSubmatch(fileText)
-	var errMsg []string
-
-	if len(m) > 0 {
-		text := m[0]
-		re2 := regexp.MustCompile(`//[ \t]*@(\S+)\s+([^\r\n]+)`)
-		data := re2.FindAllStringSubmatch(text, -1)
-		updateUrls := make([]string, 0)
-
-		for _, item := range data {
-			v := strings.TrimSpace(item[2])
-			switch item[1] {
-			case "name":
-				jsInfo.Name = v
-			case "homepageURL":
-				jsInfo.HomePage = v
-			case "license":
-				jsInfo.License = v
-			case "author":
-				jsInfo.Author = v
-			case "version":
-				jsInfo.Version = v
-			case "description":
-				v = strings.ReplaceAll(v, "\\n", "\n")
-				jsInfo.Desc = v
-			case "timestamp":
-				timestamp, errParse := strconv.ParseInt(v, 10, 64)
-				if errParse == nil {
-					jsInfo.UpdateTime = timestamp
-				} else {
-					t := carbon.Parse(v)
-					if t.IsValid() {
-						jsInfo.UpdateTime = t.Timestamp()
-					}
-				}
-			case "updateUrl":
-				updateUrls = append(updateUrls, v)
-			case "etag":
-				jsInfo.Etag = v
-			case "depends":
-				dependsStr := strings.SplitN(v, ":", 2)
-				if len(dependsStr) != 2 {
-					errMsg = append(errMsg, fmt.Sprintf("插件「%s」指定依赖格式不正确，应为 作者:插件名:[SemVer版本约束，可选]，现为「%s」", jsInfo.Name, v))
-					continue
-				}
-				author := dependsStr[0]
-				name := dependsStr[1]
-				var dependsInfo JsScriptDepends
-				dependsInfo.Author = author
-				dependsInfo.RawKey = v
-
-				if strings.Contains(name, ":") {
-					split := strings.SplitN(name, ":", 2)
-					constraint, err := semver.NewConstraint(split[1])
-					if err != nil {
-						errMsg = append(errMsg, fmt.Sprintf("插件「%s」指定依赖格式不正确，应为 作者:插件名:[SemVer版本约束，可选]，现为「%s」", jsInfo.Name, v))
-						continue
-					}
-					dependsInfo.Name = split[0]
-					dependsInfo.Constraint = constraint
-				} else {
-					dependsInfo.Name = name
-					dependsInfo.Constraint, _ = semver.NewConstraint("")
-				}
-				jsInfo.Depends = append(jsInfo.Depends, dependsInfo)
-			case "sealVersion":
-				vc, err := semver.NewConstraint(v)
-				if err != nil {
-					errMsg = append(errMsg, fmt.Sprintf("插件「%s」限制余烬版本的格式不正确，应满足semver版本范围语法，例如「1.4.0, >=1.4.0, 1.4.5-dev」等，当前为「%s」", jsInfo.Name, v))
-					continue
-				}
-
-				if !isJSAPIVersionCompatible(vc, v, VERSION, VERSION_JSAPI_COMPATIBLE) {
-					errMsg = append(errMsg, fmt.Sprintf("插件「%s」依赖的余烬版本限制在 %s，与余烬版本(%s)的JSAPI不兼容", jsInfo.Name, v, VERSION.String()))
-				}
-			case "needCompiled":
-				jsInfo.needCompiled = true
-			case "storeID":
-				jsInfo.StoreID = v
-			}
-		}
-		jsInfo.UpdateUrls = updateUrls
+	runtimeID, metadata, err := d.jsRuntimeManagerInstance().ParseUserScript(s, string(rawData))
+	if err != nil {
+		jsInfo.Enable = false
+		jsInfo.ErrText = err.Error()
+		return nil, err
 	}
+	jsInfo.Runtime = metadata.Runtime
+	jsInfo.RuntimeID = string(runtimeID)
+	jsInfo.Name = firstNonEmptyUserScriptValue(metadata.Name, jsInfo.Name)
+	jsInfo.HomePage = metadata.HomePage
+	jsInfo.License = metadata.License
+	jsInfo.Author = metadata.Author
+	jsInfo.Version = metadata.Version
+	jsInfo.Desc = metadata.Description
+	jsInfo.UpdateTime = metadata.UpdateTime
+	jsInfo.UpdateUrls = append([]string(nil), metadata.UpdateURLs...)
+	jsInfo.Etag = metadata.Etag
+	jsInfo.needCompiled = metadata.NeedCompiled
+	jsInfo.StoreID = metadata.StoreID
 
+	var errMsg []string
+	for _, dependency := range metadata.Depends {
+		constraintRaw := strings.TrimSpace(dependency.Constraint)
+		if constraintRaw == "" {
+			constraintRaw = "*"
+		}
+		constraint, constraintErr := semver.NewConstraint(constraintRaw)
+		if constraintErr != nil {
+			errMsg = append(errMsg, fmt.Sprintf("插件「%s」指定依赖格式不正确，应为 作者:插件名:[SemVer版本约束，可选]，现为「%s」", jsInfo.Name, dependency.RawKey))
+			continue
+		}
+		jsInfo.Depends = append(jsInfo.Depends, JsScriptDepends{
+			Author:     dependency.Author,
+			Name:       dependency.Name,
+			Constraint: constraint,
+			RawKey:     dependency.RawKey,
+		})
+	}
+	if metadata.SealVersion != "" {
+		vc, constraintErr := semver.NewConstraint(metadata.SealVersion)
+		if constraintErr != nil {
+			errMsg = append(errMsg, fmt.Sprintf("插件「%s」限制余烬版本的格式不正确，应满足semver版本范围语法，例如「1.4.0, >=1.4.0, 1.4.5-dev」等，当前为「%s」", jsInfo.Name, metadata.SealVersion))
+		} else if !isJSAPIVersionCompatible(vc, metadata.SealVersion, VERSION, VERSION_JSAPI_COMPATIBLE) {
+			errMsg = append(errMsg, fmt.Sprintf("插件「%s」依赖的余烬版本限制在 %s，与余烬版本(%s)的JSAPI不兼容", jsInfo.Name, metadata.SealVersion, VERSION.String()))
+		}
+	}
 	if len(errMsg) > 0 {
 		jsInfo.Enable = false
 		jsInfo.ErrText = strings.Join(errMsg, "\n")
@@ -1503,41 +1493,182 @@ func (d *Dice) JsParseMeta(s string, installTime time.Time, rawData []byte, buil
 	return jsInfo, nil
 }
 
+func firstNonEmptyUserScriptValue(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+func (d *Dice) ensureJSScriptLoop(jsInfo *JsScriptInfo, source string) (jsengine.Loop, int64, error) {
+	if d == nil || jsInfo == nil {
+		return nil, 0, errors.New("JavaScript script loop is unavailable")
+	}
+	if d.ExtLoopManager == nil {
+		d.ExtLoopManager = NewJsLoopManager()
+	}
+	manager := d.jsRuntimeManagerInstance()
+
+	// A prepared script is bound to one generation. Never re-route it while
+	// loading; a stale generation is the only case that permits preparation
+	// again.
+	if jsInfo.runtimeGeneration != 0 {
+		loop, err := d.ExtLoopManager.GetLoop(jsInfo.runtimeGeneration)
+		if err == nil && loop != nil {
+			if err := manager.requirements.ValidateLoop(loop); err != nil {
+				return nil, 0, err
+			}
+			jsInfo.RuntimeID = string(loop.Engine())
+			return loop, jsInfo.runtimeGeneration, nil
+		}
+		jsInfo.runtimeGeneration = 0
+	}
+
+	_, hasHint := jsengine.UserScriptRuntimeHint(source)
+	resolve := func(id jsengine.EngineID) (jsengine.Loop, error) {
+		if existing, _ := d.ExtLoopManager.LoopForEngine(id); existing != nil {
+			if err := manager.requirements.ValidateLoop(existing); err != nil {
+				return nil, err
+			}
+			return existing, nil
+		}
+		options, err := BuildRuntimeOptionsForEngine(id, d.Config.JsConfig)
+		if err != nil {
+			return nil, err
+		}
+		return manager.Resolve(context.Background(), id, options)
+	}
+
+	var (
+		resolvedID jsengine.EngineID
+		loop       jsengine.Loop
+		err        error
+	)
+	if hasHint {
+		resolvedID, loop, err = manager.resolveScript(jsInfo.Filename, source, resolve)
+	} else {
+		selectedID := d.configuredJSEngine()
+		if existing, version := d.ExtLoopManager.LoopForEngine(selectedID); existing != nil {
+			if err := manager.requirements.ValidateLoop(existing); err != nil {
+				return nil, 0, err
+			}
+			jsInfo.RuntimeID = string(selectedID)
+			jsInfo.runtimeGeneration = version
+			return existing, version, nil
+		}
+		resolvedID = normalizeRequestedEngine(selectedID)
+		loop, err = resolve(resolvedID)
+		if err != nil {
+			resolvedID, loop, err = manager.resolveScript(jsInfo.Filename, source, resolve)
+		}
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	if loop == nil {
+		return nil, 0, errors.New("JavaScript runtime returned a nil loop")
+	}
+
+	if existing, version := d.ExtLoopManager.LoopForEngine(resolvedID); existing == loop {
+		jsInfo.RuntimeID = string(resolvedID)
+		jsInfo.runtimeGeneration = version
+		return existing, version, nil
+	}
+	registry, err := d.installNativeJSServices(loop)
+	if err != nil {
+		_ = loop.Close()
+		return nil, 0, err
+	}
+	instance := newJSRuntimeInstance(loop, registry)
+	version := d.ExtLoopManager.AddInstance(instance)
+	registered, registeredVersion := d.ExtLoopManager.LoopForEngine(resolvedID)
+	if registered != loop {
+		if registered == nil {
+			return nil, 0, errors.New("JavaScript runtime instance registration failed")
+		}
+		jsInfo.RuntimeID = string(registered.Engine())
+		jsInfo.runtimeGeneration = registeredVersion
+		return registered, registeredVersion, nil
+	}
+	if err := d.initializeJSLoop(loop, version); err != nil {
+		d.ExtLoopManager.RemoveInstance(version)
+		return nil, 0, err
+	}
+	jsInfo.RuntimeID = string(resolvedID)
+	jsInfo.runtimeGeneration = version
+	return loop, version, nil
+}
+
+func (d *Dice) prepareJSScriptRuntimes(jsInfos []*JsScriptInfo) []*JsScriptInfo {
+	if len(jsInfos) == 0 {
+		return jsInfos
+	}
+	prepared := make([]*JsScriptInfo, 0, len(jsInfos))
+	for _, jsInfo := range jsInfos {
+		if jsInfo == nil || !jsInfo.Enable {
+			prepared = append(prepared, jsInfo)
+			continue
+		}
+		source, err := os.ReadFile(jsInfo.Filename)
+		if err == nil {
+			_, _, err = d.ensureJSScriptLoop(jsInfo, string(source))
+		}
+		if err != nil {
+			jsInfo.Enable = false
+			jsInfo.ErrText = err.Error()
+			if d.Logger != nil {
+				d.Logger.Error("准备 JS runtime 失败: ", err.Error())
+			}
+			continue
+		}
+		prepared = append(prepared, jsInfo)
+	}
+	return prepared
+}
+
 func (d *Dice) JsLoadScriptRaw(jsInfo *JsScriptInfo) {
 	var err error
+	if jsInfo == nil {
+		return
+	}
 	if jsInfo.Enable {
-		d.JsLoadingScript = jsInfo
+		source, readErr := os.ReadFile(jsInfo.Filename)
+		if readErr != nil {
+			err = readErr
+		}
+		var loop jsengine.Loop
+		if err == nil {
+			loop, _, err = d.ensureJSScriptLoop(jsInfo, string(source))
+		}
+
 		var targetPath string
 		var cleanup bool
-		if jsInfo.needCompiled {
-			d.Logger.Infof("脚本<%s>正在经过编译处理……", jsInfo.Name)
+		if err == nil && jsInfo.needCompiled {
+			if d.Logger != nil {
+				d.Logger.Infof("脚本<%s>正在经过编译处理……", jsInfo.Name)
+			}
 			targetPath, cleanup, err = tsScriptCompile(jsInfo.Filename)
 			if cleanup {
 				defer func(name string) {
 					_ = os.Remove(name)
 				}(targetPath)
 			}
-		} else {
+		} else if err == nil {
 			targetPath = jsInfo.Filename
 		}
 		if err == nil {
-			loop, _ := d.ExtLoopManager.CurrentLoop()
-			if loop == nil {
+			data, readErr := os.ReadFile(targetPath)
+			if readErr != nil {
+				err = readErr
+			} else if loop == nil {
 				err = errors.New("JavaScript runtime is unavailable")
 			} else {
-				data, readErr := os.ReadFile(targetPath)
-				if readErr != nil {
-					err = readErr
-				} else {
-					err = loop.LoadEntry(jsengine.Entry{
-						Filename: targetPath,
-						Source:   string(data),
-						Kind:     jsengine.EntryExtension,
-					})
-				}
+				err = jsengine.LoadEntryWithContext(loop, &jsExecutionContext{Script: jsInfo}, jsengine.Entry{
+					Filename: targetPath,
+					Source:   string(data),
+					Kind:     jsengine.EntryExtension,
+				})
 			}
 		}
-		d.JsLoadingScript = nil
 	} else {
 		d.Logger.Infof("脚本<%s>已被禁用，跳过加载", jsInfo.Name)
 	}
@@ -1776,7 +1907,12 @@ func checkJsScriptsDeps(jsScripts []*JsScriptInfo) ([]*JsScriptInfo, map[string]
 						fmt.Sprintf("「%s」依赖的「%s」不存在，所需版本：%s", key, depKey, dep.Constraint.String()))
 					continue
 				}
-				// 版本是否符合要求
+				if script.RuntimeID != "" && depScript.RuntimeID != "" &&
+					normalizeRequestedEngine(jsengine.EngineID(script.RuntimeID)) != normalizeRequestedEngine(jsengine.EngineID(depScript.RuntimeID)) {
+					invalidInfoMap[key] = append(invalidInfoMap[key],
+						fmt.Sprintf("「%s」依赖的「%s」属于不同 runtime（%s -> %s），禁止直接依赖", key, depKey, script.RuntimeID, depScript.RuntimeID))
+					continue
+				}
 				depVersion, vErr := semver.NewVersion(depScript.Version)
 				if vErr != nil {
 					invalidInfoMap[key] = append(invalidInfoMap[key],
@@ -1947,10 +2083,7 @@ func (t *JsScriptTask) run() {
 		t.logger.Errorf("插件定时任务获取JS事件循环失败: %v", err)
 		return
 	}
-	err = loop.Run(func(jsengine.Runtime) error {
-		prev := t.dice.JsCurrentPlugin
-		t.dice.JsCurrentPlugin = t.ext
-		defer func() { t.dice.JsCurrentPlugin = prev }()
+	err = jsengine.RunWithContext(loop, jsContextForPlugin(t.ext), func(jsengine.Runtime) error {
 		t.task(taskCtx)
 		return nil
 	})

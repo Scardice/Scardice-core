@@ -435,11 +435,8 @@ func (i *ExtInfo) CallOnMessagePreprocess(d *Dice, ctx *MsgContext, msg *Message
 			}
 			return messagePreprocessDecision{action: messagePreprocessNoop}
 		}
-		err = loop.Run(func(runtime jsengine.Runtime) error {
+		err = jsengine.RunWithContext(loop, jsContextForPlugin(ext), func(runtime jsengine.Runtime) error {
 			return runEngineCallback(func() error {
-				prev := d.JsCurrentPlugin
-				d.JsCurrentPlugin = ext
-				defer func() { d.JsCurrentPlugin = prev }()
 				value, callErr := ext.OnMessagePreprocessEngine(runtime, ctx, cloneMessageForPreprocess(msg))
 				if callErr != nil {
 					return callErr
@@ -483,16 +480,13 @@ func (i *ExtInfo) CallOnMessagePreprocess(d *Dice, ctx *MsgContext, msg *Message
 			}
 			return messagePreprocessDecision{action: messagePreprocessNoop}
 		}
-		err = loop.Run(func(runtime jsengine.Runtime) error {
+		err = jsengine.RunWithContext(loop, jsContextForPlugin(ext), func(runtime jsengine.Runtime) error {
 			return runEngineCallback(func() error {
 				// Compatibility branch: only legacy Goja callbacks use Raw.
 				vm, ok := gojaengine.Raw(runtime)
 				if !ok {
 					return errors.New("legacy Goja message preprocess callback requires a Goja runtime")
 				}
-				prev := d.JsCurrentPlugin
-				d.JsCurrentPlugin = ext
-				defer func() { d.JsCurrentPlugin = prev }()
 				runLegacy(vm)
 				return nil
 			})
@@ -513,10 +507,11 @@ func (i *ExtInfo) CallOnMessageSend(d *Dice, ctx *MsgContext, msg *Message, flag
 	if ext == nil || ext.OnMessageSend == nil {
 		return
 	}
-	ext.callWithJsCheck(d, func() {
+	ext.notifyWithJsCheck(d, func() {
 		ext.OnMessageSend(ctx, msg, flag)
 	})
 }
+
 // CallOnMessageDeleted 调用 OnMessageDeleted 回调（处理 wrapper 代理）
 func (i *ExtInfo) CallOnMessageDeleted(d *Dice, ctx *MsgContext, msg *Message) {
 	ext := i.GetRealExt()
@@ -540,7 +535,19 @@ func (i *ExtInfo) CallOnGroupLeave(d *Dice, ctx *MsgContext, event *events.Group
 }
 
 // callWithJsCheck 保留旧行为：JS 扩展需要切回事件循环，避免并发问题。
+// 它会等待回调结束，因此只能在事件循环之外调用；事后通知类回调请用
+// notifyWithJsCheck。
 func (i *ExtInfo) callWithJsCheck(d *Dice, f func()) {
+	i.runWithJsCheck(d, f, false)
+}
+
+// notifyWithJsCheck 把事后通知排入 JS 事件循环但不等待它完成。
+// seal.replyToSender 等宿主函数会在事件循环内触发这类通知，等待会自锁。
+func (i *ExtInfo) notifyWithJsCheck(d *Dice, f func()) {
+	i.runWithJsCheck(d, f, true)
+}
+
+func (i *ExtInfo) runWithJsCheck(d *Dice, f func(), schedule bool) {
 	if f == nil {
 		return
 	}
@@ -570,15 +577,23 @@ func (i *ExtInfo) callWithJsCheck(d *Dice, f func()) {
 		}
 		return
 	}
-	err = loop.Run(func(jsengine.Runtime) error {
+	call := func(jsengine.Runtime) error {
 		return runEngineCallback(func() error {
-			prev := d.JsCurrentPlugin
-			d.JsCurrentPlugin = i
-			defer func() { d.JsCurrentPlugin = prev }()
 			f()
 			return nil
 		})
-	})
+	}
+	if schedule {
+		// 没有调用方接收排队回调的失败，所以在回调内部记录。
+		err = jsengine.ScheduleWithContext(loop, jsContextForPlugin(i), func(runtime jsengine.Runtime) error {
+			if callErr := call(runtime); callErr != nil && d.Logger != nil {
+				d.Logger.Errorf("JS脚本异常: %v", callErr)
+			}
+			return nil
+		})
+	} else {
+		err = jsengine.RunWithContext(loop, jsContextForPlugin(i), call)
+	}
 	if err != nil && d.Logger != nil {
 		d.Logger.Errorf("JS脚本异常: %v", err)
 	}

@@ -197,7 +197,7 @@ func (d *Dice) installJSHostAPI(runtime jsengine.Runtime) error {
 	return nil
 }
 
-func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, seal jsengine.Object, versionID int64, sourceLocation func() string) error {
+func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop, seal jsengine.Object, versionID int64, sourceLocation func() string) error {
 	ext := runtime.NewObject()
 	if err := seal.Set("ext", ext); err != nil {
 		return err
@@ -219,9 +219,11 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, seal jsengine.Objec
 		}
 	})
 	_ = ext.Set("new", func(name, author, version string) *ExtInfo {
+		context := jsExecutionContextFor(loop)
+		source := jsContextScript(context)
 		var official bool
-		if d.JsLoadingScript != nil {
-			official = d.JsLoadingScript.Official
+		if source != nil {
+			official = source.Official
 		}
 		return &ExtInfo{
 			Name: name, Author: author, Version: version,
@@ -231,7 +233,7 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, seal jsengine.Objec
 			Brief:         "一个JS自定义扩展",
 			Official:      official,
 			CmdMap:        CmdMapCls{},
-			Source:        d.JsLoadingScript,
+			Source:        source,
 			JSLoopVersion: versionID,
 		}
 	})
@@ -252,7 +254,7 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, seal jsengine.Objec
 
 		extName := realExt.Name
 		if realExt.Source == nil {
-			realExt.Source = d.JsLoadingScript
+			realExt.Source = jsContextScript(jsExecutionContextFor(loop))
 		}
 
 		// 1. 查找或创建 wrapper

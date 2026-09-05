@@ -42,6 +42,8 @@ type Options struct {
 	Printer          console.Printer
 	Logger           sealws.Logger
 	NetworkAuthorize func(string) error
+	CurrentContext   func() any
+	ScheduleOnLoop   func(any, func(*goja.Runtime) error) error
 	Filesystem       FilesystemHooks
 }
 
@@ -63,6 +65,7 @@ func NewInstaller(options Options) *Installer {
 	return installer
 }
 func (i *Installer) Owner() string { return "goja" }
+
 // runtime-owned dependencies are absent rather than being advertised as no-op
 // implementations.
 func (i *Installer) Definitions() []services.Definition {
@@ -164,7 +167,17 @@ func (i *Installer) Enable(vm *goja.Runtime) error {
 	sealabort.Enable(vm)
 	sealhttp.Enable(vm)
 	if i.options.Proxy != nil {
-		if err := sealhttp.EnableFetchWithPolicyAndLifecycle(vm, i.options.Loop, i.options.Proxy, i.options.NetworkAuthorize, i.fetchLifecycle); err != nil {
+		if err := sealhttp.EnableFetchWithPolicyAndLifecycleAndContext(
+			vm,
+			i.options.Loop,
+			i.options.Proxy,
+			i.options.NetworkAuthorize,
+			i.fetchLifecycle,
+			sealhttp.AsyncContextHooks{
+				CurrentContext: i.options.CurrentContext,
+				ScheduleOnLoop: i.options.ScheduleOnLoop,
+			},
+		); err != nil {
 			return err
 		}
 	}

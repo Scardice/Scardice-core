@@ -19,16 +19,44 @@ import (
 
 	"Scardice-core/utils/jsengine"
 	"Scardice-core/utils/jsengine/hostbridge"
+	jsservices "Scardice-core/utils/jsengine/services"
 )
 
 type nativeHostState struct {
-	loop         *nativeLoop
-	session      *hostbridge.Session
-	mu           sync.Mutex
-	lastErr      string
-	callbacks    map[uint64]uint64
-	nextCallback uint64
-	closed       bool
+	loop            *nativeLoop
+	session         *hostbridge.Session
+	serviceRegistry *jsservices.Registry
+	mu              sync.Mutex
+	lastErr         string
+	callbacks       map[uint64]uint64
+	nextCallback    uint64
+	closed          bool
+}
+type nativeServiceSink struct {
+	loop *nativeLoop
+}
+
+func (s nativeServiceSink) enqueue(kind jsservices.EventKind, id jsservices.RequestID, response jsservices.Response) error {
+	if s.loop == nil {
+		return ErrNativeClosed
+	}
+	return s.loop.enqueueServiceEvent(nativeServiceEvent{
+		kind:     kind,
+		request:  id,
+		response: response,
+	})
+}
+
+func (s nativeServiceSink) Event(id jsservices.RequestID, response jsservices.Response) error {
+	return s.enqueue(jsservices.EventData, id, response)
+}
+
+func (s nativeServiceSink) Complete(id jsservices.RequestID, response jsservices.Response) error {
+	return s.enqueue(jsservices.EventComplete, id, response)
+}
+
+func (s nativeServiceSink) Close(id jsservices.RequestID, response jsservices.Response) error {
+	return s.enqueue(jsservices.EventClose, id, response)
 }
 
 func newNativeHostState(loop *nativeLoop) *nativeHostState {
@@ -56,6 +84,14 @@ func (s *nativeHostState) errorText() string {
 		return "native host callback failed"
 	}
 	return s.lastErr
+}
+func (s *nativeHostState) setServiceRegistry(registry *jsservices.Registry) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.serviceRegistry = registry
+	s.mu.Unlock()
 }
 
 func hostStateFromContext(ctx C.sc_host_ctx_t) (state *nativeHostState, err error) {
@@ -171,6 +207,10 @@ func hostString(view C.sc_string_view) (string, error) {
 }
 
 func copyHostBytes(buffer *C.char, capacity C.uint64_t, data []byte) C.sc_status_t {
+	return copyServiceBuffer(unsafe.Pointer(buffer), capacity, data)
+}
+
+func copyServiceBuffer(buffer unsafe.Pointer, capacity C.uint64_t, data []byte) C.sc_status_t {
 	if uint64(capacity) > uint64(^uint(0)>>1) || uint64(capacity) < uint64(len(data)) {
 		return C.sc_status_t(-1)
 	}
@@ -178,7 +218,7 @@ func copyHostBytes(buffer *C.char, capacity C.uint64_t, data []byte) C.sc_status
 		if buffer == nil {
 			return C.sc_status_t(-1)
 		}
-		copy(unsafe.Slice((*byte)(unsafe.Pointer(buffer)), int(capacity)), data)
+		copy(unsafe.Slice((*byte)(buffer), int(capacity)), data)
 	}
 	return C.SC_OK
 }
@@ -191,6 +231,65 @@ func (s *nativeHostState) checkRuntime(runtimeHandle C.sc_runtime_t) error {
 		return ErrNativeStaleValue
 	}
 	return nil
+}
+
+func decodeNativeServiceRequest(service C.sc_string_view, request *C.sc_host_service_request_v1) (jsservices.Name, jsservices.Request, error) {
+	if request == nil || request.struct_size < C.uint32_t(unsafe.Sizeof(*request)) {
+		return "", jsservices.Request{}, errors.New("invalid native host service request")
+	}
+	serviceName, err := hostString(service)
+	if err != nil {
+		return "", jsservices.Request{}, err
+	}
+	requestString, err := hostString(request.string)
+	if err != nil {
+		return "", jsservices.Request{}, err
+	}
+	if uint64(request.bytes_len) > uint64(^uint(0)>>1) ||
+		(request.bytes_len != 0 && request.bytes == nil) {
+		return "", jsservices.Request{}, errors.New("invalid native host service byte buffer")
+	}
+	requestBytes := make([]byte, int(request.bytes_len))
+	if len(requestBytes) != 0 {
+		copy(requestBytes, unsafe.Slice((*byte)(unsafe.Pointer(request.bytes)), len(requestBytes)))
+	}
+	serviceID := jsservices.NormalizeName(jsservices.Name(serviceName))
+	requestValue := jsservices.Request{
+		Service:   serviceID,
+		Operation: jsservices.OperationID(request.operation),
+		String:    requestString,
+		Bytes:     requestBytes,
+		Bool:      request.bool_value != 0,
+		Int64:     int64(request.int64_value),
+		Uint64:    uint64(request.uint64_value),
+		Float64:   float64(request.float64_value),
+	}
+	if serviceID == jsservices.Fetch && requestValue.Operation == jsservices.OpFetchRequest {
+		var metadata struct {
+			URL string `json:"url"`
+		}
+		if json.Unmarshal([]byte(requestString), &metadata) == nil {
+			requestValue.Target = metadata.URL
+		}
+	}
+	return serviceID, requestValue, nil
+}
+
+func nativeHostServiceStatus(err error) C.sc_status_t {
+	switch {
+	case errors.Is(err, jsservices.ErrRegistryClosed):
+		return C.SC_ECLOSED
+	case errors.Is(err, jsservices.ErrDeadlineExceeded):
+		return C.SC_ETIMEOUT
+	case errors.Is(err, jsservices.ErrCancelled):
+		return C.SC_ESTATE
+	case errors.Is(err, jsservices.ErrPermissionDenied),
+		errors.Is(err, jsservices.ErrUnsupported),
+		errors.Is(err, jsservices.ErrServiceNotFound):
+		return C.SC_ENOTSUP
+	default:
+		return C.SC_EHOST
+	}
 }
 
 //export sc_native_go_host_get
@@ -359,6 +458,151 @@ func sc_native_go_host_call(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, f
 			return C.sc_status_t(-20)
 		}
 		*out = C.sc_value_t(handle)
+		return C.SC_OK
+	})
+}
+
+//export sc_native_go_host_service_call
+func sc_native_go_host_service_call(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, service C.sc_string_view, request *C.sc_host_service_request_v1, response *C.sc_host_service_response_v1) C.sc_status_t {
+	return withHostState(ctx, func(state *nativeHostState) C.sc_status_t {
+		if err := state.checkRuntime(runtimeHandle); err != nil {
+			state.setError(err)
+			return C.SC_ECLOSED
+		}
+		if request == nil || response == nil ||
+			request.struct_size < C.uint32_t(unsafe.Sizeof(*request)) ||
+			response.struct_size < C.uint32_t(unsafe.Sizeof(*response)) {
+			err := errors.New("invalid native host service request")
+			state.setError(err)
+			return C.SC_EINVAL
+		}
+		serviceName, err := hostString(service)
+		if err != nil {
+			state.setError(err)
+			return C.SC_EINVAL
+		}
+		requestString, err := hostString(request.string)
+		if err != nil {
+			state.setError(err)
+			return C.SC_EINVAL
+		}
+		if uint64(request.bytes_len) > uint64(^uint(0)>>1) ||
+			(request.bytes_len != 0 && request.bytes == nil) {
+			err := errors.New("invalid native host service byte buffer")
+			state.setError(err)
+			return C.SC_EINVAL
+		}
+		requestBytes := make([]byte, int(request.bytes_len))
+		if len(requestBytes) != 0 {
+			copy(requestBytes, unsafe.Slice((*byte)(unsafe.Pointer(request.bytes)), len(requestBytes)))
+		}
+
+		state.mu.Lock()
+		registry := state.serviceRegistry
+		state.mu.Unlock()
+		if registry == nil {
+			response.status = C.SC_SERVICE_UNSUPPORTED
+			state.setError(errors.New("native host service registry is unavailable"))
+			return C.SC_OK
+		}
+		result, invokeErr := registry.InvokeNative(jsservices.Call{
+			Request: jsservices.Request{
+				Service:   jsservices.Name(serviceName),
+				Operation: jsservices.OperationID(request.operation),
+				String:    requestString,
+				Bytes:     requestBytes,
+				Bool:      request.bool_value != 0,
+				Int64:     int64(request.int64_value),
+				Uint64:    uint64(request.uint64_value),
+				Float64:   float64(request.float64_value),
+			},
+			Context: state.loop.CurrentContext(),
+		})
+		response.status = C.uint32_t(result.Status)
+		response.bool_value = 0
+		if result.Bool {
+			response.bool_value = 1
+		}
+		response.int64_value = C.int64_t(result.Int64)
+		response.uint64_value = C.uint64_t(result.Uint64)
+		response.float64_value = C.double(result.Float64)
+		response.string_required = C.uint64_t(len(result.String))
+		response.bytes_required = C.uint64_t(len(result.Bytes))
+		if status := copyServiceBuffer(unsafe.Pointer(response.string_buffer), response.string_capacity, []byte(result.String)); status != C.SC_OK {
+			state.setError(errors.New("native host service string output buffer is too small"))
+			return status
+		}
+		if status := copyServiceBuffer(unsafe.Pointer(response.bytes_buffer), response.bytes_capacity, result.Bytes); status != C.SC_OK {
+			state.setError(errors.New("native host service byte output buffer is too small"))
+			return status
+		}
+		if invokeErr != nil {
+			state.setError(invokeErr)
+		}
+		return C.SC_OK
+	})
+}
+
+//export sc_native_go_host_service_start
+func sc_native_go_host_service_start(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, service C.sc_string_view, request *C.sc_host_service_request_v1, outRequest *C.sc_service_request_t) C.sc_status_t {
+	return withHostState(ctx, func(state *nativeHostState) C.sc_status_t {
+		if err := state.checkRuntime(runtimeHandle); err != nil {
+			state.setError(err)
+			return C.SC_ECLOSED
+		}
+		if outRequest == nil {
+			err := errors.New("native host service start output is nil")
+			state.setError(err)
+			return C.SC_EINVAL
+		}
+		*outRequest = 0
+		_, requestValue, err := decodeNativeServiceRequest(service, request)
+		if err != nil {
+			state.setError(err)
+			return C.SC_EINVAL
+		}
+		state.mu.Lock()
+		registry := state.serviceRegistry
+		state.mu.Unlock()
+		if registry == nil {
+			err := errors.New("native host service registry is unavailable")
+			state.setError(err)
+			return C.SC_ENOTSUP
+		}
+		id, err := registry.StartNative(jsservices.Call{Request: requestValue, Context: state.loop.CurrentContext()}, nativeServiceSink{loop: state.loop})
+		if err != nil {
+			state.setError(err)
+			return nativeHostServiceStatus(err)
+		}
+		*outRequest = C.sc_service_request_t(id)
+		return C.SC_OK
+	})
+}
+
+//export sc_native_go_host_service_cancel
+func sc_native_go_host_service_cancel(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, request C.sc_service_request_t) C.sc_status_t {
+	return withHostState(ctx, func(state *nativeHostState) C.sc_status_t {
+		if err := state.checkRuntime(runtimeHandle); err != nil {
+			state.setError(err)
+			return C.SC_ECLOSED
+		}
+		if request == 0 {
+			err := errors.New("native host service cancel request is empty")
+			state.setError(err)
+			return C.SC_EINVAL
+		}
+		state.mu.Lock()
+		registry := state.serviceRegistry
+		state.mu.Unlock()
+		if registry == nil {
+			err := errors.New("native host service registry is unavailable")
+			state.setError(err)
+			return C.SC_ENOTSUP
+		}
+		if err := registry.Cancel(jsservices.RequestID(request)); err != nil {
+			state.setError(err)
+			return nativeHostServiceStatus(err)
+		}
 		return C.SC_OK
 	})
 }

@@ -283,6 +283,20 @@ func (g *GroupInfo) TriggerExtHook(d *Dice, getHook func(*ExtInfo) func()) {
 	}
 }
 
+// TriggerExtNotifyHook 与 TriggerExtHook 相同，但把 JS 扩展回调排入事件循环而
+// 不等待。发送后通知可能由事件循环内的宿主函数触发，等待会自锁。
+func (g *GroupInfo) TriggerExtNotifyHook(d *Dice, getHook func(*ExtInfo) func()) {
+	for _, wrapper := range g.GetActivatedExtList(d) {
+		ext := wrapper.GetRealExt()
+		if ext == nil {
+			continue
+		}
+		if hook := getHook(ext); hook != nil {
+			ext.notifyWithJsCheck(d, hook)
+		}
+	}
+}
+
 // GetActivatedExtListRaw 直接访问扩展列表（用于序列化、内部修改等场景）
 func (g *GroupInfo) GetActivatedExtListRaw() []*ExtInfo {
 	g.extInitMu.Lock()
@@ -2966,13 +2980,8 @@ func (s *IMSession) executeSolveEngine(ctx *MsgContext, msg *Message, cmdArgs *C
 	}
 
 	var result CmdExecuteResult
-	err = loop.Run(func(runtime jsengine.Runtime) error {
+	err = jsengine.RunWithContext(loop, jsContextForPlugin(plugin), func(runtime jsengine.Runtime) error {
 		return runEngineCallback(func() error {
-			prev := s.Parent.JsCurrentPlugin
-			if plugin != nil {
-				s.Parent.JsCurrentPlugin = plugin.GetRealExt()
-			}
-			defer func() { s.Parent.JsCurrentPlugin = prev }()
 			value, solveErr := item.SolveEngine(runtime, ctx, msg, cmdArgs)
 			if solveErr != nil {
 				return solveErr
@@ -3138,13 +3147,12 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 			}
 			done := make(chan CmdExecuteResult, 1)
 			fail := make(chan error, 1)
-			err = loop.Run(func(runtime jsengine.Runtime) (runErr error) {
-				prev := s.Parent.JsCurrentPlugin
-				if candidate.Ext != nil {
-					s.Parent.JsCurrentPlugin = candidate.Ext.GetRealExt()
-				}
+			var executionPlugin *ExtInfo
+			if candidate.Ext != nil {
+				executionPlugin = candidate.Ext.GetRealExt()
+			}
+			err = jsengine.RunWithContext(loop, jsContextForPlugin(executionPlugin), func(runtime jsengine.Runtime) (runErr error) {
 				defer func() {
-					s.Parent.JsCurrentPlugin = prev
 					if recovered := recover(); recovered != nil {
 						runErr = formatJSSolveRecoveredError(recovered)
 					}

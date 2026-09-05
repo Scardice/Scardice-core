@@ -1,26 +1,26 @@
 #include "scardice_runtime_v1.h"
 
 #include <limits.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
 #define ECHO_MAX_VALUES 128
 #define ECHO_MAX_PROPERTIES 32
 #define ECHO_MAX_KEY 32
 #define ECHO_ERROR_CAPACITY 256
 
-#define ECHO_TYPE_UNDEFINED 0U
-#define ECHO_TYPE_NULL 1U
-#define ECHO_TYPE_BOOL 2U
-#define ECHO_TYPE_I64 3U
-#define ECHO_TYPE_U64 4U
-#define ECHO_TYPE_F64 5U
-#define ECHO_TYPE_STRING 6U
-#define ECHO_TYPE_OBJECT 7U
-#define ECHO_TYPE_HOST_OBJECT 8U
-#define ECHO_TYPE_HOST_FUNCTION 9U
+#define ECHO_TYPE_UNDEFINED SC_VALUE_TYPE_UNDEFINED
+#define ECHO_TYPE_NULL SC_VALUE_TYPE_NULL
+#define ECHO_TYPE_BOOL SC_VALUE_TYPE_BOOL
+#define ECHO_TYPE_I64 SC_VALUE_TYPE_I64
+#define ECHO_TYPE_U64 SC_VALUE_TYPE_U64
+#define ECHO_TYPE_F64 SC_VALUE_TYPE_F64
+#define ECHO_TYPE_STRING SC_VALUE_TYPE_STRING
+#define ECHO_TYPE_OBJECT SC_VALUE_TYPE_OBJECT
+#define ECHO_TYPE_HOST_OBJECT SC_VALUE_TYPE_HOST_OBJECT
+#define ECHO_TYPE_HOST_FUNCTION SC_VALUE_TYPE_HOST_FUNCTION
 
 typedef struct echo_property {
     uint32_t used;
@@ -295,6 +295,34 @@ static sc_status_t SC_CALL echo_eval(sc_runtime_t runtime, sc_string_view filena
             state->values[*out - 1].as.i64 = 3;
         }
         return status;
+    }
+    {
+        static const char object_source[] = "({ answer: 42 })";
+        if (source.len == sizeof(object_source) - 1 &&
+            memcmp(source.data, object_source, sizeof(object_source) - 1) == 0) {
+            static const sc_string_view answer_key = {"answer", 6};
+            sc_value_t object;
+            sc_value_t answer;
+            sc_status_t status = echo_value_new(state, ECHO_TYPE_OBJECT, &object);
+            if (status != SC_OK) {
+                return status;
+            }
+            status = echo_value_new(state, ECHO_TYPE_I64, &answer);
+            if (status != SC_OK) {
+                echo_value_release_internal(state, object);
+                return status;
+            }
+            state->values[answer - 1].as.i64 = 42;
+            status = echo_property_set(state, state->values[object - 1].properties,
+                                       answer_key, answer);
+            if (status != SC_OK) {
+                echo_value_release_internal(state, answer);
+                echo_value_release_internal(state, object);
+                return status;
+            }
+            *out = object;
+            return SC_OK;
+        }
     }
     if (source.len == 16 && memcmp(source.data, "throw echo error", 16) == 0) {
         return echo_error("echo eval error: deterministic failure", SC_EEXCEPTION);
@@ -608,6 +636,22 @@ static sc_status_t SC_CALL echo_last_error_copy(sc_runtime_t runtime, char *buff
     return SC_OK;
 }
 
+static sc_status_t SC_CALL echo_service_event(sc_runtime_t runtime,
+                                              const sc_service_event_v1 *event) {
+    echo_runtime *state = NULL;
+    if (event == NULL || event->struct_size < sizeof(*event) ||
+        echo_runtime_check(runtime, 1, &state) != SC_OK) {
+        return SC_EINVAL;
+    }
+    (void)state;
+    return echo_error("echo fixture does not support asynchronous services", SC_ENOTSUP);
+}
+
+static sc_status_t SC_CALL echo_tick(sc_runtime_t runtime) {
+    echo_runtime *state = NULL;
+    return echo_runtime_check(runtime, 1, &state);
+}
+
 static const sc_runtime_descriptor_v1 ECHO_DESCRIPTOR = {
     sizeof(sc_runtime_descriptor_v1),
     SC_RUNTIME_ABI_MAJOR,
@@ -655,10 +699,12 @@ static const sc_runtime_api_v1 ECHO_API = {
     echo_value_retain,
     echo_value_release,
     echo_last_error_copy,
+    echo_service_event,
+    echo_tick,
 };
 
 static const sc_runtime_plugin_v1 ECHO_PLUGIN = {
-    sizeof(sc_runtime_plugin_v1),
+    offsetof(sc_runtime_plugin_v1, extension_count),
     ECHO_DESCRIPTOR,
     ECHO_API,
 };
@@ -667,9 +713,9 @@ SC_EXPORT sc_status_t SC_CALL scardice_runtime_query_v1(
     const sc_runtime_query_v1 *query, const sc_runtime_plugin_v1 **out_plugin) {
     if (query == NULL || out_plugin == NULL || query->struct_size < sizeof(*query) ||
         query->runtime_abi_major != SC_RUNTIME_ABI_MAJOR ||
-        query->runtime_abi_minor > SC_RUNTIME_ABI_MINOR ||
+        query->runtime_abi_minor != SC_RUNTIME_ABI_MINOR ||
         query->host_abi_major != SC_HOST_ABI_MAJOR ||
-        query->host_abi_minor > SC_HOST_ABI_MINOR) {
+        query->host_abi_minor != SC_HOST_ABI_MINOR) {
         return SC_EABI;
     }
     *out_plugin = &ECHO_PLUGIN;

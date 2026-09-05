@@ -30,8 +30,8 @@ func TestBuildQuickJSRuntimeOptionsSerializesAllFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := `{"version":1,"runtime":{"memoryLimitBytes":134217728,"gcThresholdBytes":33554432,"maxStackSizeBytes":524288,"executionTimeoutMillis":3000},"services":{"fetch":{"maxConcurrent":2,"maxResponseBytes":4194304},"websocket":{"maxConnections":5,"maxMessageBytes":6291456},"filesystem":{"maxReadBytes":7340032,"maxWriteBytes":8388608},"pbkdf2":{"maxIterations":9,"maxOutputBytes":10}}}`
-	if got := string(options.OptionsJSON); got != want {
-		t.Fatalf("OptionsJSON = %s, want %s", got, want)
+	if got := string(options.PayloadFor("quickjs")); got != want {
+		t.Fatalf("QuickJS payload = %s, want %s", got, want)
 	}
 }
 
@@ -43,14 +43,14 @@ func TestBuildQuickJSRuntimeOptionsUsesDefaultsAndUnlimitedPolicy(t *testing.T) 
 	var payload struct {
 		Version uint32 `json:"version"`
 		Runtime struct {
-			Memory uint64 `json:"memoryLimitBytes"`
-			GC     uint64 `json:"gcThresholdBytes"`
-			Stack  uint64 `json:"maxStackSizeBytes"`
+			Memory  uint64 `json:"memoryLimitBytes"`
+			GC      uint64 `json:"gcThresholdBytes"`
+			Stack   uint64 `json:"maxStackSizeBytes"`
 			Timeout uint64 `json:"executionTimeoutMillis"`
 		} `json:"runtime"`
 		Services map[string]map[string]uint64 `json:"services"`
 	}
-	if err := json.Unmarshal(options.OptionsJSON, &payload); err != nil {
+	if err := json.Unmarshal(options.PayloadFor("quickjs"), &payload); err != nil {
 		t.Fatal(err)
 	}
 	if payload.Version != 1 || payload.Runtime.Memory != 256*1024*1024 || payload.Runtime.GC != 64*1024*1024 || payload.Runtime.Stack != 1024*1024 || payload.Runtime.Timeout != 0 {
@@ -74,11 +74,12 @@ func TestBuildQuickJSRuntimeOptionsRejectsOverflowAndKeepsSecretsOut(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(options.OptionsJSON) == "" || string(options.OptionsJSON) == "null" {
+	payloadBytes := options.PayloadFor("quickjs")
+	if len(payloadBytes) == 0 || string(payloadBytes) == "null" {
 		t.Fatal("empty options payload")
 	}
 	for _, secret := range []string{"password", "token", "secret", "mailPassword"} {
-		if bytes.Contains(options.OptionsJSON, []byte(secret)) {
+		if bytes.Contains(payloadBytes, []byte(secret)) {
 			t.Fatalf("serialized options contain secret-like key %q", secret)
 		}
 	}
@@ -110,15 +111,29 @@ func TestBuildQuickJSRuntimeOptionsRejectsPolicyByteOverflow(t *testing.T) {
 	}
 }
 
-
 func TestDiceQuickJSRuntimeOptionsUsesEngineNeutralContract(t *testing.T) {
 	dice := &Dice{Config: Config{JsConfig: JsConfig{QuickJSMemoryLimitMiB: 2}}}
 	options, err := dice.quickJSRuntimeOptions()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(options.OptionsJSON) == 0 {
+	if len(options.PayloadFor("quickjs")) == 0 {
 		t.Fatal("Dice quickjs options omitted payload")
 	}
 	var _ jsengine.RuntimeOptions = options
+}
+func TestRuntimeOptionsForEngineIgnoresQuickJSFieldsForGoja(t *testing.T) {
+	options, err := BuildRuntimeOptionsForEngine(jsengine.EngineGoja, JsConfig{QuickJSMemoryLimitMiB: math.MaxUint64})
+	if err != nil {
+		t.Fatalf("BuildRuntimeOptionsForEngine(goja) error = %v", err)
+	}
+	if payload := options.PayloadFor(jsengine.EngineGoja); len(payload) != 0 {
+		t.Fatalf("Goja payload = %q, want empty", payload)
+	}
+}
+func TestBuildQuickJSOptionsRejectsFilesystemLimitAboveNativeSyncCapacity(t *testing.T) {
+	_, err := BuildQuickJSOptionsPayload(JsConfig{QuickJSMaxFilesystemReadMiB: 17})
+	if !errors.Is(err, ErrQuickJSOptionsOutOfRange) {
+		t.Fatalf("filesystem limit error = %v, want %v", err, ErrQuickJSOptionsOutOfRange)
+	}
 }

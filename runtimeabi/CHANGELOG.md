@@ -1,6 +1,49 @@
 # Changelog
 
-All notable changes to the Scardice native runtime ABI are recorded here. The v1 surface is append-only: a compatible minor revision may add fields, function-pointer slots, or capability bits, but it must not reorder existing members or change their meaning.
+All notable changes to the Scardice native runtime ABI are recorded here. Released contracts are append-only, but the current development tree is an explicit paired break and is not an old-provider compatibility promise.
+## Development tree — current paired ABI
+
+### Changed
+
+- The active header now appends typed asynchronous service start/cancel/event
+  slots and the `sc_service_event_v1` envelope, plus the owner-thread `tick`
+  progression hook.
+- The current Core and standalone provider are rebuilt as one development
+  pair. Older short tables and the former `compat/v1` fixture are not
+  supported.
+- QuickJS native service coverage now includes console, crypto, fetch, and
+  filesystem operations, with separate synchronous filesystem operation
+  identifiers.
+- Runtime and provider version strings, and the numeric ABI constants, remain
+  unchanged during development.
+- Public entry-kind and value-type constants now live in the header.
+- The plugin table appends a validated extension descriptor array. QuickJS
+  exposes the context extension used to propagate opaque execution identity
+  across script, timer, Promise, and host-service callbacks.
+- `runtimeabi/tests/conformance.c` and the QuickJS CTest integration fixture
+  validate constants and extension-table wiring beyond raw layout offsets.
+- Added `SC_CAP_CONTEXT_PROPAGATION` / Go `CapabilityContextPropagation` at
+  bit 10. QuickJS declares the capability; Core rejects the declaration if
+  its context extension version, size, or callbacks are invalid.
+- Retained Runtime ABI `1.0`, Host ABI `1.1`, and existing v1 header/query
+  names. This remains a paired development contract, not an old-consumer
+  compatibility or independent-release negotiation promise.
+
+
+## [1.1.0] — Host service extension
+
+### Added
+
+- Host ABI v1.1 `service_call` with fixed-width scalar/bytes request and response unions.
+- Typed `SC_SERVICE_*` statuses and console operation identifiers.
+- `SC_CAP_HOST_SERVICE` capability bit for providers that dispatch synchronous host services.
+- QuickJS native provider metadata for the `console` service.
+
+### Compatibility constraints
+
+- This development break intentionally has no old-provider downgrade path.
+- A future published incompatible contract will use a new query symbol rather
+  than silently changing an existing release contract.
 
 ## [1.0.0] — Frozen
 

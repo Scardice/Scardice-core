@@ -18,6 +18,7 @@ enum {
     SC_NATIVE_CREATE = -1009,
     SC_NATIVE_CORRUPT_VTABLE = -1010,
     SC_NATIVE_TOO_SMALL = -1011,
+    SC_NATIVE_UNSUPPORTED = -1012,
     SC_NATIVE_INTERNAL = -1099
 };
 
@@ -109,6 +110,17 @@ void sc_native_value_release(uint64_t library, uint64_t runtime, uint64_t value)
 int sc_native_last_error_copy(uint64_t library, uint64_t runtime, char *buffer,
                               uint64_t buffer_capacity, uint64_t *required,
                               char *error, uint64_t capacity);
+int sc_native_service_event(uint64_t library, uint64_t runtime, uint32_t kind,
+                            uint32_t status, uint64_t request,
+                            const char *string, uint64_t string_len,
+                            const uint8_t *bytes, uint64_t bytes_len,
+                            uint32_t bool_value, int64_t int64_value,
+                            uint64_t uint64_value, double float64_value,
+                            char *error, uint64_t capacity);
+int sc_native_tick(uint64_t library, uint64_t runtime, char *error, uint64_t capacity);
+int sc_native_set_context(uint64_t library, uint64_t runtime, uint64_t token,
+                          char *error, uint64_t capacity);
+uint64_t sc_native_current_context(uint64_t library, uint64_t runtime);
 
 #ifdef __cplusplus
 }

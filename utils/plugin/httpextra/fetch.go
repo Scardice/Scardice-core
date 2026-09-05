@@ -40,6 +40,17 @@ type FetchLifecycle struct {
 	closed bool
 }
 
+// AsyncContextHooks let the owning adapter restore an opaque execution
+// context before a fetch completion resolves its Promise.
+//
+// ScheduleOnLoop MUST NOT wait for the callback: it runs on the JS owner
+// thread, which may already be executing the goroutine's own caller. Its error
+// reports only whether the callback was accepted.
+type AsyncContextHooks struct {
+	CurrentContext func() any
+	ScheduleOnLoop func(any, func(*goja.Runtime) error) error
+}
+
 func NewFetchLifecycle() *FetchLifecycle {
 	return &FetchLifecycle{active: make(map[*fetchRequestData]struct{})}
 }
@@ -102,32 +113,35 @@ func (s *fetchAbortState) get() goja.Value {
 	return s.reason
 }
 
-// EnableFetch installs fetch without an authorization hook for compatibility
-// with existing direct Goja callers.
+// EnableFetch installs fetch without an authorization hook for direct Goja
+// callers.
 func EnableFetch(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler) error {
-	return EnableFetchWithPolicyAndLifecycle(rt, loop, proxy, nil, nil)
+	return EnableFetchWithPolicyAndLifecycleAndContext(rt, loop, proxy, nil, nil, AsyncContextHooks{})
 }
 
 // EnableFetchWithPolicy installs fetch with an adapter-owned policy check.
-// The hook runs before any network goroutine starts, so denied requests cannot
-// leak IO past the SealPack boundary.
 func EnableFetchWithPolicy(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler, authorize func(string) error) error {
-	return EnableFetchWithPolicyAndLifecycle(rt, loop, proxy, authorize, nil)
+	return EnableFetchWithPolicyAndLifecycleAndContext(rt, loop, proxy, authorize, nil, AsyncContextHooks{})
 }
 
 // EnableFetchWithPolicyAndLifecycle additionally attaches requests to a
 // lifecycle owner, allowing shutdown to cancel in-flight network work.
 func EnableFetchWithPolicyAndLifecycle(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler, authorize func(string) error, lifecycle *FetchLifecycle) error {
+	return EnableFetchWithPolicyAndLifecycleAndContext(rt, loop, proxy, authorize, lifecycle, AsyncContextHooks{})
+}
+
+// EnableFetchWithPolicyAndLifecycleAndContext installs fetch and restores the
+// opaque context captured at request creation before resolving its Promise.
+func EnableFetchWithPolicyAndLifecycleAndContext(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler, authorize func(string) error, lifecycle *FetchLifecycle, hooks AsyncContextHooks) error {
 	if loop == nil {
 		return errors.New("JS event loop is required for fetch")
 	}
 	if proxy == nil {
 		return errors.New("proxy handler cannot be nil")
 	}
-	return rt.Set("fetch", newFetchFn(rt, loop, proxy, authorize, lifecycle))
+	return rt.Set("fetch", newFetchFn(rt, loop, proxy, authorize, lifecycle, hooks))
 }
-
-func newFetchFn(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler, authorize func(string) error, lifecycle *FetchLifecycle) func(goja.FunctionCall) goja.Value {
+func newFetchFn(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler, authorize func(string) error, lifecycle *FetchLifecycle, hooks AsyncContextHooks) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		promise, resolve, reject := rt.NewPromise()
 
@@ -148,12 +162,16 @@ func newFetchFn(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler,
 				return rt.ToValue(promise)
 			}
 		}
+		var executionContext any
+		if hooks.CurrentContext != nil {
+			executionContext = hooks.CurrentContext()
+		}
 		go func() {
 			if lifecycle != nil {
 				defer lifecycle.Done(requestData)
 			}
 			responseData, err := doFetchRequest(requestData, proxy)
-			loop.RunOnLoop(func(loopRT *goja.Runtime) {
+			complete := func(loopRT *goja.Runtime) {
 				if requestData.ctx != nil && requestData.ctx.Err() != nil {
 					reason := requestData.abort.get()
 					if reason == nil || goja.IsUndefined(reason) || goja.IsNull(reason) {
@@ -169,7 +187,15 @@ func newFetchFn(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler,
 				response := loopRT.NewObject()
 				bindResponse(loopRT, response, responseData)
 				_ = resolve(response)
-			})
+			}
+			if hooks.ScheduleOnLoop != nil {
+				_ = hooks.ScheduleOnLoop(executionContext, func(loopRT *goja.Runtime) error {
+					complete(loopRT)
+					return nil
+				})
+				return
+			}
+			loop.RunOnLoop(complete)
 		}()
 
 		return rt.ToValue(promise)

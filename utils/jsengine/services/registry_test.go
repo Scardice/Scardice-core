@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"Scardice-core/dice/sealpack"
 	"Scardice-core/utils/jsengine"
 	"Scardice-core/utils/jsengine/services"
 )
@@ -32,6 +31,15 @@ func (i *testInstaller) Owner() string                      { return i.owner }
 func (i *testInstaller) Definitions() []services.Definition { return i.defs }
 func (i *testInstaller) Install() error                     { i.installed = true; return nil }
 func (i *testInstaller) Close() error                       { i.closed++; return nil }
+
+type testAuthorizer struct{ deny bool }
+
+func (a testAuthorizer) Authorize(services.Name, services.OperationID, string) error {
+	if a.deny {
+		return errors.New("denied by test authorizer")
+	}
+	return nil
+}
 
 func TestRegistryRejectsDuplicateAndReportsMissingService(t *testing.T) {
 	registry := services.NewRegistry()
@@ -62,7 +70,9 @@ func TestRegistryEnforcesPermissionDeadlineAndCancellation(t *testing.T) {
 	if err := registry.Register(service); err != nil {
 		t.Fatal(err)
 	}
-	base := t.TempDir()
+	registry.SetPolicyProvider(func(services.Call) services.Policy {
+		return services.Policy{Authorizer: testAuthorizer{deny: true}}
+	})
 	denied, err := registry.Invoke(services.Call{Request: services.Request{
 		Service:   services.Filesystem,
 		Operation: services.OpFilesystemReadFile,
@@ -71,9 +81,7 @@ func TestRegistryEnforcesPermissionDeadlineAndCancellation(t *testing.T) {
 	if !errors.Is(err, services.ErrPermissionDenied) || denied.Status != services.StatusPermissionDenied {
 		t.Fatalf("Invoke(denied) = %#v, %v; want permission denied", denied, err)
 	}
-	policy := services.Policy{Sandbox: sealpack.NewSandbox("pkg", &sealpack.Permissions{
-		FileRead: []string{"**"},
-	}, base, t.TempDir())}
+	policy := services.Policy{Authorizer: testAuthorizer{}}
 	if _, err := registry.Invoke(services.Call{Request: services.Request{
 		Service:   services.Filesystem,
 		Operation: services.OpFilesystemReadFile,

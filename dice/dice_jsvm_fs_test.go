@@ -1,24 +1,28 @@
 package dice
 
 import (
+	"errors"
+	"github.com/dop251/goja"
+	"github.com/dop251/goja_nodejs/eventloop"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
 
-	"github.com/dop251/goja"
-	"github.com/dop251/goja_nodejs/eventloop"
+	"Scardice-core/utils/jsengine"
+	gojaengine "Scardice-core/utils/jsengine/goja"
 )
 
 func newTestFsDice(t *testing.T) *Dice {
 	t.Helper()
 	return &Dice{
 		BaseConfig: BaseConfig{DataDir: t.TempDir()},
-		JsCurrentPlugin: &ExtInfo{
-			Name: "fsTest",
-		},
 	}
+}
+
+func fsTestContext() *jsExecutionContext {
+	return &jsExecutionContext{Plugin: &ExtInfo{Name: "fsTest"}}
 }
 
 func TestJsFsResolveDataPathRejectsTraversalAndPlatformAmbiguity(t *testing.T) {
@@ -34,7 +38,7 @@ func TestJsFsResolveDataPathRejectsTraversalAndPlatformAmbiguity(t *testing.T) {
 		"data://C:\\Windows\\win.ini",
 	}
 	for _, path := range badPaths {
-		if _, err := jsFsResolveAbsolute(d, path); err == nil {
+		if _, err := jsFsResolveAbsoluteWithContext(d, path, fsTestContext()); err == nil {
 			t.Fatalf("expected %q to be rejected", path)
 		}
 	}
@@ -42,7 +46,7 @@ func TestJsFsResolveDataPathRejectsTraversalAndPlatformAmbiguity(t *testing.T) {
 
 func TestJsFsResolveDataPathStaysInsideBase(t *testing.T) {
 	d := newTestFsDice(t)
-	resolved, err := jsFsResolveAbsolute(d, "data://nested/example.json")
+	resolved, err := jsFsResolveAbsoluteWithContext(d, "data://nested/example.json", fsTestContext())
 	if err != nil {
 		t.Fatalf("resolve data path: %v", err)
 	}
@@ -72,7 +76,7 @@ func TestJsFsDataPathRejectsSymlinkEscape(t *testing.T) {
 		t.Fatalf("create symlink: %v", err)
 	}
 
-	readTarget, resolveErr := jsFsResolveAbsolute(d, "data://link/secret.txt")
+	readTarget, resolveErr := jsFsResolveAbsoluteWithContext(d, "data://link/secret.txt", fsTestContext())
 	if resolveErr != nil {
 		t.Fatalf("lexical resolve should pass before symlink validation: %v", resolveErr)
 	}
@@ -80,7 +84,7 @@ func TestJsFsDataPathRejectsSymlinkEscape(t *testing.T) {
 		t.Fatal("expected symlinked read target outside data base to be rejected")
 	}
 
-	writeTarget, err := jsFsResolveAbsolute(d, "data://link/new.txt")
+	writeTarget, err := jsFsResolveAbsoluteWithContext(d, "data://link/new.txt", fsTestContext())
 	if err != nil {
 		t.Fatalf("lexical resolve should pass before parent symlink validation: %v", err)
 	}
@@ -93,7 +97,7 @@ func TestJsFsAsyncDataPathOperations(t *testing.T) {
 	d := newTestFsDice(t)
 	loop := startFsTestLoop(t)
 	runFsLoopSync(t, loop, func(vm *goja.Runtime) {
-		jsFsEnable(vm, d, loop)
+		jsFsEnable(vm, d, loop, gojaengine.WrapEventLoop(loop))
 		_, err := vm.RunString(`
 			globalThis.__fsDone = false;
 			globalThis.__fsErr = "";
@@ -129,7 +133,7 @@ func TestJsFsAsyncRejectsUnsafePaths(t *testing.T) {
 	d := newTestFsDice(t)
 	loop := startFsTestLoop(t)
 	runFsLoopSync(t, loop, func(vm *goja.Runtime) {
-		jsFsEnable(vm, d, loop)
+		jsFsEnable(vm, d, loop, gojaengine.WrapEventLoop(loop))
 		_, err := vm.RunString(`
 			globalThis.__fsDone = false;
 			globalThis.__fsErr = "";
@@ -180,7 +184,7 @@ func TestJsFsAsyncDataPathRejectsSymlinkEscape(t *testing.T) {
 
 	loop := startFsTestLoop(t)
 	runFsLoopSync(t, loop, func(vm *goja.Runtime) {
-		jsFsEnable(vm, d, loop)
+		jsFsEnable(vm, d, loop, gojaengine.WrapEventLoop(loop))
 		_, err := vm.RunString(`
 			globalThis.__fsDone = false;
 			globalThis.__fsErr = "";
@@ -216,7 +220,7 @@ func TestJsFsAsyncUnrestrictedAbsolutePath(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "async-unrestricted.txt")
 	loop := startFsTestLoop(t)
 	runFsLoopSync(t, loop, func(vm *goja.Runtime) {
-		jsFsEnable(vm, d, loop)
+		jsFsEnable(vm, d, loop, gojaengine.WrapEventLoop(loop))
 		_ = vm.Set("__fsTarget", target)
 		_, err := vm.RunString(`
 			globalThis.__fsDone = false;
@@ -249,7 +253,7 @@ func TestJsFsConcurrentAsyncOperations(t *testing.T) {
 	d := newTestFsDice(t)
 	loop := startFsTestLoop(t)
 	runFsLoopSync(t, loop, func(vm *goja.Runtime) {
-		jsFsEnable(vm, d, loop)
+		jsFsEnable(vm, d, loop, gojaengine.WrapEventLoop(loop))
 		_, err := vm.RunString(`
 			globalThis.__fsDone = false;
 			globalThis.__fsErr = "";
@@ -288,28 +292,36 @@ func TestJsFsConcurrentAsyncOperations(t *testing.T) {
 func startFsTestLoop(t *testing.T) *eventloop.EventLoop {
 	t.Helper()
 	loop := eventloop.NewEventLoop(eventloop.EnableConsole(false))
-	go loop.StartInForeground()
+	engineLoop := gojaengine.WrapEventLoop(loop)
+	if err := gojaengine.InstallContextPropagation(engineLoop); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		_ = gojaengine.StartInForeground(engineLoop)
+	}()
+	if err := gojaengine.WaitUntilStarted(engineLoop); err != nil {
+		t.Fatal(err)
+	}
 	runFsLoopSync(t, loop, func(_ *goja.Runtime) {})
 	t.Cleanup(func() {
-		loop.Stop()
+		_ = engineLoop.Close()
 	})
 	return loop
 }
 
 func runFsLoopSync(t *testing.T, loop *eventloop.EventLoop, f func(*goja.Runtime)) {
 	t.Helper()
-	done := make(chan struct{})
-	var recovered interface{}
-	loop.RunOnLoop(func(vm *goja.Runtime) {
-		defer close(done)
-		defer func() {
-			recovered = recover()
-		}()
+	engineLoop := gojaengine.WrapEventLoop(loop)
+	err := jsengine.RunWithContext(engineLoop, fsTestContext(), func(runtime jsengine.Runtime) error {
+		vm, ok := gojaengine.Raw(runtime)
+		if !ok {
+			return errors.New("Goja runtime adapter unavailable")
+		}
 		f(vm)
+		return nil
 	})
-	<-done
-	if recovered != nil {
-		t.Fatalf("panic in JS event loop test callback: %v", recovered)
+	if err != nil {
+		t.Fatalf("panic in JS event loop test callback: %v", err)
 	}
 }
 

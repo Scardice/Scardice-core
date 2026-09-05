@@ -21,21 +21,24 @@ func Provider() jsengine.Provider {
 
 func (provider) Descriptor() jsengine.Descriptor {
 	return jsengine.Descriptor{
-		ID:      jsengine.EngineGoja,
-		Name:    "Goja",
-		Version: "builtin",
-		Language: "Go",
+		ID:         jsengine.EngineGoja,
+		Name:       "Goja",
+		Version:    "builtin",
+		Language:   "Go",
+		Author:     "Scardice",
+		Extensions: []string{".js", ".ts"},
 		Capabilities: jsengine.CapabilityScript.With(
 			jsengine.CapabilityCommonJS,
 			jsengine.CapabilityHostObject,
 			jsengine.CapabilityHostFunction,
+			jsengine.CapabilityContextPropagation,
 		),
 		Builtin: true,
 	}
 }
 
 func (provider) Open(_ context.Context, options jsengine.RuntimeOptions) (jsengine.Loop, error) {
-	if err := validateOptions(options.OptionsJSON); err != nil {
+	if err := validateOptions(options.PayloadFor(jsengine.EngineGoja)); err != nil {
 		return nil, err
 	}
 	return adapter.New(), nil

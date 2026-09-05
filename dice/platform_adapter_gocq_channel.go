@@ -96,7 +96,7 @@ func (pa *PlatformAdapterGocq) SendToChannelGroup(ctx *MsgContext, userID string
 	rawID, _ := pa.mustExtractChannelID(userID)
 	for _, i := range ctx.Dice.ExtList {
 		if i.OnMessageSend != nil {
-			i.callWithJsCheck(ctx.Dice, func() {
+			i.notifyWithJsCheck(ctx.Dice, func() {
 				i.OnMessageSend(ctx, &Message{
 					MessageType: "group",
 					Message:     text,

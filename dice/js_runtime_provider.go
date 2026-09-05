@@ -25,14 +25,17 @@ type diceGojaProvider struct {
 
 func (p *diceGojaProvider) Descriptor() jsengine.Descriptor {
 	return jsengine.Descriptor{
-		ID:       jsengine.EngineGoja,
-		Name:     "Goja",
-		Version:  "builtin",
-		Language: "Go",
+		ID:         jsengine.EngineGoja,
+		Name:       "Goja",
+		Version:    "builtin",
+		Language:   "Go",
+		Author:     "Scardice",
+		Extensions: []string{".js", ".ts"},
 		Capabilities: jsengine.CapabilityScript.With(
 			jsengine.CapabilityCommonJS,
 			jsengine.CapabilityHostObject,
 			jsengine.CapabilityHostFunction,
+			jsengine.CapabilityContextPropagation,
 		),
 		Builtin: true,
 	}
@@ -58,26 +61,45 @@ func (p *diceGojaProvider) Open(ctx context.Context, _ jsengine.RuntimeOptions) 
 		eventloop.WithLogger(d.Logger),
 	)
 	engineLoop := gojaengine.WrapEventLoop(rawLoop)
+	if err := gojaengine.InstallContextPropagation(engineLoop); err != nil {
+		_ = engineLoop.Close()
+		return nil, err
+	}
 	proxy := goproxy.NewProxyHttpServer()
 	printer := &PrinterFunc{d: d, isRecord: false, recorder: []string{}}
 	serviceRegistry := jsservices.NewRegistry()
 	installer := gojaservices.NewInstaller(gojaservices.Options{
-		Registry:         registry,
-		Loop:             rawLoop,
-		Proxy:            proxy,
-		Printer:          printer,
-		Logger:           d.Logger,
-		NetworkAuthorize: func(target string) error { return jsNetworkAuthorize(d, target) },
+		Registry: registry,
+		Loop:     rawLoop,
+		Proxy:    proxy,
+		Printer:  printer,
+		Logger:   d.Logger,
+		NetworkAuthorize: func(target string) error {
+			return jsNetworkAuthorizeWithContext(d, jsExecutionContextFor(engineLoop), target)
+		},
+		CurrentContext: func() any {
+			return jsengine.CurrentContext(engineLoop)
+		},
+		ScheduleOnLoop: func(context any, run func(*goja.Runtime) error) error {
+			return jsengine.ScheduleWithContext(engineLoop, context, func(runtime jsengine.Runtime) error {
+				vm, ok := gojaengine.Raw(runtime)
+				if !ok {
+					return fmt.Errorf("Goja runtime adapter unavailable")
+				}
+				return run(vm)
+			})
+		},
 		Filesystem: gojaservices.FilesystemHooks{
 			Require: func(rt *goja.Runtime, module *goja.Object) {
-				jsFsRequire(rt, module, d, rawLoop)
+				jsFsRequire(rt, module, d, rawLoop, engineLoop)
 			},
 			Enable: func(rt *goja.Runtime) {
-				jsFsEnable(rt, d, rawLoop)
+				jsFsEnable(rt, d, rawLoop, engineLoop)
 			},
 		},
 	})
 	if _, err := serviceRegistry.Install(installer); err != nil {
+		_ = serviceRegistry.Close()
 		_ = engineLoop.Close()
 		return nil, err
 	}
@@ -98,18 +120,28 @@ func (p *diceGojaProvider) Open(ctx context.Context, _ jsengine.RuntimeOptions) 
 		_ = engineLoop.Close()
 		return nil, setupErr
 	}
-	if err := ctx.Err(); err != nil {
+	d.JsPrinter = printer
+	startErr := make(chan error, 1)
+	go func() {
+		err := gojaengine.StartInForeground(engineLoop)
+		if err != nil && d.Logger != nil {
+			d.Logger.Errorf("JS事件循环启动失败: %v", err)
+		}
+		startErr <- err
+	}()
+	if err := gojaengine.WaitUntilStarted(engineLoop); err != nil {
 		_ = serviceRegistry.Close()
 		_ = engineLoop.Close()
 		return nil, err
 	}
-
-	d.JsPrinter = printer
-	d.JsServices = serviceRegistry
-	go func() {
-		if err := gojaengine.StartInForeground(engineLoop); err != nil && d.Logger != nil {
-			d.Logger.Errorf("JS事件循环启动失败: %v", err)
+	select {
+	case err := <-startErr:
+		if err != nil {
+			_ = serviceRegistry.Close()
+			_ = engineLoop.Close()
+			return nil, err
 		}
-	}()
-	return engineLoop, nil
+	default:
+	}
+	return ownJSRuntimeLoop(engineLoop, serviceRegistry), nil
 }

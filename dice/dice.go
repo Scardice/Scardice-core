@@ -25,7 +25,6 @@ import (
 	"Scardice-core/logger"
 	"Scardice-core/utils/dboperator/engine"
 	"Scardice-core/utils/jsengine"
-	jsservices "Scardice-core/utils/jsengine/services"
 	"Scardice-core/utils/public_dice"
 	randcore "Scardice-core/utils/random"
 )
@@ -143,13 +142,19 @@ type ExtDefaultSettingItem struct {
 type ExtDefaultSettingItemSlice []*ExtDefaultSettingItem
 
 type JsLoopManager struct {
-	loop     jsengine.Loop
-	loopLock sync.RWMutex
-	version  int64
+	loop           jsengine.Loop
+	loopLock       sync.RWMutex
+	version        int64
+	currentVersion int64
+	instances      map[int64]*jsRuntimeInstance
+	engines        map[jsengine.EngineID]int64
 }
 
 func NewJsLoopManager() *JsLoopManager {
-	return &JsLoopManager{version: 0}
+	return &JsLoopManager{
+		instances: make(map[int64]*jsRuntimeInstance),
+		engines:   make(map[jsengine.EngineID]int64),
+	}
 }
 
 // GetLoop returns the loop for a matching runtime generation.
@@ -157,36 +162,153 @@ func (m *JsLoopManager) GetLoop(expectedVersion int64) (jsengine.Loop, error) {
 	m.loopLock.RLock()
 	defer m.loopLock.RUnlock()
 
-	if m.version != expectedVersion {
-		return nil, fmt.Errorf("version mismatch: expected %d, current %d", expectedVersion, m.version)
+	if instance, ok := m.instances[expectedVersion]; ok && instance != nil {
+		return instance.loop, nil
 	}
-	return m.loop, nil
+	if expectedVersion == m.currentVersion && m.loop == nil {
+		return nil, nil
+	}
+	return nil, fmt.Errorf("version mismatch: expected %d, current %d", expectedVersion, m.version)
 }
 
-// CurrentLoop returns the active loop and its generation as one snapshot.
-// Callers that dispatch callbacks should prefer GetLoop with the callback's
-// captured generation; this method is only for loading new script entries and
-// compatibility callbacks that have no generation metadata.
+// CurrentLoop returns the default loop and its generation as one snapshot.
+// Script-specific loops remain available through GetLoop and LoopForEngine.
 func (m *JsLoopManager) CurrentLoop() (jsengine.Loop, int64) {
 	m.loopLock.RLock()
 	defer m.loopLock.RUnlock()
-	return m.loop, m.version
+	return m.loop, m.currentVersion
 }
 
-// SetLoop replaces the active loop, closes the previous loop, and increments
-// the generation so callbacks registered against it become stale.
-func (m *JsLoopManager) SetLoop(newLoop jsengine.Loop) int64 {
+// LoopForEngine returns the live loop registered for one runtime ID.
+func (m *JsLoopManager) LoopForEngine(engine jsengine.EngineID) (jsengine.Loop, int64) {
+	m.loopLock.RLock()
+	defer m.loopLock.RUnlock()
+	engine = jsengine.NormalizeEngineID(string(engine))
+	version, ok := m.engines[engine]
+	if !ok {
+		return nil, 0
+	}
+	instance := m.instances[version]
+	if instance == nil {
+		return nil, 0
+	}
+	return instance.loop, version
+}
+
+// AddInstance retains a fully-owned runtime instance without replacing the
+// default loop. A duplicate engine is rejected by closing the new instance.
+func (m *JsLoopManager) AddInstance(instance *jsRuntimeInstance) int64 {
+	if m == nil || instance == nil || instance.loop == nil {
+		return 0
+	}
+	engine := jsengine.NormalizeEngineID(string(instance.loop.Engine()))
 	m.loopLock.Lock()
-	oldLoop := m.loop
-	m.loop = newLoop
+	if m.instances == nil {
+		m.instances = make(map[int64]*jsRuntimeInstance)
+	}
+	if m.engines == nil {
+		m.engines = make(map[jsengine.EngineID]int64)
+	}
+	if existingVersion, ok := m.engines[engine]; ok {
+		existing := m.instances[existingVersion]
+		m.loopLock.Unlock()
+		if existing != instance {
+			_ = instance.Close()
+		}
+		return existingVersion
+	}
 	m.version++
 	version := m.version
+	instance.generation = version
+	m.instances[version] = instance
+	m.engines[engine] = version
+	if m.loop == nil {
+		m.loop = instance.loop
+		m.currentVersion = version
+	}
+	m.loopLock.Unlock()
+	return version
+}
+
+// AddLoop is the low-level test and compatibility seam for callers that do
+// not have additional runtime resources to transfer.
+func (m *JsLoopManager) AddLoop(newLoop jsengine.Loop) int64 {
+	return m.AddInstance(newJSRuntimeInstance(newLoop))
+}
+
+// RemoveInstance closes and removes one script-specific runtime instance after
+// initialization fails. It leaves the generation counter monotonic.
+func (m *JsLoopManager) RemoveInstance(version int64) {
+	m.loopLock.Lock()
+	instance, ok := m.instances[version]
+	if !ok {
+		m.loopLock.Unlock()
+		return
+	}
+	delete(m.instances, version)
+	engine := jsengine.NormalizeEngineID(string(instance.loop.Engine()))
+	if current, exists := m.engines[engine]; exists && current == version {
+		delete(m.engines, engine)
+	}
+	if m.currentVersion == version {
+		m.loop = nil
+		m.currentVersion = 0
+	}
+	m.loopLock.Unlock()
+	_ = instance.Close()
+}
+
+// SetInstance replaces the default instance and closes every retained
+// instance. It is the reload/shutdown boundary; all previous generations
+// become stale.
+func (m *JsLoopManager) SetInstance(newInstance *jsRuntimeInstance) int64 {
+	m.loopLock.Lock()
+	oldInstances := make([]*jsRuntimeInstance, 0, len(m.instances))
+	seen := make(map[*jsRuntimeInstance]struct{})
+	for _, oldInstance := range m.instances {
+		if oldInstance != nil {
+			if _, ok := seen[oldInstance]; !ok {
+				seen[oldInstance] = struct{}{}
+				oldInstances = append(oldInstances, oldInstance)
+			}
+		}
+	}
+	m.version++
+	version := m.version
+	m.loop = nil
+	m.currentVersion = version
+	m.instances = make(map[int64]*jsRuntimeInstance)
+	m.engines = make(map[jsengine.EngineID]int64)
+	if newInstance != nil && newInstance.loop != nil {
+		newInstance.generation = version
+		m.loop = newInstance.loop
+		m.instances[version] = newInstance
+		m.engines[jsengine.NormalizeEngineID(string(newInstance.loop.Engine()))] = version
+	}
 	m.loopLock.Unlock()
 
-	if oldLoop != nil && oldLoop != newLoop {
-		_ = oldLoop.Close()
+	for _, oldInstance := range oldInstances {
+		if oldInstance != newInstance {
+			_ = oldInstance.Close()
+		}
 	}
 	return version
+}
+
+// SetLoop wraps a bare loop in an owned instance for compatibility with
+// existing low-level callers. Runtime initialization uses SetInstance.
+func (m *JsLoopManager) SetLoop(newLoop jsengine.Loop) int64 {
+	if newLoop != nil {
+		m.loopLock.RLock()
+		for _, instance := range m.instances {
+			if instance != nil && instance.loop == newLoop {
+				m.loopLock.RUnlock()
+				return m.SetInstance(instance)
+			}
+		}
+		m.loopLock.RUnlock()
+	}
+	return m.SetInstance(newJSRuntimeInstance(newLoop))
 }
 
 // 强制coc7排序在较前位置
@@ -239,7 +361,6 @@ type Dice struct {
 	Cron             *cron.Cron           `json:"-"             yaml:"-"`
 	AliveNoticeEntry cron.EntryID         `json:"-"             yaml:"-"`
 	JsPrinter        *PrinterFunc         `json:"-"             yaml:"-"`
-	JsServices       *jsservices.Registry `json:"-"             yaml:"-"`
 	jsRuntimeManager *JSRuntimeManager    `json:"-" yaml:"-"`
 
 	// JsLoop           *eventloop.EventLoop `yaml:"-" json:"-"`
@@ -253,13 +374,6 @@ type Dice struct {
 	JsReloadProgress JsReloadProgressTracker `json:"-" yaml:"-"`
 	// 内置脚本摘要表，用于判断内置脚本是否有更新
 	JsBuiltinDigestSet map[string]bool `json:"-" yaml:"-"`
-	// 当前在加载的脚本路径，用于关联 jsScriptInfo 和 ExtInfo
-	JsLoadingScript *JsScriptInfo `json:"-" yaml:"-"`
-	// 当前在 jsengine.Loop.Run 回调内执行的 JS 扩展。
-	// 注意：仅在 jsengine.Loop.Run 回调内部（事件循环 goroutine 上）设置/清除，
-	// 外部 goroutine 不要读写。
-	// 用途：在 JS 原生模块（如 fs）内据此定位调用插件的沙箱权限。
-	JsCurrentPlugin *ExtInfo `json:"-" yaml:"-"`
 
 	// 游戏系统规则模板
 	GameSystemMap *SyncMap[string, *GameSystemTemplate] `json:"-" yaml:"-"`

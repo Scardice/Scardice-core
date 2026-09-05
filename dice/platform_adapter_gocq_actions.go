@@ -176,7 +176,7 @@ func (pa *PlatformAdapterGocq) SendToPerson(ctx *MsgContext, userID string, text
 
 	for _, i := range ctx.Dice.ExtList {
 		if i.OnMessageSend != nil {
-			i.callWithJsCheck(ctx.Dice, func() {
+			i.notifyWithJsCheck(ctx.Dice, func() {
 				i.OnMessageSend(ctx, &Message{
 					Message:     text,
 					MessageType: "private",
@@ -280,7 +280,7 @@ func (pa *PlatformAdapterGocq) SendToGroup(ctx *MsgContext, groupID string, text
 				UserID:   pa.EndPoint.UserID,
 			},
 		}
-		groupInfo.TriggerExtHook(ctx.Dice, func(ext *ExtInfo) func() {
+		groupInfo.TriggerExtNotifyHook(ctx.Dice, func(ext *ExtInfo) func() {
 			if ext.OnMessageSend == nil {
 				return nil
 			}
@@ -460,7 +460,7 @@ func (pa *PlatformAdapterGocq) SendGroupForwardMsg(ctx *MsgContext, groupID stri
 					UserID:   pa.EndPoint.UserID,
 				},
 			}
-			groupInfo.TriggerExtHook(ctx.Dice, func(ext *ExtInfo) func() {
+			groupInfo.TriggerExtNotifyHook(ctx.Dice, func(ext *ExtInfo) func() {
 				if ext.OnMessageSend == nil {
 					return nil
 				}
@@ -505,7 +505,7 @@ func (pa *PlatformAdapterGocq) SendPrivateForwardMsg(ctx *MsgContext, userID str
 	if ctx != nil && ctx.Dice != nil {
 		for _, i := range ctx.Dice.ExtList {
 			if i.OnMessageSend != nil {
-				i.callWithJsCheck(ctx.Dice, func() {
+				i.notifyWithJsCheck(ctx.Dice, func() {
 					i.OnMessageSend(ctx, &Message{
 						Message:     sendText,
 						MessageType: "private",
