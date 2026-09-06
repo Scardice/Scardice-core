@@ -22,7 +22,7 @@ Expected versions are compared for every requested stream after all heads are re
 
 The event sequence is advanced once for one contiguous range. Domain event rows contain exact payload bytes, metadata scalars, stream version, global position, and checksum. `Load` verifies persisted checksum bytes before returning an envelope.
 
-Participant rows are applied in fixed table order with stable key sorting and optimistic row-version checks; every conditional update requires one affected row and participant conflicts unwrap `ErrParticipantConflict` without exposing keys. Duplicate participant keys are rejected before transaction allocation. Existing sparse updates preserve durable state, secret updates append immutable history rows, and plugin/fence deletes use expected-version CAS while reporting their keys in `CommitResult`. Transaction-aware participant/projector hooks receive the same transaction and are never invoked as external side effects. Hook errors are redacted to typed `ErrParticipantFailure`/`ErrProjectorFailure`. Any error rolls back heads, sequence, events, hook writes, and participant rows together. No domain decision callback or projector callback is retried.
+Participant rows are applied in fixed table order with stable key sorting and optimistic row-version checks; every conditional update requires one affected row and participant conflicts unwrap `ErrParticipantConflict` without exposing keys. Duplicate participant keys are rejected before transaction allocation. Existing sparse updates preserve durable state, secret updates append immutable history rows, and plugin/fence creates, updates, and deletes report their keys in `CommitResult` while using expected-version CAS. Transaction-aware participant/projector hooks receive the same transaction and are never invoked as external side effects. Hook errors are redacted to typed `ErrParticipantFailure`/`ErrProjectorFailure`. Any error rolls back heads, sequence, events, hook writes, and participant rows together. No domain decision callback or projector callback is retried.
 
 ## TDD evidence
 
@@ -54,7 +54,7 @@ No formatter, linter, or project-wide test suite was run.
 
 ## Commit
 
-Implementation commits: `9fc13ec5` (atomic UnitOfWork), `636ff72f` (redacted participant keys), `89426b55` (artifact CAS persistence), `b32a9be6` (locks/transaction-only hooks/participant CAS), `cb355ca1` (sparse preservation/history/delete), `17ce7d0d` (validation/fence/hook evidence), `a896bcbd` (delete result consistency), and the final plugin update-result follow-up.
+Implementation commits: `9fc13ec5` (atomic UnitOfWork), `636ff72f` (redacted participant keys), `89426b55` (artifact CAS persistence), `b32a9be6` (locks/transaction-only hooks/participant CAS), `cb355ca1` (sparse preservation/history/delete), `17ce7d0d` (validation/fence/hook evidence), `a896bcbd` (delete result consistency), `2812e553` (plugin update results).
 The report is committed as the required Task 3 report follow-up on the same branch.
 
 - SQLite and GORM paths are covered locally. Remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available.
