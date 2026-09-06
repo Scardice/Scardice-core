@@ -63,14 +63,20 @@ var (
 	ErrDuplicateParticipant = errors.New("eventstore: duplicate participant")
 	ErrOversizeInput     = errors.New("eventstore: input exceeds configured bound")
 	ErrStaleLease        = errors.New("eventstore: stale lease")
-	ErrNotFound          = errors.New("eventstore: not found")
-	ErrInvalidTransition = errors.New("eventstore: invalid state transition")
-	ErrInvalidRiskClass  = errors.New("eventstore: invalid risk class")
-	ErrPayloadExpired    = errors.New("eventstore: encrypted payload expired")
-	ErrArtifactGone      = errors.New("eventstore: artifact gone")
+	ErrNotFound           = errors.New("eventstore: not found")
+	ErrInvalidTransition  = errors.New("eventstore: invalid state transition")
+	ErrInvalidRiskClass   = errors.New("eventstore: invalid risk class")
+	ErrPayloadExpired     = errors.New("eventstore: encrypted payload expired")
+	ErrArtifactGone       = errors.New("eventstore: artifact gone")
 	ErrEncryptionUnavailable = errors.New("eventstore: encryption unavailable")
-	ErrInvalidTTL        = errors.New("eventstore: invalid ttl")
-	ErrDeduplicated      = errors.New("eventstore: deduplicated")
+	ErrAuthenticationFailed = errors.New("eventstore: encrypted data authentication failed")
+	ErrInvalidTTL          = errors.New("eventstore: invalid ttl")
+	ErrDeduplicated        = errors.New("eventstore: deduplicated")
+	ErrReadinessInvalid    = errors.New("eventstore: invalid readiness")
+	ErrReadinessQuarantined = errors.New("eventstore: readiness quarantine")
+	ErrKeySourceUnavailable = errors.New("eventstore: key source unavailable")
+	ErrKeyUnavailable      = errors.New("eventstore: encryption key unavailable")
+	ErrPluginKVNotFound    = errors.New("eventstore: plugin key not found")
 )
 
 // Clock is injected anywhere a contract allocates a timestamp.
@@ -718,20 +724,67 @@ type OperationView struct {
 	Status      string
 	ResultCode  string
 	ErrorCode   string
-	ArtifactID  string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	ExpiresAt   time.Time
+	ArtifactID string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	ExpiresAt time.Time
 }
-
 type Readiness struct {
 	Mode                  string
 	SchemaVersion         uint32
 	DatabaseIdentity      string
 	IndexRootID           string
+	EncryptionRootIDs     []string
+	SourceManifestDigest  []byte
+	TargetManifestDigest  []byte
 	TerminalGlobalPosition uint64
 	TerminalProjectionPosition uint64
 	CompletedAt            time.Time
+}
+
+type EncryptionRoot struct {
+	ID       string
+	Material []byte
+}
+
+// KeySource supplies a stable index root and versioned encryption roots.
+// It is intentionally an opaque interface so deployments can wrap KMS/HSM
+// implementations without importing their types into eventstore.
+type KeySource interface{}
+
+type SecretPutRequest struct {
+	SecretRef       string
+	EndpointID      string
+	AdapterID       string
+	SecretVersion   uint64
+	ExpectedVersion uint64
+	Plaintext       []byte
+}
+
+type PluginKVPutRequest struct {
+	ExtensionID     string
+	Key             string
+	Value           []byte
+	ExpectedVersion uint64
+}
+
+type PluginKVItem struct {
+	ExtensionID string
+	Key         string
+	Value       []byte
+	Version     uint64
+}
+
+type PluginKVListRequest struct {
+	ExtensionID string
+	Prefix      string
+	Limit       int
+}
+
+type EncryptionRotationResult struct {
+	Updated int
+	Skipped int
+	CurrentRootID string
 }
 
 type RebuildRequest struct { ProjectorVersion string }
@@ -775,4 +828,17 @@ type PrivacyPurger interface {
 }
 type SecretResolver interface {
 	ResolveSecret(context.Context, string, uint64) (SecretResolution, error)
+}
+type SecretRepository interface {
+	PutSecret(context.Context, SecretPutRequest) (SecretResolution, error)
+	ResolveSecret(context.Context, string, uint64) (SecretResolution, error)
+}
+type PluginKVRepository interface {
+	GetPluginKV(context.Context, string, string) (PluginKVItem, error)
+	SetPluginKV(context.Context, PluginKVPutRequest) (PluginKVItem, error)
+	DeletePluginKV(context.Context, string, string, uint64) error
+	ListPluginKV(context.Context, PluginKVListRequest) ([]PluginKVItem, error)
+}
+type EncryptionRotator interface {
+	RotateEncryptionRoots(context.Context) (EncryptionRotationResult, error)
 }

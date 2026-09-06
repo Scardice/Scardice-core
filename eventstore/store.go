@@ -80,10 +80,15 @@ func WithClock(clock Clock) StoreOption {
 func WithIDGenerator(generator IDGenerator) StoreOption {
 	return func(s *GORMStore) { if generator != nil { s.ids = generator } }
 }
-func WithPayloadCodec(codec any) StoreOption {
-	return func(s *GORMStore) { s.codec = codec }
+func WithPayloadCodec(codec any) StoreOption { return func(s *GORMStore) { s.codec = codec } }
+func WithKeySource(source KeySource) StoreOption {
+	return func(s *GORMStore) {
+		s.keySource = source
+		if source != nil {
+			s.codec = &a6PayloadCodec{source: source}
+		}
+	}
 }
-func WithArtifactCodec(codec any) StoreOption { return WithPayloadCodec(codec) }
 
 type GORMStore struct {
 	db *Database
@@ -96,6 +101,7 @@ type GORMStore struct {
 	clock Clock
 	ids IDGenerator
 	codec any
+	keySource KeySource
 }
 func NewStore(database *Database, options ...StoreOption) *GORMStore {
 	s := &GORMStore{db: database, clock: SystemClock{}, ids: UUIDGenerator{}}
