@@ -188,3 +188,9 @@ func TestParticipantConflictIsTypedAndRedacted(t *testing.T) {
 	if !errors.Is(err, ErrParticipantConflict) { t.Fatalf("errors.Is participant conflict = %v", err) }
 	if err == nil || strings.Contains(err.Error(), "secret-operation") { t.Fatalf("participant error leaked key: %v", err) }
 }
+
+func TestVersionExhaustionRejectsWithoutMutation(t *testing.T) {
+	if _, err := nextVersion(maxUint64); !errors.Is(err, ErrVersionExhausted) { t.Fatalf("next version exhaustion = %v", err) }
+	if err := participantVersion(maxUint64, maxUint64, maxUint64, tableOperations, "<redacted>"); !errors.Is(err, ErrVersionExhausted) { t.Fatalf("participant version exhaustion = %v", err) }
+	if _, err := nextVersion(maxUint64 - 1); err != nil { t.Fatalf("penultimate version rejected: %v", err) }
+}
