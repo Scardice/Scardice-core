@@ -234,3 +234,21 @@ ok  	Scardice-core/eventstore	0.171s
 ```
 
 Concern: remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available; all bounded SQLite migration and index paths are covered locally.
+
+## Final foreign-index-owner follow-up
+
+Implementation commit: `274c3eef`.
+
+- Before dropping the legacy artifact index during rebuild, inspect the database-global index owner. A name owned by another table now fails closed instead of being silently dropped.
+- Added a regression that creates an unrelated table with the artifact index name, verifies OpenDatabase rejects the malformed legacy schema, and confirms the unrelated index remains intact.
+
+Final uncached verification:
+
+```text
+go test -count=1 ./eventstore -run 'TestOpenDatabase|TestEventStoreSchema|TestDatabaseClose'
+ok  	Scardice-core/eventstore	0.035s
+go test -count=1 ./eventstore
+ok  	Scardice-core/eventstore	0.177s
+```
+
+Concern: remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available; all local migration, context, and index-owner paths are covered.
