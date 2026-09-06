@@ -545,6 +545,9 @@ func TestTask5StrictIngressAndParticipantContracts(t *testing.T) {
 		t.Fatalf("uow outbox terminal transition err = %v", err)
 	}
 
+	if _, err := store.UpdateOutbox(ctx, NewEffect{EffectID: effect.EffectID, Status: OutboxStatusLeased, ExpectedVersion: 1}); !errors.Is(err, ErrStaleLease) {
+		t.Fatalf("forged outbox lease transition err = %v", err)
+	}
 	if _, err := store.Commit(ctx, UnitOfWork{
 		Operations: []OperationUpdate{{OperationID: "artifact-uow-roundtrip", PrincipalID: "artifact-owner"}},
 		ArtifactUpdates: []ArtifactUpdate{{

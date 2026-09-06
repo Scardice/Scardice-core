@@ -821,7 +821,7 @@ func (s *GORMStore) UpdateOutbox(ctx context.Context, effect NewEffect) (result 
 	if effect.Status != OutboxStatusLeased && (effect.LeaseOwner != "" || effect.LeaseEpoch != 0 || effect.AttemptID != "" || !effect.LeaseExpiresAt.IsZero()) {
 		return CommitResult{}, ErrStaleLease
 	}
-	if row.Status == OutboxStatusLeased || row.Status == OutboxStatusDispatched {
+	if row.Status == OutboxStatusLeased || row.Status == OutboxStatusDispatched || effect.Status == OutboxStatusLeased {
 		if !task5LeaseMatches(row.LeaseOwner, row.LeaseEpoch, row.AttemptID, effect.LeaseOwner, effect.LeaseEpoch, effect.AttemptID) || !task5LeaseActive(row.LeaseExpiry, now) {
 			return CommitResult{}, ErrStaleLease
 		}
