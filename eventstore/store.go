@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"sync"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -12,11 +13,16 @@ import (
 )
 
 var (
-	ErrChecksumMismatch   = errors.New("eventstore: checksum mismatch")
-	ErrParticipantConflict = errors.New("eventstore: participant conflict")
-	ErrParticipantFailure  = errors.New("eventstore: participant failure")
-	ErrProjectorFailure    = errors.New("eventstore: projector failure")
-	ErrVersionExhausted    = errors.New("eventstore: version exhausted")
+	ErrChecksumMismatch       = errors.New("eventstore: checksum mismatch")
+	ErrParticipantConflict    = errors.New("eventstore: participant conflict")
+	ErrParticipantFailure     = errors.New("eventstore: participant failure")
+	ErrProjectorFailure       = errors.New("eventstore: projector failure")
+	ErrInvalidProjector       = errors.New("eventstore: invalid projector")
+	ErrDuplicateProjector     = errors.New("eventstore: duplicate projector")
+	ErrProjectorVersionConflict = errors.New("eventstore: projector version conflict")
+	ErrUnsupportedEventSchema = errors.New("eventstore: unsupported event schema")
+	ErrProjectionInvariant    = errors.New("eventstore: projection invariant failed")
+	ErrVersionExhausted       = errors.New("eventstore: version exhausted")
 )
 
 type ParticipantConflict struct {
@@ -29,17 +35,40 @@ type ParticipantConflict struct {
 type ParticipantConflictError struct { Conflicts []ParticipantConflict }
 func (e *ParticipantConflictError) Error() string { return ErrParticipantConflict.Error() }
 func (e *ParticipantConflictError) Unwrap() error { return ErrParticipantConflict }
+
 type Projector func(context.Context, *gorm.DB, []Envelope) error
+
+// ProjectionDescriptor is a stable, store-local projector registration.
+// Name and Version are persisted as the projector set identity during publish.
+type ProjectionDescriptor struct {
+	Name                string
+	Version             string
+	SchemaVersion       string
+	ProjectorSetVersion string
+	ProjectorVersion    string
+	Apply               Projector
+}
+
+type ProjectorDescriptor = ProjectionDescriptor
+type ProjectorRegistration = ProjectionDescriptor
+type ProjectorSpec = ProjectionDescriptor
+
 type ParticipantHook func(context.Context, *gorm.DB, UnitOfWork) error
 type StoreOption func(*GORMStore)
-func WithProjector(projector Projector) StoreOption { return func(s *GORMStore) { s.RegisterProjector(projector) } }
+
+func WithProjector(projector any) StoreOption {
+	return func(s *GORMStore) { _ = s.RegisterProjector(projector) }
+}
+func WithProjection(descriptor ProjectionDescriptor) StoreOption {
+	return func(s *GORMStore) { _ = s.RegisterProjection(descriptor) }
+}
 func WithParticipant(hook ParticipantHook) StoreOption { return func(s *GORMStore) { s.RegisterParticipant(hook) } }
 func WithLockObserver(observer func(string)) StoreOption { return func(s *GORMStore) { s.SetLockObserver(observer) } }
 
 type GORMStore struct {
 	db *Database
 	mu sync.RWMutex
-	projectors []Projector
+	projectors []ProjectionDescriptor
 	participants []ParticipantHook
 	lockObserver func(string)
 }
@@ -48,18 +77,71 @@ func NewStore(database *Database, options ...StoreOption) *GORMStore {
 	for _, option := range options { if option != nil { option(s) } }
 	return s
 }
-func NewGORMStore(database *Database, options ...StoreOption) *GORMStore { return NewStore(database, options...) }
-func NewEventStore(database *Database, options ...StoreOption) *GORMStore { return NewStore(database, options...) }
-
-func (s *GORMStore) RegisterProjector(projector Projector) {
-	if s == nil || projector == nil { return }
-	s.mu.Lock(); defer s.mu.Unlock(); s.projectors = append(s.projectors, projector)
+func (s *GORMStore) RegisterProjection(descriptor ProjectionDescriptor) error {
+	version := descriptor.Version
+	if version == "" {
+		version = descriptor.SchemaVersion
+	}
+	if version == "" {
+		version = descriptor.ProjectorSetVersion
+	}
+	if version == "" {
+		version = descriptor.ProjectorVersion
+	}
+	descriptor.Name = strings.TrimSpace(descriptor.Name)
+	descriptor.Version = strings.TrimSpace(version)
+	if s == nil || descriptor.Apply == nil || descriptor.Name == "" || descriptor.Version == "" {
+		return ErrInvalidProjector
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.projectors {
+		if existing.Name != descriptor.Name {
+			continue
+		}
+		if existing.Version != descriptor.Version {
+			return ErrProjectorVersionConflict
+		}
+		return ErrDuplicateProjector
+	}
+	s.projectors = append(s.projectors, descriptor)
+	sort.Slice(s.projectors, func(i, j int) bool { return s.projectors[i].Name < s.projectors[j].Name })
+	return nil
 }
+
+// RegisterProjector preserves the A2 callback form while accepting stable
+// descriptors for A3 callers.
+func (s *GORMStore) RegisterProjector(projector any) error {
+	switch value := projector.(type) {
+	case ProjectionDescriptor:
+		return s.RegisterProjection(value)
+	case Projector:
+		if value == nil {
+			return ErrInvalidProjector
+		}
+		s.mu.Lock()
+		name := "legacy"
+		for i := range s.projectors {
+			if s.projectors[i].Name == name {
+				name = "legacy-" + string(rune('0'+i+1))
+			}
+		}
+		s.projectors = append(s.projectors, ProjectionDescriptor{Name: name, Version: "legacy", Apply: value})
+		sort.Slice(s.projectors, func(i, j int) bool { return s.projectors[i].Name < s.projectors[j].Name })
+		s.mu.Unlock()
+		return nil
+	case func(context.Context, *gorm.DB, []Envelope) error:
+		return s.RegisterProjector(Projector(value))
+	default:
+		return ErrInvalidProjector
+	}
+}
+
+func (s *GORMStore) SetProjector(projector any) error { return s.RegisterProjector(projector) }
 func (s *GORMStore) RegisterParticipant(hook ParticipantHook) {
 	if s == nil || hook == nil { return }
 	s.mu.Lock(); defer s.mu.Unlock(); s.participants = append(s.participants, hook)
 }
-func (s *GORMStore) SetProjector(projector Projector) { s.RegisterProjector(projector) }
 func (s *GORMStore) SetParticipant(hook ParticipantHook) { s.RegisterParticipant(hook) }
 func (s *GORMStore) SetLockObserver(observer func(string)) {
 	if s == nil { return }
@@ -70,6 +152,7 @@ func (s *GORMStore) observeLock(name string) {
 	s.mu.RLock(); observer := s.lockObserver; s.mu.RUnlock()
 	if observer != nil { observer(name) }
 }
+
 
 func locked(db *gorm.DB) *gorm.DB {
 	if db != nil && db.Dialector.Name() != "sqlite" {
@@ -163,13 +246,35 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 		if err = tx.Model(&aggregateHeadRow{}).Where("aggregate_type = ? AND aggregate_id = ?", item.Stream.AggregateType, item.Stream.AggregateID).Updates(map[string]any{"current_version": result.StreamVersions[item.Stream], "updated_at": time.Now().UTC()}).Error; err != nil { return CommitResult{}, errors.New("eventstore: advance aggregate head failed") }
 	}
 
-	if err = s.applyParticipants(ctx, tx, work, &result); err != nil { return CommitResult{}, err }
-	s.mu.RLock(); projectors := append([]Projector(nil), s.projectors...); participants := append([]ParticipantHook(nil), s.participants...); s.mu.RUnlock()
+	if err = s.applyParticipants(ctx, tx, work, &result); err != nil {
+		return CommitResult{}, err
+	}
+	s.mu.RLock()
+	projectors := append([]ProjectionDescriptor(nil), s.projectors...)
+	participants := append([]ParticipantHook(nil), s.participants...)
+	s.mu.RUnlock()
+	controlUpdates := map[string]any{"updated_at": time.Now().UTC()}
+	if len(result.Events) > 0 {
+		control.TerminalPosition = result.Events[len(result.Events)-1].GlobalPosition
+		controlUpdates["terminal_position"] = control.TerminalPosition
+	}
+	if len(projectors) > 0 {
+		control.ProjectorSetVersion = projectorSetVersion(projectors)
+		controlUpdates["projector_set_version"] = control.ProjectorSetVersion
+	}
+	if len(controlUpdates) > 1 {
+		if err = tx.Model(&projectionControlRow{}).Where("singleton_id = ?", "default").Updates(controlUpdates).Error; err != nil {
+			return CommitResult{}, errors.New("eventstore: update projection control failed")
+		}
+	}
 	for _, hook := range participants {
 		if hookErr := hook(ctx, tx, work); hookErr != nil { return CommitResult{}, ErrParticipantFailure }
 	}
-	for _, projector := range projectors {
-		if hookErr := projector(ctx, tx, result.Events); hookErr != nil { return CommitResult{}, ErrProjectorFailure }
+	if len(projectors) > 0 {
+		tx = tx.Set(projectionGenerationKey, control.ActiveGeneration)
+	}
+	for _, descriptor := range projectors {
+		if hookErr := descriptor.Apply(ctx, tx, result.Events); hookErr != nil { return CommitResult{}, ErrProjectorFailure }
 	}
 	if err = tx.Commit().Error; err != nil { return CommitResult{}, errors.New("eventstore: commit transaction failed") }
 	committed = true
