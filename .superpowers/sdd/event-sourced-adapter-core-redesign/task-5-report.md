@@ -6,8 +6,8 @@
 - `eventstore/schema.go`: durable resolution audit fields and bounded outbox retry metadata.
 - `eventstore/store.go`: injected clock, ID generator, and payload codec options with production defaults.
 - `eventstore/store_test.go`: migrated legacy participant fixtures to valid ordered/risk/status contracts and retained aggregate/UoW compatibility coverage without allowing arbitrary ingress state injection.
-- `eventstore/task5.go`: transactional inbox/outbox acceptance, lane allocation, provider dedupe, predecessor-blocked claims, lease/CAS lifecycle, resolution, payload scrubbing/expiry, risk transitions, and artifact put/consume.
-- `eventstore/task5_test.go`: behavior-first regression coverage for dedupe, lane ordering/concurrency, lease/CAS/state transitions, ambiguity, scrubbing/TTL, artifact codec/size/expiry/one-winner, and fail-closed encryption.
+- `eventstore/task5.go`: transactional inbox/outbox acceptance, lane allocation, provider dedupe, predecessor-blocked claims, lease/CAS lifecycle, resolution, payload scrubbing/expiry, risk transitions, and artifact put/consume. The final hardening also rejects identity/content conflicts, malformed opaque payload metadata, generic terminal/dispatched UoW transitions, forged pending leases, and artifact owner mismatches.
+- `eventstore/task5_test.go`: behavior-first regression coverage for dedupe, lane ordering/concurrency, lease/CAS/state transitions, ambiguity, scrubbing/TTL, artifact codec/size/expiry/one-winner, fail-closed encryption, and strict participant contracts.
 `Store.Commit` participant application runs through the same transaction-bound invariant helpers: new inbox/effect rows ignore caller ordering, reject invalid status/risk/lease/encryption metadata, allocate typed lanes, enforce dedupe and TTL caps, and reject direct artifact terminal/oversize updates. Existing participant updates retain expected-version and active-lease CAS; terminal rows cannot be rewritten through the aggregate-only store.
 ## Algorithms and transitions
 
@@ -34,10 +34,10 @@ Exact required commands and results:
 
 ```text
 go test -race ./eventstore -run 'TestInbox|TestOutbox|TestArtifact|TestLane|TestLease|TestEffect|TestDedup' -count=1
-ok   Scardice-core/eventstore  1.370s
+ok   Scardice-core/eventstore  1.380s
 
 go test -count=1 ./eventstore
-ok   Scardice-core/eventstore  0.705s
+ok   Scardice-core/eventstore  0.739s
 ```
 
 The commands were rerun after the final source/test commits and included the Task5 tests whose names match the required filters. No formatter, linter, or project-wide suite was run.
@@ -47,7 +47,7 @@ The commands were rerun after the final source/test commits and included the Tas
 - Implementation and tests: `0470750b` (`eventstore: add ordered inbox outbox and artifacts`)
 - Lease/completion and scrub hardening: `19330c86`, `ab3a177f`
 - Participant bypass closure, strict UoW invariants, TTL/expiry scrub coverage: `b0fd9b28`, `a276823a`
-
+- Strict ingress, dedupe conflict, canonical lane ordering, artifact ownership/status/TTL, and participant contract hardening: `2828cb0`
 ## Limitation
 
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
