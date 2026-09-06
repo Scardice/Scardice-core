@@ -54,6 +54,9 @@ func TestCommitRejectsDuplicateAndOversize(t *testing.T) {
 	if err := ValidateUnitOfWork(UnitOfWork{Streams:[]StreamAppend{{Stream:StreamID{"bound","bytes"},Events:bytes}}}); err == nil { t.Fatal("byte bound accepted") } else if bound,ok:=err.(*OversizeError); !ok || bound.Bound!="unit of work encoded bytes" { t.Fatalf("byte bound err = %v",err) }
 	participantBytes := UnitOfWork{Operations: []OperationUpdate{{OperationID:"oversized-participant", PrivateContextCiphertext:make([]byte, MaxUnitOfWorkBytes)}}}
 	if err := ValidateUnitOfWork(participantBytes); err == nil { t.Fatal("participant byte bound accepted") } else if bound,ok:=err.(*OversizeError); !ok || bound.Bound!="unit of work encoded bytes" { t.Fatalf("participant byte bound err = %v",err) }
+	nearBytes := make([]NewEvent, 64)
+	for i := range nearBytes { nearBytes[i] = testEvent(strconv.Itoa(i)); nearBytes[i].Payload = make([]byte, MaxEventPayloadBytes) }
+	if err := ValidateUnitOfWork(UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{"bound", "metadata"}, Events: nearBytes}}}); err == nil { t.Fatal("metadata byte bound accepted") } else if bound,ok:=err.(*OversizeError); !ok || bound.Bound!="unit of work encoded bytes" { t.Fatalf("metadata byte bound err = %v",err) }
 }
 
 func testEvent(id string) NewEvent {

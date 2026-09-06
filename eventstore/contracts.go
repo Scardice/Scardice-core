@@ -491,6 +491,7 @@ func ValidateUnitOfWork(work UnitOfWork) error {
 			return ErrDuplicateStream
 		}
 		seen[append.Stream] = struct{}{}
+		addFields(len(append.Stream.AggregateType), len(append.Stream.AggregateID))
 		eventCount += len(append.Events)
 		for _, event := range append.Events {
 			if event.EventType == "" || event.SchemaVersion == 0 {
@@ -502,6 +503,7 @@ func ValidateUnitOfWork(work UnitOfWork) error {
 			if len(event.Payload) > MaxEventPayloadBytes {
 				return &OversizeError{Bound: "event payload", Limit: MaxEventPayloadBytes, Actual: len(event.Payload)}
 			}
+			addFields(len(event.EventType), len(event.Metadata.EventID), len(event.Metadata.CommandID), len(event.Metadata.CorrelationID), len(event.Metadata.CausationID), len(event.Metadata.PrincipalID), len(event.Metadata.Producer))
 			addBytes(len(event.Payload))
 		}
 	}
@@ -540,15 +542,17 @@ func ValidateUnitOfWork(work UnitOfWork) error {
 func validateParticipantKeys(work UnitOfWork) error {
 	seen := func() map[string]struct{} { return make(map[string]struct{}) }
 	check := func(m map[string]struct{}, key string) error { if _, ok := m[key]; ok { return ErrDuplicateParticipant }; m[key] = struct{}{}; return nil }
+	type pair struct{ first, second string }
+	checkPair := func(m map[pair]struct{}, key pair) error { if _, ok := m[key]; ok { return ErrDuplicateParticipant }; m[key] = struct{}{}; return nil }
 	ops, arts, secrets, inbox, effects := seen(), seen(), seen(), seen(), seen()
-	plugins, fences := seen(), seen()
+	plugins, fences := make(map[pair]struct{}), make(map[pair]struct{})
 	for _, v := range work.Operations { if v.OperationID != "" { if err:=check(ops,v.OperationID);err!=nil{return err} } }
 	for _, v := range work.ArtifactUpdates { if v.ArtifactID != "" { if err:=check(arts,v.ArtifactID);err!=nil{return err} } }
 	for _, v := range work.SecretUpdates { if v.SecretRef != "" { if err:=check(secrets,v.SecretRef);err!=nil{return err} } }
 	for _, v := range work.InboxUpdates { if v.InboxID != "" { if err:=check(inbox,v.InboxID);err!=nil{return err} } }
 	for _, v := range work.Effects { if v.EffectID != "" { if err:=check(effects,v.EffectID);err!=nil{return err} } }
-	for _, v := range work.PluginKVUpdates { if v.ExtensionID != "" && len(v.KeyHMAC)>0 { if err:=check(plugins,v.ExtensionID+string([]byte{0})+string(v.KeyHMAC));err!=nil{return err} } }
-	for _, v := range work.FenceUpdates { if len(v.SubjectKey)>0 && v.Scope != "" { if err:=check(fences,string(v.SubjectKey)+string([]byte{0})+v.Scope);err!=nil{return err} } }
+	for _, v := range work.PluginKVUpdates { if v.ExtensionID != "" && len(v.KeyHMAC)>0 { if err:=checkPair(plugins,pair{v.ExtensionID,string(v.KeyHMAC)});err!=nil{return err} } }
+	for _, v := range work.FenceUpdates { if len(v.SubjectKey)>0 && v.Scope != "" { if err:=checkPair(fences,pair{string(v.SubjectKey),v.Scope});err!=nil{return err} } }
 	return nil
 }
 

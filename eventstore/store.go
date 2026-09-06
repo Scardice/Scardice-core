@@ -204,8 +204,14 @@ func participantVersion(expected, current, supplied uint64, table, key string) e
 	return nil
 }
 
+func participantCAS(table, key string, expected, current uint64, q *gorm.DB) error {
+	if q.Error != nil { return ErrParticipantFailure }
+	if current != 0 && q.RowsAffected != 1 {
+		return &ParticipantConflictError{Conflicts: []ParticipantConflict{{Table: table, Key: key, ExpectedVersion: expected, CurrentVersion: current}}}
+	}
+	return nil
+}
 func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work UnitOfWork, result *CommitResult) error {
-	// Fixed participant order is intentional; each group is sorted by its stable key.
 	applyOps := func() error { ops := append([]OperationUpdate(nil), work.Operations...); sort.Slice(ops, func(i,j int) bool{return ops[i].OperationID < ops[j].OperationID})
 	for _, update := range ops {
 		if update.OperationID == "" { return ErrParticipantFailure }
@@ -220,7 +226,7 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 			if update.Kind != "" { row.Kind = update.Kind }; if update.Status != "" { row.Status = update.Status }; if update.PrincipalID != "" { row.PrincipalID = update.PrincipalID }; if update.ResourceID != "" { row.ResourceID = update.ResourceID }; if update.IdempotencyScope != "" { row.IdempotencyScope = update.IdempotencyScope }; if update.IdempotencyKey != "" { row.IdempotencyKey = update.IdempotencyKey }; if update.RequestID != "" { row.RequestID = update.RequestID }; if len(update.RequestDigest) > 0 { row.RequestDigest = update.RequestDigest }; if update.CorrelationID != "" { row.CorrelationID = update.CorrelationID }; if update.ResultCode != "" { row.ResultCode = update.ResultCode }; if update.ErrorCode != "" { row.ErrorCode = update.ErrorCode }; if update.ArtifactID != "" { row.ArtifactRef = update.ArtifactID }; if len(update.PrivateContextCiphertext) > 0 { row.PrivateContext = update.PrivateContextCiphertext }; if len(update.PrivateContextNonce) > 0 { row.PrivateNonce = update.PrivateContextNonce }; if update.EncryptionKeyID != "" { row.PrivateKeyID = update.EncryptionKeyID }; if !update.ExpiresAt.IsZero() { row.ExpiresAt = timePtr(update.ExpiresAt) }; row.Version = version; row.UpdatedAt = now
 			q=tx.Model(&operationRow{}).Where("operation_id = ? AND version = ?",update.OperationID,current).Updates(map[string]any{"version":row.Version,"kind":row.Kind,"status":row.Status,"principal_id":row.PrincipalID,"resource_type":row.ResourceType,"resource_id":row.ResourceID,"idempotency_scope":row.IdempotencyScope,"idempotency_key":row.IdempotencyKey,"request_id":row.RequestID,"request_digest":row.RequestDigest,"correlation_id":row.CorrelationID,"result_code":row.ResultCode,"error_code":row.ErrorCode,"artifact_id":row.ArtifactRef,"private_context":row.PrivateContext,"private_nonce":row.PrivateNonce,"private_key_id":row.PrivateKeyID,"updated_at":row.UpdatedAt,"expires_at":row.ExpiresAt})
 		}
-		if q.Error != nil || (current != 0 && q.RowsAffected != 1) { return ErrParticipantFailure }; result.OperationIDs=append(result.OperationIDs,update.OperationID)
+		if err := participantCAS(tableOperations, "<redacted>", update.ExpectedVersion, current, q); err != nil { return err }; result.OperationIDs=append(result.OperationIDs,update.OperationID)
 	}
 	return nil
 }
@@ -232,7 +238,7 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 			if update.OperationID != "" { row.OperationID=update.OperationID }; if update.OwnerPrincipalID != "" { row.OwnerPrincipalID=update.OwnerPrincipalID }; if update.MediaType != "" { row.MediaType=update.MediaType }; if update.SafeFilename != "" { row.SafeFilename=update.SafeFilename }; if update.Size != 0 { row.Size=update.Size }; if update.Status != "" { row.Status=update.Status }; if len(update.Ciphertext)>0 { row.Ciphertext=update.Ciphertext }; if len(update.Nonce)>0 { row.Nonce=update.Nonce }; if update.EncryptionKeyID != "" { row.EncryptionKeyID=update.EncryptionKeyID }; if !update.ExpiresAt.IsZero() { row.ExpiresAt=update.ExpiresAt }; if !update.ConsumedAt.IsZero() { row.ConsumedAt=timePtr(update.ConsumedAt) }; row.Version=version
 			q=tx.Model(&operationArtifactRow{}).Where("artifact_id = ? AND version = ?",update.ArtifactID,current).Updates(map[string]any{"version":row.Version,"operation_id":row.OperationID,"owner_principal_id":row.OwnerPrincipalID,"media_type":row.MediaType,"safe_filename":row.SafeFilename,"size":row.Size,"status":row.Status,"ciphertext":row.Ciphertext,"nonce":row.Nonce,"encryption_key_id":row.EncryptionKeyID,"expires_at":row.ExpiresAt,"consumed_at":row.ConsumedAt})
 		}
-		if q.Error!=nil || (current != 0 && q.RowsAffected != 1){return ErrParticipantFailure}; result.ArtifactIDs=append(result.ArtifactIDs,update.ArtifactID)
+		if err := participantCAS(tableOperationArtifacts, "<redacted>", update.ExpectedVersion, current, q); err != nil { return err }; result.ArtifactIDs=append(result.ArtifactIDs,update.ArtifactID)
 	}
 	return nil
 }
@@ -242,7 +248,7 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 		var latest adapterSecretRow
 		q:=tx.Where("secret_ref = ?",update.SecretRef).Order("row_version DESC").First(&latest); current:=uint64(0)
 		if q.Error==nil { current=latest.RowVersion } else if !errors.Is(q.Error,gorm.ErrRecordNotFound) { return ErrParticipantFailure }
-		if err:=participantVersion(update.ExpectedVersion,current,update.Version,tableAdapterSecrets,update.SecretRef);err!=nil{return err}
+		if err:=participantVersion(update.ExpectedVersion,current,update.Version,tableAdapterSecrets,"<redacted>");err!=nil{return err}
 		version:=current+1; secretVersion:=update.SecretVersion; if secretVersion==0 {if current>0 {secretVersion=latest.SecretVersion+1} else {secretVersion=1}}; if current>0 && secretVersion<=latest.SecretVersion{return ErrParticipantConflict}
 		row:=latest; row.SecretRef=update.SecretRef; row.SecretVersion=secretVersion; row.RowVersion=version; if current==0 { row.EndpointID=nonempty(update.EndpointID,"unknown"); row.AdapterID=nonempty(update.AdapterID,"unknown"); row.AdapterType="opaque"; row.Ciphertext=nonemptyBytes(update.Ciphertext); row.Nonce=nonemptyBytes(update.Nonce); row.EncryptionKeyID=nonempty(update.EncryptionKeyID,"opaque"); row.CreatedAt=time.Now().UTC() }; if update.EndpointID!="" {row.EndpointID=update.EndpointID}; if update.AdapterID!="" {row.AdapterID=update.AdapterID}; if len(update.Ciphertext)>0 {row.Ciphertext=update.Ciphertext}; if len(update.Nonce)>0 {row.Nonce=update.Nonce}; if update.EncryptionKeyID!="" {row.EncryptionKeyID=update.EncryptionKeyID}; row.UpdatedAt=chooseTime(update.UpdatedAt,time.Now().UTC())
 		q=tx.Create(&row); if q.Error!=nil{return ErrParticipantFailure}; result.SecretRefs=append(result.SecretRefs,update.SecretRef)
@@ -255,8 +261,8 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 		var row pluginKVRow; q:=tx.Where("extension_id = ? AND key_hmac = ?",update.ExtensionID,update.KeyHMAC).First(&row); current:=uint64(0)
 		if q.Error==nil {current=row.RowVersion} else if !errors.Is(q.Error,gorm.ErrRecordNotFound){return ErrParticipantFailure}
 		if err:=participantVersion(update.ExpectedVersion,current,update.Version,tablePluginKV,"<redacted>");err!=nil{return err}
-		if update.Deleted { q=tx.Where("extension_id = ? AND key_hmac = ? AND row_version = ?",update.ExtensionID,update.KeyHMAC,current).Delete(&pluginKVRow{}); if current==0 || q.Error!=nil || q.RowsAffected!=1{return ErrParticipantFailure}; result.PluginKVIndexes=append(result.PluginKVIndexes,append([]byte(nil),update.KeyHMAC...)); continue }
-		version:=current+1; if current==0 {row=pluginKVRow{ExtensionID:update.ExtensionID,KeyHMAC:update.KeyHMAC,EncryptedKey:nonemptyBytes(update.KeyCiphertext),KeyNonce:nonemptyBytes(update.KeyNonce),EncryptedValue:nonemptyBytes(update.ValueCiphertext),ValueNonce:nonemptyBytes(update.ValueNonce),ValueSize:update.ValueSize,RowVersion:version,EncryptionKeyID:nonempty(update.EncryptionKeyID,"opaque"),CreatedAt:time.Now().UTC(),UpdatedAt:chooseTime(update.UpdatedAt,time.Now().UTC())}} else {if len(update.KeyCiphertext)>0{row.EncryptedKey=update.KeyCiphertext};if len(update.KeyNonce)>0{row.KeyNonce=update.KeyNonce};if len(update.ValueCiphertext)>0{row.EncryptedValue=update.ValueCiphertext};if len(update.ValueNonce)>0{row.ValueNonce=update.ValueNonce};if update.ValueSize!=0{row.ValueSize=update.ValueSize};if update.EncryptionKeyID!=""{row.EncryptionKeyID=update.EncryptionKeyID};row.RowVersion=version;row.UpdatedAt=chooseTime(update.UpdatedAt,time.Now().UTC());q=tx.Model(&pluginKVRow{}).Where("extension_id = ? AND key_hmac = ? AND row_version = ?",update.ExtensionID,update.KeyHMAC,current).Updates(map[string]any{"encrypted_key":row.EncryptedKey,"key_nonce":row.KeyNonce,"encrypted_value":row.EncryptedValue,"value_nonce":row.ValueNonce,"value_size":row.ValueSize,"row_version":version,"updated_at":row.UpdatedAt,"encryption_key_id":row.EncryptionKeyID});if q.Error!=nil || q.RowsAffected!=1{return ErrParticipantFailure};result.PluginKVIndexes=append(result.PluginKVIndexes,append([]byte(nil),update.KeyHMAC...));continue}
+		if update.Deleted { if current==0{return &ParticipantConflictError{Conflicts:[]ParticipantConflict{{Table:tablePluginKV,Key:"<redacted>",ExpectedVersion:update.ExpectedVersion,CurrentVersion:current}}}}; q=tx.Where("extension_id = ? AND key_hmac = ? AND row_version = ?",update.ExtensionID,update.KeyHMAC,current).Delete(&pluginKVRow{}); if err:=participantCAS(tablePluginKV,"<redacted>",update.ExpectedVersion,current,q);err!=nil{return err}; result.PluginKVIndexes=append(result.PluginKVIndexes,append([]byte(nil),update.KeyHMAC...)); continue }
+		version:=current+1; if current==0 {row=pluginKVRow{ExtensionID:update.ExtensionID,KeyHMAC:update.KeyHMAC,EncryptedKey:nonemptyBytes(update.KeyCiphertext),KeyNonce:nonemptyBytes(update.KeyNonce),EncryptedValue:nonemptyBytes(update.ValueCiphertext),ValueNonce:nonemptyBytes(update.ValueNonce),ValueSize:update.ValueSize,RowVersion:version,EncryptionKeyID:nonempty(update.EncryptionKeyID,"opaque"),CreatedAt:time.Now().UTC(),UpdatedAt:chooseTime(update.UpdatedAt,time.Now().UTC())}} else {if len(update.KeyCiphertext)>0{row.EncryptedKey=update.KeyCiphertext};if len(update.KeyNonce)>0{row.KeyNonce=update.KeyNonce};if len(update.ValueCiphertext)>0{row.EncryptedValue=update.ValueCiphertext};if len(update.ValueNonce)>0{row.ValueNonce=update.ValueNonce};if update.ValueSize!=0{row.ValueSize=update.ValueSize};if update.EncryptionKeyID!=""{row.EncryptionKeyID=update.EncryptionKeyID};row.RowVersion=version;row.UpdatedAt=chooseTime(update.UpdatedAt,time.Now().UTC());q=tx.Model(&pluginKVRow{}).Where("extension_id = ? AND key_hmac = ? AND row_version = ?",update.ExtensionID,update.KeyHMAC,current).Updates(map[string]any{"encrypted_key":row.EncryptedKey,"key_nonce":row.KeyNonce,"encrypted_value":row.EncryptedValue,"value_nonce":row.ValueNonce,"value_size":row.ValueSize,"row_version":version,"updated_at":row.UpdatedAt,"encryption_key_id":row.EncryptionKeyID});if err:=participantCAS(tablePluginKV,"<redacted>",update.ExpectedVersion,current,q);err!=nil{return err};result.PluginKVIndexes=append(result.PluginKVIndexes,append([]byte(nil),update.KeyHMAC...));continue}
 		if q=tx.Create(&row);q.Error!=nil{return ErrParticipantFailure}; result.PluginKVIndexes=append(result.PluginKVIndexes,append([]byte(nil),update.KeyHMAC...))
 	}
 	return nil
@@ -320,7 +326,7 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 				"payload_expires_at": row.PayloadExpiresAt, "workflow_id": row.WorkflowID,
 			})
 		}
-		if q.Error != nil || (current != 0 && q.RowsAffected != 1) { return ErrParticipantFailure }
+		if err := participantCAS(tableInboxMessages, "<redacted>", update.ExpectedVersion, current, q); err != nil { return err }
 		result.InboxIDs = append(result.InboxIDs, update.InboxID)
 	}
 	return nil
@@ -392,7 +398,7 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 				"completed_at": row.CompletedAt, "payload_expires_at": row.PayloadExpiresAt,
 			})
 		}
-		if q.Error != nil || (current != 0 && q.RowsAffected != 1) { return ErrParticipantFailure }
+		if err := participantCAS(tableOutboxEffects, "<redacted>", update.ExpectedVersion, current, q); err != nil { return err }
 		result.EffectIDs = append(result.EffectIDs, update.EffectID)
 	}
 	return nil
@@ -403,10 +409,10 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 		var row subjectFenceRow
 		q:=tx.Where("subject_key = ? AND scope = ?",update.SubjectKey,update.Scope).First(&row); current:=uint64(0); if q.Error==nil{current=row.Version}else if !errors.Is(q.Error,gorm.ErrRecordNotFound){return ErrParticipantFailure}
 		if err:=participantVersion(update.ExpectedVersion,current,update.Version,tableSubjectFences,"<redacted>");err!=nil{return err}
-		if update.Deleted { if current==0{return ErrParticipantFailure}; q=tx.Where("subject_key = ? AND scope = ? AND version = ?",update.SubjectKey,update.Scope,current).Delete(&subjectFenceRow{}); if q.Error!=nil || q.RowsAffected!=1{return ErrParticipantFailure}; result.FenceKeys=append(result.FenceKeys,append([]byte(nil),update.SubjectKey...)); continue }
+		if update.Deleted { if current==0{return &ParticipantConflictError{Conflicts:[]ParticipantConflict{{Table:tableSubjectFences,Key:"<redacted>",ExpectedVersion:update.ExpectedVersion,CurrentVersion:current}}}}; q=tx.Where("subject_key = ? AND scope = ? AND version = ?",update.SubjectKey,update.Scope,current).Delete(&subjectFenceRow{}); if err:=participantCAS(tableSubjectFences,"<redacted>",update.ExpectedVersion,current,q);err!=nil{return err}; result.FenceKeys=append(result.FenceKeys,append([]byte(nil),update.SubjectKey...)); continue }
 		version:=current+1
 		if current==0 { if update.PurgeOperationID=="" {return ErrParticipantFailure}; row=subjectFenceRow{SubjectKey:update.SubjectKey,Scope:update.Scope,Version:version,PurgeOperationID:update.PurgeOperationID,CreatedAt:chooseTime(update.CreatedAt,time.Now().UTC()),ExpiresAt:timePtr(update.ExpiresAt)}; q=tx.Create(&row) } else { if update.PurgeOperationID!="" {row.PurgeOperationID=update.PurgeOperationID}; if !update.CreatedAt.IsZero(){row.CreatedAt=update.CreatedAt}; if !update.ExpiresAt.IsZero(){row.ExpiresAt=timePtr(update.ExpiresAt)}; row.Version=version; q=tx.Model(&subjectFenceRow{}).Where("subject_key = ? AND scope = ? AND version = ?",update.SubjectKey,update.Scope,current).Updates(map[string]any{"version":row.Version,"purge_operation_id":row.PurgeOperationID,"created_at":row.CreatedAt,"expires_at":row.ExpiresAt}) }
-		if q.Error!=nil || (current != 0 && q.RowsAffected != 1){return ErrParticipantFailure};result.FenceKeys=append(result.FenceKeys,append([]byte(nil),update.SubjectKey...))
+		if err := participantCAS(tableSubjectFences, "<redacted>", update.ExpectedVersion, current, q); err != nil { return err };result.FenceKeys=append(result.FenceKeys,append([]byte(nil),update.SubjectKey...))
 	}
 	return nil
 }
