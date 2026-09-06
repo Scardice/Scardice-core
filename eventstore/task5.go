@@ -1376,7 +1376,7 @@ func (s *GORMStore) task5PersistExpiredArtifacts(ctx context.Context, work UnitO
 		if q.Error != nil {
 			return ErrParticipantFailure
 		}
-		if row.ExpiresAt.After(first.now) || (len(row.Ciphertext) == 0 && len(row.Nonce) == 0) {
+		if row.ExpiresAt.After(first.now) {
 			continue
 		}
 		version, versionErr := nextVersion(row.Version)
