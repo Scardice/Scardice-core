@@ -55,3 +55,23 @@ Follow-up implementation commit: `81b7a35f`.
 - Added regression tests for restrictive FKs, TLS downgrade/custom rejection, and mixed PostgreSQL host lists.
 
 Focused and package tests were rerun after these fixes and passed.
+
+## Review follow-up 2
+
+Follow-up implementation commit: `f04a6921`.
+
+- Disabled GORM automatic remote pings and MySQL version initialization before the explicitly bounded `PingContext`; schema migration, singleton initialization, and all runtime invariants use a bounded query context.
+- Parsed PostgreSQL URL query host overrides and keyword host lists; every effective host must be loopback or Unix, with mixed, fallback, and ambiguous whitespace forms rejected.
+- Added restrictive foreign keys for artifact-to-operation, operation-to-artifact, and subject-fence-to-purge-operation references, including orphan rejection/action tests.
+- Runtime schema validation now checks both required unique and required non-unique index semantics and every ordered composite column contract.
+- Added immediate single-writer contention and failed SQLite initialization/recovery tests.
+- Restricted MySQL TLS to the driver's certificate-verifying `tls=true` mode; `preferred`, `skip-verify`, and unregistered custom names fail closed.
+
+Final verification after this follow-up:
+
+```text
+go test ./eventstore -run 'TestOpenDatabase|TestEventStoreSchema|TestDatabaseClose'
+ok  Scardice-core/eventstore  0.033s
+go test ./eventstore
+ok  Scardice-core/eventstore  0.146s
+```
