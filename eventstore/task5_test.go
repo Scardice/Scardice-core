@@ -146,8 +146,8 @@ func TestOutboxLeaseDispatchCompletionAndStale(t *testing.T) {
 	if _, err := store.CompleteOutbox(context.Background(), completion); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CompleteOutbox(context.Background(), completion); err != nil {
-		t.Fatalf("idempotent completion: %v", err)
+	if _, err := store.CompleteOutbox(context.Background(), completion); !errors.Is(err, ErrStaleLease) {
+		t.Fatalf("terminal completion without active lease err=%v", err)
 	}
 	var row outboxEffectRow
 	if err := db.GORM().Where("effect_id = ?", "effect-1").First(&row).Error; err != nil {
@@ -616,11 +616,15 @@ func TestTask5StableDedupeAfterScrubAndLeaseRequiredTransitions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CompleteOutbox(ctx, OutboxCompletionRequest{EffectID: effect.EffectID, WorkerID: outboxLease.Effect.LeaseOwner, LeaseEpoch: outboxLease.Effect.LeaseEpoch, AttemptID: outboxLease.Effect.AttemptID, Status: OutboxStatusSucceeded, ResultCode: "ok"}); err != nil {
+	dispatched, err := store.MarkOutboxDispatched(ctx, OutboxDispatchRequest{EffectID: effect.EffectID, WorkerID: outboxLease.Effect.LeaseOwner, LeaseEpoch: outboxLease.Effect.LeaseEpoch, AttemptID: outboxLease.Effect.AttemptID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompleteOutbox(ctx, OutboxCompletionRequest{EffectID: effect.EffectID, WorkerID: outboxLease.Effect.LeaseOwner, LeaseEpoch: outboxLease.Effect.LeaseEpoch, AttemptID: dispatched.Effect.AttemptID, Status: OutboxStatusSucceeded, ResultCode: "ok"}); err != nil {
 		t.Fatal(err)
 	}
 	terminalEffectUpdate := effect
-	terminalEffectUpdate.ExpectedVersion = 3
+	terminalEffectUpdate.ExpectedVersion = 4
 	terminalEffectUpdate.Status = OutboxStatusSucceeded
 	terminalEffectUpdate.ResultCode = "rewritten"
 	if _, err := store.UpdateOutbox(ctx, terminalEffectUpdate); !errors.Is(err, ErrInvalidTransition) {
