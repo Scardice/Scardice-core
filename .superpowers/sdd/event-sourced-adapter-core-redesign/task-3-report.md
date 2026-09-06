@@ -41,21 +41,21 @@ Green focused race run:
 
 ```text
 go test -race ./eventstore -run 'TestCommit|TestMultiStreamConflict|TestLockOrder|TestRollback|TestChecksum' -count=1
-ok  Scardice-core/eventstore  1.157s
+ok  Scardice-core/eventstore  1.168s
 ```
 
 Green package run:
 
 ```text
 go test ./eventstore
-ok  Scardice-core/eventstore  0.216s
+ok  Scardice-core/eventstore  0.277s
 ```
 
 No formatter, linter, or project-wide test suite was run.
 
 ## Commit
 
-Implementation commit SHA: `9fc13ec5` (`eventstore: implement atomic unit of work commits`).
+Implementation commits: `9fc13ec5` (`eventstore: implement atomic unit of work commits`) and the scoped redaction hardening follow-up.
 The report is committed as the required Task 3 report follow-up on the same branch.
 
 - SQLite and GORM paths are covered locally. Remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available.
