@@ -252,3 +252,20 @@ ok  	Scardice-core/eventstore	0.177s
 ```
 
 Concern: remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available; all local migration, context, and index-owner paths are covered.
+
+## Final fixture-quality follow-up
+
+Implementation commit: `5a8f7ec3`.
+
+- Updated the subject-fence orphan regression to include its required non-null `version=1`, ensuring the assertion exercises the restrictive operation foreign key rather than a NOT NULL failure.
+
+Final uncached verification:
+
+```text
+go test -count=1 ./eventstore -run 'TestOpenDatabase|TestEventStoreSchema|TestDatabaseClose'
+ok  	Scardice-core/eventstore	0.045s
+go test -count=1 ./eventstore
+ok  	Scardice-core/eventstore	0.186s
+```
+
+Concern: remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available.
