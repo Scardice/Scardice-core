@@ -34,10 +34,10 @@ Exact required commands and results:
 
 ```text
 go test -race ./eventstore -run 'TestInbox|TestOutbox|TestArtifact|TestLane|TestLease|TestEffect|TestDedup' -count=1
-ok   Scardice-core/eventstore  1.380s
+ok   Scardice-core/eventstore  1.419s
 
 go test -count=1 ./eventstore
-ok   Scardice-core/eventstore  0.739s
+ok   Scardice-core/eventstore  0.727s
 ```
 
 The commands were rerun after the final source/test commits and included the Task5 tests whose names match the required filters. No formatter, linter, or project-wide suite was run.
@@ -47,7 +47,8 @@ The commands were rerun after the final source/test commits and included the Tas
 - Implementation and tests: `0470750b` (`eventstore: add ordered inbox outbox and artifacts`)
 - Lease/completion and scrub hardening: `19330c86`, `ab3a177f`
 - Participant bypass closure, strict UoW invariants, TTL/expiry scrub coverage: `b0fd9b28`, `a276823a`
-- Strict ingress, dedupe conflict, canonical lane ordering, artifact ownership/status/TTL, and participant contract hardening: `2828cb0`
+- Strict ingress, dedupe conflict, canonical lane ordering, artifact ownership/status/TTL, and participant contract hardening: `2828cb0c`
+- Lease lifecycle guard requiring identity for generic leased updates: `87de65fa`
 ## Limitation
 
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
