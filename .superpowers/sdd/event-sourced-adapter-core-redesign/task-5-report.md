@@ -50,6 +50,7 @@ The commands were rerun after the final source/test commits and included the Tas
 - Lease lifecycle guard requiring identity for generic leased updates: `87de65fa`
 - Final Task5 bypass/expiry/codec/terminal-idempotence hardening: `caf959fe`.
 - Expiry observation ordering, conflict-safe effect insertion, artifact compensation/bounds, and strict completion contract: `f24a93a2`.
+- Artifact compensation status compatibility and report refresh: `0da12e1c`.
 - Stale-version expiry precedence across public/UoW/resolution paths and regression coverage: `ea42b89d`.
 - Dispatched outbox update expiry scrub and regression coverage: `6830225f`.
 ## Limitation
