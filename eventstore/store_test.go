@@ -1,0 +1,104 @@
+package eventstore
+
+import (
+	"context"
+	"errors"
+	"path/filepath"
+	"testing"
+)
+
+func TestCommitMultiStreamContiguousPositions(t *testing.T) {
+	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "events.db")})
+	if err != nil { t.Fatal(err) }
+	defer db.Close()
+	store := NewStore(db)
+	work := UnitOfWork{Streams: []StreamAppend{
+		{Stream: StreamID{AggregateType: "z", AggregateID: "1"}, Events: []NewEvent{{EventType: "a", SchemaVersion: 1, Payload: []byte(`{"n":1}`), Metadata: Metadata{EventID: "e1", CommandID: "c1", CorrelationID: "r1", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}}}},
+		{Stream: StreamID{AggregateType: "a", AggregateID: "1"}, Events: []NewEvent{{EventType: "b", SchemaVersion: 1, Payload: []byte(`{"n":2}`), Metadata: Metadata{EventID: "e2", CommandID: "c2", CorrelationID: "r2", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}}}},
+	}}
+	result, err := store.Commit(context.Background(), work)
+	if err != nil { t.Fatal(err) }
+	if len(result.Events) != 2 || result.Events[0].GlobalPosition != 1 || result.Events[1].GlobalPosition != 2 { t.Fatalf("events = %#v", result.Events) }
+	if result.Events[0].Stream != work.Streams[0].Stream || result.Events[1].Stream != work.Streams[1].Stream { t.Fatalf("caller order not preserved: %#v", result.Events) }
+}
+
+func TestCommitRejectsEmptyWork(t *testing.T) {
+	if err := ValidateUnitOfWork(UnitOfWork{}); !errors.Is(err, ErrEmptyUnitOfWork) { t.Fatalf("err = %v", err) }
+}
+
+func testStore(t *testing.T) (*GORMStore, *Database) {
+	t.Helper()
+	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "events.db")})
+	if err != nil { t.Fatal(err) }
+	return NewStore(db), db
+}
+
+func testEvent(id string) NewEvent {
+	return NewEvent{EventType: "changed", SchemaVersion: 1, Payload: []byte(`{"value":1}`), Metadata: Metadata{EventID:id, CommandID:"cmd-"+id, CorrelationID:"corr-"+id, OccurredAtUnixNanoUTC:1, OccurredAtUnixNanoSet:true}}
+}
+
+func TestMultiStreamConflictReturnsCompleteSet(t *testing.T) {
+	store, db := testStore(t); defer db.Close()
+	first := UnitOfWork{Streams: []StreamAppend{{Stream:StreamID{"a","1"}, Events:[]NewEvent{testEvent("c1")}}, {Stream:StreamID{"b","1"}, Events:[]NewEvent{testEvent("c2")}}}}
+	if _, err := store.Commit(context.Background(), first); err != nil { t.Fatal(err) }
+	_, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream:StreamID{"a","1"}, ExpectedVersion:0, Events:[]NewEvent{testEvent("c3")}}, {Stream:StreamID{"b","1"}, ExpectedVersion:0, Events:[]NewEvent{testEvent("c4")}}}})
+	var conflict *ConflictError
+	if !errors.As(err, &conflict) || len(conflict.Conflicts) != 2 { t.Fatalf("err = %#v", err) }
+}
+
+func TestLockOrderAndZeroStreamParticipant(t *testing.T) {
+	store, db := testStore(t); defer db.Close()
+	var locks []string
+	store.SetLockObserver(func(name string) { locks = append(locks, name) })
+	if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream:StreamID{"z","1"}, Events:[]NewEvent{testEvent("l1")}}, {Stream:StreamID{"a","1"}, Events:[]NewEvent{testEvent("l2")}}}}); err != nil { t.Fatal(err) }
+	if len(locks) < 3 || locks[0] != tableProjectionControl || locks[len(locks)-1] != tableEventGlobalSequence { t.Fatalf("lock order = %#v", locks) }
+	locks = nil
+	if _, err := store.Commit(context.Background(), UnitOfWork{PluginKVUpdates: []PluginKVUpdate{{ExtensionID:"ext",KeyHMAC:[]byte("key"),KeyCiphertext:[]byte("k"),ValueCiphertext:[]byte("v")}}}); err != nil { t.Fatal(err) }
+	for _, lock := range locks { if lock == tableEventGlobalSequence { t.Fatal("zero-event participant advanced global sequence") } }
+}
+
+func TestRollbackAfterProjectorFailure(t *testing.T) {
+	store, db := testStore(t); defer db.Close()
+	store.RegisterProjector(func(context.Context, []Envelope) error { return errors.New("opaque projector failure") })
+	_, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream:StreamID{"a","1"}, Events:[]NewEvent{testEvent("rb1")}}}})
+	if !errors.Is(err, ErrProjectorFailure) { t.Fatalf("err = %v", err) }
+	var events int64
+	if err := db.GORM().Model(&domainEventRow{}).Count(&events).Error; err != nil { t.Fatal(err) }
+	if events != 0 { t.Fatalf("events after rollback = %d", events) }
+}
+
+func TestChecksumVerificationOnLoad(t *testing.T) {
+	store, db := testStore(t); defer db.Close()
+	if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream:StreamID{"a","1"}, Events:[]NewEvent{testEvent("sum1")}}}}); err != nil { t.Fatal(err) }
+	if err := db.GORM().Model(&domainEventRow{}).Where("event_id = ?", "sum1").Update("payload", []byte("tampered")).Error; err != nil { t.Fatal(err) }
+	_, err := store.Load(context.Background(), StreamID{"a","1"}, 1)
+	if !errors.Is(err, ErrChecksumMismatch) { t.Fatalf("err = %v", err) }
+}
+
+func TestCommitConcurrentWritersNoDeadlock(t *testing.T) {
+	store, db := testStore(t); defer db.Close()
+	left := UnitOfWork{Streams: []StreamAppend{{Stream:StreamID{"a","1"}, Events:[]NewEvent{testEvent("cw1")}}, {Stream:StreamID{"b","1"}, Events:[]NewEvent{testEvent("cw2")}}}}
+	right := UnitOfWork{Streams: []StreamAppend{{Stream:StreamID{"b","1"}, Events:[]NewEvent{testEvent("cw3")}}, {Stream:StreamID{"a","1"}, Events:[]NewEvent{testEvent("cw4")}}}}
+	results := make(chan error, 2)
+	go func(){ _, err := store.Commit(context.Background(), left); results <- err }()
+	go func(){ _, err := store.Commit(context.Background(), right); results <- err }()
+	var committed, conflicts int
+	for range 2 { if err := <-results; err == nil { committed++ } else if errors.Is(err, ErrConflict) { conflicts++ } else { t.Fatalf("writer err = %v", err) } }
+	if committed != 1 || conflicts != 1 { t.Fatalf("committed=%d conflicts=%d", committed, conflicts) }
+}
+
+func TestZeroStreamParticipantUpdates(t *testing.T) {
+	store, db := testStore(t); defer db.Close()
+	work := UnitOfWork{
+		Operations: []OperationUpdate{{OperationID:"op-zero", PrincipalID:"p-zero"}},
+		ArtifactUpdates: []ArtifactUpdate{{ArtifactID:"art-zero", OperationID:"op-zero", Ciphertext:[]byte("cipher")}},
+		SecretUpdates: []SecretUpdate{{SecretRef:"secret-zero", Ciphertext:[]byte("secret"), Nonce:[]byte("nonce")}},
+		PluginKVUpdates: []PluginKVUpdate{{ExtensionID:"plugin-zero", KeyHMAC:[]byte("key-zero"), KeyCiphertext:[]byte("key"), ValueCiphertext:[]byte("value")}},
+	}
+	result, err := store.Commit(context.Background(), work)
+	if err != nil { t.Fatal(err) }
+	if len(result.Events) != 0 || len(result.ArtifactIDs) != 1 || len(result.SecretRefs) != 1 || len(result.PluginKVIndexes) != 1 { t.Fatalf("result = %#v", result) }
+	var sequence eventGlobalSequenceRow
+	if err := db.GORM().First(&sequence).Error; err != nil { t.Fatal(err) }
+	if sequence.NextPosition != 1 { t.Fatalf("sequence advanced to %d", sequence.NextPosition) }
+}
