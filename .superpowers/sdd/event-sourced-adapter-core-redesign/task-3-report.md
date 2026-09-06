@@ -41,7 +41,7 @@ Green focused race run:
 
 ```text
 go test -race ./eventstore -run 'TestCommit|TestMultiStreamConflict|TestLockOrder|TestRollback|TestChecksum' -count=1
-ok  Scardice-core/eventstore  1.192s
+ok  Scardice-core/eventstore  1.197s
 ```
 
 Green package run:
@@ -55,7 +55,7 @@ No formatter, linter, or project-wide test suite was run.
 
 ## Commit
 
-Implementation commits: `9fc13ec5` (atomic UnitOfWork), `636ff72f` (redacted participant keys), `89426b55` (artifact CAS persistence), `b32a9be6` (locks/transaction-only hooks/participant CAS), `cb355ca1` (sparse preservation/history/delete), `17ce7d0d` (validation/fence/hook evidence), `a896bcbd` (delete result consistency), `2812e553` (plugin update results), `ffc6cfd1` (participant order/typed-store/sparse inbox-effect/encoded-size).
+Implementation commits: `9fc13ec5` (atomic UnitOfWork), `636ff72f` (redacted participant keys), `89426b55` (artifact CAS persistence), `b32a9be6` (locks/transaction-only hooks/participant CAS), `cb355ca1` (sparse preservation/history/delete), `17ce7d0d` (validation/fence/hook evidence), `a896bcbd` (delete result consistency), `2812e553` (plugin update results), `ffc6cfd1` (participant order/typed-store/sparse inbox-effect/encoded-size), `ed03ae73` (overflow-safe field accounting).
 Additional focused regression: `go test -race ./eventstore -run 'TestZeroStream|TestParticipantConflict' -count=1` → `ok Scardice-core/eventstore 1.073s`.
 
 - SQLite and GORM paths are covered locally. Remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available.
