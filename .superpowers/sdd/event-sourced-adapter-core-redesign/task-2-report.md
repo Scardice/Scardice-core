@@ -90,3 +90,21 @@ ok  Scardice-core/eventstore  0.041s
 go test ./eventstore
 ok  Scardice-core/eventstore  (cached)
 ```
+
+## Review follow-up 3
+
+Follow-up implementation commit: `ced22571`.
+
+- Restored `domain_events.payload` as a required native `[]byte` column with a 256 KiB size declaration; the SQLite schema test asserts its presence, native blob type, and non-null contract.
+- Rejected duplicate MySQL `tls` keys, duplicate PostgreSQL URL/keyword `sslmode` keys, duplicate keyword hosts, and ambiguous effective settings.
+- Split PostgreSQL URL-query host lists on commas before loopback/Unix validation; mixed remote hosts reject while all-loopback lists pass.
+- Kept MySQL acceptance to the driver's built-in certificate-verifying `tls=true` mode.
+
+Final uncached verification:
+
+```text
+go test -count=1 ./eventstore -run 'TestOpenDatabase|TestEventStoreSchema|TestDatabaseClose'
+ok  Scardice-core/eventstore  0.038s
+go test -count=1 ./eventstore
+ok  Scardice-core/eventstore  0.151s
+```
