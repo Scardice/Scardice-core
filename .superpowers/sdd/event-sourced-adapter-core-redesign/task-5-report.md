@@ -46,7 +46,7 @@ The commands were rerun after the final source/test commits and included the Tas
 
 - Implementation and tests: `0470750b` (`eventstore: add ordered inbox outbox and artifacts`)
 - Lease/completion and scrub hardening: `19330c86`, `ab3a177f`
-- Participant bypass closure, strict UoW invariants, TTL/expiry scrub coverage: `b0fd9b28`
+- Participant bypass closure, strict UoW invariants, TTL/expiry scrub coverage: `b0fd9b28`, `a276823a`
 
 ## Limitation
 
