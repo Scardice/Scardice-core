@@ -150,7 +150,8 @@ type operationRow struct {
 	CorrelationID     string     `gorm:"type:varchar(255)"`
 	ResultCode        string     `gorm:"type:varchar(255)"`
 	ErrorCode         string     `gorm:"type:varchar(255)"`
-	ArtifactRef string     `gorm:"column:artifact_id;type:varchar(255)"`
+	ArtifactRef       string     `gorm:"column:artifact_id;type:varchar(255)"`
+	PrivateContext    []byte     `gorm:""`
 	PrivateNonce      []byte     `gorm:"size:12"`
 	PrivateKeyID      string     `gorm:"type:varchar(255)"`
 	CreatedAt         time.Time  `gorm:"not null"`
@@ -166,6 +167,7 @@ type operationArtifactRow struct {
 	OwnerPrincipalID string `gorm:"type:varchar(255);not null"`
 	MediaType    string     `gorm:"type:varchar(255);not null"`
 	SafeFilename string     `gorm:"type:varchar(255)"`
+	Size         int64      `gorm:"not null"`
 	Status       string     `gorm:"type:varchar(32);not null"`
 	Operation    *operationRow `gorm:"foreignKey:OperationID;references:OperationID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT;"`
 	Ciphertext   []byte     `gorm:""`

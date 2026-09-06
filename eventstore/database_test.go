@@ -410,3 +410,21 @@ func TestOperationArtifactForeignKeysAllowNullableFirstLinking(t *testing.T) {
 		t.Fatal("operation delete bypassed restrictive artifact reference")
 	}
 }
+
+func TestEventStoreSensitiveSchemaColumns(t *testing.T) {
+	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "events.db")})
+	if err != nil {
+		t.Fatalf("open sqlite database: %v", err)
+	}
+	defer db.Close()
+	assertSQLiteColumn(t, db, tableOperations, "private_context")
+	assertSQLiteColumn(t, db, tableOperationArtifacts, "size")
+}
+
+func assertSQLiteColumn(t *testing.T, db *Database, table, column string) {
+	t.Helper()
+	var name string
+	if err := db.SQLDB().QueryRowContext(context.Background(), "SELECT name FROM pragma_table_info(?) WHERE name = ?", table, column).Scan(&name); err != nil {
+		t.Fatalf("missing %s.%s: %v", table, column, err)
+	}
+}
