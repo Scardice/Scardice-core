@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	mysqlDriver "github.com/go-sql-driver/mysql"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
@@ -322,24 +323,26 @@ func validKeywordDSN(dsn string) bool {
 
 func isLoopbackOrUnixDSN(dbType, dsn string) bool {
 	if dbType == "mysql" {
-		lower := strings.ToLower(dsn)
-		if strings.Contains(lower, "@unix(") {
-			return true
+		cfg, err := mysqlDriver.ParseDSN(dsn)
+		if err != nil {
+			return false
 		}
-		if start := strings.Index(lower, "@tcp("); start >= 0 {
-			end := strings.IndexByte(lower[start+len("@tcp("):], ')')
-			if end < 0 {
-				return false
-			}
-			hostPort := dsn[start+len("@tcp(") : start+len("@tcp(")+end]
-			host, _, err := net.SplitHostPort(hostPort)
+		switch cfg.Net {
+		case "unix":
+			return cfg.Addr != ""
+		case "tcp":
+			host, _, err := net.SplitHostPort(cfg.Addr)
 			if err != nil {
-				host = hostPort
+				host = cfg.Addr
+			}
+			if host == "" {
+				return false
 			}
 			ip := net.ParseIP(host)
 			return host == "localhost" || (ip != nil && ip.IsLoopback())
+		default:
+			return false
 		}
-		return false
 	}
 	if strings.Contains(dsn, "://") {
 		if strings.ContainsAny(dsn, " \t\r\n") {
@@ -401,28 +404,155 @@ func allLoopbackOrUnixHosts(hosts []string) bool {
 func safeDatabaseError(operation, dbType string, _ error) error {
 	return fmt.Errorf("event database %s failed for %s", operation, dbType)
 }
+const sqliteOperationArtifactsDDL = `CREATE TABLE operation_artifacts (
+	artifact_id TEXT NOT NULL PRIMARY KEY,
+	version INTEGER NOT NULL,
+	operation_id TEXT NOT NULL,
+	owner_principal_id TEXT NOT NULL,
+	media_type TEXT NOT NULL,
+	safe_filename TEXT,
+	size INTEGER NOT NULL,
+	status TEXT NOT NULL,
+	ciphertext BLOB,
+	nonce BLOB,
+	encryption_key_id TEXT,
+	expires_at DATETIME NOT NULL,
+	consumed_at DATETIME,
+	FOREIGN KEY(operation_id) REFERENCES operations(operation_id) ON UPDATE RESTRICT ON DELETE RESTRICT
+)`
+
+func ensureSQLiteOperationArtifacts(db *gorm.DB) error {
+	sqlDB, err := db.DB()
+	if err != nil {
+		return err
+	}
+	var tableName string
+	err = sqlDB.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'operation_artifacts'`).Scan(&tableName)
+	if errors.Is(err, sql.ErrNoRows) {
+		_, err = sqlDB.Exec(sqliteOperationArtifactsDDL)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+
+	type columnInfo struct{ notNull int }
+	columns := make(map[string]columnInfo)
+	rows, err := sqlDB.Query(`SELECT name, "notnull" FROM pragma_table_info('operation_artifacts')`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var name string
+		var notNull int
+		if err := rows.Scan(&name, &notNull); err != nil {
+			rows.Close()
+			return err
+		}
+		columns[name] = columnInfo{notNull: notNull}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	required := []string{"artifact_id", "operation_id", "owner_principal_id", "media_type", "safe_filename", "size", "status", "ciphertext", "nonce", "encryption_key_id", "expires_at", "consumed_at"}
+	for _, column := range required {
+		if _, ok := columns[column]; !ok {
+			return fmt.Errorf("SQLite operation_artifacts schema is missing %s", column)
+		}
+	}
+	versionPresent := false
+	versionNotNull := false
+	if info, ok := columns["version"]; ok {
+		versionPresent = true
+		versionNotNull = info.notNull == 1
+	}
+
+	fkReady := false
+	fkRows, err := sqlDB.Query(`SELECT "table", "from", "to", on_update, on_delete FROM pragma_foreign_key_list('operation_artifacts')`)
+	if err != nil {
+		return err
+	}
+	for fkRows.Next() {
+		var table, from, to, onUpdate, onDelete string
+		if err := fkRows.Scan(&table, &from, &to, &onUpdate, &onDelete); err != nil {
+			fkRows.Close()
+			return err
+		}
+		if table == tableOperations && from == "operation_id" && to == "operation_id" &&
+			strings.EqualFold(onUpdate, "RESTRICT") && strings.EqualFold(onDelete, "RESTRICT") {
+			fkReady = true
+		}
+	}
+	if err := fkRows.Err(); err != nil {
+		fkRows.Close()
+		return err
+	}
+	fkRows.Close()
+	if versionPresent && versionNotNull && fkReady {
+		return nil
+	}
+
+	if versionPresent && !versionNotNull {
+		var nullVersions int
+		if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM operation_artifacts WHERE version IS NULL`).Scan(&nullVersions); err != nil {
+			return err
+		}
+		if nullVersions != 0 {
+			return fmt.Errorf("SQLite operation_artifacts contains NULL versions")
+		}
+	}
+	var orphanCount int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM operation_artifacts AS a LEFT JOIN operations AS o ON o.operation_id = a.operation_id WHERE o.operation_id IS NULL`).Scan(&orphanCount); err != nil {
+		return err
+	}
+	if orphanCount != 0 {
+		return fmt.Errorf("SQLite operation_artifacts contains orphan operation references")
+	}
+
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	rollback := func(cause error) error {
+		_ = tx.Rollback().Error
+		return cause
+	}
+	if err := tx.Exec(`ALTER TABLE operation_artifacts RENAME TO operation_artifacts_legacy`).Error; err != nil {
+		return rollback(err)
+	}
+	if err := tx.Exec(sqliteOperationArtifactsDDL).Error; err != nil {
+		return rollback(err)
+	}
+	selectColumns := make([]string, 0, len(required)+1)
+	for _, column := range required {
+		selectColumns = append(selectColumns, `"`+column+`"`)
+	}
+	if versionPresent {
+		selectColumns = append([]string{`"version"`}, selectColumns...)
+	} else {
+		selectColumns = append([]string{"1"}, selectColumns...)
+	}
+	if err := tx.Exec(`INSERT INTO operation_artifacts (`+strings.Join(append([]string{"version"}, required...), ", ")+`) SELECT `+strings.Join(selectColumns, ", ")+` FROM operation_artifacts_legacy`).Error; err != nil {
+		return rollback(err)
+	}
+	if err := tx.Exec(`DROP TABLE operation_artifacts_legacy`).Error; err != nil {
+		return rollback(err)
+	}
+	if err := tx.Commit().Error; err != nil {
+		return err
+	}
+	return nil
+}
 
 func migrateSchema(db *gorm.DB) error {
 	if db.Dialector.Name() == "sqlite" {
 		if err := db.AutoMigrate(&operationRow{}); err != nil {
 			return err
 		}
-		if err := db.Exec(`CREATE TABLE IF NOT EXISTS operation_artifacts (
-			artifact_id TEXT NOT NULL PRIMARY KEY,
-			version INTEGER NOT NULL,
-			operation_id TEXT NOT NULL,
-			owner_principal_id TEXT NOT NULL,
-			media_type TEXT NOT NULL,
-			safe_filename TEXT,
-			size INTEGER NOT NULL,
-			status TEXT NOT NULL,
-			ciphertext BLOB,
-			nonce BLOB,
-			encryption_key_id TEXT,
-			expires_at DATETIME NOT NULL,
-			consumed_at DATETIME,
-			FOREIGN KEY(operation_id) REFERENCES operations(operation_id) ON UPDATE RESTRICT ON DELETE RESTRICT
-		)`).Error; err != nil {
+		if err := ensureSQLiteOperationArtifacts(db); err != nil {
 			return err
 		}
 	}

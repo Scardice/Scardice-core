@@ -8,8 +8,10 @@ import (
 	"strings"
 	"testing"
 	"time"
-)
 
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+)
 func TestOpenDatabaseSQLiteEffectiveSettings(t *testing.T) {
 	datadir := t.TempDir()
 	t.Setenv("DATADIR", datadir)
@@ -199,7 +201,7 @@ func TestEventStoreSchemaForeignKeys(t *testing.T) {
 	if !strings.EqualFold(onUpdate, "RESTRICT") {
 		t.Fatalf("artifact operation foreign key on_update = %q, want RESTRICT", onUpdate)
 	}
-	_, err = db.SQLDB().ExecContext(context.Background(), `INSERT INTO operation_artifacts (artifact_id, operation_id, owner_principal_id, media_type, size, status, expires_at) VALUES ('artifact', 'missing-operation', 'owner', 'text/plain', 0, 'available', CURRENT_TIMESTAMP)`)
+	_, err = db.SQLDB().ExecContext(context.Background(), `INSERT INTO operation_artifacts (artifact_id, version, operation_id, owner_principal_id, media_type, size, status, expires_at) VALUES ('artifact', 1, 'missing-operation', 'owner', 'text/plain', 0, 'available', CURRENT_TIMESTAMP)`)
 	if err == nil {
 		t.Fatal("orphan operation artifact insert succeeded")
 	}
@@ -245,7 +247,7 @@ func TestEventStoreSchemaHasAllRestrictiveForeignKeys(t *testing.T) {
 
 	assertForeignKeyAction(t, db, "operation_artifacts", "operations", "RESTRICT")
 	assertForeignKeyAction(t, db, "subject_fences", "operations", "RESTRICT")
-	if _, err := db.SQLDB().ExecContext(context.Background(), `INSERT INTO operation_artifacts (artifact_id, operation_id, owner_principal_id, media_type, size, status, expires_at) VALUES ('orphan-artifact', 'missing-operation', 'owner', 'text/plain', 0, 'available', CURRENT_TIMESTAMP)`); err == nil {
+	if _, err := db.SQLDB().ExecContext(context.Background(), `INSERT INTO operation_artifacts (artifact_id, version, operation_id, owner_principal_id, media_type, size, status, expires_at) VALUES ('orphan-artifact', 1, 'missing-operation', 'owner', 'text/plain', 0, 'available', CURRENT_TIMESTAMP)`); err == nil {
 		t.Fatal("orphan operation artifact reference insert succeeded")
 	}
 	if _, err := db.SQLDB().ExecContext(context.Background(), `INSERT INTO subject_fences (subject_key, scope, purge_operation_id, created_at) VALUES (x'01', 'subject', 'missing-operation', CURRENT_TIMESTAMP)`); err == nil {
@@ -373,6 +375,12 @@ func TestDatabaseTLSAndHostDuplicateSettingsFailClosed(t *testing.T) {
 	if isLoopbackOrUnixDSN("postgres", "postgres://localhost/events host=evil.example") {
 		t.Fatal("URL DSN with keyword host fragment accepted")
 	}
+	if isLoopbackOrUnixDSN("mysql", "user:pass@tcp(evil.example:3306)/events?marker=@unix(/tmp/mysql.sock)") {
+		t.Fatal("MySQL DSN marker text incorrectly qualified as loopback")
+	}
+	if !isLoopbackOrUnixDSN("mysql", "user:pass@tcp(127.0.0.1:3306)/events") {
+		t.Fatal("loopback MySQL TCP DSN rejected")
+	}
 }
 func TestEventStoreDomainEventMetadataColumns(t *testing.T) {
 	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "events.db")})
@@ -439,6 +447,99 @@ func TestEventStoreSensitiveSchemaColumns(t *testing.T) {
 		}
 	}
 
+}
+func TestSQLiteLegacyOperationArtifactsUpgrade(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	legacy, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open legacy sqlite database: %v", err)
+	}
+	if err := legacy.AutoMigrate(&operationRow{}); err != nil {
+		t.Fatalf("create legacy operations table: %v", err)
+	}
+	if err := legacy.Exec(`CREATE TABLE operation_artifacts (
+		artifact_id TEXT NOT NULL PRIMARY KEY,
+		operation_id TEXT NOT NULL,
+		owner_principal_id TEXT NOT NULL,
+		media_type TEXT NOT NULL,
+		safe_filename TEXT,
+		size INTEGER NOT NULL,
+		status TEXT NOT NULL,
+		ciphertext BLOB,
+		nonce BLOB,
+		encryption_key_id TEXT,
+		expires_at DATETIME NOT NULL,
+		consumed_at DATETIME
+	)`).Error; err != nil {
+		t.Fatalf("create legacy artifact table: %v", err)
+	}
+	if err := legacy.Exec(`INSERT INTO operations (operation_id, version, status, kind, principal_id, idempotency_scope, idempotency_key, created_at, updated_at) VALUES ('legacy-op', 1, 'pending', 'test', 'principal', 'scope', 'legacy-key', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`).Error; err != nil {
+		t.Fatalf("insert legacy operation: %v", err)
+	}
+	if err := legacy.Exec(`INSERT INTO operation_artifacts (artifact_id, operation_id, owner_principal_id, media_type, size, status, expires_at) VALUES ('legacy-artifact', 'legacy-op', 'principal', 'text/plain', 7, 'available', CURRENT_TIMESTAMP)`).Error; err != nil {
+		t.Fatalf("insert legacy artifact: %v", err)
+	}
+	legacySQL, err := legacy.DB()
+	if err != nil {
+		t.Fatalf("get legacy sql database: %v", err)
+	}
+	if err := legacySQL.Close(); err != nil {
+		t.Fatalf("close legacy sqlite database: %v", err)
+	}
+
+	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: path})
+	if err != nil {
+		t.Fatalf("upgrade legacy sqlite database: %v", err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.SQLDB().QueryRowContext(context.Background(), `SELECT version FROM operation_artifacts WHERE artifact_id = 'legacy-artifact'`).Scan(&version); err != nil {
+		t.Fatalf("read upgraded artifact version: %v", err)
+	}
+	if version != 1 {
+		t.Fatalf("upgraded artifact version = %d, want 1", version)
+	}
+	assertForeignKeyAction(t, db, "operation_artifacts", "operations", "RESTRICT")
+	if _, err := db.SQLDB().ExecContext(context.Background(), `INSERT INTO operation_artifacts (artifact_id, version, operation_id, owner_principal_id, media_type, size, status, expires_at) VALUES ('legacy-orphan', 1, 'missing-operation', 'principal', 'text/plain', 0, 'available', CURRENT_TIMESTAMP)`); err == nil {
+		t.Fatal("upgraded artifact table accepted orphan operation reference")
+	}
+	orphanPath := filepath.Join(t.TempDir(), "legacy-orphan.db")
+	orphanLegacy, err := gorm.Open(sqlite.Open(orphanPath), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open orphan legacy sqlite database: %v", err)
+	}
+	if err := orphanLegacy.AutoMigrate(&operationRow{}); err != nil {
+		t.Fatalf("create orphan legacy operations table: %v", err)
+	}
+	if err := orphanLegacy.Exec(`CREATE TABLE operation_artifacts (
+		artifact_id TEXT NOT NULL PRIMARY KEY,
+		operation_id TEXT NOT NULL,
+		owner_principal_id TEXT NOT NULL,
+		media_type TEXT NOT NULL,
+		safe_filename TEXT,
+		size INTEGER NOT NULL,
+		status TEXT NOT NULL,
+		ciphertext BLOB,
+		nonce BLOB,
+		encryption_key_id TEXT,
+		expires_at DATETIME NOT NULL,
+		consumed_at DATETIME
+	)`).Error; err != nil {
+		t.Fatalf("create orphan legacy artifact table: %v", err)
+	}
+	if err := orphanLegacy.Exec(`INSERT INTO operation_artifacts (artifact_id, operation_id, owner_principal_id, media_type, size, status, expires_at) VALUES ('orphan-artifact', 'missing-operation', 'principal', 'text/plain', 0, 'available', CURRENT_TIMESTAMP)`).Error; err != nil {
+		t.Fatalf("insert orphan legacy artifact: %v", err)
+	}
+	orphanSQL, err := orphanLegacy.DB()
+	if err != nil {
+		t.Fatalf("get orphan legacy sql database: %v", err)
+	}
+	if err := orphanSQL.Close(); err != nil {
+		t.Fatalf("close orphan legacy sqlite database: %v", err)
+	}
+	if _, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: orphanPath}); err == nil {
+		t.Fatal("legacy orphan artifact database opened successfully")
+	}
 }
 func assertSQLiteColumn(t *testing.T, db *Database, table, column string) {
 	t.Helper()
