@@ -8,7 +8,7 @@ Implemented and committed A3 projection behavior in `eventstore` only.
 - `eventstore/store.go`: store-local stable projector descriptors and deterministic name ordering; backward-compatible A2 callback registration kept out of A3 rebuilds; synchronous live projector application in the existing UnitOfWork transaction; active-generation context and terminal-position/projector-set control updates; observable constructor-option errors; callback execution outside the registry lock with a commit-time registry fence.
 - `eventstore/projection.go`: generation-aware projection row helper/reader, canonical SHA-256 digest, keyset event scanning, checksum/schema/envelope/global-position invariant validation, shadow generation rebuild, catch-up, registry-change fencing, publication fence, and generation publication.
 - `eventstore/schema.go`, `eventstore/database_test.go`: nullable event/projection payload columns and migrated schema assertion to preserve nil-vs-empty payload semantics.
-- `eventstore/projection_test.go`: registration/version/alias validation, option failures, set identity/collision coverage, live write/rollback, 1,024-event rebuild with 1,000/24 keyset pages and empty payload, concurrent commit catch-up, registry-change refusal, checksum/schema/malformed-row/global-position refusal, generation-independent digest ordering, empty rebuild, and active-generation reader coverage.
+- `eventstore/projection_test.go`: registration/version/alias validation, option failures, set identity/collision coverage, live write/rollback, 1,024-event rebuild with 1,000/24 keyset pages and empty payload, concurrent commit catch-up, stable and legacy registry-change refusal, checksum/schema/malformed-row/global-position refusal, generation-independent digest ordering, empty rebuild, and active-generation reader coverage.
 
 ## Registration/version contract
 
@@ -49,20 +49,20 @@ Green focused race validation:
 
 ```text
 go test -race ./eventstore -run 'TestProjection|TestRebuild|TestDigest|TestProjector|TestGeneration'
-ok  	Scardice-core/eventstore  2.148s
+ok  	Scardice-core/eventstore  2.209s
 ```
 
 Green package validation:
 
 ```text
 go test ./eventstore
-ok  	Scardice-core/eventstore  0.599s
+ok  	Scardice-core/eventstore  0.573s
 ```
 
 No formatter, linter, or project-wide suite was run.
 
 ## Commit
-Implementation commits: `a1ee6229` (initial projection implementation), `6b2f4866` (projector version validation), `ed920afc` (registry fencing, canonical set identity, envelope validation, nil/empty payload preservation, deterministic digest ordering, option-error propagation, and concurrency/edge-case tests), `d1d56f87` (unsupported-schema sentinel compatibility), and `e4d6415d` (reentrant projector fencing, nullable payload schema, global-position continuity validation, and migrated tests).
+Implementation commits: `a1ee6229` (initial projection implementation), `6b2f4866` (projector version validation), `ed920afc` (registry fencing, canonical set identity, envelope validation, nil/empty payload preservation, deterministic digest ordering, option-error propagation, and concurrency/edge-case tests), `d1d56f87` (unsupported-schema sentinel compatibility), `e4d6415d` (reentrant projector fencing, nullable payload schema, global-position continuity validation, and migrated tests), and `cdec32ca` (full-registry publication fencing and concurrent legacy-registration regression).
 
 ## Concerns
 
