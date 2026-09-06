@@ -458,6 +458,69 @@ func TestTask5ExpiredLeasedMutationScrubsBeforeStaleLease(t *testing.T) {
 		t.Fatal("expired outbox payload was not scrubbed")
 	}
 }
+func TestTask5ExpiredRowsPrecedeVersionConflicts(t *testing.T) {
+	store, db, clock := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	inbox := task5Inbox("expired-version-inbox", "expired-version-provider", "expired-version-inbox-lane")
+	inbox.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
+		t.Fatal(err)
+	}
+	effect := task5Effect("expired-version-effect", "expired-version-effect-lane")
+	effect.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
+		t.Fatal(err)
+	}
+	resolveInbox := task5Inbox("expired-version-resolve-inbox", "expired-version-resolve-provider", "expired-version-resolve-inbox-lane")
+	resolveInbox.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.AcceptInbox(ctx, resolveInbox); err != nil {
+		t.Fatal(err)
+	}
+	resolveEffect := task5Effect("expired-version-resolve-effect", "expired-version-resolve-effect-lane")
+	resolveEffect.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.AcceptOutbox(ctx, resolveEffect); err != nil {
+		t.Fatal(err)
+	}
+	uowInbox := task5Inbox("expired-version-uow-inbox", "expired-version-uow-provider", "expired-version-uow-inbox-lane")
+	uowInbox.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.AcceptInbox(ctx, uowInbox); err != nil {
+		t.Fatal(err)
+	}
+	uowEffect := task5Effect("expired-version-uow-effect", "expired-version-uow-effect-lane")
+	uowEffect.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.AcceptOutbox(ctx, uowEffect); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Minute)
+	if _, err := store.UpdateInbox(ctx, InboxUpdate{InboxID: inbox.InboxID, ExpectedVersion: 99, Status: InboxStatusPending}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("expired inbox version err = %v", err)
+	}
+	if _, err := store.UpdateOutbox(ctx, NewEffect{EffectID: effect.EffectID, ExpectedVersion: 99, Status: OutboxStatusPending}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("expired outbox version err = %v", err)
+	}
+	if _, err := store.ResolveInbox(ctx, InboxResolutionRequest{InboxID: resolveInbox.InboxID, ExpectedVersion: 99, Resolution: InboxResolutionRetry, PrincipalID: "operator", Reason: "expired"}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("expired inbox resolution version err = %v", err)
+	}
+	if _, err := store.ResolveOutbox(ctx, OutboxResolutionRequest{EffectID: resolveEffect.EffectID, ExpectedVersion: 99, Resolution: OutboxResolutionRetry, PrincipalID: "operator", Reason: "expired"}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("expired outbox resolution version err = %v", err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{{InboxID: uowInbox.InboxID, ExpectedVersion: 99, Status: InboxStatusPending}}}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("expired UoW inbox version err = %v", err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{EffectID: uowEffect.EffectID, ExpectedVersion: 99, Status: OutboxStatusPending}}}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("expired UoW outbox version err = %v", err)
+	}
+	for _, table := range []string{"inbox_messages", "outbox_effects"} {
+		var count int64
+		if err := db.GORM().Table(table).Where("(payload_ciphertext IS NOT NULL AND length(payload_ciphertext) > 0) OR (payload_nonce IS NOT NULL AND length(payload_nonce) > 0)").Count(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("expired %s payloads remain: %d", table, count)
+		}
+	}
+}
 
 func TestTask5OutboxAcceptanceDedupeDoesNotAdvanceLane(t *testing.T) {
 	store, db, _ := task5Store(t)

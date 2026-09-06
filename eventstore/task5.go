@@ -491,6 +491,16 @@ func (s *GORMStore) UpdateInbox(ctx context.Context, update InboxUpdate) (result
 	if q.Error != nil {
 		return CommitResult{}, errors.New("eventstore: load inbox failed")
 	}
+	now := s.task5Now()
+	if row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
+		if err = task5ScrubInbox(tx, &row, now, false); err != nil {
+			return CommitResult{}, err
+		}
+		if err = task5Commit(tx); err != nil {
+			return CommitResult{}, err
+		}
+		return CommitResult{}, ErrPayloadExpired
+	}
 	if update.ExpectedVersion != row.Version {
 		return CommitResult{}, participantConflict(tableInboxMessages)
 	}
@@ -505,16 +515,6 @@ func (s *GORMStore) UpdateInbox(ctx context.Context, update InboxUpdate) (result
 		!update.PayloadExpiresAt.IsZero() || update.WorkflowID != "" || !update.CallbackStartedAt.IsZero() || !update.CompletedAt.IsZero() ||
 		update.PrincipalID != "" || update.Reason != "" || !update.ResolutionAt.IsZero() {
 		return CommitResult{}, ErrInvalidTransition
-	}
-	now := s.task5Now()
-	if row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
-		if err = task5ScrubInbox(tx, &row, now, false); err != nil {
-			return CommitResult{}, err
-		}
-		if err = task5Commit(tx); err != nil {
-			return CommitResult{}, err
-		}
-		return CommitResult{}, ErrPayloadExpired
 	}
 	if update.Status != InboxStatusLeased && update.Status != InboxStatusCallbackStarted && row.Status != InboxStatusLeased && row.Status != InboxStatusCallbackStarted && (update.LeaseOwner != "" || update.LeaseEpoch != 0 || update.AttemptID != "" || !update.LeaseExpiresAt.IsZero()) {
 		return CommitResult{}, ErrStaleLease
@@ -608,6 +608,16 @@ func (s *GORMStore) resolveInboxTx(ctx context.Context, req InboxResolutionReque
 	if q.Error != nil {
 		return CommitResult{}, errors.New("eventstore: load inbox failed")
 	}
+	now := s.task5Now()
+	if inboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
+		if err = task5ScrubInbox(tx, &row, now, false); err != nil {
+			return CommitResult{}, err
+		}
+		if err = task5Commit(tx); err != nil {
+			return CommitResult{}, err
+		}
+		return CommitResult{}, ErrPayloadExpired
+	}
 	if req.ExpectedVersion != row.Version {
 		return CommitResult{}, participantConflict(tableInboxMessages)
 	}
@@ -617,7 +627,6 @@ func (s *GORMStore) resolveInboxTx(ctx context.Context, req InboxResolutionReque
 		}
 		return CommitResult{}, ErrInvalidTransition
 	}
-	now := s.task5Now()
 	if resolutionAt.IsZero() {
 		resolutionAt = now
 	}
@@ -906,6 +915,16 @@ func (s *GORMStore) UpdateOutbox(ctx context.Context, effect NewEffect) (result 
 	if q.Error != nil {
 		return CommitResult{}, errors.New("eventstore: load outbox failed")
 	}
+	now := s.task5Now()
+	if outboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
+		if err = task5ScrubOutbox(tx, &row, now); err != nil {
+			return CommitResult{}, err
+		}
+		if err = task5Commit(tx); err != nil {
+			return CommitResult{}, err
+		}
+		return CommitResult{}, ErrPayloadExpired
+	}
 	if effect.EndpointID != "" || len(effect.LaneHMAC) > 0 || effect.OrderingSequence != 0 ||
 		effect.EffectType != "" || len(effect.PayloadCiphertext) > 0 || len(effect.PayloadNonce) > 0 ||
 		len(effect.ContentDigest) > 0 || effect.DigestKeyID != "" || !effect.PayloadExpiresAt.IsZero() ||
@@ -933,16 +952,6 @@ func (s *GORMStore) UpdateOutbox(ctx context.Context, effect NewEffect) (result 
 	}
 	if effect.RiskClass != "" && effect.RiskClass != row.RiskClass {
 		return CommitResult{}, ErrInvalidTransition
-	}
-	now := s.task5Now()
-	if row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
-		if err = task5ScrubOutbox(tx, &row, now); err != nil {
-			return CommitResult{}, err
-		}
-		if err = task5Commit(tx); err != nil {
-			return CommitResult{}, err
-		}
-		return CommitResult{}, ErrPayloadExpired
 	}
 	leaseState := row.Status == OutboxStatusLeased || row.Status == OutboxStatusDispatched
 	leaseFields := effect.LeaseOwner != "" || effect.LeaseEpoch != 0 || effect.AttemptID != "" || !effect.LeaseExpiresAt.IsZero()
@@ -1227,6 +1236,16 @@ func (s *GORMStore) ResolveOutbox(ctx context.Context, req OutboxResolutionReque
 	if q.Error != nil {
 		return CommitResult{}, errors.New("eventstore: load outbox failed")
 	}
+	now := s.task5Now()
+	if outboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
+		if err = task5ScrubOutbox(tx, &row, now); err != nil {
+			return CommitResult{}, err
+		}
+		if err = task5Commit(tx); err != nil {
+			return CommitResult{}, err
+		}
+		return CommitResult{}, ErrPayloadExpired
+	}
 	if req.ExpectedVersion != row.Version {
 		return CommitResult{}, participantConflict(tableOutboxEffects)
 	}
@@ -1236,7 +1255,6 @@ func (s *GORMStore) ResolveOutbox(ctx context.Context, req OutboxResolutionReque
 	if !outboxUnresolved(row.Status) {
 		return CommitResult{}, ErrInvalidTransition
 	}
-	now := s.task5Now()
 	if req.Resolution == OutboxResolutionRetry {
 		if row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
 			if e := task5ScrubOutbox(tx, &row, now); e != nil {
@@ -1814,6 +1832,10 @@ func (s *GORMStore) applyTask5InboxParticipants(tx *gorm.DB, work UnitOfWork, re
 		} else if q.Error != nil {
 			return ErrParticipantFailure
 		} else {
+			now := s.task5Now()
+			if inboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
+				return &task5ExpiredPayloadError{table: tableInboxMessages, id: row.InboxID, now: now}
+			}
 			hasOpaqueReplay := len(update.PayloadCiphertext) > 0 || len(update.PayloadNonce) > 0 || len(update.ContentDigest) > 0
 			if hasOpaqueReplay {
 				if err := validateTask5OpaquePayload(update.PayloadCiphertext, update.PayloadNonce, update.DigestKeyID); err != nil {
@@ -1821,10 +1843,6 @@ func (s *GORMStore) applyTask5InboxParticipants(tx *gorm.DB, work UnitOfWork, re
 				}
 				if !task5InboxDuplicate(row, update) {
 					return ErrConflict
-				}
-				now := s.task5Now()
-				if inboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
-					return &task5ExpiredPayloadError{table: tableInboxMessages, id: row.InboxID, now: now}
 				}
 				if update.ExpectedVersion != 0 && update.ExpectedVersion != row.Version {
 					return participantConflict(tableInboxMessages)
@@ -1848,10 +1866,6 @@ func (s *GORMStore) applyTask5InboxParticipants(tx *gorm.DB, work UnitOfWork, re
 			if update.EndpointID != "" || update.ProviderEventKey != "" || len(update.LaneHMAC) > 0 || update.OrderingSequence != 0 || update.WorkflowID != "" ||
 				len(update.PayloadCiphertext) > 0 || len(update.PayloadNonce) > 0 || len(update.ContentDigest) > 0 || !update.PayloadExpiresAt.IsZero() {
 				return ErrInvalidTransition
-			}
-			now := s.task5Now()
-			if row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
-				return &task5ExpiredPayloadError{table: tableInboxMessages, id: row.InboxID, now: now}
 			}
 			if update.Status != InboxStatusLeased && update.Status != InboxStatusCallbackStarted && row.Status != InboxStatusLeased && row.Status != InboxStatusCallbackStarted && (update.LeaseOwner != "" || update.LeaseEpoch != 0 || update.AttemptID != "" || !update.LeaseExpiresAt.IsZero()) {
 				return ErrStaleLease
@@ -2034,6 +2048,10 @@ func (s *GORMStore) applyTask5EffectParticipants(tx *gorm.DB, work UnitOfWork, r
 		} else if q.Error != nil {
 			return ErrParticipantFailure
 		} else {
+			now := s.task5Now()
+			if outboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
+				return &task5ExpiredPayloadError{table: tableOutboxEffects, id: row.EffectID, now: now}
+			}
 			hasOpaqueReplay := len(update.PayloadCiphertext) > 0 || len(update.PayloadNonce) > 0 || len(update.ContentDigest) > 0
 			if hasOpaqueReplay {
 				if err := validateTask5OpaquePayload(update.PayloadCiphertext, update.PayloadNonce, update.DigestKeyID); err != nil {
@@ -2041,10 +2059,6 @@ func (s *GORMStore) applyTask5EffectParticipants(tx *gorm.DB, work UnitOfWork, r
 				}
 				if !task5EffectDuplicate(row, update) {
 					return ErrConflict
-				}
-				now := s.task5Now()
-				if outboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
-					return &task5ExpiredPayloadError{table: tableOutboxEffects, id: row.EffectID, now: now}
 				}
 				if update.ExpectedVersion != 0 && update.ExpectedVersion != row.Version {
 					return participantConflict(tableOutboxEffects)
@@ -2065,16 +2079,12 @@ func (s *GORMStore) applyTask5EffectParticipants(tx *gorm.DB, work UnitOfWork, r
 			if row.Status == OutboxStatusSucceeded || row.Status == OutboxStatusFailed || row.Status == OutboxStatusAmbiguous {
 				return ErrInvalidTransition
 			}
-			now := s.task5Now()
 			if update.Status == OutboxStatusDispatched || update.Status == OutboxStatusSucceeded || update.Status == OutboxStatusFailed {
 				return ErrInvalidTransition
 			}
 			if update.EndpointID != "" || len(update.LaneHMAC) > 0 || update.OrderingSequence != 0 || update.EffectType != "" ||
 				len(update.PayloadCiphertext) > 0 || len(update.PayloadNonce) > 0 || len(update.ContentDigest) > 0 || !update.PayloadExpiresAt.IsZero() || !update.DispatchedAt.IsZero() || update.ResultCode != "" || update.ErrorCode != "" || update.ProviderMessageID != "" {
 				return ErrInvalidTransition
-			}
-			if row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
-				return &task5ExpiredPayloadError{table: tableOutboxEffects, id: row.EffectID, now: now}
 			}
 			leaseState := row.Status == OutboxStatusLeased || row.Status == OutboxStatusDispatched
 			if leaseState {
@@ -2205,14 +2215,14 @@ func (s *GORMStore) applyTask5ArtifactParticipants(tx *gorm.DB, work UnitOfWork,
 		} else if q.Error != nil {
 			return ErrParticipantFailure
 		} else {
+			if (row.Status == "available" || row.Status == "ready") && !row.ExpiresAt.After(now) {
+				return &task5ExpiredArtifactError{id: row.ArtifactID, now: now}
+			}
 			if err := participantVersion(update.ExpectedVersion, row.Version, update.Version, tableOperationArtifacts, "<redacted>"); err != nil {
 				return err
 			}
 			if row.Status != "ready" && row.Status != "available" {
 				return ErrArtifactGone
-			}
-			if (row.Status == "available" || row.Status == "ready") && !row.ExpiresAt.After(now) {
-				return &task5ExpiredArtifactError{id: row.ArtifactID, now: now}
 			}
 			if update.Status != "" && update.Status != row.Status && !(row.Status == "ready" && update.Status == "available") {
 				return ErrInvalidTransition
