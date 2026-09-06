@@ -62,13 +62,16 @@ func SetLogger(logger Logger) {
 
 type (
 	// WebSocketModule 是WebSocket模块的根实例
-	WebSocketModule struct{}
+	WebSocketModule struct {
+		manager *WebSocketManager
+	}
 
 	// WebSocket 表示WebSocket模块的一个实例
 	WebSocket struct {
 		rt        *goja.Runtime
 		loop      *eventloop.EventLoop
 		authorize func(string) error
+		manager   *WebSocketManager
 	}
 
 	WebSocketManager struct {
@@ -76,6 +79,18 @@ type (
 		mutex       sync.Mutex
 	}
 )
+
+// NewManager 创建一个独立的WebSocket连接管理器。
+func NewManager() *WebSocketManager {
+	return &WebSocketManager{}
+}
+
+func managerOrGlobal(manager *WebSocketManager) *WebSocketManager {
+	if manager == nil {
+		return GlobalConnManager
+	}
+	return manager
+}
 
 // Register 注册连接
 func (m *WebSocketManager) Register(conn *WebSocketConnection) {
@@ -114,11 +129,14 @@ func (m *WebSocketManager) Unregister(conn *WebSocketConnection) {
 	}
 }
 
-// Manager方法结束
-
-// New 返回一个新的WebSocketModule实例
+// New 返回一个使用进程级全局管理器的WebSocketModule实例。
 func New() *WebSocketModule {
-	return &WebSocketModule{}
+	return NewWithManager(GlobalConnManager)
+}
+
+// NewWithManager 返回一个使用指定连接管理器的WebSocketModule实例。
+func NewWithManager(manager *WebSocketManager) *WebSocketModule {
+	return &WebSocketModule{manager: managerOrGlobal(manager)}
 }
 
 // NewInstance 为给定的goja运行时创建一个新的WebSocket实例
@@ -129,10 +147,15 @@ func (m *WebSocketModule) NewInstance(rt *goja.Runtime, loop *eventloop.EventLoo
 // NewInstanceWithPolicy creates a WebSocket adapter with a pre-dial policy
 // check. The hook runs on the Goja owner thread before any network goroutine.
 func (m *WebSocketModule) NewInstanceWithPolicy(rt *goja.Runtime, loop *eventloop.EventLoop, authorize func(string) error) *WebSocket {
+	manager := GlobalConnManager
+	if m != nil {
+		manager = managerOrGlobal(m.manager)
+	}
 	return &WebSocket{
 		rt:        rt,
 		loop:      loop,
 		authorize: authorize,
+		manager:   manager,
 	}
 }
 
@@ -170,6 +193,7 @@ func (ws *WebSocket) Exports() goja.Value {
 type WebSocketConnection struct {
 	rt           *goja.Runtime
 	loop         *eventloop.EventLoop
+	manager      *WebSocketManager
 	ctx          context.Context
 	conn         *websocket.Conn
 	scheduled    chan goja.Callable
@@ -282,10 +306,10 @@ func (ws *WebSocket) NewWebSocketConnection(call goja.FunctionCall) goja.Value {
 		panic(rt.NewTypeError("WebSocket requires event loop. Please provide eventloop when calling Enable()."))
 	}
 
-	// 创建WebSocketConnection实例
 	conn := &WebSocketConnection{
 		rt:             rt,
 		loop:           ws.loop,
+		manager:        managerOrGlobal(ws.manager),
 		url:            url,
 		protocol:       "", // 协议将在连接建立后设置
 		readyState:     Connecting,
@@ -297,8 +321,8 @@ func (ws *WebSocket) NewWebSocketConnection(call goja.FunctionCall) goja.Value {
 		onerror:        goja.Undefined(),
 		eventListeners: make(map[string][]goja.Value),
 	}
-	// 注册到全局管理器
-	GlobalConnManager.Register(conn)
+	// 注册到所属管理器
+	conn.manager.Register(conn)
 
 	// 创建JavaScript对象并绑定属性和方法
 	conn.bindWebSocketMethods()
@@ -636,8 +660,8 @@ func (conn *WebSocketConnection) readPump() {
 func (conn *WebSocketConnection) webSocketCloseConnection() {
 	conn.shutdownOnce.Do(func() {
 		WebSocketLogger.Debugf("清理WebSocket连接资源 url=%s", conn.url)
-		// 从全局管理器中注销
-		GlobalConnManager.Unregister(conn)
+		// 从所属管理器中注销
+		conn.manager.Unregister(conn)
 		close(conn.done)
 		if conn.conn != nil {
 			_ = conn.conn.Close()
@@ -655,7 +679,18 @@ func Enable(rt *goja.Runtime, loop *eventloop.EventLoop) {
 // EnableWithPolicy installs WebSocket with an authorization hook that runs
 // before dialing. A denied URL never starts a connection goroutine.
 func EnableWithPolicy(rt *goja.Runtime, loop *eventloop.EventLoop, authorize func(string) error) {
-	module := New()
+	EnableWithPolicyAndManager(rt, loop, GlobalConnManager, authorize)
+}
+
+// EnableWithManager installs WebSocket using the supplied connection manager.
+func EnableWithManager(rt *goja.Runtime, loop *eventloop.EventLoop, manager *WebSocketManager) {
+	EnableWithPolicyAndManager(rt, loop, manager, nil)
+}
+
+// EnableWithPolicyAndManager installs WebSocket using the supplied connection
+// manager and authorization hook.
+func EnableWithPolicyAndManager(rt *goja.Runtime, loop *eventloop.EventLoop, manager *WebSocketManager, authorize func(string) error) {
+	module := NewWithManager(manager)
 	instance := module.NewInstanceWithPolicy(rt, loop, authorize)
 	_ = rt.Set("WebSocket", instance.Exports())
 }

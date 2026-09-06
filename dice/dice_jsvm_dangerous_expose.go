@@ -49,7 +49,7 @@ func (d *Dice) installDangerousJSInstance(runtime jsengine.Runtime, seal jsengin
 		if !ok {
 			return errors.New("runtime does not support dangerous exposure")
 		}
-		value = gojaengine.WrapValue(vm, exposeDangerousJSValue(vm, d))
+		value, err = gojaengine.WrapValueForRuntime(runtime, exposeDangerousJSValue(vm, d))
 	}
 	if err != nil {
 		return err

@@ -223,6 +223,26 @@ func copyServiceBuffer(buffer unsafe.Pointer, capacity C.uint64_t, data []byte) 
 	return C.SC_OK
 }
 
+// copyServiceResponseBuffer reports the required length separately so callers
+// can probe with a zero-capacity response and retry with an exact buffer.
+func copyServiceResponseBuffer(buffer unsafe.Pointer, capacity C.uint64_t, data []byte) C.sc_status_t {
+	if uint64(capacity) > uint64(^uint(0)>>1) {
+		return C.sc_status_t(-1)
+	}
+	if len(data) == 0 || capacity == 0 {
+		return C.SC_OK
+	}
+	count := len(data)
+	if uint64(count) > uint64(capacity) {
+		count = int(capacity)
+	}
+	if buffer == nil {
+		return C.sc_status_t(-1)
+	}
+	copy(unsafe.Slice((*byte)(buffer), int(capacity))[:count], data[:count])
+	return C.SC_OK
+}
+
 func (s *nativeHostState) checkRuntime(runtimeHandle C.sc_runtime_t) error {
 	if s == nil || s.loop == nil || s.loop.closed.Load() {
 		return ErrNativeClosed
@@ -532,8 +552,8 @@ func sc_native_go_host_service_call(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runt
 			state.setError(errors.New("native host service string output buffer is too small"))
 			return status
 		}
-		if status := copyServiceBuffer(unsafe.Pointer(response.bytes_buffer), response.bytes_capacity, result.Bytes); status != C.SC_OK {
-			state.setError(errors.New("native host service byte output buffer is too small"))
+		if status := copyServiceResponseBuffer(unsafe.Pointer(response.bytes_buffer), response.bytes_capacity, result.Bytes); status != C.SC_OK {
+			state.setError(errors.New("native host service byte output buffer is invalid"))
 			return status
 		}
 		if invokeErr != nil {

@@ -2,11 +2,15 @@ package gojaservices_test
 
 import (
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/dop251/goja"
 	"github.com/dop251/goja_nodejs/eventloop"
 	"github.com/dop251/goja_nodejs/require"
+	"github.com/gorilla/websocket"
 
 	"Scardice-core/utils/jsengine/services"
 	gojaservices "Scardice-core/utils/jsengine/services/goja"
@@ -74,4 +78,100 @@ func TestInstallerPreservesCoreGojaServiceBehavior(t *testing.T) {
 			t.Fatalf("Lookup(%q) error = %v", name, err)
 		}
 	}
+}
+func TestInstallerCloseOnlyClosesOwnedWebSockets(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	hold := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		<-hold
+	}))
+	defer srv.Close()
+	defer close(hold)
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	loop1 := eventloop.NewEventLoop(eventloop.EnableConsole(false))
+	loop2 := eventloop.NewEventLoop(eventloop.EnableConsole(false))
+	go loop1.StartInForeground()
+	go loop2.StartInForeground()
+	t.Cleanup(func() {
+		loop1.Stop()
+		loop2.Stop()
+	})
+	time.Sleep(20 * time.Millisecond)
+
+	installer1 := gojaservices.NewInstaller(gojaservices.Options{
+		Registry: require.NewRegistry(),
+		Loop:     loop1,
+	})
+	installer2 := gojaservices.NewInstaller(gojaservices.Options{
+		Registry: require.NewRegistry(),
+		Loop:     loop2,
+	})
+	if err := installer1.Install(); err != nil {
+		t.Fatalf("installer1.Install() error = %v", err)
+	}
+	if err := installer2.Install(); err != nil {
+		t.Fatalf("installer2.Install() error = %v", err)
+	}
+
+	var scriptErr error
+	runOnLoop := func(loop *eventloop.EventLoop, installer *gojaservices.Installer) {
+		done := make(chan struct{})
+		loop.RunOnLoop(func(vm *goja.Runtime) {
+			if err := installer.Enable(vm); err != nil {
+				scriptErr = err
+			} else {
+				_, scriptErr = vm.RunString(`globalThis.__ws = new WebSocket("` + wsURL + `");`)
+			}
+			close(done)
+		})
+		<-done
+	}
+	runOnLoop(loop1, installer1)
+	if scriptErr != nil {
+		t.Fatalf("installer1 WebSocket setup error = %v", scriptErr)
+	}
+	runOnLoop(loop2, installer2)
+	if scriptErr != nil {
+		t.Fatalf("installer2 WebSocket setup error = %v", scriptErr)
+	}
+
+	readyState := func(loop *eventloop.EventLoop) int {
+		done := make(chan struct{})
+		state := -1
+		loop.RunOnLoop(func(vm *goja.Runtime) {
+			state = int(vm.Get("__ws").ToObject(vm).Get("readyState").ToInteger())
+			close(done)
+		})
+		<-done
+		return state
+	}
+	waitForState := func(loop *eventloop.EventLoop, expected int) {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if readyState(loop) == expected {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("WebSocket did not reach readyState %d", expected)
+	}
+	waitForState(loop1, 1)
+	waitForState(loop2, 1)
+
+	if err := installer1.Close(); err != nil {
+		t.Fatalf("installer1.Close() error = %v", err)
+	}
+	if got := readyState(loop1); got != 3 {
+		t.Fatalf("owner WebSocket readyState after close = %d, want 3", got)
+	}
+	if got := readyState(loop2); got != 1 {
+		t.Fatalf("unrelated WebSocket readyState after owner close = %d, want 1", got)
+	}
+	_ = installer2.Close()
 }

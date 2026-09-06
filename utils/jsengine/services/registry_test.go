@@ -108,6 +108,64 @@ func TestRegistryEnforcesPermissionDeadlineAndCancellation(t *testing.T) {
 		t.Fatalf("Invoke(cancel) error = %v, want ErrCancelled", err)
 	}
 }
+func TestRegistryInvokeUsesStructuredRequestTargetForPolicy(t *testing.T) {
+	registry := services.NewRegistry()
+	service := &testService{definition: services.Definition{
+		Name:       services.Console,
+		Operations: []services.OperationID{services.OpConsoleLog},
+	}}
+	if err := registry.Register(service); err != nil {
+		t.Fatal(err)
+	}
+	authorizer := new(targetRecordingAuthorizer)
+	response, err := registry.Invoke(services.Call{
+		Request: services.Request{
+			Service:   services.Console,
+			Operation: services.OpConsoleLog,
+			String:    `{"target":"https://example.test"}`,
+			Target:    "https://example.test",
+		},
+		Policy: services.Policy{Authorizer: authorizer},
+	})
+	if err != nil {
+		t.Fatalf("Invoke() error = %v", err)
+	}
+	if response.Status != services.StatusOK {
+		t.Fatalf("Invoke() status = %v, want ok", response.Status)
+	}
+	if authorizer.target != "https://example.test" {
+		t.Fatalf("policy target = %q, want structured target", authorizer.target)
+	}
+}
+
+func TestRegistryInvokeFallsBackToRequestStringForPolicyTarget(t *testing.T) {
+	registry := services.NewRegistry()
+	service := &testService{definition: services.Definition{
+		Name:       services.Console,
+		Operations: []services.OperationID{services.OpConsoleLog},
+	}}
+	if err := registry.Register(service); err != nil {
+		t.Fatal(err)
+	}
+	authorizer := new(targetRecordingAuthorizer)
+	response, err := registry.Invoke(services.Call{
+		Request: services.Request{
+			Service:   services.Console,
+			Operation: services.OpConsoleLog,
+			String:    "console payload",
+		},
+		Policy: services.Policy{Authorizer: authorizer},
+	})
+	if err != nil {
+		t.Fatalf("Invoke() error = %v", err)
+	}
+	if response.Status != services.StatusOK {
+		t.Fatalf("Invoke() status = %v, want ok", response.Status)
+	}
+	if authorizer.target != "console payload" {
+		t.Fatalf("policy target = %q, want request string", authorizer.target)
+	}
+}
 
 func TestRegistryInstallationOwnsServicesAndClosesExactlyOnce(t *testing.T) {
 	registry := services.NewRegistry()

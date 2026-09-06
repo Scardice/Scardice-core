@@ -111,6 +111,56 @@ func TestExposeDangerousJSValueRecursivelyExposesAndMutatesSealInst(t *testing.T
 		t.Fatalf("Go DiceMasters was not updated: %#v", d.DiceMasters)
 	}
 }
+func TestJsInit_GojaDangerousSealInstUsesLiveRealm(t *testing.T) {
+	d := &Dice{
+		Logger: zap.NewNop().Sugar(),
+		BaseConfig: BaseConfig{
+			DataDir: t.TempDir(),
+		},
+		ImSession: &IMSession{
+			ServiceAtNew: new(SyncMap[string, *GroupInfo]),
+			EndPoints:    []*EndPointInfo{},
+		},
+		DirtyGroups:   new(SyncMap[string, int64]),
+		AttrsManager:  &AttrsManager{},
+		ExtRegistry:   new(SyncMap[string, *ExtInfo]),
+		CommandPrefix: []string{".", "。"},
+		DiceMasters:   []string{"QQ:1001"},
+		Config: Config{
+			JsConfig:   JsConfig{JsEnable: true, JsEngine: "goja"},
+			MailConfig: MailConfig{MailEnable: false},
+		},
+		AdvancedConfig: AdvancedConfig{ExposeDangerousSealInst: true},
+	}
+	d.JsInit()
+	t.Cleanup(func() {
+		if d.ExtLoopManager != nil {
+			d.ExtLoopManager.SetLoop(nil)
+		}
+	})
+	if !d.Config.JsEnable {
+		t.Fatal("Goja initialization disabled JavaScript")
+	}
+
+	loop, err := d.ExtLoopManager.GetLoop(d.ExtLoopManager.version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := loop.Run(func(runtime jsengine.Runtime) error {
+		_, err := runtime.RunString("dangerous-goja.js", `
+			if (typeof seal.inst.getDiceDataPath !== "function") throw new Error("missing method");
+			if (typeof seal.inst.jsSealInstExposed !== "undefined") throw new Error("leaked internal field");
+			seal.inst.commandPrefix[0] = "!";
+			seal.inst.commandPrefix.push("/");
+		`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if d.CommandPrefix[0] != "!" || d.CommandPrefix[2] != "/" {
+		t.Fatalf("Go CommandPrefix was not updated: %#v", d.CommandPrefix)
+	}
+}
 
 func TestInstallDangerousJSInstanceNativeQuickJSMatchesGojaMutationContract(t *testing.T) {
 	if os.Getenv("SCARDICE_RUNTIME_ROOT") == "" && os.Getenv("SCARDICE_QUICKJS_PACKAGE") == "" {

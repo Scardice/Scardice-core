@@ -151,7 +151,7 @@ func BuildQuickJSOptionsPayload(config JsConfig) (QuickJSOptionsPayload, error) 
 		config.QuickJSMaxPBKDF2Iterations > quickJSMaxMemoryBytes ||
 		config.QuickJSMaxPBKDF2OutputBytes > quickJSMaxMemoryBytes ||
 		fetchResponse > quickJSMaxMemoryBytes || websocketMessage > quickJSMaxMemoryBytes ||
-		filesystemRead > 16*1024*1024 || filesystemWrite > 16*1024*1024 {
+		filesystemRead > quickJSMaxMemoryBytes || filesystemWrite > quickJSMaxMemoryBytes {
 		return QuickJSOptionsPayload{}, ErrQuickJSOptionsOutOfRange
 	}
 	return QuickJSOptionsPayload{

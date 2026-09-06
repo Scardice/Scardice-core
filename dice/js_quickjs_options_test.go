@@ -131,8 +131,22 @@ func TestRuntimeOptionsForEngineIgnoresQuickJSFieldsForGoja(t *testing.T) {
 		t.Fatalf("Goja payload = %q, want empty", payload)
 	}
 }
-func TestBuildQuickJSOptionsRejectsFilesystemLimitAboveNativeSyncCapacity(t *testing.T) {
-	_, err := BuildQuickJSOptionsPayload(JsConfig{QuickJSMaxFilesystemReadMiB: 17})
+func TestBuildQuickJSOptionsAllowsFilesystemLimitsAboveLegacySyncCapacity(t *testing.T) {
+	payload, err := BuildQuickJSOptionsPayload(JsConfig{
+		QuickJSMaxFilesystemReadMiB:  17,
+		QuickJSMaxFilesystemWriteMiB: 17,
+	})
+	if err != nil {
+		t.Fatalf("filesystem limits above legacy capacity error = %v", err)
+	}
+	if payload.Services.Filesystem.MaxReadBytes != 17*1024*1024 ||
+		payload.Services.Filesystem.MaxWriteBytes != 17*1024*1024 {
+		t.Fatalf("filesystem limits = %#v, want 17 MiB", payload.Services.Filesystem)
+	}
+}
+
+func TestBuildQuickJSOptionsRejectsFilesystemLimitAboveRuntimeMemory(t *testing.T) {
+	_, err := BuildQuickJSOptionsPayload(JsConfig{QuickJSMaxFilesystemReadMiB: (1 << 20) + 1})
 	if !errors.Is(err, ErrQuickJSOptionsOutOfRange) {
 		t.Fatalf("filesystem limit error = %v, want %v", err, ErrQuickJSOptionsOutOfRange)
 	}

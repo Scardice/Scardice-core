@@ -373,6 +373,16 @@ func WrapValue(vm *goja.Runtime, raw goja.Value) jsengine.Value {
 	return value{value: raw, realm: realmFor(vm)}
 }
 
+// WrapValueForRuntime adapts a raw Goja value for the realm owned by runtime.
+// The raw value must have been created by the same Goja runtime.
+func WrapValueForRuntime(engine jsengine.Runtime, raw goja.Value) (jsengine.Value, error) {
+	adapter, ok := engine.(*runtime)
+	if !ok || adapter == nil || adapter.vm == nil {
+		return nil, errors.New("goja runtime is required")
+	}
+	return value{value: raw, realm: adapter.realm}, nil
+}
+
 func (r *runtime) RunString(filename, source string) (jsengine.Value, error) {
 	program, err := goja.Compile(filename, source, false)
 	if err != nil {

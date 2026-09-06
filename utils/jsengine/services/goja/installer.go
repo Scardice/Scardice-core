@@ -55,10 +55,14 @@ type Installer struct {
 	installed      bool
 	closed         bool
 	fetchLifecycle *sealhttp.FetchLifecycle
+	wsManager      *sealws.WebSocketManager
 }
 
 func NewInstaller(options Options) *Installer {
-	installer := &Installer{options: options}
+	installer := &Installer{
+		options:   options,
+		wsManager: sealws.NewManager(),
+	}
 	if options.Proxy != nil {
 		installer.fetchLifecycle = sealhttp.NewFetchLifecycle()
 	}
@@ -159,7 +163,7 @@ func (i *Installer) Enable(vm *goja.Runtime) error {
 	i.mu.Unlock()
 
 	console.Enable(vm)
-	sealws.EnableWithPolicy(vm, i.options.Loop, i.options.NetworkAuthorize)
+	sealws.EnableWithPolicyAndManager(vm, i.options.Loop, i.wsManager, i.options.NetworkAuthorize)
 	i.options.Registry.Enable(vm)
 	sealcrypto.Enable(vm)
 	buffer.Enable(vm)
@@ -215,6 +219,6 @@ func (i *Installer) Close() error {
 	if err := i.fetchLifecycle.Close(); err != nil {
 		return err
 	}
-	sealws.GlobalConnManager.CloseAll()
+	i.wsManager.CloseAll()
 	return nil
 }

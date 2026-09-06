@@ -481,7 +481,50 @@ func InstallServiceRegistry(loop jsengine.Loop, registry *jsservices.Registry) e
 	})
 }
 
-const nativeTickInterval = time.Millisecond
+const (
+	// Runtime ABI v1 has no deadline query or provider-to-host timer wake hook.
+	// Keep the compatibility fallback bounded for timer resolution, while
+	// allowing truly idle runtimes to stop calling C every millisecond.
+	nativeTickMinDelay = time.Millisecond
+	nativeTickMaxDelay = 16 * time.Millisecond
+)
+
+type nativeTickSchedule struct {
+	delay time.Duration
+}
+
+func newNativeTickSchedule() *nativeTickSchedule {
+	return &nativeTickSchedule{delay: nativeTickMinDelay}
+}
+
+func (s *nativeTickSchedule) nextDelay() time.Duration {
+	if s.delay <= 0 {
+		s.delay = nativeTickMinDelay
+	}
+	return s.delay
+}
+
+func (s *nativeTickSchedule) onIdle() {
+	delay := s.nextDelay() * 2
+	if delay > nativeTickMaxDelay {
+		delay = nativeTickMaxDelay
+	}
+	s.delay = delay
+}
+
+func (s *nativeTickSchedule) onWake() {
+	s.delay = nativeTickMinDelay
+}
+
+func resetNativeTickTimer(timer *time.Timer, delay time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(delay)
+}
 
 func (l *nativeLoop) tick() {
 	if l == nil || l.closed.Load() || l.runtime == 0 {
@@ -541,8 +584,9 @@ func (l *nativeLoop) worker(options jsengine.RuntimeOptions, ready chan<- error)
 	}
 	ready <- nil
 
-	ticker := time.NewTicker(nativeTickInterval)
-	defer ticker.Stop()
+	schedule := newNativeTickSchedule()
+	timer := time.NewTimer(schedule.nextDelay())
+	defer timer.Stop()
 	for {
 		select {
 		case task := <-l.tasks:
@@ -555,13 +599,21 @@ func (l *nativeLoop) worker(options jsengine.RuntimeOptions, ready chan<- error)
 			err := runNativeTask(rt, task.fn)
 			rt.scope.release()
 			task.done <- err
+			l.drainScheduled()
+			l.tick()
+			schedule.onWake()
+			resetNativeTickTimer(timer, schedule.nextDelay())
 		case <-l.eventWake:
 			l.drainServiceEvents()
 			l.drainScheduled()
 			l.tick()
-		case <-ticker.C:
+			schedule.onWake()
+			resetNativeTickTimer(timer, schedule.nextDelay())
+		case <-timer.C:
 			l.drainScheduled()
 			l.tick()
+			schedule.onIdle()
+			resetNativeTickTimer(timer, schedule.nextDelay())
 		}
 	}
 }

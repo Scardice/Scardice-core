@@ -162,6 +162,13 @@ type Request struct {
 	Float64   float64
 }
 
+func requestPolicyTarget(request Request) string {
+	if request.Target != "" {
+		return request.Target
+	}
+	return request.String
+}
+
 // Response is the scalar/bytes response union. StatusOK with an unused value
 // field represents an operation that has no return value.
 type Response struct {
@@ -815,11 +822,7 @@ func (r *Registry) start(call Call, sink AsyncSink) (RequestID, error) {
 		}
 	}
 	call.Policy = r.policyFor(call)
-	target := call.Request.Target
-	if target == "" {
-		target = call.Request.String
-	}
-	if err := call.Policy.Authorize(serviceName, call.Request.Operation, target); err != nil {
+	if err := call.Policy.Authorize(serviceName, call.Request.Operation, requestPolicyTarget(call.Request)); err != nil {
 		return 0, &CallError{
 			Status:    StatusPermissionDenied,
 			Service:   serviceName,
@@ -989,7 +992,7 @@ func (r *Registry) invoke(call Call) (Response, error) {
 		}
 	}
 	call.Policy = r.policyFor(call)
-	if err := call.Policy.Authorize(serviceName, call.Request.Operation, call.Request.String); err != nil {
+	if err := call.Policy.Authorize(serviceName, call.Request.Operation, requestPolicyTarget(call.Request)); err != nil {
 		return Response{Status: StatusPermissionDenied}, &CallError{Status: StatusPermissionDenied, Service: serviceName, Operation: call.Request.Operation, Cause: err}
 	}
 	if entry.service == nil {
