@@ -20,14 +20,14 @@ Required focused command:
 
 ```text
 go test ./eventstore -run 'TestOpenDatabase|TestEventStoreSchema|TestDatabaseClose'
-ok  Scardice-core/eventstore  0.016s
+ok  Scardice-core/eventstore  0.023s
 ```
 
 Required package command:
 
 ```text
 go test ./eventstore
-ok  Scardice-core/eventstore  (cached)
+ok  Scardice-core/eventstore  0.039s
 ```
 
 No formatter, linter, race run, or project-wide test suite was run, as required. Remote integration tests were not run because they must remain opt-in and no credentials were supplied.
@@ -41,3 +41,17 @@ No formatter, linter, race run, or project-wide test suite was run, as required.
 ## Commit
 
 Implementation commit SHA: `385c7fda`.
+
+## Review follow-up
+
+Follow-up implementation commit: `81b7a35f`.
+
+- Replaced dialect-invalid `type:blob` tags with native `[]byte` mappings. MySQL size tags select sufficient `mediumblob`/`longblob` capacity while PostgreSQL uses `bytea`; SQLite remains `blob`.
+- Added restrictive operation-artifact → operation foreign-key enforcement and SQLite assertions for `RESTRICT` delete/update actions plus orphan rejection.
+- Tightened MySQL TLS acceptance to only verified `true`/`verify-full` modes.
+- Propagated a bounded `QueryTimeout` context through migration, singleton initialization, schema, and index validation.
+- Added runtime index contract validation for required names, ordered columns, and uniqueness.
+- Hardened loopback/Unix PostgreSQL exceptions to require every effective host in a parsed host list to be loopback or Unix; mixed/ambiguous/fallback hosts are rejected.
+- Added regression tests for restrictive FKs, TLS downgrade/custom rejection, and mixed PostgreSQL host lists.
+
+Focused and package tests were rerun after these fixes and passed.
