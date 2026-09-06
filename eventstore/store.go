@@ -96,11 +96,11 @@ func (s *GORMStore) RegisterProjection(descriptor ProjectionDescriptor) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, existing := range s.projectors {
-		if existing.Name != descriptor.Name {
-			continue
-		}
 		if existing.Version != descriptor.Version {
 			return ErrProjectorVersionConflict
+		}
+		if existing.Name != descriptor.Name {
+			continue
 		}
 		return ErrDuplicateProjector
 	}

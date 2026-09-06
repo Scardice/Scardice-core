@@ -54,6 +54,9 @@ func TestProjectionRegistrationRejectsEmptyDuplicateAndConflictingVersion(t *tes
 	if err := store.RegisterProjection(projectionDescriptor("v2", apply)); !errors.Is(err, ErrProjectorVersionConflict) {
 		t.Fatalf("conflict error = %v", err)
 	}
+	if err := store.RegisterProjection(ProjectionDescriptor{Name: "other", Version: "v2", Apply: apply}); !errors.Is(err, ErrProjectorVersionConflict) {
+		t.Fatalf("cross-projector conflict error = %v", err)
+	}
 }
 
 func TestProjectorLiveWritesUseActiveGenerationAndRollback(t *testing.T) {
