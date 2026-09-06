@@ -215,3 +215,22 @@ ok  	Scardice-core/eventstore	0.170s
 ```
 
 Concern: remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available; DSN parsing and all SQLite migration paths are covered locally.
+
+## Final bounded-migration follow-up
+
+Implementation commit: `e883b489`.
+
+- Bound every SQLite `operation_artifacts` preflight query and execution to the OpenDatabase schema context, including the transactional rebuild.
+- Dropped and recreated the named artifact unique index inside the rebuild transaction, preventing a legacy index name from remaining attached to the renamed table while the new table lacks its required uniqueness constraint.
+- Extended the legacy migration fixture to start with the named unique index and assert its preserved presence after upgrade.
+
+Final uncached verification:
+
+```text
+go test -count=1 ./eventstore -run 'TestOpenDatabase|TestEventStoreSchema|TestDatabaseClose'
+ok  	Scardice-core/eventstore	0.039s
+go test -count=1 ./eventstore
+ok  	Scardice-core/eventstore	0.171s
+```
+
+Concern: remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available; all bounded SQLite migration and index paths are covered locally.
