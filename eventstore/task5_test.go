@@ -507,3 +507,59 @@ func TestOutboxDispatchedExpiryScrubsBeforeAmbiguity(t *testing.T) {
 		t.Fatalf("dispatched expiry row = %#v", row)
 	}
 }
+func TestTask5StrictIngressAndParticipantContracts(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	inbox := task5Inbox("strict-inbox", "strict-provider", "strict-lane")
+	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
+		t.Fatal(err)
+	}
+	conflicting := inbox
+	conflicting.PayloadCiphertext = []byte("different")
+	if _, err := store.AcceptInbox(ctx, conflicting); !errors.Is(err, ErrConflict) {
+		t.Fatalf("inbox content conflict err = %v", err)
+	}
+	invalidOutbox := task5Effect("strict-effect", "strict-outbox-lane")
+	invalidOutbox.Status = OutboxStatusLeased
+	if _, err := store.AcceptOutbox(ctx, invalidOutbox); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("non-pending outbox acceptance err = %v", err)
+	}
+	pendingLease := inbox
+	pendingLease.ExpectedVersion = 1
+	pendingLease.LeaseOwner = "forged"
+	pendingLease.LeaseEpoch = 1
+	pendingLease.AttemptID = "forged-attempt"
+	if _, err := store.UpdateInbox(ctx, pendingLease); !errors.Is(err, ErrStaleLease) {
+		t.Fatalf("pending inbox lease injection err = %v", err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{{InboxID: inbox.InboxID, Resolution: InboxResolutionRetry, ExpectedVersion: 1}}}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("uow inbox resolution err = %v", err)
+	}
+	effect := task5Effect("strict-uow-effect", "strict-uow-lane")
+	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{EffectID: effect.EffectID, Status: OutboxStatusSucceeded, ExpectedVersion: 1}}}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("uow outbox terminal transition err = %v", err)
+	}
+
+	if _, err := store.Commit(ctx, UnitOfWork{
+		Operations: []OperationUpdate{{OperationID: "artifact-uow-roundtrip", PrincipalID: "artifact-owner"}},
+		ArtifactUpdates: []ArtifactUpdate{{
+			ArtifactID: "artifact-uow-roundtrip", OperationID: "artifact-uow-roundtrip",
+			Size: 3, Ciphertext: []byte("sealed:abc"), Nonce: []byte("nonce"), EncryptionKeyID: "artifact-key",
+			Status: "ready",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := store.ConsumeArtifact(ctx, ArtifactConsumeRequest{ArtifactID: "artifact-uow-roundtrip"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(artifact.Plaintext) != "abc" || artifact.OwnerPrincipalID != "artifact-owner" {
+		t.Fatalf("artifact roundtrip = %#v", artifact)
+	}
+}

@@ -141,7 +141,7 @@ func TestZeroStreamParticipantUpdates(t *testing.T) {
 	store, db := testStore(t); defer db.Close()
 	work := UnitOfWork{
 		Operations: []OperationUpdate{{OperationID:"op-zero", PrincipalID:"p-zero"}},
-		ArtifactUpdates: []ArtifactUpdate{{ArtifactID:"art-zero", OperationID:"op-zero", Ciphertext:[]byte("cipher"), Nonce:[]byte("nonce"), EncryptionKeyID:"artifact-key", Status:"ready"}},
+		ArtifactUpdates: []ArtifactUpdate{{ArtifactID:"art-zero",OperationID:"op-zero",OwnerPrincipalID:"p-zero",Ciphertext:[]byte("cipher"),Nonce:[]byte("nonce"),EncryptionKeyID:"artifact-key",Status:"ready"}},
 		SecretUpdates: []SecretUpdate{{SecretRef:"secret-zero", Ciphertext:[]byte("secret"), Nonce:[]byte("nonce")}},
 		PluginKVUpdates: []PluginKVUpdate{{ExtensionID:"plugin-zero", KeyHMAC:[]byte("key-zero"), KeyCiphertext:[]byte("key"), ValueCiphertext:[]byte("value")}},
 		InboxUpdates: []InboxUpdate{{InboxID:"inbox-zero",EndpointID:"endpoint-zero",ProviderEventKey:"provider-zero",LaneHMAC:[]byte("in-lane"),OrderingSequence:99,Status:InboxStatusPending,PayloadCiphertext:[]byte("in-payload"),PayloadNonce:[]byte("in-nonce"),ContentDigest:[]byte("in-digest"),DigestKeyID:"in-key",WorkflowID:"workflow-zero"}},
