@@ -250,7 +250,7 @@ func TestEventStoreSchemaHasAllRestrictiveForeignKeys(t *testing.T) {
 	if _, err := db.SQLDB().ExecContext(context.Background(), `INSERT INTO operation_artifacts (artifact_id, version, operation_id, owner_principal_id, media_type, size, status, expires_at) VALUES ('orphan-artifact', 1, 'missing-operation', 'owner', 'text/plain', 0, 'available', CURRENT_TIMESTAMP)`); err == nil {
 		t.Fatal("orphan operation artifact reference insert succeeded")
 	}
-	if _, err := db.SQLDB().ExecContext(context.Background(), `INSERT INTO subject_fences (subject_key, scope, purge_operation_id, created_at) VALUES (x'01', 'subject', 'missing-operation', CURRENT_TIMESTAMP)`); err == nil {
+	if _, err := db.SQLDB().ExecContext(context.Background(), `INSERT INTO subject_fences (subject_key, scope, version, purge_operation_id, created_at) VALUES (x'01', 'subject', 1, 'missing-operation', CURRENT_TIMESTAMP)`); err == nil {
 		t.Fatal("orphan subject fence operation reference insert succeeded")
 	}
 }
