@@ -348,6 +348,7 @@ func TestDatabaseTLSAndHostDuplicateSettingsFailClosed(t *testing.T) {
 	if dsnDeclaresVerifiedTLS("mysql", "user:pass@tcp(db:3306)/events?tls=true&tls=skip-verify") {
 		t.Fatal("duplicate MySQL TLS settings accepted")
 	}
+
 	if dsnDeclaresVerifiedTLS("postgres", "postgres://db/events?sslmode=verify-full&sslmode=disable") {
 		t.Fatal("duplicate PostgreSQL URL sslmode settings accepted")
 	}
@@ -362,5 +363,30 @@ func TestDatabaseTLSAndHostDuplicateSettingsFailClosed(t *testing.T) {
 	}
 	if !isLoopbackOrUnixDSN("postgres", "postgres://localhost/events?host=127.0.0.1,localhost") {
 		t.Fatal("all-loopback PostgreSQL URL host list rejected")
+	}
+}
+func TestEventStoreDomainEventMetadataColumns(t *testing.T) {
+	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "events.db")})
+	if err != nil {
+		t.Fatalf("open sqlite database: %v", err)
+	}
+	defer db.Close()
+	rows, err := db.SQLDB().QueryContext(context.Background(), "SELECT name FROM pragma_table_info(?)", tableDomainEvents)
+	if err != nil {
+		t.Fatalf("inspect domain event columns: %v", err)
+	}
+	defer rows.Close()
+	got := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan domain event column: %v", err)
+		}
+		got[name] = true
+	}
+	for _, column := range []string{"event_id", "aggregate_type", "aggregate_id", "aggregate_version", "global_position", "event_type", "schema_version", "payload", "command_id", "correlation_id", "causation_id", "principal_id", "producer", "occurred_at_unix_nano_utc", "checksum", "created_at"} {
+		if !got[column] {
+			t.Errorf("missing domain event column %q", column)
+		}
 	}
 }

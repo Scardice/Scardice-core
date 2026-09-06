@@ -86,6 +86,7 @@ type domainEventRow struct {
 	EventType              string    `gorm:"type:varchar(255);not null"`
 	SchemaVersion          uint16    `gorm:"not null"`
 	Payload                []byte    `gorm:"not null;size:262144"`
+	CommandID              string    `gorm:"type:varchar(255)"`
 	CorrelationID          string    `gorm:"type:varchar(255)"`
 	CausationID            string    `gorm:"type:varchar(255)"`
 	PrincipalID             string    `gorm:"type:varchar(255)"`
