@@ -46,7 +46,7 @@ The commands were rerun after the final source/test commits and included the Tas
 ## Commits
 
 - Implementation and tests: `0470750b` (`eventstore: add ordered inbox outbox and artifacts`)
-- Follow-up completion identity hardening: `19330c86` (`eventstore: enforce terminal completion lease identity`)
+- Follow-up completion identity and scrub-marker hardening: `19330c86`, `ab3a177f`
 - Report: committed separately after implementation.
 
 ## Limitation
