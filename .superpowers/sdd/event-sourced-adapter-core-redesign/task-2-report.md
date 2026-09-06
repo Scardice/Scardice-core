@@ -40,4 +40,4 @@ No formatter, linter, race run, or project-wide test suite was run, as required.
 
 ## Commit
 
-Commit SHA: pending final commit.
+Implementation commit SHA: `385c7fda`.
