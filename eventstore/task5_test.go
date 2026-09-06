@@ -576,7 +576,15 @@ func TestTask5UOWArtifactExpiryScrubsOnObservedExpiry(t *testing.T) {
 			Size: 3, Ciphertext: []byte("sealed:def"), Nonce: []byte("nonce"), EncryptionKeyID: "test-key",
 			ExpiresAt: clock.Now().Add(time.Minute),
 		},
+		{
+			ArtifactID: "uow-expiring-artifact-consumed", OperationID: "uow-expiring-artifact-op", OwnerPrincipalID: "uow-expiring-owner",
+			Size: 3, Ciphertext: []byte("sealed:ghi"), Nonce: []byte("nonce"), EncryptionKeyID: "test-key",
+			ExpiresAt: clock.Now().Add(time.Minute),
+		},
 	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ConsumeArtifact(ctx, ArtifactConsumeRequest{ArtifactID: "uow-expiring-artifact-consumed"}); err != nil {
 		t.Fatal(err)
 	}
 	clock.Advance(2 * time.Minute)
@@ -592,6 +600,13 @@ func TestTask5UOWArtifactExpiryScrubsOnObservedExpiry(t *testing.T) {
 	}
 	if row.Status != "expired" || len(row.Ciphertext) != 0 || len(row.Nonce) != 0 {
 		t.Fatalf("expired artifact row = %#v", row)
+	}
+	var consumed operationArtifactRow
+	if err := db.GORM().Where("artifact_id = ?", "uow-expiring-artifact-consumed").First(&consumed).Error; err != nil {
+		t.Fatal(err)
+	}
+	if consumed.Status != "consumed" || len(consumed.Ciphertext) != 0 || len(consumed.Nonce) != 0 || consumed.Version != 2 {
+		t.Fatalf("consumed artifact row = %#v", consumed)
 	}
 	var second operationArtifactRow
 	if err := db.GORM().Where("artifact_id = ?", "uow-expiring-artifact-2").First(&second).Error; err != nil {
@@ -779,6 +794,47 @@ func TestTask5StrictIngressAndParticipantContracts(t *testing.T) {
 	}
 	if string(artifact.Plaintext) != "abc" || artifact.OwnerPrincipalID != "artifact-owner" {
 		t.Fatalf("artifact roundtrip = %#v", artifact)
+	}
+}
+func TestOutboxObservedExpiryMarksNonIdempotentDispatchAmbiguous(t *testing.T) {
+	store, db, clock := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	effect := task5Effect("observed-expired-nonidempotent", "observed-expired-nonidempotent-lane")
+	effect.RiskClass = RiskNonIdempotentAfterDispatch
+	effect.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "observed-expired-worker", LeaseDuration: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatched, err := store.MarkOutboxDispatched(ctx, OutboxDispatchRequest{EffectID: effect.EffectID, WorkerID: claimed.Effect.LeaseOwner, LeaseEpoch: claimed.Effect.LeaseEpoch, AttemptID: claimed.Effect.AttemptID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Minute)
+	if _, err := store.UpdateOutbox(ctx, NewEffect{EffectID: effect.EffectID, ExpectedVersion: dispatched.Effect.Version, Status: OutboxStatusAmbiguous, LeaseOwner: dispatched.Effect.LeaseOwner, LeaseEpoch: dispatched.Effect.LeaseEpoch, AttemptID: dispatched.Effect.AttemptID}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("non-idempotent observed expiry err = %v", err)
+	}
+	var row outboxEffectRow
+	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != OutboxStatusAmbiguous || row.LeaseExpiry != nil || len(row.PayloadCiphertext) != 0 || len(row.PayloadNonce) != 0 {
+		t.Fatalf("non-idempotent observed expiry row = %#v", row)
+	}
+	version := row.Version
+	if _, err := store.UpdateOutbox(ctx, NewEffect{EffectID: effect.EffectID, ExpectedVersion: version, Status: OutboxStatusPending}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("ambiguous replay err = %v", err)
+	}
+	var replay outboxEffectRow
+	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&replay).Error; err != nil {
+		t.Fatal(err)
+	}
+	if replay.Version != version {
+		t.Fatalf("ambiguous replay changed version from %d to %d", version, replay.Version)
 	}
 }
 func TestTask5StableDedupeAfterScrubAndLeaseRequiredTransitions(t *testing.T) {
@@ -1144,5 +1200,95 @@ func TestTask5UOWExpiryScrubsBeforeError(t *testing.T) {
 	}
 	if len(effectRow.PayloadCiphertext) != 0 || len(effectRow.PayloadNonce) != 0 {
 		t.Fatalf("uow ambiguous expiry retained payload: %#v", effectRow)
+	}
+}
+func TestTask5PublicExpiredReplayScrubsBeforeDedupe(t *testing.T) {
+	store, db, clock := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	inbox := task5Inbox("expired-replay-inbox", "expired-replay-provider", "expired-replay-inbox-lane")
+	inbox.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
+		t.Fatal(err)
+	}
+	effect := task5Effect("expired-replay-effect", "expired-replay-effect-lane")
+	effect.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Minute)
+	changedInbox := inbox
+	changedInbox.PayloadExpiresAt = time.Time{}
+	changedInbox.PayloadCiphertext = []byte("changed")
+	if _, err := store.AcceptInbox(ctx, changedInbox); !errors.Is(err, ErrConflict) {
+		t.Fatalf("changed expired inbox replay err = %v", err)
+	}
+	sameInbox := inbox
+	sameInbox.PayloadExpiresAt = time.Time{}
+	if _, err := store.AcceptInbox(ctx, sameInbox); !errors.Is(err, ErrConflict) {
+		t.Fatalf("same expired inbox replay err = %v", err)
+	}
+	changedEffect := effect
+	changedEffect.PayloadExpiresAt = time.Time{}
+	changedEffect.PayloadCiphertext = []byte("changed")
+	if _, err := store.AcceptOutbox(ctx, changedEffect); !errors.Is(err, ErrConflict) {
+		t.Fatalf("changed expired outbox replay err = %v", err)
+	}
+	sameEffect := effect
+	sameEffect.PayloadExpiresAt = time.Time{}
+	if _, err := store.AcceptOutbox(ctx, sameEffect); !errors.Is(err, ErrConflict) {
+		t.Fatalf("same expired outbox replay err = %v", err)
+	}
+	var inboxRow inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&inboxRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(inboxRow.PayloadCiphertext) != 0 || len(inboxRow.PayloadNonce) != 0 {
+		t.Fatal("expired inbox replay retained payload")
+	}
+	var effectRow outboxEffectRow
+	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&effectRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(effectRow.PayloadCiphertext) != 0 || len(effectRow.PayloadNonce) != 0 {
+		t.Fatal("expired outbox replay retained payload")
+	}
+}
+func TestTask5UOWExpiredInitialDedupePrecedesReplay(t *testing.T) {
+	store, db, clock := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	inbox := task5Inbox("uow-dedupe-expired-inbox", "uow-dedupe-expired-provider", "uow-dedupe-expired-lane")
+	inbox.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
+		t.Fatal(err)
+	}
+	effect := task5Effect("uow-dedupe-expired-effect", "uow-dedupe-expired-effect-lane")
+	effect.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Minute)
+	replayInbox := task5Inbox("uow-dedupe-expired-new-id", inbox.ProviderEventKey, string(inbox.LaneHMAC))
+	replayInbox.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{replayInbox}}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("uow expired inbox dedupe err = %v", err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{effect}}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("uow expired effect dedupe err = %v", err)
+	}
+	var inboxRow inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&inboxRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(inboxRow.PayloadCiphertext) != 0 || len(inboxRow.PayloadNonce) != 0 {
+		t.Fatal("uow expired inbox dedupe retained payload")
+	}
+	var effectRow outboxEffectRow
+	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&effectRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(effectRow.PayloadCiphertext) != 0 || len(effectRow.PayloadNonce) != 0 {
+		t.Fatal("uow expired effect dedupe retained payload")
 	}
 }

@@ -326,17 +326,21 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 	var existing inboxMessageRow
 	q := locked(tx).Where("endpoint_id = ? AND provider_event_id = ?", update.EndpointID, update.ProviderEventKey).First(&existing)
 	if q.Error == nil {
-		if !task5InboxDuplicate(existing, update) {
-			return CommitResult{}, ErrConflict
-		}
 		if inboxUnresolved(existing.Status) && existing.PayloadExpiresAt != nil && !existing.PayloadExpiresAt.After(now) {
+			original := existing
 			if err = task5ScrubInbox(tx, &existing, now, false); err != nil {
 				return CommitResult{}, err
 			}
 			if err = task5Commit(tx); err != nil {
 				return CommitResult{}, err
 			}
+			if !task5InboxDuplicate(original, update) {
+				return CommitResult{}, ErrConflict
+			}
 			return CommitResult{}, ErrPayloadExpired
+		}
+		if !task5InboxDuplicate(existing, update) {
+			return CommitResult{}, ErrConflict
 		}
 		result = CommitResult{InboxIDs: []string{existing.InboxID}, OrderingSequence: existing.OrderingSequence, Version: existing.Version, Deduplicated: true, Idempotent: true}
 		if err = task5Commit(tx); err != nil {
@@ -728,17 +732,21 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 	var existing outboxEffectRow
 	lookup := locked(tx).Where("effect_id = ?", effect.EffectID).First(&existing)
 	if lookup.Error == nil {
-		if !task5EffectDuplicate(existing, effect) {
-			return CommitResult{}, ErrConflict
-		}
 		if outboxUnresolved(existing.Status) && existing.PayloadExpiresAt != nil && !existing.PayloadExpiresAt.After(now) {
+			original := existing
 			if err = task5ScrubOutbox(tx, &existing, now); err != nil {
 				return CommitResult{}, err
 			}
 			if err = task5Commit(tx); err != nil {
 				return CommitResult{}, err
 			}
+			if !task5EffectDuplicate(original, effect) {
+				return CommitResult{}, ErrConflict
+			}
 			return CommitResult{}, ErrPayloadExpired
+		}
+		if !task5EffectDuplicate(existing, effect) {
+			return CommitResult{}, ErrConflict
 		}
 		return CommitResult{EffectIDs: []string{existing.EffectID}, OrderingSequence: existing.OrderingSequence, Version: existing.Version, Deduplicated: true, Idempotent: true}, task5Commit(tx)
 	}
@@ -1314,6 +1322,9 @@ func participantConflict(table string) error {
 }
 
 func task5ScrubInbox(tx *gorm.DB, row *inboxMessageRow, now time.Time, terminal bool) error {
+	if len(row.PayloadCiphertext) == 0 && len(row.PayloadNonce) == 0 {
+		return nil
+	}
 	row.PayloadCiphertext = nil
 	row.PayloadNonce = nil
 	if terminal {
@@ -1332,8 +1343,16 @@ func task5ScrubInbox(tx *gorm.DB, row *inboxMessageRow, now time.Time, terminal 
 	return nil
 }
 func task5ScrubOutbox(tx *gorm.DB, row *outboxEffectRow, now time.Time) error {
+	nonIdempotentDispatch := row.Status == OutboxStatusDispatched && row.DispatchedAt != nil && row.RiskClass != RiskProviderIdempotent
+	if len(row.PayloadCiphertext) == 0 && len(row.PayloadNonce) == 0 && !nonIdempotentDispatch {
+		return nil
+	}
 	row.PayloadCiphertext = nil
 	row.PayloadNonce = nil
+	if nonIdempotentDispatch {
+		row.Status = OutboxStatusAmbiguous
+		row.LeaseExpiry = nil
+	}
 	row.ScrubbedAt = task5Ptr(now)
 	if row.ResolutionReason == "" {
 		row.ResolutionReason = "payload-expired"
@@ -1394,7 +1413,10 @@ func (s *GORMStore) task5PersistExpiredArtifacts(ctx context.Context, work UnitO
 		if q.Error != nil {
 			return ErrParticipantFailure
 		}
-		if row.ExpiresAt.After(first.now) {
+		if row.Status != "available" && row.Status != "ready" {
+			continue
+		}
+		if row.ExpiresAt.After(first.now) || (len(row.Ciphertext) == 0 && len(row.Nonce) == 0) {
 			continue
 		}
 		version, versionErr := nextVersion(row.Version)
@@ -1782,9 +1804,13 @@ func (s *GORMStore) applyTask5InboxParticipants(tx *gorm.DB, work UnitOfWork, re
 			if len(update.PayloadCiphertext) == 0 || len(update.PayloadNonce) == 0 || update.DigestKeyID == "" || len(update.PayloadCiphertext) > MaxArtifactBytes {
 				return ErrParticipantFailure
 			}
+			now := s.task5Now()
 			var existing inboxMessageRow
 			dedupe := locked(tx).Where("endpoint_id = ? AND provider_event_id = ?", update.EndpointID, update.ProviderEventKey).First(&existing)
 			if dedupe.Error == nil {
+				if inboxUnresolved(existing.Status) && existing.PayloadExpiresAt != nil && !existing.PayloadExpiresAt.After(now) {
+					return &task5ExpiredPayloadError{table: tableInboxMessages, id: existing.InboxID, now: now}
+				}
 				if !task5InboxDuplicate(existing, update) {
 					return ErrConflict
 				}
@@ -1795,7 +1821,6 @@ func (s *GORMStore) applyTask5InboxParticipants(tx *gorm.DB, work UnitOfWork, re
 			if !errors.Is(dedupe.Error, gorm.ErrRecordNotFound) {
 				return ErrParticipantFailure
 			}
-			now := s.task5Now()
 			expiry, expiryErr := task5ParticipantExpiry(update.PayloadExpiresAt, now, InboxPayloadTTL)
 			if expiryErr != nil {
 				return expiryErr
@@ -1817,6 +1842,9 @@ func (s *GORMStore) applyTask5InboxParticipants(tx *gorm.DB, work UnitOfWork, re
 				lookup := locked(tx).Where("endpoint_id = ? AND provider_event_id = ?", update.EndpointID, update.ProviderEventKey).First(&duplicate)
 				if lookup.Error != nil {
 					return ErrParticipantFailure
+				}
+				if inboxUnresolved(duplicate.Status) && duplicate.PayloadExpiresAt != nil && !duplicate.PayloadExpiresAt.After(now) {
+					return &task5ExpiredPayloadError{table: tableInboxMessages, id: duplicate.InboxID, now: now}
 				}
 				if !task5InboxDuplicate(duplicate, update) {
 					return ErrConflict
@@ -1998,8 +2026,12 @@ func (s *GORMStore) applyTask5EffectParticipants(tx *gorm.DB, work UnitOfWork, r
 			if !update.DispatchedAt.IsZero() || !update.CompletedAt.IsZero() || update.ResultCode != "" || update.ErrorCode != "" || update.ProviderMessageID != "" || update.RetryCount != 0 || update.PrincipalID != "" || update.Reason != "" || update.Resolution != "" || !update.ResolutionAt.IsZero() {
 				return ErrInvalidTransition
 			}
+			now := s.task5Now()
 			var existing outboxEffectRow
 			if tx.Where("effect_id = ?", update.EffectID).First(&existing).Error == nil {
+				if outboxUnresolved(existing.Status) && existing.PayloadExpiresAt != nil && !existing.PayloadExpiresAt.After(now) {
+					return &task5ExpiredPayloadError{table: tableOutboxEffects, id: existing.EffectID, now: now}
+				}
 				if !task5EffectDuplicate(existing, update) {
 					return ErrConflict
 				}
@@ -2007,7 +2039,6 @@ func (s *GORMStore) applyTask5EffectParticipants(tx *gorm.DB, work UnitOfWork, r
 				result.Deduplicated, result.Idempotent, result.OrderingSequence, result.Version = true, true, existing.OrderingSequence, existing.Version
 				continue
 			}
-			now := s.task5Now()
 			expiry, expiryErr := task5ParticipantExpiry(update.PayloadExpiresAt, now, InboxPayloadTTL)
 			if expiryErr != nil {
 				return expiryErr
@@ -2033,6 +2064,9 @@ func (s *GORMStore) applyTask5EffectParticipants(tx *gorm.DB, work UnitOfWork, r
 				lookup := locked(tx).Where("effect_id = ?", update.EffectID).First(&duplicate)
 				if lookup.Error != nil {
 					return ErrParticipantFailure
+				}
+				if outboxUnresolved(duplicate.Status) && duplicate.PayloadExpiresAt != nil && !duplicate.PayloadExpiresAt.After(now) {
+					return &task5ExpiredPayloadError{table: tableOutboxEffects, id: duplicate.EffectID, now: now}
 				}
 				if !task5EffectDuplicate(duplicate, update) {
 					return ErrConflict
