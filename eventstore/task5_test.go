@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 type task5Clock struct {
@@ -206,6 +209,45 @@ func TestArtifactCodecBoundAndOneWinner(t *testing.T) {
 	clock.Advance(2 * time.Minute)
 	if _, err := store.ConsumeArtifact(context.Background(), ArtifactConsumeRequest{ArtifactID: "artifact-2"}); !errors.Is(err, ErrArtifactGone) {
 		t.Fatalf("expired consume err=%v", err)
+	}
+}
+func TestTask5ConsumeArtifactCommitErrorNeverReturnsPlaintext(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := store.Commit(ctx, UnitOfWork{Operations: []OperationUpdate{{OperationID: "artifact-commit-error-op", PrincipalID: "owner"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PutArtifact(ctx, ArtifactPutRequest{
+		ArtifactID: "artifact-commit-error",
+		OperationID: "artifact-commit-error-op",
+		OwnerPrincipalID: "owner",
+		Plaintext: []byte("secret"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const callbackName = "task5_test_rollback_consume_artifact"
+	if err := db.GORM().Callback().Update().After("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table == "operation_artifacts" {
+			tx.Rollback()
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer db.GORM().Callback().Update().Remove(callbackName)
+	result, err := store.ConsumeArtifact(ctx, ArtifactConsumeRequest{ArtifactID: "artifact-commit-error"})
+	if err == nil {
+		t.Fatal("consume unexpectedly succeeded after forced commit failure")
+	}
+	if !reflect.DeepEqual(result, ArtifactResult{}) {
+		t.Fatalf("commit-error consume returned plaintext/result: %#v", result)
+	}
+	var row operationArtifactRow
+	if err := db.GORM().Where("artifact_id = ?", "artifact-commit-error").First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != "available" || len(row.Ciphertext) == 0 || len(row.Nonce) == 0 {
+		t.Fatalf("commit-error consume mutated artifact: %#v", row)
 	}
 }
 
@@ -641,12 +683,22 @@ func TestInboxIngressRejectsPayloadTTLBypass(t *testing.T) {
 	if _, err := store.AcceptInbox(context.Background(), update); !errors.Is(err, ErrInvalidTTL) {
 		t.Fatalf("inbox ttl err = %v", err)
 	}
+	expired := task5Inbox("ttl-expired-inbox", "ttl-expired-provider", "ttl-expired-lane")
+	expired.PayloadExpiresAt = clock.Now().Add(-time.Second)
+	if _, err := store.AcceptInbox(context.Background(), expired); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("expired inbox ttl err = %v", err)
+	}
 }
 
 func TestOutboxIngressRejectsPayloadTTLBypass(t *testing.T) {
 	store, db, clock := task5Store(t)
 	defer db.Close()
 	effect := task5Effect("ttl-effect", "ttl-lane")
+	expired := task5Effect("ttl-expired-effect", "ttl-expired-lane")
+	expired.PayloadExpiresAt = clock.Now().Add(-time.Second)
+	if _, err := store.AcceptOutbox(context.Background(), expired); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("expired outbox ttl err = %v", err)
+	}
 	effect.PayloadExpiresAt = clock.Now().Add(InboxPayloadTTL + time.Second)
 	if _, err := store.AcceptOutbox(context.Background(), effect); !errors.Is(err, ErrInvalidTTL) {
 		t.Fatalf("outbox ttl err = %v", err)
@@ -991,6 +1043,9 @@ func TestTask5PendingTerminationAndNonceBound(t *testing.T) {
 	if _, err := store.UpdateOutbox(ctx, failedEffect); !errors.Is(err, ErrStaleLease) {
 		t.Fatalf("pending outbox termination err = %v", err)
 	}
+	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{EffectID: effect.EffectID, Status: OutboxStatusFailed, ExpectedVersion: 1}}}); !errors.Is(err, ErrStaleLease) {
+		t.Fatalf("pending outbox participant termination err = %v", err)
+	}
 
 	invalidNonce := task5Inbox("nonce-bound", "nonce-bound-provider", "nonce-bound-lane")
 	invalidNonce.PayloadNonce = make([]byte, task5NonceLimit+1)
@@ -1219,7 +1274,7 @@ func TestTask5PublicExpiredReplayScrubsBeforeDedupe(t *testing.T) {
 	}
 	clock.Advance(2 * time.Minute)
 	sameInbox := inbox
-	sameInbox.PayloadExpiresAt = time.Time{}
+	sameInbox.PayloadExpiresAt = clock.Now().Add(-time.Minute)
 	if _, err := store.AcceptInbox(ctx, sameInbox); !errors.Is(err, ErrPayloadExpired) {
 		t.Fatalf("same expired inbox replay err = %v", err)
 	}
@@ -1230,7 +1285,7 @@ func TestTask5PublicExpiredReplayScrubsBeforeDedupe(t *testing.T) {
 		t.Fatalf("changed expired inbox replay err = %v", err)
 	}
 	sameEffect := effect
-	sameEffect.PayloadExpiresAt = time.Time{}
+	sameEffect.PayloadExpiresAt = clock.Now().Add(-time.Minute)
 	if _, err := store.AcceptOutbox(ctx, sameEffect); !errors.Is(err, ErrPayloadExpired) {
 		t.Fatalf("same expired outbox replay err = %v", err)
 	}

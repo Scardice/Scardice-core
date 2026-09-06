@@ -303,13 +303,6 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 		return CommitResult{}, ErrInvalidTransition
 	}
 	now := s.task5Now()
-	if update.PayloadExpiresAt.IsZero() {
-		update.PayloadExpiresAt = now.Add(InboxPayloadTTL)
-	} else if !update.PayloadExpiresAt.After(now) {
-		return CommitResult{}, ErrPayloadExpired
-	} else if update.PayloadExpiresAt.After(now.Add(InboxPayloadTTL)) {
-		return CommitResult{}, ErrInvalidTTL
-	}
 	base, err := s.task5Base(ctx)
 	if err != nil {
 		return CommitResult{}, err
@@ -339,6 +332,14 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 			}
 			return CommitResult{}, ErrPayloadExpired
 		}
+		if !update.PayloadExpiresAt.IsZero() {
+			if !update.PayloadExpiresAt.After(now) {
+				return CommitResult{}, ErrPayloadExpired
+			}
+			if update.PayloadExpiresAt.After(now.Add(InboxPayloadTTL)) {
+				return CommitResult{}, ErrInvalidTTL
+			}
+		}
 		if !task5InboxDuplicate(existing, update) {
 			return CommitResult{}, ErrConflict
 		}
@@ -350,6 +351,13 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 	}
 	if !errors.Is(q.Error, gorm.ErrRecordNotFound) {
 		return CommitResult{}, errors.New("eventstore: dedupe lookup failed")
+	}
+	if update.PayloadExpiresAt.IsZero() {
+		update.PayloadExpiresAt = now.Add(InboxPayloadTTL)
+	} else if !update.PayloadExpiresAt.After(now) {
+		return CommitResult{}, ErrPayloadExpired
+	} else if update.PayloadExpiresAt.After(now.Add(InboxPayloadTTL)) {
+		return CommitResult{}, ErrInvalidTTL
 	}
 	sequence, err := task5AllocateLane(tx, inboxLaneKind, update.LaneHMAC, now)
 	if err != nil {
@@ -709,13 +717,6 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 		return CommitResult{}, ErrInvalidTransition
 	}
 	now := s.task5Now()
-	if effect.PayloadExpiresAt.IsZero() {
-		effect.PayloadExpiresAt = now.Add(InboxPayloadTTL)
-	} else if !effect.PayloadExpiresAt.After(now) {
-		return CommitResult{}, ErrPayloadExpired
-	} else if effect.PayloadExpiresAt.After(now.Add(InboxPayloadTTL)) {
-		return CommitResult{}, ErrInvalidTTL
-	}
 	base, err := s.task5Base(ctx)
 	if err != nil {
 		return CommitResult{}, err
@@ -745,6 +746,14 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 			}
 			return CommitResult{}, ErrPayloadExpired
 		}
+		if !effect.PayloadExpiresAt.IsZero() {
+			if !effect.PayloadExpiresAt.After(now) {
+				return CommitResult{}, ErrPayloadExpired
+			}
+			if effect.PayloadExpiresAt.After(now.Add(InboxPayloadTTL)) {
+				return CommitResult{}, ErrInvalidTTL
+			}
+		}
 		if !task5EffectDuplicate(existing, effect) {
 			return CommitResult{}, ErrConflict
 		}
@@ -752,6 +761,13 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 	}
 	if !errors.Is(lookup.Error, gorm.ErrRecordNotFound) {
 		return CommitResult{}, errors.New("eventstore: lookup outbox failed")
+	}
+	if effect.PayloadExpiresAt.IsZero() {
+		effect.PayloadExpiresAt = now.Add(InboxPayloadTTL)
+	} else if !effect.PayloadExpiresAt.After(now) {
+		return CommitResult{}, ErrPayloadExpired
+	} else if effect.PayloadExpiresAt.After(now.Add(InboxPayloadTTL)) {
+		return CommitResult{}, ErrInvalidTTL
 	}
 	seq, err := task5AllocateLane(tx, outboxLaneKind, effect.LaneHMAC, now)
 	if err != nil {
@@ -1750,11 +1766,11 @@ func (s *GORMStore) ConsumeArtifact(ctx context.Context, req ArtifactConsumeRequ
 	if q.Error != nil || q.RowsAffected != 1 {
 		return ArtifactResult{}, ErrStaleLease
 	}
-	result = ArtifactResult{ArtifactID: row.ArtifactID, OperationID: row.OperationID, OwnerPrincipalID: row.OwnerPrincipalID, MediaType: row.MediaType, SafeFilename: row.SafeFilename, Size: row.Size, Plaintext: task5Copy(plaintext), ExpiresAt: row.ExpiresAt, ConsumedAt: now}
+	consumed := ArtifactResult{ArtifactID: row.ArtifactID, OperationID: row.OperationID, OwnerPrincipalID: row.OwnerPrincipalID, MediaType: row.MediaType, SafeFilename: row.SafeFilename, Size: row.Size, Plaintext: task5Copy(plaintext), ExpiresAt: row.ExpiresAt, ConsumedAt: now}
 	if err = task5Commit(tx); err != nil {
 		return ArtifactResult{}, err
 	}
-	return result, nil
+	return consumed, nil
 }
 
 func task5ParticipantExpiry(expiry time.Time, now time.Time, max time.Duration) (time.Time, error) {
@@ -2113,7 +2129,7 @@ func (s *GORMStore) applyTask5EffectParticipants(tx *gorm.DB, work UnitOfWork, r
 			if row.Status == OutboxStatusSucceeded || row.Status == OutboxStatusFailed || row.Status == OutboxStatusAmbiguous {
 				return ErrInvalidTransition
 			}
-			if update.Status == OutboxStatusDispatched || update.Status == OutboxStatusSucceeded || update.Status == OutboxStatusFailed {
+			if update.Status == OutboxStatusDispatched || update.Status == OutboxStatusSucceeded {
 				return ErrInvalidTransition
 			}
 			if update.EndpointID != "" || len(update.LaneHMAC) > 0 || update.OrderingSequence != 0 || update.EffectType != "" ||
@@ -2121,12 +2137,19 @@ func (s *GORMStore) applyTask5EffectParticipants(tx *gorm.DB, work UnitOfWork, r
 				return ErrInvalidTransition
 			}
 			leaseState := row.Status == OutboxStatusLeased || row.Status == OutboxStatusDispatched
-			if leaseState {
+			requiresLease := update.Status != "" && update.Status != OutboxStatusPending
+			if requiresLease && !leaseState {
+				return ErrStaleLease
+			}
+			if leaseState || requiresLease {
 				if !task5LeaseMatches(row.LeaseOwner, row.LeaseEpoch, row.AttemptID, update.LeaseOwner, update.LeaseEpoch, update.AttemptID) || !task5LeaseActive(row.LeaseExpiry, now) {
 					return ErrStaleLease
 				}
-			} else if update.Status == OutboxStatusLeased || update.Status == OutboxStatusDispatched || update.LeaseOwner != "" || update.LeaseEpoch != 0 || update.AttemptID != "" || !update.LeaseExpiresAt.IsZero() {
+			} else if update.LeaseOwner != "" || update.LeaseEpoch != 0 || update.AttemptID != "" || !update.LeaseExpiresAt.IsZero() {
 				return ErrStaleLease
+			}
+			if row.Status == OutboxStatusDispatched && (update.Status == OutboxStatusSucceeded || update.Status == OutboxStatusFailed) {
+				return ErrInvalidTransition
 			}
 			if update.Status != "" {
 				if !validOutboxStatus(update.Status) || !outboxTransitionAllowed(row.Status, update.Status) {
