@@ -108,3 +108,38 @@ ok  Scardice-core/eventstore  0.038s
 go test -count=1 ./eventstore
 ok  Scardice-core/eventstore  0.151s
 ```
+
+## Review follow-up 4
+
+Follow-up implementation commit: `c2ce960c`.
+
+- Restored both `domain_events.payload` and the complete A1 metadata sequence, including `command_id` immediately before `correlation_id`; a schema test now asserts every required domain-event column.
+- Rejected PostgreSQL keyword settings with whitespace-separated key/equal/value fragments, duplicate `sslmode`/`host` entries, and ambiguous malformed tokens.
+- Rechecked duplicate MySQL URL TLS keys and duplicate/effective PostgreSQL URL host/TLS settings; URL host lists are comma-split before loopback/Unix validation.
+
+Final uncached verification:
+
+```text
+go test -count=1 ./eventstore -run 'TestOpenDatabase|TestEventStoreSchema|TestDatabaseClose'
+ok  Scardice-core/eventstore  0.034s
+go test -count=1 ./eventstore
+ok  Scardice-core/eventstore  0.154s
+```
+ 
+## Review follow-up 4b
+
+Follow-up implementation commit: `fcfe8f60`.
+
+- Restored the full `domain_events` metadata contract and made SQLite PRAGMA setup use the caller-bounded context for every statement/readback.
+- Removed the unusable reverse `operations.artifact_id -> operation_artifacts` FK. The operation artifact row and subject fence retain restrictive dependent-to-operation FKs; `operations.artifact_id` remains an application-validated nullable reference.
+- SQLite creates the operation-artifact dependent table with its restrictive FK before GORM migration, while remote constraint creation remains a second phase after all tables exist.
+- Added a valid nullable-first operation/artifact linking regression: create operation, create artifact, set `artifact_id`, and verify deleting the referenced operation is restricted.
+
+Final uncached verification:
+
+```text
+go test -count=1 ./eventstore -run 'TestOpenDatabase|TestEventStoreSchema|TestDatabaseClose'
+ok  Scardice-core/eventstore  0.044s
+go test -count=1 ./eventstore
+ok  Scardice-core/eventstore  0.170s
+```
