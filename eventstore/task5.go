@@ -17,7 +17,7 @@ const (
 	outboxLaneKind       = "outbox"
 	defaultLeaseDuration = time.Minute
 	task5PayloadLimit = 2 * 1024 * 1024
-	task5NonceLimit      = 256
+	task5NonceLimit      = 12
 )
 
 func (s *GORMStore) task5Base(ctx context.Context) (*gorm.DB, error) {
@@ -67,25 +67,45 @@ func validateTask5OpaquePayload(ciphertext, nonce []byte, keyID string) error {
 	}
 	return nil
 }
+func task5StableDigestEqual(storedDigest []byte, storedKey string, digest []byte, key string) bool {
+	if storedKey != key || len(storedDigest) == 0 || len(digest) == 0 {
+		return false
+	}
+	return bytes.Equal(storedDigest, digest)
+}
+
 func task5InboxDuplicate(row inboxMessageRow, update InboxUpdate) bool {
-	return row.EndpointID == update.EndpointID &&
-		row.ProviderEventKey == update.ProviderEventKey &&
-		bytes.Equal(row.LaneHMAC, update.LaneHMAC) &&
-		bytes.Equal(row.PayloadCiphertext, update.PayloadCiphertext) &&
-		bytes.Equal(row.PayloadNonce, update.PayloadNonce) &&
-		row.EncryptionKeyID == update.DigestKeyID &&
-		bytes.Equal(row.ContentDigest, update.ContentDigest)
+	if row.EndpointID != update.EndpointID || row.ProviderEventKey != update.ProviderEventKey || !bytes.Equal(row.LaneHMAC, update.LaneHMAC) {
+		return false
+	}
+	if len(row.ContentDigest) == 0 || len(update.ContentDigest) == 0 {
+		return len(row.ContentDigest) == 0 && len(update.ContentDigest) == 0 &&
+			len(row.PayloadCiphertext) > 0 && bytes.Equal(row.PayloadCiphertext, update.PayloadCiphertext) &&
+			len(row.PayloadNonce) > 0 && bytes.Equal(row.PayloadNonce, update.PayloadNonce) &&
+			row.EncryptionKeyID == update.DigestKeyID
+	}
+	storedKey := row.ContentDigestKeyID
+	if storedKey == "" {
+		storedKey = row.EncryptionKeyID
+	}
+	return task5StableDigestEqual(row.ContentDigest, storedKey, update.ContentDigest, update.DigestKeyID)
 }
 
 func task5EffectDuplicate(row outboxEffectRow, update NewEffect) bool {
-	return row.EndpointID == update.EndpointID &&
-		bytes.Equal(row.LaneHMAC, update.LaneHMAC) &&
-		row.EffectClass == update.EffectType &&
-		row.RiskClass == update.RiskClass &&
-		bytes.Equal(row.PayloadCiphertext, update.PayloadCiphertext) &&
-		bytes.Equal(row.PayloadNonce, update.PayloadNonce) &&
-		row.EncryptionKeyID == update.DigestKeyID &&
-		bytes.Equal(row.ContentDigest, update.ContentDigest)
+	if row.EndpointID != update.EndpointID || !bytes.Equal(row.LaneHMAC, update.LaneHMAC) || row.EffectClass != update.EffectType || row.RiskClass != update.RiskClass {
+		return false
+	}
+	if len(row.ContentDigest) == 0 || len(update.ContentDigest) == 0 {
+		return len(row.ContentDigest) == 0 && len(update.ContentDigest) == 0 &&
+			len(row.PayloadCiphertext) > 0 && bytes.Equal(row.PayloadCiphertext, update.PayloadCiphertext) &&
+			len(row.PayloadNonce) > 0 && bytes.Equal(row.PayloadNonce, update.PayloadNonce) &&
+			row.EncryptionKeyID == update.DigestKeyID
+	}
+	storedKey := row.ContentDigestKeyID
+	if storedKey == "" {
+		storedKey = row.EncryptionKeyID
+	}
+	return task5StableDigestEqual(row.ContentDigest, storedKey, update.ContentDigest, update.DigestKeyID)
 }
 
 func task5ReleaseLane(tx *gorm.DB, kind string, lane []byte, sequence uint64) error {
@@ -430,17 +450,20 @@ func (s *GORMStore) UpdateInbox(ctx context.Context, update InboxUpdate) (result
 	if update.ExpectedVersion != row.Version {
 		return CommitResult{}, participantConflict(tableInboxMessages)
 	}
+	if row.Status == InboxStatusFailed || row.Status == InboxStatusConfirmedConsumed || row.Status == InboxStatusSkipped {
+		return CommitResult{}, ErrInvalidTransition
+	}
 	now := s.task5Now()
 	if update.Status != InboxStatusLeased && update.Status != InboxStatusCallbackStarted && row.Status != InboxStatusLeased && row.Status != InboxStatusCallbackStarted && (update.LeaseOwner != "" || update.LeaseEpoch != 0 || update.AttemptID != "" || !update.LeaseExpiresAt.IsZero()) {
 		return CommitResult{}, ErrStaleLease
 	}
-	if !inboxTransitionAllowed(row.Status, update.Status) {
-		return CommitResult{}, ErrInvalidTransition
-	}
-	if update.Status == InboxStatusLeased || row.Status == InboxStatusLeased || row.Status == InboxStatusCallbackStarted {
+	if update.Status != InboxStatusPending || row.Status != InboxStatusPending {
 		if !task5LeaseMatches(row.LeaseOwner, row.LeaseEpoch, row.AttemptID, update.LeaseOwner, update.LeaseEpoch, update.AttemptID) || !task5LeaseActive(row.LeaseExpiry, now) {
 			return CommitResult{}, ErrStaleLease
 		}
+	}
+	if !inboxTransitionAllowed(row.Status, update.Status) {
+		return CommitResult{}, ErrInvalidTransition
 	}
 	if update.Status == InboxStatusPending && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
 		if err = task5ScrubInbox(tx, &row, now, false); err != nil {
@@ -808,6 +831,9 @@ func (s *GORMStore) UpdateOutbox(ctx context.Context, effect NewEffect) (result 
 	if q.Error != nil {
 		return CommitResult{}, errors.New("eventstore: load outbox failed")
 	}
+	if row.Status == OutboxStatusSucceeded || row.Status == OutboxStatusFailed || row.Status == OutboxStatusAmbiguous {
+		return CommitResult{}, ErrInvalidTransition
+	}
 	if effect.ExpectedVersion != row.Version {
 		return CommitResult{}, participantConflict(tableOutboxEffects)
 	}
@@ -821,7 +847,7 @@ func (s *GORMStore) UpdateOutbox(ctx context.Context, effect NewEffect) (result 
 	if effect.Status != OutboxStatusLeased && (effect.LeaseOwner != "" || effect.LeaseEpoch != 0 || effect.AttemptID != "" || !effect.LeaseExpiresAt.IsZero()) {
 		return CommitResult{}, ErrStaleLease
 	}
-	if row.Status == OutboxStatusLeased || row.Status == OutboxStatusDispatched || effect.Status == OutboxStatusLeased {
+	if effect.Status != OutboxStatusPending || row.Status != OutboxStatusPending {
 		if !task5LeaseMatches(row.LeaseOwner, row.LeaseEpoch, row.AttemptID, effect.LeaseOwner, effect.LeaseEpoch, effect.AttemptID) || !task5LeaseActive(row.LeaseExpiry, now) {
 			return CommitResult{}, ErrStaleLease
 		}
@@ -1445,6 +1471,9 @@ func (s *GORMStore) applyTask5InboxParticipants(tx *gorm.DB, work UnitOfWork, re
 		} else if q.Error != nil {
 			return ErrParticipantFailure
 		} else {
+			if row.Status == InboxStatusFailed || row.Status == InboxStatusConfirmedConsumed || row.Status == InboxStatusSkipped {
+				return ErrInvalidTransition
+			}
 			if len(update.PayloadCiphertext) > 0 || len(update.PayloadNonce) > 0 || len(update.ContentDigest) > 0 || !update.PayloadExpiresAt.IsZero() {
 				return ErrInvalidTransition
 			}
@@ -1456,7 +1485,12 @@ func (s *GORMStore) applyTask5InboxParticipants(tx *gorm.DB, work UnitOfWork, re
 				if !validInboxStatus(update.Status) || !inboxTransitionAllowed(row.Status, update.Status) {
 					return ErrInvalidTransition
 				}
-				if (row.Status == InboxStatusLeased || row.Status == InboxStatusCallbackStarted || update.Status == InboxStatusLeased || update.Status == InboxStatusCallbackStarted) && (!task5LeaseMatches(row.LeaseOwner, row.LeaseEpoch, row.AttemptID, update.LeaseOwner, update.LeaseEpoch, update.AttemptID) || !task5LeaseActive(row.LeaseExpiry, now)) {
+			}
+			if update.Resolution != "" || update.PrincipalID != "" || update.Reason != "" || !update.ResolutionAt.IsZero() {
+				return ErrInvalidTransition
+			}
+			if update.Status != InboxStatusPending || row.Status != InboxStatusPending {
+				if !task5LeaseMatches(row.LeaseOwner, row.LeaseEpoch, row.AttemptID, update.LeaseOwner, update.LeaseEpoch, update.AttemptID) || !task5LeaseActive(row.LeaseExpiry, now) {
 					return ErrStaleLease
 				}
 			}

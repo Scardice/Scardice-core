@@ -513,11 +513,13 @@ func TestTask5StrictIngressAndParticipantContracts(t *testing.T) {
 	ctx := context.Background()
 
 	inbox := task5Inbox("strict-inbox", "strict-provider", "strict-lane")
+	inbox.ContentDigest = []byte("strict-digest")
 	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
 		t.Fatal(err)
 	}
 	conflicting := inbox
 	conflicting.PayloadCiphertext = []byte("different")
+	conflicting.ContentDigest = []byte("different-digest")
 	if _, err := store.AcceptInbox(ctx, conflicting); !errors.Is(err, ErrConflict) {
 		t.Fatalf("inbox content conflict err = %v", err)
 	}
@@ -564,5 +566,111 @@ func TestTask5StrictIngressAndParticipantContracts(t *testing.T) {
 	}
 	if string(artifact.Plaintext) != "abc" || artifact.OwnerPrincipalID != "artifact-owner" {
 		t.Fatalf("artifact roundtrip = %#v", artifact)
+	}
+}
+func TestTask5StableDedupeAfterScrubAndLeaseRequiredTransitions(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	inbox := task5Inbox("stable-inbox", "stable-provider", "stable-lane")
+	inbox.ContentDigest = []byte("stable-digest")
+	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
+		t.Fatal(err)
+	}
+	inboxLease, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "worker", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedInbox := inboxLease.Update
+	failedInbox.Status = InboxStatusFailed
+	if _, err := store.UpdateInbox(ctx, failedInbox); err != nil {
+		t.Fatal(err)
+	}
+	terminalInboxUpdate := failedInbox
+	terminalInboxUpdate.ExpectedVersion = 3
+	terminalInboxUpdate.PrincipalID = "attacker"
+	if _, err := store.UpdateInbox(ctx, terminalInboxUpdate); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("terminal inbox generic update err = %v", err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{{InboxID: inbox.InboxID, Status: InboxStatusFailed, ExpectedVersion: 3}}}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("terminal inbox participant update err = %v", err)
+	}
+	replayInbox := inbox
+	replayInbox.PayloadCiphertext = []byte("re-encrypted")
+	if result, err := store.AcceptInbox(ctx, replayInbox); err != nil || !result.Deduplicated {
+		t.Fatalf("scrubbed inbox replay = %#v err=%v", result, err)
+	}
+	conflictingInbox := replayInbox
+	conflictingInbox.ContentDigest = []byte("different-digest")
+	if _, err := store.AcceptInbox(ctx, conflictingInbox); !errors.Is(err, ErrConflict) {
+		t.Fatalf("scrubbed inbox digest conflict err = %v", err)
+	}
+
+	effect := task5Effect("stable-effect", "stable-effect-lane")
+	effect.ContentDigest = []byte("stable-effect-digest")
+	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
+		t.Fatal(err)
+	}
+	outboxLease, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "worker", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompleteOutbox(ctx, OutboxCompletionRequest{EffectID: effect.EffectID, WorkerID: outboxLease.Effect.LeaseOwner, LeaseEpoch: outboxLease.Effect.LeaseEpoch, AttemptID: outboxLease.Effect.AttemptID, Status: OutboxStatusSucceeded, ResultCode: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	terminalEffectUpdate := effect
+	terminalEffectUpdate.ExpectedVersion = 3
+	terminalEffectUpdate.Status = OutboxStatusSucceeded
+	terminalEffectUpdate.ResultCode = "rewritten"
+	if _, err := store.UpdateOutbox(ctx, terminalEffectUpdate); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("terminal outbox generic update err = %v", err)
+	}
+	replayEffect := effect
+	replayEffect.PayloadCiphertext = []byte("re-encrypted")
+	if result, err := store.AcceptOutbox(ctx, replayEffect); err != nil || !result.Deduplicated {
+		t.Fatalf("scrubbed outbox replay = %#v err=%v", result, err)
+	}
+	conflictingEffect := replayEffect
+	conflictingEffect.ContentDigest = []byte("different-effect-digest")
+	if _, err := store.AcceptOutbox(ctx, conflictingEffect); !errors.Is(err, ErrConflict) {
+		t.Fatalf("scrubbed outbox digest conflict err = %v", err)
+	}
+}
+
+func TestTask5PendingTerminationAndNonceBound(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	inbox := task5Inbox("pending-termination-inbox", "pending-termination-provider", "pending-termination-lane")
+	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
+		t.Fatal(err)
+	}
+	failedInbox := inbox
+	failedInbox.Status = InboxStatusFailed
+	failedInbox.ExpectedVersion = 1
+	if _, err := store.UpdateInbox(ctx, failedInbox); !errors.Is(err, ErrStaleLease) {
+		t.Fatalf("pending inbox termination err = %v", err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{{InboxID: inbox.InboxID, Status: InboxStatusFailed, ExpectedVersion: 1}}}); !errors.Is(err, ErrStaleLease) {
+		t.Fatalf("pending inbox participant termination err = %v", err)
+	}
+
+	effect := task5Effect("pending-termination-effect", "pending-termination-effect-lane")
+	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
+		t.Fatal(err)
+	}
+	failedEffect := effect
+	failedEffect.Status = OutboxStatusFailed
+	failedEffect.ExpectedVersion = 1
+	if _, err := store.UpdateOutbox(ctx, failedEffect); !errors.Is(err, ErrStaleLease) {
+		t.Fatalf("pending outbox termination err = %v", err)
+	}
+
+	invalidNonce := task5Inbox("nonce-bound", "nonce-bound-provider", "nonce-bound-lane")
+	invalidNonce.PayloadNonce = make([]byte, task5NonceLimit+1)
+	if _, err := store.AcceptInbox(ctx, invalidNonce); !errors.Is(err, ErrInvalidMetadata) {
+		t.Fatalf("nonce bound err = %v", err)
 	}
 }
