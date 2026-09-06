@@ -311,6 +311,14 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 	}
 
 	if err = s.applyParticipants(ctx, tx, work, &result); err != nil {
+		var expired *task5ExpiredPayloadError
+		if errors.As(err, &expired) {
+			_ = tx.Rollback().Error
+			if scrubErr := s.task5PersistExpiredPayload(ctx, expired); scrubErr != nil {
+				return CommitResult{}, scrubErr
+			}
+			return CommitResult{}, ErrPayloadExpired
+		}
 		return CommitResult{}, err
 	}
 	s.projectorMu.RLock()

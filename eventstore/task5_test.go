@@ -689,8 +689,24 @@ func TestTask5ParticipantVersionContract(t *testing.T) {
 		t.Fatalf("new inbox supplied version err = %v", err)
 	}
 	inbox.Version = 1
+	inbox.ExpectedVersion = 9
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{inbox}}); !errors.Is(err, ErrParticipantConflict) {
+		t.Fatalf("new inbox expected version err = %v", err)
+	}
+	inbox.ExpectedVersion = 0
 	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{inbox}}); err != nil {
 		t.Fatalf("new inbox version 1: %v", err)
+	}
+	replayInbox := inbox
+	replayInbox.Version = 0
+	if result, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{replayInbox}}); err != nil || !result.Deduplicated || !result.Idempotent {
+		t.Fatalf("existing inbox full replay = %#v err=%v", result, err)
+	}
+	oversizedInboxReplay := replayInbox
+	oversizedInboxReplay.PayloadCiphertext = make([]byte, task5PayloadLimit+1)
+	var bound *OversizeError
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{oversizedInboxReplay}}); !errors.As(err, &bound) {
+		t.Fatalf("oversized inbox replay err = %v", err)
 	}
 	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{{InboxID: inbox.InboxID, ExpectedVersion: 1, Version: 3, Status: InboxStatusPending}}}); !errors.Is(err, ErrParticipantConflict) {
 		t.Fatalf("existing inbox supplied version err = %v", err)
@@ -705,8 +721,24 @@ func TestTask5ParticipantVersionContract(t *testing.T) {
 		t.Fatalf("new effect supplied version err = %v", err)
 	}
 	effect.Version = 1
+	effect.ExpectedVersion = 9
+	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{effect}}); !errors.Is(err, ErrParticipantConflict) {
+		t.Fatalf("new effect expected version err = %v", err)
+	}
+	effect.ExpectedVersion = 0
 	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{effect}}); err != nil {
 		t.Fatalf("new effect version 1: %v", err)
+	}
+	replayEffect := effect
+	replayEffect.Version = 0
+	if result, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{replayEffect}}); err != nil || !result.Deduplicated || !result.Idempotent {
+		t.Fatalf("existing effect full replay = %#v err=%v", result, err)
+	}
+	oversizedEffectReplay := replayEffect
+	oversizedEffectReplay.PayloadCiphertext = make([]byte, task5PayloadLimit+1)
+	bound = nil
+	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{oversizedEffectReplay}}); !errors.As(err, &bound) {
+		t.Fatalf("oversized effect replay err = %v", err)
 	}
 	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{EffectID: effect.EffectID, ExpectedVersion: 1, Version: 3, Status: OutboxStatusPending}}}); !errors.Is(err, ErrParticipantConflict) {
 		t.Fatalf("existing effect supplied version err = %v", err)
@@ -742,5 +774,96 @@ func TestTask5ParticipantVersionContract(t *testing.T) {
 	}
 	if _, err := store.Commit(ctx, UnitOfWork{ArtifactUpdates: []ArtifactUpdate{{ArtifactID: artifact.ArtifactID, ExpectedVersion: 1, Version: 2}}}); err != nil {
 		t.Fatalf("existing artifact version 2: %v", err)
+	}
+}
+func TestTask5UOWCallbackStartedTimestamp(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	inbox := task5Inbox("uow-callback-started", "uow-callback-provider", "uow-callback-lane")
+	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "uow-callback-worker", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{{InboxID: inbox.InboxID, ExpectedVersion: lease.Update.Version, Version: lease.Update.Version + 1, Status: InboxStatusCallbackStarted, LeaseOwner: lease.Update.LeaseOwner, LeaseEpoch: lease.Update.LeaseEpoch, AttemptID: lease.Update.AttemptID}}}); err != nil {
+		t.Fatal(err)
+	}
+	var row inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.CallbackStartedAt == nil || row.Status != InboxStatusCallbackStarted {
+		t.Fatalf("callback-started participant row = %#v", row)
+	}
+}
+func TestTask5UOWExpiryScrubsBeforeError(t *testing.T) {
+	store, db, clock := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	inbox := task5Inbox("uow-expired-inbox", "uow-expired-provider", "uow-expired-lane")
+	inbox.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
+		t.Fatal(err)
+	}
+	inboxLease, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "uow-expiry-worker", LeaseDuration: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Minute)
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{{InboxID: inbox.InboxID, ExpectedVersion: inboxLease.Update.Version, Version: inboxLease.Update.Version + 1, Status: InboxStatusCallbackStarted, LeaseOwner: inboxLease.Update.LeaseOwner, LeaseEpoch: inboxLease.Update.LeaseEpoch, AttemptID: inboxLease.Update.AttemptID}}}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("uow callback expiry err = %v", err)
+	}
+	var inboxRow inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&inboxRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(inboxRow.PayloadCiphertext) != 0 || len(inboxRow.PayloadNonce) != 0 {
+		t.Fatalf("uow inbox expiry retained payload: %#v", inboxRow)
+	}
+
+	effect := task5Effect("uow-expired-effect", "uow-expired-effect-lane")
+	effect.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
+		t.Fatal(err)
+	}
+	effectLease, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "uow-expiry-worker", LeaseDuration: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Minute)
+	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{EffectID: effect.EffectID, ExpectedVersion: effectLease.Effect.Version, Version: effectLease.Effect.Version + 1, Status: OutboxStatusPending, LeaseOwner: effectLease.Effect.LeaseOwner, LeaseEpoch: effectLease.Effect.LeaseEpoch, AttemptID: effectLease.Effect.AttemptID}}}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("uow pending expiry err = %v", err)
+	}
+	var effectRow outboxEffectRow
+	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&effectRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(effectRow.PayloadCiphertext) != 0 || len(effectRow.PayloadNonce) != 0 {
+		t.Fatalf("uow effect expiry retained payload: %#v", effectRow)
+	}
+
+	ambiguous := task5Effect("uow-expired-ambiguous", "uow-expired-ambiguous-lane")
+	ambiguous.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.AcceptOutbox(ctx, ambiguous); err != nil {
+		t.Fatal(err)
+	}
+	ambiguousLease, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "uow-expiry-worker", LeaseDuration: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Minute)
+	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{EffectID: ambiguous.EffectID, ExpectedVersion: ambiguousLease.Effect.Version, Version: ambiguousLease.Effect.Version + 1, Status: OutboxStatusAmbiguous, LeaseOwner: ambiguousLease.Effect.LeaseOwner, LeaseEpoch: ambiguousLease.Effect.LeaseEpoch, AttemptID: ambiguousLease.Effect.AttemptID}}}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("uow ambiguous expiry err = %v", err)
+	}
+	effectRow = outboxEffectRow{}
+	if err := db.GORM().Where("effect_id = ?", ambiguous.EffectID).First(&effectRow).Error; err != nil {
+		t.Fatalf("query ambiguous effect %q err=%v", ambiguous.EffectID, err)
+	}
+	if len(effectRow.PayloadCiphertext) != 0 || len(effectRow.PayloadNonce) != 0 {
+		t.Fatalf("uow ambiguous expiry retained payload: %#v", effectRow)
 	}
 }
