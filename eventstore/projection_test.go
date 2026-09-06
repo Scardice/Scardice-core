@@ -286,6 +286,51 @@ func TestRebuildAbortsWhenProjectorRegistryChanges(t *testing.T) {
 	}
 }
 
+func TestRebuildAbortsWhenLegacyProjectorRegistersConcurrently(t *testing.T) {
+	store, db := projectionTestStore(t)
+	defer db.Close()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls int
+	if err := store.RegisterProjection(projectionDescriptor("v1", func(_ context.Context, tx *gorm.DB, events []Envelope) error {
+		calls++
+		if calls == 2 {
+			close(started)
+			<-release
+		}
+		return projectionApply(context.Background(), tx, events)
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{"a", "legacy-registry"}, Events: []NewEvent{testEvent("legacy-registry-1")}}}}); err != nil {
+		t.Fatal(err)
+	}
+	var before projectionControlRow
+	if err := db.GORM().First(&before).Error; err != nil {
+		t.Fatal(err)
+	}
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := store.Rebuild(context.Background(), RebuildRequest{ProjectorVersion: "v1"})
+		resultCh <- err
+	}()
+	<-started
+	if err := store.RegisterProjector(Projector(func(context.Context, *gorm.DB, []Envelope) error { return nil })); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-resultCh; !errors.Is(err, ErrProjectorRegistryChanged) {
+		t.Fatalf("legacy registry change error = %v", err)
+	}
+	var after projectionControlRow
+	if err := db.GORM().First(&after).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.ActiveGeneration != before.ActiveGeneration || after.TerminalPosition != before.TerminalPosition {
+		t.Fatalf("published after legacy registry change: before=%#v after=%#v", before, after)
+	}
+}
+
 func TestProjectorLiveWritesUseActiveGenerationAndRollback(t *testing.T) {
 	store, db := projectionTestStore(t)
 	defer db.Close()

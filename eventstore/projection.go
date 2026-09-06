@@ -395,8 +395,12 @@ func (s *GORMStore) publishProjection(ctx context.Context, generation string, cu
 	}
 	s.projectorMu.RLock()
 	defer s.projectorMu.RUnlock()
-	current := stableProjectors(s.projectors)
-	if !sameProjectors(current, projectors) || setVersion != projectorSetVersion(current) {
+	currentAll := append([]ProjectionDescriptor(nil), s.projectors...)
+	if !sameProjectors(currentAll, projectors) {
+		return RebuildResult{}, ErrProjectorRegistryChanged
+	}
+	current := stableProjectors(currentAll)
+	if setVersion != projectorSetVersion(current) {
 		return RebuildResult{}, ErrProjectorRegistryChanged
 	}
 	if err := validateProjectionRows(tx, generation); err != nil {
