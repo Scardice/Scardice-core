@@ -420,16 +420,19 @@ const sqliteOperationArtifactsDDL = `CREATE TABLE operation_artifacts (
 	consumed_at DATETIME,
 	FOREIGN KEY(operation_id) REFERENCES operations(operation_id) ON UPDATE RESTRICT ON DELETE RESTRICT
 )`
-
 func ensureSQLiteOperationArtifacts(db *gorm.DB) error {
+	ctx := context.Background()
+	if db.Statement != nil && db.Statement.Context != nil {
+		ctx = db.Statement.Context
+	}
 	sqlDB, err := db.DB()
 	if err != nil {
 		return err
 	}
 	var tableName string
-	err = sqlDB.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'operation_artifacts'`).Scan(&tableName)
+	err = sqlDB.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'operation_artifacts'`).Scan(&tableName)
 	if errors.Is(err, sql.ErrNoRows) {
-		_, err = sqlDB.Exec(sqliteOperationArtifactsDDL)
+		_, err = sqlDB.ExecContext(ctx, sqliteOperationArtifactsDDL)
 		return err
 	}
 	if err != nil {
@@ -438,7 +441,7 @@ func ensureSQLiteOperationArtifacts(db *gorm.DB) error {
 
 	type columnInfo struct{ notNull int }
 	columns := make(map[string]columnInfo)
-	rows, err := sqlDB.Query(`SELECT name, "notnull" FROM pragma_table_info('operation_artifacts')`)
+	rows, err := sqlDB.QueryContext(ctx, `SELECT name, "notnull" FROM pragma_table_info('operation_artifacts')`)
 	if err != nil {
 		return err
 	}
@@ -471,7 +474,7 @@ func ensureSQLiteOperationArtifacts(db *gorm.DB) error {
 	}
 
 	fkReady := false
-	fkRows, err := sqlDB.Query(`SELECT "table", "from", "to", on_update, on_delete FROM pragma_foreign_key_list('operation_artifacts')`)
+	fkRows, err := sqlDB.QueryContext(ctx, `SELECT "table", "from", "to", on_update, on_delete FROM pragma_foreign_key_list('operation_artifacts')`)
 	if err != nil {
 		return err
 	}
@@ -497,7 +500,7 @@ func ensureSQLiteOperationArtifacts(db *gorm.DB) error {
 
 	if versionPresent && !versionNotNull {
 		var nullVersions int
-		if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM operation_artifacts WHERE version IS NULL`).Scan(&nullVersions); err != nil {
+		if err := sqlDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_artifacts WHERE version IS NULL`).Scan(&nullVersions); err != nil {
 			return err
 		}
 		if nullVersions != 0 {
@@ -505,20 +508,23 @@ func ensureSQLiteOperationArtifacts(db *gorm.DB) error {
 		}
 	}
 	var orphanCount int
-	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM operation_artifacts AS a LEFT JOIN operations AS o ON o.operation_id = a.operation_id WHERE o.operation_id IS NULL`).Scan(&orphanCount); err != nil {
+	if err := sqlDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_artifacts AS a LEFT JOIN operations AS o ON o.operation_id = a.operation_id WHERE o.operation_id IS NULL`).Scan(&orphanCount); err != nil {
 		return err
 	}
 	if orphanCount != 0 {
 		return fmt.Errorf("SQLite operation_artifacts contains orphan operation references")
 	}
 
-	tx := db.Begin()
+	tx := db.WithContext(ctx).Begin()
 	if tx.Error != nil {
 		return tx.Error
 	}
 	rollback := func(cause error) error {
 		_ = tx.Rollback().Error
 		return cause
+	}
+	if err := tx.Exec(`DROP INDEX IF EXISTS ux_operation_artifacts_artifact_id`).Error; err != nil {
+		return rollback(err)
 	}
 	if err := tx.Exec(`ALTER TABLE operation_artifacts RENAME TO operation_artifacts_legacy`).Error; err != nil {
 		return rollback(err)
@@ -539,6 +545,9 @@ func ensureSQLiteOperationArtifacts(db *gorm.DB) error {
 		return rollback(err)
 	}
 	if err := tx.Exec(`DROP TABLE operation_artifacts_legacy`).Error; err != nil {
+		return rollback(err)
+	}
+	if err := tx.Exec(`CREATE UNIQUE INDEX ux_operation_artifacts_artifact_id ON operation_artifacts(artifact_id)`).Error; err != nil {
 		return rollback(err)
 	}
 	if err := tx.Commit().Error; err != nil {

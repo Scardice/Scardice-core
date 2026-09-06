@@ -479,6 +479,9 @@ func TestSQLiteLegacyOperationArtifactsUpgrade(t *testing.T) {
 	if err := legacy.Exec(`INSERT INTO operation_artifacts (artifact_id, operation_id, owner_principal_id, media_type, size, status, expires_at) VALUES ('legacy-artifact', 'legacy-op', 'principal', 'text/plain', 7, 'available', CURRENT_TIMESTAMP)`).Error; err != nil {
 		t.Fatalf("insert legacy artifact: %v", err)
 	}
+	if err := legacy.Exec(`CREATE UNIQUE INDEX ux_operation_artifacts_artifact_id ON operation_artifacts(artifact_id)`).Error; err != nil {
+		t.Fatalf("create legacy artifact index: %v", err)
+	}
 	legacySQL, err := legacy.DB()
 	if err != nil {
 		t.Fatalf("get legacy sql database: %v", err)
@@ -492,6 +495,7 @@ func TestSQLiteLegacyOperationArtifactsUpgrade(t *testing.T) {
 		t.Fatalf("upgrade legacy sqlite database: %v", err)
 	}
 	defer db.Close()
+	assertIndexColumns(t, db, tableOperationArtifacts, "ux_operation_artifacts_artifact_id", []string{"artifact_id"})
 	var version int
 	if err := db.SQLDB().QueryRowContext(context.Background(), `SELECT version FROM operation_artifacts WHERE artifact_id = 'legacy-artifact'`).Scan(&version); err != nil {
 		t.Fatalf("read upgraded artifact version: %v", err)
