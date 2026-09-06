@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,6 +52,8 @@ func TestCommitRejectsDuplicateAndOversize(t *testing.T) {
 	if err := ValidateUnitOfWork(UnitOfWork{Streams:[]StreamAppend{{Stream:StreamID{"bound","events"},Events:events}}}); err == nil { t.Fatal("event bound accepted") } else if bound,ok:=err.(*OversizeError); !ok || bound.Bound!="unit of work events" { t.Fatalf("event bound err = %v",err) }
 	bytes := make([]NewEvent, 65); for i := range bytes { bytes[i]=testEvent(strconv.Itoa(i)); bytes[i].Payload=make([]byte,MaxEventPayloadBytes) }
 	if err := ValidateUnitOfWork(UnitOfWork{Streams:[]StreamAppend{{Stream:StreamID{"bound","bytes"},Events:bytes}}}); err == nil { t.Fatal("byte bound accepted") } else if bound,ok:=err.(*OversizeError); !ok || bound.Bound!="unit of work encoded bytes" { t.Fatalf("byte bound err = %v",err) }
+	participantBytes := UnitOfWork{Operations: []OperationUpdate{{OperationID:"oversized-participant", PrivateContextCiphertext:make([]byte, MaxUnitOfWorkBytes)}}}
+	if err := ValidateUnitOfWork(participantBytes); err == nil { t.Fatal("participant byte bound accepted") } else if bound,ok:=err.(*OversizeError); !ok || bound.Bound!="unit of work encoded bytes" { t.Fatalf("participant byte bound err = %v",err) }
 }
 
 func testEvent(id string) NewEvent {
@@ -138,16 +141,26 @@ func TestZeroStreamParticipantUpdates(t *testing.T) {
 		ArtifactUpdates: []ArtifactUpdate{{ArtifactID:"art-zero", OperationID:"op-zero", Ciphertext:[]byte("cipher")}},
 		SecretUpdates: []SecretUpdate{{SecretRef:"secret-zero", Ciphertext:[]byte("secret"), Nonce:[]byte("nonce")}},
 		PluginKVUpdates: []PluginKVUpdate{{ExtensionID:"plugin-zero", KeyHMAC:[]byte("key-zero"), KeyCiphertext:[]byte("key"), ValueCiphertext:[]byte("value")}},
+		InboxUpdates: []InboxUpdate{{InboxID:"inbox-zero", EndpointID:"endpoint-zero", ProviderEventKey:"provider-zero", LaneHMAC:[]byte("in-lane"), OrderingSequence:1, Status:"received", LeaseOwner:"owner-zero", LeaseEpoch:7, AttemptID:"attempt-zero", PayloadCiphertext:[]byte("in-payload"), PayloadNonce:[]byte("in-nonce"), ContentDigest:[]byte("in-digest"), DigestKeyID:"in-key", WorkflowID:"workflow-zero"}},
+		Effects: []NewEffect{{EffectID:"effect-zero", EndpointID:"endpoint-zero", LaneHMAC:[]byte("out-lane"), OrderingSequence:1, EffectType:"send", RiskClass:"high", Status:"pending", AttemptID:"effect-attempt", LeaseOwner:"effect-owner", LeaseEpoch:9, PayloadCiphertext:[]byte("out-payload"), PayloadNonce:[]byte("out-nonce"), ContentDigest:[]byte("out-digest"), DigestKeyID:"out-key", ProviderMessageID:"provider-message", ResultCode:"initial", ErrorCode:"initial-error"}},
 		FenceUpdates: []SubjectFenceUpdate{{SubjectKey:[]byte("subject-zero"), Scope:"all", PurgeOperationID:"op-zero"}},
 	}
 	result, err := store.Commit(context.Background(), work)
 	if err != nil { t.Fatal(err) }
-	if len(result.Events) != 0 || len(result.ArtifactIDs) != 1 || len(result.SecretRefs) != 1 || len(result.PluginKVIndexes) != 1 || len(result.FenceKeys) != 1 { t.Fatalf("result = %#v", result) }
+	if len(result.Events) != 0 || len(result.ArtifactIDs) != 1 || len(result.SecretRefs) != 1 || len(result.PluginKVIndexes) != 1 || len(result.InboxIDs) != 1 || len(result.EffectIDs) != 1 || len(result.FenceKeys) != 1 { t.Fatalf("result = %#v", result) }
 	var sequence eventGlobalSequenceRow
 	if err := db.GORM().First(&sequence).Error; err != nil { t.Fatal(err) }
 	if sequence.NextPosition != 1 { t.Fatalf("sequence advanced to %d", sequence.NextPosition) }
 	if _, err := store.Commit(context.Background(), UnitOfWork{ArtifactUpdates: []ArtifactUpdate{{ArtifactID:"art-zero", ExpectedVersion:1, OperationID:"op-zero", Ciphertext:[]byte("cipher-2")}}}); err != nil { t.Fatalf("artifact CAS update: %v", err) }
 	if _, err := store.Commit(context.Background(), UnitOfWork{Operations: []OperationUpdate{{OperationID:"op-zero", ExpectedVersion:1, Status:"running"}}}); err != nil { t.Fatalf("sparse operation update: %v", err) }
+	if _, err := store.Commit(context.Background(), UnitOfWork{InboxUpdates: []InboxUpdate{{InboxID:"inbox-zero", ExpectedVersion:1, Status:"callback", AttemptID:"attempt-callback"}}}); err != nil { t.Fatalf("sparse inbox update: %v", err) }
+	var inboxRow inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", "inbox-zero").First(&inboxRow).Error; err != nil { t.Fatal(err) }
+	if inboxRow.Version != 2 || inboxRow.Status != "callback" || inboxRow.AttemptID != "attempt-callback" || inboxRow.ProviderEventKey != "provider-zero" || string(inboxRow.LaneHMAC) != "in-lane" || inboxRow.LeaseEpoch != 7 || string(inboxRow.PayloadCiphertext) != "in-payload" || inboxRow.WorkflowID != "workflow-zero" { t.Fatalf("inbox sparse preservation = %#v", inboxRow) }
+	if _, err := store.Commit(context.Background(), UnitOfWork{Effects: []NewEffect{{EffectID:"effect-zero", ExpectedVersion:1, Status:"dispatched", ResultCode:"delivered"}}}); err != nil { t.Fatalf("sparse effect update: %v", err) }
+	var effectRow outboxEffectRow
+	if err := db.GORM().Where("effect_id = ?", "effect-zero").First(&effectRow).Error; err != nil { t.Fatal(err) }
+	if effectRow.Version != 2 || effectRow.Status != "dispatched" || effectRow.ResultCode != "delivered" || effectRow.ProviderMessageID != "provider-message" || string(effectRow.LaneHMAC) != "out-lane" || effectRow.LeaseEpoch != 9 || string(effectRow.PayloadCiphertext) != "out-payload" || effectRow.RiskClass != "high" { t.Fatalf("effect sparse preservation = %#v", effectRow) }
 	pluginResult, err := store.Commit(context.Background(), UnitOfWork{PluginKVUpdates: []PluginKVUpdate{{ExtensionID:"plugin-zero", KeyHMAC:[]byte("key-zero"), ExpectedVersion:1, ValueCiphertext:[]byte("value-2")}}})
 	if err != nil { t.Fatalf("sparse plugin update: %v", err) }
 	if len(pluginResult.PluginKVIndexes) != 1 || string(pluginResult.PluginKVIndexes[0]) != "key-zero" { t.Fatalf("plugin update result = %#v", pluginResult) }
@@ -164,4 +177,11 @@ func TestZeroStreamParticipantUpdates(t *testing.T) {
 	if err := db.GORM().Model(&adapterSecretRow{}).Where("secret_ref = ?", "secret-zero").Count(&secretRows).Error; err != nil { t.Fatal(err) }
 	if err := db.GORM().Model(&pluginKVRow{}).Where("extension_id = ?", "plugin-zero").Count(&pluginRows).Error; err != nil { t.Fatal(err) }
 	if secretRows != 2 || pluginRows != 0 { t.Fatalf("secret history=%d plugin rows=%d", secretRows, pluginRows) }
+}
+func TestParticipantConflictIsTypedAndRedacted(t *testing.T) {
+	store, db := testStore(t); defer db.Close()
+	if _, err := store.Commit(context.Background(), UnitOfWork{Operations: []OperationUpdate{{OperationID:"secret-operation", Status:"pending"}}}); err != nil { t.Fatal(err) }
+	_, err := store.Commit(context.Background(), UnitOfWork{Operations: []OperationUpdate{{OperationID:"secret-operation", ExpectedVersion:0, Status:"running"}}})
+	if !errors.Is(err, ErrParticipantConflict) { t.Fatalf("errors.Is participant conflict = %v", err) }
+	if err == nil || strings.Contains(err.Error(), "secret-operation") { t.Fatalf("participant error leaked key: %v", err) }
 }

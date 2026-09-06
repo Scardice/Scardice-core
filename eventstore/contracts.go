@@ -473,7 +473,15 @@ func ValidateUnitOfWork(work UnitOfWork) error {
 	}
 	seen := make(map[StreamID]struct{}, len(work.Streams))
 	eventCount := 0
-	encodedBytes := 0
+	var encodedBytes uint64
+	addBytes := func(n int) {
+		if n <= 0 || encodedBytes > MaxUnitOfWorkBytes { return }
+		if uint64(n) > uint64(MaxUnitOfWorkBytes)-encodedBytes {
+			encodedBytes = uint64(MaxUnitOfWorkBytes) + 1
+			return
+		}
+		encodedBytes += uint64(n)
+	}
 	for _, append := range work.Streams {
 		if append.Stream.AggregateType == "" || append.Stream.AggregateID == "" {
 			return ErrInvalidEvent
@@ -493,14 +501,36 @@ func ValidateUnitOfWork(work UnitOfWork) error {
 			if len(event.Payload) > MaxEventPayloadBytes {
 				return &OversizeError{Bound: "event payload", Limit: MaxEventPayloadBytes, Actual: len(event.Payload)}
 			}
-			encodedBytes += len(event.Payload)
+			addBytes(len(event.Payload))
 		}
 	}
 	if eventCount > MaxUnitOfWorkEvents {
 		return &OversizeError{Bound: "unit of work events", Limit: MaxUnitOfWorkEvents, Actual: eventCount}
 	}
+	for _, update := range work.Operations {
+		addBytes(len(update.OperationID) + len(update.Kind) + len(update.Status) + len(update.PrincipalID) + len(update.ResourceID) + len(update.IdempotencyScope) + len(update.IdempotencyKey) + len(update.RequestID) + len(update.RequestDigest) + len(update.CorrelationID) + len(update.ResultCode) + len(update.ErrorCode) + len(update.ArtifactID) + len(update.PrivateContextCiphertext) + len(update.PrivateContextNonce) + len(update.EncryptionKeyID))
+	}
+	for _, update := range work.InboxUpdates {
+		addBytes(len(update.InboxID) + len(update.EndpointID) + len(update.ProviderEventKey) + len(update.LaneHMAC) + len(update.Status) + len(update.LeaseOwner) + len(update.AttemptID) + len(update.PayloadCiphertext) + len(update.PayloadNonce) + len(update.ContentDigest) + len(update.DigestKeyID) + len(update.WorkflowID))
+	}
+	for _, update := range work.Effects {
+		addBytes(len(update.EffectID) + len(update.EndpointID) + len(update.LaneHMAC) + len(update.EffectType) + len(update.RiskClass) + len(update.Status) + len(update.AttemptID) + len(update.LeaseOwner) + len(update.PayloadCiphertext) + len(update.PayloadNonce) + len(update.ContentDigest) + len(update.DigestKeyID) + len(update.ProviderMessageID) + len(update.ResultCode) + len(update.ErrorCode))
+	}
+	for _, update := range work.ArtifactUpdates {
+		addBytes(len(update.ArtifactID) + len(update.OperationID) + len(update.OwnerPrincipalID) + len(update.MediaType) + len(update.SafeFilename) + len(update.Ciphertext) + len(update.Nonce) + len(update.EncryptionKeyID) )
+	}
+	for _, update := range work.SecretUpdates {
+		addBytes(len(update.SecretRef) + len(update.EndpointID) + len(update.AdapterID) + len(update.Ciphertext) + len(update.Nonce) + len(update.EncryptionKeyID))
+	}
+	for _, update := range work.PluginKVUpdates {
+		addBytes(len(update.ExtensionID) + len(update.KeyHMAC) + len(update.KeyCiphertext) + len(update.KeyNonce) + len(update.ValueCiphertext) + len(update.ValueNonce) + len(update.EncryptionKeyID))
+	}
+	for _, update := range work.FenceUpdates {
+		addBytes(len(update.SubjectKey) + len(update.Scope) + len(update.PurgeOperationID))
+	}
 	if encodedBytes > MaxUnitOfWorkBytes {
-		return &OversizeError{Bound: "unit of work encoded bytes", Limit: MaxUnitOfWorkBytes, Actual: encodedBytes}
+		actual := int(encodedBytes)
+		return &OversizeError{Bound: "unit of work encoded bytes", Limit: MaxUnitOfWorkBytes, Actual: actual}
 	}
 	if err := validateParticipantKeys(work); err != nil { return err }
 	return nil
