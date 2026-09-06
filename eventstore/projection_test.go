@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"sync"
 	"time"
 	"gorm.io/gorm"
 )
@@ -45,6 +46,9 @@ func TestProjectionRegistrationRejectsEmptyDuplicateAndConflictingVersion(t *tes
 	if err := store.RegisterProjection(ProjectionDescriptor{Name: "events", Apply: apply}); !errors.Is(err, ErrInvalidProjector) {
 		t.Fatalf("empty version error = %v", err)
 	}
+	if err := store.RegisterProjection(ProjectionDescriptor{Name: "alias", Version: "v1", SchemaVersion: "v2", Apply: apply}); !errors.Is(err, ErrProjectorVersionConflict) {
+		t.Fatalf("alias version conflict error = %v", err)
+	}
 	if err := store.RegisterProjection(projectionDescriptor("v1", apply)); err != nil {
 		t.Fatal(err)
 	}
@@ -57,13 +61,130 @@ func TestProjectionRegistrationRejectsEmptyDuplicateAndConflictingVersion(t *tes
 	if err := store.RegisterProjection(ProjectionDescriptor{Name: "other", Version: "v2", Apply: apply}); !errors.Is(err, ErrProjectorVersionConflict) {
 		t.Fatalf("cross-projector conflict error = %v", err)
 	}
+	_, dbWithOption := projectionTestStore(t)
+	defer dbWithOption.Close()
+	invalid := NewStore(dbWithOption, WithProjection(ProjectionDescriptor{Name: " ", Version: "v1", Apply: apply}))
+	if _, err := invalid.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{"a", "option"}, Events: []NewEvent{testEvent("option")}}}}); !errors.Is(err, ErrInvalidProjector) {
+		t.Fatalf("invalid option error = %v", err)
+	}
+}
+func TestProjectorSetVersionIncludesEveryStableName(t *testing.T) {
+	apply := func(context.Context, *gorm.DB, []Envelope) error { return nil }
+	single := projectorSetVersion([]ProjectionDescriptor{{Name: "events", Version: "v1", Apply: apply}})
+	double := projectorSetVersion([]ProjectionDescriptor{
+		{Name: "events", Version: "v1", Apply: apply},
+		{Name: "other", Version: "v1", Apply: apply},
+	})
+	if single == double {
+		t.Fatalf("projector set identity ignored registration set: %q", single)
+	}
+	collisionA := projectorSetVersion([]ProjectionDescriptor{{Name: "a=b", Version: "v"}})
+	collisionB := projectorSetVersion([]ProjectionDescriptor{{Name: "a", Version: "b=v"}})
+	if collisionA == collisionB {
+		t.Fatalf("projector set identity collided: %q", collisionA)
+	}
+}
+func TestRebuildEmptyStorePublishesGeneration(t *testing.T) {
+	store, db := projectionTestStore(t)
+	defer db.Close()
+	if err := store.RegisterProjection(projectionDescriptor("v1", projectionApply)); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.Rebuild(context.Background(), RebuildRequest{ProjectorVersion: "v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.GenerationID == "" || result.TerminalPosition != 0 {
+		t.Fatalf("empty rebuild result = %#v", result)
+	}
+	var control projectionControlRow
+	if err := db.GORM().First(&control).Error; err != nil {
+		t.Fatal(err)
+	}
+	if control.ActiveGeneration != result.GenerationID || control.TerminalPosition != 0 {
+		t.Fatalf("empty rebuild control = %#v", control)
+	}
+}
+
+func TestRebuildRejectsMalformedPersistedEnvelope(t *testing.T) {
+	store, db := projectionTestStore(t)
+	defer db.Close()
+	if err := store.RegisterProjection(projectionDescriptor("v1", projectionApply)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{"a", "malformed"}, Events: []NewEvent{testEvent("malformed")}}}}); err != nil {
+		t.Fatal(err)
+	}
+	var row domainEventRow
+	if err := db.GORM().Where("event_id = ?", "malformed").First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := projectionEnvelope(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope.Stream.AggregateType = ""
+	checksum := ComputeEventChecksum(envelope)
+	row.Checksum = append([]byte(nil), checksum[:]...)
+	if err := db.GORM().Model(&domainEventRow{}).Where("event_id = ?", "malformed").Updates(map[string]any{"aggregate_type": "", "checksum": row.Checksum}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Rebuild(context.Background(), RebuildRequest{ProjectorVersion: "v1"}); !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("malformed rebuild error = %v", err)
+	}
+}
+
+
+func TestRebuildAbortsWhenProjectorRegistryChanges(t *testing.T) {
+	store, db := projectionTestStore(t)
+	defer db.Close()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls int
+	if err := store.RegisterProjection(projectionDescriptor("v1", func(_ context.Context, tx *gorm.DB, events []Envelope) error {
+		calls++
+		if calls == 2 {
+			close(started)
+			<-release
+		}
+		return projectionApply(context.Background(), tx, events)
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{"a", "registry"}, Events: []NewEvent{testEvent("registry-1")}}}}); err != nil {
+		t.Fatal(err)
+	}
+	var before projectionControlRow
+	if err := db.GORM().First(&before).Error; err != nil {
+		t.Fatal(err)
+	}
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := store.Rebuild(context.Background(), RebuildRequest{ProjectorVersion: "v1"})
+		resultCh <- err
+	}()
+	<-started
+	if err := store.RegisterProjection(ProjectionDescriptor{Name: "other", Version: "v1", Apply: projectionApply}); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-resultCh; !errors.Is(err, ErrProjectorRegistryChanged) {
+		t.Fatalf("registry change rebuild error = %v", err)
+	}
+	var after projectionControlRow
+	if err := db.GORM().First(&after).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.ActiveGeneration != before.ActiveGeneration || after.TerminalPosition != before.TerminalPosition {
+		t.Fatalf("published after registry change: before=%#v after=%#v", before, after)
+	}
 }
 
 func TestProjectorLiveWritesUseActiveGenerationAndRollback(t *testing.T) {
 	store, db := projectionTestStore(t)
 	defer db.Close()
 	var calls int
-	store.RegisterProjection(projectionDescriptor("v1", func(_ context.Context, tx *gorm.DB, events []Envelope) error {
+	if err := store.RegisterProjection(projectionDescriptor("v1", func(_ context.Context, tx *gorm.DB, events []Envelope) error {
 		calls++
 		for _, event := range events {
 			if err := writeProjection(tx, event); err != nil {
@@ -71,7 +192,9 @@ func TestProjectorLiveWritesUseActiveGenerationAndRollback(t *testing.T) {
 			}
 		}
 		return nil
-	}))
+	})); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{"a", "1"}, Events: []NewEvent{testEvent("live-1")}}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +229,9 @@ func TestProjectorLiveWritesUseActiveGenerationAndRollback(t *testing.T) {
 func TestRebuildKeysetDigestAndPriorGenerationRetention(t *testing.T) {
 	store, db := projectionTestStore(t)
 	defer db.Close()
+	var pageSizes []int
 	apply := func(_ context.Context, tx *gorm.DB, events []Envelope) error {
+		pageSizes = append(pageSizes, len(events))
 		for _, event := range events {
 			if err := writeProjection(tx, event); err != nil {
 				return err
@@ -121,6 +246,9 @@ func TestRebuildKeysetDigestAndPriorGenerationRetention(t *testing.T) {
 		events := make([]NewEvent, 64)
 		for i := range events {
 			events[i] = testEvent(fmt.Sprintf("rebuild-%04d", batch*64+i))
+			if batch == 0 && i == 0 {
+				events[i].Payload = []byte{}
+			}
 		}
 		if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{"a", "rebuild"}, ExpectedVersion: uint64(batch * 64), Events: events}}}); err != nil {
 			t.Fatal(err)
@@ -130,8 +258,23 @@ func TestRebuildKeysetDigestAndPriorGenerationRetention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	row, err := store.ReadProjectionRow(context.Background(), "events", "rebuild-0000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Payload == nil || len(row.Payload) != 0 {
+		t.Fatalf("empty payload was not preserved: %#v", row.Payload)
+	}
 	if result.TerminalPosition != 1024 || result.GenerationID == "" {
 		t.Fatalf("result = %#v", result)
+	}
+	sawFullPage, sawRemainder := false, false
+	for _, size := range pageSizes {
+		sawFullPage = sawFullPage || size == projectionPageSize
+		sawRemainder = sawRemainder || size == 24
+	}
+	if !sawFullPage || !sawRemainder {
+		t.Fatalf("keyset page sizes = %#v", pageSizes)
 	}
 	var oldRows int64
 	if err := db.GORM().Model(&projectionReadModelRow{}).Where("projection_generation = ?", "initial").Count(&oldRows).Error; err != nil {
@@ -155,6 +298,70 @@ func TestRebuildKeysetDigestAndPriorGenerationRetention(t *testing.T) {
 		t.Fatalf("digest changed: %s != %s", result.Digest, again.Digest)
 	}
 }
+func TestRebuildCatchesConcurrentCommitBeforePublication(t *testing.T) {
+	store, db := projectionTestStore(t)
+	defer db.Close()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	apply := func(_ context.Context, tx *gorm.DB, events []Envelope) error {
+		if len(events) == projectionPageSize {
+			once.Do(func() {
+				close(started)
+				<-release
+			})
+		}
+		return projectionApply(context.Background(), tx, events)
+	}
+	if err := store.RegisterProjection(projectionDescriptor("v1", apply)); err != nil {
+		t.Fatal(err)
+	}
+	for batch := 0; batch < 16; batch++ {
+		events := make([]NewEvent, 64)
+		for i := range events {
+			events[i] = testEvent(fmt.Sprintf("concurrent-%04d", batch*64+i))
+		}
+		if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{"a", "concurrent"}, ExpectedVersion: uint64(batch * 64), Events: events}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rebuildResult := make(chan RebuildResult, 1)
+	rebuildErrors := make(chan error, 1)
+	go func() {
+		result, err := store.Rebuild(context.Background(), RebuildRequest{ProjectorVersion: "v1"})
+		rebuildResult <- result
+		rebuildErrors <- err
+	}()
+	<-started
+	commitResult := make(chan error, 1)
+	go func() {
+		_, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{"a", "concurrent"}, ExpectedVersion: 1024, Events: []NewEvent{testEvent("concurrent-tail")}}}})
+		commitResult <- err
+	}()
+	close(release)
+	if err := <-commitResult; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-rebuildErrors; err != nil {
+		t.Fatal(err)
+	}
+	result := <-rebuildResult
+	var control projectionControlRow
+	if err := db.GORM().First(&control).Error; err != nil {
+		t.Fatal(err)
+	}
+	if control.TerminalPosition != 1025 {
+		t.Fatalf("terminal position = %d, rebuild result = %#v", control.TerminalPosition, result)
+	}
+	row, err := store.ReadProjectionRow(context.Background(), "events", "concurrent-tail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.ProjectionGeneration != control.ActiveGeneration {
+		t.Fatalf("reader mixed generations: row=%#v control=%#v", row, control)
+	}
+}
+
 
 func TestRebuildRejectsCorruptChecksumAndUnsupportedSchema(t *testing.T) {
 	store, db := projectionTestStore(t)
@@ -217,14 +424,15 @@ func TestDigestIgnoresGeneration(t *testing.T) {
 	defer db.Close()
 	now := time.Now().UTC()
 	rows := []projectionReadModelRow{
-		{ProjectionGeneration: "one", ProjectionName: "events", RowKey: "a", Payload: []byte("1"), UpdatedAt: now},
-		{ProjectionGeneration: "two", ProjectionName: "events", RowKey: "a", Payload: []byte("1"), UpdatedAt: now.Add(time.Hour)},
+		{ProjectionGeneration: "one", ProjectionName: "z", RowKey: "z", Payload: []byte("1"), UpdatedAt: now},
+		{ProjectionGeneration: "one", ProjectionName: "A", RowKey: "A", Payload: []byte("2"), UpdatedAt: now},
+		{ProjectionGeneration: "two", ProjectionName: "A", RowKey: "A", Payload: []byte("2"), UpdatedAt: now.Add(time.Hour)},
+		{ProjectionGeneration: "two", ProjectionName: "z", RowKey: "z", Payload: []byte("1"), UpdatedAt: now.Add(time.Hour)},
 	}
-	if err := db.GORM().Create(&rows[0]).Error; err != nil {
-		t.Fatal(err)
-	}
-	if err := db.GORM().Create(&rows[1]).Error; err != nil {
-		t.Fatal(err)
+	for i := range rows {
+		if err := db.GORM().Create(&rows[i]).Error; err != nil {
+			t.Fatal(err)
+		}
 	}
 	first, err := store.DigestProjection(context.Background(), "one")
 	if err != nil {
@@ -247,5 +455,16 @@ func TestGenerationAwareReaderDoesNotMixGenerations(t *testing.T) {
 	}
 	if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{"a", "reader"}, Events: []NewEvent{testEvent("reader-1")}}}}); err != nil {
 		t.Fatal(err)
+	}
+	result, err := store.Rebuild(context.Background(), RebuildRequest{ProjectorVersion: "v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := store.ReadProjectionRow(context.Background(), "events", "reader-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.ProjectionGeneration != result.GenerationID || string(row.Payload) != `{"value":1}` {
+		t.Fatalf("reader mixed generations: row=%#v result=%#v", row, result)
 	}
 }

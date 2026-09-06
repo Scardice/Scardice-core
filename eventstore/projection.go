@@ -1,10 +1,13 @@
 package eventstore
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,8 +28,15 @@ type ProjectionRow struct {
 	ProjectionGeneration string
 	ProjectionName       string
 	RowKey               string
+
 	Payload              []byte
 	UpdatedAt            time.Time
+}
+func copyProjectionBytes(value []byte) []byte {
+	if value == nil {
+		return nil
+	}
+	return append([]byte{}, value...)
 }
 
 func ProjectionGeneration(tx *gorm.DB) string {
@@ -55,7 +65,7 @@ func UpsertProjectionRow(tx *gorm.DB, projectionName, rowKey string, payload []b
 		ProjectionGeneration: generation,
 		ProjectionName:       projectionName,
 		RowKey:               rowKey,
-		Payload:              append([]byte(nil), payload...),
+		Payload:              copyProjectionBytes(payload),
 		UpdatedAt:            time.Now().UTC(),
 	}
 	return tx.Clauses(clause.OnConflict{
@@ -68,46 +78,83 @@ func PutProjectionRow(tx *gorm.DB, projectionName, rowKey string, payload []byte
 	return UpsertProjectionRow(tx, projectionName, rowKey, payload)
 }
 
-func projectorSetVersion(projectors []ProjectionDescriptor) string {
-	if len(projectors) == 0 {
-		return "initial"
-	}
-	ordered := append([]ProjectionDescriptor(nil), projectors...)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Name < ordered[j].Name })
-	version := ordered[0].Version
-	allSame := true
-	for _, projector := range ordered[1:] {
-		if projector.Version != version {
-			allSame = false
-			break
+func stableProjectors(projectors []ProjectionDescriptor) []ProjectionDescriptor {
+	stable := make([]ProjectionDescriptor, 0, len(projectors))
+	for _, projector := range projectors {
+		if !projector.Legacy {
+			stable = append(stable, projector)
 		}
 	}
-	if allSame {
-		return version
+	return stable
+}
+
+func projectorSetVersion(projectors []ProjectionDescriptor) string {
+	ordered := append([]ProjectionDescriptor(nil), projectors...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Name < ordered[j].Name })
+	var builder strings.Builder
+	builder.WriteString("eventstore.projector-set.v1;")
+	for _, projector := range ordered {
+		builder.WriteString(strconv.Itoa(len(projector.Name)))
+		builder.WriteByte(':')
+		builder.WriteString(projector.Name)
+		builder.WriteString(strconv.Itoa(len(projector.Version)))
+		builder.WriteByte(':')
+		builder.WriteString(projector.Version)
 	}
-	parts := make([]string, len(ordered))
-	for i, projector := range ordered {
-		parts[i] = projector.Name + "=" + projector.Version
+	encoded := builder.String()
+	if len(encoded) <= 255 {
+		return encoded
 	}
-	return strings.Join(parts, "|")
+	sum := sha256.Sum256([]byte(encoded))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func sameProjectors(a, b []ProjectionDescriptor) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name || a[i].Version != b[i].Version || a[i].Legacy != b[i].Legacy {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *GORMStore) projectorSnapshot() ([]ProjectionDescriptor, string, error) {
 	if s == nil {
 		return nil, "", errors.New("eventstore: store unavailable")
 	}
-	s.mu.RLock()
-	projectors := append([]ProjectionDescriptor(nil), s.projectors...)
-	s.mu.RUnlock()
+	s.projectorMu.RLock()
+	projectors := stableProjectors(s.projectors)
+	s.projectorMu.RUnlock()
 	if len(projectors) == 0 {
 		return nil, "", ErrInvalidProjector
 	}
 	return projectors, projectorSetVersion(projectors), nil
 }
+func projectorRequestVersion(projectors []ProjectionDescriptor, requested, canonical string) bool {
+	if requested == canonical {
+		return true
+	}
+	if len(projectors) == 0 {
+		return false
+	}
+	for _, projector := range projectors {
+		if projector.Version != requested {
+			return false
+		}
+	}
+	return true
+}
+
 
 func (s *GORMStore) Rebuild(ctx context.Context, request RebuildRequest) (RebuildResult, error) {
 	if s == nil || s.db == nil || s.db.GORM() == nil {
 		return RebuildResult{}, errors.New("eventstore: store unavailable")
+	}
+	if initErr := s.initializationError(); initErr != nil {
+		return RebuildResult{}, initErr
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -116,7 +163,7 @@ func (s *GORMStore) Rebuild(ctx context.Context, request RebuildRequest) (Rebuil
 	if err != nil {
 		return RebuildResult{}, err
 	}
-	if request.ProjectorVersion == "" || request.ProjectorVersion != setVersion {
+	if request.ProjectorVersion == "" || !projectorRequestVersion(projectors, request.ProjectorVersion, setVersion) {
 		return RebuildResult{}, ErrProjectorVersionConflict
 	}
 	base := s.db.GORM().WithContext(ctx)
@@ -194,6 +241,12 @@ func loadProjectionEventPage(db *gorm.DB, cursor, highWater uint64) ([]domainEve
 }
 
 func projectionEnvelope(row domainEventRow) (Envelope, error) {
+	if row.AggregateType == "" || row.AggregateID == "" || row.AggregateVersion == 0 ||
+		row.GlobalPosition == 0 || row.EventID == "" || row.EventType == "" ||
+		row.CommandID == "" || row.CorrelationID == "" ||
+		row.SchemaVersion == 0 || len(row.Payload) > MaxEventPayloadBytes {
+		return Envelope{}, ErrInvalidEvent
+	}
 	if row.SchemaVersion != supportedEventSchemaVersion {
 		return Envelope{}, ErrUnsupportedEventSchema
 	}
@@ -209,7 +262,7 @@ func projectionEnvelope(row domainEventRow) (Envelope, error) {
 		EventID:        row.EventID,
 		EventType:      row.EventType,
 		SchemaVersion:  row.SchemaVersion,
-		Payload:        append([]byte(nil), row.Payload...),
+		Payload:        copyProjectionBytes(row.Payload),
 		Metadata: Metadata{
 			EventID:                   row.EventID,
 			CommandID:                row.CommandID,
@@ -276,6 +329,12 @@ func (s *GORMStore) publishProjection(ctx context.Context, generation string, cu
 		return RebuildResult{}, errors.New("eventstore: lock projection control failed")
 	}
 	s.observeLock(tableProjectionControl)
+	s.projectorMu.RLock()
+	defer s.projectorMu.RUnlock()
+	current := stableProjectors(s.projectors)
+	if !sameProjectors(current, projectors) || setVersion != projectorSetVersion(current) {
+		return RebuildResult{}, ErrProjectorRegistryChanged
+	}
 	var sequence eventGlobalSequenceRow
 	if err := locked(tx).Where("singleton_id = ?", "default").First(&sequence).Error; err != nil {
 		return RebuildResult{}, errors.New("eventstore: lock event sequence failed")
@@ -303,9 +362,9 @@ func (s *GORMStore) publishProjection(ctx context.Context, generation string, cu
 			}
 			envelopes[i] = envelope
 		}
-		tx = tx.Set(projectionGenerationKey, generation)
+		projectionTx := tx.Set(projectionGenerationKey, generation)
 		for _, projector := range projectors {
-			if err := projector.Apply(ctx, tx, envelopes); err != nil {
+			if err := projector.Apply(ctx, projectionTx, envelopes); err != nil {
 				return RebuildResult{}, ErrProjectorFailure
 			}
 		}
@@ -349,10 +408,16 @@ func validateProjectionRows(tx *gorm.DB, generation string) error {
 
 func digestProjectionRows(tx *gorm.DB, generation string) (EventChecksum, error) {
 	var rows []projectionReadModelRow
-	if err := tx.Where("projection_generation = ?", generation).
-		Order("projection_name ASC, row_key ASC").Find(&rows).Error; err != nil {
+	if err := tx.Where("projection_generation = ?", generation).Find(&rows).Error; err != nil {
 		return EventChecksum{}, err
 	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		nameI, nameJ := []byte(rows[i].ProjectionName), []byte(rows[j].ProjectionName)
+		if cmp := bytes.Compare(nameI, nameJ); cmp != 0 {
+			return cmp < 0
+		}
+		return bytes.Compare([]byte(rows[i].RowKey), []byte(rows[j].RowKey)) < 0
+	})
 	hash := sha256.New()
 	writeCanonicalString(hash, "eventstore.projection.digest.v1")
 	for _, row := range rows {
@@ -412,5 +477,5 @@ func (s *GORMStore) ReadProjectionRow(ctx context.Context, projectionName, rowKe
 		return ProjectionRow{}, errors.New("eventstore: commit projection read failed")
 	}
 	committed = true
-	return ProjectionRow{ProjectionGeneration: row.ProjectionGeneration, ProjectionName: row.ProjectionName, RowKey: row.RowKey, Payload: append([]byte(nil), row.Payload...), UpdatedAt: row.UpdatedAt}, nil
+	return ProjectionRow{ProjectionGeneration: row.ProjectionGeneration, ProjectionName: row.ProjectionName, RowKey: row.RowKey, Payload: copyProjectionBytes(row.Payload), UpdatedAt: row.UpdatedAt}, nil
 }
