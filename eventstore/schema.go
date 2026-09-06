@@ -85,7 +85,7 @@ type domainEventRow struct {
 	GlobalPosition         uint64    `gorm:"not null;uniqueIndex:ux_domain_events_global_position;index:ix_domain_events_global_position,priority:1"`
 	EventType              string    `gorm:"type:varchar(255);not null"`
 	SchemaVersion          uint16    `gorm:"not null"`
-	CommandID              string    `gorm:"type:varchar(255)"`
+	Payload                []byte    `gorm:"not null;size:262144"`
 	CorrelationID          string    `gorm:"type:varchar(255)"`
 	CausationID            string    `gorm:"type:varchar(255)"`
 	PrincipalID             string    `gorm:"type:varchar(255)"`

@@ -272,24 +272,34 @@ func dsnDeclaresVerifiedTLS(dbType, dsn string) bool {
 		if err != nil {
 			return false
 		}
-		tls := strings.ToLower(parsed.Query().Get("tls"))
-		return tls == "true"
+		values := parsed.Query()["tls"]
+		return len(values) == 1 && strings.EqualFold(values[0], "true")
 	}
 	parsed, err := url.Parse(dsn)
 	if err == nil {
-		sslmode := strings.ToLower(parsed.Query().Get("sslmode"))
-		if sslmode == "verify-full" || sslmode == "verify-ca" {
-			return true
+		values := parsed.Query()["sslmode"]
+		if len(values) == 1 {
+			mode := strings.ToLower(values[0])
+			return mode == "verify-full" || mode == "verify-ca"
+		}
+		if len(values) > 1 {
+			return false
 		}
 	}
+	mode := ""
+	count := 0
 	for _, field := range strings.Fields(dsn) {
 		key, value, ok := strings.Cut(field, "=")
-		if key == "sslmode" && ok {
-			value = strings.ToLower(value)
-			return value == "verify-full" || value == "verify-ca"
+		if key != "sslmode" || !ok {
+			continue
 		}
+		mode = strings.ToLower(value)
+		count++
 	}
-	return false
+	if count != 1 {
+		return false
+	}
+	return mode == "verify-full" || mode == "verify-ca"
 }
 
 func isLoopbackOrUnixDSN(dbType, dsn string) bool {
@@ -318,11 +328,14 @@ func isLoopbackOrUnixDSN(dbType, dsn string) bool {
 		if err != nil {
 			return false
 		}
-		hosts := parsed.Query()["host"]
-		if len(hosts) == 0 {
-			hosts = []string{parsed.Hostname()}
+		values := parsed.Query()["host"]
+		if len(values) > 1 {
+			return false
 		}
-		return allLoopbackOrUnixHosts(hosts)
+		if len(values) == 1 {
+			return allLoopbackOrUnixHosts(strings.Split(values[0], ","))
+		}
+		return allLoopbackOrUnixHosts([]string{parsed.Hostname()})
 	}
 	if strings.Contains(dsn, "host=") {
 		fields := strings.Fields(dsn)
@@ -331,14 +344,17 @@ func isLoopbackOrUnixDSN(dbType, dsn string) bool {
 				return false
 			}
 		}
+		hostValue := ""
+		hostCount := 0
 		for _, field := range fields {
 			key, value, ok := strings.Cut(field, "=")
 			if key != "host" || !ok || value == "" {
 				continue
 			}
-			return allLoopbackOrUnixHosts(strings.Split(value, ","))
+			hostValue = value
+			hostCount++
 		}
-		return false
+		return hostCount == 1 && allLoopbackOrUnixHosts(strings.Split(hostValue, ","))
 	}
 	return false
 }

@@ -327,3 +327,40 @@ func TestOpenDatabaseRejectsFailedSQLiteInitialization(t *testing.T) {
 	}
 	defer db.Close()
 }
+
+func TestEventStoreDomainEventPayloadColumn(t *testing.T) {
+	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "events.db")})
+	if err != nil {
+		t.Fatalf("open sqlite database: %v", err)
+	}
+	defer db.Close()
+	var columnType string
+	var notNull int
+	if err := db.SQLDB().QueryRowContext(context.Background(), "SELECT type, \"notnull\" FROM pragma_table_info(?) WHERE name = ?", tableDomainEvents, "payload").Scan(&columnType, &notNull); err != nil {
+		t.Fatalf("inspect domain event payload column: %v", err)
+	}
+	if !strings.EqualFold(columnType, "blob") || notNull != 1 {
+		t.Fatalf("payload column type/notnull = %q/%d, want blob/1", columnType, notNull)
+	}
+}
+
+func TestDatabaseTLSAndHostDuplicateSettingsFailClosed(t *testing.T) {
+	if dsnDeclaresVerifiedTLS("mysql", "user:pass@tcp(db:3306)/events?tls=true&tls=skip-verify") {
+		t.Fatal("duplicate MySQL TLS settings accepted")
+	}
+	if dsnDeclaresVerifiedTLS("postgres", "postgres://db/events?sslmode=verify-full&sslmode=disable") {
+		t.Fatal("duplicate PostgreSQL URL sslmode settings accepted")
+	}
+	if dsnDeclaresVerifiedTLS("postgres", "sslmode=verify-full sslmode=disable host=localhost") {
+		t.Fatal("duplicate PostgreSQL keyword sslmode settings accepted")
+	}
+	if isLoopbackOrUnixDSN("postgres", "host=localhost host=evil.example dbname=events") {
+		t.Fatal("duplicate PostgreSQL keyword host settings accepted")
+	}
+	if isLoopbackOrUnixDSN("postgres", "postgres://localhost/events?host=/tmp/pg,evil.example") {
+		t.Fatal("mixed PostgreSQL URL host list accepted")
+	}
+	if !isLoopbackOrUnixDSN("postgres", "postgres://localhost/events?host=127.0.0.1,localhost") {
+		t.Fatal("all-loopback PostgreSQL URL host list rejected")
+	}
+}
