@@ -311,6 +311,17 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 	}
 
 	if err = s.applyParticipants(ctx, tx, work, &result); err != nil {
+		var expiredArtifact *task5ExpiredArtifactError
+		if errors.As(err, &expiredArtifact) {
+			_ = tx.Rollback().Error
+			compCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			scrubErr := s.task5PersistExpiredArtifacts(compCtx, work, expiredArtifact)
+			cancel()
+			if scrubErr != nil {
+				return CommitResult{}, scrubErr
+			}
+			return CommitResult{}, ErrArtifactGone
+		}
 		var expired *task5ExpiredPayloadError
 		if errors.As(err, &expired) {
 			_ = tx.Rollback().Error

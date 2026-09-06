@@ -30,6 +30,16 @@ func (task5Codec) Decrypt(_ context.Context, ciphertext, _ []byte, _ string) ([]
 	}
 	return append([]byte(nil), ciphertext[len(prefix):]...), nil
 }
+type task5CorruptCodec struct {
+	plaintext []byte
+}
+
+func (task5CorruptCodec) Encrypt(_ context.Context, plaintext []byte) ([]byte, []byte, string, error) {
+	return append([]byte("sealed:"), plaintext...), []byte("nonce"), "test-key", nil
+}
+func (c task5CorruptCodec) Decrypt(_ context.Context, _ []byte, _ []byte, _ string) ([]byte, error) {
+	return append([]byte(nil), c.plaintext...), nil
+}
 
 func task5Store(t *testing.T) (*GORMStore, *Database, *task5Clock) {
 	t.Helper()
@@ -359,6 +369,23 @@ func TestTask5UnitOfWorkRejectsInvalidIngressParticipants(t *testing.T) {
 		t.Fatalf("lane after rejected effect = %#v err=%v", goodEffect, err)
 	}
 }
+func TestTask5UOWExistingIngressIdentityIsImmutable(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := store.AcceptInbox(ctx, task5Inbox("uow-identity-inbox", "uow-identity-provider", "uow-identity-lane")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{{InboxID: "uow-identity-inbox", ExpectedVersion: 1, EndpointID: "forged"}}}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("inbox identity mutation err = %v", err)
+	}
+	if _, err := store.AcceptOutbox(ctx, task5Effect("uow-identity-effect", "uow-identity-effect-lane")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{EffectID: "uow-identity-effect", ExpectedVersion: 1, EndpointID: "forged"}}}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("effect identity mutation err = %v", err)
+	}
+}
 
 func TestTask5LeaseMutationsRejectExpiredAttempt(t *testing.T) {
 	store, db, clock := task5Store(t)
@@ -385,6 +412,50 @@ func TestTask5LeaseMutationsRejectExpiredAttempt(t *testing.T) {
 	clock.Advance(2 * time.Minute)
 	if _, err := store.RenewOutbox(context.Background(), OutboxRenewRequest{EffectID: outbox.Effect.EffectID, WorkerID: outbox.Effect.LeaseOwner, LeaseEpoch: outbox.Effect.LeaseEpoch, AttemptID: outbox.Effect.AttemptID, LeaseDuration: time.Minute}); !errors.Is(err, ErrStaleLease) {
 		t.Fatalf("expired outbox renew err = %v", err)
+	}
+}
+func TestTask5ExpiredLeasedMutationScrubsBeforeStaleLease(t *testing.T) {
+	store, db, clock := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	inbox := task5Inbox("expired-observed-inbox", "expired-observed-provider", "expired-observed-lane")
+	inbox.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
+		t.Fatal(err)
+	}
+	inboxLease, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "expired-worker", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	effect := task5Effect("expired-observed-effect", "expired-observed-lane")
+	effect.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
+		t.Fatal(err)
+	}
+	effectLease, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "expired-worker", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Minute)
+	if _, err := store.UpdateInbox(ctx, InboxUpdate{InboxID: inboxLease.Update.InboxID, ExpectedVersion: inboxLease.Update.Version, Status: InboxStatusCallbackStarted, LeaseOwner: inboxLease.Update.LeaseOwner, LeaseEpoch: inboxLease.Update.LeaseEpoch, AttemptID: inboxLease.Update.AttemptID}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("expired inbox mutation err = %v", err)
+	}
+	if _, err := store.RenewOutbox(ctx, OutboxRenewRequest{EffectID: effectLease.Effect.EffectID, WorkerID: effectLease.Effect.LeaseOwner, LeaseEpoch: effectLease.Effect.LeaseEpoch, AttemptID: effectLease.Effect.AttemptID, LeaseDuration: time.Minute}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("expired outbox renewal err = %v", err)
+	}
+	var inboxRow inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&inboxRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(inboxRow.PayloadCiphertext) != 0 || len(inboxRow.PayloadNonce) != 0 {
+		t.Fatal("expired inbox payload was not scrubbed")
+	}
+	var effectRow outboxEffectRow
+	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&effectRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(effectRow.PayloadCiphertext) != 0 || len(effectRow.PayloadNonce) != 0 {
+		t.Fatal("expired outbox payload was not scrubbed")
 	}
 }
 
@@ -422,6 +493,65 @@ func TestTask5ArtifactParticipantBoundsAndStatus(t *testing.T) {
 	}
 	if _, err := store.Commit(context.Background(), UnitOfWork{ArtifactUpdates: []ArtifactUpdate{{ArtifactID: "invalid-uow-artifact", OperationID: "artifact-uow-op", Size: 1, Ciphertext: []byte("cipher"), Nonce: []byte("nonce"), Status: "consumed"}}}); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("invalid artifact participant err = %v", err)
+	}
+}
+func TestTask5UOWArtifactExpiryScrubsOnObservedExpiry(t *testing.T) {
+	store, db, clock := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := store.Commit(ctx, UnitOfWork{Operations: []OperationUpdate{{OperationID: "uow-expiring-artifact-op", PrincipalID: "uow-expiring-owner"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{ArtifactUpdates: []ArtifactUpdate{
+		{
+			ArtifactID: "uow-expiring-artifact", OperationID: "uow-expiring-artifact-op", OwnerPrincipalID: "uow-expiring-owner",
+			Size: 3, Ciphertext: []byte("sealed:abc"), Nonce: []byte("nonce"), EncryptionKeyID: "test-key",
+			ExpiresAt: clock.Now().Add(time.Minute),
+		},
+		{
+			ArtifactID: "uow-expiring-artifact-2", OperationID: "uow-expiring-artifact-op", OwnerPrincipalID: "uow-expiring-owner",
+			Size: 3, Ciphertext: []byte("sealed:def"), Nonce: []byte("nonce"), EncryptionKeyID: "test-key",
+			ExpiresAt: clock.Now().Add(time.Minute),
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Minute)
+	if _, err := store.Commit(ctx, UnitOfWork{ArtifactUpdates: []ArtifactUpdate{
+		{ArtifactID: "uow-expiring-artifact", ExpectedVersion: 1},
+		{ArtifactID: "uow-expiring-artifact-2", ExpectedVersion: 1},
+	}}); !errors.Is(err, ErrArtifactGone) {
+		t.Fatalf("expired artifact participant err = %v", err)
+	}
+	var row operationArtifactRow
+	if err := db.GORM().Where("artifact_id = ?", "uow-expiring-artifact").First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != "expired" || len(row.Ciphertext) != 0 || len(row.Nonce) != 0 {
+		t.Fatalf("expired artifact row = %#v", row)
+	}
+	var second operationArtifactRow
+	if err := db.GORM().Where("artifact_id = ?", "uow-expiring-artifact-2").First(&second).Error; err != nil {
+		t.Fatal(err)
+	}
+	if second.Status != "expired" || len(second.Ciphertext) != 0 || len(second.Nonce) != 0 {
+		t.Fatalf("second expired artifact row = %#v", second)
+	}
+}
+
+func TestTask5ConsumeArtifactRejectsCorruptCodecPlaintext(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := store.Commit(ctx, UnitOfWork{Operations: []OperationUpdate{{OperationID: "corrupt-artifact-op", PrincipalID: "corrupt-owner"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PutArtifact(ctx, ArtifactPutRequest{ArtifactID: "corrupt-artifact", OperationID: "corrupt-artifact-op", OwnerPrincipalID: "corrupt-owner", Plaintext: []byte("secret")}); err != nil {
+		t.Fatal(err)
+	}
+	store.codec = task5CorruptCodec{plaintext: []byte("wrong")}
+	if _, err := store.ConsumeArtifact(ctx, ArtifactConsumeRequest{ArtifactID: "corrupt-artifact"}); !errors.Is(err, ErrInvalidMetadata) {
+		t.Fatalf("corrupt artifact codec err = %v", err)
 	}
 }
 func TestInboxIngressRejectsPayloadTTLBypass(t *testing.T) {
@@ -693,6 +823,26 @@ func TestTask5PublicIngressRejectsImmutableFieldsAndVersions(t *testing.T) {
 	}
 	if _, err := store.UpdateOutbox(ctx, NewEffect{EffectID: effect.EffectID, ExpectedVersion: 1, Version: 9, Status: OutboxStatusPending}); !errors.Is(err, ErrParticipantConflict) {
 		t.Fatalf("update outbox version err = %v", err)
+	}
+}
+func TestTask5PublicUpdateCannotCompleteDispatchedEffect(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	effect := task5Effect("public-dispatched-completion", "public-dispatched-completion-lane")
+	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "public-dispatched-worker", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatched, err := store.MarkOutboxDispatched(ctx, OutboxDispatchRequest{EffectID: effect.EffectID, WorkerID: claimed.Effect.LeaseOwner, LeaseEpoch: claimed.Effect.LeaseEpoch, AttemptID: claimed.Effect.AttemptID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateOutbox(ctx, NewEffect{EffectID: effect.EffectID, ExpectedVersion: dispatched.Effect.Version, Status: OutboxStatusSucceeded, LeaseOwner: dispatched.Effect.LeaseOwner, LeaseEpoch: dispatched.Effect.LeaseEpoch, AttemptID: dispatched.Effect.AttemptID}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("dispatched generic completion err = %v", err)
 	}
 }
 
