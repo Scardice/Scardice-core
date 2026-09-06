@@ -172,7 +172,7 @@ func OpenDatabase(ctx context.Context, config DatabaseConfig) (*Database, error)
 		return nil, safeDatabaseError("connect", dbType, err)
 	}
 	if dbType == "sqlite" || dbType == "sqlite3" {
-		if err := configureAndValidateSQLite(sqlDB); err != nil {
+		if err := configureAndValidateSQLite(pingCtx, sqlDB); err != nil {
 			_ = sqlDB.Close()
 			return nil, safeDatabaseError("configure sqlite", dbType, err)
 		}
@@ -214,32 +214,32 @@ func sqliteDSN(dsn string) string {
 	return dsn + separator + "_journal_mode=WAL&_foreign_keys=on&_busy_timeout=15000&_synchronous=FULL&_txlock=immediate"
 }
 
-func configureAndValidateSQLite(sqlDB *sql.DB) error {
+func configureAndValidateSQLite(ctx context.Context, sqlDB *sql.DB) error {
 	for _, statement := range []string{
 		"PRAGMA journal_mode = WAL",
 		"PRAGMA foreign_keys = ON",
 		"PRAGMA busy_timeout = 15000",
 		"PRAGMA synchronous = FULL",
 	} {
-		if _, err := sqlDB.Exec(statement); err != nil {
+		if _, err := sqlDB.ExecContext(ctx, statement); err != nil {
 			return err
 		}
 	}
 	var journalMode string
-	if err := sqlDB.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+	if err := sqlDB.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&journalMode); err != nil {
 		return err
 	}
 	if !strings.EqualFold(journalMode, "wal") {
 		return fmt.Errorf("journal mode is not WAL")
 	}
 	var foreignKeys, busyTimeout, synchronous int
-	if err := sqlDB.QueryRow("PRAGMA foreign_keys").Scan(&foreignKeys); err != nil {
+	if err := sqlDB.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&foreignKeys); err != nil {
 		return err
 	}
-	if err := sqlDB.QueryRow("PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+	if err := sqlDB.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
 		return err
 	}
-	if err := sqlDB.QueryRow("PRAGMA synchronous").Scan(&synchronous); err != nil {
+	if err := sqlDB.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&synchronous); err != nil {
 		return err
 	}
 	if foreignKeys != 1 || busyTimeout < int(minimumSQLiteBusyTimeout/time.Millisecond) || synchronous != 2 {
@@ -384,17 +384,45 @@ func safeDatabaseError(operation, dbType string, _ error) error {
 }
 
 func migrateSchema(db *gorm.DB) error {
-	if err := db.AutoMigrate(schemaModels()...); err != nil {
+	if db.Dialector.Name() == "sqlite" {
+		if err := db.AutoMigrate(&operationRow{}); err != nil {
+			return err
+		}
+		if err := db.Exec(`CREATE TABLE IF NOT EXISTS operation_artifacts (
+			artifact_id TEXT NOT NULL PRIMARY KEY,
+			operation_id TEXT NOT NULL,
+			owner_principal_id TEXT NOT NULL,
+			media_type TEXT NOT NULL,
+			safe_filename TEXT,
+			size INTEGER NOT NULL,
+			status TEXT NOT NULL,
+			ciphertext BLOB,
+			nonce BLOB,
+			encryption_key_id TEXT,
+			expires_at DATETIME NOT NULL,
+			consumed_at DATETIME,
+			FOREIGN KEY(operation_id) REFERENCES operations(operation_id) ON UPDATE RESTRICT ON DELETE RESTRICT
+		)`).Error; err != nil {
+			return err
+		}
+	}
+	models := schemaModels()
+	if db.Dialector.Name() == "sqlite" {
+		models = schemaModelsWithoutOperationArtifacts()
+	}
+	if err := db.AutoMigrate(models...); err != nil {
 		return err
 	}
 	if db.Dialector.Name() == "sqlite" {
+		if err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS ux_operation_artifacts_artifact_id ON operation_artifacts(artifact_id)").Error; err != nil {
+			return err
+		}
 		return nil
 	}
 	for _, constraint := range []struct {
 		model any
 		name  string
 	}{
-		{&operationRow{}, "Artifact"},
 		{&operationArtifactRow{}, "Operation"},
 		{&subjectFenceRow{}, "PurgeOperation"},
 	} {

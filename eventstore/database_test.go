@@ -243,9 +243,9 @@ func TestEventStoreSchemaHasAllRestrictiveForeignKeys(t *testing.T) {
 	}
 	defer db.Close()
 
-	assertForeignKeyAction(t, db, "operations", "operation_artifacts", "RESTRICT")
+	assertForeignKeyAction(t, db, "operation_artifacts", "operations", "RESTRICT")
 	assertForeignKeyAction(t, db, "subject_fences", "operations", "RESTRICT")
-	if _, err := db.SQLDB().ExecContext(context.Background(), `INSERT INTO operations (operation_id, version, status, kind, principal_id, idempotency_scope, idempotency_key, artifact_id, created_at, updated_at) VALUES ('op', 1, 'pending', 'test', 'principal', 'scope', 'key', 'missing-artifact', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`); err == nil {
+	if _, err := db.SQLDB().ExecContext(context.Background(), `INSERT INTO operation_artifacts (artifact_id, operation_id, owner_principal_id, media_type, size, status, expires_at) VALUES ('orphan-artifact', 'missing-operation', 'owner', 'text/plain', 0, 'available', CURRENT_TIMESTAMP)`); err == nil {
 		t.Fatal("orphan operation artifact reference insert succeeded")
 	}
 	if _, err := db.SQLDB().ExecContext(context.Background(), `INSERT INTO subject_fences (subject_key, scope, purge_operation_id, created_at) VALUES (x'01', 'subject', 'missing-operation', CURRENT_TIMESTAMP)`); err == nil {
@@ -388,5 +388,25 @@ func TestEventStoreDomainEventMetadataColumns(t *testing.T) {
 		if !got[column] {
 			t.Errorf("missing domain event column %q", column)
 		}
+	}
+}
+
+func TestOperationArtifactForeignKeysAllowNullableFirstLinking(t *testing.T) {
+	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "events.db")})
+	if err != nil {
+		t.Fatalf("open sqlite database: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.SQLDB().ExecContext(context.Background(), `INSERT INTO operations (operation_id, version, status, kind, principal_id, idempotency_scope, idempotency_key, created_at, updated_at) VALUES ('op-link', 1, 'pending', 'test', 'principal', 'scope', 'key-link', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("insert operation before artifact: %v", err)
+	}
+	if _, err := db.SQLDB().ExecContext(context.Background(), `INSERT INTO operation_artifacts (artifact_id, operation_id, owner_principal_id, media_type, size, status, expires_at) VALUES ('artifact-link', 'op-link', 'principal', 'text/plain', 0, 'available', CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("insert artifact: %v", err)
+	}
+	if _, err := db.SQLDB().ExecContext(context.Background(), "UPDATE operations SET artifact_id = 'artifact-link' WHERE operation_id = 'op-link'"); err != nil {
+		t.Fatalf("link operation to artifact: %v", err)
+	}
+	if _, err := db.SQLDB().ExecContext(context.Background(), "DELETE FROM operations WHERE operation_id = 'op-link'"); err == nil {
+		t.Fatal("operation delete bypassed restrictive artifact reference")
 	}
 }

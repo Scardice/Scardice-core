@@ -138,6 +138,7 @@ func (projectionReadModelRow) TableName() string { return tableProjectionReadMod
 
 type operationRow struct {
 	Version           uint64     `gorm:"not null"`
+	Status            string     `gorm:"type:varchar(32);not null"`
 	OperationID       string     `gorm:"type:varchar(255);not null;primaryKey;uniqueIndex:ux_operations_operation_id"`
 	Kind              string     `gorm:"type:varchar(255);not null"`
 	PrincipalID       string     `gorm:"type:varchar(255);not null;uniqueIndex:ux_operations_idempotency,priority:1"`
@@ -149,36 +150,33 @@ type operationRow struct {
 	CorrelationID     string     `gorm:"type:varchar(255)"`
 	ResultCode        string     `gorm:"type:varchar(255)"`
 	ErrorCode         string     `gorm:"type:varchar(255)"`
-	ArtifactID        string     `gorm:"type:varchar(255)"`
-	PrivateContext    []byte     `gorm:""`
+	ArtifactRef string     `gorm:"column:artifact_id;type:varchar(255)"`
 	PrivateNonce      []byte     `gorm:"size:12"`
 	PrivateKeyID      string     `gorm:"type:varchar(255)"`
-	Artifact          *operationArtifactRow `gorm:"foreignKey:ArtifactID;references:ArtifactID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT;"`
 	CreatedAt         time.Time  `gorm:"not null"`
 	UpdatedAt         time.Time  `gorm:"not null"`
 	ExpiresAt         *time.Time
-	Artifacts         []operationArtifactRow `gorm:"foreignKey:OperationID;references:OperationID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT;"`
 }
 func (operationRow) TableName() string { return tableOperations }
 
 
-
 type operationArtifactRow struct {
-	ArtifactID   string     `gorm:"type:varchar(255);not null;uniqueIndex:ux_operation_artifacts_artifact_id"`
+	ArtifactID   string     `gorm:"type:varchar(255);not null;primaryKey;uniqueIndex:ux_operation_artifacts_artifact_id"`
 	OperationID  string     `gorm:"type:varchar(255);not null"`
 	OwnerPrincipalID string `gorm:"type:varchar(255);not null"`
 	MediaType    string     `gorm:"type:varchar(255);not null"`
 	SafeFilename string     `gorm:"type:varchar(255)"`
 	Size         int64      `gorm:"not null"`
-	Operation    *operationRow `gorm:"foreignKey:OperationID;references:OperationID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT;"`
+	Status       string     `gorm:"type:varchar(32);not null"`
 	Ciphertext   []byte     `gorm:""`
 	Nonce        []byte     `gorm:"size:12"`
-	EncryptionKeyID string   `gorm:"type:varchar(255)"`
+	EncryptionKeyID string `gorm:"type:varchar(255)"`
 	ExpiresAt    time.Time  `gorm:"not null"`
 	ConsumedAt   *time.Time
 }
-
 func (operationArtifactRow) TableName() string { return tableOperationArtifacts }
+
+
 
 type laneHeadRow struct {
 	Kind      string    `gorm:"type:varchar(32);primaryKey;uniqueIndex:pk_lane_heads,priority:1"`
@@ -305,5 +303,15 @@ func schemaModels() []any {
 		&operationArtifactRow{}, &laneHeadRow{}, &inboxMessageRow{},
 		&outboxEffectRow{}, &adapterSecretRow{}, &pluginKVRow{},
 		&subjectFenceRow{}, &storeReadinessRow{},
+	}
+}
+
+func schemaModelsWithoutOperationArtifacts() []any {
+	return []any{
+		&domainEventRow{}, &eventGlobalSequenceRow{}, &aggregateHeadRow{},
+		&projectionControlRow{}, &projectionReadModelRow{}, &operationRow{},
+		&laneHeadRow{}, &inboxMessageRow{}, &outboxEffectRow{},
+		&adapterSecretRow{}, &pluginKVRow{}, &subjectFenceRow{},
+		&storeReadinessRow{},
 	}
 }
