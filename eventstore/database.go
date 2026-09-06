@@ -122,11 +122,11 @@ func OpenDatabase(ctx context.Context, config DatabaseConfig) (*Database, error)
 		gormDB, err = gorm.Open(sqlite.Open(sqliteDSN(dsn)), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	case "mysql":
 		if err = validateRemoteConfig(dbType, config); err == nil {
-			gormDB, err = gorm.Open(mysql.New(mysql.Config{DSN: config.DSN, SkipInitializeWithVersion: true}), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent), DisableAutomaticPing: true})
+			gormDB, err = gorm.Open(mysql.New(mysql.Config{DSN: config.DSN, SkipInitializeWithVersion: true}), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent), DisableAutomaticPing: true, DisableForeignKeyConstraintWhenMigrating: true})
 		}
 	case "postgres", "postgresql":
 		if err = validateRemoteConfig(dbType, config); err == nil {
-			gormDB, err = gorm.Open(postgres.Open(config.DSN), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent), DisableAutomaticPing: true})
+			gormDB, err = gorm.Open(postgres.Open(config.DSN), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent), DisableAutomaticPing: true, DisableForeignKeyConstraintWhenMigrating: true})
 		}
 	default:
 		return nil, fmt.Errorf("event database: unsupported type %q", dbType)
@@ -371,9 +371,26 @@ func migrateSchema(db *gorm.DB) error {
 	if err := db.AutoMigrate(schemaModels()...); err != nil {
 		return err
 	}
+	if db.Dialector.Name() == "sqlite" {
+		return nil
+	}
+	for _, constraint := range []struct {
+		model any
+		name  string
+	}{
+		{&operationRow{}, "Artifact"},
+		{&operationArtifactRow{}, "Operation"},
+		{&subjectFenceRow{}, "PurgeOperation"},
+	} {
+		if !db.Migrator().HasConstraint(constraint.model, constraint.name) {
+			if err := db.Migrator().CreateConstraint(constraint.model, constraint.name); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
-
 }
+
 func initializeSingletons(db *gorm.DB) error {
 	now := time.Now().UTC()
 	if err := db.Where("singleton_id = ?", "default").FirstOrCreate(&eventGlobalSequenceRow{SingletonID: "default", NextPosition: 1, UpdatedAt: now}).Error; err != nil {
