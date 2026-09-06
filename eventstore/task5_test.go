@@ -1217,27 +1217,27 @@ func TestTask5PublicExpiredReplayScrubsBeforeDedupe(t *testing.T) {
 		t.Fatal(err)
 	}
 	clock.Advance(2 * time.Minute)
+	sameInbox := inbox
+	sameInbox.PayloadExpiresAt = time.Time{}
+	if _, err := store.AcceptInbox(ctx, sameInbox); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("same expired inbox replay err = %v", err)
+	}
 	changedInbox := inbox
 	changedInbox.PayloadExpiresAt = time.Time{}
 	changedInbox.PayloadCiphertext = []byte("changed")
 	if _, err := store.AcceptInbox(ctx, changedInbox); !errors.Is(err, ErrConflict) {
 		t.Fatalf("changed expired inbox replay err = %v", err)
 	}
-	sameInbox := inbox
-	sameInbox.PayloadExpiresAt = time.Time{}
-	if _, err := store.AcceptInbox(ctx, sameInbox); !errors.Is(err, ErrConflict) {
-		t.Fatalf("same expired inbox replay err = %v", err)
+	sameEffect := effect
+	sameEffect.PayloadExpiresAt = time.Time{}
+	if _, err := store.AcceptOutbox(ctx, sameEffect); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("same expired outbox replay err = %v", err)
 	}
 	changedEffect := effect
 	changedEffect.PayloadExpiresAt = time.Time{}
 	changedEffect.PayloadCiphertext = []byte("changed")
 	if _, err := store.AcceptOutbox(ctx, changedEffect); !errors.Is(err, ErrConflict) {
 		t.Fatalf("changed expired outbox replay err = %v", err)
-	}
-	sameEffect := effect
-	sameEffect.PayloadExpiresAt = time.Time{}
-	if _, err := store.AcceptOutbox(ctx, sameEffect); !errors.Is(err, ErrConflict) {
-		t.Fatalf("same expired outbox replay err = %v", err)
 	}
 	var inboxRow inboxMessageRow
 	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&inboxRow).Error; err != nil {
