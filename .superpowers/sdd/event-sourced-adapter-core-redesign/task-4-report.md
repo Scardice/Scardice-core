@@ -48,20 +48,20 @@ Green focused race validation:
 
 ```text
 go test -race ./eventstore -run 'TestProjection|TestRebuild|TestDigest|TestProjector|TestGeneration' -count=1
-ok  	Scardice-core/eventstore  2.118s
+ok  	Scardice-core/eventstore  2.125s
 
 Green package validation:
 
 ```text
 go test ./eventstore -count=1
-ok  	Scardice-core/eventstore  0.543s
+ok  	Scardice-core/eventstore  0.551s
 ```
 
 No formatter, linter, or project-wide suite was run.
 
 ## Commit
 
-Implementation commits: `a1ee6229` (initial projection implementation), `6b2f4866` (projector version validation), and `ed920afc` (registry fencing, canonical set identity, envelope validation, nil/empty payload preservation, deterministic digest ordering, option-error propagation, and concurrency/edge-case tests).
+Implementation commits: `a1ee6229` (initial projection implementation), `6b2f4866` (projector version validation), `ed920afc` (registry fencing, canonical set identity, envelope validation, nil/empty payload preservation, deterministic digest ordering, option-error propagation, and concurrency/edge-case tests), and `d1d56f87` (unsupported-schema sentinel compatibility).
 
 ## Concerns
 
