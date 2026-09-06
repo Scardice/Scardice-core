@@ -175,3 +175,23 @@ ok  Scardice-core/eventstore  0.035s
 go test -count=1 ./eventstore
 ok  Scardice-core/eventstore  0.180s
 ```
+
+## Contract-completeness follow-up
+
+Implementation commit: `2a9a7245`.
+
+- Completed the schema fields required by the contract-completeness review: operation request IDs, artifact versions, outbox risk/content-digest-key/completion/expiry metadata, adapter IDs, independent plugin key/value nonces, and subject-fence versions.
+- Kept artifact `size` and all existing encrypted payload/nonce/key-ID fields intact; SQLite's explicit artifact DDL now includes the required non-null version column.
+- Added focused schema assertions for every restored field and updated the nullable-first artifact-linking fixture.
+- Hardened PostgreSQL URL DSN parsing so any `://` input must parse as a URL with exactly one accepted `sslmode`; URL/keyword hybrids and URL host fragments containing whitespace fail closed. Loopback host validation rejects the same ambiguous URL hybrids.
+
+Final uncached verification:
+
+```text
+go test -count=1 ./eventstore -run 'TestOpenDatabase|TestEventStoreSchema|TestDatabaseClose'
+ok  	Scardice-core/eventstore	0.043s
+go test -count=1 ./eventstore
+ok  	Scardice-core/eventstore	0.167s
+```
+
+Concern: remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available; this change is covered by local schema/parser tests only.
