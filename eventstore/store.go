@@ -21,7 +21,7 @@ var (
 	ErrDuplicateProjector     = errors.New("eventstore: duplicate projector")
 	ErrProjectorVersionConflict = errors.New("eventstore: projector version conflict")
 	ErrProjectorRegistryChanged = errors.New("eventstore: projector registry changed")
-	ErrUnsupportedEventSchema = errors.New("eventstore: unsupported event schema")
+	ErrUnsupportedEventSchema = ErrUnsupportedSchema
 	ErrProjectionInvariant    = errors.New("eventstore: projection invariant failed")
 	ErrVersionExhausted       = errors.New("eventstore: version exhausted")
 )
