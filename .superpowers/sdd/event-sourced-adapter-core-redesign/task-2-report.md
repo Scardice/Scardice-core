@@ -159,3 +159,19 @@ ok  Scardice-core/eventstore  0.033s
 go test -count=1 ./eventstore
 ok  Scardice-core/eventstore  0.160s
 ```
+
+## Final schema-column follow-up
+
+Implementation commit: `0f9b1cb3`.
+
+- Restored `operations.private_context` as native `[]byte` and `operation_artifacts.size` as the required bounded artifact-size column.
+- Added a schema regression test covering both columns.
+
+Final uncached verification:
+
+```text
+go test -count=1 ./eventstore -run 'TestOpenDatabase|TestEventStoreSchema|TestDatabaseClose'
+ok  Scardice-core/eventstore  0.035s
+go test -count=1 ./eventstore
+ok  Scardice-core/eventstore  0.180s
+```
