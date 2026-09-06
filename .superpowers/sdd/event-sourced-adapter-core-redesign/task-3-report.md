@@ -22,7 +22,7 @@ Expected versions are compared for every requested stream after all heads are re
 
 The event sequence is advanced once for one contiguous range. Domain event rows contain exact payload bytes, metadata scalars, stream version, global position, and checksum. `Load` verifies persisted checksum bytes before returning an envelope.
 
-Participant rows are applied in the exact A2 order `operations -> inbox_messages -> outbox_effects -> operation_artifacts -> adapter_secrets -> plugin_kv -> subject_fences`, with stable key sorting inside each group and optimistic row-version checks. Every conditional update requires one affected row and returns a redacted `ParticipantConflictError` (unwrapping `ErrParticipantConflict`) on a lost CAS; true SQL failures remain `ErrParticipantFailure`. Duplicate participant keys use structural tuple keys, and the aggregate encoded byte budget includes stream IDs, event type, metadata strings, and all persisted participant fields; both are rejected before transaction allocation. Existing sparse updates preserve durable state across all participant columns, secret updates append immutable history rows, and plugin/fence creates, updates, and deletes report their keys in `CommitResult` while using expected-version CAS. Transaction-aware participant/projector hooks receive the same transaction and are never invoked as external side effects. Hook errors are redacted to typed `ErrParticipantFailure`/`ErrProjectorFailure`. Any error rolls back heads, sequence, events, hook writes, and participant rows together. No domain decision callback or projector callback is retried.
+Participant rows are applied in the exact A2 order `operations -> inbox_messages -> outbox_effects -> operation_artifacts -> adapter_secrets -> plugin_kv -> subject_fences`, with stable key sorting inside each group and optimistic row-version checks. Every conditional update requires one affected row and returns a redacted `ParticipantConflictError` (unwrapping `ErrParticipantConflict`) on a lost CAS; true SQL failures remain `ErrParticipantFailure`. Duplicate participant keys use structural tuple keys, and the aggregate encoded byte budget includes stream IDs, event type, metadata strings, and all persisted participant fields; both are rejected before transaction allocation. Every stream/global/participant version increment is checked against uint64 exhaustion. Existing sparse updates preserve durable state across all participant columns, secret updates append immutable history rows, and plugin/fence creates, updates, and deletes report their keys in `CommitResult` while using expected-version CAS. Transaction-aware participant/projector hooks receive the same transaction and are never invoked as external side effects. Hook errors are redacted to typed `ErrParticipantFailure`/`ErrProjectorFailure`. Any error rolls back heads, sequence, events, hook writes, and participant rows together. No domain decision callback or projector callback is retried.
 
 
 ## TDD evidence
@@ -41,22 +41,22 @@ Green focused race run:
 
 ```text
 go test -race ./eventstore -run 'TestCommit|TestMultiStreamConflict|TestLockOrder|TestRollback|TestChecksum' -count=1
-ok  Scardice-core/eventstore  1.202s
+ok  Scardice-core/eventstore  1.241s
 ```
 
 Green package run:
 
 ```text
-go test ./eventstore
-ok  Scardice-core/eventstore  0.224s
+go test ./eventstore -count=1
+ok  Scardice-core/eventstore  0.270s
 ```
 
 No formatter, linter, or project-wide test suite was run.
 
 ## Commit
 
-Implementation commits: `9fc13ec5` (atomic UnitOfWork), `636ff72f` (redacted participant keys), `89426b55` (artifact CAS persistence), `b32a9be6` (locks/transaction-only hooks/participant CAS), `cb355ca1` (sparse preservation/history/delete), `17ce7d0d` (validation/fence/hook evidence), `a896bcbd` (delete result consistency), `2812e553` (plugin update results), `ffc6cfd1` (participant order/typed-store/sparse inbox-effect/encoded-size), `ed03ae73` (overflow-safe field accounting), `92c1e34c` (metadata/CAS/structural-key hardening).
-Additional focused regression: `go test -race ./eventstore -run 'TestZeroStream|TestParticipantConflict' -count=1` → `ok Scardice-core/eventstore 1.073s`.
+Implementation commits: `9fc13ec5` (atomic UnitOfWork), `636ff72f` (redacted participant keys), `89426b55` (artifact CAS persistence), `b32a9be6` (locks/transaction-only hooks/participant CAS), `cb355ca1` (sparse preservation/history/delete), `17ce7d0d` (validation/fence/hook evidence), `a896bcbd` (delete result consistency), `2812e553` (plugin update results), `ffc6cfd1` (participant order/typed-store/sparse inbox-effect/encoded-size), `ed03ae73` (overflow-safe field accounting), `92c1e34c` (metadata/CAS/structural-key hardening), `c8e7aa4d` (version exhaustion guards/regression).
+Additional focused regression: `go test -race ./eventstore -run 'TestZeroStream|TestParticipantConflict' -count=1` → `ok Scardice-core/eventstore 1.073s`; `TestVersionExhaustionRejectsWithoutMutation` passes under race.
 
 - SQLite and GORM paths are covered locally. Remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available.
-- Participant payloads are intentionally treated as opaque ciphertext/nonce fields; encryption and business semantics remain later-slice responsibilities.
+- SQLite cannot represent uint64 values with the high bit set in its INTEGER driver path, so the exhaustion regression exercises the shared max-value guards directly; production DB paths reject overflow before writes.
