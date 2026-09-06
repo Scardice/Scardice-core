@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -43,6 +44,13 @@ func TestCommitRejectsDuplicateAndOversize(t *testing.T) {
 	oversized := UnitOfWork{Streams: []StreamAppend{{Stream:StreamID{"a","oversize"}, Events:[]NewEvent{{EventType:"x",SchemaVersion:1,Payload:make([]byte,MaxEventPayloadBytes+1),Metadata:Metadata{EventID:"e",CommandID:"c",CorrelationID:"r",OccurredAtUnixNanoUTC:1,OccurredAtUnixNanoSet:true}}}}}}
 	var bound *OversizeError
 	if err := ValidateUnitOfWork(oversized); !errors.As(err, &bound) || bound.Bound != "event payload" { t.Fatalf("oversize err = %v", err) }
+	if err := ValidateUnitOfWork(UnitOfWork{Operations: []OperationUpdate{{OperationID:"dup"}, {OperationID:"dup"}}}); !errors.Is(err, ErrDuplicateParticipant) { t.Fatalf("participant duplicate err = %v", err) }
+	streams := make([]StreamAppend, MaxUnitOfWorkStreams+1); for i := range streams { streams[i].Stream=StreamID{"bound",strconv.Itoa(i)} }
+	if err := ValidateUnitOfWork(UnitOfWork{Streams:streams}); err == nil { t.Fatal("stream bound accepted") } else if bound,ok:=err.(*OversizeError); !ok || bound.Bound!="unit of work streams" { t.Fatalf("stream bound err = %v",err) }
+	events := make([]NewEvent, MaxUnitOfWorkEvents+1); for i := range events { events[i]=testEvent(strconv.Itoa(i)) }
+	if err := ValidateUnitOfWork(UnitOfWork{Streams:[]StreamAppend{{Stream:StreamID{"bound","events"},Events:events}}}); err == nil { t.Fatal("event bound accepted") } else if bound,ok:=err.(*OversizeError); !ok || bound.Bound!="unit of work events" { t.Fatalf("event bound err = %v",err) }
+	bytes := make([]NewEvent, 65); for i := range bytes { bytes[i]=testEvent(strconv.Itoa(i)); bytes[i].Payload=make([]byte,MaxEventPayloadBytes) }
+	if err := ValidateUnitOfWork(UnitOfWork{Streams:[]StreamAppend{{Stream:StreamID{"bound","bytes"},Events:bytes}}}); err == nil { t.Fatal("byte bound accepted") } else if bound,ok:=err.(*OversizeError); !ok || bound.Bound!="unit of work encoded bytes" { t.Fatalf("byte bound err = %v",err) }
 }
 
 func testEvent(id string) NewEvent {
@@ -71,7 +79,9 @@ func TestLockOrderAndZeroStreamParticipant(t *testing.T) {
 
 func TestRollbackAfterProjectorFailure(t *testing.T) {
 	store, db := testStore(t); defer db.Close()
+	var projectorCalls int
 	store.RegisterProjector(func(_ context.Context, tx *gorm.DB, _ []Envelope) error {
+		projectorCalls++
 		if err := tx.Create(&projectionReadModelRow{ProjectionGeneration:"test", ProjectionName:"test", RowKey:"row", Payload:[]byte("opaque"), UpdatedAt:time.Now().UTC()}).Error; err != nil { return err }
 		return errors.New("opaque projector failure")
 	})
@@ -83,6 +93,22 @@ func TestRollbackAfterProjectorFailure(t *testing.T) {
 	var projected int64
 	if err := db.GORM().Model(&projectionReadModelRow{}).Count(&projected).Error; err != nil { t.Fatal(err) }
 	if projected != 0 { t.Fatalf("projector row after rollback = %d", projected) }
+	if projectorCalls != 1 { t.Fatalf("projector calls = %d", projectorCalls) }
+}
+func TestRollbackAfterParticipantFailure(t *testing.T) {
+	store, db := testStore(t); defer db.Close()
+	store.RegisterParticipant(func(_ context.Context, tx *gorm.DB, _ UnitOfWork) error {
+		if err := tx.Create(&operationRow{OperationID:"hook-operation", Version:1, Kind:"hook", Status:"pending", PrincipalID:"hook", IdempotencyScope:"hook", IdempotencyKey:"hook", CreatedAt:time.Now().UTC(), UpdatedAt:time.Now().UTC()}).Error; err != nil { return err }
+		if err := tx.Create(&projectionReadModelRow{ProjectionGeneration:"participant", ProjectionName:"participant", RowKey:"row", Payload:[]byte("opaque"), UpdatedAt:time.Now().UTC()}).Error; err != nil { return err }
+		return errors.New("opaque participant failure")
+	})
+	_, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream:StreamID{"a","participant"}, Events:[]NewEvent{testEvent("part1")}}}})
+	if !errors.Is(err, ErrParticipantFailure) { t.Fatalf("err = %v", err) }
+	var events, projected, operations int64
+	if err := db.GORM().Model(&domainEventRow{}).Count(&events).Error; err != nil { t.Fatal(err) }
+	if err := db.GORM().Model(&projectionReadModelRow{}).Count(&projected).Error; err != nil { t.Fatal(err) }
+	if err := db.GORM().Model(&operationRow{}).Count(&operations).Error; err != nil { t.Fatal(err) }
+	if events != 0 || projected != 0 || operations != 0 { t.Fatalf("rollback events=%d projected=%d operations=%d", events, projected, operations) }
 }
 
 func TestChecksumVerificationOnLoad(t *testing.T) {
@@ -112,10 +138,11 @@ func TestZeroStreamParticipantUpdates(t *testing.T) {
 		ArtifactUpdates: []ArtifactUpdate{{ArtifactID:"art-zero", OperationID:"op-zero", Ciphertext:[]byte("cipher")}},
 		SecretUpdates: []SecretUpdate{{SecretRef:"secret-zero", Ciphertext:[]byte("secret"), Nonce:[]byte("nonce")}},
 		PluginKVUpdates: []PluginKVUpdate{{ExtensionID:"plugin-zero", KeyHMAC:[]byte("key-zero"), KeyCiphertext:[]byte("key"), ValueCiphertext:[]byte("value")}},
+		FenceUpdates: []SubjectFenceUpdate{{SubjectKey:[]byte("subject-zero"), Scope:"all", PurgeOperationID:"op-zero"}},
 	}
 	result, err := store.Commit(context.Background(), work)
 	if err != nil { t.Fatal(err) }
-	if len(result.Events) != 0 || len(result.ArtifactIDs) != 1 || len(result.SecretRefs) != 1 || len(result.PluginKVIndexes) != 1 { t.Fatalf("result = %#v", result) }
+	if len(result.Events) != 0 || len(result.ArtifactIDs) != 1 || len(result.SecretRefs) != 1 || len(result.PluginKVIndexes) != 1 || len(result.FenceKeys) != 1 { t.Fatalf("result = %#v", result) }
 	var sequence eventGlobalSequenceRow
 	if err := db.GORM().First(&sequence).Error; err != nil { t.Fatal(err) }
 	if sequence.NextPosition != 1 { t.Fatalf("sequence advanced to %d", sequence.NextPosition) }
@@ -124,6 +151,8 @@ func TestZeroStreamParticipantUpdates(t *testing.T) {
 	var operation operationRow
 	if err := db.GORM().Where("operation_id = ?", "op-zero").First(&operation).Error; err != nil { t.Fatal(err) }
 	if operation.Version != 2 || operation.PrincipalID != "p-zero" || operation.Status != "running" { t.Fatalf("operation preservation = %#v", operation) }
+	if _, err := store.Commit(context.Background(), UnitOfWork{FenceUpdates: []SubjectFenceUpdate{{SubjectKey:[]byte("subject-zero"), Scope:"all", ExpectedVersion:1, ExpiresAt:time.Now().Add(time.Hour)}}}); err != nil { t.Fatalf("sparse fence update: %v", err) }
+	if _, err := store.Commit(context.Background(), UnitOfWork{FenceUpdates: []SubjectFenceUpdate{{SubjectKey:[]byte("subject-zero"), Scope:"all", ExpectedVersion:2, Deleted:true}}}); err != nil { t.Fatalf("fence delete: %v", err) }
 	if _, err := store.Commit(context.Background(), UnitOfWork{SecretUpdates: []SecretUpdate{{SecretRef:"secret-zero", ExpectedVersion:1, Ciphertext:[]byte("secret-2"), Nonce:[]byte("nonce-2")}}, PluginKVUpdates: []PluginKVUpdate{{ExtensionID:"plugin-zero", KeyHMAC:[]byte("key-zero"), ExpectedVersion:1, Deleted:true}}}); err != nil { t.Fatalf("history/delete update: %v", err) }
 	var secretRows, pluginRows int64
 	if err := db.GORM().Model(&adapterSecretRow{}).Where("secret_ref = ?", "secret-zero").Count(&secretRows).Error; err != nil { t.Fatal(err) }

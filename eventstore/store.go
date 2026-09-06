@@ -27,6 +27,7 @@ type ParticipantConflict struct {
 
 type ParticipantConflictError struct { Conflicts []ParticipantConflict }
 func (e *ParticipantConflictError) Error() string { return ErrParticipantConflict.Error() }
+func (e *ParticipantConflictError) Unwrap() error { return ErrParticipantConflict }
 type Projector func(context.Context, *gorm.DB, []Envelope) error
 type ParticipantHook func(context.Context, *gorm.DB, UnitOfWork) error
 type StoreOption func(*GORMStore)
@@ -291,9 +292,9 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 		var row subjectFenceRow
 		q:=tx.Where("subject_key = ? AND scope = ?",update.SubjectKey,update.Scope).First(&row); current:=uint64(0); if q.Error==nil{current=row.Version}else if !errors.Is(q.Error,gorm.ErrRecordNotFound){return ErrParticipantFailure}
 		if err:=participantVersion(update.ExpectedVersion,current,update.Version,tableSubjectFences,"<redacted>");err!=nil{return err}
-		if update.Deleted { if current==0{return ErrParticipantFailure}; q=tx.Where("subject_key = ? AND scope = ? AND version = ?",update.SubjectKey,update.Scope,current).Delete(&subjectFenceRow{}); if q.Error!=nil || q.RowsAffected!=1{return ErrParticipantFailure}; continue }
-		version:=current+1; row=subjectFenceRow{SubjectKey:update.SubjectKey,Scope:update.Scope,Version:version,PurgeOperationID:update.PurgeOperationID,CreatedAt:chooseTime(update.CreatedAt,time.Now().UTC()),ExpiresAt:timePtr(update.ExpiresAt)}
-		if current==0{q=tx.Create(&row)}else{q=tx.Model(&subjectFenceRow{}).Where("subject_key = ? AND scope = ? AND version = ?",update.SubjectKey,update.Scope,current).Updates(map[string]any{"version":version,"purge_operation_id":row.PurgeOperationID,"expires_at":row.ExpiresAt})}
+		if update.Deleted { if current==0{return ErrParticipantFailure}; q=tx.Where("subject_key = ? AND scope = ? AND version = ?",update.SubjectKey,update.Scope,current).Delete(&subjectFenceRow{}); if q.Error!=nil || q.RowsAffected!=1{return ErrParticipantFailure}; result.FenceKeys=append(result.FenceKeys,append([]byte(nil),update.SubjectKey...)); continue }
+		version:=current+1
+		if current==0 { if update.PurgeOperationID=="" {return ErrParticipantFailure}; row=subjectFenceRow{SubjectKey:update.SubjectKey,Scope:update.Scope,Version:version,PurgeOperationID:update.PurgeOperationID,CreatedAt:chooseTime(update.CreatedAt,time.Now().UTC()),ExpiresAt:timePtr(update.ExpiresAt)}; q=tx.Create(&row) } else { if update.PurgeOperationID!="" {row.PurgeOperationID=update.PurgeOperationID}; if !update.CreatedAt.IsZero(){row.CreatedAt=update.CreatedAt}; if !update.ExpiresAt.IsZero(){row.ExpiresAt=timePtr(update.ExpiresAt)}; row.Version=version; q=tx.Model(&subjectFenceRow{}).Where("subject_key = ? AND scope = ? AND version = ?",update.SubjectKey,update.Scope,current).Updates(map[string]any{"version":row.Version,"purge_operation_id":row.PurgeOperationID,"created_at":row.CreatedAt,"expires_at":row.ExpiresAt}) }
 		if q.Error!=nil || (current != 0 && q.RowsAffected != 1){return ErrParticipantFailure};result.FenceKeys=append(result.FenceKeys,append([]byte(nil),update.SubjectKey...))
 	}
 	return nil

@@ -25,12 +25,13 @@ var (
 	ErrInvalidEvent      = errors.New("eventstore: invalid event")
 	ErrInvalidMetadata   = errors.New("eventstore: invalid metadata")
 	ErrUnsupportedSchema = errors.New("eventstore: unsupported schema")
-	ErrConflict          = errors.New("eventstore: conflict")
-	ErrEmptyUnitOfWork   = errors.New("eventstore: empty unit of work")
-	ErrDuplicateStream   = errors.New("eventstore: duplicate stream")
-	ErrOversizeInput     = errors.New("eventstore: input exceeds configured bound")
-	ErrStaleLease        = errors.New("eventstore: stale lease")
-	ErrNotFound          = errors.New("eventstore: not found")
+	ErrConflict             = errors.New("eventstore: conflict")
+	ErrEmptyUnitOfWork      = errors.New("eventstore: empty unit of work")
+	ErrDuplicateStream      = errors.New("eventstore: duplicate stream")
+	ErrDuplicateParticipant = errors.New("eventstore: duplicate participant")
+	ErrOversizeInput        = errors.New("eventstore: input exceeds configured bound")
+	ErrStaleLease           = errors.New("eventstore: stale lease")
+	ErrNotFound              = errors.New("eventstore: not found")
 )
 
 // Clock is injected anywhere a contract allocates a timestamp.
@@ -501,6 +502,22 @@ func ValidateUnitOfWork(work UnitOfWork) error {
 	if encodedBytes > MaxUnitOfWorkBytes {
 		return &OversizeError{Bound: "unit of work encoded bytes", Limit: MaxUnitOfWorkBytes, Actual: encodedBytes}
 	}
+	if err := validateParticipantKeys(work); err != nil { return err }
+	return nil
+}
+
+func validateParticipantKeys(work UnitOfWork) error {
+	seen := func() map[string]struct{} { return make(map[string]struct{}) }
+	check := func(m map[string]struct{}, key string) error { if _, ok := m[key]; ok { return ErrDuplicateParticipant }; m[key] = struct{}{}; return nil }
+	ops, arts, secrets, inbox, effects := seen(), seen(), seen(), seen(), seen()
+	plugins, fences := seen(), seen()
+	for _, v := range work.Operations { if v.OperationID != "" { if err:=check(ops,v.OperationID);err!=nil{return err} } }
+	for _, v := range work.ArtifactUpdates { if v.ArtifactID != "" { if err:=check(arts,v.ArtifactID);err!=nil{return err} } }
+	for _, v := range work.SecretUpdates { if v.SecretRef != "" { if err:=check(secrets,v.SecretRef);err!=nil{return err} } }
+	for _, v := range work.InboxUpdates { if v.InboxID != "" { if err:=check(inbox,v.InboxID);err!=nil{return err} } }
+	for _, v := range work.Effects { if v.EffectID != "" { if err:=check(effects,v.EffectID);err!=nil{return err} } }
+	for _, v := range work.PluginKVUpdates { if v.ExtensionID != "" && len(v.KeyHMAC)>0 { if err:=check(plugins,v.ExtensionID+string([]byte{0})+string(v.KeyHMAC));err!=nil{return err} } }
+	for _, v := range work.FenceUpdates { if len(v.SubjectKey)>0 && v.Scope != "" { if err:=check(fences,string(v.SubjectKey)+string([]byte{0})+v.Scope);err!=nil{return err} } }
 	return nil
 }
 
