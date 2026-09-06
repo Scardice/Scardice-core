@@ -824,7 +824,7 @@ func TestTask5StrictIngressAndParticipantContracts(t *testing.T) {
 	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{EffectID: effect.EffectID, Status: OutboxStatusSucceeded, ExpectedVersion: 1}}}); !errors.Is(err, ErrInvalidTransition) {
+	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{EffectID: effect.EffectID, Status: OutboxStatusSucceeded, ExpectedVersion: 1}}}); !errors.Is(err, ErrStaleLease) {
 		t.Fatalf("uow outbox terminal transition err = %v", err)
 	}
 

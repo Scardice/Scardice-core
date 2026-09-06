@@ -2129,7 +2129,7 @@ func (s *GORMStore) applyTask5EffectParticipants(tx *gorm.DB, work UnitOfWork, r
 			if row.Status == OutboxStatusSucceeded || row.Status == OutboxStatusFailed || row.Status == OutboxStatusAmbiguous {
 				return ErrInvalidTransition
 			}
-			if update.Status == OutboxStatusDispatched || update.Status == OutboxStatusSucceeded {
+			if update.Status == OutboxStatusDispatched {
 				return ErrInvalidTransition
 			}
 			if update.EndpointID != "" || len(update.LaneHMAC) > 0 || update.OrderingSequence != 0 || update.EffectType != "" ||
