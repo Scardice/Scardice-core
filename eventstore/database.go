@@ -122,11 +122,11 @@ func OpenDatabase(ctx context.Context, config DatabaseConfig) (*Database, error)
 		gormDB, err = gorm.Open(sqlite.Open(sqliteDSN(dsn)), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	case "mysql":
 		if err = validateRemoteConfig(dbType, config); err == nil {
-			gormDB, err = gorm.Open(mysql.Open(config.DSN), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+			gormDB, err = gorm.Open(mysql.New(mysql.Config{DSN: config.DSN, SkipInitializeWithVersion: true}), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent), DisableAutomaticPing: true})
 		}
 	case "postgres", "postgresql":
 		if err = validateRemoteConfig(dbType, config); err == nil {
-			gormDB, err = gorm.Open(postgres.Open(config.DSN), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+			gormDB, err = gorm.Open(postgres.Open(config.DSN), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent), DisableAutomaticPing: true})
 		}
 	default:
 		return nil, fmt.Errorf("event database: unsupported type %q", dbType)
@@ -266,7 +266,6 @@ func validateRemoteConfig(dbType string, config DatabaseConfig) error {
 	}
 	return nil
 }
-
 func dsnDeclaresVerifiedTLS(dbType, dsn string) bool {
 	if dbType == "mysql" {
 		parsed, err := url.Parse(dsn)
@@ -274,7 +273,7 @@ func dsnDeclaresVerifiedTLS(dbType, dsn string) bool {
 			return false
 		}
 		tls := strings.ToLower(parsed.Query().Get("tls"))
-		return tls == "true" || tls == "verify-full"
+		return tls == "true"
 	}
 	parsed, err := url.Parse(dsn)
 	if err == nil {
@@ -314,39 +313,54 @@ func isLoopbackOrUnixDSN(dbType, dsn string) bool {
 		}
 		return false
 	}
+	if strings.Contains(dsn, "://") {
+		parsed, err := url.Parse(dsn)
+		if err != nil {
+			return false
+		}
+		hosts := parsed.Query()["host"]
+		if len(hosts) == 0 {
+			hosts = []string{parsed.Hostname()}
+		}
+		return allLoopbackOrUnixHosts(hosts)
+	}
 	if strings.Contains(dsn, "host=") {
-		for _, field := range strings.Fields(dsn) {
+		fields := strings.Fields(dsn)
+		for _, field := range fields {
+			if !strings.Contains(field, "=") {
+				return false
+			}
+		}
+		for _, field := range fields {
 			key, value, ok := strings.Cut(field, "=")
 			if key != "host" || !ok || value == "" {
 				continue
 			}
-			for _, host := range strings.Split(value, ",") {
-				host = strings.Trim(host, "'\"")
-				if host == "" {
-					return false
-				}
-				if strings.HasPrefix(host, "/") {
-					continue
-				}
-				ip := net.ParseIP(host)
-				if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
-					return false
-				}
-			}
-			return true
+			return allLoopbackOrUnixHosts(strings.Split(value, ","))
 		}
 		return false
 	}
-	parsed, err := url.Parse(dsn)
-	if err != nil || parsed.Hostname() == "" {
+	return false
+}
+
+func allLoopbackOrUnixHosts(hosts []string) bool {
+	if len(hosts) == 0 {
 		return false
 	}
-	host := parsed.Hostname()
-	if host == "localhost" {
-		return true
+	for _, host := range hosts {
+		host = strings.Trim(host, "'\"")
+		if host == "" {
+			return false
+		}
+		if strings.HasPrefix(host, "/") {
+			continue
+		}
+		ip := net.ParseIP(host)
+		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			return false
+		}
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return true
 }
 
 func safeDatabaseError(operation, dbType string, _ error) error {
@@ -429,6 +443,9 @@ func validateRequiredIndexes(db *gorm.DB) error {
 			unique, uniqueOK := index.Unique()
 			if requiredEventStoreIndexes[key] && (!uniqueOK || !unique) {
 				return fmt.Errorf("required unique index is not unique")
+			}
+			if !requiredEventStoreIndexes[key] && uniqueOK && unique {
+				return fmt.Errorf("required non-unique index is unique")
 			}
 			if !sameStrings(index.Columns(), wantColumns) {
 				return fmt.Errorf("index columns do not match contract")

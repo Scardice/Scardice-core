@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestOpenDatabaseSQLiteEffectiveSettings(t *testing.T) {
@@ -144,6 +145,9 @@ func assertEventStoreSchema(t *testing.T, db *Database) {
 		if wantUnique && unique != 1 {
 			t.Errorf("index %q unique = %d, want unique", name, unique)
 		}
+		if !wantUnique && unique == 1 {
+			t.Errorf("index %q is unexpectedly unique", name)
+		}
 	}
 	assertIndexColumns(t, db, "domain_events", "ix_domain_events_global_position", []string{"global_position"})
 	assertIndexColumns(t, db, "inbox_messages", "ix_inbox_status_lease", []string{"status", "lease_expiry"})
@@ -230,4 +234,96 @@ func TestLoopbackTLSExceptionRejectsMixedPostgresHosts(t *testing.T) {
 	if !isLoopbackOrUnixDSN("postgres", "host=127.0.0.1,localhost dbname=events") {
 		t.Error("all-loopback PostgreSQL host list was rejected")
 	}
+}
+
+func TestEventStoreSchemaHasAllRestrictiveForeignKeys(t *testing.T) {
+	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "events.db")})
+	if err != nil {
+		t.Fatalf("open sqlite database: %v", err)
+	}
+	defer db.Close()
+
+	assertForeignKeyAction(t, db, "operations", "operation_artifacts", "RESTRICT")
+	assertForeignKeyAction(t, db, "subject_fences", "operations", "RESTRICT")
+	if _, err := db.SQLDB().ExecContext(context.Background(), `INSERT INTO operations (operation_id, version, status, kind, principal_id, idempotency_scope, idempotency_key, artifact_id, created_at, updated_at) VALUES ('op', 1, 'pending', 'test', 'principal', 'scope', 'key', 'missing-artifact', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`); err == nil {
+		t.Fatal("orphan operation artifact reference insert succeeded")
+	}
+	if _, err := db.SQLDB().ExecContext(context.Background(), `INSERT INTO subject_fences (subject_key, scope, purge_operation_id, created_at) VALUES (x'01', 'subject', 'missing-operation', CURRENT_TIMESTAMP)`); err == nil {
+		t.Fatal("orphan subject fence operation reference insert succeeded")
+	}
+}
+
+func assertForeignKeyAction(t *testing.T, db *Database, table, target, wantDelete string) {
+	t.Helper()
+	var onDelete string
+	if err := db.SQLDB().QueryRowContext(context.Background(), "SELECT on_delete FROM pragma_foreign_key_list(?) WHERE \"table\" = ?", table, target).Scan(&onDelete); err != nil {
+		t.Fatalf("inspect %s -> %s foreign key: %v", table, target, err)
+	}
+	if !strings.EqualFold(onDelete, wantDelete) {
+		t.Fatalf("%s -> %s on_delete = %q, want %s", table, target, onDelete, wantDelete)
+	}
+}
+
+func TestLoopbackTLSExceptionRejectsURLQueryHostOverride(t *testing.T) {
+	if isLoopbackOrUnixDSN("postgres", "postgres://localhost/events?host=evil.example") {
+		t.Fatal("URL query host override incorrectly qualified for insecure loopback exception")
+	}
+}
+
+func TestLoopbackTLSExceptionRejectsAmbiguousPostgresWhitespace(t *testing.T) {
+	for _, dsn := range []string{
+		"host='localhost db.remote' dbname=events",
+		"host=localhost db.remote dbname=events",
+	} {
+		if isLoopbackOrUnixDSN("postgres", dsn) {
+			t.Errorf("ambiguous DSN %q qualified for insecure loopback exception", dsn)
+		}
+	}
+}
+
+func TestSQLiteImmediateWriterContentionIsBounded(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "events.db")
+	first, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: dsn})
+	if err != nil {
+		t.Fatalf("open first database: %v", err)
+	}
+	defer first.Close()
+	second, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: dsn})
+	if err != nil {
+		t.Fatalf("open second database: %v", err)
+	}
+	defer second.Close()
+
+	if _, err := first.SQLDB().ExecContext(context.Background(), "CREATE TABLE IF NOT EXISTS writer_lock_probe (id INTEGER)"); err != nil {
+		t.Fatalf("create writer probe: %v", err)
+	}
+	tx, err := first.SQLDB().BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin first writer: %v", err)
+	}
+	defer tx.Rollback()
+	if _, err := second.SQLDB().ExecContext(context.Background(), "PRAGMA busy_timeout = 100"); err != nil {
+		t.Fatalf("set contention timeout: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	if _, err := second.SQLDB().ExecContext(ctx, "INSERT INTO writer_lock_probe (id) VALUES (1)"); err == nil {
+		t.Fatal("second writer unexpectedly succeeded while first writer held lock")
+	}
+}
+
+func TestOpenDatabaseRejectsFailedSQLiteInitialization(t *testing.T) {
+	root := t.TempDir()
+	dsn := filepath.Join(root, "missing", "events.db")
+	if _, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: dsn}); err == nil {
+		t.Fatal("open with unavailable SQLite parent unexpectedly succeeded")
+	}
+	if err := os.Mkdir(filepath.Dir(dsn), 0o700); err != nil {
+		t.Fatalf("create SQLite parent: %v", err)
+	}
+	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: dsn})
+	if err != nil {
+		t.Fatalf("open after fixing SQLite parent: %v", err)
+	}
+	defer db.Close()
 }

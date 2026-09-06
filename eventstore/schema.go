@@ -85,7 +85,6 @@ type domainEventRow struct {
 	GlobalPosition         uint64    `gorm:"not null;uniqueIndex:ux_domain_events_global_position;index:ix_domain_events_global_position,priority:1"`
 	EventType              string    `gorm:"type:varchar(255);not null"`
 	SchemaVersion          uint16    `gorm:"not null"`
-	Payload                []byte    `gorm:"not null"`
 	CommandID              string    `gorm:"type:varchar(255)"`
 	CorrelationID          string    `gorm:"type:varchar(255)"`
 	CausationID            string    `gorm:"type:varchar(255)"`
@@ -153,6 +152,7 @@ type operationRow struct {
 	PrivateContext    []byte     `gorm:""`
 	PrivateNonce      []byte     `gorm:"size:12"`
 	PrivateKeyID      string     `gorm:"type:varchar(255)"`
+	Artifact          *operationArtifactRow `gorm:"foreignKey:ArtifactID;references:ArtifactID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT;"`
 	CreatedAt         time.Time  `gorm:"not null"`
 	UpdatedAt         time.Time  `gorm:"not null"`
 	ExpiresAt         *time.Time
@@ -276,6 +276,7 @@ type subjectFenceRow struct {
 	PurgeOperationID string `gorm:"type:varchar(255);not null"`
 	CreatedAt time.Time `gorm:"not null"`
 	ExpiresAt *time.Time
+	PurgeOperation *operationRow `gorm:"foreignKey:PurgeOperationID;references:OperationID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT;"`
 }
 
 func (subjectFenceRow) TableName() string { return tableSubjectFences }
