@@ -591,6 +591,7 @@ func TestTask5UOWArtifactExpiryScrubsOnObservedExpiry(t *testing.T) {
 	if _, err := store.Commit(ctx, UnitOfWork{ArtifactUpdates: []ArtifactUpdate{
 		{ArtifactID: "uow-expiring-artifact", ExpectedVersion: 1},
 		{ArtifactID: "uow-expiring-artifact-2", ExpectedVersion: 1},
+		{ArtifactID: "uow-expiring-artifact-consumed", ExpectedVersion: 2},
 	}}); !errors.Is(err, ErrArtifactGone) {
 		t.Fatalf("expired artifact participant err = %v", err)
 	}
