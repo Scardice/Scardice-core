@@ -41,12 +41,13 @@ go test -count=1 ./eventstore
 ok   Scardice-core/eventstore  0.639s
 ```
 
-The first command was run after the final source/test commit and included the Task5 tests whose names match the required filters. No formatter, linter, or project-wide suite was run.
+The commands were rerun after the final source/test commits and included the Task5 tests whose names match the required filters. No formatter, linter, or project-wide suite was run.
 
 ## Commits
 
 - Implementation and tests: `0470750b` (`eventstore: add ordered inbox outbox and artifacts`)
-- Report: committed separately after this file is written.
+- Follow-up completion identity hardening: `19330c86` (`eventstore: enforce terminal completion lease identity`)
+- Report: committed separately after implementation.
 
 ## Limitation
 
