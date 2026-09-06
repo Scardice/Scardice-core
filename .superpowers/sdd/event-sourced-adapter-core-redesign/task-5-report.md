@@ -33,10 +33,10 @@ Exact required commands and results:
 
 ```text
 go test -race ./eventstore -run 'TestInbox|TestOutbox|TestArtifact|TestLane|TestLease|TestEffect|TestDedup' -count=1
-ok   Scardice-core/eventstore  1.448s
+ok   Scardice-core/eventstore  1.436s
 
 go test -count=1 ./eventstore
-ok   Scardice-core/eventstore  0.720s
+ok   Scardice-core/eventstore  0.790s
 ```
 
 The commands were rerun after the final source/test commits and included the Task5 tests whose names match the required filters. No formatter, linter, or project-wide suite was run.
