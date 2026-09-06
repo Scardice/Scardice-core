@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -75,6 +76,29 @@ func TestEventContract(t *testing.T) {
 	if got := ComputeEventChecksum(envelope); got != envelope.Checksum {
 		t.Fatal("event checksum is not reproducible")
 	}
+	const wantChecksum = "738d44a6f3fc9e32fbb8db4c2f3b14444c8ec129d3cf129b6275540fb22fa13d"
+	if got := envelope.Checksum.String(); got != wantChecksum {
+		t.Fatalf("checksum = %s, want known vector %s", got, wantChecksum)
+	}
+	mutations := []struct {
+		name string
+		edit func(*Envelope)
+	}{
+		{"stream version", func(e *Envelope) { e.StreamVersion++ }},
+		{"event type", func(e *Envelope) { e.EventType = "counter.other" }},
+		{"schema version", func(e *Envelope) { e.SchemaVersion++ }},
+		{"metadata event ID", func(e *Envelope) { e.Metadata.EventID = "event-2" }},
+		{"payload bytes", func(e *Envelope) { e.Payload = json.RawMessage(`{"delta":2}`) }},
+	}
+	for _, mutation := range mutations {
+		t.Run("checksum changes "+mutation.name, func(t *testing.T) {
+			changed := envelope
+			mutation.edit(&changed)
+			if got := ComputeEventChecksum(changed); got == envelope.Checksum {
+				t.Fatal("checksum did not change")
+			}
+		})
+	}
 
 	var aggregate counterAggregate
 	if err := aggregate.Apply(envelope); err != nil {
@@ -121,6 +145,31 @@ func TestEventContract(t *testing.T) {
 	}
 	if _, err := (EventFactory{}).NewEvent("counter.changed", 1, json.RawMessage(`{"delta":1}`), Metadata{}); !errors.Is(err, ErrInvalidMetadata) {
 		t.Fatalf("invalid metadata error = %v", err)
+	}
+	epochMetadata := Metadata{
+		EventID: "event-epoch", CommandID: "command-epoch", CorrelationID: "correlation-epoch",
+		OccurredAt: time.Unix(0, 0).UTC(),
+	}
+	epochEvent, err := (EventFactory{}).NewEvent("counter.changed", 1, json.RawMessage(`{"delta":1}`), epochMetadata)
+	if err != nil {
+		t.Fatalf("Unix epoch metadata rejected: %v", err)
+	}
+	if _, err := (EventFactory{}).Envelope(stream, 1, 10, epochEvent); err != nil {
+		t.Fatalf("Unix epoch envelope rejected: %v", err)
+	}
+	invalidWorkErr := ValidateUnitOfWork(UnitOfWork{Streams: []StreamAppend{{
+		Stream: stream,
+		Events: []NewEvent{{
+			EventType: "counter.changed",
+			SchemaVersion: 1,
+			Payload: json.RawMessage(`{"secret":"must-not-leak"}`),
+		}},
+	}}})
+	if !errors.Is(invalidWorkErr, ErrInvalidMetadata) {
+		t.Fatalf("missing event metadata error = %v", invalidWorkErr)
+	}
+	if strings.Contains(invalidWorkErr.Error(), "must-not-leak") {
+		t.Fatal("invalid metadata error leaked payload")
 	}
 }
 

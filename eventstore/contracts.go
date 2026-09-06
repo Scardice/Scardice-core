@@ -71,6 +71,7 @@ type Metadata struct {
 	Producer               string
 	OccurredAt             time.Time
 	OccurredAtUnixNanoUTC  int64
+	OccurredAtUnixNanoSet  bool
 }
 
 // StreamID identifies one aggregate stream without importing an aggregate type.
@@ -142,7 +143,7 @@ func (f EventFactory) NewEvent(eventType string, schemaVersion uint16, payload j
 			return NewEvent{}, err
 		}
 	}
-	if metadata.OccurredAt.IsZero() && metadata.OccurredAtUnixNanoUTC == 0 {
+	if metadata.OccurredAt.IsZero() && metadata.OccurredAtUnixNanoUTC == 0 && !metadata.OccurredAtUnixNanoSet {
 		if f.Clock == nil {
 			return NewEvent{}, ErrInvalidMetadata
 		}
@@ -151,11 +152,25 @@ func (f EventFactory) NewEvent(eventType string, schemaVersion uint16, payload j
 	if !metadata.OccurredAt.IsZero() {
 		metadata.OccurredAt = metadata.OccurredAt.UTC()
 		metadata.OccurredAtUnixNanoUTC = metadata.OccurredAt.UnixNano()
+		metadata.OccurredAtUnixNanoSet = true
 	}
-	if metadata.OccurredAtUnixNanoUTC == 0 {
+	if metadata.OccurredAt.IsZero() && (metadata.OccurredAtUnixNanoUTC != 0 || metadata.OccurredAtUnixNanoSet) {
+		metadata.OccurredAtUnixNanoSet = true
+	}
+	if metadata.OccurredAt.IsZero() && !metadata.OccurredAtUnixNanoSet {
 		return NewEvent{}, ErrInvalidMetadata
 	}
 	return NewEvent{EventType: eventType, SchemaVersion: schemaVersion, Payload: payload, Metadata: metadata}, nil
+}
+func metadataHasTimestamp(metadata Metadata) bool {
+	return !metadata.OccurredAt.IsZero() || metadata.OccurredAtUnixNanoSet || metadata.OccurredAtUnixNanoUTC != 0
+}
+
+func metadataUnixNano(metadata Metadata) int64 {
+	if !metadata.OccurredAt.IsZero() {
+		return metadata.OccurredAt.UTC().UnixNano()
+	}
+	return metadata.OccurredAtUnixNanoUTC
 }
 
 // Envelope assigns storage positions and computes the stable event checksum.
@@ -169,7 +184,7 @@ func (f EventFactory) Envelope(stream StreamID, streamVersion, globalPosition ui
 		}
 		return Envelope{}, ErrInvalidEvent
 	}
-	if event.Metadata.EventID == "" || event.Metadata.CommandID == "" || event.Metadata.CorrelationID == "" || event.Metadata.OccurredAtUnixNanoUTC == 0 {
+	if event.Metadata.EventID == "" || event.Metadata.CommandID == "" || event.Metadata.CorrelationID == "" || !metadataHasTimestamp(event.Metadata) {
 		return Envelope{}, ErrInvalidMetadata
 	}
 	envelope := Envelope{
@@ -187,55 +202,74 @@ func (f EventFactory) Envelope(stream StreamID, streamVersion, globalPosition ui
 }
 
 // ComputeEventChecksum implements A1's domain-separated canonical checksum.
-// Every scalar is length-prefixed, and the payload bytes are included verbatim.
+// Every scalar has an explicit type and null marker followed by a length-prefixed
+// value. The payload bytes are included verbatim and are never decoded.
 func ComputeEventChecksum(event Envelope) EventChecksum {
 	h := sha256.New()
-	writeChecksumString(h, "SCARDICE-EVENT-V1")
-	writeChecksumString(h, event.Stream.AggregateType)
-	writeChecksumString(h, event.Stream.AggregateID)
-	writeChecksumUint64(h, event.StreamVersion)
-	writeChecksumUint64(h, event.GlobalPosition)
-	writeChecksumString(h, event.EventID)
-	writeChecksumString(h, event.EventType)
-	writeChecksumUint16(h, event.SchemaVersion)
-	writeChecksumString(h, event.Metadata.EventID)
-	writeChecksumString(h, event.Metadata.CommandID)
-	writeChecksumString(h, event.Metadata.CorrelationID)
-	writeChecksumString(h, event.Metadata.CausationID)
-	writeChecksumString(h, event.Metadata.PrincipalID)
-	writeChecksumString(h, event.Metadata.Producer)
-	writeChecksumInt64(h, event.Metadata.OccurredAtUnixNanoUTC)
-	writeChecksumBytes(h, event.Payload)
+	writeCanonicalString(h, "SCARDICE-EVENT-V1")
+	writeCanonicalString(h, event.Stream.AggregateType)
+	writeCanonicalString(h, event.Stream.AggregateID)
+	writeCanonicalUint64(h, event.StreamVersion)
+	writeCanonicalUint64(h, event.GlobalPosition)
+	writeCanonicalString(h, event.EventType)
+	writeCanonicalUint16(h, event.SchemaVersion)
+	writeCanonicalString(h, event.Metadata.EventID)
+	writeCanonicalString(h, event.Metadata.CommandID)
+	writeCanonicalString(h, event.Metadata.CorrelationID)
+	writeCanonicalOptionalString(h, event.Metadata.CausationID)
+	writeCanonicalOptionalString(h, event.Metadata.PrincipalID)
+	writeCanonicalOptionalString(h, event.Metadata.Producer)
+	writeCanonicalInt64(h, metadataUnixNano(event.Metadata))
+	writeCanonicalBytes(h, event.Payload, event.Payload == nil)
 	var checksum EventChecksum
 	copy(checksum[:], h.Sum(nil))
 	return checksum
 }
 
-func writeChecksumBytes(h interface{ Write([]byte) (int, error) }, value []byte) {
+// writeCanonicalField is the one scalar encoding used by checksums. A marker
+// value of zero is null; one is non-null. Non-null values, including empty
+// strings/byte slices, retain a zero length rather than becoming null.
+func writeCanonicalField(h interface{ Write([]byte) (int, error) }, typeTag byte, isNull bool, value []byte) {
+	marker := byte(1)
+	if isNull {
+		marker = 0
+		value = nil
+	}
+	_, _ = h.Write([]byte{typeTag, marker})
 	var length [8]byte
 	binary.BigEndian.PutUint64(length[:], uint64(len(value)))
 	_, _ = h.Write(length[:])
 	_, _ = h.Write(value)
 }
 
-func writeChecksumString(h interface{ Write([]byte) (int, error) }, value string) {
-	writeChecksumBytes(h, []byte(value))
+func writeCanonicalString(h interface{ Write([]byte) (int, error) }, value string) {
+	writeCanonicalField(h, 's', false, []byte(value))
 }
 
-func writeChecksumUint16(h interface{ Write([]byte) (int, error) }, value uint16) {
+func writeCanonicalOptionalString(h interface{ Write([]byte) (int, error) }, value string) {
+	writeCanonicalField(h, 's', value == "", []byte(value))
+}
+
+func writeCanonicalBytes(h interface{ Write([]byte) (int, error) }, value []byte, isNull bool) {
+	writeCanonicalField(h, 'b', isNull, value)
+}
+
+func writeCanonicalUint16(h interface{ Write([]byte) (int, error) }, value uint16) {
 	var encoded [2]byte
 	binary.BigEndian.PutUint16(encoded[:], value)
-	_, _ = h.Write(encoded[:])
+	writeCanonicalField(h, 'h', false, encoded[:])
 }
 
-func writeChecksumUint64(h interface{ Write([]byte) (int, error) }, value uint64) {
+func writeCanonicalUint64(h interface{ Write([]byte) (int, error) }, value uint64) {
 	var encoded [8]byte
 	binary.BigEndian.PutUint64(encoded[:], value)
-	_, _ = h.Write(encoded[:])
+	writeCanonicalField(h, 'u', false, encoded[:])
 }
 
-func writeChecksumInt64(h interface{ Write([]byte) (int, error) }, value int64) {
-	writeChecksumUint64(h, uint64(value))
+func writeCanonicalInt64(h interface{ Write([]byte) (int, error) }, value int64) {
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], uint64(value))
+	writeCanonicalField(h, 'i', false, encoded[:])
 }
 
 // StreamAppend is one already-decided optimistic append.
@@ -441,6 +475,9 @@ func ValidateUnitOfWork(work UnitOfWork) error {
 		for _, event := range append.Events {
 			if event.EventType == "" || event.SchemaVersion == 0 {
 				return ErrInvalidEvent
+			}
+			if !metadataHasTimestamp(event.Metadata) || event.Metadata.EventID == "" || event.Metadata.CommandID == "" || event.Metadata.CorrelationID == "" {
+				return ErrInvalidMetadata
 			}
 			if len(event.Payload) > MaxEventPayloadBytes {
 				return &OversizeError{Bound: "event payload", Limit: MaxEventPayloadBytes, Actual: len(event.Payload)}
