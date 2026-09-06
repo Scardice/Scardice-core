@@ -40,21 +40,21 @@ Green focused race run:
 
 ```text
 go test -race ./eventstore -run 'TestCommit|TestMultiStreamConflict|TestLockOrder|TestRollback|TestChecksum' -count=1
-ok  Scardice-core/eventstore  1.190s
+ok  Scardice-core/eventstore  1.189s
 ```
 
 Green package run:
 
 ```text
 go test ./eventstore
-ok  Scardice-core/eventstore  0.225s
+ok  Scardice-core/eventstore  0.231s
 ```
 
 No formatter, linter, or project-wide test suite was run.
 
 ## Commit
 
-Implementation commits: `9fc13ec5` (atomic UnitOfWork), `636ff72f` (redacted participant keys), `89426b55` (artifact CAS persistence), `b32a9be6` (locks/transaction-only hooks/participant CAS), `cb355ca1` (sparse preservation/history/delete), `17ce7d0d` (validation/fence/hook evidence), and the final result-consistency follow-up.
+Implementation commits: `9fc13ec5` (atomic UnitOfWork), `636ff72f` (redacted participant keys), `89426b55` (artifact CAS persistence), `b32a9be6` (locks/transaction-only hooks/participant CAS), `cb355ca1` (sparse preservation/history/delete), `17ce7d0d` (validation/fence/hook evidence), `a896bcbd` (delete result consistency), and the final plugin update-result follow-up.
 The report is committed as the required Task 3 report follow-up on the same branch.
 
 - SQLite and GORM paths are covered locally. Remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available.

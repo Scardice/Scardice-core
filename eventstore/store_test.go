@@ -148,12 +148,18 @@ func TestZeroStreamParticipantUpdates(t *testing.T) {
 	if sequence.NextPosition != 1 { t.Fatalf("sequence advanced to %d", sequence.NextPosition) }
 	if _, err := store.Commit(context.Background(), UnitOfWork{ArtifactUpdates: []ArtifactUpdate{{ArtifactID:"art-zero", ExpectedVersion:1, OperationID:"op-zero", Ciphertext:[]byte("cipher-2")}}}); err != nil { t.Fatalf("artifact CAS update: %v", err) }
 	if _, err := store.Commit(context.Background(), UnitOfWork{Operations: []OperationUpdate{{OperationID:"op-zero", ExpectedVersion:1, Status:"running"}}}); err != nil { t.Fatalf("sparse operation update: %v", err) }
+	pluginResult, err := store.Commit(context.Background(), UnitOfWork{PluginKVUpdates: []PluginKVUpdate{{ExtensionID:"plugin-zero", KeyHMAC:[]byte("key-zero"), ExpectedVersion:1, ValueCiphertext:[]byte("value-2")}}})
+	if err != nil { t.Fatalf("sparse plugin update: %v", err) }
+	if len(pluginResult.PluginKVIndexes) != 1 || string(pluginResult.PluginKVIndexes[0]) != "key-zero" { t.Fatalf("plugin update result = %#v", pluginResult) }
+	
 	var operation operationRow
 	if err := db.GORM().Where("operation_id = ?", "op-zero").First(&operation).Error; err != nil { t.Fatal(err) }
 	if operation.Version != 2 || operation.PrincipalID != "p-zero" || operation.Status != "running" { t.Fatalf("operation preservation = %#v", operation) }
 	if _, err := store.Commit(context.Background(), UnitOfWork{FenceUpdates: []SubjectFenceUpdate{{SubjectKey:[]byte("subject-zero"), Scope:"all", ExpectedVersion:1, ExpiresAt:time.Now().Add(time.Hour)}}}); err != nil { t.Fatalf("sparse fence update: %v", err) }
 	if _, err := store.Commit(context.Background(), UnitOfWork{FenceUpdates: []SubjectFenceUpdate{{SubjectKey:[]byte("subject-zero"), Scope:"all", ExpectedVersion:2, Deleted:true}}}); err != nil { t.Fatalf("fence delete: %v", err) }
-	if _, err := store.Commit(context.Background(), UnitOfWork{SecretUpdates: []SecretUpdate{{SecretRef:"secret-zero", ExpectedVersion:1, Ciphertext:[]byte("secret-2"), Nonce:[]byte("nonce-2")}}, PluginKVUpdates: []PluginKVUpdate{{ExtensionID:"plugin-zero", KeyHMAC:[]byte("key-zero"), ExpectedVersion:1, Deleted:true}}}); err != nil { t.Fatalf("history/delete update: %v", err) }
+	deleteResult, err := store.Commit(context.Background(), UnitOfWork{SecretUpdates: []SecretUpdate{{SecretRef:"secret-zero", ExpectedVersion:1, Ciphertext:[]byte("secret-2"), Nonce:[]byte("nonce-2")}}, PluginKVUpdates: []PluginKVUpdate{{ExtensionID:"plugin-zero", KeyHMAC:[]byte("key-zero"), ExpectedVersion:2, Deleted:true}}})
+	if err != nil { t.Fatalf("history/delete update: %v", err) }
+	if len(deleteResult.PluginKVIndexes) != 1 || string(deleteResult.PluginKVIndexes[0]) != "key-zero" { t.Fatalf("plugin delete result = %#v", deleteResult) }
 	var secretRows, pluginRows int64
 	if err := db.GORM().Model(&adapterSecretRow{}).Where("secret_ref = ?", "secret-zero").Count(&secretRows).Error; err != nil { t.Fatal(err) }
 	if err := db.GORM().Model(&pluginKVRow{}).Where("extension_id = ?", "plugin-zero").Count(&pluginRows).Error; err != nil { t.Fatal(err) }
