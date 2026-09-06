@@ -341,8 +341,8 @@ func TestEventStoreDomainEventPayloadColumn(t *testing.T) {
 	if err := db.SQLDB().QueryRowContext(context.Background(), "SELECT type, \"notnull\" FROM pragma_table_info(?) WHERE name = ?", tableDomainEvents, "payload").Scan(&columnType, &notNull); err != nil {
 		t.Fatalf("inspect domain event payload column: %v", err)
 	}
-	if !strings.EqualFold(columnType, "blob") || notNull != 1 {
-		t.Fatalf("payload column type/notnull = %q/%d, want blob/1", columnType, notNull)
+	if !strings.EqualFold(columnType, "blob") || notNull != 0 {
+		t.Fatalf("payload column type/notnull = %q/%d, want blob/0", columnType, notNull)
 	}
 }
 

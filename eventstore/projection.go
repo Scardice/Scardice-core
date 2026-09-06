@@ -121,13 +121,19 @@ func sameProjectors(a, b []ProjectionDescriptor) bool {
 	return true
 }
 
+
 func (s *GORMStore) projectorSnapshot() ([]ProjectionDescriptor, string, error) {
 	if s == nil {
 		return nil, "", errors.New("eventstore: store unavailable")
 	}
 	s.projectorMu.RLock()
-	projectors := stableProjectors(s.projectors)
-	s.projectorMu.RUnlock()
+	defer s.projectorMu.RUnlock()
+	for _, projector := range s.projectors {
+		if projector.Legacy {
+			return nil, "", ErrLegacyProjector
+		}
+	}
+	projectors := append([]ProjectionDescriptor(nil), s.projectors...)
 	if len(projectors) == 0 {
 		return nil, "", ErrInvalidProjector
 	}
@@ -186,7 +192,10 @@ func (s *GORMStore) Rebuild(ctx context.Context, request RebuildRequest) (Rebuil
 			return RebuildResult{}, err
 		}
 		if len(rows) == 0 {
-			return RebuildResult{}, errors.New("eventstore: projection event scan stalled")
+			return RebuildResult{}, ErrProjectionInvariant
+		}
+		if err := validateProjectionPage(rows, cursor); err != nil {
+			return RebuildResult{}, err
 		}
 		if err := s.applyProjectionPage(ctx, generation, rows, projectors); err != nil {
 			return RebuildResult{}, err
@@ -208,8 +217,11 @@ func (s *GORMStore) Rebuild(ctx context.Context, request RebuildRequest) (Rebuil
 		if err != nil {
 			return RebuildResult{}, err
 		}
+		if err := validateProjectionPage(rows, cursor); err != nil {
+			return RebuildResult{}, err
+		}
 		if len(rows) == 0 {
-			return RebuildResult{}, errors.New("eventstore: projection catch-up stalled")
+			return RebuildResult{}, ErrProjectionInvariant
 		}
 		if err := s.applyProjectionPage(ctx, generation, rows, projectors); err != nil {
 			return RebuildResult{}, err
@@ -228,6 +240,20 @@ func (s *GORMStore) highWater(ctx context.Context) (uint64, error) {
 		return 0, nil
 	}
 	return sequence.NextPosition - 1, nil
+}
+
+func validateProjectionPage(rows []domainEventRow, cursor uint64) error {
+	expected := cursor
+	for _, row := range rows {
+		if expected == maxUint64 {
+			return ErrProjectionInvariant
+		}
+		expected++
+		if row.GlobalPosition != expected {
+			return ErrProjectionInvariant
+		}
+	}
+	return nil
 }
 
 func loadProjectionEventPage(db *gorm.DB, cursor, highWater uint64) ([]domainEventRow, error) {
@@ -329,12 +355,6 @@ func (s *GORMStore) publishProjection(ctx context.Context, generation string, cu
 		return RebuildResult{}, errors.New("eventstore: lock projection control failed")
 	}
 	s.observeLock(tableProjectionControl)
-	s.projectorMu.RLock()
-	defer s.projectorMu.RUnlock()
-	current := stableProjectors(s.projectors)
-	if !sameProjectors(current, projectors) || setVersion != projectorSetVersion(current) {
-		return RebuildResult{}, ErrProjectorRegistryChanged
-	}
 	var sequence eventGlobalSequenceRow
 	if err := locked(tx).Where("singleton_id = ?", "default").First(&sequence).Error; err != nil {
 		return RebuildResult{}, errors.New("eventstore: lock event sequence failed")
@@ -352,7 +372,10 @@ func (s *GORMStore) publishProjection(ctx context.Context, generation string, cu
 			return RebuildResult{}, err
 		}
 		if len(rows) == 0 {
-			return RebuildResult{}, errors.New("eventstore: projection final scan stalled")
+			return RebuildResult{}, ErrProjectionInvariant
+		}
+		if err := validateProjectionPage(rows, cursor); err != nil {
+			return RebuildResult{}, err
 		}
 		envelopes := make([]Envelope, len(rows))
 		for i, row := range rows {
@@ -369,6 +392,12 @@ func (s *GORMStore) publishProjection(ctx context.Context, generation string, cu
 			}
 		}
 		cursor = rows[len(rows)-1].GlobalPosition
+	}
+	s.projectorMu.RLock()
+	defer s.projectorMu.RUnlock()
+	current := stableProjectors(s.projectors)
+	if !sameProjectors(current, projectors) || setVersion != projectorSetVersion(current) {
+		return RebuildResult{}, ErrProjectorRegistryChanged
 	}
 	if err := validateProjectionRows(tx, generation); err != nil {
 		return RebuildResult{}, err

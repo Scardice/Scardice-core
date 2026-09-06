@@ -13,17 +13,18 @@ import (
 )
 
 var (
-	ErrChecksumMismatch       = errors.New("eventstore: checksum mismatch")
-	ErrParticipantConflict    = errors.New("eventstore: participant conflict")
-	ErrParticipantFailure     = errors.New("eventstore: participant failure")
-	ErrProjectorFailure       = errors.New("eventstore: projector failure")
-	ErrInvalidProjector       = errors.New("eventstore: invalid projector")
-	ErrDuplicateProjector     = errors.New("eventstore: duplicate projector")
+	ErrChecksumMismatch          = errors.New("eventstore: checksum mismatch")
+	ErrParticipantConflict       = errors.New("eventstore: participant conflict")
+	ErrParticipantFailure        = errors.New("eventstore: participant failure")
+	ErrProjectorFailure         = errors.New("eventstore: projector failure")
+	ErrInvalidProjector          = errors.New("eventstore: invalid projector")
+	ErrDuplicateProjector       = errors.New("eventstore: duplicate projector")
 	ErrProjectorVersionConflict = errors.New("eventstore: projector version conflict")
 	ErrProjectorRegistryChanged = errors.New("eventstore: projector registry changed")
-	ErrUnsupportedEventSchema = ErrUnsupportedSchema
-	ErrProjectionInvariant    = errors.New("eventstore: projection invariant failed")
-	ErrVersionExhausted       = errors.New("eventstore: version exhausted")
+	ErrLegacyProjector           = errors.New("eventstore: legacy projector requires A2 live compatibility")
+	ErrProjectionInvariant      = errors.New("eventstore: projection invariant failed")
+	ErrVersionExhausted         = errors.New("eventstore: version exhausted")
+	ErrUnsupportedEventSchema   = ErrUnsupportedSchema
 )
 
 type ParticipantConflict struct {
@@ -300,8 +301,8 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 		return CommitResult{}, err
 	}
 	s.projectorMu.RLock()
-	defer s.projectorMu.RUnlock()
 	projectors := append([]ProjectionDescriptor(nil), s.projectors...)
+	s.projectorMu.RUnlock()
 	s.mu.RLock()
 	participants := append([]ParticipantHook(nil), s.participants...)
 	s.mu.RUnlock()
@@ -329,8 +330,15 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 	for _, descriptor := range projectors {
 		if hookErr := descriptor.Apply(ctx, tx, result.Events); hookErr != nil { return CommitResult{}, ErrProjectorFailure }
 	}
-	if err = tx.Commit().Error; err != nil { return CommitResult{}, errors.New("eventstore: commit transaction failed") }
-	committed = true
+	s.projectorMu.RLock()
+	currentProjectors := append([]ProjectionDescriptor(nil), s.projectors...)
+	if !sameProjectors(currentProjectors, projectors) {
+		s.projectorMu.RUnlock()
+		return CommitResult{}, ErrProjectorRegistryChanged
+	}
+	commitErr := tx.Commit().Error
+	s.projectorMu.RUnlock()
+	if err = commitErr; err != nil { return CommitResult{}, errors.New("eventstore: commit transaction failed") }
 	return result, nil
 }
 
@@ -353,7 +361,7 @@ func (s *GORMStore) Load(ctx context.Context, stream StreamID, fromVersion uint6
 		var checksum EventChecksum
 		if len(row.Checksum) != len(checksum) { return nil, ErrChecksumMismatch }
 		copy(checksum[:], row.Checksum)
-		envelope := Envelope{Stream: stream, StreamVersion: row.AggregateVersion, GlobalPosition: row.GlobalPosition, EventID: row.EventID, EventType: row.EventType, SchemaVersion: row.SchemaVersion, Payload: append([]byte(nil), row.Payload...), Metadata: Metadata{EventID: row.EventID, CommandID: row.CommandID, CorrelationID: row.CorrelationID, CausationID: row.CausationID, PrincipalID: row.PrincipalID, Producer: row.Producer, OccurredAtUnixNanoUTC: row.OccurredAtUnixNanoUTC, OccurredAtUnixNanoSet: true}, Checksum: checksum}
+		envelope := Envelope{Stream: stream, StreamVersion: row.AggregateVersion, GlobalPosition: row.GlobalPosition, EventID: row.EventID, EventType: row.EventType, SchemaVersion: row.SchemaVersion, Payload: copyProjectionBytes(row.Payload), Metadata: Metadata{EventID: row.EventID, CommandID: row.CommandID, CorrelationID: row.CorrelationID, CausationID: row.CausationID, PrincipalID: row.PrincipalID, Producer: row.Producer, OccurredAtUnixNanoUTC: row.OccurredAtUnixNanoUTC, OccurredAtUnixNanoSet: true}, Checksum: checksum}
 		if ComputeEventChecksum(envelope) != checksum { return nil, ErrChecksumMismatch }
 		envelopes = append(envelopes, envelope)
 	}

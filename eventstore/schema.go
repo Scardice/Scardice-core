@@ -85,7 +85,7 @@ type domainEventRow struct {
 	GlobalPosition         uint64    `gorm:"not null;uniqueIndex:ux_domain_events_global_position;index:ix_domain_events_global_position,priority:1"`
 	EventType              string    `gorm:"type:varchar(255);not null"`
 	SchemaVersion          uint16    `gorm:"not null"`
-	Payload                []byte    `gorm:"not null;size:262144"`
+	Payload                []byte    `gorm:"size:262144"`
 	CommandID              string    `gorm:"type:varchar(255)"`
 	CorrelationID          string    `gorm:"type:varchar(255)"`
 	CausationID            string    `gorm:"type:varchar(255)"`
@@ -130,7 +130,7 @@ type projectionReadModelRow struct {
 	ProjectionGeneration string    `gorm:"column:projection_generation;type:varchar(255);primaryKey;uniqueIndex:pk_projection_read_models,priority:1"`
 	ProjectionName       string    `gorm:"type:varchar(255);primaryKey;uniqueIndex:pk_projection_read_models,priority:2"`
 	RowKey               string    `gorm:"type:varchar(255);primaryKey;uniqueIndex:pk_projection_read_models,priority:3"`
-	Payload              []byte    `gorm:"not null"`
+	Payload              []byte
 	UpdatedAt            time.Time `gorm:"not null"`
 }
 

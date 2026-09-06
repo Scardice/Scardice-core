@@ -134,6 +134,112 @@ func TestRebuildRejectsMalformedPersistedEnvelope(t *testing.T) {
 	}
 }
 
+func TestRebuildRejectsGlobalPositionGap(t *testing.T) {
+	store, db := projectionTestStore(t)
+	defer db.Close()
+	if err := store.RegisterProjection(projectionDescriptor("v1", projectionApply)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{"a", "gap"}, Events: []NewEvent{testEvent("gap")}}}}); err != nil {
+		t.Fatal(err)
+	}
+	var before projectionControlRow
+	if err := db.GORM().First(&before).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GORM().Model(&domainEventRow{}).Where("event_id = ?", "gap").Update("global_position", 0).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Rebuild(context.Background(), RebuildRequest{ProjectorVersion: "v1"}); !errors.Is(err, ErrProjectionInvariant) {
+		t.Fatalf("gap rebuild error = %v", err)
+	}
+	var after projectionControlRow
+	if err := db.GORM().First(&after).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.ActiveGeneration != before.ActiveGeneration || after.TerminalPosition != before.TerminalPosition {
+		t.Fatalf("gap rebuild published: before=%#v after=%#v", before, after)
+	}
+}
+func TestRebuildRejectsMixedLegacyAndStableProjectors(t *testing.T) {
+	store, db := projectionTestStore(t)
+	defer db.Close()
+	if err := store.RegisterProjection(projectionDescriptor("v1", projectionApply)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RegisterProjector(Projector(func(_ context.Context, tx *gorm.DB, events []Envelope) error {
+		for _, event := range events {
+			if err := UpsertProjectionRow(tx, "legacy", event.EventID, event.Payload); err != nil {
+				return err
+			}
+		}
+		return nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{"a", "mixed"}, Events: []NewEvent{testEvent("mixed-1")}}}}); err != nil {
+		t.Fatal(err)
+	}
+	var before projectionControlRow
+	if err := db.GORM().First(&before).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Rebuild(context.Background(), RebuildRequest{ProjectorVersion: projectorSetVersion([]ProjectionDescriptor{{Name: "events", Version: "v1"}})}); !errors.Is(err, ErrLegacyProjector) {
+		t.Fatalf("mixed rebuild error = %v", err)
+	}
+	var after projectionControlRow
+	if err := db.GORM().First(&after).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.ActiveGeneration != before.ActiveGeneration || after.TerminalPosition != before.TerminalPosition {
+		t.Fatalf("mixed rebuild published: before=%#v after=%#v", before, after)
+	}
+}
+
+func TestLiveAndRebuildPreserveNilPayload(t *testing.T) {
+	store, db := projectionTestStore(t)
+	defer db.Close()
+	if err := store.RegisterProjection(projectionDescriptor("v1", projectionApply)); err != nil {
+		t.Fatal(err)
+	}
+	event := testEvent("nil-payload")
+	event.Payload = nil
+	if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{"a", "nil"}, Events: []NewEvent{event}}}}); err != nil {
+		t.Fatal(err)
+	}
+	row, err := store.ReadProjectionRow(context.Background(), "events", "nil-payload")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Payload != nil {
+		t.Fatalf("live nil payload became non-nil: %#v", row.Payload)
+	}
+	result, err := store.Rebuild(context.Background(), RebuildRequest{ProjectorVersion: "v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebuilt, err := store.ReadProjectionRow(context.Background(), "events", "nil-payload")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebuilt.ProjectionGeneration != result.GenerationID || rebuilt.Payload != nil {
+		t.Fatalf("rebuilt nil payload = %#v", rebuilt)
+	}
+	emptyEvent := testEvent("empty-load")
+	emptyEvent.Payload = []byte{}
+	if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{"a", "empty"}, Events: []NewEvent{emptyEvent}}}}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load(context.Background(), StreamID{"a", "empty"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 1 || loaded[0].Payload == nil || len(loaded[0].Payload) != 0 {
+		t.Fatalf("empty payload round trip = %#v", loaded)
+	}
+}
+
+
 
 func TestRebuildAbortsWhenProjectorRegistryChanges(t *testing.T) {
 	store, db := projectionTestStore(t)
