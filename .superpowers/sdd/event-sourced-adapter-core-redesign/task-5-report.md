@@ -25,7 +25,7 @@ go test ./eventstore -run 'TestTask5' -count=1
 # FAIL: undefined WithClock, WithPayloadCodec, status constants, and repository methods
 ```
 
-After the narrow implementation, the same behavior tests passed. The tests assert observable outcomes rather than row existence alone, including monotonic concurrent allocation, blocked successors, stale lease rejection, active-lease terminal completion, ambiguity, scrubbed bytes, codec round-trip, bounded artifacts, no-codec rollback, participant supplied-version validation, sparse leased-effect identity, opaque replay bounds, callback timestamps, and compensating UoW expiry scrubbing.
+After the narrow implementation, the same behavior tests passed. The tests assert observable outcomes rather than row existence alone, including monotonic concurrent allocation, blocked successors, stale lease rejection, active-lease terminal completion, ambiguity, scrubbed bytes, codec round-trip, bounded artifacts, no-codec rollback, participant supplied-version validation, sparse leased-effect identity, opaque replay bounds, callback timestamps, compensating UoW expiry scrubbing, and dispatched update expiry scrubbing.
 
 ## Verification
 
@@ -33,10 +33,10 @@ Exact required commands and results:
 
 ```text
 go test -race ./eventstore -run 'TestInbox|TestOutbox|TestArtifact|TestLane|TestLease|TestEffect|TestDedup' -count=1
-ok   Scardice-core/eventstore  1.422s
+ok   Scardice-core/eventstore  1.414s
 
 go test -count=1 ./eventstore
-ok   Scardice-core/eventstore  0.830s
+ok   Scardice-core/eventstore  0.752s
 ```
 
 The commands were rerun after the final source/test commits and included the Task5 tests whose names match the required filters. No formatter, linter, or project-wide suite was run.
@@ -48,7 +48,7 @@ The commands were rerun after the final source/test commits and included the Tas
 - Participant bypass closure, strict UoW invariants, TTL/expiry scrub coverage: `b0fd9b28`, `a276823a`
 - Strict ingress, dedupe conflict, canonical lane ordering, artifact ownership/status/TTL, and participant contract hardening: `2828cb0c`
 - Lease lifecycle guard requiring identity for generic leased updates: `87de65fa`
-- UoW replay/expiry, compensating scrub transactions, callback timestamps, and active ambiguity expiry: `faec2583`
+- Dispatched outbox update expiry scrub and regression coverage: `6830225f`
 ## Limitation
 
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
