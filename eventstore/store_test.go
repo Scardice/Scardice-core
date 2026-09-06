@@ -101,4 +101,5 @@ func TestZeroStreamParticipantUpdates(t *testing.T) {
 	var sequence eventGlobalSequenceRow
 	if err := db.GORM().First(&sequence).Error; err != nil { t.Fatal(err) }
 	if sequence.NextPosition != 1 { t.Fatalf("sequence advanced to %d", sequence.NextPosition) }
+	if _, err := store.Commit(context.Background(), UnitOfWork{ArtifactUpdates: []ArtifactUpdate{{ArtifactID:"art-zero", ExpectedVersion:1, OperationID:"op-zero", Ciphertext:[]byte("cipher-2")}}}); err != nil { t.Fatalf("artifact CAS update: %v", err) }
 }
