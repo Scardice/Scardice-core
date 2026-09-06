@@ -33,10 +33,10 @@ Exact required commands and results:
 
 ```text
 go test -race ./eventstore -run 'TestInbox|TestOutbox|TestArtifact|TestLane|TestLease|TestEffect|TestDedup' -count=1
-ok   Scardice-core/eventstore  1.357s
+ok   Scardice-core/eventstore  1.377s
 
 go test -count=1 ./eventstore
-ok   Scardice-core/eventstore  0.678s
+ok   Scardice-core/eventstore  0.708s
 ```
 
 The commands were rerun after the final source/test commits and included the Task5 tests whose names match the required filters. No formatter, linter, or project-wide suite was run.
@@ -57,6 +57,7 @@ The commands were rerun after the final source/test commits and included the Tas
 - Replay assertion refinement and final verification refresh: `95b6c90d`.
 - Consumed-artifact compensation coverage and final suite rerun: `99190962`.
 - Final review closure: post-lookup TTL ordering, UoW non-pending lease enforcement, commit-error artifact zero-result protection, and regression coverage: `e883a075`.
+- UoW pending terminal fixture migration to stable `ErrStaleLease` semantics and final suite rerun: `aa8f3f9c`.
 ## Limitation
 
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
