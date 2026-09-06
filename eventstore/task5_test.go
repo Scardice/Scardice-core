@@ -91,9 +91,7 @@ func TestInboxOrderingAndResolution(t *testing.T) {
 	if _, err := store.ClaimInbox(context.Background(), InboxClaimRequest{WorkerID: "other", LeaseDuration: time.Minute}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("predecessor claim err=%v", err)
 	}
-	started := first.Update
-	started.ExpectedVersion = first.Update.Version
-	started.Status = InboxStatusCallbackStarted
+	started := InboxUpdate{InboxID: first.Update.InboxID, ExpectedVersion: first.Update.Version, Status: InboxStatusCallbackStarted, LeaseOwner: first.Update.LeaseOwner, LeaseEpoch: first.Update.LeaseEpoch, AttemptID: first.Update.AttemptID}
 	if _, err := store.UpdateInbox(context.Background(), started); err != nil {
 		t.Fatal(err)
 	}
@@ -146,8 +144,8 @@ func TestOutboxLeaseDispatchCompletionAndStale(t *testing.T) {
 	if _, err := store.CompleteOutbox(context.Background(), completion); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CompleteOutbox(context.Background(), completion); !errors.Is(err, ErrStaleLease) {
-		t.Fatalf("terminal completion without active lease err=%v", err)
+	if result, err := store.CompleteOutbox(context.Background(), completion); err != nil || !result.Idempotent {
+		t.Fatalf("terminal completion idempotence = %#v err=%v", result, err)
 	}
 	var row outboxEffectRow
 	if err := db.GORM().Where("effect_id = ?", "effect-1").First(&row).Error; err != nil {
@@ -373,9 +371,7 @@ func TestTask5LeaseMutationsRejectExpiredAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	clock.Advance(2 * time.Minute)
-	update := claimed.Update
-	update.ExpectedVersion = claimed.Update.Version
-	update.Status = InboxStatusCallbackStarted
+	update := InboxUpdate{InboxID: claimed.Update.InboxID, ExpectedVersion: claimed.Update.Version, Status: InboxStatusCallbackStarted, LeaseOwner: claimed.Update.LeaseOwner, LeaseEpoch: claimed.Update.LeaseEpoch, AttemptID: claimed.Update.AttemptID}
 	if _, err := store.UpdateInbox(context.Background(), update); !errors.Is(err, ErrStaleLease) {
 		t.Fatalf("expired inbox mutation err = %v", err)
 	}
@@ -460,9 +456,7 @@ func TestInboxCallbackExpiryScrubsWithoutUnblockingRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	callback := claimed.Update
-	callback.ExpectedVersion = claimed.Update.Version
-	callback.Status = InboxStatusCallbackStarted
+	callback := InboxUpdate{InboxID: claimed.Update.InboxID, ExpectedVersion: claimed.Update.Version, Status: InboxStatusCallbackStarted, LeaseOwner: claimed.Update.LeaseOwner, LeaseEpoch: claimed.Update.LeaseEpoch, AttemptID: claimed.Update.AttemptID}
 	if _, err := store.UpdateInbox(context.Background(), callback); err != nil {
 		t.Fatal(err)
 	}
@@ -558,11 +552,7 @@ func TestTask5StrictIngressAndParticipantContracts(t *testing.T) {
 	if _, err := store.AcceptOutbox(ctx, invalidOutbox); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("non-pending outbox acceptance err = %v", err)
 	}
-	pendingLease := inbox
-	pendingLease.ExpectedVersion = 1
-	pendingLease.LeaseOwner = "forged"
-	pendingLease.LeaseEpoch = 1
-	pendingLease.AttemptID = "forged-attempt"
+	pendingLease := InboxUpdate{InboxID: inbox.InboxID, ExpectedVersion: 1, Status: InboxStatusPending, LeaseOwner: "forged", LeaseEpoch: 1, AttemptID: "forged-attempt"}
 	if _, err := store.UpdateInbox(ctx, pendingLease); !errors.Is(err, ErrStaleLease) {
 		t.Fatalf("pending inbox lease injection err = %v", err)
 	}
@@ -603,6 +593,7 @@ func TestTask5StableDedupeAfterScrubAndLeaseRequiredTransitions(t *testing.T) {
 	defer db.Close()
 	ctx := context.Background()
 
+
 	inbox := task5Inbox("stable-inbox", "stable-provider", "stable-lane")
 	inbox.ContentDigest = []byte("stable-digest")
 	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
@@ -612,8 +603,7 @@ func TestTask5StableDedupeAfterScrubAndLeaseRequiredTransitions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	failedInbox := inboxLease.Update
-	failedInbox.Status = InboxStatusFailed
+	failedInbox := InboxUpdate{InboxID: inboxLease.Update.InboxID, ExpectedVersion: inboxLease.Update.Version, Status: InboxStatusFailed, LeaseOwner: inboxLease.Update.LeaseOwner, LeaseEpoch: inboxLease.Update.LeaseEpoch, AttemptID: inboxLease.Update.AttemptID}
 	if _, err := store.UpdateInbox(ctx, failedInbox); err != nil {
 		t.Fatal(err)
 	}
@@ -671,6 +661,40 @@ func TestTask5StableDedupeAfterScrubAndLeaseRequiredTransitions(t *testing.T) {
 		t.Fatalf("scrubbed outbox digest conflict err = %v", err)
 	}
 }
+func TestTask5PublicIngressRejectsImmutableFieldsAndVersions(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	inbox := task5Inbox("public-immutable-inbox", "public-immutable-provider", "public-immutable-lane")
+	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcceptInbox(ctx, InboxUpdate{InboxID: "new-inbox", EndpointID: "endpoint", ProviderEventKey: "provider", LaneHMAC: []byte("lane"), Version: 1, PayloadCiphertext: []byte("sealed"), PayloadNonce: []byte("nonce"), DigestKeyID: "key"}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("accept inbox version err = %v", err)
+	}
+	if _, err := store.UpdateInbox(ctx, InboxUpdate{InboxID: inbox.InboxID, ExpectedVersion: 1, Status: InboxStatusPending, PayloadCiphertext: []byte("sealed")}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("update inbox payload err = %v", err)
+	}
+	if _, err := store.UpdateInbox(ctx, InboxUpdate{InboxID: inbox.InboxID, ExpectedVersion: 1, Version: 9, Status: InboxStatusPending}); !errors.Is(err, ErrParticipantConflict) {
+		t.Fatalf("update inbox version err = %v", err)
+	}
+	if _, err := store.UpdateInbox(ctx, InboxUpdate{InboxID: inbox.InboxID, ExpectedVersion: 1, Status: InboxStatusPending, Resolution: InboxResolutionRetry}); !errors.Is(err, ErrInvalidMetadata) {
+		t.Fatalf("update inbox resolution metadata err = %v", err)
+	}
+	effect := task5Effect("public-immutable-effect", "public-immutable-effect-lane")
+	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcceptOutbox(ctx, NewEffect{EffectID: "new-effect", EndpointID: "endpoint", LaneHMAC: []byte("lane"), EffectType: "send", RiskClass: RiskPreDispatchRetryable, Version: 1, PayloadCiphertext: []byte("sealed"), PayloadNonce: []byte("nonce"), DigestKeyID: "key"}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("accept outbox version err = %v", err)
+	}
+	if _, err := store.UpdateOutbox(ctx, NewEffect{EffectID: effect.EffectID, ExpectedVersion: 1, Status: OutboxStatusPending, EndpointID: "forged"}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("update outbox endpoint err = %v", err)
+	}
+	if _, err := store.UpdateOutbox(ctx, NewEffect{EffectID: effect.EffectID, ExpectedVersion: 1, Version: 9, Status: OutboxStatusPending}); !errors.Is(err, ErrParticipantConflict) {
+		t.Fatalf("update outbox version err = %v", err)
+	}
+}
 
 func TestTask5PendingTerminationAndNonceBound(t *testing.T) {
 	store, db, _ := task5Store(t)
@@ -681,9 +705,7 @@ func TestTask5PendingTerminationAndNonceBound(t *testing.T) {
 	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
 		t.Fatal(err)
 	}
-	failedInbox := inbox
-	failedInbox.Status = InboxStatusFailed
-	failedInbox.ExpectedVersion = 1
+	failedInbox := InboxUpdate{InboxID: inbox.InboxID, Status: InboxStatusFailed, ExpectedVersion: 1}
 	if _, err := store.UpdateInbox(ctx, failedInbox); !errors.Is(err, ErrStaleLease) {
 		t.Fatalf("pending inbox termination err = %v", err)
 	}
@@ -695,9 +717,7 @@ func TestTask5PendingTerminationAndNonceBound(t *testing.T) {
 	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
 		t.Fatal(err)
 	}
-	failedEffect := effect
-	failedEffect.Status = OutboxStatusFailed
-	failedEffect.ExpectedVersion = 1
+	failedEffect := NewEffect{EffectID: effect.EffectID, Status: OutboxStatusFailed, ExpectedVersion: 1}
 	if _, err := store.UpdateOutbox(ctx, failedEffect); !errors.Is(err, ErrStaleLease) {
 		t.Fatalf("pending outbox termination err = %v", err)
 	}
@@ -706,6 +726,22 @@ func TestTask5PendingTerminationAndNonceBound(t *testing.T) {
 	invalidNonce.PayloadNonce = make([]byte, task5NonceLimit+1)
 	if _, err := store.AcceptInbox(ctx, invalidNonce); !errors.Is(err, ErrInvalidMetadata) {
 		t.Fatalf("nonce bound err = %v", err)
+	}
+}
+func TestTask5ArtifactUnsupportedCodecFailsClosed(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	store.codec = struct{}{}
+	ctx := context.Background()
+	if _, err := store.Commit(ctx, UnitOfWork{Operations: []OperationUpdate{{OperationID: "artifact-unsupported-op", PrincipalID: "owner"}}}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := store.Commit(ctx, UnitOfWork{ArtifactUpdates: []ArtifactUpdate{{
+		ArtifactID: "artifact-unsupported", OperationID: "artifact-unsupported-op", Size: 3,
+		Ciphertext: []byte("sealed:abc"), Nonce: []byte("nonce"), EncryptionKeyID: "artifact-key",
+	}}})
+	if !errors.Is(err, ErrEncryptionUnavailable) {
+		t.Fatalf("unsupported artifact codec err = %v", err)
 	}
 }
 func TestTask5ParticipantVersionContract(t *testing.T) {

@@ -154,7 +154,7 @@ func TestZeroStreamParticipantUpdates(t *testing.T) {
 	var sequence eventGlobalSequenceRow
 	if err := db.GORM().First(&sequence).Error; err != nil { t.Fatal(err) }
 	if sequence.NextPosition != 1 { t.Fatalf("sequence advanced to %d", sequence.NextPosition) }
-	if _, err := store.Commit(context.Background(), UnitOfWork{ArtifactUpdates: []ArtifactUpdate{{ArtifactID:"art-zero",ExpectedVersion:1,OperationID:"op-zero"}}}); err != nil { t.Fatalf("artifact CAS update: %v", err) }
+	if _, err := store.Commit(context.Background(), UnitOfWork{ArtifactUpdates: []ArtifactUpdate{{ArtifactID:"art-zero",ExpectedVersion:1}}}); err != nil { t.Fatalf("artifact CAS update: %v", err) }
 	if _, err := store.Commit(context.Background(), UnitOfWork{Operations: []OperationUpdate{{OperationID:"op-zero", ExpectedVersion:1, Status:"running"}}}); err != nil { t.Fatalf("sparse operation update: %v", err) }
 	if _, err := store.Commit(context.Background(), UnitOfWork{InboxUpdates: []InboxUpdate{{InboxID:"inbox-zero",ExpectedVersion:1,Status:InboxStatusPending}}}); err != nil { t.Fatalf("sparse inbox update: %v", err) }
 	var inboxRow inboxMessageRow
