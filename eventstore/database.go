@@ -497,7 +497,15 @@ func ensureSQLiteOperationArtifacts(db *gorm.DB) error {
 	if versionPresent && versionNotNull && fkReady {
 		return nil
 	}
-
+	var indexOwner string
+	err = sqlDB.QueryRowContext(ctx, `SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?`, "ux_operation_artifacts_artifact_id").Scan(&indexOwner)
+	if err == nil {
+		if indexOwner != tableOperationArtifacts {
+			return fmt.Errorf("SQLite index name ux_operation_artifacts_artifact_id is owned by %s", indexOwner)
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	if versionPresent && !versionNotNull {
 		var nullVersions int
 		if err := sqlDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_artifacts WHERE version IS NULL`).Scan(&nullVersions); err != nil {

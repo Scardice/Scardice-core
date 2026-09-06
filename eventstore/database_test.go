@@ -545,6 +545,65 @@ func TestSQLiteLegacyOperationArtifactsUpgrade(t *testing.T) {
 		t.Fatal("legacy orphan artifact database opened successfully")
 	}
 }
+func TestSQLiteLegacyMigrationRejectsForeignIndexOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-index-owner.db")
+	legacy, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open legacy sqlite database: %v", err)
+	}
+	if err := legacy.AutoMigrate(&operationRow{}); err != nil {
+		t.Fatalf("create legacy operations table: %v", err)
+	}
+	if err := legacy.Exec(`CREATE TABLE operation_artifacts (
+		artifact_id TEXT NOT NULL PRIMARY KEY,
+		operation_id TEXT NOT NULL,
+		owner_principal_id TEXT NOT NULL,
+		media_type TEXT NOT NULL,
+		safe_filename TEXT,
+		size INTEGER NOT NULL,
+		status TEXT NOT NULL,
+		ciphertext BLOB,
+		nonce BLOB,
+		encryption_key_id TEXT,
+		expires_at DATETIME NOT NULL,
+		consumed_at DATETIME
+	)`).Error; err != nil {
+		t.Fatalf("create legacy artifact table: %v", err)
+	}
+	if err := legacy.Exec(`CREATE TABLE unrelated_index_owner (id INTEGER PRIMARY KEY, value TEXT)`).Error; err != nil {
+		t.Fatalf("create unrelated table: %v", err)
+	}
+	if err := legacy.Exec(`CREATE UNIQUE INDEX ux_operation_artifacts_artifact_id ON unrelated_index_owner(value)`).Error; err != nil {
+		t.Fatalf("create unrelated index: %v", err)
+	}
+	legacySQL, err := legacy.DB()
+	if err != nil {
+		t.Fatalf("get legacy sql database: %v", err)
+	}
+	if err := legacySQL.Close(); err != nil {
+		t.Fatalf("close legacy sqlite database: %v", err)
+	}
+	if _, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: path}); err == nil {
+		t.Fatal("legacy database with foreign index owner opened successfully")
+	}
+
+	check, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("reopen rejected legacy database: %v", err)
+	}
+	var owner string
+	if err := check.Raw(`SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?`, "ux_operation_artifacts_artifact_id").Scan(&owner).Error; err != nil {
+		t.Fatalf("inspect preserved unrelated index: %v", err)
+	}
+	if owner != "unrelated_index_owner" {
+		t.Fatalf("index owner = %q, want unrelated_index_owner", owner)
+	}
+	checkSQL, err := check.DB()
+	if err != nil {
+		t.Fatalf("get check sql database: %v", err)
+	}
+	_ = checkSQL.Close()
+}
 func assertSQLiteColumn(t *testing.T, db *Database, table, column string) {
 	t.Helper()
 	var name string
