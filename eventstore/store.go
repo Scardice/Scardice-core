@@ -74,6 +74,16 @@ func WithProjection(descriptor ProjectionDescriptor) StoreOption {
 }
 func WithParticipant(hook ParticipantHook) StoreOption { return func(s *GORMStore) { s.RegisterParticipant(hook) } }
 func WithLockObserver(observer func(string)) StoreOption { return func(s *GORMStore) { s.SetLockObserver(observer) } }
+func WithClock(clock Clock) StoreOption {
+	return func(s *GORMStore) { if clock != nil { s.clock = clock } }
+}
+func WithIDGenerator(generator IDGenerator) StoreOption {
+	return func(s *GORMStore) { if generator != nil { s.ids = generator } }
+}
+func WithPayloadCodec(codec any) StoreOption {
+	return func(s *GORMStore) { s.codec = codec }
+}
+func WithArtifactCodec(codec any) StoreOption { return WithPayloadCodec(codec) }
 
 type GORMStore struct {
 	db *Database
@@ -83,9 +93,12 @@ type GORMStore struct {
 	projectors []ProjectionDescriptor
 	participants []ParticipantHook
 	lockObserver func(string)
+	clock Clock
+	ids IDGenerator
+	codec any
 }
 func NewStore(database *Database, options ...StoreOption) *GORMStore {
-	s := &GORMStore{db: database}
+	s := &GORMStore{db: database, clock: SystemClock{}, ids: UUIDGenerator{}}
 	for _, option := range options { if option != nil { option(s) } }
 	return s
 }

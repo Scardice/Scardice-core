@@ -212,8 +212,10 @@ type inboxMessageRow struct {
 	ContentDigestKeyID string `gorm:"type:varchar(255)"`
 	PayloadExpiresAt *time.Time
 	WorkflowID string `gorm:"type:varchar(255)"`
+	ResolutionPrincipal string `gorm:"type:varchar(255)"`
+	ResolutionReason string `gorm:"type:varchar(512)"`
+	ResolutionAt *time.Time
 }
-
 func (inboxMessageRow) TableName() string { return tableInboxMessages }
 
 type outboxEffectRow struct {
@@ -244,8 +246,11 @@ type outboxEffectRow struct {
 	PayloadExpiresAt *time.Time
 	CreatedAt time.Time `gorm:"not null"`
 	ScrubbedAt *time.Time
+	RetryCount uint32 `gorm:"not null"`
+	ResolutionPrincipal string `gorm:"type:varchar(255)"`
+	ResolutionReason string `gorm:"type:varchar(512)"`
+	ResolutionAt *time.Time
 }
-
 func (outboxEffectRow) TableName() string { return tableOutboxEffects }
 
 type adapterSecretRow struct {

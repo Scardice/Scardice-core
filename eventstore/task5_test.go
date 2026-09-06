@@ -1,0 +1,310 @@
+package eventstore
+
+import (
+	"context"
+	"errors"
+	"path/filepath"
+	"strconv"
+	"sync"
+	"testing"
+	"time"
+)
+
+type task5Clock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *task5Clock) Now() time.Time          { c.mu.Lock(); defer c.mu.Unlock(); return c.now }
+func (c *task5Clock) Advance(d time.Duration) { c.mu.Lock(); c.now = c.now.Add(d); c.mu.Unlock() }
+
+type task5Codec struct{}
+
+func (task5Codec) Encrypt(_ context.Context, plaintext []byte) ([]byte, []byte, string, error) {
+	return append([]byte("sealed:"), plaintext...), []byte("nonce"), "test-key", nil
+}
+func (task5Codec) Decrypt(_ context.Context, ciphertext, _ []byte, _ string) ([]byte, error) {
+	const prefix = "sealed:"
+	if len(ciphertext) < len(prefix) || string(ciphertext[:len(prefix)]) != prefix {
+		return nil, errors.New("bad ciphertext")
+	}
+	return append([]byte(nil), ciphertext[len(prefix):]...), nil
+}
+
+func task5Store(t *testing.T) (*GORMStore, *Database, *task5Clock) {
+	t.Helper()
+	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "task5.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := &task5Clock{now: time.Unix(100, 0).UTC()}
+	return NewStore(db, WithClock(clock), WithPayloadCodec(task5Codec{})), db, clock
+}
+
+func task5Inbox(id, provider, lane string) InboxUpdate {
+	return InboxUpdate{InboxID: id, EndpointID: "endpoint", ProviderEventKey: provider, LaneHMAC: []byte(lane), Status: InboxStatusPending, PayloadCiphertext: []byte("ciphertext"), PayloadNonce: []byte("nonce"), DigestKeyID: "digest-key"}
+}
+
+func task5Effect(id, lane string) NewEffect {
+	return NewEffect{EffectID: id, EndpointID: "endpoint", LaneHMAC: []byte(lane), EffectType: "send", RiskClass: RiskPreDispatchRetryable, Status: OutboxStatusPending, PayloadCiphertext: []byte("ciphertext"), PayloadNonce: []byte("nonce"), DigestKeyID: "digest-key"}
+}
+
+func TestInboxAcceptanceDedupeAndLaneAllocation(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	first, err := store.AcceptInbox(context.Background(), task5Inbox("inbox-1", "provider-1", "lane-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.OrderingSequence != 1 || first.Deduplicated {
+		t.Fatalf("first result = %#v", first)
+	}
+	second, err := store.AcceptInbox(context.Background(), task5Inbox("different-id", "provider-1", "lane-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Deduplicated || second.OrderingSequence != 1 || len(second.InboxIDs) != 1 || second.InboxIDs[0] != "inbox-1" {
+		t.Fatalf("dedupe result = %#v", second)
+	}
+	third, err := store.AcceptInbox(context.Background(), task5Inbox("inbox-2", "provider-2", "lane-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.OrderingSequence != 2 {
+		t.Fatalf("caller sequence bypassed allocation: %#v", third)
+	}
+}
+
+func TestInboxOrderingAndResolution(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	if _, err := store.AcceptInbox(context.Background(), task5Inbox("inbox-1", "p1", "lane")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcceptInbox(context.Background(), task5Inbox("inbox-2", "p2", "lane")); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.ClaimInbox(context.Background(), InboxClaimRequest{WorkerID: "worker", LeaseDuration: time.Minute})
+	if err != nil || first.Update.InboxID != "inbox-1" {
+		t.Fatalf("first claim = %#v err=%v", first, err)
+	}
+	if _, err := store.ClaimInbox(context.Background(), InboxClaimRequest{WorkerID: "other", LeaseDuration: time.Minute}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("predecessor claim err=%v", err)
+	}
+	started := first.Update
+	started.ExpectedVersion = first.Update.Version
+	started.Status = InboxStatusCallbackStarted
+	if _, err := store.UpdateInbox(context.Background(), started); err != nil {
+		t.Fatal(err)
+	}
+	ambiguous := started
+	ambiguous.ExpectedVersion = 3
+	ambiguous.Status = InboxStatusAmbiguous
+	if _, err := store.UpdateInbox(context.Background(), ambiguous); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimInbox(context.Background(), InboxClaimRequest{WorkerID: "other", LeaseDuration: time.Minute}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ambiguous predecessor claim err=%v", err)
+	}
+	if _, err := store.ResolveInbox(context.Background(), InboxResolutionRequest{InboxID: "inbox-1", ExpectedVersion: 4, Resolution: InboxResolutionConfirmedConsumed, PrincipalID: "operator", Reason: "verified"}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.ClaimInbox(context.Background(), InboxClaimRequest{WorkerID: "other", LeaseDuration: time.Minute})
+	if err != nil || second.Update.InboxID != "inbox-2" {
+		t.Fatalf("resolved successor claim = %#v err=%v", second, err)
+	}
+	var row inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", "inbox-1").First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(row.PayloadCiphertext) != 0 || len(row.PayloadNonce) != 0 {
+		t.Fatal("terminal inbox payload was not scrubbed")
+	}
+}
+
+func TestOutboxLeaseDispatchCompletionAndStale(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	if _, err := store.AcceptOutbox(context.Background(), task5Effect("effect-1", "lane")); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimOutbox(context.Background(), OutboxClaimRequest{WorkerID: "worker", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatched, err := store.MarkOutboxDispatched(context.Background(), OutboxDispatchRequest{EffectID: claimed.Effect.EffectID, WorkerID: "worker", LeaseEpoch: claimed.Effect.LeaseEpoch, AttemptID: claimed.Effect.AttemptID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dispatched.Effect.Status != OutboxStatusDispatched || dispatched.Effect.AttemptID == claimed.Effect.AttemptID {
+		t.Fatalf("dispatch marker = %#v", dispatched)
+	}
+	if _, err := store.CompleteOutbox(context.Background(), OutboxCompletionRequest{EffectID: "effect-1", WorkerID: "stale", LeaseEpoch: claimed.Effect.LeaseEpoch, AttemptID: claimed.Effect.AttemptID, Status: OutboxStatusSucceeded, ResultCode: "ok"}); !errors.Is(err, ErrStaleLease) {
+		t.Fatalf("stale completion err=%v", err)
+	}
+	completion := OutboxCompletionRequest{EffectID: "effect-1", WorkerID: "worker", LeaseEpoch: dispatched.Effect.LeaseEpoch, AttemptID: dispatched.Effect.AttemptID, Status: OutboxStatusSucceeded, ResultCode: "ok"}
+	if _, err := store.CompleteOutbox(context.Background(), completion); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompleteOutbox(context.Background(), completion); err != nil {
+		t.Fatalf("idempotent completion: %v", err)
+	}
+	var row outboxEffectRow
+	if err := db.GORM().Where("effect_id = ?", "effect-1").First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != OutboxStatusSucceeded || len(row.PayloadCiphertext) != 0 || len(row.PayloadNonce) != 0 {
+		t.Fatalf("terminal outbox row = %#v", row)
+	}
+}
+
+func TestArtifactCodecBoundAndOneWinner(t *testing.T) {
+	store, db, clock := task5Store(t)
+	defer db.Close()
+	if _, err := store.Commit(context.Background(), UnitOfWork{Operations: []OperationUpdate{{OperationID: "op-1", PrincipalID: "principal"}}}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := store.PutArtifact(context.Background(), ArtifactPutRequest{ArtifactID: "artifact-1", OperationID: "op-1", OwnerPrincipalID: "principal", Plaintext: []byte("secret"), TTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.ConsumeArtifact(context.Background(), ArtifactConsumeRequest{ArtifactID: "artifact-1"})
+	if err != nil || string(got.Plaintext) != "secret" {
+		t.Fatalf("consume = %#v err=%v", got, err)
+	}
+	if _, err := store.ConsumeArtifact(context.Background(), ArtifactConsumeRequest{ArtifactID: "artifact-1"}); !errors.Is(err, ErrArtifactGone) {
+		t.Fatalf("losing consume err=%v", err)
+	}
+	var row operationArtifactRow
+	if err := db.GORM().Where("artifact_id = ?", "artifact-1").First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(row.Ciphertext) != 0 || len(row.Nonce) != 0 {
+		t.Fatal("artifact ciphertext was not scrubbed")
+	}
+	if _, err := store.PutArtifact(context.Background(), ArtifactPutRequest{ArtifactID: "too-large", OperationID: "op-1", Plaintext: make([]byte, MaxArtifactBytes+1)}); !errors.Is(err, ErrOversizeInput) {
+		t.Fatalf("size bound err=%v", err)
+	}
+	if _, err := store.PutArtifact(context.Background(), ArtifactPutRequest{ArtifactID: "artifact-2", OperationID: "op-1", Plaintext: []byte("expired"), TTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Minute)
+	if _, err := store.ConsumeArtifact(context.Background(), ArtifactConsumeRequest{ArtifactID: "artifact-2"}); !errors.Is(err, ErrArtifactGone) {
+		t.Fatalf("expired consume err=%v", err)
+	}
+}
+
+func TestInboxConcurrentAcceptanceAllocatesUniqueSequences(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	const count = 12
+	errs := make(chan error, count)
+	var wg sync.WaitGroup
+	for i := range count {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			u := task5Inbox("concurrent-"+strconv.Itoa(i), "provider-"+strconv.Itoa(i), "shared-lane")
+			_, err := store.AcceptInbox(context.Background(), u)
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var rows []inboxMessageRow
+	if err := db.GORM().Where("lane_hmac = ?", []byte("shared-lane")).Order("ordering_sequence ASC").Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != count {
+		t.Fatalf("rows = %d, want %d", len(rows), count)
+	}
+	for i, row := range rows {
+		if row.OrderingSequence != uint64(i+1) {
+			t.Fatalf("sequence[%d] = %d", i, row.OrderingSequence)
+		}
+	}
+}
+
+func TestInboxPayloadExpiryScrubsWithoutUnblockingRetry(t *testing.T) {
+	store, db, clock := task5Store(t)
+	defer db.Close()
+	expiry := clock.Now().Add(time.Minute)
+	u := task5Inbox("expiry-inbox", "expiry-provider", "expiry-lane")
+	u.PayloadExpiresAt = expiry
+	if _, err := store.AcceptInbox(context.Background(), u); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimInbox(context.Background(), InboxClaimRequest{WorkerID: "worker", LeaseDuration: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Minute)
+	if _, err := store.ClaimInbox(context.Background(), InboxClaimRequest{WorkerID: "worker", LeaseDuration: time.Minute}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("expired claim err = %v", err)
+	}
+	var row inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", "expiry-inbox").First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != InboxStatusLeased || len(row.PayloadCiphertext) != 0 || len(row.PayloadNonce) != 0 {
+		t.Fatalf("expired row = %#v", row)
+	}
+}
+
+func TestOutboxNonIdempotentDispatchExpiryBecomesAmbiguous(t *testing.T) {
+	store, db, clock := task5Store(t)
+	defer db.Close()
+	effect := task5Effect("ambiguous-effect", "ambiguous-lane")
+	effect.RiskClass = RiskNonIdempotentAfterDispatch
+	if _, err := store.AcceptOutbox(context.Background(), effect); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimOutbox(context.Background(), OutboxClaimRequest{WorkerID: "worker", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatched, err := store.MarkOutboxDispatched(context.Background(), OutboxDispatchRequest{EffectID: claimed.Effect.EffectID, WorkerID: "worker", LeaseEpoch: claimed.Effect.LeaseEpoch, AttemptID: claimed.Effect.AttemptID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Minute)
+	if _, err := store.ClaimOutbox(context.Background(), OutboxClaimRequest{WorkerID: "other", LeaseDuration: time.Minute}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ambiguous claim err = %v", err)
+	}
+	var row outboxEffectRow
+	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != OutboxStatusAmbiguous {
+		t.Fatalf("status = %q, want %q", row.Status, OutboxStatusAmbiguous)
+	}
+	if _, err := store.ResolveOutbox(context.Background(), OutboxResolutionRequest{EffectID: effect.EffectID, ExpectedVersion: dispatched.Effect.Version + 1, Resolution: OutboxResolutionSucceeded, PrincipalID: "operator", Reason: "provider checked"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestArtifactFailsClosedWithoutCodec(t *testing.T) {
+	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "no-codec.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := NewStore(db, WithClock(&task5Clock{now: time.Unix(100, 0).UTC()}))
+	if _, err := store.Commit(context.Background(), UnitOfWork{Operations: []OperationUpdate{{OperationID: "no-codec-op", PrincipalID: "principal"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PutArtifact(context.Background(), ArtifactPutRequest{ArtifactID: "no-codec-artifact", OperationID: "no-codec-op", Plaintext: []byte("secret")}); !errors.Is(err, ErrEncryptionUnavailable) {
+		t.Fatalf("without codec err = %v", err)
+	}
+	var rows int64
+	if err := db.GORM().Model(&operationArtifactRow{}).Where("artifact_id = ?", "no-codec-artifact").Count(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatal("failed encryption left an artifact row")
+	}
+}

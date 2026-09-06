@@ -19,19 +19,58 @@ const (
 	MaxUnitOfWorkStreams = 128
 	MaxUnitOfWorkEvents  = 2048
 	MaxUnitOfWorkBytes   = 16 * 1024 * 1024
+	MaxArtifactBytes     = 32 * 1024 * 1024
+	DefaultArtifactTTL   = 10 * time.Minute
+	MaxArtifactTTL       = 60 * time.Minute
+	InboxPayloadTTL      = 30 * 24 * time.Hour
+)
+
+const (
+	InboxStatusPending           = "pending"
+	InboxStatusLeased            = "leased"
+	InboxStatusCallbackStarted   = "callback-started"
+	InboxStatusAmbiguous         = "ambiguous"
+	InboxStatusConfirmedConsumed = "confirmed-consumed"
+	InboxStatusFailed            = "failed"
+	InboxStatusSkipped           = "skip"
+
+	OutboxStatusPending    = "pending"
+	OutboxStatusLeased     = "leased"
+	OutboxStatusDispatched = "dispatched"
+	OutboxStatusSucceeded  = "succeeded"
+	OutboxStatusFailed     = "failed"
+	OutboxStatusAmbiguous  = "ambiguous"
+
+	RiskPreDispatchRetryable       = "pre-dispatch-retryable"
+	RiskProviderIdempotent         = "provider-idempotent"
+	RiskNonIdempotentAfterDispatch = "non-idempotent-after-dispatch"
+
+	InboxResolutionConfirmedConsumed = "confirmed-consumed"
+	InboxResolutionRetry             = "retry"
+	InboxResolutionSkip              = "skip"
+	OutboxResolutionRetry            = "retry"
+	OutboxResolutionSucceeded        = "succeeded"
+	OutboxResolutionFailed           = "failed"
 )
 
 var (
 	ErrInvalidEvent      = errors.New("eventstore: invalid event")
 	ErrInvalidMetadata   = errors.New("eventstore: invalid metadata")
 	ErrUnsupportedSchema = errors.New("eventstore: unsupported schema")
-	ErrConflict             = errors.New("eventstore: conflict")
-	ErrEmptyUnitOfWork      = errors.New("eventstore: empty unit of work")
-	ErrDuplicateStream      = errors.New("eventstore: duplicate stream")
+	ErrConflict          = errors.New("eventstore: conflict")
+	ErrEmptyUnitOfWork   = errors.New("eventstore: empty unit of work")
+	ErrDuplicateStream   = errors.New("eventstore: duplicate stream")
 	ErrDuplicateParticipant = errors.New("eventstore: duplicate participant")
-	ErrOversizeInput        = errors.New("eventstore: input exceeds configured bound")
-	ErrStaleLease           = errors.New("eventstore: stale lease")
-	ErrNotFound              = errors.New("eventstore: not found")
+	ErrOversizeInput     = errors.New("eventstore: input exceeds configured bound")
+	ErrStaleLease        = errors.New("eventstore: stale lease")
+	ErrNotFound          = errors.New("eventstore: not found")
+	ErrInvalidTransition = errors.New("eventstore: invalid state transition")
+	ErrInvalidRiskClass  = errors.New("eventstore: invalid risk class")
+	ErrPayloadExpired    = errors.New("eventstore: encrypted payload expired")
+	ErrArtifactGone      = errors.New("eventstore: artifact gone")
+	ErrEncryptionUnavailable = errors.New("eventstore: encryption unavailable")
+	ErrInvalidTTL        = errors.New("eventstore: invalid ttl")
+	ErrDeduplicated      = errors.New("eventstore: deduplicated")
 )
 
 // Clock is injected anywhere a contract allocates a timestamp.
@@ -314,6 +353,10 @@ type CommitResult struct {
 	SecretRefs      []string
 	PluginKVIndexes [][]byte
 	FenceKeys       [][]byte
+	Deduplicated    bool
+	Idempotent      bool
+	OrderingSequence uint64
+	Version         uint64
 }
 
 // Store is intentionally limited to aggregate event operations.
@@ -371,6 +414,10 @@ type InboxUpdate struct {
 	CallbackStartedAt      time.Time
 	CompletedAt            time.Time
 	PayloadExpiresAt       time.Time
+	Resolution             string
+	PrincipalID             string
+	Reason                 string
+	ResolutionAt           time.Time
 }
 
 // NewEffect is an outbound intent; its payload must be encrypted by persistence.
@@ -392,14 +439,19 @@ type NewEffect struct {
 	NextAttemptAt          time.Time
 	DispatchedAt           time.Time
 	PayloadCiphertext      []byte
-	PayloadNonce            []byte
+	PayloadNonce           []byte
 	ContentDigest          []byte
-	DigestKeyID            string
+	DigestKeyID             string
 	ProviderMessageID      string
 	ResultCode             string
 	ErrorCode              string
 	CompletedAt            time.Time
-	PayloadExpiresAt        time.Time
+	PayloadExpiresAt       time.Time
+	RetryCount             uint32
+	Resolution             string
+	PrincipalID             string
+	Reason                 string
+	ResolutionAt           time.Time
 }
 
 // ArtifactUpdate represents encrypted, bounded operation output.
@@ -575,6 +627,76 @@ type StreamConflict struct {
 	CurrentVersion  uint64
 }
 
+type InboxResolutionRequest struct {
+	InboxID string
+	ExpectedVersion uint64
+	Resolution string
+	PrincipalID string
+	Reason string
+}
+type OutboxRenewRequest struct {
+	EffectID string
+	WorkerID string
+	LeaseEpoch uint64
+	AttemptID string
+	LeaseDuration time.Duration
+}
+type OutboxDispatchRequest struct {
+	EffectID string
+	WorkerID string
+	LeaseEpoch uint64
+	AttemptID string
+}
+type OutboxCompletionRequest struct {
+	EffectID string
+	WorkerID string
+	LeaseEpoch uint64
+	AttemptID string
+	Status string
+	ResultCode string
+	ErrorCode string
+	ProviderMessageID string
+}
+type OutboxResolutionRequest struct {
+	EffectID string
+	ExpectedVersion uint64
+	Resolution string
+	PrincipalID string
+	Reason string
+}
+type ArtifactPutRequest struct {
+	ArtifactID string
+	OperationID string
+	OwnerPrincipalID string
+	MediaType string
+	SafeFilename string
+	Plaintext []byte
+	TTL time.Duration
+}
+type ArtifactPutResult struct {
+	ArtifactID string
+	Version uint64
+	Size int64
+	ExpiresAt time.Time
+}
+type ArtifactConsumeRequest struct { ArtifactID string }
+type ArtifactResult struct {
+	ArtifactID string
+	OperationID string
+	OwnerPrincipalID string
+	MediaType string
+	SafeFilename string
+	Size int64
+	Plaintext []byte
+	ExpiresAt time.Time
+	ConsumedAt time.Time
+}
+type PayloadCodec interface {
+	Encrypt(context.Context, []byte) ([]byte, []byte, string, error)
+	Decrypt(context.Context, []byte, []byte, string) ([]byte, error)
+}
+type ArtifactCodec = PayloadCodec
+
 // ConflictError carries only stream identities and versions, never event data.
 type ConflictError struct { Conflicts []StreamConflict }
 
@@ -623,10 +745,20 @@ type InboxRepository interface {
 	AcceptInbox(context.Context, InboxUpdate) (CommitResult, error)
 	ClaimInbox(context.Context, InboxClaimRequest) (InboxLease, error)
 	UpdateInbox(context.Context, InboxUpdate) (CommitResult, error)
+	ResolveInbox(context.Context, InboxResolutionRequest) (CommitResult, error)
 }
 type OutboxRepository interface {
+	AcceptOutbox(context.Context, NewEffect) (CommitResult, error)
 	ClaimOutbox(context.Context, OutboxClaimRequest) (OutboxLease, error)
 	UpdateOutbox(context.Context, NewEffect) (CommitResult, error)
+	RenewOutbox(context.Context, OutboxRenewRequest) (OutboxLease, error)
+	MarkOutboxDispatched(context.Context, OutboxDispatchRequest) (OutboxLease, error)
+	CompleteOutbox(context.Context, OutboxCompletionRequest) (CommitResult, error)
+	ResolveOutbox(context.Context, OutboxResolutionRequest) (CommitResult, error)
+}
+type ArtifactRepository interface {
+	PutArtifact(context.Context, ArtifactPutRequest) (ArtifactPutResult, error)
+	ConsumeArtifact(context.Context, ArtifactConsumeRequest) (ArtifactResult, error)
 }
 type OperationRepository interface {
 	GetOperation(context.Context, string) (OperationView, error)
