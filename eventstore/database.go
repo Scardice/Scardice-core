@@ -177,17 +177,28 @@ func OpenDatabase(ctx context.Context, config DatabaseConfig) (*Database, error)
 			return nil, safeDatabaseError("configure sqlite", dbType, err)
 		}
 	}
-	if err := migrateSchema(gormDB); err != nil {
+	queryTimeout := config.QueryTimeout
+	if queryTimeout <= 0 {
+		queryTimeout = defaultDatabaseQueryTimeout
+	}
+	schemaCtx, cancelSchema := context.WithTimeout(ctx, queryTimeout)
+	defer cancelSchema()
+	schemaDB := gormDB.WithContext(schemaCtx)
+	if err := migrateSchema(schemaDB); err != nil {
 		_ = sqlDB.Close()
 		return nil, safeDatabaseError("migrate schema", dbType, err)
 	}
-	if err := initializeSingletons(gormDB); err != nil {
+	if err := initializeSingletons(schemaDB); err != nil {
 		_ = sqlDB.Close()
 		return nil, safeDatabaseError("initialize schema", dbType, err)
 	}
-	if err := validateSchema(gormDB); err != nil {
+	if err := validateSchema(schemaDB); err != nil {
 		_ = sqlDB.Close()
 		return nil, safeDatabaseError("validate schema", dbType, err)
+	}
+	if err := validateRequiredIndexes(schemaDB); err != nil {
+		_ = sqlDB.Close()
+		return nil, safeDatabaseError("validate indexes", dbType, err)
 	}
 	return owned, nil
 }
@@ -263,7 +274,7 @@ func dsnDeclaresVerifiedTLS(dbType, dsn string) bool {
 			return false
 		}
 		tls := strings.ToLower(parsed.Query().Get("tls"))
-		return tls != "" && tls != "false" && tls != "skip-verify"
+		return tls == "true" || tls == "verify-full"
 	}
 	parsed, err := url.Parse(dsn)
 	if err == nil {
@@ -303,28 +314,31 @@ func isLoopbackOrUnixDSN(dbType, dsn string) bool {
 		}
 		return false
 	}
-	if strings.HasPrefix(dsn, "host=/") || strings.HasPrefix(dsn, "postgres:///") {
-		return true
-	}
 	if strings.Contains(dsn, "host=") {
 		for _, field := range strings.Fields(dsn) {
 			key, value, ok := strings.Cut(field, "=")
-			if !ok {
+			if key != "host" || !ok || value == "" {
 				continue
 			}
-			if key == "host" && strings.HasPrefix(value, "/") {
-				return true
-			}
-			if key == "host" {
-				ip := net.ParseIP(value)
-				if value == "localhost" || (ip != nil && ip.IsLoopback()) {
-					return true
+			for _, host := range strings.Split(value, ",") {
+				host = strings.Trim(host, "'\"")
+				if host == "" {
+					return false
+				}
+				if strings.HasPrefix(host, "/") {
+					continue
+				}
+				ip := net.ParseIP(host)
+				if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+					return false
 				}
 			}
+			return true
 		}
+		return false
 	}
 	parsed, err := url.Parse(dsn)
-	if err != nil {
+	if err != nil || parsed.Hostname() == "" {
 		return false
 	}
 	host := parsed.Hostname()
@@ -340,9 +354,12 @@ func safeDatabaseError(operation, dbType string, _ error) error {
 }
 
 func migrateSchema(db *gorm.DB) error {
-	return db.AutoMigrate(schemaModels()...)
-}
+	if err := db.AutoMigrate(schemaModels()...); err != nil {
+		return err
+	}
+	return nil
 
+}
 func initializeSingletons(db *gorm.DB) error {
 	now := time.Now().UTC()
 	if err := db.Where("singleton_id = ?", "default").FirstOrCreate(&eventGlobalSequenceRow{SingletonID: "default", NextPosition: 1, UpdatedAt: now}).Error; err != nil {
@@ -374,4 +391,61 @@ func validateSchema(db *gorm.DB) error {
 		return errors.New("store readiness singleton invariant failed")
 	}
 	return nil
+}
+
+func validateRequiredIndexes(db *gorm.DB) error {
+	db = db.Session(&gorm.Session{Logger: logger.Default.LogMode(logger.Silent)})
+	models := map[string]any{
+		tableDomainEvents:        &domainEventRow{},
+		tableAggregateHeads:      &aggregateHeadRow{},
+		tableProjectionReadModel: &projectionReadModelRow{},
+		tableOperations:          &operationRow{},
+		tableOperationArtifacts:  &operationArtifactRow{},
+		tableLaneHeads:           &laneHeadRow{},
+		tableInboxMessages:        &inboxMessageRow{},
+		tableOutboxEffects:       &outboxEffectRow{},
+		tableAdapterSecrets:      &adapterSecretRow{},
+		tablePluginKV:            &pluginKVRow{},
+		tableSubjectFences:       &subjectFenceRow{},
+	}
+	for table, model := range models {
+		indexes, err := db.Migrator().GetIndexes(model)
+		if err != nil {
+			return err
+		}
+		got := make(map[string]gorm.Index, len(indexes))
+		for _, index := range indexes {
+			got[index.Name()] = index
+		}
+		for key, wantColumns := range requiredEventStoreIndexColumns {
+			if !strings.HasPrefix(key, table+":") {
+				continue
+			}
+			name := strings.TrimPrefix(key, table+":")
+			index, ok := got[name]
+			if !ok {
+				return fmt.Errorf("missing index")
+			}
+			unique, uniqueOK := index.Unique()
+			if requiredEventStoreIndexes[key] && (!uniqueOK || !unique) {
+				return fmt.Errorf("required unique index is not unique")
+			}
+			if !sameStrings(index.Columns(), wantColumns) {
+				return fmt.Errorf("index columns do not match contract")
+			}
+		}
+	}
+	return nil
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

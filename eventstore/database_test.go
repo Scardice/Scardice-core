@@ -178,3 +178,56 @@ func assertIndexColumns(t *testing.T, db *Database, table, index string, want []
 		}
 	}
 }
+
+func TestEventStoreSchemaForeignKeys(t *testing.T) {
+	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "events.db")})
+	if err != nil {
+		t.Fatalf("open sqlite database: %v", err)
+	}
+	defer db.Close()
+	var onDelete, onUpdate string
+	if err := db.SQLDB().QueryRowContext(context.Background(), "SELECT on_delete, on_update FROM pragma_foreign_key_list(?) WHERE \"table\" = ?", "operation_artifacts", "operations").Scan(&onDelete, &onUpdate); err != nil {
+		t.Fatalf("inspect operation artifact foreign key: %v", err)
+	}
+	if !strings.EqualFold(onDelete, "RESTRICT") {
+		t.Fatalf("artifact operation foreign key on_delete = %q, want RESTRICT", onDelete)
+	}
+	if !strings.EqualFold(onUpdate, "RESTRICT") {
+		t.Fatalf("artifact operation foreign key on_update = %q, want RESTRICT", onUpdate)
+	}
+	_, err = db.SQLDB().ExecContext(context.Background(), `INSERT INTO operation_artifacts (artifact_id, operation_id, owner_principal_id, media_type, size, status, expires_at) VALUES ('artifact', 'missing-operation', 'owner', 'text/plain', 0, 'available', CURRENT_TIMESTAMP)`)
+	if err == nil {
+		t.Fatal("orphan operation artifact insert succeeded")
+	}
+}
+
+func TestOpenDatabaseRejectsUnverifiedMySQLTLSModes(t *testing.T) {
+	for _, mode := range []string{"preferred", "custom"} {
+		_, err := OpenDatabase(context.Background(), DatabaseConfig{
+			Type: "mysql",
+			DSN: "alice:secret@tcp(db.example:3306)/events?tls=" + mode,
+			TLSVerify: true,
+		})
+		if err == nil {
+			t.Fatalf("TLS mode %q accepted, want fail-closed rejection", mode)
+		}
+		if strings.Contains(err.Error(), "secret") {
+			t.Fatalf("TLS mode %q leaked DSN secret: %v", mode, err)
+		}
+	}
+}
+
+func TestLoopbackTLSExceptionRejectsMixedPostgresHosts(t *testing.T) {
+	for _, dsn := range []string{
+		"host=127.0.0.1,db.remote dbname=events",
+		"host=/tmp/pg,db.remote dbname=events",
+		"postgres:///events",
+	} {
+		if isLoopbackOrUnixDSN("postgres", dsn) {
+			t.Errorf("DSN %q incorrectly qualifies for insecure loopback exception", dsn)
+		}
+	}
+	if !isLoopbackOrUnixDSN("postgres", "host=127.0.0.1,localhost dbname=events") {
+		t.Error("all-loopback PostgreSQL host list was rejected")
+	}
+}
