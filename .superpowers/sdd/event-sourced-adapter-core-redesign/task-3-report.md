@@ -7,9 +7,8 @@ Implemented and committed the A2 database-backed eventstore commit path. The nar
 ## Changed files
 
 - `eventstore/store.go`: explicit `GORMStore` wiring, pre-transaction UnitOfWork validation, SQLite/GORM transaction commit path, canonical lock order, aggregate head materialization and CAS conflicts, contiguous event positions, immutable event insertion, checksum verification, participant persistence/CAS, rollback-safe participant/projector hooks, and checksum-validating load.
-- `eventstore/store_test.go`: TDD commit-path coverage for caller-order/contiguous positions, empty work, complete stream conflicts, lock ordering, zero-stream participant updates, projector rollback, checksum corruption, and concurrent opposing stream order.
 
-No endpoint/provider/API/JS/startup or later projection rebuild/inbox/outbox/encryption services were wired.
+- `eventstore/store_test.go`: TDD commit-path coverage for caller-order/contiguous positions, empty/duplicate/oversize work, complete stream conflicts, lock ordering, zero-stream participant updates, sparse participant preservation, secret history/delete semantics, projector rollback including hook writes, checksum corruption, and concurrent opposing stream order.
 
 ## A2 behavior
 
@@ -41,21 +40,21 @@ Green focused race run:
 
 ```text
 go test -race ./eventstore -run 'TestCommit|TestMultiStreamConflict|TestLockOrder|TestRollback|TestChecksum' -count=1
-ok  Scardice-core/eventstore  1.175s
+ok  Scardice-core/eventstore  1.143s
 ```
 
 Green package run:
 
 ```text
 go test ./eventstore
-ok  Scardice-core/eventstore  0.251s
+ok  Scardice-core/eventstore  0.227s
 ```
 
 No formatter, linter, or project-wide test suite was run.
 
 ## Commit
 
-Implementation commits: `9fc13ec5` (atomic UnitOfWork), `636ff72f` (redacted participant keys), `89426b55` (artifact CAS persistence), and the transaction-lock/hook/CAS review-fix follow-up.
+Implementation commits: `9fc13ec5` (atomic UnitOfWork), `636ff72f` (redacted participant keys), `89426b55` (artifact CAS persistence), `b32a9be6` (locks/transaction-only hooks/participant CAS), and the sparse-preservation/history/delete follow-up.
 The report is committed as the required Task 3 report follow-up on the same branch.
 
 - SQLite and GORM paths are covered locally. Remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available.
