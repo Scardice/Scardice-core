@@ -81,3 +81,12 @@ Additional round-two hardening commit: `a85a7c9e`.
 - Remote GORM opens now skip automatic foreign-key creation until all tables exist, then add the restrictive relationships in a deterministic second phase; SQLite keeps GORM's native cyclic-constraint migration path.
 - PostgreSQL URL query hosts are treated as effective hosts, and keyword DSNs with malformed/ambiguous whitespace tokens fail closed.
 - MySQL acceptance is limited to `tls=true`, the driver's certificate-verifying built-in mode.
+
+Final post-hardening evidence:
+
+```text
+go test ./eventstore -run 'TestOpenDatabase|TestEventStoreSchema|TestDatabaseClose'
+ok  Scardice-core/eventstore  0.041s
+go test ./eventstore
+ok  Scardice-core/eventstore  (cached)
+```
