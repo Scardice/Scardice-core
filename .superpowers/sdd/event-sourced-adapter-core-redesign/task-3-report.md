@@ -55,10 +55,8 @@ No formatter, linter, or project-wide test suite was run.
 
 ## Commit
 
-Implementation commit SHA: to be filled after the eventstore commit.
-Report commit SHA: to be filled after the report commit.
-
-## Concerns
+Implementation commit SHA: `9fc13ec5` (`eventstore: implement atomic unit of work commits`).
+The report is committed as the required Task 3 report follow-up on the same branch.
 
 - SQLite and GORM paths are covered locally. Remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available.
 - Participant payloads are intentionally treated as opaque ciphertext/nonce fields; encryption and business semantics remain later-slice responsibilities.
