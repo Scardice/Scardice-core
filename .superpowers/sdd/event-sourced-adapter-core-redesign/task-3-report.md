@@ -6,9 +6,9 @@ Implemented and committed the A2 database-backed eventstore commit path. The nar
 
 ## Changed files
 
-- `eventstore/store.go`: explicit `GORMStore` wiring, pre-transaction UnitOfWork validation, SQLite/GORM transaction commit path, canonical lock order, aggregate head materialization and CAS conflicts, contiguous event positions, immutable event insertion, checksum verification, participant persistence/CAS, rollback-safe participant/projector hooks, and checksum-validating load.
-
-- `eventstore/store_test.go`: TDD commit-path coverage for caller-order/contiguous positions, empty/duplicate/oversize work, complete stream conflicts, lock ordering, zero-stream participant updates, sparse participant preservation, secret history/delete semantics, projector rollback including hook writes, checksum corruption, and concurrent opposing stream order.
+- `eventstore/store.go`: typed `*Database` store wiring (no raw GORM bypass), pre-transaction UnitOfWork validation, SQLite/GORM transaction commit path, canonical lock order, aggregate head materialization and CAS conflicts, contiguous event positions, immutable event insertion, checksum verification, participant persistence/CAS, rollback-safe participant/projector hooks, and checksum-validating load.
+- `eventstore/contracts.go`: bounded encoded-size accounting across stream and participant bytes, duplicate participant-key validation, and redacted participant conflict labels.
+- `eventstore/store_test.go`: TDD commit-path coverage for caller-order/contiguous positions, empty/duplicate/oversize work, complete stream conflicts, typed/redacted participant conflicts, lock ordering, zero-stream participant updates, sparse operation/artifact/inbox/effect/plugin/fence preservation, secret history/delete semantics, projector rollback including hook writes, checksum corruption, and concurrent opposing stream order.
 
 ## A2 behavior
 
@@ -22,7 +22,8 @@ Expected versions are compared for every requested stream after all heads are re
 
 The event sequence is advanced once for one contiguous range. Domain event rows contain exact payload bytes, metadata scalars, stream version, global position, and checksum. `Load` verifies persisted checksum bytes before returning an envelope.
 
-Participant rows are applied in fixed table order with stable key sorting and optimistic row-version checks; every conditional update requires one affected row and participant conflicts unwrap `ErrParticipantConflict` without exposing keys. Duplicate participant keys are rejected before transaction allocation. Existing sparse updates preserve durable state, secret updates append immutable history rows, and plugin/fence creates, updates, and deletes report their keys in `CommitResult` while using expected-version CAS. Transaction-aware participant/projector hooks receive the same transaction and are never invoked as external side effects. Hook errors are redacted to typed `ErrParticipantFailure`/`ErrProjectorFailure`. Any error rolls back heads, sequence, events, hook writes, and participant rows together. No domain decision callback or projector callback is retried.
+Participant rows are applied in the exact A2 order `operations -> inbox_messages -> outbox_effects -> operation_artifacts -> adapter_secrets -> plugin_kv -> subject_fences`, with stable key sorting inside each group and optimistic row-version checks. Every conditional update requires one affected row; participant conflicts unwrap `ErrParticipantConflict` and use redacted labels. Duplicate participant keys and the aggregate encoded byte budget are rejected before transaction allocation. Existing sparse updates preserve durable state across all participant columns, secret updates append immutable history rows, and plugin/fence creates, updates, and deletes report their keys in `CommitResult` while using expected-version CAS. Transaction-aware participant/projector hooks receive the same transaction and are never invoked as external side effects. Hook errors are redacted to typed `ErrParticipantFailure`/`ErrProjectorFailure`. Any error rolls back heads, sequence, events, hook writes, and participant rows together. No domain decision callback or projector callback is retried.
+
 
 ## TDD evidence
 
@@ -40,22 +41,22 @@ Green focused race run:
 
 ```text
 go test -race ./eventstore -run 'TestCommit|TestMultiStreamConflict|TestLockOrder|TestRollback|TestChecksum' -count=1
-ok  Scardice-core/eventstore  1.189s
+ok  Scardice-core/eventstore  1.192s
 ```
 
 Green package run:
 
 ```text
 go test ./eventstore
-ok  Scardice-core/eventstore  0.231s
+ok  Scardice-core/eventstore  0.233s
 ```
 
 No formatter, linter, or project-wide test suite was run.
 
 ## Commit
 
-Implementation commits: `9fc13ec5` (atomic UnitOfWork), `636ff72f` (redacted participant keys), `89426b55` (artifact CAS persistence), `b32a9be6` (locks/transaction-only hooks/participant CAS), `cb355ca1` (sparse preservation/history/delete), `17ce7d0d` (validation/fence/hook evidence), `a896bcbd` (delete result consistency), `2812e553` (plugin update results).
-The report is committed as the required Task 3 report follow-up on the same branch.
+Implementation commits: `9fc13ec5` (atomic UnitOfWork), `636ff72f` (redacted participant keys), `89426b55` (artifact CAS persistence), `b32a9be6` (locks/transaction-only hooks/participant CAS), `cb355ca1` (sparse preservation/history/delete), `17ce7d0d` (validation/fence/hook evidence), `a896bcbd` (delete result consistency), `2812e553` (plugin update results), `ffc6cfd1` (participant order/typed-store/sparse inbox-effect/encoded-size).
+Additional focused regression: `go test -race ./eventstore -run 'TestZeroStream|TestParticipantConflict' -count=1` → `ok Scardice-core/eventstore 1.073s`.
 
 - SQLite and GORM paths are covered locally. Remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available.
 - Participant payloads are intentionally treated as opaque ciphertext/nonce fields; encryption and business semantics remain later-slice responsibilities.
