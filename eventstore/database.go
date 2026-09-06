@@ -286,11 +286,14 @@ func dsnDeclaresVerifiedTLS(dbType, dsn string) bool {
 			return false
 		}
 	}
+	if !validKeywordDSN(dsn) {
+		return false
+	}
 	mode := ""
 	count := 0
 	for _, field := range strings.Fields(dsn) {
-		key, value, ok := strings.Cut(field, "=")
-		if key != "sslmode" || !ok {
+		key, value, _ := strings.Cut(field, "=")
+		if key != "sslmode" {
 			continue
 		}
 		mode = strings.ToLower(value)
@@ -300,6 +303,20 @@ func dsnDeclaresVerifiedTLS(dbType, dsn string) bool {
 		return false
 	}
 	return mode == "verify-full" || mode == "verify-ca"
+}
+
+func validKeywordDSN(dsn string) bool {
+	fields := strings.Fields(dsn)
+	if len(fields) == 0 {
+		return false
+	}
+	for _, field := range fields {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok || key == "" || value == "" || strings.ContainsAny(key+value, "'\"") {
+			return false
+		}
+	}
+	return true
 }
 
 func isLoopbackOrUnixDSN(dbType, dsn string) bool {
@@ -338,12 +355,10 @@ func isLoopbackOrUnixDSN(dbType, dsn string) bool {
 		return allLoopbackOrUnixHosts([]string{parsed.Hostname()})
 	}
 	if strings.Contains(dsn, "host=") {
-		fields := strings.Fields(dsn)
-		for _, field := range fields {
-			if !strings.Contains(field, "=") {
-				return false
-			}
+		if !validKeywordDSN(dsn) {
+			return false
 		}
+		fields := strings.Fields(dsn)
 		hostValue := ""
 		hostCount := 0
 		for _, field := range fields {

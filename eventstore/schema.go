@@ -166,8 +166,8 @@ type operationArtifactRow struct {
 	OwnerPrincipalID string `gorm:"type:varchar(255);not null"`
 	MediaType    string     `gorm:"type:varchar(255);not null"`
 	SafeFilename string     `gorm:"type:varchar(255)"`
-	Size         int64      `gorm:"not null"`
 	Status       string     `gorm:"type:varchar(32);not null"`
+	Operation    *operationRow `gorm:"foreignKey:OperationID;references:OperationID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT;"`
 	Ciphertext   []byte     `gorm:""`
 	Nonce        []byte     `gorm:"size:12"`
 	EncryptionKeyID string `gorm:"type:varchar(255)"`
