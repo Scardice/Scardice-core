@@ -25,7 +25,7 @@ go test ./eventstore -run 'TestTask5' -count=1
 # FAIL: undefined WithClock, WithPayloadCodec, status constants, and repository methods
 ```
 
-After the narrow implementation, the same behavior tests passed. The tests assert observable outcomes rather than row existence alone, including monotonic concurrent allocation, blocked successors, stale lease rejection, active-lease terminal completion, terminal replay idempotence, ambiguity, scrubbed bytes, codec round-trip, bounded artifacts, no-codec rollback, participant supplied-version validation, sparse leased-effect identity, opaque replay bounds, callback timestamps, public immutable-field rejection, artifact expiry immutability, unsupported-codec fail-closed behavior, stale-lease expiry scrubbing, corrupt decoded-size rejection, dispatched completion contract, multi-artifact compensation, and compensating UoW expiry scrubbing.
+After the narrow implementation, the same behavior tests passed. The tests assert observable outcomes rather than row existence alone, including monotonic concurrent allocation, blocked successors, stale lease rejection, stale-version expiry precedence, active-lease terminal completion, terminal replay idempotence, ambiguity, scrubbed bytes, codec round-trip, bounded artifacts, no-codec rollback, participant supplied-version validation, sparse leased-effect identity, opaque replay bounds, callback timestamps, public immutable-field rejection, artifact expiry immutability, unsupported-codec fail-closed behavior, stale-lease expiry scrubbing, corrupt decoded-size rejection, dispatched completion contract, multi-artifact compensation, and compensating UoW expiry scrubbing.
 
 ## Verification
 
@@ -33,10 +33,10 @@ Exact required commands and results:
 
 ```text
 go test -race ./eventstore -run 'TestInbox|TestOutbox|TestArtifact|TestLane|TestLease|TestEffect|TestDedup' -count=1
-ok   Scardice-core/eventstore  1.489s
+ok   Scardice-core/eventstore  1.409s
 
 go test -count=1 ./eventstore
-ok   Scardice-core/eventstore  0.850s
+ok   Scardice-core/eventstore  0.694s
 ```
 
 The commands were rerun after the final source/test commits and included the Task5 tests whose names match the required filters. No formatter, linter, or project-wide suite was run.
@@ -50,6 +50,7 @@ The commands were rerun after the final source/test commits and included the Tas
 - Lease lifecycle guard requiring identity for generic leased updates: `87de65fa`
 - Final Task5 bypass/expiry/codec/terminal-idempotence hardening: `caf959fe`.
 - Expiry observation ordering, conflict-safe effect insertion, artifact compensation/bounds, and strict completion contract: `f24a93a2`.
+- Stale-version expiry precedence across public/UoW/resolution paths and regression coverage: `ea42b89d`.
 - Dispatched outbox update expiry scrub and regression coverage: `6830225f`.
 ## Limitation
 
