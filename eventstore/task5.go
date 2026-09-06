@@ -690,6 +690,7 @@ func (s *GORMStore) UpdateOutbox(ctx context.Context, effect NewEffect) (result 
 		row.LeaseExpiry = nil
 		row.PayloadCiphertext = nil
 		row.PayloadNonce = nil
+		row.ScrubbedAt = task5Ptr(now)
 	}
 	q = tx.Model(&outboxEffectRow{}).Where("effect_id = ? AND version = ?", row.EffectID, effect.ExpectedVersion).Updates(outboxMap(row))
 	if q.Error != nil {
@@ -849,6 +850,7 @@ func (s *GORMStore) CompleteOutbox(ctx context.Context, req OutboxCompletionRequ
 	now := s.task5Now()
 	row.Status, row.Version, row.ResultCode, row.ErrorCode, row.ProviderMessageID, row.CompletedAt, row.LeaseExpiry = req.Status, version, req.ResultCode, req.ErrorCode, req.ProviderMessageID, &now, nil
 	row.PayloadCiphertext = nil
+	row.ScrubbedAt = task5Ptr(now)
 	row.PayloadNonce = nil
 	q = tx.Model(&outboxEffectRow{}).Where("effect_id = ? AND version = ? AND lease_owner = ? AND lease_epoch = ? AND attempt_id = ?", row.EffectID, reqVersion(row.Version), req.WorkerID, req.LeaseEpoch, req.AttemptID).Updates(outboxMap(row))
 	if q.Error != nil {
@@ -926,6 +928,7 @@ func (s *GORMStore) ResolveOutbox(ctx context.Context, req OutboxResolutionReque
 	if row.Status != OutboxStatusPending {
 		row.PayloadCiphertext = nil
 		row.PayloadNonce = nil
+		row.ScrubbedAt = task5Ptr(now)
 		row.CompletedAt = task5Ptr(now)
 	}
 	q = tx.Model(&outboxEffectRow{}).Where("effect_id = ? AND version = ?", row.EffectID, req.ExpectedVersion).Updates(outboxMap(row))
@@ -969,6 +972,7 @@ func task5ScrubInbox(tx *gorm.DB, row *inboxMessageRow, now time.Time, terminal 
 func task5ScrubOutbox(tx *gorm.DB, row *outboxEffectRow, now time.Time) error {
 	row.PayloadCiphertext = nil
 	row.PayloadNonce = nil
+	row.ScrubbedAt = task5Ptr(now)
 	row.ResolutionReason = "payload-expired"
 	row.ResolutionAt = task5Ptr(now)
 	version, e := nextVersion(row.Version)
@@ -987,7 +991,7 @@ func inboxMap(row inboxMessageRow) map[string]any {
 	return map[string]any{"version": row.Version, "status": row.Status, "lease_owner": row.LeaseOwner, "lease_epoch": row.LeaseEpoch, "lease_expiry": row.LeaseExpiry, "attempt_id": row.AttemptID, "callback_started_at": row.CallbackStartedAt, "completed_at": row.CompletedAt, "payload_ciphertext": row.PayloadCiphertext, "payload_nonce": row.PayloadNonce, "encryption_key_id": row.EncryptionKeyID, "content_digest": row.ContentDigest, "content_digest_key_id": row.ContentDigestKeyID, "payload_expires_at": row.PayloadExpiresAt, "workflow_id": row.WorkflowID, "resolution_principal": row.ResolutionPrincipal, "resolution_reason": row.ResolutionReason, "resolution_at": row.ResolutionAt}
 }
 func outboxMap(row outboxEffectRow) map[string]any {
-	return map[string]any{"version": row.Version, "status": row.Status, "attempt_id": row.AttemptID, "lease_owner": row.LeaseOwner, "lease_epoch": row.LeaseEpoch, "lease_expiry": row.LeaseExpiry, "dispatched_at": row.DispatchedAt, "deadline_at": row.DeadlineAt, "next_attempt_at": row.NextAttemptAt, "payload_ciphertext": row.PayloadCiphertext, "payload_nonce": row.PayloadNonce, "encryption_key_id": row.EncryptionKeyID, "content_digest": row.ContentDigest, "content_digest_key_id": row.ContentDigestKeyID, "result_code": row.ResultCode, "error_code": row.ErrorCode, "provider_message_id": row.ProviderMessageID, "completed_at": row.CompletedAt, "payload_expires_at": row.PayloadExpiresAt, "retry_count": row.RetryCount, "resolution_principal": row.ResolutionPrincipal, "resolution_reason": row.ResolutionReason, "resolution_at": row.ResolutionAt}
+	return map[string]any{"version": row.Version, "status": row.Status, "attempt_id": row.AttemptID, "lease_owner": row.LeaseOwner, "lease_epoch": row.LeaseEpoch, "lease_expiry": row.LeaseExpiry, "dispatched_at": row.DispatchedAt, "deadline_at": row.DeadlineAt, "next_attempt_at": row.NextAttemptAt, "payload_ciphertext": row.PayloadCiphertext, "payload_nonce": row.PayloadNonce, "encryption_key_id": row.EncryptionKeyID, "content_digest": row.ContentDigest, "content_digest_key_id": row.ContentDigestKeyID, "result_code": row.ResultCode, "error_code": row.ErrorCode, "provider_message_id": row.ProviderMessageID, "completed_at": row.CompletedAt, "payload_expires_at": row.PayloadExpiresAt, "retry_count": row.RetryCount, "scrubbed_at": row.ScrubbedAt, "resolution_principal": row.ResolutionPrincipal, "resolution_reason": row.ResolutionReason, "resolution_at": row.ResolutionAt}
 }
 
 func inboxUpdateFromRow(row inboxMessageRow) InboxUpdate {
