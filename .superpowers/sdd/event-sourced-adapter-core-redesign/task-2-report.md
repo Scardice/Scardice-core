@@ -195,3 +195,23 @@ ok  	Scardice-core/eventstore	0.167s
 ```
 
 Concern: remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available; this change is covered by local schema/parser tests only.
+
+## Final migration and DSN hardening follow-up
+
+Implementation commit: `f9cce63d`.
+
+- Replaced raw MySQL loopback substring checks with `go-sql-driver/mysql.ParseDSN`; only parsed `unix` sockets or parsed `tcp` loopback addresses qualify for the TLS exception, while marker text and malformed/remote DSNs fail closed.
+- Added idempotent SQLite `operation_artifacts` schema inspection and rebuild. Legacy tables missing `version` or the restrictive operation FK are rebuilt transactionally with existing rows preserved; missing required columns, NULL versions, and orphan operation references fail closed.
+- SQLite opening now validates the dependent operation FK as part of migration on every open, and the legacy migration regression verifies version preservation, restrictive FK behavior, valid orphan rejection, and fail-closed upgrade of an orphaned legacy table.
+- Corrected orphan-FK fixtures to provide a valid non-null artifact version, ensuring failures exercise the FK rather than the version constraint.
+
+Final uncached verification:
+
+```text
+go test -count=1 ./eventstore -run 'TestOpenDatabase|TestEventStoreSchema|TestDatabaseClose'
+ok  	Scardice-core/eventstore	0.044s
+go test -count=1 ./eventstore
+ok  	Scardice-core/eventstore	0.170s
+```
+
+Concern: remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available; DSN parsing and all SQLite migration paths are covered locally.
