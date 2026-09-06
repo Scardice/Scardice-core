@@ -898,7 +898,7 @@ func (s *GORMStore) UpdateOutbox(ctx context.Context, effect NewEffect) (result 
 			return CommitResult{}, ErrStaleLease
 		}
 	}
-	if row.Status == OutboxStatusLeased && (effect.Status == OutboxStatusPending || effect.Status == OutboxStatusAmbiguous) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
+	if (row.Status == OutboxStatusLeased || row.Status == OutboxStatusDispatched) && (effect.Status == OutboxStatusPending || effect.Status == OutboxStatusAmbiguous) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
 		if err = task5ScrubOutbox(tx, &row, now); err != nil {
 			return CommitResult{}, err
 		}

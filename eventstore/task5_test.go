@@ -507,6 +507,36 @@ func TestOutboxDispatchedExpiryScrubsBeforeAmbiguity(t *testing.T) {
 		t.Fatalf("dispatched expiry row = %#v", row)
 	}
 }
+func TestOutboxUpdateDispatchedExpiryScrubs(t *testing.T) {
+	store, db, clock := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	effect := task5Effect("update-dispatched-expired", "update-dispatched-expired-lane")
+	effect.RiskClass = RiskProviderIdempotent
+	effect.PayloadExpiresAt = clock.Now().Add(time.Minute)
+	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "worker", LeaseDuration: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatched, err := store.MarkOutboxDispatched(ctx, OutboxDispatchRequest{EffectID: effect.EffectID, WorkerID: claimed.Effect.LeaseOwner, LeaseEpoch: claimed.Effect.LeaseEpoch, AttemptID: claimed.Effect.AttemptID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Minute)
+	if _, err := store.UpdateOutbox(ctx, NewEffect{EffectID: effect.EffectID, ExpectedVersion: dispatched.Effect.Version, Status: OutboxStatusAmbiguous, LeaseOwner: dispatched.Effect.LeaseOwner, LeaseEpoch: dispatched.Effect.LeaseEpoch, AttemptID: dispatched.Effect.AttemptID}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("dispatched update expiry err = %v", err)
+	}
+	var row outboxEffectRow
+	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != OutboxStatusDispatched || len(row.PayloadCiphertext) != 0 || len(row.PayloadNonce) != 0 {
+		t.Fatalf("dispatched update expiry row = %#v", row)
+	}
+}
 func TestTask5StrictIngressAndParticipantContracts(t *testing.T) {
 	store, db, _ := task5Store(t)
 	defer db.Close()
