@@ -831,6 +831,9 @@ func (s *GORMStore) CompleteOutbox(ctx context.Context, req OutboxCompletionRequ
 		return CommitResult{}, ErrInvalidTransition
 	}
 	if row.Status == req.Status && row.ResultCode == req.ResultCode && row.ErrorCode == req.ErrorCode && row.ProviderMessageID == req.ProviderMessageID {
+		if !task5LeaseMatches(row.LeaseOwner, row.LeaseEpoch, row.AttemptID, req.WorkerID, req.LeaseEpoch, req.AttemptID) {
+			return CommitResult{}, ErrStaleLease
+		}
 		return CommitResult{EffectIDs: []string{row.EffectID}, Version: row.Version, Idempotent: true}, task5Commit(tx)
 	}
 	if row.Status != OutboxStatusLeased && row.Status != OutboxStatusDispatched {
