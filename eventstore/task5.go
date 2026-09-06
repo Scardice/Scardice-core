@@ -1282,7 +1282,7 @@ func (s *GORMStore) applyTask5InboxParticipants(tx *gorm.DB, work UnitOfWork, re
 			if update.Status == "" {
 				update.Status = InboxStatusPending
 			}
-			if update.Status != InboxStatusPending || update.LeaseOwner != "" || update.LeaseEpoch != 0 || update.AttemptID != "" || !update.LeaseExpiresAt.IsZero() {
+			if update.Status != InboxStatusPending || update.LeaseOwner != "" || update.LeaseEpoch != 0 || update.AttemptID != "" || !update.LeaseExpiresAt.IsZero() || !update.CallbackStartedAt.IsZero() || !update.CompletedAt.IsZero() || update.PrincipalID != "" || update.Reason != "" || !update.ResolutionAt.IsZero() {
 				return ErrInvalidTransition
 			}
 			if len(update.PayloadCiphertext) == 0 || len(update.PayloadNonce) == 0 || update.DigestKeyID == "" || len(update.PayloadCiphertext) > MaxArtifactBytes {
@@ -1333,6 +1333,9 @@ func (s *GORMStore) applyTask5InboxParticipants(tx *gorm.DB, work UnitOfWork, re
 				if (row.Status == InboxStatusLeased || row.Status == InboxStatusCallbackStarted || update.Status == InboxStatusLeased || update.Status == InboxStatusCallbackStarted) && (!task5LeaseMatches(row.LeaseOwner, row.LeaseEpoch, row.AttemptID, update.LeaseOwner, update.LeaseEpoch, update.AttemptID) || !task5LeaseActive(row.LeaseExpiry, now)) {
 					return ErrStaleLease
 				}
+			}
+			if (!update.CallbackStartedAt.IsZero() && update.Status != InboxStatusCallbackStarted) || (!update.CompletedAt.IsZero() && update.Status != InboxStatusFailed && update.Status != InboxStatusConfirmedConsumed && update.Status != InboxStatusSkipped) {
+				return ErrInvalidTransition
 			}
 			if update.ExpectedVersion != row.Version {
 				return participantConflict(tableInboxMessages)
@@ -1425,6 +1428,9 @@ func (s *GORMStore) applyTask5EffectParticipants(tx *gorm.DB, work UnitOfWork, r
 					return ErrInvalidRiskClass
 				}
 				return ErrParticipantFailure
+			}
+			if !update.DispatchedAt.IsZero() || !update.CompletedAt.IsZero() || update.ResultCode != "" || update.ErrorCode != "" || update.ProviderMessageID != "" || update.RetryCount != 0 || update.PrincipalID != "" || update.Reason != "" || !update.ResolutionAt.IsZero() {
+				return ErrInvalidTransition
 			}
 			var existing outboxEffectRow
 			if tx.Where("effect_id = ?", update.EffectID).First(&existing).Error == nil {
@@ -1532,10 +1538,10 @@ func (s *GORMStore) applyTask5ArtifactParticipants(tx *gorm.DB, work UnitOfWork,
 		var row operationArtifactRow
 		q := tx.Where("artifact_id = ?", update.ArtifactID).First(&row)
 		if errors.Is(q.Error, gorm.ErrRecordNotFound) {
-			if update.OperationID == "" || update.Status == "available" || len(update.Ciphertext) == 0 || len(update.Nonce) == 0 || update.EncryptionKeyID == "" {
+			if update.OperationID == "" || update.Status == "available" || len(update.Ciphertext) == 0 || len(update.Nonce) == 0 || update.EncryptionKeyID == "" || !update.ConsumedAt.IsZero() {
 				return ErrInvalidTransition
 			}
-			row = operationArtifactRow{ArtifactID: update.ArtifactID, Version: 1, OperationID: update.OperationID, OwnerPrincipalID: nonempty(update.OwnerPrincipalID, "unknown"), MediaType: nonempty(update.MediaType, "application/octet-stream"), SafeFilename: update.SafeFilename, Size: update.Size, Status: "ready", Ciphertext: task5Copy(update.Ciphertext), Nonce: task5Copy(update.Nonce), EncryptionKeyID: update.EncryptionKeyID, ExpiresAt: expiry, ConsumedAt: task5Ptr(update.ConsumedAt)}
+			row = operationArtifactRow{ArtifactID: update.ArtifactID, Version: 1, OperationID: update.OperationID, OwnerPrincipalID: nonempty(update.OwnerPrincipalID, "unknown"), MediaType: nonempty(update.MediaType, "application/octet-stream"), SafeFilename: update.SafeFilename, Size: update.Size, Status: "ready", Ciphertext: task5Copy(update.Ciphertext), Nonce: task5Copy(update.Nonce), EncryptionKeyID: update.EncryptionKeyID, ExpiresAt: expiry}
 			if q = tx.Create(&row); q.Error != nil {
 				return ErrParticipantFailure
 			}
