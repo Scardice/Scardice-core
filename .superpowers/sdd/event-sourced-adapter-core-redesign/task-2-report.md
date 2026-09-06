@@ -143,3 +143,19 @@ ok  Scardice-core/eventstore  0.044s
 go test -count=1 ./eventstore
 ok  Scardice-core/eventstore  0.170s
 ```
+
+## Review follow-up 5 (final)
+
+Follow-up implementation commit: `81837f42`.
+
+- Restored the dependent `operation_artifacts.operation_id -> operations.operation_id` association used by remote second-phase constraint creation; the reverse `operations.artifact_id` FK remains intentionally absent for the writable nullable-first/application-validated contract.
+- PostgreSQL keyword DSNs now require every whitespace token to be one non-empty `key=value` pair with no quote/fragment syntax; malformed spacing, duplicate effective settings, and unsupported forms fail closed. MySQL and URL duplicate-key checks remain strict.
+
+Final uncached verification:
+
+```text
+go test -count=1 ./eventstore -run 'TestOpenDatabase|TestEventStoreSchema|TestDatabaseClose'
+ok  Scardice-core/eventstore  0.033s
+go test -count=1 ./eventstore
+ok  Scardice-core/eventstore  0.160s
+```
