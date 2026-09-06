@@ -678,3 +678,69 @@ func TestTask5PendingTerminationAndNonceBound(t *testing.T) {
 		t.Fatalf("nonce bound err = %v", err)
 	}
 }
+func TestTask5ParticipantVersionContract(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	inbox := task5Inbox("participant-version-inbox", "participant-version-provider", "participant-version-lane")
+	inbox.Version = 2
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{inbox}}); !errors.Is(err, ErrParticipantConflict) {
+		t.Fatalf("new inbox supplied version err = %v", err)
+	}
+	inbox.Version = 1
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{inbox}}); err != nil {
+		t.Fatalf("new inbox version 1: %v", err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{{InboxID: inbox.InboxID, ExpectedVersion: 1, Version: 3, Status: InboxStatusPending}}}); !errors.Is(err, ErrParticipantConflict) {
+		t.Fatalf("existing inbox supplied version err = %v", err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{{InboxID: inbox.InboxID, ExpectedVersion: 1, Version: 2, Status: InboxStatusPending}}}); err != nil {
+		t.Fatalf("existing inbox version 2: %v", err)
+	}
+
+	effect := task5Effect("participant-version-effect", "participant-version-effect-lane")
+	effect.Version = 2
+	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{effect}}); !errors.Is(err, ErrParticipantConflict) {
+		t.Fatalf("new effect supplied version err = %v", err)
+	}
+	effect.Version = 1
+	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{effect}}); err != nil {
+		t.Fatalf("new effect version 1: %v", err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{EffectID: effect.EffectID, ExpectedVersion: 1, Version: 3, Status: OutboxStatusPending}}}); !errors.Is(err, ErrParticipantConflict) {
+		t.Fatalf("existing effect supplied version err = %v", err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{EffectID: effect.EffectID, ExpectedVersion: 1, Version: 2, Status: OutboxStatusPending}}}); err != nil {
+		t.Fatalf("existing effect version 2: %v", err)
+	}
+	effectLease, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "participant-version-worker", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{EffectID: effect.EffectID, ExpectedVersion: effectLease.Effect.Version, RetryCount: 9, Version: effectLease.Effect.Version + 1}}}); !errors.Is(err, ErrStaleLease) {
+		t.Fatalf("sparse leased effect without identity err = %v", err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{EffectID: effect.EffectID, ExpectedVersion: effectLease.Effect.Version, RetryCount: 9, Version: effectLease.Effect.Version + 1, LeaseOwner: effectLease.Effect.LeaseOwner, LeaseEpoch: effectLease.Effect.LeaseEpoch, AttemptID: effectLease.Effect.AttemptID}}}); err != nil {
+		t.Fatalf("sparse leased effect with identity: %v", err)
+	}
+
+	if _, err := store.Commit(ctx, UnitOfWork{Operations: []OperationUpdate{{OperationID: "participant-version-operation", PrincipalID: "participant-version-principal"}}}); err != nil {
+		t.Fatal(err)
+	}
+	artifact := ArtifactUpdate{ArtifactID: "participant-version-artifact", OperationID: "participant-version-operation", OwnerPrincipalID: "participant-version-principal", Size: 8, Ciphertext: []byte("sealed:artifact"), Nonce: []byte("nonce"), EncryptionKeyID: "test-key"}
+	artifact.Version = 2
+	if _, err := store.Commit(ctx, UnitOfWork{ArtifactUpdates: []ArtifactUpdate{artifact}}); !errors.Is(err, ErrParticipantConflict) {
+		t.Fatalf("new artifact supplied version err = %v", err)
+	}
+	artifact.Version = 1
+	if _, err := store.Commit(ctx, UnitOfWork{ArtifactUpdates: []ArtifactUpdate{artifact}}); err != nil {
+		t.Fatalf("new artifact version 1: %v", err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{ArtifactUpdates: []ArtifactUpdate{{ArtifactID: artifact.ArtifactID, ExpectedVersion: 1, Version: 3}}}); !errors.Is(err, ErrParticipantConflict) {
+		t.Fatalf("existing artifact supplied version err = %v", err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{ArtifactUpdates: []ArtifactUpdate{{ArtifactID: artifact.ArtifactID, ExpectedVersion: 1, Version: 2}}}); err != nil {
+		t.Fatalf("existing artifact version 2: %v", err)
+	}
+}

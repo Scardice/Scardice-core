@@ -1486,6 +1486,9 @@ func (s *GORMStore) applyTask5InboxParticipants(tx *gorm.DB, work UnitOfWork, re
 		var row inboxMessageRow
 		q := tx.Where("inbox_id = ?", update.InboxID).First(&row)
 		if errors.Is(q.Error, gorm.ErrRecordNotFound) {
+			if err := participantVersion(update.ExpectedVersion, 0, update.Version, tableInboxMessages, "<redacted>"); err != nil {
+				return err
+			}
 			if update.EndpointID == "" || update.ProviderEventKey == "" || len(update.LaneHMAC) == 0 {
 				return ErrParticipantFailure
 			}
@@ -1551,6 +1554,9 @@ func (s *GORMStore) applyTask5InboxParticipants(tx *gorm.DB, work UnitOfWork, re
 		} else if q.Error != nil {
 			return ErrParticipantFailure
 		} else {
+			if err := participantVersion(update.ExpectedVersion, row.Version, update.Version, tableInboxMessages, "<redacted>"); err != nil {
+				return err
+			}
 			if row.Status == InboxStatusFailed || row.Status == InboxStatusConfirmedConsumed || row.Status == InboxStatusSkipped {
 				return ErrInvalidTransition
 			}
@@ -1665,6 +1671,9 @@ func (s *GORMStore) applyTask5EffectParticipants(tx *gorm.DB, work UnitOfWork, r
 		var row outboxEffectRow
 		q := tx.Where("effect_id = ?", update.EffectID).First(&row)
 		if errors.Is(q.Error, gorm.ErrRecordNotFound) {
+			if err := participantVersion(update.ExpectedVersion, 0, update.Version, tableOutboxEffects, "<redacted>"); err != nil {
+				return err
+			}
 			if update.EndpointID == "" || len(update.LaneHMAC) == 0 {
 				return ErrParticipantFailure
 			}
@@ -1717,6 +1726,9 @@ func (s *GORMStore) applyTask5EffectParticipants(tx *gorm.DB, work UnitOfWork, r
 		} else if q.Error != nil {
 			return ErrParticipantFailure
 		} else {
+			if err := participantVersion(update.ExpectedVersion, row.Version, update.Version, tableOutboxEffects, "<redacted>"); err != nil {
+				return err
+			}
 			if row.Status == OutboxStatusSucceeded || row.Status == OutboxStatusFailed || row.Status == OutboxStatusAmbiguous {
 				return ErrInvalidTransition
 			}
@@ -1727,15 +1739,17 @@ func (s *GORMStore) applyTask5EffectParticipants(tx *gorm.DB, work UnitOfWork, r
 			if len(update.PayloadCiphertext) > 0 || len(update.PayloadNonce) > 0 || len(update.ContentDigest) > 0 || !update.PayloadExpiresAt.IsZero() || !update.DispatchedAt.IsZero() || update.ResultCode != "" || update.ErrorCode != "" || update.ProviderMessageID != "" {
 				return ErrInvalidTransition
 			}
-			if update.Status != OutboxStatusLeased && update.Status != OutboxStatusDispatched && (update.LeaseOwner != "" || update.LeaseEpoch != 0 || update.AttemptID != "" || !update.LeaseExpiresAt.IsZero()) {
+			leaseState := row.Status == OutboxStatusLeased || row.Status == OutboxStatusDispatched
+			if leaseState {
+				if !task5LeaseMatches(row.LeaseOwner, row.LeaseEpoch, row.AttemptID, update.LeaseOwner, update.LeaseEpoch, update.AttemptID) || !task5LeaseActive(row.LeaseExpiry, now) {
+					return ErrStaleLease
+				}
+			} else if update.Status == OutboxStatusLeased || update.Status == OutboxStatusDispatched || update.LeaseOwner != "" || update.LeaseEpoch != 0 || update.AttemptID != "" || !update.LeaseExpiresAt.IsZero() {
 				return ErrStaleLease
 			}
 			if update.Status != "" {
 				if !validOutboxStatus(update.Status) || !outboxTransitionAllowed(row.Status, update.Status) {
 					return ErrInvalidTransition
-				}
-				if (row.Status == OutboxStatusLeased || row.Status == OutboxStatusDispatched || update.Status == OutboxStatusLeased || update.Status == OutboxStatusDispatched) && (!task5LeaseMatches(row.LeaseOwner, row.LeaseEpoch, row.AttemptID, update.LeaseOwner, update.LeaseEpoch, update.AttemptID) || !task5LeaseActive(row.LeaseExpiry, now)) {
-					return ErrStaleLease
 				}
 			}
 			if update.RiskClass != "" && !validRisk(update.RiskClass) {
@@ -1816,8 +1830,8 @@ func (s *GORMStore) applyTask5ArtifactParticipants(tx *gorm.DB, work UnitOfWork,
 			if update.OperationID == "" || len(update.Ciphertext) == 0 || len(update.Nonce) == 0 || update.EncryptionKeyID == "" || !update.ConsumedAt.IsZero() {
 				return ErrInvalidTransition
 			}
-			if update.ExpectedVersion != 0 {
-				return participantConflict(tableOperationArtifacts)
+			if err := participantVersion(update.ExpectedVersion, 0, update.Version, tableOperationArtifacts, "<redacted>"); err != nil {
+				return err
 			}
 			var operation operationRow
 			operationQuery := locked(tx).Select("operation_id", "principal_id").Where("operation_id = ?", update.OperationID).First(&operation)
@@ -1851,6 +1865,9 @@ func (s *GORMStore) applyTask5ArtifactParticipants(tx *gorm.DB, work UnitOfWork,
 		} else if q.Error != nil {
 			return ErrParticipantFailure
 		} else {
+			if err := participantVersion(update.ExpectedVersion, row.Version, update.Version, tableOperationArtifacts, "<redacted>"); err != nil {
+				return err
+			}
 			if row.Status != "ready" && row.Status != "available" {
 				return ErrArtifactGone
 			}
