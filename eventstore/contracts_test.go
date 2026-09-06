@@ -157,6 +157,20 @@ func TestEventContract(t *testing.T) {
 	if _, err := (EventFactory{}).Envelope(stream, 1, 10, epochEvent); err != nil {
 		t.Fatalf("Unix epoch envelope rejected: %v", err)
 	}
+	conflictingMetadata := epochMetadata
+	conflictingMetadata.OccurredAt = time.Unix(10, 0).UTC()
+	conflictingMetadata.OccurredAtUnixNanoUTC = time.Unix(11, 0).UTC().UnixNano()
+	conflictingMetadata.OccurredAtUnixNanoSet = true
+	if _, err := (EventFactory{}).NewEvent("counter.changed", 1, json.RawMessage(`{"secret":"timestamp"}`), conflictingMetadata); !errors.Is(err, ErrInvalidMetadata) {
+		t.Fatalf("conflicting timestamps error = %v", err)
+	}
+	conflictingEvent := NewEvent{EventType: "counter.changed", SchemaVersion: 1, Payload: json.RawMessage(`{"delta":1}`), Metadata: conflictingMetadata}
+	if _, err := (EventFactory{}).Envelope(stream, 1, 11, conflictingEvent); !errors.Is(err, ErrInvalidMetadata) {
+		t.Fatalf("conflicting timestamps accepted by Envelope: %v", err)
+	}
+	if err := ValidateUnitOfWork(UnitOfWork{Streams: []StreamAppend{{Stream: stream, Events: []NewEvent{conflictingEvent}}}}); !errors.Is(err, ErrInvalidMetadata) {
+		t.Fatalf("conflicting timestamps accepted by ValidateUnitOfWork: %v", err)
+	}
 	invalidWorkErr := ValidateUnitOfWork(UnitOfWork{Streams: []StreamAppend{{
 		Stream: stream,
 		Events: []NewEvent{{

@@ -119,6 +119,9 @@ func (f EventFactory) NewEvent(eventType string, schemaVersion uint16, payload j
 		}
 		return NewEvent{}, ErrInvalidEvent
 	}
+	if metadataTimestampConflict(metadata) {
+		return NewEvent{}, ErrInvalidMetadata
+	}
 	if metadata.EventID == "" || metadata.CommandID == "" || metadata.CorrelationID == "" {
 		if f.IDs == nil {
 			return NewEvent{}, ErrInvalidMetadata
@@ -166,6 +169,13 @@ func metadataHasTimestamp(metadata Metadata) bool {
 	return !metadata.OccurredAt.IsZero() || metadata.OccurredAtUnixNanoSet || metadata.OccurredAtUnixNanoUTC != 0
 }
 
+func metadataTimestampConflict(metadata Metadata) bool {
+	if metadata.OccurredAt.IsZero() || (!metadata.OccurredAtUnixNanoSet && metadata.OccurredAtUnixNanoUTC == 0) {
+		return false
+	}
+	return metadata.OccurredAt.UTC().UnixNano() != metadata.OccurredAtUnixNanoUTC
+}
+
 func metadataUnixNano(metadata Metadata) int64 {
 	if !metadata.OccurredAt.IsZero() {
 		return metadata.OccurredAt.UTC().UnixNano()
@@ -184,7 +194,7 @@ func (f EventFactory) Envelope(stream StreamID, streamVersion, globalPosition ui
 		}
 		return Envelope{}, ErrInvalidEvent
 	}
-	if event.Metadata.EventID == "" || event.Metadata.CommandID == "" || event.Metadata.CorrelationID == "" || !metadataHasTimestamp(event.Metadata) {
+	if metadataTimestampConflict(event.Metadata) || event.Metadata.EventID == "" || event.Metadata.CommandID == "" || event.Metadata.CorrelationID == "" || !metadataHasTimestamp(event.Metadata) {
 		return Envelope{}, ErrInvalidMetadata
 	}
 	envelope := Envelope{
@@ -476,7 +486,7 @@ func ValidateUnitOfWork(work UnitOfWork) error {
 			if event.EventType == "" || event.SchemaVersion == 0 {
 				return ErrInvalidEvent
 			}
-			if !metadataHasTimestamp(event.Metadata) || event.Metadata.EventID == "" || event.Metadata.CommandID == "" || event.Metadata.CorrelationID == "" {
+			if metadataTimestampConflict(event.Metadata) || !metadataHasTimestamp(event.Metadata) || event.Metadata.EventID == "" || event.Metadata.CommandID == "" || event.Metadata.CorrelationID == "" {
 				return ErrInvalidMetadata
 			}
 			if len(event.Payload) > MaxEventPayloadBytes {
