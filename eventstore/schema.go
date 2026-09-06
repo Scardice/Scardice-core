@@ -146,6 +146,7 @@ type operationRow struct {
 	ResourceID        string     `gorm:"type:varchar(255)"`
 	IdempotencyScope  string     `gorm:"type:varchar(255);not null;uniqueIndex:ux_operations_idempotency,priority:2"`
 	IdempotencyKey    string     `gorm:"type:varchar(255);not null;uniqueIndex:ux_operations_idempotency,priority:3"`
+	RequestID         string     `gorm:"type:varchar(255)"`
 	RequestDigest     []byte     `gorm:"size:32"`
 	CorrelationID     string     `gorm:"type:varchar(255)"`
 	ResultCode        string     `gorm:"type:varchar(255)"`
@@ -163,6 +164,7 @@ func (operationRow) TableName() string { return tableOperations }
 
 type operationArtifactRow struct {
 	ArtifactID   string     `gorm:"type:varchar(255);not null;primaryKey;uniqueIndex:ux_operation_artifacts_artifact_id"`
+	Version      uint64       `gorm:"not null"`
 	OperationID  string     `gorm:"type:varchar(255);not null"`
 	OwnerPrincipalID string `gorm:"type:varchar(255);not null"`
 	MediaType    string     `gorm:"type:varchar(255);not null"`
@@ -221,6 +223,7 @@ type outboxEffectRow struct {
 	LaneHMAC []byte `gorm:"size:32;not null;uniqueIndex:ux_outbox_lane_sequence,priority:1"`
 	OrderingSequence uint64 `gorm:"not null;uniqueIndex:ux_outbox_lane_sequence,priority:2"`
 	EffectClass string `gorm:"type:varchar(64);not null"`
+	RiskClass string `gorm:"type:varchar(64);not null"`
 	Status string `gorm:"type:varchar(32);not null;index:ix_outbox_status_attempt,priority:1"`
 	AttemptID string `gorm:"type:varchar(255)"`
 	LeaseOwner string `gorm:"type:varchar(255)"`
@@ -233,9 +236,12 @@ type outboxEffectRow struct {
 	PayloadNonce []byte `gorm:"size:12"`
 	EncryptionKeyID string `gorm:"type:varchar(255)"`
 	ContentDigest []byte `gorm:"size:32"`
+	ContentDigestKeyID string `gorm:"type:varchar(255)"`
 	ResultCode string `gorm:"type:varchar(255)"`
 	ErrorCode string `gorm:"type:varchar(255)"`
 	ProviderMessageID string `gorm:"type:varchar(255)"`
+	CompletedAt *time.Time
+	PayloadExpiresAt *time.Time
 	CreatedAt time.Time `gorm:"not null"`
 	ScrubbedAt *time.Time
 }
@@ -246,6 +252,7 @@ type adapterSecretRow struct {
 	SecretRef string `gorm:"type:varchar(255);not null;uniqueIndex:ux_adapter_secret_ref_version,priority:1"`
 	SecretVersion uint64 `gorm:"not null;uniqueIndex:ux_adapter_secret_ref_version,priority:2"`
 	EndpointID string `gorm:"type:varchar(255);not null"`
+	AdapterID string `gorm:"type:varchar(255);not null"`
 	AdapterType string `gorm:"type:varchar(255);not null"`
 	Ciphertext []byte `gorm:"not null"`
 	Nonce []byte `gorm:"size:12;not null"`
@@ -261,7 +268,9 @@ type pluginKVRow struct {
 	ExtensionID string `gorm:"type:varchar(255);primaryKey;uniqueIndex:ux_plugin_extension_key,priority:1"`
 	KeyHMAC []byte `gorm:"column:key_hmac;size:32;primaryKey;uniqueIndex:ux_plugin_extension_key,priority:2"`
 	EncryptedKey []byte `gorm:"not null;size:1024"`
+	KeyNonce []byte `gorm:"size:12;not null"`
 	EncryptedValue []byte `gorm:"not null;size:8388608"`
+	ValueNonce []byte `gorm:"size:12;not null"`
 	ValueSize int64 `gorm:"not null"`
 	RowVersion uint64 `gorm:"not null"`
 	EncryptionKeyID string `gorm:"type:varchar(255);not null"`
@@ -274,6 +283,7 @@ func (pluginKVRow) TableName() string { return tablePluginKV }
 type subjectFenceRow struct {
 	SubjectKey []byte `gorm:"column:subject_key;size:32;not null;uniqueIndex:ux_subject_fence_key_scope,priority:1"`
 	Scope string `gorm:"type:varchar(64);not null;uniqueIndex:ux_subject_fence_key_scope,priority:2"`
+	Version uint64 `gorm:"not null"`
 	PurgeOperationID string `gorm:"type:varchar(255);not null"`
 	CreatedAt time.Time `gorm:"not null"`
 	ExpiresAt *time.Time

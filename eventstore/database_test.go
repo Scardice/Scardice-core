@@ -364,6 +364,15 @@ func TestDatabaseTLSAndHostDuplicateSettingsFailClosed(t *testing.T) {
 	if !isLoopbackOrUnixDSN("postgres", "postgres://localhost/events?host=127.0.0.1,localhost") {
 		t.Fatal("all-loopback PostgreSQL URL host list rejected")
 	}
+	if dsnDeclaresVerifiedTLS("postgres", "postgres://db/events?foo=1 sslmode=verify-full") {
+		t.Fatal("hybrid PostgreSQL URL/keyword TLS settings accepted")
+	}
+	if dsnDeclaresVerifiedTLS("postgres", "postgres://db/events sslmode=verify-full") {
+		t.Fatal("URL DSN with keyword TLS fragment accepted")
+	}
+	if isLoopbackOrUnixDSN("postgres", "postgres://localhost/events host=evil.example") {
+		t.Fatal("URL DSN with keyword host fragment accepted")
+	}
 }
 func TestEventStoreDomainEventMetadataColumns(t *testing.T) {
 	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "events.db")})
@@ -400,7 +409,7 @@ func TestOperationArtifactForeignKeysAllowNullableFirstLinking(t *testing.T) {
 	if _, err := db.SQLDB().ExecContext(context.Background(), `INSERT INTO operations (operation_id, version, status, kind, principal_id, idempotency_scope, idempotency_key, created_at, updated_at) VALUES ('op-link', 1, 'pending', 'test', 'principal', 'scope', 'key-link', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`); err != nil {
 		t.Fatalf("insert operation before artifact: %v", err)
 	}
-	if _, err := db.SQLDB().ExecContext(context.Background(), `INSERT INTO operation_artifacts (artifact_id, operation_id, owner_principal_id, media_type, size, status, expires_at) VALUES ('artifact-link', 'op-link', 'principal', 'text/plain', 0, 'available', CURRENT_TIMESTAMP)`); err != nil {
+	if _, err := db.SQLDB().ExecContext(context.Background(), `INSERT INTO operation_artifacts (artifact_id, version, operation_id, owner_principal_id, media_type, size, status, expires_at) VALUES ('artifact-link', 1, 'op-link', 'principal', 'text/plain', 0, 'available', CURRENT_TIMESTAMP)`); err != nil {
 		t.Fatalf("insert artifact: %v", err)
 	}
 	if _, err := db.SQLDB().ExecContext(context.Background(), "UPDATE operations SET artifact_id = 'artifact-link' WHERE operation_id = 'op-link'"); err != nil {
@@ -417,10 +426,20 @@ func TestEventStoreSensitiveSchemaColumns(t *testing.T) {
 		t.Fatalf("open sqlite database: %v", err)
 	}
 	defer db.Close()
-	assertSQLiteColumn(t, db, tableOperations, "private_context")
-	assertSQLiteColumn(t, db, tableOperationArtifacts, "size")
-}
+	for table, columns := range map[string][]string{
+		tableOperations:          {"request_id", "private_context", "private_nonce", "private_key_id"},
+		tableOperationArtifacts:  {"size", "version"},
+		tableOutboxEffects:       {"risk_class", "content_digest_key_id", "completed_at", "payload_expires_at"},
+		tableAdapterSecrets:      {"adapter_id"},
+		tablePluginKV:             {"key_nonce", "value_nonce"},
+		tableSubjectFences:        {"version"},
+	} {
+		for _, column := range columns {
+			assertSQLiteColumn(t, db, table, column)
+		}
+	}
 
+}
 func assertSQLiteColumn(t *testing.T, db *Database, table, column string) {
 	t.Helper()
 	var name string

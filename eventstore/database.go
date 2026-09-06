@@ -275,16 +275,17 @@ func dsnDeclaresVerifiedTLS(dbType, dsn string) bool {
 		values := parsed.Query()["tls"]
 		return len(values) == 1 && strings.EqualFold(values[0], "true")
 	}
-	parsed, err := url.Parse(dsn)
-	if err == nil {
-		values := parsed.Query()["sslmode"]
-		if len(values) == 1 {
-			mode := strings.ToLower(values[0])
-			return mode == "verify-full" || mode == "verify-ca"
-		}
-		if len(values) > 1 {
+	if strings.Contains(dsn, "://") {
+		parsed, err := url.Parse(dsn)
+		if err != nil {
 			return false
 		}
+		values := parsed.Query()["sslmode"]
+		if len(values) != 1 {
+			return false
+		}
+		mode := strings.ToLower(values[0])
+		return mode == "verify-full" || mode == "verify-ca"
 	}
 	if !validKeywordDSN(dsn) {
 		return false
@@ -341,6 +342,9 @@ func isLoopbackOrUnixDSN(dbType, dsn string) bool {
 		return false
 	}
 	if strings.Contains(dsn, "://") {
+		if strings.ContainsAny(dsn, " \t\r\n") {
+			return false
+		}
 		parsed, err := url.Parse(dsn)
 		if err != nil {
 			return false
@@ -405,6 +409,7 @@ func migrateSchema(db *gorm.DB) error {
 		}
 		if err := db.Exec(`CREATE TABLE IF NOT EXISTS operation_artifacts (
 			artifact_id TEXT NOT NULL PRIMARY KEY,
+			version INTEGER NOT NULL,
 			operation_id TEXT NOT NULL,
 			owner_principal_id TEXT NOT NULL,
 			media_type TEXT NOT NULL,
