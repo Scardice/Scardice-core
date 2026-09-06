@@ -12,7 +12,7 @@ Implemented and committed A3 projection behavior in `eventstore` only.
 
 ## Registration/version contract
 
-`ProjectionDescriptor` carries stable `Name`, `Version`, and transactional `Apply(context.Context, *gorm.DB, []Envelope) error`; `ProjectorDescriptor`, `ProjectorRegistration`, and `ProjectorSpec` are aliases. `RegisterProjection` rejects empty/whitespace names or versions, nil callbacks, duplicate names, and same-name version conflicts. Registrations are owned by each `GORMStore`, copied under its mutex, and sorted by name before application. A descriptor's `SchemaVersion`, `ProjectorSetVersion`, or `ProjectorVersion` fields are accepted as compatibility aliases for `Version`. A set with one version stores that version; mixed descriptor versions use the deterministic `name=version|...` form.
+`ProjectionDescriptor` carries stable `Name`, `Version`, and transactional `Apply(context.Context, *gorm.DB, []Envelope) error`; `ProjectorDescriptor`, `ProjectorRegistration`, and `ProjectorSpec` are aliases. `RegisterProjection` rejects empty/whitespace names or versions, nil callbacks, duplicate names, and conflicting projector-set versions (including same-name version changes). Registrations are owned by each `GORMStore`, copied under its mutex, and sorted by name before application. A descriptor's `SchemaVersion`, `ProjectorSetVersion`, or `ProjectorVersion` fields are accepted as compatibility aliases for `Version`. All descriptors in one store must use the same version.
 
 The existing `RegisterProjector(Projector)` form remains supported for A2 callers using deterministic legacy names/version `legacy`. Descriptor callers can use either `RegisterProjection` or `RegisterProjector`; `WithProjector` accepts both forms and `WithProjection` is provided for descriptors.
 
@@ -49,21 +49,20 @@ Green focused race validation:
 
 ```text
 go test -race ./eventstore -run 'TestProjection|TestRebuild|TestDigest|TestProjector|TestGeneration'
-ok   Scardice-core/eventstore  1.679s
-```
+ok  	Scardice-core/eventstore  1.696s
 
 Green package validation:
 
 ```text
 go test ./eventstore
-ok   Scardice-core/eventstore  0.432s
+ok  	Scardice-core/eventstore  0.471s
 ```
 
 No formatter, linter, or project-wide suite was run.
 
 ## Commit
 
-Implementation commit: `a1ee6229` (`eventstore: add deterministic synchronous projections`).
+Implementation commits: `a1ee6229` (`eventstore: add deterministic synchronous projections`) and `6b2f4866` (`eventstore: reject conflicting projector set versions`).
 
 ## Concerns
 
