@@ -482,6 +482,7 @@ func ValidateUnitOfWork(work UnitOfWork) error {
 		}
 		encodedBytes += uint64(n)
 	}
+	addFields := func(parts ...int) { for _, part := range parts { addBytes(part) } }
 	for _, append := range work.Streams {
 		if append.Stream.AggregateType == "" || append.Stream.AggregateID == "" {
 			return ErrInvalidEvent
@@ -508,25 +509,25 @@ func ValidateUnitOfWork(work UnitOfWork) error {
 		return &OversizeError{Bound: "unit of work events", Limit: MaxUnitOfWorkEvents, Actual: eventCount}
 	}
 	for _, update := range work.Operations {
-		addBytes(len(update.OperationID) + len(update.Kind) + len(update.Status) + len(update.PrincipalID) + len(update.ResourceID) + len(update.IdempotencyScope) + len(update.IdempotencyKey) + len(update.RequestID) + len(update.RequestDigest) + len(update.CorrelationID) + len(update.ResultCode) + len(update.ErrorCode) + len(update.ArtifactID) + len(update.PrivateContextCiphertext) + len(update.PrivateContextNonce) + len(update.EncryptionKeyID))
+		addFields(len(update.OperationID), len(update.Kind), len(update.Status), len(update.PrincipalID), len(update.ResourceID), len(update.IdempotencyScope), len(update.IdempotencyKey), len(update.RequestID), len(update.RequestDigest), len(update.CorrelationID), len(update.ResultCode), len(update.ErrorCode), len(update.ArtifactID), len(update.PrivateContextCiphertext), len(update.PrivateContextNonce), len(update.EncryptionKeyID))
 	}
 	for _, update := range work.InboxUpdates {
-		addBytes(len(update.InboxID) + len(update.EndpointID) + len(update.ProviderEventKey) + len(update.LaneHMAC) + len(update.Status) + len(update.LeaseOwner) + len(update.AttemptID) + len(update.PayloadCiphertext) + len(update.PayloadNonce) + len(update.ContentDigest) + len(update.DigestKeyID) + len(update.WorkflowID))
+		addFields(len(update.InboxID), len(update.EndpointID), len(update.ProviderEventKey), len(update.LaneHMAC), len(update.Status), len(update.LeaseOwner), len(update.AttemptID), len(update.PayloadCiphertext), len(update.PayloadNonce), len(update.ContentDigest), len(update.DigestKeyID), len(update.WorkflowID))
 	}
 	for _, update := range work.Effects {
-		addBytes(len(update.EffectID) + len(update.EndpointID) + len(update.LaneHMAC) + len(update.EffectType) + len(update.RiskClass) + len(update.Status) + len(update.AttemptID) + len(update.LeaseOwner) + len(update.PayloadCiphertext) + len(update.PayloadNonce) + len(update.ContentDigest) + len(update.DigestKeyID) + len(update.ProviderMessageID) + len(update.ResultCode) + len(update.ErrorCode))
+		addFields(len(update.EffectID), len(update.EndpointID), len(update.LaneHMAC), len(update.EffectType), len(update.RiskClass), len(update.Status), len(update.AttemptID), len(update.LeaseOwner), len(update.PayloadCiphertext), len(update.PayloadNonce), len(update.ContentDigest), len(update.DigestKeyID), len(update.ProviderMessageID), len(update.ResultCode), len(update.ErrorCode))
 	}
 	for _, update := range work.ArtifactUpdates {
-		addBytes(len(update.ArtifactID) + len(update.OperationID) + len(update.OwnerPrincipalID) + len(update.MediaType) + len(update.SafeFilename) + len(update.Ciphertext) + len(update.Nonce) + len(update.EncryptionKeyID) )
+		addFields(len(update.ArtifactID), len(update.OperationID), len(update.OwnerPrincipalID), len(update.MediaType), len(update.SafeFilename), len(update.Ciphertext), len(update.Nonce), len(update.EncryptionKeyID))
 	}
 	for _, update := range work.SecretUpdates {
-		addBytes(len(update.SecretRef) + len(update.EndpointID) + len(update.AdapterID) + len(update.Ciphertext) + len(update.Nonce) + len(update.EncryptionKeyID))
+		addFields(len(update.SecretRef), len(update.EndpointID), len(update.AdapterID), len(update.Ciphertext), len(update.Nonce), len(update.EncryptionKeyID))
 	}
 	for _, update := range work.PluginKVUpdates {
-		addBytes(len(update.ExtensionID) + len(update.KeyHMAC) + len(update.KeyCiphertext) + len(update.KeyNonce) + len(update.ValueCiphertext) + len(update.ValueNonce) + len(update.EncryptionKeyID))
+		addFields(len(update.ExtensionID), len(update.KeyHMAC), len(update.KeyCiphertext), len(update.KeyNonce), len(update.ValueCiphertext), len(update.ValueNonce), len(update.EncryptionKeyID))
 	}
 	for _, update := range work.FenceUpdates {
-		addBytes(len(update.SubjectKey) + len(update.Scope) + len(update.PurgeOperationID))
+		addFields(len(update.SubjectKey), len(update.Scope), len(update.PurgeOperationID))
 	}
 	if encodedBytes > MaxUnitOfWorkBytes {
 		actual := int(encodedBytes)
