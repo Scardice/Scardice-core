@@ -15,15 +15,15 @@ No endpoint/provider/API/JS/startup or later projection rebuild/inbox/outbox/enc
 
 The event-bearing path acquires locks in this order:
 
-1. `projection_control` singleton
-2. Missing/materialized `aggregate_heads`, read in lexicographic `(AggregateType, AggregateID)` order
-3. `event_global_sequence` singleton (only when at least one event is present)
+1. `projection_control` singleton (dialects supporting row locks use `FOR UPDATE`; SQLite relies on its configured immediate transaction)
+2. Missing/materialized `aggregate_heads`, read in lexicographic `(AggregateType, AggregateID)` order (row-lock clause on non-SQLite dialects)
+3. `event_global_sequence` singleton (only when at least one event is present; row-lock clause on non-SQLite dialects)
 
 Expected versions are compared for every requested stream after all heads are read. A `ConflictError` contains every stale stream's identity and expected/current versions and no event content. Events are allocated and emitted in the original `UnitOfWork.Streams` order and each stream's original event order; lock sorting never reorders emitted events. SQLite's configured immediate transaction provides single-writer serialization. Zero-stream participant-only work does not read or advance `event_global_sequence`.
 
 The event sequence is advanced once for one contiguous range. Domain event rows contain exact payload bytes, metadata scalars, stream version, global position, and checksum. `Load` verifies persisted checksum bytes before returning an envelope.
 
-Participant rows are applied in fixed table order with stable key sorting and optimistic row-version checks. Transaction-aware participant/projector hooks are available for narrow rollback tests; hook errors are redacted to typed `ErrParticipantFailure`/`ErrProjectorFailure`. Any error rolls back heads, sequence, events, and participant rows together. No domain decision callback or projector callback is retried.
+Participant rows are applied in fixed table order with stable key sorting and optimistic row-version checks; every conditional update requires one affected row. Transaction-aware participant/projector hooks receive the same transaction and are never invoked as external side effects. Hook errors are redacted to typed `ErrParticipantFailure`/`ErrProjectorFailure`. Any error rolls back heads, sequence, events, hook writes, and participant rows together. No domain decision callback or projector callback is retried.
 
 ## TDD evidence
 
@@ -41,21 +41,21 @@ Green focused race run:
 
 ```text
 go test -race ./eventstore -run 'TestCommit|TestMultiStreamConflict|TestLockOrder|TestRollback|TestChecksum' -count=1
-ok  Scardice-core/eventstore  1.147s
+ok  Scardice-core/eventstore  1.175s
 ```
 
 Green package run:
 
 ```text
 go test ./eventstore
-ok  Scardice-core/eventstore  0.215s
+ok  Scardice-core/eventstore  0.251s
 ```
 
 No formatter, linter, or project-wide test suite was run.
 
 ## Commit
 
-Implementation commits: `9fc13ec5` (atomic UnitOfWork), `636ff72f` (redacted participant keys), and the artifact CAS-column fix follow-up.
+Implementation commits: `9fc13ec5` (atomic UnitOfWork), `636ff72f` (redacted participant keys), `89426b55` (artifact CAS persistence), and the transaction-lock/hook/CAS review-fix follow-up.
 The report is committed as the required Task 3 report follow-up on the same branch.
 
 - SQLite and GORM paths are covered locally. Remote MySQL/PostgreSQL integration remains opt-in because no remote credentials are available.

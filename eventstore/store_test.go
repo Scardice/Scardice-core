@@ -5,6 +5,9 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"gorm.io/gorm"
 )
 
 func TestCommitMultiStreamContiguousPositions(t *testing.T) {
@@ -33,6 +36,15 @@ func testStore(t *testing.T) (*GORMStore, *Database) {
 	return NewStore(db), db
 }
 
+func TestCommitRejectsDuplicateAndOversize(t *testing.T) {
+	stream := StreamID{"a", "duplicate"}
+	duplicate := UnitOfWork{Streams: []StreamAppend{{Stream:stream}, {Stream:stream}}}
+	if err := ValidateUnitOfWork(duplicate); !errors.Is(err, ErrDuplicateStream) { t.Fatalf("duplicate err = %v", err) }
+	oversized := UnitOfWork{Streams: []StreamAppend{{Stream:StreamID{"a","oversize"}, Events:[]NewEvent{{EventType:"x",SchemaVersion:1,Payload:make([]byte,MaxEventPayloadBytes+1),Metadata:Metadata{EventID:"e",CommandID:"c",CorrelationID:"r",OccurredAtUnixNanoUTC:1,OccurredAtUnixNanoSet:true}}}}}}
+	var bound *OversizeError
+	if err := ValidateUnitOfWork(oversized); !errors.As(err, &bound) || bound.Bound != "event payload" { t.Fatalf("oversize err = %v", err) }
+}
+
 func testEvent(id string) NewEvent {
 	return NewEvent{EventType: "changed", SchemaVersion: 1, Payload: []byte(`{"value":1}`), Metadata: Metadata{EventID:id, CommandID:"cmd-"+id, CorrelationID:"corr-"+id, OccurredAtUnixNanoUTC:1, OccurredAtUnixNanoSet:true}}
 }
@@ -59,12 +71,18 @@ func TestLockOrderAndZeroStreamParticipant(t *testing.T) {
 
 func TestRollbackAfterProjectorFailure(t *testing.T) {
 	store, db := testStore(t); defer db.Close()
-	store.RegisterProjector(func(context.Context, []Envelope) error { return errors.New("opaque projector failure") })
+	store.RegisterProjector(func(_ context.Context, tx *gorm.DB, _ []Envelope) error {
+		if err := tx.Create(&projectionReadModelRow{ProjectionGeneration:"test", ProjectionName:"test", RowKey:"row", Payload:[]byte("opaque"), UpdatedAt:time.Now().UTC()}).Error; err != nil { return err }
+		return errors.New("opaque projector failure")
+	})
 	_, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream:StreamID{"a","1"}, Events:[]NewEvent{testEvent("rb1")}}}})
 	if !errors.Is(err, ErrProjectorFailure) { t.Fatalf("err = %v", err) }
 	var events int64
 	if err := db.GORM().Model(&domainEventRow{}).Count(&events).Error; err != nil { t.Fatal(err) }
 	if events != 0 { t.Fatalf("events after rollback = %d", events) }
+	var projected int64
+	if err := db.GORM().Model(&projectionReadModelRow{}).Count(&projected).Error; err != nil { t.Fatal(err) }
+	if projected != 0 { t.Fatalf("projector row after rollback = %d", projected) }
 }
 
 func TestChecksumVerificationOnLoad(t *testing.T) {

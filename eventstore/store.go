@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var (
@@ -26,15 +27,11 @@ type ParticipantConflict struct {
 
 type ParticipantConflictError struct { Conflicts []ParticipantConflict }
 func (e *ParticipantConflictError) Error() string { return ErrParticipantConflict.Error() }
-type Projector func(context.Context, []Envelope) error
-type ParticipantHook func(context.Context, UnitOfWork) error
-type TransactionProjector func(context.Context, *gorm.DB, []Envelope) error
-type TransactionParticipant func(context.Context, *gorm.DB, UnitOfWork) error
+type Projector func(context.Context, *gorm.DB, []Envelope) error
+type ParticipantHook func(context.Context, *gorm.DB, UnitOfWork) error
 type StoreOption func(*GORMStore)
 func WithProjector(projector Projector) StoreOption { return func(s *GORMStore) { s.RegisterProjector(projector) } }
-func WithParticipant(hook any) StoreOption { return func(s *GORMStore) { s.RegisterParticipant(hook) } }
-func WithTransactionProjector(projector TransactionProjector) StoreOption { return func(s *GORMStore) { s.RegisterProjectorTx(projector) } }
-func WithTransactionParticipant(hook TransactionParticipant) StoreOption { return func(s *GORMStore) { s.RegisterParticipantTx(hook) } }
+func WithParticipant(hook ParticipantHook) StoreOption { return func(s *GORMStore) { s.RegisterParticipant(hook) } }
 func WithLockObserver(observer func(string)) StoreOption { return func(s *GORMStore) { s.SetLockObserver(observer) } }
 
 type GORMStore struct {
@@ -42,14 +39,9 @@ type GORMStore struct {
 	rawDB *gorm.DB
 	mu sync.RWMutex
 	projectors []Projector
-	txProjectors []TransactionProjector
 	participants []ParticipantHook
-	txParticipants []TransactionParticipant
 	lockObserver func(string)
 }
-
-// NewStore wires a store to one explicitly owned Database. A *gorm.DB is also
-// accepted for tests that already own the database handle; Close is then a no-op.
 func NewStore(database any, options ...StoreOption) *GORMStore {
 	s := &GORMStore{}
 	switch value := database.(type) {
@@ -64,34 +56,16 @@ func NewStore(database any, options ...StoreOption) *GORMStore {
 func NewGORMStore(database any, options ...StoreOption) *GORMStore { return NewStore(database, options...) }
 func NewEventStore(database any, options ...StoreOption) *GORMStore { return NewStore(database, options...) }
 
-func (s *GORMStore) RegisterProjector(projector any) {
+func (s *GORMStore) RegisterProjector(projector Projector) {
 	if s == nil || projector == nil { return }
-	s.mu.Lock(); defer s.mu.Unlock()
-	switch hook := projector.(type) {
-	case Projector: s.projectors = append(s.projectors, hook)
-	case func(context.Context, []Envelope) error: s.projectors = append(s.projectors, Projector(hook))
-	case TransactionProjector: s.txProjectors = append(s.txProjectors, hook)
-	case func(context.Context, *gorm.DB, []Envelope) error: s.txProjectors = append(s.txProjectors, TransactionProjector(hook))
-	}
+	s.mu.Lock(); defer s.mu.Unlock(); s.projectors = append(s.projectors, projector)
 }
-func (s *GORMStore) RegisterProjectorTx(projector TransactionProjector) {
-	if s == nil || projector == nil { return }; s.mu.Lock(); defer s.mu.Unlock(); s.txProjectors = append(s.txProjectors, projector)
-}
-func (s *GORMStore) RegisterParticipant(hook any) {
+func (s *GORMStore) RegisterParticipant(hook ParticipantHook) {
 	if s == nil || hook == nil { return }
-	s.mu.Lock(); defer s.mu.Unlock()
-	switch value := hook.(type) {
-	case ParticipantHook: s.participants = append(s.participants, value)
-	case func(context.Context, UnitOfWork) error: s.participants = append(s.participants, ParticipantHook(value))
-	case TransactionParticipant: s.txParticipants = append(s.txParticipants, value)
-	case func(context.Context, *gorm.DB, UnitOfWork) error: s.txParticipants = append(s.txParticipants, TransactionParticipant(value))
-	}
+	s.mu.Lock(); defer s.mu.Unlock(); s.participants = append(s.participants, hook)
 }
-func (s *GORMStore) RegisterParticipantTx(hook TransactionParticipant) {
-	if s == nil || hook == nil { return }; s.mu.Lock(); defer s.mu.Unlock(); s.txParticipants = append(s.txParticipants, hook)
-}
-func (s *GORMStore) SetProjector(projector any) { s.RegisterProjector(projector) }
-func (s *GORMStore) SetParticipant(hook any) { s.RegisterParticipant(hook) }
+func (s *GORMStore) SetProjector(projector Projector) { s.RegisterProjector(projector) }
+func (s *GORMStore) SetParticipant(hook ParticipantHook) { s.RegisterParticipant(hook) }
 func (s *GORMStore) SetLockObserver(observer func(string)) {
 	if s == nil { return }
 	s.mu.Lock(); defer s.mu.Unlock(); s.lockObserver = observer
@@ -100,6 +74,13 @@ func (s *GORMStore) SetLockObserver(observer func(string)) {
 func (s *GORMStore) observeLock(name string) {
 	s.mu.RLock(); observer := s.lockObserver; s.mu.RUnlock()
 	if observer != nil { observer(name) }
+}
+
+func locked(db *gorm.DB) *gorm.DB {
+	if db != nil && db.Dialector.Name() != "sqlite" {
+		return db.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	return db
 }
 
 func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitResult, err error) {
@@ -116,9 +97,8 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 		if !committed { _ = tx.Rollback().Error }
 	}()
 
-	// A2 lock order: projection control, aggregate heads, global sequence.
 	var control projectionControlRow
-	if err = tx.Where("singleton_id = ?", "default").First(&control).Error; err != nil { return CommitResult{}, errors.New("eventstore: lock projection control failed") }
+	if err = locked(tx).Where("singleton_id = ?", "default").First(&control).Error; err != nil { return CommitResult{}, errors.New("eventstore: lock projection control failed") }
 	s.observeLock(tableProjectionControl)
 
 	type headState struct { stream StreamID; current uint64 }
@@ -128,7 +108,7 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 	headStates := make(map[StreamID]headState, len(headOrder))
 	for _, stream := range headOrder {
 		var head aggregateHeadRow
-		q := tx.Where("aggregate_type = ? AND aggregate_id = ?", stream.AggregateType, stream.AggregateID).First(&head)
+		q := locked(tx).Where("aggregate_type = ? AND aggregate_id = ?", stream.AggregateType, stream.AggregateID).First(&head)
 		if errors.Is(q.Error, gorm.ErrRecordNotFound) {
 			head = aggregateHeadRow{AggregateType: stream.AggregateType, AggregateID: stream.AggregateID, UpdatedAt: time.Now().UTC()}
 			if q = tx.Create(&head); q.Error != nil { return CommitResult{}, errors.New("eventstore: materialize aggregate head failed") }
@@ -150,7 +130,7 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 	for _, item := range work.Streams { totalEvents += len(item.Events) }
 	var sequence eventGlobalSequenceRow
 	if totalEvents > 0 {
-		if err = tx.Where("singleton_id = ?", "default").First(&sequence).Error; err != nil { return CommitResult{}, errors.New("eventstore: lock event sequence failed") }
+		if err = locked(tx).Where("singleton_id = ?", "default").First(&sequence).Error; err != nil { return CommitResult{}, errors.New("eventstore: lock event sequence failed") }
 		s.observeLock(tableEventGlobalSequence)
 	}
 
@@ -184,18 +164,12 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 	}
 
 	if err = s.applyParticipants(ctx, tx, work, &result); err != nil { return CommitResult{}, err }
-	s.mu.RLock(); projectors := append([]Projector(nil), s.projectors...); txProjectors := append([]TransactionProjector(nil), s.txProjectors...); participants := append([]ParticipantHook(nil), s.participants...); txParticipants := append([]TransactionParticipant(nil), s.txParticipants...); s.mu.RUnlock()
-	for _, hook := range txParticipants {
+	s.mu.RLock(); projectors := append([]Projector(nil), s.projectors...); participants := append([]ParticipantHook(nil), s.participants...); s.mu.RUnlock()
+	for _, hook := range participants {
 		if hookErr := hook(ctx, tx, work); hookErr != nil { return CommitResult{}, ErrParticipantFailure }
 	}
-	for _, hook := range participants {
-		if hookErr := hook(ctx, work); hookErr != nil { return CommitResult{}, ErrParticipantFailure }
-	}
-	for _, projector := range txProjectors {
-		if hookErr := projector(ctx, tx, result.Events); hookErr != nil { return CommitResult{}, ErrProjectorFailure }
-	}
 	for _, projector := range projectors {
-		if hookErr := projector(ctx, result.Events); hookErr != nil { return CommitResult{}, ErrProjectorFailure }
+		if hookErr := projector(ctx, tx, result.Events); hookErr != nil { return CommitResult{}, ErrProjectorFailure }
 	}
 	if err = tx.Commit().Error; err != nil { return CommitResult{}, errors.New("eventstore: commit transaction failed") }
 	committed = true
@@ -241,20 +215,24 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 	ops := append([]OperationUpdate(nil), work.Operations...); sort.Slice(ops, func(i,j int) bool{return ops[i].OperationID < ops[j].OperationID})
 	for _, update := range ops {
 		if update.OperationID == "" { return ErrParticipantFailure }
-		var row operationRow; q := tx.Where("operation_id = ?", update.OperationID).First(&row); current := uint64(0)
+		var row operationRow
+		q := tx.Where("operation_id = ?", update.OperationID).First(&row)
+		current := uint64(0)
+		if q.Error == nil { current = row.Version } else if !errors.Is(q.Error, gorm.ErrRecordNotFound) { return ErrParticipantFailure }
+		if err := participantVersion(update.ExpectedVersion, current, update.Version, tableOperations, update.OperationID); err != nil { return err }
 		version := current+1; now := update.UpdatedAt; if now.IsZero(){now=time.Now().UTC()}
 		if current == 0 { row = operationRow{OperationID:update.OperationID, Version:version, Kind:nonempty(update.Kind,"unknown"), Status:nonempty(update.Status,"pending"), PrincipalID:nonempty(update.PrincipalID,update.OperationID), ResourceType:nonempty(update.ResourceID,"unknown"), ResourceID:update.ResourceID, IdempotencyScope:nonempty(update.IdempotencyScope,"operation"), IdempotencyKey:nonempty(update.IdempotencyKey,update.OperationID), RequestID:update.RequestID, RequestDigest:update.RequestDigest, CorrelationID:update.CorrelationID, ResultCode:update.ResultCode, ErrorCode:update.ErrorCode, ArtifactRef:update.ArtifactID, PrivateContext:update.PrivateContextCiphertext, PrivateNonce:update.PrivateContextNonce, PrivateKeyID:update.EncryptionKeyID, CreatedAt:chooseTime(update.CreatedAt,now), UpdatedAt:now, ExpiresAt:timePtr(update.ExpiresAt)}; q=tx.Create(&row)
-		} else { q=tx.Model(&operationRow{}).Where("operation_id = ? AND version = ?",update.OperationID,current).Updates(map[string]any{"version":version,"status":update.Status,"result_code":update.ResultCode,"error_code":update.ErrorCode,"artifact_id":update.ArtifactID,"updated_at":now}) }
-		if q.Error != nil || q.RowsAffected == 0 && current != 0 { return ErrParticipantFailure }; result.OperationIDs=append(result.OperationIDs,update.OperationID)
+		} else { q=tx.Model(&operationRow{}).Where("operation_id = ? AND version = ?",update.OperationID,current).Updates(map[string]any{"version":version,"kind":update.Kind,"status":update.Status,"principal_id":update.PrincipalID,"resource_type":update.ResourceID,"resource_id":update.ResourceID,"idempotency_scope":update.IdempotencyScope,"idempotency_key":update.IdempotencyKey,"request_id":update.RequestID,"request_digest":update.RequestDigest,"correlation_id":update.CorrelationID,"result_code":update.ResultCode,"error_code":update.ErrorCode,"artifact_id":update.ArtifactID,"private_context":update.PrivateContextCiphertext,"private_nonce":update.PrivateContextNonce,"private_key_id":update.EncryptionKeyID,"updated_at":now,"expires_at":timePtr(update.ExpiresAt)}) }
+		if q.Error != nil || (current != 0 && q.RowsAffected != 1) { return ErrParticipantFailure }; result.OperationIDs=append(result.OperationIDs,update.OperationID)
 	}
 	arts := append([]ArtifactUpdate(nil), work.ArtifactUpdates...); sort.Slice(arts, func(i,j int) bool{return arts[i].ArtifactID < arts[j].ArtifactID})
 	for _, update := range arts {
-		var row operationArtifactRow; q:=tx.Where("artifact_id = ?",update.ArtifactID).First(&row); current:=uint64(0); if q.Error==nil{current=row.Version}else if !errors.Is(q.Error,gorm.ErrRecordNotFound){return ErrParticipantFailure}; if update.ArtifactID==""{return ErrParticipantFailure}; if err:=participantVersion(update.ExpectedVersion,current,update.Version,tableOperationArtifacts,update.ArtifactID);err!=nil{return err}; version:=current+1; row=operationArtifactRow{ArtifactID:update.ArtifactID,Version:version,OperationID:update.OperationID,OwnerPrincipalID:nonempty(update.OwnerPrincipalID,"unknown"),MediaType:nonempty(update.MediaType,"application/octet-stream"),SafeFilename:update.SafeFilename,Size:update.Size,Status:nonempty(update.Status,"ready"),Ciphertext:update.Ciphertext,Nonce:update.Nonce,EncryptionKeyID:update.EncryptionKeyID,ExpiresAt:chooseTime(update.ExpiresAt,time.Now().UTC())}; if current==0{q=tx.Create(&row)}else{q=tx.Model(&operationArtifactRow{}).Where("artifact_id = ? AND version = ?",update.ArtifactID,current).Updates(map[string]any{"version":version,"status":row.Status,"ciphertext":row.Ciphertext,"nonce":row.Nonce})}; if q.Error!=nil{return ErrParticipantFailure}; result.ArtifactIDs=append(result.ArtifactIDs,update.ArtifactID)
+		var row operationArtifactRow; q:=tx.Where("artifact_id = ?",update.ArtifactID).First(&row); current:=uint64(0); if q.Error==nil{current=row.Version}else if !errors.Is(q.Error,gorm.ErrRecordNotFound){return ErrParticipantFailure}; if update.ArtifactID==""{return ErrParticipantFailure}; if err:=participantVersion(update.ExpectedVersion,current,update.Version,tableOperationArtifacts,update.ArtifactID);err!=nil{return err}; version:=current+1; row=operationArtifactRow{ArtifactID:update.ArtifactID,Version:version,OperationID:update.OperationID,OwnerPrincipalID:nonempty(update.OwnerPrincipalID,"unknown"),MediaType:nonempty(update.MediaType,"application/octet-stream"),SafeFilename:update.SafeFilename,Size:update.Size,Status:nonempty(update.Status,"ready"),Ciphertext:update.Ciphertext,Nonce:update.Nonce,EncryptionKeyID:update.EncryptionKeyID,ExpiresAt:chooseTime(update.ExpiresAt,time.Now().UTC()),ConsumedAt:timePtr(update.ConsumedAt)}; if current==0{q=tx.Create(&row)}else{q=tx.Model(&operationArtifactRow{}).Where("artifact_id = ? AND version = ?",update.ArtifactID,current).Updates(map[string]any{"version":version,"operation_id":row.OperationID,"owner_principal_id":row.OwnerPrincipalID,"media_type":row.MediaType,"safe_filename":row.SafeFilename,"size":row.Size,"status":row.Status,"ciphertext":row.Ciphertext,"nonce":row.Nonce,"encryption_key_id":row.EncryptionKeyID,"expires_at":row.ExpiresAt,"consumed_at":row.ConsumedAt})}; if q.Error!=nil || (current != 0 && q.RowsAffected != 1){return ErrParticipantFailure}; result.ArtifactIDs=append(result.ArtifactIDs,update.ArtifactID)
 	}
 	secrets := append([]SecretUpdate(nil), work.SecretUpdates...); sort.Slice(secrets, func(i,j int) bool{return secrets[i].SecretRef < secrets[j].SecretRef})
-	for _, update := range secrets { if update.SecretRef==""{return ErrParticipantFailure}; var row adapterSecretRow; q:=tx.Where("secret_ref = ?",update.SecretRef).Order("secret_version DESC").First(&row); current:=uint64(0);if q.Error==nil{current=row.RowVersion}else if !errors.Is(q.Error,gorm.ErrRecordNotFound){return ErrParticipantFailure};if err:=participantVersion(update.ExpectedVersion,current,update.Version,tableAdapterSecrets,update.SecretRef);err!=nil{return err};version:=current+1;row=adapterSecretRow{SecretRef:update.SecretRef,SecretVersion:chooseUint(update.SecretVersion,version),EndpointID:nonempty(update.EndpointID,"unknown"),AdapterID:nonempty(update.AdapterID,"unknown"),AdapterType:"opaque",Ciphertext:nonemptyBytes(update.Ciphertext),Nonce:nonemptyBytes(update.Nonce),EncryptionKeyID:nonempty(update.EncryptionKeyID,"opaque"),RowVersion:version,CreatedAt:time.Now().UTC(),UpdatedAt:chooseTime(update.UpdatedAt,time.Now().UTC())};if current==0{q=tx.Create(&row)}else{q=tx.Model(&adapterSecretRow{}).Where("secret_ref = ? AND row_version = ?",update.SecretRef,current).Updates(map[string]any{"secret_version":row.SecretVersion,"ciphertext":row.Ciphertext,"nonce":row.Nonce,"row_version":version,"updated_at":row.UpdatedAt})};if q.Error!=nil{return ErrParticipantFailure};result.SecretRefs=append(result.SecretRefs,update.SecretRef)}
+	for _, update := range secrets { if update.SecretRef==""{return ErrParticipantFailure}; var row adapterSecretRow; q:=tx.Where("secret_ref = ?",update.SecretRef).Order("secret_version DESC").First(&row); current:=uint64(0);if q.Error==nil{current=row.RowVersion}else if !errors.Is(q.Error,gorm.ErrRecordNotFound){return ErrParticipantFailure};if err:=participantVersion(update.ExpectedVersion,current,update.Version,tableAdapterSecrets,update.SecretRef);err!=nil{return err};version:=current+1;row=adapterSecretRow{SecretRef:update.SecretRef,SecretVersion:chooseUint(update.SecretVersion,version),EndpointID:nonempty(update.EndpointID,"unknown"),AdapterID:nonempty(update.AdapterID,"unknown"),AdapterType:"opaque",Ciphertext:nonemptyBytes(update.Ciphertext),Nonce:nonemptyBytes(update.Nonce),EncryptionKeyID:nonempty(update.EncryptionKeyID,"opaque"),RowVersion:version,CreatedAt:time.Now().UTC(),UpdatedAt:chooseTime(update.UpdatedAt,time.Now().UTC())};if current==0{q=tx.Create(&row)}else{q=tx.Model(&adapterSecretRow{}).Where("secret_ref = ? AND row_version = ?",update.SecretRef,current).Updates(map[string]any{"secret_version":row.SecretVersion,"ciphertext":row.Ciphertext,"nonce":row.Nonce,"row_version":version,"updated_at":row.UpdatedAt})};if q.Error!=nil || (current != 0 && q.RowsAffected != 1){return ErrParticipantFailure};result.SecretRefs=append(result.SecretRefs,update.SecretRef)}
 	plugins := append([]PluginKVUpdate(nil), work.PluginKVUpdates...);sort.Slice(plugins,func(i,j int)bool{if plugins[i].ExtensionID!=plugins[j].ExtensionID{return plugins[i].ExtensionID<plugins[j].ExtensionID};return string(plugins[i].KeyHMAC)<string(plugins[j].KeyHMAC)})
-	for _, update := range plugins {var row pluginKVRow;q:=tx.Where("extension_id = ? AND key_hmac = ?",update.ExtensionID,update.KeyHMAC).First(&row);current:=uint64(0);if q.Error==nil{current=row.RowVersion}else if !errors.Is(q.Error,gorm.ErrRecordNotFound){return ErrParticipantFailure};if update.ExtensionID==""||len(update.KeyHMAC)==0{return ErrParticipantFailure};if err:=participantVersion(update.ExpectedVersion,current,update.Version,tablePluginKV,"<redacted>");err!=nil{return err};version:=current+1;row=pluginKVRow{ExtensionID:update.ExtensionID,KeyHMAC:update.KeyHMAC,EncryptedKey:nonemptyBytes(update.KeyCiphertext),KeyNonce:nonemptyBytes(update.KeyNonce),EncryptedValue:nonemptyBytes(update.ValueCiphertext),ValueNonce:nonemptyBytes(update.ValueNonce),ValueSize:update.ValueSize,RowVersion:version,EncryptionKeyID:nonempty(update.EncryptionKeyID,"opaque"),CreatedAt:time.Now().UTC(),UpdatedAt:chooseTime(update.UpdatedAt,time.Now().UTC())};if current==0{q=tx.Create(&row)}else{q=tx.Model(&pluginKVRow{}).Where("extension_id = ? AND key_hmac = ? AND row_version = ?",update.ExtensionID,update.KeyHMAC,current).Updates(map[string]any{"encrypted_key":row.EncryptedKey,"key_nonce":row.KeyNonce,"encrypted_value":row.EncryptedValue,"value_nonce":row.ValueNonce,"value_size":row.ValueSize,"row_version":version,"updated_at":row.UpdatedAt})};if q.Error!=nil{return ErrParticipantFailure};result.PluginKVIndexes=append(result.PluginKVIndexes,append([]byte(nil),update.KeyHMAC...))}
+	for _, update := range plugins {var row pluginKVRow;q:=tx.Where("extension_id = ? AND key_hmac = ?",update.ExtensionID,update.KeyHMAC).First(&row);current:=uint64(0);if q.Error==nil{current=row.RowVersion}else if !errors.Is(q.Error,gorm.ErrRecordNotFound){return ErrParticipantFailure};if update.ExtensionID==""||len(update.KeyHMAC)==0{return ErrParticipantFailure};if err:=participantVersion(update.ExpectedVersion,current,update.Version,tablePluginKV,"<redacted>");err!=nil{return err};version:=current+1;row=pluginKVRow{ExtensionID:update.ExtensionID,KeyHMAC:update.KeyHMAC,EncryptedKey:nonemptyBytes(update.KeyCiphertext),KeyNonce:nonemptyBytes(update.KeyNonce),EncryptedValue:nonemptyBytes(update.ValueCiphertext),ValueNonce:nonemptyBytes(update.ValueNonce),ValueSize:update.ValueSize,RowVersion:version,EncryptionKeyID:nonempty(update.EncryptionKeyID,"opaque"),CreatedAt:time.Now().UTC(),UpdatedAt:chooseTime(update.UpdatedAt,time.Now().UTC())};if current==0{q=tx.Create(&row)}else{q=tx.Model(&pluginKVRow{}).Where("extension_id = ? AND key_hmac = ? AND row_version = ?",update.ExtensionID,update.KeyHMAC,current).Updates(map[string]any{"encrypted_key":row.EncryptedKey,"key_nonce":row.KeyNonce,"encrypted_value":row.EncryptedValue,"value_nonce":row.ValueNonce,"value_size":row.ValueSize,"row_version":version,"updated_at":row.UpdatedAt})};if q.Error!=nil || (current != 0 && q.RowsAffected != 1){return ErrParticipantFailure};result.PluginKVIndexes=append(result.PluginKVIndexes,append([]byte(nil),update.KeyHMAC...))}
 	inbox := append([]InboxUpdate(nil), work.InboxUpdates...); sort.Slice(inbox, func(i,j int)bool{return inbox[i].InboxID<inbox[j].InboxID})
 	for _, update := range inbox {
 		if update.InboxID=="" { return ErrParticipantFailure }
@@ -265,7 +243,7 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 		version:=current+1; now:=time.Now().UTC()
 		row=inboxMessageRow{InboxID:update.InboxID,EndpointID:nonempty(update.EndpointID,"unknown"),ProviderEventKey:nonempty(update.ProviderEventKey,update.InboxID),LaneHMAC:nonemptyBytes(update.LaneHMAC),OrderingSequence:update.OrderingSequence,Status:nonempty(update.Status,"pending"),Version:version,LeaseOwner:update.LeaseOwner,LeaseEpoch:update.LeaseEpoch,LeaseExpiry:timePtr(update.LeaseExpiresAt),AttemptID:update.AttemptID,CallbackStartedAt:timePtr(update.CallbackStartedAt),CompletedAt:timePtr(update.CompletedAt),PayloadCiphertext:update.PayloadCiphertext,PayloadNonce:update.PayloadNonce,EncryptionKeyID:nonempty(update.DigestKeyID,"opaque"),ContentDigest:update.ContentDigest,ContentDigestKeyID:update.DigestKeyID,PayloadExpiresAt:timePtr(update.PayloadExpiresAt),WorkflowID:update.WorkflowID}
 		if current==0 { q=tx.Create(&row) } else { q=tx.Model(&inboxMessageRow{}).Where("inbox_id = ? AND version = ?",update.InboxID,current).Updates(map[string]any{"version":version,"status":row.Status,"lease_owner":row.LeaseOwner,"lease_epoch":row.LeaseEpoch,"lease_expiry":row.LeaseExpiry,"attempt_id":row.AttemptID,"completed_at":row.CompletedAt}) }
-		if q.Error!=nil{return ErrParticipantFailure}; result.InboxIDs=append(result.InboxIDs,update.InboxID); _=now
+		if q.Error!=nil || (current != 0 && q.RowsAffected != 1){return ErrParticipantFailure}; result.InboxIDs=append(result.InboxIDs,update.InboxID); _=now
 	}
 	effects := append([]NewEffect(nil), work.Effects...); sort.Slice(effects, func(i,j int)bool{return effects[i].EffectID<effects[j].EffectID})
 	for _, update := range effects {
@@ -277,7 +255,7 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 		version:=current+1; now:=time.Now().UTC()
 		row=outboxEffectRow{EffectID:update.EffectID,Version:version,EndpointID:nonempty(update.EndpointID,"unknown"),LaneHMAC:nonemptyBytes(update.LaneHMAC),OrderingSequence:update.OrderingSequence,EffectClass:nonempty(update.EffectType,"unknown"),RiskClass:nonempty(update.RiskClass,"normal"),Status:nonempty(update.Status,"pending"),AttemptID:update.AttemptID,LeaseOwner:update.LeaseOwner,LeaseEpoch:update.LeaseEpoch,LeaseExpiry:timePtr(update.LeaseExpiresAt),DeadlineAt:timePtr(update.DeadlineAt),NextAttemptAt:timePtr(update.NextAttemptAt),DispatchedAt:timePtr(update.DispatchedAt),PayloadCiphertext:update.PayloadCiphertext,PayloadNonce:update.PayloadNonce,EncryptionKeyID:nonempty(update.DigestKeyID,"opaque"),ContentDigest:update.ContentDigest,ContentDigestKeyID:update.DigestKeyID,ResultCode:update.ResultCode,ErrorCode:update.ErrorCode,ProviderMessageID:update.ProviderMessageID,CompletedAt:timePtr(update.CompletedAt),PayloadExpiresAt:timePtr(update.PayloadExpiresAt),CreatedAt:now}
 		if current==0 {q=tx.Create(&row)} else {q=tx.Model(&outboxEffectRow{}).Where("effect_id = ? AND version = ?",update.EffectID,current).Updates(map[string]any{"version":version,"status":row.Status,"lease_owner":row.LeaseOwner,"lease_epoch":row.LeaseEpoch,"lease_expiry":row.LeaseExpiry,"attempt_id":row.AttemptID,"result_code":row.ResultCode,"error_code":row.ErrorCode})}
-		if q.Error!=nil{return ErrParticipantFailure}; result.EffectIDs=append(result.EffectIDs,update.EffectID)
+		if q.Error!=nil || (current != 0 && q.RowsAffected != 1){return ErrParticipantFailure}; result.EffectIDs=append(result.EffectIDs,update.EffectID)
 	}
 	fences := append([]SubjectFenceUpdate(nil), work.FenceUpdates...); sort.Slice(fences,func(i,j int)bool{if string(fences[i].SubjectKey)!=string(fences[j].SubjectKey){return string(fences[i].SubjectKey)<string(fences[j].SubjectKey)};return fences[i].Scope<fences[j].Scope})
 	for _, update := range fences {
@@ -288,7 +266,7 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 		if err:=participantVersion(update.ExpectedVersion,current,update.Version,tableSubjectFences,"<redacted>");err!=nil{return err}
 		version:=current+1; row=subjectFenceRow{SubjectKey:update.SubjectKey,Scope:update.Scope,Version:version,PurgeOperationID:update.PurgeOperationID,CreatedAt:chooseTime(update.CreatedAt,time.Now().UTC()),ExpiresAt:timePtr(update.ExpiresAt)}
 		if current==0{q=tx.Create(&row)}else{q=tx.Model(&subjectFenceRow{}).Where("subject_key = ? AND scope = ? AND version = ?",update.SubjectKey,update.Scope,current).Updates(map[string]any{"version":version,"purge_operation_id":row.PurgeOperationID,"expires_at":row.ExpiresAt})}
-		if q.Error!=nil{return ErrParticipantFailure};result.FenceKeys=append(result.FenceKeys,append([]byte(nil),update.SubjectKey...))
+		if q.Error!=nil || (current != 0 && q.RowsAffected != 1){return ErrParticipantFailure};result.FenceKeys=append(result.FenceKeys,append([]byte(nil),update.SubjectKey...))
 	}
 	return nil
 }
