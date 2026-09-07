@@ -522,13 +522,20 @@ func (s *GORMStore) ReadProjectionRow(ctx context.Context, projectionName, rowKe
 			_ = tx.Rollback().Error
 		}
 	}()
+	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		return ProjectionRow{}, err
+	}
 	var control projectionControlRow
-	if err := tx.Where("singleton_id = ?", "default").First(&control).Error; err != nil {
-		return ProjectionRow{}, errors.New("eventstore: read projection control failed")
+	if err := locked(tx).Where("singleton_id = ?", "default").First(&control).Error; err != nil {
+		return ProjectionRow{}, ErrParticipantFailure
 	}
 	var row projectionReadModelRow
-	if err := tx.Where("projection_generation = ? AND projection_name = ? AND row_key = ?", control.ActiveGeneration, projectionName, rowKey).First(&row).Error; err != nil {
-		return ProjectionRow{}, err
+	queryErr := locked(tx).Where("projection_generation = ? AND projection_name = ? AND row_key = ?", control.ActiveGeneration, projectionName, rowKey).First(&row).Error
+	if errors.Is(queryErr, gorm.ErrRecordNotFound) {
+		return ProjectionRow{}, ErrNotFound
+	}
+	if queryErr != nil {
+		return ProjectionRow{}, ErrParticipantFailure
 	}
 	if err := tx.Commit().Error; err != nil {
 		return ProjectionRow{}, errors.New("eventstore: commit projection read failed")

@@ -586,12 +586,31 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 			return ErrParticipantFailure
 		}
 	}
+	validatePrivate := func(operationID, principal string, version uint64, ciphertext, nonce []byte, keyID string) error {
+		if len(ciphertext) > MaxSecretBytes+16 {
+			return &OversizeError{Bound: "encrypted operation private bytes", Limit: MaxSecretBytes + 16, Actual: len(ciphertext)}
+		}
+		if len(nonce) != 12 || strings.TrimSpace(keyID) == "" {
+			return ErrInvalidMetadata
+		}
+		if err := s.validateA6KeyID(ctx, db, keyID); err != nil {
+			return err
+		}
+		plain, err := openBoundPayload(ctx, s.codec, "operation-private/v1", operationID, principal, version, ciphertext, nonce, keyID)
+		if err != nil {
+			return ErrAuthenticationFailed
+		}
+		if len(plain) > MaxSecretBytes {
+			return &OversizeError{Bound: "operation private bytes", Limit: MaxSecretBytes, Actual: len(plain)}
+		}
+		return nil
+	}
 	for _, update := range work.Operations {
 		if update.OperationID == "" {
 			return ErrInvalidMetadata
 		}
 		var existing operationRow
-		lookupErr := db.WithContext(ctx).Select("principal_id, private_payload_version").Where("operation_id = ?", update.OperationID).First(&existing).Error
+		lookupErr := db.WithContext(ctx).Select("principal_id, private_context, private_nonce, private_key_id, private_payload_version").Where("operation_id = ?", update.OperationID).First(&existing).Error
 		existingFound := lookupErr == nil
 		if !existingFound && !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
 			return ErrParticipantFailure
@@ -605,6 +624,11 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 			return ErrInvalidTransition
 		}
 		if !allCipher {
+			if existingFound && (len(existing.PrivateContext) > 0 || len(existing.PrivateNonce) > 0 || existing.PrivateKeyID != "") {
+				if err := validatePrivate(update.OperationID, existing.PrincipalID, task5PayloadVersion(existing.PrivatePayloadVersion), existing.PrivateContext, existing.PrivateNonce, existing.PrivateKeyID); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		if update.PrincipalID == "" {
@@ -614,11 +638,8 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		if existingFound {
 			version = task5PayloadVersion(existing.PrivatePayloadVersion)
 		}
-		if err := s.validateA6KeyID(ctx, db, update.EncryptionKeyID); err != nil {
+		if err := validatePrivate(update.OperationID, update.PrincipalID, version, update.PrivateContextCiphertext, update.PrivateContextNonce, update.EncryptionKeyID); err != nil {
 			return err
-		}
-		if _, err := openBoundPayload(ctx, s.codec, "operation-private/v1", update.OperationID, update.PrincipalID, version, update.PrivateContextCiphertext, update.PrivateContextNonce, update.EncryptionKeyID); err != nil {
-			return ErrAuthenticationFailed
 		}
 	}
 	for _, update := range work.InboxUpdates {
@@ -707,8 +728,11 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		owner := update.OwnerPrincipalID
 		if owner == "" && update.OperationID != "" {
 			var operation operationRow
-			if err := db.WithContext(ctx).Select("principal_id").Where("operation_id = ?", update.OperationID).First(&operation).Error; err == nil {
+			ownerErr := db.WithContext(ctx).Select("principal_id").Where("operation_id = ?", update.OperationID).First(&operation).Error
+			if ownerErr == nil {
 				owner = operation.PrincipalID
+			} else if !errors.Is(ownerErr, gorm.ErrRecordNotFound) {
+				return ErrParticipantFailure
 			}
 		}
 		if owner == "" {
@@ -725,8 +749,11 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		if err := s.validateA6KeyID(ctx, db, update.EncryptionKeyID); err != nil {
 			return err
 		}
-		if err := db.WithContext(ctx).Select("payload_version").Where("artifact_id = ?", update.ArtifactID).First(&existingArtifact).Error; err == nil {
+		versionQuery := db.WithContext(ctx).Select("payload_version").Where("artifact_id = ?", update.ArtifactID).First(&existingArtifact)
+		if versionQuery.Error == nil {
 			version = task5PayloadVersion(existingArtifact.PayloadVersion)
+		} else if !errors.Is(versionQuery.Error, gorm.ErrRecordNotFound) {
+			return ErrParticipantFailure
 		}
 		if _, err := openBoundPayload(ctx, s.codec, "artifact/v1", update.ArtifactID, owner, version, update.Ciphertext, update.Nonce, update.EncryptionKeyID); err != nil {
 			return ErrAuthenticationFailed

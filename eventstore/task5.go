@@ -1819,8 +1819,12 @@ func (s *GORMStore) task5PersistExpiredPayloads(ctx context.Context, work UnitOf
 	sort.Strings(inboxIDs)
 	for _, id := range inboxIDs {
 		var row inboxMessageRow
-		if q := tx.Where("inbox_id = ?", id).First(&row); q.Error != nil {
+		q := locked(tx).Where("inbox_id = ?", id).First(&row)
+		if errors.Is(q.Error, gorm.ErrRecordNotFound) {
 			continue
+		}
+		if q.Error != nil {
+			return ErrParticipantFailure
 		}
 		if inboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(first.now) {
 			if err = scrubInbox(row.InboxID, first.now); err != nil {
@@ -1838,8 +1842,12 @@ func (s *GORMStore) task5PersistExpiredPayloads(ctx context.Context, work UnitOf
 	sort.Strings(effectIDs)
 	for _, id := range effectIDs {
 		var row outboxEffectRow
-		if q := tx.Where("effect_id = ?", id).First(&row); q.Error != nil {
+		q := locked(tx).Where("effect_id = ?", id).First(&row)
+		if errors.Is(q.Error, gorm.ErrRecordNotFound) {
 			continue
+		}
+		if q.Error != nil {
+			return ErrParticipantFailure
 		}
 		if outboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(first.now) {
 			if err = scrubOutbox(row.EffectID, first.now); err != nil {
