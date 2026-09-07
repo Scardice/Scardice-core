@@ -291,6 +291,11 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 	if err := validateTask5OpaquePayload(update.PayloadCiphertext, update.PayloadNonce, update.DigestKeyID); err != nil {
 		return CommitResult{}, err
 	}
+	if s.keySource != nil {
+		if _, decryptErr := openBoundPayload(ctx, s.codec, "inbox/v1", update.InboxID, update.EndpointID, 1, update.PayloadCiphertext, update.PayloadNonce, update.DigestKeyID); decryptErr != nil {
+			return CommitResult{}, ErrAuthenticationFailed
+		}
+	}
 	if update.LeaseOwner != "" || update.LeaseEpoch != 0 || update.AttemptID != "" || !update.LeaseExpiresAt.IsZero() ||
 		!update.CallbackStartedAt.IsZero() || !update.CompletedAt.IsZero() || update.PrincipalID != "" || update.Reason != "" ||
 		update.Resolution != "" || !update.ResolutionAt.IsZero() {
@@ -700,6 +705,11 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 	}
 	if err := validateTask5OpaquePayload(effect.PayloadCiphertext, effect.PayloadNonce, effect.DigestKeyID); err != nil {
 		return CommitResult{}, err
+	}
+	if s.keySource != nil {
+		if _, decryptErr := openBoundPayload(ctx, s.codec, "outbox/v1", effect.EffectID, effect.EndpointID, 1, effect.PayloadCiphertext, effect.PayloadNonce, effect.DigestKeyID); decryptErr != nil {
+			return CommitResult{}, ErrAuthenticationFailed
+		}
 	}
 	if effect.LeaseOwner != "" || effect.LeaseEpoch != 0 || effect.AttemptID != "" || !effect.LeaseExpiresAt.IsZero() ||
 		!effect.DispatchedAt.IsZero() || !effect.CompletedAt.IsZero() || effect.ProviderMessageID != "" ||
@@ -1602,6 +1612,23 @@ func sealPayload(ctx context.Context, codec any, plaintext []byte) ([]byte, []by
 	}
 	return nil, nil, "", ErrEncryptionUnavailable
 }
+func sealBoundPayload(ctx context.Context, codec any, domain, identity, owner string, version uint64, plaintext []byte) ([]byte, []byte, string, error) {
+	if bound, ok := codec.(interface {
+		EncryptBound(context.Context, string, string, string, uint64, []byte) ([]byte, []byte, string, error)
+	}); ok {
+		return bound.EncryptBound(ctx, domain, identity, owner, version, plaintext)
+	}
+	return sealPayload(ctx, codec, plaintext)
+}
+
+func openBoundPayload(ctx context.Context, codec any, domain, identity, owner string, version uint64, ciphertext, nonce []byte, keyID string) ([]byte, error) {
+	if bound, ok := codec.(interface {
+		DecryptBound(context.Context, string, string, string, uint64, []byte, []byte, string) ([]byte, error)
+	}); ok {
+		return bound.DecryptBound(ctx, domain, identity, owner, version, ciphertext, nonce, keyID)
+	}
+	return openPayload(ctx, codec, ciphertext, nonce, keyID)
+}
 func openPayload(ctx context.Context, codec any, ciphertext, nonce []byte, keyID string) ([]byte, error) {
 	if codec == nil {
 		return nil, ErrEncryptionUnavailable
@@ -1640,13 +1667,6 @@ func (s *GORMStore) PutArtifact(ctx context.Context, req ArtifactPutRequest) (re
 	if ttl < 0 || ttl > MaxArtifactTTL {
 		return ArtifactPutResult{}, ErrInvalidTTL
 	}
-	ciphertext, nonce, keyID, err := sealPayload(ctx, s.codec, req.Plaintext)
-	if err != nil {
-		return ArtifactPutResult{}, ErrEncryptionUnavailable
-	}
-	if opaqueErr := validateTask5ArtifactOpaquePayload(ciphertext, nonce, keyID); opaqueErr != nil {
-		return ArtifactPutResult{}, opaqueErr
-	}
 	if req.ArtifactID == "" {
 		req.ArtifactID, err = s.task5ID()
 		if err != nil {
@@ -1679,6 +1699,13 @@ func (s *GORMStore) PutArtifact(ctx context.Context, req ArtifactPutRequest) (re
 	}
 	if req.OwnerPrincipalID != operation.PrincipalID {
 		return ArtifactPutResult{}, ErrInvalidMetadata
+	}
+	ciphertext, nonce, keyID, err := sealBoundPayload(ctx, s.codec, "artifact/v1", req.ArtifactID, req.OwnerPrincipalID, 1, req.Plaintext)
+	if err != nil {
+		return ArtifactPutResult{}, ErrEncryptionUnavailable
+	}
+	if opaqueErr := validateTask5ArtifactOpaquePayload(ciphertext, nonce, keyID); opaqueErr != nil {
+		return ArtifactPutResult{}, opaqueErr
 	}
 	now := s.task5Now()
 	expires := now.Add(ttl)
@@ -1746,7 +1773,7 @@ func (s *GORMStore) ConsumeArtifact(ctx context.Context, req ArtifactConsumeRequ
 	if len(row.Ciphertext) == 0 || len(row.Nonce) == 0 {
 		return ArtifactResult{}, ErrArtifactGone
 	}
-	plaintext, openErr := openPayload(ctx, s.codec, row.Ciphertext, row.Nonce, row.EncryptionKeyID)
+	plaintext, openErr := openBoundPayload(ctx, s.codec, "artifact/v1", row.ArtifactID, row.OwnerPrincipalID, row.Version, row.Ciphertext, row.Nonce, row.EncryptionKeyID)
 	if openErr != nil {
 		return ArtifactResult{}, ErrEncryptionUnavailable
 	}

@@ -272,9 +272,9 @@ func (adapterSecretRow) TableName() string { return tableAdapterSecrets }
 type pluginKVRow struct {
 	ExtensionID string `gorm:"type:varchar(255);primaryKey;uniqueIndex:ux_plugin_extension_key,priority:1"`
 	KeyHMAC []byte `gorm:"column:key_hmac;size:32;primaryKey;uniqueIndex:ux_plugin_extension_key,priority:2"`
-	EncryptedKey []byte `gorm:"not null;size:1024"`
+	EncryptedKey []byte `gorm:"not null;size:1040"`
 	KeyNonce []byte `gorm:"size:12;not null"`
-	EncryptedValue []byte `gorm:"not null;size:8388608"`
+	EncryptedValue []byte `gorm:"not null;size:8388624"`
 	ValueNonce []byte `gorm:"size:12;not null"`
 	ValueSize int64 `gorm:"not null"`
 	RowVersion uint64 `gorm:"not null"`

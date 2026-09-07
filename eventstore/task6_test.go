@@ -2,13 +2,47 @@ package eventstore
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 )
+
+type MemoryKeySource struct {
+	IndexID       string
+	IndexMaterial []byte
+	Roots         map[string][]byte
+	CurrentID     string
+}
+
+func NewMemoryKeySource(indexID string, indexMaterial []byte, roots map[string][]byte, currentID string) *MemoryKeySource {
+	copyRoots := make(map[string][]byte, len(roots))
+	for id, material := range roots {
+		copyRoots[id] = append([]byte(nil), material...)
+	}
+	return &MemoryKeySource{IndexID: indexID, IndexMaterial: append([]byte(nil), indexMaterial...), Roots: copyRoots, CurrentID: currentID}
+}
+func (m *MemoryKeySource) IndexRootID(context.Context) (string, error) { if m == nil || m.IndexID == "" { return "", ErrKeySourceUnavailable }; return m.IndexID, nil }
+func (m *MemoryKeySource) IndexRootMaterial(context.Context) ([]byte, error) { if m == nil || len(m.IndexMaterial) != 32 { return nil, ErrKeySourceUnavailable }; return append([]byte(nil), m.IndexMaterial...), nil }
+func (m *MemoryKeySource) CurrentEncryptionRoot(ctx context.Context) (EncryptionRoot, error) { if m == nil || m.CurrentID == "" { return EncryptionRoot{}, ErrKeySourceUnavailable }; material, err := m.EncryptionRoot(ctx, m.CurrentID); return EncryptionRoot{ID: m.CurrentID, Material: material}, err }
+func (m *MemoryKeySource) EncryptionRoot(_ context.Context, id string) ([]byte, error) { if m == nil { return nil, ErrKeySourceUnavailable }; material, ok := m.Roots[id]; if !ok || len(material) != 32 { return nil, ErrKeyUnavailable }; return append([]byte(nil), material...), nil }
+func (m *MemoryKeySource) EncryptionRoots(ctx context.Context) ([]EncryptionRoot, error) { if m == nil { return nil, ErrKeySourceUnavailable }; ids := make([]string, 0, len(m.Roots)); for id := range m.Roots { ids = append(ids, id) }; sort.Strings(ids); out := make([]EncryptionRoot, 0, len(ids)); for _, id := range ids { material, err := m.EncryptionRoot(ctx, id); if err != nil { return nil, err }; out = append(out, EncryptionRoot{ID: id, Material: material}) }; return out, nil }
+
+func TestCryptoKnownVector(t *testing.T) {
+	source := task6Source()
+	got, err := a6HMAC(context.Background(), source, "plugin-key-index/v1", "ext", "key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "0c8ff04fa7aed3f959d1149243a62e586c79c8a4ccc5f8283abd5c00c0f71b88"
+	if hex.EncodeToString(got) != want {
+		t.Fatalf("HMAC vector=%x want=%s", got, want)
+	}
+}
 
 func task6Source() *MemoryKeySource {
 	return NewMemoryKeySource("index-v1", []byte("01234567890123456789012345678901"), map[string][]byte{
@@ -71,7 +105,7 @@ func TestPluginKVExactAndPrefixIsolation(t *testing.T) {
 func TestReadinessPinAndRootAvailability(t *testing.T) {
 	store, db, source := task6Store(t)
 	defer db.Close()
-	readiness := Readiness{Mode: "import", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: "index-v1", EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC()}
+	readiness := Readiness{Mode: "import", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: "index-v1", EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), TerminalGlobalPosition: 1, TerminalProjectionPosition: 1, CompletedAt: time.Unix(1, 0).UTC()}
 	if err := store.SetReadiness(context.Background(), readiness); err != nil { t.Fatal(err) }
 	got, err := store.GetReadiness(context.Background())
 	if err != nil || got.Mode != "import" || got.IndexRootID != "index-v1" { t.Fatalf("readiness=%#v err=%v", got, err) }
@@ -104,4 +138,123 @@ func TestRotationReencryptsSecretAndPlugin(t *testing.T) {
 	if result.Updated < 2 || result.CurrentRootID != "root-v2" { t.Fatalf("rotation result=%#v", result) }
 	if got, err := store.ResolveSecret(ctx, "rotate-secret", 0); err != nil || string(got.Plaintext) != "secret" { t.Fatalf("rotated secret=%q err=%v", got.Plaintext, err) }
 	if got, err := store.GetPluginKV(ctx, "rotate-ext", "key"); err != nil || string(got.Value) != "value" { t.Fatalf("rotated plugin=%q err=%v", got.Value, err) }
+}
+func TestReadinessRejectsNonEmptyFresh(t *testing.T) {
+	store, db, _ := task6Store(t)
+	defer db.Close()
+	event := NewEvent{EventType: "task6.event", SchemaVersion: 1, Payload: []byte(`{}`), Metadata: Metadata{EventID: "event-1", CommandID: "command-1", CorrelationID: "correlation-1", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}}
+	if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{AggregateType: "task6", AggregateID: "1"}, Events: []NewEvent{event}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ValidateReadiness(context.Background()); !errors.Is(err, ErrReadinessQuarantined) {
+		t.Fatalf("unconfigured nonempty readiness err=%v", err)
+	}
+	if err := store.SetReadiness(context.Background(), Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: "index-v1"}); !errors.Is(err, ErrReadinessQuarantined) {
+		t.Fatalf("fresh nonempty readiness err=%v", err)
+	}
+}
+
+func TestRemoteDatabaseRequiresExternalKeySource(t *testing.T) {
+	_, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "postgres", DSN: "postgres://invalid.invalid/eventstore"})
+	if !errors.Is(err, ErrKeySourceUnavailable) {
+		t.Fatalf("remote source error=%v", err)
+	}
+}
+
+func TestUnixKeySourceUsesExplicitCurrentRoot(t *testing.T) {
+	if os.Getenv("GOOS") == "windows" {
+		t.Skip("Unix key source contract")
+	}
+	dir := t.TempDir()
+	indexPath := filepath.Join(dir, "index.key")
+	if err := CreateUnixKeyFile(indexPath, []byte("01234567890123456789012345678901")); err != nil {
+		t.Fatal(err)
+	}
+	roots := filepath.Join(dir, "roots")
+	if err := os.Mkdir(roots, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateUnixKeyFile(filepath.Join(roots, "root-a.key"), []byte("abcdefghijklmnopqrstuvwxyz123456")); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateUnixKeyFile(filepath.Join(roots, "root-z.key"), []byte("12345678901234567890123456789012")); err != nil {
+		t.Fatal(err)
+	}
+	current := filepath.Join(roots, "current")
+	if err := os.WriteFile(current, []byte("root-a"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	source := NewUnixFileKeySource(indexPath, roots)
+	root, err := source.CurrentEncryptionRoot(context.Background())
+	if err != nil || root.ID != "root-a" {
+		t.Fatalf("current root=%#v err=%v", root, err)
+	}
+}
+func TestPluginKVCiphertextBoundsAtMaximum(t *testing.T) {
+	store, db, _ := task6Store(t)
+	defer db.Close()
+	key := strings.Repeat("k", MaxPluginKeyBytes)
+	value := make([]byte, MaxPluginValueBytes)
+	for i := range value {
+		value[i] = byte(i)
+	}
+	item, err := store.SetPluginKV(context.Background(), PluginKVPutRequest{ExtensionID: "max-ext", Key: key, Value: value})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(item.Value) != MaxPluginValueBytes {
+		t.Fatalf("stored max value len=%d", len(item.Value))
+	}
+	got, err := store.GetPluginKV(context.Background(), "max-ext", key)
+	if err != nil || len(got.Value) != MaxPluginValueBytes {
+		t.Fatalf("loaded max value len=%d err=%v", len(got.Value), err)
+	}
+}
+func TestA6ArtifactAADBindsRowIdentity(t *testing.T) {
+	store, db, _ := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	for _, operationID := range []string{"artifact-op-1", "artifact-op-2"} {
+		if _, err := store.Commit(ctx, UnitOfWork{Operations: []OperationUpdate{{OperationID: operationID, PrincipalID: "owner-" + operationID}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.PutArtifact(ctx, ArtifactPutRequest{ArtifactID: "artifact-a", OperationID: "artifact-op-1", OwnerPrincipalID: "owner-artifact-op-1", Plaintext: []byte("alpha")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PutArtifact(ctx, ArtifactPutRequest{ArtifactID: "artifact-b", OperationID: "artifact-op-2", OwnerPrincipalID: "owner-artifact-op-2", Plaintext: []byte("bravo")}); err != nil {
+		t.Fatal(err)
+	}
+	var first, second operationArtifactRow
+	if err := db.GORM().Where("artifact_id = ?", "artifact-a").First(&first).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GORM().Where("artifact_id = ?", "artifact-b").First(&second).Error; err != nil {
+		t.Fatal(err)
+	}
+	first.Ciphertext, second.Ciphertext = second.Ciphertext, first.Ciphertext
+	first.Nonce, second.Nonce = second.Nonce, first.Nonce
+	if err := db.GORM().Save(&first).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GORM().Save(&second).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ConsumeArtifact(ctx, ArtifactConsumeRequest{ArtifactID: "artifact-a"}); !errors.Is(err, ErrEncryptionUnavailable) {
+		t.Fatalf("swapped artifact err=%v", err)
+	}
+}
+func TestA6UoWRejectsWrongCiphertextKey(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	ciphertext, nonce, keyID, err := a6Seal(ctx, source, "operation-private/v1", "uow-op", "owner", 1, []byte("private"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.Roots["root-v1"] = []byte("ZYXWVUTSRQPONMLKJIHGFEDCBA987654")
+	_, err = store.Commit(ctx, UnitOfWork{Operations: []OperationUpdate{{OperationID: "uow-op", Version: 0, PrincipalID: "owner", PrivateContextCiphertext: ciphertext, PrivateContextNonce: nonce, EncryptionKeyID: keyID}}})
+	if !errors.Is(err, ErrAuthenticationFailed) {
+		t.Fatalf("wrong-key UoW err=%v", err)
+	}
 }

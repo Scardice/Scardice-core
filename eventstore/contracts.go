@@ -747,10 +747,14 @@ type EncryptionRoot struct {
 	Material []byte
 }
 
-// KeySource supplies a stable index root and versioned encryption roots.
-// It is intentionally an opaque interface so deployments can wrap KMS/HSM
-// implementations without importing their types into eventstore.
-type KeySource interface{}
+// KeySource supplies a stable installation index root and versioned encryption roots.
+// Implementations may wrap a KMS, HSM, or owner-only local key files.
+type KeySource interface {
+	IndexRootID(context.Context) (string, error)
+	IndexRootMaterial(context.Context) ([]byte, error)
+	CurrentEncryptionRoot(context.Context) (EncryptionRoot, error)
+	EncryptionRoot(context.Context, string) ([]byte, error)
+}
 
 type SecretPutRequest struct {
 	SecretRef       string

@@ -37,6 +37,12 @@ type DatabaseConfig struct {
 	Type string
 	DSN  string
 
+	// KeySource is required for remote databases and is carried to stores
+	// opened from this database. SQLite callers may supply it explicitly when
+	// using A6 encrypted repositories.
+	KeySource KeySource
+	DatabaseIdentity string
+
 	TLSVerify             bool
 	AllowInsecureLoopback bool
 
@@ -51,6 +57,8 @@ type DatabaseConfig struct {
 type Database struct {
 	gormDB *gorm.DB
 	sqlDB  *sql.DB
+	databaseIdentity string
+	keySource KeySource
 
 	mu       sync.Mutex
 	closed   bool
@@ -101,6 +109,9 @@ func OpenDatabase(ctx context.Context, config DatabaseConfig) (*Database, error)
 	if dbType == "" {
 		dbType = "sqlite"
 	}
+	if dbType != "sqlite" && dbType != "sqlite3" && config.KeySource == nil {
+		return nil, ErrKeySourceUnavailable
+	}
 	connectTimeout := config.ConnectTimeout
 	if connectTimeout <= 0 {
 		connectTimeout = defaultDatabaseConnectTimeout
@@ -140,7 +151,7 @@ func OpenDatabase(ctx context.Context, config DatabaseConfig) (*Database, error)
 	if err != nil {
 		return nil, safeDatabaseError("acquire pool", dbType, err)
 	}
-	owned := &Database{gormDB: gormDB, sqlDB: sqlDB}
+	owned := &Database{gormDB: gormDB, sqlDB: sqlDB, keySource: config.KeySource, databaseIdentity: config.DatabaseIdentity}
 	if dbType == "sqlite" || dbType == "sqlite3" {
 		sqlDB.SetMaxOpenConns(1)
 		sqlDB.SetMaxIdleConns(1)

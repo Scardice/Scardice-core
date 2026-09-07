@@ -80,13 +80,20 @@ func WithClock(clock Clock) StoreOption {
 func WithIDGenerator(generator IDGenerator) StoreOption {
 	return func(s *GORMStore) { if generator != nil { s.ids = generator } }
 }
-func WithPayloadCodec(codec any) StoreOption { return func(s *GORMStore) { s.codec = codec } }
+func WithPayloadCodec(codec any) StoreOption {
+	return func(s *GORMStore) {
+		if s.keySource == nil {
+			s.codec = codec
+		}
+	}
+}
 func WithKeySource(source KeySource) StoreOption {
 	return func(s *GORMStore) {
-		s.keySource = source
-		if source != nil {
-			s.codec = &a6PayloadCodec{source: source}
+		if source == nil {
+			return
 		}
+		s.keySource = source
+		s.codec = &a6PayloadCodec{source: source}
 	}
 }
 
@@ -105,7 +112,15 @@ type GORMStore struct {
 }
 func NewStore(database *Database, options ...StoreOption) *GORMStore {
 	s := &GORMStore{db: database, clock: SystemClock{}, ids: UUIDGenerator{}}
-	for _, option := range options { if option != nil { option(s) } }
+	if database != nil && database.keySource != nil {
+		s.keySource = database.keySource
+		s.codec = &a6PayloadCodec{source: database.keySource}
+	}
+	for _, option := range options {
+		if option != nil {
+			option(s)
+		}
+	}
 	return s
 }
 func descriptorVersion(descriptor ProjectionDescriptor) (string, error) {
@@ -232,8 +247,10 @@ func locked(db *gorm.DB) *gorm.DB {
 }
 
 func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitResult, err error) {
+	if ctx == nil { ctx = context.Background() }
 	if err = ValidateUnitOfWork(work); err != nil { return CommitResult{}, err }
 	if initErr := s.initializationError(); initErr != nil { return CommitResult{}, initErr }
+	if err = s.validateA6UnitOfWork(ctx, work); err != nil { return CommitResult{}, err }
 	base := (*gorm.DB)(nil)
 	if s.db != nil { base = s.db.GORM() }
 	if base == nil { return CommitResult{}, errors.New("eventstore: store unavailable") }
