@@ -426,6 +426,9 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 	if err != nil {
 		return CommitResult{}, err
 	}
+	if err := lockPublication(tx); err != nil {
+		return CommitResult{}, err
+	}
 	defer func() {
 		if err != nil {
 			task5Rollback(tx)
@@ -520,6 +523,9 @@ func (s *GORMStore) ClaimInbox(ctx context.Context, req InboxClaimRequest) (leas
 	if err != nil {
 		return InboxLease{}, err
 	}
+	if err := lockPublication(tx); err != nil {
+		return InboxLease{}, err
+	}
 	defer func() {
 		if err != nil {
 			task5Rollback(tx)
@@ -537,6 +543,15 @@ func (s *GORMStore) ClaimInbox(ctx context.Context, req InboxClaimRequest) (leas
 			return InboxLease{}, err
 		}
 	}
+	commitObservedScrub := func(candidateErr error) error {
+		if !expiredObserved {
+			return candidateErr
+		}
+		if commitErr := task5Commit(tx); commitErr != nil {
+			return commitErr
+		}
+		return candidateErr
+	}
 	var row inboxMessageRow
 	q := locked(tx).Where("(status = ? OR (status = ? AND (lease_expiry IS NULL OR lease_expiry <= ?)))", InboxStatusPending, InboxStatusLeased, now).Where("NOT EXISTS (SELECT 1 FROM inbox_messages p WHERE p.lane_hmac = inbox_messages.lane_hmac AND p.ordering_sequence < inbox_messages.ordering_sequence AND p.status IN ?)", []string{InboxStatusPending, InboxStatusLeased, InboxStatusCallbackStarted, InboxStatusAmbiguous}).Order("ordering_sequence ASC").First(&row)
 	if errors.Is(q.Error, gorm.ErrRecordNotFound) {
@@ -549,7 +564,7 @@ func (s *GORMStore) ClaimInbox(ctx context.Context, req InboxClaimRequest) (leas
 		return InboxLease{}, ErrNotFound
 	}
 	if q.Error != nil {
-		return InboxLease{}, errors.New("eventstore: claim inbox query failed")
+		return InboxLease{}, commitObservedScrub(errors.New("eventstore: claim inbox query failed"))
 	}
 	if row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
 		if len(row.PayloadCiphertext) > 0 || len(row.PayloadNonce) > 0 {
@@ -563,27 +578,27 @@ func (s *GORMStore) ClaimInbox(ctx context.Context, req InboxClaimRequest) (leas
 		return InboxLease{}, ErrPayloadExpired
 	}
 	if err = s.task5ValidatePayload(ctx, "inbox/v1", row.InboxID, row.EndpointID, task5PayloadVersion(row.PayloadVersion), row.PayloadCiphertext, row.PayloadNonce, row.EncryptionKeyID, false); err != nil {
-		return InboxLease{}, err
+		return InboxLease{}, commitObservedScrub(err)
 	}
 	if row.LeaseEpoch == maxUint64 {
-		return InboxLease{}, ErrVersionExhausted
+		return InboxLease{}, commitObservedScrub(ErrVersionExhausted)
 	}
 	attempt, idErr := s.task5ID()
 	if idErr != nil {
-		return InboxLease{}, idErr
+		return InboxLease{}, commitObservedScrub(idErr)
 	}
 	expires := now.Add(task5LeaseDuration(req.LeaseDuration))
 	version, vErr := nextVersion(row.Version)
 	if vErr != nil {
-		return InboxLease{}, vErr
+		return InboxLease{}, commitObservedScrub(vErr)
 	}
 	updates := map[string]any{"status": InboxStatusLeased, "version": version, "lease_owner": req.WorkerID, "lease_epoch": row.LeaseEpoch + 1, "lease_expiry": expires, "attempt_id": attempt}
 	q = tx.Model(&inboxMessageRow{}).Where("inbox_id = ? AND version = ?", row.InboxID, row.Version).Updates(updates)
 	if q.Error != nil {
-		return InboxLease{}, errors.New("eventstore: claim inbox failed")
+		return InboxLease{}, commitObservedScrub(errors.New("eventstore: claim inbox failed"))
 	}
 	if q.RowsAffected != 1 {
-		return InboxLease{}, ErrStaleLease
+		return InboxLease{}, commitObservedScrub(ErrStaleLease)
 	}
 	row.Status, row.Version, row.LeaseOwner, row.LeaseEpoch, row.LeaseExpiry, row.AttemptID = InboxStatusLeased, version, req.WorkerID, row.LeaseEpoch+1, &expires, attempt
 	lease.Update = inboxUpdateFromRow(row)
@@ -612,6 +627,9 @@ func (s *GORMStore) UpdateInbox(ctx context.Context, update InboxUpdate) (result
 	}
 	tx, err := task5Begin(base)
 	if err != nil {
+		return CommitResult{}, err
+	}
+	if err := lockPublication(tx); err != nil {
 		return CommitResult{}, err
 	}
 	defer func() {
@@ -735,6 +753,9 @@ func (s *GORMStore) resolveInboxTx(ctx context.Context, req InboxResolutionReque
 	if err != nil {
 		return CommitResult{}, err
 	}
+	if err := lockPublication(tx); err != nil {
+		return CommitResult{}, err
+	}
 	defer func() {
 		if err != nil {
 			task5Rollback(tx)
@@ -763,7 +784,10 @@ func (s *GORMStore) resolveInboxTx(ctx context.Context, req InboxResolutionReque
 	}
 	if !inboxUnresolved(row.Status) {
 		if req.Resolution == InboxResolutionConfirmedConsumed && row.Status == InboxStatusConfirmedConsumed {
-			return CommitResult{InboxIDs: []string{row.InboxID}, Version: row.Version, Idempotent: true}, task5Commit(tx)
+			if err = task5Commit(tx); err != nil {
+				return CommitResult{}, err
+			}
+			return CommitResult{InboxIDs: []string{row.InboxID}, Version: row.Version, Idempotent: true}, nil
 		}
 		return CommitResult{}, ErrInvalidTransition
 	}
@@ -873,6 +897,9 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 	if err != nil {
 		return CommitResult{}, err
 	}
+	if err := lockPublication(tx); err != nil {
+		return CommitResult{}, err
+	}
 	defer func() {
 		if err != nil {
 			task5Rollback(tx)
@@ -905,7 +932,10 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 		if !task5EffectDuplicate(existing, effect) {
 			return CommitResult{}, ErrConflict
 		}
-		return CommitResult{EffectIDs: []string{existing.EffectID}, OrderingSequence: existing.OrderingSequence, Version: existing.Version, Deduplicated: true, Idempotent: true}, task5Commit(tx)
+		if err = task5Commit(tx); err != nil {
+			return CommitResult{}, err
+		}
+		return CommitResult{EffectIDs: []string{existing.EffectID}, OrderingSequence: existing.OrderingSequence, Version: existing.Version, Deduplicated: true, Idempotent: true}, nil
 	}
 	if !errors.Is(lookup.Error, gorm.ErrRecordNotFound) {
 		return CommitResult{}, errors.New("eventstore: lookup outbox failed")
@@ -964,6 +994,9 @@ func (s *GORMStore) ClaimOutbox(ctx context.Context, req OutboxClaimRequest) (le
 	if err != nil {
 		return OutboxLease{}, err
 	}
+	if err := lockPublication(tx); err != nil {
+		return OutboxLease{}, err
+	}
 	defer func() {
 		if err != nil {
 			task5Rollback(tx)
@@ -987,6 +1020,15 @@ func (s *GORMStore) ClaimOutbox(ctx context.Context, req OutboxClaimRequest) (le
 			return OutboxLease{}, err
 		}
 	}
+	commitObservedScrub := func(candidateErr error) error {
+		if !expiredObserved {
+			return candidateErr
+		}
+		if commitErr := task5Commit(tx); commitErr != nil {
+			return commitErr
+		}
+		return candidateErr
+	}
 	var row outboxEffectRow
 	q := locked(tx).Where("((status = ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)) OR (status = ? AND (lease_expiry IS NULL OR lease_expiry <= ?)) OR (status = ? AND lease_expiry IS NOT NULL AND lease_expiry <= ?))", OutboxStatusPending, now, OutboxStatusLeased, now, OutboxStatusDispatched, now).Where("NOT EXISTS (SELECT 1 FROM outbox_effects p WHERE p.lane_hmac = outbox_effects.lane_hmac AND p.ordering_sequence < outbox_effects.ordering_sequence AND p.status IN ?)", []string{OutboxStatusPending, OutboxStatusLeased, OutboxStatusDispatched, OutboxStatusAmbiguous}).Order("ordering_sequence ASC").First(&row)
 	if errors.Is(q.Error, gorm.ErrRecordNotFound) {
@@ -999,17 +1041,17 @@ func (s *GORMStore) ClaimOutbox(ctx context.Context, req OutboxClaimRequest) (le
 		return OutboxLease{}, ErrNotFound
 	}
 	if q.Error != nil {
-		return OutboxLease{}, errors.New("eventstore: claim outbox query failed")
+		return OutboxLease{}, commitObservedScrub(errors.New("eventstore: claim outbox query failed"))
 	}
 	if (row.Status == OutboxStatusLeased || row.Status == OutboxStatusDispatched) && row.LeaseExpiry != nil && !row.LeaseExpiry.After(now) && row.DispatchedAt != nil && row.RiskClass != RiskProviderIdempotent {
 		version, vErr := nextVersion(row.Version)
 		if vErr != nil {
-			return OutboxLease{}, vErr
+			return OutboxLease{}, commitObservedScrub(vErr)
 		}
 		row.Status, row.Version, row.ResolutionReason, row.ResolutionAt, row.LeaseExpiry = OutboxStatusAmbiguous, version, "expired-after-dispatch", task5Ptr(now), nil
 		q = tx.Model(&outboxEffectRow{}).Where("effect_id = ? AND version = ?", row.EffectID, version-1).Updates(outboxMap(row))
 		if q.Error != nil || q.RowsAffected != 1 {
-			return OutboxLease{}, ErrStaleLease
+			return OutboxLease{}, commitObservedScrub(ErrStaleLease)
 		}
 		if err = task5Commit(tx); err != nil {
 			return OutboxLease{}, err
@@ -1028,18 +1070,18 @@ func (s *GORMStore) ClaimOutbox(ctx context.Context, req OutboxClaimRequest) (le
 		return OutboxLease{}, ErrPayloadExpired
 	}
 	if err = s.task5ValidatePayload(ctx, "outbox/v1", row.EffectID, row.EndpointID, task5PayloadVersion(row.PayloadVersion), row.PayloadCiphertext, row.PayloadNonce, row.EncryptionKeyID, false); err != nil {
-		return OutboxLease{}, err
+		return OutboxLease{}, commitObservedScrub(err)
 	}
 	if row.LeaseEpoch == maxUint64 {
-		return OutboxLease{}, ErrVersionExhausted
+		return OutboxLease{}, commitObservedScrub(ErrVersionExhausted)
 	}
 	attempt, idErr := s.task5ID()
 	if idErr != nil {
-		return OutboxLease{}, idErr
+		return OutboxLease{}, commitObservedScrub(idErr)
 	}
 	version, vErr := nextVersion(row.Version)
 	if vErr != nil {
-		return OutboxLease{}, vErr
+		return OutboxLease{}, commitObservedScrub(vErr)
 	}
 	expires := now.Add(task5LeaseDuration(req.LeaseDuration))
 	retry := row.RetryCount
@@ -1052,10 +1094,10 @@ func (s *GORMStore) ClaimOutbox(ctx context.Context, req OutboxClaimRequest) (le
 	updates := map[string]any{"status": OutboxStatusLeased, "version": version, "lease_owner": req.WorkerID, "lease_epoch": row.LeaseEpoch + 1, "lease_expiry": expires, "attempt_id": attempt, "retry_count": retry}
 	q = tx.Model(&outboxEffectRow{}).Where("effect_id = ? AND version = ?", row.EffectID, row.Version).Updates(updates)
 	if q.Error != nil {
-		return OutboxLease{}, errors.New("eventstore: claim outbox failed")
+		return OutboxLease{}, commitObservedScrub(errors.New("eventstore: claim outbox failed"))
 	}
 	if q.RowsAffected != 1 {
-		return OutboxLease{}, ErrStaleLease
+		return OutboxLease{}, commitObservedScrub(ErrStaleLease)
 	}
 	row.Status, row.Version, row.LeaseOwner, row.LeaseEpoch, row.LeaseExpiry, row.AttemptID, row.RetryCount = OutboxStatusLeased, version, req.WorkerID, row.LeaseEpoch+1, &expires, attempt, retry
 	lease.Effect = effectFromRow(row)
@@ -1081,6 +1123,9 @@ func (s *GORMStore) UpdateOutbox(ctx context.Context, effect NewEffect) (result 
 	}
 	tx, err := task5Begin(base)
 	if err != nil {
+		return CommitResult{}, err
+	}
+	if err := lockPublication(tx); err != nil {
 		return CommitResult{}, err
 	}
 	defer func() {
@@ -1215,6 +1260,9 @@ func (s *GORMStore) renewOutbox(ctx context.Context, req OutboxRenewRequest) (le
 	if err != nil {
 		return OutboxLease{}, err
 	}
+	if err := lockPublication(tx); err != nil {
+		return OutboxLease{}, err
+	}
 	defer func() {
 		if err != nil {
 			task5Rollback(tx)
@@ -1268,6 +1316,9 @@ func (s *GORMStore) MarkOutboxDispatched(ctx context.Context, req OutboxDispatch
 	}
 	tx, err := task5Begin(base)
 	if err != nil {
+		return OutboxLease{}, err
+	}
+	if err := lockPublication(tx); err != nil {
 		return OutboxLease{}, err
 	}
 	defer func() {
@@ -1335,6 +1386,9 @@ func (s *GORMStore) CompleteOutbox(ctx context.Context, req OutboxCompletionRequ
 	if err != nil {
 		return CommitResult{}, err
 	}
+	if err := lockPublication(tx); err != nil {
+		return CommitResult{}, err
+	}
 	defer func() {
 		if err != nil {
 			task5Rollback(tx)
@@ -1369,7 +1423,10 @@ func (s *GORMStore) CompleteOutbox(ctx context.Context, req OutboxCompletionRequ
 		} else if !task5LeaseMatches(row.LeaseOwner, row.LeaseEpoch, row.AttemptID, req.WorkerID, req.LeaseEpoch, req.AttemptID) || !task5LeaseActive(row.LeaseExpiry, now) {
 			return CommitResult{}, ErrStaleLease
 		}
-		return CommitResult{EffectIDs: []string{row.EffectID}, Version: row.Version, Idempotent: true}, task5Commit(tx)
+		if err = task5Commit(tx); err != nil {
+			return CommitResult{}, err
+		}
+		return CommitResult{EffectIDs: []string{row.EffectID}, Version: row.Version, Idempotent: true}, nil
 	}
 	if row.Status != OutboxStatusDispatched || row.DispatchedAt == nil {
 		return CommitResult{}, ErrInvalidTransition
@@ -1417,6 +1474,9 @@ func (s *GORMStore) ResolveOutbox(ctx context.Context, req OutboxResolutionReque
 	}
 	tx, err := task5Begin(base)
 	if err != nil {
+		return CommitResult{}, err
+	}
+	if err := lockPublication(tx); err != nil {
 		return CommitResult{}, err
 	}
 	defer func() {
@@ -1573,6 +1633,9 @@ func (s *GORMStore) task5PersistExpiredArtifacts(ctx context.Context, work UnitO
 	if err != nil {
 		return err
 	}
+	if err := lockPublication(tx); err != nil {
+		return err
+	}
 	defer func() {
 		if err != nil {
 			task5Rollback(tx)
@@ -1632,6 +1695,9 @@ func (s *GORMStore) task5PersistExpiredPayloads(ctx context.Context, work UnitOf
 	}
 	tx, err := task5Begin(base)
 	if err != nil {
+		return err
+	}
+	if err := lockPublication(tx); err != nil {
 		return err
 	}
 	defer func() {
@@ -1848,6 +1914,9 @@ func (s *GORMStore) PutArtifact(ctx context.Context, req ArtifactPutRequest) (re
 	if err != nil {
 		return ArtifactPutResult{}, err
 	}
+	if err := lockPublication(tx); err != nil {
+		return ArtifactPutResult{}, err
+	}
 	defer func() {
 		if err != nil {
 			task5Rollback(tx)
@@ -1905,6 +1974,9 @@ func (s *GORMStore) ConsumeArtifact(ctx context.Context, req ArtifactConsumeRequ
 	}
 	tx, err := task5Begin(base)
 	if err != nil {
+		return ArtifactResult{}, err
+	}
+	if err := lockPublication(tx); err != nil {
 		return ArtifactResult{}, err
 	}
 	defer func() {

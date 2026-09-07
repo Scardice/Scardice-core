@@ -250,6 +250,97 @@ func TestTask5ConsumeArtifactCommitErrorNeverReturnsPlaintext(t *testing.T) {
 		t.Fatalf("commit-error consume mutated artifact: %#v", row)
 	}
 }
+func TestTask5LeaseCommitErrorsReturnZeroLease(t *testing.T) {
+	{
+		store, db, _ := task5Store(t)
+		defer db.Close()
+		if _, err := store.AcceptInbox(context.Background(), task5Inbox("commit-error-claim-inbox", "commit-error-provider", "commit-error-lane")); err != nil {
+			t.Fatal(err)
+		}
+		const callbackName = "task5_test_rollback_claim_inbox"
+		if err := db.GORM().Callback().Update().After("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table == tableInboxMessages {
+				tx.Rollback()
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := store.ClaimInbox(context.Background(), InboxClaimRequest{WorkerID: "worker"})
+		_ = db.GORM().Callback().Update().Remove(callbackName)
+		if err == nil || !reflect.DeepEqual(lease, InboxLease{}) {
+			t.Fatalf("claim inbox commit error lease=%#v err=%v", lease, err)
+		}
+	}
+	{
+		store, db, _ := task5Store(t)
+		defer db.Close()
+		if _, err := store.AcceptOutbox(context.Background(), task5Effect("commit-error-claim-effect", "commit-error-claim-lane")); err != nil {
+			t.Fatal(err)
+		}
+		const callbackName = "task5_test_rollback_claim_outbox"
+		if err := db.GORM().Callback().Update().After("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table == tableOutboxEffects {
+				tx.Rollback()
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := store.ClaimOutbox(context.Background(), OutboxClaimRequest{WorkerID: "worker"})
+		_ = db.GORM().Callback().Update().Remove(callbackName)
+		if err == nil || !reflect.DeepEqual(lease, OutboxLease{}) {
+			t.Fatalf("claim outbox commit error lease=%#v err=%v", lease, err)
+		}
+	}
+	{
+		store, db, _ := task5Store(t)
+		defer db.Close()
+		if _, err := store.AcceptOutbox(context.Background(), task5Effect("commit-error-renew-effect", "commit-error-renew-lane")); err != nil {
+			t.Fatal(err)
+		}
+		claimed, err := store.ClaimOutbox(context.Background(), OutboxClaimRequest{WorkerID: "worker"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		const callbackName = "task5_test_rollback_renew_outbox"
+		if err := db.GORM().Callback().Update().After("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table == tableOutboxEffects {
+				tx.Rollback()
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := store.RenewOutbox(context.Background(), OutboxRenewRequest{EffectID: claimed.Effect.EffectID, WorkerID: claimed.Effect.LeaseOwner, LeaseEpoch: claimed.Effect.LeaseEpoch, AttemptID: claimed.Effect.AttemptID, LeaseDuration: time.Minute})
+		_ = db.GORM().Callback().Update().Remove(callbackName)
+		if err == nil || !reflect.DeepEqual(lease, OutboxLease{}) {
+			t.Fatalf("renew outbox commit error lease=%#v err=%v", lease, err)
+		}
+	}
+	{
+		store, db, _ := task5Store(t)
+		defer db.Close()
+		if _, err := store.AcceptOutbox(context.Background(), task5Effect("commit-error-mark-effect", "commit-error-mark-lane")); err != nil {
+			t.Fatal(err)
+		}
+		claimed, err := store.ClaimOutbox(context.Background(), OutboxClaimRequest{WorkerID: "worker"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		const callbackName = "task5_test_rollback_mark_outbox"
+		if err := db.GORM().Callback().Update().After("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table == tableOutboxEffects {
+				tx.Rollback()
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := store.MarkOutboxDispatched(context.Background(), OutboxDispatchRequest{EffectID: claimed.Effect.EffectID, WorkerID: claimed.Effect.LeaseOwner, LeaseEpoch: claimed.Effect.LeaseEpoch, AttemptID: claimed.Effect.AttemptID})
+		_ = db.GORM().Callback().Update().Remove(callbackName)
+		if err == nil || !reflect.DeepEqual(lease, OutboxLease{}) {
+			t.Fatalf("mark outbox commit error lease=%#v err=%v", lease, err)
+		}
+	}
+}
+
 
 func TestInboxConcurrentAcceptanceAllocatesUniqueSequences(t *testing.T) {
 	store, db, _ := task5Store(t)

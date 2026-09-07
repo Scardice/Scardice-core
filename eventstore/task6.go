@@ -1256,11 +1256,6 @@ func (s *GORMStore) rotateSecretRows(ctx context.Context, root EncryptionRoot) (
 			if row.EncryptionKeyID == root.ID {
 				continue
 			}
-			rowVersion, versionErr := nextVersion(row.RowVersion)
-			if versionErr != nil {
-				err = versionErr
-				return
-			}
 			plain, openErr := a6Open(ctx, s.keySource, "adapter-secret/v1", row.SecretRef, row.EndpointID+"/"+row.AdapterID, row.SecretVersion, row.EncryptionKeyID, row.Ciphertext, row.Nonce)
 			if openErr != nil {
 				err = openErr
@@ -1271,7 +1266,7 @@ func (s *GORMStore) rotateSecretRows(ctx context.Context, root EncryptionRoot) (
 				err = sealErr
 				return
 			}
-			q = s.db.GORM().WithContext(ctx).Model(&adapterSecretRow{}).Where("secret_ref = ? AND secret_version = ? AND row_version = ? AND encryption_key_id = ?", row.SecretRef, row.SecretVersion, row.RowVersion, row.EncryptionKeyID).Updates(map[string]any{"ciphertext": ciphertext, "nonce": nonce, "encryption_key_id": keyID, "row_version": rowVersion, "updated_at": s.task5Now()})
+			q = s.db.GORM().WithContext(ctx).Model(&adapterSecretRow{}).Where("secret_ref = ? AND secret_version = ? AND row_version = ? AND encryption_key_id = ?", row.SecretRef, row.SecretVersion, row.RowVersion, row.EncryptionKeyID).Updates(map[string]any{"ciphertext": ciphertext, "nonce": nonce, "encryption_key_id": keyID, "updated_at": s.task5Now()})
 			if q.Error != nil {
 				err = ErrParticipantFailure
 				return
@@ -1531,22 +1526,17 @@ func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRo
 				err = openErr
 				return
 			}
-			newVersion, versionErr := nextVersion(row.RowVersion)
-			if versionErr != nil {
-				err = versionErr
-				return
-			}
-			keyCipher, keyNonce, keyID, sealErr := a6SealWithRoot(root, "plugin-kv-key/v1", string(row.KeyHMAC), row.ExtensionID, newVersion, key)
+			keyCipher, keyNonce, keyID, sealErr := a6SealWithRoot(root, "plugin-kv-key/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, key)
 			if sealErr != nil {
 				err = sealErr
 				return
 			}
-			valueCipher, valueNonce, valueKeyID, sealErr := a6SealWithRoot(root, "plugin-kv-value/v1", string(row.KeyHMAC), row.ExtensionID, newVersion, value)
+			valueCipher, valueNonce, valueKeyID, sealErr := a6SealWithRoot(root, "plugin-kv-value/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, value)
 			if sealErr != nil || valueKeyID != keyID {
 				err = ErrEncryptionUnavailable
 				return
 			}
-			q = base.Model(&pluginKVRow{}).Where("extension_id = ? AND key_hmac = ? AND row_version = ? AND encryption_key_id = ?", row.ExtensionID, row.KeyHMAC, row.RowVersion, row.EncryptionKeyID).Updates(map[string]any{"encrypted_key": keyCipher, "key_nonce": keyNonce, "encrypted_value": valueCipher, "value_nonce": valueNonce, "encryption_key_id": keyID, "row_version": newVersion, "updated_at": s.task5Now()})
+			q = base.Model(&pluginKVRow{}).Where("extension_id = ? AND key_hmac = ? AND row_version = ? AND encryption_key_id = ?", row.ExtensionID, row.KeyHMAC, row.RowVersion, row.EncryptionKeyID).Updates(map[string]any{"encrypted_key": keyCipher, "key_nonce": keyNonce, "encrypted_value": valueCipher, "value_nonce": valueNonce, "encryption_key_id": keyID, "updated_at": s.task5Now()})
 			if q.Error != nil {
 				err = ErrParticipantFailure
 				return

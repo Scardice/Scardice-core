@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+	"sync"
 	"time"
 )
 
@@ -127,6 +129,46 @@ func TestReadinessRequiresCurrentEncryptionRoot(t *testing.T) {
 		t.Fatalf("empty encryption roots err=%v", err)
 	}
 }
+func TestReadinessMutationSerialization(t *testing.T) {
+	store, db, _ := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	readiness := Readiness{
+		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: "index-v1",
+		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
+		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+	}
+	if err := store.SetReadiness(ctx, readiness); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	errs := make(chan error, 8)
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		extensionID := fmt.Sprintf("serialized-ext-%d", i)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := store.SetPluginKV(ctx, PluginKVPutRequest{ExtensionID: extensionID, Key: "key", Value: []byte("value")})
+			errs <- err
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- store.SetReadiness(ctx, readiness)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent readiness/mutation error: %v", err)
+		}
+	}
+}
+
 
 func TestPublicA6OperationRevalidatesReadiness(t *testing.T) {
 	store, db, _ := task6Store(t)
@@ -212,6 +254,10 @@ func TestRotationReencryptsSecretAndPlugin(t *testing.T) {
 	ctx := context.Background()
 	if _, err := store.PutSecret(ctx, SecretPutRequest{SecretRef: "rotate-secret", EndpointID: "endpoint", AdapterID: "adapter", Plaintext: []byte("secret")}); err != nil { t.Fatal(err) }
 	if _, err := store.SetPluginKV(ctx, PluginKVPutRequest{ExtensionID: "rotate-ext", Key: "key", Value: []byte("value")}); err != nil { t.Fatal(err) }
+	var beforeSecret adapterSecretRow
+	if err := db.GORM().Where("secret_ref = ?", "rotate-secret").First(&beforeSecret).Error; err != nil { t.Fatal(err) }
+	var beforePlugin pluginKVRow
+	if err := db.GORM().Where("extension_id = ?", "rotate-ext").First(&beforePlugin).Error; err != nil { t.Fatal(err) }
 	source.Roots["root-v2"] = []byte("12345678901234567890123456789012")
 	if err := store.SetReadiness(ctx, Readiness{Mode: "import", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: "index-v1", EncryptionRootIDs: []string{"root-v1", "root-v2"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), TerminalGlobalPosition: 0, TerminalProjectionPosition: 0, CompletedAt: time.Unix(1, 0).UTC()}); err != nil { t.Fatal(err) }
 	source.IndexMaterial[0] ^= 0xff
@@ -221,6 +267,16 @@ func TestRotationReencryptsSecretAndPlugin(t *testing.T) {
 	result, err := store.RotateEncryptionRoots(ctx)
 	if err != nil { t.Fatal(err) }
 	if result.Updated < 2 || result.CurrentRootID != "root-v2" { t.Fatalf("rotation result=%#v", result) }
+	var afterSecret adapterSecretRow
+	if err := db.GORM().Where("secret_ref = ?", "rotate-secret").First(&afterSecret).Error; err != nil { t.Fatal(err) }
+	var afterPlugin pluginKVRow
+	if err := db.GORM().Where("extension_id = ?", "rotate-ext").First(&afterPlugin).Error; err != nil { t.Fatal(err) }
+	if afterSecret.RowVersion != beforeSecret.RowVersion || afterSecret.SecretVersion != beforeSecret.SecretVersion || afterSecret.EncryptionKeyID != "root-v2" {
+		t.Fatalf("rotation changed secret logical version: before=%#v after=%#v", beforeSecret, afterSecret)
+	}
+	if afterPlugin.RowVersion != beforePlugin.RowVersion || afterPlugin.EncryptionKeyID != "root-v2" {
+		t.Fatalf("rotation changed plugin logical version: before=%#v after=%#v", beforePlugin, afterPlugin)
+	}
 	if got, err := store.ResolveSecret(ctx, "rotate-secret", 0); err != nil || string(got.Plaintext) != "secret" { t.Fatalf("rotated secret=%q err=%v", got.Plaintext, err) }
 	if got, err := store.GetPluginKV(ctx, "rotate-ext", "key"); err != nil || string(got.Value) != "value" { t.Fatalf("rotated plugin=%q err=%v", got.Value, err) }
 }
@@ -426,6 +482,103 @@ func TestA6ClaimRejectsTamperedPayloadBeforeLease(t *testing.T) {
 	}
 	if inbox.Status != InboxStatusPending || inbox.Version != 1 {
 		t.Fatalf("tampered inbox mutated row=%#v", inbox)
+	}
+}
+
+func TestA6ClaimsCommitExpiredScrubBeforeAuthFailure(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	expiredAt := now.Add(-time.Minute)
+	futureAt := now.Add(time.Hour)
+	expiredInboxCipher, expiredInboxNonce, keyID, err := a6Seal(ctx, source, "inbox/v1", "expired-inbox", "endpoint", 1, []byte("expired"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateInboxCipher, candidateInboxNonce, _, err := a6Seal(ctx, source, "inbox/v1", "candidate-inbox", "endpoint", 1, []byte("candidate"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateInboxCipher[0] ^= 1
+	inboxRows := []inboxMessageRow{
+		{InboxID: "blocked-inbox", EndpointID: "endpoint", ProviderEventKey: "blocked-provider", LaneHMAC: []byte("blocked-lane"), OrderingSequence: 1, Status: InboxStatusCallbackStarted, Version: 1, PayloadVersion: 1},
+		{InboxID: "expired-inbox", EndpointID: "endpoint", ProviderEventKey: "expired-provider", LaneHMAC: []byte("blocked-lane"), OrderingSequence: 2, Status: InboxStatusPending, Version: 1, PayloadVersion: 1, PayloadCiphertext: expiredInboxCipher, PayloadNonce: expiredInboxNonce, EncryptionKeyID: keyID, PayloadExpiresAt: &expiredAt},
+		{InboxID: "candidate-inbox", EndpointID: "endpoint", ProviderEventKey: "candidate-provider", LaneHMAC: []byte("candidate-lane"), OrderingSequence: 1, Status: InboxStatusPending, Version: 1, PayloadVersion: 1, PayloadCiphertext: candidateInboxCipher, PayloadNonce: candidateInboxNonce, EncryptionKeyID: keyID, PayloadExpiresAt: &futureAt},
+	}
+	if err := db.GORM().Create(&inboxRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "worker"}); !errors.Is(err, ErrAuthenticationFailed) {
+		t.Fatalf("tampered inbox claim err=%v", err)
+	}
+	var expiredInbox inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", "expired-inbox").First(&expiredInbox).Error; err != nil {
+		t.Fatal(err)
+	}
+	if expiredInbox.Version != 2 || len(expiredInbox.PayloadCiphertext) != 0 || len(expiredInbox.PayloadNonce) != 0 {
+		t.Fatalf("expired inbox scrub was rolled back: %#v", expiredInbox)
+	}
+
+	expiredOutboxCipher, expiredOutboxNonce, outboxKeyID, err := a6Seal(ctx, source, "outbox/v1", "expired-effect", "endpoint", 1, []byte("expired"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateOutboxCipher, candidateOutboxNonce, _, err := a6Seal(ctx, source, "outbox/v1", "candidate-effect", "endpoint", 1, []byte("candidate"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateOutboxCipher[0] ^= 1
+	outboxRows := []outboxEffectRow{
+		{EffectID: "blocked-effect", EndpointID: "endpoint", LaneHMAC: []byte("blocked-outbox-lane"), OrderingSequence: 1, EffectClass: "send", RiskClass: RiskPreDispatchRetryable, Status: OutboxStatusAmbiguous, Version: 1, PayloadVersion: 1},
+		{EffectID: "expired-effect", EndpointID: "endpoint", LaneHMAC: []byte("blocked-outbox-lane"), OrderingSequence: 2, EffectClass: "send", RiskClass: RiskPreDispatchRetryable, Status: OutboxStatusPending, Version: 1, PayloadVersion: 1, PayloadCiphertext: expiredOutboxCipher, PayloadNonce: expiredOutboxNonce, EncryptionKeyID: outboxKeyID, PayloadExpiresAt: &expiredAt},
+		{EffectID: "candidate-effect", EndpointID: "endpoint", LaneHMAC: []byte("candidate-outbox-lane"), OrderingSequence: 1, EffectClass: "send", RiskClass: RiskPreDispatchRetryable, Status: OutboxStatusPending, Version: 1, PayloadVersion: 1, PayloadCiphertext: candidateOutboxCipher, PayloadNonce: candidateOutboxNonce, EncryptionKeyID: outboxKeyID, PayloadExpiresAt: &futureAt},
+	}
+	if err := db.GORM().Create(&outboxRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "worker"}); !errors.Is(err, ErrAuthenticationFailed) {
+		t.Fatalf("tampered outbox claim err=%v", err)
+	}
+	var expiredOutbox outboxEffectRow
+	if err := db.GORM().Where("effect_id = ?", "expired-effect").First(&expiredOutbox).Error; err != nil {
+		t.Fatal(err)
+	}
+	if expiredOutbox.Version != 2 || len(expiredOutbox.PayloadCiphertext) != 0 || len(expiredOutbox.PayloadNonce) != 0 {
+		t.Fatalf("expired outbox scrub was rolled back: %#v", expiredOutbox)
+	}
+}
+
+func TestA6PluginUoWResealedUpdateRoundtrip(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := store.SetPluginKV(ctx, PluginKVPutRequest{ExtensionID: "uow-ext", Key: "key", Value: []byte("value")}); err != nil {
+		t.Fatal(err)
+	}
+	var row pluginKVRow
+	if err := db.GORM().Where("extension_id = ?", "uow-ext").First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	keyCipher, keyNonce, keyID, err := a6Seal(ctx, source, "plugin-kv-key/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion+1, []byte("key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	valueCipher, valueNonce, valueKeyID, err := a6Seal(ctx, source, "plugin-kv-value/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion+1, []byte("value"))
+	if err != nil || valueKeyID != keyID {
+		t.Fatalf("value seal err=%v key=%q", err, valueKeyID)
+	}
+	result, err := store.Commit(ctx, UnitOfWork{PluginKVUpdates: []PluginKVUpdate{{
+		ExtensionID: "uow-ext", KeyHMAC: row.KeyHMAC, ExpectedVersion: row.RowVersion, Version: row.RowVersion + 1,
+		KeyCiphertext: keyCipher, KeyNonce: keyNonce, ValueCiphertext: valueCipher, ValueNonce: valueNonce,
+		ValueSize: 5, EncryptionKeyID: keyID,
+	}}})
+	if err != nil || len(result.PluginKVIndexes) != 1 {
+		t.Fatalf("encrypted PluginKV UoW update result=%#v err=%v", result, err)
+	}
+	item, err := store.GetPluginKV(ctx, "uow-ext", "key")
+	if err != nil || string(item.Value) != "value" || item.Version != row.RowVersion+1 {
+		t.Fatalf("encrypted PluginKV UoW roundtrip item=%#v err=%v", item, err)
 	}
 }
 
