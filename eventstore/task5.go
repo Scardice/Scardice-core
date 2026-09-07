@@ -793,7 +793,7 @@ func (s *GORMStore) resolveInboxTx(ctx context.Context, req InboxResolutionReque
 		return CommitResult{}, errors.New("eventstore: load inbox failed")
 	}
 	now := s.task5Now()
-	if inboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
+	if (row.Status == InboxStatusPending || row.Status == InboxStatusLeased) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
 		if err = task5ScrubInbox(tx, &row, now, false); err != nil {
 			return CommitResult{}, err
 		}

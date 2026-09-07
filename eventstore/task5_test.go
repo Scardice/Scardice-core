@@ -824,6 +824,18 @@ func TestInboxCallbackExpiryScrubsWithoutUnblockingRetry(t *testing.T) {
 	if row.Status != InboxStatusCallbackStarted || len(row.PayloadCiphertext) != 0 || len(row.PayloadNonce) != 0 {
 		t.Fatalf("callback expiry row = %#v", row)
 	}
+	if _, err := store.ResolveInbox(context.Background(), InboxResolutionRequest{
+		InboxID: row.InboxID, ExpectedVersion: row.Version, Resolution: InboxResolutionSkip,
+		PrincipalID: "operator", Reason: "callback expired",
+	}); err != nil {
+		t.Fatalf("callback expiry resolve err = %v", err)
+	}
+	if err := db.GORM().Where("inbox_id = ?", row.InboxID).First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != InboxStatusSkipped {
+		t.Fatalf("callback expiry resolved status = %q", row.Status)
+	}
 }
 
 func TestOutboxDispatchedExpiryScrubsBeforeAmbiguity(t *testing.T) {
