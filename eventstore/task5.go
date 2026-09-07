@@ -460,8 +460,12 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 	if q.Error == nil {
 		if inboxUnresolved(existing.Status) && existing.PayloadExpiresAt != nil && !existing.PayloadExpiresAt.After(now) {
 			if update.AllowExpiredDedupe {
-				if deleteErr := tx.Where("inbox_id = ? AND version = ?", existing.InboxID, existing.Version).Delete(&inboxMessageRow{}).Error; deleteErr != nil {
-					return CommitResult{}, deleteErr
+				deleteResult := tx.Where("inbox_id = ? AND version = ?", existing.InboxID, existing.Version).Delete(&inboxMessageRow{})
+				if deleteResult.Error != nil {
+					return CommitResult{}, deleteResult.Error
+				}
+				if deleteResult.RowsAffected != 1 {
+					return CommitResult{}, ErrConflict
 				}
 				goto insertExpiredReplacement
 			}

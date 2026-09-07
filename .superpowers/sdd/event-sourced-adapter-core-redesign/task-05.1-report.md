@@ -106,3 +106,5 @@ ok   Scardice-core/eventstore
 ```
 
 No formatter, linter, or project-wide test suite was run for the fixes. Prior Slice02–04 source/test files are present as untracked shared-worktree dependencies; the fix commit stages only direct Task1 files plus the focused runtime/TTL test files and the directly modified eventstore ingress contracts.
+
+The post-TTL replacement path also checks the delete row count and returns `ErrConflict` if the locked expired identity disappeared concurrently; no silent duplicate admission occurs.
