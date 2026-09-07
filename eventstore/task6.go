@@ -1,7 +1,9 @@
 package eventstore
 
 import (
+	"bytes"
 	"context"
+	"slices"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -442,7 +444,7 @@ func (s *GORMStore) validateReadinessOnDB(ctx context.Context, db *gorm.DB, allo
 	if err != nil {
 		return ErrReadinessQuarantined
 	}
-	if r.IndexRootID == "unconfigured" || !allowFreshNonempty && !s.freshWasInitialized() && r.Mode == "fresh" && nonempty {
+	if r.IndexRootID == "unconfigured" || !allowFreshNonempty && r.Mode == "fresh" && nonempty && !s.freshWasInitialized(r) {
 		return ErrReadinessQuarantined
 	}
 	var control projectionControlRow
@@ -979,28 +981,50 @@ func (s *GORMStore) initializeA6Readiness(ctx context.Context) error {
 		}); err != nil {
 			return err
 		}
-		s.markFreshInitialized()
-		return nil
 	}
 	return s.ValidateReadiness(ctx)
 }
-func (s *GORMStore) markFreshInitialized() {
+func (s *GORMStore) markFreshInitialized(r Readiness) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	s.freshInitialized = true
+	s.freshBaseline = Readiness{
+		Mode: r.Mode, SchemaVersion: r.SchemaVersion, DatabaseIdentity: r.DatabaseIdentity,
+		IndexRootID: r.IndexRootID, IndexRootFingerprint: append([]byte(nil), r.IndexRootFingerprint...),
+		EncryptionRootIDs: append([]string(nil), r.EncryptionRootIDs...),
+	}
+	s.freshBaselineSet = true
 	s.mu.Unlock()
 }
 
-func (s *GORMStore) freshWasInitialized() bool {
+func (s *GORMStore) clearFreshInitialized() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.freshInitialized = false
+	s.freshBaseline = Readiness{}
+	s.freshBaselineSet = false
+	s.mu.Unlock()
+}
+
+func (s *GORMStore) freshWasInitialized(r Readiness) bool {
 	if s == nil {
 		return false
 	}
 	s.mu.RLock()
-	initialized := s.freshInitialized
+	initialized, baseline := s.freshInitialized, s.freshBaseline
+	baselineSet := s.freshBaselineSet
 	s.mu.RUnlock()
-	return initialized
+	if !initialized || !baselineSet || baseline.Mode != r.Mode || baseline.SchemaVersion != r.SchemaVersion ||
+		baseline.DatabaseIdentity != r.DatabaseIdentity || baseline.IndexRootID != r.IndexRootID ||
+		!bytes.Equal(baseline.IndexRootFingerprint, r.IndexRootFingerprint) ||
+		!slices.Equal(baseline.EncryptionRootIDs, r.EncryptionRootIDs) {
+		return false
+	}
+	return true
 }
 func (s *GORMStore) requireReady(ctx context.Context) error {
 	if s == nil {
@@ -1112,10 +1136,6 @@ func (s *GORMStore) SetReadiness(ctx context.Context, r Readiness) error {
 	if refs, refErr := readinessRootReferences(ctx, tx); refErr != nil {
 		return ErrParticipantFailure
 	} else {
-		requested := make(map[string]struct{}, len(r.EncryptionRootIDs))
-		for _, rootID := range r.EncryptionRootIDs {
-			requested[rootID] = struct{}{}
-		}
 		for rootID := range refs {
 			if _, ok := requested[rootID]; !ok {
 				return ErrReadinessQuarantined
@@ -1140,7 +1160,9 @@ func (s *GORMStore) SetReadiness(ctx context.Context, r Readiness) error {
 		return ErrReadinessInvalid
 	}
 	if r.Mode == "fresh" {
-		s.markFreshInitialized()
+		s.markFreshInitialized(r)
+	} else {
+		s.clearFreshInitialized()
 	}
 	s.clearInitializationError()
 	return nil

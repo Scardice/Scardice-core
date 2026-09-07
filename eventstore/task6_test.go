@@ -688,18 +688,27 @@ func TestRotationReencryptsSecretAndPlugin(t *testing.T) {
 	if got, err := store.ResolveSecret(ctx, "rotate-secret", 0); err != nil || string(got.Plaintext) != "secret" { t.Fatalf("rotated secret=%q err=%v", got.Plaintext, err) }
 	if got, err := store.GetPluginKV(ctx, "rotate-ext", "key"); err != nil || string(got.Value) != "value" { t.Fatalf("rotated plugin=%q err=%v", got.Value, err) }
 }
-func TestReadinessRejectsNonEmptyFresh(t *testing.T) {
-	store, db, _ := task6Store(t)
+func TestReadinessRejectsTamperedValidFreshMode(t *testing.T) {
+	store, db, source := task6Store(t)
 	defer db.Close()
 	event := NewEvent{EventType: "task6.event", SchemaVersion: 1, Payload: []byte(`{}`), Metadata: Metadata{EventID: "event-1", CommandID: "command-1", CorrelationID: "correlation-1", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}}
 	if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{AggregateType: "task6", AggregateID: "1"}, Events: []NewEvent{event}}}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ValidateReadiness(context.Background()); !errors.Is(err, ErrReadinessQuarantined) {
-		t.Fatalf("unconfigured nonempty readiness err=%v", err)
+	var existing storeReadinessRow
+	if err := db.GORM().Where("singleton_id = ?", "default").First(&existing).Error; err != nil {
+		t.Fatal(err)
 	}
-	if err := store.SetReadiness(context.Background(), Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: "index-v1"}); !errors.Is(err, ErrReadinessQuarantined) {
-		t.Fatalf("fresh nonempty readiness err=%v", err)
+	if err := db.GORM().Model(&storeReadinessRow{}).Where("singleton_id = ?", "default").Updates(map[string]any{
+		"mode": "fresh", "schema_version": "1", "database_identity": "db-1", "index_root_id": source.IndexID,
+		"index_root_fingerprint": existing.IndexRootFingerprint, "encryption_root_ids": existing.EncryptionRootIDs,
+		"source_manifest_digest": nil, "target_manifest_digest": nil, "terminal_global_position": 0,
+		"terminal_projection_position": 0, "completed_at": nil,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ValidateReadiness(context.Background()); !errors.Is(err, ErrReadinessQuarantined) {
+		t.Fatalf("tampered valid fresh readiness err=%v", err)
 	}
 }
 func TestA6StartupReadinessGate(t *testing.T) {

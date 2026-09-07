@@ -408,6 +408,7 @@ func TestOutboxNonIdempotentDispatchExpiryBecomesAmbiguous(t *testing.T) {
 	defer db.Close()
 	effect := task5Effect("ambiguous-effect", "ambiguous-lane")
 	effect.RiskClass = RiskNonIdempotentAfterDispatch
+	effect.PayloadExpiresAt = clock.Now().Add(time.Minute)
 	if _, err := store.AcceptOutbox(context.Background(), effect); err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +421,7 @@ func TestOutboxNonIdempotentDispatchExpiryBecomesAmbiguous(t *testing.T) {
 		t.Fatal(err)
 	}
 	clock.Advance(2 * time.Minute)
-	if _, err := store.ClaimOutbox(context.Background(), OutboxClaimRequest{WorkerID: "other", LeaseDuration: time.Minute}); !errors.Is(err, ErrNotFound) {
+	if _, err := store.ClaimOutbox(context.Background(), OutboxClaimRequest{WorkerID: "other", LeaseDuration: time.Minute}); !errors.Is(err, ErrPayloadExpired) {
 		t.Fatalf("ambiguous claim err = %v", err)
 	}
 	var row outboxEffectRow

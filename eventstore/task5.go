@@ -1448,7 +1448,7 @@ func (s *GORMStore) CompleteOutbox(ctx context.Context, req OutboxCompletionRequ
 		return CommitResult{}, ErrInvalidTransition
 	}
 	now := s.task5Now()
-	if outboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
+	if row.Status != OutboxStatusAmbiguous && outboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
 		if err = task5ScrubOutbox(tx, &row, now); err != nil {
 			return CommitResult{}, err
 		}
@@ -1536,7 +1536,7 @@ func (s *GORMStore) ResolveOutbox(ctx context.Context, req OutboxResolutionReque
 		return CommitResult{}, errors.New("eventstore: load outbox failed")
 	}
 	now := s.task5Now()
-	if outboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
+	if row.Status != OutboxStatusAmbiguous && outboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
 		if err = task5ScrubOutbox(tx, &row, now); err != nil {
 			return CommitResult{}, err
 		}

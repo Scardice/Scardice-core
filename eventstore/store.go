@@ -110,6 +110,8 @@ type GORMStore struct {
 	codec any
 	keySource KeySource
 	freshInitialized bool
+	freshBaseline Readiness
+	freshBaselineSet bool
 }
 func NewStore(database *Database, options ...StoreOption) *GORMStore {
 	s := &GORMStore{db: database, clock: SystemClock{}, ids: UUIDGenerator{}}
