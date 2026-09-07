@@ -2,6 +2,7 @@ package main
 
 // _ "net/http/pprof"
 import (
+	"context"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -27,10 +28,12 @@ import (
 	"github.com/labstack/echo/v4/middleware"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-
 	"Scardice-core/api"
 	"Scardice-core/dice"
 	"Scardice-core/dice/service"
+	"Scardice-core/endpoint"
+	"Scardice-core/core/messageflow"
+	"Scardice-core/eventstore"
 	"Scardice-core/logger"
 	v2 "Scardice-core/migrate/v2"
 	"Scardice-core/static"
@@ -528,7 +531,15 @@ func main() {
 
 	go dice.TryGetBackendURL()
 
-	cleanUp := cleanupCreate(diceManager, pprofStop)
+	var endpointBootstrap *endpoint.Bootstrap
+	cleanUp := cleanupCreate(diceManager, func() {
+		pprofStop()
+		if endpointBootstrap != nil {
+			if err := endpointBootstrap.Shutdown(context.Background()); err != nil {
+				logger.M().Errorf("endpoint bootstrap shutdown failed: %v", err)
+			}
+		}
+	})
 	defer dice.CrashLog()
 	defer cleanUp()
 
@@ -539,7 +550,52 @@ func main() {
 	if opts.JustForTest {
 		diceManager.JustForTest = true
 	}
-
+	var coreDice *dice.Dice
+	if len(diceManager.Dice) > 0 {
+		coreDice = diceManager.Dice[0]
+	}
+	endpointDBConfig, endpointConfigErr := endpointDatabaseConfigFromEnv(os.Getenv)
+	if endpointConfigErr != nil {
+		log.Errorf("endpoint event database configuration failed: %v", endpointConfigErr)
+		return
+	}
+	if endpointDBConfig.DSN != "" {
+		if coreDice == nil || coreDice.ImSession == nil {
+			log.Errorf("endpoint event database requires an initialized Core session")
+			return
+		}
+		eventDB, openErr := eventstore.OpenDatabase(context.Background(), endpointDBConfig)
+		if openErr != nil {
+			log.Errorf("endpoint event database startup failed: %v", openErr)
+			return
+		}
+		store := eventstore.NewStore(eventDB)
+		inboundService, inboundErr := messageflow.NewInboundService(store, store)
+		if inboundErr != nil {
+			_ = eventDB.Close()
+			log.Errorf("endpoint inbound service construction failed: %v", inboundErr)
+			return
+		}
+		endpointBootstrap, openErr = endpoint.NewBootstrap(store, nil, dice.NewOnebotDescriptor())
+		if openErr != nil {
+			_ = eventDB.Close()
+			log.Errorf("endpoint bootstrap construction failed: %v", openErr)
+			return
+		}
+		if openErr = endpointBootstrap.SetInboundSink(inboundService); openErr != nil {
+			log.Errorf("endpoint inbound bridge setup failed: %v", openErr)
+			return
+		}
+		api.RegisterEndpointBootstrap(endpointBootstrap)
+		if _, openErr = endpointBootstrap.Startup(context.Background()); openErr != nil {
+			log.Errorf("endpoint bootstrap replay/reconcile failed: %v", openErr)
+			return
+		}
+	} else {
+		// No event-store configuration means pure OneBot remains stopped; the
+		// legacy data DB is never treated as an authoritative fallback.
+		api.RegisterEndpointService(nil)
+	}
 	go func() {
 		// 每5分钟做一次新版本检查
 		for {
@@ -675,8 +731,9 @@ func diceServe(d *dice.Dice) {
 						}
 						return
 					}
+					// Pure OneBot is restored from endpoint aggregate state and started
+					// only by EndpointLifecycle/Supervisor composition.
 					if conn.ProtocolType == "pureonebot" {
-						dice.ServePureOnebot(d, conn)
 						return
 					}
 					time.Sleep(10 * time.Second) // 稍作等待再连接

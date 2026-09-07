@@ -265,6 +265,22 @@ func a6HMAC(ctx context.Context, source KeySource, domain string, parts ...strin
 	}
 	return h.Sum(nil), nil
 }
+// KeyedDigest computes an index-root HMAC inside the store's admitted
+// security boundary. Callers receive only the digest and non-secret key ID.
+func (s *GORMStore) KeyedDigest(ctx context.Context, domain string, parts ...string) ([]byte, string, error) {
+	if s.keySource == nil {
+		return nil, "", ErrKeySourceUnavailable
+	}
+	keyID, err := s.keySource.IndexRootID(ctx)
+	if err != nil || keyID == "" {
+		return nil, "", ErrKeySourceUnavailable
+	}
+	digest, err := a6HMAC(ctx, s.keySource, domain, parts...)
+	if err != nil {
+		return nil, "", err
+	}
+	return digest, keyID, nil
+}
 func (s *GORMStore) validatePluginKeyIndex(ctx context.Context, extension string, index, plaintext []byte) error {
 	expected, err := a6HMAC(ctx, s.keySource, "plugin-key-index/v1", extension, string(plaintext))
 	if err != nil {
