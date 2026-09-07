@@ -1163,6 +1163,35 @@ func TestA6UOWExpiredRowsPrecedePayloadAuthentication(t *testing.T) {
 	}
 }
 
+func TestA6MixedUOWExpiryScrubsExplicitAndDedupeRows(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	expiredAt := time.Now().UTC().Add(-time.Minute)
+	rows := []inboxMessageRow{
+		{InboxID: "mixed-explicit", EndpointID: "endpoint", ProviderEventKey: "explicit-provider", LaneHMAC: []byte("mixed-lane-a"), OrderingSequence: 1, Status: InboxStatusPending, Version: 1, PayloadVersion: 1, PayloadCiphertext: []byte{1}, PayloadNonce: make([]byte, 12), EncryptionKeyID: source.CurrentID, PayloadExpiresAt: &expiredAt},
+		{InboxID: "mixed-dedupe", EndpointID: "endpoint", ProviderEventKey: "dedupe-provider", LaneHMAC: []byte("mixed-lane-b"), OrderingSequence: 1, Status: InboxStatusPending, Version: 1, PayloadVersion: 1, PayloadCiphertext: []byte{1}, PayloadNonce: make([]byte, 12), EncryptionKeyID: source.CurrentID, PayloadExpiresAt: &expiredAt},
+	}
+	if err := db.GORM().Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	work := UnitOfWork{InboxUpdates: []InboxUpdate{
+		{InboxID: rows[0].InboxID, EndpointID: rows[0].EndpointID, ProviderEventKey: rows[0].ProviderEventKey, PayloadCiphertext: []byte{2}, PayloadNonce: make([]byte, 12), PayloadEncryptionKeyID: source.CurrentID},
+		{InboxID: "mixed-new-id", EndpointID: rows[1].EndpointID, ProviderEventKey: rows[1].ProviderEventKey, PayloadCiphertext: []byte{2}, PayloadNonce: make([]byte, 12), PayloadEncryptionKeyID: source.CurrentID},
+	}}
+	if _, err := store.Commit(ctx, work); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("mixed UoW expiry err=%v", err)
+	}
+	for i := range rows {
+		if err := db.GORM().Where("inbox_id = ?", rows[i].InboxID).First(&rows[i]).Error; err != nil {
+			t.Fatal(err)
+		}
+		if rows[i].Version != 2 || len(rows[i].PayloadCiphertext) != 0 || len(rows[i].PayloadNonce) != 0 {
+			t.Fatalf("mixed UoW row not scrubbed: %#v", rows[i])
+		}
+	}
+}
+
 func itemKeyHMAC(t *testing.T, source KeySource, extension, key string) []byte {
 	t.Helper()
 	index, err := a6HMAC(context.Background(), source, "plugin-key-index/v1", extension, key)

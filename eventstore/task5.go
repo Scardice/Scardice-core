@@ -1802,6 +1802,20 @@ func (s *GORMStore) task5PersistExpiredPayloads(ctx context.Context, work UnitOf
 	for _, update := range work.InboxUpdates {
 		inboxIDs = append(inboxIDs, update.InboxID)
 	}
+	for _, update := range work.InboxUpdates {
+		if update.EndpointID == "" || update.ProviderEventKey == "" {
+			continue
+		}
+		var dedupe inboxMessageRow
+		q := locked(tx).Where("endpoint_id = ? AND provider_event_id = ?", update.EndpointID, update.ProviderEventKey).First(&dedupe)
+		if errors.Is(q.Error, gorm.ErrRecordNotFound) {
+			continue
+		}
+		if q.Error != nil {
+			return ErrParticipantFailure
+		}
+		inboxIDs = append(inboxIDs, dedupe.InboxID)
+	}
 	sort.Strings(inboxIDs)
 	for _, id := range inboxIDs {
 		var row inboxMessageRow

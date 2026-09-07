@@ -548,14 +548,25 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 	}
 	now := s.task5Now()
 	for _, update := range work.InboxUpdates {
-		if update.InboxID == "" {
+		if update.InboxID != "" {
+			var row inboxMessageRow
+			query := locked(db).Where("inbox_id = ?", update.InboxID).First(&row)
+			if query.Error == nil {
+				if inboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
+					return &task5ExpiredPayloadError{table: tableInboxMessages, id: row.InboxID, now: now}
+				}
+			} else if !errors.Is(query.Error, gorm.ErrRecordNotFound) {
+				return ErrParticipantFailure
+			}
+		}
+		if update.EndpointID == "" || update.ProviderEventKey == "" {
 			continue
 		}
-		var row inboxMessageRow
-		query := locked(db).Where("inbox_id = ?", update.InboxID).First(&row)
+		var dedupe inboxMessageRow
+		query := locked(db).Where("endpoint_id = ? AND provider_event_id = ?", update.EndpointID, update.ProviderEventKey).First(&dedupe)
 		if query.Error == nil {
-			if inboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
-				return &task5ExpiredPayloadError{table: tableInboxMessages, id: row.InboxID, now: now}
+			if inboxUnresolved(dedupe.Status) && dedupe.PayloadExpiresAt != nil && !dedupe.PayloadExpiresAt.After(now) {
+				return &task5ExpiredPayloadError{table: tableInboxMessages, id: dedupe.InboxID, now: now}
 			}
 		} else if !errors.Is(query.Error, gorm.ErrRecordNotFound) {
 			return ErrParticipantFailure
