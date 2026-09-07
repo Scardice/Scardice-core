@@ -849,6 +849,7 @@ func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRo
 	var artifacts []operationArtifactRow
 	if err = s.db.GORM().WithContext(ctx).Where("ciphertext IS NOT NULL AND length(ciphertext) > 0").Find(&artifacts).Error; err != nil { return }
 	for _, row := range artifacts {
+		if row.EncryptionKeyID == root.ID { continue }
 		plain, e := a6Open(ctx, s.keySource, "artifact/v1", row.ArtifactID, row.OwnerPrincipalID, row.Version, row.EncryptionKeyID, row.Ciphertext, row.Nonce); if e != nil { err = e; return }
 		ciphertext, nonce, keyID, e := a6SealWithRoot(root, "artifact/v1", row.ArtifactID, row.OwnerPrincipalID, row.Version, plain); if e != nil { err = e; return }
 		q := s.db.GORM().WithContext(ctx).Model(&operationArtifactRow{}).Where("artifact_id = ? AND version = ? AND encryption_key_id = ?", row.ArtifactID, row.Version, row.EncryptionKeyID).Updates(map[string]any{"ciphertext": ciphertext, "nonce": nonce, "encryption_key_id": keyID}); if q.Error != nil { err = ErrParticipantFailure; return }; if q.RowsAffected == 1 { updated++ } else { skipped++ }
@@ -856,6 +857,7 @@ func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRo
 	var inboxes []inboxMessageRow
 	if err = s.db.GORM().WithContext(ctx).Where("payload_ciphertext IS NOT NULL AND length(payload_ciphertext) > 0").Find(&inboxes).Error; err != nil { return }
 	for _, row := range inboxes {
+		if row.EncryptionKeyID == root.ID { continue }
 		plain, e := a6Open(ctx, s.keySource, "inbox/v1", row.InboxID, row.EndpointID, row.Version, row.EncryptionKeyID, row.PayloadCiphertext, row.PayloadNonce); if e != nil { err = e; return }
 		ciphertext, nonce, keyID, e := a6SealWithRoot(root, "inbox/v1", row.InboxID, row.EndpointID, row.Version, plain); if e != nil { err = e; return }
 		q := s.db.GORM().WithContext(ctx).Model(&inboxMessageRow{}).Where("inbox_id = ? AND version = ? AND encryption_key_id = ?", row.InboxID, row.Version, row.EncryptionKeyID).Updates(map[string]any{"payload_ciphertext": ciphertext, "payload_nonce": nonce, "encryption_key_id": keyID}); if q.Error != nil { err = ErrParticipantFailure; return }; if q.RowsAffected == 1 { updated++ } else { skipped++ }
@@ -863,6 +865,7 @@ func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRo
 	var effects []outboxEffectRow
 	if err = s.db.GORM().WithContext(ctx).Where("payload_ciphertext IS NOT NULL AND length(payload_ciphertext) > 0").Find(&effects).Error; err != nil { return }
 	for _, row := range effects {
+		if row.EncryptionKeyID == root.ID { continue }
 		plain, e := a6Open(ctx, s.keySource, "outbox/v1", row.EffectID, row.EndpointID, row.Version, row.EncryptionKeyID, row.PayloadCiphertext, row.PayloadNonce); if e != nil { err = e; return }
 		ciphertext, nonce, keyID, e := a6SealWithRoot(root, "outbox/v1", row.EffectID, row.EndpointID, row.Version, plain); if e != nil { err = e; return }
 		q := s.db.GORM().WithContext(ctx).Model(&outboxEffectRow{}).Where("effect_id = ? AND version = ? AND encryption_key_id = ?", row.EffectID, row.Version, row.EncryptionKeyID).Updates(map[string]any{"payload_ciphertext": ciphertext, "payload_nonce": nonce, "encryption_key_id": keyID}); if q.Error != nil { err = ErrParticipantFailure; return }; if q.RowsAffected == 1 { updated++ } else { skipped++ }
