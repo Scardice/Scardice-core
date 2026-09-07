@@ -1203,6 +1203,36 @@ func TestA6MixedUOWExpiryScrubsExplicitAndDedupeRows(t *testing.T) {
 	}
 }
 
+func TestA6UOWArtifactDerivesOwnerFromSameUOWOperation(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	artifact, nonce, keyID, err := a6Seal(ctx, source, "artifact/v1", "same-uow-artifact", "same-uow-owner", 1, []byte("artifact"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.Commit(ctx, UnitOfWork{
+		Operations: []OperationUpdate{{OperationID: "same-uow-operation", PrincipalID: "same-uow-owner"}},
+		ArtifactUpdates: []ArtifactUpdate{{
+			ArtifactID: "same-uow-artifact", OperationID: "same-uow-operation", Size: int64(len("artifact")),
+			Ciphertext: artifact, Nonce: nonce, EncryptionKeyID: keyID,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("same-UoW operation/artifact err=%v", err)
+	}
+	if len(result.ArtifactIDs) != 1 || result.ArtifactIDs[0] != "same-uow-artifact" {
+		t.Fatalf("same-UoW artifact result=%#v", result)
+	}
+	var row operationArtifactRow
+	if err := db.GORM().Where("artifact_id = ?", "same-uow-artifact").First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.OwnerPrincipalID != "same-uow-owner" {
+		t.Fatalf("same-UoW artifact owner=%q", row.OwnerPrincipalID)
+	}
+}
+
 func itemKeyHMAC(t *testing.T, source KeySource, extension, key string) []byte {
 	t.Helper()
 	index, err := a6HMAC(context.Background(), source, "plugin-key-index/v1", extension, key)

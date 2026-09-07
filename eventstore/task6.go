@@ -726,7 +726,26 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 			return ErrInvalidMetadata
 		}
 		owner := update.OwnerPrincipalID
-		if owner == "" && update.OperationID != "" {
+		var workOperation *OperationUpdate
+		if update.OperationID != "" {
+			for i := range work.Operations {
+				if work.Operations[i].OperationID == update.OperationID {
+					workOperation = &work.Operations[i]
+					break
+				}
+			}
+		}
+		if workOperation != nil {
+			principal := workOperation.PrincipalID
+			if principal == "" {
+				principal = workOperation.OperationID
+			}
+			if owner == "" {
+				owner = principal
+			} else if owner != principal {
+				return ErrInvalidMetadata
+			}
+		} else if owner == "" && update.OperationID != "" {
 			var operation operationRow
 			ownerErr := db.WithContext(ctx).Select("principal_id").Where("operation_id = ?", update.OperationID).First(&operation).Error
 			if ownerErr == nil {
