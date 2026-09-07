@@ -1405,6 +1405,28 @@ func TestA6MixedInboxArtifactExpiryCompensation(t *testing.T) {
 	}
 }
 
+func TestA6UOWPluginVersionOverflowFailsBeforeAuthentication(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	keyHMAC := itemKeyHMAC(t, source, "plugin-key-index/v1", "overflow-key")
+	now := time.Now().UTC()
+	row := pluginKVRow{
+		ExtensionID: "overflow-extension", KeyHMAC: keyHMAC, EncryptedKey: []byte{1}, KeyNonce: make([]byte, 12),
+		EncryptedValue: []byte{1}, ValueNonce: make([]byte, 12), ValueSize: 1, RowVersion: uint64(^uint64(0) >> 1),
+		EncryptionKeyID: source.CurrentID, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := db.GORM().Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	_, err := store.Commit(context.Background(), UnitOfWork{PluginKVUpdates: []PluginKVUpdate{{
+		ExtensionID: row.ExtensionID, KeyHMAC: row.KeyHMAC, KeyCiphertext: []byte{1}, KeyNonce: make([]byte, 12),
+		ValueCiphertext: []byte{1}, ValueNonce: make([]byte, 12), ValueSize: 1, EncryptionKeyID: source.CurrentID,
+	}}})
+	if !errors.Is(err, ErrVersionExhausted) {
+		t.Fatalf("plugin version overflow err=%v", err)
+	}
+}
+
 func itemKeyHMAC(t *testing.T, source KeySource, extension, key string) []byte {
 	t.Helper()
 	index, err := a6HMAC(context.Background(), source, "plugin-key-index/v1", extension, key)

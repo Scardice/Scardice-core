@@ -912,7 +912,14 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		version := uint64(1)
 		query := db.WithContext(ctx).Where("extension_id = ? AND key_hmac = ?", update.ExtensionID, update.KeyHMAC).First(&existing)
 		if query.Error == nil {
-			version = existing.RowVersion + 1
+			if existing.RowVersion >= uint64(^uint64(0)>>1) {
+				return ErrVersionExhausted
+			}
+			next, nextErr := nextVersion(existing.RowVersion)
+			if nextErr != nil {
+				return nextErr
+			}
+			version = next
 		} else if !errors.Is(query.Error, gorm.ErrRecordNotFound) {
 			return ErrParticipantFailure
 		}
