@@ -350,6 +350,11 @@ func (s *GORMStore) publishProjection(ctx context.Context, generation string, cu
 			_ = tx.Rollback().Error
 		}
 	}()
+	var readiness storeReadinessRow
+	if err := locked(tx).Where("singleton_id = ?", "default").First(&readiness).Error; err != nil {
+		return RebuildResult{}, errors.New("eventstore: lock readiness failed")
+	}
+	s.observeLock(tableStoreReadiness)
 	var control projectionControlRow
 	if err := locked(tx).Where("singleton_id = ?", "default").First(&control).Error; err != nil {
 		return RebuildResult{}, errors.New("eventstore: lock projection control failed")
@@ -418,6 +423,14 @@ func (s *GORMStore) publishProjection(ctx context.Context, generation string, cu
 		"updated_at": time.Now().UTC(),
 	}).Error; err != nil {
 		return RebuildResult{}, errors.New("eventstore: publish projection generation failed")
+	}
+	if readiness.Mode == "import" {
+		if err := tx.Model(&storeReadinessRow{}).Where("singleton_id = ?", "default").Updates(map[string]any{
+			"terminal_global_position": latest,
+			"terminal_projection_position": cursor,
+		}).Error; err != nil {
+			return RebuildResult{}, errors.New("eventstore: publish readiness terminal failed")
+		}
 	}
 	if err := tx.Commit().Error; err != nil {
 		return RebuildResult{}, errors.New("eventstore: commit projection publication failed")

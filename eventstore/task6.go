@@ -400,6 +400,9 @@ func readinessTerminalPositions(ctx context.Context, db *gorm.DB) (uint64, uint6
 }
 
 func (s *GORMStore) ValidateReadiness(ctx context.Context) error {
+	return s.validateReadiness(ctx, false)
+}
+func (s *GORMStore) validateReadiness(ctx context.Context, allowFreshNonempty bool) error {
 	if s == nil || s.db == nil || s.db.GORM() == nil {
 		return ErrReadinessInvalid
 	}
@@ -414,7 +417,11 @@ func (s *GORMStore) ValidateReadiness(ctx context.Context) error {
 	if err != nil {
 		return ErrReadinessQuarantined
 	}
-	if r.IndexRootID == "unconfigured" || r.Mode == "fresh" && nonempty {
+	if r.IndexRootID == "unconfigured" || !allowFreshNonempty && r.Mode == "fresh" && nonempty {
+		return ErrReadinessQuarantined
+	}
+	var control projectionControlRow
+	if err := s.db.GORM().WithContext(ctx).Where("singleton_id = ?", "default").First(&control).Error; err != nil || control.PublicationState != "published" {
 		return ErrReadinessQuarantined
 	}
 	if s.keySource == nil {
@@ -431,7 +438,8 @@ func (s *GORMStore) ValidateReadiness(ctx context.Context) error {
 	if len(r.IndexRootFingerprint) != len(fingerprint) || !hmac.Equal(r.IndexRootFingerprint, fingerprint[:]) {
 		return ErrReadinessQuarantined
 	}
-	if _, err = keySourceCurrent(ctx, s.keySource); err != nil {
+	current, err := keySourceCurrent(ctx, s.keySource)
+	if err != nil {
 		return ErrReadinessQuarantined
 	}
 	available := make(map[string]struct{}, len(r.EncryptionRootIDs))
@@ -440,6 +448,9 @@ func (s *GORMStore) ValidateReadiness(ctx context.Context) error {
 			return ErrReadinessQuarantined
 		}
 		available[rootID] = struct{}{}
+	}
+	if _, ok := available[current.ID]; !ok {
+		return ErrReadinessQuarantined
 	}
 	if refs, refErr := readinessRootReferences(ctx, s.db.GORM()); refErr != nil {
 		return ErrReadinessQuarantined
@@ -478,15 +489,31 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		return err
 	}
 	for _, update := range work.Operations {
-		if len(update.PrivateContextCiphertext) == 0 && len(update.PrivateContextNonce) == 0 {
+		if update.OperationID == "" {
+			return ErrInvalidMetadata
+		}
+		var existing operationRow
+		lookupErr := db.WithContext(ctx).Select("principal_id, private_payload_version").Where("operation_id = ?", update.OperationID).First(&existing).Error
+		existingFound := lookupErr == nil
+		if !existingFound && !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+			return ErrParticipantFailure
+		}
+		hasCipher := len(update.PrivateContextCiphertext) > 0 || len(update.PrivateContextNonce) > 0 || update.EncryptionKeyID != ""
+		allCipher := len(update.PrivateContextCiphertext) > 0 && len(update.PrivateContextNonce) > 0 && update.EncryptionKeyID != ""
+		if hasCipher && !allCipher {
+			return ErrInvalidMetadata
+		}
+		if existingFound && update.PrincipalID != "" && update.PrincipalID != existing.PrincipalID && !allCipher {
+			return ErrInvalidTransition
+		}
+		if !allCipher {
 			continue
 		}
-		if update.OperationID == "" || update.PrincipalID == "" || update.EncryptionKeyID == "" {
+		if update.PrincipalID == "" {
 			return ErrInvalidMetadata
 		}
 		version := uint64(1)
-		var existing operationRow
-		if err := db.WithContext(ctx).Select("private_payload_version").Where("operation_id = ?", update.OperationID).First(&existing).Error; err == nil {
+		if existingFound {
 			version = task5PayloadVersion(existing.PrivatePayloadVersion)
 		}
 		if _, err := openBoundPayload(ctx, s.codec, "operation-private/v1", update.OperationID, update.PrincipalID, version, update.PrivateContextCiphertext, update.PrivateContextNonce, update.EncryptionKeyID); err != nil {
@@ -705,12 +732,15 @@ func (s *GORMStore) initializeA6Readiness(ctx context.Context) error {
 	}
 	return s.ValidateReadiness(ctx)
 }
-func (s *GORMStore) requireReady(context.Context) error {
+func (s *GORMStore) requireReady(ctx context.Context) error {
 	if s == nil {
 		return ErrReadinessInvalid
 	}
 	if err := s.initializationError(); err != nil {
 		return err
+	}
+	if s.keySource != nil {
+		return s.validateReadiness(ctx, true)
 	}
 	return nil
 }
@@ -732,13 +762,19 @@ func (s *GORMStore) SetReadiness(ctx context.Context, r Readiness) error {
 		return ErrReadinessQuarantined
 	}
 	r.IndexRootFingerprint = append([]byte(nil), fingerprint[:]...)
-	if _, err = keySourceCurrent(ctx, s.keySource); err != nil {
+	current, err := keySourceCurrent(ctx, s.keySource)
+	if err != nil {
 		return ErrKeyUnavailable
 	}
+	requested := make(map[string]struct{}, len(r.EncryptionRootIDs))
 	for _, rootID := range r.EncryptionRootIDs {
+		requested[rootID] = struct{}{}
 		if _, err = keySourceRoot(ctx, s.keySource, rootID); err != nil {
 			return ErrKeyUnavailable
 		}
+	}
+	if _, ok := requested[current.ID]; !ok {
+		return ErrReadinessQuarantined
 	}
 	if expected := strings.TrimSpace(s.db.databaseIdentity); expected != "" && r.DatabaseIdentity != expected {
 		return ErrReadinessQuarantined
@@ -767,6 +803,9 @@ func (s *GORMStore) SetReadiness(ctx context.Context, r Readiness) error {
 	var control projectionControlRow
 	if lockErr := locked(tx).Where("singleton_id = ?", "default").First(&control).Error; lockErr != nil {
 		return ErrParticipantFailure
+	}
+	if control.PublicationState != "published" {
+		return ErrReadinessQuarantined
 	}
 	nonempty, countErr := readinessDatabaseNonEmpty(ctx, tx)
 	if countErr != nil {
@@ -845,7 +884,11 @@ func (s *GORMStore) PutSecret(ctx context.Context, req SecretPutRequest) (Secret
 	if version == 0 {
 		version = 1
 		if current > 0 {
-			version = latest.SecretVersion + 1
+			nextVersionValue, versionErr := nextVersion(latest.SecretVersion)
+			if versionErr != nil {
+				return SecretResolution{}, versionErr
+			}
+			version = nextVersionValue
 		}
 	} else if current > 0 && version <= latest.SecretVersion {
 		return SecretResolution{}, ErrParticipantConflict
@@ -854,7 +897,11 @@ func (s *GORMStore) PutSecret(ctx context.Context, req SecretPutRequest) (Secret
 	if err != nil {
 		return SecretResolution{}, err
 	}
-	row := adapterSecretRow{SecretRef: req.SecretRef, SecretVersion: version, EndpointID: req.EndpointID, AdapterID: req.AdapterID, AdapterType: "opaque", Ciphertext: ciphertext, Nonce: nonce, EncryptionKeyID: keyID, RowVersion: current + 1, CreatedAt: now, UpdatedAt: now}
+	rowVersion, err := nextVersion(current)
+	if err != nil {
+		return SecretResolution{}, err
+	}
+	row := adapterSecretRow{SecretRef: req.SecretRef, SecretVersion: version, EndpointID: req.EndpointID, AdapterID: req.AdapterID, AdapterType: "opaque", Ciphertext: ciphertext, Nonce: nonce, EncryptionKeyID: keyID, RowVersion: rowVersion, CreatedAt: now, UpdatedAt: now}
 	if err = tx.Create(&row).Error; err != nil {
 		return SecretResolution{}, ErrParticipantFailure
 	}
@@ -1209,6 +1256,11 @@ func (s *GORMStore) rotateSecretRows(ctx context.Context, root EncryptionRoot) (
 			if row.EncryptionKeyID == root.ID {
 				continue
 			}
+			rowVersion, versionErr := nextVersion(row.RowVersion)
+			if versionErr != nil {
+				err = versionErr
+				return
+			}
 			plain, openErr := a6Open(ctx, s.keySource, "adapter-secret/v1", row.SecretRef, row.EndpointID+"/"+row.AdapterID, row.SecretVersion, row.EncryptionKeyID, row.Ciphertext, row.Nonce)
 			if openErr != nil {
 				err = openErr
@@ -1219,7 +1271,7 @@ func (s *GORMStore) rotateSecretRows(ctx context.Context, root EncryptionRoot) (
 				err = sealErr
 				return
 			}
-			q = s.db.GORM().WithContext(ctx).Model(&adapterSecretRow{}).Where("secret_ref = ? AND secret_version = ? AND row_version = ? AND encryption_key_id = ?", row.SecretRef, row.SecretVersion, row.RowVersion, row.EncryptionKeyID).Updates(map[string]any{"ciphertext": ciphertext, "nonce": nonce, "encryption_key_id": keyID, "row_version": row.RowVersion + 1, "updated_at": s.task5Now()})
+			q = s.db.GORM().WithContext(ctx).Model(&adapterSecretRow{}).Where("secret_ref = ? AND secret_version = ? AND row_version = ? AND encryption_key_id = ?", row.SecretRef, row.SecretVersion, row.RowVersion, row.EncryptionKeyID).Updates(map[string]any{"ciphertext": ciphertext, "nonce": nonce, "encryption_key_id": keyID, "row_version": rowVersion, "updated_at": s.task5Now()})
 			if q.Error != nil {
 				err = ErrParticipantFailure
 				return

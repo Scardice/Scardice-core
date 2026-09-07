@@ -467,6 +467,9 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 		if q.Error == nil { current = row.Version } else if !errors.Is(q.Error, gorm.ErrRecordNotFound) { return ErrParticipantFailure }
 		if err := participantVersion(update.ExpectedVersion, current, update.Version, tableOperations, "<redacted>"); err != nil { return err }
 		version, err := nextVersion(current); if err != nil { return err }; now := chooseTime(update.UpdatedAt, time.Now().UTC())
+		if current > 0 && update.PrincipalID != "" && update.PrincipalID != row.PrincipalID && (len(update.PrivateContextCiphertext) == 0 || len(update.PrivateContextNonce) == 0 || update.EncryptionKeyID == "") {
+			return ErrInvalidTransition
+		}
 		if current == 0 { row = operationRow{OperationID:update.OperationID, Version:version, Kind:nonempty(update.Kind,"unknown"), Status:nonempty(update.Status,"pending"), PrincipalID:nonempty(update.PrincipalID,update.OperationID), ResourceType:nonempty(update.ResourceID,"unknown"), ResourceID:update.ResourceID, IdempotencyScope:nonempty(update.IdempotencyScope,"operation"), IdempotencyKey:nonempty(update.IdempotencyKey,update.OperationID), RequestID:update.RequestID, RequestDigest:update.RequestDigest, CorrelationID:update.CorrelationID, ResultCode:update.ResultCode, ErrorCode:update.ErrorCode, ArtifactRef:update.ArtifactID, PrivatePayloadVersion:1, PrivateContext:update.PrivateContextCiphertext, PrivateNonce:update.PrivateContextNonce, PrivateKeyID:update.EncryptionKeyID, CreatedAt:chooseTime(update.CreatedAt,now), UpdatedAt:now, ExpiresAt:timePtr(update.ExpiresAt)}; q=tx.Create(&row)
 		} else {
 			if update.Kind != "" { row.Kind = update.Kind }; if update.Status != "" { row.Status = update.Status }; if update.PrincipalID != "" { row.PrincipalID = update.PrincipalID }; if update.ResourceID != "" { row.ResourceID = update.ResourceID }; if update.IdempotencyScope != "" { row.IdempotencyScope = update.IdempotencyScope }; if update.IdempotencyKey != "" { row.IdempotencyKey = update.IdempotencyKey }; if update.RequestID != "" { row.RequestID = update.RequestID }; if len(update.RequestDigest) > 0 { row.RequestDigest = update.RequestDigest }; if update.CorrelationID != "" { row.CorrelationID = update.CorrelationID }; if update.ResultCode != "" { row.ResultCode = update.ResultCode }; if update.ErrorCode != "" { row.ErrorCode = update.ErrorCode }; if update.ArtifactID != "" { row.ArtifactRef = update.ArtifactID }; if len(update.PrivateContextCiphertext) > 0 { row.PrivateContext = update.PrivateContextCiphertext }; if len(update.PrivateContextNonce) > 0 { row.PrivateNonce = update.PrivateContextNonce }; if update.EncryptionKeyID != "" { row.PrivateKeyID = update.EncryptionKeyID }; if !update.ExpiresAt.IsZero() { row.ExpiresAt = timePtr(update.ExpiresAt) }; row.Version = version; row.UpdatedAt = now
@@ -636,7 +639,7 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 					return err
 				}
 				var row pluginKVRow
-				q := tx.Where("extension_id = ? AND key_hmac = ?", update.ExtensionID, update.KeyHMAC).First(&row)
+				q := locked(tx).Where("extension_id = ? AND key_hmac = ?", update.ExtensionID, update.KeyHMAC).First(&row)
 				if errors.Is(q.Error, gorm.ErrRecordNotFound) {
 					return &ParticipantConflictError{Conflicts: []ParticipantConflict{{Table: tablePluginKV, Key: "<redacted>", ExpectedVersion: update.ExpectedVersion, CurrentVersion: 0}}}
 				}
@@ -645,6 +648,11 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 				}
 				if err := participantVersion(update.ExpectedVersion, row.RowVersion, update.Version, tablePluginKV, "<redacted>"); err != nil {
 					return err
+				}
+				if s.keySource != nil {
+					if _, err := s.decodePluginKVRow(ctx, row); err != nil {
+						return err
+					}
 				}
 				q = tx.Where("extension_id = ? AND key_hmac = ? AND row_version = ?", update.ExtensionID, update.KeyHMAC, row.RowVersion).Delete(&pluginKVRow{})
 				if err := participantCAS(tablePluginKV, "<redacted>", update.ExpectedVersion, row.RowVersion, q); err != nil {
