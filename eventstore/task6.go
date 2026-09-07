@@ -993,8 +993,13 @@ func (s *GORMStore) SetReadiness(ctx context.Context, r Readiness) error {
 	var existing storeReadinessRow
 	queryErr := locked(tx).Where("singleton_id = ?", "default").First(&existing).Error
 	if queryErr == nil {
-		if existing.IndexRootID != "" && existing.IndexRootID != "unconfigured" && existing.IndexRootID != r.IndexRootID {
-			return ErrReadinessQuarantined
+		if existing.IndexRootID != "" && existing.IndexRootID != "unconfigured" {
+			if existing.IndexRootID != r.IndexRootID {
+				return ErrReadinessQuarantined
+			}
+			if len(existing.IndexRootFingerprint) != len(fingerprint) || !hmac.Equal(existing.IndexRootFingerprint, fingerprint[:]) {
+				return ErrReadinessQuarantined
+			}
 		}
 		if existing.Mode == "import" && r.Mode == "fresh" {
 			return ErrReadinessInvalid

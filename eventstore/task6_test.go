@@ -433,15 +433,26 @@ func TestReadinessPinAndRootAvailability(t *testing.T) {
 	}
 	if err := store.SetReadiness(context.Background(), readiness); err != nil { t.Fatal(err) }
 	got, err := store.GetReadiness(context.Background())
-	if err != nil || got.Mode != "import" || got.IndexRootID != "index-v1" { t.Fatalf("readiness=%#v err=%v", got, err) }
+	if err != nil || got.Mode != "import" || got.IndexRootID != "index-v1" {
+		t.Fatalf("readiness=%#v err=%v", got, err)
+	}
+	source.IndexMaterial[0] ^= 0xff
+	if err := store.SetReadiness(context.Background(), Readiness{Mode: "import", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: source.IndexID, EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC()}); !errors.Is(err, ErrReadinessQuarantined) {
+		t.Fatalf("changed index material was silently repinned")
+	}
+	source.IndexMaterial[0] ^= 0xff
 	source.IndexMaterial[0] ^= 0xff
 	if !errors.Is(store.ValidateReadiness(context.Background()), ErrReadinessQuarantined) {
 		t.Fatalf("changed index material readiness was accepted")
 	}
 	source.IndexMaterial[0] ^= 0xff
 	source.IndexID = "changed-index"
-	if !errors.Is(store.ValidateReadiness(context.Background()), ErrReadinessQuarantined) { t.Fatalf("changed index readiness was accepted") }
-	if err := store.SetReadiness(context.Background(), Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: "changed-index"}); !errors.Is(err, ErrReadinessQuarantined) { t.Fatalf("changed pin write err=%v", err) }
+	if !errors.Is(store.ValidateReadiness(context.Background()), ErrReadinessQuarantined) {
+		t.Fatalf("changed index readiness was accepted")
+	}
+	if err := store.SetReadiness(context.Background(), Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: "changed-index", EncryptionRootIDs: []string{"root-v1"}}); !errors.Is(err, ErrReadinessQuarantined) {
+		t.Fatalf("changed pin write err=%v", err)
+	}
 }
 func TestReadinessRequiresCurrentEncryptionRoot(t *testing.T) {
 	store, db, source := task6Store(t)
