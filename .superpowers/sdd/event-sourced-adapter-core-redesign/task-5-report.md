@@ -12,6 +12,8 @@
 - `eventstore/task5_test.go`: behavior-first regression coverage for dedupe, lane ordering/concurrency, lease/CAS/state transitions, ambiguity, scrubbing/TTL, artifact codec/size/expiry/one-winner, fail-closed encryption, strict participant contracts, stable digest replay, terminal rewrite rejection, pending termination rejection, nonce boundaries, participant supplied-version checks, sparse leased-effect identity, replay bounds, callback timestamps, public immutable-field/version validation, terminal completion idempotence, stale-lease expiry scrubbing, corrupt codec rejection, multi-artifact compensation, consumed-artifact compensation exclusion, expired replay precedence, explicit expired/default/capped ingress TTLs, commit-error zero-result plaintext protection, and compensating UoW expiry scrubbing.
 - `eventstore/store_test.go`: migrated legacy participant fixtures to sparse artifact updates while retaining aggregate/UoW compatibility coverage without allowing arbitrary ingress state injection.
 `Store.Commit` participant application runs through the same transaction-bound invariant helpers: new inbox/effect rows ignore caller ordering, reject invalid status/risk/lease/encryption metadata, allocate typed lanes, enforce dedupe and TTL caps, and reject direct artifact terminal/oversize updates. Existing participant updates retain expected-version and active-lease CAS; terminal rows cannot be rewritten through the aggregate-only store.
+- `eventstore/database.go`, `eventstore/projection.go`: SQLite artifact payload-version migration/defaults and unified readiness gating for projection reads/rebuilds.
+- `eventstore/task6_test.go`: A6 ingress fixtures now use the explicit payload-encryption key field required when a key source is configured.
 ## Algorithms and transitions
 
 Acceptance starts one database transaction, checks inbox provider dedupe `(endpoint_id, provider_event_id)`, then materializes/locks the typed `lane_heads` row and allocates `NextSequence`. Caller ordering values are ignored. The head update and message/effect insert commit together, so row failure rolls back the head. Inbox and outbox use distinct lane kinds. Dedupe compares retained keyed content digests after scrub; when no digest was supplied, it compares live ciphertext/nonce and refuses scrubbed replay rather than guessing content identity. Claims use ordered candidates with a same-lane predecessor `NOT EXISTS` query; no `SKIP LOCKED` or process-global mutex is used. Non-SQLite dialects use the existing `FOR UPDATE` helper, while SQLite relies on its immediate transaction and busy timeout.
@@ -19,6 +21,7 @@ A6-enabled inbox/outbox rows now carry separate rotatable payload encryption key
 Inbox unresolved states are `pending`, `leased`, `callback-started`, and `ambiguous`. Only pending work or expired pre-callback leases are claimable. Callback start is persisted before external work, including through UoW participant updates. Lease owner, epoch, attempt, expiry, and expected row version are checked atomically, including `lease_expiry > now` in every worker mutation CAS. Explicit operator resolutions are `confirmed-consumed`, `retry`, and `skip`; retry returns to pending only while ciphertext is inside the 30-day TTL. Ambiguous/callback-started predecessors block later lane items. Terminal outcomes scrub ciphertext and nonce in the same commit. Observed expiry is scrubbed before stale-lease responses and returns `ErrPayloadExpired`; UoW compensation scrubs all expired participants before returning the typed error, and UoW initial dedupe/relookup rejects expired replay before idempotent success.
 Outbox accepts only `pending` and the declared risk classes `pre-dispatch-retryable`, `provider-idempotent`, and `non-idempotent-after-dispatch`. Claims use the same predecessor algorithm. Renew, dispatch marker, and completion require effect/owner/epoch/attempt CAS and an active lease, but observed payload expiry is scrubbed before lease errors. Dispatch allocates a fresh attempt ID and persists `dispatched_at` before provider I/O. Generic public updates cannot complete dispatched work; completion rejects stale leases and leased-to-terminal transitions. Exact terminal completion replays for the same attempt are idempotent even after the lease is cleared, while mismatched attempts remain stale. Expired post-dispatch non-idempotent work transitions to `ambiguous` with resolution metadata preserved, regardless of which public/UoW/resolution observer first sees expiry; repeat observation with no bytes is a no-op.
 Artifacts accept plaintext only through the injected codec boundary, cap plaintext and stored ciphertext at 32 MiB, default to 10 minutes, and reject TTLs over 60 minutes. Without a codec/key boundary, put, consume, and UoW artifact creation fail closed with `ErrEncryptionUnavailable`; plaintext-as-ciphertext fallback is not used. Consume/expiry is one transaction with a row CAS: one winner decrypts and returns plaintext only when decoded length matches stored size and remains within the cap, losers/expired requests receive `ErrArtifactGone`, and ciphertext/nonce are scrubbed before commit. `ready` and `available` are consumed/expired consistently; compensation only rewrites eligible non-terminal rows and skips already-scrubbed rows, so consumed/terminal artifacts keep their state/version. Commit errors return a zero `ArtifactResult`, never plaintext.
+All Task5 and A6 persistence APIs pass through the cached startup readiness gate before opening transactions; only readiness inspection/repair methods bypass that gate. Reopened non-empty stores with invalid readiness therefore remain read-only/quarantined across inbox, outbox, aggregate, projection, secret, plugin, and artifact paths. Operation private payloads and inbox/outbox/artifact payloads persist an immutable `PayloadVersion`/`PrivatePayloadVersion` (default 1); status/version CAS updates never modify it, and claims, consume, validation, and root rotation use the persisted value for AAD. SQLite artifact migration upgrades legacy tables with payload version 1 defaults.
 
 ## TDD evidence
 
@@ -37,16 +40,17 @@ Exact required commands and results:
 
 ```text
 go test -race ./eventstore -run 'TestInbox|TestOutbox|TestArtifact|TestLane|TestLease|TestEffect|TestDedup' -count=1
-ok  	Scardice-core/eventstore	1.413s
+ok  	Scardice-core/eventstore	1.362s
 
 go test -race ./eventstore -run 'TestReadiness|TestKey|TestCrypto|TestSecret|TestPlugin|TestKV|TestRotation|TestA6|TestEncryption' -count=1
-ok  	Scardice-core/eventstore	1.604s
+ok  	Scardice-core/eventstore	1.643s
 
 go test -count=1 ./eventstore
-ok  	Scardice-core/eventstore	0.784s
+ok  	Scardice-core/eventstore	0.788s
 ```
 
 The commands were rerun after the final source/test commits and included the Task5 tests whose names match the required filters. No formatter, linter, or project-wide suite was run.
+The final source/test hardening commit also passed `go test ./eventstore -run 'Test(SQLite|Database|Schema)' -count=1` and `go test -race ./eventstore -run 'TestA6|TestReadiness|TestKey|TestCrypto|TestSecret|TestPlugin|TestKV|TestRotation|TestEncryption' -count=1`. No formatter, linter, or project-wide suite was run.
 
 ## Commits
 
@@ -66,6 +70,7 @@ The commands were rerun after the final source/test commits and included the Tas
 - Final review closure: post-lookup TTL ordering, UoW non-pending lease enforcement, commit-error artifact zero-result protection, and regression coverage: `e883a075`.
 - UoW pending terminal fixture migration to stable `ErrStaleLease` semantics and final suite rerun: `aa8f3f9c`.
 - A6 encrypted repository hardening, readiness startup/fingerprint gates, stable digest-key separation, and plugin/artifact authentication coverage: `a1afa714`.
+- Readiness gate unification, canonical payload/digest key enforcement, encrypted plugin delete/quota integrity, plugin key root references, immutable AAD payload versions, and SQLite migration compatibility: `d49cd789`.
 ## Limitation
 
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
