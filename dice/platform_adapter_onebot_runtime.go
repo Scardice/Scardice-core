@@ -82,6 +82,8 @@ type onebotRuntime struct {
 	inboundCollisions atomic.Uint64
 	inboundRetries atomic.Uint64
 	transportDropped atomic.Uint64
+	transportDropMu sync.Mutex
+	transportDropBaselines map[*socketio.WebsocketWrapper]uint64
 }
 type onebotRuntimeEvent struct {
 	kind string
@@ -118,15 +120,34 @@ func (r *onebotRuntime) trackConnection(conn *socketio.WebsocketWrapper) {
 	r.connectionMu.Unlock()
 	r.callbackMu.Unlock()
 }
+func (r *onebotRuntime) accountTransportDrops(conn *socketio.WebsocketWrapper) {
+	if conn == nil {
+		return
+	}
+	r.accountTransportDropCount(conn, conn.DroppedEventCount())
+}
+
+func (r *onebotRuntime) accountTransportDropCount(conn *socketio.WebsocketWrapper, current uint64) {
+	if conn == nil {
+		return
+	}
+	r.transportDropMu.Lock()
+	previous := r.transportDropBaselines[conn]
+	if current > previous {
+		r.transportDropped.Add(current - previous)
+	}
+	r.transportDropBaselines[conn] = current
+	r.transportDropMu.Unlock()
+}
 
 func (r *onebotRuntime) completeConnection(conn *socketio.WebsocketWrapper) {
 	if conn == nil {
 		return
 	}
 	r.connectionMu.Lock()
+	r.accountTransportDrops(conn)
 	if done, ok := r.connections[conn]; ok {
 		delete(r.connections, conn)
-		r.transportDropped.Add(conn.DroppedEventCount())
 		close(done)
 	}
 	r.connectionMu.Unlock()
@@ -140,6 +161,7 @@ func newOnebotRuntime(config OnebotConfig, resolver adapterapi.SecretResolver, l
 		stopCh: make(chan struct{}), doneCh: make(chan struct{}),
 		events: make(chan onebotRuntimeEvent, 32),
 		connections: make(map[*socketio.WebsocketWrapper]chan struct{}),
+		transportDropBaselines: make(map[*socketio.WebsocketWrapper]uint64),
 	}
 }
 
@@ -425,11 +447,17 @@ func (r *onebotRuntime) Diagnostics(context.Context) adapterapi.DiagnosticReport
 	}
 	dropped := r.transportDropped.Load()
 	r.connectionMu.Lock()
+	r.transportDropMu.Lock()
 	for wrapper := range r.connections {
 		if wrapper != nil {
-			dropped += wrapper.DroppedEventCount()
+			current := wrapper.DroppedEventCount()
+			previous := r.transportDropBaselines[wrapper]
+			if current > previous {
+				dropped += current - previous
+			}
 		}
 	}
+	r.transportDropMu.Unlock()
 	r.connectionMu.Unlock()
 	count := func(code, message string, value uint64) adapterapi.DiagnosticEntry {
 		return adapterapi.DiagnosticEntry{

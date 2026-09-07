@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	socketio "github.com/PaienNate/pineutil/evsocket/v2"
 	"github.com/gorilla/websocket"
 
 	"Scardice-core/adapterapi"
@@ -419,11 +420,19 @@ func TestOnebotRuntimeDiagnosticsExposeIngressCounters(t *testing.T) {
 
 func TestOnebotRuntimeDiagnosticsRetainCompletedTransportDrops(t *testing.T) {
 	runtime := newOnebotRuntime(OnebotConfig{}, nil)
-	runtime.transportDropped.Store(3)
+	wrapper := &socketio.WebsocketWrapper{}
+	runtime.accountTransportDropCount(wrapper, 3)
+	runtime.accountTransportDropCount(wrapper, 5)
+	if got := runtime.transportDropped.Load(); got != 5 {
+		t.Fatalf("cumulative transport drops = %d, want 5", got)
+	}
+	runtime.connectionMu.Lock()
+	runtime.connections[wrapper] = make(chan struct{})
+	runtime.connectionMu.Unlock()
 	report := runtime.Diagnostics(context.Background())
 	for _, entry := range report.Entries {
 		if entry.Code == "transport.dropped_events" {
-			if entry.Message != "Transport callback events dropped at queue admission: 3" {
+			if entry.Message != "Transport callback events dropped at queue admission: 5" {
 				t.Fatalf("transport drop diagnostic = %q", entry.Message)
 			}
 			return

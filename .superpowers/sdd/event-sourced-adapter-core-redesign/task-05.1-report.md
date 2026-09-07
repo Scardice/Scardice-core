@@ -238,3 +238,18 @@ ok   github.com/PaienNate/pineutil/evsocket/v2
 go test ./dice -run 'TestOnebotRuntimeDiagnostics(RetainCompletedTransportDrops|ExposeIngressCounters)' -count=1
 ok   Scardice-core/dice
 ```
+
+## Round 8 fixes
+
+- Completed-wrapper transport drops now use a per-wrapper last-accounted baseline. Reconnects no longer add a wrapper's lifetime cumulative count twice; diagnostics combine the exact historical delta with the active wrapper delta. A focused two-snapshot regression covers counts 3 then 5 producing cumulative 5, not 8.
+- `connectReady` signaling is idempotent across reconnects via `sync.Once`, and a full terminal-only queue gives a new disconnect event priority over queued non-disconnect terminal events while remaining bounded. Duplicate/unadmittable terminal events are still counted rather than blocking shutdown.
+
+### Round 8 GREEN evidence
+
+```text
+go test ./evsocket/v2 -run 'Test(ConnectReadySignalIsIdempotentAcrossReconnects|WrapperEventQueueIsBounded|TransportMessageIsBoundBeforeCopy)' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+
+go test ./dice -run 'TestOnebotRuntimeDiagnostics(RetainCompletedTransportDrops|ExposeIngressCounters)' -count=1
+ok   Scardice-core/dice
+```

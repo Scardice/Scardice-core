@@ -568,6 +568,14 @@ func (kws *WebsocketWrapper) enqueueEvent(event eventEnvelope) {
 					break
 				}
 			}
+			if replaced < 0 && event.payload.Name == EventDisconnect {
+				for i, queued := range kws.eventQueue {
+					if queued.payload == nil || queued.payload.Name != EventDisconnect {
+						replaced = i
+						break
+					}
+				}
+			}
 			if replaced >= 0 {
 				copy(kws.eventQueue[replaced:], kws.eventQueue[replaced+1:])
 				kws.eventQueue[len(kws.eventQueue)-1] = eventEnvelope{}
