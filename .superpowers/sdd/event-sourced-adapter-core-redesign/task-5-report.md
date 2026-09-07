@@ -300,4 +300,21 @@ ok  	Scardice-core/eventstore	6.478s
 ```
 
 Thirty-second-round implementation and regression coverage: `c13650c3`.
+
+Thirty-third-round source commit `193802a2` prechecks existing A6 operation, inbox, outbox, and artifact row versions against `maxPersistedVersion` before decrypt/authentication. Wrong ciphertext on an exhausted row now returns `ErrVersionExhausted` rather than authentication failure or wrapped version zero. `TestA6UOWOperationVersionOverflowPrecedesPrivateAuthentication` covers operation/private precedence; existing artifact and payload regressions cover the other encrypted rows.
+
+Additional verification after `193802a2`:
+
+```text
+go test ./eventstore -run 'TestA6UOWOperationVersionOverflowPrecedesPrivateAuthentication|TestA6UOWSparseOperationUsesPersistedPrincipalForArtifactAAD' -count=1
+ok  	Scardice-core/eventstore	0.018s
+
+go test ./eventstore -count=1
+ok  	Scardice-core/eventstore	1.294s
+
+go test -race ./eventstore -count=1
+ok  	Scardice-core/eventstore	6.985s
+```
+
+Thirty-third-round implementation and regression coverage: `193802a2`.
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
