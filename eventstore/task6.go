@@ -1095,8 +1095,12 @@ func (s *GORMStore) ResolveSecret(ctx context.Context, ref string, version uint6
 	} else {
 		q = q.Order("secret_version DESC")
 	}
-	if err := q.First(&row).Error; err != nil {
+	queryErr := q.First(&row).Error
+	if errors.Is(queryErr, gorm.ErrRecordNotFound) {
 		return SecretResolution{}, ErrNotFound
+	}
+	if queryErr != nil {
+		return SecretResolution{}, ErrParticipantFailure
 	}
 	if len(row.Ciphertext) > MaxSecretBytes+16 {
 		return SecretResolution{}, &OversizeError{Bound: "encrypted secret bytes", Limit: MaxSecretBytes + 16, Actual: len(row.Ciphertext)}
@@ -1352,8 +1356,12 @@ func (s *GORMStore) GetPluginKV(ctx context.Context, extension, key string) (Plu
 		return PluginKVItem{}, err
 	}
 	var row pluginKVRow
-	if err := locked(tx).Where("extension_id = ? AND key_hmac = ?", extension, index).First(&row).Error; err != nil {
+	queryErr := locked(tx).Where("extension_id = ? AND key_hmac = ?", extension, index).First(&row).Error
+	if errors.Is(queryErr, gorm.ErrRecordNotFound) {
 		return PluginKVItem{}, ErrPluginKVNotFound
+	}
+	if queryErr != nil {
+		return PluginKVItem{}, ErrParticipantFailure
 	}
 	item, err := s.decodePluginKVRow(ctx, tx, row)
 	if err != nil {
