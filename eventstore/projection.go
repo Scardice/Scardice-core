@@ -432,6 +432,11 @@ func (s *GORMStore) publishProjection(ctx context.Context, generation string, cu
 			return RebuildResult{}, errors.New("eventstore: publish readiness terminal failed")
 		}
 	}
+	if s.keySource != nil {
+		if err := s.validateReadinessOnDB(ctx, tx, false); err != nil {
+			return RebuildResult{}, err
+		}
+	}
 	if err := tx.Commit().Error; err != nil {
 		return RebuildResult{}, errors.New("eventstore: commit projection publication failed")
 	}

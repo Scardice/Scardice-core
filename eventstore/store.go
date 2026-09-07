@@ -159,6 +159,15 @@ func (s *GORMStore) recordInitError(err error) {
 	}
 	s.mu.Unlock()
 }
+func (s *GORMStore) clearInitializationError() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.initErr = nil
+	s.mu.Unlock()
+}
+
 
 func (s *GORMStore) initializationError() error {
 	if s == nil {
@@ -437,6 +446,93 @@ func (s *GORMStore) Load(ctx context.Context, stream StreamID, fromVersion uint6
 	}
 	return envelopes, nil
 }
+func operationStatusTerminal(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "succeeded", "failed", "completed", "cancelled", "canceled", "expired":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *GORMStore) GetOperation(ctx context.Context, operationID string) (OperationView, error) {
+	if s == nil || s.db == nil || s.db.GORM() == nil {
+		return OperationView{}, ErrParticipantFailure
+	}
+	if err := s.requireReady(ctx); err != nil {
+		return OperationView{}, err
+	}
+	if strings.TrimSpace(operationID) == "" {
+		return OperationView{}, ErrNotFound
+	}
+	var row operationRow
+	if err := s.db.GORM().WithContext(ctx).Where("operation_id = ?", operationID).First(&row).Error; err != nil {
+		return OperationView{}, ErrNotFound
+	}
+	return OperationView{
+		OperationID: row.OperationID, Version: row.Version, Kind: row.Kind, Status: row.Status,
+		ResultCode: row.ResultCode, ErrorCode: row.ErrorCode, ArtifactID: row.ArtifactRef,
+		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, ExpiresAt: valueTime(row.ExpiresAt),
+	}, nil
+}
+
+func (s *GORMStore) Purge(ctx context.Context, req PrivacyPurgeRequest) (PrivacyPurgeResult, error) {
+	if s == nil || s.db == nil || s.db.GORM() == nil {
+		return PrivacyPurgeResult{}, ErrParticipantFailure
+	}
+	if err := s.requireReady(ctx); err != nil {
+		return PrivacyPurgeResult{}, err
+	}
+	if strings.TrimSpace(req.OperationID) == "" {
+		return PrivacyPurgeResult{}, ErrInvalidMetadata
+	}
+	scope := strings.ToLower(strings.TrimSpace(req.Scope))
+	if scope == "" {
+		scope = "private"
+	}
+	if scope != "private" && scope != "artifacts" && scope != "all" {
+		return PrivacyPurgeResult{}, ErrInvalidMetadata
+	}
+	tx := s.db.GORM().WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return PrivacyPurgeResult{}, ErrParticipantFailure
+	}
+	defer tx.Rollback()
+	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		return PrivacyPurgeResult{}, err
+	}
+	var row operationRow
+	if err := locked(tx).Where("operation_id = ?", req.OperationID).First(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return PrivacyPurgeResult{}, ErrNotFound
+		}
+		return PrivacyPurgeResult{}, ErrParticipantFailure
+	}
+	if !req.AllowActive && !operationStatusTerminal(row.Status) {
+		return PrivacyPurgeResult{}, ErrInvalidTransition
+	}
+	var deleted int64
+	if scope == "private" || scope == "all" {
+		if len(row.PrivateContext) > 0 || len(row.PrivateNonce) > 0 || row.PrivateKeyID != "" {
+			if err := tx.Model(&operationRow{}).Where("operation_id = ? AND version = ?", row.OperationID, row.Version).Updates(map[string]any{"private_context": nil, "private_nonce": nil, "private_key_id": "", "updated_at": s.task5Now()}).Error; err != nil {
+				return PrivacyPurgeResult{}, ErrParticipantFailure
+			}
+			deleted++
+		}
+	}
+	if scope == "artifacts" || scope == "all" {
+		q := tx.Where("operation_id = ?", req.OperationID).Delete(&operationArtifactRow{})
+		if q.Error != nil {
+			return PrivacyPurgeResult{}, ErrParticipantFailure
+		}
+		deleted += q.RowsAffected
+	}
+	if err := tx.Commit().Error; err != nil {
+		return PrivacyPurgeResult{}, ErrParticipantFailure
+	}
+	return PrivacyPurgeResult{OperationID: req.OperationID, Deleted: deleted}, nil
+}
+
 
 func (s *GORMStore) Close() error { if s == nil || s.db == nil { return nil }; return s.db.Close() }
 const maxUint64 = ^uint64(0)

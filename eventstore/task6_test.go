@@ -164,6 +164,49 @@ func TestPluginKVLookupBounds(t *testing.T) {
 		t.Fatalf("oversized list prefix err=%v", err)
 	}
 }
+func TestOperationViewAndPrivacyPurge(t *testing.T) {
+	store, db, _ := task6Store(t)
+	defer db.Close()
+	now := time.Now().UTC()
+	if err := db.GORM().Create(&operationRow{
+		OperationID: "purge-operation", Version: 1, Kind: "test", Status: "succeeded",
+		PrincipalID: "principal", IdempotencyScope: "scope", IdempotencyKey: "key",
+		PrivateContext: []byte("ciphertext"), PrivateNonce: []byte("nonce"), PrivateKeyID: "root-v1",
+		CreatedAt: now, UpdatedAt: now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GORM().Create(&operationArtifactRow{
+		ArtifactID: "purge-artifact", Version: 1, OperationID: "purge-operation", OwnerPrincipalID: "principal",
+		MediaType: "application/octet-stream", Size: 1, Status: "available", Ciphertext: []byte("ciphertext"),
+		Nonce: []byte("nonce"), EncryptionKeyID: "root-v1", ExpiresAt: now.Add(time.Hour),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.GetOperation(context.Background(), "purge-operation")
+	if err != nil || view.OperationID != "purge-operation" || view.Status != "succeeded" {
+		t.Fatalf("operation view=%#v err=%v", view, err)
+	}
+	purged, err := store.Purge(context.Background(), PrivacyPurgeRequest{OperationID: "purge-operation", Scope: "all"})
+	if err != nil || purged.Deleted != 2 {
+		t.Fatalf("purge=%#v err=%v", purged, err)
+	}
+	var operation operationRow
+	if err := db.GORM().Where("operation_id = ?", "purge-operation").First(&operation).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(operation.PrivateContext) != 0 || len(operation.PrivateNonce) != 0 || operation.PrivateKeyID != "" {
+		t.Fatalf("private context survived purge: %#v", operation)
+	}
+	var artifactCount int64
+	if err := db.GORM().Model(&operationArtifactRow{}).Where("operation_id = ?", "purge-operation").Count(&artifactCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if artifactCount != 0 {
+		t.Fatalf("artifacts survived purge: %d", artifactCount)
+	}
+}
+
 
 
 func TestReadinessPinAndRootAvailability(t *testing.T) {

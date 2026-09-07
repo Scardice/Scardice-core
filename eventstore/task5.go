@@ -2018,8 +2018,8 @@ func (s *GORMStore) ConsumeArtifact(ctx context.Context, req ArtifactConsumeRequ
 	if err = s.requireA6BoundCodec(); err != nil {
 		return ArtifactResult{}, err
 	}
-	if len(row.Ciphertext) == 0 || len(row.Nonce) == 0 {
-		return ArtifactResult{}, ErrArtifactGone
+	if err = validateTask5ArtifactOpaquePayload(row.Ciphertext, row.Nonce, row.EncryptionKeyID); err != nil {
+		return ArtifactResult{}, err
 	}
 	plaintext, openErr := openBoundPayload(ctx, s.codec, "artifact/v1", row.ArtifactID, row.OwnerPrincipalID, task5PayloadVersion(row.PayloadVersion), row.Ciphertext, row.Nonce, row.EncryptionKeyID)
 	if openErr != nil {
@@ -2104,7 +2104,7 @@ func (s *GORMStore) applyTask5InboxParticipants(ctx context.Context, tx *gorm.DB
 			if update.Status != InboxStatusPending || update.LeaseOwner != "" || update.LeaseEpoch != 0 || update.AttemptID != "" || !update.LeaseExpiresAt.IsZero() || !update.CallbackStartedAt.IsZero() || !update.CompletedAt.IsZero() || update.PrincipalID != "" || update.Reason != "" || update.Resolution != "" || !update.ResolutionAt.IsZero() {
 				return ErrInvalidTransition
 			}
-			if len(update.PayloadCiphertext) == 0 || len(update.PayloadNonce) == 0 || payloadKeyID == "" || len(update.PayloadCiphertext) > MaxArtifactBytes {
+			if len(update.PayloadCiphertext) == 0 || len(update.PayloadNonce) == 0 || payloadKeyID == "" || len(update.PayloadCiphertext) > task5PayloadLimit {
 				return ErrParticipantFailure
 			}
 			now := s.task5Now()
@@ -2324,7 +2324,7 @@ func (s *GORMStore) applyTask5EffectParticipants(ctx context.Context, tx *gorm.D
 			if err := validateTask5OpaquePayload(update.PayloadCiphertext, update.PayloadNonce, payloadKeyID); err != nil {
 				return err
 			}
-			if update.EffectType == "" || !validRisk(update.RiskClass) || (update.Status != "" && update.Status != OutboxStatusPending) || update.LeaseOwner != "" || update.LeaseEpoch != 0 || update.AttemptID != "" || !update.LeaseExpiresAt.IsZero() || len(update.PayloadCiphertext) == 0 || len(update.PayloadNonce) == 0 || payloadKeyID == "" || len(update.PayloadCiphertext) > MaxArtifactBytes {
+			if update.EffectType == "" || !validRisk(update.RiskClass) || (update.Status != "" && update.Status != OutboxStatusPending) || update.LeaseOwner != "" || update.LeaseEpoch != 0 || update.AttemptID != "" || !update.LeaseExpiresAt.IsZero() || len(update.PayloadCiphertext) == 0 || len(update.PayloadNonce) == 0 || payloadKeyID == "" || len(update.PayloadCiphertext) > task5PayloadLimit {
 				if update.Status != "" && update.Status != OutboxStatusPending {
 					return ErrInvalidTransition
 				}
@@ -2622,3 +2622,5 @@ func (s *GORMStore) applyTask5ArtifactParticipants(tx *gorm.DB, work UnitOfWork,
 var _ InboxRepository = (*GORMStore)(nil)
 var _ OutboxRepository = (*GORMStore)(nil)
 var _ ArtifactRepository = (*GORMStore)(nil)
+var _ OperationRepository = (*GORMStore)(nil)
+var _ PrivacyPurger = (*GORMStore)(nil)

@@ -559,6 +559,9 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		if err := db.WithContext(ctx).Select("payload_version").Where("inbox_id = ?", update.InboxID).First(&existing).Error; err == nil {
 			version = task5PayloadVersion(existing.PayloadVersion)
 		}
+		if err := validateTask5OpaquePayload(update.PayloadCiphertext, update.PayloadNonce, payloadKeyID); err != nil {
+			return err
+		}
 		if _, err := openBoundPayload(ctx, s.codec, "inbox/v1", update.InboxID, update.EndpointID, version, update.PayloadCiphertext, update.PayloadNonce, payloadKeyID); err != nil {
 			return ErrAuthenticationFailed
 		}
@@ -584,6 +587,9 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		var existing outboxEffectRow
 		if err := db.WithContext(ctx).Select("payload_version").Where("effect_id = ?", effect.EffectID).First(&existing).Error; err == nil {
 			version = task5PayloadVersion(existing.PayloadVersion)
+		}
+		if err := validateTask5OpaquePayload(effect.PayloadCiphertext, effect.PayloadNonce, payloadKeyID); err != nil {
+			return err
 		}
 		if _, err := openBoundPayload(ctx, s.codec, "outbox/v1", effect.EffectID, effect.EndpointID, version, effect.PayloadCiphertext, effect.PayloadNonce, payloadKeyID); err != nil {
 			return ErrAuthenticationFailed
@@ -660,6 +666,12 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 			return ErrInvalidMetadata
 		}
 		if allCipher {
+			if len(update.Ciphertext) > MaxSecretBytes+16 {
+				return &OversizeError{Bound: "encrypted secret bytes", Limit: MaxSecretBytes + 16, Actual: len(update.Ciphertext)}
+			}
+			if len(update.Nonce) != 12 {
+				return ErrInvalidMetadata
+			}
 			plain, err := a6Open(ctx, s.keySource, "adapter-secret/v1", update.SecretRef, endpoint+"/"+adapter, secretVersion, update.EncryptionKeyID, update.Ciphertext, update.Nonce)
 			if err != nil {
 				return ErrAuthenticationFailed
@@ -669,6 +681,12 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 			}
 		} else {
 			if !existing {
+				return ErrInvalidMetadata
+			}
+			if len(latest.Ciphertext) > MaxSecretBytes+16 {
+				return &OversizeError{Bound: "encrypted secret bytes", Limit: MaxSecretBytes + 16, Actual: len(latest.Ciphertext)}
+			}
+			if len(latest.Nonce) != 12 {
 				return ErrInvalidMetadata
 			}
 			plain, err := a6Open(ctx, s.keySource, "adapter-secret/v1", latest.SecretRef, latest.EndpointID+"/"+latest.AdapterID, latest.SecretVersion, latest.EncryptionKeyID, latest.Ciphertext, latest.Nonce)
@@ -685,6 +703,15 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 			continue
 		}
 		if update.ExtensionID == "" || len(update.ExtensionID) > MaxPluginExtensionBytes || len(update.KeyHMAC) != sha256.Size || len(update.KeyCiphertext) == 0 || len(update.KeyNonce) == 0 || len(update.ValueCiphertext) == 0 || len(update.ValueNonce) == 0 || update.EncryptionKeyID == "" {
+			return ErrInvalidMetadata
+		}
+		if len(update.KeyCiphertext) > MaxPluginKeyBytes+16 {
+			return &OversizeError{Bound: "encrypted plugin key bytes", Limit: MaxPluginKeyBytes + 16, Actual: len(update.KeyCiphertext)}
+		}
+		if len(update.ValueCiphertext) > MaxPluginValueBytes+16 {
+			return &OversizeError{Bound: "encrypted plugin value bytes", Limit: MaxPluginValueBytes + 16, Actual: len(update.ValueCiphertext)}
+		}
+		if len(update.KeyNonce) != 12 || len(update.ValueNonce) != 12 {
 			return ErrInvalidMetadata
 		}
 		var existing pluginKVRow
@@ -832,6 +859,26 @@ func (s *GORMStore) SetReadiness(ctx context.Context, r Readiness) error {
 	if control.PublicationState != "published" {
 		return ErrReadinessQuarantined
 	}
+	lockedIndexID, lockedIndexMaterial, indexErr := keySourceIndex(ctx, s.keySource)
+	if indexErr != nil || lockedIndexID != r.IndexRootID {
+		return ErrReadinessQuarantined
+	}
+	lockedFingerprint := sha256.Sum256(lockedIndexMaterial)
+	if !hmac.Equal(r.IndexRootFingerprint, lockedFingerprint[:]) {
+		return ErrReadinessQuarantined
+	}
+	lockedCurrent, currentErr := keySourceCurrent(ctx, s.keySource)
+	if currentErr != nil {
+		return ErrKeyUnavailable
+	}
+	if _, ok := requested[lockedCurrent.ID]; !ok {
+		return ErrReadinessQuarantined
+	}
+	for rootID := range requested {
+		if _, rootErr := keySourceRoot(ctx, s.keySource, rootID); rootErr != nil {
+			return ErrKeyUnavailable
+		}
+	}
 	nonempty, countErr := readinessDatabaseNonEmpty(ctx, tx)
 	if countErr != nil {
 		return ErrParticipantFailure
@@ -869,6 +916,7 @@ func (s *GORMStore) SetReadiness(ctx context.Context, r Readiness) error {
 	if err = tx.Commit().Error; err != nil {
 		return ErrReadinessInvalid
 	}
+	s.clearInitializationError()
 	return nil
 }
 
@@ -952,6 +1000,12 @@ func (s *GORMStore) ResolveSecret(ctx context.Context, ref string, version uint6
 	if err := q.First(&row).Error; err != nil {
 		return SecretResolution{}, ErrNotFound
 	}
+	if len(row.Ciphertext) > MaxSecretBytes+16 {
+		return SecretResolution{}, &OversizeError{Bound: "encrypted secret bytes", Limit: MaxSecretBytes + 16, Actual: len(row.Ciphertext)}
+	}
+	if len(row.Nonce) != 12 {
+		return SecretResolution{}, ErrInvalidMetadata
+	}
 	plain, err := a6Open(ctx, s.keySource, "adapter-secret/v1", row.SecretRef, row.EndpointID+"/"+row.AdapterID, row.SecretVersion, row.EncryptionKeyID, row.Ciphertext, row.Nonce)
 	if err != nil {
 		return SecretResolution{}, ErrAuthenticationFailed
@@ -974,6 +1028,15 @@ func (s *GORMStore) pluginValueUsageOn(ctx context.Context, db *gorm.DB, extensi
 	for _, row := range rows {
 		if len(exclude) > 0 && hmac.Equal(row.KeyHMAC, exclude) {
 			continue
+		}
+		if len(row.EncryptedKey) > MaxPluginKeyBytes+16 {
+			return 0, &OversizeError{Bound: "encrypted plugin key bytes", Limit: MaxPluginKeyBytes + 16, Actual: len(row.EncryptedKey)}
+		}
+		if len(row.EncryptedValue) > MaxPluginValueBytes+16 {
+			return 0, &OversizeError{Bound: "encrypted plugin value bytes", Limit: MaxPluginValueBytes + 16, Actual: len(row.EncryptedValue)}
+		}
+		if len(row.KeyNonce) != 12 || len(row.ValueNonce) != 12 {
+			return 0, ErrInvalidMetadata
 		}
 		key, err := a6Open(ctx, s.keySource, "plugin-kv-key/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedKey, row.KeyNonce)
 		if err != nil {
@@ -1114,6 +1177,15 @@ func (s *GORMStore) SetPluginKV(ctx context.Context, req PluginKVPutRequest) (Pl
 }
 
 func (s *GORMStore) decodePluginKVRow(ctx context.Context, row pluginKVRow) (PluginKVItem, error) {
+	if len(row.EncryptedKey) > MaxPluginKeyBytes+16 {
+		return PluginKVItem{}, &OversizeError{Bound: "encrypted plugin key bytes", Limit: MaxPluginKeyBytes + 16, Actual: len(row.EncryptedKey)}
+	}
+	if len(row.EncryptedValue) > MaxPluginValueBytes+16 {
+		return PluginKVItem{}, &OversizeError{Bound: "encrypted plugin value bytes", Limit: MaxPluginValueBytes + 16, Actual: len(row.EncryptedValue)}
+	}
+	if len(row.KeyNonce) != 12 || len(row.ValueNonce) != 12 {
+		return PluginKVItem{}, ErrInvalidMetadata
+	}
 	key, err := a6Open(ctx, s.keySource, "plugin-kv-key/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedKey, row.KeyNonce)
 	if err != nil {
 		return PluginKVItem{}, ErrAuthenticationFailed
@@ -1276,17 +1348,17 @@ func (s *GORMStore) RotateEncryptionRoots(ctx context.Context) (EncryptionRotati
 	result := EncryptionRotationResult{CurrentRootID: root.ID}
 	updated, skipped, err := s.rotateSecretRows(ctx, root)
 	if err != nil {
-		return result, err
+		return EncryptionRotationResult{}, err
 	}
 	result.Updated, result.Skipped = updated, skipped
 	updated, skipped, err = s.rotateA6PayloadTables(ctx, root)
 	if err != nil {
-		return result, err
+		return EncryptionRotationResult{}, err
 	}
 	result.Updated += updated
 	result.Skipped += skipped
 	if err := s.refreshReadinessRoots(ctx, root.ID); err != nil {
-		return result, err
+		return EncryptionRotationResult{}, err
 	}
 	return result, nil
 }
@@ -1322,9 +1394,21 @@ func (s *GORMStore) rotateSecretRows(ctx context.Context, root EncryptionRoot) (
 			if row.EncryptionKeyID == root.ID {
 				continue
 			}
+			if len(row.Ciphertext) > MaxSecretBytes+16 {
+				err = &OversizeError{Bound: "encrypted secret bytes", Limit: MaxSecretBytes + 16, Actual: len(row.Ciphertext)}
+				return
+			}
+			if len(row.Nonce) != 12 {
+				err = ErrInvalidMetadata
+				return
+			}
 			plain, openErr := a6Open(ctx, s.keySource, "adapter-secret/v1", row.SecretRef, row.EndpointID+"/"+row.AdapterID, row.SecretVersion, row.EncryptionKeyID, row.Ciphertext, row.Nonce)
 			if openErr != nil {
 				err = openErr
+				return
+			}
+			if len(plain) > MaxSecretBytes {
+				err = &OversizeError{Bound: "secret bytes", Limit: MaxSecretBytes, Actual: len(plain)}
 				return
 			}
 			ciphertext, nonce, keyID, sealErr := a6SealWithRoot(root, "adapter-secret/v1", row.SecretRef, row.EndpointID+"/"+row.AdapterID, row.SecretVersion, plain)
@@ -1400,7 +1484,7 @@ func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRo
 			_ = base.Rollback().Error
 		}
 	}()
-	if err = lockPublication(base); err != nil {
+	if err = s.lockMutationPublication(ctx, base); err != nil {
 		return
 	}
 	var operationCursor string
@@ -1420,9 +1504,21 @@ func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRo
 			if row.PrivateKeyID == root.ID {
 				continue
 			}
+			if len(row.PrivateContext) > MaxUnitOfWorkBytes+16 {
+				err = &OversizeError{Bound: "encrypted operation private bytes", Limit: MaxUnitOfWorkBytes + 16, Actual: len(row.PrivateContext)}
+				return
+			}
+			if len(row.PrivateNonce) != 12 {
+				err = ErrInvalidMetadata
+				return
+			}
 			plain, openErr := a6Open(ctx, s.keySource, "operation-private/v1", row.OperationID, row.PrincipalID, task5PayloadVersion(row.PrivatePayloadVersion), row.PrivateKeyID, row.PrivateContext, row.PrivateNonce)
 			if openErr != nil {
 				err = openErr
+				return
+			}
+			if len(plain) > MaxUnitOfWorkBytes {
+				err = &OversizeError{Bound: "operation private bytes", Limit: MaxUnitOfWorkBytes, Actual: len(plain)}
 				return
 			}
 			ciphertext, nonce, keyID, sealErr := a6SealWithRoot(root, "operation-private/v1", row.OperationID, row.PrincipalID, task5PayloadVersion(row.PrivatePayloadVersion), plain)
@@ -1463,9 +1559,21 @@ func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRo
 			if row.EncryptionKeyID == root.ID {
 				continue
 			}
+			if len(row.Ciphertext) > MaxArtifactBytes+16 {
+				err = &OversizeError{Bound: "encrypted artifact bytes", Limit: MaxArtifactBytes + 16, Actual: len(row.Ciphertext)}
+				return
+			}
+			if len(row.Nonce) != 12 {
+				err = ErrInvalidMetadata
+				return
+			}
 			plain, openErr := a6Open(ctx, s.keySource, "artifact/v1", row.ArtifactID, row.OwnerPrincipalID, task5PayloadVersion(row.PayloadVersion), row.EncryptionKeyID, row.Ciphertext, row.Nonce)
 			if openErr != nil {
 				err = openErr
+				return
+			}
+			if len(plain) > MaxArtifactBytes || int64(len(plain)) != row.Size {
+				err = ErrInvalidMetadata
 				return
 			}
 			ciphertext, nonce, keyID, sealErr := a6SealWithRoot(root, "artifact/v1", row.ArtifactID, row.OwnerPrincipalID, task5PayloadVersion(row.PayloadVersion), plain)
@@ -1506,9 +1614,21 @@ func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRo
 			if row.EncryptionKeyID == root.ID {
 				continue
 			}
+			if len(row.PayloadCiphertext) > task5PayloadLimit {
+				err = &OversizeError{Bound: "encrypted payload", Limit: task5PayloadLimit, Actual: len(row.PayloadCiphertext)}
+				return
+			}
+			if len(row.PayloadNonce) != 12 {
+				err = ErrInvalidMetadata
+				return
+			}
 			plain, openErr := a6Open(ctx, s.keySource, "inbox/v1", row.InboxID, row.EndpointID, task5PayloadVersion(row.PayloadVersion), row.EncryptionKeyID, row.PayloadCiphertext, row.PayloadNonce)
 			if openErr != nil {
 				err = openErr
+				return
+			}
+			if len(plain) > task5PayloadLimit {
+				err = &OversizeError{Bound: "payload", Limit: task5PayloadLimit, Actual: len(plain)}
 				return
 			}
 			ciphertext, nonce, keyID, sealErr := a6SealWithRoot(root, "inbox/v1", row.InboxID, row.EndpointID, task5PayloadVersion(row.PayloadVersion), plain)
@@ -1549,9 +1669,21 @@ func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRo
 			if row.EncryptionKeyID == root.ID {
 				continue
 			}
+			if len(row.PayloadCiphertext) > task5PayloadLimit {
+				err = &OversizeError{Bound: "encrypted payload", Limit: task5PayloadLimit, Actual: len(row.PayloadCiphertext)}
+				return
+			}
+			if len(row.PayloadNonce) != 12 {
+				err = ErrInvalidMetadata
+				return
+			}
 			plain, openErr := a6Open(ctx, s.keySource, "outbox/v1", row.EffectID, row.EndpointID, task5PayloadVersion(row.PayloadVersion), row.EncryptionKeyID, row.PayloadCiphertext, row.PayloadNonce)
 			if openErr != nil {
 				err = openErr
+				return
+			}
+			if len(plain) > task5PayloadLimit {
+				err = &OversizeError{Bound: "payload", Limit: task5PayloadLimit, Actual: len(plain)}
 				return
 			}
 			ciphertext, nonce, keyID, sealErr := a6SealWithRoot(root, "outbox/v1", row.EffectID, row.EndpointID, task5PayloadVersion(row.PayloadVersion), plain)
@@ -1593,9 +1725,25 @@ func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRo
 			if row.EncryptionKeyID == root.ID {
 				continue
 			}
+			if len(row.EncryptedKey) > MaxPluginKeyBytes+16 {
+				err = &OversizeError{Bound: "encrypted plugin key bytes", Limit: MaxPluginKeyBytes + 16, Actual: len(row.EncryptedKey)}
+				return
+			}
+			if len(row.EncryptedValue) > MaxPluginValueBytes+16 {
+				err = &OversizeError{Bound: "encrypted plugin value bytes", Limit: MaxPluginValueBytes + 16, Actual: len(row.EncryptedValue)}
+				return
+			}
+			if len(row.KeyNonce) != 12 || len(row.ValueNonce) != 12 {
+				err = ErrInvalidMetadata
+				return
+			}
 			key, openErr := a6Open(ctx, s.keySource, "plugin-kv-key/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedKey, row.KeyNonce)
 			if openErr != nil {
 				err = openErr
+				return
+			}
+			if len(key) == 0 || len(key) > MaxPluginKeyBytes {
+				err = ErrInvalidMetadata
 				return
 			}
 			if openErr = s.validatePluginKeyIndex(ctx, row.ExtensionID, row.KeyHMAC, key); openErr != nil {
@@ -1605,6 +1753,10 @@ func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRo
 			value, openErr := a6Open(ctx, s.keySource, "plugin-kv-value/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedValue, row.ValueNonce)
 			if openErr != nil {
 				err = openErr
+				return
+			}
+			if len(value) > MaxPluginValueBytes || int64(len(value)) != row.ValueSize {
+				err = ErrInvalidMetadata
 				return
 			}
 			keyCipher, keyNonce, keyID, sealErr := a6SealWithRoot(root, "plugin-kv-key/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, key)
