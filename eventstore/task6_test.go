@@ -216,6 +216,9 @@ func TestReadinessPinAndRootAvailability(t *testing.T) {
 	store, db, source := task6Store(t)
 	defer db.Close()
 	readiness := Readiness{Mode: "import", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: "index-v1", EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), TerminalGlobalPosition: 0, TerminalProjectionPosition: 0, CompletedAt: time.Unix(1, 0).UTC()}
+	if err := store.SetReadiness(context.Background(), Readiness{Mode: "import", SchemaVersion: 2, DatabaseIdentity: "db-1", IndexRootID: source.IndexID, EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC()}); !errors.Is(err, ErrReadinessInvalid) {
+		t.Fatalf("unsupported readiness schema err=%v", err)
+	}
 	if err := store.SetReadiness(context.Background(), readiness); err != nil { t.Fatal(err) }
 	got, err := store.GetReadiness(context.Background())
 	if err != nil || got.Mode != "import" || got.IndexRootID != "index-v1" { t.Fatalf("readiness=%#v err=%v", got, err) }

@@ -31,10 +31,12 @@ const (
 	MaxPluginKeyBytes       = 1024
 	MaxPluginValueBytes     = 8 * 1024 * 1024
 	MaxPluginKeys            = 10000
-	MaxPluginBytes         = 64 * 1024 * 1024
-	MaxPluginScan = 10000
-	MaxPluginResults = 1000
-	MaxPluginResponseBytes = 8 * 1024 * 1024
+	MaxPluginBytes           = 64 * 1024 * 1024
+	MaxPluginScan            = 10000
+	MaxPluginResults         = 1000
+	MaxPluginResponseBytes   = 8 * 1024 * 1024
+
+	supportedReadinessSchemaVersion uint32 = 1
 )
 
 var a6Domains = []string{
@@ -321,7 +323,7 @@ func timeOrZero(v *time.Time) time.Time {
 	return *v
 }
 func validateReadinessValue(r Readiness) error {
-	if r.Mode != "fresh" && r.Mode != "import" || r.SchemaVersion == 0 || strings.TrimSpace(r.DatabaseIdentity) == "" || strings.TrimSpace(r.IndexRootID) == "" {
+	if r.Mode != "fresh" && r.Mode != "import" || r.SchemaVersion == 0 || r.SchemaVersion > supportedReadinessSchemaVersion || strings.TrimSpace(r.DatabaseIdentity) == "" || strings.TrimSpace(r.IndexRootID) == "" {
 		return ErrReadinessInvalid
 	}
 	if len(r.SourceManifestDigest) != 0 && len(r.SourceManifestDigest) != 32 || len(r.TargetManifestDigest) != 0 && len(r.TargetManifestDigest) != 32 {
@@ -431,6 +433,9 @@ func (s *GORMStore) validateReadinessOnDB(ctx context.Context, db *gorm.DB, allo
 		return err
 	}
 	if err = validateReadinessValue(r); err != nil {
+		if r.Mode == "fresh" {
+			return ErrReadinessQuarantined
+		}
 		return err
 	}
 	nonempty, err := readinessDatabaseNonEmpty(ctx, db)
