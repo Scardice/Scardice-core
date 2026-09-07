@@ -376,3 +376,16 @@ func TestOnebotRuntimeInboundQueueBackpressureIsStopCancellable(t *testing.T) {
 		t.Fatal("blocked inbound enqueue was not released by Stop")
 	}
 }
+
+func TestOnebotRuntimeInboundRetryIsBounded(t *testing.T) {
+	event := &onebotRuntimeEvent{kind: "inbound"}
+	if !rehandoffOnebotInbound(event) || !rehandoffOnebotInbound(event) {
+		t.Fatal("expected two bounded rehandoffs")
+	}
+	if event.attempt != maxOnebotInboundRetries {
+		t.Fatalf("attempts = %d, want %d", event.attempt, maxOnebotInboundRetries)
+	}
+	if rehandoffOnebotInbound(event) {
+		t.Fatal("unexpected rehandoff beyond bound")
+	}
+}

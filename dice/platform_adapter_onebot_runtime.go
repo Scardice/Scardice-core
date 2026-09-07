@@ -26,6 +26,7 @@ import (
 )
 
 const maxOnebotInboundBytes = adapterapi.MaxInboundTextBytes
+const maxOnebotInboundRetries uint8 = 2
 
 var ErrOnebotInboundPayloadTooLarge = errors.New("onebot: inbound payload exceeds bound")
 
@@ -79,12 +80,14 @@ type onebotRuntime struct {
 	inboundRejected atomic.Uint64
 	inboundBackpressure atomic.Uint64
 	inboundCollisions atomic.Uint64
+	inboundRetries atomic.Uint64
 }
 type onebotRuntimeEvent struct {
 	kind string
 	kws  *socketio.WebsocketWrapper
 	err  error
 	raw  []byte
+	attempt uint8
 }
 
 func (r *onebotRuntime) admitCallback(fn func()) {
@@ -151,6 +154,11 @@ func (r *onebotRuntime) BackpressureInboundCount() uint64 {
 func (r *onebotRuntime) InboundConflictCount() uint64 {
 	if r == nil { return 0 }
 	return r.inboundCollisions.Load()
+}
+
+func (r *onebotRuntime) InboundRetryCount() uint64 {
+	if r == nil { return 0 }
+	return r.inboundRetries.Load()
 }
 
 func (r *onebotRuntime) Capabilities() adapterapi.CapabilitySet {
@@ -518,6 +526,12 @@ func (r *onebotRuntime) Run(ctx context.Context, core adapterapi.CorePort) (runE
 						continue
 					}
 					if isRetryableOnebotInboundError(err) {
+						if rehandoffOnebotInbound(&event) {
+							r.inboundRetries.Add(1)
+							if r.enqueue(event) {
+								continue
+							}
+						}
 						r.inboundRejected.Add(1)
 						continue
 					}
@@ -527,6 +541,14 @@ func (r *onebotRuntime) Run(ctx context.Context, core adapterapi.CorePort) (runE
 			}
 		}
 	}
+}
+
+func rehandoffOnebotInbound(event *onebotRuntimeEvent) bool {
+	if event == nil || event.attempt >= maxOnebotInboundRetries {
+		return false
+	}
+	event.attempt++
+	return true
 }
 
 func isRetryableOnebotInboundError(err error) bool {

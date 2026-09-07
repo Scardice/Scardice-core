@@ -86,6 +86,7 @@ func TestInboundServiceFallbackDuplicateAndCollision(t *testing.T) {
 	svc, err := NewInboundService(repo, ingressCryptoStub{})
 	if err != nil { t.Fatal(err) }
 	noID := testFencedMessage("", "body")
+	noID.Message.OccurredAt = time.Time{}
 	first, err := svc.HandleInbound(context.Background(), noID)
 	if err != nil { t.Fatal(err) }
 	second, err := svc.HandleInbound(context.Background(), noID)

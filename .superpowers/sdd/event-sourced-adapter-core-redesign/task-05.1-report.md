@@ -123,3 +123,33 @@ ok   Scardice-core/dice
 ok   Scardice-core/eventstore
 ok   Scardice-core/core/messageflow
 ```
+
+## Round 3 fixes
+
+- The pineutil websocket wrapper now bounds its serialized callback queue at 32 events. Admission checks the queue cap before incrementing the wait group, drops overflow without starting another drain, and exposes a dropped-event counter for operational observation. This closes the unbounded wrapper queue around the already-bounded runtime event channel.
+- Retryable dequeued inbound failures now receive at most two bounded rehandoffs through the runtime queue. Exhausted retries are rejected without a Failed lifecycle report or fabricated provider acknowledgement. Conflict handling remains nonfatal and observable through `InboundConflictCount`; retry activity is observable through `InboundRetryCount`.
+- The fallback identity regression now uses a zero `OccurredAt` value, proving deterministic no-ID/no-time duplicate behavior.
+
+### Round 3 RED/GREEN evidence
+
+```text
+go test ./evsocket/v2 -run 'TestWrapperEventQueueIsBounded' -count=1
+FAIL: undefined maxWrapperEventQueue and WebsocketWrapper.DroppedEventCount
+
+go test ./evsocket/v2 -run 'Test(WrapperEventQueueIsBounded|ShutdownWaitDrainsQueuedWrapperEvents)' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+
+go test ./dice ./core/messageflow -run 'Test(InboundServiceFallbackDuplicateAndCollision|OnebotRuntimeInboundRetryIsBounded|OnebotRuntimeInboundQueueBackpressureIsStopCancellable|OnebotInbound)' -count=1
+ok   Scardice-core/dice
+ok   Scardice-core/core/messageflow
+```
+
+No formatter, linter, or project-wide suite was run.
+
+Round 3 files changed:
+
+- `third_party/pineutil/evsocket/v2/socketio.go`
+- `third_party/pineutil/evsocket/v2/socketio_test.go`
+- `dice/platform_adapter_onebot_runtime.go`
+- `dice/platform_adapter_onebot_runtime_test.go`
+- `core/messageflow/inbound_test.go`
