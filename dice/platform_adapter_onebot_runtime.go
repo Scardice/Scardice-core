@@ -78,6 +78,7 @@ type onebotRuntime struct {
 	connections map[*socketio.WebsocketWrapper]chan struct{}
 	inboundRejected atomic.Uint64
 	inboundBackpressure atomic.Uint64
+	inboundCollisions atomic.Uint64
 }
 type onebotRuntimeEvent struct {
 	kind string
@@ -145,6 +146,11 @@ func (r *onebotRuntime) RejectedInboundCount() uint64 {
 func (r *onebotRuntime) BackpressureInboundCount() uint64 {
 	if r == nil { return 0 }
 	return r.inboundBackpressure.Load()
+}
+
+func (r *onebotRuntime) InboundConflictCount() uint64 {
+	if r == nil { return 0 }
+	return r.inboundCollisions.Load()
 }
 
 func (r *onebotRuntime) Capabilities() adapterapi.CapabilitySet {
@@ -506,6 +512,11 @@ func (r *onebotRuntime) Run(ctx context.Context, core adapterapi.CorePort) (runE
 				return err
 			case "inbound":
 				if err := r.handleInbound(runCtx, event.raw); err != nil {
+					if errors.Is(err, eventstore.ErrConflict) {
+						r.inboundCollisions.Add(1)
+						r.inboundRejected.Add(1)
+						continue
+					}
 					if isRetryableOnebotInboundError(err) {
 						r.inboundRejected.Add(1)
 						continue

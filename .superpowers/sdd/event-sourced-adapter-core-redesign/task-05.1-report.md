@@ -108,3 +108,18 @@ ok   Scardice-core/eventstore
 No formatter, linter, or project-wide test suite was run for the fixes. Prior Slice02–04 source/test files are present as untracked shared-worktree dependencies; the fix commit stages only direct Task1 files plus the focused runtime/TTL test files and the directly modified eventstore ingress contracts.
 
 The post-TTL replacement path also checks the delete row count and returns `ErrConflict` if the locked expired identity disappeared concurrently; no silent duplicate admission occurs.
+
+## Round 2 fixes
+
+- Explicit `AllowExpiredDedupe` replacement now applies to every inbox status, including terminal/resolved rows whose ciphertext was already scrubbed. Non-capable legacy callers retain the existing expired-replay rejection behavior. A focused terminal-resolution/post-TTL reaccept test covers this path.
+- Stable-ID body conflicts are treated as nonfatal provider collisions by the runtime: the event is rejected/dropped, collision and rejection counters increment, and the runtime remains alive. Retryable Core/storage ingress errors are likewise consumed without a Failed lifecycle observation. No provider ACK is fabricated; the durable ingress contract is the ACK boundary, while a provider-specific transport can retry according to its own delivery semantics.
+- The expired-row delete is locked and checks `RowsAffected == 1`; concurrent disappearance returns `ErrConflict`.
+
+Round 2 focused verification:
+
+```text
+go test ./dice ./eventstore ./core/messageflow -run 'Test(InboundService|InboxIngressAllowsExplicitReacceptAfter.*DedupeTTL|OnebotInbound|OnebotRuntime)' -count=1
+ok   Scardice-core/dice
+ok   Scardice-core/eventstore
+ok   Scardice-core/core/messageflow
+```
