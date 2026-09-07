@@ -273,3 +273,101 @@ func TestA6UoWRejectsWrongCiphertextKey(t *testing.T) {
 		t.Fatalf("wrong-key UoW err=%v", err)
 	}
 }
+
+func TestA6ArtifactStatusUpdateKeepsPayloadDecryptable(t *testing.T) {
+	store, db, _ := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := store.Commit(ctx, UnitOfWork{Operations: []OperationUpdate{{OperationID: "artifact-status-op", PrincipalID: "artifact-status-owner"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PutArtifact(ctx, ArtifactPutRequest{ArtifactID: "artifact-status", OperationID: "artifact-status-op", OwnerPrincipalID: "artifact-status-owner", Plaintext: []byte("status")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GORM().Model(&operationArtifactRow{}).Where("artifact_id = ?", "artifact-status").Update("status", "ready").Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{ArtifactUpdates: []ArtifactUpdate{{ArtifactID: "artifact-status", Status: "available", ExpectedVersion: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.ConsumeArtifact(ctx, ArtifactConsumeRequest{ArtifactID: "artifact-status"})
+	if err != nil || string(result.Plaintext) != "status" {
+		t.Fatalf("status update consume=%q err=%v", result.Plaintext, err)
+	}
+}
+
+func TestA6ClaimRejectsTamperedPayloadBeforeLease(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	inboxCipher, inboxNonce, inboxKey, err := a6Seal(ctx, source, "inbox/v1", "claim-inbox", "endpoint", 1, []byte("inbox"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcceptInbox(ctx, InboxUpdate{InboxID: "claim-inbox", EndpointID: "endpoint", ProviderEventKey: "provider", LaneHMAC: []byte("lane"), Status: InboxStatusPending, PayloadCiphertext: inboxCipher, PayloadNonce: inboxNonce, DigestKeyID: inboxKey}); err != nil {
+		t.Fatal(err)
+	}
+	var inbox inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", "claim-inbox").First(&inbox).Error; err != nil {
+		t.Fatal(err)
+	}
+	inbox.PayloadCiphertext[0] ^= 1
+	if err := db.GORM().Model(&inboxMessageRow{}).Where("inbox_id = ?", inbox.InboxID).Update("payload_ciphertext", inbox.PayloadCiphertext).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "worker"}); !errors.Is(err, ErrAuthenticationFailed) {
+		t.Fatalf("tampered inbox claim err=%v", err)
+	}
+	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&inbox).Error; err != nil {
+		t.Fatal(err)
+	}
+	if inbox.Status != InboxStatusPending || inbox.Version != 1 {
+		t.Fatalf("tampered inbox mutated row=%#v", inbox)
+	}
+}
+
+func TestA6SparseSecretUpdateResealsNewVersion(t *testing.T) {
+	store, db, _ := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := store.PutSecret(ctx, SecretPutRequest{SecretRef: "sparse-secret", EndpointID: "endpoint", AdapterID: "adapter", Plaintext: []byte("secret")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{SecretUpdates: []SecretUpdate{{SecretRef: "sparse-secret", ExpectedVersion: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := store.ResolveSecret(ctx, "sparse-secret", 2)
+	if err != nil || string(resolved.Plaintext) != "secret" {
+		t.Fatalf("sparse secret=%q err=%v", resolved.Plaintext, err)
+	}
+}
+
+func TestA6ClaimOutboxRejectsTamperedPayloadBeforeLease(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	ciphertext, nonce, keyID, err := a6Seal(ctx, source, "outbox/v1", "claim-effect", "endpoint", 1, []byte("effect"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcceptOutbox(ctx, NewEffect{EffectID: "claim-effect", EndpointID: "endpoint", LaneHMAC: []byte("lane"), EffectType: "send", RiskClass: RiskPreDispatchRetryable, Status: OutboxStatusPending, PayloadCiphertext: ciphertext, PayloadNonce: nonce, DigestKeyID: keyID}); err != nil {
+		t.Fatal(err)
+	}
+	var effect outboxEffectRow
+	if err := db.GORM().Where("effect_id = ?", "claim-effect").First(&effect).Error; err != nil {
+		t.Fatal(err)
+	}
+	effect.PayloadCiphertext[0] ^= 1
+	if err := db.GORM().Model(&outboxEffectRow{}).Where("effect_id = ?", effect.EffectID).Update("payload_ciphertext", effect.PayloadCiphertext).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "worker"}); !errors.Is(err, ErrAuthenticationFailed) {
+		t.Fatalf("tampered effect claim err=%v", err)
+	}
+	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&effect).Error; err != nil {
+		t.Fatal(err)
+	}
+	if effect.Status != OutboxStatusPending || effect.Version != 1 {
+		t.Fatalf("tampered effect mutated row=%#v", effect)
+	}
+}

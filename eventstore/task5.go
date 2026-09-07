@@ -91,11 +91,56 @@ func validateTask5ArtifactOpaquePayload(ciphertext, nonce []byte, keyID string) 
 	}
 	return nil
 }
+func (s *GORMStore) task5ValidatePayload(ctx context.Context, domain, identity, owner string, version uint64, ciphertext, nonce []byte, keyID string, artifact bool) error {
+	if len(ciphertext) == 0 && len(nonce) == 0 {
+		if s.keySource != nil {
+			return ErrAuthenticationFailed
+		}
+		return nil
+	}
+	limitErr := validateTask5OpaquePayload(ciphertext, nonce, keyID)
+	if artifact {
+		limitErr = validateTask5ArtifactOpaquePayload(ciphertext, nonce, keyID)
+	}
+	if limitErr != nil {
+		return limitErr
+	}
+	if s.keySource == nil {
+		return nil
+	}
+	if err := s.requireA6BoundCodec(); err != nil {
+		return err
+	}
+	if _, err := openBoundPayload(ctx, s.codec, domain, identity, owner, version, ciphertext, nonce, keyID); err != nil {
+		return ErrAuthenticationFailed
+	}
+	return nil
+}
 func task5StableDigestEqual(storedDigest []byte, storedKey string, digest []byte, key string) bool {
 	if storedKey != key || len(storedDigest) == 0 || len(digest) == 0 {
 		return false
 	}
 	return bytes.Equal(storedDigest, digest)
+}
+
+func hasBoundPayloadCodec(codec any) bool {
+	_, encryptOK := codec.(interface {
+		EncryptBound(context.Context, string, string, string, uint64, []byte) ([]byte, []byte, string, error)
+	})
+	_, decryptOK := codec.(interface {
+		DecryptBound(context.Context, string, string, string, uint64, []byte, []byte, string) ([]byte, error)
+	})
+	return encryptOK && decryptOK
+}
+
+func (s *GORMStore) requireA6BoundCodec() error {
+	if s == nil || s.keySource == nil {
+		return nil
+	}
+	if !hasBoundPayloadCodec(s.codec) {
+		return ErrEncryptionUnavailable
+	}
+	return nil
 }
 
 func task5InboxDuplicate(row inboxMessageRow, update InboxUpdate) bool {
@@ -292,6 +337,9 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 		return CommitResult{}, err
 	}
 	if s.keySource != nil {
+		if err := s.requireA6BoundCodec(); err != nil {
+			return CommitResult{}, err
+		}
 		if _, decryptErr := openBoundPayload(ctx, s.codec, "inbox/v1", update.InboxID, update.EndpointID, 1, update.PayloadCiphertext, update.PayloadNonce, update.DigestKeyID); decryptErr != nil {
 			return CommitResult{}, ErrAuthenticationFailed
 		}
@@ -448,6 +496,9 @@ func (s *GORMStore) ClaimInbox(ctx context.Context, req InboxClaimRequest) (leas
 			return InboxLease{}, err
 		}
 		return InboxLease{}, ErrPayloadExpired
+	}
+	if err = s.task5ValidatePayload(ctx, "inbox/v1", row.InboxID, row.EndpointID, 1, row.PayloadCiphertext, row.PayloadNonce, row.EncryptionKeyID, false); err != nil {
+		return InboxLease{}, err
 	}
 	if row.LeaseEpoch == maxUint64 {
 		return InboxLease{}, ErrVersionExhausted
@@ -707,6 +758,9 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 		return CommitResult{}, err
 	}
 	if s.keySource != nil {
+		if err := s.requireA6BoundCodec(); err != nil {
+			return CommitResult{}, err
+		}
 		if _, decryptErr := openBoundPayload(ctx, s.codec, "outbox/v1", effect.EffectID, effect.EndpointID, 1, effect.PayloadCiphertext, effect.PayloadNonce, effect.DigestKeyID); decryptErr != nil {
 			return CommitResult{}, ErrAuthenticationFailed
 		}
@@ -885,6 +939,9 @@ func (s *GORMStore) ClaimOutbox(ctx context.Context, req OutboxClaimRequest) (le
 			return OutboxLease{}, err
 		}
 		return OutboxLease{}, ErrPayloadExpired
+	}
+	if err = s.task5ValidatePayload(ctx, "outbox/v1", row.EffectID, row.EndpointID, 1, row.PayloadCiphertext, row.PayloadNonce, row.EncryptionKeyID, false); err != nil {
+		return OutboxLease{}, err
 	}
 	if row.LeaseEpoch == maxUint64 {
 		return OutboxLease{}, ErrVersionExhausted
@@ -1700,6 +1757,9 @@ func (s *GORMStore) PutArtifact(ctx context.Context, req ArtifactPutRequest) (re
 	if req.OwnerPrincipalID != operation.PrincipalID {
 		return ArtifactPutResult{}, ErrInvalidMetadata
 	}
+	if err = s.requireA6BoundCodec(); err != nil {
+		return ArtifactPutResult{}, err
+	}
 	ciphertext, nonce, keyID, err := sealBoundPayload(ctx, s.codec, "artifact/v1", req.ArtifactID, req.OwnerPrincipalID, 1, req.Plaintext)
 	if err != nil {
 		return ArtifactPutResult{}, ErrEncryptionUnavailable
@@ -1770,10 +1830,13 @@ func (s *GORMStore) ConsumeArtifact(ctx context.Context, req ArtifactConsumeRequ
 		}
 		return ArtifactResult{}, ErrArtifactGone
 	}
+	if err = s.requireA6BoundCodec(); err != nil {
+		return ArtifactResult{}, err
+	}
 	if len(row.Ciphertext) == 0 || len(row.Nonce) == 0 {
 		return ArtifactResult{}, ErrArtifactGone
 	}
-	plaintext, openErr := openBoundPayload(ctx, s.codec, "artifact/v1", row.ArtifactID, row.OwnerPrincipalID, row.Version, row.Ciphertext, row.Nonce, row.EncryptionKeyID)
+	plaintext, openErr := openBoundPayload(ctx, s.codec, "artifact/v1", row.ArtifactID, row.OwnerPrincipalID, 1, row.Ciphertext, row.Nonce, row.EncryptionKeyID)
 	if openErr != nil {
 		return ArtifactResult{}, ErrEncryptionUnavailable
 	}

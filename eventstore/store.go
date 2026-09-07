@@ -250,7 +250,6 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 	if ctx == nil { ctx = context.Background() }
 	if err = ValidateUnitOfWork(work); err != nil { return CommitResult{}, err }
 	if initErr := s.initializationError(); initErr != nil { return CommitResult{}, initErr }
-	if err = s.validateA6UnitOfWork(ctx, work); err != nil { return CommitResult{}, err }
 	base := (*gorm.DB)(nil)
 	if s.db != nil { base = s.db.GORM() }
 	if base == nil { return CommitResult{}, errors.New("eventstore: store unavailable") }
@@ -262,8 +261,11 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 		if !committed { _ = tx.Rollback().Error }
 	}()
 
+	var readiness storeReadinessRow
+	if err = locked(tx).Where("singleton_id = ?", "default").First(&readiness).Error; err != nil { return CommitResult{}, errors.New("eventstore: lock readiness failed") }
 	var control projectionControlRow
 	if err = locked(tx).Where("singleton_id = ?", "default").First(&control).Error; err != nil { return CommitResult{}, errors.New("eventstore: lock projection control failed") }
+	if err = s.validateA6UnitOfWorkWithDB(ctx, tx, work); err != nil { return CommitResult{}, err }
 	s.observeLock(tableProjectionControl)
 
 	type headState struct { stream StreamID; current uint64 }
@@ -471,31 +473,262 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 	return nil
 }
 	applyArts := func() error { return s.applyTask5ArtifactParticipants(tx, work, result) }
-	applySecrets := func() error { secrets := append([]SecretUpdate(nil), work.SecretUpdates...); sort.Slice(secrets, func(i,j int) bool{return secrets[i].SecretRef < secrets[j].SecretRef})
-	for _, update := range secrets {
-		if update.SecretRef=="" { return ErrParticipantFailure }
-		var latest adapterSecretRow
-		q:=tx.Where("secret_ref = ?",update.SecretRef).Order("row_version DESC").First(&latest); current:=uint64(0)
-		if q.Error==nil { current=latest.RowVersion } else if !errors.Is(q.Error,gorm.ErrRecordNotFound) { return ErrParticipantFailure }
-		if err:=participantVersion(update.ExpectedVersion,current,update.Version,tableAdapterSecrets,"<redacted>");err!=nil{return err}
-		version, err := nextVersion(current); if err != nil { return err }; secretVersion:=update.SecretVersion; if secretVersion==0 {if current>0 {if latest.SecretVersion==maxUint64{return ErrVersionExhausted};secretVersion=latest.SecretVersion+1} else {secretVersion=1}}; if current>0 && secretVersion<=latest.SecretVersion{return ErrParticipantConflict}
-		row:=latest; row.SecretRef=update.SecretRef; row.SecretVersion=secretVersion; row.RowVersion=version; if current==0 { row.EndpointID=nonempty(update.EndpointID,"unknown"); row.AdapterID=nonempty(update.AdapterID,"unknown"); row.AdapterType="opaque"; row.Ciphertext=nonemptyBytes(update.Ciphertext); row.Nonce=nonemptyBytes(update.Nonce); row.EncryptionKeyID=nonempty(update.EncryptionKeyID,"opaque"); row.CreatedAt=time.Now().UTC() }; if update.EndpointID!="" {row.EndpointID=update.EndpointID}; if update.AdapterID!="" {row.AdapterID=update.AdapterID}; if len(update.Ciphertext)>0 {row.Ciphertext=update.Ciphertext}; if len(update.Nonce)>0 {row.Nonce=update.Nonce}; if update.EncryptionKeyID!="" {row.EncryptionKeyID=update.EncryptionKeyID}; row.UpdatedAt=chooseTime(update.UpdatedAt,time.Now().UTC())
-		q=tx.Create(&row); if q.Error!=nil{return ErrParticipantFailure}; result.SecretRefs=append(result.SecretRefs,update.SecretRef)
+	applySecrets := func() error {
+		secrets := append([]SecretUpdate(nil), work.SecretUpdates...)
+		sort.Slice(secrets, func(i, j int) bool { return secrets[i].SecretRef < secrets[j].SecretRef })
+		for _, update := range secrets {
+			if update.SecretRef == "" {
+				return ErrParticipantFailure
+			}
+			var latest adapterSecretRow
+			q := tx.Where("secret_ref = ?", update.SecretRef).Order("row_version DESC").First(&latest)
+			current := uint64(0)
+			if q.Error == nil {
+				current = latest.RowVersion
+			} else if !errors.Is(q.Error, gorm.ErrRecordNotFound) {
+				return ErrParticipantFailure
+			}
+			if err := participantVersion(update.ExpectedVersion, current, update.Version, tableAdapterSecrets, "<redacted>"); err != nil {
+				return err
+			}
+			version, err := nextVersion(current)
+			if err != nil {
+				return err
+			}
+			secretVersion := update.SecretVersion
+			if secretVersion == 0 {
+				secretVersion = 1
+				if current > 0 {
+					if latest.SecretVersion == maxUint64 {
+						return ErrVersionExhausted
+					}
+					secretVersion = latest.SecretVersion + 1
+				}
+			}
+			if current > 0 && secretVersion <= latest.SecretVersion {
+				return ErrParticipantConflict
+			}
+			allCipher := len(update.Ciphertext) > 0 && len(update.Nonce) > 0 && (update.EncryptionKeyID != "" || s.keySource == nil)
+			anyCipher := len(update.Ciphertext) > 0 || len(update.Nonce) > 0 || update.EncryptionKeyID != ""
+			if s.keySource != nil && anyCipher && !allCipher {
+				return ErrInvalidMetadata
+			}
+			if current == 0 && s.keySource != nil && !allCipher {
+				return ErrInvalidMetadata
+			}
+			row := latest
+			row.SecretRef = update.SecretRef
+			row.SecretVersion = secretVersion
+			row.RowVersion = version
+			if current == 0 {
+				row.EndpointID = update.EndpointID
+				row.AdapterID = update.AdapterID
+				row.AdapterType = "opaque"
+				row.Ciphertext = append([]byte(nil), update.Ciphertext...)
+				row.Nonce = append([]byte(nil), update.Nonce...)
+				row.EncryptionKeyID = update.EncryptionKeyID
+				if s.keySource == nil {
+					row.Ciphertext = nonemptyBytes(row.Ciphertext)
+					row.Nonce = nonemptyBytes(row.Nonce)
+					row.EncryptionKeyID = nonempty(row.EncryptionKeyID, "opaque")
+				}
+				row.CreatedAt = time.Now().UTC()
+			} else {
+				if update.EndpointID != "" {
+					row.EndpointID = update.EndpointID
+				}
+				if update.AdapterID != "" {
+					row.AdapterID = update.AdapterID
+				}
+				if allCipher {
+					row.Ciphertext = append([]byte(nil), update.Ciphertext...)
+					row.Nonce = append([]byte(nil), update.Nonce...)
+					if update.EncryptionKeyID != "" {
+						row.EncryptionKeyID = update.EncryptionKeyID
+					}
+				} else if s.keySource != nil {
+					plain, openErr := a6Open(ctx, s.keySource, "adapter-secret/v1", latest.SecretRef, latest.EndpointID+"/"+latest.AdapterID, latest.SecretVersion, latest.EncryptionKeyID, latest.Ciphertext, latest.Nonce)
+					if openErr != nil {
+						return ErrAuthenticationFailed
+					}
+					ciphertext, nonce, keyID, sealErr := a6Seal(ctx, s.keySource, "adapter-secret/v1", row.SecretRef, row.EndpointID+"/"+row.AdapterID, row.SecretVersion, plain)
+					if sealErr != nil {
+						return ErrEncryptionUnavailable
+					}
+					row.Ciphertext, row.Nonce, row.EncryptionKeyID = ciphertext, nonce, keyID
+				}
+			}
+			row.UpdatedAt = chooseTime(update.UpdatedAt, time.Now().UTC())
+			if len(row.Ciphertext) == 0 || len(row.Nonce) == 0 || row.EncryptionKeyID == "" {
+				return ErrInvalidMetadata
+			}
+			q = tx.Create(&row)
+			if q.Error != nil {
+				return ErrParticipantFailure
+			}
+			result.SecretRefs = append(result.SecretRefs, update.SecretRef)
+		}
+		return nil
 	}
-	return nil
-}
-	applyPlugins := func() error { plugins := append([]PluginKVUpdate(nil), work.PluginKVUpdates...);sort.Slice(plugins,func(i,j int)bool{if plugins[i].ExtensionID!=plugins[j].ExtensionID{return plugins[i].ExtensionID<plugins[j].ExtensionID};return string(plugins[i].KeyHMAC)<string(plugins[j].KeyHMAC)})
-	for _, update := range plugins {
-		if update.ExtensionID=="" || len(update.KeyHMAC)==0 {return ErrParticipantFailure}
-		var row pluginKVRow; q:=tx.Where("extension_id = ? AND key_hmac = ?",update.ExtensionID,update.KeyHMAC).First(&row); current:=uint64(0)
-		if q.Error==nil {current=row.RowVersion} else if !errors.Is(q.Error,gorm.ErrRecordNotFound){return ErrParticipantFailure}
-		if err:=participantVersion(update.ExpectedVersion,current,update.Version,tablePluginKV,"<redacted>");err!=nil{return err}
-		if update.Deleted { if current==0{return &ParticipantConflictError{Conflicts:[]ParticipantConflict{{Table:tablePluginKV,Key:"<redacted>",ExpectedVersion:update.ExpectedVersion,CurrentVersion:current}}}}; q=tx.Where("extension_id = ? AND key_hmac = ? AND row_version = ?",update.ExtensionID,update.KeyHMAC,current).Delete(&pluginKVRow{}); if err:=participantCAS(tablePluginKV,"<redacted>",update.ExpectedVersion,current,q);err!=nil{return err}; result.PluginKVIndexes=append(result.PluginKVIndexes,append([]byte(nil),update.KeyHMAC...)); continue }
-		version, err := nextVersion(current); if err != nil { return err }; if current == 0 {row=pluginKVRow{ExtensionID:update.ExtensionID,KeyHMAC:update.KeyHMAC,EncryptedKey:nonemptyBytes(update.KeyCiphertext),KeyNonce:nonemptyBytes(update.KeyNonce),EncryptedValue:nonemptyBytes(update.ValueCiphertext),ValueNonce:nonemptyBytes(update.ValueNonce),ValueSize:update.ValueSize,RowVersion:version,EncryptionKeyID:nonempty(update.EncryptionKeyID,"opaque"),CreatedAt:time.Now().UTC(),UpdatedAt:chooseTime(update.UpdatedAt,time.Now().UTC())}} else {if len(update.KeyCiphertext)>0{row.EncryptedKey=update.KeyCiphertext};if len(update.KeyNonce)>0{row.KeyNonce=update.KeyNonce};if len(update.ValueCiphertext)>0{row.EncryptedValue=update.ValueCiphertext};if len(update.ValueNonce)>0{row.ValueNonce=update.ValueNonce};if update.ValueSize!=0{row.ValueSize=update.ValueSize};if update.EncryptionKeyID!=""{row.EncryptionKeyID=update.EncryptionKeyID};row.RowVersion=version;row.UpdatedAt=chooseTime(update.UpdatedAt,time.Now().UTC());q=tx.Model(&pluginKVRow{}).Where("extension_id = ? AND key_hmac = ? AND row_version = ?",update.ExtensionID,update.KeyHMAC,current).Updates(map[string]any{"encrypted_key":row.EncryptedKey,"key_nonce":row.KeyNonce,"encrypted_value":row.EncryptedValue,"value_nonce":row.ValueNonce,"value_size":row.ValueSize,"row_version":version,"updated_at":row.UpdatedAt,"encryption_key_id":row.EncryptionKeyID});if err:=participantCAS(tablePluginKV,"<redacted>",update.ExpectedVersion,current,q);err!=nil{return err};result.PluginKVIndexes=append(result.PluginKVIndexes,append([]byte(nil),update.KeyHMAC...));continue}
-		if q=tx.Create(&row);q.Error!=nil{return ErrParticipantFailure}; result.PluginKVIndexes=append(result.PluginKVIndexes,append([]byte(nil),update.KeyHMAC...))
+	applyPlugins := func() error {
+		plugins := append([]PluginKVUpdate(nil), work.PluginKVUpdates...)
+		sort.Slice(plugins, func(i, j int) bool {
+			if plugins[i].ExtensionID != plugins[j].ExtensionID {
+				return plugins[i].ExtensionID < plugins[j].ExtensionID
+			}
+			return string(plugins[i].KeyHMAC) < string(plugins[j].KeyHMAC)
+		})
+		if len(plugins) == 0 {
+			return nil
+		}
+		if err := lockPluginQuota(tx); err != nil {
+			return err
+		}
+		type quota struct{ count, usage int64 }
+		quotas := make(map[string]quota)
+		loadQuota := func(extension string) (quota, error) {
+			if q, ok := quotas[extension]; ok {
+				return q, nil
+			}
+			var rows []pluginKVRow
+			if err := tx.Where("extension_id = ?", extension).Order("key_hmac ASC").Limit(MaxPluginScan + 1).Find(&rows).Error; err != nil {
+				return quota{}, ErrParticipantFailure
+			}
+			if len(rows) > MaxPluginScan {
+				return quota{}, ErrOversizeInput
+			}
+			q := quota{count: int64(len(rows))}
+			for _, row := range rows {
+				if row.ValueSize < 0 || row.ValueSize > MaxPluginValueBytes {
+					return quota{}, ErrInvalidMetadata
+				}
+				if s.keySource != nil {
+					plain, openErr := a6Open(ctx, s.keySource, "plugin-kv-value/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedValue, row.ValueNonce)
+					if openErr != nil || int64(len(plain)) != row.ValueSize {
+						return quota{}, ErrAuthenticationFailed
+					}
+				}
+				q.usage += row.ValueSize
+			}
+			if q.usage > MaxPluginBytes {
+				return quota{}, ErrOversizeInput
+			}
+			quotas[extension] = q
+			return q, nil
+		}
+		for _, update := range plugins {
+			if update.ExtensionID == "" || len(update.KeyHMAC) == 0 || s.keySource != nil && len(update.KeyHMAC) != 32 {
+				return ErrParticipantFailure
+			}
+			if update.ValueSize < 0 || update.ValueSize > MaxPluginValueBytes {
+				return ErrOversizeInput
+			}
+			if update.Deleted {
+				currentQuota, err := loadQuota(update.ExtensionID)
+				if err != nil {
+					return err
+				}
+				var row pluginKVRow
+				q := tx.Where("extension_id = ? AND key_hmac = ?", update.ExtensionID, update.KeyHMAC).First(&row)
+				if errors.Is(q.Error, gorm.ErrRecordNotFound) {
+					return &ParticipantConflictError{Conflicts: []ParticipantConflict{{Table: tablePluginKV, Key: "<redacted>", ExpectedVersion: update.ExpectedVersion, CurrentVersion: 0}}}
+				}
+				if q.Error != nil {
+					return ErrParticipantFailure
+				}
+				if err := participantVersion(update.ExpectedVersion, row.RowVersion, update.Version, tablePluginKV, "<redacted>"); err != nil {
+					return err
+				}
+				q = tx.Where("extension_id = ? AND key_hmac = ? AND row_version = ?", update.ExtensionID, update.KeyHMAC, row.RowVersion).Delete(&pluginKVRow{})
+				if err := participantCAS(tablePluginKV, "<redacted>", update.ExpectedVersion, row.RowVersion, q); err != nil {
+					return err
+				}
+				currentQuota.count--
+				currentQuota.usage -= row.ValueSize
+				quotas[update.ExtensionID] = currentQuota
+				result.PluginKVIndexes = append(result.PluginKVIndexes, append([]byte(nil), update.KeyHMAC...))
+				continue
+			}
+			keyLen := len(update.KeyCiphertext)
+			valueLen := len(update.ValueCiphertext)
+			if s.keySource == nil && (keyLen > MaxPluginKeyBytes+16 || valueLen > MaxPluginValueBytes+16) {
+				return ErrOversizeInput
+			}
+			var row pluginKVRow
+			q := tx.Where("extension_id = ? AND key_hmac = ?", update.ExtensionID, update.KeyHMAC).First(&row)
+			current := uint64(0)
+			if q.Error == nil {
+				current = row.RowVersion
+			} else if !errors.Is(q.Error, gorm.ErrRecordNotFound) {
+				return ErrParticipantFailure
+			}
+			if err := participantVersion(update.ExpectedVersion, current, update.Version, tablePluginKV, "<redacted>"); err != nil {
+				return err
+			}
+			if current == 0 && s.keySource != nil && (len(update.KeyCiphertext) == 0 || len(update.KeyNonce) == 0 || len(update.ValueCiphertext) == 0 || len(update.ValueNonce) == 0 || update.EncryptionKeyID == "") {
+				return ErrInvalidMetadata
+			}
+			currentQuota, err := loadQuota(update.ExtensionID)
+			if err != nil {
+				return err
+			}
+			oldSize := int64(0)
+			if current > 0 {
+				oldSize = row.ValueSize
+			} else if currentQuota.count >= MaxPluginKeys {
+				return ErrOversizeInput
+			}
+			version, err := nextVersion(current)
+			if err != nil {
+				return err
+			}
+			if current == 0 {
+				row = pluginKVRow{ExtensionID: update.ExtensionID, KeyHMAC: append([]byte(nil), update.KeyHMAC...), EncryptedKey: append([]byte(nil), update.KeyCiphertext...), KeyNonce: append([]byte(nil), update.KeyNonce...), EncryptedValue: append([]byte(nil), update.ValueCiphertext...), ValueNonce: append([]byte(nil), update.ValueNonce...), ValueSize: update.ValueSize, RowVersion: version, EncryptionKeyID: update.EncryptionKeyID, CreatedAt: chooseTime(update.UpdatedAt, time.Now().UTC()), UpdatedAt: chooseTime(update.UpdatedAt, time.Now().UTC())}
+				if s.keySource == nil {
+					row.EncryptedKey = nonemptyBytes(row.EncryptedKey)
+					row.KeyNonce = nonemptyBytes(row.KeyNonce)
+					row.EncryptedValue = nonemptyBytes(row.EncryptedValue)
+					row.ValueNonce = nonemptyBytes(row.ValueNonce)
+					row.EncryptionKeyID = nonempty(row.EncryptionKeyID, "opaque")
+				}
+				q = tx.Create(&row)
+			} else {
+				if len(update.KeyCiphertext) > 0 {
+					row.EncryptedKey = append([]byte(nil), update.KeyCiphertext...)
+				}
+				if len(update.KeyNonce) > 0 {
+					row.KeyNonce = append([]byte(nil), update.KeyNonce...)
+				}
+				if len(update.ValueCiphertext) > 0 {
+					row.EncryptedValue = append([]byte(nil), update.ValueCiphertext...)
+					row.ValueSize = update.ValueSize
+				}
+				if len(update.ValueNonce) > 0 {
+					row.ValueNonce = append([]byte(nil), update.ValueNonce...)
+				}
+				if update.EncryptionKeyID != "" {
+					row.EncryptionKeyID = update.EncryptionKeyID
+				}
+				row.RowVersion = version
+				row.UpdatedAt = chooseTime(update.UpdatedAt, time.Now().UTC())
+				q = tx.Model(&pluginKVRow{}).Where("extension_id = ? AND key_hmac = ? AND row_version = ?", update.ExtensionID, update.KeyHMAC, current).Updates(map[string]any{"encrypted_key": row.EncryptedKey, "key_nonce": row.KeyNonce, "encrypted_value": row.EncryptedValue, "value_nonce": row.ValueNonce, "value_size": row.ValueSize, "row_version": row.RowVersion, "encryption_key_id": row.EncryptionKeyID, "updated_at": row.UpdatedAt})
+			}
+			if err := participantCAS(tablePluginKV, "<redacted>", update.ExpectedVersion, current, q); err != nil {
+				return err
+			}
+			currentQuota.usage -= oldSize
+			currentQuota.usage += row.ValueSize
+			if current == 0 {
+				currentQuota.count++
+			}
+			if currentQuota.usage > MaxPluginBytes {
+				return ErrOversizeInput
+			}
+			quotas[update.ExtensionID] = currentQuota
+			result.PluginKVIndexes = append(result.PluginKVIndexes, append([]byte(nil), update.KeyHMAC...))
+		}
+		return nil
 	}
-	return nil
-}
 	applyInbox := func() error { return s.applyTask5InboxParticipants(tx, work, result) }
 	applyEffects := func() error { return s.applyTask5EffectParticipants(tx, work, result) }
 	applyFences := func() error { fences := append([]SubjectFenceUpdate(nil), work.FenceUpdates...); sort.Slice(fences,func(i,j int)bool{if string(fences[i].SubjectKey)!=string(fences[j].SubjectKey){return string(fences[i].SubjectKey)<string(fences[j].SubjectKey)};return fences[i].Scope<fences[j].Scope})
