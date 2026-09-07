@@ -215,4 +215,21 @@ ok  	Scardice-core/eventstore	6.280s
 ```
 
 Twenty-seventh-round implementation and regression coverage: `c28bf123`.
+
+Twenty-eighth-round source commit `b71a96a9` applies the same storage-width overflow fence to public `SetPluginKV` updates before root sealing and row CAS. `TestSetPluginKVVersionOverflowFailsBeforeSeal` verifies a maximum SQLite-storable row returns `ErrVersionExhausted` instead of wrapping the AAD version or surfacing a later participant failure.
+
+Additional verification after `b71a96a9`:
+
+```text
+go test ./eventstore -run 'TestSetPluginKVVersionOverflowFailsBeforeSeal|TestA6UOWPluginVersionOverflowFailsBeforeAuthentication' -count=1
+ok  	Scardice-core/eventstore	0.019s
+
+go test ./eventstore -count=1
+ok  	Scardice-core/eventstore	1.319s
+
+go test -race ./eventstore -count=1
+ok  	Scardice-core/eventstore	6.588s
+```
+
+Twenty-eighth-round implementation and regression coverage: `b71a96a9`.
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
