@@ -619,6 +619,7 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		}
 		return nil
 	}
+	operationOwners := make(map[string]string, len(work.Operations))
 	for _, update := range work.Operations {
 		if update.OperationID == "" {
 			return ErrInvalidMetadata
@@ -629,6 +630,14 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		if !existingFound && !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
 			return ErrParticipantFailure
 		}
+		principal := update.PrincipalID
+		if principal == "" && existingFound {
+			principal = existing.PrincipalID
+		}
+		if principal == "" {
+			principal = update.OperationID
+		}
+		operationOwners[update.OperationID] = principal
 		hasCipher := len(update.PrivateContextCiphertext) > 0 || len(update.PrivateContextNonce) > 0 || update.EncryptionKeyID != ""
 		allCipher := len(update.PrivateContextCiphertext) > 0 && len(update.PrivateContextNonce) > 0 && update.EncryptionKeyID != ""
 		if hasCipher && !allCipher {
@@ -750,9 +759,12 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 			}
 		}
 		if workOperation != nil {
-			principal := workOperation.PrincipalID
+			principal := operationOwners[workOperation.OperationID]
 			if principal == "" {
-				principal = workOperation.OperationID
+				principal = workOperation.PrincipalID
+				if principal == "" {
+					principal = workOperation.OperationID
+				}
 			}
 			if owner == "" {
 				owner = principal

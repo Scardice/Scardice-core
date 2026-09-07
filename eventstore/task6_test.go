@@ -1249,6 +1249,43 @@ func TestA6UOWArtifactDerivesOwnerFromSameUOWOperation(t *testing.T) {
 	}
 }
 
+func TestA6UOWSparseOperationUsesPersistedPrincipalForArtifactAAD(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	operationID := "sparse-owner-operation"
+	privateCiphertext, privateNonce, keyID, err := a6Seal(ctx, source, "operation-private/v1", operationID, "persisted-owner", 1, []byte("private"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{Operations: []OperationUpdate{{
+		OperationID: operationID, PrincipalID: "persisted-owner",
+		PrivateContextCiphertext: privateCiphertext, PrivateContextNonce: privateNonce, EncryptionKeyID: keyID,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	artifactCiphertext, artifactNonce, artifactKeyID, err := a6Seal(ctx, source, "artifact/v1", "sparse-owner-artifact", "persisted-owner", 1, []byte("artifact"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{
+		Operations: []OperationUpdate{{OperationID: operationID, ExpectedVersion: 1}},
+		ArtifactUpdates: []ArtifactUpdate{{
+			ArtifactID: "sparse-owner-artifact", OperationID: operationID, Size: 8,
+			Ciphertext: artifactCiphertext, Nonce: artifactNonce, EncryptionKeyID: artifactKeyID,
+		}},
+	}); err != nil {
+		t.Fatalf("sparse operation artifact AAD err=%v", err)
+	}
+	var row operationArtifactRow
+	if err := db.GORM().Where("artifact_id = ?", "sparse-owner-artifact").First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.OwnerPrincipalID != "persisted-owner" {
+		t.Fatalf("artifact owner=%q", row.OwnerPrincipalID)
+	}
+}
+
 func TestA6UOWExpiredArtifactPrecedesPayloadAuthentication(t *testing.T) {
 	store, db, source := task6Store(t)
 	defer db.Close()
