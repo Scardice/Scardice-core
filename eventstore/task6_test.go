@@ -1477,6 +1477,27 @@ func TestSetPluginKVVersionOverflowFailsBeforeSeal(t *testing.T) {
 	}
 }
 
+func TestA6UOWOperationVersionOverflowPrecedesPrivateAuthentication(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	now := time.Now().UTC()
+	row := operationRow{
+		Version: maxPersistedVersion, Status: "pending", OperationID: "overflow-operation", Kind: "test",
+		PrincipalID: "owner", IdempotencyScope: "scope", IdempotencyKey: "overflow-operation",
+		PrivatePayloadVersion: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := db.GORM().Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	_, err := store.Commit(context.Background(), UnitOfWork{Operations: []OperationUpdate{{
+		OperationID: row.OperationID, ExpectedVersion: row.Version, PrincipalID: row.PrincipalID,
+		PrivateContextCiphertext: []byte{1}, PrivateContextNonce: make([]byte, 12), EncryptionKeyID: source.CurrentID,
+	}}})
+	if !errors.Is(err, ErrVersionExhausted) {
+		t.Fatalf("operation version overflow err=%v", err)
+	}
+}
+
 func itemKeyHMAC(t *testing.T, source KeySource, extension, key string) []byte {
 	t.Helper()
 	index, err := a6HMAC(context.Background(), source, "plugin-key-index/v1", extension, key)

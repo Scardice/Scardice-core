@@ -627,8 +627,11 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 			return ErrInvalidMetadata
 		}
 		var existing operationRow
-		lookupErr := db.WithContext(ctx).Select("principal_id, private_context, private_nonce, private_key_id, private_payload_version").Where("operation_id = ?", update.OperationID).First(&existing).Error
+		lookupErr := db.WithContext(ctx).Select("version, principal_id, private_context, private_nonce, private_key_id, private_payload_version").Where("operation_id = ?", update.OperationID).First(&existing).Error
 		existingFound := lookupErr == nil
+		if existingFound && existing.Version >= maxPersistedVersion {
+			return ErrVersionExhausted
+		}
 		if !existingFound && !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
 			return ErrParticipantFailure
 		}
@@ -688,6 +691,9 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		var existing inboxMessageRow
 		lookup := locked(db).Where("inbox_id = ?", update.InboxID).First(&existing)
 		if lookup.Error == nil {
+			if existing.Version >= maxPersistedVersion {
+				return ErrVersionExhausted
+			}
 			if inboxUnresolved(existing.Status) && existing.PayloadExpiresAt != nil && !existing.PayloadExpiresAt.After(s.task5Now()) {
 				return &task5ExpiredPayloadError{table: tableInboxMessages, id: existing.InboxID, now: s.task5Now()}
 			}
@@ -726,6 +732,9 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		var existing outboxEffectRow
 		lookup := locked(db).Where("effect_id = ?", effect.EffectID).First(&existing)
 		if lookup.Error == nil {
+			if existing.Version >= maxPersistedVersion {
+				return ErrVersionExhausted
+			}
 			if outboxUnresolved(existing.Status) && existing.PayloadExpiresAt != nil && !existing.PayloadExpiresAt.After(s.task5Now()) {
 				return &task5ExpiredPayloadError{table: tableOutboxEffects, id: existing.EffectID, now: s.task5Now()}
 			}
@@ -793,11 +802,11 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		}
 		version := uint64(1)
 		var existingArtifact operationArtifactRow
-		if err := s.validateA6KeyID(ctx, db, update.EncryptionKeyID); err != nil {
-			return err
-		}
-		versionQuery := db.WithContext(ctx).Select("payload_version").Where("artifact_id = ?", update.ArtifactID).First(&existingArtifact)
+		versionQuery := db.WithContext(ctx).Select("version, payload_version").Where("artifact_id = ?", update.ArtifactID).First(&existingArtifact)
 		if versionQuery.Error == nil {
+			if existingArtifact.Version >= maxPersistedVersion {
+				return ErrVersionExhausted
+			}
 			version = task5PayloadVersion(existingArtifact.PayloadVersion)
 		} else if !errors.Is(versionQuery.Error, gorm.ErrRecordNotFound) {
 			return ErrParticipantFailure
