@@ -811,6 +811,9 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		} else if !errors.Is(versionQuery.Error, gorm.ErrRecordNotFound) {
 			return ErrParticipantFailure
 		}
+		if err := s.validateA6KeyID(ctx, db, update.EncryptionKeyID); err != nil {
+			return err
+		}
 		if _, err := openBoundPayload(ctx, s.codec, "artifact/v1", update.ArtifactID, owner, version, update.Ciphertext, update.Nonce, update.EncryptionKeyID); err != nil {
 			return ErrAuthenticationFailed
 		}

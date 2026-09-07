@@ -1498,6 +1498,22 @@ func TestA6UOWOperationVersionOverflowPrecedesPrivateAuthentication(t *testing.T
 	}
 }
 
+func TestA6UOWArtifactRejectsUnadmittedEncryptionRoot(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := store.Commit(ctx, UnitOfWork{Operations: []OperationUpdate{{OperationID: "unadmitted-artifact-operation", PrincipalID: "owner"}}}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := store.Commit(ctx, UnitOfWork{ArtifactUpdates: []ArtifactUpdate{{
+		ArtifactID: "unadmitted-artifact", OperationID: "unadmitted-artifact-operation", OwnerPrincipalID: "owner",
+		Size: 1, Ciphertext: []byte{1}, Nonce: make([]byte, 12), EncryptionKeyID: source.CurrentID + "-unadmitted",
+	}}})
+	if !errors.Is(err, ErrReadinessQuarantined) {
+		t.Fatalf("unadmitted artifact root err=%v", err)
+	}
+}
+
 func itemKeyHMAC(t *testing.T, source KeySource, extension, key string) []byte {
 	t.Helper()
 	index, err := a6HMAC(context.Background(), source, "plugin-key-index/v1", extension, key)
