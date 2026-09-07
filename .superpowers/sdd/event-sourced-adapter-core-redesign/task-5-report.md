@@ -232,4 +232,21 @@ ok  	Scardice-core/eventstore	6.588s
 ```
 
 Twenty-eighth-round implementation and regression coverage: `b71a96a9`.
+
+Twenty-ninth-round source commit `db734667` adds storage-width guards for secret row/secret-version allocation in both A6 UoW validation and public `PutSecret`, before AAD authentication/sealing. Startup readiness now bootstraps only the canonical fresh/unconfigured singleton; malformed or unsupported readiness is rejected fail-closed. Readiness repair clears only readiness initialization errors, preserving unrelated invalid projector option errors. Regression coverage includes `TestSecretVersionOverflowFailsBeforeAuthenticationAndSeal`, `TestA6StartupRejectsMalformedUnconfiguredReadiness`, and `TestA6ReadinessBootstrapPreservesProjectorInitError`.
+
+Additional verification after `db734667`:
+
+```text
+go test ./eventstore -run 'TestSecretVersionOverflowFailsBeforeAuthenticationAndSeal|TestA6StartupRejectsMalformedUnconfiguredReadiness|TestA6ReadinessBootstrapPreservesProjectorInitError|TestA6StartupReadinessGate' -count=1
+ok  	Scardice-core/eventstore	0.064s
+
+go test ./eventstore -count=1
+ok  	Scardice-core/eventstore	1.454s
+
+go test -race ./eventstore -count=1
+ok  	Scardice-core/eventstore	6.975s
+```
+
+Twenty-ninth-round implementation and regression coverage: `db734667`.
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
