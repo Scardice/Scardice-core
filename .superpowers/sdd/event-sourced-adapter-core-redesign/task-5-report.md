@@ -147,4 +147,21 @@ ok  	Scardice-core/eventstore	5.590s
 ```
 
 Twenty-third-round implementation and regression coverage: `3a84eaf8`.
+
+Twenty-fourth-round source commit `a158afa7` applies the same post-scrub operator-resolution rule to inboxes: only pending/leased expired rows are rejected as payload-expired; callback-started and ambiguous rows remain resolvable with skip/confirmed-consumed CAS after their bytes have been scrubbed. `TestInboxCallbackExpiryScrubsWithoutUnblockingRetry` now expires a callback-started row, verifies scrubbing, and resolves it.
+
+Additional verification after `a158afa7`:
+
+```text
+go test ./eventstore -run 'TestInboxCallbackExpiryScrubsWithoutUnblockingRetry|TestInboxPayloadExpiryScrubsWithoutUnblockingRetry' -count=1
+ok  	Scardice-core/eventstore	0.020s
+
+go test ./eventstore -count=1
+ok  	Scardice-core/eventstore	1.201s
+
+go test -race ./eventstore -count=1
+ok  	Scardice-core/eventstore	5.538s
+```
+
+Twenty-fourth-round implementation and regression coverage: `a158afa7`.
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
