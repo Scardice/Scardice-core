@@ -436,6 +436,21 @@ func TestOutboxNonIdempotentDispatchExpiryBecomesAmbiguous(t *testing.T) {
 	}
 }
 
+
+func TestTask5PersistedVersionWidthOverflowFailsClosed(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	effect := task5Effect("persisted-width-effect", "persisted-width-lane")
+	if _, err := store.AcceptOutbox(context.Background(), effect); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GORM().Model(&outboxEffectRow{}).Where("effect_id = ?", effect.EffectID).Update("version", maxPersistedVersion).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimOutbox(context.Background(), OutboxClaimRequest{WorkerID: "worker", LeaseDuration: time.Minute}); !errors.Is(err, ErrVersionExhausted) {
+		t.Fatalf("persisted outbox version overflow err=%v", err)
+	}
+}
 func TestArtifactFailsClosedWithoutCodec(t *testing.T) {
 	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "no-codec.db")})
 	if err != nil {

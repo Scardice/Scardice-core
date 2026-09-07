@@ -614,7 +614,7 @@ const maxUint64 = ^uint64(0)
 const maxPersistedVersion = uint64(^uint64(0) >> 1)
 
 func nextVersion(current uint64) (uint64, error) {
-	if current == maxUint64 {
+	if current >= maxPersistedVersion {
 		return 0, ErrVersionExhausted
 	}
 	return current + 1, nil
@@ -624,8 +624,8 @@ func nextVersion(current uint64) (uint64, error) {
 func participantVersion(expected, current, supplied uint64, table, key string) error {
 	if expected != current { return &ParticipantConflictError{Conflicts: []ParticipantConflict{{Table: table, Key: key, ExpectedVersion: expected, CurrentVersion: current}}} }
 	if supplied != 0 {
-		if current == maxUint64 { return ErrVersionExhausted }
-		if supplied != current+1 { return ErrParticipantConflict }
+		if current >= maxPersistedVersion { return ErrVersionExhausted }
+		if supplied != current+1 { return &ParticipantConflictError{Conflicts: []ParticipantConflict{{Table: table, Key: key, ExpectedVersion: supplied, CurrentVersion: current}}} }
 	}
 	return nil
 }

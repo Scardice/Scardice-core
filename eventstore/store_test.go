@@ -192,5 +192,5 @@ func TestParticipantConflictIsTypedAndRedacted(t *testing.T) {
 func TestVersionExhaustionRejectsWithoutMutation(t *testing.T) {
 	if _, err := nextVersion(maxUint64); !errors.Is(err, ErrVersionExhausted) { t.Fatalf("next version exhaustion = %v", err) }
 	if err := participantVersion(maxUint64, maxUint64, maxUint64, tableOperations, "<redacted>"); !errors.Is(err, ErrVersionExhausted) { t.Fatalf("participant version exhaustion = %v", err) }
-	if _, err := nextVersion(maxUint64 - 1); err != nil { t.Fatalf("penultimate version rejected: %v", err) }
+	if _, err := nextVersion(maxPersistedVersion - 1); err != nil { t.Fatalf("penultimate persisted version rejected: %v", err) }
 }
