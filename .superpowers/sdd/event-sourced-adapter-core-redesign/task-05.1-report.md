@@ -207,3 +207,19 @@ Round 5 files changed:
 - `third_party/pineutil/evsocket/v2/socketio_test.go`
 - `dice/platform_adapter_onebot_runtime.go`
 - `dice/platform_adapter_onebot_runtime_test.go`
+
+## Round 6 fixes
+
+- Runtime queue admission is nonblocking for every callback. A full bounded event channel immediately rejects inbound admission and increments backpressure telemetry instead of blocking the wrapper drain; this prevents a bounded wrapper queue from being held behind an unbounded callback wait.
+- The transport-level raw-frame bound and one-shot readiness gate remain in force, so oversized frames are rejected before copying and reconnects cannot strand queue drains.
+
+### Round 6 GREEN evidence
+
+```text
+go test ./evsocket/v2 -run 'Test(WrapperEventQueueIsBounded|ShutdownWaitDrainsQueuedWrapperEvents|TransportMessageIsBoundBeforeCopy)' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+
+go test ./dice ./core/messageflow -run 'Test(InboundService(FallbackDuplicateAndCollision|NoIDNoTimeUsesContentDigestIdentity)|OnebotRuntime(InboundRetryIsBounded|DiagnosticsExposeIngressCounters|InboundQueueBackpressureIsNonBlocking|KeepsAliveOnRetryableInboundError)|OnebotInbound)' -count=1
+ok   Scardice-core/dice
+ok   Scardice-core/core/messageflow
+```
