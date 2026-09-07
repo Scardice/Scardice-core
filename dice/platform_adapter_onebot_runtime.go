@@ -417,8 +417,32 @@ func onebotMessageChain(payload adapterapi.EffectPayload) (schema.MessageChain, 
 	return chain, nil
 }
 
-func (*onebotRuntime) Diagnostics(context.Context) adapterapi.DiagnosticReport {
-	return adapterapi.DiagnosticReport{}
+func (r *onebotRuntime) Diagnostics(context.Context) adapterapi.DiagnosticReport {
+	if r == nil {
+		return adapterapi.DiagnosticReport{}
+	}
+	dropped := uint64(0)
+	r.connectionMu.Lock()
+	for wrapper := range r.connections {
+		if wrapper != nil {
+			dropped += wrapper.DroppedEventCount()
+		}
+	}
+	r.connectionMu.Unlock()
+	count := func(code, message string, value uint64) adapterapi.DiagnosticEntry {
+		return adapterapi.DiagnosticEntry{
+			Severity: adapterapi.DiagnosticInfo,
+			Code:     code,
+			Message:  message + ": " + strconv.FormatUint(value, 10),
+		}
+	}
+	return adapterapi.DiagnosticReport{Entries: []adapterapi.DiagnosticEntry{
+		count("inbound.rejected", "Rejected inbound events", r.inboundRejected.Load()),
+		count("inbound.backpressure", "Inbound backpressure events", r.inboundBackpressure.Load()),
+		count("inbound.conflicts", "Inbound identity conflicts", r.inboundCollisions.Load()),
+		count("inbound.retries", "Inbound bounded rehandoffs", r.inboundRetries.Load()),
+		count("transport.dropped_events", "Transport callback events dropped at queue admission", dropped),
+	}}
 }
 
 func (r *onebotRuntime) Run(ctx context.Context, core adapterapi.CorePort) (runErr error) {
@@ -807,7 +831,6 @@ func (r *onebotRuntime) handleInbound(ctx context.Context, raw []byte) error {
 		Platform:        "QQ",
 		Text:            onebotInboundText(envelope.Message),
 		Segments:        onebotInboundSegments(envelope.Message),
-		OccurredAt:      time.Now(),
 	}
 	if envelope.Time > 0 {
 		message.OccurredAt = time.Unix(envelope.Time, 0)

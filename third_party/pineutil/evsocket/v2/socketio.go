@@ -541,12 +541,45 @@ func (kws *WebsocketWrapper) shouldQueueEvent(event string) bool {
 	}
 }
 
+func isTerminalWrapperEvent(event eventEnvelope) bool {
+	if event.payload == nil {
+		return false
+	}
+	switch event.payload.Name {
+	case EventDisconnect, EventError, EventClose:
+		return true
+	default:
+		return false
+	}
+}
+
 func (kws *WebsocketWrapper) enqueueEvent(event eventEnvelope) {
 	kws.eventMu.Lock()
 	if len(kws.eventQueue) >= maxWrapperEventQueue {
-		kws.droppedEvents.Add(1)
-		kws.eventMu.Unlock()
-		return
+		if isTerminalWrapperEvent(event) {
+			replaced := -1
+			for i, queued := range kws.eventQueue {
+				if !isTerminalWrapperEvent(queued) {
+					replaced = i
+					break
+				}
+			}
+			if replaced >= 0 {
+				copy(kws.eventQueue[replaced:], kws.eventQueue[replaced+1:])
+				kws.eventQueue[len(kws.eventQueue)-1] = eventEnvelope{}
+				kws.eventQueue = kws.eventQueue[:len(kws.eventQueue)-1]
+				kws.eventWG.Done()
+				kws.droppedEvents.Add(1)
+			} else {
+				kws.droppedEvents.Add(1)
+				kws.eventMu.Unlock()
+				return
+			}
+		} else {
+			kws.droppedEvents.Add(1)
+			kws.eventMu.Unlock()
+			return
+		}
 	}
 	kws.eventWG.Add(1)
 	kws.eventQueue = append(kws.eventQueue, event)

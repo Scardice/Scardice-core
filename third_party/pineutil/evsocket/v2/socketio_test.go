@@ -54,6 +54,7 @@ func TestWrapperEventQueueIsBounded(t *testing.T) {
 	close(wrapper.connectReady)
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	disconnected := make(chan struct{})
 	manager.On(EventMessage, func(*EventPayload) {
 		select {
 		case <-entered:
@@ -61,6 +62,9 @@ func TestWrapperEventQueueIsBounded(t *testing.T) {
 			close(entered)
 		}
 		<-release
+	})
+	manager.On(EventDisconnect, func(*EventPayload) {
+		close(disconnected)
 	})
 	wrapper.dispatchMessage(1, []byte("first"))
 	select {
@@ -71,12 +75,21 @@ func TestWrapperEventQueueIsBounded(t *testing.T) {
 	for range maxWrapperEventQueue {
 		wrapper.dispatchMessage(1, []byte("queued"))
 	}
-	wrapper.dispatchMessage(1, []byte("overflow"))
+	wrapper.dispatchEvent(EventDisconnect, nil, nil)
 	if wrapper.DroppedEventCount() != 1 {
-		t.Fatalf("dropped events = %d", wrapper.DroppedEventCount())
+		t.Fatalf("dropped events after terminal admission = %d", wrapper.DroppedEventCount())
+	}
+	wrapper.dispatchMessage(1, []byte("overflow"))
+	if wrapper.DroppedEventCount() != 2 {
+		t.Fatalf("dropped events after overflow = %d", wrapper.DroppedEventCount())
 	}
 	close(release)
 	if err := wrapper.WaitEvents(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case <-disconnected:
+	case <-time.After(time.Second):
+		t.Fatal("terminal disconnect event was dropped")
 	}
 }

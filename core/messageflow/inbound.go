@@ -199,14 +199,14 @@ func (s *InboundService) providerKey(ctx context.Context, endpointID adapterapi.
 	if !message.OccurredAt.IsZero() {
 		occurred = fmt.Sprintf("%d", message.OccurredAt.UTC().UnixNano())
 	}
-	identityDigest, _, err := s.security.KeyedDigest(ctx, "fallback-provider-key/v1", canonicalIngressTuple(string(endpointID), message.Platform, string(message.Sender), target, occurred))
+	identityParts := []string{string(endpointID), message.Platform, string(message.Sender), target, occurred}
+	if message.OccurredAt.IsZero() {
+		identityParts = append(identityParts, hex.EncodeToString(contentDigest))
+	}
+	identityDigest, _, err := s.security.KeyedDigest(ctx, "fallback-provider-key/v1", canonicalIngressTuple(identityParts...))
 	if err != nil {
 		return "", err
 	}
-	// The body digest is persisted separately and is intentionally not folded
-	// into the identity key, so a same-identity/different-body collision is
-	// detected by the durable repository rather than silently admitted.
-	_ = contentDigest
 	return "fallback:" + hex.EncodeToString(identityDigest), nil
 }
 

@@ -108,6 +108,9 @@ func TestOnebotInboundWithoutMessageIDLeavesFallbackForCore(t *testing.T) {
 	if err := runtime.handleInbound(context.Background(), raw); err != nil { t.Fatal(err) }
 	message := <-core.inboundCh
 	if message.ProviderEventID != "" { t.Fatalf("provider id = %q", message.ProviderEventID) }
+	if !message.OccurredAt.IsZero() {
+		t.Fatalf("missing provider time became non-deterministic: %v", message.OccurredAt)
+	}
 }
 
 func TestOnebotInboundRejectsOversizedRawFrameBeforeParsing(t *testing.T) {
@@ -387,5 +390,35 @@ func TestOnebotRuntimeInboundRetryIsBounded(t *testing.T) {
 	}
 	if rehandoffOnebotInbound(event) {
 		t.Fatal("unexpected rehandoff beyond bound")
+	}
+}
+
+func TestOnebotRuntimeDiagnosticsExposeIngressCounters(t *testing.T) {
+	runtime := newOnebotRuntime(OnebotConfig{}, nil)
+	runtime.inboundRejected.Store(3)
+	runtime.inboundBackpressure.Store(2)
+	runtime.inboundCollisions.Store(1)
+	runtime.inboundRetries.Store(4)
+	report := runtime.Diagnostics(context.Background())
+	if err := report.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"inbound.rejected":     "Rejected inbound events: 3",
+		"inbound.backpressure": "Inbound backpressure events: 2",
+		"inbound.conflicts":    "Inbound identity conflicts: 1",
+		"inbound.retries":      "Inbound bounded rehandoffs: 4",
+		"transport.dropped_events": "Transport callback events dropped at queue admission: 0",
+	}
+	for _, entry := range report.Entries {
+		if expected, ok := want[entry.Code]; ok {
+			if entry.Message != expected {
+				t.Fatalf("%s message = %q, want %q", entry.Code, entry.Message, expected)
+			}
+			delete(want, entry.Code)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing diagnostics = %#v", want)
 	}
 }

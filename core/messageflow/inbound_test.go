@@ -86,7 +86,6 @@ func TestInboundServiceFallbackDuplicateAndCollision(t *testing.T) {
 	svc, err := NewInboundService(repo, ingressCryptoStub{})
 	if err != nil { t.Fatal(err) }
 	noID := testFencedMessage("", "body")
-	noID.Message.OccurredAt = time.Time{}
 	first, err := svc.HandleInbound(context.Background(), noID)
 	if err != nil { t.Fatal(err) }
 	second, err := svc.HandleInbound(context.Background(), noID)
@@ -96,6 +95,35 @@ func TestInboundServiceFallbackDuplicateAndCollision(t *testing.T) {
 	collision.Message.Text = "changed"
 	if _, err := svc.HandleInbound(context.Background(), collision); !errors.Is(err, eventstore.ErrConflict) { t.Fatalf("fallback collision = %v", err) }
 	if svc.CollisionCount() == 0 { t.Fatal("fallback collision telemetry was not recorded") }
+}
+
+func TestInboundServiceNoIDNoTimeUsesContentDigestIdentity(t *testing.T) {
+	repo := &ingressRepoStub{}
+	svc, err := NewInboundService(repo, ingressCryptoStub{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := testFencedMessage("", "body")
+	message.Message.OccurredAt = time.Time{}
+	first, err := svc.HandleInbound(context.Background(), message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := svc.HandleInbound(context.Background(), message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate.Outcome != adapterapi.IngressDuplicate || duplicate.InboxID != first.InboxID {
+		t.Fatalf("no-time duplicate = %#v, first = %#v", duplicate, first)
+	}
+	message.Message.Text = "changed"
+	changed, err := svc.HandleInbound(context.Background(), message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Outcome != adapterapi.IngressAccepted || changed.InboxID == first.InboxID {
+		t.Fatalf("no-time content identity = %#v, first = %#v", changed, first)
+	}
 }
 
 func TestInboundServiceStableIDChangedBodyIsCollision(t *testing.T) {

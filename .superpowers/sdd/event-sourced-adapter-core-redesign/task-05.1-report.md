@@ -153,3 +153,32 @@ Round 3 files changed:
 - `dice/platform_adapter_onebot_runtime.go`
 - `dice/platform_adapter_onebot_runtime_test.go`
 - `core/messageflow/inbound_test.go`
+
+## Round 4 fixes
+
+- OneBot no longer substitutes `time.Now()` when the provider omits its event timestamp. A missing timestamp remains zero and the Core fallback provider identity includes the keyed content digest only for the zero-time/no-ID branch; identical deliveries deduplicate deterministically while distinct bodies receive distinct deterministic fallback identities. Timestamped fallback events retain collision detection.
+- Queue admission now reserves terminal transport events (`disconnect`, `error`, and `close`) by evicting an already queued nonterminal event when full. Terminal lifecycle/error delivery therefore cannot be displaced by a saturated message queue; the queue remains bounded and evictions are counted.
+- `onebotRuntime.Diagnostics` exposes bounded snapshots for rejection, backpressure, conflicts, retries, and summed transport queue drops through the Core runtime diagnostics seam.
+
+### Round 4 RED/GREEN evidence
+
+```text
+go test ./core/messageflow -run 'TestInboundServiceNoIDNoTimeUsesContentDigestIdentity' -count=1
+FAIL: eventstore: conflict
+
+go test ./evsocket/v2 -run 'Test(WrapperEventQueueIsBounded|ShutdownWaitDrainsQueuedWrapperEvents)' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+
+go test ./dice ./core/messageflow -run 'Test(InboundService(FallbackDuplicateAndCollision|NoIDNoTimeUsesContentDigestIdentity)|OnebotRuntime(InboundRetryIsBounded|DiagnosticsExposeIngressCounters)|OnebotInbound)' -count=1
+ok   Scardice-core/dice
+ok   Scardice-core/core/messageflow
+```
+
+Round 4 files changed:
+
+- `core/messageflow/inbound.go`
+- `core/messageflow/inbound_test.go`
+- `dice/platform_adapter_onebot_runtime.go`
+- `dice/platform_adapter_onebot_runtime_test.go`
+- `third_party/pineutil/evsocket/v2/socketio.go`
+- `third_party/pineutil/evsocket/v2/socketio_test.go`
