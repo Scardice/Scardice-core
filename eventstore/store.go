@@ -252,7 +252,7 @@ func locked(db *gorm.DB) *gorm.DB {
 func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitResult, err error) {
 	if ctx == nil { ctx = context.Background() }
 	if err = ValidateUnitOfWork(work); err != nil { return CommitResult{}, err }
-	if initErr := s.initializationError(); initErr != nil { return CommitResult{}, initErr }
+	if initErr := s.requireReady(ctx); initErr != nil { return CommitResult{}, initErr }
 	base := (*gorm.DB)(nil)
 	if s.db != nil { base = s.db.GORM() }
 	if base == nil { return CommitResult{}, errors.New("eventstore: store unavailable") }
@@ -416,6 +416,7 @@ func (s *GORMStore) Load(ctx context.Context, stream StreamID, fromVersion uint6
 	if s.db != nil { base = s.db.GORM() }
 	if base == nil { return nil, errors.New("eventstore: store unavailable") }
 	if ctx == nil { ctx = context.Background() }
+	if err := s.requireReady(ctx); err != nil { return nil, err }
 	var rows []domainEventRow
 	q := base.WithContext(ctx).Where("aggregate_type = ? AND aggregate_id = ? AND aggregate_version >= ?", stream.AggregateType, stream.AggregateID, fromVersion).Order("aggregate_version ASC").Find(&rows)
 	if q.Error != nil { return nil, errors.New("eventstore: load events failed") }
@@ -466,7 +467,7 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 		if q.Error == nil { current = row.Version } else if !errors.Is(q.Error, gorm.ErrRecordNotFound) { return ErrParticipantFailure }
 		if err := participantVersion(update.ExpectedVersion, current, update.Version, tableOperations, "<redacted>"); err != nil { return err }
 		version, err := nextVersion(current); if err != nil { return err }; now := chooseTime(update.UpdatedAt, time.Now().UTC())
-		if current == 0 { row = operationRow{OperationID:update.OperationID, Version:version, Kind:nonempty(update.Kind,"unknown"), Status:nonempty(update.Status,"pending"), PrincipalID:nonempty(update.PrincipalID,update.OperationID), ResourceType:nonempty(update.ResourceID,"unknown"), ResourceID:update.ResourceID, IdempotencyScope:nonempty(update.IdempotencyScope,"operation"), IdempotencyKey:nonempty(update.IdempotencyKey,update.OperationID), RequestID:update.RequestID, RequestDigest:update.RequestDigest, CorrelationID:update.CorrelationID, ResultCode:update.ResultCode, ErrorCode:update.ErrorCode, ArtifactRef:update.ArtifactID, PrivateContext:update.PrivateContextCiphertext, PrivateNonce:update.PrivateContextNonce, PrivateKeyID:update.EncryptionKeyID, CreatedAt:chooseTime(update.CreatedAt,now), UpdatedAt:now, ExpiresAt:timePtr(update.ExpiresAt)}; q=tx.Create(&row)
+		if current == 0 { row = operationRow{OperationID:update.OperationID, Version:version, Kind:nonempty(update.Kind,"unknown"), Status:nonempty(update.Status,"pending"), PrincipalID:nonempty(update.PrincipalID,update.OperationID), ResourceType:nonempty(update.ResourceID,"unknown"), ResourceID:update.ResourceID, IdempotencyScope:nonempty(update.IdempotencyScope,"operation"), IdempotencyKey:nonempty(update.IdempotencyKey,update.OperationID), RequestID:update.RequestID, RequestDigest:update.RequestDigest, CorrelationID:update.CorrelationID, ResultCode:update.ResultCode, ErrorCode:update.ErrorCode, ArtifactRef:update.ArtifactID, PrivatePayloadVersion:1, PrivateContext:update.PrivateContextCiphertext, PrivateNonce:update.PrivateContextNonce, PrivateKeyID:update.EncryptionKeyID, CreatedAt:chooseTime(update.CreatedAt,now), UpdatedAt:now, ExpiresAt:timePtr(update.ExpiresAt)}; q=tx.Create(&row)
 		} else {
 			if update.Kind != "" { row.Kind = update.Kind }; if update.Status != "" { row.Status = update.Status }; if update.PrincipalID != "" { row.PrincipalID = update.PrincipalID }; if update.ResourceID != "" { row.ResourceID = update.ResourceID }; if update.IdempotencyScope != "" { row.IdempotencyScope = update.IdempotencyScope }; if update.IdempotencyKey != "" { row.IdempotencyKey = update.IdempotencyKey }; if update.RequestID != "" { row.RequestID = update.RequestID }; if len(update.RequestDigest) > 0 { row.RequestDigest = update.RequestDigest }; if update.CorrelationID != "" { row.CorrelationID = update.CorrelationID }; if update.ResultCode != "" { row.ResultCode = update.ResultCode }; if update.ErrorCode != "" { row.ErrorCode = update.ErrorCode }; if update.ArtifactID != "" { row.ArtifactRef = update.ArtifactID }; if len(update.PrivateContextCiphertext) > 0 { row.PrivateContext = update.PrivateContextCiphertext }; if len(update.PrivateContextNonce) > 0 { row.PrivateNonce = update.PrivateContextNonce }; if update.EncryptionKeyID != "" { row.PrivateKeyID = update.EncryptionKeyID }; if !update.ExpiresAt.IsZero() { row.ExpiresAt = timePtr(update.ExpiresAt) }; row.Version = version; row.UpdatedAt = now
 			q=tx.Model(&operationRow{}).Where("operation_id = ? AND version = ?",update.OperationID,current).Updates(map[string]any{"version":row.Version,"kind":row.Kind,"status":row.Status,"principal_id":row.PrincipalID,"resource_type":row.ResourceType,"resource_id":row.ResourceID,"idempotency_scope":row.IdempotencyScope,"idempotency_key":row.IdempotencyKey,"request_id":row.RequestID,"request_digest":row.RequestDigest,"correlation_id":row.CorrelationID,"result_code":row.ResultCode,"error_code":row.ErrorCode,"artifact_id":row.ArtifactRef,"private_context":row.PrivateContext,"private_nonce":row.PrivateNonce,"private_key_id":row.PrivateKeyID,"updated_at":row.UpdatedAt,"expires_at":row.ExpiresAt})
@@ -606,9 +607,12 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 					return quota{}, ErrInvalidMetadata
 				}
 				if s.keySource != nil {
-					plain, openErr := a6Open(ctx, s.keySource, "plugin-kv-value/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedValue, row.ValueNonce)
-					if openErr != nil || int64(len(plain)) != row.ValueSize {
-						return quota{}, ErrAuthenticationFailed
+					item, decodeErr := s.decodePluginKVRow(ctx, row)
+					if decodeErr != nil {
+						return quota{}, decodeErr
+					}
+					if int64(len(item.Value)) != row.ValueSize {
+						return quota{}, ErrInvalidMetadata
 					}
 				}
 				q.usage += row.ValueSize

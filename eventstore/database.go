@@ -427,6 +427,7 @@ const sqliteOperationArtifactsDDL = `CREATE TABLE operation_artifacts (
 	ciphertext BLOB,
 	nonce BLOB,
 	encryption_key_id TEXT,
+	payload_version INTEGER NOT NULL DEFAULT 1,
 	expires_at DATETIME NOT NULL,
 	consumed_at DATETIME,
 	FOREIGN KEY(operation_id) REFERENCES operations(operation_id) ON UPDATE RESTRICT ON DELETE RESTRICT
@@ -470,10 +471,12 @@ func ensureSQLiteOperationArtifacts(db *gorm.DB) error {
 		return err
 	}
 	rows.Close()
-
-	required := []string{"artifact_id", "operation_id", "owner_principal_id", "media_type", "safe_filename", "size", "status", "ciphertext", "nonce", "encryption_key_id", "expires_at", "consumed_at"}
+	required := []string{"artifact_id", "operation_id", "owner_principal_id", "media_type", "safe_filename", "size", "status", "ciphertext", "nonce", "encryption_key_id", "payload_version", "expires_at", "consumed_at"}
 	for _, column := range required {
 		if _, ok := columns[column]; !ok {
+			if column == "payload_version" {
+				continue
+			}
 			return fmt.Errorf("SQLite operation_artifacts schema is missing %s", column)
 		}
 	}
@@ -505,7 +508,11 @@ func ensureSQLiteOperationArtifacts(db *gorm.DB) error {
 		return err
 	}
 	fkRows.Close()
-	if versionPresent && versionNotNull && fkReady {
+	payloadVersionPresent := false
+	if info, ok := columns["payload_version"]; ok {
+		payloadVersionPresent = info.notNull == 1
+	}
+	if versionPresent && versionNotNull && payloadVersionPresent && fkReady {
 		return nil
 	}
 	var indexOwner string
@@ -553,7 +560,11 @@ func ensureSQLiteOperationArtifacts(db *gorm.DB) error {
 	}
 	selectColumns := make([]string, 0, len(required)+1)
 	for _, column := range required {
-		selectColumns = append(selectColumns, `"`+column+`"`)
+		if column == "payload_version" && !payloadVersionPresent {
+			selectColumns = append(selectColumns, "1")
+		} else {
+			selectColumns = append(selectColumns, `"`+column+`"`)
+		}
 	}
 	if versionPresent {
 		selectColumns = append([]string{`"version"`}, selectColumns...)

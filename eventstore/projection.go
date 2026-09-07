@@ -159,11 +159,11 @@ func (s *GORMStore) Rebuild(ctx context.Context, request RebuildRequest) (Rebuil
 	if s == nil || s.db == nil || s.db.GORM() == nil {
 		return RebuildResult{}, errors.New("eventstore: store unavailable")
 	}
-	if initErr := s.initializationError(); initErr != nil {
-		return RebuildResult{}, initErr
-	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := s.requireReady(ctx); err != nil {
+		return RebuildResult{}, err
 	}
 	projectors, setVersion, err := s.projectorSnapshot()
 	if err != nil {
@@ -471,6 +471,9 @@ func (s *GORMStore) DigestProjection(ctx context.Context, generation string) (Ev
 	if s == nil || s.db == nil || s.db.GORM() == nil {
 		return EventChecksum{}, errors.New("eventstore: store unavailable")
 	}
+	if err := s.requireReady(ctx); err != nil {
+		return EventChecksum{}, err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -487,6 +490,9 @@ func (s *GORMStore) ReadProjectionRow(ctx context.Context, projectionName, rowKe
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := s.requireReady(ctx); err != nil {
+		return ProjectionRow{}, err
 	}
 	tx := s.db.GORM().WithContext(ctx).Begin()
 	if tx.Error != nil {

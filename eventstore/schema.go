@@ -149,10 +149,11 @@ type operationRow struct {
 	RequestID         string     `gorm:"type:varchar(255)"`
 	RequestDigest     []byte     `gorm:"size:32"`
 	CorrelationID     string     `gorm:"type:varchar(255)"`
-	ResultCode        string     `gorm:"type:varchar(255)"`
 	ErrorCode         string     `gorm:"type:varchar(255)"`
+	ResultCode         string     `gorm:"type:varchar(255)"`
 	ArtifactRef       string     `gorm:"column:artifact_id;type:varchar(255)"`
 	PrivateContext    []byte     `gorm:""`
+	PrivatePayloadVersion uint64  `gorm:"not null;default:1"`
 	PrivateNonce      []byte     `gorm:"size:12"`
 	PrivateKeyID      string     `gorm:"type:varchar(255)"`
 	CreatedAt         time.Time  `gorm:"not null"`
@@ -175,6 +176,7 @@ type operationArtifactRow struct {
 	Ciphertext   []byte     `gorm:""`
 	Nonce        []byte     `gorm:"size:12"`
 	EncryptionKeyID string `gorm:"type:varchar(255)"`
+	PayloadVersion uint64 `gorm:"not null;default:1"`
 	ExpiresAt    time.Time  `gorm:"not null"`
 	ConsumedAt   *time.Time
 }
@@ -208,9 +210,10 @@ type inboxMessageRow struct {
 	PayloadCiphertext []byte `gorm:""`
 	PayloadNonce []byte `gorm:"size:12"`
 	EncryptionKeyID string `gorm:"type:varchar(255)"`
+	PayloadVersion uint64 `gorm:"not null;default:1"`
 	ContentDigest []byte `gorm:"size:32"`
-	ContentDigestKeyID string `gorm:"type:varchar(255)"`
 	PayloadExpiresAt *time.Time
+	ContentDigestKeyID string `gorm:"type:varchar(255)"`
 	WorkflowID string `gorm:"type:varchar(255)"`
 	ResolutionPrincipal string `gorm:"type:varchar(255)"`
 	ResolutionReason string `gorm:"type:varchar(512)"`
@@ -237,10 +240,11 @@ type outboxEffectRow struct {
 	PayloadCiphertext []byte `gorm:""`
 	PayloadNonce []byte `gorm:"size:12"`
 	EncryptionKeyID string `gorm:"type:varchar(255)"`
+	PayloadVersion uint64 `gorm:"not null;default:1"`
 	ContentDigest []byte `gorm:"size:32"`
+	ErrorCode string `gorm:"type:varchar(255)"`
 	ContentDigestKeyID string `gorm:"type:varchar(255)"`
 	ResultCode string `gorm:"type:varchar(255)"`
-	ErrorCode string `gorm:"type:varchar(255)"`
 	ProviderMessageID string `gorm:"type:varchar(255)"`
 	CompletedAt *time.Time
 	PayloadExpiresAt *time.Time

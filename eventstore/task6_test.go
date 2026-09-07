@@ -330,7 +330,7 @@ func TestA6ClaimRejectsTamperedPayloadBeforeLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.AcceptInbox(ctx, InboxUpdate{InboxID: "claim-inbox", EndpointID: "endpoint", ProviderEventKey: "provider", LaneHMAC: []byte("lane"), Status: InboxStatusPending, PayloadCiphertext: inboxCipher, PayloadNonce: inboxNonce, DigestKeyID: inboxKey}); err != nil {
+	if _, err := store.AcceptInbox(ctx, InboxUpdate{InboxID: "claim-inbox", EndpointID: "endpoint", ProviderEventKey: "provider", LaneHMAC: []byte("lane"), Status: InboxStatusPending, PayloadCiphertext: inboxCipher, PayloadNonce: inboxNonce, PayloadEncryptionKeyID: inboxKey}); err != nil {
 		t.Fatal(err)
 	}
 	var inbox inboxMessageRow
@@ -376,7 +376,7 @@ func TestA6ClaimOutboxRejectsTamperedPayloadBeforeLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.AcceptOutbox(ctx, NewEffect{EffectID: "claim-effect", EndpointID: "endpoint", LaneHMAC: []byte("lane"), EffectType: "send", RiskClass: RiskPreDispatchRetryable, Status: OutboxStatusPending, PayloadCiphertext: ciphertext, PayloadNonce: nonce, DigestKeyID: keyID}); err != nil {
+	if _, err := store.AcceptOutbox(ctx, NewEffect{EffectID: "claim-effect", EndpointID: "endpoint", LaneHMAC: []byte("lane"), EffectType: "send", RiskClass: RiskPreDispatchRetryable, Status: OutboxStatusPending, PayloadCiphertext: ciphertext, PayloadNonce: nonce, PayloadEncryptionKeyID: keyID}); err != nil {
 		t.Fatal(err)
 	}
 	var effect outboxEffectRow
