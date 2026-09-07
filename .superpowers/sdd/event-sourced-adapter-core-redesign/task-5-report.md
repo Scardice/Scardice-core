@@ -6,14 +6,14 @@
 - `eventstore/schema.go`: durable resolution audit fields and bounded outbox retry metadata.
 - `eventstore/store.go`: injected clock, ID generator, and payload codec options with production defaults. `Commit` rolls back a failed UoW and, for payload/artifact expiry, runs detached bounded compensating transactions that scrub every expired inbox/outbox participant and every eligible (`available`/`ready`) expired artifact in canonical table/ID order; compensation errors are returned instead of claiming expiry was scrubbed.
 - `eventstore/task5.go`: transactional inbox/outbox acceptance, lane allocation, provider dedupe, predecessor-blocked claims, lease/CAS lifecycle, resolution, payload scrubbing/expiry, risk transitions, and artifact put/consume. Public accepts reject supplied versions, defer incoming TTL validation until after existing-row expiry observation, and restore default/cap validation for new rows; public updates validate versions and reject ignored identity/opaque/lifecycle fields, dispatched terminal completion is reserved for `CompleteOutbox`, and stale-lease paths scrub observed expiry before returning. Expired replay handling scrubs before dedupe/conflict evaluation; UoW initial dedupe/relookup returns typed expiry before idempotent success and non-pending status mutations require an active lease. Non-idempotent dispatched outbox expiry transitions to `ambiguous` with resolution metadata preserved. Loaded scrub paths avoid version churn when bytes are already absent. Artifact commit failures return a zero result and never expose decrypted bytes.
-- `eventstore/task6.go`: A6 plugin key-index HMAC recomputation with constant-time comparison, readiness terminal/publication validation, startup fail-closed readiness gating, index-root material fingerprint pinning, unsupported readiness-schema rejection, fresh-mode metadata/position/completion strictness, immutable public secret binding across versions, rotation preflight and transaction fencing, authoritative readiness revalidation inside mutation transactions and projection publication, decoded secret/plugin/payload/artifact bounds before decrypt, bounded plugin lookup inputs, and redacted artifact authentication/unavailability mapping.
+- `eventstore/task6.go`: A6 plugin key-index HMAC recomputation with constant-time comparison, readiness terminal/publication validation, startup fail-closed readiness gating, index-root material fingerprint pinning, unsupported readiness-schema rejection, fresh-mode metadata/position/completion strictness, immutable public secret binding across versions, readiness-admitted encryption-root key-ID checks before decrypt/apply, publication-fenced current-root snapshots for writes and rotation, authoritative readiness revalidation inside mutation transactions and projection publication, decoded secret/plugin/payload/artifact bounds before decrypt, bounded plugin lookup inputs, and redacted artifact authentication/unavailability mapping.
 - `eventstore/contracts.go`: separate payload-encryption and stable content-digest key identities for inbox/effect records, while retaining the legacy field as a compatibility fallback.
 - `eventstore/schema.go`: durable index-root fingerprint in the readiness singleton.
 - `eventstore/task5_test.go`: behavior-first regression coverage for dedupe, lane ordering/concurrency, lease/CAS/state transitions, ambiguity, scrubbing/TTL, artifact codec/size/expiry/one-winner, fail-closed encryption, strict participant contracts, stable digest replay, terminal rewrite rejection, pending termination rejection, nonce boundaries, participant supplied-version checks, sparse leased-effect identity, replay bounds, callback timestamps, public immutable-field/version validation, terminal completion idempotence, stale-lease expiry scrubbing, corrupt codec rejection, multi-artifact compensation, consumed-artifact compensation exclusion, expired replay precedence, explicit expired/default/capped ingress TTLs, commit-error zero-result plaintext protection, and compensating UoW expiry scrubbing.
 - `eventstore/store_test.go`: migrated legacy participant fixtures to sparse artifact updates while retaining aggregate/UoW compatibility coverage without allowing arbitrary ingress state injection.
 `Store.Commit` participant application runs through the same transaction-bound invariant helpers: new inbox/effect rows ignore caller ordering, reject invalid status/risk/lease/encryption metadata, allocate typed lanes, enforce dedupe and TTL caps, and reject direct artifact terminal/oversize updates. Existing participant updates retain expected-version and active-lease CAS; terminal rows cannot be rewritten through the aggregate-only store. `GORMStore` implements the declared operation view with an explicit public-column select (private ciphertext is never loaded) and privacy purge with an operation version/CAS fence.
 - `eventstore/database.go`, `eventstore/projection.go`: SQLite artifact payload-version migration/defaults and unified readiness gating for projection reads/rebuilds; projection publication revalidates readiness after final locked updates.
-- `eventstore/task6_test.go`: A6 ingress fixtures now use the explicit payload-encryption key field required when a key source is configured; coverage includes fresh-readiness tamper rejection, unsupported readiness schema rejection, decoded secret bounds, plugin lookup bounds, and operation/privacy repositories.
+- `eventstore/task6_test.go`: A6 ingress fixtures now use the explicit payload-encryption key field required when a key source is configured; coverage includes fresh-readiness tamper rejection, unsupported readiness schema rejection, decoded secret bounds, readiness-admitted key IDs/current-root writes, plugin lookup bounds, and operation/privacy repositories including empty/private and artifact-only purge fences.
 ## Algorithms and transitions
 
 Acceptance starts one database transaction, checks inbox provider dedupe `(endpoint_id, provider_event_id)`, then materializes/locks the typed `lane_heads` row and allocates `NextSequence`. Caller ordering values are ignored. The head update and message/effect insert commit together, so row failure rolls back the head. Inbox and outbox use distinct lane kinds. Dedupe compares retained keyed content digests after scrub; when no digest was supplied, it compares live ciphertext/nonce and refuses scrubbed replay rather than guessing content identity. Claims use ordered candidates with a same-lane predecessor `NOT EXISTS` query; no `SKIP LOCKED` or process-global mutex is used. Non-SQLite dialects use the existing `FOR UPDATE` helper, while SQLite relies on its immediate transaction and busy timeout.
@@ -38,7 +38,7 @@ After the narrow implementation, the same behavior tests passed. The tests asser
 
 ## Verification
 
-Exact required commands and results after ninth-round commits `6881ae2b`, `cec1cfee`, `62a55ddc`, and `8f3e169e` (on top of `79a28c61`):
+Exact required commands and results after tenth-round source commit `a40c81d0` (on top of ninth-round commits `6881ae2b`, `cec1cfee`, `62a55ddc`, and `8f3e169e`):
 
 ```text
 go test -race ./eventstore -run 'TestInbox|TestOutbox|TestArtifact|TestLane|TestLease|TestEffect|TestDedup' -count=1
@@ -48,13 +48,13 @@ go test -race ./eventstore -run 'TestReadiness|TestKey|TestCrypto|TestSecret|Tes
 ok  	Scardice-core/eventstore	2.101s
 
 go test -race ./eventstore -count=1
-ok  	Scardice-core/eventstore	4.891s
+ok  	Scardice-core/eventstore	4.926s
 
 go test -count=1 ./eventstore
-ok  	Scardice-core/eventstore	0.961s
+ok  	Scardice-core/eventstore	0.988s
 ```
 
-The commands were run after the ninth-round source/test commits and included projection post-lock readiness validation, rotation fencing and zero-result errors, readiness-repair cache recovery, unsupported readiness-schema rejection, strict fresh-mode metadata/position/completion validation, immutable public secret binding, ciphertext/nonce bounds before decrypt, Task5 UoW payload caps, explicit public operation selection, version/CAS-fenced privacy purge, and operation/privacy repository coverage. No formatter, linter, or project-wide suite was run.
+The commands were run after the tenth-round source commit and included operation version fencing for every purge scope, readiness-admitted key IDs before decrypt/apply, transaction-safe readiness checks in SQLite, publication-fenced current-root snapshots for PutSecret/SetPluginKV/PutArtifact and sparse secret resealing, rotation current-root ID fencing, unsupported readiness-schema rejection, strict fresh-mode metadata/position/completion validation, immutable public secret binding, and operation/privacy repository coverage. No formatter, linter, or project-wide suite was run.
 
 ## Commits
 
@@ -81,5 +81,6 @@ The commands were run after the ninth-round source/test commits and included pro
 - Projection/rotation fencing, readiness-repair cache recovery, pre-decrypt ciphertext bounds, Task5 UoW payload caps, and operation/privacy repository implementation: `79a28c61`.
 - Ninth-round privacy/readiness contract fixes and full fresh-field coverage: `6881ae2b`, `cec1cfee`, `62a55ddc`.
 - Public `PutSecret` binding invariant and final race/normal verification: `8f3e169e`.
+- Tenth-round purge/key-admission/current-root fencing and regression coverage: `a40c81d0`.
 
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
