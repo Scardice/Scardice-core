@@ -450,7 +450,30 @@ func TestTask5PersistedVersionWidthOverflowFailsClosed(t *testing.T) {
 	if _, err := store.ClaimOutbox(context.Background(), OutboxClaimRequest{WorkerID: "worker", LeaseDuration: time.Minute}); !errors.Is(err, ErrVersionExhausted) {
 		t.Fatalf("persisted outbox version overflow err=%v", err)
 	}
+	inbox := task5Inbox("persisted-width-inbox", "persisted-width-inbox-provider", "persisted-width-inbox-lane")
+	if _, err := store.AcceptInbox(context.Background(), inbox); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GORM().Model(&inboxMessageRow{}).Where("inbox_id = ?", inbox.InboxID).Update("lease_epoch", maxPersistedVersion).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimInbox(context.Background(), InboxClaimRequest{WorkerID: "worker", LeaseDuration: time.Minute}); !errors.Is(err, ErrVersionExhausted) {
+		t.Fatalf("persisted inbox lease epoch overflow err=%v", err)
+	}
+	laneInbox := task5Inbox("persisted-width-lane-inbox", "persisted-width-lane-provider", "persisted-width-lane")
+	if _, err := store.AcceptInbox(context.Background(), laneInbox); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GORM().Model(&laneHeadRow{}).Where("kind = ? AND lane_hmac = ?", "inbox", laneInbox.LaneHMAC).Update("next_sequence", maxPersistedVersion).Error; err != nil {
+		t.Fatal(err)
+	}
+	laneInbox.InboxID = "persisted-width-lane-inbox-2"
+	laneInbox.ProviderEventKey = "persisted-width-lane-provider-2"
+	if _, err := store.AcceptInbox(context.Background(), laneInbox); !errors.Is(err, ErrVersionExhausted) {
+		t.Fatalf("persisted lane sequence overflow err=%v", err)
+	}
 }
+
 func TestArtifactFailsClosedWithoutCodec(t *testing.T) {
 	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "no-codec.db")})
 	if err != nil {

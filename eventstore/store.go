@@ -686,11 +686,14 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 			if secretVersion == 0 {
 				secretVersion = 1
 				if current > 0 {
-					if latest.SecretVersion == maxUint64 {
+					if latest.SecretVersion >= maxPersistedVersion {
 						return ErrVersionExhausted
 					}
 					secretVersion = latest.SecretVersion + 1
 				}
+			}
+			if secretVersion >= maxPersistedVersion {
+				return ErrVersionExhausted
 			}
 			if current > 0 && secretVersion <= latest.SecretVersion {
 				return ErrParticipantConflict

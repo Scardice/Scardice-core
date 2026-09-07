@@ -294,10 +294,14 @@ func task5AllocateLane(tx *gorm.DB, kind string, lane []byte, now time.Time) (ui
 		return 0, err
 	}
 	sequence := head.NextSequence
-	if sequence == 0 || sequence == maxUint64 {
+	if sequence == 0 || sequence >= maxPersistedVersion {
 		return 0, ErrVersionExhausted
 	}
-	head.NextSequence++
+	nextSequence, nextErr := nextVersion(sequence)
+	if nextErr != nil {
+		return 0, nextErr
+	}
+	head.NextSequence = nextSequence
 	head.UpdatedAt = now
 	if err := tx.Model(&laneHeadRow{}).Where("kind = ? AND lane_hmac = ?", kind, lane).Updates(map[string]any{"next_sequence": head.NextSequence, "updated_at": head.UpdatedAt}).Error; err != nil {
 		return 0, errors.New("eventstore: advance lane head failed")
@@ -601,7 +605,7 @@ func (s *GORMStore) ClaimInbox(ctx context.Context, req InboxClaimRequest) (leas
 	if err = s.task5ValidatePayload(ctx, tx, "inbox/v1", row.InboxID, row.EndpointID, task5PayloadVersion(row.PayloadVersion), row.PayloadCiphertext, row.PayloadNonce, row.EncryptionKeyID, false); err != nil {
 		return InboxLease{}, commitObservedScrub(err)
 	}
-	if row.LeaseEpoch == maxUint64 {
+	if row.LeaseEpoch >= maxPersistedVersion {
 		return InboxLease{}, commitObservedScrub(ErrVersionExhausted)
 	}
 	attempt, idErr := s.task5ID()
@@ -1116,6 +1120,9 @@ func (s *GORMStore) ClaimOutbox(ctx context.Context, req OutboxClaimRequest) (le
 	attempt, idErr := s.task5ID()
 	if idErr != nil {
 		return OutboxLease{}, commitObservedScrub(idErr)
+	}
+	if row.LeaseEpoch >= maxPersistedVersion {
+		return OutboxLease{}, commitObservedScrub(ErrVersionExhausted)
 	}
 	version, vErr := nextVersion(row.Version)
 	if vErr != nil {
