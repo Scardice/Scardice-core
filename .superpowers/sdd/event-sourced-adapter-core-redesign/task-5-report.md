@@ -22,7 +22,7 @@ Inbox unresolved states are `pending`, `leased`, `callback-started`, and `ambigu
 Outbox accepts only `pending` and the declared risk classes `pre-dispatch-retryable`, `provider-idempotent`, and `non-idempotent-after-dispatch`. Claims use the same predecessor algorithm. Renew, dispatch marker, and completion require effect/owner/epoch/attempt CAS and an active lease, but observed payload expiry is scrubbed before lease errors. Dispatch allocates a fresh attempt ID and persists `dispatched_at` before provider I/O. Generic public updates cannot complete dispatched work; completion rejects stale leases and leased-to-terminal transitions. Exact terminal completion replays for the same attempt are idempotent even after the lease is cleared, while mismatched attempts remain stale. Expired post-dispatch non-idempotent work transitions to `ambiguous` with resolution metadata preserved, regardless of which public/UoW/resolution observer first sees expiry; repeat observation with no bytes is a no-op.
 Artifacts accept plaintext only through the injected codec boundary, cap plaintext and stored ciphertext at 32 MiB, default to 10 minutes, and reject TTLs over 60 minutes. Without a codec/key boundary, put, consume, and UoW artifact creation fail closed with `ErrEncryptionUnavailable`; plaintext-as-ciphertext fallback is not used. Consume/expiry is one transaction with a row CAS: one winner decrypts and returns plaintext only when decoded length matches stored size and remains within the cap, losers/expired requests receive `ErrArtifactGone`, and ciphertext/nonce are scrubbed before commit. `ready` and `available` are consumed/expired consistently; compensation only rewrites eligible non-terminal rows and skips already-scrubbed rows, so consumed/terminal artifacts keep their state/version. Commit errors return a zero `ArtifactResult`, never plaintext.
 All Task5 and A6 persistence APIs pass through the cached startup readiness gate before opening transactions; only readiness inspection/repair methods bypass that gate. Reopened non-empty stores with invalid readiness therefore remain read-only/quarantined across inbox, outbox, aggregate, projection, secret, plugin, and artifact paths. Operation private payloads and inbox/outbox/artifact payloads persist an immutable `PayloadVersion`/`PrivatePayloadVersion` (default 1); status/version CAS updates never modify it, and claims, consume, validation, and root rotation use the persisted value for AAD. SQLite artifact migration upgrades legacy tables with payload version 1 defaults.
-Public encrypted operations revalidate the authoritative readiness row and key source on every call, including current-root availability and published projection state, so post-startup tampering quarantines writes and reads. Readiness updates and projection publication acquire readiness/control/sequence locks in canonical order and publish import terminal positions atomically. Encrypted operation principal changes require a fully authenticated resealed payload tuple; partial ciphertext metadata is rejected. Plugin deletions authenticate the encrypted key/value while holding the row lock. Secret/plugin row-version and secret-version allocation, including root rotation, fail closed at `MaxUint64` without mutating data.
+Public encrypted operations revalidate the authoritative readiness row and key source on every call, including current-root availability and published projection state, so post-startup tampering quarantines writes and reads. Readiness updates and projection publication acquire readiness/control/sequence locks in canonical order and publish import terminal positions atomically. Encrypted operation principal changes require a fully authenticated resealed payload tuple; partial ciphertext metadata is rejected. Plugin deletions authenticate the encrypted key/value while holding the row lock. Secret/plugin row-version and secret-version allocation, including root rotation, fail closed at `MaxUint64` without mutating data. Every Task5 mutation/compensation transaction now acquires the readiness publication fence before touching lane or payload rows. Claims commit observed expiry scrubs before returning later authentication/CAS errors, and lease/result commit failures return zero sensitive values. Root rotation changes only ciphertext/key identity while preserving logical row/AAD versions; encrypted PluginKV UoW updates authenticate the resulting version and round-trip after CAS updates.
 
 
 ## TDD evidence
@@ -38,20 +38,20 @@ After the narrow implementation, the same behavior tests passed. The tests asser
 
 ## Verification
 
-Exact required commands and results after commit `e8b20d72`:
+Exact required commands and results after commit `96b423bc`:
 
 ```text
 go test -race ./eventstore -run 'TestInbox|TestOutbox|TestArtifact|TestLane|TestLease|TestEffect|TestDedup' -count=1
-ok  	Scardice-core/eventstore	1.380s
+ok  	Scardice-core/eventstore	1.382s
 
 go test -race ./eventstore -run 'TestReadiness|TestKey|TestCrypto|TestSecret|TestPlugin|TestKV|TestRotation|TestA6|TestEncryption' -count=1
-ok  	Scardice-core/eventstore	1.798s
+ok  	Scardice-core/eventstore	1.802s
 
 go test -count=1 ./eventstore
-ok  	Scardice-core/eventstore	0.895s
+ok  	Scardice-core/eventstore	0.941s
 ```
 
-The commands were run after the final source/test commit and included the Task5 tests whose names match the required filters. No formatter, linter, or project-wide suite was run.
+The commands were run after the final sixth-round source/test commit and included Task5 mutation-lock, claim scrub-compensation, lease zero-result, PluginKV UoW roundtrip, rotation-version, and concurrent readiness/mutation regressions. No formatter, linter, or project-wide suite was run.
 
 ## Commits
 
@@ -73,6 +73,7 @@ The commands were run after the final source/test commit and included the Task5 
 - A6 encrypted repository hardening, readiness startup/fingerprint gates, stable digest-key separation, and plugin/artifact authentication coverage: `a1afa714`.
 - Readiness gate unification, canonical payload/digest key enforcement, encrypted plugin delete/quota integrity, plugin key root references, immutable AAD payload versions, and SQLite migration compatibility: `d49cd789`.
 - Readiness/control publication ordering, dynamic source validation, version-overflow guards, operation AAD ownership invariants, authenticated plugin deletion, and regression coverage: `e8b20d72`.
+- Task5 mutation readiness fencing, claim scrub compensation, zero-result commit-error guarantees, encrypted PluginKV UoW roundtrip, and root-only rotation version preservation: `96b423bc`.
 ## Limitation
 
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
