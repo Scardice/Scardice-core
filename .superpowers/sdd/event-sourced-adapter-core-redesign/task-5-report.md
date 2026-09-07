@@ -317,4 +317,21 @@ ok  	Scardice-core/eventstore	6.985s
 ```
 
 Thirty-third-round implementation and regression coverage: `193802a2`.
+
+Thirty-fourth-round source commit `d4d08e31` restores the transaction-authoritative A6 encryption-root admission check for UoW artifact updates after existing-row version prechecks and before artifact AAD authentication. `TestA6UOWArtifactRejectsUnadmittedEncryptionRoot` verifies readiness quarantine for an unadmitted root.
+
+Additional verification after `d4d08e31`:
+
+```text
+go test ./eventstore -run 'TestA6UOWArtifactRejectsUnadmittedEncryptionRoot|TestA6UOWOperationVersionOverflowPrecedesPrivateAuthentication' -count=1
+ok  	Scardice-core/eventstore	0.024s
+
+go test ./eventstore -count=1
+ok  	Scardice-core/eventstore	1.431s
+
+go test -race ./eventstore -count=1
+ok  	Scardice-core/eventstore	6.233s
+```
+
+Thirty-fourth-round implementation and regression coverage: `d4d08e31`.
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
