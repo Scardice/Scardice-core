@@ -272,7 +272,7 @@ func validateReadinessValue(r Readiness) error {
 }
 
 func readinessDatabaseNonEmpty(ctx context.Context, db *gorm.DB) (bool, error) {
-	for _, model := range []any{&domainEventRow{}, &operationRow{}, &operationArtifactRow{}, &inboxMessageRow{}, &outboxEffectRow{}, &adapterSecretRow{}, &pluginKVRow{}} {
+	for _, model := range []any{&domainEventRow{}, &aggregateHeadRow{}, &projectionReadModelRow{}, &operationRow{}, &operationArtifactRow{}, &laneHeadRow{}, &inboxMessageRow{}, &outboxEffectRow{}, &adapterSecretRow{}, &pluginKVRow{}, &subjectFenceRow{}} {
 		var count int64
 		if err := db.WithContext(ctx).Model(model).Count(&count).Error; err != nil {
 			return false, err
@@ -485,7 +485,7 @@ func (s *GORMStore) SetReadiness(ctx context.Context, r Readiness) error {
 	}
 	defer tx.Rollback()
 	var existing storeReadinessRow
-	queryErr := tx.Where("singleton_id = ?", "default").First(&existing).Error
+	queryErr := locked(tx).Where("singleton_id = ?", "default").First(&existing).Error
 	if queryErr == nil {
 		if existing.IndexRootID != "" && existing.IndexRootID != "unconfigured" && existing.IndexRootID != r.IndexRootID {
 			return ErrReadinessQuarantined
