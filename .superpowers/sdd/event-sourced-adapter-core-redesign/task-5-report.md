@@ -93,4 +93,21 @@ The commands were run after the twentieth-round source commit and included same-
 - Nineteenth-round stable readiness fingerprint pinning and omitted-fingerprint regression: `7acadcec`.
 - Twentieth-round same-UoW operation/artifact owner derivation closure: `603b2bd1`.
 
+
+Twenty-first-round source commit `0d7e20d1` added a live-store fresh-readiness initialization marker: same-process commits after the first fresh initialization remain valid, while a reopened nonempty fresh store with no live initialization marker remains quarantined. It also added an A6 UoW artifact-expiry pre-scan and compensation branch so expired available/ready artifacts are scrubbed before malformed ciphertext authentication.
+
+Additional verification after `0d7e20d1`:
+
+```text
+go test ./eventstore -run 'TestA6UOWExpiredArtifactPrecedesPayloadAuthentication|TestA6FreshInitializationAllowsSubsequentCommit' -count=1
+ok  	Scardice-core/eventstore	0.019s
+
+go test ./eventstore -count=1
+ok  	Scardice-core/eventstore	1.201s
+
+go test -race ./eventstore -count=1
+ok  	Scardice-core/eventstore	5.459s
+```
+
+Twenty-first-round implementation and regression coverage: `0d7e20d1`.
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
