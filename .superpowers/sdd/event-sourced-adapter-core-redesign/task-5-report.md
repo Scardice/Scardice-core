@@ -38,20 +38,20 @@ After the narrow implementation, the same behavior tests passed. The tests asser
 
 ## Verification
 
-Exact required commands and results after commit `96b423bc`:
+Exact required commands and results after commit `b704890b` (on top of `96b423bc`):
 
 ```text
 go test -race ./eventstore -run 'TestInbox|TestOutbox|TestArtifact|TestLane|TestLease|TestEffect|TestDedup' -count=1
-ok  	Scardice-core/eventstore	1.382s
+ok  	Scardice-core/eventstore	1.411s
 
 go test -race ./eventstore -run 'TestReadiness|TestKey|TestCrypto|TestSecret|TestPlugin|TestKV|TestRotation|TestA6|TestEncryption' -count=1
-ok  	Scardice-core/eventstore	1.802s
+ok  	Scardice-core/eventstore	1.858s
 
 go test -count=1 ./eventstore
-ok  	Scardice-core/eventstore	0.941s
+ok  	Scardice-core/eventstore	0.933s
 ```
 
-The commands were run after the final sixth-round source/test commit and included Task5 mutation-lock, claim scrub-compensation, lease zero-result, PluginKV UoW roundtrip, rotation-version, and concurrent readiness/mutation regressions. No formatter, linter, or project-wide suite was run.
+The commands were run after the final sixth-round source/test commits and included Task5 mutation-lock, claim scrub-compensation, lease zero-result, PluginKV UoW roundtrip, rotation-version/fence, and concurrent readiness/mutation regressions. No formatter, linter, or project-wide suite was run.
 
 ## Commits
 
@@ -74,6 +74,7 @@ The commands were run after the final sixth-round source/test commit and include
 - Readiness gate unification, canonical payload/digest key enforcement, encrypted plugin delete/quota integrity, plugin key root references, immutable AAD payload versions, and SQLite migration compatibility: `d49cd789`.
 - Readiness/control publication ordering, dynamic source validation, version-overflow guards, operation AAD ownership invariants, authenticated plugin deletion, and regression coverage: `e8b20d72`.
 - Task5 mutation readiness fencing, claim scrub compensation, zero-result commit-error guarantees, encrypted PluginKV UoW roundtrip, and root-only rotation version preservation: `96b423bc`.
+- Rotation helper transactions now hold the readiness publication fence while re-encrypting every A6 table: `b704890b`.
 ## Limitation
 
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
