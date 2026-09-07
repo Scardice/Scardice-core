@@ -181,4 +181,21 @@ ok  	Scardice-core/eventstore	5.501s
 ```
 
 Twenty-fifth-round implementation and regression coverage: `a8ec2402`.
+
+Twenty-sixth-round source commit `fe5d3f1a` extends payload-expiry compensation to scrub eligible expired artifacts in the same detached transaction as inbox/outbox rows. Mixed UoWs that encounter an expired inbox before artifact authentication now scrub both rows; malformed artifact ciphertext cannot remain available after the typed expiry result. Regression coverage is `TestA6MixedInboxArtifactExpiryCompensation`.
+
+Additional verification after `fe5d3f1a`:
+
+```text
+go test ./eventstore -run 'TestA6MixedInboxArtifactExpiryCompensation|TestA6UOWExpiredArtifactPrecedesPayloadAuthentication' -count=1
+ok  	Scardice-core/eventstore	0.026s
+
+go test ./eventstore -count=1
+ok  	Scardice-core/eventstore	1.172s
+
+go test -race ./eventstore -count=1
+ok  	Scardice-core/eventstore	5.661s
+```
+
+Twenty-sixth-round implementation and regression coverage: `fe5d3f1a`.
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
