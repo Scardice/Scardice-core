@@ -110,4 +110,21 @@ ok  	Scardice-core/eventstore	5.459s
 ```
 
 Twenty-first-round implementation and regression coverage: `0d7e20d1`.
+
+Twenty-second-round source commit `db51040e` resolves persisted operation principals before AAD validation for sparse operation updates in the same UoW as artifact writes. A sparse update no longer falls back to the operation ID when the durable principal differs; the artifact is authenticated and persisted with the existing principal. Regression coverage is `TestA6UOWSparseOperationUsesPersistedPrincipalForArtifactAAD`.
+
+Additional verification after `db51040e`:
+
+```text
+go test ./eventstore -run 'TestA6UOWSparseOperationUsesPersistedPrincipalForArtifactAAD|TestA6UOWArtifactDerivesOwnerFromSameUOWOperation' -count=1
+ok  	Scardice-core/eventstore	1.25s
+
+go test ./eventstore -count=1
+ok  	Scardice-core/eventstore	1.212s
+
+go test -race ./eventstore -count=1
+ok  	Scardice-core/eventstore	5.465s
+```
+
+Twenty-second-round implementation and regression coverage: `db51040e`.
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
