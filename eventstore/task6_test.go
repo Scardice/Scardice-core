@@ -444,6 +444,31 @@ func TestReadinessRejectsUnpublishedProjection(t *testing.T) {
 		t.Fatalf("unpublished readiness err=%v", err)
 	}
 }
+func TestTask5LockFailureRollsBackTransaction(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	ciphertext, nonce, keyID, err := a6Seal(ctx, source, "inbox/v1", "rollback-inbox", "endpoint", 1, []byte("payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox := InboxUpdate{
+		InboxID: "rollback-inbox", EndpointID: "endpoint", ProviderEventKey: "rollback-provider", LaneHMAC: []byte("rollback-lane"),
+		PayloadCiphertext: ciphertext, PayloadNonce: nonce, PayloadEncryptionKeyID: keyID,
+	}
+	if err := db.GORM().Model(&projectionControlRow{}).Where("singleton_id = ?", "default").Update("publication_state", "building").Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcceptInbox(ctx, inbox); !errors.Is(err, ErrReadinessQuarantined) {
+		t.Fatalf("lock failure err=%v", err)
+	}
+	if err := db.GORM().Model(&projectionControlRow{}).Where("singleton_id = ?", "default").Update("publication_state", "published").Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
+		t.Fatalf("post-lock-failure accept err=%v", err)
+	}
+}
 
 func TestVersionOverflowFailsBeforeMutation(t *testing.T) {
 	if _, err := nextVersion(maxUint64); !errors.Is(err, ErrVersionExhausted) {

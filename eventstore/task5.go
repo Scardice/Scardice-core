@@ -422,6 +422,7 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 		return CommitResult{}, err
 	}
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		task5Rollback(tx)
 		return CommitResult{}, err
 	}
 	defer func() {
@@ -530,6 +531,7 @@ func (s *GORMStore) ClaimInbox(ctx context.Context, req InboxClaimRequest) (leas
 		return InboxLease{}, err
 	}
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		task5Rollback(tx)
 		return InboxLease{}, err
 	}
 	defer func() {
@@ -636,6 +638,7 @@ func (s *GORMStore) UpdateInbox(ctx context.Context, update InboxUpdate) (result
 		return CommitResult{}, err
 	}
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		task5Rollback(tx)
 		return CommitResult{}, err
 	}
 	defer func() {
@@ -760,6 +763,7 @@ func (s *GORMStore) resolveInboxTx(ctx context.Context, req InboxResolutionReque
 		return CommitResult{}, err
 	}
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		task5Rollback(tx)
 		return CommitResult{}, err
 	}
 	defer func() {
@@ -896,6 +900,7 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 		return CommitResult{}, err
 	}
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		task5Rollback(tx)
 		return CommitResult{}, err
 	}
 	defer func() {
@@ -1004,6 +1009,7 @@ func (s *GORMStore) ClaimOutbox(ctx context.Context, req OutboxClaimRequest) (le
 		return OutboxLease{}, err
 	}
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		task5Rollback(tx)
 		return OutboxLease{}, err
 	}
 	defer func() {
@@ -1135,6 +1141,7 @@ func (s *GORMStore) UpdateOutbox(ctx context.Context, effect NewEffect) (result 
 		return CommitResult{}, err
 	}
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		task5Rollback(tx)
 		return CommitResult{}, err
 	}
 	defer func() {
@@ -1270,6 +1277,7 @@ func (s *GORMStore) renewOutbox(ctx context.Context, req OutboxRenewRequest) (le
 		return OutboxLease{}, err
 	}
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		task5Rollback(tx)
 		return OutboxLease{}, err
 	}
 	defer func() {
@@ -1328,6 +1336,7 @@ func (s *GORMStore) MarkOutboxDispatched(ctx context.Context, req OutboxDispatch
 		return OutboxLease{}, err
 	}
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		task5Rollback(tx)
 		return OutboxLease{}, err
 	}
 	defer func() {
@@ -1396,6 +1405,7 @@ func (s *GORMStore) CompleteOutbox(ctx context.Context, req OutboxCompletionRequ
 		return CommitResult{}, err
 	}
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		task5Rollback(tx)
 		return CommitResult{}, err
 	}
 	defer func() {
@@ -1486,6 +1496,7 @@ func (s *GORMStore) ResolveOutbox(ctx context.Context, req OutboxResolutionReque
 		return CommitResult{}, err
 	}
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		task5Rollback(tx)
 		return CommitResult{}, err
 	}
 	defer func() {
@@ -1643,6 +1654,7 @@ func (s *GORMStore) task5PersistExpiredArtifacts(ctx context.Context, work UnitO
 		return err
 	}
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		task5Rollback(tx)
 		return err
 	}
 	defer func() {
@@ -1707,6 +1719,7 @@ func (s *GORMStore) task5PersistExpiredPayloads(ctx context.Context, work UnitOf
 		return err
 	}
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		task5Rollback(tx)
 		return err
 	}
 	defer func() {
@@ -1936,6 +1949,7 @@ func (s *GORMStore) PutArtifact(ctx context.Context, req ArtifactPutRequest) (re
 		return ArtifactPutResult{}, err
 	}
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		task5Rollback(tx)
 		return ArtifactPutResult{}, err
 	}
 	defer func() {
@@ -2001,6 +2015,7 @@ func (s *GORMStore) ConsumeArtifact(ctx context.Context, req ArtifactConsumeRequ
 		return ArtifactResult{}, err
 	}
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		task5Rollback(tx)
 		return ArtifactResult{}, err
 	}
 	defer func() {
