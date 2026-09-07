@@ -135,22 +135,19 @@ func TestOnebotInboundQueueBackpressureIsObservableWithoutBlocking(t *testing.T)
 	for range cap(runtime.events) {
 		runtime.events <- onebotRuntimeEvent{kind: "inbound"}
 	}
-	enqueued := make(chan struct{})
+	done := make(chan bool, 1)
 	go func() {
-		runtime.enqueue(onebotRuntimeEvent{kind: "inbound"})
-		close(enqueued)
+		done <- runtime.enqueue(onebotRuntimeEvent{kind: "inbound"})
 	}()
 	select {
-	case <-enqueued:
-		t.Fatal("inbound queue silently accepted beyond bounded capacity")
-	case <-time.After(50 * time.Millisecond):
+	case accepted := <-done:
+		if accepted {
+			t.Fatal("inbound queue silently accepted beyond bounded capacity")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("full inbound queue blocked callback admission")
 	}
 	if err := runtime.Stop(context.Background()); err != nil { t.Fatal(err) }
-	select {
-	case <-enqueued:
-	case <-time.After(time.Second):
-		t.Fatal("blocked inbound enqueue was not released by Stop")
-	}
 	if runtime.BackpressureInboundCount() != 1 { t.Fatalf("backpressure count = %d", runtime.BackpressureInboundCount()) }
 }
 
@@ -355,28 +352,25 @@ func TestOnebotRuntimeStopBeforeRunRejectsStaleCallbacks(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
-func TestOnebotRuntimeInboundQueueBackpressureIsStopCancellable(t *testing.T) {
+func TestOnebotRuntimeInboundQueueBackpressureIsNonBlocking(t *testing.T) {
 	runtime := newOnebotRuntime(OnebotConfig{}, nil)
 	for range cap(runtime.events) {
 		runtime.events <- onebotRuntimeEvent{kind: "inbound"}
 	}
-	enqueued := make(chan struct{})
+	done := make(chan bool, 1)
 	go func() {
-		runtime.enqueue(onebotRuntimeEvent{kind: "inbound"})
-		close(enqueued)
+		done <- runtime.enqueue(onebotRuntimeEvent{kind: "inbound"})
 	}()
 	select {
-	case <-enqueued:
-		t.Fatal("inbound queue silently accepted beyond bounded capacity")
-	case <-time.After(50 * time.Millisecond):
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-enqueued:
+	case accepted := <-done:
+		if accepted {
+			t.Fatal("inbound queue silently accepted beyond bounded capacity")
+		}
 	case <-time.After(time.Second):
-		t.Fatal("blocked inbound enqueue was not released by Stop")
+		t.Fatal("full inbound queue blocked callback admission")
+	}
+	if runtime.BackpressureInboundCount() != 1 {
+		t.Fatalf("backpressure count = %d", runtime.BackpressureInboundCount())
 	}
 }
 

@@ -1,9 +1,12 @@
 package socketio
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
+
+	"github.com/lxzan/gws"
 )
 
 func TestShutdownWaitDrainsQueuedWrapperEvents(t *testing.T) {
@@ -91,5 +94,22 @@ func TestWrapperEventQueueIsBounded(t *testing.T) {
 	case <-disconnected:
 	case <-time.After(time.Second):
 		t.Fatal("terminal disconnect event was dropped")
+	}
+}
+
+func TestTransportMessageIsBoundBeforeCopy(t *testing.T) {
+	manager := NewSocketInstance()
+	wrapper := newClientWrapper(manager, "ws://127.0.0.1", ClientOptions{})
+	handler := &transportHandler{wrapper: wrapper}
+	message := &gws.Message{
+		Opcode: gws.OpcodeText,
+		Data:   bytes.NewBuffer(make([]byte, maxWrapperMessageBytes+1)),
+	}
+	handler.OnMessage(nil, message)
+	if wrapper.DroppedEventCount() != 1 {
+		t.Fatalf("dropped events = %d", wrapper.DroppedEventCount())
+	}
+	if len(wrapper.eventQueue) != 0 {
+		t.Fatalf("oversized message entered queue: %d", len(wrapper.eventQueue))
 	}
 }

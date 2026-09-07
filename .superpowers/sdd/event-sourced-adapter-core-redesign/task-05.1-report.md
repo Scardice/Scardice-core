@@ -182,3 +182,28 @@ Round 4 files changed:
 - `dice/platform_adapter_onebot_runtime_test.go`
 - `third_party/pineutil/evsocket/v2/socketio.go`
 - `third_party/pineutil/evsocket/v2/socketio_test.go`
+
+## Round 5 fixes
+
+- The wrapper readiness gate is now one-shot: reconnects no longer replace `connectReady`, so an in-flight drain cannot wait on a stale channel that a later connection never closes. Existing queued callbacks continue draining after the first successful connection, and shutdown wait remains balanced.
+- `transportHandler.OnMessage` checks the frame length against a 256 KiB transport bound before copying `message.Bytes()`. Oversized frames are closed and counted as transport drops without entering the wrapper queue.
+- Runtime event admission is explicitly nonblocking when the bounded Core event channel is full. Inbound callbacks receive observable backpressure accounting instead of blocking the wrapper drain; retry rehandoff remains bounded.
+- Terminal event reservation and runtime diagnostics from Round 4 remain covered; diagnostics now include the transport-level pre-copy drop count.
+
+### Round 5 GREEN evidence
+
+```text
+go test ./evsocket/v2 -run 'Test(WrapperEventQueueIsBounded|ShutdownWaitDrainsQueuedWrapperEvents|TransportMessageIsBoundBeforeCopy)' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+
+go test ./dice ./core/messageflow -run 'Test(InboundService(FallbackDuplicateAndCollision|NoIDNoTimeUsesContentDigestIdentity)|OnebotRuntime(InboundRetryIsBounded|DiagnosticsExposeIngressCounters|InboundQueueBackpressureIsNonBlocking|KeepsAliveOnRetryableInboundError)|OnebotInbound)' -count=1
+ok   Scardice-core/dice
+ok   Scardice-core/core/messageflow
+```
+
+Round 5 files changed:
+
+- `third_party/pineutil/evsocket/v2/socketio.go`
+- `third_party/pineutil/evsocket/v2/socketio_test.go`
+- `dice/platform_adapter_onebot_runtime.go`
+- `dice/platform_adapter_onebot_runtime_test.go`

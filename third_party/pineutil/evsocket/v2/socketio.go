@@ -28,6 +28,7 @@ const (
 )
 
 const maxWrapperEventQueue = 32
+const maxWrapperMessageBytes = 256 * 1024
 
 const (
 	defaultClientHandshakeTimeout = 10 * time.Second
@@ -424,9 +425,11 @@ type WebsocketWrapper struct {
 	eventMu       sync.Mutex
 	eventQueue    []eventEnvelope
 	eventDraining bool
-	eventWG       sync.WaitGroup
 	droppedEvents atomic.Uint64
-	connectReady  chan struct{}
+	eventWG       sync.WaitGroup
+	// connectReady is a one-shot readiness gate. It remains closed after the
+	// first successful connection so reconnects cannot strand an existing drain.
+	connectReady chan struct{}
 
 	OnConnected    func()
 	OnDisconnected func(err error)
@@ -927,11 +930,6 @@ func (kws *WebsocketWrapper) setClientState(state clientTransportState) {
 
 func (kws *WebsocketWrapper) connectClientTransport(reconnecting bool) error {
 	opened := make(chan struct{})
-	if reconnecting {
-		kws.eventMu.Lock()
-		kws.connectReady = make(chan struct{})
-		kws.eventMu.Unlock()
-	}
 	handler := &transportHandler{wrapper: kws, opened: opened}
 	requestHeader := cloneHeader(kws.clientOptions.RequestHeader)
 	if len(kws.clientOptions.Subprotocols) > 0 && requestHeader.Get("Sec-WebSocket-Protocol") == "" {
@@ -1116,6 +1114,10 @@ func (h *transportHandler) OnOpen(socket *gws.Conn) {
 func (h *transportHandler) OnMessage(socket *gws.Conn, message *gws.Message) {
 	defer message.Close()
 	h.wrapper.refreshClientDeadline(socket)
+	if len(message.Bytes()) > maxWrapperMessageBytes {
+		h.wrapper.droppedEvents.Add(1)
+		return
+	}
 	data := append([]byte(nil), message.Bytes()...)
 	h.wrapper.dispatchMessage(message.Opcode, data)
 }

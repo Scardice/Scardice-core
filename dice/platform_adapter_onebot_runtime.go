@@ -721,7 +721,7 @@ func (r *onebotRuntime) enqueue(event onebotRuntimeEvent) bool {
 	select {
 	case r.events <- event:
 		return true
-	case <-r.stopCh:
+	default:
 		if event.kind == "inbound" {
 			r.inboundBackpressure.Add(1)
 		}
