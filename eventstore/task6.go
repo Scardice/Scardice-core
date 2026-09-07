@@ -1238,11 +1238,23 @@ func (s *GORMStore) RotateEncryptionRoots(ctx context.Context) (EncryptionRotati
 }
 
 func (s *GORMStore) rotateSecretRows(ctx context.Context, root EncryptionRoot) (updated, skipped int, err error) {
+	tx := s.db.GORM().WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return 0, 0, ErrParticipantFailure
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback().Error
+		}
+	}()
+	if err = lockPublication(tx); err != nil {
+		return
+	}
 	var cursorRef string
 	var cursorVersion uint64
 	for {
 		var rows []adapterSecretRow
-		q := s.db.GORM().WithContext(ctx).Order("secret_ref ASC, secret_version ASC").Limit(rotationPageSize)
+		q := tx.Order("secret_ref ASC, secret_version ASC").Limit(rotationPageSize)
 		if cursorRef != "" {
 			q = q.Where("(secret_ref > ?) OR (secret_ref = ? AND secret_version > ?)", cursorRef, cursorRef, cursorVersion)
 		}
@@ -1250,7 +1262,7 @@ func (s *GORMStore) rotateSecretRows(ctx context.Context, root EncryptionRoot) (
 			return
 		}
 		if len(rows) == 0 {
-			return
+			break
 		}
 		for _, row := range rows {
 			if row.EncryptionKeyID == root.ID {
@@ -1266,7 +1278,7 @@ func (s *GORMStore) rotateSecretRows(ctx context.Context, root EncryptionRoot) (
 				err = sealErr
 				return
 			}
-			q = s.db.GORM().WithContext(ctx).Model(&adapterSecretRow{}).Where("secret_ref = ? AND secret_version = ? AND row_version = ? AND encryption_key_id = ?", row.SecretRef, row.SecretVersion, row.RowVersion, row.EncryptionKeyID).Updates(map[string]any{"ciphertext": ciphertext, "nonce": nonce, "encryption_key_id": keyID, "updated_at": s.task5Now()})
+			q = tx.Model(&adapterSecretRow{}).Where("secret_ref = ? AND secret_version = ? AND row_version = ? AND encryption_key_id = ?", row.SecretRef, row.SecretVersion, row.RowVersion, row.EncryptionKeyID).Updates(map[string]any{"ciphertext": ciphertext, "nonce": nonce, "encryption_key_id": keyID, "updated_at": s.task5Now()})
 			if q.Error != nil {
 				err = ErrParticipantFailure
 				return
@@ -1280,9 +1292,13 @@ func (s *GORMStore) rotateSecretRows(ctx context.Context, root EncryptionRoot) (
 		last := rows[len(rows)-1]
 		cursorRef, cursorVersion = last.SecretRef, last.SecretVersion
 		if len(rows) < rotationPageSize {
-			return
+			break
 		}
 	}
+	if err = tx.Commit().Error; err != nil {
+		err = ErrParticipantFailure
+	}
+	return
 }
 func (s *GORMStore) refreshReadinessRoots(ctx context.Context, currentID string) error {
 	tx := s.db.GORM().WithContext(ctx).Begin()
@@ -1321,7 +1337,18 @@ func (s *GORMStore) refreshReadinessRoots(ctx context.Context, currentID string)
 
 
 func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRoot) (updated, skipped int, err error) {
-	base := s.db.GORM().WithContext(ctx)
+	base := s.db.GORM().WithContext(ctx).Begin()
+	if base.Error != nil {
+		return 0, 0, ErrParticipantFailure
+	}
+	defer func() {
+		if err != nil {
+			_ = base.Rollback().Error
+		}
+	}()
+	if err = lockPublication(base); err != nil {
+		return
+	}
 	var operationCursor string
 	for {
 		var rows []operationRow
@@ -1552,6 +1579,9 @@ func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRo
 		if len(rows) < rotationPageSize {
 			break
 		}
+	}
+	if err = base.Commit().Error; err != nil {
+		err = ErrParticipantFailure
 	}
 	return
 }
