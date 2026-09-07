@@ -137,7 +137,7 @@ func (s *GORMStore) task5CanonicalDigestKeyID(ctx context.Context, explicit stri
 	}
 	return indexID, nil
 }
-func (s *GORMStore) task5ValidatePayload(ctx context.Context, domain, identity, owner string, version uint64, ciphertext, nonce []byte, keyID string, artifact bool) error {
+func (s *GORMStore) task5ValidatePayload(ctx context.Context, db *gorm.DB, domain, identity, owner string, version uint64, ciphertext, nonce []byte, keyID string, artifact bool) error {
 	if len(ciphertext) == 0 && len(nonce) == 0 {
 		if s.keySource != nil {
 			return ErrAuthenticationFailed
@@ -155,6 +155,9 @@ func (s *GORMStore) task5ValidatePayload(ctx context.Context, domain, identity, 
 		return nil
 	}
 	if err := s.requireA6BoundCodec(); err != nil {
+		return err
+	}
+	if err := s.validateA6KeyID(ctx, db, keyID); err != nil {
 		return err
 	}
 	if _, err := openBoundPayload(ctx, s.codec, domain, identity, owner, version, ciphertext, nonce, keyID); err != nil {
@@ -402,6 +405,9 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 		if err := s.requireA6BoundCodec(); err != nil {
 			return CommitResult{}, err
 		}
+		if err := s.validateA6KeyID(ctx, s.db.GORM(), payloadKeyID); err != nil {
+			return CommitResult{}, err
+		}
 		if _, decryptErr := openBoundPayload(ctx, s.codec, "inbox/v1", update.InboxID, update.EndpointID, 1, update.PayloadCiphertext, update.PayloadNonce, payloadKeyID); decryptErr != nil {
 			return CommitResult{}, ErrAuthenticationFailed
 		}
@@ -577,7 +583,7 @@ func (s *GORMStore) ClaimInbox(ctx context.Context, req InboxClaimRequest) (leas
 		}
 		return InboxLease{}, ErrPayloadExpired
 	}
-	if err = s.task5ValidatePayload(ctx, "inbox/v1", row.InboxID, row.EndpointID, task5PayloadVersion(row.PayloadVersion), row.PayloadCiphertext, row.PayloadNonce, row.EncryptionKeyID, false); err != nil {
+	if err = s.task5ValidatePayload(ctx, tx, "inbox/v1", row.InboxID, row.EndpointID, task5PayloadVersion(row.PayloadVersion), row.PayloadCiphertext, row.PayloadNonce, row.EncryptionKeyID, false); err != nil {
 		return InboxLease{}, commitObservedScrub(err)
 	}
 	if row.LeaseEpoch == maxUint64 {
@@ -869,6 +875,9 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 		if err := s.requireA6BoundCodec(); err != nil {
 			return CommitResult{}, err
 		}
+		if err := s.validateA6KeyID(ctx, s.db.GORM(), payloadKeyID); err != nil {
+			return CommitResult{}, err
+		}
 		if _, decryptErr := openBoundPayload(ctx, s.codec, "outbox/v1", effect.EffectID, effect.EndpointID, 1, effect.PayloadCiphertext, effect.PayloadNonce, payloadKeyID); decryptErr != nil {
 			return CommitResult{}, ErrAuthenticationFailed
 		}
@@ -1069,7 +1078,7 @@ func (s *GORMStore) ClaimOutbox(ctx context.Context, req OutboxClaimRequest) (le
 		}
 		return OutboxLease{}, ErrPayloadExpired
 	}
-	if err = s.task5ValidatePayload(ctx, "outbox/v1", row.EffectID, row.EndpointID, task5PayloadVersion(row.PayloadVersion), row.PayloadCiphertext, row.PayloadNonce, row.EncryptionKeyID, false); err != nil {
+	if err = s.task5ValidatePayload(ctx, tx, "outbox/v1", row.EffectID, row.EndpointID, task5PayloadVersion(row.PayloadVersion), row.PayloadCiphertext, row.PayloadNonce, row.EncryptionKeyID, false); err != nil {
 		return OutboxLease{}, commitObservedScrub(err)
 	}
 	if row.LeaseEpoch == maxUint64 {
@@ -1850,6 +1859,18 @@ func sealBoundPayload(ctx context.Context, codec any, domain, identity, owner st
 	}
 	return sealPayload(ctx, codec, plaintext)
 }
+func (s *GORMStore) sealBoundPayloadInMutation(ctx context.Context, tx *gorm.DB, domain, identity, owner string, version uint64, plaintext []byte) ([]byte, []byte, string, error) {
+	if s.keySource != nil {
+		if _, ok := s.codec.(*a6PayloadCodec); ok {
+			root, err := s.admittedCurrentRoot(ctx, tx)
+			if err != nil {
+				return nil, nil, "", err
+			}
+			return a6SealWithRoot(root, domain, identity, owner, version, plaintext)
+		}
+	}
+	return sealBoundPayload(ctx, s.codec, domain, identity, owner, version, plaintext)
+}
 
 func openBoundPayload(ctx context.Context, codec any, domain, identity, owner string, version uint64, ciphertext, nonce []byte, keyID string) ([]byte, error) {
 	if bound, ok := codec.(interface {
@@ -1939,8 +1960,11 @@ func (s *GORMStore) PutArtifact(ctx context.Context, req ArtifactPutRequest) (re
 	if err = s.requireA6BoundCodec(); err != nil {
 		return ArtifactPutResult{}, err
 	}
-	ciphertext, nonce, keyID, err := sealBoundPayload(ctx, s.codec, "artifact/v1", req.ArtifactID, req.OwnerPrincipalID, 1, req.Plaintext)
+	ciphertext, nonce, keyID, err := s.sealBoundPayloadInMutation(ctx, tx, "artifact/v1", req.ArtifactID, req.OwnerPrincipalID, 1, req.Plaintext)
 	if err != nil {
+		if errors.Is(err, ErrReadinessQuarantined) {
+			return ArtifactPutResult{}, err
+		}
 		return ArtifactPutResult{}, ErrEncryptionUnavailable
 	}
 	if opaqueErr := validateTask5ArtifactOpaquePayload(ciphertext, nonce, keyID); opaqueErr != nil {
@@ -2022,6 +2046,9 @@ func (s *GORMStore) ConsumeArtifact(ctx context.Context, req ArtifactConsumeRequ
 		return ArtifactResult{}, err
 	}
 	if err = validateTask5ArtifactOpaquePayload(row.Ciphertext, row.Nonce, row.EncryptionKeyID); err != nil {
+		return ArtifactResult{}, err
+	}
+	if err = s.validateA6KeyID(ctx, tx, row.EncryptionKeyID); err != nil {
 		return ArtifactResult{}, err
 	}
 	plaintext, openErr := openBoundPayload(ctx, s.codec, "artifact/v1", row.ArtifactID, row.OwnerPrincipalID, task5PayloadVersion(row.PayloadVersion), row.Ciphertext, row.Nonce, row.EncryptionKeyID)

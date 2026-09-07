@@ -512,24 +512,29 @@ func (s *GORMStore) Purge(ctx context.Context, req PrivacyPurgeRequest) (Privacy
 		return PrivacyPurgeResult{}, ErrInvalidTransition
 	}
 	var deleted int64
-	if scope == "private" || scope == "all" {
-		if len(row.PrivateContext) > 0 || len(row.PrivateNonce) > 0 || row.PrivateKeyID != "" {
-			nextVersionValue, versionErr := nextVersion(row.Version)
-			if versionErr != nil {
-				return PrivacyPurgeResult{}, versionErr
-			}
-			q := tx.Model(&operationRow{}).Where("operation_id = ? AND version = ?", row.OperationID, row.Version).Updates(map[string]any{"version": nextVersionValue, "private_context": nil, "private_nonce": nil, "private_key_id": "", "updated_at": s.task5Now()})
-			if q.Error != nil {
-				return PrivacyPurgeResult{}, ErrParticipantFailure
-			}
-			if q.RowsAffected != 1 {
-				return PrivacyPurgeResult{}, ErrParticipantConflict
-			}
-			deleted++
-		}
+	nextVersionValue, versionErr := nextVersion(row.Version)
+	if versionErr != nil {
+		return PrivacyPurgeResult{}, versionErr
+	}
+	privateBytesPresent := len(row.PrivateContext) > 0 || len(row.PrivateNonce) > 0 || row.PrivateKeyID != ""
+	operationUpdates := map[string]any{"version": nextVersionValue, "updated_at": s.task5Now()}
+	if (scope == "private" || scope == "all") && privateBytesPresent {
+		operationUpdates["private_context"] = nil
+		operationUpdates["private_nonce"] = nil
+		operationUpdates["private_key_id"] = ""
+	}
+	q := tx.Model(&operationRow{}).Where("operation_id = ? AND version = ?", row.OperationID, row.Version).Updates(operationUpdates)
+	if q.Error != nil {
+		return PrivacyPurgeResult{}, ErrParticipantFailure
+	}
+	if q.RowsAffected != 1 {
+		return PrivacyPurgeResult{}, ErrParticipantConflict
+	}
+	if (scope == "private" || scope == "all") && privateBytesPresent {
+		deleted++
 	}
 	if scope == "artifacts" || scope == "all" {
-		q := tx.Where("operation_id = ?", req.OperationID).Delete(&operationArtifactRow{})
+		q = tx.Where("operation_id = ?", req.OperationID).Delete(&operationArtifactRow{})
 		if q.Error != nil {
 			return PrivacyPurgeResult{}, ErrParticipantFailure
 		}
@@ -664,11 +669,18 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 						row.EncryptionKeyID = update.EncryptionKeyID
 					}
 				} else if s.keySource != nil {
+					if err := s.validateA6KeyID(ctx, tx, latest.EncryptionKeyID); err != nil {
+						return err
+					}
 					plain, openErr := a6Open(ctx, s.keySource, "adapter-secret/v1", latest.SecretRef, latest.EndpointID+"/"+latest.AdapterID, latest.SecretVersion, latest.EncryptionKeyID, latest.Ciphertext, latest.Nonce)
 					if openErr != nil {
 						return ErrAuthenticationFailed
 					}
-					ciphertext, nonce, keyID, sealErr := a6Seal(ctx, s.keySource, "adapter-secret/v1", row.SecretRef, row.EndpointID+"/"+row.AdapterID, row.SecretVersion, plain)
+					root, rootErr := s.admittedCurrentRoot(ctx, tx)
+					if rootErr != nil {
+						return rootErr
+					}
+					ciphertext, nonce, keyID, sealErr := a6SealWithRoot(root, "adapter-secret/v1", row.SecretRef, row.EndpointID+"/"+row.AdapterID, row.SecretVersion, plain)
 					if sealErr != nil {
 						return ErrEncryptionUnavailable
 					}
@@ -720,7 +732,7 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 					return quota{}, ErrInvalidMetadata
 				}
 				if s.keySource != nil {
-					item, decodeErr := s.decodePluginKVRow(ctx, row)
+					item, decodeErr := s.decodePluginKVRow(ctx, tx, row)
 					if decodeErr != nil {
 						return quota{}, decodeErr
 					}
@@ -760,7 +772,7 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 					return err
 				}
 				if s.keySource != nil {
-					if _, err := s.decodePluginKVRow(ctx, row); err != nil {
+					if _, err := s.decodePluginKVRow(ctx, tx, row); err != nil {
 						return err
 					}
 				}

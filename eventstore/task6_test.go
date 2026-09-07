@@ -135,6 +135,32 @@ func TestA6SecretDecodedBounds(t *testing.T) {
 		t.Fatalf("oversized resolved secret=%d err=%v", len(resolved.Plaintext), err)
 	}
 }
+func TestA6KeyIDsRequireReadinessAdmission(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	source.Roots["root-v2"] = []byte("12345678901234567890123456789012")
+	ciphertext, nonce, keyID, err := a6SealWithRoot(EncryptionRoot{ID: "root-v2", Material: source.Roots["root-v2"]}, "adapter-secret/v1", "unadmitted-secret", "endpoint/adapter", 1, []byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{SecretUpdates: []SecretUpdate{{
+		SecretRef: "unadmitted-secret", EndpointID: "endpoint", AdapterID: "adapter", SecretVersion: 1,
+		Ciphertext: ciphertext, Nonce: nonce, EncryptionKeyID: keyID,
+	}}}); !errors.Is(err, ErrReadinessQuarantined) {
+		t.Fatalf("unadmitted UoW root err=%v", err)
+	}
+	now := time.Now().UTC()
+	if err := db.GORM().Create(&adapterSecretRow{
+		SecretRef: "unadmitted-secret", SecretVersion: 1, EndpointID: "endpoint", AdapterID: "adapter", AdapterType: "opaque",
+		Ciphertext: ciphertext, Nonce: nonce, EncryptionKeyID: keyID, RowVersion: 1, CreatedAt: now, UpdatedAt: now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ResolveSecret(ctx, "unadmitted-secret", 1); !errors.Is(err, ErrReadinessQuarantined) {
+		t.Fatalf("unadmitted stored root err=%v", err)
+	}
+}
 
 
 func TestPluginKVExactAndPrefixIsolation(t *testing.T) {
@@ -168,6 +194,19 @@ func TestPluginKVLookupBounds(t *testing.T) {
 	}
 	if _, err := store.ListPluginKV(ctx, PluginKVListRequest{ExtensionID: "ext", Prefix: longKey}); !errors.Is(err, ErrOversizeInput) {
 		t.Fatalf("oversized list prefix err=%v", err)
+	}
+}
+func TestA6WritesUseReadinessAdmittedCurrentRoot(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	source.Roots["root-v2"] = []byte("12345678901234567890123456789012")
+	source.CurrentID = "root-v2"
+	if _, err := store.PutSecret(context.Background(), SecretPutRequest{SecretRef: "current-root", EndpointID: "endpoint", AdapterID: "adapter", Plaintext: []byte("secret")}); !errors.Is(err, ErrReadinessQuarantined) {
+		t.Fatalf("unadmitted current root secret err=%v", err)
+	}
+	source.CurrentID = "root-v1"
+	if _, err := store.PutSecret(context.Background(), SecretPutRequest{SecretRef: "current-root", EndpointID: "endpoint", AdapterID: "adapter", Plaintext: []byte("secret")}); err != nil {
+		t.Fatalf("admitted current root secret err=%v", err)
 	}
 }
 func TestOperationViewAndPrivacyPurge(t *testing.T) {
@@ -213,6 +252,39 @@ func TestOperationViewAndPrivacyPurge(t *testing.T) {
 	}
 	if artifactCount != 0 {
 		t.Fatalf("artifacts survived purge: %d", artifactCount)
+	}
+	if err := db.GORM().Create(&operationRow{
+		OperationID: "purge-artifacts-only", Version: 1, Kind: "test", Status: "succeeded",
+		PrincipalID: "principal", IdempotencyScope: "scope", IdempotencyKey: "key-artifacts-only",
+		CreatedAt: now, UpdatedAt: now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GORM().Create(&operationArtifactRow{
+		ArtifactID: "purge-artifacts-only-artifact", Version: 1, OperationID: "purge-artifacts-only", OwnerPrincipalID: "principal",
+		MediaType: "application/octet-stream", Size: 1, Status: "available", Ciphertext: []byte("ciphertext"),
+		Nonce: []byte("nonce"), EncryptionKeyID: "root-v1", ExpiresAt: now.Add(time.Hour),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if purged, err := store.Purge(context.Background(), PrivacyPurgeRequest{OperationID: "purge-artifacts-only", Scope: "artifacts"}); err != nil || purged.Deleted != 1 {
+		t.Fatalf("artifact-only purge=%#v err=%v", purged, err)
+	}
+	operation = operationRow{}
+	if err := db.GORM().Where("operation_id = ?", "purge-artifacts-only").First(&operation).Error; err != nil {
+		t.Fatal(err)
+	}
+	if operation.Version != 2 {
+		t.Fatalf("artifact-only purge did not fence operation: %d", operation.Version)
+	}
+	if purged, err := store.Purge(context.Background(), PrivacyPurgeRequest{OperationID: "purge-artifacts-only", Scope: "private"}); err != nil || purged.Deleted != 0 {
+		t.Fatalf("empty-private purge=%#v err=%v", purged, err)
+	}
+	if err := db.GORM().Where("operation_id = ?", "purge-artifacts-only").First(&operation).Error; err != nil {
+		t.Fatal(err)
+	}
+	if operation.Version != 3 {
+		t.Fatalf("empty-private purge did not fence operation: %d", operation.Version)
 	}
 }
 

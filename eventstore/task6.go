@@ -494,6 +494,39 @@ func (s *GORMStore) validateReadinessOnDB(ctx context.Context, db *gorm.DB, allo
 	}
 	return nil
 }
+func (s *GORMStore) validateA6KeyID(ctx context.Context, db *gorm.DB, keyID string) error {
+	if s == nil || s.keySource == nil {
+		return nil
+	}
+	if strings.TrimSpace(keyID) == "" || db == nil {
+		return ErrInvalidMetadata
+	}
+	var row storeReadinessRow
+	if err := db.WithContext(ctx).Where("singleton_id = ?", "default").First(&row).Error; err != nil {
+		return ErrReadinessQuarantined
+	}
+	readiness, err := readinessFromRow(row)
+	if err != nil || validateReadinessValue(readiness) != nil {
+		return ErrReadinessQuarantined
+	}
+	for _, admitted := range readiness.EncryptionRootIDs {
+		if admitted == keyID {
+			return nil
+		}
+	}
+	return ErrReadinessQuarantined
+}
+
+func (s *GORMStore) admittedCurrentRoot(ctx context.Context, db *gorm.DB) (EncryptionRoot, error) {
+	root, err := keySourceCurrent(ctx, s.keySource)
+	if err != nil {
+		return EncryptionRoot{}, err
+	}
+	if err := s.validateA6KeyID(ctx, db, root.ID); err != nil {
+		return EncryptionRoot{}, err
+	}
+	return root, nil
+}
 func (s *GORMStore) validateA6UnitOfWork(ctx context.Context, work UnitOfWork) error {
 	if s == nil || s.db == nil || s.db.GORM() == nil {
 		return ErrParticipantFailure
@@ -541,6 +574,9 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		if existingFound {
 			version = task5PayloadVersion(existing.PrivatePayloadVersion)
 		}
+		if err := s.validateA6KeyID(ctx, db, update.EncryptionKeyID); err != nil {
+			return err
+		}
 		if _, err := openBoundPayload(ctx, s.codec, "operation-private/v1", update.OperationID, update.PrincipalID, version, update.PrivateContextCiphertext, update.PrivateContextNonce, update.EncryptionKeyID); err != nil {
 			return ErrAuthenticationFailed
 		}
@@ -568,6 +604,9 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 			version = task5PayloadVersion(existing.PayloadVersion)
 		}
 		if err := validateTask5OpaquePayload(update.PayloadCiphertext, update.PayloadNonce, payloadKeyID); err != nil {
+			return err
+		}
+		if err := s.validateA6KeyID(ctx, db, payloadKeyID); err != nil {
 			return err
 		}
 		if _, err := openBoundPayload(ctx, s.codec, "inbox/v1", update.InboxID, update.EndpointID, version, update.PayloadCiphertext, update.PayloadNonce, payloadKeyID); err != nil {
@@ -599,6 +638,9 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		if err := validateTask5OpaquePayload(effect.PayloadCiphertext, effect.PayloadNonce, payloadKeyID); err != nil {
 			return err
 		}
+		if err := s.validateA6KeyID(ctx, db, payloadKeyID); err != nil {
+			return err
+		}
 		if _, err := openBoundPayload(ctx, s.codec, "outbox/v1", effect.EffectID, effect.EndpointID, version, effect.PayloadCiphertext, effect.PayloadNonce, payloadKeyID); err != nil {
 			return ErrAuthenticationFailed
 		}
@@ -628,6 +670,9 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		}
 		version := uint64(1)
 		var existingArtifact operationArtifactRow
+		if err := s.validateA6KeyID(ctx, db, update.EncryptionKeyID); err != nil {
+			return err
+		}
 		if err := db.WithContext(ctx).Select("payload_version").Where("artifact_id = ?", update.ArtifactID).First(&existingArtifact).Error; err == nil {
 			version = task5PayloadVersion(existingArtifact.PayloadVersion)
 		}
@@ -686,6 +731,9 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 			if len(update.Nonce) != 12 {
 				return ErrInvalidMetadata
 			}
+			if err := s.validateA6KeyID(ctx, db, update.EncryptionKeyID); err != nil {
+				return err
+			}
 			plain, err := a6Open(ctx, s.keySource, "adapter-secret/v1", update.SecretRef, endpoint+"/"+adapter, secretVersion, update.EncryptionKeyID, update.Ciphertext, update.Nonce)
 			if err != nil {
 				return ErrAuthenticationFailed
@@ -702,6 +750,9 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 			}
 			if len(latest.Nonce) != 12 {
 				return ErrInvalidMetadata
+			}
+			if err := s.validateA6KeyID(ctx, db, latest.EncryptionKeyID); err != nil {
+				return err
 			}
 			plain, err := a6Open(ctx, s.keySource, "adapter-secret/v1", latest.SecretRef, latest.EndpointID+"/"+latest.AdapterID, latest.SecretVersion, latest.EncryptionKeyID, latest.Ciphertext, latest.Nonce)
 			if err != nil {
@@ -741,6 +792,9 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		}
 		if update.Version != 0 {
 			version = update.Version
+		}
+		if err := s.validateA6KeyID(ctx, db, update.EncryptionKeyID); err != nil {
+			return err
 		}
 		key, err := a6Open(ctx, s.keySource, "plugin-kv-key/v1", string(update.KeyHMAC), update.ExtensionID, version, update.EncryptionKeyID, update.KeyCiphertext, update.KeyNonce)
 		if err != nil {
@@ -986,7 +1040,11 @@ func (s *GORMStore) PutSecret(ctx context.Context, req SecretPutRequest) (Secret
 	} else if current > 0 && version <= latest.SecretVersion {
 		return SecretResolution{}, ErrParticipantConflict
 	}
-	ciphertext, nonce, keyID, err := a6Seal(ctx, s.keySource, "adapter-secret/v1", req.SecretRef, req.EndpointID+"/"+req.AdapterID, version, req.Plaintext)
+	root, err := s.admittedCurrentRoot(ctx, tx)
+	if err != nil {
+		return SecretResolution{}, err
+	}
+	ciphertext, nonce, keyID, err := a6SealWithRoot(root, "adapter-secret/v1", req.SecretRef, req.EndpointID+"/"+req.AdapterID, version, req.Plaintext)
 	if err != nil {
 		return SecretResolution{}, err
 	}
@@ -1026,6 +1084,9 @@ func (s *GORMStore) ResolveSecret(ctx context.Context, ref string, version uint6
 	if len(row.Nonce) != 12 {
 		return SecretResolution{}, ErrInvalidMetadata
 	}
+	if err := s.validateA6KeyID(ctx, s.db.GORM(), row.EncryptionKeyID); err != nil {
+		return SecretResolution{}, err
+	}
 	plain, err := a6Open(ctx, s.keySource, "adapter-secret/v1", row.SecretRef, row.EndpointID+"/"+row.AdapterID, row.SecretVersion, row.EncryptionKeyID, row.Ciphertext, row.Nonce)
 	if err != nil {
 		return SecretResolution{}, ErrAuthenticationFailed
@@ -1060,6 +1121,9 @@ func (s *GORMStore) pluginValueUsageOn(ctx context.Context, db *gorm.DB, extensi
 		}
 		if len(row.KeyNonce) != 12 || len(row.ValueNonce) != 12 {
 			return 0, ErrInvalidMetadata
+		}
+		if err := s.validateA6KeyID(ctx, db, row.EncryptionKeyID); err != nil {
+			return 0, err
 		}
 		key, err := a6Open(ctx, s.keySource, "plugin-kv-key/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedKey, row.KeyNonce)
 		if err != nil {
@@ -1100,6 +1164,19 @@ func (s *GORMStore) lockMutationPublication(ctx context.Context, tx *gorm.DB) er
 		return nil
 	}
 	return s.validateReadinessOnDB(ctx, tx, false)
+}
+func (s *GORMStore) lockRotationPublication(ctx context.Context, tx *gorm.DB, expectedRootID string) error {
+	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		return err
+	}
+	current, err := s.admittedCurrentRoot(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if current.ID != expectedRootID {
+		return ErrReadinessQuarantined
+	}
+	return nil
 }
 
 
@@ -1169,7 +1246,7 @@ func (s *GORMStore) SetPluginKV(ctx context.Context, req PluginKVPutRequest) (Pl
 	if err != nil {
 		return PluginKVItem{}, err
 	}
-	root, err := keySourceCurrent(ctx, s.keySource)
+	root, err := s.admittedCurrentRoot(ctx, tx)
 	if err != nil {
 		return PluginKVItem{}, err
 	}
@@ -1199,7 +1276,7 @@ func (s *GORMStore) SetPluginKV(ctx context.Context, req PluginKVPutRequest) (Pl
 	return PluginKVItem{ExtensionID: req.ExtensionID, Key: req.Key, Value: append([]byte(nil), req.Value...), Version: version}, nil
 }
 
-func (s *GORMStore) decodePluginKVRow(ctx context.Context, row pluginKVRow) (PluginKVItem, error) {
+func (s *GORMStore) decodePluginKVRow(ctx context.Context, db *gorm.DB, row pluginKVRow) (PluginKVItem, error) {
 	if row.ValueSize < 0 || row.ValueSize > MaxPluginValueBytes {
 		return PluginKVItem{}, &OversizeError{Bound: "plugin value bytes", Limit: MaxPluginValueBytes, Actual: int(row.ValueSize)}
 	}
@@ -1208,6 +1285,9 @@ func (s *GORMStore) decodePluginKVRow(ctx context.Context, row pluginKVRow) (Plu
 	}
 	if len(row.EncryptedValue) > MaxPluginValueBytes+16 {
 		return PluginKVItem{}, &OversizeError{Bound: "encrypted plugin value bytes", Limit: MaxPluginValueBytes + 16, Actual: len(row.EncryptedValue)}
+	}
+	if err := s.validateA6KeyID(ctx, db, row.EncryptionKeyID); err != nil {
+		return PluginKVItem{}, err
 	}
 	if len(row.KeyNonce) != 12 || len(row.ValueNonce) != 12 {
 		return PluginKVItem{}, ErrInvalidMetadata
@@ -1247,7 +1327,7 @@ func (s *GORMStore) GetPluginKV(ctx context.Context, extension, key string) (Plu
 	if err := s.db.GORM().WithContext(ctx).Where("extension_id = ? AND key_hmac = ?", extension, index).First(&row).Error; err != nil {
 		return PluginKVItem{}, ErrPluginKVNotFound
 	}
-	item, err := s.decodePluginKVRow(ctx, row)
+	item, err := s.decodePluginKVRow(ctx, s.db.GORM(), row)
 	if err != nil {
 		return PluginKVItem{}, err
 	}
@@ -1292,7 +1372,7 @@ func (s *GORMStore) DeletePluginKV(ctx context.Context, extension, key string, e
 	if expected > 0 && expected != row.RowVersion {
 		return ErrParticipantConflict
 	}
-	if _, err := s.decodePluginKVRow(ctx, row); err != nil {
+	if _, err := s.decodePluginKVRow(ctx, tx, row); err != nil {
 		return err
 	}
 	q := tx.Where("extension_id = ? AND key_hmac = ? AND row_version = ?", extension, index, row.RowVersion).Delete(&pluginKVRow{})
@@ -1332,7 +1412,7 @@ func (s *GORMStore) ListPluginKV(ctx context.Context, req PluginKVListRequest) (
 	out := make([]PluginKVItem, 0, minInt(limit, len(rows)))
 	responseBytes := 0
 	for _, row := range rows {
-		item, err := s.decodePluginKVRow(ctx, row)
+		item, err := s.decodePluginKVRow(ctx, s.db.GORM(), row)
 		if err != nil {
 			return nil, err
 		}
@@ -1399,7 +1479,7 @@ func (s *GORMStore) rotateSecretRows(ctx context.Context, root EncryptionRoot) (
 			_ = tx.Rollback().Error
 		}
 	}()
-	if err = s.lockMutationPublication(ctx, tx); err != nil {
+	if err = s.lockRotationPublication(ctx, tx, root.ID); err != nil {
 		return
 	}
 	var cursorRef string
@@ -1470,7 +1550,7 @@ func (s *GORMStore) refreshReadinessRoots(ctx context.Context, currentID string)
 		return ErrParticipantFailure
 	}
 	defer tx.Rollback()
-	if err := s.lockMutationPublication(ctx, tx); err != nil {
+	if err := s.lockRotationPublication(ctx, tx, currentID); err != nil {
 		return err
 	}
 	refs, err := readinessRootReferences(ctx, tx)
@@ -1510,7 +1590,7 @@ func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRo
 			_ = base.Rollback().Error
 		}
 	}()
-	if err = s.lockMutationPublication(ctx, base); err != nil {
+	if err = s.lockRotationPublication(ctx, base, root.ID); err != nil {
 		return
 	}
 	var operationCursor string
