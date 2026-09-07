@@ -253,3 +253,14 @@ ok   github.com/PaienNate/pineutil/evsocket/v2
 go test ./dice -run 'TestOnebotRuntimeDiagnostics(RetainCompletedTransportDrops|ExposeIngressCounters)' -count=1
 ok   Scardice-core/dice
 ```
+
+## Round 9 fixes
+
+- Diagnostics now loads the cumulative transport-drop counter only after acquiring the same connection/drop locks used by completion accounting. A completed reconnect cannot interleave between the cumulative load and active-wrapper delta snapshot.
+
+### Round 9 GREEN evidence
+
+```text
+go test ./dice -run 'TestOnebotRuntimeDiagnostics(RetainCompletedTransportDrops|ExposeIngressCounters)' -count=1
+ok   Scardice-core/dice
+```

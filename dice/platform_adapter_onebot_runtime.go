@@ -445,9 +445,9 @@ func (r *onebotRuntime) Diagnostics(context.Context) adapterapi.DiagnosticReport
 	if r == nil {
 		return adapterapi.DiagnosticReport{}
 	}
-	dropped := r.transportDropped.Load()
 	r.connectionMu.Lock()
 	r.transportDropMu.Lock()
+	dropped := r.transportDropped.Load()
 	for wrapper := range r.connections {
 		if wrapper != nil {
 			current := wrapper.DroppedEventCount()
