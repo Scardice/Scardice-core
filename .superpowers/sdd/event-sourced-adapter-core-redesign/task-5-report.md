@@ -13,7 +13,7 @@
 - `eventstore/store_test.go`: migrated legacy participant fixtures to sparse artifact updates while retaining aggregate/UoW compatibility coverage without allowing arbitrary ingress state injection.
 `Store.Commit` participant application runs through the same transaction-bound invariant helpers: new inbox/effect rows ignore caller ordering, reject invalid status/risk/lease/encryption metadata, allocate typed lanes, enforce dedupe and TTL caps, and reject direct artifact terminal/oversize updates. Existing participant updates retain expected-version and active-lease CAS; terminal rows cannot be rewritten through the aggregate-only store. `GORMStore` implements the declared operation view with an explicit public-column select (private ciphertext is never loaded) and privacy purge with an operation version/CAS fence.
 - `eventstore/database.go`, `eventstore/projection.go`: SQLite artifact payload-version migration/defaults and unified readiness gating for projection reads/rebuilds; projection publication revalidates readiness after final locked updates.
-- `eventstore/task6_test.go`: A6 ingress fixtures now use the explicit payload-encryption key field required when a key source is configured; coverage includes fresh-readiness tamper rejection, unsupported readiness schema rejection, decoded secret bounds, readiness-admitted key IDs/current-root writes, old-root removal rejection under ingress locking, plugin lookup bounds, and operation/privacy repositories including empty/private and artifact-only purge fences.
+- `eventstore/task6_test.go`: A6 ingress fixtures now use the explicit payload-encryption key field required when a key source is configured; coverage includes fresh-readiness tamper rejection, unsupported readiness schema rejection, decoded secret bounds, readiness-admitted key IDs/current-root writes, old-root removal rejection under ingress locking, Task5 lock-failure rollback followed by a successful SQLite write, plugin lookup bounds, and operation/privacy repositories including empty/private and artifact-only purge fences.
 ## Algorithms and transitions
 
 Acceptance starts one database transaction, checks inbox provider dedupe `(endpoint_id, provider_event_id)`, then materializes/locks the typed `lane_heads` row and allocates `NextSequence`. Caller ordering values are ignored. The head update and message/effect insert commit together, so row failure rolls back the head. Inbox and outbox use distinct lane kinds. Dedupe compares retained keyed content digests after scrub; when no digest was supplied, it compares live ciphertext/nonce and refuses scrubbed replay rather than guessing content identity. Claims use ordered candidates with a same-lane predecessor `NOT EXISTS` query; no `SKIP LOCKED` or process-global mutex is used. Non-SQLite dialects use the existing `FOR UPDATE` helper, while SQLite relies on its immediate transaction and busy timeout.
@@ -38,7 +38,7 @@ After the narrow implementation, the same behavior tests passed. The tests asser
 
 ## Verification
 
-Exact required commands and results after eleventh-round source commit `4109cf6b` (on top of tenth-round source `a40c81d0`):
+Exact required commands and results after twelfth-round source commit `bdf14f8f` (on top of eleventh-round source `4109cf6b`):
 
 ```text
 go test -race ./eventstore -run 'TestInbox|TestOutbox|TestArtifact|TestLane|TestLease|TestEffect|TestDedup' -count=1
@@ -48,13 +48,13 @@ go test -race ./eventstore -run 'TestReadiness|TestKey|TestCrypto|TestSecret|Tes
 ok  	Scardice-core/eventstore	2.101s
 
 go test -race ./eventstore -count=1
-ok  	Scardice-core/eventstore	4.962s
+ok  	Scardice-core/eventstore	5.127s
 
 go test -count=1 ./eventstore
-ok  	Scardice-core/eventstore	0.988s
+ok  	Scardice-core/eventstore	1.025s
 ```
 
-The commands were run after the eleventh-round source commit and included operation version fencing for every purge scope, readiness-admitted key IDs before decrypt/apply, transaction-safe readiness checks in SQLite, publication-fenced current-root snapshots for PutSecret/SetPluginKV/PutArtifact and sparse secret resealing, rotation current-root ID fencing, ingress key admission/AAD validation after the publication lock, old-root removal rejection, unsupported readiness-schema rejection, strict fresh-mode metadata/position/completion validation, immutable public secret binding, and operation/privacy repository coverage. No formatter, linter, or project-wide suite was run.
+The commands were run after the twelfth-round source commit and included explicit rollback before every Task5/artifact lock-failure return, post-failure SQLite write recovery, operation version fencing for every purge scope, readiness-admitted key IDs before decrypt/apply, transaction-safe readiness checks in SQLite, publication-fenced current-root snapshots for PutSecret/SetPluginKV/PutArtifact and sparse secret resealing, rotation current-root ID fencing, ingress key admission/AAD validation after the publication lock, old-root removal rejection, unsupported readiness-schema rejection, strict fresh-mode metadata/position/completion validation, immutable public secret binding, and operation/privacy repository coverage. No formatter, linter, or project-wide suite was run.
 
 ## Commits
 
@@ -83,5 +83,6 @@ The commands were run after the eleventh-round source commit and included operat
 - Public `PutSecret` binding invariant and final race/normal verification: `8f3e169e`.
 - Tenth-round purge/key-admission/current-root fencing and regression coverage: `a40c81d0`.
 - Eleventh-round ingress race closure and old-root removal regression: `4109cf6b`.
+- Twelfth-round Task5/artifact lock-failure rollback closure and SQLite recovery regression: `bdf14f8f`.
 
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
