@@ -38,7 +38,7 @@ After the narrow implementation, the same behavior tests passed. The tests asser
 
 ## Verification
 
-Exact required commands and results after fourteenth-round source commit `e237254f` (on top of thirteenth-round source `c33ab4bd`):
+Exact required commands and results after fifteenth-round source commit `6ad47f57` (on top of fourteenth-round source `e237254f`):
 
 ```text
 go test -race ./eventstore -run 'TestInbox|TestOutbox|TestArtifact|TestLane|TestLease|TestEffect|TestDedup' -count=1
@@ -48,13 +48,13 @@ go test -race ./eventstore -run 'TestReadiness|TestKey|TestCrypto|TestSecret|Tes
 ok  	Scardice-core/eventstore	2.101s
 
 go test -race ./eventstore -count=1
-ok  	Scardice-core/eventstore	5.404s
+ok  	Scardice-core/eventstore	5.361s
 
 go test -count=1 ./eventstore
-ok  	Scardice-core/eventstore	1.161s
+ok  	Scardice-core/eventstore	1.134s
 ```
 
-The commands were run after the fourteenth-round source commit and included explicit rollback before every Task5/artifact lock-failure return, post-failure SQLite write recovery, same-transaction publication/readiness fencing for secret and plugin reads, read-fenced root-removal concurrency coverage, A6 UoW expiry compensation before encrypted payload authentication, malformed expired ingress scrub-before-auth ordering, stable public not-found versus participant query-error mappings for secret and plugin reads, operation version fencing for every purge scope, readiness-admitted key IDs before decrypt/apply, publication-fenced current-root snapshots for PutSecret/SetPluginKV/PutArtifact and sparse secret resealing, rotation current-root ID fencing, ingress key admission/AAD validation after the publication lock, old-root removal rejection, unsupported readiness-schema rejection, strict fresh-mode metadata/position/completion validation, immutable public secret binding, and operation/privacy repository coverage. No formatter, linter, or project-wide suite was run.
+The commands were run after the fifteenth-round source commit and included explicit rollback before every Task5/artifact lock-failure return, post-failure SQLite write recovery, same-transaction publication/readiness fencing for secret and plugin reads, public operation not-found versus participant query-error fencing, a mixed-UoW expiry pre-scan before operation/inbox/outbox authentication, read-fenced root-removal concurrency coverage, A6 UoW expiry compensation before encrypted payload authentication, malformed expired ingress scrub-before-auth ordering, stable public not-found versus participant query-error mappings for secret and plugin reads, operation version fencing for every purge scope, readiness-admitted key IDs before decrypt/apply, publication-fenced current-root snapshots for PutSecret/SetPluginKV/PutArtifact and sparse secret resealing, rotation current-root ID fencing, ingress key admission/AAD validation after the publication lock, old-root removal rejection, unsupported readiness-schema rejection, strict fresh-mode metadata/position/completion validation, immutable public secret binding, and operation/privacy repository coverage. No formatter, linter, or project-wide suite was run.
 
 ## Commits
 
@@ -86,5 +86,6 @@ The commands were run after the fourteenth-round source commit and included expl
 - Twelfth-round Task5/artifact lock-failure rollback closure and SQLite recovery regression: `bdf14f8f`.
 - Thirteenth-round read-fence, ingress scrub-before-auth, and A6 UoW expiry-compensation hardening: `c33ab4bd`.
 - Fourteenth-round public read query-error fencing: `e237254f`.
+- Fifteenth-round public operation query-error fencing and mixed-UoW expiry pre-scan: `6ad47f57`.
 
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
