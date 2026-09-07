@@ -283,4 +283,21 @@ ok  	Scardice-core/eventstore	6.347s
 ```
 
 Thirty-first-round implementation and regression coverage: `d53a0b97`.
+
+Thirty-second-round source commit `c13650c3` moves the ClaimOutbox lease-epoch storage-width fence ahead of task5 ID generation, eliminating custom-ID side effects and generic ID errors when the persisted epoch is already exhausted.
+
+Additional verification after `c13650c3`:
+
+```text
+go test ./eventstore -run 'TestTask5PersistedVersionWidthOverflowFailsClosed' -count=1
+ok  	Scardice-core/eventstore	0.014s
+
+go test ./eventstore -count=1
+ok  	Scardice-core/eventstore	1.436s
+
+go test -race ./eventstore -count=1
+ok  	Scardice-core/eventstore	6.478s
+```
+
+Thirty-second-round implementation and regression coverage: `c13650c3`.
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
