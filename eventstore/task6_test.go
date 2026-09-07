@@ -1427,6 +1427,27 @@ func TestA6UOWPluginVersionOverflowFailsBeforeAuthentication(t *testing.T) {
 	}
 }
 
+func TestSetPluginKVVersionOverflowFailsBeforeSeal(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	extensionID := "public-overflow-extension"
+	key := "public-overflow-key"
+	keyHMAC := itemKeyHMAC(t, source, extensionID, key)
+	now := time.Now().UTC()
+	row := pluginKVRow{
+		ExtensionID: extensionID, KeyHMAC: keyHMAC, EncryptedKey: []byte{1}, KeyNonce: make([]byte, 12),
+		EncryptedValue: []byte{1}, ValueNonce: make([]byte, 12), ValueSize: 1, RowVersion: uint64(^uint64(0) >> 1),
+		EncryptionKeyID: source.CurrentID, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := db.GORM().Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	_, err := store.SetPluginKV(context.Background(), PluginKVPutRequest{ExtensionID: extensionID, Key: key, Value: []byte("value"), ExpectedVersion: row.RowVersion})
+	if !errors.Is(err, ErrVersionExhausted) {
+		t.Fatalf("public plugin version overflow err=%v", err)
+	}
+}
+
 func itemKeyHMAC(t *testing.T, source KeySource, extension, key string) []byte {
 	t.Helper()
 	index, err := a6HMAC(context.Background(), source, "plugin-key-index/v1", extension, key)

@@ -1416,6 +1416,9 @@ func (s *GORMStore) SetPluginKV(ctx context.Context, req PluginKVPutRequest) (Pl
 	current := uint64(0)
 	if q.Error == nil {
 		current = existing.RowVersion
+		if current >= uint64(^uint64(0)>>1) {
+			return PluginKVItem{}, ErrVersionExhausted
+		}
 	} else if !errors.Is(q.Error, gorm.ErrRecordNotFound) {
 		return PluginKVItem{}, ErrParticipantFailure
 	}
