@@ -466,7 +466,7 @@ func (s *GORMStore) GetOperation(ctx context.Context, operationID string) (Opera
 		return OperationView{}, ErrNotFound
 	}
 	var row operationRow
-	if err := s.db.GORM().WithContext(ctx).Where("operation_id = ?", operationID).First(&row).Error; err != nil {
+	if err := s.db.GORM().WithContext(ctx).Select("operation_id", "version", "kind", "status", "result_code", "error_code", "artifact_id", "created_at", "updated_at", "expires_at").Where("operation_id = ?", operationID).First(&row).Error; err != nil {
 		return OperationView{}, ErrNotFound
 	}
 	return OperationView{
@@ -514,8 +514,16 @@ func (s *GORMStore) Purge(ctx context.Context, req PrivacyPurgeRequest) (Privacy
 	var deleted int64
 	if scope == "private" || scope == "all" {
 		if len(row.PrivateContext) > 0 || len(row.PrivateNonce) > 0 || row.PrivateKeyID != "" {
-			if err := tx.Model(&operationRow{}).Where("operation_id = ? AND version = ?", row.OperationID, row.Version).Updates(map[string]any{"private_context": nil, "private_nonce": nil, "private_key_id": "", "updated_at": s.task5Now()}).Error; err != nil {
+			nextVersionValue, versionErr := nextVersion(row.Version)
+			if versionErr != nil {
+				return PrivacyPurgeResult{}, versionErr
+			}
+			q := tx.Model(&operationRow{}).Where("operation_id = ? AND version = ?", row.OperationID, row.Version).Updates(map[string]any{"version": nextVersionValue, "private_context": nil, "private_nonce": nil, "private_key_id": "", "updated_at": s.task5Now()})
+			if q.Error != nil {
 				return PrivacyPurgeResult{}, ErrParticipantFailure
+			}
+			if q.RowsAffected != 1 {
+				return PrivacyPurgeResult{}, ErrParticipantConflict
 			}
 			deleted++
 		}

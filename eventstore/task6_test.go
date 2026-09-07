@@ -199,6 +199,9 @@ func TestOperationViewAndPrivacyPurge(t *testing.T) {
 		t.Fatalf("private context survived purge: %#v", operation)
 	}
 	var artifactCount int64
+	if operation.Version != 2 {
+		t.Fatalf("purge did not fence operation version: %d", operation.Version)
+	}
 	if err := db.GORM().Model(&operationArtifactRow{}).Where("operation_id = ?", "purge-operation").Count(&artifactCount).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -229,6 +232,9 @@ func TestReadinessRequiresCurrentEncryptionRoot(t *testing.T) {
 	store, db, source := task6Store(t)
 	defer db.Close()
 	ctx := context.Background()
+	if err := store.SetReadiness(ctx, Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: source.IndexID, EncryptionRootIDs: []string{"root-v1"}, TerminalGlobalPosition: 1}); !errors.Is(err, ErrReadinessInvalid) {
+		t.Fatalf("fresh terminal position err=%v", err)
+	}
 	err := store.SetReadiness(ctx, Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: source.IndexID})
 	if !errors.Is(err, ErrReadinessQuarantined) {
 		t.Fatalf("empty encryption roots err=%v", err)

@@ -2015,6 +2015,9 @@ func (s *GORMStore) ConsumeArtifact(ctx context.Context, req ArtifactConsumeRequ
 		}
 		return ArtifactResult{}, ErrArtifactGone
 	}
+	if row.Size < 0 || row.Size > MaxArtifactBytes {
+		return ArtifactResult{}, &OversizeError{Bound: "artifact bytes", Limit: MaxArtifactBytes, Actual: int(row.Size)}
+	}
 	if err = s.requireA6BoundCodec(); err != nil {
 		return ArtifactResult{}, err
 	}

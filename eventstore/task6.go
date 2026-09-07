@@ -330,6 +330,9 @@ func validateReadinessValue(r Readiness) error {
 	if r.TerminalGlobalPosition == maxUint64 || r.TerminalProjectionPosition == maxUint64 {
 		return ErrReadinessInvalid
 	}
+	if r.Mode == "fresh" && (r.TerminalGlobalPosition != 0 || r.TerminalProjectionPosition != 0 || !r.CompletedAt.IsZero() || len(r.SourceManifestDigest) != 0 || len(r.TargetManifestDigest) != 0) {
+		return ErrReadinessInvalid
+	}
 	if r.Mode == "import" && (len(r.SourceManifestDigest) != 32 || len(r.TargetManifestDigest) != 32 || r.CompletedAt.IsZero()) {
 		return ErrReadinessInvalid
 	}
@@ -612,6 +615,12 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		if owner == "" {
 			return ErrInvalidMetadata
 		}
+		if update.Size < 0 || update.Size > MaxArtifactBytes {
+			return &OversizeError{Bound: "artifact bytes", Limit: MaxArtifactBytes, Actual: int(update.Size)}
+		}
+		if err := validateTask5ArtifactOpaquePayload(update.Ciphertext, update.Nonce, update.EncryptionKeyID); err != nil {
+			return err
+		}
 		version := uint64(1)
 		var existingArtifact operationArtifactRow
 		if err := db.WithContext(ctx).Select("payload_version").Where("artifact_id = ?", update.ArtifactID).First(&existingArtifact).Error; err == nil {
@@ -704,6 +713,9 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		}
 		if update.ExtensionID == "" || len(update.ExtensionID) > MaxPluginExtensionBytes || len(update.KeyHMAC) != sha256.Size || len(update.KeyCiphertext) == 0 || len(update.KeyNonce) == 0 || len(update.ValueCiphertext) == 0 || len(update.ValueNonce) == 0 || update.EncryptionKeyID == "" {
 			return ErrInvalidMetadata
+		}
+		if update.ValueSize < 0 || update.ValueSize > MaxPluginValueBytes {
+			return &OversizeError{Bound: "plugin value bytes", Limit: MaxPluginValueBytes, Actual: int(update.ValueSize)}
 		}
 		if len(update.KeyCiphertext) > MaxPluginKeyBytes+16 {
 			return &OversizeError{Bound: "encrypted plugin key bytes", Limit: MaxPluginKeyBytes + 16, Actual: len(update.KeyCiphertext)}
@@ -1029,6 +1041,9 @@ func (s *GORMStore) pluginValueUsageOn(ctx context.Context, db *gorm.DB, extensi
 		if len(exclude) > 0 && hmac.Equal(row.KeyHMAC, exclude) {
 			continue
 		}
+		if row.ValueSize < 0 || row.ValueSize > MaxPluginValueBytes {
+			return 0, &OversizeError{Bound: "plugin value bytes", Limit: MaxPluginValueBytes, Actual: int(row.ValueSize)}
+		}
 		if len(row.EncryptedKey) > MaxPluginKeyBytes+16 {
 			return 0, &OversizeError{Bound: "encrypted plugin key bytes", Limit: MaxPluginKeyBytes + 16, Actual: len(row.EncryptedKey)}
 		}
@@ -1177,6 +1192,9 @@ func (s *GORMStore) SetPluginKV(ctx context.Context, req PluginKVPutRequest) (Pl
 }
 
 func (s *GORMStore) decodePluginKVRow(ctx context.Context, row pluginKVRow) (PluginKVItem, error) {
+	if row.ValueSize < 0 || row.ValueSize > MaxPluginValueBytes {
+		return PluginKVItem{}, &OversizeError{Bound: "plugin value bytes", Limit: MaxPluginValueBytes, Actual: int(row.ValueSize)}
+	}
 	if len(row.EncryptedKey) > MaxPluginKeyBytes+16 {
 		return PluginKVItem{}, &OversizeError{Bound: "encrypted plugin key bytes", Limit: MaxPluginKeyBytes + 16, Actual: len(row.EncryptedKey)}
 	}
@@ -1559,6 +1577,10 @@ func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRo
 			if row.EncryptionKeyID == root.ID {
 				continue
 			}
+			if row.Size < 0 || row.Size > MaxArtifactBytes {
+				err = &OversizeError{Bound: "artifact bytes", Limit: MaxArtifactBytes, Actual: int(row.Size)}
+				return
+			}
 			if len(row.Ciphertext) > MaxArtifactBytes+16 {
 				err = &OversizeError{Bound: "encrypted artifact bytes", Limit: MaxArtifactBytes + 16, Actual: len(row.Ciphertext)}
 				return
@@ -1724,6 +1746,10 @@ func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRo
 		for _, row := range rows {
 			if row.EncryptionKeyID == root.ID {
 				continue
+			}
+			if row.ValueSize < 0 || row.ValueSize > MaxPluginValueBytes {
+				err = &OversizeError{Bound: "plugin value bytes", Limit: MaxPluginValueBytes, Actual: int(row.ValueSize)}
+				return
 			}
 			if len(row.EncryptedKey) > MaxPluginKeyBytes+16 {
 				err = &OversizeError{Bound: "encrypted plugin key bytes", Limit: MaxPluginKeyBytes + 16, Actual: len(row.EncryptedKey)}
