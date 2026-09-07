@@ -209,6 +209,37 @@ func TestA6WritesUseReadinessAdmittedCurrentRoot(t *testing.T) {
 		t.Fatalf("admitted current root secret err=%v", err)
 	}
 }
+func TestAcceptRejectsKeyAfterReadinessRootRemoval(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	source.Roots["root-v2"] = []byte("12345678901234567890123456789012")
+	if err := store.SetReadiness(ctx, Readiness{
+		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: source.IndexID,
+		EncryptionRootIDs: []string{"root-v1", "root-v2"}, SourceManifestDigest: make([]byte, 32),
+		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	source.CurrentID = "root-v2"
+	if err := store.SetReadiness(ctx, Readiness{
+		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: source.IndexID,
+		EncryptionRootIDs: []string{"root-v2"}, SourceManifestDigest: make([]byte, 32),
+		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ciphertext, nonce, keyID, err := a6SealWithRoot(EncryptionRoot{ID: "root-v1", Material: []byte("abcdefghijklmnopqrstuvwxyz123456")}, "inbox/v1", "old-root-inbox", "endpoint", 1, []byte("payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcceptInbox(ctx, InboxUpdate{
+		InboxID: "old-root-inbox", EndpointID: "endpoint", ProviderEventKey: "provider", LaneHMAC: []byte("lane"),
+		PayloadCiphertext: ciphertext, PayloadNonce: nonce, PayloadEncryptionKeyID: keyID,
+	}); !errors.Is(err, ErrReadinessQuarantined) {
+		t.Fatalf("removed-root inbox err=%v", err)
+	}
+}
 func TestOperationViewAndPrivacyPurge(t *testing.T) {
 	store, db, _ := task6Store(t)
 	defer db.Close()

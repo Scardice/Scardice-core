@@ -401,17 +401,6 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 	if err := validateTask5OpaquePayload(update.PayloadCiphertext, update.PayloadNonce, payloadKeyID); err != nil {
 		return CommitResult{}, err
 	}
-	if s.keySource != nil {
-		if err := s.requireA6BoundCodec(); err != nil {
-			return CommitResult{}, err
-		}
-		if err := s.validateA6KeyID(ctx, s.db.GORM(), payloadKeyID); err != nil {
-			return CommitResult{}, err
-		}
-		if _, decryptErr := openBoundPayload(ctx, s.codec, "inbox/v1", update.InboxID, update.EndpointID, 1, update.PayloadCiphertext, update.PayloadNonce, payloadKeyID); decryptErr != nil {
-			return CommitResult{}, ErrAuthenticationFailed
-		}
-	}
 	if update.LeaseOwner != "" || update.LeaseEpoch != 0 || update.AttemptID != "" || !update.LeaseExpiresAt.IsZero() ||
 		!update.CallbackStartedAt.IsZero() || !update.CompletedAt.IsZero() || update.PrincipalID != "" || update.Reason != "" ||
 		update.Resolution != "" || !update.ResolutionAt.IsZero() {
@@ -440,6 +429,17 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 			task5Rollback(tx)
 		}
 	}()
+	if s.keySource != nil {
+		if err := s.requireA6BoundCodec(); err != nil {
+			return CommitResult{}, err
+		}
+		if err := s.validateA6KeyID(ctx, tx, payloadKeyID); err != nil {
+			return CommitResult{}, err
+		}
+		if _, decryptErr := openBoundPayload(ctx, s.codec, "inbox/v1", update.InboxID, update.EndpointID, 1, update.PayloadCiphertext, update.PayloadNonce, payloadKeyID); decryptErr != nil {
+			return CommitResult{}, ErrAuthenticationFailed
+		}
+	}
 	var existing inboxMessageRow
 	q := locked(tx).Where("endpoint_id = ? AND provider_event_id = ?", update.EndpointID, update.ProviderEventKey).First(&existing)
 	if q.Error == nil {
@@ -871,17 +871,6 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 	if err := validateTask5OpaquePayload(effect.PayloadCiphertext, effect.PayloadNonce, payloadKeyID); err != nil {
 		return CommitResult{}, err
 	}
-	if s.keySource != nil {
-		if err := s.requireA6BoundCodec(); err != nil {
-			return CommitResult{}, err
-		}
-		if err := s.validateA6KeyID(ctx, s.db.GORM(), payloadKeyID); err != nil {
-			return CommitResult{}, err
-		}
-		if _, decryptErr := openBoundPayload(ctx, s.codec, "outbox/v1", effect.EffectID, effect.EndpointID, 1, effect.PayloadCiphertext, effect.PayloadNonce, payloadKeyID); decryptErr != nil {
-			return CommitResult{}, ErrAuthenticationFailed
-		}
-	}
 	if effect.LeaseOwner != "" || effect.LeaseEpoch != 0 || effect.AttemptID != "" || !effect.LeaseExpiresAt.IsZero() ||
 		!effect.DispatchedAt.IsZero() || !effect.CompletedAt.IsZero() || effect.ProviderMessageID != "" ||
 		effect.ResultCode != "" || effect.ErrorCode != "" || effect.RetryCount != 0 || effect.PrincipalID != "" ||
@@ -914,6 +903,17 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 			task5Rollback(tx)
 		}
 	}()
+	if s.keySource != nil {
+		if err := s.requireA6BoundCodec(); err != nil {
+			return CommitResult{}, err
+		}
+		if err := s.validateA6KeyID(ctx, tx, payloadKeyID); err != nil {
+			return CommitResult{}, err
+		}
+		if _, decryptErr := openBoundPayload(ctx, s.codec, "outbox/v1", effect.EffectID, effect.EndpointID, 1, effect.PayloadCiphertext, effect.PayloadNonce, payloadKeyID); decryptErr != nil {
+			return CommitResult{}, ErrAuthenticationFailed
+		}
+	}
 	var existing outboxEffectRow
 	lookup := locked(tx).Where("effect_id = ?", effect.EffectID).First(&existing)
 	if lookup.Error == nil {
