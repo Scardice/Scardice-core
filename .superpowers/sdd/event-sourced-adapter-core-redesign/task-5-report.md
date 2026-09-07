@@ -249,4 +249,21 @@ ok  	Scardice-core/eventstore	6.975s
 ```
 
 Twenty-ninth-round implementation and regression coverage: `db734667`.
+
+Thirtieth-round source commit `7107e4c6` makes the shared `nextVersion` allocator fail closed at the maximum signed persisted integer (`maxPersistedVersion`), preserving `nextVersion` overflow semantics while preventing SQLite/PostgreSQL signed-integer wrap across aggregate, participant, Task5, A6, purge, lease, and artifact version paths. Participant supplied-version validation uses the same storage-width fence. `TestTask5PersistedVersionWidthOverflowFailsClosed` adds a persisted outbox boundary regression.
+
+Additional verification after `7107e4c6`:
+
+```text
+go test ./eventstore -run 'TestTask5PersistedVersionWidthOverflowFailsClosed' -count=1
+ok  	Scardice-core/eventstore	0.012s
+
+go test ./eventstore -count=1
+ok  	Scardice-core/eventstore	1.407s
+
+go test -race ./eventstore -count=1
+ok  	Scardice-core/eventstore	6.182s
+```
+
+Thirtieth-round implementation and regression coverage: `7107e4c6`.
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
