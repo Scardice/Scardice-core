@@ -53,6 +53,9 @@ func (f *UnixFileKeySource) IndexRootID(context.Context) (string, error) {
 	return filepath.Base(f.IndexPath), nil
 }
 func (f *UnixFileKeySource) IndexRootMaterial(context.Context) ([]byte, error) {
+	if f == nil {
+		return nil, ErrKeySourceUnavailable
+	}
 	return readKeyFile(f.IndexPath)
 }
 func (f *UnixFileKeySource) CurrentEncryptionRoot(ctx context.Context) (EncryptionRoot, error) {
@@ -83,6 +86,9 @@ func (f *UnixFileKeySource) EncryptionRoot(_ context.Context, id string) ([]byte
 	return readKeyFile(filepath.Join(f.RootsDir, id+".key"))
 }
 func (f *UnixFileKeySource) EncryptionRoots(ctx context.Context) ([]EncryptionRoot, error) {
+	if f == nil {
+		return nil, ErrKeySourceUnavailable
+	}
 	if runtime.GOOS == "windows" {
 		return nil, ErrKeySourceUnavailable
 	}
@@ -166,7 +172,8 @@ func readSecureFile(path string, maxBytes int) ([]byte, error) {
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 {
 		return nil, ErrKeyUnavailable
 	}
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok && int(stat.Uid) != os.Getuid() {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(stat.Uid) != os.Getuid() {
 		return nil, ErrKeyUnavailable
 	}
 	raw, err := io.ReadAll(io.LimitReader(file, int64(maxBytes)+1))
