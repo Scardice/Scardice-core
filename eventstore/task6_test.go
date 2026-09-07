@@ -1249,6 +1249,39 @@ func TestA6UOWArtifactDerivesOwnerFromSameUOWOperation(t *testing.T) {
 	}
 }
 
+func TestA6UOWExpiredArtifactPrecedesPayloadAuthentication(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	expiredAt := time.Now().UTC().Add(-time.Minute)
+	row := operationArtifactRow{
+		ArtifactID: "uow-expired-artifact", Version: 1, PayloadVersion: 1, OperationID: "uow-operation",
+		OwnerPrincipalID: "owner", MediaType: "application/octet-stream", Size: 1, Status: "available",
+		Ciphertext: []byte{1}, Nonce: make([]byte, 12), EncryptionKeyID: source.CurrentID, ExpiresAt: expiredAt,
+	}
+	if err := db.GORM().Create(&operationRow{
+		OperationID: row.OperationID, Version: 1, Status: "pending", Kind: "test",
+		PrincipalID: row.OwnerPrincipalID, IdempotencyScope: "scope", IdempotencyKey: row.OperationID,
+		PrivatePayloadVersion: 1, CreatedAt: expiredAt, UpdatedAt: expiredAt,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GORM().Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(context.Background(), UnitOfWork{ArtifactUpdates: []ArtifactUpdate{{
+		ArtifactID: row.ArtifactID, OperationID: row.OperationID, OwnerPrincipalID: row.OwnerPrincipalID,
+		Size: 1, Ciphertext: []byte{2}, Nonce: make([]byte, 12), EncryptionKeyID: source.CurrentID,
+	}}}); !errors.Is(err, ErrArtifactGone) {
+		t.Fatalf("expired artifact auth precedence err=%v", err)
+	}
+	if err := db.GORM().Where("artifact_id = ?", row.ArtifactID).First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Version != 2 || row.Status != "expired" || len(row.Ciphertext) != 0 || len(row.Nonce) != 0 {
+		t.Fatalf("expired artifact was not scrubbed: %#v", row)
+	}
+}
+
 func itemKeyHMAC(t *testing.T, source KeySource, extension, key string) []byte {
 	t.Helper()
 	index, err := a6HMAC(context.Background(), source, "plugin-key-index/v1", extension, key)

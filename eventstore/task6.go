@@ -586,6 +586,20 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 			return ErrParticipantFailure
 		}
 	}
+	for _, update := range work.ArtifactUpdates {
+		if update.ArtifactID == "" {
+			continue
+		}
+		var row operationArtifactRow
+		query := locked(db).Where("artifact_id = ?", update.ArtifactID).First(&row)
+		if query.Error == nil {
+			if (row.Status == "available" || row.Status == "ready") && !row.ExpiresAt.After(now) && (len(row.Ciphertext) > 0 || len(row.Nonce) > 0) {
+				return &task5ExpiredArtifactError{id: row.ArtifactID, now: now}
+			}
+		} else if !errors.Is(query.Error, gorm.ErrRecordNotFound) {
+			return ErrParticipantFailure
+		}
+	}
 	validatePrivate := func(operationID, principal string, version uint64, ciphertext, nonce []byte, keyID string) error {
 		if len(ciphertext) > MaxSecretBytes+16 {
 			return &OversizeError{Bound: "encrypted operation private bytes", Limit: MaxSecretBytes + 16, Actual: len(ciphertext)}
