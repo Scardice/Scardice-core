@@ -235,8 +235,22 @@ func TestReadinessRequiresCurrentEncryptionRoot(t *testing.T) {
 	store, db, source := task6Store(t)
 	defer db.Close()
 	ctx := context.Background()
-	if err := store.SetReadiness(ctx, Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: source.IndexID, EncryptionRootIDs: []string{"root-v1"}, TerminalGlobalPosition: 1}); !errors.Is(err, ErrReadinessInvalid) {
-		t.Fatalf("fresh terminal position err=%v", err)
+	cases := []struct {
+		name string
+		mutate func(*Readiness)
+	}{
+		{name: "global position", mutate: func(r *Readiness) { r.TerminalGlobalPosition = 1 }},
+		{name: "projection position", mutate: func(r *Readiness) { r.TerminalProjectionPosition = 1 }},
+		{name: "source manifest", mutate: func(r *Readiness) { r.SourceManifestDigest = make([]byte, 32) }},
+		{name: "target manifest", mutate: func(r *Readiness) { r.TargetManifestDigest = make([]byte, 32) }},
+		{name: "completion", mutate: func(r *Readiness) { r.CompletedAt = time.Unix(1, 0).UTC() }},
+	}
+	for _, tc := range cases {
+		readiness := Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: source.IndexID, EncryptionRootIDs: []string{"root-v1"}}
+		tc.mutate(&readiness)
+		if err := store.SetReadiness(ctx, readiness); !errors.Is(err, ErrReadinessInvalid) {
+			t.Fatalf("fresh %s err=%v", tc.name, err)
+		}
 	}
 	err := store.SetReadiness(ctx, Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: source.IndexID})
 	if !errors.Is(err, ErrReadinessQuarantined) {
