@@ -411,6 +411,17 @@ func TestOperationViewAndPrivacyPurge(t *testing.T) {
 	}
 }
 
+func TestGetOperationQueryFailureIsNotNotFound(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	if err := db.GORM().Migrator().DropTable(&operationRow{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetOperation(context.Background(), "query-failure"); !errors.Is(err, ErrParticipantFailure) {
+		t.Fatalf("operation query failure err=%v", err)
+	}
+}
+
 
 
 func TestReadinessPinAndRootAvailability(t *testing.T) {
