@@ -127,4 +127,24 @@ ok  	Scardice-core/eventstore	5.465s
 ```
 
 Twenty-second-round implementation and regression coverage: `db51040e`.
+
+Twenty-third-round source commit `3a84eaf8` pins the live fresh-readiness baseline (mode, schema, identity, index root/fingerprint, and admitted encryption roots) so direct valid-looking fresh-mode metadata tampering still quarantines after initialization; import transitions clear that live marker. It also allows operator `ResolveOutbox` success/failure decisions for already-ambiguous non-idempotent effects after expiry scrubbing, while unresolved non-ambiguous expired effects retain the expiry rejection. The regression now expires the dispatched non-idempotent effect before claim and resolves it afterward.
+
+Additional verification after `3a84eaf8`:
+
+```text
+go test ./eventstore -run 'TestOutboxNonIdempotentDispatchExpiryBecomesAmbiguous' -count=1
+ok  	Scardice-core/eventstore	0.012s
+
+go test ./eventstore -run 'TestReadinessRejectsTamperedValidFreshMode|TestA6FreshInitializationAllowsSubsequentCommit|TestReadinessRejectsNonEmptyFresh' -count=1
+ok  	Scardice-core/eventstore	0.018s
+
+go test ./eventstore -count=1
+ok  	Scardice-core/eventstore	1.302s
+
+go test -race ./eventstore -count=1
+ok  	Scardice-core/eventstore	5.590s
+```
+
+Twenty-third-round implementation and regression coverage: `3a84eaf8`.
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
