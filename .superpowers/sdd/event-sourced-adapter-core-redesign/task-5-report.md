@@ -164,4 +164,21 @@ ok  	Scardice-core/eventstore	5.538s
 ```
 
 Twenty-fourth-round implementation and regression coverage: `a158afa7`.
+
+Twenty-fifth-round source commit `a8ec2402` advances import readiness terminal positions in the same Commit transaction as event sequence and projection-control updates. Eventful commits no longer self-quarantine on the next readiness validation; the readiness row is rolled back together with event/projection writes on failure. Regression coverage is `TestImportReadinessAdvancesWithEventCommit`.
+
+Additional verification after `a8ec2402`:
+
+```text
+go test ./eventstore -run 'TestImportReadinessAdvancesWithEventCommit' -count=1
+ok  	Scardice-core/eventstore	1.20s
+
+go test ./eventstore -count=1
+ok  	Scardice-core/eventstore	1.210s
+
+go test -race ./eventstore -count=1
+ok  	Scardice-core/eventstore	5.501s
+```
+
+Twenty-fifth-round implementation and regression coverage: `a8ec2402`.
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
