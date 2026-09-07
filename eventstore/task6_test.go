@@ -34,6 +34,26 @@ func (m *MemoryKeySource) CurrentEncryptionRoot(ctx context.Context) (Encryption
 func (m *MemoryKeySource) EncryptionRoot(_ context.Context, id string) ([]byte, error) { if m == nil { return nil, ErrKeySourceUnavailable }; material, ok := m.Roots[id]; if !ok || len(material) != 32 { return nil, ErrKeyUnavailable }; return append([]byte(nil), material...), nil }
 func (m *MemoryKeySource) EncryptionRoots(ctx context.Context) ([]EncryptionRoot, error) { if m == nil { return nil, ErrKeySourceUnavailable }; ids := make([]string, 0, len(m.Roots)); for id := range m.Roots { ids = append(ids, id) }; sort.Strings(ids); out := make([]EncryptionRoot, 0, len(ids)); for _, id := range ids { material, err := m.EncryptionRoot(ctx, id); if err != nil { return nil, err }; out = append(out, EncryptionRoot{ID: id, Material: material}) }; return out, nil }
 
+type gatedRootKeySource struct {
+	*MemoryKeySource
+	mu      sync.Mutex
+	calls   int
+	blocked chan struct{}
+	release chan struct{}
+}
+
+func (s *gatedRootKeySource) EncryptionRoot(ctx context.Context, id string) ([]byte, error) {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+	if call == 2 {
+		close(s.blocked)
+		<-s.release
+	}
+	return s.MemoryKeySource.EncryptionRoot(ctx, id)
+}
+
 func TestCryptoKnownVector(t *testing.T) {
 	source := task6Source()
 	got, err := a6HMAC(context.Background(), source, "plugin-key-index/v1", "ext", "key")
@@ -210,6 +230,7 @@ func TestA6WritesUseReadinessAdmittedCurrentRoot(t *testing.T) {
 	}
 }
 func TestAcceptRejectsKeyAfterReadinessRootRemoval(t *testing.T) {
+
 	store, db, source := task6Store(t)
 	defer db.Close()
 	ctx := context.Background()
@@ -238,6 +259,77 @@ func TestAcceptRejectsKeyAfterReadinessRootRemoval(t *testing.T) {
 		PayloadCiphertext: ciphertext, PayloadNonce: nonce, PayloadEncryptionKeyID: keyID,
 	}); !errors.Is(err, ErrReadinessQuarantined) {
 		t.Fatalf("removed-root inbox err=%v", err)
+	}
+}
+func TestA6ReadFenceBlocksConcurrentRootRemoval(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := store.PutSecret(ctx, SecretPutRequest{
+		SecretRef: "read-fence-secret", EndpointID: "endpoint", AdapterID: "adapter",
+		Plaintext: []byte("secret"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gated := &gatedRootKeySource{
+		MemoryKeySource: source,
+		blocked:         make(chan struct{}),
+		release:         make(chan struct{}),
+	}
+	store.keySource = gated
+	resolveDone := make(chan struct {
+		res SecretResolution
+		err error
+	}, 1)
+	go func() {
+		res, err := store.ResolveSecret(ctx, "read-fence-secret", 1)
+		resolveDone <- struct {
+			res SecretResolution
+			err error
+		}{res: res, err: err}
+	}()
+	select {
+	case <-gated.blocked:
+	case <-time.After(time.Second):
+		t.Fatal("ResolveSecret did not reach gated decrypt")
+	}
+	source.Roots["root-v2"] = []byte("12345678901234567890123456789012")
+	source.CurrentID = "root-v2"
+	removal := Readiness{
+		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: source.IndexID,
+		EncryptionRootIDs: []string{"root-v2"}, SourceManifestDigest: make([]byte, 32),
+		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+	}
+	removalDone := make(chan error, 1)
+	go func() { removalDone <- store.SetReadiness(ctx, removal) }()
+	select {
+	case err := <-removalDone:
+		if err == nil {
+			t.Fatal("root removal committed while secret read held publication fence")
+		}
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(gated.release)
+	select {
+	case result := <-resolveDone:
+		if result.err != nil || string(result.res.Plaintext) != "secret" {
+			t.Fatalf("fenced secret read=%q err=%v", result.res.Plaintext, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ResolveSecret did not finish after releasing gate")
+	}
+	var removalErr error
+	select {
+	case removalErr = <-removalDone:
+	case <-time.After(time.Second):
+		t.Fatal("root removal did not finish after releasing read fence")
+	}
+	if removalErr == nil {
+		t.Fatal("root removal unexpectedly succeeded")
+	}
+	source.CurrentID = "root-v1"
+	if _, err := store.ResolveSecret(ctx, "read-fence-secret", 1); err != nil {
+		t.Fatalf("post-fence secret read err=%v", err)
 	}
 }
 func TestOperationViewAndPrivacyPurge(t *testing.T) {
@@ -827,6 +919,58 @@ func TestA6ClaimsCommitExpiredScrubBeforeAuthFailure(t *testing.T) {
 	}
 }
 
+func TestA6AcceptExpiredRowsPrecedePayloadAuthentication(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	expiredAt := time.Now().UTC().Add(-time.Minute)
+	inbox := inboxMessageRow{
+		InboxID: "expired-accept-inbox", EndpointID: "endpoint", ProviderEventKey: "expired-provider",
+		LaneHMAC: []byte("expired-lane"), OrderingSequence: 1, Status: InboxStatusPending, Version: 1,
+		PayloadVersion: 1, PayloadCiphertext: []byte{0x01}, PayloadNonce: make([]byte, 12),
+		EncryptionKeyID: source.CurrentID, PayloadExpiresAt: &expiredAt,
+	}
+	if err := db.GORM().Create(&inbox).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcceptInbox(ctx, InboxUpdate{
+		InboxID: inbox.InboxID, EndpointID: inbox.EndpointID, ProviderEventKey: inbox.ProviderEventKey,
+		LaneHMAC: inbox.LaneHMAC, PayloadCiphertext: []byte{0x02}, PayloadNonce: make([]byte, 12),
+		PayloadEncryptionKeyID: source.CurrentID,
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("expired inbox auth/dedupe precedence err=%v", err)
+	}
+	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&inbox).Error; err != nil {
+		t.Fatal(err)
+	}
+	if inbox.Version != 2 || len(inbox.PayloadCiphertext) != 0 || len(inbox.PayloadNonce) != 0 {
+		t.Fatalf("expired inbox was not scrubbed before auth: %#v", inbox)
+	}
+
+	effect := outboxEffectRow{
+		EffectID: "expired-accept-effect", EndpointID: "endpoint", LaneHMAC: []byte("expired-effect-lane"),
+		OrderingSequence: 1, EffectClass: "send", RiskClass: RiskPreDispatchRetryable, Status: OutboxStatusPending,
+		Version: 1, PayloadVersion: 1, PayloadCiphertext: []byte{0x01}, PayloadNonce: make([]byte, 12),
+		EncryptionKeyID: source.CurrentID, PayloadExpiresAt: &expiredAt,
+	}
+	if err := db.GORM().Create(&effect).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcceptOutbox(ctx, NewEffect{
+		EffectID: effect.EffectID, EndpointID: effect.EndpointID, LaneHMAC: effect.LaneHMAC,
+		EffectType: effect.EffectClass, RiskClass: effect.RiskClass, PayloadCiphertext: []byte{0x02},
+		PayloadNonce: make([]byte, 12), PayloadEncryptionKeyID: source.CurrentID,
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("expired outbox auth/dedupe precedence err=%v", err)
+	}
+	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&effect).Error; err != nil {
+		t.Fatal(err)
+	}
+	if effect.Version != 2 || len(effect.PayloadCiphertext) != 0 || len(effect.PayloadNonce) != 0 {
+		t.Fatalf("expired outbox was not scrubbed before auth: %#v", effect)
+	}
+}
+
 func TestA6PluginUoWResealedUpdateRoundtrip(t *testing.T) {
 	store, db, source := task6Store(t)
 	defer db.Close()
@@ -953,6 +1097,58 @@ func TestA6PluginKeyHMACBinding(t *testing.T) {
 	}
 	if _, err := store.ListPluginKV(ctx, PluginKVListRequest{ExtensionID: "ext"}); !errors.Is(err, ErrAuthenticationFailed) {
 		t.Fatalf("tampered plugin list err=%v", err)
+	}
+}
+
+func TestA6UOWExpiredRowsPrecedePayloadAuthentication(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	expiredAt := time.Now().UTC().Add(-time.Minute)
+	inbox := inboxMessageRow{
+		InboxID: "uow-expired-auth-inbox", EndpointID: "endpoint", ProviderEventKey: "uow-provider",
+		LaneHMAC: []byte("uow-expired-lane"), OrderingSequence: 1, Status: InboxStatusPending, Version: 1,
+		PayloadVersion: 1, PayloadCiphertext: []byte{0x01}, PayloadNonce: make([]byte, 12),
+		EncryptionKeyID: source.CurrentID, PayloadExpiresAt: &expiredAt,
+	}
+	if err := db.GORM().Create(&inbox).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{{
+		InboxID: inbox.InboxID, ExpectedVersion: 1, Version: 2, Status: InboxStatusPending,
+		EndpointID: inbox.EndpointID, PayloadCiphertext: []byte{0x02}, PayloadNonce: make([]byte, 12),
+		PayloadEncryptionKeyID: source.CurrentID,
+	}}}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("uow expired inbox auth precedence err=%v", err)
+	}
+	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&inbox).Error; err != nil {
+		t.Fatal(err)
+	}
+	if inbox.Version != 2 || len(inbox.PayloadCiphertext) != 0 || len(inbox.PayloadNonce) != 0 {
+		t.Fatalf("uow expired inbox was not scrubbed: %#v", inbox)
+	}
+
+	effect := outboxEffectRow{
+		EffectID: "uow-expired-auth-effect", EndpointID: "endpoint", LaneHMAC: []byte("uow-expired-effect-lane"),
+		OrderingSequence: 1, EffectClass: "send", RiskClass: RiskPreDispatchRetryable, Status: OutboxStatusPending,
+		Version: 1, PayloadVersion: 1, PayloadCiphertext: []byte{0x01}, PayloadNonce: make([]byte, 12),
+		EncryptionKeyID: source.CurrentID, PayloadExpiresAt: &expiredAt,
+	}
+	if err := db.GORM().Create(&effect).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{
+		EffectID: effect.EffectID, ExpectedVersion: 1, Version: 2, Status: OutboxStatusPending,
+		EndpointID: effect.EndpointID, EffectType: effect.EffectClass, RiskClass: effect.RiskClass,
+		PayloadCiphertext: []byte{0x02}, PayloadNonce: make([]byte, 12), PayloadEncryptionKeyID: source.CurrentID,
+	}}}); !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("uow expired outbox auth precedence err=%v", err)
+	}
+	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&effect).Error; err != nil {
+		t.Fatal(err)
+	}
+	if effect.Version != 2 || len(effect.PayloadCiphertext) != 0 || len(effect.PayloadNonce) != 0 {
+		t.Fatalf("uow expired outbox was not scrubbed: %#v", effect)
 	}
 }
 

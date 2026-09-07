@@ -281,9 +281,24 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 		return CommitResult{}, ErrReadinessQuarantined
 	}
 	if s.keySource != nil {
-		if err = s.validateReadinessOnDB(ctx, tx, false); err != nil { return CommitResult{}, err }
+		if err = s.validateReadinessOnDB(ctx, tx, false); err != nil {
+			return CommitResult{}, err
+		}
+		if err = s.validateA6UnitOfWorkWithDB(ctx, tx, work); err != nil {
+			var expired *task5ExpiredPayloadError
+			if errors.As(err, &expired) {
+				_ = tx.Rollback().Error
+				compCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				scrubErr := s.task5PersistExpiredPayloads(compCtx, work, expired)
+				cancel()
+				if scrubErr != nil {
+					return CommitResult{}, scrubErr
+				}
+				return CommitResult{}, ErrPayloadExpired
+			}
+			return CommitResult{}, err
+		}
 	}
-	if err = s.validateA6UnitOfWorkWithDB(ctx, tx, work); err != nil { return CommitResult{}, err }
 	s.observeLock(tableProjectionControl)
 
 	type headState struct { stream StreamID; current uint64 }

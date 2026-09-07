@@ -600,8 +600,14 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		}
 		version := uint64(1)
 		var existing inboxMessageRow
-		if err := db.WithContext(ctx).Select("payload_version").Where("inbox_id = ?", update.InboxID).First(&existing).Error; err == nil {
+		lookup := locked(db).Where("inbox_id = ?", update.InboxID).First(&existing)
+		if lookup.Error == nil {
+			if inboxUnresolved(existing.Status) && existing.PayloadExpiresAt != nil && !existing.PayloadExpiresAt.After(s.task5Now()) {
+				return &task5ExpiredPayloadError{table: tableInboxMessages, id: existing.InboxID, now: s.task5Now()}
+			}
 			version = task5PayloadVersion(existing.PayloadVersion)
+		} else if !errors.Is(lookup.Error, gorm.ErrRecordNotFound) {
+			return ErrParticipantFailure
 		}
 		if err := validateTask5OpaquePayload(update.PayloadCiphertext, update.PayloadNonce, payloadKeyID); err != nil {
 			return err
@@ -632,8 +638,14 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		}
 		version := uint64(1)
 		var existing outboxEffectRow
-		if err := db.WithContext(ctx).Select("payload_version").Where("effect_id = ?", effect.EffectID).First(&existing).Error; err == nil {
+		lookup := locked(db).Where("effect_id = ?", effect.EffectID).First(&existing)
+		if lookup.Error == nil {
+			if outboxUnresolved(existing.Status) && existing.PayloadExpiresAt != nil && !existing.PayloadExpiresAt.After(s.task5Now()) {
+				return &task5ExpiredPayloadError{table: tableOutboxEffects, id: existing.EffectID, now: s.task5Now()}
+			}
 			version = task5PayloadVersion(existing.PayloadVersion)
+		} else if !errors.Is(lookup.Error, gorm.ErrRecordNotFound) {
+			return ErrParticipantFailure
 		}
 		if err := validateTask5OpaquePayload(effect.PayloadCiphertext, effect.PayloadNonce, payloadKeyID); err != nil {
 			return err
@@ -1068,8 +1080,16 @@ func (s *GORMStore) ResolveSecret(ctx context.Context, ref string, version uint6
 	if ref == "" {
 		return SecretResolution{}, ErrNotFound
 	}
+	tx := s.db.GORM().WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return SecretResolution{}, ErrParticipantFailure
+	}
+	defer tx.Rollback()
+	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		return SecretResolution{}, err
+	}
 	var row adapterSecretRow
-	q := s.db.GORM().WithContext(ctx).Where("secret_ref = ?", ref)
+	q := locked(tx).Where("secret_ref = ?", ref)
 	if version > 0 {
 		q = q.Where("secret_version = ?", version)
 	} else {
@@ -1084,7 +1104,7 @@ func (s *GORMStore) ResolveSecret(ctx context.Context, ref string, version uint6
 	if len(row.Nonce) != 12 {
 		return SecretResolution{}, ErrInvalidMetadata
 	}
-	if err := s.validateA6KeyID(ctx, s.db.GORM(), row.EncryptionKeyID); err != nil {
+	if err := s.validateA6KeyID(ctx, tx, row.EncryptionKeyID); err != nil {
 		return SecretResolution{}, err
 	}
 	plain, err := a6Open(ctx, s.keySource, "adapter-secret/v1", row.SecretRef, row.EndpointID+"/"+row.AdapterID, row.SecretVersion, row.EncryptionKeyID, row.Ciphertext, row.Nonce)
@@ -1319,15 +1339,23 @@ func (s *GORMStore) GetPluginKV(ctx context.Context, extension, key string) (Plu
 	if len(extension) > MaxPluginExtensionBytes || len(key) > MaxPluginKeyBytes {
 		return PluginKVItem{}, ErrOversizeInput
 	}
+	tx := s.db.GORM().WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return PluginKVItem{}, ErrParticipantFailure
+	}
+	defer tx.Rollback()
+	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		return PluginKVItem{}, err
+	}
 	index, err := a6HMAC(ctx, s.keySource, "plugin-key-index/v1", extension, key)
 	if err != nil {
 		return PluginKVItem{}, err
 	}
 	var row pluginKVRow
-	if err := s.db.GORM().WithContext(ctx).Where("extension_id = ? AND key_hmac = ?", extension, index).First(&row).Error; err != nil {
+	if err := locked(tx).Where("extension_id = ? AND key_hmac = ?", extension, index).First(&row).Error; err != nil {
 		return PluginKVItem{}, ErrPluginKVNotFound
 	}
-	item, err := s.decodePluginKVRow(ctx, s.db.GORM(), row)
+	item, err := s.decodePluginKVRow(ctx, tx, row)
 	if err != nil {
 		return PluginKVItem{}, err
 	}
@@ -1402,8 +1430,16 @@ func (s *GORMStore) ListPluginKV(ctx context.Context, req PluginKVListRequest) (
 	if limit <= 0 || limit > MaxPluginResults {
 		limit = MaxPluginResults
 	}
+	tx := s.db.GORM().WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return nil, ErrParticipantFailure
+	}
+	defer tx.Rollback()
+	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		return nil, err
+	}
 	var rows []pluginKVRow
-	if err := s.db.GORM().WithContext(ctx).Where("extension_id = ?", req.ExtensionID).Order("key_hmac ASC").Limit(MaxPluginScan + 1).Find(&rows).Error; err != nil {
+	if err := locked(tx).Where("extension_id = ?", req.ExtensionID).Order("key_hmac ASC").Limit(MaxPluginScan + 1).Find(&rows).Error; err != nil {
 		return nil, ErrParticipantFailure
 	}
 	if len(rows) > MaxPluginScan {
@@ -1412,7 +1448,7 @@ func (s *GORMStore) ListPluginKV(ctx context.Context, req PluginKVListRequest) (
 	out := make([]PluginKVItem, 0, minInt(limit, len(rows)))
 	responseBytes := 0
 	for _, row := range rows {
-		item, err := s.decodePluginKVRow(ctx, s.db.GORM(), row)
+		item, err := s.decodePluginKVRow(ctx, tx, row)
 		if err != nil {
 			return nil, err
 		}

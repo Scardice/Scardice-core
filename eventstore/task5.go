@@ -430,16 +430,23 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 			task5Rollback(tx)
 		}
 	}()
-	if s.keySource != nil {
+	validatePayload := func() error {
+		if err := validateTask5OpaquePayload(update.PayloadCiphertext, update.PayloadNonce, payloadKeyID); err != nil {
+			return err
+		}
+		if s.keySource == nil {
+			return nil
+		}
 		if err := s.requireA6BoundCodec(); err != nil {
-			return CommitResult{}, err
+			return err
 		}
 		if err := s.validateA6KeyID(ctx, tx, payloadKeyID); err != nil {
-			return CommitResult{}, err
+			return err
 		}
 		if _, decryptErr := openBoundPayload(ctx, s.codec, "inbox/v1", update.InboxID, update.EndpointID, 1, update.PayloadCiphertext, update.PayloadNonce, payloadKeyID); decryptErr != nil {
-			return CommitResult{}, ErrAuthenticationFailed
+			return ErrAuthenticationFailed
 		}
+		return nil
 	}
 	var existing inboxMessageRow
 	q := locked(tx).Where("endpoint_id = ? AND provider_event_id = ?", update.EndpointID, update.ProviderEventKey).First(&existing)
@@ -465,6 +472,9 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 				return CommitResult{}, ErrInvalidTTL
 			}
 		}
+	if err = validatePayload(); err != nil {
+		return CommitResult{}, err
+	}
 		if !task5InboxDuplicate(existing, update) {
 			return CommitResult{}, ErrConflict
 		}
@@ -483,6 +493,9 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 		return CommitResult{}, ErrPayloadExpired
 	} else if update.PayloadExpiresAt.After(now.Add(InboxPayloadTTL)) {
 		return CommitResult{}, ErrInvalidTTL
+	}
+	if err = validatePayload(); err != nil {
+		return CommitResult{}, err
 	}
 	sequence, err := task5AllocateLane(tx, inboxLaneKind, update.LaneHMAC, now)
 	if err != nil {
@@ -872,9 +885,6 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 		return CommitResult{}, digestErr
 	}
 	effect.ContentDigestKeyID = digestKeyID
-	if err := validateTask5OpaquePayload(effect.PayloadCiphertext, effect.PayloadNonce, payloadKeyID); err != nil {
-		return CommitResult{}, err
-	}
 	if effect.LeaseOwner != "" || effect.LeaseEpoch != 0 || effect.AttemptID != "" || !effect.LeaseExpiresAt.IsZero() ||
 		!effect.DispatchedAt.IsZero() || !effect.CompletedAt.IsZero() || effect.ProviderMessageID != "" ||
 		effect.ResultCode != "" || effect.ErrorCode != "" || effect.RetryCount != 0 || effect.PrincipalID != "" ||
@@ -908,16 +918,23 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 			task5Rollback(tx)
 		}
 	}()
-	if s.keySource != nil {
+	validatePayload := func() error {
+		if err := validateTask5OpaquePayload(effect.PayloadCiphertext, effect.PayloadNonce, payloadKeyID); err != nil {
+			return err
+		}
+		if s.keySource == nil {
+			return nil
+		}
 		if err := s.requireA6BoundCodec(); err != nil {
-			return CommitResult{}, err
+			return err
 		}
 		if err := s.validateA6KeyID(ctx, tx, payloadKeyID); err != nil {
-			return CommitResult{}, err
+			return err
 		}
 		if _, decryptErr := openBoundPayload(ctx, s.codec, "outbox/v1", effect.EffectID, effect.EndpointID, 1, effect.PayloadCiphertext, effect.PayloadNonce, payloadKeyID); decryptErr != nil {
-			return CommitResult{}, ErrAuthenticationFailed
+			return ErrAuthenticationFailed
 		}
+		return nil
 	}
 	var existing outboxEffectRow
 	lookup := locked(tx).Where("effect_id = ?", effect.EffectID).First(&existing)
@@ -943,6 +960,9 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 				return CommitResult{}, ErrInvalidTTL
 			}
 		}
+	if err = validatePayload(); err != nil {
+		return CommitResult{}, err
+	}
 		if !task5EffectDuplicate(existing, effect) {
 			return CommitResult{}, ErrConflict
 		}
@@ -960,6 +980,9 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 		return CommitResult{}, ErrPayloadExpired
 	} else if effect.PayloadExpiresAt.After(now.Add(InboxPayloadTTL)) {
 		return CommitResult{}, ErrInvalidTTL
+	}
+	if err = validatePayload(); err != nil {
+		return CommitResult{}, err
 	}
 	seq, err := task5AllocateLane(tx, outboxLaneKind, effect.LaneHMAC, now)
 	if err != nil {
@@ -1760,6 +1783,15 @@ func (s *GORMStore) task5PersistExpiredPayloads(ctx context.Context, work UnitOf
 		}
 		seenOutbox[id] = true
 		return nil
+	}
+	if first.table == tableInboxMessages {
+		if err = scrubInbox(first.id, first.now); err != nil {
+			return err
+		}
+	} else if first.table == tableOutboxEffects {
+		if err = scrubOutbox(first.id, first.now); err != nil {
+			return err
+		}
 	}
 	inboxIDs := make([]string, 0, len(work.InboxUpdates)+1)
 	if first.table == tableInboxMessages {
