@@ -1333,6 +1333,7 @@ func TestA6UOWExpiredArtifactPrecedesPayloadAuthentication(t *testing.T) {
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
+
 	if err := db.GORM().Create(&row).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -1347,6 +1348,60 @@ func TestA6UOWExpiredArtifactPrecedesPayloadAuthentication(t *testing.T) {
 	}
 	if row.Version != 2 || row.Status != "expired" || len(row.Ciphertext) != 0 || len(row.Nonce) != 0 {
 		t.Fatalf("expired artifact was not scrubbed: %#v", row)
+	}
+}
+func TestA6MixedInboxArtifactExpiryCompensation(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	expiredAt := time.Now().UTC().Add(-time.Minute)
+	inbox := inboxMessageRow{
+		InboxID: "mixed-inbox-artifact-expiry", EndpointID: "endpoint", ProviderEventKey: "provider",
+		LaneHMAC: []byte("mixed-lane"), OrderingSequence: 1, Status: InboxStatusPending, Version: 1, PayloadVersion: 1,
+		PayloadCiphertext: []byte{1}, PayloadNonce: make([]byte, 12), EncryptionKeyID: source.CurrentID, PayloadExpiresAt: &expiredAt,
+	}
+	if err := db.GORM().Create(&inbox).Error; err != nil {
+		t.Fatal(err)
+	}
+	operationID := "mixed-inbox-artifact-operation"
+	if err := db.GORM().Create(&operationRow{
+		OperationID: operationID, Version: 1, Status: "pending", Kind: "test", PrincipalID: "owner",
+		IdempotencyScope: "scope", IdempotencyKey: operationID, PrivatePayloadVersion: 1,
+		CreatedAt: expiredAt, UpdatedAt: expiredAt,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	artifact := operationArtifactRow{
+		ArtifactID: "mixed-inbox-artifact", Version: 1, PayloadVersion: 1, OperationID: operationID,
+		OwnerPrincipalID: "owner", MediaType: "application/octet-stream", Size: 1, Status: "available",
+		Ciphertext: []byte{1}, Nonce: make([]byte, 12), EncryptionKeyID: source.CurrentID, ExpiresAt: expiredAt,
+	}
+	if err := db.GORM().Create(&artifact).Error; err != nil {
+		t.Fatal(err)
+	}
+	_, err := store.Commit(context.Background(), UnitOfWork{
+		InboxUpdates: []InboxUpdate{{
+			InboxID: inbox.InboxID, EndpointID: inbox.EndpointID, ProviderEventKey: inbox.ProviderEventKey,
+			PayloadCiphertext: []byte{2}, PayloadNonce: make([]byte, 12), PayloadEncryptionKeyID: source.CurrentID,
+		}},
+		ArtifactUpdates: []ArtifactUpdate{{
+			ArtifactID: artifact.ArtifactID, OperationID: operationID, OwnerPrincipalID: "owner",
+			Size: 1, Ciphertext: []byte{2}, Nonce: make([]byte, 12), EncryptionKeyID: source.CurrentID,
+		}},
+	})
+	if !errors.Is(err, ErrPayloadExpired) {
+		t.Fatalf("mixed inbox/artifact expiry err=%v", err)
+	}
+	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&inbox).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GORM().Where("artifact_id = ?", artifact.ArtifactID).First(&artifact).Error; err != nil {
+		t.Fatal(err)
+	}
+	if inbox.Version != 2 || len(inbox.PayloadCiphertext) != 0 || len(inbox.PayloadNonce) != 0 {
+		t.Fatalf("mixed inbox row not scrubbed: %#v", inbox)
+	}
+	if artifact.Version != 2 || artifact.Status != "expired" || len(artifact.Ciphertext) != 0 || len(artifact.Nonce) != 0 {
+		t.Fatalf("mixed artifact row not scrubbed: %#v", artifact)
 	}
 }
 

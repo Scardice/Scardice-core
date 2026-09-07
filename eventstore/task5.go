@@ -1784,6 +1784,37 @@ func (s *GORMStore) task5PersistExpiredPayloads(ctx context.Context, work UnitOf
 		seenOutbox[id] = true
 		return nil
 	}
+	seenArtifacts := map[string]bool{}
+	scrubArtifact := func(id string, now time.Time) error {
+		if id == "" || seenArtifacts[id] {
+			return nil
+		}
+		var row operationArtifactRow
+		q := locked(tx).Where("artifact_id = ?", id).First(&row)
+		if errors.Is(q.Error, gorm.ErrRecordNotFound) {
+			seenArtifacts[id] = true
+			return nil
+		}
+		if q.Error != nil {
+			return ErrParticipantFailure
+		}
+		if (row.Status != "available" && row.Status != "ready") || row.ExpiresAt.After(now) || (len(row.Ciphertext) == 0 && len(row.Nonce) == 0) {
+			seenArtifacts[id] = true
+			return nil
+		}
+		version, versionErr := nextVersion(row.Version)
+		if versionErr != nil {
+			return versionErr
+		}
+		q = tx.Model(&operationArtifactRow{}).Where("artifact_id = ? AND version = ?", row.ArtifactID, row.Version).Updates(map[string]any{
+			"version": version, "status": "expired", "ciphertext": nil, "nonce": nil, "consumed_at": now,
+		})
+		if q.Error != nil || q.RowsAffected != 1 {
+			return ErrStaleLease
+		}
+		seenArtifacts[id] = true
+		return nil
+	}
 	if first.table == tableInboxMessages {
 		if err = scrubInbox(first.id, first.now); err != nil {
 			return err
@@ -1851,6 +1882,28 @@ func (s *GORMStore) task5PersistExpiredPayloads(ctx context.Context, work UnitOf
 		}
 		if outboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(first.now) {
 			if err = scrubOutbox(row.EffectID, first.now); err != nil {
+				return err
+			}
+		}
+	}
+	artifactIDs := make([]string, 0, len(work.ArtifactUpdates))
+	for _, update := range work.ArtifactUpdates {
+		if update.ArtifactID != "" {
+			artifactIDs = append(artifactIDs, update.ArtifactID)
+		}
+	}
+	sort.Strings(artifactIDs)
+	for _, id := range artifactIDs {
+		var row operationArtifactRow
+		q := locked(tx).Where("artifact_id = ?", id).First(&row)
+		if errors.Is(q.Error, gorm.ErrRecordNotFound) {
+			continue
+		}
+		if q.Error != nil {
+			return ErrParticipantFailure
+		}
+		if (row.Status == "available" || row.Status == "ready") && !row.ExpiresAt.After(first.now) {
+			if err = scrubArtifact(row.ArtifactID, first.now); err != nil {
 				return err
 			}
 		}
