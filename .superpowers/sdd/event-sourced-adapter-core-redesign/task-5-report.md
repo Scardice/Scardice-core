@@ -6,7 +6,7 @@
 - `eventstore/schema.go`: durable resolution audit fields and bounded outbox retry metadata.
 - `eventstore/store.go`: injected clock, ID generator, and payload codec options with production defaults. `Commit` rolls back a failed UoW and, for payload/artifact expiry, runs detached bounded compensating transactions that scrub every expired inbox/outbox participant and every eligible (`available`/`ready`) expired artifact in canonical table/ID order; compensation errors are returned instead of claiming expiry was scrubbed.
 - `eventstore/task5.go`: transactional inbox/outbox acceptance, lane allocation, provider dedupe, predecessor-blocked claims, lease/CAS lifecycle, resolution, payload scrubbing/expiry, risk transitions, and artifact put/consume. Public accepts reject supplied versions, defer incoming TTL validation until after existing-row expiry observation, and restore default/cap validation for new rows; public updates validate versions and reject ignored identity/opaque/lifecycle fields, dispatched terminal completion is reserved for `CompleteOutbox`, and stale-lease paths scrub observed expiry before returning. Expired replay handling scrubs before dedupe/conflict evaluation; UoW initial dedupe/relookup returns typed expiry before idempotent success and non-pending status mutations require an active lease. Non-idempotent dispatched outbox expiry transitions to `ambiguous` with resolution metadata preserved. Loaded scrub paths avoid version churn when bytes are already absent. Artifact commit failures return a zero result and never expose decrypted bytes.
-- `eventstore/task6.go`: A6 plugin key-index HMAC recomputation with constant-time comparison, readiness terminal/publication validation, startup fail-closed readiness gating, index-root material fingerprint pinning, unsupported readiness-schema rejection, fresh-mode metadata/position/completion strictness, rotation preflight and transaction fencing, authoritative readiness revalidation inside mutation transactions and projection publication, decoded secret/plugin/payload/artifact bounds before decrypt, bounded plugin lookup inputs, and redacted artifact authentication/unavailability mapping.
+- `eventstore/task6.go`: A6 plugin key-index HMAC recomputation with constant-time comparison, readiness terminal/publication validation, startup fail-closed readiness gating, index-root material fingerprint pinning, unsupported readiness-schema rejection, fresh-mode metadata/position/completion strictness, immutable public secret binding across versions, rotation preflight and transaction fencing, authoritative readiness revalidation inside mutation transactions and projection publication, decoded secret/plugin/payload/artifact bounds before decrypt, bounded plugin lookup inputs, and redacted artifact authentication/unavailability mapping.
 - `eventstore/contracts.go`: separate payload-encryption and stable content-digest key identities for inbox/effect records, while retaining the legacy field as a compatibility fallback.
 - `eventstore/schema.go`: durable index-root fingerprint in the readiness singleton.
 - `eventstore/task5_test.go`: behavior-first regression coverage for dedupe, lane ordering/concurrency, lease/CAS/state transitions, ambiguity, scrubbing/TTL, artifact codec/size/expiry/one-winner, fail-closed encryption, strict participant contracts, stable digest replay, terminal rewrite rejection, pending termination rejection, nonce boundaries, participant supplied-version checks, sparse leased-effect identity, replay bounds, callback timestamps, public immutable-field/version validation, terminal completion idempotence, stale-lease expiry scrubbing, corrupt codec rejection, multi-artifact compensation, consumed-artifact compensation exclusion, expired replay precedence, explicit expired/default/capped ingress TTLs, commit-error zero-result plaintext protection, and compensating UoW expiry scrubbing.
@@ -38,7 +38,7 @@ After the narrow implementation, the same behavior tests passed. The tests asser
 
 ## Verification
 
-Exact required commands and results after ninth-round commits `6881ae2b`, `cec1cfee`, and `62a55ddc` (on top of `79a28c61`):
+Exact required commands and results after ninth-round commits `6881ae2b`, `cec1cfee`, `62a55ddc`, and `8f3e169e` (on top of `79a28c61`):
 
 ```text
 go test -race ./eventstore -run 'TestInbox|TestOutbox|TestArtifact|TestLane|TestLease|TestEffect|TestDedup' -count=1
@@ -48,13 +48,13 @@ go test -race ./eventstore -run 'TestReadiness|TestKey|TestCrypto|TestSecret|Tes
 ok  	Scardice-core/eventstore	2.101s
 
 go test -race ./eventstore -count=1
-ok  	Scardice-core/eventstore	4.866s
+ok  	Scardice-core/eventstore	4.891s
 
 go test -count=1 ./eventstore
-ok  	Scardice-core/eventstore	0.975s
+ok  	Scardice-core/eventstore	0.961s
 ```
 
-The commands were run after the ninth-round source/test commits and included projection post-lock readiness validation, rotation fencing and zero-result errors, readiness-repair cache recovery, unsupported readiness-schema rejection, strict fresh-mode metadata/position/completion validation, ciphertext/nonce bounds before decrypt, Task5 UoW payload caps, explicit public operation selection, version/CAS-fenced privacy purge, and operation/privacy repository coverage. No formatter, linter, or project-wide suite was run.
+The commands were run after the ninth-round source/test commits and included projection post-lock readiness validation, rotation fencing and zero-result errors, readiness-repair cache recovery, unsupported readiness-schema rejection, strict fresh-mode metadata/position/completion validation, immutable public secret binding, ciphertext/nonce bounds before decrypt, Task5 UoW payload caps, explicit public operation selection, version/CAS-fenced privacy purge, and operation/privacy repository coverage. No formatter, linter, or project-wide suite was run.
 
 ## Commits
 
@@ -80,5 +80,6 @@ The commands were run after the ninth-round source/test commits and included pro
 - Rotation helper transactions now hold the readiness publication fence while re-encrypting every A6 table: `b704890b`.
 - Projection/rotation fencing, readiness-repair cache recovery, pre-decrypt ciphertext bounds, Task5 UoW payload caps, and operation/privacy repository implementation: `79a28c61`.
 - Ninth-round privacy/readiness contract fixes and full fresh-field coverage: `6881ae2b`, `cec1cfee`, `62a55ddc`.
+- Public `PutSecret` binding invariant and final race/normal verification: `8f3e169e`.
 
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
