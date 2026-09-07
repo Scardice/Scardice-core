@@ -268,6 +268,12 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 	if err = locked(tx).Where("singleton_id = ?", "default").First(&readiness).Error; err != nil { return CommitResult{}, errors.New("eventstore: lock readiness failed") }
 	var control projectionControlRow
 	if err = locked(tx).Where("singleton_id = ?", "default").First(&control).Error; err != nil { return CommitResult{}, errors.New("eventstore: lock projection control failed") }
+	if control.PublicationState != "published" {
+		return CommitResult{}, ErrReadinessQuarantined
+	}
+	if s.keySource != nil {
+		if err = s.validateReadinessOnDB(ctx, tx, false); err != nil { return CommitResult{}, err }
+	}
 	if err = s.validateA6UnitOfWorkWithDB(ctx, tx, work); err != nil { return CommitResult{}, err }
 	s.observeLock(tableProjectionControl)
 

@@ -57,7 +57,15 @@ func task6Store(t *testing.T) (*GORMStore, *Database, *MemoryKeySource) {
 	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "task6.db")})
 	if err != nil { t.Fatal(err) }
 	source := task6Source()
-	return NewStore(db, WithKeySource(source)), db, source
+	store := NewStore(db, WithKeySource(source))
+	if err := store.SetReadiness(context.Background(), Readiness{
+		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: source.IndexID,
+		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
+		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return store, db, source
 }
 
 func TestA6CryptoRoundTripAndAuthentication(t *testing.T) {
@@ -87,6 +95,41 @@ func TestSecretHistoryAndWrongKey(t *testing.T) {
 	source.Roots["root-v1"] = []byte("ZYXWVUTSRQPONMLKJIHGFEDCBA987654")
 	if _, err := store.ResolveSecret(ctx, "secret-ref", 1); !errors.Is(err, ErrAuthenticationFailed) && !errors.Is(err, ErrKeyUnavailable) { t.Fatalf("wrong root err=%v", err) }
 }
+func TestA6SecretDecodedBounds(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	oversized := make([]byte, MaxSecretBytes+1)
+	ciphertext, nonce, keyID, err := a6Seal(ctx, source, "adapter-secret/v1", "oversized-secret", "endpoint/adapter", 1, oversized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{SecretUpdates: []SecretUpdate{{
+		SecretRef: "oversized-secret", EndpointID: "endpoint", AdapterID: "adapter", SecretVersion: 1,
+		Ciphertext: ciphertext, Nonce: nonce, EncryptionKeyID: keyID,
+	}}}); !errors.Is(err, ErrOversizeInput) {
+		t.Fatalf("oversized encrypted UoW secret err=%v", err)
+	}
+	var count int64
+	if err := db.GORM().Model(&adapterSecretRow{}).Where("secret_ref = ?", "oversized-secret").Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("oversized UoW secret persisted: %d", count)
+	}
+	now := time.Now().UTC()
+	if err := db.GORM().Create(&adapterSecretRow{
+		SecretRef: "oversized-secret", SecretVersion: 1, EndpointID: "endpoint", AdapterID: "adapter", AdapterType: "opaque",
+		Ciphertext: ciphertext, Nonce: nonce, EncryptionKeyID: keyID, RowVersion: 1, CreatedAt: now, UpdatedAt: now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := store.ResolveSecret(ctx, "oversized-secret", 1)
+	if !errors.Is(err, ErrOversizeInput) || len(resolved.Plaintext) != 0 {
+		t.Fatalf("oversized resolved secret=%d err=%v", len(resolved.Plaintext), err)
+	}
+}
+
 
 func TestPluginKVExactAndPrefixIsolation(t *testing.T) {
 	store, db, _ := task6Store(t)
@@ -103,6 +146,25 @@ func TestPluginKVExactAndPrefixIsolation(t *testing.T) {
 	if err := store.DeletePluginKV(ctx, "ext-a", "alpha", item.Version); err != nil { t.Fatal(err) }
 	if _, err := store.GetPluginKV(ctx, "ext-a", "alpha"); !errors.Is(err, ErrPluginKVNotFound) { t.Fatalf("delete err=%v", err) }
 }
+func TestPluginKVLookupBounds(t *testing.T) {
+	store, db, _ := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	longKey := strings.Repeat("k", MaxPluginKeyBytes+1)
+	if _, err := store.GetPluginKV(ctx, "ext", longKey); !errors.Is(err, ErrOversizeInput) {
+		t.Fatalf("oversized get key err=%v", err)
+	}
+	if err := store.DeletePluginKV(ctx, "ext", longKey, 0); !errors.Is(err, ErrOversizeInput) {
+		t.Fatalf("oversized delete key err=%v", err)
+	}
+	if _, err := store.ListPluginKV(ctx, PluginKVListRequest{ExtensionID: strings.Repeat("e", MaxPluginExtensionBytes+1)}); !errors.Is(err, ErrOversizeInput) {
+		t.Fatalf("oversized list extension err=%v", err)
+	}
+	if _, err := store.ListPluginKV(ctx, PluginKVListRequest{ExtensionID: "ext", Prefix: longKey}); !errors.Is(err, ErrOversizeInput) {
+		t.Fatalf("oversized list prefix err=%v", err)
+	}
+}
+
 
 func TestReadinessPinAndRootAvailability(t *testing.T) {
 	store, db, source := task6Store(t)
@@ -180,6 +242,22 @@ func TestPublicA6OperationRevalidatesReadiness(t *testing.T) {
 		t.Fatalf("tampered readiness write err=%v", err)
 	}
 }
+func TestPublicMutationRejectsFreshNonemptyReadinessTamper(t *testing.T) {
+	store, db, _ := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	event := NewEvent{EventType: "readiness.tamper", SchemaVersion: 1, Payload: []byte(`{}`), Metadata: Metadata{EventID: "readiness-tamper-1", CommandID: "readiness-tamper-command-1", CorrelationID: "readiness-tamper-correlation-1", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}}
+	if _, err := store.Commit(ctx, UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{AggregateType: "readiness", AggregateID: "1"}, Events: []NewEvent{event}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GORM().Model(&storeReadinessRow{}).Where("singleton_id = ?", "default").Update("mode", "fresh").Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{AggregateType: "readiness", AggregateID: "2"}, Events: []NewEvent{event}}}}); !errors.Is(err, ErrReadinessQuarantined) {
+		t.Fatalf("fresh nonempty readiness mutation err=%v", err)
+	}
+}
+
 
 func TestReadinessRejectsUnpublishedProjection(t *testing.T) {
 	store, db, _ := task6Store(t)
