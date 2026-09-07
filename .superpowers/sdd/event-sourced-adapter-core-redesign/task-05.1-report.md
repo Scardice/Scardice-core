@@ -69,3 +69,40 @@ No formatter, linter, or project-wide test suite was run.
 - Provider notice/request conversion remains outside this task; the pure OneBot runtime continues to advertise and normalize message events only.
 - The legacy `IMSession.ExecutePureOnebotInbound` method remains for compatibility and its existing direct unit test; no production provider ingress sink calls it after this change. Later Slice05 tasks own inbox callback execution and execution-path collapse.
 - `GORMStore.KeyedDigest` intentionally returns `ErrKeySourceUnavailable` when the store has no admitted key source; it does not fall back to plaintext hashing. Production configuration must provide the eventstore security source for encrypted ingress.
+
+## Round 1 fixes
+
+The parent review identified five Task1 correctness gaps; all are now addressed:
+
+- OneBot uses `onebot-message-<message_id>` as the stable provider event key when `message_id` is present. Events without one leave `ProviderEventID` empty so Core computes the bounded fallback key. A stable ID with a changed normalized envelope reaches the same durable identity and returns `eventstore.ErrConflict`.
+- Raw OneBot frames are rejected before JSON parsing/copying above `maxOnebotInboundBytes` (`adapterapi.MaxInboundTextBytes`). The transport queue remains bounded and stop-cancellable; oversized and queue-rejected ingress are observable through runtime counters. Retryable ingress/backpressure errors are consumed by the Run loop without publishing Failed or terminating the runtime.
+- Lane HMAC input now uses canonical length-prefixed tuple encoding. Conversation is preferred over Target for lane selection, so two target facts in one conversation cannot split ordering lanes. Target remains in the normalized fact and fallback identity.
+- `InboxUpdate.AllowExpiredDedupe` is a non-persisted explicit capability for callers that own a shorter dedupe TTL. After expiry, the eventstore deletes the old dedupe row and allocates a new ordered inbox row instead of returning a permanent duplicate. Existing Task5 callers retain the prior expired-replay rejection behavior.
+
+### Round 1 RED/GREEN evidence
+
+```text
+go test ./dice -run 'TestOnebotInboundProviderKey|TestOnebotInboundWithoutMessageID' -count=1
+FAIL: stable ID returned raw-hash onebot-15b329712bded911; no-ID returned onebot-1c2b555340f27ffc
+
+go test ./core/messageflow -run 'TestInboundService(StableIDChangedBody|ConversationLane)' -count=1
+FAIL: conversation split lanes
+
+go test ./eventstore -run 'TestInboxIngressAllowsExplicitReacceptAfterDedupeTTL' -count=1
+FAIL: InboxUpdate had no AllowExpiredDedupe field
+```
+
+```text
+go test ./dice ./core/messageflow ./eventstore -run 'Test(InboundService|InboxIngressAllowsExplicitReaccept|OnebotInbound|OnebotRuntimeKeepsAlive)' -count=1
+ok   Scardice-core/dice
+ok   Scardice-core/core/messageflow
+ok   Scardice-core/eventstore
+
+go test ./dice -run 'TestOnebotRuntime' -count=1
+ok   Scardice-core/dice
+
+go test ./eventstore -run 'Test(Task5PublicExpiredReplayScrubsBeforeDedupe|Task5UOWExpiredInitialDedupePrecedesReplay|InboxIngressRejectsPayloadTTLBypass)' -count=1
+ok   Scardice-core/eventstore
+```
+
+No formatter, linter, or project-wide test suite was run for the fixes. Prior Slice02–04 source/test files are present as untracked shared-worktree dependencies; the fix commit stages only direct Task1 files plus the focused runtime/TTL test files and the directly modified eventstore ingress contracts.

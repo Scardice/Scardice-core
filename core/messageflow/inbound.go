@@ -1,7 +1,9 @@
 package messageflow
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -122,11 +124,11 @@ func (s *InboundService) HandleInbound(ctx context.Context, fenced endpoint.Fenc
 	if err != nil {
 		return adapterapi.IngressReceipt{}, err
 	}
-	target := message.Target
-	if target == "" {
-		target = string(message.Conversation)
+	conversation := string(message.Conversation)
+	if conversation == "" {
+		conversation = message.Target
 	}
-	laneDigest, _, err := s.security.KeyedDigest(ctx, "inbound-lane/v1", string(fenced.EndpointID), target)
+	laneDigest, _, err := s.security.KeyedDigest(ctx, "inbound-lane/v1", canonicalIngressTuple(string(fenced.EndpointID), conversation))
 	if err != nil {
 		return adapterapi.IngressReceipt{}, err
 	}
@@ -157,7 +159,7 @@ func (s *InboundService) HandleInbound(ctx context.Context, fenced endpoint.Fenc
 		LaneHMAC: laneDigest, Status: eventstore.InboxStatusPending,
 		PayloadCiphertext: ciphertext, PayloadNonce: nonce,
 		ContentDigest: contentDigest, ContentDigestKeyID: digestKeyID,
-		PayloadEncryptionKeyID: encryptionKeyID, PayloadExpiresAt: now.Add(IngressPayloadTTL),
+		PayloadEncryptionKeyID: encryptionKeyID, PayloadExpiresAt: now.Add(IngressPayloadTTL), AllowExpiredDedupe: true,
 	})
 	if err != nil {
 		if errors.Is(err, eventstore.ErrConflict) {
@@ -197,7 +199,7 @@ func (s *InboundService) providerKey(ctx context.Context, endpointID adapterapi.
 	if !message.OccurredAt.IsZero() {
 		occurred = fmt.Sprintf("%d", message.OccurredAt.UTC().UnixNano())
 	}
-	identityDigest, _, err := s.security.KeyedDigest(ctx, "fallback-provider-key/v1", string(endpointID), message.Platform, string(message.Sender), target, occurred)
+	identityDigest, _, err := s.security.KeyedDigest(ctx, "fallback-provider-key/v1", canonicalIngressTuple(string(endpointID), message.Platform, string(message.Sender), target, occurred))
 	if err != nil {
 		return "", err
 	}
@@ -206,6 +208,18 @@ func (s *InboundService) providerKey(ctx context.Context, endpointID adapterapi.
 	// detected by the durable repository rather than silently admitted.
 	_ = contentDigest
 	return "fallback:" + hex.EncodeToString(identityDigest), nil
+}
+
+func canonicalIngressTuple(parts ...string) string {
+	var encoded bytes.Buffer
+	encoded.WriteString("inbound-tuple/v1")
+	var length [8]byte
+	for _, part := range parts {
+		binary.BigEndian.PutUint64(length[:], uint64(len(part)))
+		_, _ = encoded.Write(length[:])
+		_, _ = encoded.WriteString(part)
+	}
+	return encoded.String()
 }
 
 func (s *InboundService) recordCollision(collision IngressCollision) {

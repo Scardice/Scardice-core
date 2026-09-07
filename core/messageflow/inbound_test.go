@@ -97,6 +97,34 @@ func TestInboundServiceFallbackDuplicateAndCollision(t *testing.T) {
 	if svc.CollisionCount() == 0 { t.Fatal("fallback collision telemetry was not recorded") }
 }
 
+func TestInboundServiceStableIDChangedBodyIsCollision(t *testing.T) {
+	repo := &ingressRepoStub{}
+	svc, err := NewInboundService(repo, ingressCryptoStub{})
+	if err != nil { t.Fatal(err) }
+	first := testFencedMessage("stable-envelope", "before")
+	if _, err := svc.HandleInbound(context.Background(), first); err != nil { t.Fatal(err) }
+	first.Message.Text = "after"
+	if _, err := svc.HandleInbound(context.Background(), first); !errors.Is(err, eventstore.ErrConflict) {
+		t.Fatalf("stable envelope collision = %v", err)
+	}
+}
+
+func TestInboundServiceConversationLaneIgnoresDifferentTarget(t *testing.T) {
+	repo := &ingressRepoStub{}
+	svc, err := NewInboundService(repo, ingressCryptoStub{})
+	if err != nil { t.Fatal(err) }
+	first := testFencedMessage("lane-1", "one")
+	second := testFencedMessage("lane-2", "two")
+	second.Message.Target = "QQ:another-target"
+	if _, err := svc.HandleInbound(context.Background(), first); err != nil { t.Fatal(err) }
+	if _, err := svc.HandleInbound(context.Background(), second); err != nil { t.Fatal(err) }
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	if string(repo.updates[0].LaneHMAC) != string(repo.updates[1].LaneHMAC) {
+		t.Fatalf("conversation split lanes: %q %q", repo.updates[0].LaneHMAC, repo.updates[1].LaneHMAC)
+	}
+}
+
 func TestInboundServiceRejectsWhenBoundedAdmissionIsFull(t *testing.T) {
 	release := make(chan struct{})
 	repo := &ingressRepoStub{block: release}

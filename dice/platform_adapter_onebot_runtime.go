@@ -2,7 +2,6 @@ package dice
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -19,10 +18,16 @@ import (
 	"github.com/bytedance/sonic"
 
 	"Scardice-core/adapterapi"
+	"Scardice-core/core/messageflow"
 	emitter "Scardice-core/dice/imsdk/onebot"
 	"Scardice-core/dice/imsdk/onebot/schema"
 	emitterTypes "Scardice-core/dice/imsdk/onebot/types"
+	"Scardice-core/eventstore"
 )
+
+const maxOnebotInboundBytes = adapterapi.MaxInboundTextBytes
+
+var ErrOnebotInboundPayloadTooLarge = errors.New("onebot: inbound payload exceeds bound")
 
 // onebotRuntime is a generation-scoped owner of the protocol transport. It
 // deliberately has no Dice, IMSession, endpoint, or persistence dependency.
@@ -71,6 +76,8 @@ type onebotRuntime struct {
 	handlerWG  sync.WaitGroup
 	connectionMu sync.Mutex
 	connections map[*socketio.WebsocketWrapper]chan struct{}
+	inboundRejected atomic.Uint64
+	inboundBackpressure atomic.Uint64
 }
 type onebotRuntimeEvent struct {
 	kind string
@@ -128,6 +135,16 @@ func newOnebotRuntime(config OnebotConfig, resolver adapterapi.SecretResolver, l
 		events: make(chan onebotRuntimeEvent, 32),
 		connections: make(map[*socketio.WebsocketWrapper]chan struct{}),
 	}
+}
+
+func (r *onebotRuntime) RejectedInboundCount() uint64 {
+	if r == nil { return 0 }
+	return r.inboundRejected.Load()
+}
+
+func (r *onebotRuntime) BackpressureInboundCount() uint64 {
+	if r == nil { return 0 }
+	return r.inboundBackpressure.Load()
 }
 
 func (r *onebotRuntime) Capabilities() adapterapi.CapabilitySet {
@@ -489,12 +506,25 @@ func (r *onebotRuntime) Run(ctx context.Context, core adapterapi.CorePort) (runE
 				return err
 			case "inbound":
 				if err := r.handleInbound(runCtx, event.raw); err != nil {
+					if isRetryableOnebotInboundError(err) {
+						r.inboundRejected.Add(1)
+						continue
+					}
 					_ = r.reportFailure(runCtx, "inbound_failed", err)
 					return err
 				}
 			}
 		}
 	}
+}
+
+func isRetryableOnebotInboundError(err error) bool {
+	return errors.Is(err, messageflow.ErrIngressBackpressure) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, eventstore.ErrReadinessQuarantined) ||
+		errors.Is(err, eventstore.ErrKeySourceUnavailable) ||
+		errors.Is(err, eventstore.ErrEncryptionUnavailable) ||
+		errors.Is(err, eventstore.ErrParticipantFailure)
 }
 
 func (r *onebotRuntime) Stop(ctx context.Context) error {
@@ -605,6 +635,10 @@ func (r *onebotRuntime) installCallbacks(manager *socketio.SocketInstance, token
 			if payload == nil || len(payload.Data) == 0 {
 				return
 			}
+			if len(payload.Data) > maxOnebotInboundBytes {
+				r.inboundRejected.Add(1)
+				return
+			}
 			var response emitter.Response[sonic.NoCopyRawMessage]
 			if err := sonic.Unmarshal(payload.Data, &response); err == nil && response.Echo != "" {
 				r.mu.Lock()
@@ -626,10 +660,15 @@ func (r *onebotRuntime) installCallbacks(manager *socketio.SocketInstance, token
 }
 
 
-func (r *onebotRuntime) enqueue(event onebotRuntimeEvent) {
+func (r *onebotRuntime) enqueue(event onebotRuntimeEvent) bool {
 	select {
 	case r.events <- event:
+		return true
 	case <-r.stopCh:
+		if event.kind == "inbound" {
+			r.inboundBackpressure.Add(1)
+		}
+		return false
 	}
 }
 
@@ -703,6 +742,10 @@ func (r *onebotRuntime) wrapHTTPHandler(next http.Handler) http.Handler {
 }
 
 func (r *onebotRuntime) handleInbound(ctx context.Context, raw []byte) error {
+	if len(raw) > maxOnebotInboundBytes {
+		r.inboundRejected.Add(1)
+		return ErrOnebotInboundPayloadTooLarge
+	}
 	var envelope struct {
 		PostType  string          `json:"post_type"`
 		Time      int64           `json:"time"`
@@ -717,10 +760,13 @@ func (r *onebotRuntime) handleInbound(ctx context.Context, raw []byte) error {
 	if envelope.PostType != "message" {
 		return nil
 	}
-	sum := sha256.Sum256(raw)
-	eventID, err := adapterapi.NewProviderEventID(fmt.Sprintf("onebot-%x", sum[:8]))
-	if err != nil {
-		return err
+	var eventID adapterapi.ProviderEventID
+	if id, ok := onebotInboundInt(envelope.MessageID); ok {
+		var eventErr error
+		eventID, eventErr = adapterapi.NewProviderEventID(fmt.Sprintf("onebot-message-%d", id))
+		if eventErr != nil {
+			return eventErr
+		}
 	}
 	message := adapterapi.InboundMessage{
 		ProviderEventID: eventID,

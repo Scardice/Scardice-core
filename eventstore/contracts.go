@@ -54,29 +54,29 @@ const (
 )
 
 var (
-	ErrInvalidEvent      = errors.New("eventstore: invalid event")
-	ErrInvalidMetadata   = errors.New("eventstore: invalid metadata")
-	ErrUnsupportedSchema = errors.New("eventstore: unsupported schema")
-	ErrConflict          = errors.New("eventstore: conflict")
-	ErrEmptyUnitOfWork   = errors.New("eventstore: empty unit of work")
-	ErrDuplicateStream   = errors.New("eventstore: duplicate stream")
-	ErrDuplicateParticipant = errors.New("eventstore: duplicate participant")
-	ErrOversizeInput     = errors.New("eventstore: input exceeds configured bound")
-	ErrStaleLease        = errors.New("eventstore: stale lease")
-	ErrNotFound           = errors.New("eventstore: not found")
-	ErrInvalidTransition  = errors.New("eventstore: invalid state transition")
-	ErrInvalidRiskClass   = errors.New("eventstore: invalid risk class")
-	ErrPayloadExpired     = errors.New("eventstore: encrypted payload expired")
-	ErrArtifactGone       = errors.New("eventstore: artifact gone")
+	ErrInvalidEvent          = errors.New("eventstore: invalid event")
+	ErrInvalidMetadata       = errors.New("eventstore: invalid metadata")
+	ErrUnsupportedSchema     = errors.New("eventstore: unsupported schema")
+	ErrConflict              = errors.New("eventstore: conflict")
+	ErrEmptyUnitOfWork       = errors.New("eventstore: empty unit of work")
+	ErrDuplicateStream       = errors.New("eventstore: duplicate stream")
+	ErrDuplicateParticipant  = errors.New("eventstore: duplicate participant")
+	ErrOversizeInput         = errors.New("eventstore: input exceeds configured bound")
+	ErrStaleLease            = errors.New("eventstore: stale lease")
+	ErrNotFound              = errors.New("eventstore: not found")
+	ErrInvalidTransition     = errors.New("eventstore: invalid state transition")
+	ErrInvalidRiskClass      = errors.New("eventstore: invalid risk class")
+	ErrPayloadExpired        = errors.New("eventstore: encrypted payload expired")
+	ErrArtifactGone          = errors.New("eventstore: artifact gone")
 	ErrEncryptionUnavailable = errors.New("eventstore: encryption unavailable")
-	ErrAuthenticationFailed = errors.New("eventstore: encrypted data authentication failed")
-	ErrInvalidTTL          = errors.New("eventstore: invalid ttl")
-	ErrDeduplicated        = errors.New("eventstore: deduplicated")
-	ErrReadinessInvalid    = errors.New("eventstore: invalid readiness")
-	ErrReadinessQuarantined = errors.New("eventstore: readiness quarantine")
-	ErrKeySourceUnavailable = errors.New("eventstore: key source unavailable")
-	ErrKeyUnavailable      = errors.New("eventstore: encryption key unavailable")
-	ErrPluginKVNotFound    = errors.New("eventstore: plugin key not found")
+	ErrAuthenticationFailed  = errors.New("eventstore: encrypted data authentication failed")
+	ErrInvalidTTL            = errors.New("eventstore: invalid ttl")
+	ErrDeduplicated          = errors.New("eventstore: deduplicated")
+	ErrReadinessInvalid      = errors.New("eventstore: invalid readiness")
+	ErrReadinessQuarantined  = errors.New("eventstore: readiness quarantine")
+	ErrKeySourceUnavailable  = errors.New("eventstore: key source unavailable")
+	ErrKeyUnavailable        = errors.New("eventstore: encryption key unavailable")
+	ErrPluginKVNotFound      = errors.New("eventstore: plugin key not found")
 )
 
 // Clock is injected anywhere a contract allocates a timestamp.
@@ -109,15 +109,15 @@ func (UUIDGenerator) NewID() (string, error) {
 // is retained as the canonical storage scalar; OccurredAt is a convenience for
 // callers constructing events in Go.
 type Metadata struct {
-	EventID                string
-	CommandID              string
-	CorrelationID          string
-	CausationID            string
-	PrincipalID            string
-	Producer               string
-	OccurredAt             time.Time
-	OccurredAtUnixNanoUTC  int64
-	OccurredAtUnixNanoSet  bool
+	EventID               string
+	CommandID             string
+	CorrelationID         string
+	CausationID           string
+	PrincipalID           string
+	Producer              string
+	OccurredAt            time.Time
+	OccurredAtUnixNanoUTC int64
+	OccurredAtUnixNanoSet bool
 }
 
 // StreamID identifies one aggregate stream without importing an aggregate type.
@@ -350,19 +350,19 @@ type UnitOfWork struct {
 
 // CommitResult reports allocated event positions and participant versions.
 type CommitResult struct {
-	Events          []Envelope
-	StreamVersions  map[StreamID]uint64
-	OperationIDs    []string
-	InboxIDs        []string
-	EffectIDs       []string
-	ArtifactIDs     []string
-	SecretRefs      []string
-	PluginKVIndexes [][]byte
-	FenceKeys       [][]byte
-	Deduplicated    bool
-	Idempotent      bool
+	Events           []Envelope
+	StreamVersions   map[StreamID]uint64
+	OperationIDs     []string
+	InboxIDs         []string
+	EffectIDs        []string
+	ArtifactIDs      []string
+	SecretRefs       []string
+	PluginKVIndexes  [][]byte
+	FenceKeys        [][]byte
+	Deduplicated     bool
+	Idempotent       bool
 	OrderingSequence uint64
-	Version         uint64
+	Version          uint64
 }
 
 // Store is intentionally limited to aggregate event operations.
@@ -375,87 +375,93 @@ type Store interface {
 // OperationUpdate contains opaque/encrypted private context, never plaintext
 // credentials or message bodies.
 type OperationUpdate struct {
-	OperationID             string
-	ExpectedVersion         uint64
-	Version                 uint64
-	Kind                    string
-	Status                  string
-	PrincipalID             string
-	ResourceID              string
-	RequestID               string
-	CorrelationID           string
-	IdempotencyScope        string
-	IdempotencyKey          string
-	RequestDigest           []byte
-	ResultCode              string
-	ErrorCode               string
-	ArtifactID              string
+	OperationID              string
+	ExpectedVersion          uint64
+	Version                  uint64
+	Kind                     string
+	Status                   string
+	PrincipalID              string
+	ResourceID               string
+	RequestID                string
+	CorrelationID            string
+	IdempotencyScope         string
+	IdempotencyKey           string
+	RequestDigest            []byte
+	ResultCode               string
+	ErrorCode                string
+	ArtifactID               string
 	PrivateContextCiphertext []byte
-	PrivateContextNonce     []byte
-	EncryptionKeyID         string
-	CreatedAt               time.Time
-	UpdatedAt               time.Time
-	ExpiresAt               time.Time
+	PrivateContextNonce      []byte
+	EncryptionKeyID          string
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
+	ExpiresAt                time.Time
 }
 
 // InboxUpdate contains encrypted ingress data and durable state transitions.
 type InboxUpdate struct {
-	InboxID                string
-	ExpectedVersion        uint64
-	Version                uint64
-	EndpointID             string
-	ProviderEventKey       string
-	LaneHMAC               []byte
-	OrderingSequence       uint64
-	Status                 string
-	LeaseOwner             string
-	LeaseEpoch             uint64
-	LeaseExpiresAt         time.Time
-	AttemptID              string
-	PayloadCiphertext      []byte
-	PayloadNonce            []byte
-	ContentDigest           []byte
+	InboxID           string
+	ExpectedVersion   uint64
+	Version           uint64
+	EndpointID        string
+	ProviderEventKey  string
+	LaneHMAC          []byte
+	OrderingSequence  uint64
+	Status            string
+	LeaseOwner        string
+	LeaseEpoch        uint64
+	LeaseExpiresAt    time.Time
+	AttemptID         string
+	PayloadCiphertext []byte
+	PayloadNonce      []byte
+	ContentDigest     []byte
 	// DigestKeyID is the legacy payload-key field. New A6 callers should set
 	// PayloadEncryptionKeyID and ContentDigestKeyID separately.
-	DigestKeyID             string
-	PayloadEncryptionKeyID  string
-	ContentDigestKeyID      string
+	DigestKeyID            string
+	PayloadEncryptionKeyID string
+	ContentDigestKeyID     string
 	WorkflowID             string
 	CallbackStartedAt      time.Time
 	CompletedAt            time.Time
 	PayloadExpiresAt       time.Time
 	Resolution             string
-	PrincipalID             string
+	PrincipalID            string
 	Reason                 string
 	ResolutionAt           time.Time
+	// AllowExpiredDedupe permits a caller that owns an explicit bounded
+	// dedupe TTL to replace an expired inbox identity instead of treating the
+	// old row as a permanent duplicate. It is not persisted.
+	AllowExpiredDedupe bool
 }
+
 
 // NewEffect is an outbound intent; its payload must be encrypted by persistence.
 type NewEffect struct {
-	EffectID               string
-	ExpectedVersion        uint64
-	Version                uint64
-	EndpointID             string
-	LaneHMAC               []byte
-	OrderingSequence       uint64
-	EffectType             string
-	RiskClass              string
-	Status                 string
-	AttemptID              string
-	LeaseOwner             string
-	LeaseEpoch             uint64
-	LeaseExpiresAt         time.Time
-	DeadlineAt             time.Time
-	NextAttemptAt          time.Time
-	DispatchedAt           time.Time
-	PayloadCiphertext      []byte
-	PayloadNonce            []byte
-	ContentDigest           []byte
+	EffectID          string
+	ExpectedVersion   uint64
+	Version           uint64
+	EndpointID        string
+	LaneHMAC          []byte
+	OrderingSequence  uint64
+	EffectType        string
+	RiskClass         string
+	Status            string
+	AttemptID         string
+	LeaseOwner        string
+	LeaseEpoch        uint64
+	LeaseExpiresAt    time.Time
+	DeadlineAt        time.Time
+	NextAttemptAt     time.Time
+	DispatchedAt      time.Time
+	PayloadCiphertext []byte
+	PayloadNonce      []byte
+	PayloadVersion    uint64
+	ContentDigest     []byte
 	// DigestKeyID is the legacy payload-key field. New A6 callers should set
 	// PayloadEncryptionKeyID and ContentDigestKeyID separately.
-	DigestKeyID             string
-	PayloadEncryptionKeyID  string
-	ContentDigestKeyID      string
+	DigestKeyID            string
+	PayloadEncryptionKeyID string
+	ContentDigestKeyID     string
 	ProviderMessageID      string
 	ResultCode             string
 	ErrorCode              string
@@ -463,69 +469,70 @@ type NewEffect struct {
 	PayloadExpiresAt       time.Time
 	RetryCount             uint32
 	Resolution             string
-	PrincipalID             string
+	PrincipalID            string
 	Reason                 string
 	ResolutionAt           time.Time
 }
 
-// ArtifactUpdate represents encrypted, bounded operation output.
 type ArtifactUpdate struct {
-	ArtifactID             string
-	ExpectedVersion        uint64
-	Version                uint64
-	OperationID            string
-	OwnerPrincipalID       string
-	MediaType              string
-	SafeFilename            string
-	Size                   int64
-	Status                 string
-	Ciphertext             []byte
-	Nonce                  []byte
-	EncryptionKeyID        string
-	ExpiresAt               time.Time
-	ConsumedAt             time.Time
+	ArtifactID       string
+	ExpectedVersion  uint64
+	Version          uint64
+	OperationID      string
+	OwnerPrincipalID string
+	MediaType        string
+	SafeFilename     string
+	Size             int64
+	Status           string
+	Ciphertext       []byte
+	Nonce            []byte
+	EncryptionKeyID  string
+	Plaintext        []byte `json:"-"`
+	PlaintextSet     bool   `json:"-"`
+	ExpiresAt        time.Time
+	ConsumedAt       time.Time
 }
 
 // SecretUpdate references encrypted operational secret material.
 type SecretUpdate struct {
-	SecretRef              string
-	ExpectedVersion        uint64
-	Version                uint64
-	EndpointID             string
-	AdapterID              string
-	SecretVersion          uint64
-	Ciphertext             []byte
-	Nonce                  []byte
-	EncryptionKeyID        string
-	UpdatedAt              time.Time
+	SecretRef       string
+	ExpectedVersion uint64
+	Version         uint64
+	EndpointID      string
+	AdapterID       string
+	SecretVersion   uint64
+	Ciphertext      []byte
+	Nonce           []byte
+	EncryptionKeyID string
+	UpdatedAt       time.Time
 }
 
 // PluginKVUpdate is encrypted mutable plugin state indexed by a keyed digest.
 type PluginKVUpdate struct {
-	ExtensionID            string
-	KeyHMAC                []byte
-	ExpectedVersion        uint64
-	Version                uint64
-	KeyCiphertext          []byte
-	KeyNonce               []byte
-	ValueCiphertext        []byte
-	ValueNonce             []byte
-	EncryptionKeyID        string
-	ValueSize               int64
-	Deleted                 bool
-	UpdatedAt              time.Time
+	ExtensionID     string
+	KeyHMAC         []byte
+	ExpectedVersion uint64
+	Version         uint64
+	KeyCiphertext   []byte
+	KeyNonce        []byte
+	ValueCiphertext []byte
+	ValueNonce      []byte
+	EncryptionKeyID string
+	ValueSize       int64
+	Deleted         bool
+	UpdatedAt       time.Time
 }
 
 // SubjectFenceUpdate is a privacy-purge ingress fence keyed by HMAC identity.
 type SubjectFenceUpdate struct {
-	SubjectKey             []byte
-	Scope                  string
-	ExpectedVersion        uint64
-	Version                uint64
-	PurgeOperationID       string
-	CreatedAt              time.Time
-	ExpiresAt              time.Time
-	Deleted                 bool
+	SubjectKey       []byte
+	Scope            string
+	ExpectedVersion  uint64
+	Version          uint64
+	PurgeOperationID string
+	CreatedAt        time.Time
+	ExpiresAt        time.Time
+	Deleted          bool
 }
 
 // ValidateUnitOfWork performs pre-transaction validation and never includes
@@ -541,14 +548,20 @@ func ValidateUnitOfWork(work UnitOfWork) error {
 	eventCount := 0
 	var encodedBytes uint64
 	addBytes := func(n int) {
-		if n <= 0 || encodedBytes > MaxUnitOfWorkBytes { return }
+		if n <= 0 || encodedBytes > MaxUnitOfWorkBytes {
+			return
+		}
 		if uint64(n) > uint64(MaxUnitOfWorkBytes)-encodedBytes {
 			encodedBytes = uint64(MaxUnitOfWorkBytes) + 1
 			return
 		}
 		encodedBytes += uint64(n)
 	}
-	addFields := func(parts ...int) { for _, part := range parts { addBytes(part) } }
+	addFields := func(parts ...int) {
+		for _, part := range parts {
+			addBytes(part)
+		}
+	}
 	for _, append := range work.Streams {
 		if append.Stream.AggregateType == "" || append.Stream.AggregateID == "" {
 			return ErrInvalidEvent
@@ -586,7 +599,7 @@ func ValidateUnitOfWork(work UnitOfWork) error {
 		addFields(len(update.EffectID), len(update.EndpointID), len(update.LaneHMAC), len(update.EffectType), len(update.RiskClass), len(update.Status), len(update.LeaseOwner), len(update.AttemptID), len(update.PayloadCiphertext), len(update.PayloadNonce), len(update.ContentDigest), len(update.DigestKeyID), len(update.PayloadEncryptionKeyID), len(update.ContentDigestKeyID), len(update.ProviderMessageID), len(update.ResultCode), len(update.ErrorCode))
 	}
 	for _, update := range work.ArtifactUpdates {
-		addFields(len(update.ArtifactID), len(update.OperationID), len(update.OwnerPrincipalID), len(update.MediaType), len(update.SafeFilename), len(update.Ciphertext), len(update.Nonce), len(update.EncryptionKeyID))
+		addFields(len(update.ArtifactID), len(update.OperationID), len(update.OwnerPrincipalID), len(update.MediaType), len(update.SafeFilename), len(update.Ciphertext), len(update.Nonce), len(update.EncryptionKeyID), len(update.Plaintext))
 	}
 	for _, update := range work.SecretUpdates {
 		addFields(len(update.SecretRef), len(update.EndpointID), len(update.AdapterID), len(update.Ciphertext), len(update.Nonce), len(update.EncryptionKeyID))
@@ -601,24 +614,80 @@ func ValidateUnitOfWork(work UnitOfWork) error {
 		actual := int(encodedBytes)
 		return &OversizeError{Bound: "unit of work encoded bytes", Limit: MaxUnitOfWorkBytes, Actual: actual}
 	}
-	if err := validateParticipantKeys(work); err != nil { return err }
+	if err := validateParticipantKeys(work); err != nil {
+		return err
+	}
 	return nil
 }
 
 func validateParticipantKeys(work UnitOfWork) error {
 	seen := func() map[string]struct{} { return make(map[string]struct{}) }
-	check := func(m map[string]struct{}, key string) error { if _, ok := m[key]; ok { return ErrDuplicateParticipant }; m[key] = struct{}{}; return nil }
+	check := func(m map[string]struct{}, key string) error {
+		if _, ok := m[key]; ok {
+			return ErrDuplicateParticipant
+		}
+		m[key] = struct{}{}
+		return nil
+	}
 	type pair struct{ first, second string }
-	checkPair := func(m map[pair]struct{}, key pair) error { if _, ok := m[key]; ok { return ErrDuplicateParticipant }; m[key] = struct{}{}; return nil }
+	checkPair := func(m map[pair]struct{}, key pair) error {
+		if _, ok := m[key]; ok {
+			return ErrDuplicateParticipant
+		}
+		m[key] = struct{}{}
+		return nil
+	}
 	ops, arts, secrets, inbox, effects := seen(), seen(), seen(), seen(), seen()
 	plugins, fences := make(map[pair]struct{}), make(map[pair]struct{})
-	for _, v := range work.Operations { if v.OperationID != "" { if err:=check(ops,v.OperationID);err!=nil{return err} } }
-	for _, v := range work.ArtifactUpdates { if v.ArtifactID != "" { if err:=check(arts,v.ArtifactID);err!=nil{return err} } }
-	for _, v := range work.SecretUpdates { if v.SecretRef != "" { if err:=check(secrets,v.SecretRef);err!=nil{return err} } }
-	for _, v := range work.InboxUpdates { if v.InboxID != "" { if err:=check(inbox,v.InboxID);err!=nil{return err} } }
-	for _, v := range work.Effects { if v.EffectID != "" { if err:=check(effects,v.EffectID);err!=nil{return err} } }
-	for _, v := range work.PluginKVUpdates { if v.ExtensionID != "" && len(v.KeyHMAC)>0 { if err:=checkPair(plugins,pair{v.ExtensionID,string(v.KeyHMAC)});err!=nil{return err} } }
-	for _, v := range work.FenceUpdates { if len(v.SubjectKey)>0 && v.Scope != "" { if err:=checkPair(fences,pair{string(v.SubjectKey),v.Scope});err!=nil{return err} } }
+	for _, v := range work.Operations {
+		if v.OperationID != "" {
+			if err := check(ops, v.OperationID); err != nil {
+				return err
+			}
+		}
+	}
+	for _, v := range work.ArtifactUpdates {
+		if v.ArtifactID != "" {
+			if err := check(arts, v.ArtifactID); err != nil {
+				return err
+			}
+		}
+	}
+	for _, v := range work.SecretUpdates {
+		if v.SecretRef != "" {
+			if err := check(secrets, v.SecretRef); err != nil {
+				return err
+			}
+		}
+	}
+	for _, v := range work.InboxUpdates {
+		if v.InboxID != "" {
+			if err := check(inbox, v.InboxID); err != nil {
+				return err
+			}
+		}
+	}
+	for _, v := range work.Effects {
+		if v.EffectID != "" {
+			if err := check(effects, v.EffectID); err != nil {
+				return err
+			}
+		}
+	}
+	for _, v := range work.PluginKVUpdates {
+		if v.ExtensionID != "" && len(v.KeyHMAC) > 0 {
+			if err := checkPair(plugins, pair{v.ExtensionID, string(v.KeyHMAC)}); err != nil {
+				return err
+			}
+		}
+	}
+	for _, v := range work.FenceUpdates {
+		if len(v.SubjectKey) > 0 && v.Scope != "" {
+			if err := checkPair(fences, pair{string(v.SubjectKey), v.Scope}); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -642,68 +711,87 @@ type StreamConflict struct {
 }
 
 type InboxResolutionRequest struct {
-	InboxID string
+	InboxID         string
 	ExpectedVersion uint64
-	Resolution string
-	PrincipalID string
-	Reason string
+	Resolution      string
+	PrincipalID     string
+	Reason          string
 }
 type OutboxRenewRequest struct {
-	EffectID string
-	WorkerID string
-	LeaseEpoch uint64
-	AttemptID string
+	EffectID      string
+	WorkerID      string
+	LeaseEpoch    uint64
+	AttemptID     string
 	LeaseDuration time.Duration
 }
 type OutboxDispatchRequest struct {
-	EffectID string
-	WorkerID string
+	EffectID   string
+	WorkerID   string
 	LeaseEpoch uint64
-	AttemptID string
+	AttemptID  string
+}
+type OutboxPreDispatchRequeueRequest struct {
+	EffectID      string
+	WorkerID      string
+	LeaseEpoch    uint64
+	AttemptID     string
+	RetryCount    uint32
+	NextAttemptAt time.Time
 }
 type OutboxCompletionRequest struct {
-	EffectID string
-	WorkerID string
-	LeaseEpoch uint64
-	AttemptID string
-	Status string
-	ResultCode string
-	ErrorCode string
+	EffectID          string
+	WorkerID          string
+	LeaseEpoch        uint64
+	AttemptID         string
+	Status            string
+	ResultCode        string
+	ErrorCode         string
 	ProviderMessageID string
 }
 type OutboxResolutionRequest struct {
-	EffectID string
+	EffectID        string
 	ExpectedVersion uint64
-	Resolution string
-	PrincipalID string
-	Reason string
+	Resolution      string
+	PrincipalID     string
+	Reason          string
+}
+// OutboxQuarantineRequest settles a dispatcher-owned lease after a durable
+// validation or persistence failure. Implementations must CAS all lease fields.
+type OutboxQuarantineRequest struct {
+	EffectID        string
+	ExpectedVersion uint64
+	WorkerID        string
+	LeaseEpoch      uint64
+	AttemptID       string
+	ErrorCode       string
+	Reason          string
 }
 type ArtifactPutRequest struct {
-	ArtifactID string
-	OperationID string
+	ArtifactID       string
+	OperationID      string
 	OwnerPrincipalID string
-	MediaType string
-	SafeFilename string
-	Plaintext []byte
-	TTL time.Duration
+	MediaType        string
+	SafeFilename     string
+	Plaintext        []byte
+	TTL              time.Duration
 }
 type ArtifactPutResult struct {
 	ArtifactID string
-	Version uint64
-	Size int64
-	ExpiresAt time.Time
+	Version    uint64
+	Size       int64
+	ExpiresAt  time.Time
 }
-type ArtifactConsumeRequest struct { ArtifactID string }
+type ArtifactConsumeRequest struct{ ArtifactID string }
 type ArtifactResult struct {
-	ArtifactID string
-	OperationID string
+	ArtifactID       string
+	OperationID      string
 	OwnerPrincipalID string
-	MediaType string
-	SafeFilename string
-	Size int64
-	Plaintext []byte
-	ExpiresAt time.Time
-	ConsumedAt time.Time
+	MediaType        string
+	SafeFilename     string
+	Size             int64
+	Plaintext        []byte
+	ExpiresAt        time.Time
+	ConsumedAt       time.Time
 }
 type PayloadCodec interface {
 	Encrypt(context.Context, []byte) ([]byte, []byte, string, error)
@@ -712,43 +800,54 @@ type PayloadCodec interface {
 type ArtifactCodec = PayloadCodec
 
 // ConflictError carries only stream identities and versions, never event data.
-type ConflictError struct { Conflicts []StreamConflict }
+type ConflictError struct{ Conflicts []StreamConflict }
 
 func (e *ConflictError) Error() string { return ErrConflict.Error() }
 func (e *ConflictError) Unwrap() error { return ErrConflict }
 
 // InboxClaimRequest and InboxLease are domain-neutral lease contracts.
-type InboxClaimRequest struct { WorkerID string; LeaseDuration time.Duration }
-type InboxLease struct { Update InboxUpdate }
+type InboxClaimRequest struct {
+	WorkerID      string
+	LeaseDuration time.Duration
+}
+type InboxLease struct{ Update InboxUpdate }
 
-type OutboxClaimRequest struct { WorkerID string; LeaseDuration time.Duration }
-type OutboxLease struct { Effect NewEffect }
+type OutboxClaimRequest struct {
+	WorkerID      string
+	LeaseDuration time.Duration
+}
+type OutboxLease struct{ Effect NewEffect }
 
 // OperationView excludes private encrypted context.
 type OperationView struct {
-	OperationID string
-	Version     uint64
-	Kind        string
-	Status      string
-	ResultCode  string
-	ErrorCode   string
-	ArtifactID string
-	CreatedAt time.Time
-	UpdatedAt time.Time
-	ExpiresAt time.Time
+	OperationID      string
+	Version          uint64
+	Kind             string
+	Status           string
+	ResultCode       string
+	ErrorCode        string
+	ArtifactID       string
+	ResourceID       string
+	IdempotencyScope string
+	IdempotencyKey   string
+	RequestID        string
+	RequestDigest    []byte
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	ExpiresAt        time.Time
 }
 type Readiness struct {
-	Mode                  string
-	SchemaVersion         uint32
-	DatabaseIdentity      string
-	IndexRootID           string
-	IndexRootFingerprint  []byte
-	EncryptionRootIDs     []string
-	SourceManifestDigest  []byte
-	TargetManifestDigest  []byte
-	TerminalGlobalPosition uint64
+	Mode                       string
+	SchemaVersion              uint32
+	DatabaseIdentity           string
+	IndexRootID                string
+	IndexRootFingerprint       []byte
+	EncryptionRootIDs          []string
+	SourceManifestDigest       []byte
+	TargetManifestDigest       []byte
+	TerminalGlobalPosition     uint64
 	TerminalProjectionPosition uint64
-	CompletedAt            time.Time
+	CompletedAt                time.Time
 }
 
 type EncryptionRoot struct {
@@ -795,16 +894,31 @@ type PluginKVListRequest struct {
 }
 
 type EncryptionRotationResult struct {
-	Updated int
-	Skipped int
+	Updated       int
+	Skipped       int
 	CurrentRootID string
 }
 
-type RebuildRequest struct { ProjectorVersion string }
-type RebuildResult struct { GenerationID string; TerminalPosition uint64; Digest EventChecksum }
-type PrivacyPurgeRequest struct { OperationID string; Scope string; AllowActive bool }
-type PrivacyPurgeResult struct { OperationID string; Deleted int64 }
-type SecretResolution struct { SecretRef string; SecretVersion uint64; Plaintext []byte }
+type RebuildRequest struct{ ProjectorVersion string }
+type RebuildResult struct {
+	GenerationID     string
+	TerminalPosition uint64
+	Digest           EventChecksum
+}
+type PrivacyPurgeRequest struct {
+	OperationID string
+	Scope       string
+	AllowActive bool
+}
+type PrivacyPurgeResult struct {
+	OperationID string
+	Deleted     int64
+}
+type SecretResolution struct {
+	SecretRef     string
+	SecretVersion uint64
+	Plaintext     []byte
+}
 
 // Separate narrow repository contracts deliberately keep Store aggregate-only.
 type InboxRepository interface {
@@ -817,10 +931,14 @@ type OutboxRepository interface {
 	AcceptOutbox(context.Context, NewEffect) (CommitResult, error)
 	ClaimOutbox(context.Context, OutboxClaimRequest) (OutboxLease, error)
 	UpdateOutbox(context.Context, NewEffect) (CommitResult, error)
+	RequeuePreDispatch(context.Context, OutboxPreDispatchRequeueRequest) (CommitResult, error)
 	RenewOutbox(context.Context, OutboxRenewRequest) (OutboxLease, error)
 	MarkOutboxDispatched(context.Context, OutboxDispatchRequest) (OutboxLease, error)
 	CompleteOutbox(context.Context, OutboxCompletionRequest) (CommitResult, error)
 	ResolveOutbox(context.Context, OutboxResolutionRequest) (CommitResult, error)
+}
+type OutboxQuarantineRepository interface {
+	QuarantineOutbox(context.Context, OutboxQuarantineRequest) (CommitResult, error)
 }
 type ArtifactRepository interface {
 	PutArtifact(context.Context, ArtifactPutRequest) (ArtifactPutResult, error)
