@@ -113,3 +113,15 @@ func TestTransportMessageIsBoundBeforeCopy(t *testing.T) {
 		t.Fatalf("oversized message entered queue: %d", len(wrapper.eventQueue))
 	}
 }
+
+func TestConnectReadySignalIsIdempotentAcrossReconnects(t *testing.T) {
+	manager := NewSocketInstance()
+	wrapper := newClientWrapper(manager, "ws://127.0.0.1", ClientOptions{})
+	wrapper.markConnectedReady()
+	wrapper.markConnectedReady()
+	select {
+	case <-wrapper.connectReady:
+	default:
+		t.Fatal("connect readiness was not signaled")
+	}
+}

@@ -81,6 +81,7 @@ type onebotRuntime struct {
 	inboundBackpressure atomic.Uint64
 	inboundCollisions atomic.Uint64
 	inboundRetries atomic.Uint64
+	transportDropped atomic.Uint64
 }
 type onebotRuntimeEvent struct {
 	kind string
@@ -125,6 +126,7 @@ func (r *onebotRuntime) completeConnection(conn *socketio.WebsocketWrapper) {
 	r.connectionMu.Lock()
 	if done, ok := r.connections[conn]; ok {
 		delete(r.connections, conn)
+		r.transportDropped.Add(conn.DroppedEventCount())
 		close(done)
 	}
 	r.connectionMu.Unlock()
@@ -421,7 +423,7 @@ func (r *onebotRuntime) Diagnostics(context.Context) adapterapi.DiagnosticReport
 	if r == nil {
 		return adapterapi.DiagnosticReport{}
 	}
-	dropped := uint64(0)
+	dropped := r.transportDropped.Load()
 	r.connectionMu.Lock()
 	for wrapper := range r.connections {
 		if wrapper != nil {

@@ -429,7 +429,8 @@ type WebsocketWrapper struct {
 	eventWG       sync.WaitGroup
 	// connectReady is a one-shot readiness gate. It remains closed after the
 	// first successful connection so reconnects cannot strand an existing drain.
-	connectReady chan struct{}
+	connectReady     chan struct{}
+	connectReadyOnce sync.Once
 
 	OnConnected    func()
 	OnDisconnected func(err error)
@@ -595,6 +596,12 @@ func (kws *WebsocketWrapper) enqueueEvent(event eventEnvelope) {
 	go kws.drainEvents()
 }
 
+
+func (kws *WebsocketWrapper) markConnectedReady() {
+	kws.connectReadyOnce.Do(func() {
+		close(kws.connectReady)
+	})
+}
 func (kws *WebsocketWrapper) DroppedEventCount() uint64 {
 	if kws == nil { return 0 }
 	return kws.droppedEvents.Load()
@@ -1107,7 +1114,7 @@ func (h *transportHandler) OnOpen(socket *gws.Conn) {
 		close(h.opened)
 		h.opened = nil
 	}
-	close(wrapper.connectReady)
+	wrapper.markConnectedReady()
 	wrapper.dispatchEvent(EventConnect, nil, nil)
 }
 

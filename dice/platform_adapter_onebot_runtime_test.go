@@ -416,3 +416,18 @@ func TestOnebotRuntimeDiagnosticsExposeIngressCounters(t *testing.T) {
 		t.Fatalf("missing diagnostics = %#v", want)
 	}
 }
+
+func TestOnebotRuntimeDiagnosticsRetainCompletedTransportDrops(t *testing.T) {
+	runtime := newOnebotRuntime(OnebotConfig{}, nil)
+	runtime.transportDropped.Store(3)
+	report := runtime.Diagnostics(context.Background())
+	for _, entry := range report.Entries {
+		if entry.Code == "transport.dropped_events" {
+			if entry.Message != "Transport callback events dropped at queue admission: 3" {
+				t.Fatalf("transport drop diagnostic = %q", entry.Message)
+			}
+			return
+		}
+	}
+	t.Fatal("missing transport drop diagnostic")
+}

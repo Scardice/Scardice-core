@@ -222,4 +222,19 @@ ok   github.com/PaienNate/pineutil/evsocket/v2
 go test ./dice ./core/messageflow -run 'Test(InboundService(FallbackDuplicateAndCollision|NoIDNoTimeUsesContentDigestIdentity)|OnebotRuntime(InboundRetryIsBounded|DiagnosticsExposeIngressCounters|InboundQueueBackpressureIsNonBlocking|KeepsAliveOnRetryableInboundError)|OnebotInbound)' -count=1
 ok   Scardice-core/dice
 ok   Scardice-core/core/messageflow
+
+## Round 7 fixes
+
+- The one-shot readiness gate is now guarded by `sync.Once`; repeated successful `OnOpen` calls during reconnect cannot panic while the drain remains released.
+- Runtime diagnostics retain completed wrapper drop counts in a cumulative counter before connection deletion, then add active wrapper counts for the current snapshot.
+- The pre-existing EventConnect/disconnect ordering behavior is outside this Task1 bounded-ingress seam and was not broadened; this round only hardens reconnect readiness and historical diagnostics.
+
+### Round 7 GREEN evidence
+
+```text
+go test ./evsocket/v2 -run 'Test(ConnectReadySignalIsIdempotentAcrossReconnects|WrapperEventQueueIsBounded|TransportMessageIsBoundBeforeCopy)' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+
+go test ./dice -run 'TestOnebotRuntimeDiagnostics(RetainCompletedTransportDrops|ExposeIngressCounters)' -count=1
+ok   Scardice-core/dice
 ```
