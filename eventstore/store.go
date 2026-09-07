@@ -109,6 +109,7 @@ type GORMStore struct {
 	ids IDGenerator
 	codec any
 	keySource KeySource
+	freshInitialized bool
 }
 func NewStore(database *Database, options ...StoreOption) *GORMStore {
 	s := &GORMStore{db: database, clock: SystemClock{}, ids: UUIDGenerator{}}

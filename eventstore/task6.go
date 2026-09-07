@@ -442,7 +442,7 @@ func (s *GORMStore) validateReadinessOnDB(ctx context.Context, db *gorm.DB, allo
 	if err != nil {
 		return ErrReadinessQuarantined
 	}
-	if r.IndexRootID == "unconfigured" || !allowFreshNonempty && r.Mode == "fresh" && nonempty {
+	if r.IndexRootID == "unconfigured" || !allowFreshNonempty && !s.freshWasInitialized() && r.Mode == "fresh" && nonempty {
 		return ErrReadinessQuarantined
 	}
 	var control projectionControlRow
@@ -934,6 +934,7 @@ func (s *GORMStore) initializeA6Readiness(ctx context.Context) error {
 		indexID, _, indexErr := keySourceIndex(ctx, s.keySource)
 		if indexErr != nil {
 			return ErrKeySourceUnavailable
+
 		}
 		current, currentErr := keySourceCurrent(ctx, s.keySource)
 		if currentErr != nil {
@@ -946,12 +947,34 @@ func (s *GORMStore) initializeA6Readiness(ctx context.Context) error {
 		if identity == "" {
 			identity = "eventstore"
 		}
-		return s.SetReadiness(ctx, Readiness{
+		if err := s.SetReadiness(ctx, Readiness{
 			Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: identity,
 			IndexRootID: indexID, EncryptionRootIDs: []string{current.ID},
-		})
+		}); err != nil {
+			return err
+		}
+		s.markFreshInitialized()
+		return nil
 	}
 	return s.ValidateReadiness(ctx)
+}
+func (s *GORMStore) markFreshInitialized() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.freshInitialized = true
+	s.mu.Unlock()
+}
+
+func (s *GORMStore) freshWasInitialized() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	initialized := s.freshInitialized
+	s.mu.RUnlock()
+	return initialized
 }
 func (s *GORMStore) requireReady(ctx context.Context) error {
 	if s == nil {
@@ -1089,6 +1112,9 @@ func (s *GORMStore) SetReadiness(ctx context.Context, r Readiness) error {
 	}
 	if err = tx.Commit().Error; err != nil {
 		return ErrReadinessInvalid
+	}
+	if r.Mode == "fresh" {
+		s.markFreshInitialized()
 	}
 	s.clearInitializationError()
 	return nil

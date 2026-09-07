@@ -454,6 +454,22 @@ func TestReadinessPinAndRootAvailability(t *testing.T) {
 		t.Fatalf("changed pin write err=%v", err)
 	}
 }
+
+func TestA6FreshInitializationAllowsSubsequentCommit(t *testing.T) {
+	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "fresh-commit.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	source := task6Source()
+	store := NewStore(db, WithKeySource(source))
+	ctx := context.Background()
+	for _, operationID := range []string{"fresh-operation-1", "fresh-operation-2"} {
+		if _, err := store.Commit(ctx, UnitOfWork{Operations: []OperationUpdate{{OperationID: operationID}}}); err != nil {
+			t.Fatalf("fresh commit %s err=%v", operationID, err)
+		}
+	}
+}
 func TestReadinessRequiresCurrentEncryptionRoot(t *testing.T) {
 	store, db, source := task6Store(t)
 	defer db.Close()
