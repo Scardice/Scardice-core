@@ -428,6 +428,15 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 			return CommitResult{}, errors.New("eventstore: update projection control failed")
 		}
 	}
+	if readiness.Mode == "import" && len(result.Events) > 0 {
+		latest := result.Events[len(result.Events)-1].GlobalPosition
+		if err = tx.Model(&storeReadinessRow{}).Where("singleton_id = ?", "default").Updates(map[string]any{
+			"terminal_global_position": latest,
+			"terminal_projection_position": control.TerminalPosition,
+		}).Error; err != nil {
+			return CommitResult{}, errors.New("eventstore: advance readiness terminals failed")
+		}
+	}
 	for _, hook := range participants {
 		if hookErr := hook(ctx, tx, work); hookErr != nil { return CommitResult{}, ErrParticipantFailure }
 	}

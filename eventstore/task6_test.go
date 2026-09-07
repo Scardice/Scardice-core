@@ -711,6 +711,28 @@ func TestReadinessRejectsTamperedValidFreshMode(t *testing.T) {
 		t.Fatalf("tampered valid fresh readiness err=%v", err)
 	}
 }
+
+func TestImportReadinessAdvancesWithEventCommit(t *testing.T) {
+	store, db, _ := task6Store(t)
+	defer db.Close()
+	event := NewEvent{EventType: "import.event", SchemaVersion: 1, Payload: []byte(`{}`), Metadata: Metadata{EventID: "import-event-1", CommandID: "import-command-1", CorrelationID: "import-correlation-1", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}}
+	if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{AggregateType: "import", AggregateID: "1"}, Events: []NewEvent{event}}}}); err != nil {
+		t.Fatal(err)
+	}
+	readiness, err := store.GetReadiness(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readiness.TerminalGlobalPosition == 0 || readiness.TerminalProjectionPosition == 0 {
+		t.Fatalf("import readiness terminals not advanced: %#v", readiness)
+	}
+	if err := store.ValidateReadiness(context.Background()); err != nil {
+		t.Fatalf("import readiness after event commit err=%v", err)
+	}
+	if _, err := store.Commit(context.Background(), UnitOfWork{Operations: []OperationUpdate{{OperationID: "import-followup"}}}); err != nil {
+		t.Fatalf("follow-up participant commit err=%v", err)
+	}
+}
 func TestA6StartupReadinessGate(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "startup-gate.db")
