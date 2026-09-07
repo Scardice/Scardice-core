@@ -970,6 +970,9 @@ func (s *GORMStore) PutSecret(ctx context.Context, req SecretPutRequest) (Secret
 	if req.ExpectedVersion != 0 && req.ExpectedVersion != current {
 		return SecretResolution{}, ErrParticipantConflict
 	}
+	if current > 0 && (req.EndpointID != latest.EndpointID || req.AdapterID != latest.AdapterID) {
+		return SecretResolution{}, ErrInvalidMetadata
+	}
 	version := req.SecretVersion
 	if version == 0 {
 		version = 1

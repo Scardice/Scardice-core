@@ -87,6 +87,12 @@ func TestSecretHistoryAndWrongKey(t *testing.T) {
 	second, err := store.PutSecret(ctx, SecretPutRequest{SecretRef: "secret-ref", EndpointID: "endpoint", AdapterID: "adapter", ExpectedVersion: 1, Plaintext: []byte("two")})
 	if err != nil { t.Fatal(err) }
 	if first.SecretVersion != 1 || second.SecretVersion != 2 { t.Fatalf("secret versions=%d,%d", first.SecretVersion, second.SecretVersion) }
+	if _, err := store.PutSecret(ctx, SecretPutRequest{SecretRef: "secret-ref", EndpointID: "other-endpoint", AdapterID: "adapter", ExpectedVersion: 2, Plaintext: []byte("rebind")}); !errors.Is(err, ErrInvalidMetadata) {
+		t.Fatalf("secret endpoint rebind err=%v", err)
+	}
+	if _, err := store.PutSecret(ctx, SecretPutRequest{SecretRef: "secret-ref", EndpointID: "endpoint", AdapterID: "other-adapter", ExpectedVersion: 2, Plaintext: []byte("rebind")}); !errors.Is(err, ErrInvalidMetadata) {
+		t.Fatalf("secret adapter rebind err=%v", err)
+	}
 	resolved, err := store.ResolveSecret(ctx, "secret-ref", 1)
 	if err != nil || string(resolved.Plaintext) != "one" { t.Fatalf("resolve v1=%q err=%v", resolved.Plaintext, err) }
 	var row adapterSecretRow
