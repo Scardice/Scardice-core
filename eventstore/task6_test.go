@@ -12,6 +12,7 @@ import (
 	"testing"
 	"sync"
 	"time"
+	"gorm.io/gorm"
 )
 
 type MemoryKeySource struct {
@@ -751,6 +752,34 @@ func TestA6StartupReadinessGate(t *testing.T) {
 		t.Fatalf("startup readiness gate err=%v", err)
 	}
 }
+func TestA6StartupRejectsMalformedUnconfiguredReadiness(t *testing.T) {
+	ctx := context.Background()
+	db, err := OpenDatabase(ctx, DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "malformed-readiness.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.GORM().Model(&storeReadinessRow{}).Where("singleton_id = ?", "default").Update("schema_version", "2").Error; err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(db, WithKeySource(task6Source()))
+	if _, err := store.Commit(ctx, UnitOfWork{Operations: []OperationUpdate{{OperationID: "malformed-readiness-op"}}}); !errors.Is(err, ErrReadinessInvalid) {
+		t.Fatalf("malformed unconfigured readiness err=%v", err)
+	}
+}
+
+func TestA6ReadinessBootstrapPreservesProjectorInitError(t *testing.T) {
+	ctx := context.Background()
+	db, err := OpenDatabase(ctx, DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "projector-readiness.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := NewStore(db, WithProjection(ProjectionDescriptor{Name: " ", Version: "v1", Apply: func(context.Context, *gorm.DB, []Envelope) error { return nil }}), WithKeySource(task6Source()))
+	if _, err := store.Commit(ctx, UnitOfWork{Operations: []OperationUpdate{{OperationID: "projector-readiness-op"}}}); !errors.Is(err, ErrInvalidProjector) {
+		t.Fatalf("projector init error was cleared: %v", err)
+	}
+}
 
 func TestRemoteDatabaseRequiresExternalKeySource(t *testing.T) {
 	_, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "postgres", DSN: "postgres://invalid.invalid/eventstore"})
@@ -1455,4 +1484,24 @@ func itemKeyHMAC(t *testing.T, source KeySource, extension, key string) []byte {
 		t.Fatal(err)
 	}
 	return index
+}
+
+func TestSecretVersionOverflowFailsBeforeAuthenticationAndSeal(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	now := time.Now().UTC()
+	row := adapterSecretRow{
+		SecretRef: "overflow-secret", SecretVersion: uint64(^uint64(0) >> 1), EndpointID: "endpoint", AdapterID: "adapter",
+		AdapterType: "opaque", Ciphertext: []byte{1}, Nonce: make([]byte, 12), EncryptionKeyID: source.CurrentID,
+		RowVersion: uint64(^uint64(0) >> 1), CreatedAt: now, UpdatedAt: now,
+	}
+	if err := db.GORM().Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(context.Background(), UnitOfWork{SecretUpdates: []SecretUpdate{{SecretRef: row.SecretRef}}}); !errors.Is(err, ErrVersionExhausted) {
+		t.Fatalf("UoW secret version overflow err=%v", err)
+	}
+	if _, err := store.PutSecret(context.Background(), SecretPutRequest{SecretRef: row.SecretRef, EndpointID: row.EndpointID, AdapterID: row.AdapterID, Plaintext: []byte("value")}); !errors.Is(err, ErrVersionExhausted) {
+		t.Fatalf("public secret version overflow err=%v", err)
+	}
 }

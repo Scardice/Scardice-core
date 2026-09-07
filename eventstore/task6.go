@@ -816,6 +816,9 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		if !existing && !errors.Is(query.Error, gorm.ErrRecordNotFound) {
 			return ErrParticipantFailure
 		}
+		if existing && (latest.RowVersion >= maxPersistedVersion || latest.SecretVersion >= maxPersistedVersion) {
+			return ErrVersionExhausted
+		}
 		endpoint, adapter := update.EndpointID, update.AdapterID
 		secretVersion := update.SecretVersion
 		allCipher := len(update.Ciphertext) > 0 && len(update.Nonce) > 0 && update.EncryptionKeyID != ""
@@ -846,6 +849,9 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 			if secretVersion == 0 {
 				secretVersion = 1
 			}
+		}
+		if secretVersion >= maxPersistedVersion {
+			return ErrVersionExhausted
 		}
 		if secretVersion == 0 || update.EncryptionKeyID == "" && !existing {
 			return ErrInvalidMetadata
@@ -912,7 +918,7 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		version := uint64(1)
 		query := db.WithContext(ctx).Where("extension_id = ? AND key_hmac = ?", update.ExtensionID, update.KeyHMAC).First(&existing)
 		if query.Error == nil {
-			if existing.RowVersion >= uint64(^uint64(0)>>1) {
+			if existing.RowVersion >= maxPersistedVersion {
 				return ErrVersionExhausted
 			}
 			next, nextErr := nextVersion(existing.RowVersion)
@@ -958,18 +964,26 @@ func (s *GORMStore) initializeA6Readiness(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	canonical := r.Mode == "fresh" && r.SchemaVersion == 1 && r.DatabaseIdentity == "eventstore" &&
+		r.IndexRootID == "unconfigured" && len(r.IndexRootFingerprint) == 0 && len(r.EncryptionRootIDs) == 0 &&
+		len(r.SourceManifestDigest) == 0 && len(r.TargetManifestDigest) == 0 &&
+		r.TerminalGlobalPosition == 0 && r.TerminalProjectionPosition == 0 && r.CompletedAt.IsZero()
+	if !canonical {
+		if err := validateReadinessValue(r); err != nil {
+			return err
+		}
+	}
 	nonempty, err := readinessDatabaseNonEmpty(ctx, s.db.GORM())
 	if err != nil {
 		return ErrReadinessQuarantined
 	}
-	if r.IndexRootID == "" || r.IndexRootID == "unconfigured" {
+	if canonical {
 		if nonempty {
 			return ErrReadinessQuarantined
 		}
 		indexID, _, indexErr := keySourceIndex(ctx, s.keySource)
 		if indexErr != nil {
 			return ErrKeySourceUnavailable
-
 		}
 		current, currentErr := keySourceCurrent(ctx, s.keySource)
 		if currentErr != nil {
@@ -978,9 +992,6 @@ func (s *GORMStore) initializeA6Readiness(ctx context.Context) error {
 		identity := r.DatabaseIdentity
 		if configured := strings.TrimSpace(s.db.databaseIdentity); configured != "" {
 			identity = configured
-		}
-		if identity == "" {
-			identity = "eventstore"
 		}
 		if err := s.SetReadiness(ctx, Readiness{
 			Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: identity,
@@ -1171,7 +1182,7 @@ func (s *GORMStore) SetReadiness(ctx context.Context, r Readiness) error {
 	} else {
 		s.clearFreshInitialized()
 	}
-	s.clearInitializationError()
+	s.clearReadinessError()
 	return nil
 }
 
@@ -1202,6 +1213,9 @@ func (s *GORMStore) PutSecret(ctx context.Context, req SecretPutRequest) (Secret
 	query := locked(tx).Where("secret_ref = ?", req.SecretRef).Order("row_version DESC").First(&latest)
 	if query.Error == nil {
 		current = latest.RowVersion
+		if current >= maxPersistedVersion || latest.SecretVersion >= maxPersistedVersion {
+			return SecretResolution{}, ErrVersionExhausted
+		}
 	} else if !errors.Is(query.Error, gorm.ErrRecordNotFound) {
 		return SecretResolution{}, ErrParticipantFailure
 	}
@@ -1223,6 +1237,9 @@ func (s *GORMStore) PutSecret(ctx context.Context, req SecretPutRequest) (Secret
 		}
 	} else if current > 0 && version <= latest.SecretVersion {
 		return SecretResolution{}, ErrParticipantConflict
+	}
+	if version >= maxPersistedVersion {
+		return SecretResolution{}, ErrVersionExhausted
 	}
 	root, err := s.admittedCurrentRoot(ctx, tx)
 	if err != nil {

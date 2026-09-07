@@ -102,6 +102,7 @@ type GORMStore struct {
 	mu sync.RWMutex
 	projectorMu sync.RWMutex
 	initErr error
+	readinessErr error
 	projectors []ProjectionDescriptor
 	participants []ParticipantHook
 	lockObserver func(string)
@@ -125,7 +126,7 @@ func NewStore(database *Database, options ...StoreOption) *GORMStore {
 		}
 	}
 	if s.keySource != nil {
-		s.recordInitError(s.initializeA6Readiness(context.Background()))
+		s.recordReadinessError(s.initializeA6Readiness(context.Background()))
 	}
 	return s
 }
@@ -162,6 +163,24 @@ func (s *GORMStore) recordInitError(err error) {
 	}
 	s.mu.Unlock()
 }
+func (s *GORMStore) recordReadinessError(err error) {
+	if s == nil || err == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.readinessErr == nil {
+		s.readinessErr = err
+	}
+	s.mu.Unlock()
+}
+func (s *GORMStore) clearReadinessError() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.readinessErr = nil
+	s.mu.Unlock()
+}
 func (s *GORMStore) clearInitializationError() {
 	if s == nil {
 		return
@@ -170,16 +189,17 @@ func (s *GORMStore) clearInitializationError() {
 	s.initErr = nil
 	s.mu.Unlock()
 }
-
-
 func (s *GORMStore) initializationError() error {
 	if s == nil {
 		return nil
 	}
 	s.mu.RLock()
-	err := s.initErr
+	initErr, readinessErr := s.initErr, s.readinessErr
 	s.mu.RUnlock()
-	return err
+	if initErr != nil {
+		return initErr
+	}
+	return readinessErr
 }
 
 func (s *GORMStore) RegisterProjection(descriptor ProjectionDescriptor) error {
@@ -591,9 +611,12 @@ func (s *GORMStore) Purge(ctx context.Context, req PrivacyPurgeRequest) (Privacy
 
 func (s *GORMStore) Close() error { if s == nil || s.db == nil { return nil }; return s.db.Close() }
 const maxUint64 = ^uint64(0)
+const maxPersistedVersion = uint64(^uint64(0) >> 1)
 
 func nextVersion(current uint64) (uint64, error) {
-	if current == maxUint64 { return 0, ErrVersionExhausted }
+	if current == maxUint64 {
+		return 0, ErrVersionExhausted
+	}
 	return current + 1, nil
 }
 
