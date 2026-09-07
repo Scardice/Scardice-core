@@ -18,7 +18,7 @@ Secret rows preserve `(secret_ref, secret_version)` history and CAS row versions
 
 
 ## TDD evidence
-Focused tests cover AES-GCM round trips and wrong-AAD authentication failure, an independently computed HMAC vector, non-plaintext SQL storage, immutable secret versions and wrong-key failure, direct wrong-key UoW rejection, plugin extension isolation/prefix listing/max ciphertext bounds, readiness index-root pin and non-empty rejection, remote key-source requirement, Unix key-file current-root/security checks, row-bound artifact swap rejection, and root rotation preserving secret/plugin readability. Existing Task5 tests remain green.
+Focused tests cover AES-GCM round trips and wrong-AAD authentication failure, an independently computed HMAC vector, non-plaintext SQL storage, immutable secret versions and wrong-key failure, direct wrong-key UoW rejection, valid row-bound artifact UoW writes, plugin extension isolation/prefix listing/max ciphertext bounds, readiness index-root pin and non-empty rejection, remote key-source requirement, Unix key-file current-root/security checks, row-bound artifact swap rejection, and root rotation preserving secret/plugin readability. Existing Task5 tests remain green.
 
 ## Verification
 
