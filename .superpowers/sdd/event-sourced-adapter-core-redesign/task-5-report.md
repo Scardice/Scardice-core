@@ -266,4 +266,21 @@ ok  	Scardice-core/eventstore	6.182s
 ```
 
 Thirtieth-round implementation and regression coverage: `7107e4c6`.
+
+Thirty-first-round source commit `d53a0b97` extends persisted-width fences to lane-head `next_sequence`, inbox/outbox lease epochs, and public/UoW mismatched secret-version increments. These counters now return `ErrVersionExhausted` before arithmetic wrap or persistence, using the shared `maxPersistedVersion` contract. `TestTask5PersistedVersionWidthOverflowFailsClosed` covers outbox row version, inbox lease epoch, and lane sequence boundaries.
+
+Additional verification after `d53a0b97`:
+
+```text
+go test ./eventstore -run 'TestTask5PersistedVersionWidthOverflowFailsClosed' -count=1
+ok  	Scardice-core/eventstore	0.014s
+
+go test ./eventstore -count=1
+ok  	Scardice-core/eventstore	1.626s
+
+go test -race ./eventstore -count=1
+ok  	Scardice-core/eventstore	6.347s
+```
+
+Thirty-first-round implementation and regression coverage: `d53a0b97`.
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
