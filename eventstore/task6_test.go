@@ -244,6 +244,21 @@ func TestA6ArtifactAADBindsRowIdentity(t *testing.T) {
 		t.Fatalf("swapped artifact err=%v", err)
 	}
 }
+func TestA6ArtifactUoWBoundCiphertext(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := store.Commit(ctx, UnitOfWork{Operations: []OperationUpdate{{OperationID: "artifact-uow-op", PrincipalID: "artifact-uow-owner"}}}); err != nil {
+		t.Fatal(err)
+	}
+	ciphertext, nonce, keyID, err := a6Seal(ctx, source, "artifact/v1", "artifact-uow", "artifact-uow-owner", 1, []byte("payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{ArtifactUpdates: []ArtifactUpdate{{ArtifactID: "artifact-uow", OperationID: "artifact-uow-op", OwnerPrincipalID: "artifact-uow-owner", Size: 7, Ciphertext: ciphertext, Nonce: nonce, EncryptionKeyID: keyID}}}); err != nil {
+		t.Fatalf("bound artifact UoW err=%v", err)
+	}
+}
 func TestA6UoWRejectsWrongCiphertextKey(t *testing.T) {
 	store, db, source := task6Store(t)
 	defer db.Close()

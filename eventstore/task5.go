@@ -2275,7 +2275,7 @@ func (s *GORMStore) applyTask5ArtifactParticipants(tx *gorm.DB, work UnitOfWork,
 			if s.codec == nil {
 				return ErrEncryptionUnavailable
 			}
-			plaintext, decryptErr := openPayload(context.Background(), s.codec, update.Ciphertext, update.Nonce, update.EncryptionKeyID)
+			plaintext, decryptErr := openBoundPayload(context.Background(), s.codec, "artifact/v1", update.ArtifactID, owner, 1, update.Ciphertext, update.Nonce, update.EncryptionKeyID)
 			if errors.Is(decryptErr, ErrEncryptionUnavailable) {
 				return ErrEncryptionUnavailable
 			}
