@@ -1114,15 +1114,12 @@ func (s *GORMStore) ClaimOutbox(ctx context.Context, req OutboxClaimRequest) (le
 	if err = s.task5ValidatePayload(ctx, tx, "outbox/v1", row.EffectID, row.EndpointID, task5PayloadVersion(row.PayloadVersion), row.PayloadCiphertext, row.PayloadNonce, row.EncryptionKeyID, false); err != nil {
 		return OutboxLease{}, commitObservedScrub(err)
 	}
-	if row.LeaseEpoch == maxUint64 {
+	if row.LeaseEpoch >= maxPersistedVersion {
 		return OutboxLease{}, commitObservedScrub(ErrVersionExhausted)
 	}
 	attempt, idErr := s.task5ID()
 	if idErr != nil {
 		return OutboxLease{}, commitObservedScrub(idErr)
-	}
-	if row.LeaseEpoch >= maxPersistedVersion {
-		return OutboxLease{}, commitObservedScrub(ErrVersionExhausted)
 	}
 	version, vErr := nextVersion(row.Version)
 	if vErr != nil {
