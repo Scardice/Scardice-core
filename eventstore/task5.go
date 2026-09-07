@@ -83,8 +83,8 @@ func validateTask5OpaquePayload(ciphertext, nonce []byte, keyID string) error {
 	return nil
 }
 func validateTask5ArtifactOpaquePayload(ciphertext, nonce []byte, keyID string) error {
-	if len(ciphertext) > MaxArtifactBytes {
-		return &OversizeError{Bound: "artifact bytes", Limit: MaxArtifactBytes, Actual: len(ciphertext)}
+	if len(ciphertext) > MaxArtifactBytes+16 {
+		return &OversizeError{Bound: "encrypted artifact bytes", Limit: MaxArtifactBytes + 16, Actual: len(ciphertext)}
 	}
 	if len(ciphertext) == 0 || len(nonce) == 0 || len(nonce) > task5NonceLimit || strings.TrimSpace(keyID) == "" {
 		return ErrInvalidMetadata
@@ -2301,8 +2301,11 @@ func (s *GORMStore) applyTask5ArtifactParticipants(tx *gorm.DB, work UnitOfWork,
 		if update.ArtifactID == "" {
 			return ErrParticipantFailure
 		}
-		if update.Size < 0 || update.Size > MaxArtifactBytes || len(update.Ciphertext) > MaxArtifactBytes {
+		if update.Size < 0 || update.Size > MaxArtifactBytes {
 			return &OversizeError{Bound: "artifact bytes", Limit: MaxArtifactBytes, Actual: int(update.Size)}
+		}
+		if len(update.Ciphertext) > MaxArtifactBytes+16 {
+			return &OversizeError{Bound: "encrypted artifact bytes", Limit: MaxArtifactBytes + 16, Actual: len(update.Ciphertext)}
 		}
 		if update.Status != "" && update.Status != "ready" && update.Status != "available" {
 			return ErrInvalidTransition
