@@ -38,7 +38,7 @@ After the narrow implementation, the same behavior tests passed. The tests asser
 
 ## Verification
 
-Exact required commands and results after sixteenth-round source commit `fc05a451` (on top of fifteenth-round source `6ad47f57`):
+Exact required commands and results after eighteenth-round source commit `17d200bf` (on top of seventeenth-round source `9e607dcb`):
 
 ```text
 go test -race ./eventstore -run 'TestInbox|TestOutbox|TestArtifact|TestLane|TestLease|TestEffect|TestDedup' -count=1
@@ -48,13 +48,13 @@ go test -race ./eventstore -run 'TestReadiness|TestKey|TestCrypto|TestSecret|Tes
 ok  	Scardice-core/eventstore	2.101s
 
 go test -race ./eventstore -count=1
-ok  	Scardice-core/eventstore	5.320s
+ok  	Scardice-core/eventstore	5.480s
 
 go test -count=1 ./eventstore
-ok  	Scardice-core/eventstore	1.203s
+ok  	Scardice-core/eventstore	1.243s
 ```
 
-The commands were run after the sixteenth-round source commit and included explicit public GetOperation query-failure regression coverage, explicit rollback before every Task5/artifact lock-failure return, post-failure SQLite write recovery, same-transaction publication/readiness fencing for secret and plugin reads, public operation not-found versus participant query-error fencing, a mixed-UoW expiry pre-scan before operation/inbox/outbox authentication, read-fenced root-removal concurrency coverage, A6 UoW expiry compensation before encrypted payload authentication, malformed expired ingress scrub-before-auth ordering, stable public not-found versus participant query-error mappings for secret and plugin reads, operation version fencing for every purge scope, readiness-admitted key IDs before decrypt/apply, publication-fenced current-root snapshots for PutSecret/SetPluginKV/PutArtifact and sparse secret resealing, rotation current-root ID fencing, ingress key admission/AAD validation after the publication lock, old-root removal rejection, unsupported readiness-schema rejection, strict fresh-mode metadata/position/completion validation, immutable public secret binding, and operation/privacy repository coverage. No formatter, linter, or project-wide suite was run.
+The commands were run after the eighteenth-round source commit and included compensation query-error fencing, operation-private ciphertext/decoded-size bounds for sparse and resealed UoW updates, publication/readiness-fenced projection reads with stable missing/error mappings, mixed-UoW explicit-ID plus provider-dedupe expiry scrub coverage, explicit public GetOperation query-failure regression coverage, explicit rollback before every Task5/artifact lock-failure return, post-failure SQLite write recovery, same-transaction publication/readiness fencing for secret and plugin reads, public operation not-found versus participant query-error fencing, a mixed-UoW expiry pre-scan before operation/inbox/outbox authentication, read-fenced root-removal concurrency coverage, A6 UoW expiry compensation before encrypted payload authentication, malformed expired ingress scrub-before-auth ordering, stable public not-found versus participant query-error mappings for secret and plugin reads, operation version fencing for every purge scope, readiness-admitted key IDs before decrypt/apply, publication-fenced current-root snapshots for PutSecret/SetPluginKV/PutArtifact and sparse secret resealing, rotation current-root ID fencing, ingress key admission/AAD validation after the publication lock, old-root removal rejection, unsupported readiness-schema rejection, strict fresh-mode metadata/position/completion validation, immutable public secret binding, and operation/privacy repository coverage. No formatter, linter, or project-wide suite was run.
 
 ## Commits
 
@@ -88,5 +88,7 @@ The commands were run after the sixteenth-round source commit and included expli
 - Fourteenth-round public read query-error fencing: `e237254f`.
 - Fifteenth-round public operation query-error fencing and mixed-UoW expiry pre-scan: `6ad47f57`.
 - Sixteenth-round public operation query-failure regression: `fc05a451`.
+- Seventeenth-round mixed-UoW explicit/dedupe expiry scrub closure: `9e607dcb`.
+- Eighteenth-round remaining encrypted-read, projection-fence, operation-bound, and compensation-query hardening: `17d200bf`.
 
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
