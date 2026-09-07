@@ -198,4 +198,21 @@ ok  	Scardice-core/eventstore	5.661s
 ```
 
 Twenty-sixth-round implementation and regression coverage: `fe5d3f1a`.
+
+Twenty-seventh-round source commit `c28bf123` adds a fail-closed `nextVersion`/storage-width overflow guard to A6 UoW PluginKV validation before key/value AAD authentication. `TestA6UOWPluginVersionOverflowFailsBeforeAuthentication` seeds the maximum SQLite-storable row version and verifies `ErrVersionExhausted` wins over authentication.
+
+Additional verification after `c28bf123`:
+
+```text
+go test ./eventstore -run 'TestA6UOWPluginVersionOverflowFailsBeforeAuthentication' -count=1
+ok  	Scardice-core/eventstore	0.011s
+
+go test ./eventstore -count=1
+ok  	Scardice-core/eventstore	1.454s
+
+go test -race ./eventstore -count=1
+ok  	Scardice-core/eventstore	6.280s
+```
+
+Twenty-seventh-round implementation and regression coverage: `c28bf123`.
 Verification exercised SQLite, including its race path. Live MySQL/PostgreSQL integration and remote `FOR UPDATE` execution were not available in this focused environment; dialect-aware locking remains opt-in through the existing helper and should be covered by deployment-specific credentials/integration tests.
