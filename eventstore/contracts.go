@@ -413,9 +413,13 @@ type InboxUpdate struct {
 	LeaseExpiresAt         time.Time
 	AttemptID              string
 	PayloadCiphertext      []byte
-	PayloadNonce           []byte
-	ContentDigest          []byte
-	DigestKeyID            string
+	PayloadNonce            []byte
+	ContentDigest           []byte
+	// DigestKeyID is the legacy payload-key field. New A6 callers should set
+	// PayloadEncryptionKeyID and ContentDigestKeyID separately.
+	DigestKeyID             string
+	PayloadEncryptionKeyID  string
+	ContentDigestKeyID      string
 	WorkflowID             string
 	CallbackStartedAt      time.Time
 	CompletedAt            time.Time
@@ -445,9 +449,13 @@ type NewEffect struct {
 	NextAttemptAt          time.Time
 	DispatchedAt           time.Time
 	PayloadCiphertext      []byte
-	PayloadNonce           []byte
-	ContentDigest          []byte
+	PayloadNonce            []byte
+	ContentDigest           []byte
+	// DigestKeyID is the legacy payload-key field. New A6 callers should set
+	// PayloadEncryptionKeyID and ContentDigestKeyID separately.
 	DigestKeyID             string
+	PayloadEncryptionKeyID  string
+	ContentDigestKeyID      string
 	ProviderMessageID      string
 	ResultCode             string
 	ErrorCode              string
@@ -572,10 +580,10 @@ func ValidateUnitOfWork(work UnitOfWork) error {
 		addFields(len(update.OperationID), len(update.Kind), len(update.Status), len(update.PrincipalID), len(update.ResourceID), len(update.IdempotencyScope), len(update.IdempotencyKey), len(update.RequestID), len(update.RequestDigest), len(update.CorrelationID), len(update.ResultCode), len(update.ErrorCode), len(update.ArtifactID), len(update.PrivateContextCiphertext), len(update.PrivateContextNonce), len(update.EncryptionKeyID))
 	}
 	for _, update := range work.InboxUpdates {
-		addFields(len(update.InboxID), len(update.EndpointID), len(update.ProviderEventKey), len(update.LaneHMAC), len(update.Status), len(update.LeaseOwner), len(update.AttemptID), len(update.PayloadCiphertext), len(update.PayloadNonce), len(update.ContentDigest), len(update.DigestKeyID), len(update.WorkflowID))
+		addFields(len(update.InboxID), len(update.EndpointID), len(update.ProviderEventKey), len(update.LaneHMAC), len(update.Status), len(update.LeaseOwner), len(update.AttemptID), len(update.PayloadCiphertext), len(update.PayloadNonce), len(update.ContentDigest), len(update.DigestKeyID), len(update.PayloadEncryptionKeyID), len(update.ContentDigestKeyID), len(update.WorkflowID))
 	}
 	for _, update := range work.Effects {
-		addFields(len(update.EffectID), len(update.EndpointID), len(update.LaneHMAC), len(update.EffectType), len(update.RiskClass), len(update.Status), len(update.AttemptID), len(update.LeaseOwner), len(update.PayloadCiphertext), len(update.PayloadNonce), len(update.ContentDigest), len(update.DigestKeyID), len(update.ProviderMessageID), len(update.ResultCode), len(update.ErrorCode))
+		addFields(len(update.EffectID), len(update.EndpointID), len(update.LaneHMAC), len(update.EffectType), len(update.RiskClass), len(update.Status), len(update.LeaseOwner), len(update.AttemptID), len(update.PayloadCiphertext), len(update.PayloadNonce), len(update.ContentDigest), len(update.DigestKeyID), len(update.PayloadEncryptionKeyID), len(update.ContentDigestKeyID), len(update.ProviderMessageID), len(update.ResultCode), len(update.ErrorCode))
 	}
 	for _, update := range work.ArtifactUpdates {
 		addFields(len(update.ArtifactID), len(update.OperationID), len(update.OwnerPrincipalID), len(update.MediaType), len(update.SafeFilename), len(update.Ciphertext), len(update.Nonce), len(update.EncryptionKeyID))
@@ -734,6 +742,7 @@ type Readiness struct {
 	SchemaVersion         uint32
 	DatabaseIdentity      string
 	IndexRootID           string
+	IndexRootFingerprint  []byte
 	EncryptionRootIDs     []string
 	SourceManifestDigest  []byte
 	TargetManifestDigest  []byte

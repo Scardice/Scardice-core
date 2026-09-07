@@ -303,6 +303,7 @@ type storeReadinessRow struct {
 	SchemaVersion string `gorm:"type:varchar(64);not null"`
 	DatabaseIdentity string `gorm:"type:varchar(255);not null"`
 	IndexRootID string `gorm:"type:varchar(255);not null"`
+	IndexRootFingerprint []byte `gorm:"size:32"`
 	EncryptionRootIDs []byte `gorm:"not null"`
 	SourceManifestDigest []byte `gorm:"size:32"`
 	TargetManifestDigest []byte `gorm:"size:32"`

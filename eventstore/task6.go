@@ -260,6 +260,16 @@ func a6HMAC(ctx context.Context, source KeySource, domain string, parts ...strin
 	}
 	return h.Sum(nil), nil
 }
+func (s *GORMStore) validatePluginKeyIndex(ctx context.Context, extension string, index, plaintext []byte) error {
+	expected, err := a6HMAC(ctx, s.keySource, "plugin-key-index/v1", extension, string(plaintext))
+	if err != nil {
+		return err
+	}
+	if !hmac.Equal(expected, index) {
+		return ErrAuthenticationFailed
+	}
+	return nil
+}
 
 type a6PayloadCodec struct{ source KeySource }
 func (c *a6PayloadCodec) Encrypt(ctx context.Context, plaintext []byte)([]byte,[]byte,string,error){return a6Seal(ctx,c.source,"artifact/v1","payload","",0,plaintext)}
@@ -267,7 +277,26 @@ func (c *a6PayloadCodec) Decrypt(ctx context.Context,ciphertext,nonce []byte,key
 func (c *a6PayloadCodec) EncryptBound(ctx context.Context, domain, identity, owner string, version uint64, plaintext []byte)([]byte,[]byte,string,error){return a6Seal(ctx,c.source,domain,identity,owner,version,plaintext)}
 func (c *a6PayloadCodec) DecryptBound(ctx context.Context, domain, identity, owner string, version uint64, ciphertext, nonce []byte, keyID string)([]byte,error){return a6Open(ctx,c.source,domain,identity,owner,version,keyID,ciphertext,nonce)}
 
-func (s *GORMStore) GetReadiness(ctx context.Context)(Readiness,error){var row storeReadinessRow;if s==nil||s.db==nil{return Readiness{},ErrReadinessInvalid};if err:=s.db.GORM().WithContext(ctx).Where("singleton_id = ?","default").First(&row).Error;err!=nil{return Readiness{},ErrReadinessQuarantined};var roots []string;if len(row.EncryptionRootIDs)>0{if json.Unmarshal(row.EncryptionRootIDs,&roots)!=nil{return Readiness{},ErrReadinessInvalid}};return Readiness{Mode:row.Mode,SchemaVersion:parseSchemaVersion(row.SchemaVersion),DatabaseIdentity:row.DatabaseIdentity,IndexRootID:row.IndexRootID,EncryptionRootIDs:roots,SourceManifestDigest:append([]byte(nil),row.SourceManifestDigest...),TargetManifestDigest:append([]byte(nil),row.TargetManifestDigest...),TerminalGlobalPosition:row.TerminalGlobalPosition,TerminalProjectionPosition:row.TerminalProjectionPosition,CompletedAt:timeOrZero(row.CompletedAt)},nil}
+func (s *GORMStore) GetReadiness(ctx context.Context) (Readiness, error) {
+	var row storeReadinessRow
+	if s == nil || s.db == nil {
+		return Readiness{}, ErrReadinessInvalid
+	}
+	if err := s.db.GORM().WithContext(ctx).Where("singleton_id = ?", "default").First(&row).Error; err != nil {
+		return Readiness{}, ErrReadinessQuarantined
+	}
+	var roots []string
+	if len(row.EncryptionRootIDs) > 0 && json.Unmarshal(row.EncryptionRootIDs, &roots) != nil {
+		return Readiness{}, ErrReadinessInvalid
+	}
+	return Readiness{
+		Mode: row.Mode, SchemaVersion: parseSchemaVersion(row.SchemaVersion), DatabaseIdentity: row.DatabaseIdentity,
+		IndexRootID: row.IndexRootID, IndexRootFingerprint: append([]byte(nil), row.IndexRootFingerprint...),
+		EncryptionRootIDs: roots, SourceManifestDigest: append([]byte(nil), row.SourceManifestDigest...),
+		TargetManifestDigest: append([]byte(nil), row.TargetManifestDigest...), TerminalGlobalPosition: row.TerminalGlobalPosition,
+		TerminalProjectionPosition: row.TerminalProjectionPosition, CompletedAt: timeOrZero(row.CompletedAt),
+	}, nil
+}
 func parseSchemaVersion(v string) uint32 {
 	n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32)
 	if err != nil {
@@ -292,7 +321,7 @@ func validateReadinessValue(r Readiness) error {
 	if r.TerminalGlobalPosition == maxUint64 || r.TerminalProjectionPosition == maxUint64 {
 		return ErrReadinessInvalid
 	}
-	if r.Mode == "import" && (len(r.SourceManifestDigest) != 32 || len(r.TargetManifestDigest) != 32 || r.TerminalGlobalPosition == 0 || r.TerminalProjectionPosition == 0 || r.CompletedAt.IsZero()) {
+	if r.Mode == "import" && (len(r.SourceManifestDigest) != 32 || len(r.TargetManifestDigest) != 32 || r.CompletedAt.IsZero()) {
 		return ErrReadinessInvalid
 	}
 	seen := make(map[string]struct{}, len(r.EncryptionRootIDs))
@@ -387,14 +416,18 @@ func (s *GORMStore) ValidateReadiness(ctx context.Context) error {
 	if r.IndexRootID == "unconfigured" || r.Mode == "fresh" && nonempty {
 		return ErrReadinessQuarantined
 	}
-	if expected := strings.TrimSpace(s.db.databaseIdentity); expected != "" && r.DatabaseIdentity != expected {
-		return ErrReadinessQuarantined
-	}
 	if s.keySource == nil {
 		return ErrKeySourceUnavailable
 	}
-	id, _, err := keySourceIndex(ctx, s.keySource)
+	if expected := strings.TrimSpace(s.db.databaseIdentity); expected != "" && r.DatabaseIdentity != expected {
+		return ErrReadinessQuarantined
+	}
+	id, indexMaterial, err := keySourceIndex(ctx, s.keySource)
 	if err != nil || id != r.IndexRootID {
+		return ErrReadinessQuarantined
+	}
+	fingerprint := sha256.Sum256(indexMaterial)
+	if len(r.IndexRootFingerprint) != len(fingerprint) || !hmac.Equal(r.IndexRootFingerprint, fingerprint[:]) {
 		return ErrReadinessQuarantined
 	}
 	if _, err = keySourceCurrent(ctx, s.keySource); err != nil {
@@ -416,7 +449,7 @@ func (s *GORMStore) ValidateReadiness(ctx context.Context) error {
 			}
 		}
 	}
-	if nonempty && r.Mode == "import" {
+	if r.Mode == "import" {
 		global, projection, terminalErr := readinessTerminalPositions(ctx, s.db.GORM())
 		if terminalErr != nil || global != r.TerminalGlobalPosition || projection != r.TerminalProjectionPosition {
 			return ErrReadinessQuarantined
@@ -459,11 +492,18 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		if len(update.PayloadCiphertext) == 0 && len(update.PayloadNonce) == 0 {
 			continue
 		}
-		if update.InboxID == "" || update.EndpointID == "" || update.DigestKeyID == "" {
+		payloadKeyID := task5PayloadKeyID(update)
+		if update.InboxID == "" || update.EndpointID == "" || payloadKeyID == "" {
 			return ErrInvalidMetadata
 		}
+		if update.ContentDigestKeyID != "" {
+			indexID, _, indexErr := keySourceIndex(ctx, s.keySource)
+			if indexErr != nil || update.ContentDigestKeyID != indexID {
+				return ErrAuthenticationFailed
+			}
+		}
 		version := uint64(1)
-		if _, err := openBoundPayload(ctx, s.codec, "inbox/v1", update.InboxID, update.EndpointID, version, update.PayloadCiphertext, update.PayloadNonce, update.DigestKeyID); err != nil {
+		if _, err := openBoundPayload(ctx, s.codec, "inbox/v1", update.InboxID, update.EndpointID, version, update.PayloadCiphertext, update.PayloadNonce, payloadKeyID); err != nil {
 			return ErrAuthenticationFailed
 		}
 	}
@@ -471,11 +511,18 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		if len(effect.PayloadCiphertext) == 0 && len(effect.PayloadNonce) == 0 {
 			continue
 		}
-		if effect.EffectID == "" || effect.EndpointID == "" || effect.DigestKeyID == "" {
+		payloadKeyID := task5EffectPayloadKeyID(effect)
+		if effect.EffectID == "" || effect.EndpointID == "" || payloadKeyID == "" {
 			return ErrInvalidMetadata
 		}
+		if effect.ContentDigestKeyID != "" {
+			indexID, _, indexErr := keySourceIndex(ctx, s.keySource)
+			if indexErr != nil || effect.ContentDigestKeyID != indexID {
+				return ErrAuthenticationFailed
+			}
+		}
 		version := uint64(1)
-		if _, err := openBoundPayload(ctx, s.codec, "outbox/v1", effect.EffectID, effect.EndpointID, version, effect.PayloadCiphertext, effect.PayloadNonce, effect.DigestKeyID); err != nil {
+		if _, err := openBoundPayload(ctx, s.codec, "outbox/v1", effect.EffectID, effect.EndpointID, version, effect.PayloadCiphertext, effect.PayloadNonce, payloadKeyID); err != nil {
 			return ErrAuthenticationFailed
 		}
 	}
@@ -583,6 +630,9 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 		if len(key) == 0 || len(key) > MaxPluginKeyBytes {
 			return ErrInvalidMetadata
 		}
+		if err := s.validatePluginKeyIndex(ctx, update.ExtensionID, update.KeyHMAC, key); err != nil {
+			return err
+		}
 		value, err := a6Open(ctx, s.keySource, "plugin-kv-value/v1", string(update.KeyHMAC), update.ExtensionID, version, update.EncryptionKeyID, update.ValueCiphertext, update.ValueNonce)
 		if err != nil {
 			return ErrAuthenticationFailed
@@ -594,6 +644,45 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 	return nil
 }
 
+func (s *GORMStore) initializeA6Readiness(ctx context.Context) error {
+	if s == nil || s.keySource == nil {
+		return nil
+	}
+	r, err := s.GetReadiness(ctx)
+	if err != nil {
+		return err
+	}
+	nonempty, err := readinessDatabaseNonEmpty(ctx, s.db.GORM())
+	if err != nil {
+		return ErrReadinessQuarantined
+	}
+	if r.IndexRootID == "" || r.IndexRootID == "unconfigured" {
+		if nonempty {
+			return ErrReadinessQuarantined
+		}
+		indexID, _, indexErr := keySourceIndex(ctx, s.keySource)
+		if indexErr != nil {
+			return ErrKeySourceUnavailable
+		}
+		current, currentErr := keySourceCurrent(ctx, s.keySource)
+		if currentErr != nil {
+			return currentErr
+		}
+		identity := r.DatabaseIdentity
+		if configured := strings.TrimSpace(s.db.databaseIdentity); configured != "" {
+			identity = configured
+		}
+		if identity == "" {
+			identity = "eventstore"
+		}
+		return s.SetReadiness(ctx, Readiness{
+			Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: identity,
+			IndexRootID: indexID, EncryptionRootIDs: []string{current.ID},
+		})
+	}
+	return s.ValidateReadiness(ctx)
+}
+
 func (s *GORMStore) SetReadiness(ctx context.Context, r Readiness) error {
 	if err := validateReadinessValue(r); err != nil {
 		return err
@@ -601,10 +690,15 @@ func (s *GORMStore) SetReadiness(ctx context.Context, r Readiness) error {
 	if s == nil || s.db == nil || s.keySource == nil {
 		return ErrKeySourceUnavailable
 	}
-	id, _, err := keySourceIndex(ctx, s.keySource)
+	id, indexMaterial, err := keySourceIndex(ctx, s.keySource)
 	if err != nil || id != r.IndexRootID {
 		return ErrReadinessQuarantined
 	}
+	fingerprint := sha256.Sum256(indexMaterial)
+	if len(r.IndexRootFingerprint) != 0 && (len(r.IndexRootFingerprint) != len(fingerprint) || !hmac.Equal(r.IndexRootFingerprint, fingerprint[:])) {
+		return ErrReadinessQuarantined
+	}
+	r.IndexRootFingerprint = append([]byte(nil), fingerprint[:]...)
 	if _, err = keySourceCurrent(ctx, s.keySource); err != nil {
 		return ErrKeyUnavailable
 	}
@@ -661,13 +755,13 @@ func (s *GORMStore) SetReadiness(ctx context.Context, r Readiness) error {
 			}
 		}
 	}
-	if nonempty && r.Mode == "import" {
+	if r.Mode == "import" {
 		global, projection, terminalErr := readinessTerminalPositions(ctx, tx)
 		if terminalErr != nil || control.PublicationState != "published" || global != r.TerminalGlobalPosition || projection != r.TerminalProjectionPosition {
 			return ErrReadinessQuarantined
 		}
 	}
-	row := storeReadinessRow{SingletonID: "default", Mode: r.Mode, SchemaVersion: fmt.Sprint(r.SchemaVersion), DatabaseIdentity: r.DatabaseIdentity, IndexRootID: r.IndexRootID, EncryptionRootIDs: roots, SourceManifestDigest: append([]byte(nil), r.SourceManifestDigest...), TargetManifestDigest: append([]byte(nil), r.TargetManifestDigest...), TerminalGlobalPosition: r.TerminalGlobalPosition, TerminalProjectionPosition: r.TerminalProjectionPosition}
+	row := storeReadinessRow{SingletonID: "default", Mode: r.Mode, SchemaVersion: fmt.Sprint(r.SchemaVersion), DatabaseIdentity: r.DatabaseIdentity, IndexRootID: r.IndexRootID, IndexRootFingerprint: append([]byte(nil), r.IndexRootFingerprint...), EncryptionRootIDs: roots, SourceManifestDigest: append([]byte(nil), r.SourceManifestDigest...), TargetManifestDigest: append([]byte(nil), r.TargetManifestDigest...), TerminalGlobalPosition: r.TerminalGlobalPosition, TerminalProjectionPosition: r.TerminalProjectionPosition}
 	if !r.CompletedAt.IsZero() {
 		completed := r.CompletedAt
 		row.CompletedAt = &completed
@@ -745,8 +839,18 @@ func (s *GORMStore) pluginValueUsageOn(ctx context.Context, db *gorm.DB, extensi
 	}
 	var total int64
 	for _, row := range rows {
-		if string(row.KeyHMAC) == string(exclude) {
+		if len(exclude) > 0 && hmac.Equal(row.KeyHMAC, exclude) {
 			continue
+		}
+		key, err := a6Open(ctx, s.keySource, "plugin-kv-key/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedKey, row.KeyNonce)
+		if err != nil {
+			return 0, ErrAuthenticationFailed
+		}
+		if len(key) == 0 || len(key) > MaxPluginKeyBytes {
+			return 0, ErrInvalidMetadata
+		}
+		if err := s.validatePluginKeyIndex(ctx, row.ExtensionID, row.KeyHMAC, key); err != nil {
+			return 0, err
 		}
 		plain, err := a6Open(ctx, s.keySource, "plugin-kv-value/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedValue, row.ValueNonce)
 		if err != nil {
@@ -868,6 +972,9 @@ func (s *GORMStore) decodePluginKVRow(ctx context.Context, row pluginKVRow) (Plu
 	if len(key) == 0 || len(key) > MaxPluginKeyBytes || len(value) > MaxPluginValueBytes || int64(len(value)) != row.ValueSize {
 		return PluginKVItem{}, ErrInvalidMetadata
 	}
+	if err := s.validatePluginKeyIndex(ctx, row.ExtensionID, row.KeyHMAC, key); err != nil {
+		return PluginKVItem{}, err
+	}
 	return PluginKVItem{ExtensionID: row.ExtensionID, Key: string(key), Value: value, Version: row.RowVersion}, nil
 }
 
@@ -965,6 +1072,9 @@ func minInt(a, b int) int {
 const rotationPageSize = 256
 
 func (s *GORMStore) RotateEncryptionRoots(ctx context.Context) (EncryptionRotationResult, error) {
+	if err := s.ValidateReadiness(ctx); err != nil {
+		return EncryptionRotationResult{}, err
+	}
 	root, err := keySourceCurrent(ctx, s.keySource)
 	if err != nil {
 		return EncryptionRotationResult{}, err
@@ -1264,6 +1374,10 @@ func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRo
 			}
 			key, openErr := a6Open(ctx, s.keySource, "plugin-kv-key/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedKey, row.KeyNonce)
 			if openErr != nil {
+				err = openErr
+				return
+			}
+			if openErr = s.validatePluginKeyIndex(ctx, row.ExtensionID, row.KeyHMAC, key); openErr != nil {
 				err = openErr
 				return
 			}

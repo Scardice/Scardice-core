@@ -121,6 +121,9 @@ func NewStore(database *Database, options ...StoreOption) *GORMStore {
 			option(s)
 		}
 	}
+	if s.keySource != nil {
+		s.recordInitError(s.initializeA6Readiness(context.Background()))
+	}
 	return s
 }
 func descriptorVersion(descriptor ProjectionDescriptor) (string, error) {
@@ -729,8 +732,8 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 		}
 		return nil
 	}
-	applyInbox := func() error { return s.applyTask5InboxParticipants(tx, work, result) }
-	applyEffects := func() error { return s.applyTask5EffectParticipants(tx, work, result) }
+	applyInbox := func() error { return s.applyTask5InboxParticipants(ctx, tx, work, result) }
+	applyEffects := func() error { return s.applyTask5EffectParticipants(ctx, tx, work, result) }
 	applyFences := func() error { fences := append([]SubjectFenceUpdate(nil), work.FenceUpdates...); sort.Slice(fences,func(i,j int)bool{if string(fences[i].SubjectKey)!=string(fences[j].SubjectKey){return string(fences[i].SubjectKey)<string(fences[j].SubjectKey)};return fences[i].Scope<fences[j].Scope})
 	for _, update := range fences {
 		if len(update.SubjectKey)==0 || update.Scope=="" {return ErrParticipantFailure}
