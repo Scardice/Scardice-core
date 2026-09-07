@@ -481,8 +481,12 @@ func (s *GORMStore) GetOperation(ctx context.Context, operationID string) (Opera
 		return OperationView{}, ErrNotFound
 	}
 	var row operationRow
-	if err := s.db.GORM().WithContext(ctx).Select("operation_id", "version", "kind", "status", "result_code", "error_code", "artifact_id", "created_at", "updated_at", "expires_at").Where("operation_id = ?", operationID).First(&row).Error; err != nil {
+	queryErr := s.db.GORM().WithContext(ctx).Select("operation_id", "version", "kind", "status", "result_code", "error_code", "artifact_id", "created_at", "updated_at", "expires_at").Where("operation_id = ?", operationID).First(&row).Error
+	if errors.Is(queryErr, gorm.ErrRecordNotFound) {
 		return OperationView{}, ErrNotFound
+	}
+	if queryErr != nil {
+		return OperationView{}, ErrParticipantFailure
 	}
 	return OperationView{
 		OperationID: row.OperationID, Version: row.Version, Kind: row.Kind, Status: row.Status,

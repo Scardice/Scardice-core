@@ -546,6 +546,35 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 	if err := s.requireA6BoundCodec(); err != nil {
 		return err
 	}
+	now := s.task5Now()
+	for _, update := range work.InboxUpdates {
+		if update.InboxID == "" {
+			continue
+		}
+		var row inboxMessageRow
+		query := locked(db).Where("inbox_id = ?", update.InboxID).First(&row)
+		if query.Error == nil {
+			if inboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
+				return &task5ExpiredPayloadError{table: tableInboxMessages, id: row.InboxID, now: now}
+			}
+		} else if !errors.Is(query.Error, gorm.ErrRecordNotFound) {
+			return ErrParticipantFailure
+		}
+	}
+	for _, effect := range work.Effects {
+		if effect.EffectID == "" {
+			continue
+		}
+		var row outboxEffectRow
+		query := locked(db).Where("effect_id = ?", effect.EffectID).First(&row)
+		if query.Error == nil {
+			if outboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
+				return &task5ExpiredPayloadError{table: tableOutboxEffects, id: row.EffectID, now: now}
+			}
+		} else if !errors.Is(query.Error, gorm.ErrRecordNotFound) {
+			return ErrParticipantFailure
+		}
+	}
 	for _, update := range work.Operations {
 		if update.OperationID == "" {
 			return ErrInvalidMetadata
