@@ -116,6 +116,7 @@ func TestRepositoryValidatesReplayBeforeCommitWithoutProjector(t *testing.T) {
 
 func TestStrictBoundsAndTypedNilAreRejected(t *testing.T) {
 	if _, err := PlanDeleteForUser("dice-1", "group-1", strings.Repeat("u", MaxIdentityPartBytes+1), []Scope{ScopeCharacters}); err != ErrInvalidIdentity { t.Fatalf("oversized purge user = %v", err) }
+	if _, err := PlanDelete("dice-1", "group-1", []Scope{"unknown"}); err != ErrInvalidCommand { t.Fatalf("unknown purge scope = %v", err) }
 	if _, err := PlanDelete("dice-1", "group-1", []Scope{ScopeCharacters}); err != ErrInvalidIdentity { t.Fatalf("group-wide character purge = %v", err) }
 	if _, err := PlanDeleteForUser("dice-1", "group-1", "user-1", []Scope{ScopeCharacters}); err != nil { t.Fatal(err) }
 	if err := NewGroupUserAttrsBindingChangedV1(strings.Repeat("x", MaxIdentityPartBytes+1)).attrsValidate(); err != ErrInvalidIdentity { t.Fatalf("oversized binding = %v", err) }
