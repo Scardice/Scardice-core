@@ -120,6 +120,13 @@ func TestTypedEventRejectsNilOversizeAndInvalidPrivilege(t *testing.T) {
 	}}); !errors.Is(err, ErrInvalidEvent) {
 		t.Fatalf("malformed replay payload error = %v", err)
 	}
+	malformedField := []byte(`{"userId":"` + strings.Repeat("x", MaxGroupIdentityPartBytes+1) + `","enabled":true}`)
+	if _, err := ReplayEnvelopes([]eventstore.Envelope{{
+		Stream: GroupStream("dice-1", "group-1"), StreamVersion: 1,
+		EventType: string(EventGroupBotListChanged), SchemaVersion: GroupEventSchemaVersion, Payload: malformedField,
+	}}); !errors.Is(err, ErrInvalidIdentity) {
+		t.Fatalf("malformed replay identifier error = %v", err)
+	}
 	state, err := Reduce(State{}, NewGroupCreatedV1("dice-1", "group-1", "", 0))
 	if err != nil {
 		t.Fatal(err)

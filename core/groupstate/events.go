@@ -266,5 +266,6 @@ func DecodeTypedEvent(eventType EventType, payload []byte) (TypedEvent, error) {
 	default: return nil, fmt.Errorf("%w: %s", ErrInvalidEvent, eventType)
 	}
 	if err := json.Unmarshal(payload, event); err != nil { return nil, fmt.Errorf("%w: %v", ErrInvalidEvent, err) }
+	if err := event.validate(); err != nil { return nil, err }
 	return event, nil
 }
