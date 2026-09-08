@@ -104,7 +104,7 @@ func PlanDelete(state State, request DeleteRequest) (DeletePlan, error) {
 	}
 	if plan.DiceID == "" { plan.DiceID = state.DiceID }
 	if plan.GroupID == "" { plan.GroupID = state.GroupID }
-	if len(plan.ActiveDiceIDs) > 0 && !request.AllowActive { return plan, ErrActiveGroup }
+	if (state.Active || len(plan.ActiveDiceIDs) > 0) && !request.AllowActive { return plan, ErrActiveGroup }
 	for _, scope := range scopes {
 		switch scope {
 		case ScopeGroupRecord:
