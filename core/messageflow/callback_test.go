@@ -618,6 +618,47 @@ func TestCallbackSQLiteAmbiguityUsesIndependentContext(t *testing.T) {
 		t.Fatalf("canceled callback row=%#v host calls=%d", row, host.calls)
 	}
 }
+func TestCallbackSQLiteCommitCancellationUsesIndependentContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "callback-commit-canceled.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := eventstore.NewStore(db, eventstore.WithPayloadCodec(callbackTestCodec{}))
+	inbox := eventstore.InboxUpdate{
+		InboxID: "sqlite-commit-canceled-inbox", EndpointID: "endpoint", ProviderEventKey: "commit-canceled-provider",
+		LaneHMAC: []byte("commit-canceled-lane"), Status: eventstore.InboxStatusPending,
+		PayloadCiphertext: []byte("payload"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key",
+		ContentDigest: []byte{1}, ContentDigestKeyID: "digest",
+	}
+	if _, err := store.AcceptInbox(context.Background(), inbox); err != nil {
+		t.Fatal(err)
+	}
+	host := &callbackTestHost{fn: func(context.Context, CallbackRequest, *playerstate.LocalOverlay, *MutationCollector) (CallbackResult, error) {
+		cancel()
+		return CallbackResult{}, nil
+	}}
+	service, err := NewCallbackService(CallbackConfig{
+		Inbox: store, Store: store, Codec: callbackTestCodec{}, AllowUnboundCodec: true,
+		Resolver: callbackTestResolver{}, Group: groupstate.NewRepository(store), Player: playerstate.NewRepository(store),
+		Host: host, WorkerID: "worker",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ProcessOne(ctx); err == nil {
+		t.Fatal("commit cancellation unexpectedly succeeded")
+	}
+	var row eventstoreInboxRowForTest
+	if err := db.GORM().Table("inbox_messages").Where("inbox_id = ?", inbox.InboxID).Scan(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != eventstore.InboxStatusAmbiguous || len(row.PayloadCiphertext) != 0 || host.calls != 1 {
+		t.Fatalf("commit-canceled callback row=%#v host calls=%d", row, host.calls)
+	}
+}
 
 type eventstoreInboxRowForTest struct {
 	Status            string
