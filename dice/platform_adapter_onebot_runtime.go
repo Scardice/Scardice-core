@@ -536,6 +536,9 @@ func (r *onebotRuntime) Run(ctx context.Context, core adapterapi.CorePort) (runE
 	}
 
 	for {
+		if err := r.drainPriorityEvents(runCtx); err != nil {
+			return err
+		}
 		select {
 		case <-r.stopCh:
 			return nil
@@ -560,6 +563,27 @@ func (r *onebotRuntime) Run(ctx context.Context, core adapterapi.CorePort) (runE
 			if err := r.processRuntimeEvent(runCtx, event); err != nil {
 				return err
 			}
+		}
+	}
+}
+
+func (r *onebotRuntime) drainPriorityEvents(ctx context.Context) error {
+	for {
+		select {
+		case event := <-r.priorityConnect:
+			if err := r.processRuntimeEvent(ctx, event); err != nil {
+				return err
+			}
+		case event := <-r.priorityDisconnect:
+			if err := r.processRuntimeEvent(ctx, event); err != nil {
+				return err
+			}
+		case event := <-r.priorityAuthFailed:
+			if err := r.processRuntimeEvent(ctx, event); err != nil {
+				return err
+			}
+		default:
+			return nil
 		}
 	}
 }

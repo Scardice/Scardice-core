@@ -316,3 +316,14 @@ ok   Scardice-core/messageflow
 go test ./evsocket/v2 -run 'Test(WrapperEventQueueIsBounded|ShutdownWaitDrainsQueuedWrapperEvents|ConnectReadySignalIsIdempotentAcrossReconnects|TransportMessageIsBoundBeforeCopy)' -count=1
 ok   github.com/PaienNate/pineutil/evsocket/v2
 ```
+
+## Round 13 fixes
+
+- Run now performs a nonblocking priority drain before entering the ordinary select loop, while retaining dedicated priority cases for controls arriving concurrently. A focused regression confirms distinct connect and disconnect controls remain available while duplicate disconnects coalesce and are diagnosed.
+
+### Round 13 GREEN evidence
+
+```text
+go test ./dice -run 'TestOnebotRuntime(PriorityEventCoalescesAndPreemptsInbound|DiagnosticsExposeIngressCounters|InboundRetryIsBounded)' -count=1
+ok   Scardice-core/dice
+```

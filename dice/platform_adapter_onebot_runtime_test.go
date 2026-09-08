@@ -393,8 +393,8 @@ func TestOnebotRuntimePriorityEventCoalescesAndPreemptsInbound(t *testing.T) {
 	for range cap(runtime.events) {
 		runtime.events <- onebotRuntimeEvent{kind: "inbound"}
 	}
-	if !runtime.enqueue(onebotRuntimeEvent{kind: "disconnect"}) || !runtime.enqueue(onebotRuntimeEvent{kind: "disconnect"}) {
-		t.Fatal("priority disconnect was not admitted/coalesced")
+	if !runtime.enqueue(onebotRuntimeEvent{kind: "disconnect"}) || !runtime.enqueue(onebotRuntimeEvent{kind: "disconnect"}) || !runtime.enqueue(onebotRuntimeEvent{kind: "connect"}) {
+		t.Fatal("priority controls were not admitted/coalesced")
 	}
 	select {
 	case event := <-runtime.priorityDisconnect:
@@ -403,6 +403,14 @@ func TestOnebotRuntimePriorityEventCoalescesAndPreemptsInbound(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("priority disconnect missing after admission")
+	}
+	select {
+	case event := <-runtime.priorityConnect:
+		if event.kind != "connect" {
+			t.Fatalf("priority event = %q", event.kind)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("priority connect missing after admission")
 	}
 	if runtime.priorityDropped.Load() != 1 {
 		t.Fatalf("coalesced priority count = %d", runtime.priorityDropped.Load())
