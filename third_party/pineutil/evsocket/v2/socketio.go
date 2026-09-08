@@ -537,18 +537,18 @@ func (kws *WebsocketWrapper) onPong(payload string) {
 		cb(payload)
 	}
 }
-func (kws *WebsocketWrapper) dispatchEvent(event string, data []byte, eventErr error) {
+func (kws *WebsocketWrapper) dispatchEvent(event string, data []byte, eventErr error) bool {
 	payload := kws.newEventPayload(event, data, eventErr)
 	callbacks := kws.manager.listeners.get(event)
 	if kws.shouldQueueEvent(event) {
-		kws.enqueueEvent(eventEnvelope{payload: payload, callbacks: callbacks})
-		return
+		return kws.enqueueEvent(eventEnvelope{payload: payload, callbacks: callbacks})
 	}
 	kws.eventWG.Add(1)
 	go func() {
 		defer kws.eventWG.Done()
 		kws.invokeEventCallbacks(eventEnvelope{payload: payload, callbacks: callbacks})
 	}()
+	return true
 }
 
 func (kws *WebsocketWrapper) dispatchMessage(opcode gws.Opcode, data []byte) {
@@ -578,7 +578,7 @@ func isTerminalWrapperEvent(event eventEnvelope) bool {
 	}
 }
 
-func (kws *WebsocketWrapper) enqueueEvent(event eventEnvelope) {
+func (kws *WebsocketWrapper) enqueueEvent(event eventEnvelope) bool {
 	kws.eventMu.Lock()
 	if len(kws.eventQueue) >= maxWrapperEventQueue {
 		if isTerminalWrapperEvent(event) {
@@ -606,23 +606,24 @@ func (kws *WebsocketWrapper) enqueueEvent(event eventEnvelope) {
 			} else {
 				kws.droppedEvents.Add(1)
 				kws.eventMu.Unlock()
-				return
+				return false
 			}
 		} else {
 			kws.droppedEvents.Add(1)
 			kws.eventMu.Unlock()
-			return
+			return false
 		}
 	}
 	kws.eventWG.Add(1)
 	kws.eventQueue = append(kws.eventQueue, event)
 	if kws.eventDraining {
 		kws.eventMu.Unlock()
-		return
+		return true
 	}
 	kws.eventDraining = true
 	kws.eventMu.Unlock()
 	go kws.drainEvents()
+	return true
 }
 
 
@@ -1109,15 +1110,19 @@ func (kws *WebsocketWrapper) finalizeTransportClose(socket *gws.Conn, err error)
 	kws.stateMu.Unlock()
 	if !kws.clientMode {
 		kws.serverClosed.Store(true)
-		pending := int32(1)
-		if err != nil {
-			pending++
-		}
-		kws.serverTerminalPending.Store(pending)
+		kws.serverTerminalPending.Store(0)
+		kws.serverTerminalPending.Add(1)
 	}
-	kws.dispatchEvent(EventDisconnect, nil, err)
+	if !kws.dispatchEvent(EventDisconnect, nil, err) && !kws.clientMode {
+		kws.serverTerminalPending.Add(-1)
+	}
 	if err != nil {
-		kws.dispatchEvent(EventError, nil, err)
+		if !kws.clientMode {
+			kws.serverTerminalPending.Add(1)
+		}
+		if !kws.dispatchEvent(EventError, nil, err) && !kws.clientMode {
+			kws.serverTerminalPending.Add(-1)
+		}
 	}
 	return true
 }

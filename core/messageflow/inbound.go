@@ -91,31 +91,51 @@ func (s *InboundService) CollisionCount() uint64 { return s.collisions.Load() }
 // HandleInbound durably accepts one normalized provider fact. It never invokes
 // IMSession, Core, plugins, or callbacks; consumers claim the encrypted inbox
 
-func inboundJSONUpperBound(message adapterapi.InboundMessage) int {
-	total := len(message.ProviderEventID) + len(message.MessageID) + len(message.Platform) +
-		len(message.Sender) + len(message.Conversation) + len(message.Target) +
-		len(string(message.Kind)) + len(message.Text) + len(message.CausationID)
-	for _, segment := range message.Segments {
-		total += len(segment.Kind) + len(segment.Text) + len(segment.ProviderID) + len(segment.URL)
+func inboundJSONEscapedLen(value string) int {
+	total := 0
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '"', '\\', '\b', '\f', '\n', '\r', '\t':
+			total += 2
+		case '<', '>', '&':
+			total += 6
+		default:
+			if value[i] < 0x20 {
+				total += 6
+			} else {
+				total++
+			}
+		}
 	}
-	const jsonEscapeUpperBound = 6
+	return total
+}
+
+func inboundJSONUpperBound(message adapterapi.InboundMessage) int {
+	total := inboundJSONEscapedLen(string(message.ProviderEventID)) + inboundJSONEscapedLen(string(message.MessageID)) + inboundJSONEscapedLen(message.Platform) +
+		inboundJSONEscapedLen(string(message.Sender)) + inboundJSONEscapedLen(string(message.Conversation)) + inboundJSONEscapedLen(message.Target) +
+		inboundJSONEscapedLen(string(message.Kind)) + inboundJSONEscapedLen(message.Text) + inboundJSONEscapedLen(string(message.CausationID))
+	for _, segment := range message.Segments {
+		total += inboundJSONEscapedLen(segment.Kind) + inboundJSONEscapedLen(segment.Text) + inboundJSONEscapedLen(segment.ProviderID) + inboundJSONEscapedLen(segment.URL)
+	}
 	const fixedJSONOverhead = 512
 	const segmentJSONOverhead = 64
 	fixed := fixedJSONOverhead + segmentJSONOverhead*len(message.Segments)
-	if fixed > eventstore.MaxEventPayloadBytes || total > (eventstore.MaxEventPayloadBytes-fixed)/jsonEscapeUpperBound {
+	if fixed > eventstore.MaxEventPayloadBytes || total > eventstore.MaxEventPayloadBytes-fixed {
 		return eventstore.MaxEventPayloadBytes + 1
 	}
-	return fixed + total*jsonEscapeUpperBound
+	return fixed + total
 }
 
 func ingressPayloadJSONUpperBound(endpointID adapterapi.EndpointID, digestKeyID string, messageBound, contentDigestBytes int) int {
 	const fixedJSONOverhead = 512
 	const jsonEscapeUpperBound = 6
-	total := len(endpointID) + len(digestKeyID) + len(eventstore.InboxStatusPending) + contentDigestBytes + 32 + messageBound
-	if total > (eventstore.MaxEventPayloadBytes-fixedJSONOverhead)/jsonEscapeUpperBound {
+	const numericAndDigestOverhead = 128
+	rawEnvelope := len(endpointID) + len(digestKeyID) + len(eventstore.InboxStatusPending)
+	envelopeBound := fixedJSONOverhead + numericAndDigestOverhead + rawEnvelope*jsonEscapeUpperBound + contentDigestBytes*2
+	if envelopeBound > eventstore.MaxEventPayloadBytes || messageBound > eventstore.MaxEventPayloadBytes-envelopeBound {
 		return eventstore.MaxEventPayloadBytes + 1
 	}
-	return fixedJSONOverhead + total*jsonEscapeUpperBound
+	return envelopeBound + messageBound
 }
 
 // row in a later workflow.

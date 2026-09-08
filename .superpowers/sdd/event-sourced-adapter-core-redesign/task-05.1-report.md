@@ -430,3 +430,19 @@ ok   Scardice-core/core/messageflow
 go test ./core/messageflow -run 'TestInboundService(RejectsAggregatePayloadBeforeMarshal|RejectsEscapeHeavyAggregateBeforeMarshal|RejectsEnvelopeAggregateBeforePayloadMarshal|StableDuplicateReturnsPriorReceipt)' -count=1
 ok   Scardice-core/core/messageflow
 ```
+
+## Round 22 fixes
+
+- Corrected the envelope preflight to treat the already-escaped message bound as final bytes rather than multiplying it again. Newly added endpoint/key/status strings use conservative escaping, while digest bytes and numeric framing receive explicit reserve bytes.
+- Normal ASCII 100 KiB messages remain below the preflight bound; long valid endpoint IDs and escape-heavy aggregates are rejected before payload marshal.
+- Terminal pending accounting now increments only when terminal queue admission succeeds and decrements when admission fails, preventing dropped terminal events from pinning server-wrapper registry entries.
+
+### Round 22 GREEN evidence
+
+```text
+go test ./core/messageflow -run 'TestInbound(Service(RejectsAggregatePayloadBeforeMarshal|RejectsEscapeHeavyAggregateBeforeMarshal|RejectsEnvelopeAggregateBeforePayloadMarshal)|InboundPayloadUpperBoundAllowsNormal100KiBMessage)' -count=1
+ok   Scardice-core/core/messageflow
+
+go test ./evsocket/v2 -run 'Test(ServerWrapperUnregistersAfterTerminalCallbacksDrain|WrapperEventQueueIsBounded|TransportMessageIsBoundBeforeCopy)' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+```
