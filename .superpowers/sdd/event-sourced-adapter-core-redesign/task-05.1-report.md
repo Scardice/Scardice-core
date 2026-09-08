@@ -458,3 +458,15 @@ ok   github.com/PaienNate/pineutil/evsocket/v2
 go test ./evsocket/v2 -run 'Test(WrapperEventQueueIsBounded|DisconnectEvictsQueuedConnectWhenTerminalQueueIsFull|SafePoolDeleteIfPreservesReplacement)' -count=1
 ok   github.com/PaienNate/pineutil/evsocket/v2
 ```
+
+## Round 24 fixes
+
+- Explicitly covered the full-Disconnect terminal queue edge: duplicate disconnect admission is coalesced/dropped while the already queued disconnect remains the completion signal; terminal pending accounting reconciles the failed duplicate admission.
+- Added a reconnect-storm regression with a full Disconnect queue and a duplicate disconnect.
+
+### Round 24 GREEN evidence
+
+```text
+go test ./evsocket/v2 -run 'TestDuplicateDisconnectCoalescesWhenTerminalQueueIsFull' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+```

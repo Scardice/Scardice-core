@@ -221,3 +221,30 @@ func TestDisconnectEvictsQueuedConnectWhenTerminalQueueIsFull(t *testing.T) {
 		t.Fatal("disconnect was dropped behind queued connect events")
 	}
 }
+
+func TestDuplicateDisconnectCoalescesWhenTerminalQueueIsFull(t *testing.T) {
+	manager := NewSocketInstance()
+	wrapper := newClientWrapper(manager, "ws://127.0.0.1", ClientOptions{})
+	close(wrapper.connectReady)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	manager.On(EventMessage, func(*EventPayload) {
+		close(entered)
+		<-release
+	})
+	manager.On(EventDisconnect, func(*EventPayload) {})
+	wrapper.dispatchMessage(1, []byte("first"))
+	<-entered
+	for range maxWrapperEventQueue {
+		wrapper.dispatchEvent(EventDisconnect, nil, nil)
+	}
+	before := wrapper.DroppedEventCount()
+	wrapper.dispatchEvent(EventDisconnect, nil, nil)
+	if wrapper.DroppedEventCount() != before+1 {
+		t.Fatalf("duplicate disconnect drop count = %d, want %d", wrapper.DroppedEventCount(), before+1)
+	}
+	close(release)
+	if err := wrapper.WaitEvents(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
