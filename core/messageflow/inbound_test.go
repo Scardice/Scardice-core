@@ -3,6 +3,7 @@ package messageflow
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -123,6 +124,28 @@ func TestInboundServiceNoIDNoTimeUsesContentDigestIdentity(t *testing.T) {
 	}
 	if changed.Outcome != adapterapi.IngressAccepted || changed.InboxID == first.InboxID {
 		t.Fatalf("no-time content identity = %#v, first = %#v", changed, first)
+	}
+}
+
+func TestInboundServiceRejectsAggregatePayloadBeforeMarshal(t *testing.T) {
+	repo := &ingressRepoStub{}
+	svc, err := NewInboundService(repo, ingressCryptoStub{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	large := strings.Repeat("x", 150*1024)
+	message := testFencedMessage("aggregate", "body")
+	message.Message.Segments = []adapterapi.InboundSegment{
+		{Kind: "text", Text: large},
+		{Kind: "text", Text: large},
+	}
+	if _, err := svc.HandleInbound(context.Background(), message); !errors.Is(err, ErrIngressPayload) {
+		t.Fatalf("aggregate payload error = %v", err)
+	}
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	if len(repo.updates) != 0 {
+		t.Fatalf("oversized aggregate admitted %d updates", len(repo.updates))
 	}
 }
 

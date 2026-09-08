@@ -90,6 +90,22 @@ func (s *InboundService) CollisionCount() uint64 { return s.collisions.Load() }
 
 // HandleInbound durably accepts one normalized provider fact. It never invokes
 // IMSession, Core, plugins, or callbacks; consumers claim the encrypted inbox
+
+func inboundJSONUpperBound(message adapterapi.InboundMessage) int {
+	total := len(message.ProviderEventID) + len(message.MessageID) + len(message.Platform) +
+		len(message.Sender) + len(message.Conversation) + len(message.Target) +
+		len(string(message.Kind)) + len(message.Text) + len(message.CausationID)
+	for _, segment := range message.Segments {
+		total += len(segment.Kind) + len(segment.Text) + len(segment.ProviderID) + len(segment.URL)
+	}
+	const jsonEscapeUpperBound = 6
+	const fixedJSONOverhead = 512
+	if total > (eventstore.MaxEventPayloadBytes-fixedJSONOverhead)/jsonEscapeUpperBound {
+		return eventstore.MaxEventPayloadBytes + 1
+	}
+	return fixedJSONOverhead + total*jsonEscapeUpperBound
+}
+
 // row in a later workflow.
 func (s *InboundService) HandleInbound(ctx context.Context, fenced endpoint.FencedInbound) (adapterapi.IngressReceipt, error) {
 	if s == nil || s.repo == nil || s.security == nil {
@@ -113,6 +129,9 @@ func (s *InboundService) HandleInbound(ctx context.Context, fenced endpoint.Fenc
 	}
 
 	message := fenced.Message
+	if inboundJSONUpperBound(message) > eventstore.MaxEventPayloadBytes {
+		return adapterapi.IngressReceipt{}, ErrIngressPayload
+	}
 	contentBytes, err := json.Marshal(message)
 	if err != nil {
 		return adapterapi.IngressReceipt{}, err

@@ -394,3 +394,15 @@ ok   github.com/PaienNate/pineutil/evsocket/v2
 go test ./evsocket/v2 -run 'TestServerWrapperUnregistersAfterTerminalCallbacksDrain' -count=1
 ok   github.com/PaienNate/pineutil/evsocket/v2
 ```
+
+## Round 19 fixes
+
+- Added a cheap aggregate JSON upper-bound preflight before `json.Marshal`. It accounts for all bounded message and segment fields with a conservative JSON-escape multiplier and rejects payloads that cannot fit the 256 KiB event payload bound, preventing multi-megabyte serialization allocations under concurrent ingress.
+- Added a regression with two individually valid 150 KiB segments proving aggregate rejection before durable admission.
+
+### Round 19 GREEN evidence
+
+```text
+go test ./core/messageflow -run 'TestInboundServiceRejectsAggregatePayloadBeforeMarshal' -count=1
+ok   Scardice-core/core/messageflow
+```
