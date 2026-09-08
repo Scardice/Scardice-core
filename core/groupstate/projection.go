@@ -34,7 +34,10 @@ func applyGroupProjection(ctx context.Context, tx *gorm.DB, events []eventstore.
 		var row projectionRow
 		query := tx.WithContext(ctx).Where("projection_generation = ? AND projection_name = ? AND row_key = ?", eventstore.ProjectionGeneration(tx), GroupProjectionName, envelope.Stream.AggregateID).First(&row)
 		if query.Error == nil {
-			if err := json.Unmarshal(row.Payload, &state); err != nil { return ErrInvalidState }
+			var decodeErr error
+			state, decodeErr = decodeProjectionState(row.Payload)
+			if decodeErr != nil { return decodeErr }
+			if canonicalAggregateID(state.DiceID, state.GroupID) != envelope.Stream.AggregateID { return ErrInvalidState }
 		} else if !errors.Is(query.Error, gorm.ErrRecordNotFound) { return query.Error }
 		state, err := ApplyEnvelope(state, envelope)
 		if err != nil { return err }
@@ -43,6 +46,20 @@ func applyGroupProjection(ctx context.Context, tx *gorm.DB, events []eventstore.
 	}
 	return nil
 }
+func decodeProjectionState(payload []byte) (State, error) {
+	var value any
+	if err := json.Unmarshal(payload, &value); err != nil { return State{}, ErrInvalidState }
+	if _, ok := value.(map[string]any); !ok || containsJSONNull(value) { return State{}, ErrInvalidState }
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	var state State
+	if err := decoder.Decode(&state); err != nil { return State{}, ErrInvalidState }
+	if err := decoder.Decode(&struct{}{}); err != io.EOF { return State{}, ErrInvalidState }
+	if state.Version == 0 { return State{}, ErrInvalidState }
+	if err := ValidateState(state); err != nil { return State{}, err }
+	return state, nil
+}
+
 
 type projectionReader interface { ReadProjectionRow(context.Context, string, string) (eventstore.ProjectionRow, error) }
 
@@ -54,16 +71,8 @@ func ReadProjected(ctx context.Context, store any, diceID, groupID string) (Stat
 	stream := GroupStream(diceID, groupID)
 	row, err := reader.ReadProjectionRow(ctx, GroupProjectionName, stream.AggregateID)
 	if err != nil { return State{}, err }
-	var value any
-	if err := json.Unmarshal(row.Payload, &value); err != nil { return State{}, ErrInvalidState }
-	if _, ok := value.(map[string]any); !ok || containsJSONNull(value) { return State{}, ErrInvalidState }
-	decoder := json.NewDecoder(bytes.NewReader(row.Payload))
-	decoder.DisallowUnknownFields()
-	var state State
-	if err := decoder.Decode(&state); err != nil { return State{}, ErrInvalidState }
-	if err := decoder.Decode(&struct{}{}); err != io.EOF { return State{}, ErrInvalidState }
-	if state.Version == 0 { return State{}, ErrInvalidState }
-	if err := ValidateState(state); err != nil { return State{}, err }
+	state, err := decodeProjectionState(row.Payload)
+	if err != nil { return State{}, err }
 	if canonicalAggregateID(state.DiceID, state.GroupID) != stream.AggregateID { return State{}, ErrInvalidState }
 	return state.Clone(), nil
 }

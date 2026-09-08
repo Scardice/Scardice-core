@@ -390,6 +390,27 @@ func TestRepositoryAndProjectionReplayTypedEvents(t *testing.T) {
 		t.Fatalf("projection read was mutable = %#v, err = %v", again, err)
 	}
 }
+func TestGroupProjectionRejectsCorruptExistingRow(t *testing.T) {
+	ctx := context.Background()
+	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/group-corrupt-projection.db"})
+	if err != nil { t.Fatal(err) }
+	defer db.Close()
+	store := eventstore.NewStore(db, eventstore.WithProjection(GroupProjection()))
+	repository := NewRepository(store)
+	metadata := eventstore.Metadata{EventID: "projection-created-event", CommandID: "projection-created-command", CorrelationID: "projection-created-correlation", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}
+	if _, err := repository.AppendTyped(ctx, "dice-1", "group-1", 0, metadata, []TypedEvent{NewGroupCreatedV1("dice-1", "group-1", "name", 1)}); err != nil {
+		t.Fatal(err)
+	}
+	stream := GroupStream("dice-1", "group-1")
+	update := db.GORM().Model(&projectionRow{}).Where("projection_name = ? AND row_key = ?", GroupProjectionName, stream.AggregateID).Update("payload", []byte(`{"version":1}`))
+	if update.Error != nil || update.RowsAffected != 1 {
+		t.Fatalf("corrupt projection update rows=%d err=%v", update.RowsAffected, update.Error)
+	}
+	metadata.EventID, metadata.CommandID, metadata.CorrelationID = "projection-next-event", "projection-next-command", "projection-next-correlation"
+	if _, err := repository.AppendTyped(ctx, "dice-1", "group-1", 1, metadata, []TypedEvent{NewGroupNameChangedV1("renamed")}); !errors.Is(err, eventstore.ErrProjectorFailure) {
+		t.Fatalf("corrupt existing projection error = %v", err)
+	}
+}
 
 func TestAppendTypedAllocatesUniqueEventIDsForBatch(t *testing.T) {
 	db, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/group-batch.db"})
