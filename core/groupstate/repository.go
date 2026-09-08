@@ -13,6 +13,8 @@ var ErrRepositoryUnavailable = errors.New("groupstate: repository unavailable")
 type Repository struct { Store eventstore.Store }
 func NewRepository(store eventstore.Store) *Repository { return &Repository{Store: store} }
 
+
+type GroupRepository = Repository
 func (r *Repository) Load(ctx context.Context, diceID, groupID string) (State, error) {
 	if r == nil || r.Store == nil { return State{}, ErrRepositoryUnavailable }
 	events, err := r.Store.Load(ctx, GroupStream(diceID, groupID), 1)

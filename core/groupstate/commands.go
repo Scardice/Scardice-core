@@ -46,6 +46,7 @@ type Command struct {
 	DiceSideNum int64
 	DiceSideExpr string
 	RollShaperMode string
+
 	DefaultHelpGroup string
 	HelpPackages []string
 	WelcomeMessage string
@@ -59,6 +60,8 @@ type Decision struct {
 	Events []TypedEvent
 	Replay bool
 }
+type GroupCommand = Command
+type GroupDecision = Decision
 
 var ErrInvalidCommand = errors.New("groupstate: invalid command")
 var ErrStaleVersion = errors.New("groupstate: stale expected version")
