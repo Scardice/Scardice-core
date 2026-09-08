@@ -191,3 +191,33 @@ func TestSafePoolDeleteIfPreservesReplacement(t *testing.T) {
 		t.Fatalf("replacement wrapper was deleted: got=%p err=%v", got, err)
 	}
 }
+
+func TestDisconnectEvictsQueuedConnectWhenTerminalQueueIsFull(t *testing.T) {
+	manager := NewSocketInstance()
+	wrapper := newClientWrapper(manager, "ws://127.0.0.1", ClientOptions{})
+	close(wrapper.connectReady)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	disconnected := make(chan struct{})
+	manager.On(EventMessage, func(*EventPayload) {
+		close(entered)
+		<-release
+	})
+	manager.On(EventConnect, func(*EventPayload) {})
+	manager.On(EventDisconnect, func(*EventPayload) { close(disconnected) })
+	wrapper.dispatchMessage(1, []byte("first"))
+	<-entered
+	for range maxWrapperEventQueue {
+		wrapper.dispatchEvent(EventConnect, nil, nil)
+	}
+	wrapper.dispatchEvent(EventDisconnect, nil, nil)
+	close(release)
+	if err := wrapper.WaitEvents(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-disconnected:
+	case <-time.After(time.Second):
+		t.Fatal("disconnect was dropped behind queued connect events")
+	}
+}

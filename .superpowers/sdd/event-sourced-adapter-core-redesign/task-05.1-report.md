@@ -446,3 +446,15 @@ ok   Scardice-core/core/messageflow
 go test ./evsocket/v2 -run 'Test(ServerWrapperUnregistersAfterTerminalCallbacksDrain|WrapperEventQueueIsBounded|TransportMessageIsBoundBeforeCopy)' -count=1
 ok   github.com/PaienNate/pineutil/evsocket/v2
 ```
+
+## Round 23 fixes
+
+- Full lifecycle queues now preserve Disconnect over queued Connect events: an incoming Disconnect evicts any non-Disconnect terminal event, while Connect preserves queued Disconnect and coalesces duplicate Connects. This prevents a dropped Disconnect from pinning runtime connection completion.
+- Added a full terminal-queue regression with queued Connect events proving Disconnect delivery after bounded admission.
+
+### Round 23 GREEN evidence
+
+```text
+go test ./evsocket/v2 -run 'Test(WrapperEventQueueIsBounded|DisconnectEvictsQueuedConnectWhenTerminalQueueIsFull|SafePoolDeleteIfPreservesReplacement)' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+```

@@ -589,7 +589,14 @@ func (kws *WebsocketWrapper) enqueueEvent(event eventEnvelope) bool {
 					break
 				}
 			}
-			if replaced < 0 && (event.payload.Name == EventDisconnect || event.payload.Name == EventConnect) {
+			if event.payload.Name == EventDisconnect {
+				for i, queued := range kws.eventQueue {
+					if queued.payload == nil || queued.payload.Name != EventDisconnect {
+						replaced = i
+						break
+					}
+				}
+			} else if event.payload.Name == EventConnect {
 				for i, queued := range kws.eventQueue {
 					if queued.payload == nil || (queued.payload.Name != EventDisconnect && queued.payload.Name != EventConnect) {
 						replaced = i
