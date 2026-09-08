@@ -1,6 +1,10 @@
 package messageflow
 
 import (
+	"Scardice-core/adapterapi"
+	"Scardice-core/core/groupstate"
+	"Scardice-core/core/playerstate"
+	"Scardice-core/eventstore"
 	"bytes"
 	"context"
 	"crypto/subtle"
@@ -8,14 +12,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
-
-	"Scardice-core/adapterapi"
-	"Scardice-core/core/groupstate"
-	"Scardice-core/core/playerstate"
-	"Scardice-core/eventstore"
 )
 
 const (
@@ -143,28 +143,47 @@ type CallbackService struct {
 	factory      eventstore.EventFactory
 }
 
+func callbackIsNil(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
+}
+
 // NewCallbackService validates and constructs the durable callback service.
 func NewCallbackService(config CallbackConfig) (*CallbackService, error) {
-	if config.Inbox == nil || config.Store == nil || config.Resolver == nil || config.Group == nil || config.Player == nil || config.Host == nil || strings.TrimSpace(config.WorkerID) == "" {
+	boundCodec := config.BoundCodec
+	if callbackIsNil(boundCodec) {
+		boundCodec = nil
+	}
+	if boundCodec == nil && !callbackIsNil(config.Codec) {
+		boundCodec, _ = config.Codec.(BoundPayloadDecryptor)
+		if callbackIsNil(boundCodec) {
+			boundCodec = nil
+		}
+	}
+	if callbackIsNil(config.Inbox) || callbackIsNil(config.Store) || callbackIsNil(config.Resolver) || callbackIsNil(config.Group) || callbackIsNil(config.Player) || callbackIsNil(config.Host) || strings.TrimSpace(config.WorkerID) == "" {
 		return nil, ErrCallbackUnavailable
 	}
-	boundCodec := config.BoundCodec
-	if boundCodec == nil && config.Codec != nil {
-		boundCodec, _ = config.Codec.(BoundPayloadDecryptor)
-	}
-	if boundCodec == nil && (!config.AllowUnboundCodec || config.Codec == nil) {
+	if boundCodec == nil && (!config.AllowUnboundCodec || callbackIsNil(config.Codec)) {
 		return nil, ErrCallbackUnavailable
 	}
 	if config.LeaseDuration <= 0 {
 		config.LeaseDuration = time.Minute
 	}
-	if config.Clock == nil {
+	if callbackIsNil(config.Clock) {
 		config.Clock = eventstore.SystemClock{}
 	}
-	if config.Factory.Clock == nil {
+	if callbackIsNil(config.Factory.Clock) {
 		config.Factory.Clock = config.Clock
 	}
-	if config.Factory.IDs == nil {
+	if callbackIsNil(config.Factory.IDs) {
 		config.Factory.IDs = eventstore.UUIDGenerator{}
 	}
 	return &CallbackService{
@@ -279,8 +298,12 @@ func (s *CallbackService) ProcessOne(ctx context.Context) (summary CallbackResul
 func (s *CallbackService) decodeClaimed(ctx context.Context, update eventstore.InboxUpdate) (ingressPayload, error) {
 	var plaintext []byte
 	var err error
+	version := update.PayloadVersion
+	if version == 0 {
+		version = 1
+	}
 	if s.boundCodec != nil {
-		plaintext, err = s.boundCodec.DecryptBound(ctx, "inbox/v1", update.InboxID, update.EndpointID, 1, append([]byte(nil), update.PayloadCiphertext...), append([]byte(nil), update.PayloadNonce...), update.PayloadEncryptionKeyID)
+		plaintext, err = s.boundCodec.DecryptBound(ctx, "inbox/v1", update.InboxID, update.EndpointID, version, append([]byte(nil), update.PayloadCiphertext...), append([]byte(nil), update.PayloadNonce...), update.PayloadEncryptionKeyID)
 	} else if s.allowUnbound && s.codec != nil {
 		plaintext, err = s.codec.Decrypt(ctx, append([]byte(nil), update.PayloadCiphertext...), append([]byte(nil), update.PayloadNonce...), update.PayloadEncryptionKeyID)
 	} else {
@@ -643,10 +666,10 @@ type MutationCollector struct {
 }
 
 func NewMutationCollector(factory eventstore.EventFactory) *MutationCollector {
-	if factory.Clock == nil {
+	if callbackIsNil(factory.Clock) {
 		factory.Clock = eventstore.SystemClock{}
 	}
-	if factory.IDs == nil {
+	if callbackIsNil(factory.IDs) {
 		factory.IDs = eventstore.UUIDGenerator{}
 	}
 	return &MutationCollector{factory: factory, streams: map[eventstore.StreamID]eventstore.StreamAppend{}, plugins: map[string]eventstore.PluginKVUpdate{}, effects: map[string]eventstore.NewEffect{}}

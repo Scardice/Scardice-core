@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 func TestTask4WorkflowLinkAndInboxCompletionAreAtomic(t *testing.T) {
@@ -266,6 +268,23 @@ func TestTask4OpaqueInboxReplayRejectsWorkflowLink(t *testing.T) {
 	}
 	if events, err := store.Load(ctx, StreamID{AggregateType: "message-workflow", AggregateID: workflowID}, 1); err != nil || len(events) != 0 {
 		t.Fatalf("workflow partial events=%d err=%v", len(events), err)
+	}
+}
+func TestTask4NewInboxRejectsUnlinkedWorkflow(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	work := UnitOfWork{InboxUpdates: []InboxUpdate{{
+		InboxID: "task4-unlinked-inbox", EndpointID: "endpoint", ProviderEventKey: "task4-unlinked-provider",
+		LaneHMAC: []byte("task4-unlinked-lane"), Status: InboxStatusPending, WorkflowID: "workflow-unlinked",
+		PayloadCiphertext: []byte("ciphertext"), PayloadNonce: []byte("nonce"), DigestKeyID: "key",
+	}}}
+	if _, err := store.Commit(ctx, work); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("unlinked workflow insert err=%v", err)
+	}
+	var row inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", "task4-unlinked-inbox").First(&row).Error; !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("unlinked workflow row err=%v row=%#v", err, row)
 	}
 }
 

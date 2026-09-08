@@ -414,6 +414,7 @@ type InboxUpdate struct {
 	AttemptID         string
 	PayloadCiphertext []byte
 	PayloadNonce      []byte
+	PayloadVersion    uint64
 	ContentDigest     []byte
 	// DigestKeyID is the legacy payload-key field. New A6 callers should set
 	// PayloadEncryptionKeyID and ContentDigestKeyID separately.

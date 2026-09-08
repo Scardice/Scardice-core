@@ -13,6 +13,21 @@ import (
 	"Scardice-core/eventstore"
 )
 
+func TestCallbackRejectsTypedNilDependencies(t *testing.T) {
+	var inbox *callbackTestInbox
+	if _, err := NewCallbackService(CallbackConfig{
+		Inbox: inbox, Store: &callbackTestStore{}, Codec: callbackTestCodec{}, AllowUnboundCodec: true,
+		Resolver: callbackTestResolver{}, Group: callbackTestGroupLoader{}, Player: callbackTestPlayerLoader{},
+		Host: &callbackTestHost{}, WorkerID: "worker",
+	}); !errors.Is(err, ErrCallbackUnavailable) {
+		t.Fatalf("typed-nil callback dependency err=%v", err)
+	}
+	var clock *callbackFixedClock
+	if collector := NewMutationCollector(eventstore.EventFactory{Clock: clock}); collector == nil {
+		t.Fatal("typed-nil collector clock returned nil collector")
+	}
+}
+
 func TestCallbackProcessOneClaimsAndMarksBeforeHost(t *testing.T) {
 	inbox := newCallbackTestInbox()
 	store := &callbackTestStore{}
@@ -533,6 +548,25 @@ func TestCallbackSQLiteMarkerAndTerminalCommit(t *testing.T) {
 	}
 	if _, err := store.ClaimInbox(ctx, eventstore.InboxClaimRequest{WorkerID: "second-worker"}); !errors.Is(err, eventstore.ErrNotFound) {
 		t.Fatalf("terminal inbox was claimable: %v", err)
+	}
+}
+func TestCallbackBoundDecryptUsesPersistedPayloadVersion(t *testing.T) {
+	inbox := newCallbackTestInbox()
+	inbox.lease.Update.PayloadVersion = 7
+	boundVersion := uint64(0)
+	codec := callbackTestBoundCodec{version: &boundVersion}
+	service, err := NewCallbackService(CallbackConfig{
+		Inbox: inbox, Store: &callbackTestStore{}, Codec: codec, Resolver: callbackTestResolver{},
+		Group: callbackTestGroupLoader{}, Player: callbackTestPlayerLoader{}, Host: &callbackTestHost{}, WorkerID: "worker",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if boundVersion != 7 {
+		t.Fatalf("bound decrypt version=%d", boundVersion)
 	}
 }
 
