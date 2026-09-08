@@ -716,6 +716,100 @@ func TestCallbackSQLiteExpiredLeaseStillMarksAmbiguous(t *testing.T) {
 	}
 }
 
+func TestCallbackSQLiteCommitExpiryFinalizesStartedAndPreservesLaneOrder(t *testing.T) {
+	var successorID string
+	ctx := context.Background()
+	clock := &callbackFixedClock{now: time.Now().UTC()}
+	source := &callbackA6KeySource{}
+	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "callback-commit-expired.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := eventstore.NewStore(db, eventstore.WithClock(clock), eventstore.WithKeySource(source))
+	if err := store.SetReadiness(ctx, eventstore.Readiness{
+		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: "index-v1",
+		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
+		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	inbound, err := NewInboundService(store, store, WithIngressClock(clock))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstReceipt, err := inbound.HandleInbound(ctx, endpoint.FencedInbound{
+		EndpointID: "endpoint", Generation: 1, DesiredVersion: 1,
+		Message: adapterapi.InboundMessage{
+			ProviderEventID: "commit-expired-provider", MessageID: "commit-expired-message",
+			Platform: "test", Sender: "sender", Conversation: "group", Target: "group",
+			Kind: adapterapi.InboundKindMessage, Text: "first",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstReceipt.Outcome != adapterapi.IngressAccepted || firstReceipt.InboxID == "" {
+		t.Fatalf("first ingress receipt=%#v", firstReceipt)
+	}
+	host := &callbackTestHost{}
+	host.fn = func(hostCtx context.Context, _ CallbackRequest, _ *playerstate.LocalOverlay, _ *MutationCollector) (CallbackResult, error) {
+		if host.calls == 1 {
+			clock.now = clock.now.Add(IngressPayloadTTL + time.Minute)
+			successorReceipt, ingressErr := inbound.HandleInbound(hostCtx, endpoint.FencedInbound{
+				EndpointID: "endpoint", Generation: 1, DesiredVersion: 1,
+				Message: adapterapi.InboundMessage{
+					ProviderEventID: "commit-expired-successor", MessageID: "commit-expired-successor-message",
+					Platform: "test", Sender: "sender", Conversation: "group", Target: "group",
+					Kind: adapterapi.InboundKindMessage, Text: "successor",
+				},
+			})
+			if ingressErr != nil {
+				return CallbackResult{}, ingressErr
+			}
+			successorID = successorReceipt.InboxID
+			if successorID == "" {
+				return CallbackResult{}, errors.New("successor inbox ID missing")
+			}
+		}
+		return CallbackResult{}, nil
+	}
+	service, err := NewCallbackService(CallbackConfig{
+		Inbox: store, Store: store, BoundCodec: store, Resolver: callbackTestResolver{},
+		Group: groupstate.NewRepository(store), Player: playerstate.NewRepository(store),
+		Host: host, WorkerID: "worker", LeaseDuration: time.Minute, Clock: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, processErr := service.ProcessOne(ctx)
+	var firstRow eventstoreInboxRowForTest
+	if err := db.GORM().Table("inbox_messages").Where("inbox_id = ?", firstReceipt.InboxID).Scan(&firstRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(processErr, eventstore.ErrPayloadExpired) {
+		t.Fatalf("expired commit err=%v", processErr)
+	}
+	if errors.Is(processErr, eventstore.ErrStaleLease) {
+		t.Fatalf("expired commit returned stale marker error: %v", processErr)
+	}
+	if firstRow.Status != eventstore.InboxStatusAmbiguous || len(firstRow.PayloadCiphertext) != 0 {
+		t.Fatalf("expired callback-started row=%#v", firstRow)
+	}
+	var successorRow eventstoreInboxRowForTest
+	if err := db.GORM().Table("inbox_messages").Where("inbox_id = ?", successorID).Scan(&successorRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if successorRow.Status != eventstore.InboxStatusPending {
+		t.Fatalf("successor row=%#v", successorRow)
+	}
+	if _, err := service.ProcessOne(ctx); !errors.Is(err, eventstore.ErrNotFound) {
+		t.Fatalf("ambiguous predecessor did not hold lane: %v", err)
+	}
+	if host.calls != 1 {
+		t.Fatalf("blocked lane retried host calls=%d", host.calls)
+	}
+}
 func TestCallbackSQLiteRecoversExpiredStartedAndClaimsSuccessor(t *testing.T) {
 	ctx := context.Background()
 	clock := &callbackFixedClock{now: time.Unix(100, 0).UTC()}

@@ -2214,11 +2214,15 @@ func (s *GORMStore) task5PersistExpiredPayloads(ctx context.Context, work UnitOf
 		var row inboxMessageRow
 		if q := locked(tx).Where("inbox_id = ?", id).First(&row); q.Error != nil {
 			return ErrParticipantFailure
-		} else if len(row.PayloadCiphertext) == 0 && len(row.PayloadNonce) == 0 {
-			seenInbox[id] = true
-			return nil
-		} else if err = task5ScrubInbox(tx, &row, now, false); err != nil {
-			return err
+		}
+		if row.Status == InboxStatusCallbackStarted {
+			if err = task5FinalizeInboxPayload(tx, &row, now, InboxStatusAmbiguous, "payload-expired"); err != nil {
+				return err
+			}
+		} else if len(row.PayloadCiphertext) != 0 || len(row.PayloadNonce) != 0 {
+			if err = task5ScrubInbox(tx, &row, now, false); err != nil {
+				return err
+			}
 		}
 		seenInbox[id] = true
 		return nil
