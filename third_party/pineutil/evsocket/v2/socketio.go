@@ -582,6 +582,15 @@ func (kws *WebsocketWrapper) enqueueEvent(event eventEnvelope) bool {
 	kws.eventMu.Lock()
 	if len(kws.eventQueue) >= maxWrapperEventQueue {
 		if isTerminalWrapperEvent(event) {
+			if event.payload.Name == EventConnect {
+				for _, queued := range kws.eventQueue {
+					if queued.payload != nil && queued.payload.Name == EventConnect {
+						kws.droppedEvents.Add(1)
+						kws.eventMu.Unlock()
+						return false
+					}
+				}
+			}
 			replaced := -1
 			for i, queued := range kws.eventQueue {
 				if !isTerminalWrapperEvent(queued) {

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"Scardice-core/adapterapi"
 	"Scardice-core/endpoint"
@@ -93,19 +94,26 @@ func (s *InboundService) CollisionCount() uint64 { return s.collisions.Load() }
 
 func inboundJSONEscapedLen(value string) int {
 	total := 0
-	for i := 0; i < len(value); i++ {
-		switch value[i] {
+	for i := 0; i < len(value); {
+		r, size := utf8.DecodeRuneInString(value[i:])
+		if r == utf8.RuneError && size == 1 {
+			total += 6
+			i++
+			continue
+		}
+		switch r {
 		case '"', '\\', '\b', '\f', '\n', '\r', '\t':
 			total += 2
-		case '<', '>', '&':
+		case '<', '>', '&', '\u2028', '\u2029':
 			total += 6
 		default:
-			if value[i] < 0x20 {
+			if r < 0x20 {
 				total += 6
 			} else {
-				total++
+				total += size
 			}
 		}
+		i += size
 	}
 	return total
 }

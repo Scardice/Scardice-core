@@ -1,6 +1,7 @@
 package messageflow
 
 import (
+	"encoding/json"
 	"context"
 	"errors"
 	"strings"
@@ -187,6 +188,28 @@ func TestInboundPayloadUpperBoundAllowsNormal100KiBMessage(t *testing.T) {
 	}
 }
 
+func TestInboundJSONEscapedLenCoversUnicodeLineSeparators(t *testing.T) {
+	value := "\u2028\u2029"
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := inboundJSONEscapedLen(value), len(encoded)-2; got != want {
+		t.Fatalf("escaped length = %d, want %d", got, want)
+	}
+}
+
+
+func TestInboundJSONEscapedLenCoversInvalidUTF8Replacement(t *testing.T) {
+	value := string([]byte{0xff})
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := inboundJSONEscapedLen(value), len(encoded)-2; got < want {
+		t.Fatalf("escaped length = %d, want at least %d", got, want)
+	}
+}
 func TestInboundServiceStableIDChangedBodyIsCollision(t *testing.T) {
 	repo := &ingressRepoStub{}
 	svc, err := NewInboundService(repo, ingressCryptoStub{})

@@ -470,3 +470,18 @@ ok   github.com/PaienNate/pineutil/evsocket/v2
 go test ./evsocket/v2 -run 'TestDuplicateDisconnectCoalescesWhenTerminalQueueIsFull' -count=1
 ok   github.com/PaienNate/pineutil/evsocket/v2
 ```
+
+## Round 25 fixes
+
+- Made inbound escaped-length preflight rune-aware for JSON's `\u2028`/`\u2029` HTML-safe escapes and invalid UTF-8 replacement output, preserving the no-oversized-marshal invariant.
+- Full Connect admission now coalesces a duplicate queued Connect before evicting ordinary events. Added unicode/invalid-byte sizing and duplicate-Connect queue regressions.
+
+### Round 25 GREEN evidence
+
+```text
+go test ./core/messageflow -run 'TestInboundJSONEscapedLenCovers(UnicodeLineSeparators|InvalidUTF8Replacement)' -count=1
+ok   Scardice-core/core/messageflow
+
+go test ./evsocket/v2 -run 'Test(DuplicateConnectCoalescesBeforeEvictingOrdinaryQueue|DuplicateDisconnectCoalescesWhenTerminalQueueIsFull|DisconnectEvictsQueuedConnectWhenTerminalQueueIsFull)' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+```
