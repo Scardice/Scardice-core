@@ -388,21 +388,24 @@ func TestOnebotRuntimeInboundRetryIsBounded(t *testing.T) {
 	}
 }
 
-func TestOnebotRuntimePriorityEventEvictsInboundAdmission(t *testing.T) {
+func TestOnebotRuntimePriorityEventCoalescesAndPreemptsInbound(t *testing.T) {
 	runtime := newOnebotRuntime(OnebotConfig{}, nil)
 	for range cap(runtime.events) {
 		runtime.events <- onebotRuntimeEvent{kind: "inbound"}
 	}
-	if !runtime.enqueue(onebotRuntimeEvent{kind: "disconnect"}) {
-		t.Fatal("priority disconnect was not admitted")
+	if !runtime.enqueue(onebotRuntimeEvent{kind: "disconnect"}) || !runtime.enqueue(onebotRuntimeEvent{kind: "disconnect"}) {
+		t.Fatal("priority disconnect was not admitted/coalesced")
 	}
 	select {
-	case event := <-runtime.priorityEvents:
+	case event := <-runtime.priorityDisconnect:
 		if event.kind != "disconnect" {
 			t.Fatalf("priority event = %q", event.kind)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("priority disconnect missing after admission")
+	}
+	if runtime.priorityDropped.Load() != 1 {
+		t.Fatalf("coalesced priority count = %d", runtime.priorityDropped.Load())
 	}
 	if len(runtime.events) != cap(runtime.events) {
 		t.Fatalf("inbound queue changed while admitting priority event: %d", len(runtime.events))
@@ -424,6 +427,7 @@ func TestOnebotRuntimeDiagnosticsExposeIngressCounters(t *testing.T) {
 		"inbound.backpressure": "Inbound backpressure events: 2",
 		"inbound.conflicts":    "Inbound identity conflicts: 1",
 		"inbound.retries":      "Inbound bounded rehandoffs: 4",
+		"priority.coalesced": "Coalesced duplicate priority events: 0",
 		"transport.dropped_events": "Transport callback events dropped at queue admission: 0",
 	}
 	for _, entry := range report.Entries {

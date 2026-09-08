@@ -67,8 +67,10 @@ type onebotRuntime struct {
 	doneOnce sync.Once
 	stopCh   chan struct{}
 	doneCh   chan struct{}
+	priorityConnect chan onebotRuntimeEvent
+	priorityDisconnect chan onebotRuntimeEvent
+	priorityAuthFailed chan onebotRuntimeEvent
 	events   chan onebotRuntimeEvent
-	priorityEvents chan onebotRuntimeEvent
 	fenced   atomic.Bool
 	stopReq  atomic.Bool
 	callbackMu sync.Mutex
@@ -83,6 +85,7 @@ type onebotRuntime struct {
 	inboundCollisions atomic.Uint64
 	inboundRetries atomic.Uint64
 	transportDropped atomic.Uint64
+	priorityDropped atomic.Uint64
 	transportDropMu sync.Mutex
 }
 type onebotConnectionState struct {
@@ -149,8 +152,10 @@ func newOnebotRuntime(config OnebotConfig, resolver adapterapi.SecretResolver, l
 	return &onebotRuntime{
 		config: config, resolver: resolver, listenerFactory: listenerFactory,
 		stopCh: make(chan struct{}), doneCh: make(chan struct{}),
+		priorityConnect: make(chan onebotRuntimeEvent, 1),
+		priorityDisconnect: make(chan onebotRuntimeEvent, 1),
+		priorityAuthFailed: make(chan onebotRuntimeEvent, 1),
 		events: make(chan onebotRuntimeEvent, 32),
-		priorityEvents: make(chan onebotRuntimeEvent, 4),
 		connections: make(map[*socketio.WebsocketWrapper]onebotConnectionState),
 	}
 }
@@ -460,6 +465,7 @@ func (r *onebotRuntime) Diagnostics(context.Context) adapterapi.DiagnosticReport
 		count("inbound.backpressure", "Inbound backpressure events", r.inboundBackpressure.Load()),
 		count("inbound.conflicts", "Inbound identity conflicts", r.inboundCollisions.Load()),
 		count("inbound.retries", "Inbound bounded rehandoffs", r.inboundRetries.Load()),
+		count("priority.coalesced", "Coalesced duplicate priority events", r.priorityDropped.Load()),
 		count("transport.dropped_events", "Transport callback events dropped at queue admission", dropped),
 	}}
 }
@@ -538,7 +544,15 @@ func (r *onebotRuntime) Run(ctx context.Context, core adapterapi.CorePort) (runE
 				return nil
 			}
 			return runCtx.Err()
-		case event := <-r.priorityEvents:
+		case event := <-r.priorityConnect:
+			if err := r.processRuntimeEvent(runCtx, event); err != nil {
+				return err
+			}
+		case event := <-r.priorityDisconnect:
+			if err := r.processRuntimeEvent(runCtx, event); err != nil {
+				return err
+			}
+		case event := <-r.priorityAuthFailed:
 			if err := r.processRuntimeEvent(runCtx, event); err != nil {
 				return err
 			}
@@ -746,22 +760,27 @@ func (r *onebotRuntime) installCallbacks(manager *socketio.SocketInstance, token
 	})
 }
 
-func isOnebotPriorityEvent(kind string) bool {
+func priorityChannel(r *onebotRuntime, kind string) chan onebotRuntimeEvent {
 	switch kind {
-	case "connect", "disconnect", "auth_failed":
-		return true
+	case "connect":
+		return r.priorityConnect
+	case "disconnect":
+		return r.priorityDisconnect
+	case "auth_failed":
+		return r.priorityAuthFailed
 	default:
-		return false
+		return nil
 	}
 }
 
 func (r *onebotRuntime) enqueue(event onebotRuntimeEvent) bool {
-	if isOnebotPriorityEvent(event.kind) {
+	if channel := priorityChannel(r, event.kind); channel != nil {
 		select {
-		case r.priorityEvents <- event:
+		case channel <- event:
 			return true
 		default:
-			return false
+			r.priorityDropped.Add(1)
+			return true
 		}
 	}
 	select {

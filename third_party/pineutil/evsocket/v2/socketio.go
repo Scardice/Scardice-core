@@ -538,7 +538,7 @@ func (kws *WebsocketWrapper) dispatchMessage(opcode gws.Opcode, data []byte) {
 
 func (kws *WebsocketWrapper) shouldQueueEvent(event string) bool {
 	switch event {
-	case EventMessage, EventPing, EventPong, EventDisconnect, EventError, EventClose:
+	case EventMessage, EventPing, EventPong, EventConnect, EventDisconnect, EventError, EventClose:
 		return true
 	default:
 		return false

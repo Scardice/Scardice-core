@@ -298,3 +298,21 @@ ok   Scardice-core/dice
 go test ./evsocket/v2 -run 'TestTransportMessageIsBoundBeforeCopy' -count=1
 ok   github.com/PaienNate/pineutil/evsocket/v2
 ```
+
+
+## Round 12 fixes
+
+- Control ingress now has bounded per-kind slots for connect, disconnect, and auth-failed events. Repeated controls coalesce and increment `priority.coalesced`; they never block or silently displace a different control kind. Run drains all control slots before ordinary ingress processing.
+- The wrapper queues EventConnect with disconnect/error lifecycle events, preserving callback ordering through reconnect and shutdown.
+- Active connection state carries the drop baseline, so disconnected wrapper pointers are not retained.
+
+### Round 12 GREEN evidence
+
+```text
+go test ./dice ./core/messageflow -run 'Test(InboundService|OnebotInbound|OnebotRuntime(PriorityEventCoalescesAndPreemptsInbound|InboundRetryIsBounded|Diagnostics(RetainCompletedTransportDrops|ExposeIngressCounters)|InboundQueueBackpressureIsNonBlocking|KeepsAliveOnRetryableInboundError))' -count=1
+ok   Scardice-core/dice
+ok   Scardice-core/messageflow
+
+go test ./evsocket/v2 -run 'Test(WrapperEventQueueIsBounded|ShutdownWaitDrainsQueuedWrapperEvents|ConnectReadySignalIsIdempotentAcrossReconnects|TransportMessageIsBoundBeforeCopy)' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+```
