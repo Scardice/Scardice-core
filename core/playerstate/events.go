@@ -55,6 +55,17 @@ const (
 	ModerationRankChanged = EventModerationRankChanged
 	ModerationDeleted = EventModerationDeleted
 )
+func (e EventType) Valid() bool {
+	switch e {
+	case EventPlayerCreated, EventPlayerNameChanged, EventPlayerPrivilegeChanged, EventPlayerTemplateChanged, EventPlayerLastCommandChanged,
+		EventGroupUserAttrsCreated, EventGroupUserAttrsBindingChanged, EventGroupUserAttrsSet, EventGroupUserAttrsIncremented,
+		EventGroupUserAttrsDeleted, EventGroupUserAttrsCleared, EventCharacterCreated, EventCharacterRenamed, EventCharacterSheetReplaced,
+		EventCharacterDeleted, EventModerationCreated, EventModerationScoreChanged, EventModerationRankChanged, EventModerationDeleted:
+		return true
+	default:
+		return false
+	}
+}
 
 var (
 	ErrInvalidEvent = errors.New("playerstate: invalid event")
