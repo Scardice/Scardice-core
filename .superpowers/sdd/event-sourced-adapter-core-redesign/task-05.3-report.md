@@ -52,7 +52,7 @@ Coverage includes disjoint streams and purge prefixes, player replay and immutab
 
 ## Strictness follow-up
 
-The focused regressions also cover bounded scoped identities (including character IDs, binding IDs, subjects, and purge users), typed-nil event rejection before interface method dispatch, payload-size rejection before JSON parsing, reducer version-overflow rejection, two moderation subjects replaying in independent streams while remaining covered by one group purge prefix, and rejection of plaintext moderation reasons in favor of 64-character hexadecimal digests.
+The focused regressions also cover bounded scoped identities (including character IDs, binding IDs, subjects, and purge users), typed-nil event rejection before interface method dispatch, nonnil pointer event compatibility across all owners, payload-size rejection before JSON parsing, reducer version-overflow rejection, two moderation subjects replaying in independent streams while remaining covered by one group purge prefix, and rejection of plaintext moderation reasons in favor of 64-character hexadecimal digests.
 
 ## Writer migration boundary
 

@@ -102,6 +102,19 @@ func TestTypedNilEventIsRejected(t *testing.T) {
 	var event *PlayerNameChangedV1
 	if _, err := ReducePlayer(PlayerState{}, event); err != ErrInvalidEvent { t.Fatalf("typed nil error = %v", err) }
 }
+func TestPointerEventsMarshalAcrossOwners(t *testing.T) {
+	player := &PlayerNameChangedV1{Name: "name"}
+	attrs := &GroupUserAttrsCreatedV1{DiceID: "dice-1", GroupID: "group-1", UserID: "user-1"}
+	character := &CharacterRenamedV1{Name: "Hero"}
+	moderation := &ModerationRankChangedV1{Rank: 1}
+	if _, err := MarshalPlayerEvent(player); err != nil { t.Fatalf("player pointer: %v", err) }
+	if _, err := MarshalGroupUserAttrsEvent(attrs); err != nil { t.Fatalf("attrs pointer: %v", err) }
+	if _, err := MarshalCharacterEvent(character); err != nil { t.Fatalf("character pointer: %v", err) }
+	if _, err := MarshalModerationEvent(moderation); err != nil { t.Fatalf("moderation pointer: %v", err) }
+	meta := eventstore.Metadata{EventID: "pointer", CommandID: "command", CorrelationID: "correlation", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}
+	if _, err := NewEvent(player, meta); err != nil { t.Fatalf("NewEvent pointer: %v", err) }
+	if _, err := NewEventWithFactory(eventstore.EventFactory{}, player, meta); err != nil { t.Fatalf("factory pointer: %v", err) }
+}
 func TestRepositoryValidatesReplayBeforeCommitWithoutProjector(t *testing.T) {
 	ctx := context.Background()
 	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/validation.db"})
