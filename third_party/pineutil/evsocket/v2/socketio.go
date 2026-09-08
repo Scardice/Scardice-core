@@ -430,6 +430,8 @@ type WebsocketWrapper struct {
 	alive         atomic.Bool
 	transport     atomic.Pointer[gws.Conn]
 	connectedOnce atomic.Bool
+	serverClosed  atomic.Bool
+	serverTerminalPending atomic.Int32
 	clientState   clientTransportState
 	heartbeatStop chan struct{}
 	heartbeatConn *gws.Conn
@@ -442,7 +444,6 @@ type WebsocketWrapper struct {
 	// first successful connection so reconnects cannot strand an existing drain.
 	connectReady     chan struct{}
 	connectReadyOnce sync.Once
-
 	OnConnected    func()
 	OnDisconnected func(err error)
 	OnConnectError func(err error)
@@ -635,13 +636,20 @@ func (kws *WebsocketWrapper) drainEvents() {
 		kws.eventMu.Lock()
 		if len(kws.eventQueue) == 0 {
 			kws.eventDraining = false
+			readyToUnregister := !kws.clientMode && kws.serverClosed.Load() && kws.serverTerminalPending.Load() == 0
 			kws.eventMu.Unlock()
+			if readyToUnregister {
+				kws.manager.unregisterWrapper(kws)
+			}
 			return
 		}
 		event := kws.eventQueue[0]
 		kws.eventQueue = kws.eventQueue[1:]
 		kws.eventMu.Unlock()
 		kws.invokeEventCallbacks(event)
+		if !kws.clientMode && kws.serverClosed.Load() && (event.payload.Name == EventDisconnect || event.payload.Name == EventError) {
+			kws.serverTerminalPending.Add(-1)
+		}
 		kws.eventWG.Done()
 	}
 }
@@ -1075,13 +1083,17 @@ func (kws *WebsocketWrapper) finalizeTransportClose(socket *gws.Conn, err error)
 		kws.clientState = clientTransportStateDisconnected
 	}
 	kws.stateMu.Unlock()
-	kws.manager.pool.delete(kws.GetUUID())
+	if !kws.clientMode {
+		kws.serverClosed.Store(true)
+		pending := int32(1)
+		if err != nil {
+			pending++
+		}
+		kws.serverTerminalPending.Store(pending)
+	}
 	kws.dispatchEvent(EventDisconnect, nil, err)
 	if err != nil {
 		kws.dispatchEvent(EventError, nil, err)
-	}
-	if !kws.clientMode {
-		kws.manager.unregisterWrapper(kws)
 	}
 	return true
 }

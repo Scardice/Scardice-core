@@ -342,3 +342,15 @@ ok   github.com/PaienNate/pineutil/evsocket/v2
 go test ./dice -run 'TestOnebotRuntime(PriorityEventCoalescesAndPreemptsInbound|Diagnostics(RetainCompletedTransportDrops|ExposeIngressCounters)|InboundRetryIsBounded)' -count=1
 ok   Scardice-core/dice
 ```
+
+## Round 15 fixes
+
+- Server wrappers now mark terminal closure but defer registry removal until their queued terminal callbacks have drained. This preserves `ShutdownWait`'s callback-drain contract while still preventing registry retention after lifecycle completion. Failed upgrade/start-reader paths continue to unregister immediately.
+- Added a lifecycle regression that queues a server disconnect callback, waits for callback completion, and verifies registry removal only after the drain.
+
+### Round 15 GREEN evidence
+
+```text
+go test ./evsocket/v2 -run 'Test(ServerWrapperRegistryUnregistersChurn|ServerWrapperUnregistersAfterTerminalCallbacksDrain|ShutdownWaitDrainsQueuedWrapperEvents|WrapperEventQueueIsBounded)' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+```

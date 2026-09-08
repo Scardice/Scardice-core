@@ -139,3 +139,22 @@ func TestServerWrapperRegistryUnregistersChurn(t *testing.T) {
 		t.Fatalf("registered wrappers after churn = %d", len(manager.wrappers))
 	}
 }
+
+func TestServerWrapperUnregistersAfterTerminalCallbacksDrain(t *testing.T) {
+	manager := NewSocketInstance()
+	wrapper := newServerWrapper(manager)
+	manager.registerWrapper(wrapper)
+	close(wrapper.connectReady)
+	manager.On(EventDisconnect, func(*EventPayload) {})
+	wrapper.serverClosed.Store(true)
+	wrapper.serverTerminalPending.Store(1)
+	wrapper.dispatchEvent(EventDisconnect, nil, nil)
+	if err := wrapper.WaitEvents(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.wrappersMu.Lock()
+	defer manager.wrappersMu.Unlock()
+	if _, ok := manager.wrappers[wrapper]; ok {
+		t.Fatal("server wrapper unregistered before terminal callback drain")
+	}
+}
