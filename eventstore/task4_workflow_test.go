@@ -194,6 +194,50 @@ func TestTask4DirectInboxUpdateRejectsCompletedAt(t *testing.T) {
 		t.Fatalf("inbox changed after rejected completed-at update=%#v", row)
 	}
 }
+func TestTask4A6TerminalStatusOnlyCommitSucceeds(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	ciphertext, nonce, keyID, err := a6Seal(ctx, source, "inbox/v1", "task4-a6-terminal", "endpoint", 1, []byte("payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox := InboxUpdate{
+		InboxID: "task4-a6-terminal", EndpointID: "endpoint", ProviderEventKey: "task4-a6-provider",
+		LaneHMAC: []byte("task4-a6-lane"), Status: InboxStatusPending,
+		PayloadCiphertext: ciphertext, PayloadNonce: nonce, PayloadEncryptionKeyID: keyID,
+	}
+	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "task4-a6-worker", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := InboxUpdate{
+		InboxID: lease.Update.InboxID, ExpectedVersion: lease.Update.Version, Version: lease.Update.Version + 1,
+		Status: InboxStatusCallbackStarted, LeaseOwner: lease.Update.LeaseOwner, LeaseEpoch: lease.Update.LeaseEpoch,
+		AttemptID: lease.Update.AttemptID, LeaseExpiresAt: lease.Update.LeaseExpiresAt,
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{started}}); err != nil {
+		t.Fatal(err)
+	}
+	terminal := InboxUpdate{
+		InboxID: lease.Update.InboxID, ExpectedVersion: started.Version, Version: started.Version + 1,
+		Status: InboxStatusConfirmedConsumed, LeaseOwner: lease.Update.LeaseOwner, LeaseEpoch: lease.Update.LeaseEpoch,
+		AttemptID: lease.Update.AttemptID, LeaseExpiresAt: lease.Update.LeaseExpiresAt, CompletedAt: time.Now().UTC(),
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{terminal}}); err != nil {
+		t.Fatalf("A6 terminal status-only commit err=%v", err)
+	}
+	var row inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != InboxStatusConfirmedConsumed || len(row.PayloadCiphertext) != 0 || row.EncryptionKeyID != keyID {
+		t.Fatalf("A6 terminal row=%#v", row)
+	}
+}
 func TestTask4OpaqueInboxReplayRejectsWorkflowLink(t *testing.T) {
 	store, db, _ := task5Store(t)
 	defer db.Close()

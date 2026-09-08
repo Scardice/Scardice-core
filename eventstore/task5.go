@@ -2781,15 +2781,18 @@ func (s *GORMStore) applyTask5InboxParticipants(ctx context.Context, tx *gorm.DB
 		return updates[i].InboxID < updates[j].InboxID
 	})
 	for _, update := range updates {
+		payloadBearing := len(update.PayloadCiphertext) > 0 || len(update.PayloadNonce) > 0 || len(update.ContentDigest) > 0 || update.PayloadEncryptionKeyID != "" || update.ContentDigestKeyID != "" || update.DigestKeyID != ""
 		payloadKeyID := task5PayloadKeyID(update)
-		if err := task5ValidateKeyFields(s.keySource, update.DigestKeyID, update.PayloadEncryptionKeyID); err != nil {
-			return err
+		if payloadBearing {
+			if err := task5ValidateKeyFields(s.keySource, update.DigestKeyID, update.PayloadEncryptionKeyID); err != nil {
+				return err
+			}
+			digestKeyID, digestErr := s.task5CanonicalDigestKeyID(ctx, update.ContentDigestKeyID)
+			if digestErr != nil {
+				return digestErr
+			}
+			update.ContentDigestKeyID = digestKeyID
 		}
-		digestKeyID, digestErr := s.task5CanonicalDigestKeyID(ctx, update.ContentDigestKeyID)
-		if digestErr != nil {
-			return digestErr
-		}
-		update.ContentDigestKeyID = digestKeyID
 		if update.InboxID == "" {
 			return ErrParticipantFailure
 		}
