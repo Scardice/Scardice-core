@@ -118,7 +118,7 @@ type PlayerDeletedV1 struct{}
 func NewPlayerDeletedV1() PlayerDeletedV1 { return PlayerDeletedV1{} }
 func (PlayerDeletedV1) EventType() EventType { return EventPlayerDeleted }
 func (PlayerDeletedV1) playerValidate() error{return nil}
-func (PlayerDeletedV1) playerApply(s *PlayerState) error { if s.Version==0{return ErrInvalidState}; s.Name=""; s.AutoSetNameTemplate=""; s.Deleted=true; return nil }
+func (PlayerDeletedV1) playerApply(s *PlayerState) error { if s.Version==0 || s.Deleted{return ErrInvalidState}; s.Name=""; s.AutoSetNameTemplate=""; s.Deleted=true; return nil }
 
 type EncryptedValue struct { Ciphertext []byte `json:"ciphertext,omitempty"`; KeyID string `json:"keyId,omitempty"` }
 func NewEncryptedValue(ciphertext []byte,keyID string)EncryptedValue{return EncryptedValue{append([]byte(nil),ciphertext...),keyID}}
@@ -182,7 +182,7 @@ type CharacterDeletedV1 struct{}
 func NewCharacterDeletedV1() CharacterDeletedV1{return CharacterDeletedV1{}}
 func (CharacterDeletedV1) EventType() EventType{return EventCharacterDeleted}
 func (CharacterDeletedV1) characterValidate()error{return nil}
-func (CharacterDeletedV1) characterApply(s *CharacterState)error{if s.Version==0{return ErrInvalidState};s.Name="";s.Sheet=EncryptedValue{};s.Deleted=true;return nil}
+func (CharacterDeletedV1) characterApply(s *CharacterState)error{if s.Version==0||s.Deleted{return ErrInvalidState};s.Name="";s.Sheet=EncryptedValue{};s.Deleted=true;return nil}
 
 type ModerationCreatedV1 struct { DiceID string `json:"diceId"`; GroupID string `json:"groupId"`; SubjectID string `json:"subjectId"`; Rank int `json:"rank"`; Score int64 `json:"score"` }
 func NewModerationCreatedV1(diceID,groupID,subjectID string,rank int,score int64) ModerationCreatedV1{return ModerationCreatedV1{diceID,groupID,subjectID,rank,score}}
@@ -206,7 +206,7 @@ type ModerationDeletedV1 struct{}
 func NewModerationDeletedV1() ModerationDeletedV1{return ModerationDeletedV1{}}
 func (ModerationDeletedV1) EventType() EventType{return EventModerationDeleted}
 func (ModerationDeletedV1) moderationValidate()error{return nil}
-func (ModerationDeletedV1) moderationApply(s *ModerationState)error{if s.Version==0{return ErrInvalidState};s.Deleted=true;return nil}
+func (ModerationDeletedV1) moderationApply(s *ModerationState)error{if s.Version==0||s.Deleted{return ErrInvalidState};s.Deleted=true;return nil}
 
 func validateText(value string) error { if strings.TrimSpace(value)=="" || len(value)>eventstore.MaxEventPayloadBytes{return ErrInvalidState}; return nil }
 func validateOptionalText(value string) error { if value!="" { return validateText(value) }; return nil }

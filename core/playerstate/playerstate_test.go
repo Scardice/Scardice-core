@@ -133,3 +133,13 @@ func TestReducersRejectVersionOverflow(t *testing.T) {
 	if _, err := ReduceCharacter(CharacterState{Version: overflow}, NewCharacterRenamedV1("x")); err != ErrInvalidState { t.Fatalf("character overflow = %v", err) }
 	if _, err := ReduceModeration(ModerationState{Version: overflow}, NewModerationRankChangedV1(0)); err != ErrInvalidState { t.Fatalf("moderation overflow = %v", err) }
 }
+func TestTerminalDeletionCannotRepeat(t *testing.T) {
+	player, err := ReplayPlayer([]PlayerEvent{NewPlayerCreatedV1("dice-1", "group-1", "user-1", "name"), NewPlayerDeletedV1()}); if err != nil { t.Fatal(err) }
+	if _, err = ReducePlayer(player, NewPlayerDeletedV1()); err != ErrInvalidState { t.Fatalf("repeat player delete = %v", err) }
+	character, err := ReplayCharacters([]CharacterEvent{NewCharacterCreatedV1("dice-1", "user-1", "character-1", "name", "coc7"), NewCharacterDeletedV1()}); if err != nil { t.Fatal(err) }
+	if _, err = ReduceCharacter(character, NewCharacterDeletedV1()); err != ErrInvalidState { t.Fatalf("repeat character delete = %v", err) }
+	moderation, err := ReplayModeration([]ModerationEvent{NewModerationCreatedV1("dice-1", "group-1", "QQ:1", -1, 0), NewModerationDeletedV1()}); if err != nil { t.Fatal(err) }
+	if _, err = ReduceModeration(moderation, NewModerationDeletedV1()); err != ErrInvalidState { t.Fatalf("repeat moderation delete = %v", err) }
+	attrs := GroupUserAttrsState{Version: 1, Deleted: true}
+	if _, err = ReduceGroupUserAttrs(attrs, NewGroupUserAttrsClearedV1()); err != ErrInvalidState { t.Fatalf("mutation on deleted attrs = %v", err) }
+}
