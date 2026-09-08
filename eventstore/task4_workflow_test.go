@@ -111,6 +111,7 @@ func TestTask4WorkflowEventRejectsOverlayMarkerWithoutPartialWrites(t *testing.T
 		{name: "escaped payload", payload: []byte(`{"value":"\u0024t"}`)},
 		{name: "malformed trailing escaped payload", payload: []byte(`{"ok":1} {"value":"\u0024t"`)},
 		{name: "duplicate escaped payload", payload: []byte(`{"value":"ok","value":"\u0024t"}`)},
+		{name: "duplicate marker-free payload", payload: []byte(`{"value":1,"value":2}`)},
 		{name: "metadata principal", mutate: func(event *NewEvent) { event.Metadata.PrincipalID = "$t-principal" }},
 	}
 	for _, test := range tests {
@@ -472,6 +473,37 @@ func TestTask4A6UOWPayloadVersionBindsInboxAndEffect(t *testing.T) {
 	}
 	if _, err := a6Open(ctx, source, "outbox/v1", effectRow.EffectID, effectRow.EndpointID, 1, effectRow.EncryptionKeyID, effectRow.PayloadCiphertext, effectRow.PayloadNonce); !errors.Is(err, ErrAuthenticationFailed) {
 		t.Fatalf("effect v1 open err=%v", err)
+	}
+}
+func TestTask4A6AcceptOutboxPayloadVersionBindsAAD(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	const version = uint64(7)
+	ciphertext, nonce, keyID, err := a6Seal(ctx, source, "outbox/v1", "task4-a6-accept-effect", "endpoint", version, []byte("accept-v7"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	effect := NewEffect{
+		EffectID: "task4-a6-accept-effect", EndpointID: "endpoint", LaneHMAC: []byte("task4-a6-accept-lane"),
+		EffectType: "send", RiskClass: RiskPreDispatchRetryable, Status: OutboxStatusPending, PayloadVersion: version,
+		PayloadCiphertext: ciphertext, PayloadNonce: nonce, PayloadEncryptionKeyID: keyID,
+	}
+	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
+		t.Fatal(err)
+	}
+	var row outboxEffectRow
+	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.PayloadVersion != version {
+		t.Fatalf("outbox payload version=%d want=%d", row.PayloadVersion, version)
+	}
+	if plain, err := a6Open(ctx, source, "outbox/v1", row.EffectID, row.EndpointID, version, row.EncryptionKeyID, row.PayloadCiphertext, row.PayloadNonce); err != nil || string(plain) != "accept-v7" {
+		t.Fatalf("outbox v7 open plain=%q err=%v", plain, err)
+	}
+	if _, err := a6Open(ctx, source, "outbox/v1", row.EffectID, row.EndpointID, 1, row.EncryptionKeyID, row.PayloadCiphertext, row.PayloadNonce); !errors.Is(err, ErrAuthenticationFailed) {
+		t.Fatalf("outbox v1 open err=%v", err)
 	}
 }
 func TestTask4OpaqueInboxReplayRejectsWorkflowLink(t *testing.T) {

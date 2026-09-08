@@ -973,6 +973,7 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 	if effect.Status != OutboxStatusPending {
 		return CommitResult{}, ErrInvalidTransition
 	}
+	payloadVersion := task5PayloadVersion(effect.PayloadVersion)
 	now := s.task5Now()
 	base, err := s.task5Base(ctx)
 	if err != nil {
@@ -1004,7 +1005,7 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 		if err := s.validateA6KeyID(ctx, tx, payloadKeyID); err != nil {
 			return err
 		}
-		if _, decryptErr := openBoundPayload(ctx, s.codec, "outbox/v1", effect.EffectID, effect.EndpointID, 1, effect.PayloadCiphertext, effect.PayloadNonce, payloadKeyID); decryptErr != nil {
+		if _, decryptErr := openBoundPayload(ctx, s.codec, "outbox/v1", effect.EffectID, effect.EndpointID, payloadVersion, effect.PayloadCiphertext, effect.PayloadNonce, payloadKeyID); decryptErr != nil {
 			return ErrAuthenticationFailed
 		}
 		return nil
@@ -2757,12 +2758,21 @@ func task5ScanWorkflowJSON(decoder *json.Decoder) (bool, error) {
 		switch delimiter {
 		case '{':
 			contains := false
+			seen := make(map[string]struct{})
 			for decoder.More() {
 				key, keyErr := decoder.Token()
 				if keyErr != nil {
 					return false, keyErr
 				}
-				if text, ok := key.(string); ok && strings.Contains(text, "$t") {
+				keyText, keyOK := key.(string)
+				if !keyOK {
+					return false, errors.New("eventstore: invalid workflow JSON object key")
+				}
+				if _, exists := seen[keyText]; exists {
+					return false, errors.New("eventstore: duplicate workflow JSON object key")
+				}
+				seen[keyText] = struct{}{}
+				if strings.Contains(keyText, "$t") {
 					contains = true
 				}
 				child, childErr := task5ScanWorkflowJSON(decoder)
