@@ -277,9 +277,24 @@ ok   github.com/PaienNate/pineutil/evsocket/v2
 ```
 
 
-- Runtime terminal admission now evicts one queued inbound event when the bounded runtime channel is full, preserving disconnect/connect/auth-failed control delivery without blocking callbacks. Oversized transport close behavior is nil-safe and bounded.
+- Runtime terminal admission now uses a separate bounded priority channel, preserving disconnect/connect/auth-failed control delivery without blocking callbacks. Oversized transport close behavior is nil-safe and bounded.
 
 ```text
 go test ./dice -run 'TestOnebotRuntime(PriorityEventEvictsInboundAdmission|Diagnostics(RetainCompletedTransportDrops|ExposeIngressCounters))' -count=1
 ok   Scardice-core/dice
+```
+
+## Round 11 fixes
+
+- Runtime control events use a separate bounded priority channel consumed by the Run loop before ordinary ingress events. Connect, disconnect, and auth-failed events cannot be displaced by a saturated inbound channel or an unrelated queue head; the priority channel remains nonblocking and bounded.
+- Transport-drop baselines now live in the active connection state and are deleted with the connection. Reconnect deltas remain exact without retaining a map entry for every disconnected wrapper.
+
+### Round 11 GREEN evidence
+
+```text
+go test ./dice -run 'TestOnebotRuntime(PriorityEventEvictsInboundAdmission|InboundRetryIsBounded|Diagnostics(RetainCompletedTransportDrops|ExposeIngressCounters)|InboundQueueBackpressureIsNonBlocking)' -count=1
+ok   Scardice-core/dice
+
+go test ./evsocket/v2 -run 'TestTransportMessageIsBoundBeforeCopy' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
 ```

@@ -396,15 +396,16 @@ func TestOnebotRuntimePriorityEventEvictsInboundAdmission(t *testing.T) {
 	if !runtime.enqueue(onebotRuntimeEvent{kind: "disconnect"}) {
 		t.Fatal("priority disconnect was not admitted")
 	}
-	found := false
-	for range cap(runtime.events) {
-		if event := <-runtime.events; event.kind == "disconnect" {
-			found = true
-			break
+	select {
+	case event := <-runtime.priorityEvents:
+		if event.kind != "disconnect" {
+			t.Fatalf("priority event = %q", event.kind)
 		}
+	case <-time.After(time.Second):
+		t.Fatal("priority disconnect missing after admission")
 	}
-	if !found {
-		t.Fatal("priority disconnect missing after inbound eviction")
+	if len(runtime.events) != cap(runtime.events) {
+		t.Fatalf("inbound queue changed while admitting priority event: %d", len(runtime.events))
 	}
 }
 
@@ -440,14 +441,10 @@ func TestOnebotRuntimeDiagnosticsExposeIngressCounters(t *testing.T) {
 
 func TestOnebotRuntimeDiagnosticsRetainCompletedTransportDrops(t *testing.T) {
 	runtime := newOnebotRuntime(OnebotConfig{}, nil)
+	runtime.transportDropped.Store(5)
 	wrapper := &socketio.WebsocketWrapper{}
-	runtime.accountTransportDropCount(wrapper, 3)
-	runtime.accountTransportDropCount(wrapper, 5)
-	if got := runtime.transportDropped.Load(); got != 5 {
-		t.Fatalf("cumulative transport drops = %d, want 5", got)
-	}
 	runtime.connectionMu.Lock()
-	runtime.connections[wrapper] = make(chan struct{})
+	runtime.connections[wrapper] = onebotConnectionState{done: make(chan struct{}), dropBaseline: 5}
 	runtime.connectionMu.Unlock()
 	report := runtime.Diagnostics(context.Background())
 	for _, entry := range report.Entries {

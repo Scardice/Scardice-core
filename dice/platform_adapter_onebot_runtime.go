@@ -68,6 +68,7 @@ type onebotRuntime struct {
 	stopCh   chan struct{}
 	doneCh   chan struct{}
 	events   chan onebotRuntimeEvent
+	priorityEvents chan onebotRuntimeEvent
 	fenced   atomic.Bool
 	stopReq  atomic.Bool
 	callbackMu sync.Mutex
@@ -76,14 +77,17 @@ type onebotRuntime struct {
 	handlerMu  sync.Mutex
 	handlerWG  sync.WaitGroup
 	connectionMu sync.Mutex
-	connections map[*socketio.WebsocketWrapper]chan struct{}
+	connections map[*socketio.WebsocketWrapper]onebotConnectionState
 	inboundRejected atomic.Uint64
 	inboundBackpressure atomic.Uint64
 	inboundCollisions atomic.Uint64
 	inboundRetries atomic.Uint64
 	transportDropped atomic.Uint64
 	transportDropMu sync.Mutex
-	transportDropBaselines map[*socketio.WebsocketWrapper]uint64
+}
+type onebotConnectionState struct {
+	done chan struct{}
+	dropBaseline uint64
 }
 type onebotRuntimeEvent struct {
 	kind string
@@ -115,29 +119,10 @@ func (r *onebotRuntime) trackConnection(conn *socketio.WebsocketWrapper) {
 	}
 	r.connectionMu.Lock()
 	if _, ok := r.connections[conn]; !ok {
-		r.connections[conn] = make(chan struct{})
+		r.connections[conn] = onebotConnectionState{done: make(chan struct{}), dropBaseline: conn.DroppedEventCount()}
 	}
 	r.connectionMu.Unlock()
 	r.callbackMu.Unlock()
-}
-func (r *onebotRuntime) accountTransportDrops(conn *socketio.WebsocketWrapper) {
-	if conn == nil {
-		return
-	}
-	r.accountTransportDropCount(conn, conn.DroppedEventCount())
-}
-
-func (r *onebotRuntime) accountTransportDropCount(conn *socketio.WebsocketWrapper, current uint64) {
-	if conn == nil {
-		return
-	}
-	r.transportDropMu.Lock()
-	previous := r.transportDropBaselines[conn]
-	if current > previous {
-		r.transportDropped.Add(current - previous)
-	}
-	r.transportDropBaselines[conn] = current
-	r.transportDropMu.Unlock()
 }
 
 func (r *onebotRuntime) completeConnection(conn *socketio.WebsocketWrapper) {
@@ -145,10 +130,15 @@ func (r *onebotRuntime) completeConnection(conn *socketio.WebsocketWrapper) {
 		return
 	}
 	r.connectionMu.Lock()
-	r.accountTransportDrops(conn)
-	if done, ok := r.connections[conn]; ok {
+	if state, ok := r.connections[conn]; ok {
+		current := conn.DroppedEventCount()
+		r.transportDropMu.Lock()
+		if current > state.dropBaseline {
+			r.transportDropped.Add(current - state.dropBaseline)
+		}
+		r.transportDropMu.Unlock()
 		delete(r.connections, conn)
-		close(done)
+		close(state.done)
 	}
 	r.connectionMu.Unlock()
 }
@@ -160,8 +150,8 @@ func newOnebotRuntime(config OnebotConfig, resolver adapterapi.SecretResolver, l
 		config: config, resolver: resolver, listenerFactory: listenerFactory,
 		stopCh: make(chan struct{}), doneCh: make(chan struct{}),
 		events: make(chan onebotRuntimeEvent, 32),
-		connections: make(map[*socketio.WebsocketWrapper]chan struct{}),
-		transportDropBaselines: make(map[*socketio.WebsocketWrapper]uint64),
+		priorityEvents: make(chan onebotRuntimeEvent, 4),
+		connections: make(map[*socketio.WebsocketWrapper]onebotConnectionState),
 	}
 }
 
@@ -448,12 +438,11 @@ func (r *onebotRuntime) Diagnostics(context.Context) adapterapi.DiagnosticReport
 	r.connectionMu.Lock()
 	r.transportDropMu.Lock()
 	dropped := r.transportDropped.Load()
-	for wrapper := range r.connections {
+	for wrapper, state := range r.connections {
 		if wrapper != nil {
 			current := wrapper.DroppedEventCount()
-			previous := r.transportDropBaselines[wrapper]
-			if current > previous {
-				dropped += current - previous
+			if current > state.dropBaseline {
+				dropped += current - state.dropBaseline
 			}
 		}
 	}
@@ -462,8 +451,8 @@ func (r *onebotRuntime) Diagnostics(context.Context) adapterapi.DiagnosticReport
 	count := func(code, message string, value uint64) adapterapi.DiagnosticEntry {
 		return adapterapi.DiagnosticEntry{
 			Severity: adapterapi.DiagnosticInfo,
-			Code:     code,
-			Message:  message + ": " + strconv.FormatUint(value, 10),
+			Code: code,
+			Message: message + ": " + strconv.FormatUint(value, 10),
 		}
 	}
 	return adapterapi.DiagnosticReport{Entries: []adapterapi.DiagnosticEntry{
@@ -549,52 +538,63 @@ func (r *onebotRuntime) Run(ctx context.Context, core adapterapi.CorePort) (runE
 				return nil
 			}
 			return runCtx.Err()
-		case event := <-r.events:
-			if r.fenced.Load() {
-				continue
-			}
-			switch event.kind {
-			case "connect":
-				if err := r.handleConnected(runCtx, event.kws); err != nil {
-					_ = r.reportFailure(runCtx, "login_info_failed", err)
-					return err
-				}
-			case "disconnect":
-				if event.err == nil {
-					event.err = errors.New("remote WebSocket closed")
-				}
-				_ = r.reportFailure(runCtx, "remote_closed", event.err)
-				return event.err
-			case "auth_failed":
-				err := event.err
-				if err == nil {
-					err = errors.New("OneBot authorization failed")
-				}
-				_ = r.reportFailure(runCtx, "auth_failed", err)
+		case event := <-r.priorityEvents:
+			if err := r.processRuntimeEvent(runCtx, event); err != nil {
 				return err
-			case "inbound":
-				if err := r.handleInbound(runCtx, event.raw); err != nil {
-					if errors.Is(err, eventstore.ErrConflict) {
-						r.inboundCollisions.Add(1)
-						r.inboundRejected.Add(1)
-						continue
-					}
-					if isRetryableOnebotInboundError(err) {
-						if rehandoffOnebotInbound(&event) {
-							r.inboundRetries.Add(1)
-							if r.enqueue(event) {
-								continue
-							}
-						}
-						r.inboundRejected.Add(1)
-						continue
-					}
-					_ = r.reportFailure(runCtx, "inbound_failed", err)
-					return err
-				}
+			}
+		case event := <-r.events:
+			if err := r.processRuntimeEvent(runCtx, event); err != nil {
+				return err
 			}
 		}
 	}
+}
+
+func (r *onebotRuntime) processRuntimeEvent(runCtx context.Context, event onebotRuntimeEvent) error {
+	if r.fenced.Load() {
+		return nil
+	}
+	switch event.kind {
+	case "connect":
+		if err := r.handleConnected(runCtx, event.kws); err != nil {
+			_ = r.reportFailure(runCtx, "login_info_failed", err)
+			return err
+		}
+	case "disconnect":
+		if event.err == nil {
+			event.err = errors.New("remote WebSocket closed")
+		}
+		_ = r.reportFailure(runCtx, "remote_closed", event.err)
+		return event.err
+	case "auth_failed":
+		err := event.err
+		if err == nil {
+			err = errors.New("OneBot authorization failed")
+		}
+		_ = r.reportFailure(runCtx, "auth_failed", err)
+		return err
+	case "inbound":
+		if err := r.handleInbound(runCtx, event.raw); err != nil {
+			if errors.Is(err, eventstore.ErrConflict) {
+				r.inboundCollisions.Add(1)
+				r.inboundRejected.Add(1)
+				return nil
+			}
+			if isRetryableOnebotInboundError(err) {
+				if rehandoffOnebotInbound(&event) {
+					r.inboundRetries.Add(1)
+					if r.enqueue(event) {
+						return nil
+					}
+				}
+				r.inboundRejected.Add(1)
+				return nil
+			}
+			_ = r.reportFailure(runCtx, "inbound_failed", err)
+			return err
+		}
+	}
+	return nil
 }
 
 func rehandoffOnebotInbound(event *onebotRuntimeEvent) bool {
@@ -756,37 +756,23 @@ func isOnebotPriorityEvent(kind string) bool {
 }
 
 func (r *onebotRuntime) enqueue(event onebotRuntimeEvent) bool {
-	select {
-	case r.events <- event:
-		return true
-	default:
-	}
 	if isOnebotPriorityEvent(event.kind) {
 		select {
-		case queued := <-r.events:
-			if queued.kind != "inbound" {
-				select {
-				case r.events <- queued:
-				default:
-					return false
-				}
-				return false
-			}
-			r.inboundBackpressure.Add(1)
-			select {
-			case r.events <- event:
-				return true
-			default:
-				return false
-			}
+		case r.priorityEvents <- event:
+			return true
 		default:
 			return false
 		}
 	}
-	if event.kind == "inbound" {
-		r.inboundBackpressure.Add(1)
+	select {
+	case r.events <- event:
+		return true
+	default:
+		if event.kind == "inbound" {
+			r.inboundBackpressure.Add(1)
+		}
+		return false
 	}
-	return false
 }
 
 func (r *onebotRuntime) startClient(manager *socketio.SocketInstance, token string, ctx context.Context) error {
@@ -1089,15 +1075,15 @@ func (r *onebotRuntime) cleanup() {
 	r.wg.Wait()
 	r.connectionMu.Lock()
 	waits := make([]chan struct{}, 0, len(r.connections))
-	for _, done := range r.connections {
-		waits = append(waits, done)
+	for _, state := range r.connections {
+		waits = append(waits, state.done)
 	}
 	r.connectionMu.Unlock()
 	for _, done := range waits {
 		<-done
 	}
 	r.connectionMu.Lock()
-	r.connections = make(map[*socketio.WebsocketWrapper]chan struct{})
+	r.connections = make(map[*socketio.WebsocketWrapper]onebotConnectionState)
 	r.connectionMu.Unlock()
 	if tokenRef != nil {
 		*tokenRef = ""
