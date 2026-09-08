@@ -66,6 +66,6 @@ ok
 
 未运行 formatter、linter 或项目级全套测试。
 
-## 当前提交基线
+## 实现提交
 
-任务实现开始前读取的当前 HEAD：`895fea9542b47f95863e03552d8d1b9e4aba1719`。实现改动尚未由本 worker 创建提交；集成 owner 应在合并全部 slice 改动后生成最终 commit hash。
+本任务实现提交：`dcc27905309c5a8a732811dc3293fb7c3ec9aa80`。该提交仅包含本任务 ownership 内的 5 个文件；集成 owner 可在合并其他 slice 后继续生成上层集成提交。
