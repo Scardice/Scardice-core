@@ -163,7 +163,7 @@ func (GroupUserAttrsClearedV1) attrsApply(s *GroupUserAttrsState)error{if s.Vers
 type CharacterCreatedV1 struct { DiceID string `json:"diceId"`; UserID string `json:"userId"`; CharacterID string `json:"characterId"`; Name string `json:"name"`; SheetType string `json:"sheetType,omitempty"` }
 func NewCharacterCreatedV1(diceID,userID,id,name,sheetType string) CharacterCreatedV1{return CharacterCreatedV1{diceID,userID,id,name,sheetType}}
 func (CharacterCreatedV1) EventType() EventType{return EventCharacterCreated}
-func (e CharacterCreatedV1) characterValidate()error{if err:=validateIdentity(e.DiceID,e.UserID);err!=nil{return err};if err:=validateScopedID(e.CharacterID);err!=nil{return err};return validateText(e.Name)}
+func (e CharacterCreatedV1) characterValidate()error{if err:=validateIdentity(e.DiceID,e.UserID,e.CharacterID);err!=nil{return err};return validateText(e.Name)}
 func (e CharacterCreatedV1) characterApply(s *CharacterState)error{if s.Version!=0||s.Deleted{return ErrInvalidState};s.DiceID,s.UserID,s.CharacterID,s.Name,s.SheetType=e.DiceID,e.UserID,e.CharacterID,e.Name,e.SheetType;return nil}
 
 type CharacterRenamedV1 struct { Name string `json:"name"` }
@@ -188,7 +188,7 @@ type ModerationCreatedV1 struct { DiceID string `json:"diceId"`; GroupID string 
 func NewModerationCreatedV1(diceID,groupID,subjectID string,rank int,score int64) ModerationCreatedV1{return ModerationCreatedV1{diceID,groupID,subjectID,rank,score}}
 func (ModerationCreatedV1) EventType() EventType{return EventModerationCreated}
 func (e ModerationCreatedV1) moderationApply(s *ModerationState)error{if s.Version!=0||s.Deleted{return ErrInvalidState};s.DiceID,s.GroupID,s.SubjectID,s.Rank,s.Score=e.DiceID,e.GroupID,e.SubjectID,e.Rank,e.Score;return nil}
-func (e ModerationCreatedV1) moderationValidate()error{if err:=validateIdentity(e.DiceID,e.GroupID);err!=nil{return err};if err:=validateScopedID(e.SubjectID);err!=nil{return err};if e.Rank < -30 || e.Rank > 30{return ErrInvalidState};return nil}
+func (e ModerationCreatedV1) moderationValidate()error{if err:=validateIdentity(e.DiceID,e.GroupID,e.SubjectID);err!=nil{return err};if e.Rank < -30 || e.Rank > 30{return ErrInvalidState};return nil}
 type ModerationScoreChangedV1 struct { Score int64 `json:"score"`; ReasonDigest string `json:"reasonDigest,omitempty"` }
 func NewModerationScoreChangedV1(score int64,reasonDigest string) ModerationScoreChangedV1{return ModerationScoreChangedV1{score,reasonDigest}}
 func (ModerationScoreChangedV1) EventType() EventType{return EventModerationScoreChanged}
