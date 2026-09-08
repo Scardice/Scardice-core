@@ -32,11 +32,12 @@ func (e *task5ExpiredArtifactError) Error() string { return ErrArtifactGone.Erro
 func (e *task5ExpiredArtifactError) Unwrap() error { return ErrArtifactGone }
 
 const (
-	inboxLaneKind        = "inbox"
-	outboxLaneKind       = "outbox"
-	defaultLeaseDuration = time.Minute
-	task5PayloadLimit    = 2 * 1024 * 1024
-	task5NonceLimit      = 12
+	inboxLaneKind             = "inbox"
+	outboxLaneKind            = "outbox"
+	defaultLeaseDuration      = time.Minute
+	task5PayloadLimit         = 2 * 1024 * 1024
+	task5NonceLimit           = 12
+	task5PayloadScrubBatchSize = 128
 )
 
 func (s *GORMStore) task5Base(ctx context.Context) (*gorm.DB, error) {
@@ -594,7 +595,7 @@ func (s *GORMStore) ClaimInbox(ctx context.Context, req InboxClaimRequest) (leas
 	now := s.task5Now()
 	if req.RecoverExpiredCallbackStarted {
 		var recoveredRows []inboxMessageRow
-		recoveredQuery := locked(tx).Where("status = ? AND lease_expiry IS NOT NULL AND lease_expiry <= ?", InboxStatusCallbackStarted, now).Find(&recoveredRows)
+		recoveredQuery := locked(tx).Where("status = ? AND lease_expiry IS NOT NULL AND lease_expiry <= ?", InboxStatusCallbackStarted, now).Order("lease_expiry ASC, inbox_id ASC").Limit(task5PayloadScrubBatchSize).Find(&recoveredRows)
 		if recoveredQuery.Error != nil {
 			return InboxLease{}, errors.New("eventstore: recover callback-started query failed")
 		}
@@ -605,7 +606,7 @@ func (s *GORMStore) ClaimInbox(ctx context.Context, req InboxClaimRequest) (leas
 		}
 	}
 	var expiredRows []inboxMessageRow
-	expiredQuery := locked(tx).Where("status IN ? AND payload_expires_at IS NOT NULL AND payload_expires_at <= ? AND (payload_ciphertext IS NOT NULL OR payload_nonce IS NOT NULL)", []string{InboxStatusPending, InboxStatusLeased, InboxStatusCallbackStarted, InboxStatusAmbiguous}, now).Find(&expiredRows)
+	expiredQuery := locked(tx).Where("status IN ? AND payload_expires_at IS NOT NULL AND payload_expires_at <= ? AND (payload_ciphertext IS NOT NULL OR payload_nonce IS NOT NULL)", []string{InboxStatusPending, InboxStatusLeased, InboxStatusCallbackStarted, InboxStatusAmbiguous}, now).Order("payload_expires_at ASC, inbox_id ASC").Limit(task5PayloadScrubBatchSize).Find(&expiredRows)
 	if expiredQuery.Error != nil {
 		return InboxLease{}, errors.New("eventstore: scrub inbox query failed")
 	}
@@ -1114,7 +1115,7 @@ func (s *GORMStore) ClaimOutbox(ctx context.Context, req OutboxClaimRequest) (le
 	}()
 	now := s.task5Now()
 	var expiredRows []outboxEffectRow
-	expiredQuery := locked(tx).Where("status IN ? AND payload_expires_at IS NOT NULL AND payload_expires_at <= ? AND (payload_ciphertext IS NOT NULL OR payload_nonce IS NOT NULL)", []string{OutboxStatusPending, OutboxStatusLeased, OutboxStatusDispatched, OutboxStatusAmbiguous}, now).Find(&expiredRows)
+	expiredQuery := locked(tx).Where("status IN ? AND payload_expires_at IS NOT NULL AND payload_expires_at <= ? AND (payload_ciphertext IS NOT NULL OR payload_nonce IS NOT NULL)", []string{OutboxStatusPending, OutboxStatusLeased, OutboxStatusDispatched, OutboxStatusAmbiguous}, now).Order("payload_expires_at ASC, effect_id ASC").Limit(task5PayloadScrubBatchSize).Find(&expiredRows)
 	if expiredQuery.Error != nil {
 		return OutboxLease{}, errors.New("eventstore: scrub outbox query failed")
 	}
@@ -2732,20 +2733,15 @@ func task5WorkflowEventContainsOverlay(event NewEvent) bool {
 		strings.Contains(event.Metadata.Producer, "$t") {
 		return true
 	}
-	raw := string(event.Payload)
 	decoder := json.NewDecoder(bytes.NewReader(event.Payload))
-	for {
-		contains, err := task5ScanWorkflowJSON(decoder)
-		if errors.Is(err, io.EOF) {
-			return strings.Contains(raw, "$t")
-		}
-		if err != nil {
-			return strings.Contains(raw, "$t")
-		}
-		if contains {
-			return true
-		}
+	contains, err := task5ScanWorkflowJSON(decoder)
+	if err != nil {
+		return true
 	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return true
+	}
+	return contains
 }
 
 func task5ScanWorkflowJSON(decoder *json.Decoder) (bool, error) {
@@ -2792,6 +2788,8 @@ func task5ScanWorkflowJSON(decoder *json.Decoder) (bool, error) {
 				return false, err
 			}
 			return contains, nil
+		default:
+			return false, errors.New("eventstore: invalid workflow JSON delimiter")
 		}
 	}
 	return false, nil

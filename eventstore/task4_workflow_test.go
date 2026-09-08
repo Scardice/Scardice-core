@@ -3,6 +3,7 @@ package eventstore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -108,6 +109,8 @@ func TestTask4WorkflowEventRejectsOverlayMarkerWithoutPartialWrites(t *testing.T
 		mutate  func(*NewEvent)
 	}{
 		{name: "escaped payload", payload: []byte(`{"value":"\u0024t"}`)},
+		{name: "malformed trailing escaped payload", payload: []byte(`{"ok":1} {"value":"\u0024t"`)},
+		{name: "duplicate escaped payload", payload: []byte(`{"value":"ok","value":"\u0024t"}`)},
 		{name: "metadata principal", mutate: func(event *NewEvent) { event.Metadata.PrincipalID = "$t-principal" }},
 	}
 	for _, test := range tests {
@@ -204,6 +207,50 @@ func TestTask4AcceptExpiredDedupeRetainsCallbackUncertainty(t *testing.T) {
 				t.Fatalf("uncertain row changed count=%d before=%#v after=%#v", count, before, after)
 			}
 		})
+	}
+}
+func TestTask4RecoverExpiredCallbackStartedIsBounded(t *testing.T) {
+	store, db, clock := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	expiredAt := clock.Now().Add(-time.Minute)
+	futureAt := clock.Now().Add(time.Minute)
+	rows := make([]inboxMessageRow, 129)
+	for i := range rows {
+		rows[i] = inboxMessageRow{
+			InboxID: fmt.Sprintf("task4-recovery-%03d", i), EndpointID: "endpoint",
+			ProviderEventKey: fmt.Sprintf("task4-recovery-provider-%03d", i),
+			LaneHMAC:         []byte(fmt.Sprintf("task4-recovery-lane-%03d", i)), OrderingSequence: 1,
+			Status: InboxStatusCallbackStarted, Version: 1, PayloadVersion: 1,
+			LeaseExpiry: &expiredAt, PayloadExpiresAt: &futureAt,
+			PayloadCiphertext: []byte("ciphertext"), PayloadNonce: []byte("nonce"), EncryptionKeyID: "key",
+		}
+	}
+	if err := db.GORM().Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "recovery-worker", RecoverExpiredCallbackStarted: true}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("recovery claim err=%v", err)
+	}
+	var ambiguous, callbackStarted int64
+	if err := db.GORM().Model(&inboxMessageRow{}).Where("status = ?", InboxStatusAmbiguous).Count(&ambiguous).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GORM().Model(&inboxMessageRow{}).Where("status = ?", InboxStatusCallbackStarted).Count(&callbackStarted).Error; err != nil {
+		t.Fatal(err)
+	}
+	if ambiguous != task5PayloadScrubBatchSize || callbackStarted != int64(len(rows)-task5PayloadScrubBatchSize) {
+		t.Fatalf("recovery batch ambiguous=%d callback-started=%d", ambiguous, callbackStarted)
+	}
+	var first, last inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", "task4-recovery-000").First(&first).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GORM().Where("inbox_id = ?", "task4-recovery-128").First(&last).Error; err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != InboxStatusAmbiguous || last.Status != InboxStatusCallbackStarted {
+		t.Fatalf("recovery order first=%q last=%q", first.Status, last.Status)
 	}
 }
 func TestTask4WorkflowLinkRequiresExactSameUOWParticipant(t *testing.T) {
