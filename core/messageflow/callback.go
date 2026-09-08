@@ -92,20 +92,30 @@ type CompatibilityHost interface {
 	HandleCallback(context.Context, CallbackRequest, *playerstate.LocalOverlay, *MutationCollector) (CallbackResult, error)
 }
 
+// BoundPayloadDecryptor authenticates callback payloads with the inbox
+// identity and endpoint as AEAD associated data.
+type BoundPayloadDecryptor interface {
+	DecryptBound(context.Context, string, string, string, uint64, []byte, []byte, string) ([]byte, error)
+}
+
 // CallbackConfig wires the narrow durable callback service.
 type CallbackConfig struct {
-	Inbox    eventstore.InboxRepository
-	Store    eventstore.Store
-	Codec    eventstore.PayloadCodec
-	Resolver CallbackScopeResolver
-	Group    CallbackGroupLoader
-	Player   CallbackPlayerLoader
-	Host     CompatibilityHost
-	WorkerID string
+	Inbox      eventstore.InboxRepository
+	Store      eventstore.Store
+	Codec      eventstore.PayloadCodec
+	BoundCodec BoundPayloadDecryptor
+	Resolver   CallbackScopeResolver
+	Group      CallbackGroupLoader
+	Player     CallbackPlayerLoader
+	Host       CompatibilityHost
+	WorkerID   string
 
-	LeaseDuration time.Duration
-	Clock         eventstore.Clock
-	Factory       eventstore.EventFactory
+	// AllowUnboundCodec is only for explicitly non-A6 codecs. Production
+	// callback services must provide BoundCodec or a Codec implementing it.
+	AllowUnboundCodec bool
+	LeaseDuration     time.Duration
+	Clock             eventstore.Clock
+	Factory           eventstore.EventFactory
 }
 
 // CallbackResultSummary reports the durable terminal outcome of ProcessOne.
@@ -118,22 +128,31 @@ type CallbackResultSummary struct {
 
 // CallbackService claims and executes one inbox callback at a time.
 type CallbackService struct {
-	inbox    eventstore.InboxRepository
-	store    eventstore.Store
-	codec    eventstore.PayloadCodec
-	resolver CallbackScopeResolver
-	group    CallbackGroupLoader
-	player   CallbackPlayerLoader
-	host     CompatibilityHost
-	workerID string
-	lease    time.Duration
-	clock    eventstore.Clock
-	factory  eventstore.EventFactory
+	inbox        eventstore.InboxRepository
+	store        eventstore.Store
+	codec        eventstore.PayloadCodec
+	boundCodec   BoundPayloadDecryptor
+	resolver     CallbackScopeResolver
+	group        CallbackGroupLoader
+	player       CallbackPlayerLoader
+	host         CompatibilityHost
+	workerID     string
+	allowUnbound bool
+	lease        time.Duration
+	clock        eventstore.Clock
+	factory      eventstore.EventFactory
 }
 
 // NewCallbackService validates and constructs the durable callback service.
 func NewCallbackService(config CallbackConfig) (*CallbackService, error) {
-	if config.Inbox == nil || config.Store == nil || config.Codec == nil || config.Resolver == nil || config.Group == nil || config.Player == nil || config.Host == nil || strings.TrimSpace(config.WorkerID) == "" {
+	if config.Inbox == nil || config.Store == nil || config.Resolver == nil || config.Group == nil || config.Player == nil || config.Host == nil || strings.TrimSpace(config.WorkerID) == "" {
+		return nil, ErrCallbackUnavailable
+	}
+	boundCodec := config.BoundCodec
+	if boundCodec == nil && config.Codec != nil {
+		boundCodec, _ = config.Codec.(BoundPayloadDecryptor)
+	}
+	if boundCodec == nil && (!config.AllowUnboundCodec || config.Codec == nil) {
 		return nil, ErrCallbackUnavailable
 	}
 	if config.LeaseDuration <= 0 {
@@ -149,9 +168,10 @@ func NewCallbackService(config CallbackConfig) (*CallbackService, error) {
 		config.Factory.IDs = eventstore.UUIDGenerator{}
 	}
 	return &CallbackService{
-		inbox: config.Inbox, store: config.Store, codec: config.Codec, resolver: config.Resolver,
-		group: config.Group, player: config.Player, host: config.Host, workerID: config.WorkerID,
-		lease: config.LeaseDuration, clock: config.Clock, factory: config.Factory,
+		inbox: config.Inbox, store: config.Store, codec: config.Codec, boundCodec: boundCodec,
+		resolver: config.Resolver, group: config.Group, player: config.Player, host: config.Host,
+		workerID: config.WorkerID, allowUnbound: config.AllowUnboundCodec, lease: config.LeaseDuration,
+		clock: config.Clock, factory: config.Factory,
 	}, nil
 }
 
@@ -159,7 +179,7 @@ func NewCallbackService(config CallbackConfig) (*CallbackService, error) {
 // atomic callback UnitOfWork or leaves the row failed/ambiguous. Host execution
 // is never retried after callback-started.
 func (s *CallbackService) ProcessOne(ctx context.Context) (summary CallbackResultSummary, err error) {
-	if s == nil || s.inbox == nil || s.store == nil || s.codec == nil || s.resolver == nil || s.group == nil || s.player == nil || s.host == nil {
+	if s == nil || s.inbox == nil || s.store == nil || (s.codec == nil && s.boundCodec == nil) || s.resolver == nil || s.group == nil || s.player == nil || s.host == nil {
 		return summary, ErrCallbackUnavailable
 	}
 	if ctx == nil {
@@ -167,7 +187,7 @@ func (s *CallbackService) ProcessOne(ctx context.Context) (summary CallbackResul
 	}
 	for attempt := 1; attempt <= CallbackMaxPreMarkerAttempts; attempt++ {
 		summary.Attempts = attempt
-		lease, claimErr := s.inbox.ClaimInbox(ctx, eventstore.InboxClaimRequest{WorkerID: s.workerID, LeaseDuration: s.lease, QuarantinePayloadErrors: true, TerminalizeExpired: true})
+		lease, claimErr := s.inbox.ClaimInbox(ctx, eventstore.InboxClaimRequest{WorkerID: s.workerID, LeaseDuration: s.lease, QuarantinePayloadErrors: true, TerminalizeExpired: true, RecoverExpiredCallbackStarted: true})
 		if claimErr != nil {
 			return summary, claimErr
 		}
@@ -213,27 +233,22 @@ func (s *CallbackService) ProcessOne(ctx context.Context) (summary CallbackResul
 		collector := NewMutationCollector(s.factory)
 		callbackResult, hostErr := invokeCallbackHost(ctx, s.host, request, overlay, collector)
 		if hostErr != nil {
-			_ = s.markAmbiguous(ctx, lease.Update, startedVersion)
-			return summary, hostErr
+			return s.afterMarkerFailure(summary, hostErr, lease.Update, startedVersion)
 		}
 		if workflowErr := validateWorkflowResult(callbackResult.Workflow); workflowErr != nil {
-			_ = s.markAmbiguous(ctx, lease.Update, startedVersion)
-			return summary, workflowErr
+			return s.afterMarkerFailure(summary, workflowErr, lease.Update, startedVersion)
 		}
 		work, buildErr := collector.unitOfWork()
 		if buildErr != nil {
-			_ = s.markAmbiguous(ctx, lease.Update, startedVersion)
-			return summary, buildErr
+			return s.afterMarkerFailure(summary, buildErr, lease.Update, startedVersion)
 		}
 		if callbackResult.Workflow != nil {
 			if err := collector.addWorkflow(*callbackResult.Workflow); err != nil {
-				_ = s.markAmbiguous(ctx, lease.Update, startedVersion)
-				return summary, err
+				return s.afterMarkerFailure(summary, err, lease.Update, startedVersion)
 			}
 			work, buildErr = collector.unitOfWork()
 			if buildErr != nil {
-				_ = s.markAmbiguous(ctx, lease.Update, startedVersion)
-				return summary, buildErr
+				return s.afterMarkerFailure(summary, buildErr, lease.Update, startedVersion)
 			}
 		}
 		completedAt := s.clock.Now().UTC()
@@ -248,12 +263,10 @@ func (s *CallbackService) ProcessOne(ctx context.Context) (summary CallbackResul
 		}
 		work.InboxUpdates = append(work.InboxUpdates, terminal)
 		if commitErr := eventstore.ValidateUnitOfWork(work); commitErr != nil {
-			_ = s.markAmbiguous(ctx, lease.Update, startedVersion)
-			return summary, commitErr
+			return s.afterMarkerFailure(summary, commitErr, lease.Update, startedVersion)
 		}
 		if _, commitErr := s.store.Commit(ctx, work); commitErr != nil {
-			_ = s.markAmbiguous(ctx, lease.Update, startedVersion)
-			return summary, commitErr
+			return s.afterMarkerFailure(summary, commitErr, lease.Update, startedVersion)
 		}
 		summary.InboxID, summary.Status = lease.Update.InboxID, eventstore.InboxStatusConfirmedConsumed
 		if callbackResult.Workflow != nil {
@@ -264,7 +277,15 @@ func (s *CallbackService) ProcessOne(ctx context.Context) (summary CallbackResul
 	return summary, eventstore.ErrConflict
 }
 func (s *CallbackService) decodeClaimed(ctx context.Context, update eventstore.InboxUpdate) (ingressPayload, error) {
-	plaintext, err := s.codec.Decrypt(ctx, append([]byte(nil), update.PayloadCiphertext...), append([]byte(nil), update.PayloadNonce...), update.PayloadEncryptionKeyID)
+	var plaintext []byte
+	var err error
+	if s.boundCodec != nil {
+		plaintext, err = s.boundCodec.DecryptBound(ctx, "inbox/v1", update.InboxID, update.EndpointID, 1, append([]byte(nil), update.PayloadCiphertext...), append([]byte(nil), update.PayloadNonce...), update.PayloadEncryptionKeyID)
+	} else if s.allowUnbound && s.codec != nil {
+		plaintext, err = s.codec.Decrypt(ctx, append([]byte(nil), update.PayloadCiphertext...), append([]byte(nil), update.PayloadNonce...), update.PayloadEncryptionKeyID)
+	} else {
+		return ingressPayload{}, ErrCallbackUnavailable
+	}
 	if err != nil {
 		return ingressPayload{}, err
 	}
@@ -287,6 +308,9 @@ func (s *CallbackService) decodeClaimed(ctx context.Context, update eventstore.I
 func decodeIngressPayload(payload []byte) (ingressPayload, error) {
 	if len(payload) == 0 || len(payload) > eventstore.MaxEventPayloadBytes {
 		return ingressPayload{}, fmt.Errorf("%w: payload bound", ErrCallbackPayload)
+	}
+	if err := validateStrictJSON(payload); err != nil {
+		return ingressPayload{}, fmt.Errorf("%w: strict JSON: %v", ErrCallbackPayload, err)
 	}
 	var shape any
 	decoder := json.NewDecoder(bytes.NewReader(payload))
@@ -409,6 +433,17 @@ func (s *CallbackService) failLease(ctx context.Context, lease eventstore.InboxU
 	return err
 }
 
+const callbackAmbiguityTimeout = 5 * time.Second
+
+func (s *CallbackService) afterMarkerFailure(summary CallbackResultSummary, cause error, lease eventstore.InboxUpdate, version uint64) (CallbackResultSummary, error) {
+	recoveryCtx, cancel := context.WithTimeout(context.Background(), callbackAmbiguityTimeout)
+	defer cancel()
+	if err := s.markAmbiguous(recoveryCtx, lease, version); err != nil {
+		return summary, errors.Join(cause, err)
+	}
+	return summary, cause
+}
+
 func (s *CallbackService) markAmbiguous(ctx context.Context, lease eventstore.InboxUpdate, version uint64) error {
 	_, err := s.inbox.UpdateInbox(ctx, eventstore.InboxUpdate{
 		InboxID: lease.InboxID, ExpectedVersion: version, Version: version,
@@ -417,7 +452,6 @@ func (s *CallbackService) markAmbiguous(ctx context.Context, lease eventstore.In
 	})
 	return err
 }
-
 func invokeCallbackHost(ctx context.Context, host CompatibilityHost, request CallbackRequest, overlay *playerstate.LocalOverlay, collector *MutationCollector) (result CallbackResult, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -461,11 +495,98 @@ func validWorkflowID(value string) bool {
 }
 
 func containsOverlayEventPayload(value []byte) bool {
-	var decoded any
-	if err := json.Unmarshal(value, &decoded); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(value))
+	decoder.UseNumber()
+	decoded, err := scanJSONValue(decoder)
+	if err != nil {
 		return true
 	}
-	return containsOverlayValue(decoded)
+	if _, err := decoder.Token(); err != io.EOF {
+		return true
+	}
+	return decoded
+}
+
+func validateStrictJSON(value []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(value))
+	decoder.UseNumber()
+	if _, err := scanJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			return errors.New("trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+func scanJSONValue(decoder *json.Decoder) (bool, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return false, err
+	}
+	switch value := token.(type) {
+	case string:
+		return containsOverlayText(value), nil
+	case json.Delim:
+		switch value {
+		case '{':
+			seen := make(map[string]struct{})
+			overlay := false
+			for decoder.More() {
+				keyToken, err := decoder.Token()
+				if err != nil {
+					return false, err
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return false, errors.New("invalid JSON object key")
+				}
+				if _, duplicate := seen[key]; duplicate {
+					return false, errors.New("duplicate JSON object key")
+				}
+				seen[key] = struct{}{}
+				if containsOverlayText(key) {
+					overlay = true
+				}
+				childOverlay, err := scanJSONValue(decoder)
+				if err != nil {
+					return false, err
+				}
+				overlay = overlay || childOverlay
+			}
+			end, err := decoder.Token()
+			if err != nil || end != json.Delim('}') {
+				if err == nil {
+					err = errors.New("invalid JSON object")
+				}
+				return false, err
+			}
+			return overlay, nil
+		case '[':
+			overlay := false
+			for decoder.More() {
+				childOverlay, err := scanJSONValue(decoder)
+				if err != nil {
+					return false, err
+				}
+				overlay = overlay || childOverlay
+			}
+			end, err := decoder.Token()
+			if err != nil || end != json.Delim(']') {
+				if err == nil {
+					err = errors.New("invalid JSON array")
+				}
+				return false, err
+			}
+			return overlay, nil
+		}
+		return false, errors.New("unexpected JSON delimiter")
+	default:
+		return false, nil
+	}
 }
 
 func containsOverlayMetadata(metadata eventstore.Metadata) bool {
@@ -481,25 +602,6 @@ func containsOverlayText(value string) bool {
 	return strings.Contains(value, "$t")
 }
 
-func containsOverlayValue(value any) bool {
-	switch item := value.(type) {
-	case string:
-		return containsOverlayText(item)
-	case []any:
-		for _, child := range item {
-			if containsOverlayValue(child) {
-				return true
-			}
-		}
-	case map[string]any:
-		for key, child := range item {
-			if containsOverlayText(key) || containsOverlayValue(child) {
-				return true
-			}
-		}
-	}
-	return false
-}
 
 // MutationCollector is the sole callback mutation output. It owns copied
 // event/effect/KV bytes and rejects duplicate participants before commit.

@@ -81,6 +81,10 @@ func TestCallbackPayloadMetadataMismatchNoHost(t *testing.T) {
 			name:    "digest key",
 			payload: `{"endpointId":"endpoint","generation":1,"desiredVersion":1,"message":{"kind":1,"sender":"user","conversation":"group","platform":"test"},"contentDigest":"AQ==","contentDigestKeyId":"other-digest","status":"pending"}`,
 		},
+		{
+			name:    "duplicate envelope field",
+			payload: `{"endpointId":"endpoint","generation":1,"desiredVersion":1,"message":{"kind":1,"sender":"user","conversation":"group","platform":"test"},"contentDigest":"AQ==","contentDigestKeyId":"digest","status":"pending","status":"pending"}`,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -198,6 +202,12 @@ func TestCallbackCollectorRejectsOverlayAndDuplicateStreams(t *testing.T) {
 	if err := collector.AddStream(eventstore.StreamID{AggregateType: "group", AggregateID: "escaped"}, 0, []eventstore.NewEvent{callbackEvent("group.changed", `{"nested":["\u0024t"]}`)}); !errors.Is(err, eventstore.ErrInvalidEvent) {
 		t.Fatalf("escaped overlay event err=%v", err)
 	}
+	if err := NewMutationCollector(eventstore.EventFactory{}).AddStream(eventstore.StreamID{AggregateType: "group", AggregateID: "duplicate-key"}, 0, []eventstore.NewEvent{callbackEvent("group.changed", `{"value":"$t","value":"ok"}`)}); !errors.Is(err, eventstore.ErrInvalidEvent) {
+		t.Fatalf("duplicate-key event err=%v", err)
+	}
+	if err := NewMutationCollector(eventstore.EventFactory{}).AddStream(eventstore.StreamID{AggregateType: "group", AggregateID: "trailing-value"}, 0, []eventstore.NewEvent{callbackEvent("group.changed", `{"value":"ok"} {"value":"later"}`)}); !errors.Is(err, eventstore.ErrInvalidEvent) {
+		t.Fatalf("trailing event err=%v", err)
+	}
 	for _, field := range []string{"EventID", "CommandID", "CorrelationID", "CausationID", "PrincipalID", "Producer"} {
 		event := callbackEvent("group.metadata", `{}`)
 		switch field {
@@ -246,7 +256,7 @@ func newCallbackTestInbox() *callbackTestInbox {
 }
 func newCallbackTestService(t *testing.T, inbox *callbackTestInbox, store *callbackTestStore, host *callbackTestHost, codec callbackTestCodec, options ...any) *CallbackService {
 	t.Helper()
-	config := CallbackConfig{Inbox: inbox, Store: store, Codec: codec, Resolver: callbackTestResolver{}, Group: callbackTestGroupLoader{}, Player: callbackTestPlayerLoader{}, Host: host, WorkerID: "worker"}
+	config := CallbackConfig{Inbox: inbox, Store: store, Codec: codec, AllowUnboundCodec: true, Resolver: callbackTestResolver{}, Group: callbackTestGroupLoader{}, Player: callbackTestPlayerLoader{}, Host: host, WorkerID: "worker"}
 	for _, option := range options {
 		switch value := option.(type) {
 		case callbackTestGroupLoader:
@@ -328,6 +338,34 @@ func (c callbackTestCodec) Decrypt(context.Context, []byte, []byte, string) ([]b
 	return []byte(`{"endpointId":"endpoint","generation":1,"desiredVersion":1,"message":{"kind":1,"sender":"user","conversation":"group","platform":"test"},"contentDigest":"AQ==","contentDigestKeyId":"digest","status":"pending"}`), nil
 }
 
+type callbackTestBoundCodec struct {
+	callbackTestCodec
+	calls    *int
+	domain   *string
+	identity *string
+	owner    *string
+	version  *uint64
+}
+
+func (c callbackTestBoundCodec) DecryptBound(ctx context.Context, domain, identity, owner string, version uint64, ciphertext, nonce []byte, keyID string) ([]byte, error) {
+	if c.calls != nil {
+		*c.calls = *c.calls + 1
+	}
+	if c.domain != nil {
+		*c.domain = domain
+	}
+	if c.identity != nil {
+		*c.identity = identity
+	}
+	if c.owner != nil {
+		*c.owner = owner
+	}
+	if c.version != nil {
+		*c.version = version
+	}
+	return c.callbackTestCodec.Decrypt(ctx, ciphertext, nonce, keyID)
+}
+
 type callbackTestResolver struct{}
 
 func (callbackTestResolver) Resolve(context.Context, string, adapterapi.InboundMessage) (CallbackScope, error) {
@@ -401,9 +439,12 @@ func TestCallbackSQLiteMarkerAndTerminalCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	host := &callbackTestHost{}
+	boundCalls := 0
+	boundDomain, boundIdentity, boundOwner := "", "", ""
+	var boundVersion uint64
 	service, err := NewCallbackService(CallbackConfig{
-		Inbox: store, Store: store, Codec: callbackTestCodec{}, Resolver: callbackTestResolver{},
-		Group: groupstate.NewRepository(store), Player: playerstate.NewRepository(store), Host: host, WorkerID: "worker",
+		Inbox: store, Store: store, Codec: callbackTestBoundCodec{calls: &boundCalls, domain: &boundDomain, identity: &boundIdentity, owner: &boundOwner, version: &boundVersion},
+		Resolver: callbackTestResolver{}, Group: groupstate.NewRepository(store), Player: playerstate.NewRepository(store), Host: host, WorkerID: "worker",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -411,8 +452,8 @@ func TestCallbackSQLiteMarkerAndTerminalCommit(t *testing.T) {
 	if _, err := service.ProcessOne(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if host.calls != 1 {
-		t.Fatalf("host calls=%d", host.calls)
+	if host.calls != 1 || boundCalls != 1 || boundDomain != "inbox/v1" || boundIdentity != inbox.InboxID || boundOwner != inbox.EndpointID || boundVersion != 1 {
+		t.Fatalf("host calls=%d bound calls=%d domain=%q identity=%q owner=%q version=%d", host.calls, boundCalls, boundDomain, boundIdentity, boundOwner, boundVersion)
 	}
 	if _, err := store.ClaimInbox(ctx, eventstore.InboxClaimRequest{WorkerID: "second-worker"}); !errors.Is(err, eventstore.ErrNotFound) {
 		t.Fatalf("terminal inbox was claimable: %v", err)
@@ -448,7 +489,7 @@ func TestCallbackSQLiteExpiredLeaseStillMarksAmbiguous(t *testing.T) {
 		return CallbackResult{}, errors.New("callback failed after lease expiry")
 	}}
 	service, err := NewCallbackService(CallbackConfig{
-		Inbox: store, Store: store, Codec: callbackTestCodec{}, Resolver: callbackTestResolver{},
+		Inbox: store, Store: store, Codec: callbackTestCodec{}, AllowUnboundCodec: true, Resolver: callbackTestResolver{},
 		Group: groupstate.NewRepository(store), Player: playerstate.NewRepository(store), Host: host, WorkerID: "worker",
 		LeaseDuration: time.Minute, Clock: clock,
 	})
@@ -470,6 +511,111 @@ func TestCallbackSQLiteExpiredLeaseStillMarksAmbiguous(t *testing.T) {
 	}
 	if host.calls != 1 {
 		t.Fatalf("ambiguous callback host calls=%d", host.calls)
+	}
+}
+
+func TestCallbackSQLiteRecoversExpiredStartedAndClaimsSuccessor(t *testing.T) {
+	ctx := context.Background()
+	clock := &callbackFixedClock{now: time.Unix(100, 0).UTC()}
+	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "callback-recovery.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := eventstore.NewStore(db, eventstore.WithClock(clock), eventstore.WithPayloadCodec(callbackTestCodec{}))
+	first := eventstore.InboxUpdate{
+		InboxID: "sqlite-started-inbox", EndpointID: "endpoint", ProviderEventKey: "started-provider",
+		LaneHMAC: []byte("started-lane"), Status: eventstore.InboxStatusPending,
+		PayloadCiphertext: []byte("payload"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key",
+		ContentDigest: []byte{1}, ContentDigestKeyID: "digest",
+	}
+	if _, err := store.AcceptInbox(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.ClaimInbox(ctx, eventstore.InboxClaimRequest{WorkerID: "crashed-worker", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateInbox(ctx, eventstore.InboxUpdate{
+		InboxID: first.InboxID, ExpectedVersion: lease.Update.Version, Version: lease.Update.Version,
+		Status: eventstore.InboxStatusCallbackStarted, LeaseOwner: lease.Update.LeaseOwner,
+		LeaseEpoch: lease.Update.LeaseEpoch, AttemptID: lease.Update.AttemptID, LeaseExpiresAt: lease.Update.LeaseExpiresAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.InboxID = "sqlite-successor-inbox"
+	second.ProviderEventKey = "successor-provider"
+	second.LaneHMAC = []byte("successor-lane")
+	if _, err := store.AcceptInbox(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	clock.now = clock.now.Add(2 * time.Minute)
+	host := &callbackTestHost{}
+	service, err := NewCallbackService(CallbackConfig{
+		Inbox: store, Store: store, Codec: callbackTestCodec{}, AllowUnboundCodec: true,
+		Resolver: callbackTestResolver{}, Group: groupstate.NewRepository(store), Player: playerstate.NewRepository(store),
+		Host: host, WorkerID: "recovery-worker", LeaseDuration: time.Minute, Clock: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ProcessOne(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var firstRow, secondRow eventstoreInboxRowForTest
+	if err := db.GORM().Table("inbox_messages").Where("inbox_id = ?", first.InboxID).Scan(&firstRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GORM().Table("inbox_messages").Where("inbox_id = ?", second.InboxID).Scan(&secondRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if firstRow.Status != eventstore.InboxStatusAmbiguous || len(firstRow.PayloadCiphertext) != 0 {
+		t.Fatalf("expired callback-started row=%#v", firstRow)
+	}
+	if secondRow.Status != eventstore.InboxStatusConfirmedConsumed || host.calls != 1 {
+		t.Fatalf("successor row=%#v host calls=%d", secondRow, host.calls)
+	}
+}
+func TestCallbackSQLiteAmbiguityUsesIndependentContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "callback-canceled.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := eventstore.NewStore(db, eventstore.WithPayloadCodec(callbackTestCodec{}))
+	inbox := eventstore.InboxUpdate{
+		InboxID: "sqlite-canceled-inbox", EndpointID: "endpoint", ProviderEventKey: "canceled-provider",
+		LaneHMAC: []byte("canceled-lane"), Status: eventstore.InboxStatusPending,
+		PayloadCiphertext: []byte("payload"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key",
+		ContentDigest: []byte{1}, ContentDigestKeyID: "digest",
+	}
+	if _, err := store.AcceptInbox(context.Background(), inbox); err != nil {
+		t.Fatal(err)
+	}
+	host := &callbackTestHost{fn: func(context.Context, CallbackRequest, *playerstate.LocalOverlay, *MutationCollector) (CallbackResult, error) {
+		cancel()
+		return CallbackResult{}, errors.New("callback failed after context cancellation")
+	}}
+	service, err := NewCallbackService(CallbackConfig{
+		Inbox: store, Store: store, Codec: callbackTestCodec{}, AllowUnboundCodec: true,
+		Resolver: callbackTestResolver{}, Group: groupstate.NewRepository(store), Player: playerstate.NewRepository(store),
+		Host: host, WorkerID: "worker",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ProcessOne(ctx); err == nil {
+		t.Fatal("canceled callback unexpectedly succeeded")
+	}
+	var row eventstoreInboxRowForTest
+	if err := db.GORM().Table("inbox_messages").Where("inbox_id = ?", inbox.InboxID).Scan(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != eventstore.InboxStatusAmbiguous || len(row.PayloadCiphertext) != 0 || host.calls != 1 {
+		t.Fatalf("canceled callback row=%#v host calls=%d", row, host.calls)
 	}
 }
 

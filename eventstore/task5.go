@@ -585,6 +585,18 @@ func (s *GORMStore) ClaimInbox(ctx context.Context, req InboxClaimRequest) (leas
 		}
 	}()
 	now := s.task5Now()
+	if req.RecoverExpiredCallbackStarted {
+		var recoveredRows []inboxMessageRow
+		recoveredQuery := locked(tx).Where("status = ? AND lease_expiry IS NOT NULL AND lease_expiry <= ?", InboxStatusCallbackStarted, now).Find(&recoveredRows)
+		if recoveredQuery.Error != nil {
+			return InboxLease{}, errors.New("eventstore: recover callback-started query failed")
+		}
+		for i := range recoveredRows {
+			if err = task5RecoverExpiredCallbackStarted(tx, &recoveredRows[i], now); err != nil {
+				return InboxLease{}, err
+			}
+		}
+	}
 	var expiredRows []inboxMessageRow
 	expiredQuery := locked(tx).Where("status IN ? AND payload_expires_at IS NOT NULL AND payload_expires_at <= ? AND (payload_ciphertext IS NOT NULL OR payload_nonce IS NOT NULL)", []string{InboxStatusPending, InboxStatusLeased, InboxStatusCallbackStarted, InboxStatusAmbiguous}, now).Find(&expiredRows)
 	if expiredQuery.Error != nil {
@@ -2048,6 +2060,12 @@ func task5FinalizeInboxPayload(tx *gorm.DB, row *inboxMessageRow, now time.Time,
 	}
 	return nil
 }
+func task5RecoverExpiredCallbackStarted(tx *gorm.DB, row *inboxMessageRow, now time.Time) error {
+	if row.Status != InboxStatusCallbackStarted || row.LeaseExpiry == nil || row.LeaseExpiry.After(now) {
+		return nil
+	}
+	return task5FinalizeInboxPayload(tx, row, now, InboxStatusAmbiguous, "callback-lease-expired")
+}
 
 func task5QuarantineInboxPayload(tx *gorm.DB, row *inboxMessageRow, now time.Time, reason string) error {
 	return task5FinalizeInboxPayload(tx, row, now, InboxStatusFailed, reason)
@@ -2862,6 +2880,9 @@ func (s *GORMStore) applyTask5InboxParticipants(ctx context.Context, tx *gorm.DB
 			}
 			hasOpaqueReplay := len(update.PayloadCiphertext) > 0 || len(update.PayloadNonce) > 0 || len(update.ContentDigest) > 0
 			if hasOpaqueReplay {
+				if update.WorkflowID != "" {
+					return ErrInvalidTransition
+				}
 				if err := validateTask5OpaquePayload(update.PayloadCiphertext, update.PayloadNonce, payloadKeyID); err != nil {
 					return err
 				}

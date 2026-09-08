@@ -194,6 +194,36 @@ func TestTask4DirectInboxUpdateRejectsCompletedAt(t *testing.T) {
 		t.Fatalf("inbox changed after rejected completed-at update=%#v", row)
 	}
 }
+func TestTask4OpaqueInboxReplayRejectsWorkflowLink(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	inbox, lease := task4PrepareStartedInbox(t, store, ctx, "task4-opaque-workflow")
+	workflowID := "workflow-opaque-replay"
+	work := UnitOfWork{
+		Streams: []StreamAppend{task4WorkflowStream(workflowID, MessageWorkflowTerminatedEventTypeForTest, "opaque-replay-event")},
+		InboxUpdates: []InboxUpdate{{
+			InboxID: inbox.InboxID, ExpectedVersion: lease.Update.Version + 1, Version: lease.Update.Version + 1,
+			Status: InboxStatusPending, WorkflowID: workflowID, EndpointID: inbox.EndpointID,
+			ProviderEventKey: inbox.ProviderEventKey, LaneHMAC: inbox.LaneHMAC,
+			PayloadCiphertext: inbox.PayloadCiphertext, PayloadNonce: inbox.PayloadNonce,
+			PayloadEncryptionKeyID: inbox.PayloadEncryptionKeyID, ContentDigest: inbox.ContentDigest,
+		}},
+	}
+	if _, err := store.Commit(ctx, work); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("opaque workflow replay err=%v", err)
+	}
+	var row inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != InboxStatusCallbackStarted || row.WorkflowID != "" {
+		t.Fatalf("inbox changed after rejected opaque workflow=%#v", row)
+	}
+	if events, err := store.Load(ctx, StreamID{AggregateType: "message-workflow", AggregateID: workflowID}, 1); err != nil || len(events) != 0 {
+		t.Fatalf("workflow partial events=%d err=%v", len(events), err)
+	}
+}
 
 func TestTask4CallbackClaimQuarantinesAuthenticationFailure(t *testing.T) {
 	store, db, source := task6Store(t)
