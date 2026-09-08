@@ -13,8 +13,9 @@ const (
 	GroupUserAttrsAggregateType = "attrs/group-user"
 	CharacterAggregateType = "character"
 	ModerationAggregateType = "moderation/group"
-	EventSchemaVersion uint16 = 1
 	MaxIdentityPartBytes = 255
+	EventSchemaVersion uint16 = 1
+	MaxStreamAggregateIDBytes = 255
 )
 
 type PlayerState struct { Version uint64 `json:"version"`; DiceID string `json:"diceId"`; GroupID string `json:"groupId"`; UserID string `json:"userId"`; Name string `json:"name,omitempty"`; Privilege int `json:"privilege"`; AutoSetNameTemplate string `json:"autoSetNameTemplate,omitempty"`; LastCommandAt int64 `json:"lastCommandAt,omitempty"`; Deleted bool `json:"deleted"` }
