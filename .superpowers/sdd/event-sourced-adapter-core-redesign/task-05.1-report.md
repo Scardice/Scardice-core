@@ -406,3 +406,15 @@ ok   github.com/PaienNate/pineutil/evsocket/v2
 go test ./core/messageflow -run 'TestInboundServiceRejectsAggregatePayloadBeforeMarshal' -count=1
 ok   Scardice-core/core/messageflow
 ```
+
+## Round 20 fixes
+
+- Aggregate preflight now includes 64 bytes of conservative JSON structure overhead per segment (keys, punctuation, and array framing), not only escaped field bytes.
+- Added a 256-segment NUL-escape regression whose field lengths are individually valid but whose escaped JSON plus structural overhead exceeds the event payload bound; it is rejected before marshal.
+
+### Round 20 GREEN evidence
+
+```text
+go test ./core/messageflow -run 'TestInboundService(RejectsAggregatePayloadBeforeMarshal|RejectsEscapeHeavyAggregateBeforeMarshal)' -count=1
+ok   Scardice-core/core/messageflow
+```

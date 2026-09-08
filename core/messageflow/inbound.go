@@ -100,10 +100,12 @@ func inboundJSONUpperBound(message adapterapi.InboundMessage) int {
 	}
 	const jsonEscapeUpperBound = 6
 	const fixedJSONOverhead = 512
-	if total > (eventstore.MaxEventPayloadBytes-fixedJSONOverhead)/jsonEscapeUpperBound {
+	const segmentJSONOverhead = 64
+	fixed := fixedJSONOverhead + segmentJSONOverhead*len(message.Segments)
+	if fixed > eventstore.MaxEventPayloadBytes || total > (eventstore.MaxEventPayloadBytes-fixed)/jsonEscapeUpperBound {
 		return eventstore.MaxEventPayloadBytes + 1
 	}
-	return fixedJSONOverhead + total*jsonEscapeUpperBound
+	return fixed + total*jsonEscapeUpperBound
 }
 
 // row in a later workflow.

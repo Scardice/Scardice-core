@@ -149,6 +149,23 @@ func TestInboundServiceRejectsAggregatePayloadBeforeMarshal(t *testing.T) {
 	}
 }
 
+func TestInboundServiceRejectsEscapeHeavyAggregateBeforeMarshal(t *testing.T) {
+	repo := &ingressRepoStub{}
+	svc, err := NewInboundService(repo, ingressCryptoStub{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	segments := make([]adapterapi.InboundSegment, adapterapi.MaxInboundSegments)
+	for i := range segments {
+		segments[i] = adapterapi.InboundSegment{Kind: "text", Text: strings.Repeat("\x00", 160)}
+	}
+	message := testFencedMessage("escape-heavy", "body")
+	message.Message.Segments = segments
+	if _, err := svc.HandleInbound(context.Background(), message); !errors.Is(err, ErrIngressPayload) {
+		t.Fatalf("escape-heavy aggregate error = %v", err)
+	}
+}
+
 func TestInboundServiceStableIDChangedBodyIsCollision(t *testing.T) {
 	repo := &ingressRepoStub{}
 	svc, err := NewInboundService(repo, ingressCryptoStub{})
