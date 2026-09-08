@@ -470,10 +470,10 @@ func validateWorkflowResult(workflow *WorkflowResult) error {
 	if workflow == nil {
 		return nil
 	}
-	if !validWorkflowID(workflow.ID) || workflow.ExpectedVersion == ^uint64(0) {
+	if !validWorkflowID(workflow.ID) || containsOverlayText(workflow.ID) || workflow.ExpectedVersion == ^uint64(0) {
 		return ErrCallbackWorkflow
 	}
-	if workflow.Event.EventType != MessageWorkflowTerminatedEventType || workflow.Event.SchemaVersion == 0 || workflow.Event.Metadata.EventID == "" || workflow.Event.Metadata.CommandID == "" || workflow.Event.Metadata.CorrelationID == "" || len(workflow.Event.Payload) == 0 || len(workflow.Event.Payload) > eventstore.MaxEventPayloadBytes {
+	if workflow.Event.EventType != MessageWorkflowTerminatedEventType || containsOverlayText(workflow.Event.EventType) || workflow.Event.SchemaVersion == 0 || workflow.Event.Metadata.EventID == "" || workflow.Event.Metadata.CommandID == "" || workflow.Event.Metadata.CorrelationID == "" || len(workflow.Event.Payload) == 0 || len(workflow.Event.Payload) > eventstore.MaxEventPayloadBytes {
 		return ErrCallbackWorkflow
 	}
 	if containsOverlayEventPayload(workflow.Event.Payload) || containsOverlayMetadata(workflow.Event.Metadata) {
@@ -601,7 +601,36 @@ func containsOverlayMetadata(metadata eventstore.Metadata) bool {
 func containsOverlayText(value string) bool {
 	return strings.Contains(value, "$t")
 }
+func containsOverlayStream(stream eventstore.StreamID) bool {
+	return containsOverlayText(stream.AggregateType) || containsOverlayText(stream.AggregateID)
+}
 
+func containsOverlayEvent(event eventstore.NewEvent) bool {
+	return containsOverlayText(event.EventType) || containsOverlayMetadata(event.Metadata) || containsOverlayEventPayload(event.Payload)
+}
+
+func containsOverlayPlugin(update eventstore.PluginKVUpdate) bool {
+	return containsOverlayText(update.ExtensionID) || containsOverlayText(update.EncryptionKeyID)
+}
+
+func containsOverlayEffect(effect eventstore.NewEffect) bool {
+	return containsOverlayText(effect.EffectID) ||
+		containsOverlayText(effect.EndpointID) ||
+		containsOverlayText(effect.EffectType) ||
+		containsOverlayText(effect.RiskClass) ||
+		containsOverlayText(effect.Status) ||
+		containsOverlayText(effect.AttemptID) ||
+		containsOverlayText(effect.LeaseOwner) ||
+		containsOverlayText(effect.DigestKeyID) ||
+		containsOverlayText(effect.PayloadEncryptionKeyID) ||
+		containsOverlayText(effect.ContentDigestKeyID) ||
+		containsOverlayText(effect.ProviderMessageID) ||
+		containsOverlayText(effect.ResultCode) ||
+		containsOverlayText(effect.ErrorCode) ||
+		containsOverlayText(effect.Resolution) ||
+		containsOverlayText(effect.PrincipalID) ||
+		containsOverlayText(effect.Reason)
+}
 
 // MutationCollector is the sole callback mutation output. It owns copied
 // event/effect/KV bytes and rejects duplicate participants before commit.
@@ -625,7 +654,7 @@ func NewMutationCollector(factory eventstore.EventFactory) *MutationCollector {
 
 // AddStream adds already-decided events to one non-workflow stream.
 func (c *MutationCollector) AddStream(stream eventstore.StreamID, expectedVersion uint64, events []eventstore.NewEvent) error {
-	if c == nil || stream.AggregateType == "" || stream.AggregateID == "" || len(events) == 0 || stream.AggregateType == MessageWorkflowAggregateType {
+	if c == nil || stream.AggregateType == "" || stream.AggregateID == "" || len(events) == 0 || stream.AggregateType == MessageWorkflowAggregateType || containsOverlayStream(stream) {
 		return ErrCallbackWorkflow
 	}
 	if _, exists := c.streams[stream]; exists {
@@ -643,7 +672,7 @@ func (c *MutationCollector) AddStream(stream eventstore.StreamID, expectedVersio
 	}
 	copied := make([]eventstore.NewEvent, len(events))
 	for i, event := range events {
-		if event.EventType == "" || event.SchemaVersion == 0 || len(event.Payload) > eventstore.MaxEventPayloadBytes || event.Metadata.EventID == "" || event.Metadata.CommandID == "" || event.Metadata.CorrelationID == "" || containsOverlayMetadata(event.Metadata) || containsOverlayEventPayload(event.Payload) {
+		if event.EventType == "" || event.SchemaVersion == 0 || len(event.Payload) > eventstore.MaxEventPayloadBytes || event.Metadata.EventID == "" || event.Metadata.CommandID == "" || event.Metadata.CorrelationID == "" || containsOverlayEvent(event) {
 			return eventstore.ErrInvalidEvent
 		}
 		copied[i] = cloneNewEvent(event)
@@ -706,7 +735,7 @@ func (c *MutationCollector) AddGroupUserAttrsEvents(stream eventstore.StreamID, 
 // AddPluginKV adds an already encrypted plugin state update. Plaintext key or
 // value APIs are intentionally absent.
 func (c *MutationCollector) AddPluginKV(update eventstore.PluginKVUpdate) error {
-	if c == nil || strings.TrimSpace(update.ExtensionID) == "" || len(update.KeyHMAC) == 0 || update.ValueSize < 0 || update.ValueSize > eventstore.MaxPluginValueBytes {
+	if c == nil || strings.TrimSpace(update.ExtensionID) == "" || len(update.KeyHMAC) == 0 || update.ValueSize < 0 || update.ValueSize > eventstore.MaxPluginValueBytes || containsOverlayPlugin(update) {
 		return eventstore.ErrInvalidMetadata
 	}
 	if !update.Deleted && (len(update.KeyCiphertext) == 0 || len(update.KeyNonce) == 0 || len(update.ValueCiphertext) == 0 || len(update.ValueNonce) == 0 || strings.TrimSpace(update.EncryptionKeyID) == "") {
@@ -726,7 +755,7 @@ func (c *MutationCollector) AddPluginKV(update eventstore.PluginKVUpdate) error 
 
 // AddEffect adds a prevalidated encrypted outbound intent.
 func (c *MutationCollector) AddEffect(effect eventstore.NewEffect) error {
-	if c == nil || strings.TrimSpace(effect.EffectID) == "" || strings.TrimSpace(effect.EndpointID) == "" || len(effect.LaneHMAC) == 0 || strings.TrimSpace(effect.EffectType) == "" || !validRisk(effect.RiskClass) || effect.Status != eventstore.OutboxStatusPending || len(effect.PayloadCiphertext) == 0 || len(effect.PayloadNonce) == 0 || strings.TrimSpace(effect.PayloadEncryptionKeyID) == "" {
+	if c == nil || strings.TrimSpace(effect.EffectID) == "" || strings.TrimSpace(effect.EndpointID) == "" || len(effect.LaneHMAC) == 0 || strings.TrimSpace(effect.EffectType) == "" || !validRisk(effect.RiskClass) || effect.Status != eventstore.OutboxStatusPending || len(effect.PayloadCiphertext) == 0 || len(effect.PayloadNonce) == 0 || strings.TrimSpace(effect.PayloadEncryptionKeyID) == "" || containsOverlayEffect(effect) {
 		return eventstore.ErrInvalidMetadata
 	}
 	if _, exists := c.effects[effect.EffectID]; exists {

@@ -228,6 +228,82 @@ func TestCallbackCollectorRejectsOverlayAndDuplicateStreams(t *testing.T) {
 			t.Fatalf("overlay metadata %s err=%v", field, err)
 		}
 	}
+	for _, stream := range []eventstore.StreamID{
+		{AggregateType: "$t-type", AggregateID: "group"},
+		{AggregateType: "group", AggregateID: "$t-id"},
+	} {
+		if err := NewMutationCollector(eventstore.EventFactory{}).AddStream(stream, 0, []eventstore.NewEvent{callbackEvent("group.changed", `{}`)}); !errors.Is(err, ErrCallbackWorkflow) {
+			t.Fatalf("overlay stream %#v err=%v", stream, err)
+		}
+	}
+	event := callbackEvent("group.changed", `{}`)
+	event.EventType = "$t-event"
+	if err := NewMutationCollector(eventstore.EventFactory{}).AddStream(eventstore.StreamID{AggregateType: "group", AggregateID: "event-type"}, 0, []eventstore.NewEvent{event}); !errors.Is(err, eventstore.ErrInvalidEvent) {
+		t.Fatalf("overlay event type err=%v", err)
+	}
+	plugin := eventstore.PluginKVUpdate{
+		ExtensionID: "plugin", KeyHMAC: []byte("key"), KeyCiphertext: []byte("ciphertext"), KeyNonce: []byte("nonce"),
+		ValueCiphertext: []byte("value"), ValueNonce: []byte("nonce"), EncryptionKeyID: "key", ValueSize: 2,
+	}
+	for _, field := range []string{"ExtensionID", "EncryptionKeyID"} {
+		update := plugin
+		if field == "ExtensionID" {
+			update.ExtensionID = "$t-plugin"
+		} else {
+			update.EncryptionKeyID = "$t-plugin-key"
+		}
+		if err := NewMutationCollector(eventstore.EventFactory{}).AddPluginKV(update); !errors.Is(err, eventstore.ErrInvalidMetadata) {
+			t.Fatalf("overlay plugin %s err=%v", field, err)
+		}
+	}
+	effect := eventstore.NewEffect{
+		EffectID: "effect", EndpointID: "endpoint", LaneHMAC: []byte("lane"), EffectType: "send",
+		RiskClass: eventstore.RiskPreDispatchRetryable, Status: eventstore.OutboxStatusPending,
+		PayloadCiphertext: []byte("ciphertext"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key",
+	}
+	for _, field := range []string{"EffectID", "EndpointID", "EffectType", "RiskClass", "Status", "AttemptID", "LeaseOwner", "DigestKeyID", "PayloadEncryptionKeyID", "ContentDigestKeyID", "ProviderMessageID", "ResultCode", "ErrorCode", "Resolution", "PrincipalID", "Reason"} {
+		update := effect
+		switch field {
+		case "EffectID":
+			update.EffectID = "$t-effect"
+		case "EndpointID":
+			update.EndpointID = "$t-endpoint"
+		case "EffectType":
+			update.EffectType = "$t-effect-type"
+		case "RiskClass":
+			update.RiskClass = "$t-risk"
+		case "Status":
+			update.Status = "$t-status"
+		case "AttemptID":
+			update.AttemptID = "$t-attempt"
+		case "LeaseOwner":
+			update.LeaseOwner = "$t-owner"
+		case "DigestKeyID":
+			update.DigestKeyID = "$t-digest"
+		case "PayloadEncryptionKeyID":
+			update.PayloadEncryptionKeyID = "$t-payload-key"
+		case "ContentDigestKeyID":
+			update.ContentDigestKeyID = "$t-content-key"
+		case "ProviderMessageID":
+			update.ProviderMessageID = "$t-provider"
+		case "ResultCode":
+			update.ResultCode = "$t-result"
+		case "ErrorCode":
+			update.ErrorCode = "$t-error"
+		case "Resolution":
+			update.Resolution = "$t-resolution"
+		case "PrincipalID":
+			update.PrincipalID = "$t-principal"
+		case "Reason":
+			update.Reason = "$t-reason"
+		}
+		if err := NewMutationCollector(eventstore.EventFactory{}).AddEffect(update); !errors.Is(err, eventstore.ErrInvalidMetadata) {
+			t.Fatalf("overlay effect %s err=%v", field, err)
+		}
+	}
+	if err := validateWorkflowResult(&WorkflowResult{ID: "$t-workflow", Event: callbackEvent(MessageWorkflowTerminatedEventType, `{}`)}); !errors.Is(err, ErrCallbackWorkflow) {
+		t.Fatalf("overlay workflow id err=%v", err)
+	}
 	opaqueCollector := NewMutationCollector(eventstore.EventFactory{})
 	if err := opaqueCollector.AddPluginKV(eventstore.PluginKVUpdate{
 		ExtensionID: "plugin", KeyHMAC: []byte("key"), KeyCiphertext: []byte("$t-ciphertext"),
