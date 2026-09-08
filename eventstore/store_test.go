@@ -144,7 +144,7 @@ func TestZeroStreamParticipantUpdates(t *testing.T) {
 		ArtifactUpdates: []ArtifactUpdate{{ArtifactID:"art-zero",OperationID:"op-zero",OwnerPrincipalID:"p-zero",Ciphertext:[]byte("sealed:artifact"),Nonce:[]byte("nonce"),EncryptionKeyID:"test-key",Size:8,Status:"ready"}},
 		SecretUpdates: []SecretUpdate{{SecretRef:"secret-zero", Ciphertext:[]byte("secret"), Nonce:[]byte("nonce")}},
 		PluginKVUpdates: []PluginKVUpdate{{ExtensionID:"plugin-zero", KeyHMAC:[]byte("key-zero"), KeyCiphertext:[]byte("key"), ValueCiphertext:[]byte("value")}},
-		InboxUpdates: []InboxUpdate{{InboxID:"inbox-zero",EndpointID:"endpoint-zero",ProviderEventKey:"provider-zero",LaneHMAC:[]byte("in-lane"),OrderingSequence:99,Status:InboxStatusPending,PayloadCiphertext:[]byte("in-payload"),PayloadNonce:[]byte("in-nonce"),ContentDigest:[]byte("in-digest"),DigestKeyID:"in-key",WorkflowID:"workflow-zero"}},
+		InboxUpdates: []InboxUpdate{{InboxID:"inbox-zero",EndpointID:"endpoint-zero",ProviderEventKey:"provider-zero",LaneHMAC:[]byte("in-lane"),OrderingSequence:99,Status:InboxStatusPending,PayloadCiphertext:[]byte("in-payload"),PayloadNonce:[]byte("in-nonce"),ContentDigest:[]byte("in-digest"),DigestKeyID:"in-key"}},
 		Effects: []NewEffect{{EffectID:"effect-zero",EndpointID:"endpoint-zero",LaneHMAC:[]byte("out-lane"),OrderingSequence:99,EffectType:"send",RiskClass:RiskPreDispatchRetryable,Status:OutboxStatusPending,PayloadCiphertext:[]byte("out-payload"),PayloadNonce:[]byte("out-nonce"),ContentDigest:[]byte("out-digest"),DigestKeyID:"out-key"}},
 		FenceUpdates: []SubjectFenceUpdate{{SubjectKey:[]byte("subject-zero"), Scope:"all", PurgeOperationID:"op-zero"}},
 	}
@@ -159,7 +159,7 @@ func TestZeroStreamParticipantUpdates(t *testing.T) {
 	if _, err := store.Commit(context.Background(), UnitOfWork{InboxUpdates: []InboxUpdate{{InboxID:"inbox-zero",ExpectedVersion:1,Status:InboxStatusPending}}}); err != nil { t.Fatalf("sparse inbox update: %v", err) }
 	var inboxRow inboxMessageRow
 	if err := db.GORM().Where("inbox_id = ?", "inbox-zero").First(&inboxRow).Error; err != nil { t.Fatal(err) }
-	if inboxRow.Version != 2 || inboxRow.Status != InboxStatusPending || inboxRow.OrderingSequence != 1 || string(inboxRow.PayloadCiphertext) != "in-payload" || inboxRow.WorkflowID != "workflow-zero" { t.Fatalf("inbox sparse preservation = %#v", inboxRow) }
+	if inboxRow.Version != 2 || inboxRow.Status != InboxStatusPending || inboxRow.OrderingSequence != 1 || string(inboxRow.PayloadCiphertext) != "in-payload" || inboxRow.WorkflowID != "" { t.Fatalf("inbox sparse preservation = %#v", inboxRow) }
 	if _, err := store.Commit(context.Background(), UnitOfWork{Effects: []NewEffect{{EffectID:"effect-zero",ExpectedVersion:1,Status:OutboxStatusPending}}}); err != nil { t.Fatalf("sparse effect update: %v", err) }
 	var effectRow outboxEffectRow
 	if err := db.GORM().Where("effect_id = ?", "effect-zero").First(&effectRow).Error; err != nil { t.Fatal(err) }

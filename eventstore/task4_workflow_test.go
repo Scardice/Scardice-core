@@ -73,6 +73,48 @@ func TestTask4WorkflowLinkRejectsInvalidIdentityWithoutPartialWrites(t *testing.
 		t.Fatalf("workflow partial events=%d err=%v", len(events), err)
 	}
 }
+func TestTask4WorkflowLinkRejectsOverlayMarkerWithoutPartialWrites(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	inbox, lease := task4PrepareStartedInbox(t, store, ctx, "task4-overlay-workflow")
+	workflowID := "$t-workflow"
+	work := UnitOfWork{
+		Streams: []StreamAppend{task4WorkflowStream(workflowID, MessageWorkflowTerminatedEventTypeForTest, "overlay-workflow-event")},
+		InboxUpdates: []InboxUpdate{{
+			InboxID: inbox.InboxID, ExpectedVersion: lease.Update.Version + 1, Version: lease.Update.Version + 2,
+			Status: InboxStatusConfirmedConsumed, WorkflowID: workflowID, LeaseOwner: lease.Update.LeaseOwner,
+			LeaseEpoch: lease.Update.LeaseEpoch, AttemptID: lease.Update.AttemptID, LeaseExpiresAt: lease.Update.LeaseExpiresAt,
+		}},
+	}
+	if _, err := store.Commit(ctx, work); !errors.Is(err, ErrInvalidMetadata) {
+		t.Fatalf("overlay workflow err=%v", err)
+	}
+	var row inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != InboxStatusCallbackStarted || row.WorkflowID != "" {
+		t.Fatalf("inbox changed after rejected overlay workflow=%#v", row)
+	}
+	if events, err := store.Load(ctx, StreamID{AggregateType: "message-workflow", AggregateID: workflowID}, 1); err != nil || len(events) != 0 {
+		t.Fatalf("workflow partial events=%d err=%v", len(events), err)
+	}
+}
+func TestTask4AcceptInboxRejectsWorkflowLinkWithoutPartialWrites(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	inbox := task5Inbox("task4-accept-workflow", "task4-accept-workflow-provider", "task4-accept-workflow-lane")
+	inbox.WorkflowID = "workflow-accept-orphan"
+	if _, err := store.AcceptInbox(ctx, inbox); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("accept workflow err=%v", err)
+	}
+	var row inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&row).Error; !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("accept workflow row err=%v row=%#v", err, row)
+	}
+}
 func TestTask4WorkflowLinkRequiresExactSameUOWParticipant(t *testing.T) {
 	tests := []struct {
 		name    string

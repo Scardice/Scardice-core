@@ -320,7 +320,7 @@ func validInboxStatus(v string) bool {
 	return false
 }
 func validInboxWorkflowID(value string) bool {
-	if strings.TrimSpace(value) == "" || len(value) > 255 {
+	if strings.TrimSpace(value) == "" || len(value) > 255 || strings.Contains(value, "$t") {
 		return false
 	}
 	for _, r := range value {
@@ -428,6 +428,9 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 		update.Status = InboxStatusPending
 	}
 	if update.Status != InboxStatusPending {
+		return CommitResult{}, ErrInvalidTransition
+	}
+	if update.WorkflowID != "" {
 		return CommitResult{}, ErrInvalidTransition
 	}
 	now := s.task5Now()
