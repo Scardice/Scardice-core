@@ -485,3 +485,19 @@ ok   Scardice-core/core/messageflow
 go test ./evsocket/v2 -run 'Test(DuplicateConnectCoalescesBeforeEvictingOrdinaryQueue|DuplicateDisconnectCoalescesWhenTerminalQueueIsFull|DisconnectEvictsQueuedConnectWhenTerminalQueueIsFull)' -count=1
 ok   github.com/PaienNate/pineutil/evsocket/v2
 ```
+
+## Round 26 fixes
+
+- Added an explicit `eventEnvelope.terminal` marker. Only Disconnect/Error events admitted by transport-close finalization decrement server terminal-pending state; ordinary pre-close Error events no longer consume that accounting.
+- Terminal queue eviction reconciles pending state for an admitted terminal envelope that is removed.
+- Added a server lifecycle regression covering pre-close Error followed by terminal Disconnect and registry unregister.
+
+### Round 26 GREEN evidence
+
+```text
+go test ./evsocket/v2 -run 'Test(ServerWrapperUnregistersAfterTerminalCallbacksDrain|ServerPreCloseErrorDoesNotConsumeTerminalPending)' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+
+go test ./evsocket/v2 -run 'Test(WrapperEventQueueIsBounded|DuplicateConnectCoalescesBeforeEvictingOrdinaryQueue|DuplicateDisconnectCoalescesWhenTerminalQueueIsFull)' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+```

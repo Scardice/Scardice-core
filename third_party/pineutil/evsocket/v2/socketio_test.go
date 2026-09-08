@@ -3,6 +3,7 @@ package socketio
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -157,9 +158,10 @@ func TestServerWrapperUnregistersAfterTerminalCallbacksDrain(t *testing.T) {
 	manager.registerWrapper(wrapper)
 	close(wrapper.connectReady)
 	manager.On(EventDisconnect, func(*EventPayload) {})
+	manager.On(EventError, func(*EventPayload) {})
 	wrapper.serverClosed.Store(true)
 	wrapper.serverTerminalPending.Store(1)
-	wrapper.dispatchEvent(EventDisconnect, nil, nil)
+	wrapper.dispatchTerminalEvent(EventDisconnect, nil, nil)
 	if err := wrapper.WaitEvents(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -167,6 +169,27 @@ func TestServerWrapperUnregistersAfterTerminalCallbacksDrain(t *testing.T) {
 	defer manager.wrappersMu.Unlock()
 	if _, ok := manager.wrappers[wrapper]; ok {
 		t.Fatal("server wrapper unregistered before terminal callback drain")
+	}
+}
+
+func TestServerPreCloseErrorDoesNotConsumeTerminalPending(t *testing.T) {
+	manager := NewSocketInstance()
+	wrapper := newServerWrapper(manager)
+	manager.registerWrapper(wrapper)
+	close(wrapper.connectReady)
+	manager.On(EventError, func(*EventPayload) {})
+	manager.On(EventDisconnect, func(*EventPayload) {})
+	wrapper.dispatchEvent(EventError, nil, errors.New("pre-close"))
+	wrapper.serverClosed.Store(true)
+	wrapper.serverTerminalPending.Store(1)
+	wrapper.dispatchTerminalEvent(EventDisconnect, nil, nil)
+	if err := wrapper.WaitEvents(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.wrappersMu.Lock()
+	defer manager.wrappersMu.Unlock()
+	if _, ok := manager.wrappers[wrapper]; ok {
+		t.Fatal("server wrapper remained registered after terminal disconnect")
 	}
 }
 

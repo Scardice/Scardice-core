@@ -111,6 +111,7 @@ type eventEnvelope struct {
 	payload   *EventPayload
 	callbacks []eventCallback
 	opcode    gws.Opcode
+	terminal  bool
 }
 
 type eventCallback func(payload *EventPayload)
@@ -538,15 +539,24 @@ func (kws *WebsocketWrapper) onPong(payload string) {
 	}
 }
 func (kws *WebsocketWrapper) dispatchEvent(event string, data []byte, eventErr error) bool {
+	return kws.dispatchEventWithTerminal(event, data, eventErr, false)
+}
+
+func (kws *WebsocketWrapper) dispatchTerminalEvent(event string, data []byte, eventErr error) bool {
+	return kws.dispatchEventWithTerminal(event, data, eventErr, true)
+}
+
+func (kws *WebsocketWrapper) dispatchEventWithTerminal(event string, data []byte, eventErr error, terminal bool) bool {
 	payload := kws.newEventPayload(event, data, eventErr)
 	callbacks := kws.manager.listeners.get(event)
+	envelope := eventEnvelope{payload: payload, callbacks: callbacks, terminal: terminal}
 	if kws.shouldQueueEvent(event) {
-		return kws.enqueueEvent(eventEnvelope{payload: payload, callbacks: callbacks})
+		return kws.enqueueEvent(envelope)
 	}
 	kws.eventWG.Add(1)
 	go func() {
 		defer kws.eventWG.Done()
-		kws.invokeEventCallbacks(eventEnvelope{payload: payload, callbacks: callbacks})
+		kws.invokeEventCallbacks(envelope)
 	}()
 	return true
 }
@@ -614,10 +624,14 @@ func (kws *WebsocketWrapper) enqueueEvent(event eventEnvelope) bool {
 				}
 			}
 			if replaced >= 0 {
+				dropped := kws.eventQueue[replaced]
 				copy(kws.eventQueue[replaced:], kws.eventQueue[replaced+1:])
 				kws.eventQueue[len(kws.eventQueue)-1] = eventEnvelope{}
 				kws.eventQueue = kws.eventQueue[:len(kws.eventQueue)-1]
 				kws.eventWG.Done()
+				if dropped.terminal && !kws.clientMode {
+					kws.serverTerminalPending.Add(-1)
+				}
 				kws.droppedEvents.Add(1)
 			} else {
 				kws.droppedEvents.Add(1)
@@ -680,7 +694,7 @@ func (kws *WebsocketWrapper) drainEvents() {
 		kws.eventQueue = kws.eventQueue[1:]
 		kws.eventMu.Unlock()
 		kws.invokeEventCallbacks(event)
-		if !kws.clientMode && kws.serverClosed.Load() && (event.payload.Name == EventDisconnect || event.payload.Name == EventError) {
+		if !kws.clientMode && event.terminal {
 			if kws.serverTerminalPending.Add(-1) == 0 {
 				kws.eventMu.Lock()
 				empty := len(kws.eventQueue) == 0
@@ -1129,14 +1143,14 @@ func (kws *WebsocketWrapper) finalizeTransportClose(socket *gws.Conn, err error)
 		kws.serverTerminalPending.Store(0)
 		kws.serverTerminalPending.Add(1)
 	}
-	if !kws.dispatchEvent(EventDisconnect, nil, err) && !kws.clientMode {
+	if !kws.dispatchTerminalEvent(EventDisconnect, nil, err) && !kws.clientMode {
 		kws.serverTerminalPending.Add(-1)
 	}
 	if err != nil {
 		if !kws.clientMode {
 			kws.serverTerminalPending.Add(1)
 		}
-		if !kws.dispatchEvent(EventError, nil, err) && !kws.clientMode {
+		if !kws.dispatchTerminalEvent(EventError, nil, err) && !kws.clientMode {
 			kws.serverTerminalPending.Add(-1)
 		}
 	}
