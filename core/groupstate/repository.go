@@ -1,0 +1,138 @@
+package groupstate
+
+import (
+	"context"
+	"errors"
+	"strings"
+
+	"Scardice-core/eventstore"
+)
+
+var ErrRepositoryUnavailable = errors.New("groupstate: repository unavailable")
+
+type Repository struct { Store eventstore.Store }
+func NewRepository(store eventstore.Store) *Repository { return &Repository{Store: store} }
+
+func (r *Repository) Load(ctx context.Context, diceID, groupID string) (State, error) {
+	if r == nil || r.Store == nil { return State{}, ErrRepositoryUnavailable }
+	events, err := r.Store.Load(ctx, GroupStream(diceID, groupID), 1)
+	if err != nil { return State{}, err }
+	if len(events) == 0 { return State{}, nil }
+	return ReplayEnvelopes(events)
+}
+
+func (r *Repository) Append(ctx context.Context, diceID, groupID string, expectedVersion uint64, events []eventstore.NewEvent) (eventstore.CommitResult, error) {
+	if r == nil || r.Store == nil { return eventstore.CommitResult{}, ErrRepositoryUnavailable }
+	if len(events) == 0 { return eventstore.CommitResult{}, eventstore.ErrEmptyUnitOfWork }
+	return r.Store.Commit(ctx, eventstore.UnitOfWork{Streams: []eventstore.StreamAppend{{Stream: GroupStream(diceID, groupID), ExpectedVersion: expectedVersion, Events: append([]eventstore.NewEvent(nil), events...)}}})
+}
+
+func (r *Repository) AppendTyped(ctx context.Context, diceID, groupID string, expectedVersion uint64, metadata eventstore.Metadata, events []TypedEvent) (eventstore.CommitResult, error) {
+	encoded := make([]eventstore.NewEvent, 0, len(events))
+	for _, event := range events { item, err := NewEvent(event, metadata); if err != nil { return eventstore.CommitResult{}, err }; encoded = append(encoded, item) }
+	return r.Append(ctx, diceID, groupID, expectedVersion, encoded)
+}
+
+// DecideAndAppend is the one repository write seam for all group-record
+// writers. Callers choose a typed Command; attrs and moderation use other
+// repositories and cannot accidentally share this stream.
+func (r *Repository) DecideAndAppend(ctx context.Context, state State, expectedVersion uint64, metadata eventstore.Metadata, command Command) (eventstore.CommitResult, error) {
+	decision, err := Decide(state, command)
+	if err != nil { return eventstore.CommitResult{}, err }
+	return r.AppendTyped(ctx, state.DiceID, state.GroupID, expectedVersion, metadata, decision.Events)
+}
+
+// Scope matches the existing /group/local_data/delete contract. Group record,
+// attrs, and moderation are never represented by one shared stream.
+type Scope string
+const (
+	ScopeGroupRecord Scope = "group_record"
+	ScopePlayers     Scope = "players"
+	ScopeAttrs       Scope = "attrs"
+)
+
+var ScopeOrder = []Scope{ScopeGroupRecord, ScopePlayers, ScopeAttrs}
+
+func NormalizeScopes(scopes []Scope) ([]Scope, error) {
+	if len(scopes) == 0 { return []Scope{ScopeGroupRecord}, nil }
+	seen := map[Scope]bool{}
+	for _, scope := range scopes {
+		scope = Scope(strings.TrimSpace(string(scope)))
+		if scope != ScopeGroupRecord && scope != ScopePlayers && scope != ScopeAttrs { return nil, errors.New("groupstate: unsupported deletion scope") }
+		seen[scope] = true
+	}
+	result := make([]Scope, 0, len(seen)); for _, scope := range ScopeOrder { if seen[scope] { result = append(result, scope) } }; return result, nil
+}
+func ScopeSelected(scopes []Scope, scope Scope) bool { for _, item := range scopes { if item == scope { return true } }; return false }
+
+var ErrActiveGroup = errors.New("groupstate: active group requires allowActive")
+
+type DeleteRequest struct {
+	DiceID string
+	GroupID string
+	Scopes []Scope
+	AllowActive bool
+	DryRun bool
+}
+type DeletePlan struct {
+	DiceID string
+	GroupID string
+	Scopes []Scope
+	AllowActive bool
+	DryRun bool
+	ActiveDiceIDs []string
+	ExistingDiceIDs []string
+	Streams []eventstore.StreamID
+	StreamPrefixes []string
+	IncludesAttrs bool
+	IncludesPlayers bool
+	IncludesModeration bool
+}
+
+func trueKeys(values map[string]bool) []string {
+	result := make([]string, 0, len(values)); for key, value := range values { if value { result = append(result, key) } }; sortStrings(result); return result
+}
+func sortStrings(values []string) { for i := 1; i < len(values); i++ { for j := i; j > 0 && values[j] < values[j-1]; j-- { values[j], values[j-1] = values[j-1], values[j] } } }
+
+func PlanDelete(state State, request DeleteRequest) (DeletePlan, error) {
+	scopes, err := NormalizeScopes(request.Scopes)
+	if err != nil { return DeletePlan{}, err }
+	plan := DeletePlan{
+		DiceID: request.DiceID, GroupID: request.GroupID, Scopes: scopes,
+		AllowActive: request.AllowActive, DryRun: request.DryRun,
+		ActiveDiceIDs: trueKeys(state.DiceIDActive), ExistingDiceIDs: trueKeys(state.DiceIDExists),
+	}
+	if plan.DiceID == "" { plan.DiceID = state.DiceID }
+	if plan.GroupID == "" { plan.GroupID = state.GroupID }
+	if len(plan.ActiveDiceIDs) > 0 && !request.AllowActive { return plan, ErrActiveGroup }
+	for _, scope := range scopes {
+		switch scope {
+		case ScopeGroupRecord:
+			plan.Streams = append(plan.Streams, GroupStream(plan.DiceID, plan.GroupID))
+		case ScopeAttrs:
+			plan.Streams = append(plan.Streams, AttrsStream(plan.DiceID, plan.GroupID))
+			plan.StreamPrefixes = append(plan.StreamPrefixes, GroupUserAttrsStreamPrefix(plan.DiceID, plan.GroupID))
+			plan.IncludesAttrs = true
+		case ScopePlayers:
+			plan.StreamPrefixes = append(plan.StreamPrefixes, PlayerStreamPrefix(plan.DiceID, plan.GroupID))
+			plan.IncludesPlayers = true
+		}
+	}
+	return plan, nil
+}
+
+func PlayerStream(diceID, groupID, userID string) eventstore.StreamID {
+	return eventstore.StreamID{AggregateType: "player", AggregateID: diceID + "/" + groupID + "/" + userID}
+}
+func PlayerStreamPrefix(diceID, groupID string) string { return diceID + "/" + groupID + "/" }
+func GroupUserAttrsStreamPrefix(diceID, groupID string) string { return diceID + "/" + groupID + "/" }
+
+func AttrsStream(diceID, groupID string) eventstore.StreamID {
+	return eventstore.StreamID{AggregateType: "attrs/group", AggregateID: diceID + "/" + groupID}
+}
+func GroupUserAttrsStream(diceID, groupID, userID string) eventstore.StreamID {
+	return eventstore.StreamID{AggregateType: "attrs/group-user", AggregateID: diceID + "/" + groupID + "/" + userID}
+}
+func ModerationStream(diceID, groupID string) eventstore.StreamID {
+	return eventstore.StreamID{AggregateType: "moderation/group", AggregateID: diceID + "/" + groupID}
+}
