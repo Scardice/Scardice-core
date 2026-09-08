@@ -54,6 +54,7 @@ type Command struct {
 
 	DefaultHelpGroup string
 	HelpPackages []string
+	WelcomeEnabled bool
 	WelcomeMessage string
 	UserID string
 	Level int
@@ -97,7 +98,7 @@ func Decide(state State, command Command) (Decision, error) {
 	case CommandHelp:
 		return Decision{Events: []TypedEvent{NewGroupHelpChangedV1(command.DefaultHelpGroup, command.HelpPackages)}}, nil
 	case CommandWelcome:
-		return Decision{Events: []TypedEvent{NewGroupWelcomeChangedV1(command.Active, command.WelcomeMessage)}}, nil
+		return Decision{Events: []TypedEvent{NewGroupWelcomeChangedV1(command.WelcomeEnabled, command.WelcomeMessage)}}, nil
 	case CommandBotList:
 		return Decision{Events: []TypedEvent{NewGroupBotListChangedV1(command.UserID, command.Enabled)}}, nil
 	case CommandPrivilege:

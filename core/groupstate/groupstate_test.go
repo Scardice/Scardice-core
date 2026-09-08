@@ -74,6 +74,19 @@ func TestStreamIdentityAndDeletePrefixesAreUnambiguous(t *testing.T) {
 	if _, err := PlanDelete(State{}, DeleteRequest{DiceID: strings.Repeat("x", MaxGroupIdentityPartBytes+1), GroupID: "group-1"}); !errors.Is(err, ErrInvalidIdentity) {
 		t.Fatalf("oversized delete identity error = %v", err)
 	}
+	maxPart := strings.Repeat("x", MaxGroupIdentityPartBytes)
+	if ValidateIdentity(maxPart, maxPart) == nil || GroupStream(maxPart, maxPart).AggregateID != "" {
+		t.Fatal("group stream exceeded aggregate ID bound")
+	}
+	if ValidatePlayerIdentity(maxPart, maxPart, maxPart) == nil || PlayerStream(maxPart, maxPart, maxPart).AggregateID != "" {
+		t.Fatal("player stream exceeded aggregate ID bound")
+	}
+	if AttrsStream(maxPart, maxPart).AggregateID != "" || GroupUserAttrsStream(maxPart, maxPart, maxPart).AggregateID != "" {
+		t.Fatal("attrs stream exceeded aggregate ID bound")
+	}
+	if _, err := PlanDelete(State{Version: 1, DiceID: "dice-1", GroupID: "group-1"}, DeleteRequest{DiceID: "dice-2", GroupID: "group-1"}); !errors.Is(err, ErrInvalidIdentity) {
+		t.Fatalf("mismatched delete selector error = %v", err)
+	}
 	plan, err := PlanDelete(State{}, DeleteRequest{DiceID: "dice-1", GroupID: "group-1", Scopes: []Scope{ScopePlayers, ScopeAttrs}})
 	if err != nil || len(plan.StreamPrefixes) != 2 || plan.StreamPrefixes[0].AggregateType == plan.StreamPrefixes[1].AggregateType {
 		t.Fatalf("typed delete prefixes = %#v, err = %v", plan.StreamPrefixes, err)
@@ -88,6 +101,24 @@ func TestTypedEventRejectsNilOversizeAndInvalidPrivilege(t *testing.T) {
 	oversized := NewGroupWelcomeChangedV1(true, strings.Repeat("x", MaxGroupEventPayloadBytes))
 	if _, err := MarshalTypedEvent(oversized); !errors.As(err, new(*eventstore.OversizeError)) {
 		t.Fatalf("oversized event error = %v", err)
+	}
+	oversizedID := strings.Repeat("x", MaxGroupIdentityPartBytes+1)
+	if _, err := MarshalTypedEvent(NewGroupBotListChangedV1(oversizedID, true)); !errors.Is(err, ErrInvalidIdentity) {
+		t.Fatalf("oversized typed identifier error = %v", err)
+	}
+	if _, err := MarshalTypedEvent(NewGroupActivationChangedV1(strings.Repeat("x", MaxGroupEventPayloadBytes), true, true)); !errors.Is(err, ErrInvalidIdentity) {
+		t.Fatalf("oversized activation identifier error = %v", err)
+	}
+	for _, payload := range []string{"null", "[]"} {
+		if _, err := DecodeTypedEvent(EventGroupNameChanged, []byte(payload)); !errors.Is(err, ErrInvalidEvent) {
+			t.Fatalf("malformed %s payload error = %v", payload, err)
+		}
+	}
+	if _, err := ReplayEnvelopes([]eventstore.Envelope{{
+		Stream: GroupStream("dice-1", "group-1"), StreamVersion: 1,
+		EventType: string(EventGroupNameChanged), SchemaVersion: GroupEventSchemaVersion, Payload: []byte("null"),
+	}}); !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("malformed replay payload error = %v", err)
 	}
 	state, err := Reduce(State{}, NewGroupCreatedV1("dice-1", "group-1", "", 0))
 	if err != nil {
@@ -122,6 +153,15 @@ func TestGroupDecideEmitsTypedRecordFacts(t *testing.T) {
 	}
 	if _, ok := decision.Events[0].(GroupCreatedV1); !ok {
 		t.Fatalf("create event type = %T", decision.Events[0])
+	}
+}
+func TestDecideWelcomeUsesExplicitEnabledField(t *testing.T) {
+	state := State{Version: 1, DiceID: "dice-1", GroupID: "group-1"}
+	decision, err := Decide(state, Command{Kind: CommandWelcome, Active: true, WelcomeEnabled: false, WelcomeMessage: "hello"})
+	if err != nil { t.Fatal(err) }
+	welcome, ok := decision.Events[0].(GroupWelcomeChangedV1)
+	if !ok || welcome.Enabled {
+		t.Fatalf("welcome decision = %#v", decision.Events)
 	}
 }
 
@@ -161,6 +201,41 @@ func TestDecideAndAppendCreateUsesCommandIdentity(t *testing.T) {
 	projected, err := ReadProjected(context.Background(), store, "dice-1", "group-1")
 	if err != nil || projected.DiceID != "dice-1" || projected.GroupID != "group-1" {
 		t.Fatalf("created projection = %#v, err = %v", projected, err)
+	}
+}
+func TestAppendRejectsUnreplayableFirstEventWithoutProjector(t *testing.T) {
+	ctx := context.Background()
+	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/group-no-projector.db"})
+	if err != nil { t.Fatal(err) }
+	defer db.Close()
+	repository := NewRepository(eventstore.NewStore(db))
+	created, err := NewEvent(NewGroupCreatedV1("dice-1", "group-1", "name", 1), eventstore.Metadata{
+		EventID: "created-event", CommandID: "created-command", CorrelationID: "created-correlation",
+		OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true,
+	})
+	if err != nil { t.Fatal(err) }
+	name, err := NewEvent(NewGroupNameChangedV1("unreachable"), eventstore.Metadata{
+		EventID: "name-event", CommandID: "name-command", CorrelationID: "name-correlation",
+		OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true,
+	})
+	if err != nil { t.Fatal(err) }
+	if _, err := repository.Append(ctx, "dice-1", "group-1", 0, []eventstore.NewEvent{name}); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("unreplayable first event error = %v", err)
+	}
+	if _, err := repository.Append(ctx, "dice-1", "group-1", 0, []eventstore.NewEvent{created}); err != nil {
+		t.Fatal(err)
+	}
+	duplicateSystem, err := NewEvent(NewGroupSystemChangedV1("coc7"), eventstore.Metadata{
+		EventID: "name-event", CommandID: "name-command", CorrelationID: "name-correlation",
+		OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true,
+	})
+	if err != nil { t.Fatal(err) }
+	if _, err := repository.Append(ctx, "dice-1", "group-1", 1, []eventstore.NewEvent{name, duplicateSystem}); !errors.Is(err, eventstore.ErrConflict) {
+		t.Fatalf("duplicate raw event ID error = %v", err)
+	}
+	state, err := repository.Load(ctx, "dice-1", "group-1")
+	if err != nil || state.Version != 1 || state.GroupName != "name" {
+		t.Fatalf("replayed no-projector state = %#v, err = %v", state, err)
 	}
 }
 

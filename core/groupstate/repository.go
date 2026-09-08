@@ -35,20 +35,47 @@ func (r *Repository) Append(ctx context.Context, diceID, groupID string, expecte
 	if err := ValidateIdentity(diceID, groupID); err != nil { return eventstore.CommitResult{}, err }
 	if len(events) == 0 { return eventstore.CommitResult{}, eventstore.ErrEmptyUnitOfWork }
 	stream := GroupStream(diceID, groupID)
-	for _, event := range events {
-		if event.SchemaVersion != GroupEventSchemaVersion {
-			return eventstore.CommitResult{}, ErrInvalidEvent
-		}
-		if len(event.Payload) > MaxGroupEventPayloadBytes {
-			return eventstore.CommitResult{}, &eventstore.OversizeError{Bound: "group event payload", Limit: MaxGroupEventPayloadBytes, Actual: len(event.Payload)}
-		}
-		typed, err := DecodeTypedEvent(EventType(event.EventType), event.Payload)
-		if err != nil { return eventstore.CommitResult{}, err }
-		if created, ok := typed.(*GroupCreatedV1); ok && canonicalAggregateID(created.DiceID, created.GroupID) != stream.AggregateID {
-			return eventstore.CommitResult{}, ErrInvalidIdentity
-		}
+	if err := r.validateAppend(ctx, stream, expectedVersion, events); err != nil {
+		return eventstore.CommitResult{}, err
 	}
 	return r.Store.Commit(ctx, eventstore.UnitOfWork{Streams: []eventstore.StreamAppend{{Stream: stream, ExpectedVersion: expectedVersion, Events: append([]eventstore.NewEvent(nil), events...)}}})
+}
+
+func (r *Repository) validateAppend(ctx context.Context, stream eventstore.StreamID, expectedVersion uint64, events []eventstore.NewEvent) error {
+	persisted, err := r.Store.Load(ctx, stream, 1)
+	if err != nil { return err }
+	state := State{}
+	if len(persisted) > 0 {
+		state, err = ReplayEnvelopes(persisted)
+		if err != nil { return err }
+	}
+	if state.Version != expectedVersion { return eventstore.ErrConflict }
+	seenEventIDs := make(map[string]struct{}, len(events))
+	for _, event := range events {
+		if !eventMetadataValid(event.Metadata) { return eventstore.ErrInvalidMetadata }
+		if _, duplicate := seenEventIDs[event.Metadata.EventID]; duplicate { return eventstore.ErrConflict }
+		seenEventIDs[event.Metadata.EventID] = struct{}{}
+		if event.SchemaVersion != GroupEventSchemaVersion {
+			return ErrInvalidEvent
+		}
+		if len(event.Payload) > MaxGroupEventPayloadBytes {
+			return &eventstore.OversizeError{Bound: "group event payload", Limit: MaxGroupEventPayloadBytes, Actual: len(event.Payload)}
+		}
+		typed, err := DecodeTypedEvent(EventType(event.EventType), event.Payload)
+		if err != nil { return err }
+		if state.Version == 0 && typed.EventType() != EventGroupCreated {
+			return ErrInvalidState
+		}
+		if state.Version > 0 && typed.EventType() == EventGroupCreated {
+			return ErrInvalidState
+		}
+		if created, ok := typed.(*GroupCreatedV1); ok && canonicalAggregateID(created.DiceID, created.GroupID) != stream.AggregateID {
+			return ErrInvalidIdentity
+		}
+		state, err = Reduce(state, typed)
+		if err != nil { return err }
+	}
+	return ValidateState(state)
 }
 
 func (r *Repository) AppendTyped(ctx context.Context, diceID, groupID string, expectedVersion uint64, metadata eventstore.Metadata, events []TypedEvent) (eventstore.CommitResult, error) {
@@ -148,6 +175,9 @@ func sortStrings(values []string) { for i := 1; i < len(values); i++ { for j := 
 func PlanDelete(state State, request DeleteRequest) (DeletePlan, error) {
 	scopes, err := NormalizeScopes(request.Scopes)
 	if err != nil { return DeletePlan{}, err }
+	if state.Version > 0 && ((request.DiceID != "" && request.DiceID != state.DiceID) || (request.GroupID != "" && request.GroupID != state.GroupID)) {
+		return DeletePlan{}, ErrInvalidIdentity
+	}
 	plan := DeletePlan{
 		DiceID: request.DiceID, GroupID: request.GroupID, Scopes: scopes,
 		AllowActive: request.AllowActive, DryRun: request.DryRun,
@@ -173,20 +203,24 @@ func PlanDelete(state State, request DeleteRequest) (DeletePlan, error) {
 	return plan, nil
 }
 func PlayerStream(diceID, groupID, userID string) eventstore.StreamID {
-	return eventstore.StreamID{AggregateType: "player", AggregateID: canonicalAggregateParts(diceID, groupID, userID)}
+	return boundedStream("player", diceID, groupID, userID)
+}
+func boundedPrefix(aggregateType string, parts ...string) StreamPrefix {
+	if validateCanonicalParts(parts...) != nil { return StreamPrefix{AggregateType: aggregateType} }
+	return StreamPrefix{AggregateType: aggregateType, Prefix: canonicalAggregateParts(parts...)}
 }
 func PlayerStreamPrefix(diceID, groupID string) StreamPrefix {
-	return StreamPrefix{AggregateType: "player", Prefix: canonicalAggregateParts(diceID, groupID)}
+	return boundedPrefix("player", diceID, groupID)
 }
 func GroupUserAttrsStreamPrefix(diceID, groupID string) StreamPrefix {
-	return StreamPrefix{AggregateType: "attrs/group-user", Prefix: canonicalAggregateParts(diceID, groupID)}
+	return boundedPrefix("attrs/group-user", diceID, groupID)
 }
 func AttrsStream(diceID, groupID string) eventstore.StreamID {
-	return eventstore.StreamID{AggregateType: "attrs/group", AggregateID: canonicalAggregateID(diceID, groupID)}
+	return boundedStream("attrs/group", diceID, groupID)
 }
 func GroupUserAttrsStream(diceID, groupID, userID string) eventstore.StreamID {
-	return eventstore.StreamID{AggregateType: "attrs/group-user", AggregateID: canonicalAggregateParts(diceID, groupID, userID)}
+	return boundedStream("attrs/group-user", diceID, groupID, userID)
 }
 func ModerationStream(diceID, groupID string) eventstore.StreamID {
-	return eventstore.StreamID{AggregateType: "moderation/group", AggregateID: canonicalAggregateID(diceID, groupID)}
+	return boundedStream("moderation/group", diceID, groupID)
 }

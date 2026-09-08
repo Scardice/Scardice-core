@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"strings"
 
 	"Scardice-core/eventstore"
 
@@ -69,6 +68,7 @@ var (
 type TypedEvent interface {
 	EventType() EventType
 	apply(*State) error
+	validate() error
 }
 
 type GroupCreatedV1 struct {
@@ -104,7 +104,7 @@ func NewGroupActivationChangedV1(diceID string, active, exists bool) GroupActiva
 }
 func (GroupActivationChangedV1) EventType() EventType { return EventGroupActivationChanged }
 func (e GroupActivationChangedV1) apply(s *State) error {
-	if s.Version == 0 || s.Deleted || strings.TrimSpace(e.DiceID) == "" { return ErrInvalidState }
+	if s.Version == 0 || s.Deleted || !validScopedIdentifier(e.DiceID) { return ErrInvalidState }
 	if e.Exists { s.DiceIDExists[e.DiceID] = true } else { delete(s.DiceIDExists, e.DiceID) }
 	if e.Active { s.DiceIDActive[e.DiceID] = true } else { delete(s.DiceIDActive, e.DiceID) }
 	s.Active = len(s.DiceIDActive) > 0
@@ -117,7 +117,7 @@ func NewGroupIdentityChangedV1(guildID, channelID string) GroupIdentityChangedV1
 }
 func (GroupIdentityChangedV1) EventType() EventType { return EventGroupIdentityChanged }
 func (e GroupIdentityChangedV1) apply(s *State) error {
-	if s.Version == 0 || s.Deleted { return ErrInvalidState }
+	if s.Version == 0 || s.Deleted || !validOptionalScopedIdentifier(e.GuildID) || !validOptionalScopedIdentifier(e.ChannelID) { return ErrInvalidState }
 	s.GuildID, s.ChannelID = e.GuildID, e.ChannelID
 	return nil
 }
@@ -131,7 +131,7 @@ type GroupExtensionChangedV1 struct { ExtensionID string `json:"extensionId"`; E
 func NewGroupExtensionChangedV1(id string, enabled bool) GroupExtensionChangedV1 { return GroupExtensionChangedV1{ExtensionID: id, Enabled: enabled, Inactivated: !enabled} }
 func (GroupExtensionChangedV1) EventType() EventType { return EventGroupExtensionChanged }
 func (e GroupExtensionChangedV1) apply(s *State) error {
-	if s.Version == 0 || s.Deleted || strings.TrimSpace(e.ExtensionID) == "" { return ErrInvalidState }
+	if s.Version == 0 || s.Deleted || !validScopedIdentifier(e.ExtensionID) { return ErrInvalidState }
 	if e.Enabled { s.addExtension(e.ExtensionID); delete(s.InactivatedExtensions, e.ExtensionID) } else { s.removeExtension(e.ExtensionID); s.InactivatedExtensions[e.ExtensionID] = true }
 	return nil
 }
@@ -150,7 +150,12 @@ func (e GroupTemplateChangedV1) apply(s *State) error { if s.Version == 0 || s.D
 type GroupHelpChangedV1 struct { DefaultHelpGroup string `json:"defaultHelpGroup"`; HelpPackages []string `json:"helpPackages,omitempty"` }
 func NewGroupHelpChangedV1(group string, packages []string) GroupHelpChangedV1 { return GroupHelpChangedV1{DefaultHelpGroup: group, HelpPackages: append([]string(nil), packages...)} }
 func (GroupHelpChangedV1) EventType() EventType { return EventGroupHelpChanged }
-func (e GroupHelpChangedV1) apply(s *State) error { if s.Version == 0 || s.Deleted { return ErrInvalidState }; s.DefaultHelpGroup, s.HelpPackages = e.DefaultHelpGroup, append([]string(nil), e.HelpPackages...); return nil }
+func (e GroupHelpChangedV1) apply(s *State) error {
+	if s.Version == 0 || s.Deleted || !validOptionalScopedIdentifier(e.DefaultHelpGroup) { return ErrInvalidState }
+	for _, item := range e.HelpPackages { if !validOptionalScopedIdentifier(item) { return ErrInvalidState } }
+	s.DefaultHelpGroup, s.HelpPackages = e.DefaultHelpGroup, append([]string(nil), e.HelpPackages...)
+	return nil
+}
 
 type GroupWelcomeChangedV1 struct { Enabled bool `json:"enabled"`; Message string `json:"message,omitempty"` }
 func NewGroupWelcomeChangedV1(enabled bool, message string) GroupWelcomeChangedV1 { return GroupWelcomeChangedV1{Enabled: enabled, Message: message} }
@@ -160,12 +165,12 @@ func (e GroupWelcomeChangedV1) apply(s *State) error { if s.Version == 0 || s.De
 type GroupBotListChangedV1 struct { UserID string `json:"userId"`; Enabled bool `json:"enabled"` }
 func NewGroupBotListChangedV1(userID string, enabled bool) GroupBotListChangedV1 { return GroupBotListChangedV1{UserID: userID, Enabled: enabled} }
 func (GroupBotListChangedV1) EventType() EventType { return EventGroupBotListChanged }
-func (e GroupBotListChangedV1) apply(s *State) error { if s.Version == 0 || s.Deleted || strings.TrimSpace(e.UserID) == "" { return ErrInvalidState }; if e.Enabled { s.BotList[e.UserID] = true } else { delete(s.BotList, e.UserID) }; return nil }
+func (e GroupBotListChangedV1) apply(s *State) error { if s.Version == 0 || s.Deleted || !validScopedIdentifier(e.UserID) { return ErrInvalidState }; if e.Enabled { s.BotList[e.UserID] = true } else { delete(s.BotList, e.UserID) }; return nil }
 
 type GroupPrivilegeChangedV1 struct { UserID string `json:"userId"`; Level int `json:"level"` }
 func NewGroupPrivilegeChangedV1(userID string, level int) GroupPrivilegeChangedV1 { return GroupPrivilegeChangedV1{UserID: userID, Level: level} }
 func (GroupPrivilegeChangedV1) EventType() EventType { return EventGroupPrivilegeChanged }
-func (e GroupPrivilegeChangedV1) apply(s *State) error { if s.Version == 0 || s.Deleted || strings.TrimSpace(e.UserID) == "" || e.Level < -30 || e.Level > 100 { return ErrInvalidState }; s.Privileges[e.UserID] = e.Level; return nil }
+func (e GroupPrivilegeChangedV1) apply(s *State) error { if s.Version == 0 || s.Deleted || !validScopedIdentifier(e.UserID) || e.Level < -30 || e.Level > 100 { return ErrInvalidState }; s.Privileges[e.UserID] = e.Level; return nil }
 
 type GroupRecordDeletedV1 struct{}
 func NewGroupRecordDeletedV1() GroupRecordDeletedV1 { return GroupRecordDeletedV1{} }
@@ -173,6 +178,43 @@ func (GroupRecordDeletedV1) EventType() EventType { return EventGroupRecordDelet
 func (GroupRecordDeletedV1) apply(s *State) error { if s.Version == 0 || s.Deleted { return ErrInvalidState }; s.Deleted, s.Active = true, false; return nil }
 
 func (s *State) addExtension(id string) { for _, current := range s.ActivatedExtensions { if current == id { return } }; s.ActivatedExtensions = append(s.ActivatedExtensions, id) }
+func (e GroupCreatedV1) validate() error {
+	if ValidateIdentity(e.DiceID, e.GroupID) != nil || !validOptionalScopedIdentifier(e.InviteUserID) { return ErrInvalidIdentity }
+	return nil
+}
+func (e GroupActivationChangedV1) validate() error {
+	if !validScopedIdentifier(e.DiceID) { return ErrInvalidIdentity }
+	return nil
+}
+func (e GroupIdentityChangedV1) validate() error {
+	if !validOptionalScopedIdentifier(e.GuildID) || !validOptionalScopedIdentifier(e.ChannelID) { return ErrInvalidIdentity }
+	return nil
+}
+func (e GroupNameChangedV1) validate() error { return nil }
+func (e GroupExtensionChangedV1) validate() error {
+	if !validScopedIdentifier(e.ExtensionID) { return ErrInvalidIdentity }
+	return nil
+}
+func (e GroupSystemChangedV1) validate() error { return nil }
+func (e GroupTemplateChangedV1) validate() error { return nil }
+func (e GroupHelpChangedV1) validate() error {
+	if !validOptionalScopedIdentifier(e.DefaultHelpGroup) { return ErrInvalidIdentity }
+	for _, item := range e.HelpPackages {
+		if !validOptionalScopedIdentifier(item) { return ErrInvalidIdentity }
+	}
+	return nil
+}
+func (e GroupWelcomeChangedV1) validate() error { return nil }
+func (e GroupBotListChangedV1) validate() error {
+	if !validScopedIdentifier(e.UserID) { return ErrInvalidIdentity }
+	return nil
+}
+func (e GroupPrivilegeChangedV1) validate() error {
+	if !validScopedIdentifier(e.UserID) || e.Level < -30 || e.Level > 100 { return ErrInvalidIdentity }
+	return nil
+}
+func (GroupRecordDeletedV1) validate() error { return nil }
+
 func (s *State) removeExtension(id string) { for i, current := range s.ActivatedExtensions { if current == id { s.ActivatedExtensions = append(s.ActivatedExtensions[:i], s.ActivatedExtensions[i+1:]...); return } } }
 func isNilTypedEvent(event TypedEvent) bool {
 	if event == nil { return true }
@@ -186,6 +228,7 @@ func isNilTypedEvent(event TypedEvent) bool {
 }
 func MarshalTypedEvent(event TypedEvent) ([]byte, error) {
 	if isNilTypedEvent(event) || !event.EventType().Valid() { return nil, ErrInvalidEvent }
+	if err := event.validate(); err != nil { return nil, err }
 	payload, err := json.Marshal(event)
 	if err != nil { return nil, err }
 	if len(payload) > MaxGroupEventPayloadBytes {
@@ -201,6 +244,10 @@ func MarshalTypedEvents(events []TypedEvent) ([]byte, error) {
 func DecodeTypedEvent(eventType EventType, payload []byte) (TypedEvent, error) {
 	if len(payload) > MaxGroupEventPayloadBytes {
 		return nil, &eventstore.OversizeError{Bound: "group event payload", Limit: MaxGroupEventPayloadBytes, Actual: len(payload)}
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &object); err != nil || object == nil {
+		return nil, fmt.Errorf("%w: payload must be a JSON object", ErrInvalidEvent)
 	}
 	var event TypedEvent
 	switch eventType {

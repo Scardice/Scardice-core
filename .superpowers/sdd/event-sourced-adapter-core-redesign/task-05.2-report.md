@@ -28,7 +28,7 @@ No UI repository files were changed.
 - `events.go` defines a closed typed event vocabulary for creation, activation, identity, name, extension, system, template, help, welcome, bot-list, privilege, and group-record deletion facts. Creation retains invite-user and entered-at facts; identity retains guild/channel facts; template retains the CoC rule index. Payloads are concrete `*V1` structs and can be encoded/decoded by event type.
 - `aggregate.go` defines value `State`, immutable `Clone`, pure `Reduce`, typed envelope validation, ordered `Replay`, and `ReplayEnvelopes`. Envelope replay checks schema, stream version, aggregate type, payload bounds, and canonical group identity. Typed nils and oversized payloads are rejected.
 - `projection.go` registers the generation-aware `group-record`/`v1` projector. The projector rebuilds each Group state from event envelopes using the existing `eventstore.UpsertProjectionRow` contract. `ReadProjected` returns a deep value copy; mutating it cannot mutate projection/reducer state.
-- `repository.go` provides `Load`, `Append`, `AppendTyped`, and `DecideAndAppend` as the one Group-record write seam. It validates dice/group identity, keeps batch event IDs unique (including generated IDs), and defines typed deletion-prefix contracts.
+- `repository.go` provides `Load`, `Append`, `AppendTyped`, and `DecideAndAppend` as the one Group-record write seam. It validates dice/group identity, reloads and replays the current stream before append (requiring `group.created` at version zero and rejecting a second create), rejects missing/duplicate raw event IDs before commit, keeps typed batch event IDs unique (including generated IDs), and defines typed deletion-prefix contracts.
 - Deletion planning preserves default `group_record`, explicit scopes, `dryRun`, and `allowActive`. A group-record plan contains only the Group stream. An attrs plan contains the group attrs stream and a typed group-user attrs prefix; player plans contain a typed player prefix. Moderation is never silently included.
 
 ## Writer migration
@@ -61,7 +61,7 @@ go test ./core/groupstate -count=1
 ok  	Scardice-core/core/groupstate	0.047s
 ```
 
-The focused tests cover typed replay, exclusion of attrs/moderation payloads, collision-safe stream identities, immutable compatibility reads, projection live writes and rebuild, deletion scopes, dry-run/allowActive, create routing, invite/identity/template facts, payload and privilege bounds, batch event-ID uniqueness, and repository availability behavior.
+The focused tests cover typed replay, exclusion of attrs/moderation payloads, collision-safe and bounded stream identities (including player user parts), immutable compatibility reads, projection live writes and rebuild, deletion scopes, dry-run/allowActive and selector coupling, create routing, invite/identity/template facts, explicit welcome enablement, append ordering without a projector, malformed/null payloads, payload and identifier bounds, privilege bounds, raw and typed batch event-ID uniqueness, and repository availability behavior.
 
 No formatter, linter, or project-wide suite was run, as required by the task brief.
 
@@ -87,5 +87,5 @@ No formatter, linter, or project-wide suite was run, as required by the task bri
 
 - Creation now routes the command's Dice/group identity before opening the stream, avoiding an empty-state `"/"` stream.
 - Creation retains `InviteUserID`; identity changes retain guild/channel IDs; template changes retain the CoC rule index.
-- Stream IDs use length-prefixed canonical parts to prevent slash-based identity collisions. Delete prefixes carry aggregate type plus prefix, so player and group-user attrs cannot be confused.
-- Typed nil events, oversized payloads, malformed envelope order/identity, invalid group IDs, and out-of-range privilege levels are rejected. Batched typed appends allocate unique event IDs when metadata is reused.
+- Stream IDs use length-prefixed canonical parts to prevent slash-based identity collisions, and every canonical aggregate ID is bounded to the eventstore `varchar(255)` limit (including player user parts). Delete prefixes carry aggregate type plus prefix, so player and group-user attrs cannot be confused.
+- Typed nil events, oversized payloads and identifiers, malformed/null envelope payloads, malformed envelope order/identity, invalid or mismatched group selectors, overloaded welcome activation flags, and out-of-range privilege levels are rejected. Batched raw and typed appends allocate/reject duplicate event IDs before commit.

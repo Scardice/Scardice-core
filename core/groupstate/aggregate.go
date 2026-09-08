@@ -122,18 +122,36 @@ const (
 	GroupAggregateType = "group"
 	GroupEventSchemaVersion = uint16(1)
 	MaxGroupIdentityPartBytes = 255
+	MaxStreamAggregateIDBytes = 255
 	MaxGroupEventPayloadBytes = eventstore.MaxEventPayloadBytes
 )
 
 var ErrInvalidIdentity = fmt.Errorf("groupstate: invalid group identity")
 
-func ValidateIdentity(diceID, groupID string) error {
-	if strings.TrimSpace(diceID) == "" || strings.TrimSpace(groupID) == "" ||
-		len(diceID) > MaxGroupIdentityPartBytes || len(groupID) > MaxGroupIdentityPartBytes {
+func validScopedIdentifier(value string) bool {
+	return strings.TrimSpace(value) != "" && len(value) <= MaxGroupIdentityPartBytes
+}
+func validOptionalScopedIdentifier(value string) bool {
+	return value == "" || validScopedIdentifier(value)
+}
+func validateCanonicalParts(parts ...string) error {
+	for _, part := range parts {
+		if !validScopedIdentifier(part) { return ErrInvalidIdentity }
+	}
+	if len(canonicalAggregateParts(parts...)) > MaxStreamAggregateIDBytes {
 		return ErrInvalidIdentity
 	}
 	return nil
 }
+
+func ValidateIdentity(diceID, groupID string) error {
+	return validateCanonicalParts(diceID, groupID)
+}
+
+func ValidatePlayerIdentity(diceID, groupID, userID string) error {
+	return validateCanonicalParts(diceID, groupID, userID)
+}
+
 func canonicalAggregateID(diceID, groupID string) string {
 	return canonicalAggregateParts(diceID, groupID)
 }
@@ -142,8 +160,14 @@ func canonicalAggregateParts(parts ...string) string {
 	for _, part := range parts { encoded += fmt.Sprintf("%d:%s", len(part), part) }
 	return encoded
 }
+func boundedStream(aggregateType string, parts ...string) eventstore.StreamID {
+	if validateCanonicalParts(parts...) != nil {
+		return eventstore.StreamID{AggregateType: aggregateType}
+	}
+	return eventstore.StreamID{AggregateType: aggregateType, AggregateID: canonicalAggregateParts(parts...)}
+}
 func GroupStream(diceID, groupID string) eventstore.StreamID {
-	return eventstore.StreamID{AggregateType: GroupAggregateType, AggregateID: canonicalAggregateID(diceID, groupID)}
+	return boundedStream(GroupAggregateType, diceID, groupID)
 }
 func eventMetadataValid(metadata eventstore.Metadata) bool {
 	return metadata.EventID != "" && metadata.CommandID != "" && metadata.CorrelationID != "" && (!metadata.OccurredAt.IsZero() || metadata.OccurredAtUnixNanoSet || metadata.OccurredAtUnixNanoUTC != 0)
