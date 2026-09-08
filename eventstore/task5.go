@@ -319,6 +319,17 @@ func validInboxStatus(v string) bool {
 	}
 	return false
 }
+func validInboxWorkflowID(value string) bool {
+	if strings.TrimSpace(value) == "" || len(value) > 255 {
+		return false
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f || r == '/' || r == '\\' {
+			return false
+		}
+	}
+	return true
+}
 func validOutboxStatus(v string) bool {
 	switch v {
 	case OutboxStatusPending, OutboxStatusLeased, OutboxStatusDispatched, OutboxStatusSucceeded, OutboxStatusFailed, OutboxStatusAmbiguous:
@@ -358,7 +369,7 @@ func inboxTransitionAllowed(from, to string) bool {
 	case InboxStatusLeased:
 		return to == InboxStatusCallbackStarted || to == InboxStatusFailed || to == InboxStatusPending
 	case InboxStatusCallbackStarted:
-		return to == InboxStatusAmbiguous
+		return to == InboxStatusAmbiguous || to == InboxStatusConfirmedConsumed
 	case InboxStatusAmbiguous:
 		return false
 	}
@@ -710,8 +721,7 @@ func (s *GORMStore) UpdateInbox(ctx context.Context, update InboxUpdate) (result
 	if update.EndpointID != "" || update.ProviderEventKey != "" || len(update.LaneHMAC) > 0 || update.OrderingSequence != 0 ||
 		len(update.PayloadCiphertext) > 0 || len(update.PayloadNonce) > 0 || len(update.ContentDigest) > 0 || update.DigestKeyID != "" ||
 		update.PayloadEncryptionKeyID != "" || update.ContentDigestKeyID != "" || !update.PayloadExpiresAt.IsZero() ||
-		update.WorkflowID != "" || !update.CallbackStartedAt.IsZero() || !update.CompletedAt.IsZero() ||
-		update.PrincipalID != "" || update.Reason != "" || !update.ResolutionAt.IsZero() {
+		update.WorkflowID != "" || !update.CallbackStartedAt.IsZero() || update.PrincipalID != "" || update.Reason != "" || !update.ResolutionAt.IsZero() {
 		return CommitResult{}, ErrInvalidTransition
 	}
 	if update.Status != InboxStatusLeased && update.Status != InboxStatusCallbackStarted && row.Status != InboxStatusLeased && row.Status != InboxStatusCallbackStarted && (update.LeaseOwner != "" || update.LeaseEpoch != 0 || update.AttemptID != "" || !update.LeaseExpiresAt.IsZero()) {
@@ -1854,7 +1864,6 @@ func (s *GORMStore) QuarantineOutbox(ctx context.Context, req OutboxQuarantineRe
 	return result, nil
 }
 
-
 func (s *GORMStore) ResolveOutbox(ctx context.Context, req OutboxResolutionRequest) (result CommitResult, err error) {
 	if err := s.requireReady(ctx); err != nil {
 		return CommitResult{}, err
@@ -2749,10 +2758,21 @@ func (s *GORMStore) applyTask5InboxParticipants(ctx context.Context, tx *gorm.DB
 			if row.Status == InboxStatusFailed || row.Status == InboxStatusConfirmedConsumed || row.Status == InboxStatusSkipped {
 				return ErrInvalidTransition
 			}
-			if update.EndpointID != "" || update.ProviderEventKey != "" || len(update.LaneHMAC) > 0 || update.OrderingSequence != 0 || update.WorkflowID != "" ||
+			if update.EndpointID != "" || update.ProviderEventKey != "" || len(update.LaneHMAC) > 0 || update.OrderingSequence != 0 ||
 				len(update.PayloadCiphertext) > 0 || len(update.PayloadNonce) > 0 || len(update.ContentDigest) > 0 || update.DigestKeyID != "" ||
 				update.PayloadEncryptionKeyID != "" || update.ContentDigestKeyID != "" || !update.PayloadExpiresAt.IsZero() {
 				return ErrInvalidTransition
+			}
+			if update.WorkflowID != "" {
+				if !validInboxWorkflowID(update.WorkflowID) {
+					return ErrInvalidMetadata
+				}
+				if row.WorkflowID != "" && row.WorkflowID != update.WorkflowID {
+					return ErrInvalidTransition
+				}
+				if row.WorkflowID == "" && (row.Status != InboxStatusCallbackStarted || update.Status != InboxStatusConfirmedConsumed) {
+					return ErrInvalidTransition
+				}
 			}
 			if update.Status != InboxStatusLeased && update.Status != InboxStatusCallbackStarted && row.Status != InboxStatusLeased && row.Status != InboxStatusCallbackStarted && (update.LeaseOwner != "" || update.LeaseEpoch != 0 || update.AttemptID != "" || !update.LeaseExpiresAt.IsZero()) {
 				return ErrStaleLease
@@ -2791,6 +2811,9 @@ func (s *GORMStore) applyTask5InboxParticipants(ctx context.Context, tx *gorm.DB
 			}
 			if update.LeaseOwner != "" {
 				row.LeaseOwner = update.LeaseOwner
+			}
+			if update.WorkflowID != "" {
+				row.WorkflowID = update.WorkflowID
 			}
 			if update.LeaseEpoch != 0 {
 				row.LeaseEpoch = update.LeaseEpoch
