@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"math"
@@ -2721,6 +2722,88 @@ const (
 	task5MessageWorkflowAggregateType       = "message-workflow"
 	task5MessageWorkflowTerminatedEventType = "message-workflow.terminated"
 )
+func task5WorkflowEventContainsOverlay(event NewEvent) bool {
+	if strings.Contains(event.EventType, "$t") ||
+		strings.Contains(event.Metadata.EventID, "$t") ||
+		strings.Contains(event.Metadata.CommandID, "$t") ||
+		strings.Contains(event.Metadata.CorrelationID, "$t") ||
+		strings.Contains(event.Metadata.CausationID, "$t") ||
+		strings.Contains(event.Metadata.PrincipalID, "$t") ||
+		strings.Contains(event.Metadata.Producer, "$t") {
+		return true
+	}
+	raw := string(event.Payload)
+	decoder := json.NewDecoder(bytes.NewReader(event.Payload))
+	for {
+		contains, err := task5ScanWorkflowJSON(decoder)
+		if errors.Is(err, io.EOF) {
+			return strings.Contains(raw, "$t")
+		}
+		if err != nil {
+			return strings.Contains(raw, "$t")
+		}
+		if contains {
+			return true
+		}
+	}
+}
+
+func task5ScanWorkflowJSON(decoder *json.Decoder) (bool, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return false, err
+	}
+	if text, ok := token.(string); ok && strings.Contains(text, "$t") {
+		return true, nil
+	}
+	switch delimiter := token.(type) {
+	case json.Delim:
+		switch delimiter {
+		case '{':
+			contains := false
+			for decoder.More() {
+				key, keyErr := decoder.Token()
+				if keyErr != nil {
+					return false, keyErr
+				}
+				if text, ok := key.(string); ok && strings.Contains(text, "$t") {
+					contains = true
+				}
+				child, childErr := task5ScanWorkflowJSON(decoder)
+				if childErr != nil {
+					return false, childErr
+				}
+				contains = contains || child
+			}
+			if _, err := decoder.Token(); err != nil {
+				return false, err
+			}
+			return contains, nil
+		case '[':
+			contains := false
+			for decoder.More() {
+				child, childErr := task5ScanWorkflowJSON(decoder)
+				if childErr != nil {
+					return false, childErr
+				}
+				contains = contains || child
+			}
+			if _, err := decoder.Token(); err != nil {
+				return false, err
+			}
+			return contains, nil
+		}
+	}
+	return false, nil
+}
+
+func task5WorkflowEventValidation(event NewEvent) error {
+	if task5WorkflowEventContainsOverlay(event) {
+		return ErrInvalidEvent
+	}
+	return nil
+}
+
 
 func task5WorkflowStreamCount(work UnitOfWork) int {
 	count := 0
@@ -2758,6 +2841,9 @@ func (s *GORMStore) validateTask5WorkflowLink(ctx context.Context, tx *gorm.DB, 
 	}
 	if workflow.Stream.AggregateID != link.WorkflowID || len(workflow.Events) != 1 || workflow.Events[0].EventType != task5MessageWorkflowTerminatedEventType {
 		return ErrInvalidTransition
+	}
+	if err := task5WorkflowEventValidation(workflow.Events[0]); err != nil {
+		return err
 	}
 	var head aggregateHeadRow
 	query := locked(tx).WithContext(ctx).Where("aggregate_type = ? AND aggregate_id = ?", workflow.Stream.AggregateType, workflow.Stream.AggregateID).First(&head)

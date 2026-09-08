@@ -101,6 +101,53 @@ func TestTask4WorkflowLinkRejectsOverlayMarkerWithoutPartialWrites(t *testing.T)
 		t.Fatalf("workflow partial events=%d err=%v", len(events), err)
 	}
 }
+func TestTask4WorkflowEventRejectsOverlayMarkerWithoutPartialWrites(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload []byte
+		mutate  func(*NewEvent)
+	}{
+		{name: "escaped payload", payload: []byte(`{"value":"\u0024t"}`)},
+		{name: "metadata principal", mutate: func(event *NewEvent) { event.Metadata.PrincipalID = "$t-principal" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, db, _ := task5Store(t)
+			defer db.Close()
+			ctx := context.Background()
+			inbox, lease := task4PrepareStartedInbox(t, store, ctx, "task4-overlay-event-"+test.name)
+			workflowID := "workflow-overlay-event-" + test.name
+			stream := task4WorkflowStream(workflowID, MessageWorkflowTerminatedEventTypeForTest, "overlay-event-"+test.name)
+			if test.payload != nil {
+				stream.Events[0].Payload = test.payload
+			}
+			if test.mutate != nil {
+				test.mutate(&stream.Events[0])
+			}
+			work := UnitOfWork{
+				Streams: []StreamAppend{stream},
+				InboxUpdates: []InboxUpdate{{
+					InboxID: inbox.InboxID, ExpectedVersion: lease.Update.Version + 1, Version: lease.Update.Version + 2,
+					Status: InboxStatusConfirmedConsumed, WorkflowID: workflowID, LeaseOwner: lease.Update.LeaseOwner,
+					LeaseEpoch: lease.Update.LeaseEpoch, AttemptID: lease.Update.AttemptID, LeaseExpiresAt: lease.Update.LeaseExpiresAt,
+				}},
+			}
+			if _, err := store.Commit(ctx, work); !errors.Is(err, ErrInvalidEvent) {
+				t.Fatalf("overlay event err=%v", err)
+			}
+			var row inboxMessageRow
+			if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&row).Error; err != nil {
+				t.Fatal(err)
+			}
+			if row.Status != InboxStatusCallbackStarted || row.WorkflowID != "" {
+				t.Fatalf("inbox changed after rejected overlay event=%#v", row)
+			}
+			if events, err := store.Load(ctx, StreamID{AggregateType: "message-workflow", AggregateID: workflowID}, 1); err != nil || len(events) != 0 {
+				t.Fatalf("workflow partial events=%d err=%v", len(events), err)
+			}
+		})
+	}
+}
 func TestTask4AcceptInboxRejectsWorkflowLinkWithoutPartialWrites(t *testing.T) {
 	store, db, _ := task5Store(t)
 	defer db.Close()
