@@ -64,6 +64,39 @@ func TestCallbackMalformedPayloadNoHost(t *testing.T) {
 	}
 }
 
+func TestCallbackPayloadMetadataMismatchNoHost(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{
+			name:    "endpoint",
+			payload: `{"endpointId":"other-endpoint","generation":1,"desiredVersion":1,"message":{"kind":1,"sender":"user","conversation":"group","platform":"test"},"contentDigest":"AQ==","contentDigestKeyId":"digest","status":"pending"}`,
+		},
+		{
+			name:    "digest",
+			payload: `{"endpointId":"endpoint","generation":1,"desiredVersion":1,"message":{"kind":1,"sender":"user","conversation":"group","platform":"test"},"contentDigest":"Ag==","contentDigestKeyId":"digest","status":"pending"}`,
+		},
+		{
+			name:    "digest key",
+			payload: `{"endpointId":"endpoint","generation":1,"desiredVersion":1,"message":{"kind":1,"sender":"user","conversation":"group","platform":"test"},"contentDigest":"AQ==","contentDigestKeyId":"other-digest","status":"pending"}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			inbox := newCallbackTestInbox()
+			host := &callbackTestHost{inbox: inbox}
+			service := newCallbackTestService(t, inbox, &callbackTestStore{}, host, callbackTestCodec{payload: []byte(test.payload)})
+			if _, err := service.ProcessOne(context.Background()); !errors.Is(err, ErrCallbackPayload) {
+				t.Fatalf("metadata mismatch err=%v", err)
+			}
+			if host.called {
+				t.Fatal("metadata mismatch reached host")
+			}
+		})
+	}
+}
+
 func TestCallbackPreMarkerConflictRetriesAtMostThree(t *testing.T) {
 	inbox := newCallbackTestInbox()
 	inbox.markerConflicts = CallbackMaxPreMarkerAttempts
@@ -178,7 +211,7 @@ func callbackEvent(eventType, payload string) eventstore.NewEvent {
 }
 
 func newCallbackTestInbox() *callbackTestInbox {
-	return &callbackTestInbox{lease: eventstore.InboxLease{Update: eventstore.InboxUpdate{InboxID: "inbox-1", EndpointID: "endpoint", Status: eventstore.InboxStatusLeased, Version: 1, LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", PayloadCiphertext: []byte("payload"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key"}}}
+	return &callbackTestInbox{lease: eventstore.InboxLease{Update: eventstore.InboxUpdate{InboxID: "inbox-1", EndpointID: "endpoint", Status: eventstore.InboxStatusLeased, Version: 1, LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", PayloadCiphertext: []byte("payload"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", ContentDigest: []byte{1}, ContentDigestKeyID: "digest"}}}
 }
 func newCallbackTestService(t *testing.T, inbox *callbackTestInbox, store *callbackTestStore, host *callbackTestHost, codec callbackTestCodec, options ...any) *CallbackService {
 	t.Helper()
@@ -332,7 +365,7 @@ func TestCallbackSQLiteMarkerAndTerminalCommit(t *testing.T) {
 	}
 	defer db.Close()
 	store := eventstore.NewStore(db, eventstore.WithPayloadCodec(callbackTestCodec{}))
-	inbox := eventstore.InboxUpdate{InboxID: "sqlite-inbox", EndpointID: "endpoint", ProviderEventKey: "provider", LaneHMAC: []byte("lane"), Status: eventstore.InboxStatusPending, PayloadCiphertext: []byte("payload"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", ContentDigest: []byte("digest"), ContentDigestKeyID: "digest-key"}
+	inbox := eventstore.InboxUpdate{InboxID: "sqlite-inbox", EndpointID: "endpoint", ProviderEventKey: "provider", LaneHMAC: []byte("lane"), Status: eventstore.InboxStatusPending, PayloadCiphertext: []byte("payload"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", ContentDigest: []byte{1}, ContentDigestKeyID: "digest"}
 	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
 		t.Fatal(err)
 	}

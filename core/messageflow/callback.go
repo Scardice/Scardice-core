@@ -3,6 +3,7 @@ package messageflow
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -262,13 +263,25 @@ func (s *CallbackService) ProcessOne(ctx context.Context) (summary CallbackResul
 	}
 	return summary, eventstore.ErrConflict
 }
-
 func (s *CallbackService) decodeClaimed(ctx context.Context, update eventstore.InboxUpdate) (ingressPayload, error) {
 	plaintext, err := s.codec.Decrypt(ctx, append([]byte(nil), update.PayloadCiphertext...), append([]byte(nil), update.PayloadNonce...), update.PayloadEncryptionKeyID)
 	if err != nil {
 		return ingressPayload{}, err
 	}
-	return decodeIngressPayload(plaintext)
+	decoded, err := decodeIngressPayload(plaintext)
+	if err != nil {
+		return ingressPayload{}, err
+	}
+	digestKeyID := update.ContentDigestKeyID
+	if digestKeyID == "" {
+		digestKeyID = update.DigestKeyID
+	}
+	if subtle.ConstantTimeCompare([]byte(decoded.EndpointID), []byte(update.EndpointID)) != 1 ||
+		subtle.ConstantTimeCompare(decoded.ContentDigest, update.ContentDigest) != 1 ||
+		subtle.ConstantTimeCompare([]byte(decoded.ContentDigestKeyID), []byte(digestKeyID)) != 1 {
+		return ingressPayload{}, fmt.Errorf("%w: ingress metadata mismatch", ErrCallbackPayload)
+	}
+	return decoded, nil
 }
 
 func decodeIngressPayload(payload []byte) (ingressPayload, error) {

@@ -721,7 +721,7 @@ func (s *GORMStore) UpdateInbox(ctx context.Context, update InboxUpdate) (result
 	if update.EndpointID != "" || update.ProviderEventKey != "" || len(update.LaneHMAC) > 0 || update.OrderingSequence != 0 ||
 		len(update.PayloadCiphertext) > 0 || len(update.PayloadNonce) > 0 || len(update.ContentDigest) > 0 || update.DigestKeyID != "" ||
 		update.PayloadEncryptionKeyID != "" || update.ContentDigestKeyID != "" || !update.PayloadExpiresAt.IsZero() ||
-		update.WorkflowID != "" || !update.CallbackStartedAt.IsZero() || update.PrincipalID != "" || update.Reason != "" || !update.ResolutionAt.IsZero() {
+		update.WorkflowID != "" || !update.CallbackStartedAt.IsZero() || !update.CompletedAt.IsZero() || update.PrincipalID != "" || update.Reason != "" || !update.ResolutionAt.IsZero() {
 		return CommitResult{}, ErrInvalidTransition
 	}
 	if update.Status != InboxStatusLeased && update.Status != InboxStatusCallbackStarted && row.Status != InboxStatusLeased && row.Status != InboxStatusCallbackStarted && (update.LeaseOwner != "" || update.LeaseEpoch != 0 || update.AttemptID != "" || !update.LeaseExpiresAt.IsZero()) {
@@ -2629,7 +2629,68 @@ func task5ParticipantExpiry(expiry time.Time, now time.Time, max time.Duration) 
 	return expiry, nil
 }
 
+const (
+	task5MessageWorkflowAggregateType       = "message-workflow"
+	task5MessageWorkflowTerminatedEventType = "message-workflow.terminated"
+)
+
+func task5WorkflowStreamCount(work UnitOfWork) int {
+	count := 0
+	for _, streamAppend := range work.Streams {
+		if streamAppend.Stream.AggregateType == task5MessageWorkflowAggregateType {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *GORMStore) validateTask5WorkflowLink(ctx context.Context, tx *gorm.DB, work UnitOfWork) error {
+	workflowStreams := make([]StreamAppend, 0, 1)
+	for _, streamAppend := range work.Streams {
+		if streamAppend.Stream.AggregateType == task5MessageWorkflowAggregateType {
+			workflowStreams = append(workflowStreams, streamAppend)
+		}
+	}
+	if len(workflowStreams) == 0 {
+		return nil
+	}
+	workflowLinks := make([]InboxUpdate, 0, 1)
+	for _, update := range work.InboxUpdates {
+		if update.WorkflowID != "" {
+			workflowLinks = append(workflowLinks, update)
+		}
+	}
+	if len(workflowStreams) != 1 || len(workflowLinks) != 1 {
+		return ErrInvalidTransition
+	}
+	workflow := workflowStreams[0]
+	link := workflowLinks[0]
+	if !validInboxWorkflowID(link.WorkflowID) {
+		return ErrInvalidMetadata
+	}
+	if workflow.Stream.AggregateID != link.WorkflowID || len(workflow.Events) != 1 || workflow.Events[0].EventType != task5MessageWorkflowTerminatedEventType {
+		return ErrInvalidTransition
+	}
+	var head aggregateHeadRow
+	query := locked(tx).WithContext(ctx).Where("aggregate_type = ? AND aggregate_id = ?", workflow.Stream.AggregateType, workflow.Stream.AggregateID).First(&head)
+	if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+		return participantConflict(tableAggregateHeads)
+	}
+	if query.Error != nil {
+		return ErrParticipantFailure
+	}
+	expectedHeadVersion := workflow.ExpectedVersion + uint64(len(workflow.Events))
+	if head.CurrentVersion != expectedHeadVersion {
+		return participantConflict(tableAggregateHeads)
+	}
+	return nil
+}
+
 func (s *GORMStore) applyTask5InboxParticipants(ctx context.Context, tx *gorm.DB, work UnitOfWork, result *CommitResult) error {
+	workflowStreamCount := task5WorkflowStreamCount(work)
+	if err := s.validateTask5WorkflowLink(ctx, tx, work); err != nil {
+		return err
+	}
 	updates := append([]InboxUpdate(nil), work.InboxUpdates...)
 	sort.Slice(updates, func(i, j int) bool {
 		if laneCompare := bytes.Compare(updates[i].LaneHMAC, updates[j].LaneHMAC); laneCompare != 0 {
@@ -2653,6 +2714,9 @@ func (s *GORMStore) applyTask5InboxParticipants(ctx context.Context, tx *gorm.DB
 		var row inboxMessageRow
 		q := tx.Where("inbox_id = ?", update.InboxID).First(&row)
 		if errors.Is(q.Error, gorm.ErrRecordNotFound) {
+			if update.WorkflowID != "" && workflowStreamCount != 0 {
+				return ErrInvalidTransition
+			}
 			if err := participantVersion(update.ExpectedVersion, 0, update.Version, tableInboxMessages, "<redacted>"); err != nil {
 				return err
 			}
@@ -2758,19 +2822,25 @@ func (s *GORMStore) applyTask5InboxParticipants(ctx context.Context, tx *gorm.DB
 			if row.Status == InboxStatusFailed || row.Status == InboxStatusConfirmedConsumed || row.Status == InboxStatusSkipped {
 				return ErrInvalidTransition
 			}
+			if row.WorkflowID != "" && update.Status == InboxStatusConfirmedConsumed && update.WorkflowID == "" {
+				return ErrInvalidTransition
+			}
 			if update.EndpointID != "" || update.ProviderEventKey != "" || len(update.LaneHMAC) > 0 || update.OrderingSequence != 0 ||
 				len(update.PayloadCiphertext) > 0 || len(update.PayloadNonce) > 0 || len(update.ContentDigest) > 0 || update.DigestKeyID != "" ||
 				update.PayloadEncryptionKeyID != "" || update.ContentDigestKeyID != "" || !update.PayloadExpiresAt.IsZero() {
 				return ErrInvalidTransition
 			}
 			if update.WorkflowID != "" {
-				if !validInboxWorkflowID(update.WorkflowID) {
+				if !validInboxWorkflowID(update.WorkflowID) || update.Status != InboxStatusConfirmedConsumed {
 					return ErrInvalidMetadata
+				}
+				if workflowStreamCount == 0 {
+					return ErrInvalidTransition
 				}
 				if row.WorkflowID != "" && row.WorkflowID != update.WorkflowID {
 					return ErrInvalidTransition
 				}
-				if row.WorkflowID == "" && (row.Status != InboxStatusCallbackStarted || update.Status != InboxStatusConfirmedConsumed) {
+				if row.WorkflowID == "" && row.Status != InboxStatusCallbackStarted {
 					return ErrInvalidTransition
 				}
 			}

@@ -71,6 +71,76 @@ func TestTask4WorkflowLinkRejectsInvalidIdentityWithoutPartialWrites(t *testing.
 		t.Fatalf("workflow partial events=%d err=%v", len(events), err)
 	}
 }
+func TestTask4WorkflowLinkRequiresExactSameUOWParticipant(t *testing.T) {
+	tests := []struct {
+		name    string
+		streams []StreamAppend
+		link    string
+	}{
+		{name: "missing workflow stream", link: "workflow-exact"},
+		{
+			name:    "wrong aggregate",
+			streams: []StreamAppend{task4WorkflowStream("workflow-other", MessageWorkflowTerminatedEventTypeForTest, "wrong-aggregate")},
+			link:    "workflow-exact",
+		},
+		{
+			name: "multiple workflow streams",
+			streams: []StreamAppend{
+				task4WorkflowStream("workflow-exact", MessageWorkflowTerminatedEventTypeForTest, "multiple-exact"),
+				task4WorkflowStream("workflow-other", MessageWorkflowTerminatedEventTypeForTest, "multiple-other"),
+			},
+			link: "workflow-exact",
+		},
+		{
+			name:    "wrong terminal event",
+			streams: []StreamAppend{task4WorkflowStream("workflow-exact", "message-workflow.started", "wrong-event")},
+			link:    "workflow-exact",
+		},
+		{
+			name:    "missing inbox link",
+			streams: []StreamAppend{task4WorkflowStream("workflow-exact", MessageWorkflowTerminatedEventTypeForTest, "missing-link")},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, db, _ := task5Store(t)
+			defer db.Close()
+			ctx := context.Background()
+			inbox, lease := task4PrepareStartedInbox(t, store, ctx, "task4-exact-"+test.name)
+			update := InboxUpdate{
+				InboxID: inbox.InboxID, ExpectedVersion: lease.Update.Version + 1, Version: lease.Update.Version + 2,
+				Status: InboxStatusConfirmedConsumed, WorkflowID: test.link, LeaseOwner: lease.Update.LeaseOwner,
+				LeaseEpoch: lease.Update.LeaseEpoch, AttemptID: lease.Update.AttemptID, LeaseExpiresAt: lease.Update.LeaseExpiresAt,
+			}
+			if test.link == "" {
+				update.WorkflowID = ""
+			}
+			if _, err := store.Commit(ctx, UnitOfWork{Streams: test.streams, InboxUpdates: []InboxUpdate{update}}); !errors.Is(err, ErrInvalidTransition) {
+				t.Fatalf("workflow participant err=%v", err)
+			}
+			var row inboxMessageRow
+			if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&row).Error; err != nil {
+				t.Fatal(err)
+			}
+			if row.Status != InboxStatusCallbackStarted || row.WorkflowID != "" {
+				t.Fatalf("inbox changed after rejected workflow=%#v", row)
+			}
+			if events, err := store.Load(ctx, StreamID{AggregateType: "message-workflow", AggregateID: "workflow-exact"}, 1); err != nil || len(events) != 0 {
+				t.Fatalf("workflow partial events=%d err=%v", len(events), err)
+			}
+		})
+	}
+}
+
+func task4WorkflowStream(id, eventType, eventID string) StreamAppend {
+	return StreamAppend{
+		Stream:          StreamID{AggregateType: "message-workflow", AggregateID: id},
+		ExpectedVersion: 0,
+		Events: []NewEvent{{EventType: eventType, SchemaVersion: 1, Payload: []byte(`{}`), Metadata: Metadata{
+			EventID: eventID, CommandID: eventID + "-command", CorrelationID: eventID + "-correlation", OccurredAt: time.Unix(1, 0).UTC(),
+		}}},
+	}
+}
 
 func TestTask4WorkflowLinkRollsBackOnParticipantFailure(t *testing.T) {
 	store, db, _ := task5Store(t)
@@ -95,6 +165,33 @@ func TestTask4WorkflowLinkRollsBackOnParticipantFailure(t *testing.T) {
 	}
 	if events, err := store.Load(ctx, StreamID{AggregateType: "message-workflow", AggregateID: workflowID}, 1); err != nil || len(events) != 0 {
 		t.Fatalf("workflow partial events=%d err=%v", len(events), err)
+	}
+}
+func TestTask4DirectInboxUpdateRejectsCompletedAt(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	inbox := task5Inbox("task4-completed-at", "task4-completed-at-provider", "task4-completed-at-lane")
+	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "task4-completed-at-worker", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateInbox(ctx, InboxUpdate{
+		InboxID: lease.Update.InboxID, ExpectedVersion: lease.Update.Version, Status: InboxStatusCallbackStarted,
+		LeaseOwner: lease.Update.LeaseOwner, LeaseEpoch: lease.Update.LeaseEpoch, AttemptID: lease.Update.AttemptID,
+		CompletedAt: time.Now().UTC(),
+	}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("completed-at direct update err=%v", err)
+	}
+	var row inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != InboxStatusLeased || row.CompletedAt != nil {
+		t.Fatalf("inbox changed after rejected completed-at update=%#v", row)
 	}
 }
 
