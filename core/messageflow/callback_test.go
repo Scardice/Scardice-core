@@ -10,6 +10,7 @@ import (
 	"Scardice-core/adapterapi"
 	"Scardice-core/core/groupstate"
 	"Scardice-core/core/playerstate"
+	"Scardice-core/endpoint"
 	"Scardice-core/eventstore"
 )
 
@@ -548,6 +549,97 @@ func TestCallbackSQLiteMarkerAndTerminalCommit(t *testing.T) {
 	}
 	if _, err := store.ClaimInbox(ctx, eventstore.InboxClaimRequest{WorkerID: "second-worker"}); !errors.Is(err, eventstore.ErrNotFound) {
 		t.Fatalf("terminal inbox was claimable: %v", err)
+	}
+}
+
+type callbackA6KeySource struct{}
+
+func (*callbackA6KeySource) IndexRootID(context.Context) (string, error) {
+	return "index-v1", nil
+}
+
+func (*callbackA6KeySource) IndexRootMaterial(context.Context) ([]byte, error) {
+	return []byte("01234567890123456789012345678901"), nil
+}
+
+func (s *callbackA6KeySource) CurrentEncryptionRoot(ctx context.Context) (eventstore.EncryptionRoot, error) {
+	material, err := s.EncryptionRoot(ctx, "root-v1")
+	return eventstore.EncryptionRoot{ID: "root-v1", Material: material}, err
+}
+
+func (*callbackA6KeySource) EncryptionRoot(context.Context, string) ([]byte, error) {
+	return []byte("abcdefghijklmnopqrstuvwxyz123456"), nil
+}
+
+func TestCallbackSQLiteA6ProcessOneSuccessScrubsPayloadAndRetainsKeyMetadata(t *testing.T) {
+	ctx := context.Background()
+	const sourceID = "index-v1"
+	source := &callbackA6KeySource{}
+	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "callback-a6.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := eventstore.NewStore(db, eventstore.WithKeySource(source))
+	if err := store.SetReadiness(ctx, eventstore.Readiness{
+		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: sourceID,
+		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
+		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	inbound, err := NewInboundService(store, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := inbound.HandleInbound(ctx, endpoint.FencedInbound{
+		EndpointID: "endpoint", Generation: 1, DesiredVersion: 1,
+		Message: adapterapi.InboundMessage{
+			ProviderEventID: "provider-a6", MessageID: "message-a6", Platform: "test",
+			Sender: "sender-a6", Conversation: "group-a6", Target: "group-a6",
+			Kind: adapterapi.InboundKindMessage, Text: "hello-a6",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Outcome != adapterapi.IngressAccepted || receipt.InboxID == "" {
+		t.Fatalf("ingress receipt=%#v", receipt)
+	}
+	host := &callbackTestHost{}
+	service, err := NewCallbackService(CallbackConfig{
+		Inbox: store, Store: store, BoundCodec: store, Resolver: callbackTestResolver{},
+		Group: groupstate.NewRepository(store), Player: playerstate.NewRepository(store), Host: host, WorkerID: "worker-a6",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary, err := service.ProcessOne(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.InboxID != receipt.InboxID || summary.Status != eventstore.InboxStatusConfirmedConsumed || host.calls != 1 {
+		t.Fatalf("summary=%#v host calls=%d", summary, host.calls)
+	}
+	var row struct {
+		Status             string
+		PayloadCiphertext  []byte
+		PayloadNonce       []byte
+		EncryptionKeyID    string
+		ContentDigestKeyID string
+		PayloadVersion     uint64
+	}
+	if err := db.GORM().Table("inbox_messages").Where("inbox_id = ?", receipt.InboxID).First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != eventstore.InboxStatusConfirmedConsumed || len(row.PayloadCiphertext) != 0 || len(row.PayloadNonce) != 0 {
+		t.Fatalf("terminal A6 payload was not scrubbed: %#v", row)
+	}
+	if row.EncryptionKeyID != "root-v1" || row.ContentDigestKeyID != sourceID || row.PayloadVersion != 1 {
+		t.Fatalf("terminal A6 key metadata=%#v", row)
+	}
+	if _, err := store.ClaimInbox(ctx, eventstore.InboxClaimRequest{WorkerID: "second-worker"}); !errors.Is(err, eventstore.ErrNotFound) {
+		t.Fatalf("terminal A6 inbox was claimable: %v", err)
 	}
 }
 func TestCallbackBoundDecryptUsesPersistedPayloadVersion(t *testing.T) {
