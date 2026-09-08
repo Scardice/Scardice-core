@@ -13,6 +13,7 @@ import (
 func TestGroupEventsReplayIntoRecordWithoutAttrsOrModeration(t *testing.T) {
 	events := []TypedEvent{
 		NewGroupCreatedV1("dice-1", "group-1", "name", 1700000000),
+		NewGroupIdentityChangedV1("guild-1", "channel-1"),
 		NewGroupActivationChangedV1("bot-1", true, true),
 		NewGroupExtensionChangedV1("coc7", true),
 		NewGroupSystemChangedV1("coc7"),
@@ -20,7 +21,6 @@ func TestGroupEventsReplayIntoRecordWithoutAttrsOrModeration(t *testing.T) {
 		NewGroupBotListChangedV1("bot-2", true),
 		NewGroupPrivilegeChangedV1("user-1", 60),
 	}
-
 	state := State{}
 	for _, typed := range events {
 		var err error
@@ -50,7 +50,7 @@ func TestGroupEventsReplayIntoRecordWithoutAttrsOrModeration(t *testing.T) {
 }
 
 func TestGroupStreamAndOwnershipScopesAreIndependent(t *testing.T) {
-	if got := GroupStream("dice-1", "group-1"); got != (eventstore.StreamID{AggregateType: "group", AggregateID: "dice-1/group-1"}) {
+	if got := GroupStream("dice-1", "group-1"); got != (eventstore.StreamID{AggregateType: "group", AggregateID: canonicalAggregateID("dice-1", "group-1")}) {
 		t.Fatalf("group stream = %#v", got)
 	}
 	if got := AttrsStream("dice-1", "group-1"); got.AggregateType != "attrs/group" || got == GroupStream("dice-1", "group-1") {
@@ -61,6 +61,40 @@ func TestGroupStreamAndOwnershipScopesAreIndependent(t *testing.T) {
 	}
 	if got := ModerationStream("dice-1", "group-1"); got.AggregateType != "moderation/group" {
 		t.Fatalf("moderation stream = %#v", got)
+	}
+}
+
+func TestStreamIdentityAndDeletePrefixesAreUnambiguous(t *testing.T) {
+	if GroupStream("a/b", "c") == GroupStream("a", "b/c") {
+		t.Fatal("group stream identity collided")
+	}
+	if _, err := PlanDelete(State{}, DeleteRequest{}); !errors.Is(err, ErrInvalidIdentity) {
+		t.Fatalf("empty delete identity error = %v", err)
+	}
+	if _, err := PlanDelete(State{}, DeleteRequest{DiceID: strings.Repeat("x", MaxGroupIdentityPartBytes+1), GroupID: "group-1"}); !errors.Is(err, ErrInvalidIdentity) {
+		t.Fatalf("oversized delete identity error = %v", err)
+	}
+	plan, err := PlanDelete(State{}, DeleteRequest{DiceID: "dice-1", GroupID: "group-1", Scopes: []Scope{ScopePlayers, ScopeAttrs}})
+	if err != nil || len(plan.StreamPrefixes) != 2 || plan.StreamPrefixes[0].AggregateType == plan.StreamPrefixes[1].AggregateType {
+		t.Fatalf("typed delete prefixes = %#v, err = %v", plan.StreamPrefixes, err)
+	}
+}
+
+func TestTypedEventRejectsNilOversizeAndInvalidPrivilege(t *testing.T) {
+	var nilEvent *GroupNameChangedV1
+	if _, err := Reduce(State{}, nilEvent); !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("nil typed event error = %v", err)
+	}
+	oversized := NewGroupWelcomeChangedV1(true, strings.Repeat("x", MaxGroupEventPayloadBytes))
+	if _, err := MarshalTypedEvent(oversized); !errors.As(err, new(*eventstore.OversizeError)) {
+		t.Fatalf("oversized event error = %v", err)
+	}
+	state, err := Reduce(State{}, NewGroupCreatedV1("dice-1", "group-1", "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Reduce(state, NewGroupPrivilegeChangedV1("user-1", 101)); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("invalid privilege error = %v", err)
 	}
 }
 
@@ -78,7 +112,6 @@ func TestCompatibilityViewDoesNotExposeMutableAuthoritativeMaps(t *testing.T) {
 		t.Fatal("compatibility view mutated authoritative state")
 	}
 }
-
 func TestGroupDecideEmitsTypedRecordFacts(t *testing.T) {
 	decision, err := Decide(State{}, Command{Kind: CommandCreate, DiceID: "dice-1", GroupID: "group-1", GroupName: "name", EnteredAt: 1})
 	if err != nil {
@@ -92,8 +125,47 @@ func TestGroupDecideEmitsTypedRecordFacts(t *testing.T) {
 	}
 }
 
+func TestGroupCreatedAndTemplateReplayInviteAndCocRuleFacts(t *testing.T) {
+	created := NewGroupCreatedWithInviteV1("dice-1", "group-1", "name", "user-1", 1)
+	template := NewGroupTemplateWithCocRuleV1(20, "1d20", "soft", 7)
+	state, err := Replay([]TypedEvent{created, template})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.InviteUserID != "user-1" || state.CocRuleIndex != 7 {
+		t.Fatalf("record facts = %#v", state)
+	}
+	payload, err := MarshalTypedEvents([]TypedEvent{created, template})
+	if err != nil || !strings.Contains(string(payload), "user-1") || !strings.Contains(string(payload), "cocRuleIndex") {
+		t.Fatalf("typed payload = %s, err = %v", payload, err)
+	}
+}
+
+func TestDecideAndAppendCreateUsesCommandIdentity(t *testing.T) {
+	db, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/group-create.db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := eventstore.NewStore(db, eventstore.WithProjection(GroupProjection()))
+	repository := NewRepository(store)
+	metadata := eventstore.Metadata{EventID: "create-event", CommandID: "create-command", CorrelationID: "create-correlation", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}
+	_, err = repository.DecideAndAppend(context.Background(), State{}, 0, metadata, Command{Kind: CommandCreate, DiceID: "dice-1", GroupID: "group-1", GroupName: "name"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := repository.Load(context.Background(), "dice-1", "group-1")
+	if err != nil || state.DiceID != "dice-1" || state.GroupID != "group-1" {
+		t.Fatalf("created state = %#v, err = %v", state, err)
+	}
+	projected, err := ReadProjected(context.Background(), store, "dice-1", "group-1")
+	if err != nil || projected.DiceID != "dice-1" || projected.GroupID != "group-1" {
+		t.Fatalf("created projection = %#v, err = %v", projected, err)
+	}
+}
+
 func TestGroupDeletePlanPreservesDryRunAllowActiveAndScopes(t *testing.T) {
-	state := State{GroupID: "group-1", DiceIDActive: map[string]bool{"bot-1": true}, DiceIDExists: map[string]bool{"bot-1": true}}
+	state := State{DiceID: "dice-1", GroupID: "group-1", DiceIDActive: map[string]bool{"bot-1": true}, DiceIDExists: map[string]bool{"bot-1": true}}
 	_, err := PlanDelete(state, DeleteRequest{Scopes: []Scope{ScopeGroupRecord}})
 	if !errors.Is(err, ErrActiveGroup) {
 		t.Fatalf("active delete error = %v", err)
@@ -168,6 +240,28 @@ func TestRepositoryAndProjectionReplayTypedEvents(t *testing.T) {
 	again, err := ReadProjected(context.Background(), store, "dice-1", "group-1")
 	if err != nil || !again.BotList["bot-1"] {
 		t.Fatalf("projection read was mutable = %#v, err = %v", again, err)
+	}
+}
+
+func TestAppendTypedAllocatesUniqueEventIDsForBatch(t *testing.T) {
+	db, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/group-batch.db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := eventstore.NewStore(db, eventstore.WithProjection(GroupProjection()))
+	repository := NewRepository(store)
+	metadata := eventstore.Metadata{EventID: "batch-event", CommandID: "batch-command", CorrelationID: "batch-correlation", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}
+	_, err = repository.AppendTyped(context.Background(), "dice-1", "group-1", 0, metadata, []TypedEvent{
+		NewGroupCreatedV1("dice-1", "group-1", "name", 1),
+		NewGroupNameChangedV1("renamed"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.Load(context.Background(), GroupStream("dice-1", "group-1"), 1)
+	if err != nil || len(events) != 2 || events[0].EventID == events[1].EventID {
+		t.Fatalf("batch events = %#v, err = %v", events, err)
 	}
 }
 

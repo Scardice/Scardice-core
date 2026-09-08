@@ -6,6 +6,7 @@ type CommandKind string
 const (
 	CommandCreate CommandKind = "create"
 	CommandActivation CommandKind = "activation"
+	CommandIdentity CommandKind = "identity"
 	CommandName CommandKind = "name"
 	CommandExtension CommandKind = "extension"
 	CommandSystem CommandKind = "system"
@@ -19,10 +20,10 @@ const (
 const (
 	Create = CommandCreate
 	Activation = CommandActivation
+	Identity = CommandIdentity
 	Name = CommandName
 	Extension = CommandExtension
 	System = CommandSystem
-	Template = CommandTemplate
 	Help = CommandHelp
 	Welcome = CommandWelcome
 	BotList = CommandBotList
@@ -36,7 +37,10 @@ type Command struct {
 	DiceID string
 	GroupID string
 	GroupName string
+	InviteUserID string
 	EnteredAt int64
+	GuildID string
+	ChannelID string
 	DiceIDForActivation string
 	Active bool
 	Exists bool
@@ -46,6 +50,7 @@ type Command struct {
 	DiceSideNum int64
 	DiceSideExpr string
 	RollShaperMode string
+	CocRuleIndex int
 
 	DefaultHelpGroup string
 	HelpPackages []string
@@ -71,11 +76,13 @@ func Decide(state State, command Command) (Decision, error) {
 	if state.Version > 0 && command.ExpectedVersionSet && command.ExpectedVersion != state.Version { return Decision{}, ErrStaleVersion }
 	if kind == CommandCreate {
 		if state.Version != 0 { return Decision{}, ErrInvalidState }
-		if command.DiceID == "" || command.GroupID == "" { return Decision{}, ErrInvalidCommand }
-		return Decision{Events: []TypedEvent{NewGroupCreatedV1(command.DiceID, command.GroupID, command.GroupName, command.EnteredAt)}}, nil
+		if ValidateIdentity(command.DiceID, command.GroupID) != nil { return Decision{}, ErrInvalidCommand }
+		return Decision{Events: []TypedEvent{NewGroupCreatedWithInviteV1(command.DiceID, command.GroupID, command.GroupName, command.InviteUserID, command.EnteredAt)}}, nil
 	}
 	if state.Version == 0 || state.Deleted { return Decision{}, ErrInvalidState }
 	switch kind {
+	case CommandIdentity:
+		return Decision{Events: []TypedEvent{NewGroupIdentityChangedV1(command.GuildID, command.ChannelID)}}, nil
 	case CommandActivation:
 		if command.DiceIDForActivation == "" { command.DiceIDForActivation = command.DiceID }
 		return Decision{Events: []TypedEvent{NewGroupActivationChangedV1(command.DiceIDForActivation, command.Active, command.Exists)}}, nil
@@ -86,7 +93,7 @@ func Decide(state State, command Command) (Decision, error) {
 	case CommandSystem:
 		return Decision{Events: []TypedEvent{NewGroupSystemChangedV1(command.System)}}, nil
 	case CommandTemplate:
-		return Decision{Events: []TypedEvent{NewGroupTemplateChangedV1(command.DiceSideNum, command.DiceSideExpr, command.RollShaperMode)}}, nil
+		return Decision{Events: []TypedEvent{NewGroupTemplateWithCocRuleV1(command.DiceSideNum, command.DiceSideExpr, command.RollShaperMode, command.CocRuleIndex)}}, nil
 	case CommandHelp:
 		return Decision{Events: []TypedEvent{NewGroupHelpChangedV1(command.DefaultHelpGroup, command.HelpPackages)}}, nil
 	case CommandWelcome:

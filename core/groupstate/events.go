@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
-)
 
+	"Scardice-core/eventstore"
+
+)
 // EventType is the closed set of durable group-record facts. Attribute and
 // moderation values deliberately have no event type here: they have separate
 // aggregate owners and deletion scopes.
@@ -15,6 +18,7 @@ type EventType string
 const (
 	EventGroupCreated             EventType = "group.created"
 	EventGroupActivationChanged   EventType = "group.activation_changed"
+	EventGroupIdentityChanged     EventType = "group.identity_changed"
 	EventGroupNameChanged         EventType = "group.name_changed"
 	EventGroupExtensionChanged    EventType = "group.extension_changed"
 	EventGroupSystemChanged       EventType = "group.system_changed"
@@ -25,12 +29,10 @@ const (
 	EventGroupPrivilegeChanged    EventType = "group.privilege_changed"
 	EventGroupRecordDeleted       EventType = "group.record_deleted"
 )
-
-// Compatibility aliases keep event names easy to discover without creating a
-// second event vocabulary.
 const (
 	GroupCreated           = EventGroupCreated
 	GroupActivationChanged = EventGroupActivationChanged
+	GroupIdentityChanged   = EventGroupIdentityChanged
 	GroupNameChanged       = EventGroupNameChanged
 	GroupExtensionChanged  = EventGroupExtensionChanged
 	GroupSystemChanged     = EventGroupSystemChanged
@@ -44,7 +46,7 @@ const (
 
 func (e EventType) Valid() bool {
 	switch e {
-	case EventGroupCreated, EventGroupActivationChanged, EventGroupNameChanged,
+	case EventGroupCreated, EventGroupActivationChanged, EventGroupIdentityChanged, EventGroupNameChanged,
 		EventGroupExtensionChanged, EventGroupSystemChanged, EventGroupTemplateChanged,
 		EventGroupHelpChanged, EventGroupWelcomeChanged, EventGroupBotListChanged,
 		EventGroupPrivilegeChanged, EventGroupRecordDeleted:
@@ -70,20 +72,24 @@ type TypedEvent interface {
 }
 
 type GroupCreatedV1 struct {
-	DiceID    string `json:"diceId"`
-	GroupID   string `json:"groupId"`
+	DiceID string `json:"diceId"`
+	GroupID string `json:"groupId"`
 	GroupName string `json:"groupName,omitempty"`
-	EnteredAt int64  `json:"enteredAt,omitempty"`
+	InviteUserID string `json:"inviteUserId,omitempty"`
+	EnteredAt int64 `json:"enteredAt,omitempty"`
 }
 func NewGroupCreatedV1(diceID, groupID, groupName string, enteredAt int64) GroupCreatedV1 {
 	return GroupCreatedV1{DiceID: diceID, GroupID: groupID, GroupName: groupName, EnteredAt: enteredAt}
 }
+func NewGroupCreatedWithInviteV1(diceID, groupID, groupName, inviteUserID string, enteredAt int64) GroupCreatedV1 {
+	return GroupCreatedV1{DiceID: diceID, GroupID: groupID, GroupName: groupName, InviteUserID: inviteUserID, EnteredAt: enteredAt}
+}
 func (GroupCreatedV1) EventType() EventType { return EventGroupCreated }
 func (e GroupCreatedV1) apply(s *State) error {
-	if s.Version != 0 || strings.TrimSpace(e.DiceID) == "" || strings.TrimSpace(e.GroupID) == "" {
+	if s.Version != 0 || ValidateIdentity(e.DiceID, e.GroupID) != nil {
 		return ErrInvalidState
 	}
-	s.DiceID, s.GroupID, s.GroupName, s.EnteredAt = e.DiceID, e.GroupID, e.GroupName, e.EnteredAt
+	s.DiceID, s.GroupID, s.GroupName, s.InviteUserID, s.EnteredAt = e.DiceID, e.GroupID, e.GroupName, e.InviteUserID, e.EnteredAt
 	s.DiceIDActive, s.DiceIDExists, s.BotList, s.InactivatedExtensions, s.Privileges = map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]int{}
 	return nil
 }
@@ -102,6 +108,17 @@ func (e GroupActivationChangedV1) apply(s *State) error {
 	if e.Exists { s.DiceIDExists[e.DiceID] = true } else { delete(s.DiceIDExists, e.DiceID) }
 	if e.Active { s.DiceIDActive[e.DiceID] = true } else { delete(s.DiceIDActive, e.DiceID) }
 	s.Active = len(s.DiceIDActive) > 0
+	return nil
+}
+
+type GroupIdentityChangedV1 struct { GuildID string `json:"guildId"`; ChannelID string `json:"channelId"` }
+func NewGroupIdentityChangedV1(guildID, channelID string) GroupIdentityChangedV1 {
+	return GroupIdentityChangedV1{GuildID: guildID, ChannelID: channelID}
+}
+func (GroupIdentityChangedV1) EventType() EventType { return EventGroupIdentityChanged }
+func (e GroupIdentityChangedV1) apply(s *State) error {
+	if s.Version == 0 || s.Deleted { return ErrInvalidState }
+	s.GuildID, s.ChannelID = e.GuildID, e.ChannelID
 	return nil
 }
 
@@ -124,10 +141,11 @@ func NewGroupSystemChangedV1(system string) GroupSystemChangedV1 { return GroupS
 func (GroupSystemChangedV1) EventType() EventType { return EventGroupSystemChanged }
 func (e GroupSystemChangedV1) apply(s *State) error { if s.Version == 0 || s.Deleted { return ErrInvalidState }; s.System = e.System; return nil }
 
-type GroupTemplateChangedV1 struct { DiceSideNum int64 `json:"diceSideNum"`; DiceSideExpr string `json:"diceSideExpr"`; RollShaperMode string `json:"rollShaperMode"` }
+type GroupTemplateChangedV1 struct { DiceSideNum int64 `json:"diceSideNum"`; DiceSideExpr string `json:"diceSideExpr"`; RollShaperMode string `json:"rollShaperMode"`; CocRuleIndex int `json:"cocRuleIndex"` }
 func NewGroupTemplateChangedV1(num int64, expr, mode string) GroupTemplateChangedV1 { return GroupTemplateChangedV1{DiceSideNum: num, DiceSideExpr: expr, RollShaperMode: mode} }
+func NewGroupTemplateWithCocRuleV1(num int64, expr, mode string, index int) GroupTemplateChangedV1 { return GroupTemplateChangedV1{DiceSideNum: num, DiceSideExpr: expr, RollShaperMode: mode, CocRuleIndex: index} }
 func (GroupTemplateChangedV1) EventType() EventType { return EventGroupTemplateChanged }
-func (e GroupTemplateChangedV1) apply(s *State) error { if s.Version == 0 || s.Deleted { return ErrInvalidState }; s.DiceSideNum, s.DiceSideExpr, s.RollShaperMode = e.DiceSideNum, e.DiceSideExpr, e.RollShaperMode; return nil }
+func (e GroupTemplateChangedV1) apply(s *State) error { if s.Version == 0 || s.Deleted { return ErrInvalidState }; s.DiceSideNum, s.DiceSideExpr, s.RollShaperMode, s.CocRuleIndex = e.DiceSideNum, e.DiceSideExpr, e.RollShaperMode, e.CocRuleIndex; return nil }
 
 type GroupHelpChangedV1 struct { DefaultHelpGroup string `json:"defaultHelpGroup"`; HelpPackages []string `json:"helpPackages,omitempty"` }
 func NewGroupHelpChangedV1(group string, packages []string) GroupHelpChangedV1 { return GroupHelpChangedV1{DefaultHelpGroup: group, HelpPackages: append([]string(nil), packages...)} }
@@ -147,7 +165,7 @@ func (e GroupBotListChangedV1) apply(s *State) error { if s.Version == 0 || s.De
 type GroupPrivilegeChangedV1 struct { UserID string `json:"userId"`; Level int `json:"level"` }
 func NewGroupPrivilegeChangedV1(userID string, level int) GroupPrivilegeChangedV1 { return GroupPrivilegeChangedV1{UserID: userID, Level: level} }
 func (GroupPrivilegeChangedV1) EventType() EventType { return EventGroupPrivilegeChanged }
-func (e GroupPrivilegeChangedV1) apply(s *State) error { if s.Version == 0 || s.Deleted || strings.TrimSpace(e.UserID) == "" || e.Level < -30 { return ErrInvalidState }; s.Privileges[e.UserID] = e.Level; return nil }
+func (e GroupPrivilegeChangedV1) apply(s *State) error { if s.Version == 0 || s.Deleted || strings.TrimSpace(e.UserID) == "" || e.Level < -30 || e.Level > 100 { return ErrInvalidState }; s.Privileges[e.UserID] = e.Level; return nil }
 
 type GroupRecordDeletedV1 struct{}
 func NewGroupRecordDeletedV1() GroupRecordDeletedV1 { return GroupRecordDeletedV1{} }
@@ -156,10 +174,24 @@ func (GroupRecordDeletedV1) apply(s *State) error { if s.Version == 0 || s.Delet
 
 func (s *State) addExtension(id string) { for _, current := range s.ActivatedExtensions { if current == id { return } }; s.ActivatedExtensions = append(s.ActivatedExtensions, id) }
 func (s *State) removeExtension(id string) { for i, current := range s.ActivatedExtensions { if current == id { s.ActivatedExtensions = append(s.ActivatedExtensions[:i], s.ActivatedExtensions[i+1:]...); return } } }
-
+func isNilTypedEvent(event TypedEvent) bool {
+	if event == nil { return true }
+	value := reflect.ValueOf(event)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
 func MarshalTypedEvent(event TypedEvent) ([]byte, error) {
-	if event == nil || !event.EventType().Valid() { return nil, ErrInvalidEvent }
-	return json.Marshal(event)
+	if isNilTypedEvent(event) || !event.EventType().Valid() { return nil, ErrInvalidEvent }
+	payload, err := json.Marshal(event)
+	if err != nil { return nil, err }
+	if len(payload) > MaxGroupEventPayloadBytes {
+		return nil, &eventstore.OversizeError{Bound: "group event payload", Limit: MaxGroupEventPayloadBytes, Actual: len(payload)}
+	}
+	return payload, nil
 }
 func MarshalTypedEvents(events []TypedEvent) ([]byte, error) {
 	encoded := make([]json.RawMessage, 0, len(events))
@@ -167,10 +199,14 @@ func MarshalTypedEvents(events []TypedEvent) ([]byte, error) {
 	return json.Marshal(encoded)
 }
 func DecodeTypedEvent(eventType EventType, payload []byte) (TypedEvent, error) {
+	if len(payload) > MaxGroupEventPayloadBytes {
+		return nil, &eventstore.OversizeError{Bound: "group event payload", Limit: MaxGroupEventPayloadBytes, Actual: len(payload)}
+	}
 	var event TypedEvent
 	switch eventType {
 	case EventGroupCreated: event = &GroupCreatedV1{}
 	case EventGroupActivationChanged: event = &GroupActivationChangedV1{}
+	case EventGroupIdentityChanged: event = &GroupIdentityChangedV1{}
 	case EventGroupNameChanged: event = &GroupNameChangedV1{}
 	case EventGroupExtensionChanged: event = &GroupExtensionChangedV1{}
 	case EventGroupSystemChanged: event = &GroupSystemChangedV1{}

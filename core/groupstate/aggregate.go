@@ -2,6 +2,7 @@ package groupstate
 
 import (
 	"fmt"
+	"strings"
 
 	"Scardice-core/eventstore"
 )
@@ -14,6 +15,7 @@ type State struct {
 	DiceID                string            `json:"diceId"`
 	GroupID               string            `json:"groupId"`
 	GroupName             string            `json:"groupName,omitempty"`
+	InviteUserID          string            `json:"inviteUserId,omitempty"`
 	GuildID               string            `json:"guildId,omitempty"`
 	ChannelID             string            `json:"channelId,omitempty"`
 	Active                bool              `json:"active"`
@@ -25,6 +27,7 @@ type State struct {
 	DiceSideNum           int64             `json:"diceSideNum,omitempty"`
 	DiceSideExpr          string            `json:"diceSideExpr,omitempty"`
 	RollShaperMode        string            `json:"rollShaperMode,omitempty"`
+	CocRuleIndex          int               `json:"cocRuleIndex,omitempty"`
 	HelpPackages          []string          `json:"helpPackages,omitempty"`
 	DefaultHelpGroup      string            `json:"defaultHelpGroup,omitempty"`
 	ShowGroupWelcome      bool              `json:"showGroupWelcome"`
@@ -76,7 +79,7 @@ func (s *State) ensureMaps() {
 // Reduce applies one typed fact to a copied state. The input state's maps are
 // never mutated, which keeps compatibility reads from becoming authorities.
 func Reduce(state State, event TypedEvent) (State, error) {
-	if event == nil || !event.EventType().Valid() { return State{}, ErrInvalidEvent }
+	if isNilTypedEvent(event) || !event.EventType().Valid() { return State{}, ErrInvalidEvent }
 	next := state.Clone()
 	if next.Version > 0 { next.ensureMaps() }
 	if err := event.apply(&next); err != nil { return State{}, err }
@@ -98,11 +101,14 @@ func ApplyEnvelope(state State, envelope eventstore.Envelope) (State, error) {
 		return State{}, fmt.Errorf("%w: schema or aggregate type", ErrUnsupportedSchema)
 	}
 	if envelope.StreamVersion != state.Version+1 { return State{}, ErrInvalidState }
+	if len(envelope.Payload) > MaxGroupEventPayloadBytes {
+		return State{}, &eventstore.OversizeError{Bound: "group event payload", Limit: MaxGroupEventPayloadBytes, Actual: len(envelope.Payload)}
+	}
 	event, err := DecodeTypedEvent(EventType(envelope.EventType), envelope.Payload)
 	if err != nil { return State{}, err }
 	next, err := Reduce(state, event)
 	if err != nil { return State{}, err }
-	if next.DiceID+"/"+next.GroupID != envelope.Stream.AggregateID { return State{}, ErrInvalidState }
+	if next.DiceID == "" || next.GroupID == "" || canonicalAggregateID(next.DiceID, next.GroupID) != envelope.Stream.AggregateID { return State{}, ErrInvalidState }
 	return next, nil
 }
 
@@ -113,12 +119,31 @@ func ReplayEnvelopes(envelopes []eventstore.Envelope) (State, error) {
 }
 
 const (
-	GroupAggregateType       = "group"
-	GroupEventSchemaVersion  = uint16(1)
+	GroupAggregateType = "group"
+	GroupEventSchemaVersion = uint16(1)
+	MaxGroupIdentityPartBytes = 255
+	MaxGroupEventPayloadBytes = eventstore.MaxEventPayloadBytes
 )
 
+var ErrInvalidIdentity = fmt.Errorf("groupstate: invalid group identity")
+
+func ValidateIdentity(diceID, groupID string) error {
+	if strings.TrimSpace(diceID) == "" || strings.TrimSpace(groupID) == "" ||
+		len(diceID) > MaxGroupIdentityPartBytes || len(groupID) > MaxGroupIdentityPartBytes {
+		return ErrInvalidIdentity
+	}
+	return nil
+}
+func canonicalAggregateID(diceID, groupID string) string {
+	return canonicalAggregateParts(diceID, groupID)
+}
+func canonicalAggregateParts(parts ...string) string {
+	var encoded string
+	for _, part := range parts { encoded += fmt.Sprintf("%d:%s", len(part), part) }
+	return encoded
+}
 func GroupStream(diceID, groupID string) eventstore.StreamID {
-	return eventstore.StreamID{AggregateType: GroupAggregateType, AggregateID: diceID + "/" + groupID}
+	return eventstore.StreamID{AggregateType: GroupAggregateType, AggregateID: canonicalAggregateID(diceID, groupID)}
 }
 func eventMetadataValid(metadata eventstore.Metadata) bool {
 	return metadata.EventID != "" && metadata.CommandID != "" && metadata.CorrelationID != "" && (!metadata.OccurredAt.IsZero() || metadata.OccurredAtUnixNanoSet || metadata.OccurredAtUnixNanoUTC != 0)
@@ -143,11 +168,9 @@ type CompatibilityView struct {
 	State
 }
 func (s State) CompatibilityView() CompatibilityView { return CompatibilityView{State: s.Clone()} }
-func (v CompatibilityView) Clone() CompatibilityView { return CompatibilityView{State: v.State.Clone()} }
-
 func ValidateState(state State) error {
 	if state.Version == 0 { return nil }
-	if state.GroupID == "" || state.DiceID == "" { return ErrInvalidState }
+	if ValidateIdentity(state.DiceID, state.GroupID) != nil { return ErrInvalidState }
 	if state.Deleted && state.Active { return ErrDeletedGroup }
 	return nil
 }
