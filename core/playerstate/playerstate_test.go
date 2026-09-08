@@ -1,6 +1,7 @@
 package playerstate
 
 import (
+	"bytes"
 	"context"
 	"reflect"
 	"strings"
@@ -13,14 +14,14 @@ func TestOwnershipStreamsAndPurgeScopesAreDisjoint(t *testing.T) {
 	player := PlayerStream("dice-1", "group-1", "user-1")
 	attrs := GroupUserAttrsStream("dice-1", "group-1", "user-1")
 	character := CharacterStream("dice-1", "user-1", "character-1")
-	moderation := ModerationStream("dice-1", "group-1")
+	moderation := ModerationStream("dice-1", "group-1", "QQ:1")
 	if player == attrs || player == character || player == moderation || attrs == character { t.Fatalf("ownership streams overlap") }
 	if got := PlayerStreamPrefix("dice-1", "group-1"); got.AggregateType != PlayerAggregateType || !strings.Contains(got.Prefix, "dice-1") { t.Fatalf("player prefix = %#v", got) }
 	if got := GroupUserAttrsStreamPrefix("dice-1", "group-1"); got.AggregateType != GroupUserAttrsAggregateType { t.Fatalf("attrs prefix = %#v", got) }
 	plan, err := PlanDeleteForUser("dice-1", "group-1", "user-1", []Scope{ScopePlayers, ScopeAttrs, ScopeCharacters, ScopeModeration})
 	if err != nil { t.Fatal(err) }
-	if len(plan.StreamPrefixes) != 3 || len(plan.Streams) != 1 || plan.Streams[0].AggregateType != ModerationAggregateType { t.Fatalf("purge plan = %#v", plan) }
-	if plan.StreamPrefixes[0].AggregateType != PlayerAggregateType || plan.StreamPrefixes[1].AggregateType != GroupUserAttrsAggregateType || plan.StreamPrefixes[2].AggregateType != CharacterAggregateType { t.Fatalf("mixed purge owners = %#v", plan.StreamPrefixes) }
+	if len(plan.StreamPrefixes) != 4 || len(plan.Streams) != 0 { t.Fatalf("purge plan = %#v", plan) }
+	if plan.StreamPrefixes[0].AggregateType != PlayerAggregateType || plan.StreamPrefixes[1].AggregateType != GroupUserAttrsAggregateType || plan.StreamPrefixes[2].AggregateType != CharacterAggregateType || plan.StreamPrefixes[3].AggregateType != ModerationAggregateType { t.Fatalf("mixed purge owners = %#v", plan.StreamPrefixes) }
 }
 
 func TestPlayerReplayAndCompatibilityReadExcludeLocalOverlayAndOtherOwners(t *testing.T) {
@@ -82,8 +83,53 @@ func TestModerationIsSeparateAndRebuildable(t *testing.T) {
 	payload, err := MarshalModerationEvents(events)
 	if err != nil || strings.Contains(string(payload), "player") || strings.Contains(string(payload), "attrs") { t.Fatalf("moderation payload crossed owners: %s", payload) }
 }
+func TestModerationSubjectsHaveIndependentStreamsAndGroupPurgePrefix(t *testing.T) {
+	first := NewModerationCreatedV1("dice-1", "group-1", "QQ:1", -10, 1)
+	second := NewModerationCreatedV1("dice-1", "group-1", "QQ:2", -30, 2)
+	if ModerationStream(first.DiceID, first.GroupID, first.SubjectID) == ModerationStream(second.DiceID, second.GroupID, second.SubjectID) { t.Fatal("moderation subjects share one stream") }
+	firstState, err := ReplayModeration([]ModerationEvent{first}); if err != nil || firstState.SubjectID != "QQ:1" { t.Fatalf("first moderation = %#v, err = %v", firstState, err) }
+	secondState, err := ReplayModeration([]ModerationEvent{second}); if err != nil || secondState.SubjectID != "QQ:2" { t.Fatalf("second moderation = %#v, err = %v", secondState, err) }
+	plan, err := PlanDelete("dice-1", "group-1", []Scope{ScopeModeration}); if err != nil || len(plan.StreamPrefixes) != 1 || plan.StreamPrefixes[0] != ModerationStreamPrefix("dice-1", "group-1") { t.Fatalf("moderation purge = %#v, err = %v", plan, err) }
+}
 
 func TestTypedNilEventIsRejected(t *testing.T) {
 	var event *PlayerNameChangedV1
 	if _, err := ReducePlayer(PlayerState{}, event); err != ErrInvalidEvent { t.Fatalf("typed nil error = %v", err) }
+}
+func TestRepositoryValidatesReplayBeforeCommitWithoutProjector(t *testing.T) {
+	ctx := context.Background()
+	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/validation.db"})
+	if err != nil { t.Fatal(err) }
+	defer db.Close()
+	repo := NewRepository(eventstore.NewStore(db))
+	meta := eventstore.Metadata{EventID: "invalid", CommandID: "command", CorrelationID: "correlation", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}
+	if _, err := repo.AppendPlayerTyped(ctx, "dice-1", "group-1", "user-1", 0, meta, []PlayerEvent{NewPlayerNameChangedV1("name")}); err != ErrInvalidState { t.Fatalf("mutation before create = %v", err) }
+	meta.EventID, meta.CommandID, meta.CorrelationID = "create", "create-command", "create-correlation"
+	if _, err := repo.AppendPlayerTyped(ctx, "dice-1", "group-1", "user-1", 0, meta, []PlayerEvent{NewPlayerCreatedV1("dice-1", "group-1", "user-1", "name")}); err != nil { t.Fatal(err) }
+	meta.EventID, meta.CommandID, meta.CorrelationID = "create-again", "create-again-command", "create-again-correlation"
+	if _, err := repo.AppendPlayerTyped(ctx, "dice-1", "group-1", "user-1", 1, meta, []PlayerEvent{NewPlayerCreatedV1("dice-1", "group-1", "user-1", "again")}); err != ErrInvalidState { t.Fatalf("second create = %v", err) }
+	meta.EventID, meta.CommandID, meta.CorrelationID = "delete", "delete-command", "delete-correlation"
+	if _, err := repo.AppendPlayerTyped(ctx, "dice-1", "group-1", "user-1", 1, meta, []PlayerEvent{NewPlayerDeletedV1()}); err != nil { t.Fatal(err) }
+	meta.EventID, meta.CommandID, meta.CorrelationID = "after-delete", "after-delete-command", "after-delete-correlation"
+	if _, err := repo.AppendPlayerTyped(ctx, "dice-1", "group-1", "user-1", 2, meta, []PlayerEvent{NewPlayerNameChangedV1("again")}); err != ErrInvalidState { t.Fatalf("mutation after delete = %v", err) }
+}
+
+func TestStrictBoundsAndTypedNilAreRejected(t *testing.T) {
+	if _, err := PlanDeleteForUser("dice-1", "group-1", strings.Repeat("u", MaxIdentityPartBytes+1), []Scope{ScopeCharacters}); err != ErrInvalidIdentity { t.Fatalf("oversized purge user = %v", err) }
+	if _, err := PlanDelete("dice-1", "group-1", []Scope{ScopeCharacters}); err != ErrInvalidIdentity { t.Fatalf("group-wide character purge = %v", err) }
+	if _, err := PlanDeleteForUser("dice-1", "group-1", "user-1", []Scope{ScopeCharacters}); err != nil { t.Fatal(err) }
+	if err := NewGroupUserAttrsBindingChangedV1(strings.Repeat("x", MaxIdentityPartBytes+1)).attrsValidate(); err != ErrInvalidIdentity { t.Fatalf("oversized binding = %v", err) }
+	if err := NewCharacterCreatedV1("dice-1", "user-1", strings.Repeat("x", MaxIdentityPartBytes+1), "name", "coc7").characterValidate(); err != ErrInvalidIdentity { t.Fatalf("oversized character = %v", err) }
+	if _, err := DecodePlayerEvent(EventPlayerNameChanged, bytes.Repeat([]byte("x"), eventstore.MaxEventPayloadBytes+1)); err == nil { t.Fatal("oversized decode accepted") }
+	var nilEvent *PlayerNameChangedV1
+	if _, err := NewEvent(nilEvent, eventstore.Metadata{EventID: "e", CommandID: "c", CorrelationID: "r", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}); err != eventstore.ErrInvalidEvent { t.Fatalf("typed nil NewEvent = %v", err) }
+	if _, err := NewEventWithFactory(eventstore.EventFactory{}, nilEvent, eventstore.Metadata{OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}); err != eventstore.ErrInvalidEvent { t.Fatalf("typed nil factory event = %v", err) }
+}
+
+func TestReducersRejectVersionOverflow(t *testing.T) {
+	overflow := ^uint64(0)
+	if _, err := ReducePlayer(PlayerState{Version: overflow}, NewPlayerNameChangedV1("x")); err != ErrInvalidState { t.Fatalf("player overflow = %v", err) }
+	if _, err := ReduceGroupUserAttrs(GroupUserAttrsState{Version: overflow}, NewGroupUserAttrsClearedV1()); err != ErrInvalidState { t.Fatalf("attrs overflow = %v", err) }
+	if _, err := ReduceCharacter(CharacterState{Version: overflow}, NewCharacterRenamedV1("x")); err != ErrInvalidState { t.Fatalf("character overflow = %v", err) }
+	if _, err := ReduceModeration(ModerationState{Version: overflow}, NewModerationRankChangedV1(0)); err != ErrInvalidState { t.Fatalf("moderation overflow = %v", err) }
 }

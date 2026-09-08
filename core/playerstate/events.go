@@ -121,7 +121,7 @@ func (PlayerDeletedV1) playerValidate() error{return nil}
 func (PlayerDeletedV1) playerApply(s *PlayerState) error { if s.Version==0{return ErrInvalidState}; s.Name=""; s.AutoSetNameTemplate=""; s.Deleted=true; return nil }
 
 type EncryptedValue struct { Ciphertext []byte `json:"ciphertext,omitempty"`; KeyID string `json:"keyId,omitempty"` }
-func NewEncryptedValue(ciphertext []byte, keyID string) EncryptedValue { return EncryptedValue{append([]byte(nil), ciphertext...), keyID} }
+func NewEncryptedValue(ciphertext []byte,keyID string)EncryptedValue{return EncryptedValue{append([]byte(nil),ciphertext...),keyID}}
 func (v EncryptedValue) Clone() EncryptedValue { return NewEncryptedValue(v.Ciphertext,v.KeyID) }
 func (v EncryptedValue) valid() error { if len(v.Ciphertext)==0 || strings.TrimSpace(v.KeyID)=="" || len(v.KeyID)>255{return ErrInvalidState}; return nil }
 
@@ -134,7 +134,7 @@ func (e GroupUserAttrsCreatedV1) attrsApply(s *GroupUserAttrsState)error{if s.Ve
 type GroupUserAttrsBindingChangedV1 struct { BindingSheetID string `json:"bindingSheetId,omitempty"` }
 func NewGroupUserAttrsBindingChangedV1(id string) GroupUserAttrsBindingChangedV1{return GroupUserAttrsBindingChangedV1{id}}
 func (GroupUserAttrsBindingChangedV1) EventType() EventType{return EventGroupUserAttrsBindingChanged}
-func (e GroupUserAttrsBindingChangedV1) attrsValidate()error{return validateOptionalText(e.BindingSheetID)}
+func (e GroupUserAttrsBindingChangedV1) attrsValidate()error{if e.BindingSheetID==""{return nil};return validateScopedID(e.BindingSheetID)}
 func (e GroupUserAttrsBindingChangedV1) attrsApply(s *GroupUserAttrsState)error{if s.Version==0||s.Deleted{return ErrInvalidState};s.BindingSheetID=e.BindingSheetID;return nil}
 
 type GroupUserAttrsSetV1 struct { Key string `json:"key"`; Value EncryptedValue `json:"value"` }
@@ -154,7 +154,6 @@ func NewGroupUserAttrsDeletedV1(key string) GroupUserAttrsDeletedV1{return Group
 func (GroupUserAttrsDeletedV1) EventType() EventType{return EventGroupUserAttrsDeleted}
 func (e GroupUserAttrsDeletedV1) attrsValidate()error{return validateText(e.Key)}
 func (e GroupUserAttrsDeletedV1) attrsApply(s *GroupUserAttrsState)error{if s.Version==0||s.Deleted{return ErrInvalidState};delete(s.Values,e.Key);s.Operations=append(s.Operations,AttributeOperation{Kind:OperationDelete,Key:e.Key});return nil}
-
 type GroupUserAttrsClearedV1 struct{}
 func NewGroupUserAttrsClearedV1() GroupUserAttrsClearedV1{return GroupUserAttrsClearedV1{}}
 func (GroupUserAttrsClearedV1) EventType() EventType{return EventGroupUserAttrsCleared}
@@ -164,7 +163,7 @@ func (GroupUserAttrsClearedV1) attrsApply(s *GroupUserAttrsState)error{if s.Vers
 type CharacterCreatedV1 struct { DiceID string `json:"diceId"`; UserID string `json:"userId"`; CharacterID string `json:"characterId"`; Name string `json:"name"`; SheetType string `json:"sheetType,omitempty"` }
 func NewCharacterCreatedV1(diceID,userID,id,name,sheetType string) CharacterCreatedV1{return CharacterCreatedV1{diceID,userID,id,name,sheetType}}
 func (CharacterCreatedV1) EventType() EventType{return EventCharacterCreated}
-func (e CharacterCreatedV1) characterValidate()error{if err:=validateIdentity(e.DiceID,e.UserID);err!=nil{return err};if err:=validateText(e.CharacterID);err!=nil{return err};return validateText(e.Name)}
+func (e CharacterCreatedV1) characterValidate()error{if err:=validateIdentity(e.DiceID,e.UserID);err!=nil{return err};if err:=validateScopedID(e.CharacterID);err!=nil{return err};return validateText(e.Name)}
 func (e CharacterCreatedV1) characterApply(s *CharacterState)error{if s.Version!=0||s.Deleted{return ErrInvalidState};s.DiceID,s.UserID,s.CharacterID,s.Name,s.SheetType=e.DiceID,e.UserID,e.CharacterID,e.Name,e.SheetType;return nil}
 
 type CharacterRenamedV1 struct { Name string `json:"name"` }
@@ -188,9 +187,8 @@ func (CharacterDeletedV1) characterApply(s *CharacterState)error{if s.Version==0
 type ModerationCreatedV1 struct { DiceID string `json:"diceId"`; GroupID string `json:"groupId"`; SubjectID string `json:"subjectId"`; Rank int `json:"rank"`; Score int64 `json:"score"` }
 func NewModerationCreatedV1(diceID,groupID,subjectID string,rank int,score int64) ModerationCreatedV1{return ModerationCreatedV1{diceID,groupID,subjectID,rank,score}}
 func (ModerationCreatedV1) EventType() EventType{return EventModerationCreated}
-func (e ModerationCreatedV1) moderationValidate()error{if err:=validateIdentity(e.DiceID,e.GroupID);err!=nil{return err};if err:=validateText(e.SubjectID);err!=nil{return err};if e.Rank < -30 || e.Rank > 30{return ErrInvalidState};return nil}
 func (e ModerationCreatedV1) moderationApply(s *ModerationState)error{if s.Version!=0||s.Deleted{return ErrInvalidState};s.DiceID,s.GroupID,s.SubjectID,s.Rank,s.Score=e.DiceID,e.GroupID,e.SubjectID,e.Rank,e.Score;return nil}
-
+func (e ModerationCreatedV1) moderationValidate()error{if err:=validateIdentity(e.DiceID,e.GroupID);err!=nil{return err};if err:=validateScopedID(e.SubjectID);err!=nil{return err};if e.Rank < -30 || e.Rank > 30{return ErrInvalidState};return nil}
 type ModerationScoreChangedV1 struct { Score int64 `json:"score"`; ReasonDigest string `json:"reasonDigest,omitempty"` }
 func NewModerationScoreChangedV1(score int64,reasonDigest string) ModerationScoreChangedV1{return ModerationScoreChangedV1{score,reasonDigest}}
 func (ModerationScoreChangedV1) EventType() EventType{return EventModerationScoreChanged}
@@ -201,6 +199,7 @@ type ModerationRankChangedV1 struct { Rank int `json:"rank"` }
 func NewModerationRankChangedV1(rank int) ModerationRankChangedV1{return ModerationRankChangedV1{rank}}
 func (ModerationRankChangedV1) EventType() EventType{return EventModerationRankChanged}
 func (e ModerationRankChangedV1) moderationValidate()error{if e.Rank < -30 || e.Rank > 30{return ErrInvalidState};return nil}
+func validateScopedID(value string) error { if strings.TrimSpace(value)=="" || len(value)>MaxIdentityPartBytes { return ErrInvalidIdentity }; return nil }
 func (e ModerationRankChangedV1) moderationApply(s *ModerationState)error{if s.Version==0||s.Deleted{return ErrInvalidState};s.Rank=e.Rank;return nil}
 
 type ModerationDeletedV1 struct{}
@@ -223,15 +222,17 @@ func MarshalCharacterEvents(events []CharacterEvent)([]byte,error){for _,e:=rang
 func MarshalModerationEvent(event ModerationEvent)([]byte,error){switch e:=event.(type){case ModerationCreatedV1:return marshalTyped(e,e.EventType(),e.moderationValidate);case ModerationScoreChangedV1:return marshalTyped(e,e.EventType(),e.moderationValidate);case ModerationRankChangedV1:return marshalTyped(e,e.EventType(),e.moderationValidate);case ModerationDeletedV1:return marshalTyped(e,e.EventType(),e.moderationValidate);default:return nil,ErrInvalidEvent}}
 func MarshalModerationEvents(events []ModerationEvent)([]byte,error){for _,e:=range events{if _,err:=MarshalModerationEvent(e);err!=nil{return nil,err}};return marshalArray(events)}
 
-func decodeObject(payload []byte, out any) error { var value any; if err:=json.Unmarshal(payload,&value);err!=nil{return ErrInvalidEvent}; if _,ok:=value.(map[string]any);!ok||containsNull(value){return ErrInvalidEvent}; decoder:=json.NewDecoder(bytes.NewReader(payload));decoder.DisallowUnknownFields();if err:=decoder.Decode(out);err!=nil{return ErrInvalidEvent};if err:=decoder.Decode(&struct{}{});err!=io.EOF{return ErrInvalidEvent};return nil }
+func decodeObject(payload []byte, out any) error { if err:=rejectOversizePayload(payload);err!=nil{return err};var value any;if err:=json.Unmarshal(payload,&value);err!=nil{return ErrInvalidEvent};if _,ok:=value.(map[string]any);!ok||containsNull(value){return ErrInvalidEvent};decoder:=json.NewDecoder(bytes.NewReader(payload));decoder.DisallowUnknownFields();if err:=decoder.Decode(out);err!=nil{return ErrInvalidEvent};if err:=decoder.Decode(&struct{}{});err!=io.EOF{return ErrInvalidEvent};return nil }
 func containsNull(value any)bool{switch v:=value.(type){case nil:return true;case map[string]any:for _,x:=range v{if containsNull(x){return true}};case []any:for _,x:=range v{if containsNull(x){return true}}};return false}
+func rejectOversizePayload(payload []byte) error { if len(payload) > eventstore.MaxEventPayloadBytes { return &eventstore.OversizeError{Bound: "playerstate event payload", Limit: eventstore.MaxEventPayloadBytes, Actual: len(payload)} }; return nil }
 func DecodePlayerEvent(typ EventType,payload []byte)(PlayerEvent,error){switch typ{case EventPlayerCreated:var e PlayerCreatedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.playerValidate();case EventPlayerNameChanged:var e PlayerNameChangedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.playerValidate();case EventPlayerPrivilegeChanged:var e PlayerPrivilegeChangedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.playerValidate();case EventPlayerTemplateChanged:var e PlayerAutoSetNameTemplateChangedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.playerValidate();case EventPlayerLastCommandChanged:var e PlayerLastCommandChangedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.playerValidate();case EventPlayerDeleted:var e PlayerDeletedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.playerValidate();default:return nil,ErrInvalidEvent}}
 func DecodeGroupUserAttrsEvent(typ EventType,payload []byte)(GroupUserAttrsEvent,error){switch typ{case EventGroupUserAttrsCreated:var e GroupUserAttrsCreatedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.attrsValidate();case EventGroupUserAttrsBindingChanged:var e GroupUserAttrsBindingChangedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.attrsValidate();case EventGroupUserAttrsSet:var e GroupUserAttrsSetV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.attrsValidate();case EventGroupUserAttrsIncremented:var e GroupUserAttrsIncrementedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.attrsValidate();case EventGroupUserAttrsDeleted:var e GroupUserAttrsDeletedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.attrsValidate();case EventGroupUserAttrsCleared:var e GroupUserAttrsClearedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.attrsValidate();default:return nil,ErrInvalidEvent}}
 func DecodeCharacterEvent(typ EventType,payload []byte)(CharacterEvent,error){switch typ{case EventCharacterCreated:var e CharacterCreatedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.characterValidate();case EventCharacterRenamed:var e CharacterRenamedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.characterValidate();case EventCharacterSheetReplaced:var e CharacterSheetReplacedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.characterValidate();case EventCharacterDeleted:var e CharacterDeletedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.characterValidate();default:return nil,ErrInvalidEvent}}
 func DecodeModerationEvent(typ EventType,payload []byte)(ModerationEvent,error){switch typ{case EventModerationCreated:var e ModerationCreatedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.moderationValidate();case EventModerationScoreChanged:var e ModerationScoreChangedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.moderationValidate();case EventModerationRankChanged:var e ModerationRankChangedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.moderationValidate();case EventModerationDeleted:var e ModerationDeletedV1;if err:=decodeObject(payload,&e);err!=nil{return nil,err};return e,e.moderationValidate();default:return nil,ErrInvalidEvent}}
 
-func NewEvent(event any, metadata eventstore.Metadata)(eventstore.NewEvent,error){if metadata.EventID==""||metadata.CommandID==""||metadata.CorrelationID==""||(metadata.OccurredAt.IsZero()&&metadata.OccurredAtUnixNanoUTC==0&&!metadata.OccurredAtUnixNanoSet){return eventstore.NewEvent{},eventstore.ErrInvalidMetadata};if !metadata.OccurredAt.IsZero()&&(metadata.OccurredAtUnixNanoSet||metadata.OccurredAtUnixNanoUTC!=0)&&metadata.OccurredAt.UTC().UnixNano()!=metadata.OccurredAtUnixNanoUTC{return eventstore.NewEvent{},eventstore.ErrInvalidMetadata};var typ EventType;var payload []byte;var err error;switch e:=event.(type){case PlayerEvent:typ=e.EventType();payload,err=MarshalPlayerEvent(e);case GroupUserAttrsEvent:typ=e.EventType();payload,err=MarshalGroupUserAttrsEvent(e);case CharacterEvent:typ=e.EventType();payload,err=MarshalCharacterEvent(e);case ModerationEvent:typ=e.EventType();payload,err=MarshalModerationEvent(e);default:return eventstore.NewEvent{},ErrInvalidEvent};if err!=nil{return eventstore.NewEvent{},err};return eventstore.NewEvent{EventType:string(typ),SchemaVersion:EventSchemaVersion,Payload:payload,Metadata:metadata},nil}
+func NewEvent(event any, metadata eventstore.Metadata)(eventstore.NewEvent,error){if isNilEvent(event){return eventstore.NewEvent{},eventstore.ErrInvalidEvent};if metadata.EventID==""||metadata.CommandID==""||metadata.CorrelationID==""||(metadata.OccurredAt.IsZero()&&metadata.OccurredAtUnixNanoUTC==0&&!metadata.OccurredAtUnixNanoSet){return eventstore.NewEvent{},eventstore.ErrInvalidMetadata};if !metadata.OccurredAt.IsZero()&&(metadata.OccurredAtUnixNanoSet||metadata.OccurredAtUnixNanoUTC!=0)&&metadata.OccurredAt.UTC().UnixNano()!=metadata.OccurredAtUnixNanoUTC{return eventstore.NewEvent{},eventstore.ErrInvalidMetadata};var typ EventType;var payload []byte;var err error;switch e:=event.(type){case PlayerEvent:typ=e.EventType();payload,err=MarshalPlayerEvent(e);case GroupUserAttrsEvent:typ=e.EventType();payload,err=MarshalGroupUserAttrsEvent(e);case CharacterEvent:typ=e.EventType();payload,err=MarshalCharacterEvent(e);case ModerationEvent:typ=e.EventType();payload,err=MarshalModerationEvent(e);default:return eventstore.NewEvent{},eventstore.ErrInvalidEvent};if err!=nil{return eventstore.NewEvent{},err};return eventstore.NewEvent{EventType:string(typ),SchemaVersion:EventSchemaVersion,Payload:payload,Metadata:metadata},nil}
 func NewEventWithFactory(factory eventstore.EventFactory, event any, metadata eventstore.Metadata) (eventstore.NewEvent, error) {
+	if isNilEvent(event) { return eventstore.NewEvent{}, eventstore.ErrInvalidEvent }
 	var typ EventType
 	var payload []byte
 	var err error
