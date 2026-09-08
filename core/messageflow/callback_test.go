@@ -198,6 +198,34 @@ func TestCallbackCollectorRejectsOverlayAndDuplicateStreams(t *testing.T) {
 	if err := collector.AddStream(eventstore.StreamID{AggregateType: "group", AggregateID: "escaped"}, 0, []eventstore.NewEvent{callbackEvent("group.changed", `{"nested":["\u0024t"]}`)}); !errors.Is(err, eventstore.ErrInvalidEvent) {
 		t.Fatalf("escaped overlay event err=%v", err)
 	}
+	for _, field := range []string{"EventID", "CommandID", "CorrelationID", "CausationID", "PrincipalID", "Producer"} {
+		event := callbackEvent("group.metadata", `{}`)
+		switch field {
+		case "EventID":
+			event.Metadata.EventID = "$t-event"
+		case "CommandID":
+			event.Metadata.CommandID = "$t-command"
+		case "CorrelationID":
+			event.Metadata.CorrelationID = "$t-correlation"
+		case "CausationID":
+			event.Metadata.CausationID = "$t-causation"
+		case "PrincipalID":
+			event.Metadata.PrincipalID = "$t-principal"
+		case "Producer":
+			event.Metadata.Producer = "$t-producer"
+		}
+		if err := NewMutationCollector(eventstore.EventFactory{}).AddStream(eventstore.StreamID{AggregateType: "group", AggregateID: "metadata-" + field}, 0, []eventstore.NewEvent{event}); !errors.Is(err, eventstore.ErrInvalidEvent) {
+			t.Fatalf("overlay metadata %s err=%v", field, err)
+		}
+	}
+	opaqueCollector := NewMutationCollector(eventstore.EventFactory{})
+	if err := opaqueCollector.AddPluginKV(eventstore.PluginKVUpdate{
+		ExtensionID: "plugin", KeyHMAC: []byte("key"), KeyCiphertext: []byte("$t-ciphertext"),
+		KeyNonce: []byte("nonce"), ValueCiphertext: []byte("$t-ciphertext"), ValueNonce: []byte("nonce"),
+		EncryptionKeyID: "key", ValueSize: 2,
+	}); err != nil {
+		t.Fatalf("opaque ciphertext rejected: %v", err)
+	}
 	if err := collector.AddStream(stream, 0, []eventstore.NewEvent{callbackEvent("group.changed", `{}`)}); err != nil {
 		t.Fatal(err)
 	}
