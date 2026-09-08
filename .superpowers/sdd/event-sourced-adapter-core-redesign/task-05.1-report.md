@@ -370,3 +370,15 @@ ok   github.com/PaienNate/pineutil/evsocket/v2
 go test ./dice -run 'TestOnebotRuntime(DiagnosticsRetainCompletedTransportDrops|PriorityEventCoalescesAndPreemptsInbound)' -count=1
 ok   Scardice-core/dice
 ```
+
+## Round 17 fixes
+
+- Safe-pool close removal is now identity-checked (`deleteIf`), so a delayed close cannot delete a replacement wrapper that reuses the same UUID.
+- EventConnect is treated as a lifecycle control in bounded admission and can evict ordinary queued events alongside Disconnect; a full-queue regression verifies both Connect and Disconnect survive while ordinary events are dropped.
+
+### Round 17 GREEN evidence
+
+```text
+go test ./evsocket/v2 -run 'Test(WrapperEventQueueIsBounded|SafePoolDeleteIfPreservesReplacement|TransportDropBaselineCapturesPreConnectDrops|ServerWrapperUnregistersAfterTerminalCallbacksDrain)' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+```

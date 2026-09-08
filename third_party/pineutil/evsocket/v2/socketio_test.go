@@ -58,6 +58,7 @@ func TestWrapperEventQueueIsBounded(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	disconnected := make(chan struct{})
+	connected := make(chan struct{})
 	manager.On(EventMessage, func(*EventPayload) {
 		select {
 		case <-entered:
@@ -69,6 +70,9 @@ func TestWrapperEventQueueIsBounded(t *testing.T) {
 	manager.On(EventDisconnect, func(*EventPayload) {
 		close(disconnected)
 	})
+	manager.On(EventConnect, func(*EventPayload) {
+		close(connected)
+	})
 	wrapper.dispatchMessage(1, []byte("first"))
 	select {
 	case <-entered:
@@ -79,11 +83,12 @@ func TestWrapperEventQueueIsBounded(t *testing.T) {
 		wrapper.dispatchMessage(1, []byte("queued"))
 	}
 	wrapper.dispatchEvent(EventDisconnect, nil, nil)
-	if wrapper.DroppedEventCount() != 1 {
-		t.Fatalf("dropped events after terminal admission = %d", wrapper.DroppedEventCount())
+	wrapper.dispatchEvent(EventConnect, nil, nil)
+	if wrapper.DroppedEventCount() != 2 {
+		t.Fatalf("dropped events after lifecycle admission = %d", wrapper.DroppedEventCount())
 	}
 	wrapper.dispatchMessage(1, []byte("overflow"))
-	if wrapper.DroppedEventCount() != 2 {
+	if wrapper.DroppedEventCount() != 3 {
 		t.Fatalf("dropped events after overflow = %d", wrapper.DroppedEventCount())
 	}
 	close(release)
@@ -94,6 +99,11 @@ func TestWrapperEventQueueIsBounded(t *testing.T) {
 	case <-disconnected:
 	case <-time.After(time.Second):
 		t.Fatal("terminal disconnect event was dropped")
+	}
+	select {
+	case <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("terminal connect event was dropped")
 	}
 }
 
@@ -166,5 +176,18 @@ func TestTransportDropBaselineCapturesPreConnectDrops(t *testing.T) {
 	(&transportHandler{wrapper: wrapper}).OnOpen(nil)
 	if got := wrapper.TransportDropBaseline(); got != 3 {
 		t.Fatalf("transport drop baseline = %d, want 3", got)
+	}
+}
+
+func TestSafePoolDeleteIfPreservesReplacement(t *testing.T) {
+	pool := safePool{}
+	oldWrapper := &WebsocketWrapper{UUID: "same"}
+	newWrapper := &WebsocketWrapper{UUID: "same"}
+	pool.set(oldWrapper)
+	pool.set(newWrapper)
+	pool.deleteIf("same", oldWrapper)
+	got, err := pool.get("same")
+	if err != nil || got != newWrapper {
+		t.Fatalf("replacement wrapper was deleted: got=%p err=%v", got, err)
 	}
 }

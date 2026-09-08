@@ -182,6 +182,14 @@ func (p *safePool) delete(key string) {
 	delete(p.conn, key)
 }
 
+func (p *safePool) deleteIf(key string, expected *WebsocketWrapper) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if current := p.conn[key]; current == expected {
+		delete(p.conn, key)
+	}
+}
+
 func (p *safePool) all() map[string]*WebsocketWrapper {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -563,7 +571,7 @@ func isTerminalWrapperEvent(event eventEnvelope) bool {
 		return false
 	}
 	switch event.payload.Name {
-	case EventDisconnect, EventError, EventClose:
+	case EventDisconnect, EventError, EventClose, EventConnect:
 		return true
 	default:
 		return false
@@ -581,9 +589,9 @@ func (kws *WebsocketWrapper) enqueueEvent(event eventEnvelope) {
 					break
 				}
 			}
-			if replaced < 0 && event.payload.Name == EventDisconnect {
+			if replaced < 0 && (event.payload.Name == EventDisconnect || event.payload.Name == EventConnect) {
 				for i, queued := range kws.eventQueue {
-					if queued.payload == nil || queued.payload.Name != EventDisconnect {
+					if queued.payload == nil || (queued.payload.Name != EventDisconnect && queued.payload.Name != EventConnect) {
 						replaced = i
 						break
 					}
@@ -1086,7 +1094,7 @@ func (kws *WebsocketWrapper) finalizeTransportClose(socket *gws.Conn, err error)
 	}
 	kws.stopClientHeartbeat(socket)
 	kws.transport.Store(nil)
-	kws.manager.pool.delete(kws.GetUUID())
+	kws.manager.pool.deleteIf(kws.GetUUID(), kws)
 	kws.stateMu.Lock()
 	if kws.clientState != clientTransportStateConnecting {
 		kws.clientState = clientTransportStateDisconnected
