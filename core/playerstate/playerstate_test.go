@@ -77,7 +77,7 @@ func TestMultipleCharactersHaveIndependentGlobalStreams(t *testing.T) {
 	if CharacterStream("dice-1", "user-1", "character-1") == CharacterStream("dice-1", "user-1", "character-2") { t.Fatal("characters share one global stream") }
 }
 func TestModerationIsSeparateAndRebuildable(t *testing.T) {
-	events := []ModerationEvent{NewModerationCreatedV1("dice-1", "group-1", "QQ:1", -10, 4), NewModerationScoreChangedV1(9, "digest-1"), NewModerationRankChangedV1(-30)}
+	events := []ModerationEvent{NewModerationCreatedV1("dice-1", "group-1", "QQ:1", -10, 4), NewModerationScoreChangedV1(9, strings.Repeat("a", 64)), NewModerationRankChangedV1(-30)}
 	state, err := ReplayModeration(events)
 	if err != nil || state.Rank != -30 || state.Score != 9 || state.SubjectID != "QQ:1" { t.Fatalf("moderation = %#v, err = %v", state, err) }
 	payload, err := MarshalModerationEvents(events)
@@ -90,6 +90,12 @@ func TestModerationSubjectsHaveIndependentStreamsAndGroupPurgePrefix(t *testing.
 	firstState, err := ReplayModeration([]ModerationEvent{first}); if err != nil || firstState.SubjectID != "QQ:1" { t.Fatalf("first moderation = %#v, err = %v", firstState, err) }
 	secondState, err := ReplayModeration([]ModerationEvent{second}); if err != nil || secondState.SubjectID != "QQ:2" { t.Fatalf("second moderation = %#v, err = %v", secondState, err) }
 	plan, err := PlanDelete("dice-1", "group-1", []Scope{ScopeModeration}); if err != nil || len(plan.StreamPrefixes) != 1 || plan.StreamPrefixes[0] != ModerationStreamPrefix("dice-1", "group-1") { t.Fatalf("moderation purge = %#v, err = %v", plan, err) }
+}
+func TestModerationReasonDigestIsOpaque(t *testing.T) {
+	legacy := NewModerationScoreChangedV1(1, "legacy plaintext reason")
+	if _, err := MarshalModerationEvent(legacy); err != ErrInvalidState { t.Fatalf("legacy reason accepted: %v", err) }
+	valid := NewModerationScoreChangedV1(1, strings.Repeat("a", 64))
+	if _, err := MarshalModerationEvent(valid); err != nil { t.Fatalf("digest rejected: %v", err) }
 }
 
 func TestTypedNilEventIsRejected(t *testing.T) {

@@ -2,6 +2,7 @@ package playerstate
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -192,7 +193,7 @@ func (e ModerationCreatedV1) moderationValidate()error{if err:=validateIdentity(
 type ModerationScoreChangedV1 struct { Score int64 `json:"score"`; ReasonDigest string `json:"reasonDigest,omitempty"` }
 func NewModerationScoreChangedV1(score int64,reasonDigest string) ModerationScoreChangedV1{return ModerationScoreChangedV1{score,reasonDigest}}
 func (ModerationScoreChangedV1) EventType() EventType{return EventModerationScoreChanged}
-func (e ModerationScoreChangedV1) moderationValidate()error{return validateOptionalText(e.ReasonDigest)}
+func (e ModerationScoreChangedV1) moderationValidate()error{return validateDigest(e.ReasonDigest)}
 func (e ModerationScoreChangedV1) moderationApply(s *ModerationState)error{if s.Version==0||s.Deleted{return ErrInvalidState};s.Score=e.Score;s.ReasonDigest=e.ReasonDigest;return nil}
 
 type ModerationRankChangedV1 struct { Rank int `json:"rank"` }
@@ -209,6 +210,7 @@ func (ModerationDeletedV1) moderationValidate()error{return nil}
 func (ModerationDeletedV1) moderationApply(s *ModerationState)error{if s.Version==0||s.Deleted{return ErrInvalidState};s.Deleted=true;return nil}
 
 func validateText(value string) error { if strings.TrimSpace(value)=="" || len(value)>eventstore.MaxEventPayloadBytes{return ErrInvalidState}; return nil }
+func validateDigest(value string) error { if value=="" { return nil }; if len(value)!=64 { return ErrInvalidState }; if _,err:=hex.DecodeString(value); err!=nil { return ErrInvalidState }; return nil }
 func validateOptionalText(value string) error { if value!="" { return validateText(value) }; return nil }
 func validateIdentity(parts ...string) error { for _,part:=range parts {if strings.TrimSpace(part)==""||len(part)>MaxIdentityPartBytes{return ErrInvalidIdentity}};if len(canonical(parts...))>MaxStreamAggregateIDBytes{return ErrInvalidIdentity};return nil }
 func marshalTyped(event any, typ EventType, validate func() error) ([]byte,error) { if event==nil{return nil,ErrInvalidEvent};if err:=validate();err!=nil{return nil,err};payload,err:=json.Marshal(event);if err!=nil{return nil,err};if len(payload)>eventstore.MaxEventPayloadBytes{return nil,&eventstore.OversizeError{Bound:"playerstate event payload",Limit:eventstore.MaxEventPayloadBytes,Actual:len(payload)}};return payload,nil }
