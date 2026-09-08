@@ -47,10 +47,16 @@ type projectionReader interface { ReadProjectionRow(context.Context, string, str
 // ReadProjected returns a value copy from the active immutable projection. It
 // never returns a pointer to store-owned or cached mutable state.
 func ReadProjected(ctx context.Context, store any, diceID, groupID string) (State, error) {
+	if err := ValidateIdentity(diceID, groupID); err != nil { return State{}, err }
 	reader, ok := store.(projectionReader); if !ok || reader == nil { return State{}, ErrRepositoryUnavailable }
-	row, err := reader.ReadProjectionRow(ctx, GroupProjectionName, GroupStream(diceID, groupID).AggregateID)
+	stream := GroupStream(diceID, groupID)
+	row, err := reader.ReadProjectionRow(ctx, GroupProjectionName, stream.AggregateID)
 	if err != nil { return State{}, err }
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(row.Payload, &object); err != nil || object == nil { return State{}, ErrInvalidState }
 	var state State
 	if err := json.Unmarshal(row.Payload, &state); err != nil { return State{}, ErrInvalidState }
+	if err := ValidateState(state); err != nil { return State{}, err }
+	if canonicalAggregateID(state.DiceID, state.GroupID) != stream.AggregateID { return State{}, ErrInvalidState }
 	return state.Clone(), nil
 }

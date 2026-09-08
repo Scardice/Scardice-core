@@ -73,8 +73,8 @@ var ErrInvalidCommand = errors.New("groupstate: invalid command")
 var ErrStaleVersion = errors.New("groupstate: stale expected version")
 
 func Decide(state State, command Command) (Decision, error) {
+	if command.ExpectedVersionSet && command.ExpectedVersion != state.Version { return Decision{}, ErrStaleVersion }
 	kind := command.Kind; if kind == "" { kind = command.Type }
-	if state.Version > 0 && command.ExpectedVersionSet && command.ExpectedVersion != state.Version { return Decision{}, ErrStaleVersion }
 	if kind == CommandCreate {
 		if state.Version != 0 { return Decision{}, ErrInvalidState }
 		if ValidateIdentity(command.DiceID, command.GroupID) != nil { return Decision{}, ErrInvalidCommand }

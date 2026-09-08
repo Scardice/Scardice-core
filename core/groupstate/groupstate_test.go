@@ -6,9 +6,14 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"Scardice-core/eventstore"
 )
+type fakeProjectionReader struct{ payload []byte }
+func (r fakeProjectionReader) ReadProjectionRow(context.Context, string, string) (eventstore.ProjectionRow, error) {
+	return eventstore.ProjectionRow{Payload: append([]byte(nil), r.payload...)}, nil
+}
 
 func TestGroupEventsReplayIntoRecordWithoutAttrsOrModeration(t *testing.T) {
 	events := []TypedEvent{
@@ -84,12 +89,29 @@ func TestStreamIdentityAndDeletePrefixesAreUnambiguous(t *testing.T) {
 	if AttrsStream(maxPart, maxPart).AggregateID != "" || GroupUserAttrsStream(maxPart, maxPart, maxPart).AggregateID != "" {
 		t.Fatal("attrs stream exceeded aggregate ID bound")
 	}
+	if _, err := ApplyEnvelope(
+		State{Version: 1, DiceID: maxPart, GroupID: maxPart},
+		eventstore.Envelope{
+			Stream: eventstore.StreamID{AggregateType: GroupAggregateType, AggregateID: canonicalAggregateID(maxPart, maxPart)},
+			StreamVersion: 2, EventType: string(EventGroupNameChanged), SchemaVersion: GroupEventSchemaVersion,
+			Payload: []byte(`{"groupName":"x"}`),
+		},
+	); !errors.Is(err, ErrInvalidIdentity) {
+		t.Fatalf("oversized envelope identity error = %v", err)
+	}
 	if _, err := PlanDelete(State{Version: 1, DiceID: "dice-1", GroupID: "group-1"}, DeleteRequest{DiceID: "dice-2", GroupID: "group-1"}); !errors.Is(err, ErrInvalidIdentity) {
 		t.Fatalf("mismatched delete selector error = %v", err)
 	}
 	plan, err := PlanDelete(State{}, DeleteRequest{DiceID: "dice-1", GroupID: "group-1", Scopes: []Scope{ScopePlayers, ScopeAttrs}})
 	if err != nil || len(plan.StreamPrefixes) != 2 || plan.StreamPrefixes[0].AggregateType == plan.StreamPrefixes[1].AggregateType {
 		t.Fatalf("typed delete prefixes = %#v, err = %v", plan.StreamPrefixes, err)
+	}
+	conflictingMetadata := eventstore.Metadata{
+		EventID: "event", CommandID: "command", CorrelationID: "correlation",
+		OccurredAt: time.Unix(1, 0), OccurredAtUnixNanoUTC: 2, OccurredAtUnixNanoSet: true,
+	}
+	if _, err := NewEvent(NewGroupNameChangedV1("name"), conflictingMetadata); !errors.Is(err, eventstore.ErrInvalidMetadata) {
+		t.Fatalf("conflicting metadata error = %v", err)
 	}
 }
 
@@ -127,6 +149,29 @@ func TestTypedEventRejectsNilOversizeAndInvalidPrivilege(t *testing.T) {
 	}}); !errors.Is(err, ErrInvalidIdentity) {
 		t.Fatalf("malformed replay identifier error = %v", err)
 	}
+	for _, payload := range []string{
+		`{"groupName":"ok","attrs":{"valueMap":{"x":1}}}`,
+		`{"groupName":"ok"} {}`,
+	} {
+		if _, err := DecodeTypedEvent(EventGroupNameChanged, []byte(payload)); !errors.Is(err, ErrInvalidEvent) {
+			t.Fatalf("unknown/trailing payload error = %v", err)
+		}
+	}
+	for _, malformed := range []struct {
+		eventType EventType
+		payload   string
+	}{
+		{EventGroupWelcomeChanged, `{"enabled":null}`},
+		{EventGroupActivationChanged, `{"diceId":"dice-1","active":null,"exists":true}`},
+		{EventGroupHelpChanged, `{"helpPackages":["core",null]}`},
+	} {
+		if _, err := ReplayEnvelopes([]eventstore.Envelope{{
+			Stream: GroupStream("dice-1", "group-1"), StreamVersion: 1,
+			EventType: string(malformed.eventType), SchemaVersion: GroupEventSchemaVersion, Payload: []byte(malformed.payload),
+		}}); !errors.Is(err, ErrInvalidEvent) {
+			t.Fatalf("malformed null field %s error = %v", malformed.eventType, err)
+		}
+	}
 	state, err := Reduce(State{}, NewGroupCreatedV1("dice-1", "group-1", "", 0))
 	if err != nil {
 		t.Fatal(err)
@@ -153,6 +198,17 @@ func TestCompatibilityViewDoesNotExposeMutableAuthoritativeMaps(t *testing.T) {
 		t.Fatal("compatibility view mutated authoritative state")
 	}
 }
+func TestReadProjectedRejectsCorruptRows(t *testing.T) {
+	for _, payload := range []string{
+		"null",
+		`{"version":1}`,
+		`{"version":1,"diceId":"dice-1","groupId":"group-1","deleted":true,"active":true}`,
+	} {
+		if _, err := ReadProjected(context.Background(), fakeProjectionReader{payload: []byte(payload)}, "dice-1", "group-1"); !errors.Is(err, ErrInvalidState) && !errors.Is(err, ErrDeletedGroup) {
+			t.Fatalf("corrupt projection %s error = %v", payload, err)
+		}
+	}
+}
 func TestGroupDecideEmitsTypedRecordFacts(t *testing.T) {
 	decision, err := Decide(State{}, Command{Kind: CommandCreate, DiceID: "dice-1", GroupID: "group-1", GroupName: "name", EnteredAt: 1})
 	if err != nil {
@@ -163,6 +219,9 @@ func TestGroupDecideEmitsTypedRecordFacts(t *testing.T) {
 	}
 	if _, ok := decision.Events[0].(GroupCreatedV1); !ok {
 		t.Fatalf("create event type = %T", decision.Events[0])
+	}
+	if _, err := Decide(State{}, Command{Kind: CommandCreate, DiceID: "dice-1", GroupID: "group-1", ExpectedVersion: 1, ExpectedVersionSet: true}); !errors.Is(err, ErrStaleVersion) {
+		t.Fatalf("empty-state stale version error = %v", err)
 	}
 }
 func TestDecideWelcomeUsesExplicitEnabledField(t *testing.T) {

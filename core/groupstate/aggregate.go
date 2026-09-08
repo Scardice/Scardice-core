@@ -109,7 +109,8 @@ func ApplyEnvelope(state State, envelope eventstore.Envelope) (State, error) {
 	if err != nil { return State{}, err }
 	next, err := Reduce(state, event)
 	if err != nil { return State{}, err }
-	if next.DiceID == "" || next.GroupID == "" || canonicalAggregateID(next.DiceID, next.GroupID) != envelope.Stream.AggregateID { return State{}, ErrInvalidState }
+	if ValidateIdentity(next.DiceID, next.GroupID) != nil { return State{}, ErrInvalidIdentity }
+	if len(envelope.Stream.AggregateID) > MaxStreamAggregateIDBytes || canonicalAggregateID(next.DiceID, next.GroupID) != envelope.Stream.AggregateID { return State{}, ErrInvalidState }
 	return next, nil
 }
 
@@ -171,7 +172,11 @@ func GroupStream(diceID, groupID string) eventstore.StreamID {
 	return boundedStream(GroupAggregateType, diceID, groupID)
 }
 func eventMetadataValid(metadata eventstore.Metadata) bool {
-	return metadata.EventID != "" && metadata.CommandID != "" && metadata.CorrelationID != "" && (!metadata.OccurredAt.IsZero() || metadata.OccurredAtUnixNanoSet || metadata.OccurredAtUnixNanoUTC != 0)
+	return metadata.EventID != "" && metadata.CommandID != "" && metadata.CorrelationID != "" && (!metadata.OccurredAt.IsZero() || metadata.OccurredAtUnixNanoSet || metadata.OccurredAtUnixNanoUTC != 0) && !eventMetadataTimestampConflict(metadata)
+}
+func eventMetadataTimestampConflict(metadata eventstore.Metadata) bool {
+	if metadata.OccurredAt.IsZero() || (!metadata.OccurredAtUnixNanoSet && metadata.OccurredAtUnixNanoUTC == 0) { return false }
+	return metadata.OccurredAt.UTC().UnixNano() != metadata.OccurredAtUnixNanoUTC
 }
 
 // NewEvent serializes one typed Group fact into the domain-neutral eventstore

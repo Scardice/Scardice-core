@@ -1,13 +1,14 @@
 package groupstate
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 
 	"Scardice-core/eventstore"
-
 )
 // EventType is the closed set of durable group-record facts. Attribute and
 // moderation values deliberately have no event type here: they have separate
@@ -241,13 +242,27 @@ func MarshalTypedEvents(events []TypedEvent) ([]byte, error) {
 	for _, event := range events { payload, err := MarshalTypedEvent(event); if err != nil { return nil, err }; encoded = append(encoded, payload) }
 	return json.Marshal(encoded)
 }
+func containsJSONNull(value any) bool {
+	switch item := value.(type) {
+	case nil:
+		return true
+	case []any:
+		for _, child := range item { if containsJSONNull(child) { return true } }
+	case map[string]any:
+		for _, child := range item { if containsJSONNull(child) { return true } }
+	}
+	return false
+}
 func DecodeTypedEvent(eventType EventType, payload []byte) (TypedEvent, error) {
 	if len(payload) > MaxGroupEventPayloadBytes {
 		return nil, &eventstore.OversizeError{Bound: "group event payload", Limit: MaxGroupEventPayloadBytes, Actual: len(payload)}
 	}
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(payload, &object); err != nil || object == nil {
-		return nil, fmt.Errorf("%w: payload must be a JSON object", ErrInvalidEvent)
+	var value any
+	if err := json.Unmarshal(payload, &value); err != nil {
+		return nil, fmt.Errorf("%w: invalid JSON payload", ErrInvalidEvent)
+	}
+	if _, ok := value.(map[string]any); !ok || containsJSONNull(value) {
+		return nil, fmt.Errorf("%w: payload must be a non-null JSON object", ErrInvalidEvent)
 	}
 	var event TypedEvent
 	switch eventType {
@@ -265,7 +280,10 @@ func DecodeTypedEvent(eventType EventType, payload []byte) (TypedEvent, error) {
 	case EventGroupRecordDeleted: event = &GroupRecordDeletedV1{}
 	default: return nil, fmt.Errorf("%w: %s", ErrInvalidEvent, eventType)
 	}
-	if err := json.Unmarshal(payload, event); err != nil { return nil, fmt.Errorf("%w: %v", ErrInvalidEvent, err) }
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(event); err != nil { return nil, fmt.Errorf("%w: %v", ErrInvalidEvent, err) }
+	if err := decoder.Decode(&struct{}{}); err != io.EOF { return nil, fmt.Errorf("%w: trailing JSON payload", ErrInvalidEvent) }
 	if err := event.validate(); err != nil { return nil, err }
 	return event, nil
 }
