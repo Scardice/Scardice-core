@@ -388,6 +388,26 @@ func TestOnebotRuntimeInboundRetryIsBounded(t *testing.T) {
 	}
 }
 
+func TestOnebotRuntimePriorityEventEvictsInboundAdmission(t *testing.T) {
+	runtime := newOnebotRuntime(OnebotConfig{}, nil)
+	for range cap(runtime.events) {
+		runtime.events <- onebotRuntimeEvent{kind: "inbound"}
+	}
+	if !runtime.enqueue(onebotRuntimeEvent{kind: "disconnect"}) {
+		t.Fatal("priority disconnect was not admitted")
+	}
+	found := false
+	for range cap(runtime.events) {
+		if event := <-runtime.events; event.kind == "disconnect" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("priority disconnect missing after inbound eviction")
+	}
+}
+
 func TestOnebotRuntimeDiagnosticsExposeIngressCounters(t *testing.T) {
 	runtime := newOnebotRuntime(OnebotConfig{}, nil)
 	runtime.inboundRejected.Store(3)

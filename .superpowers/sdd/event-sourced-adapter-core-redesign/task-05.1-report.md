@@ -264,3 +264,22 @@ ok   Scardice-core/dice
 go test ./dice -run 'TestOnebotRuntimeDiagnostics(RetainCompletedTransportDrops|ExposeIngressCounters)' -count=1
 ok   Scardice-core/dice
 ```
+
+## Round 10 fixes
+
+- Oversized transport frames now fail fast: after incrementing the bounded drop counter, `OnMessage` sends WebSocket close code 1009 (`message too large`) when a socket is available, while retaining a nil-safe path for deterministic unit tests. The frame is never copied or admitted to the wrapper queue.
+
+### Round 10 GREEN evidence
+
+```text
+go test ./evsocket/v2 -run 'TestTransportMessageIsBoundBeforeCopy' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+```
+
+
+- Runtime terminal admission now evicts one queued inbound event when the bounded runtime channel is full, preserving disconnect/connect/auth-failed control delivery without blocking callbacks. Oversized transport close behavior is nil-safe and bounded.
+
+```text
+go test ./dice -run 'TestOnebotRuntime(PriorityEventEvictsInboundAdmission|Diagnostics(RetainCompletedTransportDrops|ExposeIngressCounters))' -count=1
+ok   Scardice-core/dice
+```

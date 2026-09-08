@@ -1131,6 +1131,9 @@ func (h *transportHandler) OnMessage(socket *gws.Conn, message *gws.Message) {
 	h.wrapper.refreshClientDeadline(socket)
 	if len(message.Bytes()) > maxWrapperMessageBytes {
 		h.wrapper.droppedEvents.Add(1)
+		if socket != nil {
+			_ = socket.WriteClose(1009, []byte("message too large"))
+		}
 		return
 	}
 	data := append([]byte(nil), message.Bytes()...)

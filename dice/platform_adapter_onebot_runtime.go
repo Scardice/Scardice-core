@@ -746,17 +746,47 @@ func (r *onebotRuntime) installCallbacks(manager *socketio.SocketInstance, token
 	})
 }
 
+func isOnebotPriorityEvent(kind string) bool {
+	switch kind {
+	case "connect", "disconnect", "auth_failed":
+		return true
+	default:
+		return false
+	}
+}
 
 func (r *onebotRuntime) enqueue(event onebotRuntimeEvent) bool {
 	select {
 	case r.events <- event:
 		return true
 	default:
-		if event.kind == "inbound" {
-			r.inboundBackpressure.Add(1)
-		}
-		return false
 	}
+	if isOnebotPriorityEvent(event.kind) {
+		select {
+		case queued := <-r.events:
+			if queued.kind != "inbound" {
+				select {
+				case r.events <- queued:
+				default:
+					return false
+				}
+				return false
+			}
+			r.inboundBackpressure.Add(1)
+			select {
+			case r.events <- event:
+				return true
+			default:
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	if event.kind == "inbound" {
+		r.inboundBackpressure.Add(1)
+	}
+	return false
 }
 
 func (r *onebotRuntime) startClient(manager *socketio.SocketInstance, token string, ctx context.Context) error {
