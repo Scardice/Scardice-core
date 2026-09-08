@@ -134,6 +134,9 @@ func TestTypedEventRejectsNilOversizeAndInvalidPrivilege(t *testing.T) {
 	if _, err := Reduce(state, NewGroupPrivilegeChangedV1("user-1", 101)); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("invalid privilege error = %v", err)
 	}
+	if _, err := Reduce(state, NewGroupExtensionChangedV1(oversizedID, true)); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("invalid direct reducer identifier error = %v", err)
+	}
 }
 
 func TestCompatibilityViewDoesNotExposeMutableAuthoritativeMaps(t *testing.T) {

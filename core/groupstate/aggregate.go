@@ -80,6 +80,7 @@ func (s *State) ensureMaps() {
 // never mutated, which keeps compatibility reads from becoming authorities.
 func Reduce(state State, event TypedEvent) (State, error) {
 	if isNilTypedEvent(event) || !event.EventType().Valid() { return State{}, ErrInvalidEvent }
+	if err := event.validate(); err != nil { return State{}, ErrInvalidState }
 	next := state.Clone()
 	if next.Version > 0 { next.ensureMaps() }
 	if err := event.apply(&next); err != nil { return State{}, err }
