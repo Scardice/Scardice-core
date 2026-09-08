@@ -592,7 +592,11 @@ func (s *GORMStore) ClaimInbox(ctx context.Context, req InboxClaimRequest) (leas
 	}
 	expiredObserved := len(expiredRows) > 0
 	for i := range expiredRows {
-		if err = task5ScrubInbox(tx, &expiredRows[i], now, true); err != nil {
+		if req.TerminalizeExpired {
+			if err = task5TerminalizeExpiredInbox(tx, &expiredRows[i], now); err != nil {
+				return InboxLease{}, err
+			}
+		} else if err = task5ScrubInbox(tx, &expiredRows[i], now, true); err != nil {
 			return InboxLease{}, err
 		}
 	}
@@ -620,7 +624,11 @@ func (s *GORMStore) ClaimInbox(ctx context.Context, req InboxClaimRequest) (leas
 		return InboxLease{}, commitObservedScrub(errors.New("eventstore: claim inbox query failed"))
 	}
 	if row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
-		if len(row.PayloadCiphertext) > 0 || len(row.PayloadNonce) > 0 {
+		if req.TerminalizeExpired {
+			if err = task5TerminalizeExpiredInbox(tx, &row, now); err != nil {
+				return InboxLease{}, err
+			}
+		} else if len(row.PayloadCiphertext) > 0 || len(row.PayloadNonce) > 0 {
 			if err = task5ScrubInbox(tx, &row, now, true); err != nil {
 				return InboxLease{}, err
 			}
@@ -631,6 +639,15 @@ func (s *GORMStore) ClaimInbox(ctx context.Context, req InboxClaimRequest) (leas
 		return InboxLease{}, ErrPayloadExpired
 	}
 	if err = s.task5ValidatePayload(ctx, tx, "inbox/v1", row.InboxID, row.EndpointID, task5PayloadVersion(row.PayloadVersion), row.PayloadCiphertext, row.PayloadNonce, row.EncryptionKeyID, false); err != nil {
+		if req.QuarantinePayloadErrors && errors.Is(err, ErrAuthenticationFailed) {
+			if quarantineErr := task5QuarantineInboxPayload(tx, &row, now, "payload-authentication-failed"); quarantineErr != nil {
+				return InboxLease{}, quarantineErr
+			}
+			if commitErr := task5Commit(tx); commitErr != nil {
+				return InboxLease{}, commitErr
+			}
+			return InboxLease{}, err
+		}
 		return InboxLease{}, commitObservedScrub(err)
 	}
 	if row.LeaseEpoch >= maxPersistedVersion {
@@ -700,7 +717,8 @@ func (s *GORMStore) UpdateInbox(ctx context.Context, update InboxUpdate) (result
 		return CommitResult{}, errors.New("eventstore: load inbox failed")
 	}
 	now := s.task5Now()
-	if row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
+	allowExpiredAmbiguous := task5AllowsExpiredAmbiguous(row, update)
+	if row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) && !allowExpiredAmbiguous {
 		if err = task5ScrubInbox(tx, &row, now, false); err != nil {
 			return CommitResult{}, err
 		}
@@ -728,7 +746,7 @@ func (s *GORMStore) UpdateInbox(ctx context.Context, update InboxUpdate) (result
 		return CommitResult{}, ErrStaleLease
 	}
 	if update.Status != InboxStatusPending || row.Status != InboxStatusPending {
-		if !task5LeaseMatches(row.LeaseOwner, row.LeaseEpoch, row.AttemptID, update.LeaseOwner, update.LeaseEpoch, update.AttemptID) || !task5LeaseActive(row.LeaseExpiry, now) {
+		if !allowExpiredAmbiguous && (!task5LeaseMatches(row.LeaseOwner, row.LeaseEpoch, row.AttemptID, update.LeaseOwner, update.LeaseEpoch, update.AttemptID) || !task5LeaseActive(row.LeaseExpiry, now)) {
 			return CommitResult{}, ErrStaleLease
 		}
 	}
@@ -765,13 +783,17 @@ func (s *GORMStore) UpdateInbox(ctx context.Context, update InboxUpdate) (result
 	if !update.ResolutionAt.IsZero() {
 		row.ResolutionAt = task5Ptr(update.ResolutionAt)
 	}
-	if update.Status == InboxStatusFailed || update.Status == InboxStatusConfirmedConsumed || update.Status == InboxStatusSkipped {
+	if update.Status == InboxStatusFailed || update.Status == InboxStatusConfirmedConsumed || update.Status == InboxStatusSkipped || update.Status == InboxStatusAmbiguous {
 		row.LeaseExpiry = nil
 		row.PayloadCiphertext = nil
 		row.PayloadNonce = nil
 		row.ResolutionAt = task5Ptr(now)
 	}
-	q = tx.Model(&inboxMessageRow{}).Where("inbox_id = ? AND version = ? AND (lease_expiry IS NULL OR lease_expiry > ?)", row.InboxID, update.ExpectedVersion, now).Updates(inboxMap(row))
+	updateQuery := tx.Model(&inboxMessageRow{}).Where("inbox_id = ? AND version = ?", row.InboxID, update.ExpectedVersion)
+	if !allowExpiredAmbiguous {
+		updateQuery = updateQuery.Where("(lease_expiry IS NULL OR lease_expiry > ?)", now)
+	}
+	q = updateQuery.Updates(inboxMap(row))
 	if q.Error != nil {
 		return CommitResult{}, errors.New("eventstore: update inbox failed")
 	}
@@ -1972,6 +1994,13 @@ func task5LeaseMatches(owner string, epoch uint64, attempt, wantOwner string, wa
 func task5LeaseActive(expiry *time.Time, now time.Time) bool {
 	return expiry != nil && expiry.After(now)
 }
+func task5AllowsExpiredAmbiguous(row inboxMessageRow, update InboxUpdate) bool {
+	return row.Status == InboxStatusCallbackStarted &&
+		update.Status == InboxStatusAmbiguous &&
+		update.ExpectedVersion == row.Version &&
+		task5LeaseMatches(row.LeaseOwner, row.LeaseEpoch, row.AttemptID, update.LeaseOwner, update.LeaseEpoch, update.AttemptID)
+}
+
 func participantConflict(table string) error {
 	return &ParticipantConflictError{Conflicts: []ParticipantConflict{{Table: table, Key: "<redacted>"}}}
 }
@@ -1997,6 +2026,41 @@ func task5ScrubInbox(tx *gorm.DB, row *inboxMessageRow, now time.Time, terminal 
 	}
 	return nil
 }
+func task5FinalizeInboxPayload(tx *gorm.DB, row *inboxMessageRow, now time.Time, status, reason string) error {
+	row.Status = status
+	row.LeaseOwner = ""
+	row.LeaseEpoch = 0
+	row.LeaseExpiry = nil
+	row.AttemptID = ""
+	row.PayloadCiphertext = nil
+	row.PayloadNonce = nil
+	row.CompletedAt = task5Ptr(now)
+	row.ResolutionReason = reason
+	row.ResolutionAt = task5Ptr(now)
+	version, err := nextVersion(row.Version)
+	if err != nil {
+		return err
+	}
+	row.Version = version
+	q := tx.Model(&inboxMessageRow{}).Where("inbox_id = ? AND version = ?", row.InboxID, version-1).Updates(inboxMap(*row))
+	if q.Error != nil || q.RowsAffected != 1 {
+		return ErrStaleLease
+	}
+	return nil
+}
+
+func task5QuarantineInboxPayload(tx *gorm.DB, row *inboxMessageRow, now time.Time, reason string) error {
+	return task5FinalizeInboxPayload(tx, row, now, InboxStatusFailed, reason)
+}
+
+func task5TerminalizeExpiredInbox(tx *gorm.DB, row *inboxMessageRow, now time.Time) error {
+	status := InboxStatusAmbiguous
+	if row.Status == InboxStatusPending || row.Status == InboxStatusLeased {
+		status = InboxStatusFailed
+	}
+	return task5FinalizeInboxPayload(tx, row, now, status, "payload-expired")
+}
+
 func task5ScrubOutbox(tx *gorm.DB, row *outboxEffectRow, now time.Time) error {
 	nonIdempotentDispatch := row.Status == OutboxStatusDispatched && row.DispatchedAt != nil && row.RiskClass != RiskProviderIdempotent
 	if len(row.PayloadCiphertext) == 0 && len(row.PayloadNonce) == 0 && !nonIdempotentDispatch {
@@ -2792,7 +2856,8 @@ func (s *GORMStore) applyTask5InboxParticipants(ctx context.Context, tx *gorm.DB
 			return ErrParticipantFailure
 		} else {
 			now := s.task5Now()
-			if inboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
+			allowExpiredAmbiguous := task5AllowsExpiredAmbiguous(row, update)
+			if inboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) && !allowExpiredAmbiguous {
 				return &task5ExpiredPayloadError{table: tableInboxMessages, id: row.InboxID, now: now}
 			}
 			hasOpaqueReplay := len(update.PayloadCiphertext) > 0 || len(update.PayloadNonce) > 0 || len(update.ContentDigest) > 0
@@ -2856,7 +2921,7 @@ func (s *GORMStore) applyTask5InboxParticipants(ctx context.Context, tx *gorm.DB
 				return ErrInvalidTransition
 			}
 			if update.Status != InboxStatusPending || row.Status != InboxStatusPending {
-				if !task5LeaseMatches(row.LeaseOwner, row.LeaseEpoch, row.AttemptID, update.LeaseOwner, update.LeaseEpoch, update.AttemptID) || !task5LeaseActive(row.LeaseExpiry, now) {
+				if !allowExpiredAmbiguous && (!task5LeaseMatches(row.LeaseOwner, row.LeaseEpoch, row.AttemptID, update.LeaseOwner, update.LeaseEpoch, update.AttemptID) || !task5LeaseActive(row.LeaseExpiry, now)) {
 					return ErrStaleLease
 				}
 			}
@@ -2916,14 +2981,18 @@ func (s *GORMStore) applyTask5InboxParticipants(ctx context.Context, tx *gorm.DB
 				}
 				row.PayloadExpiresAt = task5Ptr(expiry)
 			}
-			if update.Status == InboxStatusFailed || update.Status == InboxStatusConfirmedConsumed || update.Status == InboxStatusSkipped {
+			if update.Status == InboxStatusFailed || update.Status == InboxStatusConfirmedConsumed || update.Status == InboxStatusSkipped || update.Status == InboxStatusAmbiguous {
 				row.LeaseExpiry = nil
 				row.PayloadCiphertext = nil
 				row.PayloadNonce = nil
 				row.ResolutionAt = task5Ptr(now)
 			}
 			row.Version = version
-			q = tx.Model(&inboxMessageRow{}).Where("inbox_id = ? AND version = ? AND (lease_expiry IS NULL OR lease_expiry > ?)", row.InboxID, update.ExpectedVersion, now).Updates(inboxParticipantMap(row))
+			updateQuery := tx.Model(&inboxMessageRow{}).Where("inbox_id = ? AND version = ?", row.InboxID, update.ExpectedVersion)
+			if !allowExpiredAmbiguous {
+				updateQuery = updateQuery.Where("(lease_expiry IS NULL OR lease_expiry > ?)", now)
+			}
+			q = updateQuery.Updates(inboxParticipantMap(row))
 			if q.Error != nil || q.RowsAffected != 1 {
 				return ErrStaleLease
 			}

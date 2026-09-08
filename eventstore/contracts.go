@@ -805,10 +805,13 @@ type ConflictError struct{ Conflicts []StreamConflict }
 func (e *ConflictError) Error() string { return ErrConflict.Error() }
 func (e *ConflictError) Unwrap() error { return ErrConflict }
 
-// InboxClaimRequest and InboxLease are domain-neutral lease contracts.
+// InboxClaimRequest and InboxLease are domain-neutral lease contracts. Callback
+// workers may request terminal quarantine for invalid payloads and expirations.
 type InboxClaimRequest struct {
-	WorkerID      string
-	LeaseDuration time.Duration
+	WorkerID                string
+	LeaseDuration           time.Duration
+	QuarantinePayloadErrors bool
+	TerminalizeExpired      bool
 }
 type InboxLease struct{ Update InboxUpdate }
 

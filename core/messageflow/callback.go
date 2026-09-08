@@ -167,7 +167,7 @@ func (s *CallbackService) ProcessOne(ctx context.Context) (summary CallbackResul
 	}
 	for attempt := 1; attempt <= CallbackMaxPreMarkerAttempts; attempt++ {
 		summary.Attempts = attempt
-		lease, claimErr := s.inbox.ClaimInbox(ctx, eventstore.InboxClaimRequest{WorkerID: s.workerID, LeaseDuration: s.lease})
+		lease, claimErr := s.inbox.ClaimInbox(ctx, eventstore.InboxClaimRequest{WorkerID: s.workerID, LeaseDuration: s.lease, QuarantinePayloadErrors: true, TerminalizeExpired: true})
 		if claimErr != nil {
 			return summary, claimErr
 		}
@@ -460,7 +460,36 @@ func validWorkflowID(value string) bool {
 	return true
 }
 
-func containsOverlayBytes(value []byte) bool { return bytes.Contains(value, []byte("$t")) }
+func containsOverlayBytes(value []byte) bool {
+	if bytes.Contains(value, []byte("$t")) {
+		return true
+	}
+	var decoded any
+	if err := json.Unmarshal(value, &decoded); err != nil {
+		return false
+	}
+	return containsOverlayValue(decoded)
+}
+
+func containsOverlayValue(value any) bool {
+	switch item := value.(type) {
+	case string:
+		return strings.Contains(item, "$t")
+	case []any:
+		for _, child := range item {
+			if containsOverlayValue(child) {
+				return true
+			}
+		}
+	case map[string]any:
+		for key, child := range item {
+			if strings.Contains(key, "$t") || containsOverlayValue(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // MutationCollector is the sole callback mutation output. It owns copied
 // event/effect/KV bytes and rejects duplicate participants before commit.

@@ -195,6 +195,112 @@ func TestTask4DirectInboxUpdateRejectsCompletedAt(t *testing.T) {
 	}
 }
 
+func TestTask4CallbackClaimQuarantinesAuthenticationFailure(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	firstCipher, firstNonce, keyID, err := a6Seal(ctx, source, "inbox/v1", "task4-auth-failure", "endpoint", 1, []byte("first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcceptInbox(ctx, InboxUpdate{
+		InboxID: "task4-auth-failure", EndpointID: "endpoint", ProviderEventKey: "task4-auth-failure-provider",
+		LaneHMAC: []byte("task4-auth-failure-lane"), Status: InboxStatusPending,
+		PayloadCiphertext: firstCipher, PayloadNonce: firstNonce, PayloadEncryptionKeyID: keyID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	secondCipher, secondNonce, secondKeyID, err := a6Seal(ctx, source, "inbox/v1", "task4-auth-success", "endpoint", 1, []byte("second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcceptInbox(ctx, InboxUpdate{
+		InboxID: "task4-auth-success", EndpointID: "endpoint", ProviderEventKey: "task4-auth-success-provider",
+		LaneHMAC: []byte("task4-auth-failure-lane"), Status: InboxStatusPending,
+		PayloadCiphertext: secondCipher, PayloadNonce: secondNonce, PayloadEncryptionKeyID: secondKeyID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var firstRow inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", "task4-auth-failure").First(&firstRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	firstRow.PayloadCiphertext[0] ^= 1
+	if err := db.GORM().Model(&inboxMessageRow{}).Where("inbox_id = ?", firstRow.InboxID).Update("payload_ciphertext", firstRow.PayloadCiphertext).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "task4-callback-worker", QuarantinePayloadErrors: true, TerminalizeExpired: true}); !errors.Is(err, ErrAuthenticationFailed) {
+		t.Fatalf("callback claim authentication err=%v", err)
+	}
+	if err := db.GORM().Where("inbox_id = ?", firstRow.InboxID).First(&firstRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if firstRow.Status != InboxStatusFailed || firstRow.Version != 2 || len(firstRow.PayloadCiphertext) != 0 || firstRow.CompletedAt == nil {
+		t.Fatalf("tampered callback row=%#v", firstRow)
+	}
+	lease, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "task4-callback-worker", QuarantinePayloadErrors: true, TerminalizeExpired: true})
+	if err != nil || lease.Update.InboxID != "task4-auth-success" {
+		t.Fatalf("lane remained blocked lease=%#v err=%v", lease, err)
+	}
+}
+
+func TestTask4CallbackClaimTerminalizesExpiredPendingPayload(t *testing.T) {
+	store, db, clock := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	expiredAt := clock.Now().Add(-time.Minute)
+	futureAt := clock.Now().Add(time.Hour)
+	rows := []inboxMessageRow{
+		{
+			InboxID: "task4-expired-pending", EndpointID: "endpoint", ProviderEventKey: "expired-pending-provider",
+			LaneHMAC: []byte("task4-expired-lane"), OrderingSequence: 1, Status: InboxStatusPending,
+			Version: 1, PayloadVersion: 1, PayloadCiphertext: []byte("expired"), PayloadNonce: []byte("nonce"), EncryptionKeyID: "key",
+			PayloadExpiresAt: &expiredAt,
+		},
+		{
+			InboxID: "task4-after-expired", EndpointID: "endpoint", ProviderEventKey: "after-expired-provider",
+			LaneHMAC: []byte("task4-expired-lane"), OrderingSequence: 2, Status: InboxStatusPending,
+			Version: 1, PayloadVersion: 1, PayloadCiphertext: []byte("next"), PayloadNonce: []byte("nonce"), EncryptionKeyID: "key",
+			PayloadExpiresAt: &futureAt,
+		},
+	}
+	if err := db.GORM().Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "task4-expiry-worker", QuarantinePayloadErrors: true, TerminalizeExpired: true})
+	if err != nil || lease.Update.InboxID != "task4-after-expired" {
+		t.Fatalf("expired pending row blocked lane lease=%#v err=%v", lease, err)
+	}
+	var expiredRow inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", "task4-expired-pending").First(&expiredRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if expiredRow.Status != InboxStatusFailed || expiredRow.Version != 2 || len(expiredRow.PayloadCiphertext) != 0 || expiredRow.CompletedAt == nil {
+		t.Fatalf("expired pending row=%#v", expiredRow)
+	}
+}
+func TestTask4UOWAmbiguousCASAllowsExpiredLease(t *testing.T) {
+	store, db, clock := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	inbox, lease := task4PrepareStartedInbox(t, store, ctx, "task4-uow-expired-lease")
+	clock.now = clock.now.Add(2 * time.Minute)
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{{
+		InboxID: inbox.InboxID, ExpectedVersion: lease.Update.Version + 1, Version: lease.Update.Version + 2,
+		Status: InboxStatusAmbiguous, LeaseOwner: lease.Update.LeaseOwner, LeaseEpoch: lease.Update.LeaseEpoch,
+		AttemptID: lease.Update.AttemptID, LeaseExpiresAt: lease.Update.LeaseExpiresAt,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	var row inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != InboxStatusAmbiguous || len(row.PayloadCiphertext) != 0 || row.LeaseExpiry != nil {
+		t.Fatalf("expired UOW ambiguity row=%#v", row)
+	}
+}
+
 func task4PrepareStartedInbox(t *testing.T, store *GORMStore, ctx context.Context, id string) (InboxUpdate, InboxLease) {
 	t.Helper()
 	inbox := task5Inbox(id, id+"-provider", id+"-lane")

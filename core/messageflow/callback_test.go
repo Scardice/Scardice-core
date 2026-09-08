@@ -5,11 +5,11 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"Scardice-core/adapterapi"
 	"Scardice-core/core/groupstate"
 	"Scardice-core/core/playerstate"
-
 	"Scardice-core/eventstore"
 )
 
@@ -194,6 +194,9 @@ func TestCallbackCollectorRejectsOverlayAndDuplicateStreams(t *testing.T) {
 	stream := eventstore.StreamID{AggregateType: "group", AggregateID: "group-1"}
 	if err := collector.AddStream(stream, 0, []eventstore.NewEvent{callbackEvent("group.changed", `{"value":"$t"}`)}); !errors.Is(err, eventstore.ErrInvalidEvent) {
 		t.Fatalf("overlay event err=%v", err)
+	}
+	if err := collector.AddStream(eventstore.StreamID{AggregateType: "group", AggregateID: "escaped"}, 0, []eventstore.NewEvent{callbackEvent("group.changed", `{"nested":["\u0024t"]}`)}); !errors.Is(err, eventstore.ErrInvalidEvent) {
+		t.Fatalf("escaped overlay event err=%v", err)
 	}
 	if err := collector.AddStream(stream, 0, []eventstore.NewEvent{callbackEvent("group.changed", `{}`)}); err != nil {
 		t.Fatal(err)
@@ -386,4 +389,63 @@ func TestCallbackSQLiteMarkerAndTerminalCommit(t *testing.T) {
 	if _, err := store.ClaimInbox(ctx, eventstore.InboxClaimRequest{WorkerID: "second-worker"}); !errors.Is(err, eventstore.ErrNotFound) {
 		t.Fatalf("terminal inbox was claimable: %v", err)
 	}
+}
+
+type callbackFixedClock struct {
+	now time.Time
+}
+
+func (c *callbackFixedClock) Now() time.Time { return c.now }
+
+func TestCallbackSQLiteExpiredLeaseStillMarksAmbiguous(t *testing.T) {
+	ctx := context.Background()
+	clock := &callbackFixedClock{now: time.Unix(100, 0).UTC()}
+	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "callback-expired.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := eventstore.NewStore(db, eventstore.WithClock(clock), eventstore.WithPayloadCodec(callbackTestCodec{}))
+	inbox := eventstore.InboxUpdate{
+		InboxID: "sqlite-expired-inbox", EndpointID: "endpoint", ProviderEventKey: "expired-provider",
+		LaneHMAC: []byte("expired-lane"), Status: eventstore.InboxStatusPending,
+		PayloadCiphertext: []byte("payload"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key",
+		ContentDigest: []byte{1}, ContentDigestKeyID: "digest",
+	}
+	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
+		t.Fatal(err)
+	}
+	host := &callbackTestHost{fn: func(context.Context, CallbackRequest, *playerstate.LocalOverlay, *MutationCollector) (CallbackResult, error) {
+		clock.now = clock.now.Add(2 * time.Minute)
+		return CallbackResult{}, errors.New("callback failed after lease expiry")
+	}}
+	service, err := NewCallbackService(CallbackConfig{
+		Inbox: store, Store: store, Codec: callbackTestCodec{}, Resolver: callbackTestResolver{},
+		Group: groupstate.NewRepository(store), Player: playerstate.NewRepository(store), Host: host, WorkerID: "worker",
+		LeaseDuration: time.Minute, Clock: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ProcessOne(ctx); err == nil {
+		t.Fatal("expired callback unexpectedly succeeded")
+	}
+	var row eventstoreInboxRowForTest
+	if err := db.GORM().Table("inbox_messages").Where("inbox_id = ?", inbox.InboxID).Scan(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != eventstore.InboxStatusAmbiguous || len(row.PayloadCiphertext) != 0 || host.calls != 1 {
+		t.Fatalf("expired callback row=%#v host calls=%d", row, host.calls)
+	}
+	if _, err := service.ProcessOne(ctx); !errors.Is(err, eventstore.ErrNotFound) {
+		t.Fatalf("ambiguous callback rerun err=%v", err)
+	}
+	if host.calls != 1 {
+		t.Fatalf("ambiguous callback host calls=%d", host.calls)
+	}
+}
+
+type eventstoreInboxRowForTest struct {
+	Status            string
+	PayloadCiphertext []byte
 }
