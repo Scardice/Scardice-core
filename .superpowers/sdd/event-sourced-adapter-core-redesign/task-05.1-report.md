@@ -327,3 +327,18 @@ ok   github.com/PaienNate/pineutil/evsocket/v2
 go test ./dice -run 'TestOnebotRuntime(PriorityEventCoalescesAndPreemptsInbound|DiagnosticsExposeIngressCounters|InboundRetryIsBounded)' -count=1
 ok   Scardice-core/dice
 ```
+
+## Round 14 fixes
+
+- Server wrapper registration is now lifecycle-bounded: failed upgrades and failed reader starts unregister immediately, and terminal server transport closure unregisters the wrapper after terminal events are queued. Client wrappers remain registered for reuse/reconnect.
+- A churn regression registers and unregisters 128 server wrappers and verifies the instance registry returns to zero.
+
+### Round 14 GREEN evidence
+
+```text
+go test ./evsocket/v2 -run 'Test(ServerWrapperRegistryUnregistersChurn|WrapperEventQueueIsBounded|ShutdownWaitDrainsQueuedWrapperEvents|TransportMessageIsBoundBeforeCopy)' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+
+go test ./dice -run 'TestOnebotRuntime(PriorityEventCoalescesAndPreemptsInbound|Diagnostics(RetainCompletedTransportDrops|ExposeIngressCounters)|InboundRetryIsBounded)' -count=1
+ok   Scardice-core/dice
+```

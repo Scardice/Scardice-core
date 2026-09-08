@@ -220,6 +220,15 @@ func (sm *SocketInstance) registerWrapper(wrapper *WebsocketWrapper) {
 	sm.wrappersMu.Unlock()
 }
 
+func (sm *SocketInstance) unregisterWrapper(wrapper *WebsocketWrapper) {
+	if wrapper == nil {
+		return
+	}
+	sm.wrappersMu.Lock()
+	delete(sm.wrappers, wrapper)
+	sm.wrappersMu.Unlock()
+}
+
 // IsShutdown 返回实例是否已经关闭。
 func (sm *SocketInstance) IsShutdown() bool {
 	return sm.isShutdown.Load()
@@ -373,9 +382,11 @@ func (sm *SocketInstance) New() http.HandlerFunc {
 		upgrader := gws.NewUpgrader(handler, cloneServerOption(sm.ServerOptions))
 		socket, err := upgrader.Upgrade(w, r)
 		if err != nil {
+			sm.unregisterWrapper(wrapper)
 			return
 		}
 		if !sm.startReader(socket) {
+			sm.unregisterWrapper(wrapper)
 			_ = socket.WriteClose(1001, []byte("socket instance is shutting down"))
 		}
 	}
@@ -1068,6 +1079,9 @@ func (kws *WebsocketWrapper) finalizeTransportClose(socket *gws.Conn, err error)
 	kws.dispatchEvent(EventDisconnect, nil, err)
 	if err != nil {
 		kws.dispatchEvent(EventError, nil, err)
+	}
+	if !kws.clientMode {
+		kws.manager.unregisterWrapper(kws)
 	}
 	return true
 }

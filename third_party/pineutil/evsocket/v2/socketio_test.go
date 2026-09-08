@@ -125,3 +125,17 @@ func TestConnectReadySignalIsIdempotentAcrossReconnects(t *testing.T) {
 		t.Fatal("connect readiness was not signaled")
 	}
 }
+
+func TestServerWrapperRegistryUnregistersChurn(t *testing.T) {
+	manager := NewSocketInstance()
+	for range 128 {
+		wrapper := newServerWrapper(manager)
+		manager.registerWrapper(wrapper)
+		manager.unregisterWrapper(wrapper)
+	}
+	manager.wrappersMu.Lock()
+	defer manager.wrappersMu.Unlock()
+	if len(manager.wrappers) != 0 {
+		t.Fatalf("registered wrappers after churn = %d", len(manager.wrappers))
+	}
+}
