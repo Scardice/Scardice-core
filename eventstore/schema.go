@@ -198,6 +198,7 @@ type inboxMessageRow struct {
 	EndpointID string `gorm:"type:varchar(255);not null;uniqueIndex:ux_inbox_endpoint_provider,priority:1"`
 	ProviderEventKey string `gorm:"column:provider_event_id;type:varchar(255);not null;uniqueIndex:ux_inbox_endpoint_provider,priority:2"`
 	LaneHMAC []byte `gorm:"size:32;not null;uniqueIndex:ux_inbox_lane_sequence,priority:1"`
+	SubjectKey []byte `gorm:"size:32;index:ix_inbox_subject_key"`
 	OrderingSequence uint64 `gorm:"not null;uniqueIndex:ux_inbox_lane_sequence,priority:2"`
 	Status string `gorm:"type:varchar(32);not null;index:ix_inbox_status_lease,priority:1"`
 	Version uint64 `gorm:"not null"`
@@ -226,6 +227,7 @@ type outboxEffectRow struct {
 	Version uint64 `gorm:"not null"`
 	EndpointID string `gorm:"type:varchar(255);not null"`
 	LaneHMAC []byte `gorm:"size:32;not null;uniqueIndex:ux_outbox_lane_sequence,priority:1"`
+	SubjectKey []byte `gorm:"size:32;index:ix_outbox_subject_key"`
 	OrderingSequence uint64 `gorm:"not null;uniqueIndex:ux_outbox_lane_sequence,priority:2"`
 	EffectClass string `gorm:"type:varchar(64);not null"`
 	RiskClass string `gorm:"type:varchar(64);not null"`
@@ -316,6 +318,19 @@ type storeReadinessRow struct {
 	CompletedAt *time.Time
 }
 
+type privacyAuditRow struct {
+	AuditID string `gorm:"type:varchar(64);primaryKey"`
+	OperationDigest []byte `gorm:"size:32;not null;index"`
+	ScopesDigest []byte `gorm:"size:32;not null"`
+	RequestDigest []byte `gorm:"size:32;not null"`
+	GroupRecord int64 `gorm:"not null"`
+	Players int64 `gorm:"not null"`
+	Attrs int64 `gorm:"not null"`
+	Status string `gorm:"type:varchar(32);not null"`
+	CreatedAt time.Time `gorm:"not null"`
+}
+func (privacyAuditRow) TableName() string { return "privacy_purge_audit" }
+
 func (storeReadinessRow) TableName() string { return tableStoreReadiness }
 
 func schemaModels() []any {
@@ -323,8 +338,7 @@ func schemaModels() []any {
 		&domainEventRow{}, &eventGlobalSequenceRow{}, &aggregateHeadRow{},
 		&projectionControlRow{}, &projectionReadModelRow{}, &operationRow{},
 		&operationArtifactRow{}, &laneHeadRow{}, &inboxMessageRow{},
-		&outboxEffectRow{}, &adapterSecretRow{}, &pluginKVRow{},
-		&subjectFenceRow{}, &storeReadinessRow{},
+		&subjectFenceRow{}, &storeReadinessRow{}, &privacyAuditRow{},
 	}
 }
 
@@ -333,7 +347,6 @@ func schemaModelsWithoutOperationArtifacts() []any {
 		&domainEventRow{}, &eventGlobalSequenceRow{}, &aggregateHeadRow{},
 		&projectionControlRow{}, &projectionReadModelRow{}, &operationRow{},
 		&laneHeadRow{}, &inboxMessageRow{}, &outboxEffectRow{},
-		&adapterSecretRow{}, &pluginKVRow{}, &subjectFenceRow{},
-		&storeReadinessRow{},
+		&adapterSecretRow{}, &pluginKVRow{}, &subjectFenceRow{}, &storeReadinessRow{}, &privacyAuditRow{},
 	}
 }

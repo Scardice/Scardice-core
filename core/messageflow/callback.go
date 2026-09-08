@@ -250,6 +250,7 @@ func (s *CallbackService) ProcessOne(ctx context.Context) (summary CallbackResul
 		}
 		overlay := playerstate.NewLocalOverlay()
 		collector := NewMutationCollector(s.factory)
+		collector.subjectKey = append([]byte(nil), lease.Update.SubjectKey...)
 		callbackResult, hostErr := invokeCallbackHost(ctx, s.host, request, overlay, collector)
 		if hostErr != nil {
 			return s.afterMarkerFailure(summary, hostErr, lease.Update, startedVersion)
@@ -662,6 +663,7 @@ type MutationCollector struct {
 	streams  map[eventstore.StreamID]eventstore.StreamAppend
 	plugins  map[string]eventstore.PluginKVUpdate
 	effects  map[string]eventstore.NewEffect
+	subjectKey []byte
 	workflow *eventstore.StreamAppend
 }
 
@@ -785,6 +787,7 @@ func (c *MutationCollector) AddEffect(effect eventstore.NewEffect) error {
 		return eventstore.ErrDuplicateParticipant
 	}
 	effect.LaneHMAC = append([]byte(nil), effect.LaneHMAC...)
+	if len(effect.SubjectKey) == 0 && len(c.subjectKey) == 32 { effect.SubjectKey = append([]byte(nil), c.subjectKey...) }
 	effect.PayloadCiphertext = append([]byte(nil), effect.PayloadCiphertext...)
 	effect.PayloadNonce = append([]byte(nil), effect.PayloadNonce...)
 	effect.ContentDigest = append([]byte(nil), effect.ContentDigest...)

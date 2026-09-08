@@ -599,9 +599,8 @@ func migrateSchema(db *gorm.DB) error {
 	if db.Dialector.Name() == "sqlite" {
 		models = schemaModelsWithoutOperationArtifacts()
 	}
-	if err := db.AutoMigrate(models...); err != nil {
-		return err
-	}
+	if err := db.AutoMigrate(models...); err != nil { return err }
+	if err := db.AutoMigrate(&privacyAuditRow{}); err != nil { return err }
 	if db.Dialector.Name() == "sqlite" {
 		if err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS ux_operation_artifacts_artifact_id ON operation_artifacts(artifact_id)").Error; err != nil {
 			return err

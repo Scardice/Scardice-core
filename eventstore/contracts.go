@@ -118,6 +118,8 @@ type Metadata struct {
 	OccurredAt            time.Time
 	OccurredAtUnixNanoUTC int64
 	OccurredAtUnixNanoSet bool
+	// SubjectKey is an opaque HMAC binding an event to a privacy subject.
+	SubjectKey             []byte
 }
 
 // StreamID identifies one aggregate stream without importing an aggregate type.
@@ -406,6 +408,8 @@ type InboxUpdate struct {
 	EndpointID        string
 	ProviderEventKey  string
 	LaneHMAC          []byte
+	// SubjectKey is an opaque HMAC binding the message to a purge subject.
+	SubjectKey []byte
 	OrderingSequence  uint64
 	Status            string
 	LeaseOwner        string
@@ -435,7 +439,6 @@ type InboxUpdate struct {
 	AllowExpiredDedupe bool
 }
 
-
 // NewEffect is an outbound intent; its payload must be encrypted by persistence.
 type NewEffect struct {
 	EffectID          string
@@ -443,6 +446,8 @@ type NewEffect struct {
 	Version           uint64
 	EndpointID        string
 	LaneHMAC          []byte
+	// SubjectKey is an opaque HMAC binding the effect to a purge subject.
+	SubjectKey []byte
 	OrderingSequence  uint64
 	EffectType        string
 	RiskClass         string
@@ -756,6 +761,7 @@ type OutboxResolutionRequest struct {
 	PrincipalID     string
 	Reason          string
 }
+
 // OutboxQuarantineRequest settles a dispatcher-owned lease after a durable
 // validation or persistence failure. Implementations must CAS all lease fields.
 type OutboxQuarantineRequest struct {
@@ -910,6 +916,61 @@ type RebuildResult struct {
 	TerminalPosition uint64
 	Digest           EventChecksum
 }
+// PrivacyCounts are exact counts of durable event-store records selected by a
+// controlled group purge. Counts are intentionally split by scope.
+type PrivacyCounts struct {
+	GroupRecord int64 `json:"groupRecord"`
+	Players     int64 `json:"players"`
+	Attrs       int64 `json:"attrs"`
+}
+
+type PrivacyDryRunRequest struct {
+	GroupID string
+	ActiveDiceIDs []string
+	DiceIDs []string
+	Scopes  []string
+}
+
+type PrivacyDryRunResult struct {
+	Version         uint64
+	Digest          []byte
+	DigestKeyID      string
+	SubjectKey       []byte
+	Counts           PrivacyCounts
+	ActiveDiceIDs    []string
+	ExistingDiceIDs  []string
+	TargetHighWater  uint64
+	Uncovered        []string
+}
+type PrivacyOperationContext struct {
+	GroupID string   `json:"groupId"`
+	DiceIDs []string `json:"diceIds"`
+	Scopes  []string `json:"scopes"`
+	Cursor  string   `json:"cursor,omitempty"`
+	Phase   string   `json:"phase"`
+	Counts  PrivacyCounts `json:"counts"`
+	ActiveDiceIDs []string `json:"activeDiceIds,omitempty"`
+	TargetHighWater uint64 `json:"targetHighWater,omitempty"`
+	ConfirmationDigest []byte `json:"confirmationDigest,omitempty"`
+	ConfirmationVersion uint64 `json:"confirmationVersion,omitempty"`
+}
+
+type PrivacyBatchRequest struct {
+	OperationID string
+	GroupID     string
+	Phase       string
+	DiceIDs     []string
+	Scopes      []string
+	Cursor      string
+	Limit       int
+}
+
+type PrivacyBatchResult struct {
+	NextCursor string
+	Deleted    PrivacyCounts
+	Done       bool
+}
+
 type PrivacyPurgeRequest struct {
 	OperationID string
 	Scope       string
@@ -955,6 +1016,31 @@ type OperationRepository interface {
 type ReadinessRepository interface {
 	GetReadiness(context.Context) (Readiness, error)
 	SetReadiness(context.Context, Readiness) error
+}
+// PrivacyHistoryRepository is the narrow durable seam used by the privacy
+// orchestration service. Selectors and cursors are interpreted only by the
+// implementation; callers never receive database handles.
+type PrivacyHistoryRepository interface {
+	PrivacyDryRun(context.Context, PrivacyDryRunRequest) (PrivacyDryRunResult, error)
+	PrivacyCreateOperation(context.Context, string, []byte, PrivacyOperationContext) error
+	PrivacyLoadOperation(context.Context, string) (OperationView, PrivacyOperationContext, error)
+	PrivacyUpdateOperation(context.Context, string, uint64, PrivacyOperationContext, string) (uint64, error)
+	PrivacyFence(context.Context, []byte, string, string) (uint64, error)
+	PrivacyFenceVersion(context.Context, []byte, string) (uint64, error)
+	PrivacyUnfence(context.Context, []byte, string, uint64, string) error
+	PrivacyResolvePending(context.Context, []byte, string) error
+	PrivacyDeleteBatch(context.Context, PrivacyBatchRequest) (PrivacyBatchResult, error)
+	PrivacyRebuildPublish(context.Context, uint64) error
+	PrivacyScrubOperation(context.Context, string, uint64) error
+}
+
+// PrivacyFinalizer atomically marks an operation complete and scrubs its
+// private context after the subject fence has been released.
+type PrivacyFinalizer interface {
+	PrivacyFinalizeOperation(context.Context, string, uint64, string) (uint64, error)
+}
+type PrivacySubjectVerifier interface {
+	PrivacyVerifyOperationSubject(context.Context, string, string) error
 }
 type ProjectionRebuilder interface {
 	Rebuild(context.Context, RebuildRequest) (RebuildResult, error)

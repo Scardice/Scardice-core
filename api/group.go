@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 
+	"Scardice-core/core/privacypurge"
 	"Scardice-core/dice"
 	"Scardice-core/dice/service"
 )
@@ -31,14 +33,19 @@ type groupLocalDataDeleteRequest struct {
 	Scopes      []string `json:"scopes"      yaml:"scopes"`
 	AllowActive bool     `json:"allowActive" yaml:"allowActive"`
 	DryRun      bool     `json:"dryRun"      yaml:"dryRun"`
+	ConfirmDigest string `json:"confirmDigest,omitempty" yaml:"confirmDigest,omitempty"`
+	ConfirmVersion uint64 `json:"confirmVersion,omitempty" yaml:"confirmVersion,omitempty"`
+	OperationID string `json:"operationId,omitempty" yaml:"operationId,omitempty"`
+	Resume bool `json:"resume,omitempty" yaml:"resume,omitempty"`
+	Phase string `json:"phase,omitempty" yaml:"phase,omitempty"`
 }
 
 type groupLocalDataDeleteDeleted struct {
 	GroupRecord       bool  `json:"groupRecord"`
 	GroupInfoRows     int64 `json:"groupInfoRows"`
-	PlayerRows        int64 `json:"playerRows"`
-	GroupAttrRows     int64 `json:"groupAttrRows"`
-	GroupUserAttrRows int64 `json:"groupUserAttrRows"`
+	PlayerRows        int64  `json:"playerRows"`
+	GroupAttrRows     int64  `json:"groupAttrRows"`
+	GroupUserAttrRows int64  `json:"groupUserAttrRows"`
 }
 
 type groupLocalDataDeleteResult struct {
@@ -49,6 +56,11 @@ type groupLocalDataDeleteResult struct {
 	ActiveDiceIDs   []string                    `json:"activeDiceIds"`
 	ExistingDiceIDs []string                    `json:"existingDiceIds"`
 	Deleted         groupLocalDataDeleteDeleted `json:"deleted"`
+	Operation       string                      `json:"operation,omitempty"`
+	Status          string                      `json:"status,omitempty"`
+	Phase           string                      `json:"phase,omitempty"`
+	Confirmation    map[string]interface{}      `json:"confirmation,omitempty"`
+	UncoveredData   []string                    `json:"uncoveredData,omitempty"`
 }
 
 func normalizeGroupLocalDataDeleteScopes(scopes []string) ([]string, error) {
@@ -224,62 +236,36 @@ func groupLocalDataDelete(c echo.Context) error {
 		})
 	}
 
-	if v.DryRun {
-		return Success(&c, Response{
-			"data": data,
-		})
+	durable := privacyPurgeService()
+	if durable == nil {
+		if !v.DryRun {
+			return Error(&c, "持久化隐私删除服务不可用，已拒绝执行", Response{"data": data})
+		}
+		return Success(&c, Response{"data": data, "uncoveredData": []string{"eventstore 未配置"}})
 	}
-
-	if groupLocalDataScopeSelected(scopes, groupLocalDataScopeGroupRecord) {
-		if myDice.DirtyGroups != nil {
-			myDice.DirtyGroups.Delete(v.GroupID)
-		}
-		myDice.ImSession.ServiceAtNew.Delete(v.GroupID)
-		if dm != nil {
-			dm.GroupNameCache.Delete(v.GroupID)
-		}
-
-		rows, err := service.GroupInfoDelete(myDice.DBOperator, v.GroupID)
-		if err != nil {
-			return Error(&c, fmt.Sprintf("删除群组本地记录失败: %v", err), Response{
-				"data": data,
-			})
-		}
-		data.Deleted.GroupInfoRows = rows
-		data.Deleted.GroupRecord = existedInMemory || rows > 0
+	diceIDs := append([]string(nil), existingDiceIDs...)
+	for _, id := range activeDiceIDs {
+		found := false
+		for _, current := range diceIDs { if current == id { found = true; break } }
+		if !found { diceIDs = append(diceIDs, id) }
 	}
-
-	if groupLocalDataScopeSelected(scopes, groupLocalDataScopePlayers) {
-		if group != nil {
-			group.Players = new(dice.SyncMap[string, *dice.GroupPlayerInfo])
-		}
-		rows, err := service.GroupPlayerInfoDeleteByGroup(myDice.DBOperator, v.GroupID)
-		if err != nil {
-			return Error(&c, fmt.Sprintf("删除群组玩家本地记录失败: %v", err), Response{
-				"data": data,
-			})
-		}
-		data.Deleted.PlayerRows = rows
+	confirmation, decodeErr := hex.DecodeString(strings.TrimSpace(v.ConfirmDigest))
+	if decodeErr != nil { confirmation = nil }
+	purgeReq := privacypurge.Request{GroupID: v.GroupID, DiceIDs: diceIDs, Scopes: scopes, ActiveDiceIDs: activeDiceIDs, AllowActive: v.AllowActive, DryRun: v.DryRun, ConfirmationDigest: confirmation, ConfirmationVersion: v.ConfirmVersion, OperationID: v.OperationID, Resume: v.Resume}
+	var purgeResult privacypurge.Result
+	if v.DryRun { purgeResult, err = durable.DryRun(c.Request().Context(), purgeReq) } else { purgeResult, err = durable.Confirm(c.Request().Context(), purgeReq) }
+	data.Operation, data.Status, data.Phase = purgeResult.OperationID, purgeResult.Status, purgeResult.Phase
+	data.Confirmation = map[string]interface{}{"digest": fmt.Sprintf("%x", purgeResult.ConfirmationDigest), "version": purgeResult.ConfirmationVersion}
+	data.UncoveredData = append([]string(nil), purgeResult.Uncovered...)
+	data.Deleted.GroupRecord = purgeResult.Deleted.GroupRecord > 0
+	data.Deleted.PlayerRows = purgeResult.Deleted.Players
+	data.Deleted.GroupAttrRows = purgeResult.Deleted.Attrs
+	if err != nil {
+		return Error(&c, err.Error(), Response{"data": data})
 	}
-
-	if groupLocalDataScopeSelected(scopes, groupLocalDataScopeAttrs) {
-		groupAttrRows, groupUserAttrRows, err := service.AttrsDeleteByGroupScope(myDice.DBOperator, v.GroupID)
-		if err != nil {
-			return Error(&c, fmt.Sprintf("删除群组属性本地记录失败: %v", err), Response{
-				"data": data,
-			})
-		}
-		if myDice.AttrsManager != nil {
-			myDice.AttrsManager.DeleteCachedGroupData(v.GroupID, true, true)
-		}
-		data.Deleted.GroupAttrRows = groupAttrRows
-		data.Deleted.GroupUserAttrRows = groupUserAttrRows
-	}
-
-	return Success(&c, Response{
-		"data": data,
-	})
+	return Success(&c, Response{"data": data})
 }
+
 
 func groupQuit(c echo.Context) error {
 	if !doAuth(c) {

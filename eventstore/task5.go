@@ -397,6 +397,7 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 	if err := s.requireReady(ctx); err != nil {
 		return CommitResult{}, err
 	}
+	if len(update.SubjectKey) != 0 && len(update.SubjectKey) != 32 { return CommitResult{}, ErrInvalidMetadata }
 	if update.InboxID == "" {
 		update.InboxID, err = s.task5ID()
 		if err != nil {
@@ -447,6 +448,22 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
 		task5Rollback(tx)
 		return CommitResult{}, err
+	}
+	var fencedSubject int64
+	if len(update.SubjectKey) > 0 {
+		if err := tx.Model(&subjectFenceRow{}).Where("subject_key = ? AND scope = ?", update.SubjectKey, "group").Count(&fencedSubject).Error; err != nil {
+			task5Rollback(tx)
+			return CommitResult{}, ErrParticipantFailure
+		}
+	} else {
+		if err := tx.Model(&subjectFenceRow{}).Where("scope = ?", "group").Count(&fencedSubject).Error; err != nil {
+			task5Rollback(tx)
+			return CommitResult{}, ErrParticipantFailure
+		}
+	}
+	if fencedSubject > 0 {
+		task5Rollback(tx)
+		return CommitResult{}, ErrInvalidTransition
 	}
 	defer func() {
 		if err != nil {
@@ -526,7 +543,7 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 	if !errors.Is(q.Error, gorm.ErrRecordNotFound) {
 		return CommitResult{}, errors.New("eventstore: dedupe lookup failed")
 	}
-	insertExpiredReplacement:
+insertExpiredReplacement:
 	if update.PayloadExpiresAt.IsZero() {
 		update.PayloadExpiresAt = now.Add(InboxPayloadTTL)
 	} else if !update.PayloadExpiresAt.After(now) {
@@ -542,6 +559,7 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 		return CommitResult{}, err
 	}
 	row := inboxMessageRow{InboxID: update.InboxID, EndpointID: update.EndpointID, ProviderEventKey: update.ProviderEventKey, LaneHMAC: task5Copy(update.LaneHMAC), OrderingSequence: sequence, Status: InboxStatusPending, Version: 1, PayloadVersion: task5PayloadVersion(update.PayloadVersion), PayloadCiphertext: task5Copy(update.PayloadCiphertext), PayloadNonce: task5Copy(update.PayloadNonce), EncryptionKeyID: payloadKeyID, ContentDigest: task5Copy(update.ContentDigest), ContentDigestKeyID: task5ContentDigestKeyID(update.DigestKeyID, update.ContentDigestKeyID), PayloadExpiresAt: task5Ptr(update.PayloadExpiresAt), WorkflowID: update.WorkflowID}
+	row.SubjectKey = task5Copy(update.SubjectKey)
 	if q = tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row); q.Error != nil {
 		return CommitResult{}, errors.New("eventstore: insert inbox failed")
 	}
@@ -937,6 +955,7 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 	if err := s.requireReady(ctx); err != nil {
 		return CommitResult{}, err
 	}
+	if len(effect.SubjectKey) != 0 && len(effect.SubjectKey) != 32 { return CommitResult{}, ErrInvalidMetadata }
 	if effect.EffectID == "" {
 		effect.EffectID, err = s.task5ID()
 		if err != nil {
@@ -986,6 +1005,22 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
 		task5Rollback(tx)
 		return CommitResult{}, err
+	}
+	var fencedSubject int64
+	if len(effect.SubjectKey) > 0 {
+		if err := tx.Model(&subjectFenceRow{}).Where("subject_key = ? AND scope = ?", effect.SubjectKey, "group").Count(&fencedSubject).Error; err != nil {
+			task5Rollback(tx)
+			return CommitResult{}, ErrParticipantFailure
+		}
+	} else {
+		if err := tx.Model(&subjectFenceRow{}).Where("scope = ?", "group").Count(&fencedSubject).Error; err != nil {
+			task5Rollback(tx)
+			return CommitResult{}, ErrParticipantFailure
+		}
+	}
+	if fencedSubject > 0 {
+		task5Rollback(tx)
+		return CommitResult{}, ErrInvalidTransition
 	}
 	defer func() {
 		if err != nil {
@@ -1713,9 +1748,9 @@ func (s *GORMStore) QuarantineOutbox(ctx context.Context, req OutboxQuarantineRe
 		return result, errors.New("eventstore: load source event for quarantine failed")
 	}
 	var sourceIdentity struct {
-		EffectID string `json:"effectId"`
+		EffectID    string `json:"effectId"`
 		OperationID string `json:"operationId"`
-		EndpointID string `json:"endpointId"`
+		EndpointID  string `json:"endpointId"`
 	}
 	operationID := ""
 	if sourceFound && json.Unmarshal(source.Payload, &sourceIdentity) == nil &&
@@ -1827,12 +1862,12 @@ func (s *GORMStore) QuarantineOutbox(ctx context.Context, req OutboxQuarantineRe
 			principalID = "endpoint-dispatcher"
 		}
 		eventPayload, marshalErr := json.Marshal(struct {
-			EffectID string `json:"effectId"`
+			EffectID    string `json:"effectId"`
 			OperationID string `json:"operationId,omitempty"`
-			EndpointID string `json:"endpointId"`
-			Status string `json:"status"`
-			ErrorCode string `json:"errorCode"`
-			Reason string `json:"reason"`
+			EndpointID  string `json:"endpointId"`
+			Status      string `json:"status"`
+			ErrorCode   string `json:"errorCode"`
+			Reason      string `json:"reason"`
 		}{row.EffectID, operationID, row.EndpointID, quarantineStatus, errorCode, reason})
 		if marshalErr != nil {
 			return result, errors.New("eventstore: quarantine event build failed")
@@ -1865,7 +1900,7 @@ func (s *GORMStore) QuarantineOutbox(ctx context.Context, req OutboxQuarantineRe
 		}
 		if readiness.Mode == "import" {
 			if q = tx.Model(&storeReadinessRow{}).Where("singleton_id = ?", "default").Updates(map[string]any{
-				"terminal_global_position": position,
+				"terminal_global_position":     position,
 				"terminal_projection_position": position,
 			}); q.Error != nil || q.RowsAffected != 1 {
 				return result, errors.New("eventstore: advance readiness terminals failed")
@@ -1878,7 +1913,7 @@ func (s *GORMStore) QuarantineOutbox(ctx context.Context, req OutboxQuarantineRe
 		if len(stable) > 0 {
 			if q = tx.Model(&projectionControlRow{}).Where("singleton_id = ?", "default").Updates(map[string]any{
 				"projector_set_version": projectorSetVersion(stable),
-				"updated_at": now,
+				"updated_at":            now,
 			}); q.Error != nil || q.RowsAffected != 1 {
 				return result, errors.New("eventstore: update projector control failed")
 			}
@@ -2374,6 +2409,7 @@ func inboxUpdateFromRow(row inboxMessageRow) InboxUpdate {
 	return InboxUpdate{
 		InboxID: row.InboxID, ExpectedVersion: row.Version, Version: row.Version,
 		EndpointID: row.EndpointID, ProviderEventKey: row.ProviderEventKey, LaneHMAC: task5Copy(row.LaneHMAC),
+		SubjectKey: task5Copy(row.SubjectKey),
 		OrderingSequence: row.OrderingSequence, Status: row.Status, LeaseOwner: row.LeaseOwner, LeaseEpoch: row.LeaseEpoch,
 		LeaseExpiresAt: valueTime(row.LeaseExpiry), AttemptID: row.AttemptID, PayloadCiphertext: task5Copy(row.PayloadCiphertext),
 		PayloadNonce: task5Copy(row.PayloadNonce), PayloadVersion: task5PayloadVersion(row.PayloadVersion), ContentDigest: task5Copy(row.ContentDigest), DigestKeyID: row.ContentDigestKeyID,
@@ -2388,6 +2424,7 @@ func effectFromRow(row outboxEffectRow) NewEffect {
 	return NewEffect{
 		EffectID: row.EffectID, ExpectedVersion: row.Version, Version: row.Version, EndpointID: row.EndpointID,
 		LaneHMAC: task5Copy(row.LaneHMAC), OrderingSequence: row.OrderingSequence, EffectType: row.EffectClass,
+		SubjectKey: task5Copy(row.SubjectKey),
 		RiskClass: row.RiskClass, Status: row.Status, AttemptID: row.AttemptID, LeaseOwner: row.LeaseOwner,
 		LeaseEpoch: row.LeaseEpoch, LeaseExpiresAt: valueTime(row.LeaseExpiry), DeadlineAt: valueTime(row.DeadlineAt),
 		NextAttemptAt: valueTime(row.NextAttemptAt), DispatchedAt: valueTime(row.DispatchedAt),
@@ -2954,6 +2991,7 @@ func (s *GORMStore) applyTask5InboxParticipants(ctx context.Context, tx *gorm.DB
 				status = InboxStatusPending
 			}
 			row = inboxMessageRow{InboxID: update.InboxID, EndpointID: update.EndpointID, ProviderEventKey: update.ProviderEventKey, LaneHMAC: task5Copy(update.LaneHMAC), OrderingSequence: sequence, Status: status, Version: 1, PayloadVersion: task5PayloadVersion(update.PayloadVersion), LeaseOwner: update.LeaseOwner, LeaseEpoch: update.LeaseEpoch, LeaseExpiry: task5Ptr(update.LeaseExpiresAt), AttemptID: update.AttemptID, CallbackStartedAt: task5Ptr(update.CallbackStartedAt), CompletedAt: task5Ptr(update.CompletedAt), PayloadCiphertext: task5Copy(update.PayloadCiphertext), PayloadNonce: task5Copy(update.PayloadNonce), EncryptionKeyID: payloadKeyID, ContentDigest: task5Copy(update.ContentDigest), ContentDigestKeyID: task5ContentDigestKeyID(update.DigestKeyID, update.ContentDigestKeyID), PayloadExpiresAt: task5Ptr(expiry), WorkflowID: update.WorkflowID, ResolutionPrincipal: update.PrincipalID, ResolutionReason: update.Reason, ResolutionAt: task5Ptr(update.ResolutionAt)}
+			row.SubjectKey = task5Copy(update.SubjectKey)
 			if q = tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row); q.Error != nil {
 				return ErrParticipantFailure
 			}
@@ -3214,6 +3252,7 @@ func (s *GORMStore) applyTask5EffectParticipants(ctx context.Context, tx *gorm.D
 				risk = RiskPreDispatchRetryable
 			}
 			row = outboxEffectRow{EffectID: update.EffectID, Version: 1, PayloadVersion: task5PayloadVersion(update.PayloadVersion), EndpointID: update.EndpointID, LaneHMAC: task5Copy(update.LaneHMAC), OrderingSequence: sequence, EffectClass: update.EffectType, RiskClass: risk, Status: status, AttemptID: update.AttemptID, LeaseOwner: update.LeaseOwner, LeaseEpoch: update.LeaseEpoch, LeaseExpiry: task5Ptr(update.LeaseExpiresAt), DispatchedAt: task5Ptr(update.DispatchedAt), DeadlineAt: task5Ptr(update.DeadlineAt), NextAttemptAt: task5Ptr(update.NextAttemptAt), PayloadCiphertext: task5Copy(update.PayloadCiphertext), PayloadNonce: task5Copy(update.PayloadNonce), EncryptionKeyID: payloadKeyID, ContentDigest: task5Copy(update.ContentDigest), ContentDigestKeyID: task5ContentDigestKeyID(update.DigestKeyID, update.ContentDigestKeyID), ResultCode: update.ResultCode, ErrorCode: update.ErrorCode, ProviderMessageID: update.ProviderMessageID, CompletedAt: task5Ptr(update.CompletedAt), PayloadExpiresAt: task5Ptr(expiry), CreatedAt: now, RetryCount: update.RetryCount}
+			row.SubjectKey = task5Copy(update.SubjectKey)
 			if q = tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row); q.Error != nil {
 				return ErrParticipantFailure
 			}

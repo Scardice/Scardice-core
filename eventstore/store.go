@@ -303,6 +303,9 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 	if control.PublicationState != "published" {
 		return CommitResult{}, ErrReadinessQuarantined
 	}
+	if err = s.privacyRejectFencedStreams(ctx, tx, work.Streams); err != nil {
+		return CommitResult{}, err
+	}
 	if s.keySource != nil {
 		if err = s.validateReadinessOnDB(ctx, tx, false); err != nil {
 			return CommitResult{}, err
@@ -659,7 +662,7 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 	}
 	return nil
 }
-	applyArts := func() error { return s.applyTask5ArtifactParticipants(tx, work, result) }
+	applyArts := func() error { return s.applyTask5ArtifactParticipants(ctx, tx, work, result) }
 	applySecrets := func() error {
 		secrets := append([]SecretUpdate(nil), work.SecretUpdates...)
 		sort.Slice(secrets, func(i, j int) bool { return secrets[i].SecretRef < secrets[j].SecretRef })
@@ -935,13 +938,19 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 		return nil
 	}
 	applyInbox := func() error { return s.applyTask5InboxParticipants(ctx, tx, work, result) }
-	applyEffects := func() error { return s.applyTask5EffectParticipants(ctx, tx, work, result) }
+	applyEffects := func() error {
+		if err := s.privacyRejectFencedEffects(ctx, tx, work.Effects); err != nil { return err }
+		return s.applyTask5EffectParticipants(ctx, tx, work, result)
+	}
 	applyFences := func() error { fences := append([]SubjectFenceUpdate(nil), work.FenceUpdates...); sort.Slice(fences,func(i,j int)bool{if string(fences[i].SubjectKey)!=string(fences[j].SubjectKey){return string(fences[i].SubjectKey)<string(fences[j].SubjectKey)};return fences[i].Scope<fences[j].Scope})
 	for _, update := range fences {
 		if len(update.SubjectKey)==0 || update.Scope=="" {return ErrParticipantFailure}
 		var row subjectFenceRow
 		q:=tx.Where("subject_key = ? AND scope = ?",update.SubjectKey,update.Scope).First(&row); current:=uint64(0); if q.Error==nil{current=row.Version}else if !errors.Is(q.Error,gorm.ErrRecordNotFound){return ErrParticipantFailure}
 		if err:=participantVersion(update.ExpectedVersion,current,update.Version,tableSubjectFences,"<redacted>");err!=nil{return err}
+		if update.Deleted && update.Scope == privacyFenceScope {
+			if update.PurgeOperationID == "" || row.PurgeOperationID != update.PurgeOperationID { return ErrAuthenticationFailed }
+		}
 		if update.Deleted { if current==0{return &ParticipantConflictError{Conflicts:[]ParticipantConflict{{Table:tableSubjectFences,Key:"<redacted>",ExpectedVersion:update.ExpectedVersion,CurrentVersion:current}}}}; q=tx.Where("subject_key = ? AND scope = ? AND version = ?",update.SubjectKey,update.Scope,current).Delete(&subjectFenceRow{}); if err:=participantCAS(tableSubjectFences,"<redacted>",update.ExpectedVersion,current,q);err!=nil{return err}; result.FenceKeys=append(result.FenceKeys,append([]byte(nil),update.SubjectKey...)); continue }
 		version, err := nextVersion(current); if err != nil { return err }
 		if current==0 { if update.PurgeOperationID=="" {return ErrParticipantFailure}; row=subjectFenceRow{SubjectKey:update.SubjectKey,Scope:update.Scope,Version:version,PurgeOperationID:update.PurgeOperationID,CreatedAt:chooseTime(update.CreatedAt,time.Now().UTC()),ExpiresAt:timePtr(update.ExpiresAt)}; q=tx.Create(&row) } else { if update.PurgeOperationID!="" {row.PurgeOperationID=update.PurgeOperationID}; if !update.CreatedAt.IsZero(){row.CreatedAt=update.CreatedAt}; if !update.ExpiresAt.IsZero(){row.ExpiresAt=timePtr(update.ExpiresAt)}; row.Version=version; q=tx.Model(&subjectFenceRow{}).Where("subject_key = ? AND scope = ? AND version = ?",update.SubjectKey,update.Scope,current).Updates(map[string]any{"version":row.Version,"purge_operation_id":row.PurgeOperationID,"created_at":row.CreatedAt,"expires_at":row.ExpiresAt}) }

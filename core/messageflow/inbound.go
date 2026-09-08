@@ -191,6 +191,10 @@ func (s *InboundService) HandleInbound(ctx context.Context, fenced endpoint.Fenc
 	if err != nil {
 		return adapterapi.IngressReceipt{}, err
 	}
+	subjectKey, _, err := s.security.KeyedDigest(ctx, "privacy-subject/v1", conversation)
+	if err != nil {
+		return adapterapi.IngressReceipt{}, err
+	}
 	providerKey, err := s.providerKey(ctx, fenced.EndpointID, message, contentDigest)
 	if err != nil {
 		return adapterapi.IngressReceipt{}, err
@@ -218,7 +222,7 @@ func (s *InboundService) HandleInbound(ctx context.Context, fenced endpoint.Fenc
 	now := s.clock.Now().UTC()
 	result, err := s.repo.AcceptInbox(ctx, eventstore.InboxUpdate{
 		InboxID: inboxID, EndpointID: string(fenced.EndpointID), ProviderEventKey: providerKey,
-		LaneHMAC: laneDigest, Status: eventstore.InboxStatusPending,
+		LaneHMAC: laneDigest, SubjectKey: subjectKey, Status: eventstore.InboxStatusPending,
 		PayloadCiphertext: ciphertext, PayloadNonce: nonce,
 		ContentDigest: contentDigest, ContentDigestKeyID: digestKeyID,
 		PayloadEncryptionKeyID: encryptionKeyID, PayloadExpiresAt: now.Add(IngressPayloadTTL), AllowExpiredDedupe: true,

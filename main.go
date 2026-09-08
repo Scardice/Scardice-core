@@ -33,6 +33,7 @@ import (
 	"Scardice-core/dice/service"
 	"Scardice-core/endpoint"
 	"Scardice-core/core/messageflow"
+	"Scardice-core/core/privacypurge"
 	"Scardice-core/eventstore"
 	"Scardice-core/logger"
 	v2 "Scardice-core/migrate/v2"
@@ -576,6 +577,7 @@ func main() {
 			log.Errorf("endpoint inbound service construction failed: %v", inboundErr)
 			return
 		}
+		api.RegisterPrivacyPurgeService(privacypurge.NewService(store))
 		endpointBootstrap, openErr = endpoint.NewBootstrap(store, nil, dice.NewOnebotDescriptor())
 		if openErr != nil {
 			_ = eventDB.Close()
@@ -591,10 +593,12 @@ func main() {
 			log.Errorf("endpoint bootstrap replay/reconcile failed: %v", openErr)
 			return
 		}
+		api.RegisterPrivacyPurgeService(privacypurge.NewService(store))
 	} else {
 		// No event-store configuration means pure OneBot remains stopped; the
 		// legacy data DB is never treated as an authoritative fallback.
 		api.RegisterEndpointService(nil)
+		api.RegisterPrivacyPurgeService(nil)
 	}
 	go func() {
 		// 每5分钟做一次新版本检查
