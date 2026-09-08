@@ -664,7 +664,14 @@ func (kws *WebsocketWrapper) drainEvents() {
 		kws.eventMu.Unlock()
 		kws.invokeEventCallbacks(event)
 		if !kws.clientMode && kws.serverClosed.Load() && (event.payload.Name == EventDisconnect || event.payload.Name == EventError) {
-			kws.serverTerminalPending.Add(-1)
+			if kws.serverTerminalPending.Add(-1) == 0 {
+				kws.eventMu.Lock()
+				empty := len(kws.eventQueue) == 0
+				kws.eventMu.Unlock()
+				if empty {
+					kws.manager.unregisterWrapper(kws)
+				}
+			}
 		}
 		kws.eventWG.Done()
 	}

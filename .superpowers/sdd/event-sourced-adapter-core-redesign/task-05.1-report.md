@@ -382,3 +382,15 @@ ok   Scardice-core/dice
 go test ./evsocket/v2 -run 'Test(WrapperEventQueueIsBounded|SafePoolDeleteIfPreservesReplacement|TransportDropBaselineCapturesPreConnectDrops|ServerWrapperUnregistersAfterTerminalCallbacksDrain)' -count=1
 ok   github.com/PaienNate/pineutil/evsocket/v2
 ```
+
+## Round 18 fixes
+
+- Server wrapper unregistration now occurs before the final queued terminal callback calls `eventWG.Done`, so `WaitEvents` cannot return while the wrapper remains in the instance registry.
+- The terminal drain regression covers callback completion followed immediately by registry absence.
+
+### Round 18 GREEN evidence
+
+```text
+go test ./evsocket/v2 -run 'TestServerWrapperUnregistersAfterTerminalCallbacksDrain' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+```
