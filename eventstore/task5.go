@@ -1062,7 +1062,7 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 	if err != nil {
 		return CommitResult{}, err
 	}
-	row := outboxEffectRow{EffectID: effect.EffectID, Version: 1, PayloadVersion: 1, EndpointID: effect.EndpointID, LaneHMAC: task5Copy(effect.LaneHMAC), OrderingSequence: seq, EffectClass: effect.EffectType, RiskClass: effect.RiskClass, Status: OutboxStatusPending, PayloadCiphertext: task5Copy(effect.PayloadCiphertext), PayloadNonce: task5Copy(effect.PayloadNonce), EncryptionKeyID: payloadKeyID, ContentDigest: task5Copy(effect.ContentDigest), ContentDigestKeyID: task5ContentDigestKeyID(effect.DigestKeyID, effect.ContentDigestKeyID), DeadlineAt: task5Ptr(effect.DeadlineAt), NextAttemptAt: task5Ptr(effect.NextAttemptAt), PayloadExpiresAt: task5Ptr(effect.PayloadExpiresAt), CreatedAt: now}
+	row := outboxEffectRow{EffectID: effect.EffectID, Version: 1, PayloadVersion: payloadVersion, EndpointID: effect.EndpointID, LaneHMAC: task5Copy(effect.LaneHMAC), OrderingSequence: seq, EffectClass: effect.EffectType, RiskClass: effect.RiskClass, Status: OutboxStatusPending, PayloadCiphertext: task5Copy(effect.PayloadCiphertext), PayloadNonce: task5Copy(effect.PayloadNonce), EncryptionKeyID: payloadKeyID, ContentDigest: task5Copy(effect.ContentDigest), ContentDigestKeyID: task5ContentDigestKeyID(effect.DigestKeyID, effect.ContentDigestKeyID), DeadlineAt: task5Ptr(effect.DeadlineAt), NextAttemptAt: task5Ptr(effect.NextAttemptAt), PayloadExpiresAt: task5Ptr(effect.PayloadExpiresAt), CreatedAt: now}
 	q := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row)
 	if q.Error != nil {
 		return CommitResult{}, errors.New("eventstore: insert outbox failed")
