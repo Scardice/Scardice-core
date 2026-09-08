@@ -108,6 +108,16 @@ func inboundJSONUpperBound(message adapterapi.InboundMessage) int {
 	return fixed + total*jsonEscapeUpperBound
 }
 
+func ingressPayloadJSONUpperBound(endpointID adapterapi.EndpointID, digestKeyID string, messageBound, contentDigestBytes int) int {
+	const fixedJSONOverhead = 512
+	const jsonEscapeUpperBound = 6
+	total := len(endpointID) + len(digestKeyID) + len(eventstore.InboxStatusPending) + contentDigestBytes + 32 + messageBound
+	if total > (eventstore.MaxEventPayloadBytes-fixedJSONOverhead)/jsonEscapeUpperBound {
+		return eventstore.MaxEventPayloadBytes + 1
+	}
+	return fixedJSONOverhead + total*jsonEscapeUpperBound
+}
+
 // row in a later workflow.
 func (s *InboundService) HandleInbound(ctx context.Context, fenced endpoint.FencedInbound) (adapterapi.IngressReceipt, error) {
 	if s == nil || s.repo == nil || s.security == nil {
@@ -163,6 +173,9 @@ func (s *InboundService) HandleInbound(ctx context.Context, fenced endpoint.Fenc
 	}
 	inboxID := "inbox-" + hex.EncodeToString(inboxDigest)
 	payload := ingressPayload{EndpointID: fenced.EndpointID, Generation: fenced.Generation, DesiredVersion: fenced.DesiredVersion, Message: message, ContentDigest: contentDigest, ContentDigestKeyID: digestKeyID, Status: eventstore.InboxStatusPending}
+	if ingressPayloadJSONUpperBound(fenced.EndpointID, digestKeyID, inboundJSONUpperBound(message), len(contentDigest)) > eventstore.MaxEventPayloadBytes {
+		return adapterapi.IngressReceipt{}, ErrIngressPayload
+	}
 	plaintext, err := json.Marshal(payload)
 	if err != nil {
 		return adapterapi.IngressReceipt{}, err

@@ -166,6 +166,19 @@ func TestInboundServiceRejectsEscapeHeavyAggregateBeforeMarshal(t *testing.T) {
 	}
 }
 
+func TestInboundServiceRejectsEnvelopeAggregateBeforePayloadMarshal(t *testing.T) {
+	repo := &ingressRepoStub{}
+	svc, err := NewInboundService(repo, ingressCryptoStub{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := testFencedMessage("envelope", strings.Repeat("x", 40*1024))
+	message.EndpointID = adapterapi.EndpointID(strings.Repeat("e", adapterapi.MaxIdentifierBytes))
+	if _, err := svc.HandleInbound(context.Background(), message); !errors.Is(err, ErrIngressPayload) {
+		t.Fatalf("envelope aggregate error = %v", err)
+	}
+}
+
 func TestInboundServiceStableIDChangedBodyIsCollision(t *testing.T) {
 	repo := &ingressRepoStub{}
 	svc, err := NewInboundService(repo, ingressCryptoStub{})

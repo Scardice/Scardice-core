@@ -418,3 +418,15 @@ ok   Scardice-core/core/messageflow
 go test ./core/messageflow -run 'TestInboundService(RejectsAggregatePayloadBeforeMarshal|RejectsEscapeHeavyAggregateBeforeMarshal)' -count=1
 ok   Scardice-core/core/messageflow
 ```
+
+## Round 21 fixes
+
+- Added a second conservative preflight for the encrypted inbox payload envelope, including endpoint ID, digest key ID, digest bytes, status, generation/version framing, and the already-bounded message estimate. This rejects near-limit messages whose envelope would exceed the 256 KiB event payload limit before `json.Marshal(payload)`.
+- Added a regression using a 4 KiB valid endpoint ID and a near-limit message to prove envelope-level rejection.
+
+### Round 21 GREEN evidence
+
+```text
+go test ./core/messageflow -run 'TestInboundService(RejectsAggregatePayloadBeforeMarshal|RejectsEscapeHeavyAggregateBeforeMarshal|RejectsEnvelopeAggregateBeforePayloadMarshal|StableDuplicateReturnsPriorReceipt)' -count=1
+ok   Scardice-core/core/messageflow
+```
