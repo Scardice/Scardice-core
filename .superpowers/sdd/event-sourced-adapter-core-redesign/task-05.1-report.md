@@ -354,3 +354,19 @@ ok   Scardice-core/dice
 go test ./evsocket/v2 -run 'Test(ServerWrapperRegistryUnregistersChurn|ServerWrapperUnregistersAfterTerminalCallbacksDrain|ShutdownWaitDrainsQueuedWrapperEvents|WrapperEventQueueIsBounded)' -count=1
 ok   github.com/PaienNate/pineutil/evsocket/v2
 ```
+
+## Round 16 fixes
+
+- Restored safe-pool removal in `finalizeTransportClose`, preventing dead wrappers from remaining in Broadcast/Shutdown pool state.
+- Added a transport-open drop baseline captured by `OnOpen`; runtime connection state uses that baseline rather than sampling after queued EventConnect delivery, so pre-EventConnect transport drops are accounted in the subsequent close delta.
+- Added focused pool cleanup and pre-connect baseline regressions.
+
+### Round 16 GREEN evidence
+
+```text
+go test ./evsocket/v2 -run 'Test(ServerWrapperRegistryUnregistersChurn|ServerWrapperUnregistersAfterTerminalCallbacksDrain|TransportDropBaselineCapturesPreConnectDrops|ShutdownWaitDrainsQueuedWrapperEvents)' -count=1
+ok   github.com/PaienNate/pineutil/evsocket/v2
+
+go test ./dice -run 'TestOnebotRuntime(DiagnosticsRetainCompletedTransportDrops|PriorityEventCoalescesAndPreemptsInbound)' -count=1
+ok   Scardice-core/dice
+```

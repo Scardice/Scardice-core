@@ -158,3 +158,13 @@ func TestServerWrapperUnregistersAfterTerminalCallbacksDrain(t *testing.T) {
 		t.Fatal("server wrapper unregistered before terminal callback drain")
 	}
 }
+
+func TestTransportDropBaselineCapturesPreConnectDrops(t *testing.T) {
+	manager := NewSocketInstance()
+	wrapper := newServerWrapper(manager)
+	wrapper.droppedEvents.Store(3)
+	(&transportHandler{wrapper: wrapper}).OnOpen(nil)
+	if got := wrapper.TransportDropBaseline(); got != 3 {
+		t.Fatalf("transport drop baseline = %d, want 3", got)
+	}
+}

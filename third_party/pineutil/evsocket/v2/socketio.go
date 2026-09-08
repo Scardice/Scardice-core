@@ -432,6 +432,7 @@ type WebsocketWrapper struct {
 	connectedOnce atomic.Bool
 	serverClosed  atomic.Bool
 	serverTerminalPending atomic.Int32
+	transportDropBaseline atomic.Uint64
 	clientState   clientTransportState
 	heartbeatStop chan struct{}
 	heartbeatConn *gws.Conn
@@ -625,6 +626,13 @@ func (kws *WebsocketWrapper) markConnectedReady() {
 func (kws *WebsocketWrapper) DroppedEventCount() uint64 {
 	if kws == nil { return 0 }
 	return kws.droppedEvents.Load()
+}
+
+func (kws *WebsocketWrapper) TransportDropBaseline() uint64 {
+	if kws == nil {
+		return 0
+	}
+	return kws.transportDropBaseline.Load()
 }
 
 func (kws *WebsocketWrapper) drainEvents() {
@@ -1078,6 +1086,7 @@ func (kws *WebsocketWrapper) finalizeTransportClose(socket *gws.Conn, err error)
 	}
 	kws.stopClientHeartbeat(socket)
 	kws.transport.Store(nil)
+	kws.manager.pool.delete(kws.GetUUID())
 	kws.stateMu.Lock()
 	if kws.clientState != clientTransportStateConnecting {
 		kws.clientState = clientTransportStateDisconnected
@@ -1144,6 +1153,7 @@ func (h *transportHandler) OnOpen(socket *gws.Conn) {
 	wrapper.setClientState(clientTransportStateConnected)
 	wrapper.startClientHeartbeat(socket)
 	wrapper.manager.pool.set(wrapper)
+	wrapper.transportDropBaseline.Store(wrapper.DroppedEventCount())
 	if h.opened != nil {
 		close(h.opened)
 		h.opened = nil

@@ -122,7 +122,7 @@ func (r *onebotRuntime) trackConnection(conn *socketio.WebsocketWrapper) {
 	}
 	r.connectionMu.Lock()
 	if _, ok := r.connections[conn]; !ok {
-		r.connections[conn] = onebotConnectionState{done: make(chan struct{}), dropBaseline: conn.DroppedEventCount()}
+		r.connections[conn] = onebotConnectionState{done: make(chan struct{}), dropBaseline: conn.TransportDropBaseline()}
 	}
 	r.connectionMu.Unlock()
 	r.callbackMu.Unlock()
