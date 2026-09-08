@@ -1176,13 +1176,15 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 			}
 			groupInfo.MarkDirty(d) // SetBotOnAtGroup 已调用过一次，这里确保后续修改也被标记
 
-			dm := d.Parent
-			groupName := dm.TryGetGroupName(groupInfo.GroupID)
-
-			txt := fmt.Sprintf("自动激活: 发现无记录群组%s(%s)，因为已是群成员，所以自动激活，开启状态: %t", groupName, groupInfo.GroupID, autoOn)
-			if dm.ShouldRefreshGroupInfo(msg.GroupID) {
-				ep.Adapter.GetGroupInfoAsync(msg.GroupID)
+			groupName := msg.GroupName
+			if options.parser == messageParserLegacy {
+				dm := d.Parent
+				groupName = dm.TryGetGroupName(groupInfo.GroupID)
+				if dm.ShouldRefreshGroupInfo(msg.GroupID) {
+					ep.Adapter.GetGroupInfoAsync(msg.GroupID)
+				}
 			}
+			txt := fmt.Sprintf("自动激活: 发现无记录群组%s(%s)，因为已是群成员，所以自动激活，开启状态: %t", groupName, groupInfo.GroupID, autoOn)
 			log.Info(txt)
 			mctx.Notice(txt, NoticeTypeGroup)
 
@@ -1190,7 +1192,7 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 				// ServiceAtNew changed
 				// Pinenutn:这个i不知道是啥，放你一马（
 				activatedList, _ := mctx.Session.ServiceAtNew.Load(msg.GroupID)
-				if ok {
+				if options.parser == messageParserSegments || ok {
 					for _, wrapper := range activatedList.GetActivatedExtList(mctx.Dice) {
 						ext := wrapper.GetRealExt()
 						if ext == nil {
@@ -1204,6 +1206,9 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 					}
 				}
 			}
+		}
+		if options.parser == messageParserSegments && groupInfo != nil {
+			groupInfo.GroupName = msg.GroupName
 		}
 
 		mctx.Group, mctx.Player = GetPlayerInfoBySender(mctx, msg)
