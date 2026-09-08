@@ -115,6 +115,50 @@ func TestTask4AcceptInboxRejectsWorkflowLinkWithoutPartialWrites(t *testing.T) {
 		t.Fatalf("accept workflow row err=%v row=%#v", err, row)
 	}
 }
+func TestTask4AcceptExpiredDedupeRetainsCallbackUncertainty(t *testing.T) {
+	for _, status := range []string{InboxStatusCallbackStarted, InboxStatusAmbiguous} {
+		t.Run(status, func(t *testing.T) {
+			store, db, _ := task5Store(t)
+			defer db.Close()
+			ctx := context.Background()
+			inbox := task5Inbox("task4-expired-"+status, "task4-expired-provider-"+status, "task4-expired-lane-"+status)
+			if _, err := store.AcceptInbox(ctx, inbox); err != nil {
+				t.Fatal(err)
+			}
+			expiredAt := time.Unix(99, 0).UTC()
+			if err := db.GORM().Model(&inboxMessageRow{}).Where("inbox_id = ?", inbox.InboxID).Updates(map[string]any{
+				"status": status, "payload_expires_at": expiredAt,
+			}).Error; err != nil {
+				t.Fatal(err)
+			}
+			var before inboxMessageRow
+			if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&before).Error; err != nil {
+				t.Fatal(err)
+			}
+			if before.PayloadExpiresAt == nil || before.PayloadExpiresAt.After(time.Now()) {
+				t.Fatalf("fixture expiry=%v", before.PayloadExpiresAt)
+			}
+			if before.Status != status {
+				t.Fatalf("fixture status=%q want=%q", before.Status, status)
+			}
+			inbox.AllowExpiredDedupe = true
+			if _, err := store.AcceptInbox(ctx, inbox); !errors.Is(err, ErrPayloadExpired) {
+				t.Fatalf("expired uncertain dedupe err=%v", err)
+			}
+			var after inboxMessageRow
+			if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&after).Error; err != nil {
+				t.Fatal(err)
+			}
+			var count int64
+			if err := db.GORM().Model(&inboxMessageRow{}).Where("endpoint_id = ? AND provider_event_id = ?", inbox.EndpointID, inbox.ProviderEventKey).Count(&count).Error; err != nil {
+				t.Fatal(err)
+			}
+			if count != 1 || after.InboxID != before.InboxID || after.Version != before.Version || after.Status != status || after.OrderingSequence != before.OrderingSequence {
+				t.Fatalf("uncertain row changed count=%d before=%#v after=%#v", count, before, after)
+			}
+		})
+	}
+}
 func TestTask4WorkflowLinkRequiresExactSameUOWParticipant(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -280,6 +324,60 @@ func TestTask4A6TerminalStatusOnlyCommitSucceeds(t *testing.T) {
 	}
 	if row.Status != InboxStatusConfirmedConsumed || len(row.PayloadCiphertext) != 0 || row.EncryptionKeyID != keyID {
 		t.Fatalf("A6 terminal row=%#v", row)
+	}
+}
+func TestTask4A6UOWPayloadVersionBindsInboxAndEffect(t *testing.T) {
+	store, db, source := task6Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	const version = uint64(7)
+	inboxCipher, inboxNonce, inboxKeyID, err := a6Seal(ctx, source, "inbox/v1", "task4-a6-uow-inbox", "endpoint", version, []byte("inbox-v7"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	effectCipher, effectNonce, effectKeyID, err := a6Seal(ctx, source, "outbox/v1", "task4-a6-uow-effect", "endpoint", version, []byte("effect-v7"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{
+		InboxUpdates: []InboxUpdate{{
+			InboxID: "task4-a6-uow-inbox", EndpointID: "endpoint", ProviderEventKey: "task4-a6-uow-inbox-provider",
+			LaneHMAC: []byte("task4-a6-uow-inbox-lane"), Status: InboxStatusPending, PayloadVersion: version,
+			PayloadCiphertext: inboxCipher, PayloadNonce: inboxNonce, PayloadEncryptionKeyID: inboxKeyID,
+		}},
+		Effects: []NewEffect{{
+			EffectID: "task4-a6-uow-effect", EndpointID: "endpoint", LaneHMAC: []byte("task4-a6-uow-effect-lane"),
+			EffectType: "send", RiskClass: RiskPreDispatchRetryable, Status: OutboxStatusPending, PayloadVersion: version,
+			PayloadCiphertext: effectCipher, PayloadNonce: effectNonce, PayloadEncryptionKeyID: effectKeyID,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var inboxRow inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", "task4-a6-uow-inbox").First(&inboxRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if inboxRow.PayloadVersion != version {
+		t.Fatalf("inbox payload version=%d want=%d", inboxRow.PayloadVersion, version)
+	}
+	if plain, err := a6Open(ctx, source, "inbox/v1", inboxRow.InboxID, inboxRow.EndpointID, version, inboxRow.EncryptionKeyID, inboxRow.PayloadCiphertext, inboxRow.PayloadNonce); err != nil || string(plain) != "inbox-v7" {
+		t.Fatalf("inbox v7 open plain=%q err=%v", plain, err)
+	}
+	if _, err := a6Open(ctx, source, "inbox/v1", inboxRow.InboxID, inboxRow.EndpointID, 1, inboxRow.EncryptionKeyID, inboxRow.PayloadCiphertext, inboxRow.PayloadNonce); !errors.Is(err, ErrAuthenticationFailed) {
+		t.Fatalf("inbox v1 open err=%v", err)
+	}
+	var effectRow outboxEffectRow
+	if err := db.GORM().Where("effect_id = ?", "task4-a6-uow-effect").First(&effectRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if effectRow.PayloadVersion != version {
+		t.Fatalf("effect payload version=%d want=%d", effectRow.PayloadVersion, version)
+	}
+	if plain, err := a6Open(ctx, source, "outbox/v1", effectRow.EffectID, effectRow.EndpointID, version, effectRow.EncryptionKeyID, effectRow.PayloadCiphertext, effectRow.PayloadNonce); err != nil || string(plain) != "effect-v7" {
+		t.Fatalf("effect v7 open plain=%q err=%v", plain, err)
+	}
+	if _, err := a6Open(ctx, source, "outbox/v1", effectRow.EffectID, effectRow.EndpointID, 1, effectRow.EncryptionKeyID, effectRow.PayloadCiphertext, effectRow.PayloadNonce); !errors.Is(err, ErrAuthenticationFailed) {
+		t.Fatalf("effect v1 open err=%v", err)
 	}
 }
 func TestTask4OpaqueInboxReplayRejectsWorkflowLink(t *testing.T) {

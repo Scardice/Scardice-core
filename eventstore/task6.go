@@ -703,7 +703,7 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 				return ErrAuthenticationFailed
 			}
 		}
-		version := uint64(1)
+		version := task5PayloadVersion(update.PayloadVersion)
 		var existing inboxMessageRow
 		lookup := locked(db).Where("inbox_id = ?", update.InboxID).First(&existing)
 		if lookup.Error == nil {
@@ -744,7 +744,7 @@ func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB,
 				return ErrAuthenticationFailed
 			}
 		}
-		version := uint64(1)
+		version := task5PayloadVersion(effect.PayloadVersion)
 		var existing outboxEffectRow
 		lookup := locked(db).Where("effect_id = ?", effect.EffectID).First(&existing)
 		if lookup.Error == nil {
