@@ -678,3 +678,83 @@ func TestExecuteNew_MultipleGroups(t *testing.T) {
 		t.Error("GroupInfo not created for group B")
 	}
 }
+func TestExecuteWrappersShareCommandReplyAndUnsupportedOutcome(t *testing.T) {
+	run := func(useNew bool) string {
+		d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+		defer cleanup()
+		msg := newPrivateMsg("QQ:999", ".help 骰点")
+		if useNew {
+			d.ImSession.ExecuteNew(ep, msg)
+		} else {
+			d.ImSession.Execute(ep, msg, true)
+		}
+		reply, ok := adapter.waitForMsg(2 * time.Second)
+		if !ok {
+			t.Fatalf("wrapper=%t did not reply to deterministic command", useNew)
+		}
+		return reply
+	}
+	legacyReply := run(false)
+	segmentReply := run(true)
+	if legacyReply != segmentReply {
+		t.Fatalf("wrapper replies differ: legacy=%q segment=%q", legacyReply, segmentReply)
+	}
+
+	for _, useNew := range []bool{false, true} {
+		d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+		msg := newPrivateMsg("QQ:999", ".unsupported-command")
+		if useNew {
+			d.ImSession.ExecuteNew(ep, msg)
+		} else {
+			d.ImSession.Execute(ep, msg, true)
+		}
+		select {
+		case got := <-adapter.msgCh:
+			t.Fatalf("wrapper=%t replied to unsupported command: %q", useNew, got)
+		case <-time.After(300 * time.Millisecond):
+		}
+		cleanup()
+	}
+}
+
+func TestExecuteNewPreservesSegmentMentionCommand(t *testing.T) {
+	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	msg := newGroupMsg("QQ-Group:segment-mention", "QQ:999", "")
+	msg.Message = ""
+	msg.Segment = []message.IMessageElement{
+		&message.AtElement{Target: "100000"},
+		&message.TextElement{Content: ".help 骰点"},
+	}
+	d.ImSession.ExecuteNew(ep, msg)
+	if _, ok := adapter.waitForMsg(2 * time.Second); !ok {
+		t.Fatal("segment-aware mention command did not produce a reply")
+	}
+}
+
+func TestExecuteRunInSyncControlsNonCommandHookScheduling(t *testing.T) {
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	groupID := "QQ-Group:sync-hook"
+	setupCtx := &MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession}
+	group := SetBotOnAtGroup(setupCtx, groupID)
+	hookCalls := make(chan struct{}, 2)
+	group.SetActivatedExtList([]*ExtInfo{{
+		Name:                 "execute-sync-hook-test",
+		OnNotCommandReceived: func(_ *MsgContext, _ *Message) { hookCalls <- struct{}{} },
+	}}, nil)
+
+	d.ImSession.Execute(ep, newGroupMsg(groupID, "QQ:999", "plain text"), true)
+	select {
+	case <-hookCalls:
+	default:
+		t.Fatal("Execute(..., true) returned before non-command hook ran")
+	}
+
+	d.ImSession.Execute(ep, newGroupMsg(groupID, "QQ:998", "plain text"), false)
+	select {
+	case <-hookCalls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Execute(..., false) did not schedule non-command hook")
+	}
+}
