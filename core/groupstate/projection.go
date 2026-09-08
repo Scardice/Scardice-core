@@ -1,9 +1,11 @@
 package groupstate
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 
 	"Scardice-core/eventstore"
 	"gorm.io/gorm"
@@ -52,10 +54,15 @@ func ReadProjected(ctx context.Context, store any, diceID, groupID string) (Stat
 	stream := GroupStream(diceID, groupID)
 	row, err := reader.ReadProjectionRow(ctx, GroupProjectionName, stream.AggregateID)
 	if err != nil { return State{}, err }
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(row.Payload, &object); err != nil || object == nil { return State{}, ErrInvalidState }
+	var value any
+	if err := json.Unmarshal(row.Payload, &value); err != nil { return State{}, ErrInvalidState }
+	if _, ok := value.(map[string]any); !ok || containsJSONNull(value) { return State{}, ErrInvalidState }
+	decoder := json.NewDecoder(bytes.NewReader(row.Payload))
+	decoder.DisallowUnknownFields()
 	var state State
-	if err := json.Unmarshal(row.Payload, &state); err != nil { return State{}, ErrInvalidState }
+	if err := decoder.Decode(&state); err != nil { return State{}, ErrInvalidState }
+	if err := decoder.Decode(&struct{}{}); err != io.EOF { return State{}, ErrInvalidState }
+	if state.Version == 0 { return State{}, ErrInvalidState }
 	if err := ValidateState(state); err != nil { return State{}, err }
 	if canonicalAggregateID(state.DiceID, state.GroupID) != stream.AggregateID { return State{}, ErrInvalidState }
 	return state.Clone(), nil

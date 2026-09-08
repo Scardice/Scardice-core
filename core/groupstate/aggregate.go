@@ -201,6 +201,30 @@ func (s State) CompatibilityView() CompatibilityView { return CompatibilityView{
 func ValidateState(state State) error {
 	if state.Version == 0 { return nil }
 	if ValidateIdentity(state.DiceID, state.GroupID) != nil { return ErrInvalidState }
+	hasActive := false
+	for diceID, active := range state.DiceIDActive {
+		if !validScopedIdentifier(diceID) { return ErrInvalidState }
+		hasActive = hasActive || active
+	}
+	for diceID := range state.DiceIDExists {
+		if !validScopedIdentifier(diceID) { return ErrInvalidState }
+	}
+	for extensionID := range state.InactivatedExtensions {
+		if !validScopedIdentifier(extensionID) { return ErrInvalidState }
+	}
+	for _, extensionID := range state.ActivatedExtensions {
+		if !validScopedIdentifier(extensionID) { return ErrInvalidState }
+	}
+	if !validOptionalScopedIdentifier(state.InviteUserID) || !validOptionalScopedIdentifier(state.GuildID) || !validOptionalScopedIdentifier(state.ChannelID) {
+		return ErrInvalidState
+	}
+	for userID := range state.BotList {
+		if !validScopedIdentifier(userID) { return ErrInvalidState }
+	}
+	for userID, level := range state.Privileges {
+		if !validScopedIdentifier(userID) || level < -30 || level > 100 { return ErrInvalidState }
+	}
+	if state.Active != hasActive { return ErrInvalidState }
 	if state.Deleted && state.Active { return ErrDeletedGroup }
 	return nil
 }

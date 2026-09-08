@@ -201,7 +201,11 @@ func TestCompatibilityViewDoesNotExposeMutableAuthoritativeMaps(t *testing.T) {
 func TestReadProjectedRejectsCorruptRows(t *testing.T) {
 	for _, payload := range []string{
 		"null",
+		`{"version":0}`,
 		`{"version":1}`,
+		`{"version":1,"diceId":"dice-1","groupId":"group-1","active":true}`,
+		`{"version":1,"diceId":"dice-1","groupId":"group-1","diceIdActive":{"":true}}`,
+		`{"version":1,"diceId":"dice-1","groupId":"group-1","privileges":{"user-1":101}}`,
 		`{"version":1,"diceId":"dice-1","groupId":"group-1","deleted":true,"active":true}`,
 	} {
 		if _, err := ReadProjected(context.Background(), fakeProjectionReader{payload: []byte(payload)}, "dice-1", "group-1"); !errors.Is(err, ErrInvalidState) && !errors.Is(err, ErrDeletedGroup) {

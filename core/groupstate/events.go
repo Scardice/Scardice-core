@@ -176,7 +176,7 @@ func (e GroupPrivilegeChangedV1) apply(s *State) error { if s.Version == 0 || s.
 type GroupRecordDeletedV1 struct{}
 func NewGroupRecordDeletedV1() GroupRecordDeletedV1 { return GroupRecordDeletedV1{} }
 func (GroupRecordDeletedV1) EventType() EventType { return EventGroupRecordDeleted }
-func (GroupRecordDeletedV1) apply(s *State) error { if s.Version == 0 || s.Deleted { return ErrInvalidState }; s.Deleted, s.Active = true, false; return nil }
+func (GroupRecordDeletedV1) apply(s *State) error { if s.Version == 0 || s.Deleted { return ErrInvalidState }; s.Deleted, s.Active, s.DiceIDActive = true, false, map[string]bool{}; return nil }
 
 func (s *State) addExtension(id string) { for _, current := range s.ActivatedExtensions { if current == id { return } }; s.ActivatedExtensions = append(s.ActivatedExtensions, id) }
 func (e GroupCreatedV1) validate() error {
