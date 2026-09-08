@@ -86,10 +86,12 @@ func (r *Repository) AppendTyped(ctx context.Context, diceID, groupID string, ex
 	if factory.IDs == nil { factory.IDs = eventstore.UUIDGenerator{} }
 	encoded := make([]eventstore.NewEvent, 0, len(events))
 	seen := make(map[string]struct{}, len(events))
+	explicit := make(map[string]struct{}, len(events))
 	for _, event := range events {
 		itemMetadata := metadata
 		if itemMetadata.EventID != "" {
-			if _, duplicate := seen[itemMetadata.EventID]; duplicate { itemMetadata.EventID = "" }
+			if _, duplicate := explicit[itemMetadata.EventID]; duplicate { return eventstore.CommitResult{}, eventstore.ErrConflict }
+			explicit[itemMetadata.EventID] = struct{}{}
 		}
 		item, err := NewEventWithFactory(factory, event, itemMetadata)
 		if err != nil { return eventstore.CommitResult{}, err }

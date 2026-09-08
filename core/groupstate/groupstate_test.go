@@ -399,7 +399,7 @@ func TestAppendTypedAllocatesUniqueEventIDsForBatch(t *testing.T) {
 	defer db.Close()
 	store := eventstore.NewStore(db, eventstore.WithProjection(GroupProjection()))
 	repository := NewRepository(store)
-	metadata := eventstore.Metadata{EventID: "batch-event", CommandID: "batch-command", CorrelationID: "batch-correlation", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}
+	metadata := eventstore.Metadata{CommandID: "batch-command", CorrelationID: "batch-correlation", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}
 	_, err = repository.AppendTyped(context.Background(), "dice-1", "group-1", 0, metadata, []TypedEvent{
 		NewGroupCreatedV1("dice-1", "group-1", "name", 1),
 		NewGroupNameChangedV1("renamed"),
@@ -410,6 +410,23 @@ func TestAppendTypedAllocatesUniqueEventIDsForBatch(t *testing.T) {
 	events, err := store.Load(context.Background(), GroupStream("dice-1", "group-1"), 1)
 	if err != nil || len(events) != 2 || events[0].EventID == events[1].EventID {
 		t.Fatalf("batch events = %#v, err = %v", events, err)
+	}
+}
+func TestAppendTypedRejectsDuplicateExplicitEventID(t *testing.T) {
+	ctx := context.Background()
+	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/group-duplicate.db"})
+	if err != nil { t.Fatal(err) }
+	defer db.Close()
+	repository := NewRepository(eventstore.NewStore(db))
+	metadata := eventstore.Metadata{EventID: "duplicate-event", CommandID: "duplicate-command", CorrelationID: "duplicate-correlation", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}
+	if _, err := repository.AppendTyped(ctx, "dice-1", "group-1", 0, metadata, []TypedEvent{
+		NewGroupCreatedV1("dice-1", "group-1", "name", 1), NewGroupNameChangedV1("renamed"),
+	}); !errors.Is(err, eventstore.ErrConflict) {
+		t.Fatalf("duplicate explicit event ID error = %v", err)
+	}
+	events, err := repository.Store.Load(ctx, GroupStream("dice-1", "group-1"), 1)
+	if err != nil || len(events) != 0 {
+		t.Fatalf("duplicate batch committed events = %#v, err = %v", events, err)
 	}
 }
 
