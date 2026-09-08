@@ -758,3 +758,48 @@ func TestExecuteRunInSyncControlsNonCommandHookScheduling(t *testing.T) {
 		t.Fatal("Execute(..., false) did not schedule non-command hook")
 	}
 }
+func TestExecuteLeavesUnsupportedMessageUnchanged(t *testing.T) {
+	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	msg := &Message{
+		Platform:    "QQ",
+		MessageType: "channel",
+		Sender:      SenderBase{UserID: "QQ:999", Nickname: "Tester"},
+		Segment:     []message.IMessageElement{&message.TextElement{Content: ".r 1d1"}},
+	}
+	d.ImSession.Execute(ep, msg, true)
+	if msg.Message != "" {
+		t.Fatalf("unsupported Execute mutated Message to %q", msg.Message)
+	}
+	select {
+	case got := <-adapter.msgCh:
+		t.Fatalf("unsupported Execute replied: %q", got)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+func TestExecuteSetsTempVarsBeforeNonCommandHook(t *testing.T) {
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	groupID := "QQ-Group:temp-vars-hook"
+	setupCtx := &MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession}
+	group := SetBotOnAtGroup(setupCtx, groupID)
+	seen := make(chan string, 1)
+	group.SetActivatedExtList([]*ExtInfo{{
+		Name: "execute-temp-vars-test",
+		OnNotCommandReceived: func(ctx *MsgContext, _ *Message) {
+			value, _ := VarGetValueStr(ctx, "$tQQ昵称")
+			seen <- value
+		},
+	}}, nil)
+
+	d.ImSession.Execute(ep, newGroupMsg(groupID, "QQ:999", "plain text"), true)
+	select {
+	case value := <-seen:
+		if value != "<Tester>" {
+			t.Fatalf("hook saw $tQQ昵称=%q, want <Tester>", value)
+		}
+	default:
+		t.Fatal("non-command hook ran before temporary variables were initialized")
+	}
+}

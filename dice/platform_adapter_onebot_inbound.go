@@ -4,44 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
-	"time"
 
 	"Scardice-core/adapterapi"
 )
 
 var ErrPureOnebotInboundUnavailable = errors.New("pureonebot inbound core is unavailable")
-
-func pureOnebotCoreMessage(ep *EndPointInfo, inbound adapterapi.InboundMessage) *Message {
-	message := &Message{
-		Time:        inbound.OccurredAt.Unix(),
-		MessageType: "private",
-		Message:     inbound.Text,
-		Platform:    ep.Platform,
-		Sender:      SenderBase{UserID: string(inbound.Sender)},
-		RawID:       string(inbound.MessageID),
-	}
-	if message.Time <= 0 {
-		message.Time = time.Now().Unix()
-	}
-	conversation := string(inbound.Conversation)
-	if strings.HasPrefix(conversation, "QQ:group:") {
-		message.GroupID = "QQ-Group:" + strings.TrimPrefix(conversation, "QQ:group:")
-		message.MessageType = "group"
-		message.GroupName = message.GroupID
-	}
-	if inbound.MessageID != "" {
-		message.RawID = string(inbound.MessageID)
-	}
-	if message.Message == "" && len(inbound.Segments) > 0 {
-		for _, segment := range inbound.Segments {
-			if segment.Text != "" {
-				message.Message += segment.Text
-			}
-		}
-	}
-	return message
-}
 
 // ExecutePureOnebotInbound forwards the provider-neutral contract through the
 // injected durable ingress seam. It never invokes a legacy Execute wrapper.
@@ -52,11 +21,11 @@ func (s *IMSession) ExecutePureOnebotInbound(ctx context.Context, ep *EndPointIn
 	if err := inbound.Validate(); err != nil {
 		return adapterapi.IngressReceipt{}, err
 	}
-	if s == nil || s.Parent == nil || ep == nil || !inbound.ProviderEventID.Valid() {
+	if s == nil || s.Parent == nil || ep == nil {
 		return adapterapi.IngressReceipt{}, ErrPureOnebotInboundUnavailable
 	}
 	if inbound.Kind != adapterapi.InboundKindMessage {
-		return adapterapi.IngressReceipt{Outcome: adapterapi.IngressRejected, InboxID: string(inbound.ProviderEventID)}, nil
+		return adapterapi.IngressReceipt{Outcome: adapterapi.IngressRejected}, nil
 	}
 	executor := s.PureOnebotInboundExecutor
 	if executor == nil {
@@ -66,18 +35,18 @@ func (s *IMSession) ExecutePureOnebotInbound(ctx context.Context, ep *EndPointIn
 	if err != nil {
 		return adapterapi.IngressReceipt{}, err
 	}
-	if receipt.InboxID == "" {
-		receipt.InboxID = string(inbound.ProviderEventID)
-	}
 	if err := receipt.Validate(); err != nil {
 		return adapterapi.IngressReceipt{}, err
+	}
+	if (receipt.Outcome == adapterapi.IngressAccepted || receipt.Outcome == adapterapi.IngressDuplicate) && receipt.InboxID == "" {
+		return adapterapi.IngressReceipt{}, fmt.Errorf("%w: durable receipt missing inbox id", adapterapi.ErrInvalidContract)
 	}
 	return receipt, nil
 }
 
 // NewPureOnebotReadEndpoint derives the minimal legacy EndPointInfo view
-// required by ExecuteNew from the endpoint projection. It does not attach an
-// adapter or mutate IMSession.EndPoints.
+// required by compatibility ingress callers. It does not attach an adapter or
+// mutate IMSession.EndPoints.
 func NewPureOnebotReadEndpoint(id adapterapi.EndpointID, config adapterapi.ValidatedConfig) *EndPointInfo {
 	var canonical OnebotConfig
 	_ = json.Unmarshal(config.Canonical, &canonical)

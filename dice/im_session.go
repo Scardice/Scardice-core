@@ -1152,7 +1152,9 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 	mctx.Session = s
 	mctx.EndPoint = ep
 	log := d.Logger
-	ensureMessageTextFromSegments(msg)
+	if options.parser == messageParserSegments || msg.MessageType == "group" || msg.MessageType == "private" {
+		ensureMessageTextFromSegments(msg)
+	}
 	if msg.MessageType != "group" && msg.MessageType != "private" {
 		result.unsupported = true
 		return
@@ -1349,6 +1351,13 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 				}
 			}
 		}
+		if msg.MessageType == "private" {
+			if mctx.CommandID != 0 {
+				log.Infof("收到<%s>(%s)的私聊指令: %s", msg.Sender.Nickname, msg.Sender.UserID, incomingMessageLogText(msg))
+			} else if !d.Config.OnlyLogCommandInPrivate {
+				log.Infof("收到<%s>(%s)的私聊消息: %s", msg.Sender.Nickname, msg.Sender.UserID, incomingMessageLogText(msg))
+			}
+		}
 
 		// 敏感词拦截：全部输入
 		if mctx.IsCurGroupBotOn && d.Config.EnableCensor && d.Config.CensorMode == AllInput {
@@ -1381,6 +1390,7 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 				return
 			}
 		}
+		SetTempVars(mctx, msg.Sender.Nickname)
 
 		if result.command != nil {
 			// Hook filtering, censoring, and command execution are shared by
