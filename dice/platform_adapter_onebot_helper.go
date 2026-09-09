@@ -1,8 +1,6 @@
 package dice
 
 import (
-	"time"
-
 	"github.com/google/uuid"
 )
 
@@ -35,19 +33,4 @@ func NewOnebotConnItem(v AddOnebotEcho) *EndPointInfo {
 		ImageAssetBaseURL: v.ImageAssetBaseURL,
 	}
 	return conn
-}
-
-func ServePureOnebot(d *Dice, ep *EndPointInfo) {
-	defer CrashLog()
-	if ep.Platform == "QQ" {
-		conn := ep.Adapter.(*PlatformAdapterOnebot)
-		ep.BindRuntime(d.ImSession)
-		d.Logger.Infof("Pure Onebot V11尝试连接")
-		if conn.Serve() != 0 {
-			d.Logger.Errorf("连接Pure Onebot V11失败")
-			ep.State = 3
-			d.LastUpdatedTime = time.Now().Unix()
-			d.Save(false)
-		}
-	}
 }

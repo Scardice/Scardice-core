@@ -116,6 +116,17 @@ func TestDecodeResponseDecodeFailureIncludesRawResponse(t *testing.T) {
 		t.Fatalf("expected request params in %q", msg)
 	}
 }
+func TestDecodeResponseRejectsUnknownOrEmptyStatus(t *testing.T) {
+	for _, status := range []string{"", "pending", "unknown"} {
+		t.Run(status, func(t *testing.T) {
+			resp := Response[sonic.NoCopyRawMessage]{Status: status, RetCode: 0, Data: sonic.NoCopyRawMessage(`{}`)}
+			if _, err := decodeResponse[map[string]any](ACTION_GET_STATUS, "echo-status", nil, resp); err == nil {
+				t.Fatalf("status %q was accepted", status)
+			}
+		})
+	}
+}
+
 
 func TestWaitEchoAfterSendTimeoutWrapsActionContext(t *testing.T) {
 	oldTimeout := EchoTimeOut

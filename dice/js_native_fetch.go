@@ -97,6 +97,9 @@ func (s *nativeFetchService) Start(call services.AsyncCall) error {
 	if err := jsNetworkAuthorizeWithContext(s.dice, executionContext, request.URL); err != nil {
 		return err
 	}
+	if err := jsCompatibilityExternalAccess(executionContext); err != nil {
+		return err
+	}
 	requestContext := context.WithValue(context.Background(), jsExecutionContextKey{}, executionContext)
 	var cancel context.CancelFunc
 	ctx := requestContext

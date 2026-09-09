@@ -17,6 +17,43 @@ Runtime plugin 是实现 `runtimeabi/include/scardice_runtime_v1.h` 的原生动
 
 因此，`Runtime Plugin != JavaScript Extension`。安装 runtime plugin 等同于安装受信任的进程内代码，只应使用可信来源提供的构建产物。
 
+## JavaScript compatibility baseline
+
+The observable JavaScript extension contract is versioned in
+[`dice/testdata/plugin_compat/manifest.v1.json`](../dice/testdata/plugin_compat/manifest.v1.json).
+The manifest is the trust boundary for the compatibility facade: listed
+supported names and values are commitments; private authority and deliberately
+unsupported compatibility writes (currently global `$m` and group `$g`
+attributes) fail with a stable error rather than being misrouted. Filesystem,
+network, and adapter effects remain externally ambiguous. The Goja fixture in
+the same directory is executable coverage of the current host bindings,
+context fields, callback order, and documented errors.
+For live callbacks, admission is scoped to the runtime generation and the
+stable callback identity plus provider event ID; a stale generation or a
+request executing in another realm is rejected rather than run. In the
+durable outbound compatibility path, `OnMessageSend` is scheduled only from
+a committed-success result, is best effort after that durable result, and is
+not an exactly-once notification guarantee.
+
+## Compatibility callbacks and replay
+
+The compatibility host has an explicit execution boundary. `live` may enter
+legacy JavaScript callbacks, schedule callback work, and capture durable
+outbox effects. Projection `replay` and shadow `rebuild` use event decoders
+and projectors only: they do not enter legacy callbacks, schedule callback
+work, or capture/enqueue effects. There is no generic replay-safe plugin API.
+
+After a live callback has crossed a permitted filesystem, network, or other
+external boundary, a lost/uncertain result is reported as
+`ambiguous` (`ErrJSExternalEffectAmbiguous`). The inbox lane remains blocked
+and the callback is not automatically rerun; only explicit operator
+resolution may retry it. Deterministic validation failures are reported
+separately and do not imply that an external effect occurred.
+
+The outbox mediates durable outbound effects only. It does not mediate,
+record, or make arbitrary filesystem/network calls replayable. Existing
+filesystem and network permission checks remain enforced before those calls.
+
 ## 安装与选择
 
 runtime plugin 不能由普通 JavaScript 扩展自动安装。管理员应在停止或维护窗口中将经过验证的归档解压到 runtime 根目录：

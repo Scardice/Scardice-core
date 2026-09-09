@@ -272,8 +272,12 @@ func (s *CallbackService) ProcessOne(ctx context.Context) (summary CallbackResul
 			}
 		}
 		completedAt := s.clock.Now().UTC()
+		terminalVersion, terminalErr := nextCallbackVersion(startedVersion)
+		if terminalErr != nil {
+			return s.afterMarkerFailure(summary, terminalErr, lease.Update, startedVersion)
+		}
 		terminal := eventstore.InboxUpdate{
-			InboxID: lease.Update.InboxID, ExpectedVersion: startedVersion, Version: startedVersion + 1,
+			InboxID: lease.Update.InboxID, ExpectedVersion: startedVersion, Version: terminalVersion,
 			Status: eventstore.InboxStatusConfirmedConsumed, LeaseOwner: lease.Update.LeaseOwner,
 			LeaseEpoch: lease.Update.LeaseEpoch, AttemptID: lease.Update.AttemptID,
 			LeaseExpiresAt: lease.Update.LeaseExpiresAt, CompletedAt: completedAt,
@@ -438,11 +442,12 @@ func validateClaimAt(update eventstore.InboxUpdate, now time.Time, workerID stri
 }
 
 func nextCallbackVersion(version uint64) (uint64, error) {
-	if version == ^uint64(0) {
+	if version >= ^uint64(0)>>1 {
 		return 0, eventstore.ErrVersionExhausted
 	}
 	return version + 1, nil
 }
+
 
 func isPreMarkerConflict(err error) bool {
 	return errors.Is(err, eventstore.ErrConflict) || errors.Is(err, eventstore.ErrParticipantConflict) || errors.Is(err, eventstore.ErrStaleLease)
@@ -682,6 +687,9 @@ func (c *MutationCollector) AddStream(stream eventstore.StreamID, expectedVersio
 	if c == nil || stream.AggregateType == "" || stream.AggregateID == "" || len(events) == 0 || stream.AggregateType == MessageWorkflowAggregateType || containsOverlayStream(stream) {
 		return ErrCallbackWorkflow
 	}
+	if c.streams == nil {
+		c.streams = make(map[eventstore.StreamID]eventstore.StreamAppend)
+	}
 	if _, exists := c.streams[stream]; exists {
 		return eventstore.ErrDuplicateStream
 	}
@@ -708,6 +716,9 @@ func (c *MutationCollector) AddStream(stream eventstore.StreamID, expectedVersio
 
 // AddGroupEvents serializes typed Group facts with the injected event factory.
 func (c *MutationCollector) AddGroupEvents(stream eventstore.StreamID, expectedVersion uint64, metadata eventstore.Metadata, events []groupstate.TypedEvent) error {
+	if c == nil {
+		return ErrCallbackUnavailable
+	}
 	encoded := make([]eventstore.NewEvent, 0, len(events))
 	for index, event := range events {
 		itemMetadata := metadata
@@ -723,8 +734,29 @@ func (c *MutationCollector) AddGroupEvents(stream eventstore.StreamID, expectedV
 	return c.AddStream(stream, expectedVersion, encoded)
 }
 
-// AddPlayerEvents serializes typed Player facts with the injected event factory.
 func (c *MutationCollector) AddPlayerEvents(stream eventstore.StreamID, expectedVersion uint64, metadata eventstore.Metadata, events []playerstate.PlayerEvent) error {
+	if c == nil {
+		return ErrCallbackUnavailable
+	}
+	encoded := make([]eventstore.NewEvent, 0, len(events))
+	for index, event := range events {
+		itemMetadata := metadata
+		if index > 0 {
+			itemMetadata.EventID = ""
+		}
+		item, err := playerstate.NewEventWithFactory(c.factory, event, itemMetadata)
+		if err != nil {
+			return err
+		}
+		encoded = append(encoded, item)
+	}
+	return c.AddStream(stream, expectedVersion, encoded)
+}
+// AddModerationEvents serializes typed moderation facts.
+func (c *MutationCollector) AddModerationEvents(stream eventstore.StreamID, expectedVersion uint64, metadata eventstore.Metadata, events []playerstate.ModerationEvent) error {
+	if c == nil {
+		return ErrCallbackUnavailable
+	}
 	encoded := make([]eventstore.NewEvent, 0, len(events))
 	for index, event := range events {
 		itemMetadata := metadata
@@ -740,8 +772,12 @@ func (c *MutationCollector) AddPlayerEvents(stream eventstore.StreamID, expected
 	return c.AddStream(stream, expectedVersion, encoded)
 }
 
+
 // AddGroupUserAttrsEvents serializes typed group-user attribute facts.
 func (c *MutationCollector) AddGroupUserAttrsEvents(stream eventstore.StreamID, expectedVersion uint64, metadata eventstore.Metadata, events []playerstate.GroupUserAttrsEvent) error {
+	if c == nil {
+		return ErrCallbackUnavailable
+	}
 	encoded := make([]eventstore.NewEvent, 0, len(events))
 	for index, event := range events {
 		itemMetadata := metadata
@@ -760,40 +796,72 @@ func (c *MutationCollector) AddGroupUserAttrsEvents(stream eventstore.StreamID, 
 // AddPluginKV adds an already encrypted plugin state update. Plaintext key or
 // value APIs are intentionally absent.
 func (c *MutationCollector) AddPluginKV(update eventstore.PluginKVUpdate) error {
-	if c == nil || strings.TrimSpace(update.ExtensionID) == "" || len(update.KeyHMAC) == 0 || update.ValueSize < 0 || update.ValueSize > eventstore.MaxPluginValueBytes || containsOverlayPlugin(update) {
+	return c.AddPluginKVBatch([]eventstore.PluginKVUpdate{update})
+}
+
+// AddPluginKVBatch validates every update before mutating the collector, so a
+// failed batch cannot leave a partially staged unit of work.
+func (c *MutationCollector) AddPluginKVBatch(updates []eventstore.PluginKVUpdate) error {
+	if c == nil || len(updates) == 0 {
 		return eventstore.ErrInvalidMetadata
 	}
-	if !update.Deleted && (len(update.KeyCiphertext) == 0 || len(update.KeyNonce) == 0 || len(update.ValueCiphertext) == 0 || len(update.ValueNonce) == 0 || strings.TrimSpace(update.EncryptionKeyID) == "") {
-		return eventstore.ErrInvalidMetadata
+	copied := make([]eventstore.PluginKVUpdate, len(updates))
+	seen := make(map[string]struct{}, len(updates))
+	for i, update := range updates {
+		if strings.TrimSpace(update.ExtensionID) == "" || len(update.KeyHMAC) == 0 || update.ValueSize < 0 || update.ValueSize > eventstore.MaxPluginValueBytes || containsOverlayPlugin(update) {
+			return eventstore.ErrInvalidMetadata
+		}
+		if !update.Deleted && (len(update.KeyCiphertext) == 0 || len(update.KeyNonce) == 0 || len(update.ValueCiphertext) == 0 || len(update.ValueNonce) == 0 || strings.TrimSpace(update.EncryptionKeyID) == "") {
+			return eventstore.ErrInvalidMetadata
+		}
+		key := pluginKey(update)
+		if _, exists := c.plugins[key]; exists {
+			return eventstore.ErrDuplicateParticipant
+		}
+		if _, exists := seen[key]; exists {
+			return eventstore.ErrDuplicateParticipant
+		}
+		seen[key] = struct{}{}
+		copied[i] = clonePlugin(update)
 	}
-	if _, exists := c.plugins[pluginKey(update)]; exists {
-		return eventstore.ErrDuplicateParticipant
+	if c.plugins == nil {
+		c.plugins = make(map[string]eventstore.PluginKVUpdate, len(copied))
 	}
-	update.KeyHMAC = append([]byte(nil), update.KeyHMAC...)
-	update.KeyCiphertext = append([]byte(nil), update.KeyCiphertext...)
-	update.KeyNonce = append([]byte(nil), update.KeyNonce...)
-	update.ValueCiphertext = append([]byte(nil), update.ValueCiphertext...)
-	update.ValueNonce = append([]byte(nil), update.ValueNonce...)
-	c.plugins[pluginKey(update)] = update
+	for i := range copied {
+		c.plugins[pluginKey(copied[i])] = copied[i]
+	}
 	return nil
 }
 
-// AddEffect adds a prevalidated encrypted outbound intent.
 func (c *MutationCollector) AddEffect(effect eventstore.NewEffect) error {
 	if c == nil || strings.TrimSpace(effect.EffectID) == "" || strings.TrimSpace(effect.EndpointID) == "" || len(effect.LaneHMAC) == 0 || strings.TrimSpace(effect.EffectType) == "" || !validRisk(effect.RiskClass) || effect.Status != eventstore.OutboxStatusPending || len(effect.PayloadCiphertext) == 0 || len(effect.PayloadNonce) == 0 || strings.TrimSpace(effect.PayloadEncryptionKeyID) == "" || containsOverlayEffect(effect) {
+		return eventstore.ErrInvalidMetadata
+	}
+	if effect.ExpectedVersion != 0 || effect.PrincipalID != "" {
 		return eventstore.ErrInvalidMetadata
 	}
 	if _, exists := c.effects[effect.EffectID]; exists {
 		return eventstore.ErrDuplicateParticipant
 	}
+	if len(c.subjectKey) > 0 && len(effect.SubjectKey) > 0 && !bytes.Equal(effect.SubjectKey, c.subjectKey) {
+		return eventstore.ErrInvalidMetadata
+	}
 	effect.LaneHMAC = append([]byte(nil), effect.LaneHMAC...)
-	if len(effect.SubjectKey) == 0 && len(c.subjectKey) == 32 { effect.SubjectKey = append([]byte(nil), c.subjectKey...) }
+	if len(c.subjectKey) > 0 {
+		effect.SubjectKey = append([]byte(nil), c.subjectKey...)
+	} else {
+		effect.SubjectKey = append([]byte(nil), effect.SubjectKey...)
+	}
 	effect.PayloadCiphertext = append([]byte(nil), effect.PayloadCiphertext...)
 	effect.PayloadNonce = append([]byte(nil), effect.PayloadNonce...)
 	effect.ContentDigest = append([]byte(nil), effect.ContentDigest...)
+	if c.effects == nil {
+		c.effects = make(map[string]eventstore.NewEffect)
+	}
 	c.effects[effect.EffectID] = effect
 	return nil
 }
+
 
 func (c *MutationCollector) addWorkflow(workflow WorkflowResult) error {
 	if err := validateWorkflowResult(&workflow); err != nil {
@@ -824,6 +892,7 @@ func (c *MutationCollector) unitOfWork() (eventstore.UnitOfWork, error) {
 		}
 		return streams[i].Stream.AggregateID < streams[j].Stream.AggregateID
 	})
+
 	plugins := make([]eventstore.PluginKVUpdate, 0, len(c.plugins))
 	for _, update := range c.plugins {
 		plugins = append(plugins, clonePlugin(update))
@@ -841,6 +910,11 @@ func (c *MutationCollector) unitOfWork() (eventstore.UnitOfWork, error) {
 	sort.Slice(effects, func(i, j int) bool { return effects[i].EffectID < effects[j].EffectID })
 	return eventstore.UnitOfWork{Streams: streams, PluginKVUpdates: plugins, Effects: effects}, nil
 }
+// UnitOfWork returns an owned snapshot suitable for an explicit commit.
+func (c *MutationCollector) UnitOfWork() (eventstore.UnitOfWork, error) {
+	return c.unitOfWork()
+}
+
 
 func pluginKey(update eventstore.PluginKVUpdate) string {
 	return update.ExtensionID + "\x00" + string(update.KeyHMAC)
@@ -850,6 +924,7 @@ func validRisk(value string) bool {
 }
 func cloneNewEvent(event eventstore.NewEvent) eventstore.NewEvent {
 	event.Payload = append([]byte(nil), event.Payload...)
+	event.Metadata.SubjectKey = append([]byte(nil), event.Metadata.SubjectKey...)
 	return event
 }
 func cloneStreamAppend(item eventstore.StreamAppend) eventstore.StreamAppend {
@@ -869,6 +944,7 @@ func clonePlugin(item eventstore.PluginKVUpdate) eventstore.PluginKVUpdate {
 }
 func cloneEffect(item eventstore.NewEffect) eventstore.NewEffect {
 	item.LaneHMAC = append([]byte(nil), item.LaneHMAC...)
+	item.SubjectKey = append([]byte(nil), item.SubjectKey...)
 	item.PayloadCiphertext = append([]byte(nil), item.PayloadCiphertext...)
 	item.PayloadNonce = append([]byte(nil), item.PayloadNonce...)
 	item.ContentDigest = append([]byte(nil), item.ContentDigest...)

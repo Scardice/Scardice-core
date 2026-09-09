@@ -162,7 +162,7 @@ func (e *emitterSocket) waitEchoAfterSend(ctx context.Context, action Action, ec
 }
 
 func decodeResponse[R any](action Action, echoId string, params any, resp Response[sonic.NoCopyRawMessage]) (*R, error) {
-	if strings.EqualFold(resp.Status, "failed") || resp.RetCode != 0 {
+	if !strings.EqualFold(resp.Status, "ok") || resp.RetCode != 0 {
 		return nil, fmt.Errorf("OneBot 动作执行失败: action=%s echo=%s params=%s response=%s",
 			action, echoId, marshalForError(params), marshalForError(resp))
 	}

@@ -1,6 +1,7 @@
 package eventstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"path/filepath"
@@ -33,6 +34,7 @@ func (task5Codec) Decrypt(_ context.Context, ciphertext, _ []byte, _ string) ([]
 	}
 	return append([]byte(nil), ciphertext[len(prefix):]...), nil
 }
+
 type task5CorruptCodec struct {
 	plaintext []byte
 }
@@ -52,6 +54,158 @@ func task5Store(t *testing.T) (*GORMStore, *Database, *task5Clock) {
 	}
 	clock := &task5Clock{now: time.Unix(100, 0).UTC()}
 	return NewStore(db, WithClock(clock), WithPayloadCodec(task5Codec{})), db, clock
+}
+func TestQuarantineOutboxScrubsLeaseAndAppendsAuditedFailure(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	effect := task5Effect("quarantine-effect", "quarantine-lane")
+	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
+		t.Fatal(err)
+	}
+	sourcePayload := []byte(`{"effectId":"quarantine-effect","operationId":"quarantine-operation","endpointId":"endpoint"}`)
+	if _, err := store.Commit(ctx, UnitOfWork{
+		Streams: []StreamAppend{{Stream: StreamID{AggregateType: "outbound-effect", AggregateID: effect.EffectID}, Events: []NewEvent{{
+			EventType: "OutboundEffectRequestedV1", SchemaVersion: 1, Payload: sourcePayload,
+			Metadata: Metadata{EventID: "source-event", CommandID: "source-command", CorrelationID: "source-correlation", PrincipalID: "source-principal", OccurredAt: time.Unix(100, 0).UTC()},
+		}}}},
+		Operations: []OperationUpdate{{OperationID: "quarantine-operation", ExpectedVersion: 0, Version: 1, Status: "pending", PrincipalID: "source-principal", ResourceID: effect.EffectID}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "quarantine-worker", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GORM().Model(&storeReadinessRow{}).Where("singleton_id = ?", "default").Update("mode", "import").Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.QuarantineOutbox(ctx, OutboxQuarantineRequest{
+		EffectID: lease.Effect.EffectID, ExpectedVersion: lease.Effect.Version,
+		WorkerID: lease.Effect.LeaseOwner, LeaseEpoch: lease.Effect.LeaseEpoch, AttemptID: lease.Effect.AttemptID,
+		ErrorCode: "raw-token-/secret", Reason: "raw /path/token",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var outbox outboxEffectRow
+	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&outbox).Error; err != nil {
+		t.Fatal(err)
+	}
+	if outbox.Status != OutboxStatusFailed || outbox.LeaseExpiry != nil || len(outbox.PayloadCiphertext) != 0 || len(outbox.PayloadNonce) != 0 {
+		t.Fatalf("quarantined outbox = %#v", outbox)
+	}
+	if outbox.ErrorCode == "raw-token-/secret" || outbox.ResolutionReason == "raw /path/token" {
+		t.Fatalf("quarantine retained raw diagnostic: %#v", outbox)
+	}
+	var operation operationRow
+	if err := db.GORM().Where("operation_id = ?", "quarantine-operation").First(&operation).Error; err != nil {
+		t.Fatal(err)
+	}
+	if operation.Status != "failed" || operation.Version != 2 || operation.ErrorCode == "" {
+		t.Fatalf("quarantined operation = %#v", operation)
+	}
+	events, err := store.Load(ctx, StreamID{AggregateType: "outbound-effect", AggregateID: effect.EffectID}, 2)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("quarantine result events=%#v err=%v", events, err)
+	}
+	var readiness storeReadinessRow
+	if err := db.GORM().Where("singleton_id = ?", "default").First(&readiness).Error; err != nil {
+		t.Fatal(err)
+	}
+	if readiness.TerminalGlobalPosition != events[0].GlobalPosition || readiness.TerminalProjectionPosition != events[0].GlobalPosition {
+		t.Fatalf("import readiness terminals = global %d/projection %d, event %d", readiness.TerminalGlobalPosition, readiness.TerminalProjectionPosition, events[0].GlobalPosition)
+	}
+	if events[0].EventType != "OutboundEffectFailedV1" || string(events[0].Payload) == "" || string(events[0].Payload) == string(sourcePayload) {
+		t.Fatalf("quarantine result event = %#v", events[0])
+	}
+	if bytes.Contains(events[0].Payload, []byte("raw-token")) || bytes.Contains(events[0].Payload, []byte("/path/token")) {
+		t.Fatalf("quarantine event retained raw diagnostic: %s", events[0].Payload)
+	}
+}
+func TestQuarantineOutboxAfterDispatchSettlesAmbiguous(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	effect := task5Effect("quarantine-dispatched", "quarantine-dispatched-lane")
+	effect.RiskClass = RiskNonIdempotentAfterDispatch
+	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{
+		Streams: []StreamAppend{{Stream: StreamID{AggregateType: "outbound-effect", AggregateID: effect.EffectID}, Events: []NewEvent{{
+			EventType: "OutboundEffectRequestedV1", SchemaVersion: 1,
+			Payload: []byte(`{"effectId":"quarantine-dispatched","operationId":"quarantine-dispatched-operation","endpointId":"endpoint"}`),
+			Metadata: Metadata{EventID: "source-event", CommandID: "source-command", CorrelationID: "source-correlation", PrincipalID: "source-principal", OccurredAt: time.Unix(100, 0).UTC()},
+		}}}},
+		Operations: []OperationUpdate{{OperationID: "quarantine-dispatched-operation", ExpectedVersion: 0, Version: 1, Status: "pending", PrincipalID: "source-principal", ResourceID: effect.EffectID}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "quarantine-worker", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatched, err := store.MarkOutboxDispatched(ctx, OutboxDispatchRequest{EffectID: effect.EffectID, WorkerID: lease.Effect.LeaseOwner, LeaseEpoch: lease.Effect.LeaseEpoch, AttemptID: lease.Effect.AttemptID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := OutboxQuarantineRequest{EffectID: effect.EffectID, ExpectedVersion: dispatched.Effect.Version, WorkerID: dispatched.Effect.LeaseOwner, LeaseEpoch: dispatched.Effect.LeaseEpoch, AttemptID: dispatched.Effect.AttemptID, ErrorCode: "terminal-persistence", Reason: "terminal persistence failed"}
+	if _, err := store.QuarantineOutbox(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	var outbox outboxEffectRow
+	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&outbox).Error; err != nil {
+		t.Fatal(err)
+	}
+	if outbox.Status != OutboxStatusAmbiguous {
+		t.Fatalf("quarantined dispatched outbox status = %q, want %q", outbox.Status, OutboxStatusAmbiguous)
+	}
+	var operation operationRow
+	if err := db.GORM().Where("operation_id = ?", "quarantine-dispatched-operation").First(&operation).Error; err != nil {
+		t.Fatal(err)
+	}
+	if operation.Status != "ambiguous" {
+		t.Fatalf("quarantined dispatched operation status = %q, want ambiguous", operation.Status)
+	}
+	events, err := store.Load(ctx, StreamID{AggregateType: "outbound-effect", AggregateID: effect.EffectID}, 2)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("quarantine events = %#v, err = %v", events, err)
+	}
+	if events[0].EventType != "OutboundEffectAmbiguousV1" {
+		t.Fatalf("quarantine event type = %q, want OutboundEffectAmbiguousV1", events[0].EventType)
+	}
+	if _, err := store.QuarantineOutbox(ctx, req); !errors.Is(err, ErrStaleLease) {
+		t.Fatalf("stale quarantine err = %v, want stale lease", err)
+	}
+}
+
+func TestPreDispatchRequeueRequiresNarrowLeaseAPI(t *testing.T) {
+	store, db, _ := task5Store(t)
+	defer db.Close()
+	effect := task5Effect("pre-requeue", "lane-pre")
+	effect.RiskClass = RiskNonIdempotentAfterDispatch
+	if _, err := store.AcceptOutbox(context.Background(), effect); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.ClaimOutbox(context.Background(), OutboxClaimRequest{WorkerID: "worker", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatched, err := store.MarkOutboxDispatched(context.Background(), OutboxDispatchRequest{EffectID: lease.Effect.EffectID, WorkerID: lease.Effect.LeaseOwner, LeaseEpoch: lease.Effect.LeaseEpoch, AttemptID: lease.Effect.AttemptID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.Commit(context.Background(), UnitOfWork{Effects: []NewEffect{{EffectID: dispatched.Effect.EffectID, ExpectedVersion: dispatched.Effect.Version, Version: dispatched.Effect.Version + 1, Status: OutboxStatusPending, LeaseOwner: dispatched.Effect.LeaseOwner, LeaseEpoch: dispatched.Effect.LeaseEpoch, AttemptID: dispatched.Effect.AttemptID}}})
+	if !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("generic pending transition err=%v", err)
+	}
+	result, err := store.RequeuePreDispatch(context.Background(), OutboxPreDispatchRequeueRequest{EffectID: dispatched.Effect.EffectID, WorkerID: dispatched.Effect.LeaseOwner, LeaseEpoch: dispatched.Effect.LeaseEpoch, AttemptID: dispatched.Effect.AttemptID, RetryCount: 1, NextAttemptAt: time.Now().Add(time.Minute)})
+	if err != nil || result.Version != dispatched.Effect.Version+1 {
+		t.Fatalf("narrow requeue result=%#v err=%v", result, err)
+	}
+	if _, err := store.RequeuePreDispatch(context.Background(), OutboxPreDispatchRequeueRequest{EffectID: dispatched.Effect.EffectID, WorkerID: dispatched.Effect.LeaseOwner, LeaseEpoch: dispatched.Effect.LeaseEpoch, AttemptID: dispatched.Effect.AttemptID}); !errors.Is(err, ErrStaleLease) {
+		t.Fatalf("stale requeue err=%v", err)
+	}
 }
 
 func task5Inbox(id, provider, lane string) InboxUpdate {
@@ -219,10 +373,10 @@ func TestTask5ConsumeArtifactCommitErrorNeverReturnsPlaintext(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := store.PutArtifact(ctx, ArtifactPutRequest{
-		ArtifactID: "artifact-commit-error",
-		OperationID: "artifact-commit-error-op",
+		ArtifactID:       "artifact-commit-error",
+		OperationID:      "artifact-commit-error-op",
 		OwnerPrincipalID: "owner",
-		Plaintext: []byte("secret"),
+		Plaintext:        []byte("secret"),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +495,6 @@ func TestTask5LeaseCommitErrorsReturnZeroLease(t *testing.T) {
 	}
 }
 
-
 func TestInboxConcurrentAcceptanceAllocatesUniqueSequences(t *testing.T) {
 	store, db, _ := task5Store(t)
 	defer db.Close()
@@ -435,7 +588,6 @@ func TestOutboxNonIdempotentDispatchExpiryBecomesAmbiguous(t *testing.T) {
 		t.Fatal(err)
 	}
 }
-
 
 func TestTask5PersistedVersionWidthOverflowFailsClosed(t *testing.T) {
 	store, db, _ := task5Store(t)
@@ -904,6 +1056,48 @@ func TestOutboxDispatchedExpiryScrubsBeforeAmbiguity(t *testing.T) {
 		t.Fatalf("dispatched expiry row = %#v", row)
 	}
 }
+func TestOutboxLeaseExpiryScrubsDispatchedNonIdempotentPayload(t *testing.T) {
+	store, db, clock := task5Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	effect := task5Effect("lease-only-scrub", "lease-only-scrub-lane")
+	effect.RiskClass = RiskNonIdempotentAfterDispatch
+	effect.PayloadExpiresAt = clock.Now().Add(5 * time.Minute)
+	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "worker", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatched, err := store.MarkOutboxDispatched(ctx, OutboxDispatchRequest{
+		EffectID: effect.EffectID,
+		WorkerID: claimed.Effect.LeaseOwner,
+		LeaseEpoch: claimed.Effect.LeaseEpoch,
+		AttemptID: claimed.Effect.AttemptID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := task5Effect("lease-only-scrub-followup", "lease-only-scrub-lane")
+	if _, err := store.AcceptOutbox(ctx, blocked); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Minute)
+	if _, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "other", LeaseDuration: time.Minute}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("lease-only expiry claim err = %v", err)
+	}
+	var row outboxEffectRow
+	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Version != dispatched.Effect.Version+1 || row.Status != OutboxStatusAmbiguous || row.LeaseOwner != "" || row.LeaseEpoch != 0 || row.AttemptID != "" || row.LeaseExpiry != nil || len(row.PayloadCiphertext) != 0 || len(row.PayloadNonce) != 0 || row.ScrubbedAt == nil {
+		t.Fatalf("lease-only expiry row = %#v", row)
+	}
+	if _, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "third", LeaseDuration: time.Minute}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ambiguous lane claim err = %v", err)
+	}
+}
 func TestOutboxUpdateDispatchedExpiryScrubs(t *testing.T) {
 	store, db, clock := task5Store(t)
 	defer db.Close()
@@ -1036,7 +1230,6 @@ func TestTask5StableDedupeAfterScrubAndLeaseRequiredTransitions(t *testing.T) {
 	store, db, _ := task5Store(t)
 	defer db.Close()
 	ctx := context.Background()
-
 
 	inbox := task5Inbox("stable-inbox", "stable-provider", "stable-lane")
 	inbox.ContentDigest = []byte("stable-digest")

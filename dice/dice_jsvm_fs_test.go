@@ -128,6 +128,50 @@ func TestJsFsAsyncDataPathOperations(t *testing.T) {
 		t.Fatalf("unexpected async fs result: %s", result)
 	}
 }
+func TestJsFsReplayDoesNotTouchDisk(t *testing.T) {
+	d := newTestFsDice(t)
+	loop := startFsTestLoop(t)
+	engineLoop := gojaengine.WrapEventLoop(loop)
+	executionContext := &jsExecutionContext{
+		Plugin:           &ExtInfo{Name: "fsReplay"},
+		CompatibilityMode: JSCompatibilityReplay,
+	}
+	err := jsengine.RunWithContext(engineLoop, executionContext, func(runtime jsengine.Runtime) error {
+		vm, ok := gojaengine.Raw(runtime)
+		if !ok {
+			return errors.New("Goja runtime adapter unavailable")
+		}
+		jsFsEnable(vm, d, loop, engineLoop)
+		_, err := runtime.RunString("replay-fs.js", `
+			const replayErrors = [];
+			for (const operation of [
+				() => fs.writeFile("data://sync.txt", "blocked"),
+				() => fs.readFile("data://sync.txt"),
+				() => fs.stat("data://sync.txt"),
+				() => fs.readDir("data://"),
+				() => fs.mkdir("data://new-directory"),
+				() => fs.remove("data://sync.txt"),
+			]) {
+				try {
+					operation();
+				} catch (err) {
+					replayErrors.push(String(err));
+				}
+			}
+			if (replayErrors.length !== 6 || replayErrors.some((err) => !err.includes("suppressed"))) {
+				throw new Error("replay fs operations were not suppressed: " + replayErrors.join("|"));
+			}
+		`)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataRoot := filepath.Join(d.BaseConfig.DataDir, "extensions", "fsReplay", "data")
+	if _, err := os.Stat(dataRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replay created filesystem state: stat err=%v", err)
+	}
+}
 
 func TestJsFsAsyncRejectsUnsafePaths(t *testing.T) {
 	d := newTestFsDice(t)

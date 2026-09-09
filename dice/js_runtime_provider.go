@@ -81,6 +81,9 @@ func (p *diceGojaProvider) Open(ctx context.Context, _ jsengine.RuntimeOptions) 
 			return jsengine.CurrentContext(engineLoop)
 		},
 		ScheduleOnLoop: func(context any, run func(*goja.Runtime) error) error {
+			if err := jsCompatibilitySchedulingAllowed(context); err != nil {
+				return err
+			}
 			return jsengine.ScheduleWithContext(engineLoop, context, func(runtime jsengine.Runtime) error {
 				vm, ok := gojaengine.Raw(runtime)
 				if !ok {

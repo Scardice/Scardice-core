@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -191,6 +192,7 @@ type ConfigManager struct {
 	filename string
 	Plugins  map[string]*PluginConfig
 	lock     sync.RWMutex
+	owner    *Dice
 }
 
 func NewConfigManager(filename string) *ConfigManager {
@@ -198,6 +200,13 @@ func NewConfigManager(filename string) *ConfigManager {
 		filename: filename,
 		Plugins:  make(map[string]*PluginConfig),
 	}
+}
+
+func (cm *ConfigManager) SetOwner(owner *Dice) {
+	if cm == nil {
+		return
+	}
+	cm.owner = owner
 }
 
 func (cm *ConfigManager) NewConfigItem(key string, defaultValue interface{}, description string) *ConfigItem {
@@ -209,32 +218,25 @@ func (cm *ConfigManager) NewConfigItem(key string, defaultValue interface{}, des
 	}
 }
 
-func (cm *ConfigManager) RegisterPluginConfig(pluginName string, configItems ...*ConfigItem) {
+func (cm *ConfigManager) RegisterPluginConfig(pluginName string, configItems ...*ConfigItem) error {
+	if cm == nil {
+		return errors.New("config manager is nil")
+	}
+	if cm.owner != nil && cm.owner.DurableStore != nil {
+		for _, item := range configItems {
+			if err := cm.owner.durableRegisterConfigByName(context.Background(), pluginName, item); err != nil {
+				return err
+			}
+		}
+	}
+
 	cm.lock.Lock()
 	defer cm.lock.Unlock()
-	// var allowedTypes = map[string]bool{
-	//	"string": true,
-	//	"bool":   true,
-	//	"int":    true,
-	//	"float":  true,
-	//	"array":  true,
-	// }
-
-	// var isValidType = func(t string) bool {
-	//	return allowedTypes[t]
-	// }
-
-	// Check if the plugin already exists
+	if cm.Plugins == nil {
+		cm.Plugins = make(map[string]*PluginConfig)
+	}
 	if existingPlugin, ok := cm.Plugins[pluginName]; ok {
-		// Create a set of new keys for easy lookup
-		newKeys := make(map[string]bool)
-		for _, item := range configItems {
-			newKeys[item.Key] = true
-		}
-
-		// Update or add new config items
 		for _, newItem := range configItems {
-			// if isValidType(newItem.Type) {
 			if existingItem, itemExists := existingPlugin.Configs[newItem.Key]; itemExists {
 				typeChanged := newItem.Type != "" && existingItem.Type != newItem.Type
 				if newItem.Type != "" {
@@ -246,14 +248,12 @@ func (cm *ConfigManager) RegisterPluginConfig(pluginName string, configItems ...
 				existingItem.DefaultValue = newItem.DefaultValue
 				existingItem.Option = newItem.Option
 				existingItem.Description = newItem.Description
-				existingItem.Deprecated = false // Reset deprecated flag
+				existingItem.Deprecated = false
 				existingItem.task = newItem.task
 				if typeChanged {
 					existingItem.Value = newItem.DefaultValue
 				}
 				existingPlugin.Configs[newItem.Key] = existingItem
-				// Extension can reorder config by re-registering it
-				// Time complexity of removing the old position is O(1) if the order doesn't change
 				for i, configKey := range existingPlugin.OrderedConfigKeys {
 					if configKey == existingItem.Key {
 						existingPlugin.OrderedConfigKeys = append(existingPlugin.OrderedConfigKeys[:i], existingPlugin.OrderedConfigKeys[i+1:]...)
@@ -266,7 +266,6 @@ func (cm *ConfigManager) RegisterPluginConfig(pluginName string, configItems ...
 				existingPlugin.OrderedConfigKeys = append(existingPlugin.OrderedConfigKeys, newItem.Key)
 			}
 		}
-
 		cm.Plugins[pluginName] = existingPlugin
 	} else {
 		configs := make(map[string]*ConfigItem)
@@ -281,10 +280,22 @@ func (cm *ConfigManager) RegisterPluginConfig(pluginName string, configItems ...
 			OrderedConfigKeys: orderedConfigKeys,
 		}
 	}
-	_ = cm.save()
+	return cm.save()
 }
 
 func (cm *ConfigManager) UnregisterConfig(pluginName string, keys ...string) {
+	if cm == nil {
+		return
+	}
+	if cm.owner != nil && cm.owner.DurableStore != nil {
+		for _, key := range keys {
+			if err := cm.owner.durableUnregisterConfigByName(context.Background(), pluginName, key); err != nil {
+				logger.M().Error("durable config unregister failed", pluginName, key, err)
+				return
+			}
+		}
+	}
+
 	cm.lock.Lock()
 	defer cm.lock.Unlock()
 
@@ -299,7 +310,6 @@ func (cm *ConfigManager) UnregisterConfig(pluginName string, keys ...string) {
 		}
 		delete(plugin.Configs, key)
 	}
-	// Remove from orderedConfigKeys
 	newOrderedConfigKeys := make([]string, 0, len(plugin.OrderedConfigKeys))
 	for _, configKey := range plugin.OrderedConfigKeys {
 		if _, ok := plugin.Configs[configKey]; ok {
@@ -316,9 +326,39 @@ func (cm *ConfigManager) UnregisterConfig(pluginName string, keys ...string) {
 }
 
 func (cm *ConfigManager) SetConfig(pluginName, key string, value interface{}) error {
+	if cm == nil {
+		return errors.New("config manager is nil")
+	}
+	if cm.owner != nil && cm.owner.DurableStore != nil {
+		cm.lock.RLock()
+		plugin := cm.Plugins[pluginName]
+		var configType string
+		if plugin != nil && plugin.Configs[key] != nil {
+			configType = plugin.Configs[key].Type
+		}
+		cm.lock.RUnlock()
+		if configType == "" {
+			return fmt.Errorf("plugin config %s/%s not found", pluginName, key)
+		}
+		durableValue := value
+		if strings.HasPrefix(configType, "task:once") {
+			text, ok := value.(string)
+			if !ok {
+				return errors.New("task config value must be a string")
+			}
+			_, normalized, err := parseTaskOnceExpr(text)
+			if err != nil {
+				return err
+			}
+			durableValue = normalized
+		}
+		if err := cm.owner.durableSetConfigByName(context.Background(), pluginName, key, durableValue); err != nil {
+			return err
+		}
+	}
+
 	cm.lock.Lock()
 	defer cm.lock.Unlock()
-
 	plugin, ok := cm.Plugins[pluginName]
 	if !ok {
 		return fmt.Errorf("plugin: %v not found", pluginName)
@@ -328,7 +368,10 @@ func (cm *ConfigManager) SetConfig(pluginName, key string, value interface{}) er
 	if exists {
 		switch configItem.Type {
 		case "task:cron", "task:daily", "task:once":
-			val := value.(string)
+			val, ok := value.(string)
+			if !ok {
+				return errors.New("task config value must be a string")
+			}
 			if configItem.Type == "task:once" {
 				_, normalized, err := parseTaskOnceExpr(val)
 				if err != nil {
@@ -337,10 +380,8 @@ func (cm *ConfigManager) SetConfig(pluginName, key string, value interface{}) er
 				val = normalized
 			}
 			configItem.Value = val
-			// 立即生效
 			if configItem.task != nil {
-				err := configItem.task.reset(val)
-				if err != nil {
+				if err := configItem.task.reset(val); err != nil {
 					return err
 				}
 			}
@@ -371,6 +412,27 @@ func (cm *ConfigManager) getConfig(pluginName, key string) *ConfigItem {
 }
 
 func (cm *ConfigManager) ResetConfigToDefault(pluginName, key string) {
+	if cm == nil {
+		return
+	}
+	if cm.owner != nil && cm.owner.DurableStore != nil {
+		cm.lock.RLock()
+		plugin := cm.Plugins[pluginName]
+		var defaultValue any
+		if plugin != nil && plugin.Configs[key] != nil {
+			defaultValue = plugin.Configs[key].DefaultValue
+		}
+		cm.lock.RUnlock()
+		if defaultValue == nil {
+			logger.M().Debug("plugin config default not found", pluginName, key)
+			return
+		}
+		if err := cm.owner.durableSetConfigByName(context.Background(), pluginName, key, defaultValue); err != nil {
+			logger.M().Error("durable config reset failed", pluginName, key, err)
+			return
+		}
+	}
+
 	cm.lock.Lock()
 	defer cm.lock.Unlock()
 	log := logger.M()
@@ -386,7 +448,10 @@ func (cm *ConfigManager) ResetConfigToDefault(pluginName, key string) {
 		log.Debug("reset config to default", pluginName, key)
 		configItem.Value = configItem.DefaultValue
 		if strings.HasPrefix(configItem.Type, "task:") {
-			taskVal := configItem.Value.(string)
+			taskVal, ok := configItem.Value.(string)
+			if !ok {
+				return
+			}
 			if configItem.Type == "task:once" {
 				_, normalized, err := parseTaskOnceExpr(taskVal)
 				if err == nil {
@@ -405,6 +470,9 @@ func (cm *ConfigManager) ResetConfigToDefault(pluginName, key string) {
 }
 
 func (cm *ConfigManager) save() error {
+	if cm != nil && cm.owner != nil && cm.owner.DurableStore != nil {
+		return nil
+	}
 	data, err := json.MarshalIndent(cm.Plugins, "", "\t")
 	if err != nil {
 		return err
@@ -2479,35 +2547,47 @@ func (d *Dice) ApplyExtDefaultSettings() {
 }
 
 func (d *Dice) Save(isAuto bool) {
+	if d == nil || (d.DurableStore != nil && d.Parent != nil && d.Parent.EventSourcedMode) {
+		return
+	}
 	d.ImSession.RefreshEndPointsSnapshot()
 	saveStartTime := time.Now()
 
 	configStartTime := time.Now()
 	if d.LastUpdatedTime != 0 {
-		totalConf := &struct {
-			// copy from Dice
-			ImSession     *IMSession  `jsbind:"imSession"     json:"-"             yaml:"imSession"`
-			DeckList      []*DeckInfo `jsbind:"deckList"      yaml:"deckList"`      // 牌堆信息
-			CommandPrefix []string    `jsbind:"commandPrefix" yaml:"commandPrefix"` // 指令前导
-			DiceMasters   []string    `jsbind:"diceMasters"   yaml:"diceMasters"`   // 骰主设置，需要格式: 平台:帐号
-
-			Config `yaml:",inline"`
+		legacyServe := &struct {
+			ImSession *IMSession  `yaml:"imSession"`
+			DeckList  []*DeckInfo `yaml:"deckList"`
 		}{
-			// 这些都是由于导出到 goja 无法拆分的字段
-			d.ImSession,
-			d.DeckList,
-			d.CommandPrefix,
-			d.DiceMasters,
-
-			d.Config,
+			ImSession: d.ImSession,
+			DeckList:  d.DeckList,
 		}
-		a, err1 := yaml.Marshal(totalConf)
-		advancedData, err2 := yaml.Marshal(d.AdvancedConfig)
+		serveData, serveErr := yaml.Marshal(legacyServe)
+		advancedData, advancedErr := []byte(nil), error(nil)
+		if !d.DurableStoreAttached() {
+			legacyConf := &struct {
+				ImSession     *IMSession  `yaml:"imSession"`
+				DeckList      []*DeckInfo `yaml:"deckList"`
+				CommandPrefix []string    `yaml:"commandPrefix"`
+				DiceMasters   []string    `yaml:"diceMasters"`
+				Config        `yaml:",inline"`
+			}{
+				ImSession:     d.ImSession,
+				DeckList:      d.DeckList,
+				CommandPrefix: d.CommandPrefix,
+				DiceMasters:   d.DiceMasters,
+				Config:        d.Config,
+			}
+			serveData, serveErr = yaml.Marshal(legacyConf)
+			advancedData, advancedErr = yaml.Marshal(d.AdvancedConfig)
+		}
 
-		if err1 == nil && err2 == nil {
-			err1 := utils.AtomicWriteFile(filepath.Join(d.BaseConfig.DataDir, "serve.yaml"), a, 0o644)
-			err2 := utils.AtomicWriteFile(filepath.Join(d.BaseConfig.DataDir, "advanced.yaml"), advancedData, 0o644)
-			if err1 == nil && err2 == nil {
+		if serveErr == nil && advancedErr == nil {
+			serveErr = utils.AtomicWriteFile(filepath.Join(d.BaseConfig.DataDir, "serve.yaml"), serveData, 0o644)
+			if !d.DurableStoreAttached() {
+				advancedErr = utils.AtomicWriteFile(filepath.Join(d.BaseConfig.DataDir, "advanced.yaml"), advancedData, 0o644)
+			}
+			if serveErr == nil && advancedErr == nil {
 				now := time.Now()
 				d.Config.LastSavedTime = &now
 				if isAuto {
@@ -2516,12 +2596,12 @@ func (d *Dice) Save(isAuto bool) {
 					d.Logger.Info("保存数据")
 				}
 				d.LastUpdatedTime = 0
-			} else if err1 != nil && err2 != nil {
-				d.Logger.Error("保存 serve.yaml 和 advanced.yaml 出错", err2)
-			} else if err1 != nil {
-				d.Logger.Error("保存 serve.yaml 出错", err1)
+			} else if serveErr != nil && advancedErr != nil {
+				d.Logger.Error("保存 serve.yaml 和 advanced.yaml 出错", advancedErr)
+			} else if serveErr != nil {
+				d.Logger.Error("保存 serve.yaml 出错", serveErr)
 			} else {
-				d.Logger.Error("保存 advanced.yaml 出错", err2)
+				d.Logger.Error("保存 advanced.yaml 出错", advancedErr)
 			}
 		}
 	}

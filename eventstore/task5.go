@@ -5,9 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"io"
 	"math"
 	"sort"
 	"strings"
@@ -32,11 +32,11 @@ func (e *task5ExpiredArtifactError) Error() string { return ErrArtifactGone.Erro
 func (e *task5ExpiredArtifactError) Unwrap() error { return ErrArtifactGone }
 
 const (
-	inboxLaneKind             = "inbox"
-	outboxLaneKind            = "outbox"
-	defaultLeaseDuration      = time.Minute
-	task5PayloadLimit         = 2 * 1024 * 1024
-	task5NonceLimit           = 12
+	inboxLaneKind              = "inbox"
+	outboxLaneKind             = "outbox"
+	defaultLeaseDuration       = time.Minute
+	task5PayloadLimit          = 2 * 1024 * 1024
+	task5NonceLimit            = 12
 	task5PayloadScrubBatchSize = 128
 )
 
@@ -262,6 +262,9 @@ func task5Begin(base *gorm.DB) (*gorm.DB, error) {
 }
 
 func task5Commit(tx *gorm.DB) error {
+	if err := markFreshInitializedTx(tx); err != nil {
+		return err
+	}
 	if err := tx.Commit().Error; err != nil {
 		return errors.New("eventstore: commit transaction failed")
 	}
@@ -397,7 +400,9 @@ func (s *GORMStore) AcceptInbox(ctx context.Context, update InboxUpdate) (result
 	if err := s.requireReady(ctx); err != nil {
 		return CommitResult{}, err
 	}
-	if len(update.SubjectKey) != 0 && len(update.SubjectKey) != 32 { return CommitResult{}, ErrInvalidMetadata }
+	if len(update.SubjectKey) != 0 && len(update.SubjectKey) != 32 {
+		return CommitResult{}, ErrInvalidMetadata
+	}
 	if update.InboxID == "" {
 		update.InboxID, err = s.task5ID()
 		if err != nil {
@@ -955,7 +960,9 @@ func (s *GORMStore) AcceptOutbox(ctx context.Context, effect NewEffect) (result 
 	if err := s.requireReady(ctx); err != nil {
 		return CommitResult{}, err
 	}
-	if len(effect.SubjectKey) != 0 && len(effect.SubjectKey) != 32 { return CommitResult{}, ErrInvalidMetadata }
+	if len(effect.SubjectKey) != 0 && len(effect.SubjectKey) != 32 {
+		return CommitResult{}, ErrInvalidMetadata
+	}
 	if effect.EffectID == "" {
 		effect.EffectID, err = s.task5ID()
 		if err != nil {
@@ -2409,7 +2416,7 @@ func inboxUpdateFromRow(row inboxMessageRow) InboxUpdate {
 	return InboxUpdate{
 		InboxID: row.InboxID, ExpectedVersion: row.Version, Version: row.Version,
 		EndpointID: row.EndpointID, ProviderEventKey: row.ProviderEventKey, LaneHMAC: task5Copy(row.LaneHMAC),
-		SubjectKey: task5Copy(row.SubjectKey),
+		SubjectKey:       task5Copy(row.SubjectKey),
 		OrderingSequence: row.OrderingSequence, Status: row.Status, LeaseOwner: row.LeaseOwner, LeaseEpoch: row.LeaseEpoch,
 		LeaseExpiresAt: valueTime(row.LeaseExpiry), AttemptID: row.AttemptID, PayloadCiphertext: task5Copy(row.PayloadCiphertext),
 		PayloadNonce: task5Copy(row.PayloadNonce), PayloadVersion: task5PayloadVersion(row.PayloadVersion), ContentDigest: task5Copy(row.ContentDigest), DigestKeyID: row.ContentDigestKeyID,
@@ -2425,7 +2432,7 @@ func effectFromRow(row outboxEffectRow) NewEffect {
 		EffectID: row.EffectID, ExpectedVersion: row.Version, Version: row.Version, EndpointID: row.EndpointID,
 		LaneHMAC: task5Copy(row.LaneHMAC), OrderingSequence: row.OrderingSequence, EffectType: row.EffectClass,
 		SubjectKey: task5Copy(row.SubjectKey),
-		RiskClass: row.RiskClass, Status: row.Status, AttemptID: row.AttemptID, LeaseOwner: row.LeaseOwner,
+		RiskClass:  row.RiskClass, Status: row.Status, AttemptID: row.AttemptID, LeaseOwner: row.LeaseOwner,
 		LeaseEpoch: row.LeaseEpoch, LeaseExpiresAt: valueTime(row.LeaseExpiry), DeadlineAt: valueTime(row.DeadlineAt),
 		NextAttemptAt: valueTime(row.NextAttemptAt), DispatchedAt: valueTime(row.DispatchedAt),
 		PayloadCiphertext: task5Copy(row.PayloadCiphertext), PayloadNonce: task5Copy(row.PayloadNonce), PayloadVersion: uint64(row.PayloadVersion),
@@ -2682,6 +2689,9 @@ func (s *GORMStore) ConsumeArtifact(ctx context.Context, req ArtifactConsumeRequ
 	if q.Error != nil {
 		return ArtifactResult{}, errors.New("eventstore: load artifact failed")
 	}
+	if req.OwnerPrincipalID != "" && req.OwnerPrincipalID != row.OwnerPrincipalID {
+		return ArtifactResult{}, ErrArtifactOwner
+	}
 	now := s.task5Now()
 	if row.Status != "available" && row.Status != "ready" {
 		return ArtifactResult{}, ErrArtifactGone
@@ -2765,6 +2775,7 @@ const (
 	task5MessageWorkflowAggregateType       = "message-workflow"
 	task5MessageWorkflowTerminatedEventType = "message-workflow.terminated"
 )
+
 func task5WorkflowEventContainsOverlay(event NewEvent) bool {
 	if strings.Contains(event.EventType, "$t") ||
 		strings.Contains(event.Metadata.EventID, "$t") ||
@@ -2852,7 +2863,6 @@ func task5WorkflowEventValidation(event NewEvent) error {
 	}
 	return nil
 }
-
 
 func task5WorkflowStreamCount(work UnitOfWork) int {
 	count := 0

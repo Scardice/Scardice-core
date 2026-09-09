@@ -165,6 +165,18 @@ func forceStop(c echo.Context) error {
 		err := recover()
 		log.Errorf("异常: %v\n堆栈: %v", err, string(debug.Stack()))
 		diceManager := dm
+		if diceManager.EventSourcedMode {
+			for _, instance := range diceManager.Dice {
+				if instance != nil && instance.Cron != nil {
+					instance.Cron.Stop()
+				}
+			}
+			if diceManager.Cron != nil {
+				diceManager.Cron.Stop()
+			}
+			log.Info("事件源 Core 清理完成，程序即将退出")
+			os.Exit(0)
+		}
 
 		for _, i := range diceManager.Dice {
 			if i.IsAlreadyLoadConfig {
@@ -498,6 +510,27 @@ func handleGetConfigs(c echo.Context) error {
 	}
 	pluginName := c.QueryParam("pluginName")
 	resp := getConfigResp{}
+	if myDice.DurableStoreAttached() {
+		state, err := myDice.DurableExtensionState(nil)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusServiceUnavailable, err.Error())
+		}
+		for _, id := range state.ExtensionOrder {
+			if pluginName != "" && id != pluginName {
+				continue
+			}
+			configs, err := myDice.DurableExtensionConfigItems(nil, id)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusServiceUnavailable, err.Error())
+			}
+			resp[id] = &apiPluginConfig{PluginName: id, Configs: configs}
+		}
+		data, err := json.Marshal(resp)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to marshal data")
+		}
+		return c.JSONBlob(http.StatusOK, data)
+	}
 	for k, v := range myDice.ConfigManager.Plugins {
 		if pluginName != "" && k != pluginName {
 			continue
@@ -645,45 +678,19 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 	e.GET(prefix+"/hello", hello2)
 	e.GET(prefix+"/log/fetchAndClear", logFetchAndClear)
 	e.GET(prefix+"/log/stream", logStream)
-	e.GET(prefix+"/im_connections/list", ImConnections)
-	e.GET(prefix+"/im_connections/get", ImConnectionsGet)
-
-	e.GET(prefix+"/im_connections/qq/get_versions", ImConnectionsGetQQVersions)
-	e.POST(prefix+"/im_connections/qrcode", ImConnectionsQrcodeGet)
-	e.POST(prefix+"/im_connections/sms_code_get", ImConnectionsSmsCodeGet)
-	e.POST(prefix+"/im_connections/sms_code_set", ImConnectionsSmsCodeSet)
-	e.POST(prefix+"/im_connections/gocq_captcha_set", ImConnectionsCaptchaSet)
-
-	// 这些都是与QQ/OneBot直接相关
-	e.POST(prefix+"/im_connections/addOnebot11ReverseWs", ImConnectionsAddReverseWs)
-	e.POST(prefix+"/im_connections/addGocqSeparate", ImConnectionsAddGocqSeparate)
-	// NOTE(lyjjl): 当前项目已经移除 gocq 支持，没有 对应 NewGoCqhttpConnectInfoItem。
-	// e.POST(prefix+"/im_connections/addBuiltinGocq", ImConnectionsAddBuiltinGocq)
-	e.POST(prefix+"/im_connections/addLagrange", ImConnectionsAddBuiltinLagrange)
-	// e.POST(prefix+"/im_connections/addLagrangeGo", ImConnectionsAddLagrangeGO)
-	e.POST(prefix+"/im_connections/addRed", ImConnectionsAddRed)
-	e.POST(prefix+"/im_connections/addOfficialQQ", ImConnectionsAddOfficialQQ)
-
-	e.POST(prefix+"/im_connections/addDiscord", ImConnectionsAddDiscord)
-	e.POST(prefix+"/im_connections/addKook", ImConnectionsAddKook)
-	e.POST(prefix+"/im_connections/addTelegram", ImConnectionsAddTelegram)
-	e.POST(prefix+"/im_connections/addMinecraft", ImConnectionsAddMinecraft)
-	e.POST(prefix+"/im_connections/addDodo", ImConnectionsAddDodo)
-	e.POST(prefix+"/im_connections/addDingtalk", ImConnectionsAddDingTalk)
-	e.POST(prefix+"/im_connections/addSlack", ImConnectionsAddSlack)
-	e.POST(prefix+"/im_connections/addSealChat", ImConnectionsAddSealChat)
-	e.POST(prefix+"/im_connections/addSatori", ImConnectionsAddSatori)
-	e.POST(prefix+"/im_connections/addMilky", ImConnectionsAddMilky)
-	e.POST(prefix+"/im_connections/addMilkyInternal", ImConnectionsAddMilkyInternal)
-
-	e.POST(prefix+"/im_connections/del", ImConnectionsDel)
-	e.POST(prefix+"/im_connections/set_enable", ImConnectionsSetEnable)
-	e.POST(prefix+"/im_connections/set_data", ImConnectionsSetData)
-	e.GET(prefix+"/im_connections/asset_base_url", ImConnectionsGetAssetBaseURL)
-	e.GET(prefix+"/im_connections/get_lgr_signinfo", ImConnectionsGetSignInfo)
-	e.POST(prefix+"/im_connections/gocqhttpRelogin", ImConnectionsGocqhttpRelogin)
-	e.POST(prefix+"/im_connections/walleQRelogin", ImConnectionsWalleQRelogin)
-	e.GET(prefix+"/im_connections/gocq_config_download.zip", ImConnectionsGocqConfigDownload)
+	e.GET(prefix+"/endpoints", endpointList)
+	e.POST(prefix+"/endpoints", endpointCreate)
+	e.GET(prefix+"/endpoints/:id", endpointGet)
+	e.PATCH(prefix+"/endpoints/:id/config", endpointConfigPatch)
+	e.POST(prefix+"/endpoints/:id/enable", endpointEnable)
+	e.POST(prefix+"/endpoints/:id/disable", endpointDisable)
+	e.POST(prefix+"/endpoints/:id/relogin", endpointRelogin)
+	e.POST(prefix+"/endpoints/:id/actions/:action", endpointAction)
+	e.GET(prefix+"/endpoints/:id/diagnostics", endpointDiagnostics)
+	e.DELETE(prefix+"/endpoints/:id", endpointDelete)
+	e.GET(prefix+"/operations/:id", operationGet)
+	e.POST(prefix+"/operations/:id/resolve", operationResolve)
+	e.GET(prefix+"/operations/:id/artifact", operationArtifact)
 
 	e.GET(prefix+"/configs/customText", customText)
 	e.POST(prefix+"/configs/customText/save", customTextSave)

@@ -8,6 +8,10 @@ import "Scardice-core/utils/jsengine"
 type jsExecutionContext struct {
 	Plugin *ExtInfo
 	Script *JsScriptInfo
+	// CompatibilityMode is live by default for existing callers. Replay and
+	// rebuild callers must set it explicitly before entering host services.
+	CompatibilityMode JSCompatibilityExecutionMode
+	ExternalEffects  *JSExternalEffectTracker
 }
 
 // jsExecutionContextIdentity is the comparable identity of one execution

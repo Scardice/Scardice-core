@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"sort"
-	"sync"
 	"strings"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -13,15 +13,15 @@ import (
 )
 
 var (
-	ErrChecksumMismatch          = errors.New("eventstore: checksum mismatch")
-	ErrParticipantConflict       = errors.New("eventstore: participant conflict")
-	ErrParticipantFailure        = errors.New("eventstore: participant failure")
+	ErrChecksumMismatch         = errors.New("eventstore: checksum mismatch")
+	ErrParticipantConflict      = errors.New("eventstore: participant conflict")
+	ErrParticipantFailure       = errors.New("eventstore: participant failure")
 	ErrProjectorFailure         = errors.New("eventstore: projector failure")
-	ErrInvalidProjector          = errors.New("eventstore: invalid projector")
+	ErrInvalidProjector         = errors.New("eventstore: invalid projector")
 	ErrDuplicateProjector       = errors.New("eventstore: duplicate projector")
 	ErrProjectorVersionConflict = errors.New("eventstore: projector version conflict")
 	ErrProjectorRegistryChanged = errors.New("eventstore: projector registry changed")
-	ErrLegacyProjector           = errors.New("eventstore: legacy projector requires A2 live compatibility")
+	ErrLegacyProjector          = errors.New("eventstore: legacy projector requires A2 live compatibility")
 	ErrProjectionInvariant      = errors.New("eventstore: projection invariant failed")
 	ErrVersionExhausted         = errors.New("eventstore: version exhausted")
 	ErrUnsupportedEventSchema   = ErrUnsupportedSchema
@@ -34,7 +34,8 @@ type ParticipantConflict struct {
 	CurrentVersion  uint64
 }
 
-type ParticipantConflictError struct { Conflicts []ParticipantConflict }
+type ParticipantConflictError struct{ Conflicts []ParticipantConflict }
+
 func (e *ParticipantConflictError) Error() string { return ErrParticipantConflict.Error() }
 func (e *ParticipantConflictError) Unwrap() error { return ErrParticipantConflict }
 
@@ -58,6 +59,7 @@ type ProjectorSpec = ProjectionDescriptor
 
 type ParticipantHook func(context.Context, *gorm.DB, UnitOfWork) error
 type StoreOption func(*GORMStore)
+
 func WithProjector(projector any) StoreOption {
 	return func(s *GORMStore) {
 		if err := s.RegisterProjector(projector); err != nil {
@@ -72,13 +74,25 @@ func WithProjection(descriptor ProjectionDescriptor) StoreOption {
 		}
 	}
 }
-func WithParticipant(hook ParticipantHook) StoreOption { return func(s *GORMStore) { s.RegisterParticipant(hook) } }
-func WithLockObserver(observer func(string)) StoreOption { return func(s *GORMStore) { s.SetLockObserver(observer) } }
+func WithParticipant(hook ParticipantHook) StoreOption {
+	return func(s *GORMStore) { s.RegisterParticipant(hook) }
+}
+func WithLockObserver(observer func(string)) StoreOption {
+	return func(s *GORMStore) { s.SetLockObserver(observer) }
+}
 func WithClock(clock Clock) StoreOption {
-	return func(s *GORMStore) { if clock != nil { s.clock = clock } }
+	return func(s *GORMStore) {
+		if clock != nil {
+			s.clock = clock
+		}
+	}
 }
 func WithIDGenerator(generator IDGenerator) StoreOption {
-	return func(s *GORMStore) { if generator != nil { s.ids = generator } }
+	return func(s *GORMStore) {
+		if generator != nil {
+			s.ids = generator
+		}
+	}
 }
 func WithPayloadCodec(codec any) StoreOption {
 	return func(s *GORMStore) {
@@ -98,22 +112,23 @@ func WithKeySource(source KeySource) StoreOption {
 }
 
 type GORMStore struct {
-	db *Database
-	mu sync.RWMutex
-	projectorMu sync.RWMutex
-	initErr error
-	readinessErr error
-	projectors []ProjectionDescriptor
-	participants []ParticipantHook
-	lockObserver func(string)
-	clock Clock
-	ids IDGenerator
-	codec any
-	keySource KeySource
+	db               *Database
+	mu               sync.RWMutex
+	projectorMu      sync.RWMutex
+	initErr          error
+	readinessErr     error
+	projectors       []ProjectionDescriptor
+	participants     []ParticipantHook
+	lockObserver     func(string)
+	clock            Clock
+	ids              IDGenerator
+	codec            any
+	keySource        KeySource
 	freshInitialized bool
-	freshBaseline Readiness
+	freshBaseline    Readiness
 	freshBaselineSet bool
 }
+
 func NewStore(database *Database, options ...StoreOption) *GORMStore {
 	s := &GORMStore{db: database, clock: SystemClock{}, ids: UUIDGenerator{}}
 	if database != nil && database.keySource != nil {
@@ -259,20 +274,31 @@ func (s *GORMStore) RegisterProjector(projector any) error {
 
 func (s *GORMStore) SetProjector(projector any) error { return s.RegisterProjector(projector) }
 func (s *GORMStore) RegisterParticipant(hook ParticipantHook) {
-	if s == nil || hook == nil { return }
-	s.mu.Lock(); defer s.mu.Unlock(); s.participants = append(s.participants, hook)
+	if s == nil || hook == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.participants = append(s.participants, hook)
 }
 func (s *GORMStore) SetParticipant(hook ParticipantHook) { s.RegisterParticipant(hook) }
 func (s *GORMStore) SetLockObserver(observer func(string)) {
-	if s == nil { return }
-	s.mu.Lock(); defer s.mu.Unlock(); s.lockObserver = observer
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lockObserver = observer
 }
 
 func (s *GORMStore) observeLock(name string) {
-	s.mu.RLock(); observer := s.lockObserver; s.mu.RUnlock()
-	if observer != nil { observer(name) }
+	s.mu.RLock()
+	observer := s.lockObserver
+	s.mu.RUnlock()
+	if observer != nil {
+		observer(name)
+	}
 }
-
 
 func locked(db *gorm.DB) *gorm.DB {
 	if db != nil && db.Dialector.Name() != "sqlite" {
@@ -282,24 +308,44 @@ func locked(db *gorm.DB) *gorm.DB {
 }
 
 func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitResult, err error) {
-	if ctx == nil { ctx = context.Background() }
-	if err = ValidateUnitOfWork(work); err != nil { return CommitResult{}, err }
-	if initErr := s.requireReady(ctx); initErr != nil { return CommitResult{}, initErr }
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err = ValidateUnitOfWork(work); err != nil {
+		return CommitResult{}, err
+	}
+	if initErr := s.requireReady(ctx); initErr != nil {
+		return CommitResult{}, initErr
+	}
 	base := (*gorm.DB)(nil)
-	if s.db != nil { base = s.db.GORM() }
-	if base == nil { return CommitResult{}, errors.New("eventstore: store unavailable") }
-	if ctx == nil { ctx = context.Background() }
+	if s.db != nil {
+		base = s.db.GORM()
+	}
+	if base == nil {
+		return CommitResult{}, errors.New("eventstore: store unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	tx := base.WithContext(ctx).Begin()
-	if tx.Error != nil { return CommitResult{}, errors.New("eventstore: begin transaction failed") }
+	if tx.Error != nil {
+		return CommitResult{}, errors.New("eventstore: begin transaction failed")
+	}
 	committed := false
 	defer func() {
-		if !committed { _ = tx.Rollback().Error }
+		if !committed {
+			_ = tx.Rollback().Error
+		}
 	}()
 
 	var readiness storeReadinessRow
-	if err = locked(tx).Where("singleton_id = ?", "default").First(&readiness).Error; err != nil { return CommitResult{}, errors.New("eventstore: lock readiness failed") }
+	if err = locked(tx).Where("singleton_id = ?", "default").First(&readiness).Error; err != nil {
+		return CommitResult{}, errors.New("eventstore: lock readiness failed")
+	}
 	var control projectionControlRow
-	if err = locked(tx).Where("singleton_id = ?", "default").First(&control).Error; err != nil { return CommitResult{}, errors.New("eventstore: lock projection control failed") }
+	if err = locked(tx).Where("singleton_id = ?", "default").First(&control).Error; err != nil {
+		return CommitResult{}, errors.New("eventstore: lock projection control failed")
+	}
 	if control.PublicationState != "published" {
 		return CommitResult{}, ErrReadinessQuarantined
 	}
@@ -338,9 +384,14 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 	}
 	s.observeLock(tableProjectionControl)
 
-	type headState struct { stream StreamID; current uint64 }
+	type headState struct {
+		stream  StreamID
+		current uint64
+	}
 	headOrder := make([]StreamID, 0, len(work.Streams))
-	for _, item := range work.Streams { headOrder = append(headOrder, item.Stream) }
+	for _, item := range work.Streams {
+		headOrder = append(headOrder, item.Stream)
+	}
 	sort.Slice(headOrder, func(i, j int) bool { return streamLess(headOrder[i], headOrder[j]) })
 	headStates := make(map[StreamID]headState, len(headOrder))
 	for _, stream := range headOrder {
@@ -348,8 +399,12 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 		q := locked(tx).Where("aggregate_type = ? AND aggregate_id = ?", stream.AggregateType, stream.AggregateID).First(&head)
 		if errors.Is(q.Error, gorm.ErrRecordNotFound) {
 			head = aggregateHeadRow{AggregateType: stream.AggregateType, AggregateID: stream.AggregateID, UpdatedAt: time.Now().UTC()}
-			if q = tx.Create(&head); q.Error != nil { return CommitResult{}, errors.New("eventstore: materialize aggregate head failed") }
-		} else if q.Error != nil { return CommitResult{}, errors.New("eventstore: lock aggregate head failed") }
+			if q = tx.Create(&head); q.Error != nil {
+				return CommitResult{}, errors.New("eventstore: materialize aggregate head failed")
+			}
+		} else if q.Error != nil {
+			return CommitResult{}, errors.New("eventstore: lock aggregate head failed")
+		}
 		headStates[stream] = headState{stream: stream, current: head.CurrentVersion}
 		s.observeLock(tableAggregateHeads)
 	}
@@ -361,18 +416,28 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 			conflicts = append(conflicts, StreamConflict{Stream: item.Stream, ExpectedVersion: item.ExpectedVersion, CurrentVersion: current})
 		}
 	}
-	if len(conflicts) != 0 { return CommitResult{}, &ConflictError{Conflicts: conflicts} }
+	if len(conflicts) != 0 {
+		return CommitResult{}, &ConflictError{Conflicts: conflicts}
+	}
 
 	totalEvents := 0
-	for _, item := range work.Streams { totalEvents += len(item.Events) }
 	for _, item := range work.Streams {
-		if uint64(len(item.Events)) > maxUint64-headStates[item.Stream].current { return CommitResult{}, ErrVersionExhausted }
+		totalEvents += len(item.Events)
+	}
+	for _, item := range work.Streams {
+		if uint64(len(item.Events)) > maxUint64-headStates[item.Stream].current {
+			return CommitResult{}, ErrVersionExhausted
+		}
 	}
 	var sequence eventGlobalSequenceRow
 	if totalEvents > 0 {
-		if err = locked(tx).Where("singleton_id = ?", "default").First(&sequence).Error; err != nil { return CommitResult{}, errors.New("eventstore: lock event sequence failed") }
+		if err = locked(tx).Where("singleton_id = ?", "default").First(&sequence).Error; err != nil {
+			return CommitResult{}, errors.New("eventstore: lock event sequence failed")
+		}
 		s.observeLock(tableEventGlobalSequence)
-		if uint64(totalEvents) > maxUint64-sequence.NextPosition { return CommitResult{}, ErrVersionExhausted }
+		if uint64(totalEvents) > maxUint64-sequence.NextPosition {
+			return CommitResult{}, ErrVersionExhausted
+		}
 	}
 
 	result.StreamVersions = make(map[StreamID]uint64, len(work.Streams))
@@ -383,26 +448,42 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 			version := headStates[item.Stream].current
 			for _, event := range item.Events {
 				version, err = nextVersion(version)
-				if err != nil { return CommitResult{}, err }
+				if err != nil {
+					return CommitResult{}, err
+				}
 				envelope, envelopeErr := (EventFactory{}).Envelope(item.Stream, version, position, event)
-				if envelopeErr != nil { return CommitResult{}, envelopeErr }
+				if envelopeErr != nil {
+					return CommitResult{}, envelopeErr
+				}
 				row := domainEventRow{EventID: envelope.EventID, AggregateType: envelope.Stream.AggregateType, AggregateID: envelope.Stream.AggregateID, AggregateVersion: envelope.StreamVersion, GlobalPosition: envelope.GlobalPosition, EventType: envelope.EventType, SchemaVersion: envelope.SchemaVersion, Payload: envelope.Payload, CommandID: envelope.Metadata.CommandID, CorrelationID: envelope.Metadata.CorrelationID, CausationID: envelope.Metadata.CausationID, PrincipalID: envelope.Metadata.PrincipalID, Producer: envelope.Metadata.Producer, OccurredAtUnixNanoUTC: metadataUnixNano(envelope.Metadata), Checksum: append([]byte(nil), envelope.Checksum[:]...), CreatedAt: time.Now().UTC()}
-				if err = tx.Create(&row).Error; err != nil { return CommitResult{}, errors.New("eventstore: insert domain event failed") }
+				if err = tx.Create(&row).Error; err != nil {
+					return CommitResult{}, errors.New("eventstore: insert domain event failed")
+				}
 				result.Events = append(result.Events, envelope)
 				position, err = nextVersion(position)
-				if err != nil { return CommitResult{}, err }
+				if err != nil {
+					return CommitResult{}, err
+				}
 			}
 			result.StreamVersions[item.Stream] = version
 		}
 		sequence.NextPosition = position
 		sequence.UpdatedAt = time.Now().UTC()
-		if err = tx.Model(&eventGlobalSequenceRow{}).Where("singleton_id = ?", "default").Updates(map[string]any{"next_position": sequence.NextPosition, "updated_at": sequence.UpdatedAt}).Error; err != nil { return CommitResult{}, errors.New("eventstore: advance event sequence failed") }
+		if err = tx.Model(&eventGlobalSequenceRow{}).Where("singleton_id = ?", "default").Updates(map[string]any{"next_position": sequence.NextPosition, "updated_at": sequence.UpdatedAt}).Error; err != nil {
+			return CommitResult{}, errors.New("eventstore: advance event sequence failed")
+		}
 	} else {
-		for _, item := range work.Streams { result.StreamVersions[item.Stream] = headStates[item.Stream].current }
+		for _, item := range work.Streams {
+			result.StreamVersions[item.Stream] = headStates[item.Stream].current
+		}
 	}
 	for _, item := range work.Streams {
-		if len(item.Events) == 0 { continue }
-		if err = tx.Model(&aggregateHeadRow{}).Where("aggregate_type = ? AND aggregate_id = ?", item.Stream.AggregateType, item.Stream.AggregateID).Updates(map[string]any{"current_version": result.StreamVersions[item.Stream], "updated_at": time.Now().UTC()}).Error; err != nil { return CommitResult{}, errors.New("eventstore: advance aggregate head failed") }
+		if len(item.Events) == 0 {
+			continue
+		}
+		if err = tx.Model(&aggregateHeadRow{}).Where("aggregate_type = ? AND aggregate_id = ?", item.Stream.AggregateType, item.Stream.AggregateID).Updates(map[string]any{"current_version": result.StreamVersions[item.Stream], "updated_at": time.Now().UTC()}).Error; err != nil {
+			return CommitResult{}, errors.New("eventstore: advance aggregate head failed")
+		}
 	}
 
 	if err = s.applyParticipants(ctx, tx, work, &result); err != nil {
@@ -430,6 +511,14 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 		}
 		return CommitResult{}, err
 	}
+	if readiness.Mode == "fresh" &&
+		(len(work.Streams) > 0 || len(work.Operations) > 0 || len(work.InboxUpdates) > 0 ||
+			len(work.Effects) > 0 || len(work.ArtifactUpdates) > 0 || len(work.SecretUpdates) > 0 ||
+			len(work.PluginKVUpdates) > 0 || len(work.FenceUpdates) > 0) {
+		if err = markFreshInitializedTx(tx); err != nil {
+			return CommitResult{}, err
+		}
+	}
 	s.projectorMu.RLock()
 	projectors := append([]ProjectionDescriptor(nil), s.projectors...)
 	s.projectorMu.RUnlock()
@@ -454,20 +543,24 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 	if readiness.Mode == "import" && len(result.Events) > 0 {
 		latest := result.Events[len(result.Events)-1].GlobalPosition
 		if err = tx.Model(&storeReadinessRow{}).Where("singleton_id = ?", "default").Updates(map[string]any{
-			"terminal_global_position": latest,
+			"terminal_global_position":     latest,
 			"terminal_projection_position": control.TerminalPosition,
 		}).Error; err != nil {
 			return CommitResult{}, errors.New("eventstore: advance readiness terminals failed")
 		}
 	}
 	for _, hook := range participants {
-		if hookErr := hook(ctx, tx, work); hookErr != nil { return CommitResult{}, ErrParticipantFailure }
+		if hookErr := hook(ctx, tx, work); hookErr != nil {
+			return CommitResult{}, ErrParticipantFailure
+		}
 	}
 	if len(projectors) > 0 {
 		tx = tx.Set(projectionGenerationKey, control.ActiveGeneration)
 	}
 	for _, descriptor := range projectors {
-		if hookErr := descriptor.Apply(ctx, tx, result.Events); hookErr != nil { return CommitResult{}, ErrProjectorFailure }
+		if hookErr := descriptor.Apply(ctx, tx, result.Events); hookErr != nil {
+			return CommitResult{}, ErrProjectorFailure
+		}
 	}
 	s.projectorMu.RLock()
 	currentProjectors := append([]ProjectionDescriptor(nil), s.projectors...)
@@ -477,32 +570,52 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 	}
 	commitErr := tx.Commit().Error
 	s.projectorMu.RUnlock()
-	if err = commitErr; err != nil { return CommitResult{}, errors.New("eventstore: commit transaction failed") }
+	if err = commitErr; err != nil {
+		return CommitResult{}, errors.New("eventstore: commit transaction failed")
+	}
 	return result, nil
 }
 
 func streamLess(a, b StreamID) bool {
-	if a.AggregateType != b.AggregateType { return a.AggregateType < b.AggregateType }
+	if a.AggregateType != b.AggregateType {
+		return a.AggregateType < b.AggregateType
+	}
 	return a.AggregateID < b.AggregateID
 }
 
 func (s *GORMStore) Load(ctx context.Context, stream StreamID, fromVersion uint64) ([]Envelope, error) {
-	if s == nil { return nil, errors.New("eventstore: store unavailable") }
+	if s == nil {
+		return nil, errors.New("eventstore: store unavailable")
+	}
 	base := (*gorm.DB)(nil)
-	if s.db != nil { base = s.db.GORM() }
-	if base == nil { return nil, errors.New("eventstore: store unavailable") }
-	if ctx == nil { ctx = context.Background() }
-	if err := s.requireReady(ctx); err != nil { return nil, err }
+	if s.db != nil {
+		base = s.db.GORM()
+	}
+	if base == nil {
+		return nil, errors.New("eventstore: store unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := s.requireReady(ctx); err != nil {
+		return nil, err
+	}
 	var rows []domainEventRow
 	q := base.WithContext(ctx).Where("aggregate_type = ? AND aggregate_id = ? AND aggregate_version >= ?", stream.AggregateType, stream.AggregateID, fromVersion).Order("aggregate_version ASC").Find(&rows)
-	if q.Error != nil { return nil, errors.New("eventstore: load events failed") }
+	if q.Error != nil {
+		return nil, errors.New("eventstore: load events failed")
+	}
 	envelopes := make([]Envelope, 0, len(rows))
 	for _, row := range rows {
 		var checksum EventChecksum
-		if len(row.Checksum) != len(checksum) { return nil, ErrChecksumMismatch }
+		if len(row.Checksum) != len(checksum) {
+			return nil, ErrChecksumMismatch
+		}
 		copy(checksum[:], row.Checksum)
 		envelope := Envelope{Stream: stream, StreamVersion: row.AggregateVersion, GlobalPosition: row.GlobalPosition, EventID: row.EventID, EventType: row.EventType, SchemaVersion: row.SchemaVersion, Payload: copyProjectionBytes(row.Payload), Metadata: Metadata{EventID: row.EventID, CommandID: row.CommandID, CorrelationID: row.CorrelationID, CausationID: row.CausationID, PrincipalID: row.PrincipalID, Producer: row.Producer, OccurredAtUnixNanoUTC: row.OccurredAtUnixNanoUTC, OccurredAtUnixNanoSet: true}, Checksum: checksum}
-		if ComputeEventChecksum(envelope) != checksum { return nil, ErrChecksumMismatch }
+		if ComputeEventChecksum(envelope) != checksum {
+			return nil, ErrChecksumMismatch
+		}
 		envelopes = append(envelopes, envelope)
 	}
 	return envelopes, nil
@@ -527,7 +640,12 @@ func (s *GORMStore) GetOperation(ctx context.Context, operationID string) (Opera
 		return OperationView{}, ErrNotFound
 	}
 	var row operationRow
-	queryErr := s.db.GORM().WithContext(ctx).Select("operation_id", "version", "kind", "status", "result_code", "error_code", "artifact_id", "created_at", "updated_at", "expires_at").Where("operation_id = ?", operationID).First(&row).Error
+	queryErr := s.db.GORM().WithContext(ctx).Select(
+		"operation_id", "version", "kind", "status", "principal_id", "resource_id",
+		"idempotency_scope", "idempotency_key", "request_id", "request_digest",
+		"correlation_id", "result_code", "error_code", "artifact_id",
+		"created_at", "updated_at", "expires_at",
+	).Where("operation_id = ?", operationID).First(&row).Error
 	if errors.Is(queryErr, gorm.ErrRecordNotFound) {
 		return OperationView{}, ErrNotFound
 	}
@@ -535,8 +653,12 @@ func (s *GORMStore) GetOperation(ctx context.Context, operationID string) (Opera
 		return OperationView{}, ErrParticipantFailure
 	}
 	return OperationView{
-		OperationID: row.OperationID, Version: row.Version, Kind: row.Kind, Status: row.Status,
-		ResultCode: row.ResultCode, ErrorCode: row.ErrorCode, ArtifactID: row.ArtifactRef,
+		OperationID: row.OperationID, Version: row.Version, Kind: row.Kind,
+		Status: row.Status, PrincipalID: row.PrincipalID, ResourceID: row.ResourceID,
+		IdempotencyScope: row.IdempotencyScope, IdempotencyKey: row.IdempotencyKey,
+		RequestID: row.RequestID, RequestDigest: append([]byte(nil), row.RequestDigest...),
+		CorrelationID: row.CorrelationID, ResultCode: row.ResultCode,
+		ErrorCode: row.ErrorCode, ArtifactID: row.ArtifactRef,
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, ExpiresAt: valueTime(row.ExpiresAt),
 	}, nil
 }
@@ -611,8 +733,13 @@ func (s *GORMStore) Purge(ctx context.Context, req PrivacyPurgeRequest) (Privacy
 	return PrivacyPurgeResult{OperationID: req.OperationID, Deleted: deleted}, nil
 }
 
+func (s *GORMStore) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
+}
 
-func (s *GORMStore) Close() error { if s == nil || s.db == nil { return nil }; return s.db.Close() }
 const maxUint64 = ^uint64(0)
 const maxPersistedVersion = uint64(^uint64(0) >> 1)
 
@@ -623,45 +750,120 @@ func nextVersion(current uint64) (uint64, error) {
 	return current + 1, nil
 }
 
-
 func participantVersion(expected, current, supplied uint64, table, key string) error {
-	if expected != current { return &ParticipantConflictError{Conflicts: []ParticipantConflict{{Table: table, Key: key, ExpectedVersion: expected, CurrentVersion: current}}} }
+	if expected != current {
+		return &ParticipantConflictError{Conflicts: []ParticipantConflict{{Table: table, Key: key, ExpectedVersion: expected, CurrentVersion: current}}}
+	}
 	if supplied != 0 {
-		if current >= maxPersistedVersion { return ErrVersionExhausted }
-		if supplied != current+1 { return &ParticipantConflictError{Conflicts: []ParticipantConflict{{Table: table, Key: key, ExpectedVersion: supplied, CurrentVersion: current}}} }
+		if current >= maxPersistedVersion {
+			return ErrVersionExhausted
+		}
+		if supplied != current+1 {
+			return &ParticipantConflictError{Conflicts: []ParticipantConflict{{Table: table, Key: key, ExpectedVersion: supplied, CurrentVersion: current}}}
+		}
 	}
 	return nil
 }
 
 func participantCAS(table, key string, expected, current uint64, q *gorm.DB) error {
-	if q.Error != nil { return ErrParticipantFailure }
+	if q.Error != nil {
+		return ErrParticipantFailure
+	}
 	if current != 0 && q.RowsAffected != 1 {
 		return &ParticipantConflictError{Conflicts: []ParticipantConflict{{Table: table, Key: key, ExpectedVersion: expected, CurrentVersion: current}}}
 	}
 	return nil
 }
 func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work UnitOfWork, result *CommitResult) error {
-	applyOps := func() error { ops := append([]OperationUpdate(nil), work.Operations...); sort.Slice(ops, func(i,j int) bool{return ops[i].OperationID < ops[j].OperationID})
-	for _, update := range ops {
-		if update.OperationID == "" { return ErrParticipantFailure }
-		var row operationRow
-		q := tx.Where("operation_id = ?", update.OperationID).First(&row)
-		current := uint64(0)
-		if q.Error == nil { current = row.Version } else if !errors.Is(q.Error, gorm.ErrRecordNotFound) { return ErrParticipantFailure }
-		if err := participantVersion(update.ExpectedVersion, current, update.Version, tableOperations, "<redacted>"); err != nil { return err }
-		version, err := nextVersion(current); if err != nil { return err }; now := chooseTime(update.UpdatedAt, time.Now().UTC())
-		if current > 0 && update.PrincipalID != "" && update.PrincipalID != row.PrincipalID && (len(update.PrivateContextCiphertext) == 0 || len(update.PrivateContextNonce) == 0 || update.EncryptionKeyID == "") {
-			return ErrInvalidTransition
+	applyOps := func() error {
+		ops := append([]OperationUpdate(nil), work.Operations...)
+		sort.Slice(ops, func(i, j int) bool { return ops[i].OperationID < ops[j].OperationID })
+		for _, update := range ops {
+			if update.OperationID == "" {
+				return ErrParticipantFailure
+			}
+			var row operationRow
+			q := tx.Where("operation_id = ?", update.OperationID).First(&row)
+			current := uint64(0)
+			if q.Error == nil {
+				current = row.Version
+			} else if !errors.Is(q.Error, gorm.ErrRecordNotFound) {
+				return ErrParticipantFailure
+			}
+			if err := participantVersion(update.ExpectedVersion, current, update.Version, tableOperations, "<redacted>"); err != nil {
+				return err
+			}
+			version, err := nextVersion(current)
+			if err != nil {
+				return err
+			}
+			now := chooseTime(update.UpdatedAt, time.Now().UTC())
+			if current > 0 && update.PrincipalID != "" && update.PrincipalID != row.PrincipalID && (len(update.PrivateContextCiphertext) == 0 || len(update.PrivateContextNonce) == 0 || update.EncryptionKeyID == "") {
+				return ErrInvalidTransition
+			}
+			if current == 0 {
+				row = operationRow{OperationID: update.OperationID, Version: version, Kind: nonempty(update.Kind, "unknown"), Status: nonempty(update.Status, "pending"), PrincipalID: nonempty(update.PrincipalID, update.OperationID), ResourceType: nonempty(update.ResourceID, "unknown"), ResourceID: update.ResourceID, IdempotencyScope: nonempty(update.IdempotencyScope, "operation"), IdempotencyKey: nonempty(update.IdempotencyKey, update.OperationID), RequestID: update.RequestID, RequestDigest: update.RequestDigest, CorrelationID: update.CorrelationID, ResultCode: update.ResultCode, ErrorCode: update.ErrorCode, ArtifactRef: update.ArtifactID, PrivatePayloadVersion: 1, PrivateContext: update.PrivateContextCiphertext, PrivateNonce: update.PrivateContextNonce, PrivateKeyID: update.EncryptionKeyID, CreatedAt: chooseTime(update.CreatedAt, now), UpdatedAt: now, ExpiresAt: timePtr(update.ExpiresAt)}
+				q = tx.Create(&row)
+			} else {
+				if update.Kind != "" {
+					row.Kind = update.Kind
+				}
+				if update.Status != "" {
+					row.Status = update.Status
+				}
+				if update.PrincipalID != "" {
+					row.PrincipalID = update.PrincipalID
+				}
+				if update.ResourceID != "" {
+					row.ResourceID = update.ResourceID
+				}
+				if update.IdempotencyScope != "" {
+					row.IdempotencyScope = update.IdempotencyScope
+				}
+				if update.IdempotencyKey != "" {
+					row.IdempotencyKey = update.IdempotencyKey
+				}
+				if update.RequestID != "" {
+					row.RequestID = update.RequestID
+				}
+				if len(update.RequestDigest) > 0 {
+					row.RequestDigest = update.RequestDigest
+				}
+				if update.CorrelationID != "" {
+					row.CorrelationID = update.CorrelationID
+				}
+				if update.ResultCode != "" {
+					row.ResultCode = update.ResultCode
+				}
+				if update.ErrorCode != "" {
+					row.ErrorCode = update.ErrorCode
+				}
+				if update.ArtifactID != "" {
+					row.ArtifactRef = update.ArtifactID
+				}
+				if len(update.PrivateContextCiphertext) > 0 {
+					row.PrivateContext = update.PrivateContextCiphertext
+				}
+				if len(update.PrivateContextNonce) > 0 {
+					row.PrivateNonce = update.PrivateContextNonce
+				}
+				if update.EncryptionKeyID != "" {
+					row.PrivateKeyID = update.EncryptionKeyID
+				}
+				if !update.ExpiresAt.IsZero() {
+					row.ExpiresAt = timePtr(update.ExpiresAt)
+				}
+				row.Version = version
+				row.UpdatedAt = now
+				q = tx.Model(&operationRow{}).Where("operation_id = ? AND version = ?", update.OperationID, current).Updates(map[string]any{"version": row.Version, "kind": row.Kind, "status": row.Status, "principal_id": row.PrincipalID, "resource_type": row.ResourceType, "resource_id": row.ResourceID, "idempotency_scope": row.IdempotencyScope, "idempotency_key": row.IdempotencyKey, "request_id": row.RequestID, "request_digest": row.RequestDigest, "correlation_id": row.CorrelationID, "result_code": row.ResultCode, "error_code": row.ErrorCode, "artifact_id": row.ArtifactRef, "private_context": row.PrivateContext, "private_nonce": row.PrivateNonce, "private_key_id": row.PrivateKeyID, "updated_at": row.UpdatedAt, "expires_at": row.ExpiresAt})
+			}
+			if err := participantCAS(tableOperations, "<redacted>", update.ExpectedVersion, current, q); err != nil {
+				return err
+			}
+			result.OperationIDs = append(result.OperationIDs, update.OperationID)
 		}
-		if current == 0 { row = operationRow{OperationID:update.OperationID, Version:version, Kind:nonempty(update.Kind,"unknown"), Status:nonempty(update.Status,"pending"), PrincipalID:nonempty(update.PrincipalID,update.OperationID), ResourceType:nonempty(update.ResourceID,"unknown"), ResourceID:update.ResourceID, IdempotencyScope:nonempty(update.IdempotencyScope,"operation"), IdempotencyKey:nonempty(update.IdempotencyKey,update.OperationID), RequestID:update.RequestID, RequestDigest:update.RequestDigest, CorrelationID:update.CorrelationID, ResultCode:update.ResultCode, ErrorCode:update.ErrorCode, ArtifactRef:update.ArtifactID, PrivatePayloadVersion:1, PrivateContext:update.PrivateContextCiphertext, PrivateNonce:update.PrivateContextNonce, PrivateKeyID:update.EncryptionKeyID, CreatedAt:chooseTime(update.CreatedAt,now), UpdatedAt:now, ExpiresAt:timePtr(update.ExpiresAt)}; q=tx.Create(&row)
-		} else {
-			if update.Kind != "" { row.Kind = update.Kind }; if update.Status != "" { row.Status = update.Status }; if update.PrincipalID != "" { row.PrincipalID = update.PrincipalID }; if update.ResourceID != "" { row.ResourceID = update.ResourceID }; if update.IdempotencyScope != "" { row.IdempotencyScope = update.IdempotencyScope }; if update.IdempotencyKey != "" { row.IdempotencyKey = update.IdempotencyKey }; if update.RequestID != "" { row.RequestID = update.RequestID }; if len(update.RequestDigest) > 0 { row.RequestDigest = update.RequestDigest }; if update.CorrelationID != "" { row.CorrelationID = update.CorrelationID }; if update.ResultCode != "" { row.ResultCode = update.ResultCode }; if update.ErrorCode != "" { row.ErrorCode = update.ErrorCode }; if update.ArtifactID != "" { row.ArtifactRef = update.ArtifactID }; if len(update.PrivateContextCiphertext) > 0 { row.PrivateContext = update.PrivateContextCiphertext }; if len(update.PrivateContextNonce) > 0 { row.PrivateNonce = update.PrivateContextNonce }; if update.EncryptionKeyID != "" { row.PrivateKeyID = update.EncryptionKeyID }; if !update.ExpiresAt.IsZero() { row.ExpiresAt = timePtr(update.ExpiresAt) }; row.Version = version; row.UpdatedAt = now
-			q=tx.Model(&operationRow{}).Where("operation_id = ? AND version = ?",update.OperationID,current).Updates(map[string]any{"version":row.Version,"kind":row.Kind,"status":row.Status,"principal_id":row.PrincipalID,"resource_type":row.ResourceType,"resource_id":row.ResourceID,"idempotency_scope":row.IdempotencyScope,"idempotency_key":row.IdempotencyKey,"request_id":row.RequestID,"request_digest":row.RequestDigest,"correlation_id":row.CorrelationID,"result_code":row.ResultCode,"error_code":row.ErrorCode,"artifact_id":row.ArtifactRef,"private_context":row.PrivateContext,"private_nonce":row.PrivateNonce,"private_key_id":row.PrivateKeyID,"updated_at":row.UpdatedAt,"expires_at":row.ExpiresAt})
-		}
-		if err := participantCAS(tableOperations, "<redacted>", update.ExpectedVersion, current, q); err != nil { return err }; result.OperationIDs=append(result.OperationIDs,update.OperationID)
+		return nil
 	}
-	return nil
-}
 	applyArts := func() error { return s.applyTask5ArtifactParticipants(ctx, tx, work, result) }
 	applySecrets := func() error {
 		secrets := append([]SecretUpdate(nil), work.SecretUpdates...)
@@ -939,38 +1141,132 @@ func (s *GORMStore) applyParticipants(ctx context.Context, tx *gorm.DB, work Uni
 	}
 	applyInbox := func() error { return s.applyTask5InboxParticipants(ctx, tx, work, result) }
 	applyEffects := func() error {
-		if err := s.privacyRejectFencedEffects(ctx, tx, work.Effects); err != nil { return err }
+		if err := s.privacyRejectFencedEffects(ctx, tx, work.Effects); err != nil {
+			return err
+		}
 		return s.applyTask5EffectParticipants(ctx, tx, work, result)
 	}
-	applyFences := func() error { fences := append([]SubjectFenceUpdate(nil), work.FenceUpdates...); sort.Slice(fences,func(i,j int)bool{if string(fences[i].SubjectKey)!=string(fences[j].SubjectKey){return string(fences[i].SubjectKey)<string(fences[j].SubjectKey)};return fences[i].Scope<fences[j].Scope})
-	for _, update := range fences {
-		if len(update.SubjectKey)==0 || update.Scope=="" {return ErrParticipantFailure}
-		var row subjectFenceRow
-		q:=tx.Where("subject_key = ? AND scope = ?",update.SubjectKey,update.Scope).First(&row); current:=uint64(0); if q.Error==nil{current=row.Version}else if !errors.Is(q.Error,gorm.ErrRecordNotFound){return ErrParticipantFailure}
-		if err:=participantVersion(update.ExpectedVersion,current,update.Version,tableSubjectFences,"<redacted>");err!=nil{return err}
-		if update.Deleted && update.Scope == privacyFenceScope {
-			if update.PurgeOperationID == "" || row.PurgeOperationID != update.PurgeOperationID { return ErrAuthenticationFailed }
+	applyFences := func() error {
+		fences := append([]SubjectFenceUpdate(nil), work.FenceUpdates...)
+		sort.Slice(fences, func(i, j int) bool {
+			if string(fences[i].SubjectKey) != string(fences[j].SubjectKey) {
+				return string(fences[i].SubjectKey) < string(fences[j].SubjectKey)
+			}
+			return fences[i].Scope < fences[j].Scope
+		})
+		for _, update := range fences {
+			if len(update.SubjectKey) == 0 || update.Scope == "" {
+				return ErrParticipantFailure
+			}
+			var row subjectFenceRow
+			q := tx.Where("subject_key = ? AND scope = ?", update.SubjectKey, update.Scope).First(&row)
+			current := uint64(0)
+			if q.Error == nil {
+				current = row.Version
+			} else if !errors.Is(q.Error, gorm.ErrRecordNotFound) {
+				return ErrParticipantFailure
+			}
+			if err := participantVersion(update.ExpectedVersion, current, update.Version, tableSubjectFences, "<redacted>"); err != nil {
+				return err
+			}
+			if update.Deleted && update.Scope == privacyFenceScope {
+				if update.PurgeOperationID == "" || row.PurgeOperationID != update.PurgeOperationID {
+					return ErrAuthenticationFailed
+				}
+			}
+			if update.Deleted {
+				if current == 0 {
+					return &ParticipantConflictError{Conflicts: []ParticipantConflict{{Table: tableSubjectFences, Key: "<redacted>", ExpectedVersion: update.ExpectedVersion, CurrentVersion: current}}}
+				}
+				q = tx.Where("subject_key = ? AND scope = ? AND version = ?", update.SubjectKey, update.Scope, current).Delete(&subjectFenceRow{})
+				if err := participantCAS(tableSubjectFences, "<redacted>", update.ExpectedVersion, current, q); err != nil {
+					return err
+				}
+				result.FenceKeys = append(result.FenceKeys, append([]byte(nil), update.SubjectKey...))
+				continue
+			}
+			version, err := nextVersion(current)
+			if err != nil {
+				return err
+			}
+			if current == 0 {
+				if update.PurgeOperationID == "" {
+					return ErrParticipantFailure
+				}
+				row = subjectFenceRow{SubjectKey: update.SubjectKey, Scope: update.Scope, Version: version, PurgeOperationID: update.PurgeOperationID, CreatedAt: chooseTime(update.CreatedAt, time.Now().UTC()), ExpiresAt: timePtr(update.ExpiresAt)}
+				q = tx.Create(&row)
+			} else {
+				if update.PurgeOperationID != "" {
+					row.PurgeOperationID = update.PurgeOperationID
+				}
+				if !update.CreatedAt.IsZero() {
+					row.CreatedAt = update.CreatedAt
+				}
+				if !update.ExpiresAt.IsZero() {
+					row.ExpiresAt = timePtr(update.ExpiresAt)
+				}
+				row.Version = version
+				q = tx.Model(&subjectFenceRow{}).Where("subject_key = ? AND scope = ? AND version = ?", update.SubjectKey, update.Scope, current).Updates(map[string]any{"version": row.Version, "purge_operation_id": row.PurgeOperationID, "created_at": row.CreatedAt, "expires_at": row.ExpiresAt})
+			}
+			if err := participantCAS(tableSubjectFences, "<redacted>", update.ExpectedVersion, current, q); err != nil {
+				return err
+			}
+			result.FenceKeys = append(result.FenceKeys, append([]byte(nil), update.SubjectKey...))
 		}
-		if update.Deleted { if current==0{return &ParticipantConflictError{Conflicts:[]ParticipantConflict{{Table:tableSubjectFences,Key:"<redacted>",ExpectedVersion:update.ExpectedVersion,CurrentVersion:current}}}}; q=tx.Where("subject_key = ? AND scope = ? AND version = ?",update.SubjectKey,update.Scope,current).Delete(&subjectFenceRow{}); if err:=participantCAS(tableSubjectFences,"<redacted>",update.ExpectedVersion,current,q);err!=nil{return err}; result.FenceKeys=append(result.FenceKeys,append([]byte(nil),update.SubjectKey...)); continue }
-		version, err := nextVersion(current); if err != nil { return err }
-		if current==0 { if update.PurgeOperationID=="" {return ErrParticipantFailure}; row=subjectFenceRow{SubjectKey:update.SubjectKey,Scope:update.Scope,Version:version,PurgeOperationID:update.PurgeOperationID,CreatedAt:chooseTime(update.CreatedAt,time.Now().UTC()),ExpiresAt:timePtr(update.ExpiresAt)}; q=tx.Create(&row) } else { if update.PurgeOperationID!="" {row.PurgeOperationID=update.PurgeOperationID}; if !update.CreatedAt.IsZero(){row.CreatedAt=update.CreatedAt}; if !update.ExpiresAt.IsZero(){row.ExpiresAt=timePtr(update.ExpiresAt)}; row.Version=version; q=tx.Model(&subjectFenceRow{}).Where("subject_key = ? AND scope = ? AND version = ?",update.SubjectKey,update.Scope,current).Updates(map[string]any{"version":row.Version,"purge_operation_id":row.PurgeOperationID,"created_at":row.CreatedAt,"expires_at":row.ExpiresAt}) }
-		if err := participantCAS(tableSubjectFences, "<redacted>", update.ExpectedVersion, current, q); err != nil { return err };result.FenceKeys=append(result.FenceKeys,append([]byte(nil),update.SubjectKey...))
+		return nil
+	}
+	if err := applyOps(); err != nil {
+		return err
+	}
+	if err := applyInbox(); err != nil {
+		return err
+	}
+	if err := applyEffects(); err != nil {
+		return err
+	}
+	if err := applyArts(); err != nil {
+		return err
+	}
+	if err := applySecrets(); err != nil {
+		return err
+	}
+	if err := applyPlugins(); err != nil {
+		return err
+	}
+	if err := applyFences(); err != nil {
+		return err
 	}
 	return nil
 }
-	if err := applyOps(); err != nil { return err }
-	if err := applyInbox(); err != nil { return err }
-	if err := applyEffects(); err != nil { return err }
-	if err := applyArts(); err != nil { return err }
-	if err := applySecrets(); err != nil { return err }
-	if err := applyPlugins(); err != nil { return err }
-	if err := applyFences(); err != nil { return err }
-	return nil
+func nonempty(v, fallback string) string {
+	if v == "" {
+		return fallback
+	}
+	return v
 }
-func nonempty(v, fallback string) string { if v=="" {return fallback};return v }
-func nonemptyBytes(v []byte) []byte { if len(v)==0{return []byte{0}};return v }
-func chooseTime(v, fallback time.Time) time.Time {if v.IsZero(){return fallback};return v}
-func timePtr(v time.Time) *time.Time {if v.IsZero(){return nil};return &v}
-func chooseUint(v, fallback uint64) uint64 {if v==0{return fallback};return v}
+func nonemptyBytes(v []byte) []byte {
+	if len(v) == 0 {
+		return []byte{0}
+	}
+	return v
+}
+func chooseTime(v, fallback time.Time) time.Time {
+	if v.IsZero() {
+		return fallback
+	}
+	return v
+}
+func timePtr(v time.Time) *time.Time {
+	if v.IsZero() {
+		return nil
+	}
+	return &v
+}
+func chooseUint(v, fallback uint64) uint64 {
+	if v == 0 {
+		return fallback
+	}
+	return v
+}
 
 var _ Store = (*GORMStore)(nil)

@@ -68,6 +68,7 @@ var (
 	ErrInvalidRiskClass      = errors.New("eventstore: invalid risk class")
 	ErrPayloadExpired        = errors.New("eventstore: encrypted payload expired")
 	ErrArtifactGone          = errors.New("eventstore: artifact gone")
+	ErrArtifactOwner         = errors.New("eventstore: artifact owner mismatch")
 	ErrEncryptionUnavailable = errors.New("eventstore: encryption unavailable")
 	ErrAuthenticationFailed  = errors.New("eventstore: encrypted data authentication failed")
 	ErrInvalidTTL            = errors.New("eventstore: invalid ttl")
@@ -119,7 +120,7 @@ type Metadata struct {
 	OccurredAtUnixNanoUTC int64
 	OccurredAtUnixNanoSet bool
 	// SubjectKey is an opaque HMAC binding an event to a privacy subject.
-	SubjectKey             []byte
+	SubjectKey []byte
 }
 
 // StreamID identifies one aggregate stream without importing an aggregate type.
@@ -402,14 +403,14 @@ type OperationUpdate struct {
 
 // InboxUpdate contains encrypted ingress data and durable state transitions.
 type InboxUpdate struct {
-	InboxID           string
-	ExpectedVersion   uint64
-	Version           uint64
-	EndpointID        string
-	ProviderEventKey  string
-	LaneHMAC          []byte
+	InboxID          string
+	ExpectedVersion  uint64
+	Version          uint64
+	EndpointID       string
+	ProviderEventKey string
+	LaneHMAC         []byte
 	// SubjectKey is an opaque HMAC binding the message to a purge subject.
-	SubjectKey []byte
+	SubjectKey        []byte
 	OrderingSequence  uint64
 	Status            string
 	LeaseOwner        string
@@ -441,13 +442,13 @@ type InboxUpdate struct {
 
 // NewEffect is an outbound intent; its payload must be encrypted by persistence.
 type NewEffect struct {
-	EffectID          string
-	ExpectedVersion   uint64
-	Version           uint64
-	EndpointID        string
-	LaneHMAC          []byte
+	EffectID        string
+	ExpectedVersion uint64
+	Version         uint64
+	EndpointID      string
+	LaneHMAC        []byte
 	// SubjectKey is an opaque HMAC binding the effect to a purge subject.
-	SubjectKey []byte
+	SubjectKey        []byte
 	OrderingSequence  uint64
 	EffectType        string
 	RiskClass         string
@@ -788,7 +789,10 @@ type ArtifactPutResult struct {
 	Size       int64
 	ExpiresAt  time.Time
 }
-type ArtifactConsumeRequest struct{ ArtifactID string }
+type ArtifactConsumeRequest struct {
+	ArtifactID       string
+	OwnerPrincipalID string
+}
 type ArtifactResult struct {
 	ArtifactID       string
 	OperationID      string
@@ -838,11 +842,13 @@ type OperationView struct {
 	ResultCode       string
 	ErrorCode        string
 	ArtifactID       string
+	PrincipalID      string
 	ResourceID       string
 	IdempotencyScope string
 	IdempotencyKey   string
 	RequestID        string
 	RequestDigest    []byte
+	CorrelationID    string
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 	ExpiresAt        time.Time
@@ -858,6 +864,7 @@ type Readiness struct {
 	TargetManifestDigest       []byte
 	TerminalGlobalPosition     uint64
 	TerminalProjectionPosition uint64
+	freshInitialized           bool
 	CompletedAt                time.Time
 }
 
@@ -916,6 +923,7 @@ type RebuildResult struct {
 	TerminalPosition uint64
 	Digest           EventChecksum
 }
+
 // PrivacyCounts are exact counts of durable event-store records selected by a
 // controlled group purge. Counts are intentionally split by scope.
 type PrivacyCounts struct {
@@ -925,34 +933,34 @@ type PrivacyCounts struct {
 }
 
 type PrivacyDryRunRequest struct {
-	GroupID string
+	GroupID       string
 	ActiveDiceIDs []string
-	DiceIDs []string
-	Scopes  []string
+	DiceIDs       []string
+	Scopes        []string
 }
 
 type PrivacyDryRunResult struct {
 	Version         uint64
 	Digest          []byte
-	DigestKeyID      string
-	SubjectKey       []byte
-	Counts           PrivacyCounts
-	ActiveDiceIDs    []string
-	ExistingDiceIDs  []string
-	TargetHighWater  uint64
-	Uncovered        []string
+	DigestKeyID     string
+	SubjectKey      []byte
+	Counts          PrivacyCounts
+	ActiveDiceIDs   []string
+	ExistingDiceIDs []string
+	TargetHighWater uint64
+	Uncovered       []string
 }
 type PrivacyOperationContext struct {
-	GroupID string   `json:"groupId"`
-	DiceIDs []string `json:"diceIds"`
-	Scopes  []string `json:"scopes"`
-	Cursor  string   `json:"cursor,omitempty"`
-	Phase   string   `json:"phase"`
-	Counts  PrivacyCounts `json:"counts"`
-	ActiveDiceIDs []string `json:"activeDiceIds,omitempty"`
-	TargetHighWater uint64 `json:"targetHighWater,omitempty"`
-	ConfirmationDigest []byte `json:"confirmationDigest,omitempty"`
-	ConfirmationVersion uint64 `json:"confirmationVersion,omitempty"`
+	GroupID             string        `json:"groupId"`
+	DiceIDs             []string      `json:"diceIds"`
+	Scopes              []string      `json:"scopes"`
+	Cursor              string        `json:"cursor,omitempty"`
+	Phase               string        `json:"phase"`
+	Counts              PrivacyCounts `json:"counts"`
+	ActiveDiceIDs       []string      `json:"activeDiceIds,omitempty"`
+	TargetHighWater     uint64        `json:"targetHighWater,omitempty"`
+	ConfirmationDigest  []byte        `json:"confirmationDigest,omitempty"`
+	ConfirmationVersion uint64        `json:"confirmationVersion,omitempty"`
 }
 
 type PrivacyBatchRequest struct {
@@ -1017,6 +1025,7 @@ type ReadinessRepository interface {
 	GetReadiness(context.Context) (Readiness, error)
 	SetReadiness(context.Context, Readiness) error
 }
+
 // PrivacyHistoryRepository is the narrow durable seam used by the privacy
 // orchestration service. Selectors and cursors are interpreted only by the
 // implementation; callers never receive database handles.

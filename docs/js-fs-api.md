@@ -145,6 +145,19 @@ QuickJS `fs` 默认不公开同步调用。使用 `fs/promises`，或从 `requir
 
 异步接口会在调用当下完成路径解析与权限检查。若操作已经开始,之后再修改 `allowFilesystemUnrestrictedAccess` 不会影响该次已发起的文件操作。
 
+### Compatibility replay and ambiguity
+
+Filesystem calls made by a live compatibility callback retain the permission
+checks above. Once a permitted call may have started, a crash or lost callback
+result is treated as `ambiguous`; the inbox lane is blocked and the callback
+is never automatically rerun. Deterministic path or permission validation
+errors remain ordinary callback failures.
+
+Projection replay and rebuild never invoke legacy JavaScript callbacks and
+therefore do not perform filesystem or network calls. The outbox only
+mediates durable outbound effects; it does not mediate arbitrary `fs` or
+network I/O.
+
 ---
 
 ## 简短示例:扩展私有数据存储

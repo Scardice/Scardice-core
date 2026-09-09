@@ -13,6 +13,7 @@ import (
 
 	ds "github.com/sealdice/dicescript"
 
+	"Scardice-core/adapterapi"
 	"Scardice-core/logger"
 	"Scardice-core/message"
 	"Scardice-core/utils/panicHandler"
@@ -122,7 +123,7 @@ func stripForwardSplitMarkers(text string, splitKey string) string {
 //   - true：已发送（或当前平台支持且已处理）
 //   - false：当前平台/适配器不支持，调用方应自行回退到普通 ReplyToSender
 func TryReplyToSenderMergedForward(ctx *MsgContext, msg *Message, title string, contents []string) bool {
-	if ctx == nil || msg == nil || ctx.Dice == nil || ctx.EndPoint == nil || ctx.EndPoint.Adapter == nil {
+	if ctx == nil || msg == nil || ctx.Dice == nil || ctx.EndPoint == nil || ctx.EndPoint.Adapter == nil || isPureOnebotEndpoint(ctx.EndPoint) {
 		return false
 	}
 	if len(contents) == 0 {
@@ -196,7 +197,7 @@ func TryReplyToSenderMergedForward(ctx *MsgContext, msg *Message, title string, 
 // ReplyForward lets extensions resend received structured nodes or construct
 // their own. Missing sender identity is normalized to the current endpoint.
 func ReplyForward(ctx *MsgContext, msg *Message, nodes []message.ForwardNode) bool {
-	if ctx == nil || msg == nil || ctx.EndPoint == nil || ctx.EndPoint.Adapter == nil || len(nodes) == 0 {
+	if ctx == nil || msg == nil || ctx.EndPoint == nil || ctx.EndPoint.Adapter == nil || len(nodes) == 0 || isPureOnebotEndpoint(ctx.EndPoint) {
 		return false
 	}
 	for i := range nodes {
@@ -425,6 +426,15 @@ func ReplyToSender(ctx *MsgContext, msg *Message, text string) {
 		logger.M().Errorf("ReplyToSender 被调用，但没有正确传递参数！请检查您的参数！: ctx=%v, msg=%v", ctx, msg)
 		return
 	}
+	if isPureOnebotEndpoint(ctx.EndPoint) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				logger.M().Errorf("ReplyToSender 执行异常: %v", recovered)
+			}
+		}()
+		ReplyToSenderRaw(ctx, msg, text, "")
+		return
+	}
 	panicHandler.Once(logger.M(), func() {
 		ReplyToSenderRaw(ctx, msg, text, "")
 	})
@@ -435,10 +445,20 @@ func ReplyToSenderNoCheck(ctx *MsgContext, msg *Message, text string) {
 		logger.M().Errorf("ReplyToSenderNoCheck 被调用，但没有正确传递参数！请检查您的参数！: ctx=%v, msg=%v", ctx, msg)
 		return
 	}
+	if isPureOnebotEndpoint(ctx.EndPoint) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				logger.M().Errorf("ReplyToSenderNoCheck 执行异常: %v", recovered)
+			}
+		}()
+		replyToSenderRawNoCheck(ctx, msg, text, "")
+		return
+	}
 	panicHandler.Once(logger.M(), func() {
 		replyToSenderRawNoCheck(ctx, msg, text, "")
 	})
 }
+
 
 func ReplyGroupRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 	if ctx.AliasPrefixText != "" {
@@ -487,9 +507,6 @@ func ReplyGroupRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 }
 
 func replyGroupRawNoCheck(ctx *MsgContext, msg *Message, text string, flag string) {
-	if ctx != nil {
-		ctx.SetCommandReplied(true)
-	}
 	if ctx.AliasPrefixText != "" {
 		text = ctx.AliasPrefixText + text
 		ctx.AliasPrefixText = ""
@@ -501,11 +518,14 @@ func replyGroupRawNoCheck(ctx *MsgContext, msg *Message, text string, flag strin
 	if lenWithoutBase64(text) > 15000 {
 		text = "要发送的文本过长"
 	}
-	if ctx.Group != nil {
+	accepted := deliverReplyPlan(ctx, msg, strings.TrimSpace(text), flag, true)
+	if accepted && ctx != nil && ctx.Group != nil {
 		atomic.StoreInt64(&ctx.Group.RecentDiceSendTime, time.Now().Unix())
 		ctx.Group.MarkDirty(ctx.Dice)
 	}
-	deliverReplyPlan(ctx, msg, strings.TrimSpace(text), flag, true)
+	if ctx != nil && (!isPureOnebotEndpoint(ctx.EndPoint) || accepted) {
+		ctx.SetCommandReplied(true)
+	}
 }
 
 func ReplyGroup(ctx *MsgContext, msg *Message, text string) {
@@ -556,9 +576,6 @@ func ReplyPersonRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 }
 
 func replyPersonRawNoCheck(ctx *MsgContext, msg *Message, text string, flag string) {
-	if ctx != nil {
-		ctx.SetCommandReplied(true)
-	}
 	if ctx.AliasPrefixText != "" {
 		text = ctx.AliasPrefixText + text
 		ctx.AliasPrefixText = ""
@@ -570,13 +587,20 @@ func replyPersonRawNoCheck(ctx *MsgContext, msg *Message, text string, flag stri
 	if lenWithoutBase64(text) > 15000 {
 		text = "要发送的文本过长"
 	}
-	deliverReplyPlan(ctx, msg, strings.TrimSpace(text), flag, false)
-}
-
-func deliverReplyPlan(ctx *MsgContext, msg *Message, text string, flag string, group bool) {
-	if ctx == nil || ctx.EndPoint == nil || ctx.EndPoint.Adapter == nil {
-		return
+	accepted := deliverReplyPlan(ctx, msg, strings.TrimSpace(text), flag, false)
+	if ctx != nil && (!isPureOnebotEndpoint(ctx.EndPoint) || accepted) {
+		ctx.SetCommandReplied(true)
 	}
+}
+func deliverReplyPlan(ctx *MsgContext, msg *Message, text string, flag string, group bool) bool {
+	if ctx == nil || ctx.EndPoint == nil {
+		return false
+	}
+	pureOnebot := isPureOnebotEndpoint(ctx.EndPoint)
+	if !pureOnebot && ctx.EndPoint.Adapter == nil {
+		return false
+	}
+	accepted := false
 	for _, item := range ctx.compileReplyPlan(text) {
 		if item.Forward {
 			parts := ctx.SplitText(item.Text)
@@ -587,6 +611,10 @@ func deliverReplyPlan(ctx *MsgContext, msg *Message, text string, flag string, g
 				}
 			}
 			if len(contents) == 0 {
+				continue
+			}
+			if pureOnebot {
+				// 合并转发尚未有安全的 durable payload 表示，避免重新走 provider。
 				continue
 			}
 			if sender, ok := ctx.EndPoint.Adapter.(forwardMsgSender); ok {
@@ -618,6 +646,14 @@ func deliverReplyPlan(ctx *MsgContext, msg *Message, text string, flag string, g
 			if part == "" {
 				continue
 			}
+			if pureOnebot {
+				if ctx.Dice != nil {
+					if bridge := ctx.Dice.OutboundBridge; bridge != nil && bridge.SubmitText(ctx, msg, part, flag, group) == nil {
+						accepted = true
+					}
+				}
+				continue
+			}
 			if ctx.EndPoint.Platform == "QQ" {
 				doSleepQQ(ctx)
 			}
@@ -628,6 +664,7 @@ func deliverReplyPlan(ctx *MsgContext, msg *Message, text string, flag string, g
 			}
 		}
 	}
+	return !pureOnebot || accepted
 }
 
 func visibleReplyText(ctx *MsgContext, text string) string {
@@ -671,23 +708,24 @@ func CrossMsgBySearch(se *IMSession, p, t, txt string, pr bool) bool {
 
 	return true
 }
-
-// TODO: CrossMsgById 用指定 Id 的 EndPoint 发送跨平台消息，现在似乎没有这个需求
-
 func ReplyPerson(ctx *MsgContext, msg *Message, text string) {
 	ReplyPersonRaw(ctx, msg, text, "")
 }
 
 func SendFileToSenderRaw(ctx *MsgContext, msg *Message, path string, flag string) {
-	inGroup := msg.MessageType == "group"
-	if inGroup {
+	if msg.MessageType == "group" {
 		SendFileToGroupRaw(ctx, msg, path, flag)
-	} else {
-		SendFileToPersonRaw(ctx, msg, path, flag)
+		return
 	}
+	SendFileToPersonRaw(ctx, msg, path, flag)
 }
 
+// TODO: CrossMsgById 用指定 Id 的 EndPoint 发送跨平台消息，现在似乎没有这个需求
 func SendFileToPersonRaw(ctx *MsgContext, msg *Message, path string, flag string) {
+	if isPureOnebotEndpoint(ctx.EndPoint) {
+		// 文件路径尚未转换为 durable ArtifactInput；不得回退到 provider。
+		return
+	}
 	if ctx.Dice != nil {
 		ctx.Dice.Logger.Infof("发文件给(账号%s): %s", msg.Sender.UserID, path)
 	}
@@ -695,6 +733,10 @@ func SendFileToPersonRaw(ctx *MsgContext, msg *Message, path string, flag string
 }
 
 func SendFileToGroupRaw(ctx *MsgContext, msg *Message, path string, flag string) {
+	if isPureOnebotEndpoint(ctx.EndPoint) {
+		// 文件路径尚未转换为 durable ArtifactInput；不得回退到 provider。
+		return
+	}
 	if ctx.Dice != nil {
 		ctx.Dice.Logger.Infof("发文件给(群%s): %s", msg.GroupID, path)
 	}
@@ -702,11 +744,31 @@ func SendFileToGroupRaw(ctx *MsgContext, msg *Message, path string, flag string)
 }
 
 func MemberBan(ctx *MsgContext, groupID string, userID string, duration int64) {
-	ctx.EndPoint.Adapter.MemberBan(groupID, userID, duration)
+	if ctx != nil && isPureOnebotEndpoint(ctx.EndPoint) {
+		if bridge, ok := ctx.Dice.OutboundBridge.(durableOutboundActionPort); ok {
+			target := adapterapi.EffectTarget{Kind: adapterapi.TargetGroup, Conversation: adapterapi.ConversationID(canonicalOnebotGroupID(groupID)), Member: adapterapi.PrincipalID(canonicalOnebotUserID(userID))}
+			if duration > 0 && uint64(duration) <= uint64(^uint32(0)) {
+				_ = bridge.SubmitAction(ctx, adapterapi.EffectPayload{Kind: adapterapi.EffectPayloadBan, Target: target, DurationSeconds: uint32(duration)})
+			}
+		}
+		return
+	}
+	if ctx != nil && ctx.EndPoint != nil && ctx.EndPoint.Adapter != nil {
+		ctx.EndPoint.Adapter.MemberBan(groupID, userID, duration)
+	}
 }
 
 func MemberKick(ctx *MsgContext, groupID string, userID string) {
-	ctx.EndPoint.Adapter.MemberKick(groupID, userID)
+	if ctx != nil && isPureOnebotEndpoint(ctx.EndPoint) {
+		if bridge, ok := ctx.Dice.OutboundBridge.(durableOutboundActionPort); ok {
+			target := adapterapi.EffectTarget{Kind: adapterapi.TargetGroup, Conversation: adapterapi.ConversationID(canonicalOnebotGroupID(groupID)), Member: adapterapi.PrincipalID(canonicalOnebotUserID(userID))}
+			_ = bridge.SubmitAction(ctx, adapterapi.EffectPayload{Kind: adapterapi.EffectPayloadKick, Target: target})
+		}
+		return
+	}
+	if ctx != nil && ctx.EndPoint != nil && ctx.EndPoint.Adapter != nil {
+		ctx.EndPoint.Adapter.MemberKick(groupID, userID)
+	}
 }
 
 type ByLength []string

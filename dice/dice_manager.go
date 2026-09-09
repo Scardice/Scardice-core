@@ -39,6 +39,7 @@ type DiceManager struct { //nolint:revive
 	Dice                 []*Dice
 	diceLock             sync.RWMutex
 	Operator             engine.DatabaseOperator
+	EventSourcedMode     bool `json:"-" yaml:"-"`
 	ServeAddress         string
 	trayTooltip          string
 	trayTooltipLock      sync.RWMutex
@@ -267,7 +268,43 @@ func (dm *DiceManager) LoadDice() {
 	}
 }
 
+// InitializeRuntime prepares process-owned runtime infrastructure without
+// reading or mutating legacy configuration. Event-sourced startup calls this
+// only after the event-store readiness gate has passed.
+func (dm *DiceManager) InitializeRuntime() error {
+	if dm == nil {
+		return errors.New("dice manager is nil")
+	}
+	dm.EventSourcedMode = true
+	dm.AppVersionCode = VERSION_CODE
+	dm.AppBootTime = time.Now().Unix()
+	dm.JsRegistry = new(require.Registry)
+	dm.Cron = cron.New()
+	dm.Cron.Start()
+	dm.AccessTokens = SyncMap[string, bool]{}
+	if dm.UIPasswordSalt == "" {
+		salt, err := GenerateCryptoToken(32)
+		if err != nil {
+			return err
+		}
+		dm.UIPasswordSalt = salt
+	}
+	if dm.AssetImageToken == "" {
+		token, err := GenerateCryptoToken(32)
+		if err != nil {
+			return err
+		}
+		dm.AssetImageToken = token
+	}
+	dm.AutoBackupEnable = true
+	dm.AutoBackupTime = "@every 12h"
+	return nil
+}
+
 func (dm *DiceManager) Save() {
+	if dm == nil || dm.EventSourcedMode {
+		return
+	}
 	var dc Configs
 	dc.ServeAddress = dm.ServeAddress
 	dc.TrayTooltip = dm.GetTrayTooltip()
@@ -344,6 +381,23 @@ func (dm *DiceManager) InitDice(writer *logger.UIWriter) {
 	dm.RebootRequestChan = make(chan int, 1)
 	dm.UpdateCheckRequestChan = make(chan int, 1)
 	dm.UpdateDownloadedChan = make(chan string, 1)
+	if dm.EventSourcedMode {
+		for _, instance := range dm.Dice {
+			if instance == nil {
+				continue
+			}
+			instance.Parent = dm
+			instance.initEventSourcedRuntime(writer)
+		}
+		dm.DiceRandomMode = string(normalizeGlobalDiceRandomMode(dm.DiceRandomMode, nil))
+		dm.syncDiceRandomMode()
+		if err := dm.ActivateDiceRandomMode(); err != nil {
+			log.Warnf("[随机源] 激活全局模式 %s 失败，当前生效模式为 %s: %v", dm.GetDiceRandomMode(), globalRandSource.CurrentMode(), err)
+		}
+		globalRandSource.LogActiveMode(log)
+		log.Infof("事件源 Core 壳初始化完成，耗时 %dms", time.Since(startTime).Milliseconds())
+		return
+	}
 
 	dm.LoadNamesAsync()
 

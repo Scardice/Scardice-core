@@ -137,6 +137,7 @@ func (l *ownedSchedulableJSLoop) Schedule(run func(jsengine.Runtime) error) erro
 type ownedContextAwareJSLoop struct {
 	*ownedJSLoop
 	contextAware jsengine.ContextAwareLoop
+	ownerAware   jsengine.OwnerAwareLoop
 }
 
 func (l *ownedContextAwareJSLoop) RunWithContext(context any, run func(jsengine.Runtime) error) error {
@@ -155,6 +156,10 @@ func (l *ownedContextAwareJSLoop) CurrentContext() any {
 	return l.contextAware.CurrentContext()
 }
 
+func (l *ownedContextAwareJSLoop) InOwner() bool {
+	return l.ownerAware != nil && l.ownerAware.InOwner()
+}
+
 func (l *ownedContextAwareJSLoop) LoadEntryWithContext(context any, entry jsengine.Entry) error {
 	return l.contextAware.LoadEntryWithContext(context, entry)
 }
@@ -162,7 +167,8 @@ func (l *ownedContextAwareJSLoop) LoadEntryWithContext(context any, entry jsengi
 func ownJSRuntimeLoop(loop jsengine.Loop, registries ...*services.Registry) jsengine.Loop {
 	owned := &ownedJSLoop{loop: loop, resources: uniqueJSServiceRegistries(registries)}
 	if contextAware, ok := loop.(jsengine.ContextAwareLoop); ok {
-		return &ownedContextAwareJSLoop{ownedJSLoop: owned, contextAware: contextAware}
+		ownerAware, _ := loop.(jsengine.OwnerAwareLoop)
+		return &ownedContextAwareJSLoop{ownedJSLoop: owned, contextAware: contextAware, ownerAware: ownerAware}
 	}
 	if schedulable, ok := loop.(jsengine.SchedulableLoop); ok {
 		return &ownedSchedulableJSLoop{ownedJSLoop: owned, schedulable: schedulable}

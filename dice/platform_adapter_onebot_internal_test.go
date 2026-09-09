@@ -51,6 +51,35 @@ type groupReqCall struct {
 }
 
 var _ emitter.Emitter = (*onebotTestEmitter)(nil)
+// onebotTestOutboundBridge keeps request-handler tests focused on their
+// notification and moderation decisions. Durable bridge behavior is covered by
+// outbound_bridge_test.go and task6_bridge_test.go.
+type onebotTestOutboundBridge struct {
+	emitter emitter.Emitter
+}
+
+func (b *onebotTestOutboundBridge) SubmitText(_ *MsgContext, msg *Message, _ string, _ string, group bool) error {
+	if b == nil || b.emitter == nil || msg == nil {
+		return errors.New("test outbound bridge unavailable")
+	}
+	if group {
+		groupID := ExtractQQEmitterGroupID(msg.GroupID)
+		if groupID <= 0 {
+			return errors.New("test outbound bridge group target unavailable")
+		}
+		_, err := b.emitter.SendGrMsg(context.Background(), groupID, nil)
+		return err
+	}
+	userID := ExtractQQEmitterUserID(msg.Sender.UserID)
+	if userID <= 0 {
+		return errors.New("test outbound bridge user target unavailable")
+	}
+	_, err := b.emitter.SendPvtMsg(context.Background(), userID, nil)
+	return err
+}
+
+var _ OutboundBridgePort = (*onebotTestOutboundBridge)(nil)
+
 
 func (m *onebotTestEmitter) SendPvtMsg(context.Context, int64, schema.MessageChain) (*emitterTypes.SendMsgRes, error) {
 	if m.sendPvtCh != nil {
@@ -193,6 +222,7 @@ func newPureOnebotTestAdapter(t *testing.T) (*Dice, *PlatformAdapterOnebot, *one
 		sendGrCh:   make(chan time.Time, 8),
 	}
 	pa.sendEmitter = em
+	d.OutboundBridge = &onebotTestOutboundBridge{emitter: em}
 
 	ep.Platform = "QQ"
 	ep.ProtocolType = "pureonebot"
@@ -1105,4 +1135,148 @@ func waitPureOnebotInfoLogCount(t *testing.T, observed *observer.ObservedLogs, s
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %d log entries containing %q", count, snippet)
+}
+
+func TestOnebotInternalLifecycleFSMFailureAndStop(t *testing.T) {
+	d, pa, _, cleanup := newPureOnebotTestAdapter(t)
+	defer cleanup()
+
+	pa.Mode = "unsupported"
+	pa.desiredEnabled = false
+	pa.ensureFSM()
+	if got := pa.sm.Current(); got != "disconnected" {
+		t.Fatalf("initial FSM state = %q, want disconnected", got)
+	}
+
+	if err := pa.sm.Event(t.Context(), "enable"); err != nil {
+		t.Fatalf("enable event: %v", err)
+	}
+	if got := pa.sm.Current(); got != "failed" {
+		t.Fatalf("startup failure FSM state = %q, want failed", got)
+	}
+	if pa.EndPoint.State != StateConnectionFailed {
+		t.Fatalf("startup failure endpoint state = %d, want %d", pa.EndPoint.State, StateConnectionFailed)
+	}
+	if pa.EndPoint.Enable {
+		t.Fatal("startup failure unexpectedly persisted endpoint enabled")
+	}
+	if d.Config.LastSavedTime == nil {
+		t.Fatal("startup failure did not record a persistence write")
+	}
+
+	// Clear the prior startup write so this callback's persistence is observed directly.
+	pa.desiredEnabled = true
+	pa.EndPoint.Session.Parent.Config.LastSavedTime = nil
+	pa.retryMutex.Lock()
+	pa.isRetrying = true // prevent the characterization callback from starting a real backoff loop
+	pa.retryMutex.Unlock()
+	pa.cbEnterFailed(t.Context(), nil)
+	if pa.EndPoint.State != StateConnectionFailed || !pa.EndPoint.Enable {
+		t.Fatalf("desired-enabled failure endpoint = state %d enable %t, want failed/true", pa.EndPoint.State, pa.EndPoint.Enable)
+	}
+	if d.Config.LastSavedTime == nil {
+		t.Fatal("desired-enabled failure callback did not record a persistence write")
+	}
+
+	if err := pa.sm.Event(t.Context(), "disable"); err != nil {
+		t.Fatalf("disable event: %v", err)
+	}
+	if got := pa.sm.Current(); got != "disconnected" {
+		t.Fatalf("disabled FSM state = %q, want disconnected", got)
+	}
+	if pa.EndPoint.State != StateDisconnected || pa.EndPoint.Enable {
+		t.Fatalf("disabled endpoint = state %d enable %t, want disconnected/false", pa.EndPoint.State, pa.EndPoint.Enable)
+	}
+	if pa.websocketManager != nil || pa.antPool != nil || pa.friendRequestDedupeCache != nil {
+		t.Fatal("disable did not release OneBot runtime resources")
+	}
+}
+
+func TestOnebotInternalLoginIdentityUpdate(t *testing.T) {
+	_, pa, em, cleanup := newPureOnebotTestAdapter(t)
+	defer cleanup()
+
+	events := make(chan string, 1)
+	pa.desiredEnabled = true
+	pa.sm = newPureOnebotRetryFSM(events)
+	pa.loginInitRetrySleep = func(time.Duration) {}
+	em.loginInfo = &emitterTypes.LoginInfo{UserId: 246810, NickName: "身份测试"}
+	pa.scheduleLoginInfoRetry()
+
+	select {
+	case event := <-events:
+		if event != "connect_ok" {
+			t.Fatalf("identity retry event = %q, want connect_ok", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for identity retry")
+	}
+	if pa.EndPoint.UserID != "QQ:246810" || pa.EndPoint.Nickname != "身份测试" {
+		t.Fatalf("identity retry endpoint = %q/%q, want QQ:246810/身份测试", pa.EndPoint.UserID, pa.EndPoint.Nickname)
+	}
+}
+
+
+func TestOnebotInternalRetryDelayAndGuard(t *testing.T) {
+	_, pa, em, cleanup := newPureOnebotTestAdapter(t)
+	defer cleanup()
+
+	events := make(chan string, 1)
+	sleepDurations := make(chan time.Duration, 1)
+	pa.desiredEnabled = true
+	pa.sm = newPureOnebotRetryFSM(events)
+	pa.loginInitRetrySleep = func(delay time.Duration) {
+		sleepDurations <- delay
+		pa.desiredEnabled = false
+	}
+	em.loginInfo = &emitterTypes.LoginInfo{UserId: 987654, NickName: "retry"}
+	pa.scheduleLoginInfoRetry()
+
+	select {
+	case delay := <-sleepDurations:
+		if delay != 3*time.Second {
+			t.Fatalf("retry delay = %v, want 3s", delay)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for retry delay hook")
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("retry guard allowed FSM event after disable: %q", event)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := pa.sm.Current(); got != "connecting" {
+		t.Fatalf("retry guard FSM state = %q, want connecting", got)
+	}
+}
+
+func TestOnebotInternalStaleCallbackAfterStopIsObservable(t *testing.T) {
+	d, pa, _, cleanup := newPureOnebotTestAdapter(t)
+	defer cleanup()
+
+	pa.initializeCommonResources()
+	pa.desiredEnabled = false
+	pa.cbEnterDisconnected(t.Context(), nil)
+	pa.cleanupResources()
+	if pa.EndPoint.State != StateDisconnected || pa.EndPoint.Enable {
+		t.Fatalf("stopped endpoint = state %d enable %t, want disconnected/false", pa.EndPoint.State, pa.EndPoint.Enable)
+	}
+
+	// Characterize the current stale-callback behavior: callbacks do not carry
+	// a generation/stop fence and can mutate the endpoint after cleanup.
+	pa.EndPoint.UserID = "QQ:before-stale"
+	pa.EndPoint.Nickname = "before-stale"
+	beforeUserID := pa.EndPoint.UserID
+	beforeNickname := pa.EndPoint.Nickname
+	d.Config.LastSavedTime = nil
+	pa.cbEnterConnected(t.Context(), nil)
+	if pa.EndPoint.State != StateConnected || !pa.EndPoint.Enable {
+		t.Fatalf("stale connected callback endpoint = state %d enable %t, want connected/true", pa.EndPoint.State, pa.EndPoint.Enable)
+	}
+	if pa.EndPoint.UserID != beforeUserID || pa.EndPoint.Nickname != beforeNickname {
+		t.Fatalf("stale connected callback changed identity to %q/%q, want %q/%q", pa.EndPoint.UserID, pa.EndPoint.Nickname, beforeUserID, beforeNickname)
+	}
+	if d.Config.LastSavedTime == nil {
+		t.Fatal("stale callback did not record a persistence write")
+	}
 }

@@ -202,6 +202,9 @@ func (d *Dice) GetExtConfigFilePath(extName string, filename string) string {
 
 // ClearExtStorage 删除扩展 storage.db 并重新初始化。
 func ClearExtStorage(d *Dice, ext *ExtInfo, name string) error {
+	if d != nil && d.DurableStore != nil {
+		return d.clearDurableExtensionStorage(name)
+	}
 	err := ext.StorageClose()
 	if err != nil {
 		return err
@@ -509,7 +512,7 @@ func (i *ExtInfo) CallOnMessageSend(d *Dice, ctx *MsgContext, msg *Message, flag
 	}
 	ext.notifyWithJsCheck(d, func() {
 		ext.OnMessageSend(ctx, msg, flag)
-	})
+	}, jsCallbackDispatch{kind: jsCallbackSend, providerEventID: callbackEventIDForMessage(ctx, msg)})
 }
 
 // CallOnMessageDeleted 调用 OnMessageDeleted 回调（处理 wrapper 代理）
@@ -537,72 +540,29 @@ func (i *ExtInfo) CallOnGroupLeave(d *Dice, ctx *MsgContext, event *events.Group
 // callWithJsCheck 保留旧行为：JS 扩展需要切回事件循环，避免并发问题。
 // 它会等待回调结束，因此只能在事件循环之外调用；事后通知类回调请用
 // notifyWithJsCheck。
-func (i *ExtInfo) callWithJsCheck(d *Dice, f func()) {
-	i.runWithJsCheck(d, f, false)
+func (i *ExtInfo) callWithJsCheck(d *Dice, f func(), details ...jsCallbackDispatch) {
+	i.runWithJsCheck(d, f, false, details...)
 }
 
 // notifyWithJsCheck 把事后通知排入 JS 事件循环但不等待它完成。
 // seal.replyToSender 等宿主函数会在事件循环内触发这类通知，等待会自锁。
-func (i *ExtInfo) notifyWithJsCheck(d *Dice, f func()) {
-	i.runWithJsCheck(d, f, true)
+func (i *ExtInfo) notifyWithJsCheck(d *Dice, f func(), details ...jsCallbackDispatch) {
+	i.runWithJsCheck(d, f, true, details...)
 }
 
-func (i *ExtInfo) runWithJsCheck(d *Dice, f func(), schedule bool) {
-	if f == nil {
+func (i *ExtInfo) runWithJsCheck(d *Dice, f func(), schedule bool, details ...jsCallbackDispatch) {
+	if len(details) == 0 {
+		i.dispatchWithJsCheck(d, jsCallbackMessage, "", schedule, f)
 		return
 	}
-	if !i.IsJsExt {
-		f()
-		return
-	}
-	if d == nil || !d.Config.JsEnable {
-		if d != nil && d.Logger != nil {
-			d.Logger.Infof("当前已关闭js扩展<%v>", i.Name)
-		}
-		return
-	}
-	if d.ExtLoopManager == nil {
-		if d.Logger != nil {
-			d.Logger.Errorf("扩展<%s>运行环境不可用", i.Name)
-		}
-		return
-	}
-	loop, err := d.ExtLoopManager.GetLoop(i.JSLoopVersion)
-	if err == nil && loop == nil {
-		err = errors.New("JavaScript runtime is unavailable")
-	}
-	if err != nil {
-		if d.Logger != nil {
-			d.Logger.Errorf("扩展<%s>运行环境已经过期: %v", i.Name, err)
-		}
-		return
-	}
-	call := func(jsengine.Runtime) error {
-		return runEngineCallback(func() error {
-			f()
-			return nil
-		})
-	}
-	if schedule {
-		// 没有调用方接收排队回调的失败，所以在回调内部记录。
-		err = jsengine.ScheduleWithContext(loop, jsContextForPlugin(i), func(runtime jsengine.Runtime) error {
-			if callErr := call(runtime); callErr != nil && d.Logger != nil {
-				d.Logger.Errorf("JS脚本异常: %v", callErr)
-			}
-			return nil
-		})
-	} else {
-		err = jsengine.RunWithContext(loop, jsContextForPlugin(i), call)
-	}
-	if err != nil && d.Logger != nil {
-		d.Logger.Errorf("JS脚本异常: %v", err)
-	}
+	detail := details[0]
+	i.dispatchWithJsCheck(d, detail.kind, detail.providerEventID, schedule, f)
 }
 
 // StorageInit 与旧版一致：使用互斥锁确保只初始化一次。
 func (i *ExtInfo) StorageInit() error {
 	var err error
-	if i.dice == nil {
+	if i == nil || i.dice == nil {
 		return errors.New("[扩展]:必须先把扩展注册到 Dice")
 	}
 	d := i.dice
@@ -610,6 +570,11 @@ func (i *ExtInfo) StorageInit() error {
 	i.dbMu.Lock()
 	defer i.dbMu.Unlock()
 	if i.init {
+		return nil
+	}
+	if d.DurableStore != nil {
+		i.Storage = nil
+		i.init = true
 		return nil
 	}
 
@@ -626,13 +591,17 @@ func (i *ExtInfo) StorageInit() error {
 
 // StorageClose 与旧逻辑一致：先判断 init，再关闭数据库并回收状态。
 func (i *ExtInfo) StorageClose() error {
+	if i == nil {
+		return nil
+	}
 	i.dbMu.Lock()
 	defer i.dbMu.Unlock()
 	if !i.init {
 		return nil
 	}
 	if i.Storage == nil {
-		return errors.New("[扩展]:Storage 未初始化")
+		i.init = false
+		return nil
 	}
 	err := i.Storage.Close()
 	if err != nil {
@@ -650,6 +619,9 @@ func (i *ExtInfo) StorageSet(k, v string) error {
 	if target == nil {
 		return errors.New("[扩展]:目标扩展不存在")
 	}
+	if target.dice != nil && target.dice.DurableStore != nil {
+		return target.dice.durableStorageSet(target.Name, k, v)
+	}
 	if err := target.StorageInit(); err != nil {
 		return err
 	}
@@ -666,13 +638,15 @@ func (i *ExtInfo) StorageGet(k string) (string, error) {
 	if target == nil {
 		return "", errors.New("[扩展]:目标扩展不存在")
 	}
+	if target.dice != nil && target.dice.DurableStore != nil {
+		return target.dice.durableStorageGet(target.Name, k)
+	}
 	if err := target.StorageInit(); err != nil {
 		return "", err
 	}
 
 	var val string
 	var err error
-
 	db := target.Storage
 	err = db.View(func(tx *buntdb.Tx) error {
 		val, err = tx.Get(k)
@@ -681,7 +655,6 @@ func (i *ExtInfo) StorageGet(k string) (string, error) {
 		}
 		return nil
 	})
-
 	return val, err
 }
 
@@ -690,6 +663,9 @@ func (i *ExtInfo) StorageList() ([]string, error) {
 	target := i.GetRealExt()
 	if target == nil {
 		return nil, errors.New("[扩展]:目标扩展不存在")
+	}
+	if target.dice != nil && target.dice.DurableStore != nil {
+		return target.dice.durableStorageList(target.Name)
 	}
 	if err := target.StorageInit(); err != nil {
 		return nil, err

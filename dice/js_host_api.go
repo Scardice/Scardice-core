@@ -295,6 +295,11 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			// 注册 wrapper 到 ExtRegistry 和 ExtList
 			d.RegisterExtension(wrapper)
 		}
+		if d.DurableStore != nil {
+			if err := d.DurableDiscoverExtension(nil, wrapper); err != nil {
+				panic(err)
+			}
+		}
 
 		// 2. 注册真实 ExtInfo 到 JsExtRegistry
 		if d.JsExtRegistry == nil {
@@ -330,8 +335,7 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			DefaultValue: defaultValue,
 			Description:  description,
 		}
-		d.ConfigManager.RegisterPluginConfig(ei.Name, config)
-		return nil
+		return d.ConfigManager.RegisterPluginConfig(ei.Name, config)
 	})
 	_ = ext.Set("registerIntConfig", func(ei *ExtInfo, key string, defaultValue int64, description string, group string) error {
 		if ei.dice == nil {
@@ -345,8 +349,7 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			DefaultValue: defaultValue,
 			Description:  description,
 		}
-		d.ConfigManager.RegisterPluginConfig(ei.Name, config)
-		return nil
+		return d.ConfigManager.RegisterPluginConfig(ei.Name, config)
 	})
 	_ = ext.Set("registerBoolConfig", func(ei *ExtInfo, key string, defaultValue bool, description string, group string) error {
 		if ei.dice == nil {
@@ -360,8 +363,7 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			DefaultValue: defaultValue,
 			Description:  description,
 		}
-		d.ConfigManager.RegisterPluginConfig(ei.Name, config)
-		return nil
+		return d.ConfigManager.RegisterPluginConfig(ei.Name, config)
 	})
 	_ = ext.Set("registerFloatConfig", func(ei *ExtInfo, key string, defaultValue float64, description string, group string) error {
 		if ei.dice == nil {
@@ -375,8 +377,7 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			DefaultValue: defaultValue,
 			Description:  description,
 		}
-		d.ConfigManager.RegisterPluginConfig(ei.Name, config)
-		return nil
+		return d.ConfigManager.RegisterPluginConfig(ei.Name, config)
 	})
 	_ = ext.Set("registerTemplateConfig", func(ei *ExtInfo, key string, defaultValue []string, description string, group string) error {
 		if ei.dice == nil {
@@ -390,8 +391,7 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			DefaultValue: defaultValue,
 			Description:  description,
 		}
-		d.ConfigManager.RegisterPluginConfig(ei.Name, config)
-		return nil
+		return d.ConfigManager.RegisterPluginConfig(ei.Name, config)
 	})
 	_ = ext.Set("registerOptionConfig", func(ei *ExtInfo, key string, defaultValue string, option []string, description string, group string) error {
 		if ei.dice == nil {
@@ -406,8 +406,7 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			Option:       option,
 			Description:  description,
 		}
-		d.ConfigManager.RegisterPluginConfig(ei.Name, config)
-		return nil
+		return d.ConfigManager.RegisterPluginConfig(ei.Name, config)
 	})
 	_ = ext.Set("newConfigItem", func(ei *ExtInfo, key string, defaultValue interface{}, description string) *ConfigItem {
 		if ei.dice == nil {
@@ -419,56 +418,79 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 		if ei.dice == nil {
 			return errors.New("请先完成此扩展的注册")
 		}
-		d.ConfigManager.RegisterPluginConfig(ei.Name, config...)
-		return nil
+		return d.ConfigManager.RegisterPluginConfig(ei.Name, config...)
 	})
 	_ = ext.Set("getConfig", func(ei *ExtInfo, key string) *ConfigItem {
-		if ei.dice == nil {
+		if ei == nil || ei.dice == nil {
 			return nil
 		}
-		return d.ConfigManager.getConfig(ei.Name, key)
+		return d.compatibilityConfigItem(ei, key)
 	})
 	_ = ext.Set("getStringConfig", func(ei *ExtInfo, key string) string {
-		cfg := d.ConfigManager.getConfig(ei.Name, key)
-		if ei.dice == nil || cfg == nil || cfg.Type != "string" {
+		cfg := d.compatibilityConfigItem(ei, key)
+		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "string" {
 			panic("配置不存在或类型不匹配")
 		}
-		return cfg.Value.(string)
+		value, ok := cfg.Value.(string)
+		if !ok {
+			panic("配置值类型不匹配")
+		}
+		return value
 	})
 	_ = ext.Set("getIntConfig", func(ei *ExtInfo, key string) int64 {
-		cfg := d.ConfigManager.getConfig(ei.Name, key)
-		if ei.dice == nil || cfg == nil || cfg.Type != "int" {
+		cfg := d.compatibilityConfigItem(ei, key)
+		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "int" {
 			panic("配置不存在或类型不匹配")
 		}
-		return cfg.Value.(int64)
+		value, ok := cfg.Value.(int64)
+		if !ok {
+			panic("配置值类型不匹配")
+		}
+		return value
 	})
 	_ = ext.Set("getBoolConfig", func(ei *ExtInfo, key string) bool {
-		cfg := d.ConfigManager.getConfig(ei.Name, key)
-		if ei.dice == nil || cfg == nil || cfg.Type != "bool" {
+		cfg := d.compatibilityConfigItem(ei, key)
+		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "bool" {
 			panic("配置不存在或类型不匹配")
 		}
-		return cfg.Value.(bool)
+		value, ok := cfg.Value.(bool)
+		if !ok {
+			panic("配置值类型不匹配")
+		}
+		return value
 	})
 	_ = ext.Set("getFloatConfig", func(ei *ExtInfo, key string) float64 {
-		cfg := d.ConfigManager.getConfig(ei.Name, key)
-		if ei.dice == nil || cfg == nil || cfg.Type != "float" {
+		cfg := d.compatibilityConfigItem(ei, key)
+		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "float" {
 			panic("配置不存在或类型不匹配")
 		}
-		return cfg.Value.(float64)
+		value, ok := cfg.Value.(float64)
+		if !ok {
+			panic("配置值类型不匹配")
+		}
+		return value
 	})
 	_ = ext.Set("getTemplateConfig", func(ei *ExtInfo, key string) []string {
-		cfg := d.ConfigManager.getConfig(ei.Name, key)
-		if ei.dice == nil || cfg == nil || cfg.Type != "template" {
+		cfg := d.compatibilityConfigItem(ei, key)
+		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "template" {
 			panic("配置不存在或类型不匹配")
 		}
-		return cfg.Value.([]string)
+		value, ok := cfg.Value.([]string)
+		if !ok {
+			panic("配置值类型不匹配")
+		}
+		return append([]string(nil), value...)
 	})
 	_ = ext.Set("getOptionConfig", func(ei *ExtInfo, key string) string {
-		cfg := d.ConfigManager.getConfig(ei.Name, key)
-		if ei.dice == nil || cfg == nil || cfg.Type != "option" {
+		cfg := d.compatibilityConfigItem(ei, key)
+		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "option" {
 			panic("配置不存在或类型不匹配")
 		}
-		return cfg.Value.(string)
+		value, ok := cfg.Value.(string)
+		if !ok {
+			panic("配置值类型不匹配")
+		}
+		return value
 	})
 	_ = ext.Set("unregisterConfig", func(ei *ExtInfo, key ...string) {
 		if ei.dice == nil {
@@ -496,7 +518,7 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 		task := JsScriptTask{cron: scriptCron, key: key, task: fn, lock: ei.dice.JsScriptCronLock, logger: ei.dice.Logger, dice: ei.dice, ext: ei}
 		expr := value
 		if key != "" && taskType != "once" {
-			if config := d.ConfigManager.getConfig(ei.Name, key); config != nil {
+			if config := d.compatibilityConfigItem(ei, key); config != nil {
 				expr = config.Value.(string)
 				// Stop old task
 				if config.task != nil {
@@ -561,7 +583,7 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 		}
 
 		if key != "" && taskType != "once" {
-			config := d.ConfigManager.getConfig(ei.Name, key)
+			config := d.compatibilityConfigItem(ei, key)
 
 			switch taskType {
 			case "cron":

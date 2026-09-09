@@ -266,6 +266,10 @@ func (l *nativeLoop) onOwnerThread() bool {
 	return owner != 0 && owner == uint64(C.sc_native_thread_id())
 }
 
+func (l *nativeLoop) InOwner() bool {
+	return l.onOwnerThread()
+}
+
 // registerContext returns the provider token that identifies context.
 //
 // Tokens are interned and outlive the call that introduced them: the provider

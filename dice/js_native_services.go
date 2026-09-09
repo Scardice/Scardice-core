@@ -183,9 +183,15 @@ func (s *nativeFilesystemService) prepare(request services.Request, write bool, 
 		if err := s.dice.validateNativeFilesystemBytes(request.Bytes, true); err != nil {
 			return jsFsResolvedPath{}, err
 		}
+		if err := jsCompatibilityExternalAccess(context); err != nil {
+			return jsFsResolvedPath{}, err
+		}
 		return resolved, nil
 	}
 	if err := jsFsEnsureExistingDataTargetInside(resolved); err != nil {
+		return jsFsResolvedPath{}, err
+	}
+	if err := jsCompatibilityExternalAccess(context); err != nil {
 		return jsFsResolvedPath{}, err
 	}
 	return resolved, nil
@@ -335,7 +341,10 @@ type nativeServiceAuthorizer struct {
 func (a nativeServiceAuthorizer) Authorize(service services.Name, operation services.OperationID, target string) error {
 	switch services.NormalizeName(service) {
 	case services.Fetch, services.HTTP, services.WebSocket:
-		return jsNetworkAuthorizeWithContext(a.dice, a.context, target)
+		if err := jsNetworkAuthorizeWithContext(a.dice, a.context, target); err != nil {
+			return err
+		}
+		return jsCompatibilityExternalAccess(a.context)
 	case services.Filesystem:
 		write := operation == services.OpFilesystemWriteFile ||
 			operation == services.OpFilesystemWriteFileSync ||

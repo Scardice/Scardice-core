@@ -1203,7 +1203,7 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 						if ext.OnGroupJoined != nil {
 							ext.callWithJsCheck(mctx.Dice, func() {
 								ext.OnGroupJoined(mctx, msg)
-							})
+							}, jsCallbackDispatch{kind: jsCallbackActivation, providerEventID: callbackEventIDForMessage(mctx, msg)})
 						}
 					}
 				}
@@ -1243,7 +1243,7 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 					if ext.OnMessageReceived != nil {
 						ext.callWithJsCheck(mctx.Dice, func() {
 							ext.OnMessageReceived(mctx, msg)
-						})
+						}, jsCallbackDispatch{kind: jsCallbackMessage, providerEventID: callbackEventIDForMessage(mctx, msg)})
 					}
 				}
 			}
@@ -1427,7 +1427,7 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 							notCommandReceiveCall := func() {
 								i.callWithJsCheck(d, func() {
 									i.OnNotCommandReceived(mctx, msg)
-								})
+								}, jsCallbackDispatch{kind: jsCallbackMessage, providerEventID: callbackEventIDForMessage(mctx, msg)})
 							}
 
 							if options.runInSync {
@@ -1557,7 +1557,7 @@ func (ep *EndPointInfo) TriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *
 				overrideHandled := false
 				ext.callWithJsCheck(mctx.Dice, func() {
 					overrideHandled = ext.OnCommandOverride(mctx, msg, cmdArgs)
-				})
+				}, jsCallbackDispatch{kind: jsCallbackCommand, providerEventID: callbackEventIDForMessage(mctx, msg)})
 				handled = overrideHandled
 				if handled {
 					break
@@ -1652,7 +1652,7 @@ func (s *IMSession) OnGroupJoined(ctx *MsgContext, msg *Message) {
 		if ext.OnGroupJoined != nil {
 			ext.callWithJsCheck(d, func() {
 				ext.OnGroupJoined(ctx, msg)
-			})
+			}, jsCallbackDispatch{kind: jsCallbackGroup, providerEventID: callbackEventIDForMessage(ctx, msg)})
 		}
 	}
 }
@@ -3055,7 +3055,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 			if ext.OnCommandReceived != nil {
 				ext.callWithJsCheck(ctx.Dice, func() {
 					ext.OnCommandReceived(ctx, msg, cmdArgs)
-				})
+				}, jsCallbackDispatch{kind: jsCallbackCommand, providerEventID: callbackEventIDForMessage(ctx, msg)})
 			}
 		}
 	}

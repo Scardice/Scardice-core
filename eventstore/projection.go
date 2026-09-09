@@ -543,3 +543,50 @@ func (s *GORMStore) ReadProjectionRow(ctx context.Context, projectionName, rowKe
 	committed = true
 	return ProjectionRow{ProjectionGeneration: row.ProjectionGeneration, ProjectionName: row.ProjectionName, RowKey: row.RowKey, Payload: copyProjectionBytes(row.Payload), UpdatedAt: row.UpdatedAt}, nil
 }
+// ListProjectionRows returns the active generation rows for one projection.
+// It is a read-only startup source; it never constructs a runtime or invokes
+// a projector.
+func (s *GORMStore) ListProjectionRows(ctx context.Context, projectionName string) ([]ProjectionRow, error) {
+	if s == nil || s.db == nil || s.db.GORM() == nil {
+		return nil, errors.New("eventstore: store unavailable")
+	}
+	if strings.TrimSpace(projectionName) == "" {
+		return nil, ErrProjectionInvariant
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := s.requireReady(ctx); err != nil {
+		return nil, err
+	}
+	tx := s.db.GORM().WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return nil, errors.New("eventstore: begin projection read failed")
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback().Error
+		}
+	}()
+	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		return nil, err
+	}
+	var control projectionControlRow
+	if err := locked(tx).Where("singleton_id = ?", "default").First(&control).Error; err != nil {
+		return nil, ErrParticipantFailure
+	}
+	var rows []projectionReadModelRow
+	if err := locked(tx).Where("projection_generation = ? AND projection_name = ?", control.ActiveGeneration, projectionName).Order("row_key ASC").Find(&rows).Error; err != nil {
+		return nil, ErrParticipantFailure
+	}
+	if err := tx.Commit().Error; err != nil {
+		return nil, errors.New("eventstore: commit projection read failed")
+	}
+	committed = true
+	result := make([]ProjectionRow, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, ProjectionRow{ProjectionGeneration: row.ProjectionGeneration, ProjectionName: row.ProjectionName, RowKey: row.RowKey, Payload: copyProjectionBytes(row.Payload), UpdatedAt: row.UpdatedAt})
+	}
+	return result, nil
+}

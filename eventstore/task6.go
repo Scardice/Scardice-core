@@ -3,7 +3,6 @@ package eventstore
 import (
 	"bytes"
 	"context"
-	"slices"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -17,8 +16,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -32,11 +32,11 @@ const (
 	MaxPluginExtensionBytes = 255
 	MaxPluginKeyBytes       = 1024
 	MaxPluginValueBytes     = 8 * 1024 * 1024
-	MaxPluginKeys            = 10000
-	MaxPluginBytes           = 64 * 1024 * 1024
-	MaxPluginScan            = 10000
-	MaxPluginResults         = 1000
-	MaxPluginResponseBytes   = 8 * 1024 * 1024
+	MaxPluginKeys           = 10000
+	MaxPluginBytes          = 64 * 1024 * 1024
+	MaxPluginScan           = 10000
+	MaxPluginResults        = 1000
+	MaxPluginResponseBytes  = 8 * 1024 * 1024
 
 	supportedReadinessSchemaVersion uint32 = 1
 )
@@ -47,7 +47,12 @@ var a6Domains = []string{
 	"target-index/v1", "content-digest/v1",
 }
 
-type UnixFileKeySource struct { IndexPath string; RootsDir string; CurrentID string }
+type UnixFileKeySource struct {
+	IndexPath string
+	RootsDir  string
+	CurrentID string
+}
+
 func NewUnixFileKeySource(indexPath, rootsDir string) *UnixFileKeySource {
 	return &UnixFileKeySource{IndexPath: indexPath, RootsDir: rootsDir}
 }
@@ -195,12 +200,91 @@ func readKeyFile(path string) ([]byte, error) {
 	return raw, nil
 }
 
-func keySourceIndex(ctx context.Context, source KeySource)(string,[]byte,error){if source==nil{return "",nil,ErrKeySourceUnavailable};ids,ok:=source.(interface{IndexRootID(context.Context)(string,error)});if !ok{return "",nil,ErrKeySourceUnavailable};id,e:=ids.IndexRootID(ctx);if e!=nil||id==""{return "",nil,ErrKeySourceUnavailable};materials,ok:=source.(interface{IndexRootMaterial(context.Context)([]byte,error)});if !ok{return "",nil,ErrKeySourceUnavailable};material,e:=materials.IndexRootMaterial(ctx);if e!=nil||len(material)!=32{return "",nil,ErrKeySourceUnavailable};return id,material,nil}
-func keySourceCurrent(ctx context.Context, source KeySource)(EncryptionRoot,error){if source==nil{return EncryptionRoot{},ErrKeySourceUnavailable};v,ok:=source.(interface{CurrentEncryptionRoot(context.Context)(EncryptionRoot,error)});if !ok{return EncryptionRoot{},ErrKeySourceUnavailable};root,e:=v.CurrentEncryptionRoot(ctx);if e!=nil||root.ID==""||len(root.Material)!=32{return EncryptionRoot{},ErrKeyUnavailable};return root,nil}
-func keySourceRoot(ctx context.Context, source KeySource,id string)([]byte,error){if source==nil{return nil,ErrKeySourceUnavailable};v,ok:=source.(interface{EncryptionRoot(context.Context,string)([]byte,error)});if !ok{return nil,ErrKeySourceUnavailable};material,e:=v.EncryptionRoot(ctx,id);if e!=nil||len(material)!=32{return nil,ErrKeyUnavailable};return material,nil}
-func deriveA6(root []byte,label string)([]byte,error){if len(root)!=32{return nil,ErrKeyUnavailable};out:=make([]byte,32);r:=hkdf.New(sha256.New,root,nil,[]byte(label));if _,e:=io.ReadFull(r,out);e!=nil{return nil,ErrKeyUnavailable};return out,nil}
-func lengthField(dst []byte,v []byte)[]byte{var n [4]byte;binary.BigEndian.PutUint32(n[:],uint32(len(v)));dst=append(dst,n[:]...);return append(dst,v...)}
-func a6AAD(domain,identity,owner string,version uint64,keyID string)[]byte{aad:=make([]byte,0,128);aad=lengthField(aad,[]byte(domain));aad=lengthField(aad,[]byte(identity));aad=lengthField(aad,[]byte(owner));var b [8]byte;binary.BigEndian.PutUint64(b[:],version);aad=append(aad,b[:]...);return lengthField(aad,[]byte(keyID))}
+func keySourceIndex(ctx context.Context, source KeySource) (string, []byte, error) {
+	if source == nil {
+		return "", nil, ErrKeySourceUnavailable
+	}
+	ids, ok := source.(interface {
+		IndexRootID(context.Context) (string, error)
+	})
+	if !ok {
+		return "", nil, ErrKeySourceUnavailable
+	}
+	id, e := ids.IndexRootID(ctx)
+	if e != nil || id == "" {
+		return "", nil, ErrKeySourceUnavailable
+	}
+	materials, ok := source.(interface {
+		IndexRootMaterial(context.Context) ([]byte, error)
+	})
+	if !ok {
+		return "", nil, ErrKeySourceUnavailable
+	}
+	material, e := materials.IndexRootMaterial(ctx)
+	if e != nil || len(material) != 32 {
+		return "", nil, ErrKeySourceUnavailable
+	}
+	return id, material, nil
+}
+func keySourceCurrent(ctx context.Context, source KeySource) (EncryptionRoot, error) {
+	if source == nil {
+		return EncryptionRoot{}, ErrKeySourceUnavailable
+	}
+	v, ok := source.(interface {
+		CurrentEncryptionRoot(context.Context) (EncryptionRoot, error)
+	})
+	if !ok {
+		return EncryptionRoot{}, ErrKeySourceUnavailable
+	}
+	root, e := v.CurrentEncryptionRoot(ctx)
+	if e != nil || root.ID == "" || len(root.Material) != 32 {
+		return EncryptionRoot{}, ErrKeyUnavailable
+	}
+	return root, nil
+}
+func keySourceRoot(ctx context.Context, source KeySource, id string) ([]byte, error) {
+	if source == nil {
+		return nil, ErrKeySourceUnavailable
+	}
+	v, ok := source.(interface {
+		EncryptionRoot(context.Context, string) ([]byte, error)
+	})
+	if !ok {
+		return nil, ErrKeySourceUnavailable
+	}
+	material, e := v.EncryptionRoot(ctx, id)
+	if e != nil || len(material) != 32 {
+		return nil, ErrKeyUnavailable
+	}
+	return material, nil
+}
+func deriveA6(root []byte, label string) ([]byte, error) {
+	if len(root) != 32 {
+		return nil, ErrKeyUnavailable
+	}
+	out := make([]byte, 32)
+	r := hkdf.New(sha256.New, root, nil, []byte(label))
+	if _, e := io.ReadFull(r, out); e != nil {
+		return nil, ErrKeyUnavailable
+	}
+	return out, nil
+}
+func lengthField(dst []byte, v []byte) []byte {
+	var n [4]byte
+	binary.BigEndian.PutUint32(n[:], uint32(len(v)))
+	dst = append(dst, n[:]...)
+	return append(dst, v...)
+}
+func a6AAD(domain, identity, owner string, version uint64, keyID string) []byte {
+	aad := make([]byte, 0, 128)
+	aad = lengthField(aad, []byte(domain))
+	aad = lengthField(aad, []byte(identity))
+	aad = lengthField(aad, []byte(owner))
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], version)
+	aad = append(aad, b[:]...)
+	return lengthField(aad, []byte(keyID))
+}
 func a6SealWithRoot(root EncryptionRoot, domain, identity, owner string, version uint64, plaintext []byte) ([]byte, []byte, string, error) {
 	sub, err := deriveA6(root.Material, domain)
 	if err != nil {
@@ -265,6 +349,7 @@ func a6HMAC(ctx context.Context, source KeySource, domain string, parts ...strin
 	}
 	return h.Sum(nil), nil
 }
+
 // KeyedDigest computes an index-root HMAC inside the store's admitted
 // security boundary. Callers receive only the digest and non-secret key ID.
 func (s *GORMStore) KeyedDigest(ctx context.Context, domain string, parts ...string) ([]byte, string, error) {
@@ -281,6 +366,7 @@ func (s *GORMStore) KeyedDigest(ctx context.Context, domain string, parts ...str
 	}
 	return digest, keyID, nil
 }
+
 func (s *GORMStore) validatePluginKeyIndex(ctx context.Context, extension string, index, plaintext []byte) error {
 	expected, err := a6HMAC(ctx, s.keySource, "plugin-key-index/v1", extension, string(plaintext))
 	if err != nil {
@@ -293,10 +379,19 @@ func (s *GORMStore) validatePluginKeyIndex(ctx context.Context, extension string
 }
 
 type a6PayloadCodec struct{ source KeySource }
-func (c *a6PayloadCodec) Encrypt(ctx context.Context, plaintext []byte)([]byte,[]byte,string,error){return a6Seal(ctx,c.source,"artifact/v1","payload","",0,plaintext)}
-func (c *a6PayloadCodec) Decrypt(ctx context.Context,ciphertext,nonce []byte,keyID string)([]byte,error){return a6Open(ctx,c.source,"artifact/v1","payload","",0,keyID,ciphertext,nonce)}
-func (c *a6PayloadCodec) EncryptBound(ctx context.Context, domain, identity, owner string, version uint64, plaintext []byte)([]byte,[]byte,string,error){return a6Seal(ctx,c.source,domain,identity,owner,version,plaintext)}
-func (c *a6PayloadCodec) DecryptBound(ctx context.Context, domain, identity, owner string, version uint64, ciphertext, nonce []byte, keyID string)([]byte,error){return a6Open(ctx,c.source,domain,identity,owner,version,keyID,ciphertext,nonce)}
+
+func (c *a6PayloadCodec) Encrypt(ctx context.Context, plaintext []byte) ([]byte, []byte, string, error) {
+	return a6Seal(ctx, c.source, "artifact/v1", "payload", "", 0, plaintext)
+}
+func (c *a6PayloadCodec) Decrypt(ctx context.Context, ciphertext, nonce []byte, keyID string) ([]byte, error) {
+	return a6Open(ctx, c.source, "artifact/v1", "payload", "", 0, keyID, ciphertext, nonce)
+}
+func (c *a6PayloadCodec) EncryptBound(ctx context.Context, domain, identity, owner string, version uint64, plaintext []byte) ([]byte, []byte, string, error) {
+	return a6Seal(ctx, c.source, domain, identity, owner, version, plaintext)
+}
+func (c *a6PayloadCodec) DecryptBound(ctx context.Context, domain, identity, owner string, version uint64, ciphertext, nonce []byte, keyID string) ([]byte, error) {
+	return a6Open(ctx, c.source, domain, identity, owner, version, keyID, ciphertext, nonce)
+}
 
 func readinessFromRow(row storeReadinessRow) (Readiness, error) {
 	var roots []string
@@ -308,7 +403,8 @@ func readinessFromRow(row storeReadinessRow) (Readiness, error) {
 		IndexRootID: row.IndexRootID, IndexRootFingerprint: append([]byte(nil), row.IndexRootFingerprint...),
 		EncryptionRootIDs: roots, SourceManifestDigest: append([]byte(nil), row.SourceManifestDigest...),
 		TargetManifestDigest: append([]byte(nil), row.TargetManifestDigest...), TerminalGlobalPosition: row.TerminalGlobalPosition,
-		TerminalProjectionPosition: row.TerminalProjectionPosition, CompletedAt: timeOrZero(row.CompletedAt),
+		TerminalProjectionPosition: row.TerminalProjectionPosition, freshInitialized: row.FreshInitialized,
+		CompletedAt: timeOrZero(row.CompletedAt),
 	}, nil
 }
 
@@ -387,8 +483,8 @@ func readinessDatabaseNonEmpty(ctx context.Context, db *gorm.DB) (bool, error) {
 func readinessRootReferences(ctx context.Context, db *gorm.DB) (map[string]struct{}, error) {
 	refs := make(map[string]struct{})
 	queries := []struct {
-		model any
-		field string
+		model  any
+		field  string
 		cipher string
 	}{
 		{&adapterSecretRow{}, "encryption_key_id", "ciphertext"},
@@ -460,7 +556,7 @@ func (s *GORMStore) validateReadinessOnDB(ctx context.Context, db *gorm.DB, allo
 	if err != nil {
 		return ErrReadinessQuarantined
 	}
-	if r.IndexRootID == "unconfigured" || !allowFreshNonempty && r.Mode == "fresh" && nonempty && !s.freshWasInitialized(r) {
+	if r.IndexRootID == "unconfigured" || !allowFreshNonempty && r.Mode == "fresh" && nonempty && !r.freshInitialized && !s.freshWasInitialized(r) {
 		return ErrReadinessQuarantined
 	}
 	var control projectionControlRow
@@ -1072,6 +1168,27 @@ func (s *GORMStore) freshWasInitialized(r Readiness) bool {
 	}
 	return true
 }
+func markFreshInitializedTx(tx *gorm.DB) error {
+	if tx == nil {
+		return ErrReadinessInvalid
+	}
+	var row storeReadinessRow
+	query := tx.Where("singleton_id = ?", "default").First(&row)
+	if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if query.Error != nil {
+		return errors.New("eventstore: read fresh readiness marker failed")
+	}
+	if row.Mode != "fresh" || row.FreshInitialized {
+		return nil
+	}
+	if err := tx.Model(&storeReadinessRow{}).Where("singleton_id = ?", "default").Update("fresh_initialized", true).Error; err != nil {
+		return errors.New("eventstore: mark fresh readiness initialized failed")
+	}
+	return nil
+}
+
 func (s *GORMStore) requireReady(ctx context.Context) error {
 	if s == nil {
 		return ErrReadinessInvalid
@@ -1084,7 +1201,6 @@ func (s *GORMStore) requireReady(ctx context.Context) error {
 	}
 	return nil
 }
-
 
 func (s *GORMStore) SetReadiness(ctx context.Context, r Readiness) error {
 	if err := validateReadinessValue(r); err != nil {
@@ -1419,7 +1535,6 @@ func (s *GORMStore) lockRotationPublication(ctx context.Context, tx *gorm.DB, ex
 	}
 	return nil
 }
-
 
 func (s *GORMStore) pluginValueUsage(ctx context.Context, extension string, exclude []byte) (int64, error) {
 	return s.pluginValueUsageOn(ctx, s.db.GORM(), extension, exclude)
@@ -1842,7 +1957,6 @@ func (s *GORMStore) refreshReadinessRoots(ctx context.Context, currentID string)
 	}
 	return nil
 }
-
 
 func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRoot) (updated, skipped int, err error) {
 	base := s.db.GORM().WithContext(ctx).Begin()

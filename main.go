@@ -21,6 +21,22 @@ import (
 	"syscall"
 	"time"
 
+	"Scardice-core/api"
+	"Scardice-core/core/configstate"
+	"Scardice-core/core/extensionstate"
+	"Scardice-core/core/messageflow"
+	"Scardice-core/core/privacypurge"
+	"Scardice-core/dice"
+	"Scardice-core/dice/service"
+	"Scardice-core/endpoint"
+	"Scardice-core/eventstore"
+	"Scardice-core/logger"
+	"Scardice-core/migrate/eventsourcing"
+	"Scardice-core/static"
+	"Scardice-core/utils/crypto"
+	"Scardice-core/utils/dboperator"
+	"Scardice-core/utils/oschecker"
+	"Scardice-core/utils/paniclog"
 	"github.com/gofrs/flock"
 	"github.com/jessevdk/go-flags"
 	"github.com/joho/godotenv"
@@ -28,20 +44,6 @@ import (
 	"github.com/labstack/echo/v4/middleware"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"Scardice-core/api"
-	"Scardice-core/dice"
-	"Scardice-core/dice/service"
-	"Scardice-core/endpoint"
-	"Scardice-core/core/messageflow"
-	"Scardice-core/core/privacypurge"
-	"Scardice-core/eventstore"
-	"Scardice-core/logger"
-	v2 "Scardice-core/migrate/v2"
-	"Scardice-core/static"
-	"Scardice-core/utils/crypto"
-	"Scardice-core/utils/dboperator"
-	"Scardice-core/utils/oschecker"
-	"Scardice-core/utils/paniclog"
 )
 
 /*
@@ -80,6 +82,17 @@ func cleanupCreate(diceManager *dice.DiceManager, extraCleanup func()) func() {
 
 		if !diceManager.CleanupFlag.CompareAndSwap(0, 1) {
 			// 尝试更新cleanup标记，如果已经为1则退出
+			return
+		}
+		if diceManager.EventSourcedMode {
+			for _, instance := range diceManager.Dice {
+				if instance != nil && instance.Cron != nil {
+					instance.Cron.Stop()
+				}
+			}
+			if diceManager.Cron != nil {
+				diceManager.Cron.Stop()
+			}
 			return
 		}
 
@@ -344,28 +357,49 @@ func main() {
 
 	// 提早初始化是为了读取ServiceName
 
-	// diceManager初始化数据库
-	operator, err := dboperator.GetDatabaseOperator()
-	if err != nil {
-		log.Errorf("Failed to init database: %v", err)
+	// Event-store readiness is the first runtime gate. No legacy loader,
+	// JavaScript, timer, pprof worker, Supervisor, or provider is started
+	// before this read-only validation succeeds.
+	endpointDBConfig, endpointConfigErr := endpointDatabaseConfigFromEnv(os.Getenv)
+	if endpointConfigErr != nil {
+		log.Errorf("endpoint event database configuration failed: %v", endpointConfigErr)
 		return
 	}
-	diceManager := &dice.DiceManager{
-		Operator: operator,
+	if endpointDBConfig.DSN == "" {
+		log.Error("event-store configuration is required; refusing legacy runtime fallback")
+		return
 	}
+	eventDB, openErr := eventstore.OpenDatabase(context.Background(), endpointDBConfig)
+	if openErr != nil {
+		log.Errorf("endpoint event database startup failed: %v", openErr)
+		return
+	}
+	defer eventDB.Close()
+	eventStore := eventstore.NewStore(eventDB, eventstore.WithProjection(configstate.ConfigProjection()), eventstore.WithProjection(extensionstate.ExtensionProjection()))
+	if openErr = eventStore.ValidateReadiness(context.Background()); openErr != nil {
+		log.Errorf("event-store readiness validation failed: %v", openErr)
+		return
+	}
+	legacyState := legacyStatePresent()
+	if _, openErr = eventsourcing.ValidateStartupReadiness(context.Background(), eventStore, legacyState); openErr != nil {
+		log.Errorf("event-store startup gate rejected state: %v", openErr)
+		return
+	}
+
+	// Legacy data is never loaded into the runtime. The importer is the only
+	// allowed legacy reader; this process starts with an empty Core shell after
+	// an import-ready target has been published.
+	diceManager := &dice.DiceManager{}
 
 	if opts.ContainerMode {
 		log.Info("当前为容器模式，内置适配器与更新功能已被禁用")
 		diceManager.ContainerMode = true
 	}
-
-	diceManager.LoadDice()
-	diceManager.IsReady = true
-
-	pprofStop, recErr := startPprofRecordIfEnabled(opts.PprofRecord, log, diceManager.AppBootTime)
-	if recErr != nil {
-		log.Warnf("pprof 记录启动失败: %v", recErr)
+	if err = diceManager.InitializeRuntime(); err != nil {
+		log.Errorf("runtime initialization failed: %v", err)
+		return
 	}
+	var pprofStop func() = func() {}
 
 	if opts.Address != "" {
 		log.Infof("由参数输入了服务地址: %s", opts.Address)
@@ -521,10 +555,6 @@ func main() {
 	//	log.Fatalf("您的146数据库可能存在问题，为保护数据，已经停止执行150升级命令。请尝试联系开发者，并提供你的日志。\n"+
 	//		"数据已回滚，您可暂时使用旧版本等待进一步的修复和更新。您的报错内容为: %v", err)
 	// }
-	err = v2.InitUpgrader(operator)
-	if err != nil {
-		log.Errorf("升级流程出现问题，请检查，问题为: %v", err)
-	}
 
 	if !opts.ShowConsole || opts.MultiInstanceOnWindows {
 		hideWindow()
@@ -533,8 +563,10 @@ func main() {
 	go dice.TryGetBackendURL()
 
 	var endpointBootstrap *endpoint.Bootstrap
+	var dispatcherCancel context.CancelFunc = func() {}
 	cleanUp := cleanupCreate(diceManager, func() {
 		pprofStop()
+		dispatcherCancel()
 		if endpointBootstrap != nil {
 			if err := endpointBootstrap.Shutdown(context.Background()); err != nil {
 				logger.M().Errorf("endpoint bootstrap shutdown failed: %v", err)
@@ -546,60 +578,71 @@ func main() {
 
 	// 初始化核心
 	diceManager.TryCreateDefault()
-	diceManager.InitDice(uiWriter)
-
-	if opts.JustForTest {
-		diceManager.JustForTest = true
+	for _, instance := range diceManager.Dice {
+		if err := instance.AttachDurableStore(eventStore); err != nil {
+			log.Errorf("attach durable event store failed: %v", err)
+			return
+		}
 	}
+	if err = diceManager.PrepareEventSourcedState(context.Background()); err != nil {
+		log.Errorf("event-sourced Core state initialization failed: %v", err)
+		return
+	}
+	diceManager.InitDice(uiWriter)
+	diceManager.IsReady = true
 	var coreDice *dice.Dice
 	if len(diceManager.Dice) > 0 {
 		coreDice = diceManager.Dice[0]
 	}
-	endpointDBConfig, endpointConfigErr := endpointDatabaseConfigFromEnv(os.Getenv)
-	if endpointConfigErr != nil {
-		log.Errorf("endpoint event database configuration failed: %v", endpointConfigErr)
+	var recErr error
+
+	if coreDice == nil || coreDice.ImSession == nil {
+		log.Errorf("event database requires an initialized Core session")
 		return
 	}
-	if endpointDBConfig.DSN != "" {
-		if coreDice == nil || coreDice.ImSession == nil {
-			log.Errorf("endpoint event database requires an initialized Core session")
-			return
-		}
-		eventDB, openErr := eventstore.OpenDatabase(context.Background(), endpointDBConfig)
-		if openErr != nil {
-			log.Errorf("endpoint event database startup failed: %v", openErr)
-			return
-		}
-		store := eventstore.NewStore(eventDB)
-		inboundService, inboundErr := messageflow.NewInboundService(store, store)
-		if inboundErr != nil {
-			_ = eventDB.Close()
-			log.Errorf("endpoint inbound service construction failed: %v", inboundErr)
-			return
-		}
-		api.RegisterPrivacyPurgeService(privacypurge.NewService(store))
-		endpointBootstrap, openErr = endpoint.NewBootstrap(store, nil, dice.NewOnebotDescriptor())
-		if openErr != nil {
-			_ = eventDB.Close()
-			log.Errorf("endpoint bootstrap construction failed: %v", openErr)
-			return
-		}
-		if openErr = endpointBootstrap.SetInboundSink(inboundService); openErr != nil {
-			log.Errorf("endpoint inbound bridge setup failed: %v", openErr)
-			return
-		}
-		api.RegisterEndpointBootstrap(endpointBootstrap)
-		if _, openErr = endpointBootstrap.Startup(context.Background()); openErr != nil {
-			log.Errorf("endpoint bootstrap replay/reconcile failed: %v", openErr)
-			return
-		}
-		api.RegisterPrivacyPurgeService(privacypurge.NewService(store))
-	} else {
-		// No event-store configuration means pure OneBot remains stopped; the
-		// legacy data DB is never treated as an authoritative fallback.
-		api.RegisterEndpointService(nil)
-		api.RegisterPrivacyPurgeService(nil)
+	inboundService, inboundErr := messageflow.NewInboundService(eventStore, eventStore)
+	if inboundErr != nil {
+		log.Errorf("endpoint inbound service construction failed: %v", inboundErr)
+		return
 	}
+	api.RegisterPrivacyPurgeService(privacypurge.NewService(eventStore))
+	endpointBootstrap, openErr = endpoint.NewBootstrap(eventStore, nil, dice.NewAdapterDescriptors()...)
+	if openErr != nil {
+		log.Errorf("endpoint bootstrap construction failed: %v", openErr)
+		return
+	}
+	if openErr = endpointBootstrap.SetInboundSink(inboundService); openErr != nil {
+		log.Errorf("endpoint inbound bridge setup failed: %v", openErr)
+		return
+	}
+	api.RegisterEndpointBootstrap(endpointBootstrap)
+	if _, openErr = endpointBootstrap.Startup(context.Background()); openErr != nil {
+		log.Errorf("endpoint bootstrap replay/reconcile failed: %v", openErr)
+		return
+	}
+
+	pprofStop, recErr = startPprofRecordIfEnabled(opts.PprofRecord, log, diceManager.AppBootTime)
+	if recErr != nil {
+		log.Warnf("pprof 记录启动失败: %v", recErr)
+	}
+
+	resolver := newEventEndpointResolver(endpointBootstrap.Service, endpointBootstrap.Registry, eventStore)
+	outboundService, outboundErr := messageflow.NewOutboundService(eventStore, resolver, eventStore, eventstore.UUIDGenerator{})
+	if outboundErr != nil {
+		log.Errorf("durable outbound service construction failed: %v", outboundErr)
+		return
+	}
+	bridge := dice.NewDurableOutboundBridge(outboundService, resolver, eventstore.UUIDGenerator{})
+	coreDice.OutboundBridge = bridge
+	coreDice.DurableStore = eventStore
+	dispatcher, dispatcherErr := endpoint.NewEffectDispatcher(eventStore, eventStore, endpointBootstrap.Supervisor, "scardice-outbox", endpoint.WithEffectResultNotifier(bridge), endpoint.WithEffectSuccessNotifier(bridge))
+	if dispatcherErr != nil {
+		log.Errorf("outbound dispatcher construction failed: %v", dispatcherErr)
+		return
+	}
+	dispatcherCtx, cancelDispatcher := context.WithCancel(context.Background())
+	dispatcherCancel = cancelDispatcher
+	go runEventEffectDispatcher(dispatcherCtx, dispatcher)
 	go func() {
 		// 每5分钟做一次新版本检查
 		for {
@@ -626,10 +669,6 @@ func main() {
 		log.Infof("由参数输入了服务地址: %s", opts.Address)
 	}
 
-	for _, d := range diceManager.Dice {
-		go diceServe(d)
-	}
-
 	go uiServe(diceManager, opts.HideUIWhenBoot, useBuiltinUI)
 	// OOM分析工具
 	// err = nil
@@ -651,119 +690,6 @@ func removeUpdateFiles() {
 	_ = os.Remove("./auto_update")
 	_ = os.Remove("./_delete_me.exe")
 	_ = os.RemoveAll("./update")
-}
-
-func diceServe(d *dice.Dice) {
-	log := d.Logger
-	defer dice.CrashLog()
-	if len(d.ImSession.EndPoints) == 0 {
-		log.Infof("未检测到任何帐号，请先到“帐号设置”进行添加")
-	}
-
-	d.UIEndpoint = new(dice.EndPointInfo)
-	d.UIEndpoint.Enable = true
-	d.UIEndpoint.Platform = "UI"
-	d.UIEndpoint.ID = "1"
-	d.UIEndpoint.State = 1
-	d.UIEndpoint.UserID = "UI:1000"
-	d.UIEndpoint.Adapter = &dice.PlatformAdapterHTTP{EndPoint: d.UIEndpoint}
-	d.UIEndpoint.Session = d.ImSession
-
-	dice.TextMapCompatibleCheckAll(d)
-
-	for _, _conn := range d.ImSession.EndPoints {
-		if _conn.Enable {
-			go func(conn *dice.EndPointInfo) {
-				defer dice.ErrorLogAndContinue(d)
-
-				switch conn.Platform {
-				case "QQ":
-					if conn.ProtocolType == "walle-q" {
-						pa := conn.Adapter.(*dice.PlatformAdapterWalleQ)
-						dice.WalleQServe(d, conn, pa.InPackWalleQPassword, pa.InPackWalleQProtocol, false)
-					}
-					if conn.ProtocolType == "onebot" {
-						pa := conn.Adapter.(*dice.PlatformAdapterGocq)
-						if pa.UseInPackClient && pa.BuiltinMode == "lagrange" {
-							dice.LagrangeServe(d, conn, dice.LagrangeLoginInfo{
-								IsAsyncRun: true,
-							})
-							return
-						}
-						if pa.UseInPackClient {
-							log.Errorf("不支持或已经废弃的内置适配器模式: %s", pa.BuiltinMode)
-							return
-						}
-						dice.GoCqhttpServe(d, conn, dice.GoCqhttpLoginInfo{
-							Password:         pa.InPackGoCqhttpPassword,
-							Protocol:         pa.InPackGoCqhttpProtocol,
-							AppVersion:       pa.InPackGoCqhttpAppVersion,
-							IsAsyncRun:       true,
-							UseSignServer:    pa.UseSignServer,
-							SignServerConfig: pa.SignServerConfig,
-						})
-					}
-					if conn.ProtocolType == "red" {
-						dice.ServeRed(d, conn)
-					}
-					if conn.ProtocolType == "official" {
-						dice.ServerOfficialQQ(d, conn)
-						return
-					}
-					if conn.ProtocolType == "satori" {
-						dice.ServeSatori(d, conn)
-					}
-					if conn.ProtocolType == "LagrangeGo" {
-						// dice.ServeLagrangeGo(d, conn)
-						return
-					}
-					if conn.ProtocolType == "milky" {
-						pa := conn.Adapter.(*dice.PlatformAdapterMilky)
-						switch pa.BuiltInMode {
-						case "lagrangeV2":
-							if runtime.GOOS == "android" {
-								return
-							}
-							dice.ServeMilkyBuiltIn(d, conn)
-							return
-						case "yogurt":
-							dice.ServeMilkyBuiltIn(d, conn)
-							return
-						default:
-							// 分离
-							dice.ServeMilky(d, conn)
-						}
-						return
-					}
-					// Pure OneBot is restored from endpoint aggregate state and started
-					// only by EndpointLifecycle/Supervisor composition.
-					if conn.ProtocolType == "pureonebot" {
-						return
-					}
-					time.Sleep(10 * time.Second) // 稍作等待再连接
-					dice.ServeQQ(d, conn)
-				case "DISCORD":
-					dice.ServeDiscord(d, conn)
-				case "KOOK":
-					dice.ServeKook(d, conn)
-				case "TG":
-					dice.ServeTelegram(d, conn)
-				case "MC":
-					dice.ServeMinecraft(d, conn)
-				case "DODO":
-					dice.ServeDodo(d, conn)
-				case "SLACK":
-					dice.ServeSlack(d, conn)
-				case "DINGTALK":
-					dice.ServeDingTalk(d, conn)
-				case "SEALCHAT":
-					dice.ServeSealChat(d, conn)
-				}
-			}(_conn)
-		} else {
-			_conn.State = 0 // 重置状态
-		}
-	}
 }
 
 func uiServe(dm *dice.DiceManager, hideUI bool, useBuiltin bool) {

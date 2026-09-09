@@ -183,8 +183,8 @@ func TestTask7SQLitePrivacyServiceConfirmResumeAndScrub(t *testing.T) {
 type task7FailingPrivacyRepo struct {
 	*eventstore.GORMStore
 	failDeleteBefore, failDeleteAfter, failRebuild, failFinalize, failFinalizeAfter bool
-	deleteCalls int
-	deleteRequests []eventstore.PrivacyBatchRequest
+	deleteCalls                                                                     int
+	deleteRequests                                                                  []eventstore.PrivacyBatchRequest
 }
 
 func (r *task7FailingPrivacyRepo) PrivacyFinalizeOperation(ctx context.Context, operationID string, expected uint64, status string) (uint64, error) {

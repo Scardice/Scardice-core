@@ -38,6 +38,15 @@ type ContextAwareLoop interface {
 	CurrentContext() any
 	LoadEntryWithContext(context any, entry Entry) error
 }
+// OwnerAwareLoop reports whether the caller is executing on the loop's owner
+// thread/goroutine. CurrentContext is intentionally not used for this check:
+// providers may expose the last active context to unrelated callers while the
+// owner is busy.
+type OwnerAwareLoop interface {
+	ContextAwareLoop
+	InOwner() bool
+}
+
 
 // LoadEntryWithContext evaluates an entry while retaining its opaque context
 // across engine-owned asynchronous callbacks.
@@ -87,4 +96,10 @@ func CurrentContext(loop Loop) any {
 		return aware.CurrentContext()
 	}
 	return nil
+}
+// InOwner reports owner-thread/goroutine affinity when the provider exposes it.
+// A false result is conservative: callers must use the waiting entry point.
+func InOwner(loop Loop) bool {
+	owner, ok := loop.(OwnerAwareLoop)
+	return ok && owner.InOwner()
 }

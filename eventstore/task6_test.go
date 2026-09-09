@@ -5,14 +5,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"gorm.io/gorm"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-	"testing"
 	"sync"
+	"testing"
 	"time"
-	"gorm.io/gorm"
 )
 
 type MemoryKeySource struct {
@@ -29,11 +29,54 @@ func NewMemoryKeySource(indexID string, indexMaterial []byte, roots map[string][
 	}
 	return &MemoryKeySource{IndexID: indexID, IndexMaterial: append([]byte(nil), indexMaterial...), Roots: copyRoots, CurrentID: currentID}
 }
-func (m *MemoryKeySource) IndexRootID(context.Context) (string, error) { if m == nil || m.IndexID == "" { return "", ErrKeySourceUnavailable }; return m.IndexID, nil }
-func (m *MemoryKeySource) IndexRootMaterial(context.Context) ([]byte, error) { if m == nil || len(m.IndexMaterial) != 32 { return nil, ErrKeySourceUnavailable }; return append([]byte(nil), m.IndexMaterial...), nil }
-func (m *MemoryKeySource) CurrentEncryptionRoot(ctx context.Context) (EncryptionRoot, error) { if m == nil || m.CurrentID == "" { return EncryptionRoot{}, ErrKeySourceUnavailable }; material, err := m.EncryptionRoot(ctx, m.CurrentID); return EncryptionRoot{ID: m.CurrentID, Material: material}, err }
-func (m *MemoryKeySource) EncryptionRoot(_ context.Context, id string) ([]byte, error) { if m == nil { return nil, ErrKeySourceUnavailable }; material, ok := m.Roots[id]; if !ok || len(material) != 32 { return nil, ErrKeyUnavailable }; return append([]byte(nil), material...), nil }
-func (m *MemoryKeySource) EncryptionRoots(ctx context.Context) ([]EncryptionRoot, error) { if m == nil { return nil, ErrKeySourceUnavailable }; ids := make([]string, 0, len(m.Roots)); for id := range m.Roots { ids = append(ids, id) }; sort.Strings(ids); out := make([]EncryptionRoot, 0, len(ids)); for _, id := range ids { material, err := m.EncryptionRoot(ctx, id); if err != nil { return nil, err }; out = append(out, EncryptionRoot{ID: id, Material: material}) }; return out, nil }
+func (m *MemoryKeySource) IndexRootID(context.Context) (string, error) {
+	if m == nil || m.IndexID == "" {
+		return "", ErrKeySourceUnavailable
+	}
+	return m.IndexID, nil
+}
+func (m *MemoryKeySource) IndexRootMaterial(context.Context) ([]byte, error) {
+	if m == nil || len(m.IndexMaterial) != 32 {
+		return nil, ErrKeySourceUnavailable
+	}
+	return append([]byte(nil), m.IndexMaterial...), nil
+}
+func (m *MemoryKeySource) CurrentEncryptionRoot(ctx context.Context) (EncryptionRoot, error) {
+	if m == nil || m.CurrentID == "" {
+		return EncryptionRoot{}, ErrKeySourceUnavailable
+	}
+	material, err := m.EncryptionRoot(ctx, m.CurrentID)
+	return EncryptionRoot{ID: m.CurrentID, Material: material}, err
+}
+func (m *MemoryKeySource) EncryptionRoot(_ context.Context, id string) ([]byte, error) {
+	if m == nil {
+		return nil, ErrKeySourceUnavailable
+	}
+	material, ok := m.Roots[id]
+	if !ok || len(material) != 32 {
+		return nil, ErrKeyUnavailable
+	}
+	return append([]byte(nil), material...), nil
+}
+func (m *MemoryKeySource) EncryptionRoots(ctx context.Context) ([]EncryptionRoot, error) {
+	if m == nil {
+		return nil, ErrKeySourceUnavailable
+	}
+	ids := make([]string, 0, len(m.Roots))
+	for id := range m.Roots {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]EncryptionRoot, 0, len(ids))
+	for _, id := range ids {
+		material, err := m.EncryptionRoot(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, EncryptionRoot{ID: id, Material: material})
+	}
+	return out, nil
+}
 
 type gatedRootKeySource struct {
 	*MemoryKeySource
@@ -76,7 +119,9 @@ func task6Source() *MemoryKeySource {
 func task6Store(t *testing.T) (*GORMStore, *Database, *MemoryKeySource) {
 	t.Helper()
 	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "task6.db")})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	source := task6Source()
 	store := NewStore(db, WithKeySource(source))
 	if err := store.SetReadiness(context.Background(), Readiness{
@@ -92,11 +137,19 @@ func task6Store(t *testing.T) (*GORMStore, *Database, *MemoryKeySource) {
 func TestA6CryptoRoundTripAndAuthentication(t *testing.T) {
 	source := task6Source()
 	ciphertext, nonce, keyID, err := a6Seal(context.Background(), source, "adapter-secret/v1", "secret-ref", "endpoint/adapter", 1, []byte("secret"))
-	if err != nil { t.Fatal(err) }
-	if keyID != "root-v1" || string(ciphertext) == "secret" || len(nonce) != 12 { t.Fatalf("crypto output key=%q nonce=%d ciphertext=%q", keyID, len(nonce), ciphertext) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keyID != "root-v1" || string(ciphertext) == "secret" || len(nonce) != 12 {
+		t.Fatalf("crypto output key=%q nonce=%d ciphertext=%q", keyID, len(nonce), ciphertext)
+	}
 	plain, err := a6Open(context.Background(), source, "adapter-secret/v1", "secret-ref", "endpoint/adapter", 1, keyID, ciphertext, nonce)
-	if err != nil || string(plain) != "secret" { t.Fatalf("round trip plaintext=%q err=%v", plain, err) }
-	if _, err := a6Open(context.Background(), source, "adapter-secret/v1", "other-ref", "endpoint/adapter", 1, keyID, ciphertext, nonce); !errors.Is(err, ErrAuthenticationFailed) { t.Fatalf("wrong AAD err=%v", err) }
+	if err != nil || string(plain) != "secret" {
+		t.Fatalf("round trip plaintext=%q err=%v", plain, err)
+	}
+	if _, err := a6Open(context.Background(), source, "adapter-secret/v1", "other-ref", "endpoint/adapter", 1, keyID, ciphertext, nonce); !errors.Is(err, ErrAuthenticationFailed) {
+		t.Fatalf("wrong AAD err=%v", err)
+	}
 }
 
 func TestSecretHistoryAndWrongKey(t *testing.T) {
@@ -104,10 +157,16 @@ func TestSecretHistoryAndWrongKey(t *testing.T) {
 	defer db.Close()
 	ctx := context.Background()
 	first, err := store.PutSecret(ctx, SecretPutRequest{SecretRef: "secret-ref", EndpointID: "endpoint", AdapterID: "adapter", Plaintext: []byte("one")})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	second, err := store.PutSecret(ctx, SecretPutRequest{SecretRef: "secret-ref", EndpointID: "endpoint", AdapterID: "adapter", ExpectedVersion: 1, Plaintext: []byte("two")})
-	if err != nil { t.Fatal(err) }
-	if first.SecretVersion != 1 || second.SecretVersion != 2 { t.Fatalf("secret versions=%d,%d", first.SecretVersion, second.SecretVersion) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.SecretVersion != 1 || second.SecretVersion != 2 {
+		t.Fatalf("secret versions=%d,%d", first.SecretVersion, second.SecretVersion)
+	}
 	if _, err := store.PutSecret(ctx, SecretPutRequest{SecretRef: "secret-ref", EndpointID: "other-endpoint", AdapterID: "adapter", ExpectedVersion: 2, Plaintext: []byte("rebind")}); !errors.Is(err, ErrInvalidMetadata) {
 		t.Fatalf("secret endpoint rebind err=%v", err)
 	}
@@ -115,12 +174,20 @@ func TestSecretHistoryAndWrongKey(t *testing.T) {
 		t.Fatalf("secret adapter rebind err=%v", err)
 	}
 	resolved, err := store.ResolveSecret(ctx, "secret-ref", 1)
-	if err != nil || string(resolved.Plaintext) != "one" { t.Fatalf("resolve v1=%q err=%v", resolved.Plaintext, err) }
+	if err != nil || string(resolved.Plaintext) != "one" {
+		t.Fatalf("resolve v1=%q err=%v", resolved.Plaintext, err)
+	}
 	var row adapterSecretRow
-	if err := db.GORM().Where("secret_ref = ? AND secret_version = ?", "secret-ref", 1).First(&row).Error; err != nil { t.Fatal(err) }
-	if strings.Contains(string(row.Ciphertext), "one") { t.Fatal("secret plaintext persisted") }
+	if err := db.GORM().Where("secret_ref = ? AND secret_version = ?", "secret-ref", 1).First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(row.Ciphertext), "one") {
+		t.Fatal("secret plaintext persisted")
+	}
 	source.Roots["root-v1"] = []byte("ZYXWVUTSRQPONMLKJIHGFEDCBA987654")
-	if _, err := store.ResolveSecret(ctx, "secret-ref", 1); !errors.Is(err, ErrAuthenticationFailed) && !errors.Is(err, ErrKeyUnavailable) { t.Fatalf("wrong root err=%v", err) }
+	if _, err := store.ResolveSecret(ctx, "secret-ref", 1); !errors.Is(err, ErrAuthenticationFailed) && !errors.Is(err, ErrKeyUnavailable) {
+		t.Fatalf("wrong root err=%v", err)
+	}
 }
 func TestA6SecretDecodedBounds(t *testing.T) {
 	store, db, source := task6Store(t)
@@ -183,21 +250,36 @@ func TestA6KeyIDsRequireReadinessAdmission(t *testing.T) {
 	}
 }
 
-
 func TestPluginKVExactAndPrefixIsolation(t *testing.T) {
 	store, db, _ := task6Store(t)
 	defer db.Close()
 	ctx := context.Background()
-	if _, err := store.SetPluginKV(ctx, PluginKVPutRequest{ExtensionID: "ext-a", Key: "alpha", Value: []byte("one")}); err != nil { t.Fatal(err) }
-	if _, err := store.SetPluginKV(ctx, PluginKVPutRequest{ExtensionID: "ext-a", Key: "alpine", Value: []byte("two")}); err != nil { t.Fatal(err) }
-	if _, err := store.SetPluginKV(ctx, PluginKVPutRequest{ExtensionID: "ext-b", Key: "alpha", Value: []byte("other")}); err != nil { t.Fatal(err) }
+	if _, err := store.SetPluginKV(ctx, PluginKVPutRequest{ExtensionID: "ext-a", Key: "alpha", Value: []byte("one")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetPluginKV(ctx, PluginKVPutRequest{ExtensionID: "ext-a", Key: "alpine", Value: []byte("two")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetPluginKV(ctx, PluginKVPutRequest{ExtensionID: "ext-b", Key: "alpha", Value: []byte("other")}); err != nil {
+		t.Fatal(err)
+	}
 	item, err := store.GetPluginKV(ctx, "ext-a", "alpha")
-	if err != nil || string(item.Value) != "one" { t.Fatalf("get=%#v err=%v", item, err) }
+	if err != nil || string(item.Value) != "one" {
+		t.Fatalf("get=%#v err=%v", item, err)
+	}
 	items, err := store.ListPluginKV(ctx, PluginKVListRequest{ExtensionID: "ext-a", Prefix: "alp"})
-	if err != nil || len(items) != 2 { t.Fatalf("list=%#v err=%v", items, err) }
-	if _, err := store.GetPluginKV(ctx, "ext-b", "alpine"); !errors.Is(err, ErrPluginKVNotFound) { t.Fatalf("extension isolation err=%v", err) }
-	if err := store.DeletePluginKV(ctx, "ext-a", "alpha", item.Version); err != nil { t.Fatal(err) }
-	if _, err := store.GetPluginKV(ctx, "ext-a", "alpha"); !errors.Is(err, ErrPluginKVNotFound) { t.Fatalf("delete err=%v", err) }
+	if err != nil || len(items) != 2 {
+		t.Fatalf("list=%#v err=%v", items, err)
+	}
+	if _, err := store.GetPluginKV(ctx, "ext-b", "alpine"); !errors.Is(err, ErrPluginKVNotFound) {
+		t.Fatalf("extension isolation err=%v", err)
+	}
+	if err := store.DeletePluginKV(ctx, "ext-a", "alpha", item.Version); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetPluginKV(ctx, "ext-a", "alpha"); !errors.Is(err, ErrPluginKVNotFound) {
+		t.Fatalf("delete err=%v", err)
+	}
 }
 func TestPluginKVLookupBounds(t *testing.T) {
 	store, db, _ := task6Store(t)
@@ -423,8 +505,6 @@ func TestGetOperationQueryFailureIsNotNotFound(t *testing.T) {
 	}
 }
 
-
-
 func TestReadinessPinAndRootAvailability(t *testing.T) {
 	store, db, source := task6Store(t)
 	defer db.Close()
@@ -432,7 +512,9 @@ func TestReadinessPinAndRootAvailability(t *testing.T) {
 	if err := store.SetReadiness(context.Background(), Readiness{Mode: "import", SchemaVersion: 2, DatabaseIdentity: "db-1", IndexRootID: source.IndexID, EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC()}); !errors.Is(err, ErrReadinessInvalid) {
 		t.Fatalf("unsupported readiness schema err=%v", err)
 	}
-	if err := store.SetReadiness(context.Background(), readiness); err != nil { t.Fatal(err) }
+	if err := store.SetReadiness(context.Background(), readiness); err != nil {
+		t.Fatal(err)
+	}
 	got, err := store.GetReadiness(context.Background())
 	if err != nil || got.Mode != "import" || got.IndexRootID != "index-v1" {
 		t.Fatalf("readiness=%#v err=%v", got, err)
@@ -476,7 +558,7 @@ func TestReadinessRequiresCurrentEncryptionRoot(t *testing.T) {
 	defer db.Close()
 	ctx := context.Background()
 	cases := []struct {
-		name string
+		name   string
 		mutate func(*Readiness)
 	}{
 		{name: "global position", mutate: func(r *Readiness) { r.TerminalGlobalPosition = 1 }},
@@ -537,7 +619,6 @@ func TestReadinessMutationSerialization(t *testing.T) {
 	}
 }
 
-
 func TestPublicA6OperationRevalidatesReadiness(t *testing.T) {
 	store, db, _ := task6Store(t)
 	defer db.Close()
@@ -563,7 +644,6 @@ func TestPublicMutationRejectsFreshNonemptyReadinessTamper(t *testing.T) {
 		t.Fatalf("fresh nonempty readiness mutation err=%v", err)
 	}
 }
-
 
 func TestReadinessRejectsUnpublishedProjection(t *testing.T) {
 	store, db, _ := task6Store(t)
@@ -622,7 +702,7 @@ func TestA6OperationPrincipalAndCiphertextInvariants(t *testing.T) {
 	}
 	if _, err := store.Commit(ctx, UnitOfWork{Operations: []OperationUpdate{{OperationID: "partial-op", PrincipalID: "owner", EncryptionKeyID: keyID}}}); !errors.Is(err, ErrInvalidMetadata) {
 		t.Fatalf("partial ciphertext err=%v", err)
-}
+	}
 }
 
 func TestA6DeletedPluginAuthenticatesBeforeDelete(t *testing.T) {
@@ -648,46 +728,80 @@ func TestA6DeletedPluginAuthenticatesBeforeDelete(t *testing.T) {
 }
 
 func TestKeyFileSecurity(t *testing.T) {
-	if os.Getenv("GOOS") == "windows" { t.Skip("Unix key file contract") }
+	if os.Getenv("GOOS") == "windows" {
+		t.Skip("Unix key file contract")
+	}
 	path := filepath.Join(t.TempDir(), "root.key")
 	material := []byte("01234567890123456789012345678901")
-	if err := CreateUnixKeyFile(path, material); err != nil { t.Fatal(err) }
+	if err := CreateUnixKeyFile(path, material); err != nil {
+		t.Fatal(err)
+	}
 	got, err := readKeyFile(path)
-	if err != nil || string(got) != string(material) { t.Fatalf("key read=%q err=%v", got, err) }
-	if err := os.Chmod(path, 0644); err != nil { t.Fatal(err) }
-	if _, err := readKeyFile(path); !errors.Is(err, ErrKeyUnavailable) { t.Fatalf("insecure mode err=%v", err) }
+	if err != nil || string(got) != string(material) {
+		t.Fatalf("key read=%q err=%v", got, err)
+	}
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readKeyFile(path); !errors.Is(err, ErrKeyUnavailable) {
+		t.Fatalf("insecure mode err=%v", err)
+	}
 }
 func TestRotationReencryptsSecretAndPlugin(t *testing.T) {
 	store, db, source := task6Store(t)
 	defer db.Close()
 	ctx := context.Background()
-	if _, err := store.PutSecret(ctx, SecretPutRequest{SecretRef: "rotate-secret", EndpointID: "endpoint", AdapterID: "adapter", Plaintext: []byte("secret")}); err != nil { t.Fatal(err) }
-	if _, err := store.SetPluginKV(ctx, PluginKVPutRequest{ExtensionID: "rotate-ext", Key: "key", Value: []byte("value")}); err != nil { t.Fatal(err) }
+	if _, err := store.PutSecret(ctx, SecretPutRequest{SecretRef: "rotate-secret", EndpointID: "endpoint", AdapterID: "adapter", Plaintext: []byte("secret")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetPluginKV(ctx, PluginKVPutRequest{ExtensionID: "rotate-ext", Key: "key", Value: []byte("value")}); err != nil {
+		t.Fatal(err)
+	}
 	var beforeSecret adapterSecretRow
-	if err := db.GORM().Where("secret_ref = ?", "rotate-secret").First(&beforeSecret).Error; err != nil { t.Fatal(err) }
+	if err := db.GORM().Where("secret_ref = ?", "rotate-secret").First(&beforeSecret).Error; err != nil {
+		t.Fatal(err)
+	}
 	var beforePlugin pluginKVRow
-	if err := db.GORM().Where("extension_id = ?", "rotate-ext").First(&beforePlugin).Error; err != nil { t.Fatal(err) }
+	if err := db.GORM().Where("extension_id = ?", "rotate-ext").First(&beforePlugin).Error; err != nil {
+		t.Fatal(err)
+	}
 	source.Roots["root-v2"] = []byte("12345678901234567890123456789012")
-	if err := store.SetReadiness(ctx, Readiness{Mode: "import", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: "index-v1", EncryptionRootIDs: []string{"root-v1", "root-v2"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), TerminalGlobalPosition: 0, TerminalProjectionPosition: 0, CompletedAt: time.Unix(1, 0).UTC()}); err != nil { t.Fatal(err) }
+	if err := store.SetReadiness(ctx, Readiness{Mode: "import", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: "index-v1", EncryptionRootIDs: []string{"root-v1", "root-v2"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), TerminalGlobalPosition: 0, TerminalProjectionPosition: 0, CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
+		t.Fatal(err)
+	}
 	source.IndexMaterial[0] ^= 0xff
-	if _, err := store.RotateEncryptionRoots(ctx); !errors.Is(err, ErrReadinessQuarantined) { t.Fatalf("changed index material rotation err=%v", err) }
+	if _, err := store.RotateEncryptionRoots(ctx); !errors.Is(err, ErrReadinessQuarantined) {
+		t.Fatalf("changed index material rotation err=%v", err)
+	}
 	source.IndexMaterial[0] ^= 0xff
 	source.CurrentID = "root-v2"
 	result, err := store.RotateEncryptionRoots(ctx)
-	if err != nil { t.Fatal(err) }
-	if result.Updated < 2 || result.CurrentRootID != "root-v2" { t.Fatalf("rotation result=%#v", result) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Updated < 2 || result.CurrentRootID != "root-v2" {
+		t.Fatalf("rotation result=%#v", result)
+	}
 	var afterSecret adapterSecretRow
-	if err := db.GORM().Where("secret_ref = ?", "rotate-secret").First(&afterSecret).Error; err != nil { t.Fatal(err) }
+	if err := db.GORM().Where("secret_ref = ?", "rotate-secret").First(&afterSecret).Error; err != nil {
+		t.Fatal(err)
+	}
 	var afterPlugin pluginKVRow
-	if err := db.GORM().Where("extension_id = ?", "rotate-ext").First(&afterPlugin).Error; err != nil { t.Fatal(err) }
+	if err := db.GORM().Where("extension_id = ?", "rotate-ext").First(&afterPlugin).Error; err != nil {
+		t.Fatal(err)
+	}
 	if afterSecret.RowVersion != beforeSecret.RowVersion || afterSecret.SecretVersion != beforeSecret.SecretVersion || afterSecret.EncryptionKeyID != "root-v2" {
 		t.Fatalf("rotation changed secret logical version: before=%#v after=%#v", beforeSecret, afterSecret)
 	}
 	if afterPlugin.RowVersion != beforePlugin.RowVersion || afterPlugin.EncryptionKeyID != "root-v2" {
 		t.Fatalf("rotation changed plugin logical version: before=%#v after=%#v", beforePlugin, afterPlugin)
 	}
-	if got, err := store.ResolveSecret(ctx, "rotate-secret", 0); err != nil || string(got.Plaintext) != "secret" { t.Fatalf("rotated secret=%q err=%v", got.Plaintext, err) }
-	if got, err := store.GetPluginKV(ctx, "rotate-ext", "key"); err != nil || string(got.Value) != "value" { t.Fatalf("rotated plugin=%q err=%v", got.Value, err) }
+	if got, err := store.ResolveSecret(ctx, "rotate-secret", 0); err != nil || string(got.Plaintext) != "secret" {
+		t.Fatalf("rotated secret=%q err=%v", got.Plaintext, err)
+	}
+	if got, err := store.GetPluginKV(ctx, "rotate-ext", "key"); err != nil || string(got.Value) != "value" {
+		t.Fatalf("rotated plugin=%q err=%v", got.Value, err)
+	}
 }
 func TestReadinessRejectsTamperedValidFreshMode(t *testing.T) {
 	store, db, source := task6Store(t)
@@ -734,18 +848,71 @@ func TestImportReadinessAdvancesWithEventCommit(t *testing.T) {
 		t.Fatalf("follow-up participant commit err=%v", err)
 	}
 }
+func TestFreshReadinessSurvivesReopenAfterCommit(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "fresh-reopen.db")
+	source := task6Source()
+	db, err := OpenDatabase(ctx, DatabaseConfig{Type: "sqlite", DSN: path, KeySource: source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(db, WithKeySource(source))
+	if err := store.SetReadiness(ctx, Readiness{
+		Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: source.IndexID,
+		EncryptionRootIDs: []string{"root-v1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	event := NewEvent{
+		EventType: "fresh.event", SchemaVersion: 1, Payload: []byte(`{}`),
+		Metadata: Metadata{
+			EventID: "fresh-event-1", CommandID: "fresh-command-1",
+			CorrelationID: "fresh-correlation-1", OccurredAtUnixNanoUTC: 1,
+			OccurredAtUnixNanoSet: true,
+		},
+	}
+	if _, err := store.Commit(ctx, UnitOfWork{
+		Streams: []StreamAppend{{Stream: StreamID{AggregateType: "fresh", AggregateID: "1"}, Events: []NewEvent{event}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopenedDB, err := OpenDatabase(ctx, DatabaseConfig{Type: "sqlite", DSN: path, KeySource: source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopenedDB.Close()
+	reopened := NewStore(reopenedDB, WithKeySource(source))
+	if err := reopened.ValidateReadiness(ctx); err != nil {
+		t.Fatalf("fresh readiness after reopen err=%v", err)
+	}
+}
+
 func TestA6StartupReadinessGate(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "startup-gate.db")
 	source := task6Source()
 	db, err := OpenDatabase(ctx, DatabaseConfig{Type: "sqlite", DSN: path})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	store := NewStore(db, WithKeySource(source))
 	event := NewEvent{EventType: "startup.gate", SchemaVersion: 1, Payload: []byte(`{}`), Metadata: Metadata{EventID: "startup-event", CommandID: "startup-command", CorrelationID: "startup-correlation", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}}
-	if _, err := store.Commit(ctx, UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{AggregateType: "startup", AggregateID: "1"}, Events: []NewEvent{event}}}}); err != nil { t.Fatal(err) }
-	if err := db.Close(); err != nil { t.Fatal(err) }
+	if _, err := store.Commit(ctx, UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{AggregateType: "startup", AggregateID: "1"}, Events: []NewEvent{event}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GORM().Model(&storeReadinessRow{}).Where("singleton_id = ?", "default").Update("fresh_initialized", false).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
 	db, err = OpenDatabase(ctx, DatabaseConfig{Type: "sqlite", DSN: path, KeySource: source})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer db.Close()
 	reopened := NewStore(db)
 	if _, err := reopened.Commit(ctx, UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{AggregateType: "startup", AggregateID: "2"}, Events: []NewEvent{event}}}}); !errors.Is(err, ErrReadinessQuarantined) {

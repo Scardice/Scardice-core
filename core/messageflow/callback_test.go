@@ -960,3 +960,53 @@ type eventstoreInboxRowForTest struct {
 	Status            string
 	PayloadCiphertext []byte
 }
+
+func TestMutationCollectorBatchAndSubjectBindingAreAtomic(t *testing.T) {
+	collector := NewMutationCollector(eventstore.EventFactory{})
+	valid := eventstore.PluginKVUpdate{ExtensionID: "plugin", KeyHMAC: []byte("one"), KeyCiphertext: []byte("key"), KeyNonce: []byte("nonce"), ValueCiphertext: []byte("value"), ValueNonce: []byte("nonce"), EncryptionKeyID: "key", ValueSize: 5}
+	invalid := valid
+	invalid.ExtensionID = "$t-plugin"
+	if err := collector.AddPluginKVBatch([]eventstore.PluginKVUpdate{valid, invalid}); !errors.Is(err, eventstore.ErrInvalidMetadata) {
+		t.Fatalf("batch err=%v", err)
+	}
+	work, err := collector.UnitOfWork()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(work.PluginKVUpdates) != 0 {
+		t.Fatalf("failed batch staged %#v", work.PluginKVUpdates)
+	}
+	collector.subjectKey = []byte("subject")
+	effect := eventstore.NewEffect{EffectID: "effect", EndpointID: "endpoint", LaneHMAC: []byte("lane"), EffectType: "send", RiskClass: eventstore.RiskPreDispatchRetryable, Status: eventstore.OutboxStatusPending, PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key"}
+	if err := collector.AddEffect(effect); err != nil {
+		t.Fatal(err)
+	}
+	effect.SubjectKey = []byte("forged")
+	if err := collector.AddEffect(effect); !errors.Is(err, eventstore.ErrDuplicateParticipant) {
+		t.Fatalf("duplicate forged effect err=%v", err)
+	}
+	work, err = collector.UnitOfWork()
+	if err != nil || len(work.Effects) != 1 || string(work.Effects[0].SubjectKey) != "subject" {
+		t.Fatalf("bound effect=%#v err=%v", work.Effects, err)
+	}
+	work.Effects[0].SubjectKey[0] = 'x'
+	again, err := collector.UnitOfWork()
+	if err != nil || string(again.Effects[0].SubjectKey) != "subject" {
+		t.Fatalf("effect snapshot aliases collector=%#v err=%v", again.Effects, err)
+	}
+}
+
+func TestMutationCollectorClonesEventSubjectKey(t *testing.T) {
+	collector := NewMutationCollector(eventstore.EventFactory{})
+	key := []byte("subject")
+	event := callbackEvent("group.changed", `{}`)
+	event.Metadata.SubjectKey = key
+	if err := collector.AddStream(eventstore.StreamID{AggregateType: "group", AggregateID: "group-1"}, 0, []eventstore.NewEvent{event}); err != nil {
+		t.Fatal(err)
+	}
+	key[0] = 'x'
+	work, err := collector.UnitOfWork()
+	if err != nil || string(work.Streams[0].Events[0].Metadata.SubjectKey) != "subject" {
+		t.Fatalf("event subject key=%#v err=%v", work.Streams, err)
+	}
+}

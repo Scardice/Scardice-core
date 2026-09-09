@@ -231,7 +231,7 @@ require (
 )
 
 replace (
-	github.com/Szzrain/dodo-open-go v0.2.7 => github.com/sealdice/dodo-open-go v0.2.8
+	github.com/PaienNate/pineutil v1.1.1 => ./third_party/pineutil
 	// Try to fix sqlite in cgofree
 	// github.com/glebarez/sqlite v1.11.0 => github.com/PaienNate/sqlite v0.0.0-20241102151933-067d82f14685
 	github.com/dop251/goja_nodejs v0.0.0-20250409162600-f7acab6894b0 => github.com/PaienNate/goja_nodejs v0.0.0-20250924024212-bac2e5ba5231

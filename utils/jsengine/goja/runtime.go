@@ -2,8 +2,11 @@
 package goja
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	goruntime "runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -75,8 +78,20 @@ type eventLoop struct {
 	running   atomic.Bool
 	once      sync.Once
 	context   atomic.Bool
+	ownerGID  atomic.Uint64
 	started   chan struct{}
 	startOnce sync.Once
+}
+
+func currentGoroutineID() uint64 {
+	var buffer [64]byte
+	n := goruntime.Stack(buffer[:], false)
+	fields := bytes.Fields(buffer[:n])
+	if len(fields) < 2 {
+		return 0
+	}
+	id, _ := strconv.ParseUint(string(fields[1]), 10, 64)
+	return id
 }
 
 type value struct {
@@ -141,6 +156,12 @@ func StartInForeground(loop jsengine.Loop) error {
 		return errors.New("goja event loop is already running")
 	}
 	adapter.signalStarted()
+	owner := currentGoroutineID()
+	previousOwner := adapter.ownerGID.Load()
+	if owner != 0 {
+		adapter.ownerGID.Store(owner)
+		defer adapter.ownerGID.Store(previousOwner)
+	}
 	defer adapter.running.Store(false)
 	var runErr error
 	func() {
@@ -152,6 +173,12 @@ func StartInForeground(loop jsengine.Loop) error {
 		adapter.loop.StartInForeground()
 	}()
 	return runErr
+}
+
+func (l *eventLoop) Engine() jsengine.EngineID { return jsengine.EngineGoja }
+
+func (l *eventLoop) Descriptor() jsengine.Descriptor {
+	return (&runtime{}).Descriptor()
 }
 
 // WaitUntilStarted waits until StartInForeground has claimed loop ownership.
@@ -167,13 +194,13 @@ func WaitUntilStarted(loop jsengine.Loop) error {
 	return nil
 }
 
-func (l *eventLoop) Engine() jsengine.EngineID { return jsengine.EngineGoja }
-
-func (l *eventLoop) Descriptor() jsengine.Descriptor {
-	return (&runtime{}).Descriptor()
-}
-
 func (l *eventLoop) invoke(context any, run func(jsengine.Runtime) error, vm *goja.Runtime) error {
+	owner := currentGoroutineID()
+	previousOwner := l.ownerGID.Load()
+	if owner != 0 && previousOwner != owner {
+		l.ownerGID.Store(owner)
+		defer l.ownerGID.Store(previousOwner)
+	}
 	return l.realm.state.with(context, func() error {
 		return run(&runtime{vm: vm, realm: l.realm})
 	})
@@ -265,6 +292,10 @@ func (l *eventLoop) CurrentContext() any {
 		return nil
 	}
 	return l.realm.state.currentContext()
+}
+
+func (l *eventLoop) InOwner() bool {
+	return l != nil && l.ownerGID.Load() != 0 && l.ownerGID.Load() == currentGoroutineID()
 }
 
 func gojaLoadEntry(runtime jsengine.Runtime, entry jsengine.Entry) error {

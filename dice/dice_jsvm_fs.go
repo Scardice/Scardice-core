@@ -279,8 +279,11 @@ func jsFsRunAsync(vm *goja.Runtime, rawLoop *eventloop.EventLoop, engineLoop jse
 	if rawLoop == nil || engineLoop == nil {
 		return jsFsRejectedPromise(vm, errors.New("JS event loop 未初始化,无法执行异步 fs 操作"))
 	}
-	promise, resolve, reject := vm.NewPromise()
 	executionContext := jsExecutionContextFor(engineLoop)
+	if err := jsCompatibilityExternalAccess(executionContext); err != nil {
+		return jsFsRejectedPromise(vm, err)
+	}
+	promise, resolve, reject := vm.NewPromise()
 	go func() {
 		value, err := work()
 		_ = jsengine.ScheduleWithContext(engineLoop, executionContext, func(runtime jsengine.Runtime) error {
@@ -316,11 +319,15 @@ func jsFsStatValue(vm *goja.Runtime, info os.FileInfo) goja.Value {
 func jsFsReadFile(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		raw := call.Argument(0).String()
-		if err := jsFilesystemAuthorizeWithContext(d, jsExecutionContextFor(engineLoop), raw, false); err != nil {
+		executionContext := jsExecutionContextFor(engineLoop)
+		if err := jsFilesystemAuthorizeWithContext(d, executionContext, raw, false); err != nil {
 			jsFsThrow(vm, err)
 		}
-		resolved, err := jsFsResolveAbsoluteWithContext(d, raw, jsExecutionContextFor(engineLoop))
+		resolved, err := jsFsResolveAbsoluteWithContext(d, raw, executionContext)
 		if err != nil {
+			jsFsThrow(vm, err)
+		}
+		if err := jsCompatibilityExternalAccess(executionContext); err != nil {
 			jsFsThrow(vm, err)
 		}
 		if err = jsFsEnsureExistingDataTargetInside(resolved); err != nil {
@@ -333,6 +340,7 @@ func jsFsReadFile(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja
 		return vm.ToValue(vm.NewArrayBuffer(data))
 	}
 }
+
 
 func jsFsWriteFile(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
@@ -354,6 +362,9 @@ func jsFsWriteFile(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goj
 				mode = os.FileMode(v.ToInteger())
 			}
 		}
+		if err := jsCompatibilityExternalAccess(jsExecutionContextFor(engineLoop)); err != nil {
+			jsFsThrow(vm, err)
+		}
 		if err := jsFsEnsureParent(resolved); err != nil {
 			jsFsThrow(vm, err)
 		}
@@ -372,6 +383,9 @@ func jsFsStat(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja.Fun
 		}
 		resolved, err := jsFsResolveAbsoluteWithContext(d, raw, jsExecutionContextFor(engineLoop))
 		if err != nil {
+			jsFsThrow(vm, err)
+		}
+		if err := jsCompatibilityExternalAccess(jsExecutionContextFor(engineLoop)); err != nil {
 			jsFsThrow(vm, err)
 		}
 		if err = jsFsEnsureExistingDataTargetInside(resolved); err != nil {
@@ -562,6 +576,9 @@ func jsFsReadDir(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja.
 		if err != nil {
 			jsFsThrow(vm, err)
 		}
+		if err := jsCompatibilityExternalAccess(jsExecutionContextFor(engineLoop)); err != nil {
+			jsFsThrow(vm, err)
+		}
 		if err = jsFsEnsureExistingDataTargetInside(resolved); err != nil {
 			jsFsThrow(vm, err)
 		}
@@ -596,6 +613,9 @@ func jsFsMkdir(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja.Fu
 				mode = os.FileMode(v.ToInteger())
 			}
 		}
+		if err := jsCompatibilityExternalAccess(jsExecutionContextFor(engineLoop)); err != nil {
+			jsFsThrow(vm, err)
+		}
 		if err := jsFsEnsureDataParentInside(resolved); err != nil {
 			jsFsThrow(vm, err)
 		}
@@ -617,6 +637,9 @@ func jsFsRemove(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja.F
 		}
 		resolved, err := jsFsResolveAbsoluteWithContext(d, raw, jsExecutionContextFor(engineLoop))
 		if err != nil {
+			jsFsThrow(vm, err)
+		}
+		if err := jsCompatibilityExternalAccess(jsExecutionContextFor(engineLoop)); err != nil {
 			jsFsThrow(vm, err)
 		}
 		if err := jsFsEnsureExistingDataTargetInside(resolved); err != nil {

@@ -22,6 +22,7 @@ import (
 	"go.uber.org/zap"
 
 	"Scardice-core/dice/events"
+	"Scardice-core/eventstore"
 	"Scardice-core/logger"
 	"Scardice-core/utils/dboperator/engine"
 	"Scardice-core/utils/jsengine"
@@ -148,12 +149,15 @@ type JsLoopManager struct {
 	currentVersion int64
 	instances      map[int64]*jsRuntimeInstance
 	engines        map[jsengine.EngineID]int64
+	// callbackKeys is generation-local live scheduling admission state.
+	callbackKeys map[jsCallbackKey]struct{}
 }
 
 func NewJsLoopManager() *JsLoopManager {
 	return &JsLoopManager{
-		instances: make(map[int64]*jsRuntimeInstance),
-		engines:   make(map[jsengine.EngineID]int64),
+		instances:    make(map[int64]*jsRuntimeInstance),
+		engines:      make(map[jsengine.EngineID]int64),
+		callbackKeys: make(map[jsCallbackKey]struct{}),
 	}
 }
 
@@ -279,6 +283,7 @@ func (m *JsLoopManager) SetInstance(newInstance *jsRuntimeInstance) int64 {
 	m.currentVersion = version
 	m.instances = make(map[int64]*jsRuntimeInstance)
 	m.engines = make(map[jsengine.EngineID]int64)
+	m.callbackKeys = make(map[jsCallbackKey]struct{})
 	if newInstance != nil && newInstance.loop != nil {
 		newInstance.generation = version
 		m.loop = newInstance.loop
@@ -318,9 +323,14 @@ func (x ExtDefaultSettingItemSlice) Less(i, _ int) bool { return x[i].Name == "c
 func (x ExtDefaultSettingItemSlice) Swap(i, j int)      { x[i], x[j] = x[j], x[i] }
 
 type Dice struct {
+	// 纯 OneBot 的出站请求通过此窄接口进入 durable outbound service。
+	OutboundBridge OutboundBridgePort `json:"-" yaml:"-"`
+	// DurableStore is the optional event-store seam for extension/config
+	// compatibility APIs. It intentionally exposes only the store interface,
+	// never a mutable aggregate or projection pointer.
+	DurableStore eventstore.Store `json:"-" yaml:"-"`
 	// 由于被导出的原因，暂时不迁移至 config
-	ImSession *IMSession `jsbind:"imSession" json:"-" yaml:"imSession"`
-
+	ImSession   *IMSession                 `jsbind:"imSession" json:"-" yaml:"imSession"`
 	CmdMap      CmdMapCls                  `json:"-" yaml:"-"`
 	ExtList     []*ExtInfo                 `yaml:"-"`
 	ExtRegistry *SyncMap[string, *ExtInfo] `json:"-" yaml:"-"`
@@ -498,12 +508,24 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 	d.ImSession.Parent = d
 	d.ImSession.ServiceAtNew = new(SyncMap[string, *GroupInfo])
 	d.ImSession.PendingQuits = new(SyncMap[string, *PendingQuitInfo])
+
+	// UIEndpoint is a transient compatibility endpoint for local Core/UI
+	// helpers. It is never part of the endpoint aggregate or persisted state.
+	d.UIEndpoint = &EndPointInfo{}
+	d.UIEndpoint.Enable = true
+	d.UIEndpoint.Platform = "UI"
+	d.UIEndpoint.ID = "1"
+	d.UIEndpoint.State = StateConnected
+	d.UIEndpoint.UserID = "UI:1000"
+	d.UIEndpoint.Adapter = &PlatformAdapterHTTP{EndPoint: d.UIEndpoint}
+	d.UIEndpoint.Session = d.ImSession
 	d.CmdMap = CmdMapCls{}
 	d.ExtRegistry = new(SyncMap[string, *ExtInfo])
 	// ActiveWithGraph 通过 activeWithGraph() 方法懒加载，无需在此初始化
 	d.GameSystemMap = new(SyncMap[string, *GameSystemTemplate])
 	d.DirtyGroups = new(SyncMap[string, int64]) // 脏群组列表
 	d.ConfigManager = NewConfigManager(filepath.Join(d.BaseConfig.DataDir, "configs", "plugin-configs.json"))
+	d.ConfigManager.SetOwner(d)
 	err = d.ConfigManager.Load()
 	if err != nil {
 		loggerInstance.Error("Failed to load plugin configs: ", err)
