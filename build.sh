@@ -17,7 +17,7 @@ done
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-DEFAULT_VERSION_PRERELEASE="-dev"
+DEFAULT_VERSION_PRERELEASE="-qianqian"
 DEFAULT_APP_CHANNEL="dev"
 DEFAULT_APPNAME="Scardice"
 DEFAULT_VERSION_MAIN="$(sed -n 's/^[[:space:]]*VERSION_MAIN[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' dice/version.go | head -n1)"

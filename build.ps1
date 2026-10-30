@@ -37,7 +37,7 @@ foreach ($arg in $RemainingArgs) {
 $script:ROOT_DIR = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 Set-Location $script:ROOT_DIR
 
-$script:DEFAULT_VERSION_PRERELEASE = '-dev'
+$script:DEFAULT_VERSION_PRERELEASE = '-qianqian'
 $script:DEFAULT_APP_CHANNEL = 'dev'
 $script:DEFAULT_APPNAME = 'Scardice'
 
