@@ -321,6 +321,27 @@ func TestSplitFirst_CQCodeProtection(t *testing.T) {
 	}
 }
 
+func TestSplitFirst_TextAndCQBoundaries(t *testing.T) {
+	tests := []struct {
+		name, text, first, rest string
+		limit                   int
+	}{
+		{"UTF8字节边界", "你ab", "你", "ab", 1},
+		{"尾部CQ不额外分页", "ab[CQ:face]", "ab[CQ:face]", "", 2},
+		{"CQ内连续换行不抢占分段", "a[CQ:x,k=\n\nz]\n\nbcccc", "a[CQ:x,k=\n\nz]\n", "bcccc", 4},
+		{"换行序列只消费切分边界内部分", "a\n\n\nb", "a", "\nb", 3},
+		{"无效UTF8逐字节保留", "\xffab", "\xff", "ab", 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			first, rest := splitFirst(tt.text, tt.limit)
+			if first != tt.first || rest != tt.rest {
+				t.Fatalf("splitFirst = (%q, %q), want (%q, %q)", first, rest, tt.first, tt.rest)
+			}
+		})
+	}
+}
+
 // truncateStr 截断字符串用于显示
 func truncateStr(s string, maxLen int) string {
 	if len(s) <= maxLen {

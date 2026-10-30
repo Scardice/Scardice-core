@@ -13,7 +13,9 @@ import (
 	"crypto/rsa"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
+	"os"
 
 	"github.com/dop251/goja"
 )
@@ -58,21 +60,29 @@ type cryptoKeyHandle struct {
 	X25519Private  *ecdh.PrivateKey
 }
 
-func Enable(rt *goja.Runtime) {
-	_ = rt.Set("crypto", ensureCryptoObject(rt))
+// Enable installs crypto; a nil warning sink uses the standard WARN logger.
+func Enable(rt *goja.Runtime, warn func(string)) {
+	_ = rt.Set("crypto", ensureCryptoObject(rt, warn))
 }
 
-func Require(rt *goja.Runtime, module *goja.Object) {
-	_ = module.Set("exports", ensureCryptoObject(rt))
+// Require returns a CommonJS loader bound to the owning runtime's warning sink.
+func Require(warn func(string)) func(*goja.Runtime, *goja.Object) {
+	return func(rt *goja.Runtime, module *goja.Object) {
+		_ = module.Set("exports", ensureCryptoObject(rt, warn))
+	}
 }
 
-func ensureCryptoObject(rt *goja.Runtime) *goja.Object {
+func ensureCryptoObject(rt *goja.Runtime, warn func(string)) *goja.Object {
 	ensureTextEncodingGlobals(rt)
 
 	if current := rt.Get("crypto"); !goja.IsUndefined(current) && !goja.IsNull(current) {
 		if obj, ok := current.(*goja.Object); ok {
 			return obj
 		}
+	}
+	if warn == nil {
+		logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+		warn = func(message string) { logger.Warn(message) }
 	}
 
 	cryptoObj := rt.NewObject()
@@ -97,10 +107,10 @@ func ensureCryptoObject(rt *goja.Runtime) *goja.Object {
 		return subtleVerify(rt, call)
 	})
 	_ = subtleObj.Set("encrypt", func(call goja.FunctionCall) goja.Value {
-		return subtleEncrypt(rt, call)
+		return subtleEncrypt(rt, call, warn)
 	})
 	_ = subtleObj.Set("decrypt", func(call goja.FunctionCall) goja.Value {
-		return subtleDecrypt(rt, call)
+		return subtleDecrypt(rt, call, warn)
 	})
 	_ = subtleObj.Set("deriveBits", func(call goja.FunctionCall) goja.Value {
 		return subtleDeriveBits(rt, call)
@@ -109,10 +119,10 @@ func ensureCryptoObject(rt *goja.Runtime) *goja.Object {
 		return subtleDeriveKey(rt, call)
 	})
 	_ = subtleObj.Set("wrapKey", func(call goja.FunctionCall) goja.Value {
-		return subtleWrapKey(rt, call)
+		return subtleWrapKey(rt, call, warn)
 	})
 	_ = subtleObj.Set("unwrapKey", func(call goja.FunctionCall) goja.Value {
-		return subtleUnwrapKey(rt, call)
+		return subtleUnwrapKey(rt, call, warn)
 	})
 
 	_ = cryptoObj.Set("subtle", subtleObj)
@@ -123,6 +133,23 @@ func ensureCryptoObject(rt *goja.Runtime) *goja.Object {
 
 	_ = rt.Set("crypto", cryptoObj)
 	return cryptoObj
+}
+
+func warnDeprecatedRSA(rt *goja.Runtime, algorithm, operation string, warn func(string)) {
+	if algorithm != "RSAES-PKCS1-V1_5" {
+		return
+	}
+
+	source := "unknown"
+	var storage [4]goja.StackFrame
+	frames := rt.CaptureCallStack(len(storage), storage[:0])
+	for index := range frames {
+		if frames[index].SrcName() != "<native>" {
+			source = frames[index].Position().String()
+			break
+		}
+	}
+	warn(fmt.Sprintf("弃用 API crypto.subtle.%s: RSAES-PKCS1-v1_5 已弃用；请迁移至 RSA-OAEP + SHA-256（密文格式不兼容）。调用来源=%q", operation, source))
 }
 
 func signData(rt *goja.Runtime, algorithm string, algObj *goja.Object, key *cryptoKeyHandle, data []byte) ([]byte, error) {
@@ -509,6 +536,7 @@ func encryptData(rt *goja.Runtime, algorithm string, algObj *goja.Object, key *c
 		if pub == nil {
 			return nil, errors.New("RSAES-PKCS1-v1_5 requires an RSA key")
 		}
+		//nolint:staticcheck // SA1019: this explicit legacy RSAES format is not wire-compatible with OAEP.
 		return rsa.EncryptPKCS1v15(rand.Reader, pub, data)
 	default:
 		return nil, fmt.Errorf("unsupported encrypt algorithm: %s", algorithm)
@@ -674,6 +702,7 @@ func decryptData(rt *goja.Runtime, algorithm string, algObj *goja.Object, key *c
 		if key.RSAPrivate == nil {
 			return nil, errors.New("RSAES-PKCS1-v1_5 requires a private RSA key")
 		}
+		//nolint:staticcheck // SA1019: legacy RSAES ciphertext must remain decryptable; OAEP cannot decode it.
 		return rsa.DecryptPKCS1v15(rand.Reader, key.RSAPrivate, data)
 	default:
 		return nil, fmt.Errorf("unsupported decrypt algorithm: %s", algorithm)
@@ -787,16 +816,10 @@ func importRawKey(rt *goja.Runtime, algorithm string, algObj *goja.Object, raw [
 		if len(cpy) != 1+2*size || cpy[0] != 0x04 {
 			return nil, errors.New("EC raw key must be an uncompressed point")
 		}
-		ecdhCurve, err := ecdhCurveByElliptic(curve)
+		pub, err := ecdsa.ParseUncompressedPublicKey(curve, cpy)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("invalid EC raw public key: %w", err)
 		}
-		if _, err = ecdhCurve.NewPublicKey(cpy); err != nil {
-			return nil, errors.New("invalid EC raw public key")
-		}
-		x := new(big.Int).SetBytes(cpy[1 : 1+size])
-		y := new(big.Int).SetBytes(cpy[1+size:])
-		pub := &ecdsa.PublicKey{Curve: curve, X: x, Y: y}
 		handle := &cryptoKeyHandle{
 			Type:        "public",
 			Extractable: true,

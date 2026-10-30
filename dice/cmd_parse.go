@@ -13,6 +13,7 @@ import (
 	ds "github.com/sealdice/dicescript"
 	"github.com/tidwall/gjson"
 
+	"Scardice-core/core/messageflow"
 	"Scardice-core/dice/service"
 	"Scardice-core/message"
 )
@@ -42,42 +43,64 @@ type AtInfo struct {
 func (i *AtInfo) CopyCtx(ctx *MsgContext) (*MsgContext, bool) {
 	mctx := ctx.ShallowCopy() // 复制一个ctx，用于其他用途
 	mctx.vm = nil
-	if ctx.Group != nil {
-		playerUserID := i.UserID
-		if pa, ok := ctx.EndPoint.Adapter.(*PlatformAdapterOfficialQQ); ok && ctx.Dice.DBOperator != nil {
-			key := service.OfficialQQIdentityMappingKey{
-				MigrationID: service.OfficialQQExplicitIdentityMigrationID,
-				Account:     strconv.FormatUint(pa.AppID, 10),
-				Store:       service.OfficialQQIdentityStoreDelegate,
-				Keyspace:    service.OfficialQQIdentityKeyspacePlayerUserID,
-				OldID:       i.UserID,
-			}
-			journal := service.NewOfficialQQIdentityJournal(ctx.Dice.DBOperator, time.Now)
-			if resolvedID, applied, err := journal.ResolveApplied(context.Background(), key); err == nil && applied {
-				playerUserID = resolvedID
-			}
-		}
-		p := ctx.Group.PlayerGet(ctx.Dice.DBOperator, playerUserID)
-		if p != nil {
-			mctx.Player = p
-		} else {
-			// TODO: 主动获取用户名
-			mctx.Player = &GroupPlayerInfo{
-				Name:          "",
-				UserID:        playerUserID,
-				ValueMapTemp:  &ds.ValueMap{},
-				UpdatedAtTime: 0,
-			}
-			// 特殊处理 official qq
-			if strings.HasPrefix(playerUserID, "OpenQQCH:") {
-				mctx.Player.Name = "<@!" + strings.TrimPrefix(playerUserID, "OpenQQCH:") + ">"
-			} else if strings.HasPrefix(playerUserID, "OpenQQ-Member-T:") {
-				mctx.Player.Name = playerUserID[len(playerUserID)-4:]
-			}
-		}
-		return mctx, p != nil
+	if ctx.Group == nil {
+		return mctx, false
 	}
-	return mctx, false
+	playerUserID := i.UserID
+	if provider, ok := ctx.EndPoint.Adapter.(officialQQIdentityAccountProvider); ok && ctx.Dice.DBOperator != nil {
+		key := service.OfficialQQIdentityMappingKey{
+			MigrationID: service.OfficialQQExplicitIdentityMigrationID,
+			Account:     provider.officialQQIdentityAccount(),
+			Store:       service.OfficialQQIdentityStoreDelegate,
+			Keyspace:    service.OfficialQQIdentityKeyspacePlayerUserID,
+			OldID:       i.UserID,
+		}
+		journal := service.NewOfficialQQIdentityJournal(ctx.Dice.DBOperator, time.Now)
+		if resolvedID, applied, err := journal.ResolveApplied(context.Background(), key); err == nil && applied {
+			playerUserID = resolvedID
+		}
+	}
+	var player *GroupPlayerInfo
+	var found bool
+	if ctx.callbackTransaction != nil {
+		if ctx.Player != nil && ctx.Player.UserID == playerUserID {
+			player, found = ctx.Player, true
+		} else {
+			cached, _ := ctx.Group.Players.Load(playerUserID)
+			player, found = ctx.callbackTransaction.resolveDelegatedPlayer(
+				context.Background(),
+				messageflow.CallbackScope{
+					DiceID: ctx.Dice.BaseConfig.Name, GroupID: ctx.Group.GroupID, UserID: playerUserID,
+				},
+				cached,
+				ctx.callbackMetadata,
+			)
+			if player != nil {
+				ctx.Group.Players.Store(playerUserID, player)
+			}
+		}
+	} else {
+		player = ctx.Group.PlayerGet(ctx.Dice.DBOperator, playerUserID)
+		found = player != nil
+	}
+	if player == nil {
+		// TODO: 主动获取用户名
+		player = &GroupPlayerInfo{
+			Name:         "",
+			UserID:       playerUserID,
+			ValueMapTemp: &ds.ValueMap{},
+		}
+	}
+	if !found {
+		// 特殊处理 official qq
+		if strings.HasPrefix(playerUserID, "OpenQQCH:") {
+			player.Name = "<@!" + strings.TrimPrefix(playerUserID, "OpenQQCH:") + ">"
+		} else if strings.HasPrefix(playerUserID, "OpenQQ-Member-T:") {
+			player.Name = playerUserID[len(playerUserID)-4:]
+		}
+	}
+	mctx.Player = player
+	return mctx, found
 }
 
 type CmdArgs struct {
@@ -733,28 +756,21 @@ func CQParse(cmd string) *CQCommand {
 	}
 }
 
+var (
+	qqAtPattern         = regexp.MustCompile(`\[CQ:at,qq=(\d+)(?:,name=(?:.*?))?\]`)
+	normalizedAtPattern = regexp.MustCompile(`<@!?(\S+?)>`)
+	// UI 测试界面沿用 CQ 码，qq 字段是测试 ID 的后缀（如 UI:alice 写作 qq=alice）。
+	uiAtPattern = regexp.MustCompile(`\[CQ:at,qq=([A-Za-z0-9_-]{1,32})(?:,name=(?:.*?))?\]`)
+)
+
 func AtParse(cmd string, prefix string) (string, []*AtInfo) {
-	// gocq的@:		[CQ:at,qq=3604749540]
-	// discordGo的@:	<@1048209604938563736>
 	ret := make([]*AtInfo, 0)
-	re := regexp.MustCompile("")
+	re := normalizedAtPattern
 	switch prefix {
 	case "QQ":
-		re = regexp.MustCompile(`\[CQ:at,qq=(\d+)(?:,name=(?:.*?))?\]`)
-	case "OpenQQ", "OpenQQCH":
-		re = regexp.MustCompile(`<@!?(\S+?)>`)
-	case "DISCORD":
-		re = regexp.MustCompile(`<@(\d+?)>`)
-	case "KOOK":
-		re = regexp.MustCompile(`\(met\)(\d+?)\(met\)`)
-	case "TG":
-		re = regexp.MustCompile(`tg:\/\/user\?id=(\d+)`)
-	case "DODO":
-		re = regexp.MustCompile(`<@\!(\d+?)>`)
-	case "SLACK":
-		re = regexp.MustCompile(`<@(.+?)>`)
-	case "SEALCHAT":
-		re = regexp.MustCompile(`<@(\S+?)>`)
+		re = qqAtPattern
+	case "UI":
+		re = uiAtPattern
 	}
 
 	m := re.FindAllStringSubmatch(cmd, -1)
@@ -776,7 +792,7 @@ func AtBuild(uid string) string {
 	if uid == "" {
 		return ""
 	}
-	re := regexp.MustCompile("(QQ|DISCORD|KOOK|TG|DODO).*?:(.*)")
+	re := regexp.MustCompile("(QQ|DISCORD|KOOK|TG|DODO|UI).*?:(.*)")
 	m := re.FindStringSubmatch(uid)
 	var text string
 	if len(m) == 3 {

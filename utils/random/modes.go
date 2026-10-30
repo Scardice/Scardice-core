@@ -113,7 +113,7 @@ func ModeSpecFor(mode Mode) ModeSpec {
 		return ModeSpec{
 			Label:     "混合模式 (Hybrid)",
 			Algorithm: "多源输出按位异或（XOR）混合",
-			Standard:  "组合模式：混合 PCG、国密 SM3、AES-CTR-DRBG、操作系统 CRNG 等全部可用来源",
+			Standard:  "组合模式：至少需要两个可用基础源；混合 PCG、国密 SM3、AES-CTR-DRBG、操作系统 CRNG 等全部可用来源",
 			ShortDesc: "多源异或混合，安全冗余最高、性能最低",
 			Description: "将上述多个高质量随机源的输出按位异或（XOR）混合。依据概率论基本结论：若各随机源相互独立，" +
 				"且其中至少一个为真随机（均匀分布），则其异或结果必为真随机——无论其余源的分布如何。" +

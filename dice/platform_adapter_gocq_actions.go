@@ -3,7 +3,6 @@ package dice
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"Scardice-core/adapterapi"
 	"Scardice-core/message"
 	"Scardice-core/utils"
 
@@ -175,18 +175,16 @@ func (pa *PlatformAdapterGocq) SendToPerson(ctx *MsgContext, userID string, text
 	}
 
 	for _, i := range ctx.Dice.ExtList {
-		if i.OnMessageSend != nil {
-			i.notifyWithJsCheck(ctx.Dice, func() {
-				i.OnMessageSend(ctx, &Message{
-					Message:     text,
-					MessageType: "private",
-					Platform:    pa.EndPoint.Platform,
-					Sender: SenderBase{
-						Nickname: pa.EndPoint.Nickname,
-						UserID:   pa.EndPoint.UserID,
-					},
-				}, flag)
-			})
+		if i.HasOnMessageSend() {
+			i.CallOnMessageSend(ctx.Dice, ctx, &Message{
+				Message:     text,
+				MessageType: "private",
+				Platform:    pa.EndPoint.Platform,
+				Sender: SenderBase{
+					Nickname: pa.EndPoint.Nickname,
+					UserID:   pa.EndPoint.UserID,
+				},
+			}, flag)
 		}
 	}
 
@@ -280,12 +278,9 @@ func (pa *PlatformAdapterGocq) SendToGroup(ctx *MsgContext, groupID string, text
 				UserID:   pa.EndPoint.UserID,
 			},
 		}
-		groupInfo.TriggerExtNotifyHook(ctx.Dice, func(ext *ExtInfo) func() {
-			if ext.OnMessageSend == nil {
-				return nil
-			}
-			return func() { ext.OnMessageSend(ctx, msgToSend, flag) }
-		})
+		for _, wrapper := range groupInfo.GetActivatedExtList(ctx.Dice) {
+			wrapper.CallOnMessageSend(ctx.Dice, ctx, msgToSend, flag)
+		}
 	}
 
 	type GroupMessageParams struct {
@@ -372,59 +367,6 @@ func buildGocqForwardNodes(nodes []message.ForwardNode) []gocqForwardNode {
 	return ret
 }
 
-func messageHasUnloadedForward(msg *Message) bool {
-	if msg == nil {
-		return false
-	}
-	for _, element := range msg.Segment {
-		if forward, ok := element.(*message.ForwardElement); ok && !forward.Loaded && forward.ForwardID != "" {
-			return true
-		}
-	}
-	return false
-}
-
-func (pa *PlatformAdapterGocq) expandGocqForwards(msg *Message) {
-	if pa == nil || pa.Socket == nil || pa.EndPoint == nil || pa.EndPoint.Session == nil || pa.EndPoint.Session.Parent == nil || msg == nil {
-		return
-	}
-	log := pa.EndPoint.Session.Parent.Logger.Named("onebot-forward")
-	for _, element := range msg.Segment {
-		forward, ok := element.(*message.ForwardElement)
-		if !ok || forward.Loaded || forward.ForwardID == "" {
-			continue
-		}
-		echo := pa.getCustomEcho()
-		command, err := json.Marshal(oneBotCommand{
-			Action: "get_forward_msg",
-			Params: struct {
-				ID string `json:"id"`
-			}{ID: forward.ForwardID},
-			Echo: echo,
-		})
-		if err != nil {
-			forward.LoadError = err.Error()
-			continue
-		}
-		var response json.RawMessage
-		err = pa.waitEcho2(echo, &response, func(emi *echoMapInfo) {
-			emi.timeout = time.Now().Add(8 * time.Second).Unix()
-			socketSendText(pa.Socket, string(command))
-		})
-		if err != nil {
-			forward.LoadError = err.Error()
-			continue
-		}
-		nodes, err := parseOnebotForwardResponse(log, response)
-		if err != nil {
-			forward.LoadError = err.Error()
-			continue
-		}
-		forward.Nodes = nodes
-		forward.Loaded = true
-	}
-}
-
 func (pa *PlatformAdapterGocq) SendGroupForwardMsg(ctx *MsgContext, groupID string, nodes []message.ForwardNode) bool {
 	if groupID == "" || len(nodes) == 0 {
 		return false
@@ -460,12 +402,9 @@ func (pa *PlatformAdapterGocq) SendGroupForwardMsg(ctx *MsgContext, groupID stri
 					UserID:   pa.EndPoint.UserID,
 				},
 			}
-			groupInfo.TriggerExtNotifyHook(ctx.Dice, func(ext *ExtInfo) func() {
-				if ext.OnMessageSend == nil {
-					return nil
-				}
-				return func() { ext.OnMessageSend(ctx, msgToSend, "") }
-			})
+			for _, wrapper := range groupInfo.GetActivatedExtList(ctx.Dice) {
+				wrapper.CallOnMessageSend(ctx.Dice, ctx, msgToSend, "")
+			}
 		}
 	}
 
@@ -504,18 +443,16 @@ func (pa *PlatformAdapterGocq) SendPrivateForwardMsg(ctx *MsgContext, userID str
 	sendText := forwardNodesToText(nodes)
 	if ctx != nil && ctx.Dice != nil {
 		for _, i := range ctx.Dice.ExtList {
-			if i.OnMessageSend != nil {
-				i.notifyWithJsCheck(ctx.Dice, func() {
-					i.OnMessageSend(ctx, &Message{
-						Message:     sendText,
-						MessageType: "private",
-						Platform:    pa.EndPoint.Platform,
-						Sender: SenderBase{
-							Nickname: pa.EndPoint.Nickname,
-							UserID:   pa.EndPoint.UserID,
-						},
-					}, "")
-				})
+			if i.HasOnMessageSend() {
+				i.CallOnMessageSend(ctx.Dice, ctx, &Message{
+					Message:     sendText,
+					MessageType: "private",
+					Platform:    pa.EndPoint.Platform,
+					Sender: SenderBase{
+						Nickname: pa.EndPoint.Nickname,
+						UserID:   pa.EndPoint.UserID,
+					},
+				}, "")
 			}
 		}
 	}
@@ -534,83 +471,60 @@ func (pa *PlatformAdapterGocq) SendPrivateForwardMsg(ctx *MsgContext, userID str
 	return true
 }
 
-func (pa *PlatformAdapterGocq) SendFileToPerson(ctx *MsgContext, userID string, path string, _ string) {
+func (pa *PlatformAdapterGocq) SendFileToPerson(ctx *MsgContext, userID string, path string, _ string) adapterapi.EffectResult {
+	if pa == nil || pa.Socket == nil {
+		return adapterapi.UnsupportedResult("gocq_socket_unavailable")
+	}
 	rawID, idType := pa.mustExtractID(userID)
-	if idType != QQUidPerson {
-		return
+	if idType != QQUidPerson || rawID <= 0 {
+		return adapterapi.UnsupportedResult("gocq_invalid_person_id")
 	}
-
-	dice := pa.EndPoint.Session.Parent
-	// 路径可以是 http/base64/本地路径，但 gocq 的文件上传只支持本地文件，所以临时下载到本地
-	fileName, temp, err := message.ExtractLocalTempFile(path)
-
-	// 删除文件后 lagrange 发送不出去，先注释掉
-	// defer func(name string) {
-	// 	 _ = os.Remove(name)
-	// }(temp)
-
-	if err != nil {
-		dice.Logger.Errorf("尝试发送文件[path=%s]出错: %s", path, err.Error())
-		return
-	}
-
-	type uploadPrivateFileParams struct {
-		UserID int64  `json:"user_id"`
-		File   string `json:"file"`
-		Name   string `json:"name"`
-	}
-	a, _ := json.Marshal(oneBotCommand{
-		Action: "upload_private_file",
-		Params: uploadPrivateFileParams{
-			UserID: rawID,
-			File:   temp,
-			Name:   fileName,
-		},
-	})
-	doSleepQQ(ctx)
-	socketSendText(pa.Socket, string(a))
+	return pa.sendLocalFile(ctx, "upload_private_file", rawID, path)
 }
 
-func (pa *PlatformAdapterGocq) SendFileToGroup(ctx *MsgContext, groupID string, path string, flag string) {
-	if groupID == "" {
-		return
+func (pa *PlatformAdapterGocq) SendFileToGroup(ctx *MsgContext, groupID string, path string, _ string) adapterapi.EffectResult {
+	if pa == nil || pa.Socket == nil {
+		return adapterapi.UnsupportedResult("gocq_socket_unavailable")
 	}
 	rawID, idType := pa.mustExtractID(groupID)
-	if idType == 0 {
-		// qq频道尚不支持文件发送，降级
-		pa.SendToChannelGroup(ctx, groupID, fmt.Sprintf("[尝试发送文件: %s，但不支持]", filepath.Base(path)), flag)
-		return
+	if idType != QQUidGroup || rawID <= 0 {
+		return adapterapi.UnsupportedResult("gocq_invalid_group_id")
 	}
+	return pa.sendLocalFile(ctx, "upload_group_file", rawID, path)
+}
 
-	dice := pa.EndPoint.Session.Parent
-	// 路径可以是 http/base64/本地路径，但 gocq 的文件上传只支持本地文件，所以临时下载到本地
+func (pa *PlatformAdapterGocq) sendLocalFile(ctx *MsgContext, action string, targetID int64, path string) adapterapi.EffectResult {
+	if ctx == nil || ctx.Dice == nil {
+		return adapterapi.TerminalResult("gocq_context_unavailable", "Dice context is unavailable")
+	}
 	fileName, temp, err := message.ExtractLocalTempFile(path)
-
-	// 删除文件后 lagrange 发送不出去，先注释掉
-	// defer func(name string) {
-	//	  _ = os.Remove(name)
-	// }(temp)
-
 	if err != nil {
-		dice.Logger.Errorf("尝试发送文件[path=%s]出错: %s", path, err.Error())
-		return
+		if ctx.Dice.Logger != nil {
+			ctx.Dice.Logger.Errorf("尝试发送文件[path=%s]出错: %s", path, err.Error())
+		}
+		return adapterapi.TerminalResult("gocq_file_preparation_failed", "local file could not be prepared")
 	}
-
-	type uploadGroupFileParams struct {
-		GroupID int64  `json:"group_id"`
-		File    string `json:"file"`
-		Name    string `json:"name"`
+	var params any
+	switch action {
+	case "upload_private_file":
+		params = struct {
+			UserID int64  `json:"user_id"`
+			File   string `json:"file"`
+			Name   string `json:"name"`
+		}{UserID: targetID, File: temp, Name: fileName}
+	case "upload_group_file":
+		params = struct {
+			GroupID int64  `json:"group_id"`
+			File    string `json:"file"`
+			Name    string `json:"name"`
+		}{GroupID: targetID, File: temp, Name: fileName}
+	default:
+		return adapterapi.UnsupportedResult("gocq_file_action_unsupported")
 	}
-	a, _ := json.Marshal(oneBotCommand{
-		Action: "upload_group_file",
-		Params: uploadGroupFileParams{
-			GroupID: rawID,
-			File:    temp,
-			Name:    fileName,
-		},
-	})
+	a, _ := json.Marshal(oneBotCommand{Action: action, Params: params})
 	doSleepQQ(ctx)
 	socketSendText(pa.Socket, string(a))
+	return adapterapi.AmbiguousResult("gocq_file_upload_unacknowledged", "GoCQ does not acknowledge file upload results")
 }
 
 // SetGroupAddRequest 同意加群

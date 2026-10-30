@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -20,8 +21,35 @@ var (
 	ErrMissingOperationLookup = errors.New("messageflow: durable operation lookup unavailable")
 )
 
+func endpointUnavailable(reason string, cause error) error {
+	if cause != nil {
+		return fmt.Errorf("%w: %s: %w", ErrEndpointUnavailable, reason, cause)
+	}
+	return fmt.Errorf("%w: %s", ErrEndpointUnavailable, reason)
+}
+
+func observedStateLabel(state adapterapi.ObservedState) string {
+	switch state {
+	case adapterapi.ObservedStateStopped:
+		return "stopped"
+	case adapterapi.ObservedStateStarting:
+		return "starting"
+	case adapterapi.ObservedStateConnected:
+		return "connected"
+	case adapterapi.ObservedStateStopping:
+		return "stopping"
+	case adapterapi.ObservedStateFailed:
+		return "failed"
+	case adapterapi.ObservedStateAmbiguous:
+		return "ambiguous"
+	default:
+		return "invalid"
+	}
+}
+
 type EndpointSnapshot struct {
 	EndpointID    adapterapi.EndpointID
+	AdapterKey    adapterapi.AdapterKey
 	DesiredState  string
 	ObservedState adapterapi.ObservedState
 	Capabilities  adapterapi.CapabilitySet
@@ -31,17 +59,17 @@ type EndpointSnapshot struct {
 }
 
 type EndpointResolver interface {
-	Resolve(context.Context, adapterapi.EndpointID) (EndpointSnapshot, error)
+	Resolve(ctx context.Context, endpointID adapterapi.EndpointID) (EndpointSnapshot, error)
 }
 type IndexSigner interface {
-	KeyedDigest(context.Context, string, ...string) ([]byte, string, error)
+	KeyedDigest(ctx context.Context, domain string, parts ...string) ([]byte, string, error)
 }
 type OperationLookup interface {
-	GetOperationByIdempotency(context.Context, string, string, string) (eventstore.OperationView, error)
+	GetOperationByIdempotency(ctx context.Context, principal, scope, key string) (eventstore.OperationView, error)
 }
 type IDGenerator interface{ NewID() (string, error) }
 type BoundEncryptor interface {
-	EncryptBound(context.Context, string, string, string, uint64, []byte) ([]byte, []byte, string, error)
+	EncryptBound(ctx context.Context, domain, identity, owner string, version uint64, plaintext []byte) ([]byte, []byte, string, error)
 }
 
 type SubmitRequest struct {
@@ -56,6 +84,47 @@ type SubmitResult struct {
 	EffectID     string
 	Digest       []byte
 	Deduplicated bool
+}
+
+// PreparedOutbound is a validated, encrypted outbound request that has not
+// been committed. Callers may atomically combine Work with other participants.
+type PreparedOutbound struct {
+	Work   eventstore.UnitOfWork
+	Result SubmitResult
+}
+
+type preparedStore struct {
+	eventstore.Store
+	lookup OperationLookup
+	work   eventstore.UnitOfWork
+}
+
+func (s *preparedStore) Commit(_ context.Context, work eventstore.UnitOfWork) (eventstore.CommitResult, error) {
+	s.work = work
+	return eventstore.CommitResult{}, nil
+}
+
+func (s *preparedStore) GetOperationByIdempotency(ctx context.Context, principal, scope, key string) (eventstore.OperationView, error) {
+	return s.lookup.GetOperationByIdempotency(ctx, principal, scope, key)
+}
+
+// Prepare validates and encrypts an outbound request without committing it.
+func (s *OutboundService) Prepare(ctx context.Context, req SubmitRequest) (PreparedOutbound, error) {
+	if s == nil {
+		return PreparedOutbound{}, errors.New("messageflow: outbound service unavailable")
+	}
+	lookup, ok := s.store.(OperationLookup)
+	if !ok {
+		return PreparedOutbound{}, ErrMissingOperationLookup
+	}
+	capture := &preparedStore{Store: s.store, lookup: lookup}
+	s.serial.Lock()
+	defer s.serial.Unlock()
+	result, err := s.submit(ctx, req, capture)
+	if err != nil {
+		return PreparedOutbound{}, err
+	}
+	return PreparedOutbound{Work: capture.work, Result: result}, nil
 }
 
 type effectWire struct {
@@ -166,11 +235,18 @@ func NewOutboundService(store eventstore.Store, resolver EndpointResolver, encry
 	return s, nil
 }
 func (s *OutboundService) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, error) {
-	if ctx == nil {
-		ctx = context.Background()
+	if s == nil {
+		return SubmitResult{}, errors.New("messageflow: outbound service unavailable")
 	}
 	s.serial.Lock()
 	defer s.serial.Unlock()
+	return s.submit(ctx, req, s.store)
+}
+
+func (s *OutboundService) submit(ctx context.Context, req SubmitRequest, store eventstore.Store) (SubmitResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	e := req.Effect
 	if !req.PrincipalID.Valid() {
 		return SubmitResult{}, adapterapi.ErrInvalidContract
@@ -207,32 +283,38 @@ func (s *OutboundService) Submit(ctx context.Context, req SubmitRequest) (Submit
 	if err := e.Validate(); err != nil {
 		return SubmitResult{}, err
 	}
-	snap, err := s.resolver.Resolve(ctx, e.EndpointID)
-	if err != nil {
-		return SubmitResult{}, ErrEndpointUnavailable
+	snap, laneErr := s.resolver.Resolve(ctx, e.EndpointID)
+	if laneErr != nil {
+		return SubmitResult{}, endpointUnavailable("endpoint resolver failed", laneErr)
 	}
 	if snap.EndpointID != e.EndpointID {
-		return SubmitResult{}, ErrEndpointUnavailable
+		return SubmitResult{}, endpointUnavailable(fmt.Sprintf("resolved endpoint %q does not match request %q", snap.EndpointID, e.EndpointID), nil)
 	}
 	if snap.IndexRootID == "" || snap.IndexSigner == nil {
-		return SubmitResult{}, ErrEndpointUnavailable
+		return SubmitResult{}, endpointUnavailable("endpoint index signer unavailable", nil)
 	}
 	if err := e.Lane.VerifyWithSigner(snapshotLaneSigner(ctx, snap), e.EndpointID, e.Payload.Target); err != nil {
-		return SubmitResult{}, ErrEndpointUnavailable
+		return SubmitResult{}, endpointUnavailable("outbound lane verification failed", err)
 	}
-	plain, err := effectBytes(e)
-	if err != nil {
-		return SubmitResult{}, err
+	plain, laneErr := effectBytes(e)
+	if laneErr != nil {
+		return SubmitResult{}, laneErr
 	}
-	digestPlain, err := logicalDigestBytes(e)
-	if err != nil {
-		return SubmitResult{}, err
+	digestPlain, laneErr := logicalDigestBytes(e)
+	if laneErr != nil {
+		return SubmitResult{}, laneErr
 	}
-	digest, digestKeyID, err := snap.IndexSigner.KeyedDigest(ctx, "outbound-request/v1", string(digestPlain))
-	if err != nil || digestKeyID != snap.IndexRootID || len(digest) == 0 {
-		return SubmitResult{}, ErrEndpointUnavailable
+	digest, digestKeyID, laneErr := snap.IndexSigner.KeyedDigest(ctx, "outbound-request/v1", string(digestPlain))
+	if laneErr != nil {
+		return SubmitResult{}, endpointUnavailable("outbound request digest failed", laneErr)
 	}
-	lookup := s.store.(OperationLookup)
+	if digestKeyID != snap.IndexRootID {
+		return SubmitResult{}, endpointUnavailable("outbound request digest key changed", nil)
+	}
+	if len(digest) == 0 {
+		return SubmitResult{}, endpointUnavailable("outbound request digest is empty", nil)
+	}
+	lookup := store.(OperationLookup)
 	if view, lookupErr := lookup.GetOperationByIdempotency(ctx, string(req.PrincipalID), "outbound", req.CommandID); lookupErr == nil {
 		if !hmac.Equal(view.RequestDigest, digest) {
 			return SubmitResult{}, ErrCommandConflict
@@ -243,23 +325,23 @@ func (s *OutboundService) Submit(ctx context.Context, req SubmitRequest) (Submit
 	}
 	now := s.clock.Now().UTC()
 	if snap.DesiredState != "enabled" || snap.ObservedState != adapterapi.ObservedStateConnected {
-		return SubmitResult{}, ErrEndpointUnavailable
+		return SubmitResult{}, endpointUnavailable(fmt.Sprintf("endpoint %q has desired state %q and observed state %q", e.EndpointID, snap.DesiredState, observedStateLabel(snap.ObservedState)), nil)
 	}
 	if !e.Deadline.After(now) {
-		return SubmitResult{}, ErrEndpointUnavailable
+		return SubmitResult{}, endpointUnavailable(fmt.Sprintf("outbound deadline expired at %s", e.Deadline.UTC().Format(time.RFC3339Nano)), nil)
 	}
 	if err := e.ValidateForCapabilities(snap.Capabilities, snap.Actions); err != nil {
 		return SubmitResult{}, ErrCapabilityDenied
 	}
 	effectID := e.ID
 	opID := e.OperationID
-	cipher, nonce, keyID, err := s.encryptor.EncryptBound(ctx, "outbox/v1", string(effectID), string(e.EndpointID), 1, plain)
-	if err != nil {
-		return SubmitResult{}, err
+	cipher, nonce, keyID, laneErr := s.encryptor.EncryptBound(ctx, "outbox/v1", string(effectID), string(e.EndpointID), 1, plain)
+	if laneErr != nil {
+		return SubmitResult{}, laneErr
 	}
-	lane, err := laneMAC(e)
-	if err != nil {
-		return SubmitResult{}, err
+	lane, laneErr := laneMAC(e)
+	if laneErr != nil {
+		return SubmitResult{}, laneErr
 	}
 	expiry := time.Time{}
 	if e.Deadline.After(now) && !e.Deadline.After(now.Add(eventstore.InboxPayloadTTL)) {
@@ -292,26 +374,32 @@ func (s *OutboundService) Submit(ctx context.Context, req SubmitRequest) (Submit
 	if marshalErr != nil {
 		return SubmitResult{}, errors.New("messageflow: shape event encoding failed")
 	}
-	work := eventstore.UnitOfWork{Streams: []eventstore.StreamAppend{{Stream: eventstore.StreamID{AggregateType: "outbound-effect", AggregateID: string(effectID)}, Events: []eventstore.NewEvent{{EventType: "OutboundEffectRequestedV1", SchemaVersion: 1, Payload: eventPayload, Metadata: eventstore.Metadata{EventID: effectEventID, CommandID: req.CommandID, CorrelationID: string(e.CorrelationID), CausationID: string(e.CausationID), PrincipalID: string(req.PrincipalID), Producer: "core/messageflow", OccurredAt: now}}}}}, Operations: []eventstore.OperationUpdate{{OperationID: string(opID), Kind: "outbound-effect", Status: "pending", PrincipalID: string(req.PrincipalID), ResourceID: string(effectID), RequestID: req.CommandID, CorrelationID: string(e.CorrelationID), IdempotencyScope: "outbound", IdempotencyKey: req.CommandID, RequestDigest: digest, CreatedAt: now, UpdatedAt: now}}, Effects: []eventstore.NewEffect{{EffectID: string(effectID), EndpointID: string(e.EndpointID), LaneHMAC: lane, EffectType: effectType(e.Kind), RiskClass: riskClass(e.Risk, e.RetryClass), Status: eventstore.OutboxStatusPending, DeadlineAt: e.Deadline, PayloadCiphertext: cipher, PayloadNonce: nonce, ContentDigest: digest, DigestKeyID: "", PayloadEncryptionKeyID: keyID, ContentDigestKeyID: snap.IndexRootID, PayloadExpiresAt: expiry}}}
+	work := eventstore.UnitOfWork{Streams: []eventstore.StreamAppend{{Stream: eventstore.StreamID{AggregateType: "outbound-effect", AggregateID: string(effectID)}, Events: []eventstore.NewEvent{{EventType: "OutboundEffectRequestedV1", SchemaVersion: 1, Payload: eventPayload, Metadata: eventstore.Metadata{EventID: effectEventID, CommandID: req.CommandID, CorrelationID: string(e.CorrelationID), CausationID: string(e.CausationID), PrincipalID: string(req.PrincipalID), Producer: "core/messageflow", OccurredAt: now}}}}}, Operations: []eventstore.OperationUpdate{{OperationID: string(opID), Kind: "outbound-effect", Status: "pending", PrincipalID: string(req.PrincipalID), ResourceID: string(effectID), RequestID: req.CommandID, CorrelationID: string(e.CorrelationID), IdempotencyScope: "outbound", IdempotencyKey: req.CommandID, RequestDigest: digest, CreatedAt: now, UpdatedAt: now}}, Effects: []eventstore.NewEffect{{EffectID: string(effectID), EndpointID: string(e.EndpointID), LaneHMAC: lane, EffectType: effectType(e.Kind), RiskClass: riskClass(e.Risk, e.RetryClass), Status: eventstore.OutboxStatusPending, DeadlineAt: e.Deadline, NextAttemptAt: e.NotBefore, PayloadCiphertext: cipher, PayloadNonce: nonce, ContentDigest: digest, DigestKeyID: "", PayloadEncryptionKeyID: keyID, ContentDigestKeyID: snap.IndexRootID, PayloadExpiresAt: expiry}}}
 	subject := string(e.Payload.Target.Conversation)
 	if subject == "" {
 		subject = string(e.Payload.Target.Member)
 	}
 	subjectKey, subjectKeyID, subjectErr := snap.IndexSigner.KeyedDigest(ctx, "privacy-subject/v1", subject)
-	if subjectErr != nil || subjectKeyID != snap.IndexRootID || len(subjectKey) == 0 {
-		return SubmitResult{}, ErrEndpointUnavailable
+	if subjectErr != nil {
+		return SubmitResult{}, endpointUnavailable("privacy subject digest failed", subjectErr)
+	}
+	if subjectKeyID != snap.IndexRootID {
+		return SubmitResult{}, endpointUnavailable("privacy subject digest key changed", nil)
+	}
+	if len(subjectKey) == 0 {
+		return SubmitResult{}, endpointUnavailable("privacy subject digest is empty", nil)
 	}
 	work.Streams[0].Events[0].Metadata.SubjectKey = subjectKey
 	work.Effects[0].SubjectKey = subjectKey
-	result, err := s.store.Commit(ctx, work)
-	if err != nil {
-		if view, lookupErr := s.store.(OperationLookup).GetOperationByIdempotency(ctx, string(req.PrincipalID), "outbound", req.CommandID); lookupErr == nil {
+	result, laneErr := store.Commit(ctx, work)
+	if laneErr != nil {
+		if view, lookupErr := store.(OperationLookup).GetOperationByIdempotency(ctx, string(req.PrincipalID), "outbound", req.CommandID); lookupErr == nil {
 			if !hmac.Equal(view.RequestDigest, digest) {
 				return SubmitResult{}, ErrCommandConflict
 			}
 			return SubmitResult{OperationID: view.OperationID, EffectID: view.ResourceID, Digest: append([]byte(nil), digest...), Deduplicated: true}, nil
 		}
-		return SubmitResult{}, err
+		return SubmitResult{}, laneErr
 	}
 	accepted := SubmitResult{OperationID: string(opID), EffectID: string(effectID), Digest: digest, Deduplicated: result.Deduplicated}
 	return accepted, nil

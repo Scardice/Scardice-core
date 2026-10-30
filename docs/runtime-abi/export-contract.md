@@ -1,70 +1,68 @@
-# JavaScript value export contract
+# JavaScript 值导出契约
 
-This document records the Phase 8 audit of `Value.Export()` after the native adapter was added. `Export()` remains a compatibility escape hatch; generic Core code uses `Object()` and `ExportPrimitive()`.
+`jsengine.Value` 通过 `Object()` 和 `ExportPrimitive()` 提供引擎中立的值读取边界。通用 Core 代码先识别对象，再导出原语；`Export()` 保留为引擎特定兼容接口。
 
-## Contract
+## 原语转换
 
-`jsengine.Value.ExportPrimitive() (any, error)` is the engine-neutral conversion boundary.
+`ExportPrimitive() (any, error)` 返回以下稳定分类。
 
-- `bool`, `string`, and numeric JavaScript primitives are returned as Go scalar values. Numeric width follows the adapter (`int64`/`uint64` for native values; Goja and QuickJS retain their existing numeric export representation).
-- JavaScript `undefined` and `null` both return `(nil, nil)`. Callers must use `Object()` first when an object must be distinguished from a nullish value.
-- Objects, functions, and host references return an error wrapping `jsengine.ErrPrimitiveExportUnsupported`. No map, slice, Go pointer/interface, JSON string, or arbitrary object coercion crosses this boundary.
-- A nil `Value` is handled by the caller as an absent result; implementations return `(nil, nil)` for a nil wrapped raw value where applicable.
-- `Export()` is retained only for legacy compatibility and engine-owned values. It must not be used to decide whether a generic result is an object.
+| JavaScript 值 | Go 结果 | 错误分类 |
+| --- | --- | --- |
+| `undefined`、`null` | `nil` | `jsengine.ErrNoPrimitiveValue` |
+| Boolean | `bool` | `nil` |
+| String | `string` | `nil` |
+| Number 或原生整数 tag | 适配器原生的 `int64`、`uint64` 或 `float64` | `nil` |
+| Object、Function、Host Object、Host Function | `nil` | 包装 `jsengine.ErrPrimitiveExportUnsupported` |
+| Provider 判定为 stale 的值 | `nil` | Provider 生命周期错误 |
 
-## Implementation capability
+调用方把 `nil Value` 作为缺省结果分支处理。`errors.Is` 用于识别 `ErrNoPrimitiveValue` 与 `ErrPrimitiveExportUnsupported`；错误文本可附带 `object`、`host function` 或原生 tag 等诊断。
 
-| Implementation | Primitive conversion | Objects/functions/host refs | Nullish result |
-| --- | --- | --- | --- |
-| `utils/jsengine/goja` | bool, string, Goja numeric scalar | deterministic unsupported error | `nil, nil` |
-| `utils/jsengine/native` | bool, string, i64, u64, f64 through native conversion calls | deterministic unsupported error for object, host object, host function | `nil, nil` |
-| `utils/jsengine/quickjs` | bool, string, number | deterministic unsupported error; this does not change QuickJS's legacy `Export` behavior | `nil, nil` |
-| `dice.gojaEngineValue` | Same explicit primitive policy for the legacy Goja callback adapter | deterministic unsupported error | `nil, nil` |
+该边界的输出集合为 Boolean、String 和数值标量。对象图、map、slice、Go 指针、interface 投影和 JSON 文本采用对应的显式对象或 JSON 接口。
 
-The frozen C ABI is unchanged. There is no export opcode, JSON fallback, or object-to-Go conversion in the ABI.
+## 对象读取
 
-## Callsite audit
+对象结果通过 `Value.Object()` 进入 `jsengine.Object`。
 
-The table covers every repository `.Export()` call found by repository search. Line numbers refer to the Phase 8 working tree; implementation line numbers can move without changing the classification.
+1. 调用 `Object()`；返回对象时，在当前 owner 回调内使用 `Has`、`Get` 和 `Set`。
+2. 返回值为空时，调用 `ExportPrimitive()` 处理原语或 nullish 分类。
+3. getter 错误敏感路径使用 `FallibleObject.GetWithError`，并传播脚本异常。
 
-| File and line/symbol | Value category required | Native-capable? | Migration or intentional rationale |
-| --- | --- | --- | --- |
-| `api/js.go:85`, QuickJS `jsExec` branch | API execution result | N/A for native; QuickJS-specific branch | Intentionally retained while QuickJS engine branching remains legacy-owned. Goja/API results use `exportJSAPIValue` below. The later QuickJS cutover must replace this legacy JSON-oriented path with the same explicit policy. |
-| `api/js.go:exportJSAPIValue`, Goja `jsExec` branch | primitive API result | Yes | Migrated to `ExportPrimitive`; native/object results produce a diagnostic unsupported error rather than silently becoming `nil`. |
-| `dice/ext.go:parseMessagePreprocessEngineValue` | string/nullish fields and object fields | Yes | Migrated: inspect `Object()` first, then call `ExportPrimitive` for scalar fields. Native objects are read with `Has`/`Get`. |
-| `dice/im_session.go:parseJSSolveEngineResult` | solve result object and nullish result | Yes | Migrated: object fields are read through `Object()`; nullish is identified by `ExportPrimitive`. No generic `Export` type assertion remains. |
-| `dice/im_session.go:resolveJSSolveValue` | `goja.Promise` | No | Intentional Goja-only use: function accepts raw `goja.Value` and must inspect promise state/then callbacks. |
-| `dice/dice_jsvm_fs.go:jsFsBytesFrom` | string, byte slice, number array | No | Intentional Goja-only use: function accepts raw `goja.Value` and supports Goja's `[]byte`/`[]interface{}` conversion for the existing fs API. |
-| `dice/js_engine_value.go:gojaEngineValue.Export` | legacy raw Goja export | No | Adapter implementation required by compatibility API. New generic code uses `ExportPrimitive`. |
-| `utils/jsengine/goja/runtime.go:value.Export` | legacy raw Goja export | No | Adapter implementation required by compatibility API; primitive callers use `ExportPrimitive`. |
-| `utils/jsengine/native/native_cgo.go:nativeValue.Export` | legacy scalar or native object wrapper | Yes for scalars; object wrapper only | Compatibility implementation. Native objects are deliberately returned as an adapter object from legacy `Export`; generic callers must use `Object()`. `ExportPrimitive` rejects the object instead. |
-| `utils/jsengine/quickjs/runtime.go:value.Export` / `export` | legacy QuickJS scalar or JSON object projection | QuickJS only | Intentional QuickJS-specific compatibility behavior. Object JSON stringification is not part of `ExportPrimitive` or the C ABI and is not used by migrated generic callers. |
-| `utils/jsengine/runtime_contract_test.go` (all `got = value.Export()` assertions) | compatibility scalar results | Engine-specific test coverage | Tests preserve the established `Export` compatibility contract while object behavior is tested via `Object()` and the new primitive tests. |
-| `utils/jsengine/runtime_contract_test.go:TestQuickJSCallbackReturnsLiveValueOnOwnerLoop` | callback object's scalar property | Yes | Existing test-only legacy assertion; it verifies a live value and does not implement Core conversion. |
-| `utils/jsengine/builtin/goja/provider_test.go` | Goja numeric result | No | Test-only compatibility assertion for the builtin provider. |
-| `utils/jsengine/goja/runtime_test.go` | Goja numeric result | No | Test-only compatibility assertion for adapter behavior. |
-| `utils/jsengine/quickjs/runtime_test.go` | QuickJS scalar and readiness values | No | Test-only QuickJS compatibility assertions. |
-| `utils/jsengine/native/adapter_test.go` | native scalars, missing property, host function, retained value | Yes for scalar assertions | Test-only compatibility and lifecycle coverage. New `ExportPrimitive` assertions cover native scalar/object policy. Host-function assertions intentionally inspect native function implementation. |
-| `dice/dice_jsvm_dangerous_expose_test.go:TestDangerousExpose` | Goja exposed map | No | Explicit dangerous Goja-only test of the opt-in exposure API; not a generic Core path. |
-| `dice/js_host_api_test.go` | diagnostic value in test failure | No | Test-only diagnostic formatting; not a conversion decision. |
-| `dice/js_quickjs_fs_test.go` | QuickJS diagnostic value | No | Test-only QuickJS-specific diagnostic formatting. |
-| `utils/plugin/crypto/alg_helpers.go` | Goja string or object algorithm options | No | Function receives raw Goja values and then uses Goja `ToObject`; intentionally engine-specific. |
-| `utils/plugin/crypto/*_test.go` | Goja Promise, ArrayBuffer, typed byte output | No | Explicit Goja Promise/ArrayBuffer/typed internal tests. These values are not engine-neutral primitives. |
-| `utils/plugin/crypto/key_io.go` | Goja JWK map/object | No | Goja-only crypto implementation; object projection is deliberately local and not exposed through `jsengine.Value`. |
-| `utils/plugin/crypto/runtime_helpers.go` | Goja arrays, ArrayBuffer, CryptoKey host handle | No | Goja-only plugin internals; direct `Export` is required for typed values and host handles, followed by explicit Goja object handling. |
-| `utils/plugin/httpextra/fetch.go` | Goja private form-data host handle | No | Goja-only sealed plugin state. |
-| `utils/plugin/httpextra/httpextra.go` | Goja private headers handle, string/bytes, ArrayBuffer | No | Goja-only plugin state and typed internal data. |
-| `utils/plugin/httpextra/httpextra_test.go` | Goja Promise and ArrayBuffer | No | Goja-only typed integration tests. |
-| `utils/plugin/websocket/websocket.go` | Goja protocol array | No | Goja-only websocket API; raw value is consumed as a Goja array. |
+Native Object 和 Host Object 都实现该对象接口。`Object.Has` 使用 Provider 的属性语义；QuickJS Provider 采用 own-property 检查。
 
-## Compatibility and API policy
+## Promise 结果
 
-Existing `Export()` callers are not silently reinterpreted. Goja Promise, ArrayBuffer, typed plugin values, host handles, dangerous exposure, and QuickJS branching remain in their engine-specific code paths. The generic solve and preprocess paths no longer treat `Export() == nil` as “not an object”.
+Promise 通过 `jsengine.ObservePromise` 保持值归属。
 
-The API execution endpoint supports primitive return values. When a Goja/native execution result is an object, function, or host reference, it returns the explicit error text from `ExportPrimitive` in the response's `err` field and leaves `ret` unset. It never JSON-stringifies or silently reports `nil`. QuickJS's existing branch is documented above and remains intentionally unchanged for this phase; later QuickJS cutover work owns its migration.
+`PromiseObserver.ObservePromise` 在 runtime owner 上注册 settlement。普通值由当前回调立即消费；Promise fulfillment 或 rejection 在 owner 上同步调用一次 `settled`，settlement 值的有效期覆盖该回调。
 
-## Focused verification
+Goja 实现先用 `ExportType` 确认 `*goja.Promise`，再读取原始 Promise；普通对象按原值交付。Native 实现使用启动期保留的 Promise helper，并在对应 owner scope 内交付 settlement。
 
-- RED: `go test ./utils/jsengine/... ./dice -run 'TestExportPrimitive|TestParseEngineValuesReadsObjectWithoutLegacyExport|TestParseSolveEngineValueReadsObjectWithoutLegacyExport'` initially failed because `Value.ExportPrimitive` and `ErrPrimitiveExportUnsupported` did not exist. The same command also exposed unrelated pre-existing `dice` loop-manager compile errors in the Phase 7 working tree.
-- GREEN: `go test ./utils/jsengine -run 'TestExportPrimitive' -v` passes Goja and QuickJS primitive/nullish and object/function rejection tests.
-- GREEN: `go test ./utils/jsengine/...` passes. Native adapter tests compile and targeted adapter tests pass with skips when `SCARDICE_ECHO_RUNTIME` is unset.
+## `Export()` 兼容接口
+
+`Export()` 服务于已经持有具体引擎值的兼容路径。
+
+| 实现或调用域 | `Export()` 语义 |
+| --- | --- |
+| `utils/jsengine/goja` | 使用 Goja 原生导出表示；Boolean、String 和 Number 原语可复制为 Go 标量，对象与函数归属当前 realm scope。 |
+| `utils/jsengine/native` | 返回标量、`nativeObject` 或 `nativeFunction` 适配器值，使用当前 runtime 与 scope。 |
+| `dice.gojaEngineValue` | 为现有 Goja callback 适配器提供原始 Goja 导出。 |
+| Goja 专用插件模块 | 读取 Promise、ArrayBuffer、typed byte 值、JWK、Host handle 与协议数组等引擎内部类型。 |
+
+通用 solve、message preprocess 和 API 执行路径使用 `Object()`、`ExportPrimitive()` 与 `ObservePromise()`。Goja Promise 检测、文件系统 byte 输入和 Goja 插件内部类型继续使用具体引擎接口。
+
+## API 与 Core 消费语义
+
+Core 在值所属的 Loop 回调内完成分类。
+
+- `api/js.go` 的执行结果通过 `ExportPrimitive()` 写入响应。原语写入 `ret`；`undefined` 与 `null` 写入 JSON `null`；对象、函数和宿主引用产生 `result: true`、`ret: null` 和带分类文本的 `err`。
+- Message preprocess 先读取 Object 字段，再按原语契约读取字符串和 nullish 字段。
+- JS solve 先识别 Object 结果，再区分 nullish 与标量结果。
+- Host callback 的对象、函数和集合通过 HostBridge 编解码器按目标类型转换。
+
+## Runtime ABI 映射
+
+Runtime ABI v1 使用 `value_type` 区分 `UNDEFINED`、`NULL`、`BOOL`、`I64`、`U64`、`F64`、`STRING`、`OBJECT`、`HOST_OBJECT`、`HOST_FUNCTION` 与 `FUNCTION`。原语转换调用对应的 `value_to_*`，字符串使用两次 `required` 缓冲区协议。
+
+Object 通过 `object_get`、`object_set` 和 `object_has` 访问。每个结果句柄归属当前调用 scope；适配器在 scope 结束时释放普通值，并在 runtime 关闭前配对释放内部持久值。JSON 解析通过 `jsengine.JSONParser` 返回同一 scope 内的引擎原生对象。
+
+运行时所有权、上下文和关闭顺序见[运行时架构](architecture.md)。

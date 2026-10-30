@@ -1,18 +1,12 @@
 package api
 
 import (
-	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 
-	"github.com/alexmullins/zip"
 	"github.com/labstack/echo/v4"
-
-	"Scardice-core/dice"
 )
 
 const filePreviewContentSecurityPolicy = "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'"
@@ -37,6 +31,15 @@ func Int64ToBytes(i int64) []byte {
 }
 
 func doAuth(c echo.Context) bool {
+	if testWebUIAuthBypassEnabled() {
+		if WebUIOriginRateLimitBypassEnabled() {
+			return true
+		}
+		if c == nil || c.Request() == nil {
+			return false
+		}
+		return sameOriginOrNoOrigin(c.Request())
+	}
 	token := c.Request().Header.Get("token") //nolint:canonicalheader // private header
 	if token == "" {
 		token = c.QueryParam("token")
@@ -89,72 +92,4 @@ func getGithubAvatar(c echo.Context) error {
 	// 	return c.Blob(http.StatusOK, resp.ContentType(), resp.Bytes())
 	// }
 	// return c.JSON(http.StatusNotFound, "")
-}
-
-func packGocqConfig(relWorkDir string) *bytes.Buffer {
-	rootPath := filepath.Join(myDice.BaseConfig.DataDir, relWorkDir)
-
-	// 创建一个内存缓冲区，用于保存 Zip 文件内容
-	buf := new(bytes.Buffer)
-
-	// 创建 Zip Writer，将 Zip 文件内容写入内存缓冲区
-	zipWriter := zip.NewWriter(buf)
-
-	if err := compressFile(filepath.Join(rootPath, "config.yml"), "config.yml", zipWriter); err != nil {
-		myDice.Logger.Error(err)
-	}
-	if err := compressFile(filepath.Join(rootPath, "device.json"), "device.json", zipWriter); err != nil {
-		myDice.Logger.Error(err)
-	}
-	_ = compressFile(filepath.Join(rootPath, "data/versions/1.json"), "data/versions/6.json", zipWriter)
-	_ = compressFile(filepath.Join(rootPath, "data/versions/6.json"), "data/versions/6.json", zipWriter)
-
-	// 关闭 Zip Writer
-	if err := zipWriter.Close(); err != nil {
-		myDice.Logger.Fatal(err)
-	}
-
-	// 将 Zip 文件保存在内存中
-	return buf
-}
-
-func compressFile(fn string, zipFn string, zipWriter *zip.Writer) error {
-	data, err := os.ReadFile(fn)
-	if err != nil {
-		return err
-	}
-
-	h := &zip.FileHeader{Name: zipFn, Method: zip.Deflate, Flags: 0x800}
-	fileWriter, err := zipWriter.CreateHeader(h)
-	if err != nil {
-		return err
-	}
-	_, _ = fileWriter.Write(data)
-	return nil
-}
-
-func checkUidExists(c echo.Context, uid string) bool {
-	for _, i := range myDice.ImSession.EndPoints {
-		if pa, ok := i.Adapter.(*dice.PlatformAdapterGocq); ok && pa.UseInPackClient {
-			var relWorkDir string
-			switch pa.BuiltinMode {
-			case "lagrange":
-				relWorkDir = "extra/lagrange-qq" + uid
-			default:
-				continue
-			}
-			if relWorkDir == i.RelWorkDir {
-				// 不允许工作路径重复
-				_ = c.JSON(CodeAlreadyExists, i)
-				return true
-			}
-		}
-
-		// 如果存在已经启用的同账号连接，不允许重复
-		if i.Enable && i.UserID == dice.FormatDiceIDQQ(uid) {
-			_ = c.JSON(CodeAlreadyExists, i)
-			return true
-		}
-	}
-	return false
 }

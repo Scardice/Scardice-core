@@ -17,8 +17,10 @@ type EventType string
 
 const (
 	EventExtensionDiscovered        EventType = "extension_discovered"
+	EventExtensionIdentityChanged   EventType = "extension_identity_changed"
 	EventExtensionEnablementChanged EventType = "extension_enablement_changed"
 	EventExtensionDefaultsChanged   EventType = "extension_defaults_changed"
+	EventExtensionDefaultsCleared   EventType = "extension_defaults_cleared"
 	EventConfigDefinitionRegistered EventType = "config_definition_registered"
 	EventConfigDefinitionRemoved    EventType = "config_definition_removed"
 	EventConfigValueChanged         EventType = "config_value_changed"
@@ -31,7 +33,7 @@ const (
 
 func (e EventType) Valid() bool {
 	switch e {
-	case EventExtensionDiscovered, EventExtensionEnablementChanged, EventExtensionDefaultsChanged, EventConfigDefinitionRegistered, EventConfigDefinitionRemoved, EventConfigValueChanged, EventScriptDisablementChanged:
+	case EventExtensionDiscovered, EventExtensionIdentityChanged, EventExtensionEnablementChanged, EventExtensionDefaultsChanged, EventExtensionDefaultsCleared, EventConfigDefinitionRegistered, EventConfigDefinitionRemoved, EventConfigValueChanged, EventScriptDisablementChanged:
 		return true
 	}
 	return false
@@ -187,6 +189,41 @@ func (e ExtensionDiscoveredV1) apply(s *State) error {
 	return nil
 }
 
+type ExtensionIdentityChangedV1 struct {
+	Previous ExtensionIdentity `json:"previous"`
+	Identity ExtensionIdentity `json:"identity"`
+}
+
+func NewExtensionIdentityChangedV1(previous, identity ExtensionIdentity) ExtensionIdentityChangedV1 {
+	return ExtensionIdentityChangedV1{Previous: previous.Clone(), Identity: identity.Clone()}
+}
+func (ExtensionIdentityChangedV1) EventType() EventType { return EventExtensionIdentityChanged }
+func (e ExtensionIdentityChangedV1) validate() error {
+	if validateExtensionIdentity(e.Previous) != nil || validateExtensionIdentity(e.Identity) != nil ||
+		!allowedExtensionIdentityTransition(e.Previous, e.Identity) {
+		return ErrInvalidIdentity
+	}
+	return nil
+}
+func (e ExtensionIdentityChangedV1) apply(s *State) error {
+	existing, ok := s.Extensions[e.Identity.ID]
+	if !ok || !reflectIdentityEqual(existing, e.Previous) {
+		return ErrInvalidState
+	}
+	s.Extensions[e.Identity.ID] = e.Identity.Clone()
+	return nil
+}
+
+func allowedExtensionIdentityTransition(previous, next ExtensionIdentity) bool {
+	if previous.ID != next.ID {
+		return false
+	}
+	if previous.Source == "legacy" && previous.Version == "legacy" {
+		return true
+	}
+	return previous.Source == next.Source
+}
+
 type ExtensionEnablementChangedV1 struct {
 	ExtensionID string `json:"extensionId"`
 	Enabled     bool   `json:"enabled"`
@@ -255,6 +292,23 @@ func (e ExtensionDefaultsChangedV1) apply(s *State) error {
 }
 func NewExtensionDefaultSettingsChangedV1(id string, autoActive bool, disabledCommands []string) ExtensionDefaultsChangedV1 {
 	return NewExtensionDefaultsChangedV1(id, autoActive, disabledCommands)
+}
+
+type ExtensionDefaultsClearedV1 struct {
+	ExtensionID string `json:"extensionId"`
+}
+
+func NewExtensionDefaultsClearedV1(id string) ExtensionDefaultsClearedV1 {
+	return ExtensionDefaultsClearedV1{ExtensionID: id}
+}
+func (ExtensionDefaultsClearedV1) EventType() EventType { return EventExtensionDefaultsCleared }
+func (e ExtensionDefaultsClearedV1) validate() error    { return validateIdentifier(e.ExtensionID) }
+func (e ExtensionDefaultsClearedV1) apply(s *State) error {
+	if _, ok := s.Extensions[e.ExtensionID]; !ok {
+		return ErrUnknownExtension
+	}
+	delete(s.DefaultCommands, e.ExtensionID)
+	return nil
 }
 
 type ConfigDefinitionRegisteredV1 struct {
@@ -388,14 +442,14 @@ func isNilEvent(event TypedEvent) bool {
 		return true
 	}
 	value := reflect.ValueOf(event)
-	return (value.Kind() == reflect.Ptr || value.Kind() == reflect.Interface) && value.IsNil()
+	return (value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface) && value.IsNil()
 }
 func derefEvent(value any) any {
 	if value == nil {
 		return nil
 	}
 	v := reflect.ValueOf(value)
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		if v.IsNil() {
 			return nil
 		}
@@ -407,9 +461,14 @@ func MarshalEvent(event TypedEvent) ([]byte, error) {
 	if isNilEvent(event) {
 		return nil, ErrInvalidEvent
 	}
-	var value any = derefEvent(event)
+	var value = derefEvent(event)
 	switch e := value.(type) {
 	case ExtensionDiscoveredV1:
+		if err := e.validate(); err != nil {
+			return nil, err
+		}
+		value = e
+	case ExtensionIdentityChangedV1:
 		if err := e.validate(); err != nil {
 			return nil, err
 		}
@@ -420,6 +479,11 @@ func MarshalEvent(event TypedEvent) ([]byte, error) {
 		}
 		value = e
 	case ExtensionDefaultsChangedV1:
+		if err := e.validate(); err != nil {
+			return nil, err
+		}
+		value = e
+	case ExtensionDefaultsClearedV1:
 		if err := e.validate(); err != nil {
 			return nil, err
 		}
@@ -535,6 +599,15 @@ func DecodeEvent(typ EventType, payload []byte) (TypedEvent, error) {
 			return nil, err
 		}
 		return e, nil
+	case EventExtensionIdentityChanged:
+		var e ExtensionIdentityChangedV1
+		if err := decodeObject(payload, &e); err != nil {
+			return nil, err
+		}
+		if err := e.validate(); err != nil {
+			return nil, err
+		}
+		return e, nil
 	case EventExtensionEnablementChanged:
 		var e ExtensionEnablementChangedV1
 		if err := decodeObject(payload, &e); err != nil {
@@ -546,6 +619,15 @@ func DecodeEvent(typ EventType, payload []byte) (TypedEvent, error) {
 		return e, nil
 	case EventExtensionDefaultsChanged:
 		var e ExtensionDefaultsChangedV1
+		if err := decodeObject(payload, &e); err != nil {
+			return nil, err
+		}
+		if err := e.validate(); err != nil {
+			return nil, err
+		}
+		return e, nil
+	case EventExtensionDefaultsCleared:
+		var e ExtensionDefaultsClearedV1
 		if err := decodeObject(payload, &e); err != nil {
 			return nil, err
 		}

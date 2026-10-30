@@ -1,10 +1,6 @@
 package messageflow
 
 import (
-	"Scardice-core/adapterapi"
-	"Scardice-core/core/groupstate"
-	"Scardice-core/core/playerstate"
-	"Scardice-core/eventstore"
 	"bytes"
 	"context"
 	"crypto/subtle"
@@ -13,9 +9,15 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"time"
+
+	"Scardice-core/adapterapi"
+	"Scardice-core/core/groupstate"
+	"Scardice-core/core/playerstate"
+	"Scardice-core/eventstore"
 )
 
 const (
@@ -23,6 +25,8 @@ const (
 	MessageWorkflowAggregateType       = "message-workflow"
 	MessageWorkflowTerminatedEventType = "message-workflow.terminated"
 	MaxWorkflowIDBytes                 = 255
+	callbackLeaseHeartbeatFloor        = 10 * time.Millisecond
+	callbackMinimumLeaseDuration       = 3 * callbackLeaseHeartbeatFloor
 )
 
 var (
@@ -42,18 +46,18 @@ type CallbackScope struct {
 
 // CallbackGroupLoader loads an immutable copy of the group-record read model.
 type CallbackGroupLoader interface {
-	Load(context.Context, string, string) (groupstate.State, error)
+	Load(ctx context.Context, diceID, groupID string) (groupstate.State, error)
 }
 
 // CallbackPlayerLoader loads the player and group-user attribute read models.
 type CallbackPlayerLoader interface {
-	LoadPlayer(context.Context, string, string, string) (playerstate.PlayerState, error)
-	LoadGroupUserAttrs(context.Context, string, string, string) (playerstate.GroupUserAttrsState, error)
+	LoadPlayer(ctx context.Context, diceID, groupID, userID string) (playerstate.PlayerState, error)
+	LoadGroupUserAttrs(ctx context.Context, diceID, groupID, userID string) (playerstate.GroupUserAttrsState, error)
 }
 
 // CallbackScopeResolver maps normalized ingress facts to durable state owners.
 type CallbackScopeResolver interface {
-	Resolve(context.Context, string, adapterapi.InboundMessage) (CallbackScope, error)
+	Resolve(ctx context.Context, endpointID string, message adapterapi.InboundMessage) (CallbackScope, error)
 }
 
 // CallbackRequest contains only copied provider-neutral facts and read models.
@@ -82,20 +86,37 @@ type WorkflowResult struct {
 // CallbackResult is the compatibility host's durable decision. Mutations are
 // collected through the supplied MutationCollector; only an explicit Workflow
 // creates a message-workflow stream.
+type CallbackCommitFence interface {
+	TryLock() bool
+	Unlock()
+}
+
 type CallbackResult struct {
-	Workflow *WorkflowResult
+	Workflow    *WorkflowResult
+	CommitFence CallbackCommitFence
+	AfterCommit func()
+	// Release relinquishes host-owned serialization after the complete callback
+	// UnitOfWork. CallbackService defers it after the host returns, keeping the
+	// fence held through commit and AfterCommit and releasing it on every exit.
+	Release func()
 }
 
 // CompatibilityHost is the one mutable legacy seam. The service calls it only
 // after the inbox row has durably entered callback-started.
 type CompatibilityHost interface {
-	HandleCallback(context.Context, CallbackRequest, *playerstate.LocalOverlay, *MutationCollector) (CallbackResult, error)
+	HandleCallback(ctx context.Context, request CallbackRequest, overlay *playerstate.LocalOverlay, collector *MutationCollector) (CallbackResult, error)
+}
+
+// CallbackAdmission serializes hosts whose compatibility state is shared across
+// endpoint lanes. Admission precedes claiming, so waiting never consumes a lease.
+type CallbackAdmission interface {
+	BeginCallback(context.Context) (context.Context, func(), error)
 }
 
 // BoundPayloadDecryptor authenticates callback payloads with the inbox
 // identity and endpoint as AEAD associated data.
 type BoundPayloadDecryptor interface {
-	DecryptBound(context.Context, string, string, string, uint64, []byte, []byte, string) ([]byte, error)
+	DecryptBound(ctx context.Context, domain, identity, owner string, version uint64, ciphertext, nonce []byte, keyID string) ([]byte, error)
 }
 
 // CallbackConfig wires the narrow durable callback service.
@@ -143,13 +164,135 @@ type CallbackService struct {
 	factory      eventstore.EventFactory
 }
 
+type callbackLeaseHeartbeatResult struct {
+	update eventstore.InboxUpdate
+	err    error
+}
+
+func (s *CallbackService) leaseOperationContext(ctx context.Context, lease eventstore.InboxUpdate) (context.Context, context.CancelFunc, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if lease.LeaseExpiresAt.IsZero() {
+		operationCtx, cancel := context.WithCancel(ctx)
+		return operationCtx, cancel, nil
+	}
+	remaining := lease.LeaseExpiresAt.Sub(s.clock.Now().UTC())
+	margin := s.lease / 3
+	if margin < callbackLeaseHeartbeatFloor {
+		margin = callbackLeaseHeartbeatFloor
+	}
+	if remaining <= margin {
+		return nil, nil, ErrCallbackLease
+	}
+	operationCtx, cancel := context.WithTimeout(ctx, remaining-margin)
+	return operationCtx, cancel, nil
+}
+
+func (s *CallbackService) renewCallbackLease(ctx context.Context, current eventstore.InboxUpdate) (eventstore.InboxUpdate, error) {
+	renewed, err := s.inbox.RenewInbox(ctx, eventstore.InboxRenewRequest{
+		InboxID: current.InboxID, WorkerID: current.LeaseOwner,
+		LeaseEpoch: current.LeaseEpoch, AttemptID: current.AttemptID,
+		LeaseDuration: s.lease,
+	})
+	if err != nil {
+		return current, err
+	}
+	next := renewed.Update
+	if next.InboxID != current.InboxID || next.Status != eventstore.InboxStatusCallbackStarted ||
+		next.LeaseOwner != current.LeaseOwner || next.LeaseEpoch != current.LeaseEpoch ||
+		next.AttemptID != current.AttemptID || next.Version <= current.Version ||
+		!next.LeaseExpiresAt.After(s.clock.Now().UTC()) {
+		return current, ErrCallbackLease
+	}
+	return next, nil
+}
+
+func (s *CallbackService) keepLeaseAlive(ctx context.Context, cancel context.CancelFunc, initial eventstore.InboxUpdate, stop <-chan struct{}, done chan<- callbackLeaseHeartbeatResult) {
+	interval := s.lease / 3
+	if interval < callbackLeaseHeartbeatFloor {
+		interval = callbackLeaseHeartbeatFloor
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	current := initial
+	finish := func(err error) {
+		done <- callbackLeaseHeartbeatResult{update: current, err: err}
+	}
+	for {
+		select {
+		case <-stop:
+			finish(nil)
+			return
+		case <-ctx.Done():
+			select {
+			case <-stop:
+				finish(nil)
+			default:
+				finish(ctx.Err())
+			}
+			return
+		case <-ticker.C:
+			select {
+			case <-stop:
+				finish(nil)
+				return
+			default:
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				finish(ctxErr)
+				return
+			}
+			renewCtx, renewCancel, contextErr := s.leaseOperationContext(ctx, current)
+			if contextErr != nil {
+				cancel()
+				finish(contextErr)
+				return
+			}
+			next, renewErr := s.renewCallbackLease(renewCtx, current)
+			renewCancel()
+			if renewErr != nil {
+				cancel()
+				finish(renewErr)
+				return
+			}
+			current = next
+		}
+	}
+}
+
+func waitCallbackCommitFence(ctx context.Context, fence CallbackCommitFence) (func(), error) {
+	if fence == nil {
+		return func() {}, nil
+	}
+	ticker := time.NewTicker(callbackLeaseHeartbeatFloor)
+	defer ticker.Stop()
+	for {
+		if fence.TryLock() {
+			if err := ctx.Err(); err != nil {
+				fence.Unlock()
+				return nil, err
+			}
+			return fence.Unlock, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 func callbackIsNil(value any) bool {
 	if value == nil {
 		return true
 	}
 	reflected := reflect.ValueOf(value)
 	switch reflected.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
 		return reflected.IsNil()
 	default:
 		return false
@@ -176,6 +319,9 @@ func NewCallbackService(config CallbackConfig) (*CallbackService, error) {
 	}
 	if config.LeaseDuration <= 0 {
 		config.LeaseDuration = time.Minute
+	}
+	if config.LeaseDuration < callbackMinimumLeaseDuration {
+		return nil, ErrCallbackLease
 	}
 	if callbackIsNil(config.Clock) {
 		config.Clock = eventstore.SystemClock{}
@@ -204,28 +350,46 @@ func (s *CallbackService) ProcessOne(ctx context.Context) (summary CallbackResul
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if admission, ok := s.host.(CallbackAdmission); ok {
+		var release func()
+		ctx, release, err = admission.BeginCallback(ctx)
+		if err != nil {
+			return summary, err
+		}
+		defer release()
+	}
 	for attempt := 1; attempt <= CallbackMaxPreMarkerAttempts; attempt++ {
 		summary.Attempts = attempt
 		lease, claimErr := s.inbox.ClaimInbox(ctx, eventstore.InboxClaimRequest{WorkerID: s.workerID, LeaseDuration: s.lease, QuarantinePayloadErrors: true, TerminalizeExpired: true, RecoverExpiredCallbackStarted: true})
 		if claimErr != nil {
 			return summary, claimErr
 		}
+		summary.InboxID, summary.Status = lease.Update.InboxID, lease.Update.Status
 		if err := validateClaimAt(lease.Update, s.clock.Now(), s.workerID); err != nil {
 			return summary, err
 		}
 		payload, decodeErr := s.decodeClaimed(ctx, lease.Update)
 		if decodeErr != nil {
-			_ = s.failLease(ctx, lease.Update)
+			if failureErr := s.failLease(ctx, lease.Update); failureErr != nil {
+				return summary, errors.Join(decodeErr, failureErr)
+			}
+			summary.Status = eventstore.InboxStatusFailed
 			return summary, decodeErr
 		}
 		scope, group, player, attrs, loadErr := s.loadCallbackState(ctx, lease.Update.EndpointID, payload)
 		if loadErr != nil {
-			_ = s.failLease(ctx, lease.Update)
+			if failureErr := s.failLease(ctx, lease.Update); failureErr != nil {
+				return summary, errors.Join(loadErr, failureErr)
+			}
+			summary.Status = eventstore.InboxStatusFailed
 			return summary, loadErr
 		}
 		startedVersion, versionErr := nextCallbackVersion(lease.Update.Version)
 		if versionErr != nil {
-			_ = s.failLease(ctx, lease.Update)
+			if failureErr := s.failLease(ctx, lease.Update); failureErr != nil {
+				return summary, errors.Join(versionErr, failureErr)
+			}
+			summary.Status = eventstore.InboxStatusFailed
 			return summary, versionErr
 		}
 		marker := eventstore.InboxUpdate{
@@ -238,10 +402,15 @@ func (s *CallbackService) ProcessOne(ctx context.Context) (summary CallbackResul
 			if isPreMarkerConflict(markerErr) && attempt < CallbackMaxPreMarkerAttempts {
 				continue
 			}
-			_ = s.failLease(ctx, lease.Update)
+			if failureErr := s.failLease(ctx, lease.Update); failureErr != nil {
+				return summary, errors.Join(markerErr, failureErr)
+			}
+			summary.Status = eventstore.InboxStatusFailed
 			return summary, markerErr
 		}
-
+		lease.Update.Status = eventstore.InboxStatusCallbackStarted
+		lease.Update.Version = startedVersion
+		summary.Status = eventstore.InboxStatusCallbackStarted
 		request := CallbackRequest{
 			InboxID: lease.Update.InboxID, EndpointID: lease.Update.EndpointID,
 			Generation: payload.Generation, DesiredVersion: payload.DesiredVersion,
@@ -251,30 +420,109 @@ func (s *CallbackService) ProcessOne(ctx context.Context) (summary CallbackResul
 		overlay := playerstate.NewLocalOverlay()
 		collector := NewMutationCollector(s.factory)
 		collector.subjectKey = append([]byte(nil), lease.Update.SubjectKey...)
-		callbackResult, hostErr := invokeCallbackHost(ctx, s.host, request, overlay, collector)
+		hostCtx, cancelHost := context.WithCancel(ctx)
+		stopHeartbeat := make(chan struct{})
+		heartbeatDone := make(chan callbackLeaseHeartbeatResult, 1)
+		go s.keepLeaseAlive(hostCtx, cancelHost, lease.Update, stopHeartbeat, heartbeatDone)
+		heartbeatJoined := false
+		var heartbeat callbackLeaseHeartbeatResult
+		joinHeartbeat := func() callbackLeaseHeartbeatResult {
+			if heartbeatJoined {
+				return heartbeat
+			}
+			close(stopHeartbeat)
+			// A real claimed lease bounds an in-flight renewal itself. Test and
+			// explicitly non-durable repositories may omit the expiry, so they
+			// still need cancellation to make the handoff bounded.
+			if lease.Update.LeaseExpiresAt.IsZero() {
+				cancelHost()
+			}
+			heartbeat = <-heartbeatDone
+			cancelHost()
+			heartbeatJoined = true
+			lease.Update = heartbeat.update
+			startedVersion = heartbeat.update.Version
+			return heartbeat
+		}
+		afterCallbackFailure := func(cause error) (CallbackResultSummary, error) {
+			heartbeat := joinHeartbeat()
+			if heartbeat.err != nil {
+				cause = heartbeat.err
+			}
+			return s.afterMarkerFailure(summary, cause, lease.Update, startedVersion)
+		}
+
+		callbackResult, hostErr := invokeCallbackHost(hostCtx, s.host, request, overlay, collector)
+		if callbackResult.Release != nil {
+			defer callbackResult.Release()
+		}
 		if hostErr != nil {
-			return s.afterMarkerFailure(summary, hostErr, lease.Update, startedVersion)
+			return afterCallbackFailure(hostErr)
 		}
 		if workflowErr := validateWorkflowResult(callbackResult.Workflow); workflowErr != nil {
-			return s.afterMarkerFailure(summary, workflowErr, lease.Update, startedVersion)
+			return afterCallbackFailure(workflowErr)
 		}
 		work, buildErr := collector.unitOfWork()
 		if buildErr != nil {
-			return s.afterMarkerFailure(summary, buildErr, lease.Update, startedVersion)
+			return afterCallbackFailure(buildErr)
 		}
 		if callbackResult.Workflow != nil {
 			if err := collector.addWorkflow(*callbackResult.Workflow); err != nil {
-				return s.afterMarkerFailure(summary, err, lease.Update, startedVersion)
+				return afterCallbackFailure(err)
 			}
 			work, buildErr = collector.unitOfWork()
 			if buildErr != nil {
-				return s.afterMarkerFailure(summary, buildErr, lease.Update, startedVersion)
+				return afterCallbackFailure(buildErr)
 			}
 		}
+
+		unlockFence, fenceErr := waitCallbackCommitFence(hostCtx, callbackResult.CommitFence)
+		if fenceErr != nil {
+			return afterCallbackFailure(fenceErr)
+		}
+		fenceHeld := true
+		releaseFence := func() {
+			if fenceHeld {
+				unlockFence()
+				fenceHeld = false
+			}
+		}
+		defer releaseFence()
+		afterHandoffFailure := func(cause error) (CallbackResultSummary, error) {
+			releaseFence()
+			return s.afterMarkerFailure(summary, cause, lease.Update, startedVersion)
+		}
+
+		heartbeat = joinHeartbeat()
+		if heartbeat.err != nil {
+			return afterHandoffFailure(heartbeat.err)
+		}
+		if contextErr := ctx.Err(); contextErr != nil {
+			return afterHandoffFailure(contextErr)
+		}
+
+		if !lease.Update.PayloadExpiresAt.IsZero() && !lease.Update.PayloadExpiresAt.After(s.clock.Now().UTC()) {
+			return afterHandoffFailure(eventstore.ErrPayloadExpired)
+		}
+
+		// Finish the heartbeat-to-CAS handoff with one ordinary-duration renew.
+		// No renewal can change Version after terminal.ExpectedVersion is built.
+		renewCtx, renewCancel, renewContextErr := s.leaseOperationContext(ctx, lease.Update)
+		if renewContextErr != nil {
+			return afterHandoffFailure(renewContextErr)
+		}
+		renewed, renewErr := s.renewCallbackLease(renewCtx, lease.Update)
+		renewCancel()
+		if renewErr != nil {
+			return afterHandoffFailure(renewErr)
+		}
+		lease.Update = renewed
+		startedVersion = renewed.Version
+
 		completedAt := s.clock.Now().UTC()
 		terminalVersion, terminalErr := nextCallbackVersion(startedVersion)
 		if terminalErr != nil {
-			return s.afterMarkerFailure(summary, terminalErr, lease.Update, startedVersion)
+			return afterHandoffFailure(terminalErr)
 		}
 		terminal := eventstore.InboxUpdate{
 			InboxID: lease.Update.InboxID, ExpectedVersion: startedVersion, Version: terminalVersion,
@@ -287,10 +535,22 @@ func (s *CallbackService) ProcessOne(ctx context.Context) (summary CallbackResul
 		}
 		work.InboxUpdates = append(work.InboxUpdates, terminal)
 		if commitErr := eventstore.ValidateUnitOfWork(work); commitErr != nil {
-			return s.afterMarkerFailure(summary, commitErr, lease.Update, startedVersion)
+			return afterHandoffFailure(commitErr)
 		}
-		if _, commitErr := s.store.Commit(ctx, work); commitErr != nil {
-			return s.afterMarkerFailure(summary, commitErr, lease.Update, startedVersion)
+
+		// With renewal frozen, bound connection/transaction waiting to finish
+		// before the freshly renewed lease can naturally expire.
+		commitCtx, commitCancel, commitContextErr := s.leaseOperationContext(ctx, lease.Update)
+		if commitContextErr != nil {
+			return afterHandoffFailure(commitContextErr)
+		}
+		_, commitErr := s.store.Commit(commitCtx, work)
+		commitCancel()
+		if commitErr != nil {
+			return afterHandoffFailure(commitErr)
+		}
+		if callbackResult.AfterCommit != nil {
+			callbackResult.AfterCommit()
 		}
 		summary.InboxID, summary.Status = lease.Update.InboxID, eventstore.InboxStatusConfirmedConsumed
 		if callbackResult.Workflow != nil {
@@ -338,7 +598,7 @@ func decodeIngressPayload(payload []byte) (ingressPayload, error) {
 		return ingressPayload{}, fmt.Errorf("%w: payload bound", ErrCallbackPayload)
 	}
 	if err := validateStrictJSON(payload); err != nil {
-		return ingressPayload{}, fmt.Errorf("%w: strict JSON: %v", ErrCallbackPayload, err)
+		return ingressPayload{}, fmt.Errorf("%w: strict JSON: %w", ErrCallbackPayload, err)
 	}
 	var shape any
 	decoder := json.NewDecoder(bytes.NewReader(payload))
@@ -352,7 +612,7 @@ func decodeIngressPayload(payload []byte) (ingressPayload, error) {
 	decoder.DisallowUnknownFields()
 	var decoded ingressPayload
 	if err := decoder.Decode(&decoded); err != nil {
-		return ingressPayload{}, fmt.Errorf("%w: %v", ErrCallbackPayload, err)
+		return ingressPayload{}, fmt.Errorf("%w: %w", ErrCallbackPayload, err)
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return ingressPayload{}, fmt.Errorf("%w: trailing payload", ErrCallbackPayload)
@@ -387,24 +647,24 @@ func containsNull(value any) bool {
 }
 
 func (s *CallbackService) loadCallbackState(ctx context.Context, endpoint string, payload ingressPayload) (CallbackScope, groupstate.State, playerstate.PlayerState, playerstate.GroupUserAttrsState, error) {
-	scope, err := s.resolver.Resolve(ctx, endpoint, cloneInboundMessage(payload.Message))
-	if err != nil {
-		return CallbackScope{}, groupstate.State{}, playerstate.PlayerState{}, playerstate.GroupUserAttrsState{}, err
+	scope, scopeErr := s.resolver.Resolve(ctx, endpoint, cloneInboundMessage(payload.Message))
+	if scopeErr != nil {
+		return CallbackScope{}, groupstate.State{}, playerstate.PlayerState{}, playerstate.GroupUserAttrsState{}, scopeErr
 	}
 	if err := validateCallbackScope(scope); err != nil {
 		return CallbackScope{}, groupstate.State{}, playerstate.PlayerState{}, playerstate.GroupUserAttrsState{}, err
 	}
-	group, err := s.group.Load(ctx, scope.DiceID, scope.GroupID)
-	if err != nil {
-		return CallbackScope{}, groupstate.State{}, playerstate.PlayerState{}, playerstate.GroupUserAttrsState{}, err
+	group, scopeErr := s.group.Load(ctx, scope.DiceID, scope.GroupID)
+	if scopeErr != nil {
+		return CallbackScope{}, groupstate.State{}, playerstate.PlayerState{}, playerstate.GroupUserAttrsState{}, scopeErr
 	}
-	player, err := s.player.LoadPlayer(ctx, scope.DiceID, scope.GroupID, scope.UserID)
-	if err != nil {
-		return CallbackScope{}, groupstate.State{}, playerstate.PlayerState{}, playerstate.GroupUserAttrsState{}, err
+	player, scopeErr := s.player.LoadPlayer(ctx, scope.DiceID, scope.GroupID, scope.UserID)
+	if scopeErr != nil {
+		return CallbackScope{}, groupstate.State{}, playerstate.PlayerState{}, playerstate.GroupUserAttrsState{}, scopeErr
 	}
-	attrs, err := s.player.LoadGroupUserAttrs(ctx, scope.DiceID, scope.GroupID, scope.UserID)
-	if err != nil {
-		return CallbackScope{}, groupstate.State{}, playerstate.PlayerState{}, playerstate.GroupUserAttrsState{}, err
+	attrs, scopeErr := s.player.LoadGroupUserAttrs(ctx, scope.DiceID, scope.GroupID, scope.UserID)
+	if scopeErr != nil {
+		return CallbackScope{}, groupstate.State{}, playerstate.PlayerState{}, playerstate.GroupUserAttrsState{}, scopeErr
 	}
 	if group.Version > 0 && (group.DiceID != scope.DiceID || group.GroupID != scope.GroupID) {
 		return CallbackScope{}, groupstate.State{}, playerstate.PlayerState{}, playerstate.GroupUserAttrsState{}, ErrCallbackScope
@@ -448,7 +708,6 @@ func nextCallbackVersion(version uint64) (uint64, error) {
 	return version + 1, nil
 }
 
-
 func isPreMarkerConflict(err error) bool {
 	return errors.Is(err, eventstore.ErrConflict) || errors.Is(err, eventstore.ErrParticipantConflict) || errors.Is(err, eventstore.ErrStaleLease)
 }
@@ -470,6 +729,7 @@ func (s *CallbackService) afterMarkerFailure(summary CallbackResultSummary, caus
 	if err := s.markAmbiguous(recoveryCtx, lease, version); err != nil {
 		return summary, errors.Join(cause, err)
 	}
+	summary.Status = eventstore.InboxStatusAmbiguous
 	return summary, cause
 }
 
@@ -484,7 +744,7 @@ func (s *CallbackService) markAmbiguous(ctx context.Context, lease eventstore.In
 func invokeCallbackHost(ctx context.Context, host CompatibilityHost, request CallbackRequest, overlay *playerstate.LocalOverlay, collector *MutationCollector) (result CallbackResult, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("messageflow: callback host panic")
+			err = errors.New("messageflow: callback host panic")
 		}
 	}()
 	return host.HandleCallback(ctx, request, overlay, collector)
@@ -492,6 +752,10 @@ func invokeCallbackHost(ctx context.Context, host CompatibilityHost, request Cal
 
 func cloneInboundMessage(message adapterapi.InboundMessage) adapterapi.InboundMessage {
 	message.Segments = append([]adapterapi.InboundSegment(nil), message.Segments...)
+	if message.AdapterEvent != nil {
+		event := *message.AdapterEvent
+		message.AdapterEvent = &event
+	}
 	return message
 }
 
@@ -558,7 +822,8 @@ func scanJSONValue(decoder *json.Decoder) (bool, error) {
 	}
 	switch value := token.(type) {
 	case string:
-		return containsOverlayText(value), nil
+		// Templates may reference $t variables without persisting request-local state.
+		return false, nil
 	case json.Delim:
 		switch value {
 		case '{':
@@ -577,7 +842,7 @@ func scanJSONValue(decoder *json.Decoder) (bool, error) {
 					return false, errors.New("duplicate JSON object key")
 				}
 				seen[key] = struct{}{}
-				if containsOverlayText(key) {
+				if strings.HasPrefix(key, "$t") {
 					overlay = true
 				}
 				childOverlay, err := scanJSONValue(decoder)
@@ -664,12 +929,16 @@ func containsOverlayEffect(effect eventstore.NewEffect) bool {
 // MutationCollector is the sole callback mutation output. It owns copied
 // event/effect/KV bytes and rejects duplicate participants before commit.
 type MutationCollector struct {
-	factory  eventstore.EventFactory
-	streams  map[eventstore.StreamID]eventstore.StreamAppend
-	plugins  map[string]eventstore.PluginKVUpdate
-	effects  map[string]eventstore.NewEffect
+	factory    eventstore.EventFactory
+	streams    map[eventstore.StreamID]eventstore.StreamAppend
+	plugins    map[string]eventstore.PluginKVUpdate
+	secrets    map[string]eventstore.SecretUpdate
+	effects    []eventstore.NewEffect
+	effectIDs  map[string]struct{}
+	operations map[string]eventstore.OperationUpdate
+	logUpdates []eventstore.LogUpdate
 	subjectKey []byte
-	workflow *eventstore.StreamAppend
+	workflow   *eventstore.StreamAppend
 }
 
 func NewMutationCollector(factory eventstore.EventFactory) *MutationCollector {
@@ -679,10 +948,11 @@ func NewMutationCollector(factory eventstore.EventFactory) *MutationCollector {
 	if callbackIsNil(factory.IDs) {
 		factory.IDs = eventstore.UUIDGenerator{}
 	}
-	return &MutationCollector{factory: factory, streams: map[eventstore.StreamID]eventstore.StreamAppend{}, plugins: map[string]eventstore.PluginKVUpdate{}, effects: map[string]eventstore.NewEffect{}}
+	return &MutationCollector{factory: factory, streams: map[eventstore.StreamID]eventstore.StreamAppend{}, plugins: map[string]eventstore.PluginKVUpdate{}, secrets: map[string]eventstore.SecretUpdate{}, effectIDs: map[string]struct{}{}, operations: map[string]eventstore.OperationUpdate{}}
 }
 
 // AddStream adds already-decided events to one non-workflow stream.
+
 func (c *MutationCollector) AddStream(stream eventstore.StreamID, expectedVersion uint64, events []eventstore.NewEvent) error {
 	if c == nil || stream.AggregateType == "" || stream.AggregateID == "" || len(events) == 0 || stream.AggregateType == MessageWorkflowAggregateType || containsOverlayStream(stream) {
 		return ErrCallbackWorkflow
@@ -705,8 +975,21 @@ func (c *MutationCollector) AddStream(stream eventstore.StreamID, expectedVersio
 	}
 	copied := make([]eventstore.NewEvent, len(events))
 	for i, event := range events {
-		if event.EventType == "" || event.SchemaVersion == 0 || len(event.Payload) > eventstore.MaxEventPayloadBytes || event.Metadata.EventID == "" || event.Metadata.CommandID == "" || event.Metadata.CorrelationID == "" || containsOverlayEvent(event) {
-			return eventstore.ErrInvalidEvent
+		var reason string
+		switch {
+		case event.EventType == "":
+			reason = "missing event type"
+		case event.SchemaVersion == 0:
+			reason = "missing schema version"
+		case len(event.Payload) > eventstore.MaxEventPayloadBytes:
+			reason = "payload exceeds event bound"
+		case event.Metadata.EventID == "" || event.Metadata.CommandID == "" || event.Metadata.CorrelationID == "":
+			reason = "missing event, command or correlation ID"
+		case containsOverlayEvent(event):
+			reason = "request-local identity/key or malformed JSON"
+		}
+		if reason != "" {
+			return fmt.Errorf("%w: aggregate=%s event[%d]=%s: %s", eventstore.ErrInvalidEvent, stream.AggregateType, i, event.EventType, reason)
 		}
 		copied[i] = cloneNewEvent(event)
 	}
@@ -752,6 +1035,7 @@ func (c *MutationCollector) AddPlayerEvents(stream eventstore.StreamID, expected
 	}
 	return c.AddStream(stream, expectedVersion, encoded)
 }
+
 // AddModerationEvents serializes typed moderation facts.
 func (c *MutationCollector) AddModerationEvents(stream eventstore.StreamID, expectedVersion uint64, metadata eventstore.Metadata, events []playerstate.ModerationEvent) error {
 	if c == nil {
@@ -771,7 +1055,6 @@ func (c *MutationCollector) AddModerationEvents(stream eventstore.StreamID, expe
 	}
 	return c.AddStream(stream, expectedVersion, encoded)
 }
-
 
 // AddGroupUserAttrsEvents serializes typed group-user attribute facts.
 func (c *MutationCollector) AddGroupUserAttrsEvents(stream eventstore.StreamID, expectedVersion uint64, metadata eventstore.Metadata, events []playerstate.GroupUserAttrsEvent) error {
@@ -833,6 +1116,22 @@ func (c *MutationCollector) AddPluginKVBatch(updates []eventstore.PluginKVUpdate
 	return nil
 }
 
+func (c *MutationCollector) AddSecretUpdate(update eventstore.SecretUpdate) error {
+	if c == nil || strings.TrimSpace(update.SecretRef) == "" || strings.TrimSpace(update.EndpointID) == "" || strings.TrimSpace(update.AdapterID) == "" || update.SecretVersion == 0 || len(update.Ciphertext) == 0 || len(update.Nonce) == 0 || strings.TrimSpace(update.EncryptionKeyID) == "" {
+		return eventstore.ErrInvalidMetadata
+	}
+	if c.secrets == nil {
+		c.secrets = make(map[string]eventstore.SecretUpdate)
+	}
+	if _, exists := c.secrets[update.SecretRef]; exists {
+		return eventstore.ErrDuplicateParticipant
+	}
+	update.Ciphertext = append([]byte(nil), update.Ciphertext...)
+	update.Nonce = append([]byte(nil), update.Nonce...)
+	c.secrets[update.SecretRef] = update
+	return nil
+}
+
 func (c *MutationCollector) AddEffect(effect eventstore.NewEffect) error {
 	if c == nil || strings.TrimSpace(effect.EffectID) == "" || strings.TrimSpace(effect.EndpointID) == "" || len(effect.LaneHMAC) == 0 || strings.TrimSpace(effect.EffectType) == "" || !validRisk(effect.RiskClass) || effect.Status != eventstore.OutboxStatusPending || len(effect.PayloadCiphertext) == 0 || len(effect.PayloadNonce) == 0 || strings.TrimSpace(effect.PayloadEncryptionKeyID) == "" || containsOverlayEffect(effect) {
 		return eventstore.ErrInvalidMetadata
@@ -840,7 +1139,7 @@ func (c *MutationCollector) AddEffect(effect eventstore.NewEffect) error {
 	if effect.ExpectedVersion != 0 || effect.PrincipalID != "" {
 		return eventstore.ErrInvalidMetadata
 	}
-	if _, exists := c.effects[effect.EffectID]; exists {
+	if _, exists := c.effectIDs[effect.EffectID]; exists {
 		return eventstore.ErrDuplicateParticipant
 	}
 	if len(c.subjectKey) > 0 && len(effect.SubjectKey) > 0 && !bytes.Equal(effect.SubjectKey, c.subjectKey) {
@@ -855,13 +1154,119 @@ func (c *MutationCollector) AddEffect(effect eventstore.NewEffect) error {
 	effect.PayloadCiphertext = append([]byte(nil), effect.PayloadCiphertext...)
 	effect.PayloadNonce = append([]byte(nil), effect.PayloadNonce...)
 	effect.ContentDigest = append([]byte(nil), effect.ContentDigest...)
-	if c.effects == nil {
-		c.effects = make(map[string]eventstore.NewEffect)
+	if c.effectIDs == nil {
+		c.effectIDs = make(map[string]struct{})
 	}
-	c.effects[effect.EffectID] = effect
+	c.effectIDs[effect.EffectID] = struct{}{}
+	c.effects = append(c.effects, effect)
 	return nil
 }
 
+func (c *MutationCollector) AddLogUpdate(update eventstore.LogUpdate) error {
+	if c == nil {
+		return ErrCallbackUnavailable
+	}
+	if len(c.logUpdates) >= eventstore.MaxUnitOfWorkEvents {
+		return &eventstore.OversizeError{Bound: "unit of work log updates", Limit: eventstore.MaxUnitOfWorkEvents, Actual: len(c.logUpdates) + 1}
+	}
+	update.Entry = cloneStoryLogEntry(update.Entry)
+	update.Intent.Entry = cloneStoryLogEntry(update.Intent.Entry)
+	c.logUpdates = append(c.logUpdates, update)
+	return nil
+}
+
+func cloneStoryLogEntry(entry eventstore.StoryLogEntry) eventstore.StoryLogEntry {
+	entry.CommandInfo = append(entry.CommandInfo[:0:0], entry.CommandInfo...)
+	if entry.Seq != nil {
+		value := *entry.Seq
+		entry.Seq = &value
+	}
+	if entry.Removed != nil {
+		value := *entry.Removed
+		entry.Removed = &value
+	}
+	if entry.ParentID != nil {
+		value := *entry.ParentID
+		entry.ParentID = &value
+	}
+	return entry
+}
+func (c *MutationCollector) HasStoryLogStateUpdate(diceID, groupID string) bool {
+	if c == nil {
+		return false
+	}
+	for _, update := range c.logUpdates {
+		if update.IsStoryLogStateUpdate() && update.DiceID == diceID && update.GroupID == groupID {
+			return true
+		}
+	}
+	return false
+}
+
+// AddPreparedOutbound imports exactly one validated outbound stream, operation,
+// and effect produced by OutboundService.Prepare.
+//
+// The outputs of a callback belong to the subject of the message it handles,
+// wherever they are addressed: a purge of that subject must reach everything
+// derived from it, and the store fences them on that subject. Prepare keys an
+// effect to its target conversation, which differs for a reply sent elsewhere
+// (a hidden roll to the sender's private chat, a notice to another group), so
+// the effect and its stream events are rebound to the callback's subject here.
+func (c *MutationCollector) AddPreparedOutbound(prepared PreparedOutbound) error {
+	work := prepared.Work
+	if c == nil || prepared.Result.Deduplicated || len(work.Streams) != 1 || len(work.Operations) != 1 || len(work.Effects) != 1 {
+		return eventstore.ErrInvalidMetadata
+	}
+	stream, operation, effect := work.Streams[0], work.Operations[0], work.Effects[0]
+	if stream.Stream.AggregateType != "outbound-effect" || stream.Stream.AggregateID != effect.EffectID || operation.ResourceID != effect.EffectID || operation.OperationID == "" || operation.IdempotencyScope != "outbound" || operation.IdempotencyKey == "" {
+		return eventstore.ErrInvalidMetadata
+	}
+	if _, exists := c.operations[operation.OperationID]; exists {
+		return eventstore.ErrDuplicateParticipant
+	}
+	if len(c.subjectKey) > 0 {
+		events := slices.Clone(stream.Events)
+		for i := range events {
+			events[i].Metadata.SubjectKey = slices.Clone(c.subjectKey)
+		}
+		stream.Events = events
+		effect.SubjectKey = nil
+	}
+	if err := c.AddStream(stream.Stream, stream.ExpectedVersion, stream.Events); err != nil {
+		return err
+	}
+	if err := c.AddEffect(effect); err != nil {
+		delete(c.streams, stream.Stream)
+		return err
+	}
+	c.operations[operation.OperationID] = operation
+	return nil
+}
+
+// HasPreparedOutboundOperation reports whether this callback collector owns a
+// staged outbound operation. It exposes only membership, not mutable work.
+func (c *MutationCollector) HasPreparedOutboundOperation(operationID string) bool {
+	if c == nil || operationID == "" {
+		return false
+	}
+	operation, ok := c.operations[operationID]
+	return ok && operation.Kind == "outbound-effect" && operation.IdempotencyScope == "outbound"
+}
+
+func (c *MutationCollector) AddPreparedOutboundWithLog(prepared PreparedOutbound, update eventstore.LogUpdate) error {
+	if c == nil {
+		return ErrCallbackUnavailable
+	}
+	logUpdateCount := len(c.logUpdates)
+	if err := c.AddLogUpdate(update); err != nil {
+		return err
+	}
+	if err := c.AddPreparedOutbound(prepared); err != nil {
+		c.logUpdates = c.logUpdates[:logUpdateCount]
+		return err
+	}
+	return nil
+}
 
 func (c *MutationCollector) addWorkflow(workflow WorkflowResult) error {
 	if err := validateWorkflowResult(&workflow); err != nil {
@@ -903,18 +1308,35 @@ func (c *MutationCollector) unitOfWork() (eventstore.UnitOfWork, error) {
 		}
 		return bytes.Compare(plugins[i].KeyHMAC, plugins[j].KeyHMAC) < 0
 	})
+	secrets := make([]eventstore.SecretUpdate, 0, len(c.secrets))
+	for _, update := range c.secrets {
+		update.Ciphertext = append([]byte(nil), update.Ciphertext...)
+		update.Nonce = append([]byte(nil), update.Nonce...)
+		secrets = append(secrets, update)
+	}
+	sort.Slice(secrets, func(i, j int) bool { return secrets[i].SecretRef < secrets[j].SecretRef })
 	effects := make([]eventstore.NewEffect, 0, len(c.effects))
 	for _, effect := range c.effects {
 		effects = append(effects, cloneEffect(effect))
 	}
-	sort.Slice(effects, func(i, j int) bool { return effects[i].EffectID < effects[j].EffectID })
-	return eventstore.UnitOfWork{Streams: streams, PluginKVUpdates: plugins, Effects: effects}, nil
+	operations := make([]eventstore.OperationUpdate, 0, len(c.operations))
+	for _, operation := range c.operations {
+		operations = append(operations, operation)
+	}
+	sort.Slice(operations, func(i, j int) bool { return operations[i].OperationID < operations[j].OperationID })
+	logUpdates := make([]eventstore.LogUpdate, len(c.logUpdates))
+	for i, update := range c.logUpdates {
+		update.Entry = cloneStoryLogEntry(update.Entry)
+		update.Intent.Entry = cloneStoryLogEntry(update.Intent.Entry)
+		logUpdates[i] = update
+	}
+	return eventstore.UnitOfWork{Streams: streams, Operations: operations, SecretUpdates: secrets, PluginKVUpdates: plugins, Effects: effects, LogUpdates: logUpdates}, nil
 }
+
 // UnitOfWork returns an owned snapshot suitable for an explicit commit.
 func (c *MutationCollector) UnitOfWork() (eventstore.UnitOfWork, error) {
 	return c.unitOfWork()
 }
-
 
 func pluginKey(update eventstore.PluginKVUpdate) string {
 	return update.ExtensionID + "\x00" + string(update.KeyHMAC)

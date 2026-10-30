@@ -6,8 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"go.uber.org/zap"
-
 	"Scardice-core/message"
 )
 
@@ -86,56 +84,7 @@ func TestQQAdaptersPopulateRobotSenderInfo(t *testing.T) {
 	if !legacy.Sender.IsRobot {
 		t.Fatal("legacy OneBot conversion did not mark a QQ bot UIN")
 	}
-
-	modern := (&MessageOBQQ{MessageQQOBBase: MessageQQOBBase{
-		MessageType: "group",
-		Sender:      &Sender{UserID: json.RawMessage("3889000000")},
-	}}).toStdMessage()
-	if !modern.Sender.IsRobot {
-		t.Fatal("OneBot conversion did not mark a QQ bot UIN")
-	}
-
-	protocolDetected := (&MessageOBQQ{MessageQQOBBase: MessageQQOBBase{
-		MessageType: "group",
-		Sender: &Sender{
-			UserID:  json.RawMessage("12345678"),
-			IsRobot: true,
-		},
-	}}).toStdMessage()
-	if !protocolDetected.Sender.IsRobot {
-		t.Fatal("OneBot conversion discarded the protocol is_robot field")
-	}
 }
-
-func TestOneBotConversionPopulatesRobotMentionInfo(t *testing.T) {
-	raw := []byte(`{
-		"time": 1,
-		"message_id": 2,
-		"message_type": "group",
-		"group_id": 3,
-		"sender": {"user_id": 12345678, "nickname": "user"},
-		"message": [
-			{"type": "text", "data": {"text": ".r 1d6"}},
-			{"type": "at", "data": {"qq": "4010000000"}}
-		]
-	}`)
-
-	msg, err := arrayByte2ScardiceMessage(zap.NewNop().Sugar(), raw)
-	if err != nil {
-		t.Fatalf("arrayByte2ScardiceMessage returned error: %v", err)
-	}
-	if len(msg.Segment) != 2 {
-		t.Fatalf("converted segment count = %d, want 2", len(msg.Segment))
-	}
-	at, ok := msg.Segment[1].(*message.AtElement)
-	if !ok {
-		t.Fatalf("converted segment type = %T, want *message.AtElement", msg.Segment[1])
-	}
-	if !at.IsRobot {
-		t.Fatal("OneBot conversion did not mark a mentioned QQ bot UIN")
-	}
-}
-
 func TestLegacyAtParsePopulatesRobotInfo(t *testing.T) {
 	_, at := AtParse("[CQ:at,qq=3889000000].r 1d6", "QQ")
 	if len(at) != 1 || !at[0].IsRobot {

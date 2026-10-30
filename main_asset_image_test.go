@@ -76,11 +76,3 @@ func TestAssetImageHandler_FileNotExistInData(t *testing.T) {
 		t.Fatalf("expected 404 for nonexistent file, got %d", code)
 	}
 }
-
-// TestAssetImageConstant_MaxSize 锁定 main 包常量 onebotAssetMaxSize 与 dice 包一致。
-func TestAssetImageConstant_MaxSize(t *testing.T) {
-	if onebotAssetMaxSize != dice.OnebotAssetMaxSize {
-		t.Errorf("onebotAssetMaxSize=%d != dice.OnebotAssetMaxSize=%d",
-			onebotAssetMaxSize, dice.OnebotAssetMaxSize)
-	}
-}

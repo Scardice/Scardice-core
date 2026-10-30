@@ -2,13 +2,14 @@ package dice
 
 import (
 	"errors"
-	"github.com/dop251/goja"
-	"github.com/dop251/goja_nodejs/eventloop"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/dop251/goja"
+	"github.com/dop251/goja_nodejs/eventloop"
 
 	"Scardice-core/utils/jsengine"
 	gojaengine "Scardice-core/utils/jsengine/goja"
@@ -133,7 +134,7 @@ func TestJsFsReplayDoesNotTouchDisk(t *testing.T) {
 	loop := startFsTestLoop(t)
 	engineLoop := gojaengine.WrapEventLoop(loop)
 	executionContext := &jsExecutionContext{
-		Plugin:           &ExtInfo{Name: "fsReplay"},
+		Plugin:            &ExtInfo{Name: "fsReplay"},
 		CompatibilityMode: JSCompatibilityReplay,
 	}
 	err := jsengine.RunWithContext(engineLoop, executionContext, func(runtime jsengine.Runtime) error {

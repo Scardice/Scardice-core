@@ -22,5 +22,5 @@ func (o RuntimeOptions) PayloadFor(id EngineID) json.RawMessage {
 // Provider describes and opens one JavaScript runtime implementation.
 type Provider interface {
 	Descriptor() Descriptor
-	Open(context.Context, RuntimeOptions) (Loop, error)
+	Open(ctx context.Context, options RuntimeOptions) (Loop, error)
 }

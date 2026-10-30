@@ -24,9 +24,7 @@ enum {
 
 typedef struct sc_native_descriptor {
     uint32_t abi_major;
-    uint32_t abi_minor;
     uint32_t host_abi_major;
-    uint32_t host_abi_minor;
     uint64_t capabilities;
     char id[256];
     char name[256];
@@ -36,9 +34,8 @@ typedef struct sc_native_descriptor {
 
 /* The identity is an integer owned by C. It is never a Go pointer. */
 int sc_native_open(const char *path, uint64_t *out_library, char *error, uint64_t capacity);
-int sc_native_query(uint64_t library, uint32_t runtime_major, uint32_t runtime_minor,
-                    uint32_t host_major, uint32_t host_minor,
-                    sc_native_descriptor *out, char *error, uint64_t capacity);
+int sc_native_query(uint64_t library, sc_native_descriptor *out, char *error,
+                    uint64_t capacity);
 int sc_native_create(uint64_t library, uint64_t host_ctx, const char *options, uint64_t options_len,
                      uint64_t *out_runtime, char *error, uint64_t capacity);
 int sc_native_start(uint64_t library, uint64_t runtime, char *error, uint64_t capacity);

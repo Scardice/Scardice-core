@@ -8,6 +8,11 @@
 #define SC_HOST_ABI_MAJOR 1u
 #define SC_HOST_ABI_MINOR 1u
 
+/*
+ * Runtime ABI remains v1. Host ABI minor 1 appends struct-size-gated
+ * HostRef proxy retain/release callbacks.
+ */
+
 #define SC_RUNTIME_EXTENSION_CONTEXT_V1 "scardice.runtime.context.v1"
 #define SC_RUNTIME_EXTENSION_CONTEXT_ABI_MAJOR 1u
 #define SC_RUNTIME_EXTENSION_CONTEXT_ABI_MINOR 0u
@@ -257,6 +262,11 @@ typedef struct sc_runtime_api_v1 {
     sc_status_t (SC_CALL *value_to_i64)(sc_runtime_t, sc_value_t, int64_t *);
     sc_status_t (SC_CALL *value_to_u64)(sc_runtime_t, sc_value_t, uint64_t *);
     sc_status_t (SC_CALL *value_to_f64)(sc_runtime_t, sc_value_t, double *);
+    /*
+     * required is the exact UTF-8 byte length, without a terminator.
+     * An empty value succeeds with a null buffer. Otherwise an undersized
+     * or null buffer returns SC_EINVAL and sets required.
+     */
     sc_status_t (SC_CALL *value_to_utf8_copy)(
         sc_runtime_t,
         sc_value_t,
@@ -294,6 +304,10 @@ typedef struct sc_runtime_api_v1 {
         char *buffer,
         uint64_t capacity,
         uint64_t *required);
+    /*
+     * Optional v1 runtime-service tail. Consumers gate these fields by
+     * capabilities and struct_size.
+     */
     sc_status_t (SC_CALL *service_event)(
         sc_runtime_t runtime,
         const sc_service_event_v1 *event);
@@ -347,8 +361,8 @@ typedef struct sc_host_api_v1 {
         uint64_t capacity,
         uint64_t *required);
     /*
-     * Current development ABI. The paired host table contains the complete
-     * synchronous and asynchronous service surface.
+     * Optional v1 host-service tail. Providers gate these fields by
+     * capabilities and struct_size.
      */
     sc_status_t (SC_CALL *service_call)(
         sc_host_ctx_t,
@@ -366,12 +380,29 @@ typedef struct sc_host_api_v1 {
         sc_host_ctx_t,
         sc_runtime_t,
         sc_service_request_t request);
+    /*
+     * Host ABI 1.1: each provider-side JavaScript HostRef proxy retains once
+     * and releases when finalized. Method functions report their owning
+     * HostRef so providers can keep it live while the function is reachable.
+     */
+    sc_status_t (SC_CALL *host_ref_retain)(
+        sc_host_ctx_t,
+        sc_runtime_t,
+        sc_host_ref_t);
+    sc_status_t (SC_CALL *host_ref_release)(
+        sc_host_ctx_t,
+        sc_runtime_t,
+        sc_host_ref_t);
+    /* Returns 0 when the host function has no owning HostRef. */
+    sc_status_t (SC_CALL *host_function_owner)(
+        sc_host_ctx_t,
+        sc_runtime_t,
+        sc_host_func_t,
+        sc_host_ref_t *out_owner);
 } sc_host_api_v1;
 
 /*
- * extension_count and extensions are optional tail fields. Hosts accept the
- * original table through sc_runtime_api_v1 and treat a missing extension tail
- * as an empty table.
+ * Optional v1 plugin extension tail. Hosts gate these fields by struct_size.
  */
 typedef struct sc_runtime_plugin_v1 {
     uint32_t struct_size;

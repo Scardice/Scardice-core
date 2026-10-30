@@ -46,8 +46,8 @@ func newNativeFetchService(d *Dice, loop jsengine.Loop) *nativeFetchService {
 			return jsNetworkAuthorizeWithContext(d, jsOpaqueExecutionContext(request.Context().Value(jsExecutionContextKey{})), request.URL.String())
 		},
 	}
-	if d != nil && d.Config.JsConfig.QuickJSMaxFetchConcurrent != 0 {
-		service.semaphore = make(chan struct{}, d.Config.JsConfig.QuickJSMaxFetchConcurrent)
+	if d != nil && d.Config.QuickJSMaxFetchConcurrent != 0 {
+		service.semaphore = make(chan struct{}, d.Config.QuickJSMaxFetchConcurrent)
 	}
 	return service
 }
@@ -189,7 +189,7 @@ func (s *nativeFetchService) execute(ctx context.Context, request nativeFetchReq
 		return nativeFetchErrorResponse(ctx, err)
 	}
 	defer response.Body.Close()
-	data, err := readNativeFetchBody(response.Body, s.dice.Config.JsConfig.QuickJSMaxFetchResponseMiB)
+	data, err := readNativeFetchBody(response.Body, s.dice.Config.QuickJSMaxFetchResponseMiB)
 	if err != nil {
 		return nativeFetchErrorResponse(ctx, err)
 	}

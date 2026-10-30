@@ -182,8 +182,8 @@ func RegisterBuiltinExtFun(self *Dice) {
 			_isPersonal := cmdArgs.GetKwarg("my")
 			isPersonal := ctx.MessageType == "private" || _isPersonal != nil
 
-			playerAttrs := lo.Must(ctx.Dice.AttrsManager.LoadById(ctx.Player.UserID))
-			groupAttrs := lo.Must(ctx.Dice.AttrsManager.LoadById(ctx.Group.GroupID))
+			playerAttrs := lo.Must(ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Player.UserID))
+			groupAttrs := lo.Must(ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Group.GroupID))
 			subCmd := cmdArgs.GetArgN(1)
 
 		subParse:
@@ -193,7 +193,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 			case "del", "rm":
 				name := cmdArgs.GetArgN(2)
 				key := "$g:alias:" + name
-				m := lo.Must(ctx.Dice.AttrsManager.LoadById(ctx.Group.GroupID))
+				m := lo.Must(ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Group.GroupID))
 				VarSetValueStr(ctx, "$t指令来源", "群")
 				if isPersonal {
 					key = "$m:alias:" + name
@@ -333,7 +333,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 			}
 
 			if msg.MessageType == "group" {
-				groupAttrs := lo.Must(ctx.Dice.AttrsManager.LoadById(ctx.Group.GroupID))
+				groupAttrs := lo.Must(ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Group.GroupID))
 				cmdValue, ok := groupAttrs.LoadX("$g:alias:" + name)
 				if ok {
 					if cmdValue != nil && cmdValue.TypeId == ds.VMTypeString {
@@ -359,7 +359,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 				}
 			}
 
-			playerAttrs := lo.Must(ctx.Dice.AttrsManager.LoadById(ctx.Player.UserID))
+			playerAttrs := lo.Must(ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Player.UserID))
 			cmdValue, ok := playerAttrs.LoadX("$m:alias:" + name)
 			if ok {
 				if cmdValue != nil && cmdValue.TypeId == ds.VMTypeString {
@@ -445,6 +445,8 @@ func RegisterBuiltinExtFun(self *Dice) {
 				if self.Config.MailEnable {
 					if err := ctx.Dice.SendMail(cmdArgs.CleanArgs, MailTypeSendNote, NoticeTypeSend); err != nil {
 						ctx.Dice.Logger.Errorf("留言邮件发送失败: %v", err)
+						ReplyToSender(ctx, msg, "留言邮件发送失败，请稍后再试。")
+						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:留言_已记录"))
 					return CmdExecuteResult{Matched: true, Solved: true}
@@ -954,7 +956,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 		ShortHelp: helpWW,
 		Help:      "骰池(WOD/无限规则骰点):\n" + helpWW,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
-			groupAttrs := lo.Must(ctx.Dice.AttrsManager.LoadById(ctx.Group.GroupID))
+			groupAttrs := lo.Must(ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Group.GroupID))
 			switch cmdArgs.GetArgN(1) {
 			case "help":
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}

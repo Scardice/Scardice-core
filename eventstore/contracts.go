@@ -129,6 +129,12 @@ type StreamID struct {
 	AggregateID   string
 }
 
+// StreamHead is the current version of one aggregate stream.
+type StreamHead struct {
+	Stream  StreamID
+	Version uint64
+}
+
 // NewEvent is an already-decided event. Payload is kept as exact JSON bytes.
 type NewEvent struct {
 	EventType     string
@@ -285,10 +291,27 @@ func ComputeEventChecksum(event Envelope) EventChecksum {
 	return checksum
 }
 
+// verifyEnvelopeChecksum preserves the checksum's nil-versus-empty payload
+// marker when a SQL driver reports a zero-length BLOB as nil.
+func verifyEnvelopeChecksum(event Envelope) (Envelope, error) {
+	if ComputeEventChecksum(event) == event.Checksum {
+		return event, nil
+	}
+	if event.Payload == nil {
+		event.Payload = []byte{}
+		if ComputeEventChecksum(event) == event.Checksum {
+			return event, nil
+		}
+	}
+	return Envelope{}, ErrChecksumMismatch
+}
+
 // writeCanonicalField is the one scalar encoding used by checksums. A marker
 // value of zero is null; one is non-null. Non-null values, including empty
 // strings/byte slices, retain a zero length rather than becoming null.
-func writeCanonicalField(h interface{ Write([]byte) (int, error) }, typeTag byte, isNull bool, value []byte) {
+func writeCanonicalField(h interface {
+	Write(data []byte) (int, error)
+}, typeTag byte, isNull bool, value []byte) {
 	marker := byte(1)
 	if isNull {
 		marker = 0
@@ -301,31 +324,43 @@ func writeCanonicalField(h interface{ Write([]byte) (int, error) }, typeTag byte
 	_, _ = h.Write(value)
 }
 
-func writeCanonicalString(h interface{ Write([]byte) (int, error) }, value string) {
+func writeCanonicalString(h interface {
+	Write(data []byte) (int, error)
+}, value string) {
 	writeCanonicalField(h, 's', false, []byte(value))
 }
 
-func writeCanonicalOptionalString(h interface{ Write([]byte) (int, error) }, value string) {
+func writeCanonicalOptionalString(h interface {
+	Write(data []byte) (int, error)
+}, value string) {
 	writeCanonicalField(h, 's', value == "", []byte(value))
 }
 
-func writeCanonicalBytes(h interface{ Write([]byte) (int, error) }, value []byte, isNull bool) {
+func writeCanonicalBytes(h interface {
+	Write(data []byte) (int, error)
+}, value []byte, isNull bool) {
 	writeCanonicalField(h, 'b', isNull, value)
 }
 
-func writeCanonicalUint16(h interface{ Write([]byte) (int, error) }, value uint16) {
+func writeCanonicalUint16(h interface {
+	Write(data []byte) (int, error)
+}, value uint16) {
 	var encoded [2]byte
 	binary.BigEndian.PutUint16(encoded[:], value)
 	writeCanonicalField(h, 'h', false, encoded[:])
 }
 
-func writeCanonicalUint64(h interface{ Write([]byte) (int, error) }, value uint64) {
+func writeCanonicalUint64(h interface {
+	Write(data []byte) (int, error)
+}, value uint64) {
 	var encoded [8]byte
 	binary.BigEndian.PutUint64(encoded[:], value)
 	writeCanonicalField(h, 'u', false, encoded[:])
 }
 
-func writeCanonicalInt64(h interface{ Write([]byte) (int, error) }, value int64) {
+func writeCanonicalInt64(h interface {
+	Write(data []byte) (int, error)
+}, value int64) {
 	var encoded [8]byte
 	binary.BigEndian.PutUint64(encoded[:], uint64(value))
 	writeCanonicalField(h, 'i', false, encoded[:])
@@ -349,6 +384,8 @@ type UnitOfWork struct {
 	SecretUpdates   []SecretUpdate
 	PluginKVUpdates []PluginKVUpdate
 	FenceUpdates    []SubjectFenceUpdate
+	LogUpdates      []LogUpdate
+	LogImports      []StoryLogImportRecord
 }
 
 // CommitResult reports allocated event positions and participant versions.
@@ -370,8 +407,8 @@ type CommitResult struct {
 
 // Store is intentionally limited to aggregate event operations.
 type Store interface {
-	Commit(context.Context, UnitOfWork) (CommitResult, error)
-	Load(context.Context, StreamID, uint64) ([]Envelope, error)
+	Commit(ctx context.Context, work UnitOfWork) (CommitResult, error)
+	Load(ctx context.Context, stream StreamID, afterVersion uint64) ([]Envelope, error)
 	Close() error
 }
 
@@ -545,7 +582,7 @@ type SubjectFenceUpdate struct {
 // ValidateUnitOfWork performs pre-transaction validation and never includes
 // payload content in errors.
 func ValidateUnitOfWork(work UnitOfWork) error {
-	if len(work.Streams) == 0 && len(work.Operations) == 0 && len(work.InboxUpdates) == 0 && len(work.Effects) == 0 && len(work.ArtifactUpdates) == 0 && len(work.SecretUpdates) == 0 && len(work.PluginKVUpdates) == 0 && len(work.FenceUpdates) == 0 {
+	if len(work.Streams) == 0 && len(work.Operations) == 0 && len(work.InboxUpdates) == 0 && len(work.Effects) == 0 && len(work.ArtifactUpdates) == 0 && len(work.SecretUpdates) == 0 && len(work.PluginKVUpdates) == 0 && len(work.FenceUpdates) == 0 && len(work.LogUpdates) == 0 && len(work.LogImports) == 0 {
 		return ErrEmptyUnitOfWork
 	}
 	if len(work.Streams) > MaxUnitOfWorkStreams {
@@ -569,17 +606,17 @@ func ValidateUnitOfWork(work UnitOfWork) error {
 			addBytes(part)
 		}
 	}
-	for _, append := range work.Streams {
-		if append.Stream.AggregateType == "" || append.Stream.AggregateID == "" {
+	for _, streamAppend := range work.Streams {
+		if streamAppend.Stream.AggregateType == "" || streamAppend.Stream.AggregateID == "" {
 			return ErrInvalidEvent
 		}
-		if _, exists := seen[append.Stream]; exists {
+		if _, exists := seen[streamAppend.Stream]; exists {
 			return ErrDuplicateStream
 		}
-		seen[append.Stream] = struct{}{}
-		addFields(len(append.Stream.AggregateType), len(append.Stream.AggregateID))
-		eventCount += len(append.Events)
-		for _, event := range append.Events {
+		seen[streamAppend.Stream] = struct{}{}
+		addFields(len(streamAppend.Stream.AggregateType), len(streamAppend.Stream.AggregateID))
+		eventCount += len(streamAppend.Events)
+		for _, event := range streamAppend.Events {
 			if event.EventType == "" || event.SchemaVersion == 0 {
 				return ErrInvalidEvent
 			}
@@ -616,6 +653,34 @@ func ValidateUnitOfWork(work UnitOfWork) error {
 	}
 	for _, update := range work.FenceUpdates {
 		addFields(len(update.SubjectKey), len(update.Scope), len(update.PurgeOperationID))
+	}
+	if err := validateStoryLogUpdates(work.LogUpdates); err != nil {
+		return err
+	}
+	for _, update := range work.LogUpdates {
+		addFields(len(update.Kind), len(update.DiceID), len(update.GroupID), len(update.Name), len(update.RawMsgID), len(update.EffectID), len(update.UploadURL),
+			len(update.Entry.Message), len(update.Entry.Nickname), len(update.Entry.IMUserID), len(update.Entry.RawMsgID),
+			len(update.Entry.UniformID), len(update.Entry.CommandInfo), len(update.Intent.EffectID), len(update.Intent.Entry.Message),
+			len(update.Intent.Entry.Nickname), len(update.Intent.Entry.IMUserID), len(update.Intent.Entry.RawMsgID), len(update.Intent.Entry.CommandInfo))
+	}
+	if err := validateStoryLogImports(work.LogImports); err != nil {
+		return err
+	}
+	for _, record := range work.LogImports {
+		addFields(len(record.SourceID), len(record.Kind), len(record.DiceID), len(record.GroupID), len(record.SessionSourceID))
+		if record.Session != nil {
+			addFields(len(record.Session.Name), len(record.Session.UploadURL))
+			if record.Session.Extra != nil {
+				addBytes(len(*record.Session.Extra))
+			}
+		}
+		if record.Entry != nil {
+			addFields(len(record.Entry.LogName), len(record.Entry.Nickname), len(record.Entry.IMUserID), len(record.Entry.Message),
+				len(record.Entry.CommandInfo), len(record.Entry.RawMsgID), len(record.Entry.UniformID))
+		}
+		if record.State != nil {
+			addFields(len(record.State.Name))
+		}
 	}
 	if encodedBytes > MaxUnitOfWorkBytes {
 		actual := int(encodedBytes)
@@ -805,8 +870,8 @@ type ArtifactResult struct {
 	ConsumedAt       time.Time
 }
 type PayloadCodec interface {
-	Encrypt(context.Context, []byte) ([]byte, []byte, string, error)
-	Decrypt(context.Context, []byte, []byte, string) ([]byte, error)
+	Encrypt(ctx context.Context, plaintext []byte) ([]byte, []byte, string, error)
+	Decrypt(ctx context.Context, ciphertext, nonce []byte, keyID string) ([]byte, error)
 }
 type ArtifactCodec = PayloadCodec
 
@@ -825,6 +890,14 @@ type InboxClaimRequest struct {
 	TerminalizeExpired            bool
 	RecoverExpiredCallbackStarted bool
 }
+type InboxRenewRequest struct {
+	InboxID       string
+	WorkerID      string
+	LeaseEpoch    uint64
+	AttemptID     string
+	LeaseDuration time.Duration
+}
+
 type InboxLease struct{ Update InboxUpdate }
 
 type OutboxClaimRequest struct {
@@ -862,6 +935,9 @@ type Readiness struct {
 	EncryptionRootIDs          []string
 	SourceManifestDigest       []byte
 	TargetManifestDigest       []byte
+	SemanticManifest           []byte
+	ProjectionManifest         []byte
+	ProjectionManifestDigest   []byte
 	TerminalGlobalPosition     uint64
 	TerminalProjectionPosition uint64
 	freshInitialized           bool
@@ -876,10 +952,10 @@ type EncryptionRoot struct {
 // KeySource supplies a stable installation index root and versioned encryption roots.
 // Implementations may wrap a KMS, HSM, or owner-only local key files.
 type KeySource interface {
-	IndexRootID(context.Context) (string, error)
-	IndexRootMaterial(context.Context) ([]byte, error)
-	CurrentEncryptionRoot(context.Context) (EncryptionRoot, error)
-	EncryptionRoot(context.Context, string) ([]byte, error)
+	IndexRootID(ctx context.Context) (string, error)
+	IndexRootMaterial(ctx context.Context) ([]byte, error)
+	CurrentEncryptionRoot(ctx context.Context) (EncryptionRoot, error)
+	EncryptionRoot(ctx context.Context, id string) ([]byte, error)
 }
 
 type SecretPutRequest struct {
@@ -889,6 +965,11 @@ type SecretPutRequest struct {
 	SecretVersion   uint64
 	ExpectedVersion uint64
 	Plaintext       []byte
+}
+
+type SecretLookup struct {
+	SecretRef     string
+	SecretVersion uint64
 }
 
 type PluginKVPutRequest struct {
@@ -930,6 +1011,11 @@ type PrivacyCounts struct {
 	GroupRecord int64 `json:"groupRecord"`
 	Players     int64 `json:"players"`
 	Attrs       int64 `json:"attrs"`
+	LogSessions int64 `json:"logSessions"`
+	LogStates   int64 `json:"logStates"`
+	LogEntries  int64 `json:"logEntries"`
+	LogIntents  int64 `json:"logIntents"`
+	LogImports  int64 `json:"logImports"`
 }
 
 type PrivacyDryRunRequest struct {
@@ -996,80 +1082,101 @@ type SecretResolution struct {
 
 // Separate narrow repository contracts deliberately keep Store aggregate-only.
 type InboxRepository interface {
-	AcceptInbox(context.Context, InboxUpdate) (CommitResult, error)
-	ClaimInbox(context.Context, InboxClaimRequest) (InboxLease, error)
-	UpdateInbox(context.Context, InboxUpdate) (CommitResult, error)
-	ResolveInbox(context.Context, InboxResolutionRequest) (CommitResult, error)
+	AcceptInbox(ctx context.Context, update InboxUpdate) (CommitResult, error)
+	ClaimInbox(ctx context.Context, request InboxClaimRequest) (InboxLease, error)
+	RenewInbox(ctx context.Context, request InboxRenewRequest) (InboxLease, error)
+	UpdateInbox(ctx context.Context, update InboxUpdate) (CommitResult, error)
+	ResolveInbox(ctx context.Context, request InboxResolutionRequest) (CommitResult, error)
 }
 type OutboxRepository interface {
-	AcceptOutbox(context.Context, NewEffect) (CommitResult, error)
-	ClaimOutbox(context.Context, OutboxClaimRequest) (OutboxLease, error)
-	UpdateOutbox(context.Context, NewEffect) (CommitResult, error)
-	RequeuePreDispatch(context.Context, OutboxPreDispatchRequeueRequest) (CommitResult, error)
-	RenewOutbox(context.Context, OutboxRenewRequest) (OutboxLease, error)
-	MarkOutboxDispatched(context.Context, OutboxDispatchRequest) (OutboxLease, error)
-	CompleteOutbox(context.Context, OutboxCompletionRequest) (CommitResult, error)
-	ResolveOutbox(context.Context, OutboxResolutionRequest) (CommitResult, error)
+	AcceptOutbox(ctx context.Context, effect NewEffect) (CommitResult, error)
+	ClaimOutbox(ctx context.Context, request OutboxClaimRequest) (OutboxLease, error)
+	UpdateOutbox(ctx context.Context, effect NewEffect) (CommitResult, error)
+	RequeuePreDispatch(ctx context.Context, request OutboxPreDispatchRequeueRequest) (CommitResult, error)
+	RenewOutbox(ctx context.Context, request OutboxRenewRequest) (OutboxLease, error)
+	MarkOutboxDispatched(ctx context.Context, request OutboxDispatchRequest) (OutboxLease, error)
+	CompleteOutbox(ctx context.Context, request OutboxCompletionRequest) (CommitResult, error)
+	ResolveOutbox(ctx context.Context, request OutboxResolutionRequest) (CommitResult, error)
 }
 type OutboxQuarantineRepository interface {
-	QuarantineOutbox(context.Context, OutboxQuarantineRequest) (CommitResult, error)
+	QuarantineOutbox(ctx context.Context, request OutboxQuarantineRequest) (CommitResult, error)
 }
 type ArtifactRepository interface {
-	PutArtifact(context.Context, ArtifactPutRequest) (ArtifactPutResult, error)
-	ConsumeArtifact(context.Context, ArtifactConsumeRequest) (ArtifactResult, error)
+	PutArtifact(ctx context.Context, request ArtifactPutRequest) (ArtifactPutResult, error)
+	ConsumeArtifact(ctx context.Context, request ArtifactConsumeRequest) (ArtifactResult, error)
 }
 type OperationRepository interface {
-	GetOperation(context.Context, string) (OperationView, error)
+	GetOperation(ctx context.Context, operationID string) (OperationView, error)
 }
 type ReadinessRepository interface {
-	GetReadiness(context.Context) (Readiness, error)
-	SetReadiness(context.Context, Readiness) error
+	GetReadiness(ctx context.Context) (Readiness, error)
+	SetReadiness(ctx context.Context, readiness Readiness) error
+}
+
+type ReadinessMetadataRepository interface {
+	GetReadinessMetadata(ctx context.Context) (Readiness, error)
 }
 
 // PrivacyHistoryRepository is the narrow durable seam used by the privacy
 // orchestration service. Selectors and cursors are interpreted only by the
 // implementation; callers never receive database handles.
 type PrivacyHistoryRepository interface {
-	PrivacyDryRun(context.Context, PrivacyDryRunRequest) (PrivacyDryRunResult, error)
-	PrivacyCreateOperation(context.Context, string, []byte, PrivacyOperationContext) error
-	PrivacyLoadOperation(context.Context, string) (OperationView, PrivacyOperationContext, error)
-	PrivacyUpdateOperation(context.Context, string, uint64, PrivacyOperationContext, string) (uint64, error)
-	PrivacyFence(context.Context, []byte, string, string) (uint64, error)
-	PrivacyFenceVersion(context.Context, []byte, string) (uint64, error)
-	PrivacyUnfence(context.Context, []byte, string, uint64, string) error
-	PrivacyResolvePending(context.Context, []byte, string) error
-	PrivacyDeleteBatch(context.Context, PrivacyBatchRequest) (PrivacyBatchResult, error)
-	PrivacyRebuildPublish(context.Context, uint64) error
-	PrivacyScrubOperation(context.Context, string, uint64) error
+	PrivacyDryRun(ctx context.Context, request PrivacyDryRunRequest) (PrivacyDryRunResult, error)
+	PrivacyCreateOperation(ctx context.Context, operationID string, subjectKey []byte, private PrivacyOperationContext) error
+	PrivacyLoadOperation(ctx context.Context, operationID string) (OperationView, PrivacyOperationContext, error)
+	PrivacyUpdateOperation(ctx context.Context, operationID string, expectedVersion uint64, private PrivacyOperationContext, status string) (uint64, error)
+	PrivacyFence(ctx context.Context, subjectKey []byte, scope, operationID string) (uint64, error)
+	PrivacyFenceVersion(ctx context.Context, subjectKey []byte, scope string) (uint64, error)
+	PrivacyUnfence(ctx context.Context, subjectKey []byte, scope string, expectedVersion uint64, operationID string) error
+	PrivacyResolvePending(ctx context.Context, subjectKey []byte, operationID string) error
+	PrivacyDeleteBatch(ctx context.Context, request PrivacyBatchRequest) (PrivacyBatchResult, error)
+	PrivacyRebuildPublish(ctx context.Context, targetHighWater uint64) error
+	PrivacyScrubOperation(ctx context.Context, operationID string, expectedVersion uint64) error
 }
 
 // PrivacyFinalizer atomically marks an operation complete and scrubs its
 // private context after the subject fence has been released.
 type PrivacyFinalizer interface {
-	PrivacyFinalizeOperation(context.Context, string, uint64, string) (uint64, error)
+	PrivacyFinalizeOperation(ctx context.Context, operationID string, expectedVersion uint64, status string) (uint64, error)
 }
+
+// PrivacySubjectKeyResolver returns the installation-keyed identity used by
+// group privacy fences. The key is opaque and must not be persisted in payloads.
+type PrivacySubjectKeyResolver interface {
+	PrivacySubjectKey(ctx context.Context, groupID string) ([]byte, error)
+}
+
 type PrivacySubjectVerifier interface {
-	PrivacyVerifyOperationSubject(context.Context, string, string) error
+	PrivacyVerifyOperationSubject(ctx context.Context, operationID, groupID string) error
 }
 type ProjectionRebuilder interface {
-	Rebuild(context.Context, RebuildRequest) (RebuildResult, error)
+	Rebuild(ctx context.Context, request RebuildRequest) (RebuildResult, error)
 }
 type PrivacyPurger interface {
-	Purge(context.Context, PrivacyPurgeRequest) (PrivacyPurgeResult, error)
+	Purge(ctx context.Context, request PrivacyPurgeRequest) (PrivacyPurgeResult, error)
 }
 type SecretResolver interface {
-	ResolveSecret(context.Context, string, uint64) (SecretResolution, error)
+	ResolveSecret(ctx context.Context, secretRef string, version uint64) (SecretResolution, error)
+}
+
+type SecretBatchResolver interface {
+	ResolveSecrets(ctx context.Context, lookups []SecretLookup) ([]SecretResolution, error)
+}
+
+// SecretOwnerResolver resolves endpoint secrets only after filtering by owner.
+type SecretOwnerResolver interface {
+	ResolveSecretForOwner(ctx context.Context, endpointID, adapterID, secretRef string, version uint64) (SecretResolution, error)
 }
 type SecretRepository interface {
-	PutSecret(context.Context, SecretPutRequest) (SecretResolution, error)
-	ResolveSecret(context.Context, string, uint64) (SecretResolution, error)
+	PutSecret(ctx context.Context, request SecretPutRequest) (SecretResolution, error)
+	ResolveSecret(ctx context.Context, secretRef string, version uint64) (SecretResolution, error)
 }
 type PluginKVRepository interface {
-	GetPluginKV(context.Context, string, string) (PluginKVItem, error)
-	SetPluginKV(context.Context, PluginKVPutRequest) (PluginKVItem, error)
-	DeletePluginKV(context.Context, string, string, uint64) error
-	ListPluginKV(context.Context, PluginKVListRequest) ([]PluginKVItem, error)
+	GetPluginKV(ctx context.Context, extension, key string) (PluginKVItem, error)
+	SetPluginKV(ctx context.Context, request PluginKVPutRequest) (PluginKVItem, error)
+	DeletePluginKV(ctx context.Context, extension, key string, expectedVersion uint64) error
+	ListPluginKV(ctx context.Context, request PluginKVListRequest) ([]PluginKVItem, error)
 }
 type EncryptionRotator interface {
-	RotateEncryptionRoots(context.Context) (EncryptionRotationResult, error)
+	RotateEncryptionRoots(ctx context.Context) (EncryptionRotationResult, error)
 }

@@ -2,10 +2,8 @@ package configstate
 
 import (
 	"bytes"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"math"
 	"reflect"
@@ -147,20 +145,23 @@ type BanConfig struct {
 	JointScorePercentOfInviter  float64 `json:"jointScorePercentOfInviter"`
 }
 type JSConfig struct {
-	JsEnable                       bool   `json:"jsEnable"`
-	JsEngine                       string `json:"jsEngine,omitempty"`
-	QuickJSMemoryLimitMiB          uint64 `json:"quickJSMemoryLimitMiB"`
-	QuickJSGCThresholdMiB          uint64 `json:"quickJSGCThresholdMiB"`
-	QuickJSMaxStackSizeKiB         uint64 `json:"quickJSMaxStackSizeKiB"`
-	QuickJSExecuteTimeoutSeconds   uint64 `json:"quickJSExecuteTimeoutSeconds"`
-	QuickJSMaxFetchConcurrent      uint64 `json:"quickJSMaxFetchConcurrent"`
-	QuickJSMaxFetchResponseMiB     uint64 `json:"quickJSMaxFetchResponseMiB"`
-	QuickJSMaxWebSocketConnections uint64 `json:"quickJSMaxWebSocketConnections"`
-	QuickJSMaxWebSocketMessageMiB  uint64 `json:"quickJSMaxWebSocketMessageMiB"`
-	QuickJSMaxFilesystemReadMiB    uint64 `json:"quickJSMaxFilesystemReadMiB"`
-	QuickJSMaxFilesystemWriteMiB   uint64 `json:"quickJSMaxFilesystemWriteMiB"`
-	QuickJSMaxPBKDF2Iterations     uint64 `json:"quickJSMaxPBKDF2Iterations"`
-	QuickJSMaxPBKDF2OutputBytes    uint64 `json:"quickJSMaxPBKDF2OutputBytes"`
+	JsEnable                       bool                       `json:"jsEnable"`
+	JsEngine                       string                     `json:"jsEngine,omitempty"`
+	JsRuntimeOptions               map[string]json.RawMessage `json:"jsRuntimeOptions,omitempty"`
+	JsRuntimeRoutes                map[string]string          `json:"jsRuntimeRoutes,omitempty"`
+	DisabledJsScripts              map[string]bool            `json:"disabledJsScripts,omitempty"`
+	QuickJSMemoryLimitMiB          uint64                     `json:"quickJSMemoryLimitMiB"`
+	QuickJSGCThresholdMiB          uint64                     `json:"quickJSGCThresholdMiB"`
+	QuickJSMaxStackSizeKiB         uint64                     `json:"quickJSMaxStackSizeKiB"`
+	QuickJSExecuteTimeoutSeconds   uint64                     `json:"quickJSExecuteTimeoutSeconds"`
+	QuickJSMaxFetchConcurrent      uint64                     `json:"quickJSMaxFetchConcurrent"`
+	QuickJSMaxFetchResponseMiB     uint64                     `json:"quickJSMaxFetchResponseMiB"`
+	QuickJSMaxWebSocketConnections uint64                     `json:"quickJSMaxWebSocketConnections"`
+	QuickJSMaxWebSocketMessageMiB  uint64                     `json:"quickJSMaxWebSocketMessageMiB"`
+	QuickJSMaxFilesystemReadMiB    uint64                     `json:"quickJSMaxFilesystemReadMiB"`
+	QuickJSMaxFilesystemWriteMiB   uint64                     `json:"quickJSMaxFilesystemWriteMiB"`
+	QuickJSMaxPBKDF2Iterations     uint64                     `json:"quickJSMaxPBKDF2Iterations"`
+	QuickJSMaxPBKDF2OutputBytes    uint64                     `json:"quickJSMaxPBKDF2OutputBytes"`
 }
 type StoryLogConfig struct {
 	LogSizeNoticeEnable bool `json:"logSizeNoticeEnable"`
@@ -176,12 +177,13 @@ type NewsConfig struct {
 	NewsMark string `json:"newsMark,omitempty"`
 }
 type PublicDiceConfig struct {
-	Enable bool   `json:"enable"`
-	ID     string `json:"id,omitempty"`
-	Name   string `json:"name,omitempty"`
-	Brief  string `json:"brief,omitempty"`
-	Note   string `json:"note,omitempty"`
-	Avatar string `json:"avatar,omitempty"`
+	Enable      bool     `json:"enable"`
+	ID          string   `json:"id,omitempty"`
+	Name        string   `json:"name,omitempty"`
+	Brief       string   `json:"brief,omitempty"`
+	Note        string   `json:"note,omitempty"`
+	Avatar      string   `json:"avatar,omitempty"`
+	EndpointIDs []string `json:"endpointIds,omitempty"`
 }
 type CensorConfig struct {
 	Enable        bool             `json:"enable"`
@@ -269,7 +271,9 @@ func (e ExtensionChangedV1) configApply(s *State) error {
 	return setGroup(s, func() { s.Extension = e.ExtensionConfig })
 }
 func (e BanChangedV1) configApply(s *State) error { return setGroup(s, func() { s.Ban = e.BanConfig }) }
-func (e JSChangedV1) configApply(s *State) error  { return setGroup(s, func() { s.JS = e.JSConfig }) }
+func (e JSChangedV1) configApply(s *State) error {
+	return setGroup(s, func() { s.JS = cloneJSConfig(e.JSConfig) })
+}
 func (e StoryLogChangedV1) configApply(s *State) error {
 	return setGroup(s, func() { s.StoryLog = e.StoryLogConfig })
 }
@@ -280,7 +284,7 @@ func (e NewsChangedV1) configApply(s *State) error {
 	return setGroup(s, func() { s.News = e.NewsConfig })
 }
 func (e PublicDiceChangedV1) configApply(s *State) error {
-	return setGroup(s, func() { s.PublicDice = e.PublicDiceConfig })
+	return setGroup(s, func() { s.PublicDice = clonePublicDiceConfig(e.PublicDiceConfig) })
 }
 func (e CensorChangedV1) configApply(s *State) error {
 	return setGroup(s, func() { s.Censor = cloneCensorConfig(e.CensorConfig) })
@@ -365,6 +369,12 @@ func (e JSChangedV1) configValidate() error {
 	if e.JsEngine != "" && !validID(e.JsEngine) {
 		return ErrInvalidCommand
 	}
+	for extensionID, runtimeID := range e.JsRuntimeRoutes {
+		if !validID(extensionID) || strings.TrimSpace(extensionID) != extensionID ||
+			!validID(runtimeID) || strings.TrimSpace(runtimeID) != runtimeID {
+			return ErrInvalidCommand
+		}
+	}
 	return nil
 }
 func (e StoryLogChangedV1) configValidate() error {
@@ -438,6 +448,52 @@ func containsJSONNull(value any) bool {
 	}
 	return false
 }
+func containsConfigEventJSONNull(value any, typ EventType) bool {
+	if typ != EventConfigJSChanged {
+		return containsJSONNull(value)
+	}
+	fields, ok := value.(map[string]any)
+	if !ok {
+		return containsJSONNull(value)
+	}
+	for key, field := range fields {
+		if strings.EqualFold(key, "jsRuntimeOptions") {
+			providers, ok := field.(map[string]any)
+			if !ok {
+				return true
+			}
+			for _, payload := range providers {
+				if payload == nil {
+					return true
+				}
+			}
+			continue
+		}
+		if containsJSONNull(field) {
+			return true
+		}
+	}
+	return false
+}
+func containsConfigProjectionJSONNull(value any) bool {
+	fields, ok := value.(map[string]any)
+	if !ok {
+		return containsJSONNull(value)
+	}
+	for key, field := range fields {
+		if strings.EqualFold(key, "js") {
+			if containsConfigEventJSONNull(field, EventConfigJSChanged) {
+				return true
+			}
+			continue
+		}
+		if containsJSONNull(field) {
+			return true
+		}
+	}
+	return false
+}
+
 func DecodeTypedEvent(typ EventType, payload []byte) (TypedEvent, error) {
 	if len(payload) > eventstore.MaxEventPayloadBytes {
 		return nil, &eventstore.OversizeError{Bound: "config event payload", Limit: eventstore.MaxEventPayloadBytes, Actual: len(payload)}
@@ -446,7 +502,7 @@ func DecodeTypedEvent(typ EventType, payload []byte) (TypedEvent, error) {
 	if json.Unmarshal(payload, &raw) != nil {
 		return nil, ErrInvalidEvent
 	}
-	if _, ok := raw.(map[string]any); !ok || containsJSONNull(raw) {
+	if _, ok := raw.(map[string]any); !ok || containsConfigEventJSONNull(raw, typ) {
 		return nil, ErrInvalidEvent
 	}
 	var event TypedEvent
@@ -567,11 +623,6 @@ func isNilEvent(e TypedEvent) bool {
 	v := reflect.ValueOf(e)
 	return (v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface) && v.IsNil()
 }
-func digestPayload(payload []byte) string {
-	sum := eventstore.ComputeEventChecksum(eventstore.Envelope{Payload: payload})
-	return hex.EncodeToString(sum[:])
-}
-func fmtEventType(e EventType) error { return fmt.Errorf("%w: %s", ErrInvalidEvent, e) }
 
 // Constructors keep event allocation explicit at command boundaries and mirror
 // the other core aggregate packages.
@@ -584,14 +635,14 @@ func NewExtensionChangedV1(value ExtensionConfig) ExtensionChangedV1 {
 	return ExtensionChangedV1{ExtensionConfig: value}
 }
 func NewBanChangedV1(value BanConfig) BanChangedV1 { return BanChangedV1{BanConfig: value} }
-func NewJSChangedV1(value JSConfig) JSChangedV1    { return JSChangedV1{JSConfig: value} }
+func NewJSChangedV1(value JSConfig) JSChangedV1    { return JSChangedV1{JSConfig: cloneJSConfig(value)} }
 func NewStoryLogChangedV1(value StoryLogConfig) StoryLogChangedV1 {
 	return StoryLogChangedV1{StoryLogConfig: value}
 }
 func NewMailChangedV1(value MailConfig) MailChangedV1 { return MailChangedV1{MailConfig: value} }
 func NewNewsChangedV1(value NewsConfig) NewsChangedV1 { return NewsChangedV1{NewsConfig: value} }
 func NewPublicDiceChangedV1(value PublicDiceConfig) PublicDiceChangedV1 {
-	return PublicDiceChangedV1{PublicDiceConfig: value}
+	return PublicDiceChangedV1{PublicDiceConfig: clonePublicDiceConfig(value)}
 }
 func NewCensorChangedV1(value CensorConfig) CensorChangedV1 {
 	return CensorChangedV1{CensorConfig: cloneCensorConfig(value)}

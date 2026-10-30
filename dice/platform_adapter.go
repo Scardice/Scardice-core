@@ -1,11 +1,11 @@
 package dice
 
-import "Scardice-core/message"
+import (
+	"Scardice-core/adapterapi"
+	"Scardice-core/message"
+)
 
 type PlatformAdapter interface {
-	Serve() int
-	DoRelogin() bool
-	SetEnable(enable bool)
 	QuitGroup(ctx *MsgContext, ID string)
 
 	SendToPerson(ctx *MsgContext, userID string, text string, flag string)
@@ -15,8 +15,9 @@ type PlatformAdapter interface {
 	SendSegmentToGroup(ctx *MsgContext, groupID string, msg []message.IMessageElement, flag string)
 	SendSegmentToPerson(ctx *MsgContext, userID string, msg []message.IMessageElement, flag string)
 
-	SendFileToPerson(ctx *MsgContext, userID string, path string, flag string)
-	SendFileToGroup(ctx *MsgContext, groupID string, path string, flag string)
+	// EffectSucceeded requires synchronous provider acceptance, not recipient delivery. Fire-and-forget adapters return EffectAmbiguous; unsupported adapters return EffectUnsupported.
+	SendFileToPerson(ctx *MsgContext, userID string, path string, flag string) adapterapi.EffectResult
+	SendFileToGroup(ctx *MsgContext, groupID string, path string, flag string) adapterapi.EffectResult
 
 	MemberBan(groupID string, userID string, duration int64)
 	MemberKick(groupID string, userID string)
@@ -36,21 +37,11 @@ type PlatformAdapter interface {
 // 实现检查
 var (
 	_ PlatformAdapter = (*PlatformAdapterGocq)(nil)
-	_ PlatformAdapter = (*PlatformAdapterDiscord)(nil)
-	_ PlatformAdapter = (*PlatformAdapterDingTalk)(nil)
-	_ PlatformAdapter = (*PlatformAdapterDodo)(nil)
 	_ PlatformAdapter = (*PlatformAdapterHTTP)(nil)
-	_ PlatformAdapter = (*PlatformAdapterKook)(nil)
-	_ PlatformAdapter = (*PlatformAdapterMinecraft)(nil)
 	_ PlatformAdapter = (*PlatformAdapterOfficialQQ)(nil)
-	_ PlatformAdapter = (*PlatformAdapterRed)(nil)
-	_ PlatformAdapter = (*PlatformAdapterSealChat)(nil)
-	_ PlatformAdapter = (*PlatformAdapterSlack)(nil)
-	_ PlatformAdapter = (*PlatformAdapterTelegram)(nil)
 	_ PlatformAdapter = (*PlatformAdapterWalleQ)(nil)
 	_ PlatformAdapter = (*PlatformAdapterSatori)(nil)
 	_ PlatformAdapter = (*PlatformAdapterMilky)(nil)
-	_ PlatformAdapter = (*PlatformAdapterOnebot)(nil)
 
 	// _ PlatformAdapter = (*PlatformAdapterLagrangeGo)(nil)
 )

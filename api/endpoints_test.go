@@ -13,6 +13,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"Scardice-core/adapterapi"
+	"Scardice-core/dice"
 	"Scardice-core/endpoint"
 	"Scardice-core/eventstore"
 )
@@ -31,20 +32,29 @@ func (endpointAPIDescriptor) ValidateConfig(_ context.Context, raw json.RawMessa
 func (endpointAPIDescriptor) SupportedActions(adapterapi.ValidatedConfig) adapterapi.ActionSet {
 	return adapterapi.ActionSet(0).With(adapterapi.ActionKindRequestQRCode)
 }
+func (endpointAPIDescriptor) Capabilities(adapterapi.ValidatedConfig) adapterapi.CapabilitySet {
+	return adapterapi.CapabilityLifecycle | adapterapi.CapabilityActions
+}
 func (endpointAPIDescriptor) NewRuntime(adapterapi.RuntimeInit) (adapterapi.AdapterRuntime, error) {
 	return nil, errors.New("runtime construction is not used by API tests")
 }
 
-type endpointAPITestCodec struct{}
+type endpointAPITestKeySource struct{}
 
-func (endpointAPITestCodec) Encrypt(_ context.Context, plaintext []byte) ([]byte, []byte, string, error) {
-	return append([]byte("sealed:"), plaintext...), []byte("nonce"), "test-key", nil
+func (endpointAPITestKeySource) IndexRootID(context.Context) (string, error) {
+	return "api-test-index-v1", nil
 }
-func (endpointAPITestCodec) Decrypt(_ context.Context, ciphertext, _ []byte, _ string) ([]byte, error) {
-	if !strings.HasPrefix(string(ciphertext), "sealed:") {
-		return nil, errors.New("invalid ciphertext")
+func (endpointAPITestKeySource) IndexRootMaterial(context.Context) ([]byte, error) {
+	return []byte("01234567890123456789012345678901"), nil
+}
+func (endpointAPITestKeySource) CurrentEncryptionRoot(context.Context) (eventstore.EncryptionRoot, error) {
+	return eventstore.EncryptionRoot{ID: "api-test-root-v1", Material: []byte("abcdefghijklmnopqrstuvwxyz123456")}, nil
+}
+func (endpointAPITestKeySource) EncryptionRoot(_ context.Context, id string) ([]byte, error) {
+	if id != "api-test-root-v1" {
+		return nil, eventstore.ErrKeyUnavailable
 	}
-	return append([]byte(nil), ciphertext[len("sealed:"):]...), nil
+	return []byte("abcdefghijklmnopqrstuvwxyz123456"), nil
 }
 
 type endpointAPIActionExecutor struct{}
@@ -56,16 +66,54 @@ func (endpointAPIActionExecutor) ExecuteAction(context.Context, adapterapi.Actio
 	}, nil
 }
 
+type endpointAPITestApplication struct {
+	service  *endpoint.Service
+	executor endpoint.ActionExecutor
+}
+
+func (a *endpointAPITestApplication) endpointService() *endpoint.Service {
+	return a.service
+}
+
+func (a *endpointAPITestApplication) Execute(ctx context.Context, command endpoint.Command) (endpoint.Result, error) {
+	return a.service.Execute(ctx, command)
+}
+
+func (a *endpointAPITestApplication) ExecuteAction(ctx context.Context, request adapterapi.ActionRequest) (adapterapi.ActionResult, error) {
+	if a.executor == nil {
+		return adapterapi.ActionResult{}, errors.New("endpoint action executor is unavailable")
+	}
+	return a.executor.ExecuteAction(ctx, request)
+}
+
+func setEndpointAPIActionExecutor(executor endpoint.ActionExecutor) {
+	endpointServiceState.Lock()
+	defer endpointServiceState.Unlock()
+	application, ok := endpointServiceState.application.(*endpointAPITestApplication)
+	if !ok {
+		panic("endpoint API test application is not registered")
+	}
+	application.executor = executor
+}
+
 func newEndpointAPITestService(t *testing.T) (*endpoint.Service, *eventstore.Database) {
 	t.Helper()
-	db, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "endpoint-api.db")})
+	db, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{
+		Type:             "sqlite",
+		DSN:              filepath.Join(t.TempDir(), "endpoint-api.db"),
+		KeySource:        endpointAPITestKeySource{},
+		DatabaseIdentity: "endpoint-api-test",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := eventstore.NewStore(db, eventstore.WithPayloadCodec(endpointAPITestCodec{}))
-	service := endpoint.NewService(store, map[adapterapi.AdapterKey]adapterapi.Descriptor{
-		adapterapi.AdapterKey("fake"): endpointAPIDescriptor{},
-	})
+	store := eventstore.NewStore(db)
+	registry := endpoint.NewRegistry()
+	if err := registry.Register(endpointAPIDescriptor{}); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	service := endpoint.NewService(store, registry)
 	if service.InitError != nil {
 		db.Close()
 		t.Fatal(service.InitError)
@@ -73,28 +121,65 @@ func newEndpointAPITestService(t *testing.T) (*endpoint.Service, *eventstore.Dat
 	return service, db
 }
 
+const endpointAPITestSessionToken = "api-test-ui-session"
+
 func setupEndpointAPITest(t *testing.T) *endpoint.Service {
 	t.Helper()
+	t.Setenv("SCARDICE_ADMIN_TOKEN", "api-test-secret")
+	t.Setenv("SCARDICE_ADMIN_PRINCIPAL_ID", "api-test-principal")
+	t.Setenv("SCARDICE_ADMIN_ORIGINS", "")
+	ResetAdminAuthForTests()
+
 	service, db := newEndpointAPITestService(t)
-	RegisterEndpointService(service)
-	RegisterEndpointActionExecutor(nil)
-	if err := ConfigureAdminAuth("api-test-principal", "api-test-secret", nil); err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
+	registerEndpointApplication(&endpointAPITestApplication{service: service})
+	previousDice, previousManager := myDice, dm
+	manager := &dice.DiceManager{}
+	manager.AccessTokens.Store(endpointAPITestSessionToken, true)
+	myDice = &dice.Dice{Parent: manager, DiceMasters: []string{"QQ:master-user"}}
+	dm = manager
 	t.Cleanup(func() {
-		RegisterEndpointActionExecutor(nil)
-		RegisterEndpointService(nil)
+		registerEndpointApplication(nil)
+		myDice = previousDice
+		dm = previousManager
 		ResetAdminAuthForTests()
 		_ = db.Close()
 	})
 	return service
 }
 
+func TestCommandSecretsForUpdatePreservesUnchangedReferences(t *testing.T) {
+	current := adapterapi.ValidatedConfig{SecretRefs: []adapterapi.SecretRef{{Ref: "token", Version: 1}}}
+	next := adapterapi.ValidatedConfig{SecretRefs: []adapterapi.SecretRef{{Ref: "token", Version: 1}}}
+	inputs, err := commandSecretsForUpdate(next, current, nil)
+	if err != nil {
+		t.Fatalf("unchanged secret refs rejected: %v", err)
+	}
+	if inputs != nil {
+		t.Fatalf("unchanged secret refs unexpectedly produced secret inputs: %#v", inputs)
+	}
+
+	changed := adapterapi.ValidatedConfig{SecretRefs: []adapterapi.SecretRef{{Ref: "new-token", Version: 1}}}
+	if _, err := commandSecretsForUpdate(changed, current, nil); !errors.Is(err, endpoint.ErrInvalidConfig) {
+		t.Fatalf("changed secret refs error = %v, want invalid config", err)
+	}
+}
+
+func TestRegisterEndpointBootstrapNilClearsApplicationState(t *testing.T) {
+	RegisterEndpointBootstrap(&endpoint.Bootstrap{Service: &endpoint.Service{}, Supervisor: endpoint.NewSupervisor(nil)})
+	RegisterEndpointBootstrap(nil)
+	if endpointService() != nil || endpointActionExecutor() != nil {
+		t.Fatal("bootstrap unregister retained endpoint application state")
+	}
+	if _, err := endpointExecute(context.Background(), endpoint.Command{}); err == nil {
+		t.Fatal("endpoint command used stale service after bootstrap unregister")
+	}
+}
+
 func endpointAPIContext(method, path, body string) (echo.Context, *httptest.ResponseRecorder) {
 	e := echo.New()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
-	req.Header.Set(echo.HeaderAuthorization, "Bearer api-test-secret")
+	req.Header.Set(echo.HeaderAuthorization, "Bearer "+endpointAPITestSessionToken)
+	req.Header.Set("Token", endpointAPITestSessionToken)
 	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
 	req.RemoteAddr = "127.0.0.1:34001"
 	rec := httptest.NewRecorder()
@@ -130,6 +215,8 @@ func endpointAPIJSON(t *testing.T, rec *httptest.ResponseRecorder) ErrorResponse
 
 func TestEndpointCreateIdempotencyAndStrictAuth(t *testing.T) {
 	setupEndpointAPITest(t)
+	const renewedSessionToken = "api-test-ui-session-renewed"
+	myDice.Parent.AccessTokens.Store(renewedSessionToken, true)
 	body := `{"adapterKey":"fake","config":{"version":1,"payload":{"channel":"test"}}}`
 	ctx, rec := endpointAPIContext(http.MethodPost, "/sd-api/endpoints", body)
 	ctx.Request().Header.Set("Idempotency-Key", "create-key")
@@ -151,6 +238,8 @@ func TestEndpointCreateIdempotencyAndStrictAuth(t *testing.T) {
 	}
 
 	replayCtx, replayRec := endpointAPIContext(http.MethodPost, "/sd-api/endpoints", body)
+	replayCtx.Request().Header.Set(echo.HeaderAuthorization, "Bearer "+renewedSessionToken)
+	replayCtx.Request().Header.Set("Token", renewedSessionToken)
 	replayCtx.Request().Header.Set("Idempotency-Key", "create-key")
 	if err := endpointCreate(replayCtx); err != nil {
 		t.Fatal(err)
@@ -189,6 +278,32 @@ func TestEndpointCreateIdempotencyAndStrictAuth(t *testing.T) {
 		t.Fatalf("duplicate auth status=%d body=%s", duplicateRec.Code, duplicateRec.Body.String())
 	}
 }
+func TestEndpointAPIUsesWebUISessionAndNotMasterRole(t *testing.T) {
+	setupEndpointAPITest(t)
+
+	sessionCtx, sessionRec := endpointAPIContext(http.MethodGet, "/sd-api/endpoints", "")
+	if err := endpointList(sessionCtx); err != nil {
+		t.Fatal(err)
+	}
+	if sessionRec.Code != http.StatusOK {
+		t.Fatalf("authenticated UI session status=%d body=%s", sessionRec.Code, sessionRec.Body.String())
+	}
+
+	masterCtx, masterRec := endpointAPIContext(http.MethodGet, "/sd-api/endpoints", "")
+	masterCtx.Request().Header.Set(echo.HeaderAuthorization, "Bearer QQ:master-user")
+	_ = endpointList(masterCtx)
+	if masterRec.Code != http.StatusUnauthorized {
+		t.Fatalf("Master without a UI session status=%d body=%s", masterRec.Code, masterRec.Body.String())
+	}
+
+	legacyCtx, legacyRec := endpointAPIContext(http.MethodGet, "/sd-api/endpoints", "")
+	legacyCtx.Request().Header.Set(echo.HeaderAuthorization, "Bearer api-test-secret")
+	_ = endpointList(legacyCtx)
+	if legacyRec.Code != http.StatusUnauthorized {
+		t.Fatalf("standalone admin token status=%d body=%s", legacyRec.Code, legacyRec.Body.String())
+	}
+}
+
 func TestEndpointOperationResolveConfirmedSuccess(t *testing.T) {
 	service := setupEndpointAPITest(t)
 	createBody := `{"adapterKey":"fake","config":{"version":1,"payload":{"channel":"resolve"}}}`
@@ -222,6 +337,7 @@ func TestEndpointOperationResolveConfirmedSuccess(t *testing.T) {
 		EndpointID:      adapterapi.EndpointID(created.Endpoint.EndpointID),
 		OperationID:     enabled.Endpoint.OperationID,
 		Generation:      enabled.Endpoint.Generation,
+		DesiredVersion:  enabled.Endpoint.DesiredVersion,
 		CommandID:       "resolve-ambiguous-complete",
 		CorrelationID:   "resolve-ambiguous-correlation",
 		PrincipalID:     "api-test-principal",
@@ -331,7 +447,7 @@ func TestEndpointAPIActionAndArtifactAreOwnedAndOneTime(t *testing.T) {
 	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
 		t.Fatal(err)
 	}
-	RegisterEndpointActionExecutor(endpointAPIActionExecutor{})
+	setEndpointAPIActionExecutor(endpointAPIActionExecutor{})
 	version := created.Endpoint.Version
 	actionBody := EndpointActionRequest{ExpectedAggregateVersion: &version, IdempotencyKey: "qr-action"}
 	rawAction, _ := json.Marshal(actionBody)
@@ -368,5 +484,180 @@ func TestEndpointAPIActionAndArtifactAreOwnedAndOneTime(t *testing.T) {
 	}
 	if secondRec.Code != http.StatusGone || endpointAPIJSON(t, secondRec).Code != "artifact_gone" {
 		t.Fatalf("second artifact status=%d body=%s", secondRec.Code, secondRec.Body.String())
+	}
+}
+func TestEndpointListOmitsDeletedEndpointsAndPreservesTombstoneReads(t *testing.T) {
+	service := setupEndpointAPITest(t)
+	e := echo.New()
+	e.GET("/sd-api/endpoints", endpointList)
+	listServer := httptest.NewServer(e)
+	t.Cleanup(listServer.Close)
+	readEndpointList := func() []EndpointView {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, listServer.URL+"/sd-api/endpoints", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set(echo.HeaderAuthorization, "Bearer "+endpointAPITestSessionToken)
+		req.Header.Set("Token", endpointAPITestSessionToken)
+		resp, err := listServer.Client().Do(req)
+		if err != nil {
+			t.Fatalf("GET endpoint list over TCP: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET endpoint list over TCP status=%d", resp.StatusCode)
+		}
+		var views []EndpointView
+		if err := json.NewDecoder(resp.Body).Decode(&views); err != nil {
+			t.Fatal(err)
+		}
+		return views
+	}
+
+	createEndpoint := func(channel, idempotencyKey string) EndpointView {
+		t.Helper()
+		body := `{"adapterKey":"fake","config":{"version":1,"payload":{"channel":"` + channel + `"}}}`
+		ctx, rec := endpointAPIContext(http.MethodPost, "/sd-api/endpoints", body)
+		ctx.Request().Header.Set("Idempotency-Key", idempotencyKey)
+		if err := endpointCreate(ctx); err != nil || rec.Code != http.StatusAccepted {
+			t.Fatalf("create endpoint err=%v status=%d body=%s", err, rec.Code, rec.Body.String())
+		}
+		var response MutationResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Endpoint == nil {
+			t.Fatalf("create response has no endpoint: %#v", response)
+		}
+		return *response.Endpoint
+	}
+	complete := func(view EndpointView, commandID string, observed adapterapi.ObservedState) {
+		t.Helper()
+		if _, err := service.Complete(context.Background(), endpoint.Command{
+			CommandID:       commandID,
+			CorrelationID:   commandID,
+			OperationID:     view.OperationID,
+			EndpointID:      adapterapi.EndpointID(view.EndpointID),
+			Generation:      view.Generation,
+			DesiredVersion:  view.DesiredVersion,
+			PrincipalID:     "api-test-principal",
+			CompletionState: endpoint.OperationStateSucceeded,
+			ObservedState:   observed,
+		}); err != nil {
+			t.Fatalf("complete endpoint %s operation: %v", view.EndpointID, err)
+		}
+	}
+	currentVersion := func(id string) uint64 {
+		t.Helper()
+		view, err := service.Get(context.Background(), adapterapi.EndpointID(id))
+		if err != nil {
+			t.Fatalf("get endpoint %s aggregate version: %v", id, err)
+		}
+		return view.Version
+	}
+
+	lifecycleMutation := func(path, key string, version uint64, confirm bool, handler func(echo.Context) error) MutationResponse {
+		t.Helper()
+		body, err := json.Marshal(EndpointCommandRequest{
+			ExpectedAggregateVersion: &version,
+			IdempotencyKey:           key,
+			Confirm:                  confirm,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, rec := endpointAPIContext(http.MethodPost, path, string(body))
+		ctx.Request().Header.Set("Idempotency-Key", key)
+		if err := handler(ctx); err != nil || rec.Code != http.StatusAccepted {
+			t.Fatalf("lifecycle mutation %s err=%v status=%d body=%s", path, err, rec.Code, rec.Body.String())
+		}
+		var response MutationResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Endpoint == nil {
+			t.Fatalf("lifecycle mutation %s has no endpoint: %#v", path, response)
+		}
+		return response
+	}
+
+	deleted := createEndpoint("deleted", "deleted-create")
+	survivor := createEndpoint("survivor", "survivor-create")
+	enabled := lifecycleMutation("/sd-api/endpoints/"+survivor.EndpointID+"/enable", "survivor-enable", survivor.Version, false, endpointEnable)
+	complete(*enabled.Endpoint, "survivor-enable-complete", adapterapi.ObservedStateConnected)
+
+	enabledForDelete := lifecycleMutation("/sd-api/endpoints/"+deleted.EndpointID+"/enable", "deleted-enable", deleted.Version, false, endpointEnable)
+	complete(*enabledForDelete.Endpoint, "deleted-enable-complete", adapterapi.ObservedStateConnected)
+	disabled := lifecycleMutation("/sd-api/endpoints/"+deleted.EndpointID+"/disable", "deleted-disable", currentVersion(deleted.EndpointID), false, endpointDisable)
+	complete(*disabled.Endpoint, "deleted-disable-complete", adapterapi.ObservedStateStopped)
+	removing := lifecycleMutation("/sd-api/endpoints/"+deleted.EndpointID, "deleted-remove", currentVersion(deleted.EndpointID), true, endpointDelete)
+	if removing.Endpoint.DesiredState != string(endpoint.DesiredStateRemoving) || removing.Endpoint.OperationState != string(endpoint.OperationStatePending) {
+		t.Fatalf("delete request did not remain in progress: %#v", removing.Endpoint)
+	}
+	pendingList := readEndpointList()
+	pendingDeleteVisible := false
+	for _, view := range pendingList {
+		pendingDeleteVisible = pendingDeleteVisible || (view.EndpointID == deleted.EndpointID && view.DesiredState == string(endpoint.DesiredStateRemoving))
+	}
+	if len(pendingList) != 2 || !pendingDeleteVisible {
+		t.Fatalf("pending deletion missing from active endpoint list: %#v", pendingList)
+	}
+	complete(*removing.Endpoint, "deleted-remove-complete", adapterapi.ObservedStateStopped)
+	if _, err := service.Resolve(context.Background(), endpoint.Command{
+		CommandID:     "deleted-remove-resolve",
+		CorrelationID: "deleted-remove-resolve",
+		OperationID:   removing.Endpoint.OperationID,
+		EndpointID:    adapterapi.EndpointID(deleted.EndpointID),
+		Generation:    removing.Endpoint.Generation,
+		PrincipalID:   "api-test-principal",
+	}); err != nil {
+		t.Fatalf("resolve completed endpoint deletion: %v", err)
+	}
+
+	listed := readEndpointList()
+	if len(listed) != 1 || listed[0].EndpointID != survivor.EndpointID || listed[0].DesiredState != string(endpoint.DesiredStateEnabled) {
+		t.Fatalf("active endpoint list=%#v, want only enabled endpoint %q", listed, survivor.EndpointID)
+	}
+
+	getCtx, getRec := endpointAPIContext(http.MethodGet, "/sd-api/endpoints/"+deleted.EndpointID, "")
+	if err := endpointGet(getCtx); err != nil || getRec.Code != http.StatusOK {
+		t.Fatalf("get deleted endpoint err=%v status=%d body=%s", err, getRec.Code, getRec.Body.String())
+	}
+	var deletedRead EndpointView
+	if err := json.Unmarshal(getRec.Body.Bytes(), &deletedRead); err != nil {
+		t.Fatal(err)
+	}
+	if deletedRead.EndpointID != deleted.EndpointID || deletedRead.DesiredState != string(endpoint.DesiredStateDeleted) || deletedRead.ObservedState != "stopped" || deletedRead.OperationState != string(endpoint.OperationStateIdle) {
+		t.Fatalf("deleted endpoint read=%#v", deletedRead)
+	}
+
+	operationCtx, operationRec := endpointAPIContext(http.MethodGet, "/sd-api/operations/"+removing.OperationID, "")
+	if err := operationGet(operationCtx); err != nil || operationRec.Code != http.StatusOK {
+		t.Fatalf("get deletion operation err=%v status=%d body=%s", err, operationRec.Code, operationRec.Body.String())
+	}
+	var operation OperationView
+	if err := json.Unmarshal(operationRec.Body.Bytes(), &operation); err != nil {
+		t.Fatal(err)
+	}
+	if operation.Status != string(endpoint.OperationStateSucceeded) || operation.Kind != "endpoint.deleted" || operation.ResultCode != "endpoint.deleted" || operation.ResourceID != deleted.EndpointID {
+		t.Fatalf("deletion operation read=%#v", operation)
+	}
+}
+
+func TestEndpointViewDTOPreservesImportedIdentityAndStatistics(t *testing.T) {
+	view := endpointViewDTO(context.Background(), endpoint.EndpointView{
+		EndpointID:  "endpoint-1",
+		DisplayName: "Legacy Bot",
+		ProviderID:  "QQ:12345",
+		AdapterKey:  "fake",
+		Statistics: endpoint.Statistics{
+			GroupCount: 7, CommandCount: 42, LastCommandAt: 12345, OnlineSeconds: 678,
+		},
+	})
+	if view.DisplayName != "Legacy Bot" || view.ProviderID != "QQ:12345" ||
+		view.GroupNum != 7 || view.CmdExecutedNum != 42 ||
+		view.CmdExecutedLastTime != 12345 || view.OnlineTotalTime != 678 {
+		t.Fatalf("endpoint DTO lost identity or statistics: %#v", view)
 	}
 }

@@ -4,6 +4,13 @@
 #include <stddef.h>
 #include <string.h>
 
+_Static_assert(SC_RUNTIME_ABI_MAJOR == 1, "runtime ABI major changed");
+_Static_assert(SC_RUNTIME_ABI_MINOR == 0,
+               "runtime ABI minor is reserved and must remain zero");
+_Static_assert(SC_HOST_ABI_MAJOR == 1, "host ABI major changed");
+_Static_assert(SC_HOST_ABI_MINOR == 1,
+               "host ABI minor must include HostRef proxy lifecycle");
+
 _Static_assert(SC_ENTRY_SCRIPT == 0, "script entry kind changed");
 _Static_assert(SC_ENTRY_COMMONJS == 1, "CommonJS entry kind changed");
 _Static_assert(SC_ENTRY_ESMODULE == 2, "ES module entry kind changed");

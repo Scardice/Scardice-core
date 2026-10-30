@@ -1,6 +1,9 @@
 package jsengine
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
 var ErrUnsupportedEntryKind = errors.New("unsupported JavaScript entry kind")
 
@@ -28,6 +31,49 @@ type ContextKeyer interface {
 	ContextKey() any
 }
 
+// ExecutionScope supplies the lifetime of an invocation without coupling the
+// provider to host types. A nil scope remains a runtime-level task.
+type ExecutionScope interface {
+	ExecutionContext() context.Context
+}
+
+func ContextForExecution(value any) context.Context {
+	if scope, ok := value.(ExecutionScope); ok {
+		if ctx := scope.ExecutionContext(); ctx != nil {
+			return ctx
+		}
+	}
+	return context.Background()
+}
+
+type GuardedExecutionScope interface {
+	ExecutionScope
+	EnterExecution() (func(), error)
+}
+
+// Nested callbacks in the same invocation already own its admission guard.
+func EnterExecution(value, previous any) (func(), error) {
+	if scope, ok := value.(GuardedExecutionScope); ok {
+		if previous != nil && ContextForExecution(previous) == scope.ExecutionContext() {
+			return func() {}, nil
+		}
+		return scope.EnterExecution()
+	}
+	return func() {}, ContextForExecution(value).Err()
+}
+
+var revokedExecutionContext = func() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}()
+
+// RevokedExecutionScope is the tombstone for a retired provider token. Missing
+// invocation metadata must never grant the authority of an unbound task.
+type RevokedExecutionScope struct{}
+
+func (RevokedExecutionScope) ExecutionContext() context.Context { return revokedExecutionContext }
+
 // ContextAwareLoop carries an opaque host execution context across the
 // synchronous callback and engine-owned asynchronous callbacks of one realm.
 // The engine-neutral package never interprets the value.
@@ -38,6 +84,7 @@ type ContextAwareLoop interface {
 	CurrentContext() any
 	LoadEntryWithContext(context any, entry Entry) error
 }
+
 // OwnerAwareLoop reports whether the caller is executing on the loop's owner
 // thread/goroutine. CurrentContext is intentionally not used for this check:
 // providers may expose the last active context to unrelated callers while the
@@ -46,7 +93,6 @@ type OwnerAwareLoop interface {
 	ContextAwareLoop
 	InOwner() bool
 }
-
 
 // LoadEntryWithContext evaluates an entry while retaining its opaque context
 // across engine-owned asynchronous callbacks.
@@ -97,6 +143,7 @@ func CurrentContext(loop Loop) any {
 	}
 	return nil
 }
+
 // InOwner reports owner-thread/goroutine affinity when the provider exposes it.
 // A false result is conservative: callers must use the waiting entry point.
 func InOwner(loop Loop) bool {

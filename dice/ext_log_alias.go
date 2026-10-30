@@ -10,7 +10,6 @@ import (
 	"github.com/cespare/xxhash/v2"
 
 	"Scardice-core/dice/service"
-	engine "Scardice-core/utils/dboperator/engine"
 )
 
 const minLogAliasKeyLength = 8
@@ -27,12 +26,11 @@ type logNameAliasIndex struct {
 	byName  map[string]string
 }
 
-func buildLogNameAliasIndex(operator engine.DatabaseOperator, groupID string) (*logNameAliasIndex, error) {
-	names, err := service.LogGetList(operator, groupID)
+func buildLogNameAliasIndex(repository service.LogRepository, groupID string) (*logNameAliasIndex, error) {
+	names, err := repository.List(groupID)
 	if err != nil {
 		return nil, err
 	}
-
 	entries, err := buildLogNameAliasEntries(names, minLogAliasKeyLength)
 	if err != nil {
 		return nil, err
@@ -118,11 +116,11 @@ func (index *logNameAliasIndex) Resolve(input string) (string, bool) {
 	return "", false
 }
 
-func resolveLogNameForGroup(operator engine.DatabaseOperator, groupID, input string) (string, error) {
+func resolveLogNameForGroup(repository service.LogRepository, groupID, input string) (string, error) {
 	if input == "" {
 		return "", nil
 	}
-	index, err := buildLogNameAliasIndex(operator, groupID)
+	index, err := buildLogNameAliasIndex(repository, groupID)
 	if err != nil {
 		return "", err
 	}

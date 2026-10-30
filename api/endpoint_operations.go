@@ -107,7 +107,7 @@ func operationResolve(c echo.Context) error {
 		}
 		return c.JSON(http.StatusOK, MutationResponse{OperationID: existing.OperationID, Endpoint: endpointDTO})
 	}
-	command := endpoint.Command{CommandID: mutation.commandID, ID: mutation.commandID, CorrelationID: mutation.requestID, OperationID: stored.OperationID, PrincipalID: mutation.principal, RequestID: mutation.requestID, IdempotencyScope: mutation.scope, IdempotencyKey: mutation.key, RequestDigest: mutation.requestDigest, EndpointID: endpointID, ExpectedAggregateVersion: *request.ExpectedAggregateVersion, ExpectedVersion: *request.ExpectedAggregateVersion, ExpectedVersionSet: true, Generation: current.Generation}
+	command := endpoint.Command{CommandID: mutation.commandID, ID: mutation.commandID, CorrelationID: mutation.requestID, OperationID: stored.OperationID, PrincipalID: mutation.principal, RequestID: mutation.requestID, IdempotencyScope: mutation.scope, IdempotencyKey: mutation.key, RequestDigest: mutation.requestDigest, EndpointID: endpointID, ExpectedAggregateVersion: *request.ExpectedAggregateVersion, ExpectedVersion: *request.ExpectedAggregateVersion, ExpectedVersionSet: true, Generation: current.Generation, DesiredVersion: current.DesiredVersion}
 	if resolution == "confirmed-success" {
 		command.Kind = endpoint.CommandComplete
 		command.Type = endpoint.CommandComplete

@@ -145,11 +145,9 @@ func onReady() {
 		case <-mOpenExeDir.ClickedCh:
 			_ = exec.Command(`cmd`, `/c`, `explorer`, filepath.Dir(os.Args[0])).Start()
 		case <-mQuit.ClickedCh:
-			systray.Quit()
 			systrayQuited = true
-			cleanupCreate(theDM, nil)()
-			time.Sleep(3 * time.Second)
-			os.Exit(0)
+			systray.Quit()
+			return
 		case <-mAutoBoot.ClickedCh:
 			if mAutoBoot.Checked() {
 				err := getAutoStart().Disable()

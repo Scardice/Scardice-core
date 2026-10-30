@@ -1,6 +1,7 @@
 package hostbridge
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -10,7 +11,11 @@ import (
 	"sync"
 )
 
-var errorType = reflect.TypeFor[error]()
+var (
+	errorType            = reflect.TypeFor[error]()
+	ErrInvalidSliceIndex = errors.New("invalid slice index")
+	ErrNoPrimitiveValue  = errors.New("host value has no primitive representation")
+)
 
 func (s *Session) BindObject(target any) (HostRef, error) { return s.RegisterObject(target) }
 func (s *Session) ExposeDangerous(target any) (HostRef, error) {
@@ -134,8 +139,10 @@ func (s *Session) Has(ref HostRef, name string) (bool, error) {
 			_, ok = obj.Type().MethodByName(exportedMethod(name))
 			return ok, nil
 		}
+		return false, nil
+	default:
+		return false, nil
 	}
-	return false, nil
 }
 
 func (s *Session) Delete(ref HostRef, name string) (bool, error) {
@@ -214,7 +221,7 @@ func (s *Session) call(ref HostRef, name string, args []Value, codec RuntimeValu
 		return UndefinedValue(), err
 	}
 	if obj.Kind() == reflect.Slice && name == "push" {
-		var n int64 = int64(obj.Len())
+		var n = int64(obj.Len())
 		for _, arg := range args {
 			item, e := s.toGo(arg, obj.Type().Elem(), codec)
 			if e != nil {
@@ -255,7 +262,6 @@ func (s *Session) CallFunctionWithCodec(ref HostFuncRef, args []Value, codec Run
 	return s.callReflect(entry.value, args, "function", codec, false)
 }
 func (s *Session) callReflect(fn reflect.Value, args []Value, label string, codec RuntimeValueCodec, receiver bool) (result Value, err error) {
-
 	defer func() {
 		if p := recover(); p != nil {
 			result = UndefinedValue()
@@ -297,9 +303,6 @@ func (s *Session) callReflect(fn reflect.Value, args []Value, label string, code
 	outs := fn.Call(callInputs)
 	return s.outputs(outs)
 }
-func (s *Session) structField(obj reflect.Value, name string) (reflect.Value, *sync.RWMutex, bool, error) {
-	return s.structFieldMode(obj, name, false)
-}
 func (s *Session) structFieldMode(obj reflect.Value, name string, dangerous bool) (reflect.Value, *sync.RWMutex, bool, error) {
 	for _, def := range reflect.VisibleFields(obj.Elem().Type()) {
 		names := []string{}
@@ -316,14 +319,23 @@ func (s *Session) structFieldMode(obj reflect.Value, name string, dangerous bool
 			if !field.IsValid() {
 				return reflect.Value{}, nil, false, fmt.Errorf("invalid field %q", name)
 			}
-			lock, err := fieldLock(obj, def)
-			return field, lock, true, err
+			lockName := def.Tag.Get("jsbindlock")
+			if lockName == "" {
+				return field, nil, true, nil
+			}
+			method := obj.MethodByName(lockName)
+			if !method.IsValid() || method.Type().NumIn() != 0 || method.Type().NumOut() != 1 {
+				return reflect.Value{}, nil, false, fmt.Errorf("invalid jsbindlock %q on %s", lockName, def.Name)
+			}
+			out := method.Call(nil)[0]
+			lock, ok := out.Interface().(*sync.RWMutex)
+			if !ok || lock == nil {
+				return reflect.Value{}, nil, false, fmt.Errorf("jsbindlock %q on %s must return *sync.RWMutex", lockName, def.Name)
+			}
+			return field, lock, true, nil
 		}
 	}
 	return reflect.Value{}, nil, false, nil
-}
-func argsAreReceiver(args []Value, typ reflect.Type) bool {
-	return len(args) > 0 && args[0].Kind == KindHostObject && typ.Kind() == reflect.Pointer
 }
 func argsToReceiver(v Value, typ reflect.Type, s *Session) reflect.Value {
 	r, err := s.LookupObject(v.Host)
@@ -372,22 +384,6 @@ func (s *Session) outputs(outs []reflect.Value) (Value, error) {
 	return s.toValue(outs[0])
 }
 
-func fieldLock(obj reflect.Value, def reflect.StructField) (*sync.RWMutex, error) {
-	name := def.Tag.Get("jsbindlock")
-	if name == "" {
-		return nil, nil
-	}
-	method := obj.MethodByName(name)
-	if !method.IsValid() || method.Type().NumIn() != 0 || method.Type().NumOut() != 1 {
-		return nil, fmt.Errorf("invalid jsbindlock %q on %s", name, def.Name)
-	}
-	out := method.Call(nil)[0]
-	lock, ok := out.Interface().(*sync.RWMutex)
-	if !ok || lock == nil {
-		return nil, fmt.Errorf("jsbindlock %q on %s must return *sync.RWMutex", name, def.Name)
-	}
-	return lock, nil
-}
 func hostFieldByIndex(value reflect.Value, index []int) reflect.Value {
 	for _, i := range index {
 		for value.Kind() == reflect.Pointer {
@@ -425,10 +421,10 @@ func isIdentifier(name string) bool {
 		return false
 	}
 	for i, c := range name {
-		if i == 0 && !(c == '_' || c == '$' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z') {
+		if i == 0 && (c != '_' && c != '$' && (c < 'A' || c > 'Z') && (c < 'a' || c > 'z')) {
 			return false
 		}
-		if i > 0 && !(c == '_' || c == '$' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9') {
+		if i > 0 && (c != '_' && c != '$' && (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9')) {
 			return false
 		}
 	}
@@ -479,7 +475,7 @@ func (s *Session) toValueMode(v reflect.Value, dangerous bool) (Value, error) {
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 		return UintValue(v.Uint()), nil
 	case reflect.Struct:
-		target := any(v.Interface())
+		target := v.Interface()
 		if v.CanAddr() {
 			target = v.Addr().Interface()
 		}
@@ -489,7 +485,7 @@ func (s *Session) toValueMode(v reflect.Value, dangerous bool) (Value, error) {
 		}
 		return HostObjectValue(ref), nil
 	case reflect.Slice:
-		target := any(v.Interface())
+		target := v.Interface()
 		if v.CanAddr() {
 			target = v.Addr().Interface()
 		}
@@ -513,6 +509,19 @@ func (s *Session) toGo(v Value, target reflect.Type, codec RuntimeValueCodec) (r
 		switch target.Kind() {
 		case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func, reflect.Interface:
 			return reflect.Zero(target), nil
+		default:
+		}
+	}
+	if v.Kind == KindJSON {
+		switch target.Kind() {
+		case reflect.Map, reflect.Slice, reflect.Interface:
+			decoded := reflect.New(target)
+			if err := json.Unmarshal([]byte(v.String), decoded.Interface()); err != nil {
+				return reflect.Value{}, fmt.Errorf("decode JSON snapshot into %s: %w", target, err)
+			}
+			return decoded.Elem(), nil
+		default:
+			return reflect.Value{}, fmt.Errorf("JSON snapshot cannot be assigned to %s", target)
 		}
 	}
 	if target.Kind() == reflect.Interface {
@@ -560,12 +569,12 @@ func (s *Session) toGo(v Value, target reflect.Type, codec RuntimeValueCodec) (r
 	switch target.Kind() {
 	case reflect.Bool:
 		if v.Kind != KindBool {
-			return reflect.Value{}, fmt.Errorf("expected bool")
+			return reflect.Value{}, errors.New("expected bool")
 		}
 		out.SetBool(v.Bool)
 	case reflect.String:
 		if v.Kind != KindString {
-			return reflect.Value{}, fmt.Errorf("expected string")
+			return reflect.Value{}, errors.New("expected string")
 		}
 		out.SetString(v.String)
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
@@ -574,7 +583,7 @@ func (s *Session) toGo(v Value, target reflect.Type, codec RuntimeValueCodec) (r
 		} else if v.Kind == KindUint && v.Uint <= uint64(1)<<(target.Bits()-1)-1 {
 			out.SetInt(int64(v.Uint))
 		} else {
-			return reflect.Value{}, fmt.Errorf("expected integer")
+			return reflect.Value{}, errors.New("expected integer")
 		}
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 		if v.Kind == KindUint {
@@ -582,17 +591,18 @@ func (s *Session) toGo(v Value, target reflect.Type, codec RuntimeValueCodec) (r
 		} else if v.Kind == KindInt && v.Int >= 0 {
 			out.SetUint(uint64(v.Int))
 		} else {
-			return reflect.Value{}, fmt.Errorf("expected unsigned integer")
+			return reflect.Value{}, errors.New("expected unsigned integer")
 		}
 	case reflect.Float32, reflect.Float64:
-		if v.Kind == KindFloat {
+		switch v.Kind {
+		case KindFloat:
 			out.SetFloat(v.Float)
-		} else if v.Kind == KindInt {
+		case KindInt:
 			out.SetFloat(float64(v.Int))
-		} else if v.Kind == KindUint {
+		case KindUint:
 			out.SetFloat(float64(v.Uint))
-		} else {
-			return reflect.Value{}, fmt.Errorf("expected number")
+		default:
+			return reflect.Value{}, errors.New("expected number")
 		}
 	default:
 		return reflect.Value{}, fmt.Errorf("unsupported %s", target)
@@ -612,7 +622,7 @@ func (s *Session) valuePrimitive(v Value) (any, error) {
 	case KindFloat:
 		return v.Float, nil
 	case KindNull, KindUndefined:
-		return nil, nil
+		return nil, ErrNoPrimitiveValue
 	default:
 		return nil, fmt.Errorf("cannot convert kind %d", v.Kind)
 	}
@@ -638,7 +648,10 @@ func (s *Session) sliceGet(ref HostRef, obj reflect.Value, name string, dangerou
 		return HostFunctionValue(function), nil
 	}
 	i, err := strconv.Atoi(name)
-	if err != nil || i < 0 || i >= obj.Len() {
+	if err != nil || i < 0 {
+		return UndefinedValue(), fmt.Errorf("%w %q", ErrInvalidSliceIndex, name)
+	}
+	if i >= obj.Len() {
 		return UndefinedValue(), nil
 	}
 	return s.toValueMode(obj.Index(i), dangerous)

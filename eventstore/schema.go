@@ -4,6 +4,7 @@ import "time"
 
 const (
 	tableDomainEvents        = "domain_events"
+	tableEventTombstones     = "event_tombstones"
 	tableEventGlobalSequence = "event_global_sequence"
 	tableAggregateHeads      = "aggregate_heads"
 	tableProjectionControl   = "projection_control"
@@ -17,14 +18,21 @@ const (
 	tablePluginKV            = "plugin_kv"
 	tableSubjectFences       = "subject_fences"
 	tableStoreReadiness      = "store_readiness"
+	tableManagementActivity  = "management_activities"
+	tableStoryLogSessions    = "story_log_sessions"
+	tableStoryLogStates      = "story_log_states"
+	tableStoryLogEntries     = "story_log_entries"
+	tableStoryLogIntents     = "story_log_outbound_intents"
+	tableStoryLogImports     = "story_log_imports"
 )
 
 var requiredEventStoreTables = []string{
-	tableDomainEvents, tableEventGlobalSequence, tableAggregateHeads,
+	tableDomainEvents, tableEventTombstones, tableEventGlobalSequence, tableAggregateHeads,
 	tableProjectionControl, tableProjectionReadModel, tableOperations,
 	tableOperationArtifacts, tableLaneHeads, tableInboxMessages,
 	tableOutboxEffects, tableAdapterSecrets, tablePluginKV,
-	tableSubjectFences, tableStoreReadiness,
+	tableSubjectFences, tableStoreReadiness, tableManagementActivity,
+	tableStoryLogSessions, tableStoryLogStates, tableStoryLogEntries, tableStoryLogIntents, tableStoryLogImports,
 }
 
 // requiredEventStoreIndexes is keyed as table:index to make the exact table
@@ -40,15 +48,40 @@ var requiredEventStoreIndexes = map[string]bool{
 	tableOperations + ":ux_operations_idempotency":                  true,
 	tableOperationArtifacts + ":ux_operation_artifacts_artifact_id": true,
 	tableLaneHeads + ":pk_lane_heads":                               true,
+	tableLaneHeads + ":ix_lane_heads_action_ready":                  false,
+	tableLaneHeads + ":ix_lane_heads_scheduling_version":            false,
 	tableInboxMessages + ":ux_inbox_endpoint_provider":              true,
 	tableInboxMessages + ":ux_inbox_lane_sequence":                  true,
 	tableInboxMessages + ":ix_inbox_status_lease":                   false,
+	tableInboxMessages + ":ix_inbox_lane_status_ordering":           false,
+	tableInboxMessages + ":ix_inbox_status_payload_expiry":          false,
+	tableInboxMessages + ":ix_inbox_status_payload_present_expiry":  false,
+	tableInboxMessages + ":ix_inbox_scheduling_version":             false,
 	tableOutboxEffects + ":ux_outbox_effect_id":                     true,
 	tableOutboxEffects + ":ux_outbox_lane_sequence":                 true,
 	tableOutboxEffects + ":ix_outbox_status_attempt":                false,
+	tableOutboxEffects + ":ix_outbox_lane_status_ordering":          false,
+	tableOutboxEffects + ":ix_outbox_status_payload_expiry":         false,
+	tableOutboxEffects + ":ix_outbox_status_payload_present_expiry": false,
+	tableOutboxEffects + ":ix_outbox_scheduling_version":            false,
 	tableAdapterSecrets + ":ux_adapter_secret_ref_version":          true,
 	tablePluginKV + ":ux_plugin_extension_key":                      true,
 	tableSubjectFences + ":ux_subject_fence_key_scope":              true,
+	tableManagementActivity + ":ux_management_activities_id":        true,
+	tableManagementActivity + ":ix_management_activities_recent":    false,
+	tableStoryLogSessions + ":ix_story_log_sessions_dice":           false,
+	tableStoryLogSessions + ":ux_story_log_session_scope_name":      true,
+	tableStoryLogSessions + ":ix_story_log_session_owner":           false,
+	tableStoryLogSessions + ":ix_story_log_sessions_updated":        false,
+	tableStoryLogStates + ":ux_story_log_state_scope":               true,
+	tableStoryLogStates + ":ix_story_log_state_owner":               false,
+	tableStoryLogEntries + ":ix_story_log_entries_scope_session":    false,
+	tableStoryLogEntries + ":ix_story_log_entries_raw":              false,
+	tableStoryLogEntries + ":ix_story_log_entries_owner":            false,
+	tableStoryLogIntents + ":ux_story_log_intent_effect":            true,
+	tableStoryLogIntents + ":ix_story_log_intent_owner":             false,
+	tableStoryLogImports + ":ix_story_log_import_owner":             false,
+	tableStoryLogImports + ":ix_story_log_import_dice_identity":     false,
 }
 
 var requiredEventStoreIndexColumns = map[string][]string{
@@ -62,15 +95,41 @@ var requiredEventStoreIndexColumns = map[string][]string{
 	tableOperations + ":ux_operations_idempotency":                  {"principal_id", "idempotency_scope", "idempotency_key"},
 	tableOperationArtifacts + ":ux_operation_artifacts_artifact_id": {"artifact_id"},
 	tableLaneHeads + ":pk_lane_heads":                               {"kind", "lane_hmac"},
+	tableLaneHeads + ":ix_lane_heads_action_ready":                  {"kind", "ready_action", "ready_at", "active_since", "lane_hmac"},
+	tableLaneHeads + ":ix_lane_heads_scheduling_version":            {"scheduling_version", "kind", "lane_hmac"},
 	tableInboxMessages + ":ux_inbox_endpoint_provider":              {"endpoint_id", "provider_event_id"},
 	tableInboxMessages + ":ux_inbox_lane_sequence":                  {"lane_hmac", "ordering_sequence"},
 	tableInboxMessages + ":ix_inbox_status_lease":                   {"status", "lease_expiry"},
+	tableInboxMessages + ":ix_inbox_lane_status_ordering":           {"lane_hmac", "status", "ordering_sequence"},
+	tableInboxMessages + ":ix_inbox_status_payload_expiry":          {"status", "payload_expires_at", "inbox_id"},
+	tableInboxMessages + ":ix_inbox_status_payload_present_expiry":  {"status", "payload_present", "payload_expires_at", "inbox_id"},
+	tableInboxMessages + ":ix_inbox_scheduling_version":             {"scheduling_version", "inbox_id"},
 	tableOutboxEffects + ":ux_outbox_effect_id":                     {"effect_id"},
 	tableOutboxEffects + ":ux_outbox_lane_sequence":                 {"lane_hmac", "ordering_sequence"},
 	tableOutboxEffects + ":ix_outbox_status_attempt":                {"status", "next_attempt_at", "lease_expiry"},
+	tableOutboxEffects + ":ix_outbox_lane_status_ordering":          {"lane_hmac", "status", "ordering_sequence"},
+	tableOutboxEffects + ":ix_outbox_status_payload_expiry":         {"status", "payload_expires_at", "effect_id"},
+	tableOutboxEffects + ":ix_outbox_status_payload_present_expiry": {"status", "payload_present", "payload_expires_at", "effect_id"},
+	tableOutboxEffects + ":ix_outbox_scheduling_version":            {"scheduling_version", "effect_id"},
 	tableAdapterSecrets + ":ux_adapter_secret_ref_version":          {"secret_ref", "secret_version"},
 	tablePluginKV + ":ux_plugin_extension_key":                      {"extension_id", "key_hmac"},
 	tableSubjectFences + ":ux_subject_fence_key_scope":              {"subject_key", "scope"},
+	tableManagementActivity + ":ux_management_activities_id":        {"id"},
+	tableManagementActivity + ":ix_management_activities_recent":    {"occurred_at_unix_milli", "global_position"},
+	tableStoryLogSessions + ":ix_story_log_sessions_dice":           {"dice_hmac"},
+	tableStoryLogSessions + ":ux_story_log_session_scope_name":      {"scope_hmac", "name_hmac"},
+	tableStoryLogSessions + ":ix_story_log_session_owner":           {"owner_hmac", "scope_hmac"},
+	tableStoryLogSessions + ":ix_story_log_sessions_updated":        {"updated_at", "id"},
+	tableStoryLogStates + ":ux_story_log_state_scope":               {"scope_hmac"},
+	tableStoryLogStates + ":ix_story_log_state_owner":               {"owner_hmac"},
+	tableStoryLogEntries + ":ix_story_log_entries_scope_session":    {"scope_hmac", "session_id"},
+	tableStoryLogEntries + ":ix_story_log_entries_raw":              {"scope_hmac", "session_id", "raw_msg_hmac"},
+	tableStoryLogEntries + ":ix_story_log_entries_owner":            {"owner_hmac"},
+	tableStoryLogIntents + ":ux_story_log_intent_effect":            {"effect_id"},
+	tableStoryLogIntents + ":ix_story_log_intent_owner":             {"owner_hmac", "scope_hmac"},
+	tableStoryLogIntents + ":ix_story_log_intent_scope_session":     {"scope_hmac", "session_id"},
+	tableStoryLogImports + ":ix_story_log_import_owner":             {"owner_hmac", "scope_hmac"},
+	tableStoryLogImports + ":ix_story_log_import_dice_identity":     {"dice_hmac", "identity_hmac"},
 }
 
 // Binary fields intentionally use GORM's native []byte mapping: PostgreSQL
@@ -98,6 +157,14 @@ type domainEventRow struct {
 
 func (domainEventRow) TableName() string { return tableDomainEvents }
 
+// A tombstone proves a privacy deletion without retaining the erased identity
+// or payload. Global positions are never reused.
+type eventTombstoneRow struct {
+	GlobalPosition uint64 `gorm:"primaryKey;autoIncrement:false;not null"`
+}
+
+func (eventTombstoneRow) TableName() string { return tableEventTombstones }
+
 type eventGlobalSequenceRow struct {
 	SingletonID  string    `gorm:"column:singleton_id;type:varchar(32);primaryKey"`
 	NextPosition uint64    `gorm:"not null"`
@@ -119,6 +186,7 @@ type projectionControlRow struct {
 	SingletonID         string    `gorm:"column:singleton_id;type:varchar(32);primaryKey"`
 	ActiveGeneration    string    `gorm:"type:varchar(255);not null"`
 	TerminalPosition    uint64    `gorm:"not null"`
+	HistoryRevision     uint64    `gorm:"not null;default:0"`
 	ProjectorSetVersion string    `gorm:"type:varchar(255);not null"`
 	PublicationState    string    `gorm:"type:varchar(32);not null"`
 	UpdatedAt           time.Time `gorm:"not null"`
@@ -131,6 +199,7 @@ type projectionReadModelRow struct {
 	ProjectionName       string `gorm:"type:varchar(255);primaryKey;uniqueIndex:pk_projection_read_models,priority:2"`
 	RowKey               string `gorm:"type:varchar(255);primaryKey;uniqueIndex:pk_projection_read_models,priority:3"`
 	Payload              []byte
+	PayloadPresent       bool      `gorm:"not null;default:false"`
 	UpdatedAt            time.Time `gorm:"not null"`
 }
 
@@ -163,43 +232,63 @@ type operationRow struct {
 
 func (operationRow) TableName() string { return tableOperations }
 
+type managementActivityRow struct {
+	GlobalPosition      uint64 `gorm:"primaryKey;autoIncrement;index:ix_management_activities_recent,priority:2,sort:desc"`
+	ID                  string `gorm:"type:varchar(255);not null;uniqueIndex:ux_management_activities_id"`
+	OccurredAtUnixMilli int64  `gorm:"not null;index:ix_management_activities_recent,priority:1,sort:desc"`
+	Action              string `gorm:"type:varchar(255);not null"`
+	Label               string `gorm:"type:varchar(255);not null"`
+	Resource            string `gorm:"type:varchar(255);not null"`
+	Status              string `gorm:"type:varchar(32);not null"`
+	HTTPStatus          int    `gorm:"not null"`
+	Actor               string `gorm:"type:varchar(255);not null"`
+	SourceIP            string `gorm:"type:varchar(128);not null"`
+}
+
+func (managementActivityRow) TableName() string { return tableManagementActivity }
+
 type operationArtifactRow struct {
-	ArtifactID       string        `gorm:"type:varchar(255);not null;primaryKey;uniqueIndex:ux_operation_artifacts_artifact_id"`
-	Version          uint64        `gorm:"not null"`
-	OperationID      string        `gorm:"type:varchar(255);not null"`
-	OwnerPrincipalID string        `gorm:"type:varchar(255);not null"`
-	MediaType        string        `gorm:"type:varchar(255);not null"`
-	SafeFilename     string        `gorm:"type:varchar(255)"`
-	Size             int64         `gorm:"not null"`
-	Status           string        `gorm:"type:varchar(32);not null"`
-	Operation        *operationRow `gorm:"foreignKey:OperationID;references:OperationID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT;"`
-	Ciphertext       []byte        `gorm:""`
-	Nonce            []byte        `gorm:"size:12"`
-	EncryptionKeyID  string        `gorm:"type:varchar(255)"`
-	PayloadVersion   uint64        `gorm:"not null;default:1"`
-	ExpiresAt        time.Time     `gorm:"not null"`
+	ArtifactID       string    `gorm:"type:varchar(255);not null;primaryKey;uniqueIndex:ux_operation_artifacts_artifact_id"`
+	Version          uint64    `gorm:"not null"`
+	OperationID      string    `gorm:"type:varchar(255);not null"`
+	OwnerPrincipalID string    `gorm:"type:varchar(255);not null"`
+	MediaType        string    `gorm:"type:varchar(255);not null"`
+	SafeFilename     string    `gorm:"type:varchar(255)"`
+	Size             int64     `gorm:"not null"`
+	Status           string    `gorm:"type:varchar(32);not null"`
+	Ciphertext       []byte    `gorm:""`
+	Nonce            []byte    `gorm:"size:12"`
+	EncryptionKeyID  string    `gorm:"type:varchar(255)"`
+	PayloadVersion   uint64    `gorm:"not null;default:1"`
+	ExpiresAt        time.Time `gorm:"not null"`
 	ConsumedAt       *time.Time
 }
 
 func (operationArtifactRow) TableName() string { return tableOperationArtifacts }
 
 type laneHeadRow struct {
-	Kind         string    `gorm:"type:varchar(32);primaryKey;uniqueIndex:pk_lane_heads,priority:1"`
-	LaneHMAC     []byte    `gorm:"column:lane_hmac;size:32;primaryKey;uniqueIndex:pk_lane_heads,priority:2"`
-	NextSequence uint64    `gorm:"not null"`
-	UpdatedAt    time.Time `gorm:"not null"`
+	Kind              string     `gorm:"type:varchar(32);primaryKey;uniqueIndex:pk_lane_heads,priority:1;index:ix_lane_heads_action_ready,priority:1;index:ix_lane_heads_scheduling_version,priority:2"`
+	LaneHMAC          []byte     `gorm:"column:lane_hmac;size:32;primaryKey;uniqueIndex:pk_lane_heads,priority:2;index:ix_lane_heads_action_ready,priority:5;index:ix_lane_heads_scheduling_version,priority:3"`
+	NextSequence      uint64     `gorm:"not null"`
+	ActiveID          string     `gorm:"type:varchar(255);not null;default:''"`
+	ActiveSequence    uint64     `gorm:"not null;default:0"`
+	ActiveSince       *time.Time `gorm:"index:ix_lane_heads_action_ready,priority:4"`
+	ReadyAt           *time.Time `gorm:"index:ix_lane_heads_action_ready,priority:3"`
+	ReadyAction       string     `gorm:"type:varchar(32);not null;default:'';index:ix_lane_heads_action_ready,priority:2"`
+	SchedulingVersion uint8      `gorm:"not null;default:0;index:ix_lane_heads_scheduling_version,priority:1"`
+	UpdatedAt         time.Time  `gorm:"not null"`
 }
 
 func (laneHeadRow) TableName() string { return tableLaneHeads }
 
 type inboxMessageRow struct {
-	InboxID             string     `gorm:"type:varchar(255);primaryKey"`
+	InboxID             string     `gorm:"type:varchar(255);primaryKey;index:ix_inbox_status_payload_expiry,priority:3;index:ix_inbox_status_payload_present_expiry,priority:4;index:ix_inbox_scheduling_version,priority:2"`
 	EndpointID          string     `gorm:"type:varchar(255);not null;uniqueIndex:ux_inbox_endpoint_provider,priority:1"`
 	ProviderEventKey    string     `gorm:"column:provider_event_id;type:varchar(255);not null;uniqueIndex:ux_inbox_endpoint_provider,priority:2"`
-	LaneHMAC            []byte     `gorm:"size:32;not null;uniqueIndex:ux_inbox_lane_sequence,priority:1"`
+	LaneHMAC            []byte     `gorm:"size:32;not null;uniqueIndex:ux_inbox_lane_sequence,priority:1;index:ix_inbox_lane_status_ordering,priority:1"`
 	SubjectKey          []byte     `gorm:"size:32;index:ix_inbox_subject_key"`
-	OrderingSequence    uint64     `gorm:"not null;uniqueIndex:ux_inbox_lane_sequence,priority:2"`
-	Status              string     `gorm:"type:varchar(32);not null;index:ix_inbox_status_lease,priority:1"`
+	OrderingSequence    uint64     `gorm:"not null;uniqueIndex:ux_inbox_lane_sequence,priority:2;index:ix_inbox_lane_status_ordering,priority:3"`
+	Status              string     `gorm:"type:varchar(32);not null;index:ix_inbox_status_lease,priority:1;index:ix_inbox_lane_status_ordering,priority:2;index:ix_inbox_status_payload_expiry,priority:1;index:ix_inbox_status_payload_present_expiry,priority:1"`
 	Version             uint64     `gorm:"not null"`
 	LeaseOwner          string     `gorm:"type:varchar(255)"`
 	LeaseEpoch          uint64     `gorm:"not null"`
@@ -207,31 +296,33 @@ type inboxMessageRow struct {
 	AttemptID           string     `gorm:"type:varchar(255)"`
 	CallbackStartedAt   *time.Time
 	CompletedAt         *time.Time
-	PayloadCiphertext   []byte `gorm:""`
-	PayloadNonce        []byte `gorm:"size:12"`
-	EncryptionKeyID     string `gorm:"type:varchar(255)"`
-	PayloadVersion      uint64 `gorm:"not null;default:1"`
-	ContentDigest       []byte `gorm:"size:32"`
-	PayloadExpiresAt    *time.Time
-	ContentDigestKeyID  string `gorm:"type:varchar(255)"`
-	WorkflowID          string `gorm:"type:varchar(255)"`
-	ResolutionPrincipal string `gorm:"type:varchar(255)"`
-	ResolutionReason    string `gorm:"type:varchar(512)"`
+	PayloadCiphertext   []byte     `gorm:""`
+	PayloadNonce        []byte     `gorm:"size:12"`
+	EncryptionKeyID     string     `gorm:"type:varchar(255)"`
+	PayloadVersion      uint64     `gorm:"not null;default:1"`
+	ContentDigest       []byte     `gorm:"size:32"`
+	PayloadExpiresAt    *time.Time `gorm:"index:ix_inbox_status_payload_expiry,priority:2;index:ix_inbox_status_payload_present_expiry,priority:3"`
+	PayloadPresent      bool       `gorm:"not null;default:false;index:ix_inbox_status_payload_present_expiry,priority:2"`
+	SchedulingVersion   uint8      `gorm:"not null;default:0;index:ix_inbox_scheduling_version,priority:1"`
+	ContentDigestKeyID  string     `gorm:"type:varchar(255)"`
+	WorkflowID          string     `gorm:"type:varchar(255)"`
+	ResolutionPrincipal string     `gorm:"type:varchar(255)"`
+	ResolutionReason    string     `gorm:"type:varchar(512)"`
 	ResolutionAt        *time.Time
 }
 
 func (inboxMessageRow) TableName() string { return tableInboxMessages }
 
 type outboxEffectRow struct {
-	EffectID            string     `gorm:"type:varchar(255);primaryKey;uniqueIndex:ux_outbox_effect_id"`
+	EffectID            string     `gorm:"type:varchar(255);primaryKey;uniqueIndex:ux_outbox_effect_id;index:ix_outbox_status_payload_expiry,priority:3;index:ix_outbox_status_payload_present_expiry,priority:4;index:ix_outbox_scheduling_version,priority:2"`
 	Version             uint64     `gorm:"not null"`
 	EndpointID          string     `gorm:"type:varchar(255);not null"`
-	LaneHMAC            []byte     `gorm:"size:32;not null;uniqueIndex:ux_outbox_lane_sequence,priority:1"`
+	LaneHMAC            []byte     `gorm:"size:32;not null;uniqueIndex:ux_outbox_lane_sequence,priority:1;index:ix_outbox_lane_status_ordering,priority:1"`
 	SubjectKey          []byte     `gorm:"size:32;index:ix_outbox_subject_key"`
-	OrderingSequence    uint64     `gorm:"not null;uniqueIndex:ux_outbox_lane_sequence,priority:2"`
+	OrderingSequence    uint64     `gorm:"not null;uniqueIndex:ux_outbox_lane_sequence,priority:2;index:ix_outbox_lane_status_ordering,priority:3"`
 	EffectClass         string     `gorm:"type:varchar(64);not null"`
 	RiskClass           string     `gorm:"type:varchar(64);not null"`
-	Status              string     `gorm:"type:varchar(32);not null;index:ix_outbox_status_attempt,priority:1"`
+	Status              string     `gorm:"type:varchar(32);not null;index:ix_outbox_status_attempt,priority:1;index:ix_outbox_lane_status_ordering,priority:2;index:ix_outbox_status_payload_expiry,priority:1;index:ix_outbox_status_payload_present_expiry,priority:1"`
 	AttemptID           string     `gorm:"type:varchar(255)"`
 	LeaseOwner          string     `gorm:"type:varchar(255)"`
 	LeaseEpoch          uint64     `gorm:"not null"`
@@ -249,8 +340,10 @@ type outboxEffectRow struct {
 	ResultCode          string     `gorm:"type:varchar(255)"`
 	ProviderMessageID   string     `gorm:"type:varchar(255)"`
 	CompletedAt         *time.Time
-	PayloadExpiresAt    *time.Time
-	CreatedAt           time.Time `gorm:"not null"`
+	PayloadExpiresAt    *time.Time `gorm:"index:ix_outbox_status_payload_expiry,priority:2;index:ix_outbox_status_payload_present_expiry,priority:3"`
+	PayloadPresent      bool       `gorm:"not null;default:false;index:ix_outbox_status_payload_present_expiry,priority:2"`
+	SchedulingVersion   uint8      `gorm:"not null;default:0;index:ix_outbox_scheduling_version,priority:1"`
+	CreatedAt           time.Time  `gorm:"not null"`
 	ScrubbedAt          *time.Time
 	RetryCount          uint32 `gorm:"not null"`
 	ResolutionPrincipal string `gorm:"type:varchar(255)"`
@@ -314,6 +407,9 @@ type storeReadinessRow struct {
 	EncryptionRootIDs          []byte `gorm:"not null"`
 	SourceManifestDigest       []byte `gorm:"size:32"`
 	TargetManifestDigest       []byte `gorm:"size:32"`
+	SemanticManifest           []byte
+	ProjectionManifest         []byte
+	ProjectionManifestDigest   []byte `gorm:"size:32"`
 	TerminalGlobalPosition     uint64 `gorm:"not null"`
 	TerminalProjectionPosition uint64 `gorm:"not null"`
 	FreshInitialized           bool   `gorm:"not null;default:false"`
@@ -328,6 +424,11 @@ type privacyAuditRow struct {
 	GroupRecord     int64     `gorm:"not null"`
 	Players         int64     `gorm:"not null"`
 	Attrs           int64     `gorm:"not null"`
+	LogSessions     int64     `gorm:"not null;default:0"`
+	LogStates       int64     `gorm:"not null;default:0"`
+	LogEntries      int64     `gorm:"not null;default:0"`
+	LogIntents      int64     `gorm:"not null;default:0"`
+	LogImports      int64     `gorm:"not null;default:0"`
 	Status          string    `gorm:"type:varchar(32);not null"`
 	CreatedAt       time.Time `gorm:"not null"`
 }
@@ -338,18 +439,22 @@ func (storeReadinessRow) TableName() string { return tableStoreReadiness }
 
 func schemaModels() []any {
 	return []any{
-		&domainEventRow{}, &eventGlobalSequenceRow{}, &aggregateHeadRow{},
+		&domainEventRow{}, &eventTombstoneRow{}, &eventGlobalSequenceRow{}, &aggregateHeadRow{},
 		&projectionControlRow{}, &projectionReadModelRow{}, &operationRow{},
 		&operationArtifactRow{}, &laneHeadRow{}, &inboxMessageRow{},
-		&subjectFenceRow{}, &storeReadinessRow{}, &privacyAuditRow{},
+		&outboxEffectRow{}, &adapterSecretRow{}, &pluginKVRow{},
+		&subjectFenceRow{}, &storeReadinessRow{}, &privacyAuditRow{}, &managementActivityRow{},
+		&storyLogSessionRow{}, &storyLogStateRow{}, &logArchiveEntryRow{}, &logArchiveIntentRow{}, &storyLogImportRow{},
 	}
 }
 
 func schemaModelsWithoutOperationArtifacts() []any {
 	return []any{
-		&domainEventRow{}, &eventGlobalSequenceRow{}, &aggregateHeadRow{},
+		&domainEventRow{}, &eventTombstoneRow{}, &eventGlobalSequenceRow{}, &aggregateHeadRow{},
 		&projectionControlRow{}, &projectionReadModelRow{}, &operationRow{},
 		&laneHeadRow{}, &inboxMessageRow{}, &outboxEffectRow{},
-		&adapterSecretRow{}, &pluginKVRow{}, &subjectFenceRow{}, &storeReadinessRow{}, &privacyAuditRow{},
+		&adapterSecretRow{}, &pluginKVRow{}, &subjectFenceRow{},
+		&storeReadinessRow{}, &privacyAuditRow{}, &managementActivityRow{},
+		&storyLogSessionRow{}, &storyLogStateRow{}, &logArchiveEntryRow{}, &logArchiveIntentRow{}, &storyLogImportRow{},
 	}
 }

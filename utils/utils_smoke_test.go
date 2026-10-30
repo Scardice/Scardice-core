@@ -236,23 +236,6 @@ func BenchmarkSplitLongText_WithCQCode(b *testing.B) {
 	}
 }
 
-func BenchmarkLenWithoutCQCode_NoCQ(b *testing.B) {
-	text := strings.Repeat("plain text without any cq codes here. ", 20)
-	b.ResetTimer()
-	for range b.N {
-		_ = lenWithoutCQCode(text)
-	}
-}
-
-func BenchmarkLenWithoutCQCode_WithCQ(b *testing.B) {
-	cqCode := "[CQ:image,file=test.jpg]"
-	text := strings.Repeat("text "+cqCode+" more ", 20)
-	b.ResetTimer()
-	for range b.N {
-		_ = lenWithoutCQCode(text)
-	}
-}
-
 // --- Benchmark tests for SyncMap ---
 
 func BenchmarkSyncMap_Store(b *testing.B) {

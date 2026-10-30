@@ -47,6 +47,14 @@ static int plugin_has_field(const sc_runtime_plugin_v1 *plugin, size_t offset,
                             size_t size) {
   return plugin != NULL && (size_t)plugin->struct_size >= offset + size;
 }
+static int runtime_api_has_field(const sc_runtime_plugin_v1 *plugin,
+                                 size_t offset, size_t size) {
+  size_t plugin_offset = offsetof(sc_runtime_plugin_v1, api) + offset;
+  return plugin != NULL &&
+         (size_t)plugin->struct_size >= plugin_offset + size &&
+         (size_t)plugin->api.struct_size >= offset + size;
+}
+
 
 static uint32_t plugin_extension_count(const sc_runtime_plugin_v1 *plugin) {
   if (!plugin_has_field(plugin, offsetof(sc_runtime_plugin_v1, extension_count),
@@ -110,9 +118,7 @@ int sc_native_open(const char *path, uint64_t *out_library, char *error,
   return SC_NATIVE_OK;
 }
 
-int sc_native_query(uint64_t library, uint32_t runtime_major,
-                    uint32_t runtime_minor, uint32_t host_major,
-                    uint32_t host_minor, sc_native_descriptor *out, char *error,
+int sc_native_query(uint64_t library, sc_native_descriptor *out, char *error,
                     uint64_t capacity) {
   sc_native_state *state = state_from_id(library);
   sc_status_t(SC_CALL * query_fn)(const sc_runtime_query_v1 *,
@@ -133,10 +139,10 @@ int sc_native_query(uint64_t library, uint32_t runtime_major,
   }
   memset(&query, 0, sizeof(query));
   query.struct_size = (uint32_t)sizeof(query);
-  query.runtime_abi_major = runtime_major;
-  query.runtime_abi_minor = runtime_minor;
-  query.host_abi_major = host_major;
-  query.host_abi_minor = host_minor;
+  query.runtime_abi_major = SC_RUNTIME_ABI_MAJOR;
+  query.runtime_abi_minor = SC_RUNTIME_ABI_MINOR;
+  query.host_abi_major = SC_HOST_ABI_MAJOR;
+  query.host_abi_minor = SC_HOST_ABI_MINOR;
   status = query_fn(&query, &plugin);
   if (status != SC_OK) {
     set_error(error, capacity, "runtime query rejected the requested ABI");
@@ -146,8 +152,8 @@ int sc_native_query(uint64_t library, uint32_t runtime_major,
     set_error(error, capacity, "runtime query returned a null plugin");
     return SC_NATIVE_CORRUPT_VTABLE;
   }
-  if ((size_t)plugin->struct_size <
-      offsetof(sc_runtime_plugin_v1, extension_count)) {
+  if (!plugin_has_field(plugin, offsetof(sc_runtime_plugin_v1, api),
+                        sizeof(plugin->api.struct_size))) {
     set_error(error, capacity, "runtime plugin struct_size is too small");
     return SC_NATIVE_TOO_SMALL;
   }
@@ -179,7 +185,9 @@ int sc_native_query(uint64_t library, uint32_t runtime_major,
     set_error(error, capacity, "runtime descriptor struct_size is too small");
     return SC_NATIVE_TOO_SMALL;
   }
-  if (plugin->api.struct_size < sizeof(sc_runtime_api_v1)) {
+  if (!runtime_api_has_field(plugin,
+                             offsetof(sc_runtime_api_v1, last_error_copy),
+                             sizeof(plugin->api.last_error_copy))) {
     set_error(error, capacity, "runtime API struct_size is too small");
     return SC_NATIVE_TOO_SMALL;
   }
@@ -188,6 +196,16 @@ int sc_native_query(uint64_t library, uint32_t runtime_major,
       plugin->descriptor.language == NULL) {
     set_error(error, capacity, "runtime descriptor contains a null string");
     return SC_NATIVE_CORRUPT_VTABLE;
+  }
+  if (plugin->descriptor.abi_major != SC_RUNTIME_ABI_MAJOR ||
+      plugin->descriptor.abi_minor != 0) {
+    set_error(error, capacity, "runtime must declare the single ABI v1 contract");
+    return SC_NATIVE_RUNTIME_ABI;
+  }
+  if (plugin->descriptor.host_abi_major != SC_HOST_ABI_MAJOR ||
+      plugin->descriptor.host_abi_minor != SC_HOST_ABI_MINOR) {
+    set_error(error, capacity, "runtime declares an unsupported Host ABI minor");
+    return SC_NATIVE_HOST_ABI;
   }
 #define REQUIRE_API_FIELD(field)                                               \
   do {                                                                         \
@@ -229,19 +247,28 @@ int sc_native_query(uint64_t library, uint32_t runtime_major,
   REQUIRE_API_FIELD(value_retain);
   REQUIRE_API_FIELD(value_release);
   REQUIRE_API_FIELD(last_error_copy);
-  REQUIRE_API_FIELD(service_event);
-  REQUIRE_API_FIELD(tick);
+  if ((plugin->descriptor.capabilities & SC_CAP_ASYNC_HOST_SERVICE) != 0) {
+    if (!runtime_api_has_field(plugin,
+                               offsetof(sc_runtime_api_v1, service_event),
+                               sizeof(plugin->api.service_event))) {
+      set_error(error, capacity,
+                "async host-service capability requires service_event");
+      return SC_NATIVE_TOO_SMALL;
+    }
+    REQUIRE_API_FIELD(service_event);
+  }
+  if ((plugin->descriptor.capabilities & (SC_CAP_PROMISE | SC_CAP_TIMERS)) !=
+      0) {
+    if (!runtime_api_has_field(plugin, offsetof(sc_runtime_api_v1, tick),
+                               sizeof(plugin->api.tick))) {
+      set_error(error, capacity,
+                "Promise/timer capability requires tick");
+      return SC_NATIVE_TOO_SMALL;
+    }
+    REQUIRE_API_FIELD(tick);
+  }
 #undef REQUIRE_API_FIELD
-  if (plugin->descriptor.abi_major != runtime_major ||
-      plugin->descriptor.abi_minor != runtime_minor) {
-    set_error(error, capacity, "runtime ABI major/minor is incompatible");
-    return SC_NATIVE_RUNTIME_ABI;
-  }
-  if (plugin->descriptor.host_abi_major != host_major ||
-      plugin->descriptor.host_abi_minor != host_minor) {
-    set_error(error, capacity, "host ABI major/minor is incompatible");
-    return SC_NATIVE_HOST_ABI;
-  }
+
   if ((plugin->descriptor.capabilities & SC_CAP_CONTEXT_PROPAGATION) != 0) {
     sc_native_state queried_state = *state;
     queried_state.plugin = plugin;
@@ -253,9 +280,7 @@ int sc_native_query(uint64_t library, uint32_t runtime_major,
   }
   memset(out, 0, sizeof(*out));
   out->abi_major = plugin->descriptor.abi_major;
-  out->abi_minor = plugin->descriptor.abi_minor;
   out->host_abi_major = plugin->descriptor.host_abi_major;
-  out->host_abi_minor = plugin->descriptor.host_abi_minor;
   out->capabilities = plugin->descriptor.capabilities;
   if (!copy_string(out->id, sizeof(out->id), plugin->descriptor.id) ||
       !copy_string(out->name, sizeof(out->name), plugin->descriptor.name) ||
@@ -276,7 +301,7 @@ context_extension(const sc_native_state *state) {
   const sc_runtime_context_extension_v1 *table;
   if (extension == NULL ||
       extension->abi_major != SC_RUNTIME_EXTENSION_CONTEXT_ABI_MAJOR ||
-      extension->abi_minor < SC_RUNTIME_EXTENSION_CONTEXT_ABI_MINOR ||
+      extension->abi_minor != SC_RUNTIME_EXTENSION_CONTEXT_ABI_MINOR ||
       extension->table == NULL) {
     return NULL;
   }
@@ -341,6 +366,16 @@ extern sc_status_t SC_CALL sc_native_go_host_service_start(
 extern sc_status_t
     SC_CALL sc_native_go_host_service_cancel(sc_host_ctx_t, sc_runtime_t,
                                              sc_service_request_t);
+extern sc_status_t SC_CALL sc_native_go_host_object_retain(sc_host_ctx_t,
+                                                            sc_runtime_t,
+                                                            sc_host_ref_t);
+extern sc_status_t SC_CALL sc_native_go_host_object_release(sc_host_ctx_t,
+                                                             sc_runtime_t,
+                                                             sc_host_ref_t);
+extern sc_status_t SC_CALL sc_native_go_host_function_owner(sc_host_ctx_t,
+                                                              sc_runtime_t,
+                                                              sc_host_func_t,
+                                                              sc_host_ref_t *);
 
 static sc_status_t SC_CALL host_get(sc_host_ctx_t c, sc_runtime_t r,
                                     sc_host_ref_t h, sc_string_view k,
@@ -390,6 +425,19 @@ static sc_status_t SC_CALL host_service_cancel(sc_host_ctx_t c, sc_runtime_t r,
                                                sc_service_request_t request) {
   return sc_native_go_host_service_cancel(c, r, request);
 }
+static sc_status_t SC_CALL host_ref_retain(sc_host_ctx_t c, sc_runtime_t r,
+                                           sc_host_ref_t ref) {
+  return sc_native_go_host_object_retain(c, r, ref);
+}
+static sc_status_t SC_CALL host_ref_release(sc_host_ctx_t c, sc_runtime_t r,
+                                            sc_host_ref_t ref) {
+  return sc_native_go_host_object_release(c, r, ref);
+}
+static sc_status_t SC_CALL host_function_owner(sc_host_ctx_t c, sc_runtime_t r,
+                                                sc_host_func_t function,
+                                                sc_host_ref_t *owner) {
+  return sc_native_go_host_function_owner(c, r, function, owner);
+}
 
 static const sc_host_api_v1 host_api_current = {
     .struct_size = sizeof(sc_host_api_v1),
@@ -404,7 +452,10 @@ static const sc_host_api_v1 host_api_current = {
     .last_error_copy = host_last,
     .service_call = host_service_call,
     .service_start = host_service_start,
-    .service_cancel = host_service_cancel};
+    .service_cancel = host_service_cancel,
+    .host_ref_retain = host_ref_retain,
+    .host_ref_release = host_ref_release,
+    .host_function_owner = host_function_owner};
 
 int sc_native_create(uint64_t library, uint64_t host_ctx, const char *options,
                      uint64_t options_len, uint64_t *out_runtime, char *error,
@@ -876,6 +927,13 @@ int sc_native_service_event(uint64_t library, uint64_t runtime, uint32_t kind,
   sc_service_event_v1 event;
   if (state == NULL)
     return SC_NATIVE_INTERNAL;
+  if (!runtime_api_has_field(state->plugin,
+                             offsetof(sc_runtime_api_v1, service_event),
+                             sizeof(state->plugin->api.service_event)) ||
+      state->plugin->api.service_event == NULL) {
+    set_error(error, capacity, "runtime does not support service events");
+    return (int)SC_ENOTSUP;
+  }
   if (runtime == 0 || request == 0 ||
       (kind != SC_SERVICE_EVENT_DATA && kind != SC_SERVICE_EVENT_COMPLETE &&
        kind != SC_SERVICE_EVENT_CLOSE) ||
@@ -908,6 +966,12 @@ int sc_native_tick(uint64_t library, uint64_t runtime, char *error,
   sc_native_state *state = checked_state(library, error, capacity);
   if (state == NULL)
     return SC_NATIVE_INTERNAL;
+  if (!runtime_api_has_field(state->plugin,
+                             offsetof(sc_runtime_api_v1, tick),
+                             sizeof(state->plugin->api.tick)) ||
+      state->plugin->api.tick == NULL) {
+    return SC_NATIVE_OK;
+  }
   return operation_status(state, (sc_runtime_t)runtime,
                           state->plugin->api.tick((sc_runtime_t)runtime), error,
                           capacity);

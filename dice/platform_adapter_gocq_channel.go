@@ -3,8 +3,6 @@ package dice
 import (
 	"encoding/json"
 	"strings"
-
-	"Scardice-core/dice/service"
 )
 
 type SenderChannel struct {
@@ -52,6 +50,9 @@ func (msgQQ *MessageQQChannel) toStdMessage() *Message {
 }
 
 func (pa *PlatformAdapterGocq) QQChannelTrySolve(message string) {
+	if pa == nil || pa.EndPoint == nil || pa.EndPoint.Session == nil {
+		return
+	}
 	msgQQ := new(MessageQQChannel)
 	err := json.Unmarshal([]byte(message), msgQQ)
 
@@ -67,8 +68,8 @@ func (pa *PlatformAdapterGocq) QQChannelTrySolve(message string) {
 		if msgQQ.PostType == "notice" && msgQQ.NoticeType == "guild_channel_recall" {
 			groupInfo, ok := session.ServiceAtNew.Load(msg.GroupID)
 			if ok {
-				if groupInfo.GetLogState().On {
-					_ = service.LogMarkDeleteByRawMsgID(ctx.Dice.DBOperator, groupInfo.GroupID, msgQQ.MessageID)
+				if groupInfo.GetLogState().On && ctx.Dice != nil {
+					LogDeleteByID(ctx, groupInfo.GroupID, msgQQ.MessageID)
 				}
 			}
 			return
@@ -95,18 +96,16 @@ func (pa *PlatformAdapterGocq) QQChannelTrySolve(message string) {
 func (pa *PlatformAdapterGocq) SendToChannelGroup(ctx *MsgContext, userID string, text string, flag string) {
 	rawID, _ := pa.mustExtractChannelID(userID)
 	for _, i := range ctx.Dice.ExtList {
-		if i.OnMessageSend != nil {
-			i.notifyWithJsCheck(ctx.Dice, func() {
-				i.OnMessageSend(ctx, &Message{
-					MessageType: "group",
-					Message:     text,
-					GroupID:     userID,
-					Sender: SenderBase{
-						UserID:   pa.EndPoint.UserID,
-						Nickname: pa.EndPoint.Nickname,
-					},
-				}, flag)
-			})
+		if i.HasOnMessageSend() {
+			i.CallOnMessageSend(ctx.Dice, ctx, &Message{
+				MessageType: "group",
+				Message:     text,
+				GroupID:     userID,
+				Sender: SenderBase{
+					UserID:   pa.EndPoint.UserID,
+					Nickname: pa.EndPoint.Nickname,
+				},
+			}, flag)
 		}
 	}
 

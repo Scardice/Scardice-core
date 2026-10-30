@@ -31,11 +31,11 @@ func TestPluginCompatibilityManifestIsExplicit(t *testing.T) {
 	var manifest struct {
 		ManifestVersion string `json:"manifestVersion"`
 		FixtureVersion  string `json:"fixtureVersion"`
-		Fixture struct {
+		Fixture         struct {
 			Covers []string `json:"covers"`
 		} `json:"fixture"`
 		RealmRules []string `json:"realmRules"`
-		Callbacks struct {
+		Callbacks  struct {
 			Order  []string `json:"order"`
 			Fields []string `json:"fields"`
 		} `json:"callbacks"`
@@ -196,13 +196,13 @@ func TestPluginCompatibilityCallbackOrderFixture(t *testing.T) {
 			return err
 		}
 		ctx, msg := &MsgContext{}, &Message{}
-		if ext.OnMessagePreprocess == nil || ext.OnMessageReceived == nil || ext.OnCommandReceived == nil || ext.OnMessageSend == nil {
-			return fmt.Errorf("fixture did not install callback fields")
+		if ext.OnMessagePreprocess == nil || ext.OnMessageReceivedGoja == nil || ext.OnCommandReceivedGoja == nil || ext.OnMessageSendGoja == nil {
+			return errors.New("fixture did not install callback fields")
 		}
-		ext.OnMessagePreprocess(ctx, msg)
-		ext.OnMessageReceived(ctx, msg)
-		ext.OnCommandReceived(ctx, msg, &CmdArgs{})
-		ext.OnMessageSend(ctx, msg, "fixture")
+		_ = ext.OnMessagePreprocess(ctx, msg)
+		_ = ext.OnMessageReceivedGoja(ctx, msg)
+		_ = ext.OnCommandReceivedGoja(ctx, msg, &CmdArgs{})
+		_ = ext.OnMessageSendGoja(ctx, msg, "fixture")
 		value, err := runtime.RunString("plugin-compat-callback-order.js", `JSON.stringify(pluginCompatOrder)`)
 		if err != nil {
 			return err
@@ -510,15 +510,18 @@ func TestPluginCompatibilityDurableSmokeRestartRebuildAndCrash(t *testing.T) {
 }
 
 type compatFixedClock struct{ now time.Time }
+
 func (c *compatFixedClock) Now() time.Time { return c.now }
 
 type compatFixedIDs struct{ next int }
+
 func (g *compatFixedIDs) NewID() (string, error) {
 	g.next++
 	return fmt.Sprintf("compat-generated-%02d", g.next), nil
 }
 
 type compatKeySource struct{}
+
 func (compatKeySource) IndexRootID(context.Context) (string, error) { return "index-v1", nil }
 func (compatKeySource) IndexRootMaterial(context.Context) ([]byte, error) {
 	return []byte("01234567890123456789012345678901"), nil

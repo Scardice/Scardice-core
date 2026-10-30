@@ -49,10 +49,13 @@ type testIDs struct{ n int }
 
 func (g *testIDs) NewID() (string, error) { g.n++; return "generated-id", nil }
 
-type testResolver struct{ snap EndpointSnapshot }
+type testResolver struct {
+	snap EndpointSnapshot
+	err  error
+}
 
 func (r testResolver) Resolve(context.Context, adapterapi.EndpointID) (EndpointSnapshot, error) {
-	return r.snap, nil
+	return r.snap, r.err
 }
 
 type testIndexSigner struct {
@@ -121,6 +124,32 @@ func TestOutboundSubmitCommitsAllParticipants(t *testing.T) {
 	}
 	if len(enc.plain) == 0 || len(store.work.Streams[0].Events[0].Payload) == 0 {
 		t.Fatal("missing encrypted/request payload")
+	}
+}
+
+func TestOutboundPrepareBuildsParticipantsWithoutCommit(t *testing.T) {
+	root := []byte(strings.Repeat("r", 32))
+	effect := testEffect()
+	effect.Deadline = time.Now().Add(time.Hour).UTC()
+	lane, err := adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, root, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effect.Lane = lane
+	store := &testStore{}
+	service, err := NewOutboundService(store, testResolver{snap: EndpointSnapshot{EndpointID: effect.EndpointID, DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage), IndexRootID: "index-root-1", IndexSigner: testIndexSigner{root: root, id: "index-root-1"}}}, &testEncryptor{}, &testIDs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := service.Prepare(context.Background(), SubmitRequest{Effect: effect, CommandID: "cmd-prepare", PrincipalID: "principal-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.calls != 0 {
+		t.Fatal("prepare committed storage")
+	}
+	if prepared.Result.EffectID != string(effect.ID) || len(prepared.Work.Streams) != 1 || len(prepared.Work.Operations) != 1 || len(prepared.Work.Effects) != 1 {
+		t.Fatalf("prepared = %#v", prepared)
 	}
 }
 func TestOutboundSubmitDeduplicatesSameCommandAndConflictsChangedDigest(t *testing.T) {
@@ -213,6 +242,54 @@ func TestOutboundSubmitRejectsStateAndCapabilityWithValidLane(t *testing.T) {
 		if store.calls != 0 {
 			t.Fatalf("%s wrote storage", name)
 		}
+	}
+}
+
+func TestOutboundSubmitReportsEndpointStateOnUnavailableError(t *testing.T) {
+	root := []byte(strings.Repeat("r", 32))
+	effect := testEffect()
+	effect.Deadline = time.Now().Add(time.Hour).UTC()
+	lane, err := adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, root, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effect.Lane = lane
+	snapshot := EndpointSnapshot{
+		EndpointID: effect.EndpointID, DesiredState: "enabled", ObservedState: adapterapi.ObservedStateStopped,
+		Capabilities: adapterapi.CapabilityOutbound,
+		Actions:      adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage),
+		IndexRootID:  "index-root-1", IndexSigner: testIndexSigner{root: root, id: "index-root-1"},
+	}
+	service, err := NewOutboundService(&testStore{}, testResolver{snap: snapshot}, &testEncryptor{}, &testIDs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Submit(context.Background(), SubmitRequest{Effect: effect, CommandID: "unavailable-state", PrincipalID: "principal-a"})
+	if !errors.Is(err, ErrEndpointUnavailable) {
+		t.Fatalf("error = %v, want endpoint unavailable", err)
+	}
+	if !strings.Contains(err.Error(), `observed state "stopped"`) {
+		t.Fatalf("error = %v, want observed state in diagnostic", err)
+	}
+}
+
+func TestOutboundSubmitPreservesEndpointResolutionCause(t *testing.T) {
+	resolverErr := errors.New("projection read failed")
+	service, err := NewOutboundService(&testStore{}, testResolver{err: resolverErr}, &testEncryptor{}, &testIDs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	effect := testEffect()
+	effect.Deadline = time.Now().Add(time.Hour).UTC()
+	root := []byte(strings.Repeat("r", 32))
+	lane, laneErr := adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, root, 1)
+	if laneErr != nil {
+		t.Fatal(laneErr)
+	}
+	effect.Lane = lane
+	_, err = service.Submit(context.Background(), SubmitRequest{Effect: effect, CommandID: "resolver-error", PrincipalID: "principal-a"})
+	if !errors.Is(err, ErrEndpointUnavailable) || !errors.Is(err, resolverErr) {
+		t.Fatalf("error = %v, want endpoint unavailable wrapping resolver cause", err)
 	}
 }
 

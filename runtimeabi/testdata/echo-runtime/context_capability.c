@@ -1,4 +1,4 @@
-/* Current development ABI fixture; not a historical/versioned provider. */
+/* Full v1 extension fixture layered over the short-table echo provider. */
 #define scardice_runtime_query_v1 echo_query_base
 #include "echo_runtime.c"
 #undef scardice_runtime_query_v1
@@ -52,6 +52,14 @@ SC_EXPORT sc_status_t SC_CALL scardice_runtime_query_v1(
     plugin.descriptor.capabilities &= ~SC_CAP_CONTEXT_PROPAGATION;
     plugin.extension_count = 0;
     plugin.extensions = NULL;
+#elif FIXTURE_CASE == 7
+    plugin.descriptor.capabilities |= SC_CAP_ASYNC_HOST_SERVICE;
+#elif FIXTURE_CASE == 8
+    plugin.descriptor.abi_minor = 1;
+#elif FIXTURE_CASE == 9
+    plugin.descriptor.host_abi_minor = 2;
+#elif FIXTURE_CASE == 10
+    extension.abi_minor = 1;
 #endif
     *out_plugin = &plugin;
     return SC_OK;

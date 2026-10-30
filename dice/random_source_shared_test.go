@@ -3,7 +3,9 @@ package dice //nolint:testpackage
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	ds "github.com/sealdice/dicescript"
@@ -212,5 +214,48 @@ func TestGlobalRandSourceReportDoesNotConsumeActiveSource(t *testing.T) {
 	_ = globalRandSource.ReportGetText(20)
 	if got := globalRandSource.Uint64(); got != 1 {
 		t.Fatalf("Uint64() after report = %d, want 1", got)
+	}
+}
+
+func TestRetainedContextRandomCallsDuringRelease(t *testing.T) {
+	installGlobalDiceSourceState(t, completeSourceMap(
+		sourceOverride{mode: DiceRandomModePCG, src: &countingDiceSource{values: []uint64{0x8123456789abcdef}}},
+	), nil)
+	ctx := &MsgContext{diceRandSrc: globalRandSource}
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	workers.Go(func() {
+		<-start
+		ctx.releaseExecutionState()
+	})
+	workers.Go(func() {
+		<-start
+		for range 64 {
+			if got := ctx.Roll(6); got < 1 || got > 6 {
+				t.Errorf("Roll(6) = %d", got)
+			}
+			if got := ctx.Roll64(6); got < 1 || got > 6 {
+				t.Errorf("Roll64(6) = %d", got)
+			}
+			if got := ctx.RandIntn(3); got < 0 || got >= 3 {
+				t.Errorf("RandIntn(3) = %d", got)
+			}
+			if got := ctx.getChooserRand().IntN(3); got < 0 || got >= 3 {
+				t.Errorf("chooser.IntN(3) = %d", got)
+			}
+			values := []int{0, 1, 2}
+			ctx.Shuffle(len(values), func(i, j int) {
+				values[i], values[j] = values[j], values[i]
+			})
+			slices.Sort(values)
+			if !slices.Equal(values, []int{0, 1, 2}) {
+				t.Errorf("Shuffle changed the elements: %v", values)
+			}
+		}
+	})
+	close(start)
+	workers.Wait()
+	if got := ctx.Roll(1); got != 1 {
+		t.Fatalf("retained context Roll(1) after release = %d", got)
 	}
 }

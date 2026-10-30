@@ -4,7 +4,7 @@ package native
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"os"
 	"testing"
 
@@ -110,7 +110,7 @@ func BenchmarkNativeHostPropertyGet(b *testing.B) {
 		if err := loop.Run(func(runtime jsengine.Runtime) error {
 			object := runtime.Get("host").Object()
 			if object == nil {
-				return fmt.Errorf("host object is nil")
+				return errors.New("host object is nil")
 			}
 			value, err := object.Get("value").ExportPrimitive()
 			if err != nil {

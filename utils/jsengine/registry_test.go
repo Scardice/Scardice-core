@@ -8,18 +8,7 @@ import (
 
 	"Scardice-core/utils/jsengine"
 	builtin "Scardice-core/utils/jsengine/builtin/goja"
-	adapter "Scardice-core/utils/jsengine/goja"
 )
-
-type testProvider struct {
-	descriptor jsengine.Descriptor
-}
-
-func (p testProvider) Descriptor() jsengine.Descriptor { return p.descriptor }
-
-func (p testProvider) Open(context.Context, jsengine.RuntimeOptions) (jsengine.Loop, error) {
-	return adapter.New(), nil
-}
 
 func TestRegistryResolvesDefaultGojaAndNormalizesIDs(t *testing.T) {
 	registry := jsengine.NewRegistry()
@@ -92,6 +81,10 @@ func TestRegistryRejectsDuplicateCandidateAndBuiltinIDs(t *testing.T) {
 
 func TestRegistryCandidateRegistrationKeepsMetadataLazy(t *testing.T) {
 	registry := jsengine.NewRegistry()
+	loads := 0
+	provider := &candidateProvider{descriptor: jsengine.Descriptor{
+		ID: "native", Name: "Native", Version: "1.2", Language: "C++",
+	}}
 	manifest := jsengine.RuntimeManifest{
 		ID:           "native",
 		Name:         "Native",
@@ -99,6 +92,10 @@ func TestRegistryCandidateRegistrationKeepsMetadataLazy(t *testing.T) {
 		Language:     "C++",
 		Capabilities: jsengine.CapabilityScript,
 		Path:         "/tmp/native.so",
+		Load: func() (jsengine.Provider, error) {
+			loads++
+			return provider, nil
+		},
 	}
 	if err := registry.RegisterCandidate(manifest); err != nil {
 		t.Fatalf("RegisterCandidate() error = %v", err)
@@ -113,8 +110,18 @@ func TestRegistryCandidateRegistrationKeepsMetadataLazy(t *testing.T) {
 	if !descriptor.Capabilities.Has(jsengine.CapabilityScript) {
 		t.Fatalf("candidate capabilities = %v, want script capability", descriptor.Capabilities)
 	}
-	if _, err := registry.Resolve("native"); !errors.Is(err, jsengine.ErrProviderNotFound) {
-		t.Fatalf("Resolve(candidate) error = %v, want ErrProviderNotFound until a loader is provided", err)
+	if loads != 0 {
+		t.Fatalf("candidate loaded during registration: %d", loads)
+	}
+	resolved, err := registry.Resolve("native")
+	if err != nil || resolved.Descriptor().ID != "native" {
+		t.Fatalf("Resolve(candidate) = %#v, %v", resolved, err)
+	}
+	if again, err := registry.Resolve("native"); err != nil || again != resolved {
+		t.Fatalf("second Resolve(candidate) = %#v, %v; want cached provider", again, err)
+	}
+	if loads != 1 {
+		t.Fatalf("candidate load count = %d, want 1", loads)
 	}
 }
 
@@ -149,14 +156,10 @@ func TestRegistryManifestABIFieldsOverrideEmbeddedDescriptor(t *testing.T) {
 		Descriptor: jsengine.Descriptor{
 			ID:           "embedded",
 			ABIMajor:     1,
-			ABIMinor:     1,
 			HostABIMajor: 1,
-			HostABIMinor: 1,
 		},
 		ABIMajor:     2,
-		ABIMinor:     3,
 		HostABIMajor: 4,
-		HostABIMinor: 5,
 	}
 	if err := registry.RegisterCandidate(manifest); err != nil {
 		t.Fatalf("RegisterCandidate() error = %v", err)
@@ -165,9 +168,9 @@ func TestRegistryManifestABIFieldsOverrideEmbeddedDescriptor(t *testing.T) {
 	if !found {
 		t.Fatal("Descriptor() did not find candidate")
 	}
-	if descriptor.ID != manifest.ID || descriptor.ABIMajor != 2 || descriptor.ABIMinor != 3 ||
-		descriptor.HostABIMajor != 4 || descriptor.HostABIMinor != 5 {
-		t.Fatalf("candidate descriptor ABI = %#v, want manifest ABI 2.3 host 4.5", descriptor)
+	if descriptor.ID != manifest.ID || descriptor.ABIMajor != 2 ||
+		descriptor.HostABIMajor != 4 {
+		t.Fatalf("candidate descriptor ABI = %#v, want runtime v2 host v4", descriptor)
 	}
 }
 
@@ -194,4 +197,16 @@ func TestRegistryDescriptorLookupReturnsSnapshot(t *testing.T) {
 	if !found || again.Name == "mutated" {
 		t.Fatal("Descriptor() returned mutable registry metadata")
 	}
+}
+
+type candidateProvider struct {
+	descriptor jsengine.Descriptor
+}
+
+func (p candidateProvider) Descriptor() jsengine.Descriptor {
+	return p.descriptor
+}
+
+func (candidateProvider) Open(context.Context, jsengine.RuntimeOptions) (jsengine.Loop, error) {
+	return nil, errors.New("candidate provider is not opened by registry tests")
 }

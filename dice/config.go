@@ -22,7 +22,6 @@ import (
 
 	"Scardice-core/dice/service"
 	"Scardice-core/logger"
-	"Scardice-core/model"
 	"Scardice-core/utils"
 )
 
@@ -329,6 +328,8 @@ func (cm *ConfigManager) SetConfig(pluginName, key string, value interface{}) er
 	if cm == nil {
 		return errors.New("config manager is nil")
 	}
+	var validatedTaskType string
+
 	if cm.owner != nil && cm.owner.DurableStore != nil {
 		cm.lock.RLock()
 		plugin := cm.Plugins[pluginName]
@@ -341,16 +342,20 @@ func (cm *ConfigManager) SetConfig(pluginName, key string, value interface{}) er
 			return fmt.Errorf("plugin config %s/%s not found", pluginName, key)
 		}
 		durableValue := value
-		if strings.HasPrefix(configType, "task:once") {
+
+		switch configType {
+		case "task:cron", "task:daily", "task:once":
 			text, ok := value.(string)
 			if !ok {
 				return errors.New("task config value must be a string")
 			}
-			_, normalized, err := parseTaskOnceExpr(text)
+			normalized, err := normalizeTaskConfigValue(configType, text)
 			if err != nil {
 				return err
 			}
 			durableValue = normalized
+			value = normalized
+			validatedTaskType = configType
 		}
 		if err := cm.owner.durableSetConfigByName(context.Background(), pluginName, key, durableValue); err != nil {
 			return err
@@ -372,8 +377,8 @@ func (cm *ConfigManager) SetConfig(pluginName, key string, value interface{}) er
 			if !ok {
 				return errors.New("task config value must be a string")
 			}
-			if configItem.Type == "task:once" {
-				_, normalized, err := parseTaskOnceExpr(val)
+			if configItem.Type != validatedTaskType {
+				normalized, err := normalizeTaskConfigValue(configItem.Type, val)
 				if err != nil {
 					return err
 				}
@@ -415,18 +420,33 @@ func (cm *ConfigManager) ResetConfigToDefault(pluginName, key string) {
 	if cm == nil {
 		return
 	}
-	if cm.owner != nil && cm.owner.DurableStore != nil {
-		cm.lock.RLock()
-		plugin := cm.Plugins[pluginName]
-		var defaultValue any
-		if plugin != nil && plugin.Configs[key] != nil {
-			defaultValue = plugin.Configs[key].DefaultValue
-		}
-		cm.lock.RUnlock()
-		if defaultValue == nil {
-			logger.M().Debug("plugin config default not found", pluginName, key)
+	cm.lock.RLock()
+	plugin := cm.Plugins[pluginName]
+	var defaultValue any
+	configType := ""
+	if plugin != nil && plugin.Configs[key] != nil {
+		defaultValue = plugin.Configs[key].DefaultValue
+		configType = plugin.Configs[key].Type
+	}
+	cm.lock.RUnlock()
+	if defaultValue == nil {
+		logger.M().Debug("plugin config default not found", pluginName, key)
+		return
+	}
+	if strings.HasPrefix(configType, "task:") {
+		taskValue, ok := defaultValue.(string)
+		if !ok {
+			logger.M().Error("plugin task config default must be a string", pluginName, key)
 			return
 		}
+		normalized, err := normalizeTaskConfigValue(configType, taskValue)
+		if err != nil {
+			logger.M().Error("invalid plugin task config default", pluginName, key, err)
+			return
+		}
+		defaultValue = normalized
+	}
+	if cm.owner != nil && cm.owner.DurableStore != nil {
 		if err := cm.owner.durableSetConfigByName(context.Background(), pluginName, key, defaultValue); err != nil {
 			logger.M().Error("durable config reset failed", pluginName, key, err)
 			return
@@ -437,32 +457,26 @@ func (cm *ConfigManager) ResetConfigToDefault(pluginName, key string) {
 	defer cm.lock.Unlock()
 	log := logger.M()
 	log.Debug("try reset config to default", pluginName, key)
-	plugin, ok := cm.Plugins[pluginName]
-	if !ok {
+	plugin = cm.Plugins[pluginName]
+	if plugin == nil {
 		log.Debug("plugin not found", pluginName)
 		return
 	}
-
 	configItem, exists := plugin.Configs[key]
 	if exists {
-		log.Debug("reset config to default", pluginName, key)
-		configItem.Value = configItem.DefaultValue
 		if strings.HasPrefix(configItem.Type, "task:") {
-			taskVal, ok := configItem.Value.(string)
+			taskValue, ok := defaultValue.(string)
 			if !ok {
 				return
 			}
-			if configItem.Type == "task:once" {
-				_, normalized, err := parseTaskOnceExpr(taskVal)
-				if err == nil {
-					taskVal = normalized
-					configItem.Value = normalized
+			if configItem.task != nil {
+				if err := configItem.task.reset(taskValue); err != nil {
+					log.Error("reset plugin task config failed", pluginName, key, err)
+					return
 				}
 			}
-			if configItem.task != nil {
-				_ = configItem.task.reset(taskVal)
-			}
 		}
+		configItem.Value = defaultValue
 		plugin.Configs[key] = configItem
 		cm.Plugins[pluginName] = plugin
 	}
@@ -2025,6 +2039,14 @@ func setupBaseTextTemplate(d *Dice) {
 	SetupTextHelpInfo(d, helpInfo, texts, "configs/text-template.yaml")
 }
 
+// initializeTextTemplates treats a saved user template as authoritative.
+// Built-ins are loaded only when no user template exists.
+func (d *Dice) initializeTextTemplates() {
+	setupBaseTextTemplate(d)
+	loadTextTemplate(d, "configs/text-template.yaml")
+	d.GenerateTextMap()
+}
+
 func SetupTextHelpInfo(d *Dice, helpInfo TextTemplateWithHelpDict, texts TextTemplateWithWeightDict, fn string) {
 	diceTexts := d.TextMapRaw
 
@@ -2114,74 +2136,29 @@ func SetupTextHelpInfo(d *Dice, helpInfo TextTemplateWithHelpDict, texts TextTem
 	}
 }
 
-// RestoreMissingBuiltinTextEntries restores builtin text entries that were
-// omitted by an older WebUI payload or an imported text-template category.
-// Builtin entries cannot be deleted in the WebUI, so treating their absence as
-// an outdated partial payload is safe. Custom/deprecated entries are left
-// untouched so users can still remove them deliberately.
-func RestoreMissingBuiltinTextEntries(d *Dice, category string) bool {
-	helpGroup, exists := d.TextMapHelpInfo[category]
-	if !exists {
-		return false
-	}
-
-	textGroup, exists := d.TextMapRaw[category]
-	if !exists || textGroup == nil {
-		textGroup = TextTemplateWithWeight{}
-		d.TextMapRaw[category] = textGroup
-	}
-
-	changed := false
-	for key, item := range helpGroup {
-		if item == nil || item.NotBuiltin || len(item.Origin) == 0 {
-			continue
-		}
-		if _, exists := textGroup[key]; exists {
-			continue
-		}
-
-		textGroup[key] = append([]TextTemplateItem{}, item.Origin...)
-		item.Modified = false
-		changed = true
-	}
-	return changed
-}
-
-// RestoreAllMissingBuiltinTextEntries applies RestoreMissingBuiltinTextEntries
-// to every builtin text category.
-func RestoreAllMissingBuiltinTextEntries(d *Dice) bool {
-	changed := false
-	for category := range d.TextMapHelpInfo {
-		if RestoreMissingBuiltinTextEntries(d, category) {
-			changed = true
-		}
-	}
-	return changed
-}
-
 func loadTextTemplate(d *Dice, fn string) {
 	textPath := filepath.Join(d.BaseConfig.DataDir, fn)
-
-	if _, err := os.Stat(textPath); err == nil {
-		data, err := os.ReadFile(textPath)
-		if err != nil {
-			panic(err)
-		}
-		texts := TextTemplateWithWeightDict{}
-		err = yaml.Unmarshal(data, &texts)
-		if err != nil {
-			panic(err)
-		}
-
-		if texts["牌堆"] != nil {
-			texts["其它"] = texts["牌堆"]
-			delete(texts, "牌堆")
-		}
-
-		SetupTextHelpInfo(d, d.TextMapHelpInfo, texts, fn)
-	} else {
+	data, err := os.ReadFile(textPath)
+	if errors.Is(err, os.ErrNotExist) {
 		d.Logger.Info("未检测到自定义文本文件，即将进行创建。")
+		return
 	}
+	if err != nil {
+		panic(err)
+	}
+
+	texts := TextTemplateWithWeightDict{}
+	if err := yaml.Unmarshal(data, &texts); err != nil {
+		panic(err)
+	}
+
+	if texts["牌堆"] != nil {
+		texts["其它"] = texts["牌堆"]
+		delete(texts, "牌堆")
+	}
+
+	d.TextMapRaw = TextTemplateWithWeightDict{}
+	SetupTextHelpInfo(d, d.TextMapHelpInfo, texts, fn)
 }
 
 func migrateHelpTextKey(d *Dice) bool {
@@ -2297,7 +2274,6 @@ func (d *Dice) loadGroups() {
 
 	// 显式预热 sonic 编译缓存，避免首个群反序列化时 JIT 编译卡顿。
 	_ = sonic.Pretouch(reflect.TypeOf(groupInfoDecodeJSON{}))
-	_ = sonic.Pretouch(reflect.TypeOf(extNameRefsJSON{}))
 
 	// json 解码无法传递 Dice 上下文，加载期间临时提供 name -> *ExtInfo 解析器。
 	prevResolver := extJSONResolver
@@ -2445,6 +2421,22 @@ func saveTextTemplateFile(filename string, data []byte) error {
 // ApplyExtDefaultSettings 应用扩展默认配置，同时处理插件的启用和禁用
 // 新扩展激活采用延迟模式，在群组收到消息时通过 GetActivatedExtList 按需激活
 func (d *Dice) ApplyExtDefaultSettings() {
+	d.applyExtDefaultSettings(nil, true)
+}
+
+func extensionSelected(only map[string]struct{}, name string) bool {
+	if only == nil {
+		return true
+	}
+	_, ok := only[name]
+	return ok
+}
+
+// applyExtDefaultSettings 是 ApplyExtDefaultSettings 的可限定版本。
+// only 为 nil 时处理全部扩展；否则只处理其中列出的扩展，用于局部加载新插件。
+// resetGroups 为 false 时不触碰各群的手动关闭记录与扩展同步版本：新扩展靠
+// RegisterExtension 递增的 ExtRegistryVersion 让各群在下一条消息时懒同步。
+func (d *Dice) applyExtDefaultSettings(only map[string]struct{}, resetGroups bool) {
 	// 遍历两个列表
 	exts1 := map[string]*ExtDefaultSettingItem{}
 	for _, i := range d.Config.ExtDefaultSettings {
@@ -2458,6 +2450,9 @@ func (d *Dice) ApplyExtDefaultSettings() {
 
 	// 如果存在于扩展列表，但不存在于默认列表中的，添加到默认列表末尾
 	for k, v := range exts2 {
+		if !extensionSelected(only, k) {
+			continue
+		}
 		if _, exists := exts1[k]; !exists {
 			item := &ExtDefaultSettingItem{Name: k, AutoActive: v.AutoActive, DisabledCommand: map[string]bool{}}
 			(&d.Config).ExtDefaultSettings = append((&d.Config).ExtDefaultSettings, item)
@@ -2468,6 +2463,9 @@ func (d *Dice) ApplyExtDefaultSettings() {
 	// 先绑定默认设置到扩展，确保后续激活逻辑能读取AutoActive等
 	// 遍历设置表，将其插入扩展信息
 	for k, v := range exts1 {
+		if !extensionSelected(only, k) {
+			continue
+		}
 		extInfo, exists := exts2[k]
 		if exists {
 			v.ExtItem = extInfo
@@ -2508,7 +2506,7 @@ func (d *Dice) ApplyExtDefaultSettings() {
 	//
 	// 但当默认设置从关闭改为开启（AutoActive=true）时，需要清理群组中的关闭记录，
 	// 并重置群组扩展应用版本，让后续消息触发的延迟同步按新默认配置生效。
-	if d.ImSession != nil && d.ImSession.ServiceAtNew != nil {
+	if resetGroups && d.ImSession != nil && d.ImSession.ServiceAtNew != nil {
 		autoActiveNames := make(map[string]struct{}, len(exts1))
 		for name, setting := range exts1 {
 			if setting != nil && setting.AutoActive {
@@ -2546,151 +2544,15 @@ func (d *Dice) ApplyExtDefaultSettings() {
 	d.MarkModified()
 }
 
-func (d *Dice) Save(isAuto bool) {
-	if d == nil || (d.DurableStore != nil && d.Parent != nil && d.Parent.EventSourcedMode) {
+func (d *Dice) Save(_ bool) {
+	if d == nil || d.DurableStore == nil {
 		return
 	}
-	d.ImSession.RefreshEndPointsSnapshot()
-	saveStartTime := time.Now()
-
-	configStartTime := time.Now()
-	if d.LastUpdatedTime != 0 {
-		legacyServe := &struct {
-			ImSession *IMSession  `yaml:"imSession"`
-			DeckList  []*DeckInfo `yaml:"deckList"`
-		}{
-			ImSession: d.ImSession,
-			DeckList:  d.DeckList,
+	if err := d.saveEventSourcedConfig(context.Background()); err != nil {
+		if d.Logger != nil {
+			d.Logger.Errorf("保存事件源骰子配置失败: %v", err)
+		} else {
+			logger.M().Errorf("保存事件源骰子配置失败: %v", err)
 		}
-		serveData, serveErr := yaml.Marshal(legacyServe)
-		advancedData, advancedErr := []byte(nil), error(nil)
-		if !d.DurableStoreAttached() {
-			legacyConf := &struct {
-				ImSession     *IMSession  `yaml:"imSession"`
-				DeckList      []*DeckInfo `yaml:"deckList"`
-				CommandPrefix []string    `yaml:"commandPrefix"`
-				DiceMasters   []string    `yaml:"diceMasters"`
-				Config        `yaml:",inline"`
-			}{
-				ImSession:     d.ImSession,
-				DeckList:      d.DeckList,
-				CommandPrefix: d.CommandPrefix,
-				DiceMasters:   d.DiceMasters,
-				Config:        d.Config,
-			}
-			serveData, serveErr = yaml.Marshal(legacyConf)
-			advancedData, advancedErr = yaml.Marshal(d.AdvancedConfig)
-		}
-
-		if serveErr == nil && advancedErr == nil {
-			serveErr = utils.AtomicWriteFile(filepath.Join(d.BaseConfig.DataDir, "serve.yaml"), serveData, 0o644)
-			if !d.DurableStoreAttached() {
-				advancedErr = utils.AtomicWriteFile(filepath.Join(d.BaseConfig.DataDir, "advanced.yaml"), advancedData, 0o644)
-			}
-			if serveErr == nil && advancedErr == nil {
-				now := time.Now()
-				d.Config.LastSavedTime = &now
-				if isAuto {
-					d.Logger.Info("自动保存")
-				} else {
-					d.Logger.Info("保存数据")
-				}
-				d.LastUpdatedTime = 0
-			} else if serveErr != nil && advancedErr != nil {
-				d.Logger.Error("保存 serve.yaml 和 advanced.yaml 出错", advancedErr)
-			} else if serveErr != nil {
-				d.Logger.Error("保存 serve.yaml 出错", serveErr)
-			} else {
-				d.Logger.Error("保存 advanced.yaml 出错", advancedErr)
-			}
-		}
-	}
-	configDuration := time.Since(configStartTime)
-
-	groupStartTime := time.Now()
-	var groupCount, playerCount, groupSavedCount, playerSavedCount int
-	if d.DirtyGroups != nil {
-		var dirtyIDs []string
-		d.DirtyGroups.Range(func(groupID string, _ int64) bool {
-			dirtyIDs = append(dirtyIDs, groupID)
-			return true
-		})
-
-		for _, groupID := range dirtyIDs {
-			groupCount++
-			groupInfo, ok := d.ImSession.ServiceAtNew.Load(groupID)
-			if !ok || groupInfo == nil {
-				d.DirtyGroups.Delete(groupID)
-				continue
-			}
-
-			if groupInfo.Players != nil {
-				groupInfo.Players.Range(func(key string, value *GroupPlayerInfo) bool {
-					playerCount++
-					if value.UpdatedAtTime != 0 {
-						playerSavedCount++
-						now := int(time.Now().Unix())
-						value.UserID = key
-						value.GroupID = groupInfo.GroupID
-						value.UpdatedAt = now
-						_ = service.GroupPlayerInfoSave(d.DBOperator, (*model.GroupPlayerInfoBase)(value))
-						value.UpdatedAtTime = 0
-					}
-					return true
-				})
-			}
-
-			if groupInfo.UpdatedAtTime != 0 {
-				groupSavedCount++
-				data, err := json.Marshal(groupInfo)
-				if err == nil {
-					err := service.GroupInfoSave(d.DBOperator, groupInfo.GroupID, groupInfo.UpdatedAtTime, data)
-					if err != nil {
-						d.Logger.Warnf("保存群组数据失败 %v : %v", groupInfo.GroupID, err.Error())
-					}
-					groupInfo.UpdatedAtTime = 0
-				}
-			}
-
-			d.DirtyGroups.Delete(groupID)
-		}
-	}
-	groupDuration := time.Since(groupStartTime)
-
-	attrsStartTime := time.Now()
-	// 同步全部属性数据：个人角色卡、群内角色卡、群数据、个人全局数据
-	err := d.AttrsManager.CheckForSave()
-	if err != nil {
-		d.Logger.Errorf("保存属性数据失败 %v", err)
-	}
-	attrsDuration := time.Since(attrsStartTime)
-
-	// 保存黑名单数据
-	// TODO: 增加更新时间检测
-	// model.BanMapSet(d.DBData, d.Config.BanList.MapToJSON())
-
-	// endpoint数据额外更新到数据库
-	epStartTime := time.Now()
-	var epCount int
-	for _, ep := range d.ImSession.EndPoints {
-		// 为了避免Restore时没有UserId, Dump时有UserId, 导致空白数据被错误落库的情况, 这里提前做判断
-		if len(ep.UserID) > 0 {
-			epCount++
-			/* NOTE(Xiangze Li): 按理说Restore只需要在每个ep新增时做一次. 但是许多ep都是异步
-			   连接, 并且在连接真正完成之后才有UserId. 所以干脆每次保存数据都尝试一次Restore. */
-			ep.StatsRestore(d)
-			ep.StatsDump(d)
-		}
-	}
-	epDuration := time.Since(epStartTime)
-
-	totalDuration := time.Since(saveStartTime)
-	if playerSavedCount >= 1 || groupSavedCount >= 1 {
-		d.Logger.Infof("Save 完成，耗时统计: 总计 %dms | 配置文件 %dms | 群组/玩家 %dms (群%d/%d, 玩家%d/%d) | 属性 %dms | EP %dms (%d个)",
-			totalDuration.Milliseconds(),
-			configDuration.Milliseconds(),
-			groupDuration.Milliseconds(), groupSavedCount, groupCount, playerSavedCount, playerCount,
-			attrsDuration.Milliseconds(),
-			epDuration.Milliseconds(), epCount)
 	}
 }

@@ -11,9 +11,7 @@ type Descriptor struct {
 	Author   string
 
 	ABIMajor     uint32
-	ABIMinor     uint32
 	HostABIMajor uint32
-	HostABIMinor uint32
 
 	Capabilities CapabilitySet
 	// Services lists explicitly supported host-service names. Native ABI
@@ -36,14 +34,15 @@ type RuntimeManifest struct {
 	Author   string
 
 	ABIMajor     uint32
-	ABIMinor     uint32
 	HostABIMajor uint32
-	HostABIMinor uint32
 
 	Capabilities CapabilitySet
 	Services     []string
 	Extensions   []string
 	Path         string
+	// Load is invoked lazily by Registry.Resolve. It is process-local metadata
+	// and is never serialized into runtime manifests.
+	Load func() (Provider, error)
 
 	// Descriptor permits callers that already have manifest-shaped metadata to
 	// pass it without exposing a loader or provider callback in the registry.
@@ -70,14 +69,8 @@ func (m RuntimeManifest) descriptor() Descriptor {
 	if m.ABIMajor != 0 {
 		d.ABIMajor = m.ABIMajor
 	}
-	if m.ABIMinor != 0 {
-		d.ABIMinor = m.ABIMinor
-	}
 	if m.HostABIMajor != 0 {
 		d.HostABIMajor = m.HostABIMajor
-	}
-	if m.HostABIMinor != 0 {
-		d.HostABIMinor = m.HostABIMinor
 	}
 	if m.Capabilities != 0 {
 		d.Capabilities = m.Capabilities

@@ -3,11 +3,12 @@ package dice //nolint:testpackage // tests rely on unexported helpers
 
 import (
 	"errors"
+	"testing"
+	"time"
+
 	"github.com/dop251/goja"
 	"github.com/dop251/goja_nodejs/eventloop"
 	"go.uber.org/zap"
-	"testing"
-	"time"
 
 	"Scardice-core/utils/jsengine"
 	gojaengine "Scardice-core/utils/jsengine/goja"
@@ -527,8 +528,11 @@ func startCommandSolveTestLoop(t *testing.T) (jsengine.Loop, *goja.Runtime) {
 
 func TestCommandSolve_UsesSolveRawOverrideForNonJsCommand(t *testing.T) {
 	commandName := "rolltest"
+	neutralCommandName := "neutral-rolltest"
 	solveHit := 0
 	overrideHit := 0
+	neutralSolveHit := 0
+	neutralOverrideHit := 0
 
 	loop, vm := startCommandSolveTestLoop(t)
 
@@ -552,13 +556,29 @@ func TestCommandSolve_UsesSolveRawOverrideForNonJsCommand(t *testing.T) {
 					})
 				},
 			},
+			neutralCommandName: {
+				Name: neutralCommandName,
+				Raw:  true,
+				// Simulate replacing solve on a command copied through ext.find.
+				Solve: func(_ *MsgContext, _ *Message, _ *CmdArgs) CmdExecuteResult {
+					neutralSolveHit++
+					return CmdExecuteResult{Matched: true, Solved: false}
+				},
+				SolveCallback: func(_ *MsgContext, _ *Message, _ *CmdArgs) (jsengine.Value, error) {
+					neutralOverrideHit++
+					return gojaengine.WrapValue(vm, vm.ToValue(map[string]interface{}{
+						"matched": true,
+						"solved":  true,
+					})), nil
+				},
+			},
 		},
 		DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
 	}
 
 	session, ctx := newCommandSolveTestSessionAndContext("dnd5e", []*ExtInfo{ext})
 	ctx.Dice.ExtLoopManager = NewJsLoopManager()
-	_ = ctx.Dice.ExtLoopManager.SetLoop(loop)
+	ext.JSLoopVersion = ctx.Dice.ExtLoopManager.SetLoop(loop)
 
 	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})
 	if result.Status != commandSolveSolved {
@@ -570,38 +590,69 @@ func TestCommandSolve_UsesSolveRawOverrideForNonJsCommand(t *testing.T) {
 	if solveHit != 0 {
 		t.Fatalf("expected legacy Solve not to execute when SolveRaw override exists, got %d", solveHit)
 	}
+
+	neutralResult := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: neutralCommandName})
+	if neutralResult.Status != commandSolveSolved {
+		t.Fatalf("expected neutral override solved status, got %v", neutralResult.Status)
+	}
+	if neutralOverrideHit != 1 {
+		t.Fatalf("expected neutral solve override to execute once, got %d", neutralOverrideHit)
+	}
+	if neutralSolveHit != 0 {
+		t.Fatalf("expected copied Solve not to execute when neutral override exists, got %d", neutralSolveHit)
+	}
 }
 
 func TestCommandSolve_UsesEngineNeutralCallback(t *testing.T) {
 	commandName := "engine-test"
 	callbackHit := 0
+	sendHit := make(chan struct{}, 1)
 	loop := gojaengine.New()
 	t.Cleanup(func() { _ = loop.Close() })
 
 	var ext *ExtInfo
 	ext = &ExtInfo{
 		Name:    "dnd5e",
-		IsJsExt: false,
+		IsJsExt: true,
 		CmdMap: CmdMapCls{
 			commandName: {
 				Name:          commandName,
 				Raw:           true,
 				IsJsSolveFunc: true,
-				SolveEngine: func(runtime jsengine.Runtime, ctx *MsgContext, _ *Message, _ *CmdArgs) (jsengine.Value, error) {
+				SolveEngine: func(runtime jsengine.Runtime, ctx *MsgContext, msg *Message, _ *CmdArgs) (jsengine.Value, error) {
 					callbackHit++
 					if jsContextPlugin(jsExecutionContextFor(loop)) != ext {
 						return nil, errors.New("callback context was not installed")
 					}
+					ext.CallOnMessageSend(ctx.Dice, ctx, msg, "")
 					return runtime.RunString("engine-solve.js", "({ matched: true, solved: true })")
 				},
 			},
 		},
 		DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
 	}
+	ext.OnMessageSendCallback = func(_ *MsgContext, _ *Message, _ string) (jsengine.Value, error) {
+		sendHit <- struct{}{}
+		return nil, nil
+	}
 
-	session, ctx := newCommandSolveTestSessionAndContext("dnd5e", []*ExtInfo{ext})
+	wrapper := &ExtInfo{
+		Name:           ext.Name,
+		IsJsExt:        true,
+		IsWrapper:      true,
+		TargetName:     ext.Name,
+		DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
+	}
+
+	session, ctx := newCommandSolveTestSessionAndContext("dnd5e", []*ExtInfo{wrapper})
+	ctx.Dice.JsExtRegistry = new(SyncMap[string, *ExtInfo])
+	ctx.Dice.JsExtRegistry.Store(ext.Name, ext)
+	ctx.Dice.Config.JsEnable = true
+	wrapper.dice = ctx.Dice
+	ext.dice = ctx.Dice
 	ctx.Dice.ExtLoopManager = NewJsLoopManager()
 	ext.JSLoopVersion = ctx.Dice.ExtLoopManager.SetLoop(loop)
+	wrapper.JSLoopVersion = ext.JSLoopVersion
 	ext.CmdMap[commandName].JSLoopVersion = ext.JSLoopVersion
 
 	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})
@@ -610,6 +661,11 @@ func TestCommandSolve_UsesEngineNeutralCallback(t *testing.T) {
 	}
 	if callbackHit != 1 {
 		t.Fatalf("expected engine callback once, got %d", callbackHit)
+	}
+	select {
+	case <-sendHit:
+	case <-time.After(time.Second):
+		t.Fatal("reentrant onMessageSend did not execute in the real extension realm")
 	}
 	if jsengine.CurrentContext(loop) != nil {
 		t.Fatalf("loop context was not restored: %v", jsengine.CurrentContext(loop))

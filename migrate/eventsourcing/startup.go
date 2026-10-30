@@ -22,11 +22,17 @@ func ValidateStartupReadiness(ctx context.Context, repository eventstore.Readine
 	if repository == nil {
 		return eventstore.Readiness{}, eventstore.ErrReadinessInvalid
 	}
-	readiness, err := repository.GetReadiness(ctx)
-	if err != nil {
-		return eventstore.Readiness{}, err
+	var readiness eventstore.Readiness
+	var err error
+	if metadata, ok := repository.(eventstore.ReadinessMetadataRepository); ok {
+		readiness, err = metadata.GetReadinessMetadata(ctx)
+	} else {
+		readiness, err = repository.GetReadiness(ctx)
+		if err == nil {
+			err = ValidatePublication(readiness)
+		}
 	}
-	if err := ValidatePublication(readiness); err != nil {
+	if err != nil {
 		return eventstore.Readiness{}, err
 	}
 	if legacyStatePresent {

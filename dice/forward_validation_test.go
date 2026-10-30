@@ -1,7 +1,6 @@
 package dice
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -13,7 +12,6 @@ import (
 	milky "github.com/Szzrain/Milky-go-sdk"
 	"go.uber.org/zap"
 
-	emitter "Scardice-core/dice/imsdk/onebot"
 	"Scardice-core/message"
 	"Scardice-core/utils/jsengine"
 )
@@ -101,136 +99,6 @@ func TestWelcomeReplyKeepsForwardBoundariesUntilDelivery(t *testing.T) {
 	}
 }
 
-type onebotForwardRawEmitter struct {
-	*onebotRecallTestEmitter
-	muRaw       sync.Mutex
-	action      emitter.Action
-	params      any
-	response    []byte
-	responseErr error
-}
-
-func TestOnebotForwardQueueIsAsyncAndFIFO(t *testing.T) {
-	adapter := &PlatformAdapterOnebot{logger: zap.NewNop().Sugar()}
-	firstStarted := make(chan struct{})
-	releaseFirst := make(chan struct{})
-	order := make(chan int, 2)
-
-	if !adapter.enqueueOnebotForwardJob(func() {
-		close(firstStarted)
-		<-releaseFirst
-		order <- 1
-	}) {
-		t.Fatal("first forward job was not queued")
-	}
-
-	select {
-	case <-firstStarted:
-	case <-time.After(time.Second):
-		t.Fatal("forward queue worker did not start")
-	}
-
-	queued := make(chan bool, 1)
-	go func() {
-		queued <- adapter.enqueueOnebotForwardJob(func() { order <- 2 })
-	}()
-	select {
-	case ok := <-queued:
-		if !ok {
-			t.Fatal("second forward job was not queued")
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("enqueue blocked behind the running forward request")
-	}
-
-	select {
-	case got := <-order:
-		t.Fatalf("job %d completed before the first job was released", got)
-	default:
-	}
-
-	close(releaseFirst)
-	for want := 1; want <= 2; want++ {
-		select {
-		case got := <-order:
-			if got != want {
-				t.Fatalf("completion order = %d, want %d", got, want)
-			}
-		case <-time.After(time.Second):
-			t.Fatalf("timed out waiting for job %d", want)
-		}
-	}
-}
-
-func TestOnebotForwardQueueRejectsOverflow(t *testing.T) {
-	adapter := &PlatformAdapterOnebot{
-		forwardQueue:        make([]func(), maxOnebotForwardQueueSize),
-		forwardQueueRunning: true,
-	}
-	if adapter.enqueueOnebotForwardJob(func() {}) {
-		t.Fatal("full forward queue accepted another job")
-	}
-}
-
-func (e *onebotForwardRawEmitter) Raw(_ context.Context, action emitter.Action, params any) ([]byte, error) {
-	e.muRaw.Lock()
-	e.action, e.params = action, params
-	e.muRaw.Unlock()
-	return e.response, e.responseErr
-}
-
-func TestOnebotForwardSendAndExpandProtocolPayloads(t *testing.T) {
-	em := &onebotForwardRawEmitter{onebotRecallTestEmitter: &onebotRecallTestEmitter{}}
-	endpoint := &EndPointInfo{EndPointInfoBase: EndPointInfoBase{UserID: "QQ:4242", Nickname: "SelfBot"}}
-	adapter := &PlatformAdapterOnebot{EndPoint: endpoint, sendEmitter: em, ctx: context.Background(), logger: zap.NewNop().Sugar()}
-	nodes := []message.ForwardNode{{SenderID: "4242", SenderName: "SelfBot", Elements: message.ConvertStringMessage("hello")}}
-	if !adapter.SendGroupForwardMsg(&MsgContext{EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Platform: "TEST"}}}, "QQ-Group:9000", nodes) {
-		t.Fatal("OneBot forward send failed")
-	}
-	em.muRaw.Lock()
-	if em.action != "send_group_forward_msg" {
-		t.Fatalf("action = %q", em.action)
-	}
-	payload, err := json.Marshal(em.params)
-	em.muRaw.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var sent struct {
-		GroupID  int64 `json:"group_id"`
-		Messages []struct {
-			Type string `json:"type"`
-			Data struct {
-				UserID   string `json:"user_id"`
-				Nickname string `json:"nickname"`
-				Uin      string `json:"uin"`
-				Name     string `json:"name"`
-				Content  []struct {
-					Type string `json:"type"`
-				} `json:"content"`
-			} `json:"data"`
-		} `json:"messages"`
-	}
-	if err = json.Unmarshal(payload, &sent); err != nil {
-		t.Fatal(err)
-	}
-	if sent.GroupID != 9000 || len(sent.Messages) != 1 || sent.Messages[0].Type != "node" || sent.Messages[0].Data.UserID != "4242" || sent.Messages[0].Data.Uin != "4242" || sent.Messages[0].Data.Nickname != "SelfBot" || sent.Messages[0].Data.Name != "SelfBot" || len(sent.Messages[0].Data.Content) != 1 || sent.Messages[0].Data.Content[0].Type != "text" {
-		t.Fatalf("unexpected OneBot payload: %s", payload)
-	}
-
-	em.response = []byte(`{"status":"ok","retcode":0,"data":{"message":[{"type":"node","data":{"user_id":10001,"nickname":"nested","content":[{"type":"text","data":{"text":".r 9d9"}}]}}]}}`)
-	msg := &Message{Segment: []message.IMessageElement{&message.ForwardElement{Kind: "forward", ForwardID: "forward-1"}}}
-	adapter.expandOnebotForwards(msg)
-	forward := msg.Segment[0].(*message.ForwardElement)
-	if !forward.Loaded || len(forward.Nodes) != 1 || message.ConvertMessageElementsToString(forward.Nodes[0].Elements) != ".r 9d9" {
-		t.Fatalf("OneBot expansion = %#v", forward)
-	}
-	ensureMessageTextFromSegments(msg)
-	if msg.Message == ".r 9d9" {
-		t.Fatalf("expanded command leaked into routing text")
-	}
-}
-
 func TestGocqForwardCustomNodeUsesOneBotStringUserID(t *testing.T) {
 	nodes := buildGocqForwardNodes([]message.ForwardNode{{
 		SenderID: "4242", SenderName: "SelfBot", Elements: message.ConvertStringMessage("hello"),
@@ -255,27 +123,6 @@ func TestGocqForwardCustomNodeUsesOneBotStringUserID(t *testing.T) {
 	}
 	if wire.Data.UserID != "4242" || wire.Data.Uin != "4242" || wire.Data.Nickname != "SelfBot" || wire.Data.Name != "SelfBot" {
 		t.Fatalf("unexpected OneBot custom-node payload: %s", payload)
-	}
-}
-
-func TestOnebotForwardResponseSupportsNapCatMessageShapeAndLogsNodes(t *testing.T) {
-	raw := []byte(`{"status":"ok","retcode":0,"data":{"messages":[{"message_id":7,"time":123,"sender":{"user_id":10001,"nickname":"nested"},"message":[{"type":"text","data":{"text":"inside text"}}]}]}}`)
-	nodes, err := parseOnebotForwardResponse(zap.NewNop().Sugar(), raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	msg := &Message{
-		Message: "[CQ:forward,id=forward-1]",
-		Segment: []message.IMessageElement{&message.ForwardElement{
-			Kind: "forward", ForwardID: "forward-1", Loaded: true, Nodes: nodes,
-		}},
-	}
-	logged := incomingMessageLogText(msg)
-	if !strings.Contains(logged, "[合并转发解析]") || !strings.Contains(logged, "<nested>(10001): inside text") {
-		t.Fatalf("forward log text = %q", logged)
-	}
-	if strings.Contains(msg.Message, "inside text") {
-		t.Fatalf("expanded forward leaked into routing text: %q", msg.Message)
 	}
 }
 
@@ -439,7 +286,7 @@ func TestPluginForwardAPIBindingsCanConstructAndSend(t *testing.T) {
 	adapter := newForwardCaptureAdapter()
 	d := &Dice{
 		Logger: zap.NewNop().Sugar(), BaseConfig: BaseConfig{DataDir: t.TempDir()},
-		ImSession:   &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo]), EndPoints: []*EndPointInfo{}},
+		ImSession:   &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
 		DirtyGroups: new(SyncMap[string, int64]), AttrsManager: &AttrsManager{},
 	}
 	endpoint := &EndPointInfo{EndPointInfoBase: EndPointInfoBase{UserID: "QQ:4242", Nickname: "SelfBot", Platform: "TEST"}, Adapter: adapter}

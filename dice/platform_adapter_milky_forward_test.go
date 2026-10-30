@@ -122,7 +122,7 @@ func newMilkyForwardTestContext(session *milky.Session, onMessageSend func(*MsgC
 	}}
 	adapter := &PlatformAdapterMilky{EndPoint: endpoint, IntentSession: session}
 	endpoint.Adapter = adapter
-	endpoint.BindRuntime(dice.ImSession)
+	endpoint.bindCompatibilityRuntime(dice.ImSession)
 	return adapter, &MsgContext{Dice: dice, EndPoint: endpoint}
 }
 

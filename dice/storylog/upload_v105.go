@@ -63,7 +63,7 @@ func GetLogTxtAndParquetFile(env UploadEnv) (*os.File, *bytes.Buffer, error) {
 				return
 			default:
 				// 获取当前游标对应的数据
-				cursorLines, cursor, err0 := service.LogGetExportCursorLines(env.Db, env.GroupID, env.LogName, currentCursor)
+				cursorLines, cursor, err0 := env.Repo.ExportCursorEntries(env.GroupID, env.LogName, currentCursor)
 				if err0 != nil {
 					resultCh <- err0
 					return
@@ -71,9 +71,7 @@ func GetLogTxtAndParquetFile(env UploadEnv) (*os.File, *bytes.Buffer, error) {
 
 				// 写入当前批次的数据
 				for _, line := range cursorLines {
-					timeTxt := time.Unix(line.Time, 0).Format("2006-01-02 15:04:05")
-					text := fmt.Sprintf("%s(%v) %s\n%s\n\n", line.Nickname, line.IMUserID, timeTxt, line.Message)
-					if _, err0 = tempLog.WriteString(text); err0 != nil {
+					if err0 := WriteLogTextParquet(tempLog, line); err0 != nil {
 						resultCh <- fmt.Errorf("写入日志导出临时文件失败: %w", err0)
 						return
 					}
@@ -136,9 +134,12 @@ func GetLogTxtAndParquetFile(env UploadEnv) (*os.File, *bytes.Buffer, error) {
 func uploadV105(env UploadEnv) (string, string, error) {
 	_ = os.MkdirAll(env.Dir, 0o755)
 
-	url, uploadTS, updateTS, _ := service.LogGetUploadInfo(env.Db, env.GroupID, env.LogName)
-	if len(url) > 0 && uploadTS > updateTS {
-		// 已有URL且上传时间晚于Log更新时间（最后录入时间），直接返回
+	url, uploadTS, updateTS, infoErr := env.Repo.UploadInfo(env.GroupID, env.LogName)
+	if infoErr != nil && !errors.Is(infoErr, service.ErrLogNotFound) {
+		return "", env.Notice, infoErr
+	}
+	if len(url) > 0 && uploadTS >= updateTS {
+		// 上传时间不早于Log更新时间（最后录入时间）时复用已有URL
 		env.Log.Infof(
 			"查询到之前上传的URL, 直接使用 Log:%s.%s 上传时间:%s 更新时间:%s URL:%s",
 			env.GroupID, env.LogName,
@@ -173,8 +174,9 @@ func uploadV105(env UploadEnv) (string, string, error) {
 	}
 
 	url = parquetUploadToSealBackends(env, b.Bytes())
-	if errDB := service.LogSetUploadInfo(env.Db, env.GroupID, env.LogName, url); errDB != nil {
+	if errDB := env.Repo.SetUploadInfo(env.GroupID, env.LogName, url); errDB != nil {
 		env.Log.Errorf("记录Log上传信息失败: %v", errDB)
+		return "", env.Notice, fmt.Errorf("远端上传已成功（%s），但本地保存上传信息失败: %w", url, errDB)
 	}
 	if len(url) == 0 {
 		return "", env.Notice, errors.New("上传 log 到服务器失败，未能获取染色器链接")

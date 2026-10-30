@@ -46,6 +46,7 @@ const (
 	CommandEnable           CommandKind = "enable"
 	CommandDisable          CommandKind = "disable"
 	CommandSetDefaults      CommandKind = "set_defaults"
+	CommandClearDefaults    CommandKind = "clear_defaults"
 	CommandRegisterConfig   CommandKind = "register_config"
 	CommandUnregisterConfig CommandKind = "unregister_config"
 	CommandSetConfig        CommandKind = "set_config"
@@ -57,6 +58,7 @@ const (
 	Enable           = CommandEnable
 	Disable          = CommandDisable
 	SetDefaults      = CommandSetDefaults
+	ClearDefaults    = CommandClearDefaults
 	RegisterConfig   = CommandRegisterConfig
 	UnregisterConfig = CommandUnregisterConfig
 	SetConfig        = CommandSetConfig
@@ -191,16 +193,64 @@ func ApplyEnvelope(state State, envelope eventstore.Envelope) (State, error) {
 	}
 	return next, nil
 }
+
+// ReplayEnvelopes folds a stored history into a state.
+//
+// Every stored event was validated against the state it produced when it was
+// appended, so replay applies them in place and validates the final state once.
+// Cloning and revalidating the whole state per event would make replay
+// quadratic in the length of the stream. New events still go through
+// ApplyEnvelope, which keeps the strict per-event check.
 func ReplayEnvelopes(events []eventstore.Envelope) (State, error) {
 	state := State{}
-	for _, event := range events {
-		var err error
-		state, err = ApplyEnvelope(state, event)
-		if err != nil {
-			return State{}, err
-		}
+	if err := replayInto(&state, events); err != nil {
+		return State{}, err
 	}
 	return state, nil
+}
+
+// replayInto applies a stored history on top of state, which the caller must
+// own exclusively. On error state is left partially applied and must be discarded.
+func replayInto(state *State, events []eventstore.Envelope) error {
+	for _, envelope := range events {
+		if err := applyStoredEnvelope(state, envelope); err != nil {
+			return err
+		}
+	}
+	return ValidateState(*state)
+}
+
+func applyStoredEnvelope(state *State, envelope eventstore.Envelope) error {
+	if envelope.Stream.AggregateType != ExtensionAggregateType || envelope.SchemaVersion != ExtensionEventSchemaVersion {
+		return fmt.Errorf("%w: schema or aggregate type", ErrInvalidEvent)
+	}
+	if envelope.StreamVersion != state.Version+1 {
+		return ErrInvalidState
+	}
+	if len(envelope.Payload) > MaxExtensionEventPayloadBytes {
+		return &eventstore.OversizeError{Bound: "extensionstate event payload", Limit: MaxExtensionEventPayloadBytes, Actual: len(envelope.Payload)}
+	}
+	event, err := DecodeEvent(EventType(envelope.EventType), envelope.Payload)
+	if err != nil {
+		return err
+	}
+	if isNilEvent(event) || !event.EventType().Valid() {
+		return ErrInvalidEvent
+	}
+	if err := event.validate(); err != nil {
+		return err
+	}
+	if state.Version == ^uint64(0) {
+		return ErrInvalidState
+	}
+	if err := event.apply(state); err != nil {
+		return err
+	}
+	state.Version++
+	if state.DiceID == "" || ExtensionStream(state.DiceID).AggregateID != envelope.Stream.AggregateID {
+		return ErrInvalidIdentity
+	}
+	return nil
 }
 
 func ValidateState(state State) error {
@@ -282,10 +332,10 @@ func Decide(state State, command Command) (Decision, error) {
 	if kind == "" {
 		kind = command.Type
 	}
-	switch kind {
-	case CommandImportBaseline:
+	if kind == CommandImportBaseline {
 		return decideBaseline(state, command)
-	case CommandDiscover:
+	}
+	if kind == CommandDiscover {
 		if err := validateIdentity(command.DiceID); err != nil || validateExtensionIdentity(command.Identity) != nil {
 			return Decision{}, ErrInvalidCommand
 		}
@@ -296,7 +346,10 @@ func Decide(state State, command Command) (Decision, error) {
 			if reflectIdentityEqual(existing, command.Identity) {
 				return Decision{}, nil
 			}
-			return Decision{}, ErrInvalidState
+			if !allowedExtensionIdentityTransition(existing, command.Identity) {
+				return Decision{}, ErrInvalidIdentity
+			}
+			return Decision{Events: []TypedEvent{NewExtensionIdentityChangedV1(existing, command.Identity)}}, nil
 		}
 		return Decision{Events: []TypedEvent{NewExtensionDiscoveredV1(command.DiceID, command.Identity)}}, nil
 	}
@@ -345,6 +398,17 @@ func Decide(state State, command Command) (Decision, error) {
 		}
 		sortStrings(disabled)
 		return Decision{Events: []TypedEvent{NewExtensionDefaultsChangedV1(command.ExtensionID, config.AutoActive, disabled)}}, nil
+	case CommandClearDefaults:
+		if err := validateIdentifier(command.ExtensionID); err != nil {
+			return Decision{}, ErrInvalidCommand
+		}
+		if _, ok := state.Extensions[command.ExtensionID]; !ok {
+			return Decision{}, ErrUnknownExtension
+		}
+		if _, exists := state.DefaultCommands[command.ExtensionID]; !exists {
+			return Decision{}, nil
+		}
+		return Decision{Events: []TypedEvent{NewExtensionDefaultsClearedV1(command.ExtensionID)}}, nil
 	case CommandRegisterConfig:
 		def := command.Definition
 		if def.ExtensionID == "" {

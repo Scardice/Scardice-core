@@ -1,7 +1,6 @@
 package dice
 
 import (
-	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -9,34 +8,8 @@ import (
 	"go.uber.org/zap"
 )
 
-func TestEnumNonLoopbackIPv4_Filters(t *testing.T) {
-	// enumNonLoopbackIPv4 依赖系统网卡，此处仅验证过滤规则：
-	// 构造一批 IP，手动复现过滤逻辑验证。
-	cases := []struct {
-		name     string
-		ip       string
-		filtered bool
-	}{
-		{"loopback v4", "127.0.0.1", true},
-		{"loopback v4 alt", "127.0.0.2", true},
-		{"link-local", "169.254.1.1", true},
-		{"docker0 gw", "172.17.0.1", true},
-		{"normal container ip", "172.21.0.5", false},
-		{"normal lan ip", "192.168.1.10", false},
-	}
-	for _, c := range cases {
-		ip := net.ParseIP(c.ip).To4()
-		if ip == nil {
-			t.Fatalf("%s: parse failed", c.ip)
-		}
-		loopback := ip.IsLoopback()
-		linkLocal := ip[0] == 169 && ip[1] == 254
-		dockerGw := ip[0] == 172 && ip[1] == 17 && ip[2] == 0 && ip[3] == 1
-		gotFiltered := loopback || linkLocal || dockerGw
-		if gotFiltered != c.filtered {
-			t.Errorf("%s: expected filtered=%v, got %v", c.name, c.filtered, gotFiltered)
-		}
-	}
+func newServingAssetResolver(serveAddress string) *onebotAssetResolver {
+	return &onebotAssetResolver{assetServeAddress: serveAddress, logger: zap.NewNop().Sugar()}
 }
 
 func TestExtractServePort_DefaultAndParsed(t *testing.T) {
@@ -51,17 +24,11 @@ func TestExtractServePort_DefaultAndParsed(t *testing.T) {
 		{"0.0.0.0:8080", "8080"},
 		{"invalid", "3211"},
 		{"1.2.3.4:notaport", "3211"},
+		{"1.2.3.4:0", "3211"},
+		{"1.2.3.4:65536", "3211"},
 	}
 	for _, c := range cases {
-		p := &PlatformAdapterOnebot{
-			EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Session: &IMSession{
-				Parent: &Dice{
-					Parent: &DiceManager{ServeAddress: c.addr},
-				},
-			}}},
-			logger: zap.NewNop().Sugar(),
-		}
-		got := p.extractServePort()
+		got := newServingAssetResolver(c.addr).extractServePort()
 		if got != c.want {
 			t.Errorf("addr=%q: want port %q, got %q", c.addr, c.want, got)
 		}
@@ -69,13 +36,8 @@ func TestExtractServePort_DefaultAndParsed(t *testing.T) {
 }
 
 func TestDeriveImageAssetBaseURL_UserConfigWins(t *testing.T) {
-	p := &PlatformAdapterOnebot{
-		ImageAssetBaseURL: "http://user-configured:9999",
-		EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Session: &IMSession{
-			Parent: &Dice{Parent: &DiceManager{ServeAddress: "0.0.0.0:3211"}},
-		}}},
-		logger: zap.NewNop().Sugar(),
-	}
+	p := newServingAssetResolver("0.0.0.0:3211")
+	p.ImageAssetBaseURL = "http://user-configured:9999"
 	url, candidates := p.DeriveImageAssetBaseURLForDisplay()
 	if url != "http://user-configured:9999" {
 		t.Errorf("user config should win, got %q", url)
@@ -87,12 +49,7 @@ func TestDeriveImageAssetBaseURL_UserConfigWins(t *testing.T) {
 
 func TestDeriveImageAssetBaseURL_AutoFallbackToLoopback(t *testing.T) {
 	// 在无网卡或仅有 loopback 的测试环境，自动推导应兜底 127.0.0.1
-	p := &PlatformAdapterOnebot{
-		EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Session: &IMSession{
-			Parent: &Dice{Parent: &DiceManager{ServeAddress: "0.0.0.0:3211"}},
-		}}},
-		logger: zap.NewNop().Sugar(),
-	}
+	p := newServingAssetResolver("0.0.0.0:3211")
 	url, candidates := p.DeriveImageAssetBaseURLForDisplay()
 	// 不能假设测试环境必然无 IPv4，但 url 必须是 http:// 开头 + 端口 3211
 	if !strings.HasPrefix(url, "http://") {
@@ -108,12 +65,7 @@ func TestDeriveImageAssetBaseURL_AutoFallbackToLoopback(t *testing.T) {
 }
 
 func TestInvalidateDerivedBaseURL_ResetsCache(t *testing.T) {
-	p := &PlatformAdapterOnebot{
-		EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Session: &IMSession{
-			Parent: &Dice{Parent: &DiceManager{ServeAddress: "0.0.0.0:3211"}},
-		}}},
-		logger: zap.NewNop().Sugar(),
-	}
+	p := newServingAssetResolver("0.0.0.0:3211")
 	// 第一次推导，写入缓存
 	url1 := p.deriveImageAssetBaseURL()
 	if url1 == "" {
@@ -138,16 +90,9 @@ func TestInvalidateDerivedBaseURL_ResetsCache(t *testing.T) {
 	}
 }
 
-// TestDeriveImageAssetBaseURL_ConcurrentWithInvalidate 检测 sync.Once 字段替换的数据竞态。
-// 用 `go test -race` 运行：当前实现 p.derivedURLOnce = sync.Once{} 替换 struct 字段不是原子操作，
-// 与并发 deriveImageAssetBaseURL 的 Do 调用访问同一字段会产生 DATA RACE。
+// TestDeriveImageAssetBaseURL_ConcurrentWithInvalidate 在 `go test -race` 下检测缓存的并发读写。
 func TestDeriveImageAssetBaseURL_ConcurrentWithInvalidate(t *testing.T) {
-	p := &PlatformAdapterOnebot{
-		EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Session: &IMSession{
-			Parent: &Dice{Parent: &DiceManager{ServeAddress: "0.0.0.0:3211"}},
-		}}},
-		logger: zap.NewNop().Sugar(),
-	}
+	p := newServingAssetResolver("0.0.0.0:3211")
 
 	var wg sync.WaitGroup
 	const workers = 8
@@ -174,12 +119,7 @@ func TestDeriveImageAssetBaseURL_ConcurrentWithInvalidate(t *testing.T) {
 // 返回的 url 与 candidates[0] 一致（之前实现两次调用 computeDerivedBaseURL，
 // enumNonLoopbackIPv4 顺序不稳定导致 url 和 candidates 可能不匹配）。
 func TestDeriveImageAssetBaseURLForDisplay_UrlConsistentWithCandidates(t *testing.T) {
-	p := &PlatformAdapterOnebot{
-		EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Session: &IMSession{
-			Parent: &Dice{Parent: &DiceManager{ServeAddress: "0.0.0.0:3211"}},
-		}}},
-		logger: zap.NewNop().Sugar(),
-	}
+	p := newServingAssetResolver("0.0.0.0:3211")
 	url, candidates := p.DeriveImageAssetBaseURLForDisplay()
 	if !strings.HasPrefix(url, "http://") {
 		t.Fatalf("url should start with http://, got %q", url)

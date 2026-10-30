@@ -122,7 +122,10 @@ int main(int argc, char **argv) {
     CHECK(strcmp(plugin->descriptor.id, "echo-runtime") == 0 &&
               strcmp(plugin->descriptor.language, "echo") == 0,
           "descriptor has static identity");
-    CHECK(plugin->api.struct_size == sizeof(plugin->api), "API struct size is exact");
+    CHECK(plugin->api.struct_size >= offsetof(sc_runtime_api_v1, service_event),
+          "API required prefix is present");
+    CHECK(plugin->api.struct_size < offsetof(sc_runtime_api_v1, tick) + sizeof(plugin->api.tick),
+          "API optional tail is omitted");
     g_api = &plugin->api;
 
     sc_host_api_v1 host = {sizeof(host), SC_HOST_ABI_MAJOR, SC_HOST_ABI_MINOR,
@@ -132,7 +135,6 @@ int main(int argc, char **argv) {
     STATUS(g_api->create(&host, 123, &info, &runtime), SC_OK, "create succeeds");
     CHECK(runtime != 0, "runtime handle is nonzero");
     STATUS(g_api->start(runtime), SC_OK, "start succeeds");
-    STATUS(g_api->tick(runtime), SC_OK, "tick succeeds");
 
     sc_value_t value = 0;
     STATUS(g_api->eval(runtime, sv("fixture.echo"), sv("1 + 2"), &value), SC_OK,
@@ -182,11 +184,11 @@ int main(int argc, char **argv) {
     required = 0;
     STATUS(g_api->value_to_utf8_copy(runtime, value, NULL, 0, &required), SC_EINVAL,
            "string first copy reports insufficient buffer");
-    CHECK(required == strlen("persistent") + 1, "string reports required capacity");
+    CHECK(required == strlen("persistent"), "string reports exact byte length");
     char text[32];
     STATUS(g_api->value_to_utf8_copy(runtime, value, text, sizeof(text), &required), SC_OK,
            "string second copy succeeds");
-    CHECK(strcmp(text, "persistent") == 0, "object string value round trips");
+    CHECK(memcmp(text, "persistent", required) == 0, "object string value round trips");
     g_api->value_release(runtime, value);
     g_api->value_release(runtime, object);
 

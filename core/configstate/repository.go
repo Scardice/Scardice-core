@@ -130,10 +130,53 @@ func (r *Repository) AppendTyped(ctx context.Context, diceID string, expected ui
 	if len(events) == 0 {
 		return eventstore.CommitResult{}, eventstore.ErrEmptyUnitOfWork
 	}
-	if metadata.EventID != "" && !validMetadata(metadata) {
-		return eventstore.CommitResult{}, eventstore.ErrInvalidMetadata
+	encoded, err := prepareTypedEvents(r.Factory, metadata, events)
+	if err != nil {
+		return eventstore.CommitResult{}, err
 	}
-	factory := r.Factory
+	return r.Append(ctx, diceID, expected, encoded)
+}
+
+// PrepareDecision builds a validated aggregate append without committing it.
+// Callers can combine the result with other owner streams in one UnitOfWork.
+func (r *Repository) PrepareDecision(state State, expected uint64, metadata eventstore.Metadata, command Command) (eventstore.StreamAppend, error) {
+	if r == nil || r.Store == nil {
+		return eventstore.StreamAppend{}, ErrRepositoryUnavailable
+	}
+	if state.Version != expected {
+		return eventstore.StreamAppend{}, eventstore.ErrConflict
+	}
+	decision, err := Decide(state, command)
+	if err != nil {
+		return eventstore.StreamAppend{}, err
+	}
+	if len(decision.Events) == 0 {
+		return eventstore.StreamAppend{}, nil
+	}
+	diceID := state.DiceID
+	if command.Kind == CommandImportBaseline || command.Type == CommandImportBaseline {
+		if command.Baseline == nil {
+			return eventstore.StreamAppend{}, ErrInvalidCommand
+		}
+		diceID = command.Baseline.DiceID
+	}
+	if !validID(diceID) {
+		return eventstore.StreamAppend{}, ErrInvalidIdentity
+	}
+	events, err := prepareTypedEvents(r.Factory, metadata, decision.Events)
+	if err != nil {
+		return eventstore.StreamAppend{}, err
+	}
+	return eventstore.StreamAppend{Stream: ConfigStream(diceID), ExpectedVersion: expected, Events: events}, nil
+}
+
+func prepareTypedEvents(factory eventstore.EventFactory, metadata eventstore.Metadata, events []TypedEvent) ([]eventstore.NewEvent, error) {
+	if len(events) == 0 {
+		return nil, eventstore.ErrEmptyUnitOfWork
+	}
+	if metadata.EventID != "" && !validMetadata(metadata) {
+		return nil, eventstore.ErrInvalidMetadata
+	}
 	if factory.Clock == nil {
 		factory.Clock = eventstore.SystemClock{}
 	}
@@ -147,22 +190,22 @@ func (r *Repository) AppendTyped(ctx context.Context, diceID string, expected ui
 		itemMetadata := metadata
 		if itemMetadata.EventID != "" {
 			if _, ok := explicit[itemMetadata.EventID]; ok {
-				return eventstore.CommitResult{}, eventstore.ErrConflict
+				return nil, eventstore.ErrConflict
 			}
 			explicit[itemMetadata.EventID] = struct{}{}
 		}
 		item, err := NewEventWithFactory(factory, event, itemMetadata)
 		if err != nil {
-			return eventstore.CommitResult{}, err
+			return nil, err
 		}
 		if _, ok := seen[item.Metadata.EventID]; ok {
-			return eventstore.CommitResult{}, eventstore.ErrConflict
+			return nil, eventstore.ErrConflict
 		}
 		seen[item.Metadata.EventID] = struct{}{}
 		encoded = append(encoded, item)
 		metadata.EventID = ""
 	}
-	return r.Append(ctx, diceID, expected, encoded)
+	return encoded, nil
 }
 func NewEvent(event TypedEvent, metadata eventstore.Metadata) (eventstore.NewEvent, error) {
 	if event == nil {

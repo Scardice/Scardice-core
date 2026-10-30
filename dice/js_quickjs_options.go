@@ -191,8 +191,25 @@ func quickJSPolicyMiBBytes(value uint64) (uint64, error) {
 	return value * 1024 * 1024, nil
 }
 
-// BuildQuickJSRuntimeOptions serializes JsConfig into the provider namespace.
+func cloneJSRuntimeOptions(options map[string]json.RawMessage) map[string]json.RawMessage {
+	if options == nil {
+		return nil
+	}
+	cloned := make(map[string]json.RawMessage, len(options))
+	for id, payload := range options {
+		cloned[id] = append(json.RawMessage(nil), payload...)
+	}
+	return cloned
+}
+
+// BuildQuickJSRuntimeOptions returns the configured QuickJS namespace. The
+// generic payload wins; legacy fields are converted only when it is absent.
 func BuildQuickJSRuntimeOptions(config JsConfig) (jsengine.RuntimeOptions, error) {
+	options, _, err := buildRuntimeOptionsForEngine("quickjs", config)
+	return options, err
+}
+
+func buildLegacyQuickJSRuntimeOptions(config JsConfig) (jsengine.RuntimeOptions, error) {
 	payload, err := BuildQuickJSOptionsPayload(config)
 	if err != nil {
 		return jsengine.RuntimeOptions{}, err
@@ -201,20 +218,66 @@ func BuildQuickJSRuntimeOptions(config JsConfig) (jsengine.RuntimeOptions, error
 	if err != nil {
 		return jsengine.RuntimeOptions{}, fmt.Errorf("marshal QuickJS options: %w", err)
 	}
-	return jsengine.RuntimeOptions{
-		Providers: map[jsengine.EngineID]json.RawMessage{
-			jsengine.EngineID("quickjs"): encoded,
-		},
-	}, nil
+	providers := make(map[jsengine.EngineID]json.RawMessage, 1)
+	providers["quickjs"] = encoded
+	return jsengine.RuntimeOptions{Providers: providers}, nil
+}
+
+func buildRuntimeOptionsForEngine(engine jsengine.EngineID, config JsConfig) (jsengine.RuntimeOptions, bool, error) {
+	engine = jsengine.NormalizeEngineID(string(engine))
+	var payload json.RawMessage
+	found := false
+	for configuredID, configuredPayload := range config.JsRuntimeOptions {
+		if jsengine.NormalizeEngineID(configuredID) != engine {
+			continue
+		}
+		if found {
+			return jsengine.RuntimeOptions{}, false, fmt.Errorf("duplicate runtime options namespace %q", engine)
+		}
+		payload = append(payload[:0], configuredPayload...)
+		found = true
+	}
+	if found {
+		providers := make(map[jsengine.EngineID]json.RawMessage, 1)
+		providers[engine] = payload
+		return jsengine.RuntimeOptions{Providers: providers}, true, nil
+	}
+	if engine == "quickjs" {
+		options, err := buildLegacyQuickJSRuntimeOptions(config)
+		return options, false, err
+	}
+	return jsengine.RuntimeOptions{}, false, nil
 }
 
 func BuildRuntimeOptionsForEngine(engine jsengine.EngineID, config JsConfig) (jsengine.RuntimeOptions, error) {
-	engine = jsengine.NormalizeEngineID(string(engine))
-	if engine != jsengine.EngineID("quickjs") {
-		return jsengine.RuntimeOptions{}, nil
-	}
-	return BuildQuickJSRuntimeOptions(config)
+	options, _, err := buildRuntimeOptionsForEngine(engine, config)
+	return options, err
 }
+
+func hasLegacyQuickJSRuntimeOptions(config JsConfig) bool {
+	return config.QuickJSMemoryLimitMiB != 0 ||
+		config.QuickJSGCThresholdMiB != 0 ||
+		config.QuickJSMaxStackSizeKiB != 0 ||
+		config.QuickJSExecuteTimeoutSeconds != 0 ||
+		config.QuickJSMaxFetchConcurrent != 0 ||
+		config.QuickJSMaxFetchResponseMiB != 0 ||
+		config.QuickJSMaxWebSocketConnections != 0 ||
+		config.QuickJSMaxWebSocketMessageMiB != 0 ||
+		config.QuickJSMaxFilesystemReadMiB != 0 ||
+		config.QuickJSMaxFilesystemWriteMiB != 0 ||
+		config.QuickJSMaxPBKDF2Iterations != 0 ||
+		config.QuickJSMaxPBKDF2OutputBytes != 0
+}
+
+func (d *Dice) runtimeOptionsForEngine(engine jsengine.EngineID) (jsengine.RuntimeOptions, error) {
+	engine = jsengine.NormalizeEngineID(string(engine))
+	options, generic, err := buildRuntimeOptionsForEngine(engine, d.Config.JsConfig)
+	if err == nil && generic && engine == "quickjs" && hasLegacyQuickJSRuntimeOptions(d.Config.JsConfig) && d.Logger != nil {
+		d.Logger.Warn("jsRuntimeOptions.quickjs overrides legacy QuickJS options")
+	}
+	return options, err
+}
+
 func (d *Dice) quickJSRuntimeOptions() (jsengine.RuntimeOptions, error) {
-	return BuildQuickJSRuntimeOptions(d.Config.JsConfig)
+	return d.runtimeOptionsForEngine("quickjs")
 }

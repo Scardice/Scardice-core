@@ -1,36 +1,42 @@
 package endpoint
 
 import (
-	"Scardice-core/adapterapi"
 	"context"
 	"errors"
 	"fmt"
 	"sync"
 	"time"
+
+	"Scardice-core/adapterapi"
+	"Scardice-core/eventstore"
 )
 
 var (
-	ErrSupervisorInvalidEffect   = errors.New("endpoint supervisor: invalid lifecycle effect")
-	ErrSupervisorNoDescriptor    = errors.New("endpoint supervisor: descriptor not found")
-	ErrSupervisorNoLifecycleSink = errors.New("endpoint supervisor: lifecycle sink is required")
-	ErrSupervisorNoInboundSink   = errors.New("endpoint supervisor: inbound sink is required")
-	ErrSupervisorStopTimeout     = errors.New("endpoint supervisor: stop timeout")
-	ErrSupervisorAmbiguous       = errors.New("endpoint supervisor: lifecycle is ambiguous")
-	ErrSupervisorShuttingDown    = errors.New("endpoint supervisor: shutting down")
-	ErrSupervisorClosed          = ErrSupervisorShuttingDown
+	ErrSupervisorInvalidEffect      = errors.New("endpoint supervisor: invalid lifecycle effect")
+	ErrSupervisorNoDescriptor       = errors.New("endpoint supervisor: descriptor not found")
+	ErrSupervisorNoLifecycleSink    = errors.New("endpoint supervisor: lifecycle sink is required")
+	ErrSupervisorNoInboundSink      = errors.New("endpoint supervisor: inbound sink is required")
+	ErrSupervisorNoAdapterEventSink = errors.New("endpoint supervisor: adapter event sink is required")
+	ErrSupervisorNoCharacterSink    = errors.New("endpoint supervisor: character sink is required")
+	ErrSupervisorNoIdentitySink     = errors.New("endpoint supervisor: identity observation sink is required")
+	ErrSupervisorStopTimeout        = errors.New("endpoint supervisor: stop timeout")
+	ErrSupervisorAmbiguous          = errors.New("endpoint supervisor: lifecycle is ambiguous")
+	ErrSupervisorShuttingDown       = errors.New("endpoint supervisor: shutting down")
+	ErrSupervisorClosed             = ErrSupervisorShuttingDown
 )
 
 type LifecycleUpdate struct {
 	EndpointID     adapterapi.EndpointID
 	Generation     uint64
 	DesiredVersion uint64
+	RuntimeID      string
 	ObservedState  adapterapi.ObservedState
 	EffectKind     EffectKind
 	Ambiguous      bool
 	Deleted        bool
 }
 type LifecycleSink interface {
-	RecordLifecycle(context.Context, LifecycleUpdate) error
+	RecordLifecycle(ctx context.Context, update LifecycleUpdate) error
 }
 type LifecycleSinkFunc func(context.Context, LifecycleUpdate) error
 
@@ -45,12 +51,74 @@ type FencedInbound struct {
 	Message        adapterapi.InboundMessage
 }
 type InboundSink interface {
-	HandleInbound(context.Context, FencedInbound) (adapterapi.IngressReceipt, error)
+	HandleInbound(ctx context.Context, inbound FencedInbound) (adapterapi.IngressReceipt, error)
 }
 type InboundSinkFunc func(context.Context, FencedInbound) (adapterapi.IngressReceipt, error)
 
 func (f InboundSinkFunc) HandleInbound(c context.Context, i FencedInbound) (adapterapi.IngressReceipt, error) {
 	return f(c, i)
+}
+
+// FencedAdapterEvent binds a conversation-free protocol event to the active
+// endpoint worker which delivered it. The event itself cannot select a fence.
+type FencedAdapterEvent struct {
+	EndpointID     adapterapi.EndpointID
+	Generation     uint64
+	DesiredVersion uint64
+	Event          adapterapi.AdapterEvent
+}
+
+// AdapterEventSink receives ephemeral protocol events which have no
+// conversation and therefore do not belong in the durable inbox.
+type AdapterEventSink interface {
+	HandleAdapterEvent(ctx context.Context, event FencedAdapterEvent) (adapterapi.IngressReceipt, error)
+}
+
+type AdapterEventSinkFunc func(context.Context, FencedAdapterEvent) (adapterapi.IngressReceipt, error)
+
+func (f AdapterEventSinkFunc) HandleAdapterEvent(c context.Context, event FencedAdapterEvent) (adapterapi.IngressReceipt, error) {
+	return f(c, event)
+}
+
+// FencedCharacterRequest is a provider character-sheet request bound by
+// Supervisor to the endpoint generation that relayed it, so a runtime cannot
+// spoof another endpoint's identity or generation.
+type FencedCharacterRequest struct {
+	EndpointID     adapterapi.EndpointID
+	Generation     uint64
+	DesiredVersion uint64
+	Request        adapterapi.CharacterRequest
+}
+
+// CharacterSink relays fenced, Core-owned character-sheet requests. It is
+// optional: providers without a character concept never produce one.
+type CharacterSink interface {
+	HandleCharacter(ctx context.Context, request FencedCharacterRequest) (adapterapi.CharacterResponse, error)
+}
+
+type CharacterSinkFunc func(context.Context, FencedCharacterRequest) (adapterapi.CharacterResponse, error)
+
+func (f CharacterSinkFunc) HandleCharacter(c context.Context, r FencedCharacterRequest) (adapterapi.CharacterResponse, error) {
+	return f(c, r)
+}
+
+// FencedIdentityObservation is a provider identity fact bound by Supervisor to
+// the endpoint generation that reported it.
+type FencedIdentityObservation struct {
+	EndpointID     adapterapi.EndpointID
+	Generation     uint64
+	DesiredVersion uint64
+	Observation    adapterapi.LifecycleObservation
+}
+
+type IdentityObservationSink interface {
+	HandleIdentityObservation(ctx context.Context, observation FencedIdentityObservation) error
+}
+
+type IdentityObservationSinkFunc func(context.Context, FencedIdentityObservation) error
+
+func (f IdentityObservationSinkFunc) HandleIdentityObservation(c context.Context, o FencedIdentityObservation) error {
+	return f(c, o)
 }
 
 type SupervisorOption func(*Supervisor)
@@ -63,38 +131,56 @@ func WithStopTimeout(d time.Duration) SupervisorOption {
 	}
 }
 func WithWaitTimeout(d time.Duration) SupervisorOption { return WithStopTimeout(d) }
-func WithLifecycleSink(v any) SupervisorOption {
-	return func(s *Supervisor) { s.lifecycle = lifecycleSink(v) }
+func WithLifecycleSink(sink LifecycleSink) SupervisorOption {
+	return func(s *Supervisor) { s.lifecycle = sink }
 }
-func WithInboundSink(v any) SupervisorOption {
-	return func(s *Supervisor) { s.inbound = inboundSink(v) }
+func WithInboundSink(sink InboundSink) SupervisorOption {
+	return func(s *Supervisor) { s.inbound = sink }
 }
-func WithDescriptorRegistry(v any) SupervisorOption { return func(s *Supervisor) { s.registry = v } }
-func WithSecretResolver(v adapterapi.SecretResolver) SupervisorOption {
-	return func(s *Supervisor) { s.secrets = v }
+func WithAdapterEventSink(sink AdapterEventSink) SupervisorOption {
+	return func(s *Supervisor) { s.adapterEvent = sink }
+}
+
+func WithCharacterSink(sink CharacterSink) SupervisorOption {
+	return func(s *Supervisor) { s.character = sink }
+}
+
+func WithIdentityObservationSink(v IdentityObservationSink) SupervisorOption {
+	return func(s *Supervisor) { s.identity = v }
+}
+func WithSecretResolverFactory(factory func(adapterapi.EndpointID, adapterapi.AdapterKey) adapterapi.SecretResolver) SupervisorOption {
+	return func(s *Supervisor) { s.secretFactory = factory }
+}
+func WithResourceRoot(root string) SupervisorOption {
+	return func(s *Supervisor) { s.resourceRoot = root }
 }
 
 type Supervisor struct {
-	registry          any
-	service           *Service
-	lifecycle         LifecycleSink
-	inbound           InboundSink
-	secrets           adapterapi.SecretResolver
-	stopTimeout       time.Duration
-	rootCtx           context.Context
-	cancel            context.CancelFunc
-	mu                sync.Mutex
-	shutdownMu        sync.Mutex
-	active            map[adapterapi.EndpointID]*supervisorWorker
-	lanes             map[adapterapi.EndpointID]chan struct{}
-	nextGeneration    map[adapterapi.EndpointID]uint64
-	lastError         error
-	completed         map[adapterapi.EndpointID]map[string]uint64
-	terminal          map[adapterapi.EndpointID]terminalFence
-	shuttingDown      bool
-	shutdownAmbiguous bool
-	reconcileInFlight int
-	reconcileDone     chan struct{}
+	registry             DescriptorRegistry
+	lifecycle            LifecycleSink
+	inbound              InboundSink
+	adapterEvent         AdapterEventSink
+	character            CharacterSink
+	identity             IdentityObservationSink
+	secretFactory        func(adapterapi.EndpointID, adapterapi.AdapterKey) adapterapi.SecretResolver
+	resourceRoot         string
+	resourceAccessToken  string
+	resourceServeAddress string
+	stopTimeout          time.Duration
+	rootCtx              context.Context
+	cancel               context.CancelFunc
+	mu                   sync.Mutex
+	shutdownMu           sync.Mutex
+	active               map[adapterapi.EndpointID]*supervisorWorker
+	lanes                map[adapterapi.EndpointID]chan struct{}
+	nextGeneration       map[adapterapi.EndpointID]uint64
+	lastError            error
+	completed            map[adapterapi.EndpointID]map[string]uint64
+	terminal             map[adapterapi.EndpointID]terminalFence
+	shuttingDown         bool
+	shutdownAmbiguous    bool
+	reconcileInFlight    int
+	reconcileDone        chan struct{}
 }
 type terminalFence struct {
 	generation uint64
@@ -109,6 +195,7 @@ type supervisorWorker struct {
 	endpointID        adapterapi.EndpointID
 	generation        uint64
 	desiredVersion    uint64
+	runtimeID         string
 	effectKind        EffectKind
 	runtime           adapterapi.AdapterRuntime
 	cancel            context.CancelFunc
@@ -127,31 +214,44 @@ type supervisorWorker struct {
 	callbacksDone     chan struct{}
 }
 
-func NewSupervisor(args ...any) *Supervisor {
+func NewSupervisor(registry DescriptorRegistry, options ...SupervisorOption) *Supervisor {
 	root, cancel := context.WithCancel(context.Background())
-	s := &Supervisor{stopTimeout: 5 * time.Second, rootCtx: root, cancel: cancel, active: make(map[adapterapi.EndpointID]*supervisorWorker), lanes: make(map[adapterapi.EndpointID]chan struct{}), nextGeneration: make(map[adapterapi.EndpointID]uint64), completed: make(map[adapterapi.EndpointID]map[string]uint64), reconcileDone: make(chan struct{})}
+	s := &Supervisor{registry: registry, stopTimeout: 5 * time.Second, rootCtx: root, cancel: cancel, active: make(map[adapterapi.EndpointID]*supervisorWorker), lanes: make(map[adapterapi.EndpointID]chan struct{}), nextGeneration: make(map[adapterapi.EndpointID]uint64), completed: make(map[adapterapi.EndpointID]map[string]uint64), reconcileDone: make(chan struct{})}
 	close(s.reconcileDone)
-	for _, arg := range args {
-		switch v := arg.(type) {
-		case SupervisorOption:
-			v(s)
-		case *Service:
-			s.service = v
-			if s.registry == nil && v != nil {
-				s.registry = v.Registry
-			}
-		default:
-			if s.registry == nil {
-				s.registry = v
-			}
+	for _, option := range options {
+		if option != nil {
+			option(s)
 		}
-	}
-	if s.registry == nil && s.service != nil {
-		s.registry = s.service.Registry
 	}
 	return s
 }
-func NewEndpointSupervisor(args ...any) *Supervisor { return NewSupervisor(args...) }
+
+func (s *Supervisor) SetResourceRoot(root string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.resourceRoot = root
+	s.mu.Unlock()
+}
+
+func (s *Supervisor) SetResourceAccessToken(token string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.resourceAccessToken = token
+	s.mu.Unlock()
+}
+
+func (s *Supervisor) SetResourceServeAddress(address string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.resourceServeAddress = address
+	s.mu.Unlock()
+}
 func (s *Supervisor) Cancel() {
 	if s != nil && s.cancel != nil {
 		s.cancel()
@@ -186,7 +286,6 @@ func (s *Supervisor) Shutdown(c context.Context) error {
 		return err
 	}
 	s.Cancel()
-	var first error
 	for {
 		s.mu.Lock()
 		workers := make([]*supervisorWorker, 0, len(s.active))
@@ -198,7 +297,7 @@ func (s *Supervisor) Shutdown(c context.Context) error {
 			if err := c.Err(); err != nil {
 				return err
 			}
-			return first
+			return nil
 		}
 		for _, w := range workers {
 			w.mu.Lock()
@@ -211,9 +310,6 @@ func (s *Supervisor) Shutdown(c context.Context) error {
 			}
 			if err := c.Err(); err != nil {
 				s.markShutdownAmbiguous(c)
-				if first != nil {
-					return errors.Join(first, err)
-				}
 				return err
 			}
 		}
@@ -450,12 +546,39 @@ func (s *Supervisor) reconcileStart(c context.Context, state State, e LifecycleE
 	if closing {
 		return ErrSupervisorClosed
 	}
-	runtime, err := descriptor.NewRuntime(adapterapi.RuntimeInit{EndpointID: e.EndpointID, Generation: generation, DesiredVersion: e.DesiredVersion, Config: state.Config.Clone(), Secrets: s.secrets})
+	runtimeID, err := (eventstore.UUIDGenerator{}).NewID()
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	resourceRoot := s.resourceRoot
+	resourceAccessToken := s.resourceAccessToken
+	resourceServeAddress := s.resourceServeAddress
+	resolverFactory := s.secretFactory
+	s.mu.Unlock()
+	config := state.Config.Clone()
+	var secrets adapterapi.SecretResolver
+	if resolverFactory != nil {
+		secrets = resolverFactory(state.EndpointID, state.AdapterKey)
+	}
+	if len(config.SecretRefs) > 0 && (state.EndpointID == "" || state.AdapterKey == "" || secrets == nil) {
+		return eventstore.ErrKeyUnavailable
+	}
+	runtime, err := descriptor.NewRuntime(adapterapi.RuntimeInit{
+		EndpointID:           e.EndpointID,
+		Generation:           generation,
+		DesiredVersion:       e.DesiredVersion,
+		Config:               config,
+		Secrets:              secrets,
+		ResourceRoot:         resourceRoot,
+		ResourceAccessToken:  resourceAccessToken,
+		ResourceServeAddress: resourceServeAddress,
+	})
 	if err != nil {
 		return err
 	}
 	runCtx, cancel := context.WithCancel(s.rootCtx)
-	w := &supervisorWorker{endpointID: e.EndpointID, generation: generation, desiredVersion: e.DesiredVersion, effectKind: e.Kind, runtime: runtime, cancel: cancel, done: make(chan struct{}), launched: make(chan struct{}), callbacksDone: make(chan struct{})}
+	w := &supervisorWorker{endpointID: e.EndpointID, generation: generation, desiredVersion: e.DesiredVersion, runtimeID: runtimeID, effectKind: e.Kind, runtime: runtime, cancel: cancel, done: make(chan struct{}), launched: make(chan struct{}), callbacksDone: make(chan struct{})}
 	close(w.callbacksDone)
 	s.mu.Lock()
 	if s.shuttingDown {
@@ -515,11 +638,12 @@ func (s *Supervisor) runWorker(c context.Context, w *supervisorWorker, p adapter
 		return
 	}
 	runErr := safeRun(w.runtime, c, p)
-	close(w.done)
+	publishCtx := context.WithoutCancel(c)
 	w.mu.Lock()
 	w.exited = true
 	stopping, ambiguous, callbacks := w.stopping, w.ambiguous, w.callbacksDone
 	w.mu.Unlock()
+	close(w.done)
 	if stopping || ambiguous {
 		return
 	}
@@ -529,7 +653,7 @@ func (s *Supervisor) runWorker(c context.Context, w *supervisorWorker, p adapter
 		w.ambiguous = true
 		w.mu.Unlock()
 		s.remember(err)
-		_ = s.publish(context.Background(), LifecycleUpdate{EndpointID: w.endpointID, Generation: w.generation, DesiredVersion: w.desiredVersion, ObservedState: adapterapi.ObservedStateAmbiguous, Ambiguous: true})
+		_ = s.publish(publishCtx, LifecycleUpdate{EndpointID: w.endpointID, Generation: w.generation, DesiredVersion: w.desiredVersion, ObservedState: adapterapi.ObservedStateAmbiguous, Ambiguous: true})
 		return
 	}
 	w.mu.Lock()
@@ -544,7 +668,7 @@ func (s *Supervisor) runWorker(c context.Context, w *supervisorWorker, p adapter
 		w.ambiguous = true
 		w.mu.Unlock()
 		s.remember(stopErr)
-		_ = s.publish(context.Background(), LifecycleUpdate{EndpointID: w.endpointID, Generation: w.generation, DesiredVersion: w.desiredVersion, ObservedState: adapterapi.ObservedStateAmbiguous, Ambiguous: true})
+		_ = s.publish(publishCtx, LifecycleUpdate{EndpointID: w.endpointID, Generation: w.generation, DesiredVersion: w.desiredVersion, ObservedState: adapterapi.ObservedStateAmbiguous, Ambiguous: true})
 		return
 	}
 	w.mu.Lock()
@@ -561,22 +685,22 @@ func (s *Supervisor) runWorker(c context.Context, w *supervisorWorker, p adapter
 		if !beginFailureCallback(w) {
 			return
 		}
-		pubErr := s.publish(context.Background(), LifecycleUpdate{EndpointID: w.endpointID, Generation: w.generation, DesiredVersion: w.desiredVersion, ObservedState: observed})
+		pubErr := s.publish(publishCtx, LifecycleUpdate{EndpointID: w.endpointID, Generation: w.generation, DesiredVersion: w.desiredVersion, RuntimeID: w.runtimeID, ObservedState: observed})
 		endWorkerCallback(w)
 		if pubErr != nil {
 			s.remember(pubErr)
 			w.mu.Lock()
 			w.ambiguous = true
 			w.mu.Unlock()
-			_ = s.publish(context.Background(), LifecycleUpdate{EndpointID: w.endpointID, Generation: w.generation, DesiredVersion: w.desiredVersion, ObservedState: adapterapi.ObservedStateAmbiguous, Ambiguous: true})
+			_ = s.publish(publishCtx, LifecycleUpdate{EndpointID: w.endpointID, Generation: w.generation, DesiredVersion: w.desiredVersion, ObservedState: adapterapi.ObservedStateAmbiguous, Ambiguous: true})
 			return
 		}
-	} else if err := s.publish(context.Background(), LifecycleUpdate{EndpointID: w.endpointID, Generation: w.generation, DesiredVersion: w.desiredVersion, ObservedState: observed}); err != nil {
+	} else if err := s.publish(publishCtx, LifecycleUpdate{EndpointID: w.endpointID, Generation: w.generation, DesiredVersion: w.desiredVersion, RuntimeID: w.runtimeID, ObservedState: observed}); err != nil {
 		w.mu.Lock()
 		w.ambiguous = true
 		w.mu.Unlock()
 		s.remember(err)
-		_ = s.publish(context.Background(), LifecycleUpdate{EndpointID: w.endpointID, Generation: w.generation, DesiredVersion: w.desiredVersion, ObservedState: adapterapi.ObservedStateAmbiguous, Ambiguous: true})
+		_ = s.publish(publishCtx, LifecycleUpdate{EndpointID: w.endpointID, Generation: w.generation, DesiredVersion: w.desiredVersion, ObservedState: adapterapi.ObservedStateAmbiguous, Ambiguous: true})
 		return
 	}
 	s.mu.Lock()
@@ -657,7 +781,7 @@ func (s *Supervisor) waitCleanup(parent context.Context, w *supervisorWorker) er
 				w.mu.Lock()
 				w.ambiguous = true
 				w.mu.Unlock()
-				return fmt.Errorf("%w: pending terminal publication: %v", ErrSupervisorAmbiguous, err)
+				return fmt.Errorf("%w: pending terminal publication: %w", ErrSupervisorAmbiguous, err)
 			}
 			s.mu.Lock()
 			shutdownAmbiguous := s.shutdownAmbiguous
@@ -764,6 +888,15 @@ func (s *Supervisor) reconcileStop(c context.Context, state State, e LifecycleEf
 }
 func (s *Supervisor) stopWorker(parent context.Context, w *supervisorWorker, e LifecycleEffect, deleteAfter bool) error {
 	w.mu.Lock()
+	// Explicit stop/delete effects terminate their command under that effect's
+	// fence. Replaced workers and their callbacks keep the worker's old fence.
+	terminalGeneration, terminalDesiredVersion := w.generation, w.desiredVersion
+	if e.Kind == EffectStop || e.Kind == EffectDelete {
+		if e.Generation != 0 {
+			terminalGeneration = e.Generation
+		}
+		terminalDesiredVersion = e.DesiredVersion
+	}
 	if w.cleanup && w.terminalPublished && !w.ambiguous {
 		if e.Kind == EffectStart || e.Kind == EffectRelogin || e.Kind == EffectReplace {
 			w.mu.Unlock()
@@ -784,7 +917,10 @@ func (s *Supervisor) stopWorker(parent context.Context, w *supervisorWorker, e L
 	}
 	if w.stopping || w.cleanup {
 		if w.cleanup && (!w.ambiguous || w.pending != nil || (w.exited && !w.terminalPublished)) {
-			queuePendingTerminal(w, e, deleteAfter || e.Kind == EffectDelete)
+			terminalEffect := e
+			terminalEffect.Generation = terminalGeneration
+			terminalEffect.DesiredVersion = terminalDesiredVersion
+			queuePendingTerminal(w, terminalEffect, deleteAfter || e.Kind == EffectDelete)
 			w.mu.Unlock()
 			return s.waitCleanup(parent, w)
 		}
@@ -807,8 +943,8 @@ func (s *Supervisor) stopWorker(parent context.Context, w *supervisorWorker, e L
 		w.mu.Lock()
 		w.ambiguous = true
 		w.mu.Unlock()
-		ambErr := fmt.Errorf("%w: %v", ErrSupervisorAmbiguous, ErrSupervisorStopTimeout)
-		if pubErr := s.publishAmbiguous(parent, LifecycleUpdate{EndpointID: w.endpointID, Generation: w.generation, DesiredVersion: w.desiredVersion, ObservedState: adapterapi.ObservedStateAmbiguous, EffectKind: e.Kind, Ambiguous: true}); pubErr != nil {
+		ambErr := fmt.Errorf("%w: %w", ErrSupervisorAmbiguous, ErrSupervisorStopTimeout)
+		if pubErr := s.publishAmbiguous(parent, LifecycleUpdate{EndpointID: w.endpointID, Generation: terminalGeneration, DesiredVersion: terminalDesiredVersion, ObservedState: adapterapi.ObservedStateAmbiguous, EffectKind: e.Kind, Ambiguous: true}); pubErr != nil {
 			return errors.Join(ambErr, pubErr)
 		}
 		return ambErr
@@ -833,20 +969,20 @@ func (s *Supervisor) stopWorker(parent context.Context, w *supervisorWorker, e L
 			w.mu.Lock()
 			w.ambiguous = true
 			w.mu.Unlock()
-			ambErr := fmt.Errorf("%w: %v", ErrSupervisorAmbiguous, stopErr)
-			if pubErr := s.publishAmbiguous(parent, LifecycleUpdate{EndpointID: w.endpointID, Generation: w.generation, DesiredVersion: w.desiredVersion, ObservedState: adapterapi.ObservedStateAmbiguous, EffectKind: e.Kind, Ambiguous: true}); pubErr != nil {
+			ambErr := fmt.Errorf("%w: %w", ErrSupervisorAmbiguous, stopErr)
+			if pubErr := s.publishAmbiguous(parent, LifecycleUpdate{EndpointID: w.endpointID, Generation: terminalGeneration, DesiredVersion: terminalDesiredVersion, ObservedState: adapterapi.ObservedStateAmbiguous, EffectKind: e.Kind, Ambiguous: true}); pubErr != nil {
 				return errors.Join(ambErr, pubErr)
 			}
 			return ambErr
 		}
 	}
-	update := LifecycleUpdate{EndpointID: w.endpointID, Generation: w.generation, DesiredVersion: w.desiredVersion, ObservedState: adapterapi.ObservedStateStopped, EffectKind: e.Kind, Deleted: deleteAfter || e.Kind == EffectDelete}
+	update := LifecycleUpdate{EndpointID: w.endpointID, Generation: terminalGeneration, DesiredVersion: terminalDesiredVersion, ObservedState: adapterapi.ObservedStateStopped, EffectKind: e.Kind, Deleted: deleteAfter || e.Kind == EffectDelete}
 	if err := s.publish(parent, update); err != nil {
 		w.mu.Lock()
 		w.ambiguous = true
 		w.mu.Unlock()
 		ambErr := fmt.Errorf("publish stopped: %w", err)
-		if pubErr := s.publishAmbiguous(parent, LifecycleUpdate{EndpointID: w.endpointID, Generation: w.generation, DesiredVersion: w.desiredVersion, ObservedState: adapterapi.ObservedStateAmbiguous, EffectKind: e.Kind, Ambiguous: true}); pubErr != nil {
+		if pubErr := s.publishAmbiguous(parent, LifecycleUpdate{EndpointID: w.endpointID, Generation: terminalGeneration, DesiredVersion: terminalDesiredVersion, ObservedState: adapterapi.ObservedStateAmbiguous, EffectKind: e.Kind, Ambiguous: true}); pubErr != nil {
 			return errors.Join(ambErr, pubErr)
 		}
 		return ambErr
@@ -872,7 +1008,7 @@ func (s *Supervisor) terminalizeExited(parent context.Context, w *supervisorWork
 		queuePendingTerminal(w, e, deleted)
 		w.ambiguous = true
 		w.mu.Unlock()
-		amb := fmt.Errorf("%w: terminal replay publication: %v", ErrSupervisorAmbiguous, err)
+		amb := fmt.Errorf("%w: terminal replay publication: %w", ErrSupervisorAmbiguous, err)
 		if pubErr := s.publishAmbiguous(parent, LifecycleUpdate{EndpointID: w.endpointID, Generation: generation, DesiredVersion: e.DesiredVersion, ObservedState: adapterapi.ObservedStateAmbiguous, EffectKind: e.Kind, Ambiguous: true}); pubErr != nil {
 			return errors.Join(amb, pubErr)
 		}
@@ -1000,9 +1136,54 @@ func (s *Supervisor) reportObservation(c context.Context, w *supervisorWorker, o
 		return nil
 	}
 	defer endWorkerCallback(w)
-	return s.publish(c, LifecycleUpdate{EndpointID: w.endpointID, Generation: w.generation, DesiredVersion: w.desiredVersion, ObservedState: o.State})
+	if o.Kind == adapterapi.LifecycleObservationIdentity {
+		if s.identity == nil {
+			return nil
+		}
+		return s.identity.HandleIdentityObservation(c, FencedIdentityObservation{
+			EndpointID:     w.endpointID,
+			Generation:     w.generation,
+			DesiredVersion: w.desiredVersion,
+			Observation:    o,
+		})
+	}
+	return s.publish(c, LifecycleUpdate{
+		EndpointID:     w.endpointID,
+		Generation:     w.generation,
+		DesiredVersion: w.desiredVersion,
+		RuntimeID:      w.runtimeID,
+		ObservedState:  o.State,
+	})
 }
+
+// handleInbound takes a provider's delivery. A provider only reports what
+// happened live, so it may not mark a message as recovered history: that would
+// let it make Core record a message without acting on it.
 func (s *Supervisor) handleInbound(c context.Context, w *supervisorWorker, m adapterapi.InboundMessage) (adapterapi.IngressReceipt, error) {
+	if m.History != adapterapi.InboundHistoryNone {
+		return adapterapi.IngressReceipt{}, fmt.Errorf("%w: a provider cannot deliver recovered history", adapterapi.ErrInvalidContract)
+	}
+	return s.ingest(c, w, m)
+}
+
+// SubmitInbound hands ingress a message Core itself recovered from the
+// provider's history. It travels the same fenced path as a live delivery, under
+// the generation and desired version of the endpoint's active worker, so Core
+// never supplies a fence of its own.
+func (s *Supervisor) SubmitInbound(c context.Context, endpointID adapterapi.EndpointID, m adapterapi.InboundMessage) (adapterapi.IngressReceipt, error) {
+	if s == nil {
+		return adapterapi.IngressReceipt{}, ErrSupervisorClosed
+	}
+	s.mu.Lock()
+	w := s.active[endpointID]
+	s.mu.Unlock()
+	if w == nil {
+		return adapterapi.IngressReceipt{}, ErrSupervisorClosed
+	}
+	return s.ingest(c, w, m)
+}
+
+func (s *Supervisor) ingest(c context.Context, w *supervisorWorker, m adapterapi.InboundMessage) (adapterapi.IngressReceipt, error) {
 	if c == nil {
 		c = context.Background()
 	}
@@ -1028,6 +1209,71 @@ func (s *Supervisor) handleInbound(c context.Context, w *supervisorWorker, m ada
 		return adapterapi.IngressReceipt{}, err
 	}
 	return receipt, nil
+}
+
+// handleAdapterEvent relays a conversation-free protocol event through the
+// same generation and in-flight callback fence as durable ingress. A missing
+// optional sink declines the event without stopping the provider runtime.
+func (s *Supervisor) handleAdapterEvent(c context.Context, w *supervisorWorker, event adapterapi.AdapterEvent) (adapterapi.IngressReceipt, error) {
+	if c == nil {
+		c = context.Background()
+	}
+	if err := event.Validate(); err != nil {
+		return adapterapi.IngressReceipt{}, err
+	}
+	s.mu.Lock()
+	valid := !s.shuttingDown && s.active[w.endpointID] == w
+	sink := s.adapterEvent
+	s.mu.Unlock()
+	if !valid || !beginWorkerCallback(w) {
+		return adapterapi.IngressReceipt{}, ErrSupervisorClosed
+	}
+	defer endWorkerCallback(w)
+	if sink == nil {
+		return adapterapi.IngressReceipt{Outcome: adapterapi.IngressRejected}, nil
+	}
+	receipt, err := sink.HandleAdapterEvent(c, FencedAdapterEvent{
+		EndpointID:     w.endpointID,
+		Generation:     w.generation,
+		DesiredVersion: w.desiredVersion,
+		Event:          event,
+	})
+	if err != nil {
+		return adapterapi.IngressReceipt{}, err
+	}
+	if err := receipt.Validate(); err != nil {
+		return adapterapi.IngressReceipt{}, err
+	}
+	return receipt, nil
+}
+
+// handleCharacter relays a provider character-sheet request to the Core-owned
+// character service under the worker's generation fence. The response is
+// returned verbatim; the runtime serializes it back to the provider.
+func (s *Supervisor) handleCharacter(c context.Context, w *supervisorWorker, r adapterapi.CharacterRequest) (adapterapi.CharacterResponse, error) {
+	if c == nil {
+		c = context.Background()
+	}
+	if err := r.Validate(); err != nil {
+		return adapterapi.CharacterResponse{}, err
+	}
+	s.mu.Lock()
+	valid := s.active[w.endpointID] == w
+	sink := s.character
+	s.mu.Unlock()
+	if !valid || !beginWorkerCallback(w) {
+		return adapterapi.CharacterResponse{}, ErrSupervisorClosed
+	}
+	defer endWorkerCallback(w)
+	if sink == nil {
+		return adapterapi.CharacterResponse{}, ErrSupervisorNoCharacterSink
+	}
+	return sink.HandleCharacter(c, FencedCharacterRequest{
+		EndpointID:     w.endpointID,
+		Generation:     w.generation,
+		DesiredVersion: w.desiredVersion,
+		Request:        r,
+	})
 }
 func (s *Supervisor) publish(parent context.Context, u LifecycleUpdate) error {
 	if s.lifecycle == nil {
@@ -1158,7 +1404,7 @@ func (s *Supervisor) Stop(c context.Context, id adapterapi.EndpointID) error {
 
 // EffectExecutor is the generation-fenced outbound execution surface used by the dispatcher.
 type EffectExecutor interface {
-	ExecutePinned(context.Context, adapterapi.EndpointID, uint64, adapterapi.OutboundEffect) (adapterapi.EffectResult, error)
+	ExecutePinned(ctx context.Context, endpointID adapterapi.EndpointID, generation uint64, effect adapterapi.OutboundEffect) (adapterapi.EffectResult, error)
 }
 
 func (s *Supervisor) ExecutePinned(ctx context.Context, id adapterapi.EndpointID, generation uint64, effect adapterapi.OutboundEffect) (result adapterapi.EffectResult, err error) {
@@ -1194,9 +1440,39 @@ func (s *Supervisor) ExecutePinned(ctx context.Context, id adapterapi.EndpointID
 	return safeExecute(runtime, ctx, effect)
 }
 
+// RuntimeDiagnostics returns a snapshot only from the requested active generation.
+// An absent or stopping runtime has no live diagnostics.
+func (s *Supervisor) RuntimeDiagnostics(ctx context.Context, id adapterapi.EndpointID, generation uint64) (report adapterapi.DiagnosticReport, err error) {
+	if s == nil {
+		return report, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	worker := s.active[id]
+	if worker == nil || worker.generation != generation || !beginWorkerCallback(worker) {
+		s.mu.Unlock()
+		return report, nil
+	}
+	s.mu.Unlock()
+	defer endWorkerCallback(worker)
+	defer func() {
+		if recover() != nil {
+			report = adapterapi.DiagnosticReport{}
+			err = errors.New("endpoint supervisor: runtime diagnostics panic")
+		}
+	}()
+	report = worker.runtime.Diagnostics(ctx)
+	if err = report.Validate(); err != nil {
+		return adapterapi.DiagnosticReport{}, err
+	}
+	return report, nil
+}
+
 // ActionExecutor is the application-facing interactive action seam.
 type ActionExecutor interface {
-	ExecuteAction(context.Context, adapterapi.ActionRequest) (adapterapi.ActionResult, error)
+	ExecuteAction(ctx context.Context, request adapterapi.ActionRequest) (adapterapi.ActionResult, error)
 }
 
 // ExecuteAction invokes an optional interactive action on the currently
@@ -1266,6 +1542,68 @@ func safeAction(runtime adapterapi.ActionRuntime, ctx context.Context, request a
 	}
 	return result, nil
 }
+
+// QueryExecutor is the read-only provider lookup seam used by Core.
+type QueryExecutor interface {
+	Query(ctx context.Context, request adapterapi.QueryRequest) (adapterapi.QueryResult, error)
+}
+
+// Query asks the currently active generation of an endpoint a read-only
+// question. Like ExecuteAction, the Supervisor owns runtime access and
+// generation fencing; a query is never persisted or retried, so the caller's
+// context bounds how long it waits.
+func (s *Supervisor) Query(ctx context.Context, request adapterapi.QueryRequest) (adapterapi.QueryResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := request.Validate(); err != nil {
+		return adapterapi.QueryResult{}, err
+	}
+	if s == nil {
+		return adapterapi.QueryResult{}, ErrSupervisorClosed
+	}
+	s.mu.Lock()
+	worker := s.active[request.EndpointID]
+	s.mu.Unlock()
+	if worker == nil {
+		return adapterapi.QueryResult{}, ErrSupervisorClosed
+	}
+	worker.mu.Lock()
+	if request.Generation == 0 {
+		request.Generation = worker.generation
+	}
+	valid := worker.generation == request.Generation && !worker.exited && !worker.stopping && !worker.ambiguous
+	runtime := worker.runtime
+	worker.mu.Unlock()
+	if !valid || runtime == nil {
+		return adapterapi.QueryResult{}, ErrSupervisorAmbiguous
+	}
+	queryRuntime, ok := runtime.(adapterapi.QueryRuntime)
+	if !ok {
+		return adapterapi.QueryResult{}, adapterapi.ErrUnsupportedAction
+	}
+	if !beginWorkerCallback(worker) {
+		return adapterapi.QueryResult{}, ErrSupervisorAmbiguous
+	}
+	defer endWorkerCallback(worker)
+	return safeQuery(queryRuntime, ctx, request)
+}
+
+func safeQuery(runtime adapterapi.QueryRuntime, ctx context.Context, request adapterapi.QueryRequest) (result adapterapi.QueryResult, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			result, err = adapterapi.QueryResult{}, fmt.Errorf("endpoint supervisor: query panic: %v", recovered)
+		}
+	}()
+	result, err = runtime.Query(ctx, request)
+	if err != nil {
+		return adapterapi.QueryResult{}, err
+	}
+	if err = result.Validate(request); err != nil {
+		return adapterapi.QueryResult{}, err
+	}
+	return result, nil
+}
 func safeExecute(runtime adapterapi.AdapterRuntime, ctx context.Context, effect adapterapi.OutboundEffect) (result adapterapi.EffectResult, err error) {
 	var artifact *adapterapi.ArtifactResult
 	defer func() {
@@ -1292,86 +1630,21 @@ func safeExecute(runtime adapterapi.AdapterRuntime, ctx context.Context, effect 
 	}
 	return result, nil
 }
-func lifecycleSink(v any) LifecycleSink {
-	switch x := v.(type) {
-	case LifecycleSink:
-		return x
-	case func(context.Context, LifecycleUpdate) error:
-		return LifecycleSinkFunc(x)
-	default:
-		return nil
-	}
-}
-func inboundSink(v any) InboundSink {
-	switch x := v.(type) {
-	case InboundSink:
-		return x
-	case func(context.Context, FencedInbound) (adapterapi.IngressReceipt, error):
-		return InboundSinkFunc(x)
-	default:
-		return nil
-	}
-}
-func lookupDescriptor(c context.Context, r any, k adapterapi.AdapterKey) (adapterapi.Descriptor, error) {
+func lookupDescriptor(c context.Context, registry DescriptorRegistry, key adapterapi.AdapterKey) (adapterapi.Descriptor, error) {
 	if err := c.Err(); err != nil {
 		return nil, err
 	}
-	accept := func(d adapterapi.Descriptor) (adapterapi.Descriptor, error) {
-		if d == nil || d.Key() != k {
-			return nil, ErrSupervisorNoDescriptor
-		}
-		return d, nil
+	if registry == nil {
+		return nil, ErrSupervisorNoDescriptor
 	}
-	switch x := r.(type) {
-	case DescriptorRegistry:
-		d, ok := x.Lookup(c, k)
-		if err := c.Err(); err != nil {
-			return nil, err
-		}
-		if !ok {
-			return nil, ErrSupervisorNoDescriptor
-		}
-		return accept(d)
-	case DescriptorLookup:
-		d, e := x(c, k)
-		if err := c.Err(); err != nil {
-			return nil, err
-		}
-		if e != nil {
-			return nil, e
-		}
-		return accept(d)
-	case func(context.Context, adapterapi.AdapterKey) (adapterapi.Descriptor, error):
-		d, e := x(c, k)
-		if err := c.Err(); err != nil {
-			return nil, err
-		}
-		if e != nil {
-			return nil, e
-		}
-		return accept(d)
-	case func(adapterapi.AdapterKey) (adapterapi.Descriptor, bool):
-		d, ok := x(k)
-		if !ok {
-			return nil, ErrSupervisorNoDescriptor
-		}
-		return accept(d)
-	case map[adapterapi.AdapterKey]adapterapi.Descriptor:
-		d, ok := x[k]
-		if !ok {
-			return nil, ErrSupervisorNoDescriptor
-		}
-		return accept(d)
-	case map[string]adapterapi.Descriptor:
-		d, ok := x[string(k)]
-		if !ok {
-			return nil, ErrSupervisorNoDescriptor
-		}
-		return accept(d)
-	case adapterapi.Descriptor:
-		return accept(x)
+	descriptor, ok := registry.Lookup(c, key)
+	if err := c.Err(); err != nil {
+		return nil, err
 	}
-	return nil, ErrSupervisorNoDescriptor
+	if !ok || descriptor == nil || descriptor.Key() != key {
+		return nil, ErrSupervisorNoDescriptor
+	}
+	return descriptor, nil
 }
 
 type generationCorePort struct {
@@ -1382,8 +1655,17 @@ type generationCorePort struct {
 func (p *generationCorePort) HandleInbound(c context.Context, m adapterapi.InboundMessage) (adapterapi.IngressReceipt, error) {
 	return p.supervisor.handleInbound(c, p.worker, m)
 }
+func (p *generationCorePort) HandleAdapterEvent(c context.Context, event adapterapi.AdapterEvent) (adapterapi.IngressReceipt, error) {
+	return p.supervisor.handleAdapterEvent(c, p.worker, event)
+}
 func (p *generationCorePort) ReportObservation(c context.Context, o adapterapi.LifecycleObservation) error {
 	return p.supervisor.reportObservation(c, p.worker, o)
 }
 
+func (p *generationCorePort) HandleCharacter(c context.Context, r adapterapi.CharacterRequest) (adapterapi.CharacterResponse, error) {
+	return p.supervisor.handleCharacter(c, p.worker, r)
+}
+
 var _ adapterapi.CorePort = (*generationCorePort)(nil)
+var _ adapterapi.CharacterCorePort = (*generationCorePort)(nil)
+var _ adapterapi.AdapterEventCorePort = (*generationCorePort)(nil)

@@ -109,7 +109,7 @@ func TestNativeFilesystemServiceSyncLargeUnlimitedAndExplicitLimit(t *testing.T)
 		t.Fatalf("unlimited sync filesystem read = status %v, bytes %d, err %v; want %d bytes", response.Status, len(response.Bytes), err, size)
 	}
 
-	d.Config.JsConfig.QuickJSMaxFilesystemReadMiB = 1
+	d.Config.QuickJSMaxFilesystemReadMiB = 1
 	response, err = service.Invoke(services.Call{Request: services.Request{
 		Service:   services.Filesystem,
 		Operation: services.OpFilesystemReadFileSync,
@@ -118,7 +118,7 @@ func TestNativeFilesystemServiceSyncLargeUnlimitedAndExplicitLimit(t *testing.T)
 	if err == nil || response.Status != services.StatusInvalid {
 		t.Fatalf("explicit sync filesystem read = %#v, %v; want invalid over-limit response", response, err)
 	}
-	d.Config.JsConfig.QuickJSMaxFilesystemWriteMiB = 1
+	d.Config.QuickJSMaxFilesystemWriteMiB = 1
 	response, err = service.Invoke(services.Call{Request: services.Request{
 		Service:   services.Filesystem,
 		Operation: services.OpFilesystemWriteFileSync,

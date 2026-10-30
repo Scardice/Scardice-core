@@ -56,7 +56,10 @@ _Static_assert(offsetof(sc_host_api_v1, last_error_copy) == offsetof(sc_host_api
 _Static_assert(offsetof(sc_host_api_v1, service_call) == offsetof(sc_host_api_v1, host_get) + 7 * sizeof(void *), "host api service order");
 _Static_assert(offsetof(sc_host_api_v1, service_start) == offsetof(sc_host_api_v1, service_call) + sizeof(void *), "host api service start order");
 _Static_assert(offsetof(sc_host_api_v1, service_cancel) == offsetof(sc_host_api_v1, service_start) + sizeof(void *), "host api service cancel order");
-_Static_assert(sizeof(sc_host_api_v1) == offsetof(sc_host_api_v1, service_cancel) + sizeof(void *), "host api service size");
+_Static_assert(offsetof(sc_host_api_v1, host_ref_retain) == offsetof(sc_host_api_v1, service_cancel) + sizeof(void *), "host ref retain tail order");
+_Static_assert(offsetof(sc_host_api_v1, host_ref_release) == offsetof(sc_host_api_v1, host_ref_retain) + sizeof(void *), "host ref release tail order");
+_Static_assert(offsetof(sc_host_api_v1, host_function_owner) == offsetof(sc_host_api_v1, host_ref_release) + sizeof(void *), "host function owner tail order");
+_Static_assert(sizeof(sc_host_api_v1) == offsetof(sc_host_api_v1, host_function_owner) + sizeof(void *), "host api lifecycle tail size");
 
 _Static_assert(offsetof(sc_runtime_plugin_v1, struct_size) == 0, "plugin struct_size offset");
 _Static_assert(offsetof(sc_runtime_plugin_v1, descriptor) == 8, "plugin descriptor prefix");

@@ -14,6 +14,7 @@ import (
 )
 
 type jsMutationCryptoFake struct{ calls []string }
+
 func (f *jsMutationCryptoFake) KeyedDigest(_ context.Context, domain string, parts ...string) ([]byte, string, error) {
 	f.calls = append(f.calls, domain)
 	return []byte(strings.Repeat("i", 32)), "key-id", nil
@@ -28,6 +29,7 @@ type jsMutationBackendFake struct {
 	work  []eventstore.UnitOfWork
 	fail  error
 }
+
 func (f *jsMutationBackendFake) Commit(_ context.Context, w eventstore.UnitOfWork) (eventstore.CommitResult, error) {
 	if f.fail != nil {
 		return eventstore.CommitResult{}, f.fail
@@ -35,68 +37,184 @@ func (f *jsMutationBackendFake) Commit(_ context.Context, w eventstore.UnitOfWor
 	f.work = append(f.work, w)
 	return eventstore.CommitResult{}, nil
 }
-func (f *jsMutationBackendFake) Load(context.Context, eventstore.StreamID, uint64) ([]eventstore.Envelope, error) { return nil, nil }
+func (f *jsMutationBackendFake) Load(context.Context, eventstore.StreamID, uint64) ([]eventstore.Envelope, error) {
+	return nil, nil
+}
 func (f *jsMutationBackendFake) Close() error { return nil }
 func (f *jsMutationBackendFake) GetPluginKV(_ context.Context, ext, key string) (eventstore.PluginKVItem, error) {
-	item, ok := f.items[ext+"\x00"+key]; if !ok { return eventstore.PluginKVItem{}, eventstore.ErrPluginKVNotFound }; return item, nil
+	item, ok := f.items[ext+"\x00"+key]
+	if !ok {
+		return eventstore.PluginKVItem{}, eventstore.ErrPluginKVNotFound
+	}
+	return item, nil
 }
 func (f *jsMutationBackendFake) ListPluginKV(_ context.Context, req eventstore.PluginKVListRequest) ([]eventstore.PluginKVItem, error) {
 	out := make([]eventstore.PluginKVItem, 0)
-	for _, item := range f.items { if item.ExtensionID == req.ExtensionID && strings.HasPrefix(item.Key, req.Prefix) { out = append(out, item) } }
+	for _, item := range f.items {
+		if item.ExtensionID == req.ExtensionID && strings.HasPrefix(item.Key, req.Prefix) {
+			out = append(out, item)
+		}
+	}
 	return out, nil
 }
 
 func TestJSMutationCollectorCapturesTypedOwnersAndTransientState(t *testing.T) {
 	core := messageflow.NewMutationCollector(eventstore.EventFactory{})
 	collector := NewJSMutationCollector(core, JSMutationScope{DiceID: "dice", GroupID: "group", UserID: "user"}, eventstore.Metadata{CommandID: "command", CorrelationID: "correlation", OccurredAt: time.Unix(1, 0).UTC()})
-	if err := collector.CaptureGroup(groupstate.NewGroupNameChangedV1("new name")); err != nil { t.Fatal(err) }
-	if err := collector.CapturePlayer(playerstate.NewPlayerNameChangedV1("new player")); err != nil { t.Fatal(err) }
-	if err := collector.CaptureGroupUserAttrs([]playerstate.GroupUserAttrsEvent{playerstate.NewGroupUserAttrsIncrementedV1("score", 1)}, map[string]any{"$t": "local"}); err != nil { t.Fatal(err) }
-	if err := collector.CaptureModeration(playerstate.NewModerationRankChangedV1(2)); err != nil { t.Fatal(err) }
-	work, err := collector.UnitOfWork(); if err != nil { t.Fatal(err) }
-	if len(work.Streams) != 4 { t.Fatalf("streams=%d", len(work.Streams)) }
-	for _, stream := range work.Streams { for _, event := range stream.Events { if strings.Contains(string(event.Payload), "$t") { t.Fatalf("transient leaked in %#v", event) } } }
+	if err := collector.CaptureGroup(groupstate.NewGroupNameChangedV1("new name")); err != nil {
+		t.Fatal(err)
+	}
+	if err := collector.CapturePlayer(playerstate.NewPlayerNameChangedV1("new player")); err != nil {
+		t.Fatal(err)
+	}
+	if err := collector.CaptureGroupUserAttrs([]playerstate.GroupUserAttrsEvent{playerstate.NewGroupUserAttrsIncrementedV1("score", 1)}, map[string]any{"$t": "local"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := collector.CaptureModeration(playerstate.NewModerationRankChangedV1(2)); err != nil {
+		t.Fatal(err)
+	}
+	work, err := collector.UnitOfWork()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(work.Streams) != 4 {
+		t.Fatalf("streams=%d", len(work.Streams))
+	}
+	for _, stream := range work.Streams {
+		for _, event := range stream.Events {
+			if strings.Contains(string(event.Payload), "$t") {
+				t.Fatalf("transient leaked in %#v", event)
+			}
+		}
+	}
 }
 
 func TestJSPluginKVOverlayEncryptsAndReadsWrites(t *testing.T) {
 	crypto := &jsMutationCryptoFake{}
 	backend := &jsMutationBackendFake{items: map[string]eventstore.PluginKVItem{}}
 	overlay, err := NewJSPluginKVOverlay("extension", crypto, backend)
-	if err != nil { t.Fatal(err) }
-	if err := overlay.Put(context.Background(), "key", []byte("value"), 0); err != nil { t.Fatal(err) }
-	item, err := overlay.Get(context.Background(), "key"); if err != nil || string(item.Value) != "value" { t.Fatalf("item=%#v err=%v", item, err) }
-	if err := overlay.Put(context.Background(), "key", []byte("value-2"), 0); err != nil { t.Fatal(err) }
-	item, err = overlay.Get(context.Background(), "key"); if err != nil || string(item.Value) != "value-2" || item.Version != 1 { t.Fatalf("second write item=%#v err=%v", item, err) }
-	if len(backend.work) != 0 { t.Fatal("backend committed before explicit commit") }
-	if err := overlay.Commit(context.Background()); err != nil { t.Fatal(err) }
-	if len(backend.work) != 1 || len(backend.work[0].PluginKVUpdates) != 1 { t.Fatalf("work=%#v", backend.work) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if putErr := overlay.Put(context.Background(), "key", []byte("value"), 0); putErr != nil {
+		t.Fatal(putErr)
+	}
+	item, err := overlay.Get(context.Background(), "key")
+	if err != nil || string(item.Value) != "value" {
+		t.Fatalf("item=%#v err=%v", item, err)
+	}
+	if putErr := overlay.Put(context.Background(), "key", []byte("value-2"), 0); putErr != nil {
+		t.Fatal(putErr)
+	}
+	item, err = overlay.Get(context.Background(), "key")
+	if err != nil || string(item.Value) != "value-2" || item.Version != 1 {
+		t.Fatalf("second write item=%#v err=%v", item, err)
+	}
+	if len(backend.work) != 0 {
+		t.Fatal("backend committed before explicit commit")
+	}
+	if err := overlay.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.work) != 1 || len(backend.work[0].PluginKVUpdates) != 1 {
+		t.Fatalf("work=%#v", backend.work)
+	}
 	update := backend.work[0].PluginKVUpdates[0]
-	if len(update.KeyHMAC) != 32 || len(update.KeyCiphertext) == 0 || len(update.KeyNonce) == 0 || len(update.ValueCiphertext) == 0 || len(update.ValueNonce) == 0 { t.Fatalf("update=%#v", update) }
-	if len(crypto.calls) < 3 || crypto.calls[0] != "plugin-key-index/v1" || !strings.HasPrefix(crypto.calls[1], "plugin-kv-key/v1") || !strings.HasPrefix(crypto.calls[2], "plugin-kv-value/v1") { t.Fatalf("calls=%v", crypto.calls) }
+	if len(update.KeyHMAC) != 32 || len(update.KeyCiphertext) == 0 || len(update.KeyNonce) == 0 || len(update.ValueCiphertext) == 0 || len(update.ValueNonce) == 0 {
+		t.Fatalf("update=%#v", update)
+	}
+	if len(crypto.calls) < 3 || crypto.calls[0] != "plugin-key-index/v1" || !strings.HasPrefix(crypto.calls[1], "plugin-kv-key/v1") || !strings.HasPrefix(crypto.calls[2], "plugin-kv-value/v1") {
+		t.Fatalf("calls=%v", crypto.calls)
+	}
+}
+func TestJSPluginKVOverlayPreservesEmptyOpaqueKey(t *testing.T) {
+	crypto := &jsMutationCryptoFake{}
+	backend := &jsMutationBackendFake{items: map[string]eventstore.PluginKVItem{}}
+	overlay, err := NewJSPluginKVOverlay("extension", crypto, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = overlay.Put(context.Background(), "", []byte("[object Object]"), 0); err != nil {
+		t.Fatal(err)
+	}
+	item, err := overlay.Get(context.Background(), "")
+	if err != nil || item.Key != "" || string(item.Value) != "[object Object]" {
+		t.Fatalf("empty-key item=%#v err=%v", item, err)
+	}
+	if err = overlay.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.work) != 1 || len(backend.work[0].PluginKVUpdates) != 1 {
+		t.Fatalf("work=%#v", backend.work)
+	}
+}
+
+func TestJSPluginKVOverlayScansImportedEmptyOpaqueKey(t *testing.T) {
+	crypto := &jsMutationCryptoFake{}
+	backend := &jsMutationBackendFake{items: map[string]eventstore.PluginKVItem{
+		"extension\x00": {ExtensionID: "extension", Key: "", Value: []byte("[object Object]"), Version: 1},
+	}}
+	overlay, err := NewJSPluginKVOverlay("extension", crypto, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = overlay.Put(context.Background(), "next", []byte("value"), 0); err != nil {
+		t.Fatalf("write beside imported empty key: %v", err)
+	}
+	items, err := overlay.List(context.Background(), "", 10)
+	if err != nil || len(items) != 2 || items[0].Key != "" || items[1].Key != "next" {
+		t.Fatalf("items=%#v err=%v", items, err)
+	}
 }
 
 func TestJSPluginKVOverlayRejectsBounds(t *testing.T) {
-	overlay, err := NewJSPluginKVOverlay("extension", &jsMutationCryptoFake{}, &jsMutationBackendFake{items: map[string]eventstore.PluginKVItem{}}); if err != nil { t.Fatal(err) }
-	if err := overlay.Put(context.Background(), strings.Repeat("k", eventstore.MaxPluginKeyBytes+1), []byte("v"), 0); !errors.Is(err, eventstore.ErrOversizeInput) { t.Fatalf("key err=%v", err) }
-	if _, err := overlay.List(context.Background(), "", eventstore.MaxPluginResults+1); !errors.Is(err, eventstore.ErrOversizeInput) { t.Fatalf("result err=%v", err) }
+	overlay, err := NewJSPluginKVOverlay("extension", &jsMutationCryptoFake{}, &jsMutationBackendFake{items: map[string]eventstore.PluginKVItem{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := overlay.Put(context.Background(), strings.Repeat("k", eventstore.MaxPluginKeyBytes+1), []byte("v"), 0); !errors.Is(err, eventstore.ErrOversizeInput) {
+		t.Fatalf("key err=%v", err)
+	}
+	if _, err := overlay.List(context.Background(), "", eventstore.MaxPluginResults+1); !errors.Is(err, eventstore.ErrOversizeInput) {
+		t.Fatalf("result err=%v", err)
+	}
 }
 
 func TestJSEffectRejectsPlaintextAndInvalidRisk(t *testing.T) {
 	_, err := BuildJSEffect(JSEffectRequest{EffectID: "effect", EndpointID: "endpoint", LaneHMAC: []byte("lane"), EffectType: "reply", RiskClass: eventstore.RiskPreDispatchRetryable, Status: eventstore.OutboxStatusPending})
-	if err == nil { t.Fatal("plaintext effect accepted") }
+	if err == nil {
+		t.Fatal("plaintext effect accepted")
+	}
 	_, err = BuildJSEffect(JSEffectRequest{EffectID: "effect", EndpointID: "endpoint", LaneHMAC: []byte("lane"), EffectType: "reply", RiskClass: "unknown", Status: eventstore.OutboxStatusPending, PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key"})
-	if err == nil { t.Fatal("invalid risk accepted") }
+	if err == nil {
+		t.Fatal("invalid risk accepted")
+	}
 	effect, err := BuildJSEffect(JSEffectRequest{EffectID: "effect", EndpointID: "endpoint", LaneHMAC: []byte("lane"), EffectType: "reply", RiskClass: eventstore.RiskPreDispatchRetryable, Status: eventstore.OutboxStatusPending, PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key"})
-	if err != nil || effect.PayloadCiphertext == nil { t.Fatalf("effect=%#v err=%v", effect, err) }
-	if _, ok := any(effect).(interface{ Authority() any }); ok { t.Fatal("authority pointer exposed") }
+	if err != nil || effect.PayloadCiphertext == nil {
+		t.Fatalf("effect=%#v err=%v", effect, err)
+	}
+	if _, ok := any(effect).(interface{ Authority() any }); ok {
+		t.Fatal("authority pointer exposed")
+	}
 }
 
 func TestJSMutationCollectorConfigRequiresRegistration(t *testing.T) {
 	collector := NewJSMutationCollector(messageflow.NewMutationCollector(eventstore.EventFactory{}), JSMutationScope{DiceID: "d", GroupID: "g"}, eventstore.Metadata{CommandID: "c", CorrelationID: "r", OccurredAt: time.Unix(1, 0).UTC()})
-	if err := collector.CaptureConfig(JSConfigMutation{ExtensionID: "ext", Key: "missing", Value: "x"}); err == nil { t.Fatal("unregistered config accepted") }
-	collector.RegisterConfig("ext", "name", func(value any) error { if value != "x" { return errors.New("bad") }; return nil })
-	if err := collector.CaptureConfig(JSConfigMutation{ExtensionID: "ext", Key: "name", Value: "x"}); err != nil { t.Fatal(err) }
-	if len(collector.ConfigMutations()) != 1 { t.Fatal("config mutation not recorded") }
+	if err := collector.CaptureConfig(JSConfigMutation{ExtensionID: "ext", Key: "missing", Value: "x"}); err == nil {
+		t.Fatal("unregistered config accepted")
+	}
+	collector.RegisterConfig("ext", "name", func(value any) error {
+		if value != "x" {
+			return errors.New("bad")
+		}
+		return nil
+	})
+	if err := collector.CaptureConfig(JSConfigMutation{ExtensionID: "ext", Key: "name", Value: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(collector.ConfigMutations()) != 1 {
+		t.Fatal("config mutation not recorded")
+	}
 }
 
 func TestJSMutationCollectorRejectsUnsupportedGlobalOwners(t *testing.T) {

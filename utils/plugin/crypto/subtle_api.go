@@ -607,11 +607,12 @@ func subtleVerify(rt *goja.Runtime, call goja.FunctionCall) goja.Value {
 	return resolvedPromise(rt, ok)
 }
 
-func subtleEncrypt(rt *goja.Runtime, call goja.FunctionCall) goja.Value {
+func subtleEncrypt(rt *goja.Runtime, call goja.FunctionCall, warn func(string)) goja.Value {
 	algorithm, algObj, err := parseAlgorithmIdentifier(rt, call.Argument(0))
 	if err != nil {
 		return rejectedPromise(rt, err)
 	}
+	warnDeprecatedRSA(rt, algorithm, "encrypt", warn)
 	handle, err := extractCryptoKeyHandle(rt, call.Argument(1))
 	if err != nil {
 		return rejectedPromise(rt, err)
@@ -628,11 +629,12 @@ func subtleEncrypt(rt *goja.Runtime, call goja.FunctionCall) goja.Value {
 	return resolvedPromise(rt, rt.NewArrayBuffer(cipherText))
 }
 
-func subtleDecrypt(rt *goja.Runtime, call goja.FunctionCall) goja.Value {
+func subtleDecrypt(rt *goja.Runtime, call goja.FunctionCall, warn func(string)) goja.Value {
 	algorithm, algObj, err := parseAlgorithmIdentifier(rt, call.Argument(0))
 	if err != nil {
 		return rejectedPromise(rt, err)
 	}
+	warnDeprecatedRSA(rt, algorithm, "decrypt", warn)
 	handle, err := extractCryptoKeyHandle(rt, call.Argument(1))
 	if err != nil {
 		return rejectedPromise(rt, err)
@@ -730,7 +732,7 @@ func subtleDeriveKey(rt *goja.Runtime, call goja.FunctionCall) goja.Value {
 	return resolvedPromise(rt, newCryptoKeyObject(rt, handle))
 }
 
-func subtleWrapKey(rt *goja.Runtime, call goja.FunctionCall) goja.Value {
+func subtleWrapKey(rt *goja.Runtime, call goja.FunctionCall, warn func(string)) goja.Value {
 	format := strings.ToLower(strings.TrimSpace(call.Argument(0).String()))
 	keyToWrap, err := extractCryptoKeyHandle(rt, call.Argument(1))
 	if err != nil {
@@ -747,6 +749,7 @@ func subtleWrapKey(rt *goja.Runtime, call goja.FunctionCall) goja.Value {
 	if err != nil {
 		return rejectedPromise(rt, err)
 	}
+	warnDeprecatedRSA(rt, wrapAlgorithm, "wrapKey", warn)
 
 	rawKey, err := exportKeyBytesForWrap(rt, format, keyToWrap)
 	if err != nil {
@@ -759,7 +762,7 @@ func subtleWrapKey(rt *goja.Runtime, call goja.FunctionCall) goja.Value {
 	return resolvedPromise(rt, rt.NewArrayBuffer(wrapped))
 }
 
-func subtleUnwrapKey(rt *goja.Runtime, call goja.FunctionCall) goja.Value {
+func subtleUnwrapKey(rt *goja.Runtime, call goja.FunctionCall, warn func(string)) goja.Value {
 	format := strings.ToLower(strings.TrimSpace(call.Argument(0).String()))
 	wrappedData, err := bufferSourceBytes(rt, call.Argument(1), true, false)
 	if err != nil {
@@ -773,6 +776,7 @@ func subtleUnwrapKey(rt *goja.Runtime, call goja.FunctionCall) goja.Value {
 	if err != nil {
 		return rejectedPromise(rt, err)
 	}
+	warnDeprecatedRSA(rt, unwrapAlgorithm, "unwrapKey", warn)
 	unwrappedKeyAlgorithm, unwrappedKeyAlgObj, err := parseAlgorithmIdentifier(rt, call.Argument(4))
 	if err != nil {
 		return rejectedPromise(rt, err)

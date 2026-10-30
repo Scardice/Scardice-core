@@ -10,7 +10,9 @@ import (
 
 	"Scardice-core/eventstore"
 )
+
 type fakeProjectionReader struct{ payload []byte }
+
 func (r fakeProjectionReader) ReadProjectionRow(context.Context, string, string) (eventstore.ProjectionRow, error) {
 	return eventstore.ProjectionRow{Payload: append([]byte(nil), r.payload...)}, nil
 }
@@ -92,7 +94,7 @@ func TestStreamIdentityAndDeletePrefixesAreUnambiguous(t *testing.T) {
 	if _, err := ApplyEnvelope(
 		State{Version: 1, DiceID: maxPart, GroupID: maxPart},
 		eventstore.Envelope{
-			Stream: eventstore.StreamID{AggregateType: GroupAggregateType, AggregateID: canonicalAggregateID(maxPart, maxPart)},
+			Stream:        eventstore.StreamID{AggregateType: GroupAggregateType, AggregateID: canonicalAggregateID(maxPart, maxPart)},
 			StreamVersion: 2, EventType: string(EventGroupNameChanged), SchemaVersion: GroupEventSchemaVersion,
 			Payload: []byte(`{"groupName":"x"}`),
 		},
@@ -231,7 +233,9 @@ func TestGroupDecideEmitsTypedRecordFacts(t *testing.T) {
 func TestDecideWelcomeUsesExplicitEnabledField(t *testing.T) {
 	state := State{Version: 1, DiceID: "dice-1", GroupID: "group-1"}
 	decision, err := Decide(state, Command{Kind: CommandWelcome, Active: true, WelcomeEnabled: false, WelcomeMessage: "hello"})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	welcome, ok := decision.Events[0].(GroupWelcomeChangedV1)
 	if !ok || welcome.Enabled {
 		t.Fatalf("welcome decision = %#v", decision.Events)
@@ -278,37 +282,45 @@ func TestDecideAndAppendCreateUsesCommandIdentity(t *testing.T) {
 }
 func TestAppendRejectsUnreplayableFirstEventWithoutProjector(t *testing.T) {
 	ctx := context.Background()
-	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/group-no-projector.db"})
-	if err != nil { t.Fatal(err) }
+	db, persistErr := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/group-no-projector.db"})
+	if persistErr != nil {
+		t.Fatal(persistErr)
+	}
 	defer db.Close()
 	repository := NewRepository(eventstore.NewStore(db))
-	created, err := NewEvent(NewGroupCreatedV1("dice-1", "group-1", "name", 1), eventstore.Metadata{
+	created, persistErr := NewEvent(NewGroupCreatedV1("dice-1", "group-1", "name", 1), eventstore.Metadata{
 		EventID: "created-event", CommandID: "created-command", CorrelationID: "created-correlation",
 		OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true,
 	})
-	if err != nil { t.Fatal(err) }
-	name, err := NewEvent(NewGroupNameChangedV1("unreachable"), eventstore.Metadata{
+	if persistErr != nil {
+		t.Fatal(persistErr)
+	}
+	name, persistErr := NewEvent(NewGroupNameChangedV1("unreachable"), eventstore.Metadata{
 		EventID: "name-event", CommandID: "name-command", CorrelationID: "name-correlation",
 		OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true,
 	})
-	if err != nil { t.Fatal(err) }
+	if persistErr != nil {
+		t.Fatal(persistErr)
+	}
 	if _, err := repository.Append(ctx, "dice-1", "group-1", 0, []eventstore.NewEvent{name}); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("unreplayable first event error = %v", err)
 	}
 	if _, err := repository.Append(ctx, "dice-1", "group-1", 0, []eventstore.NewEvent{created}); err != nil {
 		t.Fatal(err)
 	}
-	duplicateSystem, err := NewEvent(NewGroupSystemChangedV1("coc7"), eventstore.Metadata{
+	duplicateSystem, persistErr := NewEvent(NewGroupSystemChangedV1("coc7"), eventstore.Metadata{
 		EventID: "name-event", CommandID: "name-command", CorrelationID: "name-correlation",
 		OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true,
 	})
-	if err != nil { t.Fatal(err) }
+	if persistErr != nil {
+		t.Fatal(persistErr)
+	}
 	if _, err := repository.Append(ctx, "dice-1", "group-1", 1, []eventstore.NewEvent{name, duplicateSystem}); !errors.Is(err, eventstore.ErrConflict) {
 		t.Fatalf("duplicate raw event ID error = %v", err)
 	}
-	state, err := repository.Load(ctx, "dice-1", "group-1")
-	if err != nil || state.Version != 1 || state.GroupName != "name" {
-		t.Fatalf("replayed no-projector state = %#v, err = %v", state, err)
+	state, persistErr := repository.Load(ctx, "dice-1", "group-1")
+	if persistErr != nil || state.Version != 1 || state.GroupName != "name" {
+		t.Fatalf("replayed no-projector state = %#v, err = %v", state, persistErr)
 	}
 }
 
@@ -324,8 +336,8 @@ func TestGroupDeletePlanPreservesDryRunAllowActiveAndScopes(t *testing.T) {
 	}
 	if !plan.DryRun || !plan.AllowActive || len(plan.Streams) != 1 || plan.Streams[0].AggregateType != "group" {
 		t.Fatalf("delete plan = %#v", plan)
-}
 	}
+}
 
 func TestAttrsDeletePlanDoesNotIncludeGroupRecordOrModeration(t *testing.T) {
 	state := State{DiceID: "dice-1", GroupID: "group-1"}
@@ -350,9 +362,9 @@ func TestGroupProjectorRebuildsTypedEvents(t *testing.T) {
 }
 
 func TestRepositoryAndProjectionReplayTypedEvents(t *testing.T) {
-	db, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/group.db"})
-	if err != nil {
-		t.Fatal(err)
+	db, appendErr := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/group.db"})
+	if appendErr != nil {
+		t.Fatal(appendErr)
 	}
 	defer db.Close()
 	store := eventstore.NewStore(db, eventstore.WithProjection(GroupProjection()))
@@ -365,35 +377,37 @@ func TestRepositoryAndProjectionReplayTypedEvents(t *testing.T) {
 	if _, err := repository.AppendTyped(context.Background(), "dice-1", "group-1", 1, metadata, []TypedEvent{NewGroupBotListChangedV1("bot-1", true)}); err != nil {
 		t.Fatal(err)
 	}
-	state, err := repository.Load(context.Background(), "dice-1", "group-1")
-	if err != nil || !state.BotList["bot-1"] {
-		t.Fatalf("repository state = %#v, err = %v", state, err)
+	state, appendErr := repository.Load(context.Background(), "dice-1", "group-1")
+	if appendErr != nil || !state.BotList["bot-1"] {
+		t.Fatalf("repository state = %#v, err = %v", state, appendErr)
 	}
-	projected, err := ReadProjected(context.Background(), store, "dice-1", "group-1")
-	if err != nil || !projected.BotList["bot-1"] {
-		t.Fatalf("projected state = %#v, err = %v", projected, err)
+	projected, appendErr := ReadProjected(context.Background(), store, "dice-1", "group-1")
+	if appendErr != nil || !projected.BotList["bot-1"] {
+		t.Fatalf("projected state = %#v, err = %v", projected, appendErr)
 	}
-	rebuild, err := store.Rebuild(context.Background(), eventstore.RebuildRequest{ProjectorVersion: GroupProjectionVersion})
-	if err != nil {
-		t.Fatal(err)
+	rebuild, appendErr := store.Rebuild(context.Background(), eventstore.RebuildRequest{ProjectorVersion: GroupProjectionVersion})
+	if appendErr != nil {
+		t.Fatal(appendErr)
 	}
 	if rebuild.GenerationID == "" {
 		t.Fatal("rebuild did not publish a generation")
 	}
-	projected, err = ReadProjected(context.Background(), store, "dice-1", "group-1")
-	if err != nil || !projected.BotList["bot-1"] {
-		t.Fatalf("rebuilt projected state = %#v, err = %v", projected, err)
+	projected, appendErr = ReadProjected(context.Background(), store, "dice-1", "group-1")
+	if appendErr != nil || !projected.BotList["bot-1"] {
+		t.Fatalf("rebuilt projected state = %#v, err = %v", projected, appendErr)
 	}
 	projected.BotList["bot-1"] = false
-	again, err := ReadProjected(context.Background(), store, "dice-1", "group-1")
-	if err != nil || !again.BotList["bot-1"] {
-		t.Fatalf("projection read was mutable = %#v, err = %v", again, err)
+	again, appendErr := ReadProjected(context.Background(), store, "dice-1", "group-1")
+	if appendErr != nil || !again.BotList["bot-1"] {
+		t.Fatalf("projection read was mutable = %#v, err = %v", again, appendErr)
 	}
 }
 func TestGroupProjectionRejectsCorruptExistingRow(t *testing.T) {
 	ctx := context.Background()
 	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/group-corrupt-projection.db"})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer db.Close()
 	store := eventstore.NewStore(db, eventstore.WithProjection(GroupProjection()))
 	repository := NewRepository(store)
@@ -435,8 +449,10 @@ func TestAppendTypedAllocatesUniqueEventIDsForBatch(t *testing.T) {
 }
 func TestAppendTypedRejectsDuplicateExplicitEventID(t *testing.T) {
 	ctx := context.Background()
-	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/group-duplicate.db"})
-	if err != nil { t.Fatal(err) }
+	db, repositoryErr := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/group-duplicate.db"})
+	if repositoryErr != nil {
+		t.Fatal(repositoryErr)
+	}
 	defer db.Close()
 	repository := NewRepository(eventstore.NewStore(db))
 	metadata := eventstore.Metadata{EventID: "duplicate-event", CommandID: "duplicate-command", CorrelationID: "duplicate-correlation", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}
@@ -445,9 +461,8 @@ func TestAppendTypedRejectsDuplicateExplicitEventID(t *testing.T) {
 	}); !errors.Is(err, eventstore.ErrConflict) {
 		t.Fatalf("duplicate explicit event ID error = %v", err)
 	}
-	events, err := repository.Store.Load(ctx, GroupStream("dice-1", "group-1"), 1)
-	if err != nil || len(events) != 0 {
-		t.Fatalf("duplicate batch committed events = %#v, err = %v", events, err)
+	events, repositoryErr := repository.Store.Load(ctx, GroupStream("dice-1", "group-1"), 1)
+	if repositoryErr != nil || len(events) != 0 {
+		t.Fatalf("duplicate batch committed events = %#v, err = %v", events, repositoryErr)
 	}
 }
-

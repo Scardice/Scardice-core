@@ -1,5 +1,7 @@
 package censor
 
+import "unicode/utf8"
+
 type node struct {
 	end      bool
 	content  string
@@ -56,23 +58,28 @@ func (t *trie) Match(text string) (sensitiveWords map[string]Level) {
 	}
 
 	sensitiveWords = map[string]Level{}
-	chars := []rune(text)
-	for i := range chars {
-		cur := t.root.findChild(chars[i])
+	for i, char := range text {
+		cur := t.root.findChild(char)
 		if cur == nil {
 			continue
 		}
-		// 匹配到了前缀，开始检查是否完整匹配
-		j := i + 1
-		for ; cur != nil && j < len(chars); j++ {
+		if cur.end {
+			sensitiveWords[cur.content] = cur.level
+			continue
+		}
+		size := 1
+		if char >= utf8.RuneSelf {
+			_, size = utf8.DecodeRuneInString(text[i:])
+		}
+		for _, next := range text[i+size:] {
+			cur = cur.findChild(next)
+			if cur == nil {
+				break
+			}
 			if cur.end {
 				sensitiveWords[cur.content] = cur.level
 				break
 			}
-			cur = cur.findChild(chars[j])
-		}
-		if cur != nil && j == len(chars) && cur.end {
-			sensitiveWords[cur.content] = cur.level
 		}
 	}
 	return sensitiveWords

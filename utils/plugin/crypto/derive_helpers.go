@@ -102,12 +102,18 @@ func deriveBitsECDH(rt *goja.Runtime, algObj *goja.Object, baseKey *cryptoKeyHan
 	if pub.Curve != priv.Curve {
 		return nil, errors.New("ECDH curve mismatch")
 	}
-	x, _ := pub.ScalarMult(pub.X, pub.Y, priv.D.Bytes())
-	if x == nil {
-		return nil, errors.New("ECDH derive failed")
+	privateKey, err := priv.ECDH()
+	if err != nil {
+		return nil, err
 	}
-	size := (pub.Curve.Params().BitSize + 7) / 8
-	shared := leftPad(x.Bytes(), size)
+	publicKey, err := pub.ECDH()
+	if err != nil {
+		return nil, err
+	}
+	shared, err := privateKey.ECDH(publicKey)
+	if err != nil {
+		return nil, err
+	}
 	if lengthBits > len(shared)*8 {
 		return nil, errors.New("requested length exceeds shared secret size")
 	}

@@ -84,6 +84,34 @@ func TestGroupInfoUnmarshalSkipsEmptyNameEntries(t *testing.T) {
 	}
 }
 
+func TestGroupInfoUnmarshalReplacesExtensionsOnlyOnSuccess(t *testing.T) {
+	for _, input := range []string{
+		`{"activatedExtList":"invalid"}`,
+		`{"activatedExtList":[{"name":17}]}`,
+		`{"activatedExtList":[{"name":"new"}]`,
+	} {
+		g := &GroupInfo{}
+		old := &ExtInfo{Name: "old"}
+		g.SetActivatedExtList([]*ExtInfo{old}, nil)
+		if err := json.Unmarshal([]byte(input), g); err == nil {
+			t.Fatalf("invalid extension configuration accepted: %s", input)
+		}
+		if exts := g.GetActivatedExtListRaw(); len(exts) != 1 || exts[0] != old {
+			t.Fatalf("failed decode replaced active extensions: %v", exts)
+		}
+	}
+	for _, input := range []string{`{}`, `{"activatedExtList":null}`, `{"activatedExtList":[]}`} {
+		g := &GroupInfo{}
+		g.SetActivatedExtList([]*ExtInfo{{Name: "old"}}, nil)
+		if err := json.Unmarshal([]byte(input), g); err != nil {
+			t.Fatal(err)
+		}
+		if exts := g.GetActivatedExtListRaw(); len(exts) != 0 {
+			t.Fatalf("absent/null/empty extension list retained old activation: %v", exts)
+		}
+	}
+}
+
 // TestGroupInfoMarshalKeepsExtEntryFormat 验证存储格式不变：
 // 落盘时 activatedExtList 仍是 {name, aliases, version} 对象数组。
 func TestGroupInfoMarshalKeepsExtEntryFormat(t *testing.T) {

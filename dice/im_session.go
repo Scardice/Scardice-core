@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -20,6 +21,7 @@ import (
 	"Scardice-core/adapterapi"
 	"Scardice-core/dice/events"
 	"Scardice-core/dice/service"
+	"Scardice-core/eventstore"
 	"Scardice-core/logger"
 	"Scardice-core/message"
 	"Scardice-core/model"
@@ -33,6 +35,7 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/dop251/goja"
+	"github.com/google/uuid"
 	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v3"
 )
@@ -67,7 +70,11 @@ type Message struct {
 	Platform    string      `jsbind:"platform"    json:"platform"` // 当前平台
 	GroupName   string      `json:"groupName"`
 	TmpUID      string      `json:"-"             yaml:"-"`
-	Seq         int64       `jsbind:"seq"         json:"seq"` // 平台消息序号，0=不可用/不支持
+	// TestUIOutputSplitLength applies only to responses from the UI command tester.
+	TestUIOutputSplitLength    int  `json:"-" yaml:"-"`
+	TestUIOutputSplitLengthSet bool `json:"-" yaml:"-"`
+	recovered                  bool
+	Seq                        int64 `jsbind:"seq"         json:"seq"` // 平台消息序号，0=不可用/不支持
 	// Note(Szzrain): 这里是消息段，为了支持多种消息类型，目前只有 Milky 支持，其他平台也应该尽快迁移支持，并使用 Session.ExecuteNew 方法
 	Segment []message.IMessageElement `jsbind:"segment" json:"-" yaml:"-"`
 }
@@ -116,12 +123,13 @@ type GroupInfo struct {
 	System          string                 `json:"system"          yaml:"system"`       // 规则系统，概念同bcdice的gamesystem，距离如dnd5e coc7
 	RollShaperMode  string                 `json:"rollShaperMode" yaml:"rollShaperMode"`
 
-	HelpPackages []string      `json:"helpPackages"   yaml:"-"`
-	CocRuleIndex int           `jsbind:"cocRuleIndex" json:"cocRuleIndex" yaml:"cocRuleIndex"`
-	logStateMu   *sync.RWMutex `json:"-" yaml:"-"`
-	LogCurID     uint64        `json:"-" yaml:"-"`
-	LogCurName   string        `jsbind:"logCurName"   json:"logCurName"   yaml:"logCurFile"`
-	LogOn        bool          `jsbind:"logOn"        json:"logOn"        yaml:"logOn"`
+	HelpPackages   []string      `json:"helpPackages"   yaml:"-"`
+	CocRuleIndex   int           `jsbind:"cocRuleIndex" json:"cocRuleIndex" yaml:"cocRuleIndex"`
+	logStateMu     *sync.RWMutex `json:"-" yaml:"-"`
+	LogCurID       uint64        `json:"-" yaml:"-"`
+	LogCurName     string        `jsbind:"logCurName"   json:"logCurName"   yaml:"logCurFile"`
+	LogOn          bool          `jsbind:"logOn"        json:"logOn"        yaml:"logOn"`
+	logBaselineSeq int64         `json:"-" yaml:"-"` // 受 logStateMu 保护，见 GroupLogState.BaselineSeq
 
 	QuitMarkAutoClean   bool   `json:"-"                     yaml:"-"` // 自动清群 - 播报，即将自动退出群组
 	QuitMarkMaster      bool   `json:"-"                     yaml:"-"` // 骰主命令退群 - 播报，即将自动退出群组
@@ -157,34 +165,66 @@ type GroupInfo struct {
 	ExtAppliedTime int64 `json:"-" yaml:"-"` // 群组应用扩展的时间戳，运行时使用，不序列化（强制每次启动重新初始化）
 
 	/* 日志seq断层检测 - 运行时字段 */
-	logSeqMu     sync.Mutex  `json:"-" yaml:"-"` // 保护以下三个seq追踪字段的原子读写
-	logLastSeq   int64       `json:"-" yaml:"-"` // 上条已记录消息的seq，0=未初始化
-	logLastMsgID interface{} `json:"-" yaml:"-"` // 上条已记录消息的RawID，用于断层通知的引用回复
-	logSelfSent  int64       `json:"-" yaml:"-"` // 自 logLastSeq 以来骰子自身的群内发言数
-	logGapFillMu sync.Mutex  `json:"-" yaml:"-"` // 补全防重入
+	logRuntimeMu sync.Mutex
+	logRuntime   *groupLogRuntime
+}
+
+// Callback projections are rebuilt per message; sequence tracking and the
+// recovery lock belong to the live group, not to an individual projection.
+type groupLogRuntime struct {
+	mu        sync.Mutex
+	logID     uint64
+	lastSeq   int64
+	lastMsgID interface{}
+	selfSent  int64
+	fillMu    sync.Mutex
+}
+
+func (g *GroupInfo) logSequence() *groupLogRuntime {
+	g.logRuntimeMu.Lock()
+	defer g.logRuntimeMu.Unlock()
+	if g.logRuntime == nil {
+		g.logRuntime = &groupLogRuntime{}
+	}
+	return g.logRuntime
 }
 
 // noteLogSelfSent 记录一条骰子自身的群内发言。
 // QQ的seq由群内所有消息共享，骰子发言同样占号，不计数就会把自己的回复误判成掉线遗漏。
 func (g *GroupInfo) noteLogSelfSent() {
-	g.logSeqMu.Lock()
-	defer g.logSeqMu.Unlock()
-	g.logSelfSent++
+	state := g.logSequence()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.selfSent++
 }
 
-// updateLogSeq 记录本条消息的seq，仅当 seq > 当前值时才推进，返回推进前的 seq、rawID，
-// 以及两条消息之间骰子自身的发言数（推进时一并清零，由调用方从断层数中扣除）。
-// 补录的历史消息 seq 必然小于当前值，既不会让指针回退，也不会误清自身发言计数。
-func (g *GroupInfo) updateLogSeq(seq int64, rawID interface{}) (lastSeq int64, lastMsgID interface{}, selfSent int64) {
-	g.logSeqMu.Lock()
-	defer g.logSeqMu.Unlock()
-	lastSeq, lastMsgID, selfSent = g.logLastSeq, g.logLastMsgID, g.logSelfSent
-	if seq > g.logLastSeq {
-		g.logLastSeq = seq
-		g.logLastMsgID = rawID
-		g.logSelfSent = 0
+// logSeqPosition 是记录一条新消息之前，日志所处的位置。
+type logSeqPosition struct {
+	lastSeq   int64       // 上一条已记录消息的seq，0=不知道
+	lastMsgID interface{} // 上一条已记录消息的RawID
+	selfSent  int64       // 两条消息之间骰子自身的发言数
+	rebuilt   bool        // 内存里没有这份日志的记录（刚启动或刚切换日志），lastSeq 只来自 floor
+}
+
+// updateLogSeq 记录日志 logID 收到的最新消息 seq，返回记录之前日志所处的位置。
+// floor 是该日志持久化的基线：不大于它的消息不属于这份日志，因此位置不会落在它之前。
+// 仅当 seq 大于当前位置时才推进，补录的历史消息 seq 必然更小，既不会让指针回退，也不会误清自身发言计数。
+// 切换到另一份日志时，上一份日志的位置不会被带过来。
+func (g *GroupInfo) updateLogSeq(logID uint64, floor, seq int64, rawID interface{}) logSeqPosition {
+	state := g.logSequence()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.logID != logID {
+		state.logID, state.lastSeq, state.lastMsgID, state.selfSent = logID, 0, nil, 0
 	}
-	return lastSeq, lastMsgID, selfSent
+	pos := logSeqPosition{lastSeq: state.lastSeq, lastMsgID: state.lastMsgID, selfSent: state.selfSent, rebuilt: state.lastSeq == 0}
+	if floor > pos.lastSeq {
+		pos.lastSeq, pos.lastMsgID, pos.selfSent = floor, nil, 0
+	}
+	if seq > pos.lastSeq {
+		state.lastSeq, state.lastMsgID, state.selfSent = seq, rawID, 0
+	}
+	return pos
 }
 
 // GetActivatedExtList 获取激活的扩展列表，自动处理延迟初始化
@@ -284,20 +324,6 @@ func (g *GroupInfo) TriggerExtHook(d *Dice, getHook func(*ExtInfo) func()) {
 	}
 }
 
-// TriggerExtNotifyHook 与 TriggerExtHook 相同，但把 JS 扩展回调排入事件循环而
-// 不等待。发送后通知可能由事件循环内的宿主函数触发，等待会自锁。
-func (g *GroupInfo) TriggerExtNotifyHook(d *Dice, getHook func(*ExtInfo) func()) {
-	for _, wrapper := range g.GetActivatedExtList(d) {
-		ext := wrapper.GetRealExt()
-		if ext == nil {
-			continue
-		}
-		if hook := getHook(ext); hook != nil {
-			ext.notifyWithJsCheck(d, hook)
-		}
-	}
-}
-
 // GetActivatedExtListRaw 直接访问扩展列表（用于序列化、内部修改等场景）
 func (g *GroupInfo) GetActivatedExtListRaw() []*ExtInfo {
 	g.extInitMu.Lock()
@@ -327,14 +353,9 @@ type groupInfoJSON struct {
 	ActivatedExtList []*ExtInfo `json:"activatedExtList"`
 }
 
-// groupInfoDecodeJSON 仅用于反序列化：activatedExtList 为私有字段，解码时跳过该键，
-// 由 GroupInfo.UnmarshalJSON 单独轻量解析。
+// groupInfoDecodeJSON 只读取扩展名，避免为每个群构造完整 ExtInfo。
 type groupInfoDecodeJSON struct {
 	*groupInfoAlias
-}
-
-// extNameRefsJSON activatedExtList 的轻量解码结构，仅取出扩展名。
-type extNameRefsJSON struct {
 	ActivatedExtList []struct {
 		Name string `json:"name"`
 	} `json:"activatedExtList"`
@@ -365,16 +386,13 @@ func (g *GroupInfo) MarshalJSON() ([]byte, error) {
 func (g *GroupInfo) UnmarshalJSON(data []byte) error {
 	g.rollShaperMu.Lock()
 	defer g.rollShaperMu.Unlock()
-	if err := sonic.Unmarshal(data, &groupInfoDecodeJSON{groupInfoAlias: (*groupInfoAlias)(g)}); err != nil {
-		return err
-	}
-	var refs extNameRefsJSON
-	if err := sonic.Unmarshal(data, &refs); err != nil {
+	decoded := groupInfoDecodeJSON{groupInfoAlias: (*groupInfoAlias)(g)}
+	if err := sonic.Unmarshal(data, &decoded); err != nil {
 		return err
 	}
 
 	var list []*ExtInfo
-	for _, ref := range refs.ActivatedExtList {
+	for _, ref := range decoded.ActivatedExtList {
 		if ref.Name == "" {
 			continue
 		}
@@ -408,6 +426,8 @@ type GroupLogState struct {
 	ID   uint64
 	Name string
 	On   bool
+	// BaselineSeq 是最近一次开启这份日志的那条消息的seq，0=未知。
+	BaselineSeq int64
 }
 
 func (g *GroupInfo) ensureLogStateMu() *sync.RWMutex {
@@ -422,10 +442,19 @@ func (g *GroupInfo) GetLogState() GroupLogState {
 	mu.RLock()
 	defer mu.RUnlock()
 	return GroupLogState{
-		ID:   g.LogCurID,
-		Name: g.LogCurName,
-		On:   g.LogOn,
+		ID:          g.LogCurID,
+		Name:        g.LogCurName,
+		On:          g.LogOn,
+		BaselineSeq: g.logBaselineSeq,
 	}
+}
+
+// SetLogBaselineSeq 记录当前日志的基线，见 GroupLogState.BaselineSeq。
+func (g *GroupInfo) SetLogBaselineSeq(seq int64) {
+	mu := g.ensureLogStateMu()
+	mu.Lock()
+	g.logBaselineSeq = seq
+	mu.Unlock()
 }
 
 func (g *GroupInfo) SetLogState(logID uint64, logName string, logOn bool) {
@@ -450,6 +479,7 @@ func (g *GroupInfo) ClearLogState() {
 	g.LogCurID = 0
 	g.LogCurName = ""
 	g.LogOn = false
+	g.logBaselineSeq = 0
 	mu.Unlock()
 }
 
@@ -470,7 +500,7 @@ func (group *GroupInfo) PlayerGet(operator engine.DatabaseOperator, id string) *
 		group.Players = new(SyncMap[string, *GroupPlayerInfo])
 	}
 	p, exists := group.Players.Load(id)
-	if !exists {
+	if !exists && operator != nil {
 		basePtr := service.GroupPlayerInfoGet(operator, group.GroupID, id)
 		p = (*GroupPlayerInfo)(basePtr)
 		if p != nil {
@@ -570,157 +600,6 @@ func (ep *EndPointInfo) UnmarshalYAML(value *yaml.Node) error {
 	}
 	ep.EndPointInfoBase = val.EndPointInfoBase
 
-	switch val.Platform {
-	case "QQ":
-		switch ep.ProtocolType {
-		case "onebot":
-			var val struct {
-				Adapter *PlatformAdapterGocq `yaml:"adapter"`
-			}
-
-			err = value.Decode(&val)
-			if err != nil {
-				return err
-			}
-			ep.Adapter = val.Adapter
-		case "walle-q":
-			var val struct {
-				Adapter *PlatformAdapterWalleQ `yaml:"adapter"`
-			}
-
-			err = value.Decode(&val)
-			if err != nil {
-				return err
-			}
-			ep.Adapter = val.Adapter
-		case "red":
-			var val struct {
-				Adapter *PlatformAdapterRed `yaml:"adapter"`
-			}
-			err = value.Decode(&val)
-			if err != nil {
-				return err
-			}
-			ep.Adapter = val.Adapter
-		case "official":
-			var val struct {
-				Adapter *PlatformAdapterOfficialQQ `yaml:"adapter"`
-			}
-			err = value.Decode(&val)
-			if err != nil {
-				return err
-			}
-			ep.Adapter = val.Adapter
-		case "satori":
-			var val struct {
-				Adapter *PlatformAdapterSatori `yaml:"adapter"`
-			}
-			err = value.Decode(&val)
-			if err != nil {
-				return err
-			}
-			ep.Adapter = val.Adapter
-		// case "LagrangeGo":
-		//	var val struct {
-		//		Adapter *PlatformAdapterLagrangeGo `yaml:"adapter"`
-		//	}
-		//	err = value.Decode(&val)
-		//	if err != nil {
-		//		return err
-		//	}
-		//	ep.Adapter = val.Adapter
-		case "milky":
-			var val struct {
-				Adapter *PlatformAdapterMilky `yaml:"adapter"`
-			}
-			err = value.Decode(&val)
-			if err != nil {
-				return err
-			}
-			ep.Adapter = val.Adapter
-		case "pureonebot":
-			var val struct {
-				Adapter *PlatformAdapterOnebot `yaml:"adapter"`
-			}
-			err = value.Decode(&val)
-			if err != nil {
-				return err
-			}
-			ep.Adapter = val.Adapter
-		}
-	case "DISCORD":
-		var val struct {
-			Adapter *PlatformAdapterDiscord `yaml:"adapter"`
-		}
-		err = value.Decode(&val)
-		if err != nil {
-			return err
-		}
-		ep.Adapter = val.Adapter
-	case "KOOK":
-		var val struct {
-			Adapter *PlatformAdapterKook `yaml:"adapter"`
-		}
-		err = value.Decode(&val)
-		if err != nil {
-			return err
-		}
-		ep.Adapter = val.Adapter
-	case "TG":
-		var val struct {
-			Adapter *PlatformAdapterTelegram `yaml:"adapter"`
-		}
-		err = value.Decode(&val)
-		if err != nil {
-			return err
-		}
-		ep.Adapter = val.Adapter
-	case "MC":
-		var val struct {
-			Adapter *PlatformAdapterMinecraft `yaml:"adapter"`
-		}
-		err = value.Decode(&val)
-		if err != nil {
-			return err
-		}
-		ep.Adapter = val.Adapter
-	case "DODO":
-		var val struct {
-			Adapter *PlatformAdapterDodo `yaml:"adapter"`
-		}
-		err = value.Decode(&val)
-		if err != nil {
-			return err
-		}
-		ep.Adapter = val.Adapter
-	case "DINGTALK":
-		var val struct {
-			Adapter *PlatformAdapterDingTalk `yaml:"adapter"`
-		}
-		err = value.Decode(&val)
-		if err != nil {
-			return err
-		}
-		ep.Adapter = val.Adapter
-	case "SLACK":
-		var val struct {
-			Adapter *PlatformAdapterSlack `yaml:"adapter"`
-		}
-		err = value.Decode(&val)
-		if err != nil {
-			return err
-		}
-		ep.Adapter = val.Adapter
-	case "SEALCHAT":
-		var val struct {
-			Adapter *PlatformAdapterSealChat `yaml:"adapter"`
-		}
-		err = value.Decode(&val)
-		if err != nil {
-			return err
-		}
-		ep.Adapter = val.Adapter
-	}
 	return err
 }
 
@@ -775,8 +654,10 @@ const (
 )
 
 type messageExecutionOptions struct {
-	parser    messageParserMode
-	runInSync bool
+	parser              messageParserMode
+	runInSync           bool
+	callbackTransaction *DurableCallbackTransaction
+	callbackMetadata    eventstore.Metadata
 }
 
 type messageExecutionResult struct {
@@ -784,11 +665,11 @@ type messageExecutionResult struct {
 	mentioned   bool
 	intercepted bool
 	unsupported bool
+	context     *MsgContext
 }
 
 type IMSession struct {
 	Parent       *Dice                              `yaml:"-"`
-	EndPoints    []*EndPointInfo                    `yaml:"endPoints"`
 	ServiceAtNew *SyncMap[string, *GroupInfo]       `json:"servicesAt" yaml:"-"`
 	PendingQuits *SyncMap[string, *PendingQuitInfo] `json:"-" yaml:"-"`
 
@@ -796,7 +677,6 @@ type IMSession struct {
 	// OneBot messages. It is intentionally absent by default for legacy sessions.
 	PureOnebotInboundExecutor adapterapi.CorePort `yaml:"-"`
 
-	endPointsSnapshot      atomic.Pointer[[]*EndPointInfo]
 	groupMemberWelcomeMu   sync.Mutex
 	lastGroupMemberWelcome *LastWelcomeInfo
 }
@@ -809,27 +689,11 @@ type EndPointDisplaySnapshot struct {
 	State    EndpointState
 }
 
-// RefreshEndPointsSnapshot 发布当前端点列表的只读快照。
-func (s *IMSession) RefreshEndPointsSnapshot() {
-	if s == nil {
-		return
-	}
-	snapshot := append([]*EndPointInfo(nil), s.EndPoints...)
-	s.endPointsSnapshot.Store(&snapshot)
-}
-
-// EndPointsSnapshot 返回最近发布列表中各端点展示字段的单次采样。
-// 端点状态由各适配器独立更新，因此该快照提供最终一致的托盘展示语义。
+// EndPointsSnapshot 返回 endpoint projection 的展示值采样。
 func (s *IMSession) EndPointsSnapshot() []EndPointDisplaySnapshot {
-	if s == nil {
-		return nil
-	}
-	snapshot := s.endPointsSnapshot.Load()
-	if snapshot == nil {
-		return nil
-	}
-	display := make([]EndPointDisplaySnapshot, 0, len(*snapshot))
-	for _, endpoint := range *snapshot {
+	endpoints := s.EndPointsReadOnly()
+	display := make([]EndPointDisplaySnapshot, 0, len(endpoints))
+	for _, endpoint := range endpoints {
 		if endpoint == nil {
 			continue
 		}
@@ -849,44 +713,31 @@ func (s *IMSession) ResolveLiveEndpoint(ep *EndPointInfo) (*EndPointInfo, error)
 	if s == nil {
 		return nil, errors.New("session is nil")
 	}
-
-	for _, cur := range s.EndPoints {
-		if cur == ep {
-			if cur.Session == nil {
-				cur.BindRuntime(s)
-			}
-			return cur, nil
-		}
+	if ep.Session == s {
+		return ep, nil
 	}
-
+	endpoints := s.EndPointsReadOnly()
 	if ep.ID != "" {
-		for _, cur := range s.EndPoints {
-			if cur != nil && cur.ID == ep.ID {
-				if cur.Session == nil {
-					cur.BindRuntime(s)
-				}
-				return cur, nil
+		for _, current := range endpoints {
+			if current != nil && current.ID == ep.ID {
+				return current, nil
 			}
 		}
 	}
-
 	var matched *EndPointInfo
-	for _, cur := range s.EndPoints {
-		if cur == nil {
+	for _, current := range endpoints {
+		if current == nil {
 			continue
 		}
-		if cur.UserID != ep.UserID || cur.Platform != ep.Platform || cur.ProtocolType != ep.ProtocolType {
+		if current.UserID != ep.UserID || current.Platform != ep.Platform || current.ProtocolType != ep.ProtocolType {
 			continue
 		}
-		if matched != nil && matched != cur {
+		if matched != nil {
 			return nil, fmt.Errorf("endpoint resolution ambiguous for userId=%s platform=%s protocolType=%s", ep.UserID, ep.Platform, ep.ProtocolType)
 		}
-		matched = cur
+		matched = current
 	}
 	if matched != nil {
-		if matched.Session == nil {
-			matched.BindRuntime(s)
-		}
 		return matched, nil
 	}
 
@@ -937,6 +788,19 @@ func (s *IMSession) ConsumePendingQuit(groupID string, endpointID string) *Pendi
 	return info
 }
 
+func (s *IMSession) pruneExpiredPendingQuits(now time.Time) {
+	if s == nil || s.PendingQuits == nil {
+		return
+	}
+	s.PendingQuits.Range(func(key string, info *PendingQuitInfo) bool {
+		if info == nil || now.After(info.ExpireAt) {
+			// A new registration may replace this key while Range is running.
+			s.PendingQuits.m.CompareAndDelete(key, info)
+		}
+		return true
+	})
+}
+
 type MsgContext struct {
 	MessageType string
 	Group       *GroupInfo       `jsbind:"group"`  // 当前群信息
@@ -949,16 +813,30 @@ type MsgContext struct {
 	Dice            *Dice         // 对应的 Dice
 	IsCurGroupBotOn bool          `jsbind:"isCurGroupBotOn"` // 在群内是否bot on
 
-	IsPrivate       bool        `jsbind:"isPrivate"` // 是否私聊
-	CommandID       int64       // 指令ID
-	CurrentCommand  string      // 当前解析到的指令名(小写)
-	CommandHideFlag string      `jsbind:"commandHideFlag"` // 暗骰来源群号
-	CommandInfo     interface{} // 命令信息
-	PrivilegeLevel  int         `jsbind:"privilegeLevel"` // 权限等级 -30ban 40邀请者 50管理 60群主 70信任 100master
-	GroupRoleLevel  int         // 群内权限 40邀请者 50管理 60群主 70信任 100master，相当于不考虑ban的权限等级
-	DelegateText    string      `jsbind:"delegateText"`  // 代骰附加文本
-	AliasPrefixText string      `json:"aliasPrefixText"` // 快捷指令回复前缀文本
-	CommandReplied  bool        `json:"-"`               // 当前命令是否已通过统一回复路径发出消息
+	IsPrivate            bool        `jsbind:"isPrivate"` // 是否私聊
+	CommandID            int64       // 指令ID
+	CurrentCommand       string      // 当前解析到的指令名(小写)
+	CommandHideFlag      string      `jsbind:"commandHideFlag"` // 暗骰来源群号
+	CommandInfo          interface{} // 命令信息
+	PrivilegeLevel       int         `jsbind:"privilegeLevel"` // 权限等级 -30ban 40邀请者 50管理 60群主 70信任 100master
+	GroupRoleLevel       int         // 群内权限 40邀请者 50管理 60群主 70信任 100master，相当于不考虑ban的权限等级
+	DelegateText         string      `jsbind:"delegateText"`  // 代骰附加文本
+	AliasPrefixText      string      `json:"aliasPrefixText"` // 快捷指令回复前缀文本
+	uiTestSplitLength    int
+	uiTestSplitLengthSet bool
+	callbackTransaction  *DurableCallbackTransaction
+	callbackMetadata     eventstore.Metadata
+	// executionContext bounds host-owned callbacks which do not have a durable
+	// transaction, such as global adapter events.
+	executionContext context.Context
+	// outboundDelay defers every durable effect this context submits instead of
+	// making the caller sleep inside a callback lease.
+	outboundDelay  time.Duration
+	skipLogArchive bool
+	// Recovered replies retain their trigger's log position, not delivery time.
+	logReplyTime   int64
+	logReplySeq    int64
+	CommandReplied bool `json:"-"` // 当前命令是否已通过统一回复路径发出消息
 
 	commandRepliedMu  sync.RWMutex
 	deckDepth         int                                         // 抽牌递归深度
@@ -969,18 +847,54 @@ type MsgContext struct {
 	SpamCheckedGroup  bool
 	SpamCheckedPerson bool
 
-	splitKeyMu     sync.RWMutex
-	splitKey       string
-	forwardStart   string
-	forwardEnd     string
-	vm             *ds.Context
-	_v1Rand        ds.DiceSource
-	diceRandSrc    ds.DiceSource
-	diceRollSource ds.DiceSource
-	diceRollRaw    ds.DiceSource
-	diceRollGroup  *GroupInfo
-	chooserRand    *randv2.Rand
-	chooserSrc     ds.DiceSource
+	adapterEventUnattributed bool
+
+	splitKeyMu           sync.RWMutex
+	splitKey             string
+	forwardStart         string
+	forwardEnd           string
+	vm                   *ds.Context
+	randomMu             sync.Mutex // RNG caches may be used by retained JS methods during cleanup.
+	_v1Rand              ds.DiceSource
+	diceRandSrc          ds.DiceSource
+	diceRollSource       ds.DiceSource
+	diceRollRaw          ds.DiceSource
+	diceRollGroup        *GroupInfo
+	chooserRand          *randv2.Rand
+	chooserSrc           ds.DiceSource
+	executionReleaseOnce sync.Once
+	executionReleased    atomic.Bool
+	executionParent      *MsgContext
+	jsExecutionMu        sync.Mutex
+	jsExecution          *jsMessageExecution
+	standaloneSendScope  bool
+}
+
+func (ctx *MsgContext) releaseExecutionState() {
+	if ctx == nil {
+		return
+	}
+	ctx.executionReleaseOnce.Do(func() {
+		_ = ctx.stopJSExecution()
+		ctx.executionReleased.Store(true)
+		ctx.jsExecutionMu.Lock()
+		ctx.executionContext = nil
+		ctx.jsExecutionMu.Unlock()
+		ctx.vm = nil
+		ctx.CommandInfo = nil
+		ctx.DeckPools = nil
+		ctx.deckDepth = 0
+		ctx.diceExprOverwrite = ""
+		ctx.randomMu.Lock()
+		ctx._v1Rand = nil
+		ctx.diceRandSrc = nil
+		ctx.diceRollSource = nil
+		ctx.diceRollRaw = nil
+		ctx.diceRollGroup = nil
+		ctx.chooserRand = nil
+		ctx.chooserSrc = nil
+		ctx.randomMu.Unlock()
+	})
 }
 
 func (ctx *MsgContext) SetCommandReplied(replied bool) {
@@ -1068,10 +982,13 @@ func (s *IMSession) runMessagePreprocessHooks(mctx *MsgContext, msg *Message) bo
 	}
 	for _, wrapper := range mctx.Group.GetActivatedExtList(mctx.Dice) {
 		ext := wrapper.GetRealExt()
-		if ext == nil || (ext.OnMessagePreprocess == nil && ext.OnMessagePreprocessEngine == nil) {
+		if ext == nil || !ext.HasOnMessagePreprocess() {
 			continue
 		}
 		decision := wrapper.CallOnMessagePreprocess(mctx.Dice, mctx, msg)
+		if mctx.abortAfterJSCallback() {
+			return true
+		}
 		switch decision.action {
 		case messagePreprocessRewrite:
 			normalizeIncomingMessageText(mctx.Dice, msg, decision.message)
@@ -1146,9 +1063,23 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 	d := s.Parent
 
 	mctx := &MsgContext{}
+	result.context = mctx
+	// DurableCallbackHost still needs this context while finalizing the collected mutations.
+	releaseOnReturn := options.callbackTransaction == nil
+	defer func() {
+		if releaseOnReturn {
+			mctx.releaseExecutionState()
+		}
+	}()
 	mctx.Dice = d
 	mctx.MessageType = msg.MessageType
 	mctx.IsPrivate = mctx.MessageType == "private"
+	mctx.callbackTransaction = options.callbackTransaction
+	mctx.callbackMetadata = options.callbackMetadata
+	mctx.logReplySeq = msg.Seq
+	if msg.recovered {
+		mctx.logReplyTime = msg.Time
+	}
 	mctx.Session = s
 	mctx.EndPoint = ep
 	log := d.Logger
@@ -1157,11 +1088,10 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 	}
 	if msg.MessageType != "group" && msg.MessageType != "private" {
 		result.unsupported = true
-		return
+		return result
 	}
 
 	if msg.MessageType == "group" || msg.MessageType == "private" { //nolint:nestif
-
 		// GroupEnableCheck TODO: 后续看看是否需要
 		groupInfo, ok := s.ServiceAtNew.Load(msg.GroupID)
 		if !ok && msg.GroupID != "" {
@@ -1183,7 +1113,7 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 				dm := d.Parent
 				groupName = dm.TryGetGroupName(groupInfo.GroupID)
 				if dm.ShouldRefreshGroupInfo(msg.GroupID) {
-					ep.Adapter.GetGroupInfoAsync(msg.GroupID)
+					ep.GetGroupInfoAsync(msg.GroupID)
 				}
 			}
 			txt := fmt.Sprintf("自动激活: 发现无记录群组%s(%s)，因为已是群成员，所以自动激活，开启状态: %t", groupName, groupInfo.GroupID, autoOn)
@@ -1200,16 +1130,16 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 						if ext == nil {
 							continue
 						}
-						if ext.OnGroupJoined != nil {
-							ext.callWithJsCheck(mctx.Dice, func() {
-								ext.OnGroupJoined(mctx, msg)
-							}, jsCallbackDispatch{kind: jsCallbackActivation, providerEventID: callbackEventIDForMessage(mctx, msg)})
+						ext.CallOnGroupJoined(mctx.Dice, mctx, msg)
+						if mctx.abortAfterJSCallback() {
+							result.intercepted = true
+							return result
 						}
 					}
 				}
 			}
 		}
-		if options.parser == messageParserSegments && groupInfo != nil {
+		if options.parser == messageParserSegments && groupInfo != nil && msg.GroupName != "" {
 			groupInfo.GroupName = msg.GroupName
 		}
 
@@ -1240,10 +1170,10 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 					if ext == nil {
 						continue
 					}
-					if ext.OnMessageReceived != nil {
-						ext.callWithJsCheck(mctx.Dice, func() {
-							ext.OnMessageReceived(mctx, msg)
-						}, jsCallbackDispatch{kind: jsCallbackMessage, providerEventID: callbackEventIDForMessage(mctx, msg)})
+					ext.CallOnMessageReceived(mctx.Dice, mctx, msg)
+					if mctx.abortAfterJSCallback() {
+						result.intercepted = true
+						return result
 					}
 				}
 			}
@@ -1251,7 +1181,11 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 
 		if s.runMessagePreprocessHooks(mctx, msg) {
 			result.intercepted = true
-			return
+			return result
+		}
+		if mctx.abortAfterJSCallback() {
+			result.intercepted = true
+			return result
 		}
 
 		// 消息预处理可能改写前缀或@，这里必须使用改写后的内容。
@@ -1282,7 +1216,7 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 		}
 		if notReply := checkBan(mctx, msg); notReply {
 			result.intercepted = true
-			return
+			return result
 		}
 
 		var cmdArgs *CmdArgs
@@ -1364,7 +1298,7 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 			hit, words, needToTerminate, _ := d.CensorMsg(mctx, msg, msg.Message, "")
 			if needToTerminate {
 				result.intercepted = true
-				return
+				return result
 			}
 			if hit {
 				text := DiceFormatTmpl(mctx, "核心:拦截_完全拦截_收到的所有消息")
@@ -1387,7 +1321,7 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 					)
 				}
 				result.intercepted = true
-				return
+				return result
 			}
 		}
 		SetTempVars(mctx, msg.Sender.Nickname)
@@ -1399,12 +1333,16 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 			if options.runInSync {
 				dispatch()
 			} else {
-				go dispatch()
+				releaseOnReturn = false
+				go func() {
+					defer mctx.releaseExecutionState()
+					dispatch()
+				}()
 			}
 		} else {
 			if mctx.PrivilegeLevel == -30 {
 				// 黑名单用户
-				return
+				return result
 			}
 
 			// 试图匹配自定义回复
@@ -1417,31 +1355,49 @@ func (s *IMSession) executeMessage(ep *EndPointInfo, msg *Message, options messa
 
 			if !isSenderBot {
 				if mctx.Group != nil && (mctx.Group.IsActive(mctx) || result.mentioned) {
+					var asyncCallbacks []func()
 					for _, wrapper := range mctx.Group.GetActivatedExtList(mctx.Dice) {
 						ext := wrapper.GetRealExt()
 						if ext == nil {
 							continue
 						}
 						i := ext // 保留引用
-						if i.OnNotCommandReceived != nil {
+						if i.HasOnNotCommandReceived() {
 							notCommandReceiveCall := func() {
-								i.callWithJsCheck(d, func() {
-									i.OnNotCommandReceived(mctx, msg)
-								}, jsCallbackDispatch{kind: jsCallbackMessage, providerEventID: callbackEventIDForMessage(mctx, msg)})
+								i.CallOnNotCommandReceived(d, mctx, msg)
 							}
 
 							if options.runInSync {
 								notCommandReceiveCall()
 							} else {
-								go notCommandReceiveCall()
+								asyncCallbacks = append(asyncCallbacks, notCommandReceiveCall)
 							}
 						}
+					}
+					if len(asyncCallbacks) > 0 {
+						releaseOnReturn = false
+						dispatchMessageCallbacksAsync(mctx, asyncCallbacks)
 					}
 				}
 			}
 		}
 	}
-	return
+	return result
+}
+
+func dispatchMessageCallbacksAsync(ctx *MsgContext, callbacks []func()) {
+	var remaining atomic.Int32
+	remaining.Store(int32(len(callbacks)))
+	for _, callback := range callbacks {
+		go func() {
+			defer func() {
+				if remaining.Add(-1) == 0 {
+					ctx.releaseExecutionState()
+				}
+			}()
+			callback()
+		}()
+	}
 }
 
 func (s *IMSession) PreTriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *CmdArgs) {
@@ -1553,15 +1509,13 @@ func (ep *EndPointInfo) TriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *
 			if ext == nil {
 				continue
 			}
-			if ext.OnCommandOverride != nil {
-				overrideHandled := false
-				ext.callWithJsCheck(mctx.Dice, func() {
-					overrideHandled = ext.OnCommandOverride(mctx, msg, cmdArgs)
-				}, jsCallbackDispatch{kind: jsCallbackCommand, providerEventID: callbackEventIDForMessage(mctx, msg)})
-				handled = overrideHandled
-				if handled {
-					break
-				}
+			overridden := ext.CallOnCommandOverride(mctx.Dice, mctx, msg, cmdArgs)
+			if mctx.abortAfterJSCallback() {
+				return false
+			}
+			if overridden {
+				handled = true
+				break
 			}
 		}
 	}
@@ -1570,6 +1524,9 @@ func (ep *EndPointInfo) TriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *
 	if !handled {
 		// 若自定义指令未匹配，匹配标准指令
 		solveResult = s.commandSolve(mctx, msg, cmdArgs)
+		if mctx.abortAfterJSCallback() {
+			return false
+		}
 		switch solveResult.Status {
 		case commandSolveSolved:
 			handled = true
@@ -1593,7 +1550,6 @@ func (ep *EndPointInfo) TriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *
 			ep.CmdExecutedNum++
 			ep.CmdExecutedLastTime = time.Now().Unix()
 			mctx.Player.LastCommandTime = ep.CmdExecutedLastTime
-			mctx.Player.UpdatedAtTime = time.Now().Unix()
 			if mctx.Group != nil {
 				mctx.Group.MarkDirty(mctx.Dice)
 			}
@@ -1619,28 +1575,47 @@ func (s *IMSession) OnGroupJoined(ctx *MsgContext, msg *Message) {
 	group.DiceIDExistsMap.Store(ep.UserID, true)
 	group.EnteredTime = time.Now().Unix() // 设置入群时间
 	group.MarkDirty(ctx.Dice)
-	if dm.ShouldRefreshGroupInfo(msg.GroupID) {
-		ep.Adapter.GetGroupInfoAsync(msg.GroupID)
+	// A durable callback stages the group info refresh itself and must not hold
+	// its lease while waiting, so the legacy pauses become a delay on the
+	// welcome effect.
+	inCallback := ctx.callbackTransaction != nil
+	if !inCallback && dm.ShouldRefreshGroupInfo(msg.GroupID) {
+		ep.GetGroupInfoAsync(msg.GroupID)
 	}
-	time.Sleep(2 * time.Second)
-	groupName := dm.TryGetGroupName(msg.GroupID)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Errorf("入群致辞异常: %v 堆栈: %v", r, string(debug.Stack()))
-			}
-		}()
-
-		// 稍作等待后发送入群致词
+	if !inCallback {
 		time.Sleep(2 * time.Second)
-
-		ctx.Player = &GroupPlayerInfo{}
+	}
+	groupName := dm.TryGetGroupName(msg.GroupID)
+	sendWelcome := func() {
+		// Outside a callback the legacy handler formats with an empty player. A
+		// callback resolves attributes through its transaction, which needs the
+		// real bound player.
+		if !inCallback {
+			ctx.Player = &GroupPlayerInfo{}
+		}
 		log.Infof("发送入群致辞，群: <%s>(%s)", groupName, msg.GroupID)
 		text := DiceFormatTmpl(ctx, "核心:骰子进群")
 		// forward() 的边界必须先由统一回复规划器解析；提前按 SPLIT
 		// 切分会把起止边界拆到不同消息并泄漏 FORWARD-END 标记。
 		ReplyGroup(ctx, msg, text)
-	}()
+	}
+	if inCallback {
+		ctx.setOutboundDelay(botJoinedWelcomeDelay)
+		sendWelcome()
+		ctx.setOutboundDelay(0)
+	} else {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Errorf("入群致辞异常: %v 堆栈: %v", r, string(debug.Stack()))
+				}
+			}()
+
+			// 稍作等待后发送入群致词
+			time.Sleep(2 * time.Second)
+			sendWelcome()
+		}()
+	}
 	txt := fmt.Sprintf("加入群组: <%s>(%s)", groupName, msg.GroupID)
 	log.Info(txt)
 	ctx.Notice(txt, NoticeTypeGroup)
@@ -1649,11 +1624,7 @@ func (s *IMSession) OnGroupJoined(ctx *MsgContext, msg *Message) {
 		if ext == nil {
 			continue
 		}
-		if ext.OnGroupJoined != nil {
-			ext.callWithJsCheck(d, func() {
-				ext.OnGroupJoined(ctx, msg)
-			}, jsCallbackDispatch{kind: jsCallbackGroup, providerEventID: callbackEventIDForMessage(ctx, msg)})
-		}
+		ext.CallOnGroupJoined(d, ctx, msg)
 	}
 }
 
@@ -1754,14 +1725,17 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 			s.Parent.Logger.Debugf("自动退群已跳过: 找不到对应账号连接，暂时无法处理该群。phase=%s group=%s platform=%s", phase, groupID, platform)
 			return false
 		}
-		if ep.Adapter == nil || ep.Session == nil {
+		durableReady := s.Parent.OutboundBridge != nil
+		legacyReady := ep.Adapter != nil && !isPureOnebotEndpoint(ep)
+		if ep.Session == nil || (!durableReady && !legacyReady) {
 			s.Parent.Logger.Debugf(
-				"自动退群已跳过: 账号连接尚未准备完成，暂时无法处理该群。phase=%s group=%s platform=%s endpoint=%s adapter_nil=%t session_nil=%t",
+				"自动退群已跳过: 账号连接尚未准备完成，暂时无法处理该群。phase=%s group=%s platform=%s endpoint=%s adapter_nil=%t outbound_bridge_nil=%t session_nil=%t",
 				phase,
 				groupID,
 				platform,
 				ep.UserID,
 				ep.Adapter == nil,
+				s.Parent.OutboundBridge == nil,
 				ep.Session == nil,
 			)
 			return false
@@ -1815,7 +1789,7 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 		}
 		// 如果时间比要退群的时间早
 		if last.Before(threshold) {
-			for _, ep := range s.EndPoints {
+			for _, ep := range s.EndPointsReadOnly() {
 				// 找到对应的endpoints，并准备退掉它的群
 				if !isAutoQuitEndpointReady(grp, ep, platform, "select") {
 					continue
@@ -1867,33 +1841,59 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 			hint := fmt.Sprintf("检测到群 %s 上次活动时间为 %s，尝试退出,当前为本轮第 %d 个", grp.GroupID, last.Format(time.RFC3339), i+1)
 			s.Parent.Logger.Info(hint)
 			// 创建对应退群信息
-			msgCtx := CreateTempCtx(ep, &Message{
+			actionMessage := &Message{
 				MessageType: "group",
 				Sender:      SenderBase{UserID: ep.UserID},
 				GroupID:     grp.GroupID,
+			}
+			msgCtx := CreateTempCtx(ep, actionMessage)
+			attemptID := uuid.New()
+			commandID := int64(binary.BigEndian.Uint64(attemptID[:8]) & (uint64(1)<<63 - 1))
+			if commandID == 0 {
+				commandID = 1
+			}
+			msgCtx.CommandID = commandID
+			msgCtx.CurrentCommand = "auto-inactive-group-quit:" + attemptID.String()
+
+			// The farewell has its own completed message scope. The action
+			// context remains live for the subsequent quit submission.
+			farewellCtx := CreateTempCtx(ep, actionMessage)
+			farewellCtx.CommandID = commandID
+			farewellCtx.CurrentCommand = msgCtx.CurrentCommand
+			_ = farewellCtx.runStandaloneMessageScope(func() {
+				msgText := DiceFormatTmpl(farewellCtx, "核心:骰子自动退群告别语")
+				ReplyGroupRaw(farewellCtx, &Message{GroupID: grp.GroupID}, msgText, "")
 			})
-			// 发送退群消息
-			msgText := DiceFormatTmpl(msgCtx, "核心:骰子自动退群告别语")
-			ep.Adapter.SendToGroup(msgCtx, grp.GroupID, msgText, "")
-			// 退群在退群消息延迟两秒后发送，确保消息发送完成
-			time.Sleep(2 * time.Second)
+			// Durable farewell and quit effects share one FIFO lane. Only legacy
+			// adapters need time to flush their asynchronous farewell send.
+			if s.Parent.OutboundBridge == nil && ep.Adapter != nil && !isPureOnebotEndpoint(ep) {
+				time.Sleep(2 * time.Second)
+			}
 			if !isAutoQuitEndpointReady(grp, ep, "QQ", "quit") {
+				msgCtx.releaseExecutionState()
 				s.Parent.Logger.Infof("自动退群已取消: 当前账号状态发生变化，本次不再继续退群。group=%s endpoint=%s", grp.GroupID, ep.UserID)
 				cancelled++
 				continue
 			}
-			// 删除群聊绑定信息，更新群处理时间
+			// Register before submission so a fast provider leave event keeps its
+			// origin. A rejected submission consumes the provisional marker.
+			s.MarkPendingQuit(grp.GroupID, ep.UserID, QuitOriginAutoInactive, 5*time.Minute)
+			if err := QuitGroup(msgCtx, grp.GroupID); err != nil {
+				s.ConsumePendingQuit(grp.GroupID, ep.UserID)
+				msgCtx.releaseExecutionState()
+				s.Parent.Logger.Errorf("自动退群请求提交失败: group=%s endpoint=%s error=%v", grp.GroupID, ep.UserID, err)
+				cancelled++
+				continue
+			}
 			grp.DiceIDExistsMap.Delete(ep.UserID)
 			grp.MarkDirty(msgCtx.Dice)
-			// 执行真正的退群活动，理论上这个msgCtx就能直接用
-			s.MarkPendingQuit(grp.GroupID, ep.UserID, QuitOriginAutoInactive, 5*time.Minute)
-			ep.Adapter.QuitGroup(msgCtx, grp.GroupID)
 			quitStarted++
 			if !summaryMode {
 				msgCtx.Notice(hint, NoticeTypeInactive)
 			}
 			// 生成一个随机值（8~11秒随机）
 			randomSleep := time.Duration(msgCtx.RandIntn(3000)+8000) * time.Millisecond
+			msgCtx.releaseExecutionState()
 			logger.M().Infof("退群等待，等待 %f 秒后继续", randomSleep.Seconds())
 			time.Sleep(randomSleep)
 		}
@@ -2016,8 +2016,12 @@ func checkBan(ctx *MsgContext, msg *Message) (notReply bool) {
 
 		ctx.Notice(noticeMsg, NoticeTypeBan)
 
-		time.Sleep(1 * time.Second)
-		ctx.EndPoint.Adapter.QuitGroup(ctx, groupID)
+		if d.OutboundBridge == nil && ctx.EndPoint != nil && ctx.EndPoint.Adapter != nil && !isPureOnebotEndpoint(ctx.EndPoint) {
+			time.Sleep(time.Second)
+		}
+		if err := QuitGroup(ctx, groupID); err != nil {
+			log.Errorf("黑名单用户触发退群请求提交失败: group=%s error=%v", groupID, err)
+		}
 	}
 
 	if ctx.PrivilegeLevel == -30 {
@@ -2041,8 +2045,12 @@ func checkBan(ctx *MsgContext, msg *Message) (notReply bool) {
 
 				ctx.Notice(noticeMsg, NoticeTypeBan)
 
-				time.Sleep(1 * time.Second)
-				ctx.EndPoint.Adapter.QuitGroup(ctx, groupID)
+				if d.OutboundBridge == nil && ctx.EndPoint != nil && ctx.EndPoint.Adapter != nil && !isPureOnebotEndpoint(ctx.EndPoint) {
+					time.Sleep(time.Second)
+				}
+				if err := QuitGroup(ctx, groupID); err != nil {
+					log.Errorf("黑名单群触发退群请求提交失败: group=%s error=%v", groupID, err)
+				}
 			}
 		} else if d.Config.BanList.BanBehaviorRefuseReply {
 			notReply = true
@@ -2526,10 +2534,6 @@ func formatJSSolveRecoveredError(recovered any) error {
 	}
 }
 
-func parseJSSolveResult(vm *goja.Runtime, ctx *MsgContext, solveName string, value goja.Value) (CmdExecuteResult, error) {
-	return parseJSSolveEngineResult(ctx, solveName, gojaEngineValue{vm: vm, value: value})
-}
-
 func parseJSSolveEngineResult(ctx *MsgContext, solveName string, value jsengine.Value) (CmdExecuteResult, error) {
 	if value == nil {
 		// 兼容旧插件：很多 JS solve 只 reply，不显式返回结果。
@@ -2543,8 +2547,8 @@ func parseJSSolveEngineResult(ctx *MsgContext, solveName string, value jsengine.
 
 	object := value.Object()
 	if object == nil {
-		primitive, err := value.ExportPrimitive()
-		if err == nil && primitive == nil {
+		_, err := value.ExportPrimitive()
+		if errors.Is(err, jsengine.ErrNoPrimitiveValue) {
 			if ctx != nil && ctx.IsCommandReplied() {
 				logger.M().Debugf("JS solve 返回空结果，且已回复消息，按兼容模式处理: %s", solveName)
 				return CmdExecuteResult{Matched: true, Solved: true}, nil
@@ -2566,70 +2570,6 @@ func parseJSSolveEngineResult(ctx *MsgContext, solveName string, value jsengine.
 
 func engineValueToBoolean(value jsengine.Value) bool {
 	return value != nil && value.ToBoolean()
-}
-
-func resolveJSSolveValue(vm *goja.Runtime, ctx *MsgContext, solveName string, value goja.Value, done chan<- CmdExecuteResult, fail chan<- error) {
-	promise, ok := value.Export().(*goja.Promise)
-	if !ok {
-		ret, err := parseJSSolveResult(vm, ctx, solveName, value)
-		if err != nil {
-			fail <- formatJSSolveError(err)
-			return
-		}
-		done <- ret
-		return
-	}
-
-	switch promise.State() {
-	case goja.PromiseStateFulfilled:
-		ret, err := parseJSSolveResult(vm, ctx, solveName, promise.Result())
-		if err != nil {
-			fail <- formatJSSolveError(err)
-			return
-		}
-		done <- ret
-	case goja.PromiseStateRejected:
-		fail <- fmt.Errorf("promise rejected: %v", promise.Result())
-	case goja.PromiseStatePending:
-		obj := value.ToObject(vm)
-		thenVal := obj.Get("then")
-		thenFn, isFunc := goja.AssertFunction(thenVal)
-		if !isFunc {
-			fail <- errors.New("invalid promise object: missing then")
-			return
-		}
-
-		onFulfilled := vm.ToValue(func(call goja.FunctionCall) goja.Value {
-			ret, err := parseJSSolveResult(vm, ctx, solveName, call.Argument(0))
-			if err != nil {
-				fail <- formatJSSolveError(err)
-				return goja.Undefined()
-			}
-			done <- ret
-			return goja.Undefined()
-		})
-		onRejected := vm.ToValue(func(call goja.FunctionCall) goja.Value {
-			fail <- fmt.Errorf("promise rejected: %v", call.Argument(0))
-			return goja.Undefined()
-		})
-
-		if _, err := thenFn(value, onFulfilled, onRejected); err != nil {
-			fail <- formatJSSolveError(err)
-		}
-	default:
-		fail <- errors.New("unknown promise state")
-	}
-}
-
-func waitJSSolveResult(done <-chan CmdExecuteResult, fail <-chan error, timeout time.Duration) (CmdExecuteResult, error) {
-	select {
-	case ret := <-done:
-		return ret, nil
-	case err := <-fail:
-		return CmdExecuteResult{}, err
-	case <-time.After(timeout):
-		return CmdExecuteResult{}, errJSSolveTimeout
-	}
 }
 
 func waitForCommandReply(ctx *MsgContext, timeout time.Duration) bool {
@@ -2692,14 +2632,58 @@ func logJSSolveEmptyResultWarning(log *zap.SugaredLogger, candidate commandSolve
 	)
 }
 
+func (s *IMSession) executeSolveRawValue(
+	ctx *MsgContext,
+	msg *Message,
+	cmdArgs *CmdArgs,
+	item *CmdItemInfo,
+	plugin *ExtInfo,
+	generation int64,
+) (CmdExecuteResult, error) {
+	var result CmdExecuteResult
+	err := s.Parent.ExtLoopManager.dispatchJSCallback(jsCallbackRequest{
+		Generation: generation,
+		Realm:      jsContextForMessage(plugin, ctx),
+		Kind:       jsCallbackCommand,
+		ValueCallback: func(runtime jsengine.Runtime) (value jsengine.Value, callbackErr error) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					callbackErr = formatJSSolveRecoveredError(recovered)
+				}
+			}()
+			if _, ok := gojaengine.Raw(runtime); !ok {
+				return nil, errors.New("legacy Goja solve callback requires a Goja runtime")
+			}
+			raw := item.SolveRaw(ctx, msg, cmdArgs)
+			return gojaengine.WrapValueForRuntime(runtime, raw)
+		},
+		ConsumeValue: func(value jsengine.Value) error {
+			var parseErr error
+			result, parseErr = parseJSSolveEngineResult(ctx, item.Name, value)
+			return parseErr
+		},
+		Message: ctx,
+	}, false)
+	return result, err
+}
+
 func (s *IMSession) executeSolveEngine(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs, item *CmdItemInfo, plugin *ExtInfo) (CmdExecuteResult, error) {
+	if plugin != nil {
+		plugin = plugin.GetRealExt()
+	}
 	if s.Parent.ExtLoopManager == nil {
 		executeErr := errors.New("loop manager is nil")
 		s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境不可用: %v", item.Name, executeErr)
 		return CmdExecuteResult{Matched: true, Solved: false}, executeErr
 	}
 
-	loop, err := s.Parent.ExtLoopManager.GetLoop(item.JSLoopVersion)
+	generation := item.JSLoopVersion
+	if item.SolveCallback != nil && plugin != nil && plugin.JSLoopVersion != 0 {
+		// A public neutral solve callback belongs to the extension that installed
+		// it. An ext.find copy can retain the source command's generation.
+		generation = plugin.JSLoopVersion
+	}
+	loop, err := s.Parent.ExtLoopManager.GetLoop(generation)
 	if err == nil && loop == nil {
 		err = errors.New("JavaScript runtime is unavailable")
 	}
@@ -2709,23 +2693,31 @@ func (s *IMSession) executeSolveEngine(ctx *MsgContext, msg *Message, cmdArgs *C
 	}
 
 	var result CmdExecuteResult
-	err = jsengine.RunWithContext(loop, jsContextForPlugin(plugin), func(runtime jsengine.Runtime) error {
-		return runEngineCallback(func() error {
-			value, solveErr := item.SolveEngine(runtime, ctx, msg, cmdArgs)
-			if solveErr != nil {
-				return solveErr
-			}
+	callback := func(runtime jsengine.Runtime) (jsengine.Value, error) {
+		if item.SolveEngine != nil {
+			return item.SolveEngine(runtime, ctx, msg, cmdArgs)
+		}
+		return item.SolveCallback(ctx, msg, cmdArgs)
+	}
+	err = s.Parent.ExtLoopManager.dispatchJSCallback(jsCallbackRequest{
+		Generation:    generation,
+		Realm:         jsContextForMessage(plugin, ctx),
+		Kind:          jsCallbackCommand,
+		ValueCallback: callback,
+		ConsumeValue: func(value jsengine.Value) error {
 			var parseErr error
 			result, parseErr = parseJSSolveEngineResult(ctx, item.Name, value)
 			return parseErr
-		})
-	})
+		},
+		Message: ctx,
+	}, false)
 	if err == nil {
 		return result, nil
 	}
 	if errors.Is(err, errJSSolveEmptyResult) && waitForCommandReply(ctx, jsSolveEmptyResultGraceWindow) {
 		return CmdExecuteResult{Matched: true, Solved: true}, nil
 	}
+	ctx.recordJSExecutionError(err)
 
 	ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", err))
 	return CmdExecuteResult{Matched: true, Solved: false}, err
@@ -2837,79 +2829,71 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 			}
 		}
 
+		var executionPlugin *ExtInfo
+		if candidate.Ext != nil {
+			executionPlugin = candidate.Ext.GetRealExt()
+		}
+
 		var ret CmdExecuteResult
-		// JS 兼容执行路径：
-		// 1. 引擎无关命令回调（SolveEngine）
-		// 2. 原生 Goja JS 命令(IsJsSolveFunc=true)
-		// 3. 非 JS 命令但被脚本通过 cmd.solve 覆写（SolveRaw!=nil）
-		if item.SolveEngine != nil {
-			ret, executeErr = s.executeSolveEngine(ctx, msg, cmdArgs, item, candidate.Ext)
+		// JS compatibility execution paths:
+		// 1. Engine-neutral command callbacks (SolveEngine/SolveCallback).
+		// 2. Native Goja JS commands (IsJsSolveFunc=true).
+		// 3. Non-JS commands overwritten through the legacy Goja binding (SolveRaw).
+		if item.SolveEngine != nil || item.SolveCallback != nil {
+			ret, executeErr = s.executeSolveEngine(ctx, msg, cmdArgs, item, executionPlugin)
 			if executeErr != nil {
 				return ret
 			}
 		} else if item.IsJsSolveFunc || item.SolveRaw != nil {
-			var (
-				loop jsengine.Loop
-				err  error
-			)
 			if s.Parent.ExtLoopManager == nil {
 				executeErr = errors.New("loop manager is nil")
 				s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境不可用: %v", item.Name, executeErr)
 				return CmdExecuteResult{Matched: true, Solved: false}
 			}
 
-			loop, err = s.Parent.ExtLoopManager.GetLoop(item.JSLoopVersion)
+			generation := item.JSLoopVersion
+			loop, err := s.Parent.ExtLoopManager.GetLoop(generation)
+			if err == nil && loop == nil {
+				err = errJSRuntimeUnavailable
+			}
 			if err != nil {
 				// Compatibility branch for non-JS commands overwritten by a
 				// legacy Goja SolveRaw callback with no generation metadata.
 				if !item.IsJsSolveFunc && item.SolveRaw != nil {
-					loop, _ = s.Parent.ExtLoopManager.CurrentLoop()
+					loop, generation = s.Parent.ExtLoopManager.CurrentLoop()
 					if loop != nil {
 						err = nil
 					}
 				}
-				if loop == nil {
+				if err != nil || loop == nil {
 					executeErr = err
 					s.Parent.Logger.Errorf("扩展注册的指令<%s>运行环境已经过期: %v", item.Name, err)
 					return CmdExecuteResult{Matched: true, Solved: false}
 				}
 			}
-			done := make(chan CmdExecuteResult, 1)
-			fail := make(chan error, 1)
-			var executionPlugin *ExtInfo
-			if candidate.Ext != nil {
-				executionPlugin = candidate.Ext.GetRealExt()
-			}
-			err = jsengine.RunWithContext(loop, jsContextForPlugin(executionPlugin), func(runtime jsengine.Runtime) (runErr error) {
-				defer func() {
-					if recovered := recover(); recovered != nil {
-						runErr = formatJSSolveRecoveredError(recovered)
-					}
-				}()
-				if item.SolveRaw == nil {
-					// 兼容少量旧对象：没有 solveRaw 时回退同步 solve
+
+			if item.SolveRaw == nil {
+				// Compatibility for a few old objects that mark themselves as
+				// JavaScript commands but retain a synchronous Solve callback.
+				err = jsengine.RunWithContext(loop, jsContextForMessage(executionPlugin, ctx), func(jsengine.Runtime) (runErr error) {
+					defer func() {
+						if recovered := recover(); recovered != nil {
+							runErr = formatJSSolveRecoveredError(recovered)
+						}
+					}()
 					ret = item.Solve(ctx, msg, cmdArgs)
 					return nil
-				}
-				// Compatibility branch: legacy Goja SolveRaw requires Raw.
-				vm, ok := gojaengine.Raw(runtime)
-				if !ok {
-					return errors.New("legacy Goja solve callback requires a Goja runtime")
-				}
-				resolveJSSolveValue(vm, ctx, item.Name, item.SolveRaw(ctx, msg, cmdArgs), done, fail)
-				return nil
-			})
-			if err != nil {
-				executeErr = err
-				ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", err))
-				return CmdExecuteResult{Matched: true, Solved: false}
+				})
+			} else {
+				ret, err = s.executeSolveRawValue(ctx, msg, cmdArgs, item, executionPlugin, generation)
 			}
-			if item.SolveRaw != nil {
-				ret, err = waitJSSolveResult(done, fail, jsSolveAwaitTimeout)
+			if errors.Is(err, context.DeadlineExceeded) {
+				err = errors.Join(errJSSolveTimeout, err)
 			}
 			if err != nil {
 				if errors.Is(err, errJSSolveTimeout) {
 					executeErr = err
+					ctx.recordJSExecutionError(err)
 					s.Parent.Logger.Warnf("扩展注册的指令<%s>执行超时（>%s），建议检查扩展逻辑", item.Name, jsSolveAwaitTimeout)
 					return CmdExecuteResult{Matched: true, Solved: false}
 				}
@@ -2918,11 +2902,13 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 						ret = CmdExecuteResult{Matched: true, Solved: true}
 					} else {
 						executeErr = err
+						ctx.recordJSExecutionError(err)
 						logJSSolveEmptyResultWarning(s.Parent.Logger, candidate, item.Name, ctx, msg)
 						return CmdExecuteResult{Matched: true, Solved: false}
 					}
 				} else {
 					executeErr = err
+					ctx.recordJSExecutionError(err)
 					ReplyToSender(ctx, msg, fmt.Sprintf("JS执行异常，请反馈给该扩展的作者：\n%v", err))
 					return CmdExecuteResult{Matched: true, Solved: false}
 				}
@@ -2967,6 +2953,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 			cmdMap := wrapper.GetCmdMap()
 			item = cmdMap[cmdArgs.Command]
 			if item == nil {
+				wrapper.dropJSCommandBeforeLoad(ctx, msg, cmdArgs.Command)
 				continue
 			}
 			candidates = append(candidates, commandSolveCandidate{Ext: wrapper, Item: item})
@@ -3045,6 +3032,13 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 			executeErrorText = executeErr.Error()
 		}
 	}
+	if failure := ctx.jsCallbackFailure(); failure != nil {
+		ctx.recordJSExecutionError(failure)
+		return commandSolveResult{
+			Status:       commandSolveFailed,
+			ExecuteError: failure.Error(),
+		}
+	}
 
 	if group != nil && (group.Active || ctx.IsCurGroupBotOn) {
 		for _, wrapper := range group.GetActivatedExtList(ctx.Dice) {
@@ -3052,10 +3046,13 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 			if ext == nil {
 				continue
 			}
-			if ext.OnCommandReceived != nil {
-				ext.callWithJsCheck(ctx.Dice, func() {
-					ext.OnCommandReceived(ctx, msg, cmdArgs)
-				}, jsCallbackDispatch{kind: jsCallbackCommand, providerEventID: callbackEventIDForMessage(ctx, msg)})
+			ext.CallOnCommandReceived(ctx.Dice, ctx, msg, cmdArgs)
+			if failure := ctx.jsCallbackFailure(); failure != nil {
+				ctx.recordJSExecutionError(failure)
+				return commandSolveResult{
+					Status:       commandSolveFailed,
+					ExecuteError: failure.Error(),
+				}
 			}
 		}
 	}
@@ -3176,11 +3173,7 @@ func (s *IMSession) OnPoke(ctx *MsgContext, event *events.PokeEvent) {
 		if ext == nil {
 			continue
 		}
-		if ext.OnPoke != nil {
-			ext.callWithJsCheck(ctx.Dice, func() {
-				ext.OnPoke(ctx, event)
-			})
-		}
+		ext.CallOnPoke(ctx.Dice, ctx, event)
 	}
 }
 
@@ -3216,11 +3209,7 @@ func (s *IMSession) OnMessageEdit(ctx *MsgContext, msg *Message) {
 			if ext == nil {
 				continue
 			}
-			if ext.OnMessageEdit != nil {
-				ext.callWithJsCheck(ctx.Dice, func() {
-					ext.OnMessageEdit(ctx, msg)
-				})
-			}
+			ext.CallOnMessageEdit(ctx.Dice, ctx, msg)
 		}
 	}
 }
@@ -3228,7 +3217,7 @@ func (s *IMSession) OnMessageEdit(ctx *MsgContext, msg *Message) {
 // GetEpByPlatform
 // 在 EndPoints 中找到第一个符合平台 p 且启用的
 func (s *IMSession) GetEpByPlatform(p string) *EndPointInfo {
-	for _, ep := range s.EndPoints {
+	for _, ep := range s.EndPointsReadOnly() {
 		if ep.Enable && ep.Platform == p {
 			return ep
 		}
@@ -3236,76 +3225,14 @@ func (s *IMSession) GetEpByPlatform(p string) *EndPointInfo {
 	return nil
 }
 
-// SetEnable
-/* 如果已连接，将断开连接，如果开着GCQ将自动结束。如果启用的话，则反过来  */
-func (ep *EndPointInfo) SetEnable(_ *Dice, enable bool) {
-	if ep.Enable != enable {
-		ep.Adapter.SetEnable(enable)
-	}
-}
-
-func (ep *EndPointInfo) BindRuntime(session *IMSession) {
+func (ep *EndPointInfo) bindCompatibilityRuntime(session *IMSession) {
 	if ep == nil {
 		return
 	}
 	ep.Session = session
-
-	if ep.Adapter == nil {
-		return
+	if binder, ok := ep.Adapter.(endpointRuntimeBinder); ok {
+		binder.bindEndpoint(ep)
 	}
-
-	switch ep.Platform {
-	case "QQ":
-		switch ep.ProtocolType {
-		case "onebot":
-			pa := ep.Adapter.(*PlatformAdapterGocq)
-			pa.EndPoint = ep
-		case "walle-q":
-			pa := ep.Adapter.(*PlatformAdapterWalleQ)
-			pa.EndPoint = ep
-		case "red":
-			pa := ep.Adapter.(*PlatformAdapterRed)
-			pa.EndPoint = ep
-		case "official":
-			pa := ep.Adapter.(*PlatformAdapterOfficialQQ)
-			pa.EndPoint = ep
-		case "satori":
-			pa := ep.Adapter.(*PlatformAdapterSatori)
-			pa.EndPoint = ep
-		case "milky":
-			pa := ep.Adapter.(*PlatformAdapterMilky)
-			pa.EndPoint = ep
-			//	pa.EndPoint = ep
-		}
-	case "DISCORD":
-		pa := ep.Adapter.(*PlatformAdapterDiscord)
-		pa.EndPoint = ep
-	case "KOOK":
-		pa := ep.Adapter.(*PlatformAdapterKook)
-		pa.EndPoint = ep
-	case "TG":
-		pa := ep.Adapter.(*PlatformAdapterTelegram)
-		pa.EndPoint = ep
-	case "MC":
-		pa := ep.Adapter.(*PlatformAdapterMinecraft)
-		pa.EndPoint = ep
-	case "DODO":
-		pa := ep.Adapter.(*PlatformAdapterDodo)
-		pa.EndPoint = ep
-	case "DINGTALK":
-		pa := ep.Adapter.(*PlatformAdapterDingTalk)
-		pa.EndPoint = ep
-	case "SLACK":
-		pa := ep.Adapter.(*PlatformAdapterSlack)
-		pa.EndPoint = ep
-	case "SEALCHAT":
-		pa := ep.Adapter.(*PlatformAdapterSealChat)
-		pa.EndPoint = ep
-	}
-}
-
-func (ep *EndPointInfo) AdapterSetup() {
-	ep.BindRuntime(ep.Session)
 }
 
 func (ep *EndPointInfo) RefreshGroupNum() {
@@ -3341,13 +3268,19 @@ func sendNoticeToTarget(ctx *MsgContext, target NoticeTarget, txt string) {
 	}
 }
 
+func sendStandaloneNoticeToTarget(ctx *MsgContext, target NoticeTarget, txt string) {
+	_ = ctx.runStandaloneMessageScope(func() {
+		sendNoticeToTarget(ctx, target, txt)
+	})
+}
+
 func noticeTargetMatchesEndpoint(target NoticeTarget, ep *EndPointInfo) bool {
 	return ep != nil && target.MatchesEndpoint(ep.Platform, ep.ProtocolType)
 }
 
 func noticeTargetContext(session *IMSession, ep *EndPointInfo, target NoticeTarget) *MsgContext {
 	if ep.Session == nil {
-		ep.BindRuntime(session)
+		ep.bindCompatibilityRuntime(session)
 	}
 
 	msg := &Message{Sender: SenderBase{UserID: target.ID}, MessageType: "private"}
@@ -3362,7 +3295,7 @@ func findNoticeEndpoint(session *IMSession, target NoticeTarget) *EndPointInfo {
 	if session == nil {
 		return nil
 	}
-	for _, ep := range session.EndPoints {
+	for _, ep := range session.EndPointsReadOnly() {
 		if ep != nil && ep.Enable && ep.State == StateConnected && noticeTargetMatchesEndpoint(target, ep) {
 			return ep
 		}
@@ -3370,24 +3303,29 @@ func findNoticeEndpoint(session *IMSession, target NoticeTarget) *EndPointInfo {
 	return nil
 }
 
+// noticeSession is the session notices are routed through.
+func (ctx *MsgContext) noticeSession() *IMSession {
+	if ctx.Session == nil && ctx.Dice != nil {
+		return ctx.Dice.ImSession
+	}
+	return ctx.Session
+}
+
 func sendNoticeTargetCrossPlatform(ctx *MsgContext, target NoticeTarget, txt string) bool {
 	if ctx == nil {
 		return false
 	}
-	if ctx.EndPoint != nil && ctx.EndPoint.Enable && noticeTargetMatchesEndpoint(target, ctx.EndPoint) {
-		sendNoticeToTarget(ctx, target, txt)
-		return true
+	session := ctx.noticeSession()
+	ep := ctx.EndPoint
+	if ep == nil || !ep.Enable || !noticeTargetMatchesEndpoint(target, ep) {
+		ep = findNoticeEndpoint(session, target)
 	}
-
-	session := ctx.Session
-	if session == nil && ctx.Dice != nil {
-		session = ctx.Dice.ImSession
-	}
-	ep := findNoticeEndpoint(session, target)
 	if ep == nil {
 		return false
 	}
-	sendNoticeToTarget(noticeTargetContext(session, ep, target), target, txt)
+	// The notice goes out after the command that raised it may have returned,
+	// so it is sent from a context of its own.
+	sendStandaloneNoticeToTarget(noticeTargetContext(session, ep, target), target, txt)
 	return true
 }
 
@@ -3411,14 +3349,14 @@ func (d *Dice) NoticeForEveryEndpoint(txt string, allowCrossPlatform bool, notic
 			return
 		}
 
-		for _, ep := range d.ImSession.EndPoints {
+		for _, ep := range d.ImSession.EndPointsReadOnly() {
 			if ep == nil || !ep.Enable || ep.State != StateConnected {
 				continue
 			}
 			targets := filterNoticeTargetsForEndpoint(d.Config.NoticeIDs, noticeType, ep)
 			for index, target := range targets {
 				ctx := noticeTargetContext(d.ImSession, ep, target)
-				sendNoticeToTarget(ctx, target, txt)
+				sendStandaloneNoticeToTarget(ctx, target, txt)
 				if index < len(targets)-1 {
 					time.Sleep(time.Second)
 				}
@@ -3476,6 +3414,10 @@ func (ctx *MsgContext) Notice(txt string, noticeTypes ...NoticeType) {
 	if len(noticeTypes) > 0 {
 		noticeType = noticeTypes[0]
 	}
+	if ctx.callbackTransaction != nil && !ctx.Dice.Config.MailEnable {
+		ctx.noticeInTransaction(txt, noticeType)
+		return
+	}
 	foo := func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -3494,7 +3436,9 @@ func (ctx *MsgContext) Notice(txt string, noticeTypes ...NoticeType) {
 		if ctx.EndPoint != nil && ctx.EndPoint.Enable {
 			targets := filterNoticeTargetsForEndpoint(ctx.Dice.Config.NoticeIDs, noticeType, ctx.EndPoint)
 			for index, target := range targets {
-				sendNoticeToTarget(ctx, target, txt)
+				// The notice goes out after the command that raised it may have
+				// returned, so it is sent from a context of its own.
+				sendStandaloneNoticeToTarget(noticeTargetContext(ctx.noticeSession(), ctx.EndPoint, target), target, txt)
 				sent = true
 				if index < len(targets)-1 {
 					time.Sleep(time.Second)
@@ -3604,6 +3548,7 @@ func (ctx *MsgContext) ShallowCopy() *MsgContext {
 	if ctx == nil {
 		return nil
 	}
+	ctx.randomMu.Lock()
 	copyCtx := &MsgContext{
 		MessageType:         ctx.MessageType,
 		Group:               ctx.Group,
@@ -3615,12 +3560,18 @@ func (ctx *MsgContext) ShallowCopy() *MsgContext {
 		IsCurGroupBotOn:     ctx.IsCurGroupBotOn,
 		IsPrivate:           ctx.IsPrivate,
 		CommandID:           ctx.CommandID,
+		CurrentCommand:      ctx.CurrentCommand,
 		CommandHideFlag:     ctx.CommandHideFlag,
 		CommandInfo:         ctx.CommandInfo,
 		PrivilegeLevel:      ctx.PrivilegeLevel,
 		GroupRoleLevel:      ctx.GroupRoleLevel,
 		DelegateText:        ctx.DelegateText,
 		AliasPrefixText:     ctx.AliasPrefixText,
+		callbackTransaction: ctx.callbackTransaction,
+		callbackMetadata:    ctx.callbackMetadata,
+		outboundDelay:       ctx.outboundDelay,
+		logReplyTime:        ctx.logReplyTime,
+		logReplySeq:         ctx.logReplySeq,
 		deckDepth:           ctx.deckDepth,
 		DeckPools:           ctx.DeckPools,
 		diceExprOverwrite:   ctx.diceExprOverwrite,
@@ -3636,7 +3587,10 @@ func (ctx *MsgContext) ShallowCopy() *MsgContext {
 		chooserRand:         ctx.chooserRand,
 		chooserSrc:          ctx.chooserSrc,
 		_v1Rand:             ctx._v1Rand,
+		executionParent:     ctx,
 	}
+	copyCtx.adapterEventUnattributed = ctx.adapterEventUnattributed
+	ctx.randomMu.Unlock()
 	copyCtx.SetSplitKey(ctx.getSplitKey())
 	return copyCtx
 }

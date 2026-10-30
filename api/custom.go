@@ -2,7 +2,6 @@ package api
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/labstack/echo/v4"
 
@@ -12,13 +11,6 @@ import (
 func customText(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
-	}
-	// Older WebUI versions and partial imports may have replaced an entire
-	// category without newer builtin entries. Repair the in-memory data before
-	// returning it so the missing inputs become visible immediately.
-	if dice.RestoreAllMissingBuiltinTextEntries(myDice) {
-		myDice.GenerateTextMap()
-		myDice.SaveText()
 	}
 
 	return c.JSON(http.StatusOK, map[string]interface{}{
@@ -41,14 +33,10 @@ func customTextSave(c echo.Context) error {
 	if err == nil {
 		for _, v1 := range v.Data {
 			for _, v2 := range v1 {
-				v2[0] = strings.TrimSpace(v2[0].(string))
 				v2[1] = int(v2[1].(float64))
 			}
 		}
 		myDice.TextMapRaw[v.Category] = v.Data
-		// Category saves are replacement-style. Preserve compatibility with an
-		// older page/import that does not know about newly added builtin fields.
-		dice.RestoreMissingBuiltinTextEntries(myDice, v.Category)
 		dice.SetupTextHelpInfo(myDice, myDice.TextMapHelpInfo, myDice.TextMapRaw, "configs/text-template.yaml")
 		myDice.GenerateTextMap()
 		myDice.SaveText()

@@ -71,45 +71,48 @@ func newID[T ~string](value string, lower bool) (T, error) {
 	return T(value), err
 }
 
-func NewEndpointID(value string) (EndpointID, error)       { return newID[EndpointID](value, false) }
-func NewAdapterKey(value string) (AdapterKey, error)        { return newID[AdapterKey](value, true) }
-func NewProviderEventID(value string) (ProviderEventID, error) { return newID[ProviderEventID](value, false) }
-func NewMessageID(value string) (MessageID, error)          { return newID[MessageID](value, false) }
-func NewPrincipalID(value string) (PrincipalID, error)      { return newID[PrincipalID](value, false) }
-func NewConversationID(value string) (ConversationID, error) { return newID[ConversationID](value, false) }
-func NewEffectID(value string) (EffectID, error)            { return newID[EffectID](value, false) }
-func NewOperationID(value string) (OperationID, error)      { return newID[OperationID](value, false) }
-func NewCorrelationID(value string) (CorrelationID, error)  { return newID[CorrelationID](value, false) }
-func NewCausationID(value string) (CausationID, error)      { return newID[CausationID](value, false) }
-func NewArtifactID(value string) (ArtifactID, error)        { return newID[ArtifactID](value, false) }
+func NewEndpointID(value string) (EndpointID, error) { return newID[EndpointID](value, false) }
+func NewAdapterKey(value string) (AdapterKey, error) { return newID[AdapterKey](value, true) }
+func NewProviderEventID(value string) (ProviderEventID, error) {
+	return newID[ProviderEventID](value, false)
+}
+func NewMessageID(value string) (MessageID, error)     { return newID[MessageID](value, false) }
+func NewPrincipalID(value string) (PrincipalID, error) { return newID[PrincipalID](value, false) }
+func NewConversationID(value string) (ConversationID, error) {
+	return newID[ConversationID](value, false)
+}
+func NewEffectID(value string) (EffectID, error)           { return newID[EffectID](value, false) }
+func NewOperationID(value string) (OperationID, error)     { return newID[OperationID](value, false) }
+func NewCorrelationID(value string) (CorrelationID, error) { return newID[CorrelationID](value, false) }
+func NewCausationID(value string) (CausationID, error)     { return newID[CausationID](value, false) }
+func NewArtifactID(value string) (ArtifactID, error)       { return newID[ArtifactID](value, false) }
 
 func (v EndpointID) Valid() bool { _, err := normalizeID(string(v), false); return err == nil }
 func (v AdapterKey) Valid() bool {
 	canonical, err := normalizeID(string(v), true)
 	return err == nil && canonical == string(v)
 }
-func (v ProviderEventID) Valid() bool   { _, err := normalizeID(string(v), false); return err == nil }
-func (v MessageID) Valid() bool         { _, err := normalizeID(string(v), false); return err == nil }
-func (v PrincipalID) Valid() bool       { _, err := normalizeID(string(v), false); return err == nil }
-func (v ConversationID) Valid() bool    { _, err := normalizeID(string(v), false); return err == nil }
-func (v EffectID) Valid() bool          { _, err := normalizeID(string(v), false); return err == nil }
-func (v OperationID) Valid() bool      { _, err := normalizeID(string(v), false); return err == nil }
-func (v CorrelationID) Valid() bool    { return validOptionalIdentifier(string(v)) }
-func (v CausationID) Valid() bool      { return validOptionalIdentifier(string(v)) }
-func (v ArtifactID) Valid() bool       { _, err := normalizeID(string(v), false); return err == nil }
+func (v ProviderEventID) Valid() bool { _, err := normalizeID(string(v), false); return err == nil }
+func (v MessageID) Valid() bool       { _, err := normalizeID(string(v), false); return err == nil }
+func (v PrincipalID) Valid() bool     { _, err := normalizeID(string(v), false); return err == nil }
+func (v ConversationID) Valid() bool  { _, err := normalizeID(string(v), false); return err == nil }
+func (v EffectID) Valid() bool        { _, err := normalizeID(string(v), false); return err == nil }
+func (v OperationID) Valid() bool     { _, err := normalizeID(string(v), false); return err == nil }
+func (v CorrelationID) Valid() bool   { return validOptionalIdentifier(string(v)) }
+func (v CausationID) Valid() bool     { return validOptionalIdentifier(string(v)) }
+func (v ArtifactID) Valid() bool      { _, err := normalizeID(string(v), false); return err == nil }
 
-func (v EndpointID) String() string       { return string(v) }
-func (v AdapterKey) String() string        { return string(v) }
-func (v ProviderEventID) String() string   { return string(v) }
-func (v MessageID) String() string         { return string(v) }
-func (v PrincipalID) String() string       { return string(v) }
-func (v ConversationID) String() string    { return string(v) }
-func (v EffectID) String() string          { return string(v) }
-func (v OperationID) String() string       { return string(v) }
-func (v CorrelationID) String() string     { return string(v) }
-func (v CausationID) String() string       { return string(v) }
-func (v ArtifactID) String() string        { return string(v) }
-
+func (v EndpointID) String() string      { return string(v) }
+func (v AdapterKey) String() string      { return string(v) }
+func (v ProviderEventID) String() string { return string(v) }
+func (v MessageID) String() string       { return string(v) }
+func (v PrincipalID) String() string     { return string(v) }
+func (v ConversationID) String() string  { return string(v) }
+func (v EffectID) String() string        { return string(v) }
+func (v OperationID) String() string     { return string(v) }
+func (v CorrelationID) String() string   { return string(v) }
+func (v CausationID) String() string     { return string(v) }
+func (v ArtifactID) String() string      { return string(v) }
 
 // SecretRef identifies a versioned secret without carrying its value.
 type SecretRef struct {
@@ -135,7 +138,7 @@ type SecretValue struct {
 
 // SecretResolver is the only runtime input that can resolve secret material.
 type SecretResolver interface {
-	Resolve(context.Context, SecretRef) (SecretValue, error)
+	Resolve(ctx context.Context, ref SecretRef) (SecretValue, error)
 }
 
 func (s SecretRef) Validate() error {
@@ -174,14 +177,20 @@ type RuntimeInit struct {
 	Config         ValidatedConfig
 	Secrets        SecretResolver
 	ResourceRoot   string
+	// ResourceAccessToken authenticates provider access to shared resources.
+	// It is process-local and must never be persisted in adapter configuration.
+	ResourceAccessToken string
+	// ResourceServeAddress is the core HTTP listen address used to derive a
+	// provider-reachable resource URL when the adapter has no explicit base URL.
+	ResourceServeAddress string
 }
 
 // AdapterRuntime is owned by Supervisor for one endpoint generation.
 type AdapterRuntime interface {
-	Run(context.Context, CorePort) error
+	Run(ctx context.Context, core CorePort) error
 	Stop(context.Context) error
 	Capabilities() CapabilitySet
-	Execute(context.Context, OutboundEffect) EffectResult
+	Execute(ctx context.Context, effect OutboundEffect) EffectResult
 	Diagnostics(context.Context) DiagnosticReport
 }
 
@@ -189,8 +198,8 @@ type AdapterRuntime interface {
 // do not carry endpoint, generation, or desired-version fields: an adapter
 // cannot forge the fence selected by its owner.
 type CorePort interface {
-	HandleInbound(context.Context, InboundMessage) (IngressReceipt, error)
-	ReportObservation(context.Context, LifecycleObservation) error
+	HandleInbound(ctx context.Context, message InboundMessage) (IngressReceipt, error)
+	ReportObservation(ctx context.Context, observation LifecycleObservation) error
 }
 
 // Descriptor validates pure config and creates an inert runtime. ValidateConfig
@@ -199,7 +208,8 @@ type CorePort interface {
 type Descriptor interface {
 	Key() AdapterKey
 	ConfigVersion() uint16
-	ValidateConfig(context.Context, json.RawMessage) (ValidatedConfig, error)
+	ValidateConfig(ctx context.Context, raw json.RawMessage) (ValidatedConfig, error)
+	Capabilities(ValidatedConfig) CapabilitySet
 	SupportedActions(ValidatedConfig) ActionSet
 	NewRuntime(RuntimeInit) (AdapterRuntime, error)
 }
@@ -217,18 +227,18 @@ func CanonicalizeJSON(raw json.RawMessage) (json.RawMessage, error) {
 	decoder.UseNumber()
 	var value any
 	if err := decoder.Decode(&value); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		if err == nil {
 			return nil, fmt.Errorf("%w: multiple JSON values", ErrInvalidConfig)
 		}
-		return nil, fmt.Errorf("%w: trailing JSON: %v", ErrInvalidConfig, err)
+		return nil, fmt.Errorf("%w: trailing JSON: %w", ErrInvalidConfig, err)
 	}
 	canonical, err := json.Marshal(value)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 	return canonical, nil
 }

@@ -33,6 +33,30 @@ func TestGlobalOwnerSetActiveFallsBackToAnyAvailableSource(t *testing.T) {
 	}
 }
 
+func TestGlobalOwnerHybridRequiresAtLeastTwoSources(t *testing.T) {
+	owner := randcore.NewEmptyGlobalOwner()
+	owner.RegisterSource(randcore.ModePCG, &fixedDiceSource{value: 7})
+	if err := owner.RegisterHybridSource(); err == nil {
+		t.Fatal("RegisterHybridSource accepted a single available source")
+	}
+	fallbackMode, fallbackErr := owner.SetActive(randcore.ModeHybrid)
+	if fallbackErr == nil || fallbackMode != randcore.ModePCG {
+		t.Fatalf("SetActive(hybrid) with one source = (%s, %v), want (pcg, error)", fallbackMode, fallbackErr)
+	}
+
+	owner.RegisterSource(randcore.ModeGM, &fixedDiceSource{value: 3})
+	if err := owner.RegisterHybridSource(); err != nil {
+		t.Fatalf("RegisterHybridSource with two sources: %v", err)
+	}
+	mode, err := owner.SetActive(randcore.ModeHybrid)
+	if err != nil || mode != randcore.ModeHybrid {
+		t.Fatalf("SetActive(hybrid) = (%s, %v), want (hybrid, nil)", mode, err)
+	}
+	if got := owner.Uint64(); got != 7^3 {
+		t.Fatalf("hybrid Uint64() = %d, want %d", got, 7^3)
+	}
+}
+
 func TestNewSourceForModeCreatesDistinctReaderSources(t *testing.T) {
 	gm, err := randcore.NewSourceForMode(randcore.ModeGM, nil)
 	if err != nil {

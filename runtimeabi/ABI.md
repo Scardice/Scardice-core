@@ -13,13 +13,22 @@ Scardice keeps these versions independent:
 | Seal JS API | Compatibility of the user-facing `seal.*` JavaScript API. |
 | Runtime Version | The implementation/version of a runtime provider (for example, QuickJS). |
 
-The header currently declares `SC_RUNTIME_ABI_MAJOR 1`, `SC_RUNTIME_ABI_MINOR 0`, `SC_HOST_ABI_MAJOR 1`, and `SC_HOST_ABI_MINOR 1`. Core and provider are a paired development contract: these numbers and the v1 header/query names remain unchanged, and do not promise compatibility with older consumers or providers. The current bridge requires matching Runtime and Host major/minor values; this is not a released minor-version negotiation policy.
+Runtime ABI v1 keeps `runtime_abi_minor` reserved at zero. Host ABI v1.1
+appends HostRef proxy lifecycle callbacks and the host-function owner query to
+`sc_host_api_v1`. Providers that create JavaScript HostRef proxies retain once
+per proxy and release at finalization. A provider can use the owner query to
+keep a host method's parent proxy alive for as long as the JavaScript function
+remains reachable. Host and Runtime ABI versions are queried independently
+and reported in the provider descriptor.
 
-The runtime plugin table keeps its original `struct_size`, descriptor, and API
-prefix. `extension_count` and `extensions` are append-only optional tail
-fields: a provider that reports only the original prefix is accepted with an
-empty extension table. Providers that report a partial tail or malformed
-extension descriptors are rejected before `create`.
+`service_event`, `tick`, the plugin extension table, and Host service
+callbacks remain optional v1 tails. Consumers validate optional fields through
+`struct_size` and declared capabilities. The HostRef lifecycle and method-owner
+callbacks are part of Host ABI 1.1 and must be present in that version's struct.
+Core accepts a shorter provider table only when its declared capabilities do
+not require omitted fields. Missing `tick` is a no-op, and Core never sends
+service events to a provider that omits `service_event`. Partial required tails
+and malformed extension descriptors are rejected before `create`.
 
 Every v1 struct begins with `uint32_t struct_size`. Producers set it to the byte size of the fields they provide. Consumers validate that the received size covers every field they read. This protects diagnostics and layout validation; optional tail fields are read only when covered by `struct_size`.
 
@@ -175,8 +184,11 @@ The constructors, conversion functions, object functions, and invocation functio
 8. `service_call(sc_host_ctx_t, sc_runtime_t, sc_string_view service, const sc_host_service_request_v1 *request, sc_host_service_response_v1 *response)`
 9. `service_start(sc_host_ctx_t, sc_runtime_t, sc_string_view service, const sc_host_service_request_v1 *request, sc_service_request_t *out_request)`
 10. `service_cancel(sc_host_ctx_t, sc_runtime_t, sc_service_request_t request)`
+11. `host_ref_retain(sc_host_ctx_t, sc_runtime_t, sc_host_ref_t ref)`
+12. `host_ref_release(sc_host_ctx_t, sc_runtime_t, sc_host_ref_t ref)`
+13. `host_function_owner(sc_host_ctx_t, sc_runtime_t, sc_host_func_t function, sc_host_ref_t *out_owner)`
 
-Host references and host function references are opaque session handles, not addresses. A host reference is valid for its runtime session and is released when that session closes; v1 does not require cross-session reference counting. A callback must not retain borrowed key/argument data after it returns. The host keeps the callback table and `host_ctx` valid until every runtime using them has been destroyed.
+Host references and host function references are opaque session handles, not addresses. Under Host ABI 1.1, a provider that creates a JavaScript proxy for a HostRef calls `host_ref_retain` once for that proxy and calls `host_ref_release` when the proxy is finalized. `host_function_owner` returns the owning HostRef for a host method, or zero for an ownerless function; the provider keeps a proxy for that owner in the method function's data so a function retained beyond its parent object remains callable. The HostBridge keeps the referenced object available while any proxy remains; session teardown still clears all remaining entries. A callback must not retain borrowed key/argument data after it returns. The host keeps the callback table and `host_ctx` valid until every runtime using them has been destroyed.
 
 The host-service request and response envelopes are fixed-width and contain no language-runtime pointers beyond borrowed string/byte views:
 
@@ -234,7 +246,30 @@ typedef struct sc_service_event_v1 {
 
 `kind` is one of `SC_SERVICE_EVENT_DATA`, `SC_SERVICE_EVENT_COMPLETE`, or `SC_SERVICE_EVENT_CLOSE`. Data events are non-terminal. Complete and close events are terminal; each request accepts exactly one terminal event, and providers must reject unknown requests or events delivered after termination. Event payload views are borrowed only for the `service_event` call and must be copied by a provider if retained. Request IDs, event payloads, Go values, and QuickJS values never share ownership across the ABI boundary.
 
-The QuickJS provider currently advertises the `console`, `crypto`, `fetch`, and `filesystem` services. Console operations are `0x0101` (`log`), `0x0102` (`info`), `0x0103` (`warn`), and `0x0104` (`error`). Crypto operations are `0x0201` (`digest`) and `0x0202` (`randomBytes`). Fetch uses asynchronous operation `0x0301` (`request`): the request metadata is JSON in `request.string`, request content is in `request.bytes`, and a successful terminal event returns JSON response metadata in `event.string` plus response content in `event.bytes`; HTTP status is carried in `event.int64_value`. Filesystem operations are `0x0601`/`0x0602` (`readFile`/`writeFile`) for asynchronous calls and `0x0607`/`0x0608` (`readFileSync`/`writeFileSync`) for synchronous calls. Console arguments are converted to JavaScript strings and joined with one space before dispatch. Filesystem requests carry the path in `request.string` and file contents in `request.bytes`; providers must apply the host's package authorization and configured size limits.
+The QuickJS provider advertises `console`, `crypto`, `fetch`, `filesystem`,
+and `websocket`. Console operations are `0x0101` (`log`), `0x0102` (`info`),
+`0x0103` (`warn`), and `0x0104` (`error`). Crypto operations are `0x0201`
+(`digest`) and `0x0202` (`randomBytes`).
+
+Fetch uses asynchronous operation `0x0301` (`request`): request metadata is
+JSON in `request.string`, request content is in `request.bytes`, and a
+successful terminal event returns JSON response metadata in `event.string`
+plus response content in `event.bytes`; HTTP status is carried in
+`event.int64_value`.
+
+WebSocket connect is asynchronous operation `0x0501`: `request.string` is the
+URL and `request.bytes` is a UTF-8 JSON array of requested subprotocols. Its
+request ID is also the connection handle. Data events carry JSON event
+metadata in `event.string`; message payloads are in `event.bytes`. Send
+operation `0x0502` is synchronous: `request.uint64_value` is the connection
+handle, `request.string` is `text` or `binary`, and `request.bytes` is the
+payload. Close operation `0x0503` is synchronous: `request.uint64_value` is
+the connection handle and `request.string` is JSON containing `code` and
+`reason`. Exactly one terminal close event completes the connection request.
+
+Filesystem operations are `0x0601`/`0x0602` (`readFile`/`writeFile`) for
+asynchronous calls and `0x0607`/`0x0608` (`readFileSync`/`writeFileSync`) for
+synchronous calls.
 
 ## Plugin query and lifecycle
 
@@ -247,6 +282,10 @@ SC_EXPORT sc_status_t SC_CALL scardice_runtime_query_v1(
 ```
 
 `sc_runtime_plugin_v1` is append-only and contains `struct_size`, then the embedded `sc_runtime_descriptor_v1 descriptor`, the embedded `sc_runtime_api_v1 api`, and the optional extension tail. A successful query returns a pointer to plugin-owned static storage. The host validates the required prefix, version fields, capabilities, and function pointers before calling `create`; it reads the extension tail only when its fields are covered by `struct_size`.
+
+Runtime ABI and Host ABI each have one v1 contract. Minor fields are reserved
+zero; they do not negotiate feature releases. Optional fields are discovered
+through `struct_size`, then validated against the provider's capabilities.
 
 The active plugin table appends an extension descriptor array after the
 runtime API:
@@ -275,8 +314,8 @@ requires a complete descriptor-sized prefix, a non-null name, and a non-null
 table. Extension names and tables are provider-owned static storage.
 
 The current context extension is named
-`SC_RUNTIME_EXTENSION_CONTEXT_V1` (`scardice.runtime.context.v1`) and has
-ABI `1.0`:
+`SC_RUNTIME_EXTENSION_CONTEXT_V1` (`scardice.runtime.context.v1`) and uses
+extension ABI v1 with its reserved minor field set to zero:
 
 ```c
 typedef struct sc_runtime_context_extension_v1 {

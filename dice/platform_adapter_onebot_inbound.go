@@ -45,8 +45,7 @@ func (s *IMSession) ExecutePureOnebotInbound(ctx context.Context, ep *EndPointIn
 }
 
 // NewPureOnebotReadEndpoint derives the minimal legacy EndPointInfo view
-// required by compatibility ingress callers. It does not attach an adapter or
-// mutate IMSession.EndPoints.
+// required by compatibility ingress callers without attaching an adapter.
 func NewPureOnebotReadEndpoint(id adapterapi.EndpointID, config adapterapi.ValidatedConfig) *EndPointInfo {
 	var canonical OnebotConfig
 	_ = json.Unmarshal(config.Canonical, &canonical)

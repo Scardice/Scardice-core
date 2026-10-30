@@ -203,8 +203,8 @@ func buildHybridSourceFromAvailable(available map[Mode]ds.DiceSource) (ds.DiceSo
 		labels = append(labels, ModeSpecFor(mode).Label)
 	}
 
-	if len(sources) == 0 {
-		return nil, errors.New("no available random source to build hybrid mode")
+	if len(sources) < 2 {
+		return nil, errors.New("hybrid mode requires at least two available random sources")
 	}
 
 	return &hybridSource{

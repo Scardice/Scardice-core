@@ -1,31 +1,32 @@
 # Scardice Runtime ABI v1
 
-This directory defines the current development C ABI used by Scardice Core to discover and drive a native JavaScript runtime. The v1 surface uses fixed-width integers, opaque handles, borrowed views, caller-owned buffers, function tables, and explicit status codes.
+This directory defines the C ABI used by Scardice Core to discover and drive a native JavaScript runtime. The v1 surface uses fixed-width integers, opaque handles, borrowed views, caller-owned buffers, function tables, and explicit status codes.
 
 ## Status
 
-The current header is a paired development contract for Core and native
-providers. Runtime ABI and Host ABI numeric constants remain `1.0` and `1.1`
-while this development break is in flight; those numbers do not promise
-binary compatibility with older providers. The active contract requires the
-complete current runtime and host tables, including asynchronous service
-start/cancel/event slots. There is no active `compat/v1` header or downgrade
-path.
+The repository exposes Runtime ABI v1 and Host ABI v1 through
+[`include/scardice_runtime_v1.h`](include/scardice_runtime_v1.h). Runtime
+minor remains reserved at zero; Host ABI 1.1 adds an append-only,
+`struct_size`-gated HostRef proxy retain/release tail and a method-owner query.
 
-Core and provider evolve together; old-consumer compatibility and released
-minor-version negotiation are outside this development contract.
+The service callbacks, `tick`, and extension descriptor array remain optional
+v1 tails. QuickJS requires Host ABI 1.1: providers retain each HostRef proxy
+until finalization and retain a method's owner while its function remains
+reachable. Consumers validate every field they use through `struct_size`.
 
-The ABI directory contains the active contract, compile/layout fixtures, and
-the service lifecycle rules used by native-provider smoke tests. Native
-runtime loading and QuickJS integration live under
-[`runtime-plugins/quickjs`](../runtime-plugins/quickjs).
+There is no second public compatibility header. Runtime and Host ABI versions
+are negotiated independently through the query and descriptor fields.
+
+The ABI directory contains the public contract, compile/layout fixtures, and
+service lifecycle rules. Native runtime loading and QuickJS integration live
+under [`runtime-plugins/quickjs`](../runtime-plugins/quickjs).
 
 ## Contents
 
 - [`include/scardice_runtime_v1.h`](include/scardice_runtime_v1.h) — the only
   active public C header.
 - [`ABI.md`](ABI.md) — field order, call semantics, lifetime, threading,
-  errors, service lifecycle, and negotiation rules.
+  errors, service lifecycle, and compatibility rules.
 - [`CHANGELOG.md`](CHANGELOG.md) — development-contract history.
 - [`tests/layout.c`](tests/layout.c) and [`tests/layout.cc`](tests/layout.cc) —
   C and C++ compile/layout smoke fixtures.
@@ -33,6 +34,8 @@ runtime loading and QuickJS integration live under
 - [`tests/conformance.c`](tests/conformance.c) — a linked C fixture that
   instantiates the plugin extension table and exercises the public entry/value
   constants.
+- [`tests/compat_v1.c`](tests/compat_v1.c) — compile-time assertions for the
+  stable v1 prefixes and optional tails.
 
 ## Focused verification
 
@@ -46,6 +49,9 @@ clang++ -std=c++17 -Wall -Wextra -Werror -Iruntimeabi/include \
 gcc -std=c11 -Wall -Wextra -Werror -Iruntimeabi/include \
   runtimeabi/tests/conformance.c -o /tmp/scardice-runtimeabi-conformance \
   && /tmp/scardice-runtimeabi-conformance
+gcc -std=c11 -Wall -Wextra -Werror \
+  runtimeabi/tests/compat_v1.c -o /tmp/scardice-runtimeabi-compat-v1 \
+  && /tmp/scardice-runtimeabi-compat-v1
 ```
 
 The fixtures compile without linking a runtime plugin. Their `_Static_assert`/
@@ -63,9 +69,9 @@ The fixtures compile without linking a runtime plugin. Their `_Static_assert`/
 - Handle `0` is invalid/null. `sc_runtime_t`, `sc_value_t`, `sc_host_ref_t`,
   `sc_host_func_t`, `sc_host_ctx_t`, and `sc_service_request_t` are opaque
   `uint64_t` values.
-- Every v1 struct starts with `uint32_t struct_size`. The current paired
-  provider must expose the complete table size; an older short table is
-  rejected rather than downgraded.
+- Every v1 struct starts with `uint32_t struct_size`. Consumers read optional
+  tail fields only when the producer's `struct_size` covers them and the
+  associated capability requires them.
 - `service_call` is synchronous. `service_start` returns a request handle,
   `service_cancel` requests cancellation, and `service_event` delivers copied
   data followed by exactly one terminal complete/close event.

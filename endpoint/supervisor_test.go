@@ -1,13 +1,14 @@
 package endpoint
 
 import (
-	"Scardice-core/adapterapi"
 	"context"
 	"errors"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
+
+	"Scardice-core/adapterapi"
 )
 
 func fakeEffect(id adapterapi.EndpointID, kind EffectKind, generation, desiredVersion uint64, desired DesiredState) LifecycleEffect {
@@ -62,7 +63,6 @@ func TestSupervisorIgnoresStaleGenerationReport(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("old runtime did not launch")
 	}
-	connectedBeforeRelogin := sink.Count(adapterapi.ObservedStateConnected)
 	relogin := validFakeState(t, id, key, DesiredStateEnabled, 2, 3)
 	done := make(chan error, 1)
 	go func() {
@@ -85,7 +85,11 @@ func TestSupervisorIgnoresStaleGenerationReport(t *testing.T) {
 		t.Fatal("current runtime did not launch")
 	}
 	deadline := time.Now().Add(time.Second)
-	for sink.Count(adapterapi.ObservedStateConnected) <= connectedBeforeRelogin {
+	for {
+		update := sink.Last()
+		if update.Generation == 2 && update.DesiredVersion == 3 && update.ObservedState == adapterapi.ObservedStateConnected {
+			break
+		}
 		if time.Now().After(deadline) {
 			t.Fatal("current runtime did not publish connected")
 		}
@@ -99,6 +103,73 @@ func TestSupervisorIgnoresStaleGenerationReport(t *testing.T) {
 		t.Fatalf("stale connected changed durable observations: before=%d after=%d", before, got)
 	}
 }
+
+func TestSupervisorForwardsFencedIdentityObservation(t *testing.T) {
+	id := adapterapi.EndpointID("sup-identity")
+	key := adapterapi.AdapterKey("fake")
+	descriptor := &fakeDescriptor{key: key}
+	received := make(chan FencedIdentityObservation, 1)
+	sup := NewSupervisor(
+		fakeDescriptorRegistry{key: descriptor},
+		WithLifecycleSink(&fakeLifecycleSink{}),
+		WithIdentityObservationSink(IdentityObservationSinkFunc(func(_ context.Context, observation FencedIdentityObservation) error {
+			received <- observation
+			return nil
+		})),
+	)
+	state := validFakeState(t, id, key, DesiredStateEnabled, 7, 11)
+	if err := sup.Reconcile(context.Background(), state, fakeEffect(id, EffectStart, 7, 11, DesiredStateEnabled)); err != nil {
+		t.Fatal(err)
+	}
+	runtime := descriptor.Runtime(0)
+	runtime.allowStart()
+	select {
+	case <-runtime.runStarted:
+	case <-time.After(time.Second):
+		t.Fatal("runtime did not launch")
+	}
+	providerID := adapterapi.PrincipalID("official-qq:verified-user")
+	if err := runtime.port().ReportObservation(context.Background(), adapterapi.LifecycleObservation{
+		Kind:       adapterapi.LifecycleObservationIdentity,
+		State:      adapterapi.ObservedStateConnected,
+		ProviderID: providerID,
+	}); err != nil {
+		t.Fatalf("report identity: %v", err)
+	}
+	select {
+	case observation := <-received:
+		if observation.EndpointID != id || observation.Generation != 7 || observation.DesiredVersion != 11 || observation.Observation.ProviderID != providerID {
+			t.Fatalf("fenced identity observation = %#v", observation)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("identity observation was not forwarded")
+	}
+}
+func TestSupervisorIgnoresIdentityObservationWithoutSink(t *testing.T) {
+	id := adapterapi.EndpointID("sup-identity-optional")
+	key := adapterapi.AdapterKey("fake")
+	descriptor := &fakeDescriptor{key: key}
+	sup := NewSupervisor(fakeDescriptorRegistry{key: descriptor}, WithLifecycleSink(&fakeLifecycleSink{}))
+	state := validFakeState(t, id, key, DesiredStateEnabled, 1, 2)
+	if err := sup.Reconcile(context.Background(), state, fakeEffect(id, EffectStart, 1, 2, DesiredStateEnabled)); err != nil {
+		t.Fatal(err)
+	}
+	runtime := descriptor.Runtime(0)
+	runtime.allowStart()
+	select {
+	case <-runtime.runStarted:
+	case <-time.After(time.Second):
+		t.Fatal("runtime did not launch")
+	}
+	if err := runtime.port().ReportObservation(context.Background(), adapterapi.LifecycleObservation{
+		Kind:       adapterapi.LifecycleObservationIdentity,
+		State:      adapterapi.ObservedStateConnected,
+		ProviderID: "provider-user",
+	}); err != nil {
+		t.Fatalf("optional identity sink rejected observation: %v", err)
+	}
+}
+
 func TestSupervisorStopTimeoutRetainsAmbiguousOwner(t *testing.T) {
 	id := adapterapi.EndpointID("sup-timeout")
 	key := adapterapi.AdapterKey("fake")
@@ -244,7 +315,7 @@ func TestSupervisorFailsClosedWithoutLifecycleSink(t *testing.T) {
 	id := adapterapi.EndpointID("sup-no-sink")
 	key := adapterapi.AdapterKey("fake")
 	descriptor := &fakeDescriptor{key: key}
-	sup := NewSupervisor(map[adapterapi.AdapterKey]adapterapi.Descriptor{key: descriptor})
+	sup := NewSupervisor(fakeDescriptorRegistry{key: descriptor})
 	state := validFakeState(t, id, key, DesiredStateEnabled, 1, 2)
 	if err := sup.Reconcile(context.Background(), state, fakeEffect(id, EffectStart, 1, 2, DesiredStateEnabled)); !errors.Is(err, ErrSupervisorNoLifecycleSink) {
 		t.Fatalf("nil sink err=%v", err)
@@ -337,6 +408,52 @@ func TestSupervisorStopWaitsForInflightObservation(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+func TestSupervisorPublishesExitedBeforeDone(t *testing.T) {
+	sup := NewSupervisor(nil)
+	runtime := newFakeRuntime(adapterapi.RuntimeInit{})
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	callbacksDone := make(chan struct{})
+	close(callbacksDone)
+	worker := &supervisorWorker{
+		runtime:       runtime,
+		cancel:        cancel,
+		done:          make(chan struct{}),
+		launched:      make(chan struct{}),
+		callbacksDone: callbacksDone,
+	}
+
+	go sup.runWorker(runCtx, worker, &generationCorePort{supervisor: sup, worker: worker})
+	select {
+	case <-runtime.runStarted:
+	case <-time.After(time.Second):
+		t.Fatal("runtime did not start")
+	}
+	runtime.allowStart()
+	worker.mu.Lock()
+	worker.stopping = true
+	closeOnce(runtime.exit)
+	select {
+	case <-worker.done:
+		worker.mu.Unlock()
+		t.Fatal("worker signaled done before publishing exited state")
+	case <-time.After(20 * time.Millisecond):
+	}
+	worker.mu.Unlock()
+
+	select {
+	case <-worker.done:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not signal done after publishing exited state")
+	}
+	worker.mu.Lock()
+	exited := worker.exited
+	worker.mu.Unlock()
+	if !exited {
+		t.Fatal("done channel closed without exited state")
+	}
+}
+
 func TestSupervisorNaturalRunExitStopsAndPublishes(t *testing.T) {
 	id := adapterapi.EndpointID("sup-natural-exit")
 	key := adapterapi.AdapterKey("fake")
@@ -436,13 +553,13 @@ func TestSupervisorInboundNilContextUsesBackground(t *testing.T) {
 	key := adapterapi.AdapterKey("fake")
 	descriptor := &fakeDescriptor{key: key}
 	called := make(chan struct{})
-	sup := NewSupervisor(fakeDescriptorRegistry{key: descriptor}, WithLifecycleSink(&fakeLifecycleSink{}), WithInboundSink(func(c context.Context, _ FencedInbound) (adapterapi.IngressReceipt, error) {
+	sup := NewSupervisor(fakeDescriptorRegistry{key: descriptor}, WithLifecycleSink(&fakeLifecycleSink{}), WithInboundSink(InboundSinkFunc(func(c context.Context, _ FencedInbound) (adapterapi.IngressReceipt, error) {
 		if c == nil {
 			return adapterapi.IngressReceipt{}, errors.New("nil context")
 		}
 		close(called)
 		return adapterapi.IngressReceipt{Outcome: adapterapi.IngressAccepted}, nil
-	}))
+	})))
 	state := validFakeState(t, id, key, DesiredStateEnabled, 1, 2)
 	if err := sup.Reconcile(context.Background(), state, fakeEffect(id, EffectStart, 1, 2, DesiredStateEnabled)); err != nil {
 		t.Fatal(err)
@@ -454,7 +571,9 @@ func TestSupervisorInboundNilContextUsesBackground(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("runtime did not launch")
 	}
-	receipt, err := runtime.port().HandleInbound(nil, adapterapi.InboundMessage{ProviderEventID: "evt-1", Kind: adapterapi.InboundKindMessage})
+	receipt, err := runtime.port().HandleInbound(context.Background(), adapterapi.InboundMessage{
+		ProviderEventID: "evt-1", Kind: adapterapi.InboundKindMessage, ConversationKind: adapterapi.ConversationKindDirect,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -691,7 +810,10 @@ func TestSupervisorShutdownDrainsObservationBeforeAmbiguous(t *testing.T) {
 	go func() { done <- sup.Shutdown(ctx) }()
 	close(sink.release)
 	select {
-	case <-done:
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled shutdown error = %v", err)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("shutdown did not drain observation")
 	}
@@ -1095,5 +1217,72 @@ func TestSupervisorNaturalCleanupConsumesPendingDelete(t *testing.T) {
 	}
 	if got := sup.WorkerCount(); got != 0 {
 		t.Fatalf("worker retained after pending delete: %d", got)
+	}
+}
+
+func TestSupervisorForwardsFencedCharacterRequest(t *testing.T) {
+	id := adapterapi.EndpointID("sup-character")
+	key := adapterapi.AdapterKey("fake")
+	descriptor := &fakeDescriptor{key: key}
+	received := make(chan FencedCharacterRequest, 1)
+	sup := NewSupervisor(
+		fakeDescriptorRegistry{key: descriptor},
+		WithLifecycleSink(&fakeLifecycleSink{}),
+		WithCharacterSink(CharacterSinkFunc(func(_ context.Context, request FencedCharacterRequest) (adapterapi.CharacterResponse, error) {
+			received <- request
+			return adapterapi.CharacterResponse{OK: true, Name: "Alice"}, nil
+		})),
+	)
+	state := validFakeState(t, id, key, DesiredStateEnabled, 3, 5)
+	if err := sup.Reconcile(context.Background(), state, fakeEffect(id, EffectStart, 3, 5, DesiredStateEnabled)); err != nil {
+		t.Fatal(err)
+	}
+	runtime := descriptor.Runtime(0)
+	runtime.allowStart()
+	select {
+	case <-runtime.runStarted:
+	case <-time.After(time.Second):
+		t.Fatal("runtime did not launch")
+	}
+	port, ok := runtime.port().(adapterapi.CharacterCorePort)
+	if !ok {
+		t.Fatal("generation core port does not implement CharacterCorePort")
+	}
+	response, err := port.HandleCharacter(context.Background(), adapterapi.CharacterRequest{Operation: adapterapi.CharacterOperationGet, UserID: "user-1"})
+	if err != nil || !response.OK || response.Name != "Alice" {
+		t.Fatalf("character response=%#v err=%v", response, err)
+	}
+	select {
+	case request := <-received:
+		if request.EndpointID != id || request.Generation != 3 || request.DesiredVersion != 5 || request.Request.UserID != "user-1" {
+			t.Fatalf("fenced character request = %#v", request)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("character request was not forwarded")
+	}
+}
+
+func TestSupervisorRejectsCharacterRequestWithoutSink(t *testing.T) {
+	id := adapterapi.EndpointID("sup-character-optional")
+	key := adapterapi.AdapterKey("fake")
+	descriptor := &fakeDescriptor{key: key}
+	sup := NewSupervisor(fakeDescriptorRegistry{key: descriptor}, WithLifecycleSink(&fakeLifecycleSink{}))
+	state := validFakeState(t, id, key, DesiredStateEnabled, 1, 2)
+	if err := sup.Reconcile(context.Background(), state, fakeEffect(id, EffectStart, 1, 2, DesiredStateEnabled)); err != nil {
+		t.Fatal(err)
+	}
+	runtime := descriptor.Runtime(0)
+	runtime.allowStart()
+	select {
+	case <-runtime.runStarted:
+	case <-time.After(time.Second):
+		t.Fatal("runtime did not launch")
+	}
+	port := runtime.port().(adapterapi.CharacterCorePort)
+	if _, err := port.HandleCharacter(context.Background(), adapterapi.CharacterRequest{Operation: adapterapi.CharacterOperationList, UserID: "user-1"}); !errors.Is(err, ErrSupervisorNoCharacterSink) {
+		t.Fatalf("character request error = %v", err)
+	}
+	if _, err := port.HandleCharacter(context.Background(), adapterapi.CharacterRequest{Operation: adapterapi.CharacterOperationInvalid}); err == nil {
+		t.Fatal("invalid character operation was accepted")
 	}
 }

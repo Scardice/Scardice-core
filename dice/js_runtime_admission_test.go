@@ -69,7 +69,7 @@ func TestJSRuntimeManagerRejectsProviderBeforeOpen(t *testing.T) {
 		opened:     &opened,
 	}
 	manager := NewJSRuntimeManager(t.TempDir())
-	manager.providers[provider.descriptor.ID] = provider
+	registerScriptSelectionProvider(t, manager, provider)
 	manager.requirements = diceRuntimeRequirements()
 
 	_, err := manager.Resolve(context.Background(), provider.descriptor.ID, jsengine.RuntimeOptions{})
@@ -93,7 +93,7 @@ func TestJSRuntimeManagerRejectsOpenedLoopWithoutContextInterface(t *testing.T) 
 		loop:       loop,
 	}
 	manager := NewJSRuntimeManager(t.TempDir())
-	manager.providers[provider.descriptor.ID] = provider
+	registerScriptSelectionProvider(t, manager, provider)
 	manager.requirements = diceRuntimeRequirements()
 
 	_, err := manager.Resolve(context.Background(), provider.descriptor.ID, jsengine.RuntimeOptions{})

@@ -79,9 +79,11 @@ type jsRuntimeResourceCarrier interface {
 }
 
 // ownedJSLoop preserves optional loop interfaces while making provider-created
-// service registries part of the loop's fallback ownership boundary.
+// service registries part of the loop's fallback ownership boundary. onClose
+// runs once, before anything is closed.
 type ownedJSLoop struct {
 	loop      jsengine.Loop
+	onClose   func()
 	resourceM sync.Mutex
 	resources []*services.Registry
 	closeOnce sync.Once
@@ -106,6 +108,9 @@ func (l *ownedJSLoop) Close() error {
 		return nil
 	}
 	l.closeOnce.Do(func() {
+		if l.onClose != nil {
+			l.onClose()
+		}
 		resources := l.takeJSRuntimeResources()
 		var errs []error
 		for index := len(resources) - 1; index >= 0; index-- {
@@ -164,8 +169,8 @@ func (l *ownedContextAwareJSLoop) LoadEntryWithContext(context any, entry jsengi
 	return l.contextAware.LoadEntryWithContext(context, entry)
 }
 
-func ownJSRuntimeLoop(loop jsengine.Loop, registries ...*services.Registry) jsengine.Loop {
-	owned := &ownedJSLoop{loop: loop, resources: uniqueJSServiceRegistries(registries)}
+func ownJSRuntimeLoop(loop jsengine.Loop, onClose func(), registries ...*services.Registry) jsengine.Loop {
+	owned := &ownedJSLoop{loop: loop, onClose: onClose, resources: uniqueJSServiceRegistries(registries)}
 	if contextAware, ok := loop.(jsengine.ContextAwareLoop); ok {
 		ownerAware, _ := loop.(jsengine.OwnerAwareLoop)
 		return &ownedContextAwareJSLoop{ownedJSLoop: owned, contextAware: contextAware, ownerAware: ownerAware}

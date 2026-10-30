@@ -64,7 +64,8 @@ func TestProviderRejectsUnsupportedOptionsInItsNamespace(t *testing.T) {
 func TestProviderIgnoresOptionsOwnedByAnotherNamespace(t *testing.T) {
 	loop, err := builtin.Provider().Open(context.Background(), jsengine.RuntimeOptions{
 		Providers: map[jsengine.EngineID]json.RawMessage{
-			"quickjs": json.RawMessage(`{"unsupported":true}`),
+			jsengine.EngineGoja: nil,
+			"quickjs":           json.RawMessage(`{"unsupported":true}`),
 		},
 	})
 	if err != nil {

@@ -38,11 +38,6 @@ import (
 )
 
 const (
-	hostABIMajor    = 1
-	hostABIMinor    = 1
-	runtimeABIMajor = 1
-	runtimeABIMinor = 0
-
 	nativeTypeUndefined    = C.SC_VALUE_TYPE_UNDEFINED
 	nativeTypeNull         = C.SC_VALUE_TYPE_NULL
 	nativeTypeBool         = C.SC_VALUE_TYPE_BOOL
@@ -69,7 +64,7 @@ func Load(candidate Candidate) (*Provider, error) { return candidate.Load() }
 func loadNative(candidate Candidate) (*Provider, error) {
 	absolutePath, err := filepathAbs(candidate.LibraryPath)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s: %v", ErrMissingLibrary, candidate.LibraryPath, err)
+		return nil, fmt.Errorf("%w: %s: %w", ErrMissingLibrary, candidate.LibraryPath, err)
 	}
 	candidate.LibraryPath = absolutePath
 	path := C.CString(absolutePath)
@@ -81,8 +76,8 @@ func loadNative(candidate Candidate) (*Provider, error) {
 		return nil, wrapNativeError(status, candidate.LibraryPath, cError(errorBuffer))
 	}
 	var raw C.sc_native_descriptor
-	status = C.sc_native_query(library, runtimeABIMajor, runtimeABIMinor, hostABIMajor, hostABIMinor,
-		&raw, (*C.char)(unsafe.Pointer(&errorBuffer[0])), C.uint64_t(len(errorBuffer)))
+	status = C.sc_native_query(library, &raw, (*C.char)(unsafe.Pointer(&errorBuffer[0])),
+		C.uint64_t(len(errorBuffer)))
 	if status != C.SC_NATIVE_OK {
 		return nil, wrapNativeError(status, candidate.LibraryPath, cError(errorBuffer))
 	}
@@ -93,9 +88,7 @@ func loadNative(candidate Candidate) (*Provider, error) {
 		Language:     C.GoString(&raw.language[0]),
 		Author:       candidate.Manifest.Author,
 		ABIMajor:     uint32(raw.abi_major),
-		ABIMinor:     uint32(raw.abi_minor),
 		HostABIMajor: uint32(raw.host_abi_major),
-		HostABIMinor: uint32(raw.host_abi_minor),
 		Capabilities: jsengine.CapabilitySet(raw.capabilities),
 		Services:     append([]string(nil), candidate.Manifest.Services...),
 		Extensions:   append([]string(nil), candidate.Manifest.Extensions...),
@@ -105,13 +98,15 @@ func loadNative(candidate Candidate) (*Provider, error) {
 		return nil, fmt.Errorf("%w: %w: manifest id/version %q/%q, descriptor %q/%q", ErrManifestMismatch, ErrDescriptorMismatch,
 			candidate.Manifest.ID, candidate.Manifest.Version, descriptor.ID, descriptor.Version)
 	}
-	if candidate.Manifest.RuntimeABI.Major != descriptor.ABIMajor || candidate.Manifest.RuntimeABI.MinMinor > descriptor.ABIMinor {
-		return nil, fmt.Errorf("%w: manifest runtime ABI %d.%d, descriptor %d.%d", ErrManifestMismatch,
-			candidate.Manifest.RuntimeABI.Major, candidate.Manifest.RuntimeABI.MinMinor, descriptor.ABIMajor, descriptor.ABIMinor)
+	if candidate.Manifest.RuntimeABI.Major != runtimeABIMajor ||
+		candidate.Manifest.RuntimeABI.Major != descriptor.ABIMajor {
+		return nil, fmt.Errorf("%w: manifest runtime ABI v%d, descriptor v%d", ErrManifestMismatch,
+			candidate.Manifest.RuntimeABI.Major, descriptor.ABIMajor)
 	}
-	if candidate.Manifest.HostABI.Major != descriptor.HostABIMajor || candidate.Manifest.HostABI.MinMinor > descriptor.HostABIMinor {
-		return nil, fmt.Errorf("%w: manifest host ABI %d.%d, descriptor %d.%d", ErrManifestMismatch,
-			candidate.Manifest.HostABI.Major, candidate.Manifest.HostABI.MinMinor, descriptor.HostABIMajor, descriptor.HostABIMinor)
+	if candidate.Manifest.HostABI.Major != hostABIMajor ||
+		candidate.Manifest.HostABI.Major != descriptor.HostABIMajor {
+		return nil, fmt.Errorf("%w: manifest host ABI v%d, descriptor v%d", ErrManifestMismatch,
+			candidate.Manifest.HostABI.Major, descriptor.HostABIMajor)
 	}
 	candidate.loaded = true
 	return &Provider{candidate: candidate, descriptor: descriptor, library: uint64(library)}, nil
@@ -222,12 +217,16 @@ type nativeLoop struct {
 	provider    *Provider
 	runtime     uint64
 	ownerThread atomic.Uint64
+	// activeScope is read and written only on the loop's owner thread.
+	activeScope *nativeScope
 
 	tasks     chan nativeTask
 	done      chan struct{}
 	eventWake chan struct{}
 	closed    atomic.Bool
 	once      sync.Once
+	// releaseWindow permits matching HostRef finalizers through provider destruction.
+	releaseWindow atomic.Bool
 
 	// runMu closes the admission window before shutdown enqueues its stop
 	// task. Calls already admitted finish before provider.stop runs.
@@ -239,9 +238,17 @@ type nativeLoop struct {
 	host       *nativeHostState
 	hostHandle cgo.Handle
 
-	serviceEventMu  sync.Mutex
-	serviceEvents   []nativeServiceEvent
-	tickErrorBuffer [512]byte
+	serviceEventMu         sync.Mutex
+	serviceEvents          []nativeServiceEvent
+	tickErrorBuffer        [512]byte
+	promiseObservers       atomic.Int64
+	promiseObserve         *nativeValue
+	promiseGetValue        *nativeValue
+	jsonParse              *nativeValue
+	jsonStringify          *nativeValue
+	promiseMu              sync.Mutex
+	promiseObservations    map[uint64]*nativePromiseObservation
+	nextPromiseObservation uint64
 
 	scheduledMu sync.Mutex
 	scheduled   []nativeScheduledCall
@@ -249,12 +256,13 @@ type nativeLoop struct {
 	persistentMu sync.Mutex
 	persistent   map[uint64]uint32
 
-	contextMu      sync.RWMutex
-	contexts       map[uint64]any
-	contextTokens  map[any]uint64
-	currentContext any
-	currentToken   uint64
-	nextToken      uint64
+	contextMu          sync.RWMutex
+	contexts           map[uint64]any
+	contextTokens      map[any]uint64
+	currentContext     any
+	currentToken       uint64
+	nextToken          uint64
+	hostExecutionDepth int // owner-thread only
 }
 
 func (l *nativeLoop) Engine() jsengine.EngineID { return l.provider.descriptor.ID }
@@ -272,22 +280,19 @@ func (l *nativeLoop) InOwner() bool {
 
 // registerContext returns the provider token that identifies context.
 //
-// Tokens are interned and outlive the call that introduced them: the provider
-// stores them on timers, pending Promises, and outstanding service requests, so
-// a token released when its first callback returned would leave later
-// asynchronous callbacks without a context. Interning keeps the table bounded by
-// the number of distinct contexts instead of the number of realm entries, and
-// shutdown clears it.
-func (l *nativeLoop) registerContext(context any) uint64 {
-	if context == nil {
+// Runtime-level identities are interned until shutdown. Invocation identities
+// retire with their context; retained provider tokens then resolve to a revoked
+// scope, never to an unbound task or a newer invocation.
+func (l *nativeLoop) registerContext(opaque any) uint64 {
+	if opaque == nil {
 		return 0
 	}
-	key, keyed := nativeContextKey(context)
+	key, keyed := nativeContextKey(opaque)
 	l.contextMu.Lock()
 	defer l.contextMu.Unlock()
 	if keyed {
 		if token, ok := l.contextTokens[key]; ok {
-			l.contexts[token] = context
+			l.contexts[token] = opaque
 			return token
 		}
 	}
@@ -296,9 +301,19 @@ func (l *nativeLoop) registerContext(context any) uint64 {
 		l.nextToken++
 	}
 	token := l.nextToken
-	l.contexts[token] = context
+	l.contexts[token] = opaque
 	if keyed {
 		l.contextTokens[key] = token
+	}
+	if execution := jsengine.ContextForExecution(opaque); execution.Done() != nil {
+		context.AfterFunc(execution, func() {
+			l.contextMu.Lock()
+			delete(l.contexts, token)
+			if keyed && l.contextTokens[key] == token {
+				delete(l.contextTokens, key)
+			}
+			l.contextMu.Unlock()
+		})
 	}
 	return token
 }
@@ -337,7 +352,10 @@ func (l *nativeLoop) CurrentContext() any {
 	l.contextMu.RLock()
 	defer l.contextMu.RUnlock()
 	if token != 0 {
-		return l.contexts[token]
+		if value, ok := l.contexts[token]; ok {
+			return value
+		}
+		return jsengine.RevokedExecutionScope{}
 	}
 	return l.currentContext
 }
@@ -414,11 +432,13 @@ func (l *nativeLoop) discardServiceEvents() {
 }
 
 func (l *nativeLoop) drainServiceEvents() {
-	for _, event := range l.takeServiceEvents() {
-		if err := l.deliverServiceEvent(event); err != nil && l.host != nil {
-			l.host.setError(err)
+	l.runPromiseJobs(func() {
+		for _, event := range l.takeServiceEvents() {
+			if err := l.deliverServiceEvent(event); err != nil && l.host != nil {
+				l.host.setError(err)
+			}
 		}
-	}
+	})
 }
 
 func (l *nativeLoop) deliverServiceEvent(event nativeServiceEvent) error {
@@ -534,11 +554,31 @@ func (l *nativeLoop) tick() {
 	if l == nil || l.closed.Load() || l.runtime == 0 {
 		return
 	}
-	status := C.sc_native_tick(
-		C.uint64_t(l.provider.library), C.uint64_t(l.runtime),
-		(*C.char)(unsafe.Pointer(&l.tickErrorBuffer[0])), C.uint64_t(len(l.tickErrorBuffer)),
-	)
-	if err := l.operation(status, cError(l.tickErrorBuffer[:])); err != nil && l.host != nil {
+	run := func() {
+		status := C.sc_native_tick(
+			C.uint64_t(l.provider.library), C.uint64_t(l.runtime),
+			(*C.char)(unsafe.Pointer(&l.tickErrorBuffer[0])), C.uint64_t(len(l.tickErrorBuffer)),
+		)
+		if err := l.operation(status, cError(l.tickErrorBuffer[:])); err != nil && l.host != nil {
+			l.host.setError(err)
+		}
+	}
+	l.runPromiseJobs(run)
+}
+
+// Service delivery can drain Promise jobs just like tick; both need a value
+// scope while a host is waiting to consume a settled result.
+func (l *nativeLoop) runPromiseJobs(run func()) {
+	if l.activeScope != nil || l.promiseObservers.Load() == 0 {
+		run()
+		return
+	}
+	rt := &nativeRuntime{loop: l, scope: newNativeScope(l)}
+	defer rt.scope.release()
+	if err := l.runScopedTask(rt, func(*nativeRuntime) error {
+		run()
+		return nil
+	}); err != nil && l.host != nil {
 		l.host.setError(err)
 	}
 }
@@ -586,6 +626,28 @@ func (l *nativeLoop) worker(options jsengine.RuntimeOptions, ready chan<- error)
 		ready <- wrapOperationError(status, l.provider.candidate.LibraryPath, cError(errorBuffer))
 		return
 	}
+	rt := &nativeRuntime{loop: l, scope: newNativeScope(l)}
+	err := l.runScopedTask(rt, func(rt *nativeRuntime) error {
+		if captureErr := rt.captureJSONParse(); captureErr != nil && !errors.Is(captureErr, errNativeJSONParseUnavailable) {
+			return fmt.Errorf("capture native JSON.parse intrinsic: %w", captureErr)
+		}
+		if captureErr := rt.captureJSONStringify(); captureErr != nil && !errors.Is(captureErr, errNativeJSONStringifyUnavailable) {
+			return fmt.Errorf("capture native JSON.stringify intrinsic: %w", captureErr)
+		}
+		if !l.provider.descriptor.Capabilities.Has(jsengine.CapabilityPromise) {
+			return nil
+		}
+		if promiseErr := rt.installPromiseObserver(); promiseErr != nil {
+			return fmt.Errorf("install native Promise observer: %w", promiseErr)
+		}
+		return nil
+	})
+	rt.scope.release()
+	if err != nil {
+		_ = l.shutdown()
+		ready <- err
+		return
+	}
 	ready <- nil
 
 	schedule := newNativeTickSchedule()
@@ -600,7 +662,7 @@ func (l *nativeLoop) worker(options jsengine.RuntimeOptions, ready chan<- error)
 				return
 			}
 			rt := &nativeRuntime{loop: l, scope: newNativeScope(l)}
-			err := runNativeTask(rt, task.fn)
+			err := l.runScopedTask(rt, task.fn)
 			rt.scope.release()
 			task.done <- err
 			l.drainScheduled()
@@ -630,22 +692,69 @@ func runNativeTask(rt *nativeRuntime, fn func(*nativeRuntime) error) (err error)
 	}()
 	return fn(rt)
 }
+func (l *nativeLoop) runScopedTask(rt *nativeRuntime, fn func(*nativeRuntime) error) error {
+	previous := l.activeScope
+	l.activeScope = rt.scope
+	defer func() { l.activeScope = previous }()
+	return runNativeTask(rt, fn)
+}
+
+func (l *nativeLoop) contextForDefaultEntry() any {
+	if !l.onOwnerThread() {
+		return nil
+	}
+	return l.CurrentContext()
+}
 
 func (l *nativeLoop) Run(run func(jsengine.Runtime) error) error {
-	return l.RunWithContext(l.CurrentContext(), run)
+	return l.RunWithContext(l.contextForDefaultEntry(), run)
+}
+
+func (l *nativeLoop) lockRun(ctx context.Context) error {
+	if l.runMu.TryRLock() {
+		return nil
+	}
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if l.runMu.TryRLock() {
+				return nil
+			}
+		}
+	}
 }
 
 func (l *nativeLoop) RunWithContext(context any, run func(jsengine.Runtime) error) error {
 	if run == nil {
 		return errors.New("native runtime callback is nil")
 	}
-	l.runMu.RLock()
-	defer l.runMu.RUnlock()
+	execution := jsengine.ContextForExecution(context)
+	if err := execution.Err(); err != nil {
+		return err
+	}
+	if !l.onOwnerThread() {
+		if err := l.lockRun(execution); err != nil {
+			return err
+		}
+		defer l.runMu.RUnlock()
+	}
 	if l.closed.Load() {
 		return ErrNativeClosed
 	}
 	token := l.registerContext(context)
 	runTask := func(rt *nativeRuntime) (callbackErr error) {
+		if err := execution.Err(); err != nil {
+			return err
+		}
+		leave, err := jsengine.EnterExecution(context, l.CurrentContext())
+		if err != nil {
+			return err
+		}
+		defer leave()
 		previousToken, previousContext, err := l.enterContext(token, context)
 		if err != nil {
 			return err
@@ -659,22 +768,28 @@ func (l *nativeLoop) RunWithContext(context any, run func(jsengine.Runtime) erro
 	}
 	if l.onOwnerThread() {
 		rt := &nativeRuntime{loop: l, scope: newNativeScope(l)}
-		err := runNativeTask(rt, runTask)
+		err := l.runScopedTask(rt, runTask)
 		rt.scope.release()
 		return err
 	}
 	task := nativeTask{done: make(chan error, 1), fn: runTask}
 	select {
 	case l.tasks <- task:
+	case <-execution.Done():
+		return execution.Err()
 	case <-l.done:
 		return ErrNativeClosed
 	}
-	return <-task.done
+	err := <-task.done
+	if contextErr := execution.Err(); contextErr != nil {
+		return contextErr
+	}
+	return err
 }
 
 // Schedule queues a callback for the owner thread without waiting for it.
 func (l *nativeLoop) Schedule(run func(jsengine.Runtime) error) error {
-	return l.ScheduleWithContext(l.CurrentContext(), run)
+	return l.ScheduleWithContext(l.contextForDefaultEntry(), run)
 }
 
 // ScheduleWithContext queues a context-aware callback for the owner thread.
@@ -684,8 +799,9 @@ func (l *nativeLoop) ScheduleWithContext(context any, run func(jsengine.Runtime)
 	if run == nil {
 		return errors.New("native runtime callback is nil")
 	}
-	l.runMu.RLock()
-	defer l.runMu.RUnlock()
+	if err := jsengine.ContextForExecution(context).Err(); err != nil {
+		return err
+	}
 	if l.closed.Load() {
 		return ErrNativeClosed
 	}
@@ -733,6 +849,11 @@ func (l *nativeLoop) runScheduled(call nativeScheduledCall) {
 	if l.closed.Load() {
 		return
 	}
+	leave, err := jsengine.EnterExecution(call.context, l.CurrentContext())
+	if err != nil {
+		return
+	}
+	defer leave()
 	previousToken, previousContext, err := l.enterContext(call.token, call.context)
 	if err != nil {
 		if l.host != nil {
@@ -741,7 +862,7 @@ func (l *nativeLoop) runScheduled(call nativeScheduledCall) {
 		return
 	}
 	rt := &nativeRuntime{loop: l, scope: newNativeScope(l)}
-	callbackErr := runNativeTask(rt, call.fn)
+	callbackErr := l.runScopedTask(rt, call.fn)
 	rt.scope.release()
 	if restoreErr := l.leaveContext(previousToken, previousContext); callbackErr == nil {
 		callbackErr = restoreErr
@@ -752,7 +873,7 @@ func (l *nativeLoop) runScheduled(call nativeScheduledCall) {
 }
 
 func (l *nativeLoop) LoadEntry(entry jsengine.Entry) error {
-	return l.LoadEntryWithContext(l.CurrentContext(), entry)
+	return l.LoadEntryWithContext(l.contextForDefaultEntry(), entry)
 }
 
 func (l *nativeLoop) LoadEntryWithContext(context any, entry jsengine.Entry) error {
@@ -769,6 +890,8 @@ func (l *nativeLoop) LoadEntryWithContext(context any, entry jsengine.Entry) err
 func (l *nativeLoop) Close() error {
 	l.once.Do(func() {
 		l.runMu.Lock()
+		// runMu excludes runtime calls while releases remain valid for finalizers.
+		l.releaseWindow.Store(true)
 		l.closed.Store(true)
 		closeTask := nativeTask{stop: true, done: make(chan error, 1)}
 		select {
@@ -791,6 +914,7 @@ func (l *nativeLoop) shutdown() error {
 	var first error
 	l.discardServiceEvents()
 	l.discardScheduled()
+	l.discardPromiseObservations()
 
 	// provider.stop must run while the runtime and all persistent values are
 	// still valid. Host callbacks are then released before provider.destroy.
@@ -800,12 +924,16 @@ func (l *nativeLoop) shutdown() error {
 	}
 	l.persistentMu.Lock()
 	for handle, count := range l.persistent {
-		for i := uint32(0); i < count; i++ {
+		for range count {
 			C.sc_native_value_release(C.uint64_t(l.provider.library), C.uint64_t(l.runtime), C.uint64_t(handle))
 		}
 	}
 	l.persistent = make(map[uint64]uint32)
 	l.persistentMu.Unlock()
+	l.promiseObserve = nil
+	l.promiseGetValue = nil
+	l.jsonParse = nil
+	l.jsonStringify = nil
 	if l.host != nil {
 		l.host.closeCallbacks()
 	}
@@ -815,8 +943,10 @@ func (l *nativeLoop) shutdown() error {
 	l.currentContext = nil
 	l.currentToken = 0
 	l.contextMu.Unlock()
-	if status := C.sc_native_destroy(C.uint64_t(l.provider.library), C.uint64_t(l.runtime),
-		(*C.char)(unsafe.Pointer(&errorBuffer[0])), C.uint64_t(len(errorBuffer))); status != C.SC_NATIVE_OK && first == nil {
+	destroyStatus := C.sc_native_destroy(C.uint64_t(l.provider.library), C.uint64_t(l.runtime),
+		(*C.char)(unsafe.Pointer(&errorBuffer[0])), C.uint64_t(len(errorBuffer)))
+	l.releaseWindow.Store(false)
+	if status := destroyStatus; status != C.SC_NATIVE_OK && first == nil {
 		first = wrapOperationError(status, l.provider.candidate.LibraryPath, cError(errorBuffer))
 	}
 	if l.host != nil {
@@ -1070,15 +1200,17 @@ func (r *nativeRuntime) coerce(raw interface{}) (*nativeValue, error) {
 
 func (r *nativeRuntime) sameValue(value *nativeValue) (*nativeValue, error) {
 	if value == nil || r == nil || r.loop == nil || r.loop.closed.Load() ||
-		value.loop != r.loop || value.runtime != r.loop.runtime || value.released() {
+		r.scope == nil || r.scope.released.Load() || r.loop.activeScope != r.scope ||
+		value.loop != r.loop || value.runtime != r.loop.runtime || value.scope != r.scope || !value.usable() {
 		return nil, errors.New("native value belongs to another or closed runtime")
 	}
 	return value, nil
 }
 func (r *nativeRuntime) objectValue(object *nativeObject) (*nativeValue, error) {
 	if object == nil || r == nil || r.loop == nil || r.loop.closed.Load() ||
-		object.loop != r.loop || object.runtime != r.loop.runtime ||
-		object.scope == nil || object.scope.released.Load() || object.handle == 0 {
+		r.scope == nil || r.scope.released.Load() || r.loop.activeScope != r.scope ||
+		object.loop != r.loop || object.runtime != r.loop.runtime || object.scope != r.scope ||
+		!object.usable() {
 		return nil, errors.New("native object belongs to another or closed runtime")
 	}
 	return &nativeValue{
@@ -1108,7 +1240,7 @@ func (r *nativeRuntime) coerceHostBridgeValue(value hostbridge.Value) (*nativeVa
 	case hostbridge.KindHostObject:
 		return r.newHostObject(value.Host, uint32(hostbridge.KindHostObject))
 	case hostbridge.KindHostFunction:
-		return r.newHostFunction(hostbridge.HostFuncRef(value.Function))
+		return r.newHostFunction(value.Function)
 	default:
 		return nil, fmt.Errorf("unsupported HostBridge value kind %d", value.Kind)
 	}
@@ -1254,7 +1386,10 @@ func (v *nativeValue) released() bool {
 }
 
 func (v *nativeValue) usable() bool {
-	return v != nil && v.loop != nil && !v.released() && !v.loop.closed.Load()
+	if v == nil || v.loop == nil || v.released() || v.loop.closed.Load() {
+		return false
+	}
+	return v.persistent.Load() || (v.loop.onOwnerThread() && v.loop.activeScope == v.scope)
 }
 
 func (v *nativeValue) Export() interface{} {
@@ -1314,7 +1449,7 @@ func (v *nativeValue) ExportPrimitive() (any, error) {
 	}
 	switch typ {
 	case nativeTypeUndefined, nativeTypeNull:
-		return nil, nil
+		return nil, jsengine.ErrNoPrimitiveValue
 	case nativeTypeBool:
 		var output C.uint32_t
 		if err := v.valueCallBool(&output); err != nil {
@@ -1426,9 +1561,6 @@ func (v *nativeValue) stringValue() (string, error) {
 	if uint64(required) < uint64(len(buffer)) {
 		buffer = buffer[:int(required)]
 	}
-	if len(buffer) > 0 && buffer[len(buffer)-1] == 0 {
-		buffer = buffer[:len(buffer)-1]
-	}
 	return string(buffer), nil
 }
 func (v *nativeValue) retain() error {
@@ -1469,8 +1601,8 @@ type nativeObject struct {
 }
 
 func (o *nativeObject) usable() bool {
-	return o != nil && o.loop != nil && !o.loop.closed.Load() &&
-		o.scope != nil && !o.scope.released.Load() && o.handle != 0
+	return o != nil && o.loop != nil && !o.loop.closed.Load() && o.loop.onOwnerThread() &&
+		o.scope != nil && !o.scope.released.Load() && o.loop.activeScope == o.scope && o.handle != 0
 }
 
 func (o *nativeObject) Set(name string, raw interface{}) error {
@@ -1494,8 +1626,13 @@ func (o *nativeObject) Set(name string, raw interface{}) error {
 }
 
 func (o *nativeObject) Get(name string) jsengine.Value {
+	value, _ := o.GetWithError(name)
+	return value
+}
+
+func (o *nativeObject) GetWithError(name string) (jsengine.Value, error) {
 	if !o.usable() {
-		return nil
+		return nil, ErrNativeClosed
 	}
 	key := []byte(name)
 	var keyPtr *C.char
@@ -1508,9 +1645,9 @@ func (o *nativeObject) Get(name string) jsengine.Value {
 		keyPtr, C.uint64_t(len(key)), &output, (*C.char)(unsafe.Pointer(&errorBuffer[0])), C.uint64_t(len(errorBuffer)))
 	runtime.KeepAlive(key)
 	if status != C.SC_NATIVE_OK {
-		return (&nativeRuntime{loop: o.loop, scope: o.scope}).undefined()
+		return nil, o.loop.operation(status, cError(errorBuffer))
 	}
-	return o.scope.value(uint64(output))
+	return o.scope.value(uint64(output)), nil
 }
 
 func (o *nativeObject) Has(name string) bool {
@@ -1580,5 +1717,6 @@ func ResidentLibraryCount() uint64 {
 
 var _ jsengine.Loop = (*nativeLoop)(nil)
 var _ jsengine.Runtime = (*nativeRuntime)(nil)
+var _ jsengine.JSONParser = (*nativeRuntime)(nil)
 var _ jsengine.Value = (*nativeValue)(nil)
 var _ jsengine.Object = (*nativeObject)(nil)

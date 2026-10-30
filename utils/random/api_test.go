@@ -1,6 +1,7 @@
 package random_test
 
 import (
+	"errors"
 	"math"
 	"testing"
 
@@ -81,5 +82,38 @@ func TestGlobalRandStringUsesAlphabet(t *testing.T) {
 		if char != 'a' && char != 'b' {
 			t.Fatalf("String() returned disallowed character %q", char)
 		}
+	}
+}
+
+func TestGlobalRandValidateActiveDoesNotChangeMode(t *testing.T) {
+	owner := newTestOwner(&sequenceSource{})
+
+	effective, err := owner.ValidateActive(randcore.ModeGM)
+	if err == nil || effective != randcore.ModePCG {
+		t.Fatalf("ValidateActive(gm) = (%q, %v), want PCG fallback and an unavailable-mode error", effective, err)
+	}
+	if got := owner.CurrentMode(); got != randcore.ModePCG {
+		t.Fatalf("validation changed active mode to %q, want PCG", got)
+	}
+}
+
+func TestGlobalRandActivateWithRollsBackFailedCommit(t *testing.T) {
+	owner := newTestOwner(&sequenceSource{})
+	owner.RegisterSource(randcore.ModeGM, &sequenceSource{})
+
+	commitErr := errors.New("commit failed")
+	err := owner.ActivateWith(randcore.ModeGM, func() error { return commitErr })
+	if !errors.Is(err, commitErr) {
+		t.Fatalf("ActivateWith() error = %v, want commit error", err)
+	}
+	if got := owner.CurrentMode(); got != randcore.ModePCG {
+		t.Fatalf("failed commit left active mode %q, want PCG", got)
+	}
+
+	if err := owner.ActivateWith(randcore.ModeGM, func() error { return nil }); err != nil {
+		t.Fatalf("successful ActivateWith() error = %v", err)
+	}
+	if got := owner.CurrentMode(); got != randcore.ModeGM {
+		t.Fatalf("successful commit active mode = %q, want GM", got)
 	}
 }

@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"sort"
 	"time"
 
 	"Scardice-core/dice"
@@ -15,7 +16,7 @@ func dicePublicInfo(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"endpoints": myDice.ImSession.EndPoints,
+		"endpoints": myDice.ImSession.EndPointsReadOnly(),
 		"config":    myDice.Config.PublicDiceConfig})
 }
 func dicePublicSet(c echo.Context) error {
@@ -31,14 +32,17 @@ func dicePublicSet(c echo.Context) error {
 		return Error(&c, err.Error(), Response{})
 	}
 	myDice.Config.PublicDiceConfig = v.Config
-	for _, i := range myDice.ImSession.EndPoints {
-		i.IsPublic = false
-		for _, s := range v.Selected {
-			if id, ok := s["id"].(string); ok && i.ID == id {
-				i.IsPublic = true
-			}
+	selected := make(map[string]struct{}, len(v.Selected))
+	for _, item := range v.Selected {
+		if id, ok := item["id"].(string); ok && id != "" {
+			selected[id] = struct{}{}
 		}
 	}
+	myDice.Config.EndpointIDs = myDice.Config.EndpointIDs[:0]
+	for id := range selected {
+		myDice.Config.EndpointIDs = append(myDice.Config.EndpointIDs, id)
+	}
+	sort.Strings(myDice.Config.EndpointIDs)
 	//nolint:staticcheck // keep explicit gate on PublicDiceConfig to avoid semantic ambiguity
 	if myDice.Config.PublicDiceConfig.Enable {
 		if myDice.PublicDiceInfoRegister() {

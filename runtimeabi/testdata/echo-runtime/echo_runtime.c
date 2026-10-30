@@ -11,6 +11,7 @@
 #define ECHO_MAX_KEY 32
 #define ECHO_ERROR_CAPACITY 256
 
+
 #define ECHO_TYPE_UNDEFINED SC_VALUE_TYPE_UNDEFINED
 #define ECHO_TYPE_NULL SC_VALUE_TYPE_NULL
 #define ECHO_TYPE_BOOL SC_VALUE_TYPE_BOOL
@@ -102,6 +103,7 @@ static sc_status_t echo_value_check(echo_runtime *runtime, sc_value_t value,
 }
 
 static void echo_value_release_internal(echo_runtime *runtime, sc_value_t value);
+static sc_status_t echo_value_new(echo_runtime *runtime, uint32_t type, sc_value_t *out);
 
 static void echo_properties_clear(echo_runtime *runtime, echo_property *properties) {
     for (uint32_t i = 0; i < ECHO_MAX_PROPERTIES; ++i) {
@@ -152,7 +154,7 @@ static sc_status_t echo_property_get(echo_runtime *runtime, echo_property *prope
             return SC_OK;
         }
     }
-    return echo_error("property is not present", SC_EINVAL);
+    return echo_value_new(runtime, ECHO_TYPE_UNDEFINED, out);
 }
 
 static sc_status_t echo_property_set(echo_runtime *runtime, echo_property *properties,
@@ -221,10 +223,11 @@ static sc_status_t echo_value_new(echo_runtime *runtime, uint32_t type, sc_value
 static sc_status_t SC_CALL echo_create(const sc_host_api_v1 *host, sc_host_ctx_t host_ctx,
                                        const sc_runtime_create_info_v1 *info,
                                        sc_runtime_t *out_runtime) {
-    if (host == NULL || out_runtime == NULL || host->struct_size < sizeof(*host) ||
-        host->abi_major != SC_HOST_ABI_MAJOR || host->abi_minor > SC_HOST_ABI_MINOR ||
+    if (host == NULL || out_runtime == NULL ||
+        host->struct_size < offsetof(sc_host_api_v1, service_call) ||
+        host->abi_major != SC_HOST_ABI_MAJOR || host->abi_minor != SC_HOST_ABI_MINOR ||
         info == NULL || info->struct_size < sizeof(*info)) {
-        return echo_error("invalid create or host ABI", SC_EABI);
+        return echo_error("invalid create or Host ABI v1", SC_EABI);
     }
     if (g_runtime.used) {
         return echo_error("runtime already exists", SC_ESTATE);
@@ -558,7 +561,8 @@ static sc_status_t SC_CALL echo_value_to_utf8_copy(sc_runtime_t runtime, sc_valu
     if (required == NULL || echo_runtime_check(runtime, 1, &state) != SC_OK ||
         echo_value_check(state, value, &entry) != SC_OK) return SC_EINVAL;
     if (entry->type != ECHO_TYPE_STRING) return echo_error("value is not a string", SC_EINVAL);
-    *required = entry->as.string.len + 1;
+    *required = entry->as.string.len;
+    if (*required == 0) return SC_OK;
     if (buffer == NULL || capacity < *required) return echo_error("string buffer is too small", SC_EINVAL);
     memcpy(buffer, entry->as.string.data, (size_t)*required);
     return SC_OK;
@@ -666,7 +670,7 @@ static const sc_runtime_descriptor_v1 ECHO_DESCRIPTOR = {
 };
 
 static const sc_runtime_api_v1 ECHO_API = {
-    sizeof(sc_runtime_api_v1),
+    offsetof(sc_runtime_api_v1, service_event),
     echo_create,
     echo_start,
     echo_stop,
@@ -704,16 +708,16 @@ static const sc_runtime_api_v1 ECHO_API = {
 };
 
 static const sc_runtime_plugin_v1 ECHO_PLUGIN = {
-    offsetof(sc_runtime_plugin_v1, extension_count),
-    ECHO_DESCRIPTOR,
-    ECHO_API,
+    .struct_size = offsetof(sc_runtime_plugin_v1, extension_count),
+    .descriptor = ECHO_DESCRIPTOR,
+    .api = ECHO_API,
 };
 
 SC_EXPORT sc_status_t SC_CALL scardice_runtime_query_v1(
     const sc_runtime_query_v1 *query, const sc_runtime_plugin_v1 **out_plugin) {
     if (query == NULL || out_plugin == NULL || query->struct_size < sizeof(*query) ||
         query->runtime_abi_major != SC_RUNTIME_ABI_MAJOR ||
-        query->runtime_abi_minor != SC_RUNTIME_ABI_MINOR ||
+        query->runtime_abi_minor != 0 ||
         query->host_abi_major != SC_HOST_ABI_MAJOR ||
         query->host_abi_minor != SC_HOST_ABI_MINOR) {
         return SC_EABI;

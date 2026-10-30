@@ -1,8 +1,10 @@
 package dice
 
 import (
+	"context"
 	crand "crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -84,7 +86,7 @@ func loadDismissConfirmCode(key string) (string, bool) {
 }
 
 func getOnebotBotQQID(ctx *MsgContext) (int64, bool) {
-	if ctx == nil || ctx.EndPoint == nil || ctx.EndPoint.Adapter == nil {
+	if ctx == nil || ctx.EndPoint == nil {
 		return 0, false
 	}
 
@@ -93,20 +95,7 @@ func getOnebotBotQQID(ctx *MsgContext) (int64, bool) {
 			return botID, true
 		}
 	}
-
-	switch pa := ctx.EndPoint.Adapter.(type) {
-	case *PlatformAdapterOnebot:
-		if pa.sendEmitter == nil {
-			return 0, false
-		}
-		info, err := pa.sendEmitter.GetLoginInfo(pa.ctx)
-		if err != nil || info == nil || info.UserId <= 0 {
-			return 0, false
-		}
-		return info.UserId, true
-	default:
-		return 0, false
-	}
+	return 0, false
 }
 
 func normalizeQQGroupRole(role string) string {
@@ -133,63 +122,39 @@ func parseQQGroupRole(role string) (string, bool) {
 }
 
 func checkBotGroupRole(ctx *MsgContext, groupID string) (string, bool) {
-	if ctx == nil || ctx.EndPoint == nil || ctx.EndPoint.Adapter == nil {
+	if ctx == nil || ctx.EndPoint == nil {
 		return "context invalid", false
 	}
 	const bypassCache = true
 
-	switch pa := ctx.EndPoint.Adapter.(type) {
-	case *PlatformAdapterOnebot:
-		if pa.sendEmitter == nil {
-			return "onebot emitter unavailable", false
-		}
-		botID, ok := getOnebotBotQQID(ctx)
-		if !ok {
-			return "cannot resolve bot qq id", false
-		}
-		memberInfo, err := pa.sendEmitter.GetGroupMemberInfo(pa.ctx, ExtractQQEmitterGroupID(groupID), botID, bypassCache)
-		if err != nil || memberInfo == nil {
+	// Adapters that still own a provider connection answer for themselves; an
+	// endpoint run by the supervisor has no adapter and is asked through the
+	// provider query port.
+	if ctx.EndPoint.Adapter != nil {
+		if resolver, ok := ctx.EndPoint.Adapter.(botGroupRoleResolver); ok {
+			role, err := resolver.botGroupRole(ctx, groupID, bypassCache)
 			if err != nil {
-				return fmt.Sprintf("get_group_member_info failed: %v", err), false
+				return err.Error(), false
 			}
-			return errGetGroupMemberInfoNil, false
+			return normalizedBotRole(role)
 		}
-		role, ok := parseQQGroupRole(memberInfo.Role)
-		if !ok {
-			return errGetGroupMemberInfoEmptyRole, false
-		}
-		return role, true
-	case *PlatformAdapterGocq:
-		botIDRaw := strings.TrimSpace(UserIDExtract(ctx.EndPoint.UserID))
-		groupIDRaw := strings.TrimSpace(UserIDExtract(groupID))
-		if botIDRaw == "" || groupIDRaw == "" {
-			return "cannot resolve bot/group id", false
-		}
-		memberInfo := pa.getGroupMemberInfo(groupIDRaw, botIDRaw, bypassCache)
-		if memberInfo == nil {
-			return errGetGroupMemberInfoNil, false
-		}
-		role, ok := parseQQGroupRole(memberInfo.Role)
-		if !ok {
-			return errGetGroupMemberInfoEmptyRole, false
-		}
-		return role, true
-	case *PlatformAdapterMilky:
-		memberInfo, err := pa.getGroupMemberInfo(groupID, ctx.EndPoint.UserID, bypassCache)
-		if err != nil {
-			return fmt.Sprintf("get_group_member_info failed: %v", err), false
-		}
-		if memberInfo == nil {
-			return errGetGroupMemberInfoNil, false
-		}
-		role, ok := parseQQGroupRole(memberInfo.Role)
-		if !ok {
-			return errGetGroupMemberInfoEmptyRole, false
-		}
-		return role, true
-	default:
+	}
+	if ctx.Dice == nil || ctx.Dice.ProviderQuery == nil {
 		return "adapter does not support group role check", false
 	}
+	role, err := queryBotGroupRole(ctx, groupID, bypassCache)
+	if err != nil {
+		return err.Error(), false
+	}
+	return normalizedBotRole(role)
+}
+
+func normalizedBotRole(role string) (string, bool) {
+	normalized, ok := parseQQGroupRole(role)
+	if !ok {
+		return errGetGroupMemberInfoEmptyRole, false
+	}
+	return normalized, true
 }
 
 func shouldDismissRequireOwnerConfirm(ctx *MsgContext, groupID string) (bool, bool, string) {
@@ -223,7 +188,64 @@ func isDismissConfirmCode(text string) bool {
 	return true
 }
 
+func prepareGroupQuitMembership(ctx *MsgContext, groupID string) (*preparedGroupMembershipRemoval, error) {
+	if ctx == nil || ctx.callbackTransaction == nil {
+		//nolint:nilnil // Outside a durable callback there is no membership mutation to stage.
+		return nil, nil
+	}
+	if ctx.Dice == nil || ctx.EndPoint == nil {
+		return nil, ErrDurableStateUnavailable
+	}
+	prepared, err := ctx.callbackTransaction.prepareGroupMembershipRemoval(
+		context.Background(),
+		ctx.Dice.BaseConfig.Name,
+		groupID,
+		ctx.EndPoint.UserID,
+		ctx.callbackMetadata,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &prepared, nil
+}
+
+func recordAcceptedGroupQuitMembership(ctx *MsgContext, groupID string, targetGroup *GroupInfo, prepared *preparedGroupMembershipRemoval) {
+	dice := ctx.Dice
+	session := ctx.Session
+	endpointID := ctx.EndPoint.UserID
+	apply := func() {
+		current := targetGroup
+		if session != nil && session.ServiceAtNew != nil {
+			if loaded, exists := session.ServiceAtNew.Load(groupID); exists && loaded != nil {
+				current = loaded
+			}
+		}
+		remove := func(group *GroupInfo) {
+			if group == nil || group.DiceIDExistsMap == nil {
+				return
+			}
+			group.DiceIDExistsMap.Delete(endpointID)
+			group.MarkDirty(dice)
+		}
+		remove(current)
+		if targetGroup != current {
+			remove(targetGroup)
+		}
+	}
+	if prepared != nil && ctx.callbackTransaction != nil {
+		ctx.callbackTransaction.stageGroupMembershipRemoval(*prepared, apply)
+		return
+	}
+	apply()
+}
+
 func (d *Dice) executeDismissOperation(ctx *MsgContext, msg *Message, targetGroupID string, targetGroup *GroupInfo) CmdExecuteResult {
+	membership, membershipErr := prepareGroupQuitMembership(ctx, targetGroupID)
+	if membershipErr != nil {
+		d.Logger.Errorf("退群状态准备失败: group=%s error=%v", targetGroupID, membershipErr)
+		ReplyToSender(ctx, msg, fmt.Sprintf("退群请求提交失败：%v", membershipErr))
+		return CmdExecuteResult{Matched: true, Solved: true}
+	}
 	ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰子退群预告"))
 
 	userName := ctx.Dice.Parent.TryGetUserName(msg.Sender.UserID)
@@ -238,12 +260,15 @@ func (d *Dice) executeDismissOperation(ctx *MsgContext, msg *Message, targetGrou
 	d.Logger.Info(txt)
 	ctx.Notice(txt, NoticeTypeGroup)
 
-	time.Sleep(3 * time.Second)
-	if targetGroup != nil {
-		targetGroup.DiceIDExistsMap.Delete(ctx.EndPoint.UserID)
-		targetGroup.MarkDirty(ctx.Dice)
+	if ctx.Dice.OutboundBridge == nil && ctx.EndPoint != nil && ctx.EndPoint.Adapter != nil && !isPureOnebotEndpoint(ctx.EndPoint) {
+		time.Sleep(3 * time.Second)
 	}
-	ctx.EndPoint.Adapter.QuitGroup(ctx, targetGroupID)
+	if err := QuitGroup(ctx, targetGroupID); err != nil {
+		d.Logger.Errorf("退群请求提交失败: group=%s error=%v", targetGroupID, err)
+		ReplyToSender(ctx, msg, fmt.Sprintf("退群请求提交失败：%v", err))
+		return CmdExecuteResult{Matched: true, Solved: true}
+	}
+	recordAcceptedGroupQuitMembership(ctx, targetGroupID, targetGroup, membership)
 
 	return CmdExecuteResult{Matched: true, Solved: true}
 }
@@ -357,7 +382,10 @@ func (d *Dice) registerCoreCommands() {
 				if reason == "" {
 					reason = "骰主指令"
 				}
-				(&d.Config).BanList.AddScoreBase(uid, (&d.Config).BanList.ThresholdBan, "骰主指令", reason, ctx)
+				if _, err := (&d.Config).BanList.AddScoreBaseWithError(uid, (&d.Config).BanList.ThresholdBan, "骰主指令", reason, ctx); err != nil {
+					ReplyToSender(ctx, msg, fmt.Sprintf("加入黑名单失败：%v", err))
+					break
+				}
 				ReplyToSender(ctx, msg, fmt.Sprintf("已将用户/群组 %s 加入黑名单，原因: %s", uid, reason))
 			case "rm", "del":
 				uid = getID()
@@ -371,9 +399,11 @@ func (d *Dice) registerCoreCommands() {
 					break
 				}
 
+				if err := (&d.Config).BanList.SetRankByID(d, uid, BanRankNormal, item.Name, "", ""); err != nil {
+					ReplyToSender(ctx, msg, fmt.Sprintf("移出名单失败：%v", err))
+					break
+				}
 				ReplyToSender(ctx, msg, fmt.Sprintf("已将用户/群组 %s 移出%s列表", uid, BanRankText[item.Rank]))
-				item.Score = 0
-				item.Rank = BanRankNormal
 			case "trust":
 				uid = cmdArgs.GetArgN(2)
 				if !strings.Contains(uid, ":") {
@@ -381,33 +411,33 @@ func (d *Dice) registerCoreCommands() {
 					return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 				}
 
-				(&d.Config).BanList.SetTrustByID(uid, "骰主指令", "骰主指令")
+				if err := (&d.Config).BanList.SetTrustByIDWithError(uid, "骰主指令", "骰主指令"); err != nil {
+					ReplyToSender(ctx, msg, fmt.Sprintf("加入信任列表失败：%v", err))
+					break
+				}
 				ReplyToSender(ctx, msg, fmt.Sprintf("已将用户/群组 %s 加入信任列表", uid))
 			case "list", "show":
 				// ban/warn/trust
-				var extra, text string
+				var extra string
+				var text strings.Builder
 
 				extra = cmdArgs.GetArgN(2)
-				(&d.Config).BanList.Map.Range(func(k string, v *BanListInfoItem) bool {
+				for _, v := range (&d.Config).BanList.Snapshot() {
 					if v.Rank == BanRankNormal {
-						return true
+						continue
 					}
-
 					match := (extra == "trust" && v.Rank == BanRankTrusted) ||
 						(extra == "ban" && v.Rank == BanRankBanned) ||
 						(extra == "warn" && v.Rank == BanRankWarn)
 					if extra == "" || match {
-						text += v.toText(d) + "\n"
+						text.WriteString(v.toText(d))
+						text.WriteByte('\n')
 					}
-					return true
-				})
-
-				if text == "" {
-					text = "当前名单:\n<无内容>"
-				} else {
-					text = "当前名单:\n" + text
 				}
-				ReplyToSender(ctx, msg, text)
+				if text.Len() == 0 {
+					text.WriteString("<无内容>")
+				}
+				ReplyToSender(ctx, msg, "当前名单:\n"+text.String())
 			case "query":
 				var targetID = cmdArgs.GetArgN(2)
 				if targetID == "" {
@@ -415,7 +445,7 @@ func (d *Dice) registerCoreCommands() {
 					break
 				}
 
-				v, exists := (&d.Config).BanList.Map.Load(targetID)
+				v, exists := (&d.Config).BanList.GetByID(targetID)
 				if !exists {
 					ReplyToSender(ctx, msg, fmt.Sprintf("所查询的<%s>情况：正常(0)", targetID))
 					break
@@ -471,212 +501,230 @@ func (d *Dice) registerCoreCommands() {
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 			}
 
-			if d.Parent.IsHelpReloading {
+			if d.Parent.IsHelpDocLoading() {
 				ReplyToSender(ctx, msg, "帮助文档正在重新装载，请稍后...")
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
 
-			if _config := cmdArgs.GetArgN(1); _config == "config" {
-				oldDefault := ctx.Group.DefaultHelpGroup
-				if cmdArgs.GetKwarg("groupclr") != nil {
-					ctx.Group.SetDefaultHelpGroup("")
-					if oldDefault != "" {
-						ReplyToSender(ctx, msg, "已清空默认搜索分组，原分组为"+oldDefault)
-					} else {
-						ReplyToSender(ctx, msg, "未指定默认搜索分组")
-					}
-				} else if _defaultGroup := cmdArgs.GetKwarg("group"); _defaultGroup != nil {
-					defaultGroup := _defaultGroup.Value
-					if defaultGroup == "" {
-						// 为查看默认分组
+			var commandReply string
+			var showHelp bool
+			err := d.Parent.WithHelpDocManagerRead(func(help *HelpManager) error {
+				if help == nil {
+					return errors.New("help manager is unavailable")
+				}
+
+				if _config := cmdArgs.GetArgN(1); _config == "config" {
+					oldDefault := ctx.Group.DefaultHelpGroup
+					if cmdArgs.GetKwarg("groupclr") != nil {
+						ctx.Group.SetDefaultHelpGroup("")
 						if oldDefault != "" {
-							ReplyToSender(ctx, msg, "当前默认搜索分组为"+oldDefault)
+							commandReply = "已清空默认搜索分组，原分组为" + oldDefault
 						} else {
-							ReplyToSender(ctx, msg, "未指定默认搜索分组")
+							commandReply = "未指定默认搜索分组"
+						}
+					} else if _defaultGroup := cmdArgs.GetKwarg("group"); _defaultGroup != nil {
+						defaultGroup := _defaultGroup.Value
+						if defaultGroup == "" {
+							// 为查看默认分组
+							if oldDefault != "" {
+								commandReply = "当前默认搜索分组为" + oldDefault
+							} else {
+								commandReply = "未指定默认搜索分组"
+							}
+						} else {
+							// 为设置默认分组
+							// 修复别名查询问题：在设置默认分组时，需要将别名转换为原名
+							// 这样确保存储的始终是原名，避免后续查询时出现别名无法识别的问题
+							realGroup := defaultGroup
+							if _g, ok := help.GroupAliases[defaultGroup]; ok {
+								// 如果输入的是别名，转换为对应的原名
+								realGroup = _g
+							}
+							// 使用转换后的原名设置默认分组
+							ctx.Group.SetDefaultHelpGroup(realGroup)
+							if oldDefault != "" {
+								commandReply = fmt.Sprintf("默认搜索分组由%s切换到%s", oldDefault, defaultGroup)
+							} else {
+								commandReply = "指定默认搜索分组为" + defaultGroup
+							}
 						}
 					} else {
-						// 为设置默认分组
-						// 修复别名查询问题：在设置默认分组时，需要将别名转换为原名
-						// 这样确保存储的始终是原名，避免后续查询时出现别名无法识别的问题
-						realGroup := defaultGroup
-						if _g, ok := d.Parent.Help.GroupAliases[defaultGroup]; ok {
-							// 如果输入的是别名，转换为对应的原名
-							realGroup = _g
-						}
-						// 使用转换后的原名设置默认分组
-						ctx.Group.SetDefaultHelpGroup(realGroup)
-						if oldDefault != "" {
-							ReplyToSender(ctx, msg, fmt.Sprintf("默认搜索分组由%s切换到%s", oldDefault, defaultGroup))
-						} else {
-							ReplyToSender(ctx, msg, "指定默认搜索分组为"+defaultGroup)
-						}
+						commandReply = "设置选项有误"
+						return nil
 					}
-				} else {
-					ReplyToSender(ctx, msg, "设置选项有误")
-					return CmdExecuteResult{Matched: true, Solved: true}
+					return nil
 				}
-				return CmdExecuteResult{Matched: true, Solved: true}
-			}
 
-			var (
-				useGroupSearch bool
-				group          string
-				text           = cmdArgs.CleanArgs
-			)
-			if rawGroup := cmdArgs.GetArgN(1); strings.HasPrefix(rawGroup, "#") {
-				useGroupSearch = true
-				fakeGroup := strings.TrimPrefix(rawGroup, "#")
-				text = strings.TrimPrefix(text, rawGroup+" ")
+				var (
+					useGroupSearch bool
+					group          string
+					text           = cmdArgs.CleanArgs
+				)
+				if rawGroup := cmdArgs.GetArgN(1); strings.HasPrefix(rawGroup, "#") {
+					useGroupSearch = true
+					fakeGroup := strings.TrimPrefix(rawGroup, "#")
+					text = strings.TrimPrefix(text, rawGroup+" ")
 
-				// 转换 group 别名
-				if _g, ok := d.Parent.Help.GroupAliases[fakeGroup]; ok {
-					group = _g
-				} else {
-					group = fakeGroup
-				}
-			}
-			var groupStr string
-			if group != "" {
-				groupStr = "[搜索分组" + group + "]"
-			}
-
-			var id string
-			if cmdArgs.GetKwarg("rand") != nil || cmdArgs.GetKwarg("随机") != nil {
-				// FIXME: byd WHAT IS THAT
-				if count := int(d.Parent.Help.CurID); count > 0 {
-					id = strconv.Itoa(ctx.RandIntn(count) + 1)
-				}
-			}
-
-			if id == "" {
-				var _id string
-				if useGroupSearch {
-					_id = cmdArgs.GetArgN(2)
-				} else {
-					_id = cmdArgs.GetArgN(1)
-				}
-				if _id != "" {
-					_, err2 := strconv.ParseInt(_id, 10, 64)
-					if err2 == nil {
-						id = _id
+					// 转换 group 别名
+					if _g, ok := help.GroupAliases[fakeGroup]; ok {
+						group = _g
+					} else {
+						group = fakeGroup
 					}
 				}
-			}
+				var groupStr string
+				if group != "" {
+					groupStr = "[搜索分组" + group + "]"
+				}
 
-			if id != "" {
-				text, err := d.Parent.Help.GetItemByNumericIDString(id)
-				if err == nil {
+				var id string
+				if cmdArgs.GetKwarg("rand") != nil || cmdArgs.GetKwarg("随机") != nil {
+					// FIXME: byd WHAT IS THAT
+					if count := int(help.CurID); count > 0 {
+						id = strconv.Itoa(ctx.RandIntn(count) + 1)
+					}
+				}
+
+				if id == "" {
+					var _id string
+					if useGroupSearch {
+						_id = cmdArgs.GetArgN(2)
+					} else {
+						_id = cmdArgs.GetArgN(1)
+					}
+					if _id != "" {
+						_, err2 := strconv.ParseInt(_id, 10, 64)
+						if err2 == nil {
+							id = _id
+						}
+					}
+				}
+
+				if id != "" {
+					text, err := help.GetItemByNumericIDString(id)
+					if err == nil {
+						// Copied from 支援换行符 By Fripine #963
+						text.Content = ctx.TranslateSplit(text.Content)
+						content := help.GetContent(text, 0)
+						commandReply = fmt.Sprintf("词条: %s:%s\n%s", text.PackageName, text.Title, content)
+					} else {
+						commandReply = "未发现对应ID的词条"
+					}
+					return nil
+				}
+
+				{ // 判断是否关键字缺失
+					var val string
+					if useGroupSearch {
+						val = cmdArgs.GetArgN(2)
+					} else {
+						val = cmdArgs.GetArgN(1)
+					}
+					if val == "" {
+						showHelp = true
+						return nil
+					}
+				}
+
+				numLimit := 4
+				numParam := cmdArgs.GetKwarg("num")
+				if numParam != nil {
+					_num, err := strconv.ParseInt(numParam.Value, 10, 64)
+					if err == nil {
+						numLimit = int(_num)
+					}
+				}
+
+				page := 1
+				pageParam := cmdArgs.GetKwarg("page")
+				if pageParam != nil {
+					if _page, err := strconv.ParseInt(pageParam.Value, 10, 64); err == nil {
+						page = int(_page)
+					}
+				}
+
+				if numLimit <= 0 {
+					numLimit = 1
+				} else if numLimit > 10 {
+					numLimit = 10
+				}
+				if page <= 0 {
+					page = 1
+				}
+				if group == "" {
+					// 未指定搜索分组时，取当前群指定的分组
+					group = ctx.Group.DefaultHelpGroup
+				}
+				// 进行结果搜索
+				search, total, pgStart, pgEnd, err := help.Search(ctx, text, false, numLimit, page, group)
+				if err != nil {
+					commandReply = groupStr + "搜索故障: " + err.Error()
+					//nolint:nilerr // The search error has been converted to the command's user-visible reply.
+					return nil
+				}
+				if len(search.Hits) == 0 {
+					if total == 0 {
+						commandReply = groupStr + "未找到搜索结果"
+					} else {
+						commandReply = fmt.Sprintf("%s找到%d条结果, 但在当前页码并无结果", groupStr, total)
+					}
+					return nil
+				}
+
+				// 准备接下来读取这里面的Fields
+				bestRaw := search.Hits[0].Fields
+				best := &docengine.HelpTextItem{
+					Group:       fmt.Sprintf("%v", bestRaw["group"]),
+					From:        fmt.Sprintf("%v", bestRaw["from"]),
+					Title:       fmt.Sprintf("%v", bestRaw["title"]),
+					Content:     fmt.Sprintf("%v", bestRaw["content"]),
+					PackageName: fmt.Sprintf("%v", bestRaw["package"]),
+					// 这俩是什么东西？！
+					// KeyWords:   "",
+					// RelatedExt: nil,
+				}
+				var others strings.Builder
+
+				for _, i := range search.Hits {
+					t := &docengine.HelpTextItem{
+						Group:       fmt.Sprintf("%v", i.Fields["group"]),
+						Title:       fmt.Sprintf("%v", i.Fields["title"]),
+						PackageName: fmt.Sprintf("%v", i.Fields["package"]),
+					}
+					if t.Group != "" && t.Group != HelpBuiltinGroup {
+						fmt.Fprintf(&others, "[%s][%s]【%s:%s】 匹配度%.2f\n", i.ID, t.Group, t.PackageName, t.Title, i.Score)
+					} else {
+						fmt.Fprintf(&others, "[%s]【%s:%s】 匹配度%.2f\n", i.ID, t.PackageName, t.Title, i.Score)
+					}
+				}
+
+				showBest := shouldShowBestHelpResult(search.Hits, text != "" && best.Title == text, help.GetShowBestRelativeGap())
+
+				var bestResult string
+				if showBest {
 					// Copied from 支援换行符 By Fripine #963
-					text.Content = ctx.TranslateSplit(text.Content)
-					content := d.Parent.Help.GetContent(text, 0)
-					ReplyToSender(ctx, msg, fmt.Sprintf("词条: %s:%s\n%s", text.PackageName, text.Title, content))
-				} else {
-					ReplyToSender(ctx, msg, "未发现对应ID的词条")
+					best.Content = ctx.TranslateSplit(best.Content)
+					content := help.GetContent(best, 0)
+					bestResult = fmt.Sprintf("最优先结果%s:\n词条: %s:%s\n%s\n\n", groupStr, best.PackageName, best.Title, content)
 				}
-				return CmdExecuteResult{Matched: true, Solved: true}
-			}
 
-			{ // 判断是否关键字缺失
-				var val string
-				if useGroupSearch {
-					val = cmdArgs.GetArgN(2)
-				} else {
-					val = cmdArgs.GetArgN(1)
-				}
-				if val == "" {
-					return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
-				}
-			}
-
-			numLimit := 4
-			numParam := cmdArgs.GetKwarg("num")
-			if numParam != nil {
-				_num, err := strconv.ParseInt(numParam.Value, 10, 64)
-				if err == nil {
-					numLimit = int(_num)
-				}
-			}
-
-			page := 1
-			pageParam := cmdArgs.GetKwarg("page")
-			if pageParam != nil {
-				if _page, err := strconv.ParseInt(pageParam.Value, 10, 64); err == nil {
-					page = int(_page)
-				}
-			}
-
-			if numLimit <= 0 {
-				numLimit = 1
-			} else if numLimit > 10 {
-				numLimit = 10
-			}
-			if page <= 0 {
-				page = 1
-			}
-			if group == "" {
-				// 未指定搜索分组时，取当前群指定的分组
-				group = ctx.Group.DefaultHelpGroup
-			}
-			// 进行结果搜索
-			search, total, pgStart, pgEnd, err := d.Parent.Help.Search(ctx, text, false, numLimit, page, group)
+				prefix := help.GetPrefixText()
+				rplCurPage := fmt.Sprintf("本页结果:\n%s\n", others.String())
+				rplDetailHint := "使用\".find <序号>\"可查看明细，如.find 123\n"
+				// pgStart是下标闭左边界, 加1以获得序号; pgEnd是下标开右边界, 无需调整就是最后一条的序号
+				rplPageNum := fmt.Sprintf("共%d条结果, 当前显示第%d页(第%d条 到 第%d条)\n", total, page, pgStart+1, pgEnd)
+				rplPageHint := "使用\".find <词条> --page=<页码> 查看更多结果\n"
+				commandReply = prefix + groupStr + bestResult + rplCurPage + rplDetailHint + rplPageNum + rplPageHint
+				return nil
+			})
 			if err != nil {
-				ReplyToSender(ctx, msg, groupStr+"搜索故障: "+err.Error())
+				ReplyToSender(ctx, msg, "搜索故障: "+err.Error())
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
-			if len(search.Hits) == 0 {
-				if total == 0 {
-					ReplyToSender(ctx, msg, groupStr+"未找到搜索结果")
-				} else {
-					ReplyToSender(ctx, msg, fmt.Sprintf("%s找到%d条结果, 但在当前页码并无结果", groupStr, total))
-				}
-				return CmdExecuteResult{Matched: true, Solved: true}
+			if commandReply != "" {
+				ReplyToSender(ctx, msg, commandReply)
 			}
-
-			// 准备接下来读取这里面的Fields
-			bestRaw := search.Hits[0].Fields
-			best := &docengine.HelpTextItem{
-				Group:       fmt.Sprintf("%v", bestRaw["group"]),
-				From:        fmt.Sprintf("%v", bestRaw["from"]),
-				Title:       fmt.Sprintf("%v", bestRaw["title"]),
-				Content:     fmt.Sprintf("%v", bestRaw["content"]),
-				PackageName: fmt.Sprintf("%v", bestRaw["package"]),
-				// 这俩是什么东西？！
-				// KeyWords:   "",
-				// RelatedExt: nil,
-			}
-			var others strings.Builder
-
-			for _, i := range search.Hits {
-				t := &docengine.HelpTextItem{
-					Group:       fmt.Sprintf("%v", i.Fields["group"]),
-					Title:       fmt.Sprintf("%v", i.Fields["title"]),
-					PackageName: fmt.Sprintf("%v", i.Fields["package"]),
-				}
-				if t.Group != "" && t.Group != HelpBuiltinGroup {
-					fmt.Fprintf(&others, "[%s][%s]【%s:%s】 匹配度%.2f\n", i.ID, t.Group, t.PackageName, t.Title, i.Score)
-				} else {
-					fmt.Fprintf(&others, "[%s]【%s:%s】 匹配度%.2f\n", i.ID, t.PackageName, t.Title, i.Score)
-				}
-			}
-
-			showBest := shouldShowBestHelpResult(search.Hits, text != "" && best.Title == text, d.Parent.Help.GetShowBestRelativeGap())
-
-			var bestResult string
-			if showBest {
-				// Copied from 支援换行符 By Fripine #963
-				best.Content = ctx.TranslateSplit(best.Content)
-				content := d.Parent.Help.GetContent(best, 0)
-				bestResult = fmt.Sprintf("最优先结果%s:\n词条: %s:%s\n%s\n\n", groupStr, best.PackageName, best.Title, content)
-			}
-
-			prefix := d.Parent.Help.GetPrefixText()
-			rplCurPage := fmt.Sprintf("本页结果:\n%s\n", others.String())
-			rplDetailHint := "使用\".find <序号>\"可查看明细，如.find 123\n"
-			// pgStart是下标闭左边界, 加1以获得序号; pgEnd是下标开右边界, 无需调整就是最后一条的序号
-			rplPageNum := fmt.Sprintf("共%d条结果, 当前显示第%d页(第%d条 到 第%d条)\n", total, page, pgStart+1, pgEnd)
-			rplPageHint := "使用\".find <词条> --page=<页码> 查看更多结果\n"
-			ReplyToSender(ctx, msg, prefix+groupStr+bestResult+rplCurPage+rplDetailHint+rplPageNum+rplPageHint)
-			return CmdExecuteResult{Matched: true, Solved: true}
+			return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: showHelp}
 		},
 	}
 	d.CmdMap["查询"] = cmdFind
@@ -712,7 +760,7 @@ func (d *Dice) registerCoreCommands() {
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 
-					if !dm.IsHelpReloading {
+					if !dm.IsHelpReloading.Load() {
 						if err := dm.ReloadHelp(); err != nil {
 							ReplyToSender(ctx, msg, "帮助文档重载失败: "+err.Error())
 						} else {
@@ -758,33 +806,45 @@ func (d *Dice) registerCoreCommands() {
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
 
-			if d.Parent.IsHelpReloading {
+			if d.Parent.IsHelpDocLoading() {
 				ReplyToSender(ctx, msg, "帮助文档正在重新装载，请稍后...")
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
 
-			search, _, _, _, err := d.Parent.Help.Search(ctx, cmdArgs.CleanArgs, true, 1, 1, "")
-			if err == nil {
-				if len(search.Hits) > 0 {
-					a := &docengine.HelpTextItem{
-						Group: fmt.Sprintf("%v", search.Hits[0].Fields["group"]),
-						From:  fmt.Sprintf("%v", search.Hits[0].Fields["from"]),
-						Title: fmt.Sprintf("%v", search.Hits[0].Fields["title"]),
-						// Edited. Original change from 支援换行符 By Fripine #963
-						Content:     ctx.TranslateSplit(fmt.Sprintf("%v", search.Hits[0].Fields["content"])),
-						PackageName: fmt.Sprintf("%v", search.Hits[0].Fields["package"]),
-						// 这俩是什么东西？！
-						KeyWords:   "",
-						RelatedExt: nil,
-					}
-					content := d.Parent.Help.GetContent(a, 0)
-					ReplyToSender(ctx, msg, fmt.Sprintf("%s:%s\n%s", a.PackageName, a.Title, content))
-				} else {
-					ReplyToSender(ctx, msg, "未找到搜索结果")
+			var helpReply string
+			err := d.Parent.WithHelpDocManagerRead(func(help *HelpManager) error {
+				if help == nil {
+					return errors.New("help manager is unavailable")
 				}
-			} else {
-				ReplyToSender(ctx, msg, "搜索故障: "+err.Error())
+				search, _, _, _, err := help.Search(ctx, cmdArgs.CleanArgs, true, 1, 1, "")
+				if err != nil {
+					helpReply = "搜索故障: " + err.Error()
+					//nolint:nilerr // The search error has been converted to the command's user-visible reply.
+					return nil
+				}
+				if len(search.Hits) == 0 {
+					helpReply = "未找到搜索结果"
+					return nil
+				}
+				a := &docengine.HelpTextItem{
+					Group: fmt.Sprintf("%v", search.Hits[0].Fields["group"]),
+					From:  fmt.Sprintf("%v", search.Hits[0].Fields["from"]),
+					Title: fmt.Sprintf("%v", search.Hits[0].Fields["title"]),
+					// Edited. Original change from 支援换行符 By Fripine #963
+					Content:     ctx.TranslateSplit(fmt.Sprintf("%v", search.Hits[0].Fields["content"])),
+					PackageName: fmt.Sprintf("%v", search.Hits[0].Fields["package"]),
+					// 这俩是什么东西？！
+					KeyWords:   "",
+					RelatedExt: nil,
+				}
+				content := help.GetContent(a, 0)
+				helpReply = fmt.Sprintf("%s:%s\n%s", a.PackageName, a.Title, content)
+				return nil
+			})
+			if err != nil {
+				helpReply = "搜索故障: " + err.Error()
 			}
+			ReplyToSender(ctx, msg, helpReply)
 			return CmdExecuteResult{Matched: true, Solved: true}
 		},
 	}
@@ -1227,12 +1287,15 @@ func (d *Dice) registerCoreCommands() {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 
-				doRelogin := func() {
+				endpointID := ctx.EndPoint.ID
+				doRelogin := func(reply func(text string)) {
 					reloginLastTime = time.Now().Unix()
-					ReplyToSender(ctx, msg, "开始执行重新登录")
+					reply("开始执行重新登录")
 					reloginFlag = false
 					time.Sleep(1 * time.Second)
-					ctx.EndPoint.Adapter.DoRelogin()
+					if err := d.ReloginEndpoint(context.Background(), endpointID); err != nil {
+						d.Logger.Errorf("重新登录 endpoint 失败: %v", err)
+					}
 				}
 
 				if time.Now().Unix()-reloginLastTime < 5*60 {
@@ -1248,17 +1311,20 @@ func (d *Dice) registerCoreCommands() {
 				}
 
 				if kw = cmdArgs.GetKwarg("now"); kw != nil {
-					doRelogin()
+					doRelogin(func(text string) { ReplyToSender(ctx, msg, text) })
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 
 				reloginFlag = true
 				ReplyToSender(ctx, msg, "将在30s后重新登录，期间可以输入.master relogin --cancel解除\n若遭遇风控，可能会没有任何输出。静等或输入.master relogin --now立即执行\n此指令每5分钟只能执行一次，可能解除风控，也可能使骰子失联。后果自负")
 
+				// The delayed run happens after this command returned and released its
+				// context, so its report goes through a detached reply.
+				reply := ctx.detachReply(msg)
 				go func() {
 					time.Sleep(30 * time.Second)
 					if reloginFlag {
-						doRelogin()
+						doRelogin(reply)
 					}
 				}()
 			case "backup":
@@ -1327,27 +1393,32 @@ func (d *Dice) registerCoreCommands() {
 				}
 
 				ReplyToSender(ctx, msg, "开始下载新版本，完成后将自动进行一次备份")
+				// The download finishes long after this command returned and released
+				// its context, so the goroutine keeps only stable references and
+				// reports through a detached reply.
+				reply := ctx.detachReply(msg)
+				upgradeWindowID := msg.Sender.UserID
+				if !ctx.IsPrivate {
+					upgradeWindowID = ctx.Group.GroupID
+				}
+				upgradeEndpointID := ctx.EndPoint.ID
 				go func() {
 					ret := <-dm.UpdateDownloadedChan
 
-					if ctx.IsPrivate {
-						ctx.Dice.Config.UpgradeWindowID = msg.Sender.UserID
-					} else {
-						ctx.Dice.Config.UpgradeWindowID = ctx.Group.GroupID
-					}
-					ctx.Dice.Config.UpgradeEndpointID = ctx.EndPoint.ID
-					ctx.Dice.Save(true)
+					d.Config.UpgradeWindowID = upgradeWindowID
+					d.Config.UpgradeEndpointID = upgradeEndpointID
+					d.Save(true)
 
-					bakFn, _ := ctx.Dice.Parent.Backup(BackupSelectionAll, false)
+					bakFn, _ := dm.Backup(BackupSelectionAll, false)
 					tmpPath := path.Join(os.TempDir(), bakFn)
 					_ = os.MkdirAll(tmpPath, 0755)
-					ctx.Dice.Logger.Infof("将备份文件复制到此路径: %s", tmpPath)
+					d.Logger.Infof("将备份文件复制到此路径: %s", tmpPath)
 					_ = cp.Copy(path.Join(BackupDir, bakFn), tmpPath)
 
 					if ret == "" {
-						ReplyToSender(ctx, msg, "准备开始升级，服务即将离线")
+						reply("准备开始升级，服务即将离线")
 					} else {
-						ReplyToSender(ctx, msg, "升级失败，原因: "+ret)
+						reply("升级失败，原因: " + ret)
 					}
 				}()
 				dm.UpdateRequestChan <- d
@@ -1403,7 +1474,7 @@ func (d *Dice) registerCoreCommands() {
 					ReplyToSender(ctx, msg, "js已重载")
 				case "help", "helpdoc":
 					dm := dice.Parent
-					if !dm.IsHelpReloading {
+					if !dm.IsHelpReloading.Load() {
 						if err := dm.ReloadHelp(); err != nil {
 							ReplyToSender(ctx, msg, "帮助文档重载失败: "+err.Error())
 						} else {
@@ -1443,21 +1514,28 @@ func (d *Dice) registerCoreCommands() {
 					txt += fmt.Sprintf("原因: %s", wherefore)
 				}
 
-				ReplyGroup(ctx, &Message{GroupID: gp.GroupID}, txt)
-
-				mctx := &MsgContext{
-					MessageType: "group",
-					Group:       gp,
-					EndPoint:    ctx.EndPoint,
-					Session:     ctx.Session,
-					Dice:        ctx.Dice,
-					IsPrivate:   false,
+				mctx := ctx.ShallowCopy()
+				mctx.MessageType = "group"
+				mctx.Group = gp
+				mctx.Player = nil
+				mctx.IsPrivate = false
+				membership, membershipErr := prepareGroupQuitMembership(mctx, gp.GroupID)
+				if membershipErr != nil {
+					d.Logger.Errorf("骰主退群状态准备失败: group=%s error=%v", gp.GroupID, membershipErr)
+					ReplyToSender(ctx, msg, fmt.Sprintf("退群请求提交失败：%v", membershipErr))
+					return CmdExecuteResult{Matched: true, Solved: true}
 				}
+				ReplyGroup(mctx, &Message{GroupID: gp.GroupID}, txt)
 				// SetBotOffAtGroup(mctx, gp.GroupID)
-				time.Sleep(3 * time.Second)
-				gp.DiceIDExistsMap.Delete(mctx.EndPoint.UserID)
-				gp.MarkDirty(mctx.Dice)
-				mctx.EndPoint.Adapter.QuitGroup(mctx, gp.GroupID)
+				if mctx.Dice.OutboundBridge == nil && mctx.EndPoint != nil && mctx.EndPoint.Adapter != nil && !isPureOnebotEndpoint(mctx.EndPoint) {
+					time.Sleep(3 * time.Second)
+				}
+				if err := QuitGroup(mctx, gp.GroupID); err != nil {
+					d.Logger.Errorf("骰主退群请求提交失败: group=%s error=%v", gp.GroupID, err)
+					ReplyToSender(ctx, msg, fmt.Sprintf("退群请求提交失败：%v", err))
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
+				recordAcceptedGroupQuitMembership(mctx, gp.GroupID, gp, membership)
 
 				return CmdExecuteResult{Matched: true, Solved: true}
 			case "jsclear":
@@ -2036,7 +2114,7 @@ func (d *Dice) registerCoreCommands() {
 					text := fmt.Sprintf("> [%s] 版本%s 作者%s\n", i.Name, i.Version, i.Author)
 					i.callWithJsCheck(d, func() {
 						ReplyToSender(ctx, msg, text+i.GetDescText(i))
-					})
+					}, jsCallbackDispatch{kind: jsCallbackCommand, message: ctx})
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 			}
@@ -2064,7 +2142,6 @@ func (d *Dice) registerCoreCommands() {
 				VarSetValueStr(ctx, "$t旧昵称", fmt.Sprintf("<%s>", ctx.Player.Name))
 				VarSetValueStr(ctx, "$t旧昵称_RAW", ctx.Player.Name)
 				p.Name = msg.Sender.Nickname
-				p.UpdatedAtTime = time.Now().Unix()
 				if ctx.Group != nil {
 					ctx.Group.MarkDirty(ctx.Dice)
 				}
@@ -2080,7 +2157,6 @@ func (d *Dice) registerCoreCommands() {
 				VarSetValueStr(ctx, "$t旧昵称_RAW", ctx.Player.Name)
 
 				p.Name = cmdArgs.Args[0]
-				p.UpdatedAtTime = time.Now().Unix()
 				if ctx.Group != nil {
 					ctx.Group.MarkDirty(ctx.Dice)
 				}
@@ -2293,7 +2369,6 @@ func (d *Dice) registerCoreCommands() {
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:设定默认群组骰子面数")+tipText)
 				} else {
 					p.DiceSideNum = int(num)
-					p.UpdatedAtTime = time.Now().Unix()
 					if ctx.Group != nil {
 						ctx.Group.MarkDirty(ctx.Dice)
 					}
@@ -2309,7 +2384,6 @@ func (d *Dice) registerCoreCommands() {
 						ctx.Group.MarkDirty(ctx.Dice)
 					} else {
 						p.DiceSideNum = 0
-						p.UpdatedAtTime = time.Now().Unix()
 						if ctx.Group != nil {
 							ctx.Group.MarkDirty(ctx.Dice)
 						}
@@ -2389,13 +2463,12 @@ func (d *Dice) registerCoreCommands() {
 			}
 
 			getBindingId := func() string {
-				id, _ := am.CharGetBindingId(ctx.Group.GroupID, ctx.Player.UserID)
+				id, _ := am.CharGetBindingIdForCtx(ctx, ctx.Group.GroupID, ctx.Player.UserID)
 				return id
 			}
 
 			setCurPlayerName := func(name string) {
 				ctx.Player.Name = name
-				ctx.Player.UpdatedAtTime = time.Now().Unix()
 				if ctx.Group != nil {
 					ctx.Group.MarkDirty(ctx.Dice)
 				}
@@ -2440,8 +2513,8 @@ func (d *Dice) registerCoreCommands() {
 
 				VarSetValueStr(ctx, "$t角色名", name)
 				if !am.CharCheckExists(ctx.Player.UserID, name) {
-					item := lo.Must(am.CharNew(ctx.Player.UserID, name, ctx.Group.System))
-					lo.Must0(am.CharBind(item.Id, ctx.Group.GroupID, ctx.Player.UserID))
+					item := lo.Must(am.CharNewForCtx(ctx, ctx.Player.UserID, name, ctx.Group.System))
+					lo.Must0(am.CharBindForCtx(ctx, item.Id, ctx.Group.GroupID, ctx.Player.UserID))
 					setCurPlayerName(name) // 修改当前角色名
 
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_新建"))
@@ -2468,14 +2541,14 @@ func (d *Dice) registerCoreCommands() {
 				if a != "" && b != "" {
 					if charId != "" {
 						if !am.CharCheckExists(ctx.Player.UserID, b) {
-							attrs := lo.Must(am.LoadById(charId))
+							attrs := lo.Must(am.LoadByIdForCtx(ctx, charId))
 							attrs.Name = b
 							if charId == getBindingId() {
 								// 如果是当前绑定的ID，连名字一起改
 								setCurPlayerName(b)
 							}
 							attrs.LastModifiedTime = time.Now().Unix()
-							attrs.SaveToDB(am.db) // 直接保存
+							lo.Must0(am.SaveForCtx(ctx, attrs))
 							ReplyToSender(ctx, msg, "操作完成")
 						} else {
 							ReplyToSender(ctx, msg, "此角色名已存在")
@@ -2497,7 +2570,7 @@ func (d *Dice) registerCoreCommands() {
 					if charId == "" {
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_绑定_失败"))
 					} else {
-						lo.Must0(am.CharBind(charId, ctx.Group.GroupID, ctx.Player.UserID))
+						lo.Must0(am.CharBindForCtx(ctx, charId, ctx.Group.GroupID, ctx.Player.UserID))
 						setCurPlayerName(name)
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_绑定_成功"))
 					}
@@ -2507,8 +2580,8 @@ func (d *Dice) registerCoreCommands() {
 					if charId == "" {
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_绑定_并未绑定"))
 					} else {
-						lo.Must0(am.CharBind("", ctx.Group.GroupID, ctx.Player.UserID))
-						attrs := lo.Must(am.LoadById(charId))
+						lo.Must0(am.CharBindForCtx(ctx, "", ctx.Group.GroupID, ctx.Player.UserID))
+						attrs := lo.Must(am.LoadByIdForCtx(ctx, charId))
 
 						name := attrs.Name
 						setCurPlayerName(name)
@@ -2525,13 +2598,13 @@ func (d *Dice) registerCoreCommands() {
 				VarSetValueStr(ctx, "$t角色名", name)
 
 				charId := lo.Must(am.CharIdGetByName(ctx.Player.UserID, name))
-				attrsCur := lo.Must(d.AttrsManager.Load(ctx.Group.GroupID, ctx.Player.UserID))
+				attrsCur := lo.Must(d.AttrsManager.LoadByCtx(ctx))
 
 				if attrsCur == nil {
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_角色不存在"))
 					// ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_序列化失败"))
 				} else {
-					attrs := lo.Must(am.LoadById(charId))
+					attrs := lo.Must(am.LoadByIdForCtx(ctx, charId))
 
 					attrsCur.Clear()
 					attrs.Range(func(key string, value *ds.VMValue) bool {
@@ -2553,11 +2626,11 @@ func (d *Dice) registerCoreCommands() {
 				name := getNickname()
 
 				if !am.CharCheckExists(ctx.Player.UserID, name) {
-					newItem, _ := am.CharNew(ctx.Player.UserID, name, ctx.Group.System)
-					attrs := lo.Must(am.Load(ctx.Group.GroupID, ctx.Player.UserID))
+					newItem, _ := am.CharNewForCtx(ctx, ctx.Player.UserID, name, ctx.Group.System)
+					attrs := lo.Must(am.LoadByCtx(ctx))
 
 					if newItem != nil {
-						attrsNew, err := am.LoadById(newItem.Id)
+						attrsNew, err := am.LoadByIdForCtx(ctx, newItem.Id)
 						if err != nil {
 							// ReplyToSender(ctx, msg, fmt.Sprintf("错误: %s\n", err.Error()))
 							ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_序列化失败"))
@@ -2589,8 +2662,8 @@ func (d *Dice) registerCoreCommands() {
 
 					bindingGroups := am.CharGetBindingGroupIdList(charId)
 					if len(bindingGroups) == 0 {
-						attrs := lo.Must(am.Load(ctx.Group.GroupID, ctx.Player.UserID))
-						attrsExisting := lo.Must(am.LoadById(charId))
+						attrs := lo.Must(am.LoadByCtx(ctx))
+						attrsExisting := lo.Must(am.LoadByIdForCtx(ctx, charId))
 
 						attrsExisting.Clear()
 						attrs.Range(func(key string, value *ds.VMValue) bool {
@@ -2617,13 +2690,12 @@ func (d *Dice) registerCoreCommands() {
 
 				var lst []string
 				if charId != "" {
-					lst = am.CharUnbindAll(charId)
+					lst = am.CharUnbindAllForCtx(ctx, charId)
 				}
 
 				for _, i := range lst {
 					if i == ctx.Group.GroupID {
 						ctx.Player.Name = msg.Sender.Nickname
-						ctx.Player.UpdatedAtTime = time.Now().Unix()
 						if ctx.Group != nil {
 							ctx.Group.MarkDirty(ctx.Dice)
 						}
@@ -2661,7 +2733,7 @@ func (d *Dice) registerCoreCommands() {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 
-				err := am.CharDelete(charId)
+				err := am.CharDeleteForCtx(ctx, charId)
 				if err != nil {
 					ReplyToSender(ctx, msg, "角色删除失败")
 					return CmdExecuteResult{Matched: true, Solved: true}

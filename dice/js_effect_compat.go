@@ -48,6 +48,14 @@ func BuildJSEffect(request JSEffectRequest) (eventstore.NewEffect, error) {
 	effect := eventstore.NewEffect{EffectID: request.EffectID, EndpointID: request.EndpointID, LaneHMAC: append([]byte(nil), request.LaneHMAC...), EffectType: request.EffectType, RiskClass: request.RiskClass, Status: request.Status, PayloadCiphertext: append([]byte(nil), request.PayloadCiphertext...), PayloadNonce: append([]byte(nil), request.PayloadNonce...), PayloadVersion: request.PayloadVersion, PayloadEncryptionKeyID: request.PayloadEncryptionKeyID, ContentDigest: append([]byte(nil), request.ContentDigest...), ContentDigestKeyID: request.ContentDigestKeyID}
 	return effect, nil
 }
-func BuildJSReplyEffect(request JSEffectRequest) (eventstore.NewEffect, error) { request.EffectType = "reply"; return BuildJSEffect(request) }
-func BuildJSNoticeEffect(request JSEffectRequest) (eventstore.NewEffect, error) { request.EffectType = "notice"; return BuildJSEffect(request) }
-func jsEffectRiskValid(value string) bool { return value == eventstore.RiskPreDispatchRetryable || value == eventstore.RiskProviderIdempotent || value == eventstore.RiskNonIdempotentAfterDispatch }
+func BuildJSReplyEffect(request JSEffectRequest) (eventstore.NewEffect, error) {
+	request.EffectType = "reply"
+	return BuildJSEffect(request)
+}
+func BuildJSNoticeEffect(request JSEffectRequest) (eventstore.NewEffect, error) {
+	request.EffectType = "notice"
+	return BuildJSEffect(request)
+}
+func jsEffectRiskValid(value string) bool {
+	return value == eventstore.RiskPreDispatchRetryable || value == eventstore.RiskProviderIdempotent || value == eventstore.RiskNonIdempotentAfterDispatch
+}

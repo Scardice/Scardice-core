@@ -522,12 +522,9 @@ func newScriptReloadTestPackageManager(t *testing.T) (*Dice, *PackageManager) {
 	t.Chdir(tmpDir)
 
 	testDice := &Dice{
-		BaseConfig: BaseConfig{DataDir: "."},
-		Logger:     zap.NewNop().Sugar(),
-		ImSession: &IMSession{
-			ServiceAtNew: new(SyncMap[string, *GroupInfo]),
-			EndPoints:    []*EndPointInfo{},
-		},
+		BaseConfig:         BaseConfig{DataDir: "."},
+		Logger:             zap.NewNop().Sugar(),
+		ImSession:          &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
 		DirtyGroups:        new(SyncMap[string, int64]),
 		AttrsManager:       &AttrsManager{},
 		JsBuiltinDigestSet: map[string]bool{},

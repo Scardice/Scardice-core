@@ -851,3 +851,29 @@ func TestDecodeStoreJSONResponseEnforcesLimit(t *testing.T) {
 		t.Fatalf("decodeStoreJSONResponse() error = %v, want size rejection", err)
 	}
 }
+func TestNewStoreManagerDefersBackendProbeUntilList(t *testing.T) {
+	var infoRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/info") {
+			infoRequests.Add(1)
+			_, _ = w.Write([]byte(`{"formatVersion":"2.0","name":"Test Store","protocolVersions":["2.0"]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	withOfficialStoreBackendBaseURL(t, server.URL)
+
+	manager := NewStoreManager(&Dice{})
+	if got := infoRequests.Load(); got != 0 {
+		t.Fatalf("backend probes during manager construction = %d, want 0", got)
+	}
+
+	backends := manager.StoreBackendList()
+	if got := infoRequests.Load(); got != 1 {
+		t.Fatalf("backend probes after listing = %d, want 1", got)
+	}
+	if len(backends) != 1 || !backends[0].Health || backends[0].Name != "Test Store" {
+		t.Fatalf("store backends = %#v, want one healthy backend", backends)
+	}
+}

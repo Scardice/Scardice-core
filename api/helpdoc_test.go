@@ -6,7 +6,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/labstack/echo/v4"
 
@@ -113,6 +116,191 @@ func TestHelpDocReloadAPIReflectsDeletedHelpDoc(t *testing.T) {
 
 	if countHelpItemsFromFile(items, "keep.json") != 1 {
 		t.Fatalf("existing helpdoc file keep.json should remain after API reload, total=%d count=%d", total, countHelpItemsFromFile(items, "keep.json"))
+	}
+}
+
+func TestHelpDocReadAPIsWaitForManagerReplacement(t *testing.T) {
+	root := switchAPIToTempWorkdir(t)
+	writeAPIHelpDocFile(t, root, "api-group/startup.json", map[string]string{"startup-entry": "ready"})
+
+	const token = "helpdoc-read-lock-test"
+	manager := &dice.DiceManager{HelpDocEngineType: int(dice.BlugeSearch)}
+	manager.AccessTokens.Store(token, true)
+	testDice := &dice.Dice{Parent: manager, Config: dice.Config{}, CmdMap: dice.CmdMapCls{}}
+	manager.Dice = []*dice.Dice{testDice}
+
+	oldMyDice, oldDM := myDice, dm
+	myDice, dm = testDice, manager
+	t.Cleanup(func() {
+		if manager.Help != nil {
+			manager.Help.Close()
+		}
+		myDice, dm = oldMyDice, oldDM
+	})
+
+	manager.InitHelp()
+	if manager.Help == nil {
+		t.Fatal("initial help load did not publish a manager")
+	}
+	if err := manager.WithHelpDocManagerWrite(func(help *dice.HelpManager) error {
+		help.Config = &dice.HelpConfig{Aliases: map[string][]string{
+			"startup-alias": {"startup.json"},
+		}}
+		return nil
+	}); err != nil {
+		t.Fatalf("set test HelpDoc config: %v", err)
+	}
+
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	writerDone := make(chan error, 1)
+	writerFinished := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseWriter := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	defer func() {
+		releaseWriter()
+		<-writerFinished
+	}()
+	go func() {
+		defer close(writerFinished)
+		writerDone <- manager.WithHelpDocManagerWrite(func(help *dice.HelpManager) error {
+			manager.IsHelpReloading.Store(true)
+			manager.Help = nil
+			close(locked)
+			<-release
+			manager.Help = help
+			manager.IsHelpReloading.Store(false)
+			return nil
+		})
+	}()
+	<-locked
+	e := echo.New()
+	statusReq := httptest.NewRequest(http.MethodGet, "/helpdoc/status", nil)
+	statusRec := httptest.NewRecorder()
+	if err := helpDocStatus(e.NewContext(statusReq, statusRec)); err != nil {
+		t.Fatalf("helpDocStatus returned an error: %v", err)
+	}
+	var statusBody struct {
+		Result  bool `json:"result"`
+		Loading bool `json:"loading"`
+	}
+	if err := json.Unmarshal(statusRec.Body.Bytes(), &statusBody); err != nil {
+		t.Fatalf("decode helpdoc status response: %v", err)
+	}
+	if !statusBody.Result || !statusBody.Loading {
+		t.Fatalf("helpDocStatus = %s, want result=true and loading=true", statusRec.Body.String())
+	}
+
+	type response struct {
+		name string
+		code int
+		body []byte
+		err  error
+	}
+	results := make(chan response, 3)
+	started := make(chan struct{}, 3)
+	go func() {
+		started <- struct{}{}
+		req := httptest.NewRequest(http.MethodGet, "/helpdoc/tree", nil)
+		req.Header.Set("Token", token)
+		rec := httptest.NewRecorder()
+		err := helpDocTree(e.NewContext(req, rec))
+		results <- response{name: "tree", code: rec.Code, body: rec.Body.Bytes(), err: err}
+	}()
+	go func() {
+		started <- struct{}{}
+		req := httptest.NewRequest(http.MethodPost, "/helpdoc/textitem/get_page", strings.NewReader(`{"pageNum":1,"pageSize":100}`))
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		rec := httptest.NewRecorder()
+		err := helpGetTextItemPage(e.NewContext(req, rec))
+		results <- response{name: "page", code: rec.Code, body: rec.Body.Bytes(), err: err}
+	}()
+	go func() {
+		started <- struct{}{}
+		req := httptest.NewRequest(http.MethodGet, "/helpdoc/config", nil)
+		rec := httptest.NewRecorder()
+		err := helpGetConfig(e.NewContext(req, rec))
+		results <- response{name: "config", code: rec.Code, body: rec.Body.Bytes(), err: err}
+	}()
+	<-started
+	<-started
+	<-started
+
+	early := false
+	select {
+	case <-results:
+		early = true
+	case <-time.After(50 * time.Millisecond):
+	}
+	releaseWriter()
+	if err := <-writerDone; err != nil {
+		t.Fatalf("release HelpManager writer: %v", err)
+	}
+
+	seen := make(map[string]bool, 3)
+	for range 3 {
+		select {
+		case got := <-results:
+			if got.err != nil {
+				t.Fatalf("%s handler returned an error: %v", got.name, got.err)
+			}
+			if got.code != http.StatusOK {
+				t.Fatalf("%s status = %d, want %d", got.name, got.code, http.StatusOK)
+			}
+			switch got.name {
+			case "tree":
+				var body struct {
+					Result bool            `json:"result"`
+					Data   []*dice.HelpDoc `json:"data"`
+				}
+				if err := json.Unmarshal(got.body, &body); err != nil {
+					t.Fatalf("decode tree response: %v", err)
+				}
+				if !body.Result || !helpDocTreeHasName(body.Data, "startup.json") {
+					t.Fatalf("tree response does not include the loaded help doc: %s", got.body)
+				}
+			case "page":
+				var body struct {
+					Result bool `json:"result"`
+					Data   []struct {
+						From string `json:"from"`
+					} `json:"data"`
+				}
+				if err := json.Unmarshal(got.body, &body); err != nil {
+					t.Fatalf("decode text-item response: %v", err)
+				}
+				found := false
+				for _, item := range body.Data {
+					if filepath.Base(item.From) == "startup.json" {
+						found = true
+						break
+					}
+				}
+				if !body.Result || !found {
+					t.Fatalf("text-item response does not include the loaded help doc: %s", got.body)
+				}
+			case "config":
+				var body dice.HelpConfig
+				if err := json.Unmarshal(got.body, &body); err != nil {
+					t.Fatalf("decode helpdoc config response: %v", err)
+				}
+				aliases := body.Aliases["startup-alias"]
+				if len(aliases) != 1 || aliases[0] != "startup.json" {
+					t.Fatalf("config response lost the loaded HelpDoc configuration: %s", got.body)
+				}
+			}
+			seen[got.name] = true
+		case <-time.After(5 * time.Second):
+			t.Fatal("HelpDoc read handlers did not finish after manager replacement")
+		}
+	}
+	if early {
+		t.Fatal("HelpDoc read handler returned while the manager was being replaced")
+	}
+	if !seen["tree"] || !seen["page"] || !seen["config"] {
+		t.Fatalf("missing responses: %#v", seen)
 	}
 }
 

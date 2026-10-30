@@ -31,6 +31,12 @@ func check(c echo.Context) (bool, error) {
 	if !myDice.Config.EnableCensor {
 		return false, Error(&c, "未启用拦截引擎", Response{})
 	}
+	if myDice.CensorManager == nil {
+		return false, c.JSON(http.StatusServiceUnavailable, Response{
+			"result": false,
+			"code":   "censor_runtime_unavailable",
+		})
+	}
 	if myDice.CensorManager.IsLoading {
 		return false, Error(&c, "拦截引擎正在加载，请稍候", Response{})
 	}
@@ -248,7 +254,7 @@ func censorSetConfig(c echo.Context) error {
 }
 
 func setLevelHandlers(level censor.Level, handlers []string) {
-	newHandlers := map[dice.CensorHandler]bool{}
+	newHandlers := make(map[dice.CensorHandler]bool)
 	for _, newH := range handlers {
 		switch newH {
 		case "SendWarning":
@@ -440,7 +446,7 @@ func censorDeleteWordFiles(c echo.Context) error {
 	}
 
 	v := struct {
-		Keys []string `json:"keys"`
+		Keys []string `json:"keys" query:"keys[]"`
 	}{}
 	err = c.Bind(&v)
 	if err != nil {
@@ -529,6 +535,14 @@ func censorGetLogPage(c echo.Context) error {
 		v.PageSize = 20
 	}
 
+	if myDice.DBOperator == nil {
+		return Success(&c, Response{
+			"data":     []any{},
+			"total":    0,
+			"pageNum":  v.PageNum,
+			"pageSize": 0,
+		})
+	}
 	total, page, err := service.CensorGetLogPage(myDice.DBOperator, v)
 	if err != nil {
 		return Error(&c, err.Error(), Response{})

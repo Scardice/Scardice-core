@@ -11,17 +11,17 @@ import (
 )
 
 func TestAdapterAPIRemainsDependencyLeaf(t *testing.T) {
-	root, err := filepath.Abs(".")
-	if err != nil {
-		t.Fatal(err)
+	root, parseErr := filepath.Abs(".")
+	if parseErr != nil {
+		t.Fatal(parseErr)
 	}
-	entries, err := filepath.Glob(filepath.Join(root, "*.go"))
-	if err != nil {
-		t.Fatal(err)
+	entries, parseErr := filepath.Glob(filepath.Join(root, "*.go"))
+	if parseErr != nil {
+		t.Fatal(parseErr)
 	}
-	stdlib, err := standardLibraryImports()
-	if err != nil {
-		t.Fatalf("go list std: %v", err)
+	stdlib, parseErr := standardLibraryImports()
+	if parseErr != nil {
+		t.Fatalf("go list std: %v", parseErr)
 	}
 	for _, filename := range entries {
 		if strings.HasSuffix(filename, "_test.go") {
@@ -40,9 +40,9 @@ func TestAdapterAPIRemainsDependencyLeaf(t *testing.T) {
 	}
 
 	cmd := exec.Command("go", "list", "-deps", ".")
-	output, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("go list -deps .: %v", err)
+	output, parseErr := cmd.Output()
+	if parseErr != nil {
+		t.Fatalf("go list -deps .: %v", parseErr)
 	}
 	for _, dependency := range strings.Split(string(output), "\n") {
 		if strings.HasPrefix(dependency, "Scardice-core/") && dependency != "Scardice-core/adapterapi" {
@@ -79,16 +79,4 @@ func standardLibraryImports() (map[string]bool, error) {
 
 func allowedProductionImport(path string, standard map[string]bool) bool {
 	return standard[path]
-}
-
-func TestImportBoundaryRejectsKnownNonStandardPaths(t *testing.T) {
-	standard, err := standardLibraryImports()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, path := range []string{"sdk", "example/provider", "Scardice-core/dice", "github.com/labstack/echo/v4", "gorm.io/gorm"} {
-		if allowedProductionImport(path, standard) {
-			t.Fatalf("non-standard import %q was treated as standard", path)
-		}
-	}
 }

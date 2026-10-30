@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -13,8 +14,8 @@ import (
 
 	"go.uber.org/zap"
 
+	"Scardice-core/dice/service"
 	"Scardice-core/model"
-	"Scardice-core/utils/dboperator/engine"
 )
 
 const (
@@ -28,7 +29,7 @@ var storylogHTTPClient = &http.Client{
 
 type UploadEnv struct {
 	Dir      string
-	Db       engine.DatabaseOperator
+	Repo     service.LogRepository
 	Log      *zap.SugaredLogger
 	Backends []string
 	Version  StoryVersion
@@ -58,6 +59,9 @@ func (env *UploadEnv) appendNotice(notice string) {
 }
 
 func Upload(env UploadEnv) (string, string, error) {
+	if env.Repo == nil {
+		return "", env.Notice, service.ErrLogRepositoryUnavailable
+	}
 	if env.Version == StoryVersionV1 {
 		return uploadV1(env)
 	}
@@ -65,6 +69,20 @@ func Upload(env UploadEnv) (string, string, error) {
 		return uploadV105(env)
 	}
 	return "", "", errors.New("未指定日志版本")
+}
+
+func WriteLogText(w io.Writer, item model.LogOneItem) error {
+	return writeLogText(w, item.Nickname, item.IMUserID, item.Time, item.Message)
+}
+
+func WriteLogTextParquet(w io.Writer, item model.LogOneItemParquet) error {
+	return writeLogText(w, item.Nickname, item.IMUserID, item.Time, item.Message)
+}
+
+func writeLogText(w io.Writer, nickname, userID string, timestamp int64, message string) error {
+	timeText := time.Unix(timestamp, 0).Format("2006-01-02 15:04:05")
+	_, err := fmt.Fprintf(w, "%s(%v) %s\n%s\n\n", nickname, userID, timeText, message)
+	return err
 }
 
 func compactBackendRespForLog(body []byte) string {

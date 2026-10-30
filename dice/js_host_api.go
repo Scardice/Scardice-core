@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -54,11 +55,9 @@ func (d *Dice) installJSHostAPI(runtime jsengine.Runtime) error {
 	}{
 		{name: "addBan", value: func(ctx *MsgContext, id string, place string, reason string) {
 			(&d.Config).BanList.AddScoreBase(id, d.Config.BanList.ThresholdBan, place, reason, ctx)
-			(&d.Config).BanList.SaveChanged(d)
 		}},
 		{name: "addTrust", value: func(ctx *MsgContext, id string, place string, reason string) {
 			(&d.Config).BanList.SetTrustByID(id, place, reason)
-			(&d.Config).BanList.SaveChanged(d)
 		}},
 		{name: "remove", value: func(ctx *MsgContext, id string) {
 			if _, ok := (&d.Config).BanList.GetByID(id); ok {
@@ -67,10 +66,9 @@ func (d *Dice) installJSHostAPI(runtime jsengine.Runtime) error {
 		}},
 		{name: "getList", value: func() []BanListInfoItem {
 			var list []BanListInfoItem
-			(&d.Config).BanList.Map.Range(func(_ string, value *BanListInfoItem) bool {
+			for _, value := range (&d.Config).BanList.Snapshot() {
 				list = append(list, *value)
-				return true
-			})
+			}
 			return list
 		}},
 		{name: "getUser", value: func(id string) *BanListInfoItem {
@@ -88,13 +86,13 @@ func (d *Dice) installJSHostAPI(runtime jsengine.Runtime) error {
 	}
 
 	coc := runtime.NewObject()
-	if err := setJSHostObject(coc, "newRule", func() *CocRuleInfo { return &CocRuleInfo{} }); err != nil {
+	if err := setJSHostObject(coc, "newRule", d.newJSCocRule); err != nil {
 		return err
 	}
 	if err := setJSHostObject(coc, "newRuleCheckResult", func() *CocRuleCheckRet { return &CocRuleCheckRet{} }); err != nil {
 		return err
 	}
-	if err := setJSHostObject(coc, "registerRule", func(rule *CocRuleInfo) bool { return d.CocExtraRulesAdd(rule) }); err != nil {
+	if err := setJSHostObject(coc, "registerRule", d.registerJSCocRule); err != nil {
 		return err
 	}
 	if err := setJSHostObject(seal, "coc", coc); err != nil {
@@ -157,10 +155,7 @@ func (d *Dice) installJSHostAPI(runtime jsengine.Runtime) error {
 		{name: "getCtxProxyAtPos", value: GetCtxProxyAtPos},
 		{name: "getVersion", value: jsHostVersion},
 		{name: "getEndPoints", value: func() []*EndPointInfo {
-			src := d.ImSession.EndPoints
-			dst := make([]*EndPointInfo, len(src))
-			copy(dst, src)
-			return dst
+			return d.ImSession.EndPointsReadOnly()
 		}},
 		{name: "setPlayerGroupCard", value: SetPlayerGroupCardByTemplate},
 		{name: "base64ToImage", value: Base64ToImageFunc()},
@@ -195,6 +190,26 @@ func (d *Dice) installJSHostAPI(runtime jsengine.Runtime) error {
 		return fmt.Errorf("set seal: %w", err)
 	}
 	return nil
+}
+
+func configValueTypeMismatch(ei *ExtInfo, key string, config *ConfigItem) string {
+	pluginName := ""
+	if ei != nil {
+		pluginName = ei.Name
+	}
+	declaredType := ""
+	var value any
+	if config != nil {
+		declaredType = config.Type
+		value = config.Value
+	}
+	return fmt.Sprintf(
+		"配置值类型不匹配: plugin=%q key=%q declared=%q actual=%q",
+		pluginName,
+		key,
+		declaredType,
+		fmt.Sprintf("%T", value),
+	)
 }
 
 func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop, seal jsengine.Object, versionID int64, sourceLocation func() string) error {
@@ -237,24 +252,37 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			JSLoopVersion: versionID,
 		}
 	})
+	// TODO(局部重载/更新同名插件): 这里是“谁观察了谁”的天然采集点。依赖方可能持有 find 返回的旧 ExtInfo，
+	//   局部更新时需要整链重载；应在此记录“调用方脚本 -> 被查找扩展”的边，补充 @depends 未声明的耦合。
+	//   subTODO(局部重载): 调用方脚本取自 jsExecutionContextFor(loop)；跨插件 storage 访问同理。
 	_ = ext.Set("find", func(name string) *ExtInfo {
 		return d.ExtFind(name, true)
 	})
-	_ = ext.Set("register", func(realExt *ExtInfo) {
+	_ = ext.Set("register", func(realExt *ExtInfo) (returnErr error) {
 		defer func() {
-			// 增加recover, 以免在scripts目录中存在名字冲突扩展时导致启动崩溃
-			if e := recover(); e != nil {
-				d.Logger.Error(e)
+			if recovered := recover(); recovered != nil {
+				returnErr = fmt.Errorf("注册扩展失败: %v", recovered)
 			}
 		}()
+		if realExt == nil {
+			return errors.New("注册扩展失败: 扩展为空")
+		}
 
-		if strings.ToLower(realExt.Name) == "help" || strings.ToLower(realExt.Name) == "all" {
-			panic("help 和 all 为保留关键字，无法作为插件名使用")
+		if strings.EqualFold(realExt.Name, "help") || strings.EqualFold(realExt.Name, "all") {
+			return errors.New("help 和 all 为保留关键字，无法作为插件名使用")
 		}
 
 		extName := realExt.Name
 		if realExt.Source == nil {
 			realExt.Source = jsContextScript(jsExecutionContextFor(loop))
+		}
+		if existing, ok := d.ExtRegistry.Load(extName); ok && existing != nil && !existing.IsWrapper {
+			return fmt.Errorf("注册扩展失败: 扩展名 %q 已被占用", extName)
+		}
+		if d.DurableStore != nil {
+			if err := d.DurableDiscoverExtension(context.Background(), realExt); err != nil {
+				return fmt.Errorf("注册扩展 %q 的持久身份失败: %w", extName, err)
+			}
 		}
 
 		// 1. 查找或创建 wrapper
@@ -295,11 +323,6 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			// 注册 wrapper 到 ExtRegistry 和 ExtList
 			d.RegisterExtension(wrapper)
 		}
-		if d.DurableStore != nil {
-			if err := d.DurableDiscoverExtension(nil, wrapper); err != nil {
-				panic(err)
-			}
-		}
 
 		// 2. 注册真实 ExtInfo 到 JsExtRegistry
 		if d.JsExtRegistry == nil {
@@ -309,11 +332,9 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			d.Logger.Warnf("JS 扩展 %q 正在替换同名扩展；请确认来源：现有[%s]，替换[%s]",
 				extName, jsExtensionSourceDescription(incumbent.Source), jsExtensionSourceDescription(realExt.Source))
 		}
-		d.JsExtRegistry.Store(extName, realExt)
-
-		// 3. 设置真实 ExtInfo 的属性
 		realExt.dice = d
 		realExt.JSLoopVersion = versionID
+		d.JsExtRegistry.Store(extName, realExt)
 
 		// 4. 更新全局扩展变更时间戳
 		d.ExtUpdateTime = time.Now().Unix()
@@ -322,6 +343,7 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 		if realExt.OnLoad != nil {
 			realExt.OnLoad()
 		}
+		return nil
 	})
 	_ = ext.Set("registerStringConfig", func(ei *ExtInfo, key string, defaultValue string, description string, group string) error {
 		if ei.dice == nil {
@@ -426,71 +448,89 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 		}
 		return d.compatibilityConfigItem(ei, key)
 	})
-	_ = ext.Set("getStringConfig", func(ei *ExtInfo, key string) string {
-		cfg := d.compatibilityConfigItem(ei, key)
+	_ = ext.Set("getStringConfig", func(ei *ExtInfo, key string) (string, error) {
+		cfg, err := d.compatibilityConfigItemWithError(ei, key)
+		if err != nil {
+			return "", err
+		}
 		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "string" {
-			panic("配置不存在或类型不匹配")
+			return "", errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
 		value, ok := cfg.Value.(string)
 		if !ok {
-			panic("配置值类型不匹配")
+			return "", errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
-		return value
+		return value, nil
 	})
-	_ = ext.Set("getIntConfig", func(ei *ExtInfo, key string) int64 {
-		cfg := d.compatibilityConfigItem(ei, key)
+	_ = ext.Set("getIntConfig", func(ei *ExtInfo, key string) (int64, error) {
+		cfg, err := d.compatibilityConfigItemWithError(ei, key)
+		if err != nil {
+			return 0, err
+		}
 		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "int" {
-			panic("配置不存在或类型不匹配")
+			return 0, errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
 		value, ok := cfg.Value.(int64)
 		if !ok {
-			panic("配置值类型不匹配")
+			return 0, errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
-		return value
+		return value, nil
 	})
-	_ = ext.Set("getBoolConfig", func(ei *ExtInfo, key string) bool {
-		cfg := d.compatibilityConfigItem(ei, key)
+	_ = ext.Set("getBoolConfig", func(ei *ExtInfo, key string) (bool, error) {
+		cfg, err := d.compatibilityConfigItemWithError(ei, key)
+		if err != nil {
+			return false, err
+		}
 		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "bool" {
-			panic("配置不存在或类型不匹配")
+			return false, errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
 		value, ok := cfg.Value.(bool)
 		if !ok {
-			panic("配置值类型不匹配")
+			return false, errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
-		return value
+		return value, nil
 	})
-	_ = ext.Set("getFloatConfig", func(ei *ExtInfo, key string) float64 {
-		cfg := d.compatibilityConfigItem(ei, key)
+	_ = ext.Set("getFloatConfig", func(ei *ExtInfo, key string) (float64, error) {
+		cfg, err := d.compatibilityConfigItemWithError(ei, key)
+		if err != nil {
+			return 0, err
+		}
 		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "float" {
-			panic("配置不存在或类型不匹配")
+			return 0, errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
 		value, ok := cfg.Value.(float64)
 		if !ok {
-			panic("配置值类型不匹配")
+			return 0, errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
-		return value
+		return value, nil
 	})
-	_ = ext.Set("getTemplateConfig", func(ei *ExtInfo, key string) []string {
-		cfg := d.compatibilityConfigItem(ei, key)
+	_ = ext.Set("getTemplateConfig", func(ei *ExtInfo, key string) ([]string, error) {
+		cfg, err := d.compatibilityConfigItemWithError(ei, key)
+		if err != nil {
+			return nil, err
+		}
 		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "template" {
-			panic("配置不存在或类型不匹配")
+			return nil, errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
 		value, ok := cfg.Value.([]string)
 		if !ok {
-			panic("配置值类型不匹配")
+			return nil, errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
-		return append([]string(nil), value...)
+		return append([]string(nil), value...), nil
 	})
-	_ = ext.Set("getOptionConfig", func(ei *ExtInfo, key string) string {
-		cfg := d.compatibilityConfigItem(ei, key)
+	_ = ext.Set("getOptionConfig", func(ei *ExtInfo, key string) (string, error) {
+		cfg, err := d.compatibilityConfigItemWithError(ei, key)
+		if err != nil {
+			return "", err
+		}
 		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "option" {
-			panic("配置不存在或类型不匹配")
+			return "", errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
 		value, ok := cfg.Value.(string)
 		if !ok {
-			panic("配置值类型不匹配")
+			return "", errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
-		return value
+		return value, nil
 	})
 	_ = ext.Set("unregisterConfig", func(ei *ExtInfo, key ...string) {
 		if ei.dice == nil {
@@ -510,12 +550,15 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 		if ei.dice == nil {
 			panic(errors.New("请先完成此扩展的注册"))
 		}
-		scriptCron := ei.dice.JsScriptCron
+		owner := ei.dice
+		owner.jsScriptCronMu.Lock()
+		defer owner.jsScriptCronMu.Unlock()
+		scriptCron := owner.JsScriptCron
 		if scriptCron == nil {
 			panic(errors.New("插件cron未成功初始化")) // 按理是不会发生的
 		}
 
-		task := JsScriptTask{cron: scriptCron, key: key, task: fn, lock: ei.dice.JsScriptCronLock, logger: ei.dice.Logger, dice: ei.dice, ext: ei}
+		task := JsScriptTask{cron: scriptCron, key: key, task: fn, lock: owner.JsScriptCronLock, logger: owner.Logger, dice: owner, ext: ei}
 		expr := value
 		if key != "" && taskType != "once" {
 			if config := d.compatibilityConfigItem(ei, key); config != nil {
@@ -546,6 +589,7 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			task.cronExpr = cronExpr
 			expr = cronExpr // 保持配置值为规范化后的有效表达式
 			task.entryID = &entryID
+			scriptCron.Start()
 			ei.dice.Logger.Infof("插件注册定时任务：cron=%s", cronExpr)
 		case "daily":
 			// 支持每天定时触发，24 小时表示
@@ -565,6 +609,7 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			task.cronExpr = cronExpr
 			task.entryID = &entryID
 			ei.dice.Logger.Infof("插件注册定时任务：daily=%s", expr)
+			scriptCron.Start()
 		case "once":
 			onceAt, normalizedExpr, err := parseTaskOnceExpr(expr)
 			if err != nil {
@@ -574,7 +619,7 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			task.rawValue = expr
 			task.onceAt = onceAt
 			expr = normalizedExpr // 保存为绝对执行时间戳，避免重载后延迟重复计算
-			if !task.On() {
+			if !task.on() {
 				panic("插件注册定时任务失败：一次任务注册失败")
 			}
 			ei.dice.Logger.Infof("插件注册定时任务：once=%s", expr)
@@ -607,7 +652,9 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 					task:         &task,
 				}
 			}
-			d.ConfigManager.RegisterPluginConfig(ei.Name, config)
+			if err := d.ConfigManager.RegisterPluginConfig(ei.Name, config); err != nil {
+				panic("插件注册定时任务配置失败：" + err.Error())
+			}
 		}
 
 		if ei.taskList == nil {
@@ -698,7 +745,7 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 		}
 		return tasks
 	})
-	return nil
+	return d.installJSAdapterHostAPI(runtime, loop, seal, versionID)
 }
 
 func setJSHostObject(object jsengine.Object, name string, value interface{}) error {
@@ -713,10 +760,60 @@ func (d *Dice) addJSGameSystemTemplate(data string, format string) error {
 	if err != nil {
 		return errors.New("解析失败:" + err.Error())
 	}
-	if !d.GameSystemTemplateAddEx(template, true) {
+	if !d.addJSGameSystemTemplateObject(template, true, true) {
 		return errors.New("已存在同名模板")
 	}
 	return nil
+}
+
+func (d *Dice) addJSGameSystemTemplateObject(template *GameSystemTemplate, overwrite bool, ignoreFileTemplateCollision bool) bool {
+	if template == nil {
+		return false
+	}
+	d.jsGameSystemTemplatesMu.Lock()
+	defer d.jsGameSystemTemplatesMu.Unlock()
+
+	previousJSTemplate := d.jsGameSystemTemplates[template.Name]
+	currentTemplate, hasCurrentTemplate := d.GameSystemMap.Load(template.Name)
+	jsOwnsCurrentTemplate := previousJSTemplate != nil && hasCurrentTemplate && currentTemplate == previousJSTemplate
+	if d.preferFileBackedGameSystemTemplates && d.JsReloading && hasCurrentTemplate && !jsOwnsCurrentTemplate {
+		if ignoreFileTemplateCollision {
+			if d.jsGameSystemTemplates == nil {
+				d.jsGameSystemTemplates = make(map[string]*GameSystemTemplate)
+			}
+			d.jsGameSystemTemplates[template.Name] = template
+		}
+		return ignoreFileTemplateCollision
+	}
+	if !d.addGameSystemTemplateEx(template, overwrite) {
+		return false
+	}
+	if d.jsGameSystemTemplates == nil {
+		d.jsGameSystemTemplates = make(map[string]*GameSystemTemplate)
+	}
+	d.jsGameSystemTemplates[template.Name] = template
+	return true
+}
+
+// TODO(局部重载/禁用与删除): JS 注册的规则模板只按模板名保存，没有脚本归属，只能整体清空。
+// subTODO(局部重载): 记录模板的注册脚本，卸载时只摘除该脚本注册的模板。
+func (d *Dice) clearJSTemplates() {
+	d.jsGameSystemTemplatesMu.Lock()
+	d.jsGameSystemTemplates = nil
+	d.jsGameSystemTemplatesMu.Unlock()
+}
+
+func (d *Dice) restoreJSTemplates() {
+	d.jsGameSystemTemplatesMu.Lock()
+	templates := make([]*GameSystemTemplate, 0, len(d.jsGameSystemTemplates))
+	for _, template := range d.jsGameSystemTemplates {
+		templates = append(templates, template)
+	}
+	d.jsGameSystemTemplatesMu.Unlock()
+
+	for _, template := range templates {
+		d.addGameSystemTemplateEx(template, false)
+	}
 }
 
 func jsHostAtob(s string) (string, error) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"Scardice-core/adapterapi"
 	"Scardice-core/eventstore"
@@ -16,7 +17,7 @@ const EndpointAggregateType = "endpoint"
 // deals in eventstore.Store only; projections and participants remain owned by
 // the store transaction.
 type BoundPayloadCodec interface {
-	EncryptBound(context.Context, string, string, string, uint64, []byte) ([]byte, []byte, string, error)
+	EncryptBound(ctx context.Context, domain, identity, owner string, version uint64, plaintext []byte) ([]byte, []byte, string, error)
 }
 type Repository struct {
 	Store       eventstore.Store
@@ -24,8 +25,6 @@ type Repository struct {
 	Producer    string
 	EffectCodec BoundPayloadCodec
 }
-
-type EndpointRepository = Repository
 
 func NewRepository(store eventstore.Store, codecs ...BoundPayloadCodec) *Repository {
 	repository := &Repository{Store: store, Clock: eventstore.SystemClock{}, Producer: "endpoint"}
@@ -35,9 +34,6 @@ func NewRepository(store eventstore.Store, codecs ...BoundPayloadCodec) *Reposit
 		repository.EffectCodec = provider
 	}
 	return repository
-}
-func NewEndpointRepository(store eventstore.Store, codecs ...BoundPayloadCodec) *Repository {
-	return NewRepository(store, codecs...)
 }
 
 func endpointStream(id adapterapi.EndpointID) eventstore.StreamID {
@@ -81,7 +77,9 @@ func (r *Repository) Load(ctx context.Context, id adapterapi.EndpointID) (State,
 			return State{}, fmt.Errorf("%w: persisted event version mismatch", ErrInvalidState)
 		}
 		if event.CommandID != "" && event.CommandID != envelope.Metadata.CommandID || event.CorrelationID != "" && event.CorrelationID != envelope.Metadata.CorrelationID {
-			return State{}, fmt.Errorf("%w: persisted event metadata mismatch", ErrInvalidState)
+			if !acceptsEarlyImporterEnvelopeMetadata(event, envelopeType, envelope) {
+				return State{}, fmt.Errorf("%w: persisted event metadata mismatch", ErrInvalidState)
+			}
 		}
 		if event.ID == "" {
 			event.ID = envelope.EventID
@@ -126,6 +124,30 @@ func validateLoadedEvent(event Event, envelope eventstore.Envelope) error {
 		return fmt.Errorf("endpoint: event stream mismatch: %w", ErrInvalidState)
 	}
 	return nil
+}
+
+func acceptsEarlyImporterEnvelopeMetadata(event Event, eventType EventType, envelope eventstore.Envelope) bool {
+	if envelope.Metadata.Producer != "eventsourcing-importer" ||
+		envelope.Metadata.CommandID != envelope.EventID+"-command" ||
+		envelope.Metadata.CorrelationID != envelope.EventID+"-correlation" {
+		return false
+	}
+	endpointID := string(event.EndpointID)
+	var expectedCommandID string
+	switch eventType {
+	case EventEndpointCreated:
+		expectedCommandID = "legacy-create-" + endpointID
+	case EventDesiredEnabled:
+		expectedCommandID = "legacy-enable-" + endpointID
+	case EventOperationCompleted:
+		expectedCommandID = "legacy-complete-" + endpointID
+	default:
+		return false
+	}
+	const correlationPrefix = "legacy-import-"
+	return event.CommandID == expectedCommandID &&
+		strings.HasPrefix(event.CorrelationID, correlationPrefix) &&
+		len(event.CorrelationID) > len(correlationPrefix)
 }
 
 func validateDecisionEffects(decision Decision) error {
@@ -271,6 +293,9 @@ func (r *Repository) commitWithSecrets(ctx context.Context, previous State, deci
 			return eventstore.CommitResult{}, err
 		}
 		appendEvents = append(appendEvents, newEvent)
+		if event.Type == EventEndpointIdentityObserved || event.Type == EventLegacyMetadataRestored {
+			continue
+		}
 		status := string(event.OperationState)
 		if status == string(OperationStateIdle) {
 			status = "succeeded"
@@ -280,7 +305,7 @@ func (r *Repository) commitWithSecrets(ctx context.Context, previous State, deci
 		if operationsRepo, ok := r.Store.(eventstore.OperationRepository); ok {
 			view, lookupErr := operationsRepo.GetOperation(ctx, event.OperationID)
 			if lookupErr == nil {
-				if view.Version >= uint64(^uint64(0)>>1) {
+				if view.Version >= ^uint64(0)>>1 {
 					return eventstore.CommitResult{}, eventstore.ErrVersionExhausted
 				}
 				expectedOperationVersion = view.Version
@@ -311,37 +336,9 @@ func (r *Repository) commitWithSecrets(ctx context.Context, previous State, deci
 			CreatedAt: occurred, UpdatedAt: occurred,
 		})
 	}
+	// Lifecycle intent is durable in the endpoint events and recovered by
+	// Supervisor reconciliation. The outbox is only for adapter outbound effects.
 	work := eventstore.UnitOfWork{Streams: []eventstore.StreamAppend{{Stream: endpointStream(streamID), ExpectedVersion: previous.Version, Events: appendEvents}}, Operations: operations}
-	for _, effect := range decision.Effects {
-		if r.EffectCodec == nil {
-			return eventstore.CommitResult{}, eventstore.ErrEncryptionUnavailable
-		}
-		lane := []byte("endpoint-lane")
-		intentPayload, err := json.Marshal(struct {
-			EffectID       string       `json:"effectId"`
-			EffectKind     string       `json:"effectKind"`
-			EndpointID     string       `json:"endpointId"`
-			Generation     uint64       `json:"generation"`
-			DesiredState   DesiredState `json:"desiredState"`
-			DesiredVersion uint64       `json:"desiredVersion"`
-			OperationID    string       `json:"operationId"`
-			CorrelationID  string       `json:"correlationId"`
-			CommandID      string       `json:"commandId"`
-		}{effect.ID, string(effect.Kind), string(effect.EndpointID), effect.Generation, effect.DesiredState, effect.DesiredVersion, effect.OperationID, effect.CorrelationID, effect.CommandID})
-		if err != nil {
-			return eventstore.CommitResult{}, err
-		}
-		payloadCiphertext, payloadNonce, payloadKeyID, err := r.EffectCodec.EncryptBound(ctx, "outbox/v1", effect.ID, string(effect.EndpointID), 1, intentPayload)
-		if err != nil {
-			return eventstore.CommitResult{}, err
-		}
-		work.Effects = append(work.Effects, eventstore.NewEffect{
-			EffectID: effect.ID, EndpointID: string(effect.EndpointID), LaneHMAC: lane,
-			EffectType: string(effect.Kind), RiskClass: eventstore.RiskPreDispatchRetryable,
-			Status: eventstore.OutboxStatusPending, PayloadCiphertext: payloadCiphertext,
-			PayloadNonce: payloadNonce, PayloadEncryptionKeyID: payloadKeyID,
-		})
-	}
 	for index := range inputs {
 		input := &inputs[index]
 		if input.Ref == "" || input.Version == 0 || len(input.Plaintext) == 0 || len(input.Plaintext) > eventstore.MaxSecretBytes {

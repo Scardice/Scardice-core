@@ -16,8 +16,10 @@ import (
 // 警告：不要在一个事务（写事务）里使用读的DB！否则读的DB会发现有人在写而锁住，从而死锁。
 
 func SQLiteDBInit(path string, useWAL bool) (*gorm.DB, error) {
+	databasePath := path
+	existed := sqliteDatabaseFileExists(databasePath)
 	// 使用即时事务
-	path = fmt.Sprintf("file:%v?_txlock=immediate&_busy_timeout=15000", path)
+	path = fmt.Sprintf("file:%v?_txlock=immediate&_busy_timeout=15000", databasePath)
 	open, err := gorm.Open(sqlite.Open(path), &gorm.Config{
 		Logger: logger.DefaultSealLogger,
 	})
@@ -30,6 +32,7 @@ func SQLiteDBInit(path string, useWAL bool) (*gorm.DB, error) {
 			panic(err)
 		}
 	}
+	logSQLiteDatabaseFileState(logger.M(), databasePath, existed)
 	return open, err
 }
 
@@ -73,6 +76,7 @@ func createWriteDB(path string, gormConf gorm.Config) (*gorm.DB, error) {
 }
 
 func SQLiteDBRWInit(path string) (*gorm.DB, *gorm.DB, error) {
+	existed := sqliteDatabaseFileExists(path)
 	// 由于现在我们只有一个写入连接，所以不需要使用事务
 	gormConf := gorm.Config{
 		Logger:                 logger.DefaultSealLogger,
@@ -86,6 +90,7 @@ func SQLiteDBRWInit(path string) (*gorm.DB, *gorm.DB, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	logSQLiteDatabaseFileState(logger.M(), path, existed)
 	return readDB, writeDB, nil
 }
 

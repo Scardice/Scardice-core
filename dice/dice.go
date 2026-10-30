@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -21,7 +22,9 @@ import (
 	"github.com/tidwall/buntdb"
 	"go.uber.org/zap"
 
+	"Scardice-core/core/extensionstate"
 	"Scardice-core/dice/events"
+	"Scardice-core/dice/service"
 	"Scardice-core/eventstore"
 	"Scardice-core/logger"
 	"Scardice-core/utils/dboperator/engine"
@@ -49,9 +52,11 @@ type CmdItemInfo struct {
 	JSLoopVersion  int64  // Loop版本号
 	SourceLocation string `json:"-" yaml:"-"` // JS 命令注册位置，用于诊断日志
 	Solve          func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult
-	SolveRaw       func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) goja.Value `jsbind:"solve"`
-	// SolveEngine is an engine-neutral callback. It is invoked on JSLoopVersion's
-	// owner loop and therefore its returned Value MUST be consumed before return.
+	SolveRaw       func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) goja.Value `jsbindgoja:"solve" json:"-" yaml:"-"`
+	// SolveCallback is the public engine-neutral JavaScript solve binding.
+	SolveCallback func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) (jsengine.Value, error) `jsbind:"solve" json:"-" yaml:"-"`
+	// SolveEngine is an internal engine-neutral callback that also receives its
+	// owning runtime. Returned values never leave the owner callback.
 	SolveEngine func(runtime jsengine.Runtime, ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) (jsengine.Value, error) `json:"-" yaml:"-"`
 
 	Raw                bool `jsbind:"raw"`                // 高级模式。默认模式下行为是：需要在当前群/私聊开启，或@自己时生效(需要为第一个@目标)
@@ -97,28 +102,68 @@ type ExtInfo struct {
 	// 定时任务列表，用于避免 task 失去引用
 	taskList []*JsScriptTask `json:"-" yaml:"-"`
 
-	OnNotCommandReceived func(ctx *MsgContext, msg *Message)                        `jsbind:"onNotCommandReceived" json:"-" yaml:"-"`                      // 指令过滤后剩下的
-	OnCommandOverride    func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) bool `jsbind:"onCommandOverride"    json:"-"                      yaml:"-"` // 覆盖指令行为
+	// Preserve raw Goja filter values until owner-side validation; reflection
+	// would otherwise turn undefined into null and Symbol into string.
+	AdapterEventFilter     map[string]any `jsbind:"adapterEventFilter" json:"-" yaml:"-"`
+	AdapterEventFilterGoja goja.Value     `jsbindgoja:"adapterEventFilter" json:"-" yaml:"-"`
+
+	// Native Go hooks remain synchronous. Public JavaScript properties bind to
+	// the paired Goja/provider-neutral fields so their returned Promise remains
+	// observable without changing builtin hook signatures.
+	OnNotCommandReceived         func(ctx *MsgContext, msg *Message)                                           `json:"-" yaml:"-"`
+	OnNotCommandReceivedGoja     func(ctx *MsgContext, msg *Message) goja.Value                                `jsbindgoja:"onNotCommandReceived" json:"-" yaml:"-"`
+	OnNotCommandReceivedCallback func(ctx *MsgContext, msg *Message) (jsengine.Value, error)                   `jsbind:"onNotCommandReceived" json:"-" yaml:"-"`
+	OnCommandOverride            func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) bool                    `json:"-" yaml:"-"`
+	OnCommandOverrideGoja        func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) goja.Value              `jsbindgoja:"onCommandOverride" json:"-" yaml:"-"`
+	OnCommandOverrideCallback    func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) (jsengine.Value, error) `jsbind:"onCommandOverride" json:"-" yaml:"-"`
 	// NOTE(lyjjl): 尚不清楚海豹开发组为什么禁用这个 API
 
-	OnCommandReceived   func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) `jsbind:"onCommandReceived"   json:"-" yaml:"-"`
-	OnMessagePreprocess func(ctx *MsgContext, msg *Message) goja.Value        `jsbind:"onMessagePreprocess" json:"-" yaml:"-"`
-	// OnMessagePreprocessEngine is the engine-neutral counterpart of
-	// OnMessagePreprocess. Its returned Value MUST remain inside the owner loop.
-	OnMessagePreprocessEngine func(runtime jsengine.Runtime, ctx *MsgContext, msg *Message) (jsengine.Value, error) `json:"-" yaml:"-"`
-	OnMessageReceived         func(ctx *MsgContext, msg *Message)                                                   `jsbind:"onMessageReceived"   json:"-" yaml:"-"`
-	OnMessageSend             func(ctx *MsgContext, msg *Message, flag string)                                      `jsbind:"onMessageSend"       json:"-" yaml:"-"`
-	OnMessageDeleted          func(ctx *MsgContext, msg *Message)                                                   `jsbind:"onMessageDeleted"    json:"-" yaml:"-"`
-	OnMessageEdit             func(ctx *MsgContext, msg *Message)                                                   `jsbind:"onMessageEdit"       json:"-" yaml:"-"`
-	OnGroupJoined             func(ctx *MsgContext, msg *Message)                                                   `jsbind:"onGroupJoined"       json:"-" yaml:"-"`
-	OnGroupMemberJoined       func(ctx *MsgContext, msg *Message)                                                   `jsbind:"onGroupMemberJoined" json:"-" yaml:"-"`
-	OnGuildJoined             func(ctx *MsgContext, msg *Message)                                                   `jsbind:"onGuildJoined"       json:"-" yaml:"-"`
-	OnBecomeFriend            func(ctx *MsgContext, msg *Message)                                                   `jsbind:"onBecomeFriend"      json:"-" yaml:"-"`
-	OnPoke                    func(ctx *MsgContext, event *events.PokeEvent)                                        `jsbind:"onPoke"              json:"-" yaml:"-"` // 戳一戳
-	OnGroupLeave              func(ctx *MsgContext, event *events.GroupLeaveEvent)                                  `jsbind:"onGroupLeave"        json:"-" yaml:"-"` // 群成员被踢出
-	GetDescText               func(i *ExtInfo) string                                                               `jsbind:"getDescText"         json:"-" yaml:"-"`
-	IsLoaded                  bool                                                                                  `jsbind:"isLoaded"            json:"-" yaml:"-"`
-	OnLoad                    func()                                                                                `jsbind:"onLoad"              json:"-" yaml:"-"`
+	OnCommandReceived         func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs)                         `json:"-" yaml:"-"`
+	OnCommandReceivedGoja     func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) goja.Value              `jsbindgoja:"onCommandReceived" json:"-" yaml:"-"`
+	OnCommandReceivedCallback func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) (jsengine.Value, error) `jsbind:"onCommandReceived" json:"-" yaml:"-"`
+	OnMessagePreprocess       func(ctx *MsgContext, msg *Message) goja.Value                                `jsbindgoja:"onMessagePreprocess" json:"-" yaml:"-"`
+	// OnMessagePreprocessCallback is the public engine-neutral JS callback. Its
+	// returned Value is consumed inside the owner loop.
+	OnMessagePreprocessCallback func(ctx *MsgContext, msg *Message) (jsengine.Value, error) `jsbind:"onMessagePreprocess" json:"-" yaml:"-"`
+	// OnMessagePreprocessEngine is an internal engine-neutral callback. Its
+	// returned Value MUST remain inside the owner loop.
+	OnMessagePreprocessEngine   func(runtime jsengine.Runtime, ctx *MsgContext, msg *Message) (jsengine.Value, error) `json:"-" yaml:"-"`
+	OnMessageReceived           func(ctx *MsgContext, msg *Message)                                                   `json:"-" yaml:"-"`
+	OnMessageReceivedGoja       func(ctx *MsgContext, msg *Message) goja.Value                                        `jsbindgoja:"onMessageReceived" json:"-" yaml:"-"`
+	OnMessageReceivedCallback   func(ctx *MsgContext, msg *Message) (jsengine.Value, error)                           `jsbind:"onMessageReceived" json:"-" yaml:"-"`
+	OnMessageSend               func(ctx *MsgContext, msg *Message, flag string)                                      `json:"-" yaml:"-"`
+	OnMessageSendGoja           func(ctx *MsgContext, msg *Message, flag string) goja.Value                           `jsbindgoja:"onMessageSend" json:"-" yaml:"-"`
+	OnMessageSendCallback       func(ctx *MsgContext, msg *Message, flag string) (jsengine.Value, error)              `jsbind:"onMessageSend" json:"-" yaml:"-"`
+	OnMessageDeleted            func(ctx *MsgContext, msg *Message)                                                   `json:"-" yaml:"-"`
+	OnMessageDeletedGoja        func(ctx *MsgContext, msg *Message) goja.Value                                        `jsbindgoja:"onMessageDeleted" json:"-" yaml:"-"`
+	OnMessageDeletedCallback    func(ctx *MsgContext, msg *Message) (jsengine.Value, error)                           `jsbind:"onMessageDeleted" json:"-" yaml:"-"`
+	OnMessageEdit               func(ctx *MsgContext, msg *Message)                                                   `json:"-" yaml:"-"`
+	OnMessageEditGoja           func(ctx *MsgContext, msg *Message) goja.Value                                        `jsbindgoja:"onMessageEdit" json:"-" yaml:"-"`
+	OnMessageEditCallback       func(ctx *MsgContext, msg *Message) (jsengine.Value, error)                           `jsbind:"onMessageEdit" json:"-" yaml:"-"`
+	OnGroupJoined               func(ctx *MsgContext, msg *Message)                                                   `json:"-" yaml:"-"`
+	OnGroupJoinedGoja           func(ctx *MsgContext, msg *Message) goja.Value                                        `jsbindgoja:"onGroupJoined" json:"-" yaml:"-"`
+	OnGroupJoinedCallback       func(ctx *MsgContext, msg *Message) (jsengine.Value, error)                           `jsbind:"onGroupJoined" json:"-" yaml:"-"`
+	OnGroupMemberJoined         func(ctx *MsgContext, msg *Message)                                                   `json:"-" yaml:"-"`
+	OnGroupMemberJoinedGoja     func(ctx *MsgContext, msg *Message) goja.Value                                        `jsbindgoja:"onGroupMemberJoined" json:"-" yaml:"-"`
+	OnGroupMemberJoinedCallback func(ctx *MsgContext, msg *Message) (jsengine.Value, error)                           `jsbind:"onGroupMemberJoined" json:"-" yaml:"-"`
+	OnGuildJoined               func(ctx *MsgContext, msg *Message)                                                   `json:"-" yaml:"-"`
+	OnGuildJoinedGoja           func(ctx *MsgContext, msg *Message) goja.Value                                        `jsbindgoja:"onGuildJoined" json:"-" yaml:"-"`
+	OnGuildJoinedCallback       func(ctx *MsgContext, msg *Message) (jsengine.Value, error)                           `jsbind:"onGuildJoined" json:"-" yaml:"-"`
+	OnBecomeFriend              func(ctx *MsgContext, msg *Message)                                                   `json:"-" yaml:"-"`
+	OnBecomeFriendGoja          func(ctx *MsgContext, msg *Message) goja.Value                                        `jsbindgoja:"onBecomeFriend" json:"-" yaml:"-"`
+	OnBecomeFriendCallback      func(ctx *MsgContext, msg *Message) (jsengine.Value, error)                           `jsbind:"onBecomeFriend" json:"-" yaml:"-"`
+	OnPoke                      func(ctx *MsgContext, event *events.PokeEvent)                                        `json:"-" yaml:"-"` // 戳一戳
+	OnPokeGoja                  func(ctx *MsgContext, event *events.PokeEvent) goja.Value                             `jsbindgoja:"onPoke" json:"-" yaml:"-"`
+	OnPokeCallback              func(ctx *MsgContext, event *events.PokeEvent) (jsengine.Value, error)                `jsbind:"onPoke" json:"-" yaml:"-"`
+	OnAdapterEvent              func(ctx *MsgContext, event *AdapterEventView)                                        `json:"-" yaml:"-"`
+	OnAdapterEventGoja          func(ctx *MsgContext, event goja.Value) goja.Value                                    `jsbindgoja:"onAdapterEvent" json:"-" yaml:"-"`
+	OnAdapterEventCallback      func(ctx *MsgContext, event jsengine.Value) (jsengine.Value, error)                   `jsbind:"onAdapterEvent" json:"-" yaml:"-"`
+	OnGroupLeave                func(ctx *MsgContext, event *events.GroupLeaveEvent)                                  `json:"-" yaml:"-"` // 群成员被踢出
+	OnGroupLeaveGoja            func(ctx *MsgContext, event *events.GroupLeaveEvent) goja.Value                       `jsbindgoja:"onGroupLeave" json:"-" yaml:"-"`
+	OnGroupLeaveCallback        func(ctx *MsgContext, event *events.GroupLeaveEvent) (jsengine.Value, error)          `jsbind:"onGroupLeave" json:"-" yaml:"-"`
+	GetDescText                 func(i *ExtInfo) string                                                               `jsbind:"getDescText" json:"-" yaml:"-"`
+	IsLoaded                    bool                                                                                  `jsbind:"isLoaded" json:"-" yaml:"-"`
+	OnLoad                      func()                                                                                `jsbind:"onLoad" json:"-" yaml:"-"`
 
 	// Wrapper 相关字段
 	IsWrapper  bool   `json:"-" yaml:"-"` // 是否为 Wrapper ExtInfo (代理对象)
@@ -142,6 +187,8 @@ type ExtDefaultSettingItem struct {
 
 type ExtDefaultSettingItemSlice []*ExtDefaultSettingItem
 
+var errJSRuntimeUnavailable = errors.New("JavaScript runtime is unavailable")
+
 type JsLoopManager struct {
 	loop           jsengine.Loop
 	loopLock       sync.RWMutex
@@ -150,27 +197,55 @@ type JsLoopManager struct {
 	instances      map[int64]*jsRuntimeInstance
 	engines        map[jsengine.EngineID]int64
 	// callbackKeys is generation-local live scheduling admission state.
-	callbackKeys map[jsCallbackKey]struct{}
+	callbackKeys       map[jsCallbackKey]struct{}
+	callbackWaiters    map[int64]map[uint64]func(error)
+	nextCallbackWaiter uint64
+	shutdownHook       func()
+	stopped            bool
+	stopDone           chan struct{}
+	stopErr            error
 }
 
 func NewJsLoopManager() *JsLoopManager {
 	return &JsLoopManager{
-		instances:    make(map[int64]*jsRuntimeInstance),
-		engines:      make(map[jsengine.EngineID]int64),
-		callbackKeys: make(map[jsCallbackKey]struct{}),
+		instances:       make(map[int64]*jsRuntimeInstance),
+		engines:         make(map[jsengine.EngineID]int64),
+		callbackKeys:    make(map[jsCallbackKey]struct{}),
+		callbackWaiters: make(map[int64]map[uint64]func(error)),
 	}
+}
+
+// SetShutdownHook attaches owner cleanup to the runtime shutdown boundary.
+func (m *JsLoopManager) SetShutdownHook(hook func()) {
+	m.loopLock.Lock()
+	m.shutdownHook = hook
+	m.loopLock.Unlock()
+}
+
+func (m *JsLoopManager) beginStop() {
+	if m == nil {
+		return
+	}
+	m.loopLock.Lock()
+	m.stopped = true
+	waiters := m.takeAllJSCallbackWaitersLocked()
+	m.loopLock.Unlock()
+	notifyJSCallbackWaiters(waiters, errJSRuntimeUnavailable)
 }
 
 // GetLoop returns the loop for a matching runtime generation.
 func (m *JsLoopManager) GetLoop(expectedVersion int64) (jsengine.Loop, error) {
 	m.loopLock.RLock()
 	defer m.loopLock.RUnlock()
+	if m.stopped {
+		return nil, errJSRuntimeUnavailable
+	}
 
 	if instance, ok := m.instances[expectedVersion]; ok && instance != nil {
 		return instance.loop, nil
 	}
 	if expectedVersion == m.currentVersion && m.loop == nil {
-		return nil, nil
+		return nil, errJSRuntimeUnavailable
 	}
 	return nil, fmt.Errorf("version mismatch: expected %d, current %d", expectedVersion, m.version)
 }
@@ -180,6 +255,9 @@ func (m *JsLoopManager) GetLoop(expectedVersion int64) (jsengine.Loop, error) {
 func (m *JsLoopManager) CurrentLoop() (jsengine.Loop, int64) {
 	m.loopLock.RLock()
 	defer m.loopLock.RUnlock()
+	if m.stopped {
+		return nil, m.currentVersion
+	}
 	return m.loop, m.currentVersion
 }
 
@@ -187,6 +265,9 @@ func (m *JsLoopManager) CurrentLoop() (jsengine.Loop, int64) {
 func (m *JsLoopManager) LoopForEngine(engine jsengine.EngineID) (jsengine.Loop, int64) {
 	m.loopLock.RLock()
 	defer m.loopLock.RUnlock()
+	if m.stopped {
+		return nil, 0
+	}
 	engine = jsengine.NormalizeEngineID(string(engine))
 	version, ok := m.engines[engine]
 	if !ok {
@@ -207,6 +288,11 @@ func (m *JsLoopManager) AddInstance(instance *jsRuntimeInstance) int64 {
 	}
 	engine := jsengine.NormalizeEngineID(string(instance.loop.Engine()))
 	m.loopLock.Lock()
+	if m.stopped {
+		m.loopLock.Unlock()
+		_ = instance.Close()
+		return 0
+	}
 	if m.instances == nil {
 		m.instances = make(map[int64]*jsRuntimeInstance)
 	}
@@ -258,7 +344,9 @@ func (m *JsLoopManager) RemoveInstance(version int64) {
 		m.loop = nil
 		m.currentVersion = 0
 	}
+	waiters := m.takeJSCallbackWaitersLocked(version)
 	m.loopLock.Unlock()
+	notifyJSCallbackWaiters(waiters, errJSCallbackStaleGeneration)
 	_ = instance.Close()
 }
 
@@ -267,6 +355,13 @@ func (m *JsLoopManager) RemoveInstance(version int64) {
 // become stale.
 func (m *JsLoopManager) SetInstance(newInstance *jsRuntimeInstance) int64 {
 	m.loopLock.Lock()
+	if m.stopped {
+		m.loopLock.Unlock()
+		if newInstance != nil {
+			_ = newInstance.Close()
+		}
+		return 0
+	}
 	oldInstances := make([]*jsRuntimeInstance, 0, len(m.instances))
 	seen := make(map[*jsRuntimeInstance]struct{})
 	for _, oldInstance := range m.instances {
@@ -284,20 +379,104 @@ func (m *JsLoopManager) SetInstance(newInstance *jsRuntimeInstance) int64 {
 	m.instances = make(map[int64]*jsRuntimeInstance)
 	m.engines = make(map[jsengine.EngineID]int64)
 	m.callbackKeys = make(map[jsCallbackKey]struct{})
+	waiters := m.takeAllJSCallbackWaitersLocked()
 	if newInstance != nil && newInstance.loop != nil {
 		newInstance.generation = version
 		m.loop = newInstance.loop
 		m.instances[version] = newInstance
 		m.engines[jsengine.NormalizeEngineID(string(newInstance.loop.Engine()))] = version
 	}
+	var shutdownHook func()
+	if newInstance == nil || newInstance.loop == nil {
+		shutdownHook = m.shutdownHook
+	}
 	m.loopLock.Unlock()
+	notifyJSCallbackWaiters(waiters, errJSCallbackStaleGeneration)
 
+	if shutdownHook != nil {
+		shutdownHook()
+	}
 	for _, oldInstance := range oldInstances {
 		if oldInstance != newInstance {
 			_ = oldInstance.Close()
 		}
 	}
 	return version
+}
+
+// stop permanently closes admission and all runtime generations. Close calls
+// start once; concurrent callers join the same completion boundary.
+func (m *JsLoopManager) stop() error {
+	if m == nil {
+		return nil
+	}
+	m.loopLock.Lock()
+	if m.stopDone != nil {
+		done := m.stopDone
+		m.loopLock.Unlock()
+		<-done
+		m.loopLock.RLock()
+		err := m.stopErr
+		m.loopLock.RUnlock()
+		return err
+	}
+	m.stopped = true
+	m.stopDone = make(chan struct{})
+	done := m.stopDone
+	oldInstances := make([]*jsRuntimeInstance, 0, len(m.instances))
+	seen := make(map[*jsRuntimeInstance]struct{}, len(m.instances))
+	for _, instance := range m.instances {
+		if instance == nil {
+			continue
+		}
+		if _, ok := seen[instance]; ok {
+			continue
+		}
+		seen[instance] = struct{}{}
+		oldInstances = append(oldInstances, instance)
+	}
+	m.version++
+	m.loop = nil
+	m.currentVersion = m.version
+	m.instances = make(map[int64]*jsRuntimeInstance)
+	m.engines = make(map[jsengine.EngineID]int64)
+	m.callbackKeys = make(map[jsCallbackKey]struct{})
+	waiters := m.takeAllJSCallbackWaitersLocked()
+	shutdownHook := m.shutdownHook
+	m.loopLock.Unlock()
+	notifyJSCallbackWaiters(waiters, errJSRuntimeUnavailable)
+
+	if shutdownHook != nil {
+		shutdownHook()
+	}
+	err := closeJSRuntimeInstances(oldInstances)
+	m.loopLock.Lock()
+	m.stopErr = err
+	close(done)
+	m.loopLock.Unlock()
+	return err
+}
+
+func closeJSRuntimeInstances(instances []*jsRuntimeInstance) error {
+	switch len(instances) {
+	case 0:
+		return nil
+	case 1:
+		return instances[0].Close()
+	}
+	results := make(chan error, len(instances))
+	for _, instance := range instances {
+		go func() {
+			results <- instance.Close()
+		}()
+	}
+	errs := make([]error, 0, len(instances))
+	for range instances {
+		if err := <-results; err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // SetLoop wraps a bare loop in an owned instance for compatibility with
@@ -325,10 +504,22 @@ func (x ExtDefaultSettingItemSlice) Swap(i, j int)      { x[i], x[j] = x[j], x[i
 type Dice struct {
 	// 纯 OneBot 的出站请求通过此窄接口进入 durable outbound service。
 	OutboundBridge OutboundBridgePort `json:"-" yaml:"-"`
-	// DurableStore is the optional event-store seam for extension/config
-	// compatibility APIs. It intentionally exposes only the store interface,
-	// never a mutable aggregate or projection pointer.
+	// ProviderQuery answers read-only questions about a running endpoint, such as
+	// the bot's own role in a group. It is the supervisor in production.
+	ProviderQuery ProviderQueryPort `json:"-" yaml:"-"`
+	// ProviderCall executes an immediate, generation-fenced request on a running endpoint.
+	ProviderCall ProviderCallPort `json:"-" yaml:"-"`
+	// InboundReplay hands messages recovered from a provider's history back to
+	// ingress and reports what became of them.
+	InboundReplay InboundReplayPort `json:"-" yaml:"-"`
+	mailSend      mailSendFunc
+	// DurableStore is the narrow event-store seam for aggregate operations.
 	DurableStore eventstore.Store `json:"-" yaml:"-"`
+	// LogRepository is the runtime contract shared by legacy and EventStore
+	// story-log consumers, bound to this Dice's identity.
+	LogRepository     service.LogRepository `json:"-" yaml:"-"`
+	configUpdateMu    sync.Mutex
+	EndpointLifecycle EndpointLifecyclePort `json:"-" yaml:"-"`
 	// 由于被导出的原因，暂时不迁移至 config
 	ImSession   *IMSession                 `jsbind:"imSession" json:"-" yaml:"imSession"`
 	CmdMap      CmdMapCls                  `json:"-" yaml:"-"`
@@ -367,17 +558,21 @@ type Dice struct {
 	ConfigManager *ConfigManager `yaml:"-"`
 	Parent        *DiceManager   `yaml:"-"`
 
-	CocExtraRules    map[int]*CocRuleInfo `json:"cocExtraRules" yaml:"-"`
-	Cron             *cron.Cron           `json:"-"             yaml:"-"`
-	AliveNoticeEntry cron.EntryID         `json:"-"             yaml:"-"`
-	JsPrinter        *PrinterFunc         `json:"-"             yaml:"-"`
-	jsRuntimeManager *JSRuntimeManager    `json:"-" yaml:"-"`
+	cocRulesMu       sync.RWMutex
+	cocExtraRules    map[int]CocRuleInfo
+	Cron             *cron.Cron        `json:"-"             yaml:"-"`
+	AliveNoticeEntry cron.EntryID      `json:"-"             yaml:"-"`
+	JsPrinter        *PrinterFunc      `json:"-"             yaml:"-"`
+	jsRuntimeManager *JSRuntimeManager `json:"-" yaml:"-"`
 
 	// JsLoop           *eventloop.EventLoop `yaml:"-" json:"-"`
 	ExtLoopManager   *JsLoopManager  `json:"-" yaml:"-"`
 	JsScriptList     []*JsScriptInfo `json:"-" yaml:"-"`
 	JsScriptCron     *cron.Cron      `json:"-" yaml:"-"`
 	JsScriptCronLock *sync.Mutex     `json:"-" yaml:"-"`
+	jsScriptCronMu   sync.Mutex      `json:"-" yaml:"-"`
+	// jsDependencyScope 是最近一次全量/局部加载中参与依赖检查的脚本（含被用户禁用的），供局部加载复用。
+	jsDependencyScope []*JsScriptInfo `json:"-" yaml:"-"`
 	// 重载使用的互斥锁
 	JsReloadLock sync.Mutex `json:"-" yaml:"-"`
 	// JS 重载进度，用于 WebUI 查询当前真实重载阶段。
@@ -385,8 +580,10 @@ type Dice struct {
 	// 内置脚本摘要表，用于判断内置脚本是否有更新
 	JsBuiltinDigestSet map[string]bool `json:"-" yaml:"-"`
 
-	// 游戏系统规则模板
-	GameSystemMap *SyncMap[string, *GameSystemTemplate] `json:"-" yaml:"-"`
+	GameSystemMap                       *SyncMap[string, *GameSystemTemplate] `json:"-" yaml:"-"`
+	jsGameSystemTemplatesMu             sync.Mutex
+	jsGameSystemTemplates               map[string]*GameSystemTemplate
+	preferFileBackedGameSystemTemplates bool
 
 	RunAfterLoaded []func() `json:"-" yaml:"-"`
 
@@ -423,10 +620,37 @@ type Dice struct {
 	JsExtRegistry *SyncMap[string, *ExtInfo] `json:"-" yaml:"-"` // JS 扩展真实 ExtInfo 注册表
 	ExtUpdateTime int64                      `json:"-" yaml:"-"` // 扩展变更时间戳，用于触发群组延迟更新
 	JsReloading   bool                       `json:"-" yaml:"-"` // JS 扩展正在重载中
+	// jsCallbacksGated mirrors JsReloading for lock-free reads on message goroutines.
+	jsCallbacksGated atomic.Bool       `json:"-" yaml:"-"`
+	jsLoadDrops      jsLoadDropTracker `json:"-" yaml:"-"`
+	// jsAllocSampler and jsHeapTracker are created on first use so Dice values
+	// built without a constructor still get them.
+	jsAllocSamplerOnce sync.Once       `json:"-" yaml:"-"`
+	jsAllocSampler     *JSAllocSampler `json:"-" yaml:"-"`
+	jsHeapTrackerOnce  sync.Once       `json:"-" yaml:"-"`
+	jsHeapTracker      *JSHeapTracker  `json:"-" yaml:"-"`
+	// extensionSnapshots lets durable extension state loads continue from the
+	// last replayed state instead of replaying the whole event stream.
+	extensionSnapshots extensionstate.SnapshotCache `json:"-" yaml:"-"`
 	// 记录当前运行中的 VM 是否实际暴露了 seal.inst。不能只看 AdvancedConfig，
 	// 因为脚本本身就可以通过 seal.inst 改写这份配置，但那不会立刻改变已经构建完成的 VM。
-	JsSealInstExposed bool           `json:"-" yaml:"-"`
-	startupJsLoadWG   sync.WaitGroup `json:"-" yaml:"-"`
+	JsSealInstExposed bool `json:"-" yaml:"-"`
+	// startupJsLoadMu also closes process-stop admission before waiting for
+	// lifecycle operations that were already admitted. Production startup can
+	// hold one admitted script load until application composition is complete;
+	// constructors which do not opt in retain the immediate behavior.
+	startupJsLoadMu        sync.Mutex         `json:"-" yaml:"-"`
+	startupJsLoadCount     int                `json:"-" yaml:"-"`
+	startupJsLoadDone      chan struct{}      `json:"-" yaml:"-"`
+	startupJsLoadDeferred  bool               `json:"-" yaml:"-"`
+	startupJsLoadScheduled bool               `json:"-" yaml:"-"`
+	startupJsLoadPending   bool               `json:"-" yaml:"-"`
+	startupJsLoadAfterLoad func()             `json:"-" yaml:"-"`
+	jsLifecycleCtx         context.Context    `json:"-" yaml:"-"`
+	jsLifecycleCancel      context.CancelFunc `json:"-" yaml:"-"`
+	jsStopRequested        bool               `json:"-" yaml:"-"`
+	jsStopDone             chan struct{}      `json:"-" yaml:"-"`
+	jsStopErr              error              `json:"-" yaml:"-"`
 
 	/* 保存优化 */
 	DirtyGroups *SyncMap[string, int64] `json:"-" yaml:"-"` // 脏群组列表：groupID -> UpdatedAtTime
@@ -438,42 +662,194 @@ func (d *Dice) MarkModified() {
 	d.LastUpdatedTime = time.Now().Unix()
 }
 
+// LockConfigUpdate serializes updates that persist and publish a config snapshot.
+// Callers must pair it with UnlockConfigUpdate.
+func (d *Dice) LockConfigUpdate() {
+	d.configUpdateMu.Lock()
+}
+
+// UnlockConfigUpdate releases the lock acquired by LockConfigUpdate.
+func (d *Dice) UnlockConfigUpdate() {
+	d.configUpdateMu.Unlock()
+}
+
 func (d *Dice) StartStartupJsLoad() {
-	if !d.Config.JsEnable {
+	d.startStartupJsLoad(nil)
+}
+
+func (d *Dice) startStartupJsLoad(afterLoad func()) {
+	deferred, admitted := d.admitStartupJsLoad(afterLoad)
+	if !admitted || deferred {
 		return
 	}
-	d.startupJsLoadWG.Add(1)
-	d.JsReloading = true
+	d.runStartupJsLoad(afterLoad)
+}
+
+func (d *Dice) runStartupJsLoad(afterLoad func()) {
+	if !d.Config.JsEnable {
+		defer d.finishStartupJsLoad()
+		if afterLoad != nil {
+			afterLoad()
+		}
+		return
+	}
+	d.setJsReloading(true)
 	d.JsReloadLock.Lock()
 	go func() {
-		defer d.JsReloadLock.Unlock()
-		defer d.startupJsLoadWG.Done()
+		defer func() {
+			d.JsReloadLock.Unlock()
+			d.finishStartupJsLoad()
+		}()
 		d.Logger.Info("JS 扩展脚本开始异步加载")
 		d.BeginJsReloadProgress("开始异步加载 JS 扩展脚本")
 		d.JsBuiltinDigestSet = make(map[string]bool)
 		d.JsLoadScripts()
 		// 需要在退出 JsReloading 状态后再应用默认扩展设置，
 		// 否则 JS wrapper 的 GetCmdMap() 会在重载保护下返回空映射，导致第三方 JS 扩展的指令列表丢失。
-		d.JsReloading = false
+		d.setJsReloading(false)
 		d.UpdateJsReloadProgress("apply_settings", "正在应用扩展默认设置", 0, 0, 94, "")
 		d.ApplyExtDefaultSettings()
+		if afterLoad != nil {
+			afterLoad()
+		}
 		d.FinishJsReloadProgress("JS 扩展脚本异步加载完成")
 		d.Logger.Info("JS 扩展脚本异步加载完成")
 	}()
 }
 
-func (d *Dice) WaitStartupJsLoaded() {
-	if d.Config.JsEnable {
-		d.startupJsLoadWG.Wait()
+func (d *Dice) deferStartupJSLoad() error {
+	if d == nil {
+		return errors.New("dice: cannot defer startup JavaScript for a nil runtime")
+	}
+	d.startupJsLoadMu.Lock()
+	defer d.startupJsLoadMu.Unlock()
+	if d.jsStopRequested {
+		return errors.New("dice: JavaScript runtime is stopping")
+	}
+	if d.startupJsLoadScheduled || d.startupJsLoadDeferred || d.startupJsLoadPending {
+		return errors.New("dice: startup JavaScript load is already scheduled")
+	}
+	d.startupJsLoadDeferred = true
+	return nil
+}
+
+func (d *Dice) startDeferredStartupJSLoad() {
+	if d == nil {
+		return
+	}
+	d.startupJsLoadMu.Lock()
+	if d.jsStopRequested || !d.startupJsLoadDeferred {
+		d.startupJsLoadMu.Unlock()
+		return
+	}
+	d.startupJsLoadDeferred = false
+	if !d.startupJsLoadPending {
+		d.startupJsLoadMu.Unlock()
+		return
+	}
+	afterLoad := d.startupJsLoadAfterLoad
+	d.startupJsLoadPending = false
+	d.startupJsLoadAfterLoad = nil
+	d.startupJsLoadMu.Unlock()
+	d.runStartupJsLoad(afterLoad)
+}
+
+func (d *Dice) admitStartupJsLoad(afterLoad func()) (bool, bool) {
+	d.startupJsLoadMu.Lock()
+	defer d.startupJsLoadMu.Unlock()
+	if d.jsStopRequested || (d.startupJsLoadDeferred && d.startupJsLoadScheduled) {
+		return false, false
+	}
+	if !d.beginStartupJsLoadLocked() {
+		return false, false
+	}
+	d.startupJsLoadScheduled = true
+	if !d.startupJsLoadDeferred {
+		return false, true
+	}
+	d.startupJsLoadPending = true
+	d.startupJsLoadAfterLoad = afterLoad
+	return true, true
+}
+
+func (d *Dice) cancelDeferredStartupJsLoadLocked() {
+	d.startupJsLoadDeferred = false
+	if !d.startupJsLoadPending {
+		return
+	}
+	d.startupJsLoadPending = false
+	d.startupJsLoadAfterLoad = nil
+	d.finishStartupJsLoadLocked()
+}
+
+func (d *Dice) beginStartupJsLoad() bool {
+	d.startupJsLoadMu.Lock()
+	defer d.startupJsLoadMu.Unlock()
+	return d.beginStartupJsLoadLocked()
+}
+
+func (d *Dice) beginStartupJsLoadLocked() bool {
+	if d.jsStopRequested {
+		return false
+	}
+	if d.jsLifecycleCtx == nil {
+		d.jsLifecycleCtx, d.jsLifecycleCancel = context.WithCancel(context.Background())
+	}
+	if d.startupJsLoadCount == 0 {
+		d.startupJsLoadDone = make(chan struct{})
+	}
+	d.startupJsLoadCount++
+	return true
+}
+
+// setJsReloading 同步更新 JsReloading 与回调门控标志；JS 回调只在脚本加载阶段之外投递，
+// 加载结束时汇总加载期间被丢弃的回调。
+func (d *Dice) setJsReloading(loading bool) {
+	d.JsReloading = loading
+	d.jsCallbacksGated.Store(loading)
+	if loading {
+		d.jsLoadDrops.take()
+		return
+	}
+	d.logJSLoadDropSummary()
+}
+
+func (d *Dice) finishStartupJsLoad() {
+	d.startupJsLoadMu.Lock()
+	defer d.startupJsLoadMu.Unlock()
+	d.finishStartupJsLoadLocked()
+}
+
+func (d *Dice) finishStartupJsLoadLocked() {
+	if d.startupJsLoadCount == 0 {
+		return
+	}
+	d.startupJsLoadCount--
+	if d.startupJsLoadCount == 0 {
+		close(d.startupJsLoadDone)
+		d.startupJsLoadDone = nil
 	}
 }
 
-func (d *Dice) CocExtraRulesAdd(ruleInfo *CocRuleInfo) bool {
-	if _, ok := d.CocExtraRules[ruleInfo.Index]; ok {
-		return false
+func (d *Dice) WaitStartupJsLoaded() {
+	d.startupJsLoadMu.Lock()
+	done := d.startupJsLoadDone
+	d.startupJsLoadMu.Unlock()
+	if done != nil {
+		<-done
 	}
-	d.CocExtraRules[ruleInfo.Index] = ruleInfo
-	return true
+}
+
+func (d *Dice) jsRuntimeContext() context.Context {
+	d.startupJsLoadMu.Lock()
+	defer d.startupJsLoadMu.Unlock()
+	if d.jsLifecycleCtx == nil {
+		d.jsLifecycleCtx, d.jsLifecycleCancel = context.WithCancel(context.Background())
+		if d.jsStopRequested {
+			d.jsLifecycleCancel()
+		}
+	}
+	return d.jsLifecycleCtx
 }
 
 func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter) {
@@ -492,10 +868,11 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 	d.Cron = cron.New()
 	d.Cron.Start()
 
-	d.CocExtraRules = map[int]*CocRuleInfo{}
+	d.clearCocExtraRules()
 
 	var err error
 	d.DBOperator = operator
+	d.LogRepository = service.NewLegacyLogRepository(operator, d.BaseConfig.Name)
 	d.AttrsManager = &AttrsManager{}
 	d.AttrsManager.Init(d)
 
@@ -531,6 +908,7 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 		loggerInstance.Error("Failed to load plugin configs: ", err)
 	}
 
+	d.initializeTextTemplates()
 	d.registerCoreCommands()
 	d.RegisterBuiltinExt()
 	d.loadAdvanced()
@@ -542,11 +920,12 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 		d.NewCensorManager()
 	}
 
+	// 始终在启动时应用待生效的运行时包，JS 执行开关只控制脚本加载。
+	d.jsRuntimeManager = NewJSRuntimeManagerForDice(d)
 	go d.PublicDiceSetup()
 
 	go d.StoreSetup()
 
-	// 创建js运行时
 	if d.Config.JsEnable {
 		loggerInstance.Info("js扩展支持：开启")
 		d.ExtLoopManager = NewJsLoopManager() // 此时不初始化loop，Init才初始化哦
@@ -562,13 +941,7 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 	// 反序列化时将 activatedExtList 解析为全局共享 ExtInfo 指针。
 	d.loadGroups()
 
-	for _, i := range d.ExtList {
-		if i.OnLoad != nil {
-			i.callWithJsCheck(d, func() {
-				i.OnLoad()
-			})
-		}
-	}
+	d.runExtensionOnLoad()
 
 	for _, i := range d.RunAfterLoaded {
 		defer func() {
@@ -586,6 +959,7 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 		t := time.NewTicker(30 * time.Second)
 		for {
 			<-t.C
+			d.ImSession.pruneExpiredPendingQuits(time.Now())
 			if d.IsAlreadyLoadConfig {
 				count++
 				d.Save(true)
@@ -620,7 +994,7 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 			<-t.C
 
 			// 自动更新群信息
-			for _, i := range d.ImSession.EndPoints {
+			for _, i := range d.ImSession.EndPointsReadOnly() {
 				if i.Enable {
 					// Pinenutn: Range模板 ServiceAtNew重构代码
 					d.ImSession.ServiceAtNew.Range(func(key string, groupInfo *GroupInfo) bool {
@@ -634,7 +1008,7 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 							if now-atomic.LoadInt64(&groupInfo.RecentDiceSendTime) < 60 {
 								// 在群内存在，且开启时，且不在刷新CD中
 								if groupInfo.DiceIDExistsMap.Exists(diceID) && groupInfo.DiceIDActiveMap.Exists(diceID) && d.Parent.ShouldRefreshGroupInfo(key) {
-									i.Adapter.GetGroupInfoAsync(key)
+									i.GetGroupInfoAsync(key)
 								}
 							}
 						}
@@ -648,7 +1022,7 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 
 	d.ApplyAliveNotice()
 	if d.Config.JsEnable {
-		d.StartStartupJsLoad()
+		d.startStartupJsLoad(d.PackageSetup)
 	} else {
 		loggerInstance.Info("js扩展支持已关闭，跳过js脚本的加载")
 	}
@@ -658,7 +1032,7 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 			defer ErrorLogAndContinue(d)
 
 			var ep *EndPointInfo
-			for _, _ep := range d.ImSession.EndPoints {
+			for _, _ep := range d.ImSession.EndPointsReadOnly() {
 				if _ep.ID == d.Config.UpgradeEndpointID {
 					ep = _ep
 					break
@@ -681,12 +1055,14 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 
 				// 可以了，发送消息
 				ctx := &MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession}
-				isGroup := strings.Contains(d.Config.UpgradeWindowID, "-Group:")
-				if isGroup {
-					ReplyGroup(ctx, &Message{GroupID: d.Config.UpgradeWindowID}, text)
-				} else {
-					ReplyPerson(ctx, &Message{Sender: SenderBase{UserID: d.Config.UpgradeWindowID}}, text)
-				}
+				_ = ctx.runStandaloneMessageScope(func() {
+					isGroup := strings.Contains(d.Config.UpgradeWindowID, "-Group:")
+					if isGroup {
+						ReplyGroup(ctx, &Message{GroupID: d.Config.UpgradeWindowID}, text)
+					} else {
+						ReplyPerson(ctx, &Message{Sender: SenderBase{UserID: d.Config.UpgradeWindowID}}, text)
+					}
+				})
 
 				loggerInstance.Infof("升级完成，当前版本: %s", VERSION.String())
 				(&d.Config).UpgradeWindowID = ""
@@ -701,6 +1077,16 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 	d.ResetQuitInactiveCron()
 
 	d.MarkModified()
+}
+
+func (d *Dice) runExtensionOnLoad() {
+	for _, i := range d.ExtList {
+		if i.OnLoad != nil {
+			i.callWithJsCheck(d, func() {
+				i.OnLoad()
+			})
+		}
+	}
 }
 
 func (d *Dice) rebuildParser(buffer string) *DiceRollParser {
@@ -922,6 +1308,7 @@ func (d *Dice) extFindPostProcess(ext *ExtInfo, fromJS bool) *ExtInfo {
 				SourceLocation:          info.SourceLocation,
 				Solve:                   info.Solve,
 				SolveRaw:                info.SolveRaw,
+				SolveCallback:           info.SolveCallback,
 				SolveEngine:             info.SolveEngine,
 				Raw:                     info.Raw,
 				CheckCurrentBotOn:       info.CheckCurrentBotOn,
@@ -1083,6 +1470,13 @@ func (d *Dice) ApplyAliveNotice() {
 
 // GameSystemTemplateAddEx 应用一个角色模板
 func (d *Dice) GameSystemTemplateAddEx(tmpl *GameSystemTemplate, overwrite bool) bool {
+	if d.JsSealInstExposed {
+		return d.addJSGameSystemTemplateObject(tmpl, overwrite, false)
+	}
+	return d.addGameSystemTemplateEx(tmpl, overwrite)
+}
+
+func (d *Dice) addGameSystemTemplateEx(tmpl *GameSystemTemplate, overwrite bool) bool {
 	if tmpl == nil {
 		return false
 	}
@@ -1152,7 +1546,7 @@ func (d *Dice) reloadGameSystemTemplates(files []string) error {
 			d.Logger.Warnf("加载模板文件 %s 失败: %v", templatePath, err)
 			continue
 		}
-		if d.GameSystemTemplateAddEx(tmpl, true) {
+		if d.addGameSystemTemplateEx(tmpl, true) {
 			count++
 			d.Logger.Infof("模板 %s 已重载", tmpl.Name)
 		}
@@ -1271,7 +1665,7 @@ func (d *Dice) PublicDiceEndpointRefresh() {
 	}
 
 	var endpointItems []*public_dice.Endpoint
-	for _, i := range d.ImSession.EndPoints {
+	for _, i := range d.ImSession.EndPointsReadOnly() {
 		if !i.IsPublic {
 			continue
 		}
@@ -1353,7 +1747,7 @@ func (d *Dice) PublicDiceSetupTick() {
 			return
 		}
 		var tickEndpointItems []*public_dice.TickEndpoint
-		for _, i := range d.ImSession.EndPoints {
+		for _, i := range d.ImSession.EndPointsReadOnly() {
 			if !i.IsPublic {
 				continue
 			}
@@ -1440,11 +1834,22 @@ func (d *Dice) StoreSetup() {
 	d.StoreManager = NewStoreManager(d)
 }
 
-// PackageSetup 初始化扩展包管理器
-func (d *Dice) PackageSetup() {
-	d.PackageManager = NewPackageManager(d)
-	if err := d.PackageManager.Init(); err != nil {
+func (d *Dice) initPackageManager() bool {
+	if d.PackageManager != nil {
+		return true
+	}
+	manager := NewPackageManager(d)
+	if err := manager.Init(); err != nil {
 		d.Logger.Errorf("初始化扩展包管理器失败: %v", err)
+		return false
+	}
+	d.PackageManager = manager
+	return true
+}
+
+// PackageSetup 初始化扩展包管理器并恢复扩展包模板。
+func (d *Dice) PackageSetup() {
+	if !d.initPackageManager() {
 		return
 	}
 	if err := d.PackageManager.reloadTemplates(); err != nil {

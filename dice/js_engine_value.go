@@ -22,7 +22,7 @@ func (v gojaEngineValue) Export() interface{} {
 
 func (v gojaEngineValue) ExportPrimitive() (any, error) {
 	if v.value == nil || goja.IsUndefined(v.value) || goja.IsNull(v.value) {
-		return nil, nil
+		return nil, jsengine.ErrNoPrimitiveValue
 	}
 	if _, ok := v.value.(*goja.Object); ok {
 		return nil, fmt.Errorf("%w: object", jsengine.ErrPrimitiveExportUnsupported)

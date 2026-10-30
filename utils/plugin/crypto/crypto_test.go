@@ -2,7 +2,9 @@
 package sealcrypto
 
 import (
+	"crypto/elliptic"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"io"
 	"regexp"
@@ -36,7 +38,7 @@ func mustRun(t *testing.T, vm *goja.Runtime, src string) goja.Value {
 
 func TestGetRandomValues(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	v := mustRun(t, vm, `(function(){const a = new Uint8Array(32); crypto.getRandomValues(a); return a;})()`)
 	bytesData, ok := v.Export().([]byte)
@@ -60,7 +62,7 @@ func TestGetRandomValues(t *testing.T) {
 
 func TestDigestSupportsMD5(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	v := mustRun(t, vm, `crypto.subtle.digest("MD5", new Uint8Array([97,98,99]))`)
 	result := mustPromiseFulfilled(t, v)
@@ -75,7 +77,7 @@ func TestDigestSupportsMD5(t *testing.T) {
 
 func TestGenerateSignVerifyHMACSHA1(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	k := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey(
@@ -101,7 +103,7 @@ func TestGenerateSignVerifyHMACSHA1(t *testing.T) {
 
 func TestAESCBCEncryptDecrypt(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	k := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey(
@@ -140,7 +142,7 @@ func TestAESCBCEncryptDecrypt(t *testing.T) {
 
 func TestAESGCMEncryptDecryptNon12IV(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	k := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey(
@@ -179,7 +181,7 @@ func TestAESGCMEncryptDecryptNon12IV(t *testing.T) {
 
 func TestDESCBCEncryptDecrypt(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	k := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey(
@@ -218,7 +220,7 @@ func TestDESCBCEncryptDecrypt(t *testing.T) {
 
 func Test3DESCBCEncryptDecryptAlias(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	k := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.importKey(
@@ -259,7 +261,7 @@ func Test3DESCBCEncryptDecryptAlias(t *testing.T) {
 
 func TestRSAESPKCS1v15EncryptDecrypt(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	pair := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey(
@@ -291,7 +293,7 @@ func TestRSAESPKCS1v15EncryptDecrypt(t *testing.T) {
 
 func TestRSAESPKCS1v15EncryptDecryptWithoutHashParam(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	pair := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey(
@@ -323,7 +325,7 @@ func TestRSAESPKCS1v15EncryptDecryptWithoutHashParam(t *testing.T) {
 
 func TestPBKDF2DeriveBitsSHA1(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	baseKey := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.importKey(
@@ -354,7 +356,7 @@ func TestPBKDF2DeriveBitsSHA1(t *testing.T) {
 
 func TestHKDFDeriveBitsSHA256(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	baseKey := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.importKey(
@@ -391,7 +393,7 @@ func TestHKDFDeriveBitsSHA256(t *testing.T) {
 
 func TestAESCTREncryptDecrypt(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	k := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey(
@@ -430,7 +432,7 @@ func TestAESCTREncryptDecrypt(t *testing.T) {
 
 func TestECDSAGenerateSignVerify(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	pair := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey(
@@ -467,7 +469,7 @@ func TestECDSAGenerateSignVerify(t *testing.T) {
 
 func TestECDSASignatureFormatRaw(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	pair := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey(
@@ -511,7 +513,7 @@ func TestECDSASignatureFormatRaw(t *testing.T) {
 
 func TestWrapUnwrapKey(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	keyToWrap := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey({name:"AES-CBC", length:128}, true, ["encrypt","decrypt"])
@@ -558,7 +560,7 @@ func TestWrapUnwrapKey(t *testing.T) {
 
 func TestWrapUnwrapKeyJWKRSA(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	pair := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey(
@@ -610,7 +612,7 @@ func TestWrapUnwrapKeyJWKRSA(t *testing.T) {
 
 func TestWrapUnwrapKeyPKCS8RSA(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	pair := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey(
@@ -662,7 +664,7 @@ func TestWrapUnwrapKeyPKCS8RSA(t *testing.T) {
 
 func TestECDHDeriveBits(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	aPair := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey({name:"ECDH", namedCurve:"P-256"}, true, ["deriveBits"])
@@ -699,7 +701,7 @@ func TestECDHDeriveBits(t *testing.T) {
 
 func TestAESKWEncryptDecrypt(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	k := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey({name:"AES-KW", length:128}, true, ["encrypt","decrypt","wrapKey","unwrapKey"])
@@ -725,7 +727,7 @@ func TestAESKWEncryptDecrypt(t *testing.T) {
 
 func TestPKCS1ImportExport(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	pair := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey(
@@ -761,7 +763,7 @@ func TestPKCS1ImportExport(t *testing.T) {
 
 func TestRSAJWKImportWithoutPQ(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	pair := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey(
@@ -803,7 +805,7 @@ func TestRSAJWKImportWithoutPQ(t *testing.T) {
 
 func TestRSAGenerateKeyPublicExponentVariants(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	pairE3 := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey(
@@ -854,7 +856,7 @@ func TestRSAGenerateKeyPublicExponentVariants(t *testing.T) {
 
 func TestSEC1ImportExport(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	pair := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey(
@@ -890,7 +892,7 @@ func TestSEC1ImportExport(t *testing.T) {
 
 func TestECDSARawPublicImportExport(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	pair := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey(
@@ -924,9 +926,55 @@ func TestECDSARawPublicImportExport(t *testing.T) {
 	}
 }
 
+func TestECJWKPrivateKeyValidation(t *testing.T) {
+	for _, curve := range []elliptic.Curve{elliptic.P256(), elliptic.P384(), elliptic.P521()} {
+		t.Run(curve.Params().Name, func(t *testing.T) {
+			size := (curve.Params().BitSize + 7) / 8
+			for _, scalar := range []byte{1, 0, 2} {
+				t.Run(hex.EncodeToString([]byte{scalar}), func(t *testing.T) {
+					vm := goja.New()
+					Enable(vm, nil)
+					d := make([]byte, size)
+					d[size-1] = scalar
+					jwk := map[string]interface{}{
+						"kty": "EC", "crv": curve.Params().Name,
+						"x": base64.RawURLEncoding.EncodeToString(curve.Params().Gx.FillBytes(make([]byte, size))),
+						"y": base64.RawURLEncoding.EncodeToString(curve.Params().Gy.FillBytes(make([]byte, size))),
+						"d": base64.RawURLEncoding.EncodeToString(d),
+					}
+					if err := vm.Set("jwk", jwk); err != nil {
+						t.Fatal(err)
+					}
+					result := mustRun(t, vm, `crypto.subtle.importKey("jwk", jwk, {name:"ECDSA"}, true, ["sign"])`)
+					promise, ok := result.Export().(*goja.Promise)
+					if !ok {
+						t.Fatalf("import result = %T, want Promise", result.Export())
+					}
+					if scalar != 1 {
+						if promise.State() != goja.PromiseStateRejected {
+							t.Fatal("import accepted an invalid scalar or mismatched public key")
+						}
+						return
+					}
+					key := mustPromiseFulfilled(t, result)
+					if err := vm.Set("key", key); err != nil {
+						t.Fatal(err)
+					}
+					exported := mustPromiseFulfilled(t, mustRun(t, vm, `crypto.subtle.exportKey("jwk", key)`)).ToObject(vm)
+					for _, field := range []string{"crv", "x", "y", "d"} {
+						if got := exported.Get(field).String(); got != jwk[field] {
+							t.Fatalf("exported %s = %q, want %q", field, got, jwk[field])
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestEd25519RawPublicImportExport(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	pair := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey({name:"Ed25519"}, true, ["sign","verify"])
@@ -958,7 +1006,7 @@ func TestEd25519RawPublicImportExport(t *testing.T) {
 
 func TestEd25519RawPrivateImportSign(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	importedPri := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.importKey(
@@ -994,7 +1042,7 @@ func TestEd25519RawPrivateImportSign(t *testing.T) {
 
 func TestX25519RawPublicImportForDerive(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	aPair := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey({name:"X25519"}, true, ["deriveBits"])
@@ -1037,7 +1085,7 @@ func TestX25519RawPublicImportForDerive(t *testing.T) {
 
 func TestX25519RawPrivateImportForDerive(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	aPriv := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.importKey(
@@ -1095,7 +1143,7 @@ func TestX25519RawPrivateImportForDerive(t *testing.T) {
 
 func TestEd25519SignVerify(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	pair := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey({name:"Ed25519"}, true, ["sign","verify"])
@@ -1119,7 +1167,7 @@ func TestEd25519SignVerify(t *testing.T) {
 
 func TestX25519DeriveBits(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	aPair := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey({name:"X25519"}, true, ["deriveBits"])
@@ -1155,7 +1203,7 @@ func TestX25519DeriveBits(t *testing.T) {
 
 func TestImportExportRawRoundTrip(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	k := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.importKey(
@@ -1180,7 +1228,7 @@ func TestImportExportRawRoundTrip(t *testing.T) {
 
 func TestExportJWKIncludesAlg(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	k := mustPromiseFulfilled(t, mustRun(t, vm, `
 		crypto.subtle.generateKey(
@@ -1205,7 +1253,7 @@ func TestExportJWKIncludesAlg(t *testing.T) {
 func TestRequireCryptoModule(t *testing.T) {
 	vm := goja.New()
 	reg := new(require.Registry)
-	reg.RegisterNativeModule("crypto", Require)
+	reg.RegisterNativeModule("crypto", Require(nil))
 	reg.Enable(vm)
 
 	v := mustRun(t, vm, `
@@ -1238,7 +1286,7 @@ func TestRequireCryptoModule(t *testing.T) {
 
 func TestRandomUUIDFormat(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	v := mustRun(t, vm, `crypto.randomUUID()`)
 	uuid := v.String()
@@ -1250,7 +1298,7 @@ func TestRandomUUIDFormat(t *testing.T) {
 
 func TestTextEncoderTextDecoderGlobals(t *testing.T) {
 	vm := goja.New()
-	Enable(vm)
+	Enable(vm, nil)
 
 	v := mustRun(t, vm, `
 		(function() {

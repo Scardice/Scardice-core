@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -10,10 +11,12 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humaecho"
+	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/monaco-io/request"
 	"github.com/robfig/cron/v3"
@@ -36,7 +39,9 @@ type VersionDetail struct {
 
 func preInfo(c echo.Context) error {
 	return c.JSON(200, map[string]interface{}{
-		"testMode": dm.JustForTest,
+		"testMode":                       dm.JustForTest,
+		"testWebUIAuthBypass":            testWebUIAuthBypassEnabled(),
+		"testWebUIOriginRateLimitBypass": WebUIOriginRateLimitBypassEnabled(),
 	})
 }
 
@@ -141,7 +146,7 @@ func forceStop(c echo.Context) error {
 	haskey := false
 	for _, s := range os.Environ() {
 		if strings.HasPrefix(s, "FSTOP_KEY=") {
-			key := strings.Split(s, "=")[1]
+			key := strings.TrimPrefix(s, "FSTOP_KEY=")
 			v := fStopEcho{}
 			err := c.Bind(&v)
 			if err != nil {
@@ -159,69 +164,21 @@ func forceStop(c echo.Context) error {
 		return c.JSON(http.StatusForbidden, nil)
 	}
 	defer func() {
-		// Same with main.go `cleanUpCreate()` 由于无法导入 main.go 中的函数，所以这里直接复制过来了
 		log := myDice.Logger
 		log.Info("程序即将退出，进行清理……")
-		err := recover()
-		log.Errorf("异常: %v\n堆栈: %v", err, string(debug.Stack()))
+		if err := recover(); err != nil {
+			log.Errorf("异常: %v\n堆栈: %v", err, string(debug.Stack()))
+		}
 		diceManager := dm
-		if diceManager.EventSourcedMode {
-			for _, instance := range diceManager.Dice {
-				if instance != nil && instance.Cron != nil {
-					instance.Cron.Stop()
-				}
+		for _, instance := range diceManager.Dice {
+			if instance != nil && instance.Cron != nil {
+				instance.Cron.Stop()
 			}
-			if diceManager.Cron != nil {
-				diceManager.Cron.Stop()
-			}
-			log.Info("事件源 Core 清理完成，程序即将退出")
-			os.Exit(0)
-		}
-
-		for _, i := range diceManager.Dice {
-			if i.IsAlreadyLoadConfig {
-				i.Config.BanList.SaveChanged(i)
-				err = i.AttrsManager.CheckForSave()
-				if err != nil {
-					log.Errorf("异常: %v", err)
-				}
-				i.Save(true)
-				for _, j := range i.ExtList {
-					if j.Storage != nil {
-						err := j.StorageClose()
-						if err != nil {
-							log.Errorf("异常: %v\n堆栈: %v", err, string(debug.Stack()))
-						}
-					}
-				}
-				i.IsAlreadyLoadConfig = false
-			}
-		}
-
-		for _, i := range diceManager.Dice {
-			d := i
-			d.DBOperator.Close()
-		}
-
-		// 清理gocqhttp
-		for _, i := range diceManager.Dice {
-			if i.ImSession != nil && i.ImSession.EndPoints != nil {
-				for _, j := range i.ImSession.EndPoints {
-					dice.BuiltinQQServeProcessKill(i, j)
-				}
-			}
-		}
-
-		if diceManager.Help != nil {
-			diceManager.Help.Close()
-		}
-		if diceManager.IsReady {
-			diceManager.Save()
 		}
 		if diceManager.Cron != nil {
 			diceManager.Cron.Stop()
 		}
-		log.Info("清理完成，程序即将退出")
+		log.Info("事件源 Core 清理完成，程序即将退出")
 		os.Exit(0)
 	}()
 	return c.JSON(http.StatusOK, nil)
@@ -265,19 +222,29 @@ func doSignIn(c echo.Context) error {
 		}
 		token := randomPart + ":" + head
 
-		myDice.Parent.AccessTokens.Store(token, true)
+		if myDice.Parent.EventSourcedMode {
+			authenticated, err := myDice.Parent.AuthenticateAndStoreAccessToken(v.Password, token)
+			if err != nil {
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to persist authentication token"})
+			}
+			if !authenticated {
+				return c.JSON(http.StatusBadRequest, nil)
+			}
+		} else {
+			myDice.Parent.AccessTokens.Store(token, true)
+			myDice.Parent.Save()
+		}
 		myDice.LastUpdatedTime = time.Now().Unix()
-		myDice.Parent.Save()
 		return c.JSON(http.StatusOK, map[string]string{
 			"token": token,
 		})
 	}
 
-	if myDice.Parent.UIPasswordHash == "" {
+	if myDice.Parent.EventSourcedMode {
 		return generateToken()
 	}
 
-	if myDice.Parent.UIPasswordHash == v.Password {
+	if myDice.Parent.UIPasswordHash == "" || myDice.Parent.UIPasswordHash == v.Password {
 		return generateToken()
 	}
 
@@ -359,21 +326,137 @@ func logStream(c echo.Context) error {
 	}
 }
 
-var (
-	lastPrivateExecTime int64
-	lastGroupExecTime   int64
+// uiExecLastAt 记录每个 UI 测试会话最近一次执行的时间，按会话独立限流，
+// 多个测试用户或测试群并行发言时互不阻塞。
+var uiExecLastAt = struct {
+	sync.Mutex
+	byConversation map[string]int64
+}{byConversation: map[string]int64{}}
+
+type diceExecSplitOption struct {
+	Key             string `json:"key"`
+	Label           string `json:"label"`
+	MessageSplitLen int    `json:"messageSplitLen"`
+}
+
+var diceExecSplitOptionsResponse = struct {
+	DefaultKey string                `json:"defaultKey"`
+	Options    []diceExecSplitOption `json:"options"`
+}{
+	DefaultKey: "qq",
+	Options: []diceExecSplitOption{
+		{Key: "short", Label: "短分段 300", MessageSplitLen: 300},
+		{Key: "qq", Label: "QQ 分段 2000", MessageSplitLen: 2000},
+		{Key: "unlimited", Label: "无限", MessageSplitLen: 0},
+	},
+}
+
+func diceExecSplitOptions(c echo.Context) error {
+	if !doAuth(c) {
+		return c.JSON(http.StatusForbidden, nil)
+	}
+	return c.JSON(http.StatusOK, diceExecSplitOptionsResponse)
+}
+
+type diceExecRequest struct {
+	ID              string `form:"id"              json:"id"`
+	Message         string `form:"message"         json:"message"`
+	MessageType     string `form:"messageType"     json:"messageType"`
+	MessageSplitLen *int   `form:"messageSplitLen" json:"messageSplitLen"`
+	UserID          string `form:"userId"          json:"userId"`
+	Nickname        string `form:"nickname"        json:"nickname"`
+	GroupID         string `form:"groupId"         json:"groupId"`
+	GroupName       string `form:"groupName"       json:"groupName"`
+	GroupRole       string `form:"groupRole"       json:"groupRole"`
+}
+
+type diceExecIdentity struct {
+	messageType string
+	userID      string
+	nickname    string
+	groupID     string
+	groupName   string
+	groupRole   string
+}
+
+const (
+	uiUserIDPrefix  = "UI:"
+	uiGroupIDPrefix = "UI-Group:"
+	uiExecNameLimit = 32
 )
 
+// uiSandboxIDSuffix 只允许字母、数字、下划线与连字符，长度 1–32，
+// 防止测试界面伪造其他平台的身份或注入分隔符。
+func validUISandboxIDSuffix(suffix string) bool {
+	if suffix == "" || len(suffix) > 32 {
+		return false
+	}
+	for _, r := range suffix {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '_' && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func trimUIExecName(name, fallback string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fallback
+	}
+	if runes := []rune(name); len(runes) > uiExecNameLimit {
+		return string(runes[:uiExecNameLimit])
+	}
+	return name
+}
+
+// resolveDiceExecIdentity 把测试请求映射为虚拟发送者。未提供身份字段时保持旧行为：
+// 私聊为 UI:1001，群聊为 UI-Group:2001 中的群主 UI:1002。
+func resolveDiceExecIdentity(v diceExecRequest) (diceExecIdentity, error) {
+	id := diceExecIdentity{messageType: "private", userID: "UI:1001", nickname: "User"}
+	if v.MessageType == "group" {
+		id = diceExecIdentity{
+			messageType: "group", userID: "UI:1002", nickname: "User",
+			groupID: "UI-Group:2001", groupName: "UI-Group 2001", groupRole: "owner",
+		}
+	}
+	if v.UserID != "" {
+		if !strings.HasPrefix(v.UserID, uiUserIDPrefix) || !validUISandboxIDSuffix(strings.TrimPrefix(v.UserID, uiUserIDPrefix)) {
+			return id, errors.New("userId 必须形如 UI:1001")
+		}
+		id.userID = v.UserID
+	}
+	id.nickname = trimUIExecName(v.Nickname, id.nickname)
+	if id.messageType != "group" {
+		return id, nil
+	}
+	if v.GroupID != "" {
+		if !strings.HasPrefix(v.GroupID, uiGroupIDPrefix) || !validUISandboxIDSuffix(strings.TrimPrefix(v.GroupID, uiGroupIDPrefix)) {
+			return id, errors.New("groupId 必须形如 UI-Group:2001")
+		}
+		id.groupID = v.GroupID
+		id.groupName = strings.ReplaceAll(strings.TrimPrefix(v.GroupID, "UI-"), ":", " ")
+	}
+	id.groupName = trimUIExecName(v.GroupName, id.groupName)
+	switch v.GroupRole {
+	case "":
+	case "owner", "admin", "member":
+		id.groupRole = v.GroupRole
+	default:
+		return id, errors.New("groupRole 只能是 owner、admin 或 member")
+	}
+	return id, nil
+}
+
+// DiceExec assigns every accepted request a server-generated `UI:exec:<uuid>`
+// RawID, not a provider ID or request-controlled idempotency key. Inbound
+// group-log consumers can therefore archive repeated synthetic UI messages.
 func DiceExec(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
 	}
 
-	v := struct {
-		ID          string `form:"id"          json:"id"`
-		Message     string `form:"message"`
-		MessageType string `form:"messageType"`
-	}{}
+	v := diceExecRequest{}
 	err := c.Bind(&v)
 	if err != nil {
 		return c.JSON(400, "格式错误")
@@ -381,45 +464,44 @@ func DiceExec(c echo.Context) error {
 	if v.Message == "" {
 		return c.JSON(400, "格式错误")
 	}
+	identity, err := resolveDiceExecIdentity(v)
+	if err != nil {
+		return c.JSON(400, err.Error())
+	}
 	timeNeed := int64(500)
 	if dm.JustForTest {
 		timeNeed = 80
 	}
 
-	now := time.Now().UnixMilli()
-	userID := "UI:1001"
-	messageType := "private"
-	groupID := ""
-	groupName := ""
-	groupRole := ""
-	if v.MessageType == "group" {
-		userID = "UI:1002"
-		messageType = "group"
-		groupID = "UI-Group:2001"
-		groupName = "UI-Group 2001"
-		groupRole = "owner"
-		if now-lastGroupExecTime < timeNeed {
-			return c.JSON(400, "过于频繁")
-		}
-		lastGroupExecTime = now
-	} else {
-		if now-lastPrivateExecTime < timeNeed {
-			return c.JSON(400, "过于频繁")
-		}
-		lastPrivateExecTime = now
+	conversation := identity.messageType + ":" + identity.userID
+	if identity.messageType == "group" {
+		conversation = identity.messageType + ":" + identity.groupID
 	}
+	now := time.Now().UnixMilli()
+	uiExecLastAt.Lock()
+	if now-uiExecLastAt.byConversation[conversation] < timeNeed {
+		uiExecLastAt.Unlock()
+		return c.JSON(400, "过于频繁")
+	}
+	uiExecLastAt.byConversation[conversation] = now
+	uiExecLastAt.Unlock()
 
 	msg := &dice.Message{
-		MessageType: messageType,
+		MessageType: identity.messageType,
 		Message:     v.Message,
+		RawID:       "UI:exec:" + uuid.NewString(),
 		Platform:    "UI",
 		Sender: dice.SenderBase{
-			Nickname:  "User",
-			UserID:    userID,
-			GroupRole: groupRole,
+			Nickname:  identity.nickname,
+			UserID:    identity.userID,
+			GroupRole: identity.groupRole,
 		},
-		GroupID:   groupID,
-		GroupName: groupName,
+		GroupID:   identity.groupID,
+		GroupName: identity.groupName,
+	}
+	if v.MessageSplitLen != nil {
+		msg.TestUIOutputSplitLength = *v.MessageSplitLen
+		msg.TestUIOutputSplitLengthSet = true
 	}
 	myDice.ImSession.Execute(myDice.UIEndpoint, msg, false)
 	return c.JSON(200, "ok")
@@ -429,11 +511,13 @@ func DiceRecentMessage(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
 	}
-	pa := myDice.UIEndpoint.Adapter.(*dice.PlatformAdapterHTTP)
-	defer func() {
-		pa.RecentMessage = []dice.HTTPSimpleMessage{}
-	}()
-	return c.JSON(200, pa.RecentMessage)
+	reader, ok := myDice.UIEndpoint.Adapter.(interface {
+		RecentMessagesSince(string) dice.HTTPMessageBatch
+	})
+	if !ok {
+		return c.JSON(http.StatusServiceUnavailable, nil)
+	}
+	return c.JSON(http.StatusOK, reader.RecentMessagesSince(c.QueryParam("cursor")))
 }
 
 func DiceAllCommand(c echo.Context) error {
@@ -511,22 +595,22 @@ func handleGetConfigs(c echo.Context) error {
 	pluginName := c.QueryParam("pluginName")
 	resp := getConfigResp{}
 	if myDice.DurableStoreAttached() {
-		state, err := myDice.DurableExtensionState(nil)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusServiceUnavailable, err.Error())
+		state, itemsErr := myDice.DurableExtensionState(c.Request().Context())
+		if itemsErr != nil {
+			return echo.NewHTTPError(http.StatusServiceUnavailable, itemsErr.Error())
 		}
 		for _, id := range state.ExtensionOrder {
 			if pluginName != "" && id != pluginName {
 				continue
 			}
-			configs, err := myDice.DurableExtensionConfigItems(nil, id)
+			configs, err := myDice.DurableExtensionConfigItems(c.Request().Context(), id)
 			if err != nil {
 				return echo.NewHTTPError(http.StatusServiceUnavailable, err.Error())
 			}
 			resp[id] = &apiPluginConfig{PluginName: id, Configs: configs}
 		}
-		data, err := json.Marshal(resp)
-		if err != nil {
+		data, itemsErr := json.Marshal(resp)
+		if itemsErr != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to marshal data")
 		}
 		return c.JSONBlob(http.StatusOK, data)
@@ -672,6 +756,8 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 
 	// 挂载 humaecho 到 echo 实例
 	_ = humaecho.New(e, huma.DefaultConfig("Sealdiciapi", "1.0.0"))
+	installActivityJSONSerializer(e)
+	e.Use(activityMiddleware)
 
 	e.GET(prefix+"/preInfo", preInfo)
 	e.GET(prefix+"/baseInfo", baseInfo)
@@ -679,6 +765,8 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 	e.GET(prefix+"/log/fetchAndClear", logFetchAndClear)
 	e.GET(prefix+"/log/stream", logStream)
 	e.GET(prefix+"/endpoints", endpointList)
+	e.GET(prefix+"/activity/recent", activityRecent)
+
 	e.POST(prefix+"/endpoints", endpointCreate)
 	e.GET(prefix+"/endpoints/:id", endpointGet)
 	e.PATCH(prefix+"/endpoints/:id/config", endpointConfigPatch)
@@ -712,6 +800,7 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 	e.POST(prefix+"/dice/config/advanced/set", DiceAdvancedConfigSet)
 	e.POST(prefix+"/dice/config/mail_test", DiceMailTest)
 	e.POST(prefix+"/dice/exec", DiceExec)
+	e.GET(prefix+"/dice/exec/split_options", diceExecSplitOptions)
 	e.GET(prefix+"/dice/recentMessage", DiceRecentMessage)
 	e.GET(prefix+"/dice/cmdList", DiceAllCommand)
 	e.POST(prefix+"/dice/upload_to_upgrade", DiceNewVersionUpload)
@@ -727,6 +816,7 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 
 	e.GET(prefix+"/backup/list", backupGetList)
 	e.POST(prefix+"/backup/do_backup", backupExec)
+	e.GET(prefix+"/backup/status", backupStatus)
 	e.GET(prefix+"/backup/config_get", backupConfigGet)
 	e.POST(prefix+"/backup/config_set", backupConfigSave)
 	e.GET(prefix+"/backup/download", backupDownload)
@@ -763,6 +853,10 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 	e.POST(prefix+"/js/reload", jsReload)
 	e.GET(prefix+"/js/reload/status", jsReloadStatus)
 	e.GET(prefix+"/js/runtime/status", jsRuntimeStatus)
+	e.GET(prefix+"/js/runtime/management", jsRuntimeManagementGet)
+	e.POST(prefix+"/js/runtime/config", jsRuntimeConfigSet)
+	e.POST(prefix+"/js/runtime/install", jsRuntimeInstall)
+	e.POST(prefix+"/js/runtime/uninstall", jsRuntimeUninstall)
 	e.POST(prefix+"/js/execute", jsExec)
 	e.POST(prefix+"/js/upload", jsUpload)
 	e.GET(prefix+"/js/list", jsList)
@@ -796,6 +890,7 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 	e.GET(prefix+"/story/items/page", storyGetItemPage)
 	e.DELETE(prefix+"/story/log", storyDelLog)
 	e.POST(prefix+"/story/uploadLog", storyUploadLog)
+	e.POST(prefix+"/story/check", storyCheckLog)
 	e.GET(prefix+"/story/backup/list", storyGetLogBackupList)
 	e.GET(prefix+"/story/backup/download", storyDownloadLogBackup)
 	e.POST(prefix+"/story/backup/batch_delete", storyBatchDeleteLogBackup)

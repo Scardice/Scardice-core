@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	OnebotAdapterKey      adapterapi.AdapterKey = "pureonebot"
+	OnebotAdapterKey     adapterapi.AdapterKey = "pureonebot"
 	PureOnebotAdapterKey                       = OnebotAdapterKey
 	OnebotConfigVersion                        = uint16(1)
 	onebotConfigVersion                        = OnebotConfigVersion
@@ -27,20 +27,19 @@ const (
 // Token identifies encrypted material in the event store; it never carries
 // token bytes.
 type OnebotConfig struct {
-	Mode                string                 `json:"mode"`
-	URL                 string                 `json:"url,omitempty"`
-	ClientURL           string                 `json:"clientUrl,omitempty"`
-	ConnectURL          string                 `json:"connectUrl,omitempty"`
-	ListenAddress       string                 `json:"listenAddress,omitempty"`
-	ReverseURL          string                 `json:"reverseUrl,omitempty"`
-	ReverseSuffix       string                 `json:"reverseSuffix"`
-	AccountHint         string                 `json:"accountHint,omitempty"`
-	FriendRequestPolicy string                 `json:"friendRequestPolicy"`
-	IgnoreFriendRequest bool                   `json:"ignoreFriendRequest,omitempty"`
-	ImageAssetBaseURL   string                 `json:"imageAssetBaseUrl,omitempty"`
-	InsecureSkipVerify  bool                   `json:"insecureSkipVerify"`
-	Token               adapterapi.SecretRef   `json:"token"`
-
+	Mode                string               `json:"mode"`
+	URL                 string               `json:"url,omitempty"`
+	ClientURL           string               `json:"clientUrl,omitempty"`
+	ConnectURL          string               `json:"connectUrl,omitempty"`
+	ListenAddress       string               `json:"listenAddress,omitempty"`
+	ReverseURL          string               `json:"reverseUrl,omitempty"`
+	ReverseSuffix       string               `json:"reverseSuffix"`
+	AccountHint         string               `json:"accountHint,omitempty"`
+	FriendRequestPolicy string               `json:"friendRequestPolicy"`
+	IgnoreFriendRequest bool                 `json:"ignoreFriendRequest,omitempty"`
+	ImageAssetBaseURL   string               `json:"imageAssetBaseUrl,omitempty"`
+	InsecureSkipVerify  bool                 `json:"insecureSkipVerify"`
+	Token               adapterapi.SecretRef `json:"token"`
 }
 
 // PureOnebotConfig is retained as a descriptive spelling for callers that use
@@ -50,31 +49,32 @@ type PureOnebotConfig = OnebotConfig
 type OnebotDescriptor struct{ listenerFactory onebotListenerFactory }
 type PureOnebotDescriptor = OnebotDescriptor
 
-func NewOnebotDescriptor() adapterapi.Descriptor { return OnebotDescriptor{} }
+func NewOnebotDescriptor() adapterapi.Descriptor     { return OnebotDescriptor{} }
 func NewPureOnebotDescriptor() adapterapi.Descriptor { return OnebotDescriptor{} }
 func newOnebotDescriptorWithListenerFactory(factory onebotListenerFactory) adapterapi.Descriptor {
 	return OnebotDescriptor{listenerFactory: factory}
 }
 
 func (OnebotDescriptor) Key() adapterapi.AdapterKey { return OnebotAdapterKey }
-func (OnebotDescriptor) ConfigVersion() uint16       { return onebotConfigVersion }
+func (OnebotDescriptor) ConfigVersion() uint16      { return onebotConfigVersion }
+
 type onebotConfigInput struct {
-	Mode                string           `json:"mode"`
-	URL                 string           `json:"url"`
-	ClientURL           string           `json:"clientUrl"`
-	ConnectURL          string           `json:"connectUrl"`
-	ListenAddress       string           `json:"listenAddress"`
-	ReverseURL          string           `json:"reverseUrl"`
-	ReverseSuffix       string           `json:"reverseSuffix"`
-	AccountHint         string           `json:"accountHint"`
-	FriendRequestPolicy string           `json:"friendRequestPolicy"`
-	IgnoreFriendRequest *bool            `json:"ignoreFriendRequest"`
-	IgnoreFriendRequestLegacy *bool      `json:"ignore_friend_request"`
-	ImageAssetBaseURL   string           `json:"imageAssetBaseUrl"`
-	InsecureSkipVerify  bool             `json:"insecureSkipVerify"`
-	Token               json.RawMessage  `json:"token"`
-	TokenSecretRef      string           `json:"tokenSecretRef"`
-	TokenSecretVersion  *uint64          `json:"tokenSecretVersion"`
+	Mode                      string          `json:"mode"`
+	URL                       string          `json:"url"`
+	ClientURL                 string          `json:"clientUrl"`
+	ConnectURL                string          `json:"connectUrl"`
+	ListenAddress             string          `json:"listenAddress"`
+	ReverseURL                string          `json:"reverseUrl"`
+	ReverseSuffix             string          `json:"reverseSuffix"`
+	AccountHint               string          `json:"accountHint"`
+	FriendRequestPolicy       string          `json:"friendRequestPolicy"`
+	IgnoreFriendRequest       *bool           `json:"ignoreFriendRequest"`
+	IgnoreFriendRequestLegacy *bool           `json:"ignore_friend_request"`
+	ImageAssetBaseURL         string          `json:"imageAssetBaseUrl"`
+	InsecureSkipVerify        bool            `json:"insecureSkipVerify"`
+	Token                     json.RawMessage `json:"token"`
+	TokenSecretRef            string          `json:"tokenSecretRef"`
+	TokenSecretVersion        *uint64         `json:"tokenSecretVersion"`
 }
 
 type onebotTokenInput struct {
@@ -84,15 +84,15 @@ type onebotTokenInput struct {
 }
 
 type onebotCanonicalConfig struct {
-	Mode                string                  `json:"mode"`
-	URL                 string                  `json:"url,omitempty"`
-	ListenAddress       string                  `json:"listenAddress,omitempty"`
-	ReverseSuffix       string                  `json:"reverseSuffix"`
-	AccountHint         string                  `json:"accountHint,omitempty"`
-	FriendRequestPolicy string                  `json:"friendRequestPolicy"`
-	ImageAssetBaseURL   string                  `json:"imageAssetBaseUrl,omitempty"`
-	InsecureSkipVerify  bool                    `json:"insecureSkipVerify"`
-	Token               *onebotCanonicalToken   `json:"token,omitempty"`
+	Mode                string                `json:"mode"`
+	URL                 string                `json:"url,omitempty"`
+	ListenAddress       string                `json:"listenAddress,omitempty"`
+	ReverseSuffix       string                `json:"reverseSuffix"`
+	AccountHint         string                `json:"accountHint,omitempty"`
+	FriendRequestPolicy string                `json:"friendRequestPolicy"`
+	ImageAssetBaseURL   string                `json:"imageAssetBaseUrl,omitempty"`
+	InsecureSkipVerify  bool                  `json:"insecureSkipVerify"`
+	Token               *onebotCanonicalToken `json:"token,omitempty"`
 }
 
 type onebotCanonicalToken struct {
@@ -100,7 +100,11 @@ type onebotCanonicalToken struct {
 	Version   uint64 `json:"version"`
 }
 
-func (OnebotDescriptor) ValidateConfig(ctx context.Context, raw json.RawMessage) (adapterapi.ValidatedConfig, error) {
+func (d OnebotDescriptor) ValidateConfig(ctx context.Context, raw json.RawMessage) (adapterapi.ValidatedConfig, error) {
+	return d.validateConfig(ctx, raw, true)
+}
+
+func (OnebotDescriptor) validateConfig(ctx context.Context, raw json.RawMessage, requireServerToken bool) (adapterapi.ValidatedConfig, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -183,7 +187,7 @@ func (OnebotDescriptor) ValidateConfig(ctx context.Context, raw json.RawMessage)
 	}
 	var boolPolicy string
 	if input.IgnoreFriendRequest != nil || input.IgnoreFriendRequestLegacy != nil {
-		ignore := false
+		var ignore bool
 		if input.IgnoreFriendRequest != nil {
 			ignore = *input.IgnoreFriendRequest
 		} else {
@@ -221,7 +225,7 @@ func (OnebotDescriptor) ValidateConfig(ctx context.Context, raw json.RawMessage)
 	if err != nil {
 		return adapterapi.ValidatedConfig{}, err
 	}
-	if mode == "server" && !hasToken {
+	if mode == "server" && requireServerToken && !hasToken {
 		return adapterapi.ValidatedConfig{}, invalidOnebotConfig("reverse listener requires a token secret reference")
 	}
 	canonical := onebotCanonicalConfig{
@@ -255,6 +259,14 @@ func (d OnebotDescriptor) SupportedActions(adapterapi.ValidatedConfig) adapterap
 	return onebotSupportedActions()
 }
 
+func (OnebotDescriptor) Capabilities(adapterapi.ValidatedConfig) adapterapi.CapabilitySet {
+	return adapterapi.CapabilityLifecycle |
+		adapterapi.CapabilityInbound |
+		adapterapi.CapabilityOutbound |
+		adapterapi.CapabilityActions |
+		adapterapi.CapabilityRichMessages
+}
+
 func (d OnebotDescriptor) NewRuntime(init adapterapi.RuntimeInit) (adapterapi.AdapterRuntime, error) {
 	if init.EndpointID == "" || !init.EndpointID.Valid() || init.Generation == 0 || init.DesiredVersion == 0 {
 		return nil, errors.New("onebot: runtime identity is incomplete")
@@ -275,7 +287,7 @@ func (d OnebotDescriptor) NewRuntime(init adapterapi.RuntimeInit) (adapterapi.Ad
 	if err != nil {
 		return nil, err
 	}
-	return newOnebotRuntime(config, init.Secrets, d.listenerFactory), nil
+	return newOnebotRuntimeWithResources(config, init.Secrets, init.ResourceRoot, init.ResourceAccessToken, init.ResourceServeAddress, d.listenerFactory), nil
 }
 
 func (OnebotDescriptor) decodeValidatedConfig(config adapterapi.ValidatedConfig) (OnebotConfig, error) {
@@ -484,7 +496,7 @@ func validateOnebotListenHost(host string) error {
 			return invalidOnebotConfig("listen address host is malformed")
 		}
 		for _, r := range label {
-			if !(r == '-' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') {
+			if r != '-' && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
 				return invalidOnebotConfig("listen address host is malformed")
 			}
 		}
@@ -499,8 +511,8 @@ func validateOnebotSuffix(suffix string) error {
 	return nil
 }
 
-func validateOnebotText(value, name string, max int) error {
-	if len(value) > max || hasControl([]byte(value)) {
+func validateOnebotText(value, name string, maxLength int) error {
+	if len(value) > maxLength || hasControl([]byte(value)) {
 		return invalidOnebotConfig("%s is invalid", name)
 	}
 	return nil
@@ -522,7 +534,6 @@ func rejectOnebotAliasConflict(name string, values ...string) error {
 	}
 	return nil
 }
-
 
 func invalidOnebotConfig(format string, args ...any) error {
 	return fmt.Errorf("onebot: %w: %s", adapterapi.ErrInvalidConfig, fmt.Sprintf(format, args...))

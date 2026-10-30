@@ -2,14 +2,37 @@ package dice
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"testing"
+
+	"Scardice-core/adapterapi"
+	endpointstate "Scardice-core/endpoint"
+	"Scardice-core/eventstore"
 
 	"github.com/sealdice/botgo/dto"
 
 	"Scardice-core/model"
 )
+
+type officialQQProjectionStore struct {
+	rows []eventstore.ProjectionRow
+}
+
+func (s officialQQProjectionStore) Commit(context.Context, eventstore.UnitOfWork) (eventstore.CommitResult, error) {
+	return eventstore.CommitResult{}, errors.New("not used")
+}
+
+func (s officialQQProjectionStore) Load(context.Context, eventstore.StreamID, uint64) ([]eventstore.Envelope, error) {
+	return nil, errors.New("not used")
+}
+
+func (officialQQProjectionStore) Close() error { return nil }
+
+func (s officialQQProjectionStore) ListProjectionRows(context.Context, string) ([]eventstore.ProjectionRow, error) {
+	return append([]eventstore.ProjectionRow(nil), s.rows...), nil
+}
 
 func TestOfficialQQVerifiedAccountAdmission_rejectsDuplicateWithoutChangingBlockedMapping(t *testing.T) {
 	operator, err := newMockDatabaseOperator(filepath.Join(t.TempDir(), "official-qq-duplicate.db"))
@@ -37,15 +60,34 @@ func TestOfficialQQVerifiedAccountAdmission_rejectsDuplicateWithoutChangingBlock
 		t.Fatalf("seed blocked mapping: %v", err)
 	}
 
-	existing := NewOfficialQQConnItem(100, "", "", false)
+	existing := &EndPointInfo{
+		EndPointInfoBase: EndPointInfoBase{ID: "existing-official"},
+	}
 	existing.UserID = "OpenQQ:1"
 	existing.Nickname = "existing"
-	candidate := NewOfficialQQConnItem(200, "", "", false)
-	session := &IMSession{EndPoints: []*EndPointInfo{existing, candidate}}
-	d := &Dice{DBOperator: operator, ImSession: session}
+	candidate := &EndPointInfo{
+		EndPointInfoBase: EndPointInfoBase{ID: "candidate-official"},
+		Adapter:          &PlatformAdapterOfficialQQ{AppID: 200},
+	}
+	session := &IMSession{}
+	projected, err := json.Marshal(endpointstate.EndpointView{
+		EndpointID: adapterapi.EndpointID(existing.ID),
+		AdapterKey: OfficialQQAdapterKey,
+		Config: adapterapi.ValidatedConfig{
+			Version:   1,
+			Canonical: json.RawMessage(`{"accountHint":"OpenQQ:1"}`),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &Dice{
+		DBOperator:   operator,
+		ImSession:    session,
+		DurableStore: officialQQProjectionStore{rows: []eventstore.ProjectionRow{{RowKey: existing.ID, Payload: projected}}},
+	}
 	session.Parent = d
-	existing.BindRuntime(session)
-	candidate.BindRuntime(session)
+	candidate.bindCompatibilityRuntime(session)
 	adapter := candidate.Adapter.(*PlatformAdapterOfficialQQ)
 
 	err = adapter.acceptVerifiedAccount(context.Background(), d, &dto.User{ID: "1", Username: "candidate"})
@@ -97,22 +139,5 @@ func TestOfficialQQWebsocketLifecycle_retriesReconnectInOrder(t *testing.T) {
 	}
 	if attempts != 2 {
 		t.Fatalf("session attempts = %d, want 2", attempts)
-	}
-}
-
-func TestOfficialQQConnectionEntry_skipsRunningSessionWithoutStateChange(t *testing.T) {
-	adapter := &PlatformAdapterOfficialQQ{Ctx: t.Context()}
-	endpoint := &EndPointInfo{EndPointInfoBase: EndPointInfoBase{
-		State:  StateConnected,
-		Enable: true,
-	}}
-
-	serverOfficialQQ(&Dice{}, endpoint, adapter)
-
-	if adapter.DiceServing {
-		t.Fatal("running session was marked as a new server")
-	}
-	if endpoint.State != StateConnected || !endpoint.Enable {
-		t.Fatalf("running endpoint changed: state=%d enable=%t", endpoint.State, endpoint.Enable)
 	}
 }

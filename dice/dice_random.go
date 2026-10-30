@@ -70,6 +70,29 @@ func (dm *DiceManager) SetDiceRandomMode(mode DiceRandomMode) (DiceRandomMode, e
 	return effectiveMode, nil
 }
 
+func (dm *DiceManager) ValidateDiceRandomMode(mode DiceRandomMode) (DiceRandomMode, error) {
+	if dm == nil {
+		return "", errors.New("dice manager is nil")
+	}
+	requestedMode := randcore.NormalizeMode(string(mode))
+	return globalRandSource.ValidateActive(requestedMode)
+}
+
+func (dm *DiceManager) setDiceRandomModeWithCommit(mode DiceRandomMode, commit func() error) error {
+	if dm == nil {
+		return errors.New("dice manager is nil")
+	}
+	requestedMode := randcore.NormalizeMode(string(mode))
+	return globalRandSource.ActivateWith(requestedMode, func() error {
+		if err := commit(); err != nil {
+			return err
+		}
+		dm.DiceRandomMode = string(requestedMode)
+		dm.syncDiceRandomMode()
+		return nil
+	})
+}
+
 func (d *Dice) Roll(points int) int {
 	if points <= 0 {
 		return 0

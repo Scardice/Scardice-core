@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"errors"
 	"net"
 	"net/http"
@@ -18,25 +17,34 @@ import (
 )
 
 const (
-	adminTokenEnv          = "SCARDICE_ADMIN_TOKEN"
-	adminPrincipalEnv      = "SCARDICE_ADMIN_PRINCIPAL_ID"
-	adminOriginsEnv        = "SCARDICE_ADMIN_ORIGINS"
-	adminMaxBodyBytes      = 1 << 20
-	adminRequestTimeout    = 30 * time.Second
-	adminLimiterIdle       = 15 * time.Minute
-	adminLimiterEntryLimit = 4096
+	adminPrincipalEnv             = "SCARDICE_ADMIN_PRINCIPAL_ID"
+	adminOriginsEnv               = "SCARDICE_ADMIN_ORIGINS"
+	adminAuthBypassEnv            = "SCARDICE_TEST_WEBUI_AUTH_BYPASS"
+	adminOriginRateLimitBypassEnv = "SCARDICE_TEST_WEBUI_ORIGIN_RATE_LIMIT_BYPASS"
+	adminMaxBodyBytes             = 1 << 20
+	adminRequestTimeout           = 30 * time.Second
+	adminLimiterIdle              = 15 * time.Minute
+	adminLimiterEntryLimit        = 4096
 )
 
 var (
-	errAdminUnavailable  = errors.New("admin authentication is not configured")
 	errAdminUnauthorized = errors.New("admin authentication failed")
 	errAdminOrigin       = errors.New("admin origin is not allowed")
 	errAdminRateLimit    = errors.New("admin rate limit exceeded")
 )
 
+func testWebUIAuthBypassEnabled() bool {
+	return os.Getenv(adminAuthBypassEnv) == "1"
+}
+
+// WebUIOriginRateLimitBypassEnabled reports whether test mode disables admin
+// API Origin validation and rate limiting.
+func WebUIOriginRateLimitBypassEnabled() bool {
+	return os.Getenv(adminOriginRateLimitBypassEnv) == "1"
+}
+
 type adminAuthConfig struct {
 	principal string
-	secret    []byte
 	origins   map[string]struct{}
 }
 
@@ -86,36 +94,9 @@ var adminAuthState = struct {
 	limiter *adminLimiter
 }{limiter: newAdminLimiter()}
 
-// ConfigureAdminAuth installs the credential used by the new endpoint API.
-// The secret is retained only in process memory and is never persisted.
-func ConfigureAdminAuth(principalID, secret string, origins []string) error {
-	principalID = strings.TrimSpace(principalID)
-	secret = strings.TrimSpace(secret)
-	if principalID == "" {
-		principalID = "local-admin"
-	}
-	if secret == "" || strings.ContainsAny(secret, "\r\n") {
-		return errAdminUnavailable
-	}
-	allowed, err := normalizeAdminOrigins(origins)
-	if err != nil {
-		return err
-	}
-	adminAuthState.Lock()
-	adminAuthState.config = adminAuthConfig{principal: principalID, secret: []byte(secret), origins: allowed}
-	adminAuthState.loaded = true
-	adminAuthState.limiter = newAdminLimiter()
-	adminAuthState.Unlock()
-	return nil
-}
-
-// ResetAdminAuthForTests clears process-local credentials. It is intentionally
-// exported so API contract tests can restore global state without touching env.
+// ResetAdminAuthForTests clears process-local policy state between API tests.
 func ResetAdminAuthForTests() {
 	adminAuthState.Lock()
-	for i := range adminAuthState.config.secret {
-		adminAuthState.config.secret[i] = 0
-	}
 	adminAuthState.config = adminAuthConfig{}
 	adminAuthState.loaded = false
 	adminAuthState.limiter = newAdminLimiter()
@@ -125,17 +106,13 @@ func ResetAdminAuthForTests() {
 func currentAdminAuth() (adminAuthConfig, *adminLimiter, error) {
 	adminAuthState.RLock()
 	if adminAuthState.loaded {
-		config := adminAuthConfig{principal: adminAuthState.config.principal, secret: append([]byte(nil), adminAuthState.config.secret...), origins: cloneStringSet(adminAuthState.config.origins)}
+		config := adminAuthConfig{principal: adminAuthState.config.principal, origins: cloneStringSet(adminAuthState.config.origins)}
 		limiter := adminAuthState.limiter
 		adminAuthState.RUnlock()
 		return config, limiter, nil
 	}
 	adminAuthState.RUnlock()
 
-	secret := os.Getenv(adminTokenEnv)
-	if strings.TrimSpace(secret) == "" {
-		return adminAuthConfig{}, nil, errAdminUnavailable
-	}
 	principal := strings.TrimSpace(os.Getenv(adminPrincipalEnv))
 	if principal == "" {
 		principal = "local-admin"
@@ -144,16 +121,24 @@ func currentAdminAuth() (adminAuthConfig, *adminLimiter, error) {
 	if raw := strings.TrimSpace(os.Getenv(adminOriginsEnv)); raw != "" {
 		origins = strings.Split(raw, ",")
 	}
-	if _, err := normalizeAdminOrigins(origins); err != nil {
+	allowed, err := normalizeAdminOrigins(origins)
+	if err != nil {
 		return adminAuthConfig{}, nil, err
 	}
-	if err := ConfigureAdminAuth(principal, secret, origins); err != nil {
-		return adminAuthConfig{}, nil, err
+
+	adminAuthState.Lock()
+	if adminAuthState.loaded {
+		config := adminAuthConfig{principal: adminAuthState.config.principal, origins: cloneStringSet(adminAuthState.config.origins)}
+		limiter := adminAuthState.limiter
+		adminAuthState.Unlock()
+		return config, limiter, nil
 	}
-	adminAuthState.RLock()
-	config := adminAuthConfig{principal: adminAuthState.config.principal, secret: append([]byte(nil), adminAuthState.config.secret...), origins: cloneStringSet(adminAuthState.config.origins)}
+	adminAuthState.config = adminAuthConfig{principal: principal, origins: allowed}
+	adminAuthState.loaded = true
+	adminAuthState.limiter = newAdminLimiter()
+	config := adminAuthConfig{principal: adminAuthState.config.principal, origins: cloneStringSet(adminAuthState.config.origins)}
 	limiter := adminAuthState.limiter
-	adminAuthState.RUnlock()
+	adminAuthState.Unlock()
 	return config, limiter, nil
 }
 
@@ -226,51 +211,81 @@ func requestOrigin(r *http.Request) (string, error) {
 	return normalizeAdminOrigin(scheme + "://" + r.Host)
 }
 
+func sameOriginOrNoOrigin(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	originValues := r.Header.Values(echo.HeaderOrigin)
+	if len(originValues) == 0 {
+		fetchSiteValues := r.Header.Values("Sec-Fetch-Site")
+		if len(fetchSiteValues) == 0 {
+			return true
+		}
+		return len(fetchSiteValues) == 1 && strings.EqualFold(strings.TrimSpace(fetchSiteValues[0]), "same-origin")
+	}
+	if len(originValues) != 1 || originValues[0] == "" {
+		return false
+	}
+	origin, err := normalizeAdminOrigin(originValues[0])
+	if err != nil {
+		return false
+	}
+	request, err := requestOrigin(r)
+	return err == nil && origin == request
+}
+
 func adminPrincipal(c echo.Context) (string, error) {
 	if c == nil || c.Request() == nil {
 		return "", errAdminUnauthorized
 	}
-	query := c.Request().URL.Query()
-	if _, ok := query["token"]; ok {
-		return "", errAdminUnauthorized
-	}
-	if _, ok := query["access_token"]; ok {
-		return "", errAdminUnauthorized
-	}
-	headerValues := c.Request().Header.Values(echo.HeaderAuthorization)
-	if len(headerValues) != 1 {
-		return "", errAdminUnauthorized
-	}
-	parts := strings.Fields(headerValues[0])
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" || strings.ContainsAny(parts[1], ",\r\n") {
-		return "", errAdminUnauthorized
+	if !testWebUIAuthBypassEnabled() {
+		query := c.Request().URL.Query()
+		if _, ok := query["token"]; ok {
+			return "", errAdminUnauthorized
+		}
+		if _, ok := query["access_token"]; ok {
+			return "", errAdminUnauthorized
+		}
+		headerValues := c.Request().Header.Values(echo.HeaderAuthorization)
+		if len(headerValues) != 1 {
+			return "", errAdminUnauthorized
+		}
+		parts := strings.Fields(headerValues[0])
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" || strings.ContainsAny(parts[1], ",\r\n") {
+			return "", errAdminUnauthorized
+		}
+		if myDice == nil || myDice.Parent == nil || !myDice.Parent.AccessTokens.Exists(parts[1]) {
+			return "", errAdminUnauthorized
+		}
 	}
 	config, limiter, err := currentAdminAuth()
 	if err != nil {
 		return "", err
 	}
-	candidate := []byte(parts[1])
-	if subtle.ConstantTimeCompare(candidate, config.secret) != 1 {
-		return "", errAdminUnauthorized
-	}
-	if originValues := c.Request().Header.Values(echo.HeaderOrigin); len(originValues) > 0 {
-		if len(originValues) != 1 || originValues[0] == "" {
+	if !WebUIOriginRateLimitBypassEnabled() {
+		originValues := c.Request().Header.Values(echo.HeaderOrigin)
+		if testWebUIAuthBypassEnabled() && len(originValues) == 0 && !sameOriginOrNoOrigin(c.Request()) {
 			return "", errAdminOrigin
 		}
-		normalized, normalizeErr := normalizeAdminOrigin(originValues[0])
-		if normalizeErr != nil {
-			return "", normalizeErr
-		}
-		if _, ok := config.origins[normalized]; !ok {
-			sameOrigin, sameErr := requestOrigin(c.Request())
-			if sameErr != nil || normalized != sameOrigin {
+		if len(originValues) > 0 {
+			if len(originValues) != 1 || originValues[0] == "" {
 				return "", errAdminOrigin
 			}
+			normalized, normalizeErr := normalizeAdminOrigin(originValues[0])
+			if normalizeErr != nil {
+				return "", normalizeErr
+			}
+			if _, ok := config.origins[normalized]; !ok {
+				sameOrigin, sameErr := requestOrigin(c.Request())
+				if sameErr != nil || normalized != sameOrigin {
+					return "", errAdminOrigin
+				}
+			}
 		}
-	}
-	key := config.principal + "\x00" + clientIP(c.Request())
-	if !limiter.allow(key) {
-		return "", errAdminRateLimit
+		key := config.principal + "\x00" + clientIP(c.Request())
+		if !limiter.allow(key) {
+			return "", errAdminRateLimit
+		}
 	}
 	return config.principal, nil
 }
@@ -302,13 +317,6 @@ func clientIP(r *http.Request) string {
 		return host
 	}
 	return strings.TrimSpace(r.RemoteAddr)
-}
-
-// requireAdminAuth is intentionally separate from doAuth: new routes do not
-// accept query tokens, legacy private headers, or the mutable access-token map.
-func requireAdminAuth(c echo.Context) bool {
-	_, err := authenticateAdmin(c)
-	return err == nil
 }
 
 const adminPrincipalContextKey = "admin-principal"

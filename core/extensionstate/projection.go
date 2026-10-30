@@ -8,6 +8,7 @@ import (
 	"io"
 
 	"Scardice-core/eventstore"
+
 	"gorm.io/gorm"
 )
 
@@ -88,7 +89,7 @@ func decodeProjectionState(payload []byte) (State, error) {
 }
 
 type projectionReader interface {
-	ReadProjectionRow(context.Context, string, string) (eventstore.ProjectionRow, error)
+	ReadProjectionRow(ctx context.Context, projectionName, rowKey string) (eventstore.ProjectionRow, error)
 }
 
 func ReadProjected(ctx context.Context, store any, diceID string) (State, error) {
@@ -102,7 +103,24 @@ func ReadProjected(ctx context.Context, store any, diceID string) (State, error)
 	stream := ExtensionStream(diceID)
 	row, err := reader.ReadProjectionRow(ctx, ExtensionProjectionName, stream.AggregateID)
 	if err != nil {
-		return State{}, err
+		if !errors.Is(err, eventstore.ErrNotFound) {
+			return State{}, err
+		}
+		eventStore, ok := store.(eventstore.Store)
+		if !ok {
+			return State{}, err
+		}
+		state, loadErr := NewRepository(eventStore).Load(ctx, diceID)
+		if loadErr != nil {
+			return State{}, loadErr
+		}
+		if state.Version == 0 {
+			return state, nil
+		}
+		row, err = reader.ReadProjectionRow(ctx, ExtensionProjectionName, stream.AggregateID)
+		if err != nil {
+			return State{}, err
+		}
 	}
 	state, err := decodeProjectionState(row.Payload)
 	if err != nil {

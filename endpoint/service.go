@@ -67,14 +67,13 @@ func serviceSentinel(kind string) error {
 // DescriptorRegistry is intentionally narrow: service validates configuration
 // and adapter identity without constructing a runtime or acquiring resources.
 type DescriptorRegistry interface {
-	Lookup(context.Context, adapterapi.AdapterKey) (adapterapi.Descriptor, bool)
+	Lookup(ctx context.Context, key adapterapi.AdapterKey) (adapterapi.Descriptor, bool)
 }
-type DescriptorLookup func(context.Context, adapterapi.AdapterKey) (adapterapi.Descriptor, error)
 
 type Service struct {
 	Repository *Repository
 	Store      eventstore.Store
-	Registry   any
+	Registry   DescriptorRegistry
 	InitError  error
 }
 type Result struct {
@@ -84,7 +83,6 @@ type Result struct {
 	Replay    bool
 	Effects   []LifecycleEffect
 }
-type CommandResult = Result
 
 type CommandRequest struct {
 	Command     Command
@@ -92,65 +90,29 @@ type CommandRequest struct {
 	RequestID   string
 }
 
-func NewService(store eventstore.Store, registry any, codecs ...BoundPayloadCodec) *Service {
+func NewService(store eventstore.Store, registry DescriptorRegistry, codecs ...BoundPayloadCodec) *Service {
 	s := &Service{Repository: NewRepository(store, codecs...), Store: store, Registry: registry}
-	if gormStore, ok := store.(*eventstore.GORMStore); ok {
-		s.InitError = RegisterEndpointProjections(gormStore)
+	if registrar, ok := store.(projectionRegistrar); ok {
+		s.InitError = registerEndpointProjections(registrar)
 	}
 	return s
-}
-func NewEndpointService(store eventstore.Store, registry any, codecs ...BoundPayloadCodec) *Service {
-	return NewService(store, registry, codecs...)
 }
 
 func (s *Service) descriptor(ctx context.Context, key adapterapi.AdapterKey) (adapterapi.Descriptor, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if !key.Valid() {
+	if !key.Valid() || s == nil || s.Registry == nil {
 		return nil, &ServiceError{Kind: "unknown_adapter", Cause: ErrUnknownAdapter}
 	}
-	accept := func(descriptor adapterapi.Descriptor) (adapterapi.Descriptor, error) {
-		if descriptor == nil || descriptor.Key() != key {
-			return nil, &ServiceError{Kind: "unknown_adapter", Cause: ErrUnknownAdapter}
-		}
-		return descriptor, nil
+	descriptor, ok := s.Registry.Lookup(ctx, key)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	switch registry := s.Registry.(type) {
-	case DescriptorRegistry:
-		if descriptor, ok := registry.Lookup(ctx, key); ok {
-			return accept(descriptor)
-		}
-	case DescriptorLookup:
-		descriptor, err := registry(ctx, key)
-		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return nil, err
-			}
-			return nil, &ServiceError{Kind: "unknown_adapter", Cause: err}
-		}
-		return accept(descriptor)
-	case func(context.Context, adapterapi.AdapterKey) (adapterapi.Descriptor, error):
-		descriptor, err := registry(ctx, key)
-		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return nil, err
-			}
-			return nil, &ServiceError{Kind: "unknown_adapter", Cause: err}
-		}
-		return accept(descriptor)
-	case func(adapterapi.AdapterKey) (adapterapi.Descriptor, bool):
-		descriptor, ok := registry(key)
-		if !ok {
-			return nil, &ServiceError{Kind: "unknown_adapter", Cause: ErrUnknownAdapter}
-		}
-		return accept(descriptor)
-	case map[adapterapi.AdapterKey]adapterapi.Descriptor:
-		return accept(registry[key])
-	case map[string]adapterapi.Descriptor:
-		return accept(registry[string(key)])
+	if !ok || descriptor == nil || descriptor.Key() != key {
+		return nil, &ServiceError{Kind: "unknown_adapter", Cause: ErrUnknownAdapter}
 	}
-	return nil, &ServiceError{Kind: "unknown_adapter", Cause: ErrUnknownAdapter}
+	return descriptor, nil
 }
 
 func (s *Service) validateCommand(ctx context.Context, command *Command) error {
@@ -230,7 +192,9 @@ func (s *Service) Execute(ctx context.Context, command Command) (Result, error) 
 		state = State{}
 	}
 	replayCandidate := false
-	registryIndependent := commandKind(command) == CommandComplete || commandKind(command) == CommandResolve
+	kind := commandKind(command)
+	metadataOnly := kind == CommandRestoreLegacyMetadata
+	registryIndependent := kind == CommandComplete || kind == CommandResolve || metadataOnly
 	if state.Version > 0 {
 		_, replayCandidate = state.ProcessedCommands[commandID(command)]
 		if !replayCandidate && !registryIndependent {
@@ -263,6 +227,9 @@ func (s *Service) Execute(ctx context.Context, command Command) (Result, error) 
 		if state.OperationState == OperationStatePending || state.OperationState == OperationStateAmbiguous || state.OperationState == OperationStateFailed {
 			result.Effects = pendingLifecycleEffect(state)
 		}
+		if metadataOnly {
+			return result, nil
+		}
 		operationID := operationForCommand(command)
 		if registryIndependent && state.OperationID != "" {
 			operationID = state.OperationID
@@ -289,6 +256,9 @@ func (s *Service) Execute(ctx context.Context, command Command) (Result, error) 
 		return Result{}, nextErr
 	}
 	result := Result{State: next, Commit: commit, Effects: append([]LifecycleEffect(nil), decision.Effects...)}
+	if metadataOnly {
+		return result, nil
+	}
 	operation, operationErr := s.operation(ctx, next.OperationID)
 	if operationErr != nil {
 		return Result{}, mapOperationError(operationErr)
@@ -472,12 +442,20 @@ func (s *Service) Complete(ctx context.Context, command Command) (Result, error)
 	return s.Execute(ctx, command)
 }
 
+// RecordIdentity persists a provider identity fact only when it carries the
+// active generation and desired-intent fence.
+func (s *Service) RecordIdentity(ctx context.Context, command Command) (Result, error) {
+	command.Kind = CommandObserveIdentity
+	command.Type = CommandObserveIdentity
+	return s.Execute(ctx, command)
+}
+
 func (s *Service) Get(ctx context.Context, id adapterapi.EndpointID) (EndpointView, error) {
 	if s == nil || s.Store == nil || !id.Valid() {
 		return EndpointView{}, &ServiceError{Kind: "not_found", Cause: ErrNotFound}
 	}
 	if reader, ok := s.Store.(interface {
-		ReadProjectionRow(context.Context, string, string) (eventstore.ProjectionRow, error)
+		ReadProjectionRow(ctx context.Context, projectionName, rowKey string) (eventstore.ProjectionRow, error)
 	}); ok {
 		row, err := reader.ReadProjectionRow(ctx, EndpointProjectionName, string(id))
 		if err == nil {
@@ -506,7 +484,7 @@ func (s *Service) List(ctx context.Context) ([]EndpointView, error) {
 		return nil, &ServiceError{Kind: "not_found", Cause: ErrNotFound}
 	}
 	reader, ok := s.Store.(interface {
-		ListProjectionRows(context.Context, string) ([]eventstore.ProjectionRow, error)
+		ListProjectionRows(ctx context.Context, projectionName string) ([]eventstore.ProjectionRow, error)
 	})
 	if !ok {
 		return nil, errors.New("endpoint: store does not expose endpoint projection listing")
@@ -527,7 +505,7 @@ func (s *Service) List(ctx context.Context) ([]EndpointView, error) {
 }
 
 func endpointViewFromState(state State) EndpointView {
-	return EndpointView{EndpointID: state.EndpointID, AdapterKey: state.AdapterKey, Config: state.Config.Clone(), DesiredState: state.DesiredState, ObservedState: state.ObservedState, OperationState: state.OperationState, DesiredVersion: state.DesiredVersion, Generation: state.Generation, OperationID: state.OperationID, CorrelationID: state.CorrelationID, Version: state.Version}
+	return EndpointView{EndpointID: state.EndpointID, DisplayName: state.DisplayName, Statistics: state.Statistics, AdapterKey: state.AdapterKey, Config: state.Config.Clone(), DesiredState: state.DesiredState, ObservedState: state.ObservedState, OperationState: state.OperationState, DesiredVersion: state.DesiredVersion, ProviderID: state.ProviderID, Generation: state.Generation, OperationID: state.OperationID, CorrelationID: state.CorrelationID, Version: state.Version}
 }
 
 func (s *Service) GetOperation(ctx context.Context, id string) (eventstore.OperationView, error) {

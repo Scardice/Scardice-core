@@ -18,9 +18,12 @@ import (
 func uploadV1(env UploadEnv) (string, string, error) {
 	_ = os.MkdirAll(env.Dir, 0o755)
 
-	url, uploadTS, updateTS, _ := service.LogGetUploadInfo(env.Db, env.GroupID, env.LogName)
-	if len(url) > 0 && uploadTS > updateTS {
-		// 已有URL且上传时间晚于Log更新时间（最后录入时间），直接返回
+	url, uploadTS, updateTS, infoErr := env.Repo.UploadInfo(env.GroupID, env.LogName)
+	if infoErr != nil && !errors.Is(infoErr, service.ErrLogNotFound) {
+		return "", env.Notice, infoErr
+	}
+	if len(url) > 0 && uploadTS >= updateTS {
+		// 上传时间不早于Log更新时间（最后录入时间）时复用已有URL
 		env.Log.Infof(
 			"查询到之前上传的URL, 直接使用 Log:%s.%s 上传时间:%s 更新时间:%s URL:%s",
 			env.GroupID, env.LogName,
@@ -41,7 +44,7 @@ func uploadV1(env UploadEnv) (string, string, error) {
 		)
 	}
 
-	lines, err := service.LogGetAllLines(env.Db, env.GroupID, env.LogName)
+	lines, err := env.Repo.Entries(env.GroupID, env.LogName)
 	if err != nil {
 		return "", env.Notice, err
 	}
@@ -66,8 +69,10 @@ func uploadV1(env UploadEnv) (string, string, error) {
 	}
 
 	url = uploadToSealBackends(env, zlibBuffer.Bytes())
-	if errDB := service.LogSetUploadInfo(env.Db, env.GroupID, env.LogName, url); errDB != nil {
+
+	if errDB := env.Repo.SetUploadInfo(env.GroupID, env.LogName, url); errDB != nil {
 		env.Log.Errorf("记录Log上传信息失败: %v", errDB)
+		return "", env.Notice, fmt.Errorf("远端上传已成功（%s），但本地保存上传信息失败: %w", url, errDB)
 	}
 	if len(url) == 0 {
 		return "", env.Notice, errors.New("上传 log 到服务器失败，未能获取染色器链接")
@@ -98,9 +103,10 @@ func formatAndBackup(env *UploadEnv) (err error) {
 	}()
 
 	var text strings.Builder
-	for _, i := range env.lines {
-		timeTxt := time.Unix(i.Time, 0).Format("2006-01-02 15:04:05")
-		fmt.Fprintf(&text, "%s(%v) %s\n%s\n\n", i.Nickname, i.IMUserID, timeTxt, i.Message)
+	for _, item := range env.lines {
+		if err := WriteLogText(&text, *item); err != nil {
+			return fmt.Errorf("写入文本日志失败: %w", err)
+		}
 	}
 
 	{

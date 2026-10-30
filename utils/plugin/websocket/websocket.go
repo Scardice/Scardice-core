@@ -17,6 +17,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"Scardice-core/logger"
+	gojaengine "Scardice-core/utils/jsengine/goja"
 )
 
 // Logger 日志接口，与helper.go中的Helper方法签名一致
@@ -60,6 +61,15 @@ func SetLogger(logger Logger) {
 	WebSocketLogger = logger
 }
 
+// AsyncContextHooks let the owning adapter restore the execution context that
+// created a WebSocket before dispatching events on the JavaScript owner.
+// ScheduleOnLoop only reports whether the callback was accepted and MUST NOT
+// wait for it to finish.
+type AsyncContextHooks struct {
+	CurrentContext func() any
+	ScheduleOnLoop func(any, func(*goja.Runtime) error) error
+}
+
 type (
 	// WebSocketModule 是WebSocket模块的根实例
 	WebSocketModule struct {
@@ -72,6 +82,7 @@ type (
 		loop      *eventloop.EventLoop
 		authorize func(string) error
 		manager   *WebSocketManager
+		hooks     AsyncContextHooks
 	}
 
 	WebSocketManager struct {
@@ -100,6 +111,8 @@ func (m *WebSocketManager) Register(conn *WebSocketConnection) {
 }
 
 // CloseAll 关闭所有连接
+// TODO(局部重载/禁用与删除): 连接没有脚本归属，只能 CloseAll。局部卸载需要按脚本关闭其创建的连接（fetch 同理）。
+// subTODO(局部重载): 在 Register 时记录创建连接的脚本上下文，提供 CloseByOwner。
 func (m *WebSocketManager) CloseAll() {
 	// 获取连接副本并清空原列表
 	m.mutex.Lock()
@@ -147,6 +160,12 @@ func (m *WebSocketModule) NewInstance(rt *goja.Runtime, loop *eventloop.EventLoo
 // NewInstanceWithPolicy creates a WebSocket adapter with a pre-dial policy
 // check. The hook runs on the Goja owner thread before any network goroutine.
 func (m *WebSocketModule) NewInstanceWithPolicy(rt *goja.Runtime, loop *eventloop.EventLoop, authorize func(string) error) *WebSocket {
+	return m.NewInstanceWithPolicyAndContext(rt, loop, authorize, AsyncContextHooks{})
+}
+
+// NewInstanceWithPolicyAndContext additionally restores the constructor's
+// execution context before dispatching asynchronous WebSocket events.
+func (m *WebSocketModule) NewInstanceWithPolicyAndContext(rt *goja.Runtime, loop *eventloop.EventLoop, authorize func(string) error, hooks AsyncContextHooks) *WebSocket {
 	manager := GlobalConnManager
 	if m != nil {
 		manager = managerOrGlobal(m.manager)
@@ -156,6 +175,7 @@ func (m *WebSocketModule) NewInstanceWithPolicy(rt *goja.Runtime, loop *eventloo
 		loop:      loop,
 		authorize: authorize,
 		manager:   manager,
+		hooks:     hooks,
 	}
 }
 
@@ -191,15 +211,17 @@ func (ws *WebSocket) Exports() goja.Value {
 
 // WebSocketConnection 是返回给JavaScript的WebSocket连接表示
 type WebSocketConnection struct {
-	rt           *goja.Runtime
-	loop         *eventloop.EventLoop
-	manager      *WebSocketManager
-	ctx          context.Context
-	conn         *websocket.Conn
-	scheduled    chan goja.Callable
-	done         chan struct{}
-	shutdownOnce sync.Once
-	jsObject     *goja.Object
+	rt               *goja.Runtime
+	loop             *eventloop.EventLoop
+	manager          *WebSocketManager
+	hooks            AsyncContextHooks
+	executionContext any
+	ctx              context.Context
+	conn             *websocket.Conn
+	scheduled        chan goja.Callable
+	done             chan struct{}
+	shutdownOnce     sync.Once
+	jsObject         *goja.Object
 
 	// WebSocket API 属性
 	url          string
@@ -306,20 +328,27 @@ func (ws *WebSocket) NewWebSocketConnection(call goja.FunctionCall) goja.Value {
 		panic(rt.NewTypeError("WebSocket requires event loop. Please provide eventloop when calling Enable()."))
 	}
 
+	var executionContext any
+	if ws.hooks.CurrentContext != nil {
+		executionContext = ws.hooks.CurrentContext()
+	}
+
 	conn := &WebSocketConnection{
-		rt:             rt,
-		loop:           ws.loop,
-		manager:        managerOrGlobal(ws.manager),
-		url:            url,
-		protocol:       "", // 协议将在连接建立后设置
-		readyState:     Connecting,
-		scheduled:      make(chan goja.Callable),
-		done:           make(chan struct{}),
-		onopen:         goja.Undefined(),
-		onmessage:      goja.Undefined(),
-		onclose:        goja.Undefined(),
-		onerror:        goja.Undefined(),
-		eventListeners: make(map[string][]goja.Value),
+		rt:               rt,
+		loop:             ws.loop,
+		manager:          managerOrGlobal(ws.manager),
+		hooks:            ws.hooks,
+		executionContext: executionContext,
+		url:              url,
+		protocol:         "", // 协议将在连接建立后设置
+		readyState:       Connecting,
+		scheduled:        make(chan goja.Callable),
+		done:             make(chan struct{}),
+		onopen:           goja.Undefined(),
+		onmessage:        goja.Undefined(),
+		onclose:          goja.Undefined(),
+		onerror:          goja.Undefined(),
+		eventListeners:   make(map[string][]goja.Value),
 	}
 	// 注册到所属管理器
 	conn.manager.Register(conn)
@@ -690,8 +719,14 @@ func EnableWithManager(rt *goja.Runtime, loop *eventloop.EventLoop, manager *Web
 // EnableWithPolicyAndManager installs WebSocket using the supplied connection
 // manager and authorization hook.
 func EnableWithPolicyAndManager(rt *goja.Runtime, loop *eventloop.EventLoop, manager *WebSocketManager, authorize func(string) error) {
+	EnableWithPolicyAndManagerAndContext(rt, loop, manager, authorize, AsyncContextHooks{})
+}
+
+// EnableWithPolicyAndManagerAndContext additionally restores the constructor's
+// execution context around every asynchronous event dispatch.
+func EnableWithPolicyAndManagerAndContext(rt *goja.Runtime, loop *eventloop.EventLoop, manager *WebSocketManager, authorize func(string) error, hooks AsyncContextHooks) {
 	module := NewWithManager(manager)
-	instance := module.NewInstanceWithPolicy(rt, loop, authorize)
+	instance := module.NewInstanceWithPolicyAndContext(rt, loop, authorize, hooks)
 	_ = rt.Set("WebSocket", instance.Exports())
 }
 
@@ -747,7 +782,7 @@ func (conn *WebSocketConnection) dispatchEvent(eventType string, populate func(v
 	if conn.loop == nil {
 		return
 	}
-	conn.loop.RunOnLoop(func(vm *goja.Runtime) {
+	dispatch := func(vm *goja.Runtime) error {
 		event := vm.NewObject()
 		// 标准事件 target/ currentTarget
 		_ = event.Set("target", conn.jsObject)
@@ -776,12 +811,28 @@ func (conn *WebSocketConnection) dispatchEvent(eventType string, populate func(v
 
 		// 再调用通过 addEventListener 注册的监听器
 		listeners := conn.snapshotListeners(eventType)
-		for _, l := range listeners {
-			if fn, ok := goja.AssertFunction(l); ok {
+		for _, listener := range listeners {
+			if fn, ok := goja.AssertFunction(listener); ok {
 				if _, err := fn(conn.jsObject, event); err != nil {
 					WebSocketLogger.Errorf("处理WebSocket%s事件监听失败 url=%s error=%s", eventType, conn.url, err.Error())
 				}
 			}
 		}
+		return nil
+	}
+	if conn.hooks.ScheduleOnLoop != nil {
+		if err := conn.hooks.ScheduleOnLoop(conn.executionContext, dispatch); err != nil {
+			WebSocketLogger.Errorf("调度WebSocket%s事件失败 url=%s error=%s", eventType, conn.url, err.Error())
+		}
+		return
+	}
+	if scheduled, err := gojaengine.ScheduleOnExistingEventLoop(conn.loop, conn.executionContext, dispatch); scheduled {
+		if err != nil {
+			WebSocketLogger.Errorf("调度WebSocket%s事件失败 url=%s error=%s", eventType, conn.url, err.Error())
+		}
+		return
+	}
+	conn.loop.RunOnLoop(func(vm *goja.Runtime) {
+		_ = dispatch(vm)
 	})
 }

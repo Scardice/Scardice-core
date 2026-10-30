@@ -41,26 +41,31 @@ type ArtifactInput struct {
 // OutboundEffect is a closed DTO consumed by AdapterRuntime.Execute. Its
 // payload is intentionally limited to normalized fields and typed parameters.
 type OutboundEffect struct {
-	Version    EffectVersion     `json:"version,omitempty"`
-	ID         EffectID           `json:"id"`
-	EndpointID EndpointID         `json:"endpointId,omitempty"`
-	OperationID OperationID       `json:"operationId,omitempty"`
-	CorrelationID CorrelationID   `json:"correlationId,omitempty"`
-	CausationID  CausationID      `json:"causationId,omitempty"`
-	Lane       LaneMetadata       `json:"lane,omitempty"`
-	Deadline   time.Time          `json:"deadline,omitempty"`
-	Risk       EffectRisk         `json:"risk,omitempty"`
-	RetryClass EffectRetryClass   `json:"retryClass,omitempty"`
-	RequiredCapabilities CapabilitySet `json:"requiredCapabilities,omitempty"`
-	RequiredAction ActionKind     `json:"requiredAction,omitempty"`
-	Kind       EffectKind         `json:"kind"`
-	Action     ActionKind         `json:"action,omitempty"`
-	Target     ConversationID     `json:"target,omitempty"`
-	Text       string             `json:"text,omitempty"`
-	ReplyTo    MessageID          `json:"replyTo,omitempty"`
-	Parameters []EffectParameter  `json:"parameters,omitempty"`
-	Artifact   *ArtifactInput     `json:"artifact,omitempty"`
-	Payload    EffectPayload      `json:"payload,omitempty"`
+	Version       EffectVersion `json:"version,omitempty"`
+	ID            EffectID      `json:"id"`
+	EndpointID    EndpointID    `json:"endpointId,omitempty"`
+	OperationID   OperationID   `json:"operationId,omitempty"`
+	CorrelationID CorrelationID `json:"correlationId,omitempty"`
+	CausationID   CausationID   `json:"causationId,omitempty"`
+	Lane          LaneMetadata  `json:"lane,omitempty"`
+	Deadline      time.Time     `json:"deadline,omitempty"`
+	// NotBefore delays the effect: the outbox does not hand it to the provider
+	// before this instant. It must precede Deadline and is not part of the
+	// idempotency digest, so a replayed callback that recomputes the delay still
+	// deduplicates.
+	NotBefore            time.Time         `json:"notBefore,omitzero"`
+	Risk                 EffectRisk        `json:"risk,omitempty"`
+	RetryClass           EffectRetryClass  `json:"retryClass,omitempty"`
+	RequiredCapabilities CapabilitySet     `json:"requiredCapabilities,omitempty"`
+	RequiredAction       ActionKind        `json:"requiredAction,omitempty"`
+	Kind                 EffectKind        `json:"kind"`
+	Action               ActionKind        `json:"action,omitempty"`
+	Target               ConversationID    `json:"target,omitempty"`
+	Text                 string            `json:"text,omitempty"`
+	ReplyTo              MessageID         `json:"replyTo,omitempty"`
+	Parameters           []EffectParameter `json:"parameters,omitempty"`
+	Artifact             *ArtifactInput    `json:"artifact,omitempty"`
+	Payload              EffectPayload     `json:"payload,omitempty"`
 }
 
 func (effect OutboundEffect) Validate() error {
@@ -71,18 +76,32 @@ func (effect OutboundEffect) Validate() error {
 		if effect.Version != EffectVersionOne || !effect.EndpointID.Valid() || !effect.OperationID.Valid() || effect.CorrelationID == "" || effect.CausationID == "" || !effect.CorrelationID.Valid() || !effect.CausationID.Valid() || !effect.Risk.Valid() || effect.Deadline.IsZero() || func() bool { _, err := effect.Deadline.MarshalJSON(); return err != nil }() || effect.Action != 0 || effect.Target != "" || effect.Text != "" || effect.ReplyTo != "" || len(effect.Parameters) != 0 || effect.Artifact != nil {
 			return fmt.Errorf("%w: invalid versioned effect metadata", ErrInvalidContract)
 		}
+		if !effect.NotBefore.IsZero() {
+			if _, err := effect.NotBefore.MarshalJSON(); err != nil || !effect.NotBefore.Before(effect.Deadline) {
+				return fmt.Errorf("%w: effect not-before must precede its deadline", ErrInvalidContract)
+			}
+		}
 		expectedKind, expectedCaps, expectedAction, expectedRetry, expectedRisk, ok := payloadContract(effect.Payload.Kind)
 		if effect.Payload.Kind == EffectPayloadSegments {
-			for _, segment := range effect.Payload.Segments { if segment.Artifact != nil { expectedCaps |= CapabilityArtifacts; break } }
+			for _, segment := range effect.Payload.Segments {
+				if segment.Artifact != nil {
+					expectedCaps |= CapabilityArtifacts
+					break
+				}
+			}
 		}
 		if !ok || effect.Kind != expectedKind || effect.RequiredCapabilities != expectedCaps || effect.RequiredAction != expectedAction || effect.RetryClass != expectedRetry || effect.Risk != expectedRisk {
 			return fmt.Errorf("%w: versioned effect metadata does not match payload", ErrInvalidContract)
 		}
-		if err := effect.Lane.Validate(); err != nil || effect.Lane.EndpointID != effect.EndpointID { return fmt.Errorf("%w: lane does not bind effect target", ErrInvalidContract) }
-		if err := effect.Payload.Validate(); err != nil { return err }
+		if err := effect.Lane.Validate(); err != nil || effect.Lane.EndpointID != effect.EndpointID {
+			return fmt.Errorf("%w: lane does not bind effect target", ErrInvalidContract)
+		}
+		if err := effect.Payload.Validate(); err != nil {
+			return err
+		}
 		return nil
 	}
-	if effect.EndpointID != "" || effect.OperationID != "" || effect.CorrelationID != "" || effect.CausationID != "" || effect.Lane != (LaneMetadata{}) || !effect.Deadline.IsZero() || effect.Risk != 0 || effect.RetryClass != 0 || effect.RequiredCapabilities != 0 || effect.RequiredAction != 0 || effect.Payload.Kind != 0 || effect.Payload.Target != (EffectTarget{}) || effect.Payload.Text != "" || len(effect.Payload.Segments) != 0 || effect.Payload.File != (ArtifactInput{}) || effect.Payload.MessageID != "" || effect.Payload.Card != "" || effect.Payload.DurationSeconds != 0 || effect.Payload.Reason != "" {
+	if effect.EndpointID != "" || effect.OperationID != "" || effect.CorrelationID != "" || effect.CausationID != "" || effect.Lane != (LaneMetadata{}) || !effect.Deadline.IsZero() || !effect.NotBefore.IsZero() || effect.Risk != 0 || effect.RetryClass != 0 || effect.RequiredCapabilities != 0 || effect.RequiredAction != 0 || effect.Payload.Kind != 0 || effect.Payload.Target != (EffectTarget{}) || effect.Payload.Text != "" || len(effect.Payload.Segments) != 0 || len(effect.Payload.ForwardNodes) != 0 || effect.Payload.File != (ArtifactInput{}) || effect.Payload.MessageID != "" || effect.Payload.Card != "" || effect.Payload.DurationSeconds != 0 || effect.Payload.Reason != "" || effect.Payload.RequestID != "" || effect.Payload.Approve || effect.Payload.RequestJSON != "" {
 		return fmt.Errorf("%w: versioned fields require effect version", ErrInvalidContract)
 	}
 	if effect.Kind == EffectKindAction && !effect.Action.Valid() {
@@ -103,15 +122,23 @@ func (effect OutboundEffect) Validate() error {
 		}
 	}
 	if effect.Artifact != nil {
-		if err := effect.Artifact.Validate(); err != nil { return err }
+		if err := effect.Artifact.Validate(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func (effect OutboundEffect) ValidateForCapabilities(capabilities CapabilitySet, actions ActionSet) error {
-	if err := effect.Validate(); err != nil { return err }
-	if !capabilities.Valid() || !actions.Valid() || !capabilities.Has(effect.RequiredCapabilities) { return ErrUnsupportedAction }
-	if effect.RequiredAction != 0 && !actions.Has(effect.RequiredAction) { return ErrUnsupportedAction }
+	if err := effect.Validate(); err != nil {
+		return err
+	}
+	if !capabilities.Valid() || !actions.Valid() || !capabilities.Has(effect.RequiredCapabilities) {
+		return ErrUnsupportedAction
+	}
+	if effect.RequiredAction != 0 && !actions.Has(effect.RequiredAction) {
+		return ErrUnsupportedAction
+	}
 	return nil
 }
 
@@ -129,7 +156,12 @@ const (
 )
 
 func (outcome EffectOutcome) Valid() bool {
-	switch outcome { case EffectSucceeded, EffectUnsupported, EffectRetryable, EffectTerminal, EffectAmbiguous: return true }
+	switch outcome {
+	case EffectOutcomeInvalid:
+		return false
+	case EffectSucceeded, EffectUnsupported, EffectRetryable, EffectTerminal, EffectAmbiguous:
+		return true
+	}
 	return false
 }
 
@@ -137,11 +169,12 @@ func (outcome EffectOutcome) Valid() bool {
 // bounded messages are metadata; ArtifactResult is the only place bytes may
 // temporarily exist and is explicitly sensitive/ephemeral.
 type EffectResult struct {
-	Outcome    EffectOutcome  `json:"outcome"`
-	Code       string         `json:"code,omitempty"`
-	Message    string         `json:"message,omitempty"`
-	ProviderID string         `json:"providerId,omitempty"`
-	Artifact   *ArtifactResult `json:"artifact,omitempty"`
+	Outcome    EffectOutcome    `json:"outcome"`
+	Code       string           `json:"code,omitempty"`
+	Message    string           `json:"message,omitempty"`
+	ProviderID string           `json:"providerId,omitempty"`
+	Artifact   *ArtifactResult  `json:"artifact,omitempty"`
+	GroupInfo  *GroupInfoResult `json:"groupInfo,omitempty"`
 }
 
 func (result EffectResult) Validate() error {
@@ -155,7 +188,16 @@ func (result EffectResult) Validate() error {
 		return fmt.Errorf("%w: effect result exceeds bounds", ErrInvalidContract)
 	}
 	if result.Artifact != nil {
+		if result.GroupInfo != nil {
+			return fmt.Errorf("%w: effect result carries multiple typed payloads", ErrInvalidContract)
+		}
 		return result.Artifact.Validate()
+	}
+	if result.GroupInfo != nil {
+		if result.Outcome != EffectSucceeded {
+			return fmt.Errorf("%w: group info requires a successful outcome", ErrInvalidContract)
+		}
+		return result.GroupInfo.Validate()
 	}
 	return nil
 }
@@ -184,8 +226,8 @@ type ArtifactResult struct {
 	ContentType string     `json:"contentType,omitempty"`
 	Filename    string     `json:"filename,omitempty"`
 	Bytes       []byte     `json:"-"`
-	Sensitive   bool         `json:"sensitive"`
-	Ephemeral   bool         `json:"ephemeral"`
+	Sensitive   bool       `json:"sensitive"`
+	Ephemeral   bool       `json:"ephemeral"`
 }
 
 func NewArtifactResult(contentType, filename string, bytes []byte) ArtifactResult {

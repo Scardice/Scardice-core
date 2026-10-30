@@ -33,6 +33,7 @@ func TestGroupExternalDissolveBlacklistsOperator(t *testing.T) {
 	d, endpoint, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 	d.Config.BanList.ScoreGroupKicked = 1
+	d.DBOperator = nil // 本用例只验证内存策略，不覆盖 SQL 持久化。
 
 	coreExt, ok := d.ExtRegistry.Load("core")
 	if !ok || coreExt.OnGroupLeave == nil {

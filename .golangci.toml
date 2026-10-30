@@ -3,7 +3,7 @@
 # This file is licensed under the terms of the MIT license https://opensource.org/license/mit
 # Copyright (c) 2021-2025 Marat Reymers
 
-## Golden config for golangci-lint v2.12.2
+## Golden config for golangci-lint v2.15.0
 #
 # This is the best config for golangci-lint based on my experience and opinion.
 # It is very strict, but not extremely strict.
@@ -228,7 +228,7 @@ check-blank = false
 [linters.settings.exhaustive]
 # Program elements to check for exhaustiveness.
 # Default: [ switch ]
-check = ['switch', 'map']
+check = ['switch', 'mapliteral']
 default-signifies-exhaustive = true
 
 [linters.settings.exhaustruct]
@@ -338,12 +338,8 @@ enable-all = true
 # Default: []
 disable = [
     "fieldalignment", # too strict
+    "shadow",         # short err scopes are pervasive; strict shadow analysis is too noisy
 ]
-# Settings per analyzer.
-[linters.settings.govet.settings.shadow]
-# Whether to be strict about shadowing; can be noisy.
-# Default: false
-strict = false
 
 [linters.settings.inamedparam]
 # Skips check for interface methods with only a single parameter.

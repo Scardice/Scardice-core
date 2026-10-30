@@ -43,13 +43,13 @@ const MaxObservationDetailBytes = 16 * 1024
 // LifecycleObservation contains provider facts; Supervisor attaches endpoint,
 // generation, and desired-version fences in its CorePort wrapper.
 type LifecycleObservation struct {
-	Kind         LifecycleObservationKind `json:"kind"`
-	State        ObservedState            `json:"state"`
-	ProviderID   PrincipalID              `json:"providerId,omitempty"`
-	Code         string                   `json:"code,omitempty"`
-	Detail       string                   `json:"detail,omitempty"`
-	Retryable    bool                     `json:"retryable,omitempty"`
-	OccurredAt   time.Time                `json:"occurredAt"`
+	Kind       LifecycleObservationKind `json:"kind"`
+	State      ObservedState            `json:"state"`
+	ProviderID PrincipalID              `json:"providerId,omitempty"`
+	Code       string                   `json:"code,omitempty"`
+	Detail     string                   `json:"detail,omitempty"`
+	Retryable  bool                     `json:"retryable,omitempty"`
+	OccurredAt time.Time                `json:"occurredAt"`
 }
 
 func (observation LifecycleObservation) Validate() error {

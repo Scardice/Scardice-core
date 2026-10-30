@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	ds "github.com/sealdice/dicescript"
-	"go.uber.org/zap"
 
 	"Scardice-core/message"
 )
@@ -36,24 +35,6 @@ func TestExpandedForwardContentIsExcludedFromCommandText(t *testing.T) {
 	ensureMessageTextFromSegments(msg)
 	if strings.Contains(msg.Message, ".r") || strings.Contains(extractResultFromSegments(msg.Segment), ".r") {
 		t.Fatalf("expanded forward leaked into command text: message=%q args=%q", msg.Message, extractResultFromSegments(msg.Segment))
-	}
-}
-
-func TestOnebotInlineForwardExpandsOnlyIntoSegmentTree(t *testing.T) {
-	raw := []byte(`{"message_type":"private","user_id":10001,"message":[{"type":"forward","data":{"id":"forward-1","content":[{"type":"node","data":{"user_id":10002,"nickname":"nested","content":[{"type":"text","data":{"text":".help"}}]}}]}}]}`)
-	msg, err := arrayByte2ScardiceMessage(zap.NewNop().Sugar(), raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(msg.Segment) != 1 {
-		t.Fatalf("segments = %d", len(msg.Segment))
-	}
-	forward, ok := msg.Segment[0].(*message.ForwardElement)
-	if !ok || !forward.Loaded || len(forward.Nodes) != 1 {
-		t.Fatalf("forward was not expanded structurally: %#v", msg.Segment[0])
-	}
-	if strings.Contains(msg.Message, ".help") {
-		t.Fatalf("forward command leaked into top-level text: %q", msg.Message)
 	}
 }
 

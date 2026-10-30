@@ -35,6 +35,8 @@ const (
 
 func (retry EffectRetryClass) Valid() bool {
 	switch retry {
+	case EffectRetryInvalid:
+		return false
 	case EffectRetryPreDispatch, EffectRetryProviderIdempotent, EffectRetryNonIdempotent:
 		return true
 	}
@@ -52,6 +54,8 @@ const (
 
 func (kind TargetKind) Valid() bool {
 	switch kind {
+	case TargetInvalid:
+		return false
 	case TargetPerson, TargetGroup, TargetRaw:
 		return true
 	}
@@ -92,11 +96,16 @@ const (
 	EffectPayloadBan
 	EffectPayloadKick
 	EffectPayloadGroupInfoRefresh
+	EffectPayloadAnswerRequest
+	EffectPayloadAdapterAPI
+	EffectPayloadForward
 )
 
 func (kind EffectPayloadKind) Valid() bool {
 	switch kind {
-	case EffectPayloadPersonText, EffectPayloadGroupText, EffectPayloadSegments, EffectPayloadFile, EffectPayloadEdit, EffectPayloadRecall, EffectPayloadSetGroupCard, EffectPayloadQuit, EffectPayloadBan, EffectPayloadKick, EffectPayloadGroupInfoRefresh:
+	case EffectPayloadInvalid:
+		return false
+	case EffectPayloadPersonText, EffectPayloadGroupText, EffectPayloadSegments, EffectPayloadFile, EffectPayloadEdit, EffectPayloadRecall, EffectPayloadSetGroupCard, EffectPayloadQuit, EffectPayloadBan, EffectPayloadKick, EffectPayloadGroupInfoRefresh, EffectPayloadAnswerRequest, EffectPayloadAdapterAPI, EffectPayloadForward:
 		return true
 	}
 	return false
@@ -153,16 +162,39 @@ func (segment MessageSegment) Validate() error {
 	return nil
 }
 
+type ForwardMessageNode struct {
+	SenderID   PrincipalID `json:"senderId"`
+	SenderName string      `json:"senderName"`
+	Content    string      `json:"content"`
+}
+
+func (node ForwardMessageNode) Validate() error {
+	if !node.SenderID.Valid() || len(node.SenderName) > MaxEffectFieldBytes ||
+		len(node.Content) > MaxEffectTextBytes || strings.TrimSpace(node.Content) == "" {
+		return fmt.Errorf("%w: invalid forward message node", ErrInvalidContract)
+	}
+	return nil
+}
+
 type EffectPayload struct {
-	Kind            EffectPayloadKind `json:"kind"`
-	Target          EffectTarget      `json:"target"`
-	Text            string            `json:"text,omitempty"`
-	Segments        []MessageSegment  `json:"segments,omitempty"`
-	File            ArtifactInput     `json:"file,omitempty"`
-	MessageID       MessageID         `json:"messageId,omitempty"`
-	Card            string            `json:"card,omitempty"`
-	DurationSeconds uint32            `json:"durationSeconds,omitempty"`
-	Reason          string            `json:"reason,omitempty"`
+	Kind            EffectPayloadKind    `json:"kind"`
+	Target          EffectTarget         `json:"target"`
+	Text            string               `json:"text,omitempty"`
+	Segments        []MessageSegment     `json:"segments,omitempty"`
+	ForwardNodes    []ForwardMessageNode `json:"forwardNodes,omitempty"`
+	File            ArtifactInput        `json:"file,omitempty"`
+	MessageID       MessageID            `json:"messageId,omitempty"`
+	Card            string               `json:"card,omitempty"`
+	DurationSeconds uint32               `json:"durationSeconds,omitempty"`
+	Reason          string               `json:"reason,omitempty"`
+	// RequestID and Approve answer a provider request (a friend request when the
+	// target is a person, a group invitation when it is a group). Reason is the
+	// optional rejection explanation.
+	RequestID string `json:"requestId,omitempty"`
+	Approve   bool   `json:"approve,omitempty"`
+	// RequestJSON is an exact, complete provider request envelope. Validation
+	// bounds it to a JSON object but intentionally does not interpret actions.
+	RequestJSON string `json:"requestJson,omitempty"`
 }
 
 func (payload EffectPayload) Validate() error {
@@ -172,7 +204,7 @@ func (payload EffectPayload) Validate() error {
 	if err := payload.Target.Validate(); err != nil {
 		return err
 	}
-	if len(payload.Text) > MaxEffectTextBytes || len(payload.Card) > MaxEffectFieldBytes || len(payload.Reason) > MaxEffectFieldBytes || len(payload.Segments) > MaxEffectParameters {
+	if len(payload.Text) > MaxEffectTextBytes || len(payload.Card) > MaxEffectFieldBytes || len(payload.Reason) > MaxEffectFieldBytes || len(payload.Segments) > MaxEffectParameters || len(payload.ForwardNodes) > MaxEffectParameters {
 		return fmt.Errorf("%w: effect payload exceeds bounds", ErrInvalidContract)
 	}
 	for _, segment := range payload.Segments {
@@ -180,11 +212,27 @@ func (payload EffectPayload) Validate() error {
 			return err
 		}
 	}
+	for _, node := range payload.ForwardNodes {
+		if err := node.Validate(); err != nil {
+			return err
+		}
+	}
+	if payload.Kind != EffectPayloadAnswerRequest && (payload.RequestID != "" || payload.Approve) {
+		return fmt.Errorf("%w: request answer fields on a non-answer payload", ErrInvalidContract)
+	}
+	if payload.Kind != EffectPayloadAdapterAPI && payload.RequestJSON != "" {
+		return fmt.Errorf("%w: adapter request JSON on a non-adapter payload", ErrInvalidContract)
+	}
+	if payload.Kind != EffectPayloadForward && len(payload.ForwardNodes) != 0 {
+		return fmt.Errorf("%w: forward nodes on a non-forward payload", ErrInvalidContract)
+	}
 	normalizedTarget := payload.Target.Kind == TargetPerson || payload.Target.Kind == TargetGroup
 	noMember := payload.Target.Member == ""
 	zeroFile := payload.File.ID == "" && payload.File.Filename == "" && payload.File.ContentType == ""
 	zeroMessage := payload.MessageID == ""
 	switch payload.Kind {
+	case EffectPayloadInvalid:
+		return fmt.Errorf("%w: invalid effect payload", ErrInvalidContract)
 	case EffectPayloadPersonText:
 		if payload.Target.Kind != TargetPerson || !noMember || !normalizedTarget || payload.Text == "" || len(payload.Segments) != 0 || !zeroFile || !zeroMessage || payload.Card != "" || payload.DurationSeconds != 0 || payload.Reason != "" {
 			return fmt.Errorf("%w: invalid person text payload", ErrInvalidContract)
@@ -196,6 +244,10 @@ func (payload EffectPayload) Validate() error {
 	case EffectPayloadSegments:
 		if !normalizedTarget || !noMember || len(payload.Segments) == 0 || payload.Text != "" || !zeroFile || !zeroMessage || payload.Card != "" || payload.DurationSeconds != 0 || payload.Reason != "" {
 			return fmt.Errorf("%w: invalid segments payload", ErrInvalidContract)
+		}
+	case EffectPayloadForward:
+		if !normalizedTarget || !noMember || len(payload.ForwardNodes) == 0 || payload.Text != "" || len(payload.Segments) != 0 || !zeroFile || !zeroMessage || payload.Card != "" || payload.DurationSeconds != 0 || payload.Reason != "" {
+			return fmt.Errorf("%w: invalid forward payload", ErrInvalidContract)
 		}
 	case EffectPayloadFile:
 		if !normalizedTarget || !noMember || zeroFile || payload.Text != "" || len(payload.Segments) != 0 || !zeroMessage || payload.Card != "" || payload.DurationSeconds != 0 || payload.Reason != "" {
@@ -213,7 +265,8 @@ func (payload EffectPayload) Validate() error {
 			return fmt.Errorf("%w: invalid recall payload", ErrInvalidContract)
 		}
 	case EffectPayloadSetGroupCard:
-		if payload.Target.Kind != TargetGroup || !payload.Target.Member.Valid() || payload.Card == "" || payload.Text != "" || len(payload.Segments) != 0 || !zeroFile || !zeroMessage || payload.DurationSeconds != 0 || payload.Reason != "" {
+		// An empty card clears the member's existing group card.
+		if payload.Target.Kind != TargetGroup || !payload.Target.Member.Valid() || payload.Text != "" || len(payload.Segments) != 0 || !zeroFile || !zeroMessage || payload.DurationSeconds != 0 || payload.Reason != "" {
 			return fmt.Errorf("%w: invalid group card payload", ErrInvalidContract)
 		}
 	case EffectPayloadQuit, EffectPayloadGroupInfoRefresh:
@@ -228,11 +281,27 @@ func (payload EffectPayload) Validate() error {
 		if payload.Target.Kind != TargetGroup || !payload.Target.Member.Valid() || payload.Text != "" || len(payload.Segments) != 0 || !zeroFile || !zeroMessage || payload.Card != "" || payload.DurationSeconds != 0 {
 			return fmt.Errorf("%w: invalid kick payload", ErrInvalidContract)
 		}
+	case EffectPayloadAnswerRequest:
+		if !normalizedTarget || !noMember || payload.RequestID == "" || len(payload.RequestID) > MaxEffectFieldBytes || !validOptionalIdentifier(payload.RequestID) || payload.Text != "" || len(payload.Segments) != 0 || !zeroFile || !zeroMessage || payload.Card != "" || payload.DurationSeconds != 0 {
+			return fmt.Errorf("%w: invalid request answer payload", ErrInvalidContract)
+		}
+	case EffectPayloadAdapterAPI:
+		if payload.Target.Kind != TargetRaw || payload.Target.Raw != "adapter-api" ||
+			payload.Text != "" || len(payload.Segments) != 0 || !zeroFile || !zeroMessage ||
+			payload.Card != "" || payload.DurationSeconds != 0 || payload.Reason != "" ||
+			payload.RequestID != "" || payload.Approve {
+			return fmt.Errorf("%w: invalid adapter API payload", ErrInvalidContract)
+		}
+		if err := ValidateProtocolJSON(payload.RequestJSON); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 func payloadContract(kind EffectPayloadKind) (EffectKind, CapabilitySet, ActionKind, EffectRetryClass, EffectRisk, bool) {
 	switch kind {
+	case EffectPayloadInvalid:
+		return 0, 0, 0, 0, 0, false
 	case EffectPayloadPersonText, EffectPayloadGroupText:
 		return EffectKindMessage, CapabilityOutbound, ActionKindSendMessage, EffectRetryNonIdempotent, EffectRiskNormal, true
 	case EffectPayloadSegments:
@@ -253,6 +322,12 @@ func payloadContract(kind EffectPayloadKind) (EffectKind, CapabilitySet, ActionK
 		return EffectKindAction, CapabilityOutbound | CapabilityActions, ActionKindKick, EffectRetryNonIdempotent, EffectRiskHigh, true
 	case EffectPayloadGroupInfoRefresh:
 		return EffectKindAction, CapabilityOutbound | CapabilityActions, ActionKindGroupInfoRefresh, EffectRetryProviderIdempotent, EffectRiskNormal, true
+	case EffectPayloadAnswerRequest:
+		return EffectKindAction, CapabilityOutbound | CapabilityActions, ActionKindAnswerRequest, EffectRetryNonIdempotent, EffectRiskNormal, true
+	case EffectPayloadForward:
+		return EffectKindMessage, CapabilityOutbound | CapabilityRichMessages, ActionKindSendMessage, EffectRetryNonIdempotent, EffectRiskNormal, true
+	case EffectPayloadAdapterAPI:
+		return EffectKindAction, CapabilityOutbound | CapabilityActions, ActionKindAdapterAPI, EffectRetryNonIdempotent, EffectRiskNormal, true
 	}
 	return 0, 0, 0, 0, 0, false
 }

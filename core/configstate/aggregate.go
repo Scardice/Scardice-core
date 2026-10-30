@@ -1,6 +1,11 @@
 package configstate
 
 import (
+	"bytes"
+	"encoding/json"
+	"reflect"
+	"slices"
+
 	"Scardice-core/eventstore"
 )
 
@@ -36,9 +41,11 @@ type ConfigState = State
 func (s State) Clone() State {
 	out := s
 	out.Base = cloneBaseConfig(s.Base)
+	out.JS = cloneJSConfig(s.JS)
 	out.Censor = cloneCensorConfig(s.Censor)
 	out.Store = cloneStoreConfig(s.Store)
 	out.Outer = cloneOuterConfig(s.Outer)
+	out.PublicDice = clonePublicDiceConfig(s.PublicDice)
 	return out
 }
 func ConfigStream(diceID string) eventstore.StreamID {
@@ -176,7 +183,7 @@ func decide(state State, command Command) (Decision, error) {
 		if !validID(b.DiceID) {
 			return Decision{}, ErrInvalidCommand
 		}
-		events := []TypedEvent{BaseChangedV1{DiceID: b.DiceID, ConfigVersion: b.ConfigVersion, BaseConfig: b.Base}, RateChangedV1{b.Rate}, QuitChangedV1{b.Quit}, ExtensionChangedV1{b.Extension}, BanChangedV1{b.Ban}, JSChangedV1{b.JS}, StoryLogChangedV1{b.StoryLog}, MailChangedV1{b.Mail}, NewsChangedV1{b.News}, PublicDiceChangedV1{b.PublicDice}, CensorChangedV1{b.Censor}, StoreChangedV1{b.Store}, AdvancedChangedV1{b.Advanced}, OuterChangedV1{OuterConfig{CommandPrefix: b.CommandPrefix, DiceMasters: b.DiceMasters}}}
+		events := []TypedEvent{BaseChangedV1{DiceID: b.DiceID, ConfigVersion: b.ConfigVersion, BaseConfig: b.Base}, RateChangedV1{b.Rate}, QuitChangedV1{b.Quit}, ExtensionChangedV1{b.Extension}, BanChangedV1{b.Ban}, NewJSChangedV1(b.JS), StoryLogChangedV1{b.StoryLog}, MailChangedV1{b.Mail}, NewsChangedV1{b.News}, NewPublicDiceChangedV1(b.PublicDice), CensorChangedV1{b.Censor}, StoreChangedV1{b.Store}, AdvancedChangedV1{b.Advanced}, OuterChangedV1{OuterConfig{CommandPrefix: b.CommandPrefix, DiceMasters: b.DiceMasters}}}
 		for _, e := range events {
 			if err := validateEvent(e); err != nil {
 				return Decision{}, err
@@ -225,7 +232,7 @@ func decide(state State, command Command) (Decision, error) {
 		}
 	}
 	if p.JS != nil {
-		if err := add(JSChangedV1{*p.JS}, state.JS == *p.JS); err != nil {
+		if err := add(JSChangedV1{cloneJSConfig(*p.JS)}, equalJSConfig(state.JS, *p.JS)); err != nil {
 			return Decision{}, err
 		}
 	}
@@ -245,7 +252,7 @@ func decide(state State, command Command) (Decision, error) {
 		}
 	}
 	if p.PublicDice != nil {
-		if err := add(PublicDiceChangedV1{*p.PublicDice}, state.PublicDice == *p.PublicDice); err != nil {
+		if err := add(NewPublicDiceChangedV1(*p.PublicDice), equalPublicDice(state.PublicDice, *p.PublicDice)); err != nil {
 			return Decision{}, err
 		}
 	}
@@ -299,6 +306,76 @@ func equalBase(a, b BaseConfig) bool {
 	b.NoticeIDs = nil
 	return baseScalarsEqual(a, b) && sliceEqual(idsA, idsB)
 }
+func cloneJSConfig(config JSConfig) JSConfig {
+	out := config
+	if config.JsRuntimeOptions != nil {
+		out.JsRuntimeOptions = make(map[string]json.RawMessage, len(config.JsRuntimeOptions))
+		for id, payload := range config.JsRuntimeOptions {
+			out.JsRuntimeOptions[id] = append(json.RawMessage(nil), payload...)
+		}
+	}
+	if config.JsRuntimeRoutes != nil {
+		out.JsRuntimeRoutes = make(map[string]string, len(config.JsRuntimeRoutes))
+		for extensionID, runtimeID := range config.JsRuntimeRoutes {
+			out.JsRuntimeRoutes[extensionID] = runtimeID
+		}
+	}
+	if len(config.DisabledJsScripts) > 0 {
+		out.DisabledJsScripts = make(map[string]bool, len(config.DisabledJsScripts))
+		for scriptName, disabled := range config.DisabledJsScripts {
+			out.DisabledJsScripts[scriptName] = disabled
+		}
+	} else {
+		out.DisabledJsScripts = nil
+	}
+	return out
+}
+
+func clonePublicDiceConfig(config PublicDiceConfig) PublicDiceConfig {
+	out := config
+	out.EndpointIDs = append([]string(nil), config.EndpointIDs...)
+	return out
+}
+
+func equalJSConfig(left, right JSConfig) bool {
+	leftOptions := left.JsRuntimeOptions
+	rightOptions := right.JsRuntimeOptions
+	leftRoutes := left.JsRuntimeRoutes
+	rightRoutes := right.JsRuntimeRoutes
+	leftDisabledScripts := left.DisabledJsScripts
+	rightDisabledScripts := right.DisabledJsScripts
+	left.JsRuntimeOptions = nil
+	right.JsRuntimeOptions = nil
+	left.JsRuntimeRoutes = nil
+	right.JsRuntimeRoutes = nil
+	left.DisabledJsScripts = nil
+	right.DisabledJsScripts = nil
+	if !reflect.DeepEqual(left, right) ||
+		len(leftOptions) != len(rightOptions) ||
+		len(leftRoutes) != len(rightRoutes) ||
+		len(leftDisabledScripts) != len(rightDisabledScripts) {
+		return false
+	}
+	for id, payload := range leftOptions {
+		other, ok := rightOptions[id]
+		if !ok || !bytes.Equal(payload, other) {
+			return false
+		}
+	}
+	for extensionID, runtimeID := range leftRoutes {
+		if rightRoutes[extensionID] != runtimeID {
+			return false
+		}
+	}
+	for scriptName, disabled := range leftDisabledScripts {
+		other, ok := rightDisabledScripts[scriptName]
+		if !ok || other != disabled {
+			return false
+		}
+	}
+	return true
+}
+
 func sliceEqual(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -446,4 +523,12 @@ func baseScalarsEqual(a, b BaseConfig) bool {
 	return a.CommandCompatibleMode == b.CommandCompatibleMode && a.OnlyLogCommandInGroup == b.OnlyLogCommandInGroup && a.OnlyLogCommandInPrivate == b.OnlyLogCommandInPrivate && a.VersionCode == b.VersionCode && a.MessageDelayRangeStart == b.MessageDelayRangeStart && a.MessageDelayRangeEnd == b.MessageDelayRangeEnd && a.WorkInQQChannel == b.WorkInQQChannel && a.QQChannelAutoOn == b.QQChannelAutoOn && a.QQChannelLogMessage == b.QQChannelLogMessage && a.QQEnablePoke == b.QQEnablePoke && a.TextCmdTrustOnly == b.TextCmdTrustOnly && a.IgnoreUnaddressedBotCmd == b.IgnoreUnaddressedBotCmd && a.UILogLimit == b.UILogLimit && a.FriendAddComment == b.FriendAddComment && a.CustomReplyConfigEnable == b.CustomReplyConfigEnable && a.AutoReloginEnable == b.AutoReloginEnable && a.RefuseGroupInvite == b.RefuseGroupInvite && a.BotExtFreeSwitch == b.BotExtFreeSwitch && a.BotExitWithoutAt == b.BotExitWithoutAt && a.TrustOnlyMode == b.TrustOnlyMode && a.AliveNoticeEnable == b.AliveNoticeEnable && a.AliveNoticeValue == b.AliveNoticeValue && a.ReplyDebugMode == b.ReplyDebugMode && a.PlayerNameWrapEnable == b.PlayerNameWrapEnable && a.DiceRandomMode == b.DiceRandomMode && a.VMVersionForReply == b.VMVersionForReply && a.VMVersionForDeck == b.VMVersionForDeck && a.VMVersionForCustomText == b.VMVersionForCustomText && a.VMVersionForMsg == b.VMVersionForMsg
 }
 
-// configstate comparisons normalize set-like fields at the command boundary.
+func equalPublicDice(left, right PublicDiceConfig) bool {
+	return left.Enable == right.Enable &&
+		left.ID == right.ID &&
+		left.Name == right.Name &&
+		left.Brief == right.Brief &&
+		left.Note == right.Note &&
+		left.Avatar == right.Avatar &&
+		slices.Equal(left.EndpointIDs, right.EndpointIDs)
+}

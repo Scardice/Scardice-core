@@ -87,10 +87,8 @@ func onReady() {
 			_ = exec.Command(`open`, filepath.Dir(os.Args[0])).Start()
 		case <-mQuit.ClickedCh:
 			systrayQuited = true
-			cleanupCreate(theDm, nil)()
 			systray.Quit()
-			time.Sleep(3 * time.Second)
-			os.Exit(0)
+			return
 		}
 	}
 }

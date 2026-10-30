@@ -42,8 +42,11 @@ func resourceGetList(c echo.Context) error {
 	}
 
 	// 目前只支持图片
-	var images []resource
-	_ = filepath.Walk("data/images", func(path string, info fs.FileInfo, err error) error {
+	images := make([]resource, 0)
+	walkErr := filepath.Walk("data/images", func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
 		if !info.IsDir() {
 			t, ext := getResourceType(path)
 			if t == Image {
@@ -58,6 +61,9 @@ func resourceGetList(c echo.Context) error {
 		}
 		return nil
 	})
+	if walkErr != nil && !os.IsNotExist(walkErr) {
+		return Error(&c, "读取图片资源列表失败", Response{})
+	}
 
 	return Success(&c, map[string]interface{}{
 		"data": images,
@@ -210,15 +216,26 @@ func resourceGetData(c echo.Context) error {
 		return c.NoContent(http.StatusForbidden)
 	}
 
-	img, _ := imgconv.Open(param.Path)
+	img, err := imgconv.Open(param.Path)
+	if err != nil {
+		return c.JSON(http.StatusUnprocessableEntity, Response{
+			"result": false,
+			"err":    "图片资源无法读取或解码",
+		})
+	}
 	if param.Thumbnail {
 		img = imgconv.Resize(img, &imgconv.ResizeOption{Width: 64})
 	}
 
 	buf := new(bytes.Buffer)
-	_ = imgconv.Write(buf, img, &imgconv.FormatOption{Format: imgconv.PNG})
+	if err := imgconv.Write(buf, img, &imgconv.FormatOption{Format: imgconv.PNG}); err != nil {
+		return c.JSON(http.StatusInternalServerError, Response{
+			"result": false,
+			"err":    "图片资源转换失败",
+		})
+	}
 
-	return c.Blob(http.StatusOK, "", buf.Bytes())
+	return c.Blob(http.StatusOK, "image/png", buf.Bytes())
 }
 
 func ensurePathSafe(path string) error {

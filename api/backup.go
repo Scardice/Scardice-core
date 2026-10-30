@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"io/fs"
 	"net/http"
 	"os"
@@ -38,8 +39,17 @@ func backupGetList(c echo.Context) error {
 
 	reFn := regexp.MustCompile(`^(bak_\d{6}_\d{6}(?:_auto)?_r([0-9a-f]+))_([0-9a-f]{8})\.zip$`)
 
-	var items []*backupFileItem
-	_ = filepath.Walk(dice.BackupDir, func(path string, info fs.FileInfo, err error) error {
+	items := make([]*backupFileItem, 0)
+	walkErr := filepath.Walk(dice.BackupDir, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) && strings.HasPrefix(filepath.Base(path), dice.BackupStagingDirPrefix) {
+				return nil
+			}
+			return err
+		}
+		if info.IsDir() && strings.HasPrefix(info.Name(), dice.BackupStagingDirPrefix) {
+			return filepath.SkipDir
+		}
 		if !info.IsDir() {
 			fn := info.Name()
 			matches := reFn.FindStringSubmatch(fn)
@@ -59,8 +69,11 @@ func backupGetList(c echo.Context) error {
 				Selection: selection,
 			})
 		}
-		return err
+		return nil
 	})
+	if walkErr != nil && !os.IsNotExist(walkErr) {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "读取备份文件列表失败"})
+	}
 
 	ReverseSlice(items)
 	return c.JSON(http.StatusOK, map[string]interface{}{
@@ -154,14 +167,39 @@ func backupExec(c echo.Context) error {
 	v := struct {
 		Selection uint64 `json:"selection"`
 	}{}
-	err := c.Bind(&v)
-	if err != nil {
-		return Error(&c, err.Error(), Response{})
+	if err := c.Bind(&v); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
 	}
 
-	_, err = dm.Backup(dice.BackupSelection(v.Selection), false)
+	job, err := dm.StartBackup(dice.BackupSelection(v.Selection), false)
+	if errors.Is(err, dice.ErrBackupInProgress) {
+		return c.JSON(http.StatusConflict, map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+			"job":     job,
+		})
+	}
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+	}
+	return c.JSON(http.StatusAccepted, map[string]interface{}{
+		"success": true,
+		"job":     job,
+	})
+}
+
+func backupStatus(c echo.Context) error {
+	if !doAuth(c) {
+		return c.JSON(http.StatusForbidden, nil)
+	}
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"success": err == nil,
+		"job": dm.BackupJobSnapshot(),
 	})
 }
 

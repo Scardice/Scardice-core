@@ -559,7 +559,10 @@ func CreateTempCtx(ep *EndPointInfo, msg *Message) *MsgContext {
 	//	return nil
 	// }
 
-	ctx := &MsgContext{MessageType: msg.MessageType, EndPoint: liveEp, Session: session, Dice: session.Parent}
+	ctx := &MsgContext{
+		MessageType: msg.MessageType, EndPoint: liveEp, Session: session, Dice: session.Parent,
+		uiTestSplitLength: msg.TestUIOutputSplitLength, uiTestSplitLengthSet: msg.TestUIOutputSplitLengthSet,
+	}
 
 	switch msg.MessageType {
 	case "private":
@@ -601,6 +604,7 @@ func UnpackGroupUserId(id string) (groupIdPart, userIdPart string, ok bool) {
 		"SEALCHAT-Group:":   "SEALCHAT:",
 		"SLACK-CH-Group":    "SLACK:",
 		"DINGTALK-Group":    "DINGTALK:",
+		"OpenQQCH-Channel:": "OpenQQCH:",
 		"OpenQQ-Group-T:":   "OpenQQ-Member-T:",
 		"UI-Group:":         "UI:",
 	}
@@ -625,6 +629,7 @@ func UnpackGroupUserId(id string) (groupIdPart, userIdPart string, ok bool) {
 	}
 
 	prefixMap2 := map[string]string{
+		"PG-OpenQQCH:": "OpenQQCH:",
 		"PG-QQ:":       "QQ:",
 		"PG-KOOK:":     "KOOK:",
 		"PG-SEALCHAT:": "SEALCHAT:", // PG-SEALCHAT:LJMmncRk4Kh_yPNjCNIhX:xK7iDQ13ypAw7GHiGBzHM

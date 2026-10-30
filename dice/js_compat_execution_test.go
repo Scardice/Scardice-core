@@ -1,12 +1,61 @@
 package dice
 
 import (
+	"context"
 	"errors"
 	"testing"
 
 	"Scardice-core/dice/sealpack"
 	"Scardice-core/eventstore"
+	"Scardice-core/utils/jsengine"
 )
+
+type revokedOwnerLoop struct{}
+
+func (revokedOwnerLoop) Engine() jsengine.EngineID { return jsengine.EngineGoja }
+func (revokedOwnerLoop) Descriptor() jsengine.Descriptor {
+	return jsengine.Descriptor{ID: jsengine.EngineGoja}
+}
+func (revokedOwnerLoop) Run(func(jsengine.Runtime) error) error      { return nil }
+func (revokedOwnerLoop) LoadEntry(jsengine.Entry) error              { return nil }
+func (revokedOwnerLoop) Close() error                                { return nil }
+func (revokedOwnerLoop) Schedule(func(jsengine.Runtime) error) error { return nil }
+func (revokedOwnerLoop) RunWithContext(any, func(jsengine.Runtime) error) error {
+	return nil
+}
+func (revokedOwnerLoop) ScheduleWithContext(any, func(jsengine.Runtime) error) error {
+	return nil
+}
+func (revokedOwnerLoop) CurrentContext() any { return jsengine.RevokedExecutionScope{} }
+func (revokedOwnerLoop) LoadEntryWithContext(any, jsengine.Entry) error {
+	return nil
+}
+func (revokedOwnerLoop) InOwner() bool { return true }
+
+func TestRevokedExecutionScopeResolvesToExpiredMessageContext(t *testing.T) {
+	execution := jsOpaqueExecutionContext(jsengine.RevokedExecutionScope{})
+	if execution == nil || execution.Message == nil {
+		t.Fatal("revoked provider context became an unbound standalone context")
+	}
+	if err := execution.Message.checkExecution(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("revoked message context error = %v, want context cancellation", err)
+	}
+}
+func TestRevokedNativeCallbackCannotFallbackToStandaloneStorage(t *testing.T) {
+	store, _ := repairTestStore(t)
+	loop := revokedOwnerLoop{}
+	manager := NewJsLoopManager()
+	manager.instances[1] = &jsRuntimeInstance{loop: loop, generation: 1}
+	d := &Dice{DurableStore: store, ExtLoopManager: manager}
+	ext := &ExtInfo{Name: "revoked-native-callback", dice: d}
+
+	if err := ext.StorageSet("escaped", "value"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("revoked storage write error = %v, want context cancellation", err)
+	}
+	if _, err := store.GetPluginKV(context.Background(), ext.Name, "escaped"); !errors.Is(err, eventstore.ErrPluginKVNotFound) {
+		t.Fatalf("revoked callback wrote through standalone fallback: %v", err)
+	}
+}
 
 func TestJSCompatibilityReplayDecisionSuppressesCallbacksSchedulingAndEffects(t *testing.T) {
 	decision := DecideJSCompatibility(JSCompatibilityReplay)

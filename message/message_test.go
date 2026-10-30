@@ -1,6 +1,9 @@
 package message
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 func TestConvertStringMessage_ParseRecall(t *testing.T) {
 	elems := ConvertStringMessage("[CQ:recall,id=123456]")
@@ -53,5 +56,16 @@ func TestConvertStringMessage_ParseRecallWithoutID(t *testing.T) {
 	}
 	if recall.DelayMS != 15 {
 		t.Fatalf("unexpected DelayMS: %d", recall.DelayMS)
+	}
+}
+
+func TestLocalPathFromFileURL(t *testing.T) {
+	got, err := localPathFromResourceReference("file:///data/Scardice-TEST/core/logs/synthetic%20export.txt")
+	if err != nil {
+		t.Fatalf("localPathFromResourceReference: %v", err)
+	}
+	want := filepath.FromSlash("/data/Scardice-TEST/core/logs/synthetic export.txt")
+	if got != want {
+		t.Fatalf("local path = %q, want %q", got, want)
 	}
 }

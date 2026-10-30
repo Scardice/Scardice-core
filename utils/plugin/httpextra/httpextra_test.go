@@ -536,3 +536,30 @@ func TestFetchAbortSignalCancelsRequest(t *testing.T) {
 		t.Fatalf("unexpected abort result: %s", got)
 	}
 }
+
+// Go nil slices reach JavaScript as null, so an empty FormData has to hand out
+// real empty arrays or scripts that read .length or call .forEach on the result
+// throw.
+func TestEmptyFormDataResultsAreEmptyArrays(t *testing.T) {
+	vm := goja.New()
+	Enable(vm)
+	value, err := vm.RunString(`
+		const form = new FormData();
+		form.append("a", "1");
+		JSON.stringify({
+			missing: form.getAll("nope"),
+			emptyKeys: new FormData().keys(),
+			emptyValues: new FormData().values(),
+			emptyEntries: new FormData().entries(),
+			present: form.getAll("a"),
+			missingLength: form.getAll("nope").length,
+		})
+	`)
+	if err != nil {
+		t.Fatalf("script failed: %v", err)
+	}
+	const want = `{"missing":[],"emptyKeys":[],"emptyValues":[],"emptyEntries":[],"present":["1"],"missingLength":0}`
+	if got := value.String(); got != want {
+		t.Fatalf("FormData results = %s, want %s", got, want)
+	}
+}

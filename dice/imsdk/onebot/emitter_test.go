@@ -127,7 +127,6 @@ func TestDecodeResponseRejectsUnknownOrEmptyStatus(t *testing.T) {
 	}
 }
 
-
 func TestWaitEchoAfterSendTimeoutWrapsActionContext(t *testing.T) {
 	oldTimeout := EchoTimeOut
 	EchoTimeOut = 10 * time.Millisecond
@@ -169,5 +168,72 @@ func TestWrapActionErrorIncludesOriginalFailure(t *testing.T) {
 	}
 	if !strings.Contains(msg, `"sub_type":"invite"`) {
 		t.Fatalf("expected params in %q", msg)
+	}
+}
+func TestDecodeResponseMarksRejectedAction(t *testing.T) {
+	resp := Response[sonic.NoCopyRawMessage]{
+		Status:  "failed",
+		RetCode: 1401,
+		Data:    sonic.NoCopyRawMessage(`{"message":"denied"}`),
+		Echo:    "echo-rejected",
+	}
+	_, err := decodeResponse[map[string]any](ACTION_SEND_PRIVATE_MSG, "echo-rejected", nil, resp)
+	if err == nil {
+		t.Fatal("expected failed action response")
+	}
+	var rejected interface{ IsActionRejected() }
+	if !errors.As(err, &rejected) {
+		t.Fatalf("failed action error %T lacks action-rejected classification", err)
+	}
+}
+func TestDecodeResponseOnlyMarksExplicitActionRejections(t *testing.T) {
+	tests := []struct {
+		name         string
+		status       string
+		retcode      int
+		wantRejected bool
+	}{
+		{name: "failed status", status: "failed", wantRejected: true},
+		{name: "nonzero retcode", status: "ok", retcode: 1401, wantRejected: true},
+		{name: "empty status", wantRejected: false},
+		{name: "pending status", status: "pending", wantRejected: false},
+		{name: "unknown status", status: "unknown", wantRejected: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resp := Response[sonic.NoCopyRawMessage]{
+				Status:  test.status,
+				RetCode: test.retcode,
+				Data:    sonic.NoCopyRawMessage(`{}`),
+				Echo:    "echo-classification",
+			}
+			_, err := decodeResponse[map[string]any](ACTION_SEND_PRIVATE_MSG, "echo-classification", nil, resp)
+			if err == nil {
+				t.Fatal("expected non-success response error")
+			}
+			var rejected interface{ IsActionRejected() }
+			gotRejected := errors.As(err, &rejected)
+			if gotRejected != test.wantRejected {
+				t.Fatalf("action-rejected classification = %v, want %v; error=%v", gotRejected, test.wantRejected, err)
+			}
+		})
+	}
+}
+
+func TestDecodeResponseLeavesSuccessfulMissingMessageIDForAdapterClassification(t *testing.T) {
+	resp := Response[sonic.NoCopyRawMessage]{
+		Status:  "ok",
+		RetCode: 0,
+		Data:    sonic.NoCopyRawMessage(`{}`),
+		Echo:    "echo-missing-id",
+	}
+	result, err := decodeResponse[struct {
+		MessageID int64 `json:"message_id"`
+	}](ACTION_SEND_PRIVATE_MSG, "echo-missing-id", nil, resp)
+	if err != nil {
+		t.Fatalf("decode successful response without message ID: %v", err)
+	}
+	if result == nil || result.MessageID != 0 {
+		t.Fatalf("decoded result = %#v, want a decoded response with no message ID", result)
 	}
 }

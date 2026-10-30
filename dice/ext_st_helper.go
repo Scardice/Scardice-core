@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/samber/lo"
 	ds "github.com/sealdice/dicescript"
@@ -697,7 +696,6 @@ func getCmdStBase(soi CmdStOverrideInfo) *CmdItemInfo {
 						p.Name = name
 						VarSetValueStr(mctx, "$t玩家", fmt.Sprintf("<%s>", mctx.Player.Name))
 						VarSetValueStr(mctx, "$t玩家_RAW", mctx.Player.Name)
-						p.UpdatedAtTime = time.Now().Unix()
 						if mctx.Group != nil {
 							mctx.Group.MarkDirty(mctx.Dice)
 						}

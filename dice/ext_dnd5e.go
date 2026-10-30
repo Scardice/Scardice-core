@@ -1693,7 +1693,7 @@ var dndRiLock sync.Mutex
 // LoadByCurGroup 从群信息中加载
 func (lst RIList) LoadByCurGroup(ctx *MsgContext) RIList {
 	am := ctx.Dice.AttrsManager
-	attrs, _ := am.LoadById(ctx.Group.GroupID)
+	attrs, _ := am.LoadByIdForCtx(ctx, ctx.Group.GroupID)
 
 	dndRiLock.Lock()
 	riList := attrs.Load("riList")
@@ -1740,7 +1740,7 @@ func (lst RIList) LoadByCurGroup(ctx *MsgContext) RIList {
 // SaveToGroup 写入群信息中
 func (lst RIList) SaveToGroup(ctx *MsgContext) {
 	am := ctx.Dice.AttrsManager
-	attrs, _ := am.LoadById(ctx.Group.GroupID)
+	attrs, _ := am.LoadByIdForCtx(ctx, ctx.Group.GroupID)
 	riList := ds.NewArrayVal()
 
 	ad := riList.MustReadArray()

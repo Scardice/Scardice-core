@@ -76,31 +76,85 @@ git config core.hooksPath .githooks
 
 Git 不会从远端仓库自动启用客户端 hook；每个本地 checkout 都需要执行一次上述配置。
 
-### 编译运行
+### 测试
 
-#### 使用 `build.sh` 打包（Linux 环境推荐）
-
-仓库根目录提供了交互式打包脚本：
+Go 测试按功能与行为边界组织，同包场景共享测试夹具。用例名称描述输入条件与预期结果；适配器协议、持久化恢复、迁移、运行时生命周期和兼容性分别保留对应覆盖。
 
 ```bash
-./build.sh
+go test ./...
+go test -race ./...
+go vet ./...
 ```
 
-脚本会自动执行以下流程：
+原生 QuickJS 集成测试使用已安装的运行时包。按照 [QuickJS 构建说明](runtime-plugins/quickjs/README.md) 生成包后运行：
 
-1. 更新 submodule（`Scardice-ui`、`sealdice-builtins`）到最新提交
-2. 构建 UI（若 `dist` 已匹配当前 UI 提交与 lockfile 指纹，则自动跳过）
-3. 编译 core
-4. 用 `sealdice-builtins/data` 组装并打包
-5. 在 `output/` 输出压缩包（过程文件在 `.build-cache`）
+```bash
+SCARDICE_QUICKJS_PACKAGE=/path/to/runtime-root go test ./utils/jsengine/native ./runtime-plugins/quickjs/test -count=1
+```
 
-脚本支持两种构建模式：
+WebUI 的浏览器集成测试在 Scardice-ui 仓库通过 `pnpm test` 运行，覆盖备份、牌堆操作、新闻、分页、资源预览及设置持久化。
 
-- `single`（默认，也可输入 `s`）：构建单个 `GOOS/GOARCH` 目标
-- `multi`（也可输入 `m`）：一次输入多个目标，格式为 `goos/goarch,...`，例如：
-  `linux/amd64,windows/amd64,linux/arm64`
+### 编译运行
 
-注意：如果启用 CGO 且为跨平台编译，需预先安装对应交叉编译器。
+#### 使用 Python 构建器
+
+仓库根目录的 `build.py` 使用 Python 标准库构建并打包 Scardice。准备 Python 3.9+、Go、Git；发布构建还需要 Node.js 和 pnpm。若系统有 npm 但没有 pnpm，脚本会尝试通过 npm 全局安装 pnpm。
+
+在 Linux 或 macOS 上运行：
+
+```bash
+python3 build.py
+```
+
+在 Windows 上运行：
+
+```powershell
+py build.py
+```
+
+在交互终端中不传配置组时，脚本会逐项询问构建选项，并以 `default` 组的值作为默认值。非交互环境直接使用 default 组。指定配置组后不显示交互提示：
+
+```bash
+python3 build.py --config-group default
+python3 build.py --config-group dev
+```
+
+Windows PowerShell 使用 Python Launcher：
+
+```powershell
+py build.py --config-group default
+py build.py --config-group dev
+```
+
+`default` 组构建单个本机目标并生成发布压缩包；`dev` 组只编译 core，并在仓库根目录生成本机可执行文件（Windows 使用 `.exe`）。配置组定义在根目录的 `build-config.json`。每个组会继承 `default_group` 指向组的值，再覆盖自己指定的字段。下面是可运行的配置示例：
+
+```json
+{
+  "default_group": "default",
+  "groups": {
+    "default": {
+      "version_main": null,
+      "version_prerelease": "-dev",
+      "app_channel": "dev",
+      "appname": "Scardice",
+      "build_mode": "single",
+      "targets": ["host/host"]
+    },
+    "linux-release": {
+      "build_mode": "multi",
+      "targets": ["linux/amd64", "linux/arm64"],
+      "cgo": false
+    }
+  }
+}
+```
+
+然后运行 `python3 build.py --config-group linux-release`；Windows PowerShell 对应使用 `py build.py --config-group linux-release`。`build_mode` 支持 `single` 和 `multi`；`targets` 使用 `goos/goarch` 字符串数组。启用 CGO 交叉编译前，先安装目标平台对应的 C 编译器。
+
+发布构建默认会更新 `Scardice-ui` 和 `sealdice-builtins` submodule，按 UI 提交与 lockfile 指纹决定是否重建 UI，并在 `output/` 生成压缩包。过程缓存保存在 `.build-cache/`。构建器不会清空 `output/`：只替换同名归档，保留其他文件；构建期间会暂存嵌入用的 UI 文件，并在结束后恢复原有 `static/frontend/`。
+
+配置组可通过 `update_submodules`、`pack_runtime_assets`、`strict_runtime_assets`、`compatible_names` 和 `upx` 控制 submodule、运行时资源、兼容命名与 UPX。下载代理和超时仍可通过 `BUILD_PROXY`、`DOWNLOAD_*` 等环境变量设置。
+
 
 #### 使用 `go-task`
 

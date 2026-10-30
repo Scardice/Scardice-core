@@ -18,7 +18,7 @@ func TestDiscoverManifestIsLazyAndResolvesArchitectureLibrary(t *testing.T) {
 	if err := os.MkdirAll(pkg, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	manifest := `{"schema":1,"id":"echo","name":"Echo","version":"1.0.0","language":"javascript","author":"Scardice","extensions":[".echo"],"runtimeAbi":{"major":1,"minMinor":0},"hostAbi":{"major":1,"minMinor":0},"services":["console"],"libraries":{"` + runtime.GOOS + `-` + runtime.GOARCH + `":"libecho.so"}}`
+	manifest := `{"schema":1,"id":"echo","name":"Echo","version":"1.0.0","language":"javascript","author":"Scardice","extensions":[".echo"],"runtimeAbi":{"major":1},"hostAbi":{"major":1},"services":["console"],"libraries":{"` + runtime.GOOS + `-` + runtime.GOARCH + `":"libecho.so"}}`
 	if err := os.WriteFile(filepath.Join(pkg, "runtime.json"), []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestDiscoverRejectsUnsupportedArchitecture(t *testing.T) {
 	if err := os.MkdirAll(pkg, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	manifest := `{"schema":1,"id":"echo","name":"Echo","version":"1.0.0","language":"javascript","runtimeAbi":{"major":1,"minMinor":0},"hostAbi":{"major":1,"minMinor":0},"libraries":{"unknown-os-unknown-arch":"libecho.so"}}`
+	manifest := `{"schema":1,"id":"echo","name":"Echo","version":"1.0.0","language":"javascript","runtimeAbi":{"major":1},"hostAbi":{"major":1},"libraries":{"unknown-os-unknown-arch":"libecho.so"}}`
 	if err := os.WriteFile(filepath.Join(pkg, "runtime.json"), []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestRepeatedLoadKeepsTransientPathOwnershipBounded(t *testing.T) {
 		Schema: 1, ID: "echo-runtime", Name: "Echo Runtime", Version: "1.0.0", Language: "javascript",
 		RuntimeABI: ABIRequirement{Major: 1}, HostABI: ABIRequirement{Major: 1},
 	}}
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		if _, err := candidate.Load(); err != nil {
 			t.Fatalf("Load() iteration %d error = %v", i, err)
 		}
@@ -106,7 +106,7 @@ func TestRegisterCandidatesKeepsCandidateMetadataSeparateFromBuiltin(t *testing.
 	if err := os.MkdirAll(pkg, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	manifest := `{"schema":1,"id":"goja","name":"Native Collision","version":"1.0.0","language":"javascript","runtimeAbi":{"major":1,"minMinor":0},"hostAbi":{"major":1,"minMinor":0},"libraries":{"` + runtime.GOOS + `-` + runtime.GOARCH + `":"missing.so"}}`
+	manifest := `{"schema":1,"id":"goja","name":"Native Collision","version":"1.0.0","language":"javascript","runtimeAbi":{"major":1},"hostAbi":{"major":1},"libraries":{"` + runtime.GOOS + `-` + runtime.GOARCH + `":"missing.so"}}`
 	if err := os.WriteFile(filepath.Join(pkg, "runtime.json"), []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -180,8 +180,8 @@ func TestLoadEchoProviderDescriptorAndResidentLifecycle(t *testing.T) {
 		LibraryPath: library,
 		Manifest: Manifest{
 			Schema: 1, ID: "echo-runtime", Name: "Echo Runtime", Version: "1.0.0", Language: "javascript",
-			RuntimeABI: ABIRequirement{Major: 1, MinMinor: 0},
-			HostABI:    ABIRequirement{Major: 1, MinMinor: 0},
+			RuntimeABI: ABIRequirement{Major: 1},
+			HostABI:    ABIRequirement{Major: 1},
 		},
 	}
 	provider, err := candidate.Load()

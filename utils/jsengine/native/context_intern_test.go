@@ -28,7 +28,7 @@ func TestNativeRegisterContextInternsEqualIdentities(t *testing.T) {
 	if first == 0 {
 		t.Fatal("registerContext returned the empty token")
 	}
-	for i := 0; i < 64; i++ {
+	for range 64 {
 		again := loop.registerContext(&keyedTestContext{id: 7, payload: []string{"b"}})
 		if again != first {
 			t.Fatalf("token for equal identity = %d, want %d", again, first)

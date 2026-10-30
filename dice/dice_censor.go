@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"Scardice-core/dice/censor"
 	"Scardice-core/dice/service"
@@ -57,6 +58,8 @@ type CensorManager struct {
 	Censor              *censor.Censor
 	DB                  engine.DatabaseOperator
 	SensitiveWordsFiles map[string]*censor.WordFile
+	memoryHitCountsMu   sync.Mutex
+	memoryHitCounts     map[string]map[censor.Level]int
 }
 
 func (d *Dice) NewCensorManager() {
@@ -111,15 +114,42 @@ func (cm *CensorManager) Load(d *Dice) {
 }
 
 func (cm *CensorManager) Check(ctx *MsgContext, msg *Message, checkContent string) (*MsgCheckResult, error) {
+	return cm.check(ctx, msg, checkContent, nil, false)
+}
+
+func (cm *CensorManager) checkForCensorMsg(ctx *MsgContext, msg *Message, checkContent string, thresholds map[censor.Level]int) (*MsgCheckResult, error) {
+	return cm.check(ctx, msg, checkContent, thresholds, true)
+}
+
+func (cm *CensorManager) check(ctx *MsgContext, msg *Message, checkContent string, thresholds map[censor.Level]int, evaluateMemoryThresholds bool) (*MsgCheckResult, error) {
 	if cm.IsLoading {
 		return nil, errors.New("censor is loading")
 	}
 	res := cm.Censor.Check(checkContent)
-	if !ctx.Censored && res.HighestLevel > censor.Ignore {
-		// 敏感词命中记录保存
-		service.CensorAppend(cm.DB, ctx.MessageType, msg.Sender.UserID, msg.GroupID, msg.Message, res.SensitiveWords, int(res.HighestLevel))
+	return cm.recordCensorCheck(ctx, msg, res, thresholds, evaluateMemoryThresholds), nil
+}
+
+func (cm *CensorManager) recordCensorCheck(ctx *MsgContext, msg *Message, res censor.CheckResult, thresholds map[censor.Level]int, evaluateMemoryThresholds bool) *MsgCheckResult {
+	var (
+		count                map[censor.Level]int
+		thresholdLevel       censor.Level
+		thresholdWasExceeded bool
+	)
+	if cm.DB != nil {
+		if !ctx.Censored && res.HighestLevel > censor.Ignore {
+			// 敏感词命中记录保存
+			service.CensorAppend(cm.DB, ctx.MessageType, msg.Sender.UserID, msg.GroupID, msg.Message, res.SensitiveWords, int(res.HighestLevel))
+		}
+		count = service.CensorCount(cm.DB, msg.Sender.UserID)
+	} else {
+		count, thresholdLevel, thresholdWasExceeded = cm.updateMemoryHitCounts(
+			msg.Sender.UserID,
+			res.HighestLevel,
+			!ctx.Censored && res.HighestLevel > censor.Ignore,
+			thresholds,
+			evaluateMemoryThresholds,
+		)
 	}
-	count := service.CensorCount(cm.DB, msg.Sender.UserID)
 
 	var words []string
 	for word := range res.SensitiveWords {
@@ -127,28 +157,84 @@ func (cm *CensorManager) Check(ctx *MsgContext, msg *Message, checkContent strin
 	}
 	sort.Strings(words)
 	return &MsgCheckResult{
-		UserID:            msg.Sender.UserID,
-		Level:             res.HighestLevel,
-		HitCounts:         count,
-		CurSensitiveWords: words,
-	}, nil
+		UserID:                  msg.Sender.UserID,
+		Level:                   res.HighestLevel,
+		HitCounts:               count,
+		CurSensitiveWords:       words,
+		memoryThresholdLevel:    thresholdLevel,
+		memoryThresholdExceeded: thresholdWasExceeded,
+	}
+}
+
+func (cm *CensorManager) updateMemoryHitCounts(userID string, level censor.Level, increment bool, thresholds map[censor.Level]int, evaluateThresholds bool) (map[censor.Level]int, censor.Level, bool) {
+	cm.memoryHitCountsMu.Lock()
+	defer cm.memoryHitCountsMu.Unlock()
+	if cm.memoryHitCounts == nil {
+		cm.memoryHitCounts = make(map[string]map[censor.Level]int)
+	}
+
+	counts := cm.memoryHitCounts[userID]
+	if increment {
+		if counts == nil {
+			counts = make(map[censor.Level]int)
+			cm.memoryHitCounts[userID] = counts
+		}
+		counts[level]++
+	}
+	if len(counts) == 0 {
+		return nil, censor.Ignore, false
+	}
+	snapshot := make(map[censor.Level]int, len(counts))
+	for hitLevel, count := range counts {
+		snapshot[hitLevel] = count
+	}
+	if !increment || !evaluateThresholds {
+		return snapshot, censor.Ignore, false
+	}
+
+	levels := make(censor.Levels, 0, len(counts))
+	for hitLevel := range counts {
+		levels = append(levels, hitLevel)
+	}
+	sort.Sort(sort.Reverse(levels))
+	for _, hitLevel := range levels {
+		if counts[hitLevel] > thresholds[hitLevel] {
+			delete(counts, hitLevel)
+			if len(counts) == 0 {
+				delete(cm.memoryHitCounts, userID)
+			}
+			return snapshot, hitLevel, true
+		}
+	}
+	return snapshot, censor.Ignore, false
+}
+
+func (cm *CensorManager) snapshotMemoryHitCounts(userID string, level censor.Level, increment bool) map[censor.Level]int {
+	counts, _, _ := cm.updateMemoryHitCounts(userID, level, increment, nil, false)
+	return counts
 }
 
 type MsgCheckResult struct {
-	UserID            string
-	Level             censor.Level
-	HitCounts         map[censor.Level]int
-	CurSensitiveWords []string
+	UserID                  string
+	Level                   censor.Level
+	HitCounts               map[censor.Level]int
+	CurSensitiveWords       []string
+	memoryThresholdLevel    censor.Level
+	memoryThresholdExceeded bool
 }
 
 func (d *Dice) CensorMsg(mctx *MsgContext, msg *Message, checkContent string, sendContent string) (hit bool, hitWords []string, needToTerminate bool, newContent string) {
 	log := d.Logger
-	checkResult, err := d.CensorManager.Check(mctx, msg, checkContent)
+	checkResult, err := d.CensorManager.checkForCensorMsg(mctx, msg, checkContent, d.Config.CensorThresholds)
 	if err != nil {
 		// FIXME: 尽管这种情况比较少，但是是否要提供一个配置项，用来控制默认是跳过还是拦截吗？
 		log.Warnf("拦截系统出错(%s)，来自<%s>(%s)的消息跳过了检查", err.Error(), msg.Sender.Nickname, msg.Sender.UserID)
 		return hit, hitWords, needToTerminate, newContent
 	}
+	return d.applyCensorResult(mctx, msg, checkContent, sendContent, checkResult)
+}
+
+func (d *Dice) applyCensorResult(mctx *MsgContext, msg *Message, checkContent, sendContent string, checkResult *MsgCheckResult) (hit bool, hitWords []string, needToTerminate bool, newContent string) {
 	newContent = sendContent
 
 	if checkResult.Level <= censor.Ignore {
@@ -183,12 +269,18 @@ func (d *Dice) CensorMsg(mctx *MsgContext, msg *Message, checkContent string, se
 
 	for _, level := range tempLevels {
 		hitCount := checkResult.HitCounts[level]
-		if hitCount > thresholds[level] {
+		thresholdExceeded := hitCount > thresholds[level]
+		if d.CensorManager.DB == nil {
+			thresholdExceeded = checkResult.memoryThresholdExceeded && checkResult.memoryThresholdLevel == level
+		}
+		if thresholdExceeded {
 			// 处理完跳出，多个等级超过阈值的处理仅进行最高的处理
 			// 需要终止后续动作
 			needToTerminate = true
 			// 清空此用户该等级计数
-			service.CensorClearLevelCount(d.CensorManager.DB, msg.Sender.UserID, level)
+			if d.CensorManager.DB != nil {
+				service.CensorClearLevelCount(d.CensorManager.DB, msg.Sender.UserID, level)
+			}
 			// 该等级敏感词超过阈值，执行操作
 			handler := d.Config.CensorHandlers[level]
 			levelText := censor.LevelText[level]

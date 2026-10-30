@@ -1,19 +1,20 @@
 package native
 
 import (
-	"Scardice-core/utils/jsengine"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 
+	"Scardice-core/utils/jsengine"
+
 	"strings"
 )
 
 type ABIRequirement struct {
-	Major    uint32 `json:"major"`
-	MinMinor uint32 `json:"minMinor"`
+	Major uint32 `json:"major"`
 }
 
 type Manifest struct {
@@ -30,6 +31,22 @@ type Manifest struct {
 	Services     []string          `json:"services,omitempty"`
 	Extensions   []string          `json:"extensions,omitempty"`
 	ManifestPath string            `json:"-"`
+}
+
+const (
+	runtimeABIMajor = 1
+	hostABIMajor    = 1
+)
+
+// ValidateABI checks manifest versions without opening the native library.
+func (m Manifest) ValidateABI() error {
+	if m.RuntimeABI.Major != runtimeABIMajor {
+		return fmt.Errorf("%w: manifest v%d, supported v%d", ErrRuntimeABIMismatch, m.RuntimeABI.Major, runtimeABIMajor)
+	}
+	if m.HostABI.Major != hostABIMajor {
+		return fmt.Errorf("%w: manifest v%d, supported v%d", ErrHostABIMismatch, m.HostABI.Major, hostABIMajor)
+	}
+	return nil
 }
 
 type Candidate struct {
@@ -79,7 +96,7 @@ func Discover(root string) ([]Candidate, error) {
 		}
 		var manifest Manifest
 		if err := json.Unmarshal(contents, &manifest); err != nil {
-			return nil, fmt.Errorf("%w: %s: %v", ErrManifestMismatch, manifestPath, err)
+			return nil, fmt.Errorf("%w: %s: %w", ErrManifestMismatch, manifestPath, err)
 		}
 		if manifest.Schema != 1 || manifest.ID == "" || manifest.Name == "" || manifest.Version == "" ||
 			manifest.Language == "" || manifest.RuntimeABI.Major == 0 || manifest.HostABI.Major == 0 {
@@ -91,7 +108,7 @@ func Discover(root string) ([]Candidate, error) {
 		}
 		libraryPath, err := packagePath(packageDir, libraryName)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %s: %v", ErrManifestMismatch, manifestPath, err)
+			return nil, fmt.Errorf("%w: %s: %w", ErrManifestMismatch, manifestPath, err)
 		}
 		manifest.ManifestPath = manifestPath
 		candidates = append(candidates, Candidate{Manifest: manifest, LibraryPath: libraryPath})
@@ -101,17 +118,17 @@ func Discover(root string) ([]Candidate, error) {
 
 func packagePath(packageDir, libraryName string) (string, error) {
 	if filepath.IsAbs(libraryName) {
-		return "", fmt.Errorf("library path must be relative")
+		return "", errors.New("library path must be relative")
 	}
 	clean := filepath.Clean(libraryName)
 	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("library path escapes package directory")
+		return "", errors.New("library path escapes package directory")
 	}
 	path := filepath.Join(packageDir, clean)
-	if real, err := filepath.EvalSymlinks(path); err == nil {
-		rel, relErr := filepath.Rel(packageDir, real)
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		rel, relErr := filepath.Rel(packageDir, resolved)
 		if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return "", fmt.Errorf("library symlink escapes package directory")
+			return "", errors.New("library symlink escapes package directory")
 		}
 	}
 	return path, nil
@@ -169,18 +186,16 @@ func (l *Loader) RegisterCandidates(registry jsengine.Registry) error {
 		if err := registry.RegisterCandidate(jsengine.RuntimeManifest{
 			ID: jsengine.EngineID(manifest.ID), Name: manifest.Name, Version: manifest.Version,
 			Language: manifest.Language, Author: manifest.Author, ABIMajor: manifest.RuntimeABI.Major,
-			ABIMinor: manifest.RuntimeABI.MinMinor, HostABIMajor: manifest.HostABI.Major,
-			HostABIMinor: manifest.HostABI.MinMinor, Capabilities: jsengine.CapabilitySet(manifest.Capabilities),
+			HostABIMajor: manifest.HostABI.Major, Capabilities: jsengine.CapabilitySet(manifest.Capabilities),
 			Services:   append([]string(nil), manifest.Services...),
 			Extensions: append([]string(nil), manifest.Extensions...),
 			Path:       candidate.LibraryPath,
+			Load: func() (jsengine.Provider, error) {
+				return candidate.Load()
+			},
 		}); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func wrapNoCgo(path string) error {
-	return fmt.Errorf("%w: cgo is required to load %s", ErrNativeRuntimeUnsupported, path)
 }

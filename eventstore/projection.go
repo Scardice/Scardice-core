@@ -1,7 +1,6 @@
 package eventstore
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,9 +15,12 @@ import (
 )
 
 const (
-	projectionPageSize         = 1000
-	projectionGenerationKey    = "eventstore.projection_generation"
+	projectionPageSize          = 1000
+	projectionGenerationKey     = "eventstore.projection_generation"
 	supportedEventSchemaVersion = uint16(1)
+
+	// MaxProjectionReadPageRows is the hard upper bound for one keyset page.
+	MaxProjectionReadPageRows = 5000
 )
 
 // ProjectionRow is the generation-aware read shape exposed by the narrow
@@ -29,9 +31,48 @@ type ProjectionRow struct {
 	ProjectionName       string
 	RowKey               string
 
-	Payload              []byte
-	UpdatedAt            time.Time
+	Payload   []byte
+	UpdatedAt time.Time
 }
+
+// ProjectionSnapshot identifies one published logical projection state.
+// Generation changes on rebuild publication, TerminalPosition changes on
+// live projection writes, and HistoryRevision changes on privacy deletion.
+// A paged reader must carry the complete value into every subsequent page.
+type ProjectionSnapshot struct {
+	Generation       string
+	TerminalPosition uint64
+	HistoryRevision  uint64
+}
+
+// ProjectionPageRequest selects an optional row-key prefix or half-open
+// database row-key range and an exclusive keyset cursor. Limit must be between
+// 1 and MaxProjectionReadPageRows. RowKeyStart and RowKeyEnd must either both
+// be empty or both be set. When Prefix and bounds are both supplied, SQLite
+// uses the binary bounds while other dialects use anchored Prefix matching to
+// avoid locale-collation omissions. ExpectedSnapshot is nil only for the first
+// page of an unvalidated scan. Callers needing byte-exact identity scope must
+// validate returned keys because database collations vary.
+type ProjectionPageRequest struct {
+	ProjectionName   string
+	RowKeyPrefix     string
+	RowKeyStart      string
+	RowKeyEnd        string
+	AfterRowKey      string
+	Limit            int
+	ExpectedSnapshot *ProjectionSnapshot
+}
+
+// ProjectionPage contains at most the requested number of rows. Done is true
+// only for an empty terminal page, so consumers can process the preceding page
+// outside the database transaction and then perform one final snapshot check.
+type ProjectionPage struct {
+	Snapshot   ProjectionSnapshot
+	Rows       []ProjectionRow
+	NextRowKey string
+	Done       bool
+}
+
 func copyProjectionBytes(value []byte) []byte {
 	if value == nil {
 		return nil
@@ -51,6 +92,14 @@ func ProjectionGeneration(tx *gorm.DB) string {
 	return generation
 }
 
+// withProjectionGeneration attaches the generation projectors write to. Set
+// alone returns a handle whose statement keeps every condition added to it, so
+// the handle is turned into a session: each query made from it, here or inside
+// a projector, starts clean.
+func withProjectionGeneration(tx *gorm.DB, generation string) *gorm.DB {
+	return tx.Set(projectionGenerationKey, generation).Session(&gorm.Session{})
+}
+
 func CurrentProjectionGeneration(tx *gorm.DB) string { return ProjectionGeneration(tx) }
 
 // UpsertProjectionRow writes to the generation selected by the surrounding
@@ -66,11 +115,12 @@ func UpsertProjectionRow(tx *gorm.DB, projectionName, rowKey string, payload []b
 		ProjectionName:       projectionName,
 		RowKey:               rowKey,
 		Payload:              copyProjectionBytes(payload),
+		PayloadPresent:       payload != nil,
 		UpdatedAt:            time.Now().UTC(),
 	}
 	return tx.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "projection_generation"}, {Name: "projection_name"}, {Name: "row_key"}},
-		DoUpdates: clause.AssignmentColumns([]string{"payload", "updated_at"}),
+		Columns:   []clause.Column{{Name: "projection_generation"}, {Name: "projection_name"}, {Name: "row_key"}},
+		DoUpdates: clause.AssignmentColumns([]string{"payload", "payload_present", "updated_at"}),
 	}).Create(&row).Error
 }
 
@@ -121,7 +171,6 @@ func sameProjectors(a, b []ProjectionDescriptor) bool {
 	return true
 }
 
-
 func (s *GORMStore) projectorSnapshot() ([]ProjectionDescriptor, string, error) {
 	if s == nil {
 		return nil, "", errors.New("eventstore: store unavailable")
@@ -154,7 +203,6 @@ func projectorRequestVersion(projectors []ProjectionDescriptor, requested, canon
 	return true
 }
 
-
 func (s *GORMStore) Rebuild(ctx context.Context, request RebuildRequest) (RebuildResult, error) {
 	if s == nil || s.db == nil || s.db.GORM() == nil {
 		return RebuildResult{}, errors.New("eventstore: store unavailable")
@@ -165,9 +213,9 @@ func (s *GORMStore) Rebuild(ctx context.Context, request RebuildRequest) (Rebuil
 	if err := s.requireReady(ctx); err != nil {
 		return RebuildResult{}, err
 	}
-	projectors, setVersion, err := s.projectorSnapshot()
-	if err != nil {
-		return RebuildResult{}, err
+	projectors, setVersion, projectionErr := s.projectorSnapshot()
+	if projectionErr != nil {
+		return RebuildResult{}, projectionErr
 	}
 	if request.ProjectorVersion == "" || !projectorRequestVersion(projectors, request.ProjectorVersion, setVersion) {
 		return RebuildResult{}, ErrProjectorVersionConflict
@@ -177,12 +225,12 @@ func (s *GORMStore) Rebuild(ctx context.Context, request RebuildRequest) (Rebuil
 	if err := base.Where("singleton_id = ?", "default").First(&control).Error; err != nil {
 		return RebuildResult{}, errors.New("eventstore: read projection control failed")
 	}
-	highWater, err := s.highWater(ctx)
-	if err != nil {
-		return RebuildResult{}, err
+	highWater, projectionErr := s.highWater(ctx)
+	if projectionErr != nil {
+		return RebuildResult{}, projectionErr
 	}
-	generation, err := (UUIDGenerator{}).NewID()
-	if err != nil {
+	generation, projectionErr := (UUIDGenerator{}).NewID()
+	if projectionErr != nil {
 		return RebuildResult{}, errors.New("eventstore: allocate projection generation failed")
 	}
 	cursor := uint64(0)
@@ -191,16 +239,14 @@ func (s *GORMStore) Rebuild(ctx context.Context, request RebuildRequest) (Rebuil
 		if err != nil {
 			return RebuildResult{}, err
 		}
-		if len(rows) == 0 {
-			return RebuildResult{}, ErrProjectionInvariant
-		}
-		if err := validateProjectionPage(rows, cursor); err != nil {
+		next, err := validateProjectionPage(base, rows, cursor, highWater)
+		if err != nil {
 			return RebuildResult{}, err
 		}
-		if err := s.applyProjectionPage(ctx, generation, rows, projectors); err != nil {
+		if err := s.applyProjectionPage(ctx, generation, &control, rows, projectors); err != nil {
 			return RebuildResult{}, err
 		}
-		cursor = rows[len(rows)-1].GlobalPosition
+		cursor = next
 	}
 
 	// Catch up outside the publication fence. Once the observed lag is one
@@ -217,18 +263,16 @@ func (s *GORMStore) Rebuild(ctx context.Context, request RebuildRequest) (Rebuil
 		if err != nil {
 			return RebuildResult{}, err
 		}
-		if err := validateProjectionPage(rows, cursor); err != nil {
+		next, err := validateProjectionPage(base, rows, cursor, latest)
+		if err != nil {
 			return RebuildResult{}, err
 		}
-		if len(rows) == 0 {
-			return RebuildResult{}, ErrProjectionInvariant
-		}
-		if err := s.applyProjectionPage(ctx, generation, rows, projectors); err != nil {
+		if err := s.applyProjectionPage(ctx, generation, &control, rows, projectors); err != nil {
 			return RebuildResult{}, err
 		}
-		cursor = rows[len(rows)-1].GlobalPosition
+		cursor = next
 	}
-	return s.publishProjection(ctx, generation, cursor, projectors, setVersion)
+	return s.publishProjection(ctx, generation, &control, cursor, projectors, setVersion)
 }
 
 func (s *GORMStore) highWater(ctx context.Context) (uint64, error) {
@@ -242,16 +286,38 @@ func (s *GORMStore) highWater(ctx context.Context) (uint64, error) {
 	return sequence.NextPosition - 1, nil
 }
 
-func validateProjectionPage(rows []domainEventRow, cursor uint64) error {
-	expected := cursor
+func validateProjectionPage(db *gorm.DB, rows []domainEventRow, cursor, highWater uint64) (uint64, error) {
+	if cursor > highWater {
+		return 0, ErrProjectionInvariant
+	}
 	for _, row := range rows {
-		if expected == maxUint64 {
-			return ErrProjectionInvariant
+		if row.GlobalPosition <= cursor || row.GlobalPosition > highWater {
+			return 0, ErrProjectionInvariant
 		}
-		expected++
-		if row.GlobalPosition != expected {
-			return ErrProjectionInvariant
+		if err := validateProjectionGap(db, cursor, row.GlobalPosition-1); err != nil {
+			return 0, err
 		}
+		cursor = row.GlobalPosition
+	}
+	if len(rows) == 0 {
+		if err := validateProjectionGap(db, cursor, highWater); err != nil {
+			return 0, err
+		}
+		cursor = highWater
+	}
+	return cursor, nil
+}
+
+func validateProjectionGap(db *gorm.DB, after, through uint64) error {
+	if through <= after {
+		return nil
+	}
+	var count int64
+	if err := db.Model(&eventTombstoneRow{}).Where("global_position > ? AND global_position <= ?", after, through).Count(&count).Error; err != nil {
+		return ErrParticipantFailure
+	}
+	if count < 0 || uint64(count) != through-after {
+		return ErrProjectionInvariant
 	}
 	return nil
 }
@@ -290,24 +356,24 @@ func projectionEnvelope(row domainEventRow) (Envelope, error) {
 		SchemaVersion:  row.SchemaVersion,
 		Payload:        copyProjectionBytes(row.Payload),
 		Metadata: Metadata{
-			EventID:                   row.EventID,
-			CommandID:                row.CommandID,
-			CorrelationID:            row.CorrelationID,
-			CausationID:              row.CausationID,
-			PrincipalID:              row.PrincipalID,
-			Producer:                 row.Producer,
-			OccurredAtUnixNanoUTC:    row.OccurredAtUnixNanoUTC,
-			OccurredAtUnixNanoSet:    true,
+			EventID:               row.EventID,
+			CommandID:             row.CommandID,
+			CorrelationID:         row.CorrelationID,
+			CausationID:           row.CausationID,
+			PrincipalID:           row.PrincipalID,
+			Producer:              row.Producer,
+			OccurredAtUnixNanoUTC: row.OccurredAtUnixNanoUTC,
+			OccurredAtUnixNanoSet: true,
 		},
 		Checksum: checksum,
 	}
-	if ComputeEventChecksum(envelope) != checksum {
-		return Envelope{}, ErrChecksumMismatch
-	}
-	return envelope, nil
+	return verifyEnvelopeChecksum(envelope)
 }
 
-func (s *GORMStore) applyProjectionPage(ctx context.Context, generation string, rows []domainEventRow, projectors []ProjectionDescriptor) error {
+func (s *GORMStore) applyProjectionPage(ctx context.Context, generation string, source *projectionControlRow, rows []domainEventRow, projectors []ProjectionDescriptor) error {
+	if len(rows) == 0 {
+		return nil
+	}
 	envelopes := make([]Envelope, len(rows))
 	for i, row := range rows {
 		envelope, err := projectionEnvelope(row)
@@ -326,10 +392,16 @@ func (s *GORMStore) applyProjectionPage(ctx context.Context, generation string, 
 			_ = tx.Rollback().Error
 		}
 	}()
-	tx = tx.Set(projectionGenerationKey, generation)
+	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		return err
+	}
+	if err := validateProjectionSource(tx, source); err != nil {
+		return err
+	}
+	tx = withProjectionGeneration(tx, generation)
 	for _, projector := range projectors {
 		if err := projector.Apply(ctx, tx, envelopes); err != nil {
-			return ErrProjectorFailure
+			return errors.Join(ErrProjectorFailure, err)
 		}
 	}
 	if err := tx.Commit().Error; err != nil {
@@ -339,7 +411,20 @@ func (s *GORMStore) applyProjectionPage(ctx context.Context, generation string, 
 	return nil
 }
 
-func (s *GORMStore) publishProjection(ctx context.Context, generation string, cursor uint64, projectors []ProjectionDescriptor, setVersion string) (RebuildResult, error) {
+func validateProjectionSource(tx *gorm.DB, source *projectionControlRow) error {
+	var current projectionControlRow
+	if err := tx.Where("singleton_id = ?", "default").First(&current).Error; err != nil {
+		return ErrParticipantFailure
+	}
+	// Publication can remove an in-flight shadow generation even when no
+	// additional events were erased. Fence both changes, not just the high-water mark.
+	if current.ActiveGeneration != source.ActiveGeneration || current.HistoryRevision != source.HistoryRevision {
+		return ErrParticipantConflict
+	}
+	return nil
+}
+
+func (s *GORMStore) publishProjection(ctx context.Context, generation string, source *projectionControlRow, cursor uint64, projectors []ProjectionDescriptor, setVersion string) (RebuildResult, error) {
 	tx := s.db.GORM().WithContext(ctx).Begin()
 	if tx.Error != nil {
 		return RebuildResult{}, errors.New("eventstore: begin projection publication failed")
@@ -360,6 +445,9 @@ func (s *GORMStore) publishProjection(ctx context.Context, generation string, cu
 		return RebuildResult{}, errors.New("eventstore: lock projection control failed")
 	}
 	s.observeLock(tableProjectionControl)
+	if control.ActiveGeneration != source.ActiveGeneration || control.HistoryRevision != source.HistoryRevision {
+		return RebuildResult{}, ErrParticipantConflict
+	}
 	var sequence eventGlobalSequenceRow
 	if err := locked(tx).Where("singleton_id = ?", "default").First(&sequence).Error; err != nil {
 		return RebuildResult{}, errors.New("eventstore: lock event sequence failed")
@@ -376,11 +464,13 @@ func (s *GORMStore) publishProjection(ctx context.Context, generation string, cu
 		if err != nil {
 			return RebuildResult{}, err
 		}
-		if len(rows) == 0 {
-			return RebuildResult{}, ErrProjectionInvariant
-		}
-		if err := validateProjectionPage(rows, cursor); err != nil {
+		next, err := validateProjectionPage(tx, rows, cursor, latest)
+		if err != nil {
 			return RebuildResult{}, err
+		}
+		cursor = next
+		if len(rows) == 0 {
+			continue
 		}
 		envelopes := make([]Envelope, len(rows))
 		for i, row := range rows {
@@ -390,13 +480,12 @@ func (s *GORMStore) publishProjection(ctx context.Context, generation string, cu
 			}
 			envelopes[i] = envelope
 		}
-		projectionTx := tx.Set(projectionGenerationKey, generation)
+		projectionTx := withProjectionGeneration(tx, generation)
 		for _, projector := range projectors {
 			if err := projector.Apply(ctx, projectionTx, envelopes); err != nil {
-				return RebuildResult{}, ErrProjectorFailure
+				return RebuildResult{}, errors.Join(ErrProjectorFailure, err)
 			}
 		}
-		cursor = rows[len(rows)-1].GlobalPosition
 	}
 	s.projectorMu.RLock()
 	defer s.projectorMu.RUnlock()
@@ -416,17 +505,17 @@ func (s *GORMStore) publishProjection(ctx context.Context, generation string, cu
 		return RebuildResult{}, errors.New("eventstore: compute projection digest failed")
 	}
 	if err := tx.Model(&projectionControlRow{}).Where("singleton_id = ?", "default").Updates(map[string]any{
-		"active_generation": generation,
-		"terminal_position": cursor,
+		"active_generation":     generation,
+		"terminal_position":     cursor,
 		"projector_set_version": setVersion,
-		"publication_state": "published",
-		"updated_at": time.Now().UTC(),
+		"publication_state":     "published",
+		"updated_at":            time.Now().UTC(),
 	}).Error; err != nil {
 		return RebuildResult{}, errors.New("eventstore: publish projection generation failed")
 	}
 	if readiness.Mode == "import" {
 		if err := tx.Model(&storeReadinessRow{}).Where("singleton_id = ?", "default").Updates(map[string]any{
-			"terminal_global_position": latest,
+			"terminal_global_position":     latest,
 			"terminal_projection_position": cursor,
 		}).Error; err != nil {
 			return RebuildResult{}, errors.New("eventstore: publish readiness terminal failed")
@@ -463,11 +552,10 @@ func digestProjectionRows(tx *gorm.DB, generation string) (EventChecksum, error)
 		return EventChecksum{}, err
 	}
 	sort.SliceStable(rows, func(i, j int) bool {
-		nameI, nameJ := []byte(rows[i].ProjectionName), []byte(rows[j].ProjectionName)
-		if cmp := bytes.Compare(nameI, nameJ); cmp != 0 {
-			return cmp < 0
+		if rows[i].ProjectionName != rows[j].ProjectionName {
+			return rows[i].ProjectionName < rows[j].ProjectionName
 		}
-		return bytes.Compare([]byte(rows[i].RowKey), []byte(rows[j].RowKey)) < 0
+		return rows[i].RowKey < rows[j].RowKey
 	})
 	hash := sha256.New()
 	writeCanonicalString(hash, "eventstore.projection.digest.v1")
@@ -478,7 +566,8 @@ func digestProjectionRows(tx *gorm.DB, generation string) (EventChecksum, error)
 		writeCanonicalString(hash, "row_key")
 		writeCanonicalString(hash, row.RowKey)
 		writeCanonicalString(hash, "payload")
-		writeCanonicalBytes(hash, row.Payload, row.Payload == nil)
+		payload := projectionPayload(row)
+		writeCanonicalBytes(hash, payload, payload == nil)
 	}
 	var digest EventChecksum
 	copy(digest[:], hash.Sum(nil))
@@ -541,12 +630,165 @@ func (s *GORMStore) ReadProjectionRow(ctx context.Context, projectionName, rowKe
 		return ProjectionRow{}, errors.New("eventstore: commit projection read failed")
 	}
 	committed = true
-	return ProjectionRow{ProjectionGeneration: row.ProjectionGeneration, ProjectionName: row.ProjectionName, RowKey: row.RowKey, Payload: copyProjectionBytes(row.Payload), UpdatedAt: row.UpdatedAt}, nil
+	return ProjectionRow{ProjectionGeneration: row.ProjectionGeneration, ProjectionName: row.ProjectionName, RowKey: row.RowKey, Payload: projectionPayload(row), UpdatedAt: row.UpdatedAt}, nil
 }
+
+func projectionSnapshot(control projectionControlRow) ProjectionSnapshot {
+	return ProjectionSnapshot{
+		Generation:       control.ActiveGeneration,
+		TerminalPosition: control.TerminalPosition,
+		HistoryRevision:  control.HistoryRevision,
+	}
+}
+
+func validateProjectionPageRequest(request ProjectionPageRequest) error {
+	if strings.TrimSpace(request.ProjectionName) == "" ||
+		request.Limit <= 0 || request.Limit > MaxProjectionReadPageRows ||
+		(request.RowKeyStart == "") != (request.RowKeyEnd == "") ||
+		(request.RowKeyStart != "" && request.RowKeyStart >= request.RowKeyEnd) {
+		return ErrProjectionInvariant
+	}
+	if request.ExpectedSnapshot != nil && request.ExpectedSnapshot.Generation == "" {
+		return ErrProjectionInvariant
+	}
+	if request.AfterRowKey != "" && request.ExpectedSnapshot == nil {
+		return ErrProjectionInvariant
+	}
+	return nil
+}
+
+func projectionPageQuery(db *gorm.DB, snapshot ProjectionSnapshot, request ProjectionPageRequest) *gorm.DB {
+	query := locked(db).Where(
+		"projection_generation = ? AND projection_name = ?",
+		snapshot.Generation,
+		request.ProjectionName,
+	)
+	if request.RowKeyPrefix != "" {
+		query = query.Where("row_key LIKE ? ESCAPE ?", privacyLikePrefix(request.RowKeyPrefix), `\`)
+	}
+	if request.RowKeyStart != "" && (request.RowKeyPrefix == "" || db.Name() == "sqlite") {
+		query = query.Where("row_key >= ? AND row_key < ?", request.RowKeyStart, request.RowKeyEnd)
+	}
+	if request.AfterRowKey != "" {
+		query = query.Where("row_key > ?", request.AfterRowKey)
+	}
+	return query.Order("row_key ASC").Limit(request.Limit)
+}
+
+// ListProjectionRowsPage reads one bounded keyset page from a published
+// projection snapshot. The transaction and publication lock are released
+// before the page is returned, so callers may safely open another transaction
+// while processing it. Every later page must supply the returned Snapshot;
+// generation, live terminal, or privacy revision changes fail closed with
+// ErrParticipantConflict instead of mixing logical snapshots.
+func (s *GORMStore) ListProjectionRowsPage(ctx context.Context, request ProjectionPageRequest) (ProjectionPage, error) {
+	if s == nil || s.db == nil || s.db.GORM() == nil {
+		return ProjectionPage{}, errors.New("eventstore: store unavailable")
+	}
+	if err := validateProjectionPageRequest(request); err != nil {
+		return ProjectionPage{}, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := s.requireReady(ctx); err != nil {
+		return ProjectionPage{}, err
+	}
+	tx := s.db.GORM().WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return ProjectionPage{}, errors.New("eventstore: begin projection page read failed")
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback().Error
+		}
+	}()
+	if err := s.lockMutationPublication(ctx, tx); err != nil {
+		return ProjectionPage{}, err
+	}
+	var control projectionControlRow
+	if err := locked(tx).Where("singleton_id = ?", "default").First(&control).Error; err != nil {
+		return ProjectionPage{}, ErrParticipantFailure
+	}
+	snapshot := projectionSnapshot(control)
+	if snapshot.Generation == "" {
+		return ProjectionPage{}, ErrProjectionInvariant
+	}
+	if request.ExpectedSnapshot != nil && snapshot != *request.ExpectedSnapshot {
+		return ProjectionPage{}, ErrParticipantConflict
+	}
+
+	query := projectionPageQuery(tx, snapshot, request)
+	var rows []projectionReadModelRow
+	if err := query.Find(&rows).Error; err != nil {
+		return ProjectionPage{}, ErrParticipantFailure
+	}
+	for _, row := range rows {
+		if row.ProjectionGeneration != snapshot.Generation ||
+			row.ProjectionName != request.ProjectionName ||
+			row.RowKey == "" {
+			return ProjectionPage{}, ErrProjectionInvariant
+		}
+	}
+	if err := tx.Commit().Error; err != nil {
+		return ProjectionPage{}, errors.New("eventstore: commit projection page read failed")
+	}
+	committed = true
+
+	result := ProjectionPage{
+		Snapshot:   snapshot,
+		Rows:       make([]ProjectionRow, 0, len(rows)),
+		NextRowKey: request.AfterRowKey,
+		Done:       len(rows) == 0,
+	}
+	for _, row := range rows {
+		result.Rows = append(result.Rows, ProjectionRow{
+			ProjectionGeneration: row.ProjectionGeneration,
+			ProjectionName:       row.ProjectionName,
+			RowKey:               row.RowKey,
+			Payload:              projectionPayload(row),
+			UpdatedAt:            row.UpdatedAt,
+		})
+	}
+	if len(rows) != 0 {
+		result.NextRowKey = rows[len(rows)-1].RowKey
+	}
+	return result, nil
+}
+
 // ListProjectionRows returns the active generation rows for one projection.
 // It is a read-only startup source; it never constructs a runtime or invokes
 // a projector.
 func (s *GORMStore) ListProjectionRows(ctx context.Context, projectionName string) ([]ProjectionRow, error) {
+	return s.listProjectionRows(ctx, projectionName, nil, "")
+}
+
+// ListProjectionRowsByRowKeyPrefix keeps metadata lists in one transaction:
+// unrelated live commits cannot turn a list request into a paging conflict.
+func (s *GORMStore) ListProjectionRowsByRowKeyPrefix(ctx context.Context, projectionName, prefix string) ([]ProjectionRow, error) {
+	if prefix == "" {
+		return nil, ErrProjectionInvariant
+	}
+	return s.listProjectionRows(ctx, projectionName, nil, prefix)
+}
+
+// ListProjectionRowsByRowKeyFragments returns active-generation rows whose
+// row key contains one of the supplied literal fragments. Callers must still
+// validate the complete identity when a fragment is not a full row key.
+func (s *GORMStore) ListProjectionRowsByRowKeyFragments(ctx context.Context, projectionName string, fragments []string) ([]ProjectionRow, error) {
+	if len(fragments) == 0 {
+		return []ProjectionRow{}, nil
+	}
+	for _, fragment := range fragments {
+		if fragment == "" {
+			return nil, ErrProjectionInvariant
+		}
+	}
+	return s.listProjectionRows(ctx, projectionName, fragments, "")
+}
+
+func (s *GORMStore) listProjectionRows(ctx context.Context, projectionName string, keyFragments []string, rowKeyPrefix string) ([]ProjectionRow, error) {
 	if s == nil || s.db == nil || s.db.GORM() == nil {
 		return nil, errors.New("eventstore: store unavailable")
 	}
@@ -576,8 +818,21 @@ func (s *GORMStore) ListProjectionRows(ctx context.Context, projectionName strin
 	if err := locked(tx).Where("singleton_id = ?", "default").First(&control).Error; err != nil {
 		return nil, ErrParticipantFailure
 	}
+	query := locked(tx).Where("projection_generation = ? AND projection_name = ?", control.ActiveGeneration, projectionName)
+	if rowKeyPrefix != "" {
+		query = query.Where("row_key LIKE ? ESCAPE ?", privacyLikePrefix(rowKeyPrefix), `\`)
+	}
+	if keyFragments != nil {
+		clauses := make([]string, len(keyFragments))
+		args := make([]any, len(keyFragments))
+		for i, fragment := range keyFragments {
+			clauses[i] = "row_key LIKE ? ESCAPE '\\'"
+			args[i] = "%" + privacyLikePrefix(fragment)
+		}
+		query = query.Where("("+strings.Join(clauses, " OR ")+")", args...)
+	}
 	var rows []projectionReadModelRow
-	if err := locked(tx).Where("projection_generation = ? AND projection_name = ?", control.ActiveGeneration, projectionName).Order("row_key ASC").Find(&rows).Error; err != nil {
+	if err := query.Order("row_key ASC").Find(&rows).Error; err != nil {
 		return nil, ErrParticipantFailure
 	}
 	if err := tx.Commit().Error; err != nil {
@@ -586,7 +841,56 @@ func (s *GORMStore) ListProjectionRows(ctx context.Context, projectionName strin
 	committed = true
 	result := make([]ProjectionRow, 0, len(rows))
 	for _, row := range rows {
-		result = append(result, ProjectionRow{ProjectionGeneration: row.ProjectionGeneration, ProjectionName: row.ProjectionName, RowKey: row.RowKey, Payload: copyProjectionBytes(row.Payload), UpdatedAt: row.UpdatedAt})
+		result = append(result, ProjectionRow{ProjectionGeneration: row.ProjectionGeneration, ProjectionName: row.ProjectionName, RowKey: row.RowKey, Payload: projectionPayload(row), UpdatedAt: row.UpdatedAt})
 	}
 	return result, nil
+}
+
+// ListStreamHeads returns the latest event version for each stream of one
+// aggregate type. Callers can compare projection rows with the durable stream
+// set before accepting a startup snapshot.
+func (s *GORMStore) ListStreamHeads(ctx context.Context, aggregateType string) ([]StreamHead, error) {
+	if s == nil || s.db == nil || s.db.GORM() == nil {
+		return nil, errors.New("eventstore: store unavailable")
+	}
+	if strings.TrimSpace(aggregateType) == "" {
+		return nil, errors.New("eventstore: aggregate type required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := s.requireReady(ctx); err != nil {
+		return nil, err
+	}
+	type headRow struct {
+		AggregateID string
+		Version     uint64
+	}
+	var rows []headRow
+	if err := s.db.GORM().WithContext(ctx).Model(&domainEventRow{}).
+		Select("aggregate_id, MAX(aggregate_version) AS version").
+		Where("aggregate_type = ?", aggregateType).
+		Group("aggregate_id").
+		Order("aggregate_id ASC").
+		Scan(&rows).Error; err != nil {
+		return nil, errors.New("eventstore: list stream heads failed")
+	}
+	heads := make([]StreamHead, 0, len(rows))
+	for _, row := range rows {
+		heads = append(heads, StreamHead{
+			Stream:  StreamID{AggregateType: aggregateType, AggregateID: row.AggregateID},
+			Version: row.Version,
+		})
+	}
+	return heads, nil
+}
+
+func projectionPayload(row projectionReadModelRow) []byte {
+	if !row.PayloadPresent {
+		return nil
+	}
+	if row.Payload == nil {
+		return []byte{}
+	}
+	return copyProjectionBytes(row.Payload)
 }

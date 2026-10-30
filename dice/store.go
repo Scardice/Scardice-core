@@ -590,7 +590,6 @@ func NewStoreManager(parent *Dice) *StoreManager {
 		InstalledDecks:   map[string]bool{},
 		InstalledReplies: map[string]bool{},
 	}
-	m.refreshStoreBackend()
 	return m
 }
 

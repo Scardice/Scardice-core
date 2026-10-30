@@ -61,7 +61,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version: "1.27.3"
       - run: go mod download
       - run: go generate ./...
 
@@ -72,7 +72,7 @@ jobs:
         uses: golangci/golangci-lint-action@v8
         if: github.event_name != 'pull_request'
         with:
-          version: v2.12.2
+          version: v2.15.0
           args: "--timeout 10m"
 
   core-no-cgo:
@@ -86,7 +86,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version: "1.27.3"
       - name: Test without cgo
         run: CGO_ENABLED=0 go test ./...
 
@@ -101,7 +101,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version: "1.27.3"
       - name: Reject legacy QuickJS dependencies
         shell: bash
         run: |
@@ -109,6 +109,29 @@ jobs:
             echo "legacy QuickJS dependency leaked into the Core module graph"
             exit 1
           fi
+
+  abi-c-smoke:
+    name: ABI C smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+      - name: Configure echo runtime
+        run: cmake -S runtimeabi/testdata/echo-runtime -B build/echo-runtime
+      - name: Build echo runtime
+        run: cmake --build build/echo-runtime --parallel
+      - name: Run echo ABI harness
+        run: ctest --test-dir build/echo-runtime --output-on-failure
+      - name: Run echo Go adapter integration
+        env:
+          SCARDICE_ECHO_RUNTIME: ${{ github.workspace }}/build/echo-runtime/libecho_runtime.so
+        run: go test ./utils/jsengine/native -run '^(TestNativeAdapter.*|TestRegisterCandidatesResolveLoadsNativeProvider)$' -count=1
 
   native-runtime:
     name: Native runtime (${{ matrix.name }})
@@ -142,7 +165,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version: "1.27.3"
       - name: Configure native runtime
         shell: bash
         run: >

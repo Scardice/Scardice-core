@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
 	"Scardice-core/core/configstate"
 	"Scardice-core/core/extensionstate"
+	"Scardice-core/core/managerstate"
 	"Scardice-core/eventstore"
 )
 
@@ -32,13 +34,196 @@ func (d *Dice) DurableCommitConfigSnapshot(ctx context.Context, config Config, c
 		return err
 	}
 	repo := configstate.NewRepository(store)
-	_, err = repo.DecideAndAppend(ctx, state, state.Version, eventstore.Metadata{}, configstate.Command{
+	preparedAppend, err := repo.PrepareDecision(state, state.Version, eventstore.Metadata{}, configstate.Command{
 		Kind:               configstate.CommandPatch,
 		Patch:              &patch,
 		ExpectedVersion:    state.Version,
 		ExpectedVersionSet: true,
 	})
+	if err != nil || len(preparedAppend.Events) == 0 {
+		return err
+	}
+	_, err = store.Commit(ctx, eventstore.UnitOfWork{Streams: []eventstore.StreamAppend{preparedAppend}})
 	return err
+}
+
+type DurableManagerConfigPatch struct {
+	ServeAddress   *string
+	TrayTooltip    *string
+	UIPasswordHash *string
+	DiceRandomMode *string
+}
+
+type DurableExtensionDefault struct {
+	ExtensionID      string
+	AutoActive       bool
+	DisabledCommands []string
+}
+
+type DurableConfigRequest struct {
+	Config                   Config
+	CommandPrefix            []string
+	DiceMasters              []string
+	MailPasswordRef          *string
+	PersistDiceConfig        bool
+	Manager                  *DurableManagerConfigPatch
+	ExtensionDefaults        []DurableExtensionDefault
+	PersistExtensionDefaults bool
+}
+
+// DurableCommitConfigRequest prepares only the owners addressed by the
+// request, then commits all of their aggregate decisions in one UnitOfWork.
+func (d *Dice) DurableCommitConfigRequest(ctx context.Context, request DurableConfigRequest) error {
+	store, diceID, err := d.durableStoreAndID()
+	if err != nil {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	work := eventstore.UnitOfWork{Streams: make([]eventstore.StreamAppend, 0, 3)}
+	if request.PersistDiceConfig {
+		state, readErr := configstate.ReadProjected(ctx, store, diceID)
+		if readErr != nil {
+			return fmt.Errorf("dice: read config projection: %w", readErr)
+		}
+		patch, patchErr := durableConfigPatch(state, request.Config, request.CommandPrefix, request.DiceMasters, request.MailPasswordRef)
+		if patchErr != nil {
+			return patchErr
+		}
+		preparedAppend, prepareErr := configstate.NewRepository(store).PrepareDecision(state, state.Version, eventstore.Metadata{}, configstate.Command{
+			Kind:               configstate.CommandPatch,
+			Patch:              &patch,
+			ExpectedVersion:    state.Version,
+			ExpectedVersionSet: true,
+		})
+		if prepareErr != nil {
+			return prepareErr
+		}
+		if len(preparedAppend.Events) != 0 {
+			work.Streams = append(work.Streams, preparedAppend)
+		}
+	}
+
+	if request.PersistExtensionDefaults {
+		repository, extensionDiceID, repoErr := d.durableExtensionRepository()
+		if repoErr != nil {
+			return repoErr
+		}
+		state, loadErr := repository.Load(ctx, extensionDiceID)
+		if loadErr != nil {
+			return loadErr
+		}
+		commands := make([]extensionstate.Command, 0, len(request.ExtensionDefaults)+len(state.DefaultCommands))
+		desiredDefaults := make(map[string]struct{}, len(request.ExtensionDefaults))
+		for _, defaults := range request.ExtensionDefaults {
+			desiredDefaults[defaults.ExtensionID] = struct{}{}
+			commands = append(commands, extensionstate.Command{
+				Kind:             extensionstate.CommandSetDefaults,
+				ExtensionID:      defaults.ExtensionID,
+				AutoActive:       defaults.AutoActive,
+				DisabledCommands: append([]string(nil), defaults.DisabledCommands...),
+			})
+		}
+		removedDefaults := make([]string, 0, len(state.DefaultCommands))
+		for extensionID := range state.DefaultCommands {
+			if _, desired := desiredDefaults[extensionID]; !desired {
+				removedDefaults = append(removedDefaults, extensionID)
+			}
+		}
+		sort.Strings(removedDefaults)
+		for _, extensionID := range removedDefaults {
+			commands = append(commands, extensionstate.Command{
+				Kind:        extensionstate.CommandClearDefaults,
+				ExtensionID: extensionID,
+			})
+		}
+		preparedAppend, prepareErr := repository.PrepareCommands(state, state.Version, eventstore.Metadata{}, commands)
+		if prepareErr != nil {
+			return prepareErr
+		}
+		if len(preparedAppend.Events) != 0 {
+			work.Streams = append(work.Streams, preparedAppend)
+		}
+	}
+
+	var manager *DiceManager
+	var managerPrepared *managerstate.PreparedSave
+	var managerPublic managerstate.PublicConfig
+	var managerAuth managerstate.Auth
+	managerLocked := false
+	if durableManagerPatchRequested(request.Manager) {
+		manager = d.Parent
+		if manager == nil {
+			return errors.New("dice: manager is unavailable for durable config update")
+		}
+		manager.managerStateMu.Lock()
+		managerLocked = true
+		defer func() {
+			if managerLocked {
+				manager.managerStateMu.Unlock()
+			}
+		}()
+		if manager.durableStore == nil || manager.managerState.Version == 0 {
+			return errors.New("dice: event-sourced manager state is unavailable")
+		}
+		managerPublic, managerAuth = manager.eventSourcedManagerSnapshot()
+		if request.Manager.ServeAddress != nil {
+			managerPublic.ServeAddress = *request.Manager.ServeAddress
+		}
+		if request.Manager.TrayTooltip != nil {
+			managerPublic.TrayTooltip = NormalizeTrayTooltipPrefix(*request.Manager.TrayTooltip)
+		}
+		if request.Manager.DiceRandomMode != nil {
+			managerPublic.DiceRandomMode = *request.Manager.DiceRandomMode
+		}
+		if request.Manager.UIPasswordHash != nil {
+			managerAuth.UIPasswordHash = *request.Manager.UIPasswordHash
+			managerAuth.AccessTokens = nil
+		}
+		repository, repoErr := managerstate.NewRepository(store)
+		if repoErr != nil {
+			return repoErr
+		}
+		prepared, prepareErr := repository.PrepareSave(ctx, manager.managerState, managerPublic, managerAuth)
+		if prepareErr != nil {
+			return prepareErr
+		}
+		managerPrepared = &prepared
+		work.Streams = append(work.Streams, prepared.Stream)
+		work.SecretUpdates = append(work.SecretUpdates, prepared.Secret)
+	}
+
+	if len(work.Streams) == 0 && managerPrepared == nil {
+		return nil
+	}
+	commitAndPublish := func() error {
+		if len(work.Streams) > 0 {
+			if _, err := store.Commit(ctx, work); err != nil {
+				return err
+			}
+		}
+		if managerPrepared != nil {
+			manager.managerState = managerPrepared.State
+			if request.Manager.UIPasswordHash != nil {
+				manager.applyEventSourcedManager(managerPublic, managerAuth)
+			} else {
+				manager.applyEventSourcedManagerPublic(managerPublic)
+			}
+		}
+		return nil
+	}
+	if managerPrepared != nil && request.Manager.DiceRandomMode != nil {
+		return manager.setDiceRandomModeWithCommit(DiceRandomMode(*request.Manager.DiceRandomMode), commitAndPublish)
+	}
+	return commitAndPublish()
+}
+
+func durableManagerPatchRequested(patch *DurableManagerConfigPatch) bool {
+	return patch != nil &&
+		(patch.ServeAddress != nil || patch.TrayTooltip != nil ||
+			patch.UIPasswordHash != nil || patch.DiceRandomMode != nil)
 }
 
 // DurableLegacyAdvancedView returns the advanced group without exposing the
@@ -120,13 +305,6 @@ func durableConfigSecretReference(value string) bool {
 }
 
 func durableConfigPatch(state configstate.State, config Config, commandPrefix, diceMasters []string, mailPasswordRef *string) (configstate.ConfigPatch, error) {
-	configVersion := config.ConfigVersion
-	if configVersion <= 0 {
-		configVersion = state.ConfigVersion
-	}
-	if configVersion <= 0 {
-		configVersion = 1
-	}
 	mailRef := state.Mail.MailPasswordRef
 	if mailPasswordRef != nil {
 		if *mailPasswordRef != "" && !durableConfigSecretReference(*mailPasswordRef) {
@@ -212,6 +390,9 @@ func durableConfigPatch(state configstate.State, config Config, commandPrefix, d
 	jsConfig := configstate.JSConfig{
 		JsEnable:                       config.JsEnable,
 		JsEngine:                       config.JsEngine,
+		JsRuntimeOptions:               cloneJSRuntimeOptions(config.JsRuntimeOptions),
+		JsRuntimeRoutes:                cloneJSRuntimeRoutes(config.JsRuntimeRoutes),
+		DisabledJsScripts:              cloneDisabledJsScripts(config.DisabledJsScripts),
 		QuickJSMemoryLimitMiB:          config.QuickJSMemoryLimitMiB,
 		QuickJSGCThresholdMiB:          config.QuickJSGCThresholdMiB,
 		QuickJSMaxStackSizeKiB:         config.QuickJSMaxStackSizeKiB,
@@ -228,7 +409,11 @@ func durableConfigPatch(state configstate.State, config Config, commandPrefix, d
 	storyLogConfig := configstate.StoryLogConfig{LogSizeNoticeEnable: config.LogSizeNoticeEnable, LogSizeNoticeCount: config.LogSizeNoticeCount}
 	mailConfig := configstate.MailConfig{MailEnable: config.MailEnable, MailFrom: config.MailFrom, MailPasswordRef: mailRef, MailSMTP: config.MailSMTP}
 	newsConfig := configstate.NewsConfig{NewsMark: config.NewsMark}
-	publicDiceConfig := configstate.PublicDiceConfig{Enable: config.PublicDiceConfig.Enable, ID: config.PublicDiceConfig.ID, Name: config.PublicDiceConfig.Name, Brief: config.PublicDiceConfig.Brief, Note: config.PublicDiceConfig.Note, Avatar: config.PublicDiceConfig.Avatar}
+	publicDiceConfig := configstate.PublicDiceConfig{
+		Enable: config.Enable, ID: config.ID, Name: config.PublicDiceConfig.Name,
+		Brief: config.Brief, Note: config.Note, Avatar: config.Avatar,
+		EndpointIDs: append([]string(nil), config.EndpointIDs...),
+	}
 	censorConfig := configstate.CensorConfig{Enable: config.EnableCensor, Mode: int(config.CensorMode), CaseSensitive: config.CensorCaseSensitive, MatchPinyin: config.CensorMatchPinyin, FilterRegex: config.CensorFilterRegexStr, Thresholds: map[string]int{}, Handlers: map[string]uint8{}, Scores: map[string]int{}}
 	for level, value := range config.CensorThresholds {
 		censorConfig.Thresholds[strconv.Itoa(int(level))] = value
@@ -258,4 +443,54 @@ func durableConfigPatch(state configstate.State, config Config, commandPrefix, d
 		SetCommandPrefix: true,
 		SetDiceMasters:   true,
 	}, nil
+}
+
+// LegacyConfigBaseline converts one stopped legacy Dice configuration into
+// the explicit event-sourced baseline used by the hard-cut importer.
+func LegacyConfigBaseline(diceID string, config Config, advanced AdvancedConfig, commandPrefix, diceMasters []string, mailPasswordRef, storyLogTokenRef string) (configstate.Baseline, error) {
+	patch, err := durableConfigPatch(configstate.State{}, config, commandPrefix, diceMasters, &mailPasswordRef)
+	if err != nil {
+		return configstate.Baseline{}, err
+	}
+	patch.Advanced = &configstate.AdvancedConfig{
+		Show:                              advanced.Show,
+		Enable:                            advanced.Enable,
+		StoryLogBackendURL:                advanced.StoryLogBackendUrl,
+		StoryLogAPIVersion:                advanced.StoryLogApiVersion,
+		StoryLogBackendTokenRef:           storyLogTokenRef,
+		CustomReplyCooldown:               advanced.CustomReplyCooldown,
+		ExposeDangerousSealInst:           advanced.ExposeDangerousSealInst,
+		AllowFilesystemUnrestrictedAccess: advanced.AllowFilesystemUnrestrictedAccess,
+	}
+	return baselineFromConfigPatch(diceID, config.ConfigVersion, patch, commandPrefix, diceMasters), nil
+}
+
+// LegacyExtensionBaseline preserves the extension defaults serialized in
+// serve.yaml without loading scripts or executing callbacks.
+func LegacyExtensionBaseline(config Config) extensionstate.Baseline {
+	baseline := extensionstate.Baseline{}
+	for _, item := range config.ExtDefaultSettings {
+		if item == nil || strings.TrimSpace(item.Name) == "" {
+			continue
+		}
+		disabled := make([]string, 0, len(item.DisabledCommand))
+		for command, value := range item.DisabledCommand {
+			if value {
+				disabled = append(disabled, command)
+			}
+		}
+		sort.Strings(disabled)
+		baseline.Extensions = append(baseline.Extensions, extensionstate.ExtensionIdentity{
+			ID: item.Name, Name: item.Name, Version: "legacy", Source: "legacy",
+		})
+		baseline.Defaults = append(baseline.Defaults, extensionstate.DefaultCommandUpdate{
+			ExtensionID: item.Name, AutoActive: item.AutoActive, DisabledCommands: disabled,
+		})
+		if item.AutoActive {
+			baseline.Enable = append(baseline.Enable, item.Name)
+		} else {
+			baseline.Disable = append(baseline.Disable, item.Name)
+		}
+	}
+	return baseline
 }

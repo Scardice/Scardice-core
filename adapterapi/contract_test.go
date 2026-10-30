@@ -12,7 +12,7 @@ import (
 type contractRuntime struct{}
 
 func (contractRuntime) Run(context.Context, CorePort) error { return nil }
-func (contractRuntime) Stop(context.Context) error           { return nil }
+func (contractRuntime) Stop(context.Context) error          { return nil }
 func (contractRuntime) Capabilities() CapabilitySet         { return CapabilityInbound | CapabilityLifecycle }
 func (contractRuntime) Execute(context.Context, OutboundEffect) EffectResult {
 	return UnsupportedResult("not-advertised")
@@ -34,7 +34,7 @@ func (contractSecrets) Resolve(context.Context, SecretRef) (SecretValue, error) 
 
 type contractDescriptor struct{ constructed int }
 
-func (d *contractDescriptor) Key() AdapterKey { return "fake" }
+func (d *contractDescriptor) Key() AdapterKey       { return "fake" }
 func (d *contractDescriptor) ConfigVersion() uint16 { return 1 }
 func (d *contractDescriptor) ValidateConfig(ctx context.Context, raw json.RawMessage) (ValidatedConfig, error) {
 	if err := ctx.Err(); err != nil {
@@ -48,6 +48,9 @@ func (d *contractDescriptor) ValidateConfig(ctx context.Context, raw json.RawMes
 }
 func (d *contractDescriptor) SupportedActions(ValidatedConfig) ActionSet {
 	return ActionSet(0).With(ActionKindRequestQRCode, ActionKindValidateCredentials)
+}
+func (d *contractDescriptor) Capabilities(ValidatedConfig) CapabilitySet {
+	return CapabilityLifecycle | CapabilityActions
 }
 func (d *contractDescriptor) NewRuntime(RuntimeInit) (AdapterRuntime, error) {
 	d.constructed++
@@ -100,7 +103,7 @@ func TestEffectOutcomesAreClassifiedAndNotNoOp(t *testing.T) {
 		TerminalResult("invalid-target", "target rejected"),
 		AmbiguousResult("timeout-after-send", "delivery is unknown"),
 	}
-	seen := map[EffectOutcome]bool{}
+	seen := make(map[EffectOutcome]bool)
 	for _, result := range results {
 		if err := result.Validate(); err != nil {
 			t.Fatalf("result %#v: %v", result, err)
@@ -127,18 +130,14 @@ func TestArtifactResultIsEphemeralSensitiveAndRedactedFromJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(encoded) == "" || string(encoded) == `{"contentType":"application/octet-stream","filename":"login.qr","sensitive":true,"ephemeral":true}` {
-		// The exact metadata order is not a contract; this branch only ensures a
-		// useful JSON object was emitted and the next assertion checks the secret.
-	}
 	if string(encoded) == "" || containsBytes(encoded, []byte("secret-bytes")) {
 		t.Fatalf("artifact bytes leaked through JSON: %s", encoded)
 	}
 	if !artifact.Sensitive || !artifact.Ephemeral {
 		t.Fatal("artifact markers were not set")
 	}
-	copy := append([]byte(nil), artifact.Bytes...)
-	copy[0] = 'X'
+	copiedBytes := append([]byte(nil), artifact.Bytes...)
+	copiedBytes[0] = 'X'
 	if string(artifact.Bytes) != "secret-bytes" {
 		t.Fatal("artifact constructor did not isolate byte ownership")
 	}
@@ -182,6 +181,39 @@ func TestGenerationFenceCannotBeSelectedInInboundOrObservation(t *testing.T) {
 				t.Fatalf("%s unexpectedly contains caller-selectable fence %s", typ.Name(), forbidden)
 			}
 		}
+	}
+}
+
+func TestInboundMessageRequiresExplicitKindAndConversationKind(t *testing.T) {
+	message := InboundMessage{
+		ProviderEventID: "provider-event", Kind: InboundKindMessage,
+		ConversationKind: ConversationKindDirect, Sender: "user", Conversation: "direct", Target: "direct",
+	}
+	if err := message.Validate(); err != nil {
+		t.Fatalf("explicit direct conversation rejected: %v", err)
+	}
+	message.Kind = InboundKindInvalid
+	if !errors.Is(message.Validate(), ErrInvalidContract) {
+		t.Fatal("missing inbound kind was accepted")
+	}
+	message.Kind = InboundKindMessage
+	message.ConversationKind = ConversationKindInvalid
+	if !errors.Is(message.Validate(), ErrInvalidContract) {
+		t.Fatal("missing conversation kind was accepted")
+	}
+}
+
+func TestInboundSenderRoleIsClosed(t *testing.T) {
+	message := InboundMessage{Kind: InboundKindMessage, ConversationKind: ConversationKindGroup}
+	for _, role := range []string{"", "member", "admin", "owner"} {
+		message.SenderRole = role
+		if err := message.Validate(); err != nil {
+			t.Fatalf("valid role %q rejected: %v", role, err)
+		}
+	}
+	message.SenderRole = "master"
+	if !errors.Is(message.Validate(), ErrInvalidContract) {
+		t.Fatal("provider must not be able to introduce a core-only privilege role")
 	}
 }
 

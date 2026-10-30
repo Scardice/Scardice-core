@@ -1,6 +1,11 @@
 package dice
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -53,6 +58,7 @@ type Config struct {
 func NewConfig(d *Dice) Config {
 	c := DefaultConfig
 	c.d = d
+	c.DisabledJsScripts = cloneDisabledJsScripts(c.DisabledJsScripts)
 
 	// set other default
 	c.BanList = &BanListInfo{Parent: c.d}
@@ -221,22 +227,121 @@ type BanConfig struct {
 	BanList *BanListInfo `json:"-" yaml:"banList"`
 }
 
+type JSRuntimeOptions map[string]json.RawMessage
+
+func (options *JSRuntimeOptions) UnmarshalYAML(node *yaml.Node) error {
+	if node == nil || node.Tag == "!!null" {
+		*options = nil
+		return nil
+	}
+	values := map[string]any{}
+	if err := node.Decode(&values); err != nil {
+		return err
+	}
+	decoded := make(JSRuntimeOptions, len(values))
+	for id, value := range values {
+		payload, err := json.Marshal(value)
+		if err != nil {
+			return fmt.Errorf("marshal runtime options %q: %w", id, err)
+		}
+		decoded[id] = payload
+	}
+	*options = decoded
+	return nil
+}
+
+func (options JSRuntimeOptions) MarshalYAML() (any, error) {
+	encoded := make(map[string]any, len(options))
+	for id, payload := range options {
+		if !json.Valid(payload) {
+			return nil, fmt.Errorf("runtime options %q contain invalid JSON", id)
+		}
+		decoder := json.NewDecoder(bytes.NewReader(payload))
+		decoder.UseNumber()
+		var value any
+		if err := decoder.Decode(&value); err != nil {
+			return nil, fmt.Errorf("decode runtime options %q: %w", id, err)
+		}
+		converted, err := runtimeOptionsYAMLValue(value)
+		if err != nil {
+			return nil, fmt.Errorf("convert runtime options %q to YAML: %w", id, err)
+		}
+		encoded[id] = converted
+	}
+	return encoded, nil
+}
+
+func runtimeOptionsYAMLValue(value any) (any, error) {
+	switch typed := value.(type) {
+	case json.Number:
+		text := typed.String()
+		if strings.ContainsAny(text, ".eE") {
+			return strconv.ParseFloat(text, 64)
+		}
+		if strings.HasPrefix(text, "-") {
+			return strconv.ParseInt(text, 10, 64)
+		}
+		return strconv.ParseUint(text, 10, 64)
+	case []any:
+		for index, item := range typed {
+			converted, err := runtimeOptionsYAMLValue(item)
+			if err != nil {
+				return nil, err
+			}
+			typed[index] = converted
+		}
+	case map[string]any:
+		for key, item := range typed {
+			converted, err := runtimeOptionsYAMLValue(item)
+			if err != nil {
+				return nil, err
+			}
+			typed[key] = converted
+		}
+	}
+	return value, nil
+}
+
 type JsConfig struct {
-	JsEnable                       bool            `json:"jsEnable"                         yaml:"jsEnable"`
-	JsEngine                       string          `json:"jsEngine"                         yaml:"jsEngine"` // runtime provider ID；空值兼容旧配置
-	QuickJSMemoryLimitMiB          uint64          `json:"quickJSMemoryLimitMiB"            yaml:"quickJSMemoryLimitMiB"`
-	QuickJSGCThresholdMiB          uint64          `json:"quickJSGCThresholdMiB"            yaml:"quickJSGCThresholdMiB"`
-	QuickJSMaxStackSizeKiB         uint64          `json:"quickJSMaxStackSizeKiB"           yaml:"quickJSMaxStackSizeKiB"`
-	QuickJSExecuteTimeoutSeconds   uint64          `json:"quickJSExecuteTimeoutSeconds"     yaml:"quickJSExecuteTimeoutSeconds"`
-	QuickJSMaxFetchConcurrent      uint64          `json:"quickJSMaxFetchConcurrent"        yaml:"quickJSMaxFetchConcurrent"`
-	QuickJSMaxFetchResponseMiB     uint64          `json:"quickJSMaxFetchResponseMiB"       yaml:"quickJSMaxFetchResponseMiB"`
-	QuickJSMaxWebSocketConnections uint64          `json:"quickJSMaxWebSocketConnections"   yaml:"quickJSMaxWebSocketConnections"`
-	QuickJSMaxWebSocketMessageMiB  uint64          `json:"quickJSMaxWebSocketMessageMiB"    yaml:"quickJSMaxWebSocketMessageMiB"`
-	QuickJSMaxFilesystemReadMiB    uint64          `json:"quickJSMaxFilesystemReadMiB"      yaml:"quickJSMaxFilesystemReadMiB"`
-	QuickJSMaxFilesystemWriteMiB   uint64          `json:"quickJSMaxFilesystemWriteMiB"     yaml:"quickJSMaxFilesystemWriteMiB"`
-	QuickJSMaxPBKDF2Iterations     uint64          `json:"quickJSMaxPBKDF2Iterations"       yaml:"quickJSMaxPBKDF2Iterations"`
-	QuickJSMaxPBKDF2OutputBytes    uint64          `json:"quickJSMaxPBKDF2OutputBytes"      yaml:"quickJSMaxPBKDF2OutputBytes"`
-	DisabledJsScripts              map[string]bool `json:"disabledJsScripts"                yaml:"disabledJsScripts"` // 作为set
+	JsEnable                       bool              `json:"jsEnable"                         yaml:"jsEnable"`
+	JsEngine                       string            `json:"jsEngine"                         yaml:"jsEngine"` // runtime provider ID；空值兼容旧配置
+	JsRuntimeOptions               JSRuntimeOptions  `json:"jsRuntimeOptions,omitempty" yaml:"jsRuntimeOptions,omitempty"`
+	JsRuntimeRoutes                map[string]string `json:"jsRuntimeRoutes,omitempty" yaml:"jsRuntimeRoutes,omitempty"`
+	QuickJSMemoryLimitMiB          uint64            `json:"quickJSMemoryLimitMiB"            yaml:"quickJSMemoryLimitMiB"`
+	QuickJSGCThresholdMiB          uint64            `json:"quickJSGCThresholdMiB"            yaml:"quickJSGCThresholdMiB"`
+	QuickJSMaxStackSizeKiB         uint64            `json:"quickJSMaxStackSizeKiB"           yaml:"quickJSMaxStackSizeKiB"`
+	QuickJSExecuteTimeoutSeconds   uint64            `json:"quickJSExecuteTimeoutSeconds"     yaml:"quickJSExecuteTimeoutSeconds"`
+	QuickJSMaxFetchConcurrent      uint64            `json:"quickJSMaxFetchConcurrent"        yaml:"quickJSMaxFetchConcurrent"`
+	QuickJSMaxFetchResponseMiB     uint64            `json:"quickJSMaxFetchResponseMiB"       yaml:"quickJSMaxFetchResponseMiB"`
+	QuickJSMaxWebSocketConnections uint64            `json:"quickJSMaxWebSocketConnections"   yaml:"quickJSMaxWebSocketConnections"`
+	QuickJSMaxWebSocketMessageMiB  uint64            `json:"quickJSMaxWebSocketMessageMiB"    yaml:"quickJSMaxWebSocketMessageMiB"`
+	QuickJSMaxFilesystemReadMiB    uint64            `json:"quickJSMaxFilesystemReadMiB"      yaml:"quickJSMaxFilesystemReadMiB"`
+	QuickJSMaxFilesystemWriteMiB   uint64            `json:"quickJSMaxFilesystemWriteMiB"     yaml:"quickJSMaxFilesystemWriteMiB"`
+	QuickJSMaxPBKDF2Iterations     uint64            `json:"quickJSMaxPBKDF2Iterations"       yaml:"quickJSMaxPBKDF2Iterations"`
+	QuickJSMaxPBKDF2OutputBytes    uint64            `json:"quickJSMaxPBKDF2OutputBytes"      yaml:"quickJSMaxPBKDF2OutputBytes"`
+	DisabledJsScripts              map[string]bool   `json:"disabledJsScripts"                yaml:"disabledJsScripts"` // 作为set
+}
+
+func cloneJSRuntimeRoutes(routes map[string]string) map[string]string {
+	if routes == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(routes))
+	for extensionID, runtimeID := range routes {
+		cloned[extensionID] = runtimeID
+	}
+	return cloned
+}
+
+func cloneDisabledJsScripts(scripts map[string]bool) map[string]bool {
+	if len(scripts) == 0 {
+		return nil
+	}
+	cloned := make(map[string]bool, len(scripts))
+	for name, disabled := range scripts {
+		cloned[name] = disabled
+	}
+	return cloned
 }
 
 type StoryLogConfig struct {
@@ -256,12 +361,13 @@ type NewsConfig struct {
 }
 
 type PublicDiceConfig struct {
-	Enable bool   `json:"publicDiceEnable" yaml:"publicDiceEnable"`
-	ID     string `json:"publicDiceId"     yaml:"publicDiceId"`
-	Name   string `json:"publicDiceName"   yaml:"publicDiceName"`
-	Brief  string `json:"publicDiceBrief"  yaml:"publicDiceBrief"`
-	Note   string `json:"publicDiceNote"   yaml:"publicDiceNote"`
-	Avatar string `json:"publicDiceAvatar" yaml:"publicDiceAvatar"`
+	Enable      bool     `json:"publicDiceEnable" yaml:"publicDiceEnable"`
+	ID          string   `json:"publicDiceId"     yaml:"publicDiceId"`
+	Name        string   `json:"publicDiceName"   yaml:"publicDiceName"`
+	Brief       string   `json:"publicDiceBrief"  yaml:"publicDiceBrief"`
+	Note        string   `json:"publicDiceNote"   yaml:"publicDiceNote"`
+	Avatar      string   `json:"publicDiceAvatar" yaml:"publicDiceAvatar"`
+	EndpointIDs []string `json:"publicDiceEndpointIds,omitempty" yaml:"publicDiceEndpointIds,omitempty"`
 }
 
 type CensorConfig struct {

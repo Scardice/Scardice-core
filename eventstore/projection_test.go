@@ -5,9 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"testing"
 	"sync"
+	"testing"
 	"time"
+
 	"gorm.io/gorm"
 )
 
@@ -207,20 +208,20 @@ func TestLiveAndRebuildPreserveNilPayload(t *testing.T) {
 	if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{"a", "nil"}, Events: []NewEvent{event}}}}); err != nil {
 		t.Fatal(err)
 	}
-	row, err := store.ReadProjectionRow(context.Background(), "events", "nil-payload")
-	if err != nil {
-		t.Fatal(err)
+	row, eventErr := store.ReadProjectionRow(context.Background(), "events", "nil-payload")
+	if eventErr != nil {
+		t.Fatal(eventErr)
 	}
 	if row.Payload != nil {
 		t.Fatalf("live nil payload became non-nil: %#v", row.Payload)
 	}
-	result, err := store.Rebuild(context.Background(), RebuildRequest{ProjectorVersion: "v1"})
-	if err != nil {
-		t.Fatal(err)
+	result, eventErr := store.Rebuild(context.Background(), RebuildRequest{ProjectorVersion: "v1"})
+	if eventErr != nil {
+		t.Fatal(eventErr)
 	}
-	rebuilt, err := store.ReadProjectionRow(context.Background(), "events", "nil-payload")
-	if err != nil {
-		t.Fatal(err)
+	rebuilt, eventErr := store.ReadProjectionRow(context.Background(), "events", "nil-payload")
+	if eventErr != nil {
+		t.Fatal(eventErr)
 	}
 	if rebuilt.ProjectionGeneration != result.GenerationID || rebuilt.Payload != nil {
 		t.Fatalf("rebuilt nil payload = %#v", rebuilt)
@@ -230,16 +231,14 @@ func TestLiveAndRebuildPreserveNilPayload(t *testing.T) {
 	if _, err := store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{"a", "empty"}, Events: []NewEvent{emptyEvent}}}}); err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := store.Load(context.Background(), StreamID{"a", "empty"}, 0)
-	if err != nil {
-		t.Fatal(err)
+	loaded, eventErr := store.Load(context.Background(), StreamID{"a", "empty"}, 0)
+	if eventErr != nil {
+		t.Fatal(eventErr)
 	}
 	if len(loaded) != 1 || loaded[0].Payload == nil || len(loaded[0].Payload) != 0 {
 		t.Fatalf("empty payload round trip = %#v", loaded)
 	}
 }
-
-
 
 func TestRebuildAbortsWhenProjectorRegistryChanges(t *testing.T) {
 	store, db := projectionTestStore(t)
@@ -353,7 +352,7 @@ func TestProjectorLiveWritesUseActiveGenerationAndRollback(t *testing.T) {
 	if err != nil || row.ProjectionGeneration != "initial" {
 		t.Fatalf("live row = %#v, err = %v", row, err)
 	}
-	store.RegisterProjector(func(_ context.Context, tx *gorm.DB, events []Envelope) error {
+	registerErr := store.RegisterProjector(func(_ context.Context, tx *gorm.DB, events []Envelope) error {
 		for _, event := range events {
 			if err := writeProjection(tx, event); err != nil {
 				return err
@@ -361,6 +360,9 @@ func TestProjectorLiveWritesUseActiveGenerationAndRollback(t *testing.T) {
 		}
 		return errors.New("projector failed")
 	})
+	if registerErr != nil {
+		t.Fatal(registerErr)
+	}
 	_, err = store.Commit(context.Background(), UnitOfWork{Streams: []StreamAppend{{Stream: StreamID{"a", "1"}, ExpectedVersion: 1, Events: []NewEvent{testEvent("live-2")}}}})
 	if !errors.Is(err, ErrProjectorFailure) {
 		t.Fatalf("rollback error = %v", err)
@@ -393,7 +395,7 @@ func TestRebuildKeysetDigestAndPriorGenerationRetention(t *testing.T) {
 	if err := store.RegisterProjection(projectionDescriptor("v1", apply)); err != nil {
 		t.Fatal(err)
 	}
-	for batch := 0; batch < 16; batch++ {
+	for batch := range 16 {
 		events := make([]NewEvent, 64)
 		for i := range events {
 			events[i] = testEvent(fmt.Sprintf("rebuild-%04d", batch*64+i))
@@ -467,7 +469,7 @@ func TestRebuildCatchesConcurrentCommitBeforePublication(t *testing.T) {
 	if err := store.RegisterProjection(projectionDescriptor("v1", apply)); err != nil {
 		t.Fatal(err)
 	}
-	for batch := 0; batch < 16; batch++ {
+	for batch := range 16 {
 		events := make([]NewEvent, 64)
 		for i := range events {
 			events[i] = testEvent(fmt.Sprintf("concurrent-%04d", batch*64+i))
@@ -512,7 +514,6 @@ func TestRebuildCatchesConcurrentCommitBeforePublication(t *testing.T) {
 		t.Fatalf("reader mixed generations: row=%#v control=%#v", row, control)
 	}
 }
-
 
 func TestRebuildRejectsCorruptChecksumAndUnsupportedSchema(t *testing.T) {
 	store, db := projectionTestStore(t)
@@ -617,5 +618,241 @@ func TestGenerationAwareReaderDoesNotMixGenerations(t *testing.T) {
 	}
 	if row.ProjectionGeneration != result.GenerationID || string(row.Payload) != `{"value":1}` {
 		t.Fatalf("reader mixed generations: row=%#v result=%#v", row, result)
+	}
+}
+
+func insertProjectionPageRows(t *testing.T, db *Database, generation, projectionName string, keys []string) {
+	t.Helper()
+	now := time.Now().UTC()
+	rows := make([]projectionReadModelRow, len(keys))
+	for index, key := range keys {
+		rows[index] = projectionReadModelRow{
+			ProjectionGeneration: generation,
+			ProjectionName:       projectionName,
+			RowKey:               key,
+			Payload:              []byte(key),
+			PayloadPresent:       true,
+			UpdatedAt:            now,
+		}
+	}
+	if err := db.GORM().Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProjectionRowPageUsesBoundedRangeAndStableCursor(t *testing.T) {
+	store, db := projectionTestStore(t)
+	defer db.Close()
+
+	want := []string{"1:a1:x", "1:a2:id", "1:a9:special"}
+	insertProjectionPageRows(t, db, "initial", "attributes", want)
+	insertProjectionPageRows(t, db, "initial", "attributes", []string{
+		"1:a/invalid-continuation",
+		"1:a:upper-bound",
+		"1:b1:x",
+		"2:a11:x",
+		"9:x1:a1:x",
+	})
+	insertProjectionPageRows(t, db, "prior", "attributes", []string{"1:a1:prior"})
+	insertProjectionPageRows(t, db, "initial", "other", []string{"1:a1:other"})
+
+	request := ProjectionPageRequest{
+		ProjectionName: "attributes",
+		RowKeyPrefix:   "1:a",
+		RowKeyStart:    "1:a0",
+		RowKeyEnd:      "1:a:",
+		Limit:          2,
+	}
+	var (
+		cursor   string
+		expected *ProjectionSnapshot
+		got      []string
+		pages    int
+	)
+	for {
+		request.AfterRowKey = cursor
+		request.ExpectedSnapshot = expected
+		page, err := store.ListProjectionRowsPage(context.Background(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages++
+		if expected == nil {
+			snapshot := page.Snapshot
+			expected = &snapshot
+			if snapshot.Generation != "initial" || snapshot.TerminalPosition != 0 || snapshot.HistoryRevision != 0 {
+				t.Fatalf("first snapshot = %+v", snapshot)
+			}
+		} else if page.Snapshot != *expected {
+			t.Fatalf("page snapshot = %+v, want %+v", page.Snapshot, *expected)
+		}
+		if page.Done {
+			if len(page.Rows) != 0 || page.NextRowKey != cursor {
+				t.Fatalf("terminal page = %+v, cursor = %q", page, cursor)
+			}
+			break
+		}
+		if len(page.Rows) == 0 || len(page.Rows) > request.Limit {
+			t.Fatalf("page row count = %d", len(page.Rows))
+		}
+		if page.NextRowKey != page.Rows[len(page.Rows)-1].RowKey || page.NextRowKey == cursor {
+			t.Fatalf("page cursor = %q after %q", page.NextRowKey, cursor)
+		}
+		for _, row := range page.Rows {
+			if row.ProjectionGeneration != expected.Generation ||
+				row.ProjectionName != request.ProjectionName ||
+				row.RowKey < request.RowKeyStart || row.RowKey >= request.RowKeyEnd ||
+				string(row.Payload) != row.RowKey {
+				t.Fatalf("out-of-range or corrupt row: %+v", row)
+			}
+			got = append(got, row.RowKey)
+		}
+		cursor = page.NextRowKey
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("paged row keys = %v, want %v", got, want)
+	}
+	if pages != 3 {
+		t.Fatalf("page calls = %d, want two data pages plus empty terminal page", pages)
+	}
+}
+
+func TestProjectionRowPageRejectsGenerationTerminalAndPrivacyRevisionChanges(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*testing.T, *Database)
+	}{
+		{
+			name: "generation replacement",
+			mutate: func(t *testing.T, db *Database) {
+				tx := db.GORM().Begin()
+				if tx.Error != nil {
+					t.Fatal(tx.Error)
+				}
+				replacement := projectionReadModelRow{
+					ProjectionGeneration: "replacement",
+					ProjectionName:       "attributes",
+					RowKey:               "1:a1:z",
+					Payload:              []byte("replacement"),
+					PayloadPresent:       true,
+					UpdatedAt:            time.Now().UTC(),
+				}
+				if err := tx.Create(&replacement).Error; err != nil {
+					_ = tx.Rollback().Error
+					t.Fatal(err)
+				}
+				if err := tx.Where("projection_generation = ?", "initial").Delete(&projectionReadModelRow{}).Error; err != nil {
+					_ = tx.Rollback().Error
+					t.Fatal(err)
+				}
+				if err := tx.Model(&projectionControlRow{}).Where("singleton_id = ?", "default").
+					Update("active_generation", "replacement").Error; err != nil {
+					_ = tx.Rollback().Error
+					t.Fatal(err)
+				}
+				if err := tx.Commit().Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "live terminal advance",
+			mutate: func(t *testing.T, db *Database) {
+				tx := db.GORM().Begin()
+				if tx.Error != nil {
+					t.Fatal(tx.Error)
+				}
+				if err := tx.Model(&projectionReadModelRow{}).
+					Where("projection_generation = ? AND projection_name = ? AND row_key = ?", "initial", "attributes", "1:a1:z").
+					Update("payload", []byte("updated")).Error; err != nil {
+					_ = tx.Rollback().Error
+					t.Fatal(err)
+				}
+				if err := tx.Model(&projectionControlRow{}).Where("singleton_id = ?", "default").
+					Update("terminal_position", 1).Error; err != nil {
+					_ = tx.Rollback().Error
+					t.Fatal(err)
+				}
+				if err := tx.Commit().Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "privacy deletion revision",
+			mutate: func(t *testing.T, db *Database) {
+				tx := db.GORM().Begin()
+				if tx.Error != nil {
+					t.Fatal(tx.Error)
+				}
+				if err := tx.Where("projection_generation = ? AND projection_name = ? AND row_key = ?", "initial", "attributes", "1:a1:z").
+					Delete(&projectionReadModelRow{}).Error; err != nil {
+					_ = tx.Rollback().Error
+					t.Fatal(err)
+				}
+				if err := tx.Model(&projectionControlRow{}).Where("singleton_id = ?", "default").
+					Update("history_revision", 1).Error; err != nil {
+					_ = tx.Rollback().Error
+					t.Fatal(err)
+				}
+				if err := tx.Commit().Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, db := projectionTestStore(t)
+			defer db.Close()
+			insertProjectionPageRows(t, db, "initial", "attributes", []string{"1:a1:x", "1:a1:z"})
+
+			first, err := store.ListProjectionRowsPage(context.Background(), ProjectionPageRequest{
+				ProjectionName: "attributes",
+				RowKeyPrefix:   "1:a",
+				RowKeyStart:    "1:a0",
+				RowKeyEnd:      "1:a:",
+				Limit:          1,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if first.Done || len(first.Rows) != 1 || first.NextRowKey != "1:a1:x" {
+				t.Fatalf("first page = %+v", first)
+			}
+
+			tc.mutate(t, db)
+			next, err := store.ListProjectionRowsPage(context.Background(), ProjectionPageRequest{
+				ProjectionName:   "attributes",
+				RowKeyPrefix:     "1:a",
+				RowKeyStart:      "1:a0",
+				RowKeyEnd:        "1:a:",
+				AfterRowKey:      first.NextRowKey,
+				Limit:            1,
+				ExpectedSnapshot: &first.Snapshot,
+			})
+			if !errors.Is(err, ErrParticipantConflict) {
+				t.Fatalf("changed snapshot error = %v", err)
+			}
+			if len(next.Rows) != 0 || next.NextRowKey != "" || next.Snapshot.Generation != "" || next.Done {
+				t.Fatalf("snapshot conflict returned partial page: %+v", next)
+			}
+		})
+	}
+}
+
+func TestProjectionRowPageRejectsUnboundedOrUnfencedRequests(t *testing.T) {
+	store, db := projectionTestStore(t)
+	defer db.Close()
+
+	for _, request := range []ProjectionPageRequest{
+		{ProjectionName: "attributes", Limit: 0},
+		{ProjectionName: "attributes", Limit: MaxProjectionReadPageRows + 1},
+		{ProjectionName: "attributes", RowKeyStart: "1:a0", Limit: 1},
+		{ProjectionName: "attributes", RowKeyStart: "1:a:", RowKeyEnd: "1:a0", Limit: 1},
+		{ProjectionName: "attributes", AfterRowKey: "cursor", Limit: 1},
+	} {
+		if page, err := store.ListProjectionRowsPage(context.Background(), request); !errors.Is(err, ErrProjectionInvariant) || len(page.Rows) != 0 {
+			t.Fatalf("request %+v returned page %+v, error %v", request, page, err)
+		}
 	}
 }

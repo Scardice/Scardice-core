@@ -18,13 +18,14 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"Scardice-core/api"
-	"Scardice-core/core/configstate"
-	"Scardice-core/core/extensionstate"
+	"Scardice-core/core/groupstate"
 	"Scardice-core/core/messageflow"
+	"Scardice-core/core/playerstate"
 	"Scardice-core/core/privacypurge"
 	"Scardice-core/dice"
 	"Scardice-core/dice/service"
@@ -32,11 +33,13 @@ import (
 	"Scardice-core/eventstore"
 	"Scardice-core/logger"
 	"Scardice-core/migrate/eventsourcing"
+	"Scardice-core/projectionset"
 	"Scardice-core/static"
 	"Scardice-core/utils/crypto"
 	"Scardice-core/utils/dboperator"
 	"Scardice-core/utils/oschecker"
 	"Scardice-core/utils/paniclog"
+
 	"github.com/gofrs/flock"
 	"github.com/jessevdk/go-flags"
 	"github.com/joho/godotenv"
@@ -59,90 +62,133 @@ extensions/
 var LockFileName = "Scardice-lock.lock"
 var sealLock = flock.New(LockFileName)
 
-func cleanupCreate(diceManager *dice.DiceManager, extraCleanup func()) func() {
+const runtimeShutdownTimeout = 30 * time.Second
+
+type cronStopper interface {
+	Stop() context.Context
+}
+
+func waitCronStopped(ctx context.Context, scheduler cronStopper) error {
+	if scheduler == nil {
+		return nil
+	}
+	stopped := scheduler.Stop()
+	select {
+	case <-stopped.Done():
+		return nil
+	case <-ctx.Done():
+		select {
+		case <-stopped.Done():
+			return nil
+		default:
+			return ctx.Err()
+		}
+	}
+}
+
+func cleanupCreate(diceManager *dice.DiceManager, extraCleanup func(context.Context, bool) error) func() {
+	var cleanupOnce sync.Once
 	return func() {
 		log := logger.M()
-		log.Info("程序即将退出，进行清理……")
-		if extraCleanup != nil {
-			extraCleanup()
-		}
-		err := recover()
-		if err != nil {
+		recovered := recover()
+		if recovered != nil {
 			showWindow()
-			log.Errorf("异常: %v\n堆栈: %v", err, string(debug.Stack()))
+			log.Errorf("异常: %v\n堆栈: %v", recovered, string(debug.Stack()))
 			// 顺便修正一下上面这个，应该是木落忘了。
 			if runtime.GOOS == "windows" {
 				exec.Command("pause") // windows专属
 			}
 		}
-		err = sealLock.Unlock()
-		if err != nil {
-			log.Errorf("文件锁归还出现异常 %v", err)
-		}
 
-		if !diceManager.CleanupFlag.CompareAndSwap(0, 1) {
-			// 尝试更新cleanup标记，如果已经为1则退出
-			return
-		}
-		if diceManager.EventSourcedMode {
+		// sync.Once is also the join point: a deferred cleanup racing the signal
+		// handler waits for the already-running operation instead of returning
+		// into an outer database close.
+		cleanupOnce.Do(func() {
+			log.Info("程序即将退出，进行清理……")
+			if !diceManager.CleanupFlag.CompareAndSwap(0, 1) {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), runtimeShutdownTimeout)
+			defer cancel()
+			runtimeQuiesced := true
+			var shutdownErrs []error
+			// JS、普通定时任务和事件 worker 共享一个总期限。任何仍可能访问
+			// 事件库的资源超时后，后续清理只能停 supervisor，不能关闭数据库。
 			for _, instance := range diceManager.Dice {
-				if instance != nil && instance.Cron != nil {
-					instance.Cron.Stop()
+				if instance == nil {
+					continue
+				}
+				if stopErr := instance.StopJSRuntime(ctx); stopErr != nil {
+					runtimeQuiesced = false
+					shutdownErrs = append(shutdownErrs, fmt.Errorf("stop JS runtime: %w", stopErr))
+				}
+				if instance.Cron != nil {
+					if stopErr := waitCronStopped(ctx, instance.Cron); stopErr != nil {
+						runtimeQuiesced = false
+						shutdownErrs = append(shutdownErrs, fmt.Errorf("stop instance cron: %w", stopErr))
+					}
 				}
 			}
 			if diceManager.Cron != nil {
-				diceManager.Cron.Stop()
-			}
-			return
-		}
-
-		for _, i := range diceManager.Dice {
-			if i.IsAlreadyLoadConfig {
-				i.Config.BanList.SaveChanged(i)
-				i.Save(true)
-				i.AttrsManager.Stop()
-				for _, j := range i.ExtList {
-					if j.Storage != nil {
-						// 关闭
-						err := j.StorageClose()
-						if err != nil {
-							showWindow()
-							log.Errorf("异常: %v\n堆栈: %v", err, string(debug.Stack()))
-							// 木落没有加该检查 补充上
-							if runtime.GOOS == "windows" {
-								exec.Command("pause") // windows专属
-							}
-						}
-					}
-				}
-				i.IsAlreadyLoadConfig = false
-			}
-		}
-
-		for _, i := range diceManager.Dice {
-			d := i
-			d.DBOperator.Close()
-		}
-
-		// 清理gocqhttp
-		for _, i := range diceManager.Dice {
-			if i.ImSession != nil && i.ImSession.EndPoints != nil {
-				for _, j := range i.ImSession.EndPoints {
-					dice.BuiltinQQServeProcessKill(i, j)
+				if stopErr := waitCronStopped(ctx, diceManager.Cron); stopErr != nil {
+					runtimeQuiesced = false
+					shutdownErrs = append(shutdownErrs, fmt.Errorf("stop manager cron: %w", stopErr))
 				}
 			}
-		}
+			if extraCleanup != nil {
+				if cleanupErr := extraCleanup(ctx, runtimeQuiesced); cleanupErr != nil {
+					shutdownErrs = append(shutdownErrs, cleanupErr)
+				}
+			}
+			if shutdownErr := errors.Join(shutdownErrs...); shutdownErr != nil {
+				log.Errorf("runtime shutdown did not fully quiesce before the shared deadline; process exit will force-stop remaining resources: %v", shutdownErr)
+			}
 
-		if diceManager.Help != nil {
-			diceManager.Help.Close()
-		}
-		if diceManager.IsReady {
-			diceManager.Save()
-		}
-		if diceManager.Cron != nil {
-			diceManager.Cron.Stop()
-		}
+			if unlockErr := sealLock.Unlock(); unlockErr != nil {
+				log.Errorf("文件锁归还出现异常 %v", unlockErr)
+			}
+		})
 	}
+}
+
+type eventStoreCloser interface {
+	Close() error
+}
+
+func shutdownOwnedEventRuntime(
+	ctx context.Context,
+	runtimeQuiesced bool,
+	workers *eventWorkerGroup,
+	bootstrap *endpoint.Bootstrap,
+	store eventStoreCloser,
+) error {
+	workersStopped := workers == nil
+	return shutdownEventRuntime(
+		ctx,
+		func(ctx context.Context) error {
+			if workers == nil {
+				return nil
+			}
+			err := workers.Shutdown(ctx)
+			workersStopped = err == nil
+			return err
+		},
+		func(ctx context.Context) error {
+			if !runtimeQuiesced || !workersStopped {
+				if bootstrap != nil {
+					return bootstrap.Supervisor.Shutdown(ctx)
+				}
+				return nil
+			}
+			if bootstrap != nil {
+				return bootstrap.Shutdown(ctx)
+			}
+			if store != nil {
+				return store.Close()
+			}
+			return nil
+		},
+	)
 }
 
 type pprofRecorder struct {
@@ -214,25 +260,6 @@ func (r *pprofRecorder) stop(log *zap.SugaredLogger) {
 	writeProfile("mutex")
 }
 
-func deleteOldWrongFile() {
-	_ = os.Remove("./data/names/data-logs.db")
-	_ = os.Remove("./data/names/names.zip")
-	_ = os.Remove("./data/names/serve.yaml")
-	_ = os.Remove("./data/names/names/names.xlsx")
-	_ = os.Remove("./data/names/names/names-dnd.xlsx")
-	_ = os.Remove("./data/names/names")
-
-	// 1.2.5之前版本兼容
-	_ = os.RemoveAll("./data/helpdoc/DND/3R")
-	_ = os.RemoveAll("./data/helpdoc/DND/核心")
-	_ = os.RemoveAll("./data/helpdoc/DND/扩展")
-	_ = os.RemoveAll("./data/helpdoc/DND/模组")
-	_ = os.RemoveAll("./data/helpdoc/DND/破解奥秘")
-	_ = os.Remove("./data/helpdoc/DND/法术列表大全.xlsx")
-	_ = os.Remove("./data/helpdoc/DND/名词解释.xlsx")
-	_ = os.Remove("./data/helpdoc/DND/子职列表大全.xlsx")
-}
-
 func fixTimezone() {
 	out, err := exec.Command("/system/bin/getprop", "persist.sys.timezone").Output()
 	if err != nil {
@@ -267,8 +294,10 @@ func main() {
 		LogLevel               int8   `choice:"-1"                                                                   choice:"0"              choice:"1" choice:"2" choice:"3" choice:"4" choice:"5" default:"0" description:"设置日志等级"             long:"log-level"`
 		ContainerMode          bool   `description:"容器模式，该模式下禁用内置客户端"                                                long:"container-mode"`
 		PprofRecord            bool   `description:"启用pprof记录，写入data/pprof/<启动时间戳>"                                      long:"pprof-record"`
-		MutexProfileRate       int    `description:"对互斥锁竞用的采样速率，小于等于0=关闭，1=所有，其他N=N分之1采样率" long:"mutex-profile" default:"5"`
-		BlockProfileRate       int    `description:"对阻塞事件的采样速率，小于等于0=关闭，1=所有，其他N=每N纳秒1次采样" long:"block-profile" default:"5000"`
+		ImportLegacy           bool   `description:"将已停止的 legacy YAML/SQLite/BuntDB 数据一次性导入事件库，成功后退出" long:"import-legacy"`
+		VerifyEventStore       bool   `description:"启动时执行事件库全量清单哈希与密钥引用校验" long:"verify-event-store"`
+		MutexProfileRate       int    `description:"对互斥锁竞用的采样速率，小于等于0=关闭，1=所有，其他N=N分之1采样率" long:"mutex-profile" default:"0"`
+		BlockProfileRate       int    `description:"对阻塞事件的采样速率，小于等于0=关闭，1=所有，其他N=每N纳秒1次采样" long:"block-profile" default:"0"`
 	}
 	// 读取命令行传参
 	_, err := flags.ParseArgs(&opts, os.Args)
@@ -301,7 +330,7 @@ func main() {
 	// 加载env相关
 	err = godotenv.Load()
 	if err != nil {
-		log.Errorf("未读取到.env参数，若您未使用docker或第三方数据库，可安全忽略。")
+		log.Warn("未读取到.env参数，将使用进程环境变量；若未提供事件库配置，将自动初始化本地 SQLite。")
 	}
 
 	switch opts.MutexProfileRate {
@@ -342,7 +371,6 @@ func main() {
 		service.DBVacuum()
 		return
 	}
-	deleteOldWrongFile()
 
 	if opts.Delay != 0 {
 		log.Infof("延迟启动 %d 秒", opts.Delay)
@@ -357,10 +385,16 @@ func main() {
 
 	// 提早初始化是为了读取ServiceName
 
-	// Event-store readiness is the first runtime gate. No legacy loader,
-	// JavaScript, timer, pprof worker, Supervisor, or provider is started
-	// before this read-only validation succeeds.
-	endpointDBConfig, endpointConfigErr := endpointDatabaseConfigFromEnv(os.Getenv)
+	// Event-store metadata readiness is the first runtime gate. No legacy
+	// loader, JavaScript, timer, pprof worker, Supervisor, or provider is
+	// started before this lightweight read-only check succeeds.
+	endpointDBConfig, endpointConfigErr := ensureEndpointDatabaseConfigWithAudit(os.Getenv, ".", func(event endpointBootstrapEvent) {
+		if event.Created {
+			log.Infof("自动创建%s：path=%s", event.Resource, event.Path)
+			return
+		}
+		log.Infof("复用%s：path=%s", event.Resource, event.Path)
+	})
 	if endpointConfigErr != nil {
 		log.Errorf("endpoint event database configuration failed: %v", endpointConfigErr)
 		return
@@ -374,14 +408,61 @@ func main() {
 		log.Errorf("endpoint event database startup failed: %v", openErr)
 		return
 	}
-	defer eventDB.Close()
-	eventStore := eventstore.NewStore(eventDB, eventstore.WithProjection(configstate.ConfigProjection()), eventstore.WithProjection(extensionstate.ExtensionProjection()))
-	if openErr = eventStore.ValidateReadiness(context.Background()); openErr != nil {
-		log.Errorf("event-store readiness validation failed: %v", openErr)
+	eventDatabaseHandedOff := false
+	defer func() {
+		if !eventDatabaseHandedOff {
+			_ = eventDB.Close()
+		}
+	}()
+	eventStore := eventstore.NewStore(eventDB, projectionset.StoreOptions()...)
+	if opts.VerifyEventStore {
+		if openErr = eventStore.ValidateReadiness(context.Background()); openErr != nil {
+			log.Errorf("event-store exhaustive readiness validation failed: %v", openErr)
+			return
+		}
+		log.Info("事件库全量完整性校验完成")
+	} else {
+		log.Info("事件库全量完整性校验默认关闭；可使用 --verify-event-store 显式执行")
+	}
+	if opts.ImportLegacy {
+		readiness, readinessErr := eventStore.GetReadiness(context.Background())
+		if readinessErr != nil {
+			log.Errorf("read legacy import readiness failed: %v", readinessErr)
+			return
+		}
+		persistentState, persistentStateErr := captureImportPersistentState(context.Background(), eventStore)
+		if persistentStateErr != nil {
+			log.Errorf("inspect active event database before legacy import failed: %v", persistentStateErr)
+			return
+		}
+		if closeErr := eventStore.Close(); closeErr != nil {
+			log.Errorf("close active event database before import failed: %v", closeErr)
+			return
+		}
+		installationRoot, sourceRootErr := os.Getwd()
+		if sourceRootErr != nil {
+			log.Errorf("resolve legacy installation root failed: %v", sourceRootErr)
+			return
+		}
+		sourceRoot, sourceRootErr := legacySourceRoot(installationRoot)
+		if sourceRootErr != nil {
+			log.Errorf("resolve legacy data root failed: %v", sourceRootErr)
+			return
+		}
+		result, importErr := importLegacyInstallation(context.Background(), endpointDBConfig, readiness, persistentState, sourceRoot, time.Now())
+		if importErr != nil {
+			log.Errorf("legacy import failed: %v", importErr)
+			return
+		}
+		for _, warning := range result.Warnings {
+			log.Warnf("legacy import cleanup warning: %s", warning)
+		}
+		log.Infof("legacy import published: target=%s snapshot=%s records-batches=%d; restart Scardice normally", result.TargetIdentity, result.Snapshot.Root, result.Batches)
 		return
 	}
 	legacyState := legacyStatePresent()
-	if _, openErr = eventsourcing.ValidateStartupReadiness(context.Background(), eventStore, legacyState); openErr != nil {
+	startupReadiness, openErr := eventsourcing.ValidateStartupReadiness(context.Background(), eventStore, legacyState)
+	if openErr != nil {
 		log.Errorf("event-store startup gate rejected state: %v", openErr)
 		return
 	}
@@ -390,6 +471,28 @@ func main() {
 	// allowed legacy reader; this process starts with an empty Core shell after
 	// an import-ready target has been published.
 	diceManager := &dice.DiceManager{}
+	var pprofStop = func() {}
+	var recErr error
+	var endpointBootstrap *endpoint.Bootstrap
+	eventWorkers := newEventWorkerGroup(context.Background())
+	finishCleanUp := cleanupCreate(diceManager, func(ctx context.Context, runtimeQuiesced bool) error {
+		pprofStop()
+		api.RegisterEndpointBootstrap(nil)
+		if shutdownErr := shutdownOwnedEventRuntime(ctx, runtimeQuiesced, eventWorkers, endpointBootstrap, eventStore); shutdownErr != nil {
+			return fmt.Errorf("event runtime shutdown: %w", shutdownErr)
+		}
+		return nil
+	})
+	cleanUp := func() {
+		eventWorkers.beginShutdown()
+		finishCleanUp()
+	}
+	defer dice.CrashLog()
+	defer cleanUp()
+	// Before this point the database-only defer owns the handle. From here on,
+	// cleanup owns the final close and only performs it after every database
+	// user has quiesced.
+	eventDatabaseHandedOff = true
 
 	if opts.ContainerMode {
 		log.Info("当前为容器模式，内置适配器与更新功能已被禁用")
@@ -399,7 +502,14 @@ func main() {
 		log.Errorf("runtime initialization failed: %v", err)
 		return
 	}
-	var pprofStop func() = func() {}
+	if err = diceManager.RestoreEventSourcedManager(context.Background(), eventStore); err != nil {
+		log.Errorf("event-sourced manager restore failed: %v", err)
+		return
+	}
+	if err = diceManager.RestoreEventSourcedDice(context.Background(), eventStore); err != nil {
+		log.Errorf("event-sourced Dice restore failed: %v", err)
+		return
+	}
 
 	if opts.Address != "" {
 		log.Infof("由参数输入了服务地址: %s", opts.Address)
@@ -562,41 +672,84 @@ func main() {
 
 	go dice.TryGetBackendURL()
 
-	var endpointBootstrap *endpoint.Bootstrap
-	var dispatcherCancel context.CancelFunc = func() {}
-	cleanUp := cleanupCreate(diceManager, func() {
-		pprofStop()
-		dispatcherCancel()
-		if endpointBootstrap != nil {
-			if err := endpointBootstrap.Shutdown(context.Background()); err != nil {
-				logger.M().Errorf("endpoint bootstrap shutdown failed: %v", err)
-			}
-		}
-	})
-	defer dice.CrashLog()
-	defer cleanUp()
+	pprofStop, recErr = startPprofRecordIfEnabled(opts.PprofRecord, log, diceManager.AppBootTime)
+	if recErr != nil {
+		log.Warnf("pprof 记录启动失败: %v", recErr)
+	}
+
+	// 提前接管退出信号，使启动阶段也能完成清理并落盘 pprof。
+	go func() {
+		interrupt := make(chan os.Signal, 1)
+		signal.Notify(interrupt, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+		defer signal.Stop(interrupt)
+		<-interrupt
+		cleanUp()
+		log.Info("程序即将退出，再见")
+		os.Exit(0)
+	}()
 
 	// 初始化核心
+	coreStartupStarted := time.Now()
+	log.Info("开始初始化 Core 实例")
 	diceManager.TryCreateDefault()
-	for _, instance := range diceManager.Dice {
-		if err := instance.AttachDurableStore(eventStore); err != nil {
-			log.Errorf("attach durable event store failed: %v", err)
+	startupDice := diceManager.DiceSnapshot()
+	for _, instance := range startupDice {
+		if instance == nil {
+			continue
+		}
+		if attachErr := instance.AttachDurableStore(eventStore); attachErr != nil {
+			log.Errorf("attach durable event store failed: %v", attachErr)
 			return
 		}
 	}
+	log.Infof("Core 实例准备完成: instances=%d elapsed=%s", len(startupDice), time.Since(coreStartupStarted).Round(time.Millisecond))
 	if err = diceManager.PrepareEventSourcedState(context.Background()); err != nil {
 		log.Errorf("event-sourced Core state initialization failed: %v", err)
 		return
 	}
-	diceManager.InitDice(uiWriter)
-	diceManager.IsReady = true
-	var coreDice *dice.Dice
-	if len(diceManager.Dice) > 0 {
-		coreDice = diceManager.Dice[0]
+	log.Infof("事件溯源配置恢复完成: elapsed=%s", time.Since(coreStartupStarted).Round(time.Millisecond))
+	if err = diceManager.DeferStartupJSLoad(); err != nil {
+		log.Errorf("defer production JavaScript startup failed: %v", err)
+		return
 	}
-	var recErr error
-
-	if coreDice == nil || coreDice.ImSession == nil {
+	var coreDice *dice.Dice
+	if len(startupDice) > 0 {
+		coreDice = startupDice[0]
+	}
+	if coreDice == nil {
+		log.Errorf("event database requires an initialized Core instance")
+		return
+	}
+	endpointBootstrap, openErr = endpoint.NewBootstrap(eventStore, nil, dice.NewAdapterDescriptors()...)
+	if openErr != nil {
+		log.Errorf("endpoint bootstrap construction failed: %v", openErr)
+		return
+	}
+	resolver := newEventEndpointResolver(endpointBootstrap.Service, endpointBootstrap.Registry, eventStore)
+	outboundService, outboundErr := messageflow.NewOutboundService(eventStore, resolver, eventStore, eventstore.UUIDGenerator{})
+	if outboundErr != nil {
+		log.Errorf("durable outbound service construction failed: %v", outboundErr)
+		return
+	}
+	bridge := dice.NewDurableOutboundBridge(outboundService, resolver, eventstore.UUIDGenerator{})
+	replay := inboundReplay{Supervisor: endpointBootstrap.Supervisor, GORMStore: eventStore}
+	for _, instance := range startupDice {
+		if instance == nil {
+			continue
+		}
+		// Publish the final ports before InitDice starts runtime goroutines.
+		instance.OutboundBridge = bridge
+		instance.ProviderQuery = endpointBootstrap.Supervisor
+		instance.ProviderCall = endpointBootstrap.Supervisor
+		instance.InboundReplay = replay
+	}
+	log.Info("开始初始化 Core 扩展与持久化状态")
+	diceManager.InitDice(uiWriter)
+	if diceManager.CleanupFlag.Load() != 0 {
+		return
+	}
+	log.Infof("Core 基础运行时初始化完成，JS 扩展等待端点与出站服务就绪: elapsed=%s", time.Since(coreStartupStarted).Round(time.Millisecond))
+	if coreDice.ImSession == nil {
 		log.Errorf("event database requires an initialized Core session")
 		return
 	}
@@ -605,44 +758,115 @@ func main() {
 		log.Errorf("endpoint inbound service construction failed: %v", inboundErr)
 		return
 	}
-	api.RegisterPrivacyPurgeService(privacypurge.NewService(eventStore))
-	endpointBootstrap, openErr = endpoint.NewBootstrap(eventStore, nil, dice.NewAdapterDescriptors()...)
-	if openErr != nil {
-		log.Errorf("endpoint bootstrap construction failed: %v", openErr)
+	callbackHost := dice.NewDurableCallbackHost(coreDice)
+	api.RegisterPrivacyPurgeService(privacypurge.NewService(eventStore, privacypurge.WithGroupCacheInvalidator(callbackHost.InvalidateGroup)))
+	if startupReadiness.Mode == string(eventsourcing.ModeImport) && legacyState {
+		installationRoot, repairErr := os.Getwd()
+		if repairErr != nil {
+			log.Errorf("resolve legacy endpoint metadata root failed: %v", repairErr)
+			return
+		}
+		sourceRoot, repairErr := legacySourceRoot(installationRoot)
+		if repairErr != nil {
+			log.Errorf("resolve legacy endpoint metadata source failed: %v", repairErr)
+			return
+		}
+		repaired, repairErr := eventsourcing.RepairLegacyEndpointMetadata(context.Background(), sourceRoot, endpointBootstrap.Service)
+		if repairErr != nil {
+			log.Errorf("repair imported endpoint metadata failed: %v", repairErr)
+			return
+		}
+		if repaired > 0 {
+			log.Infof("已补全早期导入遗漏的账号元数据: endpoints=%d", repaired)
+		}
+	}
+	if openErr = endpointBootstrap.SetResourceRoot(coreDice.BaseConfig.DataDir); openErr != nil {
+		log.Errorf("endpoint resource root setup failed: %v", openErr)
+		return
+	}
+	assetImageToken := ""
+	resourceServeAddress := ""
+	if coreDice.Parent != nil {
+		assetImageToken = coreDice.Parent.AssetImageToken
+		resourceServeAddress = coreDice.Parent.ServeAddress
+	}
+	if openErr = endpointBootstrap.SetResourceAccessToken(assetImageToken); openErr != nil {
+		log.Errorf("endpoint resource access setup failed: %v", openErr)
+		return
+	}
+	if openErr = endpointBootstrap.SetResourceServeAddress(resourceServeAddress); openErr != nil {
+		log.Errorf("endpoint resource address setup failed: %v", openErr)
 		return
 	}
 	if openErr = endpointBootstrap.SetInboundSink(inboundService); openErr != nil {
 		log.Errorf("endpoint inbound bridge setup failed: %v", openErr)
 		return
 	}
+	if openErr = endpointBootstrap.SetAdapterEventSink(callbackHost); openErr != nil {
+		log.Errorf("endpoint adapter event bridge setup failed: %v", openErr)
+		return
+	}
+	if openErr = endpointBootstrap.SetCharacterSink(dice.NewCharacterService(coreDice)); openErr != nil {
+		log.Errorf("endpoint character bridge setup failed: %v", openErr)
+		return
+	}
+	if openErr = endpointBootstrap.SetIdentityObservationSink(dice.NewIdentityObservationSink(coreDice, endpointBootstrap.Service)); openErr != nil {
+		log.Errorf("endpoint identity bridge setup failed: %v", openErr)
+		return
+	}
+	if diceManager.CleanupFlag.Load() != 0 {
+		return
+	}
 	api.RegisterEndpointBootstrap(endpointBootstrap)
-	if _, openErr = endpointBootstrap.Startup(context.Background()); openErr != nil {
+
+	groupInfoObserver := dice.NewGroupInfoRefreshSuccessNotifier(coreDice, callbackHost)
+	if diceManager.CleanupFlag.Load() != 0 {
+		return
+	}
+	if _, openErr = endpointBootstrap.Startup(eventWorkers.ctx); openErr != nil {
 		log.Errorf("endpoint bootstrap replay/reconcile failed: %v", openErr)
 		return
 	}
-
-	pprofStop, recErr = startPprofRecordIfEnabled(opts.PprofRecord, log, diceManager.AppBootTime)
-	if recErr != nil {
-		log.Warnf("pprof 记录启动失败: %v", recErr)
-	}
-
-	resolver := newEventEndpointResolver(endpointBootstrap.Service, endpointBootstrap.Registry, eventStore)
-	outboundService, outboundErr := messageflow.NewOutboundService(eventStore, resolver, eventStore, eventstore.UUIDGenerator{})
-	if outboundErr != nil {
-		log.Errorf("durable outbound service construction failed: %v", outboundErr)
+	callbackQueue := newEventQueueCoordinator(eventWorkers, eventCallbackIdleDelay, eventStore.InboxWorkSignal(), eventStore.HasInboxWork)
+	effectQueue := newEventQueueCoordinator(eventWorkers, eventEffectIdleDelay, eventStore.OutboxWorkSignal(), eventStore.HasOutboxWork)
+	if callbackErr := startEventWorkerPool(eventWorkers, eventCallbackWorkerCount, func(index int) (func(context.Context), error) {
+		callbackService, err := messageflow.NewCallbackService(messageflow.CallbackConfig{
+			Inbox: eventStore, Store: eventStore, BoundCodec: eventStore,
+			Resolver: dice.NewDurableCallbackScopeResolver(coreDice),
+			Group:    groupstate.NewRepository(eventStore), Player: playerstate.NewRepository(eventStore),
+			Host: callbackHost, WorkerID: fmt.Sprintf("scardice-callback-%d", index),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return func(ctx context.Context) {
+			runEventCallbackProcessor(ctx, callbackService, callbackQueue.signal)
+		}, nil
+	}); callbackErr != nil {
+		log.Errorf("durable callback worker pool construction failed: %v", callbackErr)
 		return
 	}
-	bridge := dice.NewDurableOutboundBridge(outboundService, resolver, eventstore.UUIDGenerator{})
-	coreDice.OutboundBridge = bridge
-	coreDice.DurableStore = eventStore
-	dispatcher, dispatcherErr := endpoint.NewEffectDispatcher(eventStore, eventStore, endpointBootstrap.Supervisor, "scardice-outbox", endpoint.WithEffectResultNotifier(bridge), endpoint.WithEffectSuccessNotifier(bridge))
-	if dispatcherErr != nil {
-		log.Errorf("outbound dispatcher construction failed: %v", dispatcherErr)
+	if dispatcherErr := startEventWorkerPool(eventWorkers, eventEffectWorkerCount, func(index int) (func(context.Context), error) {
+		dispatcher, err := endpoint.NewEffectDispatcher(eventStore, eventStore, endpointBootstrap.Supervisor, fmt.Sprintf("scardice-outbox-%d", index), endpoint.WithEffectResultNotifier(bridge), endpoint.WithEffectSuccessNotifier(groupInfoObserver))
+		if err != nil {
+			return nil, err
+		}
+		return func(ctx context.Context) {
+			runEventEffectDispatcher(ctx, dispatcher, effectQueue.signal)
+		}, nil
+	}); dispatcherErr != nil {
+		log.Errorf("outbound dispatcher worker pool construction failed: %v", dispatcherErr)
 		return
 	}
-	dispatcherCtx, cancelDispatcher := context.WithCancel(context.Background())
-	dispatcherCancel = cancelDispatcher
-	go runEventEffectDispatcher(dispatcherCtx, dispatcher)
+	if diceManager.CleanupFlag.Load() != 0 {
+		return
+	}
+	// This is the one production publication point: endpoint reconciliation,
+	// direct calls, durable enqueue, and their workers are ready before any
+	// enabled plugin can evaluate top-level code.
+	diceManager.IsReady = true
+	diceManager.StartDeferredStartupJSLoad()
+	log.Infof("Core 与端点运行时已就绪，JS 扩展开始后台加载: elapsed=%s", time.Since(coreStartupStarted).Round(time.Millisecond))
 	go func() {
 		// 每5分钟做一次新版本检查
 		for {
@@ -653,17 +877,6 @@ func main() {
 	go RebootRequestListen(diceManager)
 	// go UpdateRequestListen(diceManager) // 更新功能已禁用
 	// go UpdateCheckRequestListen(diceManager) // 更新功能已禁用
-
-	// 强制清理机制
-	go (func() {
-		interrupt := make(chan os.Signal, 1)
-		signal.Notify(interrupt, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
-
-		<-interrupt
-		cleanUp()
-		log.Info("程序即将退出，再见")
-		os.Exit(0)
-	})()
 
 	if opts.Address != "" {
 		log.Infof("由参数输入了服务地址: %s", opts.Address)
@@ -692,6 +905,19 @@ func removeUpdateFiles() {
 	_ = os.RemoveAll("./update")
 }
 
+func webUICORSConfig() middleware.CORSConfig {
+	allowHeaders := []string{echo.HeaderOrigin, echo.HeaderContentType, echo.HeaderAccept, "token"}
+	if api.WebUIOriginRateLimitBypassEnabled() {
+		allowHeaders = append(allowHeaders, echo.HeaderAuthorization)
+	}
+	return middleware.CORSConfig{
+		Skipper:      middleware.DefaultSkipper,
+		AllowHeaders: allowHeaders,
+		AllowOrigins: []string{"*"},
+		AllowMethods: []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPatch, http.MethodPost, http.MethodDelete},
+	}
+}
+
 func uiServe(dm *dice.DiceManager, hideUI bool, useBuiltin bool) {
 	log := logger.M()
 	log.Info("即将启动webui")
@@ -699,13 +925,7 @@ func uiServe(dm *dice.DiceManager, hideUI bool, useBuiltin bool) {
 	e := echo.New()
 
 	// 为UI添加日志，以echo方式输出
-	e.Use(logger.EchoLogMiddleware())
-	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
-		Skipper:      middleware.DefaultSkipper,
-		AllowHeaders: []string{echo.HeaderOrigin, echo.HeaderContentType, echo.HeaderAccept, "token"},
-		AllowOrigins: []string{"*"},
-		AllowMethods: []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPatch, http.MethodPost, http.MethodDelete},
-	}))
+	e.Use(middleware.CORSWithConfig(webUICORSConfig()))
 
 	e.Use(middleware.GzipWithConfig(middleware.GzipConfig{
 		Level: 5,

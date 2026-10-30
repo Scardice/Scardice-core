@@ -14,7 +14,7 @@ func exportRawKeyMaterial(handle *cryptoKeyHandle) ([]byte, error) {
 	}
 
 	if pub := ecPublicFromHandle(handle); pub != nil {
-		return marshalECRawPublicKey(pub), nil
+		return pub.Bytes()
 	}
 
 	pubEd := handle.Ed25519Public
@@ -55,13 +55,4 @@ func ecPublicFromHandle(handle *cryptoKeyHandle) *ecdsa.PublicKey {
 		return &handle.ECDHPrivate.PublicKey
 	}
 	return nil
-}
-
-func marshalECRawPublicKey(pub *ecdsa.PublicKey) []byte {
-	size := (pub.Curve.Params().BitSize + 7) / 8
-	out := make([]byte, 1+2*size)
-	out[0] = 0x04
-	copy(out[1:1+size], leftPad(pub.X.Bytes(), size))
-	copy(out[1+size:], leftPad(pub.Y.Bytes(), size))
-	return out
 }

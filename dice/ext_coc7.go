@@ -12,6 +12,8 @@ import (
 
 	"github.com/samber/lo"
 	ds "github.com/sealdice/dicescript"
+
+	"Scardice-core/utils/jsengine"
 )
 
 var (
@@ -361,7 +363,7 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 			help.WriteString(".setcoc dg // delta green 扩展规则\n")
 			help.WriteString(".setcoc details // 列出所有规则及其解释文本 \n")
 			// 自定义
-			for _, i := range self.CocExtraRules {
+			for _, i := range self.CocExtraRulesSnapshot() {
 				n := strings.ReplaceAll(i.Desc, "\n", " ")
 				fmt.Fprintf(&help, ".setcoc %d/%s // %s\n", i.Index, i.Key, n)
 			}
@@ -418,7 +420,7 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 				fmt.Fprintf(&help, ".setcoc dg // %s\n", dgStr)
 
 				// 自定义
-				for _, i := range self.CocExtraRules {
+				for _, i := range self.CocExtraRulesSnapshot() {
 					ruleStr := strings.ReplaceAll(i.Desc, "\n", " ")
 					fmt.Fprintf(&help, ".setcoc %d/%s // %s\n", i.Index, i.Key, ruleStr)
 				}
@@ -427,7 +429,7 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 			default:
 				nInt, _ := strconv.ParseInt(n, 10, 64)
-				for _, i := range ctx.Dice.CocExtraRules {
+				for _, i := range ctx.Dice.CocExtraRulesSnapshot() {
 					if i.Key == n || nInt == int64(i.Index) {
 						ctx.Group.CocRuleIndex = i.Index
 						text := fmt.Sprintf("已切换房规为%s:\n%s%s", i.Name, i.Desc, suffix)
@@ -442,14 +444,10 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 					VarSetValueInt64(ctx, "$t房规序号", int64(ctx.Group.CocRuleIndex))
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "COC:设置房规_当前"))
 				} else {
-					// TODO: 修改这种找规则的方式
-					var rule *CocRuleInfo
-					nInt64 := ctx.Group.CocRuleIndex
-					for _, i := range ctx.Dice.CocExtraRules {
-						if nInt64 == i.Index {
-							rule = i
-							break
-						}
+					rule, ok := ctx.Dice.cocExtraRule(ctx.Group.CocRuleIndex)
+					if !ok {
+						ReplyToSender(ctx, msg, "当前自定义房规不可用，请使用 .setcoc 重新选择。")
+						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 
 					VarSetValueStr(ctx, "$t房规文本", rule.Desc)
@@ -1491,16 +1489,21 @@ type CocRuleInfo struct {
 	Desc  string `jsbind:"desc"`  // 规则描述
 
 	Check func(ctx *MsgContext, d100 int64, checkValue int64, difficultyRequired int) CocRuleCheckRet `jsbind:"check"`
+
+	jsBound      bool
+	jsGeneration int64
+	jsLoop       jsengine.Loop
+	jsRealm      jsExecutionContext
 }
 
 func ResultCheck(ctx *MsgContext, cocRule int, d100 int64, attrValue int64, difficultyRequired int) (successRank int, criticalSuccessValue int64) {
 	if cocRule >= 20 {
 		d := ctx.Dice
-		val, exists := d.CocExtraRules[cocRule]
+		val, exists := d.cocExtraRule(cocRule)
 		if !exists {
 			cocRule = 0
 		} else {
-			ret := val.Check(ctx, d100, attrValue, difficultyRequired)
+			ret := val.check(ctx, d100, attrValue, difficultyRequired)
 			return ret.SuccessRank, ret.CriticalSuccessValue
 		}
 	}

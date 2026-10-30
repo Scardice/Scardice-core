@@ -4,6 +4,7 @@ package emitter
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -16,12 +17,16 @@ import (
 
 	socketio "github.com/PaienNate/pineutil/evsocket/v2"
 
+	"Scardice-core/adapterapi"
 	"Scardice-core/dice/imsdk/onebot/schema"
 	"Scardice-core/dice/imsdk/onebot/types"
 )
 
 // EchoTimeOut ws onebot await echo message time out
 var EchoTimeOut = 10 * time.Second
+
+// ErrInvalidRawRequest means validation failed before any provider I/O.
+var ErrInvalidRawRequest = fmt.Errorf("%w: invalid OneBot raw request", adapterapi.ErrInvalidContract)
 
 type Emitter interface {
 	SendPvtMsg(ctx context.Context, userId int64, msg schema.MessageChain) (*types.SendMsgRes, error)
@@ -44,10 +49,11 @@ type Emitter interface {
 	SetGroupCard(ctx context.Context, groupId int64, userId int64, card string) error
 	GetGroupInfo(ctx context.Context, groupId int64, noCache bool) (*types.GroupInfo, error)
 	GetGroupMemberInfo(ctx context.Context, groupId int64, userId int64, noCache bool) (*types.GroupMemberInfo, error)
-	GetGroupMsgHistory(ctx context.Context, groupId int64, messageSeq int64, count int) (*types.GetGroupMsgHistoryRes, error)
 	Raw(ctx context.Context, action Action, params any) ([]byte, error)
+	RawJSON(ctx context.Context, request []byte) ([]byte, error)
 
-	HandleEcho(resp Response[sonic.NoCopyRawMessage])
+	HandleEcho(echo string, raw []byte)
+	Close()
 
 	GetDroppedEchoCount() uint64
 }
@@ -63,17 +69,23 @@ type Request[T any] struct {
 type Response[T any] struct {
 	Status  string `json:"status"`
 	RetCode int    `json:"retcode"`
+	Message string `json:"message,omitempty"`
+	Msg     string `json:"msg,omitempty"`
+	Wording string `json:"wording,omitempty"`
 	Data    T      `json:"data,omitempty"`
 	Echo    string `json:"echo"`
 }
 
 func (r *Response[T]) UnmarshalJSON(data []byte) error {
 	type rawResponse struct {
-		Status       string `json:"status"`
-		RetCode      int    `json:"retcode"`
-		RetCodeCamel int    `json:"retCode"`
-		Data         T      `json:"data,omitempty"`
-		Echo         string `json:"echo"`
+		Status       string                 `json:"status"`
+		RetCode      int                    `json:"retcode"`
+		RetCodeCamel int                    `json:"retCode"`
+		Message      sonic.NoCopyRawMessage `json:"message"`
+		Msg          sonic.NoCopyRawMessage `json:"msg"`
+		Wording      sonic.NoCopyRawMessage `json:"wording"`
+		Data         T                      `json:"data,omitempty"`
+		Echo         string                 `json:"echo"`
 	}
 
 	var aux rawResponse
@@ -86,17 +98,32 @@ func (r *Response[T]) UnmarshalJSON(data []byte) error {
 	if r.RetCode == 0 && aux.RetCodeCamel != 0 {
 		r.RetCode = aux.RetCodeCamel
 	}
+	r.Message = responseDiagnosticString(aux.Message)
+	r.Msg = responseDiagnosticString(aux.Msg)
+	r.Wording = responseDiagnosticString(aux.Wording)
 	r.Data = aux.Data
 	r.Echo = aux.Echo
 	return nil
+}
+
+func responseDiagnosticString(raw sonic.NoCopyRawMessage) string {
+	// Legacy echo decoding also sees inbound events whose message is a segment array.
+	if len(raw) == 0 || raw[0] != '"' {
+		return ""
+	}
+	var value string
+	_ = sonic.Unmarshal(raw, &value)
+	return value
 }
 
 type emitterSocket struct {
 	mu     sync.Mutex
 	conn   *socketio.WebsocketWrapper
 	selfId int64
+	closed bool
+	done   chan struct{}
 
-	waiters sync.Map // map[string]chan Response[sonic.NoCopyRawMessage]
+	waiters sync.Map // map[string]chan []byte
 
 	droppedEchoCount uint64
 }
@@ -104,29 +131,34 @@ type emitterSocket struct {
 func NewEVEmitter(conn *socketio.WebsocketWrapper) *emitterSocket {
 	emitter := &emitterSocket{
 		conn: conn,
+		done: make(chan struct{}),
 	}
 	return emitter
 }
 
-func (e *emitterSocket) HandleEcho(resp Response[sonic.NoCopyRawMessage]) {
-	if resp.Echo == "" {
+func (e *emitterSocket) HandleEcho(echo string, raw []byte) {
+	chAny, ok := e.waiters.Load(echo)
+	if echo == "" || !ok {
 		atomic.AddUint64(&e.droppedEchoCount, 1)
 		return
 	}
-	chAny, ok := e.waiters.Load(resp.Echo)
-	if !ok {
-		atomic.AddUint64(&e.droppedEchoCount, 1)
-		return
-	}
-	ch, ok := chAny.(chan Response[sonic.NoCopyRawMessage])
-	if !ok {
-		atomic.AddUint64(&e.droppedEchoCount, 1)
-		return
-	}
+	ch := chAny.(chan []byte)
+	// The waiter outlives the transport callback; retain our own frame bytes.
 	select {
-	case ch <- resp:
+	case ch <- append([]byte(nil), raw...):
 	default:
 		atomic.AddUint64(&e.droppedEchoCount, 1)
+	}
+}
+
+func (e *emitterSocket) Close() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.closed {
+		e.closed = true
+		if e.done != nil {
+			close(e.done)
+		}
 	}
 }
 
@@ -141,29 +173,64 @@ func (e *emitterSocket) SetSelfId(_ context.Context, selfId int64) error {
 	return nil
 }
 
-func (e *emitterSocket) waitEchoAfterSend(ctx context.Context, action Action, echoId string, params any, send func() error) (Response[sonic.NoCopyRawMessage], error) {
+func (e *emitterSocket) waitEchoBytes(ctx context.Context, echoID string, send func() error) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	ctx, cancel := context.WithTimeout(ctx, EchoTimeOut)
 	defer cancel()
-
-	ch := make(chan Response[sonic.NoCopyRawMessage], 1)
-	e.waiters.Store(echoId, ch)
-	defer e.waiters.Delete(echoId)
-
-	if err := send(); err != nil {
-		return Response[sonic.NoCopyRawMessage]{}, wrapActionError(err, action, echoId, params)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-
+	e.mu.Lock()
+	if e.done == nil && !e.closed {
+		e.done = make(chan struct{})
+	}
+	closed, done := e.closed, e.done
+	e.mu.Unlock()
+	if closed {
+		return nil, errors.New("OneBot connection closed")
+	}
+	ch := make(chan []byte, 1)
+	e.waiters.Store(echoID, ch)
+	defer e.waiters.Delete(echoID)
+	if err := send(); err != nil {
+		return nil, err
+	}
 	select {
 	case <-ctx.Done():
-		return Response[sonic.NoCopyRawMessage]{}, wrapActionError(ctx.Err(), action, echoId, params)
-	case resp := <-ch:
-		return resp, nil
+		return nil, ctx.Err()
+	case <-done:
+		return nil, errors.New("OneBot connection closed")
+	case raw := <-ch:
+		return raw, nil
 	}
 }
 
+func (e *emitterSocket) waitEchoAfterSend(ctx context.Context, action Action, echoID string, params any, send func() error) (Response[sonic.NoCopyRawMessage], error) {
+	raw, err := e.waitEchoBytes(ctx, echoID, send)
+	if err != nil {
+		return Response[sonic.NoCopyRawMessage]{}, wrapActionError(err, action, echoID, params)
+	}
+	var response Response[sonic.NoCopyRawMessage]
+	if err := sonic.Unmarshal(raw, &response); err != nil {
+		return response, fmt.Errorf("decode OneBot response: %w", err)
+	}
+	return response, nil
+}
+
+type onebotActionRejectedError string
+
+func (err onebotActionRejectedError) Error() string { return string(err) }
+func (onebotActionRejectedError) IsActionRejected() {}
+
 func decodeResponse[R any](action Action, echoId string, params any, resp Response[sonic.NoCopyRawMessage]) (*R, error) {
-	if !strings.EqualFold(resp.Status, "ok") || resp.RetCode != 0 {
-		return nil, fmt.Errorf("OneBot 动作执行失败: action=%s echo=%s params=%s response=%s",
+	if resp.RetCode != 0 || strings.EqualFold(resp.Status, "failed") {
+		return nil, onebotActionRejectedError(fmt.Sprintf("OneBot 动作执行失败: action=%s echo=%s params=%s response=%s",
+			action, echoId, marshalForError(params), marshalForError(resp)))
+	}
+	if !strings.EqualFold(resp.Status, "ok") {
+		return nil, fmt.Errorf("OneBot 响应状态无法确认: action=%s echo=%s params=%s response=%s",
 			action, echoId, marshalForError(params), marshalForError(resp))
 	}
 	var res R
@@ -357,25 +424,54 @@ func (e *emitterSocket) GetGroupMemberInfo(ctx context.Context, groupId int64, u
 	return decodeResponse[types.GroupMemberInfo](ACTION_GET_GROUP_MEMBER_INFO, resp.Echo, params, resp)
 }
 
-func (e *emitterSocket) GetGroupMsgHistory(ctx context.Context, groupId int64, messageSeq int64, count int) (*types.GetGroupMsgHistoryRes, error) {
-	params := types.GetGroupMsgHistoryReq{
-		GroupID:    groupId,
-		MessageSeq: messageSeq,
-		Count:      count,
-	}
-	resp, err := doAction(ctx, e, ACTION_GET_GROUP_MSG_HISTORY, params)
+func (e *emitterSocket) Raw(ctx context.Context, action Action, params any) ([]byte, error) {
+	echoID := uuid.NewString()
+	request, err := sonic.Marshal(Request[any]{Action: action, Params: params, Echo: echoID})
 	if err != nil {
 		return nil, err
 	}
-	return decodeResponse[types.GetGroupMsgHistoryRes](ACTION_GET_GROUP_MSG_HISTORY, resp.Echo, params, resp)
+	return e.sendRawRequest(ctx, echoID, request)
 }
 
-func (e *emitterSocket) Raw(ctx context.Context, action Action, params any) ([]byte, error) {
-	resp, err := doAction(ctx, e, action, params)
+// RawJSON preserves all provider fields. Only the reserved correlation echo is
+// replaced; a protocol-level failure is still a response, not a transport error.
+func (e *emitterSocket) RawJSON(ctx context.Context, request []byte) ([]byte, error) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(request, &envelope); err != nil || envelope == nil {
+		return nil, fmt.Errorf("%w: request must be a JSON object", ErrInvalidRawRequest)
+	}
+	var action string
+	if json.Unmarshal(envelope["action"], &action) != nil || strings.TrimSpace(action) == "" {
+		return nil, fmt.Errorf("%w: request requires an action", ErrInvalidRawRequest)
+	}
+	echoID := uuid.NewString()
+	echoJSON, _ := json.Marshal(echoID)
+	envelope["echo"] = echoJSON
+	wire, err := json.Marshal(envelope)
 	if err != nil {
 		return nil, err
 	}
-	return sonic.Marshal(resp)
+	if len(wire) > adapterapi.MaxProtocolJSONBytes {
+		return nil, fmt.Errorf("%w: request with correlation echo exceeds bounds", ErrInvalidRawRequest)
+	}
+	return e.sendRawRequest(ctx, echoID, wire)
+}
+
+func (e *emitterSocket) sendRawRequest(ctx context.Context, echoID string, wire []byte) ([]byte, error) {
+	return e.waitEchoBytes(ctx, echoID, func() error {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if e.closed || e.conn == nil || !e.conn.IsAlive() {
+			return errors.New("OneBot connection unavailable")
+		}
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		e.conn.Emit(wire, socketio.TextMessage)
+		return nil
+	})
 }
 
 func doAction(ctx context.Context, e *emitterSocket, action string, params any) (Response[sonic.NoCopyRawMessage], error) {
@@ -383,6 +479,14 @@ func doAction(ctx context.Context, e *emitterSocket, action string, params any) 
 	resp, err := e.waitEchoAfterSend(ctx, action, echoId, params, func() error {
 		e.mu.Lock()
 		defer e.mu.Unlock()
+		if e.closed || e.conn == nil || !e.conn.IsAlive() {
+			return errors.New("OneBot connection unavailable")
+		}
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		return wsEmitWithEcho(e.conn, action, params, echoId)
 	})
 	if err != nil {

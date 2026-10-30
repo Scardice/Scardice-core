@@ -43,7 +43,7 @@ func (ctx *MsgContext) GenDefaultRollVmConfig() *ds.RollConfig {
 		// 个人变量
 		if strings.HasPrefix(name, "$m") {
 			if ctx.Session != nil && ctx.Player != nil {
-				playerAttrs := lo.Must(am.LoadById(ctx.Player.UserID))
+				playerAttrs := lo.Must(am.LoadByIdForCtx(ctx, ctx.Player.UserID))
 				playerAttrs.Store(name, v)
 			}
 			return nil, true
@@ -51,7 +51,7 @@ func (ctx *MsgContext) GenDefaultRollVmConfig() *ds.RollConfig {
 
 		// 群变量
 		if ctx.Group != nil && strings.HasPrefix(name, "$g") {
-			groupAttrs := lo.Must(am.LoadById(ctx.Group.GroupID))
+			groupAttrs := lo.Must(am.LoadByIdForCtx(ctx, ctx.Group.GroupID))
 			groupAttrs.Store(name, v)
 			return nil, true
 		}
@@ -752,7 +752,7 @@ func (ctx *MsgContext) loadAttrValueByName(name string) *ds.VMValue {
 	}
 
 	if ctx.Player != nil && ctx.Dice != nil {
-		playerAttrs := lo.Must(ctx.Dice.AttrsManager.LoadById(ctx.Player.UserID))
+		playerAttrs := lo.Must(ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Player.UserID))
 		if v := playerAttrs.Load(resolved); v != nil {
 			return v
 		}
@@ -805,7 +805,7 @@ func (ctx *MsgContext) CreateVmIfNotExists() {
 		if strings.HasPrefix(name, "$") {
 			if strings.HasPrefix(name, "$m") {
 				if ctx.Session != nil && ctx.Player != nil {
-					playerAttrs := lo.Must(am.LoadById(ctx.Player.UserID))
+					playerAttrs := lo.Must(am.LoadByIdForCtx(ctx, ctx.Player.UserID))
 					if v := playerAttrs.Load(name); v != nil {
 						return v
 					}
@@ -813,7 +813,7 @@ func (ctx *MsgContext) CreateVmIfNotExists() {
 				return ds.NewIntVal(0)
 			}
 			if strings.HasPrefix(name, "$g") && ctx.Group != nil {
-				groupAttrs := lo.Must(am.LoadById(ctx.Group.GroupID))
+				groupAttrs := lo.Must(am.LoadByIdForCtx(ctx, ctx.Group.GroupID))
 				if v := groupAttrs.Load(name); v != nil {
 					return v
 				}

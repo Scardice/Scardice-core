@@ -15,6 +15,9 @@ import (
 
 	"github.com/dop251/goja"
 	"github.com/dop251/goja_nodejs/eventloop"
+
+	"Scardice-core/utils/jsengine"
+	gojaengine "Scardice-core/utils/jsengine/goja"
 )
 
 type fetchRequestData struct {
@@ -145,26 +148,28 @@ func newFetchFn(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler,
 	return func(call goja.FunctionCall) goja.Value {
 		promise, resolve, reject := rt.NewPromise()
 
-		requestData, err := parseFetchRequest(rt, call.Argument(0), call.Argument(1))
+		var executionContext any
+		if hooks.CurrentContext != nil {
+			executionContext = hooks.CurrentContext()
+		}
+		requestData, err := parseFetchRequest(rt, jsengine.ContextForExecution(executionContext), call.Argument(0), call.Argument(1))
 		if err != nil {
 			_ = reject(rt.NewTypeError(err.Error()))
 			return rt.ToValue(promise)
 		}
 		if authorize != nil {
 			if err := authorize(requestData.url); err != nil {
+				requestData.cancel()
 				_ = reject(rt.NewGoError(err))
 				return rt.ToValue(promise)
 			}
 		}
 		if lifecycle != nil {
 			if err := lifecycle.Start(requestData); err != nil {
+				requestData.cancel()
 				_ = reject(rt.NewGoError(err))
 				return rt.ToValue(promise)
 			}
-		}
-		var executionContext any
-		if hooks.CurrentContext != nil {
-			executionContext = hooks.CurrentContext()
 		}
 		go func() {
 			if lifecycle != nil {
@@ -172,6 +177,7 @@ func newFetchFn(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler,
 			}
 			responseData, err := doFetchRequest(requestData, proxy)
 			complete := func(loopRT *goja.Runtime) {
+				defer requestData.cancel()
 				if requestData.ctx != nil && requestData.ctx.Err() != nil {
 					reason := requestData.abort.get()
 					if reason == nil || goja.IsUndefined(reason) || goja.IsNull(reason) {
@@ -189,20 +195,33 @@ func newFetchFn(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler,
 				_ = resolve(response)
 			}
 			if hooks.ScheduleOnLoop != nil {
-				_ = hooks.ScheduleOnLoop(executionContext, func(loopRT *goja.Runtime) error {
+				if err := hooks.ScheduleOnLoop(executionContext, func(loopRT *goja.Runtime) error {
 					complete(loopRT)
 					return nil
-				})
+				}); err != nil {
+					requestData.cancel()
+				}
 				return
 			}
-			loop.RunOnLoop(complete)
+			if scheduled, err := gojaengine.ScheduleOnExistingEventLoop(loop, executionContext, func(loopRT *goja.Runtime) error {
+				complete(loopRT)
+				return nil
+			}); scheduled {
+				if err != nil {
+					requestData.cancel()
+				}
+				return
+			}
+			if !loop.RunOnLoop(complete) {
+				requestData.cancel()
+			}
 		}()
 
 		return rt.ToValue(promise)
 	}
 }
 
-func parseFetchRequest(rt *goja.Runtime, input goja.Value, init goja.Value) (*fetchRequestData, error) {
+func parseFetchRequest(rt *goja.Runtime, parent context.Context, input goja.Value, init goja.Value) (*fetchRequestData, error) {
 	if goja.IsUndefined(input) || goja.IsNull(input) || strings.TrimSpace(input.String()) == "" {
 		return nil, errors.New("url parameter missing")
 	}
@@ -213,7 +232,13 @@ func parseFetchRequest(rt *goja.Runtime, input goja.Value, init goja.Value) (*fe
 		headers: newHeadersData(),
 		abort:   &fetchAbortState{},
 	}
-	data.ctx, data.cancel = context.WithCancel(context.Background())
+	data.ctx, data.cancel = context.WithCancel(parent)
+	parsed := false
+	defer func() {
+		if !parsed {
+			data.cancel()
+		}
+	}()
 
 	if obj, ok := input.(*goja.Object); ok {
 		if urlValue := obj.Get("url"); urlValue != nil && !goja.IsUndefined(urlValue) && !goja.IsNull(urlValue) {
@@ -238,6 +263,7 @@ func parseFetchRequest(rt *goja.Runtime, input goja.Value, init goja.Value) (*fe
 		return nil, err
 	}
 	data.url = encodedURL
+	parsed = true
 	return data, nil
 }
 

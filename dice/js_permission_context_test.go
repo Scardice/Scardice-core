@@ -35,10 +35,7 @@ func newPermissionTestDice(t *testing.T, packageID string, permissions sealpack.
 			lock:     &sync.RWMutex{},
 			packages: map[string]*sealpack.Instance{packageID: instance},
 		},
-		ImSession: &IMSession{
-			ServiceAtNew: new(SyncMap[string, *GroupInfo]),
-			EndPoints:    []*EndPointInfo{},
-		},
+		ImSession:    &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
 		DirtyGroups:  new(SyncMap[string, int64]),
 		AttrsManager: &AttrsManager{},
 		ExtRegistry:  new(SyncMap[string, *ExtInfo]),
@@ -207,7 +204,7 @@ func TestNativeQuickJSFilesystemPermissionContextSurvivesAsyncService(t *testing
 	}
 
 	var results any
-	for attempt := 0; attempt < 200; attempt++ {
+	for range 200 {
 		if err := loop.Run(func(runtime jsengine.Runtime) error {
 			var err error
 			if runtime.Get("__permissionDone").ToBoolean() {

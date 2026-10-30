@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"Scardice-core/eventstore"
+
 	"github.com/google/uuid"
 )
 
@@ -44,13 +45,30 @@ type Result struct {
 	Completed           bool                     `json:"completed"`
 }
 
-type Service struct {
-	repo eventstore.PrivacyHistoryRepository
-	now  func() time.Time
+type Option func(*Service)
+
+// WithGroupCacheInvalidator runs after a group privacy fence is acquired and
+// before pending work is resolved or projections are deleted.
+func WithGroupCacheInvalidator(invalidator func(context.Context, string) error) Option {
+	return func(service *Service) {
+		service.invalidateGroupCache = invalidator
+	}
 }
 
-func NewService(repo eventstore.PrivacyHistoryRepository) *Service {
-	return &Service{repo: repo, now: func() time.Time { return time.Now().UTC() }}
+type Service struct {
+	repo                 eventstore.PrivacyHistoryRepository
+	now                  func() time.Time
+	invalidateGroupCache func(context.Context, string) error
+}
+
+func NewService(repo eventstore.PrivacyHistoryRepository, options ...Option) *Service {
+	service := &Service{repo: repo, now: func() time.Time { return time.Now().UTC() }}
+	for _, option := range options {
+		if option != nil {
+			option(service)
+		}
+	}
+	return service
 }
 func canonicalScopes(scopes []string) ([]string, error) {
 	if len(scopes) == 0 {
@@ -59,14 +77,14 @@ func canonicalScopes(scopes []string) ([]string, error) {
 	seen := map[string]bool{}
 	for _, raw := range scopes {
 		switch scope := strings.TrimSpace(raw); scope {
-		case "group_record", "players", "attrs":
+		case "group_record", "players", "attrs", "logs":
 			seen[scope] = true
 		default:
 			return nil, ErrInvalidRequest
 		}
 	}
 	out := make([]string, 0, len(seen))
-	for _, scope := range []string{"group_record", "players", "attrs"} {
+	for _, scope := range []string{"group_record", "players", "attrs", "logs"} {
 		if seen[scope] {
 			out = append(out, scope)
 		}
@@ -147,7 +165,7 @@ func (s *Service) Confirm(ctx context.Context, req Request) (Result, error) {
 	if _, err := s.repo.PrivacyFence(ctx, scan.SubjectKey, "group", operationID); err != nil {
 		if errors.Is(err, eventstore.ErrParticipantConflict) {
 			if cleanupErr := s.cancelOrphan(ctx, operationID); cleanupErr != nil {
-				return Result{OperationID: operationID, Status: "failed", Phase: "fence"}, fmt.Errorf("%w: orphan cleanup: %v", err, cleanupErr)
+				return Result{OperationID: operationID, Status: "failed", Phase: "fence"}, fmt.Errorf("%w: orphan cleanup: %w", err, cleanupErr)
 			}
 			return Result{OperationID: operationID, Status: "cancelled", Phase: "fence"}, err
 		}
@@ -238,6 +256,11 @@ func (s *Service) resume(ctx context.Context, req Request) (Result, error) {
 func (s *Service) run(ctx context.Context, operationID string, subjectKey []byte, private eventstore.PrivacyOperationContext, scan eventstore.PrivacyDryRunResult) (Result, error) {
 	status := "running"
 	phase := "quiesce"
+	if s.invalidateGroupCache != nil {
+		if err := s.invalidateGroupCache(ctx, private.GroupID); err != nil {
+			return s.failed(ctx, operationID, private, subjectKey, phase, err)
+		}
+	}
 	if err := s.repo.PrivacyResolvePending(ctx, subjectKey, operationID); err != nil {
 		return s.failed(ctx, operationID, private, subjectKey, phase, err)
 	}
@@ -249,15 +272,15 @@ func (s *Service) run(ctx context.Context, operationID string, subjectKey []byte
 	if _, err := s.repo.PrivacyUpdateOperation(ctx, operationID, view.Version, private, status); err != nil {
 		return s.failed(ctx, operationID, private, subjectKey, "delete", err)
 	}
-	deleted := eventstore.PrivacyCounts{}
 	for {
-		batch, err := s.repo.PrivacyDeleteBatch(ctx, eventstore.PrivacyBatchRequest{OperationID: operationID, GroupID: private.GroupID, Phase: private.Phase, DiceIDs: private.DiceIDs, Scopes: private.Scopes, Cursor: private.Cursor, Limit: eventstore.PrivacyBatchRecords})
+		batch, err := s.repo.PrivacyDeleteBatch(ctx, eventstore.PrivacyBatchRequest{
+			OperationID: operationID, GroupID: private.GroupID, Phase: private.Phase,
+			DiceIDs: private.DiceIDs, Scopes: private.Scopes, Cursor: private.Cursor,
+			Limit: eventstore.PrivacyBatchRecords,
+		})
 		if err != nil {
 			return s.failed(ctx, operationID, private, subjectKey, "delete", err)
 		}
-		deleted.GroupRecord += batch.Deleted.GroupRecord
-		deleted.Players += batch.Deleted.Players
-		deleted.Attrs += batch.Deleted.Attrs
 		private.Cursor, private.Phase = batch.NextCursor, "delete"
 		view, _, loadErr := s.repo.PrivacyLoadOperation(ctx, operationID)
 		if loadErr != nil {
@@ -301,7 +324,7 @@ func (s *Service) run(ctx context.Context, operationID string, subjectKey []byte
 	} else {
 		return s.failed(ctx, operationID, private, subjectKey, "reopen", eventstore.ErrParticipantFailure)
 	}
-	out := Result{OperationID: operationID, Status: "completed-uncovered", Phase: "completed", Counts: scan.Counts, Deleted: deleted, Uncovered: scan.Uncovered, Completed: true}
+	out := Result{OperationID: operationID, Status: "completed-uncovered", Phase: "completed", Counts: private.Counts, Deleted: private.Counts, Uncovered: scan.Uncovered, Completed: true}
 	return out, ErrUncoveredData
 }
 
@@ -309,7 +332,7 @@ func (s *Service) failed(ctx context.Context, operationID string, private events
 	private.Phase = phase
 	view, loaded, loadErr := s.repo.PrivacyLoadOperation(ctx, operationID)
 	if loadErr != nil {
-		return Result{OperationID: operationID, Status: "failed", Phase: phase}, fmt.Errorf("%w: checkpoint load: %v", cause, loadErr)
+		return Result{OperationID: operationID, Status: "failed", Phase: phase}, fmt.Errorf("%w: checkpoint load: %w", cause, loadErr)
 	}
 	if (view.Status == "completed" || view.Status == "completed-uncovered") && loaded.GroupID == "" {
 		result := Result{OperationID: operationID, Status: view.Status, Phase: "completed", Completed: true}
@@ -320,7 +343,7 @@ func (s *Service) failed(ctx context.Context, operationID string, private events
 	}
 	private = loaded
 	if _, updateErr := s.repo.PrivacyUpdateOperation(ctx, operationID, view.Version, private, "resumable-failure"); updateErr != nil {
-		return Result{OperationID: operationID, Status: "failed", Phase: phase}, fmt.Errorf("%w: checkpoint update: %v", cause, updateErr)
+		return Result{OperationID: operationID, Status: "failed", Phase: phase}, fmt.Errorf("%w: checkpoint update: %w", cause, updateErr)
 	}
 	return Result{OperationID: operationID, Status: "resumable-failure", Phase: phase}, cause
 }

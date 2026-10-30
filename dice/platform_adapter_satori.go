@@ -7,21 +7,31 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	"Scardice-core/adapterapi"
 	"Scardice-core/message"
 	"Scardice-core/utils/satori"
-
-	"github.com/gorilla/websocket"
 
 	ds "github.com/sealdice/dicescript"
 )
 
 const SatoriProtocolVersion = "v1"
+
+func satoriEndpoints(version, host string, port int) (*url.URL, *url.URL, error) {
+	if version == "" || host == "" || port <= 0 || port > 65535 {
+		return nil, nil, errors.New("satori: invalid connection config")
+	}
+	address := net.JoinHostPort(host, strconv.Itoa(port))
+	return &url.URL{Scheme: "ws", Host: address, Path: "/" + version + "/events"},
+		&url.URL{Scheme: "http", Host: address, Path: "/" + version}, nil
+}
 
 type PlatformAdapterSatori struct {
 	EndPoint    *EndPointInfo `json:"-" yaml:"-"`
@@ -33,235 +43,10 @@ type PlatformAdapterSatori struct {
 	Port     int    `json:"port"     yaml:"port"`
 	Token    string `json:"token"    yaml:"token"`
 
-	wsUrl   *url.URL
 	httpUrl *url.URL
 
-	conn       *websocket.Conn
 	Ctx        context.Context    `json:"-" yaml:"-"`
 	CancelFunc context.CancelFunc `json:"-" yaml:"-"`
-}
-
-func (pa *PlatformAdapterSatori) Serve() int {
-	ep := pa.EndPoint
-	s := pa.EndPoint.Session
-	log := s.Parent.Logger
-	d := pa.EndPoint.Session.Parent
-
-	wsUrl := url.URL{
-		Scheme: "ws",
-		Host:   fmt.Sprintf("%s:%d", pa.Host, pa.Port),
-		Path:   fmt.Sprintf("/%s/events", pa.Version),
-	}
-	httpUrl := url.URL{
-		Scheme: "http",
-		Host:   fmt.Sprintf("%s:%d", pa.Host, pa.Port),
-		Path:   fmt.Sprintf("/%s", pa.Version),
-	}
-	pa.Ctx, pa.CancelFunc = context.WithCancel(context.Background())
-	defer func() {
-		if pa.CancelFunc != nil {
-			pa.CancelFunc()
-		}
-	}()
-
-	log.Infof("connecting to %s", wsUrl.String())
-	conn, resp, err := websocket.DefaultDialer.DialContext(pa.Ctx, wsUrl.String(), nil)
-	if err != nil {
-		log.Error("dial:", err)
-		pa.EndPoint.State = 3
-		return 1
-	}
-	defer resp.Body.Close()
-	pa.conn = conn
-	pa.EndPoint.State = 2
-
-	// 鉴权
-	auth := &SatoriPayload[SatoriIdentify]{
-		Op:   SatoriOpIdentify,
-		Body: &SatoriIdentify{Token: pa.Token},
-	}
-	authData, _ := json.Marshal(auth)
-	err = conn.WriteMessage(websocket.TextMessage, authData)
-	if err != nil {
-		log.Error("auth failed:", err)
-		pa.EndPoint.State = 3
-		return 1
-	}
-
-	_, authRespData, err := conn.ReadMessage()
-	if err != nil {
-		log.Error("auth failed:", err)
-		pa.EndPoint.State = 3
-		return 1
-	}
-	var authResp SatoriPayload[SatoriReady]
-	err = json.Unmarshal(authRespData, &authResp)
-	if err != nil {
-		log.Error("auth failed:", err)
-		pa.EndPoint.State = 3
-		return 1
-	}
-	log.Debugf("satori auth resp:%+v", authResp)
-	logins := authResp.Body.Logins
-	var login *SatoriLogin
-	if len(logins) < 1 {
-		log.Error("invalid satori login info")
-		pa.EndPoint.State = 3
-		return 1
-	} else if len(logins) > 1 {
-		for _, loginResp := range logins {
-			if loginResp.Platform == pa.Platform {
-				login = loginResp
-				break
-			}
-		}
-		if login == nil {
-			log.Error("invalid satori login info")
-			pa.EndPoint.State = 3
-			return 1
-		}
-	} else {
-		login = logins[0]
-	}
-
-	pa.wsUrl = &wsUrl
-	pa.httpUrl = &httpUrl
-	pa.EndPoint.State = 1
-	ep.UserID = formatDiceIDSatori(pa.Platform, login.SelfID)
-	if login.User != nil {
-		ep.Nickname = login.User.Name
-	}
-	d.LastUpdatedTime = time.Now().Unix()
-	d.Save(false)
-	log.Infof("satori 连接成功，账号<%s>(%s)", pa.EndPoint.Nickname, pa.EndPoint.UserID)
-
-	go func() {
-		for {
-			select {
-			case <-pa.Ctx.Done():
-				log.Info("satori finished")
-				return
-			default:
-				msgType, msgData, err := conn.ReadMessage()
-				if err != nil {
-					if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-						log.Error("satori read failed:", err)
-					}
-					if pa.CancelFunc != nil {
-						pa.CancelFunc()
-						pa.CancelFunc = nil
-					}
-					return
-				}
-				switch msgType {
-				case websocket.TextMessage:
-					log.Debugf("message=%s", msgData)
-					// handle event
-					var payload SatoriPayload[any]
-					err = json.Unmarshal(msgData, &payload)
-					if err != nil {
-						log.Error("satori data unmarshal failed:", err)
-						continue
-					}
-					if payload.Op == SatoriOpEvent {
-						var event SatoriPayload[SatoriEvent]
-						err = json.Unmarshal(msgData, &event)
-						if err != nil {
-							log.Error("satori event unmarshal failed:", err)
-							continue
-						}
-						pa.handleEvent(event)
-					}
-				case websocket.CloseMessage:
-					log.Debugf("satori closed")
-					return
-				default:
-					log.Debugf("message[type=%d]=%s", msgType, msgData)
-				}
-			}
-		}
-	}()
-
-	// 更新好友列表
-	go pa.refreshFriends()
-	// 更新群列表
-	go pa.refreshGroups()
-
-	ticker := time.NewTicker(10 * time.Second)
-	for {
-		select {
-		case <-ticker.C:
-			// heartbeat
-			hb, _ := json.Marshal(SatoriPayload[any]{
-				Op:   SatoriOpPing,
-				Body: nil,
-			})
-			err := conn.WriteMessage(websocket.TextMessage, hb)
-			if err != nil {
-				log.Error("satori heartbeat failed:", err)
-				if pa.CancelFunc != nil {
-					pa.CancelFunc()
-				}
-			}
-		case <-pa.Ctx.Done():
-			ticker.Stop()
-			_ = conn.Close()
-			pa.conn = nil
-			return 0
-		}
-	}
-}
-
-// refreshFriends 更新好友信息
-func (pa *PlatformAdapterSatori) refreshFriends() {
-	session := pa.EndPoint.Session
-	d := session.Parent
-	log := d.Logger
-	dm := d.Parent
-
-	next := ""
-	for {
-		req := make(map[string]interface{})
-		if next != "" {
-			req["next"] = next
-		}
-		reqJson, _ := json.Marshal(req)
-		data, err := pa.post("friend.list", bytes.NewBuffer(reqJson))
-		if err != nil {
-			log.Error("satori 获取好友列表失败:", err)
-			return
-		}
-		var friendPage struct {
-			Data []SatoriUser `json:"data"`
-			Next string       `json:"next"`
-		}
-		err = json.Unmarshal(data, &friendPage)
-		if err != nil {
-			log.Error("satori 获取好友列表失败:", err)
-			return
-		}
-		next = friendPage.Next
-		for _, friend := range friendPage.Data {
-			name := "未知用户"
-			if friend.Name != "" {
-				name = friend.Name
-			}
-			if friend.Nick != "" {
-				name = friend.Nick
-			}
-			if name == "" {
-				continue
-			}
-			userID := formatDiceIDSatori(pa.Platform, friend.ID)
-			dm.UserNameCache.Store(userID, &GroupNameCacheItem{
-				Name: name,
-				time: time.Now().Unix(),
-			})
-		}
-		if next == "" {
-			break
-		}
-	}
 }
 
 // refreshGroups 更新群信息
@@ -375,10 +160,9 @@ func (pa *PlatformAdapterSatori) refreshMembers(group SatoriGuild) {
 						}
 					}
 					p = &GroupPlayerInfo{
-						Name:          name,
-						UserID:        userID,
-						ValueMapTemp:  &ds.ValueMap{},
-						UpdatedAtTime: 0,
+						Name:         name,
+						UserID:       userID,
+						ValueMapTemp: &ds.ValueMap{},
 					}
 					groupInfo.Players.Store(userID, p)
 				}
@@ -388,36 +172,6 @@ func (pa *PlatformAdapterSatori) refreshMembers(group SatoriGuild) {
 			break
 		}
 	}
-}
-
-func (pa *PlatformAdapterSatori) DoRelogin() bool {
-	pa.EndPoint.Session.Parent.Logger.Infof("正在启用 satori 连接，请稍后...")
-	pa.EndPoint.State = 0
-	pa.EndPoint.Enable = false
-	if pa.CancelFunc != nil {
-		pa.CancelFunc()
-	}
-	return pa.Serve() == 0
-}
-
-func (pa *PlatformAdapterSatori) SetEnable(enable bool) {
-	d := pa.EndPoint.Session.Parent
-	e := pa.EndPoint
-	if enable {
-		e.Enable = true
-		pa.DiceServing = false
-		if pa.conn == nil {
-			go ServeQQ(d, e)
-		}
-	} else {
-		e.State = 0
-		e.Enable = false
-		if pa.CancelFunc != nil {
-			pa.CancelFunc()
-		}
-	}
-	d.LastUpdatedTime = time.Now().Unix()
-	d.Save(false)
 }
 
 func (pa *PlatformAdapterSatori) QuitGroup(ctx *MsgContext, _ string) {
@@ -479,14 +233,12 @@ func (pa *PlatformAdapterSatori) SetGroupCardName(ctx *MsgContext, name string) 
 	log.Errorf("satori %s 平台暂不支持设置群成员名片", pa.Platform)
 }
 
-func (pa *PlatformAdapterSatori) SendFileToPerson(ctx *MsgContext, userID string, path string, flag string) {
-	log := pa.EndPoint.Session.Parent.Logger
-	log.Errorf("satori %s 平台暂不支持私聊文件发送", pa.Platform)
+func (*PlatformAdapterSatori) SendFileToPerson(_ *MsgContext, _ string, _ string, _ string) adapterapi.EffectResult {
+	return adapterapi.UnsupportedResult("satori_file_send_unsupported")
 }
 
-func (pa *PlatformAdapterSatori) SendFileToGroup(ctx *MsgContext, groupID string, path string, flag string) {
-	log := pa.EndPoint.Session.Parent.Logger
-	log.Errorf("satori %s 平台暂不支持群聊文件发送", pa.Platform)
+func (*PlatformAdapterSatori) SendFileToGroup(_ *MsgContext, _ string, _ string, _ string) adapterapi.EffectResult {
+	return adapterapi.UnsupportedResult("satori_file_send_unsupported")
 }
 
 func (pa *PlatformAdapterSatori) MemberBan(groupID string, userID string, duration int64) {
@@ -582,52 +334,6 @@ func (pa *PlatformAdapterSatori) post(resource string, body io.Reader) ([]byte, 
 	}
 }
 
-func (pa *PlatformAdapterSatori) toStdMessage(messageEvent *SatoriEvent) *Message {
-	session := pa.EndPoint.Session
-	d := session.Parent
-	log := d.Logger
-	dm := d.Parent
-
-	if messageEvent.Message == nil {
-		log.Errorf("satori 消息解析失败：消息为空")
-		return nil
-	}
-	msg := new(Message)
-	msg.RawID = messageEvent.Message.ID
-	msg.Message = decodeMessage(messageEvent.Message.Content)
-	msg.Platform = pa.Platform
-
-	sender := SenderBase{}
-	sender.UserID = formatDiceIDSatori(pa.Platform, messageEvent.User.ID)
-	userName, _ := dm.UserNameCache.Load(sender.UserID)
-	if userName != nil {
-		sender.Nickname = userName.Name
-	}
-	if messageEvent.User.Name != "" {
-		sender.Nickname = messageEvent.User.Name
-	}
-	if messageEvent.User.Nick != "" {
-		sender.Nickname = messageEvent.User.Nick
-	}
-	if messageEvent.Guild != nil {
-		// 群聊消息
-		msg.MessageType = "group"
-		msg.GroupID = formatDiceIDSatoriGroup(pa.Platform, messageEvent.Guild.ID)
-		if messageEvent.Member.Nick != "" {
-			sender.Nickname = messageEvent.Member.Nick
-		}
-	} else {
-		// 私聊消息
-		msg.MessageType = "private"
-	}
-	if sender.Nickname == "" {
-		sender.Nickname = "未知用户"
-	}
-	msg.Sender = sender
-
-	return msg
-}
-
 func decodeMessage(text string) string {
 	msgRoot := satori.ElementParse(text)
 	content := strings.Builder{}
@@ -646,6 +352,85 @@ func decodeMessage(text string) string {
 		}
 	})
 	return content.String()
+}
+
+func satoriMessageCreatedInbound(platform string, event *SatoriEvent) (adapterapi.InboundMessage, error) {
+	if event == nil || event.Type != "message-created" || event.ID.String() == "" || event.Message == nil || event.Message.ID == "" || event.Message.User == nil || event.Message.User.ID == "" {
+		return adapterapi.InboundMessage{}, errors.New("satori: incomplete message-created event")
+	}
+	conversation := ""
+	conversationKind := adapterapi.ConversationKindDirect
+	if event.Message.Guild != nil {
+		conversationKind = adapterapi.ConversationKindGroup
+		if event.Message.Guild.ID == "" {
+			return adapterapi.InboundMessage{}, errors.New("satori: message-created event has empty guild")
+		}
+		conversation = formatDiceIDSatoriGroup(platform, event.Message.Guild.ID)
+	}
+	inbound := adapterapi.InboundMessage{
+		ProviderEventID:  adapterapi.ProviderEventID(event.ID.String()),
+		MessageID:        adapterapi.MessageID(event.Message.ID),
+		Platform:         platform,
+		Sender:           adapterapi.PrincipalID(formatDiceIDSatori(platform, event.Message.User.ID)),
+		Conversation:     adapterapi.ConversationID(conversation),
+		ConversationKind: conversationKind,
+		Kind:             adapterapi.InboundKindMessage,
+		Text:             decodeMessage(event.Message.Content),
+	}
+	if event.Timestamp > 0 {
+		inbound.OccurredAt = time.UnixMilli(event.Timestamp).UTC()
+	}
+	if err := inbound.Validate(); err != nil {
+		return adapterapi.InboundMessage{}, err
+	}
+	return inbound, nil
+}
+
+func satoriMessageMutationInbound(platform string, event *SatoriEvent) (adapterapi.InboundMessage, error) {
+	if event == nil || event.ID.String() == "" || event.Message == nil || event.Message.ID == "" {
+		return adapterapi.InboundMessage{}, errors.New("satori: incomplete message mutation event")
+	}
+	var kind adapterapi.InboundKind
+	switch event.Type {
+	case "message-updated":
+		kind = adapterapi.InboundKindMessageUpdated
+	case "message-deleted":
+		kind = adapterapi.InboundKindMessageDeleted
+	default:
+		return adapterapi.InboundMessage{}, errors.New("satori: unsupported message mutation event")
+	}
+	conversation := ""
+	conversationKind := adapterapi.ConversationKindDirect
+	if event.Channel != nil && event.Channel.Type != SatoriDirectChannel {
+		conversationKind = adapterapi.ConversationKindGroup
+		if event.Channel.ID == "" {
+			return adapterapi.InboundMessage{}, errors.New("satori: message mutation event has empty channel")
+		}
+		conversation = formatDiceIDSatoriGroup(platform, event.Channel.ID)
+	}
+	sender := ""
+	if event.User != nil && event.User.ID != "" {
+		sender = formatDiceIDSatori(platform, event.User.ID)
+	}
+	inbound := adapterapi.InboundMessage{
+		ProviderEventID:  adapterapi.ProviderEventID(event.ID.String()),
+		MessageID:        adapterapi.MessageID(event.Message.ID),
+		Platform:         platform,
+		Sender:           adapterapi.PrincipalID(sender),
+		Conversation:     adapterapi.ConversationID(conversation),
+		ConversationKind: conversationKind,
+		Kind:             kind,
+	}
+	if kind == adapterapi.InboundKindMessageUpdated {
+		inbound.Text = decodeMessage(event.Message.Content)
+	}
+	if event.Timestamp > 0 {
+		inbound.OccurredAt = time.UnixMilli(event.Timestamp).UTC()
+	}
+	if err := inbound.Validate(); err != nil {
+		return adapterapi.InboundMessage{}, err
+	}
+	return inbound, nil
 }
 
 func (pa *PlatformAdapterSatori) encodeMessage(content string) string {
@@ -713,75 +498,6 @@ func (pa *PlatformAdapterSatori) encodeMessage(content string) string {
 	}
 	result := msg.String()
 	return result
-}
-
-func (pa *PlatformAdapterSatori) handleEvent(event SatoriPayload[SatoriEvent]) {
-	s := pa.EndPoint.Session
-	switch event.Body.Type {
-	case "message-created": // 消息创建
-		msg := pa.toStdMessage(event.Body)
-		if msg != nil {
-			s.Execute(pa.EndPoint, msg, false)
-		}
-	case "message-updated": // 消息编辑
-		pa.editMessageHandle(event.Body)
-	case "message-deleted": // 消息撤回
-		pa.deleteMessageHandle(event.Body)
-	case "guild-added": // 加入群组
-		// satori 协议有规定该事件，但是 chronocat 目前并未支持，尚未测试
-		// pa.guildAddedHandle(event.Body)
-	case "guild-updated": // 群组被修改
-	case "guild-removed": // 退出群组
-		// satori 协议有规定该事件，但是 chronocat 目前并未支持，尚未测试
-		// pa.guildRemovedHandle(event.Body)
-	case "guild-request": // 收到入群邀请
-		// satori 协议有规定该事件，但是 chronocat 目前并未支持，尚未测试
-		// pa.guildRequestHandle(event.Body)
-	case "friend-request": // 收到好友申请
-		// satori 协议有规定该事件，但是 chronocat 目前并未支持，尚未测试
-		// pa.friendRequestHandle(event.Body)
-	}
-}
-
-func (pa *PlatformAdapterSatori) deleteMessageHandle(e *SatoriEvent) {
-	msg := new(Message)
-	msg.Time = e.Message.CreatedAt
-	msg.RawID = e.Message.ID
-	msg.Sender.UserID = formatDiceIDSatori(pa.Platform, e.User.ID)
-	msg.Sender.Nickname = e.User.Name
-	if e.User.Nick != "" {
-		msg.Sender.Nickname = e.User.Nick
-	}
-	if e.Channel.Type == SatoriDirectChannel {
-		msg.MessageType = "private"
-	} else {
-		msg.MessageType = "group"
-		msg.GroupID = formatDiceIDSatoriGroup(pa.Platform, e.Channel.ID)
-	}
-	mctx := &MsgContext{Session: pa.EndPoint.Session, EndPoint: pa.EndPoint, Dice: pa.EndPoint.Session.Parent, MessageType: msg.MessageType}
-	pa.EndPoint.Session.OnMessageDeleted(mctx, msg)
-}
-
-func (pa *PlatformAdapterSatori) editMessageHandle(e *SatoriEvent) {
-	msg := new(Message)
-	msg.Time = e.Message.UpdatedAt
-	msg.RawID = e.Message.ID
-	msg.Message = decodeMessage(e.Message.Content)
-	msg.Platform = pa.Platform
-	if e.Channel.Type == SatoriDirectChannel {
-		msg.MessageType = "private"
-	} else {
-		msg.MessageType = "group"
-		msg.GroupID = formatDiceIDSatoriGroup(pa.Platform, e.Channel.ID)
-	}
-	mctx := &MsgContext{
-		Session:     pa.EndPoint.Session,
-		EndPoint:    pa.EndPoint,
-		Dice:        pa.EndPoint.Session.Parent,
-		MessageType: msg.MessageType,
-		Player:      &GroupPlayerInfo{},
-	}
-	pa.EndPoint.Session.OnMessageEdit(mctx, msg)
 }
 
 //nolint:unused

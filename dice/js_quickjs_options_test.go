@@ -8,6 +8,10 @@ import (
 	"testing"
 
 	"Scardice-core/utils/jsengine"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+	"gopkg.in/yaml.v3"
 )
 
 func TestBuildQuickJSRuntimeOptionsSerializesAllFields(t *testing.T) {
@@ -32,6 +36,81 @@ func TestBuildQuickJSRuntimeOptionsSerializesAllFields(t *testing.T) {
 	want := `{"version":1,"runtime":{"memoryLimitBytes":134217728,"gcThresholdBytes":33554432,"maxStackSizeBytes":524288,"executionTimeoutMillis":3000},"services":{"fetch":{"maxConcurrent":2,"maxResponseBytes":4194304},"websocket":{"maxConnections":5,"maxMessageBytes":6291456},"filesystem":{"maxReadBytes":7340032,"maxWriteBytes":8388608},"pbkdf2":{"maxIterations":9,"maxOutputBytes":10}}}`
 	if got := string(options.PayloadFor("quickjs")); got != want {
 		t.Fatalf("QuickJS payload = %s, want %s", got, want)
+	}
+}
+
+func TestBuildRuntimeOptionsForEnginePassesGenericPayloadUnchanged(t *testing.T) {
+	raw := json.RawMessage(` { "opaque": [1, 2, 3] } `)
+	options, err := BuildRuntimeOptionsForEngine("custom", JsConfig{
+		JsRuntimeOptions: map[string]json.RawMessage{"CUSTOM": raw},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := options.PayloadFor("custom"); !bytes.Equal(got, raw) {
+		t.Fatalf("custom payload = %q, want %q", got, raw)
+	}
+}
+
+func TestBuildRuntimeOptionsForEngineGenericQuickJSOverridesLegacy(t *testing.T) {
+	raw := json.RawMessage(`{"ownedBy":"provider"}`)
+	options, err := BuildRuntimeOptionsForEngine("quickjs", JsConfig{
+		JsRuntimeOptions:      map[string]json.RawMessage{"quickjs": raw},
+		QuickJSMemoryLimitMiB: math.MaxUint64,
+	})
+	if err != nil {
+		t.Fatalf("generic QuickJS payload interpreted as legacy options: %v", err)
+	}
+	if got := options.PayloadFor("quickjs"); !bytes.Equal(got, raw) {
+		t.Fatalf("QuickJS payload = %q, want %q", got, raw)
+	}
+}
+
+func TestRuntimeOptionsForEngineWarnsWhenGenericQuickJSOverridesLegacy(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	dice := &Dice{
+		Config: Config{JsConfig: JsConfig{
+			JsRuntimeOptions:      map[string]json.RawMessage{"quickjs": json.RawMessage(`{"ownedBy":"provider"}`)},
+			QuickJSMemoryLimitMiB: 256,
+		}},
+		Logger: zap.New(core).Sugar(),
+	}
+	if _, err := dice.runtimeOptionsForEngine(" QuickJS "); err != nil {
+		t.Fatal(err)
+	}
+	if logs.Len() != 1 {
+		t.Fatalf("warning count = %d, want 1", logs.Len())
+	}
+}
+
+func TestJsConfigYAMLDecodesGenericRuntimeOptions(t *testing.T) {
+	var config JsConfig
+	if err := yaml.Unmarshal([]byte(`
+jsRuntimeOptions:
+  quickjs:
+    memoryLimitMiB: 384
+`), &config); err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		MemoryLimitMiB uint64 `json:"memoryLimitMiB"`
+	}
+	if err := json.Unmarshal(config.JsRuntimeOptions["quickjs"], &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.MemoryLimitMiB != 384 {
+		t.Fatalf("memoryLimitMiB = %d, want 384", payload.MemoryLimitMiB)
+	}
+	encoded, err := yaml.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roundTrip JsConfig
+	if err := yaml.Unmarshal(encoded, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(roundTrip.JsRuntimeOptions["quickjs"]); got != string(config.JsRuntimeOptions["quickjs"]) {
+		t.Fatalf("round-trip payload = %s, want %s", got, config.JsRuntimeOptions["quickjs"])
 	}
 }
 
@@ -120,7 +199,7 @@ func TestDiceQuickJSRuntimeOptionsUsesEngineNeutralContract(t *testing.T) {
 	if len(options.PayloadFor("quickjs")) == 0 {
 		t.Fatal("Dice quickjs options omitted payload")
 	}
-	var _ jsengine.RuntimeOptions = options
+	var _ = options
 }
 func TestRuntimeOptionsForEngineIgnoresQuickJSFieldsForGoja(t *testing.T) {
 	options, err := BuildRuntimeOptionsForEngine(jsengine.EngineGoja, JsConfig{QuickJSMemoryLimitMiB: math.MaxUint64})

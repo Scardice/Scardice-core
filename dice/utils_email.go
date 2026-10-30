@@ -8,6 +8,8 @@ import (
 	"gopkg.in/gomail.v2"
 )
 
+type mailSendFunc func(*gomail.Dialer, *gomail.Message) error
+
 type MailCode int
 
 const (
@@ -64,11 +66,10 @@ func (d *Dice) SendMail(body string, m MailCode, noticeTypes ...NoticeType) erro
 		return errors.New("没有启用且允许接收此类通知的邮件目标")
 	}
 
-	d.SendMailRow(sub, to, body, nil)
-	return nil
+	return d.SendMailRow(sub, to, body, nil)
 }
 
-func (d *Dice) SendMailRow(subject string, to []string, content string, attachments []string) {
+func (d *Dice) SendMailRow(subject string, to []string, content string, attachments []string) error {
 	m := gomail.NewMessage()
 	// NOTE(Xiangze Li): 按理说应当统一用DiceFotmatTmpl, 但是那样还得有一个MsgContext, 好复杂
 	diceName := "余烬核心"
@@ -92,9 +93,16 @@ func (d *Dice) SendMailRow(subject string, to []string, content string, attachme
 	}
 
 	dialer := gomail.NewDialer(d.Config.MailSMTP, 25, d.Config.MailFrom, d.Config.MailPassword)
-	if err := dialer.DialAndSend(m); err != nil {
-		d.Logger.Error(err)
+	var err error
+	if d.mailSend != nil {
+		err = d.mailSend(dialer, m)
 	} else {
-		d.Logger.Infof("Mail:[%s]%s -> %s", subject, content, strings.Join(to, ";"))
+		err = dialer.DialAndSend(m)
 	}
+	if err != nil {
+		d.Logger.Error(err)
+		return err
+	}
+	d.Logger.Infof("Mail:[%s]%s -> %s", subject, content, strings.Join(to, ";"))
+	return nil
 }

@@ -32,18 +32,14 @@ func (m JSCompatibilityExecutionMode) String() string {
 	}
 }
 
-func (m JSCompatibilityExecutionMode) sideEffectFree() bool {
-	return m == JSCompatibilityReplay || m == JSCompatibilityRebuild
-}
-
 // JSCompatibilityDecision is the decision boundary shared by callback,
 // scheduler, and effect adapters. Keeping the three permissions together
 // prevents a replay caller from accidentally enabling one side-effect path.
 type JSCompatibilityDecision struct {
-	Mode              JSCompatibilityExecutionMode
-	LegacyCallback    bool
+	Mode               JSCompatibilityExecutionMode
+	LegacyCallback     bool
 	CallbackScheduling bool
-	EffectCapture     bool
+	EffectCapture      bool
 }
 
 func DecideJSCompatibility(mode JSCompatibilityExecutionMode) JSCompatibilityDecision {
@@ -54,9 +50,9 @@ func DecideJSCompatibility(mode JSCompatibilityExecutionMode) JSCompatibilityDec
 	}
 }
 
-func (d JSCompatibilityDecision) AllowsLegacyCallback() bool { return d.LegacyCallback }
+func (d JSCompatibilityDecision) AllowsLegacyCallback() bool     { return d.LegacyCallback }
 func (d JSCompatibilityDecision) AllowsCallbackScheduling() bool { return d.CallbackScheduling }
-func (d JSCompatibilityDecision) AllowsEffectCapture() bool { return d.EffectCapture }
+func (d JSCompatibilityDecision) AllowsEffectCapture() bool      { return d.EffectCapture }
 
 var (
 	// ErrJSCompatibilityReplaySuppressed is stable and lets callers distinguish
@@ -129,10 +125,14 @@ func (b JSCompatibilityBoundary) CaptureEffect(capture func() error) error {
 // passed permission validation and may have entered filesystem/network I/O.
 // It is deliberately monotonic: once possible, recovery must not treat the
 // callback as safely rerunnable.
-type JSExternalEffectTracker struct { possible atomic.Bool }
+type JSExternalEffectTracker struct{ possible atomic.Bool }
 
 func NewJSExternalEffectTracker() *JSExternalEffectTracker { return &JSExternalEffectTracker{} }
-func (t *JSExternalEffectTracker) MarkPossible() { if t != nil { t.possible.Store(true) } }
+func (t *JSExternalEffectTracker) MarkPossible() {
+	if t != nil {
+		t.possible.Store(true)
+	}
+}
 func (t *JSExternalEffectTracker) PossiblyStarted() bool { return t != nil && t.possible.Load() }
 
 func ClassifyJSCompatibilityFailure(tracker *JSExternalEffectTracker, cause error) error {

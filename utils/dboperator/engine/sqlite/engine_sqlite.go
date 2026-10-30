@@ -98,6 +98,29 @@ func (s *SQLiteEngine) GetCensorDB(mode constant.DBMode) *gorm.DB {
 
 const defaultDataDir = "./data/default"
 
+type sqliteDatabaseInitializationLogger interface {
+	Infof(format string, args ...any)
+}
+
+func logSQLiteDatabaseFileState(log sqliteDatabaseInitializationLogger, path string, existed bool) {
+	if log == nil || path == "" {
+		return
+	}
+	if !existed {
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			return
+		}
+		log.Infof("自动创建 SQLite 数据库文件：path=%s", path)
+		return
+	}
+	log.Infof("复用 SQLite 数据库文件：path=%s", path)
+}
+func sqliteDatabaseFileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}
+
 func (s *SQLiteEngine) Init(ctx context.Context) error {
 	log := zap.S().Named(logger.LogKeyDatabase)
 	if ctx == nil {

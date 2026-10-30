@@ -9,7 +9,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"Scardice-core/dice/service"
 	sealdiceLogger "Scardice-core/logger"
 	"Scardice-core/model"
 	"Scardice-core/utils/constant"
@@ -51,7 +53,7 @@ func TestBuildLogNameAliasIndexUsesWrappedKeysAndResolvesInput(t *testing.T) {
 	appendTestLog(t, mockDB, groupID, "normal-log")
 	appendTestLog(t, mockDB, groupID, " spaced\nname ")
 
-	index, err := buildLogNameAliasIndex(mockDB, groupID)
+	index, err := buildLogNameAliasIndex(service.NewLegacyLogRepository(mockDB, ""), groupID)
 	if err != nil {
 		t.Fatalf("buildLogNameAliasIndex: %v", err)
 	}
@@ -129,7 +131,7 @@ func TestResolveLogNameForGroupPrefersExactNameBeforeAlias(t *testing.T) {
 	appendTestLog(t, mockDB, groupID, "abcdef12")
 	appendTestLog(t, mockDB, groupID, "other-log")
 
-	index, err := buildLogNameAliasIndex(mockDB, groupID)
+	index, err := buildLogNameAliasIndex(service.NewLegacyLogRepository(mockDB, ""), groupID)
 	if err != nil {
 		t.Fatalf("buildLogNameAliasIndex: %v", err)
 	}
@@ -148,7 +150,7 @@ func TestResolveLogNameForGroupPrefersExactNameBeforeAlias(t *testing.T) {
 		t.Fatal("test setup produced ambiguous exact-name collision")
 	}
 
-	got, err := resolveLogNameForGroup(mockDB, groupID, "abcdef12")
+	got, err := resolveLogNameForGroup(service.NewLegacyLogRepository(mockDB, ""), groupID, "abcdef12")
 	if err != nil {
 		t.Fatalf("resolveLogNameForGroup exact: %v", err)
 	}
@@ -163,7 +165,7 @@ func TestLogSendToBackendAcceptsAliasKey(t *testing.T) {
 	logName := "special name"
 	appendTestLog(t, mockDB, groupID, logName)
 
-	index, err := buildLogNameAliasIndex(mockDB, groupID)
+	index, err := buildLogNameAliasIndex(service.NewLegacyLogRepository(mockDB, ""), groupID)
 	if err != nil {
 		t.Fatalf("buildLogNameAliasIndex: %v", err)
 	}
@@ -234,7 +236,10 @@ func TestEnsureGroupLogStateBackfillsLegacyLogID(t *testing.T) {
 		},
 	}
 
-	logState := ensureGroupLogState(ctx, ctx.Group)
+	logState, err := ensureGroupLogState(ctx, ctx.Group)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !logState.On {
 		t.Fatal("expected legacy log state to stay on")
 	}
@@ -246,5 +251,24 @@ func TestEnsureGroupLogStateBackfillsLegacyLogID(t *testing.T) {
 	}
 	if got := ctx.Group.GetLogState().ID; got != logState.ID {
 		t.Fatalf("group LogCurID = %d, want %d", got, logState.ID)
+	}
+}
+
+func TestLogListWithoutDatabaseOperatorReportsUnavailableStorage(t *testing.T) {
+	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+
+	const groupID = "UI-Group:9001"
+	_, _ = newQuitCommandTestContext(t, d, ep, "QQ:9001", groupID, "EventSourceGroup")
+	d.DBOperator = nil
+
+	d.ImSession.ExecuteNew(ep, newGroupMsg(groupID, "QQ:9001", ".log list"))
+
+	reply, ok := adapter.waitForMsg(2 * time.Second)
+	if !ok {
+		t.Fatal("timeout: expected a reply to '.log list'")
+	}
+	if !strings.Contains(reply, "日志存储未初始化") || !strings.Contains(reply, "当前存储模式不可用") {
+		t.Fatalf("reply = %q, want an explicit unavailable-log-storage explanation", reply)
 	}
 }

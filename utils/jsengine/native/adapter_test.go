@@ -14,16 +14,10 @@ import (
 	"Scardice-core/utils/jsengine"
 )
 
-func TestNativeRuntimeProvidesEngineNeutralDangerousExposure(t *testing.T) {
-	var runtime jsengine.DangerousExposer = (*nativeRuntime)(nil)
-	if runtime == nil {
-		t.Fatal("native runtime does not implement dangerous exposure")
-	}
-}
+var _ jsengine.DangerousExposer = (*nativeRuntime)(nil)
 
 type adapterHost struct {
 	Answer int `jsbind:"answer"`
-	lock   sync.RWMutex
 }
 
 func (h *adapterHost) Add(delta int) int {
@@ -41,6 +35,22 @@ func echoCandidate(t *testing.T) Candidate {
 		Schema: 1, ID: "echo-runtime", Name: "Echo Runtime", Version: "1.0.0", Language: "javascript",
 		RuntimeABI: ABIRequirement{Major: 1}, HostABI: ABIRequirement{Major: 1},
 	}}
+}
+func TestRegisterCandidatesResolveLoadsNativeProvider(t *testing.T) {
+	candidate := echoCandidate(t)
+	loader := &Loader{candidates: []Candidate{candidate}}
+	registry := jsengine.NewRegistry()
+	if err := loader.RegisterCandidates(registry); err != nil {
+		t.Fatal(err)
+	}
+	provider, err := registry.Resolve(jsengine.EngineID(candidate.Manifest.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := provider.Descriptor()
+	if descriptor.ID != jsengine.EngineID(candidate.Manifest.ID) || descriptor.Path != candidate.LibraryPath {
+		t.Fatalf("resolved descriptor = %#v", descriptor)
+	}
 }
 
 func openEcho(t *testing.T) jsengine.Loop {
@@ -77,7 +87,7 @@ func TestNativeAdapterEchoContract(t *testing.T) {
 			return fmt.Errorf("eval export = %#v", got)
 		}
 		if got, err := value.ExportPrimitive(); err != nil || got != int64(3) {
-			return fmt.Errorf("eval primitive export = %#v, %v", got, err)
+			return fmt.Errorf("eval primitive export = %#v, %w", got, err)
 		}
 		if err := runtime.Set("u64", uint64(math.MaxUint64)); err != nil {
 			return err
@@ -104,7 +114,11 @@ func TestNativeAdapterEchoContract(t *testing.T) {
 		if got := object.Get("answer").Export(); got != int64(3) {
 			return fmt.Errorf("object answer = %#v", got)
 		}
-		if got := object.Get("missing").Export(); got != nil {
+		missing := object.Get("missing")
+		if missing == nil {
+			return errors.New("missing object property returned nil instead of an undefined value")
+		}
+		if got := missing.Export(); got != nil {
 			return fmt.Errorf("missing object property = %#v, want undefined", got)
 		}
 		objectValue, err := runtime.RunString("object.js", "({ answer: 42 })")
@@ -112,7 +126,7 @@ func TestNativeAdapterEchoContract(t *testing.T) {
 			return err
 		}
 		if _, err := objectValue.ExportPrimitive(); !errors.Is(err, jsengine.ErrPrimitiveExportUnsupported) {
-			return fmt.Errorf("object primitive export error = %v", err)
+			return fmt.Errorf("object primitive export error = %w", err)
 		}
 		if err := runtime.Bind("host", &host); err != nil {
 			return err
@@ -151,6 +165,34 @@ func TestNativeAdapterEchoContract(t *testing.T) {
 		return err
 	}); err == nil || !strings.Contains(err.Error(), "echo eval error") {
 		t.Fatalf("error = %v, want echo eval diagnostic", err)
+	}
+}
+
+func TestNativeAdapterStringExportPreservesBytes(t *testing.T) {
+	for name, want := range map[string]string{
+		"empty":        "",
+		"trailing-nul": "value\x00",
+		"unicode":      "中文🙂",
+	} {
+		t.Run(name, func(t *testing.T) {
+			loop := openEcho(t)
+			t.Cleanup(func() { _ = loop.Close() })
+			if err := loop.Run(func(runtime jsengine.Runtime) error {
+				if err := runtime.Set("text", want); err != nil {
+					return err
+				}
+				got, err := runtime.Get("text").ExportPrimitive()
+				if err != nil {
+					return err
+				}
+				if got != want {
+					return fmt.Errorf("string export = %q, want %q", got, want)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

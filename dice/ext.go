@@ -16,9 +16,7 @@ import (
 	"github.com/tidwall/buntdb"
 	"go.uber.org/zap"
 
-	"Scardice-core/dice/events"
 	"Scardice-core/utils/jsengine"
-	gojaengine "Scardice-core/utils/jsengine/goja"
 )
 
 const (
@@ -146,7 +144,7 @@ func (d *Dice) RegisterBuiltinSystemTemplate() {
 			}
 			continue
 		}
-		d.GameSystemTemplateAdd(tmpl)
+		d.addGameSystemTemplateEx(tmpl, false)
 	}
 }
 
@@ -299,6 +297,8 @@ func (i *ExtInfo) CmdMapSnapshot() CmdMapCls {
 // GetCmdMap 获取命令映射（处理 wrapper 代理）
 // 如果是 wrapper，返回真实扩展的 CmdMap
 // 如果正在重载或无法获取真实扩展，返回空 CmdMap
+// TODO(局部重载/通用): 重载期间 wrapper 的 CmdMap 由全局 JsReloading 一刀切地清空，所有 JS 插件的指令都会暂时不可用。
+// subTODO(局部重载): 改为按插件的“加载中”状态，只屏蔽正在重载的插件及其依赖闭包。
 func (i *ExtInfo) GetCmdMap() CmdMapCls {
 	// 重载期间，wrapper 的真实扩展可能还未注册，返回空 CmdMap
 	// 注意：如果 i.dice 为 nil（理论上不应发生），会走到 GetRealExt()
@@ -332,59 +332,82 @@ func parseMessagePreprocessValue(vm *goja.Runtime, value goja.Value) messagePrep
 }
 
 func parseMessagePreprocessEngineValue(value jsengine.Value) messagePreprocessDecision {
-	if value == nil {
-		return messagePreprocessDecision{action: messagePreprocessNoop}
-	}
+	decision, _ := parseMessagePreprocessEngineValueWithError(value)
+	return decision
+}
 
+func parseMessagePreprocessEngineValueWithError(value jsengine.Value) (messagePreprocessDecision, error) {
+	noOp := messagePreprocessDecision{action: messagePreprocessNoop}
+	if value == nil {
+		return noOp, nil
+	}
 	object := value.Object()
 	if object == nil {
 		primitive, err := value.ExportPrimitive()
-		if err != nil || primitive == nil {
-			return messagePreprocessDecision{action: messagePreprocessNoop}
+		if errors.Is(err, jsengine.ErrNoPrimitiveValue) || errors.Is(err, jsengine.ErrPrimitiveExportUnsupported) {
+			return noOp, nil
+		}
+		if err != nil {
+			return noOp, err
+		}
+		if primitive == nil {
+			return noOp, nil
 		}
 		text, ok := primitive.(string)
 		if !ok {
-			return messagePreprocessDecision{action: messagePreprocessNoop}
+			return noOp, nil
 		}
 		if text == "" {
-			return messagePreprocessDecision{action: messagePreprocessIntercept}
+			return messagePreprocessDecision{action: messagePreprocessIntercept}, nil
 		}
-		return messagePreprocessDecision{action: messagePreprocessRewrite, message: text}
+		return messagePreprocessDecision{action: messagePreprocessRewrite, message: text}, nil
 	}
 	if !object.Has("message") {
-		return messagePreprocessDecision{action: messagePreprocessNoop}
+		return noOp, nil
 	}
-
 	reason := ""
-	if reasonValue := object.Get("reason"); reasonValue != nil {
+	reasonValue, err := getEngineObjectProperty(object, "reason")
+	if err != nil {
+		return noOp, err
+	}
+	if reasonValue != nil {
 		if primitive, err := reasonValue.ExportPrimitive(); err == nil {
 			if text, ok := primitive.(string); ok {
 				reason = text
 			}
 		}
 	}
-
-	messageValue := object.Get("message")
+	messageValue, err := getEngineObjectProperty(object, "message")
+	if err != nil {
+		return noOp, err
+	}
 	if messageValue == nil {
-		return messagePreprocessDecision{action: messagePreprocessIntercept, reason: reason}
+		return messagePreprocessDecision{action: messagePreprocessIntercept, reason: reason}, nil
 	}
 	primitive, err := messageValue.ExportPrimitive()
 	if err == nil {
 		if text, ok := primitive.(string); ok {
 			if text == "" {
-				return messagePreprocessDecision{action: messagePreprocessIntercept, reason: reason}
+				return messagePreprocessDecision{action: messagePreprocessIntercept, reason: reason}, nil
 			}
-			return messagePreprocessDecision{action: messagePreprocessRewrite, message: text, reason: reason}
+			return messagePreprocessDecision{action: messagePreprocessRewrite, message: text, reason: reason}, nil
 		}
 		if primitive == nil || !messageValue.ToBoolean() {
-			return messagePreprocessDecision{action: messagePreprocessIntercept, reason: reason}
+			return messagePreprocessDecision{action: messagePreprocessIntercept, reason: reason}, nil
 		}
-		return messagePreprocessDecision{action: messagePreprocessNoop, reason: reason}
+		return messagePreprocessDecision{action: messagePreprocessNoop, reason: reason}, nil
 	}
 	if !messageValue.ToBoolean() {
-		return messagePreprocessDecision{action: messagePreprocessIntercept, reason: reason}
+		return messagePreprocessDecision{action: messagePreprocessIntercept, reason: reason}, nil
 	}
-	return messagePreprocessDecision{action: messagePreprocessNoop, reason: reason}
+	return messagePreprocessDecision{action: messagePreprocessNoop, reason: reason}, nil
+}
+
+func getEngineObjectProperty(object jsengine.Object, name string) (jsengine.Value, error) {
+	if fallible, ok := object.(jsengine.FallibleObject); ok {
+		return fallible.GetWithError(name)
+	}
+	return object.Get(name), nil
 }
 
 func cloneMessageForPreprocess(msg *Message) *Message {
@@ -411,130 +434,39 @@ func runEngineCallback(callback func() error) (err error) {
 // CallOnMessagePreprocess 调用 OnMessagePreprocess 回调（处理 wrapper 代理）。
 func (i *ExtInfo) CallOnMessagePreprocess(d *Dice, ctx *MsgContext, msg *Message) messagePreprocessDecision {
 	ext := i.GetRealExt()
-	var decision messagePreprocessDecision
-	if ext == nil || (ext.OnMessagePreprocess == nil && ext.OnMessagePreprocessEngine == nil) {
-		return messagePreprocessDecision{action: messagePreprocessNoop}
-	}
-	if ext.OnMessagePreprocessEngine != nil {
-		if d == nil || (ext.IsJsExt && !d.Config.JsEnable) {
-			if d != nil && d.Logger != nil {
-				d.Logger.Infof("当前已关闭js扩展<%v>", ext.Name)
-			}
-			return messagePreprocessDecision{action: messagePreprocessNoop}
-		}
-		if d.ExtLoopManager == nil {
-			if d.Logger != nil {
-				d.Logger.Errorf("扩展<%s>运行环境不可用", ext.Name)
-			}
-			return messagePreprocessDecision{action: messagePreprocessNoop}
-		}
-		loop, err := d.ExtLoopManager.GetLoop(ext.JSLoopVersion)
-		if err == nil && loop == nil {
-			err = errors.New("JavaScript runtime is unavailable")
-		}
-		if err != nil {
-			if d.Logger != nil {
-				d.Logger.Errorf("扩展<%s>运行环境已经过期: %v", ext.Name, err)
-			}
-			return messagePreprocessDecision{action: messagePreprocessNoop}
-		}
-		err = jsengine.RunWithContext(loop, jsContextForPlugin(ext), func(runtime jsengine.Runtime) error {
-			return runEngineCallback(func() error {
-				value, callErr := ext.OnMessagePreprocessEngine(runtime, ctx, cloneMessageForPreprocess(msg))
-				if callErr != nil {
-					return callErr
-				}
-				decision = parseMessagePreprocessEngineValue(value)
-				return nil
-			})
-		})
-		if err != nil && d.Logger != nil {
-			d.Logger.Errorf("扩展<%s>预处理异常: %v", ext.Name, err)
-		}
+	decision := messagePreprocessDecision{action: messagePreprocessNoop}
+	if ext == nil || !ext.HasOnMessagePreprocess() {
 		return decision
 	}
 
-	// Compatibility branch: legacy Goja callbacks expose goja.Value and cannot
-	// be invoked without the Goja adapter. Neutral callbacks above always win.
-	runLegacy := func(vm *goja.Runtime) {
-		decision = parseMessagePreprocessValue(vm, ext.OnMessagePreprocess(ctx, cloneMessageForPreprocess(msg)))
+	if !ext.IsJsExt && ext.OnMessagePreprocessEngine == nil && ext.OnMessagePreprocessCallback == nil {
+		return parseMessagePreprocessValue(nil, ext.OnMessagePreprocess(ctx, cloneMessageForPreprocess(msg)))
 	}
 
-	if ext.IsJsExt {
-		if d == nil || !d.Config.JsEnable {
-			if d != nil && d.Logger != nil {
-				d.Logger.Infof("当前已关闭js扩展<%v>", ext.Name)
-			}
-			return messagePreprocessDecision{action: messagePreprocessNoop}
+	var callback jsHookValueCallback
+	switch {
+	case ext.OnMessagePreprocessEngine != nil:
+		callback = func(runtime jsengine.Runtime) (jsengine.Value, error) {
+			return ext.OnMessagePreprocessEngine(runtime, ctx, cloneMessageForPreprocess(msg))
 		}
-		if d.ExtLoopManager == nil {
-			if d.Logger != nil {
-				d.Logger.Errorf("扩展<%s>运行环境不可用", ext.Name)
-			}
-			return messagePreprocessDecision{action: messagePreprocessNoop}
+	case ext.OnMessagePreprocessCallback != nil:
+		callback = func(jsengine.Runtime) (jsengine.Value, error) {
+			return ext.OnMessagePreprocessCallback(ctx, cloneMessageForPreprocess(msg))
 		}
-		loop, err := d.ExtLoopManager.GetLoop(ext.JSLoopVersion)
-		if err == nil && loop == nil {
-			err = errors.New("JavaScript runtime is unavailable")
-		}
-		if err != nil {
-			if d.Logger != nil {
-				d.Logger.Errorf("扩展<%s>运行环境已经过期: %v", ext.Name, err)
-			}
-			return messagePreprocessDecision{action: messagePreprocessNoop}
-		}
-		err = jsengine.RunWithContext(loop, jsContextForPlugin(ext), func(runtime jsengine.Runtime) error {
-			return runEngineCallback(func() error {
-				// Compatibility branch: only legacy Goja callbacks use Raw.
-				vm, ok := gojaengine.Raw(runtime)
-				if !ok {
-					return errors.New("legacy Goja message preprocess callback requires a Goja runtime")
-				}
-				runLegacy(vm)
-				return nil
-			})
-		})
-		if err != nil && d.Logger != nil {
-			d.Logger.Errorf("扩展<%s>预处理异常: %v", ext.Name, err)
-		}
-		return decision
+	case ext.OnMessagePreprocess != nil:
+		callback = selectJSHookValueCallback(
+			false,
+			nil,
+			true,
+			func() goja.Value { return ext.OnMessagePreprocess(ctx, cloneMessageForPreprocess(msg)) },
+		)
 	}
-
-	runLegacy(nil)
+	_ = ext.dispatchValueWithJsCheckFiltered(d, jsCallbackPreprocess, callbackEventIDForMessage(ctx, msg), false, callback, func(value jsengine.Value) error {
+		var err error
+		decision, err = parseMessagePreprocessEngineValueWithError(value)
+		return err
+	}, ctx, jsHookScopeExpired)
 	return decision
-}
-
-// CallOnMessageSend 调用 OnMessageSend 回调（处理 wrapper 代理）
-func (i *ExtInfo) CallOnMessageSend(d *Dice, ctx *MsgContext, msg *Message, flag string) {
-	ext := i.GetRealExt()
-	if ext == nil || ext.OnMessageSend == nil {
-		return
-	}
-	ext.notifyWithJsCheck(d, func() {
-		ext.OnMessageSend(ctx, msg, flag)
-	}, jsCallbackDispatch{kind: jsCallbackSend, providerEventID: callbackEventIDForMessage(ctx, msg)})
-}
-
-// CallOnMessageDeleted 调用 OnMessageDeleted 回调（处理 wrapper 代理）
-func (i *ExtInfo) CallOnMessageDeleted(d *Dice, ctx *MsgContext, msg *Message) {
-	ext := i.GetRealExt()
-	if ext == nil || ext.OnMessageDeleted == nil {
-		return
-	}
-	ext.callWithJsCheck(d, func() {
-		ext.OnMessageDeleted(ctx, msg)
-	})
-}
-
-// CallOnGroupLeave 调用 OnGroupLeave 回调（处理 wrapper 代理）
-func (i *ExtInfo) CallOnGroupLeave(d *Dice, ctx *MsgContext, event *events.GroupLeaveEvent) {
-	ext := i.GetRealExt()
-	if ext == nil || ext.OnGroupLeave == nil {
-		return
-	}
-	ext.callWithJsCheck(d, func() {
-		ext.OnGroupLeave(ctx, event)
-	})
 }
 
 // callWithJsCheck 保留旧行为：JS 扩展需要切回事件循环，避免并发问题。
@@ -552,11 +484,11 @@ func (i *ExtInfo) notifyWithJsCheck(d *Dice, f func(), details ...jsCallbackDisp
 
 func (i *ExtInfo) runWithJsCheck(d *Dice, f func(), schedule bool, details ...jsCallbackDispatch) {
 	if len(details) == 0 {
-		i.dispatchWithJsCheck(d, jsCallbackMessage, "", schedule, f)
+		i.dispatchWithJsCheck(d, jsCallbackMessage, "", schedule, f, nil)
 		return
 	}
 	detail := details[0]
-	i.dispatchWithJsCheck(d, detail.kind, detail.providerEventID, schedule, f)
+	i.dispatchWithJsCheck(d, detail.kind, detail.providerEventID, schedule, f, detail.message)
 }
 
 // StorageInit 与旧版一致：使用互斥锁确保只初始化一次。

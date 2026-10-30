@@ -22,6 +22,7 @@ const (
 )
 
 var _ PrivacyHistoryRepository = (*GORMStore)(nil)
+var _ PrivacySubjectKeyResolver = (*GORMStore)(nil)
 
 func privacyScopes(scopes []string) ([]string, error) {
 	if len(scopes) == 0 {
@@ -30,13 +31,13 @@ func privacyScopes(scopes []string) ([]string, error) {
 	seen := map[string]bool{}
 	for _, raw := range scopes {
 		scope := strings.TrimSpace(raw)
-		if scope != "group_record" && scope != "players" && scope != "attrs" {
+		if scope != "group_record" && scope != "players" && scope != "attrs" && scope != "logs" {
 			return nil, ErrInvalidMetadata
 		}
 		seen[scope] = true
 	}
 	out := make([]string, 0, len(seen))
-	for _, scope := range []string{"group_record", "players", "attrs"} {
+	for _, scope := range []string{"group_record", "players", "attrs", "logs"} {
 		if seen[scope] {
 			out = append(out, scope)
 		}
@@ -61,13 +62,15 @@ func privacySubjectKey(ctx context.Context, s *GORMStore, groupID string) ([]byt
 	return s.privacyHMAC(ctx, "privacy-subject/v1", groupID)
 }
 
-func (s *GORMStore) privacyHMAC(ctx context.Context, domain string, parts ...string) ([]byte, error) {
-	if s == nil || s.keySource == nil {
+// PrivacySubjectKey resolves the privacy-subject/v1 HMAC used by group
+// attribute events and privacy fences.
+func (s *GORMStore) PrivacySubjectKey(ctx context.Context, groupID string) ([]byte, error) {
+	return privacySubjectKey(ctx, s, groupID)
+}
+
+func privacyHMACWithMaterial(material []byte, domain string, parts ...string) ([]byte, error) {
+	if len(material) != sha256.Size {
 		return nil, ErrKeySourceUnavailable
-	}
-	_, material, err := keySourceIndex(ctx, s.keySource)
-	if err != nil {
-		return nil, err
 	}
 	mac := hmac.New(sha256.New, material)
 	mac.Write([]byte(domain))
@@ -77,8 +80,174 @@ func (s *GORMStore) privacyHMAC(ctx context.Context, domain string, parts ...str
 	return mac.Sum(nil), nil
 }
 
+func (s *GORMStore) privacyHMAC(ctx context.Context, domain string, parts ...string) ([]byte, error) {
+	if s == nil || s.keySource == nil {
+		return nil, ErrKeySourceUnavailable
+	}
+	_, material, err := keySourceIndex(ctx, s.keySource)
+	if err != nil {
+		return nil, err
+	}
+	return privacyHMACWithMaterial(material, domain, parts...)
+}
+
 func privacyLikePrefix(value string) string {
 	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(value) + `%`
+}
+
+func privacyDecodeAttributeSnapshot(row domainEventRow) (diceID, id, attrsType, secretRef string, ok bool) {
+	parts, valid := privacyDecodeParts(row.AggregateID, 2)
+	if !valid {
+		return "", "", "", "", false
+	}
+	var snapshot struct {
+		DiceID    string `json:"diceId"`
+		ID        string `json:"id"`
+		AttrsType string `json:"attrsType"`
+		SecretRef string `json:"secretRef"`
+	}
+	if err := json.Unmarshal(row.Payload, &snapshot); err != nil ||
+		snapshot.DiceID != parts[0] || snapshot.ID != parts[1] {
+		return "", "", "", "", false
+	}
+	return snapshot.DiceID, snapshot.ID, snapshot.AttrsType, snapshot.SecretRef, true
+}
+
+type privacyGroupUserPrefix struct {
+	group string
+	user  string
+}
+
+var privacyGroupUserPrefixes = [...]privacyGroupUserPrefix{
+	{"QQ-Group:", "QQ:"},
+	{"QQ-CH-Group:", "QQ-CH:"},
+	{"KOOK-CH-Group:", "KOOK:"},
+	{"DODO-Group:", "DODO:"},
+	{"TG-Group:", "TG:"},
+	{"DISCORD-CH-Group:", "DISCORD:"},
+	{"SEALCHAT-Group:", "SEALCHAT:"},
+	{"SLACK-CH-Group", "SLACK:"},
+	{"DINGTALK-Group", "DINGTALK:"},
+	{"OpenQQCH-Channel:", "OpenQQCH:"},
+	{"OpenQQ-Group-T:", "OpenQQ-Member-T:"},
+	{"UI-Group:", "UI:"},
+	{"PG-QQ:", "QQ:"},
+	{"PG-KOOK:", "KOOK:"},
+	{"PG-SEALCHAT:", "SEALCHAT:"},
+	{"PG-UI:", "UI:"},
+	{"PG-DISCORD:", "DISCORD:"},
+	{"PG-DODO:", "DODO:"},
+	{"PG-SLACK:", "SLACK:"},
+	{"PG-TG:", "TG:"},
+	{"PG-DINGTALK:", "DINGTALK:"},
+	{"PG-OpenQQCH:", "OpenQQCH:"},
+}
+
+var privacyDirectGroupPrefixes = [...]string{
+	"QQ-Group:", "QQ-CH-Group:", "KOOK-CH-Group:", "DODO-Group:",
+	"TG-Group:", "DISCORD-CH-Group:", "SEALCHAT-Group:", "UI-Group:",
+	"SLACK-CH-Group", "DINGTALK-Group", "OpenQQ-Group-T:",
+	"OpenQQCH-Channel:",
+	"PG-QQ:", "PG-KOOK:", "PG-SEALCHAT:", "PG-UI:", "PG-DISCORD:",
+	"PG-DODO:", "PG-SLACK:", "PG-TG:", "PG-DINGTALK:",
+	"PG-OpenQQCH:",
+}
+
+func privacyGroupUserOwner(id string) (string, bool) {
+	for _, prefix := range privacyGroupUserPrefixes {
+		if !strings.HasPrefix(id, prefix.group) {
+			continue
+		}
+		idx := strings.Index(id[len(prefix.group):], "-"+prefix.user)
+		if idx >= 0 {
+			return id[:len(prefix.group)+idx], true
+		}
+	}
+	return "", false
+}
+
+func privacyGroupAttributeIdentity(id, attrsType string) (groupID string, groupLike bool, scoped bool) {
+	if attrsType == "group_user" {
+		if groupID, ok := privacyGroupUserOwner(id); ok {
+			return groupID, true, true
+		}
+		return "", true, false
+	}
+	if groupID, ok := privacyGroupUserOwner(id); ok {
+		return groupID, true, true
+	}
+	for _, prefix := range privacyDirectGroupPrefixes {
+		if strings.HasPrefix(id, prefix) {
+			return id, true, true
+		}
+	}
+	if attrsType == "group" {
+		return id, true, true
+	}
+	return "", false, false
+}
+
+func privacyRecordSelection(row domainEventRow, req PrivacyDryRunRequest) (selected, ambiguous bool) {
+	if row.AggregateType != "attributes" {
+		return true, false
+	}
+	diceID, id, attrsType, _, ok := privacyDecodeAttributeSnapshot(row)
+	if !ok {
+		return false, false
+	}
+	matchedDice := false
+	for _, candidate := range req.DiceIDs {
+		if candidate == diceID {
+			matchedDice = true
+			break
+		}
+	}
+	if !matchedDice {
+		return false, false
+	}
+	groupID, groupLike, scoped := privacyGroupAttributeIdentity(id, attrsType)
+	if groupLike && scoped {
+		return groupID == req.GroupID, false
+	}
+	ambiguous = attrsType == "group_user" && groupLike && !scoped &&
+		(id == req.GroupID || strings.HasPrefix(id, req.GroupID+"-"))
+	return false, ambiguous
+}
+
+func privacyHasGroupAttrsPayload(row domainEventRow) bool {
+	if row.AggregateType != "attributes" {
+		return false
+	}
+	var snapshot struct {
+		AttrsType string `json:"attrsType"`
+	}
+	if err := json.Unmarshal(row.Payload, &snapshot); err != nil {
+		return false
+	}
+	return snapshot.AttrsType == "group" || snapshot.AttrsType == "group_user"
+}
+
+func privacyRejectUnkeyedGroupAttrs(ctx context.Context, tx *gorm.DB) error {
+	var fencedCount int64
+	if err := tx.WithContext(ctx).Model(&subjectFenceRow{}).Where("scope = ?", privacyFenceScope).Count(&fencedCount).Error; err != nil {
+		return ErrParticipantFailure
+	}
+	if fencedCount > 0 {
+		return ErrInvalidTransition
+	}
+	return nil
+}
+
+func privacyCheckSubjectFence(ctx context.Context, tx *gorm.DB, subjectKey []byte) error {
+	var row subjectFenceRow
+	err := tx.WithContext(ctx).Where("subject_key = ? AND scope = ?", subjectKey, privacyFenceScope).First(&row).Error
+	if err == nil {
+		return ErrInvalidTransition
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return ErrParticipantFailure
+	}
+	return nil
 }
 func privacyConditions(req PrivacyDryRunRequest) (string, []any, error) {
 	scopes, err := privacyScopes(req.Scopes)
@@ -90,7 +259,7 @@ func privacyConditions(req PrivacyDryRunRequest) (string, []any, error) {
 	}
 	dice := append([]string(nil), req.DiceIDs...)
 	sort.Strings(dice)
-	clauses, args := make([]string, 0, len(scopes)*len(dice)), make([]any, 0, len(scopes)*len(dice)*2)
+	clauses, args := make([]string, 0, len(scopes)*len(dice)*2), make([]any, 0, len(scopes)*len(dice)*4)
 	for _, d := range dice {
 		if strings.TrimSpace(d) == "" {
 			return "", nil, ErrInvalidMetadata
@@ -107,10 +276,17 @@ func privacyConditions(req PrivacyDryRunRequest) (string, []any, error) {
 			case "attrs":
 				clauses = append(clauses, "((aggregate_type = ? OR aggregate_type = ?) AND (aggregate_id = ? OR aggregate_id LIKE ? ESCAPE '\\'))")
 				args = append(args, "attrs/group", "attrs/group-user", groupID, privacyLikePrefix(privacyCanonical(d, req.GroupID)))
+				clauses = append(clauses, "(aggregate_type = ? AND aggregate_id LIKE ? ESCAPE '\\')")
+				args = append(args, "attributes", privacyLikePrefix(privacyCanonical(d)))
+			case "logs":
+				// Story-log rows are selected through keyed scope indexes.
 			}
 		}
 	}
-	return strings.Join(clauses, " OR "), args, nil
+	if len(clauses) == 0 {
+		return "1 = 0", nil, nil
+	}
+	return "(" + strings.Join(clauses, " OR ") + ")", args, nil
 }
 
 func (s *GORMStore) PrivacyDryRun(ctx context.Context, req PrivacyDryRunRequest) (PrivacyDryRunResult, error) {
@@ -123,14 +299,14 @@ func (s *GORMStore) PrivacyDryRun(ctx context.Context, req PrivacyDryRunRequest)
 	if err := s.requireReady(ctx); err != nil {
 		return PrivacyDryRunResult{}, err
 	}
-	scopes, err := privacyScopes(req.Scopes)
-	if err != nil {
-		return PrivacyDryRunResult{}, err
+	scopes, queryErr := privacyScopes(req.Scopes)
+	if queryErr != nil {
+		return PrivacyDryRunResult{}, queryErr
 	}
 	req.Scopes = scopes
-	condition, args, err := privacyConditions(req)
-	if err != nil {
-		return PrivacyDryRunResult{}, err
+	condition, args, queryErr := privacyConditions(req)
+	if queryErr != nil {
+		return PrivacyDryRunResult{}, queryErr
 	}
 	counts := PrivacyCounts{}
 	var maxPosition, cursor uint64
@@ -142,6 +318,13 @@ func (s *GORMStore) PrivacyDryRun(ctx context.Context, req PrivacyDryRunRequest)
 			return PrivacyDryRunResult{}, ErrParticipantFailure
 		}
 		for _, row := range rows {
+			selected, ambiguous := privacyRecordSelection(row, req)
+			if ambiguous {
+				return PrivacyDryRunResult{}, ErrInvalidMetadata
+			}
+			if !selected {
+				continue
+			}
 			if row.GlobalPosition > maxPosition {
 				maxPosition = row.GlobalPosition
 			}
@@ -155,7 +338,7 @@ func (s *GORMStore) PrivacyDryRun(ctx context.Context, req PrivacyDryRunRequest)
 				counts.GroupRecord++
 			case "player":
 				counts.Players++
-			case "attrs/group", "attrs/group-user":
+			case "attrs/group", "attrs/group-user", "attributes":
 				counts.Attrs++
 			}
 		}
@@ -164,23 +347,34 @@ func (s *GORMStore) PrivacyDryRun(ctx context.Context, req PrivacyDryRunRequest)
 		}
 		cursor = rows[len(rows)-1].GlobalPosition
 	}
+	if privacyHasLogScope(scopes) {
+		selection, err := s.privacyLogArchiveSelection(ctx, req.GroupID, req.DiceIDs)
+		if err != nil {
+			return PrivacyDryRunResult{}, err
+		}
+		if err := privacyWriteStoryLogArchiveDigest(ctx, s.db.GORM(), selection, dataHash, &counts); err != nil {
+			return PrivacyDryRunResult{}, err
+		}
+	}
 	active := append([]string(nil), req.ActiveDiceIDs...)
 	sort.Strings(active)
-	canonical := fmt.Sprintf("privacy-dry-run/v1|%s|%s|%d|%d|%d|%d|%x|active=%t|%s", req.GroupID, strings.Join(scopes, ","), maxPosition, counts.GroupRecord, counts.Players, counts.Attrs, dataHash.Sum(nil), req.ActiveDiceIDs != nil, strings.Join(active, ","))
+	canonical := fmt.Sprintf("privacy-dry-run/v2|%s|%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%x|active=%t|%s", req.GroupID, strings.Join(scopes, ","), maxPosition, counts.GroupRecord, counts.Players, counts.Attrs, counts.LogSessions, counts.LogStates, counts.LogEntries, counts.LogIntents, counts.LogImports, dataHash.Sum(nil), req.ActiveDiceIDs != nil, strings.Join(active, ","))
+	var canonicalSb170 strings.Builder
 	for _, d := range append([]string(nil), req.DiceIDs...) {
-		canonical += "|" + d
+		canonicalSb170.WriteString("|" + d)
 	}
-	digest, err := s.privacyHMAC(ctx, "privacy-confirmation/v1", canonical)
-	if err != nil {
-		return PrivacyDryRunResult{}, err
+	canonical += canonicalSb170.String()
+	digest, queryErr := s.privacyHMAC(ctx, "privacy-confirmation/v1", canonical)
+	if queryErr != nil {
+		return PrivacyDryRunResult{}, queryErr
 	}
-	keyID, _, err := keySourceIndex(ctx, s.keySource)
-	if err != nil {
-		return PrivacyDryRunResult{}, err
+	keyID, _, queryErr := keySourceIndex(ctx, s.keySource)
+	if queryErr != nil {
+		return PrivacyDryRunResult{}, queryErr
 	}
-	subjectKey, err := privacySubjectKey(ctx, s, req.GroupID)
-	if err != nil {
-		return PrivacyDryRunResult{}, err
+	subjectKey, queryErr := privacySubjectKey(ctx, s, req.GroupID)
+	if queryErr != nil {
+		return PrivacyDryRunResult{}, queryErr
 	}
 	var sequence eventGlobalSequenceRow
 	if err := s.db.GORM().WithContext(ctx).Where("singleton_id = ?", "default").First(&sequence).Error; err != nil {
@@ -190,7 +384,12 @@ func (s *GORMStore) PrivacyDryRun(ctx context.Context, req PrivacyDryRunRequest)
 	if sequence.NextPosition > 0 {
 		targetHighWater = sequence.NextPosition - 1
 	}
-	return PrivacyDryRunResult{Version: maxPosition, TargetHighWater: targetHighWater, Digest: digest, DigestKeyID: keyID, SubjectKey: subjectKey, Counts: counts, ActiveDiceIDs: active, Uncovered: []string{"legacy GroupInfo", "legacy GroupPlayerInfo", "legacy group/attrs tables", "moderation", "encrypted plugin KV", "logs", "user-global characters", "external stores", "backups"}}, nil
+	uncovered := []string{"legacy GroupInfo", "legacy GroupPlayerInfo", "legacy group/attrs tables", "moderation", "encrypted plugin KV"}
+	if !privacyHasLogScope(scopes) {
+		uncovered = append(uncovered, "logs")
+	}
+	uncovered = append(uncovered, "user-global characters", "external stores", "backups")
+	return PrivacyDryRunResult{Version: maxPosition, TargetHighWater: targetHighWater, Digest: digest, DigestKeyID: keyID, SubjectKey: subjectKey, Counts: counts, ActiveDiceIDs: active, Uncovered: uncovered}, nil
 }
 
 func marshalPrivacyContext(v PrivacyOperationContext) ([]byte, error) { return json.Marshal(v) }
@@ -422,6 +621,16 @@ func (s *GORMStore) PrivacyResolvePending(ctx context.Context, subjectKey []byte
 			return ErrParticipantConflict
 		}
 	}
+	refs := make([]queueLaneRef, 0, len(inboxRows)+len(outboxRows))
+	for _, row := range inboxRows {
+		refs = append(refs, queueLaneRef{kind: inboxLaneKind, lane: row.LaneHMAC})
+	}
+	for _, row := range outboxRows {
+		refs = append(refs, queueLaneRef{kind: outboxLaneKind, lane: row.LaneHMAC})
+	}
+	if err := refreshQueueLaneRefs(tx, refs, now); err != nil {
+		return ErrParticipantFailure
+	}
 	if err := tx.Commit().Error; err != nil {
 		return ErrParticipantFailure
 	}
@@ -465,8 +674,23 @@ func (s *GORMStore) PrivacyDeleteBatch(ctx context.Context, req PrivacyBatchRequ
 	if req.Cursor != private.Cursor {
 		return PrivacyBatchResult{}, ErrParticipantConflict
 	}
+	archiveCursor, archiveStage, err := decodePrivacyLogArchiveCursor(req.Cursor)
+	if err != nil {
+		return PrivacyBatchResult{}, err
+	}
+	logsSelected := privacyHasLogScope(canonicalScopes)
+	if archiveStage && !logsSelected {
+		return PrivacyBatchResult{}, ErrInvalidMetadata
+	}
+	var archiveSelection privacyLogArchiveSelection
+	if logsSelected {
+		archiveSelection, err = s.privacyLogArchiveSelection(ctx, req.GroupID, req.DiceIDs)
+		if err != nil {
+			return PrivacyBatchResult{}, err
+		}
+	}
 	cursor := uint64(0)
-	if strings.TrimSpace(req.Cursor) != "" {
+	if !archiveStage && strings.TrimSpace(req.Cursor) != "" {
 		cursor, err = strconv.ParseUint(req.Cursor, 10, 64)
 		if err != nil {
 			return PrivacyBatchResult{}, ErrInvalidMetadata
@@ -477,8 +701,9 @@ func (s *GORMStore) PrivacyDeleteBatch(ctx context.Context, req PrivacyBatchRequ
 	if pageLimit < 1 {
 		pageLimit = 1
 	}
-	pageCursor, sourceDone := cursor, false
+	pageCursor, sourceDone := cursor, archiveStage
 	totalBytes := 0
+	selection := PrivacyDryRunRequest{GroupID: req.GroupID, DiceIDs: req.DiceIDs}
 	for len(rows) < req.Limit && !sourceDone {
 		var page []domainEventRow
 		q := s.db.GORM().WithContext(ctx).Select("event_id", "aggregate_type", "aggregate_id", "global_position", "payload").Where(cond+" AND global_position > ?", append(args, pageCursor)...).Order("global_position ASC").Limit(pageLimit).Find(&page)
@@ -489,9 +714,19 @@ func (s *GORMStore) PrivacyDeleteBatch(ctx context.Context, req PrivacyBatchRequ
 			sourceDone = true
 			break
 		}
-		consumed := 0
+		consumed, stopped := 0, false
 		for _, row := range page {
+			selected, ambiguous := privacyRecordSelection(row, selection)
+			if ambiguous {
+				return PrivacyBatchResult{}, ErrInvalidMetadata
+			}
+			if !selected {
+				pageCursor = row.GlobalPosition
+				consumed++
+				continue
+			}
 			if len(rows) > 0 && totalBytes+len(row.Payload) > PrivacyBatchBytes {
+				stopped = true
 				break
 			}
 			rows = append(rows, row)
@@ -499,38 +734,46 @@ func (s *GORMStore) PrivacyDeleteBatch(ctx context.Context, req PrivacyBatchRequ
 			pageCursor = row.GlobalPosition
 			consumed++
 			if len(rows) == req.Limit {
+				stopped = true
 				break
 			}
 		}
+		if stopped {
+			sourceDone = len(page) < pageLimit && consumed == len(page)
+			break
+		}
 		sourceDone = len(page) < pageLimit && consumed == len(page)
-		if consumed < len(page) || totalBytes >= PrivacyBatchBytes {
+		if consumed < len(page) {
 			sourceDone = false
 			break
 		}
-		if len(rows) == 0 {
-			rows = append(rows, page[0])
-			pageCursor = page[0].GlobalPosition
-			totalBytes = len(page[0].Payload)
-		}
 	}
 	if len(rows) == 0 {
-		return PrivacyBatchResult{NextCursor: req.Cursor, Done: true}, nil
+		if sourceDone && logsSelected {
+			if !archiveStage {
+				archiveCursor = privacyLogArchiveCursor{Table: privacyLogSessionsTable}
+			}
+			return s.privacyDeleteLogArchiveBatch(ctx, req, subjectKey, fenceVersion, opView, private, archiveSelection, archiveCursor, req.Limit)
+		}
+		nextCursor := req.Cursor
+		if pageCursor != cursor {
+			nextCursor = strconv.FormatUint(pageCursor, 10)
+		}
+		return PrivacyBatchResult{NextCursor: nextCursor, Done: sourceDone}, nil
 	}
 	selected := rows
 	ids := make([]string, len(selected))
+	tombstones := make([]eventTombstoneRow, len(selected))
 	counts := PrivacyCounts{}
-	last := uint64(0)
 	for i, row := range selected {
 		ids[i] = row.EventID
-		if row.GlobalPosition > last {
-			last = row.GlobalPosition
-		}
+		tombstones[i].GlobalPosition = row.GlobalPosition
 		switch row.AggregateType {
 		case "group":
 			counts.GroupRecord++
 		case "player":
 			counts.Players++
-		case "attrs/group", "attrs/group-user":
+		case "attrs/group", "attrs/group-user", "attributes":
 			counts.Attrs++
 		}
 	}
@@ -567,28 +810,66 @@ func (s *GORMStore) PrivacyDeleteBatch(ctx context.Context, req PrivacyBatchRequ
 	if req.Phase != "delete" {
 		return PrivacyBatchResult{}, ErrInvalidTransition
 	}
-	if err := tx.Where("event_id IN ?", ids).Delete(&domainEventRow{}).Error; err != nil {
+	var control projectionControlRow
+	if err := tx.Where("singleton_id = ?", "default").First(&control).Error; err != nil {
 		return PrivacyBatchResult{}, ErrParticipantFailure
 	}
-	// Remove heads and read-model references for streams whose final history was selected.
+	revision, err := nextVersion(control.HistoryRevision)
+	if err != nil {
+		return PrivacyBatchResult{}, err
+	}
+	deleted := tx.Where("event_id IN ?", ids).Delete(&domainEventRow{})
+	if deleted.Error != nil {
+		return PrivacyBatchResult{}, ErrParticipantFailure
+	}
+	if deleted.RowsAffected != int64(len(selected)) {
+		return PrivacyBatchResult{}, ErrParticipantConflict
+	}
+	if err := tx.Create(&tombstones).Error; err != nil {
+		return PrivacyBatchResult{}, ErrParticipantFailure
+	}
+	if err := tx.Model(&projectionControlRow{}).Where("singleton_id = ?", "default").Update("history_revision", revision).Error; err != nil {
+		return PrivacyBatchResult{}, ErrParticipantFailure
+	}
+	// Remove heads, read models, and attribute secrets only after the final
+	// event for a selected stream has been removed.
 	for _, row := range selected {
 		var left int64
 		if err := tx.Model(&domainEventRow{}).Where("aggregate_type = ? AND aggregate_id = ?", row.AggregateType, row.AggregateID).Count(&left).Error; err != nil {
 			return PrivacyBatchResult{}, ErrParticipantFailure
 		}
-		if left == 0 {
-			if err := tx.Where("aggregate_type = ? AND aggregate_id = ?", row.AggregateType, row.AggregateID).Delete(&aggregateHeadRow{}).Error; err != nil {
-				return PrivacyBatchResult{}, ErrParticipantFailure
-			}
+		if left != 0 {
+			continue
 		}
-		if err := tx.Where("row_key = ?", row.AggregateID).Delete(&projectionReadModelRow{}).Error; err != nil {
+		if err := tx.Where("aggregate_type = ? AND aggregate_id = ?", row.AggregateType, row.AggregateID).Delete(&aggregateHeadRow{}).Error; err != nil {
 			return PrivacyBatchResult{}, ErrParticipantFailure
+		}
+		projections := tx.Where("row_key = ?", row.AggregateID)
+		if row.AggregateType == "attributes" {
+			projections = projections.Where("projection_name = ?", "attributes")
+		}
+		if err := projections.Delete(&projectionReadModelRow{}).Error; err != nil {
+			return PrivacyBatchResult{}, ErrParticipantFailure
+		}
+		if row.AggregateType == "attributes" {
+			_, id, _, secretRef, ok := privacyDecodeAttributeSnapshot(row)
+			if ok && secretRef != "" {
+				if err := tx.Where("secret_ref = ? AND endpoint_id = ? AND adapter_id = ?", secretRef, id, "attributes").Delete(&adapterSecretRow{}).Error; err != nil {
+					return PrivacyBatchResult{}, ErrParticipantFailure
+				}
+			}
 		}
 	}
 	if err := tx.Commit().Error; err != nil {
 		return PrivacyBatchResult{}, ErrParticipantFailure
 	}
-	return PrivacyBatchResult{NextCursor: strconv.FormatUint(last, 10), Deleted: counts, Done: sourceDone}, nil
+	nextCursor := strconv.FormatUint(pageCursor, 10)
+	done := sourceDone
+	if sourceDone && logsSelected {
+		nextCursor = encodePrivacyLogArchiveCursor(privacyLogArchiveCursor{Table: privacyLogSessionsTable})
+		done = false
+	}
+	return PrivacyBatchResult{NextCursor: nextCursor, Deleted: counts, Done: done}, nil
 }
 
 func (s *GORMStore) PrivacyRebuildPublish(ctx context.Context, targetHighWater uint64) error {
@@ -605,74 +886,55 @@ func (s *GORMStore) PrivacyRebuildPublish(ctx context.Context, targetHighWater u
 	if len(projectors) == 0 {
 		return ErrInvalidProjector
 	}
-	generation := fmt.Sprintf("privacy-%d", s.task5Now().UnixNano())
-	if len(projectors) > 0 {
-		var cursor uint64
-		for {
-			var rows []domainEventRow
-			if err := s.db.GORM().WithContext(ctx).Where("global_position > ?", cursor).Order("global_position ASC").Limit(projectionPageSize).Find(&rows).Error; err != nil {
-				return ErrParticipantFailure
-			}
-			if len(rows) == 0 {
-				break
-			}
-			if err := s.applyProjectionPage(ctx, generation, rows, projectors); err != nil {
-				return err
-			}
-			cursor = rows[len(rows)-1].GlobalPosition
+	base := s.db.GORM().WithContext(ctx)
+	var source projectionControlRow
+	if err := base.Where("singleton_id = ?", "default").First(&source).Error; err != nil {
+		return ErrParticipantFailure
+	}
+	highWater, err := s.highWater(ctx)
+	if err != nil {
+		return err
+	}
+	if highWater != targetHighWater {
+		return ErrParticipantConflict
+	}
+	generation, err := (UUIDGenerator{}).NewID()
+	if err != nil {
+		return ErrParticipantFailure
+	}
+	var cursor uint64
+	for cursor < targetHighWater {
+		rows, err := loadProjectionEventPage(base, cursor, targetHighWater)
+		if err != nil {
+			return err
 		}
-		s.projectorMu.RLock()
-		defer s.projectorMu.RUnlock()
-		tx := s.db.GORM().WithContext(ctx).Begin()
-		if tx.Error != nil {
-			return ErrParticipantFailure
+		next, err := validateProjectionPage(base, rows, cursor, targetHighWater)
+		if err != nil {
+			return err
 		}
-		defer tx.Rollback()
-		if err := s.lockMutationPublication(ctx, tx); err != nil {
-			return ErrReadinessQuarantined
+		if err := s.applyProjectionPage(ctx, generation, &source, rows, projectors); err != nil {
+			return err
 		}
-		if err := validateProjectionRows(tx, generation); err != nil {
-			return ErrProjectionInvariant
-		}
-		if _, err := digestProjectionRows(tx, generation); err != nil {
-			return ErrProjectionInvariant
-		}
-		liveSetVersion := projectorSetVersion(s.projectors)
-		if liveSetVersion != setVersion {
-			return ErrParticipantConflict
-		}
-		var sequence eventGlobalSequenceRow
-		if err := tx.Where("singleton_id = ?", "default").First(&sequence).Error; err != nil {
-			return ErrParticipantFailure
-		}
-		current := uint64(0)
-		if sequence.NextPosition > 0 {
-			current = sequence.NextPosition - 1
-		}
-		if current != targetHighWater {
-			return ErrParticipantConflict
-		}
-		latest := targetHighWater
-		if err := tx.Where("projection_generation <> ?", generation).Delete(&projectionReadModelRow{}).Error; err != nil {
-			return ErrParticipantFailure
-		}
-		if err := tx.Model(&projectionControlRow{}).Where("singleton_id = ?", "default").Updates(map[string]any{"active_generation": generation, "terminal_position": latest, "projector_set_version": setVersion, "publication_state": "published", "updated_at": s.task5Now()}).Error; err != nil {
-			return ErrParticipantFailure
-		}
-		if err := tx.Commit().Error; err != nil {
-			return ErrParticipantFailure
-		}
-		return nil
+		cursor = next
 	}
 	s.projectorMu.RLock()
 	defer s.projectorMu.RUnlock()
-	tx := s.db.GORM().WithContext(ctx).Begin()
+	tx := base.Begin()
 	if tx.Error != nil {
 		return ErrParticipantFailure
 	}
 	defer tx.Rollback()
 	if err := s.lockMutationPublication(ctx, tx); err != nil {
-		return ErrReadinessQuarantined
+		return err
+	}
+	if err := validateProjectionSource(tx, &source); err != nil {
+		return err
+	}
+	if err := validateProjectionRows(tx, generation); err != nil {
+		return ErrProjectionInvariant
+	}
+	if _, err := digestProjectionRows(tx, generation); err != nil {
+		return ErrProjectionInvariant
 	}
 	liveSetVersion := projectorSetVersion(s.projectors)
 	if liveSetVersion != setVersion {
@@ -682,17 +944,17 @@ func (s *GORMStore) PrivacyRebuildPublish(ctx context.Context, targetHighWater u
 	if err := tx.Where("singleton_id = ?", "default").First(&sequence).Error; err != nil {
 		return ErrParticipantFailure
 	}
-	latest := uint64(0)
+	current := uint64(0)
 	if sequence.NextPosition > 0 {
-		latest = sequence.NextPosition - 1
+		current = sequence.NextPosition - 1
 	}
-	if latest != targetHighWater {
+	if current != targetHighWater {
 		return ErrParticipantConflict
 	}
 	if err := tx.Where("projection_generation <> ?", generation).Delete(&projectionReadModelRow{}).Error; err != nil {
 		return ErrParticipantFailure
 	}
-	if err := tx.Model(&projectionControlRow{}).Where("singleton_id = ?", "default").Updates(map[string]any{"active_generation": generation, "terminal_position": latest, "publication_state": "published", "updated_at": s.task5Now()}).Error; err != nil {
+	if err := tx.Model(&projectionControlRow{}).Where("singleton_id = ?", "default").Updates(map[string]any{"active_generation": generation, "terminal_position": cursor, "projector_set_version": setVersion, "publication_state": "published", "updated_at": s.task5Now()}).Error; err != nil {
 		return ErrParticipantFailure
 	}
 	if err := tx.Commit().Error; err != nil {
@@ -733,10 +995,64 @@ func privacyStreamGroupID(stream StreamID) string {
 }
 
 func (s *GORMStore) privacyRejectFencedStreams(ctx context.Context, tx *gorm.DB, streams []StreamAppend) error {
-	if s == nil || s.keySource == nil {
+	if s == nil {
 		return nil
 	}
 	for _, appendStream := range streams {
+		if appendStream.Stream.AggregateType == "attributes" {
+			for _, event := range appendStream.Events {
+				row := domainEventRow{
+					AggregateType: appendStream.Stream.AggregateType,
+					AggregateID:   appendStream.Stream.AggregateID,
+					Payload:       event.Payload,
+				}
+				_, id, attrsType, _, valid := privacyDecodeAttributeSnapshot(row)
+				groupID, groupLike, scoped := privacyGroupAttributeIdentity(id, attrsType)
+				if valid && groupLike {
+					if !scoped {
+						if len(event.Metadata.SubjectKey) > 0 {
+							return ErrInvalidMetadata
+						}
+						if err := privacyRejectUnkeyedGroupAttrs(ctx, tx); err != nil {
+							return err
+						}
+						continue
+					}
+					switch len(event.Metadata.SubjectKey) {
+					case 0:
+						if err := privacyRejectUnkeyedGroupAttrs(ctx, tx); err != nil {
+							return err
+						}
+					case sha256.Size:
+						subjectKey, err := privacySubjectKey(ctx, s, groupID)
+						if err != nil {
+							return err
+						}
+						if !hmac.Equal(event.Metadata.SubjectKey, subjectKey) {
+							return ErrInvalidMetadata
+						}
+						if err := privacyCheckSubjectFence(ctx, tx, subjectKey); err != nil {
+							return err
+						}
+					default:
+						return ErrInvalidMetadata
+					}
+					continue
+				}
+				if len(event.Metadata.SubjectKey) > 0 {
+					return ErrInvalidMetadata
+				}
+				if privacyHasGroupAttrsPayload(row) {
+					if err := privacyRejectUnkeyedGroupAttrs(ctx, tx); err != nil {
+						return err
+					}
+				}
+			}
+			continue
+		}
+		if s.keySource == nil {
+			continue
+		}
 		if appendStream.Stream.AggregateType == "outbound-effect" {
 			for _, event := range appendStream.Events {
 				if len(event.Metadata.SubjectKey) != sha256.Size {
@@ -749,13 +1065,8 @@ func (s *GORMStore) privacyRejectFencedStreams(ctx context.Context, tx *gorm.DB,
 					}
 					continue
 				}
-				var fenced subjectFenceRow
-				err := tx.Where("subject_key = ? AND scope = ?", event.Metadata.SubjectKey, privacyFenceScope).First(&fenced).Error
-				if err == nil {
-					return ErrInvalidTransition
-				}
-				if !errors.Is(err, gorm.ErrRecordNotFound) {
-					return ErrParticipantFailure
+				if err := privacyCheckSubjectFence(ctx, tx, event.Metadata.SubjectKey); err != nil {
+					return err
 				}
 			}
 		}
@@ -767,13 +1078,8 @@ func (s *GORMStore) privacyRejectFencedStreams(ctx context.Context, tx *gorm.DB,
 		if err != nil {
 			return err
 		}
-		var row subjectFenceRow
-		queryErr := tx.Where("subject_key = ? AND scope = ?", subject, privacyFenceScope).First(&row).Error
-		if queryErr == nil {
-			return ErrInvalidTransition
-		}
-		if !errors.Is(queryErr, gorm.ErrRecordNotFound) {
-			return ErrParticipantFailure
+		if err := privacyCheckSubjectFence(ctx, tx, subject); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -822,30 +1128,30 @@ func (s *GORMStore) privacyRejectFencedEffects(ctx context.Context, tx *gorm.DB,
 }
 
 func (s *GORMStore) PrivacyFinalizeOperation(ctx context.Context, operationID string, expected uint64, status string) (uint64, error) {
-	next, err := nextVersion(expected)
-	if err != nil {
-		return 0, err
+	next, lookupErr := nextVersion(expected)
+	if lookupErr != nil {
+		return 0, lookupErr
 	}
 	var row operationRow
 	if err := s.db.GORM().WithContext(ctx).Where("operation_id = ? AND version = ?", operationID, expected).First(&row).Error; err != nil {
 		return 0, ErrParticipantConflict
 	}
-	plain, err := a6Open(ctx, s.keySource, "operation-private/v1", operationID, row.PrincipalID, row.Version, row.PrivateKeyID, row.PrivateContext, row.PrivateNonce)
-	if err != nil {
-		return 0, err
+	plain, lookupErr := a6Open(ctx, s.keySource, "operation-private/v1", operationID, row.PrincipalID, row.Version, row.PrivateKeyID, row.PrivateContext, row.PrivateNonce)
+	if lookupErr != nil {
+		return 0, lookupErr
 	}
-	private, err := unmarshalPrivacyContext(plain)
-	if err != nil {
-		return 0, err
+	private, lookupErr := unmarshalPrivacyContext(plain)
+	if lookupErr != nil {
+		return 0, lookupErr
 	}
-	fenceKey, err := privacySubjectKey(ctx, s, private.GroupID)
-	if err != nil {
-		return 0, err
+	fenceKey, lookupErr := privacySubjectKey(ctx, s, private.GroupID)
+	if lookupErr != nil {
+		return 0, lookupErr
 	}
 	opDigest := sha256.Sum256([]byte(operationID))
 	scopesDigest := sha256.Sum256([]byte(strings.Join(private.Scopes, ",")))
 	requestDigest := append([]byte(nil), private.ConfirmationDigest...)
-	audit := privacyAuditRow{AuditID: hexBytes(opDigest[:]), OperationDigest: opDigest[:], ScopesDigest: scopesDigest[:], RequestDigest: requestDigest, GroupRecord: private.Counts.GroupRecord, Players: private.Counts.Players, Attrs: private.Counts.Attrs, Status: status, CreatedAt: s.task5Now()}
+	audit := privacyAuditRow{AuditID: hexBytes(opDigest[:]), OperationDigest: opDigest[:], ScopesDigest: scopesDigest[:], RequestDigest: requestDigest, GroupRecord: private.Counts.GroupRecord, Players: private.Counts.Players, Attrs: private.Counts.Attrs, LogSessions: private.Counts.LogSessions, LogStates: private.Counts.LogStates, LogEntries: private.Counts.LogEntries, LogIntents: private.Counts.LogIntents, LogImports: private.Counts.LogImports, Status: status, CreatedAt: s.task5Now()}
 	tx := s.db.GORM().WithContext(ctx).Begin()
 	if tx.Error != nil {
 		return 0, ErrParticipantFailure
@@ -871,7 +1177,7 @@ func (s *GORMStore) PrivacyFinalizeOperation(ctx context.Context, operationID st
 	if fence.PurgeOperationID != operationID {
 		return 0, ErrAuthenticationFailed
 	}
-	if err := tx.Exec(`CREATE TABLE IF NOT EXISTS privacy_purge_audit (audit_id VARCHAR(64) PRIMARY KEY, operation_digest BLOB NOT NULL, scopes_digest BLOB NOT NULL, request_digest BLOB NOT NULL, group_record INTEGER NOT NULL, players INTEGER NOT NULL, attrs INTEGER NOT NULL, status VARCHAR(32) NOT NULL, created_at DATETIME NOT NULL)`).Error; err != nil {
+	if err := tx.Exec(`CREATE TABLE IF NOT EXISTS privacy_purge_audit (audit_id VARCHAR(64) PRIMARY KEY, operation_digest BLOB NOT NULL, scopes_digest BLOB NOT NULL, request_digest BLOB NOT NULL, group_record INTEGER NOT NULL, players INTEGER NOT NULL, attrs INTEGER NOT NULL, log_sessions INTEGER NOT NULL DEFAULT 0, log_states INTEGER NOT NULL DEFAULT 0, log_entries INTEGER NOT NULL DEFAULT 0, log_intents INTEGER NOT NULL DEFAULT 0, log_imports INTEGER NOT NULL DEFAULT 0, status VARCHAR(32) NOT NULL, created_at DATETIME NOT NULL)`).Error; err != nil {
 		return 0, ErrParticipantFailure
 	}
 	if err := tx.Create(&audit).Error; err != nil {

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,6 +31,7 @@ import (
 	"Scardice-core/utils"
 	"Scardice-core/utils/crypto"
 	"Scardice-core/utils/jsengine"
+	"Scardice-core/utils/jsengine/services"
 )
 
 var (
@@ -180,7 +182,7 @@ var sealInstMemberDescriptions = map[string]string{
 	"TextMapCompatible":              "文本模板兼容层映射。",
 	"ConfigManager":                  "插件配置管理器。",
 	"Parent":                         "所属 DiceManager 实例。",
-	"CocExtraRules":                  "COC 额外规则映射。",
+	"CocExtraRulesSnapshot":          "COC 额外规则元数据快照。",
 	"Cron":                           "核心 cron 调度器。",
 	"AliveNoticeEntry":               "存活通知任务的 cron 条目 ID。",
 	"JsPrinter":                      "JS 控制台输出记录器。",
@@ -256,7 +258,7 @@ var sealInstMemberDescriptions = map[string]string{
 	"Save":                          "将当前配置和高级配置落盘保存。",
 	"CanSendMail":                   "检查邮件配置是否完整可用。",
 	"SendMail":                      "按当前邮件配置发送通知邮件。",
-	"SendMailRow":                   "直接发送邮件，可指定主题、收件人、正文和附件。",
+	"SendMailRow":                   "直接发送邮件，可指定主题、收件人、正文和附件，并返回投递错误。",
 	"GetBanList":                    "获取当前黑名单/信任列表。",
 	"NewCensorManager":              "初始化敏感词审查管理器。",
 	"CensorMsg":                     "执行一条消息的敏感词审查。",
@@ -319,27 +321,37 @@ func (d *Dice) initializeJSLoop(loop jsengine.Loop, versionID int64) error {
 }
 
 func (d *Dice) JsInit() {
+	if d == nil || !d.beginStartupJsLoad() {
+		return
+	}
+	defer d.finishStartupJsLoad()
+	d.jsInit()
+}
+
+func (d *Dice) jsInit() {
 	engine := d.configuredJSEngine()
 	if d.ExtLoopManager == nil {
 		d.ExtLoopManager = NewJsLoopManager()
 	}
+	d.ExtLoopManager.SetShutdownHook(d.stopJSScriptCron)
+	d.stopJSScriptCron()
 	d.jsClear()
 	if d.JsPrinter == nil {
 		d.JsPrinter = &PrinterFunc{d: d, isRecord: false, recorder: []string{}}
 	}
 
-	options, err := BuildRuntimeOptionsForEngine(engine, d.Config.JsConfig)
+	options, err := d.runtimeOptionsForEngine(engine)
 	if err != nil {
 		d.disableJSRuntime(err)
 		return
 	}
-	loop, err := d.jsRuntimeManagerInstance().Resolve(context.Background(), engine, options)
+	loop, err := d.jsRuntimeManagerInstance().Resolve(d.jsRuntimeContext(), engine, options)
 	if err != nil {
 		d.disableJSRuntime(err)
 		return
 	}
 	registry, err := d.installNativeJSServices(loop)
-	if err != nil {
+	if err != nil && !errors.Is(err, services.ErrUnsupported) {
 		_ = loop.Close()
 		d.disableJSRuntime(err)
 		return
@@ -351,6 +363,7 @@ func (d *Dice) JsInit() {
 		d.disableJSRuntime(err)
 		return
 	}
+	d.startJSScriptCron()
 
 	(&d.Config).JsEnable = true
 	if d.Logger != nil {
@@ -361,18 +374,157 @@ func (d *Dice) JsInit() {
 }
 
 func (d *Dice) JsShutdown() {
+	if d == nil || !d.beginStartupJsLoad() {
+		return
+	}
+	defer d.finishStartupJsLoad()
 	(&d.Config).JsEnable = false
+	d.stopJSScriptCron()
 	d.jsClear()
-	d.Logger.Info("已关闭JS环境")
+	if d.Logger != nil {
+		d.Logger.Info("已关闭JS环境")
+	}
 	d.MarkModified()
 	d.Save(false)
 }
 
+// StopJSRuntime releases process-owned JS resources without changing the
+// persisted JS enable setting. The first caller closes lifecycle admission and
+// starts one stop operation; later callers wait for that same operation.
+func (d *Dice) StopJSRuntime(ctx context.Context) error {
+	if d == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	d.startupJsLoadMu.Lock()
+	done := d.jsStopDone
+	if done == nil {
+		d.jsStopRequested = true
+		if d.jsLifecycleCtx == nil {
+			d.jsLifecycleCtx, d.jsLifecycleCancel = context.WithCancel(context.Background())
+		}
+		d.jsLifecycleCancel()
+		d.cancelDeferredStartupJsLoadLocked()
+		done = make(chan struct{})
+		d.jsStopDone = done
+		activeDone := d.startupJsLoadDone
+		if activeDone == nil && d.ExtLoopManager != nil {
+			d.ExtLoopManager.beginStop()
+		}
+		go d.finishJSRuntimeStop(activeDone, done)
+	}
+	d.startupJsLoadMu.Unlock()
+
+	select {
+	case <-done:
+		return d.jsRuntimeStopError()
+	case <-ctx.Done():
+		select {
+		case <-done:
+			return d.jsRuntimeStopError()
+		default:
+			return ctx.Err()
+		}
+	}
+}
+
+func (d *Dice) finishJSRuntimeStop(activeDone <-chan struct{}, done chan struct{}) {
+	if activeDone != nil {
+		<-activeDone
+	}
+	if d.ExtLoopManager != nil {
+		d.ExtLoopManager.beginStop()
+	}
+	taskLock := d.currentJSScriptTaskLock()
+	d.stopJSScriptCron()
+	var err error
+	if d.ExtLoopManager != nil {
+		err = d.ExtLoopManager.stop()
+	}
+	d.cancelJSScriptTasks()
+	if taskLock != nil {
+		taskLock.Lock()
+		//nolint:staticcheck // SA2001: drain script tasks that acquired the lock before cancellation.
+		taskLock.Unlock()
+	}
+	d.startupJsLoadMu.Lock()
+	d.jsStopErr = err
+	close(done)
+	d.startupJsLoadMu.Unlock()
+}
+
+func (d *Dice) jsRuntimeStopError() error {
+	d.startupJsLoadMu.Lock()
+	defer d.startupJsLoadMu.Unlock()
+	return d.jsStopErr
+}
+
+func (d *Dice) startJSScriptCron() {
+	d.jsScriptCronMu.Lock()
+	defer d.jsScriptCronMu.Unlock()
+	d.JsScriptCron = cron.New(cron.WithParser(taskCronParser))
+	d.JsScriptCronLock = &sync.Mutex{}
+}
+
+func (d *Dice) currentJSScriptTaskLock() *sync.Mutex {
+	d.jsScriptCronMu.Lock()
+	defer d.jsScriptCronMu.Unlock()
+	return d.JsScriptCronLock
+}
+
+func (d *Dice) stopJSScriptCron() {
+	d.jsScriptCronMu.Lock()
+	scheduler := d.JsScriptCron
+	taskLock := d.JsScriptCronLock
+	d.JsScriptCron = nil
+	d.jsScriptCronMu.Unlock()
+	if scheduler != nil {
+		<-scheduler.Stop().Done()
+	}
+	if taskLock != nil {
+		taskLock.Lock()
+		//nolint:staticcheck // SA2001: wait for the last scheduled task before clearing its lock.
+		taskLock.Unlock()
+	}
+	d.jsScriptCronMu.Lock()
+	if d.JsScriptCron == nil && d.JsScriptCronLock == taskLock {
+		d.JsScriptCronLock = nil
+	}
+	d.jsScriptCronMu.Unlock()
+}
+
+func (d *Dice) cancelJSScriptTasks() {
+	if d.JsExtRegistry == nil {
+		return
+	}
+	d.JsExtRegistry.Range(func(_ string, ext *ExtInfo) bool {
+		if ext == nil {
+			return true
+		}
+		for _, task := range ext.taskList {
+			if task != nil {
+				task.stopAndWait()
+			}
+		}
+		return true
+	})
+}
+
+// TODO(局部重载/禁用与删除): 局部卸载需要把本函数的“整体清空”拆成按脚本摘除，见 js_incremental_load.go 顶部路线图。
+// subTODO(局部重载): JsExtRegistry、JS 模板（clearJSTemplates）、CoC 规则（clearCocExtraRules）、
+// 插件存储都只能整体清空，缺少“按脚本归属”的摘除接口。
 func (d *Dice) jsClear() {
+	// 先撤销旧 generation 并等待 owner 退出，再替换注册表与关闭插件存储。
+	if d.ExtLoopManager != nil {
+		d.ExtLoopManager.SetLoop(nil)
+	}
 	// Wrapper 架构：不再调用 ExtRemove，只清空 JsExtRegistry
 	// 注意：不标记 wrapper 为 IsDeleted，否则重载期间消息到达会导致 wrapper 被移除
 	// IsDeleted 只在 JsDelete/ExtRemove（永久删除脚本）时设置
 	d.JsSealInstExposed = false
+	d.clearJSTemplates()
 
 	// 清空/初始化 JsExtRegistry
 	if d.JsExtRegistry != nil {
@@ -386,9 +538,10 @@ func (d *Dice) jsClear() {
 	d.JsExtRegistry = new(SyncMap[string, *ExtInfo])
 
 	// 清理coc扩展规则
-	d.CocExtraRules = map[int]*CocRuleInfo{}
+	d.clearCocExtraRules()
 	// 清理脚本列表
 	d.JsScriptList = []*JsScriptInfo{}
+	d.jsDependencyScope = nil
 	// 清理 JS 注册的规则模板，同时恢复内置、用户和已启用扩展包模板。
 	if d.PackageManager == nil {
 		d.resetGameSystemTemplates()
@@ -400,10 +553,6 @@ func (d *Dice) jsClear() {
 	}
 	if d.StoreManager != nil {
 		d.StoreManager.InstalledPlugins = map[string]bool{}
-	}
-	// JsEnable=false 的启动状态下 ExtLoopManager 可能尚未初始化
-	if d.ExtLoopManager != nil {
-		d.ExtLoopManager.SetLoop(nil)
 	}
 }
 
@@ -894,6 +1043,9 @@ func collectJsScriptPaths(root string, skipBuiltin bool, isScript func(string) b
 	return files
 }
 
+// TODO(局部重载/通用): 把本函数拆成 扫描 / 计划 / 应用 三步，局部加载与“重载计划”预览才能复用同一套依赖检查与排序。
+// subTODO(局部重载): 新增路径（JsAddScript）目前复用 JsParseMeta + checkJsScriptsDeps + sortJsScripts +
+// JsLoadScriptRaw；更新、卸载路径还需要计划阶段给出“需要整链重载的闭包”。
 func (d *Dice) JsLoadScripts() {
 	d.JsScriptList = []*JsScriptInfo{}
 	d.UpdateJsReloadProgress("scan_prepare", "正在准备扫描 JS 脚本", 0, 0, 12, "")
@@ -1121,6 +1273,7 @@ func (d *Dice) JsLoadScripts() {
 	// 这样 RuntimeID 代表最终执行实例，而不是仍可能回退的候选 provider。
 	d.UpdateJsReloadProgress("runtime_prepare", "正在准备 JS runtime 实例", 0, len(jsInfos), 48, "")
 	jsInfos = d.prepareJSScriptRuntimes(jsInfos)
+	d.jsDependencyScope = slices.Clone(jsInfos)
 
 	// 检查依赖是否满足
 	d.UpdateJsReloadProgress("dependency_check", "正在检查 JS 插件依赖", 0, len(jsInfos), 50, "")
@@ -1188,6 +1341,10 @@ func (d *Dice) JsLoadScripts() {
 }
 
 func (d *Dice) JsReload() {
+	if d == nil || !d.beginStartupJsLoad() {
+		return
+	}
+	defer d.finishStartupJsLoad()
 	startTime := time.Now()
 	d.Logger.Infof("JsReload: 开始重载")
 	d.BeginJsReloadProgress("开始重载 JS 环境")
@@ -1198,20 +1355,16 @@ func (d *Dice) JsReload() {
 		}
 	}()
 
-	if d.JsScriptCron != nil {
-		d.UpdateJsReloadProgress("cron_stop", "正在停止 JS 定时任务", 0, 0, 5, "")
-		d.JsScriptCron.Stop()
-		d.JsScriptCron = nil
-	}
+	d.stopJSScriptCron()
 
 	// Wrapper 架构：设置重载标志，避免重载期间访问无效的 CmdMap
-	d.JsReloading = true
+	d.setJsReloading(true)
 
 	// Wrapper 架构：不再需要记录快照，wrapper 保留在群组中
 	// jsClear 清空 JsExtRegistry，seal.ext.register 会复用 wrapper 并注册新的真实扩展
 
 	d.UpdateJsReloadProgress("init", "正在初始化 JS 运行环境", 0, 0, 8, "")
-	d.JsInit()
+	d.jsInit()
 	d.UpdateJsReloadProgress("config", "正在加载 JS 插件配置", 0, 0, 10, "")
 	_ = d.ConfigManager.Load()
 	d.JsLoadScripts()
@@ -1221,7 +1374,7 @@ func (d *Dice) JsReload() {
 	// 以避免半重载状态下读取到失效 CmdMap。原先在 JsLoadScripts() 末尾应用默认设置，会导致第三方 JS 扩展
 	// 的指令列表被错误置空，WebUI 综合设置 - 基本设置 - 扩展及扩展指令 里只能看到官方扩展命令。
 	// 因此这里改为先结束重载状态，再统一应用默认设置，让 JS wrapper 能解析到命令表。
-	d.JsReloading = false
+	d.setJsReloading(false)
 	d.UpdateJsReloadProgress("apply_settings", "正在应用扩展默认设置", 0, 0, 94, "")
 	d.ApplyExtDefaultSettings()
 
@@ -1331,6 +1484,8 @@ type JsScriptInfo struct {
 	Depends []JsScriptDepends `json:"depends"`
 	/** 需要被编译 */
 	needCompiled bool
+	/** 因依赖不满足或循环依赖而被阻塞，插件补齐后可由局部加载自动补载 */
+	depsBlocked bool
 	/** 扩展商店唯一 ID */
 	StoreID string `json:"storeID"`
 	/** 是否包含危险 API 调用 */
@@ -1343,6 +1498,10 @@ type JsScriptInfo struct {
 	Runtime string `json:"runtime,omitempty"`
 	/** 实际选择的 runtime ID */
 	RuntimeID string `json:"runtimeId,omitempty"`
+	// runtimeStateMu serializes HTTP enable/delete changes with asynchronous
+	// hook admission and host API ownership checks.
+	runtimeStateMu sync.RWMutex
+	runtimeDeleted bool // permanent whole-script tombstone; per-extension removal does not set it
 	/** 当前重载中已固定的 runtime generation */
 	runtimeGeneration int64 `json:"-"`
 }
@@ -1511,19 +1670,25 @@ func (d *Dice) ensureJSScriptLoop(jsInfo *JsScriptInfo, source string) (jsengine
 	// A prepared script is bound to one generation. Never re-route it while
 	// loading; a stale generation is the only case that permits preparation
 	// again.
-	if jsInfo.runtimeGeneration != 0 {
-		loop, err := d.ExtLoopManager.GetLoop(jsInfo.runtimeGeneration)
+	jsInfo.runtimeStateMu.RLock()
+	generation := jsInfo.runtimeGeneration
+	jsInfo.runtimeStateMu.RUnlock()
+	if generation != 0 {
+		loop, err := d.ExtLoopManager.GetLoop(generation)
 		if err == nil && loop != nil {
 			if err := manager.requirements.ValidateLoop(loop); err != nil {
 				return nil, 0, err
 			}
 			jsInfo.RuntimeID = string(loop.Engine())
-			return loop, jsInfo.runtimeGeneration, nil
+			return loop, generation, nil
 		}
-		jsInfo.runtimeGeneration = 0
+		jsInfo.runtimeStateMu.Lock()
+		if jsInfo.runtimeGeneration == generation {
+			jsInfo.runtimeGeneration = 0
+		}
+		jsInfo.runtimeStateMu.Unlock()
 	}
 
-	_, hasHint := jsengine.UserScriptRuntimeHint(source)
 	resolve := func(id jsengine.EngineID) (jsengine.Loop, error) {
 		if existing, _ := d.ExtLoopManager.LoopForEngine(id); existing != nil {
 			if err := manager.requirements.ValidateLoop(existing); err != nil {
@@ -1531,36 +1696,20 @@ func (d *Dice) ensureJSScriptLoop(jsInfo *JsScriptInfo, source string) (jsengine
 			}
 			return existing, nil
 		}
-		options, err := BuildRuntimeOptionsForEngine(id, d.Config.JsConfig)
+		options, err := d.runtimeOptionsForEngine(id)
 		if err != nil {
 			return nil, err
 		}
-		return manager.Resolve(context.Background(), id, options)
+		return manager.Resolve(d.jsRuntimeContext(), id, options)
 	}
 
-	var (
-		resolvedID jsengine.EngineID
-		loop       jsengine.Loop
-		err        error
+	defaults, defaultCount := d.jsRuntimeDefaultsForPackage(jsInfo.PackageID)
+	resolvedID, loop, err := manager.resolveScriptWithDefaults(
+		jsInfo.Filename,
+		source,
+		defaults[:defaultCount],
+		resolve,
 	)
-	if hasHint {
-		resolvedID, loop, err = manager.resolveScript(jsInfo.Filename, source, resolve)
-	} else {
-		selectedID := d.configuredJSEngine()
-		if existing, version := d.ExtLoopManager.LoopForEngine(selectedID); existing != nil {
-			if err := manager.requirements.ValidateLoop(existing); err != nil {
-				return nil, 0, err
-			}
-			jsInfo.RuntimeID = string(selectedID)
-			jsInfo.runtimeGeneration = version
-			return existing, version, nil
-		}
-		resolvedID = normalizeRequestedEngine(selectedID)
-		loop, err = resolve(resolvedID)
-		if err != nil {
-			resolvedID, loop, err = manager.resolveScript(jsInfo.Filename, source, resolve)
-		}
-	}
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1570,11 +1719,13 @@ func (d *Dice) ensureJSScriptLoop(jsInfo *JsScriptInfo, source string) (jsengine
 
 	if existing, version := d.ExtLoopManager.LoopForEngine(resolvedID); existing == loop {
 		jsInfo.RuntimeID = string(resolvedID)
+		jsInfo.runtimeStateMu.Lock()
 		jsInfo.runtimeGeneration = version
+		jsInfo.runtimeStateMu.Unlock()
 		return existing, version, nil
 	}
 	registry, err := d.installNativeJSServices(loop)
-	if err != nil {
+	if err != nil && !errors.Is(err, services.ErrUnsupported) {
 		_ = loop.Close()
 		return nil, 0, err
 	}
@@ -1586,7 +1737,9 @@ func (d *Dice) ensureJSScriptLoop(jsInfo *JsScriptInfo, source string) (jsengine
 			return nil, 0, errors.New("JavaScript runtime instance registration failed")
 		}
 		jsInfo.RuntimeID = string(registered.Engine())
+		jsInfo.runtimeStateMu.Lock()
 		jsInfo.runtimeGeneration = registeredVersion
+		jsInfo.runtimeStateMu.Unlock()
 		return registered, registeredVersion, nil
 	}
 	if err := d.initializeJSLoop(loop, version); err != nil {
@@ -1594,7 +1747,9 @@ func (d *Dice) ensureJSScriptLoop(jsInfo *JsScriptInfo, source string) (jsengine
 		return nil, 0, err
 	}
 	jsInfo.RuntimeID = string(resolvedID)
+	jsInfo.runtimeStateMu.Lock()
 	jsInfo.runtimeGeneration = version
+	jsInfo.runtimeStateMu.Unlock()
 	return loop, version, nil
 }
 
@@ -1625,6 +1780,7 @@ func (d *Dice) prepareJSScriptRuntimes(jsInfos []*JsScriptInfo) []*JsScriptInfo 
 	return prepared
 }
 
+// TODO(局部重载/更新同名插件): 加载失败时模块缓存里会残留半成品（见 CommonJSProgram），局部重载需要在失败时驱逐并回滚注册。
 func (d *Dice) JsLoadScriptRaw(jsInfo *JsScriptInfo) {
 	var err error
 	if jsInfo == nil {
@@ -1752,7 +1908,15 @@ func CheckJsSign(rawData []byte) (bool, SignStatus) {
 	return false, ErrorSign
 }
 
+// TODO(局部重载/禁用与删除): 删除已加载插件时不应再要求全量重载，而应卸载该插件及其反向依赖闭包。
+// 现状只做了一小部分清理：标记 wrapper 为墓碑、摘除 JsExtRegistry、关闭存储；
+// 任务（taskList）、JS 模板、CoC 规则、脚本级定时器与连接、依赖方都没有处理，需重载才能彻底生效。
+// subTODO(局部重载): 脚本资源归属表、脚本级生命周期上下文、反向依赖闭包，见 js_incremental_load.go 顶部。
 func JsDelete(d *Dice, jsInfo *JsScriptInfo) {
+	jsInfo.runtimeStateMu.Lock()
+	defer jsInfo.runtimeStateMu.Unlock()
+	jsInfo.Enable = false
+	jsInfo.runtimeDeleted = true
 	dirpath := filepath.Dir(jsInfo.Filename)
 	dirname := filepath.Base(dirpath)
 
@@ -1787,22 +1951,36 @@ func JsDelete(d *Dice, jsInfo *JsScriptInfo) {
 	}
 }
 
+// TODO(局部重载/禁用与删除): 启用一个已禁用的插件应走局部加载；若它禁用前已加载过，模块缓存里仍留有旧实例，
+// 需要先有模块缓存驱逐原语。目前只改配置，需要手动重载才生效。
 func JsEnable(d *Dice, jsInfoName string) {
 	delete((&d.Config).DisabledJsScripts, jsInfoName)
 	for _, jsInfo := range d.JsScriptList {
 		if jsInfo.Name == jsInfoName {
-			jsInfo.Enable = true
+			jsInfo.runtimeStateMu.Lock()
+			if !jsInfo.runtimeDeleted {
+				jsInfo.Enable = true
+			}
+			jsInfo.runtimeStateMu.Unlock()
 		}
 	}
 	d.LastUpdatedTime = time.Now().Unix()
 	d.Save(false)
 }
 
+// TODO(局部重载/禁用与删除): 禁用应局部卸载该插件及其反向依赖闭包，依赖方标记为 depsBlocked。
+// 目前只改配置，已加载的实例会一直运行到下一次全量重载。
+// subTODO(局部重载): 脚本资源归属表、脚本级生命周期上下文、反向依赖闭包，见 js_incremental_load.go 顶部。
 func JsDisable(d *Dice, jsInfoName string) {
-	(&d.Config).DisabledJsScripts[jsInfoName] = true
+	if d.Config.DisabledJsScripts == nil {
+		d.Config.DisabledJsScripts = make(map[string]bool)
+	}
+	d.Config.DisabledJsScripts[jsInfoName] = true
 	for _, jsInfo := range d.JsScriptList {
 		if jsInfo.Name == jsInfoName {
+			jsInfo.runtimeStateMu.Lock()
 			jsInfo.Enable = false
+			jsInfo.runtimeStateMu.Unlock()
 		}
 	}
 	d.LastUpdatedTime = time.Now().Unix()
@@ -1855,6 +2033,9 @@ func (d *Dice) JsCheckUpdate(jsScriptInfo *JsScriptInfo) (string, string, string
 	return oldJs, newJs, temp.Name(), nil
 }
 
+// TODO(局部重载/更新同名插件): 更新只写文件，需要手动全量重载才生效。局部更新需要驱逐旧模块缓存，
+// 并对依赖闭包整链重载（依赖方可能持有旧 exports / ExtInfo 引用）。
+// subTODO(局部重载): 模块缓存驱逐原语、依赖闭包整链重载、seal.ext.find/require 的未声明依赖边记录。
 func (d *Dice) JsUpdate(jsScriptInfo *JsScriptInfo, tempFileName string) error {
 	newData, err := os.ReadFile(tempFileName)
 	_ = os.Remove(tempFileName)
@@ -1885,6 +2066,7 @@ func (d *Dice) JsUpdate(jsScriptInfo *JsScriptInfo, tempFileName string) error {
 	return nil
 }
 
+// TODO(局部重载/禁用与删除): 这里只能做“正向”检查；卸载需要反向依赖闭包 dependentsOf(script)。
 func checkJsScriptsDeps(jsScripts []*JsScriptInfo) ([]*JsScriptInfo, map[string][]string) {
 	canLoad := make([]*JsScriptInfo, 0, len(jsScripts))
 	invalidInfoMap := make(map[string][]string)
@@ -1932,9 +2114,11 @@ func checkJsScriptsDeps(jsScripts []*JsScriptInfo) ([]*JsScriptInfo, map[string]
 			}
 		}
 		if len(invalidInfoMap[key]) == 0 {
+			script.depsBlocked = false
 			canLoad = append(canLoad, script)
 		} else {
 			script.Enable = false
+			script.depsBlocked = true
 			script.ErrText = strings.Join(invalidInfoMap[key], "\n")
 		}
 	}
@@ -2010,6 +2194,7 @@ func sortJsScripts(jsScripts []*JsScriptInfo) ([]*JsScriptInfo, map[string][]str
 			}
 			infos[key] = append(infos[key], fmt.Sprintf("「%s」存在循环依赖，请检查，依赖列表：%s", key, strings.Join(deps, "、")))
 			script.Enable = false
+			script.depsBlocked = true
 			script.ErrText = strings.Join(infos[key], "\n")
 		}
 	}
@@ -2037,6 +2222,9 @@ type JsScriptTask struct {
 	lock     *sync.Mutex
 
 	stateLock sync.Mutex
+	stateCond *sync.Cond
+	running   int
+	closed    bool
 	logger    *zap.SugaredLogger
 
 	dice *Dice
@@ -2056,6 +2244,24 @@ type JsScriptTaskInfo struct {
 }
 
 func (t *JsScriptTask) run() {
+	if t == nil {
+		return
+	}
+	t.stateLock.Lock()
+	if t.closed {
+		t.stateLock.Unlock()
+		return
+	}
+	t.running++
+	t.stateLock.Unlock()
+	defer func() {
+		t.stateLock.Lock()
+		t.running--
+		if t.running == 0 && t.stateCond != nil {
+			t.stateCond.Broadcast()
+		}
+		t.stateLock.Unlock()
+	}()
 	taskCtx := JsScriptTaskCtx{
 		Now: time.Now().Unix(),
 		Key: t.key,
@@ -2093,8 +2299,25 @@ func (t *JsScriptTask) run() {
 }
 
 func (t *JsScriptTask) On() bool {
+	if t == nil {
+		return false
+	}
+	if t.dice != nil {
+		t.dice.jsScriptCronMu.Lock()
+		defer t.dice.jsScriptCronMu.Unlock()
+		if t.cron == nil || t.dice.JsScriptCron != t.cron {
+			return false
+		}
+	}
+	return t.on()
+}
+
+func (t *JsScriptTask) on() bool {
 	t.stateLock.Lock()
 	defer t.stateLock.Unlock()
+	if t.closed {
+		return false
+	}
 
 	switch t.taskType {
 	case "once":
@@ -2127,6 +2350,7 @@ func (t *JsScriptTask) On() bool {
 			return false
 		}
 		t.entryID = &entryID
+		t.cron.Start()
 		return true
 	default:
 		return false
@@ -2157,6 +2381,33 @@ func (t *JsScriptTask) Off() bool {
 	}
 }
 
+func (t *JsScriptTask) stopAndWait() {
+	if t == nil {
+		return
+	}
+	t.stateLock.Lock()
+	t.closed = true
+	switch t.taskType {
+	case "once":
+		if t.timer != nil {
+			t.timer.Stop()
+			t.timer = nil
+		}
+	case "cron", "daily":
+		if t.entryID != nil {
+			t.cron.Remove(*t.entryID)
+			t.entryID = nil
+		}
+	}
+	if t.running > 0 && t.stateCond == nil {
+		t.stateCond = sync.NewCond(&t.stateLock)
+	}
+	for t.running > 0 {
+		t.stateCond.Wait()
+	}
+	t.stateLock.Unlock()
+}
+
 func (t *JsScriptTask) IsActive() bool {
 	t.stateLock.Lock()
 	defer t.stateLock.Unlock()
@@ -2172,6 +2423,27 @@ func (t *JsScriptTask) IsActive() bool {
 }
 
 func (t *JsScriptTask) reset(expr string) error {
+	var (
+		rawValue string
+		cronExpr string
+		onceAt   time.Time
+		err      error
+	)
+	switch t.taskType {
+	case "cron":
+		rawValue, err = parseTaskCronExpr(expr)
+		cronExpr = rawValue
+	case "daily":
+		rawValue, cronExpr, err = normalizeTaskDailyExpr(expr)
+	case "once":
+		onceAt, rawValue, err = parseTaskOnceExpr(expr)
+	default:
+		return fmt.Errorf("unknown task type %s", t.taskType)
+	}
+	if err != nil {
+		return err
+	}
+
 	var wasScheduled bool
 	t.stateLock.Lock()
 	if t.taskType == "once" {
@@ -2185,37 +2457,55 @@ func (t *JsScriptTask) reset(expr string) error {
 		t.Off()
 	}
 
-	t.rawValue = expr
+	t.rawValue = rawValue
 	shouldOn := wasScheduled
 	switch t.taskType {
-	case "cron":
-		cronExpr, err := parseTaskCronExpr(expr)
-		if err != nil {
-			return err
-		}
-		t.cronExpr = cronExpr
-	case "daily":
-		cronExpr, err := parseTaskTime(expr)
-		if err != nil {
-			return err
-		}
+	case "cron", "daily":
 		t.cronExpr = cronExpr
 	case "once":
-		onceAt, normalizedExpr, err := parseTaskOnceExpr(expr)
-		if err != nil {
-			return err
-		}
 		t.onceAt = onceAt
-		t.rawValue = normalizedExpr
 		shouldOn = true // once 任务重置后应重新挂载一次执行
-	default:
-		return fmt.Errorf("unknown task type %s", t.taskType)
 	}
 
 	if shouldOn && !t.On() {
 		return errors.New("重新注册任务失败")
 	}
 	return nil
+}
+
+func normalizeTaskConfigValue(configType string, expr string) (string, error) {
+	switch configType {
+	case "task:cron":
+		return parseTaskCronExpr(expr)
+	case "task:daily":
+		normalized, _, err := normalizeTaskDailyExpr(expr)
+		return normalized, err
+	case "task:once":
+		_, normalized, err := parseTaskOnceExpr(expr)
+		return normalized, err
+	default:
+		return "", fmt.Errorf("unknown task config type %s", configType)
+	}
+}
+
+func normalizeTaskDailyExpr(expr string) (string, string, error) {
+	cronExpr, err := parseTaskTime(expr)
+	if err != nil {
+		return "", "", err
+	}
+	fields := strings.Fields(cronExpr)
+	if len(fields) != 5 {
+		return "", "", errors.New("invalid normalized daily task expression")
+	}
+	hour, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return "", "", err
+	}
+	minute, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return "", "", err
+	}
+	return fmt.Sprintf("%d:%02d", hour, minute), cronExpr, nil
 }
 
 func parseTaskCronExpr(expr string) (string, error) {

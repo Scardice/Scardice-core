@@ -2,9 +2,10 @@ package api
 
 import (
 	"context"
-	"github.com/labstack/echo/v4"
 	"net/http"
 	"strings"
+
+	"github.com/labstack/echo/v4"
 
 	"Scardice-core/dice"
 )
@@ -31,43 +32,54 @@ func DiceAdvancedConfigSet(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
 	}
-	prevAdvancedConfig := myDice.AdvancedConfig
-	advancedConfig := prevAdvancedConfig
-	durableAttached := myDice.DurableStoreAttached()
-	err := c.Bind(&advancedConfig)
-	if err != nil {
-		return Error(&c, err.Error(), nil)
-	}
-	if advancedConfig.CustomReplyCooldown <= 0 {
-		advancedConfig.CustomReplyCooldown = dice.DefaultCustomReplyCooldown
-	}
 
-	var tokenRef *string
-	if durableAttached && advancedConfig.StoryLogBackendToken != prevAdvancedConfig.StoryLogBackendToken {
-		ref := strings.TrimSpace(advancedConfig.StoryLogBackendToken)
-		if ref != "" && !strings.HasPrefix(ref, "vault:") && !strings.HasPrefix(ref, "sha256:") {
-			return Error(&c, "高级设置 token 必须是 vault: 或 sha256: 引用", nil)
+	var advancedConfig dice.AdvancedConfig
+	reloadNeeded := false
+	updateErr := func() error {
+		myDice.LockConfigUpdate()
+		defer myDice.UnlockConfigUpdate()
+
+		prevAdvancedConfig := myDice.AdvancedConfig
+		advancedConfig = prevAdvancedConfig
+		durableAttached := myDice.DurableStoreAttached()
+		if err := c.Bind(&advancedConfig); err != nil {
+			return Error(&c, err.Error(), nil)
 		}
-		tokenRef = &ref
-	}
-
-	if durableAttached {
-		if err := myDice.DurableCommitAdvancedSnapshot(context.Background(), advancedConfig, tokenRef); err != nil {
-			myDice.AdvancedConfig = prevAdvancedConfig
-			return echo.NewHTTPError(http.StatusConflict, err.Error())
+		if advancedConfig.CustomReplyCooldown <= 0 {
+			advancedConfig.CustomReplyCooldown = dice.DefaultCustomReplyCooldown
 		}
-		advancedConfig.StoryLogBackendToken = ""
-	}
-	myDice.AdvancedConfig = advancedConfig
 
-	// 统一标记为修改
-	myDice.MarkModified()
-	if !durableAttached {
-		myDice.Parent.Save()
+		var tokenRef *string
+		if durableAttached && advancedConfig.StoryLogBackendToken != prevAdvancedConfig.StoryLogBackendToken {
+			ref := strings.TrimSpace(advancedConfig.StoryLogBackendToken)
+			if ref != "" && !strings.HasPrefix(ref, "vault:") && !strings.HasPrefix(ref, "sha256:") {
+				return Error(&c, "高级设置 token 必须是 vault: 或 sha256: 引用", nil)
+			}
+			tokenRef = &ref
+		}
+
+		if durableAttached {
+			if err := myDice.DurableCommitAdvancedSnapshot(context.Background(), advancedConfig, tokenRef); err != nil {
+				myDice.AdvancedConfig = prevAdvancedConfig
+				return echo.NewHTTPError(http.StatusConflict, err.Error())
+			}
+			advancedConfig.StoryLogBackendToken = ""
+		}
+		myDice.AdvancedConfig = advancedConfig
+
+		myDice.MarkModified()
+		if !durableAttached {
+			myDice.Parent.Save()
+		}
+		reloadNeeded = shouldReloadDangerousAPIState(myDice.Config.JsEnable, myDice.JsSealInstExposed, advancedConfig.ExposeDangerousSealInst)
+		return nil
+	}()
+	if updateErr != nil {
+		return updateErr
 	}
 
 	reloadTriggered := false
-	if shouldReloadDangerousAPIState(myDice.Config.JsEnable, myDice.JsSealInstExposed, advancedConfig.ExposeDangerousSealInst) {
+	if reloadNeeded {
 		myDice.JsReloadLock.Lock()
 		myDice.JsReload()
 		myDice.JsReloadLock.Unlock()

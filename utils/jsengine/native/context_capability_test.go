@@ -23,17 +23,21 @@ func TestNativeContextCapabilityRequiresValidExtension(t *testing.T) {
 		t.Fatal(err)
 	}
 	cases := []struct {
-		name  string
-		kind  int
-		valid bool
+		name string
+		kind int
+		want error
 	}{
-		{"context-extension", 0, true},
-		{"missing-extension", 1, false},
-		{"incompatible-extension", 2, false},
-		{"short-context-table", 3, false},
-		{"missing-set-context", 4, false},
-		{"missing-get-context", 5, false},
-		{"generic-provider-without-context", 6, true},
+		{"context-extension", 0, nil},
+		{"missing-extension", 1, ErrCorruptVTable},
+		{"incompatible-extension", 2, ErrCorruptVTable},
+		{"short-context-table", 3, ErrCorruptVTable},
+		{"missing-set-context", 4, ErrCorruptVTable},
+		{"missing-get-context", 5, ErrCorruptVTable},
+		{"generic-provider-without-context", 6, nil},
+		{"async-service-with-short-table", 7, ErrTooSmallStruct},
+		{"nonzero-runtime-minor", 8, ErrRuntimeABIMismatch},
+		{"unsupported-host-minor", 9, ErrHostABIMismatch},
+		{"nonzero-extension-minor", 10, ErrCorruptVTable},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -50,12 +54,12 @@ func TestNativeContextCapabilityRequiresValidExtension(t *testing.T) {
 			}
 			candidate := Candidate{LibraryPath: library, Manifest: Manifest{
 				Schema: 1, ID: "echo-runtime", Name: "Echo Runtime", Version: "1.0.0", Language: "echo",
-				RuntimeABI: ABIRequirement{Major: 1}, HostABI: ABIRequirement{Major: 1, MinMinor: 1},
+				RuntimeABI: ABIRequirement{Major: 1}, HostABI: ABIRequirement{Major: 1},
 			}}
 			provider, err := candidate.Load()
-			if !test.valid {
-				if !errors.Is(err, ErrCorruptVTable) {
-					t.Fatalf("Load() error = %v, want invalid capability declaration", err)
+			if test.want != nil {
+				if !errors.Is(err, test.want) {
+					t.Fatalf("Load() error = %v, want %v", err, test.want)
 				}
 				return
 			}

@@ -2329,7 +2329,11 @@ func (pm *PackageManager) reloadTemplates() error {
 	for _, file := range templateFiles {
 		paths = append(paths, file.Path)
 	}
-	return pm.parent.GameSystemTemplateReloadFiles(paths)
+	if err := pm.parent.GameSystemTemplateReloadFiles(paths); err != nil {
+		return err
+	}
+	pm.parent.restoreJSTemplates()
+	return nil
 }
 
 // linkPackageResources 恢复扩展包运行时缓存目录。

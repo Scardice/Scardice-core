@@ -8,6 +8,7 @@ import (
 	"io"
 
 	"Scardice-core/eventstore"
+
 	"gorm.io/gorm"
 )
 
@@ -65,7 +66,7 @@ func decodeProjectionState(payload []byte) (State, error) {
 	if json.Unmarshal(payload, &value) != nil {
 		return State{}, ErrInvalidState
 	}
-	if _, ok := value.(map[string]any); !ok || containsJSONNull(value) {
+	if _, ok := value.(map[string]any); !ok || containsConfigProjectionJSONNull(value) {
 		return State{}, ErrInvalidState
 	}
 	dec := json.NewDecoder(bytes.NewReader(payload))
@@ -84,7 +85,7 @@ func decodeProjectionState(payload []byte) (State, error) {
 }
 
 type projectionReader interface {
-	ReadProjectionRow(context.Context, string, string) (eventstore.ProjectionRow, error)
+	ReadProjectionRow(ctx context.Context, projectionName, rowKey string) (eventstore.ProjectionRow, error)
 }
 
 func ReadProjected(ctx context.Context, store any, diceID string) (State, error) {

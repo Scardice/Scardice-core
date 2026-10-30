@@ -242,7 +242,7 @@ func bindFormData(rt *goja.Runtime, obj *goja.Object, data *formDataData) {
 	})
 	_ = obj.Set("getAll", func(call goja.FunctionCall) goja.Value {
 		name := call.Argument(0).String()
-		var vals []string
+		vals := []string{}
 		for _, e := range data.entries {
 			if e.name == name {
 				vals = append(vals, e.value)
@@ -281,21 +281,21 @@ func bindFormData(rt *goja.Runtime, obj *goja.Object, data *formDataData) {
 		return goja.Undefined()
 	})
 	_ = obj.Set("keys", func(call goja.FunctionCall) goja.Value {
-		var keys []string
+		keys := []string{}
 		for _, e := range data.entries {
 			keys = append(keys, e.name)
 		}
 		return rt.ToValue(keys)
 	})
 	_ = obj.Set("values", func(call goja.FunctionCall) goja.Value {
-		var vals []string
+		vals := []string{}
 		for _, e := range data.entries {
 			vals = append(vals, e.value)
 		}
 		return rt.ToValue(vals)
 	})
 	_ = obj.Set("entries", func(call goja.FunctionCall) goja.Value {
-		var entries [][]string
+		entries := [][]string{}
 		for _, e := range data.entries {
 			entries = append(entries, []string{e.name, e.value})
 		}

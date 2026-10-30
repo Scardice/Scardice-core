@@ -12,39 +12,71 @@ import (
 )
 
 type GlobalRand struct {
-	mu         sync.RWMutex
-	sources    map[Mode]ds.DiceSource
-	errs       map[Mode]error
-	activeMode Mode
+	mu           sync.RWMutex
+	sourceInitMu sync.Mutex
+	sources      map[Mode]ds.DiceSource
+	errs         map[Mode]error
+	activeMode   Mode
+	logger       *zap.SugaredLogger
+	lazyBuiltins bool
 }
 
 func NewEmptyGlobalOwner() *GlobalRand {
 	return &GlobalRand{
-		sources:    map[Mode]ds.DiceSource{},
-		errs:       map[Mode]error{},
+		sources:    make(map[Mode]ds.DiceSource),
+		errs:       make(map[Mode]error),
 		activeMode: ModePCG,
 	}
 }
 
 func NewGlobalOwner(logger *zap.SugaredLogger) *GlobalRand {
 	owner := NewEmptyGlobalOwner()
+	owner.logger = logger
+	owner.lazyBuiltins = true
 	owner.RegisterSource(ModePCG, NewPCGSource(generateRandSeed()))
-	for _, mode := range []Mode{ModeGM, ModeNIST, ModeCRNG} {
-		src, err := NewSourceForMode(mode, logger)
-		if err != nil {
-			owner.RegisterSourceError(mode, err)
-			if logger != nil {
-				logger.Errorf("[随机源] %s 模式初始化失败: %v", ModeSpecFor(mode).Label, err)
-			}
-			continue
-		}
-		owner.RegisterSource(mode, src)
-	}
-	if err := owner.RegisterHybridSource(); err != nil {
-		owner.RegisterSourceError(ModeHybrid, err)
-	}
-	owner.activeMode = ModePCG
 	return owner
+}
+
+func (g *GlobalRand) ensureSource(mode Mode) {
+	if g == nil || !g.lazyBuiltins {
+		return
+	}
+	switch mode {
+	case ModeGM, ModeNIST, ModeCRNG, ModeHybrid:
+	default:
+		return
+	}
+
+	g.sourceInitMu.Lock()
+	defer g.sourceInitMu.Unlock()
+	g.ensureSourceWhileInitializing(mode)
+}
+
+func (g *GlobalRand) ensureSourceWhileInitializing(mode Mode) {
+	g.mu.RLock()
+	source := g.sources[mode]
+	sourceErr := g.errs[mode]
+	g.mu.RUnlock()
+	if source != nil || sourceErr != nil {
+		return
+	}
+	if mode == ModeHybrid {
+		for _, baseMode := range HybridBaseModes() {
+			g.ensureSourceWhileInitializing(baseMode)
+		}
+		_ = g.RegisterHybridSource()
+		return
+	}
+
+	source, err := NewSourceForMode(mode, g.logger)
+	if err != nil {
+		g.RegisterSourceError(mode, err)
+		if g.logger != nil {
+			g.logger.Errorf("[随机源] %s 模式初始化失败: %v", ModeSpecFor(mode).Label, err)
+		}
+		return
+	}
+	g.RegisterSource(mode, source)
 }
 
 func (g *GlobalRand) RegisterSource(mode Mode, src ds.DiceSource) {
@@ -61,10 +93,10 @@ func (g *GlobalRand) RegisterSourceError(mode Mode, err error) {
 
 func (g *GlobalRand) registerSourceLocked(mode Mode, src ds.DiceSource) {
 	if g.sources == nil {
-		g.sources = map[Mode]ds.DiceSource{}
+		g.sources = make(map[Mode]ds.DiceSource)
 	}
 	if g.errs == nil {
-		g.errs = map[Mode]error{}
+		g.errs = make(map[Mode]error)
 	}
 	if src == nil {
 		delete(g.sources, mode)
@@ -77,7 +109,7 @@ func (g *GlobalRand) registerSourceLocked(mode Mode, src ds.DiceSource) {
 
 func (g *GlobalRand) registerSourceErrorLocked(mode Mode, err error) {
 	if g.errs == nil {
-		g.errs = map[Mode]error{}
+		g.errs = make(map[Mode]error)
 	}
 	if err == nil {
 		delete(g.errs, mode)
@@ -161,14 +193,14 @@ func (g *GlobalRand) RegisterHybridSource() error {
 	defer g.mu.Unlock()
 	if err != nil {
 		if g.errs == nil {
-			g.errs = map[Mode]error{}
+			g.errs = make(map[Mode]error)
 		}
 		g.errs[ModeHybrid] = err
 		delete(g.sources, ModeHybrid)
 		return err
 	}
 	if g.sources == nil {
-		g.sources = map[Mode]ds.DiceSource{}
+		g.sources = make(map[Mode]ds.DiceSource)
 	}
 	g.sources[ModeHybrid] = hybrid
 	delete(g.errs, ModeHybrid)
@@ -176,6 +208,7 @@ func (g *GlobalRand) RegisterHybridSource() error {
 }
 
 func (g *GlobalRand) SetActive(mode Mode) (Mode, error) {
+	g.ensureSource(mode)
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if src := g.sourceAvailableLocked(mode); src != nil {
@@ -196,6 +229,62 @@ func (g *GlobalRand) SetActive(mode Mode) (Mode, error) {
 		return "", initErr
 	}
 	return "", fmt.Errorf("mode %s source unavailable", mode)
+}
+
+// ValidateActive checks whether mode can be activated without changing the
+// currently active source.
+func (g *GlobalRand) ValidateActive(mode Mode) (Mode, error) {
+	g.ensureSource(mode)
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if src := g.sourceAvailableLocked(mode); src != nil {
+		return mode, nil
+	}
+
+	fallbackMode, fallbackSrc := g.pickAvailableSourceLocked(mode)
+	if fallbackSrc != nil {
+		if initErr := g.sourceErrorLocked(mode); initErr != nil {
+			return fallbackMode, initErr
+		}
+		return fallbackMode, fmt.Errorf("mode %s source unavailable", mode)
+	}
+
+	if initErr := g.sourceErrorLocked(mode); initErr != nil {
+		return "", initErr
+	}
+	return "", fmt.Errorf("mode %s source unavailable", mode)
+}
+
+// ActivateWith holds the owner lock while activating mode and committing its
+// durable configuration. Readers observe either the old mode or the committed
+// new mode; a failed commit restores the old mode before releasing the lock.
+func (g *GlobalRand) ActivateWith(mode Mode, commit func() error) error {
+	if commit == nil {
+		return errors.New("random mode commit is nil")
+	}
+	g.ensureSource(mode)
+	g.mu.Lock()
+	previousMode := g.activeMode
+	committed := false
+	defer func() {
+		if !committed {
+			g.activeMode = previousMode
+		}
+		g.mu.Unlock()
+	}()
+
+	if g.sourceAvailableLocked(mode) == nil {
+		if err := g.sourceErrorLocked(mode); err != nil {
+			return err
+		}
+		return fmt.Errorf("mode %s source unavailable", mode)
+	}
+	g.activeMode = mode
+	if err := commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 func sourceErrorFromSource(src ds.DiceSource) error {
@@ -343,6 +432,9 @@ func newReportSource(mode Mode, sources map[Mode]ds.DiceSource) (ds.DiceSource, 
 }
 
 func (g *GlobalRand) ReportGetText(points int64) string {
+	for _, mode := range SupportedModes() {
+		g.ensureSource(mode)
+	}
 	sources, errs, _ := g.snapshotSources()
 	lines := []string{fmt.Sprintf("随机源单次骰点测速 D%d", points)}
 	for _, mode := range SupportedModes() {
@@ -378,6 +470,7 @@ func (g *GlobalRand) ReportGetText(points int64) string {
 }
 
 func (g *GlobalRand) ReportStatusText(configuredMode Mode) string {
+	g.ensureSource(configuredMode)
 	g.mu.Lock()
 	effectiveMode, src := g.currentSourceLocked()
 	g.mu.Unlock()

@@ -26,12 +26,18 @@ const (
 	ActionKindBan
 	ActionKindKick
 	ActionKindGroupInfoRefresh
+	ActionKindAnswerRequest
+	// ActionKindAdapterAPI gates the abstract ability to execute a native
+	// adapter request. Provider action names remain inside the request JSON.
+	ActionKindAdapterAPI
 )
-const maxActionKind = ActionKindGroupInfoRefresh
+const maxActionKind = ActionKindAdapterAPI
 
 func (kind ActionKind) Valid() bool {
 	switch kind {
-	case ActionKindRequestQRCode, ActionKindSubmitSMS, ActionKindSubmitCaptcha, ActionKindValidateCredentials, ActionKindGenerateConfigArtifact, ActionKindSendMessage, ActionKindSendFile, ActionKindRecallMessage, ActionKindEditMessage, ActionKindSetGroupCard, ActionKindQuit, ActionKindBan, ActionKindKick, ActionKindGroupInfoRefresh:
+	case ActionKindInvalid:
+		return false
+	case ActionKindRequestQRCode, ActionKindSubmitSMS, ActionKindSubmitCaptcha, ActionKindValidateCredentials, ActionKindGenerateConfigArtifact, ActionKindSendMessage, ActionKindSendFile, ActionKindRecallMessage, ActionKindEditMessage, ActionKindSetGroupCard, ActionKindQuit, ActionKindBan, ActionKindKick, ActionKindGroupInfoRefresh, ActionKindAnswerRequest, ActionKindAdapterAPI:
 		return true
 	}
 	return false
@@ -124,5 +130,5 @@ func (result ActionResult) Validate() error {
 // ActionRuntime is optional so existing runtimes can migrate incrementally.
 // Implementations must keep ActionRequest.Payload secret fields in memory only.
 type ActionRuntime interface {
-	ExecuteAction(context.Context, ActionRequest) (ActionResult, error)
+	ExecuteAction(ctx context.Context, request ActionRequest) (ActionResult, error)
 }

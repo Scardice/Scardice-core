@@ -2,6 +2,7 @@ package dice
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/dop251/goja"
@@ -43,7 +44,7 @@ func (p *diceGojaProvider) Descriptor() jsengine.Descriptor {
 
 func (p *diceGojaProvider) Open(ctx context.Context, _ jsengine.RuntimeOptions) (jsengine.Loop, error) {
 	if p == nil || p.dice == nil {
-		return nil, fmt.Errorf("Goja Dice provider is unavailable")
+		return nil, errors.New("goja Dice provider is unavailable")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -65,6 +66,15 @@ func (p *diceGojaProvider) Open(ctx context.Context, _ jsengine.RuntimeOptions) 
 		_ = engineLoop.Close()
 		return nil, err
 	}
+	heapTracker := d.JSHeapTracker()
+	heapRealm := heapTracker.attach(rawLoop.RunOnLoop, d.JSAllocSampler())
+	opened := false
+	defer func() {
+		if !opened {
+			heapTracker.detach(heapRealm)
+		}
+	}()
+	jsengine.SetInvocationObserver(engineLoop, heapRealm)
 	proxy := goproxy.NewProxyHttpServer()
 	printer := &PrinterFunc{d: d, isRecord: false, recorder: []string{}}
 	serviceRegistry := jsservices.NewRegistry()
@@ -74,6 +84,12 @@ func (p *diceGojaProvider) Open(ctx context.Context, _ jsengine.RuntimeOptions) 
 		Proxy:    proxy,
 		Printer:  printer,
 		Logger:   d.Logger,
+		CryptoWarn: func(message string) {
+			if script := jsContextScript(jsExecutionContextFor(engineLoop)); script != nil {
+				message = fmt.Sprintf("插件=%q 文件=%q %s", script.Name, script.Filename, message)
+			}
+			printer.Warn(message)
+		},
 		NetworkAuthorize: func(target string) error {
 			return jsNetworkAuthorizeWithContext(d, jsExecutionContextFor(engineLoop), target)
 		},
@@ -84,10 +100,10 @@ func (p *diceGojaProvider) Open(ctx context.Context, _ jsengine.RuntimeOptions) 
 			if err := jsCompatibilitySchedulingAllowed(context); err != nil {
 				return err
 			}
-			return jsengine.ScheduleWithContext(engineLoop, context, func(runtime jsengine.Runtime) error {
+			return jsengine.ScheduleWithContext(engineLoop, jsCompletionContext(context), func(runtime jsengine.Runtime) error {
 				vm, ok := gojaengine.Raw(runtime)
 				if !ok {
-					return fmt.Errorf("Goja runtime adapter unavailable")
+					return errors.New("goja runtime adapter unavailable")
 				}
 				return run(vm)
 			})
@@ -111,12 +127,13 @@ func (p *diceGojaProvider) Open(ctx context.Context, _ jsengine.RuntimeOptions) 
 	rawLoop.Run(func(vm *goja.Runtime) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				setupErr = fmt.Errorf("Goja runtime setup panic: %v", recovered)
+				setupErr = fmt.Errorf("goja runtime setup panic: %v", recovered)
 			}
 		}()
-		vm.SetFieldNameMapper(goja.TagFieldNameMapper("jsbind", true))
+		vm.SetFieldNameMapper(gojaengine.FieldNameMapper())
 		vm.SetRandSource(DiceRandFloat64)
 		setupErr = installer.Enable(vm)
+		vm.SetAllocationTracker(heapRealm)
 	})
 	if setupErr != nil {
 		_ = serviceRegistry.Close()
@@ -146,5 +163,6 @@ func (p *diceGojaProvider) Open(ctx context.Context, _ jsengine.RuntimeOptions) 
 		}
 	default:
 	}
-	return ownJSRuntimeLoop(engineLoop, serviceRegistry), nil
+	opened = true
+	return ownJSRuntimeLoop(engineLoop, func() { heapTracker.detach(heapRealm) }, serviceRegistry), nil
 }

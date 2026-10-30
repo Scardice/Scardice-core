@@ -31,6 +31,7 @@ import (
 	"go.uber.org/zap/zapcore"
 	"gorm.io/gorm"
 
+	"Scardice-core/adapterapi"
 	sealdiceLogger "Scardice-core/logger"
 	"Scardice-core/message"
 	"Scardice-core/utils/constant"
@@ -48,6 +49,10 @@ type mockPlatformAdapter struct {
 	groupMsgs  []string
 	personMsgs []string
 	quitGroups []string
+	bans       []string
+	kicks      []string
+	files      []string
+	fileResult *adapterapi.EffectResult
 	msgCh      chan string
 }
 
@@ -89,26 +94,51 @@ func (m *mockPlatformAdapter) SendToPerson(_ *MsgContext, _ string, text string,
 }
 
 // Remaining PlatformAdapter methods – all no-ops for the smoke test.
-func (m *mockPlatformAdapter) Serve() int       { return 0 }
-func (m *mockPlatformAdapter) DoRelogin() bool  { return true }
-func (m *mockPlatformAdapter) SetEnable(_ bool) {}
+
 func (m *mockPlatformAdapter) QuitGroup(_ *MsgContext, groupID string) {
 	m.mu.Lock()
 	m.quitGroups = append(m.quitGroups, groupID)
 	m.mu.Unlock()
 }
 func (m *mockPlatformAdapter) SetGroupCardName(_ *MsgContext, _ string) {}
-func (m *mockPlatformAdapter) MemberBan(_ string, _ string, _ int64)    {}
-func (m *mockPlatformAdapter) MemberKick(_ string, _ string)            {}
-func (m *mockPlatformAdapter) GetGroupInfoAsync(_ string)               {}
-func (m *mockPlatformAdapter) EditMessage(_ *MsgContext, _, _ string)   {}
-func (m *mockPlatformAdapter) RecallMessage(_ *MsgContext, _ string)    {}
+func (m *mockPlatformAdapter) MemberBan(groupID string, userID string, _ int64) {
+	m.mu.Lock()
+	m.bans = append(m.bans, groupID+":"+userID)
+	m.mu.Unlock()
+}
+func (m *mockPlatformAdapter) MemberKick(groupID string, userID string) {
+	m.mu.Lock()
+	m.kicks = append(m.kicks, groupID+":"+userID)
+	m.mu.Unlock()
+}
+func (m *mockPlatformAdapter) GetGroupInfoAsync(_ string)             {}
+func (m *mockPlatformAdapter) EditMessage(_ *MsgContext, _, _ string) {}
+func (m *mockPlatformAdapter) RecallMessage(_ *MsgContext, _ string)  {}
 func (m *mockPlatformAdapter) SendSegmentToGroup(_ *MsgContext, _ string, _ []message.IMessageElement, _ string) {
 }
 func (m *mockPlatformAdapter) SendSegmentToPerson(_ *MsgContext, _ string, _ []message.IMessageElement, _ string) {
 }
-func (m *mockPlatformAdapter) SendFileToPerson(_ *MsgContext, _ string, _ string, _ string) {}
-func (m *mockPlatformAdapter) SendFileToGroup(_ *MsgContext, _ string, _ string, _ string)  {}
+func (m *mockPlatformAdapter) SendFileToPerson(_ *MsgContext, _ string, path string, _ string) adapterapi.EffectResult {
+	m.mu.Lock()
+	m.files = append(m.files, path)
+	result := m.fileResult
+	m.mu.Unlock()
+	return mockFileSendResult(result)
+}
+func (m *mockPlatformAdapter) SendFileToGroup(_ *MsgContext, _ string, path string, _ string) adapterapi.EffectResult {
+	m.mu.Lock()
+	m.files = append(m.files, path)
+	result := m.fileResult
+	m.mu.Unlock()
+	return mockFileSendResult(result)
+}
+
+func mockFileSendResult(result *adapterapi.EffectResult) adapterapi.EffectResult {
+	if result == nil {
+		return adapterapi.AmbiguousResult("mock_file_send_unconfirmed", "mock provider does not acknowledge file upload")
+	}
+	return *result
+}
 
 // ---------------------------------------------------------------------------
 // mockDatabaseOperator
@@ -184,7 +214,6 @@ func newExecuteNewTestDice(t *testing.T) (*Dice, *EndPointInfo, *mockPlatformAda
 		ExtRegistry:   new(SyncMap[string, *ExtInfo]),
 		GameSystemMap: new(SyncMap[string, *GameSystemTemplate]),
 		DirtyGroups:   new(SyncMap[string, int64]),
-		CocExtraRules: map[int]*CocRuleInfo{},
 		// Cron is not started to keep the goroutine count predictable.
 		Cron:   cron.New(),
 		Parent: dm,
@@ -240,7 +269,6 @@ func newExecuteNewTestDice(t *testing.T) (*Dice, *EndPointInfo, *mockPlatformAda
 		Adapter: adapter,
 	}
 	ep.Session = d.ImSession
-	d.ImSession.EndPoints = []*EndPointInfo{ep}
 
 	cleanup := func() {
 		// Stop package-owned workers first.
@@ -758,6 +786,115 @@ func TestExecuteRunInSyncControlsNonCommandHookScheduling(t *testing.T) {
 		t.Fatal("Execute(..., false) did not schedule non-command hook")
 	}
 }
+
+func TestExecuteMessageReleasesExecutionStateAfterSynchronousHooks(t *testing.T) {
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	groupID := "QQ-Group:sync-release"
+	setupCtx := &MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession}
+	group := SetBotOnAtGroup(setupCtx, groupID)
+	group.SetActivatedExtList([]*ExtInfo{{
+		Name: "execute-sync-release-test",
+		OnNotCommandReceived: func(ctx *MsgContext, _ *Message) {
+			ctx.CreateVmIfNotExists()
+			ctx.CommandInfo = make([]byte, 1024)
+			ctx.DeckPools = map[*DeckInfo]map[string]*ShuffleRandomPool{}
+		},
+	}}, nil)
+
+	result := d.ImSession.executeMessage(ep, newGroupMsg(groupID, "QQ:999", "plain text"), messageExecutionOptions{
+		parser:    messageParserLegacy,
+		runInSync: true,
+	})
+	if result.context == nil || !result.context.executionReleased.Load() {
+		t.Fatal("synchronous execution returned before releasing transient state")
+	}
+	if result.context.vm != nil || result.context.CommandInfo != nil || result.context.DeckPools != nil {
+		t.Fatalf("transient state retained after synchronous execution: vm=%p command=%T decks=%v", result.context.vm, result.context.CommandInfo, result.context.DeckPools)
+	}
+}
+
+func TestExecuteMessageReleasesExecutionStateAfterLastAsynchronousHook(t *testing.T) {
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	groupID := "QQ-Group:async-release"
+	setupCtx := &MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession}
+	group := SetBotOnAtGroup(setupCtx, groupID)
+	started := make(chan int, 2)
+	finished := make(chan int, 2)
+	releaseFirst := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	group.SetActivatedExtList([]*ExtInfo{
+		{
+			Name: "execute-async-release-first",
+			OnNotCommandReceived: func(ctx *MsgContext, _ *Message) {
+				ctx.CreateVmIfNotExists()
+				ctx.CommandInfo = make([]byte, 1024)
+				started <- 1
+				<-releaseFirst
+				finished <- 1
+			},
+		},
+		{
+			Name: "execute-async-release-second",
+			OnNotCommandReceived: func(_ *MsgContext, _ *Message) {
+				started <- 2
+				<-releaseSecond
+				finished <- 2
+			},
+		},
+	}, nil)
+
+	result := d.ImSession.executeMessage(ep, newGroupMsg(groupID, "QQ:999", "plain text"), messageExecutionOptions{
+		parser:    messageParserLegacy,
+		runInSync: false,
+	})
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("asynchronous hook did not start")
+		}
+	}
+	if result.context == nil {
+		t.Fatal("asynchronous execution did not return its context")
+	}
+	if result.context.executionReleased.Load() || result.context.vm == nil {
+		t.Fatalf("execution state released while hooks are active: released=%v vm=%p", result.context.executionReleased.Load(), result.context.vm)
+	}
+
+	close(releaseFirst)
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first asynchronous hook did not finish")
+	}
+	if result.context.executionReleased.Load() {
+		t.Fatal("execution state released before the last hook")
+	}
+
+	close(releaseSecond)
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second asynchronous hook did not finish")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !result.context.executionReleased.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !result.context.executionReleased.Load() {
+		t.Fatal("execution state was not released after all hooks")
+	}
+	// The release flag closes admission before cleanup finishes.
+	result.context.executionReleaseOnce.Do(func() {
+		t.Fatal("release flag was published outside the cleanup fence")
+	})
+	if result.context.vm != nil || result.context.CommandInfo != nil {
+		t.Fatalf("transient state retained after asynchronous execution: vm=%p command=%T", result.context.vm, result.context.CommandInfo)
+	}
+}
+
 func TestExecuteLeavesUnsupportedMessageUnchanged(t *testing.T) {
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
@@ -801,5 +938,34 @@ func TestExecuteSetsTempVarsBeforeNonCommandHook(t *testing.T) {
 		}
 	default:
 		t.Fatal("non-command hook ran before temporary variables were initialized")
+	}
+}
+
+func TestBanAddCommandReportsPersistenceFailure(t *testing.T) {
+	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	_, store := openBanListEventStore(t, filepath.Join(d.BaseConfig.DataDir, "events.db"), true)
+	d.BaseConfig.Name = banListEventStoreTestDiceID
+	d.DurableStore = store
+	d.DBOperator = nil
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := &MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession, PrivilegeLevel: 100}
+	msg := newPrivateMsg("QQ:999", ".ban add user QQ:storage-failure reason")
+	result := d.CmdMap["ban"].Solve(ctx, msg, &CmdArgs{
+		Args:    []string{"add", "user", "QQ:storage-failure", "reason"},
+		RawArgs: "add user QQ:storage-failure reason",
+	})
+	if !result.Matched || !result.Solved {
+		t.Fatalf("ban add result = %#v", result)
+	}
+	reply, ok := adapter.waitForMsg(2 * time.Second)
+	if !ok {
+		t.Fatal("ban add did not report the persistence failure")
+	}
+	if !strings.Contains(reply, "加入黑名单失败") || strings.Contains(reply, "已将") {
+		t.Fatalf("ban add reply = %q, must report failure without confirmation", reply)
 	}
 }

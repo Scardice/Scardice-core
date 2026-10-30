@@ -2,6 +2,7 @@ package dice
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"Scardice-core/adapterapi"
@@ -27,11 +28,12 @@ func TestExecutePureOnebotInboundRequiresDurableExecutor(t *testing.T) {
 	id := adapterapi.EndpointID("pureonebot-inbound-no-executor")
 	ep := NewPureOnebotReadEndpoint(id, adapterapi.ValidatedConfig{Version: 1, Canonical: []byte(`{"mode":"client","url":"ws://127.0.0.1:6700","accountHint":"QQ:10001"}`)})
 	_, err := d.ImSession.ExecutePureOnebotInbound(context.Background(), ep, adapterapi.InboundMessage{
-		ProviderEventID: "provider-event-no-executor",
-		Kind:            adapterapi.InboundKindMessage,
-		Text:            ".r 1d1",
+		ProviderEventID:  "provider-event-no-executor",
+		Kind:             adapterapi.InboundKindMessage,
+		ConversationKind: adapterapi.ConversationKindDirect,
+		Text:             ".r 1d1",
 	})
-	if err != ErrPureOnebotInboundUnavailable {
+	if !errors.Is(err, ErrPureOnebotInboundUnavailable) {
 		t.Fatalf("err = %v, want durable executor unavailable", err)
 	}
 }
@@ -46,7 +48,7 @@ func TestExecutePureOnebotInboundUsesInjectedDurableExecutor(t *testing.T) {
 	id := adapterapi.EndpointID("pureonebot-inbound-test")
 	ep := NewPureOnebotReadEndpoint(id, adapterapi.ValidatedConfig{Version: 1, Canonical: []byte(`{"mode":"client","url":"ws://127.0.0.1:6700","accountHint":"QQ:10001"}`)})
 	eventID := adapterapi.ProviderEventID("provider-event-1")
-	receipt, err := d.ImSession.ExecutePureOnebotInbound(context.Background(), ep, adapterapi.InboundMessage{ProviderEventID: eventID, Kind: adapterapi.InboundKindMessage, Text: ".r 1d1"})
+	receipt, err := d.ImSession.ExecutePureOnebotInbound(context.Background(), ep, adapterapi.InboundMessage{ProviderEventID: eventID, Kind: adapterapi.InboundKindMessage, ConversationKind: adapterapi.ConversationKindDirect, Text: ".r 1d1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,9 +63,6 @@ func TestExecutePureOnebotInboundUsesInjectedDurableExecutor(t *testing.T) {
 	default:
 		t.Fatal("durable executor did not receive inbound message")
 	}
-	if len(d.ImSession.EndPoints) != 1 {
-		t.Fatalf("read view mutated legacy endpoint slice: %d", len(d.ImSession.EndPoints))
-	}
 }
 
 func TestExecutePureOnebotInboundAllowsProviderEventIDFallback(t *testing.T) {
@@ -75,7 +74,7 @@ func TestExecutePureOnebotInboundAllowsProviderEventIDFallback(t *testing.T) {
 	}
 	d.ImSession.PureOnebotInboundExecutor = core
 	ep := NewPureOnebotReadEndpoint(adapterapi.EndpointID("pureonebot-inbound-fallback"), adapterapi.ValidatedConfig{Version: 1, Canonical: []byte(`{"mode":"client","url":"ws://127.0.0.1:6700"}`)})
-	receipt, err := d.ImSession.ExecutePureOnebotInbound(context.Background(), ep, adapterapi.InboundMessage{Kind: adapterapi.InboundKindMessage, Text: "plain"})
+	receipt, err := d.ImSession.ExecutePureOnebotInbound(context.Background(), ep, adapterapi.InboundMessage{Kind: adapterapi.InboundKindMessage, ConversationKind: adapterapi.ConversationKindDirect, Text: "plain"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,8 +88,9 @@ func TestExecutePureOnebotInboundRejectedReceiptHasNoSyntheticInboxID(t *testing
 	id := adapterapi.EndpointID("pureonebot-inbound-rejected")
 	ep := NewPureOnebotReadEndpoint(id, adapterapi.ValidatedConfig{Version: 1, Canonical: []byte(`{"mode":"client","url":"ws://127.0.0.1:6700"}`)})
 	receipt, err := d.ImSession.ExecutePureOnebotInbound(context.Background(), ep, adapterapi.InboundMessage{
-		ProviderEventID: "provider-event-rejected",
-		Kind:            adapterapi.InboundKindNotice,
+		ProviderEventID:  "provider-event-rejected",
+		Kind:             adapterapi.InboundKindReaction,
+		ConversationKind: adapterapi.ConversationKindDirect,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -107,7 +107,7 @@ func TestExecutePureOnebotInboundRejectsMissingDurableInboxID(t *testing.T) {
 		receipt:  adapterapi.IngressReceipt{Outcome: adapterapi.IngressDuplicate},
 	}
 	ep := NewPureOnebotReadEndpoint(adapterapi.EndpointID("pureonebot-inbound-missing-inbox"), adapterapi.ValidatedConfig{Version: 1, Canonical: []byte(`{"mode":"client","url":"ws://127.0.0.1:6700"}`)})
-	_, err := d.ImSession.ExecutePureOnebotInbound(context.Background(), ep, adapterapi.InboundMessage{Kind: adapterapi.InboundKindMessage, Text: "duplicate"})
+	_, err := d.ImSession.ExecutePureOnebotInbound(context.Background(), ep, adapterapi.InboundMessage{Kind: adapterapi.InboundKindMessage, ConversationKind: adapterapi.ConversationKindDirect, Text: "duplicate"})
 	if err == nil {
 		t.Fatal("missing durable inbox id was accepted")
 	}

@@ -196,6 +196,32 @@ func withHostState(ctx C.sc_host_ctx_t, fn func(*nativeHostState) C.sc_status_t)
 	return fn(state)
 }
 
+func withHostExecution(ctx C.sc_host_ctx_t, fn func(*nativeHostState) C.sc_status_t) C.sc_status_t {
+	return withHostState(ctx, func(state *nativeHostState) C.sc_status_t {
+		loop := state.loop
+		if loop == nil || !loop.onOwnerThread() {
+			state.setError(ErrNativeClosed)
+			return C.SC_ESTATE
+		}
+		scope := loop.CurrentContext()
+		if err := jsengine.ContextForExecution(scope).Err(); err != nil {
+			state.setError(err)
+			return C.SC_ESTATE
+		}
+		if loop.hostExecutionDepth == 0 {
+			leave, err := jsengine.EnterExecution(scope, loop.currentContext)
+			if err != nil {
+				state.setError(err)
+				return C.SC_ESTATE
+			}
+			defer leave()
+		}
+		loop.hostExecutionDepth++
+		defer func() { loop.hostExecutionDepth-- }()
+		return fn(state)
+	})
+}
+
 func hostString(view C.sc_string_view) (string, error) {
 	if view.len == 0 {
 		return "", nil
@@ -251,6 +277,19 @@ func (s *nativeHostState) checkRuntime(runtimeHandle C.sc_runtime_t) error {
 		return ErrNativeStaleValue
 	}
 	return nil
+}
+
+func (s *nativeHostState) releaseObject(runtimeHandle uint64, ref hostbridge.HostRef) error {
+	if s == nil || s.loop == nil || s.session == nil {
+		return ErrNativeClosed
+	}
+	if runtimeHandle != s.loop.runtime {
+		return ErrNativeStaleValue
+	}
+	if s.loop.closed.Load() && !s.loop.releaseWindow.Load() {
+		return ErrNativeClosed
+	}
+	return s.session.ReleaseObject(ref)
 }
 
 func decodeNativeServiceRequest(service C.sc_string_view, request *C.sc_host_service_request_v1) (jsservices.Name, jsservices.Request, error) {
@@ -312,9 +351,55 @@ func nativeHostServiceStatus(err error) C.sc_status_t {
 	}
 }
 
+//export sc_native_go_host_object_retain
+func sc_native_go_host_object_retain(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, ref C.sc_host_ref_t) C.sc_status_t {
+	return withHostState(ctx, func(state *nativeHostState) C.sc_status_t {
+		if err := state.checkRuntime(runtimeHandle); err != nil {
+			state.setError(err)
+			return C.sc_status_t(-20)
+		}
+		if err := state.session.RetainObject(hostbridge.HostRef(ref)); err != nil {
+			state.setError(err)
+			return C.sc_status_t(-20)
+		}
+		return C.SC_OK
+	})
+}
+
+//export sc_native_go_host_object_release
+func sc_native_go_host_object_release(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, ref C.sc_host_ref_t) C.sc_status_t {
+	return withHostState(ctx, func(state *nativeHostState) C.sc_status_t {
+		if err := state.releaseObject(uint64(runtimeHandle), hostbridge.HostRef(ref)); err != nil {
+			state.setError(err)
+			return C.sc_status_t(-20)
+		}
+		return C.SC_OK
+	})
+}
+
+//export sc_native_go_host_function_owner
+func sc_native_go_host_function_owner(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, function C.sc_host_func_t, outOwner *C.sc_host_ref_t) C.sc_status_t {
+	return withHostState(ctx, func(state *nativeHostState) C.sc_status_t {
+		if err := state.checkRuntime(runtimeHandle); err != nil || outOwner == nil {
+			if err == nil {
+				err = errors.New("host_function_owner output is nil")
+			}
+			state.setError(err)
+			return C.SC_EINVAL
+		}
+		owner, err := state.session.FunctionOwner(hostbridge.HostFuncRef(function))
+		if err != nil {
+			state.setError(err)
+			return C.SC_EHOST
+		}
+		*outOwner = C.sc_host_ref_t(owner)
+		return C.SC_OK
+	})
+}
+
 //export sc_native_go_host_get
 func sc_native_go_host_get(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, ref C.sc_host_ref_t, key C.sc_string_view, out *C.sc_value_t) C.sc_status_t {
-	return withHostState(ctx, func(state *nativeHostState) C.sc_status_t {
+	return withHostExecution(ctx, func(state *nativeHostState) C.sc_status_t {
 		if err := state.checkRuntime(runtimeHandle); err != nil || out == nil {
 			if err == nil {
 				err = errors.New("host_get output is nil")
@@ -344,7 +429,7 @@ func sc_native_go_host_get(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, re
 
 //export sc_native_go_host_set
 func sc_native_go_host_set(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, ref C.sc_host_ref_t, key C.sc_string_view, input C.sc_value_t) C.sc_status_t {
-	return withHostState(ctx, func(state *nativeHostState) C.sc_status_t {
+	return withHostExecution(ctx, func(state *nativeHostState) C.sc_status_t {
 		if err := state.checkRuntime(runtimeHandle); err != nil {
 			state.setError(err)
 			return C.sc_status_t(-20)
@@ -368,7 +453,7 @@ func sc_native_go_host_set(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, re
 
 //export sc_native_go_host_has
 func sc_native_go_host_has(ctx C.sc_host_ctx_t, ref C.sc_host_ref_t, key C.sc_string_view, out *C.uint32_t) C.sc_status_t {
-	return withHostState(ctx, func(state *nativeHostState) C.sc_status_t {
+	return withHostExecution(ctx, func(state *nativeHostState) C.sc_status_t {
 		if out == nil {
 			state.setError(errors.New("host_has output is nil"))
 			return C.sc_status_t(-20)
@@ -394,7 +479,7 @@ func sc_native_go_host_has(ctx C.sc_host_ctx_t, ref C.sc_host_ref_t, key C.sc_st
 
 //export sc_native_go_host_delete
 func sc_native_go_host_delete(ctx C.sc_host_ctx_t, ref C.sc_host_ref_t, key C.sc_string_view, out *C.uint32_t) C.sc_status_t {
-	return withHostState(ctx, func(state *nativeHostState) C.sc_status_t {
+	return withHostExecution(ctx, func(state *nativeHostState) C.sc_status_t {
 		if out == nil {
 			state.setError(errors.New("host_delete output is nil"))
 			return C.sc_status_t(-20)
@@ -420,7 +505,7 @@ func sc_native_go_host_delete(ctx C.sc_host_ctx_t, ref C.sc_host_ref_t, key C.sc
 
 //export sc_native_go_host_keys
 func sc_native_go_host_keys(ctx C.sc_host_ctx_t, ref C.sc_host_ref_t, buffer *C.char, capacity C.uint64_t, required *C.uint64_t) C.sc_status_t {
-	return withHostState(ctx, func(state *nativeHostState) C.sc_status_t {
+	return withHostExecution(ctx, func(state *nativeHostState) C.sc_status_t {
 		if required == nil {
 			state.setError(errors.New("host_keys output is nil"))
 			return C.sc_status_t(-20)
@@ -445,7 +530,7 @@ func sc_native_go_host_keys(ctx C.sc_host_ctx_t, ref C.sc_host_ref_t, buffer *C.
 
 //export sc_native_go_host_call
 func sc_native_go_host_call(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, function C.sc_host_func_t, thisValue C.sc_value_t, argv *C.sc_value_t, argc C.uint64_t, out *C.sc_value_t) C.sc_status_t {
-	return withHostState(ctx, func(state *nativeHostState) C.sc_status_t {
+	return withHostExecution(ctx, func(state *nativeHostState) C.sc_status_t {
 		if err := state.checkRuntime(runtimeHandle); err != nil || out == nil {
 			if err == nil {
 				err = errors.New("host_call output is nil")
@@ -484,7 +569,7 @@ func sc_native_go_host_call(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, f
 
 //export sc_native_go_host_service_call
 func sc_native_go_host_service_call(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, service C.sc_string_view, request *C.sc_host_service_request_v1, response *C.sc_host_service_response_v1) C.sc_status_t {
-	return withHostState(ctx, func(state *nativeHostState) C.sc_status_t {
+	return withHostExecution(ctx, func(state *nativeHostState) C.sc_status_t {
 		if err := state.checkRuntime(runtimeHandle); err != nil {
 			state.setError(err)
 			return C.SC_ECLOSED
@@ -565,7 +650,7 @@ func sc_native_go_host_service_call(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runt
 
 //export sc_native_go_host_service_start
 func sc_native_go_host_service_start(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, service C.sc_string_view, request *C.sc_host_service_request_v1, outRequest *C.sc_service_request_t) C.sc_status_t {
-	return withHostState(ctx, func(state *nativeHostState) C.sc_status_t {
+	return withHostExecution(ctx, func(state *nativeHostState) C.sc_status_t {
 		if err := state.checkRuntime(runtimeHandle); err != nil {
 			state.setError(err)
 			return C.SC_ECLOSED
@@ -646,12 +731,14 @@ type nativeCodec struct {
 	runtime uint64
 }
 
+var engineValueType = reflect.TypeOf((*jsengine.Value)(nil)).Elem()
+
 func (c nativeCodec) Decode(value hostbridge.Value, target reflect.Type) (reflect.Value, error) {
 	if target == nil {
 		return reflect.Value{}, errors.New("native codec callback target is nil")
 	}
 	if target.Kind() != reflect.Func {
-		return reflect.Value{}, fmt.Errorf("native codec callback target must be a function")
+		return reflect.Value{}, errors.New("native codec callback target must be a function")
 	}
 	if value.Kind != hostbridge.KindCallback {
 		return reflect.Value{}, errors.New("expected JavaScript callback value")
@@ -665,7 +752,10 @@ func (c nativeCodec) Decode(value hostbridge.Value, target reflect.Type) (reflec
 			outputs []reflect.Value
 			err     error
 		)
-		if c.state.loop.onOwnerThread() {
+		returnsEngineValue := target.NumOut() > 0 && target.Out(0) == engineValueType
+		if returnsEngineValue && !c.state.loop.onOwnerThread() {
+			err = errors.New("native callback returning jsengine.Value must run in its owner loop")
+		} else if c.state.loop.onOwnerThread() {
 			outputs, err = c.callCallback(token, target, inputs)
 		} else {
 			err = c.state.loop.Run(func(jsengine.Runtime) error {
@@ -694,16 +784,6 @@ func (c nativeCodec) callCallback(token hostbridge.CallbackRef, target reflect.T
 		return nil, err
 	}
 	arguments := make([]uint64, len(inputs))
-	for i, input := range inputs {
-		value, err := c.state.reflectValue(input)
-		if err != nil {
-			return nil, err
-		}
-		arguments[i], err = c.state.encodeValue(c.runtime, value)
-		if err != nil {
-			return nil, err
-		}
-	}
 	defer func() {
 		for _, argument := range arguments {
 			if argument != 0 {
@@ -711,6 +791,12 @@ func (c nativeCodec) callCallback(token hostbridge.CallbackRef, target reflect.T
 			}
 		}
 	}()
+	for i, input := range inputs {
+		arguments[i], err = c.encodeCallbackArgument(input)
+		if err != nil {
+			return nil, fmt.Errorf("native callback argument %d: %w", i+1, err)
+		}
+	}
 	var output C.uint64_t
 	errorBuffer := make([]byte, 512)
 	status := C.sc_native_function_call(
@@ -724,11 +810,12 @@ func (c nativeCodec) callCallback(token hostbridge.CallbackRef, target reflect.T
 	if output == 0 {
 		return nil, errors.New("native callback returned an empty value")
 	}
-	defer C.sc_native_value_release(C.uint64_t(c.state.loop.provider.library), C.uint64_t(c.runtime), output)
-	value, err := c.state.decodeValue(c.runtime, uint64(output))
-	if err != nil {
-		return nil, err
-	}
+	outputOwned := true
+	defer func() {
+		if outputOwned {
+			C.sc_native_value_release(C.uint64_t(c.state.loop.provider.library), C.uint64_t(c.runtime), output)
+		}
+	}()
 	resultCount := target.NumOut()
 	hasError := resultCount > 0 && target.Out(resultCount-1) == reflect.TypeOf((*error)(nil)).Elem()
 	if hasError {
@@ -739,15 +826,71 @@ func (c nativeCodec) callCallback(token hostbridge.CallbackRef, target reflect.T
 	}
 	results := make([]reflect.Value, target.NumOut())
 	if resultCount == 1 {
-		results[0], err = c.state.session.DecodeValue(value, target.Out(0), c)
-		if err != nil {
-			return nil, err
+		if target.Out(0) == engineValueType {
+			scope := c.state.loop.activeScope
+			if !c.state.loop.onOwnerThread() || scope == nil || scope.released.Load() {
+				return nil, errors.New("native callback result requires an active owner-loop scope")
+			}
+			value := scope.value(uint64(output))
+			if value == nil {
+				return nil, ErrNativeClosed
+			}
+			outputOwned = false
+			results[0] = reflect.New(engineValueType).Elem()
+			results[0].Set(reflect.ValueOf(value))
+		} else {
+			value, err := c.state.decodeValue(c.runtime, uint64(output))
+			if err != nil {
+				return nil, err
+			}
+			results[0], err = c.state.session.DecodeValue(value, target.Out(0), c)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	if hasError {
 		results[len(results)-1] = reflect.Zero(target.Out(len(results) - 1))
 	}
 	return results, nil
+}
+
+func (c nativeCodec) encodeCallbackArgument(input reflect.Value) (uint64, error) {
+	if input.IsValid() && input.Type() == engineValueType && !input.IsNil() {
+		abstract, ok := input.Interface().(jsengine.Value)
+		if !ok || abstract == nil {
+			return 0, errors.New("native callback argument is not an engine value")
+		}
+		value, ok := abstract.(*nativeValue)
+		if !ok || value == nil {
+			return 0, errors.New("native callback value belongs to another engine")
+		}
+		if c.state == nil || c.state.loop == nil {
+			return 0, errors.New("native callback has no owner runtime")
+		}
+		loop := c.state.loop
+		scope := loop.activeScope
+		if !loop.onOwnerThread() || c.runtime == 0 || c.runtime != loop.runtime ||
+			scope == nil || scope.released.Load() || value.handle == 0 || value.loop != loop ||
+			value.runtime != c.runtime || value.scope != scope || !value.usable() {
+			return 0, errors.New("native callback value belongs to another or expired owner scope")
+		}
+		var errorBuffer [256]byte
+		status := C.sc_native_value_retain(
+			C.uint64_t(loop.provider.library), C.uint64_t(c.runtime), C.uint64_t(value.handle),
+			(*C.char)(unsafe.Pointer(&errorBuffer[0])), C.uint64_t(len(errorBuffer)),
+		)
+		if err := loop.operation(status, cError(errorBuffer[:])); err != nil {
+			return 0, err
+		}
+		return value.handle, nil
+	}
+
+	value, err := c.state.reflectValue(input)
+	if err != nil {
+		return 0, err
+	}
+	return c.state.encodeValue(c.runtime, value)
 }
 
 func pointerToUint64(values []uint64) *C.uint64_t {
@@ -826,11 +969,10 @@ func (s *nativeHostState) decodeValue(runtimeHandle, handle uint64) (hostbridge.
 			if err := s.loop.operation(status, cError(errorBuffer)); err != nil {
 				return hostbridge.UndefinedValue(), err
 			}
-			if buffer[len(buffer)-1] == 0 {
-				buffer = buffer[:len(buffer)-1]
-			}
 		}
 		return hostbridge.StringValue(string(buffer)), nil
+	case nativeTypeObject:
+		return s.decodeJSONSnapshot(runtimeHandle, handle)
 	case nativeTypeHostObject, nativeTypeHostFunction:
 		var ref C.uint64_t
 		var kind C.uint32_t
@@ -907,20 +1049,20 @@ func (s *nativeHostState) encodeValue(runtimeHandle uint64, value hostbridge.Val
 	}
 	switch value.Kind {
 	case hostbridge.KindUndefined:
-		return call(func(out *C.uint64_t, err *C.char, cap C.uint64_t) C.int {
-			return C.sc_native_value_new_undefined(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), out, err, cap)
+		return call(func(out *C.uint64_t, err *C.char, capacity C.uint64_t) C.int {
+			return C.sc_native_value_new_undefined(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), out, err, capacity)
 		})
 	case hostbridge.KindNull:
-		return call(func(out *C.uint64_t, err *C.char, cap C.uint64_t) C.int {
-			return C.sc_native_value_new_null(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), out, err, cap)
+		return call(func(out *C.uint64_t, err *C.char, capacity C.uint64_t) C.int {
+			return C.sc_native_value_new_null(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), out, err, capacity)
 		})
 	case hostbridge.KindBool:
 		raw := C.uint32_t(0)
 		if value.Bool {
 			raw = 1
 		}
-		return call(func(out *C.uint64_t, err *C.char, cap C.uint64_t) C.int {
-			return C.sc_native_value_new_bool(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), raw, out, err, cap)
+		return call(func(out *C.uint64_t, err *C.char, capacity C.uint64_t) C.int {
+			return C.sc_native_value_new_bool(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), raw, out, err, capacity)
 		})
 	case hostbridge.KindString:
 		data := []byte(value.String)
@@ -929,30 +1071,30 @@ func (s *nativeHostState) encodeValue(runtimeHandle uint64, value hostbridge.Val
 			data = []byte{0}
 		}
 		ptr = (*C.char)(unsafe.Pointer(&data[0]))
-		output, err := call(func(out *C.uint64_t, e *C.char, cap C.uint64_t) C.int {
-			return C.sc_native_value_new_string(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), ptr, C.uint64_t(len(value.String)), out, e, cap)
+		output, err := call(func(out *C.uint64_t, e *C.char, capacity C.uint64_t) C.int {
+			return C.sc_native_value_new_string(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), ptr, C.uint64_t(len(value.String)), out, e, capacity)
 		})
 		runtime.KeepAlive(data)
 		return output, err
 	case hostbridge.KindInt:
-		return call(func(out *C.uint64_t, err *C.char, cap C.uint64_t) C.int {
-			return C.sc_native_value_new_i64(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), C.int64_t(value.Int), out, err, cap)
+		return call(func(out *C.uint64_t, err *C.char, capacity C.uint64_t) C.int {
+			return C.sc_native_value_new_i64(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), C.int64_t(value.Int), out, err, capacity)
 		})
 	case hostbridge.KindUint:
-		return call(func(out *C.uint64_t, err *C.char, cap C.uint64_t) C.int {
-			return C.sc_native_value_new_u64(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), C.uint64_t(value.Uint), out, err, cap)
+		return call(func(out *C.uint64_t, err *C.char, capacity C.uint64_t) C.int {
+			return C.sc_native_value_new_u64(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), C.uint64_t(value.Uint), out, err, capacity)
 		})
 	case hostbridge.KindFloat:
-		return call(func(out *C.uint64_t, err *C.char, cap C.uint64_t) C.int {
-			return C.sc_native_value_new_f64(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), C.double(value.Float), out, err, cap)
+		return call(func(out *C.uint64_t, err *C.char, capacity C.uint64_t) C.int {
+			return C.sc_native_value_new_f64(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), C.double(value.Float), out, err, capacity)
 		})
 	case hostbridge.KindHostObject:
-		return call(func(out *C.uint64_t, err *C.char, cap C.uint64_t) C.int {
-			return C.sc_native_host_object_new(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), C.uint64_t(value.Host), C.uint32_t(hostbridge.KindHostObject), out, err, cap)
+		return call(func(out *C.uint64_t, err *C.char, capacity C.uint64_t) C.int {
+			return C.sc_native_host_object_new(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), C.uint64_t(value.Host), C.uint32_t(hostbridge.KindHostObject), out, err, capacity)
 		})
 	case hostbridge.KindHostFunction:
-		return call(func(out *C.uint64_t, err *C.char, cap C.uint64_t) C.int {
-			return C.sc_native_host_function_new(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), C.uint64_t(value.Function), out, err, cap)
+		return call(func(out *C.uint64_t, err *C.char, capacity C.uint64_t) C.int {
+			return C.sc_native_host_function_new(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), C.uint64_t(value.Function), out, err, capacity)
 		})
 	default:
 		return 0, fmt.Errorf("unsupported HostBridge value kind %d", value.Kind)

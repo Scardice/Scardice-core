@@ -11,9 +11,9 @@ import (
 )
 
 type secretAtomicStore struct {
-	work eventstore.UnitOfWork
+	work  eventstore.UnitOfWork
 	calls int
-	err error
+	err   error
 }
 
 func (s *secretAtomicStore) Commit(_ context.Context, work eventstore.UnitOfWork) (eventstore.CommitResult, error) {
@@ -27,26 +27,37 @@ func (*secretAtomicStore) Load(context.Context, eventstore.StreamID, uint64) ([]
 func (*secretAtomicStore) Close() error { return nil }
 
 type secretAtomicCodec struct {
-	domain string
+	domain   string
 	identity string
-	owner string
-	version uint64
+	owner    string
+	version  uint64
 }
+
 func (c *secretAtomicCodec) EncryptBound(_ context.Context, domain, identity, owner string, version uint64, _ []byte) ([]byte, []byte, string, error) {
 	c.domain, c.identity, c.owner, c.version = domain, identity, owner, version
 	return []byte("opaque-ciphertext"), make([]byte, 12), "key", nil
 }
 
 type strictSecretDescriptor struct{}
+
 func (strictSecretDescriptor) Key() adapterapi.AdapterKey { return adapterapi.AdapterKey("pureonebot") }
-func (strictSecretDescriptor) ConfigVersion() uint16 { return 1 }
+func (strictSecretDescriptor) ConfigVersion() uint16      { return 1 }
 func (strictSecretDescriptor) ValidateConfig(_ context.Context, raw json.RawMessage) (adapterapi.ValidatedConfig, error) {
 	canonical, err := adapterapi.CanonicalizeJSON(raw)
-	if err != nil { return adapterapi.ValidatedConfig{}, err }
+	if err != nil {
+		return adapterapi.ValidatedConfig{}, err
+	}
 	return adapterapi.ValidatedConfig{Version: 1, Canonical: canonical, SecretRefs: []adapterapi.SecretRef{{Ref: "token-a", Version: 1}}}, nil
 }
-func (strictSecretDescriptor) SupportedActions(adapterapi.ValidatedConfig) adapterapi.ActionSet { return 0 }
-func (strictSecretDescriptor) NewRuntime(adapterapi.RuntimeInit) (adapterapi.AdapterRuntime, error) { return nil, errors.New("not used") }
+func (strictSecretDescriptor) SupportedActions(adapterapi.ValidatedConfig) adapterapi.ActionSet {
+	return 0
+}
+func (strictSecretDescriptor) Capabilities(adapterapi.ValidatedConfig) adapterapi.CapabilitySet {
+	return adapterapi.CapabilityLifecycle
+}
+func (strictSecretDescriptor) NewRuntime(adapterapi.RuntimeInit) (adapterapi.AdapterRuntime, error) {
+	return nil, errors.New("not used")
+}
 
 func TestEndpointCommandSecretInputSharesAtomicCommit(t *testing.T) {
 	store := &secretAtomicStore{err: errors.New("rollback")}
@@ -59,7 +70,7 @@ func TestEndpointCommandSecretInputSharesAtomicCommit(t *testing.T) {
 	command := Command{
 		Kind: CommandCreate, CommandID: "secret-create", CorrelationID: "secret-correlation",
 		EndpointID: adapterapi.EndpointID("endpoint-secret"), AdapterKey: adapterapi.AdapterKey("pureonebot"),
-		Config: adapterapi.ValidatedConfig{Version: 1, Canonical: configCanonical, SecretRefs: []adapterapi.SecretRef{{Ref: "token-ref", Version: 1}}},
+		Config:      adapterapi.ValidatedConfig{Version: 1, Canonical: configCanonical, SecretRefs: []adapterapi.SecretRef{{Ref: "token-ref", Version: 1}}},
 		SecretInput: &SecretInput{Ref: "token-ref", Version: 1, Plaintext: []byte("token-bytes")},
 	}
 	decision, err := Decide(State{}, command)
@@ -100,8 +111,8 @@ func TestEndpointServiceRejectsSecretReferenceAliasMismatch(t *testing.T) {
 	store := &secretAtomicStore{}
 	service := &Service{
 		Repository: NewRepository(store, &secretAtomicCodec{}),
-		Store: store,
-		Registry: map[adapterapi.AdapterKey]adapterapi.Descriptor{adapterapi.AdapterKey("pureonebot"): descriptor},
+		Store:      store,
+		Registry:   serviceRegistry{descriptor.Key(): descriptor},
 	}
 	command := Command{
 		Kind: CommandCreate, CommandID: "alias-mismatch", CorrelationID: "alias-correlation",

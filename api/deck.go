@@ -17,7 +17,11 @@ func deckList(c echo.Context) error {
 		return c.JSON(http.StatusForbidden, nil)
 	}
 
-	return c.JSON(http.StatusOK, myDice.DeckList)
+	decks := myDice.DeckList
+	if decks == nil {
+		decks = []*dice.DeckInfo{}
+	}
+	return c.JSON(http.StatusOK, decks)
 }
 
 func deckReload(c echo.Context) error {

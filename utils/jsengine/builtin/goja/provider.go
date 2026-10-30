@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"Scardice-core/utils/jsengine"
@@ -50,7 +51,7 @@ func validateOptions(raw json.RawMessage) error {
 		return nil
 	}
 	if raw[0] != '{' {
-		return fmt.Errorf("goja: unsupported runtime options: expected a JSON object")
+		return errors.New("goja: unsupported runtime options: expected a JSON object")
 	}
 
 	var options map[string]json.RawMessage
@@ -58,7 +59,7 @@ func validateOptions(raw json.RawMessage) error {
 		return fmt.Errorf("goja: unsupported runtime options: invalid JSON: %w", err)
 	}
 	if len(options) != 0 {
-		return fmt.Errorf("goja: unsupported runtime options: Goja has no provider-specific options")
+		return errors.New("goja: unsupported runtime options: Goja has no provider-specific options")
 	}
 	return nil
 }

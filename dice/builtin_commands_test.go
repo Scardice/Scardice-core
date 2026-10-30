@@ -12,6 +12,8 @@ import (
 
 	milky "github.com/Szzrain/Milky-go-sdk"
 	ds "github.com/sealdice/dicescript"
+
+	"Scardice-core/adapterapi"
 )
 
 const (
@@ -26,6 +28,70 @@ const (
 	testMilkyOwnerRoleChinese        = "群主"
 	testMilkyAdminRoleChinese        = "管理员"
 )
+
+type managementCaptureBridge struct {
+	mu      sync.Mutex
+	actions []adapterapi.EffectPayload
+}
+
+func (b *managementCaptureBridge) SubmitText(*MsgContext, *Message, string, string, bool) error {
+	return nil
+}
+
+func (b *managementCaptureBridge) SubmitAction(_ *MsgContext, payload adapterapi.EffectPayload) error {
+	b.mu.Lock()
+	b.actions = append(b.actions, payload)
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *managementCaptureBridge) snapshot() []adapterapi.EffectPayload {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]adapterapi.EffectPayload(nil), b.actions...)
+}
+
+func captureManagementActions(d *Dice) *managementCaptureBridge {
+	bridge := &managementCaptureBridge{}
+	d.OutboundBridge = bridge
+	return bridge
+}
+
+func assertQuitEffect(t *testing.T, bridge *managementCaptureBridge, groupID string) {
+	t.Helper()
+	actions := bridge.snapshot()
+	if len(actions) != 1 || actions[0].Kind != adapterapi.EffectPayloadQuit || string(actions[0].Target.Conversation) != groupID {
+		t.Fatalf("quit effects = %#v, want one quit for %q", actions, groupID)
+	}
+}
+
+func TestGetOnebotBotQQIDUsesCanonicalReadViewIdentity(t *testing.T) {
+	ctx := &MsgContext{EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{UserID: " QQ:123456 "}}}
+	botID, ok := getOnebotBotQQID(ctx)
+	if !ok || botID != 123456 {
+		t.Fatalf("getOnebotBotQQID() = (%d, %v), want (123456, true)", botID, ok)
+	}
+}
+
+func TestGetOnebotBotQQIDRejectsInvalidReadViewIdentityWithoutAdapter(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		ctx  *MsgContext
+	}{
+		{name: "nil context"},
+		{name: "nil endpoint", ctx: &MsgContext{}},
+		{name: "empty identity", ctx: &MsgContext{EndPoint: &EndPointInfo{}}},
+		{name: "zero identity", ctx: &MsgContext{EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{UserID: "QQ:0"}}}},
+		{name: "negative identity", ctx: &MsgContext{EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{UserID: "QQ:-1"}}}},
+		{name: "malformed identity", ctx: &MsgContext{EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{UserID: "QQ:not-a-number"}}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if botID, ok := getOnebotBotQQID(test.ctx); ok || botID != 0 {
+				t.Fatalf("getOnebotBotQQID() = (%d, %v), want (0, false)", botID, ok)
+			}
+		})
+	}
+}
 
 type noopMilkyLogger struct{}
 
@@ -195,8 +261,9 @@ func TestBotCommandDeclinesUnaddressedGroupWhenConfigured(t *testing.T) {
 }
 
 func TestBotByeWithoutConfirmQuitsCurrentGroup(t *testing.T) {
-	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
+	bridge := captureManagementActions(d)
 
 	ep.Platform = "TG"
 	d.Config.BotExitWithoutAt = true
@@ -207,14 +274,13 @@ func TestBotByeWithoutConfirmQuitsCurrentGroup(t *testing.T) {
 		t.Fatalf("unexpected result: %#v", result)
 	}
 
-	if len(adapter.quitGroups) != 1 || adapter.quitGroups[0] != msg.GroupID {
-		t.Fatalf("expected quit current group once, got %#v", adapter.quitGroups)
-	}
+	assertQuitEffect(t, bridge, msg.GroupID)
 }
 
 func TestBotByeTargetGroupNormalizesAndQuitsTarget(t *testing.T) {
-	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
+	bridge := captureManagementActions(d)
 
 	ep.Platform = "TG"
 	d.Config.BotExitWithoutAt = true
@@ -225,15 +291,13 @@ func TestBotByeTargetGroupNormalizesAndQuitsTarget(t *testing.T) {
 		t.Fatalf("unexpected result: %#v", result)
 	}
 
-	wantGroupID := "TG-Group:3003"
-	if len(adapter.quitGroups) != 1 || adapter.quitGroups[0] != wantGroupID {
-		t.Fatalf("expected quit normalized target group %q, got %#v", wantGroupID, adapter.quitGroups)
-	}
+	assertQuitEffect(t, bridge, "TG-Group:3003")
 }
 
 func TestBotByeWithExtraArgsShowsHelpAndDoesNotQuit(t *testing.T) {
-	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
+	bridge := captureManagementActions(d)
 
 	ep.Platform = "TG"
 	d.Config.BotExitWithoutAt = true
@@ -244,14 +308,15 @@ func TestBotByeWithExtraArgsShowsHelpAndDoesNotQuit(t *testing.T) {
 		t.Fatalf("expected help result, got %#v", result)
 	}
 
-	if len(adapter.quitGroups) != 0 {
-		t.Fatalf("expected no quit for invalid args, got %#v", adapter.quitGroups)
+	if actions := bridge.snapshot(); len(actions) != 0 {
+		t.Fatalf("invalid args submitted quit effects: %#v", actions)
 	}
 }
 
 func TestDismissAcceptsFourDigitConfirmationCode(t *testing.T) {
-	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
+	bridge := captureManagementActions(d)
 
 	d.Config.BotExitWithoutAt = true
 	ctx, msg := newQuitCommandTestContext(t, d, ep, "QQ:9004", "QQ-Group:2004", "DismissGroup")
@@ -260,8 +325,8 @@ func TestDismissAcceptsFourDigitConfirmationCode(t *testing.T) {
 	if !first.Matched || !first.Solved {
 		t.Fatalf("unexpected initial result: %#v", first)
 	}
-	if len(adapter.quitGroups) != 0 {
-		t.Fatalf("dismiss should not quit before confirmation, got %#v", adapter.quitGroups)
+	if actions := bridge.snapshot(); len(actions) != 0 {
+		t.Fatalf("dismiss submitted before confirmation: %#v", actions)
 	}
 
 	confirmKey := getDismissConfirmKeyForGroup(ctx, msg.Sender.UserID, msg.GroupID)
@@ -275,9 +340,7 @@ func TestDismissAcceptsFourDigitConfirmationCode(t *testing.T) {
 		t.Fatalf("unexpected confirmed result: %#v", second)
 	}
 
-	if len(adapter.quitGroups) != 1 || adapter.quitGroups[0] != msg.GroupID {
-		t.Fatalf("expected dismiss confirmation to quit current group, got %#v", adapter.quitGroups)
-	}
+	assertQuitEffect(t, bridge, msg.GroupID)
 }
 
 func TestShouldDismissRequireOwnerConfirmMilkyRoleNormalization(t *testing.T) {
@@ -333,7 +396,7 @@ func newMilkyQuitCommandTestContext(t *testing.T, d *Dice, senderID, groupID, gr
 	pa.EndPoint = ep
 	pa.IntentSession = session
 	ep.Adapter = pa
-	ep.BindRuntime(d.ImSession)
+	ep.bindCompatibilityRuntime(d.ImSession)
 
 	d.Config.BotExitWithoutAt = true
 	ctx, msg := newQuitCommandTestContext(t, d, ep, senderID, groupID, groupName)
@@ -345,6 +408,7 @@ func TestDismissMilkyOwnerRequiresConfirmationBeforeQuit(t *testing.T) {
 	defer cleanup()
 
 	ctx, msg, harness, closeHarness := newMilkyQuitCommandTestContext(t, d, "QQ:9010", testMilkyOwnerGroupID, "MilkyDismissGroup")
+	bridge := captureManagementActions(d)
 	defer closeHarness()
 
 	first := d.CmdMap["dismiss"].Solve(ctx, msg, &CmdArgs{})
@@ -365,15 +429,14 @@ func TestDismissMilkyOwnerRequiresConfirmationBeforeQuit(t *testing.T) {
 	if !second.Matched || !second.Solved {
 		t.Fatalf("unexpected confirmed result: %#v", second)
 	}
-	if got := harness.quitGroupSnapshot(); len(got) != 1 || got[0] != testMilkyOwnerGroupQQID {
-		t.Fatalf("expected exactly one milky quit call for group 2010, got %#v", got)
-	}
+	assertQuitEffect(t, bridge, testMilkyOwnerGroupID)
 }
 
 func TestDismissMilkyLookupErrorFallsBackToSafetyConfirmation(t *testing.T) {
 	d, _, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 	d.ExtList = nil
+	bridge := captureManagementActions(d)
 
 	session, harness, closeHarness := newMilkyRESTHarness(t, "", "milky lookup failed", testMilkyFallbackGroupQQID, 10020)
 	defer closeHarness()
@@ -383,7 +446,7 @@ func TestDismissMilkyLookupErrorFallsBackToSafetyConfirmation(t *testing.T) {
 	pa.EndPoint = ep
 	pa.IntentSession = session
 	ep.Adapter = pa
-	ep.BindRuntime(d.ImSession)
+	ep.bindCompatibilityRuntime(d.ImSession)
 
 	d.Config.BotExitWithoutAt = true
 	ctx, msg := newQuitCommandTestContext(t, d, ep, "QQ:9020", testMilkyFallbackGroupID, "MilkyFallbackGroup")
@@ -414,9 +477,7 @@ func TestDismissMilkyLookupErrorFallsBackToSafetyConfirmation(t *testing.T) {
 	if !second.Matched || !second.Solved {
 		t.Fatalf("unexpected confirmed result: %#v", second)
 	}
-	if got := harness.quitGroupSnapshot(); len(got) != 1 || got[0] != testMilkyFallbackGroupQQID {
-		t.Fatalf("expected exactly one milky quit call for group 2020, got %#v", got)
-	}
+	assertQuitEffect(t, bridge, testMilkyFallbackGroupID)
 }
 
 func TestShouldDismissRequireOwnerConfirmMilkyEmptyRole(t *testing.T) {

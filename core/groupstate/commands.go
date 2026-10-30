@@ -3,62 +3,63 @@ package groupstate
 import "errors"
 
 type CommandKind string
+
 const (
-	CommandCreate CommandKind = "create"
+	CommandCreate     CommandKind = "create"
 	CommandActivation CommandKind = "activation"
-	CommandIdentity CommandKind = "identity"
-	CommandName CommandKind = "name"
-	CommandExtension CommandKind = "extension"
-	CommandSystem CommandKind = "system"
-	CommandTemplate CommandKind = "template"
-	CommandHelp CommandKind = "help"
-	CommandWelcome CommandKind = "welcome"
-	CommandBotList CommandKind = "bot_list"
-	CommandPrivilege CommandKind = "privilege"
-	CommandDelete CommandKind = "delete"
+	CommandIdentity   CommandKind = "identity"
+	CommandName       CommandKind = "name"
+	CommandExtension  CommandKind = "extension"
+	CommandSystem     CommandKind = "system"
+	CommandTemplate   CommandKind = "template"
+	CommandHelp       CommandKind = "help"
+	CommandWelcome    CommandKind = "welcome"
+	CommandBotList    CommandKind = "bot_list"
+	CommandPrivilege  CommandKind = "privilege"
+	CommandDelete     CommandKind = "delete"
 )
 const (
-	Create = CommandCreate
+	Create     = CommandCreate
 	Activation = CommandActivation
-	Identity = CommandIdentity
-	Name = CommandName
-	Extension = CommandExtension
-	System = CommandSystem
-	Help = CommandHelp
-	Welcome = CommandWelcome
-	BotList = CommandBotList
-	Privilege = CommandPrivilege
-	Delete = CommandDelete
+	Identity   = CommandIdentity
+	Name       = CommandName
+	Extension  = CommandExtension
+	System     = CommandSystem
+	Help       = CommandHelp
+	Welcome    = CommandWelcome
+	BotList    = CommandBotList
+	Privilege  = CommandPrivilege
+	Delete     = CommandDelete
 )
 
 type Command struct {
-	Kind CommandKind
-	Type CommandKind
-	DiceID string
-	GroupID string
-	GroupName string
-	InviteUserID string
-	EnteredAt int64
-	GuildID string
-	ChannelID string
+	Kind                CommandKind
+	Type                CommandKind
+	DiceID              string
+	GroupID             string
+	GroupName           string
+	InviteUserID        string
+	EnteredAt           int64
+	GuildID             string
+	ChannelID           string
 	DiceIDForActivation string
-	Active bool
-	Exists bool
-	ExtensionID string
-	Enabled bool
-	System string
-	DiceSideNum int64
-	DiceSideExpr string
-	RollShaperMode string
-	CocRuleIndex int
+	Active              bool
+	Exists              bool
+	ExtensionID         string
+	Enabled             bool
+	System              string
+	DiceSideNum         int64
+	DiceSideExpr        string
+	RollShaperMode      string
+	CocRuleIndex        int
 
-	DefaultHelpGroup string
-	HelpPackages []string
-	WelcomeEnabled bool
-	WelcomeMessage string
-	UserID string
-	Level int
-	ExpectedVersion uint64
+	DefaultHelpGroup   string
+	HelpPackages       []string
+	WelcomeEnabled     bool
+	WelcomeMessage     string
+	UserID             string
+	Level              int
+	ExpectedVersion    uint64
 	ExpectedVersionSet bool
 }
 
@@ -73,19 +74,32 @@ var ErrInvalidCommand = errors.New("groupstate: invalid command")
 var ErrStaleVersion = errors.New("groupstate: stale expected version")
 
 func Decide(state State, command Command) (Decision, error) {
-	if command.ExpectedVersionSet && command.ExpectedVersion != state.Version { return Decision{}, ErrStaleVersion }
-	kind := command.Kind; if kind == "" { kind = command.Type }
+	if command.ExpectedVersionSet && command.ExpectedVersion != state.Version {
+		return Decision{}, ErrStaleVersion
+	}
+	kind := command.Kind
+	if kind == "" {
+		kind = command.Type
+	}
 	if kind == CommandCreate {
-		if state.Version != 0 { return Decision{}, ErrInvalidState }
-		if ValidateIdentity(command.DiceID, command.GroupID) != nil { return Decision{}, ErrInvalidCommand }
+		if state.Version != 0 {
+			return Decision{}, ErrInvalidState
+		}
+		if ValidateIdentity(command.DiceID, command.GroupID) != nil {
+			return Decision{}, ErrInvalidCommand
+		}
 		return Decision{Events: []TypedEvent{NewGroupCreatedWithInviteV1(command.DiceID, command.GroupID, command.GroupName, command.InviteUserID, command.EnteredAt)}}, nil
 	}
-	if state.Version == 0 || state.Deleted { return Decision{}, ErrInvalidState }
+	if state.Version == 0 || state.Deleted {
+		return Decision{}, ErrInvalidState
+	}
 	switch kind {
 	case CommandIdentity:
 		return Decision{Events: []TypedEvent{NewGroupIdentityChangedV1(command.GuildID, command.ChannelID)}}, nil
 	case CommandActivation:
-		if command.DiceIDForActivation == "" { command.DiceIDForActivation = command.DiceID }
+		if command.DiceIDForActivation == "" {
+			command.DiceIDForActivation = command.DiceID
+		}
 		return Decision{Events: []TypedEvent{NewGroupActivationChangedV1(command.DiceIDForActivation, command.Active, command.Exists)}}, nil
 	case CommandName:
 		return Decision{Events: []TypedEvent{NewGroupNameChangedV1(command.GroupName)}}, nil

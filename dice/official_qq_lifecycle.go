@@ -20,7 +20,7 @@ func (pa *PlatformAdapterOfficialQQ) acceptVerifiedAccount(ctx context.Context, 
 		return err
 	}
 	userID := formatDiceIDOfficialQQ(identity.ID)
-	for _, endpoint := range d.ImSession.EndPoints {
+	for _, endpoint := range d.ImSession.EndPointsReadOnly() {
 		if endpoint == nil || endpoint == pa.EndPoint || endpoint.ID == pa.EndPoint.ID {
 			continue
 		}

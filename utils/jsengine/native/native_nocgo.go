@@ -15,6 +15,10 @@ import (
 type Provider struct{ candidate Candidate }
 type LoadedProvider = Provider
 
+func wrapNoCgo(path string) error {
+	return fmt.Errorf("%w: cgo is required to load %s", ErrNativeRuntimeUnsupported, path)
+}
+
 func Load(candidate Candidate) (*Provider, error) { return candidate.Load() }
 func loadNative(candidate Candidate) (*Provider, error) {
 	if _, err := os.Stat(candidate.LibraryPath); errors.Is(err, os.ErrNotExist) {

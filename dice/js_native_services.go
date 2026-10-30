@@ -19,6 +19,8 @@ import (
 	"Scardice-core/utils/jsengine/services"
 )
 
+var errNativeJSServiceLoopUnavailable = errors.New("native JavaScript service loop is unavailable")
+
 type nativeConsoleService struct {
 	printer *PrinterFunc
 }
@@ -142,11 +144,11 @@ func (s *nativeFilesystemService) Invoke(call services.Call) (services.Response,
 		return services.Response{Status: statusForFilesystemError(err)}, err
 	}
 	if write {
-		if err := jsFsEnsureParent(resolved); err != nil {
-			return services.Response{Status: services.StatusInternal}, err
+		if parentErr := jsFsEnsureParent(resolved); parentErr != nil {
+			return services.Response{Status: services.StatusInternal}, parentErr
 		}
-		if err := utils.AtomicWriteFile(resolved.abs, request.Bytes, 0644); err != nil {
-			return services.Response{Status: services.StatusInternal}, err
+		if writeErr := utils.AtomicWriteFile(resolved.abs, request.Bytes, 0644); writeErr != nil {
+			return services.Response{Status: services.StatusInternal}, writeErr
 		}
 		return services.Response{Status: services.StatusOK}, nil
 	}
@@ -259,6 +261,8 @@ func (s *nativeFilesystemService) Start(call services.AsyncCall) error {
 			} else {
 				response = services.Response{Status: services.StatusOK}
 			}
+		default:
+			response = services.Response{Status: services.StatusUnsupported, String: services.ErrUnsupported.Error()}
 		}
 		select {
 		case <-cancelled:
@@ -290,9 +294,9 @@ func (d *Dice) validateNativeFilesystemBytes(data []byte, write bool) error {
 	if d == nil {
 		return errors.New("native filesystem service is unavailable")
 	}
-	limitMiB := d.Config.JsConfig.QuickJSMaxFilesystemReadMiB
+	limitMiB := d.Config.QuickJSMaxFilesystemReadMiB
 	if write {
-		limitMiB = d.Config.JsConfig.QuickJSMaxFilesystemWriteMiB
+		limitMiB = d.Config.QuickJSMaxFilesystemWriteMiB
 	}
 	if limitMiB == 0 {
 		return nil
@@ -312,7 +316,6 @@ func (d *Dice) validateNativeFilesystemBytes(data []byte, write bool) error {
 	return nil
 }
 
-
 type nativeServiceFactory struct {
 	name       services.Name
 	newService func(*Dice, jsengine.Loop) services.Service
@@ -328,6 +331,9 @@ var nativeServiceFactories = []nativeServiceFactory{
 	{name: services.Fetch, newService: func(d *Dice, loop jsengine.Loop) services.Service {
 		return newNativeFetchService(d, loop)
 	}},
+	{name: services.WebSocket, newService: func(d *Dice, _ jsengine.Loop) services.Service {
+		return newNativeWebSocketService(d)
+	}},
 	{name: services.Filesystem, newService: func(d *Dice, _ jsengine.Loop) services.Service {
 		return &nativeFilesystemService{dice: d}
 	}},
@@ -340,7 +346,15 @@ type nativeServiceAuthorizer struct {
 
 func (a nativeServiceAuthorizer) Authorize(service services.Name, operation services.OperationID, target string) error {
 	switch services.NormalizeName(service) {
-	case services.Fetch, services.HTTP, services.WebSocket:
+	case services.Fetch, services.HTTP:
+		if err := jsNetworkAuthorizeWithContext(a.dice, a.context, target); err != nil {
+			return err
+		}
+		return jsCompatibilityExternalAccess(a.context)
+	case services.WebSocket:
+		if operation != services.OpWebSocketConnect {
+			return nil
+		}
 		if err := jsNetworkAuthorizeWithContext(a.dice, a.context, target); err != nil {
 			return err
 		}
@@ -357,8 +371,11 @@ func (a nativeServiceAuthorizer) Authorize(service services.Name, operation serv
 }
 
 func (d *Dice) installNativeJSServices(loop jsengine.Loop) (*services.Registry, error) {
-	if loop == nil || !loop.Descriptor().Capabilities.Has(jsengine.CapabilityHostService) {
-		return nil, nil
+	if loop == nil {
+		return nil, errNativeJSServiceLoopUnavailable
+	}
+	if !loop.Descriptor().Capabilities.Has(jsengine.CapabilityHostService) {
+		return nil, fmt.Errorf("%w: engine %q does not advertise host services", services.ErrUnsupported, loop.Engine())
 	}
 	descriptor := loop.Descriptor()
 	registry := services.NewRegistry()

@@ -105,7 +105,7 @@ func Test_sendNoticeTargetCrossPlatform_delivers_selected_target_without_metadat
 		},
 		Adapter: adapter,
 	}
-	session := &IMSession{Parent: d, EndPoints: []*EndPointInfo{endpoint}}
+	session := &IMSession{Parent: d, ServiceAtNew: new(SyncMap[string, *GroupInfo])}
 	d.ImSession = session
 	endpoint.Session = session
 	ctx := &MsgContext{Dice: d, Session: session, EndPoint: endpoint}

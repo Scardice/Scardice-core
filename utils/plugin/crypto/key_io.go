@@ -128,24 +128,32 @@ func importJWK(rt *goja.Runtime, jwk map[string]interface{}, algorithm string, a
 			return nil, err
 		}
 		size := (curve.Params().BitSize + 7) / 8
-		rawPub := make([]byte, 1+2*size)
-		rawPub[0] = 0x04
-		copy(rawPub[1:1+size], leftPad(x.Bytes(), size))
-		copy(rawPub[1+size:], leftPad(y.Bytes(), size))
-		ecdhCurve, err := ecdhCurveByElliptic(curve)
-		if err != nil {
-			return nil, err
-		}
-		if _, err = ecdhCurve.NewPublicKey(rawPub); err != nil {
+		if x.BitLen() > size*8 || y.BitLen() > size*8 {
 			return nil, errors.New("invalid EC JWK point")
 		}
-		pub := &ecdsa.PublicKey{Curve: curve, X: x, Y: y}
+		rawPub := make([]byte, 1+2*size)
+		rawPub[0] = 0x04
+		x.FillBytes(rawPub[1 : 1+size])
+		y.FillBytes(rawPub[1+size:])
+		pub, err := ecdsa.ParseUncompressedPublicKey(curve, rawPub)
+		if err != nil {
+			return nil, fmt.Errorf("invalid EC JWK point: %w", err)
+		}
 		if hasMapKey(jwk, "d") {
 			d, err := parseJWKBigInt(jwk, "d")
 			if err != nil {
 				return nil, err
 			}
-			priv := &ecdsa.PrivateKey{PublicKey: *pub, D: d}
+			if d.BitLen() > size*8 {
+				return nil, errors.New("invalid EC JWK private scalar")
+			}
+			priv, err := ecdsa.ParseRawPrivateKey(curve, d.FillBytes(make([]byte, size)))
+			if err != nil {
+				return nil, fmt.Errorf("invalid EC JWK private scalar: %w", err)
+			}
+			if !priv.PublicKey.Equal(pub) {
+				return nil, errors.New("EC JWK public key does not match private scalar")
+			}
 			handle := &cryptoKeyHandle{
 				Type:        "private",
 				Extractable: extractable,
@@ -305,26 +313,26 @@ func exportJWK(handle *cryptoKeyHandle) (map[string]interface{}, error) {
 		return jwk, nil
 	}
 
-	if handle.ECDSAPublic != nil || handle.ECDSAPrivate != nil || handle.ECDHPublic != nil || handle.ECDHPrivate != nil {
+	if pub := ecPublicFromHandle(handle); pub != nil {
+		rawPub, err := pub.Bytes()
+		if err != nil {
+			return nil, err
+		}
+		size := (len(rawPub) - 1) / 2
 		jwk["kty"] = "EC"
-		pub := handle.ECDSAPublic
-		if pub == nil && handle.ECDSAPrivate != nil {
-			pub = &handle.ECDSAPrivate.PublicKey
-		}
-		if pub == nil {
-			pub = handle.ECDHPublic
-		}
-		if pub == nil && handle.ECDHPrivate != nil {
-			pub = &handle.ECDHPrivate.PublicKey
-		}
-		size := (pub.Curve.Params().BitSize + 7) / 8
 		jwk["crv"] = namedCurveFromElliptic(pub.Curve)
-		jwk["x"] = base64.RawURLEncoding.EncodeToString(leftPad(pub.X.Bytes(), size))
-		jwk["y"] = base64.RawURLEncoding.EncodeToString(leftPad(pub.Y.Bytes(), size))
-		if handle.ECDSAPrivate != nil {
-			jwk["d"] = base64.RawURLEncoding.EncodeToString(leftPad(handle.ECDSAPrivate.D.Bytes(), size))
-		} else if handle.ECDHPrivate != nil {
-			jwk["d"] = base64.RawURLEncoding.EncodeToString(leftPad(handle.ECDHPrivate.D.Bytes(), size))
+		jwk["x"] = base64.RawURLEncoding.EncodeToString(rawPub[1 : 1+size])
+		jwk["y"] = base64.RawURLEncoding.EncodeToString(rawPub[1+size:])
+		priv := handle.ECDSAPrivate
+		if priv == nil {
+			priv = handle.ECDHPrivate
+		}
+		if priv != nil {
+			rawPriv, err := priv.Bytes()
+			if err != nil {
+				return nil, err
+			}
+			jwk["d"] = base64.RawURLEncoding.EncodeToString(rawPriv)
 		}
 		return jwk, nil
 	}
@@ -837,19 +845,6 @@ func namedCurveByName(name string) (elliptic.Curve, string, error) {
 		return elliptic.P521(), "P-521", nil
 	default:
 		return nil, "", fmt.Errorf("unsupported namedCurve: %s", name)
-	}
-}
-
-func ecdhCurveByElliptic(curve elliptic.Curve) (ecdh.Curve, error) {
-	switch curve {
-	case elliptic.P256():
-		return ecdh.P256(), nil
-	case elliptic.P384():
-		return ecdh.P384(), nil
-	case elliptic.P521():
-		return ecdh.P521(), nil
-	default:
-		return nil, errors.New("unsupported ECDH curve")
 	}
 }
 

@@ -2,18 +2,24 @@ package jsengine
 
 import "errors"
 
-// ErrPrimitiveExportUnsupported indicates that a value is not a JavaScript
-// primitive and therefore cannot cross the engine-neutral conversion boundary.
-var ErrPrimitiveExportUnsupported = errors.New("JavaScript value is not a primitive")
+var (
+	// ErrNoPrimitiveValue indicates that JavaScript null or undefined has no
+	// Go primitive value to return.
+	ErrNoPrimitiveValue = errors.New("JavaScript value has no primitive representation")
+
+	// ErrPrimitiveExportUnsupported indicates that a value is not a JavaScript
+	// primitive and therefore cannot cross the engine-neutral conversion boundary.
+	ErrPrimitiveExportUnsupported = errors.New("JavaScript value is not a primitive")
+)
 
 // Value is a JavaScript value scoped to a Runtime callback.
 type Value interface {
 	// Export is a legacy, engine-specific escape hatch. Generic callers MUST
 	// use Object or ExportPrimitive instead.
 	Export() interface{}
-	// ExportPrimitive returns nil for both JavaScript undefined and null. It
-	// returns booleans, strings, and numeric primitives unchanged. Objects,
-	// functions, and host references return ErrPrimitiveExportUnsupported.
+	// ExportPrimitive returns ErrNoPrimitiveValue for JavaScript undefined and
+	// null. It returns booleans, strings, and numeric primitives unchanged.
+	// Objects, functions, and host references return ErrPrimitiveExportUnsupported.
 	ExportPrimitive() (any, error)
 	ToBoolean() bool
 	Object() Object
@@ -26,11 +32,24 @@ type DangerousExposer interface {
 	ExposeDangerous(target interface{}) (Value, error)
 }
 
+// JSONParser is an optional runtime capability for decoding JSON into
+// engine-native objects and arrays. Returned values share the current Runtime
+// callback's ownership scope and MUST NOT escape it.
+type JSONParser interface {
+	ParseJSON(raw string) (Value, error)
+}
+
 // Object is a mutable JavaScript object scoped to a Runtime callback.
 type Object interface {
 	Set(name string, value interface{}) error
 	Get(name string) Value
 	Has(name string) bool
+}
+
+// FallibleObject exposes property access errors that ordinary Object.Get
+// represents as an undefined value.
+type FallibleObject interface {
+	GetWithError(name string) (Value, error)
 }
 
 // Loop serializes all access to one JavaScript realm.

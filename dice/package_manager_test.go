@@ -810,6 +810,94 @@ func TestJsClearRestoresEnabledPackageTemplates(t *testing.T) {
 		t.Fatal("expected builtin templates to remain available after jsClear")
 	}
 }
+func TestJSGameSystemTemplateCannotReplaceFileTemplateDuringReload(t *testing.T) {
+	d := &Dice{GameSystemMap: new(SyncMap[string, *GameSystemTemplate])}
+	d.preferFileBackedGameSystemTemplates = true
+	baseTemplate, err := loadGameSystemTemplateFromData([]byte(loadTemplateFixture(t, "startup-template")), "yaml")
+	if err != nil {
+		t.Fatalf("load file-backed template: %v", err)
+	}
+	d.GameSystemTemplateAddEx(baseTemplate, true)
+	d.JsReloading = true
+
+	jsOverride := strings.Replace(loadTemplateFixture(t, "startup-template"), "fullName: package fixture", "fullName: JS override", 1)
+	if err := d.addJSGameSystemTemplate(jsOverride, "yaml"); err != nil {
+		t.Fatalf("register colliding JS template: %v", err)
+	}
+	jsSecondOverride := strings.Replace(loadTemplateFixture(t, "startup-template"), "fullName: package fixture", "fullName: second JS override", 1)
+	if err := d.addJSGameSystemTemplate(jsSecondOverride, "yaml"); err != nil {
+		t.Fatalf("register second colliding JS template: %v", err)
+	}
+	got, exists := d.GameSystemMap.Load("startup-template")
+	if !exists || got.FullName != "package fixture" {
+		t.Fatalf("file-backed template during JS reload = %#v, want package fixture", got)
+	}
+
+	jsOnly := loadTemplateFixture(t, "startup-js-only-template")
+	if err := d.addJSGameSystemTemplate(jsOnly, "yaml"); err != nil {
+		t.Fatalf("register JS-only template: %v", err)
+	}
+	if _, exists := d.GameSystemMap.Load("startup-js-only-template"); !exists {
+		t.Fatal("JS-only template should remain available during reload")
+	}
+
+	d.GameSystemMap.Delete("startup-template")
+	d.restoreJSTemplates()
+	got, exists = d.GameSystemMap.Load("startup-template")
+	if !exists || got.FullName != "second JS override" {
+		t.Fatalf("JS template after file-backed template removal = %#v, want second JS override", got)
+	}
+}
+func TestDangerousJSGameSystemTemplateAddsRetainSourceOwnership(t *testing.T) {
+	dataDir := t.TempDir()
+	templatePath := filepath.Join(t.TempDir(), "package-template.yaml")
+	packageTemplate := loadTemplateFixture(t, "startup-template")
+	if err := os.WriteFile(templatePath, []byte(packageTemplate), 0o600); err != nil {
+		t.Fatalf("write package template: %v", err)
+	}
+	d := &Dice{
+		BaseConfig:    BaseConfig{DataDir: dataDir},
+		Logger:        zap.NewNop().Sugar(),
+		GameSystemMap: new(SyncMap[string, *GameSystemTemplate]),
+	}
+	if err := d.GameSystemTemplateReloadFiles([]string{templatePath}); err != nil {
+		t.Fatalf("load file-backed templates: %v", err)
+	}
+	d.preferFileBackedGameSystemTemplates = true
+	d.JsReloading = true
+	d.JsSealInstExposed = true
+
+	override, err := loadGameSystemTemplateFromData([]byte(strings.Replace(packageTemplate, "fullName: package fixture", "fullName: dangerous JS override", 1)), "yaml")
+	if err != nil {
+		t.Fatalf("load dangerous JS override: %v", err)
+	}
+	if d.GameSystemTemplateAddEx(override, true) {
+		t.Fatal("dangerous JS API replaced a file-backed template during EventStore startup")
+	}
+	if got, exists := d.GameSystemMap.Load("startup-template"); !exists || got.FullName != "package fixture" {
+		t.Fatalf("file-backed template after dangerous registration = %#v, want package fixture", got)
+	}
+
+	jsOnly, err := loadGameSystemTemplateFromData([]byte(loadTemplateFixture(t, "startup-js-only-template")), "yaml")
+	if err != nil {
+		t.Fatalf("load JS-only template: %v", err)
+	}
+	if !d.GameSystemTemplateAddEx(jsOnly, true) {
+		t.Fatal("dangerous JS API did not add a JS-only template")
+	}
+
+	d.JsReloading = false
+	if err := d.GameSystemTemplateReloadFiles([]string{templatePath}); err != nil {
+		t.Fatalf("reload file-backed templates: %v", err)
+	}
+	d.restoreJSTemplates()
+	if got, exists := d.GameSystemMap.Load("startup-template"); !exists || got.FullName != "package fixture" {
+		t.Fatalf("file-backed template after package reload = %#v, want package fixture", got)
+	}
+	if _, exists := d.GameSystemMap.Load("startup-js-only-template"); !exists {
+		t.Fatal("JS-only template added through seal.inst was lost on package reload")
+	}
+}
 
 func TestPackageManagerReloadHelpdocUsesReloadHelp(t *testing.T) {
 	testDice, pm := newTestPackageManager(t)
@@ -842,7 +930,7 @@ func TestPackageManagerReloadHelpdocUsesReloadHelp(t *testing.T) {
 	if !result.Success {
 		t.Fatalf("ReloadByContent(helpdoc) success = false, result = %#v", result)
 	}
-	if manager.IsHelpReloading {
+	if manager.IsHelpReloading.Load() {
 		t.Fatal("IsHelpReloading should be false after reload")
 	}
 	if manager.Help == nil || !manager.Help.IsAvailable() {

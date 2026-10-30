@@ -52,9 +52,9 @@ func storeRemoveBackend(c echo.Context) error {
 		})
 	}
 	var params struct {
-		ID        string `json:"id"`
-		BackendID string `json:"backendID"`
-		Url       string `json:"url"`
+		ID        string `json:"id"        query:"id"`
+		BackendID string `json:"backendID" query:"backendID"`
+		Url       string `json:"url"       query:"url"`
 	}
 	if err := c.Bind(&params); err != nil {
 		return Error(&c, err.Error(), Response{})

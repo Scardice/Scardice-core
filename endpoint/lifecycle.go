@@ -7,9 +7,9 @@ import (
 	"strings"
 	"sync"
 
-	"Scardice-core/adapterapi"
 	"Scardice-core/eventstore"
 )
+
 var (
 	ErrEndpointLifecycleUnavailable = errors.New("endpoint: lifecycle unavailable")
 	ErrEndpointNotReady             = errors.New("endpoint: store is not ready")
@@ -21,17 +21,7 @@ var (
 // EndpointStateLister is the replay-only source used by startup. It must read
 // durable state and must not construct adapter runtimes.
 type EndpointStateLister interface {
-	ListEndpointStates(context.Context) ([]State, error)
-}
-
-// EndpointViewLister is a projection-backed startup source. Views are mapped
-// to State values without exposing private runtime or secret data.
-type EndpointViewLister interface {
-	ListEndpointViews(context.Context) ([]EndpointView, error)
-}
-
-type EndpointIDLister interface {
-	ListEndpointIDs(context.Context) ([]adapterapi.EndpointID, error)
+	ListEndpointStates(ctx context.Context) ([]State, error)
 }
 
 type StartupOption func(*StartupOptions)
@@ -39,7 +29,7 @@ type StartupOption func(*StartupOptions)
 type StartupOptions struct {
 	Rebuild          bool
 	ProjectorVersion string
-	Lister           any
+	Lister           EndpointStateLister
 }
 
 func WithProjectionRebuild(enabled bool) StartupOption {
@@ -50,14 +40,14 @@ func WithProjectorVersion(version string) StartupOption {
 	return func(options *StartupOptions) { options.ProjectorVersion = strings.TrimSpace(version) }
 }
 
-func WithEndpointLister(lister any) StartupOption {
+func WithEndpointLister(lister EndpointStateLister) StartupOption {
 	return func(options *StartupOptions) { options.Lister = lister }
 }
 
 type StartupResult struct {
-	Rebuilt    bool
-	Rebuild    eventstore.RebuildResult
-	Reconcile  ReconcileResult
+	Rebuilt   bool
+	Rebuild   eventstore.RebuildResult
+	Reconcile ReconcileResult
 }
 
 type ReconcileResult struct {
@@ -73,7 +63,7 @@ type EndpointLifecycle struct {
 	Supervisor       *Supervisor
 	Service          *Service
 	Store            eventstore.Store
-	Source           any
+	Source           EndpointStateLister
 	Rebuilder        eventstore.ProjectionRebuilder
 	ProjectorVersion string
 	shutdownMu       sync.Mutex
@@ -84,26 +74,18 @@ type EndpointLifecycle struct {
 	activeOps        int
 	closing          bool
 }
-func NewEndpointLifecycle(supervisor *Supervisor, source any, args ...any) *EndpointLifecycle {
+
+func NewEndpointLifecycle(supervisor *Supervisor, source EndpointStateLister, rebuilders ...eventstore.ProjectionRebuilder) *EndpointLifecycle {
 	lifecycle := &EndpointLifecycle{Supervisor: supervisor, Source: source, ProjectorVersion: EndpointProjectionVersion}
 	lifecycle.opDone = make(chan struct{})
 	close(lifecycle.opDone)
-	if service, ok := source.(*Service); ok && service != nil {
-		lifecycle.Service = service
-		lifecycle.Store = service.Store
-	}
 	if store, ok := source.(eventstore.Store); ok {
 		lifecycle.Store = store
 	}
-	for _, arg := range args {
-		switch candidate := arg.(type) {
-		case eventstore.ProjectionRebuilder:
-			lifecycle.Rebuilder = candidate
-		case EndpointStateLister, EndpointViewLister, EndpointIDLister,
-			func(context.Context) ([]State, error),
-			func(context.Context) ([]EndpointView, error),
-			func(context.Context) ([]adapterapi.EndpointID, error):
-			lifecycle.Source = candidate
+	for _, rebuilder := range rebuilders {
+		if rebuilder != nil {
+			lifecycle.Rebuilder = rebuilder
+			break
 		}
 	}
 	if lifecycle.Rebuilder == nil {
@@ -112,10 +94,6 @@ func NewEndpointLifecycle(supervisor *Supervisor, source any, args ...any) *Endp
 		}
 	}
 	return lifecycle
-}
-
-func NewEndpointStartup(supervisor *Supervisor, source any, args ...any) *EndpointLifecycle {
-	return NewEndpointLifecycle(supervisor, source, args...)
 }
 
 func (l *EndpointLifecycle) beginOperation() error {
@@ -158,7 +136,6 @@ func (l *EndpointLifecycle) beginClosing() <-chan struct{} {
 	}
 	return l.opDone
 }
-
 
 func (l *EndpointLifecycle) Startup(ctx context.Context, options ...StartupOption) (StartupResult, error) {
 	if ctx == nil {
@@ -318,14 +295,14 @@ func (l *EndpointLifecycle) requireReady(ctx context.Context) error {
 	if l == nil {
 		return ErrEndpointLifecycleUnavailable
 	}
-	if checker, ok := l.Source.(interface{ ValidateReadiness(context.Context) error }); ok {
-		if err := checker.ValidateReadiness(ctx); err != nil {
+	if getter, ok := l.Source.(eventstore.ReadinessMetadataRepository); ok {
+		if _, err := getter.GetReadinessMetadata(ctx); err != nil {
 			return fmt.Errorf("%w: %w", ErrEndpointNotReady, err)
 		}
 		return nil
 	}
-	if checker, ok := l.Store.(interface{ ValidateReadiness(context.Context) error }); ok {
-		if err := checker.ValidateReadiness(ctx); err != nil {
+	if getter, ok := l.Store.(eventstore.ReadinessMetadataRepository); ok {
+		if _, err := getter.GetReadinessMetadata(ctx); err != nil {
 			return fmt.Errorf("%w: %w", ErrEndpointNotReady, err)
 		}
 		return nil
@@ -342,62 +319,39 @@ func (l *EndpointLifecycle) requireReady(ctx context.Context) error {
 		}
 		return nil
 	}
+	if checker, ok := l.Source.(interface {
+		ValidateReadiness(ctx context.Context) error
+	}); ok {
+		if err := checker.ValidateReadiness(ctx); err != nil {
+			return fmt.Errorf("%w: %w", ErrEndpointNotReady, err)
+		}
+		return nil
+	}
+	if checker, ok := l.Store.(interface {
+		ValidateReadiness(ctx context.Context) error
+	}); ok {
+		if err := checker.ValidateReadiness(ctx); err != nil {
+			return fmt.Errorf("%w: %w", ErrEndpointNotReady, err)
+		}
+		return nil
+	}
 	return fmt.Errorf("%w: readiness checker unavailable", ErrEndpointNotReady)
 }
 
-func (l *EndpointLifecycle) listStates(ctx context.Context, source any) ([]State, error) {
+func (l *EndpointLifecycle) listStates(ctx context.Context, source EndpointStateLister) ([]State, error) {
 	if source == nil {
 		source = l.Source
 	}
-	switch candidate := source.(type) {
-	case EndpointStateLister:
-		return candidate.ListEndpointStates(ctx)
-	case func(context.Context) ([]State, error):
-		return candidate(ctx)
-	case EndpointViewLister:
-		views, err := candidate.ListEndpointViews(ctx)
-		return statesFromViews(views), err
-	case func(context.Context) ([]EndpointView, error):
-		views, err := candidate(ctx)
-		return statesFromViews(views), err
-	case EndpointIDLister:
-		return l.loadIDs(ctx, candidate)
-	case func(context.Context) ([]adapterapi.EndpointID, error):
-		ids, err := candidate(ctx)
-		if err != nil { return nil, err }
-		return l.loadIDsFromIDs(ctx, ids)
-	}
-	if l.Service != nil && l.Service.Repository != nil {
-		if candidate, ok := l.Service.Store.(EndpointIDLister); ok {
-			return l.loadIDs(ctx, candidate)
-		}
-	}
-	return nil, ErrEndpointListerUnavailable
-}
-
-func (l *EndpointLifecycle) loadIDs(ctx context.Context, lister EndpointIDLister) ([]State, error) {
-	ids, err := lister.ListEndpointIDs(ctx)
-	if err != nil { return nil, err }
-	return l.loadIDsFromIDs(ctx, ids)
-}
-
-func (l *EndpointLifecycle) loadIDsFromIDs(ctx context.Context, ids []adapterapi.EndpointID) ([]State, error) {
-	if l.Service == nil || l.Service.Repository == nil {
+	if source == nil {
 		return nil, ErrEndpointListerUnavailable
 	}
-	states := make([]State, 0, len(ids))
-	for _, id := range ids {
-		state, err := l.Service.Repository.Load(ctx, id)
-		if err != nil { return nil, err }
-		states = append(states, state)
-	}
-	return states, nil
+	return source.ListEndpointStates(ctx)
 }
 
 func statesFromViews(views []EndpointView) []State {
 	states := make([]State, 0, len(views))
 	for _, view := range views {
-		states = append(states, State{EndpointID: view.EndpointID, AdapterKey: view.AdapterKey, Config: view.Config.Clone(), DesiredState: view.DesiredState, ObservedState: view.ObservedState, OperationState: view.OperationState, DesiredVersion: view.DesiredVersion, Generation: view.Generation, OperationID: view.OperationID, CorrelationID: view.CorrelationID, Version: view.Version})
+		states = append(states, State{EndpointID: view.EndpointID, DisplayName: view.DisplayName, Statistics: view.Statistics, AdapterKey: view.AdapterKey, Config: view.Config.Clone(), DesiredState: view.DesiredState, ObservedState: view.ObservedState, OperationState: view.OperationState, DesiredVersion: view.DesiredVersion, ProviderID: view.ProviderID, Generation: view.Generation, OperationID: view.OperationID, CorrelationID: view.CorrelationID, Version: view.Version})
 	}
 	return states
 }

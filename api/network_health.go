@@ -3,26 +3,41 @@ package api
 import (
 	"context"
 	"net/http"
-	"net/url"
 	"sync"
 	"time"
 
 	"github.com/labstack/echo/v4"
-	"github.com/samber/lo"
 	"golang.org/x/sync/singleflight"
-
-	"Scardice-core/dice"
 )
 
-const (
-	checkTimes                 = 3
-	checkTimeout time.Duration = 5 * time.Second
-)
+const checkTimeout time.Duration = 5 * time.Second
 
 type networkHealthTarget struct {
-	Target   string        `json:"target"`
-	Ok       bool          `json:"ok"`
-	Duration time.Duration `json:"duration"`
+	Target     string        `json:"target"`
+	Ok         bool          `json:"ok"`
+	Duration   time.Duration `json:"duration"`
+	StatusCode int           `json:"statusCode"`
+}
+
+type networkHealthTargetSpec struct {
+	target string
+	url    string
+}
+
+var networkHealthTargetSpecs = [...]networkHealthTargetSpec{
+	{target: "qq", url: "https://api.sgroup.qq.com/users/@me"},
+	{target: "kook", url: "https://www.kookapp.cn/api/v3/channel/view"},
+	{target: "discord", url: "https://discord.com/api/v10/gateway"},
+	// The invalid fixed token is only a probe marker; getMe returns API JSON, unlike the website redirect.
+	{target: "telegram", url: "https://api.telegram.org/bot000000000:INVALID_NETWORK_HEALTH_PROBE/getMe"},
+	{target: "dingtalk", url: "https://api.dingtalk.com/v1.0/gateway/connections/open"},
+	{target: "slack", url: "https://slack.com/api/api.test"},
+}
+
+type networkHealthProbeResult struct {
+	Ok         bool
+	Duration   time.Duration
+	StatusCode int
 }
 
 type networkHealthResult struct {
@@ -55,133 +70,73 @@ func (checker *networkHealthChecker) check(ctx context.Context) (networkHealthRe
 	}
 }
 
-func checkHTTPConnectivity(url string) (bool, time.Duration) {
-	ctx, cancel := context.WithTimeout(context.Background(), checkTimeout)
-	defer cancel()
-
-	type rs struct {
-		ok       bool
-		duration time.Duration
+func networkHealthHTTPClient(transport http.RoundTripper) *http.Client {
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
-	rsChan := make(chan rs, checkTimes)
-	once := func(url string) {
-		myDice.Logger.Debugf("check http connectivity, url=%s", url)
+}
+
+func checkHTTPConnectivity(client *http.Client, endpoint string) networkHealthProbeResult {
+	var probe networkHealthProbeResult
+	for range 2 {
+		ctx, cancel := context.WithTimeout(context.Background(), checkTimeout)
 		start := time.Now()
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		resp, err := http.DefaultClient.Do(req) //nolint:gosec
-		duration := time.Since(start)
+		myDice.Logger.Debugf("check http connectivity, url=%s", endpoint)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			cancel()
+			myDice.Logger.Debugf("url can't be connected, error: %s", err)
+			return networkHealthProbeResult{Duration: time.Since(start)}
+		}
+		resp, err := client.Do(req) //nolint:gosec
+		probe.Duration = time.Since(start)
 		if err == nil {
 			_ = resp.Body.Close()
-			rsChan <- rs{true, duration}
-		} else {
-			myDice.Logger.Debugf("url can't be connected, error: %s", err)
-			rsChan <- rs{false, duration}
+			cancel()
+			probe.Ok = true
+			probe.StatusCode = resp.StatusCode
+			return probe
 		}
+		cancel()
+		myDice.Logger.Debugf("url can't be connected, error: %s", err)
 	}
-
-	var wg sync.WaitGroup
-	for range checkTimes {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			once(url)
-		}()
-	}
-	wg.Wait()
-	close(rsChan)
-
-	ok := true
-	var (
-		totalDuration int64
-		count         int64
-		duration      int64
-	)
-	for res := range rsChan {
-		ok = ok && res.ok
-		if res.ok {
-			count++
-			totalDuration += int64(res.duration)
-		}
-	}
-	if count != 0 {
-		duration = totalDuration / count
-	}
-	return ok, time.Duration(duration)
+	return probe
 }
 
 func runNetworkHealthCheck() networkHealthResult {
-	total := 5 // baidu, seal, sign, google, github
+	return runNetworkHealthCheckWithClient(networkHealthHTTPClient(http.DefaultTransport))
+}
+
+func runNetworkHealthCheckWithClient(client *http.Client) networkHealthResult {
+	targets := make([]networkHealthTarget, len(networkHealthTargetSpecs))
 	var wg sync.WaitGroup
-	rsChan := make(chan networkHealthTarget, total)
-
-	checkUrls := func(target string, urls []string) {
-		for _, url := range urls {
-			ok, duration := checkHTTPConnectivity(url)
-			if ok {
-				rsChan <- networkHealthTarget{
-					Target:   target,
-					Ok:       true,
-					Duration: duration,
-				}
-				return
-			}
-		}
-		rsChan <- networkHealthTarget{
-			Target:   target,
-			Ok:       false,
-			Duration: 0,
-		}
-	}
-
-	signGroups, err := dice.LagrangeGetSignInfo(myDice)
-	if err == nil && len(signGroups) > 0 {
-		signServers := signGroups[len(signGroups)-1].Servers // 取下发列表中 version 最新的签名服务器组，即最后一条
-		urls := lo.Map(signServers, func(signServerInfo *dice.SignServerInfo, _ int) string {
-			ping, _ := url.JoinPath(signServerInfo.Url, "/ping")
-			return ping
-		})
+	for index, target := range networkHealthTargetSpecs {
 		wg.Add(1)
-		go func() {
+		go func(index int, target networkHealthTargetSpec) {
 			defer wg.Done()
-			checkUrls("sign", urls)
-		}()
+			probe := checkHTTPConnectivity(client, target.url)
+			targets[index] = networkHealthTarget{
+				Target:     target.target,
+				Ok:         probe.Ok,
+				Duration:   probe.Duration,
+				StatusCode: probe.StatusCode,
+			}
+		}(index, target)
 	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		checkUrls("baidu", []string{"https://baidu.com"})
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		checkUrls("seal", dice.BackendUrls)
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		checkUrls("google", []string{"https://google.com"})
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		checkUrls("github", []string{"https://github.com"})
-	}()
-
 	wg.Wait()
-	close(rsChan)
 
-	var ok []string
-	var targets []networkHealthTarget
-	for target := range rsChan {
-		targets = append(targets, target)
+	ok := make([]string, 0, len(targets))
+	for _, target := range targets {
 		if target.Ok {
 			ok = append(ok, target.Target)
 		}
 	}
 
 	return networkHealthResult{
-		Total:     total,
+		Total:     len(networkHealthTargetSpecs),
 		Ok:        ok,
 		Targets:   targets,
 		Timestamp: time.Now().Unix(),
@@ -194,9 +149,12 @@ func (checker *networkHealthChecker) handle(c echo.Context) error {
 		return err
 	}
 
+	if result.Ok == nil {
+		result.Ok = []string{}
+	}
 	return Success(&c, Response{
 		"total":     result.Total,
-		"ok":        result.Ok, // 被 targets 代替，可废弃，但先为接口兼容保留
+		"ok":        result.Ok,
 		"targets":   result.Targets,
 		"timestamp": result.Timestamp,
 	})

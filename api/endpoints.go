@@ -45,18 +45,24 @@ type DiagnosticView struct {
 }
 
 type EndpointView struct {
-	EndpointID     string             `json:"endpointId"`
-	AdapterKey     string             `json:"adapterKey"`
-	Config         EndpointConfigView `json:"config"`
-	DesiredState   string             `json:"desiredState"`
-	ObservedState  string             `json:"observedState"`
-	OperationState string             `json:"operationState"`
-	DesiredVersion uint64             `json:"desiredVersion"`
-	Generation     uint64             `json:"generation"`
-	OperationID    string             `json:"operationId,omitempty"`
-	CorrelationID  string             `json:"correlationId,omitempty"`
-	Version        uint64             `json:"version"`
-	Capabilities   CapabilityView     `json:"capabilities"`
+	EndpointID          string             `json:"endpointId"`
+	DisplayName         string             `json:"displayName,omitempty"`
+	ProviderID          string             `json:"providerId,omitempty"`
+	GroupNum            int64              `json:"groupNum"`
+	CmdExecutedNum      int64              `json:"cmdExecutedNum"`
+	CmdExecutedLastTime int64              `json:"cmdExecutedLastTime"`
+	OnlineTotalTime     int64              `json:"onlineTotalTime"`
+	AdapterKey          string             `json:"adapterKey"`
+	Config              EndpointConfigView `json:"config"`
+	DesiredState        string             `json:"desiredState"`
+	ObservedState       string             `json:"observedState"`
+	OperationState      string             `json:"operationState"`
+	DesiredVersion      uint64             `json:"desiredVersion"`
+	Generation          uint64             `json:"generation"`
+	OperationID         string             `json:"operationId,omitempty"`
+	CorrelationID       string             `json:"correlationId,omitempty"`
+	Version             uint64             `json:"version"`
+	Capabilities        CapabilityView     `json:"capabilities"`
 }
 
 type OperationView struct {
@@ -87,6 +93,7 @@ type ErrorResponse struct {
 
 type EndpointCreateRequest struct {
 	EndpointID               string                `json:"endpointId,omitempty"`
+	DisplayName              string                `json:"displayName,omitempty"`
 	AdapterKey               string                `json:"adapterKey"`
 	Config                   EndpointConfigPayload `json:"config"`
 	Secrets                  map[string]string     `json:"secrets,omitempty"`
@@ -122,8 +129,6 @@ type adminMutation struct {
 func adminAuthHTTPError(c echo.Context, err error) error {
 	status, code, message := http.StatusUnauthorized, "admin_unauthorized", "administrator authentication failed"
 	switch {
-	case errors.Is(err, errAdminUnavailable):
-		status, code, message = http.StatusServiceUnavailable, "admin_auth_unavailable", "administrator authentication is unavailable"
 	case errors.Is(err, errAdminOrigin):
 		status, code, message = http.StatusForbidden, "origin_not_allowed", "request origin is not allowed"
 	case errors.Is(err, errAdminRateLimit):
@@ -138,14 +143,14 @@ func adminHTTPError(c echo.Context, err error) error {
 	switch {
 	case err == nil:
 		return nil
-	case errors.Is(err, errAdminUnavailable):
-		status, code, message = http.StatusServiceUnavailable, "admin_auth_unavailable", "administrator authentication is unavailable"
 	case errors.Is(err, errAdminUnauthorized):
 		status, code, message = http.StatusUnauthorized, "admin_unauthorized", "administrator authentication failed"
 	case errors.Is(err, errAdminOrigin):
 		status, code, message = http.StatusForbidden, "origin_not_allowed", "request origin is not allowed"
 	case errors.Is(err, errAdminRateLimit):
 		status, code, message = http.StatusTooManyRequests, "rate_limited", "administrator rate limit exceeded"
+	case errors.Is(err, eventstore.ErrKeySourceUnavailable):
+		status, code, message = http.StatusServiceUnavailable, "admin_key_unavailable", "administrator request signing is unavailable"
 	case errors.Is(err, eventstore.ErrArtifactGone):
 		status, code, message = http.StatusGone, "artifact_gone", "artifact is expired or already consumed"
 	case errors.Is(err, eventstore.ErrArtifactOwner):
@@ -248,9 +253,20 @@ func newAdminMutation(c echo.Context, resource, action, bodyKey string, body any
 	if err != nil {
 		return adminMutation{}, fmt.Errorf("%w: request digest", endpoint.ErrInvalid)
 	}
-	mac := hmac.New(sha256.New, config.secret)
-	_, _ = mac.Write(encoded)
-	digest := mac.Sum(nil)
+	service := endpointService()
+	if service == nil || service.Store == nil {
+		return adminMutation{}, eventstore.ErrKeySourceUnavailable
+	}
+	digestProvider, ok := service.Store.(interface {
+		KeyedDigestBytes(ctx context.Context, namespace string, value []byte) ([]byte, string, error)
+	})
+	if !ok {
+		return adminMutation{}, eventstore.ErrKeySourceUnavailable
+	}
+	digest, _, err := digestProvider.KeyedDigestBytes(c.Request().Context(), "admin-idempotency-digest/v1", encoded)
+	if err != nil {
+		return adminMutation{}, err
+	}
 	identity := config.principal + "\x00" + clientIP(c.Request()) + "\x00" + c.Request().Method + "\x00" + resource + "\x00" + action
 	scopeHash := sha256.Sum256([]byte(identity))
 	scope := "admin-v1-" + hex.EncodeToString(scopeHash[:16])
@@ -268,7 +284,7 @@ func existingAdminMutation(ctx context.Context, mutation adminMutation) (eventst
 		return eventstore.OperationView{}, false, errors.New("endpoint service unavailable")
 	}
 	repository, ok := service.Store.(interface {
-		GetOperationByIdempotency(context.Context, string, string, string) (eventstore.OperationView, error)
+		GetOperationByIdempotency(ctx context.Context, principalID, scope, key string) (eventstore.OperationView, error)
 	})
 	if !ok {
 		return eventstore.OperationView{}, false, errors.New("operation repository unavailable")
@@ -288,29 +304,14 @@ func existingAdminMutation(ctx context.Context, mutation adminMutation) (eventst
 
 func endpointDescriptor(ctx context.Context, key adapterapi.AdapterKey) (adapterapi.Descriptor, bool) {
 	service := endpointService()
-	if service == nil {
+	if service == nil || service.Registry == nil {
 		return nil, false
 	}
-	lookup := func(descriptor adapterapi.Descriptor, ok bool) (adapterapi.Descriptor, bool) {
-		if !ok || descriptor == nil || descriptor.Key() != key {
-			return nil, false
-		}
-		return descriptor, true
-	}
-	switch registry := service.Registry.(type) {
-	case interface {
-		Lookup(context.Context, adapterapi.AdapterKey) (adapterapi.Descriptor, bool)
-	}:
-		return lookup(registry.Lookup(ctx, key))
-	case map[adapterapi.AdapterKey]adapterapi.Descriptor:
-		return lookup(registry[key], true)
-	case map[string]adapterapi.Descriptor:
-		return lookup(registry[string(key)], true)
-	case adapterapi.Descriptor:
-		return lookup(registry, true)
-	default:
+	descriptor, ok := service.Registry.Lookup(ctx, key)
+	if !ok || descriptor == nil || descriptor.Key() != key {
 		return nil, false
 	}
+	return descriptor, true
 }
 
 func capabilityView(ctx context.Context, key adapterapi.AdapterKey, config adapterapi.ValidatedConfig) CapabilityView {
@@ -322,11 +323,7 @@ func capabilityView(ctx context.Context, key adapterapi.AdapterKey, config adapt
 	for _, action := range descriptor.SupportedActions(config).Kinds() {
 		view.Actions = append(view.Actions, actionName(action))
 	}
-	if provider, ok := descriptor.(interface {
-		Capabilities(adapterapi.ValidatedConfig) adapterapi.CapabilitySet
-	}); ok {
-		view.Capabilities = capabilityNames(provider.Capabilities(config))
-	}
+	view.Capabilities = capabilityNames(descriptor.Capabilities(config))
 	return view
 }
 
@@ -355,7 +352,10 @@ func capabilityNames(set adapterapi.CapabilitySet) []string {
 
 func endpointViewDTO(ctx context.Context, source endpoint.EndpointView) EndpointView {
 	return EndpointView{
-		EndpointID: string(source.EndpointID), AdapterKey: string(source.AdapterKey),
+		EndpointID: string(source.EndpointID), DisplayName: source.DisplayName,
+		ProviderID: string(source.ProviderID), GroupNum: source.Statistics.GroupCount,
+		CmdExecutedNum: source.Statistics.CommandCount, CmdExecutedLastTime: source.Statistics.LastCommandAt,
+		OnlineTotalTime: source.Statistics.OnlineSeconds, AdapterKey: string(source.AdapterKey),
 		Config:       EndpointConfigView{Version: source.Config.Version, Payload: append(json.RawMessage(nil), source.Config.Canonical...), SecretRefs: append([]adapterapi.SecretRef(nil), source.Config.SecretRefs...)},
 		DesiredState: string(source.DesiredState), ObservedState: observedStateName(source.ObservedState), OperationState: string(source.OperationState),
 		DesiredVersion: source.DesiredVersion, Generation: source.Generation, OperationID: source.OperationID,
@@ -418,10 +418,28 @@ func commandSecrets(config adapterapi.ValidatedConfig, values map[string]string)
 	}
 	return inputs, nil
 }
+func commandSecretsForUpdate(config, current adapterapi.ValidatedConfig, values map[string]string) ([]endpoint.SecretInput, error) {
+	if len(values) == 0 && sameSecretReferences(config.SecretRefs, current.SecretRefs) {
+		return nil, nil
+	}
+	return commandSecrets(config, values)
+}
+
+func sameSecretReferences(left, right []adapterapi.SecretRef) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
 
 func mutationEndpoint(ctx context.Context, operation eventstore.OperationView) (*EndpointView, error) {
 	if operation.ResourceID == "" {
-		return nil, nil
+		return nil, endpoint.ErrInvalid
 	}
 	service := endpointService()
 	if service == nil {
@@ -442,7 +460,7 @@ func endpointMutationResponse(ctx context.Context, result endpoint.Result) (Muta
 	}
 	response := MutationResponse{OperationID: operationID}
 	if result.State.EndpointID.Valid() {
-		dto := endpointViewDTO(ctx, endpoint.EndpointView{EndpointID: result.State.EndpointID, AdapterKey: result.State.AdapterKey, Config: result.State.Config, DesiredState: result.State.DesiredState, ObservedState: result.State.ObservedState, OperationState: result.State.OperationState, DesiredVersion: result.State.DesiredVersion, Generation: result.State.Generation, OperationID: result.State.OperationID, CorrelationID: result.State.CorrelationID, Version: result.State.Version})
+		dto := endpointViewDTO(ctx, endpoint.EndpointView{EndpointID: result.State.EndpointID, DisplayName: result.State.DisplayName, Statistics: result.State.Statistics, ProviderID: result.State.ProviderID, AdapterKey: result.State.AdapterKey, Config: result.State.Config, DesiredState: result.State.DesiredState, ObservedState: result.State.ObservedState, OperationState: result.State.OperationState, DesiredVersion: result.State.DesiredVersion, Generation: result.State.Generation, OperationID: result.State.OperationID, CorrelationID: result.State.CorrelationID, Version: result.State.Version})
 		response.Endpoint = &dto
 	}
 	if operationID == "" {
@@ -466,7 +484,12 @@ func endpointList(c echo.Context) error {
 		return adminHTTPError(c, err)
 	}
 	result := make([]EndpointView, 0, len(views))
+	// Keep in-flight removals visible; only resolved tombstones leave the
+	// manageable endpoint collection. endpointGet remains the historical read.
 	for _, view := range views {
+		if view.DesiredState == endpoint.DesiredStateDeleted {
+			continue
+		}
 		result = append(result, endpointViewDTO(ctx, view))
 	}
 	adminAudit(c, "list", "/endpoints", "succeeded")
@@ -551,7 +574,7 @@ func endpointCreate(c echo.Context) error {
 		}
 		return c.JSON(http.StatusOK, MutationResponse{OperationID: existing.OperationID, Endpoint: endpointDTO})
 	}
-	command := endpoint.Command{Kind: endpoint.CommandCreate, Type: endpoint.CommandCreate, CommandID: mutation.commandID, ID: mutation.commandID, CorrelationID: mutation.requestID, OperationID: mutation.operationID, PrincipalID: mutation.principal, RequestID: mutation.requestID, IdempotencyScope: mutation.scope, IdempotencyKey: mutation.key, RequestDigest: mutation.requestDigest, EndpointID: id, AdapterKey: key, Config: validated, SecretInputs: secretInputs}
+	command := endpoint.Command{Kind: endpoint.CommandCreate, Type: endpoint.CommandCreate, CommandID: mutation.commandID, ID: mutation.commandID, CorrelationID: mutation.requestID, OperationID: mutation.operationID, PrincipalID: mutation.principal, RequestID: mutation.requestID, IdempotencyScope: mutation.scope, IdempotencyKey: mutation.key, RequestDigest: mutation.requestDigest, EndpointID: id, DisplayName: strings.TrimSpace(request.DisplayName), AdapterKey: key, Config: validated, SecretInputs: secretInputs}
 	result, err := endpointExecute(ctx, command)
 	if err != nil {
 		return adminHTTPError(c, err)
@@ -599,7 +622,7 @@ func endpointConfigPatch(c echo.Context) error {
 	if validated.Version != request.Config.Version {
 		return adminHTTPError(c, endpoint.ErrInvalidConfig)
 	}
-	secretInputs, err := commandSecrets(validated, request.Secrets)
+	secretInputs, err := commandSecretsForUpdate(validated, current.Config, request.Secrets)
 	if err != nil {
 		return adminHTTPError(c, err)
 	}
@@ -701,7 +724,7 @@ func endpointDiagnostics(c echo.Context) error {
 	diagnostic := adapterapi.DiagnosticReport{}
 	if descriptor, ok := endpointDescriptor(ctx, view.AdapterKey); ok {
 		if provider, ok := descriptor.(interface {
-			Diagnostics(context.Context, adapterapi.ValidatedConfig) (adapterapi.DiagnosticReport, error)
+			Diagnostics(ctx context.Context, config adapterapi.ValidatedConfig) (adapterapi.DiagnosticReport, error)
 		}); ok {
 			diagnostic, err = provider.Diagnostics(ctx, view.Config)
 			if err != nil {
@@ -709,6 +732,11 @@ func endpointDiagnostics(c echo.Context) error {
 			}
 		}
 	}
+	runtimeDiagnostics, err := endpointRuntimeDiagnostics(ctx, id, view.Generation)
+	if err != nil {
+		return adminHTTPError(c, err)
+	}
+	diagnostic.Entries = append(diagnostic.Entries, runtimeDiagnostics.Entries...)
 	if err := diagnostic.Validate(); err != nil {
 		return adminHTTPError(c, err)
 	}

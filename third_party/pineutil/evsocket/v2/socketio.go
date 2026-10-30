@@ -202,17 +202,18 @@ func (p *safePool) all() map[string]*WebsocketWrapper {
 }
 
 type SocketInstance struct {
-	pool        safePool
-	listeners   safeListeners
-	isShutdown  atomic.Bool
-	readerMu    sync.Mutex
-	readers     int
-	readersDone chan struct{}
-	pending     map[*gws.Conn]struct{}
-	wrappersMu  sync.Mutex
-	wrappers    map[*WebsocketWrapper]struct{}
+	pool          safePool
+	listeners     safeListeners
+	isShutdown    atomic.Bool
+	readerMu      sync.Mutex
+	readers       int
+	readersDone   chan struct{}
+	pending       map[*gws.Conn]struct{}
+	wrappersMu    sync.Mutex
+	wrappers      map[*WebsocketWrapper]struct{}
 	ServerOptions *gws.ServerOption
 }
+
 func NewSocketInstance() *SocketInstance {
 	instance := &SocketInstance{}
 	instance.listeners.reset()
@@ -436,27 +437,27 @@ type WebsocketWrapper struct {
 	clientOptions ClientOptions
 	clientMode    bool
 
-	alive         atomic.Bool
-	transport     atomic.Pointer[gws.Conn]
-	connectedOnce atomic.Bool
-	serverClosed  atomic.Bool
+	alive                 atomic.Bool
+	transport             atomic.Pointer[gws.Conn]
+	connectedOnce         atomic.Bool
+	serverClosed          atomic.Bool
 	serverTerminalPending atomic.Int32
 	transportDropBaseline atomic.Uint64
-	clientState   clientTransportState
-	heartbeatStop chan struct{}
-	heartbeatConn *gws.Conn
-	eventMu       sync.Mutex
-	eventQueue    []eventEnvelope
-	eventDraining bool
-	droppedEvents atomic.Uint64
-	eventWG       sync.WaitGroup
+	clientState           clientTransportState
+	heartbeatStop         chan struct{}
+	heartbeatConn         *gws.Conn
+	eventMu               sync.Mutex
+	eventQueue            []eventEnvelope
+	eventDraining         bool
+	droppedEvents         atomic.Uint64
+	eventWG               sync.WaitGroup
 	// connectReady is a one-shot readiness gate. It remains closed after the
 	// first successful connection so reconnects cannot strand an existing drain.
 	connectReady     chan struct{}
 	connectReadyOnce sync.Once
-	OnConnected    func()
-	OnDisconnected func(err error)
-	OnConnectError func(err error)
+	OnConnected      func()
+	OnDisconnected   func(err error)
+	OnConnectError   func(err error)
 	// OnConnectFailed 只在“第一次连接尝试失败”时触发。
 	//
 	// 重连失败不会触发这个回调，而是只触发 OnConnectError。
@@ -656,14 +657,15 @@ func (kws *WebsocketWrapper) enqueueEvent(event eventEnvelope) bool {
 	return true
 }
 
-
 func (kws *WebsocketWrapper) markConnectedReady() {
 	kws.connectReadyOnce.Do(func() {
 		close(kws.connectReady)
 	})
 }
 func (kws *WebsocketWrapper) DroppedEventCount() uint64 {
-	if kws == nil { return 0 }
+	if kws == nil {
+		return 0
+	}
 	return kws.droppedEvents.Load()
 }
 
@@ -707,6 +709,7 @@ func (kws *WebsocketWrapper) drainEvents() {
 		kws.eventWG.Done()
 	}
 }
+
 // WaitEvents waits until all asynchronous callbacks queued on this wrapper
 // have finished. Shutdown callers use it after transport reader quiescence.
 func (kws *WebsocketWrapper) WaitEvents(ctx context.Context) error {
@@ -1265,4 +1268,3 @@ func cloneServerOption(option *gws.ServerOption) *gws.ServerOption {
 	}
 	return &clone
 }
-

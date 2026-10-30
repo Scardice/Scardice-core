@@ -40,7 +40,7 @@ func TestEndpointActionFailureFinishesDurableOperation(t *testing.T) {
 	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
 		t.Fatal(err)
 	}
-	RegisterEndpointActionExecutor(failingEndpointActionExecutor{})
+	setEndpointAPIActionExecutor(failingEndpointActionExecutor{})
 	version := created.Endpoint.Version
 	actionRequest := EndpointActionRequest{ExpectedAggregateVersion: &version}
 	actionBytes, err := json.Marshal(actionRequest)
@@ -53,8 +53,8 @@ func TestEndpointActionFailureFinishesDurableOperation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := endpointAction(actionCtx); err != nil {
-		t.Fatal(err)
+	if actionErr := endpointAction(actionCtx); actionErr != nil {
+		t.Fatal(actionErr)
 	}
 	if actionRec.Code != http.StatusInternalServerError || !strings.Contains(actionRec.Body.String(), `"internal_error"`) {
 		t.Fatalf("failure status=%d body=%s", actionRec.Code, actionRec.Body.String())

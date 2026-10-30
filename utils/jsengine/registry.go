@@ -3,6 +3,7 @@ package jsengine
 import (
 	"errors"
 	"fmt"
+	"sync"
 )
 
 var (
@@ -18,8 +19,7 @@ var (
 	ErrInvalidManifest = errors.New("invalid runtime manifest")
 )
 
-// Registry discovers providers and retains candidate metadata without loading
-// candidate runtimes.
+// Registry owns builtin providers and lazy runtime candidates.
 type Registry interface {
 	RegisterBuiltin(Provider) error
 	RegisterCandidate(RuntimeManifest) error
@@ -27,10 +27,40 @@ type Registry interface {
 	Descriptors() []Descriptor
 }
 
+type candidateEntry struct {
+	mu       sync.Mutex
+	load     func() (Provider, error)
+	provider Provider
+}
+
+func (entry *candidateEntry) resolve(id EngineID) (Provider, error) {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.provider != nil {
+		return entry.provider, nil
+	}
+	if entry.load == nil {
+		return nil, fmt.Errorf("%w: candidate %q has no loader", ErrProviderNotFound, id)
+	}
+	provider, err := entry.load()
+	if err != nil {
+		return nil, err
+	}
+	if provider == nil {
+		return nil, fmt.Errorf("%w: candidate %q returned nil", ErrInvalidProvider, id)
+	}
+	if resolvedID := NormalizeEngineID(string(provider.Descriptor().ID)); resolvedID != id {
+		return nil, fmt.Errorf("%w: candidate %q loaded provider %q", ErrInvalidProvider, id, resolvedID)
+	}
+	entry.provider = provider
+	return provider, nil
+}
+
 type registry struct {
+	mu          sync.RWMutex
 	providers   map[EngineID]Provider
 	descriptors map[EngineID]Descriptor
-	candidates  map[EngineID]struct{}
+	candidates  map[EngineID]*candidateEntry
 	order       []EngineID
 }
 
@@ -40,7 +70,7 @@ func NewRegistry() *registry {
 	return &registry{
 		providers:   make(map[EngineID]Provider),
 		descriptors: make(map[EngineID]Descriptor),
-		candidates:  make(map[EngineID]struct{}),
+		candidates:  make(map[EngineID]*candidateEntry),
 	}
 }
 
@@ -55,6 +85,8 @@ func (r *registry) RegisterBuiltin(provider Provider) error {
 	}
 	descriptor.Extensions = NormalizeExtensions(descriptor.Extensions)
 	descriptor.Services = append([]string(nil), descriptor.Services...)
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if _, exists := r.descriptors[descriptor.ID]; exists {
 		return fmt.Errorf("%w: duplicate provider ID %q", ErrDuplicateProvider, descriptor.ID)
 	}
@@ -73,12 +105,14 @@ func (r *registry) RegisterCandidate(manifest RuntimeManifest) error {
 	}
 	descriptor.Extensions = NormalizeExtensions(descriptor.Extensions)
 	descriptor.Services = append([]string(nil), descriptor.Services...)
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if _, exists := r.descriptors[descriptor.ID]; exists {
 		return fmt.Errorf("%w: duplicate provider ID %q", ErrDuplicateProvider, descriptor.ID)
 	}
 	descriptor.Builtin = false
 	r.descriptors[descriptor.ID] = descriptor
-	r.candidates[descriptor.ID] = struct{}{}
+	r.candidates[descriptor.ID] = &candidateEntry{load: manifest.Load}
 	r.order = append(r.order, descriptor.ID)
 	return nil
 }
@@ -88,18 +122,37 @@ func (r *registry) Resolve(id EngineID) (Provider, error) {
 	if id == "" {
 		id = EngineGoja
 	}
+	r.mu.RLock()
 	if provider, ok := r.providers[id]; ok {
+		r.mu.RUnlock()
 		return provider, nil
 	}
-	if _, ok := r.candidates[id]; ok {
-		return nil, fmt.Errorf("%w: candidate %q is not loadable", ErrProviderNotFound, id)
+	candidate := r.candidates[id]
+	r.mu.RUnlock()
+	if candidate == nil {
+		return nil, fmt.Errorf("%w: engine ID %q", ErrProviderNotFound, id)
 	}
-	return nil, fmt.Errorf("%w: engine ID %q", ErrProviderNotFound, id)
+	provider, err := candidate.resolve(id)
+	if err != nil {
+		return nil, err
+	}
+	descriptor := provider.Descriptor()
+	descriptor.ID = id
+	descriptor.Builtin = false
+	descriptor.Extensions = NormalizeExtensions(descriptor.Extensions)
+	descriptor.Services = append([]string(nil), descriptor.Services...)
+	r.mu.Lock()
+	r.providers[id] = provider
+	r.descriptors[id] = descriptor
+	r.mu.Unlock()
+	return provider, nil
 }
 
 // Descriptors returns registration-order metadata snapshots. Mutating the
 // returned slice or its descriptors does not mutate the registry.
 func (r *registry) Descriptors() []Descriptor {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	descriptors := make([]Descriptor, 0, len(r.order))
 	for _, id := range r.order {
 		descriptor := r.descriptors[id]
@@ -116,6 +169,8 @@ func (r *registry) Descriptor(id EngineID) (Descriptor, bool) {
 	if id == "" {
 		id = EngineGoja
 	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	descriptor, ok := r.descriptors[id]
 	if !ok {
 		return Descriptor{}, false

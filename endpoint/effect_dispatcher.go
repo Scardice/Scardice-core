@@ -1,8 +1,6 @@
 package endpoint
 
 import (
-	"Scardice-core/adapterapi"
-	"Scardice-core/eventstore"
 	"context"
 	"crypto/hmac"
 	crand "crypto/rand"
@@ -12,11 +10,20 @@ import (
 	"fmt"
 	"math/big"
 	"time"
+
+	"Scardice-core/adapterapi"
+	"Scardice-core/eventstore"
+	"Scardice-core/logger"
 )
 
 var (
 	ErrDispatcherDependencies = errors.New("endpoint dispatcher: dependencies required")
 	ErrDispatcherRetry        = errors.New("endpoint dispatcher: retry requires provider idempotency")
+	// errDispatchDeadlineExceededAfterDispatch marks a re-claimed effect whose
+	// deadline has passed but which had already reached the provider on an
+	// earlier attempt. The provider outcome is unknown, so it must be settled as
+	// ambiguous rather than a deterministic terminal failure.
+	errDispatchDeadlineExceededAfterDispatch = errors.New("endpoint dispatcher: deadline exceeded after dispatch")
 )
 
 func effectTypeForKind(kind adapterapi.EffectKind) string {
@@ -41,33 +48,36 @@ type effectWire struct {
 	RawTarget string                    `json:"rawTarget,omitempty"`
 }
 type DispatcherDecryptor interface {
-	DecryptBound(context.Context, string, string, string, uint64, []byte, []byte, string) ([]byte, error)
+	DecryptBound(ctx context.Context, domain, identity, owner string, version uint64, ciphertext, nonce []byte, keyID string) ([]byte, error)
 }
 type DispatcherClock interface{ Now() time.Time }
 type dispatcherClock struct{}
+
 func (dispatcherClock) Now() time.Time { return time.Now().UTC() }
+
 // EffectSuccessNotifier observes a committed terminal success. Implementations
 // must treat the callback as best-effort and must not perform provider I/O.
 type EffectSuccessNotifier interface {
-	NotifyOutboundEffectSucceeded(context.Context, adapterapi.OutboundEffect, adapterapi.EffectResult)
+	NotifyOutboundEffectSucceeded(ctx context.Context, effect adapterapi.OutboundEffect, result adapterapi.EffectResult)
 }
 
 // EffectResultNotifier observes any committed terminal outcome. It allows
 // consumers that retain in-memory acceptance state to clean it on failures.
 type EffectResultNotifier interface {
-	NotifyOutboundEffectResult(context.Context, adapterapi.OutboundEffect, adapterapi.EffectResult)
+	NotifyOutboundEffectResult(ctx context.Context, effect adapterapi.OutboundEffect, result adapterapi.EffectResult)
 }
 
-func uniformJitter(max time.Duration) time.Duration {
-	if max <= 0 {
+func uniformJitter(upperBound time.Duration) time.Duration {
+	if upperBound <= 0 {
 		return 0
 	}
-	n, err := crand.Int(crand.Reader, big.NewInt(int64(max)))
+	n, err := crand.Int(crand.Reader, big.NewInt(int64(upperBound)))
 	if err != nil {
 		return 0
 	}
 	return time.Duration(n.Int64())
 }
+
 type EffectDispatcher struct {
 	store           DispatcherStore
 	decrypt         DispatcherDecryptor
@@ -86,16 +96,16 @@ type DispatcherOption func(*EffectDispatcher)
 func WithDispatcherRandom(random func(time.Duration) time.Duration) DispatcherOption {
 	return func(d *EffectDispatcher) {
 		if random != nil {
-			d.random = func(max time.Duration) time.Duration {
-				if max <= 0 {
+			d.random = func(upperBound time.Duration) time.Duration {
+				if upperBound <= 0 {
 					return 0
 				}
-				value := random(max)
+				value := random(upperBound)
 				if value < 0 {
 					return 0
 				}
-				if value >= max {
-					return max - 1
+				if value >= upperBound {
+					return upperBound - 1
 				}
 				return value
 			}
@@ -176,7 +186,7 @@ func (d *EffectDispatcher) DispatchOnce(ctx context.Context) (result adapterapi.
 				if dispatched {
 					quarantineResult = adapterapi.AmbiguousResult("dispatcher-quarantine", "")
 				}
-				go d.notifyResult(context.Background(), quarantineEffect, quarantineResult)
+				go d.notifyResult(context.WithoutCancel(ctx), quarantineEffect, quarantineResult)
 			}
 		}
 	}()
@@ -212,7 +222,7 @@ func (d *EffectDispatcher) DispatchOnce(ctx context.Context) (result adapterapi.
 	if claimed.Effect.EffectType != "" && claimed.Effect.EffectType != effectTypeForKind(wire.Effect.Kind) {
 		return adapterapi.EffectResult{}, errors.New("endpoint dispatcher: effect type mismatch")
 	}
-	expectedRisk := map[adapterapi.EffectRetryClass]string{adapterapi.EffectRetryPreDispatch: eventstore.RiskPreDispatchRetryable, adapterapi.EffectRetryProviderIdempotent: eventstore.RiskProviderIdempotent, adapterapi.EffectRetryNonIdempotent: eventstore.RiskNonIdempotentAfterDispatch}[wire.Effect.RetryClass]
+	expectedRisk := map[adapterapi.EffectRetryClass]string{adapterapi.EffectRetryInvalid: "", adapterapi.EffectRetryPreDispatch: eventstore.RiskPreDispatchRetryable, adapterapi.EffectRetryProviderIdempotent: eventstore.RiskProviderIdempotent, adapterapi.EffectRetryNonIdempotent: eventstore.RiskNonIdempotentAfterDispatch}[wire.Effect.RetryClass]
 	if expectedRisk != "" && claimed.Effect.RiskClass != expectedRisk {
 		return adapterapi.EffectResult{}, errors.New("endpoint dispatcher: effect risk mismatch")
 	}
@@ -243,45 +253,58 @@ func (d *EffectDispatcher) DispatchOnce(ctx context.Context) (result adapterapi.
 	}
 	expectedVersion := uint64(len(previous))
 	causation, correlation, principal := previous[0].Metadata.EventID, previous[0].Metadata.CorrelationID, previous[0].Metadata.PrincipalID
-	marked, err := d.store.MarkOutboxDispatched(ctx, eventstore.OutboxDispatchRequest{EffectID: claimed.Effect.EffectID, WorkerID: claimed.Effect.LeaseOwner, LeaseEpoch: claimed.Effect.LeaseEpoch, AttemptID: claimed.Effect.AttemptID})
-	if err != nil {
-		return adapterapi.EffectResult{}, err
-	}
-	leaseEffect = marked.Effect
-	dispatched = true
-	timeout := d.executeTimeout
-	if !marked.Effect.DeadlineAt.IsZero() {
-		remaining := marked.Effect.DeadlineAt.Sub(d.clock.Now().UTC())
-		if remaining < timeout {
-			timeout = remaining
-		}
-	}
-	if !marked.Effect.LeaseExpiresAt.IsZero() {
-		leaseRemaining := marked.Effect.LeaseExpiresAt.Sub(d.clock.Now().UTC()) - time.Second
-		if leaseRemaining < timeout {
-			timeout = leaseRemaining
-		}
-	}
+	marked := claimed
 	var execErr error
 	var terminalErr error
-	generation := uint64(0)
-	if inspector, ok := d.executor.(interface {
-		InspectWorker(adapterapi.EndpointID) (WorkerInspection, bool)
-	}); ok {
-		inspection, found := inspector.InspectWorker(adapterapi.EndpointID(marked.Effect.EndpointID))
-		if !found || inspection.Generation == 0 || inspection.Exited || inspection.Ambiguous {
-			execErr = ErrSupervisorAmbiguous
-		} else {
-			generation = inspection.Generation
+	now := d.clock.Now().UTC()
+	switch {
+	case !claimed.Effect.DeadlineAt.IsZero() && !claimed.Effect.DeadlineAt.After(now) && claimed.Effect.DispatchedAt.IsZero():
+		// Never reached the provider, so the intent is deterministically unfulfilled.
+		result = adapterapi.TerminalResult("effect-deadline-exceeded", "")
+	case !claimed.Effect.DeadlineAt.IsZero() && !claimed.Effect.DeadlineAt.After(now):
+		// An earlier attempt already reached the provider (re-claimable only for a
+		// provider-idempotent risk class). The outcome is uncertain, so fall through
+		// to the ambiguous failure classification instead of a hard terminal failure.
+		execErr = errDispatchDeadlineExceededAfterDispatch
+	default:
+		marked, err = d.store.MarkOutboxDispatched(ctx, eventstore.OutboxDispatchRequest{EffectID: claimed.Effect.EffectID, WorkerID: claimed.Effect.LeaseOwner, LeaseEpoch: claimed.Effect.LeaseEpoch, AttemptID: claimed.Effect.AttemptID})
+		if err != nil {
+			return adapterapi.EffectResult{}, err
 		}
-	}
-	if execErr == nil {
-		if timeout <= 0 {
-			execErr = context.DeadlineExceeded
-		} else {
-			runCtx, cancel := context.WithTimeout(ctx, timeout)
-			result, execErr = d.executor.ExecutePinned(runCtx, adapterapi.EndpointID(marked.Effect.EndpointID), generation, wire.Effect)
-			cancel()
+		leaseEffect = marked.Effect
+		dispatched = true
+		timeout := d.executeTimeout
+		if !marked.Effect.DeadlineAt.IsZero() {
+			remaining := marked.Effect.DeadlineAt.Sub(d.clock.Now().UTC())
+			if remaining < timeout {
+				timeout = remaining
+			}
+		}
+		if !marked.Effect.LeaseExpiresAt.IsZero() {
+			leaseRemaining := marked.Effect.LeaseExpiresAt.Sub(d.clock.Now().UTC()) - time.Second
+			if leaseRemaining < timeout {
+				timeout = leaseRemaining
+			}
+		}
+		generation := uint64(0)
+		if inspector, ok := d.executor.(interface {
+			InspectWorker(endpointID adapterapi.EndpointID) (WorkerInspection, bool)
+		}); ok {
+			inspection, found := inspector.InspectWorker(adapterapi.EndpointID(marked.Effect.EndpointID))
+			if !found || inspection.Generation == 0 || inspection.Exited || inspection.Ambiguous {
+				execErr = ErrSupervisorAmbiguous
+			} else {
+				generation = inspection.Generation
+			}
+		}
+		if execErr == nil {
+			if timeout <= 0 {
+				execErr = context.DeadlineExceeded
+			} else {
+				runCtx, cancel := context.WithTimeout(ctx, timeout)
+				result, execErr = d.executor.ExecutePinned(runCtx, adapterapi.EndpointID(marked.Effect.EndpointID), generation, wire.Effect)
+				cancel()
+			}
 		}
 	}
 	artifactResult := result.Artifact
@@ -305,7 +328,7 @@ func (d *EffectDispatcher) DispatchOnce(ctx context.Context) (result adapterapi.
 				_, commitErr = d.store.Commit(ctx, eventstore.UnitOfWork{Effects: []eventstore.NewEffect{{EffectID: marked.Effect.EffectID, ExpectedVersion: marked.Effect.Version, Version: marked.Effect.Version + 1, Status: status, LeaseOwner: marked.Effect.LeaseOwner, LeaseEpoch: marked.Effect.LeaseEpoch, AttemptID: marked.Effect.AttemptID, RetryCount: retryCount, NextAttemptAt: d.clock.Now().UTC().Add(delay)}}})
 			}
 			if commitErr != nil {
-				return adapterapi.EffectResult{}, fmt.Errorf("%w: persist dispatch failure: %v", execErr, commitErr)
+				return adapterapi.EffectResult{}, fmt.Errorf("%w: persist dispatch failure: %w", execErr, commitErr)
 			}
 			leaseSettled = true
 			return adapterapi.EffectResult{}, execErr
@@ -380,28 +403,41 @@ func (d *EffectDispatcher) DispatchOnce(ctx context.Context) (result adapterapi.
 		EndpointID          string `json:"endpointId"`
 		Status              string `json:"status"`
 		ResultCode          string `json:"resultCode,omitempty"`
+		ResultMessage       string `json:"resultMessage,omitempty"`
 		ErrorCode           string `json:"errorCode,omitempty"`
 		ProviderID          string `json:"providerId,omitempty"`
 		ArtifactID          string `json:"artifactId,omitempty"`
 		ArtifactContentType string `json:"artifactContentType,omitempty"`
 		ArtifactFilename    string `json:"artifactFilename,omitempty"`
 		ArtifactSize        int64  `json:"artifactSize,omitempty"`
-	}{marked.Effect.EffectID, operation.OperationID, marked.Effect.EndpointID, status, result.Code, "", result.ProviderID, work.Operations[0].ArtifactID, func() string {
-		if result.Artifact != nil {
-			return result.Artifact.ContentType
-		}
-		return ""
-	}(), func() string {
-		if result.Artifact != nil {
-			return result.Artifact.Filename
-		}
-		return ""
-	}(), func() int64 {
-		if result.Artifact != nil {
-			return int64(len(result.Artifact.Bytes))
-		}
-		return 0
-	}()})
+	}{
+		EffectID:      marked.Effect.EffectID,
+		OperationID:   operation.OperationID,
+		EndpointID:    marked.Effect.EndpointID,
+		Status:        status,
+		ResultCode:    result.Code,
+		ResultMessage: result.Message,
+		ProviderID:    result.ProviderID,
+		ArtifactID:    work.Operations[0].ArtifactID,
+		ArtifactContentType: func() string {
+			if result.Artifact != nil {
+				return result.Artifact.ContentType
+			}
+			return ""
+		}(),
+		ArtifactFilename: func() string {
+			if result.Artifact != nil {
+				return result.Artifact.Filename
+			}
+			return ""
+		}(),
+		ArtifactSize: func() int64 {
+			if result.Artifact != nil {
+				return int64(len(result.Artifact.Bytes))
+			}
+			return 0
+		}(),
+	})
 	if err != nil {
 		return result, err
 	}
@@ -410,11 +446,26 @@ func (d *EffectDispatcher) DispatchOnce(ctx context.Context) (result adapterapi.
 		return result, err
 	}
 	leaseSettled = true
+	if status == eventstore.OutboxStatusFailed || status == eventstore.OutboxStatusAmbiguous {
+		logger.QueueFailures().Warnw(
+			"outbound effect isolated",
+			"queue", "outbox",
+			"item_id", marked.Effect.EffectID,
+			"endpoint_id", marked.Effect.EndpointID,
+			"operation_id", operation.OperationID,
+			"status", status,
+			"reason", "provider-terminal-outcome",
+			"outcome", result.Outcome,
+			"result_code", result.Code,
+			"result_message", result.Message,
+			"version", marked.Effect.Version+1,
+		)
+	}
 	if d.resultNotifier != nil {
-		go d.notifyResult(context.Background(), wire.Effect, result)
+		go d.notifyResult(context.WithoutCancel(ctx), wire.Effect, result)
 	}
 	if terminalErr == nil && result.Outcome == adapterapi.EffectSucceeded && d.successNotifier != nil {
-		go d.notifySuccess(context.Background(), wire.Effect, result)
+		go d.notifySuccess(context.WithoutCancel(ctx), wire.Effect, result)
 	}
 	return result, terminalErr
 }
@@ -454,17 +505,6 @@ func (d *EffectDispatcher) quarantineClaim(ctx context.Context, effect eventstor
 	return err
 }
 
-func dispatcherEventType(outcome adapterapi.EffectOutcome) string {
-	switch outcome {
-	case adapterapi.EffectSucceeded:
-		return "OutboundEffectSucceededV1"
-	case adapterapi.EffectAmbiguous:
-		return "OutboundEffectAmbiguousV1"
-	default:
-		return "OutboundEffectFailedV1"
-	}
-}
-
 func dispatcherStatus(risk string, outcome adapterapi.EffectOutcome) (string, error) {
 	switch outcome {
 	case adapterapi.EffectSucceeded:
@@ -493,13 +533,13 @@ func dispatcherEventTypeForStatus(status string) string {
 	}
 }
 func dispatcherFailureStatus(random func(time.Duration) time.Duration, risk string, retry uint32, deadline, now time.Time, preExec bool) (string, time.Duration) {
-	max := dispatcherRetryMax(risk)
+	retryLimit := dispatcherRetryMax(risk)
 	base := 500 * time.Millisecond
 	if preExec {
-		max = 8
+		retryLimit = 8
 		base = 250 * time.Millisecond
 	}
-	if retry > max || (!deadline.IsZero() && !deadline.After(now)) {
+	if retry > retryLimit || (!deadline.IsZero() && !deadline.After(now)) {
 		return eventstore.OutboxStatusAmbiguous, 0
 	}
 	if !preExec && risk != eventstore.RiskProviderIdempotent && risk != eventstore.RiskPreDispatchRetryable {
@@ -537,14 +577,4 @@ func dispatcherOperationStatusForEffect(status string) string {
 		return "succeeded"
 	}
 	return "failed"
-}
-func dispatcherOperationStatus(outcome adapterapi.EffectOutcome) string {
-	switch outcome {
-	case adapterapi.EffectSucceeded:
-		return "succeeded"
-	case adapterapi.EffectAmbiguous:
-		return "ambiguous"
-	default:
-		return "failed"
-	}
 }

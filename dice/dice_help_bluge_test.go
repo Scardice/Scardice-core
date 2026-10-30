@@ -7,16 +7,6 @@ import (
 	"testing"
 )
 
-func TestBlugeMigrationInvalidatesHelpIndexAndParsedCaches(t *testing.T) {
-	// Given / When / Then
-	if helpIndexSchemaVersion != 4 {
-		t.Fatalf("help index schema version = %d, want 4", helpIndexSchemaVersion)
-	}
-	if helpDocParsedCacheVersion != 4 {
-		t.Fatalf("parsed help cache version = %d, want 4", helpDocParsedCacheVersion)
-	}
-}
-
 func TestHelpManagerColdStartRebuildsFromSourceAndIgnoresLegacyIndex(t *testing.T) {
 	// Given
 	root := switchToTempWorkdir(t)

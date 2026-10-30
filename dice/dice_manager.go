@@ -1,7 +1,9 @@
 package dice
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -10,10 +12,10 @@ import (
 
 	"github.com/dop251/goja_nodejs/require"
 	"github.com/robfig/cron/v3"
-	"gopkg.in/yaml.v3"
 
+	"Scardice-core/core/managerstate"
+	"Scardice-core/eventstore"
 	"Scardice-core/logger"
-	"Scardice-core/utils"
 	"Scardice-core/utils/dboperator/engine"
 )
 
@@ -31,8 +33,12 @@ type VersionInfo struct {
 const MaxTrayTooltipPrefixLength = 10
 
 type GroupNameCacheItem struct {
-	Name string
-	time int64
+	Name                string
+	MemberCount         uint32
+	MaxMemberCount      uint32
+	MemberCountKnown    bool
+	MaxMemberCountKnown bool
+	time                int64
 }
 
 type DiceManager struct { //nolint:revive
@@ -40,12 +46,18 @@ type DiceManager struct { //nolint:revive
 	diceLock             sync.RWMutex
 	Operator             engine.DatabaseOperator
 	EventSourcedMode     bool `json:"-" yaml:"-"`
+	durableStore         eventstore.Store
+	managerState         managerstate.State
+	managerStateMu       sync.Mutex
 	ServeAddress         string
 	trayTooltip          string
 	trayTooltipLock      sync.RWMutex
 	Help                 *HelpManager
-	IsHelpReloading      bool
-	helpReloadLock       sync.Mutex
+	IsHelpReloading      atomic.Bool `yaml:"-" json:"-"`
+	helpReloadLock       sync.RWMutex
+	helpStartupMu        sync.Mutex
+	initialHelpLoadDone  chan struct{}
+	initialHelpLoadErr   error
 	UseDictForTokenizer  bool
 	HelpDocEngineType    int
 	progressExitGroupWin ProcessExitGroup
@@ -69,6 +81,8 @@ type DiceManager struct { //nolint:revive
 	AutoBackupTime      string
 	AutoBackupSelection BackupSelection
 	backupEntryID       cron.EntryID
+	backupJobMu         sync.RWMutex
+	backupJob           *BackupJob
 
 	// 备份自动清理配置
 	BackupCleanStrategy  BackupCleanStrategy // 关闭 / 保留一定数量 / 保留一定时间
@@ -86,6 +100,8 @@ type DiceManager struct { //nolint:revive
 	UpdateDownloadedChan   chan string
 	RebootRequestChan      chan int
 	UpdateCheckRequestChan chan int
+
+	groupNameCacheMu sync.Mutex
 
 	GroupNameCache SyncMap[string, *GroupNameCacheItem] // 群名缓存，全局共享, key string value *GroupNameCacheItem
 	UserNameCache  SyncMap[string, *GroupNameCacheItem] // 用户缓存，全局共享, key string value *GroupNameCacheItem
@@ -131,22 +147,186 @@ type Configs struct { //nolint:revive
 }
 
 func (dm *DiceManager) InitHelp() {
-	_ = dm.reloadHelp(false)
+	if err := dm.reloadHelp(false); err == nil {
+		dm.clearHelpDocStartupError()
+	}
 }
 
+// WithHelpDocManagerRead serializes access against initial publication, reloads, and writes.
+// The callback runs with the manager read lock held and must not re-enter
+// any HelpDocManager access method.
+func (dm *DiceManager) WithHelpDocManagerRead(fn func(*HelpManager) error) error {
+	return dm.WithHelpDocManagerReadContext(context.Background(), fn)
+}
+
+// WithHelpDocManagerReadContext waits for initial publication before taking the read lock.
+func (dm *DiceManager) WithHelpDocManagerReadContext(ctx context.Context, fn func(*HelpManager) error) error {
+	if err := dm.WaitForHelpDocStartup(ctx); err != nil {
+		return err
+	}
+	dm.helpReloadLock.RLock()
+	defer dm.helpReloadLock.RUnlock()
+	return fn(dm.Help)
+}
+
+// WithHelpDocManagerWrite serializes mutations against initial publication, reads, and reloads.
+// The callback runs with the manager write lock held and must not re-enter
+// any HelpDocManager access method.
+func (dm *DiceManager) WithHelpDocManagerWrite(fn func(*HelpManager) error) error {
+	return dm.WithHelpDocManagerWriteContext(context.Background(), fn)
+}
+
+// WithHelpDocManagerWriteContext waits for initial publication before taking the write lock.
+func (dm *DiceManager) WithHelpDocManagerWriteContext(ctx context.Context, fn func(*HelpManager) error) error {
+	if err := dm.WaitForHelpDocStartup(ctx); err != nil {
+		return err
+	}
+	dm.helpReloadLock.Lock()
+	defer dm.helpReloadLock.Unlock()
+	return fn(dm.Help)
+}
+
+// IsHelpDocLoading reports either the asynchronous initial publication or an active reload.
+func (dm *DiceManager) IsHelpDocLoading() bool {
+	if dm == nil {
+		return false
+	}
+	if dm.IsHelpReloading.Load() {
+		return true
+	}
+	dm.helpStartupMu.Lock()
+	done := dm.initialHelpLoadDone
+	dm.helpStartupMu.Unlock()
+	if done == nil {
+		return false
+	}
+	select {
+	case <-done:
+		return false
+	default:
+		return true
+	}
+}
+
+// WaitForHelpDocStartup waits for the initial HelpDoc publication and returns its concrete failure.
+func (dm *DiceManager) WaitForHelpDocStartup(ctx context.Context) error {
+	if dm == nil {
+		return errors.New("dice manager is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	dm.helpStartupMu.Lock()
+	done := dm.initialHelpLoadDone
+	dm.helpStartupMu.Unlock()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		dm.helpStartupMu.Lock()
+		err := dm.initialHelpLoadErr
+		dm.helpStartupMu.Unlock()
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (dm *DiceManager) clearHelpDocStartupError() {
+	dm.helpStartupMu.Lock()
+	defer dm.helpStartupMu.Unlock()
+	done := dm.initialHelpLoadDone
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+		dm.initialHelpLoadErr = nil
+	default:
+	}
+}
+
+func (dm *DiceManager) startHelpDocLoadAsync() {
+	dm.helpStartupMu.Lock()
+	if dm.initialHelpLoadDone != nil {
+		dm.helpStartupMu.Unlock()
+		return
+	}
+	done := make(chan struct{})
+	dm.initialHelpLoadDone = done
+	dm.initialHelpLoadErr = nil
+	dm.helpStartupMu.Unlock()
+
+	log := logger.M()
+	go func() {
+		var loadErr error
+		var finishOnce sync.Once
+		finish := func() {
+			finishOnce.Do(func() {
+				dm.helpStartupMu.Lock()
+				dm.initialHelpLoadErr = loadErr
+				close(done)
+				dm.helpStartupMu.Unlock()
+			})
+		}
+		handlePanic := func(r any, help *HelpManager) {
+			loadErr = fmt.Errorf("帮助文档初始加载失败: %v", r)
+			log.Warn("帮助文档加载失败。可能是由于退出程序过快，帮助文档还未加载完成所致", r)
+			if help != nil {
+				log.Warn("帮助文件加载失败:", help.LoadingFn)
+			}
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				dm.helpReloadLock.Lock()
+				func() {
+					defer dm.helpReloadLock.Unlock()
+					handlePanic(r, dm.Help)
+					finish()
+				}()
+			}
+		}()
+
+		// Wait before locking: a startup script may synchronously call ReloadHelp.
+		for _, d := range dm.Dice {
+			if d != nil {
+				d.WaitStartupJsLoaded()
+			}
+		}
+		dm.helpReloadLock.Lock()
+		func() {
+			defer dm.helpReloadLock.Unlock()
+			defer func() {
+				if r := recover(); r != nil {
+					handlePanic(r, dm.Help)
+				}
+				finish()
+			}()
+			loadErr = dm.reloadHelpLocked(dm.Help != nil)
+		}()
+	}()
+}
+
+// ReloadHelp does not wait for startup JS because a startup script may call it synchronously.
 func (dm *DiceManager) ReloadHelp() error {
-	return dm.reloadHelp(true)
+	err := dm.reloadHelp(true)
+	if err == nil {
+		dm.clearHelpDocStartupError()
+	}
+	return err
 }
 
 func (dm *DiceManager) reloadHelp(closeCurrent bool) error {
-	log := logger.M()
 	dm.helpReloadLock.Lock()
 	defer dm.helpReloadLock.Unlock()
+	return dm.reloadHelpLocked(closeCurrent)
+}
 
-	dm.IsHelpReloading = true
-	defer func() {
-		dm.IsHelpReloading = false
-	}()
+func (dm *DiceManager) reloadHelpLocked(closeCurrent bool) error {
+	log := logger.M()
+	dm.IsHelpReloading.Store(true)
+	defer dm.IsHelpReloading.Store(false)
 	_ = os.MkdirAll("./data/helpdoc", 0755)
 	if closeCurrent && dm.Help != nil {
 		dm.Help.Close()
@@ -157,9 +337,6 @@ func (dm *DiceManager) reloadHelp(closeCurrent bool) error {
 		return err
 	}
 	log.Info("帮助文档开始异步加载")
-	for _, d := range dm.Dice {
-		d.WaitStartupJsLoaded()
-	}
 	nextHelp := dm.Help
 	if nextHelp == nil || closeCurrent {
 		nextHelp = &HelpManager{EngineType: EngineType(dm.HelpDocEngineType)}
@@ -173,99 +350,6 @@ func (dm *DiceManager) reloadHelp(closeCurrent bool) error {
 	dm.Help = nextHelp
 	log.Info("帮助文档异步加载结束")
 	return nil
-}
-
-// LoadDice 初始化函数
-func (dm *DiceManager) LoadDice() {
-	log := logger.M()
-	dm.AppVersionCode = VERSION_CODE
-	dm.AppBootTime = time.Now().Unix()
-
-	_ = os.MkdirAll(BackupDir, 0755)
-	_ = os.MkdirAll("./data/images", 0755)
-	_ = os.MkdirAll("./data/decks", 0755)
-	_ = os.MkdirAll("./data/names", 0755)
-	_ = os.WriteFile("./data/images/Scardice.png", IconPNG, 0644)
-
-	// this can be shared by multiple runtimes
-	dm.JsRegistry = new(require.Registry)
-
-	dm.Cron = cron.New()
-	dm.Cron.Start()
-
-	dm.AccessTokens = SyncMap[string, bool]{}
-	if dm.UIPasswordSalt == "" {
-		// 旧版本升级，或新用户
-		salt, err := GenerateCryptoToken(32)
-		if err != nil {
-			log.Errorf("生成 UI 密码盐失败: %v", err)
-			return
-		}
-		dm.UIPasswordSalt = salt
-	}
-	if dm.AssetImageToken == "" {
-		// 静态资源路由鉴权 token，crypto/rand 生成，不写日志/配置
-		tok, err := GenerateCryptoToken(32)
-		if err != nil {
-			log.Errorf("生成静态资源鉴权 token 失败: %v", err)
-			return
-		}
-		dm.AssetImageToken = tok
-	}
-	dm.AutoBackupEnable = true
-	dm.AutoBackupTime = "@every 12h" // 每12小时一次
-
-	data, err := os.ReadFile("./data/dice.yaml")
-	if err != nil {
-		// 注意！！！！ 这里会退出，所以下面的都可能不执行！
-		return
-	}
-
-	var dc Configs
-	err = yaml.Unmarshal(data, &dc)
-	if err != nil {
-		log.Error("读取 data/dice.yaml 发生错误: 配置文件格式不正确", err)
-		panic(err)
-	}
-	dm.DiceRandomMode = dc.DiceRandomMode
-
-	if dc.UIPasswordSalt == "" {
-		// 旧版本升级
-		dc.UIPasswordSalt = dm.UIPasswordSalt
-	}
-
-	dm.ServeAddress = dc.ServeAddress
-	dm.SetTrayTooltip(dc.TrayTooltip)
-	dm.HelpDocEngineType = dc.HelpDocEngineType
-	dm.UIPasswordHash = dc.UIPasswordHash
-	dm.UIPasswordSalt = dc.UIPasswordSalt
-
-	dm.AutoBackupTime = dc.AutoBackupTime
-	dm.AutoBackupEnable = dc.AutoBackupEnable
-	dm.AutoBackupSelection = BackupSelection(dc.AutoBackupSelection)
-
-	if dc.AutoBackupTime == "" {
-		// 从旧版升级
-		dm.AutoBackupEnable = true
-		dm.AutoBackupTime = "@every 12h" // 每12小时一次
-	}
-
-	dm.BackupCleanStrategy = BackupCleanStrategy(dc.BackupClean.Strategy)
-	dm.BackupCleanKeepCount = dc.BackupClean.KeepCount
-	dm.BackupCleanKeepDur = time.Duration(dc.BackupClean.KeepDur)
-	dm.BackupCleanTrigger = BackupCleanTrigger(dc.BackupClean.Trigger)
-	dm.BackupCleanCron = dc.BackupClean.Cron
-
-	for _, i := range dc.AccessTokens {
-		dm.AccessTokens.Store(i, true)
-	}
-
-	for _, i := range dc.DiceConfigs {
-		newDice := new(Dice)
-		newDice.BaseConfig = i
-		newDice.ContainerMode = dm.ContainerMode
-		dm.appendDice(newDice)
-	}
 }
 
 // InitializeRuntime prepares process-owned runtime infrastructure without
@@ -302,40 +386,11 @@ func (dm *DiceManager) InitializeRuntime() error {
 }
 
 func (dm *DiceManager) Save() {
-	if dm == nil || dm.EventSourcedMode {
+	if dm == nil {
 		return
 	}
-	var dc Configs
-	dc.ServeAddress = dm.ServeAddress
-	dc.TrayTooltip = dm.GetTrayTooltip()
-	dc.HelpDocEngineType = dm.HelpDocEngineType
-	dc.UIPasswordSalt = dm.UIPasswordSalt
-	dc.UIPasswordHash = dm.UIPasswordHash
-	dc.DiceRandomMode = string(dm.GetDiceRandomMode())
-	dc.AccessTokens = []string{}
-	dc.AutoBackupTime = dm.AutoBackupTime
-	dc.AutoBackupEnable = dm.AutoBackupEnable
-	dc.AutoBackupSelection = uint64(dm.AutoBackupSelection)
-	dc.BackupClean.Strategy = int(dm.BackupCleanStrategy)
-	dc.BackupClean.KeepCount = dm.BackupCleanKeepCount
-	dc.BackupClean.KeepDur = int64(dm.BackupCleanKeepDur)
-	dc.BackupClean.Trigger = int(dm.BackupCleanTrigger)
-	dc.BackupClean.Cron = dm.BackupCleanCron
-	dc.ServiceName = dm.ServiceName
-	dc.ConfigVersion = 9914
-
-	dm.AccessTokens.Range(func(k string, v bool) bool {
-		dc.AccessTokens = append(dc.AccessTokens, k)
-		return true
-	})
-
-	for _, i := range dm.Dice {
-		dc.DiceConfigs = append(dc.DiceConfigs, i.BaseConfig)
-	}
-
-	data, err := yaml.Marshal(dc) //nolint:gosec
-	if err == nil {
-		_ = utils.AtomicWriteFile("./data/dice.yaml", data, 0644)
+	if err := dm.saveEventSourcedManager(); err != nil {
+		logger.M().Errorf("保存事件源管理器配置失败: %v", err)
 	}
 }
 
@@ -368,10 +423,35 @@ func (dm *DiceManager) DiceSnapshot() []*Dice {
 	return append([]*Dice(nil), dm.Dice...)
 }
 
-func (dm *DiceManager) appendDice(instance *Dice) {
-	dm.diceLock.Lock()
-	defer dm.diceLock.Unlock()
-	dm.Dice = append(dm.Dice, instance)
+// DeferStartupJSLoad keeps production plugin evaluation behind application
+// composition. Call it before InitDice; standalone constructors remain
+// immediate unless they explicitly opt in through this manager boundary.
+func (dm *DiceManager) DeferStartupJSLoad() error {
+	if dm == nil {
+		return errors.New("dice: nil manager cannot defer startup JavaScript")
+	}
+	for _, instance := range dm.DiceSnapshot() {
+		if instance == nil {
+			continue
+		}
+		if err := instance.deferStartupJSLoad(); err != nil {
+			return fmt.Errorf("dice %q: defer startup JavaScript: %w", instance.BaseConfig.Name, err)
+		}
+	}
+	return nil
+}
+
+// StartDeferredStartupJSLoad releases each opted-in runtime exactly once.
+// A runtime whose process-stop admission is already closed remains canceled.
+func (dm *DiceManager) StartDeferredStartupJSLoad() {
+	if dm == nil {
+		return
+	}
+	for _, instance := range dm.DiceSnapshot() {
+		if instance != nil {
+			instance.startDeferredStartupJSLoad()
+		}
+	}
 }
 
 func (dm *DiceManager) InitDice(writer *logger.UIWriter) {
@@ -395,6 +475,8 @@ func (dm *DiceManager) InitDice(writer *logger.UIWriter) {
 			log.Warnf("[随机源] 激活全局模式 %s 失败，当前生效模式为 %s: %v", dm.GetDiceRandomMode(), globalRandSource.CurrentMode(), err)
 		}
 		globalRandSource.LogActiveMode(log)
+		dm.LoadNamesAsync()
+		dm.startHelpDocLoadAsync()
 		log.Infof("事件源 Core 壳初始化完成，耗时 %dms", time.Since(startTime).Milliseconds())
 		return
 	}
@@ -438,18 +520,7 @@ func (dm *DiceManager) InitDice(writer *logger.UIWriter) {
 	}
 	globalRandSource.LogActiveMode(log)
 
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Warn("帮助文档加载失败。可能是由于退出程序过快，帮助文档还未加载完成所致", r)
-				if dm.Help != nil {
-					log.Warn("帮助文件加载失败:", dm.Help.LoadingFn)
-				}
-			}
-		}()
-		// 加载帮助
-		dm.InitHelp()
-	}()
+	dm.startHelpDocLoadAsync()
 
 	dm.ResetAutoBackup()
 	dm.ResetBackupClean()
@@ -541,9 +612,7 @@ func (dm *DiceManager) LoadNamesAsync() {
 }
 
 func (dm *DiceManager) WaitNamesLoaded() {
-	if dm.IsNamesReloading {
-		dm.namesLoadWG.Wait()
-	}
+	dm.namesLoadWG.Wait()
 }
 
 func (dm *DiceManager) TryGetGroupName(id string) string {
@@ -558,18 +627,21 @@ func (dm *DiceManager) TryGetGroupName(id string) string {
 // 返回 true 表示可以刷新（不在CD中），false 表示在CD中应跳过
 // 注意：返回 true 时会立即更新时间戳，防止并发调用重复触发刷新
 func (dm *DiceManager) ShouldRefreshGroupInfo(id string) bool {
+	dm.groupNameCacheMu.Lock()
+	defer dm.groupNameCacheMu.Unlock()
+
 	now := time.Now().Unix()
 	item, exists := dm.GroupNameCache.Load(id)
-	if exists && now-item.time < 30 {
+	if exists && item != nil && now-item.time < 30 {
 		return false // 30秒内不重复刷新
 	}
-	// 立即更新时间戳，防止并发重复刷新
-	// 保留原有名称（如果存在），只更新时间
-	name := ""
-	if exists {
-		name = item.Name
+	// 立即更新时间戳，防止并发重复刷新，同时保留已观测到的名称和人数。
+	next := GroupNameCacheItem{time: now}
+	if exists && item != nil {
+		next = *item
+		next.time = now
 	}
-	dm.GroupNameCache.Store(id, &GroupNameCacheItem{Name: name, time: now})
+	dm.GroupNameCache.Store(id, &next)
 	return true
 }
 

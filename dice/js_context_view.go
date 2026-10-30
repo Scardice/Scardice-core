@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 )
+
 // The JS*View types are request-local copies. They intentionally contain no
 // Dice, session, adapter, database, lock, channel, or provider references.
 // Mutating one of these values cannot mutate the callback's authoritative
@@ -20,17 +21,17 @@ type JSSenderView struct {
 type JSSegmentView map[string]any
 
 type JSMessageView struct {
-	Time        int64          `jsbind:"time" json:"time"`
-	MessageType string         `jsbind:"messageType" json:"messageType"`
-	GroupID     string         `jsbind:"groupId" json:"groupId"`
-	GuildID     string         `jsbind:"guildId" json:"guildId"`
-	ChannelID   string         `jsbind:"channelId" json:"channelId"`
-	Sender      JSSenderView   `jsbind:"sender" json:"sender"`
-	Message     string         `jsbind:"message" json:"message"`
-	RawID       any            `jsbind:"rawId" json:"rawId"`
-	Platform    string         `jsbind:"platform" json:"platform"`
-	GroupName   string         `json:"groupName"`
-	Seq         int64          `jsbind:"seq" json:"seq"`
+	Time        int64           `jsbind:"time" json:"time"`
+	MessageType string          `jsbind:"messageType" json:"messageType"`
+	GroupID     string          `jsbind:"groupId" json:"groupId"`
+	GuildID     string          `jsbind:"guildId" json:"guildId"`
+	ChannelID   string          `jsbind:"channelId" json:"channelId"`
+	Sender      JSSenderView    `jsbind:"sender" json:"sender"`
+	Message     string          `jsbind:"message" json:"message"`
+	RawID       any             `jsbind:"rawId" json:"rawId"`
+	Platform    string          `jsbind:"platform" json:"platform"`
+	GroupName   string          `json:"groupName"`
+	Seq         int64           `jsbind:"seq" json:"seq"`
 	Segment     []JSSegmentView `jsbind:"segment" json:"segment"`
 }
 
@@ -51,13 +52,13 @@ type JSGroupView struct {
 }
 
 type JSPlayerView struct {
-	Name               string `jsbind:"name" json:"name"`
-	UserID             string `jsbind:"userId" json:"userId"`
-	InGroup            bool   `json:"inGroup"`
-	LastCommandTime    int64  `jsbind:"lastCommandTime" json:"lastCommandTime"`
+	Name                string `jsbind:"name" json:"name"`
+	UserID              string `jsbind:"userId" json:"userId"`
+	InGroup             bool   `json:"inGroup"`
+	LastCommandTime     int64  `jsbind:"lastCommandTime" json:"lastCommandTime"`
 	AutoSetNameTemplate string `jsbind:"autoSetNameTemplate" json:"autoSetNameTemplate"`
-	DiceSideNum        int    `json:"diceSideNum"`
-	GroupID            string `json:"groupId"`
+	DiceSideNum         int    `json:"diceSideNum"`
+	GroupID             string `json:"groupId"`
 }
 
 type JSEndPointView struct {
@@ -84,8 +85,8 @@ type JSContextView struct {
 	IsCurGroupBotOn bool            `jsbind:"isCurGroupBotOn" json:"isCurGroupBotOn"`
 	IsPrivate       bool            `jsbind:"isPrivate" json:"isPrivate"`
 	CommandHideFlag string          `jsbind:"commandHideFlag" json:"commandHideFlag"`
-	PrivilegeLevel   int             `jsbind:"privilegeLevel" json:"privilegeLevel"`
-	DelegateText     string          `jsbind:"delegateText" json:"delegateText"`
+	PrivilegeLevel  int             `jsbind:"privilegeLevel" json:"privilegeLevel"`
+	DelegateText    string          `jsbind:"delegateText" json:"delegateText"`
 }
 
 type JSCallbackContext struct {
@@ -126,7 +127,7 @@ func NewJSGroupView(group *GroupInfo) *JSGroupView {
 		Active: group.Active, GroupID: group.GroupID, GuildID: group.GuildID,
 		ChannelID: group.ChannelID, GroupName: group.GroupName, CocRuleIndex: group.CocRuleIndex,
 		InactivatedExtensions: cloneStringSet(group.InactivatedExtSet),
-		HelpPackages: append([]string(nil), group.HelpPackages...),
+		HelpPackages:          append([]string(nil), group.HelpPackages...),
 	}
 	for _, extension := range group.GetActivatedExtListRaw() {
 		if extension != nil && extension.Name != "" {
@@ -226,20 +227,15 @@ func cloneJSValue(value any) any {
 const maxJSCloneDepth = 16
 
 type jsCloneReference struct {
-	kind reflect.Kind
+	kind  reflect.Kind
 	type_ reflect.Type
-	ptr  uintptr
-	len  int
-	cap  int
+	ptr   uintptr
+	len   int
+	cap   int
 }
 
 type jsCloneState struct {
 	active map[jsCloneReference]struct{}
-}
-
-func cloneJSReflectValue(value reflect.Value, depth int) any {
-	state := &jsCloneState{active: make(map[jsCloneReference]struct{})}
-	return cloneJSReflectValueWithState(value, depth, state)
 }
 
 func cloneJSReflectValueWithState(value reflect.Value, depth int, state *jsCloneState) any {
@@ -252,7 +248,8 @@ func cloneJSReflectValueWithState(value reflect.Value, depth int, state *jsClone
 			return nil
 		}
 		return cloneJSReflectValueWithState(value.Elem(), depth+1, state)
-	case reflect.Pointer:
+	case reflect.Pointer, reflect.Invalid, reflect.Uintptr, reflect.Complex64, reflect.Complex128,
+		reflect.Chan, reflect.Func, reflect.UnsafePointer:
 		return nil
 	case reflect.Map:
 		if value.IsNil() || value.Type().Key().Kind() != reflect.String {
@@ -397,6 +394,7 @@ type JSContextOverlay struct {
 	PrivilegeLevel  int    `jsbind:"privilegeLevel" json:"privilegeLevel"`
 	DelegateText    string `jsbind:"delegateText" json:"delegateText"`
 }
+
 func NewJSContextOverlay(ctx *MsgContext) *JSContextOverlay {
 	base := *NewJSContextView(ctx)
 	return &JSContextOverlay{
@@ -524,10 +522,20 @@ func (o *JSContextOverlay) DiffEntries() []JSContextMutation {
 	}
 	diff := o.Diff()
 	entries := make([]JSContextMutation, 0, 5)
-	if diff.IsPrivate != nil { entries = append(entries, JSContextMutation{Field: "isPrivate", Value: *diff.IsPrivate}) }
-	if diff.IsCurGroupBotOn != nil { entries = append(entries, JSContextMutation{Field: "isCurGroupBotOn", Value: *diff.IsCurGroupBotOn}) }
-	if diff.CommandHideFlag != nil { entries = append(entries, JSContextMutation{Field: "commandHideFlag", Value: *diff.CommandHideFlag}) }
-	if diff.PrivilegeLevel != nil { entries = append(entries, JSContextMutation{Field: "privilegeLevel", Value: *diff.PrivilegeLevel}) }
-	if diff.DelegateText != nil { entries = append(entries, JSContextMutation{Field: "delegateText", Value: *diff.DelegateText}) }
+	if diff.IsPrivate != nil {
+		entries = append(entries, JSContextMutation{Field: "isPrivate", Value: *diff.IsPrivate})
+	}
+	if diff.IsCurGroupBotOn != nil {
+		entries = append(entries, JSContextMutation{Field: "isCurGroupBotOn", Value: *diff.IsCurGroupBotOn})
+	}
+	if diff.CommandHideFlag != nil {
+		entries = append(entries, JSContextMutation{Field: "commandHideFlag", Value: *diff.CommandHideFlag})
+	}
+	if diff.PrivilegeLevel != nil {
+		entries = append(entries, JSContextMutation{Field: "privilegeLevel", Value: *diff.PrivilegeLevel})
+	}
+	if diff.DelegateText != nil {
+		entries = append(entries, JSContextMutation{Field: "delegateText", Value: *diff.DelegateText})
+	}
 	return entries
 }

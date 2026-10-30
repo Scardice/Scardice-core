@@ -106,10 +106,10 @@ func TestJSContextOverlayWhitelistAndTypedDiff(t *testing.T) {
 	}
 	want := JSContextDiff{
 		IsPrivate:       boolPtr(true),
-		IsCurGroupBotOn:  boolPtr(false),
-		CommandHideFlag:  stringPtr("hidden"),
-		PrivilegeLevel:   intPtr(60),
-		DelegateText:     stringPtr("new"),
+		IsCurGroupBotOn: boolPtr(false),
+		CommandHideFlag: stringPtr("hidden"),
+		PrivilegeLevel:  intPtr(60),
+		DelegateText:    stringPtr("new"),
 	}
 	if got := overlay.Diff(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("diff = %#v, want %#v", got, want)
@@ -163,7 +163,7 @@ func TestJSContextViewsNilSafeAndExcludeAuthorityPointers(t *testing.T) {
 
 func assertNoAuthorityPointerTypes(t *testing.T, typ reflect.Type) {
 	t.Helper()
-	for i := 0; i < typ.NumField(); i++ {
+	for i := range typ.NumField() {
 		field := typ.Field(i)
 		if field.PkgPath != "" || field.Type.Kind() != reflect.Pointer {
 			continue

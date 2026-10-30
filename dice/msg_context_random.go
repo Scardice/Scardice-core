@@ -7,6 +7,12 @@ import (
 )
 
 func (ctx *MsgContext) getDiceSource() ds.DiceSource {
+	ctx.randomMu.Lock()
+	defer ctx.randomMu.Unlock()
+	return ctx.getDiceSourceLocked()
+}
+
+func (ctx *MsgContext) getDiceSourceLocked() ds.DiceSource {
 	if ctx.diceRandSrc != nil {
 		return ctx.diceRandSrc
 	}
@@ -28,7 +34,9 @@ func (s *scopedDiceRollSource) Roll(points ds.IntType, mod int) ds.IntType {
 }
 
 func (ctx *MsgContext) getDiceRollSource() ds.DiceSource {
-	raw := ctx.getDiceSource()
+	ctx.randomMu.Lock()
+	defer ctx.randomMu.Unlock()
+	raw := ctx.getDiceSourceLocked()
 	if ctx.diceRollSource == nil || ctx.diceRollRaw != raw || ctx.diceRollGroup != ctx.Group {
 		ctx.diceRollRaw = raw
 		ctx.diceRollGroup = ctx.Group
@@ -46,7 +54,9 @@ func (ctx *MsgContext) getDiceRollSource() ds.DiceSource {
 }
 
 func (ctx *MsgContext) getChooserRand() *randv2.Rand {
-	src := normalizeDiceSource(ctx.getDiceSource())
+	ctx.randomMu.Lock()
+	defer ctx.randomMu.Unlock()
+	src := normalizeDiceSource(ctx.getDiceSourceLocked())
 	if ctx.chooserRand == nil || ctx.chooserSrc != src {
 		ctx.chooserSrc = src
 		ctx.chooserRand = randv2.New(src)

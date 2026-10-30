@@ -1,9 +1,11 @@
 package dice
 
 import (
+	"context"
 	"errors"
 	"testing"
 
+	"github.com/dop251/goja"
 	"go.uber.org/zap"
 
 	"Scardice-core/utils/jsengine"
@@ -189,7 +191,7 @@ func TestCallOnMessagePreprocessEngineHonorsJsEnableForJSProvider(t *testing.T) 
 		JSLoopVersion: version,
 		OnMessagePreprocessEngine: func(jsengine.Runtime, *MsgContext, *Message) (jsengine.Value, error) {
 			called = true
-			return nil, nil
+			return nil, jsengine.ErrNoPrimitiveValue
 		},
 	}
 
@@ -255,5 +257,30 @@ func TestParseSolveEngineValueReadsObjectWithoutLegacyExport(t *testing.T) {
 	}
 	if result != (CmdExecuteResult{Matched: true, Solved: true}) {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestLegacyPreprocessRunsOnce(t *testing.T) {
+	d := &Dice{Logger: zap.NewNop().Sugar(), ExtLoopManager: NewJsLoopManager()}
+	d.Config.JsEnable = true
+	manager := NewJSRuntimeManagerForDice(d)
+	loop, err := manager.Resolve(context.Background(), jsengine.EngineGoja, jsengine.RuntimeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := d.ExtLoopManager.SetLoop(loop)
+	t.Cleanup(func() {
+		d.ExtLoopManager.SetLoop(nil)
+	})
+	calls := 0
+	ext := &ExtInfo{IsJsExt: true, JSLoopVersion: version,
+		OnMessagePreprocess: func(*MsgContext, *Message) goja.Value {
+			calls++
+			return goja.Undefined()
+		},
+	}
+	ext.CallOnMessagePreprocess(d, &MsgContext{}, &Message{})
+	if calls != 1 {
+		t.Fatalf("one message invoked the legacy callback %d times", calls)
 	}
 }

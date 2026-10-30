@@ -52,7 +52,6 @@ func TestShutdownWaitDrainsQueuedWrapperEvents(t *testing.T) {
 	}
 }
 
-
 func TestWrapperEventQueueIsBounded(t *testing.T) {
 	manager := NewSocketInstance()
 	wrapper := newClientWrapper(manager, "ws://127.0.0.1", ClientOptions{})

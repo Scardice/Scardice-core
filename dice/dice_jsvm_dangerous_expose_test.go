@@ -117,10 +117,7 @@ func TestJsInit_GojaDangerousSealInstUsesLiveRealm(t *testing.T) {
 		BaseConfig: BaseConfig{
 			DataDir: t.TempDir(),
 		},
-		ImSession: &IMSession{
-			ServiceAtNew: new(SyncMap[string, *GroupInfo]),
-			EndPoints:    []*EndPointInfo{},
-		},
+		ImSession:     &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
 		DirtyGroups:   new(SyncMap[string, int64]),
 		AttrsManager:  &AttrsManager{},
 		ExtRegistry:   new(SyncMap[string, *ExtInfo]),
@@ -171,10 +168,7 @@ func TestInstallDangerousJSInstanceNativeQuickJSMatchesGojaMutationContract(t *t
 		BaseConfig: BaseConfig{
 			DataDir: t.TempDir(),
 		},
-		ImSession: &IMSession{
-			ServiceAtNew: new(SyncMap[string, *GroupInfo]),
-			EndPoints:    []*EndPointInfo{},
-		},
+		ImSession:     &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
 		DirtyGroups:   new(SyncMap[string, int64]),
 		AttrsManager:  &AttrsManager{},
 		ExtRegistry:   new(SyncMap[string, *ExtInfo]),

@@ -67,15 +67,6 @@ func jsFsEnsureObject(vm *goja.Runtime, d *Dice, rawLoop *eventloop.EventLoop, e
 	return fsObj
 }
 
-// jsFsResolveAbsolute 将 JS 侧路径解析为可直接用 os.* 操作的绝对路径。
-//
-// 三种路径风格:
-//   - "data://X"  -> data/<dice-name>/extensions/<currentExtName>/data/X (按扩展隔离的用户数据)
-//   - 绝对路径     -> 直传 (仅 AllowFilesystemUnrestrictedAccess=true)
-func jsFsResolveAbsolute(d *Dice, raw string) (jsFsResolvedPath, error) {
-	return jsFsResolveAbsoluteWithContext(d, raw, nil)
-}
-
 func jsFsResolveAbsoluteWithContext(d *Dice, raw string, context *jsExecutionContext) (jsFsResolvedPath, error) {
 	if raw == "" {
 		return jsFsResolvedPath{}, errors.New("路径不能为空")
@@ -183,10 +174,6 @@ func jsFsEnsureDataParentInside(p jsFsResolvedPath) error {
 	return jsFsEnsureInsideBase(p.base, absRealParent)
 }
 
-func jsFsCurrentExtName(d *Dice) (string, error) {
-	return jsFsCurrentExtNameWithContext(d, nil)
-}
-
 func jsFsCurrentExtNameWithContext(d *Dice, context *jsExecutionContext) (string, error) {
 	if d == nil {
 		return "", errors.New("无法确定当前扩展身份,data:// 路径不可用")
@@ -198,12 +185,6 @@ func jsFsCurrentExtNameWithContext(d *Dice, context *jsExecutionContext) (string
 		return script.Name, nil
 	}
 	return "", errors.New("无法确定当前扩展身份,data:// 路径不可用")
-}
-
-// jsNetworkAuthorize enforces the current package policy for a core call that
-// has no execution context. Context-aware callers must use the suffixed form.
-func jsNetworkAuthorize(d *Dice, target string) error {
-	return jsNetworkAuthorizeWithContext(d, nil, target)
 }
 
 func jsNetworkAuthorizeWithContext(d *Dice, context *jsExecutionContext, target string) error {
@@ -223,13 +204,6 @@ func jsNetworkAuthorizeWithContext(d *Dice, context *jsExecutionContext, target 
 		return err
 	}
 	return sandbox.CheckNetworkPermission(target)
-}
-
-// jsFilesystemAuthorize enforces package file permissions for a core call
-// that has no execution context. Context-aware callers must use the suffixed
-// form.
-func jsFilesystemAuthorize(d *Dice, raw string, write bool) error {
-	return jsFilesystemAuthorizeWithContext(d, nil, raw, write)
 }
 
 func jsFilesystemAuthorizeWithContext(d *Dice, context *jsExecutionContext, raw string, write bool) error {
@@ -286,14 +260,14 @@ func jsFsRunAsync(vm *goja.Runtime, rawLoop *eventloop.EventLoop, engineLoop jse
 	promise, resolve, reject := vm.NewPromise()
 	go func() {
 		value, err := work()
-		_ = jsengine.ScheduleWithContext(engineLoop, executionContext, func(runtime jsengine.Runtime) error {
+		_ = jsengine.ScheduleWithContext(engineLoop, jsCompletionContext(executionContext), func(runtime jsengine.Runtime) error {
 			loopVM, ok := gojaengine.Raw(runtime)
 			if !ok {
-				return errors.New("Goja runtime adapter unavailable")
+				return errors.New("goja runtime adapter unavailable")
 			}
 			if err != nil {
 				_ = reject(loopVM.NewGoError(err))
-				return nil
+				return err
 			}
 			if value == nil {
 				_ = resolve(goja.Undefined())
@@ -327,8 +301,8 @@ func jsFsReadFile(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja
 		if err != nil {
 			jsFsThrow(vm, err)
 		}
-		if err := jsCompatibilityExternalAccess(executionContext); err != nil {
-			jsFsThrow(vm, err)
+		if compatibilityErr := jsCompatibilityExternalAccess(executionContext); compatibilityErr != nil {
+			jsFsThrow(vm, compatibilityErr)
 		}
 		if err = jsFsEnsureExistingDataTargetInside(resolved); err != nil {
 			jsFsThrow(vm, err)
@@ -340,7 +314,6 @@ func jsFsReadFile(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja
 		return vm.ToValue(vm.NewArrayBuffer(data))
 	}
 }
-
 
 func jsFsWriteFile(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
@@ -385,8 +358,8 @@ func jsFsStat(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja.Fun
 		if err != nil {
 			jsFsThrow(vm, err)
 		}
-		if err := jsCompatibilityExternalAccess(jsExecutionContextFor(engineLoop)); err != nil {
-			jsFsThrow(vm, err)
+		if compatibilityErr := jsCompatibilityExternalAccess(jsExecutionContextFor(engineLoop)); compatibilityErr != nil {
+			jsFsThrow(vm, compatibilityErr)
 		}
 		if err = jsFsEnsureExistingDataTargetInside(resolved); err != nil {
 			jsFsThrow(vm, err)
@@ -576,8 +549,8 @@ func jsFsReadDir(vm *goja.Runtime, d *Dice, engineLoop jsengine.Loop) func(goja.
 		if err != nil {
 			jsFsThrow(vm, err)
 		}
-		if err := jsCompatibilityExternalAccess(jsExecutionContextFor(engineLoop)); err != nil {
-			jsFsThrow(vm, err)
+		if compatibilityErr := jsCompatibilityExternalAccess(jsExecutionContextFor(engineLoop)); compatibilityErr != nil {
+			jsFsThrow(vm, compatibilityErr)
 		}
 		if err = jsFsEnsureExistingDataTargetInside(resolved); err != nil {
 			jsFsThrow(vm, err)

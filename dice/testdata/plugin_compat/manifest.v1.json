@@ -39,6 +39,7 @@
       "onBecomeFriend",
       "onPoke",
       "onGroupLeave",
+      "onAdapterEvent",
       "onLoad"
     ],
     "notes": "The order is a pipeline ordering contract; branch-specific callbacks only run when their event or command state applies."
@@ -61,12 +62,14 @@
       { "name": "seal.coc", "members": ["newRule", "newRuleCheckResult", "registerRule"], "kind": "host-object" },
       { "name": "seal.deck", "members": ["draw", "reload"], "kind": "host-object" },
       { "name": "seal.ext", "members": ["newCmdItemInfo", "newCmdExecuteResult", "new", "find", "register", "registerStringConfig", "registerIntConfig", "registerBoolConfig", "registerFloatConfig", "registerTemplateConfig", "registerOptionConfig", "newConfigItem", "registerConfig", "getConfig", "getStringConfig", "getIntConfig", "getBoolConfig", "getFloatConfig", "getTemplateConfig", "getOptionConfig", "unregisterConfig", "storageList", "removeTask", "listTasks"], "kind": "host-object" },
+      { "name": "seal.adapter", "members": ["callApi", "callApiRaw", "enqueueApi", "enqueueApiRaw", "getOperation"], "kind": "host-object" },
       { "name": "seal.context", "members": ["getCtxProxyFirst", "getCtxProxyAtPos", "createTempCtx", "newMessage"], "kind": "host-function" },
       { "name": "seal.utility", "members": ["format", "formatTmpl", "getVersion", "getEndPoints", "setPlayerGroupCard", "applyPlayerGroupCardByTemplate", "base64ToImage"], "kind": "host-function" },
       { "name": "globals", "members": ["atob", "btoa"], "kind": "host-function" },
       { "name": "seal.misc", "members": ["memberBan", "memberKick"], "kind": "host-function" },
       { "name": "seal.gameSystem", "members": ["newTemplate", "newTemplateByYaml"], "kind": "host-object" },
-      { "name": "extension.fields", "members": ["name", "aliases", "version", "autoActive", "cmdMap", "author", "activeWith", "getDescText", "isLoaded", "onLoad", "onMessagePreprocess", "onMessageReceived", "onNotCommandReceived", "onCommandOverride", "onCommandReceived", "onMessageSend", "onMessageDeleted", "onMessageEdit", "onGroupJoined", "onGroupMemberJoined", "onGuildJoined", "onBecomeFriend", "onPoke", "onGroupLeave"], "kind": "jsbind-field" },
+      { "name": "extension.fields", "members": ["name", "aliases", "version", "autoActive", "cmdMap", "author", "activeWith", "getDescText", "isLoaded", "onLoad", "onMessagePreprocess", "onMessageReceived", "onNotCommandReceived", "onCommandOverride", "onCommandReceived", "onMessageSend", "onMessageDeleted", "onMessageEdit", "onGroupJoined", "onGroupMemberJoined", "onGuildJoined", "onBecomeFriend", "onPoke", "onGroupLeave", "onAdapterEvent", "adapterEventFilter"], "kind": "jsbind-field" },
+      { "name": "adapter-event.fields", "members": ["type", "protocol", "rawJson", "body", "endPoint"], "kind": "jsbind-field" },
       { "name": "message.fields", "members": ["time", "messageType", "groupId", "guildId", "channelId", "sender", "message", "rawId", "platform", "seq", "segment"], "kind": "jsbind-field" },
       { "name": "context.fields", "members": ["group", "player", "endPoint", "isCurGroupBotOn", "isPrivate", "commandHideFlag", "privilegeLevel", "delegateText"], "kind": "jsbind-field" },
       { "name": "sender.fields", "members": ["nickname", "userId", "isRobot"], "kind": "jsbind-field" },
@@ -91,6 +94,8 @@
     "external_effect_ambiguous": [
       { "name": "fs", "reason": "filesystem reads and writes are external effects and can be uncertain across crashes" },
       { "name": "fetch-and-network", "reason": "network calls are external effects and are not replay-safe" },
+      { "name": "seal.adapter.call", "members": ["callApi", "callApiRaw"], "reason": "immediate provider calls retain invocation ownership, are not automatically retried, and cannot be rolled back with the callback transaction" },
+      { "name": "seal.adapter.enqueue", "members": ["enqueueApi", "enqueueApiRaw"], "reason": "callback submissions commit atomically into the encrypted outbox; dispatched unknown actions are non-idempotent and may settle as ambiguous" },
       { "name": "send-and-notice", "members": ["replyGroup", "replyPerson", "replyToSender", "replyForward", "notice", "noticeCrossPlatform"], "reason": "adapter delivery is asynchronous and may be best-effort or externally ambiguous" },
       { "name": "registerTask", "reason": "timers execute outside the callback transaction and can outlive a generation" }
     ]

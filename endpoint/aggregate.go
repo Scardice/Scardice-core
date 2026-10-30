@@ -2,10 +2,13 @@ package endpoint
 
 import (
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
+	"unicode/utf8"
 
 	"Scardice-core/adapterapi"
 )
@@ -40,7 +43,7 @@ func Decide(state State, command Command) (Decision, error) {
 		return Decision{}, reject(RejectInvalidState, commandID, state.Version, 0, ErrInvalidState, "empty aggregate has config payload")
 	}
 	if state.Version > 0 {
-		if !state.EndpointID.Valid() || !state.AdapterKey.Valid() || !state.DesiredState.Valid() || !state.OperationState.Valid() || !state.ObservedState.Valid() || state.OperationID == "" || state.CorrelationID == "" || state.DesiredVersion != state.Version {
+		if !state.EndpointID.Valid() || !state.AdapterKey.Valid() || !state.DesiredState.Valid() || !state.OperationState.Valid() || !state.ObservedState.Valid() || state.OperationID == "" || state.CorrelationID == "" || state.DesiredVersion == 0 {
 			return Decision{}, reject(RejectInvalidState, commandID, state.Version, 0, ErrInvalidState, "state contains invalid durable values")
 		}
 		if state.Config.Version == 0 || len(state.Config.Canonical) == 0 {
@@ -49,7 +52,9 @@ func Decide(state State, command Command) (Decision, error) {
 		if err := state.Config.Validate(); err != nil {
 			return Decision{}, reject(RejectInvalidState, commandID, state.Version, 0, ErrInvalidState, err.Error())
 		}
-		if command.EndpointID == "" { command.EndpointID = state.EndpointID }
+		if command.EndpointID == "" {
+			command.EndpointID = state.EndpointID
+		}
 		if command.AdapterKey == "" {
 			command.AdapterKey = state.AdapterKey
 		} else if !command.AdapterKey.Valid() || command.AdapterKey != state.AdapterKey {
@@ -92,7 +97,7 @@ func Decide(state State, command Command) (Decision, error) {
 	if command.EndpointID != "" && command.EndpointID != state.EndpointID {
 		return Decision{}, reject(RejectInvalidCommand, commandID, state.Version, 0, ErrInvalidCommand, "command endpoint does not match aggregate")
 	}
-	if (state.OperationState == OperationStatePending || state.OperationState == OperationStateFailed || state.OperationState == OperationStateAmbiguous) && kind != CommandResolve && kind != CommandComplete {
+	if (state.OperationState == OperationStatePending || state.OperationState == OperationStateFailed || state.OperationState == OperationStateAmbiguous) && kind != CommandResolve && kind != CommandComplete && kind != CommandObserveIdentity && kind != CommandRestoreLegacyMetadata {
 		return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, 0, ErrInvalidTransition, "operation requires explicit completion or resolution")
 	}
 
@@ -122,10 +127,16 @@ func Decide(state State, command Command) (Decision, error) {
 			return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, 0, ErrInvalidTransition, "remove requires enabled or disabled desired state")
 		}
 		effect := EffectDelete
-		if state.DesiredState == DesiredStateEnabled { effect = EffectStop }
+		if state.DesiredState == DesiredStateEnabled {
+			effect = EffectStop
+		}
 		return decideLifecycle(state, command, commandID, correlationID, digest, EventRemovalRequested, DesiredStateRemoving, effect)
 	case CommandComplete:
 		return decideCompletion(state, command, commandID, correlationID, digest)
+	case CommandObserveIdentity:
+		return decideIdentityObservation(state, command, commandID, correlationID, digest)
+	case CommandRestoreLegacyMetadata:
+		return decideLegacyMetadataRestore(state, command, commandID, correlationID, digest)
 	case CommandResolve:
 		if state.DesiredState != DesiredStateRemoving || state.ObservedState != adapterapi.ObservedStateStopped ||
 			(state.OperationState != OperationStatePending && state.OperationState != OperationStateFailed && state.OperationState != OperationStateAmbiguous && state.OperationState != OperationStateSucceeded) {
@@ -151,10 +162,14 @@ func decideCompletion(state State, command Command, commandID, correlationID, di
 	if !command.ObservedState.Valid() {
 		return Decision{}, reject(RejectInvalidCommand, commandID, state.Version, 0, ErrInvalidCommand, "completion requires observation")
 	}
+	if command.Generation != state.Generation || command.DesiredVersion != state.DesiredVersion {
+		return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, command.DesiredVersion, ErrInvalidTransition, "completion requires matching lifecycle fence")
+	}
 	sequence, err := nextVersion(state.Version)
-	if err != nil { return Decision{}, reject(RejectInvalidState, commandID, state.Version, 0, ErrVersionExhausted, err.Error()) }
-	desiredVersion, err := nextVersion(state.DesiredVersion)
-	if err != nil { return Decision{}, reject(RejectInvalidState, commandID, state.Version, 0, ErrVersionExhausted, err.Error()) }
+	if err != nil {
+		return Decision{}, reject(RejectInvalidState, commandID, state.Version, 0, ErrVersionExhausted, err.Error())
+	}
+	desiredVersion := state.DesiredVersion
 	eventIDValue := eventID(state.EndpointID, commandID, correlationID, sequence, EventOperationCompleted)
 	event := Event{
 		ID: eventIDValue, EventID: eventIDValue, Type: EventOperationCompleted, Kind: EventOperationCompleted,
@@ -167,10 +182,106 @@ func decideCompletion(state State, command Command, commandID, correlationID, di
 	return Decision{Events: []Event{event}}, nil
 }
 
+func decideIdentityObservation(state State, command Command, commandID, correlationID, digest string) (Decision, error) {
+	if !command.ProviderID.Valid() || command.Generation != state.Generation || command.DesiredVersion != state.DesiredVersion {
+		return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, command.DesiredVersion, ErrInvalidTransition, "identity requires matching lifecycle fence")
+	}
+	if command.DisplayName != "" && !validDisplayName(command.DisplayName) {
+		return Decision{}, reject(RejectInvalidCommand, commandID, state.Version, 0, ErrInvalidCommand, "identity contains invalid display name")
+	}
+	displayName := state.DisplayName
+	if displayName == "" {
+		displayName = command.DisplayName
+	}
+	sequence, err := nextVersion(state.Version)
+	if err != nil {
+		return Decision{}, reject(RejectInvalidState, commandID, state.Version, 0, ErrVersionExhausted, err.Error())
+	}
+	eventIDValue := eventID(state.EndpointID, commandID, correlationID, sequence, EventEndpointIdentityObserved)
+	event := Event{
+		ID: eventIDValue, EventID: eventIDValue, Type: EventEndpointIdentityObserved, Kind: EventEndpointIdentityObserved,
+		Sequence: sequence, AggregateVersion: sequence, CommandID: commandID, CommandDigest: digest,
+		CorrelationID: correlationID, OperationID: state.OperationID, Generation: state.Generation,
+		DesiredVersion: state.DesiredVersion, ProviderID: command.ProviderID, DisplayName: displayName, DesiredState: state.DesiredState,
+		ObservedState: state.ObservedState, OperationState: state.OperationState,
+		EndpointID: state.EndpointID, AdapterKey: state.AdapterKey,
+	}
+	return Decision{Events: []Event{event}}, nil
+}
+
+func decideLegacyMetadataRestore(state State, command Command, commandID, correlationID, digest string) (Decision, error) {
+	if !validDisplayName(command.DisplayName) || (command.ProviderID != "" && !command.ProviderID.Valid()) {
+		return Decision{}, reject(RejectInvalidCommand, commandID, state.Version, 0, ErrInvalidCommand, "legacy metadata restore contains invalid display identity")
+	}
+	if !command.Statistics.valid() {
+		return Decision{}, reject(RejectInvalidCommand, commandID, state.Version, 0, ErrInvalidCommand, "legacy metadata restore contains invalid statistics")
+	}
+	displayName := command.DisplayName
+	if state.DisplayName != "" {
+		if displayName != "" && displayName != state.DisplayName {
+			return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, 0, ErrInvalidTransition, "legacy metadata restore cannot replace display identity")
+		}
+		displayName = state.DisplayName
+	}
+	providerID := command.ProviderID
+	if state.ProviderID != "" {
+		if providerID != "" && providerID != state.ProviderID {
+			return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, 0, ErrInvalidTransition, "legacy metadata restore cannot replace provider identity")
+		}
+		providerID = state.ProviderID
+	}
+	statistics := command.Statistics
+	current := state.Statistics
+	if current.GroupCount != 0 {
+		if statistics.GroupCount != 0 && statistics.GroupCount != current.GroupCount {
+			return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, 0, ErrInvalidTransition, "legacy metadata restore cannot replace group count")
+		}
+		statistics.GroupCount = current.GroupCount
+	}
+	if current.CommandCount != 0 {
+		if statistics.CommandCount != 0 && statistics.CommandCount != current.CommandCount {
+			return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, 0, ErrInvalidTransition, "legacy metadata restore cannot replace command count")
+		}
+		statistics.CommandCount = current.CommandCount
+	}
+	if current.LastCommandAt != 0 {
+		if statistics.LastCommandAt != 0 && statistics.LastCommandAt != current.LastCommandAt {
+			return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, 0, ErrInvalidTransition, "legacy metadata restore cannot replace last command time")
+		}
+		statistics.LastCommandAt = current.LastCommandAt
+	}
+	if current.OnlineSeconds != 0 {
+		if statistics.OnlineSeconds != 0 && statistics.OnlineSeconds != current.OnlineSeconds {
+			return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, 0, ErrInvalidTransition, "legacy metadata restore cannot replace online duration")
+		}
+		statistics.OnlineSeconds = current.OnlineSeconds
+	}
+	sequence, err := nextVersion(state.Version)
+	if err != nil {
+		return Decision{}, reject(RejectInvalidState, commandID, state.Version, 0, ErrVersionExhausted, err.Error())
+	}
+	eventIDValue := eventID(state.EndpointID, commandID, correlationID, sequence, EventLegacyMetadataRestored)
+	event := Event{
+		ID: eventIDValue, EventID: eventIDValue, Type: EventLegacyMetadataRestored, Kind: EventLegacyMetadataRestored,
+		Sequence: sequence, AggregateVersion: sequence, CommandID: commandID, CommandDigest: digest,
+		CorrelationID: correlationID, OperationID: state.OperationID, Generation: state.Generation,
+		DesiredVersion: state.DesiredVersion, DesiredState: state.DesiredState,
+		ObservedState: state.ObservedState, OperationState: state.OperationState,
+		EndpointID: state.EndpointID, DisplayName: displayName, ProviderID: providerID,
+		Statistics: statistics, AdapterKey: state.AdapterKey,
+	}
+	return Decision{Events: []Event{event}}, nil
+}
 
 func decideCreate(state State, command Command, commandID, correlationID, digest string) (Decision, error) {
 	if !command.EndpointID.Valid() || !command.AdapterKey.Valid() {
 		return Decision{}, reject(RejectInvalidCommand, commandID, state.Version, 0, ErrInvalidCommand, "create requires valid endpoint and adapter identifiers")
+	}
+	if !validDisplayName(command.DisplayName) || (command.ProviderID != "" && !command.ProviderID.Valid()) {
+		return Decision{}, reject(RejectInvalidCommand, commandID, state.Version, 0, ErrInvalidCommand, "create contains invalid display identity")
+	}
+	if !command.Statistics.valid() {
+		return Decision{}, reject(RejectInvalidCommand, commandID, state.Version, 0, ErrInvalidCommand, "create contains invalid statistics")
 	}
 	if state.AllowedAdapters != nil {
 		if _, ok := state.AllowedAdapters[command.AdapterKey]; !ok {
@@ -185,7 +296,8 @@ func decideCreate(state State, command Command, commandID, correlationID, digest
 		ID: eventIDValue, EventID: eventIDValue, Type: EventEndpointCreated, Kind: EventEndpointCreated,
 		Sequence: 1, AggregateVersion: 1, CommandID: commandID, CommandDigest: digest, CorrelationID: correlationID, OperationID: operationID(command.OperationID, commandID),
 		DesiredVersion: 1, DesiredState: DesiredStateDisabled, ObservedState: adapterapi.ObservedStateStopped, OperationState: OperationStateIdle,
-		EndpointID: command.EndpointID, AdapterKey: command.AdapterKey, Config: command.Config.Clone(), ConfigSet: true,
+		EndpointID: command.EndpointID, DisplayName: command.DisplayName, ProviderID: command.ProviderID,
+		Statistics: command.Statistics, AdapterKey: command.AdapterKey, Config: command.Config.Clone(), ConfigSet: true,
 	}
 	return Decision{Events: []Event{event}}, nil
 }
@@ -198,7 +310,9 @@ func decideUpdateConfig(state State, command Command, commandID, correlationID, 
 		return Decision{}, reject(RejectInvalidConfig, commandID, state.Version, 0, adapterapi.ErrInvalidConfig, err.Error())
 	}
 	effect := EffectKind("")
-	if state.DesiredState == DesiredStateEnabled { effect = EffectReplace }
+	if state.DesiredState == DesiredStateEnabled {
+		effect = EffectReplace
+	}
 	return decideLifecycleWithConfig(state, command, commandID, correlationID, digest, EventConfigUpdated, state.DesiredState, effect, command.Config)
 }
 
@@ -208,9 +322,13 @@ func decideLifecycle(state State, command Command, commandID, correlationID, dig
 
 func decideLifecycleWithConfig(state State, command Command, commandID, correlationID, digest string, eventType EventType, desired DesiredState, effect EffectKind, config adapterapi.ValidatedConfig) (Decision, error) {
 	sequence, err := nextVersion(state.Version)
-	if err != nil { return Decision{}, reject(RejectInvalidState, commandID, state.Version, 0, ErrVersionExhausted, err.Error()) }
+	if err != nil {
+		return Decision{}, reject(RejectInvalidState, commandID, state.Version, 0, ErrVersionExhausted, err.Error())
+	}
 	desiredVersion, err := nextVersion(state.DesiredVersion)
-	if err != nil { return Decision{}, reject(RejectInvalidState, commandID, state.Version, 0, ErrVersionExhausted, err.Error()) }
+	if err != nil {
+		return Decision{}, reject(RejectInvalidState, commandID, state.Version, 0, ErrVersionExhausted, err.Error())
+	}
 	generation := state.Generation
 	if effect == EffectStart || effect == EffectRelogin || effect == EffectReplace {
 		if state.Generation == ^uint64(0) {
@@ -225,8 +343,13 @@ func decideLifecycleWithConfig(state State, command Command, commandID, correlat
 		DesiredVersion: desiredVersion, Generation: generation, DesiredState: desired, ObservedState: state.ObservedState, OperationState: OperationStateIdle,
 		EndpointID: state.EndpointID, AdapterKey: state.AdapterKey, EffectKind: effect,
 	}
-	if eventType != EventEndpointDeleted && effect != "" { event.OperationState = OperationStatePending }
-	if config.Version != 0 { event.Config = config.Clone(); event.ConfigSet = true }
+	if eventType != EventEndpointDeleted && effect != "" {
+		event.OperationState = OperationStatePending
+	}
+	if config.Version != 0 {
+		event.Config = config.Clone()
+		event.ConfigSet = true
+	}
 	decision := Decision{Events: []Event{event}}
 	if effect != "" {
 		effectIDValue := effectID(event.ID, effect)
@@ -249,33 +372,39 @@ func (state State) Apply(event Event) (State, error) {
 // state's maps, config bytes, or reference slices.
 func Apply(state State, event Event) (State, error) {
 	if state.Version == 0 {
-		if state.Generation != 0 || state.EndpointID != "" || state.AdapterKey != "" || state.Config.Version != 0 || len(state.Config.Canonical) != 0 || state.Config.SecretRefs != nil || state.DesiredState != DesiredStateInvalid || state.ObservedState != adapterapi.ObservedStateInvalid || state.OperationState != OperationStateInvalid || state.DesiredVersion != 0 || state.OperationID != "" || state.CorrelationID != "" || state.PendingEffectID != "" || state.PendingEffectKind != "" || state.PendingCommandID != "" || state.ProcessedCommands != nil || state.AppliedEffects != nil {
+		if state.Generation != 0 || state.EndpointID != "" || state.DisplayName != "" || !state.Statistics.empty() || state.AdapterKey != "" || state.Config.Version != 0 || len(state.Config.Canonical) != 0 || state.Config.SecretRefs != nil || state.DesiredState != DesiredStateInvalid || state.ObservedState != adapterapi.ObservedStateInvalid || state.OperationState != OperationStateInvalid || state.DesiredVersion != 0 || state.ProviderID != "" || state.OperationID != "" || state.CorrelationID != "" || state.PendingEffectID != "" || state.PendingEffectKind != "" || state.PendingCommandID != "" || state.ProcessedCommands != nil || state.AppliedEffects != nil {
 			return State{}, fmt.Errorf("%w: invalid empty aggregate state", ErrInvalidState)
 		}
 	} else {
-		if !state.EndpointID.Valid() || !state.AdapterKey.Valid() || !state.DesiredState.Valid() || !state.OperationState.Valid() || !state.ObservedState.Valid() || state.OperationID == "" || state.CorrelationID == "" || state.DesiredVersion != state.Version || state.Config.Version == 0 || len(state.Config.Canonical) == 0 {
+		if !state.EndpointID.Valid() || !validDisplayName(state.DisplayName) || !state.Statistics.valid() || !state.AdapterKey.Valid() || !state.DesiredState.Valid() || !state.OperationState.Valid() || !state.ObservedState.Valid() || state.OperationID == "" || state.CorrelationID == "" || state.DesiredVersion == 0 || (state.ProviderID != "" && !state.ProviderID.Valid()) || state.Config.Version == 0 || len(state.Config.Canonical) == 0 {
 			return State{}, fmt.Errorf("%w: invalid current aggregate state", ErrInvalidState)
 		}
 		if err := state.Config.Validate(); err != nil {
-			return State{}, fmt.Errorf("%w: invalid current config: %v", ErrInvalidState, err)
+			return State{}, fmt.Errorf("%w: invalid current config: %w", ErrInvalidState, err)
 		}
 	}
 	typ := event.Type
 	if typ != "" && event.Kind != "" && typ != event.Kind {
 		return State{}, fmt.Errorf("%w: event type aliases conflict", ErrInvalidState)
 	}
-	if typ == "" { typ = event.Kind }
+	if typ == "" {
+		typ = event.Kind
+	}
 	eventIDValue := event.ID
 	if eventIDValue != "" && event.EventID != "" && eventIDValue != event.EventID {
 		return State{}, fmt.Errorf("%w: event id aliases conflict", ErrInvalidState)
 	}
-	if eventIDValue == "" { eventIDValue = event.EventID }
+	if eventIDValue == "" {
+		eventIDValue = event.EventID
+	}
 	sequence := event.Sequence
 	if sequence != 0 && event.AggregateVersion != 0 && sequence != event.AggregateVersion {
 		return State{}, fmt.Errorf("%w: event version aliases conflict", ErrInvalidState)
 	}
-	if sequence == 0 { sequence = event.AggregateVersion }
-	if !typ.Valid() || sequence == 0 || eventIDValue == "" || event.CommandID == "" || event.CorrelationID == "" || event.OperationID == "" || !event.EndpointID.Valid() || event.CommandDigest == "" || !event.OperationState.Valid() || !event.ObservedState.Valid() {
+	if sequence == 0 {
+		sequence = event.AggregateVersion
+	}
+	if !typ.Valid() || sequence == 0 || eventIDValue == "" || event.CommandID == "" || event.CorrelationID == "" || event.OperationID == "" || !event.EndpointID.Valid() || !validDisplayName(event.DisplayName) || !event.Statistics.valid() || event.CommandDigest == "" || !event.OperationState.Valid() || !event.ObservedState.Valid() || (event.ProviderID != "" && !event.ProviderID.Valid()) {
 		return State{}, fmt.Errorf("%w: malformed event", ErrInvalidState)
 	}
 	if expected := eventID(event.EndpointID, event.CommandID, event.CorrelationID, sequence, typ); eventIDValue != expected {
@@ -283,7 +412,7 @@ func Apply(state State, event Event) (State, error) {
 	}
 	fingerprint, fingerprintErr := eventFingerprint(event, typ, eventIDValue, sequence)
 	if fingerprintErr != nil {
-		return State{}, fmt.Errorf("%w: malformed event payload: %v", ErrInvalidState, fingerprintErr)
+		return State{}, fmt.Errorf("%w: malformed event payload: %w", ErrInvalidState, fingerprintErr)
 	}
 	if record, ok := state.ProcessedCommands[event.CommandID]; ok {
 		if record.Digest == event.CommandDigest && record.EventFingerprint == fingerprint {
@@ -301,8 +430,8 @@ func Apply(state State, event Event) (State, error) {
 	} else if event.EffectKind != "" {
 		return State{}, fmt.Errorf("%w: missing effect id", ErrInvalidState)
 	}
-	if state.Version == ^uint64(0) || state.DesiredVersion == ^uint64(0) {
-		return State{}, fmt.Errorf("%w: %v", ErrInvalidState, ErrVersionExhausted)
+	if state.Version == ^uint64(0) {
+		return State{}, fmt.Errorf("%w: %w", ErrInvalidState, ErrVersionExhausted)
 	}
 	if !typ.Valid() || sequence == 0 || sequence != state.Version+1 {
 		return State{}, fmt.Errorf("%w: malformed event", ErrInvalidState)
@@ -316,14 +445,23 @@ func Apply(state State, event Event) (State, error) {
 	if state.Version > 0 && event.Generation < state.Generation {
 		return State{}, fmt.Errorf("%w: generation regressed", ErrInvalidState)
 	}
-	if event.DesiredVersion != state.DesiredVersion+1 {
-		return State{}, fmt.Errorf("%w: non-monotonic desired version", ErrInvalidState)
+	if eventChangesDesiredIntent(typ) {
+		if state.DesiredVersion == ^uint64(0) {
+			return State{}, fmt.Errorf("%w: %w", ErrInvalidState, ErrVersionExhausted)
+		}
+		if event.DesiredVersion != state.DesiredVersion+1 {
+			return State{}, fmt.Errorf("%w: non-monotonic desired version", ErrInvalidState)
+		}
+	} else if event.DesiredVersion != state.DesiredVersion {
+		return State{}, fmt.Errorf("%w: changed desired version without new intent", ErrInvalidState)
 	}
 	if event.ConfigSet {
 		if typ != EventEndpointCreated && typ != EventConfigUpdated {
 			return State{}, fmt.Errorf("%w: unexpected config payload", ErrInvalidState)
 		}
-		if err := event.Config.Validate(); err != nil { return State{}, fmt.Errorf("%w: event config: %v", ErrInvalidState, err) }
+		if err := event.Config.Validate(); err != nil {
+			return State{}, fmt.Errorf("%w: event config: %w", ErrInvalidState, err)
+		}
 	} else {
 		if event.Config.Version != 0 || len(event.Config.Canonical) != 0 || event.Config.SecretRefs != nil {
 			return State{}, fmt.Errorf("%w: config bytes without config flag", ErrInvalidState)
@@ -332,6 +470,12 @@ func Apply(state State, event Event) (State, error) {
 			return State{}, fmt.Errorf("%w: missing config payload", ErrInvalidState)
 		}
 	}
+	if typ != EventEndpointCreated && typ != EventLegacyMetadataRestored && typ != EventEndpointIdentityObserved && event.DisplayName != "" {
+		return State{}, fmt.Errorf("%w: unexpected display identity", ErrInvalidState)
+	}
+	if typ != EventEndpointCreated && typ != EventLegacyMetadataRestored && !event.Statistics.empty() {
+		return State{}, fmt.Errorf("%w: unexpected statistics payload", ErrInvalidState)
+	}
 	if !validEventTransition(state, typ, event) {
 		return State{}, fmt.Errorf("%w: invalid event transition", ErrInvalidState)
 	}
@@ -339,14 +483,29 @@ func Apply(state State, event Event) (State, error) {
 	next.Version = sequence
 	next.Generation = event.Generation
 	next.EndpointID = event.EndpointID
-	if event.AdapterKey != "" { next.AdapterKey = event.AdapterKey }
-	if event.ConfigSet { next.Config = event.Config.Clone() }
+	if typ == EventEndpointCreated || typ == EventLegacyMetadataRestored {
+		next.DisplayName = event.DisplayName
+		next.Statistics = event.Statistics
+	} else if typ == EventEndpointIdentityObserved && event.DisplayName != "" {
+		next.DisplayName = event.DisplayName
+	}
+	if event.AdapterKey != "" {
+		next.AdapterKey = event.AdapterKey
+	}
+	if event.ConfigSet {
+		next.Config = event.Config.Clone()
+	}
 	next.DesiredState = event.DesiredState
 	next.ObservedState = event.ObservedState
 	next.OperationState = event.OperationState
 	next.DesiredVersion = event.DesiredVersion
 	next.OperationID = event.OperationID
-	next.CorrelationID = event.CorrelationID
+	if typ != EventEndpointIdentityObserved && typ != EventLegacyMetadataRestored {
+		next.CorrelationID = event.CorrelationID
+	}
+	if typ == EventEndpointCreated || typ == EventEndpointIdentityObserved || typ == EventLegacyMetadataRestored {
+		next.ProviderID = event.ProviderID
+	}
 	if event.EffectID != "" && event.EffectKind != "" {
 		next.PendingEffectID = event.EffectID
 		next.PendingEffectKind = event.EffectKind
@@ -357,8 +516,12 @@ func Apply(state State, event Event) (State, error) {
 		next.PendingEffectKind = ""
 		next.PendingCommandID = ""
 	}
-	if next.ProcessedCommands == nil { next.ProcessedCommands = make(map[string]CommandRecord) }
-	if next.AppliedEffects == nil { next.AppliedEffects = make(map[string]struct{}) }
+	if next.ProcessedCommands == nil {
+		next.ProcessedCommands = make(map[string]CommandRecord)
+	}
+	if next.AppliedEffects == nil {
+		next.AppliedEffects = make(map[string]struct{})
+	}
 	record := next.ProcessedCommands[event.CommandID]
 	if record.Digest != "" && record.Digest != event.CommandDigest {
 		return State{}, fmt.Errorf("%w: command digest conflict", ErrInvalidState)
@@ -375,20 +538,30 @@ func Apply(state State, event Event) (State, error) {
 	return next, nil
 }
 
+func eventChangesDesiredIntent(typ EventType) bool {
+	return typ != EventOperationCompleted && typ != EventEndpointIdentityObserved && typ != EventLegacyMetadataRestored
+}
+
 func validEventTransition(state State, typ EventType, event Event) bool {
 	if state.Version == 0 {
 		return typ == EventEndpointCreated && event.AdapterKey.Valid() && event.ConfigSet &&
 			event.DesiredState == DesiredStateDisabled && event.ObservedState == adapterapi.ObservedStateStopped &&
 			event.OperationState == OperationStateIdle && event.Generation == 0 && event.EffectID == "" && event.EffectKind == ""
 	}
-	if event.AdapterKey != state.AdapterKey { return false }
-	if typ != EventOperationCompleted && typ != EventEndpointDeleted && (state.OperationState == OperationStatePending || state.OperationState == OperationStateFailed || state.OperationState == OperationStateAmbiguous) {
+	if event.AdapterKey != state.AdapterKey {
 		return false
 	}
-	if typ != EventOperationCompleted && event.ObservedState != state.ObservedState { return false }
+	if typ != EventOperationCompleted && typ != EventEndpointIdentityObserved && typ != EventLegacyMetadataRestored && typ != EventEndpointDeleted && (state.OperationState == OperationStatePending || state.OperationState == OperationStateFailed || state.OperationState == OperationStateAmbiguous) {
+		return false
+	}
+	if typ != EventOperationCompleted && event.ObservedState != state.ObservedState {
+		return false
+	}
 	switch typ {
 	case EventConfigUpdated:
-		if state.DesiredState == DesiredStateRemoving || state.DesiredState == DesiredStateDeleted || event.DesiredState != state.DesiredState { return false }
+		if state.DesiredState == DesiredStateRemoving || state.DesiredState == DesiredStateDeleted || event.DesiredState != state.DesiredState {
+			return false
+		}
 		if state.DesiredState == DesiredStateEnabled {
 			return event.OperationState == OperationStatePending && event.Generation == state.Generation+1 && event.EffectKind == EffectReplace && event.EffectID != ""
 		}
@@ -413,6 +586,16 @@ func validEventTransition(state State, typ EventType, event Event) bool {
 		return (operationActive || observationRefresh) &&
 			event.OperationID == state.OperationID && event.DesiredState == state.DesiredState && event.Generation == state.Generation &&
 			event.EffectID == "" && event.EffectKind == "" && event.OperationState != OperationStateIdle && event.OperationState != OperationStatePending
+	case EventEndpointIdentityObserved:
+		displayNameUnchanged := event.DisplayName == "" || event.DisplayName == state.DisplayName || state.DisplayName == ""
+		return event.ProviderID.Valid() && displayNameUnchanged && event.OperationID == state.OperationID &&
+			event.DesiredState == state.DesiredState && event.ObservedState == state.ObservedState &&
+			event.OperationState == state.OperationState && event.Generation == state.Generation &&
+			event.EffectID == "" && event.EffectKind == ""
+	case EventLegacyMetadataRestored:
+		return event.OperationID == state.OperationID && event.DesiredState == state.DesiredState &&
+			event.ObservedState == state.ObservedState && event.OperationState == state.OperationState &&
+			event.Generation == state.Generation && event.EffectID == "" && event.EffectKind == ""
 	case EventEndpointDeleted:
 		return state.DesiredState == DesiredStateRemoving && event.OperationID == state.OperationID &&
 			(state.OperationState == OperationStatePending || state.OperationState == OperationStateFailed || state.OperationState == OperationStateAmbiguous || state.OperationState == OperationStateSucceeded) &&
@@ -436,11 +619,15 @@ func cloneState(state State) State {
 	}
 	if state.AppliedEffects != nil {
 		next.AppliedEffects = make(map[string]struct{}, len(state.AppliedEffects))
-		for key := range state.AppliedEffects { next.AppliedEffects[key] = struct{}{} }
+		for key := range state.AppliedEffects {
+			next.AppliedEffects[key] = struct{}{}
+		}
 	}
 	if state.AllowedAdapters != nil {
 		next.AllowedAdapters = make(map[adapterapi.AdapterKey]struct{}, len(state.AllowedAdapters))
-		for key := range state.AllowedAdapters { next.AllowedAdapters[key] = struct{}{} }
+		for key := range state.AllowedAdapters {
+			next.AllowedAdapters[key] = struct{}{}
+		}
 	}
 	return next
 }
@@ -450,11 +637,11 @@ func validateConfigAliases(command Command) error {
 		return nil
 	}
 	if len(command.SecretRefs) != len(command.Config.SecretRefs) {
-		return fmt.Errorf("secret reference aliases conflict")
+		return errors.New("secret reference aliases conflict")
 	}
 	for index, ref := range command.SecretRefs {
 		if ref != command.Config.SecretRefs[index] {
-			return fmt.Errorf("secret reference aliases conflict")
+			return errors.New("secret reference aliases conflict")
 		}
 	}
 	return nil
@@ -474,34 +661,41 @@ func expectedVersion(command Command) (uint64, bool) {
 	return command.ExpectedVersion, command.ExpectedVersionSet
 }
 
-
 func validateCommandAliases(command Command) error {
 	if command.Kind != "" && command.Type != "" && command.Kind != command.Type {
-		return fmt.Errorf("kind and type aliases conflict")
+		return errors.New("kind and type aliases conflict")
 	}
 	if command.CommandID != "" && command.ID != "" && command.CommandID != command.ID {
-		return fmt.Errorf("command id aliases conflict")
+		return errors.New("command id aliases conflict")
 	}
 	if command.ExpectedAggregateVersion != 0 && (command.ExpectedVersionSet || command.ExpectedVersion != 0) && command.ExpectedVersion != command.ExpectedAggregateVersion {
-		return fmt.Errorf("expected version aliases conflict")
+		return errors.New("expected version aliases conflict")
 	}
 	return nil
 }
 
 func commandKind(command Command) CommandKind {
-	if command.Kind != "" { return command.Kind }
+	if command.Kind != "" {
+		return command.Kind
+	}
 	return command.Type
 }
 func commandID(command Command) string {
-	if command.CommandID != "" { return command.CommandID }
+	if command.CommandID != "" {
+		return command.CommandID
+	}
 	return command.ID
 }
 func operationID(value, commandID string) string {
-	if value != "" { return value }
+	if value != "" {
+		return value
+	}
 	return "operation-" + shortHash(commandID)
 }
 func nextVersion(value uint64) (uint64, error) {
-	if value == ^uint64(0) { return 0, ErrVersionExhausted }
+	if value == ^uint64(0) {
+		return 0, ErrVersionExhausted
+	}
 	return value + 1, nil
 }
 func commandDigest(command Command, kind CommandKind, commandID, correlationID string) (string, error) {
@@ -509,56 +703,78 @@ func commandDigest(command Command, kind CommandKind, commandID, correlationID s
 	canonical := struct {
 		Kind CommandKind `json:"kind"`
 
-		CommandID string `json:"commandId"`
-		CorrelationID string `json:"correlationId"`
-		OperationID string `json:"operationId"`
-		EndpointID adapterapi.EndpointID `json:"endpointId"`
-		AdapterKey adapterapi.AdapterKey `json:"adapterKey"`
-		Config adapterapi.ValidatedConfig `json:"config"`
-		SecretDigest string `json:"secretDigest"`
-		ExpectedVersion uint64 `json:"expectedVersion"`
-		ExpectedVersionSet bool `json:"expectedVersionSet"`
-		ObservedState adapterapi.ObservedState `json:"observedState"`
-		Generation uint64 `json:"generation"`
-		CompletionState OperationState `json:"completionState"`
-	}{kind, commandID, correlationID, operationID(command.OperationID, commandID), command.EndpointID, command.AdapterKey, command.Config.Clone(), command.SecretDigest, expected, expectedSet, command.ObservedState, command.Generation, command.CompletionState}
+		CommandID          string                     `json:"commandId"`
+		CorrelationID      string                     `json:"correlationId"`
+		OperationID        string                     `json:"operationId"`
+		EndpointID         adapterapi.EndpointID      `json:"endpointId"`
+		DisplayName        string                     `json:"displayName"`
+		Statistics         Statistics                 `json:"statistics"`
+		AdapterKey         adapterapi.AdapterKey      `json:"adapterKey"`
+		Config             adapterapi.ValidatedConfig `json:"config"`
+		SecretDigest       string                     `json:"secretDigest"`
+		ExpectedVersion    uint64                     `json:"expectedVersion"`
+		ExpectedVersionSet bool                       `json:"expectedVersionSet"`
+		ObservedState      adapterapi.ObservedState   `json:"observedState"`
+		Generation         uint64                     `json:"generation"`
+		DesiredVersion     uint64                     `json:"desiredVersion"`
+		ProviderID         adapterapi.PrincipalID     `json:"providerId"`
+		CompletionState    OperationState             `json:"completionState"`
+	}{kind, commandID, correlationID, operationID(command.OperationID, commandID), command.EndpointID, command.DisplayName, command.Statistics, command.AdapterKey, command.Config.Clone(), command.SecretDigest, expected, expectedSet, command.ObservedState, command.Generation, command.DesiredVersion, command.ProviderID, command.CompletionState}
 	bytes, err := json.Marshal(canonical)
-	if err != nil { return "", fmt.Errorf("invalid command digest payload: %w", err) }
+	if err != nil {
+		return "", fmt.Errorf("invalid command digest payload: %w", err)
+	}
 	sum := sha256.Sum256(bytes)
 	return hex.EncodeToString(sum[:]), nil
 }
 func eventFingerprint(event Event, typ EventType, eventIDValue string, sequence uint64) (string, error) {
 	canonical := struct {
-		ID string
-		Type EventType
-		Sequence uint64
-		CommandID string
-		CommandDigest string
-		CorrelationID string
-		OperationID string
-		EffectID string
-		EffectKind EffectKind
-		Generation uint64
+		ID             string
+		Type           EventType
+		Sequence       uint64
+		CommandID      string
+		CommandDigest  string
+		CorrelationID  string
+		OperationID    string
+		EffectID       string
+		EffectKind     EffectKind
+		Generation     uint64
 		DesiredVersion uint64
-		DesiredState DesiredState
-		ObservedState adapterapi.ObservedState
+		ProviderID     adapterapi.PrincipalID
+		DesiredState   DesiredState
+		ObservedState  adapterapi.ObservedState
 		OperationState OperationState
-		EndpointID adapterapi.EndpointID
-		AdapterKey adapterapi.AdapterKey
-		Config adapterapi.ValidatedConfig
-		ConfigSet bool
-	}{eventIDValue, typ, sequence, event.CommandID, event.CommandDigest, event.CorrelationID, event.OperationID, event.EffectID, event.EffectKind, event.Generation, event.DesiredVersion, event.DesiredState, event.ObservedState, event.OperationState, event.EndpointID, event.AdapterKey, event.Config.Clone(), event.ConfigSet}
+		EndpointID     adapterapi.EndpointID
+		DisplayName    string
+		Statistics     Statistics
+		AdapterKey     adapterapi.AdapterKey
+		Config         adapterapi.ValidatedConfig
+		ConfigSet      bool
+	}{eventIDValue, typ, sequence, event.CommandID, event.CommandDigest, event.CorrelationID, event.OperationID, event.EffectID, event.EffectKind, event.Generation, event.DesiredVersion, event.ProviderID, event.DesiredState, event.ObservedState, event.OperationState, event.EndpointID, event.DisplayName, event.Statistics, event.AdapterKey, event.Config.Clone(), event.ConfigSet}
 	bytes, err := json.Marshal(canonical)
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 	sum := sha256.Sum256(bytes)
 	return hex.EncodeToString(sum[:]), nil
+}
+func validDisplayName(value string) bool {
+	if len(value) > 256 || !utf8.ValidString(value) {
+		return false
+	}
+	for _, char := range value {
+		if char < 0x20 || char == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 func eventID(endpointID adapterapi.EndpointID, commandID, correlationID string, sequence uint64, typ EventType) string {
 	sum := sha256.New()
 	writeIdentityPart(sum, string(endpointID))
 	writeIdentityPart(sum, commandID)
 	writeIdentityPart(sum, correlationID)
-	writeIdentityPart(sum, fmt.Sprintf("%d", sequence))
+	writeIdentityPart(sum, strconv.FormatUint(sequence, 10))
 	writeIdentityPart(sum, string(typ))
 	return "event-" + hex.EncodeToString(sum.Sum(nil))[:32]
 }
@@ -568,7 +784,7 @@ func effectID(eventID string, kind EffectKind) string {
 	writeIdentityPart(sum, string(kind))
 	return "effect-" + hex.EncodeToString(sum.Sum(nil))[:32]
 }
-func writeIdentityPart(sum interface{ Write([]byte) (int, error) }, value string) {
+func writeIdentityPart(sum interface{ Write(p []byte) (int, error) }, value string) {
 	var length [8]byte
 	binary.BigEndian.PutUint64(length[:], uint64(len(value)))
 	_, _ = sum.Write(length[:])

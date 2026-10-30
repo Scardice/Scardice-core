@@ -8,46 +8,49 @@ import (
 
 	"Scardice-core/adapterapi"
 	"Scardice-core/eventstore"
+
 	"gorm.io/gorm"
 )
 
 const (
-	EndpointProjectionName  = "endpoint"
-	OperationProjectionName = "endpoint-operation"
-	EndpointProjectionVersion = "v1"
+	EndpointProjectionName    = "endpoint"
+	OperationProjectionName   = "endpoint-operation"
+	EndpointProjectionVersion = "endpoint-v4"
 )
 
 // EndpointView is the public endpoint read model. It intentionally contains
 // validated non-secret config and references only; runtime, private context,
 // resolved credentials and artifacts have no representation here.
 type EndpointView struct {
-	EndpointID     adapterapi.EndpointID       `json:"endpointId"`
-	AdapterKey     adapterapi.AdapterKey       `json:"adapterKey"`
-	Config         adapterapi.ValidatedConfig  `json:"config"`
-	DesiredState   DesiredState                `json:"desiredState"`
-	ObservedState  adapterapi.ObservedState    `json:"observedState"`
-	OperationState OperationState               `json:"operationState"`
-	DesiredVersion uint64                      `json:"desiredVersion"`
-	Generation     uint64                      `json:"generation"`
-	OperationID    string                      `json:"operationId"`
-	CorrelationID  string                      `json:"correlationId"`
-	Version        uint64                      `json:"version"`
+	EndpointID     adapterapi.EndpointID      `json:"endpointId"`
+	DisplayName    string                     `json:"displayName,omitempty"`
+	Statistics     Statistics                 `json:"statistics,omitempty"`
+	AdapterKey     adapterapi.AdapterKey      `json:"adapterKey"`
+	Config         adapterapi.ValidatedConfig `json:"config"`
+	DesiredState   DesiredState               `json:"desiredState"`
+	ObservedState  adapterapi.ObservedState   `json:"observedState"`
+	OperationState OperationState             `json:"operationState"`
+	DesiredVersion uint64                     `json:"desiredVersion"`
+	ProviderID     adapterapi.PrincipalID     `json:"providerId,omitempty"`
+	Generation     uint64                     `json:"generation"`
+	OperationID    string                     `json:"operationId"`
+	CorrelationID  string                     `json:"correlationId"`
+	Version        uint64                     `json:"version"`
 }
-type EndpointProjection = EndpointView
 
 // OperationProjection is a safe operation API view. It mirrors only durable
 // operation metadata; private ciphertext and artifact contents are absent.
 type OperationProjection struct {
-	OperationID   string `json:"operationId"`
-	EndpointID    adapterapi.EndpointID `json:"endpointId"`
-	Kind          string `json:"kind"`
-	Status        OperationState `json:"status"`
-	ResultCode    string `json:"resultCode,omitempty"`
-	ErrorCode     string `json:"errorCode,omitempty"`
-	EffectID      string `json:"effectId,omitempty"`
-	DesiredVersion uint64 `json:"desiredVersion"`
-	Generation    uint64 `json:"generation"`
-	Version       uint64 `json:"version"`
+	OperationID    string                `json:"operationId"`
+	EndpointID     adapterapi.EndpointID `json:"endpointId"`
+	Kind           string                `json:"kind"`
+	Status         OperationState        `json:"status"`
+	ResultCode     string                `json:"resultCode,omitempty"`
+	ErrorCode      string                `json:"errorCode,omitempty"`
+	EffectID       string                `json:"effectId,omitempty"`
+	DesiredVersion uint64                `json:"desiredVersion"`
+	Generation     uint64                `json:"generation"`
+	Version        uint64                `json:"version"`
 }
 
 func EndpointProjectionDescriptor() eventstore.ProjectionDescriptor {
@@ -59,10 +62,19 @@ func OperationProjectionDescriptor() eventstore.ProjectionDescriptor {
 func EndpointProjections() []eventstore.ProjectionDescriptor {
 	return []eventstore.ProjectionDescriptor{EndpointProjectionDescriptor(), OperationProjectionDescriptor()}
 }
-func RegisterEndpointProjections(store *eventstore.GORMStore) error {
-	if store == nil { return errors.New("endpoint: nil eventstore") }
+
+type projectionRegistrar interface {
+	RegisterProjection(eventstore.ProjectionDescriptor) error
+}
+
+func registerEndpointProjections(store projectionRegistrar) error {
+	if store == nil {
+		return errors.New("endpoint: nil eventstore")
+	}
 	for _, descriptor := range EndpointProjections() {
-		if err := store.RegisterProjection(descriptor); err != nil && !errors.Is(err, eventstore.ErrDuplicateProjector) { return err }
+		if err := store.RegisterProjection(descriptor); err != nil && !errors.Is(err, eventstore.ErrDuplicateProjector) {
+			return err
+		}
 	}
 	return nil
 }
@@ -77,7 +89,9 @@ func decodeProjectionEvent(envelope eventstore.Envelope) (Event, error) {
 		return Event{}, fmt.Errorf("endpoint: invalid projection envelope identity: %w", ErrInvalidState)
 	}
 	var event Event
-	if err := json.Unmarshal(envelope.Payload, &event); err != nil { return Event{}, fmt.Errorf("endpoint: projection decode: %w", err) }
+	if err := json.Unmarshal(envelope.Payload, &event); err != nil {
+		return Event{}, fmt.Errorf("endpoint: projection decode: %w", err)
+	}
 	if event.ID == "" || event.EventID == "" || event.Type == "" || event.Kind == "" || event.Sequence == 0 || event.AggregateVersion == 0 || event.EndpointID == "" {
 		return Event{}, fmt.Errorf("endpoint: incomplete projection identity: %w", ErrInvalidState)
 	}
@@ -90,67 +104,130 @@ func decodeProjectionEvent(envelope eventstore.Envelope) (Event, error) {
 	if event.Sequence != 0 && event.Sequence != envelope.StreamVersion || event.AggregateVersion != 0 && event.AggregateVersion != envelope.StreamVersion {
 		return Event{}, fmt.Errorf("%w: projection event version mismatch", ErrInvalidState)
 	}
-	if event.ID == "" { event.ID = envelope.EventID }
-	if event.EventID == "" { event.EventID = envelope.EventID }
-	if event.EndpointID == "" { event.EndpointID = streamEndpointID }
-	if event.Sequence == 0 || event.AggregateVersion == 0 || event.OperationID == "" || event.CorrelationID == "" || event.CommandID == "" || event.DesiredVersion == 0 || !event.DesiredState.Valid() || !event.ObservedState.Valid() || !event.OperationState.Valid() {
+	if event.ID == "" {
+		event.ID = envelope.EventID
+	}
+	if event.EventID == "" {
+		event.EventID = envelope.EventID
+	}
+	if event.EndpointID == "" {
+		event.EndpointID = streamEndpointID
+	}
+	if event.Sequence == 0 || event.AggregateVersion == 0 || event.OperationID == "" || event.CorrelationID == "" || event.CommandID == "" || event.DesiredVersion == 0 || !event.DesiredState.Valid() || !event.ObservedState.Valid() || !event.OperationState.Valid() || (event.ProviderID != "" && !event.ProviderID.Valid()) {
 		return Event{}, fmt.Errorf("endpoint: incomplete projection event: %w", ErrInvalidState)
 	}
 	if event.EndpointID != streamEndpointID || !event.EndpointID.Valid() {
 		return Event{}, fmt.Errorf("endpoint: projection endpoint mismatch: %w", ErrInvalidState)
 	}
-	if !event.ConfigSet { event.Config = adapterapi.ValidatedConfig{} }
+	if !event.ConfigSet {
+		event.Config = adapterapi.ValidatedConfig{}
+	}
 	return event, nil
 }
 
 func ApplyEndpointProjection(_ context.Context, tx *gorm.DB, envelopes []eventstore.Envelope) error {
 	for _, envelope := range envelopes {
-		if envelope.Stream.AggregateType != EndpointAggregateType { continue }
+		if envelope.Stream.AggregateType != EndpointAggregateType {
+			continue
+		}
 		event, err := decodeProjectionEvent(envelope)
-		if err != nil { return err }
-		view := EndpointView{EndpointID: event.EndpointID, AdapterKey: event.AdapterKey, Config: event.Config.Clone(), DesiredState: event.DesiredState, ObservedState: event.ObservedState, OperationState: event.OperationState, DesiredVersion: event.DesiredVersion, Generation: event.Generation, OperationID: event.OperationID, CorrelationID: event.CorrelationID, Version: event.Sequence}
-		if !event.ConfigSet {
+		if err != nil {
+			return err
+		}
+		typ := event.Type
+		view := EndpointView{
+			EndpointID: event.EndpointID, DisplayName: event.DisplayName, Statistics: event.Statistics, AdapterKey: event.AdapterKey,
+			Config: event.Config.Clone(), DesiredState: event.DesiredState, ObservedState: event.ObservedState, OperationState: event.OperationState,
+			DesiredVersion: event.DesiredVersion, ProviderID: event.ProviderID, Generation: event.Generation,
+			OperationID: event.OperationID, CorrelationID: event.CorrelationID, Version: event.Sequence,
+		}
+		if typ != EventEndpointCreated {
 			var previous EndpointView
 			rowErr := readProjection(tx, EndpointProjectionName, string(event.EndpointID), &previous)
 			if rowErr == nil {
-				view.Config = previous.Config.Clone()
-				if view.AdapterKey == "" { view.AdapterKey = previous.AdapterKey }
+				if !event.ConfigSet {
+					view.Config = previous.Config.Clone()
+					if view.AdapterKey == "" {
+						view.AdapterKey = previous.AdapterKey
+					}
+				}
+				if typ != EventLegacyMetadataRestored {
+					if event.ProviderID == "" {
+						view.ProviderID = previous.ProviderID
+					}
+					if event.DisplayName == "" {
+						view.DisplayName = previous.DisplayName
+					}
+					view.Statistics = previous.Statistics
+				}
+				if typ == EventEndpointIdentityObserved || typ == EventLegacyMetadataRestored {
+					view.CorrelationID = previous.CorrelationID
+				}
 			} else if !errors.Is(rowErr, gorm.ErrRecordNotFound) {
 				return rowErr
 			}
 		}
 		payload, err := json.Marshal(view)
-		if err != nil { return err }
-		if err := eventstore.UpsertProjectionRow(tx, EndpointProjectionName, string(event.EndpointID), payload); err != nil { return err }
+		if err != nil {
+			return err
+		}
+		if err := eventstore.UpsertProjectionRow(tx, EndpointProjectionName, string(event.EndpointID), payload); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 func ApplyOperationProjection(_ context.Context, tx *gorm.DB, envelopes []eventstore.Envelope) error {
 	for _, envelope := range envelopes {
-		if envelope.Stream.AggregateType != EndpointAggregateType { continue }
+		if envelope.Stream.AggregateType != EndpointAggregateType {
+			continue
+		}
 		event, err := decodeProjectionEvent(envelope)
-		if err != nil { return err }
+		if err != nil {
+			return err
+		}
+		if event.Type == EventEndpointIdentityObserved || event.Type == EventLegacyMetadataRestored {
+			continue
+		}
 		status := event.OperationState
-		if status == OperationStateIdle { status = OperationStateSucceeded }
+		if status == OperationStateIdle {
+			status = OperationStateSucceeded
+		}
 		view := OperationProjection{OperationID: event.OperationID, EndpointID: event.EndpointID, Kind: string(event.Type), Status: status, EffectID: event.EffectID, DesiredVersion: event.DesiredVersion, Generation: event.Generation, Version: event.Sequence, ResultCode: string(event.Type)}
 		payload, err := json.Marshal(view)
-		if err != nil { return err }
-		if err := eventstore.UpsertProjectionRow(tx, OperationProjectionName, event.OperationID, payload); err != nil { return err }
+		if err != nil {
+			return err
+		}
+		if err := eventstore.UpsertProjectionRow(tx, OperationProjectionName, event.OperationID, payload); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func readProjection(tx *gorm.DB, name, key string, target any) error {
-	if tx == nil { return errors.New("endpoint: nil projection transaction") }
+	if tx == nil {
+		return errors.New("endpoint: nil projection transaction")
+	}
 	row, err := tx.Raw("SELECT payload FROM projection_read_models WHERE projection_generation = ? AND projection_name = ? AND row_key = ?", eventstore.ProjectionGeneration(tx), name, key).Rows()
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer row.Close()
-	if !row.Next() { return gorm.ErrRecordNotFound }
+	if !row.Next() {
+		return gorm.ErrRecordNotFound
+	}
 	var payload []byte
-	if err := row.Scan(&payload); err != nil { return err }
+	if err := row.Scan(&payload); err != nil {
+		return err
+	}
 	return json.Unmarshal(payload, target)
 }
 
 // ProjectEndpoint is retained as a short callback name for store registration.
-func ProjectEndpoint(ctx context.Context, tx *gorm.DB, events []eventstore.Envelope) error { return ApplyEndpointProjection(ctx, tx, events) }
-func ProjectOperation(ctx context.Context, tx *gorm.DB, events []eventstore.Envelope) error { return ApplyOperationProjection(ctx, tx, events) }
+func ProjectEndpoint(ctx context.Context, tx *gorm.DB, events []eventstore.Envelope) error {
+	return ApplyEndpointProjection(ctx, tx, events)
+}
+func ProjectOperation(ctx context.Context, tx *gorm.DB, events []eventstore.Envelope) error {
+	return ApplyOperationProjection(ctx, tx, events)
+}

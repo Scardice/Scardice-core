@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -27,12 +28,12 @@ var (
 )
 
 type IngressSecurity interface {
-	EncryptBound(context.Context, string, string, string, uint64, []byte) ([]byte, []byte, string, error)
-	KeyedDigest(context.Context, string, ...string) ([]byte, string, error)
+	EncryptBound(ctx context.Context, domain, identity, owner string, version uint64, plaintext []byte) ([]byte, []byte, string, error)
+	KeyedDigest(ctx context.Context, domain string, parts ...string) ([]byte, string, error)
 }
 
 type IngressCollision struct {
-	EndpointID      string
+	EndpointID       string
 	ProviderEventKey string
 }
 
@@ -86,11 +87,8 @@ func NewInboundService(repo eventstore.InboxRepository, security IngressSecurity
 	return s, nil
 }
 
-func (s *InboundService) InFlight() int { return int(s.inFlight.Load()) }
+func (s *InboundService) InFlight() int          { return int(s.inFlight.Load()) }
 func (s *InboundService) CollisionCount() uint64 { return s.collisions.Load() }
-
-// HandleInbound durably accepts one normalized provider fact. It never invokes
-// IMSession, Core, plugins, or callbacks; consumers claim the encrypted inbox
 
 func inboundJSONEscapedLen(value string) int {
 	total := 0
@@ -120,8 +118,13 @@ func inboundJSONEscapedLen(value string) int {
 
 func inboundJSONUpperBound(message adapterapi.InboundMessage) int {
 	total := inboundJSONEscapedLen(string(message.ProviderEventID)) + inboundJSONEscapedLen(string(message.MessageID)) + inboundJSONEscapedLen(message.Platform) +
-		inboundJSONEscapedLen(string(message.Sender)) + inboundJSONEscapedLen(string(message.Conversation)) + inboundJSONEscapedLen(message.Target) +
-		inboundJSONEscapedLen(string(message.Kind)) + inboundJSONEscapedLen(message.Text) + inboundJSONEscapedLen(string(message.CausationID))
+		inboundJSONEscapedLen(string(message.Sender)) + inboundJSONEscapedLen(message.SenderRole) + inboundJSONEscapedLen(string(message.Conversation)) + inboundJSONEscapedLen(message.Target) +
+		inboundJSONEscapedLen(string(message.Kind)) + inboundJSONEscapedLen(message.Text) + inboundJSONEscapedLen(string(message.CausationID)) +
+		inboundJSONEscapedLen(string(message.Subject)) + inboundJSONEscapedLen(string(message.Operator)) + inboundJSONEscapedLen(message.RequestID) +
+		inboundJSONEscapedLen(message.RequestPolicy) + inboundJSONEscapedLen(message.SenderName) + inboundJSONEscapedLen(message.SubjectName) + inboundJSONEscapedLen(message.ConversationName)
+	if message.AdapterEvent != nil {
+		total += inboundJSONEscapedLen(message.AdapterEvent.Protocol) + inboundJSONEscapedLen(message.AdapterEvent.Type) + inboundJSONEscapedLen(message.AdapterEvent.RawJSON)
+	}
 	for _, segment := range message.Segments {
 		total += inboundJSONEscapedLen(segment.Kind) + inboundJSONEscapedLen(segment.Text) + inboundJSONEscapedLen(segment.ProviderID) + inboundJSONEscapedLen(segment.URL)
 	}
@@ -146,6 +149,19 @@ func ingressPayloadJSONUpperBound(endpointID adapterapi.EndpointID, digestKeyID 
 	return envelopeBound + messageBound
 }
 
+// inboundContentDigestJSON excludes the exact provider representation from
+// normalized facts while retaining it for opaque adapter events. Every
+// normalized field, including Core's history mode, remains part of the digest.
+func inboundContentDigestJSON(message adapterapi.InboundMessage) ([]byte, error) {
+	projection := message
+	if projection.Kind != adapterapi.InboundKindAdapterEvent {
+		projection.AdapterEvent = nil
+	}
+	return json.Marshal(projection)
+}
+
+// HandleInbound durably accepts one normalized provider fact. It never invokes
+// IMSession, Core, plugins, or callbacks; consumers claim the encrypted inbox
 // row in a later workflow.
 func (s *InboundService) HandleInbound(ctx context.Context, fenced endpoint.FencedInbound) (adapterapi.IngressReceipt, error) {
 	if s == nil || s.repo == nil || s.security == nil {
@@ -172,7 +188,7 @@ func (s *InboundService) HandleInbound(ctx context.Context, fenced endpoint.Fenc
 	if inboundJSONUpperBound(message) > eventstore.MaxEventPayloadBytes {
 		return adapterapi.IngressReceipt{}, ErrIngressPayload
 	}
-	contentBytes, err := json.Marshal(message)
+	contentBytes, err := inboundContentDigestJSON(message)
 	if err != nil {
 		return adapterapi.IngressReceipt{}, err
 	}
@@ -187,7 +203,15 @@ func (s *InboundService) HandleInbound(ctx context.Context, fenced endpoint.Fenc
 	if conversation == "" {
 		conversation = message.Target
 	}
-	laneDigest, _, err := s.security.KeyedDigest(ctx, "inbound-lane/v1", canonicalIngressTuple(string(fenced.EndpointID), conversation))
+	// Recovered messages that are only recorded can be hundreds; behind the
+	// group's live lane they would hold its live messages back, so they queue
+	// in a lane of their own. The conversation, and with it the privacy subject
+	// below, is the same.
+	laneParts := []string{string(fenced.EndpointID), conversation}
+	if message.History == adapterapi.InboundHistoryRecordOnly {
+		laneParts = append(laneParts, "recorded-history")
+	}
+	laneDigest, _, err := s.security.KeyedDigest(ctx, "inbound-lane/v1", canonicalIngressTuple(laneParts...))
 	if err != nil {
 		return adapterapi.IngressReceipt{}, err
 	}
@@ -244,13 +268,13 @@ func (s *InboundService) HandleInbound(ctx context.Context, fenced endpoint.Fenc
 }
 
 type ingressPayload struct {
-	EndpointID        adapterapi.EndpointID    `json:"endpointId"`
-	Generation        uint64                   `json:"generation"`
-	DesiredVersion    uint64                   `json:"desiredVersion"`
-	Message           adapterapi.InboundMessage `json:"message"`
-	ContentDigest     []byte                   `json:"contentDigest"`
-	ContentDigestKeyID string                  `json:"contentDigestKeyId"`
-	Status            string                   `json:"status"`
+	EndpointID         adapterapi.EndpointID     `json:"endpointId"`
+	Generation         uint64                    `json:"generation"`
+	DesiredVersion     uint64                    `json:"desiredVersion"`
+	Message            adapterapi.InboundMessage `json:"message"`
+	ContentDigest      []byte                    `json:"contentDigest"`
+	ContentDigestKeyID string                    `json:"contentDigestKeyId"`
+	Status             string                    `json:"status"`
 }
 
 func (s *InboundService) providerKey(ctx context.Context, endpointID adapterapi.EndpointID, message adapterapi.InboundMessage, contentDigest []byte) (string, error) {
@@ -263,10 +287,10 @@ func (s *InboundService) providerKey(ctx context.Context, endpointID adapterapi.
 	}
 	occurred := "0"
 	if !message.OccurredAt.IsZero() {
-		occurred = fmt.Sprintf("%d", message.OccurredAt.UTC().UnixNano())
+		occurred = strconv.FormatInt(message.OccurredAt.UTC().UnixNano(), 10)
 	}
 	identityParts := []string{string(endpointID), message.Platform, string(message.Sender), target, occurred}
-	if message.OccurredAt.IsZero() {
+	if message.OccurredAt.IsZero() || message.Kind == adapterapi.InboundKindAdapterEvent {
 		identityParts = append(identityParts, hex.EncodeToString(contentDigest))
 	}
 	identityDigest, _, err := s.security.KeyedDigest(ctx, "fallback-provider-key/v1", canonicalIngressTuple(identityParts...))
@@ -294,4 +318,3 @@ func (s *InboundService) recordCollision(collision IngressCollision) {
 		s.collisionObserver(collision)
 	}
 }
-

@@ -53,34 +53,23 @@ func (state OperationState) Valid() bool {
 type CommandKind string
 
 const (
-	CommandCreate       CommandKind = "create"
-	CommandUpdateConfig CommandKind = "update_config"
-	CommandEnable       CommandKind = "enable"
-	CommandDisable      CommandKind = "disable"
-	CommandRelogin      CommandKind = "relogin"
-	CommandRemove       CommandKind = "remove"
-	CommandResolve      CommandKind = "resolve"
-	CommandComplete     CommandKind = "complete"
+	CommandCreate                CommandKind = "create"
+	CommandUpdateConfig          CommandKind = "update_config"
+	CommandEnable                CommandKind = "enable"
+	CommandDisable               CommandKind = "disable"
+	CommandRelogin               CommandKind = "relogin"
+	CommandRemove                CommandKind = "remove"
+	CommandResolve               CommandKind = "resolve"
+	CommandComplete              CommandKind = "complete"
+	CommandObserveIdentity       CommandKind = "observe_identity"
+	CommandRestoreLegacyMetadata CommandKind = "restore_legacy_metadata"
 )
 
 // Completion is a Supervisor-owned pure fact transition from pending to a
 // terminal operation state; it performs no external work.
-
 func (kind CommandKind) Valid() bool {
-	return kind == CommandCreate || kind == CommandUpdateConfig || kind == CommandEnable || kind == CommandDisable || kind == CommandRelogin || kind == CommandRemove || kind == CommandResolve || kind == CommandComplete
+	return kind == CommandCreate || kind == CommandUpdateConfig || kind == CommandEnable || kind == CommandDisable || kind == CommandRelogin || kind == CommandRemove || kind == CommandResolve || kind == CommandComplete || kind == CommandObserveIdentity || kind == CommandRestoreLegacyMetadata
 }
-
-// Compatibility names for callers that prefer noun-style constants.
-const (
-	Create       = CommandCreate
-	UpdateConfig = CommandUpdateConfig
-	Enable       = CommandEnable
-	Disable      = CommandDisable
-	Relogin      = CommandRelogin
-	Remove       = CommandRemove
-	Resolve      = CommandResolve
-	Complete     = CommandComplete
-)
 
 // SecretInput is an ephemeral plaintext secret accepted only at the command
 // boundary. It is never serialized into events, projections, operations, or
@@ -91,6 +80,23 @@ type SecretInput struct {
 	Version         uint64
 	ExpectedVersion uint64
 	Plaintext       []byte
+}
+
+// Statistics preserves account counters across migration without coupling the
+// endpoint aggregate to provider-specific runtime objects.
+type Statistics struct {
+	GroupCount    int64 `json:"groupCount,omitempty"`
+	CommandCount  int64 `json:"commandCount,omitempty"`
+	LastCommandAt int64 `json:"lastCommandAt,omitempty"`
+	OnlineSeconds int64 `json:"onlineSeconds,omitempty"`
+}
+
+func (statistics Statistics) valid() bool {
+	return statistics.GroupCount >= 0 && statistics.CommandCount >= 0 && statistics.LastCommandAt >= 0 && statistics.OnlineSeconds >= 0
+}
+
+func (statistics Statistics) empty() bool {
+	return statistics == (Statistics{})
 }
 
 type Command struct {
@@ -106,6 +112,8 @@ type Command struct {
 	IdempotencyKey           string
 	RequestDigest            []byte `json:"-"`
 	EndpointID               adapterapi.EndpointID
+	DisplayName              string
+	Statistics               Statistics
 	AdapterKey               adapterapi.AdapterKey
 	Config                   adapterapi.ValidatedConfig
 	SecretRefs               []adapterapi.SecretRef
@@ -117,6 +125,8 @@ type Command struct {
 	ExpectedVersionSet       bool
 	ObservedState            adapterapi.ObservedState
 	Generation               uint64
+	DesiredVersion           uint64
+	ProviderID               adapterapi.PrincipalID
 	CompletionState          OperationState
 }
 
@@ -125,29 +135,33 @@ type Command struct {
 type EventType string
 
 const (
-	EventEndpointCreated    EventType = "endpoint.created"
-	EventConfigUpdated      EventType = "endpoint.config_updated"
-	EventDesiredEnabled     EventType = "endpoint.enabled"
-	EventDesiredDisabled    EventType = "endpoint.disabled"
-	EventReloginRequested   EventType = "endpoint.relogin_requested"
-	EventRemovalRequested   EventType = "endpoint.removal_requested"
-	EventEndpointDeleted    EventType = "endpoint.deleted"
-	EventOperationCompleted EventType = "endpoint.operation_completed"
+	EventEndpointCreated          EventType = "endpoint.created"
+	EventConfigUpdated            EventType = "endpoint.config_updated"
+	EventDesiredEnabled           EventType = "endpoint.enabled"
+	EventDesiredDisabled          EventType = "endpoint.disabled"
+	EventReloginRequested         EventType = "endpoint.relogin_requested"
+	EventRemovalRequested         EventType = "endpoint.removal_requested"
+	EventEndpointDeleted          EventType = "endpoint.deleted"
+	EventOperationCompleted       EventType = "endpoint.operation_completed"
+	EventEndpointIdentityObserved EventType = "endpoint.identity_observed"
+	EventLegacyMetadataRestored   EventType = "endpoint.legacy_metadata_restored"
 )
 
 const (
-	EndpointCreated    = EventEndpointCreated
-	ConfigUpdated      = EventConfigUpdated
-	DesiredEnabled     = EventDesiredEnabled
-	DesiredDisabled    = EventDesiredDisabled
-	ReloginRequested   = EventReloginRequested
-	RemovalRequested   = EventRemovalRequested
-	EndpointDeleted    = EventEndpointDeleted
-	OperationCompleted = EventOperationCompleted
+	EndpointCreated          = EventEndpointCreated
+	ConfigUpdated            = EventConfigUpdated
+	DesiredEnabled           = EventDesiredEnabled
+	DesiredDisabled          = EventDesiredDisabled
+	ReloginRequested         = EventReloginRequested
+	RemovalRequested         = EventRemovalRequested
+	EndpointDeleted          = EventEndpointDeleted
+	OperationCompleted       = EventOperationCompleted
+	EndpointIdentityObserved = EventEndpointIdentityObserved
+	LegacyMetadataRestored   = EventLegacyMetadataRestored
 )
 
 func (kind EventType) Valid() bool {
-	return kind == EventEndpointCreated || kind == EventConfigUpdated || kind == EventDesiredEnabled || kind == EventDesiredDisabled || kind == EventReloginRequested || kind == EventRemovalRequested || kind == EventEndpointDeleted || kind == EventOperationCompleted
+	return kind == EventEndpointCreated || kind == EventConfigUpdated || kind == EventDesiredEnabled || kind == EventDesiredDisabled || kind == EventReloginRequested || kind == EventRemovalRequested || kind == EventEndpointDeleted || kind == EventOperationCompleted || kind == EventEndpointIdentityObserved || kind == EventLegacyMetadataRestored
 }
 
 // EffectKind is an intent for Supervisor. It is not execution and carries no
@@ -198,6 +212,9 @@ type Event struct {
 	EffectKind       EffectKind
 	Generation       uint64
 	DesiredVersion   uint64
+	ProviderID       adapterapi.PrincipalID
+	DisplayName      string
+	Statistics       Statistics
 	DesiredState     DesiredState
 	ObservedState    adapterapi.ObservedState
 	OperationState   OperationState
@@ -228,6 +245,9 @@ type State struct {
 	ObservedState     adapterapi.ObservedState
 	OperationState    OperationState
 	DesiredVersion    uint64
+	ProviderID        adapterapi.PrincipalID
+	DisplayName       string
+	Statistics        Statistics
 	OperationID       string
 	CorrelationID     string
 	PendingEffectID   string
@@ -239,17 +259,6 @@ type State struct {
 	// A nil map means the aggregate performs only adapter-key validation.
 	AllowedAdapters map[adapterapi.AdapterKey]struct{}
 }
-
-// EndpointState, EndpointAggregate, and Aggregate are compatibility aliases
-// for callers that name the durable owner explicitly; all remain plain
-// state values and contain no runtime ownership.
-type EndpointState = State
-type EndpointAggregate = State
-type Aggregate = State
-type EndpointCommand = Command
-type EndpointEvent = Event
-type EndpointEffect = LifecycleEffect
-type OperationStatus = OperationState
 
 // Decision is the complete pure result of a command. Replay is true when the
 // same command identity and digest have already been applied.

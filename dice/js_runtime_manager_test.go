@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"Scardice-core/utils/jsengine"
-	"Scardice-core/utils/jsengine/native"
 )
 
 func TestJSRuntimeManagerRegistersBuiltinGojaAndResolvesIt(t *testing.T) {
@@ -44,8 +43,8 @@ func TestJSRuntimeManagerQuickJSMissingPackageIsExplicitAndDoesNotFallback(t *te
 	if err == nil {
 		t.Fatal("Resolve(quickjs) unexpectedly succeeded without a runtime package")
 	}
-	if !errors.Is(err, native.ErrMissingLibrary) {
-		t.Fatalf("Resolve(quickjs) error = %v, want native.ErrMissingLibrary", err)
+	if !errors.Is(err, jsengine.ErrProviderNotFound) {
+		t.Fatalf("Resolve(quickjs) error = %v, want jsengine.ErrProviderNotFound", err)
 	}
 	if !strings.Contains(strings.ToLower(err.Error()), "quickjs") {
 		t.Fatalf("Resolve(quickjs) diagnostic = %q, want engine ID", err)
@@ -53,6 +52,17 @@ func TestJSRuntimeManagerQuickJSMissingPackageIsExplicitAndDoesNotFallback(t *te
 	status, ok := manager.Status("quickjs")
 	if !ok || status.Loaded || status.Error == "" {
 		t.Fatalf("missing QuickJS status did not retain failure: ok=%v status=%+v", ok, status)
+	}
+	statuses := manager.Statuses()
+	found := false
+	for _, candidate := range statuses {
+		if candidate.ID == "quickjs" && candidate.Error != "" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Statuses() = %+v, want missing QuickJS diagnostic", statuses)
 	}
 }
 
@@ -66,12 +76,12 @@ func TestJSRuntimeManagerReportsDiscoveredMetadataWithoutLoading(t *testing.T) {
 		"schema": 1,
 		"id": "quickjs",
 		"name": "QuickJS native provider",
-		"version": "0.7.7",
+		"version": "0.8.0",
 		"language": "C++",
 		"author": "Scardice",
 		"extensions": [".js", ".ts"],
-		"runtimeAbi": {"major": 1, "minMinor": 0},
-		"hostAbi": {"major": 1, "minMinor": 0},
+		"runtimeAbi": {"major": 1},
+		"hostAbi": {"major": 1},
 		"libraries": {"%s": "libquickjs.so"},
 		"capabilities": 3
 	}`, runtime.GOOS+"-"+runtime.GOARCH)
@@ -87,7 +97,7 @@ func TestJSRuntimeManagerReportsDiscoveredMetadataWithoutLoading(t *testing.T) {
 	if !status.Installed || status.Loaded || status.Builtin {
 		t.Fatalf("unexpected QuickJS status: %+v", status)
 	}
-	if status.Version != "0.7.7" || status.ABI != "1.0" {
+	if status.Version != "0.8.0" || status.ABI != "v1" {
 		t.Fatalf("metadata status = %+v", status)
 	}
 	if status.Author != "Scardice" || len(status.Extensions) != 2 || status.Extensions[0] != ".js" || status.Extensions[1] != ".ts" {
@@ -132,7 +142,7 @@ func TestJSRuntimeManagerResolvesInstalledQuickJS(t *testing.T) {
 	}
 
 	status, ok := manager.Status("quickjs")
-	if !ok || !status.Loaded || status.Version != "0.7.7" {
+	if !ok || !status.Loaded || status.Version != "0.8.0" {
 		t.Fatalf("loaded QuickJS status = ok=%v %+v", ok, status)
 	}
 }

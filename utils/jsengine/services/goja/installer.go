@@ -40,6 +40,7 @@ type Options struct {
 	Loop             *eventloop.EventLoop
 	Proxy            http.Handler
 	Printer          console.Printer
+	CryptoWarn       func(string)
 	Logger           sealws.Logger
 	NetworkAuthorize func(string) error
 	CurrentContext   func() any
@@ -56,12 +57,17 @@ type Installer struct {
 	closed         bool
 	fetchLifecycle *sealhttp.FetchLifecycle
 	wsManager      *sealws.WebSocketManager
+	cryptoWarn     func(string)
 }
 
 func NewInstaller(options Options) *Installer {
 	installer := &Installer{
-		options:   options,
-		wsManager: sealws.NewManager(),
+		options:    options,
+		wsManager:  sealws.NewManager(),
+		cryptoWarn: options.CryptoWarn,
+	}
+	if installer.cryptoWarn == nil && options.Printer != nil {
+		installer.cryptoWarn = options.Printer.Warn
 	}
 	if options.Proxy != nil {
 		installer.fetchLifecycle = sealhttp.NewFetchLifecycle()
@@ -133,7 +139,7 @@ func (i *Installer) Install() error {
 	} else {
 		i.options.Registry.RegisterNativeModule("console", console.Require)
 	}
-	i.options.Registry.RegisterNativeModule("crypto", sealcrypto.Require)
+	i.options.Registry.RegisterNativeModule("crypto", sealcrypto.Require(i.cryptoWarn))
 	i.options.Registry.RegisterNativeModule("@seal/abort", sealabort.Require)
 	i.options.Registry.RegisterNativeModule("@seal/http", sealhttp.Require)
 	i.options.Registry.RegisterNativeModule("@seal/structuredclone", sealsclone.Require)
@@ -163,9 +169,12 @@ func (i *Installer) Enable(vm *goja.Runtime) error {
 	i.mu.Unlock()
 
 	console.Enable(vm)
-	sealws.EnableWithPolicyAndManager(vm, i.options.Loop, i.wsManager, i.options.NetworkAuthorize)
+	sealws.EnableWithPolicyAndManagerAndContext(vm, i.options.Loop, i.wsManager, i.options.NetworkAuthorize, sealws.AsyncContextHooks{
+		CurrentContext: i.options.CurrentContext,
+		ScheduleOnLoop: i.options.ScheduleOnLoop,
+	})
 	i.options.Registry.Enable(vm)
-	sealcrypto.Enable(vm)
+	sealcrypto.Enable(vm, i.cryptoWarn)
 	buffer.Enable(vm)
 	url.Enable(vm)
 	sealabort.Enable(vm)

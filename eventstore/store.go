@@ -27,6 +27,8 @@ var (
 	ErrUnsupportedEventSchema   = ErrUnsupportedSchema
 )
 
+const storeWorkSignalCapacity = 4
+
 type ParticipantConflict struct {
 	Table           string
 	Key             string
@@ -115,6 +117,7 @@ type GORMStore struct {
 	db               *Database
 	mu               sync.RWMutex
 	projectorMu      sync.RWMutex
+	workMu           sync.Mutex
 	initErr          error
 	readinessErr     error
 	projectors       []ProjectionDescriptor
@@ -124,13 +127,18 @@ type GORMStore struct {
 	ids              IDGenerator
 	codec            any
 	keySource        KeySource
+	inboxWork        chan struct{}
+	outboxWork       chan struct{}
 	freshInitialized bool
 	freshBaseline    Readiness
 	freshBaselineSet bool
 }
 
 func NewStore(database *Database, options ...StoreOption) *GORMStore {
-	s := &GORMStore{db: database, clock: SystemClock{}, ids: UUIDGenerator{}}
+	s := &GORMStore{
+		db: database, clock: SystemClock{}, ids: UUIDGenerator{},
+		inboxWork: make(chan struct{}, storeWorkSignalCapacity), outboxWork: make(chan struct{}, storeWorkSignalCapacity),
+	}
 	if database != nil && database.keySource != nil {
 		s.keySource = database.keySource
 		s.codec = &a6PayloadCodec{source: database.keySource}
@@ -140,6 +148,7 @@ func NewStore(database *Database, options ...StoreOption) *GORMStore {
 			option(s)
 		}
 	}
+	s.participants = append(s.participants, s.applyStoryLogUpdates, s.applyStoryLogImports)
 	if s.keySource != nil {
 		s.recordReadinessError(s.initializeA6Readiness(context.Background()))
 	}
@@ -194,14 +203,6 @@ func (s *GORMStore) clearReadinessError() {
 	}
 	s.mu.Lock()
 	s.readinessErr = nil
-	s.mu.Unlock()
-}
-func (s *GORMStore) clearInitializationError() {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	s.initErr = nil
 	s.mu.Unlock()
 }
 func (s *GORMStore) initializationError() error {
@@ -300,11 +301,124 @@ func (s *GORMStore) observeLock(name string) {
 	}
 }
 
+// InboxWorkSignal receives whenever committed inbox work may be claimable.
+// Fetch it before a claim attempt so a concurrent commit cannot be missed.
+func (s *GORMStore) InboxWorkSignal() <-chan struct{} {
+	if s == nil {
+		return nil
+	}
+	s.workMu.Lock()
+	defer s.workMu.Unlock()
+	if s.inboxWork == nil {
+		s.inboxWork = make(chan struct{}, storeWorkSignalCapacity)
+	}
+	return s.inboxWork
+}
+
+// OutboxWorkSignal receives whenever committed outbox work may be claimable.
+// Fetch it before a claim attempt so a concurrent commit cannot be missed.
+func (s *GORMStore) OutboxWorkSignal() <-chan struct{} {
+	if s == nil {
+		return nil
+	}
+	s.workMu.Lock()
+	defer s.workMu.Unlock()
+	if s.outboxWork == nil {
+		s.outboxWork = make(chan struct{}, storeWorkSignalCapacity)
+	}
+	return s.outboxWork
+}
+
+func (s *GORMStore) signalInboxWork() {
+	if s != nil {
+		s.signalWork(&s.inboxWork)
+	}
+}
+
+func (s *GORMStore) signalOutboxWork() {
+	if s != nil {
+		s.signalWork(&s.outboxWork)
+	}
+}
+
+func (s *GORMStore) signalWork(signal *chan struct{}) {
+	s.workMu.Lock()
+	if *signal == nil {
+		*signal = make(chan struct{}, storeWorkSignalCapacity)
+	}
+	work := *signal
+	s.workMu.Unlock()
+	for range cap(work) {
+		select {
+		case work <- struct{}{}:
+		default:
+			return
+		}
+	}
+}
+
 func locked(db *gorm.DB) *gorm.DB {
-	if db != nil && db.Dialector.Name() != "sqlite" {
+	if db != nil && db.Name() != "sqlite" {
 		return db.Clauses(clause.Locking{Strength: "UPDATE"})
 	}
 	return db
+}
+
+func insertDomainEventRows(tx *gorm.DB, rows []domainEventRow) error {
+	if tx == nil || len(rows) == 0 {
+		return ErrParticipantFailure
+	}
+	if tx.Dialector == nil || tx.Name() != "sqlite" {
+		const eventInsertBatchSize = 500
+		if err := tx.CreateInBatches(&rows, eventInsertBatchSize).Error; err != nil {
+			return ErrParticipantFailure
+		}
+		return nil
+	}
+	var query strings.Builder
+	query.Grow(len(rows) * 1024)
+	query.WriteString("INSERT INTO domain_events (event_id,aggregate_type,aggregate_id,aggregate_version,global_position,event_type,schema_version,payload,command_id,correlation_id,causation_id,principal_id,producer,occurred_at_unix_nano_utc,checksum,created_at) VALUES ")
+	for index, row := range rows {
+		if index != 0 {
+			query.WriteByte(',')
+		}
+		query.WriteByte('(')
+		writeSQLiteTextLiteral(&query, row.EventID)
+		query.WriteByte(',')
+		writeSQLiteTextLiteral(&query, row.AggregateType)
+		query.WriteByte(',')
+		writeSQLiteTextLiteral(&query, row.AggregateID)
+		query.WriteByte(',')
+		writeSQLiteUint(&query, row.AggregateVersion)
+		query.WriteByte(',')
+		writeSQLiteUint(&query, row.GlobalPosition)
+		query.WriteByte(',')
+		writeSQLiteTextLiteral(&query, row.EventType)
+		query.WriteByte(',')
+		writeSQLiteUint(&query, uint64(row.SchemaVersion))
+		query.WriteByte(',')
+		writeSQLiteBlobLiteral(&query, row.Payload)
+		query.WriteByte(',')
+		writeSQLiteTextLiteral(&query, row.CommandID)
+		query.WriteByte(',')
+		writeSQLiteTextLiteral(&query, row.CorrelationID)
+		query.WriteByte(',')
+		writeSQLiteTextLiteral(&query, row.CausationID)
+		query.WriteByte(',')
+		writeSQLiteTextLiteral(&query, row.PrincipalID)
+		query.WriteByte(',')
+		writeSQLiteTextLiteral(&query, row.Producer)
+		query.WriteByte(',')
+		writeSQLiteInt(&query, row.OccurredAtUnixNanoUTC)
+		query.WriteByte(',')
+		writeSQLiteBlobLiteral(&query, row.Checksum)
+		query.WriteString(",CURRENT_TIMESTAMP)")
+	}
+	result := tx.Exec(query.String())
+	if result.Error != nil || result.RowsAffected != int64(len(rows)) {
+		return ErrParticipantFailure
+	}
+	return nil
 }
 
 func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitResult, err error) {
@@ -353,7 +467,7 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 		return CommitResult{}, err
 	}
 	if s.keySource != nil {
-		if err = s.validateReadinessOnDB(ctx, tx, false); err != nil {
+		if err = s.validateReadinessSnapshotOnDB(ctx, tx, &readiness, &control, false); err != nil {
 			return CommitResult{}, err
 		}
 		if err = s.validateA6UnitOfWorkWithDB(ctx, tx, work); err != nil {
@@ -443,6 +557,7 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 	result.StreamVersions = make(map[StreamID]uint64, len(work.Streams))
 	if totalEvents > 0 {
 		result.Events = make([]Envelope, 0, totalEvents)
+		rows := make([]domainEventRow, 0, totalEvents)
 		position := sequence.NextPosition
 		for _, item := range work.Streams {
 			version := headStates[item.Stream].current
@@ -455,10 +570,16 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 				if envelopeErr != nil {
 					return CommitResult{}, envelopeErr
 				}
-				row := domainEventRow{EventID: envelope.EventID, AggregateType: envelope.Stream.AggregateType, AggregateID: envelope.Stream.AggregateID, AggregateVersion: envelope.StreamVersion, GlobalPosition: envelope.GlobalPosition, EventType: envelope.EventType, SchemaVersion: envelope.SchemaVersion, Payload: envelope.Payload, CommandID: envelope.Metadata.CommandID, CorrelationID: envelope.Metadata.CorrelationID, CausationID: envelope.Metadata.CausationID, PrincipalID: envelope.Metadata.PrincipalID, Producer: envelope.Metadata.Producer, OccurredAtUnixNanoUTC: metadataUnixNano(envelope.Metadata), Checksum: append([]byte(nil), envelope.Checksum[:]...), CreatedAt: time.Now().UTC()}
-				if err = tx.Create(&row).Error; err != nil {
-					return CommitResult{}, errors.New("eventstore: insert domain event failed")
-				}
+				rows = append(rows, domainEventRow{
+					EventID: envelope.EventID, AggregateType: envelope.Stream.AggregateType, AggregateID: envelope.Stream.AggregateID,
+					AggregateVersion: envelope.StreamVersion, GlobalPosition: envelope.GlobalPosition,
+					EventType: envelope.EventType, SchemaVersion: envelope.SchemaVersion,
+					Payload: envelope.Payload, CommandID: envelope.Metadata.CommandID,
+					CorrelationID: envelope.Metadata.CorrelationID, CausationID: envelope.Metadata.CausationID,
+					PrincipalID: envelope.Metadata.PrincipalID, Producer: envelope.Metadata.Producer,
+					OccurredAtUnixNanoUTC: metadataUnixNano(envelope.Metadata),
+					Checksum:              append([]byte(nil), envelope.Checksum[:]...), CreatedAt: time.Now().UTC(),
+				})
 				result.Events = append(result.Events, envelope)
 				position, err = nextVersion(position)
 				if err != nil {
@@ -466,6 +587,9 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 				}
 			}
 			result.StreamVersions[item.Stream] = version
+		}
+		if err = insertDomainEventRows(tx, rows); err != nil {
+			return CommitResult{}, errors.New("eventstore: insert domain events failed")
 		}
 		sequence.NextPosition = position
 		sequence.UpdatedAt = time.Now().UTC()
@@ -511,10 +635,15 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 		}
 		return CommitResult{}, err
 	}
+	if len(work.InboxUpdates) > 0 || len(work.Effects) > 0 {
+		if err = s.refreshQueueScheduling(ctx, tx, work); err != nil {
+			return CommitResult{}, err
+		}
+	}
 	if readiness.Mode == "fresh" &&
 		(len(work.Streams) > 0 || len(work.Operations) > 0 || len(work.InboxUpdates) > 0 ||
 			len(work.Effects) > 0 || len(work.ArtifactUpdates) > 0 || len(work.SecretUpdates) > 0 ||
-			len(work.PluginKVUpdates) > 0 || len(work.FenceUpdates) > 0) {
+			len(work.PluginKVUpdates) > 0 || len(work.FenceUpdates) > 0 || len(work.LogUpdates) > 0 || len(work.LogImports) > 0) {
 		if err = markFreshInitializedTx(tx); err != nil {
 			return CommitResult{}, err
 		}
@@ -555,11 +684,11 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 		}
 	}
 	if len(projectors) > 0 {
-		tx = tx.Set(projectionGenerationKey, control.ActiveGeneration)
+		tx = withProjectionGeneration(tx, control.ActiveGeneration)
 	}
 	for _, descriptor := range projectors {
 		if hookErr := descriptor.Apply(ctx, tx, result.Events); hookErr != nil {
-			return CommitResult{}, ErrProjectorFailure
+			return CommitResult{}, errors.Join(ErrProjectorFailure, hookErr)
 		}
 	}
 	s.projectorMu.RLock()
@@ -572,6 +701,12 @@ func (s *GORMStore) Commit(ctx context.Context, work UnitOfWork) (result CommitR
 	s.projectorMu.RUnlock()
 	if err = commitErr; err != nil {
 		return CommitResult{}, errors.New("eventstore: commit transaction failed")
+	}
+	if len(work.InboxUpdates) > 0 {
+		s.signalInboxWork()
+	}
+	if len(work.Effects) > 0 {
+		s.signalOutboxWork()
 	}
 	return result, nil
 }
@@ -613,8 +748,9 @@ func (s *GORMStore) Load(ctx context.Context, stream StreamID, fromVersion uint6
 		}
 		copy(checksum[:], row.Checksum)
 		envelope := Envelope{Stream: stream, StreamVersion: row.AggregateVersion, GlobalPosition: row.GlobalPosition, EventID: row.EventID, EventType: row.EventType, SchemaVersion: row.SchemaVersion, Payload: copyProjectionBytes(row.Payload), Metadata: Metadata{EventID: row.EventID, CommandID: row.CommandID, CorrelationID: row.CorrelationID, CausationID: row.CausationID, PrincipalID: row.PrincipalID, Producer: row.Producer, OccurredAtUnixNanoUTC: row.OccurredAtUnixNanoUTC, OccurredAtUnixNanoSet: true}, Checksum: checksum}
-		if ComputeEventChecksum(envelope) != checksum {
-			return nil, ErrChecksumMismatch
+		envelope, err := verifyEnvelopeChecksum(envelope)
+		if err != nil {
+			return nil, err
 		}
 		envelopes = append(envelopes, envelope)
 	}
@@ -741,7 +877,7 @@ func (s *GORMStore) Close() error {
 }
 
 const maxUint64 = ^uint64(0)
-const maxPersistedVersion = uint64(^uint64(0) >> 1)
+const maxPersistedVersion = ^uint64(0) >> 1
 
 func nextVersion(current uint64) (uint64, error) {
 	if current >= maxPersistedVersion {
@@ -1261,12 +1397,6 @@ func timePtr(v time.Time) *time.Time {
 		return nil
 	}
 	return &v
-}
-func chooseUint(v, fallback uint64) uint64 {
-	if v == 0 {
-		return fallback
-	}
-	return v
 }
 
 var _ Store = (*GORMStore)(nil)

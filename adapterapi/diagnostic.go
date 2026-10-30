@@ -3,11 +3,11 @@ package adapterapi
 import "fmt"
 
 const (
-	MaxDiagnosticEntries     = 64
-	MaxDiagnosticFields      = 32
-	MaxDiagnosticCodeBytes   = 256
+	MaxDiagnosticEntries      = 64
+	MaxDiagnosticFields       = 32
+	MaxDiagnosticCodeBytes    = 256
 	MaxDiagnosticMessageBytes = 8 * 1024
-	MaxDiagnosticValueBytes  = 4 * 1024
+	MaxDiagnosticValueBytes   = 4 * 1024
 )
 
 // DiagnosticSeverity is a closed severity vocabulary.

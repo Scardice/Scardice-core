@@ -314,9 +314,9 @@ type AsyncCall struct {
 
 // AsyncSink receives asynchronous service data and terminal notifications.
 type AsyncSink interface {
-	Event(RequestID, Response) error
-	Complete(RequestID, Response) error
-	Close(RequestID, Response) error
+	Event(id RequestID, response Response) error
+	Complete(id RequestID, response Response) error
+	Close(id RequestID, response Response) error
 }
 
 // AsyncService extends Service with a request lifecycle.
@@ -582,15 +582,15 @@ func (r *Registry) Install(installer Installer) (*Installation, error) {
 	normalized := make([]Definition, len(definitions))
 	seen := make(map[Name]struct{}, len(definitions))
 	for i, definition := range definitions {
-		definition, err := definition.normalized()
+		normalizedDefinition, err := definition.normalized()
 		if err != nil {
 			return nil, err
 		}
-		if _, exists := seen[definition.Name]; exists {
-			return nil, fmt.Errorf("%w: %q", ErrDuplicateService, definition.Name)
+		if _, exists := seen[normalizedDefinition.Name]; exists {
+			return nil, fmt.Errorf("%w: %q", ErrDuplicateService, normalizedDefinition.Name)
 		}
-		seen[definition.Name] = struct{}{}
-		normalized[i] = definition
+		seen[normalizedDefinition.Name] = struct{}{}
+		normalized[i] = normalizedDefinition
 	}
 
 	r.mu.Lock()

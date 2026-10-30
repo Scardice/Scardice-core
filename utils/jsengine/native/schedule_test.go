@@ -96,7 +96,7 @@ func TestNativeCloseDiscardsQueuedCallbacks(t *testing.T) {
 		t.Fatal("first scheduled callback never ran")
 	}
 	var ran atomic.Int32
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		if err := jsengine.Schedule(loop, func(jsengine.Runtime) error {
 			ran.Add(1)
 			return nil
@@ -138,5 +138,38 @@ func TestNativeCloseDiscardsQueuedCallbacks(t *testing.T) {
 	native.contextMu.RUnlock()
 	if contexts != 0 {
 		t.Fatalf("retained execution contexts = %d, want 0", contexts)
+	}
+}
+
+func TestNativeHostRefReleaseIsAcceptedOnlyDuringMatchingDestroy(t *testing.T) {
+	loop := &nativeLoop{runtime: 17}
+	state := newNativeHostState(loop)
+	loop.host = state
+	ref, err := state.session.RegisterObject(&struct{ Value int }{Value: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.session.RetainObject(ref); err != nil {
+		t.Fatal(err)
+	}
+
+	loop.closed.Store(true)
+	loop.releaseWindow.Store(true)
+	if err := state.releaseObject(17, ref); err != nil {
+		t.Fatalf("matching HostRef release during provider destroy failed: %v", err)
+	}
+	if state.session.ObjectCount() != 0 {
+		t.Fatalf("destroy-time release did not remove the retained HostRef: objects=%d", state.session.ObjectCount())
+	}
+	if err := state.checkRuntime(17); !errors.Is(err, ErrNativeClosed) {
+		t.Fatalf("ordinary runtime operation during destroy = %v, want ErrNativeClosed", err)
+	}
+	if err := state.releaseObject(18, ref); !errors.Is(err, ErrNativeStaleValue) {
+		t.Fatalf("wrong-runtime release during destroy = %v, want ErrNativeStaleValue", err)
+	}
+
+	loop.releaseWindow.Store(false)
+	if err := state.releaseObject(17, ref); !errors.Is(err, ErrNativeClosed) {
+		t.Fatalf("matching release after destroy = %v, want ErrNativeClosed", err)
 	}
 }

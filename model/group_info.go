@@ -42,8 +42,6 @@ type GroupPlayerInfoBase struct {
 	// ValueMapTemp map[string]*VMValue  `yaml:"-"`           // 玩家的群内临时变量
 
 	// 非数据库信息
-	UpdatedAtTime int64 `gorm:"-" json:"-" yaml:"-"`
-	// 非数据库信息
 	RecentUsedTime int64 `gorm:"-" json:"-" yaml:"-"`
 	// 缺少信息 -> 这边原来就是int吗？
 	CreatedAt int    `gorm:"column:created_at"                                                                                  json:"-" yaml:"-"` // 创建时间

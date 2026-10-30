@@ -25,22 +25,22 @@ var (
 // JSMutationScope is the only durable ownership information accepted from JS.
 // It contains identifiers, never authoritative runtime pointers.
 type JSMutationScope struct {
-	DiceID                  string
-	GroupID                 string
-	UserID                  string
-	SubjectID               string
-	GroupExpectedVersion    uint64
-	PlayerExpectedVersion   uint64
-	AttrsExpectedVersion    uint64
+	DiceID                    string
+	GroupID                   string
+	UserID                    string
+	SubjectID                 string
+	GroupExpectedVersion      uint64
+	PlayerExpectedVersion     uint64
+	AttrsExpectedVersion      uint64
 	ModerationExpectedVersion uint64
 }
 
 // JSMutationCollector adapts explicit JS decisions to sealed core events.
 type JSMutationCollector struct {
-	core      *messageflow.MutationCollector
-	scope     JSMutationScope
-	metadata  eventstore.Metadata
-	configs   map[string]JSConfigMutation
+	core       *messageflow.MutationCollector
+	scope      JSMutationScope
+	metadata   eventstore.Metadata
+	configs    map[string]JSConfigMutation
 	validators map[string]func(any) error
 }
 
@@ -171,7 +171,6 @@ func (c *JSMutationCollector) CaptureGroupUserAttrs(events []playerstate.GroupUs
 	return c.core.AddGroupUserAttrsEvents(stream, c.scope.AttrsExpectedVersion, c.metadataFor(), events)
 }
 
-
 // JSGroupUserAttrsMutation is the closed operation vocabulary used by public
 // $m/$g/player-attrs compatibility shims.
 type JSGroupUserAttrsMutation struct {
@@ -249,10 +248,19 @@ func (c *JSMutationCollector) CaptureModeration(events ...playerstate.Moderation
 
 // JSConfigMutation is a request record consumed later by ExtensionState. It is
 // not a YAML/config-manager operation and is never persisted as an event here.
-type JSConfigMutation struct { ExtensionID string; Key string; Value any }
+type JSConfigMutation struct {
+	ExtensionID string
+	Key         string
+	Value       any
+}
+
 func (c *JSMutationCollector) RegisterConfig(extensionID, key string, validate func(any) error) {
-	if c == nil { return }
-	if c.validators == nil { c.validators = map[string]func(any) error{} }
+	if c == nil {
+		return
+	}
+	if c.validators == nil {
+		c.validators = map[string]func(any) error{}
+	}
 	c.validators[extensionID+"\x00"+key] = validate
 }
 func (c *JSMutationCollector) CaptureConfig(mutation JSConfigMutation) error {
@@ -325,7 +333,7 @@ func jsonSafeConfigValue(value reflect.Value, depth int) bool {
 		}
 		return true
 	case reflect.Slice, reflect.Array:
-		for i := 0; i < value.Len(); i++ {
+		for i := range value.Len() {
 			if !jsonSafeConfigValue(value.Index(i), depth+1) {
 				return false
 			}
@@ -355,9 +363,13 @@ func (c *JSMutationCollector) AddEffect(effect eventstore.NewEffect) error {
 	return c.core.AddEffect(effect)
 }
 func (c *JSMutationCollector) CaptureEffect(request JSEffectRequest) error {
-	if err := c.validMetadata(); err != nil { return err }
+	if err := c.validMetadata(); err != nil {
+		return err
+	}
 	effect, err := BuildJSEffect(request)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	return c.AddEffect(effect)
 }
 func (c *JSMutationCollector) CaptureReply(request JSEffectRequest) error {
@@ -369,13 +381,18 @@ func (c *JSMutationCollector) CaptureNotice(request JSEffectRequest) error {
 	return c.CaptureEffect(request)
 }
 
-func (c *JSMutationCollector) UnitOfWork() (eventstore.UnitOfWork, error) { if c == nil || c.core == nil { return eventstore.UnitOfWork{}, ErrJSMutationUnavailable }; return c.core.UnitOfWork() }
+func (c *JSMutationCollector) UnitOfWork() (eventstore.UnitOfWork, error) {
+	if c == nil || c.core == nil {
+		return eventstore.UnitOfWork{}, ErrJSMutationUnavailable
+	}
+	return c.core.UnitOfWork()
+}
 
 // JSPluginKVReadBackend is the minimum durable read surface required to build
 // an overlay without treating unknown existing keys as absent.
 type JSPluginKVReadBackend interface {
-	GetPluginKV(context.Context, string, string) (eventstore.PluginKVItem, error)
-	ListPluginKV(context.Context, eventstore.PluginKVListRequest) ([]eventstore.PluginKVItem, error)
+	GetPluginKV(ctx context.Context, extension, key string) (eventstore.PluginKVItem, error)
+	ListPluginKV(ctx context.Context, request eventstore.PluginKVListRequest) ([]eventstore.PluginKVItem, error)
 }
 
 // JSPluginKVBackend is deliberately explicit: plugin storage is used only when
@@ -388,12 +405,12 @@ type JSPluginKVBackend interface {
 // JSPluginKVScanProof is optional. Backends that cap a list response at the
 // result bound must provide a proof that the scan was complete.
 type JSPluginKVScanProof interface {
-	PluginKVScanComplete(context.Context, eventstore.PluginKVListRequest) (bool, error)
+	PluginKVScanComplete(ctx context.Context, request eventstore.PluginKVListRequest) (bool, error)
 }
 
 type JSPluginKVSealer interface {
-	KeyedDigest(context.Context, string, ...string) ([]byte, string, error)
-	EncryptBound(context.Context, string, string, string, uint64, []byte) ([]byte, []byte, string, error)
+	KeyedDigest(ctx context.Context, domain string, components ...string) ([]byte, string, error)
+	EncryptBound(ctx context.Context, domain, subject, owner string, version uint64, plaintext []byte) ([]byte, []byte, string, error)
 }
 
 type JSPluginKVCollector interface {
@@ -491,14 +508,14 @@ func (o *JSPluginKVOverlay) loadBase(ctx context.Context, key string) (eventstor
 }
 
 func nextJSPluginVersion(version uint64) (uint64, error) {
-	if version >= uint64(^uint64(0)>>1) {
+	if version >= ^uint64(0)>>1 {
 		return 0, eventstore.ErrVersionExhausted
 	}
 	return version + 1, nil
 }
 
 func (o *JSPluginKVOverlay) Put(ctx context.Context, key string, value []byte, expected uint64) error {
-	if o == nil || jsInterfaceNil(o.crypto) || strings.TrimSpace(key) == "" || strings.Contains(key, "$t") {
+	if o == nil || jsInterfaceNil(o.crypto) || strings.Contains(key, "$t") {
 		return ErrJSPluginKV
 	}
 	if len(key) > eventstore.MaxPluginKeyBytes {
@@ -527,8 +544,8 @@ func (o *JSPluginKVOverlay) Put(ctx context.Context, key string, value []byte, e
 	if err != nil {
 		return err
 	}
-	if err := o.checkQuota(ctx, key, value); err != nil {
-		return err
+	if quotaErr := o.checkQuota(ctx, key, value); quotaErr != nil {
+		return quotaErr
 	}
 	index, _, err := o.crypto.KeyedDigest(ctx, "plugin-key-index/v1", o.extension, key)
 	if err != nil {
@@ -589,7 +606,7 @@ func (o *JSPluginKVOverlay) checkQuota(ctx context.Context, key string, value []
 }
 
 func (o *JSPluginKVOverlay) Get(ctx context.Context, key string) (eventstore.PluginKVItem, error) {
-	if o == nil || strings.TrimSpace(key) == "" || strings.Contains(key, "$t") {
+	if o == nil || strings.Contains(key, "$t") {
 		return eventstore.PluginKVItem{}, ErrJSPluginKV
 	}
 	if len(key) > eventstore.MaxPluginKeyBytes {
@@ -607,7 +624,7 @@ func (o *JSPluginKVOverlay) Get(ctx context.Context, key string) (eventstore.Plu
 }
 
 func (o *JSPluginKVOverlay) Delete(ctx context.Context, key string, expected uint64) error {
-	if o == nil || jsInterfaceNil(o.crypto) || strings.TrimSpace(key) == "" || strings.Contains(key, "$t") {
+	if o == nil || jsInterfaceNil(o.crypto) || strings.Contains(key, "$t") {
 		return ErrJSPluginKV
 	}
 	if len(key) > eventstore.MaxPluginKeyBytes {
@@ -682,7 +699,7 @@ func (o *JSPluginKVOverlay) scan(ctx context.Context, prefix string) ([]eventsto
 	}
 	for i := range items {
 		item := &items[i]
-		if item.ExtensionID != o.extension || strings.TrimSpace(item.Key) == "" || strings.Contains(item.Key, "$t") {
+		if item.ExtensionID != o.extension || strings.Contains(item.Key, "$t") {
 			return nil, eventstore.ErrInvalidMetadata
 		}
 		if len(item.Key) > eventstore.MaxPluginKeyBytes {
@@ -696,7 +713,6 @@ func (o *JSPluginKVOverlay) scan(ctx context.Context, prefix string) ([]eventsto
 	return items, nil
 }
 func (o *JSPluginKVOverlay) List(ctx context.Context, prefix string, limit int) ([]eventstore.PluginKVItem, error) {
-
 	if o == nil || strings.Contains(prefix, "$t") {
 		return nil, ErrJSPluginKV
 	}

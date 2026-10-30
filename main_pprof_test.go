@@ -4,10 +4,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
-	"sync/atomic"
 	"testing"
 
+	"github.com/google/pprof/profile"
 	"go.uber.org/zap"
 )
 
@@ -33,7 +34,7 @@ func TestPProfRecorderCreatesNoOutputWhenDisabled(t *testing.T) {
 	}
 }
 
-func TestPProfRecorderCreatesProfilesAndStopsWhenEnabled(t *testing.T) {
+func TestPProfRecorderWritesValidProfilesOnStop(t *testing.T) {
 	// Given
 	t.Chdir(t.TempDir())
 	const bootTime = int64(1722528001)
@@ -46,38 +47,35 @@ func TestPProfRecorderCreatesProfilesAndStopsWhenEnabled(t *testing.T) {
 	if stop == nil {
 		t.Fatal("enabled recorder returned no shutdown callback")
 	}
-	stop()
-
-	// Then
-	for _, name := range []string{"cpu.pprof", "heap.pprof", "goroutine.pprof"} {
-		info, statErr := os.Stat(filepath.Join("data", "pprof", "1722528001", name))
-		if statErr != nil {
-			t.Fatalf("stat %s: %v", name, statErr)
-		}
-		if info.Size() == 0 {
-			t.Fatalf("%s is empty", name)
-		}
-	}
-}
-
-func TestPProfStopCallbackExecutesOnceWhenCalledRepeatedlyAndConcurrently(t *testing.T) {
-	// Given
-	var executions atomic.Int32
-	stop := oncePprofStop(func() {
-		executions.Add(1)
-	})
-
-	// When
 	var callers sync.WaitGroup
 	for range 32 {
 		callers.Go(stop)
 	}
 	callers.Wait()
 	stop()
-	stop()
 
 	// Then
-	if got := executions.Load(); got != 1 {
-		t.Fatalf("stop executions = %d, want 1", got)
+	for _, want := range []struct {
+		file, sampleType, unit string
+	}{
+		{"cpu.pprof", "cpu", "nanoseconds"},
+		{"heap.pprof", "inuse_space", "bytes"},
+		{"goroutine.pprof", "goroutine", "count"},
+	} {
+		t.Run(want.file, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join("data", "pprof", "1722528001", want.file))
+			if err != nil {
+				t.Fatal(err)
+			}
+			recorded, err := profile.ParseData(data)
+			if err != nil {
+				t.Fatalf("parse recorded profile: %v", err)
+			}
+			if !slices.ContainsFunc(recorded.SampleType, func(sample *profile.ValueType) bool {
+				return sample.Type == want.sampleType && sample.Unit == want.unit
+			}) {
+				t.Fatalf("profile sample types = %v, want %s/%s", recorded.SampleType, want.sampleType, want.unit)
+			}
+		})
 	}
 }

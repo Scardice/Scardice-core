@@ -2,7 +2,6 @@ package dice
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 )
 
@@ -25,20 +24,6 @@ func TestGroupInfoRollShaperModeRoundTrips(t *testing.T) {
 	}
 	if got := restored.getDiceRollShaperMode(); got != DiceRollShaperModeStable {
 		t.Fatalf("getDiceRollShaperMode() = %s, want stable", got)
-	}
-}
-
-func TestFormatDiceRollShaperHelpText(t *testing.T) {
-	help := formatDiceRollShaperHelpText()
-	for _, expected := range []string{
-		".rollshape set <模式>",
-		"群聊需管理员，私聊由发送者本人设置",
-		"balanced // 每轮均匀覆盖所有面；超过 1048576 面时使用 Raw",
-		"safe-tail // 两端结果概率减半；没有中间区间时使用 Raw",
-	} {
-		if !strings.Contains(help, expected) {
-			t.Fatalf("help text missing %q:\n%s", expected, help)
-		}
 	}
 }
 

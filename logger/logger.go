@@ -18,6 +18,7 @@ const (
 	LogKeyDatabaseQuery = "database.query"
 	LogKeyWeb           = "web"
 	LogKeyAdapter       = "adapter"
+	LogKeyQueueFailures = "queue-failures"
 )
 
 var DefaultSealLogger = NewGormLogger(zap.NewNop())
@@ -45,6 +46,7 @@ func newLoggerCore(level zapcore.Level, ui *UIWriter, consoleSink zapcore.WriteS
 		LogKeyDatabaseQuery: zapcore.DebugLevel,
 		LogKeyWeb:           zapcore.DebugLevel,
 		LogKeyAdapter:       level,
+		LogKeyQueueFailures: zapcore.WarnLevel,
 	}
 
 	return zapcore.NewTee(
@@ -56,6 +58,10 @@ func newLoggerCore(level zapcore.Level, ui *UIWriter, consoleSink zapcore.WriteS
 
 func M() *zap.SugaredLogger {
 	return zap.S().Named(LogKeyMain)
+}
+
+func QueueFailures() *zap.SugaredLogger {
+	return zap.S().Named(LogKeyQueueFailures)
 }
 
 type dynamicFileCore struct {

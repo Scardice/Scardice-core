@@ -482,6 +482,12 @@ type VMResult struct {
 }
 
 func (e *RollExpression) Evaluate(_ *Dice, ctx *MsgContext) (*VMStack, string, error) {
+	var diceSource ds.DiceSource
+	if ctx != nil {
+		ctx.randomMu.Lock()
+		diceSource = ctx._v1Rand
+		ctx.randomMu.Unlock()
+	}
 	stack, top := make([]VMStack, len(e.Code)), 0
 	times := 0
 	lastDetails := []string{}
@@ -506,7 +512,7 @@ func (e *RollExpression) Evaluate(_ *Dice, ctx *MsgContext) (*VMStack, string, e
 		wodState.isGE = true
 
 		am := ctx.Dice.AttrsManager
-		groupAttrs := lo.Must(am.LoadById(ctx.Group.GroupID))
+		groupAttrs := lo.Must(am.LoadByIdForCtx(ctx, ctx.Group.GroupID))
 
 		if threshold, exists := groupAttrs.LoadX("wodThreshold"); exists {
 			wodState.threshold = dsValueToRollVMv1(threshold)
@@ -660,7 +666,7 @@ func (e *RollExpression) Evaluate(_ *Dice, ctx *MsgContext) (*VMStack, string, e
 			continue
 		case TypeDiceWod:
 			t := &stack[top-1] // 加骰线
-			ret, nums, rounds, details := DiceWodRollVM(ctx._v1Rand, e, t, wodState.pool, wodState.points, wodState.threshold, wodState.isGE)
+			ret, nums, rounds, details := DiceWodRollVM(diceSource, e, t, wodState.pool, wodState.points, wodState.threshold, wodState.isGE)
 			if e.Error != nil {
 				return nil, "", e.Error
 			}
@@ -695,7 +701,7 @@ func (e *RollExpression) Evaluate(_ *Dice, ctx *MsgContext) (*VMStack, string, e
 			continue
 		case TypeDiceDC:
 			t := &stack[top-1] // 暴击值 / 也可以理解为加骰线
-			ret, nums, rounds, details := DiceDCRollVM(ctx._v1Rand, e, t, dcState.pool, dcState.points)
+			ret, nums, rounds, details := DiceDCRollVM(diceSource, e, t, dcState.pool, dcState.points)
 			if e.Error != nil {
 				return nil, "", e.Error
 			}
@@ -723,7 +729,7 @@ func (e *RollExpression) Evaluate(_ *Dice, ctx *MsgContext) (*VMStack, string, e
 			continue
 		case TypeDicePenalty, TypeDiceBonus:
 			t := stack[top-1]
-			diceResult := DiceRoll64x(ctx._v1Rand, 100)
+			diceResult := DiceRoll64x(diceSource, 100)
 			diceTens := diceResult / 10
 			diceUnits := diceResult % 10
 
@@ -737,7 +743,7 @@ func (e *RollExpression) Evaluate(_ *Dice, ctx *MsgContext) (*VMStack, string, e
 			}
 
 			for range t.Value.(int64) {
-				n := DiceRoll64x(ctx._v1Rand, 10)
+				n := DiceRoll64x(diceSource, 10)
 
 				if n == 10 {
 					num10Exists = true
@@ -1046,7 +1052,7 @@ func (e *RollExpression) Evaluate(_ *Dice, ctx *MsgContext) (*VMStack, string, e
 		case TypeDiceUnary:
 			a := &stack[top-1]
 			// Dice XXX, 如 d100
-			a.Value = DiceRoll64x(ctx._v1Rand, a.Value.(int64))
+			a.Value = DiceRoll64x(diceSource, a.Value.(int64))
 			e.Calculated = true
 			continue
 		case TypeHalt:
@@ -1320,7 +1326,7 @@ func (e *RollExpression) Evaluate(_ *Dice, ctx *MsgContext) (*VMStack, string, e
 					if e.flags.BigFailDiceOn {
 						nums = append(nums, bInt)
 					} else {
-						nums = append(nums, DiceRoll64x(ctx._v1Rand, bInt))
+						nums = append(nums, DiceRoll64x(diceSource, bInt))
 					}
 				}
 
@@ -1364,7 +1370,7 @@ func (e *RollExpression) Evaluate(_ *Dice, ctx *MsgContext) (*VMStack, string, e
 					if e.flags.BigFailDiceOn {
 						curNum = bInt
 					} else {
-						curNum = DiceRoll64x(ctx._v1Rand, bInt)
+						curNum = DiceRoll64x(diceSource, bInt)
 					}
 
 					num += curNum

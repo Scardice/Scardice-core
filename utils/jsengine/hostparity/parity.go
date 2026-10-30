@@ -17,15 +17,15 @@ import (
 // legacy QuickJS-Go and native QuickJS so their observable contracts cannot
 // drift silently.
 type Engine struct {
-	Name           string
-	Open           func(*testing.T) jsengine.Loop
+	Name            string
+	Open            func(*testing.T) jsengine.Loop
 	ExposeDangerous func(jsengine.Runtime, any) (jsengine.Value, error)
 }
 
 type nestedHost struct {
 	Value  string         `jsbind:"value"`
-	Values map[string]int  `jsbind:"values"`
-	Items  *[]int          `jsbind:"items"`
+	Values map[string]int `jsbind:"values"`
+	Items  *[]int         `jsbind:"items"`
 }
 type host struct {
 	Name     string         `jsbind:"name"`
@@ -39,12 +39,12 @@ type host struct {
 	lock     sync.RWMutex
 }
 
-func (h *host) Lock() *sync.RWMutex { return &h.lock }
-func (h *host) Add(delta int) int { return h.Count + delta }
-func (h *host) Apply(callback func(int) int) int { return callback(5) + 1 }
-func (h *host) Fail() (int, error) { return 0, errors.New("host failure") }
+func (h *host) Lock() *sync.RWMutex                          { return &h.lock }
+func (h *host) Add(delta int) int                            { return h.Count + delta }
+func (h *host) Apply(callback func(int) int) int             { return callback(5) + 1 }
+func (h *host) Fail() (int, error)                           { return 0, errors.New("host failure") }
 func (h *host) Variadic(prefix string, values ...string) int { return len(prefix) + len(values) }
-func (h *host) ReadOnlyItems() []int { return []int{7} }
+func (h *host) ReadOnlyItems() []int                         { return []int{7} }
 
 func newHost() *host {
 	items := []int{3}
@@ -146,13 +146,13 @@ func assertContract(runtime jsengine.Runtime, h *host) error {
 		}
 	}
 
-	value, err := runtime.RunString("method-error-value.js", `try { host.fail(); "missing" } catch (error) { error.message }`)
-	if err != nil {
-		return err
+	value, setErr := runtime.RunString("method-error-value.js", `try { host.fail(); "missing" } catch (error) { error.message }`)
+	if setErr != nil {
+		return setErr
 	}
-	message, err := value.ExportPrimitive()
-	if err != nil || message != "host failure" {
-		return fmt.Errorf("method error = %#v (%v)", message, err)
+	message, setErr := value.ExportPrimitive()
+	if setErr != nil || message != "host failure" {
+		return fmt.Errorf("method error = %#v (%w)", message, setErr)
 	}
 
 	if err := runtime.Set("fn", func(prefix string, values ...string) (int, error) {
@@ -160,13 +160,13 @@ func assertContract(runtime jsengine.Runtime, h *host) error {
 	}); err != nil {
 		return err
 	}
-	value, err = runtime.RunString("function.js", `fn("a", "b", "c")`)
-	if err != nil {
-		return err
+	value, setErr = runtime.RunString("function.js", `fn("a", "b", "c")`)
+	if setErr != nil {
+		return setErr
 	}
-	primitive, err := value.ExportPrimitive()
-	if err != nil {
-		return fmt.Errorf("variadic function export: %w", err)
+	primitive, setErr := value.ExportPrimitive()
+	if setErr != nil {
+		return fmt.Errorf("variadic function export: %w", setErr)
 	}
 	if err := wantNumber(primitive, 3); err != nil {
 		return fmt.Errorf("variadic function: %w", err)
@@ -174,13 +174,13 @@ func assertContract(runtime jsengine.Runtime, h *host) error {
 	if err := runtime.Set("failingFn", func() (int, error) { return 0, errors.New("function failure") }); err != nil {
 		return err
 	}
-	value, err = runtime.RunString("function-error.js", `try { failingFn() } catch (error) { error.message }`)
-	if err != nil {
-		return err
+	value, setErr = runtime.RunString("function-error.js", `try { failingFn() } catch (error) { error.message }`)
+	if setErr != nil {
+		return setErr
 	}
-	primitive, err = value.ExportPrimitive()
-	if err != nil || primitive != "function failure" {
-		return fmt.Errorf("function error = %#v (%v)", primitive, err)
+	primitive, setErr = value.ExportPrimitive()
+	if setErr != nil || primitive != "function failure" {
+		return fmt.Errorf("function error = %#v (%w)", primitive, setErr)
 	}
 	_ = h
 	return nil
@@ -193,7 +193,7 @@ func assertDangerousContract(runtime jsengine.Runtime) error {
 	}
 	primitive, err := value.ExportPrimitive()
 	if err != nil || primitive != "revealed|revealed|before|41" {
-		return fmt.Errorf("dangerous values = %#v (%v)", primitive, err)
+		return fmt.Errorf("dangerous values = %#v (%w)", primitive, err)
 	}
 	value, err = runtime.RunString("dangerous-keys.js", `Object.keys(dangerous).sort().join(",")`)
 	if err != nil {

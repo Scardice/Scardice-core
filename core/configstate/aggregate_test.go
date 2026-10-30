@@ -106,9 +106,9 @@ func TestRepositoryConflictAndProjectionReplay(t *testing.T) {
 }
 func TestRepositoryGeneratesDistinctIDsForExplicitMultiEventMetadata(t *testing.T) {
 	ctx := context.Background()
-	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/config-ids.db"})
-	if err != nil {
-		t.Fatal(err)
+	db, baselineErr := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/config-ids.db"})
+	if baselineErr != nil {
+		t.Fatal(baselineErr)
 	}
 	defer db.Close()
 	store := eventstore.NewStore(db, eventstore.WithProjection(ConfigProjection()))
@@ -119,9 +119,9 @@ func TestRepositoryGeneratesDistinctIDsForExplicitMultiEventMetadata(t *testing.
 	if _, err := repo.AppendTyped(ctx, baseline.DiceID, 0, metadata, events); err != nil {
 		t.Fatal(err)
 	}
-	persisted, err := store.Load(ctx, ConfigStream(baseline.DiceID), 1)
-	if err != nil {
-		t.Fatal(err)
+	persisted, baselineErr := store.Load(ctx, ConfigStream(baseline.DiceID), 1)
+	if baselineErr != nil {
+		t.Fatal(baselineErr)
 	}
 	if len(persisted) != len(events) || persisted[0].EventID != metadata.EventID {
 		t.Fatalf("persisted event IDs=%v, want %d events with first %q", persisted, len(events), metadata.EventID)

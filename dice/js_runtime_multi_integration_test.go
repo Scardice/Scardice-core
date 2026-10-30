@@ -27,12 +27,9 @@ func TestJsLoadScriptRawRoutesExplicitScriptsAcrossRuntimeLoops(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := &Dice{
-		Logger:     zap.NewNop().Sugar(),
-		BaseConfig: BaseConfig{DataDir: dataDir},
-		ImSession: &IMSession{
-			ServiceAtNew: new(SyncMap[string, *GroupInfo]),
-			EndPoints:    []*EndPointInfo{},
-		},
+		Logger:       zap.NewNop().Sugar(),
+		BaseConfig:   BaseConfig{DataDir: dataDir},
+		ImSession:    &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
 		DirtyGroups:  new(SyncMap[string, int64]),
 		AttrsManager: &AttrsManager{},
 		ExtRegistry:  new(SyncMap[string, *ExtInfo]),

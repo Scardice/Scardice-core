@@ -12,6 +12,10 @@ var ErrRepositoryUnavailable = errors.New("extensionstate: repository unavailabl
 type Repository struct {
 	Store   eventstore.Store
 	Factory eventstore.EventFactory
+	// Cache, when set, lets Load and appends continue from the last replayed
+	// state instead of replaying the whole stream. It is shared by every
+	// Repository that should benefit; nil keeps the plain full replay.
+	Cache *SnapshotCache
 }
 type ExtensionRepository = Repository
 
@@ -36,7 +40,17 @@ func (r *Repository) Load(ctx context.Context, diceID string) (State, error) {
 	if err := validateIdentity(diceID); err != nil {
 		return State{}, err
 	}
-	events, err := r.Store.Load(ctx, ExtensionStream(diceID), 1)
+	return r.head(ctx, ExtensionStream(diceID))
+}
+
+// head returns the state at the head of stream, owned by the caller. With a
+// cache it continues from the last replayed state; without one it replays the
+// whole stream.
+func (r *Repository) head(ctx context.Context, stream eventstore.StreamID) (State, error) {
+	if r.Cache != nil {
+		return r.Cache.current(ctx, r.Store, stream)
+	}
+	events, err := r.Store.Load(ctx, stream, 1)
 	if err != nil {
 		return State{}, err
 	}
@@ -68,16 +82,9 @@ func (r *Repository) Append(ctx context.Context, diceID string, expectedVersion 
 	return r.Store.Commit(ctx, eventstore.UnitOfWork{Streams: []eventstore.StreamAppend{{Stream: stream, ExpectedVersion: expectedVersion, Events: append([]eventstore.NewEvent(nil), events...)}}})
 }
 func (r *Repository) validateAppend(ctx context.Context, stream eventstore.StreamID, expected uint64, events []eventstore.NewEvent) error {
-	persisted, err := r.Store.Load(ctx, stream, 1)
+	state, err := r.head(ctx, stream)
 	if err != nil {
 		return err
-	}
-	state := State{}
-	if len(persisted) > 0 {
-		state, err = ReplayEnvelopes(persisted)
-		if err != nil {
-			return err
-		}
 	}
 	if state.Version != expected {
 		return eventstore.ErrConflict
@@ -106,7 +113,13 @@ func (r *Repository) validateAppend(ctx context.Context, stream eventstore.Strea
 	return ValidateState(state)
 }
 func eventMetadataValid(metadata eventstore.Metadata) bool {
-	return metadata.EventID != "" && metadata.CommandID != "" && metadata.CorrelationID != "" && (!metadata.OccurredAt.IsZero() || metadata.OccurredAtUnixNanoSet || metadata.OccurredAtUnixNanoUTC != 0) && (!(!metadata.OccurredAt.IsZero() && (metadata.OccurredAtUnixNanoSet || metadata.OccurredAtUnixNanoUTC != 0)) || metadata.OccurredAt.UTC().UnixNano() == metadata.OccurredAtUnixNanoUTC)
+	hasOccurredAt := !metadata.OccurredAt.IsZero()
+	hasOccurredAtUnix := metadata.OccurredAtUnixNanoSet || metadata.OccurredAtUnixNanoUTC != 0
+	return metadata.EventID != "" &&
+		metadata.CommandID != "" &&
+		metadata.CorrelationID != "" &&
+		(hasOccurredAt || hasOccurredAtUnix) &&
+		(!hasOccurredAt || !hasOccurredAtUnix || metadata.OccurredAt.UTC().UnixNano() == metadata.OccurredAtUnixNanoUTC)
 }
 func (r *Repository) AppendTyped(ctx context.Context, diceID string, expectedVersion uint64, metadata eventstore.Metadata, events []TypedEvent) (eventstore.CommitResult, error) {
 	if r == nil || r.Store == nil {
@@ -166,6 +179,73 @@ func (r *Repository) DecideAndAppend(ctx context.Context, state State, expectedV
 	}
 	return r.AppendTyped(ctx, diceID, expectedVersion, metadata, decision.Events)
 }
+
+// PrepareCommands decides a sequence against one evolving aggregate snapshot
+// and returns a single append for an enclosing atomic UnitOfWork.
+func (r *Repository) PrepareCommands(state State, expectedVersion uint64, metadata eventstore.Metadata, commands []Command) (eventstore.StreamAppend, error) {
+	if r == nil || r.Store == nil {
+		return eventstore.StreamAppend{}, ErrRepositoryUnavailable
+	}
+	if state.Version != expectedVersion {
+		return eventstore.StreamAppend{}, eventstore.ErrConflict
+	}
+	if len(commands) == 0 {
+		return eventstore.StreamAppend{}, nil
+	}
+	if err := validateIdentity(state.DiceID); err != nil {
+		return eventstore.StreamAppend{}, ErrInvalidIdentity
+	}
+	if metadata.EventID != "" && !eventMetadataValid(metadata) {
+		return eventstore.StreamAppend{}, eventstore.ErrInvalidMetadata
+	}
+	factory := r.Factory
+	if factory.Clock == nil {
+		factory.Clock = eventstore.SystemClock{}
+	}
+	if factory.IDs == nil {
+		factory.IDs = eventstore.UUIDGenerator{}
+	}
+	next := state.Clone()
+	encoded := make([]eventstore.NewEvent, 0, len(commands))
+	seen := map[string]bool{}
+	explicit := map[string]bool{}
+	for _, command := range commands {
+		decision, err := Decide(next, command)
+		if err != nil {
+			return eventstore.StreamAppend{}, err
+		}
+		for _, event := range decision.Events {
+			itemMetadata := metadata
+			if itemMetadata.EventID != "" {
+				if explicit[itemMetadata.EventID] {
+					return eventstore.StreamAppend{}, eventstore.ErrConflict
+				}
+				explicit[itemMetadata.EventID] = true
+			}
+			item, err := NewEventWithFactory(factory, event, itemMetadata)
+			if err != nil {
+				return eventstore.StreamAppend{}, err
+			}
+			if seen[item.Metadata.EventID] {
+				return eventstore.StreamAppend{}, eventstore.ErrConflict
+			}
+			seen[item.Metadata.EventID] = true
+			encoded = append(encoded, item)
+			metadata.EventID = ""
+			next, err = Reduce(next, event)
+			if err != nil {
+				return eventstore.StreamAppend{}, err
+			}
+		}
+	}
+	if len(encoded) == 0 {
+		return eventstore.StreamAppend{}, nil
+	}
+	return eventstore.StreamAppend{
+		Stream: ExtensionStream(state.DiceID), ExpectedVersion: expectedVersion, Events: encoded,
+	}, nil
+}
+
 func NewEvent(event TypedEvent, metadata eventstore.Metadata) (eventstore.NewEvent, error) {
 	if !eventMetadataValid(metadata) {
 		return eventstore.NewEvent{}, eventstore.ErrInvalidMetadata

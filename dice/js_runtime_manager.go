@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -24,6 +25,7 @@ type JSRuntimeStatus struct {
 	Installed    bool     `json:"installed"`
 	Loaded       bool     `json:"loaded"`
 	Builtin      bool     `json:"builtin"`
+	Managed      bool     `json:"managed"`
 	Version      string   `json:"version"`
 	Author       string   `json:"author"`
 	ABI          string   `json:"abi"`
@@ -39,12 +41,11 @@ type JSRuntimeStatus struct {
 type JSRuntimeManager struct {
 	mu       sync.RWMutex
 	registry jsengine.Registry
-	loader   *native.Loader
 
-	providers      map[jsengine.EngineID]jsengine.Provider
 	statuses       map[jsengine.EngineID]JSRuntimeStatus
 	discoveryError string
 	requirements   jsengine.RuntimeRequirements
+	packageStore   *jsRuntimePackageStore
 }
 
 // NewJSRuntimeManager creates a manager rooted at root. An empty root uses
@@ -52,54 +53,130 @@ type JSRuntimeManager struct {
 // runtimes directory. A package directory containing runtime.json is accepted
 // as a convenience for focused integration tests.
 func NewJSRuntimeManager(root string) *JSRuntimeManager {
+	return newJSRuntimeManager(root, builtin.Provider())
+}
+
+func newJSRuntimeManager(root string, gojaProvider jsengine.Provider) *JSRuntimeManager {
+	root = configuredRuntimeRoot(root)
+	return newJSRuntimeManagerWithRoots([]string{root}, gojaProvider, nil, jsengine.RuntimeRequirements{})
+}
+
+func configuredRuntimeRoot(root string) string {
 	if strings.TrimSpace(root) == "" {
 		root = os.Getenv("SCARDICE_RUNTIME_ROOT")
 	}
 	if strings.TrimSpace(root) == "" {
 		root = os.Getenv("SCARDICE_QUICKJS_PACKAGE")
 	}
-	root = normalizeRuntimeRoot(root)
+	return normalizeRuntimeRoot(root)
+}
 
+func newJSRuntimeManagerWithRoots(
+	roots []string,
+	gojaProvider jsengine.Provider,
+	packageStore *jsRuntimePackageStore,
+	requirements jsengine.RuntimeRequirements,
+) *JSRuntimeManager {
 	registry := jsengine.NewRegistry()
 	manager := &JSRuntimeManager{
-		registry:  registry,
-		loader:    native.NewLoader(root),
-		providers: make(map[jsengine.EngineID]jsengine.Provider),
-		statuses:  make(map[jsengine.EngineID]JSRuntimeStatus),
+		registry:     registry,
+		statuses:     make(map[jsengine.EngineID]JSRuntimeStatus),
+		packageStore: packageStore,
+		requirements: requirements,
 	}
-	if err := registry.RegisterBuiltin(builtin.Provider()); err != nil {
+	if err := registry.RegisterBuiltin(gojaProvider); err != nil {
 		manager.statuses[jsengine.EngineGoja] = JSRuntimeStatus{
 			ID:    string(jsengine.EngineGoja),
 			Error: err.Error(),
 		}
-	} else {
-		manager.providers[jsengine.EngineGoja] = builtin.Provider()
 	}
-	if err := manager.loader.RegisterCandidates(registry); err != nil {
-		manager.discoveryError = err.Error()
+	registered := make(map[jsengine.EngineID]struct{})
+	for _, descriptor := range registry.Descriptors() {
+		registered[normalizeRequestedEngine(descriptor.ID)] = struct{}{}
+	}
+	for _, root := range roots {
+		candidates, err := native.Discover(root)
+		if err != nil {
+			manager.appendDiscoveryError(fmt.Errorf("discover runtimes in %q: %w", root, err))
+			continue
+		}
+		seenInRoot := make(map[jsengine.EngineID]struct{}, len(candidates))
+		for _, candidate := range candidates {
+			id := normalizeRequestedEngine(jsengine.EngineID(candidate.Manifest.ID))
+			if _, exists := seenInRoot[id]; exists {
+				manager.appendDiscoveryError(fmt.Errorf("duplicate runtime ID %q in %q", id, root))
+				continue
+			}
+			seenInRoot[id] = struct{}{}
+			if _, exists := registered[id]; exists {
+				continue
+			}
+
+			manifest := candidate.Manifest
+			if err := registry.RegisterCandidate(jsengine.RuntimeManifest{
+				ID: jsengine.EngineID(manifest.ID), Name: manifest.Name, Version: manifest.Version,
+				Language: manifest.Language, Author: manifest.Author, ABIMajor: manifest.RuntimeABI.Major,
+				HostABIMajor: manifest.HostABI.Major, Capabilities: jsengine.CapabilitySet(manifest.Capabilities),
+				Services: append([]string(nil), manifest.Services...), Extensions: append([]string(nil), manifest.Extensions...),
+				Path: candidate.LibraryPath,
+				Load: func() (jsengine.Provider, error) { return candidate.Load() },
+			}); err != nil {
+				manager.appendDiscoveryError(err)
+				continue
+			}
+			registered[id] = struct{}{}
+		}
 	}
 	manager.refreshStatuses()
 	return manager
 }
 
-// NewJSRuntimeManagerForDice installs the application-aware builtin Goja
-// provider while keeping external provider discovery identical to the generic
-// manager. It also installs Dice's host admission profile, which is stricter
-// than the generic engine-neutral provider contract.
+func (m *JSRuntimeManager) appendDiscoveryError(err error) {
+	if err == nil {
+		return
+	}
+	if m.discoveryError != "" {
+		m.discoveryError += "; "
+	}
+	m.discoveryError += err.Error()
+}
+
+// NewJSRuntimeManagerForDice initializes the managed runtime catalog and
+// applies staged package changes. Call it during Dice startup, before JS use.
 func NewJSRuntimeManagerForDice(d *Dice) *JSRuntimeManager {
-	manager := NewJSRuntimeManager("")
-	manager.providers[jsengine.EngineGoja] = &diceGojaProvider{dice: d}
-	manager.requirements = jsengine.RuntimeRequirements{
+	return newJSRuntimeManagerForDice(d, true)
+}
+
+func newJSRuntimeManagerForDice(d *Dice, applyPending bool) *JSRuntimeManager {
+	requirements := jsengine.RuntimeRequirements{
 		RequiredCapabilities: jsengine.CapabilityScript |
 			jsengine.CapabilityHostObject |
 			jsengine.CapabilityHostFunction,
 		RequireContextPropagation: true,
 	}
+	var packageStore *jsRuntimePackageStore
+	var storeErr error
+	if d != nil && strings.TrimSpace(d.BaseConfig.DataDir) != "" {
+		packageStore, storeErr = newJSRuntimePackageStore(d.BaseConfig.DataDir)
+		if storeErr == nil && applyPending {
+			storeErr = packageStore.ApplyPending(requirements)
+		}
+	}
+	roots := make([]string, 0, 2)
+	if packageStore != nil {
+		roots = append(roots, packageStore.activeRoot)
+	}
+	roots = append(roots, configuredRuntimeRoot(""))
+	manager := newJSRuntimeManagerWithRoots(roots, &diceGojaProvider{dice: d}, packageStore, requirements)
+	if storeErr != nil {
+		manager.appendDiscoveryError(fmt.Errorf("managed runtime store: %w", storeErr))
+	}
 	return manager
 }
+
 func (d *Dice) jsRuntimeManagerInstance() *JSRuntimeManager {
 	if d.jsRuntimeManager == nil {
-		d.jsRuntimeManager = NewJSRuntimeManagerForDice(d)
+		d.jsRuntimeManager = newJSRuntimeManagerForDice(d, false)
 	}
 	return d.jsRuntimeManager
 }
@@ -169,19 +246,19 @@ func (m *JSRuntimeManager) Resolve(ctx context.Context, id jsengine.EngineID, op
 		return nil, fmt.Errorf("resolve JavaScript runtime %q: %w", id, err)
 	}
 	descriptor := provider.Descriptor()
-	if err := m.requirements.ValidateDescriptor(descriptor); err != nil {
-		m.recordError(id, err)
-		return nil, fmt.Errorf("admit JavaScript runtime %q: %w", id, err)
+	if descriptorErr := m.requirements.ValidateDescriptor(descriptor); descriptorErr != nil {
+		m.recordError(id, descriptorErr)
+		return nil, fmt.Errorf("admit JavaScript runtime %q: %w", id, descriptorErr)
 	}
 	loop, err := provider.Open(ctx, options)
 	if err != nil {
 		m.recordError(id, err)
 		return nil, fmt.Errorf("open JavaScript runtime %q: %w", id, err)
 	}
-	if err := m.requirements.ValidateLoop(loop); err != nil {
+	if loopErr := m.requirements.ValidateLoop(loop); loopErr != nil {
 		_ = loop.Close()
-		m.recordError(id, err)
-		return nil, fmt.Errorf("admit JavaScript runtime %q loop: %w", id, err)
+		m.recordError(id, loopErr)
+		return nil, fmt.Errorf("admit JavaScript runtime %q loop: %w", id, loopErr)
 	}
 	status := m.statuses[id]
 	status.Loaded = true
@@ -207,7 +284,7 @@ type scriptRuntimePlan struct {
 
 func (m *JSRuntimeManager) buildScriptRuntimePlan(filename, source string) (scriptRuntimePlan, error) {
 	if m == nil {
-		return scriptRuntimePlan{}, fmt.Errorf("JavaScript runtime manager is unavailable")
+		return scriptRuntimePlan{}, errors.New("JavaScript runtime manager is unavailable")
 	}
 	descriptors := m.registry.Descriptors()
 	plan := scriptRuntimePlan{
@@ -263,7 +340,7 @@ func containsRuntimeID(ids []jsengine.EngineID, want jsengine.EngineID) bool {
 // filename suffix. Suffix collisions use registration/discovery order.
 func (m *JSRuntimeManager) SelectScriptRuntime(filename, source string) (jsengine.EngineID, error) {
 	if m == nil {
-		return "", fmt.Errorf("JavaScript runtime manager is unavailable")
+		return "", errors.New("JavaScript runtime manager is unavailable")
 	}
 	m.mu.RLock()
 	plan, err := m.buildScriptRuntimePlan(filename, source)
@@ -309,7 +386,7 @@ func (m *JSRuntimeManager) SupportsScriptExtension(filename string) bool {
 // registered runtime independently of provider implementation details.
 func (m *JSRuntimeManager) ParseUserScript(filename, source string) (jsengine.EngineID, jsengine.UserScriptMetadata, error) {
 	if m == nil {
-		return "", jsengine.UserScriptMetadata{}, fmt.Errorf("JavaScript runtime manager is unavailable")
+		return "", jsengine.UserScriptMetadata{}, errors.New("JavaScript runtime manager is unavailable")
 	}
 	metadata, err := jsengine.ParseUserScript(source)
 	if err != nil {
@@ -340,8 +417,16 @@ func (m *JSRuntimeManager) ResolveScript(
 
 // resolveScript applies routing order while letting the owner reuse live loops.
 func (m *JSRuntimeManager) resolveScript(filename, source string, resolve func(jsengine.EngineID) (jsengine.Loop, error)) (jsengine.EngineID, jsengine.Loop, error) {
+	return m.resolveScriptWithDefaults(filename, source, nil, resolve)
+}
+
+func (m *JSRuntimeManager) resolveScriptWithDefaults(
+	filename, source string,
+	defaultIDs []jsengine.EngineID,
+	resolve func(jsengine.EngineID) (jsengine.Loop, error),
+) (jsengine.EngineID, jsengine.Loop, error) {
 	if m == nil {
-		return "", nil, fmt.Errorf("JavaScript runtime manager is unavailable")
+		return "", nil, errors.New("JavaScript runtime manager is unavailable")
 	}
 	m.mu.RLock()
 	plan, err := m.buildScriptRuntimePlan(filename, source)
@@ -350,8 +435,24 @@ func (m *JSRuntimeManager) resolveScript(filename, source string, resolve func(j
 		return "", nil, err
 	}
 	var lastErr error
-	attempted := make(map[jsengine.EngineID]struct{})
-	for _, id := range plan.explicitIDs {
+	attempted := make(map[jsengine.EngineID]struct{}, len(plan.explicitIDs)+len(defaultIDs)+1)
+	for _, rawID := range plan.explicitIDs {
+		id := normalizeRequestedEngine(rawID)
+		if _, alreadyTried := attempted[id]; alreadyTried {
+			continue
+		}
+		attempted[id] = struct{}{}
+		loop, resolveErr := resolve(id)
+		if resolveErr == nil {
+			return id, loop, nil
+		}
+		lastErr = resolveErr
+	}
+	for _, rawID := range defaultIDs {
+		id := normalizeRequestedEngine(rawID)
+		if _, alreadyTried := attempted[id]; alreadyTried {
+			continue
+		}
 		attempted[id] = struct{}{}
 		loop, resolveErr := resolve(id)
 		if resolveErr == nil {
@@ -377,22 +478,35 @@ func (m *JSRuntimeManager) resolveScript(filename, source string, resolve func(j
 	return "", nil, fmt.Errorf("script %q: no runtime declares suffix %q", filename, plan.extension)
 }
 
+func (d *Dice) jsRuntimeDefaultsForPackage(packageID string) ([2]jsengine.EngineID, int) {
+	var defaults [2]jsengine.EngineID
+	if d == nil {
+		return defaults, 0
+	}
+	d.configUpdateMu.Lock()
+	route := strings.TrimSpace(d.Config.JsRuntimeRoutes[packageID])
+	global := d.configuredJSEngine()
+	d.configUpdateMu.Unlock()
+
+	count := 0
+	if route != "" {
+		defaults[count] = jsengine.NormalizeEngineID(route)
+		count++
+	}
+	if !containsRuntimeID(defaults[:count], global) {
+		defaults[count] = global
+		count++
+	}
+	return defaults, count
+}
+
 func (m *JSRuntimeManager) resolveProvider(id jsengine.EngineID) (jsengine.Provider, error) {
-	if provider := m.providers[id]; provider != nil {
-		return provider, nil
+	provider, err := m.registry.Resolve(id)
+	if err != nil {
+		return nil, err
 	}
-	if _, err := m.registry.Resolve(id); err != nil {
-		// Registry candidates are metadata-only; load the selected candidate on
-		// demand and retain the loaded provider for subsequent reloads.
-		provider, loadErr := m.loader.Load(string(id))
-		if loadErr != nil {
-			return nil, loadErr
-		}
-		m.providers[id] = provider
-		m.updateDescriptor(provider.Descriptor(), true)
-		return provider, nil
-	}
-	return nil, fmt.Errorf("%w: engine ID %q is registered without a provider", jsengine.ErrProviderNotFound, id)
+	m.updateDescriptor(provider.Descriptor(), true)
+	return provider, nil
 }
 
 // Status returns a copy of one provider diagnostic snapshot.
@@ -420,15 +534,40 @@ func (m *JSRuntimeManager) Statuses() []JSRuntimeStatus {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	descriptors := m.registry.Descriptors()
-	statuses := make([]JSRuntimeStatus, 0, len(descriptors))
+	statuses := make([]JSRuntimeStatus, 0, len(m.statuses))
+	seen := make(map[jsengine.EngineID]struct{}, len(descriptors))
 	for _, descriptor := range descriptors {
 		id := normalizeRequestedEngine(descriptor.ID)
-		status := m.statuses[id]
-		status.Capabilities = append([]string(nil), status.Capabilities...)
-		status.Extensions = append([]string(nil), status.Extensions...)
-		statuses = append(statuses, status)
+		seen[id] = struct{}{}
+		statuses = append(statuses, cloneJSRuntimeStatus(m.statuses[id]))
+	}
+	extraIDs := make([]string, 0, len(m.statuses)-len(statuses))
+	for id := range m.statuses {
+		if _, ok := seen[id]; !ok {
+			extraIDs = append(extraIDs, string(id))
+		}
+	}
+	sort.Strings(extraIDs)
+	for _, rawID := range extraIDs {
+		statuses = append(statuses, cloneJSRuntimeStatus(m.statuses[jsengine.EngineID(rawID)]))
 	}
 	return statuses
+}
+
+func cloneJSRuntimeStatus(status JSRuntimeStatus) JSRuntimeStatus {
+	status.Capabilities = append([]string(nil), status.Capabilities...)
+	status.Extensions = append([]string(nil), status.Extensions...)
+	return status
+}
+
+// DiscoveryError returns a startup manifest/discovery failure, if any.
+func (m *JSRuntimeManager) DiscoveryError() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.discoveryError
 }
 
 // JSRuntimeStatuses returns provider diagnostics without opening any runtime.
@@ -437,6 +576,14 @@ func (d *Dice) JSRuntimeStatuses() []JSRuntimeStatus {
 		return nil
 	}
 	return d.jsRuntimeManagerInstance().Statuses()
+}
+
+// JSRuntimeDiscoveryError exposes runtime package discovery failures.
+func (d *Dice) JSRuntimeDiscoveryError() string {
+	if d == nil {
+		return ""
+	}
+	return d.jsRuntimeManagerInstance().DiscoveryError()
 }
 
 func (m *JSRuntimeManager) refreshStatuses() {
@@ -454,11 +601,28 @@ func (m *JSRuntimeManager) updateDescriptor(descriptor jsengine.Descriptor, load
 	status.Builtin = descriptor.Builtin
 	status.Version = descriptor.Version
 	status.Author = descriptor.Author
-	status.ABI = fmt.Sprintf("%d.%d", descriptor.ABIMajor, descriptor.ABIMinor)
+	status.ABI = fmt.Sprintf("v%d", descriptor.ABIMajor)
+	status.Managed = m.packageStore != nil && runtimePathWithin(m.packageStore.activeRoot, descriptor.Path)
 	status.Path = descriptor.Path
 	status.Capabilities = capabilityNames(descriptor.Capabilities)
 	status.Extensions = append([]string(nil), descriptor.Extensions...)
 	m.statuses[id] = status
+}
+func runtimePathWithin(root, target string) bool {
+	if root == "" || target == "" {
+		return false
+	}
+	absoluteRoot, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	absoluteTarget, err := filepath.Abs(target)
+	if err != nil {
+		return false
+	}
+	relative, err := filepath.Rel(absoluteRoot, absoluteTarget)
+	return err == nil && relative != "." && relative != ".." &&
+		!filepath.IsAbs(relative) && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 func (m *JSRuntimeManager) recordError(id jsengine.EngineID, err error) {

@@ -5,17 +5,15 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	qqbot "github.com/sealdice/botgo"
 	"github.com/sealdice/botgo/dto"
 	qqapi "github.com/sealdice/botgo/openapi"
-	qqtoken "github.com/sealdice/botgo/token"
 
+	"Scardice-core/adapterapi"
 	"Scardice-core/message"
 )
 
@@ -45,121 +43,6 @@ type PlatformAdapterOfficialQQ struct {
 	c2cSendQuota        *OfficialQQSendQuota
 	groupSendQuota      *OfficialQQSendQuota
 	sendQuotaOnce       sync.Once
-}
-
-func (pa *PlatformAdapterOfficialQQ) Serve() int {
-	ep := pa.EndPoint
-	s := pa.EndPoint.Session
-	log := s.Parent.Logger
-	d := pa.EndPoint.Session.Parent
-
-	if pa.Ctx != nil {
-		log.Info("official qq session already running, skip Serve")
-		return 0
-	}
-	log.Debug("official qq server")
-	qqbot.SetLogger(NewDummyLogger())
-	ctx, cancel := context.WithCancel(context.Background())
-	pa.Ctx, pa.CancelFunc = ctx, cancel
-	if pa.AppID == 0 {
-		ep.State = StateConnecting
-		if err := pa.beginQRLogin(ctx, "scardice"); err != nil {
-			ep.State = StateConnectionFailed
-			cancel()
-			pa.Ctx = nil
-			pa.CancelFunc = nil
-			return 1
-		}
-		return 0
-	}
-
-	pa.startOfficialQQEventQueue()
-	appID := strconv.FormatUint(pa.AppID, 10)
-	tokenSource := qqtoken.NewQQBotTokenSource(&qqtoken.QQBotCredentials{
-		AppID:     appID,
-		AppSecret: pa.AppSecret,
-	})
-	pa.Api = qqbot.NewOpenAPI(appID, tokenSource).WithTimeout(3 * time.Second)
-	pa.SessionManager = qqbot.NewSessionManager()
-
-	ep.State = 2
-	log.Debug("official qq connecting")
-	ws, err := pa.Api.WS(ctx, nil, "")
-	if err != nil || ws == nil {
-		log.Error("official qq 获取 ws 接入点失败: ", err)
-		log.Error("official qq 提示：请确认在机器人后台配置了 IP 白名单，并检查 AppID/Token 是否正确")
-		ep.State = 3
-		if pa.CancelFunc != nil {
-			pa.CancelFunc()
-		}
-		pa.Api = nil
-		pa.SessionManager = nil
-		pa.Ctx = nil
-		pa.CancelFunc = nil
-		pa.closeOfficialQQEventQueue()
-		return 1
-	}
-	if err = validateOfficialQQWebsocketAP(ws); err != nil {
-		log.Error("official qq websocket access point invalid: ", err)
-		ep.State = 3
-		if pa.CancelFunc != nil {
-			pa.CancelFunc()
-		}
-		pa.Api = nil
-		pa.SessionManager = nil
-		pa.Ctx = nil
-		pa.CancelFunc = nil
-		pa.closeOfficialQQEventQueue()
-		return 1
-	}
-
-	intent := pa.registerOfficialQQHandlers()
-	go func() {
-		currentCtx := ctx
-		defer func() {
-			isCurrent := pa.Ctx == currentCtx
-			// 防止崩掉进程
-			if r := recover(); r != nil {
-				log.Error("official qq 启动失败: ", r)
-				if isCurrent {
-					ep.State = 3
-				}
-			}
-			if isCurrent {
-				pa.closeOfficialQQEventQueue()
-				pa.Ctx = nil
-				pa.CancelFunc = nil
-				pa.SessionManager = nil
-			}
-		}()
-		if startErr := runOfficialQQSession(currentCtx, func(runCtx context.Context) error {
-			return pa.SessionManager.Start(runCtx, ws, tokenSource, &intent)
-		}); startErr != nil {
-			log.Error("official qq session manager 启动失败: ", startErr)
-			if pa.Ctx == currentCtx {
-				ep.State = 3
-			}
-		}
-	}()
-	ep.State = 1
-	ep.Enable = true
-	d.LastUpdatedTime = time.Now().Unix()
-	d.Save(false)
-	log.Info("official qq 连接成功")
-
-	botInfo, err := pa.Api.Me(ctx)
-	if err == nil {
-		if acceptErr := pa.acceptVerifiedAccount(ctx, d, botInfo); acceptErr != nil {
-			if errors.Is(acceptErr, ErrOfficialQQDuplicateAccount) {
-				cancel()
-				ep.State = StateConnectionFailed
-				return 1
-			}
-			log.Warnf("official qq verified identity migration deferred after failure: %v", acceptErr)
-		}
-	}
-
-	return 0
 }
 
 func (pa *PlatformAdapterOfficialQQ) ChannelAtMessageReceive(event *dto.WSPayload, data *dto.WSATMessageData) error {
@@ -270,57 +153,6 @@ func (pa *PlatformAdapterOfficialQQ) detectBotAccount(author *dto.User) bool {
 	}
 	trustedID, ok := strings.CutPrefix(pa.EndPoint.UserID, "OpenQQ:")
 	return ok && trustedID != "" && author.ID == trustedID
-}
-
-func (pa *PlatformAdapterOfficialQQ) DoRelogin() bool {
-	if pa.CancelFunc != nil {
-		pa.CancelFunc()
-	}
-	pa.closeOfficialQQEventQueue()
-	pa.EndPoint.Session.Parent.Logger.Infof("正在启用 official qq 服务")
-	pa.EndPoint.State = 0
-	pa.Api = nil
-	pa.SessionManager = nil
-	pa.Ctx = nil
-	pa.CancelFunc = nil
-	pa.QRLoginState = OfficialQQQRInitial
-	pa.QRURL = ""
-	pa.QRCodeData = nil
-	return pa.Serve() == 0
-}
-
-func (pa *PlatformAdapterOfficialQQ) SetEnable(enable bool) {
-	d := pa.EndPoint.Session.Parent
-	ep := pa.EndPoint
-	if enable {
-		if pa.Ctx == nil {
-			ep.Enable = false
-			pa.DiceServing = false
-			ep.State = 2
-			ServerOfficialQQ(d, ep)
-		} else {
-			if pa.QRLoginState == OfficialQQQRWaitingForScan {
-				ep.Enable = false
-				ep.State = StateConnecting
-			} else {
-				ep.Enable = true
-				ep.State = StateConnected
-			}
-		}
-	} else {
-		ep.State = 0
-		ep.Enable = false
-		if pa.CancelFunc != nil {
-			pa.CancelFunc()
-		}
-		pa.closeOfficialQQEventQueue()
-		pa.CancelFunc = nil
-		pa.Ctx = nil
-		pa.QRLoginState = OfficialQQQRInitial
-		pa.QRURL = ""
-		pa.QRCodeData = nil
-	}
-	d.LastUpdatedTime = time.Now().Unix()
 }
 
 func (pa *PlatformAdapterOfficialQQ) SendSegmentToGroup(ctx *MsgContext, groupID string, msg []message.IMessageElement, flag string) {
@@ -442,7 +274,7 @@ func (pa *PlatformAdapterOfficialQQ) sendQQGroupMsgRaw( /* ctx */ _ *MsgContext,
 		switch elem := element.(type) {
 		case *message.TextElement:
 			// QQ官方API中不能发送链接，所以全部进行转写绕过
-			content += textLinkStrip(elem.Content)
+			content += officialQQTextLinkStrip(elem.Content)
 		case *message.AtElement:
 			pa.EndPoint.Session.Parent.Logger.Warn("official qq 群聊消息暂不支持 AT 他人，跳过该部分")
 		case *message.ImageElement:
@@ -523,7 +355,7 @@ func (pa *PlatformAdapterOfficialQQ) sendQQChannelMsgRaw( /* ctx */ _ *MsgContex
 		switch e := elem.(type) {
 		case *message.TextElement:
 			// QQ官方API中不能发送链接，所以全部进行转写绕过
-			content += textLinkStrip(e.Content)
+			content += officialQQTextLinkStrip(e.Content)
 		case *message.AtElement:
 			if e.Target == "all" {
 				content += "@everyone"
@@ -622,12 +454,12 @@ func (pa *PlatformAdapterOfficialQQ) mustExtractTwoID(text string) (string, stri
 	return "", "", OpenQQUnknown
 }
 
-func (pa *PlatformAdapterOfficialQQ) SendFileToPerson(ctx *MsgContext, uid string, path string, flag string) {
-	pa.SendToPerson(ctx, uid, fmt.Sprintf("[尝试发送文件: %s，但不支持]", filepath.Base(path)), flag)
+func (*PlatformAdapterOfficialQQ) SendFileToPerson(_ *MsgContext, _ string, _ string, _ string) adapterapi.EffectResult {
+	return adapterapi.UnsupportedResult("official_qq_file_send_unsupported")
 }
 
-func (pa *PlatformAdapterOfficialQQ) SendFileToGroup(ctx *MsgContext, uid string, path string, flag string) {
-	pa.SendToPerson(ctx, uid, fmt.Sprintf("[尝试发送文件: %s，但不支持]", filepath.Base(path)), flag)
+func (*PlatformAdapterOfficialQQ) SendFileToGroup(_ *MsgContext, _ string, _ string, _ string) adapterapi.EffectResult {
+	return adapterapi.UnsupportedResult("official_qq_file_send_unsupported")
 }
 
 func (pa *PlatformAdapterOfficialQQ) QuitGroup(_ *MsgContext, _ string) {

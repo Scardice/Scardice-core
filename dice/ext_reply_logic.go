@@ -67,7 +67,7 @@ type ReplyConditionExprTrue struct {
 }
 
 // 这个是用于测试回复条件中表达式求值的测试桩
-var replyExprEvalFn = DiceExprEvalBase
+var replyExprEvalFn = replyExprEvalCached
 
 // ReplyConditionTextLenLimit 文本长度限制 // textLenLimit
 type ReplyConditionTextLenLimit struct {

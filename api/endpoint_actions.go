@@ -31,10 +31,7 @@ type ActionResponse struct {
 	Diagnostic  DiagnosticView `json:"diagnostic"`
 }
 
-var (
-	errAdminActionFailed         = errors.New("admin action failed")
-	errAdminActionAlreadyPending = errors.New("admin action already pending")
-)
+var errAdminActionFailed = errors.New("admin action failed")
 
 func actionName(kind adapterapi.ActionKind) string {
 	switch kind {
@@ -66,6 +63,10 @@ func actionName(kind adapterapi.ActionKind) string {
 		return "kick"
 	case adapterapi.ActionKindGroupInfoRefresh:
 		return "refresh-group-info"
+	case adapterapi.ActionKindAnswerRequest:
+		return "answer-request"
+	case adapterapi.ActionKindAdapterAPI:
+		return "adapter-api"
 	default:
 		return ""
 	}
@@ -105,7 +106,7 @@ func actionOperationCommit(ctx context.Context, mutation adminMutation, endpoint
 	_, err := service.Store.Commit(ctx, eventstore.UnitOfWork{Operations: []eventstore.OperationUpdate{{
 		OperationID: mutation.operationID, ExpectedVersion: 0, Version: 1,
 		Kind: "endpoint-action:" + action, Status: "pending", PrincipalID: mutation.principal,
-		ResourceID: string(endpointID), RequestID: mutation.requestID,
+		ResourceID: endpointID, RequestID: mutation.requestID,
 		CorrelationID: mutation.requestID, IdempotencyScope: mutation.scope,
 		IdempotencyKey: mutation.key, RequestDigest: append([]byte(nil), mutation.requestDigest...),
 		CreatedAt: now, UpdatedAt: now,
@@ -163,8 +164,26 @@ func validateActionRequest(action adapterapi.ActionKind, request EndpointActionR
 		if !request.Confirm {
 			return fmt.Errorf("%w: artifact generation requires confirmation", endpoint.ErrInvalid)
 		}
+	case adapterapi.ActionKindInvalid,
+		adapterapi.ActionKindRequestQRCode,
+		adapterapi.ActionKindValidateCredentials,
+		adapterapi.ActionKindSendMessage,
+		adapterapi.ActionKindSendFile,
+		adapterapi.ActionKindRecallMessage,
+		adapterapi.ActionKindEditMessage,
+		adapterapi.ActionKindSetGroupCard,
+		adapterapi.ActionKindQuit,
+		adapterapi.ActionKindBan,
+		adapterapi.ActionKindKick,
+		adapterapi.ActionKindGroupInfoRefresh,
+		adapterapi.ActionKindAnswerRequest:
+		return validateActionTTL(request.TTLSeconds)
 	}
-	if request.TTLSeconds < 0 || time.Duration(request.TTLSeconds)*time.Second > eventstore.MaxArtifactTTL {
+	return validateActionTTL(request.TTLSeconds)
+}
+
+func validateActionTTL(ttlSeconds int64) error {
+	if ttlSeconds < 0 || time.Duration(ttlSeconds)*time.Second > eventstore.MaxArtifactTTL {
 		return eventstore.ErrInvalidTTL
 	}
 	return nil

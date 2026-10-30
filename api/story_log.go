@@ -13,8 +13,41 @@ import (
 	"Scardice-core/model"
 )
 
+func requireStoryLogRepository() (service.LogRepository, error) {
+	if myDice == nil || myDice.LogRepository == nil {
+		return nil, service.ErrLogRepositoryUnavailable
+	}
+	return myDice.LogRepository, nil
+}
+
+func storyCheckLog(c echo.Context) error {
+	if !doAuth(c) {
+		return c.JSON(http.StatusForbidden, nil)
+	}
+	if _, err := requireStoryLogRepository(); err != nil {
+		return c.JSON(http.StatusServiceUnavailable, err.Error())
+	}
+	var request struct {
+		EndpointID string `json:"endpointId"`
+		GroupID    string `json:"groupId"`
+		AfterSeq   int64  `json:"afterSeq"`
+		BeforeSeq  int64  `json:"beforeSeq"`
+	}
+	if err := c.Bind(&request); err != nil {
+		return c.JSON(http.StatusBadRequest, err.Error())
+	}
+	if err := myDice.StartLogGapCheck(request.EndpointID, request.GroupID, request.AfterSeq, request.BeforeSeq); err != nil {
+		return c.JSON(http.StatusBadRequest, err.Error())
+	}
+	return c.JSON(http.StatusAccepted, map[string]bool{"accepted": true})
+}
+
 func storyGetInfo(c echo.Context) error {
-	info, err := service.LogGetInfo(myDice.DBOperator)
+	repo, err := requireStoryLogRepository()
+	if err != nil {
+		return c.JSON(http.StatusServiceUnavailable, err.Error())
+	}
+	info, err := repo.StorageInfo()
 	if err != nil {
 		myDice.Logger.Error("storyGetInfo", err)
 		return c.JSON(http.StatusInternalServerError, err)
@@ -27,7 +60,11 @@ func storyGetLogs(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
 	}
-	logs, err := service.LogGetLogs(myDice.DBOperator)
+	repo, err := requireStoryLogRepository()
+	if err != nil {
+		return c.JSON(http.StatusServiceUnavailable, err.Error())
+	}
+	logs, err := repo.AllLogs()
 	if err != nil {
 		myDice.Logger.Error("storyGetLogs", err)
 		return c.JSON(http.StatusInternalServerError, err)
@@ -40,23 +77,23 @@ func storyGetLogPage(c echo.Context) error {
 		return c.JSON(http.StatusForbidden, nil)
 	}
 	v := service.QueryLogPage{}
-	err := c.Bind(&v)
-	if err != nil {
+	if err := c.Bind(&v); err != nil {
 		return Error(&c, err.Error(), Response{})
 	}
-
 	if v.PageNum < 1 {
 		v.PageNum = 1
 	}
 	if v.PageSize <= 0 {
 		v.PageSize = 20
 	}
-
-	total, page, err := service.LogGetLogPage(myDice.DBOperator, &v)
+	repo, err := requireStoryLogRepository()
+	if err != nil {
+		return c.JSON(http.StatusServiceUnavailable, err.Error())
+	}
+	total, page, err := repo.LogsPage(&v)
 	if err != nil {
 		return Error(&c, err.Error(), Response{})
 	}
-
 	return Success(&c, Response{
 		"data":     page,
 		"total":    total,
@@ -70,7 +107,11 @@ func storyGetItems(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
 	}
-	lines, err := service.LogGetAllLines(myDice.DBOperator, c.QueryParam("groupId"), c.QueryParam("name"))
+	repo, err := requireStoryLogRepository()
+	if err != nil {
+		return c.JSON(http.StatusServiceUnavailable, err.Error())
+	}
+	lines, err := repo.Entries(c.QueryParam("groupId"), c.QueryParam("name"))
 	if err != nil {
 		myDice.Logger.Error("storyGetItems", err)
 		return c.JSON(http.StatusInternalServerError, err)
@@ -82,10 +123,8 @@ func storyGetItemPage(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
 	}
-
 	v := service.QueryLogLinePage{}
-	err := c.Bind(&v)
-	if err != nil {
+	if err := c.Bind(&v); err != nil {
 		myDice.Logger.Error("storyGetItemPage", err)
 		return c.JSON(http.StatusInternalServerError, err)
 	}
@@ -95,8 +134,11 @@ func storyGetItemPage(c echo.Context) error {
 	if v.PageSize <= 0 {
 		v.PageSize = 10
 	}
-
-	lines, err := service.LogGetLinePage(myDice.DBOperator, &v)
+	repo, err := requireStoryLogRepository()
+	if err != nil {
+		return c.JSON(http.StatusServiceUnavailable, err.Error())
+	}
+	lines, err := repo.ItemsPage(v.GroupID, v.LogName, v.PageNum, v.PageSize)
 	if err != nil {
 		myDice.Logger.Error("storyGetItemPage", err)
 		return c.JSON(http.StatusInternalServerError, err)
@@ -108,14 +150,19 @@ func storyDelLog(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
 	}
-	v := &model.LogInfo{}
-	err := c.Bind(&v)
-	if err != nil {
+	v := struct {
+		GroupID string `json:"groupId" query:"groupId"`
+		Name    string `json:"name"    query:"name"`
+	}{}
+	if err := c.Bind(&v); err != nil {
 		myDice.Logger.Error("storyDelLog", err)
 		return c.JSON(http.StatusInternalServerError, err)
 	}
-	err = service.LogDelete(myDice.DBOperator, v.GroupID, v.Name)
+	repo, err := requireStoryLogRepository()
 	if err != nil {
+		return c.JSON(http.StatusServiceUnavailable, err.Error())
+	}
+	if err = repo.Delete(v.GroupID, v.Name); err != nil {
 		if errors.Is(err, service.ErrLogNotFound) {
 			return c.JSON(http.StatusNotFound, false)
 		}
@@ -128,6 +175,9 @@ func storyDelLog(c echo.Context) error {
 func storyUploadLog(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
+	}
+	if _, err := requireStoryLogRepository(); err != nil {
+		return c.JSON(http.StatusServiceUnavailable, err.Error())
 	}
 	v := &model.LogInfo{}
 	_ = c.Bind(&v)

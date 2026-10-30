@@ -12,15 +12,15 @@ import (
 )
 
 type dispatcherTestStore struct {
-	claimed  eventstore.OutboxLease
-	marked   eventstore.OutboxLease
-	work     eventstore.UnitOfWork
-	calls        []string
-	resolved     bool
-	resolve      eventstore.OutboxResolutionRequest
-	quarantined  bool
-	quarantine   eventstore.OutboxQuarantineRequest
-	commitErr    error
+	claimed     eventstore.OutboxLease
+	marked      eventstore.OutboxLease
+	work        eventstore.UnitOfWork
+	calls       []string
+	resolved    bool
+	resolve     eventstore.OutboxResolutionRequest
+	quarantined bool
+	quarantine  eventstore.OutboxQuarantineRequest
+	commitErr   error
 }
 
 func (s *dispatcherTestStore) ClaimOutbox(_ context.Context, _ eventstore.OutboxClaimRequest) (eventstore.OutboxLease, error) {
@@ -92,11 +92,12 @@ func (d dispatcherTestDecrypt) DecryptBound(context.Context, string, string, str
 	return d.plain, nil
 }
 
-type dispatcherTestExecutor struct{ marked *bool }
+type dispatcherTestExecutor struct{}
 
-func (e dispatcherTestExecutor) ExecutePinned(context.Context, adapterapi.EndpointID, uint64, adapterapi.OutboundEffect) (adapterapi.EffectResult, error) {
+func (dispatcherTestExecutor) ExecutePinned(context.Context, adapterapi.EndpointID, uint64, adapterapi.OutboundEffect) (adapterapi.EffectResult, error) {
 	return adapterapi.EffectResult{Outcome: adapterapi.EffectSucceeded}, nil
 }
+
 type dispatcherTestNotifier struct{ received chan adapterapi.EffectResult }
 
 func (n dispatcherTestNotifier) NotifyOutboundEffectSucceeded(_ context.Context, _ adapterapi.OutboundEffect, result adapterapi.EffectResult) {
@@ -163,6 +164,7 @@ func TestEffectDispatcherQuarantinesDecodeFailure(t *testing.T) {
 		t.Fatal("dispatcher used operator resolution instead of quarantine")
 	}
 }
+
 type dispatcherQuarantineNotifier struct {
 	received chan adapterapi.EffectResult
 	effects  chan adapterapi.OutboundEffect
@@ -202,7 +204,6 @@ func TestEffectDispatcherNotifiesCommittedQuarantine(t *testing.T) {
 		t.Fatal("committed quarantine result missing")
 	}
 }
-
 
 type dispatcherInvalidResultExecutor struct{}
 
@@ -246,8 +247,8 @@ func TestEffectDispatcherQuarantinesPostDispatchPersistenceFailureAsAmbiguous(t 
 	effect := adapterapi.OutboundEffect{Version: adapterapi.EffectVersionOne, ID: "effect-1", EndpointID: "endpoint-1", OperationID: "op-1", CorrelationID: "corr-1", CausationID: "cause-1", Lane: lane, Deadline: time.Now().Add(time.Hour), Risk: adapterapi.EffectRiskNormal, RetryClass: adapterapi.EffectRetryNonIdempotent, RequiredCapabilities: adapterapi.CapabilityOutbound, RequiredAction: adapterapi.ActionKindSendMessage, Kind: adapterapi.EffectKindMessage, Payload: adapterapi.EffectPayload{Kind: adapterapi.EffectPayloadPersonText, Target: target, Text: "hello"}}
 	plain, _ := json.Marshal(effectWire{Effect: effect})
 	store := &dispatcherTestStore{
-		claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", DeadlineAt: effect.Deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}},
-		marked:  eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 2, EndpointID: "endpoint-1", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", RiskClass: eventstore.RiskNonIdempotentAfterDispatch}},
+		claimed:   eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", DeadlineAt: effect.Deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}},
+		marked:    eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 2, EndpointID: "endpoint-1", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", RiskClass: eventstore.RiskNonIdempotentAfterDispatch}},
 		commitErr: errors.New("terminal persistence failed"),
 	}
 	notifier := dispatcherQuarantineNotifier{received: make(chan adapterapi.EffectResult, 1), effects: make(chan adapterapi.OutboundEffect, 1)}
@@ -270,7 +271,6 @@ func TestEffectDispatcherQuarantinesPostDispatchPersistenceFailureAsAmbiguous(t 
 		t.Fatal("post-dispatch quarantine result missing")
 	}
 }
-
 
 type dispatcherGenerationExecutor struct {
 	generation uint64
@@ -306,6 +306,7 @@ func TestEffectDispatcherSnapshotsWorkerGeneration(t *testing.T) {
 		t.Fatalf("executor generation = %d, want snapshot %d", executor.seen, executor.generation)
 	}
 }
+
 type dispatcherUnavailableExecutor struct {
 	executed bool
 }
@@ -349,6 +350,93 @@ func TestEffectDispatcherRejectsMissingWorkerBeforeProviderExecution(t *testing.
 	}
 	if !foundRequeue {
 		t.Fatalf("missing worker calls = %v", store.calls)
+	}
+}
+
+type dispatcherRecordingExecutor struct {
+	executed bool
+}
+
+func (e *dispatcherRecordingExecutor) ExecutePinned(context.Context, adapterapi.EndpointID, uint64, adapterapi.OutboundEffect) (adapterapi.EffectResult, error) {
+	e.executed = true
+	return adapterapi.EffectResult{Outcome: adapterapi.EffectSucceeded}, nil
+}
+
+func TestEffectDispatcherExpiresBeforeDispatchMarker(t *testing.T) {
+	target := adapterapi.EffectTarget{Kind: adapterapi.TargetPerson, Conversation: "person-1"}
+	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, []byte("root"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Unix(-1, 0).UTC()
+	effect := adapterapi.OutboundEffect{Version: adapterapi.EffectVersionOne, ID: "effect-1", EndpointID: "endpoint-1", OperationID: "op-1", CorrelationID: "corr-1", CausationID: "cause-1", Lane: lane, Deadline: deadline, Risk: adapterapi.EffectRiskNormal, RetryClass: adapterapi.EffectRetryNonIdempotent, RequiredCapabilities: adapterapi.CapabilityOutbound, RequiredAction: adapterapi.ActionKindSendMessage, Kind: adapterapi.EffectKindMessage, Payload: adapterapi.EffectPayload{Kind: adapterapi.EffectPayloadPersonText, Target: target, Text: "hello"}}
+	plain, _ := json.Marshal(effectWire{Effect: effect})
+	store := &dispatcherTestStore{claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", DeadlineAt: deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}}
+	executor := &dispatcherRecordingExecutor{}
+	d, err := NewEffectDispatcher(store, dispatcherTestDecrypt{plain}, executor, "worker", WithDispatcherClock(dispatcherTestClock{}), WithDispatcherIDGenerator(&dispatcherTestIDs{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := d.DispatchOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome != adapterapi.EffectTerminal || result.Code != "effect-deadline-exceeded" {
+		t.Fatalf("result = %#v", result)
+	}
+	if executor.executed {
+		t.Fatal("expired effect reached provider execution")
+	}
+	if len(store.calls) < 2 || store.calls[0] != "claim" || store.calls[1] != "commit" {
+		t.Fatalf("store calls = %v, want claim then commit without mark", store.calls)
+	}
+	if len(store.work.Effects) != 1 || store.work.Effects[0].Status != eventstore.OutboxStatusFailed || store.work.Effects[0].ExpectedVersion != 1 {
+		t.Fatalf("terminal work = %#v", store.work)
+	}
+}
+
+func TestEffectDispatcherExpiresAfterDispatchMarkerRecordsAmbiguous(t *testing.T) {
+	target := adapterapi.EffectTarget{Kind: adapterapi.TargetPerson, Conversation: "person-1"}
+	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, []byte("root"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Unix(-1, 0).UTC()
+	dispatchedAt := time.Unix(-10, 0).UTC()
+	effect := adapterapi.OutboundEffect{
+		Version: adapterapi.EffectVersionOne, ID: "effect-1", EndpointID: "endpoint-1", OperationID: "op-1",
+		CorrelationID: "corr-1", CausationID: "cause-1", Lane: lane, Deadline: deadline, Risk: adapterapi.EffectRiskNormal,
+		RetryClass: adapterapi.EffectRetryProviderIdempotent, RequiredCapabilities: adapterapi.CapabilityOutbound | adapterapi.CapabilityActions,
+		RequiredAction: adapterapi.ActionKindRecallMessage, Kind: adapterapi.EffectKindAction,
+		Payload: adapterapi.EffectPayload{Kind: adapterapi.EffectPayloadRecall, Target: target, MessageID: "message-1"},
+	}
+	plain, _ := json.Marshal(effectWire{Effect: effect})
+	store := &dispatcherTestStore{claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 2, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 2, AttemptID: "attempt-2", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", DeadlineAt: deadline, DispatchedAt: dispatchedAt, RiskClass: eventstore.RiskProviderIdempotent}}}
+	executor := &dispatcherRecordingExecutor{}
+	d, err := NewEffectDispatcher(store, dispatcherTestDecrypt{plain}, executor, "worker", WithDispatcherClock(dispatcherTestClock{}), WithDispatcherIDGenerator(&dispatcherTestIDs{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := d.DispatchOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome != adapterapi.EffectAmbiguous {
+		t.Fatalf("result = %#v, want ambiguous outcome", result)
+	}
+	if executor.executed {
+		t.Fatal("re-claimed expired effect reached provider execution again")
+	}
+	for _, call := range store.calls {
+		if call == "mark" {
+			t.Fatalf("store calls = %v, want no dispatch marker", store.calls)
+		}
+	}
+	if len(store.calls) < 2 || store.calls[0] != "claim" || store.calls[1] != "commit" {
+		t.Fatalf("store calls = %v, want claim then commit", store.calls)
+	}
+	if len(store.work.Effects) != 1 || store.work.Effects[0].Status != eventstore.OutboxStatusAmbiguous || store.work.Effects[0].ExpectedVersion != 2 {
+		t.Fatalf("terminal work = %#v, want ambiguous status", store.work)
 	}
 }
 

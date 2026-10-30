@@ -13,6 +13,20 @@ import (
 	ds "github.com/sealdice/dicescript"
 )
 
+func callbackAttrsByID(ctx *MsgContext, manager *AttrsManager, id string) (*AttributesItem, error) {
+	if ctx != nil && ctx.callbackTransaction != nil {
+		return manager.callbackLoadByID(ctx, id)
+	}
+	return manager.LoadById(id)
+}
+
+func callbackAttrsByCtx(ctx *MsgContext, manager *AttrsManager) (*AttributesItem, error) {
+	if ctx != nil && ctx.callbackTransaction != nil {
+		return manager.callbackLoadByCtx(ctx)
+	}
+	return manager.LoadByCtx(ctx)
+}
+
 func aliasMapForCtx(ctx *MsgContext) map[string][]string {
 	if ctx != nil && ctx.SystemTemplate != nil {
 		return ctx.SystemTemplate.Alias
@@ -37,6 +51,9 @@ func _VarSetValueV1(ctx *MsgContext, s string, v *VMValue) {
 }
 
 func VarSetValue(ctx *MsgContext, s string, v *ds.VMValue) {
+	if err := ctx.checkExecution(); err != nil {
+		panic(err)
+	}
 	ctx.CreateVmIfNotExists()
 	am := ctx.Dice.AttrsManager
 	name := GetValueNameByAlias(s, aliasMapForCtx(ctx))
@@ -57,7 +74,7 @@ func VarSetValue(ctx *MsgContext, s string, v *ds.VMValue) {
 	// 个人变量
 	if strings.HasPrefix(s, "$m") {
 		if ctx.Session != nil && ctx.Player != nil {
-			playerAttrs := lo.Must(am.LoadById(ctx.Player.UserID))
+			playerAttrs := lo.Must(callbackAttrsByID(ctx, am, ctx.Player.UserID))
 			playerAttrs.Store(name, vClone)
 		}
 		return
@@ -65,26 +82,29 @@ func VarSetValue(ctx *MsgContext, s string, v *ds.VMValue) {
 
 	// 群变量
 	if ctx.Group != nil && strings.HasPrefix(s, "$g") {
-		groupAttrs := lo.Must(am.LoadById(ctx.Group.GroupID))
+		groupAttrs := lo.Must(callbackAttrsByID(ctx, am, ctx.Group.GroupID))
 		groupAttrs.Store(s, vClone)
 		return
 	}
 
 	// 个人属性
 	if ctx.Session != nil && ctx.Player != nil {
-		curAttrs := lo.Must(am.LoadByCtx(ctx))
+		curAttrs := lo.Must(callbackAttrsByCtx(ctx, am))
 		curAttrs.Store(name, vClone)
 	}
 }
 
 func VarDelValue(ctx *MsgContext, s string) {
+	if err := ctx.checkExecution(); err != nil {
+		panic(err)
+	}
 	am := ctx.Dice.AttrsManager
 	name := GetValueNameByAlias(s, aliasMapForCtx(ctx))
 
 	// 临时变量
 	if strings.HasPrefix(s, "$t") {
 		ctx.Player.ValueMapTemp.Delete(s)
-		curAttrs := lo.Must(am.LoadByCtx(ctx))
+		curAttrs := lo.Must(callbackAttrsByCtx(ctx, am))
 		curAttrs.Delete(name)
 		return
 	}
@@ -92,7 +112,7 @@ func VarDelValue(ctx *MsgContext, s string) {
 	// 个人变量
 	if strings.HasPrefix(s, "$m") {
 		if ctx.Session != nil && ctx.Player != nil {
-			playerAttrs := lo.Must(am.LoadById(ctx.Player.UserID))
+			playerAttrs := lo.Must(callbackAttrsByID(ctx, am, ctx.Player.UserID))
 			playerAttrs.Delete(name)
 			return
 		}
@@ -100,12 +120,12 @@ func VarDelValue(ctx *MsgContext, s string) {
 
 	// 群变量
 	if ctx.Group != nil && strings.HasPrefix(s, "$g") {
-		groupAttrs := lo.Must(am.LoadById(ctx.Group.GroupID))
+		groupAttrs := lo.Must(callbackAttrsByID(ctx, am, ctx.Group.GroupID))
 		groupAttrs.Delete(s)
 		return
 	}
 
-	curAttrs := lo.Must(am.LoadByCtx(ctx))
+	curAttrs := lo.Must(callbackAttrsByCtx(ctx, am))
 	curAttrs.Delete(name)
 }
 
@@ -158,20 +178,20 @@ func VarGetValue(ctx *MsgContext, s string) (*ds.VMValue, bool) {
 	// 个人全局变量
 	if strings.HasPrefix(s, "$m") {
 		if ctx.Session != nil && ctx.Player != nil {
-			playerAttrs := lo.Must(am.LoadById(ctx.Player.UserID))
+			playerAttrs := lo.Must(callbackAttrsByID(ctx, am, ctx.Player.UserID))
 			return playerAttrs.LoadX(name)
 		}
 	}
 
 	// 群变量
 	if ctx.Group != nil && strings.HasPrefix(s, "$g") {
-		groupAttrs := lo.Must(am.LoadById(ctx.Group.GroupID))
+		groupAttrs := lo.Must(callbackAttrsByID(ctx, am, ctx.Group.GroupID))
 		return groupAttrs.LoadX(s)
 	}
 
 	// 个人群变量
 	if ctx.Player != nil {
-		curAttrs := lo.Must(am.LoadByCtx(ctx))
+		curAttrs := lo.Must(callbackAttrsByCtx(ctx, am))
 		return curAttrs.LoadX(name)
 	}
 

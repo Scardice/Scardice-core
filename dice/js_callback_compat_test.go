@@ -94,10 +94,12 @@ func TestJSCallbackDispatchDeduplicatesOnlyWithinGeneration(t *testing.T) {
 	}
 	close(release)
 	waitForCallbackCount(t, &calls, 1)
+	waitForCallbackCompletion(t, loop, request.Realm)
 	if err := manager.dispatchJSCallback(request, true); err != nil {
 		t.Fatalf("reschedule after completion: %v", err)
 	}
 	waitForCallbackCount(t, &calls, 2)
+	waitForCallbackCompletion(t, loop, request.Realm)
 	select {
 	case <-started:
 	default:
@@ -109,6 +111,7 @@ func TestJSCallbackDispatchDeduplicatesOnlyWithinGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForCallbackCount(t, &calls, 3)
+	waitForCallbackCompletion(t, second, request.Realm)
 }
 
 func TestJSCallbackDispatchSynchronousReentryDoesNotDeadlock(t *testing.T) {
@@ -236,18 +239,17 @@ func TestJSCallbackDispatchFromTimerAndPromiseReentry(t *testing.T) {
 	}
 }
 
-
 func TestJSCallbackDispatchObservesAsyncCallbackError(t *testing.T) {
 	manager := NewJsLoopManager()
 	loop := gojaengine.WrapEventLoop(startFsTestLoop(t))
 	generation := manager.SetLoop(loop)
 	observed := make(chan error, 1)
 	if err := manager.dispatchJSCallback(jsCallbackRequest{
-		Generation:       generation,
-		Realm:            "plugin-a",
-		Kind:             jsCallbackMessage,
-		Callback:         func() { panic("callback failure") },
-		OnError:          func(err error) { observed <- err },
+		Generation: generation,
+		Realm:      "plugin-a",
+		Kind:       jsCallbackMessage,
+		Callback:   func() { panic("callback failure") },
+		OnError:    func(err error) { observed <- err },
 	}, true); err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +297,6 @@ func TestJSCallbackDispatchPreservesCallbackOrder(t *testing.T) {
 		jsCallbackPreprocess, jsCallbackMessage, jsCallbackCommand,
 		jsCallbackGroup, jsCallbackMember, jsCallbackActivation,
 	} {
-		kind := kind
 		if err := manager.dispatchJSCallback(jsCallbackRequest{
 			Generation: generation,
 			Realm:      "plugin-a",
@@ -329,5 +330,13 @@ func waitForCallbackCount(t *testing.T, calls *atomic.Int64, want int64) {
 		default:
 			time.Sleep(time.Millisecond)
 		}
+	}
+}
+
+// waitForCallbackCompletion queues a barrier that observes deferred callback cleanup.
+func waitForCallbackCompletion(t *testing.T, loop jsengine.Loop, context any) {
+	t.Helper()
+	if err := jsengine.RunWithContext(loop, context, func(jsengine.Runtime) error { return nil }); err != nil {
+		t.Fatalf("callback completion barrier: %v", err)
 	}
 }

@@ -1,6 +1,7 @@
 package dice //nolint:testpackage
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -40,10 +41,7 @@ func TestJsInit_WhenExtLoopManagerNil_DoesNotPanic(t *testing.T) {
 		BaseConfig: BaseConfig{
 			DataDir: t.TempDir(),
 		},
-		ImSession: &IMSession{
-			ServiceAtNew: new(SyncMap[string, *GroupInfo]),
-			EndPoints:    []*EndPointInfo{},
-		},
+		ImSession:    &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
 		DirtyGroups:  new(SyncMap[string, int64]),
 		AttrsManager: &AttrsManager{},
 	}
@@ -57,10 +55,6 @@ func TestJsInit_WhenExtLoopManagerNil_DoesNotPanic(t *testing.T) {
 			t.Fatalf("JsInit should not panic when ExtLoopManager is nil, got: %v", r)
 		}
 		// 清理后台任务，避免测试进程残留 goroutine
-		if d.JsScriptCron != nil {
-			d.JsScriptCron.Stop()
-			d.JsScriptCron = nil
-		}
 		if d.ExtLoopManager != nil {
 			// JsInit 在独立 goroutine 里调用 StartInForeground，running 标记要等该
 			// goroutine 实际跑起来才置位；若此时直接 Terminate，Stop 会因 running=false
@@ -82,6 +76,40 @@ func TestJsInit_WhenExtLoopManagerNil_DoesNotPanic(t *testing.T) {
 	}
 	if !d.Config.JsEnable {
 		t.Fatalf("expected JsEnable to be true after JsInit")
+	}
+
+	if d.JsScriptCron == nil {
+		t.Fatal("expected JS script cron scheduler to be initialized")
+	}
+	if d.JsScriptCronLock == nil {
+		t.Fatal("expected JS script cron lock to be initialized")
+	}
+	triggered := make(chan struct{}, 1)
+	task := JsScriptTask{
+		taskType: "cron",
+		cron:     d.JsScriptCron,
+		cronExpr: "@every 1ms",
+		lock:     d.JsScriptCronLock,
+		logger:   d.Logger,
+		task: func(JsScriptTaskCtx) {
+			select {
+			case triggered <- struct{}{}:
+			default:
+			}
+		},
+	}
+	if !task.On() {
+		t.Fatal("register JS script cron task")
+	}
+	defer task.Off()
+	select {
+	case <-triggered:
+	case <-time.After(time.Second):
+		t.Fatal("JS script cron scheduler did not execute a registered task")
+	}
+	d.ExtLoopManager.SetLoop(nil)
+	if d.JsScriptCron != nil || d.JsScriptCronLock != nil {
+		t.Fatal("stopping the JS runtime did not release the script cron scheduler")
 	}
 }
 
@@ -133,10 +161,7 @@ func TestJsInit_QuickJSStartsNativeHost(t *testing.T) {
 		BaseConfig: BaseConfig{
 			DataDir: t.TempDir(),
 		},
-		ImSession: &IMSession{
-			ServiceAtNew: new(SyncMap[string, *GroupInfo]),
-			EndPoints:    []*EndPointInfo{},
-		},
+		ImSession:    &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
 		DirtyGroups:  new(SyncMap[string, int64]),
 		AttrsManager: &AttrsManager{},
 	}
@@ -184,7 +209,6 @@ func TestJsInit_QuickJSStartsNativeHost(t *testing.T) {
 		}
 		return nil
 	}); err != nil {
-
 		t.Fatal(err)
 	}
 }
@@ -211,10 +235,7 @@ func TestJsInit_QuickJSInstallsNativeConsoleService(t *testing.T) {
 		BaseConfig: BaseConfig{
 			DataDir: dataDir,
 		},
-		ImSession: &IMSession{
-			ServiceAtNew: new(SyncMap[string, *GroupInfo]),
-			EndPoints:    []*EndPointInfo{},
-		},
+		ImSession:    &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
 		DirtyGroups:  new(SyncMap[string, int64]),
 		AttrsManager: &AttrsManager{},
 	}
@@ -235,9 +256,13 @@ func TestJsInit_QuickJSInstallsNativeConsoleService(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	completed := make(chan string, 1)
 	d.JsPrinter.RecordStart()
 	if err := jsengine.RunWithContext(loop, &jsExecutionContext{Plugin: &ExtInfo{Name: "native-fs-test"}}, func(runtime jsengine.Runtime) error {
-		value, err := runtime.RunString("native-console.js", `
+		if err := runtime.Bind("nativeServicesDone", func(result string) { completed <- result }); err != nil {
+			return err
+		}
+		_, err := runtime.RunString("native-console.js", `
 			console.log("log", 1);
 			console.info("info");
 			console.debug("debug");
@@ -247,41 +272,30 @@ func TestJsInit_QuickJSInstallsNativeConsoleService(t *testing.T) {
 			if (!(random instanceof Uint8Array) || random.length !== 4) {
 				throw new Error("crypto service unavailable");
 			}
-			globalThis.nativeFsResult = undefined;
 			fs.writeFileSync("data://sync.txt", "sync fs");
 			if (fs.readFileSync("data://sync.txt", { encoding: "utf8" }) !== "sync fs") {
 				throw new Error("synchronous filesystem service unavailable");
 			}
-			fs.promises.readFile("data://fixture.txt", { encoding: "utf8" }).then(value => {
+			const nativeFs = fs.promises.readFile("data://fixture.txt", { encoding: "utf8" }).then(value => {
 				return fs.promises.writeFile("data://async.txt", value + " async");
 			}).then(() => {
 				return fs.promises.readFile("data://async.txt", { encoding: "utf8" });
-			}).then(value => {
-				globalThis.nativeFsResult = value;
-			}, error => {
-				globalThis.nativeFsResult = "error:" + String(error);
 			});
-			globalThis.nativeFetchResult = undefined;
-			fetch(`+strconv.Quote(fetchServer.URL)+`).then(response => {
+			const nativeFetch = fetch(`+strconv.Quote(fetchServer.URL)+`).then(response => {
 				return response.json().then(value => ({
 					status: response.status,
 					ok: response.ok,
 					message: value.message
 				}));
-			}).then(value => {
-				globalThis.nativeFetchResult = value;
-			}, error => {
-				globalThis.nativeFetchResult = "error:" + String(error);
 			});
-			globalThis.nativeTimerResult = "pending";
-			setTimeout(() => { globalThis.nativeTimerResult = "native timer"; }, 5);
-			true
+			const nativeTimer = new Promise(resolve => setTimeout(() => resolve("native timer"), 5));
+			Promise.all([nativeFs, nativeFetch, nativeTimer]).then(
+				([filesystem, fetch, timer]) => nativeServicesDone(JSON.stringify({filesystem, fetch, timer})),
+				error => nativeServicesDone(JSON.stringify({error: String(error)}))
+			);
 		`)
 		if err != nil {
 			return err
-		}
-		if !value.ToBoolean() {
-			t.Fatal("native console script returned false")
 		}
 		module, err := runtime.LoadCommonJS("console-module.js", `module.exports = require("console") === console`)
 		if err != nil {
@@ -295,59 +309,30 @@ func TestJsInit_QuickJSInstallsNativeConsoleService(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var timerResult any
-	for attempt := 0; attempt < 100; attempt++ {
-		time.Sleep(time.Millisecond)
-		if err := loop.Run(func(runtime jsengine.Runtime) error {
-			var err error
-			timerResult, err = runtime.Get("nativeTimerResult").ExportPrimitive()
-			return err
-		}); err != nil {
-			t.Fatal(err)
-		}
-		if timerResult == "native timer" {
-			break
-		}
-	}
-	if timerResult != "native timer" {
-		t.Fatalf("native timer result = %#v, want %q", timerResult, "native timer")
-	}
-	var filesystemResult any
-	for attempt := 0; attempt < 100; attempt++ {
-		if err := loop.Run(func(runtime jsengine.Runtime) error {
-			var err error
-			filesystemResult, err = runtime.Get("nativeFsResult").ExportPrimitive()
-			return err
-		}); err != nil {
-			t.Fatal(err)
-		}
-		if filesystemResult == "native fs async" {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if filesystemResult != "native fs async" {
-		t.Fatalf("native filesystem result = %#v, want %q", filesystemResult, "native fs async")
-	}
-	var fetchResult any
-	for attempt := 0; attempt < 100; attempt++ {
-		if err := loop.Run(func(runtime jsengine.Runtime) error {
-			value, err := runtime.RunString("native-fetch-observe.js", "JSON.stringify(nativeFetchResult)")
-			if err != nil {
-				return err
+	select {
+	case raw := <-completed:
+		var result struct {
+			Filesystem string
+			Fetch      struct {
+				Status  int
+				OK      bool
+				Message string
 			}
-			fetchResult, err = value.ExportPrimitive()
-			return err
-		}); err != nil {
+			Timer string
+			Error string
+		}
+		if err := json.Unmarshal([]byte(raw), &result); err != nil {
 			t.Fatal(err)
 		}
-		if fetchResult == `{"status":200,"ok":true,"message":"native fetch"}` {
-			break
+		if result.Error != "" {
+			t.Fatalf("native services failed: %s", result.Error)
 		}
-		time.Sleep(time.Millisecond)
-	}
-	if fetchResult != `{"status":200,"ok":true,"message":"native fetch"}` {
-		t.Fatalf("native fetch result = %#v", fetchResult)
+		if result.Filesystem != "native fs async" || result.Timer != "native timer" ||
+			result.Fetch.Status != http.StatusOK || !result.Fetch.OK || result.Fetch.Message != "native fetch" {
+			t.Fatalf("native service results = %+v", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("native filesystem, fetch, and timer operations did not complete")
 	}
 	if got, want := d.JsPrinter.RecordEnd(), []string{"log 1", "info", "debug", "warn", "error"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("native console records = %#v, want %#v", got, want)
@@ -370,10 +355,7 @@ func TestJsLoadScriptRaw_NativeQuickJSExecutesAndRegistersPlugin(t *testing.T) {
 		BaseConfig: BaseConfig{
 			DataDir: dataDir,
 		},
-		ImSession: &IMSession{
-			ServiceAtNew: new(SyncMap[string, *GroupInfo]),
-			EndPoints:    []*EndPointInfo{},
-		},
+		ImSession:    &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
 		DirtyGroups:  new(SyncMap[string, int64]),
 		AttrsManager: &AttrsManager{},
 		ExtRegistry:  new(SyncMap[string, *ExtInfo]),
@@ -414,10 +396,7 @@ func TestJsInit_QuickJSDoesNotFallbackWithoutNativePackage(t *testing.T) {
 		BaseConfig: BaseConfig{
 			DataDir: t.TempDir(),
 		},
-		ImSession: &IMSession{
-			ServiceAtNew: new(SyncMap[string, *GroupInfo]),
-			EndPoints:    []*EndPointInfo{},
-		},
+		ImSession:    &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
 		DirtyGroups:  new(SyncMap[string, int64]),
 		AttrsManager: &AttrsManager{},
 	}
@@ -451,10 +430,7 @@ func TestJsLoadScriptRaw_NativeQuickJSRejectsPathESMImport(t *testing.T) {
 		BaseConfig: BaseConfig{
 			DataDir: dataDir,
 		},
-		ImSession: &IMSession{
-			ServiceAtNew: new(SyncMap[string, *GroupInfo]),
-			EndPoints:    []*EndPointInfo{},
-		},
+		ImSession:    &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
 		DirtyGroups:  new(SyncMap[string, int64]),
 		AttrsManager: &AttrsManager{},
 		ExtRegistry:  new(SyncMap[string, *ExtInfo]),

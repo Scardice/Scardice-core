@@ -66,13 +66,3 @@ func TestParseHelpDocXLSXUnescapesContent(t *testing.T) {
 		t.Fatalf("parsed XLSX content = %q, want escaped newline converted", items[0].Content)
 	}
 }
-
-func TestXlsxParserChangeInvalidatesHelpCaches(t *testing.T) {
-	// Given / When / Then
-	if helpIndexSchemaVersion < 3 {
-		t.Fatalf("help index schema version = %d, want at least 3", helpIndexSchemaVersion)
-	}
-	if helpDocParsedCacheVersion < 3 {
-		t.Fatalf("parsed help cache version = %d, want at least 3", helpDocParsedCacheVersion)
-	}
-}
