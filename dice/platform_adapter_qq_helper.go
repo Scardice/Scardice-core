@@ -218,7 +218,8 @@ func serverSatori(d *Dice, ep *EndPointInfo, conn *PlatformAdapterSatori) {
 }
 
 func serverOfficialQQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterOfficialQQ) {
-	if conn.Ctx != nil {
+	// Ctx 非空表示会话已经建立或正在运行，不能重复启动并覆盖端点状态。
+	if conn.isSessionRunning() {
 		return
 	}
 	if conn.DiceServing {
@@ -238,10 +239,6 @@ func serverOfficialQQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterOfficialQQ
 		ret := ep.Adapter.Serve()
 
 		if ret == 0 {
-			if conn.QRLoginState == OfficialQQQRWaitingForScan {
-				ep.Enable = false
-				ep.State = StateConnecting
-			}
 			break
 		}
 
