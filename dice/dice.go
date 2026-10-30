@@ -1108,6 +1108,37 @@ func (d *Dice) ResetQuitInactiveCron() {
 	}
 }
 
+func (d *Dice) publicDiceEndpoints() []*public_dice.Endpoint {
+	var endpointItems []*public_dice.Endpoint
+	for _, i := range d.ImSession.EndPoints {
+		if !i.IsPublic {
+			continue
+		}
+		endpointItems = append(endpointItems, &public_dice.Endpoint{
+			Platform: i.Platform,
+			UID:      i.UserID,
+			AppID:    publicDiceEndpointAppID(i),
+			IsOnline: i.State == 1,
+		})
+	}
+	return endpointItems
+}
+
+func (d *Dice) publicDiceTickEndpoints() []*public_dice.TickEndpoint {
+	var tickEndpointItems []*public_dice.TickEndpoint
+	for _, i := range d.ImSession.EndPoints {
+		if !i.IsPublic {
+			continue
+		}
+		tickEndpointItems = append(tickEndpointItems, &public_dice.TickEndpoint{
+			UID:      i.UserID,
+			AppID:    publicDiceEndpointAppID(i),
+			IsOnline: i.State == 1,
+		})
+	}
+	return tickEndpointItems
+}
+
 func (d *Dice) PublicDiceEndpointRefresh() {
 	cfg := &d.Config.PublicDiceConfig
 	if !cfg.Enable {
@@ -1118,20 +1149,9 @@ func (d *Dice) PublicDiceEndpointRefresh() {
 		return
 	}
 
-	var endpointItems []*public_dice.Endpoint
-	for _, i := range d.ImSession.EndPoints {
-		if !i.IsPublic {
-			continue
-		}
-		endpointItems = append(endpointItems, &public_dice.Endpoint{
-			Platform: i.Platform,
-			UID:      i.UserID,
-			IsOnline: i.State == 1,
-		})
-	}
 	req := &public_dice.EndpointUpdateRequest{
 		DiceID:    cfg.ID,
-		Endpoints: endpointItems,
+		Endpoints: d.publicDiceEndpoints(),
 	}
 
 	_, code, body := d.PublicDice.EndpointUpdate(req, GenerateVerificationKeyForPublicDice)
@@ -1200,19 +1220,9 @@ func (d *Dice) PublicDiceSetupTick() {
 			d.logPublicDiceStatus("心跳更新跳过：缺少公骰ID", 400)
 			return
 		}
-		var tickEndpointItems []*public_dice.TickEndpoint
-		for _, i := range d.ImSession.EndPoints {
-			if !i.IsPublic {
-				continue
-			}
-			tickEndpointItems = append(tickEndpointItems, &public_dice.TickEndpoint{
-				UID:      i.UserID,
-				IsOnline: i.State == 1,
-			})
-		}
 		req := &public_dice.TickUpdateRequest{
 			ID:        cfg.ID,
-			Endpoints: tickEndpointItems,
+			Endpoints: d.publicDiceTickEndpoints(),
 		}
 		_, code, body := d.PublicDice.TickUpdate(req, GenerateVerificationKeyForPublicDice)
 		if code != 200 {
@@ -1231,6 +1241,17 @@ func (d *Dice) PublicDiceSetupTick() {
 	}()
 
 	d.PublicDiceTimerId, _ = d.Cron.AddFunc("@every 3m", doTickUpdate)
+}
+
+func publicDiceEndpointAppID(endpoint *EndPointInfo) string {
+	if endpoint == nil || endpoint.Platform != "QQ" || endpoint.ProtocolType != "official" {
+		return ""
+	}
+	adapter, ok := endpoint.Adapter.(*PlatformAdapterOfficialQQ)
+	if !ok || adapter == nil {
+		return ""
+	}
+	return adapter.AppID.String()
 }
 
 func (d *Dice) PublicDiceSetup() {

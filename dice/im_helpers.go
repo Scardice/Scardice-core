@@ -436,7 +436,7 @@ func ReplyToSenderNoCheck(ctx *MsgContext, msg *Message, text string) {
 		return
 	}
 	panicHandler.Once(logger.M(), func() {
-		replyToSenderRawNoCheck(ctx, msg, text, "")
+		replyToSenderRawNoCheck(ctx, msg, withOfficialQQNameCard(ctx, text), "")
 	})
 }
 
@@ -449,6 +449,8 @@ func ReplyGroupRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 		text = ctx.DelegateText + text
 		ctx.DelegateText = ""
 	}
+
+	text = withOfficialQQNameCard(ctx, text)
 
 	if ctx.Dice.Config.RateLimitEnabled && msg.Platform == "QQ" {
 		if !spamCheckPerson(ctx, msg) {
@@ -521,6 +523,8 @@ func ReplyPersonRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 		text = ctx.DelegateText + text
 		ctx.DelegateText = ""
 	}
+
+	text = withOfficialQQNameCard(ctx, text)
 
 	if ctx.Dice.Config.RateLimitEnabled && msg.Platform == "QQ" {
 		spamCheckPerson(ctx, msg)

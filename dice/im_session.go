@@ -66,6 +66,9 @@ type Message struct {
 	GroupName   string      `json:"groupName"`
 	TmpUID      string      `json:"-"             yaml:"-"`
 	Seq         int64       `jsbind:"seq"         json:"seq"` // 平台消息序号，0=不可用/不支持
+	// MentionedInfo carries platform-provided display names keyed by normalized
+	// user ID, used to fill @ mention names without extra API calls.
+	MentionedInfo map[string]string `json:"-" yaml:"-"`
 	// Note(Szzrain): 这里是消息段，为了支持多种消息类型，目前只有 Milky 支持，其他平台也应该尽快迁移支持，并使用 Session.ExecuteNew 方法
 	Segment []message.IMessageElement `jsbind:"segment" json:"-" yaml:"-"`
 }
@@ -1236,6 +1239,7 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 		platformPrefix := msg.Platform
 		cmdArgs := CommandParse(msg.Message, cmdLst, d.CommandPrefix, platformPrefix, false)
 		if cmdArgs != nil {
+			cmdArgs.applyMentionedInfo(msg)
 			mctx.CommandID = getNextCommandID()
 
 			var tmpUID string
@@ -3074,15 +3078,8 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 			// 允许代骰时，发一句话
 			cur := -1
 			for index, i := range cmdArgs.At {
-				if i.UserID == ctx.EndPoint.UserID {
+				if cmdArgs.isBotSelfMention(ctx, i.UserID) {
 					continue
-				} else if strings.HasPrefix(ctx.EndPoint.UserID, "OpenQQ:") {
-					// 特殊处理 OpenQQ频道
-					uid := strings.TrimPrefix(i.UserID, "OpenQQCH:")
-					diceId := strings.TrimPrefix(ctx.EndPoint.UserID, "OpenQQ:")
-					if uid == diceId {
-						continue
-					}
 				}
 				cur = index
 			}

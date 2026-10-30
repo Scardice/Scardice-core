@@ -133,6 +133,13 @@ type PlatformAdapterKook struct {
 	IntentSession *kook.Session `json:"-"     yaml:"-"`
 }
 
+// recoverKookEvent 隔离事件处理中的 panic，避免 SDK 回调协程把整个进程带崩。
+func (pa *PlatformAdapterKook) recoverKookEvent(log *zap.SugaredLogger, eventName string) {
+	if r := recover(); r != nil {
+		log.Errorf("KOOK %s 事件处理异常: %v 堆栈: %v", eventName, r, string(debug.Stack()))
+	}
+}
+
 func (pa *PlatformAdapterKook) GetGroupInfoAsync(groupID string) {
 	// 极罕见情况下，未连接成功或被禁用的Endpoint也会去call GetGroupInfoAsync，并且由于IntentSession并未被实例化而抛出nil错误，因此这里做一个检查
 	if pa.IntentSession == nil {
@@ -160,8 +167,12 @@ func (pa *PlatformAdapterKook) GetGroupInfoAsync(groupID string) {
 }
 
 func (pa *PlatformAdapterKook) updateChannelNum() {
+	session := pa.IntentSession
+	if session == nil {
+		return
+	}
 	page := new(kook.PageSetting)
-	guilds, _, _ := pa.IntentSession.GuildList(page)
+	guilds, _, _ := session.GuildList(page)
 	groupNum := 0
 	// guilds是bot加入的服务器list，channels是每个服务器里的频道（有权限访问的）
 	for _, guild := range guilds {
@@ -172,13 +183,17 @@ func (pa *PlatformAdapterKook) updateChannelNum() {
 
 func (pa *PlatformAdapterKook) updateGameStatus() {
 	logger := pa.EndPoint.Session.Parent.Logger
+	session := pa.IntentSession
+	if session == nil {
+		return
+	}
 	// 注释掉的部分是遗留代码，用于在kook中注册一个叫做Scardice的GameStatus，只需要执行一次因此注释掉
 	// gameupdate := new(kook.GameUpdate)
 	// gameupdate.ID = int64(768222)
 	// gameupdate.Icon = "https://img.kookapp.cn/assets/2022-12/DfYli1buyO0e80c0.png"
 	// gameupdate.Name = "Scardice"
 	// _, _ = pa.IntentSession.GameUpdate(gameupdate)
-	err := pa.IntentSession.GameActivity(int64(768222))
+	err := session.GameActivity(int64(768222))
 	if err != nil {
 		logger.Errorf("更新游戏状态时出错:%s", err.Error())
 		return
@@ -195,15 +210,21 @@ func (pa *PlatformAdapterKook) Serve() int {
 	}
 	s := kook.New(pa.Token, plog.NewLogger(&l))
 	s.AddHandler(func(ctx *kook.KmarkdownMessageContext) {
+		defer pa.recoverKookEvent(log, "KMarkdown")
 		if ctx.Extra.Author.Bot {
 			return
 		}
 		if ctx.Common.Type == kook.MessageTypeKMarkdown || ctx.Common.Type == kook.MessageTypeImage {
-			pa.EndPoint.Session.Execute(pa.EndPoint, pa.toStdMessage(ctx), false)
+			msg := pa.toStdMessage(ctx)
+			if msg == nil {
+				return
+			}
+			pa.EndPoint.Session.Execute(pa.EndPoint, msg, false)
 			return
 		}
 	})
 	s.AddHandler(func(ctx *kook.ImageMessageContext) {
+		defer pa.recoverKookEvent(log, "Image")
 		msg := new(Message)
 		msg.Time = ctx.Common.MsgTimestamp
 		msg.RawID = ctx.Common.MsgID
@@ -226,6 +247,7 @@ func (pa *PlatformAdapterKook) Serve() int {
 		pa.EndPoint.Session.Execute(pa.EndPoint, msg, false)
 	})
 	s.AddHandler(func(ctx *kook.MessageDeleteContext) {
+		defer pa.recoverKookEvent(log, "MessageDelete")
 		msg := new(Message)
 		msg.Time = ctx.Common.MsgTimestamp
 		msg.RawID = ctx.Extra.MsgID
@@ -243,6 +265,7 @@ func (pa *PlatformAdapterKook) Serve() int {
 	})
 
 	s.AddHandler(func(ctx *kook.BotJoinContext) {
+		defer pa.recoverKookEvent(log, "BotJoin")
 		msg := new(Message)
 		msg.Time = ctx.Common.MsgTimestamp
 		msg.RawID = ctx.Common.MsgID
@@ -319,6 +342,7 @@ func (pa *PlatformAdapterKook) Serve() int {
 	})
 
 	s.AddHandler(func(ctx *kook.MessageUpdateContext) {
+		defer pa.recoverKookEvent(log, "MessageUpdate")
 		msg := new(Message)
 		msg.Time = ctx.Extra.UpdatedAt.ToTime().Unix() // secs
 		msg.RawID = ctx.Extra.MsgID
@@ -351,7 +375,14 @@ func (pa *PlatformAdapterKook) Serve() int {
 	go pa.updateGameStatus()
 	pa.EndPoint.State = 1
 	pa.EndPoint.Enable = true
-	self, _ := s.UserMe()
+	self, err := s.UserMe()
+	if err != nil || self == nil {
+		log.Errorf("获取KOOK账号信息失败:%v", err)
+		_ = s.Close()
+		pa.IntentSession = nil
+		pa.EndPoint.State = 3
+		return 1
+	}
 	pa.EndPoint.Nickname = self.Nickname
 	pa.EndPoint.UserID = FormatDiceIDKook(self.ID)
 	log.Infof("KOOK 连接成功，账号<%s>(%s)", pa.EndPoint.Nickname, pa.EndPoint.UserID)
@@ -542,6 +573,9 @@ func (pa *PlatformAdapterKook) RecallMessage(ctx *MsgContext, msgID string) {
 func (pa *PlatformAdapterKook) SendFileToChannelRaw(id string, path string, private bool) (*kook.MessageResp, error) {
 	log := zap.S().Named(logger.LogKeyAdapter)
 	bot := pa.IntentSession
+	if bot == nil {
+		return nil, fmt.Errorf("KOOK 会话未建立")
+	}
 	e, err := message.FilepathToFileElement(path)
 	if err != nil {
 		log.Errorf("向Kook频道#%s发送文件[path=%s]时出错:%s", id, path, err)
@@ -594,6 +628,9 @@ func (pa *PlatformAdapterKook) SendFileToChannelRaw(id string, path string, priv
 func (pa *PlatformAdapterKook) SendToChannelRaw(id string, text string, private bool) (*kook.MessageResp, error) {
 	log := zap.S().Named(logger.LogKeyAdapter)
 	bot := pa.IntentSession
+	if bot == nil {
+		return nil, fmt.Errorf("KOOK 会话未建立")
+	}
 	elem := message.ConvertStringMessage(text)
 	// var err error
 	streamToByte := func(stream io.Reader) []byte {
@@ -718,6 +755,9 @@ func antiMarkdownFormat(text string) string {
 
 func (pa *PlatformAdapterKook) MessageCreateRaw(base kook.MessageCreateBase, id string, isPrivate bool) (*kook.MessageResp, error) {
 	bot := pa.IntentSession
+	if bot == nil {
+		return nil, fmt.Errorf("KOOK 会话未建立")
+	}
 	if isPrivate {
 		resp, err := bot.DirectMessageCreate(&kook.DirectMessageCreate{ChatCode: id, MessageCreateBase: base})
 		return resp, err

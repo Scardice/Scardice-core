@@ -39,6 +39,7 @@ func doReq[T any](c *PublicDiceClient, method string, path string, data any, par
 type Endpoint struct {
 	Platform  string `json:"platform"  msgpack:",omitempty"`
 	UID       string `json:"uid"       msgpack:",omitempty"`
+	AppID     string `json:"appId,omitempty" msgpack:",omitempty"`
 	InviteURL string `json:"inviteUrl" msgpack:",omitempty"`
 	IsOnline  bool   `json:"isOnline"  msgpack:",omitempty"`
 
@@ -151,6 +152,7 @@ type TickUpdateRequest struct {
 // TickEndpoint 公骰心跳端点信息
 type TickEndpoint struct {
 	UID      string `json:"uid"      msgpack:",omitempty"`
+	AppID    string `json:"appId,omitempty" msgpack:",omitempty"`
 	IsOnline bool   `json:"isOnline" msgpack:",omitempty"`
 }
 
