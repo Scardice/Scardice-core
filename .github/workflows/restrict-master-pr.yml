@@ -1,0 +1,66 @@
+
+name: 限制 master 分支 PR
+
+# 当 PR 创建、重新打开、修改或更新时触发
+on:
+  pull_request_target:
+    types: [opened, reopened, edited, synchronize]
+    # 只检查目标分支为 master 的 PR
+    branches:
+      - master
+
+# 授予评论和关闭 PR 的权限
+permissions:
+  pull-requests: write
+
+jobs:
+  check-author:
+    name: 检查 PR 作者权限
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 验证组织成员身份
+        uses: actions/github-script@v9
+        with:
+          script: |
+            // 获取 PR 的基本信息
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            const author = pr.user.login;
+            const pull_number = pr.number;
+
+            // 读取作者身份信息
+            const association = pr.author_association;
+
+            // 只允许组织成员和仓库所有者
+            const allowed = ['MEMBER', 'OWNER'];
+
+            if (allowed.includes(association)) {
+              core.info(`允许 PR：${author} (${association})`);
+              return;
+            }
+
+            // 无权限用户提交的 PR 添加说明评论
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: pull_number,
+              body: [
+                '此 PR 已被自动关闭。',
+                '',
+                '只有组织成员才能向 `master` 分支提交 PR。',
+                '',
+                '请将目标分支修改为 `dev`，',
+                '或联系维护者申请组织成员资格。'
+              ].join('\n')
+            });
+
+            // 自动关闭不符合要求的 PR
+            await github.rest.pulls.update({
+              owner,
+              repo,
+              pull_number,
+              state: 'closed'
+            });
+
+            core.info(`已关闭未授权 PR #${pull_number}`);
