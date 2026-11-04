@@ -30,3 +30,5 @@
 *.a binary
 *.o binary
 *.syso binary
+
+.github/workflows/*.lock.yml linguist-generated=true
