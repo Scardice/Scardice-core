@@ -1,21 +1,33 @@
 package dice
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	ds "github.com/sealdice/dicescript"
+	"go.uber.org/zap"
 	"gorm.io/gorm"
 
+	"Scardice-core/logger"
 	"Scardice-core/model"
 	"Scardice-core/utils/constant"
 	"Scardice-core/utils/dboperator/engine"
 )
+
+// errOfficialQQIdentityTargetExists 表示目标 ID 已存在。
+// 单条冲突不应回滚整批迁移；调用方会保留旧记录并继续。
+var errOfficialQQIdentityTargetExists = errors.New("official qq identity migration target already exists")
+
+// errOfficialQQAttrsNotMergeable 表示该属性行在语义上无法合并（绑卡/非 user 类型），
+// 调用方应保留旧行继续，而不是让整个事务回滚。数据损坏等可修复问题仍返回普通错误。
+var errOfficialQQAttrsNotMergeable = errors.New("official qq attrs row is not mergeable")
 
 type officialQQIdentityMigration struct {
 	appID          string
@@ -25,6 +37,8 @@ type officialQQIdentityMigration struct {
 	groups         map[string]string
 	users          map[string]string
 	characterNames map[string]string
+	// logNames 记录因 (group_id,name) 冲突而重命名的旧日志，key 为 oldGroupID+"\x00"+oldName。
+	logNames map[string]string
 }
 
 const officialQQIdentityMigrationBatchSize = 200
@@ -80,6 +94,13 @@ func migratedCharacterName(baseName string, suffix int) string {
 }
 
 func ensureOfficialQQIdentity(d *Dice, pa *PlatformAdapterOfficialQQ, botID, uin string) error {
+	return ensureOfficialQQIdentityWithMigration(d, pa, botID, uin, true)
+}
+
+// ensureOfficialQQIdentityWithMigration 在 allowMigration=false 时只写入运行时身份，
+// 把旧数据迁移延后到下一次连接。用于旧 handler 未能及时停止的场合，避免迁移与
+// handler 并发修改同一批内存/数据库状态。
+func ensureOfficialQQIdentityWithMigration(d *Dice, pa *PlatformAdapterOfficialQQ, botID, uin string, allowMigration bool) error {
 	if d == nil || pa == nil || pa.EndPoint == nil {
 		return errors.New("QQ 官方机器人运行时未初始化")
 	}
@@ -89,25 +110,59 @@ func ensureOfficialQQIdentity(d *Dice, pa *PlatformAdapterOfficialQQ, botID, uin
 
 	expectedEndpoint := formatDiceIDOfficialQQ(uin)
 	oldEndpoint := formatDiceIDOfficialQQ(botID)
-	if current := pa.EndPoint.UserID; current != "" && current != oldEndpoint && current != expectedEndpoint {
-		return fmt.Errorf("无法识别旧账号 ID %q，期望 %q", current, oldEndpoint)
+	pa.sessionMu.Lock()
+	currentEndpoint := pa.EndPoint.UserID
+	pa.sessionMu.Unlock()
+	if currentEndpoint != "" && currentEndpoint != oldEndpoint && currentEndpoint != expectedEndpoint {
+		return fmt.Errorf("无法识别旧账号 ID %q，期望 %q", currentEndpoint, oldEndpoint)
 	}
 	// The verified runtime identity is required even when the optional legacy
 	// data migration is disabled or fails.
-	pa.UIN = uin
+	pa.setUIN(uin)
+	pa.sessionMu.Lock()
 	pa.EndPoint.UserID = expectedEndpoint
+	pa.sessionMu.Unlock()
 
-	if d.Config.OfficialQQMigrationEnable {
+	if allowMigration && d.Config.OfficialQQMigrationEnable {
 		migration := &officialQQIdentityMigration{
-			appID:       pa.AppID.String(),
+			appID:       pa.getAppID().String(),
 			uin:         uin,
 			oldEndpoint: oldEndpoint,
 			newEndpoint: expectedEndpoint,
 			groups:      map[string]string{},
 			users:       map[string]string{},
+			logNames:    map[string]string{},
+		}
+		// fix5 的冲突策略会故意保留一部分旧行；如果每次连接都据此重跑全量迁移，
+		// 会给大库带来明显的启动开销并反复输出冲突告警。这里记录“剩余旧行数量
+		// + 主键集合哈希”，两者都不变时只做内存合并和角色卡缓存同步。
+		if d.DBOperator != nil && pa.getMigrationState() != "" {
+			if count, fingerprint, err := migration.legacyRowFingerprint(d.DBOperator); err == nil &&
+				pa.getMigrationState() == migration.stateValue(count, fingerprint) {
+				if d.AttrsManager != nil {
+					if err := d.AttrsManager.CheckForSave(); err != nil {
+						return fmt.Errorf("迁移前保存属性数据失败: %w", err)
+					}
+				}
+				if err := migration.syncCharacterCache(d, d.DBOperator); err != nil {
+					return &officialQQIdentityMigrationError{cause: fmt.Errorf("同步角色卡缓存失败: %w", err)}
+				}
+				migration.collectMemory(d)
+				migration.migrateMemory(d)
+				d.LastUpdatedTime = time.Now().Unix()
+				d.Save(false)
+				return nil
+			}
 		}
 		if err := migration.run(d); err != nil {
 			return &officialQQIdentityMigrationError{cause: err}
+		}
+		if d.DBOperator != nil {
+			if count, fingerprint, err := migration.legacyRowFingerprint(d.DBOperator); err == nil {
+				pa.setMigrationState(migration.stateValue(count, fingerprint))
+			} else {
+				pa.setMigrationState("")
+			}
 		}
 	}
 
@@ -350,16 +405,134 @@ func hasTable(db *gorm.DB, value any) bool {
 	return db != nil && db.Migrator().HasTable(value)
 }
 
-func (m *officialQQIdentityMigration) shouldRunIdentityMigration(operator engine.DatabaseOperator) (bool, error) {
+func (m *officialQQIdentityMigration) stateKey() string {
+	return m.appID + "\x00" + m.uin + "\x00" + m.oldEndpoint
+}
+
+func (m *officialQQIdentityMigration) stateValue(count int64, fingerprint string) string {
+	return m.stateKey() + "|" + strconv.FormatInt(count, 10) + "|" + fingerprint
+}
+
+// legacyRowFingerprint 统计旧行数量并对其主键集合做哈希。
+// 仅用数量会在“删一条、加一条”时误判为已完成迁移；主键集合哈希能
+// 在同样的扫描成本下准确识别行集合变化。
+func (m *officialQQIdentityMigration) legacyRowFingerprint(operator engine.DatabaseOperator) (int64, string, error) {
+	type probe struct {
+		name    string
+		query   *gorm.DB
+		column  string
+		numeric bool
+	}
+	groupPrefix, groupUpperBound := m.oldGroupBounds()
+	memberPrefix, memberUpperBound := m.oldMemberBounds()
+
+	var probes []probe
+	dataDB := operator.GetDataDB(constant.READ)
+	if dataDB != nil && hasTable(dataDB, &model.GroupInfo{}) {
+		probes = append(probes, probe{
+			name:   "group_info",
+			query:  dataDB.Model(&model.GroupInfo{}).Where("id >= ? AND id < ?", groupPrefix, groupUpperBound).Order("id"),
+			column: "id",
+		})
+	}
+	logDB := operator.GetLogDB(constant.READ)
+	if logDB != nil && hasTable(logDB, &model.LogInfo{}) {
+		probes = append(probes, probe{
+			name:    "log_info",
+			query:   logDB.Model(&model.LogInfo{}).Where("group_id >= ? AND group_id < ?", groupPrefix, groupUpperBound).Order("id"),
+			column:  "id",
+			numeric: true,
+		})
+	}
+	if logDB != nil && hasTable(logDB, &model.LogOneItem{}) {
+		probes = append(probes, probe{
+			name:    "log_one_item",
+			query:   logDB.Model(&model.LogOneItem{}).Where("group_id >= ? AND group_id < ?", groupPrefix, groupUpperBound).Order("id"),
+			column:  "id",
+			numeric: true,
+		})
+	}
+	if dataDB != nil && hasTable(dataDB, &model.GroupPlayerInfoBase{}) {
+		probes = append(probes, probe{
+			name:    "group_player_info",
+			query:   dataDB.Model(&model.GroupPlayerInfoBase{}).Where("group_id >= ? AND group_id < ?", groupPrefix, groupUpperBound).Order("id"),
+			column:  "id",
+			numeric: true,
+		})
+	}
+	if dataDB != nil && hasTable(dataDB, &model.AttributesItemModel{}) {
+		probes = append(probes, probe{
+			name:   "attributes",
+			query:  m.legacyAttrsQuery(dataDB.Model(&model.AttributesItemModel{})).Order("id"),
+			column: "id",
+		})
+	}
+	if dataDB != nil && hasTable(dataDB, &model.BanInfo{}) {
+		probes = append(probes, probe{
+			name: "ban_info",
+			query: dataDB.Model(&model.BanInfo{}).Where(
+				"(id >= ? AND id < ?) OR (id >= ? AND id < ?)",
+				groupPrefix, groupUpperBound, memberPrefix, memberUpperBound,
+			).Order("id"),
+			column: "id",
+		})
+	}
+	if dataDB != nil && hasTable(dataDB, &model.EndpointInfo{}) {
+		probes = append(probes, probe{
+			name:   "endpoint_info",
+			query:  dataDB.Model(&model.EndpointInfo{}).Where("user_id = ?", m.oldEndpoint).Order("user_id"),
+			column: "user_id",
+		})
+	}
+	censorDB := operator.GetCensorDB(constant.READ)
+	if censorDB != nil && hasTable(censorDB, &model.CensorLog{}) {
+		probes = append(probes, probe{
+			name:    "censor_log",
+			query:   censorDB.Model(&model.CensorLog{}).Where("group_id >= ? AND group_id < ?", groupPrefix, groupUpperBound).Order("id"),
+			column:  "id",
+			numeric: true,
+		})
+	}
+
+	var total int64
+	hash := sha256.New()
+	for _, item := range probes {
+		var ids []string
+		if item.numeric {
+			var numericIDs []int64
+			if err := item.query.Pluck(item.column, &numericIDs).Error; err != nil {
+				return 0, "", err
+			}
+			ids = make([]string, 0, len(numericIDs))
+			for _, id := range numericIDs {
+				ids = append(ids, strconv.FormatInt(id, 10))
+			}
+		} else if err := item.query.Pluck(item.column, &ids).Error; err != nil {
+			return 0, "", err
+		}
+		sort.Strings(ids)
+		total += int64(len(ids))
+		_, _ = hash.Write([]byte(item.name))
+		_, _ = hash.Write([]byte{0})
+		for _, id := range ids {
+			_, _ = hash.Write([]byte(id))
+			_, _ = hash.Write([]byte{0})
+		}
+	}
+	return total, fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+// legacyRowCount 统计各表中仍带旧身份前缀的行数。
+// shouldRunIdentityMigration 只关心“是否大于 0”，而迁移完成标记需要精确数量。
+func (m *officialQQIdentityMigration) legacyRowCount(operator engine.DatabaseOperator) (int64, error) {
 	groupPrefix, groupUpperBound := m.oldGroupBounds()
 	memberPrefix, memberUpperBound := m.oldMemberBounds()
 
 	probes := []*gorm.DB{}
 	dataDB := operator.GetDataDB(constant.READ)
 	if !hasTable(dataDB, &model.GroupInfo{}) {
-		// Without group_info the optimized database probe cannot rule out
-		// legacy identities held only in memory, so preserve the full fallback.
-		return true, nil
+		// 无法用数据库探测排除仅存在于内存中的旧身份，返回非零强制走一次完整流程。
+		return 1, nil
 	}
 	probes = append(probes, dataDB.Model(&model.GroupInfo{}).Where("id >= ? AND id < ?", groupPrefix, groupUpperBound))
 
@@ -395,17 +568,24 @@ func (m *officialQQIdentityMigration) shouldRunIdentityMigration(operator engine
 		probes = append(probes, censorDB.Model(&model.CensorLog{}).Where("group_id >= ? AND group_id < ?", groupPrefix, groupUpperBound))
 	}
 
+	var total int64
 	for _, probe := range probes {
-		var found int
-		result := officialQQIdentityMigrationWithoutCache(probe).Select("1").Limit(1).Scan(&found)
+		var count int64
+		result := officialQQIdentityMigrationWithoutCache(probe).Count(&count)
 		if result.Error != nil {
-			return false, result.Error
+			return 0, result.Error
 		}
-		if result.RowsAffected != 0 {
-			return true, nil
-		}
+		total += count
 	}
-	return false, nil
+	return total, nil
+}
+
+func (m *officialQQIdentityMigration) shouldRunIdentityMigration(operator engine.DatabaseOperator) (bool, error) {
+	count, err := m.legacyRowCount(operator)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 func (m *officialQQIdentityMigration) collectDatabase(operator engine.DatabaseOperator) error {
@@ -583,9 +763,42 @@ func ensureNoTarget(db *gorm.DB, value any, where string, args ...any) error {
 		return err
 	}
 	if count != 0 {
-		return fmt.Errorf("目标数据已存在: %s %v", where, args)
+		return fmt.Errorf("%w: %s %v", errOfficialQQIdentityTargetExists, where, args)
 	}
 	return nil
+}
+
+func logOfficialQQIdentityConflict(kind string, oldID any, newID string) {
+	zap.S().Named(logger.LogKeyAdapter).Warnf(
+		"official qq identity migration: %s %v -> %s already exists, keep old row and continue",
+		kind, oldID, newID,
+	)
+}
+
+func logOfficialQQIdentityMergeSkipped(target string, err error) {
+	zap.S().Named(logger.LogKeyAdapter).Warnf(
+		"official qq identity migration: merge attrs %s failed, keep old rows and continue: %v",
+		target, err,
+	)
+}
+
+// uniqueOfficialQQLogName 为冲突日志生成一个在新群组内唯一的名称，
+// 让旧日志仍能在新群组下被 .log list 访问，而不是永久留在旧 ID 下。
+func uniqueOfficialQQLogName(tx *gorm.DB, groupID, name string) (string, error) {
+	for suffix := 1; suffix <= 1000; suffix++ {
+		candidate := name + " (旧)"
+		if suffix > 1 {
+			candidate = fmt.Sprintf("%s (旧 %d)", name, suffix)
+		}
+		var count int64
+		if err := tx.Model(&model.LogInfo{}).Where("group_id = ? AND name = ?", groupID, candidate).Count(&count).Error; err != nil {
+			return "", err
+		}
+		if count == 0 {
+			return candidate, nil
+		}
+	}
+	return fmt.Sprintf("%s (旧 %d)", name, time.Now().UnixNano()), nil
 }
 
 func (m *officialQQIdentityMigration) legacyAttrsQuery(db *gorm.DB) *gorm.DB {
@@ -625,10 +838,10 @@ func mergeOfficialQQUserAttrs(tx *gorm.DB, rows []model.AttributesItemModel) (mo
 	updatedAt := ordered[0].UpdatedAt
 	for _, row := range ordered {
 		if row.AttrsType != "" && row.AttrsType != "user" {
-			return model.AttributesItemModel{}, fmt.Errorf("无法合并 QQ 官方用户属性 %s: attrs_type=%q", row.Id, row.AttrsType)
+			return model.AttributesItemModel{}, fmt.Errorf("%w: 属性 %s attrs_type=%q", errOfficialQQAttrsNotMergeable, row.Id, row.AttrsType)
 		}
 		if row.BindingSheetId != "" {
-			return model.AttributesItemModel{}, fmt.Errorf("无法合并带角色绑定的 QQ 官方用户属性 %s", row.Id)
+			return model.AttributesItemModel{}, fmt.Errorf("%w: 属性 %s 带有角色绑定", errOfficialQQAttrsNotMergeable, row.Id)
 		}
 		if row.CreatedAt < createdAt {
 			createdAt = row.CreatedAt
@@ -741,6 +954,12 @@ func (m *officialQQIdentityMigration) mergeCollidingUserAttrs(tx *gorm.DB) error
 
 		merged, err := mergeOfficialQQUserAttrs(tx, sources)
 		if err != nil {
+			if errors.Is(err, errOfficialQQAttrsNotMergeable) {
+				// 绑卡/非 user 类型的单条冲突保留旧行，不影响其他表和其他行。
+				logOfficialQQIdentityMergeSkipped(target, err)
+				continue
+			}
+			// 数据损坏/解析失败通常是可修复问题，保持事务回滚，下次连接重试。
 			return err
 		}
 		merged.Id = target
@@ -880,6 +1099,58 @@ func (m *officialQQIdentityMigration) planCharacterNames(tx *gorm.DB) (map[strin
 	return renames, nil
 }
 
+func mergeOfficialQQPlayerRows(target, source model.GroupPlayerInfoBase) model.GroupPlayerInfoBase {
+	if target.Name == "" {
+		target.Name = source.Name
+	}
+	if target.AutoSetNameTemplate == "" {
+		target.AutoSetNameTemplate = source.AutoSetNameTemplate
+	}
+	if target.DiceSideNum == 0 {
+		target.DiceSideNum = source.DiceSideNum
+	}
+	if source.LastCommandTime > target.LastCommandTime {
+		target.LastCommandTime = source.LastCommandTime
+	}
+	if target.CreatedAt == 0 || (source.CreatedAt != 0 && source.CreatedAt < target.CreatedAt) {
+		target.CreatedAt = source.CreatedAt
+	}
+	if source.UpdatedAt > target.UpdatedAt {
+		target.UpdatedAt = source.UpdatedAt
+	}
+	return target
+}
+
+// mergeGroupIntoExisting 把旧 group_info 行合并进已存在的新行，然后删除旧行。
+func (m *officialQQIdentityMigration) mergeGroupIntoExisting(tx *gorm.DB, oldRow model.GroupInfo, newID string) error {
+	var targetRow model.GroupInfo
+	result := tx.Select("id, data").Where("id = ?", newID).Limit(1).Find(&targetRow)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("目标群组 %s 不存在", newID)
+	}
+	var oldGroup, targetGroup GroupInfo
+	if err := json.Unmarshal(oldRow.Data, &oldGroup); err != nil {
+		return fmt.Errorf("解析旧群组 %s 失败: %w", oldRow.ID, err)
+	}
+	if err := json.Unmarshal(targetRow.Data, &targetGroup); err != nil {
+		return fmt.Errorf("解析目标群组 %s 失败: %w", newID, err)
+	}
+	m.migrateGroup(&oldGroup, oldRow.ID)
+	targetGroup.GroupID = newID
+	mergeOfficialQQGroupMemory(&targetGroup, &oldGroup, nil)
+	data, err := json.Marshal(&targetGroup)
+	if err != nil {
+		return err
+	}
+	if err := tx.Model(&model.GroupInfo{}).Where("id = ?", newID).Update("data", data).Error; err != nil {
+		return err
+	}
+	return tx.Where("id = ?", oldRow.ID).Delete(&model.GroupInfo{}).Error
+}
+
 func (m *officialQQIdentityMigration) migrateDataDB(operator engine.DatabaseOperator) error {
 	db := operator.GetDataDB(constant.WRITE)
 	if db == nil {
@@ -897,6 +1168,15 @@ func (m *officialQQIdentityMigration) migrateDataDB(operator engine.DatabaseOper
 							continue
 						}
 						if err := ensureNoTarget(tx, &model.GroupInfo{}, "id = ?", newID); err != nil {
+							if errors.Is(err, errOfficialQQIdentityTargetExists) {
+								// 新旧群组同时存在：把旧群组的设置/扩展并入规范 ID 下的新群组，
+								// 再删除旧行，避免旧数据永久不可达。
+								if mergeErr := m.mergeGroupIntoExisting(tx, row, newID); mergeErr != nil {
+									return mergeErr
+								}
+								logOfficialQQIdentityConflict("group_info (merged)", row.ID, newID)
+								continue
+							}
 							return err
 						}
 						var group GroupInfo
@@ -927,6 +1207,39 @@ func (m *officialQQIdentityMigration) migrateDataDB(operator engine.DatabaseOper
 					for _, row := range rows {
 						newGroupID := m.migrateGroupID(row.GroupID)
 						newUserID := m.migrateContextUserID(row.GroupID, row.UserID)
+						if newGroupID == row.GroupID && newUserID == row.UserID {
+							continue
+						}
+						// group_player_info 有 (group_id,user_id) 唯一索引。目标行已存在时
+						// 不能直接 UPDATE；按玩家合并后删除旧行，保留两边较新的数据。
+						var target model.GroupPlayerInfoBase
+						targetResult := tx.Where("group_id = ? AND user_id = ?", newGroupID, newUserID).Limit(1).Find(&target)
+						if targetResult.Error != nil {
+							return targetResult.Error
+						}
+						if targetResult.RowsAffected != 0 {
+							var oldPlayer model.GroupPlayerInfoBase
+							if loadErr := tx.Where("id = ?", row.ID).Limit(1).Find(&oldPlayer).Error; loadErr != nil {
+								return loadErr
+							}
+							merged := mergeOfficialQQPlayerRows(target, oldPlayer)
+							updates := map[string]any{
+								"name":                   merged.Name,
+								"last_command_time":      merged.LastCommandTime,
+								"auto_set_name_template": merged.AutoSetNameTemplate,
+								"dice_side_num":          merged.DiceSideNum,
+								"created_at":             merged.CreatedAt,
+								"updated_at":             merged.UpdatedAt,
+							}
+							if updateErr := tx.Model(&model.GroupPlayerInfoBase{}).Where("id = ?", target.ID).Updates(updates).Error; updateErr != nil {
+								return updateErr
+							}
+							if deleteErr := tx.Where("id = ?", row.ID).Delete(&model.GroupPlayerInfoBase{}).Error; deleteErr != nil {
+								return deleteErr
+							}
+							logOfficialQQIdentityConflict("group_player_info (merged)", row.ID, fmt.Sprintf("%s/%s", newGroupID, newUserID))
+							continue
+						}
 						if err := tx.Model(&model.GroupPlayerInfoBase{}).Where("id = ?", row.ID).Updates(map[string]any{"group_id": newGroupID, "user_id": newUserID}).Error; err != nil {
 							return err
 						}
@@ -959,6 +1272,10 @@ func (m *officialQQIdentityMigration) migrateDataDB(operator engine.DatabaseOper
 						}
 						if newID != row.Id {
 							if targetErr := ensureNoTarget(tx, &model.AttributesItemModel{}, "id = ?", newID); targetErr != nil {
+								if errors.Is(targetErr, errOfficialQQIdentityTargetExists) {
+									logOfficialQQIdentityConflict("attributes", row.Id, newID)
+									continue
+								}
 								return targetErr
 							}
 						}
@@ -1108,6 +1425,24 @@ func (m *officialQQIdentityMigration) migrateLogDB(operator engine.DatabaseOpera
 					for _, row := range rows {
 						newGroupID := m.migrateGroupID(row.GroupID)
 						if err := ensureNoTarget(tx, &model.LogInfo{}, "group_id = ? AND name = ?", newGroupID, row.Name); err != nil {
+							if errors.Is(err, errOfficialQQIdentityTargetExists) {
+								newName, nameErr := uniqueOfficialQQLogName(tx, newGroupID, row.Name)
+								if nameErr != nil {
+									return nameErr
+								}
+								if m.logNames == nil {
+									m.logNames = map[string]string{}
+								}
+								m.logNames[row.GroupID+"\x00"+row.Name] = newName
+								if updateErr := tx.Model(&model.LogInfo{}).Where("id = ?", row.ID).Updates(map[string]any{
+									"group_id": newGroupID,
+									"name":     newName,
+								}).Error; updateErr != nil {
+									return updateErr
+								}
+								logOfficialQQIdentityConflict("log_info (renamed)", row.ID, newGroupID)
+								continue
+							}
 							return err
 						}
 						if err := tx.Model(&model.LogInfo{}).Where("id = ?", row.ID).UpdateColumn("group_id", newGroupID).Error; err != nil {
@@ -1201,6 +1536,9 @@ func (m *officialQQIdentityMigration) migrateGroup(group *GroupInfo, oldGroupID 
 		return
 	}
 	group.GroupID = m.migrateGroupID(oldGroupID)
+	if newName, ok := m.logNames[oldGroupID+"\x00"+group.LogCurName]; ok {
+		group.LogCurName = newName
+	}
 	group.GuildID = m.migrateAnyID(group.GuildID)
 	group.ChannelID = m.migrateAnyID(group.ChannelID)
 	group.InviteUserID = m.migrateContextUserID(oldGroupID, group.InviteUserID)
@@ -1378,6 +1716,220 @@ func mergeOfficialQQAttrItems(target, source *AttributesItem) *AttributesItem {
 	return newer
 }
 
+// mergeOfficialQQGroupMemory 把旧群组对象并入已存在的新群组对象。
+// 以新对象（规范 ID 下的现网数据）为主，只补齐缺失字段和玩家，避免旧对象整体覆盖新对象。
+func mergeOfficialQQGroupMemory(target, source *GroupInfo, d *Dice) bool {
+	if target == nil || source == nil || target == source {
+		return false
+	}
+	changed := false
+	if target.GroupName == "" && source.GroupName != "" {
+		target.GroupName = source.GroupName
+		changed = true
+	}
+	if target.GuildID == "" && source.GuildID != "" {
+		target.GuildID = source.GuildID
+		changed = true
+	}
+	if target.ChannelID == "" && source.ChannelID != "" {
+		target.ChannelID = source.ChannelID
+		changed = true
+	}
+	if target.InviteUserID == "" && source.InviteUserID != "" {
+		target.InviteUserID = source.InviteUserID
+		changed = true
+	}
+	if target.EnteredTime == 0 && source.EnteredTime != 0 {
+		target.EnteredTime = source.EnteredTime
+		changed = true
+	}
+	if target.DiceSideNum == 0 && source.DiceSideNum != 0 {
+		target.DiceSideNum = source.DiceSideNum
+		changed = true
+	}
+	if target.DiceSideExpr == "" && source.DiceSideExpr != "" {
+		target.DiceSideExpr = source.DiceSideExpr
+		changed = true
+	}
+	if target.System == "" && source.System != "" {
+		target.System = source.System
+		changed = true
+	}
+	if target.DefaultHelpGroup == "" && source.DefaultHelpGroup != "" {
+		target.DefaultHelpGroup = source.DefaultHelpGroup
+		changed = true
+	}
+	if target.ExtAppliedVersion == 0 && source.ExtAppliedVersion != 0 {
+		target.ExtAppliedVersion = source.ExtAppliedVersion
+		changed = true
+	}
+	// 这些群设置同样只存在于旧群时会被删除；补齐零值字段，避免迁移后
+	// 群失去启用状态、欢迎语、帮助包、COC 规则或日志开关。
+	if !target.Active && source.Active {
+		target.Active = true
+		changed = true
+	}
+	if !target.ShowGroupWelcome && source.ShowGroupWelcome {
+		target.ShowGroupWelcome = true
+		changed = true
+	}
+	if target.GroupWelcomeMessage == "" && source.GroupWelcomeMessage != "" {
+		target.GroupWelcomeMessage = source.GroupWelcomeMessage
+		changed = true
+	}
+	if target.CocRuleIndex == 0 && source.CocRuleIndex != 0 {
+		target.CocRuleIndex = source.CocRuleIndex
+		changed = true
+	}
+	if len(source.HelpPackages) > 0 {
+		merged := appendUniqueStrings(append([]string(nil), target.HelpPackages...), source.HelpPackages...)
+		if len(merged) != len(target.HelpPackages) {
+			target.HelpPackages = merged
+			changed = true
+		}
+	}
+	if !target.LogOn && source.LogOn {
+		target.LogOn = true
+		changed = true
+	}
+	if target.LogCurName == "" && source.LogCurName != "" {
+		target.LogCurName = source.LogCurName
+		changed = true
+	}
+	if target.LogCurID == 0 && source.LogCurID != 0 {
+		target.LogCurID = source.LogCurID
+		changed = true
+	}
+	if source.RecentDiceSendTime > target.RecentDiceSendTime {
+		target.RecentDiceSendTime = source.RecentDiceSendTime
+		changed = true
+	}
+	if target.Players == nil {
+		target.Players = new(SyncMap[string, *GroupPlayerInfo])
+	}
+	if source.Players != nil {
+		source.Players.Range(func(userID string, player *GroupPlayerInfo) bool {
+			if player == nil {
+				return true
+			}
+			current, ok := target.Players.Load(userID)
+			if !ok || current == nil {
+				target.Players.Store(userID, player)
+				changed = true
+				return true
+			}
+			if current == player {
+				return true
+			}
+			if player.LastCommandTime > current.LastCommandTime || player.UpdatedAtTime > current.UpdatedAtTime {
+				if player.Name == "" {
+					player.Name = current.Name
+				}
+				if player.AutoSetNameTemplate == "" {
+					player.AutoSetNameTemplate = current.AutoSetNameTemplate
+				}
+				if player.DiceSideNum == 0 {
+					player.DiceSideNum = current.DiceSideNum
+				}
+				target.Players.Store(userID, player)
+				changed = true
+			}
+			return true
+		})
+	}
+	if target.PlayerGroups == nil {
+		target.PlayerGroups = new(SyncMap[string, []string])
+	}
+	if source.PlayerGroups != nil {
+		source.PlayerGroups.Range(func(key string, values []string) bool {
+			current, ok := target.PlayerGroups.Load(key)
+			if !ok {
+				target.PlayerGroups.Store(key, append([]string(nil), values...))
+				changed = true
+				return true
+			}
+			merged := appendUniqueStrings(append([]string(nil), current...), values...)
+			if len(merged) != len(current) {
+				target.PlayerGroups.Store(key, merged)
+				changed = true
+			}
+			return true
+		})
+	}
+	if target.DiceIDActiveMap == nil {
+		target.DiceIDActiveMap = new(SyncMap[string, bool])
+	}
+	if target.DiceIDExistsMap == nil {
+		target.DiceIDExistsMap = new(SyncMap[string, bool])
+	}
+	if target.BotList == nil {
+		target.BotList = new(SyncMap[string, bool])
+	}
+	mergeBool := func(dst **SyncMap[string, bool], src *SyncMap[string, bool]) {
+		if src == nil {
+			return
+		}
+		src.Range(func(key string, value bool) bool {
+			if value {
+				if current, exists := (*dst).Load(key); !exists || !current {
+					(*dst).Store(key, true)
+					changed = true
+				}
+				return true
+			}
+			if _, exists := (*dst).Load(key); !exists {
+				(*dst).Store(key, false)
+				changed = true
+			}
+			return true
+		})
+	}
+	mergeBool(&target.DiceIDActiveMap, source.DiceIDActiveMap)
+	mergeBool(&target.DiceIDExistsMap, source.DiceIDExistsMap)
+	mergeBool(&target.BotList, source.BotList)
+	if target.InactivatedExtSet == nil {
+		target.InactivatedExtSet = StringSet{}
+	}
+	for name, value := range source.InactivatedExtSet {
+		if _, exists := target.InactivatedExtSet[name]; !exists {
+			target.InactivatedExtSet[name] = value
+			changed = true
+		}
+	}
+	// 旧群已启用的扩展也一并并入新群，避免迁移后扩展被静默关闭。
+	targetExts := target.GetActivatedExtListRaw()
+	sourceExts := source.GetActivatedExtListRaw()
+	if len(sourceExts) > 0 {
+		seen := make(map[string]struct{}, len(targetExts))
+		for _, ext := range targetExts {
+			if ext != nil {
+				seen[ext.Name] = struct{}{}
+			}
+		}
+		merged := append([]*ExtInfo(nil), targetExts...)
+		extChanged := false
+		for _, ext := range sourceExts {
+			if ext == nil {
+				continue
+			}
+			if _, exists := seen[ext.Name]; exists {
+				continue
+			}
+			seen[ext.Name] = struct{}{}
+			merged = append(merged, ext)
+			extChanged = true
+		}
+		if extChanged {
+			target.SetActivatedExtList(merged, d)
+			changed = true
+		}
+	}
+	if changed {
+		target.MarkDirty(d)
+	}
+	return changed
+}
+
 func (m *officialQQIdentityMigration) migrateMemory(d *Dice) {
 	if d.ImSession != nil && d.ImSession.ServiceAtNew != nil {
 		type groupEntry struct {
@@ -1393,8 +1945,15 @@ func (m *officialQQIdentityMigration) migrateMemory(d *Dice) {
 		})
 		for _, item := range groups {
 			m.migrateGroup(item.group, item.old)
+			newID := m.groups[item.old]
 			d.ImSession.ServiceAtNew.Delete(item.old)
-			d.ImSession.ServiceAtNew.Store(m.groups[item.old], item.group)
+			// fix5 的冲突策略会让旧、新群组同时存在；此时旧对象不能整体覆盖新对象，
+			// 只把旧对象中缺失的玩家/映射并入规范 ID 下的新对象。
+			if existing, ok := d.ImSession.ServiceAtNew.Load(newID); ok && existing != nil && existing != item.group {
+				mergeOfficialQQGroupMemory(existing, item.group, d)
+				continue
+			}
+			d.ImSession.ServiceAtNew.Store(newID, item.group)
 		}
 	}
 	if d.ImSession != nil && d.ImSession.PendingQuits != nil {

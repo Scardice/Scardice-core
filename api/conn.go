@@ -1055,7 +1055,7 @@ func ImConnectionsAddOfficialQQ(c echo.Context) error {
 	}
 
 	userID := "OpenQQ:" + probe.UIN
-	existingEndpoint := dice.FindOfficialQQEndpointByUIN(myDice.ImSession, probe.UIN, "")
+	existingEndpoint := dice.FindOfficialQQEndpointByUINOrBotID(myDice.ImSession, probe.UIN, probe.BotID, "")
 	if v.TestOnly {
 		result := Response{
 			"testOnly": true,

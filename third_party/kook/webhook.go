@@ -74,7 +74,7 @@ func (s *Session) WebhookHandler() http.HandlerFunc {
 			buf.ReadFrom(payloadReader)
 			dec.CryptBlocks(buf.Bytes(), buf.Bytes())
 		}
-		e, err := s.onEvent(websocket.TextMessage, buf.Bytes())
+		e, err := s.onEvent(nil, websocket.TextMessage, buf.Bytes())
 		if err == errWebhookVerify {
 			i := &struct {
 				Type        int    `json:"type"`

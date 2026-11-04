@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"gorm.io/driver/sqlite"
+	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
@@ -165,6 +165,11 @@ func openOfficialQQIdentityJournalTestDB(t *testing.T, path string) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open temp journal: %v", err)
 	}
+	t.Cleanup(func() {
+		if sqlDB, err := db.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
 	return db
 }
 

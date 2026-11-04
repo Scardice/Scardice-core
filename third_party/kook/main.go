@@ -15,7 +15,7 @@ func New(token string, l Logger, o ...SessionOption) (s *Session) {
 		RetryTimeout: 60 * time.Second,
 		ContentType:  "application/json",
 		Logger:       l,
-		snStore:      newBloomSnStore(),
+		inFlight:     make(map[int64]struct{}),
 		Sync:         true,
 		closedCh:     make(chan struct{}),
 	}

@@ -54,7 +54,7 @@ func (i *AtInfo) CopyCtx(ctx *MsgContext) (*MsgContext, bool) {
 		officialQQUIN := ""
 		if ctx.EndPoint != nil {
 			if pa, ok := ctx.EndPoint.Adapter.(*PlatformAdapterOfficialQQ); ok {
-				officialQQUIN = pa.UIN
+				officialQQUIN = pa.getUIN()
 				// 官方 QQ 的 @ 仅提供 MemberOpenID；人物卡则以
 				// OpenQQ:<UIN>-<MemberOpenID> 为键，代骰时必须先补全身份。
 				playerUserID = normalizeDiceIDOfficialQQMentionUserID(officialQQUIN, playerUserID)
@@ -778,10 +778,10 @@ func AtParse(cmd string, prefix string) (string, []*AtInfo) {
 	switch prefix {
 	case "QQ":
 		re = regexp.MustCompile(`\[CQ:at,qq=(\d+)(?:,name=(?:.*?))?\]`)
-	case "OpenQQ":
+	case "OpenQQ", "OpenQQCH":
+		// 官方 QQ 群聊/频道都可能使用 <qqbot-at-user id="..."/>，
+		// 同时兼容旧的 <@...> 格式。
 		re = officialQQAtRegex
-	case "OpenQQCH":
-		re = regexp.MustCompile(`<@!?(\S+?)>`)
 	case "DISCORD":
 		re = regexp.MustCompile(`<@(\d+?)>`)
 	case "KOOK":
@@ -801,7 +801,7 @@ func AtParse(cmd string, prefix string) (string, []*AtInfo) {
 	for _, i := range m {
 		if len(i) >= 2 {
 			target := i[1]
-			if prefix == "OpenQQ" {
+			if prefix == "OpenQQ" || prefix == "OpenQQCH" {
 				target = officialQQMentionTarget(i)
 			}
 			if target != "" {

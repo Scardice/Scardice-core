@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -221,27 +222,29 @@ type EventSignal int8
 
 // All event signal consts.
 const (
-	EventSignalEvent EventSignal = iota
-	EventSignalHello
-	EventSignalPing
-	EventSignalPong
-	EventSignalReconnect EventSignal = iota + 1
-	EventSignalResumeAck
+	EventSignalEvent     EventSignal = 0
+	EventSignalHello     EventSignal = 1
+	EventSignalPing      EventSignal = 2
+	EventSignalPong      EventSignal = 3
+	EventSignalResume    EventSignal = 4
+	EventSignalReconnect EventSignal = 5
+	EventSignalResumeAck EventSignal = 6
 )
 
 // EventStatusCode is the type for various event status code.
 type EventStatusCode int
 
-// EventStatusCode consts for event status
+// EventStatusCode consts for event status.
+// Keep these values in sync with the KOOK WebSocket documentation.
 const (
-	EventStatusOk              EventStatusCode = 0
-	EventStatusMissingArgument EventStatusCode = 40100 + iota
-	EventStatusInvalidToken
-	EventStatusTokenAuthFailed
-	EventStatusTokenExpired
-	EventStatusResumeFailed EventStatusCode = 40100 + 2 + iota
-	EventStatusSessionExpired
-	EventStatusInvalidSequenceNumber
+	EventStatusOk                    EventStatusCode = 0
+	EventStatusMissingArgument       EventStatusCode = 40100
+	EventStatusInvalidToken          EventStatusCode = 40101
+	EventStatusTokenAuthFailed       EventStatusCode = 40102
+	EventStatusTokenExpired          EventStatusCode = 40103
+	EventStatusResumeFailed          EventStatusCode = 40106
+	EventStatusSessionExpired        EventStatusCode = 40107
+	EventStatusInvalidSequenceNumber EventStatusCode = 40108
 )
 
 // EventDataHello is the struct for the data of event hello
@@ -278,22 +281,58 @@ type Session struct {
 	ContentType       string
 	Logger            Logger
 	Sync              bool
+	// FatalHandler 在后台重连遇到不可恢复的认证/会话错误时回调。
+	// 由上层适配器回置端点在线状态；必须通过 SetFatalHandler 设置。
+	FatalHandler func(error)
+	// ReconnectHandler 在后台 resume/重连成功后回调，用于把端点从
+	// “连接中”恢复为“已连接”。必须通过 SetReconnectHandler 设置。
+	ReconnectHandler func()
 
 	wsConn  *websocket.Conn
 	wsMutex sync.Mutex
-	gateway string
-	// sessionID string
+	// openMu 串行化 Open/reconnect 的建连过程，避免两个并发建连互相重置 sn 状态。
+	openMu    sync.Mutex
+	gateway   string
+	sessionID string
 	sequence  *int64
 	listening chan interface{}
+
+	// lastConnectAt 用于限制“握手成功后立刻断开”的重连频率。
+	lastConnectAt time.Time
+
+	// sessionEpoch 在每次非 resume 建连、resume 状态被丢弃或 Close 时递增。
+	// 事件处理协程用它丢弃旧会话的迟到回调。
+	// 使用 atomic.Uint64 而不是裸 uint64：32 位平台（386/arm）也能保证 8 字节对齐。
+	sessionEpoch atomic.Uint64
+	dispatcher   *eventDispatcher
+
+	// eventMu 保护 inFlight。
+	eventMu  sync.Mutex
+	inFlight map[int64]struct{}
+
+	// handlerMu 跨 dispatcher 串行化 handler。
+	// 重连/Close 时旧 dispatcher 可能还有 handler 未结束，新 dispatcher 不能与它并发执行。
+	handlerMu sync.Mutex
+	// externalHandlerMu 由适配器注入，跨 Session 串行化 handler。
+	// 禁用后立即启用会创建新 Session，仅靠 Session 内的 handlerMu 无法阻止
+	// 旧 Session 的迟到 handler 与新 Session 并发修改同一份骰子数据。
+	externalHandlerMu *sync.Mutex
+
+	// snPersist 在 sn 前进后回调，用于把 resume 快照刷到磁盘。
+	snPersistMu sync.RWMutex
+	snPersist   func()
 
 	closed       bool
 	closedCh     chan struct{}
 	reconnecting bool
+	reconnectSeq uint64
+
+	// resyncMu 保护强制重同步节流，避免 handler 卡死时形成连接风暴。
+	resyncMu         sync.Mutex
+	lastForcedResync time.Time
 
 	handlersMu sync.RWMutex
 	handlers   map[string][]*eventHandlerInstance
-
-	snStore SnStore
 }
 
 // EventDataGeneral is the struct passed to all event handler.
@@ -337,6 +376,14 @@ type EndpointGeneralResponse struct {
 }
 
 const heartbeatInterval = time.Second * 30
+
+const (
+	// minStableConnection 内的连接被视为短命连接，重连前会补足等待时间，
+	// 避免网关“接受握手后立即断开”时形成无退避的重连风暴。
+	minStableConnection = 5 * time.Second
+	// heartbeatJitter 是 KOOK 文档要求的 30s + rand(-5,5) 抖动。
+	heartbeatJitter = 5 * time.Second
+)
 
 // MessageReaction is the struct for reactions embedded to a message.
 type MessageReaction struct {

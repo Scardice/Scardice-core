@@ -1243,7 +1243,9 @@ func (d *Dice) registerCoreCommands() {
 				}
 
 				if kw = cmdArgs.GetKwarg("now"); kw != nil {
-					doRelogin()
+					// 在事件 handler 内同步 DoRelogin 会等待当前 handler 自己退出
+					// （KOOK/官方 QQ 都有 2 秒完成窗口），固定延迟并产生误导性告警。
+					go doRelogin()
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 

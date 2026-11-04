@@ -1251,7 +1251,7 @@ func publicDiceEndpointAppID(endpoint *EndPointInfo) string {
 	if !ok || adapter == nil {
 		return ""
 	}
-	return adapter.AppID.String()
+	return adapter.getAppID().String()
 }
 
 func (d *Dice) PublicDiceSetup() {

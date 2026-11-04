@@ -67,20 +67,22 @@ func TestOfficialQQOtherMentionIsStillDelegateTarget(t *testing.T) {
 func TestAtParseOfficialQQMentionTags(t *testing.T) {
 	t.Parallel()
 
-	for _, tc := range []struct {
-		name string
-		text string
-		want string
-	}{
-		{name: "qqbot tag", text: `<qqbot-at-user id="bot-open-id" /> .r`, want: "OpenQQ:bot-open-id"},
-		{name: "legacy tag", text: `<@!member-open-id> .r`, want: "OpenQQ:member-open-id"},
-	} {
-		remaining, at := AtParse(tc.text, "OpenQQ")
-		if len(at) != 1 || at[0].UserID != tc.want {
-			t.Fatalf("%s: At = %#v, want %s", tc.name, at, tc.want)
-		}
-		if !strings.Contains(remaining, ".r") {
-			t.Fatalf("%s: remaining text = %q", tc.name, remaining)
+	for _, prefix := range []string{"OpenQQ", "OpenQQCH"} {
+		for _, tc := range []struct {
+			name string
+			text string
+			want string
+		}{
+			{name: "qqbot tag", text: `<qqbot-at-user id="bot-open-id" /> .r`, want: prefix + ":bot-open-id"},
+			{name: "legacy tag", text: `<@!member-open-id> .r`, want: prefix + ":member-open-id"},
+		} {
+			remaining, at := AtParse(tc.text, prefix)
+			if len(at) != 1 || at[0].UserID != tc.want {
+				t.Fatalf("%s %s: At = %#v, want %s", prefix, tc.name, at, tc.want)
+			}
+			if !strings.Contains(remaining, ".r") {
+				t.Fatalf("%s %s: remaining text = %q", prefix, tc.name, remaining)
+			}
 		}
 	}
 }

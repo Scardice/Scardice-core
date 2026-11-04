@@ -11,12 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -124,8 +126,11 @@ type PlatformAdapterOfficialQQ struct {
 	Ctx            context.Context      `json:"-" yaml:"-"`
 	CancelFunc     context.CancelFunc   `json:"-" yaml:"-"`
 	sessionMu      sync.Mutex           `json:"-" yaml:"-"`
-	tokenSource    oauth2.TokenSource   `json:"-" yaml:"-"`
-	botID          string               `json:"-" yaml:"-"`
+	// connectMu 串行化 connect 的凭据切换/身份迁移，避免旧 connect 被取消后
+	// 仍在迁移时与下一轮 connect 并发修改同一批数据。
+	connectMu   sync.Mutex         `json:"-" yaml:"-"`
+	tokenSource oauth2.TokenSource `json:"-" yaml:"-"`
+	botID       string             `json:"-" yaml:"-"`
 
 	// Webhook服务
 	webhookMu     sync.Mutex   `json:"-" yaml:"-"`
@@ -147,6 +152,317 @@ type PlatformAdapterOfficialQQ struct {
 	c2cSendQuota   *OfficialQQSendQuota `json:"-" yaml:"-"`
 	groupSendQuota *OfficialQQSendQuota `json:"-" yaml:"-"`
 	sendQuotaOnce  sync.Once            `json:"-" yaml:"-"`
+
+	// 官方 QQ 事件串行队列；webhook 模式下 botgo 会并发回调事件。
+	eventQueueMu        sync.Mutex            `json:"-" yaml:"-"`
+	eventQueue          *officialQQEventQueue `json:"-" yaml:"-"`
+	eventQueueAccepting bool                  `json:"-" yaml:"-"`
+
+	// eventExecMu 跨队列串行化 handler 执行。
+	// 重连/重登时旧队列可能仍有 handler 未结束，新队列不能与它并发修改骰子状态。
+	eventExecMu sync.Mutex `json:"-" yaml:"-"`
+
+	// runtimeMu 保护 AppID/AppSecret/UIN/botID/Api/tokenSource。
+	// 这些字段会在重登/扫码时被写，而旧 handler 可能仍在读。
+	runtimeMu sync.RWMutex `json:"-" yaml:"-"`
+
+	// IdentityMigrationState 记录“这组剩余冲突行已经处理过”，
+	// 避免 fix5 的冲突保留策略导致每次连接都重跑全量迁移。
+	IdentityMigrationState string `json:"-" yaml:"identityMigrationState,omitempty"`
+
+	// serveMu 保护 DiceServing 与重试循环代次。
+	serveMu    sync.Mutex    `json:"-" yaml:"-"`
+	serveEpoch uint64        `json:"-" yaml:"-"`
+	serveStop  chan struct{} `json:"-" yaml:"-"`
+}
+
+func (pa *PlatformAdapterOfficialQQ) getAppID() OfficialQQAppID {
+	pa.runtimeMu.RLock()
+	defer pa.runtimeMu.RUnlock()
+	return pa.AppID
+}
+
+func (pa *PlatformAdapterOfficialQQ) setAppID(value OfficialQQAppID) {
+	pa.runtimeMu.Lock()
+	pa.AppID = value
+	pa.runtimeMu.Unlock()
+}
+
+func (pa *PlatformAdapterOfficialQQ) getAppSecret() string {
+	pa.runtimeMu.RLock()
+	defer pa.runtimeMu.RUnlock()
+	return pa.AppSecret
+}
+
+func (pa *PlatformAdapterOfficialQQ) setAppSecret(value string) {
+	pa.runtimeMu.Lock()
+	pa.AppSecret = value
+	pa.runtimeMu.Unlock()
+}
+
+func (pa *PlatformAdapterOfficialQQ) getUIN() string {
+	pa.runtimeMu.RLock()
+	defer pa.runtimeMu.RUnlock()
+	return pa.UIN
+}
+
+func (pa *PlatformAdapterOfficialQQ) setUIN(value string) {
+	pa.runtimeMu.Lock()
+	pa.UIN = value
+	pa.runtimeMu.Unlock()
+}
+
+func (pa *PlatformAdapterOfficialQQ) getBotID() string {
+	pa.runtimeMu.RLock()
+	defer pa.runtimeMu.RUnlock()
+	return pa.botID
+}
+
+func (pa *PlatformAdapterOfficialQQ) setBotID(value string) {
+	pa.runtimeMu.Lock()
+	pa.botID = value
+	pa.runtimeMu.Unlock()
+}
+
+func (pa *PlatformAdapterOfficialQQ) getAPI() qqapi.OpenAPI {
+	pa.runtimeMu.RLock()
+	defer pa.runtimeMu.RUnlock()
+	return pa.Api
+}
+
+func (pa *PlatformAdapterOfficialQQ) setAPI(value qqapi.OpenAPI) {
+	pa.runtimeMu.Lock()
+	pa.Api = value
+	pa.runtimeMu.Unlock()
+}
+
+func (pa *PlatformAdapterOfficialQQ) getTokenSource() oauth2.TokenSource {
+	pa.runtimeMu.RLock()
+	defer pa.runtimeMu.RUnlock()
+	return pa.tokenSource
+}
+
+func (pa *PlatformAdapterOfficialQQ) setTokenSource(value oauth2.TokenSource) {
+	pa.runtimeMu.Lock()
+	pa.tokenSource = value
+	pa.runtimeMu.Unlock()
+}
+
+func (pa *PlatformAdapterOfficialQQ) getMigrationState() string {
+	pa.runtimeMu.RLock()
+	defer pa.runtimeMu.RUnlock()
+	return pa.IdentityMigrationState
+}
+
+func (pa *PlatformAdapterOfficialQQ) setMigrationState(value string) {
+	pa.runtimeMu.Lock()
+	pa.IdentityMigrationState = value
+	pa.runtimeMu.Unlock()
+}
+
+func (pa *PlatformAdapterOfficialQQ) isDiceServing() bool {
+	pa.serveMu.Lock()
+	defer pa.serveMu.Unlock()
+	return pa.DiceServing
+}
+
+func (pa *PlatformAdapterOfficialQQ) setDiceServing(value bool) {
+	pa.serveMu.Lock()
+	pa.DiceServing = value
+	pa.serveMu.Unlock()
+}
+
+func (pa *PlatformAdapterOfficialQQ) setDiceServingIfEpoch(value bool, epoch uint64) bool {
+	pa.serveMu.Lock()
+	defer pa.serveMu.Unlock()
+	if pa.serveEpoch != epoch {
+		return false
+	}
+	pa.DiceServing = value
+	return true
+}
+
+// beginServeLoop 开始一轮 Serve 重试循环；旧的循环会收到停止信号。
+func (pa *PlatformAdapterOfficialQQ) beginServeLoop() (uint64, <-chan struct{}) {
+	pa.serveMu.Lock()
+	defer pa.serveMu.Unlock()
+	if pa.serveStop != nil {
+		close(pa.serveStop)
+	}
+	pa.serveEpoch++
+	pa.serveStop = make(chan struct{})
+	return pa.serveEpoch, pa.serveStop
+}
+
+// cancelServeLoop 用于用户禁用/重登，确保正在退避的重试循环不会把端点重新拉起来。
+func (pa *PlatformAdapterOfficialQQ) cancelServeLoop() {
+	pa.serveMu.Lock()
+	if pa.serveStop != nil {
+		close(pa.serveStop)
+		pa.serveStop = nil
+	}
+	pa.serveEpoch++
+	pa.serveMu.Unlock()
+}
+
+func (pa *PlatformAdapterOfficialQQ) serveLoopCurrent(epoch uint64, stop <-chan struct{}) bool {
+	pa.serveMu.Lock()
+	defer pa.serveMu.Unlock()
+	if pa.serveEpoch != epoch {
+		return false
+	}
+	select {
+	case <-stop:
+		return false
+	default:
+		return true
+	}
+}
+
+// stopSessionLocked 在持有 sessionMu 时清理会话上下文和事件队列。
+func (pa *PlatformAdapterOfficialQQ) stopSessionLocked() (context.CancelFunc, *officialQQEventQueue) {
+	cancel := pa.CancelFunc
+	pa.Ctx, pa.CancelFunc = nil, nil
+	pa.eventQueueMu.Lock()
+	queue := pa.eventQueue
+	pa.eventQueueAccepting = false
+	pa.eventQueueMu.Unlock()
+	return cancel, queue
+}
+
+func (pa *PlatformAdapterOfficialQQ) closeStoppedSession(cancel context.CancelFunc, queue *officialQQEventQueue) {
+	if cancel != nil {
+		cancel()
+	}
+	if queue != nil {
+		queue.Close()
+	}
+}
+
+// failSessionIfCurrent 原子地确认会话所有权，然后回置失败态并关闭本次会话的队列。
+func (pa *PlatformAdapterOfficialQQ) failSessionIfCurrent(ctx context.Context) bool {
+	pa.sessionMu.Lock()
+	if ctx == nil || pa.Ctx != ctx {
+		pa.sessionMu.Unlock()
+		return false
+	}
+	if ep := pa.EndPoint; ep != nil {
+		ep.State = StateConnectionFailed
+		ep.Enable = false
+	}
+	cancel, queue := pa.stopSessionLocked()
+	pa.sessionMu.Unlock()
+	pa.closeStoppedSession(cancel, queue)
+	return true
+}
+
+// finishSessionIfCurrent 用于 WS manager 退出：只有仍属于当前会话且处于在线/连接中时才回置失败。
+func (pa *PlatformAdapterOfficialQQ) finishSessionIfCurrent(ctx context.Context) bool {
+	pa.sessionMu.Lock()
+	if ctx == nil || pa.Ctx != ctx {
+		pa.sessionMu.Unlock()
+		return false
+	}
+	if ep := pa.EndPoint; ep != nil && (ep.State == StateConnected || ep.State == StateConnecting) {
+		ep.State = StateConnectionFailed
+		ep.Enable = false
+	}
+	cancel, queue := pa.stopSessionLocked()
+	pa.sessionMu.Unlock()
+	pa.closeStoppedSession(cancel, queue)
+	return true
+}
+
+// canSend 在 sessionMu 内读取 Enable/State，避免禁用/重登时读到半更新状态。
+func (pa *PlatformAdapterOfficialQQ) canSend() bool {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	return pa.EndPoint != nil && pa.EndPoint.Enable && pa.EndPoint.State == StateConnected
+}
+
+// identitySnapshot 返回当前端点身份快照，供发送消息时填充 Sender。
+func (pa *PlatformAdapterOfficialQQ) identitySnapshot() (string, string) {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	if pa.EndPoint == nil {
+		return "", ""
+	}
+	return pa.EndPoint.UserID, pa.EndPoint.Nickname
+}
+
+func (pa *PlatformAdapterOfficialQQ) senderUserID() string {
+	id, _ := pa.identitySnapshot()
+	return id
+}
+
+func (pa *PlatformAdapterOfficialQQ) senderNickname() string {
+	_, nickname := pa.identitySnapshot()
+	return nickname
+}
+
+// setEndpointIdentityIfCurrent 只在当前会话仍属于 ctx 时写端点身份，
+// 避免旧 connect/扫码协程覆盖新会话的 UIN、昵称。
+func (pa *PlatformAdapterOfficialQQ) setEndpointIdentityIfCurrent(ctx context.Context, userID, nickname string) bool {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	if ctx == nil || pa.Ctx != ctx {
+		return false
+	}
+	if ep := pa.EndPoint; ep != nil {
+		ep.UserID = userID
+		ep.Nickname = nickname
+	}
+	return true
+}
+
+// setStateIfCurrent 只在当前会话仍属于 ctx 时写端点状态。
+func (pa *PlatformAdapterOfficialQQ) setStateIfCurrent(ctx context.Context, enable bool, state EndpointState) bool {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	if ctx == nil || pa.Ctx != ctx {
+		return false
+	}
+	if ep := pa.EndPoint; ep != nil {
+		ep.Enable = enable
+		ep.State = state
+	}
+	return true
+}
+
+// setEndpointStateIfIdle 用于在没有新会话接管时回置状态（例如扫码失败）。
+func (pa *PlatformAdapterOfficialQQ) setEndpointStateIfIdle(enable bool, state EndpointState) bool {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	if pa.Ctx != nil {
+		return false
+	}
+	if ep := pa.EndPoint; ep != nil {
+		ep.Enable = enable
+		ep.State = state
+	}
+	return true
+}
+
+func (pa *PlatformAdapterOfficialQQ) setEndpointState(enable bool, state EndpointState) {
+	pa.sessionMu.Lock()
+	if ep := pa.EndPoint; ep != nil {
+		ep.Enable = enable
+		ep.State = state
+	}
+	pa.sessionMu.Unlock()
+}
+
+func (pa *PlatformAdapterOfficialQQ) setEndpointStateForCurrent(enable bool, state EndpointState) bool {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	if pa.Ctx == nil {
+		return false
+	}
+	if ep := pa.EndPoint; ep != nil {
+		ep.Enable = enable
+		ep.State = state
+	}
+	return true
 }
 
 type officialQQAdapterJSON struct {
@@ -165,9 +481,9 @@ func (pa *PlatformAdapterOfficialQQ) MarshalJSON() ([]byte, error) {
 	qrLoginState := pa.QrLoginState
 	pa.qrMu.Unlock()
 	return json.Marshal(officialQQAdapterJSON{
-		AppID:               pa.AppID,
-		UIN:                 pa.UIN,
-		AppSecretConfigured: strings.TrimSpace(pa.AppSecret) != "",
+		AppID:               pa.getAppID(),
+		UIN:                 pa.getUIN(),
+		AppSecretConfigured: strings.TrimSpace(pa.getAppSecret()) != "",
 		OnlyQQGuild:         pa.OnlyQQGuild,
 		UseWebhook:          pa.UseWebhook,
 		WebhookPath:         pa.WebhookPath,
@@ -315,21 +631,48 @@ func ProbeOfficialQQAccount(ctx context.Context, appID, appSecret string) (*Offi
 	return botInfo, nil
 }
 
-// FindOfficialQQEndpointByUIN 按 UIN 查找已存在的官方 QQ 连接；excludeID 非空时排除自身
+// FindOfficialQQEndpointByUIN 按 UIN 查找已存在的官方 QQ 连接；excludeID 非空时排除自身。
+// 旧端点可能还没有 UIN，调用方应优先使用 FindOfficialQQEndpointByUINOrBotID。
 func FindOfficialQQEndpointByUIN(s *IMSession, uin, excludeID string) *EndPointInfo {
+	return FindOfficialQQEndpointByUINOrBotID(s, uin, "", excludeID)
+}
+
+// FindOfficialQQEndpointByUINOrBotID 同时按新 UIN 和旧 botID 查找端点，
+// 避免旧端点（UserID=OpenQQ:<botID>、adapter.UIN 为空）漏过重复检查。
+func FindOfficialQQEndpointByUINOrBotID(s *IMSession, uin, botID, excludeID string) *EndPointInfo {
 	if s == nil {
 		return nil
 	}
-	userID := formatDiceIDOfficialQQ(strings.TrimSpace(uin))
-	if userID == formatDiceIDOfficialQQ("") {
+	uin = strings.TrimSpace(uin)
+	botID = strings.TrimSpace(botID)
+	wanted := map[string]struct{}{}
+	if uin != "" {
+		wanted[formatDiceIDOfficialQQ(uin)] = struct{}{}
+	}
+	if botID != "" {
+		wanted[formatDiceIDOfficialQQ(botID)] = struct{}{}
+	}
+	if len(wanted) == 0 {
 		return nil
 	}
 	for _, endpoint := range s.EndPoints {
 		if endpoint == nil {
 			continue
 		}
-		if endpoint.Platform == "QQ" && endpoint.ProtocolType == "official" && endpoint.UserID == userID && endpoint.ID != excludeID {
+		if endpoint.Platform != "QQ" || endpoint.ProtocolType != "official" || endpoint.ID == excludeID {
+			continue
+		}
+		if _, ok := wanted[endpoint.UserID]; ok {
 			return endpoint
+		}
+		// 旧端点可能还保存着 OpenQQ:<botID>，在完成身份迁移前按 adapter 字段兜底。
+		if adapter, ok := endpoint.Adapter.(*PlatformAdapterOfficialQQ); ok && adapter != nil {
+			if uin != "" && strings.TrimSpace(adapter.getUIN()) == uin {
+				return endpoint
+			}
+			if botID != "" && strings.TrimSpace(adapter.getBotID()) == botID {
+				return endpoint
+			}
 		}
 	}
 	return nil
@@ -344,20 +687,29 @@ func replaceOfficialQQCredentials(existing *EndPointInfo, source *PlatformAdapte
 		return nil, errors.New("official qq existing endpoint adapter is invalid")
 	}
 
-	existingUIN := strings.TrimSpace(adapter.UIN)
+	existingUIN := strings.TrimSpace(adapter.getUIN())
+	legacyBotID := false
 	if existingUIN == "" {
 		existingUIN, _ = extractOfficialQQUINFromUserID(existing.UserID)
+		// 旧版本端点保存的是 OpenQQ:<botID>，不是 OpenQQ:<UIN>。
+		// 扫码替换必须先认这个格式，否则老用户升级后无法用扫码重绑。
+		if existingUIN != "" && strings.TrimSpace(probe.BotID) != "" &&
+			existingUIN == strings.TrimSpace(probe.BotID) {
+			legacyBotID = true
+		}
 	}
-	if existingUIN != "" && existingUIN != strings.TrimSpace(probe.UIN) {
+	if !legacyBotID && existingUIN != "" && existingUIN != strings.TrimSpace(probe.UIN) {
 		return nil, fmt.Errorf("official qq existing endpoint UIN mismatch: existing=%s scanned=%s", existingUIN, probe.UIN)
 	}
 
-	adapter.AppID = OfficialQQAppID(source.AppID.String())
-	adapter.AppSecret = strings.TrimSpace(source.AppSecret)
-	adapter.UIN = strings.TrimSpace(probe.UIN)
-	adapter.botID = strings.TrimSpace(probe.BotID)
-	existing.UserID = formatDiceIDOfficialQQ(adapter.UIN)
+	adapter.setAppID(OfficialQQAppID(source.getAppID().String()))
+	adapter.setAppSecret(strings.TrimSpace(source.getAppSecret()))
+	adapter.setUIN(strings.TrimSpace(probe.UIN))
+	adapter.setBotID(strings.TrimSpace(probe.BotID))
+	adapter.sessionMu.Lock()
+	existing.UserID = formatDiceIDOfficialQQ(adapter.getUIN())
 	existing.Nickname = probe.Nickname
+	adapter.sessionMu.Unlock()
 	return adapter, nil
 }
 
@@ -365,10 +717,12 @@ func (pa *PlatformAdapterOfficialQQ) applyProbeResult(probe *OfficialQQAccountPr
 	if probe == nil || pa.EndPoint == nil {
 		return
 	}
-	pa.UIN = strings.TrimSpace(probe.UIN)
-	pa.botID = strings.TrimSpace(probe.BotID)
-	pa.EndPoint.UserID = formatDiceIDOfficialQQ(pa.UIN)
+	pa.setUIN(strings.TrimSpace(probe.UIN))
+	pa.setBotID(strings.TrimSpace(probe.BotID))
+	pa.sessionMu.Lock()
+	pa.EndPoint.UserID = formatDiceIDOfficialQQ(pa.getUIN())
 	pa.EndPoint.Nickname = probe.Nickname
+	pa.sessionMu.Unlock()
 }
 
 // beginSession 原子地占用会话上下文，避免 Serve 被并发调用时启动两套连接。
@@ -394,25 +748,45 @@ func (pa *PlatformAdapterOfficialQQ) isCurrentSession(ctx context.Context) bool 
 	return pa.Ctx == ctx
 }
 
-// stopSessionContext 幂等地停止当前会话；取消函数在锁外调用，避免回调路径互相等待。
-func (pa *PlatformAdapterOfficialQQ) stopSessionContext() {
+func (pa *PlatformAdapterOfficialQQ) currentSessionContext() context.Context {
 	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	return pa.Ctx
+}
+
+// stopSessionContextIf 只在当前会话仍等于 expected 时停止它。
+// 用户快速禁用/启用时，旧调用不能取消刚刚接管的新会话。
+func (pa *PlatformAdapterOfficialQQ) stopSessionContextIf(expected context.Context) bool {
+	pa.sessionMu.Lock()
+	if pa.Ctx != expected {
+		pa.sessionMu.Unlock()
+		return false
+	}
 	cancel := pa.CancelFunc
-	pa.Ctx = nil
-	pa.CancelFunc = nil
+	pa.Ctx, pa.CancelFunc = nil, nil
 	pa.sessionMu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
+	return true
 }
 
-func (pa *PlatformAdapterOfficialQQ) failConnect() int {
-	ep := pa.EndPoint
-	if ep != nil {
-		ep.State = 3
+// stopSessionContext 停止当前会话；仅用于确实需要无条件清理的路径。
+// 调用方若持有旧会话引用，应优先使用 stopSessionContextIf。
+func (pa *PlatformAdapterOfficialQQ) stopSessionContext() {
+	pa.stopSessionContextIf(pa.currentSessionContext())
+}
+
+func (pa *PlatformAdapterOfficialQQ) failConnect(ctx context.Context) int {
+	// 启动期间用户可能禁用/重登；旧 connect 协程不能回置新会话的状态或关掉新队列。
+	// failSessionIfCurrent 在 sessionMu 内完成“确认所有权 + 停止 + 取队列”，
+	// 避免 check 之后、stop 之前被新会话插入。
+	if !pa.failSessionIfCurrent(ctx) {
+		return 0
 	}
-	pa.stopSessionContext()
+	pa.sessionMu.Lock()
 	pa.SessionManager = nil
+	pa.sessionMu.Unlock()
 	// 仅扫码流程需要同步更新二维码状态，避免普通重连误标 Failed
 	pa.qrMu.Lock()
 	isQrFlow := pa.QrLoginState == OfficialQQLoginStateConnecting ||
@@ -425,12 +799,11 @@ func (pa *PlatformAdapterOfficialQQ) failConnect() int {
 }
 
 func (pa *PlatformAdapterOfficialQQ) Serve() int {
-	ep := pa.EndPoint
 	log := pa.EndPoint.Session.Parent.Logger
 
-	pa.AppID = OfficialQQAppID(pa.AppID.String())
-	pa.AppSecret = strings.TrimSpace(pa.AppSecret)
-	pa.UIN = strings.TrimSpace(pa.UIN)
+	pa.setAppID(OfficialQQAppID(pa.getAppID().String()))
+	pa.setAppSecret(strings.TrimSpace(pa.getAppSecret()))
+	pa.setUIN(strings.TrimSpace(pa.getUIN()))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	if !pa.beginSession(ctx, cancel) {
@@ -441,8 +814,8 @@ func (pa *PlatformAdapterOfficialQQ) Serve() int {
 
 	// AppID 为空时进入扫码登录：异步生成二维码并轮询，
 	// 扫码成功后探测凭据、检查重复账号，再启动连接
-	if pa.AppID.String() == "" {
-		ep.State = 2
+	if pa.getAppID().String() == "" {
+		pa.setStateIfCurrent(ctx, true, StateConnecting)
 		log.Info("official qq AppID 为空，进入扫码登录流程")
 		pa.serveQrLogin(ctx, "sealdice")
 		return 0
@@ -451,24 +824,51 @@ func (pa *PlatformAdapterOfficialQQ) Serve() int {
 	return pa.connect(ctx, nil)
 }
 
+// normalizeOfficialQQWebhookConfig 校验并规范化 webhook 路径/端口。
+// http.ServeMux.Handle 对非法 pattern 会直接 panic，必须在建连前拦截，
+// 否则管理员把 webhookPath 写成 "webhook"（少斜杠）就会让整个进程退出。
+func normalizeOfficialQQWebhookConfig(path string, port int) (string, int, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = "/webhook"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if port == 0 {
+		port = 8099
+	}
+	if port < 1 || port > 65535 {
+		return "", 0, fmt.Errorf("webhook 端口越界: %d", port)
+	}
+	if err := validateServeMuxPattern(path); err != nil {
+		return "", 0, err
+	}
+	return path, port, nil
+}
+
+// validateServeMuxPattern 用真实 ServeMux 校验 pattern，并捕获其 panic。
+// 这样既兼容 Go 1.22+ 的新 pattern 语法，也不会把进程带崩。
+func validateServeMuxPattern(pattern string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("非法的 webhook 路径 %q: %v", pattern, r)
+		}
+	}()
+	mux := http.NewServeMux()
+	mux.Handle(pattern, http.NotFoundHandler())
+	return nil
+}
+
 // connect 建立正式连接。probe 非空时复用探测结果，避免重复拉取机器人信息。
 // 调用方需确保 AppID/AppSecret 已就绪；ctx 为空时（扫码完成后）自行创建会话上下文。
 func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *OfficialQQAccountProbeResult) int {
+	pa.connectMu.Lock()
+	defer pa.connectMu.Unlock()
+
 	ep := pa.EndPoint
 	log := ep.Session.Parent.Logger
 	d := ep.Session.Parent
-	pa.AppID = OfficialQQAppID(pa.AppID.String())
-	pa.AppSecret = strings.TrimSpace(pa.AppSecret)
-	pa.UIN = strings.TrimSpace(pa.UIN)
-
-	log.Debug("official qq server")
-	qqbot.SetLogger(NewDummyLogger())
-
-	// 初始化OAuth2 token source
-	pa.tokenSource = qqtoken.NewQQBotTokenSource(&qqtoken.QQBotCredentials{
-		AppID:     pa.AppID.String(),
-		AppSecret: pa.AppSecret,
-	})
 
 	if ctx == nil {
 		newCtx, cancel := context.WithCancel(context.Background())
@@ -478,46 +878,93 @@ func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *Officia
 		}
 		ctx = newCtx
 	}
-
-	// 启动 token 自动刷新
-	if err := qqtoken.StartRefreshAccessToken(ctx, pa.tokenSource); err != nil {
-		log.Error("official qq 启动 token 刷新失败: ", err)
-		return pa.failConnect()
+	if !pa.isCurrentSession(ctx) {
+		return 0
 	}
 
-	pa.Api = qqbot.NewOpenAPI(pa.AppID.String(), pa.tokenSource).WithTimeout(officialQQAPITimeout)
+	if pa.UseWebhook {
+		path, port, err := normalizeOfficialQQWebhookConfig(pa.WebhookPath, pa.WebhookPort)
+		if err != nil {
+			log.Errorf("official qq webhook 配置无效: %v", err)
+			return pa.failConnect(ctx)
+		}
+		pa.WebhookPath = path
+		pa.WebhookPort = port
+	}
+
+	// 旧 handler 可能仍在读 AppID/API/UIN 或修改群状态。必须先静默旧队列，
+	// 再切换运行时凭据/API 并做身份迁移；超时则跳过迁移。
+	quiesced := pa.quiesceOfficialQQEventQueue(2 * time.Second)
+	if !quiesced {
+		log.Warn("official qq old event handler is still running; identity migration deferred to next connection")
+	}
+
+	pa.setAppID(OfficialQQAppID(pa.getAppID().String()))
+	pa.setAppSecret(strings.TrimSpace(pa.getAppSecret()))
+	pa.setUIN(strings.TrimSpace(pa.getUIN()))
+	pa.setTokenSource(qqtoken.NewQQBotTokenSource(&qqtoken.QQBotCredentials{
+		AppID:     pa.getAppID().String(),
+		AppSecret: pa.getAppSecret(),
+	}))
+
+	// 启动 token 自动刷新
+	if err := qqtoken.StartRefreshAccessToken(ctx, pa.getTokenSource()); err != nil {
+		log.Error("official qq 启动 token 刷新失败: ", err)
+		return pa.failConnect(ctx)
+	}
+
+	pa.setAPI(qqbot.NewOpenAPI(pa.getAppID().String(), pa.getTokenSource()).WithTimeout(officialQQAPITimeout))
 
 	botInfo := probe
 	if botInfo == nil {
 		var err error
-		botInfo, err = getOfficialQQBotInfo(ctx, pa.Api)
+		botInfo, err = getOfficialQQBotInfo(ctx, pa.getAPI())
 		if err != nil {
 			log.Error("official qq 获取机器人信息失败: ", err)
-			return pa.failConnect()
+			return pa.failConnect(ctx)
 		}
 	}
 
 	uin := botInfo.UIN
-	if pa.UIN != "" && pa.UIN != uin {
-		log.Errorf("official qq UIN 校验失败: 配置为 %s，远端返回 %s", pa.UIN, uin)
-		return pa.failConnect()
+	if pa.getUIN() != "" && pa.getUIN() != uin {
+		log.Errorf("official qq UIN 校验失败: 配置为 %s，远端返回 %s", pa.getUIN(), uin)
+		return pa.failConnect(ctx)
 	}
-	if err := ensureOfficialQQIdentity(d, pa, botInfo.BotID, uin); err != nil {
+	// 同一 UIN 只允许一个端点在线；配置层重复添加时在这里兜底拦截，
+	// 避免两条连接互相踢线。扫码流程在 connect 前已经处理过替换。
+	if d.ImSession != nil && ep.ID != "" {
+		if existing := FindOfficialQQEndpointByUINOrBotID(d.ImSession, uin, botInfo.BotID, ep.ID); existing != nil {
+			log.Errorf("official qq 账号重复: UIN=%s 已被端点 %s 使用", uin, existing.ID)
+			return pa.failConnect(ctx)
+		}
+	}
+	if !pa.isCurrentSession(ctx) {
+		return 0
+	}
+	// 身份迁移会遍历/改写群组、玩家、属性、黑名单等共享状态。
+	// 旧队列已在切换凭据/API 前静默；超时则本轮只写运行时身份、跳过迁移，
+	// 下一次连接再重试，避免用数据竞争换启动速度。
+	if err := ensureOfficialQQIdentityWithMigration(d, pa, botInfo.BotID, uin, quiesced); err != nil {
 		var migrationErr *officialQQIdentityMigrationError
 		if errors.As(err, &migrationErr) {
 			log.Error("official qq 身份数据迁移失败，将继续启动并在下次连接时重试: ", err)
 		} else {
 			log.Error("official qq 身份初始化失败: ", err)
-			return pa.failConnect()
+			return pa.failConnect(ctx)
 		}
 	}
 
-	pa.botID = botInfo.BotID
-	ep.Nickname = botInfo.Nickname
+	pa.setBotID(botInfo.BotID)
+	if !pa.setEndpointIdentityIfCurrent(ctx, formatDiceIDOfficialQQ(uin), botInfo.Nickname) {
+		// 探测/迁移期间已被新会话接管，不能继续注册全局 handler 或启动队列。
+		return 0
+	}
 
 	// 身份校验和可选的数据迁移完成后再开始接收事件。
+	// 先启动串行队列：Webhook 模式下 botgo 会并发回调事件。
+	queue := pa.startOfficialQQEventQueue()
 	event.RegisterHandlersByAppID(
-		pa.AppID.String(),
+		pa.getAppID().String(),
 		pa.makeHandlers()...,
 	)
 
@@ -544,19 +991,28 @@ func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *Officia
 		}
 		pa.setWebhookServer(server)
 
+		// 先置为已连接，避免监听协程刚启动时的首条事件回复被发送守卫丢弃；
+		// 监听失败由下面的协程回置为失败状态。
+		if !pa.setStateIfCurrent(ctx, true, StateConnected) {
+			_ = server.Close()
+			pa.closeOfficialQQEventQueueInstance(queue)
+			return 0
+		}
+
 		go func() {
 			log.Infof("official qq webhook: 监听地址 %s%s", addr, pa.WebhookPath)
 			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				log.Error("official qq webhook服务器启动失败: ", err)
-				if pa.isCurrentSession(ctx) {
-					ep.State = 3
-					ep.Enable = false
+				if pa.failSessionIfCurrent(ctx) {
+					pa.setDiceServing(false)
+					d.LastUpdatedTime = time.Now().Unix()
+					d.Save(false)
 				}
+				// 只关闭本次连接的队列；旧服务器失败时不能误关新会话队列。
+				pa.closeOfficialQQEventQueueInstance(queue)
 			}
 		}()
 
-		ep.State = 1
-		ep.Enable = true
 		pa.clearQrLoginState()
 		d.LastUpdatedTime = time.Now().Unix()
 		d.Save(false)
@@ -564,14 +1020,17 @@ func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *Officia
 		return 0
 	}
 
-	pa.SessionManager = qqbot.NewSessionManager()
-	ep.State = 2
+	manager := qqbot.NewSessionManager()
+	pa.sessionMu.Lock()
+	pa.SessionManager = manager
+	pa.sessionMu.Unlock()
+	pa.setStateIfCurrent(ctx, true, StateConnecting)
 	log.Debug("official qq connecting")
-	ws, err := pa.Api.WS(ctx, nil, "")
+	ws, err := pa.getAPI().WS(ctx, nil, "")
 	if err != nil || ws == nil {
 		log.Error("official qq 获取 ws 接入点失败? ", err)
 		log.Error("official qq 提示：请确认在机器人后台配置 IP 白名单，并检查 AppID/AppSecret 是否正确")
-		return pa.failConnect()
+		return pa.failConnect(ctx)
 	}
 	if ws.Shards == 0 {
 		ws.Shards = 1
@@ -581,7 +1040,7 @@ func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *Officia
 			"official qq session limited: shards=%d remaining=%d resetAfter=%d maxConcurrency=%d",
 			ws.Shards, ws.SessionStartLimit.Remaining, ws.SessionStartLimit.ResetAfter, ws.SessionStartLimit.MaxConcurrency,
 		)
-		return pa.failConnect()
+		return pa.failConnect(ctx)
 	}
 
 	var intent dto.Intent
@@ -601,34 +1060,37 @@ func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *Officia
 
 	log.Info("official qq WebSocket 正在建立；QQ 官方可能约每小时要求一次连接续期，自动重连属于正常现象")
 
+	// 先置为已连接，避免 Start 协程启动初期的首条事件回复被发送守卫丢弃；
+	// 启动失败由 Start 协程回置为失败状态。
+	if !pa.setStateIfCurrent(ctx, true, StateConnected) {
+		pa.closeOfficialQQEventQueueInstance(queue)
+		return 0
+	}
+
 	go func() {
 		currentCtx := ctx
 		defer func() {
-			isCurrent := pa.isCurrentSession(currentCtx)
 			// 防止崩掉进程
 			if r := recover(); r != nil {
 				log.Error("official qq 启动失败: ", r)
-				if isCurrent {
-					ep.State = 3
-					ep.Enable = false
-				}
 			}
-			if isCurrent {
-				pa.stopSessionContext()
-				pa.SessionManager = nil
+			// Start 无论是返回 nil、返回 error 还是 panic，都意味着当前会话已结束。
+			// 用户主动 SetEnable(false) 时 Ctx 已经被清空，不会覆盖用户状态。
+			if pa.finishSessionIfCurrent(currentCtx) {
+				pa.setDiceServing(false)
+				d.LastUpdatedTime = time.Now().Unix()
+				d.Save(false)
 			}
+			// 无论当前会话是否已被替换，只关闭本协程捕获的旧队列。
+			pa.closeOfficialQQEventQueueInstance(queue)
+			// 不在这里清空 pa.SessionManager：可能已有新会话接管，
+			// 本协程使用的是局部 manager，不会误启动新会话。
 		}()
-		if startErr := pa.SessionManager.Start(currentCtx, ws, pa.tokenSource, &intent); startErr != nil {
+		if startErr := manager.Start(currentCtx, ws, pa.getTokenSource(), &intent); startErr != nil {
 			log.Error("official qq session manager 启动失败: ", startErr)
-			if pa.isCurrentSession(currentCtx) {
-				ep.State = 3
-				ep.Enable = false
-			}
 		}
 	}()
 
-	ep.State = 1
-	ep.Enable = true
 	pa.clearQrLoginState()
 	d.LastUpdatedTime = time.Now().Unix()
 	d.Save(false)
@@ -674,17 +1136,37 @@ func (pa *PlatformAdapterOfficialQQ) makeHandlers() []interface{} {
 func (pa *PlatformAdapterOfficialQQ) InteractionReceive(eventRaw *dto.WSPayload, data *dto.WSInteractionData) error {
 	s := pa.EndPoint.Session
 	log := s.Parent.Logger
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("official qq interaction panic: %v", r)
+		}
+	}()
 	log.Debugf("official qq: 收到互动事件: %v, %v", eventRaw, data)
 
 	qctx := context.Background()
 	// 首先响应这个 interaction，让客户端停止loading
-	if err := pa.Api.PutInteraction(qctx, data.ID, `{"code":0}`); err != nil {
+	if err := pa.getAPI().PutInteraction(qctx, data.ID, `{"code":0}`); err != nil {
 		log.Errorf("official qq 响应互动事件失败: %v", err)
 	}
 
 	if data.Data == nil || data.Data.Type != dto.InteractionDataTypeInlineKeyboardClick {
 		return nil
 	}
+
+	// 翻页发送同样走串行事件队列，避免与消息命令在重连/重登时并发修改状态。
+	var handlerErr error
+	if err := pa.dispatchOfficialQQEvent(func() {
+		handlerErr = pa.handleInteractionPagination(eventRaw, data, qctx)
+	}); err != nil {
+		return err
+	}
+	return handlerErr
+}
+
+// handleInteractionPagination 处理翻页按钮点击后的消息发送，由串行事件队列调用。
+func (pa *PlatformAdapterOfficialQQ) handleInteractionPagination(eventRaw *dto.WSPayload, data *dto.WSInteractionData, qctx context.Context) error {
+	s := pa.EndPoint.Session
+	log := s.Parent.Logger
 
 	var resolved dto.Resolved
 	if err := json.Unmarshal(data.Data.Resolved, &resolved); err != nil {
@@ -741,13 +1223,13 @@ func (pa *PlatformAdapterOfficialQQ) InteractionReceive(eventRaw *dto.WSPayload,
 		case 0: // 频道
 			pa.sendBatchPage(eventCtx, item.BatchPages[pageIndex], tail, keyboardObj, data.ChannelID, "", "", "group", "channel")
 		case 1: // 群
-			pa.sendBatchPage(eventCtx, item.BatchPages[pageIndex], tail, keyboardObj, "", data.GroupOpenID, formatDiceIDOfficialQQGroupOpenID(pa.UIN, data.GroupOpenID), "group", "group")
+			pa.sendBatchPage(eventCtx, item.BatchPages[pageIndex], tail, keyboardObj, "", data.GroupOpenID, formatDiceIDOfficialQQGroupOpenID(pa.getUIN(), data.GroupOpenID), "group", "group")
 		case 2: // C2C
 			pa.sendBatchPage(eventCtx, item.BatchPages[pageIndex], tail, keyboardObj, data.UserOpenID, "", "", "private", "c2c")
 		default:
 			switch data.Scene {
 			case "group":
-				pa.sendBatchPage(eventCtx, item.BatchPages[pageIndex], tail, keyboardObj, "", data.GroupOpenID, formatDiceIDOfficialQQGroupOpenID(pa.UIN, data.GroupOpenID), "group", "group")
+				pa.sendBatchPage(eventCtx, item.BatchPages[pageIndex], tail, keyboardObj, "", data.GroupOpenID, formatDiceIDOfficialQQGroupOpenID(pa.getUIN(), data.GroupOpenID), "group", "group")
 			case "c2c":
 				pa.sendBatchPage(eventCtx, item.BatchPages[pageIndex], tail, keyboardObj, data.UserOpenID, "", "", "private", "c2c")
 			default:
@@ -793,7 +1275,7 @@ func (pa *PlatformAdapterOfficialQQ) InteractionReceive(eventRaw *dto.WSPayload,
 	// 根据 chat_type 发送
 	switch data.ChatType {
 	case 0: // 频道
-		msg, err := pa.Api.PostMessage(qctx, data.ChannelID, toCreate)
+		msg, err := pa.getAPI().PostMessage(qctx, data.ChannelID, toCreate)
 		if err != nil {
 			log.Errorf("official qq 翻页发送频道消息失败：%v", err)
 		} else if msg != nil {
@@ -804,33 +1286,33 @@ func (pa *PlatformAdapterOfficialQQ) InteractionReceive(eventRaw *dto.WSPayload,
 				Message:     text,
 				GroupID:     data.ChannelID,
 				Sender: SenderBase{
-					UserID:   pa.EndPoint.UserID,
-					Nickname: pa.EndPoint.Nickname,
+					UserID:   pa.senderUserID(),
+					Nickname: pa.senderNickname(),
 				},
 				RawID: msg.ID,
 			}, "")
 		}
 	case 1: // 群
-		msg, err := pa.Api.PostGroupMessage(qctx, data.GroupOpenID, toCreate)
+		msg, err := pa.getAPI().PostGroupMessage(qctx, data.GroupOpenID, toCreate)
 		if err != nil {
 			log.Errorf("official qq 翻页发送群聊消息失败：%v", err)
 		} else if msg != nil {
 			ctx.MessageType = "group"
-			groupID := formatDiceIDOfficialQQGroupOpenID(pa.UIN, data.GroupOpenID)
+			groupID := formatDiceIDOfficialQQGroupOpenID(pa.getUIN(), data.GroupOpenID)
 			pa.EndPoint.Session.OnMessageSend(ctx, &Message{
 				Platform:    "QQ",
 				MessageType: "group",
 				Message:     text,
 				GroupID:     groupID,
 				Sender: SenderBase{
-					UserID:   pa.EndPoint.UserID,
-					Nickname: pa.EndPoint.Nickname,
+					UserID:   pa.senderUserID(),
+					Nickname: pa.senderNickname(),
 				},
 				RawID: msg.ID,
 			}, "")
 		}
 	case 2: // C2C
-		msg, err := pa.Api.PostC2CMessage(qctx, data.UserOpenID, toCreate)
+		msg, err := pa.getAPI().PostC2CMessage(qctx, data.UserOpenID, toCreate)
 		if err != nil {
 			log.Errorf("official qq 翻页发送私聊消息失败： %v", err)
 		} else if msg != nil {
@@ -840,8 +1322,8 @@ func (pa *PlatformAdapterOfficialQQ) InteractionReceive(eventRaw *dto.WSPayload,
 				MessageType: "private",
 				Message:     text,
 				Sender: SenderBase{
-					UserID:   pa.EndPoint.UserID,
-					Nickname: pa.EndPoint.Nickname,
+					UserID:   pa.senderUserID(),
+					Nickname: pa.senderNickname(),
 				},
 				RawID: msg.ID,
 			}, "")
@@ -849,26 +1331,26 @@ func (pa *PlatformAdapterOfficialQQ) InteractionReceive(eventRaw *dto.WSPayload,
 	default:
 		switch data.Scene {
 		case "group":
-			msg, err := pa.Api.PostGroupMessage(qctx, data.GroupOpenID, toCreate)
+			msg, err := pa.getAPI().PostGroupMessage(qctx, data.GroupOpenID, toCreate)
 			if err != nil {
 				log.Errorf("official qq 翻页发送群聊消息失败： %v", err)
 			} else if msg != nil {
 				ctx.MessageType = "group"
-				groupID := formatDiceIDOfficialQQGroupOpenID(pa.UIN, data.GroupOpenID)
+				groupID := formatDiceIDOfficialQQGroupOpenID(pa.getUIN(), data.GroupOpenID)
 				pa.EndPoint.Session.OnMessageSend(ctx, &Message{
 					Platform:    "QQ",
 					MessageType: "group",
 					Message:     text,
 					GroupID:     groupID,
 					Sender: SenderBase{
-						UserID:   pa.EndPoint.UserID,
-						Nickname: pa.EndPoint.Nickname,
+						UserID:   pa.senderUserID(),
+						Nickname: pa.senderNickname(),
 					},
 					RawID: msg.ID,
 				}, "")
 			}
 		case "c2c":
-			msg, err := pa.Api.PostC2CMessage(qctx, data.UserOpenID, toCreate)
+			msg, err := pa.getAPI().PostC2CMessage(qctx, data.UserOpenID, toCreate)
 			if err != nil {
 				log.Errorf("official qq 翻页发送私聊消息失败：%v", err)
 			} else if msg != nil {
@@ -878,15 +1360,15 @@ func (pa *PlatformAdapterOfficialQQ) InteractionReceive(eventRaw *dto.WSPayload,
 					MessageType: "private",
 					Message:     text,
 					Sender: SenderBase{
-						UserID:   pa.EndPoint.UserID,
-						Nickname: pa.EndPoint.Nickname,
+						UserID:   pa.senderUserID(),
+						Nickname: pa.senderNickname(),
 					},
 					RawID: msg.ID,
 				}, "")
 			}
 		default:
 			if data.ChannelID != "" {
-				msg, err := pa.Api.PostMessage(qctx, data.ChannelID, toCreate)
+				msg, err := pa.getAPI().PostMessage(qctx, data.ChannelID, toCreate)
 				if err != nil {
 					log.Errorf("official qq 翻页发送频道消息失败： %v", err)
 				} else if msg != nil {
@@ -897,8 +1379,8 @@ func (pa *PlatformAdapterOfficialQQ) InteractionReceive(eventRaw *dto.WSPayload,
 						Message:     text,
 						GroupID:     data.ChannelID,
 						Sender: SenderBase{
-							UserID:   pa.EndPoint.UserID,
-							Nickname: pa.EndPoint.Nickname,
+							UserID:   pa.senderUserID(),
+							Nickname: pa.senderNickname(),
 						},
 						RawID: msg.ID,
 					}, "")
@@ -940,8 +1422,8 @@ func (pa *PlatformAdapterOfficialQQ) sendBatchPage(ctx *MsgContext, page []strin
 			Message:     text,
 			GroupID:     targetGroupID,
 			Sender: SenderBase{
-				UserID:   pa.EndPoint.UserID,
-				Nickname: pa.EndPoint.Nickname,
+				UserID:   pa.senderUserID(),
+				Nickname: pa.senderNickname(),
 			},
 			RawID: msg.ID,
 		}, "")
@@ -1052,11 +1534,13 @@ func (pa *PlatformAdapterOfficialQQ) ChannelAtMessageReceive(event *dto.WSPayloa
 	log := s.Parent.Logger
 	log.Debugf("official qq: 收到文字频道消息：%v, %v", event, data)
 
-	s.Execute(pa.EndPoint, pa.channelMsgToStdMsg(data), false)
-	return nil
+	return pa.dispatchOfficialQQEvent(func() {
+		msg := pa.channelMsgToStdMsg(event, data)
+		s.Execute(pa.EndPoint, msg, false)
+	})
 }
 
-func (pa *PlatformAdapterOfficialQQ) channelMsgToStdMsg(msgQQ *dto.WSATMessageData) *Message {
+func (pa *PlatformAdapterOfficialQQ) channelMsgToStdMsg(event *dto.WSPayload, msgQQ *dto.WSATMessageData) *Message {
 	msg := new(Message)
 	timestamp, _ := msgQQ.Timestamp.Time()
 	msg.Time = timestamp.Unix()
@@ -1072,6 +1556,16 @@ func (pa *PlatformAdapterOfficialQQ) channelMsgToStdMsg(msgQQ *dto.WSATMessageDa
 		msg.Sender.Nickname = msgQQ.Author.Username
 		msg.Sender.UserID = formatDiceIDOfficialQQCh(msgQQ.Author.ID)
 	}
+	// 频道 AT 的目标是 guild user id，与 EndPoint.UserID（OpenQQ:<UIN>）不同；
+	// 从 mentions 中取 is_you 的 id，供 cmd_parse 的 uidForAtInfo 识别自 @。
+	botSelfIDs := pa.parseBotSelfOpenIDs(event)
+	for _, match := range officialQQAtRegex.FindAllStringSubmatch(msg.Message, -1) {
+		target := officialQQMentionTarget(match)
+		if officialQQBotSelfMention(botSelfIDs, target) {
+			msg.TmpUID = "OpenQQCH:" + target
+			break
+		}
+	}
 	return msg
 }
 
@@ -1080,8 +1574,10 @@ func (pa *PlatformAdapterOfficialQQ) GuildDirectMessageReceive(event *dto.WSPayl
 	log := s.Parent.Logger
 	log.Debugf("official qq: 收到频道私信消息：%v, %v", event, data)
 
-	s.Execute(pa.EndPoint, pa.guildDirectMsgToStdMsg(data), false)
-	return nil
+	return pa.dispatchOfficialQQEvent(func() {
+		msg := pa.guildDirectMsgToStdMsg(data)
+		s.Execute(pa.EndPoint, msg, false)
+	})
 }
 
 func (pa *PlatformAdapterOfficialQQ) guildDirectMsgToStdMsg(msgQQ *dto.WSDirectMessageData) *Message {
@@ -1108,8 +1604,10 @@ func (pa *PlatformAdapterOfficialQQ) GroupAtMessageReceive(event *dto.WSPayload,
 	log := s.Parent.Logger
 	log.Debugf("official qq: 收到群聊消息：%v, %v", event, data)
 
-	s.Execute(pa.EndPoint, pa.groupMsgToStdMsg(event, data), false)
-	return nil
+	return pa.dispatchOfficialQQEvent(func() {
+		msg := pa.groupMsgToStdMsg(event, data)
+		s.Execute(pa.EndPoint, msg, false)
+	})
 }
 
 func (pa *PlatformAdapterOfficialQQ) groupMsgToStdMsg(event *dto.WSPayload, msgQQ *dto.WSGroupATMessageData) *Message {
@@ -1120,7 +1618,7 @@ func (pa *PlatformAdapterOfficialQQ) groupMsgToStdMsg(event *dto.WSPayload, msgQ
 	msg.Message = msgQQ.Content
 	msg.RawID = msgQQ.ID
 	msg.Platform = "OpenQQ"
-	msg.GroupID = formatDiceIDOfficialQQGroupOpenID(pa.UIN, msgQQ.GroupOpenID)
+	msg.GroupID = formatDiceIDOfficialQQGroupOpenID(pa.getUIN(), msgQQ.GroupOpenID)
 	if msgQQ.Author != nil {
 		if msgQQ.Author.Username != "" {
 			msg.Sender.Nickname = msgQQ.Author.Username
@@ -1129,22 +1627,26 @@ func (pa *PlatformAdapterOfficialQQ) groupMsgToStdMsg(event *dto.WSPayload, msgQ
 		} else {
 			msg.Sender.Nickname = "用户"
 		}
-		msg.Sender.UserID = formatDiceIDOfficialQQMemberOpenID(pa.UIN, msgQQ.GroupOpenID, msgQQ.Author.MemberOpenID)
+		msg.Sender.UserID = formatDiceIDOfficialQQMemberOpenID(pa.getUIN(), msgQQ.GroupOpenID, msgQQ.Author.MemberOpenID)
 		msg.Sender.GroupRole = msgQQ.Author.MemberRole
 	}
 	pa.populateGroupMentionedInfo(msg, msgQQ.Mentions)
 
-	botSelfOpenID := pa.parseBotSelfOpenID(event)
-
-	if botSelfOpenID == "" {
-		botSelfOpenID = pa.botID
+	botSelfIDs := pa.parseBotSelfOpenIDs(event)
+	if len(botSelfIDs) == 0 && pa.getBotID() != "" {
+		botSelfIDs = []string{pa.getBotID()}
 	}
 
-	m := officialQQAtRegex.FindStringSubmatch(msgQQ.Content)
-	if target := officialQQMentionTarget(m); target != "" {
-		msg.TmpUID = officialQQUserIDPrefix + target
-	} else if botSelfOpenID != "" {
-		msg.TmpUID = "OpenQQ:" + botSelfOpenID
+	// 群 AT 消息正文里可能同时 @ 了其他成员，不能把第一个 @ 当作骰子。
+	// 必须遍历所有提及，只有目标属于骰子自身时才记为骰子。
+	for _, match := range officialQQAtRegex.FindAllStringSubmatch(msgQQ.Content, -1) {
+		if target := officialQQMentionTarget(match); officialQQBotSelfMention(botSelfIDs, target) {
+			msg.TmpUID = officialQQUserIDPrefix + target
+			break
+		}
+	}
+	if msg.TmpUID == "" && len(botSelfIDs) > 0 {
+		msg.TmpUID = "OpenQQ:" + botSelfIDs[0]
 	}
 
 	appendAttachmentsToMessage(msg, msgQQ.Attachments)
@@ -1158,9 +1660,10 @@ func (pa *PlatformAdapterOfficialQQ) GroupMessageReceive(event *dto.WSPayload, d
 	log := s.Parent.Logger
 	log.Debugf("official qq: 收到群聊普通消息：%v, %v", event, data)
 
-	msg := pa.groupNormalMsgToStdMsg(event, data)
-	s.Execute(pa.EndPoint, msg, false)
-	return nil
+	return pa.dispatchOfficialQQEvent(func() {
+		msg := pa.groupNormalMsgToStdMsg(event, data)
+		s.Execute(pa.EndPoint, msg, false)
+	})
 }
 
 // groupNormalMsgToStdMsg 将群聊普通消息转换为标准消息
@@ -1172,7 +1675,7 @@ func (pa *PlatformAdapterOfficialQQ) groupNormalMsgToStdMsg(event *dto.WSPayload
 	msg.Message = msgQQ.Content
 	msg.RawID = msgQQ.ID
 	msg.Platform = "OpenQQ"
-	msg.GroupID = formatDiceIDOfficialQQGroupOpenID(pa.UIN, msgQQ.GroupOpenID)
+	msg.GroupID = formatDiceIDOfficialQQGroupOpenID(pa.getUIN(), msgQQ.GroupOpenID)
 	if msgQQ.Author != nil {
 		if msgQQ.Author.Username != "" {
 			msg.Sender.Nickname = msgQQ.Author.Username
@@ -1181,19 +1684,18 @@ func (pa *PlatformAdapterOfficialQQ) groupNormalMsgToStdMsg(event *dto.WSPayload
 		} else {
 			msg.Sender.Nickname = "用户"
 		}
-		msg.Sender.UserID = formatDiceIDOfficialQQMemberOpenID(pa.UIN, msgQQ.GroupOpenID, msgQQ.Author.MemberOpenID)
+		msg.Sender.UserID = formatDiceIDOfficialQQMemberOpenID(pa.getUIN(), msgQQ.GroupOpenID, msgQQ.Author.MemberOpenID)
 		msg.Sender.GroupRole = msgQQ.Author.MemberRole
 	}
 	pa.populateGroupMentionedInfo(msg, msgQQ.Mentions)
 
-	botSelfOpenID := pa.parseBotSelfOpenID(event)
-
-	if botSelfOpenID == "" {
-		botSelfOpenID = pa.botID
+	botSelfIDs := pa.parseBotSelfOpenIDs(event)
+	if len(botSelfIDs) == 0 && pa.getBotID() != "" {
+		botSelfIDs = []string{pa.getBotID()}
 	}
 
 	for _, match := range officialQQAtRegex.FindAllStringSubmatch(msgQQ.Content, -1) {
-		if target := officialQQMentionTarget(match); target == botSelfOpenID {
+		if target := officialQQMentionTarget(match); officialQQBotSelfMention(botSelfIDs, target) {
 			msg.TmpUID = officialQQUserIDPrefix + target
 			break
 		}
@@ -1210,9 +1712,10 @@ func (pa *PlatformAdapterOfficialQQ) C2CMessageReceiveFromEvent(payload *dto.WSP
 	log := s.Parent.Logger
 	log.Debugf("official qq: 收到单聊消息: %v", data)
 
-	msg := pa.c2cMsgToStdMsg(data)
-	s.Execute(pa.EndPoint, msg, false)
-	return nil
+	return pa.dispatchOfficialQQEvent(func() {
+		msg := pa.c2cMsgToStdMsg(data)
+		s.Execute(pa.EndPoint, msg, false)
+	})
 }
 
 // c2cMsgToStdMsg 将单聊消息转换为标准消息
@@ -1233,7 +1736,7 @@ func (pa *PlatformAdapterOfficialQQ) c2cMsgToStdMsg(msgQQ *dto.WSC2CMessageData)
 		} else {
 			msg.Sender.Nickname = "用户"
 		}
-		msg.Sender.UserID = formatDiceIDOfficialQQUserOpenID(pa.UIN, userOpenID)
+		msg.Sender.UserID = formatDiceIDOfficialQQUserOpenID(pa.getUIN(), userOpenID)
 	}
 	appendAttachmentsToMessage(msg, msgQQ.Attachments)
 	return msg
@@ -1241,12 +1744,18 @@ func (pa *PlatformAdapterOfficialQQ) c2cMsgToStdMsg(msgQQ *dto.WSC2CMessageData)
 
 // GroupMemberAddReceive 处理群成员增加事件
 func (pa *PlatformAdapterOfficialQQ) GroupMemberAddReceive(event *dto.WSPayload, data *dto.WSGroupMemberAddData) error {
+	return pa.dispatchOfficialQQEvent(func() {
+		pa.groupMemberAddReceive(event, data)
+	})
+}
+
+func (pa *PlatformAdapterOfficialQQ) groupMemberAddReceive(event *dto.WSPayload, data *dto.WSGroupMemberAddData) {
 	s := pa.EndPoint.Session
 	log := s.Parent.Logger
 	log.Debugf("official qq: 收到群成员增加事件：%v, %v", event, data)
 
-	groupID := formatDiceIDOfficialQQGroupOpenID(pa.UIN, data.GroupOpenID)
-	userID := formatDiceIDOfficialQQMemberOpenID(pa.UIN, data.GroupOpenID, data.MemberOpenID)
+	groupID := formatDiceIDOfficialQQGroupOpenID(pa.getUIN(), data.GroupOpenID)
+	userID := formatDiceIDOfficialQQMemberOpenID(pa.getUIN(), data.GroupOpenID, data.MemberOpenID)
 
 	// 如果是机器人自己加入群聊
 	if userID == pa.EndPoint.UserID || data.MemberOpenID == "" || data.MemberOpenID == "BOT" {
@@ -1294,18 +1803,22 @@ func (pa *PlatformAdapterOfficialQQ) GroupMemberAddReceive(event *dto.WSPayload,
 
 		pa.EndPoint.Session.OnGroupMemberJoined(ctx, msg)
 	}
-
-	return nil
 }
 
 // GroupMemberRemoveReceive 处理群成员减少事件
 func (pa *PlatformAdapterOfficialQQ) GroupMemberRemoveReceive(event *dto.WSPayload, data *dto.WSGroupMemberRemoveData) error {
+	return pa.dispatchOfficialQQEvent(func() {
+		pa.groupMemberRemoveReceive(event, data)
+	})
+}
+
+func (pa *PlatformAdapterOfficialQQ) groupMemberRemoveReceive(event *dto.WSPayload, data *dto.WSGroupMemberRemoveData) {
 	s := pa.EndPoint.Session
 	log := s.Parent.Logger
 	log.Debugf("official qq: 收到群成员减少事件：%v, %v", event, data)
 
-	groupID := formatDiceIDOfficialQQGroupOpenID(pa.UIN, data.GroupOpenID)
-	userID := formatDiceIDOfficialQQMemberOpenID(pa.UIN, data.GroupOpenID, data.MemberOpenID)
+	groupID := formatDiceIDOfficialQQGroupOpenID(pa.getUIN(), data.GroupOpenID)
+	userID := formatDiceIDOfficialQQMemberOpenID(pa.getUIN(), data.GroupOpenID, data.MemberOpenID)
 
 	// 如果是机器人自己被移出群
 	if userID == pa.EndPoint.UserID || data.MemberOpenID == "" || data.MemberOpenID == "BOT" {
@@ -1316,12 +1829,11 @@ func (pa *PlatformAdapterOfficialQQ) GroupMemberRemoveReceive(event *dto.WSPaylo
 
 		group, exists := s.ServiceAtNew.Load(groupID)
 		if exists {
-			group.DiceIDExistsMap.Delete(pa.EndPoint.UserID)
+			selfID, _ := pa.identitySnapshot()
+			group.DiceIDExistsMap.Delete(selfID)
 			group.MarkDirty(s.Parent)
 		}
 	}
-
-	return nil
 }
 
 // GroupAddRobotReceive 处理机器人加入群聊事件
@@ -1358,13 +1870,19 @@ func (pa *PlatformAdapterOfficialQQ) GroupDelRobotReceive(event *dto.WSPayload, 
 
 // C2CFriendReceive 处理好友关系变动事件
 func (pa *PlatformAdapterOfficialQQ) C2CFriendReceive(event *dto.WSPayload, data *dto.WSC2CFriendData) error {
+	return pa.dispatchOfficialQQEvent(func() {
+		pa.c2cFriendReceive(event, data)
+	})
+}
+
+func (pa *PlatformAdapterOfficialQQ) c2cFriendReceive(event *dto.WSPayload, data *dto.WSC2CFriendData) {
 	s := pa.EndPoint.Session
 	log := s.Parent.Logger
 	log.Debugf("official qq: 收到好友事件: %s, %v, %v", event.Type, event, data)
 
 	switch event.Type {
 	case dto.EventC2CFriendAdd:
-		userID := formatDiceIDOfficialQQUserOpenID(pa.UIN, data.OpenID)
+		userID := formatDiceIDOfficialQQUserOpenID(pa.getUIN(), data.OpenID)
 
 		ctx := &MsgContext{EndPoint: pa.EndPoint, Session: s, Dice: s.Parent}
 		if event != nil && event.EventID != "" {
@@ -1408,13 +1926,11 @@ func (pa *PlatformAdapterOfficialQQ) C2CFriendReceive(event *dto.WSPayload, data
 			}
 		}()
 	case dto.EventC2CFriendDel:
-		userID := formatDiceIDOfficialQQUserOpenID(pa.UIN, data.OpenID)
+		userID := formatDiceIDOfficialQQUserOpenID(pa.getUIN(), data.OpenID)
 		log.Infof("official qq: 与 %s 解除好友关系", userID)
 	default:
 		// 忽略其他事件
 	}
-
-	return nil
 }
 func (pa *PlatformAdapterOfficialQQ) initPaginationCache() {
 	pa.paginationMu.Lock()
@@ -1430,10 +1946,28 @@ func (pa *PlatformAdapterOfficialQQ) addToPaginationCache(id string, pages []str
 	defer pa.paginationMu.Unlock()
 
 	now := time.Now()
-	if len(pa.paginationCache) > 1000 {
+	if len(pa.paginationCache) >= 1000 {
+		// 先删过期项。不能在循环里用当前 len 作为删除条件，否则第 1001
+		// 条加入时会把所有仍在有效期内的翻页按钮一起清掉。
 		for k, v := range pa.paginationCache {
-			if now.Sub(v.CreatedAt) > 1*time.Hour || len(pa.paginationCache) > 1000 {
+			if now.Sub(v.CreatedAt) > time.Hour {
 				delete(pa.paginationCache, k)
+			}
+		}
+		if len(pa.paginationCache) >= 1000 {
+			type cacheAge struct {
+				key string
+				at  time.Time
+			}
+			ages := make([]cacheAge, 0, len(pa.paginationCache))
+			for k, v := range pa.paginationCache {
+				ages = append(ages, cacheAge{key: k, at: v.CreatedAt})
+			}
+			sort.Slice(ages, func(i, j int) bool { return ages[i].at.Before(ages[j].at) })
+			// 给即将插入的新条目留一个位置，总量不超过 1000。
+			remove := len(pa.paginationCache) - 999
+			for i := 0; i < remove && i < len(ages); i++ {
+				delete(pa.paginationCache, ages[i].key)
 			}
 		}
 	}
@@ -1606,13 +2140,44 @@ func (pa *PlatformAdapterOfficialQQ) shutdownWebhookServer() {
 }
 
 func (pa *PlatformAdapterOfficialQQ) DoRelogin() bool {
-	pa.stopSessionContext()
-	pa.EndPoint.Session.Parent.Logger.Infof("正在启用 official qq 服务")
-	pa.EndPoint.State = 0
-	pa.EndPoint.Enable = false
-	pa.clearQrLoginState()
-	pa.shutdownWebhookServer()
-	return pa.Serve() == 0
+	d := pa.EndPoint.Session.Parent
+	ctx := pa.currentSessionContext()
+	queue := pa.currentEventQueue()
+	pa.cancelServeLoop()
+	stopped := false
+	if ctx != nil {
+		pa.setStateIfCurrent(ctx, false, StateDisconnected)
+		stopped = pa.stopSessionContextIf(ctx)
+		if stopped {
+			pa.setDiceServing(false)
+		}
+	} else {
+		pa.setEndpointStateIfIdle(false, StateDisconnected)
+		pa.setDiceServingIfIdle(false)
+		stopped = true
+	}
+	// 先排空旧队列再启动新会话，身份迁移会在 connect 中继续做二次确认。
+	pa.quiesceOfficialQQEventQueueInstance(queue, 2*time.Second)
+	d.Logger.Infof("正在启用 official qq 服务")
+	if stopped && !pa.isSessionRunning() {
+		pa.clearQrLoginState()
+		pa.shutdownWebhookServer()
+	} else if !stopped {
+		// 新会话已经接管，本次重登不应再启动第三个会话。
+		d.LastUpdatedTime = time.Now().Unix()
+		d.Save(false)
+		return false
+	}
+	if pa.isSessionRunning() {
+		// 清理旧状态期间已有新会话启动，交给它。
+		d.LastUpdatedTime = time.Now().Unix()
+		d.Save(false)
+		return false
+	}
+	ok := pa.Serve() == 0
+	d.LastUpdatedTime = time.Now().Unix()
+	d.Save(false)
+	return ok
 }
 
 func (pa *PlatformAdapterOfficialQQ) SetEnable(enable bool) {
@@ -1620,28 +2185,44 @@ func (pa *PlatformAdapterOfficialQQ) SetEnable(enable bool) {
 	ep := pa.EndPoint
 	if enable {
 		if !pa.isSessionRunning() {
-			ep.Enable = false
-			pa.DiceServing = false
-			ep.State = 2
+			pa.setDiceServing(false)
+			pa.setEndpointState(false, StateConnecting)
 			ServerOfficialQQ(d, ep)
 		} else {
 			qrState, _, _ := pa.QrLoginSnapshot()
 			if qrState == OfficialQQLoginStateQRWaitingForScan {
-				ep.Enable = false
-				ep.State = StateConnecting
+				pa.setEndpointStateForCurrent(false, StateConnecting)
 			} else {
-				ep.Enable = true
-				ep.State = 1
+				pa.setEndpointStateForCurrent(true, StateConnected)
 			}
 		}
 	} else {
-		ep.State = 0
-		ep.Enable = false
-		pa.stopSessionContext()
-		pa.shutdownWebhookServer()
-		pa.clearQrLoginState()
+		// 必须让正在退避的重试循环退出，否则 15 秒后 Serve() 会把端点重新拉起来。
+		ctx := pa.currentSessionContext()
+		queue := pa.currentEventQueue()
+		pa.cancelServeLoop()
+		stopped := false
+		if ctx != nil {
+			pa.setStateIfCurrent(ctx, false, StateDisconnected)
+			stopped = pa.stopSessionContextIf(ctx)
+			if stopped {
+				pa.setDiceServing(false)
+			}
+		} else {
+			// 无会话时用 idle 版本，避免覆盖并发启动的新会话状态。
+			pa.setEndpointStateIfIdle(false, StateDisconnected)
+			pa.setDiceServingIfIdle(false)
+			stopped = true
+		}
+		pa.quiesceOfficialQQEventQueueInstance(queue, 2*time.Second)
+		// 如果已经有新会话接管，不要关闭它的 Webhook/二维码状态。
+		if stopped && !pa.isSessionRunning() {
+			pa.shutdownWebhookServer()
+			pa.clearQrLoginState()
+		}
 	}
 	d.LastUpdatedTime = time.Now().Unix()
+	d.Save(false)
 }
 
 func (pa *PlatformAdapterOfficialQQ) SendSegmentToGroup(ctx *MsgContext, groupID string, msg []message.IMessageElement, flag string) {
@@ -1651,6 +2232,9 @@ func (pa *PlatformAdapterOfficialQQ) SendSegmentToPerson(ctx *MsgContext, userID
 }
 
 func (pa *PlatformAdapterOfficialQQ) SendToPerson(ctx *MsgContext, uid string, text string, flag string) {
+	if !pa.canSend() || pa.getAPI() == nil {
+		return
+	}
 	userID, idType := pa.mustExtractID(uid)
 
 	maxLen := 900
@@ -1697,8 +2281,8 @@ func (pa *PlatformAdapterOfficialQQ) SendToPerson(ctx *MsgContext, uid string, t
 					MessageType: "private",
 					Message:     textList[0],
 					Sender: SenderBase{
-						UserID:   pa.EndPoint.UserID,
-						Nickname: pa.EndPoint.Nickname,
+						UserID:   pa.senderUserID(),
+						Nickname: pa.senderNickname(),
 					},
 					RawID: msg.ID,
 				}, flag)
@@ -1737,8 +2321,8 @@ func (pa *PlatformAdapterOfficialQQ) SendToPerson(ctx *MsgContext, uid string, t
 				MessageType: "private",
 				Message:     textList[0],
 				Sender: SenderBase{
-					UserID:   pa.EndPoint.UserID,
-					Nickname: pa.EndPoint.Nickname,
+					UserID:   pa.senderUserID(),
+					Nickname: pa.senderNickname(),
 				},
 				RawID: msg.ID,
 			}, flag)
@@ -1762,8 +2346,8 @@ func (pa *PlatformAdapterOfficialQQ) SendToPerson(ctx *MsgContext, uid string, t
 						MessageType: "private",
 						Message:     t,
 						Sender: SenderBase{
-							UserID:   pa.EndPoint.UserID,
-							Nickname: pa.EndPoint.Nickname,
+							UserID:   pa.senderUserID(),
+							Nickname: pa.senderNickname(),
 						},
 						RawID: msg.ID,
 					}, flag)
@@ -1803,8 +2387,8 @@ func (pa *PlatformAdapterOfficialQQ) SendToPerson(ctx *MsgContext, uid string, t
 					MessageType: "private",
 					Message:     t,
 					Sender: SenderBase{
-						UserID:   pa.EndPoint.UserID,
-						Nickname: pa.EndPoint.Nickname,
+						UserID:   pa.senderUserID(),
+						Nickname: pa.senderNickname(),
 					},
 					RawID: msg.ID,
 				}, flag)
@@ -1822,8 +2406,8 @@ func (pa *PlatformAdapterOfficialQQ) SendToPerson(ctx *MsgContext, uid string, t
 					MessageType: "private",
 					Message:     u.text,
 					Sender: SenderBase{
-						UserID:   pa.EndPoint.UserID,
-						Nickname: pa.EndPoint.Nickname,
+						UserID:   pa.senderUserID(),
+						Nickname: pa.senderNickname(),
 					},
 					RawID: msg.ID,
 				}, flag)
@@ -1863,8 +2447,8 @@ func (pa *PlatformAdapterOfficialQQ) SendToPerson(ctx *MsgContext, uid string, t
 				MessageType: "private",
 				Message:     u.text,
 				Sender: SenderBase{
-					UserID:   pa.EndPoint.UserID,
-					Nickname: pa.EndPoint.Nickname,
+					UserID:   pa.senderUserID(),
+					Nickname: pa.senderNickname(),
 				},
 				RawID: msg.ID,
 			}, flag)
@@ -1883,7 +2467,7 @@ func (pa *PlatformAdapterOfficialQQ) createQQGuildDirectChannel( /* ctx */ _ *Ms
 		SourceGuildID: guildID,
 		RecipientID:   userID,
 	}
-	info, err := pa.Api.CreateDirectMessage(qctx, toCreate)
+	info, err := pa.getAPI().CreateDirectMessage(qctx, toCreate)
 	if err != nil {
 		pa.EndPoint.Session.Parent.Logger.Error("official qq 创建私信频道失败：" + err.Error())
 		return "", "", err
@@ -1973,7 +2557,7 @@ func (pa *PlatformAdapterOfficialQQ) sendQQGuildDirectMsgRaw(ctx *MsgContext, ro
 	toCreate.MessageReference = msgRef
 	pa.finalizeMessageToCreate(toCreate, content, keyboardObj, true)
 
-	res, err := pa.Api.PostDirectMessage(qctx, dMsg, toCreate)
+	res, err := pa.getAPI().PostDirectMessage(qctx, dMsg, toCreate)
 	if err != nil {
 		pa.EndPoint.Session.Parent.Logger.Error("official qq 发送频道私信消息失败：", err.Error())
 	}
@@ -1995,7 +2579,7 @@ func (pa *PlatformAdapterOfficialQQ) uploadC2CMedia(qctx context.Context, userOp
 		FileData:   data,
 		SrvSendMsg: false,
 	}
-	media, err := pa.Api.PostC2CMessage(qctx, userOpenID, fMsg)
+	media, err := pa.getAPI().PostC2CMessage(qctx, userOpenID, fMsg)
 	if err != nil {
 		return nil, err
 	}
@@ -2019,7 +2603,7 @@ func (pa *PlatformAdapterOfficialQQ) uploadGroupMedia(qctx context.Context, grou
 		FileData:   data,
 		SrvSendMsg: false,
 	}
-	media, err := pa.Api.PostGroupFile(qctx, groupID, fMsg)
+	media, err := pa.getAPI().PostGroupFile(qctx, groupID, fMsg)
 	if err != nil {
 		return nil, err
 	}
@@ -2059,7 +2643,7 @@ func (pa *PlatformAdapterOfficialQQ) sendC2CMsgRaw(ctx *MsgContext, rowMsgID, us
 				return
 			}
 		}
-		res, err := pa.Api.PostC2CMessage(qctx, userOpenID, toCreate)
+		res, err := pa.getAPI().PostC2CMessage(qctx, userOpenID, toCreate)
 		if err != nil {
 			pa.EndPoint.Session.Parent.Logger.Error("official qq 发送单聊消息失败：" + err.Error())
 			lastErr = err
@@ -2274,6 +2858,9 @@ func (pa *PlatformAdapterOfficialQQ) waitGroupActiveQuota(ctx context.Context, g
 }
 
 func (pa *PlatformAdapterOfficialQQ) SendToGroup(ctx *MsgContext, uid string, text string, flag string) {
+	if !pa.canSend() || pa.getAPI() == nil {
+		return
+	}
 	groupId, idType := pa.mustExtractID(uid)
 
 	maxLen := 900
@@ -2321,8 +2908,8 @@ func (pa *PlatformAdapterOfficialQQ) SendToGroup(ctx *MsgContext, uid string, te
 					Message:     textList[0],
 					GroupID:     uid,
 					Sender: SenderBase{
-						UserID:   pa.EndPoint.UserID,
-						Nickname: pa.EndPoint.Nickname,
+						UserID:   pa.senderUserID(),
+						Nickname: pa.senderNickname(),
 					},
 					RawID: msg.ID,
 				}, flag)
@@ -2336,8 +2923,8 @@ func (pa *PlatformAdapterOfficialQQ) SendToGroup(ctx *MsgContext, uid string, te
 					Message:     textList[0],
 					GroupID:     uid,
 					Sender: SenderBase{
-						UserID:   pa.EndPoint.UserID,
-						Nickname: pa.EndPoint.Nickname,
+						UserID:   pa.senderUserID(),
+						Nickname: pa.senderNickname(),
 					},
 					RawID: msg.ID,
 				}, flag)
@@ -2366,8 +2953,8 @@ func (pa *PlatformAdapterOfficialQQ) SendToGroup(ctx *MsgContext, uid string, te
 						Message:     t,
 						GroupID:     uid,
 						Sender: SenderBase{
-							UserID:   pa.EndPoint.UserID,
-							Nickname: pa.EndPoint.Nickname,
+							UserID:   pa.senderUserID(),
+							Nickname: pa.senderNickname(),
 						},
 						RawID: msg.ID,
 					}, flag)
@@ -2381,8 +2968,8 @@ func (pa *PlatformAdapterOfficialQQ) SendToGroup(ctx *MsgContext, uid string, te
 						Message:     t,
 						GroupID:     uid,
 						Sender: SenderBase{
-							UserID:   pa.EndPoint.UserID,
-							Nickname: pa.EndPoint.Nickname,
+							UserID:   pa.senderUserID(),
+							Nickname: pa.senderNickname(),
 						},
 						RawID: msg.ID,
 					}, flag)
@@ -2406,8 +2993,8 @@ func (pa *PlatformAdapterOfficialQQ) SendToGroup(ctx *MsgContext, uid string, te
 					Message:     u.text,
 					GroupID:     uid,
 					Sender: SenderBase{
-						UserID:   pa.EndPoint.UserID,
-						Nickname: pa.EndPoint.Nickname,
+						UserID:   pa.senderUserID(),
+						Nickname: pa.senderNickname(),
 					},
 					RawID: msg.ID,
 				}, flag)
@@ -2421,8 +3008,8 @@ func (pa *PlatformAdapterOfficialQQ) SendToGroup(ctx *MsgContext, uid string, te
 					Message:     u.text,
 					GroupID:     uid,
 					Sender: SenderBase{
-						UserID:   pa.EndPoint.UserID,
-						Nickname: pa.EndPoint.Nickname,
+						UserID:   pa.senderUserID(),
+						Nickname: pa.senderNickname(),
 					},
 					RawID: msg.ID,
 				}, flag)
@@ -2460,7 +3047,7 @@ func (pa *PlatformAdapterOfficialQQ) sendQQGroupMsgRaw(ctx *MsgContext, rowMsgID
 				return
 			}
 		}
-		res, err := pa.Api.PostGroupMessage(qctx, groupID, toCreate)
+		res, err := pa.getAPI().PostGroupMessage(qctx, groupID, toCreate)
 		if err != nil {
 			pa.EndPoint.Session.Parent.Logger.Error("official qq 发送群聊消息失败：" + err.Error())
 			lastErr = err
@@ -2473,7 +3060,7 @@ func (pa *PlatformAdapterOfficialQQ) sendQQGroupMsgRaw(ctx *MsgContext, rowMsgID
 		switch elem := element.(type) {
 		case *message.TextElement:
 			content += rewriteOfficialQQGroupAtTags(textLinkStrip(elem.Content), func(target string) string {
-				return normalizeOfficialQQGroupAtTarget(pa.UIN, target)
+				return normalizeOfficialQQGroupAtTarget(pa.getUIN(), target)
 			})
 		case *message.ReplyElement:
 			msgRef = &dto.MessageReference{
@@ -2482,7 +3069,7 @@ func (pa *PlatformAdapterOfficialQQ) sendQQGroupMsgRaw(ctx *MsgContext, rowMsgID
 			}
 			toCreate.MessageReference = msgRef
 		case *message.AtElement:
-			target := normalizeOfficialQQGroupAtTarget(pa.UIN, elem.Target)
+			target := normalizeOfficialQQGroupAtTarget(pa.getUIN(), elem.Target)
 			content += renderOfficialQQGroupAtTarget(target)
 		case *message.ImageElement:
 			media, err := pa.uploadGroupMedia(qctx, groupID, elem.File, 1)
@@ -2556,8 +3143,8 @@ func (pa *PlatformAdapterOfficialQQ) sendQQChannelMsgRaw(ctx *MsgContext, rowMsg
 			target = strings.TrimPrefix(target, "QQ:")
 			if target == "all" {
 				content += "<qqbot-at-everyone />"
-			} else {
-				content += fmt.Sprintf("<qqbot-at-user id=\"%s\" />", target)
+			} else if rendered := formatOfficialQQAtUser(target); rendered != "" {
+				content += rendered
 			}
 		case *message.ImageElement:
 		case *message.ReplyElement:
@@ -2572,7 +3159,7 @@ func (pa *PlatformAdapterOfficialQQ) sendQQChannelMsgRaw(ctx *MsgContext, rowMsg
 	toCreate.MessageReference = msgRef
 	pa.finalizeMessageToCreate(toCreate, content, keyboardObj, true)
 
-	res, err := pa.Api.PostMessage(qctx, channelID, toCreate)
+	res, err := pa.getAPI().PostMessage(qctx, channelID, toCreate)
 	if err != nil {
 		pa.EndPoint.Session.Parent.Logger.Error("official qq 发送频道消息失败：" + err.Error())
 	}
@@ -2617,7 +3204,8 @@ func formatDiceIDOfficialQQGroupOpenID(uin, groupOpenID string) string {
 }
 
 func formatDiceIDOfficialQQMemberOpenID(uin, _ string, memberOpenID string) string {
-	// 官方QQ群成员ID格式
+	// 官方QQ群成员ID格式。当前实测同一用户跨群/C2C 的 openid 一致，
+	// 因此不把 groupOpenID 拼进键；若平台改为按群隔离，需要把 groupOpenID 加回。
 	return fmt.Sprintf("%s%s-%s", officialQQUserIDPrefix, uin, memberOpenID)
 }
 
@@ -2651,7 +3239,7 @@ func (pa *PlatformAdapterOfficialQQ) populateGroupMentionedInfo(msg *Message, me
 		// 官方 QQ 的消息正文仍使用裸 MemberOpenID，而人物卡使用规范 ID；
 		// 同时记录两种键，让旧字符串解析和未来的消息段解析都能取得昵称。
 		msg.MentionedInfo[officialQQUserIDPrefix+memberOpenID] = nickname
-		msg.MentionedInfo[formatDiceIDOfficialQQMemberOpenID(pa.UIN, "", memberOpenID)] = nickname
+		msg.MentionedInfo[formatDiceIDOfficialQQMemberOpenID(pa.getUIN(), "", memberOpenID)] = nickname
 	}
 }
 
@@ -2699,18 +3287,18 @@ func (pa *PlatformAdapterOfficialQQ) mustExtractID(text string) (string, OpenQQI
 
 func (pa *PlatformAdapterOfficialQQ) mustExtractTwoID(text string) (string, string, OpenQQIDType) {
 	if raw, ok := strings.CutPrefix(text, "OpenQQ-Group:"); ok {
-		groupOpenID, ok := strings.CutPrefix(raw, pa.UIN+"-")
-		if pa.UIN == "" || !ok || groupOpenID == "" {
+		groupOpenID, ok := strings.CutPrefix(raw, pa.getUIN()+"-")
+		if pa.getUIN() == "" || !ok || groupOpenID == "" {
 			return "", "", OpenQQUnknown
 		}
 		return groupOpenID, "", OpenQQGroupOpenid
 	}
 	if raw, ok := strings.CutPrefix(text, officialQQUserIDPrefix); ok {
-		if pa.UIN != "" && raw == pa.UIN {
+		if pa.getUIN() != "" && raw == pa.getUIN() {
 			return raw, "", OpenQQUser
 		}
-		userOpenID, ok := strings.CutPrefix(raw, pa.UIN+"-")
-		if pa.UIN == "" || !ok || userOpenID == "" {
+		userOpenID, ok := strings.CutPrefix(raw, pa.getUIN()+"-")
+		if pa.getUIN() == "" || !ok || userOpenID == "" {
 			return "", "", OpenQQUnknown
 		}
 		return userOpenID, "", OpenQQUserOpenid
@@ -2723,13 +3311,19 @@ func (pa *PlatformAdapterOfficialQQ) mustExtractTwoID(text string) (string, stri
 	}
 	if strings.HasPrefix(text, "OpenQQCH-Channel:") {
 		temp := text[len("OpenQQCH-Channel:"):]
-		lst := strings.Split(temp, "-")
-		return lst[1], lst[0], OpenQQCHChannel
+		parts := strings.SplitN(temp, "-", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return "", "", OpenQQUnknown
+		}
+		return parts[1], parts[0], OpenQQCHChannel
 	}
 	return "", "", OpenQQUnknown
 }
 
 func (pa *PlatformAdapterOfficialQQ) SendFileToPerson(ctx *MsgContext, uid string, path string, flag string) {
+	if !pa.canSend() || pa.getAPI() == nil {
+		return
+	}
 	if path == "" {
 		pa.EndPoint.Session.Parent.Logger.Error("official qq 发送私聊文件失败：文件路径为空")
 		return
@@ -2743,6 +3337,9 @@ func (pa *PlatformAdapterOfficialQQ) SendFileToPerson(ctx *MsgContext, uid strin
 }
 
 func (pa *PlatformAdapterOfficialQQ) SendFileToGroup(ctx *MsgContext, uid string, path string, flag string) {
+	if !pa.canSend() || pa.getAPI() == nil {
+		return
+	}
 	if path == "" {
 		pa.EndPoint.Session.Parent.Logger.Error("official qq 发送群聊文件失败：文件路径为空")
 		return
@@ -2786,10 +3383,13 @@ func (pa *PlatformAdapterOfficialQQ) ServeWebhook() int {
 func newOfficialQQWebhookHandler(pa *PlatformAdapterOfficialQQ, onError func(error)) http.Handler {
 	options := qqwebhook.HandlerOptions{
 		Credentials: &qqtoken.QQBotCredentials{
-			AppID:     pa.AppID.String(),
-			AppSecret: pa.AppSecret,
+			AppID:     pa.getAppID().String(),
+			AppSecret: pa.getAppSecret(),
 		},
-		AckMode: qqwebhook.AckAsync,
+		// AckSync 在 handler 返回后 ACK。dispatchOfficialQQEvent 会等待命令
+		// 真正执行完成，因此队列关闭/丢弃/进程崩溃时平台可以重试。
+		AckMode: qqwebhook.AckSync,
+		Deduper: newOfficialQQEventDeduper(10*time.Minute, 8192),
 	}
 	if onError != nil {
 		options.ErrorHandler = onError
@@ -2899,13 +3499,16 @@ func appendAttachmentsToMessage(msg *Message, attachments []*dto.MessageAttachme
 	}
 }
 
-func (pa *PlatformAdapterOfficialQQ) parseBotSelfOpenID(event *dto.WSPayload) string {
+func (pa *PlatformAdapterOfficialQQ) parseBotSelfOpenIDs(event *dto.WSPayload) []string {
 	if event == nil || len(event.RawMessage) == 0 {
-		return ""
+		return nil
 	}
 	type rawMention struct {
-		ID    string `json:"id"`
-		IsYou bool   `json:"is_you"`
+		ID           string `json:"id"`
+		MemberOpenID string `json:"member_openid"`
+		UserOpenID   string `json:"user_openid"`
+		IsYou        bool   `json:"is_you"`
+		Bot          bool   `json:"bot"`
 	}
 	type rawData struct {
 		Mentions []rawMention `json:"mentions"`
@@ -2915,20 +3518,82 @@ func (pa *PlatformAdapterOfficialQQ) parseBotSelfOpenID(event *dto.WSPayload) st
 		D    rawData `json:"d"`
 	}
 	var payload rawPayload
-	if err := json.Unmarshal(event.RawMessage, &payload); err == nil {
-		var mentions []rawMention
-		if len(payload.Data.Mentions) > 0 {
-			mentions = payload.Data.Mentions
-		} else {
-			mentions = payload.D.Mentions
-		}
-		for _, m := range mentions {
-			if m.IsYou {
-				return m.ID
+	if err := json.Unmarshal(event.RawMessage, &payload); err != nil {
+		return nil
+	}
+	mentions := payload.Data.Mentions
+	if len(mentions) == 0 {
+		mentions = payload.D.Mentions
+	}
+	ids := make([]string, 0, 3)
+	seen := map[string]struct{}{}
+	addIDs := func(m rawMention) {
+		// 群聊 AT 的正文使用 member_openid；回退时也应优先选它，
+		// 否则可能把全局 bot id 当成群成员 id，导致 TmpUID 匹配失败。
+		for _, id := range []string{m.MemberOpenID, m.UserOpenID, m.ID} {
+			if id == "" {
+				continue
 			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
 		}
 	}
-	return ""
+	for _, m := range mentions {
+		if m.IsYou {
+			addIDs(m)
+		}
+	}
+	if len(ids) > 0 {
+		return ids
+	}
+	// 兼容旧协议：没有 is_you 时，mentions 中只有一个 bot 条目才把它当作自身。
+	// 多个 bot 同时被 @ 时无法判断哪一个是我，宁可返回空，避免把别的机器人当成自己。
+	var botIDs []string
+	botSeen := map[string]struct{}{}
+	botMentions := 0
+	for _, m := range mentions {
+		if !m.Bot {
+			continue
+		}
+		botMentions++
+		for _, id := range []string{m.MemberOpenID, m.UserOpenID, m.ID} {
+			if id == "" {
+				continue
+			}
+			if _, ok := botSeen[id]; ok {
+				continue
+			}
+			botSeen[id] = struct{}{}
+			botIDs = append(botIDs, id)
+		}
+	}
+	if botMentions == 1 {
+		return botIDs
+	}
+	return nil
+}
+
+func (pa *PlatformAdapterOfficialQQ) parseBotSelfOpenID(event *dto.WSPayload) string {
+	ids := pa.parseBotSelfOpenIDs(event)
+	if len(ids) == 0 {
+		return ""
+	}
+	return ids[0]
+}
+
+func officialQQBotSelfMention(botSelfIDs []string, target string) bool {
+	if target == "" {
+		return false
+	}
+	for _, id := range botSelfIDs {
+		if id == target {
+			return true
+		}
+	}
+	return false
 }
 
 // ============================================================
@@ -3080,6 +3745,35 @@ type qqBotBindResult struct {
 	UserOpenID       string // 扫码用户 openid
 }
 
+// qqBotIDString 把 q.qq.com 可能返回的 string/number 统一成十进制 ID 字符串。
+// 直接 fmt.Sprintf("%v", float64) 会把 10 位 AppID 输出成科学计数法。
+func qqBotIDString(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(v)
+	case json.Number:
+		return v.String()
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return ""
+		}
+		if v == math.Trunc(v) {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case uint64:
+		return strconv.FormatUint(v, 10)
+	default:
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
+}
+
 func qqBotPollBindResult(taskID string) (*qqBotBindResult, error) {
 	reqBody, _ := json.Marshal(map[string]string{"task_id": taskID})
 	resp, err := qqBotHttpPost(qqBotPollBindResultURL, reqBody)
@@ -3110,7 +3804,7 @@ func qqBotPollBindResult(taskID string) (*qqBotBindResult, error) {
 
 	return &qqBotBindResult{
 		Status:           result.Data.Status,
-		BotAppID:         fmt.Sprintf("%v", result.Data.BotAppID),
+		BotAppID:         qqBotIDString(result.Data.BotAppID),
 		BotEncryptSecret: result.Data.BotEncryptSecret,
 		UserOpenID:       result.Data.UserOpenID,
 	}, nil
@@ -3197,7 +3891,19 @@ func removeOfficialQQEndpoint(session *IMSession, target *EndPointInfo) {
 	session.EndPoints = next
 }
 
-func (pa *PlatformAdapterOfficialQQ) failQrLogin(logMsg string, err error) {
+func (pa *PlatformAdapterOfficialQQ) setDiceServingIfIdle(value bool) bool {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	if pa.Ctx != nil {
+		return false
+	}
+	pa.serveMu.Lock()
+	pa.DiceServing = value
+	pa.serveMu.Unlock()
+	return true
+}
+
+func (pa *PlatformAdapterOfficialQQ) failQrLogin(ctx context.Context, generation uint64, logMsg string, err error) {
 	ep := pa.EndPoint
 	d := ep.Session.Parent
 	log := d.Logger
@@ -3206,13 +3912,18 @@ func (pa *PlatformAdapterOfficialQQ) failQrLogin(logMsg string, err error) {
 	} else {
 		log.Error(logMsg)
 	}
+	if !pa.isCurrentQrGeneration(generation) {
+		return
+	}
 	// 扫码流程失败后必须清掉 Ctx，否则 SetEnable/Serve 会认为会话仍在运行，
 	// 导致后续点击“启用”只改状态而不真正启动连接。
-	pa.stopSessionContext()
-	pa.DiceServing = false
+	if !pa.failSessionIfCurrent(ctx) {
+		// 扫码成功后的探测阶段已经主动清掉 Ctx；只有确实空闲时才回置失败，
+		// 不能覆盖/取消已经接管的新会话。
+		pa.setEndpointStateIfIdle(false, StateConnectionFailed)
+	}
+	pa.setDiceServingIfIdle(false)
 	pa.markQrLoginFailed()
-	ep.State = 3
-	ep.Enable = false
 	d.LastUpdatedTime = time.Now().Unix()
 	d.Save(false)
 }
@@ -3235,7 +3946,7 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 	// 启动扫码会话
 	taskID, key, err := qqBotCreateBindTask()
 	if err != nil {
-		pa.failQrLogin("official qq 创建扫码任务失败: ", err)
+		pa.failQrLogin(ctx, generation, "official qq 创建扫码任务失败: ", err)
 		return
 	}
 
@@ -3250,7 +3961,7 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 
 	qrCodeData, err := qrcode.Encode(session.QrURL, qrcode.Medium, 256)
 	if err != nil {
-		pa.failQrLogin("official qq 生成二维码失败: ", err)
+		pa.failQrLogin(ctx, generation, "official qq 生成二维码失败: ", err)
 		return
 	}
 
@@ -3298,18 +4009,18 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 				if !pa.isCurrentQrGeneration(generation) {
 					return
 				}
-				pa.AppID = OfficialQQAppID(strings.TrimSpace(result.BotAppID))
-				if pa.AppID.String() == "" {
-					pa.failQrLogin("official qq 扫码结果缺少 AppID: ", nil)
+				pa.setAppID(OfficialQQAppID(strings.TrimSpace(result.BotAppID)))
+				if pa.getAppID().String() == "" {
+					pa.failQrLogin(ctx, generation, "official qq 扫码结果缺少 AppID: ", nil)
 					return
 				}
 
 				secret, derr := qqBotDecryptSecret(result.BotEncryptSecret, curSession.Key)
 				if derr != nil {
-					pa.failQrLogin("official qq 解密 AppSecret 失败: ", derr)
+					pa.failQrLogin(ctx, generation, "official qq 解密 AppSecret 失败: ", derr)
 					return
 				}
-				pa.AppSecret = secret
+				pa.setAppSecret(secret)
 				pa.qrMu.Lock()
 				pa.QrLoginState = OfficialQQLoginStateConnecting
 				pa.QrURL = ""
@@ -3318,31 +4029,57 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 				pa.qrMu.Unlock()
 				d.LastUpdatedTime = time.Now().Unix()
 				d.Save(false)
-				log.Infof("official qq 扫码成功，AppID=%s，开始探测凭据", pa.AppID)
+				log.Infof("official qq 扫码成功，AppID=%s，开始探测凭据", pa.getAppID())
 
-				// 停止扫码 context；后续探测与 connect 使用独立生命周期
-				pa.stopSessionContext()
+				// 停止扫码 context；后续探测与 connect 使用独立生命周期。
+				// 必须只取消本函数捕获的 ctx，不能用“当前 Ctx”，否则快速
+				// 禁用/启用后会把新会话取消掉。
+				pa.stopSessionContextIf(ctx)
 				if !pa.isCurrentQrGeneration(generation) {
 					return
 				}
 
 				probeCtx, probeCancel := context.WithTimeout(context.Background(), 15*time.Second)
-				probe, probeErr := ProbeOfficialQQAccount(probeCtx, pa.AppID.String(), pa.AppSecret)
+				probe, probeErr := ProbeOfficialQQAccount(probeCtx, pa.getAppID().String(), pa.getAppSecret())
 				probeCancel()
 				if probeErr != nil {
-					pa.failQrLogin("official qq 扫码后凭据探测失败: ", probeErr)
+					pa.failQrLogin(ctx, generation, "official qq 扫码后凭据探测失败: ", probeErr)
 					return
 				}
 				if !pa.isCurrentQrGeneration(generation) {
 					return
 				}
 
-				existing := FindOfficialQQEndpointByUIN(d.ImSession, probe.UIN, ep.ID)
+				existing := FindOfficialQQEndpointByUINOrBotID(d.ImSession, probe.UIN, probe.BotID, ep.ID)
 				if existing != nil {
+					if !pa.isCurrentQrGeneration(generation) {
+						return
+					}
 					log.Infof("official qq 扫码账号重复，准备替换已有端点: UIN=%s temporaryID=%s", probe.UIN, ep.ID)
+					var originalAdapter *PlatformAdapterOfficialQQ
+					if a, ok := existing.Adapter.(*PlatformAdapterOfficialQQ); ok {
+						originalAdapter = a
+						// 先停掉重试循环、旧连接和旧队列，避免替换 AppID/UIN 时
+						// 退避中的 Serve 又用旧凭据拉起一个会话。
+						a.cancelServeLoop()
+						a.setDiceServing(false)
+						oldQueue := a.currentEventQueue()
+						// 只停止本次捕获到的会话，避免把并发启动的新会话取消。
+						if existingCtx := a.currentSessionContext(); existingCtx != nil {
+							a.stopSessionContextIf(existingCtx)
+						}
+						a.closeOfficialQQEventQueueInstance(oldQueue)
+						if oldQueue != nil {
+							_ = oldQueue.WaitForIdle(2 * time.Second)
+						}
+						a.shutdownWebhookServer()
+					}
 					existingAdapter, replaceErr := replaceOfficialQQCredentials(existing, pa, probe)
 					if replaceErr != nil {
-						pa.failQrLogin("official qq 替换已有账号失败: ", replaceErr)
+						if originalAdapter != nil {
+							_ = originalAdapter.DoRelogin()
+						}
+						pa.failQrLogin(ctx, generation, "official qq 替换已有账号失败: ", replaceErr)
 						return
 					}
 					reloginOK := existingAdapter.DoRelogin()
@@ -3351,16 +4088,17 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 					} else {
 						log.Infof("official qq 重复账号替换成功，已有端点已开始重连: UIN=%s", probe.UIN)
 					}
-					pa.AppID = ""
-					pa.AppSecret = ""
-					pa.UIN = ""
+					pa.setAppID("")
+					pa.setAppSecret("")
+					pa.setUIN("")
+					pa.sessionMu.Lock()
 					ep.UserID = ""
 					ep.Nickname = ""
-					pa.stopSessionContext()
-					pa.DiceServing = false
+					pa.sessionMu.Unlock()
+					pa.stopSessionContextIf(ctx)
+					pa.setDiceServingIfIdle(false)
 					pa.markQrLoginFailed()
-					ep.State = 3
-					ep.Enable = false
+					pa.setEndpointStateIfIdle(false, StateConnectionFailed)
 					removeOfficialQQEndpoint(d.ImSession, ep)
 					d.LastUpdatedTime = time.Now().Unix()
 					d.Save(false)
@@ -3368,14 +4106,22 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 					return
 				}
 
+				if !pa.isCurrentQrGeneration(generation) {
+					return
+				}
 				pa.applyProbeResult(probe)
 				d.LastUpdatedTime = time.Now().Unix()
 				d.Save(false)
 				log.Infof("official qq 扫码探测完成，UIN=%s，开始连接", probe.UIN)
+				if !pa.isCurrentQrGeneration(generation) {
+					return
+				}
 				if pa.connect(nil, probe) != 0 {
-					ep.Enable = false
-					d.LastUpdatedTime = time.Now().Unix()
-					d.Save(false)
+					// beginSession 失败说明已有新会话接管，不能把它的 Enable 改掉。
+					if pa.setEndpointStateIfIdle(false, StateConnectionFailed) {
+						d.LastUpdatedTime = time.Now().Unix()
+						d.Save(false)
+					}
 				}
 				return
 
@@ -3383,14 +4129,14 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 				newTaskID, newKey, cerr := qqBotCreateBindTask()
 				if cerr != nil {
 					curSession.mu.Unlock()
-					pa.failQrLogin("official qq 刷新扫码任务失败: ", cerr)
+					pa.failQrLogin(ctx, generation, "official qq 刷新扫码任务失败: ", cerr)
 					return
 				}
 				newQrURL := qqBotBuildConnectURL(newTaskID, curSession.Source)
 				newQrCodeData, qerr := qrcode.Encode(newQrURL, qrcode.Medium, 256)
 				if qerr != nil {
 					curSession.mu.Unlock()
-					pa.failQrLogin("official qq 生成新二维码失败: ", qerr)
+					pa.failQrLogin(ctx, generation, "official qq 生成新二维码失败: ", qerr)
 					return
 				}
 				curSession.TaskID = newTaskID

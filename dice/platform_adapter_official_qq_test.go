@@ -481,6 +481,33 @@ func TestOfficialQQAtFallbackUsesBotOpenID(t *testing.T) {
 	}
 }
 
+func TestOfficialQQAtUsesBotMentionWhenNotFirst(t *testing.T) {
+	t.Parallel()
+
+	pa := &PlatformAdapterOfficialQQ{UIN: "1", botID: "bot-open-id"}
+	msg := pa.groupMsgToStdMsg(nil, &dto.WSGroupATMessageData{
+		Content:     `<qqbot-at-user id="other-member" /> <qqbot-at-user id="bot-open-id" /> .r`,
+		GroupOpenID: "group-open-id",
+	})
+	if msg.TmpUID != "OpenQQ:bot-open-id" {
+		t.Fatalf("TmpUID = %q, want bot OpenID even when another member is mentioned first", msg.TmpUID)
+	}
+}
+
+func TestOfficialQQAtUsesMemberOpenIDFromMentions(t *testing.T) {
+	t.Parallel()
+
+	pa := &PlatformAdapterOfficialQQ{UIN: "1", botID: "global-bot-id"}
+	raw := []byte(`{"d":{"mentions":[{"member_openid":"group-member-openid","is_you":true}]}}`)
+	msg := pa.groupMsgToStdMsg(&dto.WSPayload{RawMessage: raw}, &dto.WSGroupATMessageData{
+		Content:     `<qqbot-at-user id="group-member-openid" /> .r`,
+		GroupOpenID: "group-open-id",
+	})
+	if msg.TmpUID != "OpenQQ:group-member-openid" {
+		t.Fatalf("TmpUID = %q, want member OpenID from is_you mention", msg.TmpUID)
+	}
+}
+
 func TestOfficialQQGroupMessagesPreserveMemberRole(t *testing.T) {
 	t.Parallel()
 
