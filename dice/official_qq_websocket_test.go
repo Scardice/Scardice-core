@@ -66,7 +66,7 @@ func TestOfficialQQWebSocket_dispatchesGroupMemberEventThroughQueue(t *testing.T
 
 	select {
 	case event := <-received:
-		if event.GroupOpenID != "group-open-id" || event.MemberOpenID != "member-open-id" || event.Timestamp != 123 {
+		if event.GroupOpenID != "group-open-id" || event.MemberOpenID != "member-open-id" || event.Timestamp != 123 || event.Sequence != 7 {
 			t.Fatalf("member event = %#v", event)
 		}
 	case <-time.After(time.Second):

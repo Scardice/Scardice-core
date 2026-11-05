@@ -4,6 +4,7 @@ package dice
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"Scardice-core/adapterapi"
@@ -50,12 +51,45 @@ func TestCreateTempCtxAllowsBoundInternalUIEndpoint(t *testing.T) {
 
 	msg := newGroupMsg("UI-Group:2101", "UI:1101", ".r 1")
 	ctx := CreateTempCtx(uiEp, msg)
+	defer ctx.releaseExecutionState()
 
 	if ctx.EndPoint != uiEp {
 		t.Fatalf("expected internal UI endpoint to be used directly")
 	}
 	if ctx.Session != d.ImSession {
 		t.Fatalf("expected ctx session to be current imSession, got %#v", ctx.Session)
+	}
+	if ctx.callbackTransaction != nil {
+		t.Fatal("detached temporary context unexpectedly acquired a durable root")
+	}
+	if ctx.Player == nil || ctx.Player.UserID() != "UI:1101" {
+		t.Fatalf("detached player identity = %#v", ctx.Player)
+	}
+	VarSetValueStr(ctx, "$t局部", "value")
+	if got, ok := VarGetValueStr(ctx, "$t局部"); !ok || got != "value" {
+		t.Fatalf("temporary value = %q, %t", got, ok)
+	}
+	VarDelValue(ctx, "$t局部")
+	if _, ok := VarGetValue(ctx, "$t局部"); ok {
+		t.Fatal("temporary delete fell through to persistent attributes")
+	}
+	ctx.IsCompatibilityTest = true
+	for _, key := range []string{"$mPreview", "$gPreview", "skill"} {
+		VarSetValueStr(ctx, key, "preview")
+		if got, ok := VarGetValueStr(ctx, key); !ok || got != "preview" {
+			t.Fatalf("compatibility value %q = %q, %t", key, got, ok)
+		}
+		VarDelValue(ctx, key)
+		if _, ok := VarGetValue(ctx, key); ok {
+			t.Fatalf("compatibility delete %q reached persistent attributes", key)
+		}
+	}
+	ctx.IsCompatibilityTest = false
+	if err := ctx.Player.SetName("must-not-persist"); !errors.Is(err, ErrPlayerHandleUnavailable) {
+		t.Fatalf("detached durable setter error = %v", err)
+	}
+	if err := ctx.getExecutionError(); err != nil {
+		t.Fatalf("local temporary operations poisoned context: %v", err)
 	}
 }
 

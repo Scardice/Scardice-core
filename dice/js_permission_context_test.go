@@ -26,21 +26,17 @@ func newPermissionTestDice(t *testing.T, packageID string, permissions sealpack.
 		InstallPath:  t.TempDir(),
 		UserDataPath: t.TempDir(),
 	}
-	d := &Dice{
-		Logger: zap.NewNop().Sugar(),
-		BaseConfig: BaseConfig{
-			DataDir: t.TempDir(),
-		},
-		PackageManager: &PackageManager{
-			lock:     &sync.RWMutex{},
-			packages: map[string]*sealpack.Instance{packageID: instance},
-		},
-		ImSession:    &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
-		DirtyGroups:  new(SyncMap[string, int64]),
-		AttrsManager: &AttrsManager{},
-		ExtRegistry:  new(SyncMap[string, *ExtInfo]),
+	d, _ := newCanonicalTestDice(t)
+	d.Logger = zap.NewNop().Sugar()
+	d.BaseConfig.DataDir = t.TempDir()
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.DataDir = d.BaseConfig.DataDir
+	})
+	d.PackageManager = &PackageManager{
+		lock:     &sync.RWMutex{},
+		packages: map[string]*sealpack.Instance{packageID: instance},
+		parent:   d,
 	}
-	d.PackageManager.parent = d
 	return d
 }
 
@@ -155,7 +151,7 @@ func TestNativeQuickJSFilesystemPermissionContextSurvivesAsyncService(t *testing
 	const packageID = "author/native-async-filesystem-permission"
 	const extensionName = "native-async-filesystem-permission"
 	d := newPermissionTestDice(t, packageID, sealpack.Permissions{FileRead: []string{"data/*"}})
-	d.Config.JsEngine = "quickjs"
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.JsEngine = "quickjs" })
 	dataDir := filepath.Join(d.BaseConfig.DataDir, "extensions", extensionName, "data")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		t.Fatal(err)

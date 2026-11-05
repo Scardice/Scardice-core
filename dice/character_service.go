@@ -2,6 +2,7 @@ package dice
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -9,31 +10,23 @@ import (
 
 	"Scardice-core/adapterapi"
 	"Scardice-core/core/attributestate"
-	"Scardice-core/dice/service"
 	"Scardice-core/endpoint"
-	"Scardice-core/eventstore"
 )
 
-// errMissingCharIDOrName reports a character request that named neither an id
-// nor a name, matching the legacy protocol sentinel.
 var errMissingCharIDOrName = errors.New("missing id or name")
 
-// CharacterService is the Core-owned implementation of the provider character
-// API. It owns durable character state and enforces the legacy ownership and
-// platform rules; provider runtimes relay bounded DTOs and apply their own
-// per-endpoint write rate limit.
 type CharacterService struct {
 	dice *Dice
 }
 
-func NewCharacterService(instance *Dice) *CharacterService {
-	return &CharacterService{dice: instance}
-}
+func NewCharacterService(instance *Dice) *CharacterService { return &CharacterService{dice: instance} }
 
 var _ endpoint.CharacterSink = (*CharacterService)(nil)
 
-// HandleCharacter executes one fenced character operation. Malformed requests
-// produce an explicit failure response so the provider is not left waiting.
+// HandleCharacter owns one independent durable root. The fenced endpoint
+// generation/version is the admission identity and the full request is the
+// canonical digest input; every metadata/value read and write shares its one
+// DomainTx.
 func (svc *CharacterService) HandleCharacter(ctx context.Context, request endpoint.FencedCharacterRequest) (adapterapi.CharacterResponse, error) {
 	if svc == nil || svc.dice == nil || svc.dice.AttrsManager == nil {
 		return adapterapi.CharacterResponse{OK: false, Error: "character service is unavailable"}, nil
@@ -41,34 +34,41 @@ func (svc *CharacterService) HandleCharacter(ctx context.Context, request endpoi
 	if err := ctx.Err(); err != nil {
 		return adapterapi.CharacterResponse{}, err
 	}
-	attrs := svc.attrs()
-	attrs.callbackGate.Lock()
-	defer attrs.callbackGate.Unlock()
-	if err := ctx.Err(); err != nil {
+	canonical, err := json.Marshal(request)
+	if err != nil {
 		return adapterapi.CharacterResponse{}, err
 	}
-	operation := request.Request
-	switch operation.Operation {
+	identity := fmt.Sprintf("character:%s:%d:%d", request.EndpointID, request.Generation, request.DesiredVersion)
+	var response adapterapi.CharacterResponse
+	err = svc.dice.WithDomainExecution(ctx, identity, canonical, func(tx *DurableCallbackTransaction) error {
+		response = svc.execute(ctx, tx, request.Request)
+		return nil
+	})
+	return response, err
+}
+
+func (svc *CharacterService) execute(ctx context.Context, tx *DurableCallbackTransaction, request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
+	switch request.Operation {
 	case adapterapi.CharacterOperationGet:
-		return svc.get(operation), nil
+		return svc.get(ctx, tx, request)
 	case adapterapi.CharacterOperationSet:
-		return svc.set(operation), nil
+		return svc.set(ctx, tx, request)
 	case adapterapi.CharacterOperationList:
-		return svc.list(operation), nil
+		return svc.list(ctx, tx, request)
 	case adapterapi.CharacterOperationNew:
-		return svc.newCharacter(operation), nil
+		return svc.newCharacter(ctx, tx, request)
 	case adapterapi.CharacterOperationSave:
-		return svc.save(operation), nil
+		return svc.save(ctx, tx, request)
 	case adapterapi.CharacterOperationTag:
-		return svc.tag(operation), nil
+		return svc.tag(ctx, tx, request)
 	case adapterapi.CharacterOperationUntagAll:
-		return svc.untagAll(operation), nil
+		return svc.untagAll(ctx, tx, request)
 	case adapterapi.CharacterOperationLoad:
-		return svc.load(operation), nil
+		return svc.load(ctx, tx, request)
 	case adapterapi.CharacterOperationDelete:
-		return svc.delete(operation), nil
+		return svc.delete(ctx, tx, request)
 	default:
-		return adapterapi.CharacterResponse{OK: false, Error: "unsupported character operation"}, nil
+		return adapterapi.CharacterResponse{OK: false, Error: "unsupported character operation"}
 	}
 }
 
@@ -78,62 +78,25 @@ func (svc *CharacterService) failure(err error) adapterapi.CharacterResponse {
 
 func (svc *CharacterService) attrs() *AttrsManager { return svc.dice.AttrsManager }
 
-// characterMetadata reads the durable owner/type/name facts for a character
-// without loading its payload. In the event-sourced runtime the legacy SQL
-// operator is unset, so the projection is the source of truth; the legacy path
-// is retained only for the SQL-backed runtime.
-func (svc *CharacterService) characterMetadata(id string) (owner, attrsType, name, sheetType string, exists bool, err error) {
-	manager := svc.attrs()
-	if manager.durable != nil {
-		state, readErr := attributestate.ReadProjected(context.Background(), manager.store, manager.diceID, id)
-		if errors.Is(readErr, eventstore.ErrNotFound) {
-			return "", "", "", "", false, nil
-		}
-		if readErr != nil {
-			return "", "", "", "", false, readErr
-		}
-		if state.AttrsType == "" {
-			return "", "", "", "", false, nil
-		}
-		return state.OwnerID, state.AttrsType, state.Name, state.SheetType, true, nil
-	}
-	item, readErr := service.AttrsGetById(manager.db, id)
-	if readErr != nil {
-		return "", "", "", "", false, readErr
-	}
-	if !item.IsDataExists() {
-		return "", "", "", "", false, nil
-	}
-	return item.OwnerId, item.AttrsType, item.Name, item.SheetType, true, nil
-}
-
-// commitAttributes durably persists a mutated attribute item and reports any
-// write error so success is never claimed before the state is committed.
-func (svc *CharacterService) commitAttributes(item *AttributesItem) error {
-	if item == nil {
-		return errors.New("character item is unavailable")
-	}
-	manager := svc.attrs()
-	if manager.durable != nil {
-		return manager.saveItem(item)
-	}
-	if manager.db == nil {
-		return errors.New("character storage is unavailable")
-	}
-	model, err := item.GetBatchSaveModel()
+func (svc *CharacterService) characterMetadata(ctx context.Context, tx *DurableCallbackTransaction, id string) (attributestate.State, bool, error) {
+	item, err := svc.attrs().LoadByTransaction(ctx, tx, id)
 	if err != nil {
-		return err
+		return attributestate.State{}, false, err
 	}
-	return service.AttrsPutsByIDBatch(manager.db, []*service.AttributesBatchUpsertModel{model})
+	state := item.State()
+	if state.AttrsType == "" {
+		return attributestate.State{}, false, nil
+	}
+	return state, true, nil
 }
 
-func (svc *CharacterService) get(request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
+func (svc *CharacterService) get(ctx context.Context, tx *DurableCallbackTransaction, request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
 	if request.GroupID == "" || request.UserID == "" {
 		return adapterapi.CharacterResponse{OK: false, Error: "missing group_id or user_id"}
 	}
 	groupID := FormatDiceIDSealChatGroup(request.GroupID)
 	userID := FormatDiceIDSealChat(request.UserID)
-	attrs, err := svc.attrs().Load(groupID, userID)
+	attrs, err := svc.attrs().LoadForTransaction(ctx, tx, groupID, userID)
 	if err != nil {
 		return svc.failure(err)
 	}
@@ -142,40 +105,40 @@ func (svc *CharacterService) get(request adapterapi.CharacterRequest) adapterapi
 		data[key] = vmValueToAny(value)
 		return true
 	})
-	return adapterapi.CharacterResponse{OK: true, Attributes: data, AttributesSet: true, Name: attrs.Name, SheetType: attrs.SheetType}
+	return adapterapi.CharacterResponse{
+		OK: true, Attributes: data, AttributesSet: true, Name: attrs.Name(), SheetType: attrs.SheetType(),
+	}
 }
 
-func (svc *CharacterService) set(request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
+func (svc *CharacterService) set(ctx context.Context, tx *DurableCallbackTransaction, request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
 	if request.GroupID == "" || request.UserID == "" {
 		return adapterapi.CharacterResponse{OK: false, Error: "missing group_id or user_id"}
 	}
 	if request.Attributes == nil && (!request.NameSet || request.Name == "") {
 		return adapterapi.CharacterResponse{OK: false, Error: "missing attrs or name"}
 	}
-	groupID := FormatDiceIDSealChatGroup(request.GroupID)
-	userID := FormatDiceIDSealChat(request.UserID)
-	attrs, err := svc.attrs().Load(groupID, userID)
+	attrs, err := svc.attrs().LoadForTransaction(ctx, tx, FormatDiceIDSealChatGroup(request.GroupID), FormatDiceIDSealChat(request.UserID))
 	if err != nil {
 		return svc.failure(err)
 	}
 	for key, value := range request.Attributes {
-		attrs.Store(key, anyToVMValue(value))
+		if err = attrs.Store(key, anyToVMValue(value)); err != nil {
+			return svc.failure(err)
+		}
 	}
 	if request.NameSet && request.Name != "" {
-		attrs.Name = request.Name
-		attrs.SetModified()
-	}
-	if err := svc.commitAttributes(attrs); err != nil {
-		return svc.failure(err)
+		if err = attrs.SetName(request.Name); err != nil {
+			return svc.failure(err)
+		}
 	}
 	return adapterapi.CharacterResponse{OK: true}
 }
 
-func (svc *CharacterService) list(request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
+func (svc *CharacterService) list(ctx context.Context, tx *DurableCallbackTransaction, request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
 	if request.UserID == "" {
 		return adapterapi.CharacterResponse{OK: false, Error: "missing user_id"}
 	}
-	list, err := svc.attrs().GetCharacterList(FormatDiceIDSealChat(request.UserID))
+	list, err := svc.attrs().GetCharacterListForTransaction(ctx, tx, FormatDiceIDSealChat(request.UserID))
 	if err != nil {
 		return svc.failure(err)
 	}
@@ -186,148 +149,150 @@ func (svc *CharacterService) list(request adapterapi.CharacterRequest) adapterap
 	return adapterapi.CharacterResponse{OK: true, List: result}
 }
 
-func (svc *CharacterService) newCharacter(request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
+func (svc *CharacterService) newCharacter(ctx context.Context, tx *DurableCallbackTransaction, request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
 	if request.GroupID == "" || request.UserID == "" || !request.NameSet || request.Name == "" {
 		return adapterapi.CharacterResponse{OK: false, Error: "missing group_id, user_id or name"}
 	}
 	userID := FormatDiceIDSealChat(request.UserID)
 	groupID := FormatDiceIDSealChatGroup(request.GroupID)
-	if svc.attrs().CharCheckExists(userID, request.Name) {
+	existingID, err := svc.attrs().CharIdGetByNameForTransaction(ctx, tx, userID, request.Name)
+	if err != nil {
+		return svc.failure(err)
+	}
+	if existingID != "" {
 		return adapterapi.CharacterResponse{OK: false, Error: "character already exists"}
 	}
 	sheetType := request.SheetType
 	if sheetType == "" {
 		sheetType = "coc7"
 	}
-	item, err := svc.attrs().CharNew(userID, request.Name, sheetType)
+	item, err := svc.attrs().CharNewForTransaction(ctx, tx, userID, request.Name, sheetType)
 	if err != nil {
 		return svc.failure(err)
 	}
-	if err := svc.attrs().CharBind(item.Id, groupID, userID); err != nil {
+	if err = svc.attrs().CharBindForTransaction(ctx, tx, item.Id, groupID, userID); err != nil {
 		return svc.failure(err)
 	}
 	return adapterapi.CharacterResponse{OK: true, ID: item.Id, Name: request.Name, SheetType: sheetType, BoundGroupID: groupID}
 }
 
-func (svc *CharacterService) save(request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
+func (svc *CharacterService) save(ctx context.Context, tx *DurableCallbackTransaction, request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
 	if request.GroupID == "" || request.UserID == "" {
 		return adapterapi.CharacterResponse{OK: false, Error: "missing group_id or user_id"}
 	}
 	userID := FormatDiceIDSealChat(request.UserID)
 	groupID := FormatDiceIDSealChatGroup(request.GroupID)
-
-	current, err := svc.attrs().Load(groupID, userID)
+	current, err := svc.attrs().LoadForTransaction(ctx, tx, groupID, userID)
 	if err != nil {
 		return svc.failure(err)
 	}
 	name := request.Name
 	if name == "" {
-		name = current.Name
+		name = current.Name()
 	}
 	if name == "" {
 		return adapterapi.CharacterResponse{OK: false, Error: "name is required"}
 	}
 	sheetType := request.SheetType
 	if sheetType == "" {
-		sheetType = current.SheetType
+		sheetType = current.SheetType()
 	}
 	if sheetType == "" {
 		sheetType = "coc7"
 	}
 
-	var action string
-	var charID string
-	existingID, _ := svc.attrs().CharIdGetByName(userID, name)
+	existingID, err := svc.attrs().CharIdGetByNameForTransaction(ctx, tx, userID, name)
+	if err != nil {
+		return svc.failure(err)
+	}
+	var action, charID string
 	if existingID == "" {
-		newItem, err := svc.attrs().CharNew(userID, name, sheetType)
-		if err != nil {
-			return svc.failure(err)
+		newItem, createErr := svc.attrs().CharNewForTransaction(ctx, tx, userID, name, sheetType)
+		if createErr != nil {
+			return svc.failure(createErr)
 		}
-		charID = newItem.Id
-		action = "created"
-		newAttrs, err := svc.attrs().LoadById(charID)
-		if err != nil {
-			return svc.failure(err)
-		}
-		current.Range(func(key string, value *ds.VMValue) bool {
-			newAttrs.Store(key, value)
-			return true
-		})
-		newAttrs.Name = name
-		newAttrs.SheetType = sheetType
-		if err := svc.commitAttributes(newAttrs); err != nil {
-			return svc.failure(err)
-		}
+		charID, action = newItem.Id, "created"
 	} else {
-		bindingGroups := svc.attrs().CharGetBindingGroupIdList(existingID)
+		bindingGroups, bindingErr := svc.attrs().CharGetBindingGroupIDListForTransaction(ctx, tx, existingID)
+		if bindingErr != nil {
+			return svc.failure(bindingErr)
+		}
 		if len(bindingGroups) > 0 {
 			return adapterapi.CharacterResponse{OK: false, Error: "character is bound, cannot overwrite", UnboundGroups: bindingGroups}
 		}
-		charID = existingID
-		action = "updated"
-		existingAttrs, err := svc.attrs().LoadById(charID)
-		if err != nil {
-			return svc.failure(err)
-		}
-		existingAttrs.Clear()
-		current.Range(func(key string, value *ds.VMValue) bool {
-			existingAttrs.Store(key, value)
-			return true
-		})
-		existingAttrs.Name = name
-		existingAttrs.SheetType = sheetType
-		existingAttrs.SetModified()
-		if err := svc.commitAttributes(existingAttrs); err != nil {
-			return svc.failure(err)
-		}
+		charID, action = existingID, "updated"
+	}
+	target, err := svc.attrs().LoadByTransaction(ctx, tx, charID)
+	if err != nil {
+		return svc.failure(err)
+	}
+	target.Clear()
+	var copyErr error
+	current.Range(func(key string, value *ds.VMValue) bool {
+		copyErr = target.Store(key, value)
+		return copyErr == nil
+	})
+	if copyErr != nil {
+		return svc.failure(copyErr)
+	}
+	if err = target.SetName(name); err != nil {
+		return svc.failure(err)
+	}
+	if err = target.SetSheetType(sheetType); err != nil {
+		return svc.failure(err)
 	}
 	return adapterapi.CharacterResponse{OK: true, ID: charID, Name: name, Action: action}
 }
 
-func (svc *CharacterService) tag(request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
+func (svc *CharacterService) tag(ctx context.Context, tx *DurableCallbackTransaction, request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
 	if request.GroupID == "" || request.UserID == "" {
 		return adapterapi.CharacterResponse{OK: false, Error: "missing group_id or user_id"}
 	}
 	userID := FormatDiceIDSealChat(request.UserID)
 	groupID := FormatDiceIDSealChatGroup(request.GroupID)
-
-	charID, charName, err := svc.charIDFromRequest(request, userID)
+	charID, charName, err := svc.charIDFromRequest(ctx, tx, request, userID)
 	if err != nil && !errors.Is(err, errMissingCharIDOrName) {
 		return svc.failure(err)
 	}
 	if charID != "" {
-		if err := svc.attrs().CharBind(charID, groupID, userID); err != nil {
+		if err = svc.attrs().CharBindForTransaction(ctx, tx, charID, groupID, userID); err != nil {
 			return svc.failure(err)
 		}
 		return adapterapi.CharacterResponse{OK: true, Action: "bind", ID: charID, Name: charName}
 	}
-	currentBindingID, _ := svc.attrs().CharGetBindingId(groupID, userID)
+	currentBindingID, err := svc.attrs().CharGetBindingIDForTransaction(ctx, tx, groupID, userID)
+	if err != nil {
+		return svc.failure(err)
+	}
 	if currentBindingID == "" {
 		return adapterapi.CharacterResponse{OK: false, Error: "no character bound"}
 	}
 	var unboundName string
-	if currentAttrs, err := svc.attrs().LoadById(currentBindingID); err == nil && currentAttrs != nil {
-		unboundName = currentAttrs.Name
+	if currentAttrs, loadErr := svc.attrs().LoadByTransaction(ctx, tx, currentBindingID); loadErr == nil {
+		unboundName = currentAttrs.Name()
 	}
-	if err := svc.attrs().CharBind("", groupID, userID); err != nil {
+	if err = svc.attrs().CharBindForTransaction(ctx, tx, "", groupID, userID); err != nil {
 		return svc.failure(err)
 	}
 	return adapterapi.CharacterResponse{OK: true, Action: "unbind", ID: currentBindingID, Name: unboundName}
 }
 
-func (svc *CharacterService) untagAll(request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
+func (svc *CharacterService) untagAll(ctx context.Context, tx *DurableCallbackTransaction, request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
 	if request.UserID == "" {
 		return adapterapi.CharacterResponse{OK: false, Error: "missing user_id"}
 	}
 	userID := FormatDiceIDSealChat(request.UserID)
-	charID, charName, err := svc.charIDFromRequest(request, userID)
+	charID, charName, err := svc.charIDFromRequest(ctx, tx, request, userID)
 	if errors.Is(err, errMissingCharIDOrName) {
 		if request.GroupID != "" {
 			groupID := FormatDiceIDSealChatGroup(request.GroupID)
-			charID, _ = svc.attrs().CharGetBindingId(groupID, userID)
+			charID, err = svc.attrs().CharGetBindingIDForTransaction(ctx, tx, groupID, userID)
+			if err != nil {
+				return svc.failure(err)
+			}
 			if charID != "" {
-				if attrs, err := svc.attrs().LoadById(charID); err == nil && attrs != nil {
-					charName = attrs.Name
+				if attrs, loadErr := svc.attrs().LoadByTransaction(ctx, tx, charID); loadErr == nil {
+					charName = attrs.Name()
 				}
 			}
 		}
@@ -337,93 +302,90 @@ func (svc *CharacterService) untagAll(request adapterapi.CharacterRequest) adapt
 	if charID == "" {
 		return adapterapi.CharacterResponse{OK: false, Error: "no character specified or bound"}
 	}
-	unbound := svc.attrs().CharUnbindAll(charID)
-	if unbound == nil {
-		return svc.failure(errors.New("character unbind failed"))
+	unbound, err := svc.attrs().CharUnbindAllForTransaction(ctx, tx, charID)
+	if err != nil {
+		return svc.failure(err)
 	}
 	return adapterapi.CharacterResponse{OK: true, ID: charID, Name: charName, UnboundGroups: unbound}
 }
 
-func (svc *CharacterService) load(request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
+func (svc *CharacterService) load(ctx context.Context, tx *DurableCallbackTransaction, request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
 	if request.GroupID == "" || request.UserID == "" {
 		return adapterapi.CharacterResponse{OK: false, Error: "missing group_id or user_id"}
 	}
 	userID := FormatDiceIDSealChat(request.UserID)
 	groupID := FormatDiceIDSealChatGroup(request.GroupID)
-
-	charID, charName, err := svc.charIDFromRequest(request, userID)
+	charID, charName, err := svc.charIDFromRequest(ctx, tx, request, userID)
 	if err != nil {
 		return svc.failure(err)
 	}
-	source, err := svc.attrs().LoadById(charID)
+	source, err := svc.attrs().LoadByTransaction(ctx, tx, charID)
 	if err != nil {
 		return svc.failure(err)
 	}
-	// Snapshot the source first: Load(groupID, userID) returns the bound card,
-	// which can be the same item as source, so clearing the target before
-	// copying would erase the data we are about to write.
 	snapshot := make(map[string]*ds.VMValue)
 	source.Range(func(key string, value *ds.VMValue) bool {
 		snapshot[key] = value
 		return true
 	})
-	sourceName, sourceSheet := source.Name, source.SheetType
-
-	target, err := svc.attrs().Load(groupID, userID)
+	sourceName, sourceSheet := source.Name(), source.SheetType()
+	target, err := svc.attrs().LoadForTransaction(ctx, tx, groupID, userID)
 	if err != nil {
 		return svc.failure(err)
 	}
 	target.Clear()
 	for key, value := range snapshot {
-		target.Store(key, value)
+		if err = target.Store(key, value); err != nil {
+			return svc.failure(err)
+		}
 	}
-	target.Name = sourceName
-	target.SheetType = sourceSheet
-	target.SetModified()
-	if err := svc.commitAttributes(target); err != nil {
+	if err = target.SetName(sourceName); err != nil {
+		return svc.failure(err)
+	}
+	if err = target.SetSheetType(sourceSheet); err != nil {
 		return svc.failure(err)
 	}
 	return adapterapi.CharacterResponse{OK: true, ID: charID, Name: charName, SheetType: sourceSheet}
 }
 
-func (svc *CharacterService) delete(request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
+func (svc *CharacterService) delete(ctx context.Context, tx *DurableCallbackTransaction, request adapterapi.CharacterRequest) adapterapi.CharacterResponse {
 	if request.UserID == "" {
 		return adapterapi.CharacterResponse{OK: false, Error: "missing user_id"}
 	}
 	userID := FormatDiceIDSealChat(request.UserID)
-	charID, charName, err := svc.charIDFromRequest(request, userID)
+	charID, charName, err := svc.charIDFromRequest(ctx, tx, request, userID)
 	if err != nil {
 		return svc.failure(err)
 	}
-	bindingGroups := svc.attrs().CharGetBindingGroupIdList(charID)
+	bindingGroups, err := svc.attrs().CharGetBindingGroupIDListForTransaction(ctx, tx, charID)
+	if err != nil {
+		return svc.failure(err)
+	}
 	if len(bindingGroups) > 0 {
 		return adapterapi.CharacterResponse{OK: false, Error: "character is bound, use untagAll first", UnboundGroups: bindingGroups}
 	}
-	if err := svc.attrs().CharDelete(charID); err != nil {
+	if err = svc.attrs().CharDeleteForTransaction(ctx, tx, charID); err != nil {
 		return svc.failure(err)
 	}
 	return adapterapi.CharacterResponse{OK: true, ID: charID, Name: charName}
 }
 
-// charIDFromRequest resolves the target character by explicit id or, failing
-// that, by name, enforcing the legacy ownership and type checks. It reads
-// durable metadata so it works when the runtime has no SQL database handle.
-func (svc *CharacterService) charIDFromRequest(request adapterapi.CharacterRequest, formattedUserID string) (string, string, error) {
+func (svc *CharacterService) charIDFromRequest(ctx context.Context, tx *DurableCallbackTransaction, request adapterapi.CharacterRequest, formattedUserID string) (string, string, error) {
 	if request.Character != "" {
-		owner, attrsType, name, _, exists, err := svc.characterMetadata(request.Character)
+		state, exists, err := svc.characterMetadata(ctx, tx, request.Character)
 		if err != nil {
 			return "", "", err
 		}
 		if !exists {
 			return "", "", fmt.Errorf("character not found: %s", request.Character)
 		}
-		if owner != formattedUserID || attrsType != service.AttrsTypeCharacter {
+		if state.OwnerID != formattedUserID || state.AttrsType != attributestate.AttrsTypeCharacter {
 			return "", "", errors.New("character not owned by user or invalid type")
 		}
-		return request.Character, name, nil
+		return request.Character, state.Name, nil
 	}
 	if request.NameSet && request.Name != "" {
-		charID, err := svc.attrs().CharIdGetByName(formattedUserID, request.Name)
+		charID, err := svc.attrs().CharIdGetByNameForTransaction(ctx, tx, formattedUserID, request.Name)
 		if err != nil {
 			return "", "", err
 		}
@@ -435,7 +397,6 @@ func (svc *CharacterService) charIDFromRequest(request adapterapi.CharacterReque
 	return "", "", errMissingCharIDOrName
 }
 
-// vmValueToAny converts a dicescript value into a JSON-serializable value.
 func vmValueToAny(value *ds.VMValue) any {
 	if value == nil {
 		return nil
@@ -453,7 +414,6 @@ func vmValueToAny(value *ds.VMValue) any {
 	}
 }
 
-// anyToVMValue converts a decoded JSON value into a dicescript value.
 func anyToVMValue(value any) *ds.VMValue {
 	switch typed := value.(type) {
 	case float64:

@@ -1,47 +1,64 @@
 package dice
 
-import (
-	"encoding/json"
-	"testing"
-)
+import "testing"
 
-func TestGroupInfoRollShaperModeRoundTrips(t *testing.T) {
-	original := &GroupInfo{GroupID: "group:test"}
-	if mode, ok := original.setDiceRollShaperMode("stable"); !ok || mode != DiceRollShaperModeStable {
-		t.Fatalf("setDiceRollShaperMode() = (%s, %v), want stable, true", mode, ok)
+func newRollShaperCommandContext(t *testing.T, private bool, privilege int, label string) *MsgContext {
+	t.Helper()
+	d, _ := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:roll-shaper-bot")
+	var message *Message
+	if private {
+		message = newPrivateMsg("QQ:roll-shaper-user", "")
+	} else {
+		message = newGroupMsg("QQ-Group:roll-shaper", "QQ:roll-shaper-user", "")
+	}
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, message, label)
+	ctx.PrivilegeLevel = privilege
+	ctx.IsPrivate = private
+	return ctx
+}
+
+func TestGroupInfoRollShaperModeRoundTripsThroughProjection(t *testing.T) {
+	d, _ := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:roll-shaper-bot")
+	message := newGroupMsg("QQ-Group:roll-shaper-persist", "QQ:roll-shaper-user", "")
+	var (
+		setMode DiceRollShaperMode
+		setOK   bool
+	)
+	withCanonicalTestMessageContext(t, d, endpoint, message, "persist-roll-shaper", func(ctx *MsgContext) error {
+		var err error
+		setMode, setOK, err = ctx.Group.setDiceRollShaperMode("stable")
+		return err
+	})
+	if !setOK || setMode != DiceRollShaperModeStable {
+		t.Fatalf("setDiceRollShaperMode() = (%s, %v), want stable, true", setMode, setOK)
 	}
 
-	data, err := json.Marshal(original)
-	if err != nil {
-		t.Fatalf("json.Marshal() error = %v", err)
+	restored := newCanonicalTestMessageContext(t, d, endpoint, message, "read-roll-shaper")
+	if restored.Group.RollShaperMode() != string(DiceRollShaperModeStable) {
+		t.Fatalf("RollShaperMode() = %q, want %q", restored.Group.RollShaperMode(), DiceRollShaperModeStable)
 	}
-	var restored GroupInfo
-	if err := json.Unmarshal(data, &restored); err != nil {
-		t.Fatalf("json.Unmarshal() error = %v", err)
-	}
-	if restored.RollShaperMode != string(DiceRollShaperModeStable) {
-		t.Fatalf("RollShaperMode = %q, want %q", restored.RollShaperMode, DiceRollShaperModeStable)
-	}
-	if got := restored.getDiceRollShaperMode(); got != DiceRollShaperModeStable {
+	if got := restored.Group.getDiceRollShaperMode(); got != DiceRollShaperModeStable {
 		t.Fatalf("getDiceRollShaperMode() = %s, want stable", got)
 	}
 }
 
 func TestGroupInfoRollShaperModeChangeClearsBalancedBag(t *testing.T) {
-	group := &GroupInfo{GroupID: "group:test"}
-	if _, ok := group.setDiceRollShaperMode("balanced"); !ok {
-		t.Fatal("set balanced failed")
+	ctx := newRollShaperCommandContext(t, false, 50, "roll-shaper-bag")
+	if _, ok, err := ctx.Group.setDiceRollShaperMode("balanced"); err != nil || !ok {
+		t.Fatalf("set balanced = ok:%v err:%v", ok, err)
 	}
-	shaper := group.getDiceRollShaper()
+	shaper := ctx.Group.getDiceRollShaper()
 	shaper.roll(&countingDiceSource{values: []uint64{0}}, 6, 0)
 	if len(shaper.bags) == 0 {
 		t.Fatal("balanced roll did not create a bag")
 	}
 
-	if _, ok := group.setDiceRollShaperMode("stable"); !ok {
-		t.Fatal("set stable failed")
+	if _, ok, err := ctx.Group.setDiceRollShaperMode("stable"); err != nil || !ok {
+		t.Fatalf("set stable = ok:%v err:%v", ok, err)
 	}
-	if len(group.getDiceRollShaper().bags) != 0 {
+	if len(ctx.Group.getDiceRollShaper().bags) != 0 {
 		t.Fatal("mode change retained balanced bags")
 	}
 }
@@ -68,52 +85,35 @@ func TestCanManageDiceRollShaper(t *testing.T) {
 }
 
 func TestSolveDiceRollShaperSetsGroupMode(t *testing.T) {
-	group := &GroupInfo{GroupID: "group:test"}
-	ctx := &MsgContext{
-		Dice:           &Dice{},
-		Group:          group,
-		PrivilegeLevel: 50,
-	}
-
+	ctx := newRollShaperCommandContext(t, false, 50, "solve-roll-shaper")
 	result := solveDiceRollShaper(ctx, nil, &CmdArgs{Args: []string{"set", "safe-tail"}})
 
 	if !result.Matched || !result.Solved {
 		t.Fatalf("solve result = %#v, want matched and solved", result)
 	}
-	if got := group.getDiceRollShaperMode(); got != DiceRollShaperModeSafeTail {
+	if got := ctx.Group.getDiceRollShaperMode(); got != DiceRollShaperModeSafeTail {
 		t.Fatalf("group mode = %s, want safe-tail", got)
 	}
 }
 
 func TestSolveDiceRollShaperAllowsPrivateSender(t *testing.T) {
-	group := &GroupInfo{GroupID: "PG-user:test"}
-	ctx := &MsgContext{
-		Dice:      &Dice{},
-		Group:     group,
-		IsPrivate: true,
-	}
-
+	ctx := newRollShaperCommandContext(t, true, 0, "private-roll-shaper")
 	solveDiceRollShaper(ctx, nil, &CmdArgs{Args: []string{"set", "soft"}})
 
-	if got := group.getDiceRollShaperMode(); got != DiceRollShaperModeSoft {
+	if got := ctx.Group.getDiceRollShaperMode(); got != DiceRollShaperModeSoft {
 		t.Fatalf("private group mode = %s, want soft", got)
 	}
 }
 
 func TestSolveDiceRollShaperRejectsInvalidModeWithoutMutation(t *testing.T) {
-	group := &GroupInfo{
-		GroupID:        "group:test",
-		RollShaperMode: string(DiceRollShaperModeStable),
-	}
-	ctx := &MsgContext{
-		Dice:           &Dice{},
-		Group:          group,
-		PrivilegeLevel: 40,
+	ctx := newRollShaperCommandContext(t, false, 40, "invalid-roll-shaper")
+	if _, ok, err := ctx.Group.setDiceRollShaperMode("stable"); err != nil || !ok {
+		t.Fatalf("seed stable mode = ok:%v err:%v", ok, err)
 	}
 
 	solveDiceRollShaper(ctx, nil, &CmdArgs{Args: []string{"set", "unknown"}})
 
-	if got := group.getDiceRollShaperMode(); got != DiceRollShaperModeStable {
+	if got := ctx.Group.getDiceRollShaperMode(); got != DiceRollShaperModeStable {
 		t.Fatalf("group mode = %s, want stable after invalid set", got)
 	}
 }

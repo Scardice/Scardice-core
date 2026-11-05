@@ -53,28 +53,26 @@ func (state OperationState) Valid() bool {
 type CommandKind string
 
 const (
-	CommandCreate                CommandKind = "create"
-	CommandUpdateConfig          CommandKind = "update_config"
-	CommandEnable                CommandKind = "enable"
-	CommandDisable               CommandKind = "disable"
-	CommandRelogin               CommandKind = "relogin"
-	CommandRemove                CommandKind = "remove"
-	CommandResolve               CommandKind = "resolve"
-	CommandComplete              CommandKind = "complete"
-	CommandObserveIdentity       CommandKind = "observe_identity"
-	CommandRestoreLegacyMetadata CommandKind = "restore_legacy_metadata"
+	CommandCreate          CommandKind = "create"
+	CommandUpdateConfig    CommandKind = "update_config"
+	CommandEnable          CommandKind = "enable"
+	CommandDisable         CommandKind = "disable"
+	CommandRelogin         CommandKind = "relogin"
+	CommandRemove          CommandKind = "remove"
+	CommandResolve         CommandKind = "resolve"
+	CommandComplete        CommandKind = "complete"
+	CommandObserveIdentity CommandKind = "observe_identity"
 )
 
 // Completion is a Supervisor-owned pure fact transition from pending to a
 // terminal operation state; it performs no external work.
 func (kind CommandKind) Valid() bool {
-	return kind == CommandCreate || kind == CommandUpdateConfig || kind == CommandEnable || kind == CommandDisable || kind == CommandRelogin || kind == CommandRemove || kind == CommandResolve || kind == CommandComplete || kind == CommandObserveIdentity || kind == CommandRestoreLegacyMetadata
+	return kind == CommandCreate || kind == CommandUpdateConfig || kind == CommandEnable || kind == CommandDisable || kind == CommandRelogin || kind == CommandRemove || kind == CommandResolve || kind == CommandComplete || kind == CommandObserveIdentity
 }
 
-// SecretInput is an ephemeral plaintext secret accepted only at the command
-// boundary. It is never serialized into events, projections, operations, or
-// errors; Repository.CommitWithSecret encrypts it inside the same UnitOfWork
-// as the endpoint event.
+// SecretInput is a transient command input. Only its reference enters endpoint
+// events and projections; Repository.CommitWithSecret persists the value in
+// the same UnitOfWork as the endpoint event.
 type SecretInput struct {
 	Ref             string
 	Version         uint64
@@ -136,6 +134,7 @@ type EventType string
 
 const (
 	EventEndpointCreated          EventType = "endpoint.created"
+	EventBaselineImported         EventType = "endpoint.baseline_imported"
 	EventConfigUpdated            EventType = "endpoint.config_updated"
 	EventDesiredEnabled           EventType = "endpoint.enabled"
 	EventDesiredDisabled          EventType = "endpoint.disabled"
@@ -144,7 +143,6 @@ const (
 	EventEndpointDeleted          EventType = "endpoint.deleted"
 	EventOperationCompleted       EventType = "endpoint.operation_completed"
 	EventEndpointIdentityObserved EventType = "endpoint.identity_observed"
-	EventLegacyMetadataRestored   EventType = "endpoint.legacy_metadata_restored"
 )
 
 const (
@@ -157,11 +155,10 @@ const (
 	EndpointDeleted          = EventEndpointDeleted
 	OperationCompleted       = EventOperationCompleted
 	EndpointIdentityObserved = EventEndpointIdentityObserved
-	LegacyMetadataRestored   = EventLegacyMetadataRestored
 )
 
 func (kind EventType) Valid() bool {
-	return kind == EventEndpointCreated || kind == EventConfigUpdated || kind == EventDesiredEnabled || kind == EventDesiredDisabled || kind == EventReloginRequested || kind == EventRemovalRequested || kind == EventEndpointDeleted || kind == EventOperationCompleted || kind == EventEndpointIdentityObserved || kind == EventLegacyMetadataRestored
+	return kind == EventEndpointCreated || kind == EventBaselineImported || kind == EventConfigUpdated || kind == EventDesiredEnabled || kind == EventDesiredDisabled || kind == EventReloginRequested || kind == EventRemovalRequested || kind == EventEndpointDeleted || kind == EventOperationCompleted || kind == EventEndpointIdentityObserved
 }
 
 // EffectKind is an intent for Supervisor. It is not execution and carries no
@@ -222,6 +219,42 @@ type Event struct {
 	AdapterKey       adapterapi.AdapterKey
 	Config           adapterapi.ValidatedConfig
 	ConfigSet        bool
+}
+
+func validEventOperation(kind EventType, state OperationState, operationID string) bool {
+	if kind == EventBaselineImported {
+		return state == OperationStateIdle && operationID == ""
+	}
+	return operationID != "" || state == OperationStateIdle && kind == EventEndpointIdentityObserved
+}
+
+// NewBaselineImported preserves an endpoint's current durable intent while
+// dropping runtime observations, fences and transient operation references.
+// Startup admits fresh lifecycle work before an enabled endpoint can run.
+func NewBaselineImported(view EndpointView, commandID, correlationID string) (Event, error) {
+	if commandID == "" || correlationID == "" || !view.EndpointID.Valid() || !view.AdapterKey.Valid() ||
+		!view.DesiredState.Valid() || !validDisplayName(view.DisplayName) || !view.Statistics.valid() ||
+		(view.ProviderID != "" && !view.ProviderID.Valid()) {
+		return Event{}, fmt.Errorf("%w: invalid endpoint baseline identity", ErrInvalidState)
+	}
+	if err := view.Config.Validate(); err != nil {
+		return Event{}, fmt.Errorf("%w: invalid endpoint baseline config: %w", ErrInvalidState, err)
+	}
+	id := eventID(view.EndpointID, commandID, correlationID, 1, EventBaselineImported)
+	event := Event{
+		ID: id, EventID: id, Type: EventBaselineImported, Kind: EventBaselineImported,
+		Sequence: 1, AggregateVersion: 1, CommandID: commandID, CorrelationID: correlationID,
+		EndpointID: view.EndpointID, AdapterKey: view.AdapterKey, Config: view.Config.Clone(), ConfigSet: true,
+		DisplayName: view.DisplayName, Statistics: view.Statistics, ProviderID: view.ProviderID,
+		DesiredState: view.DesiredState, DesiredVersion: 1,
+		ObservedState: adapterapi.ObservedStateStopped, OperationState: OperationStateIdle,
+	}
+	digest, err := eventFingerprint(event, EventBaselineImported, id, 1)
+	if err != nil {
+		return Event{}, err
+	}
+	event.CommandDigest = digest
+	return event, nil
 }
 
 // CommandRecord is the replay/idempotency ledger. It stores only digests and

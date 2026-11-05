@@ -17,7 +17,7 @@ func dicePublicInfo(c echo.Context) error {
 
 	return c.JSON(http.StatusOK, map[string]interface{}{
 		"endpoints": myDice.ImSession.EndPointsReadOnly(),
-		"config":    myDice.Config.PublicDiceConfig})
+		"config":    myDice.Config().PublicDiceConfig})
 }
 func dicePublicSet(c echo.Context) error {
 	if !doAuth(c) {
@@ -31,26 +31,31 @@ func dicePublicSet(c echo.Context) error {
 	if err != nil {
 		return Error(&c, err.Error(), Response{})
 	}
-	myDice.Config.PublicDiceConfig = v.Config
 	selected := make(map[string]struct{}, len(v.Selected))
 	for _, item := range v.Selected {
 		if id, ok := item["id"].(string); ok && id != "" {
 			selected[id] = struct{}{}
 		}
 	}
-	myDice.Config.EndpointIDs = myDice.Config.EndpointIDs[:0]
+	endpointIDs := make([]string, 0, len(selected))
 	for id := range selected {
-		myDice.Config.EndpointIDs = append(myDice.Config.EndpointIDs, id)
+		endpointIDs = append(endpointIDs, id)
 	}
-	sort.Strings(myDice.Config.EndpointIDs)
+	sort.Strings(endpointIDs)
+	if err = myDice.DurableMutateConfig(c.Request().Context(), "public-dice", v, func(config *dice.Config) error {
+		config.PublicDiceConfig = v.Config
+		config.EndpointIDs = append([]string(nil), endpointIDs...)
+		return nil
+	}); err != nil {
+		return Error(&c, err.Error(), Response{"code": "config_update_failed"})
+	}
 	//nolint:staticcheck // keep explicit gate on PublicDiceConfig to avoid semantic ambiguity
-	if myDice.Config.PublicDiceConfig.Enable {
+	if myDice.Config().PublicDiceConfig.Enable {
 		if myDice.PublicDiceInfoRegister() {
 			myDice.PublicDiceEndpointRefresh()
 		}
 	}
 	myDice.PublicDiceSetupTick()
 	myDice.LastUpdatedTime = time.Now().Unix()
-	myDice.Save(false)
 	return Success(&c, Response{})
 }

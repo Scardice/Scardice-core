@@ -64,17 +64,20 @@ type RuntimeValueCodec interface {
 }
 
 type objectEntry struct {
-	value       reflect.Value
-	identity    identity
-	proxyRefs   uint64
-	operations  map[string]HostFuncRef
-	dangerous   bool
-	hasIdentity bool
+	value         reflect.Value
+	controlled    ControlledObject
+	identity      identity
+	proxyRefs     uint64
+	operations    map[string]HostFuncRef
+	ownedFunction HostFuncRef
+	dangerous     bool
+	hasIdentity   bool
 }
 type functionEntry struct {
 	value     reflect.Value
 	owner     HostRef
 	operation string
+	proxyRefs uint64
 }
 type identity struct {
 	typ     reflect.Type
@@ -89,6 +92,7 @@ type Session struct {
 	nextFunc   HostFuncRef
 	generation Generation
 	closed     bool
+	gojaFields bool
 	objects    map[HostRef]objectEntry
 	functions  map[HostFuncRef]functionEntry
 	identities map[identity]HostRef
@@ -97,8 +101,23 @@ type Session struct {
 type Registry = Session
 
 func NewSession() *Session {
-	return &Session{generation: 1, objects: make(map[HostRef]objectEntry), functions: make(map[HostFuncRef]functionEntry), identities: make(map[identity]HostRef)}
+	return newSession(false)
 }
+
+// NewGojaSession preserves Goja's legacy jsbindgoja-over-jsbind field
+// selection while using the engine-neutral HostRef protocol.
+func NewGojaSession() *Session {
+	return newSession(true)
+}
+
+func newSession(gojaFields bool) *Session {
+	return &Session{
+		generation: 1, gojaFields: gojaFields,
+		objects: make(map[HostRef]objectEntry), functions: make(map[HostFuncRef]functionEntry),
+		identities: make(map[identity]HostRef),
+	}
+}
+
 func NewRegistry() *Registry              { return NewSession() }
 func (s *Session) Generation() Generation { s.mu.RLock(); defer s.mu.RUnlock(); return s.generation }
 
@@ -108,12 +127,22 @@ func (s *Session) registerObject(target any, dangerous bool) (HostRef, error) {
 	if !v.IsValid() {
 		return 0, errors.New("unsupported nil Host API object")
 	}
-	if v.Kind() == reflect.Pointer && v.IsNil() {
+	for v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return 0, errors.New("unsupported nil Host API object")
+		}
+		v = v.Elem()
+	}
+	if isNilable(v.Kind()) && v.IsNil() {
 		return 0, fmt.Errorf("unsupported nil Host API object of type %s", v.Type())
 	}
-	v, err := normalizeObject(v)
-	if err != nil {
-		return 0, err
+	controlled, isControlled := target.(ControlledObject)
+	if !isControlled {
+		var err error
+		v, err = normalizeObject(v)
+		if err != nil {
+			return 0, err
+		}
 	}
 	key, hasIdentity := objectIdentity(v)
 	s.mu.Lock()
@@ -123,21 +152,36 @@ func (s *Session) registerObject(target any, dangerous bool) (HostRef, error) {
 	}
 	if hasIdentity {
 		if ref, exists := s.identities[key]; exists {
+			entry := s.objects[ref]
 			if dangerous {
-				entry := s.objects[ref]
 				entry.dangerous = true
-				s.objects[ref] = entry
 			}
+			if v.Kind() == reflect.Slice && v.CanSet() && !entry.value.CanSet() {
+				entry.value = v
+			}
+			s.objects[ref] = entry
 			return ref, nil
 		}
 	}
 	s.nextHost++
 	ref := s.nextHost
-	s.objects[ref] = objectEntry{value: v, dangerous: dangerous, identity: key, hasIdentity: hasIdentity}
+	s.objects[ref] = objectEntry{
+		value: v, controlled: controlled, dangerous: dangerous,
+		identity: key, hasIdentity: hasIdentity,
+	}
 	if hasIdentity {
 		s.identities[key] = ref
 	}
 	return ref, nil
+}
+
+func isNilable(kind reflect.Kind) bool {
+	switch kind {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeObject(v reflect.Value) (reflect.Value, error) {
@@ -185,6 +229,9 @@ func objectIdentity(v reflect.Value) (identity, bool) {
 	case reflect.Map:
 		return identity{v.Type(), fmt.Sprintf("%p", v.Interface())}, true
 	case reflect.Slice:
+		if v.CanAddr() {
+			return identity{reflect.PointerTo(v.Type()), fmt.Sprintf("%x", v.Addr().Pointer())}, true
+		}
 		if v.Pointer() != 0 {
 			return identity{v.Type(), fmt.Sprintf("%x", v.Pointer())}, true
 		}
@@ -280,6 +327,9 @@ func (s *Session) ReleaseObject(ref HostRef) error {
 		s.objects[ref] = entry
 		return nil
 	}
+	if entry.ownedFunction != 0 {
+		delete(s.functions, entry.ownedFunction)
+	}
 	for _, function := range entry.operations {
 		delete(s.functions, function)
 	}
@@ -289,6 +339,21 @@ func (s *Session) ReleaseObject(ref HostRef) error {
 	}
 	return nil
 }
+func (s *Session) RetainFunction(ref HostFuncRef) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.functions[ref]
+	if !ok {
+		return fmt.Errorf("invalid HostFuncRef %d", ref)
+	}
+	if entry.proxyRefs == ^uint64(0) {
+		return fmt.Errorf("HostFuncRef %d proxy reference count overflow", ref)
+	}
+	entry.proxyRefs++
+	s.functions[ref] = entry
+	return nil
+}
+
 func (s *Session) ReleaseFunction(ref HostFuncRef) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -296,12 +361,22 @@ func (s *Session) ReleaseFunction(ref HostFuncRef) error {
 	if !ok {
 		return fmt.Errorf("invalid HostFuncRef %d", ref)
 	}
+	if entry.proxyRefs > 1 {
+		entry.proxyRefs--
+		s.functions[ref] = entry
+		return nil
+	}
 	delete(s.functions, ref)
 	if entry.owner != 0 {
-		if owner, ok := s.objects[entry.owner]; ok && owner.operations[entry.operation] == ref {
-			delete(owner.operations, entry.operation)
-			if len(owner.operations) == 0 {
-				owner.operations = nil
+		if owner, ok := s.objects[entry.owner]; ok {
+			if owner.ownedFunction == ref {
+				owner.ownedFunction = 0
+			}
+			if owner.operations[entry.operation] == ref {
+				delete(owner.operations, entry.operation)
+				if len(owner.operations) == 0 {
+					owner.operations = nil
+				}
 			}
 			s.objects[entry.owner] = owner
 		}
@@ -323,6 +398,37 @@ func (s *Session) FunctionOwner(ref HostFuncRef) (HostRef, error) {
 		return 0, err
 	}
 	return entry.owner, nil
+}
+
+// RetainFunctionOwner acquires a HostRef guard for native function construction.
+// Standalone functions get an internal owner because the Host ABI finalizes
+// HostRef proxies, not HostFuncRefs. Releasing the last owner proxy removes the
+// function and its captured Go values. The caller must ReleaseObject once after
+// construction, whether or not the provider created its own owner proxy.
+func (s *Session) RetainFunctionOwner(ref HostFuncRef) (HostRef, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	function, ok := s.functions[ref]
+	if !ok {
+		return 0, fmt.Errorf("invalid HostFuncRef %d", ref)
+	}
+	if function.owner == 0 {
+		s.nextHost++
+		function.owner = s.nextHost
+		s.objects[function.owner] = objectEntry{ownedFunction: ref, proxyRefs: 1}
+		s.functions[ref] = function
+		return function.owner, nil
+	}
+	owner, ok := s.objects[function.owner]
+	if !ok {
+		return 0, fmt.Errorf("invalid HostRef %d", function.owner)
+	}
+	if owner.proxyRefs == ^uint64(0) {
+		return 0, fmt.Errorf("HostRef %d proxy reference count overflow", function.owner)
+	}
+	owner.proxyRefs++
+	s.objects[function.owner] = owner
+	return function.owner, nil
 }
 
 func (s *Session) lookupFunctionEntry(ref HostFuncRef) (functionEntry, error) {

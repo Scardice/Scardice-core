@@ -3,7 +3,6 @@ package eventsourcing
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 
@@ -45,49 +44,17 @@ func ValidatePublication(readiness eventstore.Readiness) error {
 	if readiness.Mode != string(ModeFresh) && readiness.Mode != string(ModeImport) {
 		return fmt.Errorf("%w: unsupported readiness mode", ErrValidation)
 	}
-	if readiness.SchemaVersion == 0 {
-		return fmt.Errorf("%w: missing readiness schema version", ErrValidation)
+	if readiness.SchemaVersion != readinessSchemaVersion {
+		return fmt.Errorf("%w: unsupported readiness schema version", ErrValidation)
 	}
 	if readiness.DatabaseIdentity == "" {
 		return fmt.Errorf("%w: missing readiness database identity", ErrValidation)
 	}
-	if readiness.IndexRootID == "" {
-		return fmt.Errorf("%w: missing readiness index root", ErrValidation)
+	if readiness.Mode == string(ModeFresh) && !readiness.CompletedAt.IsZero() {
+		return fmt.Errorf("%w: fresh readiness contains an import completion time", ErrValidation)
 	}
-	if readiness.Mode == string(ModeFresh) {
-		if len(readiness.SourceManifestDigest) != 0 || len(readiness.TargetManifestDigest) != 0 ||
-			len(readiness.SemanticManifest) != 0 || len(readiness.ProjectionManifest) != 0 ||
-			len(readiness.ProjectionManifestDigest) != 0 || !readiness.CompletedAt.IsZero() {
-			return fmt.Errorf("%w: fresh readiness contains import-only fields", ErrValidation)
-		}
-		return nil
-	}
-	if len(readiness.SourceManifestDigest) != sha256.Size {
-		return fmt.Errorf("%w: source manifest digest length is %d, want %d", ErrValidation, len(readiness.SourceManifestDigest), sha256.Size)
-	}
-	if len(readiness.TargetManifestDigest) != sha256.Size {
-		return fmt.Errorf("%w: target manifest digest length is %d, want %d", ErrValidation, len(readiness.TargetManifestDigest), sha256.Size)
-	}
-	if readiness.CompletedAt.IsZero() {
+	if readiness.Mode == string(ModeImport) && readiness.CompletedAt.IsZero() {
 		return fmt.Errorf("%w: import completion time is missing", ErrValidation)
-	}
-	if len(readiness.SemanticManifest) != 0 {
-		digest := sha256.Sum256(readiness.SemanticManifest)
-		if !bytes.Equal(digest[:], readiness.SourceManifestDigest) {
-			return fmt.Errorf("%w: semantic manifest does not match source digest", ErrValidation)
-		}
-		if !bytes.Equal(digest[:], readiness.TargetManifestDigest) {
-			return fmt.Errorf("%w: semantic manifest does not match target digest", ErrValidation)
-		}
-	}
-	if (len(readiness.ProjectionManifest) == 0) != (len(readiness.ProjectionManifestDigest) == 0) {
-		return fmt.Errorf("%w: projection manifest and digest presence differ", ErrValidation)
-	}
-	if len(readiness.ProjectionManifest) != 0 {
-		digest := sha256.Sum256(readiness.ProjectionManifest)
-		if !bytes.Equal(digest[:], readiness.ProjectionManifestDigest) {
-			return fmt.Errorf("%w: projection manifest digest mismatch", ErrValidation)
-		}
 	}
 	return nil
 }

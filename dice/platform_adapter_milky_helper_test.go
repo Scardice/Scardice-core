@@ -1,8 +1,12 @@
 package dice
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
+
+	"Scardice-core/endpoint"
 )
 
 func Test_GenerateMilkyConfig_returns_yogurt_config_when_mode_is_yogurt(t *testing.T) {
@@ -170,20 +174,37 @@ func Test_getMilkyBuiltInLoginStateFromLine_returns_qrcode_state(t *testing.T) {
 	}
 }
 
-func Test_applyMilkyBuiltInLoginTerminalState_disables_endpoint(t *testing.T) {
+type milkyTerminalLifecyclePort struct {
+	disabled endpoint.Command
+	err      error
+}
+
+func (port *milkyTerminalLifecyclePort) Execute(_ context.Context, command endpoint.Command) (endpoint.Result, error) {
+	if command.Kind == endpoint.CommandDisable {
+		port.disabled = command
+	}
+	return endpoint.Result{}, port.err
+}
+
+func Test_applyMilkyBuiltInLoginTerminalState_disables_canonical_endpoint(t *testing.T) {
+	port := &milkyTerminalLifecyclePort{}
+	d := &Dice{EndpointLifecycle: port}
 	pa := &PlatformAdapterMilky{
 		BuiltInLoginState: MilkyLoginStateQRWaitingForConfirm,
 		QrCodeData:        []byte("qr"),
 	}
 	ep := &EndPointInfo{
 		EndPointInfoBase: EndPointInfoBase{
+			ID:     "milky-terminal-endpoint",
 			Enable: true,
 			State:  StateConnecting,
 		},
 		Adapter: pa,
 	}
 
-	applyMilkyBuiltInLoginTerminalState(nil, ep, MilkyLoginStateCancelled)
+	if err := applyMilkyBuiltInLoginTerminalState(d, ep, MilkyLoginStateCancelled); err != nil {
+		t.Fatal(err)
+	}
 
 	if pa.BuiltInLoginState != MilkyLoginStateCancelled {
 		t.Fatalf("expected cancelled state, got %d", pa.BuiltInLoginState)
@@ -191,11 +212,36 @@ func Test_applyMilkyBuiltInLoginTerminalState_disables_endpoint(t *testing.T) {
 	if pa.QrCodeData != nil {
 		t.Fatal("expected QR data to be cleared")
 	}
-	if ep.Enable {
-		t.Fatal("expected endpoint to be disabled")
+	if port.disabled.Kind != endpoint.CommandDisable || port.disabled.Type != endpoint.CommandDisable {
+		t.Fatalf("disable command kind=%q type=%q", port.disabled.Kind, port.disabled.Type)
 	}
-	if ep.State != StateDisconnected {
-		t.Fatalf("expected endpoint disconnected, got %d", ep.State)
+	if port.disabled.EndpointID != "milky-terminal-endpoint" {
+		t.Fatalf("disable command endpoint=%q", port.disabled.EndpointID)
+	}
+	if port.disabled.CommandID == "" || port.disabled.CommandID != port.disabled.ID || port.disabled.CommandID != port.disabled.CorrelationID {
+		t.Fatalf("disable command identity=%+v", port.disabled)
+	}
+	if !ep.Enable || ep.State != StateConnecting {
+		t.Fatalf("compatibility endpoint was mutated: enable=%v state=%d", ep.Enable, ep.State)
+	}
+}
+
+func Test_applyMilkyBuiltInLoginTerminalState_propagates_disable_failure(t *testing.T) {
+	disableErr := errors.New("disable failed")
+	port := &milkyTerminalLifecyclePort{err: disableErr}
+	d := &Dice{EndpointLifecycle: port}
+	pa := &PlatformAdapterMilky{QrCodeData: []byte("qr")}
+	ep := &EndPointInfo{
+		EndPointInfoBase: EndPointInfoBase{ID: "milky-terminal-endpoint"},
+		Adapter:          pa,
+	}
+
+	err := applyMilkyBuiltInLoginTerminalState(d, ep, MilkyLoginStateCodeExpired)
+	if !errors.Is(err, disableErr) {
+		t.Fatalf("disable error=%v, want %v", err, disableErr)
+	}
+	if pa.BuiltInLoginState != MilkyLoginStateCodeExpired || pa.QrCodeData != nil {
+		t.Fatalf("terminal state was not retained: state=%d qr=%v", pa.BuiltInLoginState, pa.QrCodeData)
 	}
 }
 

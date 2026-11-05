@@ -27,8 +27,9 @@ func (s *IMSession) EndPointsReadOnly() []*EndPointInfo {
 		}
 		return nil
 	}
-	publicEndpointIDs := make(map[string]struct{}, len(s.Parent.Config.EndpointIDs))
-	for _, endpointID := range s.Parent.Config.EndpointIDs {
+	config := s.Parent.Config()
+	publicEndpointIDs := make(map[string]struct{}, len(config.EndpointIDs))
+	for _, endpointID := range config.EndpointIDs {
 		publicEndpointIDs[endpointID] = struct{}{}
 	}
 	views := make([]*EndPointInfo, 0, len(rows))

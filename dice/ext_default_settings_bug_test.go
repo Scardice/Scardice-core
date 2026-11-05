@@ -2,105 +2,80 @@
 package dice //nolint:testpackage // tests rely on unexported helpers
 
 import (
+	"context"
 	"testing"
-
-	"go.uber.org/zap"
 )
 
-// 复现问题：
-// 1) 扩展曾被记录到 InactivatedExtSet（历史关闭）
-// 2) WebUI 将该扩展默认设置改为 AutoActive=true，并调用 ApplyExtDefaultSettings
-// 3) 群内同步时仍因 InactivatedExtSet 阻断，扩展不会自动开启
-func TestApplyExtDefaultSettings_AutoActiveStillBlockedByInactivatedSet(t *testing.T) {
-	ext := &ExtInfo{
-		Name:       "js-demo",
-		AutoActive: true,
-		CmdMap:     CmdMapCls{},
+func persistCanonicalExtensionDefault(t *testing.T, d *Dice, extensionID string, autoActive bool) {
+	t.Helper()
+	extension, ok := d.ExtRegistry.Load(extensionID)
+	if !ok {
+		t.Fatalf("extension %q is not installed in the fixture registry", extensionID)
 	}
-
-	d := &Dice{
-		Logger:      zap.NewNop().Sugar(),
-		ExtList:     []*ExtInfo{ext},
-		ExtRegistry: new(SyncMap[string, *ExtInfo]),
-		Config:      Config{},
+	if err := d.DurableDiscoverExtension(context.Background(), extension); err != nil {
+		t.Fatalf("discover extension identity: %v", err)
 	}
-	d.Config.ExtDefaultSettings = []*ExtDefaultSettingItem{
-		{
-			Name:            ext.Name,
-			AutoActive:      true,
-			DisabledCommand: map[string]bool{},
-		},
-	}
-	ext.dice = d
-	d.ExtRegistry.Store(ext.Name, ext)
-	d.ExtRegistryVersion = 1
-
-	group := &GroupInfo{
-		GroupID:           "QQ-Group:123",
-		InactivatedExtSet: StringSet{ext.Name: {}}, // 历史关闭记录
-	}
-	group.SetActivatedExtList([]*ExtInfo{}, d)
-	group.ExtAppliedVersion = d.ExtRegistryVersion // 模拟“已同步”状态（线上常态）
-	d.ImSession = &IMSession{
-		ServiceAtNew: new(SyncMap[string, *GroupInfo]),
-	}
-	d.ImSession.ServiceAtNew.Store(group.GroupID, group)
-
-	// 模拟 WebUI 配置保存后逻辑：仅应用默认设置，不清理群级关闭集合
-	d.ApplyExtDefaultSettings()
-	group.SyncExtensionsOnMessage(d)
-
-	if group.ExtGetActive(ext.Name) == nil {
-		t.Fatalf("expected ext %q to be auto-activated after enabling AutoActive in default settings, but it stays inactive", ext.Name)
+	err := d.DurableCommitConfigRequest(context.Background(), DurableConfigRequest{
+		PersistExtensionDefaults: true,
+		ExtensionDefaults: []DurableExtensionDefault{{
+			ExtensionID:      extensionID,
+			AutoActive:       autoActive,
+			DisabledCommands: nil,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("persist extension defaults: %v", err)
 	}
 }
 
-// 回归测试：
-// 默认设置从 AutoActive=true 改为 false 时，不应强制关闭已开启扩展；
-// 仅影响后续自动激活决策。
-func TestApplyExtDefaultSettings_DisableAutoActiveDoesNotForceDeactivate(t *testing.T) {
-	ext := &ExtInfo{
-		Name:       "js-demo",
-		AutoActive: true,
-		CmdMap:     CmdMapCls{},
+// An explicit historical deactivation must not permanently block a later
+// source-versioned default change to AutoActive=true.
+func TestApplyExtDefaultSettings_AutoActiveChangeClearsHistoricalDeactivation(t *testing.T) {
+	extension := &ExtInfo{Name: "js-demo", Version: "1.0.0", CmdMap: CmdMapCls{}}
+	d, _ := newCanonicalTestDice(t)
+	installCanonicalTestExtensions(d, extension)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:default-settings-bot")
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, newGroupMsg("QQ-Group:123", "QQ:owner", ""), "auto-active-default")
+	if err := ctx.Group.SetExtension(extension.Name, false); err != nil {
+		t.Fatal(err)
 	}
 
-	d := &Dice{
-		Logger:      zap.NewNop().Sugar(),
-		ExtList:     []*ExtInfo{ext},
-		ExtRegistry: new(SyncMap[string, *ExtInfo]),
-		Config:      Config{},
-	}
-	d.Config.ExtDefaultSettings = []*ExtDefaultSettingItem{
-		{
-			Name:            ext.Name,
-			AutoActive:      false,
-			DisabledCommand: map[string]bool{},
-		},
-	}
-	ext.dice = d
-	d.ExtRegistry.Store(ext.Name, ext)
-	d.ExtRegistryVersion = 1
-
-	group := &GroupInfo{
-		GroupID:           "QQ-Group:456",
-		InactivatedExtSet: StringSet{},
-	}
-	// 模拟：该扩展已经处于开启状态（用户手动开过/历史状态）
-	group.SetActivatedExtList([]*ExtInfo{ext}, d)
-	group.ExtAppliedVersion = d.ExtRegistryVersion
-	d.ImSession = &IMSession{
-		ServiceAtNew: new(SyncMap[string, *GroupInfo]),
-	}
-	d.ImSession.ServiceAtNew.Store(group.GroupID, group)
-
+	persistCanonicalExtensionDefault(t, d, extension.Name, true)
 	d.ApplyExtDefaultSettings()
-	group.SyncExtensionsOnMessage(d)
-
-	if group.ExtGetActive(ext.Name) == nil {
-		t.Fatalf("expected ext %q to remain active after disabling AutoActive default setting", ext.Name)
+	if err := ctx.Group.SyncExtensionsOnMessage(d); err != nil {
+		t.Fatal(err)
 	}
-	if group.IsExtInactivated(ext.Name) {
-		t.Fatalf("expected ext %q not to be marked inactivated while it is already active", ext.Name)
+
+	if ctx.Group.ExtGetActive(extension.Name) == nil {
+		t.Fatalf("expected ext %q to be auto-activated after enabling AutoActive in canonical defaults", extension.Name)
+	}
+	if ctx.Group.ExtensionInactivated(extension.Name) {
+		t.Fatalf("expected ext %q historical deactivation to be cleared", extension.Name)
+	}
+}
+
+// Changing the default to AutoActive=false affects future activation only; it
+// does not force-deactivate a group which already selected the extension.
+func TestApplyExtDefaultSettings_DisableAutoActiveDoesNotForceDeactivate(t *testing.T) {
+	extension := &ExtInfo{Name: "js-demo", Version: "1.0.0", AutoActive: true, CmdMap: CmdMapCls{}}
+	d, _ := newCanonicalTestDice(t)
+	installCanonicalTestExtensions(d, extension)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:default-settings-bot")
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, newGroupMsg("QQ-Group:456", "QQ:owner", ""), "disable-auto-active-default")
+	if err := ctx.Group.SetExtension(extension.Name, true); err != nil {
+		t.Fatal(err)
+	}
+
+	persistCanonicalExtensionDefault(t, d, extension.Name, false)
+	d.ApplyExtDefaultSettings()
+	if err := ctx.Group.SyncExtensionsOnMessage(d); err != nil {
+		t.Fatal(err)
+	}
+
+	if ctx.Group.ExtGetActive(extension.Name) == nil {
+		t.Fatalf("expected ext %q to remain active after disabling AutoActive default", extension.Name)
+	}
+	if ctx.Group.ExtensionInactivated(extension.Name) {
+		t.Fatalf("expected ext %q not to be marked inactivated while already active", extension.Name)
 	}
 }

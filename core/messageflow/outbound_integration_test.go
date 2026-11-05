@@ -13,25 +13,23 @@ import (
 	"Scardice-core/eventstore"
 )
 
-func TestOutboundSubmitRealSQLiteA6AtomicParticipants(t *testing.T) {
+func TestOutboundSubmitRealSQLiteAtomicParticipants(t *testing.T) {
 	ctx := context.Background()
 	db, submitErr := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/outbound.db"})
 	if submitErr != nil {
 		t.Fatal(submitErr)
 	}
 	defer db.Close()
-	source := integrationKeySource{indexID: "index-v1", index: []byte("01234567890123456789012345678901"), rootID: "root-v1", root: []byte("abcdefghijklmnopqrstuvwxyz123456")}
-	store := eventstore.NewStore(db, eventstore.WithKeySource(source))
-	if err := store.SetReadiness(ctx, eventstore.Readiness{Mode: "import", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: source.indexID, EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
+	store := eventstore.NewStore(db)
+	if err := store.SetReadiness(ctx, eventstore.Readiness{Mode: "import", SchemaVersion: 2, DatabaseIdentity: "db-1", CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
 		t.Fatal(err)
 	}
-	root := source.index
 	effect := testEffect()
 	effect.Deadline = time.Now().Add(time.Minute).UTC()
-	effect.Lane, _ = adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, root, 1)
-	resolver := testResolver{snap: EndpointSnapshot{EndpointID: effect.EndpointID, DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage), IndexRootID: source.indexID, IndexSigner: store}}
+	effect.Lane, _ = adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, 1)
+	resolver := testResolver{snap: EndpointSnapshot{EndpointID: effect.EndpointID, DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage)}}
 	resolver.snap.Capabilities = adapterapi.CapabilityOutbound | adapterapi.CapabilityRichMessages | adapterapi.CapabilityArtifacts
-	svc, submitErr := NewOutboundService(store, resolver, store, eventstore.UUIDGenerator{})
+	svc, submitErr := NewOutboundService(store, resolver, eventstore.UUIDGenerator{})
 	if submitErr != nil {
 		t.Fatal(submitErr)
 	}
@@ -56,25 +54,24 @@ func TestOutboundSubmitRealSQLiteA6AtomicParticipants(t *testing.T) {
 	segments.CausationID = "cause-segments"
 	segments.Payload = adapterapi.EffectPayload{Kind: adapterapi.EffectPayloadSegments, Target: effect.Payload.Target, Segments: []adapterapi.MessageSegment{{Kind: "text", Text: "segment-secret"}, {Kind: "file", Artifact: &adapterapi.ArtifactInput{ID: "artifact-1", ContentType: "text/plain", Filename: "file.txt"}}}}
 	segments.RequiredCapabilities = adapterapi.CapabilityOutbound | adapterapi.CapabilityRichMessages | adapterapi.CapabilityArtifacts
-	segments.Lane, _ = adapterapi.NewLaneMetadata(segments.EndpointID, segments.Payload.Target, root, 2)
+	segments.Lane, _ = adapterapi.NewLaneMetadata(segments.EndpointID, segments.Payload.Target, 2)
 	segmentResult, submitErr := svc.Submit(ctx, SubmitRequest{Effect: segments, CommandID: "segments-command", PrincipalID: "principal-a"})
 	if submitErr != nil {
 		t.Fatal(submitErr)
 	}
 	var row struct {
-		PayloadCiphertext []byte `gorm:"column:payload_ciphertext"`
-		PayloadNonce      []byte `gorm:"column:payload_nonce"`
-		EncryptionKeyID   string `gorm:"column:encryption_key_id"`
+		Payload []byte
+		Lane    string
+		Subject string
 	}
 	if err := db.GORM().Table("outbox_effects").Where("effect_id = ?", segmentResult.EffectID).First(&row).Error; err != nil {
 		t.Fatal(err)
 	}
-	plain, submitErr := store.DecryptBound(ctx, "outbox/v1", segmentResult.EffectID, string(segments.EndpointID), 1, row.PayloadCiphertext, row.PayloadNonce, row.EncryptionKeyID)
-	if submitErr != nil {
-		t.Fatal(submitErr)
+	if row.Lane != `["endpoint-1","person","person-1"]` || row.Subject != "person-1" {
+		t.Fatalf("stored effect lane=%q subject=%q", row.Lane, row.Subject)
 	}
 	var wire effectWire
-	if err := json.Unmarshal(plain, &wire); err != nil {
+	if err := json.Unmarshal(row.Payload, &wire); err != nil {
 		t.Fatal(err)
 	}
 	if len(wire.Effect.Payload.Segments) != 2 || wire.Effect.Payload.Segments[0].Text != "segment-secret" {
@@ -96,12 +93,12 @@ func TestOutboundSubmitRealSQLiteA6AtomicParticipants(t *testing.T) {
 	concurrent.OperationID = "operation-concurrent"
 	concurrent.CorrelationID = "corr-concurrent"
 	concurrent.CausationID = "cause-concurrent"
-	concurrent.Lane, _ = adapterapi.NewLaneMetadata(concurrent.EndpointID, concurrent.Payload.Target, root, 3)
-	svcA, submitErr := NewOutboundService(store, resolver, store, eventstore.UUIDGenerator{})
+	concurrent.Lane, _ = adapterapi.NewLaneMetadata(concurrent.EndpointID, concurrent.Payload.Target, 3)
+	svcA, submitErr := NewOutboundService(store, resolver, eventstore.UUIDGenerator{})
 	if submitErr != nil {
 		t.Fatal(submitErr)
 	}
-	svcB, submitErr := NewOutboundService(store, resolver, store, eventstore.UUIDGenerator{})
+	svcB, submitErr := NewOutboundService(store, resolver, eventstore.UUIDGenerator{})
 	if submitErr != nil {
 		t.Fatal(submitErr)
 	}
@@ -119,8 +116,8 @@ func TestOutboundSubmitRealSQLiteA6AtomicParticipants(t *testing.T) {
 		err   error
 	}
 	var wg sync.WaitGroup
-	results := make(chan concurrentResult, 2)
-	for _, candidate := range []*OutboundService{svcA, svcB} {
+	results := make(chan concurrentResult, 3)
+	for _, candidate := range []*OutboundService{svcA, svcA, svcB} {
 		wg.Add(1)
 		go func(service *OutboundService) {
 			defer wg.Done()
@@ -131,14 +128,26 @@ func TestOutboundSubmitRealSQLiteA6AtomicParticipants(t *testing.T) {
 	wg.Wait()
 	close(results)
 	var concurrentValues []SubmitResult
+	deduplicated := 0
 	for item := range results {
 		if item.err != nil {
 			t.Fatalf("concurrent submit err=%v", item.err)
 		}
+		if item.value.Deduplicated {
+			deduplicated++
+		}
 		concurrentValues = append(concurrentValues, item.value)
 	}
-	if len(concurrentValues) != 2 || concurrentValues[0].OperationID != concurrentValues[1].OperationID || concurrentValues[0].EffectID != concurrentValues[1].EffectID || string(concurrentValues[0].Digest) != string(concurrentValues[1].Digest) {
+	if len(concurrentValues) != 3 {
 		t.Fatalf("concurrent results=%#v", concurrentValues)
+	}
+	for _, value := range concurrentValues[1:] {
+		if value.OperationID != concurrentValues[0].OperationID || value.EffectID != concurrentValues[0].EffectID || string(value.Digest) != string(concurrentValues[0].Digest) {
+			t.Fatalf("concurrent results=%#v", concurrentValues)
+		}
+	}
+	if deduplicated != 2 {
+		t.Fatalf("deduplicated submissions=%d results=%#v", deduplicated, concurrentValues)
 	}
 	var concurrentAfterEvents, concurrentAfterOps, concurrentAfterOutbox, concurrentAfterLanes int64
 	for _, item := range []struct {
@@ -162,11 +171,11 @@ func TestOutboundSubmitRealSQLiteA6AtomicParticipants(t *testing.T) {
 	replayEffect.Deadline = effect.Deadline.Add(time.Hour)
 	replayEffect.CorrelationID = "corr-replay"
 	replayEffect.CausationID = "cause-replay"
-	replayEffect.Lane, submitErr = adapterapi.NewLaneMetadata(replayEffect.EndpointID, replayEffect.Payload.Target, root, 2)
+	replayEffect.Lane, submitErr = adapterapi.NewLaneMetadata(replayEffect.EndpointID, replayEffect.Payload.Target, 2)
 	if submitErr != nil {
 		t.Fatal(submitErr)
 	}
-	replay, submitErr := NewOutboundService(store, resolver, store, eventstore.UUIDGenerator{})
+	replay, submitErr := NewOutboundService(store, resolver, eventstore.UUIDGenerator{})
 	if submitErr != nil {
 		t.Fatal(submitErr)
 	}

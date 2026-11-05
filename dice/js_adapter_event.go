@@ -420,11 +420,7 @@ func (d *Dice) adapterEventCandidates(callbackCtx *MsgContext) []*ExtInfo {
 	if group == nil || (callbackCtx.MessageType == "group" && !group.IsActive(callbackCtx)) {
 		return nil
 	}
-	_ = group.GetActivatedExtList(d)
-	group.extInitMu.Lock()
-	candidates := append([]*ExtInfo(nil), group.activatedExtList...)
-	group.extInitMu.Unlock()
-	return candidates
+	return group.GetActivatedExtList(d)
 }
 
 // checkAdapterExtensionCurrent is shared by event delivery and adapter host
@@ -434,7 +430,8 @@ func (d *Dice) checkAdapterExtensionCurrent(extension *ExtInfo, generation int64
 	if d == nil || extension == nil || extension.dice != d || d.ExtRegistry == nil {
 		return errAdapterExtensionUnavailable
 	}
-	if extension.IsJsExt && !d.Config.JsEnable {
+	config := d.Config()
+	if extension.IsJsExt && (config == nil || !config.JsEnable) {
 		return fmt.Errorf("%w: JavaScript extensions are disabled", errAdapterExtensionUnavailable)
 	}
 	if extension.JSLoopVersion != generation {
@@ -473,10 +470,7 @@ func (d *Dice) checkAdapterExtensionCurrent(extension *ExtInfo, generation int64
 	if scope.MessageType == "group" && !scope.Group.IsActive(scope) {
 		return fmt.Errorf("%w: bot is disabled in the group", errAdapterExtensionUnavailable)
 	}
-	_ = scope.Group.GetActivatedExtList(d)
-	scope.Group.extInitMu.Lock()
-	defer scope.Group.extInitMu.Unlock()
-	for _, activated := range scope.Group.activatedExtList {
+	for _, activated := range scope.Group.GetActivatedExtList(d) {
 		if activated == registered {
 			return nil
 		}
@@ -498,8 +492,14 @@ func (d *Dice) dispatchNativeAdapterEvent(extension *ExtInfo, scope, callbackCtx
 	if extension == nil || extension.OnAdapterEvent == nil {
 		return nil
 	}
-	if err := d.checkAdapterExtensionCurrent(extension, extension.JSLoopVersion, scope); err != nil {
+	// Retired subscriptions are ordinary skips, not callback failures.
+	currentErr := d.checkAdapterExtensionCurrent(extension, extension.JSLoopVersion, scope)
+	switch {
+	case errors.Is(currentErr, errAdapterExtensionUnavailable):
 		return nil
+	case currentErr != nil:
+		d.reportNativeAdapterEventError(scope, currentErr)
+		return currentErr
 	}
 	filter, err := parseAdapterEventFilter(extension.AdapterEventFilter)
 	if err != nil {
@@ -518,8 +518,13 @@ func (d *Dice) dispatchNativeAdapterEvent(extension *ExtInfo, scope, callbackCtx
 	if !filter.matchesBody(view.Body) {
 		return nil
 	}
-	if err := d.checkAdapterExtensionCurrent(extension, extension.JSLoopVersion, scope); err != nil {
+	currentErr = d.checkAdapterExtensionCurrent(extension, extension.JSLoopVersion, scope)
+	switch {
+	case errors.Is(currentErr, errAdapterExtensionUnavailable):
 		return nil
+	case currentErr != nil:
+		d.reportNativeAdapterEventError(scope, currentErr)
+		return currentErr
 	}
 	if err := runEngineCallback(func() error {
 		extension.OnAdapterEvent(callbackCtx, view)
@@ -540,9 +545,9 @@ func currentAdapterEventCallback(
 ) jsHookValueCallback {
 	switch {
 	case extension.OnAdapterEvent != nil:
-		return func(jsengine.Runtime) (jsengine.Value, error) {
+		return func(runtime jsengine.Runtime) (jsengine.Value, error) {
 			extension.OnAdapterEvent(callbackCtx, view)
-			return nil, nil
+			return runtime.Get("undefined"), nil
 		}
 	case extension.OnAdapterEventCallback != nil:
 		return func(runtime jsengine.Runtime) (jsengine.Value, error) {
@@ -572,11 +577,17 @@ func currentAdapterEventCallback(
 func (d *Dice) dispatchJSAdapterEvent(extension *ExtInfo, scope, callbackCtx *MsgContext, event adapterapi.AdapterEvent, endpoint *EndPointInfo) error {
 	generation := extension.JSLoopVersion
 	callback := func(runtime jsengine.Runtime) (jsengine.Value, error) {
-		if err := d.checkAdapterExtensionCurrent(extension, generation, scope); err != nil {
-			return nil, nil
+		currentErr := d.checkAdapterExtensionCurrent(extension, generation, scope)
+		switch {
+		case errors.Is(currentErr, errAdapterExtensionUnavailable):
+			return runtime.Get("undefined"), nil
+		case currentErr != nil:
+			return nil, currentErr
 		}
+		// A skipped delivery has no JavaScript return value, just like a
+		// callback with no return statement. Keep it distinct from errors.
 		if extension.OnAdapterEvent == nil && extension.OnAdapterEventCallback == nil && extension.OnAdapterEventGoja == nil {
-			return nil, nil
+			return runtime.Get("undefined"), nil
 		}
 		var filter parsedAdapterEventFilter
 		var err error
@@ -589,7 +600,7 @@ func (d *Dice) dispatchJSAdapterEvent(extension *ExtInfo, scope, callbackCtx *Ms
 			return nil, fmt.Errorf("extension %q adapter event filter: %w", extension.Name, err)
 		}
 		if !filter.matchesEventType(event.Type) {
-			return nil, nil
+			return runtime.Get("undefined"), nil
 		}
 		var body map[string]any
 		if len(filter.where) != 0 || extension.OnAdapterEvent != nil {
@@ -598,7 +609,7 @@ func (d *Dice) dispatchJSAdapterEvent(extension *ExtInfo, scope, callbackCtx *Ms
 				return nil, err
 			}
 			if !filter.matchesBody(body) {
-				return nil, nil
+				return runtime.Get("undefined"), nil
 			}
 		}
 		var view *AdapterEventView
@@ -611,12 +622,16 @@ func (d *Dice) dispatchJSAdapterEvent(extension *ExtInfo, scope, callbackCtx *Ms
 				RawJSON:  event.RawJSON,
 			}
 		}
-		if err := d.checkAdapterExtensionCurrent(extension, generation, scope); err != nil {
-			return nil, nil
+		currentErr = d.checkAdapterExtensionCurrent(extension, generation, scope)
+		switch {
+		case errors.Is(currentErr, errAdapterExtensionUnavailable):
+			return runtime.Get("undefined"), nil
+		case currentErr != nil:
+			return nil, currentErr
 		}
 		selected := currentAdapterEventCallback(extension, callbackCtx, view, event, endpoint)
 		if selected == nil {
-			return nil, nil
+			return runtime.Get("undefined"), nil
 		}
 		return selected(runtime)
 	}

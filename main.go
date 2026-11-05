@@ -23,9 +23,8 @@ import (
 	"time"
 
 	"Scardice-core/api"
-	"Scardice-core/core/groupstate"
+	"Scardice-core/core/managerstate"
 	"Scardice-core/core/messageflow"
-	"Scardice-core/core/playerstate"
 	"Scardice-core/core/privacypurge"
 	"Scardice-core/dice"
 	"Scardice-core/dice/service"
@@ -47,6 +46,7 @@ import (
 	"github.com/labstack/echo/v4/middleware"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"golang.org/x/term"
 )
 
 /*
@@ -294,8 +294,7 @@ func main() {
 		LogLevel               int8   `choice:"-1"                                                                   choice:"0"              choice:"1" choice:"2" choice:"3" choice:"4" choice:"5" default:"0" description:"设置日志等级"             long:"log-level"`
 		ContainerMode          bool   `description:"容器模式，该模式下禁用内置客户端"                                                long:"container-mode"`
 		PprofRecord            bool   `description:"启用pprof记录，写入data/pprof/<启动时间戳>"                                      long:"pprof-record"`
-		ImportLegacy           bool   `description:"将已停止的 legacy YAML/SQLite/BuntDB 数据一次性导入事件库，成功后退出" long:"import-legacy"`
-		VerifyEventStore       bool   `description:"启动时执行事件库全量清单哈希与密钥引用校验" long:"verify-event-store"`
+		ImportLegacy           bool   `description:"将已停止的 legacy YAML/SQLite/BuntDB 数据一次性导入事件库，或把上一版本的加密事件库转换为明文格式，成功后退出" long:"import-legacy"`
 		MutexProfileRate       int    `description:"对互斥锁竞用的采样速率，小于等于0=关闭，1=所有，其他N=N分之1采样率" long:"mutex-profile" default:"0"`
 		BlockProfileRate       int    `description:"对阻塞事件的采样速率，小于等于0=关闭，1=所有，其他N=每N纳秒1次采样" long:"block-profile" default:"0"`
 	}
@@ -403,7 +402,38 @@ func main() {
 		log.Error("event-store configuration is required; refusing legacy runtime fallback")
 		return
 	}
-	eventDB, openErr := eventstore.OpenDatabase(context.Background(), endpointDBConfig)
+	if opts.ImportLegacy {
+		runInstallationImport(log, endpointDBConfig)
+		return
+	}
+	// An encrypted (v1) event store has to be converted before the regular
+	// store touches it; opening it would migrate its schema.
+	isV1Store, detectErr := detectV1Store(context.Background(), endpointDBConfig)
+	if detectErr != nil {
+		log.Errorf("detect the event database format failed: %v", detectErr)
+		return
+	}
+	if isV1Store {
+		if _, local := plainSQLitePath(endpointDBConfig); !local {
+			log.Error("encrypted remote event store detected; automatic conversion supports local SQLite files only; the remote schema has not been changed")
+			return
+		}
+		source, sourceErr := v1InstallationSource(context.Background(), endpointDBConfig, legacyStatePresent())
+		if sourceErr != nil {
+			log.Errorf("select authoritative migration source failed: %v", sourceErr)
+			return
+		}
+		notice := v1MigrationRequiredNotice(currentExecutable())
+		if source == installationSourceLegacy {
+			notice = migrationRequiredNotice(currentExecutable())
+		}
+		if !reportMigration(os.Stdout, os.Stdin, term.IsTerminal(int(os.Stdin.Fd())), notice, nil, func() bool {
+			return runInstallationImport(log, endpointDBConfig)
+		}) {
+			return
+		}
+	}
+	eventDB, openErr := openCurrentEventDatabase(context.Background(), endpointDBConfig)
 	if openErr != nil {
 		log.Errorf("endpoint event database startup failed: %v", openErr)
 		return
@@ -415,53 +445,32 @@ func main() {
 		}
 	}()
 	eventStore := eventstore.NewStore(eventDB, projectionset.StoreOptions()...)
-	if opts.VerifyEventStore {
-		if openErr = eventStore.ValidateReadiness(context.Background()); openErr != nil {
-			log.Errorf("event-store exhaustive readiness validation failed: %v", openErr)
-			return
-		}
-		log.Info("事件库全量完整性校验完成")
-	} else {
-		log.Info("事件库全量完整性校验默认关闭；可使用 --verify-event-store 显式执行")
-	}
-	if opts.ImportLegacy {
-		readiness, readinessErr := eventStore.GetReadiness(context.Background())
-		if readinessErr != nil {
-			log.Errorf("read legacy import readiness failed: %v", readinessErr)
-			return
-		}
-		persistentState, persistentStateErr := captureImportPersistentState(context.Background(), eventStore)
-		if persistentStateErr != nil {
-			log.Errorf("inspect active event database before legacy import failed: %v", persistentStateErr)
-			return
-		}
-		if closeErr := eventStore.Close(); closeErr != nil {
-			log.Errorf("close active event database before import failed: %v", closeErr)
-			return
-		}
-		installationRoot, sourceRootErr := os.Getwd()
-		if sourceRootErr != nil {
-			log.Errorf("resolve legacy installation root failed: %v", sourceRootErr)
-			return
-		}
-		sourceRoot, sourceRootErr := legacySourceRoot(installationRoot)
-		if sourceRootErr != nil {
-			log.Errorf("resolve legacy data root failed: %v", sourceRootErr)
-			return
-		}
-		result, importErr := importLegacyInstallation(context.Background(), endpointDBConfig, readiness, persistentState, sourceRoot, time.Now())
-		if importErr != nil {
-			log.Errorf("legacy import failed: %v", importErr)
-			return
-		}
-		for _, warning := range result.Warnings {
-			log.Warnf("legacy import cleanup warning: %s", warning)
-		}
-		log.Infof("legacy import published: target=%s snapshot=%s records-batches=%d; restart Scardice normally", result.TargetIdentity, result.Snapshot.Root, result.Batches)
-		return
-	}
 	legacyState := legacyStatePresent()
-	startupReadiness, openErr := eventsourcing.ValidateStartupReadiness(context.Background(), eventStore, legacyState)
+	_, openErr = eventsourcing.ValidateStartupReadiness(context.Background(), eventStore, legacyState)
+	if errors.Is(openErr, eventsourcing.ErrMigrationRequired) {
+		if closeErr := eventStore.Close(); closeErr != nil {
+			log.Errorf("close event store before import: %v", closeErr)
+			return
+		}
+		if !reportMigrationRequired(os.Stdout, os.Stdin, term.IsTerminal(int(os.Stdin.Fd())), currentExecutable(), nil, func() bool {
+			return runInstallationImport(log, endpointDBConfig)
+		}) {
+			return
+		}
+		// A remote import can atomically select a new blue/green slot.
+		endpointDBConfig, openErr = ensureEndpointDatabaseConfig(os.Getenv, ".")
+		if openErr != nil {
+			log.Errorf("resolve published event database: %v", openErr)
+			return
+		}
+		eventDB, openErr = openCurrentEventDatabase(context.Background(), endpointDBConfig)
+		if openErr != nil {
+			log.Errorf("open published event database: %v", openErr)
+			return
+		}
+		eventStore = eventstore.NewStore(eventDB, projectionset.StoreOptions()...)
+		_, openErr = eventsourcing.ValidateStartupReadiness(context.Background(), eventStore, legacyStatePresent())
+	}
 	if openErr != nil {
 		log.Errorf("event-store startup gate rejected state: %v", openErr)
 		return
@@ -525,8 +534,13 @@ func main() {
 			serviceName = "Scardice"
 		}
 		if serviceName != diceManager.ServiceName {
-			diceManager.ServiceName = serviceName
-			diceManager.Save()
+			if err = diceManager.DurableMutateManagerConfig(context.Background(), "service-name", serviceName, func(public *managerstate.PublicConfig) error {
+				public.ServiceName = serviceName
+				return nil
+			}); err != nil {
+				log.Errorf("persist service name failed: %v", err)
+				return
+			}
 		}
 		serviceInstall(true, serviceName, opts.ServiceUser)
 		return
@@ -725,13 +739,13 @@ func main() {
 		log.Errorf("endpoint bootstrap construction failed: %v", openErr)
 		return
 	}
-	resolver := newEventEndpointResolver(endpointBootstrap.Service, endpointBootstrap.Registry, eventStore)
-	outboundService, outboundErr := messageflow.NewOutboundService(eventStore, resolver, eventStore, eventstore.UUIDGenerator{})
+	resolver := newEventEndpointResolver(endpointBootstrap.Service, endpointBootstrap.Registry)
+	outboundService, outboundErr := messageflow.NewOutboundService(eventStore, resolver, eventstore.UUIDGenerator{})
 	if outboundErr != nil {
 		log.Errorf("durable outbound service construction failed: %v", outboundErr)
 		return
 	}
-	bridge := dice.NewDurableOutboundBridge(outboundService, resolver, eventstore.UUIDGenerator{})
+	bridge := dice.NewDurableOutboundBridge(outboundService, resolver, eventstore.UUIDGenerator{}, eventWorkers)
 	replay := inboundReplay{Supervisor: endpointBootstrap.Supervisor, GORMStore: eventStore}
 	for _, instance := range startupDice {
 		if instance == nil {
@@ -739,6 +753,7 @@ func main() {
 		}
 		// Publish the final ports before InitDice starts runtime goroutines.
 		instance.OutboundBridge = bridge
+		instance.EndpointLifecycle = endpointBootstrap
 		instance.ProviderQuery = endpointBootstrap.Supervisor
 		instance.ProviderCall = endpointBootstrap.Supervisor
 		instance.InboundReplay = replay
@@ -753,33 +768,13 @@ func main() {
 		log.Errorf("event database requires an initialized Core session")
 		return
 	}
-	inboundService, inboundErr := messageflow.NewInboundService(eventStore, eventStore)
+	inboundService, inboundErr := messageflow.NewInboundService(eventStore)
 	if inboundErr != nil {
 		log.Errorf("endpoint inbound service construction failed: %v", inboundErr)
 		return
 	}
 	callbackHost := dice.NewDurableCallbackHost(coreDice)
 	api.RegisterPrivacyPurgeService(privacypurge.NewService(eventStore, privacypurge.WithGroupCacheInvalidator(callbackHost.InvalidateGroup)))
-	if startupReadiness.Mode == string(eventsourcing.ModeImport) && legacyState {
-		installationRoot, repairErr := os.Getwd()
-		if repairErr != nil {
-			log.Errorf("resolve legacy endpoint metadata root failed: %v", repairErr)
-			return
-		}
-		sourceRoot, repairErr := legacySourceRoot(installationRoot)
-		if repairErr != nil {
-			log.Errorf("resolve legacy endpoint metadata source failed: %v", repairErr)
-			return
-		}
-		repaired, repairErr := eventsourcing.RepairLegacyEndpointMetadata(context.Background(), sourceRoot, endpointBootstrap.Service)
-		if repairErr != nil {
-			log.Errorf("repair imported endpoint metadata failed: %v", repairErr)
-			return
-		}
-		if repaired > 0 {
-			log.Infof("已补全早期导入遗漏的账号元数据: endpoints=%d", repaired)
-		}
-	}
 	if openErr = endpointBootstrap.SetResourceRoot(coreDice.BaseConfig.DataDir); openErr != nil {
 		log.Errorf("endpoint resource root setup failed: %v", openErr)
 		return
@@ -810,7 +805,7 @@ func main() {
 		log.Errorf("endpoint character bridge setup failed: %v", openErr)
 		return
 	}
-	if openErr = endpointBootstrap.SetIdentityObservationSink(dice.NewIdentityObservationSink(coreDice, endpointBootstrap.Service)); openErr != nil {
+	if openErr = endpointBootstrap.SetIdentityObservationSink(endpoint.NewIdentityObservationSink(endpointBootstrap.Service)); openErr != nil {
 		log.Errorf("endpoint identity bridge setup failed: %v", openErr)
 		return
 	}
@@ -819,8 +814,12 @@ func main() {
 	}
 	api.RegisterEndpointBootstrap(endpointBootstrap)
 
-	groupInfoObserver := dice.NewGroupInfoRefreshSuccessNotifier(coreDice, callbackHost)
+	groupInfoObserver := dice.NewGroupInfoRefreshSuccessNotifier(coreDice)
 	if diceManager.CleanupFlag.Load() != 0 {
+		return
+	}
+	if maintenanceErr := startEventInboxMaintenance(eventWorkers, eventStore); maintenanceErr != nil {
+		log.Errorf("terminal inbox startup maintenance failed: %v", maintenanceErr)
 		return
 	}
 	if _, openErr = endpointBootstrap.Startup(eventWorkers.ctx); openErr != nil {
@@ -831,10 +830,9 @@ func main() {
 	effectQueue := newEventQueueCoordinator(eventWorkers, eventEffectIdleDelay, eventStore.OutboxWorkSignal(), eventStore.HasOutboxWork)
 	if callbackErr := startEventWorkerPool(eventWorkers, eventCallbackWorkerCount, func(index int) (func(context.Context), error) {
 		callbackService, err := messageflow.NewCallbackService(messageflow.CallbackConfig{
-			Inbox: eventStore, Store: eventStore, BoundCodec: eventStore,
+			Inbox: eventStore, Store: eventStore,
 			Resolver: dice.NewDurableCallbackScopeResolver(coreDice),
-			Group:    groupstate.NewRepository(eventStore), Player: playerstate.NewRepository(eventStore),
-			Host: callbackHost, WorkerID: fmt.Sprintf("scardice-callback-%d", index),
+			Host:     callbackHost, WorkerID: fmt.Sprintf("scardice-callback-%d", index),
 		})
 		if err != nil {
 			return nil, err
@@ -847,7 +845,7 @@ func main() {
 		return
 	}
 	if dispatcherErr := startEventWorkerPool(eventWorkers, eventEffectWorkerCount, func(index int) (func(context.Context), error) {
-		dispatcher, err := endpoint.NewEffectDispatcher(eventStore, eventStore, endpointBootstrap.Supervisor, fmt.Sprintf("scardice-outbox-%d", index), endpoint.WithEffectResultNotifier(bridge), endpoint.WithEffectSuccessNotifier(groupInfoObserver))
+		dispatcher, err := endpoint.NewEffectDispatcher(eventStore, endpointBootstrap.Supervisor, fmt.Sprintf("scardice-outbox-%d", index), endpoint.WithEffectResultNotifier(bridge), endpoint.WithEffectSuccessNotifier(groupInfoObserver), endpoint.WithDispatcherNotificationOwner(eventWorkers))
 		if err != nil {
 			return nil, err
 		}

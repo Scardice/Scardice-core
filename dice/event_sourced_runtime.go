@@ -18,15 +18,15 @@ import (
 )
 
 // PrepareEventSourcedState creates the first durable configuration aggregate for
-// a fresh store and hydrates the compatibility view from its projection. It
-// never reads the legacy YAML/database files.
+// a fresh store and publishes its immutable read view. It never reads legacy
+// YAML/database files.
 func (dm *DiceManager) PrepareEventSourcedState(ctx context.Context) error {
 	return dm.prepareEventSourcedState(ctx, logEventSourcedInitialization)
 }
 
 func (dm *DiceManager) prepareEventSourcedState(ctx context.Context, observer eventSourcedInitializationObserver) error {
-	if dm == nil || !dm.EventSourcedMode {
-		return errors.New("dice manager is not in event-sourced mode")
+	if dm == nil {
+		return errors.New("dice manager is nil")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -49,8 +49,11 @@ type eventSourcedProjectionLister interface {
 // RestoreEventSourcedDice reconstructs the process-owned Dice shells from the
 // durable config projection. It does not read dice.yaml or any legacy store.
 func (dm *DiceManager) RestoreEventSourcedDice(ctx context.Context, store eventstore.Store) error {
-	if dm == nil || !dm.EventSourcedMode || store == nil {
-		return errors.New("dice manager is not ready for event-sourced restore")
+	if dm == nil {
+		return errors.New("dice manager is nil")
+	}
+	if store == nil {
+		return errors.New("dice: event store is required for restore")
 	}
 	logArchive, ok := store.(eventstore.LogRepository)
 	if !ok {
@@ -121,26 +124,21 @@ func (d *Dice) prepareEventSourcedConfig(ctx context.Context, observer eventSour
 	if d.BaseConfig.DataDir == "" {
 		d.BaseConfig.DataDir = filepath.Join("./data", d.BaseConfig.Name)
 	}
-	d.Config = NewConfig(d)
-	d.Config.BaseConfig = d.BaseConfig
-	d.Config.CommandCompatibleMode = true
-	if len(d.CommandPrefix) == 0 {
-		d.CommandPrefix = append([]string(nil), DefaultConfig.CommandPrefix...)
-	}
+	d.initializeDefaultConfigView()
+	config := NewConfig(d)
+	config.BaseConfig = d.BaseConfig
+	config.CommandCompatibleMode = true
 	repository := configstate.NewRepository(d.DurableStore)
 	state, err := repository.Load(ctx, d.BaseConfig.Name)
 	if err != nil {
 		return fmt.Errorf("dice: load event-sourced config: %w", err)
 	}
 	if state.Version == 0 {
-		if len(d.DiceMasters) == 0 {
-			d.DiceMasters = append([]string(nil), DefaultConfig.DiceMasters...)
-		}
-		patch, patchErr := durableConfigPatch(configstate.State{}, d.Config, d.CommandPrefix, d.DiceMasters, nil)
+		patch, patchErr := durableConfigPatch(configstate.State{}, config, config.CommandPrefix, config.DiceMasters, nil)
 		if patchErr != nil {
 			return fmt.Errorf("dice: build default config baseline: %w", patchErr)
 		}
-		baseline := baselineFromConfigPatch(d.BaseConfig.Name, d.Config.ConfigVersion, patch, d.CommandPrefix, d.DiceMasters)
+		baseline := baselineFromConfigPatch(d.BaseConfig.Name, config.ConfigVersion, patch, config.CommandPrefix, config.DiceMasters)
 		if _, err = repository.DecideAndAppend(ctx, state, 0, eventstore.Metadata{}, configstate.Command{
 			Kind:     configstate.CommandImportBaseline,
 			Baseline: &baseline,
@@ -171,18 +169,12 @@ func (d *Dice) prepareEventSourcedConfig(ctx context.Context, observer eventSour
 			}
 		}
 	}
-	config, advanced, projected, err := d.DurableLegacyConfigView(ctx)
-	if err != nil {
-		return fmt.Errorf("dice: hydrate event-sourced config: %w", err)
+	if err := d.ReloadConfigView(ctx); err != nil {
+		return fmt.Errorf("dice: publish event-sourced config view: %w", err)
 	}
-	d.Config = config
-	d.AdvancedConfig = advanced
-	d.CommandPrefix = append([]string(nil), projected.Outer.CommandPrefix...)
-	d.DiceMasters = append([]string(nil), projected.Outer.DiceMasters...)
-	if d.Config.BanList != nil {
-		d.Config.BanList.Parent = d
-		if err := d.Config.BanList.LoadsWithError(); err != nil {
-			return fmt.Errorf("dice: load event-sourced ban list: %w", err)
+	if banList := d.Config().BanList; banList != nil {
+		if err := banList.LoadsWithError(); err != nil {
+			return fmt.Errorf("dice: initialize event-sourced moderation: %w", err)
 		}
 	}
 	return nil
@@ -193,13 +185,7 @@ func shouldSeedDefaultDiceMasters(ctx context.Context, store eventstore.Store, d
 	if !ok {
 		return false, nil
 	}
-	var readiness eventstore.Readiness
-	var err error
-	if metadata, hasMetadata := readinessStore.(eventstore.ReadinessMetadataRepository); hasMetadata {
-		readiness, err = metadata.GetReadinessMetadata(ctx)
-	} else {
-		readiness, err = readinessStore.GetReadiness(ctx)
-	}
+	readiness, err := readinessStore.GetReadiness(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -226,6 +212,10 @@ func baselineFromConfigPatch(diceID string, configVersion int, patch configstate
 		ConfigVersion: configVersion,
 		CommandPrefix: append([]string(nil), commandPrefix...),
 		DiceMasters:   append([]string(nil), diceMasters...),
+	}
+	if patch.Outer != nil {
+		baseline.UpgradeWindowID = patch.Outer.UpgradeWindowID
+		baseline.UpgradeEndpointID = patch.Outer.UpgradeEndpointID
 	}
 	if patch.Base != nil {
 		baseline.Base = *patch.Base
@@ -269,9 +259,8 @@ func baselineFromConfigPatch(diceID string, configVersion int, patch configstate
 	return baseline
 }
 
-// initEventSourcedRuntime wires only process-owned Core compatibility state.
-// Legacy configuration, group state, stores, and periodic save loops remain
-// outside this path; their authoritative replacements are event-store owned.
+// initEventSourcedRuntime constructs process-local services and resource
+// registries. Domain facts remain in their execution owners.
 func (d *Dice) initEventSourcedRuntime(uiWriter *logger.UIWriter) {
 	d.preferFileBackedGameSystemTemplates = true
 	log := logger.M()
@@ -282,12 +271,11 @@ func (d *Dice) initEventSourcedRuntime(uiWriter *logger.UIWriter) {
 	d.clearCocExtraRules()
 	d.DBOperator = nil
 	d.BaseConfig.CommandCompatibleMode = true
-	d.ImSession = &IMSession{Parent: d, ServiceAtNew: new(SyncMap[string, *GroupInfo]), PendingQuits: new(SyncMap[string, *PendingQuitInfo])}
+	d.ImSession = &IMSession{Parent: d, PendingQuits: new(SyncMap[string, *PendingQuitInfo])}
 	d.UIEndpoint = newUIEndpoint(d.ImSession)
 	d.CmdMap = CmdMapCls{}
 	d.ExtRegistry = new(SyncMap[string, *ExtInfo])
 	d.GameSystemMap = new(SyncMap[string, *GameSystemTemplate])
-	d.DirtyGroups = new(SyncMap[string, int64])
 	d.ConfigManager = NewConfigManager(filepath.Join(d.BaseConfig.DataDir, "configs", "plugin-configs.json"))
 	d.ConfigManager.SetOwner(d)
 	d.AttrsManager = &AttrsManager{}
@@ -299,18 +287,18 @@ func (d *Dice) initEventSourcedRuntime(uiWriter *logger.UIWriter) {
 	d.RegisterBuiltinExt()
 	d.initPackageManager()
 	d.StoreSetup()
-	if banList := d.Config.BanList; banList != nil {
+	if banList := d.Config().BanList; banList != nil {
 		banList.Parent = d
 		banList.AfterLoads()
 	}
-	if d.Config.EnableCensor {
+	if d.Config().EnableCensor {
 		d.NewCensorManager()
 	}
 	d.ApplyExtDefaultSettings()
 	d.IsAlreadyLoadConfig = false
 	// 始终在启动时应用待生效的运行时包，JS 执行开关只控制脚本加载。
 	d.jsRuntimeManager = NewJSRuntimeManagerForDice(d)
-	loadStartupJS := d.Config.JsEnable
+	loadStartupJS := d.Config().JsEnable
 	if loadStartupJS {
 		d.ExtLoopManager = NewJsLoopManager()
 		d.JsInit()

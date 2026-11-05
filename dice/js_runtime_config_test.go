@@ -16,11 +16,10 @@ func TestSetJSRuntimeConfigPersistsRoutesThroughDurableFacade(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(compatKeySource{}), eventstore.WithProjection(configstate.ConfigProjection()))
+	store := eventstore.NewStore(db, eventstore.WithProjection(configstate.ConfigProjection()))
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "runtime-routes-db", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "runtime-routes-db",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -34,6 +33,7 @@ func TestSetJSRuntimeConfigPersistsRoutesThroughDurableFacade(t *testing.T) {
 		StoryLog:      configstate.StoryLogConfig{LogSizeNoticeCount: 500},
 		Advanced:      configstate.AdvancedConfig{CustomReplyCooldown: 5},
 		CommandPrefix: []string{"!"},
+		DiceMasters:   []string{"QQ:100"},
 	}
 	if _, err := repository.DecideAndAppend(ctx, configstate.State{}, 0, eventstore.Metadata{}, configstate.Command{
 		Kind: configstate.CommandImportBaseline, Baseline: &baseline,
@@ -41,9 +41,9 @@ func TestSetJSRuntimeConfigPersistsRoutesThroughDurableFacade(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	d := &Dice{
-		BaseConfig: BaseConfig{Name: "dice-1"}, Config: NewConfig(nil), DurableStore: store,
-		CommandPrefix: []string{"!"}, DiceMasters: []string{"QQ:100"},
+	d := &Dice{BaseConfig: BaseConfig{Name: "dice-1"}, DurableStore: store}
+	if err := d.ReloadConfigView(ctx); err != nil {
+		t.Fatal(err)
 	}
 	if err := d.SetJSRuntimeConfig(ctx, "goja", map[string]string{"author/example": "goja"}); err != nil {
 		t.Fatal(err)
@@ -55,11 +55,8 @@ func TestSetJSRuntimeConfigPersistsRoutesThroughDurableFacade(t *testing.T) {
 	if got := state.JS.JsRuntimeRoutes["author/example"]; got != "goja" {
 		t.Fatalf("projected extension route = %q, want goja", got)
 	}
-	view, _, _, err := d.DurableLegacyConfigView(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	view := d.Config()
 	if got := view.JsRuntimeRoutes["author/example"]; got != "goja" {
-		t.Fatalf("legacy config view extension route = %q, want goja", got)
+		t.Fatalf("config view extension route = %q, want goja", got)
 	}
 }

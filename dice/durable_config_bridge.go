@@ -2,49 +2,192 @@ package dice
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 
 	"Scardice-core/core/configstate"
+	"Scardice-core/core/execution"
 	"Scardice-core/core/extensionstate"
 	"Scardice-core/core/managerstate"
 	"Scardice-core/eventstore"
 )
 
-// DurableCommitConfigSnapshot translates the legacy in-memory config shape to
-// one optimistic event-store patch. mailPasswordRef is nil when the request
-// did not address the secret; a non-nil value is either empty or a reference.
-func (d *Dice) DurableCommitConfigSnapshot(ctx context.Context, config Config, commandPrefix, diceMasters []string, mailPasswordRef *string) error {
-	store, diceID, err := d.durableStoreAndID()
-	if err != nil {
-		return err
+var ErrConfigCommittedRuntimeApply = errors.New("dice: configuration committed but runtime view apply failed")
+
+type ConfigRuntimeApplyError struct {
+	Err error
+}
+
+func (e *ConfigRuntimeApplyError) Error() string {
+	if e == nil || e.Err == nil {
+		return ErrConfigCommittedRuntimeApply.Error()
 	}
+	return ErrConfigCommittedRuntimeApply.Error() + ": " + e.Err.Error()
+}
+
+func (e *ConfigRuntimeApplyError) Unwrap() error {
+	if e == nil {
+		return ErrConfigCommittedRuntimeApply
+	}
+	return errors.Join(ErrConfigCommittedRuntimeApply, e.Err)
+}
+
+// maxFreshDomainExecutionAttempts bounds how often a fresh root is rebuilt
+// after another writer advanced one of its read dependencies. A conflict is
+// an atomic non-commit, so every retry starts a new execution identity and
+// re-reads all owners.
+const maxFreshDomainExecutionAttempts = 4
+
+func (d *Dice) withFreshDomainExecution(
+	ctx context.Context,
+	operation string,
+	request any,
+	run func(*DurableCallbackTransaction, eventstore.Metadata) error,
+) error {
+	if d == nil || run == nil {
+		return ErrDurableStateUnavailable
+	}
+	return withFreshDomainExecution(ctx, operation, request, d.WithDomainExecution, run)
+}
+
+func (dm *DiceManager) withFreshDomainExecution(
+	ctx context.Context,
+	operation string,
+	request any,
+	run func(*DurableCallbackTransaction, eventstore.Metadata) error,
+) error {
+	if dm == nil || dm.durableStore == nil || run == nil {
+		return ErrDurableStateUnavailable
+	}
+	return withFreshDomainExecution(ctx, operation, request, func(
+		ctx context.Context,
+		identity string,
+		canonical []byte,
+		invoke func(*DurableCallbackTransaction) error,
+	) error {
+		return withDomainExecution(ctx, dm.durableStore, identity, canonical, invoke)
+	}, run)
+}
+
+func withFreshDomainExecution(
+	ctx context.Context,
+	operation string,
+	request any,
+	execute func(context.Context, string, []byte, func(*DurableCallbackTransaction) error) error,
+	run func(*DurableCallbackTransaction, eventstore.Metadata) error,
+) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	state, err := configstate.ReadProjected(ctx, store, diceID)
-	if err != nil {
-		return fmt.Errorf("dice: read config projection: %w", err)
-	}
-	patch, err := durableConfigPatch(state, config, commandPrefix, diceMasters, mailPasswordRef)
+	canonical, err := json.Marshal(struct {
+		Operation string `json:"operation"`
+		Request   any    `json:"request"`
+	}{Operation: operation, Request: request})
 	if err != nil {
 		return err
 	}
-	repo := configstate.NewRepository(store)
-	preparedAppend, err := repo.PrepareDecision(state, state.Version, eventstore.Metadata{}, configstate.Command{
-		Kind:               configstate.CommandPatch,
-		Patch:              &patch,
-		ExpectedVersion:    state.Version,
-		ExpectedVersionSet: true,
+	for attempt := 1; ; attempt++ {
+		identity, idErr := (eventstore.UUIDGenerator{}).NewID()
+		if idErr != nil {
+			return idErr
+		}
+		metadata := eventstore.Metadata{CommandID: identity, CorrelationID: identity, Producer: "dice/" + operation}
+		err = execute(ctx, identity, canonical, func(transaction *DurableCallbackTransaction) error {
+			return run(transaction, metadata)
+		})
+		if err == nil || !errors.Is(err, eventstore.ErrConflict) || attempt >= maxFreshDomainExecutionAttempts || ctx.Err() != nil {
+			return err
+		}
+	}
+}
+
+// DurableCommitConfigSnapshot applies one detached configuration DTO through
+// the canonical config participant. It never diffs a mutable runtime mirror.
+func (d *Dice) DurableCommitConfigSnapshot(ctx context.Context, config Config, commandPrefix, diceMasters []string, mailPasswordRef *string) error {
+	request := struct {
+		Config          Config   `json:"config"`
+		CommandPrefix   []string `json:"commandPrefix"`
+		DiceMasters     []string `json:"diceMasters"`
+		MailPasswordRef *string  `json:"mailPasswordRef,omitempty"`
+	}{
+		Config: config, CommandPrefix: commandPrefix, DiceMasters: diceMasters, MailPasswordRef: mailPasswordRef,
+	}
+	err := d.withFreshDomainExecution(ctx, "config-snapshot", request, func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		participant, _, stateErr := d.configOwner(ctx, transaction.Domain())
+		if stateErr != nil {
+			return stateErr
+		}
+		if !configSourceMatchesParticipant(config.source, participant) {
+			return ErrConfigViewChanged
+		}
+		state := participant.state.Clone()
+		patch, patchErr := durableConfigPatch(state, config, commandPrefix, diceMasters, mailPasswordRef)
+		if patchErr != nil {
+			return patchErr
+		}
+		return d.ContributeConfigCommand(ctx, transaction.Domain(), metadata, configstate.Command{
+			Kind: configstate.CommandPatch, Patch: &patch,
+		})
 	})
-	if err != nil || len(preparedAppend.Events) == 0 {
+	if err != nil {
 		return err
 	}
-	_, err = store.Commit(ctx, eventstore.UnitOfWork{Streams: []eventstore.StreamAppend{preparedAppend}})
-	return err
+	if err = d.ReloadConfigView(ctx); err != nil {
+		return &ConfigRuntimeApplyError{Err: err}
+	}
+	return nil
+}
+
+// DurableMutateConfig runs a pure mutation against the config state selected
+// inside one root. The callback receives a detached DTO; it must not retain it
+// or perform I/O. This is for focused business commands that cannot safely
+// construct a whole replacement from a pre-root snapshot.
+func (d *Dice) DurableMutateConfig(
+	ctx context.Context,
+	operation string,
+	request any,
+	mutate func(*Config) error,
+) error {
+	if strings.TrimSpace(operation) == "" || mutate == nil {
+		return errors.New("dice: invalid config mutation")
+	}
+	err := d.withFreshDomainExecution(ctx, "config-"+operation, request, func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		state, stateErr := d.ConfigStateForDomain(ctx, transaction.Domain())
+		if stateErr != nil {
+			return stateErr
+		}
+		config, _, stateErr := d.legacyConfigViewFromState(state)
+		if stateErr != nil {
+			return stateErr
+		}
+		if stateErr = mutate(&config); stateErr != nil {
+			return stateErr
+		}
+		patch, stateErr := durableConfigPatch(
+			state,
+			config,
+			config.CommandPrefix,
+			config.DiceMasters,
+			nil,
+		)
+		if stateErr != nil {
+			return stateErr
+		}
+		return d.ContributeConfigCommand(ctx, transaction.Domain(), metadata, configstate.Command{
+			Kind:  configstate.CommandPatch,
+			Patch: &patch,
+		})
+	})
+	if err != nil {
+		return err
+	}
+	if err = d.ReloadConfigView(ctx); err != nil {
+		return &ConfigRuntimeApplyError{Err: err}
+	}
+	return nil
 }
 
 type DurableManagerConfigPatch struct {
@@ -71,153 +214,712 @@ type DurableConfigRequest struct {
 	PersistExtensionDefaults bool
 }
 
-// DurableCommitConfigRequest prepares only the owners addressed by the
-// request, then commits all of their aggregate decisions in one UnitOfWork.
-func (d *Dice) DurableCommitConfigRequest(ctx context.Context, request DurableConfigRequest) error {
-	store, diceID, err := d.durableStoreAndID()
+type configParticipant struct {
+	store           eventstore.Store
+	base            configstate.State
+	state           configstate.State
+	dependency      eventstore.DependencySnapshot
+	reloadScheduled bool
+	events          []configstate.TypedEvent
+	metadata        eventstore.Metadata
+}
+
+func (p *configParticipant) Contribute(context.Context) (eventstore.UnitOfWork, error) {
+	if p == nil || len(p.events) == 0 {
+		return eventstore.UnitOfWork{}, nil
+	}
+	factory := eventstore.EventFactory{Clock: eventstore.SystemClock{}, IDs: eventstore.UUIDGenerator{}}
+	metadata := p.metadata
+	events := make([]eventstore.NewEvent, 0, len(p.events))
+	for _, typed := range p.events {
+		event, err := configstate.NewEventWithFactory(factory, typed, metadata)
+		if err != nil {
+			return eventstore.UnitOfWork{}, err
+		}
+		events = append(events, event)
+		metadata.EventID = ""
+	}
+	return eventstore.UnitOfWork{Streams: []eventstore.StreamAppend{{
+		Stream:          configstate.ConfigStream(p.base.DiceID),
+		ExpectedVersion: p.base.Version,
+		Events:          events,
+	}}}, nil
+}
+
+func (p *configParticipant) decide(command configstate.Command, metadata eventstore.Metadata) error {
+	if p == nil {
+		return execution.ErrInvalidParticipant
+	}
+	command.ExpectedVersion = p.state.Version
+	command.ExpectedVersionSet = true
+	decision, err := configstate.Decide(p.state, command)
 	if err != nil {
 		return err
 	}
-	if ctx == nil {
-		ctx = context.Background()
+	next := p.state
+	for _, event := range decision.Events {
+		next, err = configstate.Reduce(next, event)
+		if err != nil {
+			return err
+		}
 	}
+	p.state = next
+	p.events = append(p.events, decision.Events...)
+	if p.metadata.CommandID == "" {
+		p.metadata = metadata
+	}
+	return nil
+}
 
-	work := eventstore.UnitOfWork{Streams: make([]eventstore.StreamAppend, 0, 3)}
-	if request.PersistDiceConfig {
-		state, readErr := configstate.ReadProjected(ctx, store, diceID)
+func (d *Dice) configOwner(ctx context.Context, tx *execution.DomainTx) (*configParticipant, execution.ParticipantKey, error) {
+	return d.configOwnerFromView(ctx, tx, d.currentConfigView())
+}
+
+func (d *Dice) configOwnerFromView(
+	ctx context.Context,
+	tx *execution.DomainTx,
+	view *configReadView,
+) (*configParticipant, execution.ParticipantKey, error) {
+	if d == nil || tx == nil {
+		return nil, execution.ParticipantKey{}, execution.ErrDomainTxUnavailable
+	}
+	if view == nil || view.state.Version == 0 || view.dependency.ProjectionGeneration == "" {
+		return nil, execution.ParticipantKey{}, ErrConfigViewUnavailable
+	}
+	stream := configstate.ConfigStream(d.BaseConfig.Name)
+	key := execution.StreamParticipantKey(stream)
+	participant, err := tx.Owner(ctx, key, func(context.Context) (execution.Participant, execution.ReadDependencies, error) {
+		installed := &configParticipant{
+			store:      d.DurableStore,
+			base:       view.state.Clone(),
+			state:      view.state.Clone(),
+			dependency: view.dependency,
+		}
+		return installed, execution.ReadDependenciesFromStream(eventstore.StreamSnapshot{
+			Stream: stream, Version: view.version, Snapshot: view.dependency,
+		}), nil
+	})
+	if err != nil {
+		return nil, execution.ParticipantKey{}, err
+	}
+	typed, ok := participant.(*configParticipant)
+	if !ok {
+		return nil, execution.ParticipantKey{}, execution.ErrInvalidParticipant
+	}
+	return typed, key, nil
+}
+
+func (d *Dice) ContributeConfigCommand(
+	ctx context.Context,
+	tx *execution.DomainTx,
+	metadata eventstore.Metadata,
+	command configstate.Command,
+) error {
+	_, key, err := d.configOwner(ctx, tx)
+	if err != nil {
+		return err
+	}
+	return tx.Mutate(key, func(participant execution.Participant) error {
+		typed, ok := participant.(*configParticipant)
+		if !ok {
+			return execution.ErrInvalidParticipant
+		}
+		return typed.decide(command, metadata)
+	})
+}
+
+func (d *Dice) ConfigStateForDomain(ctx context.Context, tx *execution.DomainTx) (configstate.State, error) {
+	participant, _, err := d.configOwner(ctx, tx)
+	if err != nil {
+		return configstate.State{}, err
+	}
+	return participant.state.Clone(), nil
+}
+
+func configSourceMatchesParticipant(source configViewSource, participant *configParticipant) bool {
+	return participant != nil &&
+		source.version != 0 &&
+		source.version == participant.base.Version &&
+		source.dependency == participant.dependency
+}
+
+func (d *Dice) scheduleConfigViewReloadAfterCommit(ctx context.Context, transaction *DurableCallbackTransaction) error {
+	if transaction == nil {
+		return execution.ErrDomainTxUnavailable
+	}
+	_, key, err := d.configOwner(ctx, transaction.Domain())
+	if err != nil {
+		return err
+	}
+	schedule := false
+	if err = transaction.Domain().Mutate(key, func(participant execution.Participant) error {
+		config, ok := participant.(*configParticipant)
+		if !ok {
+			return execution.ErrInvalidParticipant
+		}
+		if !config.reloadScheduled {
+			config.reloadScheduled = true
+			schedule = true
+		}
+		return nil
+	}); err != nil || !schedule {
+		return err
+	}
+	return transaction.AfterCommit(func() {
+		if reloadErr := d.ReloadConfigView(context.Background()); reloadErr != nil && d.Logger != nil {
+			d.Logger.Errorf("配置已提交但运行时视图刷新失败: %v", reloadErr)
+		}
+	})
+}
+
+func (d *Dice) ContributeDiceMasterMutation(
+	ctx context.Context,
+	tx *execution.DomainTx,
+	metadata eventstore.Metadata,
+	uid string,
+	enabled bool,
+) (bool, error) {
+	if strings.TrimSpace(uid) == "" {
+		return false, errors.New("dice: master ID is empty")
+	}
+	state, err := d.ConfigStateForDomain(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	index := -1
+	for position, current := range state.Outer.DiceMasters {
+		if current == uid {
+			index = position
+			break
+		}
+	}
+	if enabled == (index >= 0) {
+		return false, nil
+	}
+	outer := state.Outer
+	outer.CommandPrefix = append([]string(nil), state.Outer.CommandPrefix...)
+	if enabled {
+		outer.DiceMasters = append(append([]string(nil), state.Outer.DiceMasters...), uid)
+	} else {
+		outer.DiceMasters = make([]string, 0, len(state.Outer.DiceMasters)-1)
+		outer.DiceMasters = append(outer.DiceMasters, state.Outer.DiceMasters[:index]...)
+		outer.DiceMasters = append(outer.DiceMasters, state.Outer.DiceMasters[index+1:]...)
+	}
+	if err = d.ContributeConfigCommand(ctx, tx, metadata, configstate.Command{
+		Kind:  configstate.CommandPatch,
+		Patch: &configstate.ConfigPatch{Outer: &outer},
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (d *Dice) SetDiceMasterForContext(ctx *MsgContext, uid string, enabled bool) (bool, error) {
+	if ctx == nil || ctx.callbackTransaction == nil {
+		return false, execution.ErrDomainTxUnavailable
+	}
+	if ctx.Dice != nil && ctx.Dice != d {
+		return false, errors.New("dice: message context belongs to another dice")
+	}
+	changed, err := d.ContributeDiceMasterMutation(
+		ctx.domainContext(),
+		ctx.callbackTransaction.Domain(),
+		ctx.callbackMetadata,
+		uid,
+		enabled,
+	)
+	if err != nil || !changed {
+		return changed, err
+	}
+	if err = d.scheduleConfigViewReloadAfterCommit(ctx.domainContext(), ctx.callbackTransaction); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ConfigStateForContext returns the transaction-local config state when the
+// caller is already inside a durable message root. This makes write-then-read
+// behavior observe prior mutations in the same root.
+func (d *Dice) ConfigStateForContext(ctx *MsgContext) (configstate.State, error) {
+	if d == nil {
+		return configstate.State{}, ErrDurableStateUnavailable
+	}
+	if ctx != nil && ctx.callbackTransaction != nil {
+		if ctx.Dice != nil && ctx.Dice != d {
+			return configstate.State{}, errors.New("dice: message context belongs to another dice")
+		}
+		return d.ConfigStateForDomain(ctx.domainContext(), ctx.callbackTransaction.Domain())
+	}
+	return d.ConfigStateSnapshot(), nil
+}
+
+func (d *Dice) DiceMasterIDsForContext(ctx *MsgContext) ([]string, error) {
+	if d == nil {
+		return nil, ErrDurableStateUnavailable
+	}
+	if ctx == nil || ctx.callbackTransaction == nil {
+		return d.DiceMasterIDs(), nil
+	}
+	if ctx.Dice != nil && ctx.Dice != d {
+		return nil, errors.New("dice: message context belongs to another dice")
+	}
+	participant, _, err := d.configOwner(ctx.domainContext(), ctx.callbackTransaction.Domain())
+	if err != nil {
+		return nil, err
+	}
+	return append([]string(nil), participant.state.Outer.DiceMasters...), nil
+}
+
+func (d *Dice) IsDiceMasterForContext(ctx *MsgContext, uid string) (bool, error) {
+	if d == nil {
+		return false, ErrDurableStateUnavailable
+	}
+	if ctx == nil || ctx.callbackTransaction == nil {
+		for _, master := range d.DiceMasterIDs() {
+			if master == uid {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	if ctx.Dice != nil && ctx.Dice != d {
+		return false, errors.New("dice: message context belongs to another dice")
+	}
+	participant, _, err := d.configOwner(ctx.domainContext(), ctx.callbackTransaction.Domain())
+	if err != nil {
+		return false, err
+	}
+	for _, master := range participant.state.Outer.DiceMasters {
+		if master == uid {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (d *Dice) ContributeUpgradeTarget(
+	ctx context.Context,
+	tx *execution.DomainTx,
+	metadata eventstore.Metadata,
+	windowID, endpointID string,
+) error {
+	state, err := d.ConfigStateForDomain(ctx, tx)
+	if err != nil {
+		return err
+	}
+	outer := state.Outer
+	outer.CommandPrefix = append([]string(nil), state.Outer.CommandPrefix...)
+	outer.DiceMasters = append([]string(nil), state.Outer.DiceMasters...)
+	outer.UpgradeWindowID = windowID
+	outer.UpgradeEndpointID = endpointID
+	return d.ContributeConfigCommand(ctx, tx, metadata, configstate.Command{
+		Kind:  configstate.CommandPatch,
+		Patch: &configstate.ConfigPatch{Outer: &outer},
+	})
+}
+
+func (d *Dice) SetUpgradeTargetForContext(ctx *MsgContext, windowID, endpointID string) error {
+	if ctx == nil || ctx.callbackTransaction == nil {
+		return execution.ErrDomainTxUnavailable
+	}
+	if ctx.Dice != nil && ctx.Dice != d {
+		return errors.New("dice: message context belongs to another dice")
+	}
+	if err := d.ContributeUpgradeTarget(
+		ctx.domainContext(),
+		ctx.callbackTransaction.Domain(),
+		ctx.callbackMetadata,
+		windowID,
+		endpointID,
+	); err != nil {
+		return err
+	}
+	return d.scheduleConfigViewReloadAfterCommit(ctx.domainContext(), ctx.callbackTransaction)
+}
+
+func (d *Dice) DurableSetUpgradeTarget(ctx context.Context, windowID, endpointID string) error {
+	request := struct {
+		WindowID   string `json:"windowId"`
+		EndpointID string `json:"endpointId"`
+	}{windowID, endpointID}
+	err := d.withFreshDomainExecution(ctx, "config-upgrade-target", request, func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		return d.ContributeUpgradeTarget(ctx, transaction.Domain(), metadata, windowID, endpointID)
+	})
+	if err != nil {
+		return err
+	}
+	return d.ReloadConfigView(ctx)
+}
+
+type managerParticipant struct {
+	repository *managerstate.Repository
+	base       managerstate.State
+	public     managerstate.PublicConfig
+	auth       managerstate.Auth
+	dirty      bool
+}
+
+func (p *managerParticipant) Contribute(ctx context.Context) (eventstore.UnitOfWork, error) {
+	if p == nil || !p.dirty {
+		return eventstore.UnitOfWork{}, nil
+	}
+	prepared, err := p.repository.PrepareSave(ctx, p.base, p.public, p.auth)
+	if err != nil {
+		return eventstore.UnitOfWork{}, err
+	}
+	return eventstore.UnitOfWork{
+		Streams:       []eventstore.StreamAppend{prepared.Stream},
+		SecretUpdates: []eventstore.SecretUpdate{prepared.Secret},
+	}, nil
+}
+
+type secretResolver interface {
+	ResolveSecret(ctx context.Context, ref string, version uint64) (eventstore.SecretResolution, error)
+}
+
+func (dm *DiceManager) managerOwner(ctx context.Context, tx *execution.DomainTx) (*managerParticipant, execution.ParticipantKey, error) {
+	if dm == nil || dm.durableStore == nil || tx == nil {
+		return nil, execution.ParticipantKey{}, execution.ErrDomainTxUnavailable
+	}
+	stream := managerstate.Stream()
+	key := execution.StreamParticipantKey(stream)
+	participant, err := tx.Owner(ctx, key, func(loadCtx context.Context) (execution.Participant, execution.ReadDependencies, error) {
+		reader, ok := dm.durableStore.(eventstore.ProjectionDependencyRepository)
+		if !ok {
+			return nil, execution.ReadDependencies{}, managerstate.ErrRepositoryUnavailable
+		}
+		resolver, ok := dm.durableStore.(secretResolver)
+		if !ok {
+			return nil, execution.ReadDependencies{}, managerstate.ErrRepositoryUnavailable
+		}
+		snapshot, readErr := reader.ReadProjectionDependency(loadCtx, managerstate.ProjectionName, managerstate.AggregateID, stream)
 		if readErr != nil {
-			return fmt.Errorf("dice: read config projection: %w", readErr)
+			return nil, execution.ReadDependencies{}, readErr
 		}
-		patch, patchErr := durableConfigPatch(state, request.Config, request.CommandPrefix, request.DiceMasters, request.MailPasswordRef)
-		if patchErr != nil {
-			return patchErr
+		if !snapshot.Found || snapshot.StreamVersion == 0 {
+			return nil, execution.ReadDependencies{}, managerstate.ErrInvalidState
 		}
-		preparedAppend, prepareErr := configstate.NewRepository(store).PrepareDecision(state, state.Version, eventstore.Metadata{}, configstate.Command{
-			Kind:               configstate.CommandPatch,
-			Patch:              &patch,
-			ExpectedVersion:    state.Version,
-			ExpectedVersionSet: true,
+		var state managerstate.State
+		if readErr = json.Unmarshal(snapshot.Row.Payload, &state); readErr != nil {
+			return nil, execution.ReadDependencies{}, readErr
+		}
+		if readErr = managerstate.ValidateState(state); readErr != nil || state.Version != snapshot.StreamVersion {
+			if readErr != nil {
+				return nil, execution.ReadDependencies{}, readErr
+			}
+			return nil, execution.ReadDependencies{}, execution.ErrDomainSnapshotChanged
+		}
+		secret, readErr := resolver.ResolveSecret(loadCtx, state.AuthSecretRef, state.AuthSecretVersion)
+		if readErr != nil {
+			return nil, execution.ReadDependencies{}, readErr
+		}
+		auth, readErr := managerstate.DecodeAuth(secret.Value)
+		if readErr != nil {
+			return nil, execution.ReadDependencies{}, readErr
+		}
+		repository, readErr := managerstate.NewRepository(dm.durableStore)
+		if readErr != nil {
+			return nil, execution.ReadDependencies{}, readErr
+		}
+		installed := &managerParticipant{
+			repository: repository,
+			base:       state,
+			public:     state.Public,
+			auth:       auth,
+		}
+		return installed, execution.ReadDependenciesFromStream(eventstore.StreamSnapshot{
+			Stream: stream, Version: snapshot.StreamVersion, Snapshot: snapshot.Snapshot,
+		}), nil
+	})
+	if err != nil {
+		return nil, execution.ParticipantKey{}, err
+	}
+	typed, ok := participant.(*managerParticipant)
+	if !ok {
+		return nil, execution.ParticipantKey{}, execution.ErrInvalidParticipant
+	}
+	return typed, key, nil
+}
+
+func (dm *DiceManager) contributeManagerPatch(ctx context.Context, tx *execution.DomainTx, patch *DurableManagerConfigPatch) error {
+	if !durableManagerPatchRequested(patch) {
+		return nil
+	}
+	_, key, err := dm.managerOwner(ctx, tx)
+	if err != nil {
+		return err
+	}
+	return tx.Mutate(key, func(participant execution.Participant) error {
+		manager, ok := participant.(*managerParticipant)
+		if !ok {
+			return execution.ErrInvalidParticipant
+		}
+		if patch.ServeAddress != nil {
+			manager.public.ServeAddress = *patch.ServeAddress
+		}
+		if patch.TrayTooltip != nil {
+			manager.public.TrayTooltip = NormalizeTrayTooltipPrefix(*patch.TrayTooltip)
+		}
+		if patch.DiceRandomMode != nil {
+			manager.public.DiceRandomMode = *patch.DiceRandomMode
+		}
+		if patch.UIPasswordHash != nil {
+			manager.auth.UIPasswordHash = *patch.UIPasswordHash
+			manager.auth.AccessTokens = nil
+		}
+		manager.dirty = true
+		return nil
+	})
+}
+
+func (dm *DiceManager) reloadManagerRuntime(ctx context.Context) error {
+	if dm == nil || dm.durableStore == nil {
+		return managerstate.ErrRepositoryUnavailable
+	}
+	repository, err := managerstate.NewRepository(dm.durableStore)
+	if err != nil {
+		return err
+	}
+	state, auth, err := repository.Load(ctx)
+	if err != nil {
+		return err
+	}
+	dm.publishManagerRuntime(state, auth)
+	return nil
+}
+
+func (dm *DiceManager) publishManagerRuntime(state managerstate.State, auth managerstate.Auth) bool {
+	if dm == nil {
+		return false
+	}
+	published := false
+	dm.managerStateMu.Lock()
+	if dm.managerState.Version <= state.Version {
+		dm.managerState = state
+		dm.applyEventSourcedManager(state.Public, auth)
+		published = true
+	}
+	dm.managerStateMu.Unlock()
+	return published
+}
+
+func cloneManagerPublicConfig(public managerstate.PublicConfig) managerstate.PublicConfig {
+	if public.DiceDataDirs == nil {
+		return public
+	}
+	dirs := make(map[string]string, len(public.DiceDataDirs))
+	for diceID, dataDir := range public.DiceDataDirs {
+		dirs[diceID] = dataDir
+	}
+	public.DiceDataDirs = dirs
+	return public
+}
+
+func (dm *DiceManager) ManagerPublicConfigSnapshot() (managerstate.PublicConfig, bool) {
+	if dm == nil {
+		return managerstate.PublicConfig{}, false
+	}
+	dm.managerStateMu.Lock()
+	public := cloneManagerPublicConfig(dm.managerState.Public)
+	passwordConfigured := dm.UIPasswordHash != ""
+	dm.managerStateMu.Unlock()
+	return public, passwordConfigured
+}
+
+// DurableMutateManagerConfig runs a pure mutation against canonical manager
+// public state selected inside a fresh root. The callback must not retain the
+// detached DTO or perform I/O.
+func (dm *DiceManager) DurableMutateManagerConfig(
+	ctx context.Context,
+	operation string,
+	request any,
+	mutate func(*managerstate.PublicConfig) error,
+) error {
+	if strings.TrimSpace(operation) == "" || mutate == nil {
+		return errors.New("dice: invalid manager config mutation")
+	}
+	randomModeChanged := false
+	err := dm.withFreshDomainExecution(ctx, "manager-"+operation, request, func(transaction *DurableCallbackTransaction, _ eventstore.Metadata) error {
+		randomModeChanged = false
+		_, key, ownerErr := dm.managerOwner(ctx, transaction.Domain())
+		if ownerErr != nil {
+			return ownerErr
+		}
+		return transaction.Domain().Mutate(key, func(participant execution.Participant) error {
+			manager, ok := participant.(*managerParticipant)
+			if !ok {
+				return execution.ErrInvalidParticipant
+			}
+			public := cloneManagerPublicConfig(manager.public)
+			if mutateErr := mutate(&public); mutateErr != nil {
+				return mutateErr
+			}
+			if public.DiceRandomMode != manager.public.DiceRandomMode {
+				effective, validateErr := dm.ValidateDiceRandomMode(DiceRandomMode(public.DiceRandomMode))
+				if validateErr != nil {
+					return validateErr
+				}
+				public.DiceRandomMode = string(effective)
+				randomModeChanged = true
+			}
+			manager.public = cloneManagerPublicConfig(public)
+			manager.dirty = true
+			return nil
 		})
-		if prepareErr != nil {
-			return prepareErr
-		}
-		if len(preparedAppend.Events) != 0 {
-			work.Streams = append(work.Streams, preparedAppend)
+	})
+	if err != nil {
+		return err
+	}
+	if err = dm.reloadManagerRuntime(ctx); err != nil {
+		return &ConfigRuntimeApplyError{Err: err}
+	}
+	if randomModeChanged {
+		if err = dm.ActivateDiceRandomMode(); err != nil {
+			return &ConfigRuntimeApplyError{Err: err}
 		}
 	}
+	return nil
+}
 
-	if request.PersistExtensionDefaults {
-		repository, extensionDiceID, repoErr := d.durableExtensionRepository()
-		if repoErr != nil {
-			return repoErr
+func (dm *DiceManager) DurableAuthenticateAndStoreAccessToken(ctx context.Context, password, token string) (bool, error) {
+	if strings.TrimSpace(token) == "" {
+		return false, errors.New("manager access token is empty")
+	}
+	request := struct {
+		Token string `json:"token"`
+	}{Token: token}
+	authenticated := false
+	changed := false
+	err := dm.withFreshDomainExecution(ctx, "manager-auth-token", request, func(transaction *DurableCallbackTransaction, _ eventstore.Metadata) error {
+		authenticated, changed = false, false
+		_, key, ownerErr := dm.managerOwner(ctx, transaction.Domain())
+		if ownerErr != nil {
+			return ownerErr
 		}
-		state, loadErr := repository.Load(ctx, extensionDiceID)
-		if loadErr != nil {
-			return loadErr
+		return transaction.Domain().Mutate(key, func(participant execution.Participant) error {
+			manager, ok := participant.(*managerParticipant)
+			if !ok {
+				return execution.ErrInvalidParticipant
+			}
+			if manager.auth.UIPasswordHash != "" && manager.auth.UIPasswordHash != password {
+				return nil
+			}
+			authenticated = true
+			for _, existing := range manager.auth.AccessTokens {
+				if existing == token {
+					return nil
+				}
+			}
+			manager.auth.AccessTokens = append(manager.auth.AccessTokens, token)
+			manager.dirty = true
+			changed = true
+			return nil
+		})
+	})
+	if err != nil || !changed {
+		return authenticated, err
+	}
+	if err = dm.reloadManagerRuntime(ctx); err != nil {
+		return true, &ConfigRuntimeApplyError{Err: err}
+	}
+	return true, nil
+}
+
+// DurableCommitConfigRequest contributes every addressed owner to one root.
+// Runtime publications occur only after that root has atomically committed.
+func (d *Dice) DurableCommitConfigRequest(ctx context.Context, request DurableConfigRequest) error {
+	randomModeChanged := request.Manager != nil && request.Manager.DiceRandomMode != nil
+	if randomModeChanged {
+		if d == nil || d.Parent == nil {
+			return ErrDurableStateUnavailable
 		}
-		commands := make([]extensionstate.Command, 0, len(request.ExtensionDefaults)+len(state.DefaultCommands))
-		desiredDefaults := make(map[string]struct{}, len(request.ExtensionDefaults))
-		for _, defaults := range request.ExtensionDefaults {
-			desiredDefaults[defaults.ExtensionID] = struct{}{}
-			commands = append(commands, extensionstate.Command{
-				Kind:             extensionstate.CommandSetDefaults,
-				ExtensionID:      defaults.ExtensionID,
-				AutoActive:       defaults.AutoActive,
-				DisabledCommands: append([]string(nil), defaults.DisabledCommands...),
-			})
+		effective, validateErr := d.Parent.ValidateDiceRandomMode(DiceRandomMode(*request.Manager.DiceRandomMode))
+		if validateErr != nil {
+			return validateErr
 		}
-		removedDefaults := make([]string, 0, len(state.DefaultCommands))
-		for extensionID := range state.DefaultCommands {
-			if _, desired := desiredDefaults[extensionID]; !desired {
-				removedDefaults = append(removedDefaults, extensionID)
+		managerPatch := *request.Manager
+		validatedMode := string(effective)
+		managerPatch.DiceRandomMode = &validatedMode
+		request.Manager = &managerPatch
+	}
+	err := d.withFreshDomainExecution(ctx, "config-request", request, func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		tx := transaction.Domain()
+		if request.PersistDiceConfig {
+			participant, _, stateErr := d.configOwner(ctx, tx)
+			if stateErr != nil {
+				return stateErr
+			}
+			if !configSourceMatchesParticipant(request.Config.source, participant) {
+				return ErrConfigViewChanged
+			}
+			state := participant.state.Clone()
+			patch, patchErr := durableConfigPatch(
+				state, request.Config, request.CommandPrefix, request.DiceMasters, request.MailPasswordRef,
+			)
+			if patchErr != nil {
+				return patchErr
+			}
+			if patchErr = d.ContributeConfigCommand(ctx, tx, metadata, configstate.Command{
+				Kind: configstate.CommandPatch, Patch: &patch,
+			}); patchErr != nil {
+				return patchErr
 			}
 		}
-		sort.Strings(removedDefaults)
-		for _, extensionID := range removedDefaults {
-			commands = append(commands, extensionstate.Command{
-				Kind:        extensionstate.CommandClearDefaults,
-				ExtensionID: extensionID,
-			})
+
+		if request.PersistExtensionDefaults {
+			state, stateErr := d.ExtensionStateForDomain(ctx, tx)
+			if stateErr != nil {
+				return stateErr
+			}
+			desired := make(map[string]struct{}, len(request.ExtensionDefaults))
+			for _, defaults := range request.ExtensionDefaults {
+				desired[defaults.ExtensionID] = struct{}{}
+				if stateErr = d.ContributeExtensionCommand(ctx, tx, metadata, extensionstate.Command{
+					Kind:             extensionstate.CommandSetDefaults,
+					ExtensionID:      defaults.ExtensionID,
+					AutoActive:       defaults.AutoActive,
+					DisabledCommands: append([]string(nil), defaults.DisabledCommands...),
+				}); stateErr != nil {
+					return stateErr
+				}
+			}
+			removed := make([]string, 0, len(state.DefaultCommands))
+			for extensionID := range state.DefaultCommands {
+				if _, keep := desired[extensionID]; !keep {
+					removed = append(removed, extensionID)
+				}
+			}
+			sort.Strings(removed)
+			for _, extensionID := range removed {
+				if stateErr = d.ContributeExtensionCommand(ctx, tx, metadata, extensionstate.Command{
+					Kind: extensionstate.CommandClearDefaults, ExtensionID: extensionID,
+				}); stateErr != nil {
+					return stateErr
+				}
+			}
 		}
-		preparedAppend, prepareErr := repository.PrepareCommands(state, state.Version, eventstore.Metadata{}, commands)
-		if prepareErr != nil {
-			return prepareErr
-		}
-		if len(preparedAppend.Events) != 0 {
-			work.Streams = append(work.Streams, preparedAppend)
-		}
+
+		return d.Parent.contributeManagerPatch(ctx, tx, request.Manager)
+	})
+	if err != nil {
+		return err
 	}
 
-	var manager *DiceManager
-	var managerPrepared *managerstate.PreparedSave
-	var managerPublic managerstate.PublicConfig
-	var managerAuth managerstate.Auth
-	managerLocked := false
+	var applyErr error
+	if request.PersistDiceConfig {
+		applyErr = errors.Join(applyErr, d.ReloadConfigView(ctx))
+	}
 	if durableManagerPatchRequested(request.Manager) {
-		manager = d.Parent
-		if manager == nil {
-			return errors.New("dice: manager is unavailable for durable config update")
+		reloadErr := d.Parent.reloadManagerRuntime(ctx)
+		applyErr = errors.Join(applyErr, reloadErr)
+		if reloadErr == nil && randomModeChanged {
+			applyErr = errors.Join(applyErr, d.Parent.ActivateDiceRandomMode())
 		}
-		manager.managerStateMu.Lock()
-		managerLocked = true
-		defer func() {
-			if managerLocked {
-				manager.managerStateMu.Unlock()
-			}
-		}()
-		if manager.durableStore == nil || manager.managerState.Version == 0 {
-			return errors.New("dice: event-sourced manager state is unavailable")
-		}
-		managerPublic, managerAuth = manager.eventSourcedManagerSnapshot()
-		if request.Manager.ServeAddress != nil {
-			managerPublic.ServeAddress = *request.Manager.ServeAddress
-		}
-		if request.Manager.TrayTooltip != nil {
-			managerPublic.TrayTooltip = NormalizeTrayTooltipPrefix(*request.Manager.TrayTooltip)
-		}
-		if request.Manager.DiceRandomMode != nil {
-			managerPublic.DiceRandomMode = *request.Manager.DiceRandomMode
-		}
-		if request.Manager.UIPasswordHash != nil {
-			managerAuth.UIPasswordHash = *request.Manager.UIPasswordHash
-			managerAuth.AccessTokens = nil
-		}
-		repository, repoErr := managerstate.NewRepository(store)
-		if repoErr != nil {
-			return repoErr
-		}
-		prepared, prepareErr := repository.PrepareSave(ctx, manager.managerState, managerPublic, managerAuth)
-		if prepareErr != nil {
-			return prepareErr
-		}
-		managerPrepared = &prepared
-		work.Streams = append(work.Streams, prepared.Stream)
-		work.SecretUpdates = append(work.SecretUpdates, prepared.Secret)
 	}
-
-	if len(work.Streams) == 0 && managerPrepared == nil {
-		return nil
+	if applyErr != nil {
+		return &ConfigRuntimeApplyError{Err: applyErr}
 	}
-	commitAndPublish := func() error {
-		if len(work.Streams) > 0 {
-			if _, err := store.Commit(ctx, work); err != nil {
-				return err
-			}
-		}
-		if managerPrepared != nil {
-			manager.managerState = managerPrepared.State
-			if request.Manager.UIPasswordHash != nil {
-				manager.applyEventSourcedManager(managerPublic, managerAuth)
-			} else {
-				manager.applyEventSourcedManagerPublic(managerPublic)
-			}
-		}
-		return nil
-	}
-	if managerPrepared != nil && request.Manager.DiceRandomMode != nil {
-		return manager.setDiceRandomModeWithCommit(DiceRandomMode(*request.Manager.DiceRandomMode), commitAndPublish)
-	}
-	return commitAndPublish()
+	return nil
 }
 
 func durableManagerPatchRequested(patch *DurableManagerConfigPatch) bool {
@@ -226,78 +928,70 @@ func durableManagerPatchRequested(patch *DurableManagerConfigPatch) bool {
 			patch.UIPasswordHash != nil || patch.DiceRandomMode != nil)
 }
 
-// DurableLegacyAdvancedView returns the advanced group without exposing the
-// event-store projection object.
-func (d *Dice) DurableLegacyAdvancedView(ctx context.Context) (AdvancedConfig, error) {
-	_, advanced, _, err := d.DurableLegacyConfigView(ctx)
-	return advanced, err
-}
-
 // DurableCommitAdvancedSnapshot persists advanced settings while retaining the
 // existing token reference unless the request explicitly changes it.
 func (d *Dice) DurableCommitAdvancedSnapshot(ctx context.Context, advanced AdvancedConfig, tokenRef *string) error {
-	store, diceID, err := d.durableStoreAndID()
+	request := struct {
+		Advanced AdvancedConfig `json:"advanced"`
+		TokenRef *string        `json:"tokenRef,omitempty"`
+	}{Advanced: advanced, TokenRef: tokenRef}
+	err := d.withFreshDomainExecution(ctx, "advanced-config", request, func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		participant, _, stateErr := d.configOwner(ctx, transaction.Domain())
+		if stateErr != nil {
+			return stateErr
+		}
+		if !configSourceMatchesParticipant(advanced.source, participant) {
+			return ErrConfigViewChanged
+		}
+		if advanced.ExposeDangerousSealInst {
+			return ErrDangerousSealInstUnsupported
+		}
+		state := participant.state.Clone()
+		ref := state.Advanced.StoryLogBackendTokenRef
+		if tokenRef != nil {
+			if *tokenRef != "" && !durableConfigSecretReference(*tokenRef) {
+				return errors.New("dice: advanced token must be a vault: or sha256: reference")
+			}
+			ref = strings.TrimSpace(*tokenRef)
+		}
+		group := configstate.AdvancedConfig{
+			Show:                              advanced.Show,
+			Enable:                            advanced.Enable,
+			StoryLogBackendURL:                advanced.StoryLogBackendUrl,
+			StoryLogAPIVersion:                advanced.StoryLogApiVersion,
+			StoryLogBackendTokenRef:           ref,
+			CustomReplyCooldown:               advanced.CustomReplyCooldown,
+			ExposeDangerousSealInst:           advanced.ExposeDangerousSealInst,
+			AllowFilesystemUnrestrictedAccess: advanced.AllowFilesystemUnrestrictedAccess,
+		}
+		return d.ContributeConfigCommand(ctx, transaction.Domain(), metadata, configstate.Command{
+			Kind: configstate.CommandPatch, Patch: &configstate.ConfigPatch{Advanced: &group},
+		})
+	})
 	if err != nil {
 		return err
 	}
-	if ctx == nil {
-		ctx = context.Background()
+	if err = d.ReloadConfigView(ctx); err != nil {
+		return &ConfigRuntimeApplyError{Err: err}
 	}
-	state, err := configstate.ReadProjected(ctx, store, diceID)
-	if err != nil {
-		return fmt.Errorf("dice: read config projection: %w", err)
-	}
-	ref := state.Advanced.StoryLogBackendTokenRef
-	if tokenRef != nil {
-		if *tokenRef != "" && !durableConfigSecretReference(*tokenRef) {
-			return errors.New("dice: advanced token must be a vault: or sha256: reference")
-		}
-		ref = *tokenRef
-	}
-	group := configstate.AdvancedConfig{
-		Show:                              advanced.Show,
-		Enable:                            advanced.Enable,
-		StoryLogBackendURL:                advanced.StoryLogBackendUrl,
-		StoryLogAPIVersion:                advanced.StoryLogApiVersion,
-		StoryLogBackendTokenRef:           ref,
-		CustomReplyCooldown:               advanced.CustomReplyCooldown,
-		ExposeDangerousSealInst:           advanced.ExposeDangerousSealInst,
-		AllowFilesystemUnrestrictedAccess: advanced.AllowFilesystemUnrestrictedAccess,
-	}
-	repo := configstate.NewRepository(store)
-	_, err = repo.DecideAndAppend(ctx, state, state.Version, eventstore.Metadata{}, configstate.Command{
-		Kind:               configstate.CommandPatch,
-		Patch:              &configstate.ConfigPatch{Advanced: &group},
-		ExpectedVersion:    state.Version,
-		ExpectedVersionSet: true,
-	})
-	return err
+	return nil
 }
 
 // DurableSetExtensionDefaults changes one extension's default command policy
-// through the extension aggregate instead of the legacy Config slice.
+// through the extension aggregate instead of a Config slice.
 func (d *Dice) DurableSetExtensionDefaults(ctx context.Context, extensionID string, autoActive bool, disabledCommands []string) error {
-	repo, diceID, err := d.durableExtensionRepository()
-	if err != nil {
-		return err
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	state, err := repo.Load(ctx, diceID)
-	if err != nil {
-		return err
-	}
-	if _, ok := state.Extensions[extensionID]; !ok {
-		return extensionstate.ErrUnknownExtension
-	}
-	_, err = repo.DecideAndAppend(ctx, state, state.Version, eventstore.Metadata{}, extensionstate.Command{
-		Kind:             extensionstate.CommandSetDefaults,
-		ExtensionID:      extensionID,
-		AutoActive:       autoActive,
+	request := DurableExtensionDefault{
+		ExtensionID: extensionID, AutoActive: autoActive,
 		DisabledCommands: append([]string(nil), disabledCommands...),
+	}
+	return d.withFreshDomainExecution(ctx, "extension-defaults", request, func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		return d.ContributeExtensionCommand(ctx, transaction.Domain(), metadata, extensionstate.Command{
+			Kind:             extensionstate.CommandSetDefaults,
+			ExtensionID:      extensionID,
+			AutoActive:       autoActive,
+			DisabledCommands: append([]string(nil), disabledCommands...),
+		})
 	})
-	return err
 }
 
 func durableConfigSecretReference(value string) bool {
@@ -425,7 +1119,12 @@ func durableConfigPatch(state configstate.State, config Config, commandPrefix, d
 		censorConfig.Scores[strconv.Itoa(int(level))] = value
 	}
 	storeConfig := configstate.StoreConfig{BackendURLs: append([]string(nil), config.BackendUrls...), DisabledBackendURLs: append([]string(nil), config.DisabledBackendUrls...)}
-	outerConfig := configstate.OuterConfig{CommandPrefix: append([]string(nil), commandPrefix...), DiceMasters: append([]string(nil), diceMasters...)}
+	outerConfig := configstate.OuterConfig{
+		CommandPrefix:     append([]string(nil), commandPrefix...),
+		DiceMasters:       append([]string(nil), diceMasters...),
+		UpgradeWindowID:   config.UpgradeWindowID,
+		UpgradeEndpointID: config.UpgradeEndpointID,
+	}
 	return configstate.ConfigPatch{
 		Base:             &base,
 		Rate:             &rateConfig,

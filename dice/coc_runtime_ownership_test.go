@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -23,12 +24,13 @@ func TestCustomCocRuleUsesOwnerRealmAndRejectsReload(t *testing.T) {
 			manager := NewJsLoopManager()
 			generation := manager.SetLoop(loop)
 			d := &Dice{ExtLoopManager: manager, Logger: zap.NewNop().Sugar()}
-			plugin := &ExtInfo{Name: "rule-owner", JSLoopVersion: generation, IsJsExt: true, dice: d}
+			source := &JsScriptInfo{Name: "rule-owner", Filename: "rule-owner.js", runtimeGeneration: generation}
+			plugin := &ExtInfo{Name: "rule-owner", JSLoopVersion: generation, IsJsExt: true, dice: d, Source: source}
 			var calls atomic.Int32
 			if err := loop.Run(func(rt jsengine.Runtime) error {
 				vm, _ := gojaengine.Raw(rt)
 				vm.SetFieldNameMapper(gojaengine.FieldNameMapper())
-				if err := d.installJSHostAPI(rt); err != nil {
+				if err := d.installJSHostAPI(rt, loop); err != nil {
 					return err
 				}
 				return rt.Bind("ownerProbe", func() bool {
@@ -38,12 +40,19 @@ func TestCustomCocRuleUsesOwnerRealmAndRejectsReload(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			if err := jsengine.RunWithContext(loop, jsContextForPlugin(plugin), func(rt jsengine.Runtime) error {
-				_, err := rt.RunString("rule.js", `var rule = seal.coc.newRule(); rule.index=20; rule.key="owned"; rule.check=function(){ if (!ownerProbe()) throw Error("wrong rule owner"); var ret=seal.coc.newRuleCheckResult(); ret.successRank=3; ret.criticalSuccessValue=9; return ret; }; if (!seal.coc.registerRule(rule)) throw Error("registration failed");`)
-				return err
+			realm := jsContextForRoot(context.Background(), d, plugin, source, nil, true)
+			if err := runJSExecutionRoot(realm, func() error {
+				defer realm.activatePersistentScheduler()
+				return jsengine.RunWithContext(loop, realm, func(rt jsengine.Runtime) error {
+					_, err := rt.RunString("rule.js", `var rule = seal.coc.newRule(); rule.index=20; rule.key="owned"; rule.check=function(){ if (!ownerProbe()) throw Error("wrong rule owner"); var ret=seal.coc.newRuleCheckResult(); ret.successRank=3; ret.criticalSuccessValue=9; return ret; }; if (!seal.coc.registerRule(rule)) throw Error("registration failed");`)
+					return err
+				})
 			}); err != nil {
+				realm.completePersistentBinding(err)
 				t.Fatal(err)
 			}
+			source.replacePersistentBinding(realm.binding)
+			realm.completePersistentBinding(nil)
 			if stale {
 				manager.SetLoop(nil)
 			}

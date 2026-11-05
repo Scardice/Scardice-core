@@ -93,7 +93,7 @@ func (effect OutboundEffect) Validate() error {
 		if !ok || effect.Kind != expectedKind || effect.RequiredCapabilities != expectedCaps || effect.RequiredAction != expectedAction || effect.RetryClass != expectedRetry || effect.Risk != expectedRisk {
 			return fmt.Errorf("%w: versioned effect metadata does not match payload", ErrInvalidContract)
 		}
-		if err := effect.Lane.Validate(); err != nil || effect.Lane.EndpointID != effect.EndpointID {
+		if err := effect.Lane.Verify(effect.EndpointID, effect.Payload.Target); err != nil {
 			return fmt.Errorf("%w: lane does not bind effect target", ErrInvalidContract)
 		}
 		if err := effect.Payload.Validate(); err != nil {
@@ -219,8 +219,8 @@ func AmbiguousResult(code, message string) EffectResult {
 }
 
 // ArtifactResult is an in-memory handoff only. Bytes are deliberately omitted
-// from JSON and must be consumed immediately by the dispatcher, which encrypts
-// them into artifact storage and retains metadata in events.
+// from JSON and must be consumed immediately by the dispatcher, which persists
+// them in artifact storage and retains metadata in events.
 type ArtifactResult struct {
 	ID          ArtifactID `json:"id,omitempty"`
 	ContentType string     `json:"contentType,omitempty"`

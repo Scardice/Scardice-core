@@ -23,14 +23,24 @@ func (s *nativeFilesystemTestSink) Close(_ services.RequestID, response services
 	return nil
 }
 
+func newNativeFilesystemTestDice(t *testing.T, dataDir string) *Dice {
+	t.Helper()
+	d, _ := newCanonicalTestDice(t)
+	d.BaseConfig.DataDir = dataDir
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.DataDir = dataDir })
+	updateCanonicalTestAdvancedConfig(t, d, func(config *AdvancedConfig) {
+		config.AllowFilesystemUnrestrictedAccess = true
+	})
+	return d
+}
+
 func TestNativeFilesystemServiceReadFile(t *testing.T) {
 	root := t.TempDir()
 	filename := filepath.Join(root, "fixture.txt")
 	if err := os.WriteFile(filename, []byte("native fs"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	d := &Dice{BaseConfig: BaseConfig{DataDir: root}}
-	d.AdvancedConfig.AllowFilesystemUnrestrictedAccess = true
+	d := newNativeFilesystemTestDice(t, root)
 	service := &nativeFilesystemService{dice: d}
 	sink := &nativeFilesystemTestSink{complete: make(chan services.Response, 1)}
 	if err := service.Start(services.AsyncCall{
@@ -57,8 +67,7 @@ func TestNativeFilesystemServiceReadFile(t *testing.T) {
 func TestNativeFilesystemServiceSyncReadWrite(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "sync.txt")
-	d := &Dice{BaseConfig: BaseConfig{DataDir: root}}
-	d.AdvancedConfig.AllowFilesystemUnrestrictedAccess = true
+	d := newNativeFilesystemTestDice(t, root)
 	service := &nativeFilesystemService{dice: d}
 
 	if response, err := service.Invoke(services.Call{Request: services.Request{
@@ -86,8 +95,7 @@ func TestNativeFilesystemServiceSyncLargeUnlimitedAndExplicitLimit(t *testing.T)
 	payload := make([]byte, size)
 	payload[0] = 0x5a
 	payload[len(payload)-1] = 0xa5
-	d := &Dice{BaseConfig: BaseConfig{DataDir: root}}
-	d.AdvancedConfig.AllowFilesystemUnrestrictedAccess = true
+	d := newNativeFilesystemTestDice(t, root)
 	service := &nativeFilesystemService{dice: d}
 
 	if response, err := service.Invoke(services.Call{Request: services.Request{
@@ -109,7 +117,7 @@ func TestNativeFilesystemServiceSyncLargeUnlimitedAndExplicitLimit(t *testing.T)
 		t.Fatalf("unlimited sync filesystem read = status %v, bytes %d, err %v; want %d bytes", response.Status, len(response.Bytes), err, size)
 	}
 
-	d.Config.QuickJSMaxFilesystemReadMiB = 1
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.QuickJSMaxFilesystemReadMiB = 1 })
 	response, err = service.Invoke(services.Call{Request: services.Request{
 		Service:   services.Filesystem,
 		Operation: services.OpFilesystemReadFileSync,
@@ -118,7 +126,7 @@ func TestNativeFilesystemServiceSyncLargeUnlimitedAndExplicitLimit(t *testing.T)
 	if err == nil || response.Status != services.StatusInvalid {
 		t.Fatalf("explicit sync filesystem read = %#v, %v; want invalid over-limit response", response, err)
 	}
-	d.Config.QuickJSMaxFilesystemWriteMiB = 1
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.QuickJSMaxFilesystemWriteMiB = 1 })
 	response, err = service.Invoke(services.Call{Request: services.Request{
 		Service:   services.Filesystem,
 		Operation: services.OpFilesystemWriteFileSync,

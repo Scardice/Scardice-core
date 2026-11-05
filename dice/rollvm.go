@@ -512,7 +512,7 @@ func (e *RollExpression) Evaluate(_ *Dice, ctx *MsgContext) (*VMStack, string, e
 		wodState.isGE = true
 
 		am := ctx.Dice.AttrsManager
-		groupAttrs := lo.Must(am.LoadByIdForCtx(ctx, ctx.Group.GroupID))
+		groupAttrs := lo.Must(am.LoadByIdForCtx(ctx, ctx.Group.GroupID()))
 
 		if threshold, exists := groupAttrs.LoadX("wodThreshold"); exists {
 			wodState.threshold = dsValueToRollVMv1(threshold)

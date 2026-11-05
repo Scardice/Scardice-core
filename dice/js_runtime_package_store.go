@@ -976,9 +976,12 @@ func (d *Dice) StageJSRuntimeUninstall(id string) (JSRuntimePendingChange, error
 	if d.configuredJSEngine() == runtimeID {
 		return JSRuntimePendingChange{}, fmt.Errorf("%w: runtime %q is the global default", ErrJSRuntimeInUse, runtimeID)
 	}
-	for extensionID, route := range d.Config.JsRuntimeRoutes {
-		if jsengine.NormalizeEngineID(route) == runtimeID {
-			return JSRuntimePendingChange{}, fmt.Errorf("%w: runtime %q is routed from package %q", ErrJSRuntimeInUse, runtimeID, extensionID)
+	config := d.Config()
+	if config != nil {
+		for extensionID, route := range config.JsRuntimeRoutes {
+			if jsengine.NormalizeEngineID(route) == runtimeID {
+				return JSRuntimePendingChange{}, fmt.Errorf("%w: runtime %q is routed from package %q", ErrJSRuntimeInUse, runtimeID, extensionID)
+			}
 		}
 	}
 	return store.StageUninstall(string(runtimeID))

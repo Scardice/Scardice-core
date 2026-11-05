@@ -1,32 +1,12 @@
 package dice
 
 import (
+	"context"
 	"errors"
 	"testing"
+
+	"Scardice-core/core/managerstate"
 )
-
-func TestDiceManagerActivateRandomModeSynchronizesDiceMirrors(t *testing.T) {
-	installGlobalDiceSourceState(t, completeSourceMap(
-		sourceOverride{mode: DiceRandomModePCG, src: &countingDiceSource{values: []uint64{1}}},
-		sourceOverride{mode: DiceRandomModeGM, src: &countingDiceSource{values: []uint64{2}}},
-	), nil)
-
-	manager := &DiceManager{
-		DiceRandomMode: string(DiceRandomModeGM),
-		Dice:           []*Dice{{}, {}},
-	}
-	if err := manager.ActivateDiceRandomMode(); err != nil {
-		t.Fatalf("ActivateDiceRandomMode() error = %v", err)
-	}
-	if got := globalRandSource.CurrentMode(); got != DiceRandomModeGM {
-		t.Fatalf("CurrentMode() = %s, want %s", got, DiceRandomModeGM)
-	}
-	for index, d := range manager.Dice {
-		if got := d.Config.DiceRandomMode; got != string(DiceRandomModeGM) {
-			t.Fatalf("Dice[%d].Config.DiceRandomMode = %q, want %q", index, got, DiceRandomModeGM)
-		}
-	}
-}
 
 func TestDiceManagerSetRandomModeDoesNotCommitFallback(t *testing.T) {
 	installGlobalDiceSourceState(t, completeSourceMap(
@@ -54,11 +34,9 @@ func TestDiceManagerValidateRandomModeDoesNotMutate(t *testing.T) {
 		sourceOverride{mode: DiceRandomModePCG, src: &countingDiceSource{values: []uint64{1}}},
 	), nil)
 
-	diceInstance := &Dice{}
-	diceInstance.Config.DiceRandomMode = "existing"
 	manager := &DiceManager{
 		DiceRandomMode: string(DiceRandomModePCG),
-		Dice:           []*Dice{diceInstance},
+		Dice:           []*Dice{{}},
 	}
 	effective, err := manager.ValidateDiceRandomMode(DiceRandomModeGM)
 	if err == nil {
@@ -70,50 +48,62 @@ func TestDiceManagerValidateRandomModeDoesNotMutate(t *testing.T) {
 	if got := globalRandSource.CurrentMode(); got != DiceRandomModePCG {
 		t.Fatalf("validation changed active source to %q", got)
 	}
-	if got := diceInstance.Config.DiceRandomMode; got != "existing" {
-		t.Fatalf("validation changed Dice config mode to %q", got)
-	}
 }
 
-func TestDiceManagerRandomModeCommitIsAtomicWithActivation(t *testing.T) {
+func TestDiceManagerRandomModePublishesOnlyAfterCanonicalCommit(t *testing.T) {
 	installGlobalDiceSourceState(t, completeSourceMap(
 		sourceOverride{mode: DiceRandomModePCG, src: &countingDiceSource{values: []uint64{1}}},
 		sourceOverride{mode: DiceRandomModeGM, src: &countingDiceSource{values: []uint64{2}}},
 	), nil)
-
-	diceInstance := &Dice{}
-	diceInstance.Config.DiceRandomMode = string(DiceRandomModePCG)
+	d, store := newCanonicalTestDice(t)
 	manager := &DiceManager{
-		DiceRandomMode: string(DiceRandomModePCG),
-		Dice:           []*Dice{diceInstance},
+		DiceRandomMode: string(DiceRandomModePCG), Dice: []*Dice{d},
 	}
-	commitErr := errors.New("durable commit failed")
-	err := manager.setDiceRandomModeWithCommit(DiceRandomModeGM, func() error {
-		return commitErr
+	d.Parent = manager
+	ctx := context.Background()
+	if err := manager.RestoreEventSourcedManager(ctx, store); err != nil {
+		t.Fatal(err)
+	}
+	stage := func(transaction *DurableCallbackTransaction) error {
+		_, err := manager.SetDiceRandomModeForContext(&MsgContext{Dice: d, callbackTransaction: transaction}, DiceRandomModeGM)
+		if err != nil {
+			return err
+		}
+		if got := globalRandSource.CurrentMode(); got != DiceRandomModePCG {
+			t.Fatalf("uncommitted command activated %q", got)
+		}
+		return nil
+	}
+	hostErr := errors.New("command failed after selecting a mode")
+	err := d.WithDomainExecution(ctx, "random-mode-aborted", []byte("gm"), func(transaction *DurableCallbackTransaction) error {
+		if err := stage(transaction); err != nil {
+			return err
+		}
+		return hostErr
 	})
-	if !errors.Is(err, commitErr) {
-		t.Fatalf("failed durable commit error = %v, want %v", err, commitErr)
+	if !errors.Is(err, hostErr) {
+		t.Fatalf("failed root error = %v", err)
 	}
 	if got := globalRandSource.CurrentMode(); got != DiceRandomModePCG {
-		t.Fatalf("failed commit left active mode %q, want PCG", got)
+		t.Fatalf("failed root activated %q", got)
 	}
-	if manager.DiceRandomMode != string(DiceRandomModePCG) ||
-		diceInstance.Config.DiceRandomMode != string(DiceRandomModePCG) {
-		t.Fatalf("failed commit published mode: manager=%q dice=%q", manager.DiceRandomMode, diceInstance.Config.DiceRandomMode)
+	repository, err := managerstate.NewRepository(store)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	committed := false
-	if err := manager.setDiceRandomModeWithCommit(DiceRandomModeGM, func() error {
-		committed = true
-		return nil
-	}); err != nil {
-		t.Fatalf("successful durable commit error = %v", err)
+	state, _, err := repository.Load(ctx)
+	if err != nil || state.Public.DiceRandomMode != string(DiceRandomModePCG) {
+		t.Fatalf("failed root changed canonical mode: state=%+v err=%v", state, err)
 	}
-	if !committed || globalRandSource.CurrentMode() != DiceRandomModeGM ||
-		manager.DiceRandomMode != string(DiceRandomModeGM) ||
-		diceInstance.Config.DiceRandomMode != string(DiceRandomModeGM) {
-		t.Fatalf("successful activation not published atomically: committed=%v active=%q manager=%q dice=%q",
-			committed, globalRandSource.CurrentMode(), manager.DiceRandomMode, diceInstance.Config.DiceRandomMode)
+	if err := d.WithDomainExecution(ctx, "random-mode-committed", []byte("gm"), stage); err != nil {
+		t.Fatal(err)
+	}
+	state, _, err = repository.Load(ctx)
+	if err != nil || state.Public.DiceRandomMode != string(DiceRandomModeGM) {
+		t.Fatalf("committed mode: state=%+v err=%v", state, err)
+	}
+	if got := globalRandSource.CurrentMode(); got != DiceRandomModeGM {
+		t.Fatalf("committed root did not activate canonical mode: %q", got)
 	}
 }
 func TestNormalizeGlobalDiceRandomModePrefersTopLevelConfig(t *testing.T) {

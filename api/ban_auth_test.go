@@ -13,16 +13,10 @@ import (
 
 func TestBanRoutesRejectUnauthenticatedRequests(t *testing.T) {
 	t.Setenv(adminAuthBypassEnv, "")
-	previousDice, previousManager := myDice, dm
-	t.Cleanup(func() { myDice, dm = previousDice, previousManager })
-
-	manager := &dice.DiceManager{}
-	runtime := &dice.Dice{Parent: manager}
-	banList := &dice.BanListInfo{Parent: runtime}
-	banList.Init()
-	banList.Map.Store("QQ:existing", &dice.BanListInfoItem{ID: "QQ:existing", Rank: dice.BanRankBanned})
-	runtime.Config.BanList = banList
-	myDice, dm = runtime, manager
+	runtime, banList := newBanAPIFixture(t, "ban-auth-unused-token")
+	if err := banList.SetRankByID(runtime, "QQ:existing", dice.BanRankBanned, "", "", "seed"); err != nil {
+		t.Fatal(err)
+	}
 
 	tests := []struct {
 		name    string

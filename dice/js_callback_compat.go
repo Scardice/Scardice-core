@@ -193,13 +193,27 @@ func sameJSRealm(expected, actual any) bool {
 	if expected == nil || actual == nil {
 		return expected == actual
 	}
-	// Realm affinity is plugin ownership, not invocation lifetime identity.
+	// Owner-goroutine reentry is legal only for the same script/runtime and
+	// invocation registry; source equality alone must not join another root.
 	if left, ok := expected.(*jsExecutionContext); ok {
 		if right, ok := actual.(*jsExecutionContext); ok {
 			if left == nil || right == nil {
 				return left == right
 			}
-			return left.Plugin == right.Plugin && left.Script == right.Script
+			if left == right {
+				return true
+			}
+			leftSource, rightSource := jsContextSource(left), jsContextSource(right)
+			if leftSource != nil || rightSource != nil {
+				return left.Dice == right.Dice &&
+					leftSource == rightSource &&
+					jsContextGeneration(left) == jsContextGeneration(right) &&
+					left.invocationRegistry() == right.invocationRegistry()
+			}
+			return left.Dice == right.Dice &&
+				jsContextPlugin(left) == jsContextPlugin(right) &&
+				jsContextGeneration(left) == jsContextGeneration(right) &&
+				left.invocationRegistry() == right.invocationRegistry()
 		}
 	}
 	if keyer, ok := expected.(jsengine.ContextKeyer); ok {
@@ -216,6 +230,21 @@ func sameJSRealm(expected, actual any) bool {
 		return expected == actual
 	}
 	return reflect.DeepEqual(expected, actual)
+}
+
+// sameJSRealmOwner reports whether two contexts belong to the same Dice,
+// script or plugin, and runtime generation, ignoring invocation registries.
+func sameJSRealmOwner(expected *jsExecutionContext, actual *jsExecutionContext) bool {
+	if expected == nil || actual == nil {
+		return expected == actual
+	}
+	if expected.Dice != actual.Dice || jsContextGeneration(expected) != jsContextGeneration(actual) {
+		return false
+	}
+	if source := jsContextSource(expected); source != nil || jsContextSource(actual) != nil {
+		return source == jsContextSource(actual)
+	}
+	return jsContextPlugin(expected) == jsContextPlugin(actual)
 }
 
 func messageRawID(msg *Message) any {
@@ -298,6 +327,15 @@ func executeJSCallbackRequest(runtime jsengine.Runtime, request jsCallbackReques
 	return false, nil
 }
 
+func executeJSCallbackInRealm(runtime jsengine.Runtime, request jsCallbackRequest, settle func(func() error)) (observed bool, err error) {
+	realm, _ := request.Realm.(*jsExecutionContext)
+	err = realm.withRuntime(runtime, func() error {
+		observed, err = executeJSCallbackRequest(runtime, request, settle)
+		return err
+	})
+	return observed, err
+}
+
 func (m *JsLoopManager) dispatchJSCallback(request jsCallbackRequest, schedule bool) error {
 	if m == nil || (request.Callback == nil && request.ValueCallback == nil) {
 		return nil
@@ -315,7 +353,14 @@ func (m *JsLoopManager) dispatchJSCallback(request jsCallbackRequest, schedule b
 	inOwner := jsengine.InOwner(loop)
 	current := jsengine.CurrentContext(loop)
 	if inOwner && !sameJSRealm(request.Realm, current) {
-		return errJSCallbackWrongRealm
+		// A callback with no message raised from inside the plugin's own
+		// realm has no invocation registry of its own to protect; it joins
+		// the realm that raised it. Message-bound callbacks stay strict.
+		joined, ok := current.(*jsExecutionContext)
+		if request.Message != nil || !ok || !sameJSRealmOwner(jsOpaqueExecutionContext(request.Realm), joined) {
+			return errJSCallbackWrongRealm
+		}
+		request.Realm = joined
 	}
 
 	if schedule {
@@ -365,7 +410,7 @@ func (m *JsLoopManager) dispatchJSCallback(request jsCallbackRequest, schedule b
 				return callbackErr
 			}
 			defer completion.end()
-			_, callbackErr = executeJSCallbackRequest(runtime, request, completion.settle)
+			_, callbackErr = executeJSCallbackInRealm(runtime, request, completion.settle)
 			if callbackErr != nil {
 				completion.finish(callbackErr)
 			}
@@ -379,20 +424,39 @@ func (m *JsLoopManager) dispatchJSCallback(request jsCallbackRequest, schedule b
 	}
 
 	if inOwner {
-		if request.ValueCallback != nil {
-			return errors.New("Promise-aware JavaScript callback cannot synchronously re-enter its owner")
-		}
-		return runEngineCallback(func() error {
-			request.Callback()
-			return nil
-		})
-	}
-
-	if request.ValueCallback == nil {
-		return jsengine.RunWithContext(loop, request.Realm, func(jsengine.Runtime) error {
+		if request.ValueCallback == nil {
 			return runEngineCallback(func() error {
 				request.Callback()
 				return nil
+			})
+		}
+		active := jsExecutionContextFor(loop)
+		if active == nil || active.activeRuntime == nil {
+			return errors.New("JavaScript owner reentry has no active runtime")
+		}
+		var settled bool
+		var settledErr error
+		observed, callbackErr := executeJSCallbackInRealm(active.activeRuntime, request, func(consume func() error) {
+			settled = true
+			settledErr = consume()
+		})
+		if callbackErr != nil {
+			return callbackErr
+		}
+		if observed || !settled {
+			return errors.New("asynchronous JavaScript callback cannot synchronously re-enter its owner")
+		}
+		return settledErr
+	}
+
+	if request.ValueCallback == nil {
+		return jsengine.RunWithContext(loop, request.Realm, func(runtime jsengine.Runtime) error {
+			realm, _ := request.Realm.(*jsExecutionContext)
+			return realm.withRuntime(runtime, func() error {
+				return runEngineCallback(func() error {
+					request.Callback()
+					return nil
+				})
 			})
 		})
 	}
@@ -417,7 +481,7 @@ func (m *JsLoopManager) dispatchJSCallback(request jsCallbackRequest, schedule b
 			return callbackErr
 		}
 		var callbackErr error
-		_, callbackErr = executeJSCallbackRequest(runtime, request, completion.settle)
+		_, callbackErr = executeJSCallbackInRealm(runtime, request, completion.settle)
 		return callbackErr
 	})
 	completion.end()
@@ -644,7 +708,11 @@ func (i *ExtInfo) dispatchWithJsCheck(d *Dice, kind jsCallbackKind, providerEven
 		callback()
 		return
 	}
-	if d == nil || !d.Config.JsEnable || d.ExtLoopManager == nil {
+	if d == nil || d.ExtLoopManager == nil {
+		return
+	}
+	config := d.Config()
+	if config == nil || !config.JsEnable {
 		return
 	}
 	if i.dropJSCallbackBeforeLoad(d, kind, providerEventID) {

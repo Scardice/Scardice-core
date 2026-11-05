@@ -13,28 +13,9 @@ import (
 	"time"
 )
 
-func seedPrivacyOperation(t *testing.T, store *GORMStore, group, dice, operation string, scopes []string) PrivacyDryRunResult {
-	t.Helper()
-	ctx := context.Background()
-	scan, err := store.PrivacyDryRun(ctx, PrivacyDryRunRequest{GroupID: group, DiceIDs: []string{dice}, Scopes: scopes})
-	if err != nil {
-		t.Fatal(err)
-	}
-	private := PrivacyOperationContext{GroupID: group, DiceIDs: []string{dice}, Scopes: scopes, Phase: "delete", Counts: scan.Counts, ConfirmationDigest: scan.Digest, ConfirmationVersion: scan.Version}
-	createErr := store.PrivacyCreateOperation(ctx, operation, scan.SubjectKey, private)
-	if createErr != nil {
-		t.Fatal(createErr)
-	}
-	_, fenceErr := store.PrivacyFence(ctx, scan.SubjectKey, "group", operation)
-	if fenceErr != nil {
-		t.Fatal(fenceErr)
-	}
-	return scan
-}
-
 func TestSQLiteLiveAndRebuiltDigestAgree(t *testing.T) {
 	ctx := context.Background()
-	store, db := openTransactionTestStore(t, newTransactionTestKeySource(), "task7-privacy-digest")
+	store, db := openTransactionTestStore(t, "task7-privacy-digest")
 	defer db.Close()
 	if err := store.RegisterProjection(transactionTestProjection()); err != nil {
 		t.Fatal(err)
@@ -72,73 +53,9 @@ func TestSQLiteLiveAndRebuiltDigestAgree(t *testing.T) {
 	}
 }
 
-func TestSQLitePrivacySparseHighWaterRebuildPreservesHole(t *testing.T) {
-	ctx := context.Background()
-	store, db := openTransactionTestStore(t, newTransactionTestKeySource(), "task7-privacy-sparse")
-	defer db.Close()
-	if err := store.RegisterProjection(transactionTestProjection()); err != nil {
-		t.Fatal(err)
-	}
-	targetGroup := StreamID{AggregateType: "group", AggregateID: privacyCanonical("dice-a", "sparse-group")}
-	survivorGroup := StreamID{AggregateType: "group", AggregateID: privacyCanonical("dice-b", "sparse-group")}
-	targetPlayer := StreamID{AggregateType: "player", AggregateID: privacyCanonical("dice-a", "sparse-group", "player-a")}
-	if _, err := store.Commit(ctx, UnitOfWork{Streams: []StreamAppend{
-		{Stream: targetGroup, Events: []NewEvent{transactionTestEvent("sparse-target-group", 1)}},
-		{Stream: survivorGroup, Events: []NewEvent{transactionTestEvent("sparse-survivor-group", 2)}},
-		{Stream: targetPlayer, Events: []NewEvent{transactionTestEvent("sparse-target-player", 3)}},
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	scan := seedPrivacyOperation(t, store, "sparse-group", "dice-a", "sparse-operation", []string{"group_record"})
-	if scan.TargetHighWater != 3 {
-		t.Fatalf("target high-water=%d", scan.TargetHighWater)
-	}
-	batch, err := store.PrivacyDeleteBatch(ctx, PrivacyBatchRequest{OperationID: "sparse-operation", GroupID: "sparse-group", Phase: "delete", DiceIDs: []string{"dice-a"}, Scopes: []string{"group_record"}, Limit: PrivacyBatchRecords})
-	if err != nil || batch.Deleted.GroupRecord != 1 || !batch.Done {
-		t.Fatalf("sparse delete batch=%+v err=%v", batch, err)
-	}
-	if rows, err := store.Load(ctx, targetGroup, 0); err != nil || len(rows) != 0 {
-		t.Fatalf("purged sparse target rows=%d err=%v", len(rows), err)
-	}
-	if rows, err := store.Load(ctx, survivorGroup, 0); err != nil || len(rows) != 1 {
-		t.Fatalf("survivor rows=%d err=%v", len(rows), err)
-	}
-	var beforeControl projectionControlRow
-	if err := db.GORM().Where("singleton_id = ?", "default").First(&beforeControl).Error; err != nil {
-		t.Fatal(err)
-	}
-	liveDigest, err := store.DigestProjection(ctx, beforeControl.ActiveGeneration)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.PrivacyRebuildPublish(ctx, scan.TargetHighWater); err != nil {
-		t.Fatal(err)
-	}
-	var control projectionControlRow
-	if err := db.GORM().Where("singleton_id = ?", "default").First(&control).Error; err != nil {
-		t.Fatal(err)
-	}
-	if control.TerminalPosition != scan.TargetHighWater {
-		t.Fatalf("terminal=%d target=%d", control.TerminalPosition, scan.TargetHighWater)
-	}
-	survivor, err := store.ReadProjectionRow(ctx, "counter", survivorGroup.AggregateID)
-	if err != nil || string(survivor.Payload) != `{"delta":2}` {
-		t.Fatalf("survivor projection=%+v err=%v", survivor, err)
-	}
-	if _, err := store.ReadProjectionRow(ctx, "counter", targetGroup.AggregateID); err == nil {
-		t.Fatal("purged target projection remained")
-	}
-	rebuiltDigest, err := store.DigestProjection(ctx, control.ActiveGeneration)
-	if err != nil || rebuiltDigest == (EventChecksum{}) {
-		t.Fatalf("sparse digest=%s err=%v", rebuiltDigest, err)
-	}
-	if liveDigest != rebuiltDigest {
-		t.Fatalf("sparse live/rebuilt digest live=%s rebuilt=%s", liveDigest, rebuiltDigest)
-	}
-}
 func TestSQLiteEmptyProjectorRebuildKeepsOldReadModel(t *testing.T) {
 	ctx := context.Background()
-	store, db := openTransactionTestStore(t, newTransactionTestKeySource(), "task7-privacy-empty-projector")
+	store, db := openTransactionTestStore(t, "task7-privacy-empty-projector")
 	defer db.Close()
 	old := projectionReadModelRow{ProjectionGeneration: "old-generation", ProjectionName: "legacy", RowKey: "group-a", Payload: []byte(`{"old":true}`), UpdatedAt: time.Unix(1, 0).UTC()}
 	if err := db.GORM().Create(&old).Error; err != nil {
@@ -151,7 +68,7 @@ func TestSQLiteEmptyProjectorRebuildKeepsOldReadModel(t *testing.T) {
 	if err := db.GORM().Where("singleton_id = ?", "default").First(&beforeControl).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PrivacyRebuildPublish(ctx, 0); !errors.Is(err, ErrInvalidProjector) {
+	if _, err := store.Rebuild(ctx, RebuildRequest{ProjectorVersion: "v1"}); !errors.Is(err, ErrInvalidProjector) {
 		t.Fatalf("empty projector error=%v", err)
 	}
 	var afterControl projectionControlRow
@@ -167,182 +84,6 @@ func TestSQLiteEmptyProjectorRebuildKeepsOldReadModel(t *testing.T) {
 	}
 	if string(retained.Payload) != `{"old":true}` {
 		t.Fatalf("old read model payload=%q", retained.Payload)
-	}
-}
-
-func TestSQLitePrivacyCapacityRecordAndEightMiBBound(t *testing.T) {
-	ctx := context.Background()
-	t.Run("more-than-500-records", func(t *testing.T) {
-		store, db := openTransactionTestStore(t, newTransactionTestKeySource(), "task7-privacy-500")
-		defer db.Close()
-		if err := store.RegisterProjection(transactionTestProjection()); err != nil {
-			t.Fatal(err)
-		}
-		stream := StreamID{AggregateType: "player", AggregateID: privacyCanonical("dice-a", "capacity-group", "player-a")}
-		events := make([]NewEvent, 501)
-		for i := range events {
-			events[i] = transactionTestEvent(fmt.Sprintf("capacity-%03d", i), i)
-		}
-		if _, err := store.Commit(ctx, UnitOfWork{Streams: []StreamAppend{{Stream: stream, Events: events}}}); err != nil {
-			t.Fatal(err)
-		}
-		scan := seedPrivacyOperation(t, store, "capacity-group", "dice-a", "capacity-operation", []string{"players"})
-		view, private, err := store.PrivacyLoadOperation(ctx, "capacity-operation")
-		if err != nil {
-			t.Fatal(err)
-		}
-		first, err := store.PrivacyDeleteBatch(ctx, PrivacyBatchRequest{OperationID: "capacity-operation", GroupID: "capacity-group", Phase: "delete", DiceIDs: []string{"dice-a"}, Scopes: []string{"players"}, Limit: 500})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if first.Deleted.Players != 500 || first.Done || first.NextCursor == "" {
-			t.Fatalf("first batch=%+v", first)
-		}
-		private.Cursor = first.NextCursor
-		if _, updateErr := store.PrivacyUpdateOperation(ctx, "capacity-operation", view.Version, private, "running"); updateErr != nil {
-			t.Fatal(updateErr)
-		}
-		_, _, err = store.PrivacyLoadOperation(ctx, "capacity-operation")
-		if err != nil {
-			t.Fatal(err)
-		}
-		second, err := store.PrivacyDeleteBatch(ctx, PrivacyBatchRequest{OperationID: "capacity-operation", GroupID: "capacity-group", Phase: "delete", DiceIDs: []string{"dice-a"}, Scopes: []string{"players"}, Cursor: first.NextCursor, Limit: 500})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if second.Deleted.Players != 1 || !second.Done || second.NextCursor == "" {
-			t.Fatalf("second batch=%+v", second)
-		}
-		if first.Deleted.Players > PrivacyBatchRecords || second.Deleted.Players > PrivacyBatchRecords {
-			t.Fatalf("batch exceeded record bound first=%d second=%d", first.Deleted.Players, second.Deleted.Players)
-		}
-		if scan.Counts.Players != 501 {
-			t.Fatalf("dry-run count=%+v", scan.Counts)
-		}
-		remaining, err := store.Load(ctx, stream, 0)
-		if err != nil || len(remaining) != 0 {
-			t.Fatalf("remaining events=%d err=%v", len(remaining), err)
-		}
-	})
-
-	t.Run("five-hundred-16KiB-records", func(t *testing.T) {
-		store, db := openTransactionTestStore(t, newTransactionTestKeySource(), "task7-privacy-8mib")
-		defer db.Close()
-		if _, err := db.SQLDB().ExecContext(ctx, "PRAGMA journal_mode = MEMORY; PRAGMA synchronous = OFF"); err != nil {
-			t.Fatal(err)
-		}
-		// Controlled durable SQLite fixture: 500 rows × 16 KiB stays just under 8 MiB, keeping focused validation bounded.
-		stream := StreamID{AggregateType: "player", AggregateID: privacyCanonical("dice-a", "bytes-group", "player-a")}
-		const records = 500
-		const commitChunk = 60         // several durable inserts keep each batch below the 16 MiB unit bound
-		const payloadBytes = 16 * 1024 // bounded fixture; the production page size remains 32 rows
-		now := time.Now().UTC()
-		for start := 0; start < records; start += commitChunk {
-			end := minInt(start+commitChunk, records)
-			rows := make([]domainEventRow, 0, end-start)
-			for i := start; i < end; i++ {
-				rows = append(rows, domainEventRow{
-					EventID: fmt.Sprintf("bytes-%03d", i), AggregateType: stream.AggregateType, AggregateID: stream.AggregateID,
-					AggregateVersion: uint64(i + 1), GlobalPosition: uint64(i + 1), EventType: "privacy.test", SchemaVersion: 1,
-					Payload: make([]byte, payloadBytes), CommandID: fmt.Sprintf("bytes-command-%03d", i),
-					CorrelationID: fmt.Sprintf("bytes-correlation-%03d", i), Producer: "task7", OccurredAtUnixNanoUTC: now.UnixNano(),
-					Checksum: make([]byte, 32), CreatedAt: now,
-				})
-			}
-			if err := db.GORM().CreateInBatches(&rows, commitChunk).Error; err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err := db.GORM().Model(&eventGlobalSequenceRow{}).Where("singleton_id = ?", "default").Update("next_position", records+1).Error; err != nil {
-			t.Fatal(err)
-		}
-		if err := db.GORM().Create(&aggregateHeadRow{AggregateType: stream.AggregateType, AggregateID: stream.AggregateID, CurrentVersion: records, UpdatedAt: now}).Error; err != nil {
-			t.Fatal(err)
-		}
-		scan := seedPrivacyOperation(t, store, "bytes-group", "dice-a", "bytes-operation", []string{"players"})
-		cursor := ""
-		total := int64(0)
-		batches := 0
-		maxBatchBytes := int64(0)
-		for {
-			batch, err := store.PrivacyDeleteBatch(ctx, PrivacyBatchRequest{OperationID: "bytes-operation", GroupID: "bytes-group", Phase: "delete", DiceIDs: []string{"dice-a"}, Scopes: []string{"players"}, Cursor: cursor, Limit: PrivacyBatchRecords})
-			if err != nil {
-				t.Fatal(err)
-			}
-			batches++
-			batchBytes := batch.Deleted.Players * payloadBytes
-			if batchBytes > maxBatchBytes {
-				maxBatchBytes = batchBytes
-			}
-			if batch.Deleted.Players > PrivacyBatchRecords || batchBytes > PrivacyBatchBytes {
-				t.Fatalf("batch exceeded bounds records=%d payload=%d", batch.Deleted.Players, batchBytes)
-			}
-			total += batch.Deleted.Players
-			view, private, err := store.PrivacyLoadOperation(ctx, "bytes-operation")
-			if err != nil {
-				t.Fatal(err)
-			}
-			private.Cursor = batch.NextCursor
-			if _, err := store.PrivacyUpdateOperation(ctx, "bytes-operation", view.Version, private, "running"); err != nil {
-				t.Fatal(err)
-			}
-			cursor = batch.NextCursor
-			if batch.Done {
-				break
-			}
-		}
-		if total != int64(records) || batches != 1 || maxBatchBytes > PrivacyBatchBytes {
-			t.Fatalf("capacity total=%d batches=%d max_batch_bytes=%d", total, batches, maxBatchBytes)
-		}
-		if scan.Counts.Players != int64(records) {
-			t.Fatalf("dry-run count=%+v", scan.Counts)
-		}
-		remaining, err := store.Load(ctx, stream, 0)
-		if err != nil || len(remaining) != 0 {
-			t.Fatalf("remaining events=%d err=%v", len(remaining), err)
-		}
-	})
-}
-
-func TestSQLitePrivacyDeleteBatchEightMiBCursorBoundary(t *testing.T) {
-	ctx := context.Background()
-	store, db := openTransactionTestStore(t, newTransactionTestKeySource(), "task7-privacy-page-boundary")
-	defer db.Close()
-	stream := StreamID{AggregateType: "player", AggregateID: privacyCanonical("dice-a", "page-group", "player-a")}
-	events := make([]NewEvent, 34)
-	for i := range events {
-		events[i] = transactionTestEvent(fmt.Sprintf("page-boundary-%02d", i), i)
-		events[i].Payload = make([]byte, MaxEventPayloadBytes)
-	}
-	if _, err := store.Commit(ctx, UnitOfWork{Streams: []StreamAppend{{Stream: stream, Events: events}}}); err != nil {
-		t.Fatal(err)
-	}
-	scan := seedPrivacyOperation(t, store, "page-group", "dice-a", "page-boundary-operation", []string{"players"})
-	if scan.Counts.Players != 34 {
-		t.Fatalf("dry-run count=%+v", scan.Counts)
-	}
-	firstCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	first, err := store.PrivacyDeleteBatch(firstCtx, PrivacyBatchRequest{OperationID: "page-boundary-operation", GroupID: "page-group", Phase: "delete", DiceIDs: []string{"dice-a"}, Scopes: []string{"players"}, Limit: PrivacyBatchRecords})
-	cancel()
-	if err != nil || first.Deleted.Players != 32 || first.Done || first.NextCursor != "32" {
-		t.Fatalf("first page=%+v err=%v", first, err)
-	}
-	view, private, err := store.PrivacyLoadOperation(ctx, "page-boundary-operation")
-	if err != nil {
-		t.Fatal(err)
-	}
-	private.Cursor = first.NextCursor
-	if _, err := store.PrivacyUpdateOperation(ctx, "page-boundary-operation", view.Version, private, "running"); err != nil {
-		t.Fatal(err)
-	}
-	secondCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	second, err := store.PrivacyDeleteBatch(secondCtx, PrivacyBatchRequest{OperationID: "page-boundary-operation", GroupID: "page-group", Phase: "delete", DiceIDs: []string{"dice-a"}, Scopes: []string{"players"}, Cursor: first.NextCursor, Limit: PrivacyBatchRecords})
-	cancel()
-	if err != nil || second.Deleted.Players != 2 || !second.Done || second.NextCursor != "34" {
-		t.Fatalf("second page=%+v err=%v", second, err)
-	}
-	if rows, err := store.Load(ctx, stream, 0); err != nil || len(rows) != 0 {
-		t.Fatalf("remaining rows=%d err=%v", len(rows), err)
 	}
 }
 
@@ -395,9 +136,8 @@ func TestSQLitePrivacyWorkloadMetricReport(t *testing.T) {
 		want   int
 	}{{"NORMAL", "NORMAL", 1}, {"FULL", "FULL", 2}} {
 		t.Run(mode.name, func(t *testing.T) {
-			source := newTransactionTestKeySource()
 			path := filepath.Join(t.TempDir(), "task7-metrics.db")
-			db, err := OpenDatabase(ctx, DatabaseConfig{Type: "sqlite", DSN: path, KeySource: source, DatabaseIdentity: "task7-metrics"})
+			db, err := OpenDatabase(ctx, DatabaseConfig{Type: "sqlite", DSN: path, DatabaseIdentity: "task7-metrics"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -495,9 +235,9 @@ func BenchmarkSQLitePrivacyFullWorkload(b *testing.B) {
 	}{{name: "NORMAL", pragma: "NORMAL"}, {name: "FULL", pragma: "FULL"}} {
 		b.Run(mode.name, func(b *testing.B) {
 			ctx := context.Background()
-			source := newTransactionTestKeySource()
+
 			path := filepath.Join(b.TempDir(), "task7-benchmark.db")
-			db, err := OpenDatabase(ctx, DatabaseConfig{Type: "sqlite", DSN: path, KeySource: source, DatabaseIdentity: "task7-benchmark"})
+			db, err := OpenDatabase(ctx, DatabaseConfig{Type: "sqlite", DSN: path, DatabaseIdentity: "task7-benchmark"})
 			if err != nil {
 				b.Fatal(err)
 			}

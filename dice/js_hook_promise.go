@@ -68,7 +68,7 @@ func (i *ExtInfo) dispatchValueWithJsCheckFiltered(
 	if d == nil || d.ExtLoopManager == nil {
 		return errors.New("JavaScript runtime is unavailable")
 	}
-	if i.IsJsExt && !d.Config.JsEnable {
+	if config := d.Config(); i.IsJsExt && (config == nil || !config.JsEnable) {
 		if d.Logger != nil {
 			d.Logger.Infof("当前已关闭js扩展<%v>", i.Name)
 		}

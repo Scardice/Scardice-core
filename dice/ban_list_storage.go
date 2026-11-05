@@ -1,10 +1,70 @@
 package dice
 
-import "sort"
+import (
+	"context"
+	"errors"
+	"sort"
+)
 
 // Snapshot returns sorted copies of the active ban-list items.
 func (i *BanListInfo) Snapshot() []*BanListInfoItem {
 	return i.snapshot()
+}
+
+// SnapshotForContext returns the transaction-local moderation list, including
+// subjects created or deleted earlier in the same root.
+func (i *BanListInfo) SnapshotForContext(ctx *MsgContext) ([]*BanListInfoItem, error) {
+	if i == nil || i.Parent == nil {
+		return []*BanListInfoItem{}, nil
+	}
+	if ctx == nil || ctx.callbackTransaction == nil {
+		items, err := i.Parent.GetBanListWithError(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		sortBanListItems(items)
+		return items, nil
+	}
+	if ctx.Dice != nil && ctx.Dice != i.Parent {
+		return nil, errors.New("ban list message context belongs to another dice")
+	}
+	repository, err := newModerationBanRepository(i.Parent)
+	if err != nil {
+		return nil, err
+	}
+	subjectIDs, err := repository.listSubjectIDs(ctx.domainContext())
+	if err != nil {
+		return nil, err
+	}
+	subjects := make(map[string]struct{}, len(subjectIDs))
+	for _, subjectID := range subjectIDs {
+		subjects[subjectID] = struct{}{}
+	}
+	overlay, err := i.Parent.moderationOverlaySnapshot(ctx.callbackTransaction.Domain())
+	if err != nil {
+		return nil, err
+	}
+	for subjectID, exists := range overlay {
+		if exists {
+			subjects[subjectID] = struct{}{}
+		} else {
+			delete(subjects, subjectID)
+		}
+	}
+	items := make([]*BanListInfoItem, 0, len(subjects))
+	for subjectID := range subjects {
+		item, exists, readErr := i.Parent.ModerationItemForDomain(
+			ctx.domainContext(), ctx.callbackTransaction.Domain(), subjectID,
+		)
+		if readErr != nil {
+			return nil, readErr
+		}
+		if exists {
+			items = append(items, item)
+		}
+	}
+	sortBanListItems(items)
+	return items, nil
 }
 
 func cloneBanListItem(item *BanListInfoItem) *BanListInfoItem {
@@ -18,22 +78,7 @@ func cloneBanListItem(item *BanListInfoItem) *BanListInfoItem {
 	return &copyItem
 }
 
-func (i *BanListInfo) snapshot() []*BanListInfoItem {
-	if i == nil {
-		return []*BanListInfoItem{}
-	}
-	i.itemsMu.RLock()
-	defer i.itemsMu.RUnlock()
-	if i.Map == nil {
-		return []*BanListInfoItem{}
-	}
-	items := make([]*BanListInfoItem, 0)
-	i.Map.Range(func(_ string, item *BanListInfoItem) bool {
-		if item != nil {
-			items = append(items, cloneBanListItem(item))
-		}
-		return true
-	})
+func sortBanListItems(items []*BanListInfoItem) {
 	sort.Slice(items, func(a, b int) bool {
 		left, right := items[a], items[b]
 		leftTime, rightTime := left.BanUpdatedAt, right.BanUpdatedAt
@@ -48,14 +93,24 @@ func (i *BanListInfo) snapshot() []*BanListInfoItem {
 		}
 		return left.ID < right.ID
 	})
+}
+
+func (i *BanListInfo) snapshot() []*BanListInfoItem {
+	if i == nil || i.Parent == nil {
+		return []*BanListInfoItem{}
+	}
+	items, err := i.Parent.GetBanListWithError(context.Background())
+	if err != nil {
+		if i.Parent.Logger != nil {
+			i.Parent.Logger.Errorf("黑白名单读取失败: %v", err)
+		}
+		return []*BanListInfoItem{}
+	}
 	return items
 }
 
+// PersistenceError performs a fresh authoritative read. It is retained for
+// callers that previously checked the removed mutable-cache load status.
 func (i *BanListInfo) PersistenceError() error {
-	if i == nil {
-		return nil
-	}
-	i.persistenceMu.Lock()
-	defer i.persistenceMu.Unlock()
-	return i.persistenceLoadErr
+	return i.LoadsWithError()
 }

@@ -14,14 +14,13 @@ import (
 )
 
 func TestCensorEncodedDetailsHandlerConfigRoundTrip(t *testing.T) {
-	// Given
-	previousDice := myDice
-	t.Cleanup(func() { myDice = previousDice })
-	myDice = &dice.Dice{}
-	myDice.Config.CensorHandlers = make(map[censor.Level]uint8)
-
-	// When
-	setLevelHandlers(censor.Warning, []string{"SendWarning", "SendEncodedDetails"})
+	handlers := map[censor.Level]uint8{
+		censor.Ignore:  0,
+		censor.Notice:  0,
+		censor.Caution: 0,
+		censor.Warning: levelHandlersValue([]string{"SendWarning", "SendEncodedDetails"}),
+		censor.Danger:  0,
+	}
 	got := getLevelConfig(
 		censor.Warning,
 		map[censor.Level]int{
@@ -31,7 +30,7 @@ func TestCensorEncodedDetailsHandlerConfigRoundTrip(t *testing.T) {
 			censor.Warning: 1,
 			censor.Danger:  0,
 		},
-		myDice.Config.CensorHandlers,
+		handlers,
 		map[censor.Level]int{
 			censor.Ignore:  0,
 			censor.Notice:  0,
@@ -47,17 +46,15 @@ func TestCensorEncodedDetailsHandlerConfigRoundTrip(t *testing.T) {
 	}
 }
 func TestCensorLogPageUnavailableStates(t *testing.T) {
-	previousDice, previousManager := myDice, dm
-	t.Cleanup(func() {
-		myDice = previousDice
-		dm = previousManager
-	})
-
-	manager := &dice.DiceManager{}
+	_, manager, runtime, _ := newDiceConfigDurableHandlerTest(t)
 	manager.AccessTokens.Store("censor-log-token", true)
-	dm = manager
-	myDice = &dice.Dice{Parent: manager}
-	myDice.Config.EnableCensor = true
+	myDice, dm = runtime, manager
+	if err := runtime.DurableMutateConfig(t.Context(), "censor-test-enable", true, func(config *dice.Config) error {
+		config.EnableCensor = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	for _, test := range []struct {
 		name         string

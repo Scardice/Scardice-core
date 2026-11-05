@@ -8,7 +8,6 @@ import (
 
 	"github.com/dop251/goja"
 	"github.com/dop251/goja_nodejs/eventloop"
-	"go.uber.org/zap"
 
 	"Scardice-core/utils/jsengine"
 	gojaengine "Scardice-core/utils/jsengine/goja"
@@ -41,22 +40,27 @@ func newGameSystemTemplateWithMetaForTest(name, fullName string, keys []string, 
 	}
 }
 
-func newRuleSelectionTestContext(system string) *MsgContext {
-	d := &Dice{
-		GameSystemMap: new(SyncMap[string, *GameSystemTemplate]),
-	}
+func newRuleSelectionTestContext(t *testing.T, system string) *MsgContext {
+	t.Helper()
+	d, _ := newCanonicalTestDice(t)
 	d.GameSystemMap.Store("coc7", newGameSystemTemplateForTest("coc7"))
 	d.GameSystemMap.Store("dnd5e", newGameSystemTemplateForTest("dnd5e"))
-
-	return &MsgContext{
-		Dice:  d,
-		Group: &GroupInfo{System: system},
+	ctx := newCanonicalTestMessageContext(
+		t,
+		d,
+		newCanonicalTestEndpoint(d, "QQ:rule-bot"),
+		newGroupMsg("QQ-Group:rule-selection", "QQ:rule-user", ""),
+		"rule-selection",
+	)
+	if err := ctx.Group.SetSystem(system); err != nil {
+		t.Fatalf("set rule fixture system: %v", err)
 	}
+	return ctx
 }
 
 func TestSelectRulePluginCandidateByGroupSystem(t *testing.T) {
 	t.Run("select candidate that matches group system", func(t *testing.T) {
-		ctx := newRuleSelectionTestContext("dnd5e")
+		ctx := newRuleSelectionTestContext(t, "dnd5e")
 		candidates := []commandSolveCandidate{
 			{Ext: &ExtInfo{Name: "coc7"}},
 			{Ext: &ExtInfo{Name: "dnd5e"}},
@@ -72,7 +76,7 @@ func TestSelectRulePluginCandidateByGroupSystem(t *testing.T) {
 	})
 
 	t.Run("no match should keep conflict", func(t *testing.T) {
-		ctx := newRuleSelectionTestContext("pf2e")
+		ctx := newRuleSelectionTestContext(t, "pf2e")
 		candidates := []commandSolveCandidate{
 			{Ext: &ExtInfo{Name: "coc7"}},
 			{Ext: &ExtInfo{Name: "dnd5e"}},
@@ -84,7 +88,7 @@ func TestSelectRulePluginCandidateByGroupSystem(t *testing.T) {
 	})
 
 	t.Run("mixed ordinary and rule plugins should keep conflict", func(t *testing.T) {
-		ctx := newRuleSelectionTestContext("dnd5e")
+		ctx := newRuleSelectionTestContext(t, "dnd5e")
 		candidates := []commandSolveCandidate{
 			{Ext: &ExtInfo{Name: "dnd5e"}},
 			{Ext: &ExtInfo{Name: "reply"}},
@@ -96,7 +100,7 @@ func TestSelectRulePluginCandidateByGroupSystem(t *testing.T) {
 	})
 
 	t.Run("core plus rule plugin should keep conflict", func(t *testing.T) {
-		ctx := newRuleSelectionTestContext("dnd5e")
+		ctx := newRuleSelectionTestContext(t, "dnd5e")
 		candidates := []commandSolveCandidate{
 			{},
 			{Ext: &ExtInfo{Name: "dnd5e"}},
@@ -108,17 +112,8 @@ func TestSelectRulePluginCandidateByGroupSystem(t *testing.T) {
 	})
 
 	t.Run("select current system rule plugin when third rule plugin identified by template keys", func(t *testing.T) {
-		d := &Dice{
-			GameSystemMap: new(SyncMap[string, *GameSystemTemplate]),
-		}
-		d.GameSystemMap.Store("coc7", newGameSystemTemplateForTest("coc7"))
-		d.GameSystemMap.Store("dnd5e", newGameSystemTemplateForTest("dnd5e"))
-		d.GameSystemMap.Store("DG", newGameSystemTemplateWithMetaForTest("DG", "绿色三角洲规则", []string{"dg", "绿色三角洲"}, "coc7", "dg"))
-
-		ctx := &MsgContext{
-			Dice:  d,
-			Group: &GroupInfo{System: "coc7"},
-		}
+		ctx := newRuleSelectionTestContext(t, "coc7")
+		ctx.Dice.GameSystemMap.Store("DG", newGameSystemTemplateWithMetaForTest("DG", "绿色三角洲规则", []string{"dg", "绿色三角洲"}, "coc7", "dg"))
 		candidates := []commandSolveCandidate{
 			{Ext: &ExtInfo{Name: "coc7"}},
 			{Ext: &ExtInfo{Name: "dnd5e"}},
@@ -135,15 +130,11 @@ func TestSelectRulePluginCandidateByGroupSystem(t *testing.T) {
 	})
 
 	t.Run("dependency id in relatedExt should not be treated as template self id", func(t *testing.T) {
-		d := &Dice{
-			GameSystemMap: new(SyncMap[string, *GameSystemTemplate]),
-		}
-		d.GameSystemMap.Store("DG", newGameSystemTemplateWithMetaForTest("DG", "绿色三角洲规则", []string{"dg", "绿色三角洲"}, "coc7", "dg"))
-
-		ctx := &MsgContext{
-			Dice:  d,
-			Group: &GroupInfo{System: "DG"},
-		}
+		ctx := newRuleSelectionTestContext(t, "DG")
+		// 依赖 id（coc7）只出现在 DG 的 relatedExt 中，不能自己注册为规则模板。
+		ctx.Dice.GameSystemMap.Delete("coc7")
+		ctx.Dice.GameSystemMap.Delete("dnd5e")
+		ctx.Dice.GameSystemMap.Store("DG", newGameSystemTemplateWithMetaForTest("DG", "绿色三角洲规则", []string{"dg", "绿色三角洲"}, "coc7", "dg"))
 		candidates := []commandSolveCandidate{
 			{Ext: &ExtInfo{Name: "coc7"}},
 			{Ext: &ExtInfo{Name: "绿色三角洲"}},
@@ -166,29 +157,33 @@ func newRawTestCmd(name string, hitCounter *int) *CmdItemInfo {
 	}
 }
 
-func newCommandSolveTestSessionAndContext(system string, activatedExt []*ExtInfo) (*IMSession, *MsgContext) {
-	d := &Dice{
-		Logger:        zap.NewNop().Sugar(),
-		CmdMap:        CmdMapCls{},
-		GameSystemMap: new(SyncMap[string, *GameSystemTemplate]),
-	}
+func newCommandSolveTestSessionAndContext(t *testing.T, system string, activatedExt []*ExtInfo) (*IMSession, *MsgContext) {
+	t.Helper()
+	d, _ := newCanonicalTestDice(t)
+	d.CmdMap = CmdMapCls{}
+	installCanonicalTestExtensions(d, activatedExt...)
 	d.GameSystemMap.Store("coc7", newGameSystemTemplateForTest("coc7"))
 	d.GameSystemMap.Store("dnd5e", newGameSystemTemplateForTest("dnd5e"))
-
-	s := &IMSession{Parent: d}
-	group := &GroupInfo{
-		Active: true,
-		System: system,
+	ctx := newCanonicalTestMessageContext(
+		t,
+		d,
+		newCanonicalTestEndpoint(d, "QQ:command-solve-bot"),
+		newGroupMsg("QQ-Group:command-solve", "QQ:command-user", ""),
+		"command-solve",
+	)
+	if err := ctx.Group.SetSystem(system); err != nil {
+		t.Fatalf("set command fixture system: %v", err)
 	}
-	group.SetActivatedExtList(activatedExt, nil)
-
-	ctx := &MsgContext{
-		Dice:            d,
-		Session:         s,
-		Group:           group,
-		IsCurGroupBotOn: true,
+	for _, extension := range activatedExt {
+		if extension == nil {
+			continue
+		}
+		if err := ctx.Group.SetExtension(extension.Name, true); err != nil {
+			t.Fatalf("activate command fixture extension %q: %v", extension.Name, err)
+		}
 	}
-	return s, ctx
+	ctx.IsCurGroupBotOn = true
+	return d.ImSession, ctx
 }
 
 func TestCommandSolveRuleConflictResolution(t *testing.T) {
@@ -212,7 +207,7 @@ func TestCommandSolveRuleConflictResolution(t *testing.T) {
 			DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
 		}
 
-		session, ctx := newCommandSolveTestSessionAndContext("dnd5e", []*ExtInfo{extCoc, extDnd})
+		session, ctx := newCommandSolveTestSessionAndContext(t, "dnd5e", []*ExtInfo{extCoc, extDnd})
 		result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})
 
 		if result.Status != commandSolveSolved {
@@ -243,7 +238,7 @@ func TestCommandSolveRuleConflictResolution(t *testing.T) {
 			DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
 		}
 
-		session, ctx := newCommandSolveTestSessionAndContext("pf2e", []*ExtInfo{extCoc, extDnd})
+		session, ctx := newCommandSolveTestSessionAndContext(t, "pf2e", []*ExtInfo{extCoc, extDnd})
 		result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})
 
 		if result.Status != commandSolveConflict {
@@ -282,7 +277,7 @@ func TestCommandSolveRuleConflictResolution(t *testing.T) {
 			DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
 		}
 
-		session, ctx := newCommandSolveTestSessionAndContext("coc7", []*ExtInfo{extCoc, extDnd, extDG})
+		session, ctx := newCommandSolveTestSessionAndContext(t, "coc7", []*ExtInfo{extCoc, extDnd, extDG})
 		ctx.Dice.GameSystemMap.Store("DG", newGameSystemTemplateWithMetaForTest("DG", "绿色三角洲规则", []string{"dg", "绿色三角洲"}, "coc7", "dg"))
 
 		result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})
@@ -316,7 +311,7 @@ func TestCommandSolveReturnsFailedWhenSingleCandidateNotSolved(t *testing.T) {
 		DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
 	}
 
-	session, ctx := newCommandSolveTestSessionAndContext("dnd5e", []*ExtInfo{ext})
+	session, ctx := newCommandSolveTestSessionAndContext(t, "dnd5e", []*ExtInfo{ext})
 	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})
 
 	if result.Status != commandSolveFailed {
@@ -337,7 +332,7 @@ func TestCommandSolveReturnsUnmatchedWhenSingleCandidateDeclinesMatch(t *testing
 	commandName := "rolltest"
 	hit := 0
 
-	session, ctx := newCommandSolveTestSessionAndContext("", nil)
+	session, ctx := newCommandSolveTestSessionAndContext(t, "", nil)
 	session.Parent.CmdMap[commandName] = &CmdItemInfo{
 		Name: commandName,
 		Raw:  true,
@@ -383,9 +378,11 @@ func TestFormatCommandFailureForInfoPutsErrorOnNewLineAfterLocation(t *testing.T
 
 func TestCommandSolveIgnoreReasonBotOffForCoreCommand(t *testing.T) {
 	commandName := "rolltest"
-	session, ctx := newCommandSolveTestSessionAndContext("", nil)
+	session, ctx := newCommandSolveTestSessionAndContext(t, "", nil)
 	ctx.IsCurGroupBotOn = false
-	ctx.Group.Active = false
+	if err := ctx.Group.SetActivation(ctx.EndPoint.UserID, false, true); err != nil {
+		t.Fatal(err)
+	}
 	session.Parent.CmdMap[commandName] = &CmdItemInfo{Name: commandName}
 
 	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})
@@ -411,8 +408,8 @@ func TestCommandSolveIgnoreReasonInactiveExtension(t *testing.T) {
 		DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
 	}
 
-	session, ctx := newCommandSolveTestSessionAndContext("", nil)
-	ctx.Dice.ExtList = []*ExtInfo{ext}
+	session, ctx := newCommandSolveTestSessionAndContext(t, "", nil)
+	installCanonicalTestExtensions(ctx.Dice, ext)
 
 	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})
 
@@ -440,7 +437,7 @@ func TestCommandSolveIgnoreReasonDisabledExtensionCommand(t *testing.T) {
 		DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{commandName: true}},
 	}
 
-	session, ctx := newCommandSolveTestSessionAndContext("", []*ExtInfo{ext})
+	session, ctx := newCommandSolveTestSessionAndContext(t, "", []*ExtInfo{ext})
 	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})
 
 	if result.Status != commandSolveBlocked {
@@ -458,7 +455,7 @@ func TestCommandSolveIgnoreReasonDisabledExtensionCommand(t *testing.T) {
 }
 
 func TestCommandSolveIgnoreReasonUnknownCommand(t *testing.T) {
-	session, ctx := newCommandSolveTestSessionAndContext("", nil)
+	session, ctx := newCommandSolveTestSessionAndContext(t, "", nil)
 	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: "missing"})
 
 	if result.Status != commandSolveUnmatched {
@@ -474,7 +471,7 @@ func TestCommandSolveIgnoreReasonUnknownCommand(t *testing.T) {
 
 func TestCommandSolveIgnoreReasonMentionOther(t *testing.T) {
 	commandName := "rolltest"
-	session, ctx := newCommandSolveTestSessionAndContext("", nil)
+	session, ctx := newCommandSolveTestSessionAndContext(t, "", nil)
 	session.Parent.CmdMap[commandName] = &CmdItemInfo{Name: commandName}
 
 	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{
@@ -576,7 +573,7 @@ func TestCommandSolve_UsesSolveRawOverrideForNonJsCommand(t *testing.T) {
 		DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
 	}
 
-	session, ctx := newCommandSolveTestSessionAndContext("dnd5e", []*ExtInfo{ext})
+	session, ctx := newCommandSolveTestSessionAndContext(t, "dnd5e", []*ExtInfo{ext})
 	ctx.Dice.ExtLoopManager = NewJsLoopManager()
 	ext.JSLoopVersion = ctx.Dice.ExtLoopManager.SetLoop(loop)
 
@@ -633,7 +630,7 @@ func TestCommandSolve_UsesEngineNeutralCallback(t *testing.T) {
 	}
 	ext.OnMessageSendCallback = func(_ *MsgContext, _ *Message, _ string) (jsengine.Value, error) {
 		sendHit <- struct{}{}
-		return nil, nil
+		return jsExecutionContextFor(loop).activeRuntime.Get("undefined"), nil
 	}
 
 	wrapper := &ExtInfo{
@@ -644,10 +641,10 @@ func TestCommandSolve_UsesEngineNeutralCallback(t *testing.T) {
 		DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
 	}
 
-	session, ctx := newCommandSolveTestSessionAndContext("dnd5e", []*ExtInfo{wrapper})
+	session, ctx := newCommandSolveTestSessionAndContext(t, "dnd5e", []*ExtInfo{wrapper})
 	ctx.Dice.JsExtRegistry = new(SyncMap[string, *ExtInfo])
 	ctx.Dice.JsExtRegistry.Store(ext.Name, ext)
-	ctx.Dice.Config.JsEnable = true
+	updateCanonicalTestConfig(t, ctx.Dice, func(config *Config) { config.JsEnable = true })
 	wrapper.dice = ctx.Dice
 	ext.dice = ctx.Dice
 	ctx.Dice.ExtLoopManager = NewJsLoopManager()

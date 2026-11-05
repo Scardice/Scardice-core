@@ -23,7 +23,5 @@ func isRetryableInboundError(err error) bool {
 	return errors.Is(err, messageflow.ErrIngressBackpressure) ||
 		errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, eventstore.ErrReadinessQuarantined) ||
-		errors.Is(err, eventstore.ErrKeySourceUnavailable) ||
-		errors.Is(err, eventstore.ErrEncryptionUnavailable) ||
 		errors.Is(err, eventstore.ErrParticipantFailure)
 }

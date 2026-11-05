@@ -57,7 +57,7 @@ SC_EXPORT sc_status_t SC_CALL scardice_runtime_query_v1(
 #elif FIXTURE_CASE == 8
     plugin.descriptor.abi_minor = 1;
 #elif FIXTURE_CASE == 9
-    plugin.descriptor.host_abi_minor = 2;
+    plugin.descriptor.host_abi_minor = SC_HOST_ABI_MINOR + 1u;
 #elif FIXTURE_CASE == 10
     extension.abi_minor = 1;
 #endif

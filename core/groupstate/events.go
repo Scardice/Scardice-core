@@ -17,40 +17,29 @@ import (
 type EventType string
 
 const (
-	EventGroupCreated           EventType = "group.created"
-	EventGroupActivationChanged EventType = "group.activation_changed"
-	EventGroupIdentityChanged   EventType = "group.identity_changed"
-	EventGroupNameChanged       EventType = "group.name_changed"
-	EventGroupExtensionChanged  EventType = "group.extension_changed"
-	EventGroupSystemChanged     EventType = "group.system_changed"
-	EventGroupTemplateChanged   EventType = "group.template_changed"
-	EventGroupHelpChanged       EventType = "group.help_changed"
-	EventGroupWelcomeChanged    EventType = "group.welcome_changed"
-	EventGroupBotListChanged    EventType = "group.bot_list_changed"
-	EventGroupPrivilegeChanged  EventType = "group.privilege_changed"
-	EventGroupRecordDeleted     EventType = "group.record_deleted"
-)
-const (
-	GroupCreated           = EventGroupCreated
-	GroupActivationChanged = EventGroupActivationChanged
-	GroupIdentityChanged   = EventGroupIdentityChanged
-	GroupNameChanged       = EventGroupNameChanged
-	GroupExtensionChanged  = EventGroupExtensionChanged
-	GroupSystemChanged     = EventGroupSystemChanged
-	GroupTemplateChanged   = EventGroupTemplateChanged
-	GroupHelpChanged       = EventGroupHelpChanged
-	GroupWelcomeChanged    = EventGroupWelcomeChanged
-	GroupBotListChanged    = EventGroupBotListChanged
-	GroupPrivilegeChanged  = EventGroupPrivilegeChanged
-	GroupRecordDeleted     = EventGroupRecordDeleted
+	EventGroupCreated                  EventType = "group.created"
+	EventGroupActivationChanged        EventType = "group.activation_changed"
+	EventGroupIdentityChanged          EventType = "group.identity_changed"
+	EventGroupInvitationChanged        EventType = "group.invitation_changed"
+	EventGroupNameChanged              EventType = "group.name_changed"
+	EventGroupExtensionChanged         EventType = "group.extension_changed"
+	EventGroupExtensionPriorityChanged EventType = "group.extension_priority_changed"
+	EventGroupSystemChanged            EventType = "group.system_changed"
+	EventGroupTemplateChanged          EventType = "group.template_changed"
+	EventGroupHelpChanged              EventType = "group.help_changed"
+	EventGroupWelcomeChanged           EventType = "group.welcome_changed"
+	EventGroupBotListChanged           EventType = "group.bot_list_changed"
+	EventGroupPrivilegeChanged         EventType = "group.privilege_changed"
+	EventGroupTeamChanged              EventType = "group.team_changed"
+	EventGroupRecordDeleted            EventType = "group.record_deleted"
 )
 
 func (e EventType) Valid() bool {
 	switch e {
-	case EventGroupCreated, EventGroupActivationChanged, EventGroupIdentityChanged, EventGroupNameChanged,
-		EventGroupExtensionChanged, EventGroupSystemChanged, EventGroupTemplateChanged,
+	case EventGroupCreated, EventGroupActivationChanged, EventGroupIdentityChanged, EventGroupInvitationChanged, EventGroupNameChanged,
+		EventGroupExtensionChanged, EventGroupExtensionPriorityChanged, EventGroupSystemChanged, EventGroupTemplateChanged,
 		EventGroupHelpChanged, EventGroupWelcomeChanged, EventGroupBotListChanged,
-		EventGroupPrivilegeChanged, EventGroupRecordDeleted:
+		EventGroupPrivilegeChanged, EventGroupTeamChanged, EventGroupRecordDeleted:
 		return true
 	default:
 		return false
@@ -93,7 +82,7 @@ func (e GroupCreatedV1) apply(s *State) error {
 		return ErrInvalidState
 	}
 	s.DiceID, s.GroupID, s.GroupName, s.InviteUserID, s.EnteredAt = e.DiceID, e.GroupID, e.GroupName, e.InviteUserID, e.EnteredAt
-	s.DiceIDActive, s.DiceIDExists, s.BotList, s.InactivatedExtensions, s.Privileges = map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]int{}
+	s.DiceIDActive, s.DiceIDExists, s.BotList, s.InactivatedExtensions, s.Privileges, s.PlayerGroups = map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]int{}, map[string][]string{}
 	return nil
 }
 
@@ -142,6 +131,23 @@ func (e GroupIdentityChangedV1) apply(s *State) error {
 	return nil
 }
 
+type GroupInvitationChangedV1 struct {
+	InviteUserID string `json:"inviteUserId,omitempty"`
+	EnteredAt    int64  `json:"enteredAt,omitempty"`
+}
+
+func NewGroupInvitationChangedV1(inviteUserID string, enteredAt int64) GroupInvitationChangedV1 {
+	return GroupInvitationChangedV1{InviteUserID: inviteUserID, EnteredAt: enteredAt}
+}
+func (GroupInvitationChangedV1) EventType() EventType { return EventGroupInvitationChanged }
+func (e GroupInvitationChangedV1) apply(s *State) error {
+	if s.Version == 0 || s.Deleted || !validOptionalScopedIdentifier(e.InviteUserID) {
+		return ErrInvalidState
+	}
+	s.InviteUserID, s.EnteredAt = e.InviteUserID, e.EnteredAt
+	return nil
+}
+
 type GroupNameChangedV1 struct {
 	GroupName string `json:"groupName"`
 }
@@ -179,6 +185,40 @@ func (e GroupExtensionChangedV1) apply(s *State) error {
 		removeExtension(s, e.ExtensionID)
 		s.InactivatedExtensions[e.ExtensionID] = true
 	}
+	return nil
+}
+
+type GroupExtensionPriorityChangedV1 struct {
+	ExtensionIDs []string `json:"extensionIds"`
+}
+
+func NewGroupExtensionPriorityChangedV1(extensionIDs []string) GroupExtensionPriorityChangedV1 {
+	return GroupExtensionPriorityChangedV1{ExtensionIDs: append([]string(nil), extensionIDs...)}
+}
+func (GroupExtensionPriorityChangedV1) EventType() EventType {
+	return EventGroupExtensionPriorityChanged
+}
+func (e GroupExtensionPriorityChangedV1) apply(s *State) error {
+	if s.Version == 0 || s.Deleted || len(e.ExtensionIDs) != len(s.ActivatedExtensions) {
+		return ErrInvalidState
+	}
+	remaining := make(map[string]struct{}, len(s.ActivatedExtensions))
+	for _, extensionID := range s.ActivatedExtensions {
+		remaining[extensionID] = struct{}{}
+	}
+	for _, extensionID := range e.ExtensionIDs {
+		if !validScopedIdentifier(extensionID) {
+			return ErrInvalidState
+		}
+		if _, ok := remaining[extensionID]; !ok {
+			return ErrInvalidState
+		}
+		delete(remaining, extensionID)
+	}
+	if len(remaining) != 0 {
+		return ErrInvalidState
+	}
+	s.ActivatedExtensions = append([]string(nil), e.ExtensionIDs...)
 	return nil
 }
 
@@ -297,6 +337,33 @@ func (e GroupPrivilegeChangedV1) apply(s *State) error {
 	return nil
 }
 
+type GroupTeamChangedV1 struct {
+	Name    string   `json:"name"`
+	Members []string `json:"members,omitempty"`
+	Deleted bool     `json:"deleted,omitempty"`
+}
+
+func NewGroupTeamChangedV1(name string, members []string, deleted bool) GroupTeamChangedV1 {
+	return GroupTeamChangedV1{Name: name, Members: append([]string(nil), members...), Deleted: deleted}
+}
+func (GroupTeamChangedV1) EventType() EventType { return EventGroupTeamChanged }
+func (e GroupTeamChangedV1) apply(s *State) error {
+	if s.Version == 0 || s.Deleted || !validScopedIdentifier(e.Name) {
+		return ErrInvalidState
+	}
+	for _, userID := range e.Members {
+		if !validScopedIdentifier(userID) {
+			return ErrInvalidState
+		}
+	}
+	if e.Deleted {
+		delete(s.PlayerGroups, e.Name)
+	} else {
+		s.PlayerGroups[e.Name] = append([]string(nil), e.Members...)
+	}
+	return nil
+}
+
 type GroupRecordDeletedV1 struct{}
 
 func NewGroupRecordDeletedV1() GroupRecordDeletedV1 { return GroupRecordDeletedV1{} }
@@ -335,10 +402,32 @@ func (e GroupIdentityChangedV1) validate() error {
 	}
 	return nil
 }
+func (e GroupInvitationChangedV1) validate() error {
+	if !validOptionalScopedIdentifier(e.InviteUserID) {
+		return ErrInvalidIdentity
+	}
+	return nil
+}
 func (e GroupNameChangedV1) validate() error { return nil }
 func (e GroupExtensionChangedV1) validate() error {
 	if !validScopedIdentifier(e.ExtensionID) {
 		return ErrInvalidIdentity
+	}
+	return nil
+}
+func (e GroupExtensionPriorityChangedV1) validate() error {
+	if len(e.ExtensionIDs) == 0 {
+		return ErrInvalidIdentity
+	}
+	seen := make(map[string]struct{}, len(e.ExtensionIDs))
+	for _, extensionID := range e.ExtensionIDs {
+		if !validScopedIdentifier(extensionID) {
+			return ErrInvalidIdentity
+		}
+		if _, duplicate := seen[extensionID]; duplicate {
+			return ErrInvalidIdentity
+		}
+		seen[extensionID] = struct{}{}
 	}
 	return nil
 }
@@ -365,6 +454,17 @@ func (e GroupBotListChangedV1) validate() error {
 func (e GroupPrivilegeChangedV1) validate() error {
 	if !validScopedIdentifier(e.UserID) || e.Level < -30 || e.Level > 100 {
 		return ErrInvalidIdentity
+	}
+	return nil
+}
+func (e GroupTeamChangedV1) validate() error {
+	if !validScopedIdentifier(e.Name) {
+		return ErrInvalidIdentity
+	}
+	for _, userID := range e.Members {
+		if !validScopedIdentifier(userID) {
+			return ErrInvalidIdentity
+		}
 	}
 	return nil
 }
@@ -455,10 +555,14 @@ func DecodeTypedEvent(eventType EventType, payload []byte) (TypedEvent, error) {
 		event = &GroupActivationChangedV1{}
 	case EventGroupIdentityChanged:
 		event = &GroupIdentityChangedV1{}
+	case EventGroupInvitationChanged:
+		event = &GroupInvitationChangedV1{}
 	case EventGroupNameChanged:
 		event = &GroupNameChangedV1{}
 	case EventGroupExtensionChanged:
 		event = &GroupExtensionChangedV1{}
+	case EventGroupExtensionPriorityChanged:
+		event = &GroupExtensionPriorityChangedV1{}
 	case EventGroupSystemChanged:
 		event = &GroupSystemChangedV1{}
 	case EventGroupTemplateChanged:
@@ -471,6 +575,8 @@ func DecodeTypedEvent(eventType EventType, payload []byte) (TypedEvent, error) {
 		event = &GroupBotListChangedV1{}
 	case EventGroupPrivilegeChanged:
 		event = &GroupPrivilegeChangedV1{}
+	case EventGroupTeamChanged:
+		event = &GroupTeamChangedV1{}
 	case EventGroupRecordDeleted:
 		event = &GroupRecordDeletedV1{}
 	default:

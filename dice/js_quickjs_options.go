@@ -271,8 +271,12 @@ func hasLegacyQuickJSRuntimeOptions(config JsConfig) bool {
 
 func (d *Dice) runtimeOptionsForEngine(engine jsengine.EngineID) (jsengine.RuntimeOptions, error) {
 	engine = jsengine.NormalizeEngineID(string(engine))
-	options, generic, err := buildRuntimeOptionsForEngine(engine, d.Config.JsConfig)
-	if err == nil && generic && engine == "quickjs" && hasLegacyQuickJSRuntimeOptions(d.Config.JsConfig) && d.Logger != nil {
+	config := d.Config()
+	if config == nil {
+		return jsengine.RuntimeOptions{}, errors.New("JavaScript runtime configuration is unavailable")
+	}
+	options, generic, err := buildRuntimeOptionsForEngine(engine, config.JsConfig)
+	if err == nil && generic && engine == "quickjs" && hasLegacyQuickJSRuntimeOptions(config.JsConfig) && d.Logger != nil {
 		d.Logger.Warn("jsRuntimeOptions.quickjs overrides legacy QuickJS options")
 	}
 	return options, err

@@ -27,18 +27,21 @@ func (e *forwardReplyRawEmitter) RawJSON(_ context.Context, request []byte) ([]b
 func newDurableForwardReplyContext(t *testing.T) (*MsgContext, *Message, *bridgeTestSubmitter, *DurableOutboundBridge) {
 	t.Helper()
 	submitter := &bridgeTestSubmitter{}
-	ctx, msg, _ := bridgeTestContext(submitter)
-	ctx.EndPoint.Adapter = nil
-	ctx.EndPoint.Nickname = "Dice"
+	d, _ := newCanonicalTestDice(t)
+	ep := newCanonicalTestEndpoint(d, "QQ:9001")
+	ep.ID = "endpoint-1"
+	ep.ProtocolType = "pureonebot"
+	ep.State = StateConnected
+	ep.Nickname = "Dice"
+	ctx := &MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession}
+	msg := &Message{MessageType: "private", Platform: "QQ", Sender: SenderBase{UserID: "QQ:1001"}}
 	resolver := bridgeTestResolver{snapshot: messageflow.EndpointSnapshot{
 		EndpointID: "endpoint-1", AdapterKey: adapterapi.AdapterKey("pureonebot"),
 		DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected,
 		Capabilities: adapterapi.CapabilityOutbound | adapterapi.CapabilityRichMessages,
 		Actions:      adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage),
-		IndexRootID:  "root-1",
-		IndexSigner:  bridgeTestIndexSigner{root: []byte("01234567890123456789012345678901"), id: "root-1"},
 	}}
-	bridge := NewDurableOutboundBridge(submitter, resolver, eventstore.UUIDGenerator{})
+	bridge := NewDurableOutboundBridge(submitter, resolver, eventstore.UUIDGenerator{}, newBridgeTestNotificationOwner(t))
 	ctx.Dice.OutboundBridge = bridge
 	return ctx, msg, submitter, bridge
 }

@@ -108,7 +108,7 @@ func TestPlatformAdapterMilkySkipsMessagesWithoutSupportedElements(t *testing.T)
 			session, harness := newMilkyForwardHarness(t, "")
 
 			hookCalls := 0
-			pa, ctx := newMilkyForwardTestContext(session, func(_ *MsgContext, _ *Message, _ string) {
+			pa, ctx := newMilkyForwardTestContext(t, session, func(_ *MsgContext, _ *Message, _ string) {
 				hookCalls++
 			})
 
@@ -161,7 +161,7 @@ func TestPlatformAdapterMilkySendsSupportedPartsOfMixedMessage(t *testing.T) {
 
 			hookCalls := 0
 			var hookMessage *Message
-			pa, ctx := newMilkyForwardTestContext(session, func(_ *MsgContext, msg *Message, flag string) {
+			pa, ctx := newMilkyForwardTestContext(t, session, func(_ *MsgContext, msg *Message, flag string) {
 				hookCalls++
 				hookMessage = msg
 				if flag != "mixed" {
@@ -211,7 +211,7 @@ func TestPlatformAdapterMilkyPreservesGroupPoke(t *testing.T) {
 
 	hookCalls := 0
 	var hookMessage *Message
-	pa, ctx := newMilkyForwardTestContext(session, func(_ *MsgContext, msg *Message, _ string) {
+	pa, ctx := newMilkyForwardTestContext(t, session, func(_ *MsgContext, msg *Message, _ string) {
 		hookCalls++
 		hookMessage = msg
 	})

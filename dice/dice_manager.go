@@ -42,25 +42,23 @@ type GroupNameCacheItem struct {
 }
 
 type DiceManager struct { //nolint:revive
-	Dice                 []*Dice
-	diceLock             sync.RWMutex
-	Operator             engine.DatabaseOperator
-	EventSourcedMode     bool `json:"-" yaml:"-"`
-	durableStore         eventstore.Store
-	managerState         managerstate.State
-	managerStateMu       sync.Mutex
-	ServeAddress         string
-	trayTooltip          string
-	trayTooltipLock      sync.RWMutex
-	Help                 *HelpManager
-	IsHelpReloading      atomic.Bool `yaml:"-" json:"-"`
-	helpReloadLock       sync.RWMutex
-	helpStartupMu        sync.Mutex
-	initialHelpLoadDone  chan struct{}
-	initialHelpLoadErr   error
-	UseDictForTokenizer  bool
-	HelpDocEngineType    int
-	progressExitGroupWin ProcessExitGroup
+	Dice                []*Dice
+	diceLock            sync.RWMutex
+	Operator            engine.DatabaseOperator
+	durableStore        eventstore.Store
+	managerState        managerstate.State
+	managerStateMu      sync.Mutex
+	ServeAddress        string
+	trayTooltip         string
+	trayTooltipLock     sync.RWMutex
+	Help                *HelpManager
+	IsHelpReloading     atomic.Bool `yaml:"-" json:"-"`
+	helpReloadLock      sync.RWMutex
+	helpStartupMu       sync.Mutex
+	initialHelpLoadDone chan struct{}
+	initialHelpLoadErr  error
+	UseDictForTokenizer bool
+	HelpDocEngineType   int
 
 	IsNamesReloading bool
 	NamesGenerator   *NamesGenerator
@@ -359,7 +357,6 @@ func (dm *DiceManager) InitializeRuntime() error {
 	if dm == nil {
 		return errors.New("dice manager is nil")
 	}
-	dm.EventSourcedMode = true
 	dm.AppVersionCode = VERSION_CODE
 	dm.AppBootTime = time.Now().Unix()
 	dm.JsRegistry = new(require.Registry)
@@ -383,15 +380,6 @@ func (dm *DiceManager) InitializeRuntime() error {
 	dm.AutoBackupEnable = true
 	dm.AutoBackupTime = "@every 12h"
 	return nil
-}
-
-func (dm *DiceManager) Save() {
-	if dm == nil {
-		return
-	}
-	if err := dm.saveEventSourcedManager(); err != nil {
-		logger.M().Errorf("保存事件源管理器配置失败: %v", err)
-	}
 }
 
 func (dm *DiceManager) GetTrayTooltip() string {
@@ -455,76 +443,39 @@ func (dm *DiceManager) StartDeferredStartupJSLoad() {
 }
 
 func (dm *DiceManager) InitDice(writer *logger.UIWriter) {
+	if dm == nil {
+		panic("dice: nil manager cannot initialize runtimes")
+	}
+	for _, instance := range dm.Dice {
+		if instance != nil && instance.DurableStore == nil {
+			panic(fmt.Sprintf("dice: runtime %q has no durable store", instance.BaseConfig.Name))
+		}
+	}
 	log := logger.M()
 	startTime := time.Now()
 	dm.UpdateRequestChan = make(chan *Dice, 1)
 	dm.RebootRequestChan = make(chan int, 1)
 	dm.UpdateCheckRequestChan = make(chan int, 1)
 	dm.UpdateDownloadedChan = make(chan string, 1)
-	if dm.EventSourcedMode {
-		for _, instance := range dm.Dice {
-			if instance == nil {
-				continue
-			}
-			instance.Parent = dm
-			instance.initEventSourcedRuntime(writer)
-		}
-		dm.DiceRandomMode = string(normalizeGlobalDiceRandomMode(dm.DiceRandomMode, nil))
-		dm.syncDiceRandomMode()
-		if err := dm.ActivateDiceRandomMode(); err != nil {
-			log.Warnf("[随机源] 激活全局模式 %s 失败，当前生效模式为 %s: %v", dm.GetDiceRandomMode(), globalRandSource.CurrentMode(), err)
-		}
-		globalRandSource.LogActiveMode(log)
-		dm.LoadNamesAsync()
-		dm.startHelpDocLoadAsync()
-		log.Infof("事件源 Core 壳初始化完成，耗时 %dms", time.Since(startTime).Milliseconds())
-		return
-	}
-
-	dm.LoadNamesAsync()
-
-	g, err := NewProcessExitGroup()
-	if err != nil {
-		log.Warn("进程组创建失败，若进程崩溃，gocqhttp进程可能需要手动结束。")
-	} else {
-		dm.progressExitGroupWin = g
-	}
-
-	for _, i := range dm.Dice {
-		i.Parent = dm
-		i.Init(dm.Operator, writer)
-	}
-	legacyModes := make([]BaseConfig, 0, len(dm.Dice))
-	for _, d := range dm.Dice {
-		if d != nil {
-			legacyModes = append(legacyModes, d.Config.BaseConfig)
-		}
-	}
-	configuredMode := strings.TrimSpace(dm.DiceRandomMode)
-	dm.DiceRandomMode = string(normalizeGlobalDiceRandomMode(dm.DiceRandomMode, legacyModes))
-	for _, legacy := range legacyModes {
-		if strings.TrimSpace(legacy.DiceRandomMode) == "" {
+	for _, instance := range dm.Dice {
+		if instance == nil {
 			continue
 		}
-		legacyMode := normalizeGlobalDiceRandomMode(legacy.DiceRandomMode, nil)
-		if legacyMode != dm.GetDiceRandomMode() {
-			log.Warnf("[随机源] 忽略 Dice 级随机模式 %s，使用全局模式 %s", legacyMode, dm.GetDiceRandomMode())
-		}
+		instance.Parent = dm
+		instance.initEventSourcedRuntime(writer)
 	}
-	if configuredMode == "" {
-		log.Infof("[随机源] 已从旧版 Dice 配置迁移全局模式: %s", dm.GetDiceRandomMode())
-	}
-	dm.syncDiceRandomMode()
+	dm.DiceRandomMode = string(normalizeGlobalDiceRandomMode(dm.DiceRandomMode, nil))
 	if err := dm.ActivateDiceRandomMode(); err != nil {
-		log.Warnf("[随机源] 激活全局配置模式 %s 失败，当前生效模式为 %s: %v", dm.GetDiceRandomMode(), globalRandSource.CurrentMode(), err)
+		log.Warnf("[随机源] 激活全局模式 %s 失败，当前生效模式为 %s: %v", dm.GetDiceRandomMode(), globalRandSource.CurrentMode(), err)
 	}
 	globalRandSource.LogActiveMode(log)
-
+	dm.LoadNamesAsync()
 	dm.startHelpDocLoadAsync()
-
-	dm.ResetAutoBackup()
-	dm.ResetBackupClean()
-	log.Infof("启动同步初始化完成，耗时 %dms（不含 names/deck/js/helpdoc 异步加载）", time.Since(startTime).Milliseconds())
+	if dm.Cron != nil {
+		dm.ResetAutoBackup()
+		dm.ResetBackupClean()
+	}
+	log.Infof("事件源 Core 壳初始化完成，耗时 %dms", time.Since(startTime).Milliseconds())
 }
 
 func (dm *DiceManager) ResetAutoBackup() {
@@ -584,9 +535,7 @@ func (dm *DiceManager) TryCreateDefault() {
 	if len(dm.Dice) == 0 {
 		defaultDice := new(Dice)
 		defaultDice.BaseConfig.Name = "default"
-		defaultDice.Config.MessageDelayRangeStart = DefaultConfig.MessageDelayRangeStart
-		defaultDice.Config.MessageDelayRangeEnd = DefaultConfig.MessageDelayRangeEnd
-		defaultDice.MarkModified()
+		defaultDice.initializeDefaultConfigView()
 		defaultDice.ContainerMode = dm.ContainerMode
 		dm.Dice = append(dm.Dice, defaultDice)
 	}

@@ -166,7 +166,7 @@ func (r *nativeRuntime) ObservePromise(input jsengine.Value, settled func(jsengi
 		return false, ErrNativeStaleValue
 	}
 	if settled == nil {
-		return false, errors.New("Promise settlement callback is nil")
+		return false, errors.New("promise settlement callback is nil")
 	}
 	promise, ok := input.(*nativeValue)
 	if !ok || r.loop.promiseObserve == nil || r.loop.promiseGetValue == nil {
@@ -239,7 +239,7 @@ func (l *nativeLoop) finishPromiseObservation(id uint64, rejected bool, reason s
 	if observation == nil {
 		return
 	}
-	if err := jsengine.ContextForExecution(observation.context).Err(); err != nil {
+	if err := jsengine.ExecutionErr(observation.context); err != nil {
 		observation.settled(nil, err)
 		return
 	}

@@ -22,7 +22,6 @@ const (
 	MaxArtifactBytes     = 32 * 1024 * 1024
 	DefaultArtifactTTL   = 10 * time.Minute
 	MaxArtifactTTL       = 60 * time.Minute
-	InboxPayloadTTL      = 30 * 24 * time.Hour
 )
 
 const (
@@ -54,30 +53,25 @@ const (
 )
 
 var (
-	ErrInvalidEvent          = errors.New("eventstore: invalid event")
-	ErrInvalidMetadata       = errors.New("eventstore: invalid metadata")
-	ErrUnsupportedSchema     = errors.New("eventstore: unsupported schema")
-	ErrConflict              = errors.New("eventstore: conflict")
-	ErrEmptyUnitOfWork       = errors.New("eventstore: empty unit of work")
-	ErrDuplicateStream       = errors.New("eventstore: duplicate stream")
-	ErrDuplicateParticipant  = errors.New("eventstore: duplicate participant")
-	ErrOversizeInput         = errors.New("eventstore: input exceeds configured bound")
-	ErrStaleLease            = errors.New("eventstore: stale lease")
-	ErrNotFound              = errors.New("eventstore: not found")
-	ErrInvalidTransition     = errors.New("eventstore: invalid state transition")
-	ErrInvalidRiskClass      = errors.New("eventstore: invalid risk class")
-	ErrPayloadExpired        = errors.New("eventstore: encrypted payload expired")
-	ErrArtifactGone          = errors.New("eventstore: artifact gone")
-	ErrArtifactOwner         = errors.New("eventstore: artifact owner mismatch")
-	ErrEncryptionUnavailable = errors.New("eventstore: encryption unavailable")
-	ErrAuthenticationFailed  = errors.New("eventstore: encrypted data authentication failed")
-	ErrInvalidTTL            = errors.New("eventstore: invalid ttl")
-	ErrDeduplicated          = errors.New("eventstore: deduplicated")
-	ErrReadinessInvalid      = errors.New("eventstore: invalid readiness")
-	ErrReadinessQuarantined  = errors.New("eventstore: readiness quarantine")
-	ErrKeySourceUnavailable  = errors.New("eventstore: key source unavailable")
-	ErrKeyUnavailable        = errors.New("eventstore: encryption key unavailable")
-	ErrPluginKVNotFound      = errors.New("eventstore: plugin key not found")
+	ErrInvalidEvent         = errors.New("eventstore: invalid event")
+	ErrInvalidMetadata      = errors.New("eventstore: invalid metadata")
+	ErrUnsupportedSchema    = errors.New("eventstore: unsupported schema")
+	ErrConflict             = errors.New("eventstore: conflict")
+	ErrEmptyUnitOfWork      = errors.New("eventstore: empty unit of work")
+	ErrDuplicateStream      = errors.New("eventstore: duplicate stream")
+	ErrDuplicateParticipant = errors.New("eventstore: duplicate participant")
+	ErrOversizeInput        = errors.New("eventstore: input exceeds configured bound")
+	ErrStaleLease           = errors.New("eventstore: stale lease")
+	ErrNotFound             = errors.New("eventstore: not found")
+	ErrInvalidTransition    = errors.New("eventstore: invalid state transition")
+	ErrInvalidRiskClass     = errors.New("eventstore: invalid risk class")
+	ErrArtifactGone         = errors.New("eventstore: artifact gone")
+	ErrArtifactOwner        = errors.New("eventstore: artifact owner mismatch")
+	ErrInvalidTTL           = errors.New("eventstore: invalid ttl")
+	ErrDeduplicated         = errors.New("eventstore: deduplicated")
+	ErrReadinessInvalid     = errors.New("eventstore: invalid readiness")
+	ErrReadinessQuarantined = errors.New("eventstore: readiness quarantine")
+	ErrPluginKVNotFound     = errors.New("eventstore: plugin key not found")
 )
 
 // Clock is injected anywhere a contract allocates a timestamp.
@@ -119,8 +113,6 @@ type Metadata struct {
 	OccurredAt            time.Time
 	OccurredAtUnixNanoUTC int64
 	OccurredAtUnixNanoSet bool
-	// SubjectKey is an opaque HMAC binding an event to a privacy subject.
-	SubjectKey []byte
 }
 
 // StreamID identifies one aggregate stream without importing an aggregate type.
@@ -373,19 +365,28 @@ type StreamAppend struct {
 	Events          []NewEvent
 }
 
-// UnitOfWork is the complete storage input for one atomic commit. It may contain
-// zero streams when one of the non-stream update lists is non-empty.
+// UnitOfWork is the complete storage input for one atomic commit. Read
+// expectations are validated and held with the writes they protect; they do
+// not count toward MaxUnitOfWorkStreams, which remains a write-stream bound.
+// It may contain zero streams when one of the non-stream update lists or the
+// execution terminal participant is non-empty.
 type UnitOfWork struct {
-	Streams         []StreamAppend
-	Operations      []OperationUpdate
-	InboxUpdates    []InboxUpdate
-	Effects         []NewEffect
-	ArtifactUpdates []ArtifactUpdate
-	SecretUpdates   []SecretUpdate
-	PluginKVUpdates []PluginKVUpdate
-	FenceUpdates    []SubjectFenceUpdate
-	LogUpdates      []LogUpdate
-	LogImports      []StoryLogImportRecord
+	StreamReads            []StreamReadExpectation
+	ProjectionReads        []ProjectionReadExpectation
+	PluginKVReads          []PluginKVReadExpectation
+	PluginKVNamespaceReads []PluginKVNamespaceReadExpectation
+	CatalogReads           []CatalogReadExpectation
+	CatalogUpdates         []CatalogRevisionUpdate
+	Streams                []StreamAppend
+	Operations             []OperationUpdate
+	InboxUpdates           []InboxUpdate
+	Effects                []NewEffect
+	ArtifactUpdates        []ArtifactUpdate
+	SecretUpdates          []SecretUpdate
+	PluginKVUpdates        []PluginKVUpdate
+	LogUpdates             []LogUpdate
+	LogImports             []StoryLogImportRecord
+	Execution              *ExecutionAttemptCommit
 }
 
 // CommitResult reports allocated event positions and participant versions.
@@ -398,10 +399,9 @@ type CommitResult struct {
 	ArtifactIDs      []string
 	SecretRefs       []string
 	PluginKVIndexes  [][]byte
-	FenceKeys        [][]byte
 	Deduplicated     bool
-	Idempotent       bool
 	OrderingSequence uint64
+	Idempotent       bool
 	Version          uint64
 }
 
@@ -412,80 +412,61 @@ type Store interface {
 	Close() error
 }
 
-// OperationUpdate contains opaque/encrypted private context, never plaintext
-// credentials or message bodies.
+// OperationUpdate carries command metadata and private context as raw bytes.
 type OperationUpdate struct {
-	OperationID              string
-	ExpectedVersion          uint64
-	Version                  uint64
-	Kind                     string
-	Status                   string
-	PrincipalID              string
-	ResourceID               string
-	RequestID                string
-	CorrelationID            string
-	IdempotencyScope         string
-	IdempotencyKey           string
-	RequestDigest            []byte
-	ResultCode               string
-	ErrorCode                string
-	ArtifactID               string
-	PrivateContextCiphertext []byte
-	PrivateContextNonce      []byte
-	EncryptionKeyID          string
-	CreatedAt                time.Time
-	UpdatedAt                time.Time
-	ExpiresAt                time.Time
-}
-
-// InboxUpdate contains encrypted ingress data and durable state transitions.
-type InboxUpdate struct {
-	InboxID          string
+	OperationID      string
 	ExpectedVersion  uint64
 	Version          uint64
-	EndpointID       string
-	ProviderEventKey string
-	LaneHMAC         []byte
-	// SubjectKey is an opaque HMAC binding the message to a purge subject.
-	SubjectKey        []byte
+	Kind             string
+	Status           string
+	PrincipalID      string
+	ResourceID       string
+	RequestID        string
+	CorrelationID    string
+	IdempotencyScope string
+	IdempotencyKey   string
+	RequestDigest    []byte
+	ResultCode       string
+	ErrorCode        string
+	ArtifactID       string
+	PrivateContext   []byte
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	ExpiresAt        time.Time
+}
+
+type InboxUpdate struct {
+	InboxID           string
+	ExpectedVersion   uint64
+	Version           uint64
+	EndpointID        string
+	ProviderEventKey  string
+	Lane              string
+	Subject           string
 	OrderingSequence  uint64
 	Status            string
 	LeaseOwner        string
 	LeaseEpoch        uint64
 	LeaseExpiresAt    time.Time
 	AttemptID         string
-	PayloadCiphertext []byte
-	PayloadNonce      []byte
-	PayloadVersion    uint64
+	Payload           []byte
 	ContentDigest     []byte
-	// DigestKeyID is the legacy payload-key field. New A6 callers should set
-	// PayloadEncryptionKeyID and ContentDigestKeyID separately.
-	DigestKeyID            string
-	PayloadEncryptionKeyID string
-	ContentDigestKeyID     string
-	WorkflowID             string
-	CallbackStartedAt      time.Time
-	CompletedAt            time.Time
-	PayloadExpiresAt       time.Time
-	Resolution             string
-	PrincipalID            string
-	Reason                 string
-	ResolutionAt           time.Time
-	// AllowExpiredDedupe permits a caller that owns an explicit bounded
-	// dedupe TTL to replace an expired inbox identity instead of treating the
-	// old row as a permanent duplicate. It is not persisted.
-	AllowExpiredDedupe bool
+	WorkflowID        string
+	CallbackStartedAt time.Time
+	CompletedAt       time.Time
+	Resolution        string
+	PrincipalID       string
+	Reason            string
+	ResolutionAt      time.Time
 }
 
-// NewEffect is an outbound intent; its payload must be encrypted by persistence.
 type NewEffect struct {
-	EffectID        string
-	ExpectedVersion uint64
-	Version         uint64
-	EndpointID      string
-	LaneHMAC        []byte
-	// SubjectKey is an opaque HMAC binding the effect to a purge subject.
-	SubjectKey        []byte
+	EffectID          string
+	ExpectedVersion   uint64
+	Version           uint64
+	EndpointID        string
+	Lane              string
+	Subject           string
 	OrderingSequence  uint64
 	EffectType        string
 	RiskClass         string
@@ -497,25 +478,17 @@ type NewEffect struct {
 	DeadlineAt        time.Time
 	NextAttemptAt     time.Time
 	DispatchedAt      time.Time
-	PayloadCiphertext []byte
-	PayloadNonce      []byte
-	PayloadVersion    uint64
+	Payload           []byte
 	ContentDigest     []byte
-	// DigestKeyID is the legacy payload-key field. New A6 callers should set
-	// PayloadEncryptionKeyID and ContentDigestKeyID separately.
-	DigestKeyID            string
-	PayloadEncryptionKeyID string
-	ContentDigestKeyID     string
-	ProviderMessageID      string
-	ResultCode             string
-	ErrorCode              string
-	CompletedAt            time.Time
-	PayloadExpiresAt       time.Time
-	RetryCount             uint32
-	Resolution             string
-	PrincipalID            string
-	Reason                 string
-	ResolutionAt           time.Time
+	ProviderMessageID string
+	ResultCode        string
+	ErrorCode         string
+	CompletedAt       time.Time
+	RetryCount        uint32
+	Resolution        string
+	PrincipalID       string
+	Reason            string
+	ResolutionAt      time.Time
 }
 
 type ArtifactUpdate struct {
@@ -528,16 +501,11 @@ type ArtifactUpdate struct {
 	SafeFilename     string
 	Size             int64
 	Status           string
-	Ciphertext       []byte
-	Nonce            []byte
-	EncryptionKeyID  string
-	Plaintext        []byte `json:"-"`
-	PlaintextSet     bool   `json:"-"`
+	Data             []byte
 	ExpiresAt        time.Time
 	ConsumedAt       time.Time
 }
 
-// SecretUpdate references encrypted operational secret material.
 type SecretUpdate struct {
 	SecretRef       string
 	ExpectedVersion uint64
@@ -545,50 +513,32 @@ type SecretUpdate struct {
 	EndpointID      string
 	AdapterID       string
 	SecretVersion   uint64
-	Ciphertext      []byte
-	Nonce           []byte
-	EncryptionKeyID string
+	Value           []byte
+	ValueSet        bool
 	UpdatedAt       time.Time
 }
 
-// PluginKVUpdate is encrypted mutable plugin state indexed by a keyed digest.
 type PluginKVUpdate struct {
 	ExtensionID     string
-	KeyHMAC         []byte
+	Key             string
 	ExpectedVersion uint64
 	Version         uint64
-	KeyCiphertext   []byte
-	KeyNonce        []byte
-	ValueCiphertext []byte
-	ValueNonce      []byte
-	EncryptionKeyID string
-	ValueSize       int64
+	Value           []byte
 	Deleted         bool
 	UpdatedAt       time.Time
-}
-
-// SubjectFenceUpdate is a privacy-purge ingress fence keyed by HMAC identity.
-type SubjectFenceUpdate struct {
-	SubjectKey       []byte
-	Scope            string
-	ExpectedVersion  uint64
-	Version          uint64
-	PurgeOperationID string
-	CreatedAt        time.Time
-	ExpiresAt        time.Time
-	Deleted          bool
 }
 
 // ValidateUnitOfWork performs pre-transaction validation and never includes
 // payload content in errors.
 func ValidateUnitOfWork(work UnitOfWork) error {
-	if len(work.Streams) == 0 && len(work.Operations) == 0 && len(work.InboxUpdates) == 0 && len(work.Effects) == 0 && len(work.ArtifactUpdates) == 0 && len(work.SecretUpdates) == 0 && len(work.PluginKVUpdates) == 0 && len(work.FenceUpdates) == 0 && len(work.LogUpdates) == 0 && len(work.LogImports) == 0 {
+	if len(work.Streams) == 0 && len(work.Operations) == 0 && len(work.InboxUpdates) == 0 && len(work.Effects) == 0 && len(work.ArtifactUpdates) == 0 && len(work.SecretUpdates) == 0 && len(work.PluginKVUpdates) == 0 && len(work.LogUpdates) == 0 && len(work.LogImports) == 0 && len(work.CatalogUpdates) == 0 && work.Execution == nil {
 		return ErrEmptyUnitOfWork
 	}
 	if len(work.Streams) > MaxUnitOfWorkStreams {
 		return &OversizeError{Bound: "unit of work streams", Limit: MaxUnitOfWorkStreams, Actual: len(work.Streams)}
 	}
 	seen := make(map[StreamID]struct{}, len(work.Streams))
+	streamExpectations := make(map[StreamID]uint64, len(work.StreamReads)+len(work.Streams))
 	eventCount := 0
 	var encodedBytes uint64
 	addBytes := func(n int) {
@@ -630,29 +580,78 @@ func ValidateUnitOfWork(work UnitOfWork) error {
 			addBytes(len(event.Payload))
 		}
 	}
+	for _, read := range work.StreamReads {
+		if read.Stream.AggregateType == "" || read.Stream.AggregateID == "" {
+			return ErrInvalidEvent
+		}
+		if expected, exists := streamExpectations[read.Stream]; exists && expected != read.ExpectedVersion {
+			return ErrConflict
+		}
+		streamExpectations[read.Stream] = read.ExpectedVersion
+		addFields(len(read.Stream.AggregateType), len(read.Stream.AggregateID), 8)
+	}
+	for _, appendStream := range work.Streams {
+		if expected, exists := streamExpectations[appendStream.Stream]; exists && expected != appendStream.ExpectedVersion {
+			return ErrConflict
+		}
+		streamExpectations[appendStream.Stream] = appendStream.ExpectedVersion
+	}
+	for _, read := range work.ProjectionReads {
+		if read.Generation == "" {
+			return ErrInvalidMetadata
+		}
+		addFields(len(read.Generation), 8)
+	}
+	for _, read := range work.PluginKVReads {
+		if read.Namespace == "" || len(read.Key) > MaxPluginKeyBytes {
+			return ErrInvalidMetadata
+		}
+		addFields(len(read.Namespace), len(read.Key), 9)
+	}
+	for _, read := range work.PluginKVNamespaceReads {
+		if read.Namespace == "" {
+			return ErrInvalidMetadata
+		}
+		addFields(len(read.Namespace), 8)
+	}
+	for _, read := range work.CatalogReads {
+		if read.Catalog == "" || read.Owner == "" {
+			return ErrInvalidMetadata
+		}
+		addFields(len(read.Catalog), len(read.Owner), 8)
+	}
+	for _, update := range work.CatalogUpdates {
+		if update.Catalog == "" || update.Owner == "" {
+			return ErrInvalidMetadata
+		}
+		addFields(len(update.Catalog), len(update.Owner), 8)
+	}
 	if eventCount > MaxUnitOfWorkEvents {
 		return &OversizeError{Bound: "unit of work events", Limit: MaxUnitOfWorkEvents, Actual: eventCount}
 	}
 	for _, update := range work.Operations {
-		addFields(len(update.OperationID), len(update.Kind), len(update.Status), len(update.PrincipalID), len(update.ResourceID), len(update.IdempotencyScope), len(update.IdempotencyKey), len(update.RequestID), len(update.RequestDigest), len(update.CorrelationID), len(update.ResultCode), len(update.ErrorCode), len(update.ArtifactID), len(update.PrivateContextCiphertext), len(update.PrivateContextNonce), len(update.EncryptionKeyID))
+		addFields(len(update.OperationID), len(update.Kind), len(update.Status), len(update.PrincipalID), len(update.ResourceID), len(update.IdempotencyScope), len(update.IdempotencyKey), len(update.RequestID), len(update.RequestDigest), len(update.CorrelationID), len(update.ResultCode), len(update.ErrorCode), len(update.ArtifactID), len(update.PrivateContext))
 	}
 	for _, update := range work.InboxUpdates {
-		addFields(len(update.InboxID), len(update.EndpointID), len(update.ProviderEventKey), len(update.LaneHMAC), len(update.Status), len(update.LeaseOwner), len(update.AttemptID), len(update.PayloadCiphertext), len(update.PayloadNonce), len(update.ContentDigest), len(update.DigestKeyID), len(update.PayloadEncryptionKeyID), len(update.ContentDigestKeyID), len(update.WorkflowID))
+		addFields(len(update.InboxID), len(update.EndpointID), len(update.ProviderEventKey), len(update.Lane), len(update.Subject), len(update.Status), len(update.LeaseOwner), len(update.AttemptID), len(update.Payload), len(update.WorkflowID))
 	}
 	for _, update := range work.Effects {
-		addFields(len(update.EffectID), len(update.EndpointID), len(update.LaneHMAC), len(update.EffectType), len(update.RiskClass), len(update.Status), len(update.LeaseOwner), len(update.AttemptID), len(update.PayloadCiphertext), len(update.PayloadNonce), len(update.ContentDigest), len(update.DigestKeyID), len(update.PayloadEncryptionKeyID), len(update.ContentDigestKeyID), len(update.ProviderMessageID), len(update.ResultCode), len(update.ErrorCode))
+		addFields(len(update.EffectID), len(update.EndpointID), len(update.Lane), len(update.Subject), len(update.EffectType), len(update.RiskClass), len(update.Status), len(update.LeaseOwner), len(update.AttemptID), len(update.Payload), len(update.ContentDigest), len(update.ProviderMessageID), len(update.ResultCode), len(update.ErrorCode))
 	}
 	for _, update := range work.ArtifactUpdates {
-		addFields(len(update.ArtifactID), len(update.OperationID), len(update.OwnerPrincipalID), len(update.MediaType), len(update.SafeFilename), len(update.Ciphertext), len(update.Nonce), len(update.EncryptionKeyID), len(update.Plaintext))
+		addFields(len(update.ArtifactID), len(update.OperationID), len(update.OwnerPrincipalID), len(update.MediaType), len(update.SafeFilename), len(update.Data))
 	}
 	for _, update := range work.SecretUpdates {
-		addFields(len(update.SecretRef), len(update.EndpointID), len(update.AdapterID), len(update.Ciphertext), len(update.Nonce), len(update.EncryptionKeyID))
+		addFields(len(update.SecretRef), len(update.EndpointID), len(update.AdapterID), len(update.Value))
 	}
 	for _, update := range work.PluginKVUpdates {
-		addFields(len(update.ExtensionID), len(update.KeyHMAC), len(update.KeyCiphertext), len(update.KeyNonce), len(update.ValueCiphertext), len(update.ValueNonce), len(update.EncryptionKeyID))
+		addFields(len(update.ExtensionID), len(update.Key), len(update.Value))
 	}
-	for _, update := range work.FenceUpdates {
-		addFields(len(update.SubjectKey), len(update.Scope), len(update.PurgeOperationID))
+	if work.Execution != nil {
+		if err := validateExecutionAttemptCommit(*work.Execution); err != nil {
+			return err
+		}
+		addFields(len(work.Execution.Identity), len(work.Execution.RequestDigest), len(work.Execution.AttemptID), len(work.Execution.LeaseOwner), 16)
 	}
 	if err := validateStoryLogUpdates(work.LogUpdates); err != nil {
 		return err
@@ -710,7 +709,7 @@ func validateParticipantKeys(work UnitOfWork) error {
 		return nil
 	}
 	ops, arts, secrets, inbox, effects := seen(), seen(), seen(), seen(), seen()
-	plugins, fences := make(map[pair]struct{}), make(map[pair]struct{})
+	plugins, catalogs := make(map[pair]struct{}), make(map[pair]struct{})
 	for _, v := range work.Operations {
 		if v.OperationID != "" {
 			if err := check(ops, v.OperationID); err != nil {
@@ -747,15 +746,15 @@ func validateParticipantKeys(work UnitOfWork) error {
 		}
 	}
 	for _, v := range work.PluginKVUpdates {
-		if v.ExtensionID != "" && len(v.KeyHMAC) > 0 {
-			if err := checkPair(plugins, pair{v.ExtensionID, string(v.KeyHMAC)}); err != nil {
+		if v.ExtensionID != "" && v.Key != "" {
+			if err := checkPair(plugins, pair{v.ExtensionID, v.Key}); err != nil {
 				return err
 			}
 		}
 	}
-	for _, v := range work.FenceUpdates {
-		if len(v.SubjectKey) > 0 && v.Scope != "" {
-			if err := checkPair(fences, pair{string(v.SubjectKey), v.Scope}); err != nil {
+	for _, v := range work.CatalogUpdates {
+		if v.Catalog != "" && v.Owner != "" {
+			if err := checkPair(catalogs, pair{v.Catalog, v.Owner}); err != nil {
 				return err
 			}
 		}
@@ -869,11 +868,6 @@ type ArtifactResult struct {
 	ExpiresAt        time.Time
 	ConsumedAt       time.Time
 }
-type PayloadCodec interface {
-	Encrypt(ctx context.Context, plaintext []byte) ([]byte, []byte, string, error)
-	Decrypt(ctx context.Context, ciphertext, nonce []byte, keyID string) ([]byte, error)
-}
-type ArtifactCodec = PayloadCodec
 
 // ConflictError carries only stream identities and versions, never event data.
 type ConflictError struct{ Conflicts []StreamConflict }
@@ -881,14 +875,10 @@ type ConflictError struct{ Conflicts []StreamConflict }
 func (e *ConflictError) Error() string { return ErrConflict.Error() }
 func (e *ConflictError) Unwrap() error { return ErrConflict }
 
-// InboxClaimRequest and InboxLease are domain-neutral lease contracts. Callback
-// workers may request terminal quarantine for invalid payloads and expirations.
+// InboxClaimRequest configures one inbox lease acquisition.
 type InboxClaimRequest struct {
-	WorkerID                      string
-	LeaseDuration                 time.Duration
-	QuarantinePayloadErrors       bool
-	TerminalizeExpired            bool
-	RecoverExpiredCallbackStarted bool
+	WorkerID      string
+	LeaseDuration time.Duration
 }
 type InboxRenewRequest struct {
 	InboxID       string
@@ -906,7 +896,7 @@ type OutboxClaimRequest struct {
 }
 type OutboxLease struct{ Effect NewEffect }
 
-// OperationView excludes private encrypted context.
+// OperationView excludes private context.
 type OperationView struct {
 	OperationID      string
 	Version          uint64
@@ -927,35 +917,10 @@ type OperationView struct {
 	ExpiresAt        time.Time
 }
 type Readiness struct {
-	Mode                       string
-	SchemaVersion              uint32
-	DatabaseIdentity           string
-	IndexRootID                string
-	IndexRootFingerprint       []byte
-	EncryptionRootIDs          []string
-	SourceManifestDigest       []byte
-	TargetManifestDigest       []byte
-	SemanticManifest           []byte
-	ProjectionManifest         []byte
-	ProjectionManifestDigest   []byte
-	TerminalGlobalPosition     uint64
-	TerminalProjectionPosition uint64
-	freshInitialized           bool
-	CompletedAt                time.Time
-}
-
-type EncryptionRoot struct {
-	ID       string
-	Material []byte
-}
-
-// KeySource supplies a stable installation index root and versioned encryption roots.
-// Implementations may wrap a KMS, HSM, or owner-only local key files.
-type KeySource interface {
-	IndexRootID(ctx context.Context) (string, error)
-	IndexRootMaterial(ctx context.Context) ([]byte, error)
-	CurrentEncryptionRoot(ctx context.Context) (EncryptionRoot, error)
-	EncryptionRoot(ctx context.Context, id string) ([]byte, error)
+	Mode             string
+	SchemaVersion    uint32
+	DatabaseIdentity string
+	CompletedAt      time.Time
 }
 
 type SecretPutRequest struct {
@@ -964,7 +929,7 @@ type SecretPutRequest struct {
 	AdapterID       string
 	SecretVersion   uint64
 	ExpectedVersion uint64
-	Plaintext       []byte
+	Value           []byte
 }
 
 type SecretLookup struct {
@@ -992,12 +957,6 @@ type PluginKVListRequest struct {
 	Limit       int
 }
 
-type EncryptionRotationResult struct {
-	Updated       int
-	Skipped       int
-	CurrentRootID string
-}
-
 type RebuildRequest struct{ ProjectorVersion string }
 type RebuildResult struct {
 	GenerationID     string
@@ -1016,6 +975,10 @@ type PrivacyCounts struct {
 	LogEntries  int64 `json:"logEntries"`
 	LogIntents  int64 `json:"logIntents"`
 	LogImports  int64 `json:"logImports"`
+	Inbox       int64 `json:"inbox"`
+	Outbox      int64 `json:"outbox"`
+	Secrets     int64 `json:"secrets"`
+	Projections int64 `json:"projections"`
 }
 
 type PrivacyDryRunRequest struct {
@@ -1028,56 +991,28 @@ type PrivacyDryRunRequest struct {
 type PrivacyDryRunResult struct {
 	Version         uint64
 	Digest          []byte
-	DigestKeyID     string
-	SubjectKey      []byte
 	Counts          PrivacyCounts
 	ActiveDiceIDs   []string
 	ExistingDiceIDs []string
-	TargetHighWater uint64
 	Uncovered       []string
 }
-type PrivacyOperationContext struct {
-	GroupID             string        `json:"groupId"`
-	DiceIDs             []string      `json:"diceIds"`
-	Scopes              []string      `json:"scopes"`
-	Cursor              string        `json:"cursor,omitempty"`
-	Phase               string        `json:"phase"`
-	Counts              PrivacyCounts `json:"counts"`
-	ActiveDiceIDs       []string      `json:"activeDiceIds,omitempty"`
-	TargetHighWater     uint64        `json:"targetHighWater,omitempty"`
-	ConfirmationDigest  []byte        `json:"confirmationDigest,omitempty"`
-	ConfirmationVersion uint64        `json:"confirmationVersion,omitempty"`
+
+type PrivacyDeleteRequest struct {
+	PrivacyDryRunRequest
+	AllowActive         bool
+	ConfirmationDigest  []byte
+	ConfirmationVersion uint64
 }
 
-type PrivacyBatchRequest struct {
-	OperationID string
-	GroupID     string
-	Phase       string
-	DiceIDs     []string
-	Scopes      []string
-	Cursor      string
-	Limit       int
+type PrivacyDeleteResult struct {
+	Scan    PrivacyDryRunResult
+	Deleted PrivacyCounts
 }
 
-type PrivacyBatchResult struct {
-	NextCursor string
-	Deleted    PrivacyCounts
-	Done       bool
-}
-
-type PrivacyPurgeRequest struct {
-	OperationID string
-	Scope       string
-	AllowActive bool
-}
-type PrivacyPurgeResult struct {
-	OperationID string
-	Deleted     int64
-}
 type SecretResolution struct {
 	SecretRef     string
 	SecretVersion uint64
-	Plaintext     []byte
+	Value         []byte
 }
 
 // Separate narrow repository contracts deliberately keep Store aggregate-only.
@@ -1113,47 +1048,14 @@ type ReadinessRepository interface {
 	SetReadiness(ctx context.Context, readiness Readiness) error
 }
 
-type ReadinessMetadataRepository interface {
-	GetReadinessMetadata(ctx context.Context) (Readiness, error)
-}
-
-// PrivacyHistoryRepository is the narrow durable seam used by the privacy
-// orchestration service. Selectors and cursors are interpreted only by the
-// implementation; callers never receive database handles.
-type PrivacyHistoryRepository interface {
+// GroupPrivacyRepository atomically checks confirmation and deletes selected group data.
+type GroupPrivacyRepository interface {
 	PrivacyDryRun(ctx context.Context, request PrivacyDryRunRequest) (PrivacyDryRunResult, error)
-	PrivacyCreateOperation(ctx context.Context, operationID string, subjectKey []byte, private PrivacyOperationContext) error
-	PrivacyLoadOperation(ctx context.Context, operationID string) (OperationView, PrivacyOperationContext, error)
-	PrivacyUpdateOperation(ctx context.Context, operationID string, expectedVersion uint64, private PrivacyOperationContext, status string) (uint64, error)
-	PrivacyFence(ctx context.Context, subjectKey []byte, scope, operationID string) (uint64, error)
-	PrivacyFenceVersion(ctx context.Context, subjectKey []byte, scope string) (uint64, error)
-	PrivacyUnfence(ctx context.Context, subjectKey []byte, scope string, expectedVersion uint64, operationID string) error
-	PrivacyResolvePending(ctx context.Context, subjectKey []byte, operationID string) error
-	PrivacyDeleteBatch(ctx context.Context, request PrivacyBatchRequest) (PrivacyBatchResult, error)
-	PrivacyRebuildPublish(ctx context.Context, targetHighWater uint64) error
-	PrivacyScrubOperation(ctx context.Context, operationID string, expectedVersion uint64) error
+	PrivacyDeleteGroup(ctx context.Context, request PrivacyDeleteRequest) (PrivacyDeleteResult, error)
 }
 
-// PrivacyFinalizer atomically marks an operation complete and scrubs its
-// private context after the subject fence has been released.
-type PrivacyFinalizer interface {
-	PrivacyFinalizeOperation(ctx context.Context, operationID string, expectedVersion uint64, status string) (uint64, error)
-}
-
-// PrivacySubjectKeyResolver returns the installation-keyed identity used by
-// group privacy fences. The key is opaque and must not be persisted in payloads.
-type PrivacySubjectKeyResolver interface {
-	PrivacySubjectKey(ctx context.Context, groupID string) ([]byte, error)
-}
-
-type PrivacySubjectVerifier interface {
-	PrivacyVerifyOperationSubject(ctx context.Context, operationID, groupID string) error
-}
 type ProjectionRebuilder interface {
 	Rebuild(ctx context.Context, request RebuildRequest) (RebuildResult, error)
-}
-type PrivacyPurger interface {
-	Purge(ctx context.Context, request PrivacyPurgeRequest) (PrivacyPurgeResult, error)
 }
 type SecretResolver interface {
 	ResolveSecret(ctx context.Context, secretRef string, version uint64) (SecretResolution, error)
@@ -1176,7 +1078,4 @@ type PluginKVRepository interface {
 	SetPluginKV(ctx context.Context, request PluginKVPutRequest) (PluginKVItem, error)
 	DeletePluginKV(ctx context.Context, extension, key string, expectedVersion uint64) error
 	ListPluginKV(ctx context.Context, request PluginKVListRequest) ([]PluginKVItem, error)
-}
-type EncryptionRotator interface {
-	RotateEncryptionRoots(ctx context.Context) (EncryptionRotationResult, error)
 }

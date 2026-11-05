@@ -48,11 +48,11 @@ func readAttrsTemplateVersion(attrs *AttributesItem) *semver.Version {
 	return ver
 }
 
-func writeAttrsTemplateVersion(attrs *AttributesItem, version string) {
+func writeAttrsTemplateVersion(attrs *AttributesItem, version string) error {
 	if attrs == nil || strings.TrimSpace(version) == "" {
-		return
+		return nil
 	}
-	attrs.Store(attrsTemplateVersionKey, ds.NewStrVal(version))
+	return attrs.Store(attrsTemplateVersionKey, ds.NewStrVal(version))
 }
 
 // Commands wraps command-related configuration.
@@ -195,7 +195,7 @@ func (ctx *MsgContext) syncAttrsForTemplate(attrs *AttributesItem, tmpl *GameSys
 	}
 	// 这里只在“模板已经确定、并且马上要按这个模板读取”时做一次同步，
 	// 避免在 LoadByCtx 阶段过早修改卡片数据。
-	if attrs.SheetType == "" || attrs.SheetType != tmpl.Name {
+	if sheetType := attrs.SheetType(); sheetType == "" || sheetType != tmpl.Name {
 		return
 	}
 
@@ -233,14 +233,22 @@ func (ctx *MsgContext) syncAttrsForTemplate(attrs *AttributesItem, tmpl *GameSys
 	}
 
 	for key := range toDelete {
-		attrs.Delete(key)
+		if err := attrs.Delete(key); err != nil {
+			ctx.setExecutionError(err)
+			return
+		}
 	}
 	for key, value := range toAdd {
-		attrs.Store(key, value)
+		if err := attrs.Store(key, value); err != nil {
+			ctx.setExecutionError(err)
+			return
+		}
 	}
 	// $ver 是角色卡内部版本字段，不在常规 st show 中展示；
 	// 缺失或低于模板版本时，视为旧卡并在此处完成一次迁移。
-	writeAttrsTemplateVersion(attrs, tmpl.Version)
+	if err := writeAttrsTemplateVersion(attrs, tmpl.Version); err != nil {
+		ctx.setExecutionError(err)
+	}
 }
 
 func (t *GameSystemTemplateV2) GetShowKeyAs(ctx *MsgContext, k string) (string, error) {

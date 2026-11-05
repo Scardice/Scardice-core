@@ -9,9 +9,7 @@ import (
 	"time"
 
 	"Scardice-core/adapterapi"
-	"Scardice-core/core/messageflow"
 	"Scardice-core/dice/censor"
-	"Scardice-core/eventstore"
 	"Scardice-core/utils/jsengine"
 )
 
@@ -23,9 +21,26 @@ func installAdapterTestCensor(t *testing.T, d *Dice, mode CensorMode) {
 	if err := engine.Load(); err != nil {
 		t.Fatal(err)
 	}
-	d.Config.EnableCensor = true
-	d.Config.CensorMode = mode
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.EnableCensor = true
+		config.CensorMode = mode
+	})
 	d.CensorManager = &CensorManager{Censor: engine}
+}
+
+func newCanonicalAdapterCensorBridgeTest(t *testing.T, staged bool) (*MsgContext, *DurableOutboundBridge, *adapterAPIRecordingSubmitter, *adapterAPIRecordingResolver) {
+	t.Helper()
+	_, bridge, submitter, resolver := newAdapterAPIBridgeTest(t)
+	d, _ := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:adapter-censor-bot")
+	endpoint.ID = "current-endpoint"
+	msg := newPrivateMsg("QQ:source-actor", "")
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, msg, "adapter-censor")
+	d.OutboundBridge = bridge
+	if !staged {
+		ctx.callbackTransaction = nil
+	}
+	return ctx, bridge, submitter, resolver
 }
 
 func TestAdapterCensorDurableAdmission(t *testing.T) {
@@ -38,11 +53,8 @@ func TestAdapterCensorDurableAdmission(t *testing.T) {
 	} {
 		for _, staged := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/staged=%t", raw, staged), func(t *testing.T) {
-				ctx, bridge, submitter, _ := newAdapterAPIBridgeTest(t)
+				ctx, bridge, submitter, _ := newCanonicalAdapterCensorBridgeTest(t, staged)
 				installAdapterTestCensor(t, ctx.Dice, OnlyOutputReply)
-				if staged {
-					ctx.callbackTransaction = &DurableCallbackTransaction{collector: messageflow.NewMutationCollector(eventstore.EventFactory{})}
-				}
 				operation, err := bridge.EnqueueAdapterAPI(context.Background(), ctx, "target-endpoint", raw)
 				if err == nil || operation.ID != "" {
 					t.Errorf("sensitive request admitted: operation=%+v error=%v", operation, err)
@@ -71,9 +83,9 @@ func TestAdapterCensorOutputModeAndUnavailablePolicy(t *testing.T) {
 		{"missing", OnlyOutputReply, true, "missing", true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			ctx, bridge, submitter, _ := newAdapterAPIBridgeTest(t)
+			ctx, bridge, submitter, _ := newCanonicalAdapterCensorBridgeTest(t, false)
 			installAdapterTestCensor(t, ctx.Dice, test.mode)
-			ctx.Dice.Config.EnableCensor = test.enabled
+			updateCanonicalTestConfig(t, ctx.Dice, func(config *Config) { config.EnableCensor = test.enabled })
 			if test.unavailable == "loading" {
 				ctx.Dice.CensorManager.IsLoading = true
 			}
@@ -180,12 +192,20 @@ seal.ext.register(ext);`
 		{"command-mode-chat", OnlyInputCommand, "message", false, false, false, false, true},
 		{"command-mode-command", OnlyInputCommand, "message", true, false, false, false, false},
 		{"already-censored", OnlyInputCommand, "message", true, true, false, false, false},
-		{"unknown-mode", CensorMode(99), "notice", false, false, false, false, true},
 		{"loading", AllInput, "notice", false, false, false, true, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			installAdapterTestCensor(t, d, test.mode)
-			d.Config.CensorThresholds = map[censor.Level]int{censor.Danger: 10}
+			updateCanonicalTestConfig(t, d, func(config *Config) {
+				// Unconfigured levels keep a zero threshold: their first hit exceeds it.
+				config.CensorThresholds = map[censor.Level]int{
+					censor.Ignore:  0,
+					censor.Notice:  0,
+					censor.Caution: 0,
+					censor.Warning: 0,
+					censor.Danger:  10,
+				}
+			})
 			d.CensorManager.IsLoading = test.loading
 			scope.CommandID = 0
 			if test.command {
@@ -215,7 +235,7 @@ seal.ext.register(ext);`
 				requireNoAdapterEventHit(t, hits)
 			}
 			if test.eventType != "message" && scope.Player != nil {
-				if counts := d.CensorManager.snapshotMemoryHitCounts(scope.Player.UserID, censor.Ignore, false); len(counts) != 0 {
+				if counts := d.CensorManager.snapshotMemoryHitCounts(scope.Player.UserID(), censor.Ignore, false); len(counts) != 0 {
 					t.Fatalf("opaque event attributed to its scoped member: %v", counts)
 				}
 			}
@@ -224,7 +244,7 @@ seal.ext.register(ext);`
 }
 
 func TestAdapterCensorCleanRawPreservesIndependentFields(t *testing.T) {
-	ctx, bridge, submitter, _ := newAdapterAPIBridgeTest(t)
+	ctx, bridge, submitter, _ := newCanonicalAdapterCensorBridgeTest(t, false)
 	installAdapterTestCensor(t, ctx.Dice, OnlyOutputReply)
 	raw := "{\n \"action\":\"vendor.test\",\"params\":{\"left\":\"gate\",\"right\":\"word\",\"id\":900719925474099312345}\n}"
 	operation, err := bridge.EnqueueAdapterAPI(context.Background(), ctx, "target-endpoint", raw)
@@ -237,12 +257,17 @@ func TestAdapterCensorCleanRawPreservesIndependentFields(t *testing.T) {
 }
 
 func TestAdapterCensorCountsActualActorOncePerScope(t *testing.T) {
-	ctx, bridge, _, _ := newAdapterAPIBridgeTest(t)
+	ctx, bridge, _, _ := newCanonicalAdapterCensorBridgeTest(t, false)
 	installAdapterTestCensor(t, ctx.Dice, OnlyOutputReply)
-	ctx.Dice.Config.CensorThresholds = map[censor.Level]int{censor.Danger: 10}
-	ctx.MessageType, ctx.IsPrivate = "private", true
-	ctx.Player = &GroupPlayerInfo{UserID: "source-actor", Name: "source"}
-	ctx.Session.ServiceAtNew = new(SyncMap[string, *GroupInfo])
+	updateCanonicalTestConfig(t, ctx.Dice, func(config *Config) {
+		config.CensorThresholds = map[censor.Level]int{
+			censor.Ignore:  0,
+			censor.Notice:  0,
+			censor.Caution: 0,
+			censor.Warning: 0,
+			censor.Danger:  10,
+		}
+	})
 	raw := `{"action":"vendor.test","params":{"user_id":"target-user","text":"gateword","other":"gateword"}}`
 	for range 2 {
 		if _, err := bridge.EnqueueAdapterAPI(context.Background(), ctx, "target-endpoint", raw); err == nil {
@@ -250,17 +275,18 @@ func TestAdapterCensorCountsActualActorOncePerScope(t *testing.T) {
 		}
 	}
 	manager := ctx.Dice.CensorManager
-	if counts := manager.snapshotMemoryHitCounts("source-actor", censor.Ignore, false); counts[censor.Danger] != 1 {
+	if counts := manager.snapshotMemoryHitCounts("QQ:source-actor", censor.Ignore, false); counts[censor.Danger] != 1 {
 		t.Fatalf("actor hit counts after repeated calls: %v", counts)
 	}
 	if counts := manager.snapshotMemoryHitCounts("target-user", censor.Ignore, false); len(counts) != 0 {
 		t.Fatalf("protocol target received actor penalties: %v", counts)
 	}
-	fresh := &MsgContext{Dice: ctx.Dice, Session: ctx.Session, EndPoint: ctx.EndPoint, Player: ctx.Player, MessageType: "private", IsPrivate: true}
+	fresh := newCanonicalTestMessageContext(t, ctx.Dice, ctx.EndPoint, newPrivateMsg("QQ:source-actor", ""), "adapter-censor-fresh")
+	fresh.callbackTransaction = nil
 	if _, err := bridge.EnqueueAdapterAPI(context.Background(), fresh, "target-endpoint", raw); err == nil {
 		t.Fatal("fresh scope accepted sensitive content")
 	}
-	if counts := manager.snapshotMemoryHitCounts("source-actor", censor.Ignore, false); counts[censor.Danger] != 2 {
+	if counts := manager.snapshotMemoryHitCounts("QQ:source-actor", censor.Ignore, false); counts[censor.Danger] != 2 {
 		t.Fatalf("fresh scope hit counts: %v", counts)
 	}
 }
@@ -281,7 +307,7 @@ func TestAdapterCensorProtocolTextRepresentations(t *testing.T) {
 		{"independent objects", "gateword", `{"action":"vendor.test","params":{"records":[{"type":"text","data":{"text":"gate"}},{"type":"text","data":{"text":"word"}}]}}`, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			ctx, bridge, submitter, _ := newAdapterAPIBridgeTest(t)
+			ctx, bridge, submitter, _ := newCanonicalAdapterCensorBridgeTest(t, false)
 			installAdapterTestCensor(t, ctx.Dice, OnlyOutputReply)
 			engine := ctx.Dice.CensorManager.Censor
 			engine.SensitiveKeys = map[string]censor.WordInfo{test.word: {Level: censor.Danger, Origin: test.word}}
@@ -302,14 +328,24 @@ func TestAdapterCensorProtocolTextRepresentations(t *testing.T) {
 
 func TestAdapterCensorModerationSurvivesRejectedCallback(t *testing.T) {
 	submitter := &bridgeTestSubmitter{}
-	ctx, source, _ := bridgeTestContext(submitter)
-	installAdapterTestCensor(t, ctx.Dice, OnlyOutputReply)
-	ctx.MessageType, ctx.IsPrivate = "private", true
-	ctx.Player = &GroupPlayerInfo{UserID: source.Sender.UserID, Name: "source"}
-	ctx.Session.ServiceAtNew = new(SyncMap[string, *GroupInfo])
-	ctx.Dice.Config.CensorHandlers = map[censor.Level]uint8{censor.Danger: 1 << SendEncodedDetails}
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	ctx.callbackTransaction = &DurableCallbackTransaction{collector: collector}
+	bridgeCtx, source, _ := bridgeTestContext(t, submitter)
+	d, _ := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, bridgeCtx.EndPoint.UserID)
+	endpoint.ID = bridgeCtx.EndPoint.ID
+	d.OutboundBridge = bridgeCtx.Dice.OutboundBridge
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, source, "adapter-censor-rejected-callback")
+	installAdapterTestCensor(t, d, OnlyOutputReply)
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		// A zero handler mask leaves an unconfigured level without side effects.
+		config.CensorHandlers = map[censor.Level]uint8{
+			censor.Ignore:  0,
+			censor.Notice:  0,
+			censor.Caution: 0,
+			censor.Warning: 0,
+			censor.Danger:  1 << SendEncodedDetails,
+		}
+	})
+	collector := ctx.callbackTransaction.collector
 	err := ctx.Dice.checkAdapterOutboundCensor(ctx, `{"action":"send_msg","params":{"message":"gateword"}}`)
 	if err == nil {
 		t.Fatal("sensitive request accepted")
@@ -331,12 +367,17 @@ func TestAdapterCensorModerationSurvivesRejectedCallback(t *testing.T) {
 }
 
 func TestAdapterCensorOpaqueScopeOutputHasNoUserPenalty(t *testing.T) {
-	ctx, bridge, _, _ := newAdapterAPIBridgeTest(t)
+	ctx, bridge, _, _ := newCanonicalAdapterCensorBridgeTest(t, false)
 	installAdapterTestCensor(t, ctx.Dice, OnlyOutputReply)
-	ctx.Dice.Config.CensorThresholds = map[censor.Level]int{censor.Danger: 10}
-	ctx.MessageType, ctx.IsPrivate = "private", true
-	ctx.Player = &GroupPlayerInfo{UserID: "affected-member", Name: "target"}
-	ctx.Session.ServiceAtNew = new(SyncMap[string, *GroupInfo])
+	updateCanonicalTestConfig(t, ctx.Dice, func(config *Config) {
+		config.CensorThresholds = map[censor.Level]int{
+			censor.Ignore:  0,
+			censor.Notice:  0,
+			censor.Caution: 0,
+			censor.Warning: 0,
+			censor.Danger:  10,
+		}
+	})
 	ctx.adapterEventUnattributed = true
 	_, err := bridge.EnqueueAdapterAPI(context.Background(), ctx.ShallowCopy(), "target-endpoint", `{"action":"vendor.test","params":{"text":"gateword"}}`)
 	if err == nil {

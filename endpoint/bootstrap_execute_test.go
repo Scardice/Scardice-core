@@ -11,12 +11,11 @@ import (
 )
 
 func TestBootstrapExecuteReconcilesEnableEffectOnce(t *testing.T) {
-	source := &endpointKeySource{}
-	db, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "bootstrap.db"), KeySource: source})
+	db, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "bootstrap.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := eventstore.NewStore(db, eventstore.WithKeySource(source))
+	store := eventstore.NewStore(db)
 	defer db.Close()
 	key := adapterapi.AdapterKey("fake")
 	descriptor := &fakeDescriptor{key: key}

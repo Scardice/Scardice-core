@@ -42,7 +42,7 @@ func TestForwardEffectRoundTripsAndBindsToConversation(t *testing.T) {
 		t.Fatalf("forward node order or content changed: %+v", wire.ForwardNodes)
 	}
 
-	lane, laneErr := NewLaneMetadata("endpoint-1", payload.Target, []byte("index-root"), 1)
+	lane, laneErr := NewLaneMetadata("endpoint-1", payload.Target, 1)
 	if laneErr != nil {
 		t.Fatal(laneErr)
 	}

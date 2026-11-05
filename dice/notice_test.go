@@ -4,8 +4,6 @@ package dice
 import (
 	"reflect"
 	"testing"
-
-	"go.uber.org/zap"
 )
 
 type noticeCaptureAdapter struct {
@@ -74,10 +72,7 @@ func Test_NoticeTargetMatchesEndpoint_separates_official_and_ordinary_QQ(t *test
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			// When
 			got := ParseNoticeTarget(test.raw).MatchesEndpoint("QQ", test.protocolType)
-
-			// Then
 			if got != test.want {
 				t.Fatalf("MatchesEndpoint(QQ, %q) = %t, want %t", test.protocolType, got, test.want)
 			}
@@ -86,38 +81,30 @@ func Test_NoticeTargetMatchesEndpoint_separates_official_and_ordinary_QQ(t *test
 }
 
 func Test_sendNoticeTargetCrossPlatform_delivers_selected_target_without_metadata(t *testing.T) {
-	// Given
 	adapter := &noticeCaptureAdapter{
 		mockPlatformAdapter: newMockPlatformAdapter(),
 		personIDs:           make(chan string, 1),
 	}
-	d := &Dice{Logger: zap.NewNop().Sugar(), Config: Config{BaseConfig: BaseConfig{NoticeIDs: []string{
-		"QQ:1001:only=ban",
-		"QQ:1002:only=group",
-		"QQ:1003:disable:only=ban",
-	}}}}
-	endpoint := &EndPointInfo{
-		EndPointInfoBase: EndPointInfoBase{
-			Platform:     "QQ",
-			ProtocolType: "onebot",
-			Enable:       true,
-			State:        StateConnected,
-		},
-		Adapter: adapter,
-	}
-	session := &IMSession{Parent: d, ServiceAtNew: new(SyncMap[string, *GroupInfo])}
-	d.ImSession = session
-	endpoint.Session = session
-	ctx := &MsgContext{Dice: d, Session: session, EndPoint: endpoint}
+	d, _ := newCanonicalTestDice(t)
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.NoticeIDs = []string{
+			"QQ:1001:only=ban",
+			"QQ:1002:only=group",
+			"QQ:1003:disable:only=ban",
+		}
+	})
+	endpoint := newCanonicalTestEndpoint(d, "QQ:notice-bot")
+	endpoint.ProtocolType = "onebot"
+	endpoint.State = StateConnected
+	endpoint.Adapter = adapter
+	msg := newPrivateMsg("QQ:notice-source", "")
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, msg, "notice-cross-platform")
 
-	// When
-	targets := filterNoticeTargets(d.Config.NoticeIDs, NoticeTypeBan)
+	targets := filterNoticeTargets(d.Config().NoticeIDs, NoticeTypeBan)
 	if len(targets) != 1 {
 		t.Fatalf("selected targets = %#v, want one ban target", targets)
 	}
 	sent := sendNoticeTargetCrossPlatform(ctx, targets[0], "ban notice")
-
-	// Then
 	if !sent {
 		t.Fatal("selected notice target was not delivered")
 	}

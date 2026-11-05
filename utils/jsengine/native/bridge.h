@@ -108,7 +108,7 @@ int sc_native_last_error_copy(uint64_t library, uint64_t runtime, char *buffer,
                               uint64_t buffer_capacity, uint64_t *required,
                               char *error, uint64_t capacity);
 int sc_native_service_event(uint64_t library, uint64_t runtime, uint32_t kind,
-                            uint32_t status, uint64_t request,
+                            uint32_t status, uint32_t flags, uint64_t request,
                             const char *string, uint64_t string_len,
                             const uint8_t *bytes, uint64_t bytes_len,
                             uint32_t bool_value, int64_t int64_value,

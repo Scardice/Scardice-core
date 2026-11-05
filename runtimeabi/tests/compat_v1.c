@@ -7,8 +7,8 @@ _Static_assert(SC_RUNTIME_ABI_MAJOR == 1, "runtime ABI major changed");
 _Static_assert(SC_RUNTIME_ABI_MINOR == 0,
                "runtime ABI minor is reserved and must remain zero");
 _Static_assert(SC_HOST_ABI_MAJOR == 1, "host ABI major changed");
-_Static_assert(SC_HOST_ABI_MINOR == 1,
-               "host ABI minor must include HostRef proxy lifecycle");
+_Static_assert(SC_HOST_ABI_MINOR == 2,
+               "host ABI minor must include execution status");
 
 _Static_assert(sizeof(sc_string_view) == 16, "string view layout changed");
 _Static_assert(sizeof(sc_runtime_descriptor_v1) == 64, "descriptor layout changed");
@@ -29,6 +29,9 @@ _Static_assert(offsetof(sc_host_api_v1, last_error_copy) ==
 _Static_assert(offsetof(sc_host_api_v1, service_call) ==
                    offsetof(sc_host_api_v1, last_error_copy) + sizeof(void *),
                "host API optional tail moved");
+_Static_assert(offsetof(sc_host_api_v1, execution_status) ==
+                   offsetof(sc_host_api_v1, host_function_owner) + sizeof(void *),
+               "host execution-status tail moved");
 _Static_assert(offsetof(sc_runtime_plugin_v1, descriptor) == 8,
                "plugin descriptor prefix changed");
 _Static_assert(offsetof(sc_runtime_plugin_v1, api) == 72,

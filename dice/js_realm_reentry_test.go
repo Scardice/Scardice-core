@@ -15,7 +15,7 @@ import (
 func TestJSExtMessageSendHookFromInsideRealmDoesNotDeadlock(t *testing.T) {
 	const packageID = "author/send-hook"
 	d := newPermissionTestDice(t, packageID, sealpack.Permissions{})
-	d.Config.JsEnable = true
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.JsEnable = true })
 	rawLoop := startFsTestLoop(t)
 	engineLoop := gojaengine.WrapEventLoop(rawLoop)
 	d.ExtLoopManager = NewJsLoopManager()
@@ -36,8 +36,11 @@ func TestJSExtMessageSendHookFromInsideRealmDoesNotDeadlock(t *testing.T) {
 	d.ExtList = []*ExtInfo{ext}
 	d.ImSession.Parent = d
 
-	ctx := &MsgContext{Dice: d, Session: d.ImSession}
-	if err := jsengine.RunWithContext(engineLoop, jsContextForPlugin(ext), func(jsengine.Runtime) error {
+	endpoint := newCanonicalTestEndpoint(d, "QQ:send-hook-bot")
+	ctx := newCanonicalTestMessageContext(
+		t, d, endpoint, newPrivateMsg("QQ:send-hook-user", ""), "send-hook-inside-realm",
+	)
+	if err := jsengine.RunWithContext(engineLoop, jsContextForMessage(ext, ctx), func(jsengine.Runtime) error {
 		d.ImSession.OnMessageSend(ctx, &Message{Message: "from realm", MessageType: "private"}, "")
 		return nil
 	}); err != nil {
@@ -59,7 +62,7 @@ func TestJSExtMessageSendHookFromInsideRealmDoesNotDeadlock(t *testing.T) {
 func TestJSExtMessageSendHookFromOutsideRealmStillRuns(t *testing.T) {
 	const packageID = "author/send-hook-external"
 	d := newPermissionTestDice(t, packageID, sealpack.Permissions{})
-	d.Config.JsEnable = true
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.JsEnable = true })
 	rawLoop := startFsTestLoop(t)
 	engineLoop := gojaengine.WrapEventLoop(rawLoop)
 	d.ExtLoopManager = NewJsLoopManager()
@@ -80,7 +83,10 @@ func TestJSExtMessageSendHookFromOutsideRealmStillRuns(t *testing.T) {
 	d.ExtList = []*ExtInfo{ext}
 	d.ImSession.Parent = d
 
-	ctx := &MsgContext{Dice: d, Session: d.ImSession}
+	endpoint := newCanonicalTestEndpoint(d, "QQ:send-hook-external-bot")
+	ctx := newCanonicalTestMessageContext(
+		t, d, endpoint, newPrivateMsg("QQ:send-hook-external-user", ""), "send-hook-outside-realm",
+	)
 	d.ImSession.OnMessageSend(ctx, &Message{Message: "external", MessageType: "private"}, "")
 
 	select {

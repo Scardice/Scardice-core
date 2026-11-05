@@ -78,53 +78,6 @@ func TestEndpointAggregateCreateAndDuplicateCreate(t *testing.T) {
 	}
 }
 
-func TestEndpointAggregateRestoresLegacyMetadataWithoutChangingLifecycle(t *testing.T) {
-	state := State{}
-	create, err := Decide(state, createCommand(t, "create-without-metadata"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	state = applyDecision(t, state, create)
-	before := state
-	statistics := Statistics{GroupCount: 7, CommandCount: 84, LastCommandAt: 23456, OnlineSeconds: 789}
-	command := Command{
-		Kind: CommandRestoreLegacyMetadata, CommandID: "restore-legacy-metadata",
-		CorrelationID: "legacy-metadata-repair-v1", EndpointID: state.EndpointID,
-		ExpectedVersion: state.Version, ExpectedVersionSet: true,
-		DisplayName: "Legacy Bot", ProviderID: "QQ:12345", Statistics: statistics,
-	}
-
-	decision, err := Decide(state, command)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(decision.Events) != 1 || len(decision.Effects) != 0 || decision.Events[0].Type != EventLegacyMetadataRestored {
-		t.Fatalf("restore decision = %#v", decision)
-	}
-	state = applyDecision(t, state, decision)
-	if state.DisplayName != "Legacy Bot" || state.ProviderID != "QQ:12345" || state.Statistics != statistics {
-		t.Fatalf("restored state = %#v", state)
-	}
-	if state.DesiredState != before.DesiredState || state.ObservedState != before.ObservedState ||
-		state.OperationState != before.OperationState || state.Generation != before.Generation ||
-		state.DesiredVersion != before.DesiredVersion || state.OperationID != before.OperationID {
-		t.Fatalf("restore changed lifecycle state: before=%#v after=%#v", before, state)
-	}
-	replay, err := Decide(state, command)
-	if err != nil || !replay.Replay || len(replay.Events) != 0 {
-		t.Fatalf("restore replay = %#v, %v", replay, err)
-	}
-	_, err = Decide(state, Command{
-		Kind: CommandRestoreLegacyMetadata, CommandID: "overwrite-legacy-metadata",
-		CorrelationID: "legacy-metadata-repair-v1", EndpointID: state.EndpointID,
-		ExpectedVersion: state.Version, ExpectedVersionSet: true,
-		DisplayName: "Different Bot", ProviderID: state.ProviderID, Statistics: state.Statistics,
-	})
-	if !errors.Is(err, ErrInvalidTransition) {
-		t.Fatalf("metadata overwrite error = %v, want invalid transition", err)
-	}
-}
-
 func TestEndpointAggregateEnableDuplicateEnableDisable(t *testing.T) {
 	state := State{}
 	create, err := Decide(state, createCommand(t, "create-1"))

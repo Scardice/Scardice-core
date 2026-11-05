@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"context"
 	"errors"
 	"sync/atomic"
 	"testing"
@@ -59,6 +60,26 @@ func TestJSCallbackDispatchRejectsWrongRealm(t *testing.T) {
 	}
 	if called {
 		t.Fatal("wrong realm callback executed")
+	}
+}
+
+func TestSameJSRealmNeverJoinsDistinctRootsOfOneScript(t *testing.T) {
+	d := &Dice{}
+	source := &JsScriptInfo{runtimeGeneration: 1}
+	first := jsContextForRoot(context.Background(), d, nil, source, nil, false)
+	second := jsContextForRoot(context.Background(), d, nil, source, nil, false)
+	if sameJSRealm(first, second) {
+		t.Fatal("distinct roots of one script were treated as the same owner realm")
+	}
+	_ = first.execution.stop()
+	_ = second.execution.stop()
+
+	message := &MsgContext{Dice: d}
+	t.Cleanup(message.releaseExecutionState)
+	left := &jsExecutionContext{Dice: d, Script: source, Message: message}
+	right := &jsExecutionContext{Dice: d, Script: source, Message: message}
+	if !sameJSRealm(left, right) {
+		t.Fatal("contexts sharing one message invocation registry were treated as different realms")
 	}
 }
 

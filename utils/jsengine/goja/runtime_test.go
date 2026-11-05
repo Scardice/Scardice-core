@@ -236,8 +236,12 @@ func TestWrappedEventLoopCapturesJSONParseBeforeFirstEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = loop.Close()
-		<-stopped
+		if err := loop.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+		if err := <-stopped; err != nil {
+			t.Errorf("StartInForeground() error = %v", err)
+		}
 	})
 
 	if err := loop.LoadEntry(jsengine.Entry{

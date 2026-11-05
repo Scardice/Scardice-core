@@ -17,15 +17,16 @@ func newReleasedCommandContext(t *testing.T, noticeIDs ...string) (*MsgContext, 
 	t.Helper()
 	adapter := &noticeCaptureAdapter{mockPlatformAdapter: newMockPlatformAdapter(), personIDs: make(chan string, 4)}
 	logCore, logs := observer.New(zapcore.ErrorLevel)
-	d := &Dice{Logger: zap.New(logCore).Sugar(), Config: Config{BaseConfig: BaseConfig{NoticeIDs: noticeIDs}}}
-	endpoint := &EndPointInfo{
-		EndPointInfoBase: EndPointInfoBase{Platform: "QQ", ProtocolType: "onebot", Enable: true, State: StateConnected},
-		Adapter:          adapter,
-	}
-	session := &IMSession{Parent: d, ServiceAtNew: new(SyncMap[string, *GroupInfo])}
-	d.ImSession = session
-	endpoint.Session = session
-	ctx := &MsgContext{Dice: d, Session: session, EndPoint: endpoint}
+	d, _ := newCanonicalTestDice(t)
+	d.Logger = zap.New(logCore).Sugar()
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.NoticeIDs = append([]string(nil), noticeIDs...) })
+	endpoint := newCanonicalTestEndpoint(d, "QQ:9001")
+	endpoint.ID = "detached-report-endpoint"
+	endpoint.Platform = "QQ"
+	endpoint.ProtocolType = "onebot"
+	endpoint.State = StateConnected
+	endpoint.Adapter = adapter
+	ctx := &MsgContext{Dice: d, Session: d.ImSession, EndPoint: endpoint}
 	ctx.releaseExecutionState()
 	return ctx, adapter, logs
 }
@@ -66,11 +67,39 @@ func TestDetachedReportSpeaksAfterTheCommandContextIsReleased(t *testing.T) {
 
 	// The released context refuses both of these; the fresh one must not.
 	report(func(reportCtx *MsgContext, reportMsg *Message) {
+		if reportCtx.callbackTransaction == nil {
+			t.Fatal("detached report did not create an explicit durable root")
+		}
+		if reportCtx.standaloneSendScope {
+			t.Fatal("detached report bypassed its durable root with standalone send mode")
+		}
 		VarSetValueStr(reportCtx, "$t汇报", "done")
 		ReplyToSender(reportCtx, reportMsg, "the work finished")
 	})
 	if got := awaitPerson(t, adapter, "the detached report"); got != "QQ:2002" {
 		t.Fatalf("report went to %q, want the original sender QQ:2002", got)
+	}
+}
+func TestDetachedReportInheritsLiveCallbackRoot(t *testing.T) {
+	d, _ := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:9001")
+	msg := &Message{
+		MessageType: "group", GroupID: "QQ-Group:2002",
+		Sender: SenderBase{UserID: "QQ:1001", Nickname: "Alice"},
+	}
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, msg, "detached-live-child")
+	transaction := ctx.callbackTransaction
+	report := ctx.detach(msg)
+	report(func(reportCtx *MsgContext, _ *Message) {
+		if reportCtx.callbackTransaction != transaction {
+			t.Fatal("live detached child opened a second root")
+		}
+		if reportCtx.Group == ctx.Group {
+			t.Fatal("live detached child copied the old group facade")
+		}
+	})
+	if err := ctx.getExecutionError(); err != nil {
+		t.Fatal(err)
 	}
 }
 

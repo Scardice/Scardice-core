@@ -24,11 +24,31 @@ const (
 	InboundKindMessageUpdated
 	InboundKindMessageDeleted
 	InboundKindAdapterEvent
+	// InboundKindSelfMessage is a message the endpoint's own account sent. It is
+	// recorded and may reach adapter-event hooks, but never executes commands,
+	// custom replies or message hooks.
+	InboundKindSelfMessage
 )
 
 func (kind InboundKind) Valid() bool {
-	return kind > InboundKindInvalid && kind <= InboundKindAdapterEvent
+	return kind > InboundKindInvalid && kind <= InboundKindSelfMessage
 }
+
+// SelfMessageOrigin says whether the provider runtime can tie a self message
+// to an action this Core issued through the same runtime.
+type SelfMessageOrigin uint8
+
+const (
+	// SelfMessageUnattributed is a message the runtime did not see Core send:
+	// typed by hand in another client of the account.
+	SelfMessageUnattributed SelfMessageOrigin = iota
+	// SelfMessageIssuedByCore is the provider's report of a message whose id a
+	// send action issued by this Core returned. Core has already recorded, or
+	// will record, such a message from its own outbound state.
+	SelfMessageIssuedByCore
+)
+
+func (origin SelfMessageOrigin) Valid() bool { return origin <= SelfMessageIssuedByCore }
 
 // ConversationKind distinguishes direct and group conversations independently
 // from the provider-specific conversation identifier.
@@ -154,6 +174,8 @@ type InboundMessage struct {
 	// fields. It is required for InboundKindAdapterEvent and optional for kinds
 	// with an existing Core handler.
 	AdapterEvent *AdapterEvent `json:"adapterEvent,omitempty"`
+	// SelfOrigin is set only on InboundKindSelfMessage.
+	SelfOrigin SelfMessageOrigin `json:"selfOrigin,omitempty"`
 }
 
 // Validate checks size and closed-enum bounds before an ingress is handed to
@@ -192,8 +214,16 @@ func (message InboundMessage) Validate() error {
 	if !message.History.Valid() {
 		return fmt.Errorf("%w: unknown inbound history mode", ErrInvalidContract)
 	}
-	if message.History != InboundHistoryNone && (message.Kind != InboundKindMessage || message.ConversationKind != ConversationKindGroup) {
+	if message.History != InboundHistoryNone && (message.ConversationKind != ConversationKindGroup ||
+		(message.Kind != InboundKindMessage && message.Kind != InboundKindSelfMessage)) {
 		return fmt.Errorf("%w: history applies to group messages only", ErrInvalidContract)
+	}
+	if !message.SelfOrigin.Valid() || (message.SelfOrigin != SelfMessageUnattributed && message.Kind != InboundKindSelfMessage) {
+		return fmt.Errorf("%w: self message origin", ErrInvalidContract)
+	}
+	if message.Kind == InboundKindSelfMessage &&
+		(message.MessageID == "" || message.Platform == "" || message.Sender == "" || message.Conversation == "" || message.Target != string(message.Conversation)) {
+		return fmt.Errorf("%w: self message requires its id, sender and a consistent conversation identity", ErrInvalidContract)
 	}
 	for _, segment := range message.Segments {
 		if len(segment.Kind) == 0 || len(segment.Kind) > MaxInboundFieldBytes ||

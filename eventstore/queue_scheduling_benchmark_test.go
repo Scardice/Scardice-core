@@ -30,35 +30,31 @@ type queueSchedulingBenchmarkFixture struct {
 	store    *GORMStore
 	database *Database
 	clock    *queueTestClock
-	lane     []byte
-	other    []byte
+	lane     string
+	other    string
 }
 
-func queueSchedulingBenchmarkLane(prefix byte, number int) []byte {
+func queueSchedulingBenchmarkLane(prefix byte, number int) string {
 	lane := make([]byte, 32)
 	lane[0] = prefix
 	binary.BigEndian.PutUint64(lane[24:], uint64(number+1))
-	return lane
+	return string(lane)
 }
 
-func queueSchedulingBenchmarkPendingRow(id string, lane []byte, sequence uint64, now time.Time) outboxEffectRow {
-	expires := now.Add(24 * time.Hour)
+func queueSchedulingBenchmarkPendingRow(id string, lane string, sequence uint64, now time.Time) outboxEffectRow {
 	return outboxEffectRow{
 		EffectID: id, Version: 1, EndpointID: "benchmark-endpoint",
-		LaneHMAC: lane, OrderingSequence: sequence, EffectClass: "send",
+		Lane: lane, OrderingSequence: sequence, EffectClass: "send",
 		RiskClass: RiskPreDispatchRetryable, Status: OutboxStatusPending,
-		PayloadCiphertext: []byte("ciphertext"), PayloadNonce: []byte("nonce"),
-		EncryptionKeyID: "benchmark-key", PayloadVersion: 1, PayloadExpiresAt: &expires,
-		PayloadPresent: true, SchedulingVersion: 0, CreatedAt: now,
+		Payload: []byte("benchmark-payload"), SchedulingVersion: 0, CreatedAt: now,
 	}
 }
 
-func queueSchedulingBenchmarkEffect(id string, lane []byte) NewEffect {
+func queueSchedulingBenchmarkEffect(id string, lane string) NewEffect {
 	return NewEffect{
-		EffectID: id, EndpointID: "benchmark-endpoint", LaneHMAC: append([]byte(nil), lane...),
+		EffectID: id, EndpointID: "benchmark-endpoint", Lane: lane,
 		EffectType: "send", RiskClass: RiskPreDispatchRetryable, Status: OutboxStatusPending,
-		PayloadCiphertext: []byte("ciphertext"), PayloadNonce: []byte("nonce"),
-		DigestKeyID: "benchmark-key",
+		Payload: []byte("benchmark-payload"),
 	}
 }
 
@@ -85,7 +81,7 @@ func queueSchedulingBenchmarkOpen(b *testing.B, history int, mode queueSchedulin
 	db := database.GORM()
 	clock := &queueTestClock{now: time.Unix(10_000, 0).UTC()}
 
-	historyLanes := make([][]byte, 64)
+	historyLanes := make([]string, 64)
 	for index := range historyLanes {
 		historyLanes[index] = queueSchedulingBenchmarkLane(0x10, index)
 	}
@@ -97,13 +93,11 @@ func queueSchedulingBenchmarkOpen(b *testing.B, history int, mode queueSchedulin
 		for offset := range end - start {
 			index := start + offset
 			laneIndex := index % len(historyLanes)
-			expired := clock.Now().Add(-time.Hour)
 			rows = append(rows, outboxEffectRow{
 				EffectID: fmt.Sprintf("scrubbed-history-%09d", index), Version: 1,
-				EndpointID: "benchmark-endpoint", LaneHMAC: historyLanes[laneIndex],
+				EndpointID: "benchmark-endpoint", Lane: historyLanes[laneIndex],
 				OrderingSequence: uint64(index/len(historyLanes) + 1), EffectClass: "send",
 				RiskClass: RiskPreDispatchRetryable, Status: OutboxStatusAmbiguous,
-				PayloadVersion: 1, PayloadExpiresAt: &expired, PayloadPresent: false,
 				SchedulingVersion: 0, CreatedAt: clock.Now().Add(-2 * time.Hour),
 			})
 		}
@@ -119,9 +113,8 @@ func queueSchedulingBenchmarkOpen(b *testing.B, history int, mode queueSchedulin
 		due := clock.Now().Add(time.Hour)
 		row.NextAttemptAt = &due
 		queueSchedulingBenchmarkInsertRows(b, db, []outboxEffectRow{row})
-		if err := db.Create(&laneHeadRow{
-			Kind: outboxLaneKind, LaneHMAC: fixture.lane, NextSequence: 2,
-			SchedulingVersion: 0, UpdatedAt: clock.Now(),
+		if err := laneQuery(db.Model(&laneHeadRow{}), outboxLaneKind, fixture.lane).Updates(map[string]any{
+			"next_sequence": uint64(2), "scheduling_version": uint8(0), "updated_at": clock.Now(),
 		}).Error; err != nil {
 			b.Fatal(err)
 		}
@@ -139,10 +132,8 @@ func queueSchedulingBenchmarkOpen(b *testing.B, history int, mode queueSchedulin
 			}
 			queueSchedulingBenchmarkInsertRows(b, db, rows)
 		}
-		if err := db.Create(&laneHeadRow{
-			Kind: outboxLaneKind, LaneHMAC: fixture.lane,
-			NextSequence:      queueSchedulingBenchmarkBacklog + 1,
-			SchedulingVersion: 0, UpdatedAt: clock.Now(),
+		if err := laneQuery(db.Model(&laneHeadRow{}), outboxLaneKind, fixture.lane).Updates(map[string]any{
+			"next_sequence": uint64(queueSchedulingBenchmarkBacklog + 1), "scheduling_version": uint8(0), "updated_at": clock.Now(),
 		}).Error; err != nil {
 			b.Fatal(err)
 		}
@@ -155,11 +146,13 @@ func queueSchedulingBenchmarkOpen(b *testing.B, history int, mode queueSchedulin
 		}
 		queueSchedulingBenchmarkInsertRows(b, db, rows)
 		heads := []laneHeadRow{
-			{Kind: outboxLaneKind, LaneHMAC: fixture.lane, NextSequence: 101, SchedulingVersion: 0, UpdatedAt: clock.Now().Add(-2 * time.Nanosecond)},
-			{Kind: outboxLaneKind, LaneHMAC: fixture.other, NextSequence: 2, SchedulingVersion: 0, UpdatedAt: clock.Now().Add(-time.Nanosecond)},
+			{Kind: outboxLaneKind, Lane: fixture.lane, NextSequence: 101, SchedulingVersion: 0, UpdatedAt: clock.Now().Add(-2 * time.Nanosecond)},
+			{Kind: outboxLaneKind, Lane: fixture.other, NextSequence: 2, SchedulingVersion: 0, UpdatedAt: clock.Now().Add(-time.Nanosecond)},
 		}
-		if err := db.Create(&heads).Error; err != nil {
-			b.Fatal(err)
+		for _, head := range heads {
+			if err := laneQuery(db.Model(&laneHeadRow{}), head.Kind, head.Lane).Updates(map[string]any{"next_sequence": head.NextSequence, "scheduling_version": uint8(0), "updated_at": head.UpdatedAt}).Error; err != nil {
+				b.Fatal(err)
+			}
 		}
 	default:
 		b.Fatal("unknown queue scheduling benchmark mode")

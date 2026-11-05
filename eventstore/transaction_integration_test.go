@@ -28,21 +28,11 @@ func transactionTestEvent(id string, delta int) NewEvent {
 	}
 }
 
-func newTransactionTestKeySource() *MemoryKeySource {
-	return NewMemoryKeySource(
-		"task7-index-v1",
-		[]byte("01234567890123456789012345678901"),
-		map[string][]byte{"task7-root-v1": []byte("abcdefghijklmnopqrstuvwxyz123456")},
-		"task7-root-v1",
-	)
-}
-
-func openTransactionTestStore(t testing.TB, source *MemoryKeySource, name string) (*GORMStore, *Database) {
+func openTransactionTestStore(t testing.TB, name string) (*GORMStore, *Database) {
 	t.Helper()
 	db, err := OpenDatabase(context.Background(), DatabaseConfig{
 		Type:             "sqlite",
 		DSN:              filepath.Join(t.TempDir(), name+".db"),
-		KeySource:        source,
 		DatabaseIdentity: "task7-sqlite",
 	})
 	if err != nil {
@@ -88,32 +78,22 @@ func failingTransactionTestProjection() ProjectionDescriptor {
 	}
 }
 
-func transactionTestQueuePayloads(t testing.TB, source *MemoryKeySource, ctx context.Context, prefix string) (InboxUpdate, InboxUpdate, NewEffect, NewEffect) {
+func transactionTestQueuePayloads(t testing.TB, prefix string) (InboxUpdate, InboxUpdate, NewEffect, NewEffect) {
 	t.Helper()
 	inbox := make([]InboxUpdate, 2)
 	for i := range inbox {
 		id := fmt.Sprintf("%s-inbox-%d", prefix, i+1)
-		ciphertext, nonce, keyID, err := a6Seal(ctx, source, "inbox/v1", id, "endpoint", 1, []byte(fmt.Sprintf(`{"inbox":%d}`, i+1)))
-		if err != nil {
-			t.Fatal(err)
-		}
 		inbox[i] = InboxUpdate{
 			InboxID: id, EndpointID: "endpoint", ProviderEventKey: fmt.Sprintf("%s-provider-%d", prefix, i+1),
-			LaneHMAC: []byte(prefix + "-lane"), Status: InboxStatusPending,
-			PayloadCiphertext: ciphertext, PayloadNonce: nonce, PayloadEncryptionKeyID: keyID,
+			Lane: prefix + "-lane", Status: InboxStatusPending, Payload: []byte(fmt.Sprintf(`{"inbox":%d}`, i+1)),
 		}
 	}
 	effects := make([]NewEffect, 2)
 	for i := range effects {
 		id := fmt.Sprintf("%s-effect-%d", prefix, i+1)
-		ciphertext, nonce, keyID, err := a6Seal(ctx, source, "outbox/v1", id, "endpoint", 1, []byte(fmt.Sprintf(`{"effect":%d}`, i+1)))
-		if err != nil {
-			t.Fatal(err)
-		}
 		effects[i] = NewEffect{
-			EffectID: id, EndpointID: "endpoint", LaneHMAC: []byte(prefix + "-lane"), EffectType: "send",
-			RiskClass: RiskPreDispatchRetryable, Status: OutboxStatusPending,
-			PayloadCiphertext: ciphertext, PayloadNonce: nonce, PayloadEncryptionKeyID: keyID,
+			EffectID: id, EndpointID: "endpoint", Lane: prefix + "-lane", EffectType: "send",
+			RiskClass: RiskPreDispatchRetryable, Status: OutboxStatusPending, Payload: []byte(fmt.Sprintf(`{"effect":%d}`, i+1)),
 		}
 	}
 	return inbox[0], inbox[1], effects[0], effects[1]
@@ -152,14 +132,14 @@ func assertTransactionRollback(t testing.TB, db *Database, stream StreamID, oper
 
 func TestSQLiteEndToEndTransactionPath(t *testing.T) {
 	ctx := context.Background()
-	source := newTransactionTestKeySource()
-	store, db := openTransactionTestStore(t, source, "task7-e2e")
+
+	store, db := openTransactionTestStore(t, "task7-e2e")
 	defer db.Close()
 	if err := store.RegisterProjection(transactionTestProjection()); err != nil {
 		t.Fatal(err)
 	}
 
-	inbox1, inbox2, effect1, effect2 := transactionTestQueuePayloads(t, source, ctx, "task7")
+	inbox1, inbox2, effect1, effect2 := transactionTestQueuePayloads(t, "task7")
 	stream := StreamID{AggregateType: "counter", AggregateID: "counter-1"}
 	commit, err := store.Commit(ctx, UnitOfWork{
 		Streams:    []StreamAppend{{Stream: stream, Events: []NewEvent{transactionTestEvent("task7-counter", 1)}}},
@@ -267,7 +247,7 @@ func TestSQLiteEndToEndTransactionPath(t *testing.T) {
 		t.Fatalf("terminal inbox rows = %d", len(inboxRows))
 	}
 	for _, row := range inboxRows {
-		if row.Status != InboxStatusConfirmedConsumed || len(row.PayloadCiphertext) != 0 || len(row.PayloadNonce) != 0 {
+		if row.Status != InboxStatusConfirmedConsumed || len(row.Payload) == 0 {
 			t.Fatalf("terminal inbox payload = %#v", row)
 		}
 	}
@@ -279,7 +259,7 @@ func TestSQLiteEndToEndTransactionPath(t *testing.T) {
 		t.Fatalf("terminal outbox rows = %d", len(outboxRows))
 	}
 	for _, row := range outboxRows {
-		if row.Status != OutboxStatusSucceeded || len(row.PayloadCiphertext) != 0 || len(row.PayloadNonce) != 0 {
+		if row.Status != OutboxStatusSucceeded || len(row.Payload) == 0 {
 			t.Fatalf("terminal outbox payload = %#v", row)
 		}
 	}
@@ -316,11 +296,11 @@ func TestSQLiteEndToEndTransactionPath(t *testing.T) {
 	if err != nil || rebuilt.ProjectionGeneration != rebuild.GenerationID || string(rebuilt.Payload) != `{"delta":1}` {
 		t.Fatalf("published projection = %#v err=%v", rebuilt, err)
 	}
-	if err := store.ValidateReadiness(ctx); err != nil {
+	if _, err := store.GetReadiness(ctx); err != nil {
 		t.Fatalf("readiness validation = %v", err)
 	}
 	readiness, err := store.GetReadiness(ctx)
-	if err != nil || readiness.Mode != "fresh" || readiness.IndexRootID != source.IndexID {
+	if err != nil || readiness.Mode != "fresh" {
 		t.Fatalf("readiness = %#v err=%v", readiness, err)
 	}
 
@@ -328,14 +308,14 @@ func TestSQLiteEndToEndTransactionPath(t *testing.T) {
 	if err := db.GORM().Where("artifact_id = ?", artifact.ArtifactID).First(&scrubbed).Error; err != nil {
 		t.Fatal(err)
 	}
-	if len(scrubbed.Ciphertext) != 0 || len(scrubbed.Nonce) != 0 {
-		t.Fatal("consumed artifact ciphertext was not scrubbed")
+	if string(scrubbed.Data) != `{"counter":1}` {
+		t.Fatal("consumed artifact payload was not retained")
 	}
 }
 
 func TestSQLiteConflictRollsBackWholeTransaction(t *testing.T) {
 	ctx := context.Background()
-	store, db := openTransactionTestStore(t, newTransactionTestKeySource(), "task7-conflict")
+	store, db := openTransactionTestStore(t, "task7-conflict")
 	defer db.Close()
 	stream := StreamID{AggregateType: "counter", AggregateID: "rollback-counter"}
 	if _, err := store.Commit(ctx, UnitOfWork{Streams: []StreamAppend{{Stream: stream, Events: []NewEvent{transactionTestEvent("task7-rollback-first", 1)}}}}); err != nil {
@@ -362,8 +342,8 @@ func TestSQLiteConflictRollsBackWholeTransaction(t *testing.T) {
 
 func TestSQLiteLateProjectorRollback(t *testing.T) {
 	ctx := context.Background()
-	source := newTransactionTestKeySource()
-	db, err := OpenDatabase(ctx, DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "task7-late-failure.db"), KeySource: source, DatabaseIdentity: "task7-sqlite"})
+
+	db, err := OpenDatabase(ctx, DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "task7-late-failure.db"), DatabaseIdentity: "task7-sqlite"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,9 +387,9 @@ func TestRemoteTransactionRollbackOptIn(t *testing.T) {
 			if dsn == "" {
 				t.Skipf("%s is unset; opt-in %s transaction test skipped", tc.env, tc.typeName)
 			}
-			source := newTransactionTestKeySource()
+
 			db, err := OpenDatabase(context.Background(), DatabaseConfig{
-				Type: tc.typeName, DSN: dsn, KeySource: source,
+				Type: tc.typeName, DSN: dsn,
 				DatabaseIdentity: "task7-remote-" + tc.name, TLSVerify: true,
 				ConnectTimeout: 5 * time.Second, QueryTimeout: 5 * time.Second,
 			})
@@ -454,8 +434,8 @@ func sqliteTransactionDatabaseSize(path string) int64 {
 	return size
 }
 
-func benchmarkSQLiteTransactionPath(b *testing.B, store *GORMStore, source *MemoryKeySource, ctx context.Context, prefix string) {
-	inbox1, inbox2, effect1, effect2 := transactionTestQueuePayloads(b, source, ctx, prefix)
+func benchmarkSQLiteTransactionPath(b *testing.B, store *GORMStore, ctx context.Context, prefix string) {
+	inbox1, inbox2, effect1, effect2 := transactionTestQueuePayloads(b, prefix)
 	stream := StreamID{AggregateType: "counter", AggregateID: prefix}
 	if _, err := store.Commit(ctx, UnitOfWork{
 		Streams:    []StreamAppend{{Stream: stream, Events: []NewEvent{transactionTestEvent(prefix, 1)}}},
@@ -529,14 +509,14 @@ func benchmarkSQLiteTransactionPath(b *testing.B, store *GORMStore, source *Memo
 	if _, err := store.Rebuild(ctx, RebuildRequest{ProjectorVersion: "v1"}); err != nil {
 		b.Fatal(err)
 	}
-	if err := store.ValidateReadiness(ctx); err != nil {
+	if _, err := store.GetReadiness(ctx); err != nil {
 		b.Fatal(err)
 	}
 }
 
 func BenchmarkSQLiteTransactionPath(b *testing.B) {
 	ctx := context.Background()
-	source := newTransactionTestKeySource()
+
 	payloadBytes := int64(len(`{"delta":1}`) + len(`{"counter":1}`))
 	b.SetBytes(payloadBytes)
 	b.ResetTimer()
@@ -546,7 +526,7 @@ func BenchmarkSQLiteTransactionPath(b *testing.B) {
 	for i := range b.N {
 		b.StopTimer()
 		dbPath := filepath.Join(b.TempDir(), fmt.Sprintf("task7-benchmark-%d.db", i))
-		db, err := OpenDatabase(ctx, DatabaseConfig{Type: "sqlite", DSN: dbPath, KeySource: source, DatabaseIdentity: "task7-benchmark"})
+		db, err := OpenDatabase(ctx, DatabaseConfig{Type: "sqlite", DSN: dbPath, DatabaseIdentity: "task7-benchmark"})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -561,7 +541,7 @@ func BenchmarkSQLiteTransactionPath(b *testing.B) {
 		startSize := sqliteTransactionDatabaseSize(dbPath)
 		b.StartTimer()
 		started := time.Now()
-		benchmarkSQLiteTransactionPath(b, store, source, ctx, fmt.Sprintf("bench-%d", i))
+		benchmarkSQLiteTransactionPath(b, store, ctx, fmt.Sprintf("bench-%d", i))
 		elapsed += time.Since(started)
 		if _, err := db.SQLDB().ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
 			b.Fatal(err)

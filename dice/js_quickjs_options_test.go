@@ -68,13 +68,14 @@ func TestBuildRuntimeOptionsForEngineGenericQuickJSOverridesLegacy(t *testing.T)
 
 func TestRuntimeOptionsForEngineWarnsWhenGenericQuickJSOverridesLegacy(t *testing.T) {
 	core, logs := observer.New(zap.WarnLevel)
-	dice := &Dice{
-		Config: Config{JsConfig: JsConfig{
-			JsRuntimeOptions:      map[string]json.RawMessage{"quickjs": json.RawMessage(`{"ownedBy":"provider"}`)},
-			QuickJSMemoryLimitMiB: 256,
-		}},
-		Logger: zap.New(core).Sugar(),
-	}
+	dice, _ := newCanonicalTestDice(t)
+	updateCanonicalTestConfig(t, dice, func(config *Config) {
+		config.JsRuntimeOptions = map[string]json.RawMessage{
+			"quickjs": json.RawMessage(`{"ownedBy":"provider"}`),
+		}
+		config.QuickJSMemoryLimitMiB = 256
+	})
+	dice.Logger = zap.New(core).Sugar()
 	if _, err := dice.runtimeOptionsForEngine(" QuickJS "); err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +192,8 @@ func TestBuildQuickJSRuntimeOptionsRejectsPolicyByteOverflow(t *testing.T) {
 }
 
 func TestDiceQuickJSRuntimeOptionsUsesEngineNeutralContract(t *testing.T) {
-	dice := &Dice{Config: Config{JsConfig: JsConfig{QuickJSMemoryLimitMiB: 2}}}
+	dice, _ := newCanonicalTestDice(t)
+	updateCanonicalTestConfig(t, dice, func(config *Config) { config.QuickJSMemoryLimitMiB = 2 })
 	options, err := dice.quickJSRuntimeOptions()
 	if err != nil {
 		t.Fatal(err)

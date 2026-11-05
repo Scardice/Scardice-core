@@ -35,14 +35,11 @@ type ProjectionRow struct {
 	UpdatedAt time.Time
 }
 
-// ProjectionSnapshot identifies one published logical projection state.
-// Generation changes on rebuild publication, TerminalPosition changes on
-// live projection writes, and HistoryRevision changes on privacy deletion.
-// A paged reader must carry the complete value into every subsequent page.
+// ProjectionSnapshot identifies one published generation and terminal position.
+// A paged reader carries the complete value forward.
 type ProjectionSnapshot struct {
 	Generation       string
 	TerminalPosition uint64
-	HistoryRevision  uint64
 }
 
 // ProjectionPageRequest selects an optional row-key prefix or half-open
@@ -100,8 +97,6 @@ func withProjectionGeneration(tx *gorm.DB, generation string) *gorm.DB {
 	return tx.Set(projectionGenerationKey, generation).Session(&gorm.Session{})
 }
 
-func CurrentProjectionGeneration(tx *gorm.DB) string { return ProjectionGeneration(tx) }
-
 // UpsertProjectionRow writes to the generation selected by the surrounding
 // live or rebuild transaction. Projectors should use this helper rather than
 // choosing a generation themselves.
@@ -115,29 +110,13 @@ func UpsertProjectionRow(tx *gorm.DB, projectionName, rowKey string, payload []b
 		ProjectionName:       projectionName,
 		RowKey:               rowKey,
 		Payload:              copyProjectionBytes(payload),
-		PayloadPresent:       payload != nil,
 		UpdatedAt:            time.Now().UTC(),
 	}
 	return tx.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "projection_generation"}, {Name: "projection_name"}, {Name: "row_key"}},
-		DoUpdates: clause.AssignmentColumns([]string{"payload", "payload_present", "updated_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"payload", "updated_at"}),
 	}).Create(&row).Error
 }
-
-func PutProjectionRow(tx *gorm.DB, projectionName, rowKey string, payload []byte) error {
-	return UpsertProjectionRow(tx, projectionName, rowKey, payload)
-}
-
-func stableProjectors(projectors []ProjectionDescriptor) []ProjectionDescriptor {
-	stable := make([]ProjectionDescriptor, 0, len(projectors))
-	for _, projector := range projectors {
-		if !projector.Legacy {
-			stable = append(stable, projector)
-		}
-	}
-	return stable
-}
-
 func projectorSetVersion(projectors []ProjectionDescriptor) string {
 	ordered := append([]ProjectionDescriptor(nil), projectors...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Name < ordered[j].Name })
@@ -164,7 +143,7 @@ func sameProjectors(a, b []ProjectionDescriptor) bool {
 		return false
 	}
 	for i := range a {
-		if a[i].Name != b[i].Name || a[i].Version != b[i].Version || a[i].Legacy != b[i].Legacy {
+		if a[i].Name != b[i].Name || a[i].Version != b[i].Version {
 			return false
 		}
 	}
@@ -177,11 +156,6 @@ func (s *GORMStore) projectorSnapshot() ([]ProjectionDescriptor, string, error) 
 	}
 	s.projectorMu.RLock()
 	defer s.projectorMu.RUnlock()
-	for _, projector := range s.projectors {
-		if projector.Legacy {
-			return nil, "", ErrLegacyProjector
-		}
-	}
 	projectors := append([]ProjectionDescriptor(nil), s.projectors...)
 	if len(projectors) == 0 {
 		return nil, "", ErrInvalidProjector
@@ -309,14 +283,14 @@ func validateProjectionPage(db *gorm.DB, rows []domainEventRow, cursor, highWate
 }
 
 func validateProjectionGap(db *gorm.DB, after, through uint64) error {
-	if through <= after {
-		return nil
+	if through < after {
+		return ErrProjectionInvariant
 	}
-	var count int64
-	if err := db.Model(&eventTombstoneRow{}).Where("global_position > ? AND global_position <= ?", after, through).Count(&count).Error; err != nil {
+	var invalidCount int64
+	if err := db.Model(&domainEventRow{}).Where("global_position = 0").Count(&invalidCount).Error; err != nil {
 		return ErrParticipantFailure
 	}
-	if count < 0 || uint64(count) != through-after {
+	if invalidCount != 0 {
 		return ErrProjectionInvariant
 	}
 	return nil
@@ -416,9 +390,7 @@ func validateProjectionSource(tx *gorm.DB, source *projectionControlRow) error {
 	if err := tx.Where("singleton_id = ?", "default").First(&current).Error; err != nil {
 		return ErrParticipantFailure
 	}
-	// Publication can remove an in-flight shadow generation even when no
-	// additional events were erased. Fence both changes, not just the high-water mark.
-	if current.ActiveGeneration != source.ActiveGeneration || current.HistoryRevision != source.HistoryRevision {
+	if current.ActiveGeneration != source.ActiveGeneration {
 		return ErrParticipantConflict
 	}
 	return nil
@@ -444,8 +416,7 @@ func (s *GORMStore) publishProjection(ctx context.Context, generation string, so
 	if err := locked(tx).Where("singleton_id = ?", "default").First(&control).Error; err != nil {
 		return RebuildResult{}, errors.New("eventstore: lock projection control failed")
 	}
-	s.observeLock(tableProjectionControl)
-	if control.ActiveGeneration != source.ActiveGeneration || control.HistoryRevision != source.HistoryRevision {
+	if control.ActiveGeneration != source.ActiveGeneration {
 		return RebuildResult{}, ErrParticipantConflict
 	}
 	var sequence eventGlobalSequenceRow
@@ -489,12 +460,7 @@ func (s *GORMStore) publishProjection(ctx context.Context, generation string, so
 	}
 	s.projectorMu.RLock()
 	defer s.projectorMu.RUnlock()
-	currentAll := append([]ProjectionDescriptor(nil), s.projectors...)
-	if !sameProjectors(currentAll, projectors) {
-		return RebuildResult{}, ErrProjectorRegistryChanged
-	}
-	current := stableProjectors(currentAll)
-	if setVersion != projectorSetVersion(current) {
+	if !sameProjectors(s.projectors, projectors) {
 		return RebuildResult{}, ErrProjectorRegistryChanged
 	}
 	if err := validateProjectionRows(tx, generation); err != nil {
@@ -512,19 +478,6 @@ func (s *GORMStore) publishProjection(ctx context.Context, generation string, so
 		"updated_at":            time.Now().UTC(),
 	}).Error; err != nil {
 		return RebuildResult{}, errors.New("eventstore: publish projection generation failed")
-	}
-	if readiness.Mode == "import" {
-		if err := tx.Model(&storeReadinessRow{}).Where("singleton_id = ?", "default").Updates(map[string]any{
-			"terminal_global_position":     latest,
-			"terminal_projection_position": cursor,
-		}).Error; err != nil {
-			return RebuildResult{}, errors.New("eventstore: publish readiness terminal failed")
-		}
-	}
-	if s.keySource != nil {
-		if err := s.validateReadinessOnDB(ctx, tx, false); err != nil {
-			return RebuildResult{}, err
-		}
 	}
 	if err := tx.Commit().Error; err != nil {
 		return RebuildResult{}, errors.New("eventstore: commit projection publication failed")
@@ -575,7 +528,7 @@ func digestProjectionRows(tx *gorm.DB, generation string) (EventChecksum, error)
 }
 
 func (s *GORMStore) DigestProjection(ctx context.Context, generation string) (EventChecksum, error) {
-	if s == nil || s.db == nil || s.db.GORM() == nil {
+	if s == nil || s.db == nil || s.db.ReadGORM() == nil {
 		return EventChecksum{}, errors.New("eventstore: store unavailable")
 	}
 	if err := s.requireReady(ctx); err != nil {
@@ -584,61 +537,154 @@ func (s *GORMStore) DigestProjection(ctx context.Context, generation string) (Ev
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	digest, err := digestProjectionRows(s.db.GORM().WithContext(ctx), generation)
-	if err != nil {
-		return EventChecksum{}, errors.New("eventstore: compute projection digest failed")
+	var digest EventChecksum
+	if err := s.db.ReadSnapshot(ctx, func(tx *gorm.DB) error {
+		var err error
+		digest, err = digestProjectionRows(tx, generation)
+		return err
+	}); err != nil {
+		return EventChecksum{}, projectionReadResultError("eventstore: compute projection digest failed", err)
 	}
 	return digest, nil
 }
 
-func (s *GORMStore) ReadProjectionRow(ctx context.Context, projectionName, rowKey string) (ProjectionRow, error) {
-	if s == nil || s.db == nil || s.db.GORM() == nil {
-		return ProjectionRow{}, errors.New("eventstore: store unavailable")
+// ProjectionStamp identifies the published generation and stream version from
+// which a stream's projection row was derived.
+type ProjectionStamp struct {
+	Generation    string
+	StreamVersion uint64
+}
+
+func readStreamStamp(tx *gorm.DB, control projectionControlRow, stream StreamID) (ProjectionStamp, error) {
+	var head aggregateHeadRow
+	queryErr := tx.Select("current_version").
+		Where("aggregate_type = ? AND aggregate_id = ?", stream.AggregateType, stream.AggregateID).
+		Take(&head).Error
+	if queryErr != nil && !errors.Is(queryErr, gorm.ErrRecordNotFound) {
+		return ProjectionStamp{}, ErrParticipantFailure
+	}
+	return ProjectionStamp{Generation: control.ActiveGeneration, StreamVersion: head.CurrentVersion}, nil
+}
+
+// ReadProjectionStamp returns the current stamp of stream without reading any
+// projection payload. It is the cheap validity check for a cached row.
+func (s *GORMStore) ReadProjectionStamp(ctx context.Context, stream StreamID) (ProjectionStamp, error) {
+	if s == nil || s.db == nil || s.db.ReadGORM() == nil {
+		return ProjectionStamp{}, errors.New("eventstore: store unavailable")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := s.requireReady(ctx); err != nil {
-		return ProjectionRow{}, err
+		return ProjectionStamp{}, err
 	}
-	tx := s.db.GORM().WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return ProjectionRow{}, errors.New("eventstore: begin projection read failed")
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback().Error
+	var stamp ProjectionStamp
+	err := s.db.ReadSnapshot(ctx, func(tx *gorm.DB) error {
+		control, err := readPublishedProjectionControl(tx)
+		if err != nil {
+			return err
 		}
-	}()
-	if err := s.lockMutationPublication(ctx, tx); err != nil {
-		return ProjectionRow{}, err
+		stamp, err = readStreamStamp(tx, control, stream)
+		return err
+	})
+	if err != nil {
+		return ProjectionStamp{}, projectionReadResultError("eventstore: projection stamp read failed", err)
 	}
-	var control projectionControlRow
-	if err := locked(tx).Where("singleton_id = ?", "default").First(&control).Error; err != nil {
-		return ProjectionRow{}, ErrParticipantFailure
+	return stamp, nil
+}
+
+func (s *GORMStore) ReadProjectionRow(ctx context.Context, projectionName, rowKey string) (ProjectionRow, error) {
+	row, _, err := s.readProjectionRow(ctx, projectionName, rowKey, nil)
+	return row, err
+}
+
+// ReadProjectionRowStamped returns a projection row together with the stamp of
+// stream, both read in one snapshot so the stamp describes exactly the payload
+// returned.
+func (s *GORMStore) ReadProjectionRowStamped(ctx context.Context, projectionName, rowKey string, stream StreamID) (ProjectionRow, ProjectionStamp, error) {
+	return s.readProjectionRow(ctx, projectionName, rowKey, &stream)
+}
+
+func (s *GORMStore) readProjectionRow(ctx context.Context, projectionName, rowKey string, stream *StreamID) (ProjectionRow, ProjectionStamp, error) {
+	if s == nil || s.db == nil || s.db.ReadGORM() == nil {
+		return ProjectionRow{}, ProjectionStamp{}, errors.New("eventstore: store unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := s.requireReady(ctx); err != nil {
+		return ProjectionRow{}, ProjectionStamp{}, err
 	}
 	var row projectionReadModelRow
-	queryErr := locked(tx).Where("projection_generation = ? AND projection_name = ? AND row_key = ?", control.ActiveGeneration, projectionName, rowKey).First(&row).Error
-	if errors.Is(queryErr, gorm.ErrRecordNotFound) {
-		return ProjectionRow{}, ErrNotFound
+	var stamp ProjectionStamp
+	err := s.db.ReadSnapshot(ctx, func(tx *gorm.DB) error {
+		control, err := readPublishedProjectionControl(tx)
+		if err != nil {
+			return err
+		}
+		queryErr := tx.Where(
+			"projection_generation = ? AND projection_name = ? AND row_key = ?",
+			control.ActiveGeneration,
+			projectionName,
+			rowKey,
+		).First(&row).Error
+		if errors.Is(queryErr, gorm.ErrRecordNotFound) {
+			return ErrNotFound
+		}
+		if queryErr != nil {
+			return ErrParticipantFailure
+		}
+		if stream != nil {
+			stamp, err = readStreamStamp(tx, control, *stream)
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return ProjectionRow{}, ProjectionStamp{}, projectionReadResultError("eventstore: projection read failed", err)
 	}
-	if queryErr != nil {
-		return ProjectionRow{}, ErrParticipantFailure
-	}
-	if err := tx.Commit().Error; err != nil {
-		return ProjectionRow{}, errors.New("eventstore: commit projection read failed")
-	}
-	committed = true
-	return ProjectionRow{ProjectionGeneration: row.ProjectionGeneration, ProjectionName: row.ProjectionName, RowKey: row.RowKey, Payload: projectionPayload(row), UpdatedAt: row.UpdatedAt}, nil
+	return ProjectionRow{ProjectionGeneration: row.ProjectionGeneration, ProjectionName: row.ProjectionName, RowKey: row.RowKey, Payload: projectionPayload(row), UpdatedAt: row.UpdatedAt}, stamp, nil
 }
 
 func projectionSnapshot(control projectionControlRow) ProjectionSnapshot {
-	return ProjectionSnapshot{
-		Generation:       control.ActiveGeneration,
-		TerminalPosition: control.TerminalPosition,
-		HistoryRevision:  control.HistoryRevision,
+	return ProjectionSnapshot{Generation: control.ActiveGeneration, TerminalPosition: control.TerminalPosition}
+}
+
+func readPublishedProjectionControl(tx *gorm.DB) (projectionControlRow, error) {
+	if tx == nil {
+		return projectionControlRow{}, ErrParticipantFailure
 	}
+	var readiness struct {
+		SingletonID string `gorm:"column:singleton_id"`
+	}
+	if err := tx.Model(&storeReadinessRow{}).
+		Select("singleton_id").
+		Where("singleton_id = ?", "default").
+		First(&readiness).Error; err != nil {
+		return projectionControlRow{}, ErrParticipantFailure
+	}
+	var control projectionControlRow
+	if err := tx.Where("singleton_id = ?", "default").First(&control).Error; err != nil {
+		return projectionControlRow{}, ErrParticipantFailure
+	}
+	if control.PublicationState != "published" {
+		return projectionControlRow{}, ErrReadinessQuarantined
+	}
+	return control, nil
+}
+
+func projectionReadResultError(message string, err error) error {
+	if errors.Is(err, ErrNotFound) ||
+		errors.Is(err, ErrParticipantConflict) ||
+		errors.Is(err, ErrParticipantFailure) ||
+		errors.Is(err, ErrProjectionInvariant) ||
+		errors.Is(err, ErrReadinessInvalid) ||
+		errors.Is(err, ErrReadinessQuarantined) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return errors.New(message)
 }
 
 func validateProjectionPageRequest(request ProjectionPageRequest) error {
@@ -658,13 +704,13 @@ func validateProjectionPageRequest(request ProjectionPageRequest) error {
 }
 
 func projectionPageQuery(db *gorm.DB, snapshot ProjectionSnapshot, request ProjectionPageRequest) *gorm.DB {
-	query := locked(db).Where(
+	query := db.Where(
 		"projection_generation = ? AND projection_name = ?",
 		snapshot.Generation,
 		request.ProjectionName,
 	)
 	if request.RowKeyPrefix != "" {
-		query = query.Where("row_key LIKE ? ESCAPE ?", privacyLikePrefix(request.RowKeyPrefix), `\`)
+		query = query.Where("row_key LIKE ? ESCAPE '!'", privacyLikePrefix(request.RowKeyPrefix))
 	}
 	if request.RowKeyStart != "" && (request.RowKeyPrefix == "" || db.Name() == "sqlite") {
 		query = query.Where("row_key >= ? AND row_key < ?", request.RowKeyStart, request.RowKeyEnd)
@@ -676,13 +722,13 @@ func projectionPageQuery(db *gorm.DB, snapshot ProjectionSnapshot, request Proje
 }
 
 // ListProjectionRowsPage reads one bounded keyset page from a published
-// projection snapshot. The transaction and publication lock are released
-// before the page is returned, so callers may safely open another transaction
+// projection snapshot. The short read transaction is released before the page
+// is returned, so callers may safely open another transaction
 // while processing it. Every later page must supply the returned Snapshot;
 // generation, live terminal, or privacy revision changes fail closed with
 // ErrParticipantConflict instead of mixing logical snapshots.
 func (s *GORMStore) ListProjectionRowsPage(ctx context.Context, request ProjectionPageRequest) (ProjectionPage, error) {
-	if s == nil || s.db == nil || s.db.GORM() == nil {
+	if s == nil || s.db == nil || s.db.ReadGORM() == nil {
 		return ProjectionPage{}, errors.New("eventstore: store unavailable")
 	}
 	if err := validateProjectionPageRequest(request); err != nil {
@@ -694,47 +740,38 @@ func (s *GORMStore) ListProjectionRowsPage(ctx context.Context, request Projecti
 	if err := s.requireReady(ctx); err != nil {
 		return ProjectionPage{}, err
 	}
-	tx := s.db.GORM().WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return ProjectionPage{}, errors.New("eventstore: begin projection page read failed")
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback().Error
-		}
-	}()
-	if err := s.lockMutationPublication(ctx, tx); err != nil {
-		return ProjectionPage{}, err
-	}
-	var control projectionControlRow
-	if err := locked(tx).Where("singleton_id = ?", "default").First(&control).Error; err != nil {
-		return ProjectionPage{}, ErrParticipantFailure
-	}
-	snapshot := projectionSnapshot(control)
-	if snapshot.Generation == "" {
-		return ProjectionPage{}, ErrProjectionInvariant
-	}
-	if request.ExpectedSnapshot != nil && snapshot != *request.ExpectedSnapshot {
-		return ProjectionPage{}, ErrParticipantConflict
-	}
 
-	query := projectionPageQuery(tx, snapshot, request)
-	var rows []projectionReadModelRow
-	if err := query.Find(&rows).Error; err != nil {
-		return ProjectionPage{}, ErrParticipantFailure
-	}
-	for _, row := range rows {
-		if row.ProjectionGeneration != snapshot.Generation ||
-			row.ProjectionName != request.ProjectionName ||
-			row.RowKey == "" {
-			return ProjectionPage{}, ErrProjectionInvariant
+	var (
+		snapshot ProjectionSnapshot
+		rows     []projectionReadModelRow
+	)
+	err := s.db.ReadSnapshot(ctx, func(tx *gorm.DB) error {
+		control, err := readPublishedProjectionControl(tx)
+		if err != nil {
+			return err
 		}
+		snapshot = projectionSnapshot(control)
+		if snapshot.Generation == "" {
+			return ErrProjectionInvariant
+		}
+		if request.ExpectedSnapshot != nil && snapshot != *request.ExpectedSnapshot {
+			return ErrParticipantConflict
+		}
+		if err := projectionPageQuery(tx, snapshot, request).Find(&rows).Error; err != nil {
+			return ErrParticipantFailure
+		}
+		for _, row := range rows {
+			if row.ProjectionGeneration != snapshot.Generation ||
+				row.ProjectionName != request.ProjectionName ||
+				row.RowKey == "" {
+				return ErrProjectionInvariant
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return ProjectionPage{}, projectionReadResultError("eventstore: projection page read failed", err)
 	}
-	if err := tx.Commit().Error; err != nil {
-		return ProjectionPage{}, errors.New("eventstore: commit projection page read failed")
-	}
-	committed = true
 
 	result := ProjectionPage{
 		Snapshot:   snapshot,
@@ -789,7 +826,7 @@ func (s *GORMStore) ListProjectionRowsByRowKeyFragments(ctx context.Context, pro
 }
 
 func (s *GORMStore) listProjectionRows(ctx context.Context, projectionName string, keyFragments []string, rowKeyPrefix string) ([]ProjectionRow, error) {
-	if s == nil || s.db == nil || s.db.GORM() == nil {
+	if s == nil || s.db == nil || s.db.ReadGORM() == nil {
 		return nil, errors.New("eventstore: store unavailable")
 	}
 	if strings.TrimSpace(projectionName) == "" {
@@ -801,44 +838,33 @@ func (s *GORMStore) listProjectionRows(ctx context.Context, projectionName strin
 	if err := s.requireReady(ctx); err != nil {
 		return nil, err
 	}
-	tx := s.db.GORM().WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return nil, errors.New("eventstore: begin projection read failed")
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback().Error
-		}
-	}()
-	if err := s.lockMutationPublication(ctx, tx); err != nil {
-		return nil, err
-	}
-	var control projectionControlRow
-	if err := locked(tx).Where("singleton_id = ?", "default").First(&control).Error; err != nil {
-		return nil, ErrParticipantFailure
-	}
-	query := locked(tx).Where("projection_generation = ? AND projection_name = ?", control.ActiveGeneration, projectionName)
-	if rowKeyPrefix != "" {
-		query = query.Where("row_key LIKE ? ESCAPE ?", privacyLikePrefix(rowKeyPrefix), `\`)
-	}
-	if keyFragments != nil {
-		clauses := make([]string, len(keyFragments))
-		args := make([]any, len(keyFragments))
-		for i, fragment := range keyFragments {
-			clauses[i] = "row_key LIKE ? ESCAPE '\\'"
-			args[i] = "%" + privacyLikePrefix(fragment)
-		}
-		query = query.Where("("+strings.Join(clauses, " OR ")+")", args...)
-	}
 	var rows []projectionReadModelRow
-	if err := query.Order("row_key ASC").Find(&rows).Error; err != nil {
-		return nil, ErrParticipantFailure
+	err := s.db.ReadSnapshot(ctx, func(tx *gorm.DB) error {
+		control, err := readPublishedProjectionControl(tx)
+		if err != nil {
+			return err
+		}
+		query := tx.Where("projection_generation = ? AND projection_name = ?", control.ActiveGeneration, projectionName)
+		if rowKeyPrefix != "" {
+			query = query.Where("row_key LIKE ? ESCAPE '!'", privacyLikePrefix(rowKeyPrefix))
+		}
+		if keyFragments != nil {
+			clauses := make([]string, len(keyFragments))
+			args := make([]any, len(keyFragments))
+			for i, fragment := range keyFragments {
+				clauses[i] = "row_key LIKE ? ESCAPE '!'"
+				args[i] = "%" + privacyLikePrefix(fragment)
+			}
+			query = query.Where("("+strings.Join(clauses, " OR ")+")", args...)
+		}
+		if err := query.Order("row_key ASC").Find(&rows).Error; err != nil {
+			return ErrParticipantFailure
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, projectionReadResultError("eventstore: projection read failed", err)
 	}
-	if err := tx.Commit().Error; err != nil {
-		return nil, errors.New("eventstore: commit projection read failed")
-	}
-	committed = true
 	result := make([]ProjectionRow, 0, len(rows))
 	for _, row := range rows {
 		result = append(result, ProjectionRow{ProjectionGeneration: row.ProjectionGeneration, ProjectionName: row.ProjectionName, RowKey: row.RowKey, Payload: projectionPayload(row), UpdatedAt: row.UpdatedAt})
@@ -850,7 +876,7 @@ func (s *GORMStore) listProjectionRows(ctx context.Context, projectionName strin
 // aggregate type. Callers can compare projection rows with the durable stream
 // set before accepting a startup snapshot.
 func (s *GORMStore) ListStreamHeads(ctx context.Context, aggregateType string) ([]StreamHead, error) {
-	if s == nil || s.db == nil || s.db.GORM() == nil {
+	if s == nil || s.db == nil || s.db.ReadGORM() == nil {
 		return nil, errors.New("eventstore: store unavailable")
 	}
 	if strings.TrimSpace(aggregateType) == "" {
@@ -867,13 +893,19 @@ func (s *GORMStore) ListStreamHeads(ctx context.Context, aggregateType string) (
 		Version     uint64
 	}
 	var rows []headRow
-	if err := s.db.GORM().WithContext(ctx).Model(&domainEventRow{}).
-		Select("aggregate_id, MAX(aggregate_version) AS version").
-		Where("aggregate_type = ?", aggregateType).
-		Group("aggregate_id").
-		Order("aggregate_id ASC").
-		Scan(&rows).Error; err != nil {
-		return nil, errors.New("eventstore: list stream heads failed")
+	err := s.db.ReadSnapshot(ctx, func(tx *gorm.DB) error {
+		if err := tx.Model(&domainEventRow{}).
+			Select("aggregate_id, MAX(aggregate_version) AS version").
+			Where("aggregate_type = ?", aggregateType).
+			Group("aggregate_id").
+			Order("aggregate_id ASC").
+			Scan(&rows).Error; err != nil {
+			return errors.New("eventstore: list stream heads failed")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, projectionReadResultError("eventstore: list stream heads failed", err)
 	}
 	heads := make([]StreamHead, 0, len(rows))
 	for _, row := range rows {
@@ -886,9 +918,6 @@ func (s *GORMStore) ListStreamHeads(ctx context.Context, aggregateType string) (
 }
 
 func projectionPayload(row projectionReadModelRow) []byte {
-	if !row.PayloadPresent {
-		return nil
-	}
 	if row.Payload == nil {
 		return []byte{}
 	}

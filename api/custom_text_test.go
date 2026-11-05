@@ -11,12 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	gormsqlite "github.com/glebarez/sqlite"
 	"github.com/labstack/echo/v4"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
-	"gorm.io/gorm"
-	gormlogger "gorm.io/gorm/logger"
 
 	"Scardice-core/dice"
 )
@@ -80,57 +77,41 @@ func TestCustomTextSavePreservesUnchangedSiblingWhitespace(t *testing.T) {
 	const token = "custom-text-session"
 	const category = "DND"
 
+	_, manager, testDice, _ := newDiceConfigDurableHandlerTest(t)
 	dataDir := t.TempDir()
-	testDice := &dice.Dice{
-		BaseConfig: dice.BaseConfig{DataDir: dataDir},
-		Logger:     zap.NewNop().Sugar(),
-		TextMapRaw: dice.TextTemplateWithWeightDict{
-			category: {
-				"unchanged": {{"original text\n", 1}},
-				"edited":    {{"before edit", 1}},
-			},
-		},
-		TextMapHelpInfo: dice.TextTemplateWithHelpDict{
-			category: {
-				"unchanged": {},
-				"edited":    {},
-			},
+	testDice.BaseConfig.DataDir = dataDir
+	testDice.Logger = zap.NewNop().Sugar()
+	testDice.TextMapRaw = dice.TextTemplateWithWeightDict{
+		category: {
+			"unchanged": {{"original text\n", 1}},
+			"edited":    {{"before edit", 1}},
 		},
 	}
-
-	db, err := gorm.Open(gormsqlite.Open(filepath.Join(dataDir, "attrs.db")), &gorm.Config{
-		Logger: gormlogger.Default.LogMode(gormlogger.Silent),
+	testDice.TextMapHelpInfo = dice.TextTemplateWithHelpDict{
+		category: {
+			"unchanged": {},
+			"edited":    {},
+		},
+	}
+	updateAPITestConfig(t, testDice, func(config *dice.Config) {
+		config.DataDir = dataDir
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = sqlDB.Close() })
-	testDice.DBOperator = &uiAPIContractLogOperator{db: db}
-	testDice.Config = dice.NewConfig(testDice)
+
 	session := &dice.IMSession{
 		Parent:       testDice,
-		ServiceAtNew: new(dice.SyncMap[string, *dice.GroupInfo]),
+		PendingQuits: new(dice.SyncMap[string, *dice.PendingQuitInfo]),
 	}
 	endpoint := &dice.EndPointInfo{}
 	endpoint.Session = session
 	testDice.ImSession = session
 	testDice.UIEndpoint = endpoint
 	testDice.AttrsManager = &dice.AttrsManager{}
-	testDice.AttrsManager.Init(testDice)
+	if err := testDice.AttrsManager.InitDurable(testDice); err != nil {
+		t.Fatalf("initialize durable attributes: %v", err)
+	}
 	t.Cleanup(testDice.AttrsManager.Stop)
-	manager := &dice.DiceManager{Dice: []*dice.Dice{testDice}}
 	manager.AccessTokens.Store(token, true)
-	testDice.Parent = manager
-
-	previousDice, previousManager := myDice, dm
 	myDice, dm = testDice, manager
-	t.Cleanup(func() {
-		myDice, dm = previousDice, previousManager
-	})
 
 	e := echo.New()
 	Bind(e, manager)

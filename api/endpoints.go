@@ -2,8 +2,8 @@ package api
 
 import (
 	"context"
-	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -149,8 +149,6 @@ func adminHTTPError(c echo.Context, err error) error {
 		status, code, message = http.StatusForbidden, "origin_not_allowed", "request origin is not allowed"
 	case errors.Is(err, errAdminRateLimit):
 		status, code, message = http.StatusTooManyRequests, "rate_limited", "administrator rate limit exceeded"
-	case errors.Is(err, eventstore.ErrKeySourceUnavailable):
-		status, code, message = http.StatusServiceUnavailable, "admin_key_unavailable", "administrator request signing is unavailable"
 	case errors.Is(err, eventstore.ErrArtifactGone):
 		status, code, message = http.StatusGone, "artifact_gone", "artifact is expired or already consumed"
 	case errors.Is(err, eventstore.ErrArtifactOwner):
@@ -253,20 +251,7 @@ func newAdminMutation(c echo.Context, resource, action, bodyKey string, body any
 	if err != nil {
 		return adminMutation{}, fmt.Errorf("%w: request digest", endpoint.ErrInvalid)
 	}
-	service := endpointService()
-	if service == nil || service.Store == nil {
-		return adminMutation{}, eventstore.ErrKeySourceUnavailable
-	}
-	digestProvider, ok := service.Store.(interface {
-		KeyedDigestBytes(ctx context.Context, namespace string, value []byte) ([]byte, string, error)
-	})
-	if !ok {
-		return adminMutation{}, eventstore.ErrKeySourceUnavailable
-	}
-	digest, _, err := digestProvider.KeyedDigestBytes(c.Request().Context(), "admin-idempotency-digest/v1", encoded)
-	if err != nil {
-		return adminMutation{}, err
-	}
+	digest := eventstore.DigestBytes("admin-idempotency-digest/v1", encoded)
 	identity := config.principal + "\x00" + clientIP(c.Request()) + "\x00" + c.Request().Method + "\x00" + resource + "\x00" + action
 	scopeHash := sha256.Sum256([]byte(identity))
 	scope := "admin-v1-" + hex.EncodeToString(scopeHash[:16])
@@ -296,7 +281,7 @@ func existingAdminMutation(ctx context.Context, mutation adminMutation) (eventst
 	if err != nil {
 		return eventstore.OperationView{}, false, err
 	}
-	if !hmac.Equal(view.RequestDigest, mutation.requestDigest) {
+	if subtle.ConstantTimeCompare(view.RequestDigest, mutation.requestDigest) != 1 {
 		return eventstore.OperationView{}, false, errAdminIdempotencyConflict
 	}
 	return view, true, nil

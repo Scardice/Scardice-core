@@ -20,7 +20,6 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/monaco-io/request"
 	"github.com/robfig/cron/v3"
-	"github.com/samber/lo"
 
 	"Scardice-core/dice"
 )
@@ -222,17 +221,12 @@ func doSignIn(c echo.Context) error {
 		}
 		token := randomPart + ":" + head
 
-		if myDice.Parent.EventSourcedMode {
-			authenticated, err := myDice.Parent.AuthenticateAndStoreAccessToken(v.Password, token)
-			if err != nil {
-				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to persist authentication token"})
-			}
-			if !authenticated {
-				return c.JSON(http.StatusBadRequest, nil)
-			}
-		} else {
-			myDice.Parent.AccessTokens.Store(token, true)
-			myDice.Parent.Save()
+		authenticated, err := dm.DurableAuthenticateAndStoreAccessToken(c.Request().Context(), v.Password, token)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to persist authentication token"})
+		}
+		if !authenticated {
+			return c.JSON(http.StatusBadRequest, nil)
 		}
 		myDice.LastUpdatedTime = time.Now().Unix()
 		return c.JSON(http.StatusOK, map[string]string{
@@ -240,15 +234,7 @@ func doSignIn(c echo.Context) error {
 		})
 	}
 
-	if myDice.Parent.EventSourcedMode {
-		return generateToken()
-	}
-
-	if myDice.Parent.UIPasswordHash == "" || myDice.Parent.UIPasswordHash == v.Password {
-		return generateToken()
-	}
-
-	return c.JSON(400, nil)
+	return generateToken()
 }
 
 func logFetchAndClear(c echo.Context) error {
@@ -594,45 +580,24 @@ func handleGetConfigs(c echo.Context) error {
 	}
 	pluginName := c.QueryParam("pluginName")
 	resp := getConfigResp{}
-	if myDice.DurableStoreAttached() {
-		state, itemsErr := myDice.DurableExtensionState(c.Request().Context())
-		if itemsErr != nil {
-			return echo.NewHTTPError(http.StatusServiceUnavailable, itemsErr.Error())
-		}
-		for _, id := range state.ExtensionOrder {
-			if pluginName != "" && id != pluginName {
-				continue
-			}
-			configs, err := myDice.DurableExtensionConfigItems(c.Request().Context(), id)
-			if err != nil {
-				return echo.NewHTTPError(http.StatusServiceUnavailable, err.Error())
-			}
-			resp[id] = &apiPluginConfig{PluginName: id, Configs: configs}
-		}
-		data, itemsErr := json.Marshal(resp)
-		if itemsErr != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to marshal data")
-		}
-		return c.JSONBlob(http.StatusOK, data)
+	plugins, itemsErr := myDice.ConfigManager.PluginConfigs(c.Request().Context())
+	if itemsErr != nil {
+		return echo.NewHTTPError(http.StatusServiceUnavailable, itemsErr.Error())
 	}
-	for k, v := range myDice.ConfigManager.Plugins {
-		if pluginName != "" && k != pluginName {
+	for id, plugin := range plugins {
+		if pluginName != "" && id != pluginName {
 			continue
 		}
-		configs := make([]*dice.ConfigItem, 0, len(v.OrderedConfigKeys))
-		for _, key := range v.OrderedConfigKeys {
-			configs = append(configs, v.Configs[key])
+		configs := make([]*dice.ConfigItem, 0, len(plugin.OrderedConfigKeys))
+		for _, key := range plugin.OrderedConfigKeys {
+			configs = append(configs, plugin.Configs[key])
 		}
-		resp[k] = &apiPluginConfig{
-			PluginName: v.PluginName,
-			Configs:    configs,
-		}
+		resp[id] = &apiPluginConfig{PluginName: id, Configs: configs}
 	}
-	data, err := json.Marshal(resp)
-	if err != nil {
+	data, itemsErr := json.Marshal(resp)
+	if itemsErr != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to marshal data")
 	}
-
 	return c.JSONBlob(http.StatusOK, data)
 }
 
@@ -645,20 +610,16 @@ func handleSetConfigs(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "Failed to parse data")
 	}
-	var errors []error
-	for k, v := range data {
-		for _, i := range v.Configs {
-			err := myDice.ConfigManager.SetConfig(k, i.Key, i.Value)
-			if err != nil {
-				errors = append(errors, err)
-			}
+	updates := make([]dice.PluginConfigUpdate, 0)
+	for pluginName, plugin := range data {
+		for _, item := range plugin.Configs {
+			updates = append(updates, dice.PluginConfigUpdate{
+				PluginName: pluginName, Key: item.Key, Value: item.Value,
+			})
 		}
 	}
-	if len(errors) > 0 {
-		errMsg := strings.Join(lo.Map(errors, func(e error, _ int) string {
-			return e.Error()
-		}), "\n")
-		return c.JSON(http.StatusInternalServerError, errMsg)
+	if err = myDice.ConfigManager.SetConfigs(c.Request().Context(), updates); err != nil {
+		return c.JSON(http.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(http.StatusOK, nil)
 }
@@ -692,8 +653,8 @@ func handleDeleteUnusedConfigs(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "Failed to parse data")
 	}
-	for _, key := range data.Keys {
-		myDice.ConfigManager.UnregisterConfig(data.PluginName, key)
+	if err = myDice.ConfigManager.UnregisterConfig(data.PluginName, data.Keys...); err != nil {
+		return echo.NewHTTPError(http.StatusConflict, err.Error())
 	}
 	return c.JSON(http.StatusOK, nil)
 }
@@ -707,7 +668,9 @@ func handleResetConfig(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "Failed to parse data")
 	}
-	myDice.ConfigManager.ResetConfigToDefault(data["pluginName"], data["key"])
+	if err = myDice.ConfigManager.ResetConfigToDefault(c.Request().Context(), data["pluginName"], data["key"]); err != nil {
+		return echo.NewHTTPError(http.StatusConflict, err.Error())
+	}
 	return c.JSON(http.StatusOK, nil)
 }
 

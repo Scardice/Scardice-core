@@ -12,6 +12,11 @@ import (
 	"time"
 )
 
+var (
+	errMilkyEndpointUnavailable = errors.New("milky: endpoint is unavailable")
+	errMilkyAdapterUnavailable  = errors.New("milky: endpoint adapter is unavailable")
+)
+
 var defaultLagrangeV2Config = `{
     "$schema": "https://raw.githubusercontent.com/LagrangeDev/LagrangeV2/refs/heads/main/Lagrange.Milky/Resources/appsettings_schema.json",
     "Logging": {
@@ -209,16 +214,17 @@ func getMilkyBuiltInLoginStateFromLine(line string, signals milkyBuiltInSignals)
 	}
 }
 
-func applyMilkyBuiltInLoginTerminalState(d *Dice, ep *EndPointInfo, state MilkyLoginState) {
-	pa := ep.Adapter.(*PlatformAdapterMilky)
+func applyMilkyBuiltInLoginTerminalState(d *Dice, ep *EndPointInfo, state MilkyLoginState) error {
+	if ep == nil {
+		return errMilkyEndpointUnavailable
+	}
+	pa, ok := ep.Adapter.(*PlatformAdapterMilky)
+	if !ok {
+		return errMilkyAdapterUnavailable
+	}
 	pa.BuiltInLoginState = state
 	pa.QrCodeData = nil
-	ep.Enable = false
-	ep.State = StateDisconnected
-	if d != nil {
-		d.LastUpdatedTime = time.Now().Unix()
-		d.Save(false)
-	}
+	return d.DisableEndpoint(context.Background(), ep.ID)
 }
 
 func BuiltinMilkyClientKill(dice *Dice, conn *EndPointInfo) {

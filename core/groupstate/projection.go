@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 
 	"Scardice-core/eventstore"
@@ -94,6 +95,9 @@ func decodeProjectionState(payload []byte) (State, error) {
 type projectionReader interface {
 	ReadProjectionRow(ctx context.Context, projectionName, rowKey string) (eventstore.ProjectionRow, error)
 }
+type projectionPrefixLister interface {
+	ListProjectionRowsByRowKeyPrefix(ctx context.Context, projectionName, prefix string) ([]eventstore.ProjectionRow, error)
+}
 
 // ReadProjected returns a value copy from the active immutable projection. It
 // never returns a pointer to store-owned or cached mutable state.
@@ -118,4 +122,32 @@ func ReadProjected(ctx context.Context, store any, diceID, groupID string) (Stat
 		return State{}, ErrInvalidState
 	}
 	return state.Clone(), nil
+}
+
+// ListProjected returns detached committed group records for one Dice.
+func ListProjected(ctx context.Context, store any, diceID string) ([]State, error) {
+	if !validScopedIdentifier(diceID) {
+		return nil, ErrInvalidIdentity
+	}
+	lister, ok := store.(projectionPrefixLister)
+	if !ok || lister == nil {
+		return nil, ErrRepositoryUnavailable
+	}
+	prefix := fmt.Sprintf("%d:%s", len(diceID), diceID)
+	rows, err := lister.ListProjectionRowsByRowKeyPrefix(ctx, GroupProjectionName, prefix)
+	if err != nil {
+		return nil, err
+	}
+	states := make([]State, 0, len(rows))
+	for _, row := range rows {
+		state, decodeErr := decodeProjectionState(row.Payload)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		if state.DiceID != diceID || canonicalAggregateID(state.DiceID, state.GroupID) != row.RowKey {
+			return nil, ErrInvalidState
+		}
+		states = append(states, state.Clone())
+	}
+	return states, nil
 }

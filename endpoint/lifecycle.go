@@ -217,6 +217,25 @@ func (l *EndpointLifecycle) reconcileStates(ctx context.Context, states []State)
 		if !state.EndpointID.Valid() {
 			return result, fmt.Errorf("%w: invalid endpoint state", ErrEndpointLifecycleUnavailable)
 		}
+		if state.Generation == 0 && state.OperationState == OperationStateIdle && state.OperationID == "" &&
+			(state.DesiredState == DesiredStateEnabled || state.DesiredState == DesiredStateRemoving) {
+			if l.Service == nil {
+				return result, fmt.Errorf("%w: fresh lifecycle admission requires an endpoint service", ErrEndpointLifecycleUnavailable)
+			}
+			kind := CommandRelogin
+			if state.DesiredState == DesiredStateRemoving {
+				kind = CommandResolve
+			}
+			commandID := fmt.Sprintf("startup:%s:%d:%s", state.EndpointID, state.Version, kind)
+			admitted, err := l.Service.Execute(ctx, Command{
+				Kind: kind, CommandID: commandID, CorrelationID: commandID, EndpointID: state.EndpointID,
+				ExpectedVersion: state.Version, ExpectedVersionSet: true,
+			})
+			if err != nil {
+				return result, err
+			}
+			state = admitted.State
+		}
 		if state.DesiredState != DesiredStateEnabled {
 			result.Skipped++
 			continue
@@ -295,18 +314,6 @@ func (l *EndpointLifecycle) requireReady(ctx context.Context) error {
 	if l == nil {
 		return ErrEndpointLifecycleUnavailable
 	}
-	if getter, ok := l.Source.(eventstore.ReadinessMetadataRepository); ok {
-		if _, err := getter.GetReadinessMetadata(ctx); err != nil {
-			return fmt.Errorf("%w: %w", ErrEndpointNotReady, err)
-		}
-		return nil
-	}
-	if getter, ok := l.Store.(eventstore.ReadinessMetadataRepository); ok {
-		if _, err := getter.GetReadinessMetadata(ctx); err != nil {
-			return fmt.Errorf("%w: %w", ErrEndpointNotReady, err)
-		}
-		return nil
-	}
 	if getter, ok := l.Source.(eventstore.ReadinessRepository); ok {
 		if _, err := getter.GetReadiness(ctx); err != nil {
 			return fmt.Errorf("%w: %w", ErrEndpointNotReady, err)
@@ -315,22 +322,6 @@ func (l *EndpointLifecycle) requireReady(ctx context.Context) error {
 	}
 	if getter, ok := l.Store.(eventstore.ReadinessRepository); ok {
 		if _, err := getter.GetReadiness(ctx); err != nil {
-			return fmt.Errorf("%w: %w", ErrEndpointNotReady, err)
-		}
-		return nil
-	}
-	if checker, ok := l.Source.(interface {
-		ValidateReadiness(ctx context.Context) error
-	}); ok {
-		if err := checker.ValidateReadiness(ctx); err != nil {
-			return fmt.Errorf("%w: %w", ErrEndpointNotReady, err)
-		}
-		return nil
-	}
-	if checker, ok := l.Store.(interface {
-		ValidateReadiness(ctx context.Context) error
-	}); ok {
-		if err := checker.ValidateReadiness(ctx); err != nil {
 			return fmt.Errorf("%w: %w", ErrEndpointNotReady, err)
 		}
 		return nil

@@ -46,19 +46,18 @@ func (f *groupListEventStoreFixture) openStore(initializeReadiness bool) {
 	f.t.Helper()
 	database, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{
 		Type: "sqlite", DSN: filepath.Join(f.root, "events.db"),
-		KeySource: endpointAPITestKeySource{}, DatabaseIdentity: groupListEventStoreDBIdentity,
+		DatabaseIdentity: groupListEventStoreDBIdentity,
 	})
 	if err != nil {
 		f.t.Fatalf("open EventStore database: %v", err)
 	}
 	f.database = database
-	storeOptions := append(projectionset.StoreOptions(), eventstore.WithKeySource(endpointAPITestKeySource{}))
+	storeOptions := projectionset.StoreOptions()
 	f.store = eventstore.NewStore(database, storeOptions...)
 	if initializeReadiness {
 		if err := f.store.SetReadiness(context.Background(), eventstore.Readiness{
-			Mode: "import", SchemaVersion: 1, DatabaseIdentity: groupListEventStoreDBIdentity,
-			IndexRootID: "api-test-index-v1", EncryptionRootIDs: []string{"api-test-root-v1"},
-			SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+			Mode: "import", SchemaVersion: 2, DatabaseIdentity: groupListEventStoreDBIdentity,
+			CompletedAt: time.Unix(1, 0).UTC(),
 		}); err != nil {
 			f.t.Fatalf("set EventStore readiness: %v", err)
 		}
@@ -80,7 +79,6 @@ func (f *groupListEventStoreFixture) reopenStore() {
 	if err := f.manager.PrepareEventSourcedState(context.Background()); err != nil {
 		f.t.Fatalf("rehydrate EventStore runtime after restart: %v", err)
 	}
-	f.hydrateGroups()
 	e := echo.New()
 	Bind(e, f.manager)
 	f.server = httptest.NewServer(e)
@@ -101,7 +99,9 @@ func (f *groupListEventStoreFixture) startRuntime() {
 	if err := manager.PrepareEventSourcedState(ctx); err != nil {
 		f.t.Fatalf("prepare EventStore runtime: %v", err)
 	}
-	runtime.Config.JsEnable = false
+	updateAPITestConfig(f.t, runtime, func(config *dice.Config) {
+		config.JsEnable = false
+	})
 	manager.InitDice(nil)
 	manager.JustForTest = true
 	if runtime.DBOperator != nil {
@@ -182,74 +182,76 @@ func (f *groupListEventStoreFixture) createGroup(groupID string) {
 	f.createGroupForDice(groupListEventStoreDiceID, groupID)
 }
 
+func (f *groupListEventStoreFixture) withDomainRoot(label string, run func(*dice.DurableCallbackTransaction) error) {
+	f.t.Helper()
+	if err := f.runtime.WithDomainExecution(
+		context.Background(),
+		f.runtime.DomainExecutionIdentity("api-test-fixture", label),
+		[]byte(label),
+		run,
+	); err != nil {
+		f.t.Fatalf("commit API group fixture %q: %v", label, err)
+	}
+}
+
 func (f *groupListEventStoreFixture) createGroupForDice(diceID, groupID string) {
 	f.t.Helper()
-	ctx := context.Background()
-	repository := groupstate.NewRepository(f.store)
-	if _, err := repository.DecideAndAppend(ctx, groupstate.State{}, 0, eventstore.Metadata{}, groupstate.Command{
-		Kind: groupstate.CommandCreate, DiceID: diceID, GroupID: groupID, GroupName: "persisted " + groupID,
-	}); err != nil {
-		f.t.Fatalf("persist group %q for Dice %q: %v", groupID, diceID, err)
-	}
-	state, err := repository.Load(ctx, diceID, groupID)
-	if err != nil {
-		f.t.Fatalf("load persisted group %q for Dice %q: %v", groupID, diceID, err)
-	}
-	if _, err := repository.DecideAndAppend(ctx, state, state.Version, eventstore.Metadata{}, groupstate.Command{
-		Kind: groupstate.CommandActivation, DiceIDForActivation: diceID, Active: true, Exists: true,
-	}); err != nil {
-		f.t.Fatalf("persist group activation %q for Dice %q: %v", groupID, diceID, err)
-	}
+	f.withDomainRoot("create-group:"+diceID+":"+groupID, func(transaction *dice.DurableCallbackTransaction) error {
+		group, err := transaction.Domain().Group(context.Background(), diceID, groupID)
+		if err != nil {
+			return err
+		}
+		for _, command := range []groupstate.Command{
+			{Kind: groupstate.CommandCreate, DiceID: diceID, GroupID: groupID, GroupName: "persisted " + groupID},
+			{Kind: groupstate.CommandActivation, DiceIDForActivation: diceID, Active: true, Exists: true},
+		} {
+			if err = group.Decide(command); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (f *groupListEventStoreFixture) createPlayer(diceID, groupID, userID string) {
 	f.t.Helper()
-	_, err := playerstate.NewRepository(f.store).DecideAndAppendPlayer(context.Background(), playerstate.PlayerState{}, 0,
-		eventstore.Metadata{}, playerstate.PlayerCommand{
-			Kind: playerstate.CommandPlayerCreate, DiceID: diceID, GroupID: groupID, UserID: userID, Name: "persisted " + userID,
+	f.withDomainRoot("create-player:"+diceID+":"+groupID+":"+userID, func(transaction *dice.DurableCallbackTransaction) error {
+		player, err := transaction.Domain().Player(context.Background(), diceID, groupID, userID)
+		if err != nil {
+			return err
+		}
+		return player.Decide(playerstate.PlayerCommand{
+			Kind: playerstate.CommandPlayerCreate, DiceID: diceID,
+			GroupID: groupID, UserID: userID, Name: "persisted " + userID,
 		})
-	if err != nil {
-		f.t.Fatalf("persist player %q in %q/%q: %v", userID, diceID, groupID, err)
-	}
+	})
 }
 
 func (f *groupListEventStoreFixture) deletePlayer(diceID, groupID, userID string) {
 	f.t.Helper()
-	repository := playerstate.NewRepository(f.store)
-	state, err := repository.LoadPlayer(context.Background(), diceID, groupID, userID)
-	if err != nil {
-		f.t.Fatalf("load persisted player %q in %q/%q before deletion: %v", userID, diceID, groupID, err)
-	}
-	if _, err = repository.DecideAndAppendPlayer(context.Background(), state, state.Version,
-		eventstore.Metadata{}, playerstate.PlayerCommand{Kind: playerstate.CommandPlayerDelete}); err != nil {
-		f.t.Fatalf("persist deletion of player %q in %q/%q: %v", userID, diceID, groupID, err)
-	}
+	f.withDomainRoot("delete-player:"+diceID+":"+groupID+":"+userID, func(transaction *dice.DurableCallbackTransaction) error {
+		player, err := transaction.Domain().Player(context.Background(), diceID, groupID, userID)
+		if err != nil {
+			return err
+		}
+		return player.Decide(playerstate.PlayerCommand{Kind: playerstate.CommandPlayerDelete})
+	})
 }
 
-func (f *groupListEventStoreFixture) hydrateGroups() {
+func (f *groupListEventStoreFixture) deleteGroups(groupIDs ...string) {
 	f.t.Helper()
-	rows, err := f.store.ListProjectionRows(context.Background(), groupstate.GroupProjectionName)
-	if err != nil {
-		f.t.Fatalf("list persisted group projections: %v", err)
-	}
-	f.runtime.ImSession.ServiceAtNew = new(dice.SyncMap[string, *dice.GroupInfo])
-	for _, row := range rows {
-		var state groupstate.State
-		if err := json.Unmarshal(row.Payload, &state); err != nil {
-			f.t.Fatalf("decode persisted group projection %q: %v", row.RowKey, err)
+	f.withDomainRoot("delete-groups", func(transaction *dice.DurableCallbackTransaction) error {
+		for _, groupID := range groupIDs {
+			group, err := transaction.Domain().Group(context.Background(), groupListEventStoreDiceID, groupID)
+			if err != nil {
+				return err
+			}
+			if err = group.Decide(groupstate.Command{Kind: groupstate.CommandDelete}); err != nil {
+				return err
+			}
 		}
-		if state.DiceID != groupListEventStoreDiceID || state.Deleted {
-			continue
-		}
-		group := &dice.GroupInfo{
-			GroupID: state.GroupID, GroupName: state.GroupName,
-			DiceIDExistsMap: new(dice.SyncMap[string, bool]),
-		}
-		for id, exists := range state.DiceIDExists {
-			group.DiceIDExistsMap.Store(id, exists)
-		}
-		f.runtime.ImSession.ServiceAtNew.Store(state.GroupID, group)
-	}
+		return nil
+	})
 }
 
 func TestEventSourcedGroupListCountsDistinctPersistedProfilesAcrossDice(t *testing.T) {
@@ -289,8 +291,6 @@ func TestEventSourcedGroupListCountsDistinctPersistedProfilesAcrossDice(t *testi
 			t.Fatalf("literal group fragment selected unrelated group %q from row %q", state.GroupID, row.RowKey)
 		}
 	}
-
-	fixture.hydrateGroups()
 
 	authRequest, err := http.NewRequest(http.MethodGet, fixture.server.URL+"/sd-api/hello", nil)
 	if err != nil {
@@ -335,8 +335,8 @@ func TestEventSourcedGroupListCountsDistinctPersistedProfilesAcrossDice(t *testi
 		t.Fatalf("group-list without EventStore player read model status=%d body=%s, want 503 rather than fabricated zero counts", status, body)
 	}
 
-	// Reopen the durable database and reconstruct both the event-sourced
-	// runtime configuration and group compatibility view from projections.
+	// Reopen the durable database and reconstruct the event-sourced runtime
+	// configuration; group reads continue directly from projections.
 	fixture.reopenStore()
 	status, body = fixture.request()
 	if status != http.StatusOK {
@@ -353,9 +353,9 @@ func TestEventSourcedGroupListCountsDistinctPersistedProfilesAcrossDice(t *testi
 		t.Fatalf("rehydrated group-list player counts = %#v, want %q=3, %q=1, %q=0", counts, groupA, groupB, groupC)
 	}
 
-	// A group with no persisted members must remain listed with count zero;
-	// an empty runtime group map must produce an empty result.
-	fixture.runtime.ImSession.ServiceAtNew = new(dice.SyncMap[string, *dice.GroupInfo])
+	// A group with no persisted members remains listed with count zero. Once
+	// the canonical groups are deleted, no detached runtime map can keep them.
+	fixture.deleteGroups(groupA, groupB, groupC)
 	status, body = fixture.request()
 	if status != http.StatusOK {
 		t.Fatalf("empty authenticated GET /sd-api/group/list status=%d body=%s, want 200", status, body)
@@ -365,5 +365,35 @@ func TestEventSourcedGroupListCountsDistinctPersistedProfilesAcrossDice(t *testi
 	}
 	if err := json.Unmarshal(body, &empty); err != nil || len(empty.Items) != 0 {
 		t.Fatalf("empty group-list response items=%s err=%v, want no groups", body, err)
+	}
+}
+
+func TestGroupListCompatibilityCollectionJSONShapes(t *testing.T) {
+	encoded, err := json.Marshal(groupListItem{
+		ActivatedExtList:  []*dice.ExtInfo{{Name: "enabled"}},
+		InactivatedExtSet: dice.StringSet{"disabled": struct{}{}},
+		ExtAppliedVersion: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var object map[string]json.RawMessage
+	if err = json.Unmarshal(encoded, &object); err != nil {
+		t.Fatal(err)
+	}
+	var activated []map[string]json.RawMessage
+	if err = json.Unmarshal(object["activatedExtList"], &activated); err != nil ||
+		len(activated) != 1 || string(activated[0]["name"]) != `"enabled"` {
+		t.Fatalf("activatedExtList shape = %s, err=%v", object["activatedExtList"], err)
+	}
+	var inactivated map[string]json.RawMessage
+	if err = json.Unmarshal(object["inactivatedExtSet"], &inactivated); err != nil {
+		t.Fatalf("inactivatedExtSet shape = %s, err=%v", object["inactivatedExtSet"], err)
+	}
+	if _, ok := inactivated["disabled"]; !ok {
+		t.Fatalf("inactivatedExtSet shape = %s", object["inactivatedExtSet"])
+	}
+	if _, ok := object["extAppliedVersion"]; !ok {
+		t.Fatalf("compatibility key extAppliedVersion missing from %s", encoded)
 	}
 }

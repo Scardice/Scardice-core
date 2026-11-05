@@ -282,7 +282,9 @@ func (runtime *httpAdapterRuntime) Execute(ctx context.Context, effect adapterap
 		adapterapi.EffectPayloadBan,
 		adapterapi.EffectPayloadKick,
 		adapterapi.EffectPayloadGroupInfoRefresh,
-		adapterapi.EffectPayloadAnswerRequest:
+		adapterapi.EffectPayloadAnswerRequest,
+		adapterapi.EffectPayloadAdapterAPI,
+		adapterapi.EffectPayloadForward:
 		return adapterapi.UnsupportedResult("http_effect_not_supported")
 	}
 	if messageType == "" {

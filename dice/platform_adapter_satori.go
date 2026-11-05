@@ -19,7 +19,7 @@ import (
 	"Scardice-core/message"
 	"Scardice-core/utils/satori"
 
-	ds "github.com/sealdice/dicescript"
+	"github.com/google/uuid"
 )
 
 const SatoriProtocolVersion = "v1"
@@ -51,6 +51,9 @@ type PlatformAdapterSatori struct {
 
 // refreshGroups 更新群信息
 func (pa *PlatformAdapterSatori) refreshGroups() {
+	if pa == nil || pa.EndPoint == nil || pa.EndPoint.Session == nil || pa.EndPoint.Session.Parent == nil {
+		return
+	}
 	session := pa.EndPoint.Session
 	d := session.Parent
 	log := d.Logger
@@ -62,8 +65,8 @@ func (pa *PlatformAdapterSatori) refreshGroups() {
 		if next != "" {
 			req["next"] = next
 		}
-		reqJson, _ := json.Marshal(req)
-		data, err := pa.post("guild.list", bytes.NewBuffer(reqJson))
+		reqJSON, _ := json.Marshal(req)
+		data, err := pa.post("guild.list", bytes.NewBuffer(reqJSON))
 		if err != nil {
 			log.Error("satori 获取群列表失败:", err)
 			return
@@ -72,38 +75,26 @@ func (pa *PlatformAdapterSatori) refreshGroups() {
 			Data []SatoriGuild `json:"data"`
 			Next string        `json:"next"`
 		}
-		next = groupPage.Next
-		err = json.Unmarshal(data, &groupPage)
-		if err != nil {
+		if err = json.Unmarshal(data, &groupPage); err != nil {
 			log.Error("satori 获取群列表失败:", err)
 			return
 		}
+		next = groupPage.Next
 		for _, group := range groupPage.Data {
 			if group.Name == "" {
 				continue
 			}
 			groupID := formatDiceIDSatoriGroup(pa.Platform, group.ID)
-			dm.GroupNameCache.Store(groupID, &GroupNameCacheItem{
-				Name: group.Name,
-				time: time.Now().Unix(),
-			})
-
-			groupInfo, ok := session.ServiceAtNew.Load(groupID)
-			if !ok {
-				// 新检测到群
-				ctx := &MsgContext{
-					Session:  session,
-					EndPoint: pa.EndPoint,
-					Dice:     d,
-				}
-				SetBotOnAtGroup(ctx, groupID)
-			} else if group.Name != "" && groupInfo.GroupName != group.Name {
-				// 更新群名
-				groupInfo.GroupName = group.Name
-				groupInfo.MarkDirty(d)
+			if err = pa.applySatoriGroupObservation(context.Background(), group); err != nil {
+				log.Errorf("satori 持久化群信息失败: group=%s error=%v", groupID, err)
+				continue
 			}
-
-			// 触发群成员更新
+			if dm != nil {
+				dm.GroupNameCache.Store(groupID, &GroupNameCacheItem{
+					Name: group.Name,
+					time: time.Now().Unix(),
+				})
+			}
 			go pa.refreshMembers(group)
 		}
 		if next == "" {
@@ -112,24 +103,68 @@ func (pa *PlatformAdapterSatori) refreshGroups() {
 	}
 }
 
-func (pa *PlatformAdapterSatori) refreshMembers(group SatoriGuild) {
-	session := pa.EndPoint.Session
-	d := session.Parent
-	log := d.Logger
-
+func (pa *PlatformAdapterSatori) applySatoriGroupObservation(ctx context.Context, group SatoriGuild) error {
+	if pa == nil || pa.EndPoint == nil || pa.EndPoint.Session == nil || pa.EndPoint.Session.Parent == nil {
+		return errors.New("satori: Dice session unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	d := pa.EndPoint.Session.Parent
 	groupID := formatDiceIDSatoriGroup(pa.Platform, group.ID)
-	groupInfo, ok := session.ServiceAtNew.Load(groupID)
+	request, err := json.Marshal(struct {
+		Platform  string `json:"platform"`
+		GroupID   string `json:"groupId"`
+		GroupName string `json:"groupName"`
+	}{Platform: pa.Platform, GroupID: groupID, GroupName: group.Name})
+	if err != nil {
+		return err
+	}
+	identity := d.DomainExecutionIdentity("satori-group-observation", uuid.NewString())
+	return d.WithDomainExecution(ctx, identity, request, func(transaction *DurableCallbackTransaction) error {
+		runCtx := transaction.executionContext
+		if runCtx == nil {
+			runCtx = ctx
+		}
+		carrier := &MsgContext{
+			MessageType: "group", Dice: d, Session: pa.EndPoint.Session, EndPoint: pa.EndPoint,
+			executionContext: runCtx, callbackTransaction: transaction, callbackMetadata: transaction.metadata,
+		}
+		defer carrier.releaseExecutionState()
+		groupInfo, loadErr := carrier.ResolveGroup(runCtx, groupID)
+		if loadErr != nil {
+			return loadErr
+		}
+		if groupInfo.Version() == 0 {
+			groupInfo, loadErr = SetBotOnAtGroup(carrier, groupID)
+			if loadErr != nil {
+				return loadErr
+			}
+		}
+		if group.Name != "" && groupInfo.GroupName() != group.Name {
+			if loadErr = groupInfo.SetGroupName(group.Name); loadErr != nil {
+				return loadErr
+			}
+		}
+		return transaction.Domain().Err()
+	})
+}
+
+func (pa *PlatformAdapterSatori) refreshMembers(group SatoriGuild) {
+	if pa == nil || pa.EndPoint == nil || pa.EndPoint.Session == nil || pa.EndPoint.Session.Parent == nil {
+		return
+	}
+	d := pa.EndPoint.Session.Parent
+	log := d.Logger
+	groupID := formatDiceIDSatoriGroup(pa.Platform, group.ID)
 	next := ""
 	for {
-		req := map[string]interface{}{
-			"guild_id": group.ID,
-		}
+		req := map[string]interface{}{"guild_id": group.ID}
 		if next != "" {
 			req["next"] = next
 		}
-
-		reqJson, _ := json.Marshal(req)
-		data, err := pa.post("guild.member.list", bytes.NewBuffer(reqJson))
+		reqJSON, _ := json.Marshal(req)
+		data, err := pa.post("guild.member.list", bytes.NewBuffer(reqJSON))
 		if err != nil {
 			log.Error("satori 获取群成员列表失败:", err)
 			return
@@ -138,40 +173,77 @@ func (pa *PlatformAdapterSatori) refreshMembers(group SatoriGuild) {
 			Data []SatoriGuildMember `json:"data"`
 			Next string              `json:"next"`
 		}
-		next = memberPage.Next
-		err = json.Unmarshal(data, &memberPage)
-		if err != nil {
+		if err = json.Unmarshal(data, &memberPage); err != nil {
 			log.Error("satori 获取群成员列表失败:", err)
 			return
 		}
+		next = memberPage.Next
 		for _, member := range memberPage.Data {
-			mem := member
-			userID := formatDiceIDSatori(pa.Platform, mem.User.ID)
-			if ok {
-				p := groupInfo.PlayerGet(d.DBOperator, userID)
-				if p == nil {
-					name := mem.Nick
-					if name == "" {
-						if mem.User.Name != "" {
-							name = mem.User.Name
-						}
-						if mem.User.Nick != "" {
-							name = mem.User.Nick
-						}
-					}
-					p = &GroupPlayerInfo{
-						Name:         name,
-						UserID:       userID,
-						ValueMapTemp: &ds.ValueMap{},
-					}
-					groupInfo.Players.Store(userID, p)
+			userID := formatDiceIDSatori(pa.Platform, member.User.ID)
+			name := member.Nick
+			if name == "" {
+				if member.User.Name != "" {
+					name = member.User.Name
 				}
+				if member.User.Nick != "" {
+					name = member.User.Nick
+				}
+			}
+			if err = pa.applySatoriMemberObservation(context.Background(), groupID, userID, name); err != nil {
+				log.Errorf("satori 持久化群成员失败: group=%s user=%s error=%v", groupID, userID, err)
 			}
 		}
 		if next == "" {
 			break
 		}
 	}
+}
+
+func (pa *PlatformAdapterSatori) applySatoriMemberObservation(ctx context.Context, groupID, userID, name string) error {
+	if pa == nil || pa.EndPoint == nil || pa.EndPoint.Session == nil || pa.EndPoint.Session.Parent == nil {
+		return errors.New("satori: Dice session unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	d := pa.EndPoint.Session.Parent
+	request, err := json.Marshal(struct {
+		GroupID string `json:"groupId"`
+		UserID  string `json:"userId"`
+		Name    string `json:"name"`
+	}{GroupID: groupID, UserID: userID, Name: name})
+	if err != nil {
+		return err
+	}
+	identity := d.DomainExecutionIdentity("satori-member-observation", uuid.NewString())
+	return d.WithDomainExecution(ctx, identity, request, func(transaction *DurableCallbackTransaction) error {
+		runCtx := transaction.executionContext
+		if runCtx == nil {
+			runCtx = ctx
+		}
+		carrier := &MsgContext{
+			MessageType: "group", Dice: d, Session: pa.EndPoint.Session, EndPoint: pa.EndPoint,
+			executionContext: runCtx, callbackTransaction: transaction, callbackMetadata: transaction.metadata,
+		}
+		defer carrier.releaseExecutionState()
+		groupInfo, loadErr := carrier.ResolveGroup(runCtx, groupID)
+		if loadErr != nil {
+			return loadErr
+		}
+		if groupInfo.Version() == 0 || groupInfo.Deleted() {
+			return nil
+		}
+		player, loadErr := carrier.ResolvePlayer(runCtx, groupID, userID)
+		if loadErr != nil {
+			return loadErr
+		}
+		if player.Version() == 0 {
+			if loadErr = player.create(d.BaseConfig.Name, groupID, userID, name); loadErr != nil {
+				return loadErr
+			}
+		}
+		return transaction.Domain().Err()
+	})
 }
 
 func (pa *PlatformAdapterSatori) QuitGroup(ctx *MsgContext, _ string) {
@@ -523,31 +595,42 @@ func (pa *PlatformAdapterSatori) guildRequestHandle(e *SatoriEvent) {
 	log.Infof("satori: 收到平台 %s 加群邀请: 群组<%s>(%s) 邀请人:<%s>(%s)",
 		pa.Platform, guildName, guildID, userName, uid)
 
+	config := d.Config()
+	if config == nil || config.BanList == nil {
+		log.Error("satori 处理加群邀请失败: 配置或黑名单不可用")
+		return
+	}
 	eid := e.ID.String()
-	// 邀请人在黑名单上
-	banInfo, ok := d.Config.BanList.GetByID(uid)
-	if ok {
-		if banInfo.Rank == BanRankBanned && d.Config.BanList.BanBehaviorRefuseInvite {
-			pa.sendGuildRequestResult(eid, false, "黑名单")
-			return
+	banInfo, ok, err := config.BanList.GetByIDForContext(nil, uid)
+	if err != nil {
+		log.Errorf("satori 读取邀请人黑名单失败: %v", err)
+		return
+	}
+	if ok && banInfo.Rank == BanRankBanned && config.BanList.BanBehaviorRefuseInvite {
+		pa.sendGuildRequestResult(eid, false, "黑名单")
+		return
+	}
+	isMaster := false
+	for _, masterID := range d.DiceMasterIDs() {
+		if masterID == uid {
+			isMaster = true
+			break
 		}
 	}
-	// 信任模式，如果不是信任，又不是 master 则拒绝拉群邀请
-	isMaster := d.IsMaster(uid)
-	if d.Config.TrustOnlyMode && ((banInfo != nil && banInfo.Rank != BanRankTrusted) && !isMaster) {
+	if config.TrustOnlyMode && ((banInfo != nil && banInfo.Rank != BanRankTrusted) && !isMaster) {
 		pa.sendGuildRequestResult(eid, false, "只允许骰主设置信任的人拉群")
 		return
 	}
-	// 群在黑名单上
-	banInfo, ok = d.Config.BanList.GetByID(guildID)
-	if ok {
-		if banInfo.Rank == BanRankBanned {
-			pa.sendGuildRequestResult(eid, false, "群黑名单")
-			return
-		}
+	banInfo, ok, err = config.BanList.GetByIDForContext(nil, guildID)
+	if err != nil {
+		log.Errorf("satori 读取群黑名单失败: %v", err)
+		return
 	}
-	// 拒绝加群
-	if d.Config.RefuseGroupInvite {
+	if ok && banInfo.Rank == BanRankBanned {
+		pa.sendGuildRequestResult(eid, false, "群黑名单")
+		return
+	}
+	if config.RefuseGroupInvite {
 		pa.sendGuildRequestResult(eid, false, "设置拒绝加群")
 		return
 	}
@@ -584,17 +667,22 @@ func (pa *PlatformAdapterSatori) friendRequestHandle(e *SatoriEvent) {
 	userName := dm.TryGetUserName(uid)
 	log.Infof("satori: 收到平台 %s 好友请求: 申请人:<%s>(%s)", pa.Platform, userName, uid)
 
-	eid := e.ID.String()
-	// 申请人在黑名单上
-	banInfo, ok := d.Config.BanList.GetByID(uid)
-	if ok {
-		if banInfo.Rank == BanRankBanned && d.Config.BanList.BanBehaviorRefuseInvite {
-			pa.sendGuildRequestResult(eid, false, "为被禁止用户，准备自动拒绝")
-			return
-		}
+	config := d.Config()
+	if config == nil || config.BanList == nil {
+		log.Error("satori 处理好友请求失败: 配置或黑名单不可用")
+		return
 	}
-
-	if strings.TrimSpace(d.Config.FriendAddComment) == "" {
+	eid := e.ID.String()
+	banInfo, ok, err := config.BanList.GetByIDForContext(nil, uid)
+	if err != nil {
+		log.Errorf("satori 读取好友申请黑名单失败: %v", err)
+		return
+	}
+	if ok && banInfo.Rank == BanRankBanned && config.BanList.BanBehaviorRefuseInvite {
+		pa.sendGuildRequestResult(eid, false, "为被禁止用户，准备自动拒绝")
+		return
+	}
+	if strings.TrimSpace(config.FriendAddComment) == "" {
 		pa.sendFriendRequestResult(eid, true, "")
 	} else {
 		pa.sendFriendRequestResult(eid, false, "存在好友问题校验，准备自动拒绝，请联系骰主")

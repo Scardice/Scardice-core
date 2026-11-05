@@ -10,7 +10,6 @@ import (
 )
 
 func TestExportPrimitiveSupportsPrimitiveValues(t *testing.T) {
-
 	loop := gojaengine.New()
 	defer loop.Close()
 	if err := loop.Run(func(runtime jsengine.Runtime) error {
@@ -64,7 +63,6 @@ func TestExportPrimitiveSupportsPrimitiveValues(t *testing.T) {
 }
 
 func TestExportPrimitiveRejectsObjectsAndFunctions(t *testing.T) {
-
 	loop := gojaengine.New()
 	defer loop.Close()
 	if err := loop.Run(func(runtime jsengine.Runtime) error {

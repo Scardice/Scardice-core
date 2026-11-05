@@ -2,15 +2,15 @@ package dice
 
 import (
 	"context"
-	"errors"
-	"strings"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
 
+	"Scardice-core/core/configstate"
 	"Scardice-core/core/extensionstate"
 	"Scardice-core/eventstore"
+	"Scardice-core/projectionset"
 	"Scardice-core/utils/jsengine"
 	gojaengine "Scardice-core/utils/jsengine/goja"
 )
@@ -23,19 +23,25 @@ func TestJSExtSensitiveConfigDefaultsSurviveDurableRestartAndCronGetter(t *testi
 		if err != nil {
 			t.Fatal(err)
 		}
-		return eventstore.NewStore(db,
-			eventstore.WithKeySource(compatKeySource{}),
-			eventstore.WithProjection(extensionstate.ExtensionProjection()),
-		)
+		options := projectionset.StoreOptions()
+		return eventstore.NewStore(db, options...)
 	}
 
 	store := openStore()
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "sensitive-config-restart",
-		IndexRootID: "index-v1", EncryptionRootIDs: []string{"root-v1"},
-		SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "sensitive-config-restart",
 		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
+		t.Fatal(err)
+	}
+	baseline := configstate.Baseline{DiceID: "dice-1", ConfigVersion: 1, CommandPrefix: []string{"."}}
+	if _, err := configstate.NewRepository(store).DecideAndAppend(
+		ctx,
+		configstate.State{},
+		0,
+		eventstore.Metadata{},
+		configstate.Command{Kind: configstate.CommandImportBaseline, Baseline: &baseline},
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -83,9 +89,6 @@ func TestJSExtSensitiveConfigDefaultsSurviveDurableRestartAndCronGetter(t *testi
 	}
 
 	const legacyKey = "legacy token"
-	if err := first.durableDeleteEncryptedConfigValue(ctx, pluginName, legacyKey); err != nil {
-		t.Fatal(err)
-	}
 	repository, diceID, err := first.durableExtensionRepository()
 	if err != nil {
 		t.Fatal(err)
@@ -130,23 +133,24 @@ func TestJSExtSensitiveConfigDefaultsSurviveDurableRestartAndCronGetter(t *testi
 	if got, err := first.durableStorageGet(pluginName, opaqueStorageKey); err != nil || got != "" {
 		t.Fatalf("opaque storage value after clear = %q, %v", got, err)
 	}
-	if err := first.durableStorageSet(durableConfigStorageExtensionID(pluginName), "public-key", "public-value"); !errors.Is(err, errDurableReservedStorageDomain) {
-		t.Fatalf("public storage reached internal config namespace: %v", err)
-	}
 
 	state, err := first.DurableExtensionState(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, key := range []string{"HTTP Access Token", "token", legacyKey, "empty token"} {
-		if state.ConfigDefinitions[pluginName][key].DefaultSet {
-			t.Fatalf("sensitive definition %q persisted its default in the event stream", key)
+		if !state.ConfigDefinitions[pluginName][key].DefaultSet {
+			t.Fatalf("typed definition %q lost its default", key)
 		}
 	}
-	for _, key := range []string{"HTTP Access Token", "token", "empty token"} {
-		if _, exists := state.ConfigValues[pluginName][key]; exists {
-			t.Fatalf("sensitive config %q persisted its value in the event stream", key)
-		}
+	if got := state.ConfigValues[pluginName]["HTTP Access Token"]; got.Type != extensionstate.ConfigTemplate || len(got.Strings) != 1 || got.Strings[0] != "test-access-token" {
+		t.Fatalf("typed template config = %#v", got)
+	}
+	if got := state.ConfigValues[pluginName]["token"]; got.Type != extensionstate.ConfigString || got.String != "test-string-token" {
+		t.Fatalf("typed string config = %#v", got)
+	}
+	if got := state.ConfigValues[pluginName]["empty token"]; got.Type != extensionstate.ConfigString || got.String != "" {
+		t.Fatalf("explicit empty typed config = %#v", got)
 	}
 	if got := state.ConfigValues[pluginName][legacyKey]; got.Type != extensionstate.ConfigString || got.String != "legacy-explicit-value" {
 		t.Fatalf("legacy event config value = %#v", got)
@@ -173,48 +177,67 @@ func TestJSExtSensitiveConfigDefaultsSurviveDurableRestartAndCronGetter(t *testi
 	loop := gojaengine.New()
 	version := restarted.ExtLoopManager.SetLoop(loop)
 	defer restarted.ExtLoopManager.SetLoop(nil)
-	script := &JsScriptInfo{Name: pluginName, Filename: "http-dependency.js"}
-	if err := jsengine.RunWithContext(loop, &jsExecutionContext{Script: script}, func(runtime jsengine.Runtime) error {
-		if err := restarted.installJSHostAPI(runtime); err != nil {
-			return err
-		}
-		if err := restarted.installJSExtHostAPI(runtime, loop, runtime.Get("seal").Object(), version, nil); err != nil {
-			return err
-		}
-		_, err := runtime.RunString("http-dependency.js", `
-			globalThis.sensitiveConfigCronRan = false;
-			const ext = seal.ext.new("HTTP依赖", "test", "1.2.0");
-			seal.ext.register(ext);
-			seal.ext.registerTemplateConfig(ext, "HTTP Access Token", ["test-access-token"], "token list", "");
-			seal.ext.registerStringConfig(ext, "token", "test-string-token", "single token", "");
-			seal.ext.registerStringConfig(ext, "legacy token", "replacement-default", "legacy event value", "");
-			seal.ext.registerStringConfig(ext, "empty token", "changed-default", "explicit empty value", "");
-			seal.ext.registerIntConfig(ext, "large-count", 9007199254740991, "large integer", "");
-			seal.ext.registerFloatConfig(ext, "ratio", 1.25, "floating point", "");
-			seal.ext.registerTask(ext, "cron", "0 0 1 1 *", () => {
-				const tokens = seal.ext.getTemplateConfig(ext, "HTTP Access Token");
-				const token = seal.ext.getStringConfig(ext, "token");
-				const legacyToken = seal.ext.getStringConfig(ext, "legacy token");
-				const emptyToken = seal.ext.getStringConfig(ext, "empty token");
-				const largeCount = seal.ext.getIntConfig(ext, "large-count");
-				const ratio = seal.ext.getFloatConfig(ext, "ratio");
-				globalThis.sensitiveConfigCronRan = tokens.length === 1 &&
-					tokens[0] === "test-access-token" && token === "test-string-token" &&
-					legacyToken === "legacy-explicit-value" && emptyToken === "" &&
-					largeCount === 9007199254740991 && ratio === 1.25;
-			}, "", "", "");
-		`)
-		return err
-	}); err != nil {
+	if err := restarted.ReloadConfigView(ctx); err != nil {
 		t.Fatal(err)
 	}
-
-	migratedValue, exists, err := restarted.durableEncryptedConfigValue(ctx, pluginName, legacyKey, extensionstate.ConfigString)
+	script := &JsScriptInfo{Name: pluginName, Filename: "http-dependency.js", runtimeGeneration: version}
+	var realm *jsExecutionContext
+	err = restarted.WithDomainExecution(
+		ctx,
+		restarted.DomainExecutionIdentity("test-js-load", "sensitive-config-restart"),
+		[]byte("sensitive-config-restart"),
+		func(transaction *DurableCallbackTransaction) error {
+			realm = jsContextForRoot(transaction.executionContext, restarted, nil, script, transaction, true)
+			return runJSExecutionRoot(realm, func() error {
+				defer realm.activatePersistentScheduler()
+				return jsengine.RunWithContext(loop, realm, func(runtime jsengine.Runtime) error {
+					if hostErr := restarted.installJSHostAPI(runtime, loop); hostErr != nil {
+						return hostErr
+					}
+					if hostErr := restarted.installJSExtHostAPI(runtime, loop, runtime.Get("seal").Object(), version, nil); hostErr != nil {
+						return hostErr
+					}
+					_, runErr := runtime.RunString("http-dependency.js", `
+						globalThis.sensitiveConfigCronRan = false;
+						const ext = seal.ext.new("HTTP依赖", "test", "1.2.0");
+						seal.ext.register(ext);
+						seal.ext.registerTemplateConfig(ext, "HTTP Access Token", ["test-access-token"], "token list", "");
+						seal.ext.registerStringConfig(ext, "token", "test-string-token", "single token", "");
+						seal.ext.registerStringConfig(ext, "legacy token", "replacement-default", "legacy event value", "");
+						seal.ext.registerStringConfig(ext, "empty token", "changed-default", "explicit empty value", "");
+						seal.ext.registerIntConfig(ext, "large-count", 9007199254740991, "large integer", "");
+						seal.ext.registerFloatConfig(ext, "ratio", 1.25, "floating point", "");
+						seal.ext.registerTask(ext, "cron", "0 0 1 1 *", () => {
+							const tokens = seal.ext.getTemplateConfig(ext, "HTTP Access Token");
+							const token = seal.ext.getStringConfig(ext, "token");
+							const legacyToken = seal.ext.getStringConfig(ext, "legacy token");
+							const emptyToken = seal.ext.getStringConfig(ext, "empty token");
+							const largeCount = seal.ext.getIntConfig(ext, "large-count");
+							const ratio = seal.ext.getFloatConfig(ext, "ratio");
+							globalThis.sensitiveConfigCronRan = tokens.length === 1 &&
+								tokens[0] === "test-access-token" && token === "test-string-token" &&
+								legacyToken === "legacy-explicit-value" && emptyToken === "" &&
+								largeCount === 9007199254740991 && ratio === 1.25;
+						}, "", "", "");
+					`)
+					return runErr
+				})
+			})
+		},
+	)
+	if realm != nil {
+		if err == nil {
+			script.replacePersistentBinding(realm.binding)
+		}
+		realm.completePersistentBinding(err)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !exists || migratedValue != "legacy-explicit-value" {
-		t.Fatalf("migrated legacy value = %#v, exists=%v", migratedValue, exists)
+
+	persisted, err := extensionstate.NewRepository(restartedStore).Load(ctx, "dice-1")
+	if err != nil || persisted.ConfigValues[pluginName][legacyKey].String != "legacy-explicit-value" {
+		t.Fatalf("restored typed config = %#v, err=%v", persisted.ConfigValues[pluginName], err)
 	}
 
 	realExt, ok := restarted.JsExtRegistry.Load(pluginName)
@@ -235,7 +258,7 @@ func TestJSExtSensitiveConfigDefaultsSurviveDurableRestartAndCronGetter(t *testi
 	}
 }
 
-func TestJSExtSensitiveConfigRegistrationRollsBackDefinitionWhenEncryptedValueWriteFails(t *testing.T) {
+func TestJSExtConfigRegistrationRollsBackDefinitionWhenInitialValueWriteFails(t *testing.T) {
 	ctx := context.Background()
 	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
 		Type: "sqlite",
@@ -245,14 +268,12 @@ func TestJSExtSensitiveConfigRegistrationRollsBackDefinitionWhenEncryptedValueWr
 		t.Fatal(err)
 	}
 	store := eventstore.NewStore(db,
-		eventstore.WithKeySource(compatKeySource{}),
+		eventstore.WithProjection(configstate.ConfigProjection()),
 		eventstore.WithProjection(extensionstate.ExtensionProjection()),
 	)
 	defer store.Close()
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "sensitive-config-atomicity",
-		IndexRootID: "index-v1", EncryptionRootIDs: []string{"root-v1"},
-		SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "sensitive-config-atomicity",
 		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
@@ -264,17 +285,18 @@ func TestJSExtSensitiveConfigRegistrationRollsBackDefinitionWhenEncryptedValueWr
 		DurableStore:  store,
 		ConfigManager: NewConfigManager(""),
 	}
+	seedCanonicalTestConfigBaseline(t, d)
 	d.ConfigManager.SetOwner(d)
 	ext := &ExtInfo{Name: pluginName, Version: "1.0.0", IsJsExt: true, dice: d}
 	if err := d.DurableDiscoverExtension(ctx, ext); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.GORM().Exec(`
-		CREATE TRIGGER reject_internal_config_value
-		BEFORE INSERT ON plugin_kv
-		WHEN NEW.extension_id LIKE 'scardice.internal.config/v1/%'
+		CREATE TRIGGER reject_initial_config_value
+		BEFORE INSERT ON domain_events
+		WHEN NEW.aggregate_type = 'extension-state' AND NEW.event_type = 'config_value_changed'
 		BEGIN
-			SELECT RAISE(ABORT, 'forced encrypted config failure');
+			SELECT RAISE(ABORT, 'forced initial config value failure');
 		END
 	`).Error; err != nil {
 		t.Fatal(err)
@@ -287,89 +309,13 @@ func TestJSExtSensitiveConfigRegistrationRollsBackDefinitionWhenEncryptedValueWr
 		Value:        "sensitive-default",
 	})
 	if err == nil {
-		t.Fatal("sensitive config registration succeeded despite forced encrypted value failure")
+		t.Fatal("config registration succeeded despite forced initial value failure")
 	}
 	state, loadErr := d.DurableExtensionState(ctx)
 	if loadErr != nil {
 		t.Fatal(loadErr)
 	}
 	if _, exists := state.ConfigDefinitions[pluginName]["access token"]; exists {
-		t.Fatal("config definition committed without its encrypted initial value")
-	}
-}
-
-func TestJSExtTypedGetterMismatchReportsIdentityWithoutValue(t *testing.T) {
-	loop := gojaengine.New()
-	defer loop.Close()
-	d := &Dice{
-		ConfigManager: NewConfigManager(t.TempDir() + "/plugin-configs.json"),
-		ExtRegistry:   new(SyncMap[string, *ExtInfo]),
-		Logger:        zap.NewNop().Sugar(),
-	}
-	d.ConfigManager.SetOwner(d)
-
-	const sensitiveValue = "must-not-appear-in-diagnostic"
-	var diagnostic, caughtDiagnostic string
-	if err := loop.Run(func(runtime jsengine.Runtime) error {
-		if err := d.installJSHostAPI(runtime); err != nil {
-			return err
-		}
-		if err := d.installJSExtHostAPI(runtime, loop, runtime.Get("seal").Object(), 1, nil); err != nil {
-			return err
-		}
-		if _, err := runtime.RunString("diagnostic.js", `
-			globalThis.diagnosticExt = seal.ext.new("diagnostic-ext", "test", "1.0.0");
-			seal.ext.register(globalThis.diagnosticExt);
-			seal.ext.registerIntConfig(globalThis.diagnosticExt, "count", 1, "count", "");
-		`); err != nil {
-			return err
-		}
-
-		d.ConfigManager.lock.Lock()
-		d.ConfigManager.Plugins["diagnostic-ext"].Configs["count"].Value = sensitiveValue
-		d.ConfigManager.lock.Unlock()
-
-		_, err := runtime.RunString("diagnostic-getter.js", `seal.ext.getIntConfig(globalThis.diagnosticExt, "count")`)
-		if err == nil {
-			t.Fatal("getIntConfig accepted a string value")
-		}
-		diagnostic = err.Error()
-		if _, err := runtime.RunString("diagnostic-catch.js", `
-			globalThis.caughtConfigDiagnostic = "";
-			try {
-				seal.ext.getIntConfig(globalThis.diagnosticExt, "count");
-			} catch (error) {
-				globalThis.caughtConfigDiagnostic = String(error);
-			}
-		`); err != nil {
-			return err
-		}
-		caught, err := runtime.Get("caughtConfigDiagnostic").ExportPrimitive()
-		if err != nil {
-			return err
-		}
-		caughtDiagnostic, _ = caught.(string)
-		if caughtDiagnostic == "" {
-			t.Fatal("typed getter error was not catchable in JavaScript")
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	for _, current := range []string{diagnostic, caughtDiagnostic} {
-		for _, want := range []string{
-			`plugin="diagnostic-ext"`,
-			`key="count"`,
-			`declared="int"`,
-			`actual="string"`,
-		} {
-			if !strings.Contains(current, want) {
-				t.Fatalf("diagnostic %q does not contain %q", current, want)
-			}
-		}
-		if strings.Contains(current, sensitiveValue) {
-			t.Fatal("typed getter diagnostic disclosed the configuration value")
-		}
+		t.Fatal("config definition committed without its initial value")
 	}
 }

@@ -138,8 +138,7 @@ func (t *targetFake) Reopen(context.Context) error {
 
 func (t *targetFake) GetReadiness(context.Context) (eventstore.Readiness, error) {
 	return eventstore.Readiness{
-		Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: t.initialized, IndexRootID: "target-index",
-		EncryptionRootIDs: []string{"target-root"},
+		Mode: "fresh", SchemaVersion: readinessSchemaVersion, DatabaseIdentity: t.initialized,
 	}, nil
 }
 
@@ -230,14 +229,13 @@ func TestCanonicalManifestSortsAndRedactsSensitiveIdentity(t *testing.T) {
 func TestValidatePublicationReportsFailedInvariant(t *testing.T) {
 	err := ValidatePublication(eventstore.Readiness{
 		Mode:             string(ModeImport),
-		SchemaVersion:    1,
+		SchemaVersion:    readinessSchemaVersion,
 		DatabaseIdentity: "target",
-		IndexRootID:      "index",
 	})
 	if !errors.Is(err, ErrValidation) {
 		t.Fatalf("err = %v", err)
 	}
-	if !strings.Contains(err.Error(), "source manifest digest length") {
+	if !strings.Contains(err.Error(), "import completion time is missing") {
 		t.Fatalf("validation error lacks failed invariant: %v", err)
 	}
 }
@@ -296,7 +294,7 @@ func TestLocalSQLiteSnapshotPreservesMainAndWALReadOnly(t *testing.T) {
 }
 
 func TestImporterFreshPublishesOnlyFreshReadiness(t *testing.T) {
-	readiness := &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "initial", IndexRootID: "index"}}
+	readiness := &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "initial"}}
 	result, err := NewImporter(ImporterOptions{Readiness: readiness, TargetIdentity: "target-1"}).Run(context.Background(), Request{Mode: ModeFresh})
 	if err != nil {
 		t.Fatal(err)
@@ -310,7 +308,7 @@ func TestImporterFreshPublishesOnlyFreshReadiness(t *testing.T) {
 }
 
 func TestImporterQuarantinesOnSourceDriftBeforePublication(t *testing.T) {
-	readiness := &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "initial", IndexRootID: "index"}}
+	readiness := &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "initial"}}
 	source := &sourceFake{inventory: SourceInventory{
 		Kind: SourceKindLegacy, Identity: "legacy-1", LegacyOwnershipComplete: true,
 		Metadata: SourceMetadata{Identity: "legacy-1"},
@@ -341,7 +339,7 @@ func TestImporterQuarantinesOnLateSourceDrift(t *testing.T) {
 	target := &targetFake{manifest: manifestFromSource(source.inventory)}
 	root := filepath.Join(t.TempDir(), "snapshot")
 	result, err := NewImporter(ImporterOptions{
-		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old", IndexRootID: "index"}},
+		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old"}},
 		Source:    source, Target: target, SnapshotRoot: root, TargetIdentity: "new",
 	}).Run(context.Background(), Request{Mode: ModeImport})
 	if !errors.Is(err, ErrSourceDrift) || !errors.Is(err, ErrQuarantined) {
@@ -354,7 +352,7 @@ func TestImporterQuarantinesOnLateSourceDrift(t *testing.T) {
 
 func TestImporterRejectsIncompleteOwnershipMap(t *testing.T) {
 	source := &sourceFake{inventory: SourceInventory{Kind: SourceKindLegacy, Identity: "legacy", Metadata: SourceMetadata{Identity: "legacy"}}}
-	_, err := NewImporter(ImporterOptions{Readiness: &readinessFake{value: eventstore.Readiness{IndexRootID: "index"}}, Source: source, SnapshotRoot: filepath.Join(t.TempDir(), "snapshot"), TargetIdentity: "target"}).Run(context.Background(), Request{Mode: ModeImport})
+	_, err := NewImporter(ImporterOptions{Readiness: &readinessFake{value: eventstore.Readiness{}}, Source: source, SnapshotRoot: filepath.Join(t.TempDir(), "snapshot"), TargetIdentity: "target"}).Run(context.Background(), Request{Mode: ModeImport})
 	var unsupported *UnsupportedPreflightError
 	if !errors.As(err, &unsupported) {
 		t.Fatalf("err = %v, want unsupported preflight", err)
@@ -391,7 +389,7 @@ func TestImporterBoundsEventStreamsPerUnitOfWork(t *testing.T) {
 	}
 	target := &targetFake{manifest: manifestFromSource(source.inventory)}
 	result, err := NewImporter(ImporterOptions{
-		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old", IndexRootID: "index"}},
+		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old"}},
 		Source:    source, Target: target, SnapshotRoot: filepath.Join(t.TempDir(), "snapshot"), TargetIdentity: "new",
 	}).Run(context.Background(), Request{Mode: ModeImport})
 	if err != nil {
@@ -405,7 +403,7 @@ func TestImporterSnapshotsBeforeReadingSourceInventory(t *testing.T) {
 	source := validImportSource()
 	target := &targetFake{manifest: manifestFromSource(source.inventory)}
 	_, err := NewImporter(ImporterOptions{
-		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old", IndexRootID: "index"}},
+		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old"}},
 		Source:    source, Target: target, SnapshotRoot: filepath.Join(t.TempDir(), "snapshot"), TargetIdentity: "new",
 	}).Run(context.Background(), Request{Mode: ModeImport})
 	if err != nil {
@@ -423,7 +421,7 @@ func validImportSource() *sourceFake {
 }
 
 func TestImporterRejectsImportWithoutTarget(t *testing.T) {
-	readiness := &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old", IndexRootID: "index"}}
+	readiness := &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old"}}
 	_, err := NewImporter(ImporterOptions{Readiness: readiness, Source: validImportSource(), SnapshotRoot: filepath.Join(t.TempDir(), "snapshot"), TargetIdentity: "new"}).Run(context.Background(), Request{Mode: ModeImport})
 	if !errors.Is(err, ErrTargetRequired) {
 		t.Fatalf("err = %v", err)
@@ -438,7 +436,7 @@ func TestImporterRejectsPayloadDigestMismatch(t *testing.T) {
 	source.inventory.Records[0].Payload = []byte(`{"value":2}`)
 	root := filepath.Join(t.TempDir(), "snapshot")
 	result, err := NewImporter(ImporterOptions{
-		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old", IndexRootID: "index"}},
+		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old"}},
 		Source:    source, Target: &targetFake{}, SnapshotRoot: root, TargetIdentity: "new",
 	}).Run(context.Background(), Request{Mode: ModeImport})
 	if !errors.Is(err, ErrValidation) || !errors.Is(err, ErrQuarantined) {
@@ -459,7 +457,7 @@ func TestImporterReportsPostPublicationCloseAsWarning(t *testing.T) {
 	target := &closeFailPublicationTarget{targetFake: targetFake{manifest: manifestFromSource(source.inventory)}}
 	result, err := NewImporter(ImporterOptions{
 		Readiness: &readinessFake{value: eventstore.Readiness{
-			Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old", IndexRootID: "index",
+			Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old",
 		}},
 		Source: source, Target: target, SnapshotRoot: filepath.Join(t.TempDir(), "snapshot"), TargetIdentity: "new",
 	}).Run(context.Background(), Request{Mode: ModeImport})
@@ -482,7 +480,7 @@ func TestImporterSortsVersionsBeforeImport(t *testing.T) {
 	source.inventory.Records = []SourceRecord{versionTwo, versionOne}
 	target := &targetFake{manifest: manifestFromSource(source.inventory)}
 	_, err := NewImporter(ImporterOptions{
-		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old", IndexRootID: "index"}},
+		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old"}},
 		Source:    source, Target: target, SnapshotRoot: filepath.Join(t.TempDir(), "snapshot"), TargetIdentity: "new",
 	}).Run(context.Background(), Request{Mode: ModeImport})
 	if err != nil {
@@ -496,7 +494,7 @@ func TestImporterSortsVersionsBeforeImport(t *testing.T) {
 func TestImporterImportsRebuildsReopensAndPublishes(t *testing.T) {
 	source := validImportSource()
 	target := &targetFake{manifest: manifestFromSource(source.inventory)}
-	readiness := &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old", IndexRootID: "index"}}
+	readiness := &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old"}}
 	result, err := NewImporter(ImporterOptions{Readiness: readiness, Source: source, Target: target, SnapshotRoot: filepath.Join(t.TempDir(), "snapshot"), TargetIdentity: "new"}).Run(context.Background(), Request{Mode: ModeImport})
 	if err != nil {
 		t.Fatal(err)
@@ -508,11 +506,8 @@ func TestImporterImportsRebuildsReopensAndPublishes(t *testing.T) {
 		t.Fatalf("result/publication = %#v/%#v/%#v", result, readiness.sets, target.published)
 	}
 	published := target.published[0]
-	if published.Mode != "import" || published.DatabaseIdentity != "new" || published.IndexRootID != "target-index" || published.CompletedAt.IsZero() {
+	if published.Mode != "import" || published.SchemaVersion != readinessSchemaVersion || published.DatabaseIdentity != "new" || published.CompletedAt.IsZero() {
 		t.Fatalf("readiness = %#v", published)
-	}
-	if len(published.SemanticManifest) == 0 || len(published.ProjectionManifest) == 0 || len(published.ProjectionManifestDigest) != sha256.Size {
-		t.Fatalf("readiness omitted semantic manifests: %#v", published)
 	}
 }
 
@@ -520,7 +515,7 @@ func TestImporterQuarantinesTargetManifestMismatch(t *testing.T) {
 	source := validImportSource()
 	target := &targetFake{manifest: manifestFromSource(source.inventory)}
 	target.manifest.Records[0].ContentDigest = bytes.Repeat([]byte{2}, 32)
-	readiness := &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old", IndexRootID: "index"}}
+	readiness := &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old"}}
 	result, err := NewImporter(ImporterOptions{Readiness: readiness, Source: source, Target: target, SnapshotRoot: filepath.Join(t.TempDir(), "snapshot"), TargetIdentity: "new"}).Run(context.Background(), Request{Mode: ModeImport})
 	if !errors.Is(err, ErrValidation) || !errors.Is(err, ErrQuarantined) {
 		t.Fatalf("err = %v", err)
@@ -540,7 +535,7 @@ func TestImporterQuarantinesProjectionManifestDriftAfterReopen(t *testing.T) {
 		projectionManifests: [][]byte{[]byte("rebuilt"), []byte("reopened-drift")},
 	}
 	result, err := NewImporter(ImporterOptions{
-		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old", IndexRootID: "index"}},
+		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old"}},
 		Source:    source, Target: target, SnapshotRoot: filepath.Join(t.TempDir(), "snapshot"), TargetIdentity: "new",
 	}).Run(context.Background(), Request{Mode: ModeImport})
 	if !errors.Is(err, ErrValidation) || !errors.Is(err, ErrQuarantined) {
@@ -556,7 +551,7 @@ func TestImporterQuarantinesProjectionManifestDriftAfterReopen(t *testing.T) {
 
 func TestImporterRejectsFreshIdentityReuseWhenDatabaseHasStandaloneState(t *testing.T) {
 	readiness := &readinessFake{
-		value:    eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "existing", IndexRootID: "index"},
+		value:    eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "existing"},
 		hasState: true,
 	}
 	_, err := NewImporter(ImporterOptions{
@@ -574,7 +569,7 @@ func TestPreflightRejectsPendingMigrationBackupMismatchAndCapacityOverflow(t *te
 		},
 		BackupIdentity: "source", LegacyOwnershipComplete: true,
 	}
-	readiness := eventstore.Readiness{DatabaseIdentity: "old", IndexRootID: "index"}
+	readiness := eventstore.Readiness{DatabaseIdentity: "old"}
 	pending := base
 	pending.PendingMigrations = []string{"006_V150UpgradeAttrsMigration"}
 	if _, err := DecidePreflight(context.Background(), Request{Mode: ModeImport}, "new", &pending, readiness); !errors.Is(err, ErrUnsupportedPreflight) {
@@ -594,7 +589,7 @@ func TestPreflightRejectsPendingMigrationBackupMismatchAndCapacityOverflow(t *te
 
 func TestImporterQuarantinesPublicationFailure(t *testing.T) {
 	source := validImportSource()
-	readiness := &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old", IndexRootID: "index"}}
+	readiness := &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old"}}
 	root := filepath.Join(t.TempDir(), "snapshot")
 	result, err := NewImporter(ImporterOptions{Readiness: readiness, Source: source, Target: &targetFake{manifest: manifestFromSource(source.inventory), errAt: "publish"}, SnapshotRoot: root, TargetIdentity: "new"}).Run(context.Background(), Request{Mode: ModeImport})
 	if err == nil || !errors.Is(err, ErrPublication) || !errors.Is(err, ErrQuarantined) {
@@ -613,7 +608,7 @@ func TestImporterQuarantinesEveryTargetPhaseWithoutChangingCurrentReadiness(t *t
 		t.Run(stage, func(t *testing.T) {
 			source := validImportSource()
 			current := &readinessFake{value: eventstore.Readiness{
-				Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "current", IndexRootID: "current-index",
+				Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "current",
 			}}
 			target := &targetFake{manifest: manifestFromSource(source.inventory), errAt: stage}
 			result, err := NewImporter(ImporterOptions{
@@ -646,7 +641,7 @@ func TestImporterFailureInjectionNeverPublishesPartialTarget(t *testing.T) {
 		t.Run(stage.name, func(t *testing.T) {
 			source := validImportSource()
 			current := &readinessFake{value: eventstore.Readiness{
-				Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "current", IndexRootID: "current-index",
+				Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "current",
 			}}
 			target := &targetFake{manifest: manifestFromSource(source.inventory)}
 			injected := errors.New("injected " + stage.name)

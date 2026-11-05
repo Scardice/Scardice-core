@@ -39,7 +39,7 @@ type EndpointView struct {
 }
 
 // OperationProjection is a safe operation API view. It mirrors only durable
-// operation metadata; private ciphertext and artifact contents are absent.
+// operation metadata; private context and artifact contents are absent.
 type OperationProjection struct {
 	OperationID    string                `json:"operationId"`
 	EndpointID     adapterapi.EndpointID `json:"endpointId"`
@@ -113,7 +113,7 @@ func decodeProjectionEvent(envelope eventstore.Envelope) (Event, error) {
 	if event.EndpointID == "" {
 		event.EndpointID = streamEndpointID
 	}
-	if event.Sequence == 0 || event.AggregateVersion == 0 || event.OperationID == "" || event.CorrelationID == "" || event.CommandID == "" || event.DesiredVersion == 0 || !event.DesiredState.Valid() || !event.ObservedState.Valid() || !event.OperationState.Valid() || (event.ProviderID != "" && !event.ProviderID.Valid()) {
+	if event.Sequence == 0 || event.AggregateVersion == 0 || !validEventOperation(event.Type, event.OperationState, event.OperationID) || event.CorrelationID == "" || event.CommandID == "" || event.DesiredVersion == 0 || !event.DesiredState.Valid() || !event.ObservedState.Valid() || !event.OperationState.Valid() || (event.ProviderID != "" && !event.ProviderID.Valid()) {
 		return Event{}, fmt.Errorf("endpoint: incomplete projection event: %w", ErrInvalidState)
 	}
 	if event.EndpointID != streamEndpointID || !event.EndpointID.Valid() {
@@ -141,7 +141,7 @@ func ApplyEndpointProjection(_ context.Context, tx *gorm.DB, envelopes []eventst
 			DesiredVersion: event.DesiredVersion, ProviderID: event.ProviderID, Generation: event.Generation,
 			OperationID: event.OperationID, CorrelationID: event.CorrelationID, Version: event.Sequence,
 		}
-		if typ != EventEndpointCreated {
+		if typ != EventEndpointCreated && typ != EventBaselineImported {
 			var previous EndpointView
 			rowErr := readProjection(tx, EndpointProjectionName, string(event.EndpointID), &previous)
 			if rowErr == nil {
@@ -151,16 +151,14 @@ func ApplyEndpointProjection(_ context.Context, tx *gorm.DB, envelopes []eventst
 						view.AdapterKey = previous.AdapterKey
 					}
 				}
-				if typ != EventLegacyMetadataRestored {
-					if event.ProviderID == "" {
-						view.ProviderID = previous.ProviderID
-					}
-					if event.DisplayName == "" {
-						view.DisplayName = previous.DisplayName
-					}
-					view.Statistics = previous.Statistics
+				if event.ProviderID == "" {
+					view.ProviderID = previous.ProviderID
 				}
-				if typ == EventEndpointIdentityObserved || typ == EventLegacyMetadataRestored {
+				if event.DisplayName == "" {
+					view.DisplayName = previous.DisplayName
+				}
+				view.Statistics = previous.Statistics
+				if typ == EventEndpointIdentityObserved {
 					view.CorrelationID = previous.CorrelationID
 				}
 			} else if !errors.Is(rowErr, gorm.ErrRecordNotFound) {
@@ -186,7 +184,7 @@ func ApplyOperationProjection(_ context.Context, tx *gorm.DB, envelopes []events
 		if err != nil {
 			return err
 		}
-		if event.Type == EventEndpointIdentityObserved || event.Type == EventLegacyMetadataRestored {
+		if event.Type == EventBaselineImported || event.Type == EventEndpointIdentityObserved {
 			continue
 		}
 		status := event.OperationState

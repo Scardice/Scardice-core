@@ -14,6 +14,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 
+	"Scardice-core/core/managerstate"
 	"Scardice-core/dice"
 	"Scardice-core/utils/crypto"
 )
@@ -216,15 +217,17 @@ type backupConfig struct {
 }
 
 func backupConfigGet(c echo.Context) error {
-	bc := backupConfig{}
-	bc.AutoBackupEnable = dm.AutoBackupEnable
-	bc.AutoBackupTime = dm.AutoBackupTime
-	bc.AutoBackupSelection = uint64(dm.AutoBackupSelection)
-	bc.BackupCleanStrategy = int(dm.BackupCleanStrategy)
-	bc.BackupCleanKeepCount = dm.BackupCleanKeepCount
-	bc.BackupCleanKeepDur = dm.BackupCleanKeepDur.String()
-	bc.BackupCleanTrigger = int(dm.BackupCleanTrigger)
-	bc.BackupCleanCron = dm.BackupCleanCron
+	public, _ := dm.ManagerPublicConfigSnapshot()
+	bc := backupConfig{
+		AutoBackupEnable:     public.AutoBackupEnable,
+		AutoBackupTime:       public.AutoBackupTime,
+		AutoBackupSelection:  public.AutoBackupSelection,
+		BackupCleanStrategy:  public.BackupClean.Strategy,
+		BackupCleanKeepCount: public.BackupClean.KeepCount,
+		BackupCleanKeepDur:   time.Duration(public.BackupClean.KeepDuration).String(),
+		BackupCleanTrigger:   public.BackupClean.Trigger,
+		BackupCleanCron:      public.BackupClean.Cron,
+	}
 	return c.JSON(http.StatusOK, bc)
 }
 
@@ -244,32 +247,39 @@ func backupConfigSave(c echo.Context) error {
 		return c.String(430, "")
 	}
 
-	dm.AutoBackupEnable = v.AutoBackupEnable
-	dm.AutoBackupTime = v.AutoBackupTime
-	dm.AutoBackupSelection = dice.BackupSelection(v.AutoBackupSelection)
-
-	if int(dice.BackupCleanStrategyDisabled) <= v.BackupCleanStrategy && v.BackupCleanStrategy <= int(dice.BackupCleanStrategyByTime) {
-		dm.BackupCleanStrategy = dice.BackupCleanStrategy(v.BackupCleanStrategy)
-		if dm.BackupCleanStrategy == dice.BackupCleanStrategyByCount && v.BackupCleanKeepCount > 0 {
-			dm.BackupCleanKeepCount = v.BackupCleanKeepCount
-		}
-		if dm.BackupCleanStrategy == dice.BackupCleanStrategyByTime && len(v.BackupCleanKeepDur) > 0 {
-			if dur, err := time.ParseDuration(v.BackupCleanKeepDur); err == nil {
-				dm.BackupCleanKeepDur = dur
-			} else {
-				myDice.Logger.Errorf("设定的自动清理保留时间有误: %q %v", v.BackupCleanKeepDur, err)
-			}
-		}
-		if v.BackupCleanTrigger > 0 {
-			dm.BackupCleanTrigger = dice.BackupCleanTrigger(v.BackupCleanTrigger)
-			if dm.BackupCleanTrigger&dice.BackupCleanTriggerCron > 0 {
-				dm.BackupCleanCron = v.BackupCleanCron
-			}
+	var retention *time.Duration
+	if v.BackupCleanStrategy == int(dice.BackupCleanStrategyByTime) && v.BackupCleanKeepDur != "" {
+		if duration, parseErr := time.ParseDuration(v.BackupCleanKeepDur); parseErr == nil {
+			retention = &duration
+		} else {
+			myDice.Logger.Errorf("设定的自动清理保留时间有误: %q %v", v.BackupCleanKeepDur, parseErr)
 		}
 	}
-
+	err = dm.DurableMutateManagerConfig(c.Request().Context(), "backup-settings", v, func(public *managerstate.PublicConfig) error {
+		public.AutoBackupEnable = v.AutoBackupEnable
+		public.AutoBackupTime = v.AutoBackupTime
+		public.AutoBackupSelection = v.AutoBackupSelection
+		if int(dice.BackupCleanStrategyDisabled) <= v.BackupCleanStrategy && v.BackupCleanStrategy <= int(dice.BackupCleanStrategyByTime) {
+			public.BackupClean.Strategy = v.BackupCleanStrategy
+			if v.BackupCleanStrategy == int(dice.BackupCleanStrategyByCount) && v.BackupCleanKeepCount > 0 {
+				public.BackupClean.KeepCount = v.BackupCleanKeepCount
+			}
+			if retention != nil {
+				public.BackupClean.KeepDuration = int64(*retention)
+			}
+			if v.BackupCleanTrigger > 0 {
+				public.BackupClean.Trigger = v.BackupCleanTrigger
+				if dice.BackupCleanTrigger(v.BackupCleanTrigger)&dice.BackupCleanTriggerCron > 0 {
+					public.BackupClean.Cron = v.BackupCleanCron
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return Error(&c, err.Error(), Response{"code": "config_update_failed"})
+	}
 	dm.ResetAutoBackup()
 	dm.ResetBackupClean()
-	dm.Save()
 	return c.String(http.StatusOK, "")
 }

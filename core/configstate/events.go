@@ -210,8 +210,10 @@ type AdvancedConfig struct {
 	AllowFilesystemUnrestrictedAccess bool    `json:"allowFilesystemUnrestrictedAccess"`
 }
 type OuterConfig struct {
-	CommandPrefix []string `json:"commandPrefix,omitempty"`
-	DiceMasters   []string `json:"diceMasters,omitempty"`
+	CommandPrefix     []string `json:"commandPrefix,omitempty"`
+	DiceMasters       []string `json:"diceMasters,omitempty"`
+	UpgradeWindowID   string   `json:"upgradeWindowId,omitempty"`
+	UpgradeEndpointID string   `json:"upgradeEndpointId,omitempty"`
 }
 
 // Each event carries exactly one persisted configuration group.
@@ -316,8 +318,8 @@ func cloneCensorConfig(value CensorConfig) CensorConfig {
 	return value
 }
 func cloneStoreConfig(value StoreConfig) StoreConfig {
-	value.BackendURLs = normalizeSlices(value.BackendURLs, true)
-	value.DisabledBackendURLs = normalizeSlices(value.DisabledBackendURLs, true)
+	value.BackendURLs = normalizeSlices(value.BackendURLs, false)
+	value.DisabledBackendURLs = normalizeSlices(value.DisabledBackendURLs, false)
 	return value
 }
 func cloneOuterConfig(value OuterConfig) OuterConfig {
@@ -360,7 +362,7 @@ func (e ExtensionChangedV1) configValidate() error {
 	return nil
 }
 func (e BanChangedV1) configValidate() error {
-	if e.ThresholdWarn < 0 || e.ThresholdBan < 0 || e.AutoBanMinutes < 0 || e.ScoreReducePerMinute < 0 || e.BanNotifyIntervalMinutes < 0 || !finite(e.JointScorePercentOfGroup) || e.JointScorePercentOfGroup < 0 || e.JointScorePercentOfGroup > 1 || !finite(e.JointScorePercentOfInviter) || e.JointScorePercentOfInviter < 0 || e.JointScorePercentOfInviter > 1 {
+	if e.ThresholdWarn < 0 || e.ThresholdBan < 0 || e.AutoBanMinutes < 0 || e.ScoreReducePerMinute < 0 || e.BanNotifyIntervalMinutes < -1 || !finite(e.JointScorePercentOfGroup) || e.JointScorePercentOfGroup < 0 || e.JointScorePercentOfGroup > 1 || !finite(e.JointScorePercentOfInviter) || e.JointScorePercentOfInviter < 0 || e.JointScorePercentOfInviter > 1 {
 		return ErrInvalidCommand
 	}
 	return nil
@@ -593,8 +595,8 @@ func cloneEvent(e TypedEvent) TypedEvent {
 		v.Scores = normalizeMaps(v.Scores)
 		return v
 	case StoreChangedV1:
-		v.BackendURLs = normalizeSlices(v.BackendURLs, true)
-		v.DisabledBackendURLs = normalizeSlices(v.DisabledBackendURLs, true)
+		v.BackendURLs = normalizeSlices(v.BackendURLs, false)
+		v.DisabledBackendURLs = normalizeSlices(v.DisabledBackendURLs, false)
 		return v
 	}
 	return e

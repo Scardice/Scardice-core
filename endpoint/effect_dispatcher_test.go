@@ -86,12 +86,6 @@ func (s *dispatcherTestStore) QuarantineOutbox(_ context.Context, r eventstore.O
 	return eventstore.CommitResult{EffectIDs: []string{r.EffectID}, Version: r.ExpectedVersion + 1}, nil
 }
 
-type dispatcherTestDecrypt struct{ plain []byte }
-
-func (d dispatcherTestDecrypt) DecryptBound(context.Context, string, string, string, uint64, []byte, []byte, string) ([]byte, error) {
-	return d.plain, nil
-}
-
 type dispatcherTestExecutor struct{}
 
 func (dispatcherTestExecutor) ExecutePinned(context.Context, adapterapi.EndpointID, uint64, adapterapi.OutboundEffect) (adapterapi.EffectResult, error) {
@@ -111,16 +105,17 @@ func (dispatcherTestClock) Now() time.Time          { return time.Unix(0, 0).UTC
 func (i *dispatcherTestIDs) NewID() (string, error) { i.n++; return "id-" + string(rune('0'+i.n)), nil }
 func TestEffectDispatcherUsesFreshAttemptAndAtomicTerminalWork(t *testing.T) {
 	target := adapterapi.EffectTarget{Kind: adapterapi.TargetPerson, Conversation: "person-1"}
-	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, []byte("root"), 1)
+	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	effect := adapterapi.OutboundEffect{Version: adapterapi.EffectVersionOne, ID: "effect-1", EndpointID: "endpoint-1", OperationID: "op-1", CorrelationID: "correlation-1", CausationID: "cause-1", Lane: lane, Deadline: time.Now().Add(24 * time.Hour), Risk: adapterapi.EffectRiskNormal, RetryClass: adapterapi.EffectRetryNonIdempotent, RequiredCapabilities: adapterapi.CapabilityOutbound, RequiredAction: adapterapi.ActionKindSendMessage, Kind: adapterapi.EffectKindMessage, Payload: adapterapi.EffectPayload{Kind: adapterapi.EffectPayloadPersonText, Target: target, Text: "hello"}}
 	plain, _ := json.Marshal(effectWire{Effect: effect})
-	store := &dispatcherTestStore{claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 2, AttemptID: "old-attempt", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", DeadlineAt: effect.Deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}, marked: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 2, EndpointID: "endpoint-1", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}}
+	store := &dispatcherTestStore{claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 2, AttemptID: "old-attempt", Payload: plain, DeadlineAt: effect.Deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}, marked: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 2, EndpointID: "endpoint-1", Payload: plain, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}}
+	store.claimed.Effect.Lane = lane.Key
 	ids := &dispatcherTestIDs{}
 	notifier := dispatcherTestNotifier{received: make(chan adapterapi.EffectResult, 1)}
-	d, err := NewEffectDispatcher(store, dispatcherTestDecrypt{plain}, dispatcherTestExecutor{}, "worker", WithDispatcherClock(dispatcherTestClock{}), WithDispatcherIDGenerator(ids), WithEffectSuccessNotifier(notifier))
+	d, err := NewEffectDispatcher(store, dispatcherTestExecutor{}, "worker", WithDispatcherClock(dispatcherTestClock{}), WithDispatcherIDGenerator(ids), WithEffectSuccessNotifier(notifier), WithDispatcherNotificationOwner(newDispatcherTestNotificationOwner(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,11 +138,10 @@ func TestEffectDispatcherUsesFreshAttemptAndAtomicTerminalWork(t *testing.T) {
 		t.Fatal("work")
 	}
 }
+
 func TestEffectDispatcherQuarantinesDecodeFailure(t *testing.T) {
-	store := &dispatcherTestStore{claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{
-		EffectID: "effect-1", Version: 3, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 4, AttemptID: "attempt-1", PrincipalID: "principal-1",
-	}}}
-	d, err := NewEffectDispatcher(store, dispatcherTestDecrypt{plain: []byte("{")}, dispatcherTestExecutor{}, "worker")
+	store := &dispatcherTestStore{claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 3, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 4, AttemptID: "attempt-1", PrincipalID: "principal-1", Payload: []byte("{")}}}
+	d, err := NewEffectDispatcher(store, dispatcherTestExecutor{}, "worker")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +174,7 @@ func TestEffectDispatcherNotifiesCommittedQuarantine(t *testing.T) {
 		EffectID: "effect-1", Version: 3, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 4, AttemptID: "attempt-1",
 	}}}
 	notifier := dispatcherQuarantineNotifier{received: make(chan adapterapi.EffectResult, 1), effects: make(chan adapterapi.OutboundEffect, 1)}
-	d, err := NewEffectDispatcher(store, dispatcherTestDecrypt{plain: []byte("{")}, dispatcherTestExecutor{}, "worker", WithEffectResultNotifier(notifier))
+	d, err := NewEffectDispatcher(store, dispatcherTestExecutor{}, "worker", WithEffectResultNotifier(notifier), WithDispatcherNotificationOwner(newDispatcherTestNotificationOwner(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,15 +207,16 @@ func (dispatcherInvalidResultExecutor) ExecutePinned(context.Context, adapterapi
 
 func TestEffectDispatcherNotifiesNormalizedInvalidResult(t *testing.T) {
 	target := adapterapi.EffectTarget{Kind: adapterapi.TargetPerson, Conversation: "person-1"}
-	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, []byte("root"), 1)
+	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	effect := adapterapi.OutboundEffect{Version: adapterapi.EffectVersionOne, ID: "effect-1", EndpointID: "endpoint-1", OperationID: "op-1", CorrelationID: "corr-1", CausationID: "cause-1", Lane: lane, Deadline: time.Now().Add(time.Hour), Risk: adapterapi.EffectRiskNormal, RetryClass: adapterapi.EffectRetryNonIdempotent, RequiredCapabilities: adapterapi.CapabilityOutbound, RequiredAction: adapterapi.ActionKindSendMessage, Kind: adapterapi.EffectKindMessage, Payload: adapterapi.EffectPayload{Kind: adapterapi.EffectPayloadPersonText, Target: target, Text: "hello"}}
 	plain, _ := json.Marshal(effectWire{Effect: effect})
-	store := &dispatcherTestStore{claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", DeadlineAt: effect.Deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}, marked: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 2, EndpointID: "endpoint-1", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}}
+	store := &dispatcherTestStore{claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", Payload: plain, DeadlineAt: effect.Deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}, marked: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 2, EndpointID: "endpoint-1", Payload: plain, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}}
+	store.claimed.Effect.Lane = lane.Key
 	notifier := dispatcherQuarantineNotifier{received: make(chan adapterapi.EffectResult, 1), effects: make(chan adapterapi.OutboundEffect, 1)}
-	d, err := NewEffectDispatcher(store, dispatcherTestDecrypt{plain}, dispatcherInvalidResultExecutor{}, "worker", WithDispatcherIDGenerator(&dispatcherTestIDs{}), WithEffectResultNotifier(notifier))
+	d, err := NewEffectDispatcher(store, dispatcherInvalidResultExecutor{}, "worker", WithDispatcherIDGenerator(&dispatcherTestIDs{}), WithEffectResultNotifier(notifier), WithDispatcherNotificationOwner(newDispatcherTestNotificationOwner(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,19 +235,20 @@ func TestEffectDispatcherNotifiesNormalizedInvalidResult(t *testing.T) {
 
 func TestEffectDispatcherQuarantinesPostDispatchPersistenceFailureAsAmbiguous(t *testing.T) {
 	target := adapterapi.EffectTarget{Kind: adapterapi.TargetPerson, Conversation: "person-1"}
-	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, []byte("root"), 1)
+	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	effect := adapterapi.OutboundEffect{Version: adapterapi.EffectVersionOne, ID: "effect-1", EndpointID: "endpoint-1", OperationID: "op-1", CorrelationID: "corr-1", CausationID: "cause-1", Lane: lane, Deadline: time.Now().Add(time.Hour), Risk: adapterapi.EffectRiskNormal, RetryClass: adapterapi.EffectRetryNonIdempotent, RequiredCapabilities: adapterapi.CapabilityOutbound, RequiredAction: adapterapi.ActionKindSendMessage, Kind: adapterapi.EffectKindMessage, Payload: adapterapi.EffectPayload{Kind: adapterapi.EffectPayloadPersonText, Target: target, Text: "hello"}}
 	plain, _ := json.Marshal(effectWire{Effect: effect})
 	store := &dispatcherTestStore{
-		claimed:   eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", DeadlineAt: effect.Deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}},
-		marked:    eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 2, EndpointID: "endpoint-1", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", RiskClass: eventstore.RiskNonIdempotentAfterDispatch}},
+		claimed:   eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", Payload: plain, DeadlineAt: effect.Deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}},
+		marked:    eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 2, EndpointID: "endpoint-1", Payload: plain, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}},
 		commitErr: errors.New("terminal persistence failed"),
 	}
+	store.claimed.Effect.Lane = lane.Key
 	notifier := dispatcherQuarantineNotifier{received: make(chan adapterapi.EffectResult, 1), effects: make(chan adapterapi.OutboundEffect, 1)}
-	d, err := NewEffectDispatcher(store, dispatcherTestDecrypt{plain}, dispatcherTestExecutor{}, "worker", WithDispatcherIDGenerator(&dispatcherTestIDs{}), WithEffectResultNotifier(notifier))
+	d, err := NewEffectDispatcher(store, dispatcherTestExecutor{}, "worker", WithDispatcherIDGenerator(&dispatcherTestIDs{}), WithEffectResultNotifier(notifier), WithDispatcherNotificationOwner(newDispatcherTestNotificationOwner(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,15 +283,16 @@ func (e *dispatcherGenerationExecutor) ExecutePinned(_ context.Context, _ adapte
 
 func TestEffectDispatcherSnapshotsWorkerGeneration(t *testing.T) {
 	target := adapterapi.EffectTarget{Kind: adapterapi.TargetPerson, Conversation: "person-1"}
-	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, []byte("root"), 1)
+	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	effect := adapterapi.OutboundEffect{Version: adapterapi.EffectVersionOne, ID: "effect-1", EndpointID: "endpoint-1", OperationID: "op-1", CorrelationID: "corr-1", CausationID: "cause-1", Lane: lane, Deadline: time.Now().Add(time.Hour), Risk: adapterapi.EffectRiskNormal, RetryClass: adapterapi.EffectRetryNonIdempotent, RequiredCapabilities: adapterapi.CapabilityOutbound, RequiredAction: adapterapi.ActionKindSendMessage, Kind: adapterapi.EffectKindMessage, Payload: adapterapi.EffectPayload{Kind: adapterapi.EffectPayloadPersonText, Target: target, Text: "hello"}}
 	plain, _ := json.Marshal(effectWire{Effect: effect})
-	store := &dispatcherTestStore{claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", DeadlineAt: effect.Deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}, marked: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 2, EndpointID: "endpoint-1", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}}
+	store := &dispatcherTestStore{claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", Payload: plain, DeadlineAt: effect.Deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}, marked: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 2, EndpointID: "endpoint-1", Payload: plain, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}}
+	store.claimed.Effect.Lane = lane.Key
 	executor := &dispatcherGenerationExecutor{generation: 7}
-	d, err := NewEffectDispatcher(store, dispatcherTestDecrypt{plain}, executor, "worker", WithDispatcherIDGenerator(&dispatcherTestIDs{}))
+	d, err := NewEffectDispatcher(store, executor, "worker", WithDispatcherIDGenerator(&dispatcherTestIDs{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,15 +318,16 @@ func (e *dispatcherUnavailableExecutor) ExecutePinned(context.Context, adapterap
 
 func TestEffectDispatcherRejectsMissingWorkerBeforeProviderExecution(t *testing.T) {
 	target := adapterapi.EffectTarget{Kind: adapterapi.TargetPerson, Conversation: "person-1"}
-	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, []byte("root"), 1)
+	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	effect := adapterapi.OutboundEffect{Version: adapterapi.EffectVersionOne, ID: "effect-1", EndpointID: "endpoint-1", OperationID: "op-1", CorrelationID: "corr-1", CausationID: "cause-1", Lane: lane, Deadline: time.Now().Add(time.Hour), Risk: adapterapi.EffectRiskNormal, RetryClass: adapterapi.EffectRetryNonIdempotent, RequiredCapabilities: adapterapi.CapabilityOutbound, RequiredAction: adapterapi.ActionKindSendMessage, Kind: adapterapi.EffectKindMessage, Payload: adapterapi.EffectPayload{Kind: adapterapi.EffectPayloadPersonText, Target: target, Text: "hello"}}
 	plain, _ := json.Marshal(effectWire{Effect: effect})
-	store := &dispatcherTestStore{claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", DeadlineAt: effect.Deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}, marked: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 2, EndpointID: "endpoint-1", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}}
+	store := &dispatcherTestStore{claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", Payload: plain, DeadlineAt: effect.Deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}, marked: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 2, EndpointID: "endpoint-1", Payload: plain, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}}
+	store.claimed.Effect.Lane = lane.Key
 	executor := &dispatcherUnavailableExecutor{}
-	d, err := NewEffectDispatcher(store, dispatcherTestDecrypt{plain}, executor, "worker", WithDispatcherRandom(func(time.Duration) time.Duration { return 0 }))
+	d, err := NewEffectDispatcher(store, executor, "worker", WithDispatcherRandom(func(time.Duration) time.Duration { return 0 }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,18 +360,76 @@ func (e *dispatcherRecordingExecutor) ExecutePinned(context.Context, adapterapi.
 	return adapterapi.EffectResult{Outcome: adapterapi.EffectSucceeded}, nil
 }
 
+func TestEffectDispatcherQuarantinesPayloadAndLaneIdentityMismatch(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*adapterapi.OutboundEffect, *eventstore.NewEffect)
+	}{
+		{"stored-lane", func(_ *adapterapi.OutboundEffect, row *eventstore.NewEffect) { row.Lane = "another-lane" }},
+		{"missing-lane", func(_ *adapterapi.OutboundEffect, row *eventstore.NewEffect) { row.Lane = "" }},
+		{"payload-target", func(effect *adapterapi.OutboundEffect, _ *eventstore.NewEffect) {
+			effect.Payload.Target.Conversation = "another-person"
+		}},
+		{"stored-endpoint", func(_ *adapterapi.OutboundEffect, row *eventstore.NewEffect) { row.EndpointID = "another-endpoint" }},
+		{"stored-deadline", func(_ *adapterapi.OutboundEffect, row *eventstore.NewEffect) {
+			row.DeadlineAt = row.DeadlineAt.Add(time.Second)
+		}},
+		{"stored-risk", func(_ *adapterapi.OutboundEffect, row *eventstore.NewEffect) {
+			row.RiskClass = eventstore.RiskProviderIdempotent
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			target := adapterapi.EffectTarget{Kind: adapterapi.TargetPerson, Conversation: "person-1"}
+			lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			effect := adapterapi.OutboundEffect{
+				Version: adapterapi.EffectVersionOne, ID: "effect-1", EndpointID: "endpoint-1", OperationID: "op-1",
+				CorrelationID: "corr-1", CausationID: "cause-1", Lane: lane, Deadline: time.Unix(3600, 0).UTC(),
+				Risk: adapterapi.EffectRiskNormal, RetryClass: adapterapi.EffectRetryNonIdempotent,
+				RequiredCapabilities: adapterapi.CapabilityOutbound, RequiredAction: adapterapi.ActionKindSendMessage,
+				Kind: adapterapi.EffectKindMessage, Payload: adapterapi.EffectPayload{Kind: adapterapi.EffectPayloadPersonText, Target: target, Text: "hello"},
+			}
+			row := eventstore.NewEffect{
+				EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", Lane: lane.Key,
+				LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1",
+				DeadlineAt: effect.Deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch,
+			}
+			test.mutate(&effect, &row)
+			row.Payload, err = json.Marshal(effectWire{Effect: effect})
+			if err != nil {
+				t.Fatal(err)
+			}
+			store := &dispatcherTestStore{claimed: eventstore.OutboxLease{Effect: row}}
+			executor := &dispatcherRecordingExecutor{}
+			dispatcher, err := NewEffectDispatcher(store, executor, "worker", WithDispatcherClock(dispatcherTestClock{}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = dispatcher.DispatchOnce(context.Background()); err == nil {
+				t.Fatal("inconsistent persisted effect was accepted")
+			}
+			if executor.executed || !store.quarantined {
+				t.Fatalf("identity mismatch reached provider or escaped quarantine: executed=%v quarantined=%v", executor.executed, store.quarantined)
+			}
+		})
+	}
+}
+
 func TestEffectDispatcherExpiresBeforeDispatchMarker(t *testing.T) {
 	target := adapterapi.EffectTarget{Kind: adapterapi.TargetPerson, Conversation: "person-1"}
-	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, []byte("root"), 1)
+	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Unix(-1, 0).UTC()
 	effect := adapterapi.OutboundEffect{Version: adapterapi.EffectVersionOne, ID: "effect-1", EndpointID: "endpoint-1", OperationID: "op-1", CorrelationID: "corr-1", CausationID: "cause-1", Lane: lane, Deadline: deadline, Risk: adapterapi.EffectRiskNormal, RetryClass: adapterapi.EffectRetryNonIdempotent, RequiredCapabilities: adapterapi.CapabilityOutbound, RequiredAction: adapterapi.ActionKindSendMessage, Kind: adapterapi.EffectKindMessage, Payload: adapterapi.EffectPayload{Kind: adapterapi.EffectPayloadPersonText, Target: target, Text: "hello"}}
 	plain, _ := json.Marshal(effectWire{Effect: effect})
-	store := &dispatcherTestStore{claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", DeadlineAt: deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}}
+	store := &dispatcherTestStore{claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", Payload: plain, DeadlineAt: deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}}}
+	store.claimed.Effect.Lane = lane.Key
 	executor := &dispatcherRecordingExecutor{}
-	d, err := NewEffectDispatcher(store, dispatcherTestDecrypt{plain}, executor, "worker", WithDispatcherClock(dispatcherTestClock{}), WithDispatcherIDGenerator(&dispatcherTestIDs{}))
+	d, err := NewEffectDispatcher(store, executor, "worker", WithDispatcherClock(dispatcherTestClock{}), WithDispatcherIDGenerator(&dispatcherTestIDs{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +453,7 @@ func TestEffectDispatcherExpiresBeforeDispatchMarker(t *testing.T) {
 
 func TestEffectDispatcherExpiresAfterDispatchMarkerRecordsAmbiguous(t *testing.T) {
 	target := adapterapi.EffectTarget{Kind: adapterapi.TargetPerson, Conversation: "person-1"}
-	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, []byte("root"), 1)
+	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,9 +467,10 @@ func TestEffectDispatcherExpiresAfterDispatchMarkerRecordsAmbiguous(t *testing.T
 		Payload: adapterapi.EffectPayload{Kind: adapterapi.EffectPayloadRecall, Target: target, MessageID: "message-1"},
 	}
 	plain, _ := json.Marshal(effectWire{Effect: effect})
-	store := &dispatcherTestStore{claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 2, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 2, AttemptID: "attempt-2", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", DeadlineAt: deadline, DispatchedAt: dispatchedAt, RiskClass: eventstore.RiskProviderIdempotent}}}
+	store := &dispatcherTestStore{claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 2, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 2, AttemptID: "attempt-2", Payload: plain, DeadlineAt: deadline, DispatchedAt: dispatchedAt, RiskClass: eventstore.RiskProviderIdempotent}}}
+	store.claimed.Effect.Lane = lane.Key
 	executor := &dispatcherRecordingExecutor{}
-	d, err := NewEffectDispatcher(store, dispatcherTestDecrypt{plain}, executor, "worker", WithDispatcherClock(dispatcherTestClock{}), WithDispatcherIDGenerator(&dispatcherTestIDs{}))
+	d, err := NewEffectDispatcher(store, executor, "worker", WithDispatcherClock(dispatcherTestClock{}), WithDispatcherIDGenerator(&dispatcherTestIDs{}))
 	if err != nil {
 		t.Fatal(err)
 	}

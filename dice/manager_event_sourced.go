@@ -3,8 +3,6 @@ package dice
 import (
 	"context"
 	"errors"
-	"sort"
-	"strings"
 	"time"
 
 	"Scardice-core/core/managerstate"
@@ -33,8 +31,11 @@ func (dm *DiceManager) RestoreEventSourcedManager(ctx context.Context, store eve
 }
 
 func (dm *DiceManager) restoreEventSourcedManager(ctx context.Context, store eventstore.Store, observer eventSourcedInitializationObserver) error {
-	if dm == nil || !dm.EventSourcedMode || store == nil {
-		return errors.New("dice manager is not ready for event-sourced restore")
+	if dm == nil {
+		return errors.New("dice manager is nil")
+	}
+	if store == nil {
+		return errors.New("dice: event store is required for manager restore")
 	}
 	repository, err := managerstate.NewRepository(store)
 	if err != nil {
@@ -99,83 +100,4 @@ func (dm *DiceManager) applyEventSourcedManagerPublic(public managerstate.Public
 	dm.BackupCleanTrigger = BackupCleanTrigger(public.BackupClean.Trigger)
 	dm.BackupCleanCron = public.BackupClean.Cron
 	dm.ServiceName = public.ServiceName
-}
-
-func (dm *DiceManager) saveEventSourcedManager() error {
-	dm.managerStateMu.Lock()
-	defer dm.managerStateMu.Unlock()
-	return dm.saveEventSourcedManagerLocked()
-}
-
-func (dm *DiceManager) saveEventSourcedManagerLocked() error {
-	if dm.durableStore == nil || dm.managerState.Version == 0 {
-		return errors.New("event-sourced manager state is unavailable")
-	}
-	public, auth := dm.eventSourcedManagerSnapshot()
-	repository, err := managerstate.NewRepository(dm.durableStore)
-	if err != nil {
-		return err
-	}
-	state, err := repository.Save(context.Background(), dm.managerState, public, auth)
-	if err != nil {
-		return err
-	}
-	dm.managerState = state
-	return nil
-}
-
-// AuthenticateAndStoreAccessToken serializes login with manager configuration
-// changes so a token is checked, stored, and durably published as one update.
-func (dm *DiceManager) AuthenticateAndStoreAccessToken(password, token string) (bool, error) {
-	if dm == nil || strings.TrimSpace(token) == "" {
-		return false, errors.New("manager authentication is unavailable")
-	}
-	dm.managerStateMu.Lock()
-	defer dm.managerStateMu.Unlock()
-	if dm.UIPasswordHash != "" && dm.UIPasswordHash != password {
-		return false, nil
-	}
-	dm.AccessTokens.Store(token, true)
-	if err := dm.saveEventSourcedManagerLocked(); err != nil {
-		dm.AccessTokens.Delete(token)
-		return false, err
-	}
-	return true, nil
-}
-
-func (dm *DiceManager) eventSourcedManagerSnapshot() (managerstate.PublicConfig, managerstate.Auth) {
-	tokens := make([]string, 0)
-	dm.AccessTokens.Range(func(token string, enabled bool) bool {
-		if enabled {
-			tokens = append(tokens, token)
-		}
-		return true
-	})
-	sort.Strings(tokens)
-	dataDirs := make(map[string]string, len(dm.Dice))
-	for _, instance := range dm.Dice {
-		if instance == nil || instance.BaseConfig.Name == "" {
-			continue
-		}
-		dataDir := instance.BaseConfig.DataDir
-		if dataDir == "" {
-			dataDir = "./data/" + instance.BaseConfig.Name
-		}
-		dataDirs[instance.BaseConfig.Name] = dataDir
-	}
-	public := managerstate.PublicConfig{
-		ServeAddress: dm.ServeAddress, TrayTooltip: dm.GetTrayTooltip(),
-		WebUIAddress: dm.managerState.Public.WebUIAddress, HelpDocEngineType: dm.HelpDocEngineType,
-		DiceRandomMode: dm.DiceRandomMode, AutoBackupEnable: dm.AutoBackupEnable,
-		AutoBackupTime: dm.AutoBackupTime, AutoBackupSelection: uint64(dm.AutoBackupSelection),
-		BackupClean: managerstate.BackupCleanConfig{
-			Strategy: int(dm.BackupCleanStrategy), KeepCount: dm.BackupCleanKeepCount,
-			KeepDuration: int64(dm.BackupCleanKeepDur), Trigger: int(dm.BackupCleanTrigger),
-			Cron: dm.BackupCleanCron,
-		},
-		ServiceName: dm.ServiceName, ConfigVersion: dm.managerState.Public.ConfigVersion,
-		DiceDataDirs: dataDirs,
-	}
-	auth := managerstate.Auth{UIPasswordSalt: dm.UIPasswordSalt, UIPasswordHash: dm.UIPasswordHash, AccessTokens: tokens}
-	return public, auth
 }

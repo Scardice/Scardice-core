@@ -48,7 +48,7 @@ func formatDiceRollShaperStatusText(ctx *MsgContext) string {
 		return "骰点整形模式不可用：当前消息没有可用的设置范围"
 	}
 	mode := ctx.Group.getDiceRollShaperMode()
-	return fmt.Sprintf("生效范围：%s\n骰点整形模式：%s", ctx.Group.GroupID, formatDiceRollShaperMode(mode))
+	return fmt.Sprintf("生效范围：%s\n骰点整形模式：%s", ctx.Group.GroupID(), formatDiceRollShaperMode(mode))
 }
 
 func solveDiceRollShaper(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
@@ -87,8 +87,11 @@ func solveDiceRollShaper(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExe
 		ReplyToSender(ctx, msg, fmt.Sprintf("不支持的骰点整形模式：%s\n%s", rawMode, formatDiceRollShaperHelpText()))
 		return CmdExecuteResult{Matched: true, Solved: true}
 	}
-	ctx.Group.setDiceRollShaperMode(string(mode))
-	ctx.Group.MarkDirty(ctx.Dice)
-	ReplyToSender(ctx, msg, fmt.Sprintf("已设置骰点整形模式：%s\n生效范围：%s", formatDiceRollShaperMode(mode), ctx.Group.GroupID))
+	if _, _, err := ctx.Group.setDiceRollShaperMode(string(mode)); err != nil {
+		ctx.Dice.Logger.Errorf("设置群 %s 骰点整形模式失败: %v", ctx.Group.GroupID(), err)
+		ReplyToSender(ctx, msg, "骰点整形模式设置失败")
+		return CmdExecuteResult{Matched: true, Solved: true}
+	}
+	ReplyToSender(ctx, msg, fmt.Sprintf("已设置骰点整形模式：%s\n生效范围：%s", formatDiceRollShaperMode(mode), ctx.Group.GroupID()))
 	return CmdExecuteResult{Matched: true, Solved: true}
 }

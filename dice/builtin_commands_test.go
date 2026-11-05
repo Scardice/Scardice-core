@@ -11,9 +11,9 @@ import (
 	"testing"
 
 	milky "github.com/Szzrain/Milky-go-sdk"
-	ds "github.com/sealdice/dicescript"
 
 	"Scardice-core/adapterapi"
+	"Scardice-core/core/groupstate"
 )
 
 const (
@@ -210,40 +210,14 @@ func (h *milkyRESTHarness) quitGroupSnapshot() []int64 {
 func newQuitCommandTestContext(t *testing.T, d *Dice, ep *EndPointInfo, senderID, groupID, groupName string) (*MsgContext, *Message) {
 	t.Helper()
 
-	group := &GroupInfo{
-		Active:          true,
-		GroupID:         groupID,
-		GroupName:       groupName,
-		DiceIDActiveMap: new(SyncMap[string, bool]),
-		DiceIDExistsMap: new(SyncMap[string, bool]),
-		BotList:         new(SyncMap[string, bool]),
-		Players:         new(SyncMap[string, *GroupPlayerInfo]),
-		PlayerGroups:    new(SyncMap[string, []string]),
-	}
-	group.DiceIDActiveMap.Store(ep.UserID, true)
-	group.DiceIDExistsMap.Store(ep.UserID, true)
-
-	player := &GroupPlayerInfo{
-		Name:         "Tester",
-		UserID:       senderID,
-		ValueMapTemp: &ds.ValueMap{},
-	}
-	group.Players.Store(senderID, player)
-	d.ImSession.ServiceAtNew.Store(groupID, group)
-
-	ctx := &MsgContext{
-		MessageType:     "group",
-		Group:           group,
-		Player:          player,
-		EndPoint:        ep,
-		Session:         d.ImSession,
-		Dice:            d,
-		IsCurGroupBotOn: true,
-		PrivilegeLevel:  100,
-	}
-
 	msg := newGroupMsg(groupID, senderID, "")
 	msg.GroupName = groupName
+	ctx := newCanonicalTestMessageContext(t, d, ep, msg, "quit-command:"+groupID+":"+senderID)
+	if err := ctx.Group.SetGroupName(groupName); err != nil {
+		t.Fatalf("set fixture group name: %v", err)
+	}
+	ctx.IsCurGroupBotOn = true
+	ctx.PrivilegeLevel = 100
 	return ctx, msg
 }
 
@@ -251,7 +225,7 @@ func TestBotCommandDeclinesUnaddressedGroupWhenConfigured(t *testing.T) {
 	d, ep, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 
-	d.Config.IgnoreUnaddressedBotCmd = true
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.IgnoreUnaddressedBotCmd = true })
 	ctx, msg := newQuitCommandTestContext(t, d, ep, "QQ:9000", "QQ-Group:2000", "CommandGroup")
 
 	result := d.CmdMap["bot"].Solve(ctx, msg, &CmdArgs{Args: []string{"off"}})
@@ -266,7 +240,7 @@ func TestBotByeWithoutConfirmQuitsCurrentGroup(t *testing.T) {
 	bridge := captureManagementActions(d)
 
 	ep.Platform = "TG"
-	d.Config.BotExitWithoutAt = true
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.BotExitWithoutAt = true })
 	ctx, msg := newQuitCommandTestContext(t, d, ep, "TG:9001", "TG-Group:2001", "CurrentGroup")
 
 	result := d.CmdMap["bot"].Solve(ctx, msg, &CmdArgs{Args: []string{"bye"}})
@@ -283,7 +257,22 @@ func TestBotByeTargetGroupNormalizesAndQuitsTarget(t *testing.T) {
 	bridge := captureManagementActions(d)
 
 	ep.Platform = "TG"
-	d.Config.BotExitWithoutAt = true
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.BotExitWithoutAt = true })
+	withCanonicalTestRoot(t, d, "seed-bye-target", func(transaction *DurableCallbackTransaction) error {
+		group, err := transaction.Domain().Group(transaction.executionContext, d.BaseConfig.Name, "TG-Group:3003")
+		if err != nil {
+			return err
+		}
+		if err = group.Decide(groupstate.Command{
+			Kind: groupstate.CommandCreate, DiceID: d.BaseConfig.Name,
+			GroupID: "TG-Group:3003", GroupName: "ByeTarget",
+		}); err != nil {
+			return err
+		}
+		return group.Decide(groupstate.Command{
+			Kind: groupstate.CommandActivation, DiceIDForActivation: ep.UserID, Active: true, Exists: true,
+		})
+	})
 	ctx, msg := newQuitCommandTestContext(t, d, ep, "TG:9002", "TG-Group:2002", "CommandGroup")
 
 	result := d.CmdMap["bot"].Solve(ctx, msg, &CmdArgs{Args: []string{"bye", "3003"}})
@@ -300,7 +289,7 @@ func TestBotByeWithExtraArgsShowsHelpAndDoesNotQuit(t *testing.T) {
 	bridge := captureManagementActions(d)
 
 	ep.Platform = "TG"
-	d.Config.BotExitWithoutAt = true
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.BotExitWithoutAt = true })
 	ctx, msg := newQuitCommandTestContext(t, d, ep, "TG:9003", "TG-Group:2003", "CommandGroup")
 
 	result := d.CmdMap["bot"].Solve(ctx, msg, &CmdArgs{Args: []string{"bye", "3003", "1234", "extra"}})
@@ -318,7 +307,7 @@ func TestDismissAcceptsFourDigitConfirmationCode(t *testing.T) {
 	defer cleanup()
 	bridge := captureManagementActions(d)
 
-	d.Config.BotExitWithoutAt = true
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.BotExitWithoutAt = true })
 	ctx, msg := newQuitCommandTestContext(t, d, ep, "QQ:9004", "QQ-Group:2004", "DismissGroup")
 
 	first := d.CmdMap["dismiss"].Solve(ctx, msg, &CmdArgs{})
@@ -398,7 +387,7 @@ func newMilkyQuitCommandTestContext(t *testing.T, d *Dice, senderID, groupID, gr
 	ep.Adapter = pa
 	ep.bindCompatibilityRuntime(d.ImSession)
 
-	d.Config.BotExitWithoutAt = true
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.BotExitWithoutAt = true })
 	ctx, msg := newQuitCommandTestContext(t, d, ep, senderID, groupID, groupName)
 	return ctx, msg, harness, cleanup
 }
@@ -448,7 +437,7 @@ func TestDismissMilkyLookupErrorFallsBackToSafetyConfirmation(t *testing.T) {
 	ep.Adapter = pa
 	ep.bindCompatibilityRuntime(d.ImSession)
 
-	d.Config.BotExitWithoutAt = true
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.BotExitWithoutAt = true })
 	ctx, msg := newQuitCommandTestContext(t, d, ep, "QQ:9020", testMilkyFallbackGroupID, "MilkyFallbackGroup")
 
 	needConfirm, checked, detail := shouldDismissRequireOwnerConfirm(ctx, msg.GroupID)

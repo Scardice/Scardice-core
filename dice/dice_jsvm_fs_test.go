@@ -17,9 +17,10 @@ import (
 
 func newTestFsDice(t *testing.T) *Dice {
 	t.Helper()
-	return &Dice{
-		BaseConfig: BaseConfig{DataDir: t.TempDir()},
-	}
+	d, _ := newCanonicalTestDice(t)
+	d.BaseConfig.DataDir = t.TempDir()
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.DataDir = d.BaseConfig.DataDir })
+	return d
 }
 
 func fsTestContext() *jsExecutionContext {
@@ -261,7 +262,9 @@ func TestJsFsAsyncDataPathRejectsSymlinkEscape(t *testing.T) {
 
 func TestJsFsAsyncUnrestrictedAbsolutePath(t *testing.T) {
 	d := newTestFsDice(t)
-	d.AdvancedConfig.AllowFilesystemUnrestrictedAccess = true
+	updateCanonicalTestAdvancedConfig(t, d, func(config *AdvancedConfig) {
+		config.AllowFilesystemUnrestrictedAccess = true
+	})
 	target := filepath.Join(t.TempDir(), "async-unrestricted.txt")
 	loop := startFsTestLoop(t)
 	runFsLoopSync(t, loop, func(vm *goja.Runtime) {

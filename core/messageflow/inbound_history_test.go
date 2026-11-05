@@ -1,7 +1,6 @@
 package messageflow
 
 import (
-	"bytes"
 	"context"
 	"testing"
 
@@ -17,7 +16,7 @@ import (
 // to the same conversation, so privacy erasure still finds them together.
 func TestInboundServiceGivesRecordOnlyHistoryItsOwnLane(t *testing.T) {
 	repo := &ingressRepoStub{}
-	svc, err := NewInboundService(repo, ingressCryptoStub{})
+	svc, err := NewInboundService(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,14 +33,17 @@ func TestInboundServiceGivesRecordOnlyHistoryItsOwnLane(t *testing.T) {
 
 	repo.mu.Lock()
 	defer repo.mu.Unlock()
-	liveLane, executedLane, recordedLane := repo.updates[0].LaneHMAC, repo.updates[1].LaneHMAC, repo.updates[2].LaneHMAC
-	if !bytes.Equal(liveLane, executedLane) {
+	liveLane, executedLane, recordedLane := repo.updates[0].Lane, repo.updates[1].Lane, repo.updates[2].Lane
+	if liveLane != executedLane {
 		t.Fatal("a recovered message that is processed like a live one left the group's lane")
 	}
-	if bytes.Equal(liveLane, recordedLane) {
+	if liveLane == recordedLane {
 		t.Fatal("record-only history shares the live lane and would hold the group's live messages back")
 	}
-	if !bytes.Equal(repo.updates[0].SubjectKey, repo.updates[2].SubjectKey) {
-		t.Fatal("record-only history is not part of the conversation's privacy subject")
+	if repo.updates[0].Subject != "QQ:group:9" || repo.updates[2].Subject != "QQ:group:9" {
+		t.Fatal("record-only history is not part of the conversation's plaintext subject")
+	}
+	if recordedLane != `["ep-1","group","QQ:group:9","recorded-history"]` {
+		t.Fatalf("record-only lane=%q", recordedLane)
 	}
 }

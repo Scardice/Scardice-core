@@ -3,8 +3,10 @@ package dice
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,7 +121,7 @@ seal.ext.register(adapterExt);`
 			select {
 			case got := <-outcomes:
 				if got.status != "failed" || got.tag != "complete-provider-response" || got.raw != wantRaw ||
-					got.group != scope.Group.GroupID || !got.owned {
+					got.group != scope.Group.GroupID() || !got.owned {
 					t.Fatalf("resumed adapter callback = %#v", got)
 				}
 			default:
@@ -172,7 +174,7 @@ seal.ext.register(adapterExt);`
 			return err
 		}
 		if value.ToBoolean() {
-			return fmt.Errorf("late API response resumed a revoked invocation")
+			return errors.New("late API response resumed a revoked invocation")
 		}
 		return nil
 	}); err != nil {
@@ -227,6 +229,7 @@ seal.ext.register(ext);`
 			deadline, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
 			defer cancel()
 			scope.executionContext = deadline
+			scope.callbackTransaction.executionContext = deadline
 			dispatched := make(chan error, 1)
 			go func() {
 				dispatched <- d.dispatchAdapterEvent(scope, scope, adapterapi.AdapterEvent{
@@ -262,11 +265,52 @@ seal.ext.register(ext);`
 					return err
 				}
 				if value.ToBoolean() {
-					return fmt.Errorf("disabled plugin continuation or finally resumed")
+					return errors.New("disabled plugin continuation or finally resumed")
 				}
 				return nil
 			}); err != nil {
 				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestJSAdapterEventFilterMissesDoNotHideCallbackFailure(t *testing.T) {
+	const name = "Adapter event selection error contract"
+	const script = `var selectionExt = seal.ext.new("Adapter event selection error contract", "test", "1.0.0");
+selectionExt.adapterEventFilter = { events: ["request"], where: { code: 1 } };
+selectionExt.onAdapterEvent = async function () {
+  throw Error("selected adapter event callback failed");
+};
+seal.ext.register(selectionExt);`
+	for _, engine := range []string{"goja", "quickjs"} {
+		t.Run(engine, func(t *testing.T) {
+			if engine == "quickjs" && os.Getenv("SCARDICE_RUNTIME_ROOT") == "" && os.Getenv("SCARDICE_QUICKJS_PACKAGE") == "" {
+				t.Skip("native QuickJS package is not configured")
+			}
+			d, endpoint, _, _, _ := preparePublicPreprocessRuntime(
+				t, engine, "test/adapter-selection-error/"+engine, name, script,
+			)
+			scope, _ := adapterEventGroupScope(t, d, endpoint, name)
+			for _, event := range []adapterapi.AdapterEvent{
+				{Protocol: "onebot11", Type: "notice", RawJSON: `{"post_type":"notice","code":1}`},
+				{Protocol: "onebot11", Type: "request", RawJSON: `{"post_type":"request","code":0}`},
+			} {
+				if err := d.dispatchAdapterEvent(scope, scope, event, endpoint); err != nil {
+					t.Fatalf("filter mismatch returned a callback failure: %v", err)
+				}
+				if err := scope.jsCallbackFailure(); err != nil {
+					t.Fatalf("filter mismatch poisoned the callback transaction: %v", err)
+				}
+			}
+			err := d.dispatchAdapterEvent(scope, scope, adapterapi.AdapterEvent{
+				Protocol: "onebot11", Type: "request", RawJSON: `{"post_type":"request","code":1}`,
+			}, endpoint)
+			if err == nil || !strings.Contains(err.Error(), "selected adapter event callback failed") {
+				t.Fatalf("selected callback failure = %v", err)
+			}
+			if recorded := scope.jsCallbackFailure(); recorded == nil || !strings.Contains(recorded.Error(), "selected adapter event callback failed") {
+				t.Fatalf("recorded callback failure = %v", recorded)
 			}
 		})
 	}

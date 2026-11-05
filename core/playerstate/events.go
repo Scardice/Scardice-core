@@ -86,7 +86,7 @@ var (
 )
 
 // Typed event interfaces are sealed by unexported methods. Event payloads carry
-// only player-record facts or opaque encrypted bytes; request-local $t values
+// player and attribute facts; request-local $t values
 // have no event representation.
 type PlayerEvent interface {
 	EventType() EventType
@@ -243,17 +243,12 @@ func (PlayerDeletedV1) playerApply(s *PlayerState) error {
 	return nil
 }
 
-type EncryptedValue struct {
-	Ciphertext []byte `json:"ciphertext,omitempty"`
-	KeyID      string `json:"keyId,omitempty"`
-}
+type AttributeValue []byte
 
-func NewEncryptedValue(ciphertext []byte, keyID string) EncryptedValue {
-	return EncryptedValue{append([]byte(nil), ciphertext...), keyID}
-}
-func (v EncryptedValue) Clone() EncryptedValue { return NewEncryptedValue(v.Ciphertext, v.KeyID) }
-func (v EncryptedValue) valid() error {
-	if len(v.Ciphertext) == 0 || strings.TrimSpace(v.KeyID) == "" || len(v.KeyID) > 255 {
+func NewValue(value []byte) AttributeValue     { return AttributeValue(bytes.Clone(value)) }
+func (v AttributeValue) Clone() AttributeValue { return AttributeValue(bytes.Clone(v)) }
+func (v AttributeValue) validate() error {
+	if v == nil {
 		return ErrInvalidState
 	}
 	return nil
@@ -304,25 +299,25 @@ func (e GroupUserAttrsBindingChangedV1) attrsApply(s *GroupUserAttrsState) error
 
 type GroupUserAttrsSetV1 struct {
 	Key   string         `json:"key"`
-	Value EncryptedValue `json:"value"`
+	Value AttributeValue `json:"value"`
 }
 
-func NewGroupUserAttrsSetV1(key string, ciphertext []byte, keyID string) GroupUserAttrsSetV1 {
-	return GroupUserAttrsSetV1{key, NewEncryptedValue(ciphertext, keyID)}
+func NewGroupUserAttrsSetV1(key string, value []byte) GroupUserAttrsSetV1 {
+	return GroupUserAttrsSetV1{key, NewValue(value)}
 }
 func (GroupUserAttrsSetV1) EventType() EventType { return EventGroupUserAttrsSet }
 func (e GroupUserAttrsSetV1) attrsValidate() error {
 	if err := validateAttributeKey(e.Key); err != nil {
 		return err
 	}
-	return e.Value.valid()
+	return e.Value.validate()
 }
 func (e GroupUserAttrsSetV1) attrsApply(s *GroupUserAttrsState) error {
 	if s.Version == 0 || s.Deleted {
 		return ErrInvalidState
 	}
 	if s.Values == nil {
-		s.Values = map[string]EncryptedValue{}
+		s.Values = map[string]AttributeValue{}
 	}
 	s.Values[e.Key] = e.Value.Clone()
 	s.Operations = append(s.Operations, AttributeOperation{Kind: OperationSet, Key: e.Key})
@@ -374,7 +369,7 @@ func (GroupUserAttrsClearedV1) attrsApply(s *GroupUserAttrsState) error {
 	if s.Version == 0 || s.Deleted {
 		return ErrInvalidState
 	}
-	s.Values = map[string]EncryptedValue{}
+	s.Values = map[string]AttributeValue{}
 	s.Operations = append(s.Operations, AttributeOperation{Kind: OperationClear})
 	return nil
 }
@@ -421,14 +416,14 @@ func (e CharacterRenamedV1) characterApply(s *CharacterState) error {
 }
 
 type CharacterSheetReplacedV1 struct {
-	Sheet EncryptedValue `json:"sheet"`
+	Sheet AttributeValue `json:"sheet"`
 }
 
-func NewCharacterSheetReplacedV1(ciphertext []byte, keyID string) CharacterSheetReplacedV1 {
-	return CharacterSheetReplacedV1{NewEncryptedValue(ciphertext, keyID)}
+func NewCharacterSheetReplacedV1(value []byte) CharacterSheetReplacedV1 {
+	return CharacterSheetReplacedV1{NewValue(value)}
 }
 func (CharacterSheetReplacedV1) EventType() EventType       { return EventCharacterSheetReplaced }
-func (e CharacterSheetReplacedV1) characterValidate() error { return e.Sheet.valid() }
+func (e CharacterSheetReplacedV1) characterValidate() error { return e.Sheet.validate() }
 func (e CharacterSheetReplacedV1) characterApply(s *CharacterState) error {
 	if s.Version == 0 || s.Deleted {
 		return ErrInvalidState
@@ -447,7 +442,7 @@ func (CharacterDeletedV1) characterApply(s *CharacterState) error {
 		return ErrInvalidState
 	}
 	s.Name = ""
-	s.Sheet = EncryptedValue{}
+	s.Sheet = AttributeValue{}
 	s.Deleted = true
 	return nil
 }

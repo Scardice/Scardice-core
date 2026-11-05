@@ -53,14 +53,12 @@ func newDurableExtensionDice(t *testing.T) (*Dice, *extensionLoadRecorder) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	store := eventstore.NewStore(db,
-		eventstore.WithKeySource(compatKeySource{}),
 		eventstore.WithProjection(configstate.ConfigProjection()),
 		eventstore.WithProjection(extensionstate.ExtensionProjection()),
 	)
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "extension-cache-db", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "extension-cache-db",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -71,6 +69,7 @@ func newDurableExtensionDice(t *testing.T) (*Dice, *extensionLoadRecorder) {
 		ConfigManager: NewConfigManager(t.TempDir() + "/plugin-configs.json"),
 	}
 	d.ConfigManager.SetOwner(d)
+	seedCanonicalTestConfigBaseline(t, d)
 	return d, recorder
 }
 
@@ -106,9 +105,15 @@ func TestDurableRegistrationContinuesFromTheLastKnownStateInsteadOfReplayingTheS
 	// A new plugin appends events.
 	registerDurablePlugin(t, d, 30)
 
+	// Registration continues from the projection snapshot and never replays
+	// the stream. Any stream read that does happen must be a short tail.
 	loads := recorder.takeLoads()
-	if len(loads) == 0 {
-		t.Fatal("the extension stream was never read")
+	state, err := d.DurableExtensionState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Extensions) != 31 {
+		t.Fatalf("registered extensions = %d, want 31", len(state.Extensions))
 	}
 	for _, load := range loads {
 		if load.from <= 1 || load.events > 3 {

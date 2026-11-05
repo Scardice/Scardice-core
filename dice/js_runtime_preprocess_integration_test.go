@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 
+	"Scardice-core/eventstore"
 	"Scardice-core/utils/jsengine"
 )
 
@@ -45,10 +46,12 @@ seal.ext.register(ext);
 			logCore, observedLogs := observer.New(zapcore.ErrorLevel)
 			d.jsRuntimeManager = newJSRuntimeManagerForDice(d, false)
 			d.Logger = zap.New(logCore).Sugar()
-			d.Config.JsEngine = string(jsengine.EngineGoja)
-			d.Config.JsRuntimeRoutes = map[string]string{packageID: runtimeID}
+			updateCanonicalTestConfig(t, d, func(config *Config) {
+				config.JsEngine = string(jsengine.EngineGoja)
+				config.JsRuntimeRoutes = map[string]string{packageID: runtimeID}
+			})
 			d.JsInit()
-			if !d.Config.JsEnable {
+			if !d.Config().JsEnable {
 				t.Fatalf("JS initialization for global Goja failed: runtime status=%+v", d.jsRuntimeManagerInstance().Statuses())
 			}
 
@@ -78,30 +81,32 @@ seal.ext.register(ext);
 			groupID := "QQ-Group:preprocess-public-property"
 			rewriteMessage := newGroupMsg(groupID, "QQ:999", "rewrite-probe")
 			rewriteMessage.Sender.GroupRole = "admin"
-			d.ImSession.ExecuteNew(ep, rewriteMessage)
+			if result := executeCanonicalTestMessage(t.Context(), d, ep, rewriteMessage, messageExecutionOptions{parser: messageParserSegments}); result.err != nil {
+				t.Fatalf("execute rewrite probe: %v", result.err)
+			}
 			if _, ok := adapter.waitForMsg(2 * time.Second); !ok {
 				t.Error("rewritten command did not produce a consumer reply")
 			}
 			if rewriteMessage.Message != ".rollshape set soft" {
 				t.Errorf("public callback left message %q, want rewritten command", rewriteMessage.Message)
 			}
-			group, ok := d.ImSession.ServiceAtNew.Load(groupID)
-			if !ok || group.RollShaperMode != string(DiceRollShaperModeSoft) {
-				t.Errorf("rewritten command produced group state %#v, want roll-shaper mode %q", group, DiceRollShaperModeSoft)
+			if mode := preprocessGroupMode(t, d, ep, groupID); mode != string(DiceRollShaperModeSoft) {
+				t.Errorf("rewritten command produced group mode %q, want %q", mode, DiceRollShaperModeSoft)
 			}
 
 			exceptionMessage := newGroupMsg(groupID, "QQ:999", ".rollshape set safe-tail")
 			exceptionMessage.Sender.GroupRole = "admin"
-			d.ImSession.ExecuteNew(ep, exceptionMessage)
+			if result := executeCanonicalTestMessage(t.Context(), d, ep, exceptionMessage, messageExecutionOptions{parser: messageParserSegments}); result.err != nil {
+				t.Fatalf("execute continuation command: %v", result.err)
+			}
 			if _, ok := adapter.waitForMsg(2 * time.Second); !ok {
 				t.Error("command continuation after callback exception did not produce a reply")
 			}
 			if exceptionMessage.Message != ".rollshape set safe-tail" {
 				t.Errorf("throwing callback changed message to %q, want original command", exceptionMessage.Message)
 			}
-			group, ok = d.ImSession.ServiceAtNew.Load(groupID)
-			if !ok || group.RollShaperMode != string(DiceRollShaperModeSafeTail) {
-				t.Errorf("command continuation produced group state %#v, want roll-shaper mode %q", group, DiceRollShaperModeSafeTail)
+			if mode := preprocessGroupMode(t, d, ep, groupID); mode != string(DiceRollShaperModeSafeTail) {
+				t.Errorf("command continuation produced group mode %q, want %q", mode, DiceRollShaperModeSafeTail)
 			}
 
 			loggedIntentionalError := false
@@ -233,8 +238,8 @@ seal.ext.register(ext);
 					t.Fatal(err)
 				}
 				retained := preprocessExecuteMessage(t, d, ep, adapter, retainGroup, "retention-check", true)
-				if retained.Message != ".rollshape set soft" || preprocessGroupMode(d, retainGroup) != string(DiceRollShaperModeSoft) {
-					t.Fatalf("JS-retained same-generation ctx/msg were not usable by a later real command: message=%q mode=%q", retained.Message, preprocessGroupMode(d, retainGroup))
+				if retained.Message != ".rollshape set soft" || preprocessGroupMode(t, d, ep, retainGroup) != string(DiceRollShaperModeSoft) {
+					t.Fatalf("JS-retained same-generation ctx/msg were not usable by a later real command: message=%q mode=%q", retained.Message, preprocessGroupMode(t, d, ep, retainGroup))
 				}
 				if err := preprocessSetMode(loop, "clear"); err != nil {
 					t.Fatal(err)
@@ -272,8 +277,10 @@ seal.ext.register(ext);
 					methodStashed.methodOperations != methodBaseline.methodOperations+1 ||
 					methodStashed.objects != methodBaseline.objects+1 ||
 					methodStashed.identities != methodBaseline.identities+1 ||
-					methodStashed.proxyRefs != methodBaseline.proxyRefs+2 {
-					t.Fatalf("two retained wrappers for one owner method must share one live operation and keep both owner proxies: baseline=%+v stashed=%+v ok=%t",
+					methodStashed.proxyRefs != methodBaseline.proxyRefs+1 {
+					// Host proxies are interned per HostRef, so both wrappers keep
+					// the same single owner proxy alive.
+					t.Fatalf("two retained wrappers for one owner method must share one live operation and one owner proxy: baseline=%+v stashed=%+v ok=%t",
 						methodBaseline, methodStashed, ok)
 				}
 
@@ -283,9 +290,9 @@ seal.ext.register(ext);
 				invoked := preprocessExecuteMessage(t, d, ep, adapter, groupID, "method-invoke", true)
 				methodInvoked, ok := preprocessNativeRegistrySnapshot(loop)
 				if invoked.Message != ".rollshape set soft" ||
-					preprocessGroupMode(d, groupID) != string(DiceRollShaperModeSoft) {
+					preprocessGroupMode(t, d, ep, groupID) != string(DiceRollShaperModeSoft) {
 					t.Fatalf("detached method was not callable from the later real message: message=%q mode=%q",
-						invoked.Message, preprocessGroupMode(d, groupID))
+						invoked.Message, preprocessGroupMode(t, d, ep, groupID))
 				}
 				if !ok || methodInvoked != methodStashed {
 					t.Fatalf("invoking a retained method changed its owner registrations: stashed=%+v invoked=%+v ok=%t",
@@ -377,10 +384,19 @@ func preparePublicPreprocessRuntime(t *testing.T, runtimeID, packageID, extensio
 	logCore, observedLogs := observer.New(zapcore.ErrorLevel)
 	d.jsRuntimeManager = newJSRuntimeManagerForDice(d, false)
 	d.Logger = zap.New(logCore).Sugar()
-	d.Config.JsEngine = string(jsengine.EngineGoja)
-	d.Config.JsRuntimeRoutes = map[string]string{packageID: runtimeID}
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.JsEngine = string(jsengine.EngineGoja)
+		if packageID != "" {
+			config.JsRuntimeRoutes = map[string]string{packageID: runtimeID}
+		}
+	})
+	store, ok := d.DurableStore.(*eventstore.GORMStore)
+	if !ok {
+		t.Fatalf("durable store = %T, want *eventstore.GORMStore", d.DurableStore)
+	}
+	projectCallbackTestEndpoint(t, d, store, ep)
 	d.JsInit()
-	if !d.Config.JsEnable {
+	if !d.Config().JsEnable {
 		t.Fatalf("JS initialization for global Goja failed: runtime status=%+v", d.jsRuntimeManagerInstance().Statuses())
 	}
 	scriptPath := filepath.Join(d.BaseConfig.DataDir, "scripts", "public-preprocess-lifetime.js")
@@ -514,7 +530,9 @@ func preprocessExecuteMessage(t *testing.T, d *Dice, ep *EndPointInfo, adapter *
 	t.Helper()
 	msg := newGroupMsg(groupID, "QQ:999", text)
 	msg.Sender.GroupRole = "admin"
-	d.ImSession.ExecuteNew(ep, msg)
+	if result := executeCanonicalTestMessage(t.Context(), d, ep, msg, messageExecutionOptions{parser: messageParserSegments}); result.err != nil {
+		t.Fatalf("execute %q: %v", text, result.err)
+	}
 	_, replied := adapter.waitForMsg(2 * time.Second)
 	if replied != wantReply {
 		t.Fatalf("message %q reply=%t, want %t", text, replied, wantReply)
@@ -522,12 +540,12 @@ func preprocessExecuteMessage(t *testing.T, d *Dice, ep *EndPointInfo, adapter *
 	return msg
 }
 
-func preprocessGroupMode(d *Dice, groupID string) string {
-	group, ok := d.ImSession.ServiceAtNew.Load(groupID)
-	if !ok || group == nil {
-		return ""
-	}
-	return group.RollShaperMode
+func preprocessGroupMode(t *testing.T, d *Dice, endpoint *EndPointInfo, groupID string) string {
+	t.Helper()
+	ctx := newCanonicalTestMessageContext(
+		t, d, endpoint, newGroupMsg(groupID, "QQ:preprocess-reader", ""), "preprocess-group-mode:"+groupID,
+	)
+	return ctx.Group.RollShaperMode()
 }
 
 func preprocessRunParserCases(t *testing.T, runtimeID string, d *Dice, ep *EndPointInfo, adapter *mockPlatformAdapter, logs *observer.ObservedLogs, loop jsengine.Loop, baseGroup string) {
@@ -539,8 +557,8 @@ func preprocessRunParserCases(t *testing.T, runtimeID string, d *Dice, ep *EndPo
 		t.Fatal(err)
 	}
 	own := preprocessExecuteMessage(t, d, ep, adapter, groupID, "own-probe", true)
-	if own.Message != ".rollshape set soft" || preprocessGroupMode(d, groupID) != string(DiceRollShaperModeSoft) {
-		t.Fatalf("own-message result not rewritten for %s: message=%q mode=%q", runtimeID, own.Message, preprocessGroupMode(d, groupID))
+	if own.Message != ".rollshape set soft" || preprocessGroupMode(t, d, ep, groupID) != string(DiceRollShaperModeSoft) {
+		t.Fatalf("own-message result not rewritten for %s: message=%q mode=%q", runtimeID, own.Message, preprocessGroupMode(t, d, ep, groupID))
 	}
 
 	if err := preprocessSetMode(loop, "string"); err != nil {
@@ -555,23 +573,23 @@ func preprocessRunParserCases(t *testing.T, runtimeID string, d *Dice, ep *EndPo
 		t.Fatal(err)
 	}
 	getter := preprocessExecuteMessage(t, d, ep, adapter, groupID, ".rollshape set soft", true)
-	if getter.Message != ".rollshape set soft" || preprocessGroupMode(d, groupID) != string(DiceRollShaperModeSoft) || !strings.Contains(fmt.Sprint(logs.All()), "PREPROCESS_GETTER_THROW") {
-		t.Fatalf("throwing getter must log and continue command for %s: msg=%q mode=%q logs=%v", runtimeID, getter.Message, preprocessGroupMode(d, groupID), logs.All())
+	if getter.Message != ".rollshape set soft" || preprocessGroupMode(t, d, ep, groupID) != string(DiceRollShaperModeSoft) || !strings.Contains(fmt.Sprint(logs.All()), "PREPROCESS_GETTER_THROW") {
+		t.Fatalf("throwing getter must log and continue command for %s: msg=%q mode=%q logs=%v", runtimeID, getter.Message, preprocessGroupMode(t, d, ep, groupID), logs.All())
 	}
 
 	if err := preprocessSetMode(loop, "inherited"); err != nil {
 		t.Fatal(err)
 	}
 	inherited := preprocessExecuteMessage(t, d, ep, adapter, groupID, "prototype-probe", false)
-	if inherited.Message != "prototype-probe" || preprocessGroupMode(d, groupID) != string(DiceRollShaperModeSoft) {
-		t.Fatalf("inherited-only message must not rewrite for %s: msg=%q mode=%q", runtimeID, inherited.Message, preprocessGroupMode(d, groupID))
+	if inherited.Message != "prototype-probe" || preprocessGroupMode(t, d, ep, groupID) != string(DiceRollShaperModeSoft) {
+		t.Fatalf("inherited-only message must not rewrite for %s: msg=%q mode=%q", runtimeID, inherited.Message, preprocessGroupMode(t, d, ep, groupID))
 	}
 
 	if err := preprocessSetMode(loop, "direct-throw"); err != nil {
 		t.Fatal(err)
 	}
 	thrown := preprocessExecuteMessage(t, d, ep, adapter, groupID, ".rollshape set safe-tail", true)
-	if thrown.Message != ".rollshape set safe-tail" || preprocessGroupMode(d, groupID) != string(DiceRollShaperModeSafeTail) || !strings.Contains(fmt.Sprint(logs.All()), "PREPROCESS_DIRECT_THROW") {
-		t.Fatalf("direct callback throw must remain logged no-op for %s: msg=%q mode=%q logs=%v", runtimeID, thrown.Message, preprocessGroupMode(d, groupID), logs.All())
+	if thrown.Message != ".rollshape set safe-tail" || preprocessGroupMode(t, d, ep, groupID) != string(DiceRollShaperModeSafeTail) || !strings.Contains(fmt.Sprint(logs.All()), "PREPROCESS_DIRECT_THROW") {
+		t.Fatalf("direct callback throw must remain logged no-op for %s: msg=%q mode=%q logs=%v", runtimeID, thrown.Message, preprocessGroupMode(t, d, ep, groupID), logs.All())
 	}
 }

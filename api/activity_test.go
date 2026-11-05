@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/labstack/echo/v4"
 	"go.uber.org/zap"
@@ -16,6 +17,7 @@ import (
 	"Scardice-core/dice"
 	"Scardice-core/endpoint"
 	"Scardice-core/eventstore"
+	"Scardice-core/projectionset"
 )
 
 const activityTestToken = "activity-session-secret"
@@ -49,6 +51,8 @@ type activityAPIFixture struct {
 	databases []*eventstore.Database
 }
 
+const activityTestDatabaseIdentity = "activity-api-test"
+
 func newActivityAPIFixture(t *testing.T) *activityAPIFixture {
 	t.Helper()
 	t.Setenv("SCARDICE_ADMIN_TOKEN", "activity-admin-secret")
@@ -57,7 +61,8 @@ func newActivityAPIFixture(t *testing.T) *activityAPIFixture {
 	ResetAdminAuthForTests()
 
 	previousDice, previousManager := myDice, dm
-	fixture := &activityAPIFixture{dsn: filepath.Join(t.TempDir(), "activity-events.db")}
+	root := t.TempDir()
+	fixture := &activityAPIFixture{dsn: filepath.Join(root, "activity-events.db")}
 	t.Cleanup(func() {
 		registerEndpointApplication(nil)
 		myDice, dm = previousDice, previousManager
@@ -67,6 +72,12 @@ func newActivityAPIFixture(t *testing.T) *activityAPIFixture {
 		}
 	})
 	fixture.openDatabase(t)
+	if err := fixture.store.SetReadiness(context.Background(), eventstore.Readiness{
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: activityTestDatabaseIdentity,
+		CompletedAt: time.Unix(1, 0).UTC(),
+	}); err != nil {
+		t.Fatalf("set EventStore readiness: %v", err)
+	}
 
 	registry := endpoint.NewRegistry()
 	if err := registry.Register(endpointAPIDescriptor{}); err != nil {
@@ -79,14 +90,21 @@ func newActivityAPIFixture(t *testing.T) *activityAPIFixture {
 	registerEndpointApplication(&endpointAPITestApplication{service: fixture.service})
 
 	fixture.manager = &dice.DiceManager{}
-	fixture.manager.AccessTokens.Store(activityTestToken, true)
 	fixture.runtime = &dice.Dice{
-		BaseConfig:   dice.BaseConfig{Name: "activity-api-test"},
+		BaseConfig:   dice.BaseConfig{Name: activityTestDatabaseIdentity, DataDir: filepath.Join(root, "dice")},
 		Parent:       fixture.manager,
 		DurableStore: fixture.store,
 		Logger:       zap.NewNop().Sugar(),
 	}
 	fixture.manager.Dice = []*dice.Dice{fixture.runtime}
+	ctx := context.Background()
+	if err := fixture.manager.RestoreEventSourcedManager(ctx, fixture.store); err != nil {
+		t.Fatalf("restore event-sourced manager: %v", err)
+	}
+	if err := fixture.manager.PrepareEventSourcedState(ctx); err != nil {
+		t.Fatalf("prepare event-sourced Dice config: %v", err)
+	}
+	fixture.manager.AccessTokens.Store(activityTestToken, true)
 	fixture.manager.AccessTokens.Store("api-test-ui-session", true)
 	myDice, dm = fixture.runtime, fixture.manager
 	return fixture
@@ -95,19 +113,22 @@ func newActivityAPIFixture(t *testing.T) *activityAPIFixture {
 func (f *activityAPIFixture) openDatabase(t *testing.T) {
 	t.Helper()
 	database, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{
-		Type: "sqlite", DSN: f.dsn, KeySource: endpointAPITestKeySource{}, DatabaseIdentity: "activity-api-test",
+		Type: "sqlite", DSN: f.dsn, DatabaseIdentity: activityTestDatabaseIdentity,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	f.databases = append(f.databases, database)
 	f.db = database
-	f.store = eventstore.NewStore(database)
+	f.store = eventstore.NewStore(database,
+		projectionset.StoreOptions()...,
+	)
+	if f.runtime != nil {
+		f.runtime.DurableStore = f.store
+	}
 }
 
 func (f *activityAPIFixture) bind() *echo.Echo {
-	f.runtime.DurableStore = f.store
-	f.manager.Dice = []*dice.Dice{f.runtime}
 	e := echo.New()
 	e.HideBanner = true
 	Bind(e, f.manager)
@@ -330,9 +351,7 @@ func TestActivityCaptureReportedBusinessFailures(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newActivityAPIFixture(t)
 			if test.jsRuntime {
-				runtime, _ := newJSExecDice(t)
-				fixture.runtime, fixture.manager = runtime, runtime.Parent
-				fixture.manager.AccessTokens.Store(activityTestToken, true)
+				configureJSExecDice(t, fixture.runtime, fixture.manager)
 			}
 			e := fixture.bind()
 			response := activityRequest(e, http.MethodPost, test.path, test.body, "198.51.100.10:4321", activityTestToken)

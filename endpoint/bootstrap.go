@@ -63,15 +63,6 @@ type projectionStartupSource struct {
 	}
 }
 
-func (s projectionStartupSource) ValidateReadiness(ctx context.Context) error {
-	if store, ok := s.rows.(interface {
-		ValidateReadiness(ctx context.Context) error
-	}); ok {
-		return store.ValidateReadiness(ctx)
-	}
-	return nil
-}
-
 func (s projectionStartupSource) ListEndpointStates(ctx context.Context) ([]State, error) {
 	rows, err := s.rows.ListProjectionRows(ctx, EndpointProjectionName)
 	if err != nil {
@@ -384,15 +375,15 @@ type eventStoreSecretResolver struct {
 
 func (r eventStoreSecretResolver) Resolve(ctx context.Context, ref adapterapi.SecretRef) (adapterapi.SecretValue, error) {
 	if r.resolver == nil || r.endpointID == "" || r.adapterID == "" {
-		return adapterapi.SecretValue{}, eventstore.ErrKeyUnavailable
+		return adapterapi.SecretValue{}, errors.New("endpoint: secret resolver is not configured")
 	}
 	resolved, err := r.resolver.ResolveSecretForOwner(ctx, r.endpointID, r.adapterID, ref.Ref, ref.Version)
 	if err != nil {
 		return adapterapi.SecretValue{}, err
 	}
-	value := adapterapi.SecretValue{Bytes: append([]byte(nil), resolved.Plaintext...), Version: resolved.SecretVersion}
-	for index := range resolved.Plaintext {
-		resolved.Plaintext[index] = 0
+	value := adapterapi.SecretValue{Bytes: append([]byte(nil), resolved.Value...), Version: resolved.SecretVersion}
+	for index := range resolved.Value {
+		resolved.Value[index] = 0
 	}
 	return value, nil
 }

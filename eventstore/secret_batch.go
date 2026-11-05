@@ -1,8 +1,12 @@
 package eventstore
 
 import (
+	"bytes"
 	"context"
+	"sort"
 	"strings"
+
+	"gorm.io/gorm"
 )
 
 type secretLookupKey struct {
@@ -19,16 +23,16 @@ func (s *GORMStore) ResolveSecrets(ctx context.Context, lookups []SecretLookup) 
 	if len(lookups) > MaxSecretBatchLookups {
 		return nil, &OversizeError{Bound: "secret batch lookups", Limit: MaxSecretBatchLookups, Actual: len(lookups)}
 	}
-	if s == nil || s.db == nil || s.db.GORM() == nil || s.keySource == nil {
-		return nil, ErrKeySourceUnavailable
+	if s == nil || s.db == nil || s.db.GORM() == nil {
+		return nil, ErrReadinessInvalid
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	positions := make(map[secretLookupKey]int, len(lookups))
 	for index, lookup := range lookups {
-		key := secretLookupKey{ref: strings.TrimSpace(lookup.SecretRef), version: lookup.SecretVersion}
-		if key.ref == "" || len(key.ref) > 255 || key.version == 0 {
+		key := secretLookupKey{ref: lookup.SecretRef, version: lookup.SecretVersion}
+		if key.ref == "" || len(key.ref) > MaxSecretRefBytes || key.version == 0 {
 			return nil, ErrInvalidMetadata
 		}
 		if _, duplicate := positions[key]; duplicate {
@@ -39,92 +43,89 @@ func (s *GORMStore) ResolveSecrets(ctx context.Context, lookups []SecretLookup) 
 	if err = s.requireReady(ctx); err != nil {
 		return nil, err
 	}
-
-	tx := s.db.GORM().WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return nil, ErrParticipantFailure
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback().Error
+	rowsByKey := make(map[secretLookupKey]adapterSecretRow, len(lookups))
+	err = s.db.ReadSnapshot(ctx, func(tx *gorm.DB) error {
+		_, readinessErr := readinessFromDB(ctx, tx)
+		if readinessErr != nil {
+			return ErrReadinessQuarantined
 		}
-	}()
-	if err = s.lockMutationPublication(ctx, tx); err != nil {
+		for start := 0; start < len(lookups); start += secretBatchPageSize {
+			end := min(start+secretBatchPageSize, len(lookups))
+			clauses := make([]string, 0, end-start)
+			args := make([]any, 0, (end-start)*2)
+			for _, lookup := range lookups[start:end] {
+				clauses = append(clauses, "(secret_ref = ? AND secret_version = ?)")
+				args = append(args, []byte(lookup.SecretRef), lookup.SecretVersion)
+			}
+			var page []adapterSecretRow
+			if queryErr := tx.Where(strings.Join(clauses, " OR "), args...).Find(&page).Error; queryErr != nil {
+				return ErrParticipantFailure
+			}
+			for _, row := range page {
+				key := secretLookupKey{ref: row.SecretRef, version: row.SecretVersion}
+				if _, requested := positions[key]; !requested {
+					return ErrParticipantFailure
+				}
+				if _, duplicate := rowsByKey[key]; duplicate {
+					return ErrParticipantFailure
+				}
+				if len(row.Value) > MaxSecretBytes {
+					return &OversizeError{Bound: "secret bytes", Limit: MaxSecretBytes, Actual: len(row.Value)}
+				}
+				rowsByKey[key] = row
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	readiness, semanticBytes, projectionBytes, readinessErr := runtimeReadinessFromDB(ctx, tx)
-	if readinessErr != nil || validateReadinessMetadata(readiness, semanticBytes, projectionBytes) != nil {
-		return nil, ErrReadinessQuarantined
+	if len(rowsByKey) != len(lookups) {
+		return nil, ErrNotFound
 	}
-	admittedRoots := make(map[string]struct{}, len(readiness.EncryptionRootIDs))
-	for _, keyID := range readiness.EncryptionRootIDs {
-		admittedRoots[keyID] = struct{}{}
+	orderedRows := make([]adapterSecretRow, 0, len(rowsByKey))
+	for _, row := range rowsByKey {
+		orderedRows = append(orderedRows, row)
 	}
-
+	sort.Slice(orderedRows, func(i, j int) bool {
+		if orderedRows[i].SecretRef != orderedRows[j].SecretRef {
+			return orderedRows[i].SecretRef < orderedRows[j].SecretRef
+		}
+		return orderedRows[i].SecretVersion < orderedRows[j].SecretVersion
+	})
 	results = make([]SecretResolution, len(lookups))
 	ownedResults := results
-	roots := newStoryLogImportRootCache()
-	defer roots.clear()
 	defer func() {
 		if err == nil {
 			return
 		}
 		for index := range ownedResults {
-			clear(ownedResults[index].Plaintext)
+			clear(ownedResults[index].Value)
 		}
 		results = nil
 	}()
-	found := make(map[secretLookupKey]struct{}, len(lookups))
-	for start := 0; start < len(lookups); start += secretBatchPageSize {
-		end := min(start+secretBatchPageSize, len(lookups))
-		clauses := make([]string, 0, end-start)
-		args := make([]any, 0, (end-start)*2)
-		for _, lookup := range lookups[start:end] {
-			clauses = append(clauses, "(secret_ref = ? AND secret_version = ?)")
-			args = append(args, strings.TrimSpace(lookup.SecretRef), lookup.SecretVersion)
-		}
-		var rows []adapterSecretRow
-		if queryErr := locked(tx).Where(strings.Join(clauses, " OR "), args...).Find(&rows).Error; queryErr != nil {
-			return nil, ErrParticipantFailure
-		}
-		for _, row := range rows {
-			key := secretLookupKey{ref: row.SecretRef, version: row.SecretVersion}
-			position, requested := positions[key]
-			if !requested {
-				return nil, ErrParticipantFailure
-			}
-			if _, duplicate := found[key]; duplicate {
-				return nil, ErrParticipantFailure
-			}
-			if len(row.Ciphertext) > MaxSecretBytes+16 {
-				return nil, &OversizeError{Bound: "encrypted secret bytes", Limit: MaxSecretBytes + 16, Actual: len(row.Ciphertext)}
-			}
-			if len(row.Nonce) != 12 {
-				return nil, ErrInvalidMetadata
-			}
-			if _, admitted := admittedRoots[row.EncryptionKeyID]; !admitted {
-				return nil, ErrReadinessQuarantined
-			}
-			plain, openErr := s.openA6WithRootCache(ctx, roots, "adapter-secret/v1", row.SecretRef, row.EndpointID+"/"+row.AdapterID, row.SecretVersion, row.EncryptionKeyID, row.Ciphertext, row.Nonce)
-			if openErr != nil {
-				return nil, ErrAuthenticationFailed
-			}
-			if len(plain) > MaxSecretBytes {
-				clear(plain)
-				return nil, &OversizeError{Bound: "secret bytes", Limit: MaxSecretBytes, Actual: len(plain)}
-			}
-			results[position] = SecretResolution{SecretRef: row.SecretRef, SecretVersion: row.SecretVersion, Plaintext: plain}
-			found[key] = struct{}{}
-		}
+	for _, row := range orderedRows {
+		key := secretLookupKey{ref: row.SecretRef, version: row.SecretVersion}
+		results[positions[key]] = SecretResolution{SecretRef: row.SecretRef, SecretVersion: row.SecretVersion, Value: row.Value}
 	}
-	if len(found) != len(lookups) {
-		return nil, ErrNotFound
+	err = s.db.GORM().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if lockErr := lockReadPublication(tx); lockErr != nil {
+			return lockErr
+		}
+		for _, row := range orderedRows {
+			var current adapterSecretRow
+			if queryErr := rawStringQuery(lockedShared(tx), "secret_ref", row.SecretRef).Where("secret_version = ?", row.SecretVersion).Take(&current).Error; queryErr != nil {
+				return ErrParticipantConflict
+			}
+			if current.RowVersion != row.RowVersion || current.EndpointID != row.EndpointID || current.AdapterID != row.AdapterID || !bytes.Equal(current.Value, row.Value) {
+				return ErrParticipantConflict
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	if err = tx.Commit().Error; err != nil {
-		return nil, ErrParticipantFailure
-	}
-	committed = true
 	return results, nil
 }
 

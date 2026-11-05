@@ -105,25 +105,19 @@ func (harness *milkyForwardHarness) snapshot() (string, milkyForwardRequest) {
 	return harness.endpoint, harness.request
 }
 
-func newMilkyForwardTestContext(session *milky.Session, onMessageSend func(*MsgContext, *Message, string)) (*PlatformAdapterMilky, *MsgContext) {
-	dice := &Dice{
-		Config: Config{BaseConfig: BaseConfig{
-			MessageDelayRangeStart: 0,
-			MessageDelayRangeEnd:   0,
-		}},
-		ExtList: []*ExtInfo{{OnMessageSend: onMessageSend}},
-	}
-	dice.ImSession = &IMSession{Parent: dice}
-	endpoint := &EndPointInfo{EndPointInfoBase: EndPointInfoBase{
-		UserID:       "QQ:10010",
-		Nickname:     "MilkyBot",
-		Platform:     "QQ",
-		ProtocolType: "milky",
-	}}
+func newMilkyForwardTestContext(t *testing.T, session *milky.Session, onMessageSend func(*MsgContext, *Message, string)) (*PlatformAdapterMilky, *MsgContext) {
+	t.Helper()
+	d, _ := newCanonicalTestDice(t)
+	d.ExtList = []*ExtInfo{{OnMessageSend: onMessageSend}}
+	endpoint := newCanonicalTestEndpoint(d, "QQ:10010")
+	endpoint.Nickname = "MilkyBot"
+	endpoint.Platform = "QQ"
+	endpoint.ProtocolType = "milky"
 	adapter := &PlatformAdapterMilky{EndPoint: endpoint, IntentSession: session}
 	endpoint.Adapter = adapter
-	endpoint.bindCompatibilityRuntime(dice.ImSession)
-	return adapter, &MsgContext{Dice: dice, EndPoint: endpoint}
+	message := newGroupMsg("QQ-Group:20020", "QQ:30030", "")
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, message, "milky-legacy-send")
+	return adapter, ctx
 }
 
 func Test_PlatformAdapterMilky_SendForwardMessage_preserves_ordered_nodes(t *testing.T) {
@@ -166,7 +160,7 @@ func Test_PlatformAdapterMilky_SendForwardMessage_preserves_ordered_nodes(t *tes
 			session, harness := newMilkyForwardHarness(t, "")
 			var hookCalls int
 			var hookMessage *Message
-			adapter, ctx := newMilkyForwardTestContext(session, func(_ *MsgContext, message *Message, _ string) {
+			adapter, ctx := newMilkyForwardTestContext(t, session, func(_ *MsgContext, message *Message, _ string) {
 				hookCalls++
 				hookMessage = message
 			})
@@ -219,7 +213,7 @@ func Test_PlatformAdapterMilky_SendForwardMessage_returns_false_without_hook_on_
 	validNodes := []message.ForwardNode{{SenderID: "10010", SenderName: "sender", Elements: message.ConvertStringMessage("content")}}
 	session, _ := newMilkyForwardHarness(t, "forward rejected")
 	var hookCalls int
-	adapter, ctx := newMilkyForwardTestContext(session, func(_ *MsgContext, _ *Message, _ string) {
+	adapter, ctx := newMilkyForwardTestContext(t, session, func(_ *MsgContext, _ *Message, _ string) {
 		hookCalls++
 	})
 	tests := []struct {

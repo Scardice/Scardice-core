@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync/atomic"
 	"testing"
 
 	"go.uber.org/zap"
@@ -84,7 +85,7 @@ func TestRegisterExtensionUpdatesRegistry(t *testing.T) {
 	if len(d.ExtList) != 1 {
 		t.Fatalf("expected ExtList length 1, got %d", len(d.ExtList))
 	}
-	if d.ExtRegistryVersion != 1 {
+	if atomic.LoadInt64(&d.ExtRegistryVersion) != 1 {
 		t.Fatalf("expected registry version 1, got %d", d.ExtRegistryVersion)
 	}
 	if d.ActiveWithGraph != nil {
@@ -168,13 +169,38 @@ func newTestDice(exts []*ExtInfo) *Dice {
 	return d
 }
 
-// 创建测试用的 GroupInfo
-func newTestGroupInfo() *GroupInfo {
-	g := &GroupInfo{
-		InactivatedExtSet: make(StringSet),
+func newTestExtensionGroup(t *testing.T, extensions []*ExtInfo) (*Dice, *GroupInfo) {
+	t.Helper()
+	d, _ := newCanonicalTestDice(t)
+	installCanonicalTestExtensions(d, extensions...)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:extension-self-bot")
+	ctx := newCanonicalTestMessageContext(
+		t, d, endpoint,
+		newGroupMsg("QQ-Group:extension-self", "QQ:extension-self-user", ""),
+		"extension-self",
+	)
+	return d, ctx.Group
+}
+
+func activateTestExtension(t *testing.T, group *GroupInfo, extension *ExtInfo) {
+	t.Helper()
+	if err := group.ExtActive(extension); err != nil {
+		t.Fatal(err)
 	}
-	g.SetActivatedExtList([]*ExtInfo{}, nil)
-	return g
+}
+
+func deactivateTestExtension(t *testing.T, group *GroupInfo, extension *ExtInfo) {
+	t.Helper()
+	if _, err := group.ExtInactive(extension); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func deactivateTestExtensionByName(t *testing.T, group *GroupInfo, name string) {
+	t.Helper()
+	if _, err := group.ExtInactiveByName(name); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestBuildActiveWithGraph 测试反向图构建
@@ -382,8 +408,7 @@ func TestExtActivateWithCompanion(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dice := newTestDice(tt.exts)
-			group := newTestGroupInfo()
+			dice, group := newTestExtensionGroup(t, tt.exts)
 
 			// 激活指定扩展
 			ext := dice.ExtFind(tt.activateExtName, false)
@@ -391,19 +416,19 @@ func TestExtActivateWithCompanion(t *testing.T) {
 				t.Fatalf("找不到扩展: %s", tt.activateExtName)
 			}
 
-			group.ExtActive(ext)
+			activateTestExtension(t, group, ext)
 
 			// 验证激活的扩展数量
-			if len(group.GetActivatedExtListRaw()) != len(tt.expectedActivated) {
+			if len(group.GetActivatedExtList(dice)) != len(tt.expectedActivated) {
 				t.Errorf("激活的扩展数量不匹配: got %d, want %d\ngot: %v",
-					len(group.GetActivatedExtListRaw()), len(tt.expectedActivated),
-					extListToNames(group.GetActivatedExtListRaw()))
+					len(group.GetActivatedExtList(dice)), len(tt.expectedActivated),
+					extListToNames(group.GetActivatedExtList(dice)))
 				return
 			}
 
 			// 验证所有预期的扩展都被激活（使用集合比较，不关心具体顺序）
 			activatedSet := make(map[string]bool)
-			for _, ext := range group.GetActivatedExtListRaw() {
+			for _, ext := range group.GetActivatedExtList(dice) {
 				activatedSet[ext.Name] = true
 			}
 
@@ -416,7 +441,7 @@ func TestExtActivateWithCompanion(t *testing.T) {
 			// 验证主扩展（tt.activateExtName）在所有伴随扩展之后
 			// （伴随扩展优先级应该更高，所以在列表前面）
 			mainExtIndex := -1
-			for i, ext := range group.GetActivatedExtListRaw() {
+			for i, ext := range group.GetActivatedExtList(dice) {
 				if ext.Name == tt.activateExtName {
 					mainExtIndex = i
 					break
@@ -427,8 +452,8 @@ func TestExtActivateWithCompanion(t *testing.T) {
 				t.Errorf("主扩展 %s 未被激活", tt.activateExtName)
 			} else {
 				// 检查主扩展之前的扩展是否都是伴随扩展
-				for i := range group.GetActivatedExtListRaw()[:mainExtIndex] {
-					extName := group.GetActivatedExtListRaw()[i].Name
+				for i := range group.GetActivatedExtList(dice)[:mainExtIndex] {
+					extName := group.GetActivatedExtList(dice)[i].Name
 					if extName == tt.activateExtName {
 						t.Errorf("主扩展 %s 不应该出现在位置 %d（应该在所有伴随扩展之后）", tt.activateExtName, i)
 					}
@@ -436,8 +461,8 @@ func TestExtActivateWithCompanion(t *testing.T) {
 			}
 
 			// 验证 InactivatedExtSet
-			for _, activatedExt := range group.GetActivatedExtListRaw() {
-				if group.IsExtInactivated(activatedExt.Name) {
+			for _, activatedExt := range group.GetActivatedExtList(dice) {
+				if group.ExtensionInactivated(activatedExt.Name) {
 					t.Errorf("扩展 %s 不应该在 InactivatedExtSet 中", activatedExt.Name)
 				}
 			}
@@ -489,8 +514,7 @@ func TestExtDeactivateWithCompanion(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dice := newTestDice(tt.exts)
-			group := newTestGroupInfo()
+			dice, group := newTestExtensionGroup(t, tt.exts)
 
 			// 先激活指定的扩展
 			for _, extName := range tt.activateFirst {
@@ -498,22 +522,22 @@ func TestExtDeactivateWithCompanion(t *testing.T) {
 				if ext == nil {
 					t.Fatalf("找不到扩展: %s", extName)
 				}
-				group.ExtActive(ext)
+				activateTestExtension(t, group, ext)
 			}
 
 			// 关闭指定扩展
-			group.ExtInactiveByName(tt.deactivateExtName)
+			deactivateTestExtensionByName(t, group, tt.deactivateExtName)
 
 			// 验证剩余扩展
-			if len(group.GetActivatedExtListRaw()) != len(tt.expectedRemaining) {
+			if len(group.GetActivatedExtList(dice)) != len(tt.expectedRemaining) {
 				t.Errorf("剩余扩展数量不匹配: got %d, want %d\ngot: %v\nwant: %v",
-					len(group.GetActivatedExtListRaw()), len(tt.expectedRemaining),
-					extListToNames(group.GetActivatedExtListRaw()), tt.expectedRemaining)
+					len(group.GetActivatedExtList(dice)), len(tt.expectedRemaining),
+					extListToNames(group.GetActivatedExtList(dice)), tt.expectedRemaining)
 				return
 			}
 
 			remainingSet := make(map[string]bool)
-			for _, ext := range group.GetActivatedExtListRaw() {
+			for _, ext := range group.GetActivatedExtList(dice) {
 				remainingSet[ext.Name] = true
 			}
 
@@ -597,8 +621,7 @@ func TestCommandPriority(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dice := newTestDice(tt.exts)
-			group := newTestGroupInfo()
+			dice, group := newTestExtensionGroup(t, tt.exts)
 
 			// 按顺序激活扩展
 			for _, extName := range tt.activateOrder {
@@ -606,58 +629,57 @@ func TestCommandPriority(t *testing.T) {
 				if ext == nil {
 					t.Fatalf("找不到扩展: %s", extName)
 				}
-				group.ExtActive(ext)
+				activateTestExtension(t, group, ext)
 			}
 
 			// 验证 ActivatedExtList 的顺序
-			if len(group.GetActivatedExtListRaw()) != len(tt.expectedListOrder) {
+			if len(group.GetActivatedExtList(dice)) != len(tt.expectedListOrder) {
 				t.Errorf("激活的扩展数量不匹配: got %d, want %d\ngot: %v\nwant: %v",
-					len(group.GetActivatedExtListRaw()), len(tt.expectedListOrder),
-					extListToNames(group.GetActivatedExtListRaw()), tt.expectedListOrder)
+					len(group.GetActivatedExtList(dice)), len(tt.expectedListOrder),
+					extListToNames(group.GetActivatedExtList(dice)), tt.expectedListOrder)
 				return
 			}
 
 			for i, expectedName := range tt.expectedListOrder {
-				actualName := group.GetActivatedExtListRaw()[i].Name
+				actualName := group.GetActivatedExtList(dice)[i].Name
 				if actualName != expectedName {
 					t.Errorf("位置 %d 的扩展不匹配: got %s, want %s\n完整顺序: %v",
-						i, actualName, expectedName, extListToNames(group.GetActivatedExtListRaw()))
+						i, actualName, expectedName, extListToNames(group.GetActivatedExtList(dice)))
 				}
 			}
 
 			// 额外验证：列表前面的扩展应该比后面的优先级高
-			t.Logf("激活顺序（优先级从高到低）: %v", extListToNames(group.GetActivatedExtListRaw()))
+			t.Logf("激活顺序（优先级从高到低）: %v", extListToNames(group.GetActivatedExtList(dice)))
 		})
 	}
 }
 
 // TestReopenExtensionPriority 测试重复开启扩展会提升优先级
 func TestReopenExtensionPriority(t *testing.T) {
-	dice := newTestDice([]*ExtInfo{
+	dice, group := newTestExtensionGroup(t, []*ExtInfo{
 		{Name: "ext1"},
 		{Name: "ext2"},
 		{Name: "ext3"},
 	})
-	group := newTestGroupInfo()
 
 	// 第一轮：按顺序激活 ext1, ext2, ext3
-	group.ExtActive(dice.ExtFind("ext1", false))
-	group.ExtActive(dice.ExtFind("ext2", false))
-	group.ExtActive(dice.ExtFind("ext3", false))
+	activateTestExtension(t, group, dice.ExtFind("ext1", false))
+	activateTestExtension(t, group, dice.ExtFind("ext2", false))
+	activateTestExtension(t, group, dice.ExtFind("ext3", false))
 
 	// 预期顺序：[ext3, ext2, ext1]
 	expectedOrder1 := []string{"ext3", "ext2", "ext1"}
-	actualOrder1 := extListToNames(group.GetActivatedExtListRaw())
+	actualOrder1 := extListToNames(group.GetActivatedExtList(dice))
 	if !stringSliceEqual(actualOrder1, expectedOrder1) {
 		t.Errorf("第一轮激活后顺序不匹配:\ngot:  %v\nwant: %v", actualOrder1, expectedOrder1)
 	}
 
 	// 第二轮：重新激活 ext1（应该提升到最前面）
-	group.ExtActive(dice.ExtFind("ext1", false))
+	activateTestExtension(t, group, dice.ExtFind("ext1", false))
 
 	// 预期顺序：[ext1, ext3, ext2]（ext1 被移到最前）
 	expectedOrder2 := []string{"ext1", "ext3", "ext2"}
-	actualOrder2 := extListToNames(group.GetActivatedExtListRaw())
+	actualOrder2 := extListToNames(group.GetActivatedExtList(dice))
 	if !stringSliceEqual(actualOrder2, expectedOrder2) {
 		t.Errorf("重新激活 ext1 后顺序不匹配:\ngot:  %v\nwant: %v", actualOrder2, expectedOrder2)
 	}
@@ -678,26 +700,25 @@ func extListToNames(exts []*ExtInfo) []string {
 
 // TestCompanionFollowsMainExtension 测试伴随扩展随主扩展开关（场景3）
 func TestCompanionFollowsMainExtension(t *testing.T) {
-	dice := newTestDice([]*ExtInfo{
+	dice, group := newTestExtensionGroup(t, []*ExtInfo{
 		{Name: "main"},
 		{Name: "companion", ActiveWith: []string{"main"}},
 	})
-	group := newTestGroupInfo()
 
 	// 第一步：开启主扩展，伴随扩展自动开启
-	group.ExtActive(dice.ExtFind("main", false))
+	activateTestExtension(t, group, dice.ExtFind("main", false))
 
-	if len(group.GetActivatedExtListRaw()) != 2 {
-		t.Fatalf("开启主扩展后应该有2个扩展，实际: %d", len(group.GetActivatedExtListRaw()))
+	if len(group.GetActivatedExtList(dice)) != 2 {
+		t.Fatalf("开启主扩展后应该有2个扩展，实际: %d", len(group.GetActivatedExtList(dice)))
 	}
 
-	t.Logf("✓ 开启主扩展后：%v", extListToNames(group.GetActivatedExtListRaw()))
+	t.Logf("✓ 开启主扩展后：%v", extListToNames(group.GetActivatedExtList(dice)))
 
 	// 第二步：关闭主扩展，伴随扩展自动关闭
-	group.ExtInactive(dice.ExtFind("main", false))
+	deactivateTestExtension(t, group, dice.ExtFind("main", false))
 
-	if len(group.GetActivatedExtListRaw()) != 0 {
-		t.Errorf("关闭主扩展后应该没有扩展，实际: %v", extListToNames(group.GetActivatedExtListRaw()))
+	if len(group.GetActivatedExtList(dice)) != 0 {
+		t.Errorf("关闭主扩展后应该没有扩展，实际: %v", extListToNames(group.GetActivatedExtList(dice)))
 	}
 
 	t.Logf("✓ 关闭主扩展后：所有扩展已关闭")
@@ -705,53 +726,52 @@ func TestCompanionFollowsMainExtension(t *testing.T) {
 
 // TestReopenMainExtensionReopensCompanion 测试重新开启主扩展会重新开启已关闭的伴随扩展（场景4）
 func TestReopenMainExtensionReopensCompanion(t *testing.T) {
-	dice := newTestDice([]*ExtInfo{
+	dice, group := newTestExtensionGroup(t, []*ExtInfo{
 		{Name: "main"},
 		{Name: "companion", ActiveWith: []string{"main"}},
 	})
-	group := newTestGroupInfo()
 
 	// 第一步：开启主扩展（伴随扩展自动开启）
-	group.ExtActive(dice.ExtFind("main", false))
+	activateTestExtension(t, group, dice.ExtFind("main", false))
 
-	initialOrder := extListToNames(group.GetActivatedExtListRaw())
+	initialOrder := extListToNames(group.GetActivatedExtList(dice))
 	t.Logf("初始状态：%v", initialOrder)
 
-	if len(group.GetActivatedExtListRaw()) != 2 {
-		t.Fatalf("开启主扩展后应该有2个扩展，实际: %d", len(group.GetActivatedExtListRaw()))
+	if len(group.GetActivatedExtList(dice)) != 2 {
+		t.Fatalf("开启主扩展后应该有2个扩展，实际: %d", len(group.GetActivatedExtList(dice)))
 	}
 
 	// 第二步：用户手动关闭伴随扩展
-	group.ExtInactive(dice.ExtFind("companion", false))
+	deactivateTestExtension(t, group, dice.ExtFind("companion", false))
 
-	afterCloseCompanion := extListToNames(group.GetActivatedExtListRaw())
+	afterCloseCompanion := extListToNames(group.GetActivatedExtList(dice))
 	t.Logf("手动关闭伴随扩展后：%v", afterCloseCompanion)
 
-	if len(group.GetActivatedExtListRaw()) != 1 || group.GetActivatedExtListRaw()[0].Name != "main" {
+	if len(group.GetActivatedExtList(dice)) != 1 || group.GetActivatedExtList(dice)[0].Name != "main" {
 		t.Errorf("关闭伴随扩展后应该只剩主扩展，实际: %v", afterCloseCompanion)
 	}
 
 	// 验证 companion 被标记为手动关闭
-	if !group.IsExtInactivated("companion") {
+	if !group.ExtensionInactivated("companion") {
 		t.Error("companion 应该被标记为手动关闭（在 InactivatedExtSet 中）")
 	}
 
 	// 第三步：重新开启主扩展（用户执行 .ext main on）
-	group.ExtActive(dice.ExtFind("main", false))
+	activateTestExtension(t, group, dice.ExtFind("main", false))
 
-	finalOrder := extListToNames(group.GetActivatedExtListRaw())
+	finalOrder := extListToNames(group.GetActivatedExtList(dice))
 	t.Logf("重新开启主扩展后：%v", finalOrder)
 
 	// 验证：伴随扩展应该重新开启
-	if len(group.GetActivatedExtListRaw()) != 2 {
+	if len(group.GetActivatedExtList(dice)) != 2 {
 		t.Errorf("重新开启主扩展后应该有2个扩展，实际: %d, %v",
-			len(group.GetActivatedExtListRaw()), finalOrder)
+			len(group.GetActivatedExtList(dice)), finalOrder)
 	}
 
 	// 验证两个扩展都存在
 	hasMain := false
 	hasCompanion := false
-	for _, ext := range group.GetActivatedExtListRaw() {
+	for _, ext := range group.GetActivatedExtList(dice) {
 		if ext.Name == "main" {
 			hasMain = true
 		}
@@ -768,7 +788,7 @@ func TestReopenMainExtensionReopensCompanion(t *testing.T) {
 	}
 
 	// 验证 companion 不再被标记为手动关闭
-	if group.IsExtInactivated("companion") {
+	if group.ExtensionInactivated("companion") {
 		t.Error("companion 不应该再被标记为手动关闭")
 	}
 

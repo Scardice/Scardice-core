@@ -10,7 +10,6 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/samber/lo"
 	ds "github.com/sealdice/dicescript"
 
 	"Scardice-core/utils/jsengine"
@@ -35,9 +34,15 @@ var difficultyPrefixMap = map[string]int{
 }
 
 func cardRuleCheck(mctx *MsgContext, msg *Message) *GameSystemTemplate {
-	cardType := ReadCardType(mctx)
-	if cardType != "" && cardType != mctx.Group.System {
-		ReplyToSender(mctx, msg, fmt.Sprintf("阻止操作：当前卡规则为 %s，群规则为 %s。\n为避免损坏此人物卡，请先更换角色卡，或使用.st fmt强制转卡", cardType, mctx.Group.System))
+	attrs, err := mctx.Dice.AttrsManager.LoadByCtx(mctx)
+	if err != nil {
+		mctx.setExecutionError(err)
+		ReplyToSender(mctx, msg, "读取角色卡失败："+err.Error())
+		return nil
+	}
+	cardType := attrs.SheetType()
+	if cardType != "" && cardType != mctx.Group.System() {
+		ReplyToSender(mctx, msg, fmt.Sprintf("阻止操作：当前卡规则为 %s，群规则为 %s。\n为避免损坏此人物卡，请先更换角色卡，或使用.st fmt强制转卡", cardType, mctx.Group.System()))
 		return nil
 	}
 	tmpl := mctx.Group.GetCharTemplate(mctx.Dice)
@@ -45,7 +50,11 @@ func cardRuleCheck(mctx *MsgContext, msg *Message) *GameSystemTemplate {
 		ReplyToSender(mctx, msg, fmt.Sprintf("阻止操作：未发现人物卡使用的规则: %s，可能相关扩展已经卸载，请联系骰主", cardType))
 		return nil
 	}
-	cmdStCharFormat(mctx, tmpl) // 转一下卡
+	if err = cmdStCharFormat(mctx, tmpl); err != nil {
+		mctx.setExecutionError(err)
+		ReplyToSender(mctx, msg, "转换角色卡失败："+err.Error())
+		return nil
+	}
 	return tmpl
 }
 
@@ -139,7 +148,7 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 				}
 			}
 
-			cocRule := mctx.Group.CocRuleIndex
+			cocRule := mctx.Group.CocRuleIndex()
 			if cmdArgs.Command == "rc" || cmdArgs.Command == "rch" {
 				// 强制规则书
 				cocRule = 0
@@ -275,14 +284,14 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 				VarSetValueStr(mctx, "$t检定计算过程", detailWrap)
 				VarSetValueStr(mctx, "$t计算过程", detailWrap)
 
-				SetTempVars(mctx, mctx.Player.Name) // 信息里没有QQ昵称，用这个顶一下
+				SetTempVars(mctx, mctx.Player.Name()) // 信息里没有QQ昵称，用这个顶一下
 				return nil
 			}
 
 			var text string
 			if cmdArgs.SpecialExecuteTimes > 1 {
 				VarSetValueInt64(mctx, "$t次数", int64(cmdArgs.SpecialExecuteTimes))
-				if cmdArgs.SpecialExecuteTimes > int(ctx.Dice.Config.MaxExecuteTime) {
+				if cmdArgs.SpecialExecuteTimes > int(ctx.Dice.Config().MaxExecuteTime) {
 					ReplyToSender(mctx, msg, DiceFormatTmpl(mctx, "COC:检定_轮数过多警告"))
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
@@ -314,7 +323,7 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 			commandInfo := map[string]interface{}{
 				"cmd":     "ra",
 				"rule":    "coc7",
-				"pcName":  mctx.Player.Name,
+				"pcName":  mctx.Player.Name(),
 				"cocRule": cocRule,
 				"items":   commandInfoItems,
 			}
@@ -340,7 +349,7 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 				if mctx.IsPrivate {
 					ReplyToSender(mctx, msg, DiceFormatTmpl(mctx, "核心:提示_私聊不可用"))
 				} else {
-					mctx.CommandHideFlag = mctx.Group.GroupID
+					mctx.CommandHideFlag = mctx.Group.GroupID()
 					ReplyGroup(mctx, msg, DiceFormatTmpl(mctx, "COC:检定_暗中_群内"))
 					ReplyPerson(mctx, msg, DiceFormatTmpl(mctx, "COC:检定_暗中_私聊_前缀")+text)
 				}
@@ -377,37 +386,50 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			n := cmdArgs.GetArgN(1)
 			suffix := "\nCOC7规则扩展已自动开启"
-			setRuleByName(ctx, "coc7")
+			if err := setRuleByName(ctx, "coc7"); err != nil {
+				ctx.setExecutionError(err)
+				ReplyToSender(ctx, msg, "切换规则失败："+err.Error())
+				return CmdExecuteResult{Matched: true, Solved: true}
+			}
+			setRule := func(index int, label, description string) bool {
+				if err := ctx.Group.SetCocRuleIndex(index); err != nil {
+					ctx.setExecutionError(err)
+					ReplyToSender(ctx, msg, "切换房规失败："+err.Error())
+					return false
+				}
+				ReplyToSender(ctx, msg, fmt.Sprintf("已切换房规为%s:\n%s%s", label, description, suffix))
+				return true
+			}
 
 			switch n {
 			case "0":
-				ctx.Group.CocRuleIndex = 0
-				text := fmt.Sprintf("已切换房规为%s:\n%s%s", SetCocRulePrefixText[ctx.Group.CocRuleIndex], SetCocRuleText[ctx.Group.CocRuleIndex], suffix)
-				ReplyToSender(ctx, msg, text)
+				if !setRule(0, SetCocRulePrefixText[0], SetCocRuleText[0]) {
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 			case "1":
-				ctx.Group.CocRuleIndex = 1
-				text := fmt.Sprintf("已切换房规为%s:\n%s%s", SetCocRulePrefixText[ctx.Group.CocRuleIndex], SetCocRuleText[ctx.Group.CocRuleIndex], suffix)
-				ReplyToSender(ctx, msg, text)
+				if !setRule(1, SetCocRulePrefixText[1], SetCocRuleText[1]) {
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 			case "2":
-				ctx.Group.CocRuleIndex = 2
-				text := fmt.Sprintf("已切换房规为%s:\n%s%s", SetCocRulePrefixText[ctx.Group.CocRuleIndex], SetCocRuleText[ctx.Group.CocRuleIndex], suffix)
-				ReplyToSender(ctx, msg, text)
+				if !setRule(2, SetCocRulePrefixText[2], SetCocRuleText[2]) {
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 			case "3":
-				ctx.Group.CocRuleIndex = 3
-				text := fmt.Sprintf("已切换房规为%s:\n%s%s", SetCocRulePrefixText[ctx.Group.CocRuleIndex], SetCocRuleText[ctx.Group.CocRuleIndex], suffix)
-				ReplyToSender(ctx, msg, text)
+				if !setRule(3, SetCocRulePrefixText[3], SetCocRuleText[3]) {
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 			case "4":
-				ctx.Group.CocRuleIndex = 4
-				text := fmt.Sprintf("已切换房规为%s:\n%s%s", SetCocRulePrefixText[ctx.Group.CocRuleIndex], SetCocRuleText[ctx.Group.CocRuleIndex], suffix)
-				ReplyToSender(ctx, msg, text)
+				if !setRule(4, SetCocRulePrefixText[4], SetCocRuleText[4]) {
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 			case "5":
-				ctx.Group.CocRuleIndex = 5
-				text := fmt.Sprintf("已切换房规为%s:\n%s%s", SetCocRulePrefixText[ctx.Group.CocRuleIndex], SetCocRuleText[ctx.Group.CocRuleIndex], suffix)
-				ReplyToSender(ctx, msg, text)
+				if !setRule(5, SetCocRulePrefixText[5], SetCocRuleText[5]) {
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 			case "dg":
-				ctx.Group.CocRuleIndex = 11
-				text := fmt.Sprintf("已切换房规为%s:\n%s%s", SetCocRulePrefixText[ctx.Group.CocRuleIndex], SetCocRuleText[ctx.Group.CocRuleIndex], suffix)
-				ReplyToSender(ctx, msg, text)
+				if !setRule(11, SetCocRulePrefixText[11], SetCocRuleText[11]) {
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 			case "details":
 				var help strings.Builder
 				help.WriteString("当前有coc7规则如下:\n")
@@ -431,20 +453,21 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 				nInt, _ := strconv.ParseInt(n, 10, 64)
 				for _, i := range ctx.Dice.CocExtraRulesSnapshot() {
 					if i.Key == n || nInt == int64(i.Index) {
-						ctx.Group.CocRuleIndex = i.Index
-						text := fmt.Sprintf("已切换房规为%s:\n%s%s", i.Name, i.Desc, suffix)
-						ReplyToSender(ctx, msg, text)
+						if !setRule(i.Index, i.Name, i.Desc) {
+							return CmdExecuteResult{Matched: true, Solved: true}
+						}
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 				}
 
-				if text, ok := SetCocRuleText[ctx.Group.CocRuleIndex]; ok {
+				cocRuleIndex := ctx.Group.CocRuleIndex()
+				if text, ok := SetCocRuleText[cocRuleIndex]; ok {
 					VarSetValueStr(ctx, "$t房规文本", text)
-					VarSetValueStr(ctx, "$t房规", SetCocRulePrefixText[ctx.Group.CocRuleIndex])
-					VarSetValueInt64(ctx, "$t房规序号", int64(ctx.Group.CocRuleIndex))
+					VarSetValueStr(ctx, "$t房规", SetCocRulePrefixText[cocRuleIndex])
+					VarSetValueInt64(ctx, "$t房规序号", int64(cocRuleIndex))
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "COC:设置房规_当前"))
 				} else {
-					rule, ok := ctx.Dice.cocExtraRule(ctx.Group.CocRuleIndex)
+					rule, ok := ctx.Dice.cocExtraRule(cocRuleIndex)
 					if !ok {
 						ReplyToSender(ctx, msg, "当前自定义房规不可用，请使用 .setcoc 重新选择。")
 						return CmdExecuteResult{Matched: true, Solved: true}
@@ -457,9 +480,6 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 				}
 			}
 
-			ctx.Group.ExtActive(ctx.Dice.ExtFind("coc7", false))
-			ctx.Group.System = "coc7"
-			ctx.Group.MarkDirty(ctx.Dice)
 			return CmdExecuteResult{Matched: true, Solved: true}
 		},
 	}
@@ -574,7 +594,7 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 					return *ret
 				}
 
-				cocRule := ctx.Group.CocRuleIndex
+				cocRule := ctx.Group.CocRuleIndex()
 				if cmdArgs.Command == "rcv" {
 					// 强制规则书
 					cocRule = 0
@@ -636,8 +656,8 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 				suffix1 := GetResultTextWithRequire(ctx1, successRank1, difficultyRequire1, true)
 				suffix2 := GetResultTextWithRequire(ctx2, successRank2, difficultyRequire2, true)
 
-				p1Name := ctx1.Player.Name
-				p2Name := ctx2.Player.Name
+				p1Name := ctx1.Player.Name()
+				p2Name := ctx2.Player.Name()
 				if p1Name == "" {
 					p1Name = "玩家A"
 				}
@@ -775,7 +795,7 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 
 				d100 := mctx.Roll64(100)
 				// 注意一下，这里其实是，小于失败 大于成功
-				successRank, _ := ResultCheck(mctx, mctx.Group.CocRuleIndex, d100, varValue, 0)
+				successRank, _ := ResultCheck(mctx, mctx.Group.CocRuleIndex(), d100, varValue, 0)
 				var resultText string
 				// 若玩家投出了高于当前技能值的结果，或者结果大于95，则调查员该技能获得改善：骰1D10并且立即将结果加到当前技能值上。技能可通过此方式超过100%。
 				if d100 > 95 {
@@ -866,10 +886,19 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 						}
 					}
 					VarSetValueInt64(mctx, "$t数量", int64(1))
-
-					VarSetValueStr(mctx, "$t当前绑定角色", lo.Must(mctx.Dice.AttrsManager.LoadByCtx(mctx)).Name)
-					if mctx.Player.AutoSetNameTemplate != "" {
-						_, _ = SetPlayerGroupCardByTemplate(mctx, mctx.Player.AutoSetNameTemplate)
+					attrs, attrErr := mctx.Dice.AttrsManager.LoadByCtx(mctx)
+					if attrErr != nil {
+						mctx.setExecutionError(attrErr)
+						ReplyToSender(mctx, msg, "读取角色卡失败："+attrErr.Error())
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
+					VarSetValueStr(mctx, "$t当前绑定角色", attrs.Name())
+					if template := mctx.Player.AutoSetNameTemplate(); template != "" {
+						if _, attrErr = SetPlayerGroupCardByTemplate(mctx, template); attrErr != nil {
+							mctx.setExecutionError(attrErr)
+							ReplyToSender(mctx, msg, "更新群名片失败："+attrErr.Error())
+							return CmdExecuteResult{Matched: true, Solved: true}
+						}
 					}
 					ReplyToSender(mctx, msg, DiceFormatTmpl(mctx, "COC:技能成长"))
 				} else {
@@ -947,9 +976,19 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 				sep := DiceFormatTmpl(mctx, "COC:技能成长_批量_分隔符")
 				resultStr := strings.Join(checkResultStrs, sep)
 				VarSetValueStr(mctx, "$t总结果文本", resultStr)
-				VarSetValueStr(mctx, "$t当前绑定角色", lo.Must(mctx.Dice.AttrsManager.LoadByCtx(mctx)).Name)
-				if mctx.Player.AutoSetNameTemplate != "" {
-					_, _ = SetPlayerGroupCardByTemplate(mctx, mctx.Player.AutoSetNameTemplate)
+				attrs, attrErr := mctx.Dice.AttrsManager.LoadByCtx(mctx)
+				if attrErr != nil {
+					mctx.setExecutionError(attrErr)
+					ReplyToSender(mctx, msg, "读取角色卡失败："+attrErr.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
+				VarSetValueStr(mctx, "$t当前绑定角色", attrs.Name())
+				if template := mctx.Player.AutoSetNameTemplate(); template != "" {
+					if _, attrErr = SetPlayerGroupCardByTemplate(mctx, template); attrErr != nil {
+						mctx.setExecutionError(attrErr)
+						ReplyToSender(mctx, msg, "更新群名片失败："+attrErr.Error())
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
 				}
 				ReplyToSender(mctx, msg, DiceFormatTmpl(mctx, "COC:技能成长_批量"))
 			}
@@ -1199,7 +1238,7 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 			}
 
 			// 进行检定
-			successRank, _ := ResultCheck(mctx, mctx.Group.CocRuleIndex, d100, san, 0)
+			successRank, _ := ResultCheck(mctx, mctx.Group.CocRuleIndex(), d100, san, 0)
 			suffix := GetResultText(mctx, successRank, false)
 			suffixShort := GetResultText(mctx, successRank, true)
 
@@ -1248,7 +1287,7 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 			VarSetValueInt64(ctx, "$tSuccessRank", int64(successRank))
 			VarSetValueInt64(mctx, "$t旧值", san)
 
-			SetTempVars(mctx, mctx.Player.Name) // 信息里没有QQ昵称，用这个顶一下
+			SetTempVars(mctx, mctx.Player.Name()) // 信息里没有QQ昵称，用这个顶一下
 			VarSetValueStr(mctx, "$t结果文本", DiceFormatTmpl(mctx, "COC:理智检定_单项结果文本"))
 
 			VarSetValueInt64(mctx, mctx.Player.GetValueNameByAlias("理智", tmpl.Alias), sanNew)
@@ -1285,8 +1324,8 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 			commandInfo := map[string]interface{}{
 				"cmd":     "sc",
 				"rule":    "coc7",
-				"pcName":  mctx.Player.Name,
-				"cocRule": mctx.Group.CocRuleIndex,
+				"pcName":  mctx.Player.Name(),
+				"cocRule": mctx.Group.CocRuleIndex(),
 				"items": []any{
 					map[string]any{
 						"outcome": d100,
@@ -1310,8 +1349,12 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 			}
 
 			ReplyToSender(mctx, msg, text)
-			if mctx.Player.AutoSetNameTemplate != "" {
-				_, _ = SetPlayerGroupCardByTemplate(mctx, mctx.Player.AutoSetNameTemplate)
+			if template := mctx.Player.AutoSetNameTemplate(); template != "" {
+				if _, err = SetPlayerGroupCardByTemplate(mctx, template); err != nil {
+					mctx.setExecutionError(err)
+					ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 			}
 			return CmdExecuteResult{Matched: true, Solved: true}
 		},
@@ -1331,8 +1374,8 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 					return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 				}
 			}
-			if val > ctx.Dice.Config.MaxCocCardGen {
-				val = ctx.Dice.Config.MaxCocCardGen
+			if val > ctx.Dice.Config().MaxCocCardGen {
+				val = ctx.Dice.Config().MaxCocCardGen
 			}
 
 			var ss []string
@@ -1349,9 +1392,9 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 			info := strings.Join(ss, sep)
 			VarSetValueStr(ctx, "$t制卡结果文本", info)
 			text := DiceFormatTmpl(ctx, "COC:制卡")
-			// fmt.Sprintf("<%s>的七版COC人物作成:\n%s", ctx.Player.Name, info)
-			if ctx.Dice.Config.CocCardMergeForward {
-				title := fmt.Sprintf("<%s>的COC7制卡结果", ctx.Player.Name)
+			// fmt.Sprintf("<%s>的七版COC人物作成:\n%s", ctx.Player.Name(), info)
+			if ctx.Dice.Config().CocCardMergeForward {
+				title := fmt.Sprintf("<%s>的COC7制卡结果", ctx.Player.Name())
 				if TryReplyToSenderMergedForward(ctx, msg, title, ss) {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}

@@ -81,7 +81,7 @@ func TestLegacySourceStreamsStoryLogRecordsFromSnapshot(t *testing.T) {
 	}
 	beforeDigest := sha256.Sum256(before)
 
-	source := NewLegacySourceWithKeySource(root, sqliteTargetKeySource{})
+	source := NewLegacySource(root)
 	inventory, err := source.Inventory(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -289,15 +289,15 @@ func TestLegacySourceImportsStoryLogsAcrossBatchBoundaryAndReopens(t *testing.T)
 	logSourceDigest := sha256.Sum256(logSourceBytes)
 	dataSourceDigest := sha256.Sum256(dataSourceBytes)
 
-	source := NewLegacySourceWithKeySource(root, sqliteTargetKeySource{})
+	source := NewLegacySource(root)
 	inventory, err := source.Inventory(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	targetPath := filepath.Join(t.TempDir(), "target.db")
-	target := NewSQLiteTarget(targetPath, sqliteTargetKeySource{})
+	target := NewSQLiteTarget(targetPath)
 	result, err := NewImporter(ImporterOptions{
-		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old", IndexRootID: "old-index"}},
+		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old"}},
 		Source:    source, Target: target, SnapshotRoot: filepath.Join(t.TempDir(), "snapshot"), TargetIdentity: "story-log-boundary",
 	}).Run(ctx, Request{Mode: ModeImport})
 	if err != nil {
@@ -321,7 +321,7 @@ func TestLegacySourceImportsStoryLogsAcrossBatchBoundaryAndReopens(t *testing.T)
 		t.Fatal("legacy source database bytes changed during import")
 	}
 
-	reopened := NewSQLiteTarget(targetPath, sqliteTargetKeySource{})
+	reopened := NewSQLiteTarget(targetPath)
 	reopened.identity = result.TargetIdentity
 	if err = reopened.openLocked(ctx); err != nil {
 		t.Fatal(err)
@@ -393,23 +393,11 @@ func TestLegacySourceImportsStoryLogsAcrossBatchBoundaryAndReopens(t *testing.T)
 	if err = reopened.Close(); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{targetPath, targetPath + "-wal", targetPath + "-shm"} {
-		contents, readErr := os.ReadFile(path)
-		if errors.Is(readErr, os.ErrNotExist) {
-			continue
-		}
-		if readErr != nil {
-			t.Fatal(readErr)
-		}
-		for _, private := range []string{"private-story-log-message-250", "private-story-log-extra-250", "private-story-log-raw-250"} {
-			if strings.Contains(string(contents), private) {
-				t.Fatalf("%s contains decrypted story-log value %q", path, private)
-			}
-		}
-	}
 	t.Logf("manifest SHA-256=%x; unchanged data-logs.db SHA-256=%x", result.ManifestDigest, logSourceDigest)
 }
 
+// The streams here have no drop recorder bound, so rows that would otherwise
+// be dropped (a dangling or mismatched group state) must abort.
 func TestLegacyStoryLogSourceRejectsOrphansAndInvalidFilesFromSnapshot(t *testing.T) {
 	for _, scenario := range []struct {
 		name                    string
@@ -423,9 +411,9 @@ func TestLegacyStoryLogSourceRejectsOrphansAndInvalidFilesFromSnapshot(t *testin
 	}{
 		{name: "unreadable database", unreadable: true},
 		{name: "orphan entry", orphanEntry: true},
-		{name: "dangling current group state", danglingState: true},
+		{name: "dangling current group state without recorder", danglingState: true},
 		{name: "duplicate session identity", duplicateName: true},
-		{name: "mismatched group identity", mismatchedGroupIdentity: true},
+		{name: "mismatched group identity without recorder", mismatchedGroupIdentity: true},
 		{name: "incomplete schema", incompleteSchema: true},
 		{name: "duplicate legacy id", duplicateID: true},
 	} {
@@ -510,7 +498,7 @@ func TestLegacyStoryLogSourceRejectsOrphansAndInvalidFilesFromSnapshot(t *testin
 					t.Fatal(err)
 				}
 			}
-			source := NewLegacySourceWithKeySource(root, sqliteTargetKeySource{})
+			source := NewLegacySource(root)
 			snapshot, err := source.Snapshot(ctx, filepath.Join(t.TempDir(), "snapshot"))
 			if err != nil {
 				t.Fatal(err)
@@ -533,15 +521,15 @@ func TestLegacyStoryLogSourceRejectsOrphansAndInvalidFilesFromSnapshot(t *testin
 				targetIdentity := "orphan-log-import"
 				_, importErr := NewImporter(ImporterOptions{
 					Readiness: &readinessFake{value: eventstore.Readiness{
-						Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "current", IndexRootID: "current-index",
+						Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "current",
 					}},
-					Source: source, Target: NewSQLiteTarget(targetPath, sqliteTargetKeySource{}),
+					Source: source, Target: NewSQLiteTarget(targetPath),
 					SnapshotRoot: filepath.Join(t.TempDir(), "import-snapshot"), TargetIdentity: targetIdentity,
 				}).Run(ctx, Request{Mode: ModeImport})
 				if !errors.Is(importErr, ErrValidation) || !errors.Is(importErr, ErrQuarantined) {
 					t.Fatalf("orphan log import error = %v, want validation and quarantine", importErr)
 				}
-				reopened := NewSQLiteTarget(targetPath, sqliteTargetKeySource{})
+				reopened := NewSQLiteTarget(targetPath)
 				reopened.identity = targetIdentity
 				if err = reopened.openLocked(ctx); err != nil {
 					t.Fatal(err)
@@ -629,7 +617,7 @@ func TestLegacySourceImportsCrashStoppedStoryLogWALReadOnlyAndReopens(t *testing
 		}
 	}
 
-	source := NewLegacySourceWithKeySource(root, sqliteTargetKeySource{})
+	source := NewLegacySource(root)
 	inventory, err := source.Inventory(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -748,10 +736,10 @@ func TestLegacySourceImportsCrashStoppedStoryLogWALReadOnlyAndReopens(t *testing
 	}
 
 	targetPath := filepath.Join(t.TempDir(), "target.db")
-	target := NewSQLiteTarget(targetPath, sqliteTargetKeySource{})
+	target := NewSQLiteTarget(targetPath)
 	defer target.Close()
 	result, err := NewImporter(ImporterOptions{
-		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old", IndexRootID: "old-index"}},
+		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old"}},
 		Source:    source, Target: target, SnapshotRoot: filepath.Join(t.TempDir(), "import-snapshot"), TargetIdentity: "crash-stopped-log-wal",
 	}).Run(ctx, Request{Mode: ModeImport})
 	if err != nil {

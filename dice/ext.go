@@ -178,7 +178,7 @@ func (d *Dice) RegisterExtension(extInfo *ExtInfo) {
 	for _, alias := range extInfo.Aliases {
 		registerKey(alias)
 	}
-	d.ExtRegistryVersion++
+	atomic.AddInt64(&d.ExtRegistryVersion, 1)
 	d.ActiveWithGraphMu.Lock()
 	d.ActiveWithGraph = nil
 	d.ActiveWithGraphMu.Unlock()
@@ -403,6 +403,29 @@ func parseMessagePreprocessEngineValueWithError(value jsengine.Value) (messagePr
 	return messagePreprocessDecision{action: messagePreprocessNoop, reason: reason}, nil
 }
 
+func messagePreprocessDecisionWithLocalRewrite(
+	value jsengine.Value,
+	originalText string,
+	callbackMessage *Message,
+) (messagePreprocessDecision, error) {
+	decision, err := parseMessagePreprocessEngineValueWithError(value)
+	if err != nil || callbackMessage == nil || callbackMessage.Message == originalText {
+		return decision, err
+	}
+	nullish := value == nil
+	if value != nil && value.Object() == nil {
+		primitive, exportErr := value.ExportPrimitive()
+		nullish = errors.Is(exportErr, jsengine.ErrNoPrimitiveValue) ||
+			(exportErr == nil && primitive == nil)
+	}
+	if !nullish {
+		return decision, nil
+	}
+	return messagePreprocessDecision{
+		action: messagePreprocessRewrite, message: callbackMessage.Message,
+	}, nil
+}
+
 func getEngineObjectProperty(object jsengine.Object, name string) (jsengine.Value, error) {
 	if fallible, ok := object.(jsengine.FallibleObject); ok {
 		return fallible.GetWithError(name)
@@ -438,32 +461,39 @@ func (i *ExtInfo) CallOnMessagePreprocess(d *Dice, ctx *MsgContext, msg *Message
 	if ext == nil || !ext.HasOnMessagePreprocess() {
 		return decision
 	}
+	callbackMessage := cloneMessageForPreprocess(msg)
+	originalText := ""
+	if msg != nil {
+		originalText = msg.Message
+	}
 
 	if !ext.IsJsExt && ext.OnMessagePreprocessEngine == nil && ext.OnMessagePreprocessCallback == nil {
-		return parseMessagePreprocessValue(nil, ext.OnMessagePreprocess(ctx, cloneMessageForPreprocess(msg)))
+		value := gojaEngineValue{value: ext.OnMessagePreprocess(ctx, callbackMessage)}
+		decision, _ = messagePreprocessDecisionWithLocalRewrite(value, originalText, callbackMessage)
+		return decision
 	}
 
 	var callback jsHookValueCallback
 	switch {
 	case ext.OnMessagePreprocessEngine != nil:
 		callback = func(runtime jsengine.Runtime) (jsengine.Value, error) {
-			return ext.OnMessagePreprocessEngine(runtime, ctx, cloneMessageForPreprocess(msg))
+			return ext.OnMessagePreprocessEngine(runtime, ctx, callbackMessage)
 		}
 	case ext.OnMessagePreprocessCallback != nil:
 		callback = func(jsengine.Runtime) (jsengine.Value, error) {
-			return ext.OnMessagePreprocessCallback(ctx, cloneMessageForPreprocess(msg))
+			return ext.OnMessagePreprocessCallback(ctx, callbackMessage)
 		}
 	case ext.OnMessagePreprocess != nil:
 		callback = selectJSHookValueCallback(
 			false,
 			nil,
 			true,
-			func() goja.Value { return ext.OnMessagePreprocess(ctx, cloneMessageForPreprocess(msg)) },
+			func() goja.Value { return ext.OnMessagePreprocess(ctx, callbackMessage) },
 		)
 	}
 	_ = ext.dispatchValueWithJsCheckFiltered(d, jsCallbackPreprocess, callbackEventIDForMessage(ctx, msg), false, callback, func(value jsengine.Value) error {
 		var err error
-		decision, err = parseMessagePreprocessEngineValueWithError(value)
+		decision, err = messagePreprocessDecisionWithLocalRewrite(value, originalText, callbackMessage)
 		return err
 	}, ctx, jsHookScopeExpired)
 	return decision
@@ -641,304 +671,337 @@ func (i *ExtInfo) GetPackageConfig() map[string]interface{} {
 
 // -------------------- 群扩展状态管理 --------------------
 
-func (group *GroupInfo) ensureInactivatedSet() {
-	if group.InactivatedExtSet == nil {
-		group.InactivatedExtSet = StringSet{}
+var extPlaceholderPool = new(SyncMap[string, *ExtInfo])
+
+func extNamePlaceholder(name string) *ExtInfo {
+	if placeholder, ok := extPlaceholderPool.Load(name); ok && placeholder != nil {
+		return placeholder
 	}
+	placeholder, _ := extPlaceholderPool.LoadOrStore(name, &ExtInfo{Name: name})
+	return placeholder
 }
 
-// IsExtInactivated 判断扩展是否被标记为手动关闭。
-func (group *GroupInfo) IsExtInactivated(name string) bool {
-	if group.InactivatedExtSet == nil {
-		return false
-	}
-	_, ok := group.InactivatedExtSet[name]
-	return ok
-}
-
-func (group *GroupInfo) RemoveFromInactivated(name string) {
-	if group.InactivatedExtSet == nil {
-		return
-	}
-	delete(group.InactivatedExtSet, name)
-}
-
-func (group *GroupInfo) AddToInactivated(name string) {
-	group.ensureInactivatedSet()
-	group.InactivatedExtSet[name] = struct{}{}
-}
-
-func (group *GroupInfo) indexOfActivated(name string) int {
-	for idx, item := range group.activatedExtList {
-		if item != nil && item.Name == name {
-			return idx
-		}
-	}
-	return -1
-}
-
-func (group *GroupInfo) removeActivatedByName(name string) bool {
-	idx := group.indexOfActivated(name)
-	if idx == -1 {
-		return false
-	}
-	group.activatedExtList = append(group.activatedExtList[:idx], group.activatedExtList[idx+1:]...)
-	return true
-}
-
-// SyncWrapperStatus 延迟更新机制：检查并移除无效的 nil 条目。
-// 已删除 wrapper 保留为墓碑，等待重装后恢复群的开启状态。
-func (group *GroupInfo) SyncWrapperStatus(d *Dice) bool {
-	if d == nil {
-		return false
-	}
-
-	// 确保延迟初始化已完成（GetActivatedExtList 会处理，内部有锁）
-	_ = group.GetActivatedExtList(d)
-
-	// 快速路径：无需更新（无锁检查，减少锁竞争）
-	if atomic.LoadInt64(&group.ExtAppliedTime) >= d.ExtUpdateTime {
-		return false
-	}
-
-	// 加锁保护 activatedExtList 的读写操作
-	group.extInitMu.Lock()
-	defer group.extInitMu.Unlock()
-
-	// double-check：在锁内再次检查，避免重复处理
-	if atomic.LoadInt64(&group.ExtAppliedTime) >= d.ExtUpdateTime {
-		return false
-	}
-
-	// 过滤无效条目；已删除（IsDeleted）的 wrapper 保留为墓碑。
-	needsUpdate := false
-	newList := make([]*ExtInfo, 0, len(group.activatedExtList))
-
-	for _, wrapper := range group.activatedExtList {
-		if wrapper == nil {
-			needsUpdate = true
-			continue
-		}
-		newList = append(newList, wrapper)
-	}
-
-	if needsUpdate {
-		group.activatedExtList = newList
-		group.MarkDirty(d)
-	}
-
-	atomic.StoreInt64(&group.ExtAppliedTime, d.ExtUpdateTime)
-	return needsUpdate
-}
-
-// ExtActive 开启扩展（手动触发）。
-func (group *GroupInfo) ExtActive(ei *ExtInfo) {
-	group.extInitMu.Lock()
-	defer group.extInitMu.Unlock()
-	group.extActivateInternal(ei, ActivateReasonManual)
-}
-
-// ExtActivateBatch 批量激活扩展。
-// 对于首次加载的扩展（isFirstTimeLoad[name]=true），直接激活。
-// 对于非首次加载的扩展，根据 AutoActive 设置决定是否激活。
-// 已在 InactivatedExtSet 中的扩展不会被激活。
-func (group *GroupInfo) ExtActivateBatch(extInfos []*ExtInfo, isFirstTimeLoad map[string]bool) {
-	if len(extInfos) == 0 {
-		return
-	}
-
-	group.extInitMu.Lock()
-	defer group.extInitMu.Unlock()
-
-	group.ensureInactivatedSet()
-
-	// 构建已知扩展集合
-	known := make(map[string]struct{}, len(group.activatedExtList))
-	for _, ext := range group.activatedExtList {
-		if ext != nil {
-			known[ext.Name] = struct{}{}
-		}
-	}
-
-	for _, ext := range extInfos {
-		if ext == nil {
-			continue
-		}
-		// 跳过已激活的扩展
-		if _, exists := known[ext.Name]; exists {
-			continue
-		}
-		// 跳过被用户关闭的扩展
-		if group.IsExtInactivated(ext.Name) {
-			continue
-		}
-		// 首次加载的扩展直接激活
-		if first, exists := isFirstTimeLoad[ext.Name]; exists && first {
-			group.extActivateInternal(ext, ActivateReasonFirstMessage)
-			known[ext.Name] = struct{}{}
-			continue
-		}
-		// 非首次加载，根据 AutoActive 决定
-		if ext.AutoActive || (ext.DefaultSetting != nil && ext.DefaultSetting.AutoActive) {
-			group.extActivateInternal(ext, ActivateReasonFirstMessage)
-			known[ext.Name] = struct{}{}
-		} else {
-			group.AddToInactivated(ext.Name)
-		}
-	}
-}
-
-// ExtInactive 手动关闭扩展，连带关闭伴随扩展。
-func (group *GroupInfo) ExtInactive(ei *ExtInfo) *ExtInfo {
-	group.extInitMu.Lock()
-	defer group.extInitMu.Unlock()
-	return group.extDeactivateInternal(ei, DeactivateReasonManual, true)
-}
-
-// ExtInactiveSystem 系统级关闭（不写入 Inactivated 集合）。
-func (group *GroupInfo) ExtInactiveSystem(ei *ExtInfo) *ExtInfo {
-	group.extInitMu.Lock()
-	defer group.extInitMu.Unlock()
-	return group.extDeactivateInternal(ei, DeactivateReasonSystem, false)
-}
-
-// ExtInactiveByName 通过名称关闭扩展。
-func (group *GroupInfo) ExtInactiveByName(name string) *ExtInfo {
-	group.extInitMu.Lock()
-	defer group.extInitMu.Unlock()
-	// 直接调用内部函数避免死锁（不调用 ExtInactive）
-	for _, item := range group.activatedExtList {
-		if item != nil && item.Name == name {
-			return group.extDeactivateInternal(item, DeactivateReasonManual, true)
-		}
-	}
-	return nil
-}
-
-// ExtGetActive 查询扩展是否处于激活状态。
-func (group *GroupInfo) ExtGetActive(name string) *ExtInfo {
-	group.extInitMu.Lock()
-	defer group.extInitMu.Unlock()
-	for _, item := range group.activatedExtList {
-		if item != nil && item.Name == name {
-			return item
-		}
-	}
-	return nil
-}
-
-func (group *GroupInfo) extActivateInternal(ei *ExtInfo, reason ActivateReason) {
-	if ei == nil || ei.dice == nil {
-		return
-	}
-	group.ensureInactivatedSet()
-	d := ei.dice
-	graph := d.activeWithGraph()
-	// 先激活主扩展
-	group.promoteExt(ei)
-	// 再激活伴随扩展，使其指令优先级更高（越晚激活优先级越高）
-	names := collectChainedNames(d.Logger, graph, ei.Name, maxChainDepth)
-	for _, name := range names {
-		if ext := d.ExtFind(name, false); ext != nil {
-			group.promoteExt(ext)
-		}
-	}
-	group.MarkDirty(d)
-}
-
-func (group *GroupInfo) promoteExt(ext *ExtInfo) {
-	if ext == nil {
-		return
-	}
-	group.RemoveFromInactivated(ext.Name)
-	_ = group.removeActivatedByName(ext.Name)
-	group.activatedExtList = append([]*ExtInfo{ext}, group.activatedExtList...)
-}
-
-func (group *GroupInfo) extDeactivateInternal(ei *ExtInfo, reason DeactivateReason, markInactivated bool) *ExtInfo {
-	if ei == nil || ei.dice == nil {
+func (group *GroupInfo) GetActivatedExtList(d *Dice) []*ExtInfo {
+	if group == nil || group.requireRuntimeAuthority() != nil {
 		return nil
 	}
-	d := ei.dice
-	graph := d.activeWithGraph()
-	names := []string{ei.Name}
-	names = append(names, collectChainedNames(d.Logger, graph, ei.Name, maxChainDepth)...)
+	ids := group.ActivatedExtensionIDs()
+	version := group.Version()
+	registryVersion := int64(0)
+	appliedTime := int64(1)
+	if d != nil {
+		registryVersion = atomic.LoadInt64(&d.ExtRegistryVersion)
+		if updateTime := atomic.LoadInt64(&d.ExtUpdateTime); updateTime != 0 {
+			appliedTime = updateTime
+		}
+	}
 
+	group.extensionCacheMu.Lock()
+	localMatch := group.extensionCacheStateVersion == version &&
+		slices.Equal(group.activatedExtensionIDs, ids) &&
+		(d == nil || group.extensionCacheRegistryVersion == registryVersion)
+	if localMatch {
+		resolved := slices.Clone(group.activatedExtensions)
+		group.extensionCacheMu.Unlock()
+		return resolved
+	}
+	group.extensionCacheMu.Unlock()
+
+	resources := group.runtime
+	resources.extensionMu.Lock()
+	cacheEpoch := resources.extensionCacheEpoch
+	sharedMatch := resources.extensionStateVersion == version &&
+		slices.Equal(resources.activatedExtensionIDs, ids) &&
+		(d == nil || resources.extensionRegistryVersion == registryVersion)
+	shared := slices.Clone(resources.activatedExtensions)
+	resources.extensionMu.Unlock()
+	if sharedMatch {
+		group.extensionCacheMu.Lock()
+		group.activatedExtensions = slices.Clone(shared)
+		group.activatedExtensionIDs = slices.Clone(ids)
+		group.extensionCacheStateVersion = version
+		group.extensionCacheRegistryVersion = registryVersion
+		group.extensionCacheMu.Unlock()
+		return shared
+	}
+
+	resolved := make([]*ExtInfo, 0, len(ids))
+	for _, name := range ids {
+		var extension *ExtInfo
+		if d != nil {
+			extension = d.ExtFind(name, false)
+		} else {
+			for _, current := range shared {
+				if current != nil && current.Name == name {
+					extension = current
+					break
+				}
+			}
+		}
+		if extension == nil {
+			extension = extNamePlaceholder(name)
+		}
+		resolved = append(resolved, extension)
+	}
+	group.extensionCacheMu.Lock()
+	group.activatedExtensions = slices.Clone(resolved)
+	group.activatedExtensionIDs = slices.Clone(ids)
+	group.extensionCacheStateVersion = version
+	group.extensionCacheRegistryVersion = registryVersion
+	group.extensionCacheMu.Unlock()
+
+	if d != nil && group.transaction != nil {
+		publishedExtensions := slices.Clone(resolved)
+		publishedIDs := slices.Clone(ids)
+		_ = group.transaction.AfterCommit(func() {
+			if resources.revoked.Load() || group.Version() != version {
+				return
+			}
+			resources.extensionMu.Lock()
+			defer resources.extensionMu.Unlock()
+			if resources.revoked.Load() || resources.extensionCacheEpoch != cacheEpoch {
+				return
+			}
+			resources.activatedExtensions = slices.Clone(publishedExtensions)
+			resources.activatedExtensionIDs = slices.Clone(publishedIDs)
+			resources.extensionStateVersion = version
+			resources.extensionRegistryVersion = registryVersion
+			// A nonzero marker is required even before the registry has an
+			// update timestamp, otherwise every message rebuilds this list.
+			resources.extensionAppliedTime = appliedTime
+		})
+	}
+	return slices.Clone(resolved)
+}
+
+func (group *GroupInfo) TriggerExtHook(d *Dice, getHook func(*ExtInfo) func()) {
+	for _, wrapper := range group.GetActivatedExtList(d) {
+		extension := wrapper.GetRealExt()
+		if extension == nil {
+			continue
+		}
+		if hook := getHook(extension); hook != nil {
+			hook()
+		}
+	}
+}
+
+// SyncWrapperStatus refreshes the derived extension pointer cache. Durable
+// enabled IDs remain canonical even while a plugin is uninstalled.
+func (group *GroupInfo) SyncWrapperStatus(d *Dice) bool {
+	if group == nil || group.requireRuntimeAuthority() != nil {
+		return false
+	}
+	resources := group.runtime
+	resources.extensionMu.Lock()
+	beforeVersion := resources.extensionRegistryVersion
+	resources.extensionMu.Unlock()
+	_ = group.GetActivatedExtList(d)
+	return d != nil && beforeVersion != atomic.LoadInt64(&d.ExtRegistryVersion)
+}
+
+func (group *GroupInfo) ExtActive(extension *ExtInfo) error {
+	return group.extActivateInternal(extension, ActivateReasonManual)
+}
+
+func (group *GroupInfo) ExtActivateBatch(extInfos []*ExtInfo, isFirstTimeLoad map[string]bool) error {
+	if err := group.requireRuntimeAuthority(); err != nil {
+		return err
+	}
+	for _, extension := range extInfos {
+		if extension == nil || extension.Name == "" || group.ExtensionActive(extension.Name) || group.ExtensionInactivated(extension.Name) {
+			continue
+		}
+		first := isFirstTimeLoad[extension.Name]
+		if first || extension.AutoActive || (extension.DefaultSetting != nil && extension.DefaultSetting.AutoActive) {
+			if err := group.extActivateInternal(extension, ActivateReasonFirstMessage); err != nil {
+				return err
+			}
+		} else if err := group.SetExtension(extension.Name, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (group *GroupInfo) ExtInactive(extension *ExtInfo) (*ExtInfo, error) {
+	return group.extDeactivateInternal(extension, DeactivateReasonManual, true)
+}
+
+func (group *GroupInfo) invalidateExtensionPointerCache() {
+	if group == nil {
+		return
+	}
+	group.extensionCacheMu.Lock()
+	group.activatedExtensions = nil
+	group.activatedExtensionIDs = nil
+	group.extensionCacheStateVersion = 0
+	group.extensionCacheRegistryVersion = -1
+	group.extensionCacheMu.Unlock()
+	if group.runtime == nil {
+		return
+	}
+	group.runtime.extensionMu.Lock()
+	group.runtime.activatedExtensions = nil
+	group.runtime.activatedExtensionIDs = nil
+	group.runtime.extensionStateVersion = 0
+	group.runtime.extensionRegistryVersion = -1
+	group.runtime.extensionCacheEpoch++
+	group.runtime.extensionMu.Unlock()
+}
+
+// ExtInactiveSystem invalidates only the resolved pointer cache. The enabled
+// durable ID is retained as a tombstone so reinstalling the plugin restores
+// the group's selection.
+func (group *GroupInfo) ExtInactiveSystem(extension *ExtInfo) (*ExtInfo, error) {
+	if err := group.requireRuntimeAuthority(); err != nil {
+		return nil, err
+	}
+	group.invalidateExtensionPointerCache()
+	return extension, nil
+}
+
+func (group *GroupInfo) ExtInactiveByName(name string) (*ExtInfo, error) {
+	if group == nil {
+		return nil, ErrGroupHandleUnavailable
+	}
+	var extension *ExtInfo
+	for _, candidate := range group.GetActivatedExtList(nil) {
+		if candidate != nil && candidate.Name == name {
+			extension = candidate
+			break
+		}
+	}
+	if extension == nil {
+		extension = extNamePlaceholder(name)
+	}
+	return group.extDeactivateInternal(extension, DeactivateReasonManual, true)
+}
+
+func (group *GroupInfo) ExtGetActive(name string) *ExtInfo {
+	if group == nil || group.requireRuntimeAuthority() != nil || !group.ExtensionActive(name) {
+		return nil
+	}
+	for _, extension := range group.GetActivatedExtList(nil) {
+		if extension != nil && extension.Name == name {
+			return extension
+		}
+	}
+	return extNamePlaceholder(name)
+}
+
+func (group *GroupInfo) extActivateInternal(extension *ExtInfo, _ ActivateReason) error {
+	if group == nil {
+		return ErrGroupHandleUnavailable
+	}
+	if extension == nil || extension.Name == "" || extension.dice == nil {
+		return errors.New("dice: extension activation target unavailable")
+	}
+	d := extension.dice
+	followers := collectChainedNames(d.Logger, d.activeWithGraph(), extension.Name, maxChainDepth)
+	names := append([]string{extension.Name}, followers...)
+	for _, name := range names {
+		if err := group.SetExtension(name, true); err != nil {
+			return err
+		}
+	}
+	priority := append(append([]string(nil), followers...), extension.Name)
+	if err := group.promoteExtensions(priority); err != nil {
+		return err
+	}
+	_ = group.GetActivatedExtList(d)
+	return nil
+}
+
+func (group *GroupInfo) extDeactivateInternal(extension *ExtInfo, _ DeactivateReason, markInactivated bool) (*ExtInfo, error) {
+	if group == nil {
+		return nil, ErrGroupHandleUnavailable
+	}
+	if extension == nil || extension.Name == "" {
+		return nil, errors.New("dice: extension deactivation target unavailable")
+	}
+	d := extension.dice
+	names := []string{extension.Name}
+	if d != nil {
+		names = append(names, collectChainedNames(d.Logger, d.activeWithGraph(), extension.Name, maxChainDepth)...)
+	}
 	var removed *ExtInfo
 	for _, name := range names {
 		if markInactivated {
-			group.AddToInactivated(name)
-		}
-		if ext := d.ExtFind(name, false); ext != nil {
-			if target := ext.GetRealExt(); target != nil && target.Storage != nil {
-				_ = target.StorageClose()
+			if err := group.SetExtension(name, false); err != nil {
+				return removed, err
 			}
-			if group.removeActivatedByName(name) && removed == nil {
-				removed = ext
+		}
+		if d != nil {
+			if ext := d.ExtFind(name, false); ext != nil {
+				if target := ext.GetRealExt(); target != nil && target.Storage != nil {
+					_ = target.StorageClose()
+				}
+				if removed == nil {
+					removed = ext
+				}
 			}
 		}
 	}
-	group.MarkDirty(d)
-	return removed
+	if group.runtime != nil {
+		group.runtime.extensionMu.Lock()
+		group.runtime.extensionStateVersion = 0
+		group.runtime.extensionMu.Unlock()
+	}
+	return removed, nil
 }
 
-// SyncExtensionsOnMessage 在群首次收到消息或扩展集发生变动时调用，按 AutoActive 规则处理新扩展。
-func (group *GroupInfo) SyncExtensionsOnMessage(d *Dice) {
+func (group *GroupInfo) SyncExtensionsOnMessage(d *Dice) error {
+	if err := group.requireRuntimeAuthority(); err != nil {
+		return err
+	}
 	if d == nil {
-		return
+		return errors.New("dice: extension registry unavailable")
 	}
-	// 快速路径：无需更新
-	if group.ExtAppliedVersion == d.ExtRegistryVersion {
-		return
+	registryVersion := atomic.LoadInt64(&d.ExtRegistryVersion)
+	resetEpoch := group.runtime.currentExtensionDefaultsEpoch()
+	group.runtime.extensionMu.Lock()
+	alreadyApplied := group.runtime.extensionDefaultsInitialized &&
+		group.runtime.extensionDefaultsVersion == registryVersion &&
+		group.runtime.extensionResetEpoch >= resetEpoch
+	resetPending := group.runtime.extensionResetEpoch < resetEpoch
+	group.runtime.extensionMu.Unlock()
+	if alreadyApplied {
+		return nil
 	}
-
-	group.extInitMu.Lock()
-	defer group.extInitMu.Unlock()
-
-	// double-check：在锁内再次检查
-	if group.ExtAppliedVersion == d.ExtRegistryVersion {
-		return
-	}
-
-	group.ensureInactivatedSet()
-	// 指针重解析：重装的插件（曾跨重启删除，条目为共享占位）换回真实扩展指针。
-	extMap := make(map[string]*ExtInfo, len(d.ExtList))
-	for _, ext := range d.ExtList {
-		if ext != nil {
-			extMap[ext.Name] = ext
-		}
-	}
-	newList := make([]*ExtInfo, 0, len(group.activatedExtList))
-	for _, ext := range group.activatedExtList {
-		if ext == nil {
+	for _, extension := range d.ExtList {
+		if extension == nil || extension.Name == "" || group.ExtensionActive(extension.Name) {
 			continue
 		}
-		if live := extMap[ext.Name]; live != nil && live != ext {
-			newList = append(newList, live)
+		enabled := extension.AutoActive || (extension.DefaultSetting != nil && extension.DefaultSetting.AutoActive)
+		// A recorded deactivation survives registry changes such as incremental
+		// plugin loads. Only a full defaults apply made after this group was
+		// cached re-enables AutoActive extensions over it.
+		if group.ExtensionInactivated(extension.Name) && (!resetPending || !enabled) {
 			continue
 		}
-		newList = append(newList, ext)
-	}
-	group.activatedExtList = newList
-	known := make(map[string]struct{}, len(group.activatedExtList)+len(group.InactivatedExtSet))
-	for _, ext := range group.activatedExtList {
-		if ext != nil {
-			known[ext.Name] = struct{}{}
+		if err := group.SetExtension(extension.Name, enabled); err != nil {
+			return err
 		}
 	}
-	for name := range group.InactivatedExtSet {
-		known[name] = struct{}{}
+	resources := group.runtime
+	if group.transaction == nil {
+		return ErrDomainTxUnavailable
 	}
-
-	for _, ext := range d.ExtList {
-		if _, exists := known[ext.Name]; exists {
-			continue
+	if err := group.transaction.AfterCommit(func() {
+		if resources.revoked.Load() {
+			return
 		}
-		if ext.AutoActive || (ext.DefaultSetting != nil && ext.DefaultSetting.AutoActive) {
-			group.extActivateInternal(ext, ActivateReasonFirstMessage)
-		} else {
-			group.AddToInactivated(ext.Name)
+		resources.extensionMu.Lock()
+		resources.extensionDefaultsInitialized = true
+		resources.extensionDefaultsVersion = registryVersion
+		if resources.extensionResetEpoch < resetEpoch {
+			resources.extensionResetEpoch = resetEpoch
 		}
+		resources.extensionMu.Unlock()
+	}); err != nil {
+		return err
 	}
-	group.ExtAppliedVersion = d.ExtRegistryVersion
+	_ = group.GetActivatedExtList(d)
+	return nil
 }

@@ -129,13 +129,14 @@ Runtime package 的安装、移除和更新通过重启应用。元数据缓存�
 
 带 `ctx` 的事件钩子和 `cmd.solve` 支持返回 Promise。Core 在所属 runtime 内等待并消费结果，再继续消息处理或收尾。Promise 判定采用引擎原生类型，普通返回值使用同步语义。
 
-- Goja 原生 `await` 保留发起者的插件、消息和事务归属，continuation 的写入属于发起调用。
-- 每条消息共用 10 秒总期限，覆盖排队、同步 JavaScript 与全部 Promise 等待。取消操作撤销调用权限并取消关联的 `fetch` 请求。
+- Goja 与 QuickJS 的原生 `await` 和 Promise continuation 保留发起者的插件、消息和事务归属，不借用 resolver 的上下文。QuickJS 在引擎 reaction 注册时捕获 token，并在 job 执行和异常格式化时恢复；已撤销的 job 不运行、不消耗独立调用的执行预算。定时器在执行前检查发起者权限，撤销的 interval 不会继续调度。
+- 每条消息共用 10 秒总期限，覆盖排队、同步 JavaScript 与全部 Promise 等待。取消操作撤销调用权限并取消关联的 `fetch` 请求。独立定时任务从 runtime 生命周期派生同样的调用期限，覆盖 durable admission、执行与 commit。
 - `ctx` 的发送和写入权限覆盖该调用的有效生命周期。业务异步工作通过返回或等待的 Promise 加入此生命周期；独立定时器和悬空协程使用各自的执行生命周期。
 - Durable 发送成功后的 `onMessageSend` 使用独立、best-effort 的宿主上下文，生命周期持续至返回的 Promise 结束。原消息事务保持已提交状态。
-- Runtime 停止或替换时结束等待者；取消和关闭释放宿主观察器的消息引用。插件保存的 JavaScript 对象和协程按语言引用关系回收。
+- Runtime 停止或替换时先撤销新工作准入、通知已准入工作取消，再等待正在运行的 Go 回调及事务收尾。宿主观察器、timer 和 service request 随所属生命周期释放；调用、binding 或 durable admission 已失败时，terminal 仍交给 provider 回收 Promise 或 socket，但明确禁止运行其 continuation，也不再尝试准入新事务。
+- 持久插件成功完成一次调用后，其未等待的合法异步工作继续跟随 binding 生命周期。后台 token 回收不能借用同一 binding 内另一调用的期限；owner 内执行仍受当前调用的期限约束。
 
-JavaScript `finally` 随 VM 控制流执行；Goja 硬中断的资源收尾由宿主负责。独立调用使用独立中断状态。`onLoad`、`GetDescText` 和 `HelpFunc` 使用同步契约。
+JavaScript `finally` 随 VM 控制流执行；硬中断的资源收尾由宿主负责。Goja 与 Host ABI 1.2 QuickJS 均支持纯 JavaScript CPU 循环的取消和 deadline。独立调用使用独立中断状态；不协作的 Go 宿主回调仍需自行响应取消，Core 会等待其返回，不把等待超时视为已关闭。`onLoad`、`GetDescText` 和 `HelpFunc` 使用同步契约。
 
 ## Adapter 透传 API
 

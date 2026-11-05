@@ -152,7 +152,8 @@ func newFetchFn(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler,
 		if hooks.CurrentContext != nil {
 			executionContext = hooks.CurrentContext()
 		}
-		requestData, err := parseFetchRequest(rt, jsengine.ContextForExecution(executionContext), call.Argument(0), call.Argument(1))
+		parent, release := jsengine.ContextForAsyncWork(executionContext)
+		requestData, err := parseFetchRequest(rt, parent, release, call.Argument(0), call.Argument(1))
 		if err != nil {
 			_ = reject(rt.NewTypeError(err.Error()))
 			return rt.ToValue(promise)
@@ -221,8 +222,12 @@ func newFetchFn(rt *goja.Runtime, loop *eventloop.EventLoop, proxy http.Handler,
 	}
 }
 
-func parseFetchRequest(rt *goja.Runtime, parent context.Context, input goja.Value, init goja.Value) (*fetchRequestData, error) {
+func parseFetchRequest(rt *goja.Runtime, parent context.Context, release context.CancelFunc, input goja.Value, init goja.Value) (*fetchRequestData, error) {
+	if release == nil {
+		release = func() {}
+	}
 	if goja.IsUndefined(input) || goja.IsNull(input) || strings.TrimSpace(input.String()) == "" {
+		release()
 		return nil, errors.New("url parameter missing")
 	}
 
@@ -232,7 +237,12 @@ func parseFetchRequest(rt *goja.Runtime, parent context.Context, input goja.Valu
 		headers: newHeadersData(),
 		abort:   &fetchAbortState{},
 	}
-	data.ctx, data.cancel = context.WithCancel(parent)
+	var cancel context.CancelFunc
+	data.ctx, cancel = context.WithCancel(parent)
+	data.cancel = func() {
+		cancel()
+		release()
+	}
 	parsed := false
 	defer func() {
 		if !parsed {

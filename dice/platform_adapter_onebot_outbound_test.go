@@ -114,7 +114,7 @@ func (onebotTemporaryError) Temporary() bool { return true }
 
 func outboundEffectForTest(t *testing.T, payload adapterapi.EffectPayload, caps adapterapi.CapabilitySet, action adapterapi.ActionKind) adapterapi.OutboundEffect {
 	t.Helper()
-	lane, err := adapterapi.NewLaneMetadata("endpoint-1", payload.Target, []byte("index-root"), 1)
+	lane, err := adapterapi.NewLaneMetadata("endpoint-1", payload.Target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,8 @@ func outboundEffectForTest(t *testing.T, payload adapterapi.EffectPayload, caps 
 		risk, retry = adapterapi.EffectRiskHigh, adapterapi.EffectRetryNonIdempotent
 	case adapterapi.EffectPayloadAnswerRequest:
 		retry = adapterapi.EffectRetryNonIdempotent
-	case adapterapi.EffectPayloadInvalid, adapterapi.EffectPayloadEdit, adapterapi.EffectPayloadRecall, adapterapi.EffectPayloadGroupInfoRefresh:
+	case adapterapi.EffectPayloadInvalid, adapterapi.EffectPayloadEdit, adapterapi.EffectPayloadRecall,
+		adapterapi.EffectPayloadGroupInfoRefresh, adapterapi.EffectPayloadAdapterAPI, adapterapi.EffectPayloadForward:
 	}
 	return adapterapi.OutboundEffect{
 		Version: adapterapi.EffectVersionOne, ID: "effect-1", EndpointID: "endpoint-1", OperationID: "operation-1",

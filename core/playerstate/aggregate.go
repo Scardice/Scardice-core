@@ -30,14 +30,13 @@ type PlayerState struct {
 	DiceSideNum         int64  `json:"diceSideNum,omitempty"`
 	Deleted             bool   `json:"deleted"`
 }
-type Player = PlayerState
 type GroupUserAttrsState struct {
 	Version        uint64                    `json:"version"`
 	DiceID         string                    `json:"diceId"`
 	GroupID        string                    `json:"groupId"`
 	UserID         string                    `json:"userId"`
 	BindingSheetID string                    `json:"bindingSheetId,omitempty"`
-	Values         map[string]EncryptedValue `json:"values,omitempty"`
+	Values         map[string]AttributeValue `json:"values,omitempty"`
 	Operations     []AttributeOperation      `json:"operations,omitempty"`
 	Deleted        bool                      `json:"deleted"`
 }
@@ -62,7 +61,7 @@ type CharacterState struct {
 	CharacterID string         `json:"characterId"`
 	Name        string         `json:"name"`
 	SheetType   string         `json:"sheetType,omitempty"`
-	Sheet       EncryptedValue `json:"sheet,omitempty"`
+	Sheet       AttributeValue `json:"sheet,omitzero"`
 	Deleted     bool           `json:"deleted"`
 }
 type Character = CharacterState
@@ -87,33 +86,15 @@ func (s GroupUserAttrsState) Clone() GroupUserAttrsState {
 }
 func (s CharacterState) Clone() CharacterState   { out := s; out.Sheet = s.Sheet.Clone(); return out }
 func (s ModerationState) Clone() ModerationState { return s }
-func cloneValues(in map[string]EncryptedValue) map[string]EncryptedValue {
+func cloneValues(in map[string]AttributeValue) map[string]AttributeValue {
 	if in == nil {
 		return nil
 	}
-	out := make(map[string]EncryptedValue, len(in))
+	out := make(map[string]AttributeValue, len(in))
 	for k, v := range in {
 		out[k] = v.Clone()
 	}
 	return out
-}
-
-type PlayerCompatibilityView struct{ PlayerState }
-type GroupUserAttrsCompatibilityView struct{ GroupUserAttrsState }
-type CharacterCompatibilityView struct{ CharacterState }
-type ModerationCompatibilityView struct{ ModerationState }
-
-func (s PlayerState) CompatibilityView() PlayerCompatibilityView {
-	return PlayerCompatibilityView{s.Clone()}
-}
-func (s GroupUserAttrsState) CompatibilityView() GroupUserAttrsCompatibilityView {
-	return GroupUserAttrsCompatibilityView{s.Clone()}
-}
-func (s CharacterState) CompatibilityView() CharacterCompatibilityView {
-	return CharacterCompatibilityView{s.Clone()}
-}
-func (s ModerationState) CompatibilityView() ModerationCompatibilityView {
-	return ModerationCompatibilityView{s.Clone()}
 }
 
 func isNilEvent(event any) bool {

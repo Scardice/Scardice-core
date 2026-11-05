@@ -24,7 +24,7 @@ const (
 )
 
 // OnebotConfig is the typed, non-secret pure OneBot endpoint configuration.
-// Token identifies encrypted material in the event store; it never carries
+// Token identifies secret material in the event store; it never carries
 // token bytes.
 type OnebotConfig struct {
 	Mode                string               `json:"mode"`

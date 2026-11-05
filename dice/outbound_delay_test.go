@@ -10,7 +10,7 @@ import (
 
 func TestOutboundDelayDefersTheEffectInsteadOfBlockingTheCaller(t *testing.T) {
 	submitter := &bridgeTestSubmitter{}
-	ctx, msg, _ := bridgeTestContext(submitter)
+	ctx, msg, _ := bridgeTestContext(t, submitter)
 	ctx.setOutboundDelay(4 * time.Second)
 
 	started := time.Now()
@@ -36,7 +36,7 @@ func TestOutboundDelayDefersTheEffectInsteadOfBlockingTheCaller(t *testing.T) {
 
 func TestOutboundWithoutDelayIsImmediateAndZeroDelayClearsIt(t *testing.T) {
 	submitter := &bridgeTestSubmitter{}
-	ctx, msg, _ := bridgeTestContext(submitter)
+	ctx, msg, _ := bridgeTestContext(t, submitter)
 
 	ReplyToSender(ctx, msg, "now")
 	submitter.mu.Lock()
@@ -59,7 +59,7 @@ func TestOutboundWithoutDelayIsImmediateAndZeroDelayClearsIt(t *testing.T) {
 
 func TestOutboundDelayIsCappedBelowTheDeadline(t *testing.T) {
 	submitter := &bridgeTestSubmitter{}
-	ctx, msg, _ := bridgeTestContext(submitter)
+	ctx, msg, _ := bridgeTestContext(t, submitter)
 	ctx.setOutboundDelay(24 * time.Hour)
 	ReplyToSender(ctx, msg, "capped")
 
@@ -78,14 +78,12 @@ func configureBridgeForAnswerRequest(ctx *MsgContext) {
 		ObservedState: adapterapi.ObservedStateConnected,
 		Capabilities:  adapterapi.CapabilityOutbound | adapterapi.CapabilityActions,
 		Actions:       adapterapi.ActionSet(0).With(adapterapi.ActionKindAnswerRequest),
-		IndexRootID:   "root-1",
-		IndexSigner:   bridgeTestIndexSigner{root: []byte("01234567890123456789012345678901"), id: "root-1"},
 	}}
 }
 
 func TestAnswerRequestActionIsSubmittedAsAnIdempotentProviderAction(t *testing.T) {
 	submitter := &bridgeTestSubmitter{}
-	ctx, _, legacy := bridgeTestContext(submitter)
+	ctx, _, legacy := bridgeTestContext(t, submitter)
 	configureBridgeForAnswerRequest(ctx)
 
 	payload := adapterapi.EffectPayload{

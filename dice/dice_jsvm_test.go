@@ -35,19 +35,23 @@ func (s *countingDiceSource) Uint64() uint64 {
 	return v
 }
 
-func TestJsInit_WhenExtLoopManagerNil_DoesNotPanic(t *testing.T) {
-	d := &Dice{
-		Logger: zap.NewNop().Sugar(),
-		BaseConfig: BaseConfig{
-			DataDir: t.TempDir(),
-		},
-		ImSession:    &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
-		DirtyGroups:  new(SyncMap[string, int64]),
-		AttrsManager: &AttrsManager{},
+func newJSVMTestDice(t *testing.T, dataDir string) *Dice {
+	t.Helper()
+	if dataDir == "" {
+		dataDir = t.TempDir()
 	}
+	d, _ := newCanonicalTestDice(t)
+	d.Logger = zap.NewNop().Sugar()
+	d.BaseConfig.DataDir = dataDir
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.DataDir = dataDir })
+	return d
+}
 
-	// 模拟“调用 shutdown 后重启”：JsEnable=false 且 ExtLoopManager 尚未初始化。
-	d.Config.JsEnable = false
+func TestJsInit_WhenExtLoopManagerNil_DoesNotPanic(t *testing.T) {
+	d := newJSVMTestDice(t, "")
+
+	// 模拟运行时管理器尚未初始化但期望配置已启用。
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.JsEnable = true })
 	d.ExtLoopManager = nil
 
 	defer func() {
@@ -74,8 +78,8 @@ func TestJsInit_WhenExtLoopManagerNil_DoesNotPanic(t *testing.T) {
 	if d.ExtLoopManager == nil {
 		t.Fatalf("expected ExtLoopManager to be initialized")
 	}
-	if !d.Config.JsEnable {
-		t.Fatalf("expected JsEnable to be true after JsInit")
+	if config := d.Config(); config == nil || !config.JsEnable {
+		t.Fatalf("expected configured JsEnable to remain true after JsInit")
 	}
 
 	if d.JsScriptCron == nil {
@@ -125,10 +129,8 @@ func TestJsScriptTaskRunWithoutActiveLoopReturnsWithoutPanic(t *testing.T) {
 			if test.name == "nil loop" {
 				test.manager.SetLoop(nil)
 			}
-			d := &Dice{
-				ExtLoopManager: test.manager,
-				Logger:         zap.NewNop().Sugar(),
-			}
+			d := newJSVMTestDice(t, "")
+			d.ExtLoopManager = test.manager
 			called := false
 			task := &JsScriptTask{
 				dice:   d,
@@ -156,16 +158,11 @@ func TestJsInit_QuickJSStartsNativeHost(t *testing.T) {
 	if os.Getenv("SCARDICE_RUNTIME_ROOT") == "" && os.Getenv("SCARDICE_QUICKJS_PACKAGE") == "" {
 		t.Skip("native QuickJS package is not configured")
 	}
-	d := &Dice{
-		Logger: zap.NewNop().Sugar(),
-		BaseConfig: BaseConfig{
-			DataDir: t.TempDir(),
-		},
-		ImSession:    &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
-		DirtyGroups:  new(SyncMap[string, int64]),
-		AttrsManager: &AttrsManager{},
-	}
-	d.Config.JsEngine = "quickjs"
+	d := newJSVMTestDice(t, "")
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.JsEngine = "quickjs"
+		config.JsEnable = true
+	})
 	t.Cleanup(func() {
 		if d.ExtLoopManager != nil {
 			d.ExtLoopManager.SetLoop(nil)
@@ -174,7 +171,7 @@ func TestJsInit_QuickJSStartsNativeHost(t *testing.T) {
 
 	d.JsInit()
 
-	if !d.Config.JsEnable {
+	if config := d.Config(); config == nil || !config.JsEnable {
 		if d.jsRuntimeManager != nil {
 			status, ok := d.jsRuntimeManager.Status("quickjs")
 			t.Fatalf("native QuickJS initialization left JS disabled: status=%+v ok=%v", status, ok)
@@ -230,16 +227,11 @@ func TestJsInit_QuickJSInstallsNativeConsoleService(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(fixtureDir, "fixture.txt"), []byte("native fs"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	d := &Dice{
-		Logger: zap.NewNop().Sugar(),
-		BaseConfig: BaseConfig{
-			DataDir: dataDir,
-		},
-		ImSession:    &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
-		DirtyGroups:  new(SyncMap[string, int64]),
-		AttrsManager: &AttrsManager{},
-	}
-	d.Config.JsEngine = "quickjs"
+	d := newJSVMTestDice(t, dataDir)
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.JsEngine = "quickjs"
+		config.JsEnable = true
+	})
 	t.Cleanup(func() {
 		if d.ExtLoopManager != nil {
 			d.ExtLoopManager.SetLoop(nil)
@@ -247,7 +239,7 @@ func TestJsInit_QuickJSInstallsNativeConsoleService(t *testing.T) {
 	})
 
 	d.JsInit()
-	if !d.Config.JsEnable || d.JsPrinter == nil {
+	if config := d.Config(); config == nil || !config.JsEnable || d.JsPrinter == nil {
 		status, ok := d.jsRuntimeManagerInstance().Status("quickjs")
 		t.Fatalf("native QuickJS initialization did not enable the console service: status=%+v ok=%v", status, ok)
 	}
@@ -350,24 +342,18 @@ func TestJsLoadScriptRaw_NativeQuickJSExecutesAndRegistersPlugin(t *testing.T) {
 	`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	d := &Dice{
-		Logger: zap.NewNop().Sugar(),
-		BaseConfig: BaseConfig{
-			DataDir: dataDir,
-		},
-		ImSession:    &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
-		DirtyGroups:  new(SyncMap[string, int64]),
-		AttrsManager: &AttrsManager{},
-		ExtRegistry:  new(SyncMap[string, *ExtInfo]),
-	}
-	d.Config.JsEngine = "quickjs"
+	d := newJSVMTestDice(t, dataDir)
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.JsEngine = "quickjs"
+		config.JsEnable = true
+	})
 	t.Cleanup(func() {
 		if d.ExtLoopManager != nil {
 			d.ExtLoopManager.SetLoop(nil)
 		}
 	})
 	d.JsInit()
-	if !d.Config.JsEnable {
+	if config := d.Config(); config == nil || !config.JsEnable {
 		t.Fatal("native QuickJS initialization failed")
 	}
 
@@ -391,22 +377,14 @@ func TestJsInit_QuickJSDoesNotFallbackWithoutNativePackage(t *testing.T) {
 	if os.Getenv("SCARDICE_RUNTIME_ROOT") != "" || os.Getenv("SCARDICE_QUICKJS_PACKAGE") != "" {
 		t.Skip("native QuickJS package is configured")
 	}
-	d := &Dice{
-		Logger: zap.NewNop().Sugar(),
-		BaseConfig: BaseConfig{
-			DataDir: t.TempDir(),
-		},
-		ImSession:    &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
-		DirtyGroups:  new(SyncMap[string, int64]),
-		AttrsManager: &AttrsManager{},
-	}
-	d.Config.JsEngine = "quickjs"
+	d := newJSVMTestDice(t, "")
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.JsEngine = "quickjs"
+		config.JsEnable = true
+	})
 
 	d.JsInit()
 
-	if d.Config.JsEnable {
-		t.Fatal("QuickJS was enabled without an installed native provider")
-	}
 	if d.ExtLoopManager == nil {
 		t.Fatal("QuickJS initialization did not create a loop manager")
 	}
@@ -425,24 +403,18 @@ func TestJsLoadScriptRaw_NativeQuickJSRejectsPathESMImport(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	d := &Dice{
-		Logger: zap.NewNop().Sugar(),
-		BaseConfig: BaseConfig{
-			DataDir: dataDir,
-		},
-		ImSession:    &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
-		DirtyGroups:  new(SyncMap[string, int64]),
-		AttrsManager: &AttrsManager{},
-		ExtRegistry:  new(SyncMap[string, *ExtInfo]),
-	}
-	d.Config.JsEngine = "quickjs"
+	d := newJSVMTestDice(t, dataDir)
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.JsEngine = "quickjs"
+		config.JsEnable = true
+	})
 	d.JsInit()
 	t.Cleanup(func() {
 		if d.ExtLoopManager != nil {
 			d.ExtLoopManager.SetLoop(nil)
 		}
 	})
-	if !d.Config.JsEnable {
+	if config := d.Config(); config == nil || !config.JsEnable {
 		t.Fatal("native QuickJS initialization failed")
 	}
 
@@ -472,14 +444,14 @@ func TestJsInit_BindsGojaRandSourceToGlobalRandSource(t *testing.T) {
 	if _, err := globalRandSource.SetActive(DiceRandomModePCG); err != nil {
 		t.Fatalf("activate pcg source: %v", err)
 	}
-	d := &Dice{
-		Logger: zap.NewNop().Sugar(),
-		Config: NewConfig(nil),
-	}
+	d, _ := newCanonicalTestDice(t)
+	d.Logger = zap.NewNop().Sugar()
 	if d.Logger == nil {
 		t.Fatal("expected logger to be initialized")
 	}
-	d.Config.DiceRandomMode = string(DiceRandomModePCG)
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.DiceRandomMode = string(DiceRandomModePCG)
+	})
 
 	vm := goja.New()
 	vm.SetRandSource(func() float64 {

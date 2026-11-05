@@ -8,6 +8,7 @@ package native
 import "C"
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,23 +29,58 @@ type nativeHostState struct {
 	serviceRegistry *jsservices.Registry
 	mu              sync.Mutex
 	lastErr         string
-	callbacks       map[uint64]uint64
+	callbacks       map[uint64]nativeCallbackEntry
 	nextCallback    uint64
 	closed          bool
 }
+
+type nativeCallbackEntry struct {
+	handle  uint64
+	claimed bool
+}
+
+type nativeCallbackLease struct {
+	state *nativeHostState
+	token hostbridge.CallbackRef
+}
+
+type nativeCallbackCleanup struct {
+	state *nativeHostState
+	token hostbridge.CallbackRef
+}
+type persistentNativeServicePromoter interface {
+	PromotePersistentAsyncRequest(request uint64, terminal bool, run func() (jsengine.Value, error)) error
+	PersistentAsyncPromotionEnabled() bool
+}
+
 type nativeServiceSink struct {
-	loop *nativeLoop
+	loop    *nativeLoop
+	context any
+	deliver func(nativeServiceEvent) error
 }
 
 func (s nativeServiceSink) enqueue(kind jsservices.EventKind, id jsservices.RequestID, response jsservices.Response) error {
 	if s.loop == nil {
 		return ErrNativeClosed
 	}
-	return s.loop.enqueueServiceEvent(nativeServiceEvent{
+	event := nativeServiceEvent{
 		kind:     kind,
 		request:  id,
 		response: response,
-	})
+		context:  s.context,
+	}
+	if promoter, ok := s.context.(persistentNativeServicePromoter); ok && promoter.PersistentAsyncPromotionEnabled() {
+		event.response.Bytes = append([]byte(nil), event.response.Bytes...)
+		deliver := s.deliver
+		if deliver == nil {
+			deliver = s.loop.deliverServiceEvent
+		}
+		terminal := kind == jsservices.EventComplete || kind == jsservices.EventClose
+		return promoter.PromotePersistentAsyncRequest(uint64(id), terminal, func() (jsengine.Value, error) {
+			return nil, deliver(event)
+		})
+	}
+	return s.loop.enqueueServiceEvent(event)
 }
 
 func (s nativeServiceSink) Event(id jsservices.RequestID, response jsservices.Response) error {
@@ -61,7 +97,7 @@ func (s nativeServiceSink) Close(id jsservices.RequestID, response jsservices.Re
 
 func newNativeHostState(loop *nativeLoop) *nativeHostState {
 	return &nativeHostState{
-		loop: loop, session: hostbridge.NewSession(), callbacks: make(map[uint64]uint64),
+		loop: loop, session: hostbridge.NewSession(), callbacks: make(map[uint64]nativeCallbackEntry),
 	}
 }
 
@@ -139,7 +175,7 @@ func (s *nativeHostState) registerCallback(runtimeHandle, valueHandle uint64) (h
 		C.sc_native_value_release(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), C.uint64_t(valueHandle))
 		return 0, hostbridge.ErrStaleRuntimeCallback
 	}
-	s.callbacks[token] = valueHandle
+	s.callbacks[token] = nativeCallbackEntry{handle: valueHandle}
 	s.mu.Unlock()
 	return hostbridge.CallbackRef(token), nil
 }
@@ -153,11 +189,54 @@ func (s *nativeHostState) callbackHandle(token hostbridge.CallbackRef) (uint64, 
 	if s.closed {
 		return 0, hostbridge.ErrStaleRuntimeCallback
 	}
-	handle, ok := s.callbacks[uint64(token)]
+	callback, ok := s.callbacks[uint64(token)]
 	if !ok {
 		return 0, hostbridge.ErrStaleRuntimeCallback
 	}
-	return handle, nil
+	return callback.handle, nil
+}
+
+func cleanupNativeCallback(cleanup nativeCallbackCleanup) {
+	if cleanup.state == nil || cleanup.state.loop == nil {
+		return
+	}
+	_ = cleanup.state.loop.ScheduleWithContext(nil, func(jsengine.Runtime) error {
+		cleanup.state.releaseCallback(cleanup.token, false)
+		return nil
+	})
+}
+
+// releaseCallback releases the native retain on the owner thread. Ingress
+// rollback only releases callbacks that have not yet been handed to Go.
+func (s *nativeHostState) releaseCallback(token hostbridge.CallbackRef, unclaimedOnly bool) {
+	if s == nil || s.loop == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	callback, ok := s.callbacks[uint64(token)]
+	if !ok || (unclaimedOnly && callback.claimed) {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.callbacks, uint64(token))
+	s.mu.Unlock()
+	C.sc_native_value_release(C.uint64_t(s.loop.provider.library), C.uint64_t(s.loop.runtime), C.uint64_t(callback.handle))
+}
+
+func (s *nativeHostState) discardCallback(value hostbridge.Value) {
+	if value.Kind == hostbridge.KindCallback {
+		s.releaseCallback(hostbridge.CallbackRef(value.Callback), true)
+	}
+}
+
+func (s *nativeHostState) discardCallbacks(values []hostbridge.Value) {
+	for _, value := range values {
+		s.discardCallback(value)
+	}
 }
 
 func (s *nativeHostState) closeCallbacks() {
@@ -171,8 +250,8 @@ func (s *nativeHostState) closeCallbacks() {
 	}
 	s.closed = true
 	handles := make([]uint64, 0, len(s.callbacks))
-	for _, handle := range s.callbacks {
-		handles = append(handles, handle)
+	for _, callback := range s.callbacks {
+		handles = append(handles, callback.handle)
 	}
 	s.callbacks = nil
 	s.mu.Unlock()
@@ -204,7 +283,7 @@ func withHostExecution(ctx C.sc_host_ctx_t, fn func(*nativeHostState) C.sc_statu
 			return C.SC_ESTATE
 		}
 		scope := loop.CurrentContext()
-		if err := jsengine.ContextForExecution(scope).Err(); err != nil {
+		if err := jsengine.ExecutionErr(scope); err != nil {
 			state.setError(err)
 			return C.SC_ESTATE
 		}
@@ -397,6 +476,24 @@ func sc_native_go_host_function_owner(ctx C.sc_host_ctx_t, runtimeHandle C.sc_ru
 	})
 }
 
+//export sc_native_go_execution_status
+func sc_native_go_execution_status(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t) C.sc_status_t {
+	return withHostState(ctx, func(state *nativeHostState) C.sc_status_t {
+		if err := state.checkRuntime(runtimeHandle); err != nil || !state.loop.onOwnerThread() {
+			return C.SC_ECLOSED
+		}
+		err := jsengine.ExecutionErr(state.loop.CurrentContext())
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			return C.SC_ETIMEOUT
+		case err != nil:
+			return C.SC_ECLOSED
+		default:
+			return C.SC_OK
+		}
+	})
+}
+
 //export sc_native_go_host_get
 func sc_native_go_host_get(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, ref C.sc_host_ref_t, key C.sc_string_view, out *C.sc_value_t) C.sc_status_t {
 	return withHostExecution(ctx, func(state *nativeHostState) C.sc_status_t {
@@ -412,7 +509,7 @@ func sc_native_go_host_get(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, re
 			state.setError(err)
 			return C.sc_status_t(-20)
 		}
-		value, err := state.session.Get(hostbridge.HostRef(ref), name)
+		value, err := state.session.GetWithCodec(hostbridge.HostRef(ref), name, state.codec(uint64(runtimeHandle)))
 		if err != nil {
 			state.setError(err)
 			return C.sc_status_t(-20)
@@ -440,8 +537,9 @@ func sc_native_go_host_set(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, re
 			return C.sc_status_t(-20)
 		}
 		value, err := state.decodeValue(uint64(runtimeHandle), uint64(input))
+		defer state.discardCallback(value)
 		if err == nil {
-			err = state.session.SetWithCodec(hostbridge.HostRef(ref), name, value, nativeCodec{state: state, runtime: uint64(runtimeHandle)})
+			err = state.session.SetWithCodec(hostbridge.HostRef(ref), name, value, state.codec(uint64(runtimeHandle)))
 		}
 		if err != nil {
 			state.setError(err)
@@ -543,6 +641,7 @@ func sc_native_go_host_call(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, f
 			return C.sc_status_t(-20)
 		}
 		args := make([]hostbridge.Value, int(argc))
+		defer state.discardCallbacks(args)
 		for i := range args {
 			value, err := state.decodeValue(uint64(runtimeHandle), uint64(unsafe.Slice(argv, int(argc))[i]))
 			if err != nil {
@@ -552,7 +651,7 @@ func sc_native_go_host_call(ctx C.sc_host_ctx_t, runtimeHandle C.sc_runtime_t, f
 			args[i] = value
 		}
 		_ = thisValue
-		value, err := state.session.CallFunctionWithCodec(hostbridge.HostFuncRef(function), args, nativeCodec{state: state, runtime: uint64(runtimeHandle)})
+		value, err := state.session.CallFunctionWithCodec(hostbridge.HostFuncRef(function), args, state.codec(uint64(runtimeHandle)))
 		if err != nil {
 			state.setError(err)
 			return C.sc_status_t(-20)
@@ -674,7 +773,11 @@ func sc_native_go_host_service_start(ctx C.sc_host_ctx_t, runtimeHandle C.sc_run
 			state.setError(err)
 			return C.SC_ENOTSUP
 		}
-		id, err := registry.StartNative(jsservices.Call{Request: requestValue, Context: state.loop.CurrentContext()}, nativeServiceSink{loop: state.loop})
+		callContext := state.loop.CurrentContext()
+		id, err := registry.StartNative(
+			jsservices.Call{Request: requestValue, Context: callContext},
+			nativeServiceSink{loop: state.loop, context: callContext},
+		)
 		if err != nil {
 			state.setError(err)
 			return nativeHostServiceStatus(err)
@@ -729,11 +832,21 @@ func sc_native_go_host_last(ctx C.sc_host_ctx_t, buffer *C.char, capacity C.uint
 type nativeCodec struct {
 	state   *nativeHostState
 	runtime uint64
+	scope   hostbridge.ControlledObjectScope
+	leases  []*nativeCallbackLease
+}
+
+func (s *nativeHostState) codec(runtime uint64) *nativeCodec {
+	var scope hostbridge.ControlledObjectScope
+	if s != nil && s.loop != nil {
+		scope = hostbridge.Scope(s.loop.CurrentContext())
+	}
+	return &nativeCodec{state: s, runtime: runtime, scope: scope}
 }
 
 var engineValueType = reflect.TypeOf((*jsengine.Value)(nil)).Elem()
 
-func (c nativeCodec) Decode(value hostbridge.Value, target reflect.Type) (reflect.Value, error) {
+func (c *nativeCodec) Decode(value hostbridge.Value, target reflect.Type) (reflect.Value, error) {
 	if target == nil {
 		return reflect.Value{}, errors.New("native codec callback target is nil")
 	}
@@ -747,7 +860,8 @@ func (c nativeCodec) Decode(value hostbridge.Value, target reflect.Type) (reflec
 	if _, err := c.state.callbackHandle(token); err != nil {
 		return reflect.Value{}, err
 	}
-	return reflect.MakeFunc(target, func(inputs []reflect.Value) []reflect.Value {
+	lease := &nativeCallbackLease{state: c.state, token: token}
+	callback := reflect.MakeFunc(target, func(inputs []reflect.Value) []reflect.Value {
 		var (
 			outputs []reflect.Value
 			err     error
@@ -756,10 +870,10 @@ func (c nativeCodec) Decode(value hostbridge.Value, target reflect.Type) (reflec
 		if returnsEngineValue && !c.state.loop.onOwnerThread() {
 			err = errors.New("native callback returning jsengine.Value must run in its owner loop")
 		} else if c.state.loop.onOwnerThread() {
-			outputs, err = c.callCallback(token, target, inputs)
+			outputs, err = c.callCallback(lease.token, target, inputs)
 		} else {
-			err = c.state.loop.Run(func(jsengine.Runtime) error {
-				outputs, err = c.callCallback(token, target, inputs)
+			err = c.state.loop.RunWithContext(c.scope, func(jsengine.Runtime) error {
+				outputs, err = c.callCallback(lease.token, target, inputs)
 				return err
 			})
 		}
@@ -774,11 +888,34 @@ func (c nativeCodec) Decode(value hostbridge.Value, target reflect.Type) (reflec
 			}
 			panic(err)
 		}
+		runtime.KeepAlive(lease)
 		return outputs
-	}), nil
+	})
+	c.leases = append(c.leases, lease)
+	return callback, nil
 }
 
-func (c nativeCodec) callCallback(token hostbridge.CallbackRef, target reflect.Type, inputs []reflect.Value) ([]reflect.Value, error) {
+// CommitCallbacks is the optional HostBridge handoff capability. Decoding alone
+// is not ownership transfer: a later argument or a read-only write may fail.
+// Only a value actually passed to Go receives its long-lived cleanup lease.
+func (c *nativeCodec) CommitCallbacks() {
+	if len(c.leases) == 0 {
+		return
+	}
+	c.state.mu.Lock()
+	for _, lease := range c.leases {
+		callback := c.state.callbacks[uint64(lease.token)]
+		callback.claimed = true
+		c.state.callbacks[uint64(lease.token)] = callback
+	}
+	c.state.mu.Unlock()
+	for _, lease := range c.leases {
+		runtime.AddCleanup(lease, cleanupNativeCallback, nativeCallbackCleanup{state: lease.state, token: lease.token})
+	}
+	c.leases = nil
+}
+
+func (c *nativeCodec) callCallback(token hostbridge.CallbackRef, target reflect.Type, inputs []reflect.Value) ([]reflect.Value, error) {
 	handle, err := c.state.callbackHandle(token)
 	if err != nil {
 		return nil, err
@@ -840,10 +977,12 @@ func (c nativeCodec) callCallback(token hostbridge.CallbackRef, target reflect.T
 			results[0].Set(reflect.ValueOf(value))
 		} else {
 			value, err := c.state.decodeValue(c.runtime, uint64(output))
+			defer c.state.discardCallback(value)
 			if err != nil {
 				return nil, err
 			}
-			results[0], err = c.state.session.DecodeValue(value, target.Out(0), c)
+			resultCodec := &nativeCodec{state: c.state, runtime: c.runtime, scope: c.scope}
+			results[0], err = c.state.session.DecodeValue(value, target.Out(0), resultCodec)
 			if err != nil {
 				return nil, err
 			}
@@ -855,7 +994,7 @@ func (c nativeCodec) callCallback(token hostbridge.CallbackRef, target reflect.T
 	return results, nil
 }
 
-func (c nativeCodec) encodeCallbackArgument(input reflect.Value) (uint64, error) {
+func (c *nativeCodec) encodeCallbackArgument(input reflect.Value) (uint64, error) {
 	if input.IsValid() && input.Type() == engineValueType && !input.IsNil() {
 		abstract, ok := input.Interface().(jsengine.Value)
 		if !ok || abstract == nil {
@@ -886,7 +1025,7 @@ func (c nativeCodec) encodeCallbackArgument(input reflect.Value) (uint64, error)
 		return value.handle, nil
 	}
 
-	value, err := c.state.reflectValue(input)
+	value, err := c.state.reflectValue(input, c.scope)
 	if err != nil {
 		return 0, err
 	}
@@ -900,11 +1039,11 @@ func pointerToUint64(values []uint64) *C.uint64_t {
 	return (*C.uint64_t)(unsafe.Pointer(&values[0]))
 }
 
-func (c nativeCodec) Encode(value reflect.Value) (hostbridge.Value, error) {
-	return c.state.reflectValue(value)
+func (c *nativeCodec) Encode(value reflect.Value) (hostbridge.Value, error) {
+	return c.state.reflectValue(value, c.scope)
 }
 
-func (c nativeCodec) CallCallback(hostbridge.Value, []hostbridge.Value) (hostbridge.Value, error) {
+func (c *nativeCodec) CallCallback(hostbridge.Value, []hostbridge.Value) (hostbridge.Value, error) {
 	return hostbridge.UndefinedValue(), errors.New("native runtime callback invocation is unsupported")
 }
 
@@ -996,7 +1135,7 @@ func (s *nativeHostState) decodeValue(runtimeHandle, handle uint64) (hostbridge.
 	}
 }
 
-func (s *nativeHostState) reflectValue(value reflect.Value) (hostbridge.Value, error) {
+func (s *nativeHostState) reflectValue(value reflect.Value, scope hostbridge.ControlledObjectScope) (hostbridge.Value, error) {
 	if !value.IsValid() {
 		return hostbridge.UndefinedValue(), nil
 	}
@@ -1006,7 +1145,30 @@ func (s *nativeHostState) reflectValue(value reflect.Value) (hostbridge.Value, e
 		}
 		value = value.Elem()
 	}
-	switch value.Kind() {
+	kind := value.Kind()
+	if kind == reflect.Slice && value.IsNil() {
+		value = reflect.MakeSlice(value.Type(), 0, 0)
+	}
+	if kind == reflect.Map && value.IsNil() {
+		value = reflect.MakeMap(value.Type())
+	}
+	if (kind == reflect.Pointer || kind == reflect.Func) && value.IsNil() {
+		return hostbridge.NullValue(), nil
+	}
+	if value.CanInterface() {
+		object, wrapped, err := hostbridge.Wrap(scope, value.Interface())
+		if err != nil {
+			return hostbridge.UndefinedValue(), err
+		}
+		if wrapped {
+			ref, err := s.session.BindObject(object)
+			if err != nil {
+				return hostbridge.UndefinedValue(), err
+			}
+			return hostbridge.HostObjectValue(ref), nil
+		}
+	}
+	switch kind {
 	case reflect.Bool:
 		return hostbridge.BoolValue(value.Bool()), nil
 	case reflect.String:
@@ -1018,10 +1180,7 @@ func (s *nativeHostState) reflectValue(value reflect.Value) (hostbridge.Value, e
 	case reflect.Float32, reflect.Float64:
 		return hostbridge.FloatValue(value.Float()), nil
 	case reflect.Pointer, reflect.Struct, reflect.Map, reflect.Slice:
-		if (value.Kind() == reflect.Pointer || value.Kind() == reflect.Map || value.Kind() == reflect.Slice) && value.IsNil() {
-			return hostbridge.NullValue(), nil
-		}
-		ref, err := s.session.BindObject(value.Interface())
+		ref, err := s.session.BindObject(nativeHostTarget(value))
 		if err != nil {
 			return hostbridge.UndefinedValue(), err
 		}
@@ -1035,6 +1194,13 @@ func (s *nativeHostState) reflectValue(value reflect.Value) (hostbridge.Value, e
 	default:
 		return hostbridge.UndefinedValue(), fmt.Errorf("unsupported native host result %s", value.Type())
 	}
+}
+
+func nativeHostTarget(value reflect.Value) any {
+	if (value.Kind() == reflect.Struct || value.Kind() == reflect.Slice) && value.CanAddr() {
+		return value.Addr().Interface()
+	}
+	return value.Interface()
 }
 
 func (s *nativeHostState) encodeValue(runtimeHandle uint64, value hostbridge.Value) (uint64, error) {
@@ -1093,6 +1259,11 @@ func (s *nativeHostState) encodeValue(runtimeHandle uint64, value hostbridge.Val
 			return C.sc_native_host_object_new(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), C.uint64_t(value.Host), C.uint32_t(hostbridge.KindHostObject), out, err, capacity)
 		})
 	case hostbridge.KindHostFunction:
+		owner, err := s.session.RetainFunctionOwner(value.Function)
+		if err != nil {
+			return 0, err
+		}
+		defer func() { _ = s.session.ReleaseObject(owner) }()
 		return call(func(out *C.uint64_t, err *C.char, capacity C.uint64_t) C.int {
 			return C.sc_native_host_function_new(C.uint64_t(s.loop.provider.library), C.uint64_t(runtimeHandle), C.uint64_t(value.Function), out, err, capacity)
 		})

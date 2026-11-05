@@ -3,580 +3,81 @@ package eventstore
 import (
 	"bytes"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"database/sql"
-	"encoding/binary"
-	"encoding/json"
 	"errors"
-	"io"
-	"os"
-	"path/filepath"
-	"slices"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"golang.org/x/crypto/hkdf"
 	"gorm.io/gorm"
 )
 
 const (
-	MaxSecretBytes            = 8 * 1024 * 1024
-	MaxSecretBatchLookups     = 100000
-	secretBatchPageSize       = 200
-	maxReadinessManifestBytes = 64 * 1024 * 1024
-	MaxPluginExtensionBytes   = 255
-	MaxPluginKeyBytes         = 1024
-	MaxPluginValueBytes       = 8 * 1024 * 1024
-	MaxPluginKeys             = 10000
-	MaxPluginBytes            = 64 * 1024 * 1024
-	MaxPluginScan             = 10000
-	MaxPluginResults          = 1000
-	MaxPluginResponseBytes    = 8 * 1024 * 1024
+	MaxSecretBytes          = 8 * 1024 * 1024
+	MaxSecretRefBytes       = 512
+	MaxSecretBatchLookups   = 100000
+	secretBatchPageSize     = 200
+	MaxPluginExtensionBytes = 255
+	MaxPluginKeyBytes       = 1024
+	MaxPluginValueBytes     = 8 * 1024 * 1024
+	MaxPluginKeys           = 10000
+	MaxPluginBytes          = 64 * 1024 * 1024
+	MaxPluginScan           = 10000
+	MaxPluginResults        = 1000
+	MaxPluginResponseBytes  = 8 * 1024 * 1024
 
-	supportedReadinessSchemaVersion uint32 = 1
-
-	localFileKeyCacheTTL = 5 * time.Second
+	supportedReadinessSchemaVersion uint32 = 2
 )
-
-type localFileKeyCacheEntry struct {
-	material  [32]byte
-	expiresAt time.Time
-}
-
-type LocalFileKeySource struct {
-	IndexPath string
-	RootsDir  string
-	CurrentID string
-
-	cacheMu          sync.RWMutex
-	indexRoot        [32]byte
-	indexRootLoaded  bool
-	encryptionRoots  map[string]localFileKeyCacheEntry
-	currentRootID    string
-	currentIDExpires time.Time
-	cacheTTL         time.Duration
-	now              func() time.Time
-}
-
-func NewLocalFileKeySource(indexPath, rootsDir string) *LocalFileKeySource {
-	return &LocalFileKeySource{IndexPath: indexPath, RootsDir: rootsDir}
-}
-func (f *LocalFileKeySource) IndexRootID(context.Context) (string, error) {
-	if f == nil || filepath.Base(f.IndexPath) == "." || filepath.Base(f.IndexPath) == string(filepath.Separator) {
-		return "", ErrKeySourceUnavailable
-	}
-	return filepath.Base(f.IndexPath), nil
-}
-func (f *LocalFileKeySource) IndexRootMaterial(context.Context) ([]byte, error) {
-	if f == nil {
-		return nil, ErrKeySourceUnavailable
-	}
-	f.cacheMu.RLock()
-	if f.indexRootLoaded {
-		material := bytes.Clone(f.indexRoot[:])
-		f.cacheMu.RUnlock()
-		return material, nil
-	}
-	f.cacheMu.RUnlock()
-
-	f.cacheMu.Lock()
-	defer f.cacheMu.Unlock()
-	if f.indexRootLoaded {
-		return bytes.Clone(f.indexRoot[:]), nil
-	}
-	material, err := readKeyFile(f.IndexPath)
-	if err != nil {
-		return nil, err
-	}
-	copy(f.indexRoot[:], material)
-	f.indexRootLoaded = true
-	return bytes.Clone(f.indexRoot[:]), nil
-}
-func (f *LocalFileKeySource) CurrentEncryptionRoot(ctx context.Context) (EncryptionRoot, error) {
-	if f == nil {
-		return EncryptionRoot{}, ErrKeySourceUnavailable
-	}
-	id := strings.TrimSpace(f.CurrentID)
-	if id == "" {
-		currentID, err := f.cachedCurrentRootID()
-		if err != nil {
-			return EncryptionRoot{}, ErrKeyUnavailable
-		}
-		id = currentID
-	}
-	if id == "" || strings.ContainsAny(id, `/\`) {
-		return EncryptionRoot{}, ErrKeyUnavailable
-	}
-	material, err := f.EncryptionRoot(ctx, id)
-	if err != nil {
-		return EncryptionRoot{}, err
-	}
-	return EncryptionRoot{ID: id, Material: material}, nil
-}
-func (f *LocalFileKeySource) EncryptionRoot(_ context.Context, id string) ([]byte, error) {
-	if f == nil || strings.ContainsAny(id, `/\`) || id == "" {
-		return nil, ErrKeyUnavailable
-	}
-	now := f.cacheTime()
-	f.cacheMu.RLock()
-	entry, ok := f.encryptionRoots[id]
-	if ok && now.Before(entry.expiresAt) {
-		material := bytes.Clone(entry.material[:])
-		f.cacheMu.RUnlock()
-		return material, nil
-	}
-	f.cacheMu.RUnlock()
-
-	f.cacheMu.Lock()
-	defer f.cacheMu.Unlock()
-	now = f.cacheTime()
-	entry, ok = f.encryptionRoots[id]
-	if ok && now.Before(entry.expiresAt) {
-		return bytes.Clone(entry.material[:]), nil
-	}
-	material, err := readKeyFile(filepath.Join(f.RootsDir, id+".key"))
-	if err != nil {
-		return nil, err
-	}
-	copy(entry.material[:], material)
-	entry.expiresAt = now.Add(f.effectiveCacheTTL())
-	if f.encryptionRoots == nil {
-		f.encryptionRoots = make(map[string]localFileKeyCacheEntry)
-	}
-	f.encryptionRoots[id] = entry
-	return bytes.Clone(entry.material[:]), nil
-}
-func (f *LocalFileKeySource) EncryptionRoots(ctx context.Context) ([]EncryptionRoot, error) {
-	if f == nil {
-		return nil, ErrKeySourceUnavailable
-	}
-	entries, err := os.ReadDir(f.RootsDir)
-	if err != nil {
-		return nil, ErrKeyUnavailable
-	}
-	out := make([]EncryptionRoot, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".key") {
-			continue
-		}
-		id := strings.TrimSuffix(entry.Name(), ".key")
-		material, err := f.EncryptionRoot(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, EncryptionRoot{ID: id, Material: material})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out, nil
-}
-
-func (f *LocalFileKeySource) cachedCurrentRootID() (string, error) {
-	now := f.cacheTime()
-	f.cacheMu.RLock()
-	if f.currentRootID != "" && now.Before(f.currentIDExpires) {
-		id := f.currentRootID
-		f.cacheMu.RUnlock()
-		return id, nil
-	}
-	f.cacheMu.RUnlock()
-
-	f.cacheMu.Lock()
-	defer f.cacheMu.Unlock()
-	now = f.cacheTime()
-	if f.currentRootID != "" && now.Before(f.currentIDExpires) {
-		return f.currentRootID, nil
-	}
-	id, err := readCurrentRootID(filepath.Join(f.RootsDir, "current"))
-	if err != nil {
-		return "", err
-	}
-	id = strings.TrimSpace(id)
-	if id == "" || strings.ContainsAny(id, `/\`) {
-		return "", ErrKeyUnavailable
-	}
-	f.currentRootID = id
-	f.currentIDExpires = now.Add(f.effectiveCacheTTL())
-	return id, nil
-}
-
-func (f *LocalFileKeySource) cacheTime() time.Time {
-	if f.now != nil {
-		return f.now()
-	}
-	return time.Now()
-}
-
-func (f *LocalFileKeySource) effectiveCacheTTL() time.Duration {
-	if f.cacheTTL > 0 {
-		return f.cacheTTL
-	}
-	return localFileKeyCacheTTL
-}
-func readKeyFile(path string) ([]byte, error) {
-	raw, err := readSecureFile(path, 32)
-	if err != nil || len(raw) != 32 {
-		return nil, ErrKeyUnavailable
-	}
-	return raw, nil
-}
-
-func keySourceIndex(ctx context.Context, source KeySource) (string, []byte, error) {
-	if source == nil {
-		return "", nil, ErrKeySourceUnavailable
-	}
-	ids, ok := source.(interface {
-		IndexRootID(ctx context.Context) (string, error)
-	})
-	if !ok {
-		return "", nil, ErrKeySourceUnavailable
-	}
-	id, e := ids.IndexRootID(ctx)
-	if e != nil || id == "" {
-		return "", nil, ErrKeySourceUnavailable
-	}
-	materials, ok := source.(interface {
-		IndexRootMaterial(ctx context.Context) ([]byte, error)
-	})
-	if !ok {
-		return "", nil, ErrKeySourceUnavailable
-	}
-	material, e := materials.IndexRootMaterial(ctx)
-	if e != nil || len(material) != 32 {
-		return "", nil, ErrKeySourceUnavailable
-	}
-	return id, material, nil
-}
-func keySourceCurrent(ctx context.Context, source KeySource) (EncryptionRoot, error) {
-	if source == nil {
-		return EncryptionRoot{}, ErrKeySourceUnavailable
-	}
-	v, ok := source.(interface {
-		CurrentEncryptionRoot(ctx context.Context) (EncryptionRoot, error)
-	})
-	if !ok {
-		return EncryptionRoot{}, ErrKeySourceUnavailable
-	}
-	root, e := v.CurrentEncryptionRoot(ctx)
-	if e != nil || root.ID == "" || len(root.Material) != 32 {
-		return EncryptionRoot{}, ErrKeyUnavailable
-	}
-	return root, nil
-}
-func keySourceRoot(ctx context.Context, source KeySource, id string) ([]byte, error) {
-	if source == nil {
-		return nil, ErrKeySourceUnavailable
-	}
-	v, ok := source.(interface {
-		EncryptionRoot(ctx context.Context, id string) ([]byte, error)
-	})
-	if !ok {
-		return nil, ErrKeySourceUnavailable
-	}
-	material, e := v.EncryptionRoot(ctx, id)
-	if e != nil || len(material) != 32 {
-		return nil, ErrKeyUnavailable
-	}
-	return material, nil
-}
-func deriveA6(root []byte, label string) ([]byte, error) {
-	if len(root) != 32 {
-		return nil, ErrKeyUnavailable
-	}
-	out := make([]byte, 32)
-	r := hkdf.New(sha256.New, root, nil, []byte(label))
-	if _, e := io.ReadFull(r, out); e != nil {
-		return nil, ErrKeyUnavailable
-	}
-	return out, nil
-}
-func lengthField(dst []byte, v []byte) []byte {
-	var n [4]byte
-	binary.BigEndian.PutUint32(n[:], uint32(len(v)))
-	dst = append(dst, n[:]...)
-	return append(dst, v...)
-}
-func a6AAD(domain, identity, owner string, version uint64, keyID string) []byte {
-	aad := make([]byte, 0, 128)
-	aad = lengthField(aad, []byte(domain))
-	aad = lengthField(aad, []byte(identity))
-	aad = lengthField(aad, []byte(owner))
-	var b [8]byte
-	binary.BigEndian.PutUint64(b[:], version)
-	aad = append(aad, b[:]...)
-	return lengthField(aad, []byte(keyID))
-}
-func newA6AEAD(root []byte, domain string) (cipher.AEAD, error) {
-	sub, err := deriveA6(root, domain)
-	if err != nil {
-		return nil, err
-	}
-	defer clear(sub)
-	block, err := aes.NewCipher(sub)
-	if err != nil {
-		return nil, ErrEncryptionUnavailable
-	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, ErrEncryptionUnavailable
-	}
-	return aead, nil
-}
-
-func a6SealWithAEAD(aead cipher.AEAD, domain, identity, owner string, version uint64, keyID string, plaintext []byte) ([]byte, []byte, string, error) {
-	if aead == nil {
-		return nil, nil, "", ErrEncryptionUnavailable
-	}
-	nonce := make([]byte, aead.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, nil, "", ErrEncryptionUnavailable
-	}
-	return aead.Seal(nil, nonce, plaintext, a6AAD(domain, identity, owner, version, keyID)), nonce, keyID, nil
-}
-
-func a6OpenWithAEAD(aead cipher.AEAD, domain, identity, owner string, version uint64, keyID string, ciphertext, nonce []byte) ([]byte, error) {
-	if aead == nil || len(nonce) != aead.NonceSize() {
-		return nil, ErrAuthenticationFailed
-	}
-	plain, err := aead.Open(nil, nonce, ciphertext, a6AAD(domain, identity, owner, version, keyID))
-	if err != nil {
-		return nil, ErrAuthenticationFailed
-	}
-	return plain, nil
-}
-
-func a6SealWithRoot(root EncryptionRoot, domain, identity, owner string, version uint64, plaintext []byte) ([]byte, []byte, string, error) {
-	aead, err := newA6AEAD(root.Material, domain)
-	if err != nil {
-		return nil, nil, "", err
-	}
-	return a6SealWithAEAD(aead, domain, identity, owner, version, root.ID, plaintext)
-}
-
-func a6Seal(ctx context.Context, source KeySource, domain, identity, owner string, version uint64, plaintext []byte) ([]byte, []byte, string, error) {
-	root, err := keySourceCurrent(ctx, source)
-	if err != nil {
-		return nil, nil, "", err
-	}
-	return a6SealWithRoot(root, domain, identity, owner, version, plaintext)
-}
-
-func a6Open(ctx context.Context, source KeySource, domain, identity, owner string, version uint64, keyID string, ciphertext, nonce []byte) ([]byte, error) {
-	root, err := keySourceRoot(ctx, source, keyID)
-	if err != nil {
-		return nil, err
-	}
-	return a6OpenWithRoot(root, domain, identity, owner, version, keyID, ciphertext, nonce)
-}
-
-func a6OpenWithRoot(root []byte, domain, identity, owner string, version uint64, keyID string, ciphertext, nonce []byte) ([]byte, error) {
-	aead, err := newA6AEAD(root, domain)
-	if err != nil {
-		return nil, ErrAuthenticationFailed
-	}
-	return a6OpenWithAEAD(aead, domain, identity, owner, version, keyID, ciphertext, nonce)
-}
-
-func a6HMAC(ctx context.Context, source KeySource, domain string, parts ...string) ([]byte, error) {
-	_, index, err := keySourceIndex(ctx, source)
-	if err != nil {
-		return nil, err
-	}
-	h := hmac.New(sha256.New, index)
-	h.Write([]byte(domain))
-	for _, part := range parts {
-		h.Write([]byte(part))
-	}
-	return h.Sum(nil), nil
-}
-
-// KeyedDigest computes an index-root HMAC inside the store's admitted
-// security boundary. Callers receive only the digest and non-secret key ID.
-func (s *GORMStore) KeyedDigest(ctx context.Context, domain string, parts ...string) ([]byte, string, error) {
-	if s.keySource == nil {
-		return nil, "", ErrKeySourceUnavailable
-	}
-	keyID, err := s.keySource.IndexRootID(ctx)
-	if err != nil || keyID == "" {
-		return nil, "", ErrKeySourceUnavailable
-	}
-	digest, err := a6HMAC(ctx, s.keySource, domain, parts...)
-	if err != nil {
-		return nil, "", err
-	}
-	return digest, keyID, nil
-}
-
-// KeyedDigestBytes computes an index-root HMAC without converting payload bytes to a string.
-func (s *GORMStore) KeyedDigestBytes(ctx context.Context, domain string, payload []byte) ([]byte, string, error) {
-	if s == nil || s.keySource == nil {
-		return nil, "", ErrKeySourceUnavailable
-	}
-	keyID, index, err := keySourceIndex(ctx, s.keySource)
-	if err != nil {
-		return nil, "", err
-	}
-	mac := hmac.New(sha256.New, index)
-	_, _ = mac.Write([]byte(domain))
-	_, _ = mac.Write(payload)
-	return mac.Sum(nil), keyID, nil
-}
-
-func (s *GORMStore) validatePluginKeyIndex(ctx context.Context, extension string, index, plaintext []byte) error {
-	expected, err := a6HMAC(ctx, s.keySource, "plugin-key-index/v1", extension, string(plaintext))
-	if err != nil {
-		return err
-	}
-	if !hmac.Equal(expected, index) {
-		return ErrAuthenticationFailed
-	}
-	return nil
-}
-
-type a6PayloadCodec struct{ source KeySource }
-
-func (c *a6PayloadCodec) Encrypt(ctx context.Context, plaintext []byte) ([]byte, []byte, string, error) {
-	return a6Seal(ctx, c.source, "artifact/v1", "payload", "", 0, plaintext)
-}
-func (c *a6PayloadCodec) Decrypt(ctx context.Context, ciphertext, nonce []byte, keyID string) ([]byte, error) {
-	return a6Open(ctx, c.source, "artifact/v1", "payload", "", 0, keyID, ciphertext, nonce)
-}
-func (c *a6PayloadCodec) EncryptBound(ctx context.Context, domain, identity, owner string, version uint64, plaintext []byte) ([]byte, []byte, string, error) {
-	return a6Seal(ctx, c.source, domain, identity, owner, version, plaintext)
-}
-func (c *a6PayloadCodec) DecryptBound(ctx context.Context, domain, identity, owner string, version uint64, ciphertext, nonce []byte, keyID string) ([]byte, error) {
-	return a6Open(ctx, c.source, domain, identity, owner, version, keyID, ciphertext, nonce)
-}
-
-// readinessFromRowBorrowed returns a read-only view of row's byte slices.
-// Callers must not mutate the result or retain it beyond the row's lifetime.
-func readinessFromRowBorrowed(row *storeReadinessRow) (Readiness, error) {
-	if row == nil {
-		return Readiness{}, ErrReadinessInvalid
-	}
-	var roots []string
-	if len(row.EncryptionRootIDs) > 0 && json.Unmarshal(row.EncryptionRootIDs, &roots) != nil {
-		return Readiness{}, ErrReadinessInvalid
-	}
-	return Readiness{
-		Mode: row.Mode, SchemaVersion: parseSchemaVersion(row.SchemaVersion), DatabaseIdentity: row.DatabaseIdentity,
-		IndexRootID: row.IndexRootID, IndexRootFingerprint: row.IndexRootFingerprint,
-		EncryptionRootIDs: roots, SourceManifestDigest: row.SourceManifestDigest,
-		TargetManifestDigest:     row.TargetManifestDigest,
-		SemanticManifest:         row.SemanticManifest,
-		ProjectionManifest:       row.ProjectionManifest,
-		ProjectionManifestDigest: row.ProjectionManifestDigest,
-		TerminalGlobalPosition:   row.TerminalGlobalPosition, TerminalProjectionPosition: row.TerminalProjectionPosition,
-		freshInitialized: row.FreshInitialized, CompletedAt: timeOrZero(row.CompletedAt),
-	}, nil
-}
-
-func readinessFromRow(row storeReadinessRow) (Readiness, error) {
-	r, err := readinessFromRowBorrowed(&row)
-	if err != nil {
-		return Readiness{}, err
-	}
-	r.IndexRootFingerprint = append([]byte(nil), r.IndexRootFingerprint...)
-	r.SourceManifestDigest = append([]byte(nil), r.SourceManifestDigest...)
-	r.TargetManifestDigest = append([]byte(nil), r.TargetManifestDigest...)
-	r.SemanticManifest = append([]byte(nil), r.SemanticManifest...)
-	r.ProjectionManifest = append([]byte(nil), r.ProjectionManifest...)
-	r.ProjectionManifestDigest = append([]byte(nil), r.ProjectionManifestDigest...)
-	return r, nil
-}
 
 func readinessFromDB(ctx context.Context, db *gorm.DB) (Readiness, error) {
 	var row storeReadinessRow
 	if err := db.WithContext(ctx).Where("singleton_id = ?", "default").First(&row).Error; err != nil {
 		return Readiness{}, ErrReadinessQuarantined
 	}
-	return readinessFromRow(row)
-}
-
-type runtimeReadinessRow struct {
-	Mode                       string     `gorm:"column:mode"`
-	SchemaVersion              string     `gorm:"column:schema_version"`
-	DatabaseIdentity           string     `gorm:"column:database_identity"`
-	IndexRootID                string     `gorm:"column:index_root_id"`
-	IndexRootFingerprint       []byte     `gorm:"column:index_root_fingerprint"`
-	EncryptionRootIDs          []byte     `gorm:"column:encryption_root_ids"`
-	SourceManifestDigest       []byte     `gorm:"column:source_manifest_digest"`
-	TargetManifestDigest       []byte     `gorm:"column:target_manifest_digest"`
-	ProjectionManifestDigest   []byte     `gorm:"column:projection_manifest_digest"`
-	TerminalGlobalPosition     uint64     `gorm:"column:terminal_global_position"`
-	TerminalProjectionPosition uint64     `gorm:"column:terminal_projection_position"`
-	FreshInitialized           bool       `gorm:"column:fresh_initialized"`
-	CompletedAt                *time.Time `gorm:"column:completed_at"`
-	SemanticManifestBytes      int64      `gorm:"column:semantic_manifest_bytes"`
-	ProjectionManifestBytes    int64      `gorm:"column:projection_manifest_bytes"`
-}
-
-func runtimeReadinessFromDB(ctx context.Context, db *gorm.DB) (Readiness, int64, int64, error) {
-	var row runtimeReadinessRow
-	if err := db.WithContext(ctx).Model(&storeReadinessRow{}).
-		Select("mode, schema_version, database_identity, index_root_id, index_root_fingerprint, encryption_root_ids, source_manifest_digest, target_manifest_digest, projection_manifest_digest, terminal_global_position, terminal_projection_position, fresh_initialized, completed_at, COALESCE(LENGTH(semantic_manifest), 0) AS semantic_manifest_bytes, COALESCE(LENGTH(projection_manifest), 0) AS projection_manifest_bytes").
-		Where("singleton_id = ?", "default").First(&row).Error; err != nil {
-		return Readiness{}, 0, 0, ErrReadinessQuarantined
+	r := Readiness{Mode: row.Mode, SchemaVersion: parseSchemaVersion(row.SchemaVersion), DatabaseIdentity: row.DatabaseIdentity, CompletedAt: timeOrZero(row.CompletedAt)}
+	if err := validateReadinessValue(r); err != nil {
+		return Readiness{}, err
 	}
-	var roots []string
-	if len(row.EncryptionRootIDs) > 0 && json.Unmarshal(row.EncryptionRootIDs, &roots) != nil {
-		return Readiness{}, 0, 0, ErrReadinessInvalid
-	}
-	return Readiness{
-		Mode: row.Mode, SchemaVersion: parseSchemaVersion(row.SchemaVersion), DatabaseIdentity: row.DatabaseIdentity,
-		IndexRootID: row.IndexRootID, IndexRootFingerprint: append([]byte(nil), row.IndexRootFingerprint...),
-		EncryptionRootIDs: roots, SourceManifestDigest: append([]byte(nil), row.SourceManifestDigest...),
-		TargetManifestDigest:     append([]byte(nil), row.TargetManifestDigest...),
-		ProjectionManifestDigest: append([]byte(nil), row.ProjectionManifestDigest...),
-		TerminalGlobalPosition:   row.TerminalGlobalPosition, TerminalProjectionPosition: row.TerminalProjectionPosition,
-		freshInitialized: row.FreshInitialized, CompletedAt: timeOrZero(row.CompletedAt),
-	}, row.SemanticManifestBytes, row.ProjectionManifestBytes, nil
+	return r, nil
 }
 
 func (s *GORMStore) GetReadiness(ctx context.Context) (Readiness, error) {
-	if s == nil || s.db == nil {
-		return Readiness{}, ErrReadinessInvalid
-	}
-	return readinessFromDB(ctx, s.db.GORM())
-}
-
-func (s *GORMStore) GetReadinessMetadata(ctx context.Context) (Readiness, error) {
 	if s == nil || s.db == nil || s.db.GORM() == nil {
 		return Readiness{}, ErrReadinessInvalid
-	}
-	if err := s.initializationError(); err != nil {
-		return Readiness{}, err
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	readiness, semanticBytes, projectionBytes, err := runtimeReadinessFromDB(ctx, s.db.GORM())
+	r, err := readinessFromDB(ctx, s.db.ReadGORM())
 	if err != nil {
 		return Readiness{}, err
 	}
-	if err = validateReadinessMetadata(readiness, semanticBytes, projectionBytes); err != nil {
-		if readiness.Mode == "fresh" {
-			return Readiness{}, ErrReadinessQuarantined
-		}
-		return Readiness{}, err
+	if expected := strings.TrimSpace(s.db.databaseIdentity); expected != "" && r.DatabaseIdentity != expected {
+		return Readiness{}, ErrReadinessQuarantined
 	}
-	return readiness, nil
+	return r, nil
 }
 
-// HasPersistentState reports whether any owned runtime table contains data.
-// Readiness and projection-control rows are metadata and do not count.
+// HasPersistentState is used only to select an offline migration source.
 func (s *GORMStore) HasPersistentState(ctx context.Context) (bool, error) {
 	if s == nil || s.db == nil || s.db.GORM() == nil {
 		return false, ErrReadinessInvalid
 	}
-	return readinessDatabaseNonEmpty(ctx, s.db.GORM())
+	for _, model := range schemaModels() {
+		switch model.(type) {
+		case *storeReadinessRow, *projectionControlRow, *eventGlobalSequenceRow:
+			continue
+		}
+		var count int64
+		if err := s.db.ReadGORM().WithContext(ctx).Model(model).Limit(1).Count(&count).Error; err != nil {
+			return false, err
+		}
+		if count != 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }
+
 func parseSchemaVersion(v string) uint32 {
 	n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32)
 	if err != nil {
@@ -591,928 +92,11 @@ func timeOrZero(v *time.Time) time.Time {
 	}
 	return *v
 }
-func validateReadinessMetadata(r Readiness, semanticManifestBytes, projectionManifestBytes int64) error {
-	if r.Mode != "fresh" && r.Mode != "import" || r.SchemaVersion == 0 || r.SchemaVersion > supportedReadinessSchemaVersion || strings.TrimSpace(r.DatabaseIdentity) == "" || strings.TrimSpace(r.IndexRootID) == "" {
-		return ErrReadinessInvalid
-	}
-	if len(r.SourceManifestDigest) != 0 && len(r.SourceManifestDigest) != sha256.Size ||
-		len(r.TargetManifestDigest) != 0 && len(r.TargetManifestDigest) != sha256.Size ||
-		len(r.ProjectionManifestDigest) != 0 && len(r.ProjectionManifestDigest) != sha256.Size {
-		return ErrReadinessInvalid
-	}
-	if semanticManifestBytes < 0 || projectionManifestBytes < 0 ||
-		semanticManifestBytes > int64(maxReadinessManifestBytes) || projectionManifestBytes > int64(maxReadinessManifestBytes) {
-		return ErrReadinessInvalid
-	}
-	if (projectionManifestBytes == 0) != (len(r.ProjectionManifestDigest) == 0) {
-		return ErrReadinessInvalid
-	}
-	if r.TerminalGlobalPosition == maxUint64 || r.TerminalProjectionPosition == maxUint64 {
-		return ErrReadinessInvalid
-	}
-	if r.Mode == "fresh" && (r.TerminalGlobalPosition != 0 || r.TerminalProjectionPosition != 0 || !r.CompletedAt.IsZero() ||
-		len(r.SourceManifestDigest) != 0 || len(r.TargetManifestDigest) != 0 || semanticManifestBytes != 0 ||
-		projectionManifestBytes != 0 || len(r.ProjectionManifestDigest) != 0) {
-		return ErrReadinessInvalid
-	}
-	if r.Mode == "import" && (len(r.SourceManifestDigest) != sha256.Size || len(r.TargetManifestDigest) != sha256.Size || r.CompletedAt.IsZero()) {
-		return ErrReadinessInvalid
-	}
-	seen := make(map[string]struct{}, len(r.EncryptionRootIDs))
-	for _, rootID := range r.EncryptionRootIDs {
-		if strings.TrimSpace(rootID) == "" {
-			return ErrReadinessInvalid
-		}
-		if _, ok := seen[rootID]; ok {
-			return ErrReadinessInvalid
-		}
-		seen[rootID] = struct{}{}
-	}
-	return nil
-}
 
 func validateReadinessValue(r Readiness) error {
-	if err := validateReadinessMetadata(r, int64(len(r.SemanticManifest)), int64(len(r.ProjectionManifest))); err != nil {
-		return err
-	}
-	if len(r.SemanticManifest) != 0 {
-		digest := sha256.Sum256(r.SemanticManifest)
-		if !bytes.Equal(digest[:], r.SourceManifestDigest) || !bytes.Equal(digest[:], r.TargetManifestDigest) {
-			return ErrReadinessInvalid
-		}
-	}
-	if len(r.ProjectionManifest) != 0 {
-		digest := sha256.Sum256(r.ProjectionManifest)
-		if !bytes.Equal(digest[:], r.ProjectionManifestDigest) {
-			return ErrReadinessInvalid
-		}
-	}
-	return nil
-}
-
-func readinessDatabaseNonEmpty(ctx context.Context, db *gorm.DB) (bool, error) {
-	for _, model := range []any{&domainEventRow{}, &eventTombstoneRow{}, &aggregateHeadRow{}, &projectionReadModelRow{}, &operationRow{}, &operationArtifactRow{}, &laneHeadRow{}, &inboxMessageRow{}, &outboxEffectRow{}, &adapterSecretRow{}, &pluginKVRow{}, &subjectFenceRow{}} {
-		var count int64
-		if err := db.WithContext(ctx).Model(model).Count(&count).Error; err != nil {
-			return false, err
-		}
-		if count > 0 {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-func readinessRootReferences(ctx context.Context, db *gorm.DB) (map[string]struct{}, error) {
-	// Keep DISTINCT inside each original predicate: UNION ALL must not fold
-	// differently-cased key IDs across tables under a remote DB's collation.
-	const query = `
-SELECT DISTINCT encryption_key_id AS root_id FROM adapter_secrets
-WHERE ciphertext IS NOT NULL AND length(ciphertext) > 0
-UNION ALL SELECT DISTINCT private_key_id FROM operations
-WHERE private_context IS NOT NULL AND length(private_context) > 0
-UNION ALL SELECT DISTINCT encryption_key_id FROM operation_artifacts
-WHERE ciphertext IS NOT NULL AND length(ciphertext) > 0
-UNION ALL SELECT DISTINCT encryption_key_id FROM inbox_messages
-WHERE payload_ciphertext IS NOT NULL AND length(payload_ciphertext) > 0
-UNION ALL SELECT DISTINCT encryption_key_id FROM outbox_effects
-WHERE payload_ciphertext IS NOT NULL AND length(payload_ciphertext) > 0
-UNION ALL SELECT DISTINCT encryption_key_id FROM plugin_kv
-WHERE encrypted_value IS NOT NULL AND length(encrypted_value) > 0
-UNION ALL SELECT DISTINCT encryption_key_id FROM plugin_kv
-WHERE encrypted_key IS NOT NULL AND length(encrypted_key) > 0`
-	var ids []string
-	if err := db.WithContext(ctx).Raw(query).Scan(&ids).Error; err != nil {
-		return nil, err
-	}
-	refs := make(map[string]struct{}, len(ids))
-	for _, id := range ids {
-		if strings.TrimSpace(id) == "" {
-			return nil, ErrReadinessQuarantined
-		}
-		refs[id] = struct{}{}
-	}
-	return refs, nil
-}
-
-func readinessTerminalPositions(ctx context.Context, db *gorm.DB, control *projectionControlRow) (uint64, uint64, error) {
-	if control == nil {
-		return 0, 0, ErrReadinessQuarantined
-	}
-	var sequence eventGlobalSequenceRow
-	if err := db.WithContext(ctx).Where("singleton_id = ?", "default").First(&sequence).Error; err != nil {
-		return 0, 0, err
-	}
-	latest := uint64(0)
-	if sequence.NextPosition > 0 {
-		latest = sequence.NextPosition - 1
-	}
-	return latest, control.TerminalPosition, nil
-}
-
-func (s *GORMStore) ValidateReadiness(ctx context.Context) error {
-	return s.validateReadiness(ctx, false)
-}
-
-func (s *GORMStore) validateReadiness(ctx context.Context, allowFreshNonempty bool) error {
-	if s == nil || s.db == nil || s.db.GORM() == nil {
+	if (r.Mode != "fresh" && r.Mode != "import") || r.SchemaVersion != supportedReadinessSchemaVersion ||
+		strings.TrimSpace(r.DatabaseIdentity) == "" || (r.Mode == "import" && r.CompletedAt.IsZero()) {
 		return ErrReadinessInvalid
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	db := s.db.GORM().WithContext(ctx)
-	readOnly := db.Name() == "sqlite"
-	// Read-only SQLite transactions use a deferred snapshot, not the driver's
-	// default immediate writer lock. READ COMMITTED backends fence publication.
-	return db.Transaction(func(tx *gorm.DB) error {
-		if !readOnly {
-			if err := lockPublication(tx); err != nil {
-				return err
-			}
-		}
-		return s.validateReadinessOnDB(ctx, tx, allowFreshNonempty)
-	}, &sql.TxOptions{ReadOnly: readOnly})
-}
-
-func (s *GORMStore) validateRuntimeReadiness(ctx context.Context) error {
-	if s == nil || s.db == nil || s.db.GORM() == nil {
-		return ErrReadinessInvalid
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	db := s.db.GORM().WithContext(ctx)
-	readOnly := db.Name() == "sqlite"
-	return db.Transaction(func(tx *gorm.DB) error {
-		if !readOnly {
-			if err := lockPublication(tx); err != nil {
-				return err
-			}
-		}
-		return s.validateRuntimeReadinessOnDB(ctx, tx, false)
-	}, &sql.TxOptions{ReadOnly: readOnly})
-}
-
-func validatedReadinessFromRow(row *storeReadinessRow) (Readiness, error) {
-	r, validationErr := readinessFromRowBorrowed(row)
-	if validationErr != nil {
-		return Readiness{}, validationErr
-	}
-	if validationErr = validateReadinessValue(r); validationErr != nil {
-		if r.Mode == "fresh" {
-			return Readiness{}, ErrReadinessQuarantined
-		}
-		return Readiness{}, validationErr
-	}
-	return r, nil
-}
-
-func (s *GORMStore) validateReadinessOnDB(ctx context.Context, db *gorm.DB, allowFreshNonempty bool) error {
-	if s == nil || db == nil {
-		return ErrReadinessInvalid
-	}
-	var row storeReadinessRow
-	if err := db.WithContext(ctx).Where("singleton_id = ?", "default").First(&row).Error; err != nil {
-		return ErrReadinessQuarantined
-	}
-	r, validationErr := validatedReadinessFromRow(&row)
-	if validationErr != nil {
-		return validationErr
-	}
-	return s.validateReadinessBindingsOnDB(ctx, db, r, allowFreshNonempty, true)
-}
-
-func (s *GORMStore) validateReadinessSnapshotOnDB(ctx context.Context, db *gorm.DB, row *storeReadinessRow, control *projectionControlRow, allowFreshNonempty bool) error {
-	if s == nil || db == nil || row == nil || control == nil {
-		return ErrReadinessInvalid
-	}
-	r, validationErr := validatedReadinessFromRow(row)
-	if validationErr != nil {
-		return validationErr
-	}
-	// Commit authenticates every encrypted value it touches separately; reserve
-	// the historical reference scan for the explicit exhaustive audit.
-	return s.validateReadinessBindingsUsingControlOnDB(ctx, db, r, allowFreshNonempty, false, control)
-}
-
-func (s *GORMStore) validateRuntimeReadinessOnDB(ctx context.Context, db *gorm.DB, allowFreshNonempty bool) error {
-	if s == nil || db == nil {
-		return ErrReadinessInvalid
-	}
-	r, semanticBytes, projectionBytes, validationErr := runtimeReadinessFromDB(ctx, db)
-	if validationErr != nil {
-		return validationErr
-	}
-	if validationErr = validateReadinessMetadata(r, semanticBytes, projectionBytes); validationErr != nil {
-		if r.Mode == "fresh" {
-			return ErrReadinessQuarantined
-		}
-		return validationErr
-	}
-	return s.validateReadinessBindingsOnDB(ctx, db, r, allowFreshNonempty, false)
-}
-
-func (s *GORMStore) validateReadinessBindingsOnDB(ctx context.Context, db *gorm.DB, r Readiness, allowFreshNonempty, verifyRootReferences bool) error {
-	return s.validateReadinessBindingsUsingControlOnDB(ctx, db, r, allowFreshNonempty, verifyRootReferences, nil)
-}
-
-func (s *GORMStore) validateReadinessBindingsUsingControlOnDB(ctx context.Context, db *gorm.DB, r Readiness, allowFreshNonempty, verifyRootReferences bool, control *projectionControlRow) error {
-	if r.IndexRootID == "unconfigured" {
-		return ErrReadinessQuarantined
-	}
-	if !allowFreshNonempty && r.Mode == "fresh" && !r.freshInitialized && !s.freshWasInitialized(r) {
-		nonempty, validationErr := readinessDatabaseNonEmpty(ctx, db)
-		if validationErr != nil || nonempty {
-			return ErrReadinessQuarantined
-		}
-	}
-	if control == nil {
-		control = &projectionControlRow{}
-		if err := db.WithContext(ctx).Where("singleton_id = ?", "default").First(control).Error; err != nil {
-			return ErrReadinessQuarantined
-		}
-	}
-	if control.PublicationState != "published" {
-		return ErrReadinessQuarantined
-	}
-	if s.keySource == nil {
-		return ErrKeySourceUnavailable
-	}
-	if expected := strings.TrimSpace(s.db.databaseIdentity); expected != "" && r.DatabaseIdentity != expected {
-		return ErrReadinessQuarantined
-	}
-	id, indexMaterial, validationErr := keySourceIndex(ctx, s.keySource)
-	if validationErr != nil || id != r.IndexRootID {
-		return ErrReadinessQuarantined
-	}
-	fingerprint := sha256.Sum256(indexMaterial)
-	if len(r.IndexRootFingerprint) != len(fingerprint) || !hmac.Equal(r.IndexRootFingerprint, fingerprint[:]) {
-		return ErrReadinessQuarantined
-	}
-	current, validationErr := keySourceCurrent(ctx, s.keySource)
-	if validationErr != nil {
-		return ErrReadinessQuarantined
-	}
-	if !slices.Contains(r.EncryptionRootIDs, current.ID) {
-		return ErrReadinessQuarantined
-	}
-	if verifyRootReferences {
-		// Bounded runtime validation must not open every retired root or build
-		// per-commit history indexes. Callers authenticate ciphertext they
-		// touch; an explicit audit verifies every admitted root material and
-		// historical reference here.
-		admitted := make(map[string]struct{}, len(r.EncryptionRootIDs))
-		for _, rootID := range r.EncryptionRootIDs {
-			admitted[rootID] = struct{}{}
-			if _, validationErr = keySourceRoot(ctx, s.keySource, rootID); validationErr != nil {
-				return ErrReadinessQuarantined
-			}
-		}
-		if refs, refErr := readinessRootReferences(ctx, db); refErr != nil {
-			return ErrReadinessQuarantined
-		} else {
-			for rootID := range refs {
-				if _, ok := admitted[rootID]; !ok {
-					return ErrReadinessQuarantined
-				}
-			}
-		}
-	}
-	if r.Mode == "import" {
-		global, projection, terminalErr := readinessTerminalPositions(ctx, db, control)
-		if terminalErr != nil || global != r.TerminalGlobalPosition || projection != r.TerminalProjectionPosition {
-			return ErrReadinessQuarantined
-		}
-	}
-	return nil
-}
-
-type admittedRootIDSet map[string]struct{}
-
-const transactionAdmittedRootIDsKey = "eventstore:admitted-root-ids"
-
-func decodeAdmittedRootIDs(raw []byte) (admittedRootIDSet, error) {
-	var ids []string
-	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &ids); err != nil {
-			return nil, ErrReadinessQuarantined
-		}
-	}
-	roots := make(admittedRootIDSet, len(ids))
-	for _, id := range ids {
-		if strings.TrimSpace(id) == "" {
-			return nil, ErrReadinessQuarantined
-		}
-		if _, exists := roots[id]; exists {
-			return nil, ErrReadinessQuarantined
-		}
-		roots[id] = struct{}{}
-	}
-	return roots, nil
-}
-
-func admittedRootIDsOn(ctx context.Context, db *gorm.DB) (admittedRootIDSet, error) {
-	if db == nil || db.Statement == nil {
-		return nil, ErrReadinessQuarantined
-	}
-	if value, ok := db.Statement.Settings.Load(transactionAdmittedRootIDsKey); ok {
-		if roots, valid := value.(admittedRootIDSet); valid {
-			return roots, nil
-		}
-		return nil, ErrReadinessQuarantined
-	}
-	var row struct {
-		EncryptionRootIDs []byte `gorm:"column:encryption_root_ids"`
-	}
-	if err := db.WithContext(ctx).Model(&storeReadinessRow{}).
-		Select("encryption_root_ids").
-		Where("singleton_id = ?", "default").
-		First(&row).Error; err != nil {
-		return nil, ErrReadinessQuarantined
-	}
-	roots, err := decodeAdmittedRootIDs(row.EncryptionRootIDs)
-	if err != nil {
-		return nil, err
-	}
-	db.Statement.Settings.Store(transactionAdmittedRootIDsKey, roots)
-	return roots, nil
-}
-
-func (s *GORMStore) validateA6KeyID(ctx context.Context, db *gorm.DB, keyID string) error {
-	if s == nil || s.keySource == nil {
-		return nil
-	}
-	if strings.TrimSpace(keyID) == "" || db == nil {
-		return ErrInvalidMetadata
-	}
-	roots, err := admittedRootIDsOn(ctx, db)
-	if err != nil {
-		return err
-	}
-	if _, admitted := roots[keyID]; admitted {
-		return nil
-	}
-	return ErrReadinessQuarantined
-}
-
-func (s *GORMStore) admittedCurrentRoot(ctx context.Context, db *gorm.DB) (EncryptionRoot, error) {
-	root, err := keySourceCurrent(ctx, s.keySource)
-	if err != nil {
-		return EncryptionRoot{}, err
-	}
-	if err := s.validateA6KeyID(ctx, db, root.ID); err != nil {
-		return EncryptionRoot{}, err
-	}
-	return root, nil
-}
-func (s *GORMStore) validateA6UnitOfWorkWithDB(ctx context.Context, db *gorm.DB, work UnitOfWork) error {
-	if s == nil || s.keySource == nil {
-		return nil
-	}
-	if db == nil {
-		return ErrParticipantFailure
-	}
-	if s == nil || s.keySource == nil {
-		return nil
-	}
-	if err := s.requireA6BoundCodec(); err != nil {
-		return err
-	}
-	now := s.task5Now()
-	for _, update := range work.InboxUpdates {
-		if update.InboxID != "" {
-			var row inboxMessageRow
-			query := locked(db).Where("inbox_id = ?", update.InboxID).First(&row)
-			if query.Error == nil {
-				if inboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
-					return &task5ExpiredPayloadError{table: tableInboxMessages, id: row.InboxID, now: now}
-				}
-			} else if !errors.Is(query.Error, gorm.ErrRecordNotFound) {
-				return ErrParticipantFailure
-			}
-		}
-		if update.EndpointID == "" || update.ProviderEventKey == "" {
-			continue
-		}
-		var dedupe inboxMessageRow
-		query := locked(db).Where("endpoint_id = ? AND provider_event_id = ?", update.EndpointID, update.ProviderEventKey).First(&dedupe)
-		if query.Error == nil {
-			if inboxUnresolved(dedupe.Status) && dedupe.PayloadExpiresAt != nil && !dedupe.PayloadExpiresAt.After(now) {
-				return &task5ExpiredPayloadError{table: tableInboxMessages, id: dedupe.InboxID, now: now}
-			}
-		} else if !errors.Is(query.Error, gorm.ErrRecordNotFound) {
-			return ErrParticipantFailure
-		}
-	}
-	for _, effect := range work.Effects {
-		if effect.EffectID == "" {
-			continue
-		}
-		var row outboxEffectRow
-		query := locked(db).Where("effect_id = ?", effect.EffectID).First(&row)
-		if query.Error == nil {
-			if outboxUnresolved(row.Status) && row.PayloadExpiresAt != nil && !row.PayloadExpiresAt.After(now) {
-				return &task5ExpiredPayloadError{table: tableOutboxEffects, id: row.EffectID, now: now}
-			}
-		} else if !errors.Is(query.Error, gorm.ErrRecordNotFound) {
-			return ErrParticipantFailure
-		}
-	}
-	for _, update := range work.ArtifactUpdates {
-		if update.ArtifactID == "" {
-			continue
-		}
-		var row operationArtifactRow
-		query := locked(db).Where("artifact_id = ?", update.ArtifactID).First(&row)
-		if query.Error == nil {
-			if (row.Status == "available" || row.Status == "ready") && !row.ExpiresAt.After(now) && (len(row.Ciphertext) > 0 || len(row.Nonce) > 0) {
-				return &task5ExpiredArtifactError{id: row.ArtifactID, now: now}
-			}
-		} else if !errors.Is(query.Error, gorm.ErrRecordNotFound) {
-			return ErrParticipantFailure
-		}
-	}
-	validatePrivate := func(operationID, principal string, version uint64, ciphertext, nonce []byte, keyID string) error {
-		if len(ciphertext) > MaxSecretBytes+16 {
-			return &OversizeError{Bound: "encrypted operation private bytes", Limit: MaxSecretBytes + 16, Actual: len(ciphertext)}
-		}
-		if len(nonce) != 12 || strings.TrimSpace(keyID) == "" {
-			return ErrInvalidMetadata
-		}
-		if err := s.validateA6KeyID(ctx, db, keyID); err != nil {
-			return err
-		}
-		plain, err := openBoundPayload(ctx, s.codec, "operation-private/v1", operationID, principal, version, ciphertext, nonce, keyID)
-		if err != nil {
-			return ErrAuthenticationFailed
-		}
-		if len(plain) > MaxSecretBytes {
-			return &OversizeError{Bound: "operation private bytes", Limit: MaxSecretBytes, Actual: len(plain)}
-		}
-		return nil
-	}
-	operationOwners := make(map[string]string, len(work.Operations))
-	for _, update := range work.Operations {
-		if update.OperationID == "" {
-			return ErrInvalidMetadata
-		}
-		var existing operationRow
-		lookupErr := db.WithContext(ctx).Select("version, principal_id, private_context, private_nonce, private_key_id, private_payload_version").Where("operation_id = ?", update.OperationID).First(&existing).Error
-		existingFound := lookupErr == nil
-		if existingFound && existing.Version >= maxPersistedVersion {
-			return ErrVersionExhausted
-		}
-		if !existingFound && !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
-			return ErrParticipantFailure
-		}
-		principal := update.PrincipalID
-		if principal == "" && existingFound {
-			principal = existing.PrincipalID
-		}
-		if principal == "" {
-			principal = update.OperationID
-		}
-		operationOwners[update.OperationID] = principal
-		hasCipher := len(update.PrivateContextCiphertext) > 0 || len(update.PrivateContextNonce) > 0 || update.EncryptionKeyID != ""
-		allCipher := len(update.PrivateContextCiphertext) > 0 && len(update.PrivateContextNonce) > 0 && update.EncryptionKeyID != ""
-		if hasCipher && !allCipher {
-			return ErrInvalidMetadata
-		}
-		if existingFound && update.PrincipalID != "" && update.PrincipalID != existing.PrincipalID && !allCipher {
-			return ErrInvalidTransition
-		}
-		if !allCipher {
-			if existingFound && (len(existing.PrivateContext) > 0 || len(existing.PrivateNonce) > 0 || existing.PrivateKeyID != "") {
-				if err := validatePrivate(update.OperationID, existing.PrincipalID, task5PayloadVersion(existing.PrivatePayloadVersion), existing.PrivateContext, existing.PrivateNonce, existing.PrivateKeyID); err != nil {
-					return err
-				}
-			}
-			continue
-		}
-		if update.PrincipalID == "" {
-			return ErrInvalidMetadata
-		}
-		version := uint64(1)
-		if existingFound {
-			version = task5PayloadVersion(existing.PrivatePayloadVersion)
-		}
-		if err := validatePrivate(update.OperationID, update.PrincipalID, version, update.PrivateContextCiphertext, update.PrivateContextNonce, update.EncryptionKeyID); err != nil {
-			return err
-		}
-	}
-	for _, update := range work.InboxUpdates {
-		if len(update.PayloadCiphertext) == 0 && len(update.PayloadNonce) == 0 {
-			continue
-		}
-		if err := task5ValidateKeyFields(s.keySource, update.DigestKeyID, update.PayloadEncryptionKeyID); err != nil {
-			return err
-		}
-		payloadKeyID := task5PayloadKeyID(update)
-		if update.InboxID == "" || update.EndpointID == "" || payloadKeyID == "" {
-			return ErrInvalidMetadata
-		}
-		if update.ContentDigestKeyID != "" {
-			indexID, _, indexErr := keySourceIndex(ctx, s.keySource)
-			if indexErr != nil || update.ContentDigestKeyID != indexID {
-				return ErrAuthenticationFailed
-			}
-		}
-		version := task5PayloadVersion(update.PayloadVersion)
-		var existing inboxMessageRow
-		lookup := locked(db).Where("inbox_id = ?", update.InboxID).First(&existing)
-		if lookup.Error == nil {
-			if existing.Version >= maxPersistedVersion {
-				return ErrVersionExhausted
-			}
-			if inboxUnresolved(existing.Status) && existing.PayloadExpiresAt != nil && !existing.PayloadExpiresAt.After(s.task5Now()) {
-				return &task5ExpiredPayloadError{table: tableInboxMessages, id: existing.InboxID, now: s.task5Now()}
-			}
-			version = task5PayloadVersion(existing.PayloadVersion)
-		} else if !errors.Is(lookup.Error, gorm.ErrRecordNotFound) {
-			return ErrParticipantFailure
-		}
-		if err := validateTask5OpaquePayload(update.PayloadCiphertext, update.PayloadNonce, payloadKeyID); err != nil {
-			return err
-		}
-		if err := s.validateA6KeyID(ctx, db, payloadKeyID); err != nil {
-			return err
-		}
-		if _, err := openBoundPayload(ctx, s.codec, "inbox/v1", update.InboxID, update.EndpointID, version, update.PayloadCiphertext, update.PayloadNonce, payloadKeyID); err != nil {
-			return ErrAuthenticationFailed
-		}
-	}
-	for _, effect := range work.Effects {
-		if len(effect.PayloadCiphertext) == 0 && len(effect.PayloadNonce) == 0 {
-			continue
-		}
-		if err := task5ValidateKeyFields(s.keySource, effect.DigestKeyID, effect.PayloadEncryptionKeyID); err != nil {
-			return err
-		}
-		payloadKeyID := task5EffectPayloadKeyID(effect)
-		if effect.EffectID == "" || effect.EndpointID == "" || payloadKeyID == "" {
-			return ErrInvalidMetadata
-		}
-		if effect.ContentDigestKeyID != "" {
-			indexID, _, indexErr := keySourceIndex(ctx, s.keySource)
-			if indexErr != nil || effect.ContentDigestKeyID != indexID {
-				return ErrAuthenticationFailed
-			}
-		}
-		version := task5PayloadVersion(effect.PayloadVersion)
-		var existing outboxEffectRow
-		lookup := locked(db).Where("effect_id = ?", effect.EffectID).First(&existing)
-		if lookup.Error == nil {
-			if existing.Version >= maxPersistedVersion {
-				return ErrVersionExhausted
-			}
-			if outboxUnresolved(existing.Status) && existing.PayloadExpiresAt != nil && !existing.PayloadExpiresAt.After(s.task5Now()) {
-				return &task5ExpiredPayloadError{table: tableOutboxEffects, id: existing.EffectID, now: s.task5Now()}
-			}
-			version = task5PayloadVersion(existing.PayloadVersion)
-		} else if !errors.Is(lookup.Error, gorm.ErrRecordNotFound) {
-			return ErrParticipantFailure
-		}
-		if err := validateTask5OpaquePayload(effect.PayloadCiphertext, effect.PayloadNonce, payloadKeyID); err != nil {
-			return err
-		}
-		if err := s.validateA6KeyID(ctx, db, payloadKeyID); err != nil {
-			return err
-		}
-		if _, err := openBoundPayload(ctx, s.codec, "outbox/v1", effect.EffectID, effect.EndpointID, version, effect.PayloadCiphertext, effect.PayloadNonce, payloadKeyID); err != nil {
-			return ErrAuthenticationFailed
-		}
-	}
-	for _, update := range work.ArtifactUpdates {
-		if len(update.Ciphertext) == 0 && len(update.Nonce) == 0 {
-			continue
-		}
-		if update.ArtifactID == "" || update.EncryptionKeyID == "" {
-			return ErrInvalidMetadata
-		}
-		owner := update.OwnerPrincipalID
-		var workOperation *OperationUpdate
-		if update.OperationID != "" {
-			for i := range work.Operations {
-				if work.Operations[i].OperationID == update.OperationID {
-					workOperation = &work.Operations[i]
-					break
-				}
-			}
-		}
-		if workOperation != nil {
-			principal := operationOwners[workOperation.OperationID]
-			if principal == "" {
-				principal = workOperation.PrincipalID
-				if principal == "" {
-					principal = workOperation.OperationID
-				}
-			}
-			if owner == "" {
-				owner = principal
-			} else if owner != principal {
-				return ErrInvalidMetadata
-			}
-		} else if owner == "" && update.OperationID != "" {
-			var operation operationRow
-			ownerErr := db.WithContext(ctx).Select("principal_id").Where("operation_id = ?", update.OperationID).First(&operation).Error
-			if ownerErr == nil {
-				owner = operation.PrincipalID
-			} else if !errors.Is(ownerErr, gorm.ErrRecordNotFound) {
-				return ErrParticipantFailure
-			}
-		}
-		if owner == "" {
-			return ErrInvalidMetadata
-		}
-		if update.Size < 0 || update.Size > MaxArtifactBytes {
-			return &OversizeError{Bound: "artifact bytes", Limit: MaxArtifactBytes, Actual: int(update.Size)}
-		}
-		if err := validateTask5ArtifactOpaquePayload(update.Ciphertext, update.Nonce, update.EncryptionKeyID); err != nil {
-			return err
-		}
-		version := uint64(1)
-		var existingArtifact operationArtifactRow
-		versionQuery := db.WithContext(ctx).Select("version, payload_version").Where("artifact_id = ?", update.ArtifactID).First(&existingArtifact)
-		if versionQuery.Error == nil {
-			if existingArtifact.Version >= maxPersistedVersion {
-				return ErrVersionExhausted
-			}
-			version = task5PayloadVersion(existingArtifact.PayloadVersion)
-		} else if !errors.Is(versionQuery.Error, gorm.ErrRecordNotFound) {
-			return ErrParticipantFailure
-		}
-		if err := s.validateA6KeyID(ctx, db, update.EncryptionKeyID); err != nil {
-			return err
-		}
-		if _, err := openBoundPayload(ctx, s.codec, "artifact/v1", update.ArtifactID, owner, version, update.Ciphertext, update.Nonce, update.EncryptionKeyID); err != nil {
-			return ErrAuthenticationFailed
-		}
-	}
-	for _, update := range work.SecretUpdates {
-		if strings.TrimSpace(update.SecretRef) == "" {
-			return ErrInvalidMetadata
-		}
-		var latest adapterSecretRow
-		query := db.WithContext(ctx).Where("secret_ref = ?", update.SecretRef).Order("secret_version DESC").First(&latest)
-		existing := query.Error == nil
-		if !existing && !errors.Is(query.Error, gorm.ErrRecordNotFound) {
-			return ErrParticipantFailure
-		}
-		if existing && (latest.RowVersion >= maxPersistedVersion || latest.SecretVersion >= maxPersistedVersion) {
-			return ErrVersionExhausted
-		}
-		endpoint, adapter := update.EndpointID, update.AdapterID
-		secretVersion := update.SecretVersion
-		allCipher := len(update.Ciphertext) > 0 && len(update.Nonce) > 0 && update.EncryptionKeyID != ""
-		anyCipher := len(update.Ciphertext) > 0 || len(update.Nonce) > 0 || update.EncryptionKeyID != ""
-		if anyCipher && !allCipher {
-			return ErrInvalidMetadata
-		}
-		if existing {
-			if endpoint == "" {
-				endpoint = latest.EndpointID
-			}
-			if adapter == "" {
-				adapter = latest.AdapterID
-			}
-			if secretVersion == 0 {
-				if latest.SecretVersion == maxUint64 {
-					return ErrVersionExhausted
-				}
-				secretVersion = latest.SecretVersion + 1
-			}
-			if endpoint != latest.EndpointID || adapter != latest.AdapterID {
-				return ErrInvalidMetadata
-			}
-		} else {
-			if endpoint == "" || adapter == "" || !allCipher {
-				return ErrInvalidMetadata
-			}
-			if secretVersion == 0 {
-				secretVersion = 1
-			}
-		}
-		if secretVersion >= maxPersistedVersion {
-			return ErrVersionExhausted
-		}
-		if secretVersion == 0 || update.EncryptionKeyID == "" && !existing {
-			return ErrInvalidMetadata
-		}
-		if allCipher {
-			if len(update.Ciphertext) > MaxSecretBytes+16 {
-				return &OversizeError{Bound: "encrypted secret bytes", Limit: MaxSecretBytes + 16, Actual: len(update.Ciphertext)}
-			}
-			if len(update.Nonce) != 12 {
-				return ErrInvalidMetadata
-			}
-			if err := s.validateA6KeyID(ctx, db, update.EncryptionKeyID); err != nil {
-				return err
-			}
-			plain, err := a6Open(ctx, s.keySource, "adapter-secret/v1", update.SecretRef, endpoint+"/"+adapter, secretVersion, update.EncryptionKeyID, update.Ciphertext, update.Nonce)
-			if err != nil {
-				return ErrAuthenticationFailed
-			}
-			if len(plain) > MaxSecretBytes {
-				return &OversizeError{Bound: "secret bytes", Limit: MaxSecretBytes, Actual: len(plain)}
-			}
-		} else {
-			if !existing {
-				return ErrInvalidMetadata
-			}
-			if len(latest.Ciphertext) > MaxSecretBytes+16 {
-				return &OversizeError{Bound: "encrypted secret bytes", Limit: MaxSecretBytes + 16, Actual: len(latest.Ciphertext)}
-			}
-			if len(latest.Nonce) != 12 {
-				return ErrInvalidMetadata
-			}
-			if err := s.validateA6KeyID(ctx, db, latest.EncryptionKeyID); err != nil {
-				return err
-			}
-			plain, err := a6Open(ctx, s.keySource, "adapter-secret/v1", latest.SecretRef, latest.EndpointID+"/"+latest.AdapterID, latest.SecretVersion, latest.EncryptionKeyID, latest.Ciphertext, latest.Nonce)
-			if err != nil {
-				return ErrAuthenticationFailed
-			}
-			if len(plain) > MaxSecretBytes {
-				return &OversizeError{Bound: "secret bytes", Limit: MaxSecretBytes, Actual: len(plain)}
-			}
-		}
-	}
-	for _, update := range work.PluginKVUpdates {
-		if update.Deleted {
-			continue
-		}
-		if update.ExtensionID == "" || len(update.ExtensionID) > MaxPluginExtensionBytes || len(update.KeyHMAC) != sha256.Size || len(update.KeyCiphertext) == 0 || len(update.KeyNonce) == 0 || len(update.ValueCiphertext) == 0 || len(update.ValueNonce) == 0 || update.EncryptionKeyID == "" {
-			return ErrInvalidMetadata
-		}
-		if update.ValueSize < 0 || update.ValueSize > MaxPluginValueBytes {
-			return &OversizeError{Bound: "plugin value bytes", Limit: MaxPluginValueBytes, Actual: int(update.ValueSize)}
-		}
-		if len(update.KeyCiphertext) > MaxPluginKeyBytes+16 {
-			return &OversizeError{Bound: "encrypted plugin key bytes", Limit: MaxPluginKeyBytes + 16, Actual: len(update.KeyCiphertext)}
-		}
-		if len(update.ValueCiphertext) > MaxPluginValueBytes+16 {
-			return &OversizeError{Bound: "encrypted plugin value bytes", Limit: MaxPluginValueBytes + 16, Actual: len(update.ValueCiphertext)}
-		}
-		if len(update.KeyNonce) != 12 || len(update.ValueNonce) != 12 {
-			return ErrInvalidMetadata
-		}
-		var existing pluginKVRow
-		version := uint64(1)
-		query := db.WithContext(ctx).Where("extension_id = ? AND key_hmac = ?", update.ExtensionID, update.KeyHMAC).First(&existing)
-		if query.Error == nil {
-			if existing.RowVersion >= maxPersistedVersion {
-				return ErrVersionExhausted
-			}
-			next, nextErr := nextVersion(existing.RowVersion)
-			if nextErr != nil {
-				return nextErr
-			}
-			version = next
-		} else if !errors.Is(query.Error, gorm.ErrRecordNotFound) {
-			return ErrParticipantFailure
-		}
-		if update.Version != 0 {
-			version = update.Version
-		}
-		if err := s.validateA6KeyID(ctx, db, update.EncryptionKeyID); err != nil {
-			return err
-		}
-		key, publicationErr := a6Open(ctx, s.keySource, "plugin-kv-key/v1", string(update.KeyHMAC), update.ExtensionID, version, update.EncryptionKeyID, update.KeyCiphertext, update.KeyNonce)
-		if publicationErr != nil {
-			return ErrAuthenticationFailed
-		}
-		if len(key) > MaxPluginKeyBytes {
-			return ErrInvalidMetadata
-		}
-		if err := s.validatePluginKeyIndex(ctx, update.ExtensionID, update.KeyHMAC, key); err != nil {
-			return err
-		}
-		value, publicationErr := a6Open(ctx, s.keySource, "plugin-kv-value/v1", string(update.KeyHMAC), update.ExtensionID, version, update.EncryptionKeyID, update.ValueCiphertext, update.ValueNonce)
-		if publicationErr != nil {
-			return ErrAuthenticationFailed
-		}
-		if len(value) > MaxPluginValueBytes || update.ValueSize != int64(len(value)) {
-			return ErrInvalidMetadata
-		}
-	}
-	return nil
-}
-
-func (s *GORMStore) initializeA6Readiness(ctx context.Context) error {
-	if s == nil || s.keySource == nil {
-		return nil
-	}
-	if s.db == nil || s.db.GORM() == nil {
-		return ErrReadinessInvalid
-	}
-	r, semanticManifestBytes, projectionManifestBytes, publicationErr := runtimeReadinessFromDB(ctx, s.db.GORM())
-	if publicationErr != nil {
-		return publicationErr
-	}
-	canonical := r.Mode == "fresh" && r.SchemaVersion == 1 && r.DatabaseIdentity == "eventstore" &&
-		r.IndexRootID == "unconfigured" && len(r.IndexRootFingerprint) == 0 && len(r.EncryptionRootIDs) == 0 &&
-		len(r.SourceManifestDigest) == 0 && len(r.TargetManifestDigest) == 0 && semanticManifestBytes == 0 &&
-		projectionManifestBytes == 0 && len(r.ProjectionManifestDigest) == 0 &&
-		r.TerminalGlobalPosition == 0 && r.TerminalProjectionPosition == 0 && r.CompletedAt.IsZero()
-	if !canonical {
-		if err := validateReadinessMetadata(r, semanticManifestBytes, projectionManifestBytes); err != nil {
-			return err
-		}
-	}
-	if canonical {
-		nonempty, nonemptyErr := readinessDatabaseNonEmpty(ctx, s.db.GORM())
-		if nonemptyErr != nil {
-			return ErrReadinessQuarantined
-		}
-		if nonempty {
-			return ErrReadinessQuarantined
-		}
-		indexID, _, indexErr := keySourceIndex(ctx, s.keySource)
-		if indexErr != nil {
-			return ErrKeySourceUnavailable
-		}
-		current, currentErr := keySourceCurrent(ctx, s.keySource)
-		if currentErr != nil {
-			return currentErr
-		}
-		identity := r.DatabaseIdentity
-		if configured := strings.TrimSpace(s.db.databaseIdentity); configured != "" {
-			identity = configured
-		}
-		if err := s.SetReadiness(ctx, Readiness{
-			Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: identity,
-			IndexRootID: indexID, EncryptionRootIDs: []string{current.ID},
-		}); err != nil {
-			return err
-		}
-	}
-	return s.validateRuntimeReadiness(ctx)
-}
-func (s *GORMStore) markFreshInitialized(r Readiness) {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	s.freshInitialized = true
-	s.freshBaseline = Readiness{
-		Mode: r.Mode, SchemaVersion: r.SchemaVersion, DatabaseIdentity: r.DatabaseIdentity,
-		IndexRootID: r.IndexRootID, IndexRootFingerprint: append([]byte(nil), r.IndexRootFingerprint...),
-		EncryptionRootIDs: append([]string(nil), r.EncryptionRootIDs...),
-	}
-	s.freshBaselineSet = true
-	s.mu.Unlock()
-}
-
-func (s *GORMStore) clearFreshInitialized() {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	s.freshInitialized = false
-	s.freshBaseline = Readiness{}
-	s.freshBaselineSet = false
-	s.mu.Unlock()
-}
-
-func (s *GORMStore) freshWasInitialized(r Readiness) bool {
-	if s == nil {
-		return false
-	}
-	s.mu.RLock()
-	initialized, baseline := s.freshInitialized, s.freshBaseline
-	baselineSet := s.freshBaselineSet
-	s.mu.RUnlock()
-	if !initialized || !baselineSet || baseline.Mode != r.Mode || baseline.SchemaVersion != r.SchemaVersion ||
-		baseline.DatabaseIdentity != r.DatabaseIdentity || baseline.IndexRootID != r.IndexRootID ||
-		!bytes.Equal(baseline.IndexRootFingerprint, r.IndexRootFingerprint) ||
-		!slices.Equal(baseline.EncryptionRootIDs, r.EncryptionRootIDs) {
-		return false
-	}
-	return true
-}
-func markFreshInitializedTx(tx *gorm.DB) error {
-	if tx == nil {
-		return ErrReadinessInvalid
-	}
-	var row struct {
-		Mode             string `gorm:"column:mode"`
-		FreshInitialized bool   `gorm:"column:fresh_initialized"`
-	}
-	query := tx.Model(&storeReadinessRow{}).
-		Select("mode, fresh_initialized").
-		Where("singleton_id = ?", "default").
-		First(&row)
-	if errors.Is(query.Error, gorm.ErrRecordNotFound) {
-		return nil
-	}
-	if query.Error != nil {
-		return errors.New("eventstore: read fresh readiness marker failed")
-	}
-	if row.Mode != "fresh" || row.FreshInitialized {
-		return nil
-	}
-	if err := tx.Model(&storeReadinessRow{}).Where("singleton_id = ?", "default").Update("fresh_initialized", true).Error; err != nil {
-		return errors.New("eventstore: mark fresh readiness initialized failed")
 	}
 	return nil
 }
@@ -1528,215 +112,125 @@ func (s *GORMStore) SetReadiness(ctx context.Context, r Readiness) error {
 	if err := validateReadinessValue(r); err != nil {
 		return err
 	}
-	if s == nil || s.db == nil || s.keySource == nil {
-		return ErrKeySourceUnavailable
+	if s == nil || s.db == nil || s.db.GORM() == nil {
+		return ErrReadinessInvalid
 	}
-	id, indexMaterial, err := keySourceIndex(ctx, s.keySource)
-	if err != nil || id != r.IndexRootID {
-		return ErrReadinessQuarantined
-	}
-	fingerprint := sha256.Sum256(indexMaterial)
-	if len(r.IndexRootFingerprint) != 0 && (len(r.IndexRootFingerprint) != len(fingerprint) || !hmac.Equal(r.IndexRootFingerprint, fingerprint[:])) {
-		return ErrReadinessQuarantined
-	}
-	r.IndexRootFingerprint = append([]byte(nil), fingerprint[:]...)
-	current, err := keySourceCurrent(ctx, s.keySource)
-	if err != nil {
-		return ErrKeyUnavailable
-	}
-	requested := make(map[string]struct{}, len(r.EncryptionRootIDs))
-	for _, rootID := range r.EncryptionRootIDs {
-		requested[rootID] = struct{}{}
-		if _, err = keySourceRoot(ctx, s.keySource, rootID); err != nil {
-			return ErrKeyUnavailable
-		}
-	}
-	if _, ok := requested[current.ID]; !ok {
-		return ErrReadinessQuarantined
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	if expected := strings.TrimSpace(s.db.databaseIdentity); expected != "" && r.DatabaseIdentity != expected {
 		return ErrReadinessQuarantined
 	}
-	roots, err := json.Marshal(r.EncryptionRootIDs)
-	if err != nil {
-		return ErrReadinessInvalid
-	}
-	tx := s.db.GORM().WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return ErrReadinessInvalid
-	}
-	defer tx.Rollback()
-	var existing storeReadinessRow
-	queryErr := locked(tx).Where("singleton_id = ?", "default").First(&existing).Error
-	if queryErr == nil {
-		if existing.IndexRootID != "" && existing.IndexRootID != "unconfigured" {
-			if existing.IndexRootID != r.IndexRootID {
-				return ErrReadinessQuarantined
-			}
-			if len(existing.IndexRootFingerprint) != len(fingerprint) || !hmac.Equal(existing.IndexRootFingerprint, fingerprint[:]) {
-				return ErrReadinessQuarantined
-			}
-		}
-		if existing.Mode == "import" && r.Mode == "fresh" {
-			return ErrReadinessInvalid
-		}
-	} else if !errors.Is(queryErr, gorm.ErrRecordNotFound) {
-		return ErrParticipantFailure
-	}
-	var control projectionControlRow
-	if lockErr := locked(tx).Where("singleton_id = ?", "default").First(&control).Error; lockErr != nil {
-		return ErrParticipantFailure
-	}
-	if control.PublicationState != "published" {
-		return ErrReadinessQuarantined
-	}
-	lockedIndexID, lockedIndexMaterial, indexErr := keySourceIndex(ctx, s.keySource)
-	if indexErr != nil || lockedIndexID != r.IndexRootID {
-		return ErrReadinessQuarantined
-	}
-	lockedFingerprint := sha256.Sum256(lockedIndexMaterial)
-	if !hmac.Equal(r.IndexRootFingerprint, lockedFingerprint[:]) {
-		return ErrReadinessQuarantined
-	}
-	lockedCurrent, currentErr := keySourceCurrent(ctx, s.keySource)
-	if currentErr != nil {
-		return ErrKeyUnavailable
-	}
-	if _, ok := requested[lockedCurrent.ID]; !ok {
-		return ErrReadinessQuarantined
-	}
-	for rootID := range requested {
-		if _, rootErr := keySourceRoot(ctx, s.keySource, rootID); rootErr != nil {
-			return ErrKeyUnavailable
-		}
-	}
-	nonempty, countErr := readinessDatabaseNonEmpty(ctx, tx)
-	if countErr != nil {
-		return ErrParticipantFailure
-	}
-	if r.Mode == "fresh" && nonempty {
-		return ErrReadinessQuarantined
-	}
-	if refs, refErr := readinessRootReferences(ctx, tx); refErr != nil {
-		return ErrParticipantFailure
-	} else {
-		for rootID := range refs {
-			if _, ok := requested[rootID]; !ok {
-				return ErrReadinessQuarantined
-			}
-		}
-	}
-	if r.Mode == "import" {
-		global, projection, terminalErr := readinessTerminalPositions(ctx, tx, &control)
-		if terminalErr != nil || control.PublicationState != "published" || global != r.TerminalGlobalPosition || projection != r.TerminalProjectionPosition {
+	err := s.db.GORM().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var existing storeReadinessRow
+		if err := locked(tx).Where("singleton_id = ?", "default").First(&existing).Error; err != nil {
 			return ErrReadinessQuarantined
 		}
-	}
-	row := storeReadinessRow{
-		SingletonID: "default", Mode: r.Mode, SchemaVersion: strconv.FormatUint(uint64(r.SchemaVersion), 10),
-		DatabaseIdentity: r.DatabaseIdentity, IndexRootID: r.IndexRootID,
-		IndexRootFingerprint: append([]byte(nil), r.IndexRootFingerprint...), EncryptionRootIDs: roots,
-		SourceManifestDigest:     append([]byte(nil), r.SourceManifestDigest...),
-		TargetManifestDigest:     append([]byte(nil), r.TargetManifestDigest...),
-		SemanticManifest:         append([]byte(nil), r.SemanticManifest...),
-		ProjectionManifest:       append([]byte(nil), r.ProjectionManifest...),
-		ProjectionManifestDigest: append([]byte(nil), r.ProjectionManifestDigest...),
-		TerminalGlobalPosition:   r.TerminalGlobalPosition, TerminalProjectionPosition: r.TerminalProjectionPosition,
-	}
-	if !r.CompletedAt.IsZero() {
-		completed := r.CompletedAt
-		row.CompletedAt = &completed
-	}
-	if err = tx.Save(&row).Error; err != nil {
-		return ErrReadinessInvalid
-	}
-	if err = tx.Commit().Error; err != nil {
-		return ErrReadinessInvalid
-	}
-	if r.Mode == "fresh" {
-		s.markFreshInitialized(r)
-	} else {
-		s.clearFreshInitialized()
+		if existing.Mode == "import" && r.Mode != "import" {
+			return ErrReadinessInvalid
+		}
+		var control projectionControlRow
+		if err := locked(tx).Where("singleton_id = ?", "default").First(&control).Error; err != nil || control.PublicationState != "published" {
+			return ErrReadinessQuarantined
+		}
+		return tx.Model(&storeReadinessRow{}).Where("singleton_id = ?", "default").
+			Updates(map[string]any{"mode": r.Mode, "schema_version": strconv.FormatUint(uint64(r.SchemaVersion), 10), "database_identity": r.DatabaseIdentity, "completed_at": timePtr(r.CompletedAt)}).Error
+	})
+	if err != nil {
+		return err
 	}
 	s.clearReadinessError()
 	return nil
 }
 
 func (s *GORMStore) PutSecret(ctx context.Context, req SecretPutRequest) (SecretResolution, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := s.requireReady(ctx); err != nil {
 		return SecretResolution{}, err
 	}
-	if strings.TrimSpace(req.SecretRef) == "" || strings.TrimSpace(req.EndpointID) == "" || strings.TrimSpace(req.AdapterID) == "" {
+	if strings.TrimSpace(req.SecretRef) == "" || len(req.SecretRef) > MaxSecretRefBytes || strings.TrimSpace(req.EndpointID) == "" || strings.TrimSpace(req.AdapterID) == "" {
 		return SecretResolution{}, ErrInvalidMetadata
 	}
-	if len(req.Plaintext) > MaxSecretBytes {
+	if len(req.Value) > MaxSecretBytes {
 		return SecretResolution{}, ErrOversizeInput
 	}
-	now := s.task5Now()
-	if _, err := keySourceCurrent(ctx, s.keySource); err != nil {
-		return SecretResolution{}, err
-	}
-	tx := s.db.GORM().WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return SecretResolution{}, ErrEncryptionUnavailable
-	}
-	defer tx.Rollback()
-	if err := s.lockMutationPublication(ctx, tx); err != nil {
-		return SecretResolution{}, err
-	}
-	var latest adapterSecretRow
-	current := uint64(0)
-	query := locked(tx).Where("secret_ref = ?", req.SecretRef).Order("row_version DESC").First(&latest)
+	var err error
+	var observed adapterSecretRow
+	observedFound := false
+	query := rawStringQuery(s.db.GORM().WithContext(ctx), "secret_ref", req.SecretRef).Order("row_version DESC").First(&observed)
 	if query.Error == nil {
-		current = latest.RowVersion
-		if current >= maxPersistedVersion || latest.SecretVersion >= maxPersistedVersion {
-			return SecretResolution{}, ErrVersionExhausted
-		}
+		observedFound = true
 	} else if !errors.Is(query.Error, gorm.ErrRecordNotFound) {
 		return SecretResolution{}, ErrParticipantFailure
+	}
+	current := uint64(0)
+	if observedFound {
+		current = observed.RowVersion
+		if current >= maxPersistedVersion || observed.SecretVersion >= maxPersistedVersion {
+			return SecretResolution{}, ErrVersionExhausted
+		}
 	}
 	if req.ExpectedVersion != 0 && req.ExpectedVersion != current {
 		return SecretResolution{}, ErrParticipantConflict
 	}
-	if current > 0 && (req.EndpointID != latest.EndpointID || req.AdapterID != latest.AdapterID) {
+	if observedFound && (req.EndpointID != observed.EndpointID || req.AdapterID != observed.AdapterID) {
 		return SecretResolution{}, ErrInvalidMetadata
 	}
 	version := req.SecretVersion
 	if version == 0 {
 		version = 1
-		if current > 0 {
-			nextVersionValue, versionErr := nextVersion(latest.SecretVersion)
-			if versionErr != nil {
-				return SecretResolution{}, versionErr
+		if observedFound {
+			version, err = nextVersion(observed.SecretVersion)
+			if err != nil {
+				return SecretResolution{}, err
 			}
-			version = nextVersionValue
 		}
-	} else if current > 0 && version <= latest.SecretVersion {
+	} else if observedFound && version <= observed.SecretVersion {
 		return SecretResolution{}, ErrParticipantConflict
 	}
 	if version >= maxPersistedVersion {
 		return SecretResolution{}, ErrVersionExhausted
 	}
-	root, err := s.admittedCurrentRoot(ctx, tx)
-	if err != nil {
-		return SecretResolution{}, err
-	}
-	ciphertext, nonce, keyID, err := a6SealWithRoot(root, "adapter-secret/v1", req.SecretRef, req.EndpointID+"/"+req.AdapterID, version, req.Plaintext)
-	if err != nil {
-		return SecretResolution{}, err
-	}
 	rowVersion, err := nextVersion(current)
 	if err != nil {
 		return SecretResolution{}, err
 	}
-	row := adapterSecretRow{SecretRef: req.SecretRef, SecretVersion: version, EndpointID: req.EndpointID, AdapterID: req.AdapterID, AdapterType: "opaque", Ciphertext: ciphertext, Nonce: nonce, EncryptionKeyID: keyID, RowVersion: rowVersion, CreatedAt: now, UpdatedAt: now}
-	if err = tx.Create(&row).Error; err != nil {
+	now := s.task5Now()
+	tx := s.db.GORM().WithContext(ctx).Begin()
+	if tx.Error != nil {
 		return SecretResolution{}, ErrParticipantFailure
+	}
+	defer tx.Rollback()
+	if err = s.lockParticipantPublication(ctx, tx); err != nil {
+		return SecretResolution{}, err
+	}
+	var lockedLatest adapterSecretRow
+	lockedQuery := rawStringQuery(locked(tx), "secret_ref", req.SecretRef).Order("row_version DESC").First(&lockedLatest)
+	if observedFound {
+		if lockedQuery.Error != nil || lockedLatest.RowVersion != observed.RowVersion ||
+			lockedLatest.SecretVersion != observed.SecretVersion ||
+			lockedLatest.EndpointID != observed.EndpointID || lockedLatest.AdapterID != observed.AdapterID ||
+			!bytes.Equal(lockedLatest.Value, observed.Value) {
+			return SecretResolution{}, ErrParticipantConflict
+		}
+	} else if lockedQuery.Error == nil {
+		return SecretResolution{}, ErrParticipantConflict
+	} else if !errors.Is(lockedQuery.Error, gorm.ErrRecordNotFound) {
+		return SecretResolution{}, ErrParticipantFailure
+	}
+	row := adapterSecretRow{
+		SecretRef: req.SecretRef, SecretVersion: version, EndpointID: req.EndpointID, AdapterID: req.AdapterID,
+		AdapterType: "opaque", Value: bytes.Clone(req.Value), RowVersion: rowVersion, CreatedAt: now, UpdatedAt: now,
+	}
+	if err = tx.Create(&row).Error; err != nil {
+		return SecretResolution{}, ErrParticipantConflict
 	}
 	if err = tx.Commit().Error; err != nil {
 		return SecretResolution{}, ErrParticipantFailure
 	}
-	return SecretResolution{SecretRef: req.SecretRef, SecretVersion: version, Plaintext: append([]byte(nil), req.Plaintext...)}, nil
+	return SecretResolution{SecretRef: req.SecretRef, SecretVersion: version, Value: row.Value}, nil
 }
 func (s *GORMStore) ResolveSecret(ctx context.Context, ref string, version uint64) (SecretResolution, error) {
 	return s.resolveSecret(ctx, ref, "", "", version)
@@ -1750,108 +244,91 @@ func (s *GORMStore) ResolveSecretForOwner(ctx context.Context, endpointID, adapt
 }
 
 func (s *GORMStore) resolveSecret(ctx context.Context, ref, endpointID, adapterID string, version uint64) (SecretResolution, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := s.requireReady(ctx); err != nil {
 		return SecretResolution{}, err
 	}
 	if ref == "" {
 		return SecretResolution{}, ErrNotFound
 	}
-	tx := s.db.GORM().WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return SecretResolution{}, ErrParticipantFailure
-	}
-	defer tx.Rollback()
-	if err := s.lockMutationPublication(ctx, tx); err != nil {
-		return SecretResolution{}, err
+	if len(ref) > MaxSecretRefBytes {
+		return SecretResolution{}, ErrInvalidMetadata
 	}
 	var row adapterSecretRow
-	q := locked(tx).Where("secret_ref = ?", ref)
+	query := rawStringQuery(s.db.GORM().WithContext(ctx), "secret_ref", ref)
 	if endpointID != "" {
-		q = q.Where("endpoint_id = ?", endpointID).Where("adapter_id = ?", adapterID)
+		query = rawStringQuery(rawStringQuery(query, "endpoint_id", endpointID), "adapter_id", adapterID)
 	}
 	if version > 0 {
-		q = q.Where("secret_version = ?", version)
+		query = query.Where("secret_version = ?", version)
 	} else {
-		q = q.Order("secret_version DESC")
+		query = query.Order("secret_version DESC")
 	}
-	queryErr := q.First(&row).Error
+	queryErr := query.First(&row).Error
 	if errors.Is(queryErr, gorm.ErrRecordNotFound) {
 		return SecretResolution{}, ErrNotFound
 	}
 	if queryErr != nil {
 		return SecretResolution{}, ErrParticipantFailure
 	}
-	if len(row.Ciphertext) > MaxSecretBytes+16 {
-		return SecretResolution{}, &OversizeError{Bound: "encrypted secret bytes", Limit: MaxSecretBytes + 16, Actual: len(row.Ciphertext)}
+	if len(row.Value) > MaxSecretBytes {
+		return SecretResolution{}, &OversizeError{Bound: "secret bytes", Limit: MaxSecretBytes, Actual: len(row.Value)}
 	}
-	if len(row.Nonce) != 12 {
-		return SecretResolution{}, ErrInvalidMetadata
-	}
-	if err := s.validateA6KeyID(ctx, tx, row.EncryptionKeyID); err != nil {
+	value := row.Value
+	err := s.db.GORM().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if lockErr := lockReadPublication(tx); lockErr != nil {
+			return lockErr
+		}
+		var current adapterSecretRow
+		if lockErr := rawStringQuery(lockedShared(tx), "secret_ref", row.SecretRef).Where("secret_version = ?", row.SecretVersion).Take(&current).Error; lockErr != nil {
+			return ErrParticipantConflict
+		}
+		if current.RowVersion != row.RowVersion || current.EndpointID != row.EndpointID || current.AdapterID != row.AdapterID || !bytes.Equal(current.Value, row.Value) {
+			return ErrParticipantConflict
+		}
+		return nil
+	})
+	if err != nil {
+		clear(value)
 		return SecretResolution{}, err
 	}
-	plain, err := a6Open(ctx, s.keySource, "adapter-secret/v1", row.SecretRef, row.EndpointID+"/"+row.AdapterID, row.SecretVersion, row.EncryptionKeyID, row.Ciphertext, row.Nonce)
-	if err != nil {
-		return SecretResolution{}, ErrAuthenticationFailed
-	}
-	if len(plain) > MaxSecretBytes {
-		return SecretResolution{}, &OversizeError{Bound: "secret bytes", Limit: MaxSecretBytes, Actual: len(plain)}
-	}
-	return SecretResolution{SecretRef: row.SecretRef, SecretVersion: row.SecretVersion, Plaintext: plain}, nil
+	return SecretResolution{SecretRef: row.SecretRef, SecretVersion: row.SecretVersion, Value: value}, nil
 }
 
-func (s *GORMStore) pluginValueUsageOn(ctx context.Context, db *gorm.DB, extension string, exclude []byte) (int64, error) {
-	var rows []pluginKVRow
-	if err := db.WithContext(ctx).Where("extension_id = ?", extension).Order("key_hmac ASC").Limit(MaxPluginScan + 1).Find(&rows).Error; err != nil {
-		return 0, ErrParticipantFailure
-	}
-	if len(rows) > MaxPluginScan {
-		return 0, ErrOversizeInput
-	}
+func pluginValueUsageRows(rows []pluginKVRow) (int64, error) {
 	var total int64
 	for _, row := range rows {
-		if len(exclude) > 0 && hmac.Equal(row.KeyHMAC, exclude) {
-			continue
+		if len(row.Key) > MaxPluginKeyBytes {
+			return 0, &OversizeError{Bound: "plugin key bytes", Limit: MaxPluginKeyBytes, Actual: len(row.Key)}
 		}
-		if row.ValueSize < 0 || row.ValueSize > MaxPluginValueBytes {
-			return 0, &OversizeError{Bound: "plugin value bytes", Limit: MaxPluginValueBytes, Actual: int(row.ValueSize)}
+		if len(row.Value) > MaxPluginValueBytes {
+			return 0, &OversizeError{Bound: "plugin value bytes", Limit: MaxPluginValueBytes, Actual: len(row.Value)}
 		}
-		if len(row.EncryptedKey) > MaxPluginKeyBytes+16 {
-			return 0, &OversizeError{Bound: "encrypted plugin key bytes", Limit: MaxPluginKeyBytes + 16, Actual: len(row.EncryptedKey)}
-		}
-		if len(row.EncryptedValue) > MaxPluginValueBytes+16 {
-			return 0, &OversizeError{Bound: "encrypted plugin value bytes", Limit: MaxPluginValueBytes + 16, Actual: len(row.EncryptedValue)}
-		}
-		if len(row.KeyNonce) != 12 || len(row.ValueNonce) != 12 {
-			return 0, ErrInvalidMetadata
-		}
-		if err := s.validateA6KeyID(ctx, db, row.EncryptionKeyID); err != nil {
-			return 0, err
-		}
-		key, validationErr := a6Open(ctx, s.keySource, "plugin-kv-key/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedKey, row.KeyNonce)
-		if validationErr != nil {
-			return 0, ErrAuthenticationFailed
-		}
-		if len(key) > MaxPluginKeyBytes {
-			return 0, ErrInvalidMetadata
-		}
-		if err := s.validatePluginKeyIndex(ctx, row.ExtensionID, row.KeyHMAC, key); err != nil {
-			return 0, err
-		}
-		plain, validationErr := a6Open(ctx, s.keySource, "plugin-kv-value/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedValue, row.ValueNonce)
-		if validationErr != nil {
-			return 0, ErrAuthenticationFailed
-		}
-		if len(plain) > MaxPluginValueBytes || int64(len(plain)) != row.ValueSize {
-			return 0, ErrInvalidMetadata
-		}
-		total += int64(len(plain))
+		total += int64(len(row.Value))
 		if total > MaxPluginBytes {
 			return 0, ErrOversizeInput
 		}
 	}
 	return total, nil
 }
+
+// validatePluginQuota checks the final namespace state while its transaction
+// holds lockPluginQuota. Checking after all writes lets a batch reuse capacity
+// released by deletes and overwrites regardless of key ordering.
+func validatePluginQuota(tx *gorm.DB, extension string) error {
+	var rows []pluginKVRow
+	if err := rawStringQuery(tx, "extension_id", extension).Select("key", "value").Limit(MaxPluginKeys + 1).Find(&rows).Error; err != nil {
+		return ErrParticipantFailure
+	}
+	if len(rows) > MaxPluginKeys {
+		return &OversizeError{Bound: "plugin keys", Limit: MaxPluginKeys, Actual: len(rows)}
+	}
+	_, err := pluginValueUsageRows(rows)
+	return err
+}
+
 func (s *GORMStore) lockMutationPublication(_ context.Context, tx *gorm.DB) error {
 	if err := lockPublication(tx); err != nil {
 		return err
@@ -1865,36 +342,50 @@ func (s *GORMStore) lockMutationPublication(_ context.Context, tx *gorm.DB) erro
 	}
 	return nil
 }
-func (s *GORMStore) lockRotationPublication(ctx context.Context, tx *gorm.DB, expectedRootID string) error {
-	if err := s.lockMutationPublication(ctx, tx); err != nil {
-		return err
-	}
-	current, err := s.admittedCurrentRoot(ctx, tx)
-	if err != nil {
-		return err
-	}
-	if current.ID != expectedRootID {
-		return ErrReadinessQuarantined
-	}
-	return nil
+
+func (s *GORMStore) lockParticipantPublication(_ context.Context, tx *gorm.DB) error {
+	return lockReadPublication(tx)
 }
 
-func lockPublication(tx *gorm.DB) error {
-	var readiness struct {
-		SingletonID       string `gorm:"column:singleton_id"`
-		EncryptionRootIDs []byte `gorm:"column:encryption_root_ids"`
+func lockReadPublication(tx *gorm.DB) error {
+	if tx == nil {
+		return ErrParticipantFailure
 	}
-	if err := locked(tx).Model(&storeReadinessRow{}).
-		Select("singleton_id, encryption_root_ids").
+	var readiness struct {
+		SingletonID string `gorm:"column:singleton_id"`
+	}
+	if err := lockedShared(tx).Model(&storeReadinessRow{}).
+		Select("singleton_id").
 		Where("singleton_id = ?", "default").
 		First(&readiness).Error; err != nil {
 		return ErrParticipantFailure
 	}
-	roots, err := decodeAdmittedRootIDs(readiness.EncryptionRootIDs)
-	if err != nil {
-		return err
+	var control projectionControlRow
+	if err := lockedShared(tx).Where("singleton_id = ?", "default").First(&control).Error; err != nil {
+		return ErrParticipantFailure
 	}
-	tx.Statement.Settings.Store(transactionAdmittedRootIDsKey, roots)
+	if control.PublicationState != "published" {
+		return ErrReadinessQuarantined
+	}
+	return nil
+}
+func lockPublication(tx *gorm.DB) error {
+	if tx.Name() == "sqlite" {
+		q := tx.Exec("UPDATE store_readiness SET singleton_id = singleton_id WHERE singleton_id = ?", "default")
+		if q.Error != nil || q.RowsAffected != 1 {
+			return ErrParticipantFailure
+		}
+		return nil
+	}
+	var readiness struct {
+		SingletonID string `gorm:"column:singleton_id"`
+	}
+	if err := locked(tx).Model(&storeReadinessRow{}).
+		Select("singleton_id").
+		Where("singleton_id = ?", "default").
+		First(&readiness).Error; err != nil {
+		return ErrParticipantFailure
+	}
 	return nil
 }
 func lockPluginQuota(tx *gorm.DB) error {
@@ -1906,156 +397,132 @@ func (s *GORMStore) SetPluginKV(ctx context.Context, req PluginKVPutRequest) (Pl
 		return PluginKVItem{}, err
 	}
 	if req.ExtensionID == "" || len(req.ExtensionID) > MaxPluginExtensionBytes || len(req.Key) > MaxPluginKeyBytes || len(req.Value) > MaxPluginValueBytes {
-		return PluginKVItem{}, ErrOversizeInput
+		return PluginKVItem{}, ErrInvalidMetadata
 	}
-	index, validationErr := a6HMAC(ctx, s.keySource, "plugin-key-index/v1", req.ExtensionID, req.Key)
-	if validationErr != nil {
-		return PluginKVItem{}, validationErr
+	namespace, err := pluginNamespaceKey(req.ExtensionID)
+	if err != nil {
+		return PluginKVItem{}, err
+	}
+	if err = s.ensurePluginRevisionHeads(ctx, req.ExtensionID, req.Key); err != nil {
+		return PluginKVItem{}, err
+	}
+	var snapshotRows []pluginKVRow
+	var keyHead, namespaceHead revisionHeadRow
+	err = s.db.ReadSnapshot(ctx, func(snapshot *gorm.DB) error {
+		if _, readErr := readDependencyControl(snapshot); readErr != nil {
+			return readErr
+		}
+		keyResource := pluginKeyResource(namespace, req.Key)
+		if readErr := revisionQuery(snapshot, keyResource.kind, keyResource.scope, keyResource.member).First(&keyHead).Error; readErr != nil {
+			return ErrParticipantFailure
+		}
+		namespaceResource := pluginNamespaceResource(namespace)
+		if readErr := revisionQuery(snapshot, namespaceResource.kind, namespaceResource.scope, namespaceResource.member).First(&namespaceHead).Error; readErr != nil {
+			return ErrParticipantFailure
+		}
+		return rawStringQuery(snapshot, "extension_id", req.ExtensionID).Find(&snapshotRows).Error
+	})
+	if err != nil {
+		return PluginKVItem{}, ErrParticipantFailure
+	}
+	var current uint64
+	var found bool
+	for _, existing := range snapshotRows {
+		if existing.Key == req.Key {
+			current, found = existing.RowVersion, true
+			break
+		}
+	}
+	if found != keyHead.Present {
+		return PluginKVItem{}, ErrInvalidMetadata
+	}
+	if req.ExpectedVersion != 0 && req.ExpectedVersion != current {
+		return PluginKVItem{}, ErrParticipantConflict
+	}
+	revisionPlan, err := s.prepareRevisionPlan(ctx, UnitOfWork{
+		PluginKVReads:          []PluginKVReadExpectation{{Namespace: namespace, Key: req.Key, ExpectedRevision: keyHead.Revision, ExpectedExists: found}},
+		PluginKVNamespaceReads: []PluginKVNamespaceReadExpectation{{Namespace: namespace, ExpectedRevision: namespaceHead.Revision}},
+		PluginKVUpdates:        []PluginKVUpdate{{ExtensionID: req.ExtensionID, Key: req.Key}},
+	})
+	if err != nil {
+		return PluginKVItem{}, err
 	}
 	tx := s.db.GORM().WithContext(ctx).Begin()
 	if tx.Error != nil {
 		return PluginKVItem{}, ErrParticipantFailure
 	}
 	defer tx.Rollback()
-	if err := s.lockMutationPublication(ctx, tx); err != nil {
+	if err := lockPluginQuota(tx); err != nil {
+		return PluginKVItem{}, err
+	}
+	if err := s.lockParticipantPublication(ctx, tx); err != nil {
+		return PluginKVItem{}, err
+	}
+	revisionStates, err := lockRevisionPlan(tx, revisionPlan)
+	if err != nil {
+		return PluginKVItem{}, err
+	}
+	var row pluginKVRow
+	query := pluginQuery(locked(tx), req.ExtensionID, req.Key).First(&row)
+	if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+		if found {
+			return PluginKVItem{}, ErrParticipantConflict
+		}
+		current = 0
+	} else if query.Error != nil {
+		return PluginKVItem{}, ErrParticipantFailure
+	} else if !found || row.RowVersion != current {
+		return PluginKVItem{}, ErrParticipantConflict
+	}
+	version, err := nextVersion(current)
+	if err != nil {
 		return PluginKVItem{}, err
 	}
 	now := s.task5Now()
-	var existing pluginKVRow
-	q := locked(tx).Where("extension_id = ? AND key_hmac = ?", req.ExtensionID, index).First(&existing)
-	current := uint64(0)
-	if q.Error == nil {
-		current = existing.RowVersion
-		if current >= ^uint64(0)>>1 {
-			return PluginKVItem{}, ErrVersionExhausted
-		}
-	} else if !errors.Is(q.Error, gorm.ErrRecordNotFound) {
-		return PluginKVItem{}, ErrParticipantFailure
+	row = pluginKVRow{ExtensionID: req.ExtensionID, Key: req.Key, Value: bytes.Clone(req.Value), RowVersion: version, CreatedAt: now, UpdatedAt: now}
+	if current == 0 {
+		query = tx.Create(&row)
+	} else {
+		query = pluginQuery(tx.Model(&pluginKVRow{}), req.ExtensionID, req.Key).Where("row_version = ?", current).Updates(map[string]any{"value": row.Value, "row_version": version, "updated_at": now})
 	}
-	if req.ExpectedVersion != 0 && req.ExpectedVersion != current {
+	if query.Error != nil || query.RowsAffected != 1 {
 		return PluginKVItem{}, ErrParticipantConflict
 	}
-	if current == 0 {
-		var count int64
-		if err := tx.Model(&pluginKVRow{}).Where("extension_id = ?", req.ExtensionID).Count(&count).Error; err != nil {
-			return PluginKVItem{}, ErrParticipantFailure
-		}
-		if count >= MaxPluginKeys {
-			return PluginKVItem{}, ErrOversizeInput
-		}
+	if err = validatePluginQuota(tx, req.ExtensionID); err != nil {
+		return PluginKVItem{}, err
 	}
-	usage, validationErr := s.pluginValueUsageOn(ctx, tx, req.ExtensionID, index)
-	if validationErr != nil {
-		return PluginKVItem{}, validationErr
+	if err = advanceRevisionPlan(tx, revisionPlan, revisionStates, now); err != nil {
+		return PluginKVItem{}, err
 	}
-	if usage+int64(len(req.Value)) > MaxPluginBytes {
-		return PluginKVItem{}, ErrOversizeInput
-	}
-	version, validationErr := nextVersion(current)
-	if validationErr != nil {
-		return PluginKVItem{}, validationErr
-	}
-	root, validationErr := s.admittedCurrentRoot(ctx, tx)
-	if validationErr != nil {
-		return PluginKVItem{}, validationErr
-	}
-	keyCipher, keyNonce, keyID, validationErr := a6SealWithRoot(root, "plugin-kv-key/v1", string(index), req.ExtensionID, version, []byte(req.Key))
-	if validationErr != nil {
-		return PluginKVItem{}, validationErr
-	}
-	valueCipher, valueNonce, valueKeyID, validationErr := a6SealWithRoot(root, "plugin-kv-value/v1", string(index), req.ExtensionID, version, req.Value)
-	if validationErr != nil || valueKeyID != keyID {
-		return PluginKVItem{}, ErrEncryptionUnavailable
-	}
-	row := pluginKVRow{ExtensionID: req.ExtensionID, KeyHMAC: index, EncryptedKey: keyCipher, KeyNonce: keyNonce, EncryptedValue: valueCipher, ValueNonce: valueNonce, ValueSize: int64(len(req.Value)), RowVersion: version, EncryptionKeyID: keyID, CreatedAt: now, UpdatedAt: now}
-	if current > 0 {
-		q = tx.Model(&pluginKVRow{}).Where("extension_id = ? AND key_hmac = ? AND row_version = ?", req.ExtensionID, index, current).Updates(map[string]any{"encrypted_key": keyCipher, "key_nonce": keyNonce, "encrypted_value": valueCipher, "value_nonce": valueNonce, "value_size": len(req.Value), "row_version": version, "encryption_key_id": keyID, "updated_at": now})
-		if q.Error != nil {
-			return PluginKVItem{}, ErrParticipantFailure
-		}
-		if q.RowsAffected != 1 {
-			return PluginKVItem{}, ErrParticipantConflict
-		}
-	} else if err := tx.Create(&row).Error; err != nil {
+	if err = tx.Commit().Error; err != nil {
 		return PluginKVItem{}, ErrParticipantFailure
 	}
-	if err := tx.Commit().Error; err != nil {
-		return PluginKVItem{}, ErrParticipantFailure
-	}
-	return PluginKVItem{ExtensionID: req.ExtensionID, Key: req.Key, Value: append([]byte(nil), req.Value...), Version: version}, nil
+	return PluginKVItem{ExtensionID: req.ExtensionID, Key: req.Key, Value: bytes.Clone(req.Value), Version: version}, nil
 }
 
-func (s *GORMStore) decodePluginKVRow(ctx context.Context, db *gorm.DB, row pluginKVRow) (PluginKVItem, error) {
-	if row.ValueSize < 0 || row.ValueSize > MaxPluginValueBytes {
-		return PluginKVItem{}, &OversizeError{Bound: "plugin value bytes", Limit: MaxPluginValueBytes, Actual: int(row.ValueSize)}
+func (s *GORMStore) decodePluginKVRow(_ context.Context, _ *gorm.DB, row pluginKVRow) (PluginKVItem, error) {
+	if len(row.Key) > MaxPluginKeyBytes || len(row.Value) > MaxPluginValueBytes {
+		return PluginKVItem{}, ErrOversizeInput
 	}
-	if len(row.EncryptedKey) > MaxPluginKeyBytes+16 {
-		return PluginKVItem{}, &OversizeError{Bound: "encrypted plugin key bytes", Limit: MaxPluginKeyBytes + 16, Actual: len(row.EncryptedKey)}
-	}
-	if len(row.EncryptedValue) > MaxPluginValueBytes+16 {
-		return PluginKVItem{}, &OversizeError{Bound: "encrypted plugin value bytes", Limit: MaxPluginValueBytes + 16, Actual: len(row.EncryptedValue)}
-	}
-	if err := s.validateA6KeyID(ctx, db, row.EncryptionKeyID); err != nil {
-		return PluginKVItem{}, err
-	}
-	if len(row.KeyNonce) != 12 || len(row.ValueNonce) != 12 {
-		return PluginKVItem{}, ErrInvalidMetadata
-	}
-	key, err := a6Open(ctx, s.keySource, "plugin-kv-key/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedKey, row.KeyNonce)
-	if err != nil {
-		return PluginKVItem{}, ErrAuthenticationFailed
-	}
-	value, err := a6Open(ctx, s.keySource, "plugin-kv-value/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedValue, row.ValueNonce)
-	if err != nil {
-		return PluginKVItem{}, ErrAuthenticationFailed
-	}
-	if len(row.ExtensionID) == 0 || len(row.ExtensionID) > MaxPluginExtensionBytes || len(key) > MaxPluginKeyBytes || len(value) > MaxPluginValueBytes || int64(len(value)) != row.ValueSize {
-		return PluginKVItem{}, ErrInvalidMetadata
-	}
-	if err := s.validatePluginKeyIndex(ctx, row.ExtensionID, row.KeyHMAC, key); err != nil {
-		return PluginKVItem{}, err
-	}
-	return PluginKVItem{ExtensionID: row.ExtensionID, Key: string(key), Value: value, Version: row.RowVersion}, nil
+	return PluginKVItem{ExtensionID: row.ExtensionID, Key: row.Key, Value: bytes.Clone(row.Value), Version: row.RowVersion}, nil
 }
 
 func (s *GORMStore) GetPluginKV(ctx context.Context, extension, key string) (PluginKVItem, error) {
 	if err := s.requireReady(ctx); err != nil {
 		return PluginKVItem{}, err
 	}
-	if extension == "" {
-		return PluginKVItem{}, ErrPluginKVNotFound
-	}
 	if len(extension) > MaxPluginExtensionBytes || len(key) > MaxPluginKeyBytes {
 		return PluginKVItem{}, ErrOversizeInput
 	}
-	tx := s.db.GORM().WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return PluginKVItem{}, ErrParticipantFailure
-	}
-	defer tx.Rollback()
-	if err := s.lockMutationPublication(ctx, tx); err != nil {
-		return PluginKVItem{}, err
-	}
-	index, err := a6HMAC(ctx, s.keySource, "plugin-key-index/v1", extension, key)
-	if err != nil {
-		return PluginKVItem{}, err
-	}
 	var row pluginKVRow
-	queryErr := locked(tx).Where("extension_id = ? AND key_hmac = ?", extension, index).First(&row).Error
-	if errors.Is(queryErr, gorm.ErrRecordNotFound) {
+	err := pluginQuery(s.db.GORM().WithContext(ctx), extension, key).First(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return PluginKVItem{}, ErrPluginKVNotFound
 	}
-	if queryErr != nil {
+	if err != nil {
 		return PluginKVItem{}, ErrParticipantFailure
 	}
-	item, err := s.decodePluginKVRow(ctx, tx, row)
-	if err != nil {
-		return PluginKVItem{}, err
-	}
-	if item.Key != key {
-		return PluginKVItem{}, ErrAuthenticationFailed
-	}
-	return item, nil
+	return s.decodePluginKVRow(ctx, s.db.ReadGORM(), row)
 }
 
 func (s *GORMStore) DeletePluginKV(ctx context.Context, extension, key string, expected uint64) error {
@@ -2063,12 +530,18 @@ func (s *GORMStore) DeletePluginKV(ctx context.Context, extension, key string, e
 		return err
 	}
 	if extension == "" {
-		return ErrPluginKVNotFound
+		return ErrInvalidMetadata
 	}
 	if len(extension) > MaxPluginExtensionBytes || len(key) > MaxPluginKeyBytes {
 		return ErrOversizeInput
 	}
-	index, err := a6HMAC(ctx, s.keySource, "plugin-key-index/v1", extension, key)
+	if _, err := pluginNamespaceKey(extension); err != nil {
+		return err
+	}
+	if err := s.ensurePluginRevisionHeads(ctx, extension, key); err != nil {
+		return err
+	}
+	revisionPlan, err := s.prepareRevisionPlan(ctx, UnitOfWork{PluginKVUpdates: []PluginKVUpdate{{ExtensionID: extension, Key: key, Deleted: true}}})
 	if err != nil {
 		return err
 	}
@@ -2077,87 +550,46 @@ func (s *GORMStore) DeletePluginKV(ctx context.Context, extension, key string, e
 		return ErrParticipantFailure
 	}
 	defer tx.Rollback()
-	if err := s.lockMutationPublication(ctx, tx); err != nil {
+	if err = lockPluginQuota(tx); err != nil {
+		return err
+	}
+	if err = s.lockParticipantPublication(ctx, tx); err != nil {
+		return err
+	}
+	revisionStates, err := lockRevisionPlan(tx, revisionPlan)
+	if err != nil {
 		return err
 	}
 	var row pluginKVRow
-	if err := locked(tx).Where("extension_id = ? AND key_hmac = ?", extension, index).First(&row).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			if expected > 0 {
-				return ErrParticipantConflict
-			}
-			return ErrPluginKVNotFound
-		}
+	err = pluginQuery(locked(tx), extension, key).First(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return ErrPluginKVNotFound
+	}
+	if err != nil {
 		return ErrParticipantFailure
 	}
 	if expected > 0 && expected != row.RowVersion {
 		return ErrParticipantConflict
 	}
-	if _, err := s.decodePluginKVRow(ctx, tx, row); err != nil {
-		return err
-	}
-	q := tx.Where("extension_id = ? AND key_hmac = ? AND row_version = ?", extension, index, row.RowVersion).Delete(&pluginKVRow{})
-	if q.Error != nil {
-		return ErrParticipantFailure
-	}
-	if q.RowsAffected != 1 {
+	q := pluginQuery(tx, extension, key).Where("row_version = ?", row.RowVersion).Delete(&pluginKVRow{})
+	if q.Error != nil || q.RowsAffected != 1 {
 		return ErrParticipantConflict
 	}
-	if err := tx.Commit().Error; err != nil {
+	if err = advanceRevisionPlan(tx, revisionPlan, revisionStates, s.task5Now()); err != nil {
+		return err
+	}
+	if err = tx.Commit().Error; err != nil {
 		return ErrParticipantFailure
 	}
 	return nil
 }
 
 func (s *GORMStore) ListPluginKV(ctx context.Context, req PluginKVListRequest) ([]PluginKVItem, error) {
-	if err := s.requireReady(ctx); err != nil {
+	snapshot, err := s.ListPluginKVSnapshot(ctx, req)
+	if err != nil {
 		return nil, err
 	}
-	if req.ExtensionID == "" {
-		return nil, ErrParticipantFailure
-	}
-	if len(req.ExtensionID) > MaxPluginExtensionBytes || len(req.Prefix) > MaxPluginKeyBytes {
-		return nil, ErrOversizeInput
-	}
-	limit := req.Limit
-	if limit <= 0 || limit > MaxPluginResults {
-		limit = MaxPluginResults
-	}
-	tx := s.db.GORM().WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return nil, ErrParticipantFailure
-	}
-	defer tx.Rollback()
-	if err := s.lockMutationPublication(ctx, tx); err != nil {
-		return nil, err
-	}
-	var rows []pluginKVRow
-	if err := locked(tx).Where("extension_id = ?", req.ExtensionID).Order("key_hmac ASC").Limit(MaxPluginScan + 1).Find(&rows).Error; err != nil {
-		return nil, ErrParticipantFailure
-	}
-	if len(rows) > MaxPluginScan {
-		return nil, ErrOversizeInput
-	}
-	out := make([]PluginKVItem, 0, minInt(limit, len(rows)))
-	responseBytes := 0
-	for _, row := range rows {
-		item, err := s.decodePluginKVRow(ctx, tx, row)
-		if err != nil {
-			return nil, err
-		}
-		if req.Prefix != "" && !strings.HasPrefix(item.Key, req.Prefix) {
-			continue
-		}
-		responseBytes += len(item.Key) + len(item.Value)
-		if responseBytes > MaxPluginResponseBytes {
-			return nil, ErrOversizeInput
-		}
-		out = append(out, item)
-		if len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
+	return snapshot.Items, nil
 }
 
 func minInt(a, b int) int {
@@ -2167,491 +599,7 @@ func minInt(a, b int) int {
 	return b
 }
 
-const rotationPageSize = 256
-
-func (s *GORMStore) RotateEncryptionRoots(ctx context.Context) (EncryptionRotationResult, error) {
-	if err := s.requireReady(ctx); err != nil {
-		return EncryptionRotationResult{}, err
-	}
-	if err := s.ValidateReadiness(ctx); err != nil {
-		return EncryptionRotationResult{}, err
-	}
-	root, err := keySourceCurrent(ctx, s.keySource)
-	if err != nil {
-		return EncryptionRotationResult{}, err
-	}
-	result := EncryptionRotationResult{CurrentRootID: root.ID}
-	updated, skipped, err := s.rotateSecretRows(ctx, root)
-	if err != nil {
-		return EncryptionRotationResult{}, err
-	}
-	result.Updated, result.Skipped = updated, skipped
-	updated, skipped, err = s.rotateA6PayloadTables(ctx, root)
-	if err != nil {
-		return EncryptionRotationResult{}, err
-	}
-	result.Updated += updated
-	result.Skipped += skipped
-	if err := s.refreshReadinessRoots(ctx, root.ID); err != nil {
-		return EncryptionRotationResult{}, err
-	}
-	return result, nil
-}
-
-func (s *GORMStore) rotateSecretRows(ctx context.Context, root EncryptionRoot) (updated, skipped int, err error) {
-	tx := s.db.GORM().WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return 0, 0, ErrParticipantFailure
-	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback().Error
-		}
-	}()
-	if err = s.lockRotationPublication(ctx, tx, root.ID); err != nil {
-		return updated, skipped, err
-	}
-	var cursorRef string
-	var cursorVersion uint64
-	for {
-		var rows []adapterSecretRow
-		q := tx.Order("secret_ref ASC, secret_version ASC").Limit(rotationPageSize)
-		if cursorRef != "" {
-			q = q.Where("(secret_ref > ?) OR (secret_ref = ? AND secret_version > ?)", cursorRef, cursorRef, cursorVersion)
-		}
-		if err = q.Find(&rows).Error; err != nil {
-			return updated, skipped, err
-		}
-		if len(rows) == 0 {
-			break
-		}
-		for _, row := range rows {
-			if row.EncryptionKeyID == root.ID {
-				continue
-			}
-			if len(row.Ciphertext) > MaxSecretBytes+16 {
-				err = &OversizeError{Bound: "encrypted secret bytes", Limit: MaxSecretBytes + 16, Actual: len(row.Ciphertext)}
-				return updated, skipped, err
-			}
-			if len(row.Nonce) != 12 {
-				err = ErrInvalidMetadata
-				return updated, skipped, err
-			}
-			plain, openErr := a6Open(ctx, s.keySource, "adapter-secret/v1", row.SecretRef, row.EndpointID+"/"+row.AdapterID, row.SecretVersion, row.EncryptionKeyID, row.Ciphertext, row.Nonce)
-			if openErr != nil {
-				err = openErr
-				return updated, skipped, err
-			}
-			if len(plain) > MaxSecretBytes {
-				err = &OversizeError{Bound: "secret bytes", Limit: MaxSecretBytes, Actual: len(plain)}
-				return updated, skipped, err
-			}
-			ciphertext, nonce, keyID, sealErr := a6SealWithRoot(root, "adapter-secret/v1", row.SecretRef, row.EndpointID+"/"+row.AdapterID, row.SecretVersion, plain)
-			if sealErr != nil {
-				err = sealErr
-				return updated, skipped, err
-			}
-			q = tx.Model(&adapterSecretRow{}).Where("secret_ref = ? AND secret_version = ? AND row_version = ? AND encryption_key_id = ?", row.SecretRef, row.SecretVersion, row.RowVersion, row.EncryptionKeyID).Updates(map[string]any{"ciphertext": ciphertext, "nonce": nonce, "encryption_key_id": keyID, "updated_at": s.task5Now()})
-			if q.Error != nil {
-				err = ErrParticipantFailure
-				return updated, skipped, err
-			}
-			if q.RowsAffected == 1 {
-				updated++
-			} else {
-				skipped++
-			}
-		}
-		last := rows[len(rows)-1]
-		cursorRef, cursorVersion = last.SecretRef, last.SecretVersion
-		if len(rows) < rotationPageSize {
-			break
-		}
-	}
-	if err = tx.Commit().Error; err != nil {
-		err = ErrParticipantFailure
-	}
-	return updated, skipped, err
-}
-func (s *GORMStore) refreshReadinessRoots(ctx context.Context, currentID string) error {
-	tx := s.db.GORM().WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return ErrParticipantFailure
-	}
-	defer tx.Rollback()
-	if err := s.lockRotationPublication(ctx, tx, currentID); err != nil {
-		return err
-	}
-	refs, err := readinessRootReferences(ctx, tx)
-	if err != nil {
-		return ErrParticipantFailure
-	}
-	if strings.TrimSpace(currentID) == "" {
-		return ErrReadinessInvalid
-	}
-	refs[currentID] = struct{}{}
-	ids := make([]string, 0, len(refs))
-	for id := range refs {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	data, err := json.Marshal(ids)
-	if err != nil {
-		return ErrReadinessInvalid
-	}
-	if err := tx.Model(&storeReadinessRow{}).Where("singleton_id = ?", "default").Update("encryption_root_ids", data).Error; err != nil {
-		return ErrParticipantFailure
-	}
-	if err := tx.Commit().Error; err != nil {
-		return ErrParticipantFailure
-	}
-	return nil
-}
-
-func (s *GORMStore) rotateA6PayloadTables(ctx context.Context, root EncryptionRoot) (updated, skipped int, err error) {
-	base := s.db.GORM().WithContext(ctx).Begin()
-	if base.Error != nil {
-		return 0, 0, ErrParticipantFailure
-	}
-	defer func() {
-		if err != nil {
-			_ = base.Rollback().Error
-		}
-	}()
-	if err = s.lockRotationPublication(ctx, base, root.ID); err != nil {
-		return updated, skipped, err
-	}
-	var operationCursor string
-	for {
-		var rows []operationRow
-		q := base.Where("private_context IS NOT NULL AND length(private_context) > 0")
-		if operationCursor != "" {
-			q = q.Where("operation_id > ?", operationCursor)
-		}
-		if err = q.Order("operation_id ASC").Limit(rotationPageSize).Find(&rows).Error; err != nil {
-			return updated, skipped, err
-		}
-		if len(rows) == 0 {
-			break
-		}
-		for _, row := range rows {
-			if row.PrivateKeyID == root.ID {
-				continue
-			}
-			if len(row.PrivateContext) > MaxUnitOfWorkBytes+16 {
-				err = &OversizeError{Bound: "encrypted operation private bytes", Limit: MaxUnitOfWorkBytes + 16, Actual: len(row.PrivateContext)}
-				return updated, skipped, err
-			}
-			if len(row.PrivateNonce) != 12 {
-				err = ErrInvalidMetadata
-				return updated, skipped, err
-			}
-			plain, openErr := a6Open(ctx, s.keySource, "operation-private/v1", row.OperationID, row.PrincipalID, task5PayloadVersion(row.PrivatePayloadVersion), row.PrivateKeyID, row.PrivateContext, row.PrivateNonce)
-			if openErr != nil {
-				err = openErr
-				return updated, skipped, err
-			}
-			if len(plain) > MaxUnitOfWorkBytes {
-				err = &OversizeError{Bound: "operation private bytes", Limit: MaxUnitOfWorkBytes, Actual: len(plain)}
-				return updated, skipped, err
-			}
-			ciphertext, nonce, keyID, sealErr := a6SealWithRoot(root, "operation-private/v1", row.OperationID, row.PrincipalID, task5PayloadVersion(row.PrivatePayloadVersion), plain)
-			if sealErr != nil {
-				err = sealErr
-				return updated, skipped, err
-			}
-			q = base.Model(&operationRow{}).Where("operation_id = ? AND version = ? AND private_key_id = ?", row.OperationID, row.Version, row.PrivateKeyID).Updates(map[string]any{"private_context": ciphertext, "private_nonce": nonce, "private_key_id": keyID, "updated_at": s.task5Now()})
-			if q.Error != nil {
-				err = ErrParticipantFailure
-				return updated, skipped, err
-			}
-			if q.RowsAffected == 1 {
-				updated++
-			} else {
-				skipped++
-			}
-		}
-		operationCursor = rows[len(rows)-1].OperationID
-		if len(rows) < rotationPageSize {
-			break
-		}
-	}
-	var artifactCursor string
-	for {
-		var rows []operationArtifactRow
-		q := base.Where("ciphertext IS NOT NULL AND length(ciphertext) > 0")
-		if artifactCursor != "" {
-			q = q.Where("artifact_id > ?", artifactCursor)
-		}
-		if err = q.Order("artifact_id ASC").Limit(rotationPageSize).Find(&rows).Error; err != nil {
-			return updated, skipped, err
-		}
-		if len(rows) == 0 {
-			break
-		}
-		for _, row := range rows {
-			if row.EncryptionKeyID == root.ID {
-				continue
-			}
-			if row.Size < 0 || row.Size > MaxArtifactBytes {
-				err = &OversizeError{Bound: "artifact bytes", Limit: MaxArtifactBytes, Actual: int(row.Size)}
-				return updated, skipped, err
-			}
-			if len(row.Ciphertext) > MaxArtifactBytes+16 {
-				err = &OversizeError{Bound: "encrypted artifact bytes", Limit: MaxArtifactBytes + 16, Actual: len(row.Ciphertext)}
-				return updated, skipped, err
-			}
-			if len(row.Nonce) != 12 {
-				err = ErrInvalidMetadata
-				return updated, skipped, err
-			}
-			plain, openErr := a6Open(ctx, s.keySource, "artifact/v1", row.ArtifactID, row.OwnerPrincipalID, task5PayloadVersion(row.PayloadVersion), row.EncryptionKeyID, row.Ciphertext, row.Nonce)
-			if openErr != nil {
-				err = openErr
-				return updated, skipped, err
-			}
-			if len(plain) > MaxArtifactBytes || int64(len(plain)) != row.Size {
-				err = ErrInvalidMetadata
-				return updated, skipped, err
-			}
-			ciphertext, nonce, keyID, sealErr := a6SealWithRoot(root, "artifact/v1", row.ArtifactID, row.OwnerPrincipalID, task5PayloadVersion(row.PayloadVersion), plain)
-			if sealErr != nil {
-				err = sealErr
-				return updated, skipped, err
-			}
-			q = base.Model(&operationArtifactRow{}).Where("artifact_id = ? AND version = ? AND encryption_key_id = ?", row.ArtifactID, row.Version, row.EncryptionKeyID).Updates(map[string]any{"ciphertext": ciphertext, "nonce": nonce, "encryption_key_id": keyID})
-			if q.Error != nil {
-				err = ErrParticipantFailure
-				return updated, skipped, err
-			}
-			if q.RowsAffected == 1 {
-				updated++
-			} else {
-				skipped++
-			}
-		}
-		artifactCursor = rows[len(rows)-1].ArtifactID
-		if len(rows) < rotationPageSize {
-			break
-		}
-	}
-	var inboxCursor string
-	for {
-		var rows []inboxMessageRow
-		q := base.Where("payload_ciphertext IS NOT NULL AND length(payload_ciphertext) > 0")
-		if inboxCursor != "" {
-			q = q.Where("inbox_id > ?", inboxCursor)
-		}
-		if err = q.Order("inbox_id ASC").Limit(rotationPageSize).Find(&rows).Error; err != nil {
-			return updated, skipped, err
-		}
-		if len(rows) == 0 {
-			break
-		}
-		for _, row := range rows {
-			if row.EncryptionKeyID == root.ID {
-				continue
-			}
-			if len(row.PayloadCiphertext) > task5PayloadLimit {
-				err = &OversizeError{Bound: "encrypted payload", Limit: task5PayloadLimit, Actual: len(row.PayloadCiphertext)}
-				return updated, skipped, err
-			}
-			if len(row.PayloadNonce) != 12 {
-				err = ErrInvalidMetadata
-				return updated, skipped, err
-			}
-			plain, openErr := a6Open(ctx, s.keySource, "inbox/v1", row.InboxID, row.EndpointID, task5PayloadVersion(row.PayloadVersion), row.EncryptionKeyID, row.PayloadCiphertext, row.PayloadNonce)
-			if openErr != nil {
-				err = openErr
-				return updated, skipped, err
-			}
-			if len(plain) > task5PayloadLimit {
-				err = &OversizeError{Bound: "payload", Limit: task5PayloadLimit, Actual: len(plain)}
-				return updated, skipped, err
-			}
-			ciphertext, nonce, keyID, sealErr := a6SealWithRoot(root, "inbox/v1", row.InboxID, row.EndpointID, task5PayloadVersion(row.PayloadVersion), plain)
-			if sealErr != nil {
-				err = sealErr
-				return updated, skipped, err
-			}
-			q = base.Model(&inboxMessageRow{}).Where("inbox_id = ? AND version = ? AND encryption_key_id = ?", row.InboxID, row.Version, row.EncryptionKeyID).Updates(map[string]any{"payload_ciphertext": ciphertext, "payload_nonce": nonce, "encryption_key_id": keyID})
-			if q.Error != nil {
-				err = ErrParticipantFailure
-				return updated, skipped, err
-			}
-			if q.RowsAffected == 1 {
-				updated++
-			} else {
-				skipped++
-			}
-		}
-		inboxCursor = rows[len(rows)-1].InboxID
-		if len(rows) < rotationPageSize {
-			break
-		}
-	}
-	var effectCursor string
-	for {
-		var rows []outboxEffectRow
-		q := base.Where("payload_ciphertext IS NOT NULL AND length(payload_ciphertext) > 0")
-		if effectCursor != "" {
-			q = q.Where("effect_id > ?", effectCursor)
-		}
-		if err = q.Order("effect_id ASC").Limit(rotationPageSize).Find(&rows).Error; err != nil {
-			return updated, skipped, err
-		}
-		if len(rows) == 0 {
-			break
-		}
-		for _, row := range rows {
-			if row.EncryptionKeyID == root.ID {
-				continue
-			}
-			if len(row.PayloadCiphertext) > task5PayloadLimit {
-				err = &OversizeError{Bound: "encrypted payload", Limit: task5PayloadLimit, Actual: len(row.PayloadCiphertext)}
-				return updated, skipped, err
-			}
-			if len(row.PayloadNonce) != 12 {
-				err = ErrInvalidMetadata
-				return updated, skipped, err
-			}
-			plain, openErr := a6Open(ctx, s.keySource, "outbox/v1", row.EffectID, row.EndpointID, task5PayloadVersion(row.PayloadVersion), row.EncryptionKeyID, row.PayloadCiphertext, row.PayloadNonce)
-			if openErr != nil {
-				err = openErr
-				return updated, skipped, err
-			}
-			if len(plain) > task5PayloadLimit {
-				err = &OversizeError{Bound: "payload", Limit: task5PayloadLimit, Actual: len(plain)}
-				return updated, skipped, err
-			}
-			ciphertext, nonce, keyID, sealErr := a6SealWithRoot(root, "outbox/v1", row.EffectID, row.EndpointID, task5PayloadVersion(row.PayloadVersion), plain)
-			if sealErr != nil {
-				err = sealErr
-				return updated, skipped, err
-			}
-			q = base.Model(&outboxEffectRow{}).Where("effect_id = ? AND version = ? AND encryption_key_id = ?", row.EffectID, row.Version, row.EncryptionKeyID).Updates(map[string]any{"payload_ciphertext": ciphertext, "payload_nonce": nonce, "encryption_key_id": keyID})
-			if q.Error != nil {
-				err = ErrParticipantFailure
-				return updated, skipped, err
-			}
-			if q.RowsAffected == 1 {
-				updated++
-			} else {
-				skipped++
-			}
-		}
-		effectCursor = rows[len(rows)-1].EffectID
-		if len(rows) < rotationPageSize {
-			break
-		}
-	}
-	var extensionCursor string
-	var pluginCursor []byte
-	for {
-		var rows []pluginKVRow
-		q := base.Where("encrypted_key IS NOT NULL AND length(encrypted_key) > 0")
-		if extensionCursor != "" {
-			q = q.Where("(extension_id > ?) OR (extension_id = ? AND key_hmac > ?)", extensionCursor, extensionCursor, pluginCursor)
-		}
-		if err = q.Order("extension_id ASC, key_hmac ASC").Limit(rotationPageSize).Find(&rows).Error; err != nil {
-			return updated, skipped, err
-		}
-		if len(rows) == 0 {
-			break
-		}
-		for _, row := range rows {
-			if row.EncryptionKeyID == root.ID {
-				continue
-			}
-			if row.ValueSize < 0 || row.ValueSize > MaxPluginValueBytes {
-				err = &OversizeError{Bound: "plugin value bytes", Limit: MaxPluginValueBytes, Actual: int(row.ValueSize)}
-				return updated, skipped, err
-			}
-			if len(row.EncryptedKey) > MaxPluginKeyBytes+16 {
-				err = &OversizeError{Bound: "encrypted plugin key bytes", Limit: MaxPluginKeyBytes + 16, Actual: len(row.EncryptedKey)}
-				return updated, skipped, err
-			}
-			if len(row.EncryptedValue) > MaxPluginValueBytes+16 {
-				err = &OversizeError{Bound: "encrypted plugin value bytes", Limit: MaxPluginValueBytes + 16, Actual: len(row.EncryptedValue)}
-				return updated, skipped, err
-			}
-			if len(row.KeyNonce) != 12 || len(row.ValueNonce) != 12 {
-				err = ErrInvalidMetadata
-				return updated, skipped, err
-			}
-			key, openErr := a6Open(ctx, s.keySource, "plugin-kv-key/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedKey, row.KeyNonce)
-			if openErr != nil {
-				err = openErr
-				return updated, skipped, err
-			}
-			if len(key) > MaxPluginKeyBytes {
-				err = ErrInvalidMetadata
-				return updated, skipped, err
-			}
-			if openErr = s.validatePluginKeyIndex(ctx, row.ExtensionID, row.KeyHMAC, key); openErr != nil {
-				err = openErr
-				return updated, skipped, err
-			}
-			value, openErr := a6Open(ctx, s.keySource, "plugin-kv-value/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedValue, row.ValueNonce)
-			if openErr != nil {
-				err = openErr
-				return updated, skipped, err
-			}
-			if len(value) > MaxPluginValueBytes || int64(len(value)) != row.ValueSize {
-				err = ErrInvalidMetadata
-				return updated, skipped, err
-			}
-			keyCipher, keyNonce, keyID, sealErr := a6SealWithRoot(root, "plugin-kv-key/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, key)
-			if sealErr != nil {
-				err = sealErr
-				return updated, skipped, err
-			}
-			valueCipher, valueNonce, valueKeyID, sealErr := a6SealWithRoot(root, "plugin-kv-value/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, value)
-			if sealErr != nil || valueKeyID != keyID {
-				err = ErrEncryptionUnavailable
-				return updated, skipped, err
-			}
-			q = base.Model(&pluginKVRow{}).Where("extension_id = ? AND key_hmac = ? AND row_version = ? AND encryption_key_id = ?", row.ExtensionID, row.KeyHMAC, row.RowVersion, row.EncryptionKeyID).Updates(map[string]any{"encrypted_key": keyCipher, "key_nonce": keyNonce, "encrypted_value": valueCipher, "value_nonce": valueNonce, "encryption_key_id": keyID, "updated_at": s.task5Now()})
-			if q.Error != nil {
-				err = ErrParticipantFailure
-				return updated, skipped, err
-			}
-			if q.RowsAffected == 1 {
-				updated++
-			} else {
-				skipped++
-			}
-		}
-		last := rows[len(rows)-1]
-		extensionCursor, pluginCursor = last.ExtensionID, append(pluginCursor[:0], last.KeyHMAC...)
-		if len(rows) < rotationPageSize {
-			break
-		}
-	}
-	if err = base.Commit().Error; err != nil {
-		err = ErrParticipantFailure
-	}
-	return updated, skipped, err
-}
-
-func (s *GORMStore) ValidateA6(ctx context.Context) error {
-	if err := s.requireReady(ctx); err != nil {
-		return err
-	}
-	if s.keySource == nil {
-		return ErrKeySourceUnavailable
-	}
-	if _, _, err := keySourceIndex(ctx, s.keySource); err != nil {
-		return err
-	}
-	if _, err := keySourceCurrent(ctx, s.keySource); err != nil {
-		return err
-	}
-	return nil
-}
-
 var _ SecretRepository = (*GORMStore)(nil)
 var _ SecretOwnerResolver = (*GORMStore)(nil)
 var _ PluginKVRepository = (*GORMStore)(nil)
 var _ ReadinessRepository = (*GORMStore)(nil)
-var _ EncryptionRotator = (*GORMStore)(nil)

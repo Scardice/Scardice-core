@@ -158,13 +158,14 @@ func socketSendBinary(socket *gowebsocket.Socket, data []byte) { //nolint
 }
 
 func doSleepQQ(ctx *MsgContext) {
-	if ctx.Dice != nil {
-		d := ctx.Dice
-		offset := d.Config.MessageDelayRangeEnd - d.Config.MessageDelayRangeStart
-		time.Sleep(time.Duration((d.Config.MessageDelayRangeStart + DiceRandFloat64()*offset) * float64(time.Second)))
-	} else {
-		time.Sleep(time.Duration((0.4 + DiceRandFloat64()/2) * float64(time.Second)))
+	if ctx != nil && ctx.Dice != nil {
+		if config := ctx.Dice.Config(); config != nil {
+			offset := config.MessageDelayRangeEnd - config.MessageDelayRangeStart
+			time.Sleep(time.Duration((config.MessageDelayRangeStart + DiceRandFloat64()*offset) * float64(time.Second)))
+			return
+		}
 	}
+	time.Sleep(time.Duration((0.4 + DiceRandFloat64()/2) * float64(time.Second)))
 }
 
 func (pa *PlatformAdapterGocq) SendToPerson(ctx *MsgContext, userID string, text string, flag string) {
@@ -174,18 +175,17 @@ func (pa *PlatformAdapterGocq) SendToPerson(ctx *MsgContext, userID string, text
 		return
 	}
 
-	for _, i := range ctx.Dice.ExtList {
-		if i.HasOnMessageSend() {
-			i.CallOnMessageSend(ctx.Dice, ctx, &Message{
-				Message:     text,
-				MessageType: "private",
-				Platform:    pa.EndPoint.Platform,
-				Sender: SenderBase{
-					Nickname: pa.EndPoint.Nickname,
-					UserID:   pa.EndPoint.UserID,
-				},
-			}, flag)
-		}
+	if err := notifyDirectMessageSend(ctx, &Message{
+		Message:     text,
+		MessageType: "private",
+		Platform:    pa.EndPoint.Platform,
+		Sender: SenderBase{
+			Nickname: pa.EndPoint.Nickname,
+			UserID:   pa.EndPoint.UserID,
+		},
+	}, flag); err != nil {
+		ctx.setExecutionError(err)
+		return
 	}
 
 	type GroupMessageParams struct {
@@ -242,7 +242,10 @@ func (pa *PlatformAdapterGocq) FriendPoke(userId string) {
 }
 
 func (pa *PlatformAdapterGocq) GroupPoke(ctx *MsgContext, userId string) {
-	groupId := strings.ReplaceAll(ctx.Group.GroupID, "QQ-Group:", "")
+	if ctx == nil || ctx.Group == nil {
+		return
+	}
+	groupId := strings.ReplaceAll(ctx.Group.GroupID(), "QQ-Group:", "")
 	groupID, _ := strconv.ParseInt(groupId, 10, 64)
 	userID, _ := strconv.ParseInt(userId, 10, 64)
 
@@ -267,20 +270,19 @@ func (pa *PlatformAdapterGocq) SendToGroup(ctx *MsgContext, groupID string, text
 		return
 	}
 
-	if groupInfo, ok := ctx.Session.ServiceAtNew.Load(groupID); ok {
-		msgToSend := &Message{
-			Message:     text,
-			MessageType: "group",
-			Platform:    pa.EndPoint.Platform,
-			GroupID:     groupID,
-			Sender: SenderBase{
-				Nickname: pa.EndPoint.Nickname,
-				UserID:   pa.EndPoint.UserID,
-			},
-		}
-		for _, wrapper := range groupInfo.GetActivatedExtList(ctx.Dice) {
-			wrapper.CallOnMessageSend(ctx.Dice, ctx, msgToSend, flag)
-		}
+	msgToSend := &Message{
+		Message:     text,
+		MessageType: "group",
+		Platform:    pa.EndPoint.Platform,
+		GroupID:     groupID,
+		Sender: SenderBase{
+			Nickname: pa.EndPoint.Nickname,
+			UserID:   pa.EndPoint.UserID,
+		},
+	}
+	if err := notifyDirectMessageSend(ctx, msgToSend, flag); err != nil {
+		ctx.setExecutionError(err)
+		return
 	}
 
 	type GroupMessageParams struct {
@@ -390,21 +392,20 @@ func (pa *PlatformAdapterGocq) SendGroupForwardMsg(ctx *MsgContext, groupID stri
 	}
 
 	sendText := forwardNodesToText(nodes)
-	if ctx != nil && ctx.Session != nil {
-		if groupInfo, ok := ctx.Session.ServiceAtNew.Load(groupID); ok {
-			msgToSend := &Message{
-				Message:     sendText,
-				MessageType: "group",
-				Platform:    pa.EndPoint.Platform,
-				GroupID:     groupID,
-				Sender: SenderBase{
-					Nickname: pa.EndPoint.Nickname,
-					UserID:   pa.EndPoint.UserID,
-				},
-			}
-			for _, wrapper := range groupInfo.GetActivatedExtList(ctx.Dice) {
-				wrapper.CallOnMessageSend(ctx.Dice, ctx, msgToSend, "")
-			}
+	if ctx != nil {
+		msgToSend := &Message{
+			Message:     sendText,
+			MessageType: "group",
+			Platform:    pa.EndPoint.Platform,
+			GroupID:     groupID,
+			Sender: SenderBase{
+				Nickname: pa.EndPoint.Nickname,
+				UserID:   pa.EndPoint.UserID,
+			},
+		}
+		if err := notifyDirectMessageSend(ctx, msgToSend, ""); err != nil {
+			ctx.setExecutionError(err)
+			return false
 		}
 	}
 
@@ -441,19 +442,18 @@ func (pa *PlatformAdapterGocq) SendPrivateForwardMsg(ctx *MsgContext, userID str
 	}
 
 	sendText := forwardNodesToText(nodes)
-	if ctx != nil && ctx.Dice != nil {
-		for _, i := range ctx.Dice.ExtList {
-			if i.HasOnMessageSend() {
-				i.CallOnMessageSend(ctx.Dice, ctx, &Message{
-					Message:     sendText,
-					MessageType: "private",
-					Platform:    pa.EndPoint.Platform,
-					Sender: SenderBase{
-						Nickname: pa.EndPoint.Nickname,
-						UserID:   pa.EndPoint.UserID,
-					},
-				}, "")
-			}
+	if ctx != nil {
+		if err := notifyDirectMessageSend(ctx, &Message{
+			Message:     sendText,
+			MessageType: "private",
+			Platform:    pa.EndPoint.Platform,
+			Sender: SenderBase{
+				Nickname: pa.EndPoint.Nickname,
+				UserID:   pa.EndPoint.UserID,
+			},
+		}, ""); err != nil {
+			ctx.setExecutionError(err)
+			return false
 		}
 	}
 
@@ -677,15 +677,17 @@ func (pa *PlatformAdapterGocq) GetStrangerInfo(userID string) *OnebotUserInfo {
 }
 
 func (pa *PlatformAdapterGocq) SetGroupCardName(ctx *MsgContext, name string) {
-	groupIDRaw, idType := pa.mustExtractID(ctx.Group.GroupID)
+	if ctx == nil || ctx.Group == nil || ctx.Player == nil {
+		return
+	}
+	groupIDRaw, idType := pa.mustExtractID(ctx.Group.GroupID())
 	if idType != QQUidGroup {
 		return
 	}
-	userIDRaw, idType := pa.mustExtractID(ctx.Player.UserID)
+	userIDRaw, idType := pa.mustExtractID(ctx.Player.UserID())
 	if idType != QQUidPerson {
 		return
 	}
-
 	pa.SetGroupCardNameBase(groupIDRaw, userIDRaw, name)
 }
 

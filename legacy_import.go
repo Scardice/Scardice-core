@@ -11,6 +11,7 @@ import (
 
 	"Scardice-core/eventstore"
 	"Scardice-core/migrate/eventsourcing"
+	"Scardice-core/migrate/eventsourcing/v1reader"
 )
 
 // importPersistentState is the durable readiness state observed on the active
@@ -77,7 +78,7 @@ func legacySourceRoot(installationRoot string) (string, error) {
 }
 
 func importLegacyInstallation(ctx context.Context, config eventstore.DatabaseConfig, readiness eventstore.Readiness, persistentState importPersistentState, sourceRoot string, now time.Time) (eventsourcing.ImportResult, error) {
-	source, err := legacyImportSourceFromEnv(sourceRoot, os.Getenv, config.KeySource)
+	source, err := legacyImportSourceFromEnv(sourceRoot, os.Getenv)
 	if err != nil {
 		return eventsourcing.ImportResult{}, err
 	}
@@ -96,9 +97,19 @@ func importLegacyInstallation(ctx context.Context, config eventstore.DatabaseCon
 		Target:         target,
 		SnapshotRoot:   snapshotRoot,
 		TargetIdentity: targetIdentity,
+		DropRecordsDir: sourceRoot,
 		Now:            now.UTC,
 	}).Run(ctx, eventsourcing.Request{Mode: eventsourcing.ModeImport})
 	return finishLegacyImport(sourceRoot, result, runErr)
+}
+
+// legacyImportDropWarning is the single WARN of a run that dropped rows; it is
+// empty when nothing was dropped. The rows themselves are in the record file.
+func legacyImportDropWarning(result eventsourcing.ImportResult) string {
+	if result.Dropped == 0 {
+		return ""
+	}
+	return fmt.Sprintf("legacy import: dropped %d unimportable legacy rows (group_info/group_player_info/attrs/ban_info); records: %s", result.Dropped, result.DropRecordsPath)
 }
 
 func finishLegacyImport(sourceRoot string, result eventsourcing.ImportResult, runErr error) (eventsourcing.ImportResult, error) {
@@ -158,14 +169,14 @@ func removeLegacyArtifact(root, relative string) {
 	_ = os.RemoveAll(candidate)
 }
 
-func legacyImportSourceFromEnv(sourceRoot string, getenv func(string) string, keySource eventstore.KeySource) (eventsourcing.Source, error) {
+func legacyImportSourceFromEnv(sourceRoot string, getenv func(string) string) (eventsourcing.Source, error) {
 	if getenv == nil {
 		return nil, eventsourcing.ErrSourceRequired
 	}
 	databaseType := strings.ToLower(strings.TrimSpace(getenv("DB_TYPE")))
 	switch databaseType {
 	case "", "sqlite", "sqlite3":
-		return eventsourcing.NewLegacySourceWithKeySource(sourceRoot, keySource), nil
+		return eventsourcing.NewLegacySource(sourceRoot), nil
 	case "postgresql":
 		databaseType = "postgres"
 	case "mysql", "postgres":
@@ -191,7 +202,7 @@ func legacyImportSourceFromEnv(sourceRoot string, getenv func(string) string, ke
 	if err = eventstore.ValidateRemoteDatabaseConfig(config); err != nil {
 		return nil, err
 	}
-	return eventsourcing.NewRemoteSQLSourceWithKeySource(sourceRoot, config, keySource), nil
+	return eventsourcing.NewRemoteSQLSource(sourceRoot, config), nil
 }
 
 func legacyImportTargetFromEnv(active eventstore.DatabaseConfig, now time.Time, getenv func(string) string) (eventsourcing.Target, string, error) {
@@ -200,17 +211,24 @@ func legacyImportTargetFromEnv(active eventstore.DatabaseConfig, now time.Time, 
 		databaseType = "sqlite"
 	}
 	if databaseType == "sqlite" || databaseType == "sqlite3" {
-		activePath := strings.TrimSpace(active.DSN)
-		if activePath == "" || strings.HasPrefix(activePath, "file:") || strings.ContainsRune(activePath, '\x00') {
-			return nil, "", fmt.Errorf("legacy import requires a plain SQLite database path: %w", eventsourcing.ErrTargetRequired)
-		}
-		absolute, err := filepath.Abs(activePath)
-		if err != nil {
-			return nil, "", err
+		absolute, ok := plainSQLitePath(active)
+		if !ok {
+			return nil, "", fmt.Errorf("legacy import requires a local SQLite file: %w", eventsourcing.ErrTargetRequired)
 		}
 		stamp := now.UTC().Format("20060102T150405.000000000Z")
 		candidate := absolute + ".import-" + stamp
-		return eventsourcing.NewSQLitePublicationTarget(candidate, absolute, active.KeySource), active.DatabaseIdentity, nil
+		format, err := eventsourcing.DetectSQLiteFormat(context.Background(), absolute)
+		if err != nil {
+			return nil, "", err
+		}
+		if format == v1reader.FormatUnknown {
+			return nil, "", eventsourcing.ErrValidation
+		}
+		if format == v1reader.FormatV1Encrypted {
+			target, err := eventsourcing.NewSQLiteLegacyV1PublicationTarget(context.Background(), candidate, absolute, now)
+			return target, active.DatabaseIdentity, err
+		}
+		return eventsourcing.NewSQLitePublicationTarget(candidate, absolute), active.DatabaseIdentity, nil
 	}
 	if databaseType == "postgresql" {
 		databaseType = "postgres"

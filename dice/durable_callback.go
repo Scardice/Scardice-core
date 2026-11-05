@@ -4,14 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"sort"
 	"strings"
-	"sync"
 	"time"
 
-	ds "github.com/sealdice/dicescript"
-
 	"Scardice-core/adapterapi"
+	"Scardice-core/core/execution"
 	"Scardice-core/core/groupstate"
 	"Scardice-core/core/messageflow"
 	"Scardice-core/core/playerstate"
@@ -45,7 +42,13 @@ func (r *DurableCallbackScopeResolver) Resolve(_ context.Context, endpointID str
 	var groupID string
 	switch message.ConversationKind {
 	case adapterapi.ConversationKindDirect:
-		groupID = "PG-" + userID
+		// The account's own private message belongs to the conversation with its
+		// recipient; the sender stays the account.
+		peer := userID
+		if message.Kind == adapterapi.InboundKindSelfMessage && message.Conversation != "" {
+			peer = string(message.Conversation)
+		}
+		groupID = "PG-" + peer
 	case adapterapi.ConversationKindGroup:
 		groupID = string(message.Conversation)
 		if groupID == "" {
@@ -60,224 +63,146 @@ func (r *DurableCallbackScopeResolver) Resolve(_ context.Context, endpointID str
 	return messageflow.CallbackScope{DiceID: r.dice.BaseConfig.Name, GroupID: groupID, UserID: userID}, nil
 }
 
-// DurableCallbackHost serializes the complete snapshot→execution→commit cycle
-// across endpoint lanes; mu separately protects direct legacy cache access.
+// DurableCallbackHost executes against one invocation-owned DomainTx. Shared
+// runtime resources do not own or publish durable group/player state.
 type DurableCallbackHost struct {
-	dice      *Dice
-	mu        sync.Mutex
-	admission sync.Mutex
+	dice *Dice
 }
 
 func NewDurableCallbackHost(instance *Dice) *DurableCallbackHost {
 	return &DurableCallbackHost{dice: instance}
 }
 
-func (h *DurableCallbackHost) BeginCallback(ctx context.Context) (context.Context, func(), error) {
-	if err := ctx.Err(); err != nil {
-		return ctx, nil, err
-	}
-	if h.admission.TryLock() {
-		return ctx, h.admission.Unlock, nil
-	}
-	ticker := time.NewTicker(5 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx, nil, ctx.Err()
-		case <-ticker.C:
-			if h.admission.TryLock() {
-				return ctx, h.admission.Unlock, nil
-			}
-		}
-	}
-}
-
-// InvalidateGroup removes the legacy compatibility view while the privacy
-// service owns the subject fence. The mutex excludes an in-flight callback.
-func (h *DurableCallbackHost) InvalidateGroup(_ context.Context, groupID string) error {
+func (h *DurableCallbackHost) InvalidateGroup(ctx context.Context, groupID string) error {
 	if h == nil || h.dice == nil || h.dice.ImSession == nil || groupID == "" {
 		return messageflow.ErrCallbackUnavailable
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if manager := h.dice.AttrsManager; manager != nil {
-		manager.callbackGate.Lock()
-		defer manager.callbackGate.Unlock()
-		manager.DeleteCachedGroupData(groupID, true, true)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	h.dice.ImSession.ServiceAtNew.Delete(groupID)
+	h.dice.ImSession.InvalidateGroupRuntime(groupID)
 	return nil
 }
 
-func (h *DurableCallbackHost) HandleCallback(ctx context.Context, request messageflow.CallbackRequest, _ *playerstate.LocalOverlay, collector *messageflow.MutationCollector) (messageflow.CallbackResult, error) {
+func (h *DurableCallbackHost) HandleCallback(ctx context.Context, request messageflow.CallbackRequest, _ *playerstate.LocalOverlay, collector *execution.MutationCollector) (result messageflow.CallbackResult, err error) {
 	if h == nil || h.dice == nil || h.dice.ImSession == nil || collector == nil {
-		return messageflow.CallbackResult{}, messageflow.ErrCallbackUnavailable
+		return result, messageflow.ErrCallbackUnavailable
 	}
-	if err := ctx.Err(); err != nil {
-		return messageflow.CallbackResult{}, err
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	manager := h.dice.AttrsManager
-	gateLocked := false
-	if manager != nil {
-		manager.callbackGate.Lock()
-		gateLocked = true
-	}
-	defer func() {
-		if gateLocked {
-			manager.callbackGate.Unlock()
-		}
-	}()
-	if err := ctx.Err(); err != nil {
-		return messageflow.CallbackResult{}, err
+	if err = ctx.Err(); err != nil {
+		return result, err
 	}
 	if request.Scope.DiceID != h.dice.BaseConfig.Name {
-		return messageflow.CallbackResult{}, messageflow.ErrCallbackScope
+		return result, messageflow.ErrCallbackScope
 	}
-	if request.Message.History != adapterapi.InboundHistoryNone {
-		state, eligible, err := h.historyLogState(request)
-		if err != nil || !eligible {
-			return messageflow.CallbackResult{}, err
+	if request.Message.History != adapterapi.InboundHistoryNone && request.Message.Kind != adapterapi.InboundKindSelfMessage {
+		state, eligible, historyErr := h.historyLogState(ctx, request, collector)
+		if historyErr != nil || !eligible {
+			return result, historyErr
 		}
 		if request.Message.History == adapterapi.InboundHistoryRecordOnly {
 			return h.recordHistoryMessage(request, state, collector)
 		}
 	}
-	session := h.dice.ImSession
-	var transaction *DurableCallbackTransaction
-	if h.dice.DurableStore != nil {
-		var err error
-		transaction, err = NewDurableCallbackTransaction(h.dice.DurableStore, collector)
-		if err != nil {
-			return messageflow.CallbackResult{}, err
-		}
-		transaction.executionContext = ctx
-	}
 	metadata := callbackMetadata(request)
-	// Names are remembered first so the group projected below already carries its name.
-	h.rememberNames(request.Message)
-	if request.Group.Version == 0 && request.Message.Kind == adapterapi.InboundKindMessage && request.Message.ConversationKind == adapterapi.ConversationKindGroup {
-		// A group with no recorded state is left to the session, which
-		// activates it on its first message as it always has; the difference
-		// against the empty state is recorded below like any other change.
-		session.ServiceAtNew.Delete(request.Scope.GroupID)
-	} else {
-		session.ServiceAtNew.Store(request.Scope.GroupID, compatibilityGroupFromState(h.dice, request.Group.State, request.Player.PlayerState, request.Scope))
+	transaction, err := NewDurableCallbackTransaction(ctx, h.dice.DurableStore, collector, metadata)
+	if err != nil {
+		return result, err
 	}
+	finalized := false
+	defer func() {
+		if !finalized {
+			transaction.Domain().Abort()
+		}
+	}()
+	if err = h.dice.ContributeConfigView(ctx, transaction.Domain()); err != nil {
+		return result, err
+	}
+	if err = transaction.checkEndpointFence(ctx, adapterapi.EndpointID(request.EndpointID), request.Generation, request.DesiredVersion); err != nil {
+		return result, err
+	}
+	h.rememberNames(request.Message)
+	session := h.dice.ImSession
 	endpoint := compatibilityCallbackEndpoint(session, request)
 	message := compatibilityCallbackMessage(request)
-	var execution messageExecutionResult
+	var executed messageExecutionResult
 	refreshGroupInfo := true
 	switch request.Message.Kind {
 	case adapterapi.InboundKindMessage:
-		execution = session.executeMessage(endpoint, message, messageExecutionOptions{parser: messageParserSegments, runInSync: true, callbackTransaction: transaction, callbackMetadata: metadata})
+		executed = session.executeMessage(endpoint, message, messageExecutionOptions{parser: messageParserSegments, runInSync: true, callbackTransaction: transaction, callbackMetadata: metadata})
 	case adapterapi.InboundKindMessageUpdated, adapterapi.InboundKindMessageDeleted:
 		mctx := &MsgContext{
 			Dice: h.dice, Session: session, EndPoint: endpoint,
 			MessageType: message.MessageType, IsPrivate: message.MessageType == "private",
 			callbackTransaction: transaction, callbackMetadata: metadata,
 		}
-		mctx.Group, mctx.Player = GetPlayerInfoBySender(mctx, message)
-		mctx.fillPrivilege(message)
 		if request.Message.Kind == adapterapi.InboundKindMessageUpdated {
 			session.OnMessageEdit(mctx, message)
 		} else {
 			session.OnMessageDeleted(mctx, message)
 		}
-		execution.context = mctx
+		executed.context = mctx
 	case adapterapi.InboundKindNotice, adapterapi.InboundKindRequest:
-		var err error
-		execution.context, refreshGroupInfo, err = h.handleInboundEvent(request, session, endpoint, message, transaction, metadata)
+		executed.context, refreshGroupInfo, err = h.handleInboundEvent(request, session, endpoint, message, transaction, metadata)
 		if err != nil {
-			return messageflow.CallbackResult{}, err
+			return result, err
 		}
 	case adapterapi.InboundKindAdapterEvent:
 		if request.Message.AdapterEvent == nil {
-			return messageflow.CallbackResult{}, adapterapi.ErrInvalidContract
+			return result, adapterapi.ErrInvalidContract
 		}
-		mctx := &MsgContext{
+		executed.context = &MsgContext{
 			Dice: h.dice, Session: session, EndPoint: endpoint,
 			MessageType: message.MessageType, IsPrivate: message.MessageType == "private",
 			callbackTransaction: transaction, callbackMetadata: metadata,
 		}
-		execution.context = mctx
+		refreshGroupInfo = false
+	case adapterapi.InboundKindSelfMessage:
+		executed.context, err = h.handleSelfMessage(request, session, endpoint, message, transaction, metadata)
+		if err != nil {
+			return result, err
+		}
 		refreshGroupInfo = false
 	default:
-		return messageflow.CallbackResult{}, ErrUnsupportedDurableInboundKind
+		return result, ErrUnsupportedDurableInboundKind
 	}
-	if execution.context != nil {
-		defer execution.context.releaseExecutionState()
+	if executed.err != nil {
+		return result, executed.err
+	}
+	if executed.context != nil {
+		defer executed.context.releaseExecutionState()
 		if request.Message.AdapterEvent != nil {
-			h.bindAdapterEventConversation(execution.context, request.Scope)
-			execution.context.fillPrivilege(message)
-			if err := h.dice.dispatchAdapterEvent(execution.context, execution.context, *request.Message.AdapterEvent, endpoint); err != nil {
-				return messageflow.CallbackResult{}, err
+			if request.Message.Kind != adapterapi.InboundKindSelfMessage {
+				if err = h.bindAdapterEventConversation(executed.context, request.Scope); err != nil {
+					return result, err
+				}
+			}
+			executed.context.fillPrivilege(message)
+			if err = h.dice.dispatchAdapterEvent(executed.context, executed.context, *request.Message.AdapterEvent, endpoint); err != nil {
+				return result, err
 			}
 		}
-		if err := execution.context.stopJSExecution(); err != nil {
-			return messageflow.CallbackResult{}, err
+		if err = executed.context.getExecutionError(); err != nil {
+			return result, err
+		}
+		if err = executed.context.stopJSExecution(); err != nil {
+			return result, err
+		}
+		if err = executed.context.getExecutionError(); err != nil {
+			return result, err
 		}
 	}
-
 	if refreshGroupInfo {
-		h.stageGroupInfoRefresh(ctx, request, execution.context)
+		h.stageGroupInfoRefresh(ctx, request, executed.context)
 	}
-
-	group, ok := session.ServiceAtNew.Load(request.Scope.GroupID)
-	if !ok || group == nil {
-		return messageflow.CallbackResult{}, errors.New("dice: callback did not produce group state")
+	if err = transaction.Finalize(ctx); err != nil {
+		return result, err
 	}
-	groupEvents := compatibilityGroupEvents(request.Group.State, request.Scope, group)
-	if len(groupEvents) > 0 {
-		stream := groupstate.GroupStream(request.Scope.DiceID, request.Scope.GroupID)
-		if transaction != nil {
-			if err := transaction.stageGroupEvents(stream, request.Group.Version, metadata, groupEvents); err != nil {
-				return messageflow.CallbackResult{}, err
-			}
-		} else if err := collector.AddGroupEvents(stream, request.Group.Version, metadata, groupEvents); err != nil {
-			return messageflow.CallbackResult{}, err
-		}
-	}
-	player, _ := group.Players.Load(request.Scope.UserID)
-	playerEvents := compatibilityPlayerEvents(request.Player.PlayerState, request.Scope, player)
-	if len(playerEvents) > 0 {
-		if err := collector.AddPlayerEvents(playerstate.PlayerStream(request.Scope.DiceID, request.Scope.GroupID, request.Scope.UserID), request.Player.Version, metadata, playerEvents); err != nil {
-			return messageflow.CallbackResult{}, err
-		}
-	}
-	if transaction != nil {
-		if err := transaction.Finalize(ctx); err != nil {
-			return messageflow.CallbackResult{}, err
-		}
-	}
-	var (
-		callbacks           []func()
-		commitFence         callbackCommitFence
-		changedAttributeIDs []string
-	)
-	if transaction != nil {
-		callbacks = append(callbacks, transaction.callbackAfterCommit...)
-		commitFence = transaction.callbackCommitFence
-		changedAttributeIDs = transaction.ChangedAttributeIDs()
-	}
-	result := messageflow.CallbackResult{
-		CommitFence: commitFence,
-		AfterCommit: func() {
-			for _, callback := range callbacks {
-				callback()
-			}
-			if manager != nil {
-				manager.InvalidateCachedAttributes(changedAttributeIDs)
-			}
-		},
-	}
-	if gateLocked {
-		gateLocked = false
-		result.Release = manager.callbackGate.Unlock
-	}
-	return result, nil
+	finalized = true
+	return messageflow.CallbackResult{
+		PublishCommitted: func() { publishDomainCommit(transaction) },
+		CommitFence:      transaction.callbackCommitFence,
+		AfterCommit:      func() { notifyDomainCommit(transaction) },
+	}, nil
 }
 
 func (h *DurableCallbackHost) stageGroupInfoRefresh(ctx context.Context, request messageflow.CallbackRequest, mctx *MsgContext) {
@@ -327,7 +252,6 @@ func (h *DurableCallbackHost) stageGroupInfoRefresh(ctx context.Context, request
 func compatibilityCallbackEndpoint(session *IMSession, request messageflow.CallbackRequest) *EndPointInfo {
 	for _, endpoint := range session.EndPointsReadOnly() {
 		if endpoint != nil && endpoint.ID == request.EndpointID {
-			endpoint.Session = session
 			return endpoint
 		}
 	}
@@ -413,75 +337,6 @@ func appendCallbackTextSegments(segments []message.IMessageElement, text, platfo
 	return segments
 }
 
-func compatibilityGroupFromState(d *Dice, state groupstate.State, player playerstate.PlayerState, scope messageflow.CallbackScope) *GroupInfo {
-	if state.GroupID == "" {
-		state.GroupID = scope.GroupID
-	}
-	if player.UserID == "" {
-		player.UserID = scope.UserID
-	}
-	group := &GroupInfo{
-		Active: state.Active, Players: new(SyncMap[string, *GroupPlayerInfo]),
-		InactivatedExtSet: StringSet{}, GroupID: state.GroupID, GuildID: state.GuildID,
-		ChannelID: state.ChannelID, GroupName: state.GroupName,
-		DiceIDActiveMap: new(SyncMap[string, bool]), DiceIDExistsMap: new(SyncMap[string, bool]),
-		BotList: new(SyncMap[string, bool]), DiceSideNum: state.DiceSideNum,
-		DiceSideExpr: state.DiceSideExpr, System: state.System, RollShaperMode: state.RollShaperMode,
-		HelpPackages: append([]string(nil), state.HelpPackages...), CocRuleIndex: state.CocRuleIndex,
-		ShowGroupWelcome: state.ShowGroupWelcome, GroupWelcomeMessage: state.GroupWelcomeMessage,
-		EnteredTime: state.EnteredAt, InviteUserID: state.InviteUserID,
-		DefaultHelpGroup: state.DefaultHelpGroup, PlayerGroups: new(SyncMap[string, []string]),
-	}
-	if d != nil && d.ImSession != nil && d.ImSession.ServiceAtNew != nil {
-		if previous, ok := d.ImSession.ServiceAtNew.Load(scope.GroupID); ok && previous != nil {
-			group.logRuntime = previous.logSequence()
-		}
-	}
-	if d != nil && d.Parent != nil {
-		if cached, exists := d.Parent.GroupNameCache.Load(scope.GroupID); exists && cached != nil && cached.Name != "" {
-			group.GroupName = cached.Name
-		}
-	}
-	for id, active := range state.DiceIDActive {
-		if active {
-			group.DiceIDActiveMap.Store(id, true)
-		}
-	}
-	for id, exists := range state.DiceIDExists {
-		if exists {
-			group.DiceIDExistsMap.Store(id, true)
-		}
-	}
-	for id, bot := range state.BotList {
-		if bot {
-			group.BotList.Store(id, true)
-		}
-	}
-	for id, inactive := range state.InactivatedExtensions {
-		if inactive {
-			group.InactivatedExtSet[id] = struct{}{}
-		}
-	}
-	activated := make([]*ExtInfo, 0, len(state.ActivatedExtensions))
-	for _, name := range state.ActivatedExtensions {
-		extension := d.ExtFind(name, false)
-		if extension == nil {
-			extension = extNamePlaceholder(name)
-		}
-		activated = append(activated, extension)
-	}
-	group.SetActivatedExtList(activated, d)
-	group.Players.Store(player.UserID, compatibilityPlayerFromState(player))
-	return group
-}
-func compatibilityPlayerFromState(player playerstate.PlayerState) *GroupPlayerInfo {
-	return &GroupPlayerInfo{
-		Name: player.Name, UserID: player.UserID, AutoSetNameTemplate: player.AutoSetNameTemplate,
-		LastCommandTime: player.LastCommandAt, DiceSideNum: int(player.DiceSideNum), InGroup: true,
-		ValueMapTemp: &ds.ValueMap{},
-	}
-}
-
 func callbackMetadata(request messageflow.CallbackRequest) eventstore.Metadata {
 	occurredAt := request.Message.OccurredAt
 	if occurredAt.IsZero() {
@@ -492,148 +347,4 @@ func callbackMetadata(request messageflow.CallbackRequest) eventstore.Metadata {
 		CausationID: string(request.Message.ProviderEventID), PrincipalID: request.Scope.UserID,
 		Producer: "dice/durable-callback", OccurredAt: occurredAt.UTC(),
 	}
-}
-
-func compatibilityGroupEvents(before groupstate.State, scope messageflow.CallbackScope, after *GroupInfo) []groupstate.TypedEvent {
-	if after == nil {
-		return nil
-	}
-	events := make([]groupstate.TypedEvent, 0, 12)
-	base := before
-	if before.Version == 0 {
-		events = append(events, groupstate.NewGroupCreatedWithInviteV1(scope.DiceID, after.GroupID, after.GroupName, after.InviteUserID, after.EnteredTime))
-		base = groupstate.State{DiceID: scope.DiceID, GroupID: after.GroupID, GroupName: after.GroupName, InviteUserID: after.InviteUserID, EnteredAt: after.EnteredTime}
-	}
-	active := syncBoolMap(after.DiceIDActiveMap)
-	exists := syncBoolMap(after.DiceIDExistsMap)
-	for _, id := range sortedUnionBoolKeys(base.DiceIDActive, base.DiceIDExists, active, exists) {
-		if base.DiceIDActive[id] != active[id] || base.DiceIDExists[id] != exists[id] {
-			events = append(events, groupstate.NewGroupActivationChangedV1(id, active[id], exists[id]))
-		}
-	}
-	if before.Version > 0 && (base.GroupName != after.GroupName) {
-		events = append(events, groupstate.NewGroupNameChangedV1(after.GroupName))
-	}
-	if base.GuildID != after.GuildID || base.ChannelID != after.ChannelID {
-		events = append(events, groupstate.NewGroupIdentityChangedV1(after.GuildID, after.ChannelID))
-	}
-	if base.System != after.System {
-		events = append(events, groupstate.NewGroupSystemChangedV1(after.System))
-	}
-	if base.DiceSideNum != after.DiceSideNum || base.DiceSideExpr != after.DiceSideExpr || base.RollShaperMode != after.RollShaperMode || base.CocRuleIndex != after.CocRuleIndex {
-		events = append(events, groupstate.NewGroupTemplateWithCocRuleV1(after.DiceSideNum, after.DiceSideExpr, after.RollShaperMode, after.CocRuleIndex))
-	}
-	if !equalStrings(base.HelpPackages, after.HelpPackages) || base.DefaultHelpGroup != after.DefaultHelpGroup {
-		events = append(events, groupstate.NewGroupHelpChangedV1(after.DefaultHelpGroup, after.HelpPackages))
-	}
-	if base.ShowGroupWelcome != after.ShowGroupWelcome || base.GroupWelcomeMessage != after.GroupWelcomeMessage {
-		events = append(events, groupstate.NewGroupWelcomeChangedV1(after.ShowGroupWelcome, after.GroupWelcomeMessage))
-	}
-	afterExtensions := map[string]bool{}
-	for _, extension := range after.GetActivatedExtListRaw() {
-		if extension != nil && extension.Name != "" {
-			afterExtensions[extension.Name] = true
-		}
-	}
-	beforeExtensions := extensionSet(base.ActivatedExtensions)
-	afterInactiveSet := mapStringSet(after.InactivatedExtSet)
-	for _, name := range sortedUnionStringKeys(beforeExtensions, base.InactivatedExtensions, afterExtensions, afterInactiveSet) {
-		beforeEnabled, afterEnabled := beforeExtensions[name], afterExtensions[name]
-		beforeInactive, afterInactive := base.InactivatedExtensions[name], afterInactiveSet[name]
-		if beforeInactive != afterInactive || beforeEnabled != afterEnabled {
-			events = append(events, groupstate.NewGroupExtensionChangedV1(name, afterEnabled))
-		}
-	}
-	afterBots := syncBoolMap(after.BotList)
-	for _, id := range sortedUnionBoolKeys(base.BotList, afterBots) {
-		if base.BotList[id] != afterBots[id] {
-			events = append(events, groupstate.NewGroupBotListChangedV1(id, afterBots[id]))
-		}
-	}
-	return events
-}
-
-func compatibilityPlayerEvents(before playerstate.PlayerState, scope messageflow.CallbackScope, after *GroupPlayerInfo) []playerstate.PlayerEvent {
-	if after == nil {
-		return nil
-	}
-	events := make([]playerstate.PlayerEvent, 0, 5)
-	base := before
-	if before.Version == 0 {
-		events = append(events, playerstate.NewPlayerCreatedV1(scope.DiceID, scope.GroupID, scope.UserID, after.Name))
-		base = playerstate.PlayerState{DiceID: scope.DiceID, GroupID: scope.GroupID, UserID: scope.UserID, Name: after.Name}
-	}
-	if before.Version > 0 && base.Name != after.Name {
-		events = append(events, playerstate.NewPlayerNameChangedV1(after.Name))
-	}
-	if base.AutoSetNameTemplate != after.AutoSetNameTemplate {
-		events = append(events, playerstate.NewPlayerAutoSetNameTemplateChangedV1(after.AutoSetNameTemplate))
-	}
-	if base.LastCommandAt != after.LastCommandTime {
-		events = append(events, playerstate.NewPlayerLastCommandChangedV1(after.LastCommandTime))
-	}
-	if base.DiceSideNum != int64(after.DiceSideNum) {
-		events = append(events, playerstate.NewPlayerDiceSideChangedV1(int64(after.DiceSideNum)))
-	}
-	return events
-}
-
-func syncBoolMap(source *SyncMap[string, bool]) map[string]bool {
-	values := map[string]bool{}
-	if source != nil {
-		source.Range(func(key string, value bool) bool {
-			if value {
-				values[key] = true
-			}
-			return true
-		})
-	}
-	return values
-}
-
-func mapStringSet(source StringSet) map[string]bool {
-	values := make(map[string]bool, len(source))
-	for key := range source {
-		values[key] = true
-	}
-	return values
-}
-
-func extensionSet(values []string) map[string]bool {
-	set := make(map[string]bool, len(values))
-	for _, value := range values {
-		set[value] = true
-	}
-	return set
-}
-
-func sortedUnionBoolKeys(inputs ...map[string]bool) []string {
-	keys := map[string]struct{}{}
-	for _, input := range inputs {
-		for key := range input {
-			keys[key] = struct{}{}
-		}
-	}
-	result := make([]string, 0, len(keys))
-	for key := range keys {
-		result = append(result, key)
-	}
-	sort.Strings(result)
-	return result
-}
-
-func sortedUnionStringKeys(inputs ...map[string]bool) []string {
-	return sortedUnionBoolKeys(inputs...)
-}
-
-func equalStrings(left, right []string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index] != right[index] {
-			return false
-		}
-	}
-	return true
 }

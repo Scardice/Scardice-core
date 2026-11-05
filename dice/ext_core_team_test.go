@@ -6,23 +6,36 @@ import (
 	"testing"
 )
 
-func TestTeamListUsesStoredNamesCacheAndIDFallback(t *testing.T) {
-	dm := &DiceManager{}
-	d := &Dice{Parent: dm}
-	ctx := &MsgContext{Dice: d}
-	group := &GroupInfo{
-		Players:      new(SyncMap[string, *GroupPlayerInfo]),
-		PlayerGroups: new(SyncMap[string, []string]),
-	}
-	group.PlayerGroups.Store("B组", []string{})
-	group.PlayerGroups.Store("A组", []string{"QQ:1", "QQ:2", "QQ:3"})
-	group.Players.Store("QQ:1", &GroupPlayerInfo{Name: "  海\n豹\t名  ", UserID: "QQ:1"})
-	group.Players.Store("QQ:2", nil)
-	group.Players.Store("QQ:3", nil)
-	dm.UserNameCache.Store("QQ:1", &GroupNameCacheItem{Name: "不应使用的缓存名"})
-	dm.UserNameCache.Store("QQ:2", &GroupNameCacheItem{Name: "缓存名"})
+func newTeamTestContext(t *testing.T, label string) (*Dice, *MsgContext) {
+	t.Helper()
+	d, _ := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:team-bot")
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, newGroupMsg("QQ-Group:team", "QQ:owner", ""), label)
+	return d, ctx
+}
 
-	got := teamListText(ctx, group)
+func TestTeamListUsesStoredNamesCacheAndIDFallback(t *testing.T) {
+	d, ctx := newTeamTestContext(t, "team-list-names")
+	if err := ctx.Group.SetTeam("B组", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctx.Group.SetTeam("A组", []string{"QQ:1", "QQ:2", "QQ:3"}); err != nil {
+		t.Fatal(err)
+	}
+	player, err := ctx.ResolvePlayer(ctx.domainContext(), ctx.Group.GroupID(), "QQ:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = player.create(d.BaseConfig.Name, ctx.Group.GroupID(), "QQ:1", "  海\n豹\t名  "); err != nil {
+		t.Fatal(err)
+	}
+	d.Parent.UserNameCache.Store("QQ:1", &GroupNameCacheItem{Name: "不应使用的缓存名"})
+	d.Parent.UserNameCache.Store("QQ:2", &GroupNameCacheItem{Name: "缓存名"})
+
+	got, err := teamListText(ctx, ctx.Group)
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := "当前群共有2个团队：\n" +
 		"A组（3人）：海 豹 名（QQ:1）、缓存名（QQ:2）、QQ:3\n" +
 		"B组（0人）：无成员"
@@ -35,8 +48,12 @@ func TestTeamListUsesStoredNamesCacheAndIDFallback(t *testing.T) {
 }
 
 func TestTeamListReportsNoTeams(t *testing.T) {
-	group := &GroupInfo{PlayerGroups: new(SyncMap[string, []string])}
-	if got := teamListText(nil, group); got != "当前群尚未创建团队" {
+	_, ctx := newTeamTestContext(t, "team-list-empty")
+	got, err := teamListText(ctx, ctx.Group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "当前群尚未创建团队" {
 		t.Fatalf("team list reply = %q, want empty-team hint", got)
 	}
 }

@@ -1,8 +1,8 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -38,66 +38,31 @@ func DiceConfig(c echo.Context) error {
 		return c.JSON(http.StatusForbidden, nil)
 	}
 
-	configView := myDice.Config
-	commandPrefix := append([]string(nil), myDice.CommandPrefix...)
-	diceMasters := append([]string(nil), myDice.DiceMasters...)
-	var projectedConfigState struct {
-		mailPasswordRef string
+	configView := myDice.Config()
+	if configView == nil {
+		return echo.NewHTTPError(http.StatusServiceUnavailable, "configuration view is unavailable")
 	}
-	extDefaultSettings := make([]*dice.ExtDefaultSettingItem, 0, len(configView.ExtDefaultSettings))
-	runtimeExtensionDefaults := configView.ExtDefaultSettings
-	if myDice.DurableStoreAttached() {
-		view, _, state, err := myDice.DurableLegacyConfigView(context.Background())
-		if err != nil {
-			return echo.NewHTTPError(http.StatusServiceUnavailable, err.Error())
+	commandPrefix := append([]string(nil), myDice.CommandPrefixes()...)
+	diceMasters := append([]string(nil), myDice.DiceMasterIDs()...)
+	configState := myDice.ConfigStateSnapshot()
+	projectedConfigState := struct {
+		mailPasswordRef string
+	}{mailPasswordRef: configState.Mail.MailPasswordRef}
+	extDefaultSettings, err := myDice.ExtensionDefaultSettingsView(c.Request().Context())
+	if err != nil {
+		return echo.NewHTTPError(http.StatusServiceUnavailable, err.Error())
+	}
+	for _, item := range extDefaultSettings {
+		if item == nil {
+			continue
 		}
-		configView = view
-		commandPrefix = append([]string(nil), state.Outer.CommandPrefix...)
-		diceMasters = append([]string(nil), state.Outer.DiceMasters...)
-		projectedConfigState.mailPasswordRef = state.Mail.MailPasswordRef
-		extensionState, err := myDice.DurableExtensionState(context.Background())
-		if err != nil {
-			return echo.NewHTTPError(http.StatusServiceUnavailable, err.Error())
-		}
-		durableExtensionSettings := make(map[string]struct{}, len(extensionState.DefaultCommands))
-		for _, extensionID := range extensionState.ExtensionOrder {
-			defaults, ok := extensionState.DefaultCommands[extensionID]
-			if !ok {
-				continue
-			}
-			disabled := make(map[string]bool, len(defaults.DisabledCommands))
-			for command := range defaults.DisabledCommands {
-				disabled[command] = true
-			}
-			extension := myDice.ExtFind(extensionID, false)
-			extDefaultSettings = append(extDefaultSettings, &dice.ExtDefaultSettingItem{
-				Name:            extensionID,
-				AutoActive:      defaults.AutoActive,
-				DisabledCommand: disabled,
-				ExtItem:         extension,
-				Loaded:          extension != nil,
-			})
-			durableExtensionSettings[extensionID] = struct{}{}
-		}
-		for _, item := range runtimeExtensionDefaults {
-			if item == nil || !item.Loaded {
-				continue
-			}
-			if _, ok := durableExtensionSettings[item.Name]; ok {
-				continue
-			}
-			extDefaultSettings = append(extDefaultSettings, item)
-		}
-	} else {
-		for _, item := range configView.ExtDefaultSettings {
-			if item.Loaded {
-				extDefaultSettings = append(extDefaultSettings, item)
-			}
-		}
+		item.ExtItem = myDice.ExtFind(item.Name, false)
+		item.Loaded = item.ExtItem != nil
 	}
 
+	managerView, passwordConfigured := dm.ManagerPublicConfigSnapshot()
 	password := ""
-	if myDice.Parent.UIPasswordHash != "" {
+	if passwordConfigured {
 		password = "------"
 	}
 
@@ -121,16 +86,16 @@ func DiceConfig(c echo.Context) error {
 	}
 
 	info := DiceConfigInfo{
-		Config:              configView,
+		Config:              *configView,
 		CommandPrefix:       commandPrefix,
 		DiceMasters:         diceMasters,
 		UIPassword:          password,
 		LogPageItemLimit:    limit,
 		DefaultCocRuleIndex: cocRule,
-		ServerAddress:       myDice.Parent.ServeAddress,
-		TrayTooltip:         myDice.Parent.GetTrayTooltip(),
-		HelpDocEngineType:   myDice.Parent.HelpDocEngineType,
-		DiceRandomMode:      string(myDice.Parent.GetDiceRandomMode()),
+		ServerAddress:       managerView.ServeAddress,
+		TrayTooltip:         managerView.TrayTooltip,
+		HelpDocEngineType:   managerView.HelpDocEngineType,
+		DiceRandomMode:      managerView.DiceRandomMode,
 		MaxExecuteTime:      maxExec,
 		MaxCocCardGen:       maxCard,
 	}
@@ -166,54 +131,32 @@ func DiceConfigSet(c echo.Context) error {
 		return c.JSON(http.StatusOK, nil)
 	}
 
-	durableAttached := myDice.DurableStoreAttached()
 	persistDiceConfig := false
-	if durableAttached {
-		for key := range jsonMap {
-			switch key {
-			case "serveAddress", "trayTooltip", "uiPassword", "extDefaultSettings":
-				continue
-			default:
-				persistDiceConfig = true
-			}
+	for key := range jsonMap {
+		switch key {
+		case "serveAddress", "trayTooltip", "uiPassword", "extDefaultSettings":
+			continue
+		default:
+			persistDiceConfig = true
 		}
 	}
-
-	_, hasExtensionDefaults := jsonMap["extDefaultSettings"]
-	lockConfigUpdate := !durableAttached || persistDiceConfig || hasExtensionDefaults
-	if lockConfigUpdate {
-		myDice.LockConfigUpdate()
-		defer myDice.UnlockConfigUpdate()
-	}
-	var stagedConfig dice.Config
-	config := &myDice.Config
-	if durableAttached {
-		config = &stagedConfig
-		if lockConfigUpdate {
-			stagedConfig = myDice.Config
-		}
-	}
-	var commandPrefix, diceMasters []string
-	if lockConfigUpdate {
-		commandPrefix = append([]string(nil), myDice.CommandPrefix...)
-		diceMasters = append([]string(nil), myDice.DiceMasters...)
-	}
+	configValue, _ := myDice.ConfigEditSnapshot()
+	config := &configValue
+	commandPrefix := append([]string(nil), config.CommandPrefix...)
+	diceMasters := append([]string(nil), config.DiceMasters...)
 	var durableManagerUpdate dice.DurableManagerConfigPatch
 	var durableExtensionDefaults []dice.DurableExtensionDefault
-	var pendingExtensionSettings []*dice.ExtDefaultSettingItem
 	persistExtensionDefaults := false
 	var pendingLogLimit *int
 	resetInactiveCron := false
-	if durableAttached {
-		if value, ok := jsonMap["mailPassword"]; ok {
-			password, ok := value.(string)
-			if !ok {
-				return c.JSON(http.StatusBadRequest, Response{"result": false, "err": "邮箱密码必须是 secret reference"})
-			}
-			password = strings.TrimSpace(password)
-			if password != "" && !strings.HasPrefix(password, "vault:") && !strings.HasPrefix(password, "sha256:") {
-				return c.JSON(http.StatusBadRequest, Response{"result": false, "err": "邮箱密码必须是 vault: 或 sha256: 引用"})
-			}
+	if value, ok := jsonMap["mailPassword"]; ok {
+		password, ok := value.(string)
+		if !ok {
+			return c.JSON(http.StatusBadRequest, Response{"result": false, "err": "邮箱密码必须是 secret reference"})
+		}
+		password = strings.TrimSpace(password)
+		if password != "" && !strings.HasPrefix(password, "vault:") && !strings.HasPrefix(password, "sha256:") {
+			return c.JSON(http.StatusBadRequest, Response{"result": false, "err": "邮箱密码必须是 vault: 或 sha256: 引用"})
 		}
 	}
 
@@ -241,9 +184,6 @@ func DiceConfigSet(c echo.Context) error {
 	if val, ok := jsonMap["commandPrefix"]; ok {
 		value := stringConvert(val)
 		commandPrefix = value
-		if !durableAttached {
-			myDice.CommandPrefix = value
-		}
 	}
 
 	if val, ok := jsonMap["diceMasters"]; ok {
@@ -261,9 +201,6 @@ func DiceConfigSet(c echo.Context) error {
 			masters = append(masters, i)
 		}
 		diceMasters = masters
-		if !durableAttached {
-			myDice.DiceMasters = masters
-		}
 	}
 
 	if val, ok := jsonMap["noticeIds"]; ok {
@@ -428,22 +365,15 @@ func DiceConfigSet(c echo.Context) error {
 				"err":    "DiceManager 未初始化",
 			})
 		}
-		if durableAttached {
-			if effectiveMode, err := myDice.Parent.ValidateDiceRandomMode(mode); err != nil {
-				return c.JSON(http.StatusBadRequest, Response{
-					"result": false,
-					"err":    fmt.Sprintf("随机模式 %s 当前不可用，当前生效模式为 %s: %v", mode, effectiveMode, err),
-				})
-			}
-			modeValue := string(mode)
-			durableManagerUpdate.DiceRandomMode = &modeValue
-			config.DiceRandomMode = modeValue
-		} else if effectiveMode, err := myDice.Parent.SetDiceRandomMode(mode); err != nil {
+		if effectiveMode, validateErr := myDice.Parent.ValidateDiceRandomMode(mode); validateErr != nil {
 			return c.JSON(http.StatusBadRequest, Response{
 				"result": false,
-				"err":    fmt.Sprintf("随机模式 %s 当前不可用，当前生效模式为 %s: %v", mode, effectiveMode, err),
+				"err":    fmt.Sprintf("随机模式 %s 当前不可用，当前生效模式为 %s: %v", mode, effectiveMode, validateErr),
 			})
 		}
+		modeValue := string(mode)
+		durableManagerUpdate.DiceRandomMode = &modeValue
+		config.DiceRandomMode = modeValue
 	}
 
 	if val, ok := jsonMap["QQChannelLogMessage"]; ok {
@@ -477,19 +407,12 @@ func DiceConfigSet(c echo.Context) error {
 		config.AliveNoticeValue = val.(string)
 		aliveNoticeMod = true
 	}
-	if aliveNoticeMod && !durableAttached {
-		myDice.ApplyAliveNotice()
-	}
 
 	if val, ok := jsonMap["UILogLimit"]; ok {
 		val, err := strconv.ParseInt(val.(string), 10, 64)
 		if err == nil && val >= 0 {
 			limit := int(val)
-			if durableAttached {
-				pendingLogLimit = &limit
-			} else {
-				myDice.LogWriter.SetLogLimit(limit)
-			}
+			pendingLogLimit = &limit
 		}
 	}
 
@@ -526,77 +449,47 @@ func DiceConfigSet(c echo.Context) error {
 	if val, ok := jsonMap["uiPassword"]; ok {
 		if !dm.JustForTest {
 			passwordHash := val.(string)
-			if durableAttached {
-				durableManagerUpdate.UIPasswordHash = &passwordHash
-			} else {
-				myDice.Parent.UIPasswordHash = passwordHash
-				// 清空所有现有的访问令牌，强制重新登录
-				myDice.Parent.AccessTokens = dice.SyncMap[string, bool]{}
-			}
+			durableManagerUpdate.UIPasswordHash = &passwordHash
 		}
 	}
 
 	if val, ok := jsonMap["extDefaultSettings"]; ok {
-		if durableAttached {
-			if _, ok := val.([]interface{}); !ok {
-				return c.JSON(http.StatusBadRequest, Response{"result": false, "err": "扩展默认设置必须是数组"})
-			}
+		if _, ok := val.([]interface{}); !ok {
+			return c.JSON(http.StatusBadRequest, Response{"result": false, "err": "扩展默认设置必须是数组"})
 		}
-		data, err := json.Marshal(val)
-		if err != nil {
-			if durableAttached {
-				return c.JSON(http.StatusBadRequest, Response{"result": false, "err": "扩展默认设置格式无效"})
+		data, marshalErr := json.Marshal(val)
+		if marshalErr != nil {
+			return c.JSON(http.StatusBadRequest, Response{"result": false, "err": "扩展默认设置格式无效"})
+		}
+		var items []*dice.ExtDefaultSettingItem
+		if unmarshalErr := json.Unmarshal(data, &items); unmarshalErr != nil {
+			return c.JSON(http.StatusBadRequest, Response{"result": false, "err": "扩展默认设置格式无效"})
+		}
+		for _, item := range items {
+			if item == nil {
+				return c.JSON(http.StatusBadRequest, Response{"result": false, "err": "扩展默认设置项不能为空"})
 			}
-		} else {
-			var items []*dice.ExtDefaultSettingItem
-			err := json.Unmarshal(data, &items)
-			if err != nil && durableAttached {
-				return c.JSON(http.StatusBadRequest, Response{"result": false, "err": "扩展默认设置格式无效"})
-			}
-			if err == nil {
-				if durableAttached {
-					for _, item := range items {
-						if item == nil {
-							return c.JSON(http.StatusBadRequest, Response{"result": false, "err": "扩展默认设置项不能为空"})
-						}
-					}
-					pendingExtensionSettings = items
-					persistExtensionDefaults = true
-					for _, item := range items {
-						disabledCommands := make([]string, 0, len(item.DisabledCommand))
-						for command, isDisabled := range item.DisabledCommand {
-							if isDisabled {
-								disabledCommands = append(disabledCommands, command)
-							}
-						}
-						durableExtensionDefaults = append(durableExtensionDefaults, dice.DurableExtensionDefault{
-							ExtensionID: item.Name, AutoActive: item.AutoActive, DisabledCommands: disabledCommands,
-						})
-					}
-				} else {
-					config.ExtDefaultSettings = items
-					myDice.ApplyExtDefaultSettings()
+			disabledCommands := make([]string, 0, len(item.DisabledCommand))
+			for command, isDisabled := range item.DisabledCommand {
+				if isDisabled {
+					disabledCommands = append(disabledCommands, command)
 				}
 			}
+			durableExtensionDefaults = append(durableExtensionDefaults, dice.DurableExtensionDefault{
+				ExtensionID: item.Name, AutoActive: item.AutoActive, DisabledCommands: disabledCommands,
+			})
 		}
+		persistExtensionDefaults = true
 	}
 
 	if val, ok := jsonMap["serveAddress"]; ok {
 		if !dm.JustForTest {
 			address := val.(string)
-			if durableAttached {
-				durableManagerUpdate.ServeAddress = &address
-			} else {
-				myDice.Parent.ServeAddress = address
-			}
+			durableManagerUpdate.ServeAddress = &address
 		}
 	}
 	if trayTooltipModified {
-		if durableAttached {
-			durableManagerUpdate.TrayTooltip = &trayTooltip
-		} else {
-			myDice.Parent.SetTrayTooltip(trayTooltip)
-		}
+		durableManagerUpdate.TrayTooltip = &trayTooltip
 	}
 
 	// if val, ok := jsonMap["customBotExtraText"]; ok {
@@ -683,11 +576,7 @@ func DiceConfigSet(c echo.Context) error {
 			// ignore
 		}
 		if set {
-			if durableAttached {
-				resetInactiveCron = true
-			} else {
-				myDice.ResetQuitInactiveCron()
-			}
+			resetInactiveCron = true
 		}
 	}
 
@@ -713,48 +602,45 @@ func DiceConfigSet(c echo.Context) error {
 		}
 	}
 
-	if durableAttached {
-		var mailPasswordRef *string
-		if value, ok := jsonMap["mailPassword"]; ok {
-			ref := strings.TrimSpace(value.(string))
-			mailPasswordRef = &ref
-		}
-		if err := myDice.DurableCommitConfigRequest(context.Background(), dice.DurableConfigRequest{
-			Config:                   *config,
-			CommandPrefix:            commandPrefix,
-			DiceMasters:              diceMasters,
-			MailPasswordRef:          mailPasswordRef,
-			PersistDiceConfig:        persistDiceConfig,
-			Manager:                  &durableManagerUpdate,
-			ExtensionDefaults:        durableExtensionDefaults,
-			PersistExtensionDefaults: persistExtensionDefaults,
-		}); err != nil {
-			return echo.NewHTTPError(http.StatusConflict, err.Error())
-		}
-		if persistDiceConfig {
-			myDice.Config = *config
-			myDice.CommandPrefix = commandPrefix
-			myDice.DiceMasters = diceMasters
-			myDice.Config.MailPassword = ""
-			if aliveNoticeMod {
-				myDice.ApplyAliveNotice()
-			}
-			if pendingLogLimit != nil {
-				myDice.LogWriter.SetLogLimit(*pendingLogLimit)
-			}
-			if resetInactiveCron {
-				myDice.ResetQuitInactiveCron()
-			}
-		}
-		if persistExtensionDefaults {
-			myDice.Config.ExtDefaultSettings = pendingExtensionSettings
-			myDice.ApplyExtDefaultSettings()
-		}
-		myDice.MarkModified()
-		return c.JSON(http.StatusOK, nil)
+	var mailPasswordRef *string
+	if value, ok := jsonMap["mailPassword"]; ok {
+		ref := strings.TrimSpace(value.(string))
+		mailPasswordRef = &ref
 	}
-	myDice.MarkModified()
-	myDice.Parent.Save()
+	if err := myDice.DurableCommitConfigRequest(c.Request().Context(), dice.DurableConfigRequest{
+		Config:                   *config,
+		CommandPrefix:            commandPrefix,
+		DiceMasters:              diceMasters,
+		MailPasswordRef:          mailPasswordRef,
+		PersistDiceConfig:        persistDiceConfig,
+		Manager:                  &durableManagerUpdate,
+		ExtensionDefaults:        durableExtensionDefaults,
+		PersistExtensionDefaults: persistExtensionDefaults,
+	}); err != nil {
+		var applyErr *dice.ConfigRuntimeApplyError
+		if errors.As(err, &applyErr) {
+			return c.JSON(http.StatusInternalServerError, Response{
+				"result": false,
+				"code":   "config_committed_runtime_apply_failed",
+				"err":    err.Error(),
+			})
+		}
+		return echo.NewHTTPError(http.StatusConflict, err.Error())
+	}
+	if persistDiceConfig {
+		if aliveNoticeMod {
+			myDice.ApplyAliveNotice()
+		}
+		if pendingLogLimit != nil {
+			myDice.LogWriter.SetLogLimit(*pendingLogLimit)
+		}
+		if resetInactiveCron {
+			myDice.ResetQuitInactiveCron()
+		}
+	}
+	if persistExtensionDefaults {
+		myDice.ApplyExtDefaultSettings()
+	}
 	return c.JSON(http.StatusOK, nil)
 }
 
@@ -794,6 +680,7 @@ func vmVersionSet(c echo.Context) error {
 		return Error(&c, "缺少设置vm版本的参数", Response{})
 	}
 
+	config, _ := myDice.ConfigEditSnapshot()
 	var failTypes []string
 	for _, data := range req {
 		if data.Type == "" || data.Value == "" {
@@ -802,19 +689,20 @@ func vmVersionSet(c echo.Context) error {
 		}
 		switch data.Type {
 		case dice.VMVersionReply:
-			(&myDice.Config).VMVersionForReply = data.Value
+			config.VMVersionForReply = data.Value
 		case dice.VMVersionDeck:
-			(&myDice.Config).VMVersionForDeck = data.Value
+			config.VMVersionForDeck = data.Value
 		case dice.VMVersionCustomText:
-			(&myDice.Config).VMVersionForCustomText = data.Value
+			config.VMVersionForCustomText = data.Value
 		case dice.VmVersionMsg:
-			(&myDice.Config).VMVersionForMsg = data.Value
+			config.VMVersionForMsg = data.Value
 		default:
 			failTypes = append(failTypes, data.Type)
 		}
 	}
-	myDice.MarkModified()
-	myDice.Save(false)
+	if err = myDice.DurableCommitConfigSnapshot(c.Request().Context(), config, config.CommandPrefix, config.DiceMasters, nil); err != nil {
+		return Error(&c, err.Error(), Response{"code": "config_update_failed"})
+	}
 
 	return Success(&c, Response{
 		"failTypes": failTypes,

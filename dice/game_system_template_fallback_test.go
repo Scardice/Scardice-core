@@ -11,31 +11,28 @@ import (
 func newTemplateFallbackTestCtx(t *testing.T, sheetType string, values map[string]*ds.VMValue) (*MsgContext, func()) {
 	t.Helper()
 
-	d, _, _, cleanup := newExecuteNewTestDice(t)
-	ctx := &MsgContext{
-		Dice:                d,
-		Session:             d.ImSession,
-		IsCompatibilityTest: true,
-		Group: &GroupInfo{
-			GroupID: "QQ-Group:114514",
-			System:  "coc7",
-		},
-		Player: &GroupPlayerInfo{
-			UserID: "QQ:1919810",
-			Name:   "Tester",
-		},
+	d, endpoint, _, cleanup := newExecuteNewTestDice(t)
+	message := newGroupMsg("QQ-Group:114514", "QQ:1919810", "")
+	message.Sender.Nickname = "Tester"
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, message, "template-fallback")
+	if err := ctx.Group.SetSystem("coc7"); err != nil {
+		t.Fatalf("set group system: %v", err)
 	}
 	ctx.SystemTemplate = ctx.Group.GetCharTemplate(d)
+	ctx.CreateVmIfNotExists()
 
-	attrs := &AttributesItem{
-		ID:        ctx.Group.GroupID + "-" + ctx.Player.UserID,
-		valueMap:  &ds.ValueMap{},
-		SheetType: sheetType,
+	attrs, err := d.AttrsManager.LoadByCtx(ctx)
+	if err != nil {
+		t.Fatalf("load canonical attributes: %v", err)
+	}
+	if err = attrs.SetSheetType(sheetType); err != nil {
+		t.Fatalf("set attribute sheet type: %v", err)
 	}
 	for key, value := range values {
-		attrs.Store(key, value)
+		if err = attrs.Store(key, value); err != nil {
+			t.Fatalf("store attribute %q: %v", key, err)
+		}
 	}
-	d.AttrsManager.m.Store(attrs.ID, attrs)
 
 	return ctx, cleanup
 }
@@ -116,11 +113,13 @@ func TestSetCardType_WritesTemplateVersionWithoutSyncingAliases(t *testing.T) {
 	defer cleanup()
 	expectedVersion := ctx.SystemTemplate.Version
 
-	SetCardType(ctx, "coc7")
+	if err := SetCardType(ctx, "coc7"); err != nil {
+		t.Fatal(err)
+	}
 
 	attrs := lo.Must(ctx.Dice.AttrsManager.LoadByCtx(ctx))
-	if attrs.SheetType != "coc7" {
-		t.Fatalf("expected SheetType coc7, got %q", attrs.SheetType)
+	if attrs.SheetType() != "coc7" {
+		t.Fatalf("expected SheetType coc7, got %q", attrs.SheetType())
 	}
 	if version, exists := attrs.LoadX(attrsTemplateVersionKey); !exists || version.ToString() != expectedVersion {
 		t.Fatalf("expected %s to be set to %s after SetCardType", attrsTemplateVersionKey, expectedVersion)
@@ -186,7 +185,9 @@ func TestGameSystemTemplate_GetRealValue_DoesNotResyncWhenVersionIsCurrent(t *te
 	defer cleanup()
 	expectedVersion := ctx.SystemTemplate.Version
 	attrs := lo.Must(ctx.Dice.AttrsManager.LoadByCtx(ctx))
-	attrs.Store(attrsTemplateVersionKey, ds.NewStrVal(expectedVersion))
+	if err := attrs.Store(attrsTemplateVersionKey, ds.NewStrVal(expectedVersion)); err != nil {
+		t.Fatal(err)
+	}
 
 	value, err := ctx.SystemTemplate.GetRealValue(ctx, "外语")
 	if err != nil {

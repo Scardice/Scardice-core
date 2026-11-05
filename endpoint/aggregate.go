@@ -43,7 +43,7 @@ func Decide(state State, command Command) (Decision, error) {
 		return Decision{}, reject(RejectInvalidState, commandID, state.Version, 0, ErrInvalidState, "empty aggregate has config payload")
 	}
 	if state.Version > 0 {
-		if !state.EndpointID.Valid() || !state.AdapterKey.Valid() || !state.DesiredState.Valid() || !state.OperationState.Valid() || !state.ObservedState.Valid() || state.OperationID == "" || state.CorrelationID == "" || state.DesiredVersion == 0 {
+		if !state.EndpointID.Valid() || !state.AdapterKey.Valid() || !state.DesiredState.Valid() || !state.OperationState.Valid() || !state.ObservedState.Valid() || (state.OperationID == "" && state.OperationState != OperationStateIdle) || state.CorrelationID == "" || state.DesiredVersion == 0 {
 			return Decision{}, reject(RejectInvalidState, commandID, state.Version, 0, ErrInvalidState, "state contains invalid durable values")
 		}
 		if state.Config.Version == 0 || len(state.Config.Canonical) == 0 {
@@ -97,7 +97,7 @@ func Decide(state State, command Command) (Decision, error) {
 	if command.EndpointID != "" && command.EndpointID != state.EndpointID {
 		return Decision{}, reject(RejectInvalidCommand, commandID, state.Version, 0, ErrInvalidCommand, "command endpoint does not match aggregate")
 	}
-	if (state.OperationState == OperationStatePending || state.OperationState == OperationStateFailed || state.OperationState == OperationStateAmbiguous) && kind != CommandResolve && kind != CommandComplete && kind != CommandObserveIdentity && kind != CommandRestoreLegacyMetadata {
+	if (state.OperationState == OperationStatePending || state.OperationState == OperationStateFailed || state.OperationState == OperationStateAmbiguous) && kind != CommandResolve && kind != CommandComplete && kind != CommandObserveIdentity {
 		return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, 0, ErrInvalidTransition, "operation requires explicit completion or resolution")
 	}
 
@@ -135,11 +135,13 @@ func Decide(state State, command Command) (Decision, error) {
 		return decideCompletion(state, command, commandID, correlationID, digest)
 	case CommandObserveIdentity:
 		return decideIdentityObservation(state, command, commandID, correlationID, digest)
-	case CommandRestoreLegacyMetadata:
-		return decideLegacyMetadataRestore(state, command, commandID, correlationID, digest)
 	case CommandResolve:
 		if state.DesiredState != DesiredStateRemoving || state.ObservedState != adapterapi.ObservedStateStopped ||
-			(state.OperationState != OperationStatePending && state.OperationState != OperationStateFailed && state.OperationState != OperationStateAmbiguous && state.OperationState != OperationStateSucceeded) {
+			state.OperationState != OperationStatePending &&
+				state.OperationState != OperationStateFailed &&
+				state.OperationState != OperationStateAmbiguous &&
+				state.OperationState != OperationStateSucceeded &&
+				(state.OperationState != OperationStateIdle || state.OperationID != "" || state.Generation != 0) {
 			return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, 0, ErrInvalidTransition, "resolve requires removing desired state and durable stopped observation")
 		}
 		return decideLifecycle(state, command, commandID, correlationID, digest, EventEndpointDeleted, DesiredStateDeleted, "")
@@ -205,70 +207,6 @@ func decideIdentityObservation(state State, command Command, commandID, correlat
 		DesiredVersion: state.DesiredVersion, ProviderID: command.ProviderID, DisplayName: displayName, DesiredState: state.DesiredState,
 		ObservedState: state.ObservedState, OperationState: state.OperationState,
 		EndpointID: state.EndpointID, AdapterKey: state.AdapterKey,
-	}
-	return Decision{Events: []Event{event}}, nil
-}
-
-func decideLegacyMetadataRestore(state State, command Command, commandID, correlationID, digest string) (Decision, error) {
-	if !validDisplayName(command.DisplayName) || (command.ProviderID != "" && !command.ProviderID.Valid()) {
-		return Decision{}, reject(RejectInvalidCommand, commandID, state.Version, 0, ErrInvalidCommand, "legacy metadata restore contains invalid display identity")
-	}
-	if !command.Statistics.valid() {
-		return Decision{}, reject(RejectInvalidCommand, commandID, state.Version, 0, ErrInvalidCommand, "legacy metadata restore contains invalid statistics")
-	}
-	displayName := command.DisplayName
-	if state.DisplayName != "" {
-		if displayName != "" && displayName != state.DisplayName {
-			return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, 0, ErrInvalidTransition, "legacy metadata restore cannot replace display identity")
-		}
-		displayName = state.DisplayName
-	}
-	providerID := command.ProviderID
-	if state.ProviderID != "" {
-		if providerID != "" && providerID != state.ProviderID {
-			return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, 0, ErrInvalidTransition, "legacy metadata restore cannot replace provider identity")
-		}
-		providerID = state.ProviderID
-	}
-	statistics := command.Statistics
-	current := state.Statistics
-	if current.GroupCount != 0 {
-		if statistics.GroupCount != 0 && statistics.GroupCount != current.GroupCount {
-			return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, 0, ErrInvalidTransition, "legacy metadata restore cannot replace group count")
-		}
-		statistics.GroupCount = current.GroupCount
-	}
-	if current.CommandCount != 0 {
-		if statistics.CommandCount != 0 && statistics.CommandCount != current.CommandCount {
-			return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, 0, ErrInvalidTransition, "legacy metadata restore cannot replace command count")
-		}
-		statistics.CommandCount = current.CommandCount
-	}
-	if current.LastCommandAt != 0 {
-		if statistics.LastCommandAt != 0 && statistics.LastCommandAt != current.LastCommandAt {
-			return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, 0, ErrInvalidTransition, "legacy metadata restore cannot replace last command time")
-		}
-		statistics.LastCommandAt = current.LastCommandAt
-	}
-	if current.OnlineSeconds != 0 {
-		if statistics.OnlineSeconds != 0 && statistics.OnlineSeconds != current.OnlineSeconds {
-			return Decision{}, reject(RejectInvalidTransition, commandID, state.Version, 0, ErrInvalidTransition, "legacy metadata restore cannot replace online duration")
-		}
-		statistics.OnlineSeconds = current.OnlineSeconds
-	}
-	sequence, err := nextVersion(state.Version)
-	if err != nil {
-		return Decision{}, reject(RejectInvalidState, commandID, state.Version, 0, ErrVersionExhausted, err.Error())
-	}
-	eventIDValue := eventID(state.EndpointID, commandID, correlationID, sequence, EventLegacyMetadataRestored)
-	event := Event{
-		ID: eventIDValue, EventID: eventIDValue, Type: EventLegacyMetadataRestored, Kind: EventLegacyMetadataRestored,
-		Sequence: sequence, AggregateVersion: sequence, CommandID: commandID, CommandDigest: digest,
-		CorrelationID: correlationID, OperationID: state.OperationID, Generation: state.Generation,
-		DesiredVersion: state.DesiredVersion, DesiredState: state.DesiredState,
-		ObservedState: state.ObservedState, OperationState: state.OperationState,
-		EndpointID: state.EndpointID, DisplayName: displayName, ProviderID: providerID,
-		Statistics: statistics, AdapterKey: state.AdapterKey,
 	}
 	return Decision{Events: []Event{event}}, nil
 }
@@ -376,7 +314,7 @@ func Apply(state State, event Event) (State, error) {
 			return State{}, fmt.Errorf("%w: invalid empty aggregate state", ErrInvalidState)
 		}
 	} else {
-		if !state.EndpointID.Valid() || !validDisplayName(state.DisplayName) || !state.Statistics.valid() || !state.AdapterKey.Valid() || !state.DesiredState.Valid() || !state.OperationState.Valid() || !state.ObservedState.Valid() || state.OperationID == "" || state.CorrelationID == "" || state.DesiredVersion == 0 || (state.ProviderID != "" && !state.ProviderID.Valid()) || state.Config.Version == 0 || len(state.Config.Canonical) == 0 {
+		if !state.EndpointID.Valid() || !validDisplayName(state.DisplayName) || !state.Statistics.valid() || !state.AdapterKey.Valid() || !state.DesiredState.Valid() || !state.OperationState.Valid() || !state.ObservedState.Valid() || (state.OperationID == "" && state.OperationState != OperationStateIdle) || state.CorrelationID == "" || state.DesiredVersion == 0 || (state.ProviderID != "" && !state.ProviderID.Valid()) || state.Config.Version == 0 || len(state.Config.Canonical) == 0 {
 			return State{}, fmt.Errorf("%w: invalid current aggregate state", ErrInvalidState)
 		}
 		if err := state.Config.Validate(); err != nil {
@@ -404,7 +342,7 @@ func Apply(state State, event Event) (State, error) {
 	if sequence == 0 {
 		sequence = event.AggregateVersion
 	}
-	if !typ.Valid() || sequence == 0 || eventIDValue == "" || event.CommandID == "" || event.CorrelationID == "" || event.OperationID == "" || !event.EndpointID.Valid() || !validDisplayName(event.DisplayName) || !event.Statistics.valid() || event.CommandDigest == "" || !event.OperationState.Valid() || !event.ObservedState.Valid() || (event.ProviderID != "" && !event.ProviderID.Valid()) {
+	if !typ.Valid() || sequence == 0 || eventIDValue == "" || event.CommandID == "" || event.CorrelationID == "" || !validEventOperation(typ, event.OperationState, event.OperationID) || !event.EndpointID.Valid() || !validDisplayName(event.DisplayName) || !event.Statistics.valid() || event.CommandDigest == "" || !event.OperationState.Valid() || !event.ObservedState.Valid() || (event.ProviderID != "" && !event.ProviderID.Valid()) {
 		return State{}, fmt.Errorf("%w: malformed event", ErrInvalidState)
 	}
 	if expected := eventID(event.EndpointID, event.CommandID, event.CorrelationID, sequence, typ); eventIDValue != expected {
@@ -456,7 +394,7 @@ func Apply(state State, event Event) (State, error) {
 		return State{}, fmt.Errorf("%w: changed desired version without new intent", ErrInvalidState)
 	}
 	if event.ConfigSet {
-		if typ != EventEndpointCreated && typ != EventConfigUpdated {
+		if typ != EventEndpointCreated && typ != EventBaselineImported && typ != EventConfigUpdated {
 			return State{}, fmt.Errorf("%w: unexpected config payload", ErrInvalidState)
 		}
 		if err := event.Config.Validate(); err != nil {
@@ -466,14 +404,14 @@ func Apply(state State, event Event) (State, error) {
 		if event.Config.Version != 0 || len(event.Config.Canonical) != 0 || event.Config.SecretRefs != nil {
 			return State{}, fmt.Errorf("%w: config bytes without config flag", ErrInvalidState)
 		}
-		if typ == EventEndpointCreated || typ == EventConfigUpdated {
+		if typ == EventEndpointCreated || typ == EventBaselineImported || typ == EventConfigUpdated {
 			return State{}, fmt.Errorf("%w: missing config payload", ErrInvalidState)
 		}
 	}
-	if typ != EventEndpointCreated && typ != EventLegacyMetadataRestored && typ != EventEndpointIdentityObserved && event.DisplayName != "" {
+	if typ != EventEndpointCreated && typ != EventBaselineImported && typ != EventEndpointIdentityObserved && event.DisplayName != "" {
 		return State{}, fmt.Errorf("%w: unexpected display identity", ErrInvalidState)
 	}
-	if typ != EventEndpointCreated && typ != EventLegacyMetadataRestored && !event.Statistics.empty() {
+	if typ != EventEndpointCreated && typ != EventBaselineImported && !event.Statistics.empty() {
 		return State{}, fmt.Errorf("%w: unexpected statistics payload", ErrInvalidState)
 	}
 	if !validEventTransition(state, typ, event) {
@@ -483,7 +421,7 @@ func Apply(state State, event Event) (State, error) {
 	next.Version = sequence
 	next.Generation = event.Generation
 	next.EndpointID = event.EndpointID
-	if typ == EventEndpointCreated || typ == EventLegacyMetadataRestored {
+	if typ == EventEndpointCreated || typ == EventBaselineImported {
 		next.DisplayName = event.DisplayName
 		next.Statistics = event.Statistics
 	} else if typ == EventEndpointIdentityObserved && event.DisplayName != "" {
@@ -500,10 +438,10 @@ func Apply(state State, event Event) (State, error) {
 	next.OperationState = event.OperationState
 	next.DesiredVersion = event.DesiredVersion
 	next.OperationID = event.OperationID
-	if typ != EventEndpointIdentityObserved && typ != EventLegacyMetadataRestored {
+	if typ != EventEndpointIdentityObserved {
 		next.CorrelationID = event.CorrelationID
 	}
-	if typ == EventEndpointCreated || typ == EventEndpointIdentityObserved || typ == EventLegacyMetadataRestored {
+	if typ == EventEndpointCreated || typ == EventBaselineImported || typ == EventEndpointIdentityObserved {
 		next.ProviderID = event.ProviderID
 	}
 	if event.EffectID != "" && event.EffectKind != "" {
@@ -539,11 +477,16 @@ func Apply(state State, event Event) (State, error) {
 }
 
 func eventChangesDesiredIntent(typ EventType) bool {
-	return typ != EventOperationCompleted && typ != EventEndpointIdentityObserved && typ != EventLegacyMetadataRestored
+	return typ != EventOperationCompleted && typ != EventEndpointIdentityObserved
 }
 
 func validEventTransition(state State, typ EventType, event Event) bool {
 	if state.Version == 0 {
+		if typ == EventBaselineImported {
+			return event.AdapterKey.Valid() && event.ConfigSet && event.DesiredState.Valid() &&
+				event.ObservedState == adapterapi.ObservedStateStopped && event.OperationState == OperationStateIdle &&
+				event.Generation == 0 && event.OperationID == "" && event.EffectID == "" && event.EffectKind == ""
+		}
 		return typ == EventEndpointCreated && event.AdapterKey.Valid() && event.ConfigSet &&
 			event.DesiredState == DesiredStateDisabled && event.ObservedState == adapterapi.ObservedStateStopped &&
 			event.OperationState == OperationStateIdle && event.Generation == 0 && event.EffectID == "" && event.EffectKind == ""
@@ -551,7 +494,7 @@ func validEventTransition(state State, typ EventType, event Event) bool {
 	if event.AdapterKey != state.AdapterKey {
 		return false
 	}
-	if typ != EventOperationCompleted && typ != EventEndpointIdentityObserved && typ != EventLegacyMetadataRestored && typ != EventEndpointDeleted && (state.OperationState == OperationStatePending || state.OperationState == OperationStateFailed || state.OperationState == OperationStateAmbiguous) {
+	if typ != EventOperationCompleted && typ != EventEndpointIdentityObserved && typ != EventEndpointDeleted && (state.OperationState == OperationStatePending || state.OperationState == OperationStateFailed || state.OperationState == OperationStateAmbiguous) {
 		return false
 	}
 	if typ != EventOperationCompleted && event.ObservedState != state.ObservedState {
@@ -592,13 +535,12 @@ func validEventTransition(state State, typ EventType, event Event) bool {
 			event.DesiredState == state.DesiredState && event.ObservedState == state.ObservedState &&
 			event.OperationState == state.OperationState && event.Generation == state.Generation &&
 			event.EffectID == "" && event.EffectKind == ""
-	case EventLegacyMetadataRestored:
-		return event.OperationID == state.OperationID && event.DesiredState == state.DesiredState &&
-			event.ObservedState == state.ObservedState && event.OperationState == state.OperationState &&
-			event.Generation == state.Generation && event.EffectID == "" && event.EffectKind == ""
 	case EventEndpointDeleted:
-		return state.DesiredState == DesiredStateRemoving && event.OperationID == state.OperationID &&
-			(state.OperationState == OperationStatePending || state.OperationState == OperationStateFailed || state.OperationState == OperationStateAmbiguous || state.OperationState == OperationStateSucceeded) &&
+		operationSettled := state.OperationState == OperationStatePending || state.OperationState == OperationStateFailed ||
+			state.OperationState == OperationStateAmbiguous || state.OperationState == OperationStateSucceeded
+		importedRemoval := state.OperationState == OperationStateIdle && state.OperationID == "" && state.Generation == 0
+		return state.DesiredState == DesiredStateRemoving && (event.OperationID == state.OperationID || importedRemoval) &&
+			(operationSettled || importedRemoval) && event.OperationID != "" &&
 			event.DesiredState == DesiredStateDeleted && event.ObservedState == adapterapi.ObservedStateStopped && event.OperationState == OperationStateIdle &&
 			event.Generation == state.Generation && event.EffectID == "" && event.EffectKind == ""
 	default:

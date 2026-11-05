@@ -15,16 +15,15 @@ import (
 	"Scardice-core/dice"
 )
 
+func newBanAPIFixture(t *testing.T, token string) (*dice.Dice, *dice.BanListInfo) {
+	t.Helper()
+	_, manager, runtime, _ := newDiceConfigDurableHandlerTest(t)
+	manager.AccessTokens.Store(token, true)
+	return runtime, runtime.Config().BanList
+}
+
 func TestBanConfigSetPersistsNotificationInterval(t *testing.T) {
-	// Given
-	previousDice := myDice
-	t.Cleanup(func() { myDice = previousDice })
-	manager := &dice.DiceManager{}
-	manager.AccessTokens.Store("task5-token", true)
-	myDice = &dice.Dice{
-		Parent: manager,
-		Config: dice.Config{BanConfig: dice.BanConfig{BanList: &dice.BanListInfo{}}},
-	}
+	newBanAPIFixture(t, "task5-token")
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/ban/config", strings.NewReader(`{"banNotifyIntervalMinutes":-1}`))
 	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
@@ -41,28 +40,20 @@ func TestBanConfigSetPersistsNotificationInterval(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("ban config status = %d, want %d", rec.Code, http.StatusOK)
 	}
-	if myDice.Config.BanList.BanNotifyIntervalMinutes != -1 {
-		t.Fatalf("ban notification interval = %d, want -1", myDice.Config.BanList.BanNotifyIntervalMinutes)
+	if got := myDice.Config().BanList.BanNotifyIntervalMinutes; got != -1 {
+		t.Fatalf("ban notification interval = %d, want -1", got)
 	}
 }
 func TestBanMapListReadsRuntimeItemsWithoutDatabaseOperator(t *testing.T) {
-	previousDice := myDice
-	t.Cleanup(func() { myDice = previousDice })
-
-	manager := &dice.DiceManager{}
-	manager.AccessTokens.Store("ban-list-token", true)
-	banList := &dice.BanListInfo{}
-	banList.Init()
-	banList.Map.Store("QQ:12345", &dice.BanListInfoItem{
-		ID: "QQ:12345", Name: "member", Rank: dice.BanRankBanned, Score: 200, BanUpdatedAt: 20,
-		Reasons: []string{"manual ban"},
-	})
-	banList.Map.Store("QQ:00001", &dice.BanListInfoItem{
-		ID: "QQ:00001", Name: "trusted", Rank: dice.BanRankTrusted, BanUpdatedAt: 10,
-	})
-	myDice = &dice.Dice{
-		Parent: manager,
-		Config: dice.Config{BanConfig: dice.BanConfig{BanList: banList}},
+	_, banList := newBanAPIFixture(t, "ban-list-token")
+	if err := banList.ImportItems(myDice, []*dice.BanListInfoItem{
+		{
+			ID: "QQ:12345", Name: "member", Rank: dice.BanRankBanned, Score: 200, BanUpdatedAt: 20,
+			Reasons: []string{"manual ban"},
+		},
+		{ID: "QQ:00001", Name: "trusted", Rank: dice.BanRankTrusted, BanUpdatedAt: 10},
+	}); err != nil {
+		t.Fatal(err)
 	}
 
 	e := echo.New()
@@ -86,14 +77,7 @@ func TestBanMapListReadsRuntimeItemsWithoutDatabaseOperator(t *testing.T) {
 }
 
 func TestBanMapListReturnsEmptyArrayWithoutDatabaseOperator(t *testing.T) {
-	previousDice := myDice
-	t.Cleanup(func() { myDice = previousDice })
-
-	manager := &dice.DiceManager{}
-	manager.AccessTokens.Store("ban-list-token", true)
-	banList := &dice.BanListInfo{}
-	banList.Init()
-	myDice = &dice.Dice{Parent: manager, Config: dice.Config{BanConfig: dice.BanConfig{BanList: banList}}}
+	_, _ = newBanAPIFixture(t, "ban-list-token")
 
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodGet, "/sd-api/banconfig/list", nil)
@@ -115,19 +99,7 @@ func TestBanMapListReturnsEmptyArrayWithoutDatabaseOperator(t *testing.T) {
 }
 
 func TestBanMapAddAndDeleteWorkWithoutDatabaseOperator(t *testing.T) {
-	previousDice, previousManager := myDice, dm
-	t.Cleanup(func() {
-		myDice, dm = previousDice, previousManager
-	})
-
-	manager := &dice.DiceManager{}
-	manager.AccessTokens.Store("ban-list-token", true)
-	dm = manager
-	runtime := &dice.Dice{Parent: manager}
-	banList := &dice.BanListInfo{Parent: runtime}
-	banList.Init()
-	runtime.Config.BanList = banList
-	myDice = runtime
+	_, banList := newBanAPIFixture(t, "ban-list-token")
 
 	e := echo.New()
 	addRequest := httptest.NewRequest(http.MethodPost, "/sd-api/banconfig/map_add_one", strings.NewReader(
@@ -163,19 +135,7 @@ func TestBanMapAddAndDeleteWorkWithoutDatabaseOperator(t *testing.T) {
 }
 
 func TestBanMapAddSupportsEveryBanRank(t *testing.T) {
-	previousDice, previousManager := myDice, dm
-	t.Cleanup(func() {
-		myDice, dm = previousDice, previousManager
-	})
-
-	manager := &dice.DiceManager{}
-	manager.AccessTokens.Store("ban-list-token", true)
-	dm = manager
-	runtime := &dice.Dice{Parent: manager}
-	banList := &dice.BanListInfo{Parent: runtime}
-	banList.Init()
-	runtime.Config.BanList = banList
-	myDice = runtime
+	_, banList := newBanAPIFixture(t, "ban-list-token")
 
 	tests := []struct {
 		id        string
@@ -213,19 +173,7 @@ func TestBanMapAddSupportsEveryBanRank(t *testing.T) {
 }
 
 func TestBanImportAndExportWorkWithoutDatabaseOperator(t *testing.T) {
-	previousDice, previousManager := myDice, dm
-	t.Cleanup(func() {
-		myDice, dm = previousDice, previousManager
-	})
-
-	manager := &dice.DiceManager{}
-	manager.AccessTokens.Store("ban-list-token", true)
-	dm = manager
-	runtime := &dice.Dice{Parent: manager}
-	banList := &dice.BanListInfo{Parent: runtime}
-	banList.Init()
-	runtime.Config.BanList = banList
-	myDice = runtime
+	_, banList := newBanAPIFixture(t, "ban-list-token")
 
 	var body bytes.Buffer
 	form := multipart.NewWriter(&body)

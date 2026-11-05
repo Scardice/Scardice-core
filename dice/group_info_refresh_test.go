@@ -11,8 +11,10 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
+	"gorm.io/gorm"
 
 	"Scardice-core/adapterapi"
+	"Scardice-core/core/execution"
 	"Scardice-core/core/groupstate"
 	"Scardice-core/core/messageflow"
 	"Scardice-core/core/playerstate"
@@ -30,31 +32,15 @@ func TestDurableJSCallbackStagesGroupInfoRefreshAfterClosingScript(t *testing.T)
 }
 
 func testDurableCallbackStagesCooledGroupInfoRefresh(t *testing.T, script bool) {
-	instance, endpoint, _, cleanup := newExecuteNewTestDice(t)
+	instance, runtimeEndpoint, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 	ctx := context.Background()
-	database, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
-		Type: "sqlite",
-		DSN:  t.TempDir() + "/callback-group-refresh.db",
-	})
-	if err != nil {
-		t.Fatal(err)
+	store, ok := instance.DurableStore.(*eventstore.GORMStore)
+	if !ok {
+		t.Fatal("callback group refresh requires the canonical GORM EventStore")
 	}
-	defer database.Close()
-	keys := groupInfoRefreshKeySource{}
-	store := eventstore.NewStore(database, eventstore.WithKeySource(keys))
-	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode:                 "import",
-		SchemaVersion:        1,
-		DatabaseIdentity:     "callback-group-refresh-db",
-		IndexRootID:          "group-refresh-index-v1",
-		EncryptionRootIDs:    []string{"group-refresh-root-v1"},
-		SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32),
-		CompletedAt:          time.Unix(1, 0).UTC(),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	projected := projectCallbackTestEndpoint(t, instance, store, runtimeEndpoint)
+	endpoint := projected.info
 	endpointID := adapterapi.EndpointID(endpoint.ID)
 	resolver := groupInfoRefreshResolver{snapshot: messageflow.EndpointSnapshot{
 		EndpointID:    endpointID,
@@ -63,20 +49,18 @@ func testDurableCallbackStagesCooledGroupInfoRefresh(t *testing.T, script bool) 
 		ObservedState: adapterapi.ObservedStateConnected,
 		Capabilities:  adapterapi.CapabilityOutbound | adapterapi.CapabilityActions,
 		Actions:       adapterapi.ActionSet(0).With(adapterapi.ActionKindGroupInfoRefresh),
-		IndexRootID:   "group-refresh-index-v1",
-		IndexSigner:   store,
 	}}
-	outbound, err := messageflow.NewOutboundService(store, resolver, store, eventstore.UUIDGenerator{})
+	outbound, err := messageflow.NewOutboundService(store, resolver, eventstore.UUIDGenerator{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	instance.DurableStore = store
-	instance.OutboundBridge = NewDurableOutboundBridge(outbound, resolver, eventstore.UUIDGenerator{})
+	instance.OutboundBridge = NewDurableOutboundBridge(outbound, resolver, eventstore.UUIDGenerator{}, newBridgeTestNotificationOwner(t))
 	host := NewDurableCallbackHost(instance)
 	groupID := "QQ-Group:2002"
+	seedGroupInfoRefreshCallbackConversation(t, instance, endpoint, groupID, "QQ:1001", "callback-refresh-source")
 	request := messageflow.CallbackRequest{
-		InboxID:    "inbox-group-refresh-1",
-		EndpointID: endpoint.ID,
+		InboxID: "inbox-group-refresh-1", EndpointID: endpoint.ID,
+		Generation: projected.state.Generation, DesiredVersion: projected.state.DesiredVersion,
 		Message: adapterapi.InboundMessage{
 			ProviderEventID:  "provider-group-refresh-1",
 			MessageID:        "message-group-refresh-1",
@@ -89,14 +73,6 @@ func testDurableCallbackStagesCooledGroupInfoRefresh(t *testing.T, script bool) 
 			Text:             "hello",
 		},
 		Scope: messageflow.CallbackScope{DiceID: instance.BaseConfig.Name, GroupID: groupID, UserID: "QQ:1001"},
-		Group: groupstate.State{
-			Version:      1,
-			DiceID:       instance.BaseConfig.Name,
-			GroupID:      groupID,
-			Active:       true,
-			DiceIDActive: map[string]bool{endpoint.UserID: true},
-			DiceIDExists: map[string]bool{endpoint.UserID: true},
-		}.CompatibilityView(),
 	}
 	if script {
 		loop := gojaengine.WrapEventLoop(startFsTestLoop(t))
@@ -110,13 +86,10 @@ func testDurableCallbackStagesCooledGroupInfoRefresh(t *testing.T, script bool) 
 		}
 		request.Message.Text = ".refreshprobe"
 	}
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
+	collector := execution.NewMutationCollector(eventstore.EventFactory{})
 	callbackResult, err := host.HandleCallback(ctx, request, playerstate.NewLocalOverlay(), collector)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if callbackResult.Release != nil {
-		callbackResult.Release()
 	}
 	work, err := collector.UnitOfWork()
 	if err != nil {
@@ -126,38 +99,36 @@ func testDurableCallbackStagesCooledGroupInfoRefresh(t *testing.T, script bool) 
 		t.Fatalf("callback refresh participants = effects:%d operations:%d", len(work.Effects), len(work.Operations))
 	}
 	persisted := work.Effects[0]
-	plain, err := store.DecryptBound(ctx, "outbox/v1", persisted.EffectID, persisted.EndpointID, 1, persisted.PayloadCiphertext, persisted.PayloadNonce, persisted.PayloadEncryptionKeyID)
-	if err != nil {
-		t.Fatal(err)
-	}
 	var wire struct {
 		Effect adapterapi.OutboundEffect `json:"effect"`
 	}
-	if err := json.Unmarshal(plain, &wire); err != nil {
+	if err := json.Unmarshal(persisted.Payload, &wire); err != nil {
 		t.Fatal(err)
 	}
 	if wire.Effect.Payload.Kind != adapterapi.EffectPayloadGroupInfoRefresh ||
 		wire.Effect.Payload.Target.Conversation != adapterapi.ConversationID(groupID) {
 		t.Fatalf("callback refresh effect = %#v", wire.Effect)
 	}
-	var storedEffects int64
-	if err := database.GORM().Table("outbox_effects").Count(&storedEffects).Error; err != nil {
+	hasOutboxWork, err := store.HasOutboxWork(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if storedEffects != 0 {
-		t.Fatalf("callback refresh committed outside collector: %d", storedEffects)
+	if hasOutboxWork {
+		t.Fatal("callback refresh committed outside its collector")
 	}
+	commitGroupInfoRefreshCallbackWork(t, store, work, callbackResult)
 
 	request.InboxID = "inbox-group-refresh-2"
 	request.Message.ProviderEventID = "provider-group-refresh-2"
 	request.Message.MessageID = "message-group-refresh-2"
-	secondCollector := messageflow.NewMutationCollector(eventstore.EventFactory{})
+	// A first-time sender makes the second callback mutate durable state while
+	// the group refresh cooldown still suppresses a duplicate effect.
+	request.Message.Sender = "QQ:1002"
+	request.Scope.UserID = "QQ:1002"
+	secondCollector := execution.NewMutationCollector(eventstore.EventFactory{})
 	secondResult, err := host.HandleCallback(ctx, request, playerstate.NewLocalOverlay(), secondCollector)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if secondResult.Release != nil {
-		secondResult.Release()
 	}
 	secondWork, err := secondCollector.UnitOfWork()
 	if err != nil {
@@ -166,21 +137,93 @@ func testDurableCallbackStagesCooledGroupInfoRefresh(t *testing.T, script bool) 
 	if len(secondWork.Effects) != 0 {
 		t.Fatalf("cooldown staged duplicate refresh effects: %d", len(secondWork.Effects))
 	}
+	commitGroupInfoRefreshCallbackWork(t, store, secondWork, secondResult)
 }
 
-func TestDurableCallbackMergesObservedGroupNameAndStagesTypedDiff(t *testing.T) {
-	instance, endpoint, _, cleanup := newExecuteNewTestDice(t)
-	defer cleanup()
-	groupID := "QQ-Group:2002"
-	instance.Parent.GroupNameCache.Store(groupID, &GroupNameCacheItem{
-		Name: "Observed Group",
-		time: time.Now().Unix(),
+func seedGroupInfoRefreshCallbackConversation(
+	t *testing.T,
+	d *Dice,
+	endpoint *EndPointInfo,
+	groupID, userID, label string,
+) {
+	t.Helper()
+	withCanonicalTestMessageContext(t, d, endpoint, &Message{
+		Platform: "QQ", MessageType: "group", GroupID: groupID,
+		Sender: SenderBase{UserID: userID, Nickname: "Refresh Source"},
+	}, label, func(ctx *MsgContext) error {
+		return ctx.Group.SetActivation(endpoint.UserID, true, true)
 	})
+}
+
+func commitGroupInfoRefreshCallbackWork(
+	t *testing.T,
+	store *eventstore.GORMStore,
+	work eventstore.UnitOfWork,
+	result messageflow.CallbackResult,
+) {
+	t.Helper()
+	locked := false
+	if result.CommitFence != nil {
+		if !result.CommitFence.TryLock() {
+			t.Fatal("callback commit fence is busy")
+		}
+		locked = true
+	}
+	_, err := store.Commit(context.Background(), work)
+	if err == nil && result.PublishCommitted != nil {
+		result.PublishCommitted()
+	}
+	if locked {
+		result.CommitFence.Unlock()
+	}
+	if err != nil {
+		if result.Release != nil {
+			result.Release()
+		}
+		t.Fatalf("commit callback work: %v", err)
+	}
+	if result.AfterCommit != nil {
+		result.AfterCommit()
+	}
+	if result.Release != nil {
+		result.Release()
+	}
+}
+
+func TestDurableCallbackDoesNotRestageCommittedGroupInfoObservation(t *testing.T) {
+	instance, runtimeEndpoint, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	store, ok := instance.DurableStore.(*eventstore.GORMStore)
+	if !ok {
+		t.Fatal("observed-name callback requires the canonical GORM EventStore")
+	}
+	projected := projectCallbackTestEndpoint(t, instance, store, runtimeEndpoint)
+	endpoint := projected.info
+	groupID := "QQ-Group:2002"
+	seedGroupInfoRefreshCallbackConversation(t, instance, endpoint, groupID, "QQ:1001", "observed-name-source")
+	observation := adapterapi.SucceededGroupInfoResult(adapterapi.GroupInfoResult{
+		Conversation: adapterapi.ConversationID(groupID),
+		Name:         "Observed Group",
+	})
+	NewGroupInfoRefreshSuccessNotifier(instance).
+		NotifyOutboundEffectSucceeded(context.Background(), groupInfoRefreshEffect(t, groupID), observation)
+	repository := groupstate.NewRepository(store)
+	persisted, err := repository.Load(context.Background(), instance.BaseConfig.Name, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.GroupName != "Observed Group" {
+		t.Fatalf("provider observation was not persisted before callback: %q", persisted.GroupName)
+	}
+	cached, ok := instance.Parent.GroupNameCache.Load(groupID)
+	if !ok || cached == nil || cached.Name != "Observed Group" {
+		t.Fatalf("provider observation was not published after persistence: %#v, exists=%t", cached, ok)
+	}
 	host := NewDurableCallbackHost(instance)
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
+	collector := execution.NewMutationCollector(eventstore.EventFactory{})
 	request := messageflow.CallbackRequest{
-		InboxID:    "inbox-observed-group-name",
-		EndpointID: endpoint.ID,
+		InboxID: "inbox-observed-group-name", EndpointID: endpoint.ID,
+		Generation: projected.state.Generation, DesiredVersion: projected.state.DesiredVersion,
 		Message: adapterapi.InboundMessage{
 			ProviderEventID:  "provider-observed-group-name",
 			MessageID:        "message-observed-group-name",
@@ -193,25 +236,10 @@ func TestDurableCallbackMergesObservedGroupNameAndStagesTypedDiff(t *testing.T) 
 			Text:             "hello",
 		},
 		Scope: messageflow.CallbackScope{DiceID: instance.BaseConfig.Name, GroupID: groupID, UserID: "QQ:1001"},
-		Group: groupstate.State{
-			Version:      1,
-			DiceID:       instance.BaseConfig.Name,
-			GroupID:      groupID,
-			Active:       true,
-			DiceIDActive: map[string]bool{endpoint.UserID: true},
-			DiceIDExists: map[string]bool{endpoint.UserID: true},
-		}.CompatibilityView(),
 	}
 	callbackResult, err := host.HandleCallback(context.Background(), request, playerstate.NewLocalOverlay(), collector)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if callbackResult.Release != nil {
-		callbackResult.Release()
-	}
-	group, ok := instance.ImSession.ServiceAtNew.Load(groupID)
-	if !ok || group == nil || group.GroupName != "Observed Group" {
-		t.Fatalf("compatibility group after callback = %#v, exists=%t", group, ok)
 	}
 	work, err := collector.UnitOfWork()
 	if err != nil {
@@ -225,65 +253,64 @@ func TestDurableCallbackMergesObservedGroupNameAndStagesTypedDiff(t *testing.T) 
 			}
 		}
 	}
-	if !foundNameDiff {
-		t.Fatalf("observed group name was not staged as typed group diff: %#v", work.Streams)
+	if foundNameDiff {
+		t.Fatalf("callback restaged an already committed provider observation: %#v", work.Streams)
+	}
+	commitGroupInfoRefreshCallbackWork(t, store, work, callbackResult)
+	persisted, err = repository.Load(context.Background(), instance.BaseConfig.Name, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.GroupName != "Observed Group" {
+		t.Fatalf("persisted observed group name = %q", persisted.GroupName)
 	}
 }
 
-func TestGroupInfoRefreshObserverBusyHostCachesAndPreservesKnownCounts(t *testing.T) {
-	manager := &DiceManager{}
-	d := &Dice{
-		Parent:      manager,
-		Logger:      zap.NewNop().Sugar(),
-		DirtyGroups: new(SyncMap[string, int64]),
-	}
-	d.ImSession = &IMSession{Parent: d, ServiceAtNew: new(SyncMap[string, *GroupInfo])}
+func TestGroupInfoRefreshObserverPersistsBeforeCacheAndPreservesKnownCounts(t *testing.T) {
+	d, store := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:9001")
 	groupID := "QQ-Group:2002"
-	group := &GroupInfo{GroupID: groupID, GroupName: "Old Group"}
-	d.ImSession.ServiceAtNew.Store(groupID, group)
-	manager.GroupNameCache.Store(groupID, &GroupNameCacheItem{
-		Name:                "Old Group",
-		MemberCount:         40,
-		MaxMemberCount:      500,
-		MemberCountKnown:    true,
-		MaxMemberCountKnown: true,
+	withCanonicalTestMessageContext(t, d, endpoint, &Message{
+		MessageType: "group", GroupID: groupID, GroupName: "Old Group",
+		Sender: SenderBase{UserID: "QQ:1001", Nickname: "Alice"},
+	}, "seed-observed-group", func(ctx *MsgContext) error {
+		return ctx.Group.SetGroupName("Old Group")
 	})
-	host := NewDurableCallbackHost(d)
-	notifier := NewGroupInfoRefreshSuccessNotifier(d, host)
+	d.Parent.GroupNameCache.Store(groupID, &GroupNameCacheItem{
+		Name: "Old Group", MemberCount: 40, MaxMemberCount: 500,
+		MemberCountKnown: true, MaxMemberCountKnown: true,
+	})
+	notifier := NewGroupInfoRefreshSuccessNotifier(d)
 	effect := groupInfoRefreshEffect(t, groupID)
 	result := adapterapi.SucceededGroupInfoResult(adapterapi.GroupInfoResult{
-		Conversation:     adapterapi.ConversationID(groupID),
-		Name:             "Observed Group",
-		MemberCount:      45,
-		MemberCountKnown: true,
+		Conversation: adapterapi.ConversationID(groupID), Name: "Observed Group",
+		MemberCount: 45, MemberCountKnown: true,
 	})
 
-	host.mu.Lock()
-	done := make(chan struct{})
-	go func() {
-		notifier.NotifyOutboundEffectSucceeded(context.Background(), effect, result)
-		close(done)
-	}()
-	select {
-	case <-done:
-		host.mu.Unlock()
-	case <-time.After(time.Second):
-		host.mu.Unlock()
-		<-done
-		t.Fatal("busy callback host blocked the success notifier")
-	}
+	notifier.NotifyOutboundEffectSucceeded(context.Background(), effect, result)
 
-	cached, ok := manager.GroupNameCache.Load(groupID)
+	persisted, err := groupstate.NewRepository(store).Load(context.Background(), d.BaseConfig.Name, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.GroupName != "Observed Group" {
+		t.Fatalf("persisted group name = %q, want Observed Group", persisted.GroupName)
+	}
+	cached, ok := d.Parent.GroupNameCache.Load(groupID)
 	if !ok || cached == nil || cached.Name != "Observed Group" ||
 		cached.MemberCount != 45 || !cached.MemberCountKnown ||
 		cached.MaxMemberCount != 500 || !cached.MaxMemberCountKnown {
 		t.Fatalf("cached group observation = %#v, exists=%t", cached, ok)
 	}
-	if group.GroupName != "Old Group" {
-		t.Fatalf("busy observer mutated compatibility group to %q", group.GroupName)
+
+	version := persisted.Version
+	notifier.NotifyOutboundEffectSucceeded(context.Background(), effect, result)
+	persisted, err = groupstate.NewRepository(store).Load(context.Background(), d.BaseConfig.Name, groupID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, dirty := d.DirtyGroups.Load(groupID); dirty {
-		t.Fatal("busy observer marked compatibility state dirty")
+	if persisted.Version != version {
+		t.Fatalf("duplicate observation advanced group version from %d to %d", version, persisted.Version)
 	}
 }
 
@@ -416,26 +443,28 @@ func TestMilkyGroupInfoRefreshMissingMaxDoesNotImplyDeparture(t *testing.T) {
 		t.Fatalf("missing maximum was reported as known: %#v", result.GroupInfo)
 	}
 
-	manager := &DiceManager{}
-	d := &Dice{Parent: manager, Logger: zap.NewNop().Sugar(), DirtyGroups: new(SyncMap[string, int64])}
-	d.ImSession = &IMSession{Parent: d, ServiceAtNew: new(SyncMap[string, *GroupInfo])}
-	membership := new(SyncMap[string, bool])
-	membership.Store("QQ:9001", true)
-	group := &GroupInfo{
-		GroupID:         "QQ-Group:2002",
-		GroupName:       "Old Group",
-		DiceIDExistsMap: membership,
-	}
-	d.ImSession.ServiceAtNew.Store(group.GroupID, group)
+	d, store := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:9001")
+	groupID := "QQ-Group:2002"
+	withCanonicalTestMessageContext(t, d, endpoint, &Message{
+		MessageType: "group", GroupID: groupID, GroupName: "Old Group",
+		Sender: SenderBase{UserID: "QQ:1001", Nickname: "Alice"},
+	}, "seed-milky-observation", func(ctx *MsgContext) error {
+		return ctx.Group.SetActivation(endpoint.UserID, true, true)
+	})
 
-	NewGroupInfoRefreshSuccessNotifier(d, NewDurableCallbackHost(d)).NotifyOutboundEffectSucceeded(context.Background(), effect, result)
+	NewGroupInfoRefreshSuccessNotifier(d).NotifyOutboundEffectSucceeded(context.Background(), effect, result)
 
-	cached, ok := manager.GroupNameCache.Load(group.GroupID)
+	cached, ok := d.Parent.GroupNameCache.Load(groupID)
 	if !ok || cached == nil || cached.Name != "Milky Group" ||
 		!cached.MemberCountKnown || cached.MemberCount != 23 || cached.MaxMemberCountKnown {
 		t.Fatalf("canonical Milky group cache = %#v, exists=%t", cached, ok)
 	}
-	if exists, ok := membership.Load("QQ:9001"); !ok || !exists {
+	persisted, err := groupstate.NewRepository(store).Load(context.Background(), d.BaseConfig.Name, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !persisted.DiceIDExists[endpoint.UserID] {
 		t.Fatal("unknown maximum count removed known endpoint membership")
 	}
 }
@@ -479,17 +508,15 @@ func TestMilkyGroupInfoRefreshProviderFailureIsRetryable(t *testing.T) {
 	}
 }
 
-func TestOnebotGroupInfoRefreshProviderResponseUpdatesCanonicalCache(t *testing.T) {
-	manager := &DiceManager{}
-	d := &Dice{
-		Parent:      manager,
-		Logger:      zap.NewNop().Sugar(),
-		DirtyGroups: new(SyncMap[string, int64]),
-	}
-	d.ImSession = &IMSession{Parent: d, ServiceAtNew: new(SyncMap[string, *GroupInfo])}
-	group := &GroupInfo{GroupID: "QQ-Group:2002", GroupName: "Old Group"}
-	d.ImSession.ServiceAtNew.Store(group.GroupID, group)
-	effect := groupInfoRefreshEffect(t, group.GroupID)
+func TestOnebotGroupInfoRefreshProviderResponseUpdatesCanonicalState(t *testing.T) {
+	d, store := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:9001")
+	groupID := "QQ-Group:2002"
+	withCanonicalTestMessageContext(t, d, endpoint, &Message{
+		MessageType: "group", GroupID: groupID, GroupName: "Old Group",
+		Sender: SenderBase{UserID: "QQ:1001", Nickname: "Alice"},
+	}, "seed-provider-observation", func(*MsgContext) error { return nil })
+	effect := groupInfoRefreshEffect(t, groupID)
 	outbound := &onebotOutboundFake{
 		rawResponse: []byte(`{"status":"ok","retcode":0,"data":{"group_id":2002,"group_name":"Canonical Group","member_count":45,"max_member_count":500}}`),
 	}
@@ -498,70 +525,148 @@ func TestOnebotGroupInfoRefreshProviderResponseUpdatesCanonicalCache(t *testing.
 		t.Fatalf("provider result = %#v", result)
 	}
 
-	NewGroupInfoRefreshSuccessNotifier(d, NewDurableCallbackHost(d)).NotifyOutboundEffectSucceeded(context.Background(), effect, result)
+	NewGroupInfoRefreshSuccessNotifier(d).NotifyOutboundEffectSucceeded(context.Background(), effect, result)
 
-	cached, ok := manager.GroupNameCache.Load(group.GroupID)
+	persisted, err := groupstate.NewRepository(store).Load(context.Background(), d.BaseConfig.Name, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.GroupName != "Canonical Group" {
+		t.Fatalf("persisted group name = %q", persisted.GroupName)
+	}
+	cached, ok := d.Parent.GroupNameCache.Load(groupID)
 	if !ok || cached == nil || cached.Name != "Canonical Group" ||
 		cached.MemberCount != 45 || cached.MaxMemberCount != 500 ||
 		!cached.MemberCountKnown || !cached.MaxMemberCountKnown {
 		t.Fatalf("canonical group cache = %#v, exists=%t", cached, ok)
 	}
-	if group.GroupName != "Canonical Group" {
-		t.Fatalf("compatibility group name = %q", group.GroupName)
-	}
-	if _, dirty := d.DirtyGroups.Load(group.GroupID); !dirty {
-		t.Fatal("compatibility group update was not marked dirty")
-	}
 }
 
 func TestGroupInfoRefreshSuccessNotifierRejectsMismatchedObservation(t *testing.T) {
-	manager := &DiceManager{}
-	d := &Dice{Parent: manager, Logger: zap.NewNop().Sugar(), DirtyGroups: new(SyncMap[string, int64])}
-	d.ImSession = &IMSession{Parent: d, ServiceAtNew: new(SyncMap[string, *GroupInfo])}
-	group := &GroupInfo{GroupID: "QQ-Group:2002", GroupName: "Original Group"}
-	d.ImSession.ServiceAtNew.Store(group.GroupID, group)
-	notifier := NewGroupInfoRefreshSuccessNotifier(d, NewDurableCallbackHost(d))
+	d, store := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:9001")
+	groupID := "QQ-Group:2002"
+	withCanonicalTestMessageContext(t, d, endpoint, &Message{
+		MessageType: "group", GroupID: groupID, GroupName: "Original Group",
+		Sender: SenderBase{UserID: "QQ:1001", Nickname: "Alice"},
+	}, "seed-mismatch-observation", func(ctx *MsgContext) error { return ctx.Group.SetGroupName("Original Group") })
+	notifier := NewGroupInfoRefreshSuccessNotifier(d)
 	result := adapterapi.SucceededGroupInfoResult(adapterapi.GroupInfoResult{
-		Conversation:        "QQ-Group:9999",
-		Name:                "Wrong Group",
-		MemberCount:         1,
-		MaxMemberCount:      500,
-		MemberCountKnown:    true,
-		MaxMemberCountKnown: true,
+		Conversation: "QQ-Group:9999", Name: "Wrong Group",
+		MemberCount: 1, MaxMemberCount: 500,
+		MemberCountKnown: true, MaxMemberCountKnown: true,
 	})
 
-	notifier.NotifyOutboundEffectSucceeded(context.Background(), groupInfoRefreshEffect(t, group.GroupID), result)
+	notifier.NotifyOutboundEffectSucceeded(context.Background(), groupInfoRefreshEffect(t, groupID), result)
 
-	if _, ok := manager.GroupNameCache.Load(group.GroupID); ok {
+	if _, ok := d.Parent.GroupNameCache.Load(groupID); ok {
 		t.Fatal("mismatched observation updated the canonical cache")
 	}
-	if group.GroupName != "Original Group" {
-		t.Fatalf("mismatched observation changed compatibility group to %q", group.GroupName)
+	persisted, err := groupstate.NewRepository(store).Load(context.Background(), d.BaseConfig.Name, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.GroupName != "Original Group" {
+		t.Fatalf("mismatched observation changed canonical group to %q", persisted.GroupName)
 	}
 }
 
-type groupInfoRefreshKeySource struct{}
+func TestGroupInfoRefreshSuccessNotifierDoesNotCacheFailedPersistence(t *testing.T) {
+	d, store := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:9001")
+	groupID := "QQ-Group:2002"
+	store.RegisterParticipant(func(_ context.Context, tx *gorm.DB, _ eventstore.UnitOfWork) error {
+		return tx.Exec(`
+			CREATE TRIGGER IF NOT EXISTS reject_group_info_write
+			BEFORE INSERT ON domain_events
+			WHEN NEW.aggregate_type = 'group' AND NEW.event_type = 'group.name_changed'
+			BEGIN SELECT RAISE(ABORT, 'rejected_group_info_write'); END
+		`).Error
+	})
+	withCanonicalTestMessageContext(t, d, endpoint, &Message{
+		MessageType: "group", GroupID: groupID, GroupName: "Original Group",
+		Sender: SenderBase{UserID: "QQ:1001", Nickname: "Alice"},
+	}, "seed-group-before-rejected-observation", func(ctx *MsgContext) error {
+		return ctx.Group.SetGroupName("Original Group")
+	})
+	d.Parent.GroupNameCache.Store(groupID, &GroupNameCacheItem{Name: "Original Group"})
+	core, observed := observer.New(zapcore.ErrorLevel)
+	d.Logger = zap.New(core).Sugar()
+	notifier := NewGroupInfoRefreshSuccessNotifier(d)
+	result := adapterapi.SucceededGroupInfoResult(adapterapi.GroupInfoResult{
+		Conversation: adapterapi.ConversationID(groupID), Name: "Uncommitted Group",
+	})
 
-func (groupInfoRefreshKeySource) IndexRootID(context.Context) (string, error) {
-	return "group-refresh-index-v1", nil
-}
+	notifier.NotifyOutboundEffectSucceeded(context.Background(), groupInfoRefreshEffect(t, groupID), result)
 
-func (groupInfoRefreshKeySource) IndexRootMaterial(context.Context) ([]byte, error) {
-	return []byte("01234567890123456789012345678901"), nil
-}
-
-func (groupInfoRefreshKeySource) CurrentEncryptionRoot(context.Context) (eventstore.EncryptionRoot, error) {
-	return eventstore.EncryptionRoot{
-		ID:       "group-refresh-root-v1",
-		Material: []byte("abcdefghijklmnopqrstuvwxyz123456"),
-	}, nil
-}
-
-func (groupInfoRefreshKeySource) EncryptionRoot(_ context.Context, id string) ([]byte, error) {
-	if id != "group-refresh-root-v1" {
-		return nil, eventstore.ErrKeyUnavailable
+	persisted, err := groupstate.ReadProjected(context.Background(), store, d.BaseConfig.Name, groupID)
+	if err != nil || persisted.GroupName != "Original Group" {
+		t.Fatalf("rejected observation changed committed group: %#v, err=%v", persisted, err)
 	}
-	return []byte("abcdefghijklmnopqrstuvwxyz123456"), nil
+	if cached, ok := d.Parent.GroupNameCache.Load(groupID); !ok || cached.Name != "Original Group" {
+		t.Fatalf("failed persistence published cache authority: %#v, exists=%t", cached, ok)
+	}
+	if observed.FilterMessageSnippet("eventstore: insert domain events failed").Len() == 0 {
+		t.Error("group observation did not report the rejected SQLite insert")
+	}
+}
+
+func TestGroupInfoRefreshSuccessNotifierRespectsCanceledOwner(t *testing.T) {
+	d, store := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:9001")
+	groupID := "QQ-Group:2002"
+	withCanonicalTestMessageContext(t, d, endpoint, &Message{
+		MessageType: "group", GroupID: groupID, GroupName: "Original Group",
+		Sender: SenderBase{UserID: "QQ:1001", Nickname: "Alice"},
+	}, "seed-group-before-canceled-observation", func(ctx *MsgContext) error {
+		return ctx.Group.SetGroupName("Original Group")
+	})
+	d.Parent.GroupNameCache.Store(groupID, &GroupNameCacheItem{Name: "Original Group"})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result := adapterapi.SucceededGroupInfoResult(adapterapi.GroupInfoResult{
+		Conversation: adapterapi.ConversationID(groupID), Name: "Canceled Group",
+	})
+
+	NewGroupInfoRefreshSuccessNotifier(d).NotifyOutboundEffectSucceeded(ctx, groupInfoRefreshEffect(t, groupID), result)
+
+	persisted, err := groupstate.ReadProjected(context.Background(), store, d.BaseConfig.Name, groupID)
+	if err != nil || persisted.GroupName != "Original Group" {
+		t.Fatalf("canceled notification changed committed group: %#v, err=%v", persisted, err)
+	}
+	if cached, ok := d.Parent.GroupNameCache.Load(groupID); !ok || cached.Name != "Original Group" {
+		t.Fatalf("canceled notification changed cache: %#v, exists=%t", cached, ok)
+	}
+}
+
+func TestGroupInfoRefreshSuccessNotifierIgnoresStaleObservation(t *testing.T) {
+	d, store := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:9001")
+	groupID := "QQ-Group:2002"
+	withCanonicalTestMessageContext(t, d, endpoint, &Message{
+		MessageType: "group", GroupID: groupID, GroupName: "Fresh Group",
+		Sender: SenderBase{UserID: "QQ:1001", Nickname: "Alice"},
+	}, "seed-fresh-observation", func(ctx *MsgContext) error { return ctx.Group.SetGroupName("Fresh Group") })
+	d.Parent.GroupNameCache.Store(groupID, &GroupNameCacheItem{Name: "Fresh Group", time: time.Now().Unix()})
+	effect := groupInfoRefreshEffect(t, groupID)
+	effect.Deadline = time.Now().Add(-time.Hour)
+	result := adapterapi.SucceededGroupInfoResult(adapterapi.GroupInfoResult{
+		Conversation: adapterapi.ConversationID(groupID), Name: "Stale Group",
+	})
+
+	NewGroupInfoRefreshSuccessNotifier(d).NotifyOutboundEffectSucceeded(context.Background(), effect, result)
+
+	persisted, err := groupstate.NewRepository(store).Load(context.Background(), d.BaseConfig.Name, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.GroupName != "Fresh Group" {
+		t.Fatalf("stale observation changed canonical name to %q", persisted.GroupName)
+	}
+	cached, _ := d.Parent.GroupNameCache.Load(groupID)
+	if cached == nil || cached.Name != "Fresh Group" {
+		t.Fatalf("stale observation changed display cache: %#v", cached)
+	}
 }
 
 type groupInfoRefreshResolver struct {
@@ -592,17 +697,12 @@ func TestEndPointGetGroupInfoAsyncPersistsDurableRefreshWithoutAdapter(t *testin
 	}
 	t.Cleanup(func() { _ = database.Close() })
 
-	keys := groupInfoRefreshKeySource{}
-	store := eventstore.NewStore(database, eventstore.WithKeySource(keys))
+	store := eventstore.NewStore(database)
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode:                 "import",
-		SchemaVersion:        1,
-		DatabaseIdentity:     "group-info-refresh-test-db",
-		IndexRootID:          "group-refresh-index-v1",
-		EncryptionRootIDs:    []string{"group-refresh-root-v1"},
-		SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32),
-		CompletedAt:          time.Unix(1, 0).UTC(),
+		Mode:             "import",
+		SchemaVersion:    2,
+		DatabaseIdentity: "group-info-refresh-test-db",
+		CompletedAt:      time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -615,10 +715,8 @@ func TestEndPointGetGroupInfoAsyncPersistsDurableRefreshWithoutAdapter(t *testin
 		ObservedState: adapterapi.ObservedStateConnected,
 		Capabilities:  adapterapi.CapabilityOutbound | adapterapi.CapabilityActions,
 		Actions:       adapterapi.ActionSet(0).With(adapterapi.ActionKindGroupInfoRefresh),
-		IndexRootID:   "group-refresh-index-v1",
-		IndexSigner:   store,
 	}}
-	outbound, err := messageflow.NewOutboundService(store, resolver, store, eventstore.UUIDGenerator{})
+	outbound, err := messageflow.NewOutboundService(store, resolver, eventstore.UUIDGenerator{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -626,7 +724,7 @@ func TestEndPointGetGroupInfoAsyncPersistsDurableRefreshWithoutAdapter(t *testin
 	d := &Dice{Logger: zap.NewNop().Sugar(), DurableStore: store}
 	session := &IMSession{Parent: d}
 	d.ImSession = session
-	d.OutboundBridge = NewDurableOutboundBridge(outbound, resolver, eventstore.UUIDGenerator{})
+	d.OutboundBridge = NewDurableOutboundBridge(outbound, resolver, eventstore.UUIDGenerator{}, newBridgeTestNotificationOwner(t))
 	endpoint := &EndPointInfo{EndPointInfoBase: EndPointInfoBase{
 		ID:           string(endpointID),
 		UserID:       "QQ:9001",
@@ -661,27 +759,25 @@ func TestEndPointGetGroupInfoAsyncPersistsDurableRefreshWithoutAdapter(t *testin
 	}
 
 	var row struct {
-		EffectID          string `gorm:"column:effect_id"`
-		EndpointID        string `gorm:"column:endpoint_id"`
-		PayloadCiphertext []byte `gorm:"column:payload_ciphertext"`
-		PayloadNonce      []byte `gorm:"column:payload_nonce"`
-		EncryptionKeyID   string `gorm:"column:encryption_key_id"`
+		EffectID   string `gorm:"column:effect_id"`
+		EndpointID string `gorm:"column:endpoint_id"`
+		Subject    string `gorm:"column:subject"`
+		Payload    []byte `gorm:"column:payload"`
 	}
 	if err := database.GORM().Table("outbox_effects").Take(&row).Error; err != nil {
-		t.Fatal(err)
-	}
-	plain, err := store.DecryptBound(ctx, "outbox/v1", row.EffectID, row.EndpointID, 1, row.PayloadCiphertext, row.PayloadNonce, row.EncryptionKeyID)
-	if err != nil {
 		t.Fatal(err)
 	}
 	var wire struct {
 		Effect adapterapi.OutboundEffect `json:"effect"`
 	}
-	if err := json.Unmarshal(plain, &wire); err != nil {
+	if err := json.Unmarshal(row.Payload, &wire); err != nil {
 		t.Fatal(err)
 	}
 	if err := wire.Effect.Validate(); err != nil {
 		t.Fatalf("persisted refresh effect is invalid: %v", err)
+	}
+	if string(wire.Effect.ID) != row.EffectID || string(wire.Effect.EndpointID) != row.EndpointID || row.Subject != "QQ-Group:2002" {
+		t.Fatalf("persisted refresh effect identity mismatch: row=%#v effect=%#v", row, wire.Effect)
 	}
 	payload := wire.Effect.Payload
 	if wire.Effect.Kind != adapterapi.EffectKindAction ||

@@ -86,7 +86,7 @@ func endpointRuntimeDiagnostics(ctx context.Context, id adapterapi.EndpointID, g
 	application := endpointServiceState.application
 	endpointServiceState.RUnlock()
 	provider, ok := application.(interface {
-		RuntimeDiagnostics(context.Context, adapterapi.EndpointID, uint64) (adapterapi.DiagnosticReport, error)
+		RuntimeDiagnostics(ctx context.Context, id adapterapi.EndpointID, generation uint64) (adapterapi.DiagnosticReport, error)
 	})
 	if !ok {
 		return adapterapi.DiagnosticReport{}, nil

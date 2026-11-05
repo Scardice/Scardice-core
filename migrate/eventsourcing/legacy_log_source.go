@@ -13,7 +13,6 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"Scardice-core/dice"
 	"Scardice-core/eventstore"
 )
 
@@ -24,7 +23,7 @@ const (
 	legacyLogRecordDomain  = "story-log-archive"
 )
 
-// legacyStoryLogImportPayload is the encrypted migration payload. Its explicit
+// legacyStoryLogImportPayload is the plaintext migration payload. Its explicit
 // JSON fields include values intentionally hidden by the public StoryLog JSON
 // views, such as DiceID, upload metadata, Removed, and ParentID.
 type legacyStoryLogImportPayload struct {
@@ -78,6 +77,36 @@ type legacyStoryLogStatePayload struct {
 	On        bool   `json:"on"`
 }
 
+// legacyStoryLogGroupSnapshot is the historical group_info JSON contract used
+// before GroupInfo became a live execution facade. Only archive-owned scalar
+// state is decoded; runtime handles, mutexes, and unrelated group fields are
+// intentionally not reconstructed.
+type legacyStoryLogGroupSnapshot struct {
+	GroupID string
+	LogName string
+	LogOn   bool
+}
+
+func decodeLegacyStoryLogGroupSnapshot(data []byte) (legacyStoryLogGroupSnapshot, error) {
+	fields, err := decodeLegacyGroupJSONFields(data)
+	if err != nil {
+		return legacyStoryLogGroupSnapshot{}, err
+	}
+	groupID, _, err := legacyGroupJSONString(fields, "groupId")
+	if err != nil {
+		return legacyStoryLogGroupSnapshot{}, err
+	}
+	logName, _, err := legacyGroupJSONString(fields, "logCurName")
+	if err != nil {
+		return legacyStoryLogGroupSnapshot{}, err
+	}
+	logOn, _, err := legacyGroupJSONBool(fields, "logOn")
+	if err != nil {
+		return legacyStoryLogGroupSnapshot{}, err
+	}
+	return legacyStoryLogGroupSnapshot{GroupID: groupID, LogName: logName, LogOn: logOn}, nil
+}
+
 func legacyStoryLogSourceID(sourceIdentity, diceID, groupID, kind string, legacyID uint64) string {
 	scopeDigest := sha256.Sum256([]byte(diceID + "\x00" + groupID))
 	return fmt.Sprintf("legacy-story-log/v1/%s/%s/%s/%d", sourceIdentity, hex.EncodeToString(scopeDigest[:]), kind, legacyID)
@@ -113,7 +142,7 @@ func legacyStoryLogSourceRecord(payload legacyStoryLogImportPayload) (SourceReco
 	}, nil
 }
 
-func streamLegacyStoryLogRecords(ctx context.Context, root *legacySourceRoot, dataDB *sql.DB, logPath, diceID, sourceIdentity string, yield func([]SourceRecord) error) (streamErr error) {
+func streamLegacyStoryLogRecords(ctx context.Context, root *legacySourceRoot, dataDB *sql.DB, logPath, diceID, sourceIdentity string, drops *dropRecorder, yield func([]SourceRecord) error) (streamErr error) {
 	if yield == nil {
 		return ErrValidation
 	}
@@ -154,7 +183,7 @@ func streamLegacyStoryLogRecords(ctx context.Context, root *legacySourceRoot, da
 			}
 		}
 	}
-	if err = streamLegacyStoryLogStates(ctx, dataDB, logDB, diceID, sourceIdentity, &batcher); err != nil {
+	if err = streamLegacyStoryLogStates(ctx, dataDB, logDB, diceID, sourceIdentity, drops, &batcher); err != nil {
 		return fmt.Errorf("stream legacy group story-log state: %w", err)
 	}
 	return batcher.flush()
@@ -389,55 +418,90 @@ func legacyNullableInt(value sql.NullInt64) (*int, error) {
 	return &converted, nil
 }
 
-func streamLegacyStoryLogStates(ctx context.Context, dataDB, logDB *sql.DB, diceID, sourceIdentity string, batcher *sourceRecordBatcher) (streamErr error) {
+// legacyStoryLogGroup decodes the story-log fields of one group_info row.
+func legacyStoryLogGroup(row legacyGroupRow) (legacyStoryLogGroupSnapshot, error) {
+	rowID := row.ID
+	if !utf8.ValidString(rowID) {
+		return legacyStoryLogGroupSnapshot{}, fmt.Errorf("%w: invalid text in legacy group_info row %q", ErrValidation, rowID)
+	}
+	group, decodeErr := decodeLegacyStoryLogGroupSnapshot(row.Data)
+	if decodeErr != nil {
+		return legacyStoryLogGroupSnapshot{}, fmt.Errorf("legacy group %q: %w", rowID, decodeErr)
+	}
+	if group.GroupID == "" {
+		group.GroupID = rowID
+	} else if rowID != "" && group.GroupID != rowID {
+		return legacyStoryLogGroupSnapshot{}, fmt.Errorf("%w: legacy group row identity mismatch", ErrValidation)
+	}
+	if !utf8.ValidString(group.GroupID) {
+		return legacyStoryLogGroupSnapshot{}, fmt.Errorf("%w: invalid group identity in legacy group_info row %q", ErrValidation, rowID)
+	}
+	if !utf8.ValidString(group.LogName) {
+		return legacyStoryLogGroupSnapshot{}, fmt.Errorf("%w: invalid story-log name in legacy group_info row %q", ErrValidation, rowID)
+	}
+	return group, nil
+}
+
+func streamLegacyStoryLogStates(ctx context.Context, dataDB, logDB *sql.DB, diceID, sourceIdentity string, drops *dropRecorder, batcher *sourceRecordBatcher) (streamErr error) {
 	if dataDB == nil || batcher == nil {
 		return ErrValidation
 	}
-	rows, err := dataDB.QueryContext(ctx, "SELECT id, data FROM group_info ORDER BY id")
+	rows, err := queryLegacyGroupRows(ctx, dataDB)
 	if err != nil {
 		return err
 	}
 	defer func() { streamErr = errors.Join(streamErr, rows.Close()) }()
 	for rows.Next() {
-		var rowID string
-		var data []byte
-		if err = rows.Scan(&rowID, &data); err != nil {
-			return err
+		row, scanErr := scanLegacyGroupRow(rows)
+		if scanErr != nil {
+			return scanErr
 		}
-		var group dice.GroupInfo
-		if !utf8.Valid(data) || !utf8.ValidString(rowID) {
-			return fmt.Errorf("%w: invalid text in legacy group_info row %q", ErrValidation, rowID)
+		if drops != nil {
+			// A row the group stage dropped has no imported group to carry a
+			// log state; it is already recorded.
+			_, groupDrop, groupErr := legacyGroupRowRecords(diceID, row)
+			if groupErr != nil {
+				return groupErr
+			}
+			if groupDrop != nil {
+				continue
+			}
 		}
-		if err = json.Unmarshal(data, &group); err != nil {
-			return fmt.Errorf("legacy group %q: %w", rowID, err)
+		group, groupErr := legacyStoryLogGroup(row)
+		if groupErr != nil {
+			if drops != nil && errors.Is(groupErr, ErrValidation) {
+				// The group was imported; only its undecidable story-log
+				// state is left out and recorded for manual repair.
+				if err = recordLegacyGroupDrop(drops, diceID, row, legacyGroupRowDrop{reason: legacyGroupDropStoryLog, cause: groupErr}, true); err != nil {
+					return err
+				}
+				continue
+			}
+			return groupErr
 		}
-		if group.GroupID == "" {
-			group.GroupID = rowID
-		} else if rowID != "" && group.GroupID != rowID {
-			return fmt.Errorf("%w: legacy group row identity mismatch", ErrValidation)
-		}
-		if !utf8.ValidString(group.GroupID) {
-			return fmt.Errorf("%w: invalid group identity in legacy group_info row %q", ErrValidation, rowID)
-		}
-		state := group.GetLogState()
-		if !utf8.ValidString(state.Name) {
-			return fmt.Errorf("%w: invalid story-log name in legacy group_info row %q", ErrValidation, rowID)
-		}
-		if state.Name == "" && !state.On {
+		if group.LogName == "" && !group.LogOn {
 			continue
 		}
-		if strings.TrimSpace(group.GroupID) == "" || strings.TrimSpace(state.Name) == "" || logDB == nil {
-			return fmt.Errorf("%w: legacy group log state has no session", ErrValidation)
+		sessionID, lookupErr := uint64(0), errLegacyStoryLogNoSession
+		if strings.TrimSpace(group.GroupID) != "" && strings.TrimSpace(group.LogName) != "" && logDB != nil {
+			sessionID, lookupErr = legacyStoryLogSessionID(ctx, logDB, group.GroupID, group.LogName)
 		}
-		sessionID, lookupErr := legacyStoryLogSessionID(ctx, logDB, group.GroupID, state.Name)
 		if lookupErr != nil {
+			if drops != nil && errors.Is(lookupErr, errLegacyStoryLogNoSession) {
+				// The group was imported; with no session to bind, its
+				// current story-log state is left out (imported as closed).
+				if err = recordLegacyStoryLogSessionDrop(drops, diceID, row, group, lookupErr); err != nil {
+					return err
+				}
+				continue
+			}
 			return lookupErr
 		}
 		payload := legacyStoryLogImportPayload{
 			SourceID: legacyStoryLogSourceID(sourceIdentity, diceID, group.GroupID, legacyLogImportState, 0),
 			Kind:     legacyLogImportState, DiceID: diceID, GroupID: group.GroupID,
 			SessionSourceID: legacyStoryLogSourceID(sourceIdentity, diceID, group.GroupID, legacyLogImportSession, sessionID),
-			State:           &legacyStoryLogStatePayload{DiceID: diceID, GroupID: group.GroupID, Name: state.Name, On: state.On},
+			State:           &legacyStoryLogStatePayload{DiceID: diceID, GroupID: group.GroupID, Name: group.LogName, On: group.LogOn},
 		}
 		record, recordErr := legacyStoryLogSourceRecord(payload)
 		if recordErr != nil {
@@ -471,6 +535,9 @@ func legacyStoryLogSessionID(ctx context.Context, database *sql.DB, groupID, nam
 	}
 	if err = rows.Err(); err != nil {
 		return 0, err
+	}
+	if count == 0 {
+		return 0, errLegacyStoryLogNoSession
 	}
 	if count != 1 {
 		return 0, fmt.Errorf("%w: legacy group log state has %d matching sessions", ErrValidation, count)

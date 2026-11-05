@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,9 +20,7 @@ import (
 // 反向依赖闭包（逆拓扑序）；依赖方标记为 depsBlocked，插件回来后由 JsAddScript 自动补载。
 // 入口见 JsDisable / JsEnable / JsDelete。
 //   subTODO(局部重载): 脚本资源归属表：脚本 -> 扩展名、任务、JS 模板、CoC 规则、模块 ID、定时器、连接。
-//   subTODO(局部重载): 脚本级生命周期上下文：无消息的 jsExecutionContext 的 ExecutionContext() 目前返回
-//     context.Background()，脚本顶层注册的 setTimeout/setInterval/Promise 回调无法撤销。
-//   subTODO(局部重载): 定时器句柄登记与撤销：回调被短路后 setInterval 仍会空转。
+//   subTODO(局部重载): 定时器句柄登记与撤销：脚本生命周期会撤销回调，但 setInterval 仍会空转。
 //   subTODO(局部重载): WebSocket / fetch 按脚本归属关闭（WebSocketManager 只有 CloseAll）。
 //   subTODO(局部重载): JS 规则模板、CoC 规则按脚本摘除（clearJSTemplates / clearCocExtraRules 只能整体清空）。
 //   subTODO(局部重载): 反向依赖闭包：在 checkJsScriptsDeps / sortJsScripts 之上提供 dependentsOf(script)。
@@ -68,7 +67,11 @@ type JsAddResult struct {
 // 只处理“全新”的脚本；已加载过的文件、同名插件等属于更新，返回 *JsIncrementalUnavailableError，
 // 调用方需要退回手动全量重载。
 func (d *Dice) JsAddScript(filename string) (*JsAddResult, error) {
-	if d == nil || !d.Config.JsEnable || d.ExtLoopManager == nil {
+	if d == nil {
+		return nil, newJsIncrementalUnavailable("JS 环境未运行")
+	}
+	config := d.Config()
+	if config == nil || !config.JsEnable || d.ExtLoopManager == nil {
 		return nil, newJsIncrementalUnavailable("JS 环境未运行")
 	}
 	if !d.JsReloadLock.TryLock() {
@@ -144,7 +147,7 @@ func (d *Dice) JsAddScript(filename string) (*JsAddResult, error) {
 		if script != jsInfo && script.depsBlocked {
 			want[script] = true
 			script.depsBlocked = false
-			script.Enable = !d.Config.DisabledJsScripts[script.Name]
+			script.Enable = !config.DisabledJsScripts[script.Name]
 			script.ErrText = ""
 		}
 	}
@@ -211,9 +214,7 @@ func (d *Dice) JsAddScript(filename string) (*JsAddResult, error) {
 		// 只处理新扩展，不重置各群的手动关闭记录；各群随 ExtRegistryVersion 在下一条消息时懒同步。
 		d.applyExtDefaultSettings(registered, false)
 	}
-	d.ExtUpdateTime = time.Now().Unix()
-	d.MarkModified()
-	d.Save(false)
+	atomic.StoreInt64(&d.ExtUpdateTime, time.Now().Unix())
 	return result, nil
 }
 

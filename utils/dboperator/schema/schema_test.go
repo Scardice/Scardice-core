@@ -20,7 +20,6 @@ func TestEnsureSchemasCreateMissingTables(t *testing.T) {
 	// Given: empty database (no core tables)
 	for _, name := range []string{
 		"group_player_info", "group_info", "ban_info", "endpoint_info", "attrs",
-		"official_qq_identity_mapping",
 		"logs", "log_items",
 		"censor_log",
 	} {
@@ -47,7 +46,6 @@ func TestEnsureSchemasCreateMissingTables(t *testing.T) {
 		&model.BanInfo{},
 		&model.EndpointInfo{},
 		&model.AttributesItemModel{},
-		&model.OfficialQQIdentityMapping{},
 		&model.LogInfo{},
 		&model.LogOneItem{},
 		&model.CensorLog{},

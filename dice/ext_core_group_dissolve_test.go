@@ -10,21 +10,21 @@ import (
 func TestGroupSelfDissolveDoesNotBlacklistBot(t *testing.T) {
 	d, endpoint, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
-	d.Config.BanList.ScoreGroupKicked = 1
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.BanList.ScoreGroupKicked = 1 })
 
 	coreExt, ok := d.ExtRegistry.Load("core")
 	if !ok || coreExt.OnGroupLeave == nil {
 		t.Fatal("core group-leave handler is not registered")
 	}
-	ctx := &MsgContext{Dice: d, Session: d.ImSession, EndPoint: endpoint}
-
-	coreExt.OnGroupLeave(ctx, &events.GroupLeaveEvent{
-		GroupID:    "QQ-Group:6100",
-		UserID:     endpoint.UserID,
-		OperatorID: endpoint.UserID,
+	msg := &Message{MessageType: "group", GroupID: "QQ-Group:6100", Platform: "QQ", Sender: SenderBase{UserID: endpoint.UserID}}
+	withCanonicalTestMessageContext(t, d, endpoint, msg, "self-dissolve", func(ctx *MsgContext) error {
+		coreExt.OnGroupLeave(ctx, &events.GroupLeaveEvent{
+			GroupID: msg.GroupID, UserID: endpoint.UserID, OperatorID: endpoint.UserID,
+		})
+		return ctx.getExecutionError()
 	})
 
-	if _, exists := d.Config.BanList.GetByID(endpoint.UserID); exists {
+	if _, exists := d.Config().BanList.GetByID(endpoint.UserID); exists {
 		t.Fatal("bot self-dissolve must not create a blacklist entry")
 	}
 }
@@ -32,23 +32,23 @@ func TestGroupSelfDissolveDoesNotBlacklistBot(t *testing.T) {
 func TestGroupExternalDissolveBlacklistsOperator(t *testing.T) {
 	d, endpoint, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
-	d.Config.BanList.ScoreGroupKicked = 1
-	d.DBOperator = nil // 本用例只验证内存策略，不覆盖 SQL 持久化。
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.BanList.ScoreGroupKicked = 1 })
 
 	coreExt, ok := d.ExtRegistry.Load("core")
 	if !ok || coreExt.OnGroupLeave == nil {
 		t.Fatal("core group-leave handler is not registered")
 	}
-	ctx := &MsgContext{Dice: d, Session: d.ImSession, EndPoint: endpoint}
 	operatorID := "QQ:6200"
 
-	coreExt.OnGroupLeave(ctx, &events.GroupLeaveEvent{
-		GroupID:    "QQ-Group:6101",
-		UserID:     endpoint.UserID,
-		OperatorID: operatorID,
+	msg := &Message{MessageType: "group", GroupID: "QQ-Group:6101", Platform: "QQ", Sender: SenderBase{UserID: operatorID}}
+	withCanonicalTestMessageContext(t, d, endpoint, msg, "external-dissolve", func(ctx *MsgContext) error {
+		coreExt.OnGroupLeave(ctx, &events.GroupLeaveEvent{
+			GroupID: msg.GroupID, UserID: endpoint.UserID, OperatorID: operatorID,
+		})
+		return ctx.getExecutionError()
 	})
 
-	item, exists := d.Config.BanList.GetByID(operatorID)
+	item, exists := d.Config().BanList.GetByID(operatorID)
 	if !exists {
 		t.Fatal("external dissolve must retain operator blacklist behavior")
 	}

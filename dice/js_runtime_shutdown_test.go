@@ -206,8 +206,17 @@ func TestStopJSRuntimeTimeoutsReuseSingleClose(t *testing.T) {
 	}
 }
 
+// newStartupSchedulingTestDice builds a Dice whose persisted config disables
+// JavaScript, so startup scheduling is observed without loading any scripts.
+func newStartupSchedulingTestDice(t *testing.T) *Dice {
+	t.Helper()
+	d, _ := newCanonicalTestDice(t)
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.JsEnable = false })
+	return d
+}
+
 func TestStartupJSLoadRemainsImmediateWithoutProductionDeferral(t *testing.T) {
-	d := &Dice{}
+	d := newStartupSchedulingTestDice(t)
 	var calls atomic.Int64
 
 	d.startStartupJsLoad(func() { calls.Add(1) })
@@ -219,7 +228,7 @@ func TestStartupJSLoadRemainsImmediateWithoutProductionDeferral(t *testing.T) {
 }
 
 func TestDeferredStartupJSLoadWaitsForProductionReleaseAndStartsOnce(t *testing.T) {
-	d := &Dice{}
+	d := newStartupSchedulingTestDice(t)
 	manager := &DiceManager{Dice: []*Dice{d}}
 	if err := manager.DeferStartupJSLoad(); err != nil {
 		t.Fatal(err)
@@ -253,7 +262,7 @@ func TestDeferredStartupJSLoadWaitsForProductionReleaseAndStartsOnce(t *testing.
 }
 
 func TestStopJSRuntimeCancelsDeferredStartupJSLoad(t *testing.T) {
-	d := &Dice{}
+	d := newStartupSchedulingTestDice(t)
 	manager := &DiceManager{Dice: []*Dice{d}}
 	if err := manager.DeferStartupJSLoad(); err != nil {
 		t.Fatal(err)

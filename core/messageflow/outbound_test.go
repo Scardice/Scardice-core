@@ -2,8 +2,7 @@ package messageflow
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -38,13 +37,6 @@ func (s *testStore) GetOperationByIdempotency(_ context.Context, principal, scop
 	return eventstore.OperationView{OperationID: s.work.Operations[0].OperationID, ResourceID: s.work.Effects[0].EffectID, IdempotencyScope: scope, IdempotencyKey: key, RequestDigest: append([]byte(nil), s.work.Operations[0].RequestDigest...)}, nil
 }
 
-type testEncryptor struct{ plain []byte }
-
-func (e *testEncryptor) EncryptBound(_ context.Context, _ string, _ string, _ string, _ uint64, p []byte) ([]byte, []byte, string, error) {
-	e.plain = append([]byte(nil), p...)
-	return []byte("cipher"), []byte("nonce"), "key-1", nil
-}
-
 type testIDs struct{ n int }
 
 func (g *testIDs) NewID() (string, error) { g.n++; return "generated-id", nil }
@@ -58,54 +50,64 @@ func (r testResolver) Resolve(context.Context, adapterapi.EndpointID) (EndpointS
 	return r.snap, r.err
 }
 
-type testIndexSigner struct {
-	root []byte
-	id   string
+type blockingEndpointResolver struct {
+	blocked   adapterapi.EndpointID
+	entered   chan struct{}
+	release   chan struct{}
+	snapshots map[adapterapi.EndpointID]EndpointSnapshot
 }
 
-func (s testIndexSigner) KeyedDigest(_ context.Context, domain string, parts ...string) ([]byte, string, error) {
-	mac := hmac.New(sha256.New, s.root)
-	_, _ = mac.Write([]byte(domain))
-	for _, part := range parts {
-		_, _ = mac.Write([]byte(part))
+func (r blockingEndpointResolver) Resolve(ctx context.Context, endpointID adapterapi.EndpointID) (EndpointSnapshot, error) {
+	if endpointID == r.blocked {
+		close(r.entered)
+		select {
+		case <-r.release:
+		case <-ctx.Done():
+			return EndpointSnapshot{}, ctx.Err()
+		}
 	}
-	return mac.Sum(nil), s.id, nil
+	snapshot, ok := r.snapshots[endpointID]
+	if !ok {
+		return EndpointSnapshot{}, ErrEndpointUnavailable
+	}
+	return snapshot, nil
 }
 
 func testEffect() adapterapi.OutboundEffect {
 	return adapterapi.OutboundEffect{Version: adapterapi.EffectVersionOne, ID: "effect-1", EndpointID: "endpoint-1", OperationID: "operation-1", CorrelationID: "corr-1", CausationID: "cause-1", Kind: adapterapi.EffectKindMessage, Payload: adapterapi.EffectPayload{Kind: adapterapi.EffectPayloadPersonText, Target: adapterapi.EffectTarget{Kind: adapterapi.TargetPerson, Conversation: "person-1"}, Text: "hello"}, RequiredCapabilities: adapterapi.CapabilityOutbound, RequiredAction: adapterapi.ActionKindSendMessage, RetryClass: adapterapi.EffectRetryNonIdempotent, Risk: adapterapi.EffectRiskNormal}
 }
 
-func TestOutboundSubmitCommitsShapeEventAndEncryptedEffectAtomically(t *testing.T) {
+func TestOutboundSubmitRejectsMismatchedLaneBeforeCommit(t *testing.T) {
 	e := testEffect()
-	e.Lane = adapterapi.LaneMetadata{EndpointID: "endpoint-1", TargetDigest: "x", Key: "k", Sequence: 1, MAC: "m"}
-	store := &testStore{}
-	enc := &testEncryptor{}
-	svc, err := NewOutboundService(store, testResolver{snap: EndpointSnapshot{EndpointID: "endpoint-1", DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(adapterapi.ActionKindSendMessage), IndexSigner: testIndexSigner{root: []byte("root"), id: "index-root-1"}}}, enc, &testIDs{})
+	e.Deadline = time.Now().Add(time.Minute).UTC()
+	var err error
+	e.Lane, err = adapterapi.NewLaneMetadata(e.EndpointID, adapterapi.EffectTarget{Kind: adapterapi.TargetPerson, Conversation: "other-person"}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Invalid lane is rejected before storage; a real lane is supplied by adapterapi.NewLaneMetadata in integration tests.
+	store := &testStore{}
+	svc, err := NewOutboundService(store, testResolver{snap: EndpointSnapshot{EndpointID: "endpoint-1", DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage)}}, &testIDs{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	_, err = svc.Submit(context.Background(), SubmitRequest{Effect: e, CommandID: "command-1", PrincipalID: "principal-1"})
-	if err == nil {
-		t.Fatal("invalid lane accepted")
+	if !errors.Is(err, adapterapi.ErrInvalidContract) {
+		t.Fatalf("mismatched lane err=%v", err)
 	}
 	if store.calls != 0 {
 		t.Fatal("invalid request wrote storage")
 	}
 }
 func TestOutboundSubmitCommitsAllParticipants(t *testing.T) {
-	root := []byte(strings.Repeat("r", 32))
 	e := testEffect()
 	e.Deadline = time.Now().Add(time.Hour).UTC()
-	lane, err := adapterapi.NewLaneMetadata(e.EndpointID, e.Payload.Target, root, 1)
+	lane, err := adapterapi.NewLaneMetadata(e.EndpointID, e.Payload.Target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	e.Lane = lane
 	store := &testStore{}
-	enc := &testEncryptor{}
-	svc, err := NewOutboundService(store, testResolver{snap: EndpointSnapshot{EndpointID: e.EndpointID, DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage), IndexRootID: "index-root-1", IndexSigner: testIndexSigner{root: root, id: "index-root-1"}}}, enc, &testIDs{})
+	svc, err := NewOutboundService(store, testResolver{snap: EndpointSnapshot{EndpointID: e.EndpointID, DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage)}}, &testIDs{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,22 +124,25 @@ func TestOutboundSubmitCommitsAllParticipants(t *testing.T) {
 	if strings.Contains(string(store.work.Streams[0].Events[0].Payload), "hello") || strings.Contains(string(store.work.Streams[0].Events[0].Payload), "person-1") {
 		t.Fatal("shape event leaked payload")
 	}
-	if len(enc.plain) == 0 || len(store.work.Streams[0].Events[0].Payload) == 0 {
-		t.Fatal("missing encrypted/request payload")
+	var wire effectWire
+	if err := json.Unmarshal(store.work.Effects[0].Payload, &wire); err != nil || wire.Effect.Payload.Text != "hello" || wire.Effect.Payload.Target.Conversation != "person-1" {
+		t.Fatalf("stored plaintext effect=%+v err=%v", wire, err)
+	}
+	if store.work.Effects[0].Lane != `["endpoint-1","person","person-1"]` || len(store.work.Streams[0].Events[0].Payload) == 0 {
+		t.Fatal("missing plaintext lane or shape event")
 	}
 }
 
 func TestOutboundPrepareBuildsParticipantsWithoutCommit(t *testing.T) {
-	root := []byte(strings.Repeat("r", 32))
 	effect := testEffect()
 	effect.Deadline = time.Now().Add(time.Hour).UTC()
-	lane, err := adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, root, 1)
+	lane, err := adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	effect.Lane = lane
 	store := &testStore{}
-	service, err := NewOutboundService(store, testResolver{snap: EndpointSnapshot{EndpointID: effect.EndpointID, DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage), IndexRootID: "index-root-1", IndexSigner: testIndexSigner{root: root, id: "index-root-1"}}}, &testEncryptor{}, &testIDs{})
+	service, err := NewOutboundService(store, testResolver{snap: EndpointSnapshot{EndpointID: effect.EndpointID, DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage)}}, &testIDs{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,14 +157,74 @@ func TestOutboundPrepareBuildsParticipantsWithoutCommit(t *testing.T) {
 		t.Fatalf("prepared = %#v", prepared)
 	}
 }
+func TestOutboundPrepareDoesNotSerializeIndependentEndpoints(t *testing.T) {
+	slow := testEffect()
+	slow.Deadline = time.Now().Add(time.Hour).UTC()
+	slow.Lane, _ = adapterapi.NewLaneMetadata(slow.EndpointID, slow.Payload.Target, 1)
+	fast := slow
+	fast.ID = "effect-2"
+	fast.OperationID = "operation-2"
+	fast.EndpointID = "endpoint-2"
+	fast.CorrelationID = "corr-2"
+	fast.CausationID = "cause-2"
+	fast.Lane, _ = adapterapi.NewLaneMetadata(fast.EndpointID, fast.Payload.Target, 2)
+	snapshot := func(endpointID adapterapi.EndpointID) EndpointSnapshot {
+		return EndpointSnapshot{
+			EndpointID: endpointID, DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected,
+			Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage),
+		}
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	resolver := blockingEndpointResolver{
+		blocked: slow.EndpointID, entered: entered, release: release,
+		snapshots: map[adapterapi.EndpointID]EndpointSnapshot{
+			slow.EndpointID: snapshot(slow.EndpointID),
+			fast.EndpointID: snapshot(fast.EndpointID),
+		},
+	}
+	service, err := NewOutboundService(&testStore{}, resolver, &testIDs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	slowResult := make(chan error, 1)
+	go func() {
+		_, prepareErr := service.Prepare(context.Background(), SubmitRequest{Effect: slow, CommandID: "slow", PrincipalID: "principal-a"})
+		slowResult <- prepareErr
+	}()
+	<-entered
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	fastResult := make(chan error, 1)
+	go func() {
+		_, prepareErr := service.Prepare(context.Background(), SubmitRequest{Effect: fast, CommandID: "fast", PrincipalID: "principal-a"})
+		fastResult <- prepareErr
+	}()
+	select {
+	case prepareErr := <-fastResult:
+		if prepareErr != nil {
+			t.Fatal(prepareErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("independent endpoint was serialized behind blocked prepare")
+	}
+	close(release)
+	if prepareErr := <-slowResult; prepareErr != nil {
+		t.Fatal(prepareErr)
+	}
+}
+
 func TestOutboundSubmitDeduplicatesSameCommandAndConflictsChangedDigest(t *testing.T) {
-	root := []byte(strings.Repeat("r", 32))
 	e := testEffect()
 	e.Deadline = time.Now().Add(time.Hour).UTC()
-	lane, _ := adapterapi.NewLaneMetadata(e.EndpointID, e.Payload.Target, root, 1)
+	lane, _ := adapterapi.NewLaneMetadata(e.EndpointID, e.Payload.Target, 1)
 	e.Lane = lane
 	store := &testStore{}
-	svc, err := NewOutboundService(store, testResolver{snap: EndpointSnapshot{EndpointID: e.EndpointID, DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage), IndexRootID: "index-root-1", IndexSigner: testIndexSigner{root: root, id: "index-root-1"}}}, &testEncryptor{}, &testIDs{})
+	svc, err := NewOutboundService(store, testResolver{snap: EndpointSnapshot{EndpointID: e.EndpointID, DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage)}}, &testIDs{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,19 +242,16 @@ func TestOutboundSubmitDeduplicatesSameCommandAndConflictsChangedDigest(t *testi
 	}
 }
 func TestOutboundSubmitDeduplicatesLogicalReplayWithVolatileMetadataChanges(t *testing.T) {
-	root := []byte(strings.Repeat("r", 32))
 	effect := testEffect()
 	effect.Deadline = time.Now().Add(time.Hour).UTC()
-	effect.Lane, _ = adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, root, 1)
+	effect.Lane, _ = adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, 1)
 	store := &testStore{}
 	svc, err := NewOutboundService(store, testResolver{snap: EndpointSnapshot{
 		EndpointID: effect.EndpointID, DesiredState: "enabled",
 		ObservedState: adapterapi.ObservedStateConnected,
 		Capabilities:  adapterapi.CapabilityOutbound,
 		Actions:       adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage),
-		IndexRootID:   "index-root-1",
-		IndexSigner:   testIndexSigner{root: root, id: "index-root-1"},
-	}}, &testEncryptor{}, &testIDs{})
+	}}, &testIDs{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +268,7 @@ func TestOutboundSubmitDeduplicatesLogicalReplayWithVolatileMetadataChanges(t *t
 	replay.Deadline = effect.Deadline.Add(time.Hour)
 	replay.CorrelationID = "corr-2"
 	replay.CausationID = "cause-2"
-	replay.Lane, err = adapterapi.NewLaneMetadata(replay.EndpointID, replay.Payload.Target, root, 2)
+	replay.Lane, err = adapterapi.NewLaneMetadata(replay.EndpointID, replay.Payload.Target, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,15 +286,14 @@ func TestOutboundSubmitDeduplicatesLogicalReplayWithVolatileMetadataChanges(t *t
 	}
 }
 func TestOutboundSubmitRejectsStateAndCapabilityWithValidLane(t *testing.T) {
-	root := []byte(strings.Repeat("r", 32))
 	e := testEffect()
 	e.Deadline = time.Now().Add(time.Hour).UTC()
-	lane, _ := adapterapi.NewLaneMetadata(e.EndpointID, e.Payload.Target, root, 1)
+	lane, _ := adapterapi.NewLaneMetadata(e.EndpointID, e.Payload.Target, 1)
 	e.Lane = lane
-	base := EndpointSnapshot{EndpointID: e.EndpointID, DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage), IndexRootID: "index-root-1", IndexSigner: testIndexSigner{root: root, id: "index-root-1"}}
+	base := EndpointSnapshot{EndpointID: e.EndpointID, DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage)}
 	for name, snap := range map[string]EndpointSnapshot{"disabled": func() EndpointSnapshot { s := base; s.DesiredState = "disabled"; return s }(), "missing-capability": func() EndpointSnapshot { s := base; s.Capabilities = 0; return s }()} {
 		store := &testStore{}
-		svc, err := NewOutboundService(store, testResolver{snap: snap}, &testEncryptor{}, &testIDs{})
+		svc, err := NewOutboundService(store, testResolver{snap: snap}, &testIDs{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -246,10 +307,9 @@ func TestOutboundSubmitRejectsStateAndCapabilityWithValidLane(t *testing.T) {
 }
 
 func TestOutboundSubmitReportsEndpointStateOnUnavailableError(t *testing.T) {
-	root := []byte(strings.Repeat("r", 32))
 	effect := testEffect()
 	effect.Deadline = time.Now().Add(time.Hour).UTC()
-	lane, err := adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, root, 1)
+	lane, err := adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,9 +318,8 @@ func TestOutboundSubmitReportsEndpointStateOnUnavailableError(t *testing.T) {
 		EndpointID: effect.EndpointID, DesiredState: "enabled", ObservedState: adapterapi.ObservedStateStopped,
 		Capabilities: adapterapi.CapabilityOutbound,
 		Actions:      adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage),
-		IndexRootID:  "index-root-1", IndexSigner: testIndexSigner{root: root, id: "index-root-1"},
 	}
-	service, err := NewOutboundService(&testStore{}, testResolver{snap: snapshot}, &testEncryptor{}, &testIDs{})
+	service, err := NewOutboundService(&testStore{}, testResolver{snap: snapshot}, &testIDs{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,14 +334,13 @@ func TestOutboundSubmitReportsEndpointStateOnUnavailableError(t *testing.T) {
 
 func TestOutboundSubmitPreservesEndpointResolutionCause(t *testing.T) {
 	resolverErr := errors.New("projection read failed")
-	service, err := NewOutboundService(&testStore{}, testResolver{err: resolverErr}, &testEncryptor{}, &testIDs{})
+	service, err := NewOutboundService(&testStore{}, testResolver{err: resolverErr}, &testIDs{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	effect := testEffect()
 	effect.Deadline = time.Now().Add(time.Hour).UTC()
-	root := []byte(strings.Repeat("r", 32))
-	lane, laneErr := adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, root, 1)
+	lane, laneErr := adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, 1)
 	if laneErr != nil {
 		t.Fatal(laneErr)
 	}
@@ -295,13 +353,16 @@ func TestOutboundSubmitPreservesEndpointResolutionCause(t *testing.T) {
 
 func TestOutboundSubmitRejectsEndpointBeforeCommit(t *testing.T) {
 	store := &testStore{}
-	svc, err := NewOutboundService(store, testResolver{snap: EndpointSnapshot{DesiredState: "disabled", ObservedState: adapterapi.ObservedStateStopped}}, &testEncryptor{}, &testIDs{})
+	svc, err := NewOutboundService(store, testResolver{snap: EndpointSnapshot{DesiredState: "disabled", ObservedState: adapterapi.ObservedStateStopped}}, &testIDs{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	e := testEffect()
 	e.Deadline = time.Unix(1, 0).UTC()
-	e.Lane = adapterapi.LaneMetadata{EndpointID: e.EndpointID, TargetDigest: strings.Repeat("a", 64), Key: strings.Repeat("b", 64), Sequence: 1, MAC: strings.Repeat("c", 64)}
+	e.Lane, err = adapterapi.NewLaneMetadata(e.EndpointID, e.Payload.Target, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	_, err = svc.Submit(context.Background(), SubmitRequest{Effect: e, CommandID: "c", PrincipalID: "principal-a"})
 	if !errors.Is(err, ErrEndpointUnavailable) {
 		t.Fatalf("err=%v", err)

@@ -32,7 +32,7 @@ func (n dispatcherDiagnosticNotifier) NotifyOutboundEffectResult(_ context.Conte
 
 func TestEffectDispatcherPersistsNotifiesAndLogsTerminalDiagnostics(t *testing.T) {
 	target := adapterapi.EffectTarget{Kind: adapterapi.TargetGroup, Conversation: "QQ-Group:9", Member: "QQ:8"}
-	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, []byte("root"), 1)
+	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,28 +62,8 @@ func TestEffectDispatcherPersistsNotifiesAndLogsTerminalDiagnostics(t *testing.T
 		t.Fatal(err)
 	}
 	store := &dispatcherTestStore{
-		claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{
-			EffectID:               "effect-1",
-			Version:                1,
-			EndpointID:             "endpoint-1",
-			LeaseOwner:             "worker",
-			LeaseEpoch:             1,
-			AttemptID:              "attempt-1",
-			PayloadCiphertext:      []byte("cipher"),
-			PayloadNonce:           []byte("nonce"),
-			PayloadEncryptionKeyID: "key",
-			DeadlineAt:             deadline,
-			RiskClass:              eventstore.RiskNonIdempotentAfterDispatch,
-		}},
-		marked: eventstore.OutboxLease{Effect: eventstore.NewEffect{
-			EffectID:               "effect-1",
-			Version:                2,
-			EndpointID:             "endpoint-1",
-			PayloadCiphertext:      []byte("cipher"),
-			PayloadNonce:           []byte("nonce"),
-			PayloadEncryptionKeyID: "key",
-			RiskClass:              eventstore.RiskNonIdempotentAfterDispatch,
-		}},
+		claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", Lane: effect.Lane.Key, LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", Payload: plain, DeadlineAt: deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}},
+		marked:  eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 2, EndpointID: "endpoint-1", Payload: plain, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}},
 	}
 	providerResult := adapterapi.TerminalResult(
 		"onebot_provider_rejected",
@@ -96,12 +76,12 @@ func TestEffectDispatcherPersistsNotifiesAndLogsTerminalDiagnostics(t *testing.T
 
 	dispatcher, err := NewEffectDispatcher(
 		store,
-		dispatcherTestDecrypt{plain: plain},
 		dispatcherDiagnosticExecutor{result: providerResult},
 		"worker",
 		WithDispatcherIDGenerator(&dispatcherTestIDs{}),
 		WithDispatcherClock(dispatcherTestClock{}),
 		WithEffectResultNotifier(notifier),
+		WithDispatcherNotificationOwner(newDispatcherTestNotificationOwner(t)),
 	)
 	if err != nil {
 		t.Fatal(err)

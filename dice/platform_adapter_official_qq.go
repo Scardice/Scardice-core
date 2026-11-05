@@ -168,7 +168,15 @@ func (pa *PlatformAdapterOfficialQQ) SendToPerson(ctx *MsgContext, uid string, t
 		pa.EndPoint.Session.Parent.Logger.Error("official qq 发送私聊消息失败：不支持该功能")
 		return
 	}
-	channelID, guildID, _ := pa.mustExtractTwoID(ctx.Group.ChannelID)
+	if ctx == nil || ctx.Group == nil {
+		err := errors.New("official qq 发送频道私信消息失败：缺少频道会话")
+		if ctx != nil {
+			ctx.setExecutionError(err)
+		}
+		pa.EndPoint.Session.Parent.Logger.Error(err)
+		return
+	}
+	channelID, guildID, _ := pa.mustExtractTwoID(ctx.Group.ChannelID())
 	rowID, ok := VarGetValueStr(ctx, "$tMsgID")
 	if !ok || ctx.MessageType == "group" {
 		// 需要主动发起私聊
@@ -391,10 +399,6 @@ func formatDiceIDOfficialQQChGuild(guildID string) string {
 
 func formatDiceIDOfficialQQChannel(guildID, channelID string) string {
 	return fmt.Sprintf("OpenQQCH-Channel:%s-%s", guildID, channelID)
-}
-
-func formatDiceIDOfficialQQ(userUnionID string) string {
-	return fmt.Sprintf("OpenQQ:%s", userUnionID)
 }
 
 func formatDiceIDOfficialQQGroupOpenID(botID, groupOpenID string) string {

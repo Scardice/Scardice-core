@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,8 +41,12 @@ func TestJSRuntimeManagementReturnsDefaultsAndStatuses(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if response.DefaultRuntime != d.Config.JsEngine {
-		t.Fatalf("default runtime = %q, want %q", response.DefaultRuntime, d.Config.JsEngine)
+	config := d.Config()
+	if config == nil {
+		t.Fatal("canonical JS configuration unavailable")
+	}
+	if response.DefaultRuntime != config.JsEngine {
+		t.Fatalf("default runtime = %q, want %q", response.DefaultRuntime, config.JsEngine)
 	}
 	if len(response.Runtimes) == 0 || response.Runtimes[0].ID != "goja" {
 		t.Fatalf("runtime statuses = %+v, want Goja first", response.Runtimes)
@@ -55,8 +60,12 @@ func TestJSRuntimeConfigSetPersistsGlobalAndExtensionDefaults(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	if d.Config.JsEngine != "goja" || d.Config.JsRuntimeRoutes["author/example"] != "goja" {
-		t.Fatalf("saved runtime config = default %q routes %#v", d.Config.JsEngine, d.Config.JsRuntimeRoutes)
+	config := d.Config()
+	if config == nil {
+		t.Fatal("canonical JS configuration unavailable")
+	}
+	if config.JsEngine != "goja" || config.JsRuntimeRoutes["author/example"] != "goja" {
+		t.Fatalf("saved runtime config = default %q routes %#v", config.JsEngine, config.JsRuntimeRoutes)
 	}
 }
 
@@ -67,8 +76,12 @@ func TestJSRuntimeConfigSetRejectsUnknownRuntimeWithoutChangingConfig(t *testing
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
 	}
-	if d.Config.JsEngine != "goja" || len(d.Config.JsRuntimeRoutes) != 0 {
-		t.Fatalf("invalid request changed runtime config: default %q routes %#v", d.Config.JsEngine, d.Config.JsRuntimeRoutes)
+	config := d.Config()
+	if config == nil {
+		t.Fatal("canonical JS configuration unavailable")
+	}
+	if config.JsEngine != "goja" || len(config.JsRuntimeRoutes) != 0 {
+		t.Fatalf("invalid request changed runtime config: default %q routes %#v", config.JsEngine, config.JsRuntimeRoutes)
 	}
 }
 func makeJSRuntimeArchiveForAPITest(t *testing.T) []byte {
@@ -143,7 +156,13 @@ func TestJSRuntimeInstallAndUninstallRemainPendingUntilRestart(t *testing.T) {
 		t.Fatalf("pending changes after upload = %+v", management.PendingChanges)
 	}
 
-	restartedDice := &dice.Dice{Logger: d.Logger, BaseConfig: d.BaseConfig, Config: d.Config, Parent: d.Parent}
+	restartedDice := &dice.Dice{
+		Logger: d.Logger, BaseConfig: d.BaseConfig,
+		DurableStore: d.DurableStore, Parent: d.Parent,
+	}
+	if err := restartedDice.ReloadConfigView(context.Background()); err != nil {
+		t.Fatalf("reload restarted JS configuration: %v", err)
+	}
 	myDice = restartedDice
 	restartedManager := dice.NewJSRuntimeManagerForDice(restartedDice)
 	statuses := restartedManager.Statuses()

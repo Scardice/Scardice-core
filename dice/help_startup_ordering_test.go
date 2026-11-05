@@ -11,11 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"Scardice-core/eventstore"
-	"Scardice-core/projectionset"
 	"Scardice-core/utils/jsengine"
 
-	ds "github.com/sealdice/dicescript"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -43,13 +40,13 @@ func TestInitialHelpLoadPendingWaitsForStartupJSBeforeManagerRead(t *testing.T) 
 	restoreLogger := zap.ReplaceGlobals(zap.New(core))
 	t.Cleanup(restoreLogger)
 
-	testDice := &Dice{
-		BaseConfig: BaseConfig{Name: "startup-help", DataDir: "data/startup-help"},
-		CmdMap:     CmdMapCls{},
-		ExtList:    []*ExtInfo{},
-	}
-	testDice.Config = NewConfig(testDice)
-	testDice.Config.BaseConfig = testDice.BaseConfig
+	testDice, _ := newCanonicalTestDice(t)
+	testDice.BaseConfig.DataDir = "data/startup-help"
+	testDice.CmdMap = CmdMapCls{}
+	testDice.ExtList = []*ExtInfo{}
+	updateCanonicalTestConfig(t, testDice, func(config *Config) {
+		config.DataDir = testDice.BaseConfig.DataDir
+	})
 	manager := &DiceManager{Dice: []*Dice{testDice}, HelpDocEngineType: int(BlugeSearch)}
 	testDice.Parent = manager
 
@@ -189,34 +186,34 @@ func TestInitialHelpLoadFailureReturnsErrorAndEndsPendingState(t *testing.T) {
 
 const (
 	nativeHelpStartupFixtureEnv    = "SCARDICE_NATIVE_HELP_STARTUP_FIXTURE"
-	nativeHelpStartupPartialMarker = "native-help-partial-index-ready"
+	nativeHelpStartupMidLoadMarker = "native-help-mid-load-ready"
 	nativeHelpStartupDoneMarker    = "native-help-startup-script-done"
 	nativeHelpStartupUniqueTitle   = "native-help-startup-unique-extension"
 )
 
 type nativeHelpStartupGate struct {
-	partialReached chan struct{}
-	releasePartial chan struct{}
+	midLoadReached chan struct{}
+	releaseMidLoad chan struct{}
 	scriptDone     chan struct{}
-	partialOnce    sync.Once
+	midLoadOnce    sync.Once
 	releaseOnce    sync.Once
 	doneOnce       sync.Once
 }
 
 func newNativeHelpStartupGate() *nativeHelpStartupGate {
 	return &nativeHelpStartupGate{
-		partialReached: make(chan struct{}),
-		releasePartial: make(chan struct{}),
+		midLoadReached: make(chan struct{}),
+		releaseMidLoad: make(chan struct{}),
 		scriptDone:     make(chan struct{}),
 	}
 }
 
 func (s *nativeHelpStartupGate) Write(p []byte) (int, error) {
 	switch {
-	case bytes.Contains(p, []byte(nativeHelpStartupPartialMarker)):
-		s.partialOnce.Do(func() {
-			close(s.partialReached)
-			<-s.releasePartial
+	case bytes.Contains(p, []byte(nativeHelpStartupMidLoadMarker)):
+		s.midLoadOnce.Do(func() {
+			close(s.midLoadReached)
+			<-s.releaseMidLoad
 		})
 	case bytes.Contains(p, []byte(nativeHelpStartupDoneMarker)):
 		s.doneOnce.Do(func() { close(s.scriptDone) })
@@ -227,7 +224,7 @@ func (s *nativeHelpStartupGate) Write(p []byte) (int, error) {
 func (*nativeHelpStartupGate) Sync() error { return nil }
 
 func (s *nativeHelpStartupGate) release() {
-	s.releaseOnce.Do(func() { close(s.releasePartial) })
+	s.releaseOnce.Do(func() { close(s.releaseMidLoad) })
 }
 
 func TestNativeHelpCommandsUseOnlyPublishedStartupHelp(t *testing.T) {
@@ -255,9 +252,7 @@ func runNativeHelpStartupScenario(t *testing.T, root string) {
 	const startupScript = `// ==UserScript==
 // @name Native Help startup publication fixture
 // ==/UserScript==
-seal.inst.config.jsEnable = false;
-seal.inst.parent.reloadHelp();
-console.log("native-help-partial-index-ready");
+console.log("native-help-mid-load-ready");
 const ext = seal.ext.new("native-help-startup-unique-extension", "test", "1.0.0");
 seal.ext.register(ext);
 console.log("native-help-startup-script-done");
@@ -274,23 +269,12 @@ console.log("native-help-startup-script-done");
 	core := zapcore.NewCore(zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()), gate, zapcore.DebugLevel)
 	restoreLogger := zap.ReplaceGlobals(zap.New(core))
 	ctx := context.Background()
-	database, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
-		Type: "sqlite",
-		DSN:  filepath.Join(root, "events.db"),
-	})
-	if err != nil {
-		restoreLogger()
-		t.Fatal(err)
-	}
-	store := eventstore.NewStore(database, projectionset.StoreOptions()...)
+	store := openEventSourcedRuntimeStore(t, filepath.Join(root, "events.db"))
 	runtime := &Dice{
 		BaseConfig:    BaseConfig{Name: "default", DataDir: filepath.Join("data", "default")},
 		DurableStore:  store,
 		ContainerMode: true,
 	}
-	runtime.Config = NewConfig(runtime)
-	runtime.Config.BaseConfig = runtime.BaseConfig
-	runtime.Config.JsEnable = false
 	manager := &DiceManager{Dice: []*Dice{runtime}, HelpDocEngineType: int(BlugeSearch)}
 	if err := manager.InitializeRuntime(); err != nil {
 		restoreLogger()
@@ -300,8 +284,7 @@ console.log("native-help-startup-script-done");
 		restoreLogger()
 		t.Fatal(err)
 	}
-	runtime.AdvancedConfig.ExposeDangerousSealInst = true
-	runtime.Config.JsEnable = true
+	updateCanonicalTestConfig(t, runtime, func(config *Config) { config.JsEnable = true })
 	t.Cleanup(func() {
 		gate.release()
 		startupDone := make(chan struct{})
@@ -338,44 +321,26 @@ console.log("native-help-startup-script-done");
 		if help != nil {
 			help.Close()
 		}
-		_ = store.Close()
-		_ = database.Close()
 		restoreLogger()
 	})
 
 	manager.InitDice(nil)
 	select {
-	case <-gate.partialReached:
+	case <-gate.midLoadReached:
 	case <-time.After(5 * time.Second):
-		t.Fatal("startup script did not reach the post-ReloadHelp partial-index gate")
-	}
-	if manager.IsHelpReloading.Load() {
-		t.Fatal("explicit ReloadHelp is still active at the partial-index gate")
+		t.Fatal("startup script did not reach the mid-load gate")
 	}
 	if !manager.IsHelpDocLoading() {
-		t.Fatal("initial HelpDoc publication is not pending at the partial-index gate")
+		t.Fatal("initial HelpDoc publication is not pending at the mid-load gate")
 	}
 
 	replies := &nameCommandReplyCapture{texts: make(chan string, 4)}
 	runtime.OutboundBridge = replies
-	endpoint := &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Platform: "test"}}
+	endpoint := newCanonicalTestEndpoint(runtime, "QQ:help-startup-bot")
 	newMsgContext := func() (*MsgContext, *Message) {
-		player := &GroupPlayerInfo{Name: "Tester", UserID: "test:private", ValueMapTemp: &ds.ValueMap{}}
-		msg := &Message{
-			Platform:    "test",
-			MessageType: "private",
-			Sender:      SenderBase{UserID: player.UserID, Nickname: player.Name},
-		}
-		msgCtx := &MsgContext{
-			Dice:                runtime,
-			Session:             runtime.ImSession,
-			EndPoint:            endpoint,
-			Group:               &GroupInfo{GroupID: "test:private-group"},
-			Player:              player,
-			MessageType:         "private",
-			IsPrivate:           true,
-			IsCompatibilityTest: true,
-		}
+		msg := newPrivateMsg("QQ:help-startup-user", "")
+		msgCtx := newCanonicalTestMessageContext(t, runtime, endpoint, msg, "help-startup-command")
+		msgCtx.IsCompatibilityTest = true
 		return msgCtx, msg
 	}
 	solveAndReadReply := func(command string, args *CmdArgs) string {
@@ -398,29 +363,13 @@ console.log("native-help-startup-script-done");
 		}
 	}
 
-	manager.helpReloadLock.RLock()
-	partialHelp := manager.Help
-	if partialHelp == nil || !partialHelp.IsAvailable() {
-		manager.helpReloadLock.RUnlock()
-		t.Fatal("explicit ReloadHelp did not publish a partial HelpDoc manager")
-	}
-	partialCtx, _ := newMsgContext()
-	partialResult, partialTotal, _, _, err := partialHelp.Search(partialCtx, nativeHelpStartupUniqueTitle, true, 10, 1, "")
-	manager.helpReloadLock.RUnlock()
-	if err != nil {
-		t.Fatalf("search partial HelpDoc index: %v", err)
-	}
-	if partialTotal != 0 || partialResult == nil || len(partialResult.Hits) != 0 {
-		t.Fatalf("partial HelpDoc search total=%d result=%#v, want no unique extension yet", partialTotal, partialResult)
-	}
-
 	findPendingReply := solveAndReadReply("find", &CmdArgs{Args: []string{nativeHelpStartupUniqueTitle}, CleanArgs: nativeHelpStartupUniqueTitle})
 	if !strings.Contains(findPendingReply, "帮助文档") || !strings.Contains(findPendingReply, "正在") {
-		t.Fatalf(".find during initial pending/partial index = %q, want a user-visible HelpDoc loading response", findPendingReply)
+		t.Fatalf(".find during pending startup = %q, want a user-visible HelpDoc loading response", findPendingReply)
 	}
 	helpPendingReply := solveAndReadReply("help", &CmdArgs{Args: []string{nativeHelpStartupUniqueTitle}, CleanArgs: nativeHelpStartupUniqueTitle})
 	if !strings.Contains(helpPendingReply, "帮助文档") || !strings.Contains(helpPendingReply, "正在") {
-		t.Fatalf(".help during initial pending/partial index = %q, want a user-visible HelpDoc loading response", helpPendingReply)
+		t.Fatalf(".help during pending startup = %q, want a user-visible HelpDoc loading response", helpPendingReply)
 	}
 
 	gate.release()
@@ -437,7 +386,7 @@ console.log("native-help-startup-script-done");
 	select {
 	case <-startupDone:
 	case <-time.After(5 * time.Second):
-		t.Fatal("startup JavaScript did not finish after releasing the partial-index gate")
+		t.Fatal("startup JavaScript did not finish after releasing the mid-load gate")
 	}
 	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

@@ -2,8 +2,6 @@ package dice
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
 	"errors"
 	"runtime"
 	"sync"
@@ -12,6 +10,7 @@ import (
 	"time"
 
 	"Scardice-core/adapterapi"
+	"Scardice-core/core/groupstate"
 	"Scardice-core/core/messageflow"
 	"Scardice-core/eventstore"
 	"Scardice-core/logger"
@@ -20,16 +19,20 @@ import (
 )
 
 type bridgeTestSubmitter struct {
-	mu       sync.Mutex
-	request  messageflow.SubmitRequest
-	err      error
-	dedup    bool
-	effectID string
-	onSubmit func(messageflow.SubmitRequest)
+	mu        sync.Mutex
+	request   messageflow.SubmitRequest
+	err       error
+	dedup     bool
+	effectID  string
+	onSubmit  func(messageflow.SubmitRequest)
+	preparer  durableOutboundPreparer
+	submitted int
+	prepared  int
 }
 
 func (s *bridgeTestSubmitter) Submit(_ context.Context, request messageflow.SubmitRequest) (messageflow.SubmitResult, error) {
 	s.mu.Lock()
+	s.submitted++
 	s.request = request
 	onSubmit := s.onSubmit
 	effectID := s.effectID
@@ -47,11 +50,20 @@ func (s *bridgeTestSubmitter) Submit(_ context.Context, request messageflow.Subm
 	return messageflow.SubmitResult{EffectID: effectID, OperationID: string(request.Effect.OperationID), Deduplicated: s.dedup}, nil
 }
 
-func (s *bridgeTestSubmitter) Prepare(_ context.Context, request messageflow.SubmitRequest) (messageflow.PreparedOutbound, error) {
-	if s.err != nil {
-		return messageflow.PreparedOutbound{}, s.err
+func (s *bridgeTestSubmitter) Prepare(ctx context.Context, request messageflow.SubmitRequest) (messageflow.PreparedOutbound, error) {
+	s.mu.Lock()
+	s.request = request
+	s.prepared++
+	err := s.err
+	preparer := s.preparer
+	s.mu.Unlock()
+	if err != nil {
+		return messageflow.PreparedOutbound{}, err
 	}
-	effect := eventstore.NewEffect{EffectID: string(request.Effect.ID), EndpointID: string(request.Effect.EndpointID), LaneHMAC: []byte("lane"), EffectType: "message", RiskClass: eventstore.RiskNonIdempotentAfterDispatch, Status: eventstore.OutboxStatusPending, PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key"}
+	if preparer != nil {
+		return preparer.Prepare(ctx, request)
+	}
+	effect := eventstore.NewEffect{EffectID: string(request.Effect.ID), EndpointID: string(request.Effect.EndpointID), Lane: "lane", EffectType: "message", RiskClass: eventstore.RiskNonIdempotentAfterDispatch, Status: eventstore.OutboxStatusPending, Payload: []byte("{}")}
 	stream := eventstore.StreamAppend{Stream: eventstore.StreamID{AggregateType: "outbound-effect", AggregateID: effect.EffectID}, Events: []eventstore.NewEvent{{EventType: "OutboundEffectRequestedV1", SchemaVersion: 1, Payload: []byte(`{}`), Metadata: eventstore.Metadata{EventID: "event", CommandID: request.CommandID, CorrelationID: string(request.Effect.CorrelationID)}}}}
 	operation := eventstore.OperationUpdate{OperationID: string(request.Effect.OperationID), ResourceID: effect.EffectID, IdempotencyScope: "outbound", IdempotencyKey: request.CommandID}
 	return messageflow.PreparedOutbound{Work: eventstore.UnitOfWork{Streams: []eventstore.StreamAppend{stream}, Operations: []eventstore.OperationUpdate{operation}, Effects: []eventstore.NewEffect{effect}}, Result: messageflow.SubmitResult{EffectID: effect.EffectID, OperationID: operation.OperationID}}, nil
@@ -63,30 +75,44 @@ func (r bridgeTestResolver) Resolve(context.Context, adapterapi.EndpointID) (mes
 	return r.snapshot, nil
 }
 
-type bridgeTestIndexSigner struct {
-	root []byte
-	id   string
-}
-
-func (s bridgeTestIndexSigner) KeyedDigest(_ context.Context, domain string, parts ...string) ([]byte, string, error) {
-	mac := hmac.New(sha256.New, s.root)
-	_, _ = mac.Write([]byte(domain))
-	for _, part := range parts {
-		_, _ = mac.Write([]byte(part))
-	}
-	return mac.Sum(nil), s.id, nil
-}
-
-func bridgeTestContext(submitter *bridgeTestSubmitter) (*MsgContext, *Message, *mockPlatformAdapter) {
+func bridgeTestContext(t *testing.T, submitter *bridgeTestSubmitter) (*MsgContext, *Message, *mockPlatformAdapter) {
+	t.Helper()
 	d := &Dice{Logger: logger.M()}
 	ep := &EndPointInfo{EndPointInfoBase: EndPointInfoBase{ID: "endpoint-1", Platform: "QQ", ProtocolType: "pureonebot", UserID: "QQ:9001", Enable: true, State: StateConnected}}
 	adapter := newMockPlatformAdapter()
 	ep.Adapter = adapter
 	ep.Session = &IMSession{Parent: d}
 	d.ImSession = ep.Session
-	bridge := NewDurableOutboundBridge(submitter, bridgeTestResolver{snapshot: messageflow.EndpointSnapshot{EndpointID: "endpoint-1", DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage), IndexRootID: "root-1", IndexSigner: bridgeTestIndexSigner{root: []byte("01234567890123456789012345678901"), id: "root-1"}}}, eventstore.UUIDGenerator{})
+	bridge := NewDurableOutboundBridge(submitter, bridgeTestResolver{snapshot: messageflow.EndpointSnapshot{EndpointID: "endpoint-1", DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage)}}, eventstore.UUIDGenerator{}, newBridgeTestNotificationOwner(t))
 	d.OutboundBridge = bridge
 	return &MsgContext{Dice: d, EndPoint: ep, Session: ep.Session}, &Message{MessageType: "private", Platform: "QQ", Sender: SenderBase{UserID: "QQ:1001"}}, adapter
+}
+
+func canonicalBridgeTestContext(t *testing.T, submitter *bridgeTestSubmitter) (*MsgContext, *Message, *mockPlatformAdapter) {
+	t.Helper()
+	d, store := newCanonicalTestDice(t)
+	ep := newCanonicalTestEndpoint(d, "QQ:9001")
+	ep.ID = "endpoint-1"
+	ep.Platform = "QQ"
+	ep.ProtocolType = "pureonebot"
+	ep.State = StateConnected
+	adapter := newMockPlatformAdapter()
+	ep.Adapter = adapter
+	resolver := bridgeTestResolver{snapshot: messageflow.EndpointSnapshot{
+		EndpointID: "endpoint-1", AdapterKey: PureOnebotAdapterKey,
+		DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected,
+		Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage),
+	}}
+	outbound, err := messageflow.NewOutboundService(store, resolver, eventstore.UUIDGenerator{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	submitter.preparer = outbound
+	bridge := NewDurableOutboundBridge(submitter, resolver, eventstore.UUIDGenerator{}, newBridgeTestNotificationOwner(t))
+	d.OutboundBridge = bridge
+	return &MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession}, &Message{
+		MessageType: "private", Platform: "QQ", Sender: SenderBase{UserID: "QQ:1001"},
+	}, adapter
 }
 func bridgePendingNotifications(bridge *DurableOutboundBridge) int {
 	bridge.mu.Lock()
@@ -96,7 +122,7 @@ func bridgePendingNotifications(bridge *DurableOutboundBridge) int {
 
 func TestReplyToSenderPureOnebotUsesDurableBridge(t *testing.T) {
 	submitter := &bridgeTestSubmitter{}
-	ctx, msg, legacy := bridgeTestContext(submitter)
+	ctx, msg, legacy := bridgeTestContext(t, submitter)
 	ReplyToSender(ctx, msg, "durable hello")
 	if legacy.personMsgs != nil || legacy.groupMsgs != nil {
 		t.Fatalf("legacy adapter called: %#v", legacy)
@@ -108,7 +134,7 @@ func TestReplyToSenderPureOnebotUsesDurableBridge(t *testing.T) {
 
 func TestReplyToSenderPureOnebotReadViewUsesDurableBridge(t *testing.T) {
 	submitter := &bridgeTestSubmitter{}
-	ctx, msg, _ := bridgeTestContext(submitter)
+	ctx, msg, _ := bridgeTestContext(t, submitter)
 	ctx.EndPoint.Adapter = nil
 	ReplyToSender(ctx, msg, "read view hello")
 	if submitter.request.Effect.Payload.Text != "read view hello" {
@@ -118,18 +144,20 @@ func TestReplyToSenderPureOnebotReadViewUsesDurableBridge(t *testing.T) {
 
 func TestReplyToSenderCallbackStagesPreparedOutbound(t *testing.T) {
 	submitter := &bridgeTestSubmitter{}
-	ctx, msg, legacy := bridgeTestContext(submitter)
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	transaction := &DurableCallbackTransaction{collector: collector}
+	ctx, msg, legacy := canonicalBridgeTestContext(t, submitter)
+	root := newCanonicalTestRoot(t, ctx.Dice, "callback-outbound-stage")
+	transaction := root.Transaction
 	ctx.callbackTransaction = transaction
+	ctx.callbackMetadata = root.Metadata
+	ctx.executionContext = root.Context
 	ReplyToSender(ctx, msg, "callback hello")
-	if submitter.request.Effect.ID != "" {
-		t.Fatalf("callback invoked independent submit: %#v", submitter.request)
+	if submitter.submitted != 0 || submitter.prepared != 1 {
+		t.Fatalf("callback submission paths = submit:%d prepare:%d", submitter.submitted, submitter.prepared)
 	}
 	if legacy.personMsgs != nil || legacy.groupMsgs != nil {
 		t.Fatalf("callback invoked legacy adapter: %#v", legacy)
 	}
-	work, err := collector.UnitOfWork()
+	work, err := root.Collector.UnitOfWork()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,61 +171,69 @@ func TestReplyToSenderCallbackStagesPreparedOutbound(t *testing.T) {
 	if pendingBeforeCommit != 0 {
 		t.Fatalf("callback notification registered before commit: %d", pendingBeforeCommit)
 	}
-	if transaction.callbackCommitFence == nil || len(transaction.callbackAfterCommit) != 1 {
-		t.Fatalf("callback commit fence=%v after=%d", transaction.callbackCommitFence, len(transaction.callbackAfterCommit))
+	if transaction.callbackCommitFence == nil || len(transaction.callbackPublication) != 1 || len(transaction.callbackAfterCommit) != 0 {
+		t.Fatalf("callback commit fence=%v publication=%d after=%d", transaction.callbackCommitFence, len(transaction.callbackPublication), len(transaction.callbackAfterCommit))
 	}
 	if !transaction.callbackCommitFence.TryLock() {
 		t.Fatal("callback commit fence is busy")
 	}
-	transaction.callbackAfterCommit[0]()
+	transaction.callbackPublication[0]()
 	bridge.mu.Lock()
 	pendingUnderFence := len(bridge.pending)
 	bridge.mu.Unlock()
 	transaction.callbackCommitFence.Unlock()
 	if pendingUnderFence != 1 {
-		t.Fatalf("callback notification missing after commit: %d", pendingUnderFence)
+		t.Fatalf("callback notification missing during committed publication: %d", pendingUnderFence)
 	}
 }
 
 func TestReplyToSenderCallbackProxyStagesRollbackSafeCompletion(t *testing.T) {
 	submitter := &bridgeTestSubmitter{}
-	ctx, msg, legacy := bridgeTestContext(submitter)
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	transaction := &DurableCallbackTransaction{collector: collector}
-	ctx.callbackTransaction = transaction
+	base, _, legacy := canonicalBridgeTestContext(t, submitter)
+	msg := &Message{MessageType: "group", GroupID: "QQ-Group:7001", Sender: SenderBase{UserID: "QQ:1001", Nickname: "Sender"}}
+	ctx := newCanonicalTestMessageContext(t, base.Dice, base.EndPoint, msg, "proxy-callback-outbound")
+	transaction := ctx.callbackTransaction
 	ctx.callbackMetadata = eventstore.Metadata{
 		CommandID: "proxy-callback", CorrelationID: "proxy-callback",
 		OccurredAt: time.Unix(1, 0).UTC(),
 	}
-	ctx.Group = &GroupInfo{GroupID: "QQ-Group:7001", Players: new(SyncMap[string, *GroupPlayerInfo])}
-	ctx.Player = &GroupPlayerInfo{UserID: "QQ:1001", Name: "Sender"}
-	target := &GroupPlayerInfo{UserID: "QQ:1002", Name: "Target"}
-	ctx.Group.Players.Store(target.UserID, target)
+	target, err := ctx.ResolvePlayer(ctx.domainContext(), ctx.Group.GroupID(), "QQ:1002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.Version() == 0 {
+		if err = target.create(ctx.Dice.BaseConfig.Name, ctx.Group.GroupID(), "QQ:1002", "Target"); err != nil {
+			t.Fatal(err)
+		}
+	}
 
-	proxy, found := (&AtInfo{UserID: target.UserID}).CopyCtx(ctx)
+	proxy, found := (&AtInfo{UserID: target.UserID()}).CopyCtx(ctx)
 	if !found || proxy.Player != target {
 		t.Fatalf("proxy context player = %#v, found=%t", proxy.Player, found)
 	}
 	if proxy.callbackTransaction != transaction || proxy.callbackMetadata.CommandID != "proxy-callback" {
 		t.Fatal("proxy context dropped durable callback ownership")
 	}
+	// Group creation may register unrelated runtime-cache publications; only
+	// the outbound reply must not add its own generic AfterCommit hook.
+	afterCommitBeforeReply := len(transaction.callbackAfterCommit)
 	ReplyToSender(proxy, msg, "proxy callback hello")
 
-	if submitter.request.Effect.ID != "" {
-		t.Fatalf("proxy callback invoked independent submit: %#v", submitter.request)
+	if submitter.submitted != 0 || submitter.prepared != 1 {
+		t.Fatalf("proxy callback submission paths = submit:%d prepare:%d", submitter.submitted, submitter.prepared)
 	}
 	if legacy.personMsgs != nil || legacy.groupMsgs != nil {
 		t.Fatalf("proxy callback invoked legacy adapter: %#v", legacy)
 	}
-	work, err := collector.UnitOfWork()
+	work, err := transaction.collector.UnitOfWork()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(work.Streams) != 1 || len(work.Operations) != 1 || len(work.Effects) != 1 {
-		t.Fatalf("proxy callback outbound work = %#v", work)
+	if len(work.Operations) != 1 || len(work.Effects) != 1 {
+		t.Fatalf("proxy callback outbound participants = operations:%d effects:%d", len(work.Operations), len(work.Effects))
 	}
-	if transaction.callbackCommitFence == nil || len(transaction.callbackAfterCommit) != 1 {
-		t.Fatalf("proxy callback completion fence=%v after=%d", transaction.callbackCommitFence, len(transaction.callbackAfterCommit))
+	if transaction.callbackCommitFence == nil || len(transaction.callbackPublication) != 1 || len(transaction.callbackAfterCommit) != afterCommitBeforeReply {
+		t.Fatalf("proxy callback completion fence=%v publication=%d after=%d (before reply: %d)", transaction.callbackCommitFence, len(transaction.callbackPublication), len(transaction.callbackAfterCommit), afterCommitBeforeReply)
 	}
 	bridge := ctx.Dice.OutboundBridge.(*DurableOutboundBridge)
 	bridge.mu.Lock()
@@ -209,7 +245,7 @@ func TestReplyToSenderCallbackProxyStagesRollbackSafeCompletion(t *testing.T) {
 }
 func TestReplyToSenderPureOnebotDurableRejectionDoesNotCallLegacy(t *testing.T) {
 	submitter := &bridgeTestSubmitter{err: errors.New("rejected")}
-	ctx, msg, legacy := bridgeTestContext(submitter)
+	ctx, msg, legacy := bridgeTestContext(t, submitter)
 	ReplyToSender(ctx, msg, "rejected hello")
 	if legacy.personMsgs != nil || legacy.groupMsgs != nil {
 		t.Fatalf("legacy adapter called after rejection: %#v", legacy)
@@ -220,7 +256,7 @@ func TestReplyToSenderPureOnebotDurableRejectionDoesNotCallLegacy(t *testing.T) 
 }
 
 func TestFailClosedOutboundBridgeNeverFallsBackToLegacyAdapter(t *testing.T) {
-	ctx, msg, legacy := bridgeTestContext(&bridgeTestSubmitter{})
+	ctx, msg, legacy := bridgeTestContext(t, &bridgeTestSubmitter{})
 	ctx.Dice.OutboundBridge = NewFailClosedOutboundBridge()
 	ReplyToSender(ctx, msg, "startup window")
 	if legacy.personMsgs != nil || legacy.groupMsgs != nil {
@@ -232,7 +268,7 @@ func TestFailClosedOutboundBridgeNeverFallsBackToLegacyAdapter(t *testing.T) {
 }
 
 func TestPureOnebotNilBridgeFailsClosedForPersonAndGroup(t *testing.T) {
-	ctx, msg, legacy := bridgeTestContext(&bridgeTestSubmitter{})
+	ctx, msg, legacy := bridgeTestContext(t, &bridgeTestSubmitter{})
 	ctx.Dice.OutboundBridge = nil
 
 	if accepted := deliverReplyPlan(ctx, msg, "private reply", "", false); accepted {
@@ -285,11 +321,8 @@ func TestDurableOutboundBridgeRoutesTextByProviderDescriptor(t *testing.T) {
 			d.OutboundBridge = NewDurableOutboundBridge(submitter, bridgeTestResolver{snapshot: messageflow.EndpointSnapshot{
 				EndpointID: "endpoint-1", AdapterKey: test.adapterKey, DesiredState: "enabled",
 				ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound,
-				Actions:     adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage),
-				IndexRootID: "root-1", IndexSigner: bridgeTestIndexSigner{
-					root: []byte("01234567890123456789012345678901"), id: "root-1",
-				},
-			}}, eventstore.UUIDGenerator{})
+				Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage),
+			}}, eventstore.UUIDGenerator{}, newBridgeTestNotificationOwner(t))
 			ctx := &MsgContext{Dice: d, EndPoint: ep, Session: ep.Session}
 			if err := d.OutboundBridge.SubmitText(ctx, &test.message, "hello", "", test.group); err != nil {
 				t.Fatal(err)
@@ -303,7 +336,7 @@ func TestDurableOutboundBridgeRoutesTextByProviderDescriptor(t *testing.T) {
 
 func TestDurableBridgeNotifiesOnlyCommittedSuccess(t *testing.T) {
 	submitter := &bridgeTestSubmitter{}
-	ctx, msg, _ := bridgeTestContext(submitter)
+	ctx, msg, _ := canonicalBridgeTestContext(t, submitter)
 	called := make(chan *Message, 1)
 	ctx.Dice.ExtList = []*ExtInfo{{OnMessageSend: func(_ *MsgContext, message *Message, _ string) { called <- message }}}
 	if err := ctx.Dice.OutboundBridge.SubmitText(ctx, msg, "hello", "", false); err != nil {
@@ -324,8 +357,8 @@ func TestDurableBridgeNotifiesOnlyCommittedSuccess(t *testing.T) {
 
 func TestDurableBridgePostCommitSendHookOwnsOnlyReturnedPromise(t *testing.T) {
 	submitter := &bridgeTestSubmitter{}
-	ctx, msg, _ := bridgeTestContext(submitter)
-	ctx.Dice.Config.JsEnable = true
+	ctx, msg, _ := canonicalBridgeTestContext(t, submitter)
+	updateCanonicalTestConfig(t, ctx.Dice, func(config *Config) { config.JsEnable = true })
 	loop := gojaengine.WrapEventLoop(startFsTestLoop(t))
 	manager := NewJsLoopManager()
 	generation := manager.SetLoop(loop)
@@ -381,11 +414,20 @@ extension.onMessageSend = async function (hookCtx) {
 		t.Fatal(err)
 	}
 	bridge := ctx.Dice.OutboundBridge.(*DurableOutboundBridge)
+	completionIdentity := ctx.Dice.DomainExecutionIdentity("outbound-provider-completion", string(submitter.request.Effect.ID))
 	bridge.NotifyOutboundEffectSucceeded(context.Background(), submitter.request.Effect, adapterapi.SucceededResult("provider-owned-scope"))
 	select {
 	case <-started:
 	case <-time.After(2 * time.Second):
 		t.Fatal("post-commit send hook did not start")
+	}
+	repository := ctx.Dice.DurableStore.(eventstore.ExecutionReceiptRepository)
+	receipt, err := repository.LookupExecution(context.Background(), completionIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Status != eventstore.ExecutionStatusStarted {
+		t.Fatalf("completion root sealed before its Promise settled: %#v", receipt)
 	}
 	if err := loop.Run(func(runtime jsengine.Runtime) error {
 		_, err := runtime.RunString("resolve-post-commit-send-hook.js", "resolvePostCommitHook()")
@@ -402,6 +444,7 @@ extension.onMessageSend = async function (hookCtx) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("returned send-hook Promise did not resume")
 	}
+	awaitCanonicalTestExecutionCommit(t, ctx.Dice, completionIdentity)
 
 	deadline := time.NewTimer(2 * time.Second)
 	defer deadline.Stop()
@@ -436,7 +479,7 @@ extension.onMessageSend = async function (hookCtx) {
 
 func TestDurableBridgeConcurrentTerminalNotificationFencesReconciliation(t *testing.T) {
 	submitter := &bridgeTestSubmitter{}
-	ctx, msg, _ := bridgeTestContext(submitter)
+	ctx, msg, _ := canonicalBridgeTestContext(t, submitter)
 	bridge := ctx.Dice.OutboundBridge.(*DurableOutboundBridge)
 	const canonicalEffectID = "canonical-effect-id"
 	started := make(chan struct{})
@@ -507,7 +550,7 @@ func TestDurableBridgeConcurrentTerminalNotificationFencesReconciliation(t *test
 
 func TestDurableBridgeSuccessNotificationPreservesGroupTarget(t *testing.T) {
 	submitter := &bridgeTestSubmitter{}
-	ctx, msg, _ := bridgeTestContext(submitter)
+	ctx, msg, _ := canonicalBridgeTestContext(t, submitter)
 	msg.MessageType, msg.GroupID = "group", "QQ-Group:7001"
 	called := make(chan *Message, 1)
 	ctx.Dice.ExtList = []*ExtInfo{{OnMessageSend: func(_ *MsgContext, message *Message, _ string) { called <- message }}}
@@ -526,15 +569,82 @@ func TestDurableBridgeSuccessNotificationPreservesGroupTarget(t *testing.T) {
 	}
 }
 
+func TestDurableBridgeCompletionUsesFreshSourceHandlesAndSentTarget(t *testing.T) {
+	submitter := &bridgeTestSubmitter{}
+	base, _, _ := canonicalBridgeTestContext(t, submitter)
+	source := &Message{
+		MessageType: "group", GroupID: "QQ-Group:6001",
+		Sender: SenderBase{UserID: "QQ:1001", Nickname: "Source"},
+	}
+	target := &Message{
+		MessageType: "group", GroupID: "QQ-Group:7001",
+		Sender: SenderBase{UserID: "QQ:2002", Nickname: "Target"},
+	}
+	type hookObservation struct {
+		groupID, playerID, targetID string
+		fresh                       bool
+	}
+	observed := make(chan hookObservation, 1)
+	var sourceGroup *GroupInfo
+	var sourcePlayer *GroupPlayerInfo
+	base.Dice.ExtList = []*ExtInfo{{OnMessageSend: func(hookCtx *MsgContext, sent *Message, _ string) {
+		observation := hookObservation{targetID: sent.GroupID}
+		if hookCtx.Group != nil {
+			observation.groupID = hookCtx.Group.GroupID()
+		}
+		if hookCtx.Player != nil {
+			observation.playerID = hookCtx.Player.UserID()
+		}
+		observation.fresh = hookCtx.Group != sourceGroup && hookCtx.Player != sourcePlayer
+		if err := hookCtx.Group.SetGroupName("completion committed"); err != nil {
+			hookCtx.setExecutionError(err)
+		}
+		observed <- observation
+	}}}
+
+	withCanonicalTestMessageContext(t, base.Dice, base.EndPoint, source, "source-outbound", func(ctx *MsgContext) error {
+		sourceGroup, sourcePlayer = ctx.Group, ctx.Player
+		return base.Dice.OutboundBridge.SubmitText(ctx, target, "to target", "", true)
+	})
+	effect := submitter.request.Effect
+	base.Dice.OutboundBridge.(*DurableOutboundBridge).NotifyOutboundEffectSucceeded(
+		context.Background(), effect, adapterapi.SucceededResult("provider-source-target"),
+	)
+	select {
+	case got := <-observed:
+		if got.groupID != source.GroupID || got.playerID != source.Sender.UserID || got.targetID != target.GroupID || !got.fresh {
+			t.Fatalf("completion identities = %#v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("completion hook did not run")
+	}
+	identity := base.Dice.DomainExecutionIdentity("outbound-provider-completion", string(effect.ID))
+	awaitCanonicalTestExecutionCommit(t, base.Dice, identity)
+	state, err := groupstate.NewRepository(base.Dice.DurableStore).Load(context.Background(), base.Dice.BaseConfig.Name, source.GroupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.GroupName != "completion committed" {
+		t.Fatalf("completion mutation persisted name = %q", state.GroupName)
+	}
+}
+
 func TestDurableBridgeNonSuccessOutcomesDropNotification(t *testing.T) {
 	tests := []struct {
 		name   string
 		result adapterapi.EffectResult
 		reject bool
+		mutate func(*adapterapi.OutboundEffect)
 	}{
 		{name: "terminal", result: adapterapi.TerminalResult("provider-terminal", "rejected by provider")},
 		{name: "unsupported", result: adapterapi.UnsupportedResult("missing-capability")},
 		{name: "ambiguous", result: adapterapi.AmbiguousResult("timeout-after-send", "delivery unknown")},
+		{name: "typed result for message", result: adapterapi.SucceededGroupInfoResult(adapterapi.GroupInfoResult{
+			Conversation: "QQ-Group:2002", Name: "not a message completion",
+		})},
+		{name: "mismatched accepted target", result: adapterapi.SucceededResult("provider-mismatch"), mutate: func(effect *adapterapi.OutboundEffect) {
+			effect.Payload.Target.Conversation = "QQ:9999"
+		}},
 		{name: "submit rejected", reject: true},
 	}
 	for _, test := range tests {
@@ -543,7 +653,7 @@ func TestDurableBridgeNonSuccessOutcomesDropNotification(t *testing.T) {
 			if test.reject {
 				submitter.err = errors.New("durable acceptance rejected")
 			}
-			ctx, msg, _ := bridgeTestContext(submitter)
+			ctx, msg, _ := canonicalBridgeTestContext(t, submitter)
 			bridge := ctx.Dice.OutboundBridge.(*DurableOutboundBridge)
 			var callbackCount atomic.Int32
 			called := make(chan struct{}, 1)
@@ -564,7 +674,11 @@ func TestDurableBridgeNonSuccessOutcomesDropNotification(t *testing.T) {
 				if pending := bridgePendingNotifications(bridge); pending != 1 {
 					t.Fatalf("pending before terminal result = %d, want 1", pending)
 				}
-				bridge.NotifyOutboundEffectResult(context.Background(), submitter.request.Effect, test.result)
+				effect := submitter.request.Effect
+				if test.mutate != nil {
+					test.mutate(&effect)
+				}
+				bridge.NotifyOutboundEffectResult(context.Background(), effect, test.result)
 			}
 			if pending := bridgePendingNotifications(bridge); pending != 0 {
 				t.Fatalf("pending after %s = %d, want 0", test.name, pending)
@@ -583,7 +697,7 @@ func TestDurableBridgeNonSuccessOutcomesDropNotification(t *testing.T) {
 
 func TestDurableBridgeDeduplicatedReplayWithoutPendingDoesNotLeak(t *testing.T) {
 	submitter := &bridgeTestSubmitter{dedup: true}
-	ctx, msg, _ := bridgeTestContext(submitter)
+	ctx, msg, _ := bridgeTestContext(t, submitter)
 	if err := ctx.Dice.OutboundBridge.SubmitText(ctx, msg, "replayed", "", false); err != nil {
 		t.Fatal(err)
 	}
@@ -597,7 +711,7 @@ func TestDurableBridgeDeduplicatedReplayWithoutPendingDoesNotLeak(t *testing.T) 
 }
 func TestDurableBridgeMessageHookPanicDoesNotStopDispatch(t *testing.T) {
 	submitter := &bridgeTestSubmitter{}
-	ctx, msg, _ := bridgeTestContext(submitter)
+	ctx, msg, _ := canonicalBridgeTestContext(t, submitter)
 	bridge := ctx.Dice.OutboundBridge.(*DurableOutboundBridge)
 	var callbackCount atomic.Int32
 	firstStarted := make(chan struct{})
@@ -627,6 +741,22 @@ func TestDurableBridgeMessageHookPanicDoesNotStopDispatch(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("panic callback did not unwind")
 	}
+	firstIdentity := ctx.Dice.DomainExecutionIdentity("outbound-provider-completion", string(firstEffect.ID))
+	repository := ctx.Dice.DurableStore.(eventstore.ExecutionReceiptRepository)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		receipt, err := repository.LookupExecution(context.Background(), firstIdentity)
+		if err == nil && receipt.Status == eventstore.ExecutionStatusAmbiguous {
+			break
+		}
+		if err == nil && receipt.Status == eventstore.ExecutionStatusCommitted {
+			t.Fatalf("panicking completion was fabricated as committed: %#v", receipt)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("panicking completion did not become ambiguous: receipt=%#v err=%v", receipt, err)
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if err := bridge.SubmitText(ctx, msg, "panic-isolated-2", "", false); err != nil {
 		t.Fatal(err)
 	}
@@ -644,7 +774,7 @@ func TestDurableBridgeMessageHookPanicDoesNotStopDispatch(t *testing.T) {
 
 func TestFreshDurableBridgeIgnoresPriorTerminalResult(t *testing.T) {
 	firstSubmitter := &bridgeTestSubmitter{}
-	ctx, msg, _ := bridgeTestContext(firstSubmitter)
+	ctx, msg, _ := canonicalBridgeTestContext(t, firstSubmitter)
 	firstBridge := ctx.Dice.OutboundBridge.(*DurableOutboundBridge)
 	var firstCallbacks atomic.Int32
 	ctx.Dice.ExtList = []*ExtInfo{{OnMessageSend: func(_ *MsgContext, _ *Message, _ string) { firstCallbacks.Add(1) }}}
@@ -658,7 +788,7 @@ func TestFreshDurableBridgeIgnoresPriorTerminalResult(t *testing.T) {
 	}
 
 	freshSubmitter := &bridgeTestSubmitter{}
-	freshCtx, _, _ := bridgeTestContext(freshSubmitter)
+	freshCtx, _, _ := canonicalBridgeTestContext(t, freshSubmitter)
 	freshBridge := freshCtx.Dice.OutboundBridge.(*DurableOutboundBridge)
 	var freshCallbacks atomic.Int32
 	freshCalled := make(chan struct{}, 1)
@@ -682,7 +812,7 @@ func TestFreshDurableBridgeIgnoresPriorTerminalResult(t *testing.T) {
 
 func TestDurableBridgeActionArtifactNeverInvokesMessageHook(t *testing.T) {
 	submitter := &bridgeTestSubmitter{}
-	ctx, _, _ := bridgeTestContext(submitter)
+	ctx, _, _ := bridgeTestContext(t, submitter)
 	bridge := ctx.Dice.OutboundBridge.(*DurableOutboundBridge)
 	called := make(chan struct{}, 1)
 	ctx.Dice.ExtList = []*ExtInfo{{OnMessageSend: func(_ *MsgContext, _ *Message, _ string) { called <- struct{}{} }}}
@@ -714,7 +844,7 @@ func TestDurableBridgeActionArtifactNeverInvokesMessageHook(t *testing.T) {
 
 func TestMemberBanRejectsDurationOverflow(t *testing.T) {
 	submitter := &bridgeTestSubmitter{}
-	ctx, _, _ := bridgeTestContext(submitter)
+	ctx, _, _ := bridgeTestContext(t, submitter)
 	MemberBan(ctx, "QQ-Group:7001", "QQ:1001", int64(^uint32(0))+1)
 	submitter.mu.Lock()
 	requested := submitter.request.Effect.ID != ""
@@ -734,8 +864,6 @@ func configureBridgeForManagementActions(ctx *MsgContext) {
 		Capabilities:  adapterapi.CapabilityOutbound | adapterapi.CapabilityActions,
 		Actions: adapterapi.ActionSet(0).
 			With(adapterapi.ActionKindBan, adapterapi.ActionKindKick, adapterapi.ActionKindQuit),
-		IndexRootID: "root-1",
-		IndexSigner: bridgeTestIndexSigner{root: []byte("01234567890123456789012345678901"), id: "root-1"},
 	}}
 }
 
@@ -760,7 +888,7 @@ func TestManagementActionsUseDurableBridgeForEveryProvider(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			submitter := &bridgeTestSubmitter{}
-			ctx, _, legacy := bridgeTestContext(submitter)
+			ctx, _, legacy := bridgeTestContext(t, submitter)
 			configureBridgeForManagementActions(ctx)
 			if err := test.run(ctx); err != nil {
 				t.Fatalf("management action error: %v", err)
@@ -779,7 +907,7 @@ func TestManagementActionsUseDurableBridgeForEveryProvider(t *testing.T) {
 }
 
 func TestQuitGroupDelegatesLegacyAdapterWithoutBridge(t *testing.T) {
-	ctx, _, legacy := bridgeTestContext(&bridgeTestSubmitter{})
+	ctx, _, legacy := bridgeTestContext(t, &bridgeTestSubmitter{})
 	ctx.Dice.OutboundBridge = nil
 	ctx.EndPoint.ProtocolType = "gocq"
 
@@ -802,13 +930,19 @@ func TestFileSendRejectsDurableAndPureOnebotPathsWithoutFallback(t *testing.T) {
 		{name: "durable callback transaction", callbackTransaction: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			ctx, msg, legacy := bridgeTestContext(&bridgeTestSubmitter{})
+			ctx, msg, legacy := bridgeTestContext(t, &bridgeTestSubmitter{})
+			if test.callbackTransaction {
+				ctx, msg, legacy = canonicalBridgeTestContext(t, &bridgeTestSubmitter{})
+			}
 			if !test.withBridge {
 				ctx.Dice.OutboundBridge = nil
 			}
 			if test.callbackTransaction {
 				ctx.EndPoint.ProtocolType = "gocq"
-				ctx.callbackTransaction = &DurableCallbackTransaction{}
+				root := newCanonicalTestRoot(t, ctx.Dice, "file-send-callback")
+				ctx.callbackTransaction = root.Transaction
+				ctx.callbackMetadata = root.Metadata
+				ctx.executionContext = root.Context
 			}
 
 			personResult, personErr := SendFileToPersonRaw(ctx, msg, "/synthetic/private.txt", "")
@@ -827,7 +961,7 @@ func TestFileSendRejectsDurableAndPureOnebotPathsWithoutFallback(t *testing.T) {
 }
 
 func TestFileSendDelegatesLegacyNoBridgeToProvider(t *testing.T) {
-	ctx, _, legacy := bridgeTestContext(&bridgeTestSubmitter{})
+	ctx, _, legacy := bridgeTestContext(t, &bridgeTestSubmitter{})
 	ctx.Dice.OutboundBridge = nil
 	ctx.EndPoint.ProtocolType = "gocq"
 
@@ -850,7 +984,7 @@ func TestFileSendDelegatesLegacyNoBridgeToProvider(t *testing.T) {
 }
 
 func TestFileSendReturnsClearErrorWithoutLegacyAdapter(t *testing.T) {
-	ctx, msg, _ := bridgeTestContext(&bridgeTestSubmitter{})
+	ctx, msg, _ := bridgeTestContext(t, &bridgeTestSubmitter{})
 	ctx.Dice.OutboundBridge = nil
 	ctx.EndPoint.ProtocolType = "gocq"
 	ctx.EndPoint.Adapter = nil

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -15,20 +14,14 @@ import (
 )
 
 func Test_DiceConfig_notice_targets_round_trip_without_changing_masters(t *testing.T) {
-	// Given
-	previousDice := myDice
-	t.Cleanup(func() { myDice = previousDice })
-	t.Chdir(t.TempDir())
-	if err := os.Mkdir("data", 0o755); err != nil {
-		t.Fatalf("create config data directory: %v", err)
-	}
-	manager := &dice.DiceManager{}
+	_, manager, runtime, _ := newDiceConfigDurableHandlerTest(t)
 	manager.AccessTokens.Store("task10-token", true)
-	myDice = &dice.Dice{
-		Parent:      manager,
-		DiceMasters: []string{"QQ:permission-only"},
+	if err := runtime.DurableMutateConfig(t.Context(), "notice-test-masters", []string{"QQ:permission-only"}, func(config *dice.Config) error {
+		config.DiceMasters = []string{"QQ:permission-only"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
-	manager.Dice = []*dice.Dice{myDice}
 	e := echo.New()
 	requestBody := `{"noticeIds":[" QQ:1001:only=ban,group,ban ","QQ:1002:disable:only=send",""]}`
 	setRequest := httptest.NewRequest(http.MethodPost, "/sd-api/dice/config", strings.NewReader(requestBody))

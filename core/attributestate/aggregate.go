@@ -30,20 +30,19 @@ var (
 )
 
 type State struct {
-	Version           uint64 `json:"version"`
-	DiceID            string `json:"diceId"`
-	ID                string `json:"id"`
-	AttrsType         string `json:"attrsType,omitempty"`
-	BindingSheetID    string `json:"bindingSheetId,omitempty"`
-	Name              string `json:"name,omitempty"`
-	OwnerID           string `json:"ownerId,omitempty"`
-	SheetType         string `json:"sheetType,omitempty"`
-	Hidden            bool   `json:"hidden"`
-	SecretRef         string `json:"secretRef"`
-	SecretVersion     uint64 `json:"secretVersion"`
-	CreatedAt         int64  `json:"createdAt,omitempty"`
-	UpdatedAt         int64  `json:"updatedAt,omitempty"`
-	PrivacySubjectKey []byte `json:"-"`
+	Version        uint64 `json:"version"`
+	DiceID         string `json:"diceId"`
+	ID             string `json:"id"`
+	AttrsType      string `json:"attrsType,omitempty"`
+	BindingSheetID string `json:"bindingSheetId,omitempty"`
+	Name           string `json:"name,omitempty"`
+	OwnerID        string `json:"ownerId,omitempty"`
+	SheetType      string `json:"sheetType,omitempty"`
+	Hidden         bool   `json:"hidden"`
+	SecretRef      string `json:"secretRef"`
+	SecretVersion  uint64 `json:"secretVersion"`
+	CreatedAt      int64  `json:"createdAt,omitempty"`
+	UpdatedAt      int64  `json:"updatedAt,omitempty"`
 }
 
 type BaselineImportedV1 struct {
@@ -128,7 +127,8 @@ func ValidateState(state State) error {
 }
 
 func validateBaseline(event BaselineImportedV1) error {
-	if Stream(event.DiceID, event.ID).AggregateID == "" || !validPart(event.SecretRef) || event.SecretVersion == 0 {
+	if Stream(event.DiceID, event.ID).AggregateID == "" || strings.TrimSpace(event.SecretRef) == "" ||
+		len(event.SecretRef) > eventstore.MaxSecretRefBytes || strings.ContainsRune(event.SecretRef, '\x00') || event.SecretVersion == 0 {
 		return ErrInvalidIdentity
 	}
 	if len(event.AttrsType) > 64 || len(event.BindingSheetID) > 255 || len(event.Name) > 1024 || len(event.OwnerID) > 255 || len(event.SheetType) > 255 {

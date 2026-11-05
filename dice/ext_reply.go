@@ -205,7 +205,7 @@ func RegisterBuiltinExtReply(dice *Dice) {
 		OnNotCommandReceived: func(ctx *MsgContext, msg *Message) {
 			// 当前，只有非指令才会匹配
 			rcs := ctx.Dice.CustomReplyConfig
-			if !ctx.Dice.Config.CustomReplyConfigEnable {
+			if !ctx.Dice.Config().CustomReplyConfigEnable {
 				return
 			}
 			executed := false
@@ -215,7 +215,7 @@ func RegisterBuiltinExtReply(dice *Dice) {
 			cleanText = strings.TrimSpace(cleanText)
 			VarSetValueInt64(ctx, "$t文本长度", int64(len(cleanText)))
 
-			if dice.Config.ReplyDebugMode {
+			if dice.Config().ReplyDebugMode {
 				log.Infof("[回复调试]当前文本:“%s” hex: %x 字节形式: %v", cleanText, cleanText, []byte(cleanText))
 			}
 
@@ -256,20 +256,14 @@ func RegisterBuiltinExtReply(dice *Dice) {
 				}
 
 				checkInCoolDown := func() bool {
-					lastTime := ctx.Group.LastCustomReplyTime
 					now := float64(time.Now().UnixMilli()) / 1000
 					// 自定义回复作为内建能力，统一使用高级设置中的全局冷却时间，不再混用文件内 interval。
 					// 这是有意修改语义以换取全局一致性；若配置非法，则回退到默认冷却时间。
-					interval := ctx.Dice.AdvancedConfig.CustomReplyCooldown
+					interval := ctx.Dice.AdvancedConfig().CustomReplyCooldown
 					if interval <= 0 {
 						interval = DefaultCustomReplyCooldown
 					}
-
-					if now-lastTime < interval {
-						return true // 未达到冷却，退出
-					}
-					ctx.Group.LastCustomReplyTime = now
-					return false
+					return ctx.Group.CheckCustomReplyCooldown(now, interval)
 				}
 
 				for index, i := range rc.Items {

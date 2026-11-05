@@ -11,8 +11,8 @@ import (
 func TestStoryLogImportsAreTypedIdempotentAndVerifiedAfterReopen(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "story-log-import.db")
-	source := newTestKeySource()
-	store, db := openLogArchiveTestStore(t, path, source)
+
+	store, db := openLogArchiveTestStore(t, path)
 	emptyExtra := ""
 	sessionID := "legacy/data-logs.db/logs/31"
 	entryID := "legacy/data-logs.db/log_items/72"
@@ -66,7 +66,7 @@ func TestStoryLogImportsAreTypedIdempotentAndVerifiedAfterReopen(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, db = openLogArchiveTestStore(t, path, source)
+	store, db = openLogArchiveTestStore(t, path)
 	defer db.Close()
 	manifest, err := store.ListStoryLogImports(ctx, "legacy/", "dice-a")
 	if err != nil || len(manifest) != 3 {
@@ -83,7 +83,7 @@ func TestStoryLogImportsAreTypedIdempotentAndVerifiedAfterReopen(t *testing.T) {
 		}
 	}
 	var session storyLogSessionRow
-	if err := db.GORM().Where("scope_hmac = ?", func() []byte { scope, _, _, _ := store.storyLogKeys(ctx, "dice-a", "group-a", ""); return scope }()).First(&session).Error; err != nil {
+	if err := storyScopeQuery(db.GORM(), privacyCanonical("dice-a", "group-a")).First(&session).Error; err != nil {
 		t.Fatal(err)
 	}
 	private, err := store.storyLogSession(ctx, session)
@@ -93,7 +93,7 @@ func TestStoryLogImportsAreTypedIdempotentAndVerifiedAfterReopen(t *testing.T) {
 }
 
 func TestStoryLogImportDigestPreservesNullableExtra(t *testing.T) {
-	store, db, _ := openEncryptedTestStore(t)
+	store, db := openPlainTestStore(t)
 	defer db.Close()
 	ctx := context.Background()
 	record := StoryLogImportRecord{SourceID: "source/log/1", Kind: StoryLogImportSession, DiceID: "dice", GroupID: "group", Session: &StoryLogSession{DiceID: "dice", GroupID: "group", Name: "session"}}
@@ -113,7 +113,7 @@ func TestStoryLogImportDigestPreservesNullableExtra(t *testing.T) {
 }
 
 func TestListStoryLogImportsCrossesReadbackBatchBoundary(t *testing.T) {
-	store, db, _ := openEncryptedTestStore(t)
+	store, db := openPlainTestStore(t)
 	defer db.Close()
 	ctx := context.Background()
 	sessionSourceID := "bulk/session"

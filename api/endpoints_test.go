@@ -39,24 +39,6 @@ func (endpointAPIDescriptor) NewRuntime(adapterapi.RuntimeInit) (adapterapi.Adap
 	return nil, errors.New("runtime construction is not used by API tests")
 }
 
-type endpointAPITestKeySource struct{}
-
-func (endpointAPITestKeySource) IndexRootID(context.Context) (string, error) {
-	return "api-test-index-v1", nil
-}
-func (endpointAPITestKeySource) IndexRootMaterial(context.Context) ([]byte, error) {
-	return []byte("01234567890123456789012345678901"), nil
-}
-func (endpointAPITestKeySource) CurrentEncryptionRoot(context.Context) (eventstore.EncryptionRoot, error) {
-	return eventstore.EncryptionRoot{ID: "api-test-root-v1", Material: []byte("abcdefghijklmnopqrstuvwxyz123456")}, nil
-}
-func (endpointAPITestKeySource) EncryptionRoot(_ context.Context, id string) ([]byte, error) {
-	if id != "api-test-root-v1" {
-		return nil, eventstore.ErrKeyUnavailable
-	}
-	return []byte("abcdefghijklmnopqrstuvwxyz123456"), nil
-}
-
 type endpointAPIActionExecutor struct{}
 
 func (endpointAPIActionExecutor) ExecuteAction(context.Context, adapterapi.ActionRequest) (adapterapi.ActionResult, error) {
@@ -101,7 +83,6 @@ func newEndpointAPITestService(t *testing.T) (*endpoint.Service, *eventstore.Dat
 	db, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{
 		Type:             "sqlite",
 		DSN:              filepath.Join(t.TempDir(), "endpoint-api.db"),
-		KeySource:        endpointAPITestKeySource{},
 		DatabaseIdentity: "endpoint-api-test",
 	})
 	if err != nil {
@@ -131,11 +112,14 @@ func setupEndpointAPITest(t *testing.T) *endpoint.Service {
 	ResetAdminAuthForTests()
 
 	service, db := newEndpointAPITestService(t)
-	registerEndpointApplication(&endpointAPITestApplication{service: service})
 	previousDice, previousManager := myDice, dm
-	manager := &dice.DiceManager{}
+	_, manager, runtime, _ := newDiceConfigDurableHandlerTest(t)
+	registerEndpointApplication(&endpointAPITestApplication{service: service})
 	manager.AccessTokens.Store(endpointAPITestSessionToken, true)
-	myDice = &dice.Dice{Parent: manager, DiceMasters: []string{"QQ:master-user"}}
+	updateAPITestConfig(t, runtime, func(config *dice.Config) {
+		config.DiceMasters = []string{"QQ:master-user"}
+	})
+	myDice = runtime
 	dm = manager
 	t.Cleanup(func() {
 		registerEndpointApplication(nil)

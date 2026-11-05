@@ -126,8 +126,7 @@ func TestEventContract(t *testing.T) {
 		Effects:         []NewEffect{{EffectID: "effect-1", ExpectedVersion: 0}},
 		ArtifactUpdates: []ArtifactUpdate{{ArtifactID: "artifact-1", ExpectedVersion: 0}},
 		SecretUpdates:   []SecretUpdate{{SecretRef: "secret-1", ExpectedVersion: 0}},
-		PluginKVUpdates: []PluginKVUpdate{{ExtensionID: "extension-1", KeyHMAC: []byte("key"), ExpectedVersion: 0}},
-		FenceUpdates:    []SubjectFenceUpdate{{SubjectKey: []byte("subject"), ExpectedVersion: 0}},
+		PluginKVUpdates: []PluginKVUpdate{{ExtensionID: "extension-1", Key: "key", ExpectedVersion: 0}},
 	}); err != nil {
 		t.Fatalf("contract store commit: %v", err)
 	}

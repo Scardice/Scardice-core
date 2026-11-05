@@ -7,18 +7,18 @@ import (
 )
 
 func TestResolveSecretForOwnerRejectsCrossEndpointReferences(t *testing.T) {
-	store, db, _ := openEncryptedTestStore(t)
+	store, db := openPlainTestStore(t)
 	defer db.Close()
 	ctx := context.Background()
 
 	if _, err := store.PutSecret(ctx, SecretPutRequest{
-		SecretRef: "shared-ref", EndpointID: "endpoint-a", AdapterID: "adapter-a", Plaintext: []byte("secret-a"),
+		SecretRef: "shared-ref", EndpointID: "endpoint-a", AdapterID: "adapter-a", Value: []byte("secret-a"),
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	resolved, err := store.ResolveSecretForOwner(ctx, "endpoint-a", "adapter-a", "shared-ref", 1)
-	if err != nil || string(resolved.Plaintext) != "secret-a" {
+	if err != nil || string(resolved.Value) != "secret-a" {
 		t.Fatalf("owner resolution = %#v, %v", resolved, err)
 	}
 

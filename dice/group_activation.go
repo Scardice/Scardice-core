@@ -2,44 +2,54 @@ package dice
 
 import (
 	"context"
-	"time"
+	"encoding/json"
+	"errors"
 
 	"Scardice-core/core/groupstate"
-	"Scardice-core/eventstore"
+
+	"github.com/google/uuid"
 )
 
-// RecordGroupActivation records that the given dice accounts are switched on
-// or off in a group. Durable callbacks rebuild the group from recorded state
-// for every message, so a change made only to the in-memory group would be
-// undone by the next one. Accounts already in the requested state and groups
-// with no recorded state are left alone; without an event store this does
-// nothing.
+// RecordGroupActivation records all requested endpoint toggles in one explicit
+// root execution. Missing durable authority is an error, never a no-op.
 func (d *Dice) RecordGroupActivation(ctx context.Context, groupID string, diceIDs []string, active bool) error {
 	if d == nil || d.DurableStore == nil {
-		return nil
+		return errors.New("dice: durable store unavailable")
 	}
-	repository := groupstate.NewRepository(d.DurableStore)
-	state, err := repository.Load(ctx, d.BaseConfig.Name, groupID)
-	if err != nil || state.Version == 0 {
+	if groupID == "" {
+		return errors.New("dice: group identity unavailable")
+	}
+	if len(diceIDs) == 0 {
+		return errors.New("dice: no endpoint identities selected")
+	}
+	request, err := json.Marshal(struct {
+		GroupID string   `json:"groupId"`
+		DiceIDs []string `json:"diceIds"`
+		Active  bool     `json:"active"`
+	}{GroupID: groupID, DiceIDs: diceIDs, Active: active})
+	if err != nil {
 		return err
 	}
-	for _, diceID := range diceIDs {
-		if diceID == "" || state.DiceIDActive[diceID] == active {
-			continue
+	identity := d.DomainExecutionIdentity("group-set-active", uuid.NewString())
+	return d.WithDomainExecution(ctx, identity, request, func(transaction *DurableCallbackTransaction) error {
+		group, loadErr := transaction.Domain().Group(ctx, d.BaseConfig.Name, groupID)
+		if loadErr != nil {
+			return loadErr
 		}
-		commandID, err := (eventstore.UUIDGenerator{}).NewID()
-		if err != nil {
-			return err
+		if group.Version() == 0 {
+			return errors.New("dice: group does not exist")
 		}
-		metadata := eventstore.Metadata{CommandID: commandID, CorrelationID: commandID, Producer: "dice/group-set-active", OccurredAt: time.Now().UTC()}
-		if _, err := repository.DecideAndAppend(ctx, state, state.Version, metadata, groupstate.Command{
-			Kind: groupstate.CommandActivation, DiceIDForActivation: diceID, Active: active, Exists: state.DiceIDExists[diceID],
-		}); err != nil {
-			return err
+		for _, diceID := range diceIDs {
+			if diceID == "" {
+				return errors.New("dice: endpoint identity unavailable")
+			}
+			if decideErr := group.Decide(groupstate.Command{
+				Kind: groupstate.CommandActivation, DiceIDForActivation: diceID,
+				Active: active, ActiveSet: true,
+			}); decideErr != nil {
+				return decideErr
+			}
 		}
-		if state, err = repository.Load(ctx, d.BaseConfig.Name, groupID); err != nil {
-			return err
-		}
-	}
-	return nil
+		return transaction.Domain().Err()
+	})
 }

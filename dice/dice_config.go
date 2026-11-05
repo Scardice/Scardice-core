@@ -2,8 +2,11 @@ package dice
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -12,7 +15,10 @@ import (
 	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v3"
 
+	"Scardice-core/core/configstate"
+	"Scardice-core/core/execution"
 	"Scardice-core/dice/censor"
+	"Scardice-core/eventstore"
 	"Scardice-core/utils"
 )
 
@@ -22,9 +28,15 @@ const (
 	ConfigVersionCode = 10300 // 旧的设置版本标记
 )
 
+type configViewSource struct {
+	version    uint64
+	dependency eventstore.DependencySnapshot
+}
+
 type Config struct {
 	d             *Dice `yaml:"-"`
-	ConfigVersion int   `json:"configVersion" yaml:"configVersion"` // 配置版本
+	source        configViewSource
+	ConfigVersion int `json:"configVersion" yaml:"configVersion"` // 配置版本
 
 	// 基础设置
 	BaseConfig `yaml:",inline"`
@@ -55,10 +67,317 @@ type Config struct {
 	DirtyConfig `yaml:",inline"`
 }
 
+var (
+	ErrConfigViewUnavailable = errors.New("dice: immutable config view is unavailable")
+	ErrConfigViewChanged     = errors.New("dice: config projection changed while building read view")
+)
+
+// configReadView is the immutable, source-versioned runtime representation of
+// configstate.State. A pointer is atomically replaced only after a committed
+// state has been read from one dependency snapshot.
+type configReadView struct {
+	version    uint64
+	dependency eventstore.DependencySnapshot
+	state      configstate.State
+	config     Config
+	advanced   AdvancedConfig
+}
+
+func defaultAdvancedConfig() AdvancedConfig {
+	return AdvancedConfig{CustomReplyCooldown: DefaultCustomReplyCooldown}
+}
+
+func cloneConfigStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	cloned := make([]string, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func cloneExtDefaultSettings(settings []*ExtDefaultSettingItem) []*ExtDefaultSettingItem {
+	if settings == nil {
+		return nil
+	}
+	cloned := make([]*ExtDefaultSettingItem, len(settings))
+	for index, setting := range settings {
+		if setting == nil {
+			continue
+		}
+		item := *setting
+		if setting.DisabledCommand != nil {
+			item.DisabledCommand = make(map[string]bool, len(setting.DisabledCommand))
+			for command, disabled := range setting.DisabledCommand {
+				item.DisabledCommand[command] = disabled
+			}
+		}
+		cloned[index] = &item
+	}
+	return cloned
+}
+
+func cloneConfigViewValue(source Config, owner *Dice) Config {
+	cloned := source
+	cloned.d = owner
+	if source.LastSavedTime != nil {
+		lastSaved := *source.LastSavedTime
+		cloned.LastSavedTime = &lastSaved
+	}
+	cloned.NoticeIDs = cloneConfigStrings(source.NoticeIDs)
+	cloned.ExtDefaultSettings = cloneExtDefaultSettings(source.ExtDefaultSettings)
+	cloned.JsRuntimeOptions = cloneJSRuntimeOptions(source.JsRuntimeOptions)
+	cloned.JsRuntimeRoutes = cloneJSRuntimeRoutes(source.JsRuntimeRoutes)
+	cloned.DisabledJsScripts = cloneDisabledJsScripts(source.DisabledJsScripts)
+	cloned.EndpointIDs = cloneConfigStrings(source.EndpointIDs)
+	if source.CensorThresholds != nil {
+		cloned.CensorThresholds = make(map[censor.Level]int, len(source.CensorThresholds))
+		for level, threshold := range source.CensorThresholds {
+			cloned.CensorThresholds[level] = threshold
+		}
+	}
+	if source.CensorHandlers != nil {
+		cloned.CensorHandlers = make(map[censor.Level]uint8, len(source.CensorHandlers))
+		for level, handler := range source.CensorHandlers {
+			cloned.CensorHandlers[level] = handler
+		}
+	}
+	if source.CensorScores != nil {
+		cloned.CensorScores = make(map[censor.Level]int, len(source.CensorScores))
+		for level, score := range source.CensorScores {
+			cloned.CensorScores[level] = score
+		}
+	}
+	cloned.BackendUrls = cloneConfigStrings(source.BackendUrls)
+	cloned.DisabledBackendUrls = cloneConfigStrings(source.DisabledBackendUrls)
+	cloned.DeckList = append([]*DeckInfo(nil), source.DeckList...)
+	cloned.CommandPrefix = cloneConfigStrings(source.CommandPrefix)
+	cloned.DiceMasters = cloneConfigStrings(source.DiceMasters)
+	if source.BanList != nil {
+		cloned.BanList = source.BanList.cloneReadView(owner)
+	}
+	return cloned
+}
+
+func newConfigReadView(owner *Dice, config Config, advanced AdvancedConfig, state configstate.State, dependency eventstore.DependencySnapshot) *configReadView {
+	source := configViewSource{version: state.Version, dependency: dependency}
+	config.source = source
+	advanced.source = source
+	if config.BanList != nil {
+		config.BanList.source = source
+	}
+	return &configReadView{
+		version:    state.Version,
+		dependency: dependency,
+		state:      state.Clone(),
+		config:     cloneConfigViewValue(config, owner),
+		advanced:   advanced,
+	}
+}
+
+func newDefaultConfigReadView(owner *Dice) *configReadView {
+	config := NewConfig(owner)
+	if owner != nil {
+		if owner.BaseConfig.Name != "" {
+			config.BaseConfig.Name = owner.BaseConfig.Name
+		}
+		if owner.BaseConfig.DataDir != "" {
+			config.DataDir = owner.BaseConfig.DataDir
+		}
+	}
+	return newConfigReadView(owner, config, defaultAdvancedConfig(), configstate.State{}, eventstore.DependencySnapshot{})
+}
+
+// initializeDefaultConfigView publishes defaults once. Event-sourced startup
+// replaces this view with a projection-derived one before admitting work.
+func (d *Dice) initializeDefaultConfigView() {
+	if d == nil || d.configView.Load() != nil {
+		return
+	}
+	d.configView.CompareAndSwap(nil, newDefaultConfigReadView(d))
+}
+
+func (d *Dice) currentConfigView() *configReadView {
+	if d == nil {
+		return nil
+	}
+	view := d.configView.Load()
+	if view == nil {
+		d.initializeDefaultConfigView()
+		view = d.configView.Load()
+	}
+	return view
+}
+
+// Config returns the atomically published immutable runtime config. Callers
+// must never mutate the returned value or any referenced slice/map.
+func (d *Dice) Config() *Config {
+	view := d.currentConfigView()
+	if view == nil {
+		return nil
+	}
+	return &view.config
+}
+
+func (d *Dice) AdvancedConfig() AdvancedConfig {
+	view := d.currentConfigView()
+	if view == nil {
+		return defaultAdvancedConfig()
+	}
+	return view.advanced
+}
+
+// CommandPrefixes and DiceMasterIDs return immutable slices owned by the
+// current config view. Read-only hot paths may iterate them without allocation.
+func (d *Dice) CommandPrefixes() []string {
+	view := d.currentConfigView()
+	if view == nil {
+		return nil
+	}
+	return view.config.CommandPrefix
+}
+
+func (d *Dice) DiceMasterIDs() []string {
+	view := d.currentConfigView()
+	if view == nil {
+		return nil
+	}
+	return view.config.DiceMasters
+}
+
+// ConfigEditSnapshot returns detached DTOs for API/config input processing.
+func (d *Dice) ConfigEditSnapshot() (Config, AdvancedConfig) {
+	view := d.currentConfigView()
+	if view == nil {
+		return NewConfig(d), defaultAdvancedConfig()
+	}
+	return cloneConfigViewValue(view.config, d), view.advanced
+}
+
+// ConfigStateSnapshot returns the source state carried by the same atomically
+// published view as Config. It is detached and safe for API serialization.
+func (d *Dice) ConfigStateSnapshot() configstate.State {
+	view := d.currentConfigView()
+	if view == nil {
+		return configstate.State{}
+	}
+	return view.state.Clone()
+}
+
+func (d *Dice) configReadViewFromState(
+	state configstate.State,
+	dependency eventstore.DependencySnapshot,
+	previous *configReadView,
+) (*configReadView, error) {
+	if d == nil {
+		return nil, ErrConfigViewUnavailable
+	}
+	var view *configReadView
+	if state.Version == 0 {
+		view = newDefaultConfigReadView(d)
+		view.dependency = dependency
+		source := configViewSource{dependency: dependency}
+		view.config.source = source
+		view.advanced.source = source
+		if view.config.BanList != nil {
+			view.config.BanList.source = source
+		}
+	} else {
+		config, advanced, err := d.legacyConfigViewFromState(state)
+		if err != nil {
+			return nil, err
+		}
+		if previous != nil && previous.config.BanList != nil && config.BanList != nil {
+			config.BanList.runtime = previous.config.BanList.runtime
+		}
+		view = newConfigReadView(d, config, advanced, state, dependency)
+	}
+	return view, nil
+}
+
+func configReadViewsEqual(left, right *configReadView) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.version == right.version &&
+		left.dependency == right.dependency &&
+		reflect.DeepEqual(left.state, right.state)
+}
+
+func (d *Dice) readCurrentConfigView(ctx context.Context, previous *configReadView) (*configReadView, error) {
+	reader, ok := d.DurableStore.(eventstore.ProjectionDependencyRepository)
+	if !ok {
+		return nil, fmt.Errorf("%w: projection dependency reader is unsupported", ErrConfigViewUnavailable)
+	}
+	stream := configstate.ConfigStream(d.BaseConfig.Name)
+	snapshot, err := reader.ReadProjectionDependency(ctx, configstate.ConfigProjectionName, stream.AggregateID, stream)
+	if err != nil {
+		return nil, err
+	}
+	if !snapshot.Found {
+		if snapshot.StreamVersion != 0 {
+			return nil, fmt.Errorf("%w: config projection row is missing", ErrConfigViewChanged)
+		}
+		return d.configReadViewFromState(configstate.State{}, snapshot.Snapshot, previous)
+	}
+	var state configstate.State
+	if err = json.Unmarshal(snapshot.Row.Payload, &state); err != nil {
+		return nil, fmt.Errorf("dice: decode config projection: %w", err)
+	}
+	if err = configstate.ValidateState(state); err != nil {
+		return nil, fmt.Errorf("dice: validate config projection: %w", err)
+	}
+	if state.DiceID != d.BaseConfig.Name || state.Version != snapshot.StreamVersion {
+		return nil, ErrConfigViewChanged
+	}
+	return d.configReadViewFromState(state, snapshot.Snapshot, previous)
+}
+
+func (d *Dice) refreshConfigView(ctx context.Context) (*configReadView, error) {
+	if d == nil || d.DurableStore == nil {
+		return nil, ErrConfigViewUnavailable
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		previous := d.configView.Load()
+		candidate, err := d.readCurrentConfigView(ctx, previous)
+		if err != nil {
+			return nil, err
+		}
+		if d.configView.Load() != previous {
+			continue
+		}
+		if configReadViewsEqual(previous, candidate) {
+			return previous, nil
+		}
+		if d.configView.CompareAndSwap(previous, candidate) {
+			return candidate, nil
+		}
+	}
+}
+
+// ReloadConfigView atomically publishes a projection-derived view. A slower
+// reload can never overwrite a view published after its read began.
+func (d *Dice) ReloadConfigView(ctx context.Context) error {
+	_, err := d.refreshConfigView(ctx)
+	return err
+}
+
+// ContributeConfigView refreshes stale generation/privacy epochs before Host
+// runs, then registers the exact value and proof selected for this root.
+func (d *Dice) ContributeConfigView(ctx context.Context, tx *execution.DomainTx) error {
+	view, err := d.refreshConfigView(ctx)
+	if err != nil {
+		return err
+	}
+	_, _, err = d.configOwnerFromView(ctx, tx, view)
+	return err
+}
+
 func NewConfig(d *Dice) Config {
-	c := DefaultConfig
-	c.d = d
-	c.DisabledJsScripts = cloneDisabledJsScripts(c.DisabledJsScripts)
+	c := cloneConfigViewValue(DefaultConfig, d)
 
 	// set other default
 	c.BanList = &BanListInfo{Parent: c.d}
@@ -334,7 +653,7 @@ func cloneJSRuntimeRoutes(routes map[string]string) map[string]string {
 }
 
 func cloneDisabledJsScripts(scripts map[string]bool) map[string]bool {
-	if len(scripts) == 0 {
+	if scripts == nil {
 		return nil
 	}
 	cloned := make(map[string]bool, len(scripts))

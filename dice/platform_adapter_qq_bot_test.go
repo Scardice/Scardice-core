@@ -53,8 +53,17 @@ func TestIsQQBotUserID(t *testing.T) {
 }
 
 func TestGroupInfoIsBotCombinesManualAndVirtualBots(t *testing.T) {
-	group := &GroupInfo{BotList: new(SyncMap[string, bool])}
-	group.BotList.Store("QQ:12345678", true)
+	d, _ := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:bot-list-owner")
+	ctx := newCanonicalTestMessageContext(
+		t, d, endpoint,
+		newGroupMsg("QQ-Group:bot-list", "QQ:owner", ""),
+		"bot-list",
+	)
+	group := ctx.Group
+	if err := group.SetBot("QQ:12345678", true); err != nil {
+		t.Fatal(err)
+	}
 
 	if !group.IsBot("QQ:12345678", false) {
 		t.Fatal("manually configured bot was not recognized")
@@ -66,13 +75,17 @@ func TestGroupInfoIsBotCombinesManualAndVirtualBots(t *testing.T) {
 		t.Fatal("ordinary QQ user was recognized as a bot")
 	}
 
-	group.BotList.Store("QQ:4010000000", true)
-	group.BotList.Delete("QQ:4010000000")
+	if err := group.SetBot("QQ:4010000000", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := group.SetBot("QQ:4010000000", false); err != nil {
+		t.Fatal(err)
+	}
 	if !group.IsBot("QQ:4010000000", true) {
 		t.Fatal("deleting a manual entry disabled virtual QQ bot recognition")
 	}
-	if group.BotList.Len() != 1 {
-		t.Fatalf("automatic recognition changed the persisted bot list, length = %d", group.BotList.Len())
+	if ids := group.BotIDs(); len(ids) != 1 || ids[0] != "QQ:12345678" {
+		t.Fatalf("automatic recognition changed the persisted bot list: %v", ids)
 	}
 }
 
@@ -115,11 +128,14 @@ func TestParseAtInfoPreservesQualifiedIDAndRobotFlag(t *testing.T) {
 }
 
 func TestGetCtxProxyAtPosRawSkipsQQBot(t *testing.T) {
-	ctx := &MsgContext{
-		EndPoint:     &EndPointInfo{EndPointInfoBase: EndPointInfoBase{UserID: "QQ:100000"}},
-		Group:        &GroupInfo{BotList: new(SyncMap[string, bool])},
-		DelegateText: "delegated roll",
-	}
+	d, _ := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:100000")
+	ctx := newCanonicalTestMessageContext(
+		t, d, endpoint,
+		newGroupMsg("QQ-Group:proxy-bot", "QQ:owner", ""),
+		"proxy-bot",
+	)
+	ctx.DelegateText = "delegated roll"
 	cmdArgs := &CmdArgs{At: []*AtInfo{{UserID: "QQ:4010000000", IsRobot: true}}}
 
 	got := GetCtxProxyAtPosRaw(ctx, cmdArgs, 0, false)
@@ -149,15 +165,19 @@ func TestExecuteNewFiltersQQBotInteractions(t *testing.T) {
 	assertNoAdapterMessage(t, adapter, "command mentioning another QQ bot")
 
 	const hookGroupID = "QQ-Group:81103"
-	setupCtx := &MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession}
-	hookGroup := SetBotOnAtGroup(setupCtx, hookGroupID)
 	hookCalls := make(chan string, 1)
-	hookGroup.SetActivatedExtList([]*ExtInfo{{
+	hookExtension := &ExtInfo{
 		Name: "qq-bot-filter-test",
 		OnNotCommandReceived: func(_ *MsgContext, msg *Message) {
 			hookCalls <- msg.Sender.UserID
 		},
-	}}, nil)
+	}
+	d.RegisterExtension(hookExtension)
+	withCanonicalTestMessageContext(
+		t, d, ep, newGroupMsg(hookGroupID, ep.UserID, ""),
+		"qq-bot-filter-extension",
+		func(ctx *MsgContext) error { return ctx.Group.ExtActive(hookExtension) },
+	)
 
 	robotText := newGroupMsg(hookGroupID, "QQ:3889000000", "plain text")
 	robotText.Sender.IsRobot = true

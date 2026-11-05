@@ -17,6 +17,18 @@ import (
 	"Scardice-core/logger"
 )
 
+func (ctx *MsgContext) storePersistentVMAttribute(vm *ds.Context, id, name string, value *ds.VMValue) {
+	attrs, err := ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, id)
+	if err == nil {
+		err = attrs.Store(name, value)
+	}
+	if err == nil {
+		return
+	}
+	vm.Error = err
+	ctx.setExecutionError(err)
+}
+
 func (ctx *MsgContext) GenDefaultRollVmConfig() *ds.RollConfig {
 	config := ds.RollConfig{}
 
@@ -28,31 +40,31 @@ func (ctx *MsgContext) GenDefaultRollVmConfig() *ds.RollConfig {
 	config.OpCountLimit = 30000
 	config.ParseExprLimit = 10000000 // kenichiLyon: 限制解析算力，防止递归过深，这里以建议值1000万设置。
 
-	am := ctx.Dice.AttrsManager
 	config.HookValueStore = func(vm *ds.Context, name string, v *ds.VMValue) (overwrite *ds.VMValue, solved bool) {
 		// 临时变量
 		if strings.HasPrefix(name, "$t") {
-			if ctx.Player.ValueMapTemp == nil {
-				ctx.Player.ValueMapTemp = &ds.ValueMap{}
+			if values := ctx.Player.tempValues(); values != nil {
+				values.Store(name, v)
 			}
-			ctx.Player.ValueMapTemp.Store(name, v)
 			// 继续存入local 因此solved为false
 			return nil, false
+		}
+		if ctx.IsCompatibilityTest && (strings.HasPrefix(name, "$m") || strings.HasPrefix(name, "$g")) {
+			vm.Attrs.Store(name, cloneAttributeValue(v))
+			return nil, true
 		}
 
 		// 个人变量
 		if strings.HasPrefix(name, "$m") {
 			if ctx.Session != nil && ctx.Player != nil {
-				playerAttrs := lo.Must(am.LoadByIdForCtx(ctx, ctx.Player.UserID))
-				playerAttrs.Store(name, v)
+				ctx.storePersistentVMAttribute(vm, ctx.Player.UserID(), name, v)
 			}
 			return nil, true
 		}
 
 		// 群变量
 		if ctx.Group != nil && strings.HasPrefix(name, "$g") {
-			groupAttrs := lo.Must(am.LoadByIdForCtx(ctx, ctx.Group.GroupID))
-			groupAttrs.Store(name, v)
+			ctx.storePersistentVMAttribute(vm, ctx.Group.GroupID(), name, v)
 			return nil, true
 		}
 		return nil, false
@@ -310,7 +322,7 @@ func dsValueToRollVMv1(v *ds.VMValue) *VMValue {
 func DiceFormatV1(ctx *MsgContext, s string) (string, error) { //nolint:revive
 	// 在进行格式化前刷新临时变量
 	if ctx.Player != nil {
-		SetTempVars(ctx, ctx.Player.Name)
+		SetTempVars(ctx, ctx.Player.Name())
 	}
 	s = CompatibleReplace(ctx, s)
 
@@ -727,8 +739,13 @@ func (ctx *MsgContext) loadAttrValueByName(name string) *ds.VMValue {
 	if tmpl != nil {
 		resolved = tmpl.GetAlias(name)
 	}
+	if ctx.IsCompatibilityTest && ctx.vm != nil {
+		if value, exists := ctx.vm.Attrs.Load(resolved); exists {
+			return value
+		}
+	}
 
-	if ctx.Dice != nil {
+	if ctx.Dice != nil && !ctx.IsCompatibilityTest {
 		attrs := lo.Must(ctx.Dice.AttrsManager.LoadByCtx(ctx))
 		if tmpl != nil {
 			ctx.syncAttrsForTemplate(attrs, tmpl.GameSystemTemplateV2)
@@ -751,8 +768,8 @@ func (ctx *MsgContext) loadAttrValueByName(name string) *ds.VMValue {
 		}
 	}
 
-	if ctx.Player != nil && ctx.Dice != nil {
-		playerAttrs := lo.Must(ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Player.UserID))
+	if ctx.Player != nil && ctx.Dice != nil && !ctx.IsCompatibilityTest {
+		playerAttrs := lo.Must(ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Player.UserID()))
 		if v := playerAttrs.Load(resolved); v != nil {
 			return v
 		}
@@ -794,18 +811,22 @@ func (ctx *MsgContext) CreateVmIfNotExists() {
 		}
 
 		if strings.HasPrefix(name, "$t") {
-			if ctx.Player.ValueMapTemp != nil {
-				if v, ok := ctx.Player.ValueMapTemp.Load(name); ok {
+			if values := ctx.Player.tempValues(); values != nil {
+				if v, ok := values.Load(name); ok {
 					return v
 				}
 			}
 			return ds.NewIntVal(0)
 		}
 
+		if ctx.IsCompatibilityTest && (strings.HasPrefix(name, "$m") || strings.HasPrefix(name, "$g")) {
+			return ds.NewIntVal(0)
+		}
+
 		if strings.HasPrefix(name, "$") {
 			if strings.HasPrefix(name, "$m") {
 				if ctx.Session != nil && ctx.Player != nil {
-					playerAttrs := lo.Must(am.LoadByIdForCtx(ctx, ctx.Player.UserID))
+					playerAttrs := lo.Must(am.LoadByIdForCtx(ctx, ctx.Player.UserID()))
 					if v := playerAttrs.Load(name); v != nil {
 						return v
 					}
@@ -813,7 +834,7 @@ func (ctx *MsgContext) CreateVmIfNotExists() {
 				return ds.NewIntVal(0)
 			}
 			if strings.HasPrefix(name, "$g") && ctx.Group != nil {
-				groupAttrs := lo.Must(am.LoadByIdForCtx(ctx, ctx.Group.GroupID))
+				groupAttrs := lo.Must(am.LoadByIdForCtx(ctx, ctx.Group.GroupID()))
 				if v := groupAttrs.Load(name); v != nil {
 					return v
 				}
@@ -845,7 +866,7 @@ func (ctx *MsgContext) CreateVmIfNotExists() {
 func DiceFormatV2(ctx *MsgContext, s string) (string, error) { //nolint:revive
 	// 在进行格式化前，若有玩家则刷新玩家的属性临时变量
 	if ctx.Player != nil {
-		SetTempVars(ctx, ctx.Player.Name)
+		SetTempVars(ctx, ctx.Player.Name())
 	}
 	ctx.CreateVmIfNotExists()
 	ctx.vm.Ret = nil
@@ -901,12 +922,25 @@ func _MsgCreate(messageType string, message string) *Message {
 
 var reEngineVersionMark = regexp.MustCompile(`\/\/[^\r\n]+\[(v[12])\]`)
 
+func textTemplatePreviewContext(d *Dice, message *Message) *MsgContext {
+	endpoint := d.UIEndpoint
+	if endpoint == nil {
+		endpoint = newUIEndpoint(&IMSession{Parent: d})
+	}
+	ctx := &MsgContext{
+		Dice: d, Session: endpoint.Session, EndPoint: endpoint,
+		MessageType: message.MessageType, IsPrivate: message.MessageType == "private",
+		IsCompatibilityTest: true,
+		Player:              newDetachedGroupPlayerInfo(d.BaseConfig.Name, message.GroupID, message.Sender.UserID, message.Sender.Nickname),
+	}
+	SetTempVars(ctx, message.Sender.Nickname)
+	return ctx
+}
+
 // TextMapCompatibleCheck 新旧预设文本兼容性检测
 func TextMapCompatibleCheck(d *Dice, category, k string, textItems []TextTemplateItem) {
 	key := fmt.Sprintf("%s:%s", category, k)
 	x, _ := d.TextMapCompatible.LoadOrStore(key, &SyncMap[string, TextItemCompatibleInfo]{})
-
-	am := d.AttrsManager
 
 	for _, textItem := range textItems {
 		formatExpr := textItem[0].(string)
@@ -916,32 +950,8 @@ func TextMapCompatibleCheck(d *Dice, category, k string, textItems []TextTemplat
 		tmpSeed := []byte("1234567890ABCDEF")
 		tmpSeed2 := uint64(time.Now().UnixMicro())
 
-		setupTestAttrs := func(ctx *MsgContext) {
-			// 标记为兼容性测试环境，跳过不必要的数据库查询
-			ctx.IsCompatibilityTest = true
-			// $g
-			if attrs, _ := am.LoadById("UI-Group:2101"); attrs != nil {
-				attrs.Clear()
-				attrs.IsSaved = true
-			}
-			// $m
-			if attrs, _ := am.LoadById("UI:1101"); attrs != nil {
-				attrs.Clear()
-				attrs.IsSaved = true
-			}
-			// 群内临时人物卡
-			if attrs, _ := am.LoadById("UI-Group:2101-UI:1101"); attrs != nil {
-				attrs.Clear()
-				attrs.IsSaved = true
-			}
-
-			// $t
-			ctx.Player.ValueMapTemp = &ds.ValueMap{}
-		}
-
 		// v2 部分
-		ctx := CreateTempCtx(d.UIEndpoint, msg)
-		setupTestAttrs(ctx)
+		ctx := textTemplatePreviewContext(d, msg)
 		ctx.diceRandSrc = newPCGDiceSource(tmpSeed2)
 		ctx.CreateVmIfNotExists()
 		ctx.vm.Seed = tmpSeed
@@ -961,8 +971,7 @@ func TextMapCompatibleCheck(d *Dice, category, k string, textItems []TextTemplat
 		text2, err2 := DiceFormatV2(ctx, formatExpr)
 
 		// v1 部分
-		ctx = CreateTempCtx(d.UIEndpoint, msg)
-		setupTestAttrs(ctx)
+		ctx = textTemplatePreviewContext(d, msg)
 		ctx.diceRandSrc = newPCGDiceSource(tmpSeed2)
 		ctx.CreateVmIfNotExists() // 也要设置，因为牌堆要用
 		ctx.vm.Seed = tmpSeed
@@ -984,7 +993,6 @@ func TextMapCompatibleCheck(d *Dice, category, k string, textItems []TextTemplat
 		if err1 != nil {
 			text1 = "" // 因为 formatV1 没有值的时候会返回东西，这样使得两版本一致
 		}
-		setupTestAttrs(ctx) // 清理
 
 		var ver string
 		if err2 == nil {

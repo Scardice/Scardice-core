@@ -1,24 +1,52 @@
 package dice
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"gopkg.in/gomail.v2"
+
+	"Scardice-core/eventstore"
 )
+
+// configureCanonicalTestMail stores the SMTP password as a secret value
+// and commits the mail config with its vault reference, as production does.
+func configureCanonicalTestMail(t *testing.T, d *Dice, mutate func(*Config)) {
+	t.Helper()
+	const ref = "vault:test-mail-password"
+	secrets, ok := d.DurableStore.(eventstore.SecretRepository)
+	if !ok {
+		t.Fatal("canonical fixture store does not provide secrets")
+	}
+	if _, err := secrets.PutSecret(context.Background(), eventstore.SecretPutRequest{
+		SecretRef: ref, EndpointID: "mail", AdapterID: "smtp", Value: []byte("synthetic-password"),
+	}); err != nil {
+		t.Fatalf("store mail password secret: %v", err)
+	}
+	config, _ := d.ConfigEditSnapshot()
+	config.MailEnable = true
+	config.MailFrom = "sender@example.com"
+	config.MailSMTP = "smtp.invalid"
+	if mutate != nil {
+		mutate(&config)
+	}
+	passwordRef := ref
+	if err := d.DurableCommitConfigSnapshot(context.Background(), config, config.CommandPrefix, config.DiceMasters, &passwordRef); err != nil {
+		t.Fatalf("commit mail config: %v", err)
+	}
+}
 
 func runSendCommandWithMailResult(t *testing.T, deliveryErr error) []string {
 	t.Helper()
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 
-	d.Config.MailEnable = true
-	d.Config.MailFrom = "sender@example.com"
-	d.Config.MailPassword = "synthetic-password"
-	d.Config.MailSMTP = "smtp.invalid"
-	d.Config.NoticeIDs = []string{"Mail:owner@example.com"}
+	configureCanonicalTestMail(t, d, func(config *Config) {
+		config.NoticeIDs = []string{"Mail:owner@example.com"}
+	})
 	mailCalls := 0
 	d.mailSend = func(_ *gomail.Dialer, _ *gomail.Message) error {
 		mailCalls++
@@ -29,14 +57,8 @@ func runSendCommandWithMailResult(t *testing.T, deliveryErr error) []string {
 	if !ok || funExt.CmdMap["send"] == nil {
 		t.Fatal("registered .send command is unavailable")
 	}
-	ctx := &MsgContext{
-		Dice:      d,
-		EndPoint:  ep,
-		Session:   d.ImSession,
-		Player:    &GroupPlayerInfo{Name: "Tester", UserID: "QQ:tester"},
-		IsPrivate: true,
-	}
 	msg := newPrivateMsg("QQ:tester", ".send test message")
+	ctx := newCanonicalTestMessageContext(t, d, ep, msg, "send-command")
 	result := funExt.CmdMap["send"].Solve(ctx, msg, &CmdArgs{
 		Args:      []string{"test", "message"},
 		CleanArgs: "test message",

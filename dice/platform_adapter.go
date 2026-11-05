@@ -34,6 +34,44 @@ type PlatformAdapter interface {
 	RecallMessage(ctx *MsgContext, msgID string)
 }
 
+// notifyDirectMessageSend runs the legacy direct-send hook exactly once. Group
+// sends resolve their destination through the current durable root so extension
+// selection never falls back to the removed process-wide group map.
+func notifyDirectMessageSend(ctx *MsgContext, msg *Message, flag string) error {
+	if ctx == nil || ctx.Dice == nil || ctx.callbackTransaction == nil {
+		return ErrDomainTxUnavailable
+	}
+	if msg == nil {
+		return adapterapi.ErrInvalidContract
+	}
+	if msg.MessageType != "group" {
+		for _, extension := range ctx.Dice.ExtList {
+			if extension != nil && extension.HasOnMessageSend() {
+				extension.CallOnMessageSend(ctx.Dice, ctx, msg, flag)
+			}
+		}
+		return nil
+	}
+	if msg.GroupID == "" {
+		return adapterapi.ErrInvalidContract
+	}
+	group := ctx.Group
+	if group == nil || group.GroupID() != msg.GroupID {
+		var err error
+		group, err = ctx.ResolveGroup(ctx.domainContext(), msg.GroupID)
+		if err != nil {
+			return err
+		}
+	}
+	if group.Version() == 0 || group.Deleted() {
+		return nil
+	}
+	for _, extension := range group.GetActivatedExtList(ctx.Dice) {
+		extension.CallOnMessageSend(ctx.Dice, ctx, msg, flag)
+	}
+	return nil
+}
+
 // 实现检查
 var (
 	_ PlatformAdapter = (*PlatformAdapterGocq)(nil)

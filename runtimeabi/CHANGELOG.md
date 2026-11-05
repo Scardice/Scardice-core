@@ -7,10 +7,17 @@ Released contracts are append-only.
 
 ### Changed
 
-- Runtime ABI remains v1; the current Host ABI is v1.1.
+- Runtime ABI remains v1; the current Host ABI is v1.2.
 - Runtime minor remains reserved at zero. Host minor 1 appends struct-size-
   gated HostRef proxy retain/release callbacks and a host-function owner
   query.
+- Host minor 2 appends `execution_status` for owner-thread cancellation and
+  deadline checks. Core and QuickJS require this contract instead of running
+  native script without a cancellation mechanism.
+- The previous service-event `reserved` word is now `flags`, preserving its
+  layout. Host ABI 1.2 uses `SC_SERVICE_EVENT_DISCARD_CONTINUATIONS` for
+  terminal-only cleanup after invocation, binding, or durable admission
+  failure; providers release request values without running script.
 - Runtime and Host ABI versions are queried independently and reported in the
   provider descriptor.
 - `service_event`, `tick`, the plugin extension table, and Host service

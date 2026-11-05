@@ -74,20 +74,46 @@ func checkBlackList(id string, checkType string, inviterID string, ctx *MsgConte
 		return result
 	}
 
-	banInfo, ok := ctx.Dice.Config.BanList.GetByID(id)
+	config := ctx.Dice.Config()
+	banInfo, ok, err := config.BanList.GetByIDForContext(ctx, id)
+	if err != nil {
+		ctx.setExecutionError(err)
+		result.Passed = false
+		result.FailureType = "state_unavailable"
+		result.Reason = "黑名单状态读取失败"
+		return result
+	}
+	settings, err := config.BanList.settingsForContext(ctx)
+	if err != nil {
+		ctx.setExecutionError(err)
+		result.Passed = false
+		result.FailureType = "state_unavailable"
+		result.Reason = "黑名单设置读取失败"
+		return result
+	}
+	isMaster := false
+	if inviterID != "" {
+		isMaster, err = ctx.Dice.IsDiceMasterForContext(ctx, inviterID)
+		if err != nil {
+			ctx.setExecutionError(err)
+			result.Passed = false
+			result.FailureType = "state_unavailable"
+			result.Reason = "骰主权限读取失败"
+			return result
+		}
+	}
 	if !ok || banInfo == nil {
 		if checkType != "group" {
 			return result
 		}
-		if ctx.Dice.Config.RefuseGroupInvite {
+		if config.RefuseGroupInvite {
 			result.Passed = false
 			result.FailureType = "refuse_invite"
 			result.Reason = "拒绝拉群邀请"
 			return result
 		}
 		if inviterID != "" {
-			isMaster := ctx.Dice.IsMaster(inviterID)
-			if ctx.Dice.Config.TrustOnlyMode && !isMaster {
+			if config.TrustOnlyMode && !isMaster {
 				result.Passed = false
 				result.FailureType = "trust_mode"
 				result.Reason = "只允许信任的人拉群"
@@ -102,7 +128,7 @@ func checkBlackList(id string, checkType string, inviterID string, ctx *MsgConte
 	switch checkType {
 	case "user":
 		// 检查用户是否被ban且配置了拒绝邀请
-		if banInfo.Rank == BanRankBanned && ctx.Dice.Config.BanList.BanBehaviorRefuseInvite {
+		if banInfo.Rank == BanRankBanned && settings.BanBehaviorRefuseInvite {
 			result.Passed = false
 			result.FailureType = "user_banned"
 			result.Reason = "邀请人在黑名单上"
@@ -117,8 +143,7 @@ func checkBlackList(id string, checkType string, inviterID string, ctx *MsgConte
 		}
 
 		// 信任模式检查
-		isMaster := inviterID != "" && ctx.Dice.IsMaster(inviterID)
-		if ctx.Dice.Config.TrustOnlyMode && banInfo.Rank != BanRankTrusted && !isMaster {
+		if config.TrustOnlyMode && banInfo.Rank != BanRankTrusted && !isMaster {
 			result.Passed = false
 			result.FailureType = "trust_mode"
 			result.Reason = "只允许信任的人拉群"
@@ -126,7 +151,7 @@ func checkBlackList(id string, checkType string, inviterID string, ctx *MsgConte
 		}
 
 		// 拒绝所有群邀请的配置检查
-		if ctx.Dice.Config.RefuseGroupInvite {
+		if config.RefuseGroupInvite {
 			result.Passed = false
 			result.FailureType = "refuse_invite"
 			result.Reason = "拒绝拉群邀请"

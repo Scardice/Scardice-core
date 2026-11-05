@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strconv"
 	"strings"
 
 	"Scardice-core/adapterapi"
@@ -66,7 +67,7 @@ func (r *onebotRuntime) queryGroupHistory(ctx context.Context, request adapterap
 				continue
 			}
 			// An entry that cannot be placed is left out; the rest of the page still counts.
-			if message, err := onebotHistoryInbound(item, request.Group); err == nil {
+			if message, err := onebotHistoryInbound(item, request.Group, r.ownMessages()); err == nil {
 				newestFirst = append(newestFirst, message)
 			}
 		}
@@ -84,4 +85,14 @@ func (r *onebotRuntime) queryGroupHistory(ctx context.Context, request adapterap
 // messages plus slack for pages that the window's edges cut short.
 func onebotHistoryMaxPages(limit int) int {
 	return limit/(onebotHistoryPageSize-1) + 3
+}
+
+// ownMessages tells history conversion which sender is the endpoint's own
+// account and which message ids this Core's send actions returned.
+func (r *onebotRuntime) ownMessages() onebotOwnMessages {
+	own := onebotOwnMessages{known: r.sentLedger().known}
+	if id := r.selfUserID.Load(); id > 0 {
+		own.selfID = strconv.FormatInt(id, 10)
+	}
+	return own
 }

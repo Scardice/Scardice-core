@@ -55,31 +55,13 @@ func (r *ingressRepoStub) ResolveInbox(context.Context, eventstore.InboxResoluti
 	return eventstore.CommitResult{}, eventstore.ErrNotFound
 }
 
-type ingressCryptoStub struct{}
-
-func (ingressCryptoStub) EncryptBound(_ context.Context, _, _, _ string, _ uint64, plaintext []byte) ([]byte, []byte, string, error) {
-	return append([]byte("sealed:"), plaintext...), []byte("nonce"), "key-1", nil
-}
-func (ingressCryptoStub) KeyedDigest(_ context.Context, domain string, parts ...string) ([]byte, string, error) {
-	return []byte(domain + ":" + stringsJoin(parts)), "index-1", nil
-}
-func stringsJoin(parts []string) string {
-	var out string
-	var outSb65 strings.Builder
-	for _, p := range parts {
-		outSb65.WriteString("|" + p)
-	}
-	out += outSb65.String()
-	return out
-}
-
 func testFencedMessage(id adapterapi.ProviderEventID, text string) endpoint.FencedInbound {
 	return endpoint.FencedInbound{EndpointID: "ep-1", Generation: 2, DesiredVersion: 3, Message: adapterapi.InboundMessage{ProviderEventID: id, Kind: adapterapi.InboundKindMessage, ConversationKind: adapterapi.ConversationKindGroup, Platform: "QQ", Sender: "QQ:42", Conversation: "QQ:group:9", Target: "QQ:group:9", Text: text, OccurredAt: time.Unix(100, 0).UTC()}}
 }
 
-func TestInboundServiceStableDuplicateReturnsPriorReceiptAndStoresEncryptedBody(t *testing.T) {
+func TestInboundServiceStableDuplicateReturnsPriorReceiptAndStoresPlaintextBody(t *testing.T) {
 	repo := &ingressRepoStub{}
-	svc, err := NewInboundService(repo, ingressCryptoStub{}, WithIngressCapacity(2))
+	svc, err := NewInboundService(repo, WithIngressCapacity(2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,17 +78,24 @@ func TestInboundServiceStableDuplicateReturnsPriorReceiptAndStoresEncryptedBody(
 	}
 	repo.mu.Lock()
 	defer repo.mu.Unlock()
-	if len(repo.updates) != 1 || string(repo.updates[0].PayloadCiphertext) == "secret body" {
+	if len(repo.updates) != 1 {
 		t.Fatalf("updates = %#v", repo.updates)
 	}
 	if repo.updates[0].OrderingSequence != 1 {
 		t.Fatalf("ordering = %d", repo.updates[0].OrderingSequence)
 	}
+	if repo.updates[0].Subject != "QQ:group:9" || repo.updates[0].Lane != `["ep-1","group","QQ:group:9","live"]` {
+		t.Fatalf("plaintext identity subject=%q lane=%q", repo.updates[0].Subject, repo.updates[0].Lane)
+	}
+	var stored ingressPayload
+	if err := json.Unmarshal(repo.updates[0].Payload, &stored); err != nil || stored.Message.Text != "secret body" {
+		t.Fatalf("stored ingress=%+v err=%v", stored, err)
+	}
 }
 
 func TestInboundServiceFallbackDuplicateAndCollision(t *testing.T) {
 	repo := &ingressRepoStub{}
-	svc, err := NewInboundService(repo, ingressCryptoStub{})
+	svc, err := NewInboundService(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +123,7 @@ func TestInboundServiceFallbackDuplicateAndCollision(t *testing.T) {
 
 func TestInboundServiceNoIDNoTimeUsesContentDigestIdentity(t *testing.T) {
 	repo := &ingressRepoStub{}
-	svc, err := NewInboundService(repo, ingressCryptoStub{})
+	svc, err := NewInboundService(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +152,7 @@ func TestInboundServiceNoIDNoTimeUsesContentDigestIdentity(t *testing.T) {
 
 func TestInboundServiceRejectsAggregatePayloadBeforeMarshal(t *testing.T) {
 	repo := &ingressRepoStub{}
-	svc, err := NewInboundService(repo, ingressCryptoStub{})
+	svc, err := NewInboundService(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +174,7 @@ func TestInboundServiceRejectsAggregatePayloadBeforeMarshal(t *testing.T) {
 
 func TestInboundServiceRejectsEscapeHeavyAggregateBeforeMarshal(t *testing.T) {
 	repo := &ingressRepoStub{}
-	svc, err := NewInboundService(repo, ingressCryptoStub{})
+	svc, err := NewInboundService(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,11 +191,11 @@ func TestInboundServiceRejectsEscapeHeavyAggregateBeforeMarshal(t *testing.T) {
 
 func TestInboundServiceRejectsEnvelopeAggregateBeforePayloadMarshal(t *testing.T) {
 	repo := &ingressRepoStub{}
-	svc, err := NewInboundService(repo, ingressCryptoStub{})
+	svc, err := NewInboundService(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
-	message := testFencedMessage("envelope", strings.Repeat("x", 230*1024))
+	message := testFencedMessage("envelope", strings.Repeat("x", 232*1024))
 	message.EndpointID = adapterapi.EndpointID(strings.Repeat("e", adapterapi.MaxIdentifierBytes))
 	if _, err := svc.HandleInbound(context.Background(), message); !errors.Is(err, ErrIngressPayload) {
 		t.Fatalf("envelope aggregate error = %v", err)
@@ -216,7 +205,7 @@ func TestInboundServiceRejectsEnvelopeAggregateBeforePayloadMarshal(t *testing.T
 func TestInboundPayloadUpperBoundAllowsNormal100KiBMessage(t *testing.T) {
 	message := testFencedMessage("normal-bound", strings.Repeat("x", 100*1024))
 	messageBound := inboundJSONUpperBound(message.Message)
-	if got := ingressPayloadJSONUpperBound(message.EndpointID, "key-v1", messageBound, 32); got > eventstore.MaxEventPayloadBytes {
+	if got := ingressPayloadJSONUpperBound(message.EndpointID, messageBound, 32); got > eventstore.MaxEventPayloadBytes {
 		t.Fatalf("normal 100 KiB envelope bound = %d, want <= %d", got, eventstore.MaxEventPayloadBytes)
 	}
 }
@@ -244,7 +233,7 @@ func TestInboundJSONEscapedLenCoversInvalidUTF8Replacement(t *testing.T) {
 }
 func TestInboundServiceStableIDChangedBodyIsCollision(t *testing.T) {
 	repo := &ingressRepoStub{}
-	svc, err := NewInboundService(repo, ingressCryptoStub{})
+	svc, err := NewInboundService(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +249,7 @@ func TestInboundServiceStableIDChangedBodyIsCollision(t *testing.T) {
 
 func TestInboundServiceConversationLaneIgnoresDifferentTarget(t *testing.T) {
 	repo := &ingressRepoStub{}
-	svc, err := NewInboundService(repo, ingressCryptoStub{})
+	svc, err := NewInboundService(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,15 +264,43 @@ func TestInboundServiceConversationLaneIgnoresDifferentTarget(t *testing.T) {
 	}
 	repo.mu.Lock()
 	defer repo.mu.Unlock()
-	if string(repo.updates[0].LaneHMAC) != string(repo.updates[1].LaneHMAC) {
-		t.Fatalf("conversation split lanes: %q %q", repo.updates[0].LaneHMAC, repo.updates[1].LaneHMAC)
+	if repo.updates[0].Lane != repo.updates[1].Lane {
+		t.Fatalf("conversation split lanes: %q %q", repo.updates[0].Lane, repo.updates[1].Lane)
+	}
+}
+
+func TestInboundServiceSeparatesEndpointAndConversationKinds(t *testing.T) {
+	repo := &ingressRepoStub{}
+	service, err := NewInboundService(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := testFencedMessage("group", "group")
+	direct := testFencedMessage("direct", "direct")
+	direct.Message.ConversationKind = adapterapi.ConversationKindDirect
+	otherEndpoint := testFencedMessage("other-endpoint", "other")
+	otherEndpoint.EndpointID = "ep-2"
+	for _, message := range []endpoint.FencedInbound{group, direct, otherEndpoint} {
+		if _, err := service.HandleInbound(context.Background(), message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{
+		`["ep-1","group","QQ:group:9","live"]`,
+		`["ep-1","person","QQ:group:9","live"]`,
+		`["ep-2","group","QQ:group:9","live"]`,
+	}
+	for i, update := range repo.updates {
+		if update.Lane != want[i] {
+			t.Fatalf("lane[%d]=%q want=%q", i, update.Lane, want[i])
+		}
 	}
 }
 
 func TestInboundServiceRejectsWhenBoundedAdmissionIsFull(t *testing.T) {
 	release := make(chan struct{})
 	repo := &ingressRepoStub{block: release}
-	svc, err := NewInboundService(repo, ingressCryptoStub{}, WithIngressCapacity(1))
+	svc, err := NewInboundService(repo, WithIngressCapacity(1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,10 +331,9 @@ type fixedIngressClock struct{ now time.Time }
 
 func (c fixedIngressClock) Now() time.Time { return c.now }
 
-func TestInboundServiceAssignsLaneOrderAndSevenDayPayloadTTL(t *testing.T) {
+func TestInboundServiceAssignsLaneOrder(t *testing.T) {
 	repo := &ingressRepoStub{}
-	now := time.Unix(200, 0).UTC()
-	svc, err := NewInboundService(repo, ingressCryptoStub{}, WithIngressClock(fixedIngressClock{now: now}))
+	svc, err := NewInboundService(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,10 +353,7 @@ func TestInboundServiceAssignsLaneOrderAndSevenDayPayloadTTL(t *testing.T) {
 	if len(repo.updates) != 2 || repo.updates[0].OrderingSequence != 1 || repo.updates[1].OrderingSequence != 2 {
 		t.Fatalf("ordered updates = %#v", repo.updates)
 	}
-	if string(repo.updates[0].LaneHMAC) != string(repo.updates[1].LaneHMAC) {
-		t.Fatalf("same conversation split lanes: %q %q", repo.updates[0].LaneHMAC, repo.updates[1].LaneHMAC)
-	}
-	if got := repo.updates[0].PayloadExpiresAt.Sub(now); got != IngressPayloadTTL {
-		t.Fatalf("payload ttl = %s", got)
+	if repo.updates[0].Lane != repo.updates[1].Lane {
+		t.Fatalf("same conversation split lanes: %q %q", repo.updates[0].Lane, repo.updates[1].Lane)
 	}
 }

@@ -6,59 +6,31 @@ import (
 	"time"
 
 	"Scardice-core/adapterapi"
-	"Scardice-core/core/groupstate"
+	"Scardice-core/core/execution"
 	"Scardice-core/core/playerstate"
 	"Scardice-core/eventstore"
 )
 
-type integrationKeySource struct {
-	indexID string
-	index   []byte
-	rootID  string
-	root    []byte
-}
-
-func (s integrationKeySource) IndexRootID(context.Context) (string, error) { return s.indexID, nil }
-func (s integrationKeySource) IndexRootMaterial(context.Context) ([]byte, error) {
-	return append([]byte(nil), s.index...), nil
-}
-func (s integrationKeySource) CurrentEncryptionRoot(context.Context) (eventstore.EncryptionRoot, error) {
-	return eventstore.EncryptionRoot{ID: s.rootID, Material: append([]byte(nil), s.root...)}, nil
-}
-func (s integrationKeySource) EncryptionRoot(_ context.Context, id string) ([]byte, error) {
-	if id != s.rootID {
-		return nil, eventstore.ErrKeyUnavailable
-	}
-	return append([]byte(nil), s.root...), nil
-}
-
-func defaultIntegrationKeySource() integrationKeySource {
-	return integrationKeySource{
-		indexID: "index-v1",
-		index:   []byte("01234567890123456789012345678901"),
-		rootID:  "root-v1",
-		root:    []byte("abcdefghijklmnopqrstuvwxyz123456"),
-	}
-}
 func callbackEvent(eventType, payload string) eventstore.NewEvent {
 	return eventstore.NewEvent{EventType: eventType, SchemaVersion: 1, Payload: []byte(payload), Metadata: eventstore.Metadata{EventID: eventType + "-event", CommandID: eventType + "-command", CorrelationID: eventType + "-correlation", OccurredAtUnixNanoUTC: 1, OccurredAtUnixNanoSet: true}}
 }
 
 func newCallbackTestInbox() *callbackTestInbox {
-	return &callbackTestInbox{lease: eventstore.InboxLease{Update: eventstore.InboxUpdate{InboxID: "inbox-1", EndpointID: "endpoint", Status: eventstore.InboxStatusLeased, Version: 1, LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", PayloadCiphertext: []byte("payload"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key", ContentDigest: []byte{1}, ContentDigestKeyID: "digest"}}}
+	payload := []byte(`{"endpointId":"endpoint","generation":1,"desiredVersion":1,"message":{"kind":1,"conversationKind":2,"sender":"user","conversation":"group","platform":"test"},"contentDigest":"AQ==","status":"pending"}`)
+	return &callbackTestInbox{lease: eventstore.InboxLease{Update: eventstore.InboxUpdate{InboxID: "inbox-1", EndpointID: "endpoint", Subject: "group", Status: eventstore.InboxStatusLeased, Version: 1, LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", Payload: payload, ContentDigest: []byte{1}}}}
 }
-func newCallbackTestService(t *testing.T, inbox *callbackTestInbox, store *callbackTestStore, host *callbackTestHost, codec callbackTestCodec, options ...any) *CallbackService {
-	t.Helper()
-	config := CallbackConfig{Inbox: inbox, Store: store, Codec: codec, AllowUnboundCodec: true, Resolver: callbackTestResolver{}, Group: callbackTestGroupLoader{}, Player: callbackTestPlayerLoader{}, Host: host, WorkerID: "worker"}
-	for _, option := range options {
-		switch value := option.(type) {
-		case callbackTestGroupLoader:
-			config.Group = value
-		case callbackTestPlayerLoader:
-			config.Player = value
-		}
+
+func callbackPendingTestInbox(id, provider, lane string) eventstore.InboxUpdate {
+	fixture := newCallbackTestInbox().lease.Update
+	return eventstore.InboxUpdate{
+		InboxID: id, EndpointID: fixture.EndpointID, ProviderEventKey: provider,
+		Lane: lane, Subject: fixture.Subject, Status: eventstore.InboxStatusPending,
+		Payload: fixture.Payload, ContentDigest: fixture.ContentDigest,
 	}
-	service, err := NewCallbackService(config)
+}
+func newCallbackTestService(t *testing.T, inbox *callbackTestInbox, store *callbackTestStore, host *callbackTestHost) *CallbackService {
+	t.Helper()
+	service, err := NewCallbackService(CallbackConfig{Inbox: inbox, Store: store, Resolver: callbackTestResolver{}, Host: host, WorkerID: "worker"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,71 +128,10 @@ func (f *callbackTestFence) Unlock() {
 	f.unlockCalls++
 }
 
-type callbackTestCodec struct {
-	payload []byte
-	err     error
-}
-
-func (callbackTestCodec) Encrypt(context.Context, []byte) ([]byte, []byte, string, error) {
-	return nil, nil, "", nil
-}
-func (c callbackTestCodec) Decrypt(context.Context, []byte, []byte, string) ([]byte, error) {
-	if c.err != nil {
-		return nil, c.err
-	}
-	if len(c.payload) != 0 {
-		return c.payload, nil
-	}
-	return []byte(`{"endpointId":"endpoint","generation":1,"desiredVersion":1,"message":{"kind":1,"conversationKind":2,"sender":"user","conversation":"group","platform":"test"},"contentDigest":"AQ==","contentDigestKeyId":"digest","status":"pending"}`), nil
-}
-
-type callbackTestBoundCodec struct {
-	callbackTestCodec
-	calls    *int
-	domain   *string
-	identity *string
-	owner    *string
-	version  *uint64
-}
-
-func (c callbackTestBoundCodec) DecryptBound(ctx context.Context, domain, identity, owner string, version uint64, ciphertext, nonce []byte, keyID string) ([]byte, error) {
-	if c.calls != nil {
-		*c.calls++
-	}
-	if c.domain != nil {
-		*c.domain = domain
-	}
-	if c.identity != nil {
-		*c.identity = identity
-	}
-	if c.owner != nil {
-		*c.owner = owner
-	}
-	if c.version != nil {
-		*c.version = version
-	}
-	return c.Decrypt(ctx, ciphertext, nonce, keyID)
-}
-
 type callbackTestResolver struct{}
 
 func (callbackTestResolver) Resolve(context.Context, string, adapterapi.InboundMessage) (CallbackScope, error) {
 	return CallbackScope{DiceID: "dice", GroupID: "group", UserID: "user"}, nil
-}
-
-type callbackTestGroupLoader struct{ err error }
-
-func (f callbackTestGroupLoader) Load(context.Context, string, string) (groupstate.State, error) {
-	return groupstate.State{}, f.err
-}
-
-type callbackTestPlayerLoader struct{ err error }
-
-func (f callbackTestPlayerLoader) LoadPlayer(context.Context, string, string, string) (playerstate.PlayerState, error) {
-	return playerstate.PlayerState{}, f.err
-}
-func (f callbackTestPlayerLoader) LoadGroupUserAttrs(context.Context, string, string, string) (playerstate.GroupUserAttrsState, error) {
-	return playerstate.GroupUserAttrsState{}, f.err
 }
 
 type callbackTestHost struct {
@@ -229,10 +140,10 @@ type callbackTestHost struct {
 	markerObserved bool
 	panic          bool
 	calls          int
-	fn             func(context.Context, CallbackRequest, *playerstate.LocalOverlay, *MutationCollector) (CallbackResult, error)
+	fn             func(context.Context, CallbackRequest, *playerstate.LocalOverlay, *execution.MutationCollector) (CallbackResult, error)
 }
 
-func (h *callbackTestHost) HandleCallback(ctx context.Context, request CallbackRequest, overlay *playerstate.LocalOverlay, collector *MutationCollector) (CallbackResult, error) {
+func (h *callbackTestHost) HandleCallback(ctx context.Context, request CallbackRequest, overlay *playerstate.LocalOverlay, collector *execution.MutationCollector) (CallbackResult, error) {
 	h.called = true
 	h.calls++
 	if h.inbox != nil {
@@ -258,6 +169,6 @@ type callbackFixedClock struct {
 func (c *callbackFixedClock) Now() time.Time { return c.now }
 
 type eventstoreInboxRowForTest struct {
-	Status            string
-	PayloadCiphertext []byte
+	Status  string
+	Payload []byte
 }

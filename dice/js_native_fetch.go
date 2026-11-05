@@ -46,8 +46,10 @@ func newNativeFetchService(d *Dice, loop jsengine.Loop) *nativeFetchService {
 			return jsNetworkAuthorizeWithContext(d, jsOpaqueExecutionContext(request.Context().Value(jsExecutionContextKey{})), request.URL.String())
 		},
 	}
-	if d != nil && d.Config.QuickJSMaxFetchConcurrent != 0 {
-		service.semaphore = make(chan struct{}, d.Config.QuickJSMaxFetchConcurrent)
+	if d != nil {
+		if config := d.Config(); config != nil && config.QuickJSMaxFetchConcurrent != 0 {
+			service.semaphore = make(chan struct{}, config.QuickJSMaxFetchConcurrent)
+		}
 	}
 	return service
 }
@@ -100,7 +102,14 @@ func (s *nativeFetchService) Start(call services.AsyncCall) error {
 	if err := jsCompatibilityExternalAccess(executionContext); err != nil {
 		return err
 	}
-	requestContext := context.WithValue(context.Background(), jsExecutionContextKey{}, executionContext)
+	// Persistent lineages (a script's load root and the roots opened for its
+	// timers) own their requests through the binding. Message-scoped requests
+	// keep their runtime-level lifetime.
+	asyncContext, release := context.Background(), context.CancelFunc(func() {})
+	if executionContext.persistentLineage() {
+		asyncContext, release = executionContext.AsyncWorkContext()
+	}
+	requestContext := context.WithValue(asyncContext, jsExecutionContextKey{}, executionContext)
 	var cancel context.CancelFunc
 	ctx := requestContext
 	if !call.Call.Deadline.IsZero() {
@@ -126,6 +135,7 @@ func (s *nativeFetchService) Start(call services.AsyncCall) error {
 	}
 	go func() {
 		defer close(done)
+		defer release()
 		defer cancel()
 		defer s.removePending(call.ID)
 		response := s.execute(ctx, request, call.Call.Request.Bytes)
@@ -189,7 +199,13 @@ func (s *nativeFetchService) execute(ctx context.Context, request nativeFetchReq
 		return nativeFetchErrorResponse(ctx, err)
 	}
 	defer response.Body.Close()
-	data, err := readNativeFetchBody(response.Body, s.dice.Config.QuickJSMaxFetchResponseMiB)
+	var limitMiB uint64
+	if s.dice != nil {
+		if config := s.dice.Config(); config != nil {
+			limitMiB = config.QuickJSMaxFetchResponseMiB
+		}
+	}
+	data, err := readNativeFetchBody(response.Body, limitMiB)
 	if err != nil {
 		return nativeFetchErrorResponse(ctx, err)
 	}

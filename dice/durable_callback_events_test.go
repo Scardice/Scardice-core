@@ -2,8 +2,12 @@ package dice
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,19 +20,23 @@ import (
 	"Scardice-core/eventstore"
 )
 
-// recordingPreparer records every outbound effect a callback stages, so tests
-// can assert on what Core decided to send without a provider.
+// recordingPreparer records every outbound effect a callback stages, while
+// delegating preparation and submission to the real durable outbox service.
 type recordingPreparer struct {
-	*bridgeTestSubmitter
+	*messageflow.OutboundService
 	recMu    sync.Mutex
 	prepared []adapterapi.OutboundEffect
 }
 
 func (p *recordingPreparer) Prepare(ctx context.Context, request messageflow.SubmitRequest) (messageflow.PreparedOutbound, error) {
+	prepared, err := p.OutboundService.Prepare(ctx, request)
+	if err != nil || prepared.Result.Deduplicated {
+		return prepared, err
+	}
 	p.recMu.Lock()
 	p.prepared = append(p.prepared, request.Effect)
 	p.recMu.Unlock()
-	return p.bridgeTestSubmitter.Prepare(ctx, request)
+	return prepared, nil
 }
 
 func (p *recordingPreparer) effects() []adapterapi.OutboundEffect {
@@ -68,12 +76,72 @@ func (p *recordingPreparer) textContaining(fragment string) (adapterapi.Outbound
 	return adapterapi.OutboundEffect{}, false
 }
 
+type callbackEndpointFixture struct {
+	info  *EndPointInfo
+	state endpoint.State
+}
+
+func projectCallbackTestEndpoint(t *testing.T, d *Dice, store *eventstore.GORMStore, runtime *EndPointInfo) callbackEndpointFixture {
+	t.Helper()
+	ctx := context.Background()
+	descriptor := NewOnebotDescriptor()
+	registry := endpoint.NewRegistry()
+	if err := registry.Register(descriptor); err != nil {
+		t.Fatalf("register callback endpoint descriptor: %v", err)
+	}
+	service := endpoint.NewService(store, registry)
+	if service.InitError != nil {
+		t.Fatalf("initialize callback endpoint service: %v", service.InitError)
+	}
+	config, err := descriptor.ValidateConfig(ctx, json.RawMessage(`{"mode":"client","url":"ws://127.0.0.1:6700"}`))
+	if err != nil {
+		t.Fatalf("validate callback endpoint config: %v", err)
+	}
+	created, err := service.Create(ctx, endpoint.Command{
+		CommandID: "callback-endpoint-create", CorrelationID: "callback-endpoint-create",
+		EndpointID: adapterapi.EndpointID(runtime.ID), AdapterKey: descriptor.Key(), Config: config,
+		DisplayName: runtime.Nickname, ProviderID: adapterapi.PrincipalID(runtime.UserID),
+	})
+	if err != nil {
+		t.Fatalf("create callback endpoint: %v", err)
+	}
+	enabled, err := service.Enable(ctx, endpoint.Command{
+		CommandID: "callback-endpoint-enable", CorrelationID: "callback-endpoint-enable",
+		EndpointID: adapterapi.EndpointID(runtime.ID), ExpectedVersion: created.State.Version, ExpectedVersionSet: true,
+	})
+	if err != nil {
+		t.Fatalf("enable callback endpoint: %v", err)
+	}
+	connected, err := service.Complete(ctx, endpoint.Command{
+		CommandID: "callback-endpoint-connect", CorrelationID: "callback-endpoint-connect",
+		OperationID: enabled.State.OperationID, EndpointID: enabled.State.EndpointID,
+		Generation: enabled.State.Generation, DesiredVersion: enabled.State.DesiredVersion,
+		ObservedState: adapterapi.ObservedStateConnected, CompletionState: endpoint.OperationStateSucceeded,
+	})
+	if err != nil {
+		t.Fatalf("connect callback endpoint: %v", err)
+	}
+	for _, candidate := range d.ImSession.EndPointsReadOnly() {
+		if candidate != nil && candidate.ID == runtime.ID {
+			return callbackEndpointFixture{info: candidate, state: connected.State}
+		}
+	}
+	t.Fatalf("projected callback endpoint %q is not visible to the runtime", runtime.ID)
+	return callbackEndpointFixture{}
+}
+
 type eventFixture struct {
-	t        *testing.T
-	dice     *Dice
-	endpoint *EndPointInfo
-	host     *DurableCallbackHost
-	prep     *recordingPreparer
+	t         *testing.T
+	dice      *Dice
+	store     *eventstore.GORMStore
+	endpoint  *EndPointInfo
+	fence     endpoint.State
+	host      *DurableCallbackHost
+	inbound   *messageflow.InboundService
+	callback  *messageflow.CallbackService
+	prep      *recordingPreparer
+	next      atomic.Uint64
+	lastInbox string
 }
 
 const (
@@ -83,82 +151,169 @@ const (
 
 func newEventFixture(t *testing.T) *eventFixture {
 	t.Helper()
-	instance, endpoint, _, cleanup := newExecuteNewTestDice(t)
+	instance, runtimeEndpoint, _, cleanup := newExecuteNewTestDice(t)
 	t.Cleanup(cleanup)
 	instance.ExtList = nil
-	instance.Config.MessageDelayRangeStart, instance.Config.MessageDelayRangeEnd = 0, 0
-	endpoint.Platform, endpoint.ProtocolType, endpoint.Enable, endpoint.State = "QQ", "pureonebot", true, StateConnected
-
-	database, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/events.db"})
-	if err != nil {
-		t.Fatal(err)
+	store, ok := instance.DurableStore.(*eventstore.GORMStore)
+	if !ok {
+		t.Fatal("canonical callback fixture requires a GORM EventStore")
 	}
-	t.Cleanup(func() { _ = database.Close() })
-	store := eventstore.NewStore(database, eventstore.WithKeySource(compatKeySource{}))
-	if err := store.SetReadiness(context.Background(), eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "event-callback-db", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	instance.DurableStore = store
-	// The test Dice already runs a save loop for its non-durable manager; stop it
-	// so the durable switch does not leak a second, uncancellable loop.
-	instance.AttrsManager.Stop()
-	if err := instance.AttrsManager.InitDurable(instance); err != nil {
-		t.Fatalf("durable attributes: %v", err)
-	}
-	// Cleanups run last-in-first-out: the manager must flush before the store closes.
-	t.Cleanup(instance.AttrsManager.Stop)
-
-	prep := &recordingPreparer{bridgeTestSubmitter: &bridgeTestSubmitter{}}
-	instance.OutboundBridge = NewDurableOutboundBridge(prep, bridgeTestResolver{snapshot: messageflow.EndpointSnapshot{
-		EndpointID: adapterapi.EndpointID(endpoint.ID), AdapterKey: "pureonebot", DesiredState: "enabled",
+	projected := projectCallbackTestEndpoint(t, instance, store, runtimeEndpoint)
+	resolver := bridgeTestResolver{snapshot: messageflow.EndpointSnapshot{
+		EndpointID: projected.state.EndpointID, AdapterKey: OnebotAdapterKey, DesiredState: "enabled",
 		ObservedState: adapterapi.ObservedStateConnected,
 		Capabilities:  adapterapi.CapabilityOutbound | adapterapi.CapabilityActions,
-		Actions:       adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage, adapterapi.ActionKindAnswerRequest, adapterapi.ActionKindGroupInfoRefresh),
-		IndexRootID:   "root-1",
-		IndexSigner:   bridgeTestIndexSigner{root: []byte("01234567890123456789012345678901"), id: "root-1"},
-	}}, eventstore.UUIDGenerator{})
-	return &eventFixture{t: t, dice: instance, endpoint: endpoint, host: NewDurableCallbackHost(instance), prep: prep}
+		Actions: adapterapi.ActionSet(0).With(
+			adapterapi.ActionKindSendMessage,
+			adapterapi.ActionKindAnswerRequest,
+			adapterapi.ActionKindGroupInfoRefresh,
+			adapterapi.ActionKindSetGroupCard,
+		),
+	}}
+	outbound, err := messageflow.NewOutboundService(store, resolver, eventstore.UUIDGenerator{})
+	if err != nil {
+		t.Fatalf("initialize callback outbox: %v", err)
+	}
+	prep := &recordingPreparer{OutboundService: outbound}
+	instance.OutboundBridge = NewDurableOutboundBridge(prep, resolver, eventstore.UUIDGenerator{}, newBridgeTestNotificationOwner(t))
+	host := NewDurableCallbackHost(instance)
+	callback, err := messageflow.NewCallbackService(messageflow.CallbackConfig{
+		Inbox: store, Store: store,
+		Resolver: NewDurableCallbackScopeResolver(instance), Host: host,
+		WorkerID: "event-callback-worker",
+	})
+	if err != nil {
+		t.Fatalf("initialize callback service: %v", err)
+	}
+	inbound, err := messageflow.NewInboundService(store)
+	if err != nil {
+		t.Fatalf("initialize inbound service: %v", err)
+	}
+	return &eventFixture{
+		t: t, dice: instance, store: store, endpoint: projected.info, fence: projected.state,
+		host: host, inbound: inbound, callback: callback, prep: prep,
+	}
+}
+
+func (f *eventFixture) newCallbackService(worker string, host messageflow.CallbackHost) *messageflow.CallbackService {
+	f.t.Helper()
+	service, err := messageflow.NewCallbackService(messageflow.CallbackConfig{
+		Inbox: f.store, Store: f.store,
+		Resolver: NewDurableCallbackScopeResolver(f.dice), Host: host, WorkerID: worker,
+	})
+	if err != nil {
+		f.t.Fatalf("initialize callback service %q: %v", worker, err)
+	}
+	return service
 }
 
 // notify routes notices of the given types to a private target.
 func (f *eventFixture) notify() {
-	f.dice.Config.NoticeIDs = []string{eventNoticeTarget + eventNoticeOption}
+	f.t.Helper()
+	updateCanonicalTestConfig(f.t, f.dice, func(config *Config) {
+		config.NoticeIDs = []string{eventNoticeTarget + eventNoticeOption}
+	})
 }
 
-// run delivers one typed inbound through the real durable callback host.
-func (f *eventFixture) run(inbound adapterapi.InboundMessage, group groupstate.State) error {
+func (f *eventFixture) seedConversation(inbound adapterapi.InboundMessage, desired groupstate.State, label string) {
+	f.t.Helper()
+	if desired.DiceIDActive == nil && desired.DiceIDExists == nil && desired.ActivatedExtensions == nil &&
+		!desired.ShowGroupWelcome && desired.GroupWelcomeMessage == "" {
+		return
+	}
+	groupID := string(inbound.Conversation)
+	if inbound.ConversationKind != adapterapi.ConversationKindGroup {
+		groupID = "PG-" + string(inbound.Sender)
+	}
+	userID := string(inbound.Sender)
+	withCanonicalTestRoot(f.t, f.dice, "event-seed-"+label, func(transaction *DurableCallbackTransaction) error {
+		group, err := transaction.Domain().Group(transaction.executionContext, f.dice.BaseConfig.Name, groupID)
+		if err != nil {
+			return err
+		}
+		if group.Version() == 0 {
+			if err = group.Decide(groupstate.Command{
+				Kind: groupstate.CommandCreate, DiceID: f.dice.BaseConfig.Name,
+				GroupID: groupID, GroupName: desired.GroupName,
+			}); err != nil {
+				return err
+			}
+		}
+		if err = group.Decide(groupstate.Command{
+			Kind: groupstate.CommandActivation, DiceIDForActivation: f.endpoint.UserID,
+			Active: desired.DiceIDActive[f.endpoint.UserID], Exists: desired.DiceIDExists[f.endpoint.UserID],
+		}); err != nil {
+			return err
+		}
+		for _, extensionID := range desired.ActivatedExtensions {
+			if err = group.Decide(groupstate.Command{Kind: groupstate.CommandExtension, ExtensionID: extensionID, Enabled: true}); err != nil {
+				return err
+			}
+		}
+		if desired.ShowGroupWelcome || desired.GroupWelcomeMessage != "" {
+			if err = group.Decide(groupstate.Command{
+				Kind:           groupstate.CommandWelcome,
+				WelcomeEnabled: desired.ShowGroupWelcome, WelcomeMessage: desired.GroupWelcomeMessage,
+			}); err != nil {
+				return err
+			}
+		}
+		if userID == "" {
+			return nil
+		}
+		player, err := transaction.Domain().Player(transaction.executionContext, f.dice.BaseConfig.Name, groupID, userID)
+		if err != nil {
+			return err
+		}
+		return player.Decide(playerstate.PlayerCommand{
+			Kind: playerstate.CommandPlayerCreate, DiceID: f.dice.BaseConfig.Name,
+			GroupID: groupID, UserID: userID,
+		})
+	})
+}
+
+func (f *eventFixture) enqueue(inbound adapterapi.InboundMessage, group groupstate.State) (adapterapi.IngressReceipt, error) {
 	f.t.Helper()
 	inbound.Platform = "QQ"
 	if inbound.OccurredAt.IsZero() {
 		inbound.OccurredAt = time.Unix(1700000000, 0)
 	}
 	if inbound.ProviderEventID == "" {
-		inbound.ProviderEventID = adapterapi.ProviderEventID("test-event")
+		inbound.ProviderEventID = adapterapi.ProviderEventID(fmt.Sprintf("event-%d", f.next.Add(1)))
 	}
-	// Without an endpoint projection the host derives the endpoint from Target,
-	// which the real runtime sets to the conversation. Address the bot's account
-	// so the fallback endpoint carries the bot's identity.
-	inbound.Target = f.endpoint.UserID
-	scope := messageflow.CallbackScope{DiceID: f.dice.BaseConfig.Name, UserID: string(inbound.Sender)}
-	if inbound.ConversationKind == adapterapi.ConversationKindGroup {
-		scope.GroupID = string(inbound.Conversation)
-	} else {
-		scope.GroupID = "PG-" + string(inbound.Sender)
+	if inbound.Target == "" {
+		inbound.Target = f.endpoint.UserID
 	}
-	group.DiceID, group.GroupID = f.dice.BaseConfig.Name, scope.GroupID
-	request := messageflow.CallbackRequest{
-		InboxID: "inbox-event", EndpointID: f.endpoint.ID, Message: inbound, Scope: scope,
-		Group: group.CompatibilityView(),
+	f.seedConversation(inbound, group, string(inbound.ProviderEventID))
+	return f.inbound.HandleInbound(context.Background(), endpoint.FencedInbound{
+		EndpointID: f.fence.EndpointID, Generation: f.fence.Generation,
+		DesiredVersion: f.fence.DesiredVersion, Message: inbound,
+	})
+}
+
+// run delivers one typed inbound through durable admission and the real
+// callback transaction, so all asserted state and effects have committed.
+func (f *eventFixture) run(inbound adapterapi.InboundMessage, group groupstate.State) error {
+	f.t.Helper()
+	receipt, err := f.enqueue(inbound, group)
+	if err != nil {
+		return err
 	}
-	result, err := f.host.HandleCallback(context.Background(), request, playerstate.NewLocalOverlay(), messageflow.NewMutationCollector(eventstore.EventFactory{}))
-	if result.Release != nil {
-		result.Release()
+	f.lastInbox = receipt.InboxID
+	if receipt.Outcome == adapterapi.IngressDuplicate {
+		return nil
 	}
-	return err
+	if receipt.Outcome != adapterapi.IngressAccepted {
+		return fmt.Errorf("callback ingress outcome %v", receipt.Outcome)
+	}
+	summary, err := f.callback.ProcessOne(context.Background())
+	if err != nil {
+		return err
+	}
+	if summary.Status != eventstore.InboxStatusConfirmedConsumed {
+		return fmt.Errorf("callback status %q", summary.Status)
+	}
+	return nil
 }
 
 func (f *eventFixture) activeGroup(extensions ...string) groupstate.State {
@@ -197,7 +352,8 @@ func groupNotice(event adapterapi.InboundEventKind, sender, subject, operator ad
 func TestFriendRequestIsAnsweredFromQuestionBlacklistAndPolicy(t *testing.T) {
 	tests := []struct {
 		name        string
-		setup       func(*Dice)
+		setup       func(*Config)
+		banUser     bool
 		comment     string
 		policy      string
 		wantAnswer  bool
@@ -205,17 +361,16 @@ func TestFriendRequestIsAnsweredFromQuestionBlacklistAndPolicy(t *testing.T) {
 	}{
 		{name: "no question accepts", wantAnswer: true, wantApprove: true},
 		{name: "explicit accept policy accepts", policy: "accept", wantAnswer: true, wantApprove: true},
-		{name: "right answer accepts", setup: func(d *Dice) { d.Config.FriendAddComment = "芝士" }, comment: "芝士", wantAnswer: true, wantApprove: true},
-		{name: "wrong answer rejects", setup: func(d *Dice) { d.Config.FriendAddComment = "芝士" }, comment: "蛋糕", wantAnswer: true},
-		{name: "multi-line answers are matched in order", setup: func(d *Dice) { d.Config.FriendAddComment = "甲 乙" }, comment: "问题\n回答:甲\n回答:乙", wantAnswer: true, wantApprove: true},
-		{name: "wrong multi-line answer rejects", setup: func(d *Dice) { d.Config.FriendAddComment = "甲 乙" }, comment: "问题\n回答:乙\n回答:甲", wantAnswer: true},
+		{name: "right answer accepts", setup: func(config *Config) { config.FriendAddComment = "芝士" }, comment: "芝士", wantAnswer: true, wantApprove: true},
+		{name: "wrong answer rejects", setup: func(config *Config) { config.FriendAddComment = "芝士" }, comment: "蛋糕", wantAnswer: true},
+		{name: "multi-line answers are matched in order", setup: func(config *Config) { config.FriendAddComment = "甲 乙" }, comment: "问题\n回答:甲\n回答:乙", wantAnswer: true, wantApprove: true},
+		{name: "wrong multi-line answer rejects", setup: func(config *Config) { config.FriendAddComment = "甲 乙" }, comment: "问题\n回答:乙\n回答:甲", wantAnswer: true},
 		{
 			name: "a banned user is rejected even with the right answer",
-			setup: func(d *Dice) {
-				d.Config.BanList.BanBehaviorRefuseInvite = true
-				d.Config.BanList.Map.Store("QQ:1001", &BanListInfoItem{ID: "QQ:1001", Rank: BanRankBanned})
+			setup: func(config *Config) {
+				config.BanList.BanBehaviorRefuseInvite = true
 			},
-			wantAnswer: true,
+			banUser: true, wantAnswer: true,
 		},
 		{name: "ignore policy only reports", policy: "ignore"},
 		{name: "manual policy only reports", policy: "manual"},
@@ -225,7 +380,12 @@ func TestFriendRequestIsAnsweredFromQuestionBlacklistAndPolicy(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newEventFixture(t)
 			if tt.setup != nil {
-				tt.setup(f.dice)
+				updateCanonicalTestConfig(t, f.dice, tt.setup)
+			}
+			if tt.banUser {
+				if err := f.dice.Config().BanList.SetRankByID(f.dice, "QQ:1001", BanRankBanned, "", "", "callback test"); err != nil {
+					t.Fatalf("ban friend requester: %v", err)
+				}
 			}
 			f.notify()
 			if err := f.run(friendRequest("QQ:1001", "friend-flag", tt.comment, tt.policy), groupstate.State{}); err != nil {
@@ -246,8 +406,6 @@ func TestFriendRequestIsAnsweredFromQuestionBlacklistAndPolicy(t *testing.T) {
 					t.Fatalf("answer = %#v, want approve=%v for QQ:1001 flag friend-flag", got, tt.wantApprove)
 				}
 			}
-			// The operator is told about every request, answered or not, and the
-			// report is staged in the same transaction as the answer.
 			report, ok := f.prep.textContaining("收到QQ好友邀请")
 			if !ok || report.Payload.Target.Conversation != eventNoticeTarget || !strings.Contains(report.Payload.Text, "邀请人:1001") {
 				t.Fatalf("operator report = %#v ok=%v", report.Payload, ok)
@@ -264,33 +422,36 @@ func TestFriendRequestIsAnsweredFromQuestionBlacklistAndPolicy(t *testing.T) {
 func TestGroupInviteIsAnsweredFromBlacklistAndTrustPolicy(t *testing.T) {
 	tests := []struct {
 		name        string
-		setup       func(*Dice)
+		setup       func(*Config)
+		bannedID    string
 		wantApprove bool
 		wantReason  string
 	}{
 		{name: "an ordinary invite is accepted", wantApprove: true},
-		{name: "refusing all invites rejects", setup: func(d *Dice) { d.Config.RefuseGroupInvite = true }, wantReason: "拒绝拉群邀请"},
-		{name: "trust-only mode rejects a non-master inviter", setup: func(d *Dice) {
-			d.Config.TrustOnlyMode = true
-			d.DiceMasters = []string{"QQ:99999"}
+		{name: "refusing all invites rejects", setup: func(config *Config) { config.RefuseGroupInvite = true }, wantReason: "拒绝拉群邀请"},
+		{name: "trust-only mode rejects a non-master inviter", setup: func(config *Config) {
+			config.TrustOnlyMode = true
+			config.DiceMasters = []string{"QQ:99999"}
 		}, wantReason: "只允许信任的人拉群"},
-		{name: "trust-only mode accepts a master inviter", setup: func(d *Dice) {
-			d.Config.TrustOnlyMode = true
-			d.DiceMasters = []string{"QQ:1001"}
+		{name: "trust-only mode accepts a master inviter", setup: func(config *Config) {
+			config.TrustOnlyMode = true
+			config.DiceMasters = []string{"QQ:1001"}
 		}, wantApprove: true},
-		{name: "a banned inviter is rejected", setup: func(d *Dice) {
-			d.Config.BanList.BanBehaviorRefuseInvite = true
-			d.Config.BanList.Map.Store("QQ:1001", &BanListInfoItem{ID: "QQ:1001", Rank: BanRankBanned})
-		}, wantReason: "邀请人在黑名单上"},
-		{name: "a banned group is rejected", setup: func(d *Dice) {
-			d.Config.BanList.Map.Store("QQ-Group:2002", &BanListInfoItem{ID: "QQ-Group:2002", Rank: BanRankBanned})
-		}, wantReason: "群组在黑名单上"},
+		{name: "a banned inviter is rejected", setup: func(config *Config) {
+			config.BanList.BanBehaviorRefuseInvite = true
+		}, bannedID: "QQ:1001", wantReason: "邀请人在黑名单上"},
+		{name: "a banned group is rejected", bannedID: "QQ-Group:2002", wantReason: "群组在黑名单上"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newEventFixture(t)
 			if tt.setup != nil {
-				tt.setup(f.dice)
+				updateCanonicalTestConfig(t, f.dice, tt.setup)
+			}
+			if tt.bannedID != "" {
+				if err := f.dice.Config().BanList.SetRankByID(f.dice, tt.bannedID, BanRankBanned, "", "", "callback test"); err != nil {
+					t.Fatalf("ban invite owner: %v", err)
+				}
 			}
 			f.notify()
 			if err := f.run(groupInvite("QQ:1001", "QQ-Group:2002", "group-flag"), groupstate.State{}); err != nil {
@@ -312,11 +473,12 @@ func TestGroupInviteIsAnsweredFromBlacklistAndTrustPolicy(t *testing.T) {
 	}
 }
 
-func TestRequestAnswerFailsSoftWhenTheBridgeIsUnavailable(t *testing.T) {
+func TestRequestAnswerFailsTheCallbackWhenTheBridgeIsUnavailable(t *testing.T) {
 	f := newEventFixture(t)
 	f.dice.OutboundBridge = nil
-	if err := f.run(friendRequest("QQ:1001", "friend-flag", "", ""), groupstate.State{}); err != nil {
-		t.Fatalf("a missing bridge must not fail the callback: %v", err)
+	err := f.run(friendRequest("QQ:1001", "friend-flag", "", ""), groupstate.State{})
+	if err == nil || !strings.Contains(err.Error(), "durable outbound action bridge unavailable") {
+		t.Fatalf("missing bridge error = %v", err)
 	}
 }
 
@@ -370,6 +532,31 @@ func TestPokeIsIgnoredWhileTheBotIsOffInThatGroup(t *testing.T) {
 	}
 }
 
+func TestPokeDoesNotCreateMissingConversationFacts(t *testing.T) {
+	f := newEventFixture(t)
+	called := false
+	f.dice.RegisterExtension(&ExtInfo{
+		Name: "missing-poke-probe",
+		OnPoke: func(_ *MsgContext, _ *events.PokeEvent) {
+			called = true
+		},
+	})
+	if err := f.run(
+		groupNotice(adapterapi.InboundEventPoke, "QQ:stranger", "QQ:3003", ""),
+		groupstate.State{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Fatal("poke for a missing conversation reached an extension")
+	}
+	if _, err := groupstate.ReadProjected(
+		context.Background(), f.store, f.dice.BaseConfig.Name, "QQ-Group:2002",
+	); !errors.Is(err, eventstore.ErrNotFound) {
+		t.Fatalf("missing poke manufactured group state: %v", err)
+	}
+}
+
 func TestMemberJoinedIsWelcomedOnlyWhenEnabledAndOnlyOncePerEvent(t *testing.T) {
 	enabled := func(f *eventFixture) groupstate.State {
 		group := f.activeGroup()
@@ -377,6 +564,7 @@ func TestMemberJoinedIsWelcomedOnlyWhenEnabledAndOnlyOncePerEvent(t *testing.T) 
 		return group
 	}
 	join := groupNotice(adapterapi.InboundEventMemberJoined, "QQ:4004", "QQ:4004", "QQ:1001")
+	join.ProviderEventID = "member-joined-1"
 
 	t.Run("enabled welcomes the new member in the group", func(t *testing.T) {
 		f := newEventFixture(t)
@@ -433,9 +621,9 @@ func TestBotJoiningAGroupRecordsTheInviterAndDefersTheWelcomeWithoutBlocking(t *
 		t.Fatalf("the callback slept for %s while holding its lease", elapsed)
 	}
 
-	stored, ok := f.dice.ImSession.ServiceAtNew.Load("QQ-Group:2002")
-	if !ok || stored.InviteUserID != "QQ:1001" {
-		t.Fatalf("group after join = %#v ok=%v, want inviter QQ:1001", stored, ok)
+	stored, err := groupstate.ReadProjected(context.Background(), f.store, f.dice.BaseConfig.Name, "QQ-Group:2002")
+	if err != nil || stored.InviteUserID != "QQ:1001" {
+		t.Fatalf("group after join = %#v err=%v, want inviter QQ:1001", stored, err)
 	}
 	select {
 	case inviter := <-joined:
@@ -493,18 +681,21 @@ func TestBecomingFriendsWelcomesAfterTheLegacyPauseAndFiresTheHook(t *testing.T)
 }
 
 func TestBotLeavingARoomDropsItFromTheGroupRosterAndReports(t *testing.T) {
-	for _, event := range []adapterapi.InboundEventKind{adapterapi.InboundEventSelfLeft} {
+	for _, event := range []adapterapi.InboundEventKind{
+		adapterapi.InboundEventSelfLeft,
+		adapterapi.InboundEventSelfRemoved,
+	} {
 		f := newEventFixture(t)
 		f.notify()
 		inbound := groupNotice(event, "QQ:1001", "QQ:3003", "QQ:1001")
 		if err := f.run(inbound, f.activeGroup()); err != nil {
 			t.Fatal(err)
 		}
-		group, ok := f.dice.ImSession.ServiceAtNew.Load("QQ-Group:2002")
-		if !ok {
-			t.Fatal("group vanished entirely")
+		group, err := groupstate.ReadProjected(context.Background(), f.store, f.dice.BaseConfig.Name, "QQ-Group:2002")
+		if err != nil {
+			t.Fatalf("read group after leave: %v", err)
 		}
-		if _, exists := group.DiceIDExistsMap.Load(f.endpoint.UserID); exists {
+		if group.DiceIDExists[f.endpoint.UserID] {
 			t.Fatal("the bot is still on the group roster after leaving")
 		}
 		if report, ok := f.prep.textContaining("离开群组或群解散"); !ok || !strings.Contains(report.Payload.Text, "QQ-Group:2002") {
@@ -541,13 +732,15 @@ func TestBotRemovedFromAGroupFiresTheLeaveHookWithTheOperator(t *testing.T) {
 func TestBotMutedScoresTheOperatorAndReportsTheDurationInSeconds(t *testing.T) {
 	f := newEventFixture(t)
 	f.notify()
-	f.dice.Config.BanList.ScoreGroupMuted = 100
+	updateCanonicalTestConfig(t, f.dice, func(config *Config) {
+		config.BanList.ScoreGroupMuted = 100
+	})
 	inbound := groupNotice(adapterapi.InboundEventSelfMuted, "QQ:1001", "QQ:3003", "QQ:1001")
 	inbound.DurationSeconds = 600
 	if err := f.run(inbound, f.activeGroup()); err != nil {
 		t.Fatal(err)
 	}
-	item, ok := f.dice.Config.BanList.GetByID("QQ:1001")
+	item, ok := f.dice.Config().BanList.GetByID("QQ:1001")
 	if !ok || item.Score < 100 {
 		t.Fatalf("the muting operator was not scored: %#v ok=%v", item, ok)
 	}
@@ -559,7 +752,9 @@ func TestBotMutedScoresTheOperatorAndReportsTheDurationInSeconds(t *testing.T) {
 
 func TestNoticesInsideACallbackAreStaggeredInsteadOfSleeping(t *testing.T) {
 	f := newEventFixture(t)
-	f.dice.Config.NoticeIDs = []string{"QQ:9001:only=invite", "QQ:9002:only=invite", "QQ:9003:only=invite"}
+	updateCanonicalTestConfig(t, f.dice, func(config *Config) {
+		config.NoticeIDs = []string{"QQ:9001:only=invite", "QQ:9002:only=invite", "QQ:9003:only=invite"}
+	})
 	started := time.Now()
 	if err := f.run(friendRequest("QQ:1001", "friend-flag", "", "manual"), groupstate.State{}); err != nil {
 		t.Fatal(err)
@@ -594,22 +789,31 @@ func TestNoticesInsideACallbackAreStaggeredInsteadOfSleeping(t *testing.T) {
 }
 
 func TestBlackListChecksAreDecidedFromTheInviterAndGroup(t *testing.T) {
-	d, _, _, cleanup := newExecuteNewTestDice(t)
+	d, endpointInfo, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
-	ctx := &MsgContext{Dice: d}
-	d.Config.TrustOnlyMode = true
-	d.DiceMasters = []string{"QQ:55555"}
-	d.Config.BanList.Map.Store("QQ-Group:66666", &BanListInfoItem{ID: "QQ-Group:66666", Rank: BanRankNormal})
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.TrustOnlyMode = true
+		config.DiceMasters = []string{"QQ:55555"}
+	})
+	message := &Message{
+		Platform: "QQ", MessageType: "group", GroupID: "QQ-Group:66666",
+		Sender: SenderBase{UserID: "QQ:55555", Nickname: "Trusted inviter"},
+	}
+	ctx := newCanonicalTestMessageContext(t, d, endpointInfo, message, "blacklist-trust-check")
 	if ok, reason := checkPassBlackListGroup("QQ:55555", "QQ-Group:66666", ctx); !ok {
 		t.Fatalf("a master inviter must pass trust-only mode, got %q", reason)
 	}
 	if ok, _ := checkPassBlackListGroup("QQ:11111", "QQ-Group:66666", ctx); ok {
 		t.Fatal("a non-master inviter must not pass trust-only mode")
 	}
-
-	d.Config.BanList.Map.Store("QQ:55555", &BanListInfoItem{ID: "QQ:55555", Rank: BanRankBanned})
-	d.Config.BanList.BanBehaviorRefuseInvite = true
-	result := checkBlackList("QQ:55555", "user", "", ctx)
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.BanList.BanBehaviorRefuseInvite = true
+	})
+	if err := d.Config().BanList.SetRankByID(d, "QQ:55555", BanRankBanned, "", "", "callback test"); err != nil {
+		t.Fatalf("ban trusted inviter: %v", err)
+	}
+	bannedCtx := newCanonicalTestMessageContext(t, d, endpointInfo, message, "blacklist-banned-check")
+	result := checkBlackList("QQ:55555", "user", "", bannedCtx)
 	if result.Passed || result.Reason != "邀请人在黑名单上" {
 		t.Fatalf("a banned master must still be rejected as inviter, got %#v", result)
 	}
@@ -633,8 +837,9 @@ func TestEventNamesReachCachesGroupsPlayersAndReports(t *testing.T) {
 	if !ok || !strings.Contains(report.Payload.Text, "<测试群>(QQ-Group:2002)") {
 		t.Fatalf("join report = %q ok=%v, want the group named", report.Payload.Text, ok)
 	}
-	if group, ok := f.dice.ImSession.ServiceAtNew.Load("QQ-Group:2002"); !ok || group.GroupName != "测试群" {
-		t.Fatalf("group after join = %#v", group)
+	group, err := groupstate.ReadProjected(context.Background(), f.store, f.dice.BaseConfig.Name, "QQ-Group:2002")
+	if err != nil || group.GroupName != "测试群" {
+		t.Fatalf("group after join = %#v err=%v", group, err)
 	}
 }
 
@@ -690,13 +895,11 @@ func TestANewMemberIsNamedFromTheEventNotFromItsId(t *testing.T) {
 	if err := f.run(inbound, f.activeGroup()); err != nil {
 		t.Fatal(err)
 	}
-	group, ok := f.dice.ImSession.ServiceAtNew.Load("QQ-Group:2002")
-	if !ok {
-		t.Fatal("group missing")
-	}
-	player, ok := group.Players.Load("QQ:1001")
-	if !ok || player.Name != "爱丽丝" {
-		t.Fatalf("player = %#v ok=%v, want the provider-supplied name instead of the id", player, ok)
+	player, err := playerstate.ReadProjectedPlayer(
+		context.Background(), f.store, f.dice.BaseConfig.Name, "QQ-Group:2002", "QQ:1001",
+	)
+	if err != nil || player.Name != "爱丽丝" {
+		t.Fatalf("player = %#v err=%v, want the provider-supplied name instead of the id", player, err)
 	}
 }
 
@@ -760,12 +963,12 @@ func TestDurableOpaqueAdapterEventUsesProjectedConversationScope(t *testing.T) {
 				t.Fatalf("opaque callback compatibility flags = type=%q private=%t active=%t privilege=%d role=%d",
 					ctx.MessageType, ctx.IsPrivate, ctx.IsCurGroupBotOn, ctx.PrivilegeLevel, ctx.GroupRoleLevel)
 			}
-			if ctx.callbackTransaction == nil || ctx.callbackMetadata.CommandID != "inbox-event" {
+			if ctx.callbackTransaction == nil || ctx.callbackMetadata.CommandID != fixture.lastInbox {
 				t.Fatal("opaque callback escaped durable callback ownership")
 			}
 			ReplyToSender(ctx, &Message{
-				MessageType: "group", GroupID: ctx.Group.GroupID, Platform: "QQ",
-				Sender: SenderBase{UserID: ctx.Player.UserID},
+				MessageType: "group", GroupID: ctx.Group.GroupID(), Platform: "QQ",
+				Sender: SenderBase{UserID: ctx.Player.UserID()},
 			}, "opaque adapter reply")
 			if event.RawJSON != `{"post_type":"notice","notice_type":"group_admin","group_id":2002,"user_id":1001}` {
 				t.Fatalf("raw JSON = %q", event.RawJSON)
@@ -818,7 +1021,7 @@ func TestGlobalAdapterEventUsesNilCallbackContextWithoutConversationState(t *tes
 	}
 	fixture.dice.RegisterExtension(extension)
 	receipt, err := fixture.host.HandleAdapterEvent(context.Background(), endpoint.FencedAdapterEvent{
-		EndpointID: adapterapi.EndpointID(fixture.endpoint.ID), Generation: 1, DesiredVersion: 1,
+		EndpointID: fixture.fence.EndpointID, Generation: fixture.fence.Generation, DesiredVersion: fixture.fence.DesiredVersion,
 		Event: adapterapi.AdapterEvent{Protocol: "onebot11", Type: "meta_event", RawJSON: `{"post_type":"meta_event","meta_event_type":"heartbeat"}`},
 	})
 	if err != nil || receipt.Outcome != adapterapi.IngressAccepted {
@@ -837,7 +1040,7 @@ func TestGlobalAdapterPluginFailureIsContained(t *testing.T) {
 		OnAdapterEvent:     func(*MsgContext, *AdapterEventView) {},
 	})
 	receipt, err := fixture.host.HandleAdapterEvent(context.Background(), endpoint.FencedAdapterEvent{
-		EndpointID: adapterapi.EndpointID(fixture.endpoint.ID), Generation: 1, DesiredVersion: 1,
+		EndpointID: fixture.fence.EndpointID, Generation: fixture.fence.Generation, DesiredVersion: fixture.fence.DesiredVersion,
 		Event: adapterapi.AdapterEvent{Protocol: "onebot11", Type: "notice", RawJSON: `{"post_type":"notice"}`},
 	})
 	if err != nil || receipt.Outcome != adapterapi.IngressRejected {
@@ -852,7 +1055,7 @@ func TestGlobalAdapterPluginPanicIsContained(t *testing.T) {
 		OnAdapterEvent: func(*MsgContext, *AdapterEventView) { panic("plugin boom") },
 	})
 	receipt, err := fixture.host.HandleAdapterEvent(context.Background(), endpoint.FencedAdapterEvent{
-		EndpointID: adapterapi.EndpointID(fixture.endpoint.ID), Generation: 1, DesiredVersion: 1,
+		EndpointID: fixture.fence.EndpointID, Generation: fixture.fence.Generation, DesiredVersion: fixture.fence.DesiredVersion,
 		Event: adapterapi.AdapterEvent{Protocol: "onebot11", Type: "notice", RawJSON: `{"post_type":"notice"}`},
 	})
 	if err != nil || receipt.Outcome != adapterapi.IngressRejected {

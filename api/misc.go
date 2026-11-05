@@ -37,7 +37,6 @@ func upgrade(c echo.Context) error {
 			dm.UpdateRequestChan <- myDice
 			ret := <-dm.UpdateDownloadedChan
 			if ret == "" {
-				myDice.Save(true)
 				bakFn, _ := myDice.Parent.Backup(dice.BackupSelectionAll, false)
 				tmpParent := os.TempDir()
 				tmpPath := path.Join(tmpParent, bakFn)

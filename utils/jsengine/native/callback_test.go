@@ -16,7 +16,7 @@ func TestNativeCodecRejectsNilCallbackTarget(t *testing.T) {
 			t.Fatalf("Decode panicked for nil callback target: %v", recovered)
 		}
 	}()
-	_, err := (nativeCodec{}).Decode(hostbridge.CallbackValue(1), target)
+	_, err := (&nativeCodec{}).Decode(hostbridge.CallbackValue(1), target)
 	if err == nil || err.Error() != "native codec callback target is nil" {
 		t.Fatalf("Decode error = %v, want deterministic nil-target error", err)
 	}

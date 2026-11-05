@@ -18,20 +18,6 @@ import (
 	"Scardice-core/eventstore"
 )
 
-type smokeKeyMaterial struct{ roots map[string][]byte }
-
-func smokeKeySource() *smokeKeyMaterial {
-	return &smokeKeyMaterial{roots: map[string][]byte{"root-v1": []byte("abcdefghijklmnopqrstuvwxyz123456")}}
-}
-func (s *smokeKeyMaterial) IndexRootID(context.Context) (string, error) { return "index-v1", nil }
-func (s *smokeKeyMaterial) IndexRootMaterial(context.Context) ([]byte, error) {
-	return []byte("01234567890123456789012345678901"), nil
-}
-func (s *smokeKeyMaterial) CurrentEncryptionRoot(ctx context.Context) (eventstore.EncryptionRoot, error) {
-	material, err := s.EncryptionRoot(ctx, "root-v1")
-	return eventstore.EncryptionRoot{ID: "root-v1", Material: material}, err
-}
-
 type smokeListenerHandoff struct {
 	mu        sync.Mutex
 	listeners map[string]net.Listener
@@ -87,26 +73,16 @@ func (h *smokeListenerHandoff) reserveAddress(t *testing.T, address string) {
 		h.mu.Unlock()
 	})
 }
-func (s *smokeKeyMaterial) EncryptionRoot(_ context.Context, id string) ([]byte, error) {
-	material, ok := s.roots[id]
-	if !ok {
-		return nil, eventstore.ErrKeyUnavailable
-	}
-	return append([]byte(nil), material...), nil
-}
-func openSmokeBootstrap(t *testing.T, path string, source *smokeKeyMaterial, descriptor adapterapi.Descriptor) (*endpoint.Bootstrap, *eventstore.Database) {
+func openSmokeBootstrap(t *testing.T, path string, descriptor adapterapi.Descriptor) (*endpoint.Bootstrap, *eventstore.Database) {
 	t.Helper()
-	db, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{Type: "sqlite", DSN: path, KeySource: source, DatabaseIdentity: "smoke-db"})
+	db, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{Type: "sqlite", DSN: path, DatabaseIdentity: "smoke-db"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := eventstore.NewStore(db, eventstore.WithKeySource(source))
-	readiness, readinessErr := store.GetReadiness(context.Background())
-	if readinessErr != nil || (readiness.Mode == "fresh" && readiness.TerminalGlobalPosition == 0) {
-		if err := store.SetReadiness(context.Background(), eventstore.Readiness{Mode: "import", SchemaVersion: 1, DatabaseIdentity: "smoke-db", IndexRootID: "index-v1", EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), CompletedAt: time.Now().UTC()}); err != nil {
-			_ = db.Close()
-			t.Fatal(err)
-		}
+	store := eventstore.NewStore(db)
+	if _, err := store.GetReadiness(context.Background()); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
 	}
 	bootstrap, err := endpoint.NewBootstrap(store, nil, descriptor)
 	if err != nil {
@@ -128,55 +104,6 @@ func registerSmokeCleanup(t *testing.T, bootstrap *endpoint.Bootstrap, db *event
 		}
 	})
 }
-func syncSmokeReadiness(t *testing.T, store *eventstore.GORMStore, db *eventstore.Database) {
-	t.Helper()
-	readiness, err := store.GetReadiness(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	var global struct {
-		Position uint64 `gorm:"column:position"`
-	}
-	if err := db.GORM().Table("domain_events").Select("COALESCE(MAX(global_position), 0) AS position").Scan(&global).Error; err != nil {
-		t.Fatal(err)
-	}
-	var projection struct {
-		Position uint64 `gorm:"column:position"`
-	}
-	if err := db.GORM().Table("projection_control").Select("terminal_position AS position").Where("singleton_id = ?", "default").Scan(&projection).Error; err != nil {
-		t.Fatal(err)
-	}
-	readiness.TerminalGlobalPosition = global.Position
-	t.Logf("sync readiness global=%d projection=%d prior=%+v", global.Position, projection.Position, readiness)
-	if err := store.SetReadiness(context.Background(), readiness); err != nil {
-		t.Fatal(err)
-	}
-}
-func waitSmokeReadinessQuiescent(t *testing.T, store *eventstore.GORMStore, db *eventstore.Database) {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		var global struct {
-			Position uint64 `gorm:"column:position"`
-		}
-		var projection struct {
-			Position uint64 `gorm:"column:position"`
-		}
-		if db.GORM().Table("domain_events").Select("COALESCE(MAX(global_position), 0) AS position").Scan(&global).Error == nil &&
-			db.GORM().Table("projection_control").Select("terminal_position AS position").Where("singleton_id = ?", "default").Scan(&projection).Error == nil &&
-			global.Position == projection.Position {
-			time.Sleep(20 * time.Millisecond)
-			var check struct {
-				Position uint64 `gorm:"column:position"`
-			}
-			if db.GORM().Table("domain_events").Select("COALESCE(MAX(global_position), 0) AS position").Scan(&check).Error == nil && check.Position == global.Position {
-				return
-			}
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal("eventstore readiness did not quiesce")
-}
 
 func smokeConfig(t *testing.T, descriptor adapterapi.Descriptor, address, secretRef string) adapterapi.ValidatedConfig {
 	t.Helper()
@@ -190,7 +117,7 @@ func smokeConfig(t *testing.T, descriptor adapterapi.Descriptor, address, secret
 
 func putSmokeSecret(t *testing.T, store eventstore.SecretRepository, id adapterapi.EndpointID, ref string) {
 	t.Helper()
-	if _, err := store.PutSecret(context.Background(), eventstore.SecretPutRequest{SecretRef: ref, EndpointID: string(id), AdapterID: "pureonebot", Plaintext: []byte("runtime-token")}); err != nil {
+	if _, err := store.PutSecret(context.Background(), eventstore.SecretPutRequest{SecretRef: ref, EndpointID: string(id), AdapterID: "pureonebot", Value: []byte("runtime-token")}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -282,11 +209,10 @@ func waitSmokePortClosed(t *testing.T, address string) {
 
 func TestOnebotEndpointLifecycleReloginAndRestartReconciliation(t *testing.T) {
 	ctx := context.Background()
-	source := smokeKeySource()
 	handoff := newSmokeListenerHandoff()
 	descriptor := newOnebotDescriptorWithListenerFactory(handoff.listen)
 	dbPath := filepath.Join(t.TempDir(), "pureonebot-smoke.db")
-	bootstrap, db := openSmokeBootstrap(t, dbPath, source, descriptor)
+	bootstrap, db := openSmokeBootstrap(t, dbPath, descriptor)
 	store, ok := bootstrap.Store.(eventstore.SecretRepository)
 	if !ok {
 		t.Fatal("bootstrap store does not expose secret repository")
@@ -376,10 +302,6 @@ func TestOnebotEndpointLifecycleReloginAndRestartReconciliation(t *testing.T) {
 	if !waitSmokeObservedState(t, bootstrap.Service, id, adapterapi.ObservedStateFailed) {
 		t.Fatalf("disconnect after relogin did not publish a failed observation")
 	}
-	if gormStore, ok := bootstrap.Store.(*eventstore.GORMStore); ok {
-		waitSmokeReadinessQuiescent(t, gormStore, db)
-		syncSmokeReadiness(t, gormStore, db)
-	}
 	if _, err := bootstrap.Execute(ctx, endpoint.Command{Kind: endpoint.CommandDisable, Type: endpoint.CommandDisable, CommandID: fmt.Sprintf("smoke-disable-%d", time.Now().UnixNano()), CorrelationID: "smoke-disable", EndpointID: id}); err != nil {
 		t.Fatal(err)
 	}
@@ -417,14 +339,10 @@ func TestOnebotEndpointLifecycleReloginAndRestartReconciliation(t *testing.T) {
 	if !waitSmokeObservedState(t, bootstrap.Service, id2, adapterapi.ObservedStateFailed) {
 		t.Fatalf("replay endpoint disconnect did not publish a failed observation")
 	}
-	if gormStore, ok := bootstrap.Store.(*eventstore.GORMStore); ok {
-		waitSmokeReadinessQuiescent(t, gormStore, db)
-		syncSmokeReadiness(t, gormStore, db)
-	}
 	if err := bootstrap.Shutdown(ctx); err != nil {
 		t.Fatal(err)
 	}
-	bootstrap, db = openSmokeBootstrap(t, dbPath, source, descriptor)
+	bootstrap, db = openSmokeBootstrap(t, dbPath, descriptor)
 	registerSmokeCleanup(t, bootstrap, db)
 	before, err := bootstrap.Service.Get(ctx, id2)
 	if err != nil {

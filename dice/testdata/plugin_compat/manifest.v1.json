@@ -4,7 +4,7 @@
   "surface": "javascript-plugin-public",
   "baselineRuntime": "goja",
   "fixture": {
-    "covers": ["$t", "$m", "$g", "player-attrs", "ban", "extension-config", "opaque-storage", "callbacks", "lifecycle", "external-effects"]
+    "covers": ["host-bindings", "context-fields", "context-mutations", "callback-bindings", "unregistered-config-errors"]
   },
   "trustBoundary": {
     "supported": "Only names and observable values listed in this manifest are compatibility commitments.",
@@ -17,13 +17,6 @@
     "Values must not be retained across runtime generations or passed between runtime realms."
   ],
   "callbacks": {
-    "order": [
-      "message-preprocess",
-      "message-received-or-command-filter",
-      "not-command-or-command-override",
-      "command-received",
-      "message-send"
-    ],
     "fields": [
       "onMessagePreprocess",
       "onMessageReceived",
@@ -42,7 +35,7 @@
       "onAdapterEvent",
       "onLoad"
     ],
-    "notes": "The order is a pipeline ordering contract; branch-specific callbacks only run when their event or command state applies."
+    "notes": "The fixture verifies public callback field bindings only. Runtime event and command routing determines callback execution order; this fixture does not assert pipeline or durable integration coverage."
   },
   "mutationWhitelistCandidates": {
     "context": [
@@ -95,7 +88,7 @@
       { "name": "fs", "reason": "filesystem reads and writes are external effects and can be uncertain across crashes" },
       { "name": "fetch-and-network", "reason": "network calls are external effects and are not replay-safe" },
       { "name": "seal.adapter.call", "members": ["callApi", "callApiRaw"], "reason": "immediate provider calls retain invocation ownership, are not automatically retried, and cannot be rolled back with the callback transaction" },
-      { "name": "seal.adapter.enqueue", "members": ["enqueueApi", "enqueueApiRaw"], "reason": "callback submissions commit atomically into the encrypted outbox; dispatched unknown actions are non-idempotent and may settle as ambiguous" },
+      { "name": "seal.adapter.enqueue", "members": ["enqueueApi", "enqueueApiRaw"], "reason": "callback submissions commit atomically into the durable outbox; dispatched unknown actions are non-idempotent and may settle as ambiguous" },
       { "name": "send-and-notice", "members": ["replyGroup", "replyPerson", "replyToSender", "replyForward", "notice", "noticeCrossPlatform"], "reason": "adapter delivery is asynchronous and may be best-effort or externally ambiguous" },
       { "name": "registerTask", "reason": "timers execute outside the callback transaction and can outlive a generation" }
     ]

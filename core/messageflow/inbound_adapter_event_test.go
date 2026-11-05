@@ -1,7 +1,6 @@
 package messageflow
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -30,10 +29,10 @@ func testAdapterEventInbound(raw string) adapterapi.InboundMessage {
 	}
 }
 
-func TestInboundServicePreservesAdapterEventRawJSONInsideEncryptedPayload(t *testing.T) {
+func TestInboundServicePreservesAdapterEventRawJSONInPlaintextPayload(t *testing.T) {
 	const raw = " {\n \"post_type\":\"notice\", \"big\":900719925474099312345\n} "
 	repo := &ingressRepoStub{}
-	service, err := NewInboundService(repo, ingressCryptoStub{})
+	service, err := NewInboundService(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,14 +44,10 @@ func TestInboundServicePreservesAdapterEventRawJSONInsideEncryptedPayload(t *tes
 	}
 
 	repo.mu.Lock()
-	ciphertext := append([]byte(nil), repo.updates[0].PayloadCiphertext...)
+	payloadBytes := append([]byte(nil), repo.updates[0].Payload...)
 	repo.mu.Unlock()
-	plaintext, ok := bytes.CutPrefix(ciphertext, []byte("sealed:"))
-	if !ok {
-		t.Fatalf("ciphertext does not contain test envelope: %q", ciphertext)
-	}
 	var payload ingressPayload
-	if err := json.Unmarshal(plaintext, &payload); err != nil {
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 		t.Fatal(err)
 	}
 	if payload.Message.AdapterEvent == nil || payload.Message.AdapterEvent.RawJSON != raw {
@@ -64,7 +59,7 @@ func TestInboundServiceDeduplicatesTypedLiveAndHistoryRepresentations(t *testing
 	const liveRaw = " {\n  \"post_type\":\"message\", \"message_id\":9001, \"group_id\":2002, \"vendor_extra\":true\n} "
 	const historyRaw = `{"post_type":"message","message_id":9001}`
 	repo := &ingressRepoStub{}
-	service, err := NewInboundService(repo, ingressCryptoStub{})
+	service, err := NewInboundService(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,24 +107,19 @@ func TestInboundServiceDeduplicatesTypedLiveAndHistoryRepresentations(t *testing
 		repo.mu.Unlock()
 		t.Fatalf("live/history stored %d inbox rows", len(repo.updates))
 	}
-	ciphertext := append([]byte(nil), repo.updates[0].PayloadCiphertext...)
+	payloadBytes := append([]byte(nil), repo.updates[0].Payload...)
 	repo.mu.Unlock()
-	plaintext, ok := bytes.CutPrefix(ciphertext, []byte("sealed:"))
-	if !ok {
-		t.Fatalf("ciphertext does not contain test envelope: %q", ciphertext)
-	}
 	var payload ingressPayload
-	if err := json.Unmarshal(plaintext, &payload); err != nil {
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 		t.Fatal(err)
 	}
 	if payload.Message.AdapterEvent == nil || payload.Message.AdapterEvent.RawJSON != liveRaw {
 		t.Fatalf("accepted callback lost its exact raw event: %#v", payload.Message.AdapterEvent)
 	}
 }
-
 func TestInboundServiceOpaqueEventsAtSameSecondUseContentInFallbackIdentity(t *testing.T) {
 	repo := &ingressRepoStub{}
-	service, err := NewInboundService(repo, ingressCryptoStub{})
+	service, err := NewInboundService(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +143,7 @@ func TestInboundServiceOpaqueEventsAtSameSecondUseContentInFallbackIdentity(t *t
 
 func TestInboundServiceRejectsEscapeHeavyAdapterRawBeforeMarshal(t *testing.T) {
 	repo := &ingressRepoStub{}
-	service, err := NewInboundService(repo, ingressCryptoStub{})
+	service, err := NewInboundService(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +168,7 @@ func TestInboundAdapterRawBoundFitsEventstoreLimitForSmallEvent(t *testing.T) {
 }
 
 func TestInboundServiceTypedFallbackIdentityIgnoresAdapterMetadata(t *testing.T) {
-	service, err := NewInboundService(&ingressRepoStub{}, ingressCryptoStub{})
+	service, err := NewInboundService(&ingressRepoStub{})
 	if err != nil {
 		t.Fatal(err)
 	}

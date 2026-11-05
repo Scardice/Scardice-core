@@ -13,18 +13,19 @@ Scardice keeps these versions independent:
 | Seal JS API | Compatibility of the user-facing `seal.*` JavaScript API. |
 | Runtime Version | The implementation/version of a runtime provider (for example, QuickJS). |
 
-Runtime ABI v1 keeps `runtime_abi_minor` reserved at zero. Host ABI v1.1
+Runtime ABI v1 keeps `runtime_abi_minor` reserved at zero. Host ABI 1.1
 appends HostRef proxy lifecycle callbacks and the host-function owner query to
-`sc_host_api_v1`. Providers that create JavaScript HostRef proxies retain once
-per proxy and release at finalization. A provider can use the owner query to
-keep a host method's parent proxy alive for as long as the JavaScript function
-remains reachable. Host and Runtime ABI versions are queried independently
-and reported in the provider descriptor.
+`sc_host_api_v1`; Host ABI 1.2 appends `execution_status` so native execution can
+observe the current invocation's cancellation and deadline. Core and QuickJS
+require Host ABI 1.2, including its complete, non-null execution-status slot.
+Query, descriptor, and create validation reject an older Host contract instead
+of silently ignoring cancellation. Host and Runtime ABI versions are queried
+independently and reported in the provider descriptor.
 
 `service_event`, `tick`, the plugin extension table, and Host service
 callbacks remain optional v1 tails. Consumers validate optional fields through
-`struct_size` and declared capabilities. The HostRef lifecycle and method-owner
-callbacks are part of Host ABI 1.1 and must be present in that version's struct.
+`struct_size` and declared capabilities. Host ABI 1.2 retains the 1.1 HostRef
+lifecycle and function-owner callbacks and requires the execution-status tail.
 Core accepts a shorter provider table only when its declared capabilities do
 not require omitted fields. Missing `tick` is a no-op, and Core never sends
 service events to a provider that omits `service_event`. Partial required tails
@@ -74,7 +75,7 @@ All handle values are opaque; `0` is invalid/null. The status constants are:
 | `SC_EABI` | -2 | ABI/version/struct-size incompatibility. |
 | `SC_ENOTSUP` | -3 | Capability or operation is not supported. |
 | `SC_ESTATE` | -4 | Operation is invalid for the current lifecycle state. |
-| `SC_ECLOSED` | -5 | Runtime or host session has been closed. |
+| `SC_ECLOSED` | -5 | Runtime/host session closed, or the queried execution was canceled or revoked. |
 | `SC_EEXCEPTION` | -10 | The runtime caught a script/native exception. |
 | `SC_EOOM` | -11 | Allocation failed. |
 | `SC_ETIMEOUT` | -12 | A synchronous operation timed out. |
@@ -187,8 +188,45 @@ The constructors, conversion functions, object functions, and invocation functio
 11. `host_ref_retain(sc_host_ctx_t, sc_runtime_t, sc_host_ref_t ref)`
 12. `host_ref_release(sc_host_ctx_t, sc_runtime_t, sc_host_ref_t ref)`
 13. `host_function_owner(sc_host_ctx_t, sc_runtime_t, sc_host_func_t function, sc_host_ref_t *out_owner)`
+14. `execution_status(sc_host_ctx_t, sc_runtime_t)`
 
-Host references and host function references are opaque session handles, not addresses. Under Host ABI 1.1, a provider that creates a JavaScript proxy for a HostRef calls `host_ref_retain` once for that proxy and calls `host_ref_release` when the proxy is finalized. `host_function_owner` returns the owning HostRef for a host method, or zero for an ownerless function; the provider keeps a proxy for that owner in the method function's data so a function retained beyond its parent object remains callable. The HostBridge keeps the referenced object available while any proxy remains; session teardown still clears all remaining entries. A callback must not retain borrowed key/argument data after it returns. The host keeps the callback table and `host_ctx` valid until every runtime using them has been destroyed.
+Host references and host function references are opaque session handles, not
+addresses. A provider that creates a JavaScript HostRef proxy calls
+`host_ref_retain` once for that proxy and calls `host_ref_release` at finalization.
+`host_function_owner` returns the function's owning HostRef, or zero if it has
+none. The provider keeps an owner proxy in the function's data, so a detached
+function remains callable after its parent JavaScript object is dropped.
+
+Core gives standalone native host functions a releasable internal owner.
+That owner retains the function's captured Go value, not a later replacement of
+the source field. The last owner proxy releases both entries; a failed provider
+constructor releases its temporary owner guard. The HostBridge keeps ordinary
+objects available while any proxy remains, and teardown clears remaining entries.
+A callback must not retain borrowed key/argument data after it returns. The host
+keeps the callback table and `host_ctx` valid until every runtime using them has
+been destroyed.
+
+### Execution status
+
+`execution_status(sc_host_ctx_t, sc_runtime_t)` is a read-only owner-thread
+callback. It resolves the provider's current execution-context token, not the
+runtime's creation context or an unrelated idle/live entry. Providers restore
+the originating token for timers, Promise jobs, and service callbacks before
+querying status.
+
+| Result | Provider action |
+| --- | --- |
+| `SC_OK` | Continue the current execution. An unbound runtime-level task is live. |
+| `SC_ECLOSED` | Stop the canceled, revoked, or closed execution. |
+| `SC_ETIMEOUT` | Stop the execution whose current root deadline expired. |
+
+Providers query this callback from their execution interrupt hook so a CPU-only
+loop can stop without making another HostBridge call. A non-OK result aborts
+the current operation and remains its returned status; providers must not
+downgrade cancellation/deadline to a generic script exception. This query does
+not stop or destroy the runtime, and a later live context can execute normally.
+It does not schedule work, enter a new root, or mutate host values. Lifecycle
+operations must not run from another thread as a cancellation mechanism.
 
 The host-service request and response envelopes are fixed-width and contain no language-runtime pointers beyond borrowed string/byte views:
 
@@ -232,7 +270,7 @@ typedef struct sc_service_event_v1 {
     uint32_t struct_size;
     uint32_t kind;
     uint32_t status;
-    uint32_t reserved;
+    uint32_t flags;
     sc_service_request_t request;
     sc_string_view string;
     const uint8_t *bytes;
@@ -245,6 +283,14 @@ typedef struct sc_service_event_v1 {
 ```
 
 `kind` is one of `SC_SERVICE_EVENT_DATA`, `SC_SERVICE_EVENT_COMPLETE`, or `SC_SERVICE_EVENT_CLOSE`. Data events are non-terminal. Complete and close events are terminal; each request accepts exactly one terminal event, and providers must reject unknown requests or events delivered after termination. Event payload views are borrowed only for the `service_event` call and must be copied by a provider if retained. Request IDs, event payloads, Go values, and QuickJS values never share ownership across the ABI boundary.
+
+Host ABI 1.2 defines `SC_SERVICE_EVENT_DISCARD_CONTINUATIONS` (`1`) in
+`flags`, reusing the previously reserved field without changing its layout.
+The host sets it only on a terminal event when the request's invocation,
+binding, or durable admission no longer permits script execution. The provider
+must retire the request and release its retained Promise resolvers or socket
+callback without settling the Promise, calling JavaScript, or pumping jobs.
+Ordinary service delivery uses `flags = 0`.
 
 The QuickJS provider advertises `console`, `crypto`, `fetch`, `filesystem`,
 and `websocket`. Console operations are `0x0101` (`log`), `0x0102` (`info`),
@@ -283,9 +329,11 @@ SC_EXPORT sc_status_t SC_CALL scardice_runtime_query_v1(
 
 `sc_runtime_plugin_v1` is append-only and contains `struct_size`, then the embedded `sc_runtime_descriptor_v1 descriptor`, the embedded `sc_runtime_api_v1 api`, and the optional extension tail. A successful query returns a pointer to plugin-owned static storage. The host validates the required prefix, version fields, capabilities, and function pointers before calling `create`; it reads the extension tail only when its fields are covered by `struct_size`.
 
-Runtime ABI and Host ABI each have one v1 contract. Minor fields are reserved
-zero; they do not negotiate feature releases. Optional fields are discovered
-through `struct_size`, then validated against the provider's capabilities.
+Runtime ABI v1 reserves its minor field at zero. Host ABI 1.2 has minor value
+two and requires its execution-status tail. Core and QuickJS validate the
+declared Host minor as well as `struct_size`; an older Host cannot advertise
+the current cancellation contract. Optional runtime fields remain gated by
+`struct_size` and the provider's capabilities.
 
 The active plugin table appends an extension descriptor array after the
 runtime API:
@@ -346,6 +394,12 @@ The lifecycle is `query → create → start → calls → stop → destroy`. `s
 ## Value ownership and callbacks
 
 A value handle returned by an API call is owned by the current runtime call scope. The host must not let an unretained value escape that scope. `value_retain` promotes a value to persistent ownership; every successful retain requires a matching `value_release` before `destroy`. Do not rely on a Go finalizer for correctness. A value from one runtime cannot be used with another runtime.
+
+JavaScript-to-Go callback conversion holds provisional native retains until a
+successful assignment or Go call takes ownership. A missing/read-only property,
+invalid argument count, or later conversion failure releases untransferred
+retains before returning. Once Go receives a callback, a later host error or
+panic does not revoke it; a partial slice push transfers only its written prefix.
 
 When a runtime invokes a host object or host function, the host callback may use borrowed arguments only until it returns. Host callbacks may call `value_new_*`, `value_type`, `value_to_*`, `host_object_new`, `host_function_new`, `value_retain`, `value_release`, `function_call`, `object_get`, and `object_set` reentrantly. `create`, `start`, `stop`, `destroy`, and `load_entry` are not reentrant from a host callback. Providers must avoid waiting on their own callback thread; an implementation that queues work to a worker executes reentrant calls inline on that worker to avoid deadlock.
 

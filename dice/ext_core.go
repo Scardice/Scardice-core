@@ -33,12 +33,16 @@ func RegisterBuiltinExtCore(dice *Dice) {
 
 				skip := false
 				skipReason := ""
-				banInfo, ok := ctx.Dice.Config.BanList.GetByID(opUID)
-				if ok {
-					if banInfo.Rank == 30 {
-						skip = true
-						skipReason = "信任用户"
-					}
+				ban := ctx.Dice.Config().BanList
+				banInfo, ok, err := ban.GetByIDForContext(ctx, opUID)
+				if err != nil {
+					ctx.setExecutionError(err)
+					dice.Logger.Errorf("读取踢群操作者名单状态失败: %v", err)
+					return
+				}
+				if ok && banInfo.Rank == BanRankTrusted {
+					skip = true
+					skipReason = "信任用户"
 				}
 				if ctx.Dice.IsMaster(opUID) {
 					skip = true
@@ -48,8 +52,10 @@ func RegisterBuiltinExtCore(dice *Dice) {
 				var extra string
 				if skip {
 					extra = fmt.Sprintf("\n取消处罚，原因为%s", skipReason)
-				} else {
-					ctx.Dice.Config.BanList.AddScoreByGroupKicked(opUID, event.GroupID, ctx)
+				} else if err = ban.AddScoreByGroupKickedForContext(opUID, event.GroupID, ctx); err != nil {
+					ctx.setExecutionError(err)
+					dice.Logger.Errorf("记录踢群处罚失败: %v", err)
+					return
 				}
 
 				txt := fmt.Sprintf("被踢出群: 在群组<%s>(%s)中被踢出，操作者:<%s>(%s)%s", groupName, event.GroupID, userName, event.OperatorID, extra)

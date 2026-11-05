@@ -110,7 +110,6 @@ func settleObservedPromise(payload promiseObservationPayload, result goja.Value,
 }
 
 func promiseRejectionError(reason goja.Value) (err error) {
-	err = errors.New("promise rejected: reason could not be converted to text")
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			// A throwing toString must still reject the host callback. Hard VM
@@ -118,6 +117,7 @@ func promiseRejectionError(reason goja.Value) (err error) {
 			if _, exception := recovered.(*goja.Exception); !exception {
 				panic(recovered)
 			}
+			err = errors.New("promise rejected: reason could not be converted to text")
 		}
 	}()
 	if reason == nil {
@@ -131,7 +131,7 @@ func (r *runtime) ObservePromise(input jsengine.Value, settled func(jsengine.Val
 		return false, errors.New("goja runtime is required")
 	}
 	if settled == nil {
-		return false, errors.New("Promise settlement callback is nil")
+		return false, errors.New("promise settlement callback is nil")
 	}
 	adapted, ok := input.(value)
 	if !ok {

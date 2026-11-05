@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	crand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -20,14 +19,9 @@ import (
 
 const (
 	localEndpointBootstrapVersion = 1
-	localEndpointRootID           = "root-v1"
-	localEndpointKeyBytes         = 32
 
-	endpointBootstrapResourceIndexKey    = "事件库索引密钥"
-	endpointBootstrapResourceRootKey     = "事件库加密根密钥"
-	endpointBootstrapResourceCurrentRoot = "事件库当前根选择"
-	endpointBootstrapResourceConfig      = "事件库默认配置"
-	endpointBootstrapResourceReuse       = "本地事件库配置与密钥"
+	endpointBootstrapResourceConfig = "事件库默认配置"
+	endpointBootstrapResourceReuse  = "本地事件库配置"
 )
 
 var errLocalEndpointBootstrapIncomplete = errors.New("local endpoint bootstrap state is incomplete")
@@ -68,29 +62,12 @@ func endpointEnvironmentConfigured(getenv func(string) string) bool {
 		"SCARDICE_ENDPOINT_DB_ALLOW_INSECURE_LOOPBACK",
 		"SCARDICE_ENDPOINT_DB_SLOT_FILE",
 		"SCARDICE_ENDPOINT_IMPORT_SLOT",
-		"SCARDICE_ENDPOINT_KEY_INDEX",
-		"SCARDICE_ENDPOINT_KEY_ROOTS",
 	} {
 		if strings.TrimSpace(getenv(key)) != "" {
 			return true
 		}
 	}
 	return false
-}
-
-func endpointSQLiteDatabaseFilePath(dsn string) string {
-	dsn = strings.TrimSpace(dsn)
-	if dsn == "" || dsn == ":memory:" {
-		return ""
-	}
-	dsn = strings.TrimPrefix(dsn, "file:")
-	if queryIndex := strings.IndexByte(dsn, '?'); queryIndex >= 0 {
-		dsn = dsn[:queryIndex]
-	}
-	if dsn == "" || strings.HasPrefix(dsn, ":memory:") {
-		return ""
-	}
-	return filepath.Clean(dsn)
 }
 
 func ensureLocalEndpointDatabaseConfig(rootDir string, audit endpointBootstrapAudit) (eventstore.DatabaseConfig, error) {
@@ -100,11 +77,6 @@ func ensureLocalEndpointDatabaseConfig(rootDir string, audit endpointBootstrapAu
 	endpointDir := filepath.Join(rootDir, "data", "endpoint")
 	configPath := filepath.Join(endpointDir, "config.json")
 	databasePath := filepath.Join(endpointDir, "events.db")
-	keysDir := filepath.Join(endpointDir, "keys")
-	indexPath := filepath.Join(keysDir, "index.key")
-	rootsDir := filepath.Join(keysDir, "roots")
-	rootPath := filepath.Join(rootsDir, localEndpointRootID+".key")
-	currentRootPath := filepath.Join(rootsDir, "current")
 
 	if err := ensureLocalEndpointDirectory(endpointDir); err != nil {
 		return eventstore.DatabaseConfig{}, err
@@ -122,54 +94,20 @@ func ensureLocalEndpointDatabaseConfig(rootDir string, audit endpointBootstrapAu
 			return eventstore.DatabaseConfig{}, fmt.Errorf("%w: %s", errLocalEndpointBootstrapIncomplete, endpointDir)
 		}
 	}
-	if err := ensureLocalEndpointDirectory(keysDir); err != nil {
-		return eventstore.DatabaseConfig{}, err
-	}
-	if err := ensureLocalEndpointDirectory(rootsDir); err != nil {
-		return eventstore.DatabaseConfig{}, err
-	}
-
-	keySource := eventstore.NewLocalFileKeySource(indexPath, rootsDir)
 	if exists {
-		if err := validateLocalEndpointKeyMaterial(keySource); err != nil {
-			return eventstore.DatabaseConfig{}, fmt.Errorf("%w: %w", errLocalEndpointBootstrapIncomplete, err)
-		}
 		if audit != nil {
 			audit(endpointBootstrapEvent{Resource: endpointBootstrapResourceReuse, Path: configPath})
 		}
 		return eventstore.DatabaseConfig{
 			Type: "sqlite", DSN: databasePath,
-			KeySource: keySource, DatabaseIdentity: config.DatabaseIdentity,
+			DatabaseIdentity: config.DatabaseIdentity,
 		}, nil
 	}
 
-	indexMaterial := make([]byte, localEndpointKeyBytes)
-	rootMaterial := make([]byte, localEndpointKeyBytes)
 	identityMaterial := make([]byte, 16)
-	for _, material := range [][]byte{indexMaterial, rootMaterial, identityMaterial} {
-		if _, err := crand.Read(material); err != nil {
-			return eventstore.DatabaseConfig{}, fmt.Errorf("generate local endpoint key material: %w", err)
-		}
+	if _, err := crand.Read(identityMaterial); err != nil {
+		return eventstore.DatabaseConfig{}, fmt.Errorf("generate local endpoint identity: %w", err)
 	}
-	if err := eventstore.CreateLocalKeyFile(indexPath, indexMaterial); err != nil {
-		return eventstore.DatabaseConfig{}, fmt.Errorf("create local endpoint index key: %w", err)
-	}
-	if audit != nil {
-		audit(endpointBootstrapEvent{Resource: endpointBootstrapResourceIndexKey, Path: indexPath, Created: true})
-	}
-	if err := eventstore.CreateLocalKeyFile(rootPath, rootMaterial); err != nil {
-		return eventstore.DatabaseConfig{}, fmt.Errorf("create local endpoint encryption root: %w", err)
-	}
-	if audit != nil {
-		audit(endpointBootstrapEvent{Resource: endpointBootstrapResourceRootKey, Path: rootPath, Created: true})
-	}
-	if err := utils.AtomicWriteFile(currentRootPath, []byte(localEndpointRootID+"\n"), 0o600); err != nil {
-		return eventstore.DatabaseConfig{}, fmt.Errorf("persist local endpoint current root: %w", err)
-	}
-	if audit != nil {
-		audit(endpointBootstrapEvent{Resource: endpointBootstrapResourceCurrentRoot, Path: currentRootPath, Created: true})
-	}
-
 	config = localEndpointBootstrapConfig{
 		Version:          localEndpointBootstrapVersion,
 		DatabaseIdentity: "local-" + hex.EncodeToString(identityMaterial),
@@ -185,12 +123,9 @@ func ensureLocalEndpointDatabaseConfig(rootDir string, audit endpointBootstrapAu
 	if audit != nil {
 		audit(endpointBootstrapEvent{Resource: endpointBootstrapResourceConfig, Path: configPath, Created: true})
 	}
-	if err := validateLocalEndpointKeyMaterial(keySource); err != nil {
-		return eventstore.DatabaseConfig{}, fmt.Errorf("%w: %w", errLocalEndpointBootstrapIncomplete, err)
-	}
 	return eventstore.DatabaseConfig{
 		Type: "sqlite", DSN: databasePath,
-		KeySource: keySource, DatabaseIdentity: config.DatabaseIdentity,
+		DatabaseIdentity: config.DatabaseIdentity,
 	}, nil
 }
 
@@ -246,22 +181,7 @@ func validLocalEndpointIdentity(identity string) bool {
 		!strings.ContainsAny(identity, "\x00\r\n")
 }
 
-func validateLocalEndpointKeyMaterial(source *eventstore.LocalFileKeySource) error {
-	if source == nil {
-		return eventstore.ErrKeySourceUnavailable
-	}
-	indexMaterial, err := source.IndexRootMaterial(context.Background())
-	if err != nil || len(indexMaterial) != localEndpointKeyBytes {
-		return eventstore.ErrKeyUnavailable
-	}
-	root, err := source.CurrentEncryptionRoot(context.Background())
-	if err != nil || len(root.Material) != localEndpointKeyBytes || root.ID == "" {
-		return eventstore.ErrKeyUnavailable
-	}
-	return nil
-}
-
-var errEndpointBootstrapConfig = errors.New("endpoint bootstrap requires database, key index, key roots, and database identity")
+var errEndpointBootstrapConfig = errors.New("endpoint bootstrap requires database and database identity")
 
 func endpointDatabaseConfigFromEnv(getenv func(string) string) (eventstore.DatabaseConfig, error) {
 	if getenv == nil {
@@ -290,10 +210,8 @@ func endpointDatabaseConfigForPrefix(getenv func(string) string, prefix string) 
 	if dsn == "" {
 		return eventstore.DatabaseConfig{}, nil
 	}
-	indexPath := strings.TrimSpace(getenv("SCARDICE_ENDPOINT_KEY_INDEX"))
-	rootsPath := strings.TrimSpace(getenv("SCARDICE_ENDPOINT_KEY_ROOTS"))
 	identity := strings.TrimSpace(getenv(prefix + "_ID"))
-	if indexPath == "" || rootsPath == "" || identity == "" {
+	if identity == "" {
 		return eventstore.DatabaseConfig{}, errEndpointBootstrapConfig
 	}
 	dbType := strings.ToLower(strings.TrimSpace(getenv(prefix + "_TYPE")))
@@ -310,7 +228,6 @@ func endpointDatabaseConfigForPrefix(getenv func(string) string, prefix string) 
 	}
 	return eventstore.DatabaseConfig{
 		Type: dbType, DSN: dsn,
-		KeySource:             eventstore.NewLocalFileKeySource(indexPath, rootsPath),
 		DatabaseIdentity:      identity,
 		TLSVerify:             tlsVerify,
 		AllowInsecureLoopback: allowLoopback,

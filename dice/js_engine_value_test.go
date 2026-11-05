@@ -79,14 +79,21 @@ func TestParseMessagePreprocessEngineValue(t *testing.T) {
 	}
 }
 
+func newEngineValueMessageContext(t *testing.T, d *Dice, label string) (*MsgContext, *Message) {
+	t.Helper()
+	message := newPrivateMsg("QQ:engine-value-user", "")
+	return newCanonicalTestMessageContext(
+		t, d, newCanonicalTestEndpoint(d, "QQ:engine-value-bot"), message, label,
+	), message
+}
+
 func TestCallOnMessagePreprocess_UsesEngineNeutralCallback(t *testing.T) {
 	loop := gojaengine.New()
 	t.Cleanup(func() { _ = loop.Close() })
 
-	d := &Dice{
-		Config:         Config{JsConfig: JsConfig{JsEnable: true}},
-		ExtLoopManager: NewJsLoopManager(),
-	}
+	d, _ := newCanonicalTestDice(t)
+	d.ExtLoopManager = NewJsLoopManager()
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.JsEnable = true })
 	version := d.ExtLoopManager.SetLoop(loop)
 	ext := &ExtInfo{
 		Name:          "engine-preprocess",
@@ -97,7 +104,8 @@ func TestCallOnMessagePreprocess_UsesEngineNeutralCallback(t *testing.T) {
 		},
 	}
 
-	decision := ext.CallOnMessagePreprocess(d, &MsgContext{}, &Message{Message: "original"})
+	ctx, message := newEngineValueMessageContext(t, d, "engine-neutral-callback")
+	decision := ext.CallOnMessagePreprocess(d, ctx, message)
 	if decision != (messagePreprocessDecision{
 		action:  messagePreprocessRewrite,
 		message: "rewritten",
@@ -108,11 +116,10 @@ func TestCallOnMessagePreprocess_UsesEngineNeutralCallback(t *testing.T) {
 }
 func TestCallOnMessagePreprocessEngineSupportsNonJSProviderAndRestoresContext(t *testing.T) {
 	loop := gojaengine.New()
-	d := &Dice{
-		Config:         Config{JsConfig: JsConfig{JsEnable: true}},
-		ExtLoopManager: NewJsLoopManager(),
-		Logger:         zap.NewNop().Sugar(),
-	}
+	d, _ := newCanonicalTestDice(t)
+	d.ExtLoopManager = NewJsLoopManager()
+	d.Logger = zap.NewNop().Sugar()
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.JsEnable = true })
 	version := d.ExtLoopManager.SetLoop(loop)
 	var ext *ExtInfo
 	ext = &ExtInfo{
@@ -126,7 +133,9 @@ func TestCallOnMessagePreprocessEngineSupportsNonJSProviderAndRestoresContext(t 
 		},
 	}
 
-	decision := ext.CallOnMessagePreprocess(d, &MsgContext{}, &Message{Message: "original"})
+	ctx, message := newEngineValueMessageContext(t, d, "non-js-provider")
+	message.Message = "original"
+	decision := ext.CallOnMessagePreprocess(d, ctx, message)
 	if decision.action != messagePreprocessRewrite || decision.message != "rewritten" {
 		t.Fatalf("decision = %#v", decision)
 	}
@@ -157,17 +166,17 @@ func TestCallOnMessagePreprocessEngineReportsCallbackErrorAndPanicAsNoop(t *test
 			loop := gojaengine.New()
 			t.Cleanup(func() { _ = loop.Close() })
 
-			d := &Dice{
-				ExtLoopManager: NewJsLoopManager(),
-				Logger:         zap.NewNop().Sugar(),
-			}
+			d, _ := newCanonicalTestDice(t)
+			d.ExtLoopManager = NewJsLoopManager()
+			d.Logger = zap.NewNop().Sugar()
 			version := d.ExtLoopManager.SetLoop(loop)
 			ext := &ExtInfo{
 				Name:                      "callback-failure",
 				JSLoopVersion:             version,
 				OnMessagePreprocessEngine: test.fn,
 			}
-			if decision := ext.CallOnMessagePreprocess(d, &MsgContext{}, &Message{}); decision.action != messagePreprocessNoop {
+			ctx, message := newEngineValueMessageContext(t, d, "callback-failure:"+test.name)
+			if decision := ext.CallOnMessagePreprocess(d, ctx, message); decision.action != messagePreprocessNoop {
 				t.Fatalf("decision = %#v, want noop", decision)
 			}
 		})
@@ -179,11 +188,10 @@ func TestCallOnMessagePreprocessEngineHonorsJsEnableForJSProvider(t *testing.T) 
 	t.Cleanup(func() { _ = loop.Close() })
 
 	called := false
-	d := &Dice{
-		Config:         Config{JsConfig: JsConfig{JsEnable: false}},
-		ExtLoopManager: NewJsLoopManager(),
-		Logger:         zap.NewNop().Sugar(),
-	}
+	d, _ := newCanonicalTestDice(t)
+	d.ExtLoopManager = NewJsLoopManager()
+	d.Logger = zap.NewNop().Sugar()
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.JsEnable = false })
 	version := d.ExtLoopManager.SetLoop(loop)
 	ext := &ExtInfo{
 		Name:          "disabled-js-provider",
@@ -195,7 +203,8 @@ func TestCallOnMessagePreprocessEngineHonorsJsEnableForJSProvider(t *testing.T) 
 		},
 	}
 
-	if decision := ext.CallOnMessagePreprocess(d, &MsgContext{}, &Message{}); decision.action != messagePreprocessNoop {
+	ctx, message := newEngineValueMessageContext(t, d, "disabled-js-provider")
+	if decision := ext.CallOnMessagePreprocess(d, ctx, message); decision.action != messagePreprocessNoop {
 		t.Fatalf("decision = %#v, want noop", decision)
 	}
 	if called {
@@ -261,8 +270,10 @@ func TestParseSolveEngineValueReadsObjectWithoutLegacyExport(t *testing.T) {
 }
 
 func TestLegacyPreprocessRunsOnce(t *testing.T) {
-	d := &Dice{Logger: zap.NewNop().Sugar(), ExtLoopManager: NewJsLoopManager()}
-	d.Config.JsEnable = true
+	d, _ := newCanonicalTestDice(t)
+	d.Logger = zap.NewNop().Sugar()
+	d.ExtLoopManager = NewJsLoopManager()
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.JsEnable = true })
 	manager := NewJSRuntimeManagerForDice(d)
 	loop, err := manager.Resolve(context.Background(), jsengine.EngineGoja, jsengine.RuntimeOptions{})
 	if err != nil {
@@ -279,7 +290,8 @@ func TestLegacyPreprocessRunsOnce(t *testing.T) {
 			return goja.Undefined()
 		},
 	}
-	ext.CallOnMessagePreprocess(d, &MsgContext{}, &Message{})
+	ctx, message := newEngineValueMessageContext(t, d, "legacy-preprocess")
+	ext.CallOnMessagePreprocess(d, ctx, message)
 	if calls != 1 {
 		t.Fatalf("one message invoked the legacy callback %d times", calls)
 	}

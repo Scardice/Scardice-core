@@ -330,8 +330,10 @@ func (e ConfigDefinitionRegisteredV1) apply(s *State) error {
 	if s.ConfigDefinitions[e.Definition.ExtensionID] == nil {
 		s.ConfigDefinitions[e.Definition.ExtensionID] = map[string]ConfigDefinition{}
 	}
-	if _, ok := s.ConfigDefinitions[e.Definition.ExtensionID][e.Definition.Key]; ok {
-		return ErrInvalidState
+	if current, exists := s.ConfigValues[e.Definition.ExtensionID][e.Definition.Key]; exists {
+		if err := validateConfigValue(current, e.Definition); err != nil {
+			return err
+		}
 	}
 	s.ConfigDefinitions[e.Definition.ExtensionID][e.Definition.Key] = e.Definition.Clone()
 	return nil

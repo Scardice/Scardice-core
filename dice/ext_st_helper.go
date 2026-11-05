@@ -8,10 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/samber/lo"
 	ds "github.com/sealdice/dicescript"
-
-	"Scardice-core/logger"
 )
 
 // 如果参数中存在指定的属性，将其选出作为展示项
@@ -42,8 +39,11 @@ func cmdStGetPickItemAndLimit(tmpl *GameSystemTemplate, cmdArgs *CmdArgs) (pickI
 	return pickItems, limit
 }
 
-func cmdStSortNamesByTmpl(mctx *MsgContext, tmpl *GameSystemTemplate, pickItems map[string]int, _ int64, isExport bool) (topNum int, items []string) {
-	attrs, _ := mctx.Dice.AttrsManager.LoadByCtx(mctx)
+func cmdStSortNamesByTmpl(mctx *MsgContext, tmpl *GameSystemTemplate, pickItems map[string]int, _ int64, isExport bool) (topNum int, items []string, err error) {
+	attrs, err := mctx.Dice.AttrsManager.LoadByCtx(mctx)
+	if err != nil {
+		return 0, nil, err
+	}
 	// 或者有pickItems，或者当前的变量数量大于0
 	if len(pickItems) > 0 || attrs.Len() > 0 {
 		// 按照配置文件排序
@@ -142,10 +142,10 @@ func cmdStSortNamesByTmpl(mctx *MsgContext, tmpl *GameSystemTemplate, pickItems 
 		}
 
 		// 排序完成，返回
-		return topNum, attrKeys
+		return topNum, attrKeys, nil
 	}
 
-	return -1, []string{}
+	return -1, []string{}, nil
 }
 
 func cmdStGetItemsForShow(mctx *MsgContext, tmpl *GameSystemTemplate, pickItems map[string]int, limit int64, stInfo *CmdStOverrideInfo) (items []string, droppedByLimit int, err error) {
@@ -154,7 +154,10 @@ func cmdStGetItemsForShow(mctx *MsgContext, tmpl *GameSystemTemplate, pickItems 
 	limitSkipCount := 0
 	items = []string{}
 
-	topNum, attrKeys := cmdStSortNamesByTmpl(mctx, tmpl, pickItems, limit, false)
+	topNum, attrKeys, err := cmdStSortNamesByTmpl(mctx, tmpl, pickItems, limit, false)
+	if err != nil {
+		return nil, 0, err
+	}
 
 	// 或者有pickItems，或者当前的变量数量大于0
 	if len(attrKeys) > 0 {
@@ -241,7 +244,10 @@ func cmdStGetItemsForExport(mctx *MsgContext, tmpl *GameSystemTemplate, stInfo *
 	// 修改自 cmdStGetItemsForShow
 	limitSkipCount := 0
 	items = []string{}
-	_, attrKeys := cmdStSortNamesByTmpl(mctx, tmpl, map[string]int{}, 0, true)
+	_, attrKeys, err := cmdStSortNamesByTmpl(mctx, tmpl, map[string]int{}, 0, true)
+	if err != nil {
+		return nil, 0, err
+	}
 
 	// 或者有pickItems，或者当前的变量数量大于0
 	if len(attrKeys) > 0 {
@@ -258,7 +264,10 @@ func cmdStGetItemsForExport(mctx *MsgContext, tmpl *GameSystemTemplate, stInfo *
 
 			var text string
 			if stInfo != nil && stInfo.ToExport != nil {
-				text = stInfo.ToExport(mctx, k, v, tmpl)
+				text, err = stInfo.ToExport(mctx, k, v, tmpl)
+				if err != nil {
+					return nil, 0, err
+				}
 			}
 
 			if text != "" {
@@ -279,13 +288,15 @@ func cmdStGetItemsForExport(mctx *MsgContext, tmpl *GameSystemTemplate, stInfo *
 	return items, limitSkipCount, nil
 }
 
-func cmdStValueMod(mctx *MsgContext, tmpl *GameSystemTemplate, attrs *AttributesItem, commandInfo map[string]any, i *stSetOrModInfoItem, cmdArgs *CmdArgs, stInfo *CmdStOverrideInfo) {
+func cmdStValueMod(mctx *MsgContext, tmpl *GameSystemTemplate, attrs *AttributesItem, commandInfo map[string]any, i *stSetOrModInfoItem, cmdArgs *CmdArgs, stInfo *CmdStOverrideInfo) error {
 	if stInfo.ToMod != nil {
-		stInfo.ToMod(mctx, cmdArgs, i, attrs, tmpl)
+		if _, err := stInfo.ToMod(mctx, cmdArgs, i, attrs, tmpl); err != nil {
+			return err
+		}
 	}
 
 	// 获取当前值（在 ToMod 可能重定向名称后再读取）
-	curVal, _ := attrs.valueMap.Load(i.name)
+	curVal, _ := attrs.LoadX(i.name)
 	if curVal == nil {
 		curVal, _, _, _ = tmpl.GetDefaultValue(i.name)
 	}
@@ -333,11 +344,15 @@ func cmdStValueMod(mctx *MsgContext, tmpl *GameSystemTemplate, attrs *Attributes
 	}
 
 	if theNewValue == nil {
-		theNewValue = theOldValue // 占位符，避免报错
+		theNewValue = theOldValue // 不识别的操作符保持原值
 	}
 
 	if stInfo.ToModResult != nil {
-		theNewValue = stInfo.ToModResult(mctx, cmdArgs, i, attrs, tmpl, theOldValue, theNewValue)
+		var err error
+		theNewValue, err = stInfo.ToModResult(mctx, cmdArgs, i, attrs, tmpl, theOldValue, theNewValue)
+		if err != nil {
+			return err
+		}
 	}
 
 	// 指令信息
@@ -352,7 +367,9 @@ func cmdStValueMod(mctx *MsgContext, tmpl *GameSystemTemplate, attrs *Attributes
 	})
 
 	if isSetNew {
-		attrs.Store(i.name, theNewValue)
+		if err := attrs.Store(i.name, theNewValue); err != nil {
+			return err
+		}
 	}
 
 	VarSetValueStr(mctx, "$t属性", i.name)
@@ -361,6 +378,7 @@ func cmdStValueMod(mctx *MsgContext, tmpl *GameSystemTemplate, attrs *Attributes
 	VarSetValue(mctx, "$t变化量", theModValue)
 	VarSetValueStr(mctx, "$t增加或扣除", signText)
 	VarSetValueStr(mctx, "$t表达式文本", i.expr)
+	return nil
 }
 
 type stSetOrModInfoItem struct {
@@ -408,69 +426,62 @@ func cmdStReadOrMod(ctx *MsgContext, tmpl *GameSystemTemplate, text string) (r *
 	return vm.Ret, toSetItems, toModItems, err
 }
 
-func cmdStCharFormat1(mctx *MsgContext, tmpl *GameSystemTemplate, vars *ds.ValueMap) {
-	if tmpl != nil {
-		toRemove := map[string]bool{}
-		toAdd := map[string]*ds.VMValue{}
-
-		// 先转存一次的原因是后面获取默认值时，可能会死锁
-		// TODO: 对新的map来说这个问题是否也存在？
-		backups := map[string]*ds.VMValue{}
-		vars.Range(func(key string, value *ds.VMValue) bool {
-			backups[key] = value
-			return true
-		})
-
-		for key, v := range backups {
-			newKey := tmpl.GetAlias(key)
-			// TODO: 打个标记，这里是否在默认模板卡的属性只能为整数？
-			if v.TypeId == ds.VMTypeInt {
-				// val, detail, calculated, exists2
-				val, _, _, exists := tmpl.GetDefaultValueEx0(mctx, newKey)
-				if exists && ds.ValueEqual(val, v, false) {
-					// 与默认值相同，可以从数据中移除
-					toRemove[key] = true
-					continue
-				}
-			}
-
-			if key != newKey {
-				toRemove[key] = true
-			}
-
-			toAdd[newKey] = v
-		}
-
-		for k := range toRemove {
-			vars.Delete(k)
-		}
-		for k, v := range toAdd {
-			vars.Store(k, v)
-		}
+func cmdStSetCardType(mctx *MsgContext, attrs *AttributesItem, cardType string) error {
+	if err := attrs.SetSheetType(cardType); err != nil {
+		return err
 	}
+	if tmpl, _ := mctx.Dice.GameSystemMap.Load(cardType); tmpl != nil && strings.TrimSpace(tmpl.Version) != "" {
+		return attrs.Store(attrsTemplateVersionKey, ds.NewStrVal(tmpl.Version))
+	}
+	return nil
 }
 
-func cmdStCharFormat(mctx *MsgContext, tmpl *GameSystemTemplate) {
-	attrs := lo.Must(mctx.Dice.AttrsManager.LoadByCtx(mctx))
-
+func cmdStCharFormat(mctx *MsgContext, tmpl *GameSystemTemplate) error {
+	attrs, err := mctx.Dice.AttrsManager.LoadByCtx(mctx)
+	if err != nil {
+		return err
+	}
 	if tmpl != nil {
-		cmdStCharFormat1(mctx, tmpl, attrs.valueMap) // 这里不标记值改动，因为SetSheetType会做
-		err := mctx.Dice.AttrsManager.CheckAndFreeUnused()
-		if err != nil {
-			logger.M().Errorf("check and free unused attrs error: %v", err)
-			return
+		var toRemove []string
+		toAdd := map[string]*ds.VMValue{}
+		// Range 在锁外遍历快照；默认值可能经 VM 回读同一个 DomainTx，
+		// 必须先准备变更，不能在 MutateValues 的事务锁内求值。
+		attrs.Range(func(key string, value *ds.VMValue) bool {
+			newKey := tmpl.GetAlias(key)
+			// TODO: 打个标记，这里是否在默认模板卡的属性只能为整数？
+			if value.TypeId == ds.VMTypeInt {
+				defaultValue, _, _, exists := tmpl.GetDefaultValueEx0(mctx, newKey)
+				if exists && ds.ValueEqual(defaultValue, value, false) {
+					toRemove = append(toRemove, key)
+					return true
+				}
+			}
+			if key != newKey {
+				toRemove = append(toRemove, key)
+			}
+			toAdd[newKey] = value
+			return true
+		})
+		if err = attrs.MutateValues(func(values *ds.ValueMap) {
+			for _, key := range toRemove {
+				values.Delete(key)
+			}
+			for key, value := range toAdd {
+				values.Store(key, value)
+			}
+		}); err != nil {
+			return err
 		}
 	}
-
-	attrs.SetSheetType(mctx.Group.System)
+	return cmdStSetCardType(mctx, attrs, mctx.Group.System())
 }
 
 type CmdStOverrideInfo struct {
-	ToSet        func(ctx *MsgContext, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate) bool
-	ToMod        func(ctx *MsgContext, args *CmdArgs, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate) bool
-	ToModResult  func(ctx *MsgContext, args *CmdArgs, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate, theOldValue, theNewValue *ds.VMValue) *ds.VMValue
+	ToSet        func(ctx *MsgContext, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate) (bool, error)
+	ToMod        func(ctx *MsgContext, args *CmdArgs, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate) (bool, error)
+	ToModResult  func(ctx *MsgContext, args *CmdArgs, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate, theOldValue, theNewValue *ds.VMValue) (*ds.VMValue, error)
 	ToShow       func(ctx *MsgContext, key string, val *ds.VMValue, tmpl *GameSystemTemplate) string
-	ToExport     func(ctx *MsgContext, key string, val *ds.VMValue, tmpl *GameSystemTemplate) string
+	ToExport     func(ctx *MsgContext, key string, val *ds.VMValue, tmpl *GameSystemTemplate) (string, error)
 	CommandSolve func(ctx *MsgContext, msg *Message, args *CmdArgs) *CmdExecuteResult
 	Help         string
 	HelpPrefix   string
@@ -507,10 +518,15 @@ func getCmdStBase(soi CmdStOverrideInfo) *CmdItemInfo {
 			val := cmdArgs.GetArgN(1)
 			mctx := GetCtxProxyFirst(ctx, cmdArgs)
 
-			attrs := lo.Must(dice.AttrsManager.LoadByCtx(mctx))
-			cardType := ReadCardType(mctx)
+			attrs, err := dice.AttrsManager.LoadByCtx(mctx)
+			if err != nil {
+				mctx.setExecutionError(err)
+				ReplyToSender(mctx, msg, "读取角色卡失败："+err.Error())
+				return CmdExecuteResult{Matched: true, Solved: true}
+			}
+			cardType := attrs.SheetType()
 
-			tmpl := ctx.Group.GetCharTemplate(dice)
+			tmpl := mctx.Group.GetCharTemplate(dice)
 			// 立即设置SystemTemplate，确保VM创建时能使用正确的模板
 			ctx.SystemTemplate = tmpl
 			mctx.SystemTemplate = tmpl
@@ -552,6 +568,7 @@ func getCmdStBase(soi CmdStOverrideInfo) *CmdItemInfo {
 				pickItems, limit := cmdStGetPickItemAndLimit(tmplShow, cmdArgs)
 				items, droppedByLimit, err := cmdStGetItemsForShow(mctx, tmplShow, pickItems, limit, &soi)
 				if err != nil {
+					mctx.setExecutionError(err)
 					ReplyToSender(mctx, msg, err.Error())
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
@@ -588,12 +605,16 @@ func getCmdStBase(soi CmdStOverrideInfo) *CmdItemInfo {
 
 				info := infoBuilder.String()
 				VarSetValueStr(mctx, "$t属性信息", info)
-				extra := ReadCardTypeEx(mctx, tmpl.Name)
+				extra := ""
+				if currentType := attrs.SheetType(); currentType != "" && currentType != tmpl.Name {
+					extra = fmt.Sprintf("\n这似乎是一张 %s 人物卡，请确认当前游戏类型", currentType)
+				}
 				ReplyToSender(mctx, msg, DiceFormatTmpl(mctx, "COC:属性设置_列出")+extra)
 
 			case "export":
 				items, _, err := cmdStGetItemsForExport(mctx, tmpl, &soi)
 				if err != nil {
+					mctx.setExecutionError(err)
 					ReplyToSender(mctx, msg, err.Error())
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
@@ -626,8 +647,12 @@ func getCmdStBase(soi CmdStOverrideInfo) *CmdItemInfo {
 
 					val := attrs.Load(vname)
 					if val != nil {
+						if err = attrs.Delete(vname); err != nil {
+							mctx.setExecutionError(err)
+							ReplyToSender(mctx, msg, "删除属性失败："+err.Error())
+							return CmdExecuteResult{Matched: true, Solved: true}
+						}
 						nums = append(nums, vname)
-						attrs.Delete(vname)
 					} else {
 						failed = append(failed, vname)
 					}
@@ -637,22 +662,42 @@ func getCmdStBase(soi CmdStOverrideInfo) *CmdItemInfo {
 				VarSetValueInt64(mctx, "$t失败数量", int64(len(failed)))
 				ReplyToSender(mctx, msg, DiceFormatTmpl(mctx, "COC:属性设置_删除"))
 			case "clr", "clear":
-				num := attrs.Clear()
-				attrs.SetSheetType("")
+				num := 0
+				if err = attrs.MutateValues(func(values *ds.ValueMap) {
+					num = values.Length()
+					values.Clear()
+				}); err != nil {
+					mctx.setExecutionError(err)
+					ReplyToSender(mctx, msg, "清除属性失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
+				if err = attrs.SetSheetType(""); err != nil {
+					mctx.setExecutionError(err)
+					ReplyToSender(mctx, msg, "清除角色卡类型失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				VarSetValueInt64(mctx, "$t数量", int64(num))
 				ReplyToSender(mctx, msg, DiceFormatTmpl(mctx, "COC:属性设置_清除"))
 
 			case "fmt", "format":
-				cmdStCharFormat(mctx, tmpl)
-				ReplyToSender(mctx, msg, "角色卡片类型被强制修改为: "+ctx.Group.System)
+				if err = cmdStCharFormat(mctx, tmpl); err != nil {
+					mctx.setExecutionError(err)
+					ReplyToSender(mctx, msg, "转换角色卡失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
+				ReplyToSender(mctx, msg, "角色卡片类型被强制修改为: "+mctx.Group.System())
 
 			default:
-				if cardType != "" && cardType != mctx.Group.System {
-					ReplyToSender(mctx, msg, fmt.Sprintf("阻止操作：当前卡规则为 %s，群规则为 %s。\n为避免损坏此人物卡，请先更换角色卡，或使用.st fmt强制转卡", cardType, mctx.Group.System))
+				if cardType != "" && cardType != mctx.Group.System() {
+					ReplyToSender(mctx, msg, fmt.Sprintf("阻止操作：当前卡规则为 %s，群规则为 %s。\n为避免损坏此人物卡，请先更换角色卡，或使用.st fmt强制转卡", cardType, mctx.Group.System()))
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 
-				cmdStCharFormat(mctx, tmpl) // 转一下卡
+				if err = cmdStCharFormat(mctx, tmpl); err != nil {
+					mctx.setExecutionError(err)
+					ReplyToSender(mctx, msg, "转换角色卡失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				// SystemTemplate已经在函数开始时设置，这里不需要重复设置
 
 				// 进行简化卡的尝试解析
@@ -690,18 +735,22 @@ func getCmdStBase(soi CmdStOverrideInfo) *CmdItemInfo {
 						// 确定不是属性了，现在作为角色名处理
 						input = input[len(matches[1]):]
 
-						p := mctx.Player
-						VarSetValueStr(mctx, "$t旧昵称", fmt.Sprintf("<%s>", mctx.Player.Name))
-						VarSetValueStr(mctx, "$t旧昵称_RAW", mctx.Player.Name)
-						p.Name = name
-						VarSetValueStr(mctx, "$t玩家", fmt.Sprintf("<%s>", mctx.Player.Name))
-						VarSetValueStr(mctx, "$t玩家_RAW", mctx.Player.Name)
-						if mctx.Group != nil {
-							mctx.Group.MarkDirty(mctx.Dice)
+						VarSetValueStr(mctx, "$t旧昵称", fmt.Sprintf("<%s>", mctx.Player.Name()))
+						VarSetValueStr(mctx, "$t旧昵称_RAW", mctx.Player.Name())
+						if err = mctx.Player.SetName(name); err != nil {
+							mctx.setExecutionError(err)
+							ReplyToSender(mctx, msg, "修改角色名失败："+err.Error())
+							return CmdExecuteResult{Matched: true, Solved: true}
 						}
+						VarSetValueStr(mctx, "$t玩家", fmt.Sprintf("<%s>", mctx.Player.Name()))
+						VarSetValueStr(mctx, "$t玩家_RAW", mctx.Player.Name())
 
-						if mctx.Player.AutoSetNameTemplate != "" {
-							_, _ = SetPlayerGroupCardByTemplate(mctx, mctx.Player.AutoSetNameTemplate)
+						if template := mctx.Player.AutoSetNameTemplate(); template != "" {
+							if _, err = SetPlayerGroupCardByTemplate(mctx, template); err != nil {
+								mctx.setExecutionError(err)
+								ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+								return CmdExecuteResult{Matched: true, Solved: true}
+							}
 						}
 					}
 				}
@@ -723,7 +772,12 @@ func getCmdStBase(soi CmdStOverrideInfo) *CmdItemInfo {
 					for _, i := range toSetItems {
 						var skip bool
 						if soi.ToSet != nil {
-							skip = soi.ToSet(ctx, i, attrs, tmpl)
+							skip, err = soi.ToSet(mctx, i, attrs, tmpl)
+							if err != nil {
+								mctx.setExecutionError(err)
+								ReplyToSender(mctx, msg, "设置属性失败："+err.Error())
+								return CmdExecuteResult{Matched: true, Solved: true}
+							}
 						}
 
 						if !skip {
@@ -740,7 +794,11 @@ func getCmdStBase(soi CmdStOverrideInfo) *CmdItemInfo {
 									continue
 								}
 							}
-							attrs.Store(i.name, i.value)
+							if err = attrs.Store(i.name, i.value); err != nil {
+								mctx.setExecutionError(err)
+								ReplyToSender(mctx, msg, "设置属性失败："+err.Error())
+								return CmdExecuteResult{Matched: true, Solved: true}
+							}
 						}
 						validNum++
 					}
@@ -748,7 +806,11 @@ func getCmdStBase(soi CmdStOverrideInfo) *CmdItemInfo {
 					VarSetValueInt64(mctx, "$t有效数量", validNum)
 					VarSetValueInt64(mctx, "$t同义词数量", int64(0)) // 废弃
 					text = DiceFormatTmpl(mctx, "COC:属性设置")
-					SetCardType(mctx, tmpl.Name)
+					if err = cmdStSetCardType(mctx, attrs, tmpl.Name); err != nil {
+						mctx.setExecutionError(err)
+						ReplyToSender(mctx, msg, "设置角色卡类型失败："+err.Error())
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
 				}
 
 				// 处理变更属性
@@ -759,15 +821,19 @@ func getCmdStBase(soi CmdStOverrideInfo) *CmdItemInfo {
 					commandInfo := map[string]interface{}{
 						"cmd":    "st",
 						"rule":   cardType,
-						"pcName": mctx.Player.Name,
+						"pcName": mctx.Player.Name(),
 						"items":  []interface{}{},
 					}
 
 					var textItems []string
 					var appendedText []string
-					chName := lo.Must(mctx.Dice.AttrsManager.LoadByCtx(mctx)).Name
+					chName := attrs.Name()
 					for _, i := range toModItems {
-						cmdStValueMod(mctx, tmpl, attrs, commandInfo, i, cmdArgs, &soi)
+						if err = cmdStValueMod(mctx, tmpl, attrs, commandInfo, i, cmdArgs, &soi); err != nil {
+							mctx.setExecutionError(err)
+							ReplyToSender(mctx, msg, "修改属性失败："+err.Error())
+							return CmdExecuteResult{Matched: true, Solved: true}
+						}
 						VarSetValueStr(mctx, "$t当前绑定角色", chName)
 						text2 := DiceFormatTmpl(mctx, "COC:属性设置_增减_单项")
 						textItems = append(textItems, text2)
@@ -784,8 +850,11 @@ func getCmdStBase(soi CmdStOverrideInfo) *CmdItemInfo {
 					}
 
 					ctx.CommandInfo = commandInfo
-					attrs.SetModified()
-					SetCardType(mctx, tmpl.Name)
+					if err = cmdStSetCardType(mctx, attrs, tmpl.Name); err != nil {
+						mctx.setExecutionError(err)
+						ReplyToSender(mctx, msg, "设置角色卡类型失败："+err.Error())
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
 				}
 
 				if rRestIput != "" {
@@ -795,8 +864,12 @@ func getCmdStBase(soi CmdStOverrideInfo) *CmdItemInfo {
 				ReplyToSender(mctx, msg, text)
 			}
 
-			if ctx.Player.AutoSetNameTemplate != "" {
-				_, _ = SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
+			if template := mctx.Player.AutoSetNameTemplate(); template != "" {
+				if _, err = SetPlayerGroupCardByTemplate(mctx, template); err != nil {
+					mctx.setExecutionError(err)
+					ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 			}
 
 			return CmdExecuteResult{Matched: true, Solved: true}

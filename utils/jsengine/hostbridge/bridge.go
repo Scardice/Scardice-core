@@ -17,22 +17,63 @@ var (
 	ErrNoPrimitiveValue  = errors.New("host value has no primitive representation")
 )
 
+// callbackHandoff lets codecs keep decoded callbacks provisional until the
+// bridge actually gives them to Go. Each commit covers only values decoded
+// since the prior commit, so a partially successful slice push keeps its prefix.
+type callbackHandoff interface {
+	CommitCallbacks()
+}
+
+func commitCallbacks(codec RuntimeValueCodec) {
+	if handoff, ok := codec.(callbackHandoff); ok {
+		handoff.CommitCallbacks()
+	}
+}
+
 func (s *Session) BindObject(target any) (HostRef, error) { return s.RegisterObject(target) }
 func (s *Session) ExposeDangerous(target any) (HostRef, error) {
 	return s.registerObject(target, true)
 }
 
 func (s *Session) Get(ref HostRef, name string) (Value, error) {
+	return s.get(ref, name, nil)
+}
+
+func (s *Session) GetWithCodec(ref HostRef, name string, codec RuntimeValueCodec) (Value, error) {
+	return s.get(ref, name, codec)
+}
+
+func (s *Session) get(ref HostRef, name string, codec RuntimeValueCodec) (Value, error) {
 	entry, err := s.lookupEntry(ref)
 	if err != nil {
 		return UndefinedValue(), err
 	}
+	if entry.controlled != nil {
+		raw, exists, err := entry.controlled.HostGet(name)
+		if err != nil {
+			return UndefinedValue(), err
+		}
+		if !exists {
+			return UndefinedValue(), nil
+		}
+		// A controlled function is an operation of its owner: one live entry
+		// per owner and name, released with the owner's last proxy, and
+		// resolved through HostGet again at call time.
+		if fn := reflect.ValueOf(raw); fn.IsValid() && fn.Kind() == reflect.Func && !fn.IsNil() {
+			function, opErr := s.registerOperation(ref, name)
+			if opErr != nil {
+				return UndefinedValue(), opErr
+			}
+			return HostFunctionValue(function), nil
+		}
+		return s.encodeAny(raw, false, codec)
+	}
 	obj := entry.value
 	if obj.Kind() == reflect.Map {
-		return s.mapGet(obj, name, entry.dangerous)
+		return s.mapGet(obj, name, entry.dangerous, codec)
 	}
 	if obj.Kind() == reflect.Slice {
-		return s.sliceGet(ref, obj, name, entry.dangerous)
+		return s.sliceGet(ref, obj, name, entry.dangerous, codec)
 	}
 	if obj.Kind() == reflect.Pointer && obj.Elem().Kind() == reflect.Struct {
 		field, lock, ok, err := s.structFieldMode(obj, name, entry.dangerous)
@@ -44,7 +85,7 @@ func (s *Session) Get(ref HostRef, name string) (Value, error) {
 				lock.RLock()
 				defer lock.RUnlock()
 			}
-			return s.toValueMode(field, entry.dangerous)
+			return s.encodeReflect(field, entry.dangerous, codec)
 		}
 		if method, ok := obj.Type().MethodByName(exportedMethod(name)); ok {
 			function, err := s.registerOperation(ref, method.Name)
@@ -67,10 +108,82 @@ func (s *Session) Set(ref HostRef, name string, value Value) error {
 func (s *Session) SetWithCodec(ref HostRef, name string, value Value, codec RuntimeValueCodec) error {
 	return s.set(ref, name, value, codec)
 }
+
+// SetRuntimeNative lets a runtime store an engine-native value directly into a
+// struct field whose declared type only that runtime can represent (for
+// example a live Goja value). accept receives the field type and reports
+// whether the runtime owns it; when it does not, nothing is written and the
+// caller falls back to the portable SetWithCodec path.
+func (s *Session) SetRuntimeNative(ref HostRef, name string, accept func(reflect.Type) (reflect.Value, bool, error)) (bool, error) {
+	entry, err := s.lookupEntry(ref)
+	if err != nil {
+		return false, err
+	}
+	if entry.controlled != nil {
+		return false, nil
+	}
+	obj := entry.value
+	if obj.Kind() != reflect.Pointer || obj.IsNil() || obj.Elem().Kind() != reflect.Struct {
+		return false, nil
+	}
+	field, lock, ok, err := s.structFieldMode(obj, name, entry.dangerous)
+	if err != nil || !ok {
+		return false, err
+	}
+	if !field.CanSet() {
+		return false, nil
+	}
+	converted, owned, err := accept(field.Type())
+	if err != nil || !owned {
+		return false, err
+	}
+	if lock != nil {
+		lock.Lock()
+		defer lock.Unlock()
+	}
+	field.Set(converted)
+	return true, nil
+}
+
+// GetRuntimeNative is the read counterpart of SetRuntimeNative. accept runs
+// while the field lock is held and may return an engine-native value so a live
+// runtime object is handed back unchanged instead of a portable snapshot.
+func (s *Session) GetRuntimeNative(ref HostRef, name string, accept func(reflect.Value) (any, bool, error)) (any, bool, error) {
+	entry, err := s.lookupEntry(ref)
+	if err != nil {
+		return nil, false, err
+	}
+	if entry.controlled != nil {
+		return nil, false, nil
+	}
+	obj := entry.value
+	if obj.Kind() != reflect.Pointer || obj.IsNil() || obj.Elem().Kind() != reflect.Struct {
+		return nil, false, nil
+	}
+	field, lock, ok, err := s.structFieldMode(obj, name, entry.dangerous)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	if lock != nil {
+		lock.RLock()
+		defer lock.RUnlock()
+	}
+	return accept(field)
+}
 func (s *Session) set(ref HostRef, name string, value Value, codec RuntimeValueCodec) error {
 	entry, err := s.lookupEntry(ref)
 	if err != nil {
 		return err
+	}
+	if entry.controlled != nil {
+		if value.Kind == KindNull || value.Kind == KindUndefined {
+			return entry.controlled.HostSet(name, nil)
+		}
+		decoded, err := s.toHostAny(value)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		return entry.controlled.HostSet(name, decoded)
 	}
 	obj := entry.value
 	if obj.Kind() == reflect.Map {
@@ -81,6 +194,7 @@ func (s *Session) set(ref HostRef, name string, value Value, codec RuntimeValueC
 		if err != nil {
 			return fmt.Errorf("map value: %w", err)
 		}
+		commitCallbacks(codec)
 		obj.SetMapIndex(reflect.ValueOf(name).Convert(obj.Type().Key()), item)
 		return nil
 	}
@@ -106,6 +220,7 @@ func (s *Session) set(ref HostRef, name string, value Value, codec RuntimeValueC
 		if err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
+		commitCallbacks(codec)
 		field.Set(converted)
 		return nil
 	}
@@ -116,6 +231,10 @@ func (s *Session) Has(ref HostRef, name string) (bool, error) {
 	entry, err := s.lookupEntry(ref)
 	if err != nil {
 		return false, err
+	}
+	if entry.controlled != nil {
+		_, exists, err := entry.controlled.HostGet(name)
+		return exists, err
 	}
 	obj := entry.value
 	switch obj.Kind() {
@@ -146,10 +265,16 @@ func (s *Session) Has(ref HostRef, name string) (bool, error) {
 }
 
 func (s *Session) Delete(ref HostRef, name string) (bool, error) {
-	obj, err := s.LookupObject(ref)
+	entry, err := s.lookupEntry(ref)
 	if err != nil {
 		return false, err
 	}
+	if entry.controlled != nil {
+		// ControlledObject intentionally has no delete mutation. Never fall
+		// through to reflection for a domain handle.
+		return false, nil
+	}
+	obj := entry.value
 	if obj.Kind() == reflect.Map {
 		obj.SetMapIndex(reflect.ValueOf(name).Convert(obj.Type().Key()), reflect.Value{})
 		return true, nil
@@ -161,6 +286,9 @@ func (s *Session) Keys(ref HostRef) ([]string, error) {
 	entry, err := s.lookupEntry(ref)
 	if err != nil {
 		return nil, err
+	}
+	if entry.controlled != nil {
+		return append([]string(nil), entry.controlled.HostKeys()...), nil
 	}
 	obj := entry.value
 	if obj.Kind() == reflect.Map {
@@ -184,12 +312,7 @@ func (s *Session) Keys(ref HostRef) ([]string, error) {
 		seen := map[string]bool{}
 		keys := []string{}
 		for _, field := range reflect.VisibleFields(typ) {
-			names := []string{}
-			if entry.dangerous {
-				names = dangerousBindNames(field)
-			} else if n, ok := jsBindName(field); ok {
-				names = []string{n}
-			}
+			names := s.fieldBindNames(typ, field, entry.dangerous)
 			for _, n := range names {
 				if !seen[n] {
 					keys = append(keys, n)
@@ -212,14 +335,58 @@ func (s *Session) Keys(ref HostRef) ([]string, error) {
 func (s *Session) Call(ref HostRef, name string, args []Value) (Value, error) {
 	return s.call(ref, name, args, nil)
 }
+
+// ResizeSlice changes the length of a slice HostRef for adapters that expose
+// native array semantics. A non-addressable slice may still retain its length
+// and mutate existing elements, but its header cannot be resized.
+func (s *Session) ResizeSlice(ref HostRef, length int) error {
+	if length < 0 {
+		return errors.New("slice length must not be negative")
+	}
+	entry, err := s.lookupEntry(ref)
+	if err != nil {
+		return err
+	}
+	if entry.controlled != nil || entry.value.Kind() != reflect.Slice {
+		return fmt.Errorf("HostRef %d is not a slice", ref)
+	}
+	obj := entry.value
+	if obj.Len() == length {
+		return nil
+	}
+	if !obj.CanSet() {
+		return errors.New("slice length is read-only")
+	}
+	if length < obj.Len() {
+		obj.Set(obj.Slice(0, length))
+		return nil
+	}
+	obj.Set(reflect.AppendSlice(obj, reflect.MakeSlice(obj.Type(), length-obj.Len(), length-obj.Len())))
+	return nil
+}
 func (s *Session) CallWithCodec(ref HostRef, name string, args []Value, codec RuntimeValueCodec) (Value, error) {
 	return s.call(ref, name, args, codec)
 }
 func (s *Session) call(ref HostRef, name string, args []Value, codec RuntimeValueCodec) (result Value, err error) {
-	obj, err := s.LookupObject(ref)
+	entry, err := s.lookupEntry(ref)
 	if err != nil {
 		return UndefinedValue(), err
 	}
+	if entry.controlled != nil {
+		raw, exists, err := entry.controlled.HostGet(name)
+		if err != nil {
+			return UndefinedValue(), err
+		}
+		if !exists {
+			return UndefinedValue(), fmt.Errorf("HostRef %d has no callable property %q", ref, name)
+		}
+		fn := reflect.ValueOf(raw)
+		if !fn.IsValid() || fn.Kind() != reflect.Func || fn.IsNil() {
+			return UndefinedValue(), fmt.Errorf("HostRef %d property %q is not callable", ref, name)
+		}
+		return s.callReflect(fn, args, name, codec, false)
+	}
+	obj := entry.value
 	if obj.Kind() == reflect.Slice && name == "push" {
 		var n = int64(obj.Len())
 		for _, arg := range args {
@@ -230,6 +397,7 @@ func (s *Session) call(ref HostRef, name string, args []Value, codec RuntimeValu
 			if !obj.CanSet() {
 				return UndefinedValue(), errors.New("slice is read-only")
 			}
+			commitCallbacks(codec)
 			obj.Set(reflect.Append(obj, item))
 			n++
 		}
@@ -300,17 +468,14 @@ func (s *Session) callReflect(fn reflect.Value, args []Value, label string, code
 	if offset > 0 {
 		callInputs = append([]reflect.Value{argsToReceiver(args[0], ft.In(0), s)}, inputs...)
 	}
+	commitCallbacks(codec)
 	outs := fn.Call(callInputs)
-	return s.outputs(outs)
+	return s.outputs(outs, codec)
 }
 func (s *Session) structFieldMode(obj reflect.Value, name string, dangerous bool) (reflect.Value, *sync.RWMutex, bool, error) {
-	for _, def := range reflect.VisibleFields(obj.Elem().Type()) {
-		names := []string{}
-		if dangerous {
-			names = dangerousBindNames(def)
-		} else if n, ok := jsBindName(def); ok {
-			names = []string{n}
-		}
+	typ := obj.Elem().Type()
+	for _, def := range reflect.VisibleFields(typ) {
+		names := s.fieldBindNames(typ, def, dangerous)
 		for _, n := range names {
 			if n != name {
 				continue
@@ -370,7 +535,7 @@ func dangerousBindNames(field reflect.StructField) []string {
 	}
 	return result
 }
-func (s *Session) outputs(outs []reflect.Value) (Value, error) {
+func (s *Session) outputs(outs []reflect.Value, codec RuntimeValueCodec) (Value, error) {
 	if len(outs) > 0 && outs[len(outs)-1].Type() == errorType {
 		e := outs[len(outs)-1]
 		outs = outs[:len(outs)-1]
@@ -381,7 +546,7 @@ func (s *Session) outputs(outs []reflect.Value) (Value, error) {
 	if len(outs) == 0 {
 		return UndefinedValue(), nil
 	}
-	return s.toValue(outs[0])
+	return s.encodeReflect(outs[0], false, codec)
 }
 
 func hostFieldByIndex(value reflect.Value, index []int) reflect.Value {
@@ -399,6 +564,42 @@ func hostFieldByIndex(value reflect.Value, index []int) reflect.Value {
 	}
 	return value
 }
+func (s *Session) fieldBindNames(typ reflect.Type, field reflect.StructField, dangerous bool) []string {
+	if dangerous {
+		return dangerousBindNames(field)
+	}
+	if !s.gojaFields {
+		if name, ok := jsBindName(field); ok {
+			return []string{name}
+		}
+		return nil
+	}
+	if field.PkgPath != "" {
+		return nil
+	}
+	if tag, ok := field.Tag.Lookup("jsbindgoja"); ok {
+		name := strings.Split(tag, ",")[0]
+		if name != "-" && isIdentifier(name) {
+			return []string{name}
+		}
+		return nil
+	}
+	name, ok := jsBindName(field)
+	if !ok {
+		return nil
+	}
+	for _, candidate := range reflect.VisibleFields(typ) {
+		tag, exists := candidate.Tag.Lookup("jsbindgoja")
+		if !exists {
+			continue
+		}
+		if legacyName := strings.Split(tag, ",")[0]; legacyName == name {
+			return nil
+		}
+	}
+	return []string{name}
+}
+
 func jsBindName(field reflect.StructField) (string, bool) {
 	if field.PkgPath != "" {
 		return "", false
@@ -437,8 +638,18 @@ func lowerFirst(name string) string {
 	return strings.ToLower(name[:1]) + name[1:]
 }
 
-func (s *Session) toValue(v reflect.Value) (Value, error) {
-	return s.toValueMode(v, false)
+func (s *Session) encodeAny(raw any, dangerous bool, codec RuntimeValueCodec) (Value, error) {
+	if raw == nil {
+		return NullValue(), nil
+	}
+	return s.encodeReflect(reflect.ValueOf(raw), dangerous, codec)
+}
+
+func (s *Session) encodeReflect(value reflect.Value, dangerous bool, codec RuntimeValueCodec) (Value, error) {
+	if codec != nil && !dangerous {
+		return codec.Encode(value)
+	}
+	return s.toValueMode(value, dangerous)
 }
 
 func (s *Session) toValueMode(v reflect.Value, dangerous bool) (Value, error) {
@@ -451,13 +662,29 @@ func (s *Session) toValueMode(v reflect.Value, dangerous bool) (Value, error) {
 	if !v.IsValid() {
 		return UndefinedValue(), nil
 	}
-	if (v.Kind() == reflect.Pointer || v.Kind() == reflect.Map || v.Kind() == reflect.Slice) && v.IsNil() {
+	kind := v.Kind()
+	if kind == reflect.Slice && v.IsNil() {
+		v = reflect.MakeSlice(v.Type(), 0, 0)
+	}
+	if kind == reflect.Map && v.IsNil() {
+		v = reflect.MakeMap(v.Type())
+	}
+	if kind == reflect.Pointer && v.IsNil() {
 		return NullValue(), nil
 	}
-	if v.Kind() == reflect.Func && v.IsNil() {
+	if kind == reflect.Func && v.IsNil() {
 		return UndefinedValue(), nil
 	}
-	switch v.Kind() {
+	if v.CanInterface() {
+		if _, controlled := v.Interface().(ControlledObject); controlled {
+			ref, err := s.registerObject(v.Interface(), false)
+			if err != nil {
+				return UndefinedValue(), err
+			}
+			return HostObjectValue(ref), nil
+		}
+	}
+	switch kind {
 	case reflect.Bool:
 		return BoolValue(v.Bool()), nil
 	case reflect.String:
@@ -514,7 +741,7 @@ func (s *Session) toGo(v Value, target reflect.Type, codec RuntimeValueCodec) (r
 	}
 	if v.Kind == KindJSON {
 		switch target.Kind() {
-		case reflect.Map, reflect.Slice, reflect.Interface:
+		case reflect.Map, reflect.Slice, reflect.Interface, reflect.Struct, reflect.Pointer:
 			decoded := reflect.New(target)
 			if err := json.Unmarshal([]byte(v.String), decoded.Interface()); err != nil {
 				return reflect.Value{}, fmt.Errorf("decode JSON snapshot into %s: %w", target, err)
@@ -524,14 +751,37 @@ func (s *Session) toGo(v Value, target reflect.Type, codec RuntimeValueCodec) (r
 			return reflect.Value{}, fmt.Errorf("JSON snapshot cannot be assigned to %s", target)
 		}
 	}
-	if target.Kind() == reflect.Interface {
-		if v.Kind == KindHostObject {
-			obj, err := s.LookupObject(v.Host)
+	if v.Kind == KindHostObject {
+		entry, err := s.lookupEntry(v.Host)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		if entry.controlled != nil {
+			raw, err := entry.controlled.HostUnwrap(target)
 			if err != nil {
-				return reflect.Value{}, err
+				return reflect.Value{}, fmt.Errorf("HostRef %d cannot unwrap as %s: %w", v.Host, target, err)
 			}
+			return checkedUnwrapValue(raw, target)
+		}
+		obj := entry.value
+		if obj.Type().AssignableTo(target) {
 			return obj, nil
 		}
+		if obj.Type().ConvertibleTo(target) {
+			return obj.Convert(target), nil
+		}
+		if obj.Kind() == reflect.Pointer && !obj.IsNil() {
+			elem := obj.Elem()
+			if elem.Type().AssignableTo(target) {
+				return elem, nil
+			}
+			if elem.Type().ConvertibleTo(target) {
+				return elem.Convert(target), nil
+			}
+		}
+		return reflect.Value{}, fmt.Errorf("expected %s Host API object", target)
+	}
+	if target.Kind() == reflect.Interface {
 		switch v.Kind {
 		case KindNull, KindUndefined:
 			return reflect.Zero(target), nil
@@ -540,23 +790,14 @@ func (s *Session) toGo(v Value, target reflect.Type, codec RuntimeValueCodec) (r
 			if err != nil {
 				return reflect.Value{}, err
 			}
-			return reflect.ValueOf(raw), nil
+			value := reflect.ValueOf(raw)
+			if !value.Type().AssignableTo(target) {
+				return reflect.Value{}, fmt.Errorf("%T is not assignable to %s", raw, target)
+			}
+			return value, nil
 		}
 	}
-	if target.Kind() == reflect.Pointer || target.Kind() == reflect.Map || target.Kind() == reflect.Slice {
-		if v.Kind != KindHostObject {
-			return reflect.Value{}, fmt.Errorf("expected %s Host API object", target)
-		}
-		obj, err := s.LookupObject(v.Host)
-		if err != nil {
-			return reflect.Value{}, err
-		}
-		if obj.Type().AssignableTo(target) {
-			return obj, nil
-		}
-		if obj.Type().ConvertibleTo(target) {
-			return obj.Convert(target), nil
-		}
+	if target.Kind() == reflect.Pointer || target.Kind() == reflect.Map || target.Kind() == reflect.Slice || target.Kind() == reflect.Struct {
 		return reflect.Value{}, fmt.Errorf("expected %s Host API object", target)
 	}
 	if target.Kind() == reflect.Func {
@@ -609,6 +850,64 @@ func (s *Session) toGo(v Value, target reflect.Type, codec RuntimeValueCodec) (r
 	}
 	return out, nil
 }
+func checkedUnwrapValue(raw any, target reflect.Type) (reflect.Value, error) {
+	if raw == nil {
+		if isNilable(target.Kind()) {
+			return reflect.Zero(target), nil
+		}
+		return reflect.Value{}, fmt.Errorf("HostUnwrap returned nil for %s", target)
+	}
+	value := reflect.ValueOf(raw)
+	if !value.Type().AssignableTo(target) {
+		return reflect.Value{}, fmt.Errorf("HostUnwrap returned %s, not assignable to %s", value.Type(), target)
+	}
+	return value, nil
+}
+
+func (s *Session) toHostAny(value Value) (any, error) {
+	switch value.Kind {
+	case KindBool:
+		return value.Bool, nil
+	case KindString:
+		return value.String, nil
+	case KindInt:
+		return value.Int, nil
+	case KindUint:
+		return value.Uint, nil
+	case KindFloat:
+		return value.Float, nil
+	case KindJSON:
+		var decoded any
+		if err := json.Unmarshal([]byte(value.String), &decoded); err != nil {
+			return nil, fmt.Errorf("decode JSON host value: %w", err)
+		}
+		return decoded, nil
+	case KindHostObject:
+		entry, err := s.lookupEntry(value.Host)
+		if err != nil {
+			return nil, err
+		}
+		if entry.controlled != nil {
+			return entry.controlled, nil
+		}
+		if !entry.value.IsValid() || !entry.value.CanInterface() {
+			return nil, fmt.Errorf("HostRef %d cannot be exported", value.Host)
+		}
+		return entry.value.Interface(), nil
+	case KindHostFunction:
+		entry, err := s.lookupFunctionEntry(value.Function)
+		if err != nil {
+			return nil, err
+		}
+		if !entry.value.IsValid() || !entry.value.CanInterface() {
+			return nil, fmt.Errorf("HostFuncRef %d cannot be exported without a target type", value.Function)
+		}
+		return entry.value.Interface(), nil
+	default:
+		return nil, fmt.Errorf("unsupported controlled setter value kind %d", value.Kind)
+	}
+}
+
 func (s *Session) valuePrimitive(v Value) (any, error) {
 	switch v.Kind {
 	case KindBool:
@@ -628,15 +927,15 @@ func (s *Session) valuePrimitive(v Value) (any, error) {
 	}
 }
 
-func (s *Session) mapGet(obj reflect.Value, name string, dangerous bool) (Value, error) {
+func (s *Session) mapGet(obj reflect.Value, name string, dangerous bool, codec RuntimeValueCodec) (Value, error) {
 	item := obj.MapIndex(reflect.ValueOf(name).Convert(obj.Type().Key()))
 	if !item.IsValid() {
 		return UndefinedValue(), nil
 	}
-	return s.toValueMode(item, dangerous)
+	return s.encodeReflect(item, dangerous, codec)
 }
 
-func (s *Session) sliceGet(ref HostRef, obj reflect.Value, name string, dangerous bool) (Value, error) {
+func (s *Session) sliceGet(ref HostRef, obj reflect.Value, name string, dangerous bool, codec RuntimeValueCodec) (Value, error) {
 	if name == "length" {
 		return IntValue(int64(obj.Len())), nil
 	}
@@ -654,23 +953,34 @@ func (s *Session) sliceGet(ref HostRef, obj reflect.Value, name string, dangerou
 	if i >= obj.Len() {
 		return UndefinedValue(), nil
 	}
-	return s.toValueMode(obj.Index(i), dangerous)
+	return s.encodeReflect(obj.Index(i), dangerous, codec)
 }
 func (s *Session) sliceSet(obj reflect.Value, name string, v Value, codec RuntimeValueCodec) error {
-	if !obj.CanSet() {
-		return errors.New("slice is read-only")
-	}
 	i, err := strconv.Atoi(name)
 	if err != nil || i < 0 {
 		return fmt.Errorf("invalid slice index %q", name)
-	}
-	for obj.Len() <= i {
-		obj.Set(reflect.Append(obj, reflect.Zero(obj.Type().Elem())))
 	}
 	item, err := s.toGo(v, obj.Type().Elem(), codec)
 	if err != nil {
 		return err
 	}
+	if !obj.CanSet() {
+		return errors.New("slice is read-only")
+	}
+	if i < obj.Len() {
+		// The addressable slice header is the mutation authority. Slice
+		// elements alone report CanSet even when the header was bound by value.
+		commitCallbacks(codec)
+		obj.Index(i).Set(item)
+		return nil
+	}
+	if !obj.CanSet() {
+		return errors.New("slice is read-only")
+	}
+	for obj.Len() <= i {
+		obj.Set(reflect.Append(obj, reflect.Zero(obj.Type().Elem())))
+	}
+	commitCallbacks(codec)
 	obj.Index(i).Set(item)
 	return nil
 }
@@ -680,7 +990,11 @@ func (s *Session) DecodeValue(value Value, target reflect.Type, codec RuntimeVal
 	if s == nil {
 		return reflect.Value{}, ErrSessionClosed
 	}
-	return s.toGo(value, target, codec)
+	decoded, err := s.toGo(value, target, codec)
+	if err == nil {
+		commitCallbacks(codec)
+	}
+	return decoded, err
 }
 
 // Callback creates a generation-checked reflect trampoline from an explicit
@@ -701,12 +1015,14 @@ func (s *Session) Callback(codec RuntimeValueCodec, source Value, target reflect
 		return reflect.Value{}, err
 	}
 	generation := s.Generation()
-	return reflect.MakeFunc(target, func(inputs []reflect.Value) []reflect.Value {
+	callback := reflect.MakeFunc(target, func(inputs []reflect.Value) []reflect.Value {
 		if s.Generation() != generation {
 			return staleResults(target)
 		}
 		return fn.Call(inputs)
-	}), nil
+	})
+	commitCallbacks(codec)
+	return callback, nil
 }
 func staleResults(target reflect.Type) []reflect.Value {
 	result := make([]reflect.Value, target.NumOut())

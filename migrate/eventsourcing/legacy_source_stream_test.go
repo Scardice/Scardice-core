@@ -64,7 +64,7 @@ func TestStreamLegacySQLiteNormalizesNullableScalarColumns(t *testing.T) {
 
 	var groupCreated groupstate.GroupCreatedV1
 	var playerCreated playerstate.PlayerCreatedV1
-	err = streamLegacySQLiteWithKeySource(context.Background(), path, "default", sqliteTargetKeySource{}, func(batch []SourceRecord) error {
+	err = streamLegacySQLiteWithDrops(context.Background(), path, "default", nil, func(batch []SourceRecord) error {
 		for _, record := range batch {
 			switch record.Kind {
 			case string(groupstate.EventGroupCreated):
@@ -90,7 +90,9 @@ func TestStreamLegacySQLiteNormalizesNullableScalarColumns(t *testing.T) {
 	}
 }
 
-func TestStreamLegacySQLiteReportsInvalidPlayerContext(t *testing.T) {
+// Without a drop recorder a player without identity still aborts: nothing may
+// be dropped silently. With one it is recorded (see the drop tests).
+func TestStreamLegacySQLiteWithoutRecorderReportsInvalidPlayerContext(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data.db")
 	createLegacySQLiteFixture(t, path)
 	database, err := sql.Open("sqlite", path)
@@ -104,7 +106,7 @@ func TestStreamLegacySQLiteReportsInvalidPlayerContext(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = streamLegacySQLiteWithKeySource(context.Background(), path, "default", sqliteTargetKeySource{}, func([]SourceRecord) error {
+	err = streamLegacySQLiteWithDrops(context.Background(), path, "default", nil, func([]SourceRecord) error {
 		return nil
 	})
 	if !errors.Is(err, ErrValidation) {
@@ -137,7 +139,7 @@ func TestStreamLegacySQLiteSkipsEmptyUnaddressableAttrsPlaceholder(t *testing.T)
 	}
 
 	baselines := 0
-	err = streamLegacySQLiteWithKeySource(context.Background(), path, "default", sqliteTargetKeySource{}, func(batch []SourceRecord) error {
+	err = streamLegacySQLiteWithDrops(context.Background(), path, "default", nil, func(batch []SourceRecord) error {
 		for _, record := range batch {
 			if record.Kind == attributestate.EventBaselineImported {
 				baselines++
@@ -153,7 +155,8 @@ func TestStreamLegacySQLiteSkipsEmptyUnaddressableAttrsPlaceholder(t *testing.T)
 	}
 }
 
-func TestStreamLegacySQLiteRejectsNonEmptyAttrsWithoutIdentity(t *testing.T) {
+// Without a drop recorder an addressless non-empty attrs row still aborts.
+func TestStreamLegacySQLiteWithoutRecorderRejectsNonEmptyAttrsWithoutIdentity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data.db")
 	createLegacySQLiteFixture(t, path)
 	values := &ds.ValueMap{}
@@ -173,11 +176,81 @@ func TestStreamLegacySQLiteRejectsNonEmptyAttrsWithoutIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = streamLegacySQLiteWithKeySource(context.Background(), path, "default", sqliteTargetKeySource{}, func([]SourceRecord) error {
+	err = streamLegacySQLiteWithDrops(context.Background(), path, "default", nil, func([]SourceRecord) error {
 		return nil
 	})
 	if !errors.Is(err, ErrValidation) || !strings.Contains(err.Error(), `legacy attrs ""`) {
 		t.Fatalf("non-empty attrs without identity error = %v", err)
+	}
+}
+
+// v151 deleted ban_info and attrs rows with NULL or empty data. The importer
+// records and skips them instead of aborting, and keeps the valid rows.
+func TestStreamLegacySQLiteDropsEmptyDataBanAndAttrsRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.db")
+	createLegacySQLiteFixture(t, path)
+	database, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`INSERT INTO ban_info (id, ban_updated_at, data) VALUES ('QQ:null-ban', 9, NULL)`,
+		`INSERT INTO ban_info (id, ban_updated_at, data) VALUES ('QQ:empty-ban', 10, X'')`,
+		`INSERT INTO attrs (id, data, attrs_type, name, created_at, updated_at) VALUES ('null-attrs', NULL, 'character', 'Nobody', 11, 12)`,
+		`INSERT INTO attrs (id, data, created_at, updated_at) VALUES ('empty-attrs', X'', 13, 14)`,
+	} {
+		if _, err = database.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dataDir := t.TempDir()
+	drops := newDropRecorder(dataDir, dropSourceLegacyImport, legacyDropFixedNow)
+	baselines, moderation := 0, 0
+	err = streamLegacySQLiteWithDrops(context.Background(), path, "default", drops, func(batch []SourceRecord) error {
+		for _, record := range batch {
+			switch {
+			case record.Kind == attributestate.EventBaselineImported:
+				baselines++
+			case record.RecordType == RecordTypeSecret && record.Domain == "moderation":
+				moderation++
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("empty-data rows aborted the import: %v", err)
+	}
+	if baselines != 1 || moderation != 1 {
+		t.Fatalf("imported attrs baselines/bans = %d/%d, want the fixture rows only", baselines, moderation)
+	}
+	recordPath, count, err := drops.Close()
+	if err != nil || count != 4 {
+		t.Fatalf("drop records = %q/%d/%v, want 4", recordPath, count, err)
+	}
+	records := readDropRecords(t, recordPath)
+	for identity, kind := range map[string]string{
+		"QQ:null-ban": "ban_info", "QQ:empty-ban": "ban_info", "null-attrs": "attrs", "empty-attrs": "attrs",
+	} {
+		record := records[identity]
+		detail, _ := record["detail"].(map[string]any)
+		if record["kind"] != kind || record["reason"] != "data-empty" || detail["table"] != kind || detail["rowId"] != identity || detail["dataEmpty"] != true {
+			t.Fatalf("drop record %s = %#v", identity, record)
+		}
+	}
+	if detail, _ := records["QQ:null-ban"]["detail"].(map[string]any); detail["banUpdatedAt"] != float64(9) {
+		t.Fatalf("ban drop detail = %#v", detail)
+	}
+	if detail, _ := records["null-attrs"]["detail"].(map[string]any); detail["name"] != "Nobody" || detail["attrsType"] != "character" || detail["createdAt"] != float64(11) || detail["updatedAt"] != float64(12) {
+		t.Fatalf("attrs drop detail = %#v", detail)
+	}
+
+	// Without a recorder the same rows still abort: a drop is never silent.
+	if err = streamLegacySQLiteWithDrops(context.Background(), path, "default", nil, func([]SourceRecord) error { return nil }); err == nil {
+		t.Fatal("empty-data rows were dropped without a drop record")
 	}
 }
 
@@ -204,7 +277,7 @@ func TestStreamLegacySQLiteYieldsBoundedBatches(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			if _, err = statement.Exec(id, index, payload); err != nil {
+			if _, err = statement.Exec(id, index+1, payload); err != nil {
 				return err
 			}
 		}
@@ -221,7 +294,7 @@ func TestStreamLegacySQLiteYieldsBoundedBatches(t *testing.T) {
 
 	batches := 0
 	records := 0
-	err = streamLegacySQLiteWithKeySource(context.Background(), path, "default", sqliteTargetKeySource{}, func(batch []SourceRecord) error {
+	err = streamLegacySQLiteWithDrops(context.Background(), path, "default", nil, func(batch []SourceRecord) error {
 		batches++
 		if len(batch) == 0 || len(batch) > MaxBatchRecords {
 			t.Fatalf("batch records = %d", len(batch))

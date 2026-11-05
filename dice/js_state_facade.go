@@ -2,9 +2,6 @@ package dice
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +12,7 @@ import (
 	"time"
 
 	"Scardice-core/core/configstate"
+	"Scardice-core/core/execution"
 	"Scardice-core/core/extensionstate"
 	"Scardice-core/dice/censor"
 	"Scardice-core/eventstore"
@@ -22,9 +20,8 @@ import (
 )
 
 var (
-	ErrDurableStateUnavailable      = errors.New("dice: durable state is not attached")
-	ErrDurableProjection            = errors.New("dice: durable state projection is unavailable")
-	errDurableReservedStorageDomain = errors.New("dice: extension storage identity uses a reserved internal domain")
+	ErrDurableStateUnavailable = errors.New("dice: durable state is not attached")
+	ErrDurableProjection       = errors.New("dice: durable state projection is unavailable")
 )
 
 // DurableStoreAttached reports whether this Dice instance has an event-store
@@ -91,13 +88,36 @@ func (d *Dice) DurableExtensionState(ctx context.Context) (extensionstate.State,
 	return state, nil
 }
 
+// durableExtensionStateShared returns the extension state without copying it.
+// The result is shared with the read cache and with every concurrent reader, so
+// the caller must only read it and must not retain or modify any map inside it.
+// Callers that need a private copy use DurableExtensionState.
+func (d *Dice) durableExtensionStateShared(ctx context.Context) (extensionstate.State, error) {
+	store, id, err := d.durableStoreAndID()
+	if err != nil {
+		return extensionstate.State{}, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	state, err := d.extensionReads.ReadShared(ctx, store, id)
+	if err != nil {
+		return extensionstate.State{}, fmt.Errorf("%w: extension: %w", ErrDurableProjection, err)
+	}
+	return state, nil
+}
+
 // DurableExtensionConfigItems returns detached compatibility DTOs ordered by
 // extension identity and config key. It never returns projection-owned maps.
 func (d *Dice) DurableExtensionConfigItems(ctx context.Context, pluginName string) ([]*ConfigItem, error) {
-	state, err := d.DurableExtensionState(ctx)
+	state, err := d.durableExtensionStateShared(ctx)
 	if err != nil {
 		return nil, err
 	}
+	return d.extensionConfigItemsFromState(ctx, state, pluginName)
+}
+
+func (d *Dice) extensionConfigItemsFromState(ctx context.Context, state extensionstate.State, pluginName string) ([]*ConfigItem, error) {
 	definitions := state.ConfigDefinitions[pluginName]
 	keys := make([]string, 0, len(definitions))
 	for key := range definitions {
@@ -108,17 +128,6 @@ func (d *Dice) DurableExtensionConfigItems(ctx context.Context, pluginName strin
 	for _, key := range keys {
 		definition := definitions[key]
 		item := durableConfigItem(definition)
-		if durableEncryptedConfig(definition.Type, key) {
-			value, exists, valueErr := d.durableEncryptedConfigValue(ctx, pluginName, key, definition.Type)
-			if valueErr != nil {
-				return nil, valueErr
-			}
-			if exists {
-				item.Value = value
-				items = append(items, item)
-				continue
-			}
-		}
 		if value, ok := state.ConfigValues[pluginName][key]; ok {
 			item.Value = durableLegacyValue(value)
 		}
@@ -139,44 +148,152 @@ func (d *Dice) durableExtensionRepository() (*extensionstate.Repository, string,
 	return repo, id, nil
 }
 
-func (d *Dice) ensureDurableExtension(ctx context.Context, ext *ExtInfo) (extensionstate.State, error) {
-	if ext == nil {
-		return extensionstate.State{}, errors.New("dice: extension is nil")
+type extensionParticipant struct {
+	diceID   string
+	base     extensionstate.State
+	state    extensionstate.State
+	events   []extensionstate.TypedEvent
+	metadata eventstore.Metadata
+}
+
+func (p *extensionParticipant) Contribute(context.Context) (eventstore.UnitOfWork, error) {
+	if p == nil || len(p.events) == 0 {
+		return eventstore.UnitOfWork{}, nil
 	}
-	repo, diceID, err := d.durableExtensionRepository()
-	if err != nil {
-		return extensionstate.State{}, err
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	state, err := repo.Load(ctx, diceID)
-	if err != nil {
-		return extensionstate.State{}, err
-	}
-	identity := durableExtensionIdentity(ext)
-	command := extensionstate.Command{
-		Kind:     extensionstate.CommandDiscover,
-		DiceID:   diceID,
-		Identity: identity,
-	}
-	for range 2 {
-		result, appendErr := repo.DecideAndAppend(ctx, state, state.Version, eventstore.Metadata{}, command)
-		if appendErr == nil {
-			if result.Idempotent {
-				return state, nil
-			}
-			return repo.Load(ctx, diceID)
-		}
-		if !errors.Is(appendErr, eventstore.ErrConflict) {
-			return extensionstate.State{}, appendErr
-		}
-		state, err = repo.Load(ctx, diceID)
+	factory := eventstore.EventFactory{Clock: eventstore.SystemClock{}, IDs: eventstore.UUIDGenerator{}}
+	metadata := p.metadata
+	events := make([]eventstore.NewEvent, 0, len(p.events))
+	for _, typed := range p.events {
+		event, err := extensionstate.NewEventWithFactory(factory, typed, metadata)
 		if err != nil {
-			return extensionstate.State{}, err
+			return eventstore.UnitOfWork{}, err
+		}
+		events = append(events, event)
+		metadata.EventID = ""
+	}
+	return eventstore.UnitOfWork{Streams: []eventstore.StreamAppend{{
+		Stream:          extensionstate.ExtensionStream(p.diceID),
+		ExpectedVersion: p.base.Version,
+		Events:          events,
+	}}}, nil
+}
+
+func (p *extensionParticipant) decide(command extensionstate.Command, metadata eventstore.Metadata) error {
+	if p == nil {
+		return execution.ErrInvalidParticipant
+	}
+	command.ExpectedVersion = p.state.Version
+	command.ExpectedVersionSet = true
+	decision, err := extensionstate.Decide(p.state, command)
+	if err != nil {
+		return err
+	}
+	next := p.state
+	for _, event := range decision.Events {
+		next, err = extensionstate.Reduce(next, event)
+		if err != nil {
+			return err
 		}
 	}
-	return extensionstate.State{}, eventstore.ErrConflict
+	p.state = next
+	p.events = append(p.events, decision.Events...)
+	if p.metadata.CommandID == "" {
+		p.metadata = metadata
+	}
+	return nil
+}
+
+func (d *Dice) extensionOwner(ctx context.Context, tx *execution.DomainTx) (*extensionParticipant, execution.ParticipantKey, error) {
+	if d == nil || tx == nil || d.DurableStore == nil {
+		return nil, execution.ParticipantKey{}, execution.ErrDomainTxUnavailable
+	}
+	stream := extensionstate.ExtensionStream(d.BaseConfig.Name)
+	key := execution.StreamParticipantKey(stream)
+	participant, err := tx.Owner(ctx, key, func(loadCtx context.Context) (execution.Participant, execution.ReadDependencies, error) {
+		reader, ok := d.DurableStore.(eventstore.ProjectionDependencyRepository)
+		if !ok {
+			return nil, execution.ReadDependencies{}, ErrDurableProjection
+		}
+		snapshot, readErr := reader.ReadProjectionDependency(
+			loadCtx, extensionstate.ExtensionProjectionName, stream.AggregateID, stream,
+		)
+		if readErr != nil {
+			return nil, execution.ReadDependencies{}, readErr
+		}
+		var state extensionstate.State
+		if snapshot.Found {
+			if readErr = json.Unmarshal(snapshot.Row.Payload, &state); readErr != nil {
+				return nil, execution.ReadDependencies{}, fmt.Errorf("dice: decode extension projection: %w", readErr)
+			}
+			if readErr = extensionstate.ValidateState(state); readErr != nil {
+				return nil, execution.ReadDependencies{}, readErr
+			}
+			if state.DiceID != d.BaseConfig.Name || state.Version != snapshot.StreamVersion {
+				return nil, execution.ReadDependencies{}, execution.ErrDomainSnapshotChanged
+			}
+		} else if snapshot.StreamVersion != 0 {
+			return nil, execution.ReadDependencies{}, execution.ErrDomainSnapshotChanged
+		}
+		installed := &extensionParticipant{
+			diceID: d.BaseConfig.Name,
+			base:   state.Clone(),
+			state:  state.Clone(),
+		}
+		return installed, execution.ReadDependenciesFromStream(eventstore.StreamSnapshot{
+			Stream: stream, Version: snapshot.StreamVersion, Snapshot: snapshot.Snapshot,
+		}), nil
+	})
+	if err != nil {
+		return nil, execution.ParticipantKey{}, err
+	}
+	typed, ok := participant.(*extensionParticipant)
+	if !ok {
+		return nil, execution.ParticipantKey{}, execution.ErrInvalidParticipant
+	}
+	return typed, key, nil
+}
+
+func (d *Dice) ExtensionStateForDomain(ctx context.Context, tx *execution.DomainTx) (extensionstate.State, error) {
+	participant, _, err := d.extensionOwner(ctx, tx)
+	if err != nil {
+		return extensionstate.State{}, err
+	}
+	return participant.state.Clone(), nil
+}
+
+func (d *Dice) ContributeExtensionCommand(
+	ctx context.Context,
+	tx *execution.DomainTx,
+	metadata eventstore.Metadata,
+	command extensionstate.Command,
+) error {
+	_, key, err := d.extensionOwner(ctx, tx)
+	if err != nil {
+		return err
+	}
+	return tx.Mutate(key, func(participant execution.Participant) error {
+		typed, ok := participant.(*extensionParticipant)
+		if !ok {
+			return execution.ErrInvalidParticipant
+		}
+		return typed.decide(command, metadata)
+	})
+}
+
+func (d *Dice) ensureExtensionInDomain(
+	ctx context.Context,
+	tx *execution.DomainTx,
+	metadata eventstore.Metadata,
+	ext *ExtInfo,
+) error {
+	if ext == nil {
+		return errors.New("dice: extension is nil")
+	}
+	return d.ContributeExtensionCommand(ctx, tx, metadata, extensionstate.Command{
+		Kind:     extensionstate.CommandDiscover,
+		DiceID:   d.BaseConfig.Name,
+		Identity: durableExtensionIdentity(ext),
+	})
 }
 
 func durableExtensionIdentity(ext *ExtInfo) extensionstate.ExtensionIdentity {
@@ -198,61 +315,68 @@ func durableExtensionIdentity(ext *ExtInfo) extensionstate.ExtensionIdentity {
 }
 
 func (d *Dice) DurableDiscoverExtension(ctx context.Context, ext *ExtInfo) error {
-	_, err := d.ensureDurableExtension(ctx, ext)
-	return err
+	return d.withFreshDomainExecution(ctx, "extension-discover", durableExtensionIdentity(ext), func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		return d.ensureExtensionInDomain(ctx, transaction.Domain(), metadata, ext)
+	})
 }
 
 func (d *Dice) DurableRegisterConfig(ctx context.Context, ext *ExtInfo, item *ConfigItem) error {
-	if item == nil {
-		return errors.New("dice: config item is nil")
+	if ext == nil {
+		return errors.New("dice: extension is nil")
 	}
-	if _, err := d.ensureDurableExtension(ctx, ext); err != nil {
-		return err
-	}
-	return d.durableRegisterConfigByName(ctx, ext.Name, item)
+	return d.withFreshDomainExecution(ctx, "extension-config-register", struct {
+		Extension extensionstate.ExtensionIdentity `json:"extension"`
+		Item      *ConfigItem                      `json:"item"`
+	}{durableExtensionIdentity(ext), item}, func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		if err := d.ensureExtensionInDomain(ctx, transaction.Domain(), metadata, ext); err != nil {
+			return err
+		}
+		return d.registerConfigInDomain(ctx, transaction, metadata, ext.Name, item)
+	})
 }
 
 func (d *Dice) DurableSetConfig(ctx context.Context, ext *ExtInfo, key string, value any) error {
 	if ext == nil {
 		return errors.New("dice: extension is nil")
 	}
-	if _, err := d.ensureDurableExtension(ctx, ext); err != nil {
-		return err
-	}
-	return d.durableSetConfigByName(ctx, ext.Name, key, value)
+	return d.withFreshDomainExecution(ctx, "extension-config-set", struct {
+		ExtensionID string `json:"extensionId"`
+		Key         string `json:"key"`
+		Value       any    `json:"value"`
+	}{ext.Name, key, value}, func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		if err := d.ensureExtensionInDomain(ctx, transaction.Domain(), metadata, ext); err != nil {
+			return err
+		}
+		return d.setConfigInDomain(ctx, transaction, metadata, ext.Name, key, value)
+	})
 }
 
 func (d *Dice) DurableUnregisterConfig(ctx context.Context, ext *ExtInfo, key string) error {
 	if ext == nil {
 		return errors.New("dice: extension is nil")
 	}
-	if _, err := d.ensureDurableExtension(ctx, ext); err != nil {
-		return err
-	}
-	return d.durableUnregisterConfigByName(ctx, ext.Name, key)
+	return d.withFreshDomainExecution(ctx, "extension-config-unregister", struct {
+		ExtensionID string `json:"extensionId"`
+		Key         string `json:"key"`
+	}{ext.Name, key}, func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		if err := d.ensureExtensionInDomain(ctx, transaction.Domain(), metadata, ext); err != nil {
+			return err
+		}
+		return d.unregisterConfigInDomain(ctx, transaction, metadata, ext.Name, key)
+	})
 }
 
 func (d *Dice) DurableConfigItem(ctx context.Context, ext *ExtInfo, key string) (*ConfigItem, error) {
 	if ext == nil {
 		return nil, errors.New("dice: extension is nil")
 	}
-	state, err := d.DurableExtensionState(ctx)
+	state, err := d.durableExtensionStateShared(ctx)
 	if err != nil {
 		return nil, err
 	}
 	var item *ConfigItem
 	if definition, ok := state.ConfigDefinitions[ext.Name][key]; ok {
 		item = durableConfigItem(definition)
-		if durableEncryptedConfig(definition.Type, key) {
-			value, exists, valueErr := d.durableEncryptedConfigValue(ctx, ext.Name, key, definition.Type)
-			if valueErr != nil {
-				return nil, valueErr
-			}
-			if exists {
-				item.Value = value
-				return item, nil
-			}
-		}
 		if value, ok := state.ConfigValues[ext.Name][key]; ok {
 			item.Value = durableLegacyValue(value)
 		}
@@ -264,23 +388,22 @@ func (d *Dice) DurableSetExtensionEnabled(ctx context.Context, ext *ExtInfo, ena
 	if ext == nil {
 		return errors.New("dice: extension is nil")
 	}
-	state, err := d.ensureDurableExtension(ctx, ext)
-	if err != nil {
-		return err
-	}
-	repo, _, err := d.durableExtensionRepository()
-	if err != nil {
-		return err
-	}
-	kind := extensionstate.CommandDisable
-	if enabled {
-		kind = extensionstate.CommandEnable
-	}
-	_, err = repo.DecideAndAppend(ctx, state, state.Version, eventstore.Metadata{}, extensionstate.Command{
-		Kind:        kind,
-		ExtensionID: ext.Name,
+	return d.withFreshDomainExecution(ctx, "extension-enabled", struct {
+		Extension extensionstate.ExtensionIdentity `json:"extension"`
+		Enabled   bool                             `json:"enabled"`
+	}{durableExtensionIdentity(ext), enabled}, func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		tx := transaction.Domain()
+		if err := d.ensureExtensionInDomain(ctx, tx, metadata, ext); err != nil {
+			return err
+		}
+		kind := extensionstate.CommandDisable
+		if enabled {
+			kind = extensionstate.CommandEnable
+		}
+		return d.ContributeExtensionCommand(ctx, tx, metadata, extensionstate.Command{
+			Kind: kind, ExtensionID: ext.Name,
+		})
 	})
-	return err
 }
 
 func durableConfigDefinition(extensionID string, item *ConfigItem) (extensionstate.ConfigDefinition, error) {
@@ -302,8 +425,8 @@ func durableConfigDefinition(extensionID string, item *ConfigItem) (extensionsta
 	if options, ok := item.Option.([]string); ok {
 		definition.Options = append([]string(nil), options...)
 	}
-	if item.DefaultValue != nil && !durableEncryptedConfig(typ, item.Key) {
-		value, valueErr := durableConfigValue(typ, item.DefaultValue, item.Key)
+	if item.DefaultValue != nil {
+		value, valueErr := durableConfigValue(typ, item.DefaultValue)
 		if valueErr != nil {
 			return extensionstate.ConfigDefinition{}, valueErr
 		}
@@ -340,14 +463,7 @@ func durableConfigType(value string) (extensionstate.ConfigType, error) {
 	}
 }
 
-func durableConfigValue(typ extensionstate.ConfigType, value any, key string) (extensionstate.ConfigValue, error) {
-	if durableEncryptedConfig(typ, key) {
-		return extensionstate.ConfigValue{}, errors.New("dice: raw sensitive config value is not allowed in the event stream")
-	}
-	return durableTypedConfigValue(typ, value)
-}
-
-func durableTypedConfigValue(typ extensionstate.ConfigType, value any) (extensionstate.ConfigValue, error) {
+func durableConfigValue(typ extensionstate.ConfigType, value any) (extensionstate.ConfigValue, error) {
 	switch typ {
 	case extensionstate.ConfigString, extensionstate.ConfigTaskCron, extensionstate.ConfigTaskDaily, extensionstate.ConfigTaskOnce:
 		text, ok := value.(string)
@@ -477,257 +593,22 @@ func durableLegacyValue(value extensionstate.ConfigValue) any {
 	}
 }
 
-func durableSensitiveConfig(key string) bool {
-	key = strings.ToLower(strings.TrimSpace(key))
-	for _, marker := range []string{"password", "passwd", "token", "secret", "privatekey", "private_key", "apikey", "api_key"} {
-		if strings.Contains(key, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-const durableConfigValueExtensionPrefix = "scardice.internal.config/v1/"
-
-func durableEncryptedConfig(typ extensionstate.ConfigType, key string) bool {
-	return typ != extensionstate.ConfigSecret && durableSensitiveConfig(key)
-}
-
-func durableConfigStorageExtensionID(pluginName string) string {
-	digest := sha256.Sum256([]byte(pluginName))
-	return durableConfigValueExtensionPrefix + hex.EncodeToString(digest[:])
-}
-
-func durableConfigStorageKey(configKey string) string {
-	return base64.RawURLEncoding.EncodeToString([]byte(configKey))
-}
-
-type durableConfigKVMutation struct {
-	pluginName         string
-	key                string
-	value              []byte
-	deleted            bool
-	expectedVersion    uint64
-	expectedVersionSet bool
-}
-
-func durableEncryptedConfigPayload(pluginName, key string, typ extensionstate.ConfigType, value any) ([]byte, error) {
-	stored, err := durableTypedConfigValue(typ, value)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"dice: encrypted plugin config value type mismatch: plugin=%q key=%q declared=%q actual=%q: %w",
-			pluginName,
-			key,
-			typ,
-			fmt.Sprintf("%T", value),
-			err,
-		)
-	}
-	payload, err := json.Marshal(stored)
-	if err != nil {
-		return nil, fmt.Errorf("dice: encode encrypted plugin config: plugin=%q key=%q declared=%q: %w", pluginName, key, typ, err)
-	}
-	return payload, nil
-}
-
-func durableDecodeEncryptedConfigValue(payload []byte, pluginName, key string, typ extensionstate.ConfigType) (any, error) {
-	var stored extensionstate.ConfigValue
-	if err := json.Unmarshal(payload, &stored); err != nil {
-		return nil, fmt.Errorf("dice: encrypted plugin config metadata invalid: plugin=%q key=%q declared=%q: %w", pluginName, key, typ, err)
-	}
-	if stored.Type != typ {
-		return nil, fmt.Errorf("dice: encrypted plugin config type mismatch: plugin=%q key=%q declared=%q actual=%q", pluginName, key, typ, stored.Type)
-	}
-	value := durableLegacyValue(stored)
-	if _, err := durableTypedConfigValue(typ, value); err != nil {
-		return nil, fmt.Errorf("dice: encrypted plugin config value type mismatch: plugin=%q key=%q declared=%q actual=%q", pluginName, key, typ, fmt.Sprintf("%T", value))
-	}
-	return value, nil
-}
-
-type durablePluginKVUpdatePreparer interface {
-	PreparePluginKVUpdate(ctx context.Context, request eventstore.PluginKVPutRequest) (eventstore.PluginKVUpdate, error)
-}
-
-func (d *Dice) durablePrepareConfigKVMutation(ctx context.Context, mutation durableConfigKVMutation) ([]eventstore.PluginKVUpdate, error) {
-	if d == nil || d.DurableStore == nil {
-		return nil, ErrDurableStateUnavailable
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	repository, err := d.durablePluginKV()
-	if err != nil {
-		return nil, err
-	}
-	extensionID := durableConfigStorageExtensionID(mutation.pluginName)
-	storageKey := durableConfigStorageKey(mutation.key)
-	currentVersion := mutation.expectedVersion
-	if !mutation.expectedVersionSet {
-		current, getErr := repository.GetPluginKV(ctx, extensionID, storageKey)
-		if errors.Is(getErr, eventstore.ErrPluginKVNotFound) {
-			if mutation.deleted {
-				return nil, nil
-			}
-			currentVersion = 0
-		} else if getErr != nil {
-			return nil, getErr
-		} else {
-			currentVersion = current.Version
-		}
-	} else if mutation.deleted && currentVersion == 0 {
-		return nil, nil
-	}
-	if mutation.deleted {
-		if currentVersion >= ^uint64(0)>>1 {
-			return nil, eventstore.ErrVersionExhausted
-		}
-		sealer, ok := d.DurableStore.(JSPluginKVSealer)
-		if !ok {
-			return nil, errors.New("dice: attached store does not support encrypted plugin KV sealing")
-		}
-		index, _, digestErr := sealer.KeyedDigest(ctx, "plugin-key-index/v1", extensionID, storageKey)
-		if digestErr != nil {
-			return nil, digestErr
-		}
-		if len(index) != sha256.Size {
-			return nil, errors.New("dice: invalid encrypted plugin KV index")
-		}
-		return []eventstore.PluginKVUpdate{{
-			ExtensionID:     extensionID,
-			KeyHMAC:         index,
-			ExpectedVersion: currentVersion,
-			Version:         currentVersion + 1,
-			Deleted:         true,
-		}}, nil
-	}
-	preparer, ok := d.DurableStore.(durablePluginKVUpdatePreparer)
-	if !ok {
-		return nil, errors.New("dice: attached store cannot prepare encrypted plugin KV updates")
-	}
-	update, err := preparer.PreparePluginKVUpdate(ctx, eventstore.PluginKVPutRequest{
-		ExtensionID:     extensionID,
-		Key:             storageKey,
-		Value:           mutation.value,
-		ExpectedVersion: currentVersion,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return []eventstore.PluginKVUpdate{update}, nil
-}
-
-func (d *Dice) durableCommitConfigMutation(
-	ctx context.Context,
-	repository *extensionstate.Repository,
-	state extensionstate.State,
-	command *extensionstate.Command,
-	mutation *durableConfigKVMutation,
-) error {
-	if d == nil || d.DurableStore == nil {
-		return ErrDurableStateUnavailable
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	work := eventstore.UnitOfWork{}
-	if command != nil {
-		if repository == nil {
-			return extensionstate.ErrRepositoryUnavailable
-		}
-		stream, err := repository.PrepareCommands(state, state.Version, eventstore.Metadata{}, []extensionstate.Command{*command})
-		if err != nil {
-			return err
-		}
-		if len(stream.Events) > 0 {
-			work.Streams = append(work.Streams, stream)
-		}
-	}
-	if mutation != nil {
-		updates, err := d.durablePrepareConfigKVMutation(ctx, *mutation)
-		if err != nil {
-			return err
-		}
-		work.PluginKVUpdates = append(work.PluginKVUpdates, updates...)
-	}
-	if len(work.Streams) == 0 && len(work.PluginKVUpdates) == 0 {
-		return nil
-	}
-	_, err := d.DurableStore.Commit(ctx, work)
-	return err
-}
-
-func (d *Dice) durableEncryptedConfigVersion(ctx context.Context, pluginName, key string) (uint64, bool, error) {
-	repository, err := d.durablePluginKV()
-	if err != nil {
-		return 0, false, err
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	item, err := repository.GetPluginKV(ctx, durableConfigStorageExtensionID(pluginName), durableConfigStorageKey(key))
-	if errors.Is(err, eventstore.ErrPluginKVNotFound) {
-		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, err
-	}
-	return item.Version, true, nil
-}
-
-func (d *Dice) durableEncryptedConfigValue(ctx context.Context, pluginName, key string, typ extensionstate.ConfigType) (any, bool, error) {
-	repository, err := d.durablePluginKV()
-	if err != nil {
-		return nil, false, err
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	item, err := repository.GetPluginKV(ctx, durableConfigStorageExtensionID(pluginName), durableConfigStorageKey(key))
-	if errors.Is(err, eventstore.ErrPluginKVNotFound) {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	value, err := durableDecodeEncryptedConfigValue(item.Value, pluginName, key, typ)
-	if err != nil {
-		return nil, false, err
-	}
-	return value, true, nil
-}
-
-func (d *Dice) durableSetEncryptedConfigValue(ctx context.Context, pluginName, key string, typ extensionstate.ConfigType, value any) error {
-	payload, err := durableEncryptedConfigPayload(pluginName, key, typ, value)
-	if err != nil {
-		return err
-	}
-	mutation := durableConfigKVMutation{pluginName: pluginName, key: key, value: payload}
-	return d.durableCommitConfigMutation(ctx, nil, extensionstate.State{}, nil, &mutation)
-}
-
-func (d *Dice) durableDeleteEncryptedConfigValue(ctx context.Context, pluginName, key string) error {
-	mutation := durableConfigKVMutation{pluginName: pluginName, key: key, deleted: true}
-	return d.durableCommitConfigMutation(ctx, nil, extensionstate.State{}, nil, &mutation)
-}
-
 func durableSecretReference(value string) bool {
 	value = strings.TrimSpace(value)
 	return strings.HasPrefix(value, "vault:") || strings.HasPrefix(value, "secret:")
 }
 
-func (d *Dice) durableRegisterConfigByName(ctx context.Context, pluginName string, item *ConfigItem) error {
-	if item == nil {
-		return errors.New("dice: config item is nil")
+func (d *Dice) registerConfigInDomain(
+	ctx context.Context,
+	transaction *DurableCallbackTransaction,
+	metadata eventstore.Metadata,
+	pluginName string,
+	item *ConfigItem,
+) error {
+	if transaction == nil || item == nil {
+		return errors.New("dice: config transaction and item are required")
 	}
-	repo, diceID, err := d.durableExtensionRepository()
-	if err != nil {
-		return err
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	state, err := repo.Load(ctx, diceID)
+	state, err := d.ExtensionStateForDomain(ctx, transaction.Domain())
 	if err != nil {
 		return err
 	}
@@ -738,74 +619,27 @@ func (d *Dice) durableRegisterConfigByName(ctx context.Context, pluginName strin
 	if err != nil {
 		return err
 	}
-	command := extensionstate.Command{
+	if err = d.ContributeExtensionCommand(ctx, transaction.Domain(), metadata, extensionstate.Command{
 		Kind:        extensionstate.CommandRegisterConfig,
 		ExtensionID: pluginName,
 		Definition:  definition,
-	}
-	var mutation *durableConfigKVMutation
-	previous, previouslyConfigured := state.ConfigDefinitions[pluginName][item.Key]
-	if durableEncryptedConfig(definition.Type, item.Key) {
-		typeChanged := previouslyConfigured && previous.Type != definition.Type
-		if typeChanged {
-			version, valueExists, versionErr := d.durableEncryptedConfigVersion(ctx, pluginName, item.Key)
-			if versionErr != nil {
-				return versionErr
-			}
-			if item.DefaultValue == nil {
-				if valueExists {
-					mutation = &durableConfigKVMutation{
-						pluginName: pluginName, key: item.Key, deleted: true,
-						expectedVersion: version, expectedVersionSet: true,
-					}
-				}
-			} else {
-				payload, payloadErr := durableEncryptedConfigPayload(pluginName, item.Key, definition.Type, item.DefaultValue)
-				if payloadErr != nil {
-					return payloadErr
-				}
-				mutation = &durableConfigKVMutation{
-					pluginName: pluginName, key: item.Key, value: payload,
-					expectedVersion: version, expectedVersionSet: true,
-				}
-			}
-		} else {
-			_, exists, valueErr := d.durableEncryptedConfigValue(ctx, pluginName, item.Key, definition.Type)
-			if valueErr != nil {
-				return valueErr
-			}
-			if !exists {
-				initialValue := item.DefaultValue
-				if legacyValue, legacyExists := state.ConfigValues[pluginName][item.Key]; legacyExists {
-					initialValue = durableLegacyValue(legacyValue)
-				}
-				if initialValue != nil {
-					payload, payloadErr := durableEncryptedConfigPayload(pluginName, item.Key, definition.Type, initialValue)
-					if payloadErr != nil {
-						return payloadErr
-					}
-					mutation = &durableConfigKVMutation{
-						pluginName: pluginName, key: item.Key, value: payload,
-						expectedVersionSet: true,
-					}
-				}
-			}
-		}
-	} else if previouslyConfigured && durableEncryptedConfig(previous.Type, item.Key) {
-		mutation = &durableConfigKVMutation{pluginName: pluginName, key: item.Key, deleted: true}
-	}
-	return d.durableCommitConfigMutation(ctx, repo, state, &command, mutation)
-}
-
-func (d *Dice) durableSetConfigByName(ctx context.Context, pluginName, key string, value any) error {
-	repo, diceID, err := d.durableExtensionRepository()
-	if err != nil {
+	}); err != nil {
 		return err
 	}
-	if ctx == nil {
-		ctx = context.Background()
+	return nil
+}
+
+func (d *Dice) setConfigInDomain(
+	ctx context.Context,
+	transaction *DurableCallbackTransaction,
+	metadata eventstore.Metadata,
+	pluginName, key string,
+	value any,
+) error {
+	if transaction == nil {
+		return ErrDurableStateUnavailable
 	}
-	state, err := repo.Load(ctx, diceID)
+	state, err := d.ExtensionStateForDomain(ctx, transaction.Domain())
 	if err != nil {
 		return err
 	}
@@ -813,78 +647,134 @@ func (d *Dice) durableSetConfigByName(ctx context.Context, pluginName, key strin
 	if !ok {
 		return extensionstate.ErrUnknownConfig
 	}
-	if durableEncryptedConfig(definition.Type, key) {
-		return d.durableSetEncryptedConfigValue(ctx, pluginName, key, definition.Type, value)
-	}
-	configValue, err := durableConfigValue(definition.Type, value, key)
+	configValue, err := durableConfigValue(definition.Type, value)
 	if err != nil {
 		return err
 	}
-	_, err = repo.DecideAndAppend(ctx, state, state.Version, eventstore.Metadata{}, extensionstate.Command{
+	return d.ContributeExtensionCommand(ctx, transaction.Domain(), metadata, extensionstate.Command{
 		Kind:        extensionstate.CommandSetConfig,
 		ExtensionID: pluginName,
 		Key:         key,
 		Value:       configValue,
 	})
-	return err
 }
 
-func (d *Dice) durableUnregisterConfigByName(ctx context.Context, pluginName, key string) error {
-	repo, diceID, err := d.durableExtensionRepository()
-	if err != nil {
-		return err
+func (d *Dice) unregisterConfigInDomain(
+	ctx context.Context,
+	transaction *DurableCallbackTransaction,
+	metadata eventstore.Metadata,
+	pluginName, key string,
+) error {
+	if transaction == nil {
+		return ErrDurableStateUnavailable
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	state, err := repo.Load(ctx, diceID)
+	state, err := d.ExtensionStateForDomain(ctx, transaction.Domain())
 	if err != nil {
 		return err
 	}
 	if _, ok := state.Extensions[pluginName]; !ok {
 		return extensionstate.ErrUnknownExtension
 	}
-	definition, configured := state.ConfigDefinitions[pluginName][key]
-	deleteEncryptedValue := durableSensitiveConfig(key)
-	if configured {
-		deleteEncryptedValue = durableEncryptedConfig(definition.Type, key)
-	}
-	command := extensionstate.Command{
+	if err = d.ContributeExtensionCommand(ctx, transaction.Domain(), metadata, extensionstate.Command{
 		Kind:        extensionstate.CommandUnregisterConfig,
 		ExtensionID: pluginName,
 		Key:         key,
+	}); err != nil {
+		return err
 	}
-	var mutation *durableConfigKVMutation
-	if deleteEncryptedValue {
-		mutation = &durableConfigKVMutation{pluginName: pluginName, key: key, deleted: true}
+	return nil
+}
+
+func (d *Dice) withOwnedConfigExecution(
+	ctx context.Context,
+	operation string,
+	request any,
+	run func(*DurableCallbackTransaction, eventstore.Metadata) error,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return d.durableCommitConfigMutation(ctx, repo, state, &command, mutation)
+	return d.withFreshDomainExecution(ctx, operation, request, run)
+}
+
+func (d *Dice) durableRegisterConfigsByName(ctx context.Context, pluginName string, items []*ConfigItem) error {
+	return d.withOwnedConfigExecution(ctx, "extension-config-register-by-name", struct {
+		PluginName string        `json:"pluginName"`
+		Items      []*ConfigItem `json:"items"`
+	}{pluginName, items}, func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		for _, item := range items {
+			if err := d.registerConfigInDomain(ctx, transaction, metadata, pluginName, item); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (d *Dice) durableUnregisterConfigsByName(ctx context.Context, pluginName string, keys []string) error {
+	return d.withOwnedConfigExecution(ctx, "extension-config-unregister-by-name", struct {
+		PluginName string   `json:"pluginName"`
+		Keys       []string `json:"keys"`
+	}{pluginName, keys}, func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		for _, key := range keys {
+			if err := d.unregisterConfigInDomain(ctx, transaction, metadata, pluginName, key); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (d *Dice) durableSetConfigByName(ctx context.Context, pluginName, key string, value any) error {
+	return d.withOwnedConfigExecution(ctx, "extension-config-set-by-name", struct {
+		PluginName string `json:"pluginName"`
+		Key        string `json:"key"`
+		Value      any    `json:"value"`
+	}{pluginName, key, value}, func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		return d.setConfigInDomain(ctx, transaction, metadata, pluginName, key, value)
+	})
+}
+
+//nolint:nilnil // Missing configuration is an ordinary lookup miss, surfaced as JS null.
+func (d *Dice) configItemForDomain(
+	ctx context.Context,
+	transaction *DurableCallbackTransaction,
+	pluginName, key string,
+) (*ConfigItem, error) {
+	if transaction == nil {
+		return nil, execution.ErrDomainTxUnavailable
+	}
+	state, err := d.ExtensionStateForDomain(ctx, transaction.Domain())
+	if err != nil {
+		return nil, err
+	}
+	definition, ok := state.ConfigDefinitions[pluginName][key]
+	if !ok {
+		return nil, nil
+	}
+	item := durableConfigItem(definition)
+	if value, exists := state.ConfigValues[pluginName][key]; exists {
+		item.Value = durableLegacyValue(value)
+	}
+	if d.ConfigManager != nil {
+		item.task = d.ConfigManager.taskFor(pluginName, key)
+	}
+	return item, nil
 }
 
 //nolint:nilnil // An absent extension/configuration maps to JS undefined, not an I/O failure.
 func (d *Dice) compatibilityConfigItemWithError(ext *ExtInfo, key string) (*ConfigItem, error) {
-	if ext == nil {
+	if d == nil || ext == nil {
 		return nil, nil
 	}
-	if d != nil && d.DurableStore != nil {
-		item, err := d.DurableConfigItem(context.Background(), ext, key)
-		if err != nil {
-			return nil, err
-		}
-		if item == nil {
-			return nil, nil
-		}
-		if d.ConfigManager != nil {
-			if local := d.ConfigManager.getConfig(ext.Name, key); local != nil {
-				item.task = local.task
-			}
-		}
-		return item, nil
+	item, err := d.DurableConfigItem(context.Background(), ext, key)
+	if err != nil || item == nil {
+		return item, err
 	}
-	if d == nil || d.ConfigManager == nil {
-		return nil, nil
+	if d.ConfigManager != nil {
+		item.task = d.ConfigManager.taskFor(ext.Name, key)
 	}
-	return d.ConfigManager.getConfig(ext.Name, key), nil
+	return item, nil
 }
 
 func (d *Dice) compatibilityConfigItem(ext *ExtInfo, key string) *ConfigItem {
@@ -901,64 +791,23 @@ func (d *Dice) durablePluginKV() (eventstore.PluginKVRepository, error) {
 	}
 	repository, ok := d.DurableStore.(eventstore.PluginKVRepository)
 	if !ok || repository == nil {
-		return nil, errors.New("dice: attached store does not support encrypted plugin KV")
+		return nil, errors.New("dice: attached store does not support plugin KV")
 	}
 	return repository, nil
 }
 
-func validateDurablePublicStorageExtensionID(extensionID string) error {
-	if strings.HasPrefix(extensionID, durableConfigValueExtensionPrefix) {
-		return errDurableReservedStorageDomain
-	}
-	return nil
-}
-
-func (d *Dice) durablePublicPluginKV(extensionID string) (eventstore.PluginKVRepository, error) {
-	if err := validateDurablePublicStorageExtensionID(extensionID); err != nil {
-		return nil, err
-	}
-	return d.durablePluginKV()
-}
-
 func (d *Dice) durableStorageSet(extensionID, key, value string) error {
-	if message := d.currentJSMessageContext(); message != nil {
-		if err := message.checkExecution(); err != nil {
-			return err
-		}
-		if message.callbackTransaction != nil {
-			return message.callbackTransaction.StorageSet(message.messageJSExecution().ctx, extensionID, key, value)
-		}
-	}
-	repository, err := d.durablePublicPluginKV(extensionID)
-	if err != nil {
-		return err
-	}
-	current, err := repository.GetPluginKV(context.Background(), extensionID, key)
-	expected := uint64(0)
-	if err == nil {
-		expected = current.Version
-	} else if !errors.Is(err, eventstore.ErrPluginKVNotFound) {
-		return err
-	}
-	_, err = repository.SetPluginKV(context.Background(), eventstore.PluginKVPutRequest{
-		ExtensionID:     extensionID,
-		Key:             key,
-		Value:           []byte(value),
-		ExpectedVersion: expected,
+	return d.withFreshDomainExecution(context.Background(), "extension-storage-set", struct {
+		ExtensionID string `json:"extensionId"`
+		Key         string `json:"key"`
+		Value       string `json:"value"`
+	}{extensionID, key, value}, func(transaction *DurableCallbackTransaction, _ eventstore.Metadata) error {
+		return transaction.StorageSet(context.Background(), extensionID, key, value)
 	})
-	return err
 }
 
 func (d *Dice) durableStorageGet(extensionID, key string) (string, error) {
-	if message := d.currentJSMessageContext(); message != nil {
-		if err := message.checkExecution(); err != nil {
-			return "", err
-		}
-		if message.callbackTransaction != nil {
-			return message.callbackTransaction.StorageGet(message.messageJSExecution().ctx, extensionID, key)
-		}
-	}
-	repository, err := d.durablePublicPluginKV(extensionID)
+	repository, err := d.durablePluginKV()
 	if err != nil {
 		return "", err
 	}
@@ -973,15 +822,7 @@ func (d *Dice) durableStorageGet(extensionID, key string) (string, error) {
 }
 
 func (d *Dice) durableStorageList(extensionID string) ([]string, error) {
-	if message := d.currentJSMessageContext(); message != nil {
-		if err := message.checkExecution(); err != nil {
-			return nil, err
-		}
-		if message.callbackTransaction != nil {
-			return message.callbackTransaction.StorageList(message.messageJSExecution().ctx, extensionID)
-		}
-	}
-	repository, err := d.durablePublicPluginKV(extensionID)
+	repository, err := d.durablePluginKV()
 	if err != nil {
 		return nil, err
 	}
@@ -1000,23 +841,20 @@ func (d *Dice) durableStorageList(extensionID string) ([]string, error) {
 }
 
 func (d *Dice) clearDurableExtensionStorage(extensionID string) error {
-	repository, err := d.durablePublicPluginKV(extensionID)
-	if err != nil {
-		return err
-	}
-	items, err := repository.ListPluginKV(context.Background(), eventstore.PluginKVListRequest{
-		ExtensionID: extensionID,
-		Limit:       eventstore.MaxPluginResults,
-	})
-	if err != nil {
-		return err
-	}
-	for _, item := range items {
-		if err := repository.DeletePluginKV(context.Background(), extensionID, item.Key, item.Version); err != nil {
+	return d.withOwnedConfigExecution(context.Background(), "extension-storage-clear", struct {
+		ExtensionID string `json:"extensionId"`
+	}{extensionID}, func(transaction *DurableCallbackTransaction, _ eventstore.Metadata) error {
+		keys, err := transaction.StorageList(context.Background(), extensionID)
+		if err != nil {
 			return err
 		}
-	}
-	return nil
+		for _, key := range keys {
+			if err = transaction.StorageDelete(context.Background(), extensionID, key); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // DurableLegacyConfigView adapts the detached configuration projection to the
@@ -1026,6 +864,14 @@ func (d *Dice) DurableLegacyConfigView(ctx context.Context) (Config, AdvancedCon
 	state, err := d.DurableConfigState(ctx)
 	if err != nil {
 		return Config{}, AdvancedConfig{}, configstate.State{}, err
+	}
+	config, advanced, err := d.legacyConfigViewFromState(state)
+	return config, advanced, state, err
+}
+
+func (d *Dice) legacyConfigViewFromState(state configstate.State) (Config, AdvancedConfig, error) {
+	if err := configstate.ValidateState(state); err != nil {
+		return Config{}, AdvancedConfig{}, err
 	}
 	config := NewConfig(d)
 	config.ConfigVersion = state.ConfigVersion
@@ -1153,6 +999,8 @@ func (d *Dice) DurableLegacyConfigView(ctx context.Context) (Config, AdvancedCon
 	config.StoreConfig = StoreConfig{BackendUrls: append([]string(nil), state.Store.BackendURLs...), DisabledBackendUrls: append([]string(nil), state.Store.DisabledBackendURLs...)}
 	config.CommandPrefix = append([]string(nil), state.Outer.CommandPrefix...)
 	config.DiceMasters = append([]string(nil), state.Outer.DiceMasters...)
+	config.UpgradeWindowID = state.Outer.UpgradeWindowID
+	config.UpgradeEndpointID = state.Outer.UpgradeEndpointID
 
 	advanced := AdvancedConfig{
 		Show:                              state.Advanced.Show,
@@ -1163,5 +1011,5 @@ func (d *Dice) DurableLegacyConfigView(ctx context.Context) (Config, AdvancedCon
 		ExposeDangerousSealInst:           state.Advanced.ExposeDangerousSealInst,
 		AllowFilesystemUnrestrictedAccess: state.Advanced.AllowFilesystemUnrestrictedAccess,
 	}
-	return config, advanced, state, nil
+	return config, advanced, nil
 }

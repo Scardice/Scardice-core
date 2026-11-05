@@ -204,7 +204,8 @@ func (m *JSRuntimeManager) scriptMetadataCacheKey() string {
 }
 
 func (d *Dice) disableJSRuntime(err error) {
-	(&d.Config).JsEnable = false
+	// JsEnable is durable desired configuration. A provider failure is
+	// operational state reported by JSRuntimeManager and must not rewrite it.
 	if d.Logger != nil {
 		d.Logger.Errorf("JS runtime 初始化失败: %v", err)
 	}
@@ -484,7 +485,11 @@ func (d *Dice) jsRuntimeDefaultsForPackage(packageID string) ([2]jsengine.Engine
 		return defaults, 0
 	}
 	d.configUpdateMu.Lock()
-	route := strings.TrimSpace(d.Config.JsRuntimeRoutes[packageID])
+	config := d.Config()
+	route := ""
+	if config != nil {
+		route = strings.TrimSpace(config.JsRuntimeRoutes[packageID])
+	}
 	global := d.configuredJSEngine()
 	d.configUpdateMu.Unlock()
 

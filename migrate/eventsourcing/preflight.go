@@ -32,9 +32,6 @@ func DecidePreflight(ctx context.Context, request Request, targetIdentity string
 		if inventory != nil {
 			return PreflightDecision{}, ErrSourceMutation
 		}
-		if strings.TrimSpace(readiness.IndexRootID) == "" {
-			return PreflightDecision{}, eventstore.ErrReadinessInvalid
-		}
 		return PreflightDecision{Mode: ModeFresh, TargetIdentity: targetIdentity}, nil
 	}
 	if inventory == nil {
@@ -78,9 +75,6 @@ func DecidePreflight(ctx context.Context, request Request, targetIdentity string
 	}
 	if !inventory.LegacyOwnershipComplete {
 		return PreflightDecision{}, &UnsupportedPreflightError{Feature: "complete legacy ownership map"}
-	}
-	if strings.TrimSpace(readiness.IndexRootID) == "" {
-		return PreflightDecision{}, eventstore.ErrReadinessInvalid
 	}
 	if len(inventory.Records) > MaxManifestRecords {
 		return PreflightDecision{}, ErrBatchLimit

@@ -294,9 +294,13 @@ func (d *Dice) validateNativeFilesystemBytes(data []byte, write bool) error {
 	if d == nil {
 		return errors.New("native filesystem service is unavailable")
 	}
-	limitMiB := d.Config.QuickJSMaxFilesystemReadMiB
+	config := d.Config()
+	if config == nil {
+		return errors.New("native filesystem configuration is unavailable")
+	}
+	limitMiB := config.QuickJSMaxFilesystemReadMiB
 	if write {
-		limitMiB = d.Config.QuickJSMaxFilesystemWriteMiB
+		limitMiB = config.QuickJSMaxFilesystemWriteMiB
 	}
 	if limitMiB == 0 {
 		return nil

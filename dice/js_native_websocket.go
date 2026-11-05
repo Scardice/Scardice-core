@@ -30,6 +30,7 @@ type nativeWebSocketConnection struct {
 	mu             sync.Mutex
 	writeMu        sync.Mutex
 	conn           *websocket.Conn
+	closed         bool
 	requestedClose *nativeWebSocketCloseRequest
 	close          sync.Once
 }
@@ -52,9 +53,11 @@ type nativeWebSocketCloseRequest struct {
 func newNativeWebSocketService(d *Dice) *nativeWebSocketService {
 	service := &nativeWebSocketService{dialer: *websocket.DefaultDialer}
 	if d != nil {
-		service.maxConnections = d.Config.QuickJSMaxWebSocketConnections
-		if d.Config.QuickJSMaxWebSocketMessageMiB <= ^uint64(0)/(1024*1024) {
-			service.maxMessageBytes = d.Config.QuickJSMaxWebSocketMessageMiB * 1024 * 1024
+		if config := d.Config(); config != nil {
+			service.maxConnections = config.QuickJSMaxWebSocketConnections
+			if config.QuickJSMaxWebSocketMessageMiB <= ^uint64(0)/(1024*1024) {
+				service.maxMessageBytes = config.QuickJSMaxWebSocketMessageMiB * 1024 * 1024
+			}
 		}
 	}
 	return service
@@ -133,20 +136,28 @@ func (s *nativeWebSocketService) Start(call services.AsyncCall) error {
 		}
 	}
 
-	runContext, cancel := context.WithCancel(context.Background())
-	connection := &nativeWebSocketConnection{cancel: cancel, done: make(chan struct{})}
+	asyncContext, release := context.Background(), context.CancelFunc(func() {})
+	if execution := jsOpaqueExecutionContext(call.Call.Context); execution.persistentLineage() {
+		asyncContext, release = execution.AsyncWorkContext()
+	}
+	runContext, cancel := context.WithCancel(asyncContext)
+	cancelWork := func() {
+		cancel()
+		release()
+	}
+	connection := &nativeWebSocketConnection{cancel: cancelWork, done: make(chan struct{})}
 	s.mu.Lock()
 	if s.connections == nil {
 		s.connections = make(map[services.RequestID]*nativeWebSocketConnection)
 	}
 	if _, exists := s.connections[call.ID]; exists {
 		s.mu.Unlock()
-		cancel()
+		cancelWork()
 		return errors.New("WebSocket request already exists")
 	}
 	if s.maxConnections != 0 && uint64(len(s.connections)) >= s.maxConnections {
 		s.mu.Unlock()
-		cancel()
+		cancelWork()
 		return errors.New("WebSocket connection limit reached")
 	}
 	s.connections[call.ID] = connection
@@ -175,6 +186,15 @@ func (s *nativeWebSocketService) run(ctx context.Context, call services.AsyncCal
 		s.remove(call.ID, state)
 		state.shutdown()
 	}()
+	go func() {
+		select {
+		case <-ctx.Done():
+			state.shutdown()
+		case <-call.Call.Cancellation:
+			state.shutdown()
+		case <-state.done:
+		}
+	}()
 
 	dialer := s.dialer
 	dialer.Subprotocols = append([]string(nil), protocols...)
@@ -190,21 +210,22 @@ func (s *nativeWebSocketService) run(ctx context.Context, call services.AsyncCal
 		return
 	}
 	state.mu.Lock()
+	if state.closed || ctx.Err() != nil {
+		state.mu.Unlock()
+		_ = connection.Close()
+		_ = call.Sink.Close(call.ID, services.Response{
+			Status: services.StatusCancelled,
+			String: nativeWebSocketEventJSON(nativeWebSocketEvent{
+				Type: "close", Code: websocket.CloseAbnormalClosure, Reason: context.Canceled.Error(),
+			}),
+		})
+		return
+	}
 	state.conn = connection
 	state.mu.Unlock()
 	if s.maxMessageBytes != 0 {
 		connection.SetReadLimit(int64(s.maxMessageBytes))
 	}
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			state.shutdown()
-		case <-call.Call.Cancellation:
-			state.shutdown()
-		case <-state.done:
-		}
-	}()
 
 	if err := call.Sink.Event(call.ID, services.Response{
 		Status: services.StatusOK,
@@ -331,10 +352,12 @@ func (c *nativeWebSocketConnection) shutdown() {
 		return
 	}
 	c.close.Do(func() {
-		c.cancel()
 		c.mu.Lock()
+		c.closed = true
 		connection := c.conn
+		c.conn = nil
 		c.mu.Unlock()
+		c.cancel()
 		if connection != nil {
 			_ = connection.Close()
 		}

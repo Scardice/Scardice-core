@@ -36,6 +36,9 @@ type ImporterOptions struct {
 	TargetIdentity    string
 	IdentityGenerator func() (string, error)
 	Now               func() time.Time
+	// DropRecordsDir is the data directory under which legacy rows the import
+	// cannot carry forward are recorded (see DropRecordsDirName).
+	DropRecordsDir string
 }
 
 type Importer struct{ options ImporterOptions }
@@ -61,6 +64,10 @@ type ImportResult struct {
 	Batches          int
 	QuarantineMarker string
 	Warnings         []string
+	// Dropped counts the source rows left out of the import; DropRecordsPath
+	// is the fsynced file listing them (empty when nothing was dropped).
+	Dropped         int
+	DropRecordsPath string
 }
 
 func (i *Importer) Run(ctx context.Context, request Request) (result ImportResult, runErr error) {
@@ -87,8 +94,7 @@ func (i *Importer) Run(ctx context.Context, request Request) (result ImportResul
 
 	preflightReadiness := previous
 	if reuse, ok := i.options.Target.(interface{ AllowsReadinessIdentityReuse() bool }); ok &&
-		reuse.AllowsReadinessIdentityReuse() && previous.Mode == string(ModeFresh) &&
-		previous.TerminalGlobalPosition == 0 && previous.TerminalProjectionPosition == 0 {
+		reuse.AllowsReadinessIdentityReuse() && previous.Mode == string(ModeFresh) {
 		inspector, supportsInspection := i.options.Readiness.(interface {
 			HasPersistentState(context.Context) (bool, error)
 		})
@@ -114,7 +120,7 @@ func (i *Importer) Run(ctx context.Context, request Request) (result ImportResul
 			return result, decisionErr
 		}
 		result.Mode, result.TargetIdentity = decision.Mode, decision.TargetIdentity
-		fresh := buildFreshReadiness(previous, target)
+		fresh := buildFreshReadiness(target)
 		if err := i.inject("validate"); err != nil {
 			return result, err
 		}
@@ -178,6 +184,13 @@ func (i *Importer) Run(ctx context.Context, request Request) (result ImportResul
 	if err := i.inject("initialize"); err != nil {
 		return i.quarantine(result, root, err)
 	}
+	if candidate, ok := i.options.Target.(*SQLiteTarget); ok {
+		defer func() {
+			if runErr != nil {
+				runErr = errors.Join(runErr, candidate.discardCandidate())
+			}
+		}()
+	}
 	if err := i.options.Target.Initialize(ctx, target); err != nil {
 		return i.quarantine(result, root, fmt.Errorf("initialize isolated import target: %w", err))
 	}
@@ -210,12 +223,27 @@ func (i *Importer) Run(ctx context.Context, request Request) (result ImportResul
 		}
 		return nil
 	}
+	drops := newDropRecorder(i.options.DropRecordsDir, dropSourceLegacyImport, i.options.Now)
+	if binder, ok := snapshot.Source.(interface{ bindDropRecorder(*dropRecorder) }); ok {
+		binder.bindDropRecorder(drops)
+	}
+	var streamErr error
 	if streamer, ok := snapshot.Source.(RecordStreamer); ok {
 		if err := streamer.StreamRecords(ctx, importRecords); err != nil {
-			return i.quarantine(result, root, fmt.Errorf("stream snapshot records: %w", err))
+			streamErr = fmt.Errorf("stream snapshot records: %w", err)
 		}
 	} else if err := importRecords(decision.Source.Records); err != nil {
-		return i.quarantine(result, root, err)
+		streamErr = err
+	}
+	// The record file is made durable before anything that could make the
+	// dropped rows unrecoverable; a write failure aborts the import.
+	dropPath, dropCount, dropErr := drops.Close()
+	result.Dropped, result.DropRecordsPath = dropCount, dropPath
+	if streamErr != nil {
+		return i.quarantine(result, root, streamErr)
+	}
+	if dropErr != nil {
+		return i.quarantine(result, root, fmt.Errorf("persist dropped legacy rows: %w", dropErr))
 	}
 	sourceCanonical, sourceDigest, sourceManifestErr := canonicalImportManifest(sourceManifest, MaxManifestBytes)
 	if sourceManifestErr != nil {
@@ -226,7 +254,7 @@ func (i *Importer) Run(ctx context.Context, request Request) (result ImportResul
 	if err := i.inject("rebuild"); err != nil {
 		return i.quarantine(result, root, err)
 	}
-	rebuild, rebuildErr := i.options.Target.Rebuild(ctx)
+	_, rebuildErr := i.options.Target.Rebuild(ctx)
 	if rebuildErr != nil {
 		return i.quarantine(result, root, fmt.Errorf("rebuild target projections: %w", rebuildErr))
 	}
@@ -288,10 +316,7 @@ func (i *Importer) Run(ctx context.Context, request Request) (result ImportResul
 		return i.quarantine(result, root, err)
 	}
 	result.ManifestDigest = append([]byte(nil), sourceDigest...)
-	published := buildImportReadiness(
-		targetBaseline, target, sourceCanonical, sourceDigest, projectionAfter, reopenedProjectionDigest,
-		rebuild.TerminalPosition, i.options.Now(),
-	)
+	published := buildImportReadiness(target, i.options.Now())
 	if err := i.inject("publish"); err != nil {
 		return i.quarantine(result, root, err)
 	}

@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/samber/lo"
 	ds "github.com/sealdice/dicescript"
 
 	"Scardice-core/dice/events"
@@ -182,8 +181,18 @@ func RegisterBuiltinExtFun(self *Dice) {
 			_isPersonal := cmdArgs.GetKwarg("my")
 			isPersonal := ctx.MessageType == "private" || _isPersonal != nil
 
-			playerAttrs := lo.Must(ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Player.UserID))
-			groupAttrs := lo.Must(ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Group.GroupID))
+			playerAttrs, err := ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Player.UserID())
+			if err != nil {
+				ctx.setExecutionError(err)
+				ReplyToSender(ctx, msg, "读取个人快捷指令失败："+err.Error())
+				return CmdExecuteResult{Matched: true, Solved: true}
+			}
+			groupAttrs, err := ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Group.GroupID())
+			if err != nil {
+				ctx.setExecutionError(err)
+				ReplyToSender(ctx, msg, "读取群快捷指令失败："+err.Error())
+				return CmdExecuteResult{Matched: true, Solved: true}
+			}
 			subCmd := cmdArgs.GetArgN(1)
 
 		subParse:
@@ -193,7 +202,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 			case "del", "rm":
 				name := cmdArgs.GetArgN(2)
 				key := "$g:alias:" + name
-				m := lo.Must(ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Group.GroupID))
+				m := groupAttrs
 				VarSetValueStr(ctx, "$t指令来源", "群")
 				if isPersonal {
 					key = "$m:alias:" + name
@@ -201,12 +210,16 @@ func RegisterBuiltinExtFun(self *Dice) {
 					VarSetValueStr(ctx, "$t指令来源", "个人")
 				}
 				if cmd, ok := m.LoadX(key); ok {
+					if err = m.Delete(key); err != nil {
+						ctx.setExecutionError(err)
+						ReplyToSender(ctx, msg, "删除快捷指令失败："+err.Error())
+						break
+					}
 					if cmd != nil && cmd.TypeId == ds.VMTypeString {
 						VarSetValueStr(ctx, "$t快捷指令名", name)
 						VarSetValueStr(ctx, "$t旧指令", cmd.Value.(string))
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:快捷指令_删除"))
 					}
-					m.Delete(key)
 				} else {
 					VarSetValueStr(ctx, "$t快捷指令名", name)
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:快捷指令_删除_未定义"))
@@ -263,7 +276,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 				name := subCmd
 				if len(cmdArgs.Args) >= 2 {
 					targetCmd := cmdArgs.GetArgN(2)
-					for _, prefix := range ctx.Session.Parent.CommandPrefix {
+					for _, prefix := range ctx.Session.Parent.CommandPrefixes() {
 						// 这里依然拦截不了先定义了快捷指令，后添加了新的指令前缀导致出现递归的情况，但是一是这种情况少，二是后面执行阶段也有拦截所以问题不大
 						if targetCmd == prefix+"a" || targetCmd == prefix+"&" {
 							ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:快捷指令_禁止"))
@@ -290,17 +303,25 @@ func RegisterBuiltinExtFun(self *Dice) {
 
 				if oldCmd, ok := m.LoadX(key); ok {
 					if oldCmd.TypeId == ds.VMTypeString {
-						m.Store(key, ds.NewStrVal(cmd))
+						if err = m.Store(key, ds.NewStrVal(cmd)); err != nil {
+							ctx.setExecutionError(err)
+							ReplyToSender(ctx, msg, "替换快捷指令失败："+err.Error())
+							break
+						}
 						VarSetValueStr(ctx, "$t快捷指令名", name)
 						VarSetValueStr(ctx, "$t指令", cmd)
 						VarSetValueStr(ctx, "$t旧指令", oldCmd.Value.(string))
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:快捷指令_替换"))
-					} else {
-						// 防止错误的数据一直卡着
-						m.Delete(key)
+					} else if err = m.Delete(key); err != nil {
+						ctx.setExecutionError(err)
+						ReplyToSender(ctx, msg, "清理无效快捷指令失败："+err.Error())
 					}
 				} else {
-					m.Store(key, ds.NewStrVal(cmd))
+					if err = m.Store(key, ds.NewStrVal(cmd)); err != nil {
+						ctx.setExecutionError(err)
+						ReplyToSender(ctx, msg, "新增快捷指令失败："+err.Error())
+						break
+					}
 					VarSetValueStr(ctx, "$t快捷指令名", name)
 					VarSetValueStr(ctx, "$t指令", cmd)
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:快捷指令_新增"))
@@ -333,7 +354,12 @@ func RegisterBuiltinExtFun(self *Dice) {
 			}
 
 			if msg.MessageType == "group" {
-				groupAttrs := lo.Must(ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Group.GroupID))
+				groupAttrs, err := ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Group.GroupID())
+				if err != nil {
+					ctx.setExecutionError(err)
+					ReplyToSender(ctx, msg, "读取群快捷指令失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				cmdValue, ok := groupAttrs.LoadX("$g:alias:" + name)
 				if ok {
 					if cmdValue != nil && cmdValue.TypeId == ds.VMTypeString {
@@ -341,7 +367,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 						targetCmd := strings.Join(args, " ")
 						msg.Message = targetCmd
 						msg.Segment = message.ConvertStringMessage(targetCmd)
-						targetArgs := CommandParse(targetCmd, []string{}, self.CommandPrefix, msg.Platform, false)
+						targetArgs := CommandParse(targetCmd, []string{}, self.CommandPrefixes(), msg.Platform, false)
 						if targetArgs != nil {
 							log.Infof("群快捷指令映射: .&%s -> %s", cmdArgs.CleanArgs, targetCmd)
 							if targetArgs.Command == "a" || targetArgs.Command == "&" {
@@ -359,7 +385,12 @@ func RegisterBuiltinExtFun(self *Dice) {
 				}
 			}
 
-			playerAttrs := lo.Must(ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Player.UserID))
+			playerAttrs, err := ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Player.UserID())
+			if err != nil {
+				ctx.setExecutionError(err)
+				ReplyToSender(ctx, msg, "读取个人快捷指令失败："+err.Error())
+				return CmdExecuteResult{Matched: true, Solved: true}
+			}
 			cmdValue, ok := playerAttrs.LoadX("$m:alias:" + name)
 			if ok {
 				if cmdValue != nil && cmdValue.TypeId == ds.VMTypeString {
@@ -367,7 +398,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 					targetCmd := strings.Join(args, " ")
 					msg.Message = targetCmd
 					msg.Segment = message.ConvertStringMessage(targetCmd)
-					targetArgs := CommandParse(targetCmd, []string{}, self.CommandPrefix, msg.Platform, false)
+					targetArgs := CommandParse(targetCmd, []string{}, self.CommandPrefixes(), msg.Platform, false)
 					if targetArgs != nil {
 						log.Infof("个人快捷指令映射: .&%s -> %s", cmdArgs.CleanArgs, targetCmd)
 						if targetArgs.Command == "a" || targetArgs.Command == "&" {
@@ -427,7 +458,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 					txt := cmdArgs.GetRestArgsFrom(3)
 					if uid != "" && strings.HasPrefix(uid, ctx.EndPoint.Platform) && txt != "" {
 						isGroup := strings.Contains(uid, "-Group:")
-						txt = fmt.Sprintf("本消息由骰主<%s>通过指令发送:\n", ctx.Player.Name) + txt
+						txt = fmt.Sprintf("本消息由骰主<%s>通过指令发送:\n", ctx.Player.Name()) + txt
 						if isGroup {
 							ReplyGroup(ctx, &Message{GroupID: uid}, txt)
 						} else {
@@ -442,8 +473,9 @@ func RegisterBuiltinExtFun(self *Dice) {
 			case "help", "":
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 			default:
-				if self.Config.MailEnable {
+				if self.Config().MailEnable {
 					if err := ctx.Dice.SendMail(cmdArgs.CleanArgs, MailTypeSendNote, NoticeTypeSend); err != nil {
+						ctx.setExecutionError(err)
 						ctx.Dice.Logger.Errorf("留言邮件发送失败: %v", err)
 						ReplyToSender(ctx, msg, "留言邮件发送失败，请稍后再试。")
 						return CmdExecuteResult{Matched: true, Solved: true}
@@ -453,13 +485,13 @@ func RegisterBuiltinExtFun(self *Dice) {
 				}
 				text := ""
 				if ctx.IsCurGroupBotOn {
-					text += fmt.Sprintf("一条来自群组<%s>(%s)，作者<%s>(%s)的留言:\n", ctx.Group.GroupName, ctx.Group.GroupID, ctx.Player.Name, ctx.Player.UserID)
+					text += fmt.Sprintf("一条来自群组<%s>(%s)，作者<%s>(%s)的留言:\n", ctx.Group.GroupName(), ctx.Group.GroupID(), ctx.Player.Name(), ctx.Player.UserID())
 				} else {
-					text += fmt.Sprintf("一条来自私聊，作者<%s>(%s)的留言:\n", ctx.Player.Name, ctx.Player.UserID)
+					text += fmt.Sprintf("一条来自私聊，作者<%s>(%s)的留言:\n", ctx.Player.Name(), ctx.Player.UserID())
 				}
 				text += cmdArgs.CleanArgs
 
-				for _, target := range filterNoticeTargets(ctx.Dice.Config.NoticeIDs, NoticeTypeSend) {
+				for _, target := range filterNoticeTargets(ctx.Dice.Config().NoticeIDs, NoticeTypeSend) {
 					if !sendNoticeTargetCrossPlatform(ctx, target, text) {
 						ctx.Dice.Logger.Errorf("未能向通知目标 %s 发送留言", target.ID)
 					}
@@ -488,17 +520,23 @@ func RegisterBuiltinExtFun(self *Dice) {
 			}
 
 			if cmdArgs.IsArgEqual(1, "on") {
-				ctx.Group.ShowGroupWelcome = true
-				ctx.Group.MarkDirty(ctx.Dice)
+				if err := ctx.Group.SetShowGroupWelcome(true); err != nil {
+					ctx.setExecutionError(err)
+					ReplyToSender(ctx, msg, "开启入群欢迎语失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				ReplyToSender(ctx, msg, "入群欢迎语已打开")
 			} else if cmdArgs.IsArgEqual(1, "off") {
-				ctx.Group.ShowGroupWelcome = false
-				ctx.Group.MarkDirty(ctx.Dice)
+				if err := ctx.Group.SetShowGroupWelcome(false); err != nil {
+					ctx.setExecutionError(err)
+					ReplyToSender(ctx, msg, "关闭入群欢迎语失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				ReplyToSender(ctx, msg, "入群欢迎语已关闭")
 			} else if cmdArgs.IsArgEqual(1, "show") {
-				welcome := ctx.Group.GroupWelcomeMessage
+				welcome := ctx.Group.GroupWelcomeMessage()
 				var info string
-				if ctx.Group.ShowGroupWelcome {
+				if ctx.Group.ShowGroupWelcome() {
 					info = "\n状态: 开启"
 				} else {
 					info = "\n状态: 关闭"
@@ -506,9 +544,11 @@ func RegisterBuiltinExtFun(self *Dice) {
 				ReplyToSender(ctx, msg, "当前欢迎语:\n"+welcome+info)
 			} else if _, ok := cmdArgs.EatPrefixWith("set"); ok {
 				text2 := strings.TrimSpace(cmdArgs.RawArgs[len("set"):])
-				ctx.Group.GroupWelcomeMessage = text2
-				ctx.Group.ShowGroupWelcome = true
-				ctx.Group.MarkDirty(ctx.Dice)
+				if err := ctx.Group.SetWelcome(true, text2); err != nil {
+					ctx.setExecutionError(err)
+					ReplyToSender(ctx, msg, "设置入群欢迎语失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				ReplyToSender(ctx, msg, "当前欢迎语设定为:\n"+text2+"\n入群欢迎语已自动打开(注意，会在bot off时起效)")
 			} else {
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
@@ -551,7 +591,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 			}
 			rpSeed := (time.Now().Unix() + (8 * 60 * 60)) / (24 * 60 * 60)
 			rpSeed += int64(fingerprint(ctx.EndPoint.UserID))
-			rpSeed += int64(fingerprint(ctx.Player.UserID))
+			rpSeed += int64(fingerprint(ctx.Player.UserID()))
 			randItem := rand.NewSource(rpSeed)
 			rp := randItem.Int63()%100 + 1
 
@@ -594,7 +634,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 					detail = "{" + strings.Join(results, "+") + "}\n"
 				}
 
-				text := fmt.Sprintf("<%s>骰点%dD6:\n", ctx.Player.Name, num)
+				text := fmt.Sprintf("<%s>骰点%dD6:\n", ctx.Player.Name(), num)
 				text += detail
 				text += fmt.Sprintf("成功度:%d/%d\n", successDegrees, failedCount)
 
@@ -801,7 +841,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 				checkText = "奇迹成功"
 			}
 
-			text := fmt.Sprintf("<%s>的“%s”共鸣性怪异规则检定:\n", ctx.Player.Name, showName)
+			text := fmt.Sprintf("<%s>的“%s”共鸣性怪异规则检定:\n", ctx.Player.Name(), showName)
 			text += detailPool
 			text += fmt.Sprintf("判定值: %d%s\n", checkVal, detail)
 			text += fmt.Sprintf("成功数: %d[%s]\n", successDegrees, checkText)
@@ -895,7 +935,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 				ss = append(ss, text)
 			}
 			info := strings.Join(ss, "\n")
-			ReplyToSender(ctx, msg, fmt.Sprintf("<%s>的共鸣性怪异人物做成:\n%s", ctx.Player.Name, info))
+			ReplyToSender(ctx, msg, fmt.Sprintf("<%s>的共鸣性怪异人物做成:\n%s", ctx.Player.Name(), info))
 			return CmdExecuteResult{Matched: true, Solved: true}
 		},
 	}
@@ -956,16 +996,25 @@ func RegisterBuiltinExtFun(self *Dice) {
 		ShortHelp: helpWW,
 		Help:      "骰池(WOD/无限规则骰点):\n" + helpWW,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
-			groupAttrs := lo.Must(ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Group.GroupID))
+			groupAttrs, err := ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Group.GroupID())
+			if err != nil {
+				ctx.setExecutionError(err)
+				ReplyToSender(ctx, msg, "读取骰池设定失败："+err.Error())
+				return CmdExecuteResult{Matched: true, Solved: true}
+			}
 			switch cmdArgs.GetArgN(1) {
 			case "help":
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 			case "set":
 				arg2 := cmdArgs.GetArgN(2)
 				if arg2 == "clr" || arg2 == "clear" {
-					groupAttrs.Delete("wodThreshold")
-					groupAttrs.Delete("wodPoints")
-					groupAttrs.Delete("wodAdd")
+					for _, key := range []string{"wodThreshold", "wodPoints", "wodAdd"} {
+						if err = groupAttrs.Delete(key); err != nil {
+							ctx.setExecutionError(err)
+							ReplyToSender(ctx, msg, "清除骰池设定失败："+err.Error())
+							return CmdExecuteResult{Matched: true, Solved: true}
+						}
+					}
 					ReplyToSender(ctx, msg, "骰池设定已恢复默认")
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
@@ -976,7 +1025,11 @@ func RegisterBuiltinExtFun(self *Dice) {
 				if m := reK.FindStringSubmatch(arg2); len(m) > 0 {
 					if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
 						if v >= 1 {
-							groupAttrs.Store("wodThreshold", ds.NewIntVal(ds.IntType(v)))
+							if err = groupAttrs.Store("wodThreshold", ds.NewIntVal(ds.IntType(v))); err != nil {
+								ctx.setExecutionError(err)
+								ReplyToSender(ctx, msg, "修改骰池设定失败："+err.Error())
+								return CmdExecuteResult{Matched: true, Solved: true}
+							}
 							texts = append(texts, fmt.Sprintf("成功线k: 已修改为%d", v))
 						} else {
 							texts = append(texts, "成功线k: 需要至少为1")
@@ -987,7 +1040,11 @@ func RegisterBuiltinExtFun(self *Dice) {
 				if m := reM.FindStringSubmatch(arg2); len(m) > 0 {
 					if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
 						if v >= 1 && v <= 2000 {
-							groupAttrs.Store("wodPoints", ds.NewIntVal(ds.IntType(v)))
+							if err = groupAttrs.Store("wodPoints", ds.NewIntVal(ds.IntType(v))); err != nil {
+								ctx.setExecutionError(err)
+								ReplyToSender(ctx, msg, "修改骰池设定失败："+err.Error())
+								return CmdExecuteResult{Matched: true, Solved: true}
+							}
 							texts = append(texts, fmt.Sprintf("骰子面数m: 已修改为%d", v))
 						} else {
 							texts = append(texts, "骰子面数m: 需要在1-2000之间")
@@ -998,7 +1055,11 @@ func RegisterBuiltinExtFun(self *Dice) {
 				if m := reA.FindStringSubmatch(arg2); len(m) > 0 {
 					if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
 						if v >= 2 {
-							groupAttrs.Store("wodAdd", ds.NewIntVal(ds.IntType(v)))
+							if err = groupAttrs.Store("wodAdd", ds.NewIntVal(ds.IntType(v))); err != nil {
+								ctx.setExecutionError(err)
+								ReplyToSender(ctx, msg, "修改骰池设定失败："+err.Error())
+								return CmdExecuteResult{Matched: true, Solved: true}
+							}
 							texts = append(texts, fmt.Sprintf("加骰线a: 已修改为%d", v))
 						} else {
 							texts = append(texts, "加骰线a: 需要至少为2")
@@ -1049,7 +1110,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 		ShortHelp: textHelp,
 		Help:      "文本模板指令:\n" + textHelp,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
-			if ctx.Dice.Config.TextCmdTrustOnly {
+			if ctx.Dice.Config().TextCmdTrustOnly {
 				// 检查master和信任权限
 				// 拒绝无权限访问
 				if ctx.PrivilegeLevel < 70 {
@@ -1138,7 +1199,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 			if m == 0 {
 				m = int(getDefaultDicePoints(ctx))
 			}
-			if t > int(ctx.Dice.Config.MaxExecuteTime) {
+			if t > int(ctx.Dice.Config().MaxExecuteTime) {
 				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰点_轮数过多警告"))
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
@@ -1170,7 +1231,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 				Pool: pool,
 			}
 
-			rouletteMap.Store(ctx.Group.GroupID, roulette)
+			rouletteMap.Store(ctx.Group.GroupID(), roulette)
 			VarSetValueStr(ctx, "$t原因", allArgClean)
 			if allArgClean != "" {
 				forWhatText := DiceFormatTmpl(ctx, "核心:骰点_原因")
@@ -1228,7 +1289,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 				}
 
 				// NOTE(Xiangze Li): 允许创建更多轮数。使用洗牌算法后并不会很重复计算
-				// if roulette.Time > int(ctx.Dice.Config.MaxExecuteTime) {
+				// if roulette.Time > int(ctx.Dice.Config().MaxExecuteTime) {
 				// 	ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰点_轮数过多警告"))
 				// 	return CmdExecuteResult{Matched: true, Solved: true}
 				// }
@@ -1254,7 +1315,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 				}
 				roulette.Pool = pool
 
-				rouletteMap.Store(ctx.Group.GroupID, roulette)
+				rouletteMap.Store(ctx.Group.GroupID(), roulette)
 				ReplyToSender(ctx, msg, fmt.Sprintf("创建骰池%s成功，骰子面数%d，可抽取%d次。",
 					roulette.Name, roulette.Face, roulette.Time))
 				return CmdExecuteResult{Matched: true, Solved: true}
@@ -1265,7 +1326,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 				isRouletteEmpty = false
 				return false
 			})
-			tryLoad, ok := rouletteMap.Load(ctx.Group.GroupID)
+			tryLoad, ok := rouletteMap.Load(ctx.Group.GroupID())
 			if isRouletteEmpty || !ok || tryLoad.Face == 0 {
 				ReplyToSender(ctx, msg, "当前群组无骰池，请使用.drl new创建一个。")
 				return CmdExecuteResult{Matched: true, Solved: true}
@@ -1293,7 +1354,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 			case "drlh":
 				announce := msg.Sender.Nickname + "进行了抽取。"
 				reply += fmt.Sprintf("\n来自群%s(%s)",
-					ctx.Group.GroupName, ctx.Group.GroupID)
+					ctx.Group.GroupName(), ctx.Group.GroupID())
 				if len(tryLoad.Pool) == 0 {
 					announce += "\n骰池已经抽空，现在关闭。"
 					tryLoad = singleRoulette{}
@@ -1301,7 +1362,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 				ReplyGroup(ctx, msg, announce)
 				ReplyPerson(ctx, msg, reply)
 			}
-			rouletteMap.Store(ctx.Group.GroupID, tryLoad)
+			rouletteMap.Store(ctx.Group.GroupID(), tryLoad)
 			return CmdExecuteResult{
 				Matched: true,
 				Solved:  true,
@@ -1323,7 +1384,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 		},
 		OnPoke: func(ctx *MsgContext, event *events.PokeEvent) {
 			// 检查设置中是否开启
-			if !ctx.Dice.Config.QQEnablePoke {
+			if !ctx.Dice.Config().QQEnablePoke {
 				return
 			}
 			if event.TargetID == ctx.EndPoint.UserID && event.SenderID != ctx.EndPoint.UserID {

@@ -2,7 +2,6 @@ package api
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"mime/multipart"
 	"net/http"
@@ -12,16 +11,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	gormsqlite "github.com/glebarez/sqlite"
 	"github.com/labstack/echo/v4"
-	"gorm.io/gorm"
-	gormlogger "gorm.io/gorm/logger"
 
 	"Scardice-core/dice"
 	"Scardice-core/dice/censor"
-	"Scardice-core/dice/service"
-	"Scardice-core/model"
-	"Scardice-core/utils/constant"
 )
 
 const uiAPIContractToken = "ui-api-contract-token"
@@ -75,8 +68,11 @@ func TestDiceExecSplitOptionsEndpointContract(t *testing.T) {
 
 func TestStoreRemoveBackendBindsAxiosDeleteQuery(t *testing.T) {
 	const targetURL = "https://custom-store.example/dice/api/store"
-	testDice := &dice.Dice{Config: dice.Config{StoreConfig: dice.StoreConfig{BackendUrls: []string{targetURL}}}}
-	setUpUIAPIContractDice(t, testDice)
+	_, manager, testDice, _ := newDiceConfigDurableHandlerTest(t)
+	manager.AccessTokens.Store(uiAPIContractToken, true)
+	updateAPITestConfig(t, testDice, func(config *dice.Config) {
+		config.BackendUrls = []string{targetURL}
+	})
 	testDice.StoreManager = dice.NewStoreManager(testDice)
 
 	query := url.Values{"url": []string{targetURL}}
@@ -90,8 +86,8 @@ func TestStoreRemoveBackendBindsAxiosDeleteQuery(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("storeRemoveBackend() status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
 	}
-	if len(testDice.Config.BackendUrls) != 0 {
-		t.Fatalf("backend URLs after removal = %#v, want target removed", testDice.Config.BackendUrls)
+	if urls := testDice.Config().BackendUrls; len(urls) != 0 {
+		t.Fatalf("backend URLs after removal = %#v, want target removed", urls)
 	}
 }
 
@@ -101,13 +97,14 @@ func TestCensorDeleteWordFilesBindsAxiosBracketedArrayQuery(t *testing.T) {
 	if err := os.WriteFile(filePath, []byte("word"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	testDice := &dice.Dice{
-		Config: dice.Config{CensorConfig: dice.CensorConfig{EnableCensor: true}},
-		CensorManager: &dice.CensorManager{
-			SensitiveWordsFiles: map[string]*censor.WordFile{fileKey: {Key: fileKey, Path: filePath}},
-		},
+	_, manager, testDice, _ := newDiceConfigDurableHandlerTest(t)
+	manager.AccessTokens.Store(uiAPIContractToken, true)
+	updateAPITestConfig(t, testDice, func(config *dice.Config) {
+		config.EnableCensor = true
+	})
+	testDice.CensorManager = &dice.CensorManager{
+		SensitiveWordsFiles: map[string]*censor.WordFile{fileKey: {Key: fileKey, Path: filePath}},
 	}
-	setUpUIAPIContractDice(t, testDice)
 
 	query := url.Values{}
 	query.Add("keys[]", fileKey)
@@ -129,67 +126,6 @@ func TestCensorDeleteWordFilesBindsAxiosBracketedArrayQuery(t *testing.T) {
 	}
 	if _, exists := testDice.CensorManager.SensitiveWordsFiles[fileKey]; exists {
 		t.Fatalf("censor file %q remains registered after DELETE", fileKey)
-	}
-}
-
-type uiAPIContractLogOperator struct {
-	db *gorm.DB
-}
-
-func (o *uiAPIContractLogOperator) Init(context.Context) error { return nil }
-func (o *uiAPIContractLogOperator) Type() string               { return constant.SQLITE }
-func (o *uiAPIContractLogOperator) DBCheck()                   {}
-func (o *uiAPIContractLogOperator) GetDataDB(constant.DBMode) *gorm.DB {
-	return o.db
-}
-func (o *uiAPIContractLogOperator) GetLogDB(constant.DBMode) *gorm.DB {
-	return o.db
-}
-func (o *uiAPIContractLogOperator) GetCensorDB(constant.DBMode) *gorm.DB {
-	return o.db
-}
-func (o *uiAPIContractLogOperator) Close() {}
-
-func TestStoryDeleteLogBindsAxiosDeleteQuery(t *testing.T) {
-	db, err := gorm.Open(gormsqlite.Open(filepath.Join(t.TempDir(), "story.db")), &gorm.Config{
-		Logger: gormlogger.Default.LogMode(gormlogger.Silent),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = sqlDB.Close() })
-	if err := db.AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}); err != nil {
-		t.Fatal(err)
-	}
-	const groupID, name = "QQ-Group:contract", "contract-story"
-	if err := db.Create(&model.LogInfo{GroupID: groupID, Name: name}).Error; err != nil {
-		t.Fatal(err)
-	}
-	testDice := &dice.Dice{DBOperator: &uiAPIContractLogOperator{db: db}}
-	testDice.LogRepository = service.NewLegacyLogRepository(testDice.DBOperator, testDice.BaseConfig.Name)
-	setUpUIAPIContractDice(t, testDice)
-
-	query := url.Values{"groupId": []string{groupID}, "name": []string{name}}
-	req := httptest.NewRequest(http.MethodDelete, "/sd-api/story/log?"+query.Encode(), nil)
-	req.Header.Set("Token", uiAPIContractToken)
-	recorder := httptest.NewRecorder()
-	ctx := echo.New().NewContext(req, recorder)
-	if err := storyDelLog(ctx); err != nil {
-		t.Fatalf("storyDelLog() error = %v", err)
-	}
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("storyDelLog() status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
-	}
-	var remaining int64
-	if err := db.Model(&model.LogInfo{}).Where("group_id = ? AND name = ?", groupID, name).Count(&remaining).Error; err != nil {
-		t.Fatal(err)
-	}
-	if remaining != 0 {
-		t.Fatalf("matching story log rows remaining = %d, want 0", remaining)
 	}
 }
 

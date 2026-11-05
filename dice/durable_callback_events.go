@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -36,6 +37,7 @@ func (h *DurableCallbackHost) handleInboundEvent(
 		Dice: h.dice, Session: session, EndPoint: endpoint,
 		MessageType: message.MessageType, IsPrivate: message.MessageType == "private",
 		callbackTransaction: transaction, callbackMetadata: metadata,
+		executionContext: transaction.executionContext,
 	}
 	sender := string(inbound.Sender)
 	subject := string(inbound.Subject)
@@ -45,53 +47,136 @@ func (h *DurableCallbackHost) handleInboundEvent(
 	}
 	log := h.dice.Logger
 
-	// bindPlayer loads the acting member's state. Requests and departures are
-	// answered without it, so strangers do not acquire player state.
-	bindPlayer := func() {
-		mctx.Group, mctx.Player = GetPlayerInfoBySender(mctx, message)
-		if mctx.Player != nil && mctx.Player.Name == "" {
-			mctx.Player.Name = message.Sender.Nickname
-			if mctx.Player.Name == "" {
-				mctx.Player.Name = message.Sender.UserID
+	setPlayerName := func() error {
+		if mctx.Player == nil || mctx.Player.Name() != "" {
+			return nil
+		}
+		name := message.Sender.Nickname
+		if name == "" {
+			name = message.Sender.UserID
+		}
+		return mctx.Player.SetName(name)
+	}
+	// observeGroupName commits the group name the provider supplied with this
+	// event through the group owner command; an unnamed event changes nothing.
+	observeGroupName := func(group *GroupInfo) error {
+		name := inbound.ConversationName
+		if group == nil || groupID == "" || name == "" || inbound.ConversationKind != adapterapi.ConversationKindGroup || group.GroupName() == name {
+			return nil
+		}
+		return group.SetGroupName(name)
+	}
+	bindPlayer := func(create bool) error {
+		var err error
+		if create {
+			mctx.Group, mctx.Player, err = GetPlayerInfoBySender(mctx, message)
+		} else {
+			conversationID := groupID
+			if mctx.IsPrivate {
+				if message.Sender.UserID == "" {
+					return nil
+				}
+				conversationID = "PG-" + message.Sender.UserID
 			}
-			if mctx.Group != nil {
-				mctx.Group.MarkDirty(mctx.Dice)
+			if conversationID == "" {
+				return nil
 			}
+			err = mctx.ResolveExistingDomainConversation(conversationID, message.Sender.UserID)
+		}
+		if err != nil {
+			mctx.setExecutionError(err)
+			return err
+		}
+		if err = setPlayerName(); err != nil {
+			mctx.setExecutionError(err)
+			return err
+		}
+		if err = observeGroupName(mctx.Group); err != nil {
+			mctx.setExecutionError(err)
+			return err
 		}
 		mctx.fillPrivilege(message)
+		return nil
+	}
+	bindExistingGroup := func() error {
+		if groupID == "" {
+			return nil
+		}
+		if err := mctx.ResolveExistingDomainConversation(groupID, ""); err != nil {
+			mctx.setExecutionError(err)
+			return err
+		}
+		return nil
 	}
 
 	switch inbound.Event {
 	case adapterapi.InboundEventPoke:
-		bindPlayer()
+		if err := bindPlayer(false); err != nil {
+			return mctx, false, err
+		}
+		if mctx.Group == nil {
+			return mctx, false, nil
+		}
 		session.OnPoke(mctx, &events.PokeEvent{GroupID: groupID, SenderID: sender, TargetID: subject, IsPrivate: mctx.IsPrivate})
 	case adapterapi.InboundEventMemberJoined:
 		message.Sender.UserID = subject
 		if inbound.SubjectName != "" {
 			message.Sender.Nickname = inbound.SubjectName
 		}
-		bindPlayer()
+		if err := bindPlayer(true); err != nil {
+			return mctx, false, err
+		}
 		session.OnGroupMemberJoined(mctx, message)
 	case adapterapi.InboundEventSelfJoined:
 		// The unified join handler expects the inviter in Sender.
 		message.Sender.UserID = sender
-		bindPlayer()
-		mctx.Group = SetBotOnAtGroup(mctx, groupID)
+		if err := bindPlayer(true); err != nil {
+			return mctx, false, err
+		}
+		group, err := SetBotOnAtGroup(mctx, groupID)
+		if err != nil {
+			mctx.setExecutionError(err)
+			return mctx, false, err
+		}
+		mctx.Group = group
+		if err = observeGroupName(group); err != nil {
+			mctx.setExecutionError(err)
+			return mctx, false, err
+		}
 		session.OnGroupJoined(mctx, message)
 	case adapterapi.InboundEventSelfRemoved:
+		if err := bindExistingGroup(); err != nil {
+			return mctx, false, err
+		}
 		session.OnGroupLeave(mctx, &events.GroupLeaveEvent{GroupID: groupID, UserID: subject, OperatorID: string(inbound.Operator)})
+		if err := mctx.getExecutionError(); err != nil {
+			return mctx, false, err
+		}
+		if err := h.handleSelfLeft(mctx, session, endpoint, groupID); err != nil {
+			mctx.setExecutionError(err)
+			return mctx, false, err
+		}
 		return mctx, false, nil
 	case adapterapi.InboundEventSelfLeft:
-		h.handleSelfLeft(mctx, session, endpoint, groupID)
+		if err := h.handleSelfLeft(mctx, session, endpoint, groupID); err != nil {
+			mctx.setExecutionError(err)
+			return mctx, false, err
+		}
 		return mctx, false, nil
 	case adapterapi.InboundEventSelfMuted:
+		if err := bindExistingGroup(); err != nil {
+			return mctx, false, err
+		}
 		operator := string(inbound.Operator)
 		if operator == "" {
 			operator = sender
 		}
 		groupName := h.dice.Parent.TryGetGroupName(groupID)
 		userName := h.dice.Parent.TryGetUserName(operator)
-		h.dice.Config.BanList.AddScoreByGroupMuted(operator, groupID, mctx)
+		if err := h.dice.Config().BanList.AddScoreByGroupMutedForContext(operator, groupID, mctx); err != nil {
+			mctx.setExecutionError(err)
+			return mctx, false, err
+		}
 		duration := fmt.Sprintf("%d秒", inbound.DurationSeconds)
 		if inbound.DurationSeconds == math.MaxUint32 {
 			duration = "永久"
@@ -100,64 +185,89 @@ func (h *DurableCallbackHost) handleInboundEvent(
 		log.Info(txt)
 		mctx.Notice(txt)
 	case adapterapi.InboundEventFriendAdded:
-		bindPlayer()
+		if err := bindPlayer(true); err != nil {
+			return mctx, false, err
+		}
 		message.MessageType, message.Platform = "private", "QQ"
 		welcome := DiceFormatTmpl(mctx, "核心:骰子成为好友")
 		log.Infof("与 %s 成为好友，发送好友致辞: %s", sender, welcome)
 		mctx.setOutboundDelay(friendAddedWelcomeDelay)
 		ReplyPerson(mctx, message, welcome)
 		mctx.setOutboundDelay(0)
+		if err := mctx.getExecutionError(); err != nil {
+			return mctx, false, err
+		}
 		if mctx.Group != nil {
 			for _, wrapper := range mctx.Group.GetActivatedExtList(mctx.Dice) {
 				wrapper.CallOnBecomeFriend(mctx.Dice, mctx, message)
 			}
 		}
 	case adapterapi.InboundEventFriendRequest:
-		h.handleFriendRequest(mctx, inbound, sender)
+		if err := h.handleFriendRequest(mctx, inbound, sender); err != nil {
+			mctx.setExecutionError(err)
+			return mctx, false, err
+		}
 		return mctx, false, nil
 	case adapterapi.InboundEventGroupInvite:
-		h.handleGroupInvite(mctx, inbound, sender, groupID)
+		if err := h.handleGroupInvite(mctx, inbound, sender, groupID); err != nil {
+			mctx.setExecutionError(err)
+			return mctx, false, err
+		}
 		return mctx, false, nil
 	default:
 		return nil, false, ErrUnsupportedDurableInboundKind
 	}
+	if err := mctx.getExecutionError(); err != nil {
+		return mctx, false, err
+	}
 	return mctx, true, nil
 }
 
-// handleSelfLeft removes the bot from the group's roster after it left, was
-// removed, or the group was disbanded.
-func (h *DurableCallbackHost) handleSelfLeft(mctx *MsgContext, session *IMSession, endpoint *EndPointInfo, groupID string) {
+// handleSelfLeft removes the bot from the canonical group roster after it
+// left or the group was disbanded. A departure never creates a missing group.
+func (h *DurableCallbackHost) handleSelfLeft(mctx *MsgContext, session *IMSession, endpoint *EndPointInfo, groupID string) error {
+	if endpoint == nil {
+		return errors.New("dice: endpoint unavailable for self-left event")
+	}
 	log := h.dice.Logger
 	pendingQuit := session.ConsumePendingQuit(groupID, endpoint.UserID)
 	groupName := h.dice.Parent.TryGetGroupName(groupID)
-	quietAutoQuit := pendingQuit != nil && pendingQuit.Origin == QuitOriginAutoInactive && h.dice.Config.QuitInactiveNoticeSummaryMode
-	group, exists := session.ServiceAtNew.Load(groupID)
-	if !exists {
+	quietAutoQuit := pendingQuit != nil && pendingQuit.Origin == QuitOriginAutoInactive &&
+		h.dice.Config().QuitInactiveNoticeSummaryMode
+	if err := mctx.ResolveExistingDomainConversation(groupID, ""); err != nil {
+		return err
+	}
+	if mctx.Group == nil {
 		txt := fmt.Sprintf("离开群组或群解散，删除对应群聊信息失败: <%s>(%s)", groupName, groupID)
 		log.Error(txt)
 		if !quietAutoQuit {
 			mctx.Notice(txt)
 		}
-		return
+		return mctx.getExecutionError()
 	}
-	group.DiceIDExistsMap.Delete(endpoint.UserID)
-	group.MarkDirty(h.dice)
+	if err := mctx.Group.SetActivation(endpoint.UserID, false, false); err != nil {
+		return err
+	}
 	txt := fmt.Sprintf("离开群组或群解散: <%s>(%s)", groupName, groupID)
 	log.Info(txt)
 	if !quietAutoQuit {
 		mctx.Notice(txt)
 	}
+	return mctx.getExecutionError()
 }
 
 // handleFriendRequest applies the endpoint's friend request policy and the
 // operator's verification question and blacklist, then stages the provider
 // answer in the same transaction as the report.
-func (h *DurableCallbackHost) handleFriendRequest(mctx *MsgContext, inbound adapterapi.InboundMessage, userID string) {
+func (h *DurableCallbackHost) handleFriendRequest(mctx *MsgContext, inbound adapterapi.InboundMessage, userID string) error {
 	d := h.dice
 	comment := normalizeOnebotFriendRequestComment(inbound.Text)
-	toMatch := strings.TrimSpace(d.Config.FriendAddComment)
+	toMatch := strings.TrimSpace(d.Config().FriendAddComment)
 	passQuestion := toMatch == "" || comment == DiceFormat(mctx, toMatch) || checkMultiFriendAddVerify(comment, toMatch)
 	blacklist := checkBlackList(userID, "user", "", mctx)
+	if err := mctx.getExecutionError(); err != nil {
+		return err
+	}
 
 	approve := blacklist.Passed && passQuestion
 	extra := "。回答正确"
@@ -184,42 +294,50 @@ func (h *DurableCallbackHost) handleFriendRequest(mctx *MsgContext, inbound adap
 	txt := fmt.Sprintf("收到QQ好友邀请: 邀请人:%s, 验证信息: %s, 是否自动同意: %t%s", strings.TrimPrefix(userID, "QQ:"), shown, answer && approve, extra)
 	d.Logger.Info(txt)
 	mctx.Notice(txt, NoticeTypeInvite)
-	if !answer {
-		return
+	if err := mctx.getExecutionError(); err != nil {
+		return err
 	}
-	h.answerRequest(mctx, adapterapi.EffectTarget{Kind: adapterapi.TargetPerson, Conversation: adapterapi.ConversationID(userID)}, inbound.RequestID, approve, "")
+	if !answer {
+		return nil
+	}
+	return h.answerRequest(mctx, adapterapi.EffectTarget{Kind: adapterapi.TargetPerson, Conversation: adapterapi.ConversationID(userID)}, inbound.RequestID, approve, "")
 }
 
 // handleGroupInvite decides whether to join a group the bot was invited into.
-func (h *DurableCallbackHost) handleGroupInvite(mctx *MsgContext, inbound adapterapi.InboundMessage, inviter, groupID string) {
+func (h *DurableCallbackHost) handleGroupInvite(mctx *MsgContext, inbound adapterapi.InboundMessage, inviter, groupID string) error {
 	d := h.dice
 	txt := fmt.Sprintf("收到QQ加群邀请: 群组<%s>(%s) 邀请人:<%s>(%s)", d.Parent.TryGetGroupName(groupID), groupID, d.Parent.TryGetUserName(inviter), inviter)
 	d.Logger.Info(txt)
 	mctx.Notice(txt, NoticeTypeInvite)
+	if err := mctx.getExecutionError(); err != nil {
+		return err
+	}
 
 	approve, reason := checkPassBlackListGroup(inviter, groupID, mctx)
+	if err := mctx.getExecutionError(); err != nil {
+		return err
+	}
 	if !approve {
 		d.Logger.Infof("群组 %s 加群请求被拒绝，原因为 %s", groupID, reason)
 	}
-	h.answerRequest(mctx, adapterapi.EffectTarget{Kind: adapterapi.TargetGroup, Conversation: adapterapi.ConversationID(groupID)}, inbound.RequestID, approve, reason)
+	return h.answerRequest(mctx, adapterapi.EffectTarget{Kind: adapterapi.TargetGroup, Conversation: adapterapi.ConversationID(groupID)}, inbound.RequestID, approve, reason)
 }
 
-// answerRequest stages the provider answer. A failure to stage is logged
-// rather than returned: the report has already been made and the callback must
-// still commit its state.
-func (h *DurableCallbackHost) answerRequest(mctx *MsgContext, target adapterapi.EffectTarget, requestID string, approve bool, reason string) {
+// answerRequest stages the provider answer in the active callback root. A
+// staging failure aborts the root so an unsubmitted answer is never reported
+// as successful.
+func (h *DurableCallbackHost) answerRequest(mctx *MsgContext, target adapterapi.EffectTarget, requestID string, approve bool, reason string) error {
 	port, ok := h.dice.OutboundBridge.(durableOutboundActionPort)
 	if !ok {
-		h.dice.Logger.Errorf("无法应答请求 %s: 出站桥接不可用", requestID)
-		return
+		return fmt.Errorf("dice: cannot answer request %s: durable outbound action bridge unavailable", requestID)
 	}
-	err := port.SubmitAction(mctx, adapterapi.EffectPayload{
+	if err := port.SubmitAction(mctx, adapterapi.EffectPayload{
 		Kind: adapterapi.EffectPayloadAnswerRequest, Target: target,
 		RequestID: requestID, Approve: approve, Reason: reason,
-	})
-	if err != nil {
-		h.dice.Logger.Errorf("应答请求 %s 失败: %v", requestID, err)
+	}); err != nil {
+		return fmt.Errorf("dice: answer request %s: %w", requestID, err)
 	}
+	return nil
 }
 
 // rememberNames records the display names the provider supplied with an

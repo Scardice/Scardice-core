@@ -28,10 +28,11 @@ func (ctx *MsgContext) noticeInTransaction(txt string, noticeType NoticeType) {
 		}
 	}()
 
+	config := ctx.Dice.Config()
 	sent := false
 	if ctx.EndPoint != nil && ctx.EndPoint.Enable {
 		base := ctx.outboundDelay
-		for index, target := range filterNoticeTargetsForEndpoint(ctx.Dice.Config.NoticeIDs, noticeType, ctx.EndPoint) {
+		for index, target := range filterNoticeTargetsForEndpoint(config.NoticeIDs, noticeType, ctx.EndPoint) {
 			ctx.setOutboundDelay(base + time.Duration(index)*time.Second)
 			sendNoticeToTarget(ctx, target, txt)
 			sent = true
@@ -45,7 +46,7 @@ func (ctx *MsgContext) noticeInTransaction(txt string, noticeType NoticeType) {
 	if ctx.EndPoint != nil {
 		platform = ctx.EndPoint.Platform
 	}
-	if len(filterNoticeTargets(ctx.Dice.Config.NoticeIDs, noticeType)) != 0 {
+	if len(filterNoticeTargets(config.NoticeIDs, noticeType)) != 0 {
 		ctx.Dice.Logger.Errorf("未能发送来自%s的通知：%s", platform, txt)
 	} else {
 		ctx.Dice.Logger.Warnf("因为没有启用接收 %s 分类的通知目标，无法发送来自%s的通知：%s", noticeType, platform, txt)

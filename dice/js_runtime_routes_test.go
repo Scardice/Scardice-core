@@ -30,9 +30,11 @@ func newRuntimeRouteTestManager(t *testing.T) *JSRuntimeManager {
 }
 
 func TestJSRuntimeDefaultsForPackageUsesExtensionRouteThenGlobal(t *testing.T) {
-	d := &Dice{}
-	d.Config.JsEngine = "global"
-	d.Config.JsRuntimeRoutes = map[string]string{"author/extension": "extension-route"}
+	d, _ := newCanonicalTestDice(t)
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.JsEngine = "global"
+		config.JsRuntimeRoutes = map[string]string{"author/extension": "extension-route"}
+	})
 
 	got, count := d.jsRuntimeDefaultsForPackage("author/extension")
 	want := []jsengine.EngineID{"extension-route", "global"}

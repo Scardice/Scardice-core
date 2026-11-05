@@ -4,22 +4,56 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"Scardice-core/core/attributestate"
 	"Scardice-core/core/configstate"
+	"Scardice-core/core/execution"
 	"Scardice-core/core/extensionstate"
-	"Scardice-core/core/messageflow"
 	"Scardice-core/dice/service"
 	"Scardice-core/eventstore"
 
 	ds "github.com/sealdice/dicescript"
-
-	"go.uber.org/zap"
 )
+
+// attributeStreamCount counts staged attribute appends. A callback context for
+// a first-seen group/player also stages those canonical streams in the same
+// root, which is unrelated to the attribute mutation under test.
+func attributeStreamCount(work eventstore.UnitOfWork) int {
+	count := 0
+	for _, stream := range work.Streams {
+		if stream.Stream.AggregateType == attributestate.AggregateType {
+			count++
+		}
+	}
+	return count
+}
+
+func newStateFacadeCallbackContext(
+	t *testing.T,
+	d *Dice,
+	transaction *DurableCallbackTransaction,
+	metadata eventstore.Metadata,
+	groupID string,
+	userID string,
+) *MsgContext {
+	t.Helper()
+	if d.ImSession == nil {
+		d.ImSession = &IMSession{Parent: d}
+	}
+	endpoint := newCanonicalTestEndpoint(d, "QQ:fixture-bot")
+	message := newGroupMsg(groupID, userID, "")
+	ctx, err := NewDomainMsgContext(transaction, d, d.ImSession, endpoint, message)
+	if err != nil {
+		t.Fatalf("build state facade callback context: %v", err)
+	}
+	ctx.callbackMetadata = metadata
+	ctx.executionContext = transaction.executionContext
+	t.Cleanup(ctx.releaseExecutionState)
+	return ctx
+}
 
 func TestDurableCompatibilityConfigAndStorage(t *testing.T) {
 	ctx := context.Background()
@@ -29,14 +63,12 @@ func TestDurableCompatibilityConfigAndStorage(t *testing.T) {
 	}
 	defer db.Close()
 	store := eventstore.NewStore(db,
-		eventstore.WithKeySource(compatKeySource{}),
 		eventstore.WithProjection(configstate.ConfigProjection()),
 		eventstore.WithProjection(extensionstate.ExtensionProjection()),
 	)
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "compat-facade-db", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "compat-facade-db",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -47,6 +79,7 @@ func TestDurableCompatibilityConfigAndStorage(t *testing.T) {
 		ConfigManager: NewConfigManager(t.TempDir() + "/plugin-configs.json"),
 	}
 	d.ConfigManager.SetOwner(d)
+	seedCanonicalTestConfigBaseline(t, d)
 	ext := &ExtInfo{Name: "compat-ext", Version: "1.0.0", IsJsExt: true, dice: d}
 	if err := d.DurableDiscoverExtension(ctx, ext); err != nil {
 		t.Fatal(err)
@@ -110,19 +143,18 @@ func TestDurableTemplateConfigAcceptsAJSONStringList(t *testing.T) {
 	}
 	defer db.Close()
 	store := eventstore.NewStore(db,
-		eventstore.WithKeySource(compatKeySource{}),
 		eventstore.WithProjection(configstate.ConfigProjection()),
 		eventstore.WithProjection(extensionstate.ExtensionProjection()),
 	)
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "template-config-db", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "template-config-db",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	d := &Dice{BaseConfig: BaseConfig{Name: "dice-1"}, DurableStore: store, ConfigManager: NewConfigManager(t.TempDir() + "/plugin-configs.json")}
 	d.ConfigManager.SetOwner(d)
+	seedCanonicalTestConfigBaseline(t, d)
 	ext := &ExtInfo{Name: "http-dependency", Version: "1.0.0", IsJsExt: true, dice: d}
 	if err := d.DurableDiscoverExtension(ctx, ext); err != nil {
 		t.Fatal(err)
@@ -164,13 +196,12 @@ func TestDurableDiscoveryAdoptsImportedIdentityAndDiscoversAfterBaseline(t *test
 	}
 	defer db.Close()
 	store := eventstore.NewStore(db,
-		eventstore.WithKeySource(compatKeySource{}),
+		eventstore.WithProjection(configstate.ConfigProjection()),
 		eventstore.WithProjection(extensionstate.ExtensionProjection()),
 	)
 	if err = store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "identity-db", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "identity-db",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -186,6 +217,7 @@ func TestDurableDiscoveryAdoptsImportedIdentityAndDiscoversAfterBaseline(t *test
 	}
 
 	d := &Dice{BaseConfig: BaseConfig{Name: "dice-1"}, DurableStore: store}
+	seedCanonicalTestConfigBaseline(t, d)
 	imported := &ExtInfo{Name: "imported-ext", Version: "1.0.0", IsJsExt: true}
 	if err = d.DurableDiscoverExtension(ctx, imported); err != nil {
 		t.Fatalf("adopt imported identity: %v", err)
@@ -213,16 +245,15 @@ func TestDurableCallbackTransactionStagesPluginKVWithoutDirectCommit(t *testing.
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(compatKeySource{}))
+	store := eventstore.NewStore(db)
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "callback-plugin-db", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "callback-plugin-db",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	transaction, err := NewDurableCallbackTransaction(store, collector)
+	collector := execution.NewMutationCollector(eventstore.EventFactory{})
+	transaction, err := NewDurableCallbackTransaction(ctx, store, collector, eventstore.Metadata{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,12 +282,12 @@ func TestCallbackContextStorageFacadeStagesReadAfterWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(compatKeySource{}))
-	if err := store.SetReadiness(ctx, eventstore.Readiness{Mode: "import", SchemaVersion: 1, DatabaseIdentity: "callback-context-storage-db", IndexRootID: "index-v1", EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
+	store := eventstore.NewStore(db)
+	if err := store.SetReadiness(ctx, eventstore.Readiness{Mode: "import", SchemaVersion: 2, DatabaseIdentity: "callback-context-storage-db", CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
 		t.Fatal(err)
 	}
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	transaction, err := NewDurableCallbackTransaction(store, collector)
+	collector := execution.NewMutationCollector(eventstore.EventFactory{})
+	transaction, err := NewDurableCallbackTransaction(ctx, store, collector, eventstore.Metadata{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,29 +320,29 @@ func TestDurableCallbackTransactionStagesExtensionConfigWithoutDirectCommit(t *t
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(compatKeySource{}), eventstore.WithProjection(extensionstate.ExtensionProjection()))
+	store := eventstore.NewStore(db, eventstore.WithProjection(extensionstate.ExtensionProjection()))
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "callback-config-db", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "callback-config-db",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	transaction, err := NewDurableCallbackTransaction(store, collector)
+	collector := execution.NewMutationCollector(eventstore.EventFactory{})
+	transaction, err := NewDurableCallbackTransaction(ctx, store, collector, eventstore.Metadata{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	d := &Dice{BaseConfig: BaseConfig{Name: "dice-1"}, DurableStore: store}
 	metadata := eventstore.Metadata{CommandID: "inbox-1", CorrelationID: "inbox-1", OccurredAt: time.Unix(2, 0).UTC()}
 	identity := extensionstate.ExtensionIdentity{ID: "callback-ext", Name: "callback-ext", Version: "1.0.0", Source: "js"}
 	definition := extensionstate.ConfigDefinition{ExtensionID: identity.ID, Key: "enabled", Type: extensionstate.ConfigBool, Default: extensionstate.BoolValue(false), DefaultSet: true}
-	if err := transaction.StageExtensionCommand(extensionstate.State{}, extensionstate.Command{Kind: extensionstate.CommandDiscover, DiceID: "dice-1", Identity: identity}, metadata); err != nil {
+	if err := d.ContributeExtensionCommand(ctx, transaction.Domain(), metadata, extensionstate.Command{Kind: extensionstate.CommandDiscover, DiceID: "dice-1", Identity: identity}); err != nil {
 		t.Fatal(err)
 	}
-	if err := transaction.StageExtensionCommand(extensionstate.State{}, extensionstate.Command{Kind: extensionstate.CommandRegisterConfig, ExtensionID: identity.ID, Definition: definition}, metadata); err != nil {
+	if err := d.ContributeExtensionCommand(ctx, transaction.Domain(), metadata, extensionstate.Command{Kind: extensionstate.CommandRegisterConfig, ExtensionID: identity.ID, Definition: definition}); err != nil {
 		t.Fatal(err)
 	}
-	if err := transaction.StageExtensionCommand(extensionstate.State{}, extensionstate.Command{Kind: extensionstate.CommandSetConfig, ExtensionID: identity.ID, Key: definition.Key, Value: extensionstate.BoolValue(true)}, metadata); err != nil {
+	if err := d.ContributeExtensionCommand(ctx, transaction.Domain(), metadata, extensionstate.Command{Kind: extensionstate.CommandSetConfig, ExtensionID: identity.ID, Key: definition.Key, Value: extensionstate.BoolValue(true)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := transaction.Finalize(ctx); err != nil {
@@ -336,8 +367,8 @@ func TestCallbackContextConfigFacadeStagesReadAfterWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(compatKeySource{}), eventstore.WithProjection(extensionstate.ExtensionProjection()))
-	if err := store.SetReadiness(ctx, eventstore.Readiness{Mode: "import", SchemaVersion: 1, DatabaseIdentity: "callback-context-config-db", IndexRootID: "index-v1", EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
+	store := eventstore.NewStore(db, eventstore.WithProjection(extensionstate.ExtensionProjection()))
+	if err := store.SetReadiness(ctx, eventstore.Readiness{Mode: "import", SchemaVersion: 2, DatabaseIdentity: "callback-context-config-db", CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
 		t.Fatal(err)
 	}
 	repository := extensionstate.NewRepository(store)
@@ -370,8 +401,8 @@ func TestCallbackContextConfigFacadeStagesReadAfterWrite(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	transaction, err := NewDurableCallbackTransaction(store, collector)
+	collector := execution.NewMutationCollector(eventstore.EventFactory{})
+	transaction, err := NewDurableCallbackTransaction(ctx, store, collector, eventstore.Metadata{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,12 +419,12 @@ func TestCallbackContextConfigFacadeStagesReadAfterWrite(t *testing.T) {
 	if value, ok, err := messageCtx.ExtensionConfigValue("callback-ext", "access token"); err != nil || !ok || value != "callback-secret" {
 		t.Fatalf("callback sensitive config read-after-write = %#v, %v, %v", value, ok, err)
 	}
-	if _, err := store.GetPluginKV(ctx, durableConfigStorageExtensionID("callback-ext"), durableConfigStorageKey("access token")); !errors.Is(err, eventstore.ErrPluginKVNotFound) {
-		t.Fatalf("callback sensitive config committed before terminal unit of work: %v", err)
-	}
 	persisted, err := repository.Load(ctx, "dice-1")
 	if err != nil || persisted.ConfigValues["callback-ext"]["enabled"].Bool {
 		t.Fatalf("callback config committed directly: %#v, %v", persisted, err)
+	}
+	if _, exists := persisted.ConfigValues["callback-ext"]["access token"]; exists {
+		t.Fatal("callback sensitive config committed before terminal unit of work")
 	}
 	if err := transaction.Finalize(ctx); err != nil {
 		t.Fatal(err)
@@ -402,51 +433,43 @@ func TestCallbackContextConfigFacadeStagesReadAfterWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(work.Streams) != 1 || len(work.Streams[0].Events) != 1 || len(work.PluginKVUpdates) != 1 {
+	if len(work.Streams) != 1 || len(work.Streams[0].Events) != 2 || len(work.PluginKVUpdates) != 0 {
 		t.Fatalf("callback config work = %#v", work)
 	}
 }
 
-func TestSensitiveConfigInternalSlotAcceptsOpaqueKeyAcrossDirectAndCallbackPaths(t *testing.T) {
+func TestSensitiveConfigPreservesRawKeyAcrossDirectAndCallbackPaths(t *testing.T) {
 	ctx := context.Background()
 	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
 		Type: "sqlite",
-		DSN:  t.TempDir() + "/opaque-sensitive-config-key.db",
+		DSN:  t.TempDir() + "/sensitive-config-key.db",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 	store := eventstore.NewStore(db,
-		eventstore.WithKeySource(compatKeySource{}),
+		eventstore.WithProjection(configstate.ConfigProjection()),
 		eventstore.WithProjection(extensionstate.ExtensionProjection()),
 	)
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "opaque-sensitive-config-key",
-		IndexRootID: "index-v1", EncryptionRootIDs: []string{"root-v1"},
-		SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "sensitive-config-key",
 		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	const (
-		pluginName = "opaque-config-key"
+		pluginName = "raw-config-key"
 		configKey  = "access$t token"
 	)
-	longestConfigKey := strings.Repeat("k", extensionstate.MaxExtensionIdentityPartBytes)
-	if encodedLength := len(durableConfigStorageKey(longestConfigKey)); encodedLength > eventstore.MaxPluginKeyBytes {
-		t.Fatalf("longest config key encoded to %d bytes, plugin KV limit is %d", encodedLength, eventstore.MaxPluginKeyBytes)
-	}
-	if strings.Contains(durableConfigStorageKey(configKey), "$t") {
-		t.Fatal("internal config slot retained a forbidden raw-key marker")
-	}
 	d := &Dice{
-		BaseConfig:    BaseConfig{Name: "dice-opaque-config"},
+		BaseConfig:    BaseConfig{Name: "dice-raw-config"},
 		DurableStore:  store,
 		ConfigManager: NewConfigManager(""),
 	}
 	d.ConfigManager.SetOwner(d)
+	seedCanonicalTestConfigBaseline(t, d)
 	ext := &ExtInfo{Name: pluginName, Version: "1.0.0", IsJsExt: true, dice: d}
 	if err := d.DurableDiscoverExtension(ctx, ext); err != nil {
 		t.Fatal(err)
@@ -456,22 +479,24 @@ func TestSensitiveConfigInternalSlotAcceptsOpaqueKeyAcrossDirectAndCallbackPaths
 	}); err != nil {
 		t.Fatal(err)
 	}
+	longestConfigKey := strings.Repeat("k", extensionstate.MaxExtensionIdentityPartBytes)
+	if err := d.ConfigManager.RegisterPluginConfig(pluginName, &ConfigItem{
+		Key: longestConfigKey, Type: "string", DefaultValue: "long-key-default", Value: "long-key-default",
+	}); err != nil {
+		t.Fatalf("register longest supported config key: %v", err)
+	}
 	if err := d.ConfigManager.SetConfig(pluginName, configKey, "direct-value"); err != nil {
 		t.Fatal(err)
 	}
-	internalExtensionID := durableConfigStorageExtensionID(pluginName)
-	if _, err := store.GetPluginKV(ctx, internalExtensionID, configKey); !errors.Is(err, eventstore.ErrPluginKVNotFound) {
-		t.Fatalf("raw config key was persisted in the internal namespace: %v", err)
-	}
-	if _, err := store.GetPluginKV(ctx, internalExtensionID, durableConfigStorageKey(configKey)); err != nil {
-		t.Fatalf("encoded internal config slot is missing: %v", err)
-	}
-	if value, exists, err := d.durableEncryptedConfigValue(ctx, pluginName, configKey, extensionstate.ConfigString); err != nil || !exists || value != "direct-value" {
-		t.Fatalf("direct sensitive config = %#v, exists=%v, err=%v", value, exists, err)
+	repository := extensionstate.NewRepository(store)
+	persisted, err := repository.Load(ctx, d.BaseConfig.Name)
+	if err != nil || persisted.ConfigValues[pluginName][configKey].String != "direct-value" ||
+		persisted.ConfigValues[pluginName][longestConfigKey].String != "long-key-default" {
+		t.Fatalf("direct typed config with raw keys = %#v, err=%v", persisted.ConfigValues[pluginName], err)
 	}
 
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	transaction, err := NewDurableCallbackTransaction(store, collector)
+	collector := execution.NewMutationCollector(eventstore.EventFactory{})
+	transaction, err := NewDurableCallbackTransaction(ctx, store, collector, eventstore.Metadata{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,8 +514,9 @@ func TestSensitiveConfigInternalSlotAcceptsOpaqueKeyAcrossDirectAndCallbackPaths
 	if value, exists, err := messageCtx.ExtensionConfigValue(pluginName, configKey); err != nil || !exists || value != "callback-value" {
 		t.Fatalf("callback sensitive config read-after-write = %#v, exists=%v, err=%v", value, exists, err)
 	}
-	if value, exists, err := d.durableEncryptedConfigValue(ctx, pluginName, configKey, extensionstate.ConfigString); err != nil || !exists || value != "direct-value" {
-		t.Fatalf("callback config committed before terminal unit of work: value=%#v, exists=%v, err=%v", value, exists, err)
+	persisted, err = repository.Load(ctx, d.BaseConfig.Name)
+	if err != nil || persisted.ConfigValues[pluginName][configKey].String != "direct-value" {
+		t.Fatalf("callback config committed before terminal unit of work: values=%#v, err=%v", persisted.ConfigValues[pluginName], err)
 	}
 	if err := transaction.Finalize(ctx); err != nil {
 		t.Fatal(err)
@@ -499,14 +525,15 @@ func TestSensitiveConfigInternalSlotAcceptsOpaqueKeyAcrossDirectAndCallbackPaths
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(work.Streams) != 0 || len(work.PluginKVUpdates) != 1 {
+	if len(work.Streams) != 1 || len(work.Streams[0].Events) != 1 || len(work.PluginKVUpdates) != 0 {
 		t.Fatalf("callback sensitive config work = %#v", work)
 	}
 	if _, err := store.Commit(ctx, work); err != nil {
 		t.Fatal(err)
 	}
-	if value, exists, err := d.durableEncryptedConfigValue(ctx, pluginName, configKey, extensionstate.ConfigString); err != nil || !exists || value != "callback-value" {
-		t.Fatalf("committed callback sensitive config = %#v, exists=%v, err=%v", value, exists, err)
+	persisted, err = repository.Load(ctx, d.BaseConfig.Name)
+	if err != nil || persisted.ConfigValues[pluginName][configKey].String != "callback-value" {
+		t.Fatalf("committed callback typed config = %#v, err=%v", persisted.ConfigValues[pluginName], err)
 	}
 }
 
@@ -517,22 +544,30 @@ func TestDurableCallbackTransactionStagesAttributeSnapshotWithSecret(t *testing.
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(compatKeySource{}))
+	store := eventstore.NewStore(db, eventstore.WithProjection(attributestate.Projection()))
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "callback-attrs-db", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "callback-attrs-db",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	transaction, err := NewDurableCallbackTransaction(store, collector)
+	metadata := eventstore.Metadata{CommandID: "inbox-attrs", CorrelationID: "inbox-attrs", OccurredAt: time.Unix(2, 0).UTC()}
+	collector := execution.NewMutationCollector(eventstore.EventFactory{})
+	transaction, err := NewDurableCallbackTransaction(ctx, store, collector, metadata)
 	if err != nil {
 		t.Fatal(err)
 	}
+	repository, err := attributestate.NewRepository(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &AttrsManager{durable: repository, store: store, diceID: "dice-1"}
 	state := attributestate.State{DiceID: "dice-1", ID: "QQ-Group:2002-QQ:1001", AttrsType: "group_user", SecretRef: attributestate.SecretRef("dice-1", "QQ-Group:2002-QQ:1001"), CreatedAt: 2, UpdatedAt: 2}
-	metadata := eventstore.Metadata{CommandID: "inbox-attrs", CorrelationID: "inbox-attrs", OccurredAt: time.Unix(2, 0).UTC()}
-	if err := transaction.StageAttributeSnapshot(ctx, state, []byte(`{"hp":{"t":7,"v":1}}`), metadata); err != nil {
+	item, err := manager.LoadByTransaction(ctx, transaction, state.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = item.Store("hp", ds.NewIntVal(1)); err != nil {
 		t.Fatal(err)
 	}
 	if err := transaction.Finalize(ctx); err != nil {
@@ -547,37 +582,72 @@ func TestDurableCallbackTransactionStagesAttributeSnapshotWithSecret(t *testing.
 	}
 }
 
-func TestDurableCallbackTransactionAttributeOverlayDoesNotMutateSharedCache(t *testing.T) {
+func TestDurableCallbackTransactionUsesOneCanonicalAttributeHandle(t *testing.T) {
 	ctx := context.Background()
 	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/callback-attrs-overlay.db"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(compatKeySource{}))
+	store := eventstore.NewStore(db, eventstore.WithProjection(attributestate.Projection()))
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "callback-attrs-overlay-db", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "callback-attrs-overlay-db",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	transaction, err := NewDurableCallbackTransaction(store, collector)
+	repository, err := attributestate.NewRepository(store)
 	if err != nil {
 		t.Fatal(err)
 	}
 	state := attributestate.State{DiceID: "dice-1", ID: "QQ-Group:2002-QQ:1001", AttrsType: "group_user", SecretRef: attributestate.SecretRef("dice-1", "QQ-Group:2002-QQ:1001"), CreatedAt: 2, UpdatedAt: 2}
 	sharedValues := &ds.ValueMap{}
 	sharedValues.Store("hp", ds.NewIntVal(1))
-	shared := &AttributesItem{ID: state.ID, valueMap: sharedValues, IsSaved: true}
-	overlay, err := transaction.AttributeOverlay(state, shared, eventstore.Metadata{CommandID: "inbox-overlay", CorrelationID: "inbox-overlay", OccurredAt: time.Unix(2, 0).UTC()})
+	seedPayload, err := ds.NewDictVal(sharedValues).V().ToJSON()
 	if err != nil {
 		t.Fatal(err)
 	}
-	overlay.Store("hp", ds.NewIntVal(2))
-	if got := shared.Load("hp"); got == nil || got.ToString() != "1" {
-		t.Fatalf("shared cache mutated by callback overlay: %v", got)
+	if _, err = repository.Save(ctx, state, seedPayload); err != nil {
+		t.Fatal(err)
+	}
+	metadata := eventstore.Metadata{CommandID: "inbox-overlay", CorrelationID: "inbox-overlay", OccurredAt: time.Unix(3, 0).UTC()}
+	collector := execution.NewMutationCollector(eventstore.EventFactory{})
+	transaction, err := NewDurableCallbackTransaction(ctx, store, collector, metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &AttrsManager{durable: repository, store: store, diceID: "dice-1"}
+	first, err := manager.LoadByTransaction(ctx, transaction, state.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.LoadByTransaction(ctx, transaction, state.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatal("one root loaded two attribute handles for one participant")
+	}
+	if err = first.Store("hp", ds.NewIntVal(2)); err != nil {
+		t.Fatal(err)
+	}
+	if got := second.Load("hp"); got == nil || got.ToString() != "2" {
+		t.Fatalf("canonical handle did not read its own write: %v", got)
+	}
+	_, persistedPayload, err := repository.Load(ctx, state.DiceID, state.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistedValue, err := ds.VMValueFromJSON(persistedPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistedDict, ok := persistedValue.ReadDictData()
+	if !ok {
+		t.Fatal("persisted attribute payload is not a dictionary")
+	}
+	if got, exists := persistedDict.Dict.Load("hp"); !exists || got.ToString() != "1" {
+		t.Fatalf("canonical participant wrote through before commit: %v, exists=%v", got, exists)
 	}
 	if err := transaction.Finalize(ctx); err != nil {
 		t.Fatal(err)
@@ -587,7 +657,7 @@ func TestDurableCallbackTransactionAttributeOverlayDoesNotMutateSharedCache(t *t
 		t.Fatal(err)
 	}
 	if len(work.Streams) != 1 || len(work.SecretUpdates) != 1 {
-		t.Fatalf("overlay mutation was not staged: %#v", work)
+		t.Fatalf("canonical attribute mutation was not staged: %#v", work)
 	}
 }
 
@@ -598,11 +668,10 @@ func TestCallbackVariableOverlayReadsOwnWriteWithoutMutatingDurableState(t *test
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(compatKeySource{}), eventstore.WithProjection(attributestate.Projection()))
+	store := eventstore.NewStore(db, eventstore.WithProjection(attributestate.Projection()))
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "callback-variable-overlay-db", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "callback-variable-overlay-db",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -621,13 +690,17 @@ func TestCallbackVariableOverlayReadsOwnWriteWithoutMutatingDurableState(t *test
 	if _, err := repository.Save(ctx, baseline, baselinePayload); err != nil {
 		t.Fatal(err)
 	}
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	transaction, err := NewDurableCallbackTransaction(store, collector)
+	metadata := eventstore.Metadata{CommandID: "inbox-vars", CorrelationID: "inbox-vars", OccurredAt: time.Unix(3, 0).UTC()}
+	collector := execution.NewMutationCollector(eventstore.EventFactory{})
+	transaction, err := NewDurableCallbackTransaction(ctx, store, collector, metadata)
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := &Dice{BaseConfig: BaseConfig{Name: "dice-1"}, AttrsManager: &AttrsManager{durable: repository, store: store, diceID: "dice-1"}}
-	messageCtx := &MsgContext{Dice: d, Session: &IMSession{}, Group: &GroupInfo{GroupID: "QQ-Group:2002"}, Player: &GroupPlayerInfo{UserID: "QQ:1001"}, callbackTransaction: transaction, callbackMetadata: eventstore.Metadata{CommandID: "inbox-vars", CorrelationID: "inbox-vars", OccurredAt: time.Unix(3, 0).UTC()}}
+	d := &Dice{
+		BaseConfig: BaseConfig{Name: "dice-1"}, DurableStore: store,
+		AttrsManager: &AttrsManager{durable: repository, store: store, diceID: "dice-1"},
+	}
+	messageCtx := newStateFacadeCallbackContext(t, d, transaction, metadata, "QQ-Group:2002", "QQ:1001")
 	VarSetValueInt64(messageCtx, "hp", 2)
 	if got, ok := VarGetValueInt64(messageCtx, "hp"); !ok || got != 2 {
 		t.Fatalf("callback read-after-write = %d, %v", got, ok)
@@ -646,7 +719,7 @@ func TestCallbackVariableOverlayReadsOwnWriteWithoutMutatingDurableState(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(work.Streams) != 1 || len(work.SecretUpdates) != 1 {
+	if attributeStreamCount(work) != 1 || len(work.SecretUpdates) != 1 {
 		t.Fatalf("callback variable mutation not staged: %#v", work)
 	}
 }
@@ -658,11 +731,10 @@ func TestCallbackCharacterBindingLifecycleStagesWithoutDurableWrite(t *testing.T
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(compatKeySource{}), eventstore.WithProjection(attributestate.Projection()))
+	store := eventstore.NewStore(db, eventstore.WithProjection(attributestate.Projection()))
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "callback-character-binding-db", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "callback-character-binding-db",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -679,23 +751,29 @@ func TestCallbackCharacterBindingLifecycleStagesWithoutDurableWrite(t *testing.T
 	if _, err := repository.Save(ctx, state, payload); err != nil {
 		t.Fatal(err)
 	}
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	transaction, err := NewDurableCallbackTransaction(store, collector)
+	metadata := eventstore.Metadata{CommandID: "inbox-character", CorrelationID: "inbox-character", OccurredAt: time.Unix(3, 0).UTC()}
+	collector := execution.NewMutationCollector(eventstore.EventFactory{})
+	transaction, err := NewDurableCallbackTransaction(ctx, store, collector, metadata)
 	if err != nil {
 		t.Fatal(err)
 	}
 	manager := &AttrsManager{durable: repository, store: store, diceID: "dice-1"}
-	messageCtx := &MsgContext{Dice: &Dice{BaseConfig: BaseConfig{Name: "dice-1"}, AttrsManager: manager}, Group: &GroupInfo{GroupID: "QQ-Group:2002"}, Player: &GroupPlayerInfo{UserID: "QQ:1001"}, callbackTransaction: transaction, callbackMetadata: eventstore.Metadata{CommandID: "inbox-character", CorrelationID: "inbox-character", OccurredAt: time.Unix(3, 0).UTC()}}
-	if err := manager.CharBindForCtx(messageCtx, "character-7", messageCtx.Group.GroupID, messageCtx.Player.UserID); err != nil {
+	d := &Dice{BaseConfig: BaseConfig{Name: "dice-1"}, DurableStore: store, AttrsManager: manager}
+	messageCtx := newStateFacadeCallbackContext(t, d, transaction, metadata, "QQ-Group:2002", "QQ:1001")
+	if err := manager.CharBindForCtx(messageCtx, "character-7", messageCtx.Group.GroupID(), messageCtx.Player.UserID()); err != nil {
 		t.Fatal(err)
 	}
-	if binding, err := manager.CharGetBindingIdForCtx(messageCtx, messageCtx.Group.GroupID, messageCtx.Player.UserID); err != nil || binding != "character-7" {
+	if binding, err := manager.CharGetBindingIdForCtx(messageCtx, messageCtx.Group.GroupID(), messageCtx.Player.UserID()); err != nil || binding != "character-7" {
 		t.Fatalf("callback binding read = %q, %v", binding, err)
 	}
-	if groups := manager.CharUnbindAllForCtx(messageCtx, "character-7"); len(groups) != 1 || groups[0] != "QQ-Group:2002" {
+	groups, err := manager.CharUnbindAllForCtx(messageCtx, "character-7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 1 || groups[0] != "QQ-Group:2002" {
 		t.Fatalf("callback unbound groups = %#v", groups)
 	}
-	if binding, err := manager.CharGetBindingIdForCtx(messageCtx, messageCtx.Group.GroupID, messageCtx.Player.UserID); err != nil || binding != "" {
+	if binding, err := manager.CharGetBindingIdForCtx(messageCtx, messageCtx.Group.GroupID(), messageCtx.Player.UserID()); err != nil || binding != "" {
 		t.Fatalf("callback unbinding read = %q, %v", binding, err)
 	}
 	persisted, _, err := repository.Load(ctx, "dice-1", id)
@@ -709,7 +787,7 @@ func TestCallbackCharacterBindingLifecycleStagesWithoutDurableWrite(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(work.Streams) != 1 || len(work.SecretUpdates) != 1 {
+	if attributeStreamCount(work) != 1 || len(work.SecretUpdates) != 1 {
 		t.Fatalf("callback binding was not staged: %#v", work)
 	}
 }
@@ -721,11 +799,10 @@ func TestCallbackCharacterCreationStagesWithoutDurableWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(compatKeySource{}), eventstore.WithProjection(attributestate.Projection()))
+	store := eventstore.NewStore(db, eventstore.WithProjection(attributestate.Projection()))
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "callback-character-creation-db", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "callback-character-creation-db",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -733,14 +810,16 @@ func TestCallbackCharacterCreationStagesWithoutDurableWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	transaction, err := NewDurableCallbackTransaction(store, collector)
+	metadata := eventstore.Metadata{CommandID: "inbox-character-create", CorrelationID: "inbox-character-create", OccurredAt: time.Unix(3, 0).UTC()}
+	collector := execution.NewMutationCollector(eventstore.EventFactory{})
+	transaction, err := NewDurableCallbackTransaction(ctx, store, collector, metadata)
 	if err != nil {
 		t.Fatal(err)
 	}
 	manager := &AttrsManager{durable: repository, store: store, diceID: "dice-1"}
-	messageCtx := &MsgContext{Dice: &Dice{BaseConfig: BaseConfig{Name: "dice-1"}, AttrsManager: manager}, Group: &GroupInfo{GroupID: "QQ-Group:2002"}, Player: &GroupPlayerInfo{UserID: "QQ:1001"}, callbackTransaction: transaction, callbackMetadata: eventstore.Metadata{CommandID: "inbox-character-create", CorrelationID: "inbox-character-create", OccurredAt: time.Unix(3, 0).UTC()}}
-	character, err := manager.CharNewForCtx(messageCtx, messageCtx.Player.UserID, "Alice", "coc7")
+	d := &Dice{BaseConfig: BaseConfig{Name: "dice-1"}, DurableStore: store, AttrsManager: manager}
+	messageCtx := newStateFacadeCallbackContext(t, d, transaction, metadata, "QQ-Group:2002", "QQ:1001")
+	character, err := manager.CharNewForCtx(messageCtx, messageCtx.Player.UserID(), "Alice", "coc7")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -757,7 +836,7 @@ func TestCallbackCharacterCreationStagesWithoutDurableWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(work.Streams) != 1 || len(work.SecretUpdates) != 1 {
+	if attributeStreamCount(work) != 1 || len(work.SecretUpdates) != 1 {
 		t.Fatalf("callback character creation was not staged: %#v", work)
 	}
 }
@@ -769,11 +848,10 @@ func TestCallbackCharacterRenameStagesWithoutDurableWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(compatKeySource{}), eventstore.WithProjection(attributestate.Projection()))
+	store := eventstore.NewStore(db, eventstore.WithProjection(attributestate.Projection()))
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "callback-character-rename-db", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "callback-character-rename-db",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -790,23 +868,24 @@ func TestCallbackCharacterRenameStagesWithoutDurableWrite(t *testing.T) {
 	if _, err := repository.Save(ctx, state, payload); err != nil {
 		t.Fatal(err)
 	}
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	transaction, err := NewDurableCallbackTransaction(store, collector)
+	metadata := eventstore.Metadata{CommandID: "inbox-character-rename", CorrelationID: "inbox-character-rename", OccurredAt: time.Unix(3, 0).UTC()}
+	collector := execution.NewMutationCollector(eventstore.EventFactory{})
+	transaction, err := NewDurableCallbackTransaction(ctx, store, collector, metadata)
 	if err != nil {
 		t.Fatal(err)
 	}
 	manager := &AttrsManager{durable: repository, store: store, diceID: "dice-1"}
-	messageCtx := &MsgContext{Dice: &Dice{BaseConfig: BaseConfig{Name: "dice-1"}, AttrsManager: manager}, callbackTransaction: transaction, callbackMetadata: eventstore.Metadata{CommandID: "inbox-character-rename", CorrelationID: "inbox-character-rename", OccurredAt: time.Unix(3, 0).UTC()}}
+	messageCtx := &MsgContext{Dice: &Dice{BaseConfig: BaseConfig{Name: "dice-1"}, DurableStore: store, AttrsManager: manager}, callbackTransaction: transaction, callbackMetadata: metadata}
 	item, err := manager.LoadByIdForCtx(messageCtx, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	item.Name = "Alicia"
-	if err := manager.SaveForCtx(messageCtx, item); err != nil {
+	if err := item.SetName("Alicia"); err != nil {
 		t.Fatal(err)
 	}
-	if staged, ok := transaction.AttributeState("dice-1", id); !ok || staged.Name != "Alicia" {
-		t.Fatalf("callback rename state = %#v, %v", staged, ok)
+	staged := item.State()
+	if staged.Name != "Alicia" {
+		t.Fatalf("callback rename state = %#v", staged)
 	}
 	persisted, _, err := repository.Load(ctx, "dice-1", id)
 	if err != nil || persisted.Name != "Alice" {
@@ -830,16 +909,15 @@ func TestDurableLegacyConfigSnapshotIsProjected(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(compatKeySource{}), eventstore.WithProjection(configstate.ConfigProjection()))
+	store := eventstore.NewStore(db, eventstore.WithProjection(configstate.ConfigProjection()))
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "config-facade-db", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "config-facade-db",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	d := &Dice{BaseConfig: BaseConfig{Name: "dice-1"}, Config: NewConfig(nil), DurableStore: store}
+	d := &Dice{BaseConfig: BaseConfig{Name: "dice-1"}, DurableStore: store}
 	repo := configstate.NewRepository(store)
 	_, err = repo.DecideAndAppend(ctx, configstate.State{}, 0, eventstore.Metadata{}, configstate.Command{
 		Kind: configstate.CommandImportBaseline,
@@ -858,8 +936,10 @@ func TestDurableLegacyConfigSnapshotIsProjected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	config := NewConfig(d)
+	if err = d.ReloadConfigView(ctx); err != nil {
+		t.Fatal(err)
+	}
+	config, _ := d.ConfigEditSnapshot()
 	config.FriendAddComment = "projection-owned"
 	config.Avatar = "avatar-ref"
 	runtimePayload := json.RawMessage(`{"memoryLimitMiB":384}`)
@@ -888,6 +968,7 @@ func TestDurableLegacyConfigSnapshotIsProjected(t *testing.T) {
 	}
 
 	beforeVersion := state.Version
+	config, _ = d.ConfigEditSnapshot()
 	config.MailPassword = "plaintext"
 
 	if err := d.DurableCommitConfigSnapshot(ctx, config, []string{"!"}, []string{"QQ:100"}, &config.MailPassword); err == nil {
@@ -908,8 +989,8 @@ func TestCallbackCharacterDeletionStagesWithoutDurableWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(compatKeySource{}), eventstore.WithProjection(attributestate.Projection()))
-	if err := store.SetReadiness(ctx, eventstore.Readiness{Mode: "import", SchemaVersion: 1, DatabaseIdentity: "callback-character-deletion-db", IndexRootID: "index-v1", EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
+	store := eventstore.NewStore(db, eventstore.WithProjection(attributestate.Projection()))
+	if err := store.SetReadiness(ctx, eventstore.Readiness{Mode: "import", SchemaVersion: 2, DatabaseIdentity: "callback-character-deletion-db", CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
 		t.Fatal(err)
 	}
 	repository, err := attributestate.NewRepository(store)
@@ -925,18 +1006,24 @@ func TestCallbackCharacterDeletionStagesWithoutDurableWrite(t *testing.T) {
 	if _, err := repository.Save(ctx, state, payload); err != nil {
 		t.Fatal(err)
 	}
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	transaction, err := NewDurableCallbackTransaction(store, collector)
+	metadata := eventstore.Metadata{CommandID: "inbox-character-delete", CorrelationID: "inbox-character-delete", OccurredAt: time.Unix(3, 0).UTC()}
+	collector := execution.NewMutationCollector(eventstore.EventFactory{})
+	transaction, err := NewDurableCallbackTransaction(ctx, store, collector, metadata)
 	if err != nil {
 		t.Fatal(err)
 	}
 	manager := &AttrsManager{durable: repository, store: store, diceID: "dice-1"}
-	messageCtx := &MsgContext{Dice: &Dice{BaseConfig: BaseConfig{Name: "dice-1"}, AttrsManager: manager}, callbackTransaction: transaction, callbackMetadata: eventstore.Metadata{CommandID: "inbox-character-delete", CorrelationID: "inbox-character-delete", OccurredAt: time.Unix(3, 0).UTC()}}
+	messageCtx := &MsgContext{Dice: &Dice{BaseConfig: BaseConfig{Name: "dice-1"}, DurableStore: store, AttrsManager: manager}, callbackTransaction: transaction, callbackMetadata: metadata}
 	if err := manager.CharDeleteForCtx(messageCtx, id); err != nil {
 		t.Fatal(err)
 	}
-	if staged, ok := transaction.AttributeState("dice-1", id); !ok || staged.AttrsType != "" {
-		t.Fatalf("callback deletion state = %#v, %v", staged, ok)
+	item, err := manager.LoadByIdForCtx(messageCtx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged := item.State()
+	if staged.AttrsType != "" {
+		t.Fatalf("callback deletion state = %#v", staged)
 	}
 	persisted, _, err := repository.Load(ctx, "dice-1", id)
 	if err != nil || persisted.AttrsType != service.AttrsTypeCharacter {
@@ -953,39 +1040,6 @@ func TestCallbackCharacterDeletionStagesWithoutDurableWrite(t *testing.T) {
 		t.Fatalf("callback character deletion was not staged: %#v", work)
 	}
 }
-
-type durableSaveStoreStub struct{}
-
-func (durableSaveStoreStub) Commit(context.Context, eventstore.UnitOfWork) (eventstore.CommitResult, error) {
-	return eventstore.CommitResult{}, errors.New("not used")
-}
-func (durableSaveStoreStub) Load(context.Context, eventstore.StreamID, uint64) ([]eventstore.Envelope, error) {
-	return nil, errors.New("not used")
-}
-func (durableSaveStoreStub) Close() error { return nil }
-
-func TestDurableSaveDoesNotWriteMigratedYAML(t *testing.T) {
-	dir := t.TempDir()
-	d := &Dice{
-		BaseConfig:      BaseConfig{Name: "dice-1", DataDir: dir},
-		Config:          NewConfig(nil),
-		AdvancedConfig:  AdvancedConfig{CustomReplyCooldown: 5},
-		DurableStore:    durableSaveStoreStub{},
-		AttrsManager:    &AttrsManager{},
-		Logger:          zap.NewNop().Sugar(),
-		ImSession:       &IMSession{},
-		LastUpdatedTime: 1,
-	}
-	d.Config.FriendAddComment = "must not be serialized"
-	d.Save(false)
-	if _, err := os.Stat(dir + "/serve.yaml"); !os.IsNotExist(err) {
-		t.Fatalf("serve.yaml exists or stat failed: %v", err)
-	}
-	if _, err := os.Stat(dir + "/advanced.yaml"); !os.IsNotExist(err) {
-		t.Fatalf("advanced.yaml exists or stat failed: %v", err)
-	}
-}
-
 func TestDurableConfigExtensionRestartAndRebuild(t *testing.T) {
 	ctx := context.Background()
 	dsn := t.TempDir() + "/restart.db"
@@ -994,15 +1048,14 @@ func TestDurableConfigExtensionRestartAndRebuild(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		store := eventstore.NewStore(db, eventstore.WithKeySource(compatKeySource{}), eventstore.WithProjection(configstate.ConfigProjection()), eventstore.WithProjection(extensionstate.ExtensionProjection()))
+		store := eventstore.NewStore(db, eventstore.WithProjection(configstate.ConfigProjection()), eventstore.WithProjection(extensionstate.ExtensionProjection()))
 		return db, store
 	}
 
 	db, store := openStore()
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "restart-db", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "restart-db",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}

@@ -3,7 +3,6 @@ package dice
 import (
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 )
 
@@ -33,12 +32,4 @@ func (adapter *PlatformAdapterMilky) botGroupRole(ctx *MsgContext, groupID strin
 		return "", errors.New(errGetGroupMemberInfoNil)
 	}
 	return member.Role, nil
-}
-
-type officialQQIdentityAccountProvider interface {
-	officialQQIdentityAccount() string
-}
-
-func (adapter *PlatformAdapterOfficialQQ) officialQQIdentityAccount() string {
-	return strconv.FormatUint(adapter.AppID, 10)
 }

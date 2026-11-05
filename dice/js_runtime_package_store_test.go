@@ -376,8 +376,12 @@ func TestJSRuntimePackageStoreRevalidatesABIWhileApplyingPendingInstall(t *testi
 
 func TestJSRuntimeManagementReadDoesNotApplyPendingInstallWhenJSIsDisabled(t *testing.T) {
 	t.Setenv("SCARDICE_QUICKJS_PACKAGE", "")
-	d := &Dice{BaseConfig: BaseConfig{DataDir: t.TempDir()}}
-	d.Config.JsEnable = false
+	d, _ := newCanonicalTestDice(t)
+	d.BaseConfig.DataDir = t.TempDir()
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.DataDir = d.BaseConfig.DataDir
+		config.JsEnable = false
+	})
 	d.jsRuntimeManager = NewJSRuntimeManagerForDice(d)
 	if _, err := d.StageJSRuntimeArchive(bytes.NewReader(validRuntimeTarGz(t))); err != nil {
 		t.Fatal(err)
@@ -462,22 +466,26 @@ func TestJSRuntimePackageStoreRejectsSymlinkedStoreRoot(t *testing.T) {
 
 func TestDiceCannotUninstallRuntimeReferencedByRoutingConfig(t *testing.T) {
 	t.Setenv("SCARDICE_QUICKJS_PACKAGE", "")
-	d := &Dice{BaseConfig: BaseConfig{DataDir: t.TempDir()}}
+	d, _ := newCanonicalTestDice(t)
+	d.BaseConfig.DataDir = t.TempDir()
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.DataDir = d.BaseConfig.DataDir })
 	d.jsRuntimeManager = NewJSRuntimeManagerForDice(d)
 	if _, err := d.StageJSRuntimeArchive(bytes.NewReader(validRuntimeTarGz(t))); err != nil {
 		t.Fatal(err)
 	}
 	d.jsRuntimeManager = NewJSRuntimeManagerForDice(d)
-	d.Config.JsEngine = "quickjs"
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.JsEngine = "quickjs" })
 	if _, err := d.StageJSRuntimeUninstall("quickjs"); !errors.Is(err, ErrJSRuntimeInUse) {
 		t.Fatalf("uninstall error = %v, want runtime-in-use", err)
 	}
-	d.Config.JsEngine = "goja"
-	d.Config.JsRuntimeRoutes = map[string]string{"author/example": "quickjs"}
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.JsEngine = "goja"
+		config.JsRuntimeRoutes = map[string]string{"author/example": "quickjs"}
+	})
 	if _, err := d.StageJSRuntimeUninstall("quickjs"); !errors.Is(err, ErrJSRuntimeInUse) {
 		t.Fatalf("routed uninstall error = %v, want runtime-in-use", err)
 	}
-	d.Config.JsRuntimeRoutes = nil
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.JsRuntimeRoutes = nil })
 	if _, err := d.StageJSRuntimeUninstall("quickjs"); err != nil {
 		t.Fatalf("uninstall after removing references: %v", err)
 	}

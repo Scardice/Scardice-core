@@ -100,24 +100,9 @@ func TestEventStoreSchemaForeignKeys(t *testing.T) {
 	if !strings.EqualFold(onUpdate, "RESTRICT") {
 		t.Fatalf("artifact operation foreign key on_update = %q, want RESTRICT", onUpdate)
 	}
-	assertForeignKeyAction(t, db, "subject_fences", "operations", "RESTRICT")
 	_, openErr = db.SQLDB().ExecContext(context.Background(), `INSERT INTO operation_artifacts (artifact_id, version, operation_id, owner_principal_id, media_type, size, status, expires_at) VALUES ('artifact', 1, 'missing-operation', 'owner', 'text/plain', 0, 'available', CURRENT_TIMESTAMP)`)
 	if openErr == nil {
 		t.Fatal("orphan operation artifact insert succeeded")
-	}
-	_, openErr = db.SQLDB().ExecContext(context.Background(), `INSERT INTO subject_fences (subject_key, scope, version, purge_operation_id, created_at) VALUES (x'01', 'subject', 1, 'missing-operation', CURRENT_TIMESTAMP)`)
-	if openErr == nil {
-		t.Fatal("orphan subject fence operation reference insert succeeded")
-	}
-}
-func assertForeignKeyAction(t *testing.T, db *Database, table, target, wantDelete string) {
-	t.Helper()
-	var onDelete string
-	if err := db.SQLDB().QueryRowContext(context.Background(), "SELECT on_delete FROM pragma_foreign_key_list(?) WHERE \"table\" = ?", table, target).Scan(&onDelete); err != nil {
-		t.Fatalf("inspect %s -> %s foreign key: %v", table, target, err)
-	}
-	if !strings.EqualFold(onDelete, wantDelete) {
-		t.Fatalf("%s -> %s on_delete = %q, want %s", table, target, onDelete, wantDelete)
 	}
 }
 func TestEventStoreDomainEventPayloadColumn(t *testing.T) {
@@ -189,12 +174,11 @@ func TestEventStoreSensitiveSchemaColumns(t *testing.T) {
 	}
 	defer db.Close()
 	for table, columns := range map[string][]string{
-		tableOperations:         {"request_id", "private_context", "private_nonce", "private_key_id"},
-		tableOperationArtifacts: {"size", "version"},
-		tableOutboxEffects:      {"risk_class", "content_digest_key_id", "completed_at", "payload_expires_at"},
-		tableAdapterSecrets:     {"adapter_id"},
-		tablePluginKV:           {"key_nonce", "value_nonce"},
-		tableSubjectFences:      {"version"},
+		tableOperations:         {"request_id", "private_context"},
+		tableOperationArtifacts: {"size", "version", "data"},
+		tableOutboxEffects:      {"risk_class", "completed_at"},
+		tableAdapterSecrets:     {"adapter_id", "value"},
+		tablePluginKV:           {"key", "value"},
 	} {
 		for _, column := range columns {
 			assertSQLiteColumn(t, db, table, column)

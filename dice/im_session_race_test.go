@@ -1,157 +1,90 @@
-package dice_test
+package dice
 
 import (
-	"encoding/json"
+	"context"
+	"fmt"
+	"reflect"
 	"sync"
 	"testing"
-
-	"Scardice-core/dice"
-
-	"go.uber.org/zap"
 )
 
-// TestGetActivatedExtListRace 测试 GetActivatedExtList 的并发安全性
-func TestGetActivatedExtListRace(t *testing.T) {
-	// 创建一个模拟的 Dice 对象
-	d := &dice.Dice{
-		ExtList: []*dice.ExtInfo{
-			{Name: "ext1", AutoActive: true},
-			{Name: "ext2", AutoActive: true},
-			{Name: "ext3", AutoActive: false},
-		},
-		ExtUpdateTime: 1,
+func TestCanonicalFacadeResolutionIsSingleIdentityPerRoot(t *testing.T) {
+	d, _ := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:facade-race-bot")
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, newGroupMsg("QQ-Group:facade-race", "QQ:owner", ""), "facade-resolution-race")
+
+	const workers = 100
+	results := make(chan *GroupInfo, workers)
+	errs := make(chan error, workers)
+	var wait sync.WaitGroup
+	for range workers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			group, err := ctx.ResolveGroup(context.Background(), ctx.Group.GroupID())
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- group
+		}()
 	}
-	d.Logger = zap.NewNop().Sugar()
-
-	t.Run("concurrent_get_during_init", func(t *testing.T) {
-		// 测试多个 goroutine 同时调用 GetActivatedExtList 进行初始化
-		group := &dice.GroupInfo{
-			GroupID: "test-group-1",
+	wait.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	for group := range results {
+		if group != ctx.Group {
+			t.Fatalf("same root returned distinct facades: got %p want %p", group, ctx.Group)
 		}
-		// 设置初始扩展列表
-		group.SetActivatedExtList([]*dice.ExtInfo{
-			{Name: "ext1"},
-		}, nil)
-		// 重置 ExtAppliedTime 为 0 以触发初始化
-		group.ExtAppliedTime = 0
+	}
+}
 
-		var wg sync.WaitGroup
-		const numGoroutines = 100
+func TestCanonicalExtensionStateAndRuntimeCacheRemainConsistentUnderConcurrency(t *testing.T) {
+	extension1 := &ExtInfo{Name: "ext1"}
+	extension2 := &ExtInfo{Name: "ext2"}
+	d, _ := newCanonicalTestDice(t)
+	installCanonicalTestExtensions(d, extension1, extension2)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:extension-race-bot")
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, newGroupMsg("QQ-Group:extension-race", "QQ:owner", ""), "extension-state-race")
+	if err := ctx.Group.SetExtension(extension1.Name, true); err != nil {
+		t.Fatal(err)
+	}
 
-		for range numGoroutines {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				_ = group.GetActivatedExtList(d)
-			}()
-		}
-		wg.Wait()
-	})
+	const workers = 50
+	errs := make(chan error, workers*2)
+	var wait sync.WaitGroup
+	for index := range workers {
+		wait.Add(2)
+		go func() {
+			defer wait.Done()
+			for _, extension := range ctx.Group.GetActivatedExtList(d) {
+				if extension == nil || extension.Name == "" {
+					errs <- fmt.Errorf("invalid derived extension: %#v", extension)
+				}
+			}
+		}()
+		go func(enabled bool) {
+			defer wait.Done()
+			if err := ctx.Group.SetExtension(extension2.Name, enabled); err != nil {
+				errs <- err
+			}
+		}(index%2 == 0)
+	}
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
 
-	t.Run("concurrent_get_and_set", func(t *testing.T) {
-		// 测试 GetActivatedExtList 和 SetActivatedExtList 的并发
-		group := &dice.GroupInfo{
-			GroupID: "test-group-2",
-		}
-		group.SetActivatedExtList([]*dice.ExtInfo{
-			{Name: "ext1"},
-		}, d)
-
-		var wg sync.WaitGroup
-		const numGoroutines = 50
-
-		// 一半 goroutine 读取
-		for range numGoroutines {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				_ = group.GetActivatedExtList(d)
-			}()
-		}
-
-		// 一半 goroutine 写入
-		for range numGoroutines {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				group.SetActivatedExtList([]*dice.ExtInfo{
-					{Name: "ext1"},
-					{Name: "ext2"},
-				}, d)
-			}()
-		}
-
-		wg.Wait()
-	})
-
-	t.Run("concurrent_get_and_marshal", func(t *testing.T) {
-		// 测试 GetActivatedExtList 和 MarshalJSON 的并发
-		group := &dice.GroupInfo{
-			GroupID: "test-group-3",
-		}
-		group.SetActivatedExtList([]*dice.ExtInfo{
-			{Name: "ext1"},
-			{Name: "ext2"},
-		}, d)
-
-		var wg sync.WaitGroup
-		const numGoroutines = 50
-
-		// 一半 goroutine 读取
-		for range numGoroutines {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				_ = group.GetActivatedExtList(d)
-			}()
-		}
-
-		// 一半 goroutine 序列化
-		for range numGoroutines {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				_, _ = json.Marshal(group)
-			}()
-		}
-
-		wg.Wait()
-	})
-
-	t.Run("concurrent_init_and_set", func(t *testing.T) {
-		// 测试初始化期间的 Set 操作
-		group := &dice.GroupInfo{
-			GroupID: "test-group-4",
-		}
-		group.SetActivatedExtList([]*dice.ExtInfo{
-			{Name: "ext1"},
-		}, nil)
-		// 重置以触发初始化
-		group.ExtAppliedTime = 0
-
-		var wg sync.WaitGroup
-		const numGoroutines = 50
-
-		// 一半 goroutine 触发初始化
-		for range numGoroutines {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				_ = group.GetActivatedExtList(d)
-			}()
-		}
-
-		// 一半 goroutine 写入
-		for range numGoroutines {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				group.SetActivatedExtList([]*dice.ExtInfo{
-					{Name: "newExt"},
-				}, d)
-			}()
-		}
-
-		wg.Wait()
-	})
+	if err := ctx.Group.SetExtension(extension2.Name, true); err != nil {
+		t.Fatal(err)
+	}
+	want := ctx.Group.ActivatedExtensionIDs()
+	got := extListToNames(ctx.Group.GetActivatedExtList(d))
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("runtime extension cache = %v, canonical IDs = %v", got, want)
+	}
 }

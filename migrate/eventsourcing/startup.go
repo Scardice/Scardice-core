@@ -8,8 +8,8 @@ import (
 )
 
 var (
-	ErrMigrationRequired      = errors.New("eventsourcing: imported readiness is required for existing legacy state")
-	ErrFreshReadinessRequired = errors.New("eventsourcing: fresh readiness is required for an empty legacy state")
+	ErrMigrationRequired   = errors.New("eventsourcing: imported readiness is required for existing legacy state")
+	ErrLegacyStateConflict = errors.New("eventsourcing: legacy files coexist with a populated fresh event store; choose the authoritative source explicitly before importing")
 )
 
 // ValidateStartupReadiness is the read-only startup gate. It is deliberately
@@ -22,25 +22,28 @@ func ValidateStartupReadiness(ctx context.Context, repository eventstore.Readine
 	if repository == nil {
 		return eventstore.Readiness{}, eventstore.ErrReadinessInvalid
 	}
-	var readiness eventstore.Readiness
-	var err error
-	if metadata, ok := repository.(eventstore.ReadinessMetadataRepository); ok {
-		readiness, err = metadata.GetReadinessMetadata(ctx)
-	} else {
-		readiness, err = repository.GetReadiness(ctx)
-		if err == nil {
-			err = ValidatePublication(readiness)
-		}
+	readiness, err := repository.GetReadiness(ctx)
+	if err == nil {
+		err = ValidatePublication(readiness)
 	}
 	if err != nil {
 		return eventstore.Readiness{}, err
 	}
-	if legacyStatePresent {
-		if readiness.Mode != string(ModeImport) {
-			return eventstore.Readiness{}, ErrMigrationRequired
-		}
-	} else if readiness.Mode != string(ModeFresh) {
-		return eventstore.Readiness{}, ErrFreshReadinessRequired
+	if readiness.Mode == string(ModeImport) || !legacyStatePresent {
+		return readiness, nil
 	}
-	return readiness, nil
+	inspector, ok := repository.(interface {
+		HasPersistentState(context.Context) (bool, error)
+	})
+	if !ok {
+		return eventstore.Readiness{}, ErrLegacyStateConflict
+	}
+	populated, err := inspector.HasPersistentState(ctx)
+	if err != nil {
+		return eventstore.Readiness{}, err
+	}
+	if populated {
+		return eventstore.Readiness{}, ErrLegacyStateConflict
+	}
+	return eventstore.Readiness{}, ErrMigrationRequired
 }

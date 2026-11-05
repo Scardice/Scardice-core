@@ -103,16 +103,22 @@ type onebotRuntime struct {
 	priorityConnect    chan onebotRuntimeEvent
 	priorityDisconnect chan onebotRuntimeEvent
 	listenerFailed     chan onebotRuntimeEvent
-	events             chan onebotRuntimeEvent
-	fenced             atomic.Bool
-	stopReq            atomic.Bool
-	callbackMu         sync.Mutex
-	callbackWG         sync.WaitGroup
-	wg                 sync.WaitGroup
-	handlerMu          sync.Mutex
-	handlerWG          sync.WaitGroup
-	connectionMu       sync.Mutex
-	connections        map[*socketio.WebsocketWrapper]uint64
+
+	// sent tells Core's own sends from messages typed by hand in another client
+	// of the account; selfUserID is the account's id from get_login_info.
+	sentOnce     sync.Once
+	sent         *onebotSentLedger
+	selfUserID   atomic.Int64
+	events       chan onebotRuntimeEvent
+	fenced       atomic.Bool
+	stopReq      atomic.Bool
+	callbackMu   sync.Mutex
+	callbackWG   sync.WaitGroup
+	wg           sync.WaitGroup
+	handlerMu    sync.Mutex
+	handlerWG    sync.WaitGroup
+	connectionMu sync.Mutex
+	connections  map[*socketio.WebsocketWrapper]uint64
 
 	// Conversation-free adapter events use one bounded sequential worker so
 	// plugin latency cannot occupy the protocol event loop.
@@ -618,11 +624,32 @@ func onebotForwardResult(action emitter.Action, retryClass adapterapi.EffectRetr
 	return result
 }
 
+// onebotFlexibleInt64 同时接受 JSON 数字与数字字符串：部分协议端（如把 group_id
+// 序列化为字符串的实现）与标准 OneBot 不一致，但语义相同。
+type onebotFlexibleInt64 int64
+
+func (v *onebotFlexibleInt64) UnmarshalJSON(data []byte) error {
+	var text string
+	if len(data) > 0 && data[0] == '"' {
+		if err := json.Unmarshal(data, &text); err != nil {
+			return err
+		}
+	} else {
+		text = string(data)
+	}
+	parsed, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
+	if err != nil {
+		return err
+	}
+	*v = onebotFlexibleInt64(parsed)
+	return nil
+}
+
 type onebotGroupInfoResponse struct {
-	GroupID        *int64  `json:"group_id"`
-	GroupName      *string `json:"group_name"`
-	MemberCount    *int64  `json:"member_count"`
-	MaxMemberCount *int64  `json:"max_member_count"`
+	GroupID        *onebotFlexibleInt64 `json:"group_id"`
+	GroupName      *string              `json:"group_name"`
+	MemberCount    *onebotFlexibleInt64 `json:"member_count"`
+	MaxMemberCount *onebotFlexibleInt64 `json:"max_member_count"`
 }
 
 func onebotGroupInfoRefreshResult(retryClass adapterapi.EffectRetryClass, raw []byte, target adapterapi.EffectTarget, groupID int64) adapterapi.EffectResult {
@@ -637,21 +664,24 @@ func onebotGroupInfoRefreshResult(retryClass adapterapi.EffectRetryClass, raw []
 	var info onebotGroupInfoResponse
 	if len(envelope.Data) == 0 || string(envelope.Data) == "null" ||
 		json.Unmarshal(envelope.Data, &info) != nil ||
-		info.GroupID == nil || *info.GroupID != groupID || info.GroupName == nil ||
+		info.GroupID == nil || int64(*info.GroupID) != groupID || info.GroupName == nil ||
 		(info.MemberCount != nil && (*info.MemberCount < 0 || uint64(*info.MemberCount) > uint64(^uint32(0)))) ||
 		(info.MaxMemberCount != nil && (*info.MaxMemberCount < 0 || uint64(*info.MaxMemberCount) > uint64(^uint32(0)))) {
 		return adapterapi.TerminalResult("onebot_invalid_response", "provider returned invalid group info")
 	}
 	observation := adapterapi.GroupInfoResult{
-		Conversation:        target.Conversation,
-		Name:                *info.GroupName,
-		MemberCountKnown:    info.MemberCount != nil,
-		MaxMemberCountKnown: info.MaxMemberCount != nil,
+		Conversation:     target.Conversation,
+		Name:             *info.GroupName,
+		MemberCountKnown: info.MemberCount != nil,
 	}
 	if info.MemberCount != nil {
 		observation.MemberCount = uint32(*info.MemberCount)
 	}
-	if info.MaxMemberCount != nil {
+	// 部分协议端不知道群容量，会返回 0，或返回小于当前人数的值；
+	// 这类值不是有效容量，按"未知"处理，而不是让整次刷新失败。
+	if info.MaxMemberCount != nil && *info.MaxMemberCount > 0 &&
+		(!observation.MemberCountKnown || uint32(*info.MaxMemberCount) >= observation.MemberCount) {
+		observation.MaxMemberCountKnown = true
 		observation.MaxMemberCount = uint32(*info.MaxMemberCount)
 	}
 	if err := observation.ValidateForTarget(target); err != nil {
@@ -1929,17 +1959,27 @@ func sealOnebotInbound(message *adapterapi.InboundMessage) error {
 	return nil
 }
 
+// onebotOwnMessages identifies the endpoint's own account while history is read:
+// selfID is its id ("" when unknown) and known tells whether a send action of
+// this Core returned a message id.
+type onebotOwnMessages struct {
+	selfID string
+	known  func(id string) bool
+}
+
 // onebotHistoryInbound turns one entry of a provider's group history into the
 // inbound the same message produced when it arrived live. group is the group
 // that was asked about; an entry that is not a placeable message of that group,
-// or has no time or sequence, is rejected rather than guessed at.
-func onebotHistoryInbound(raw []byte, group adapterapi.ConversationID) (adapterapi.InboundMessage, error) {
+// or has no time or sequence, is rejected rather than guessed at. An entry the
+// endpoint's own account sent (message_sent, or a sender equal to the account)
+// becomes an own message like a live report would.
+func onebotHistoryInbound(raw []byte, group adapterapi.ConversationID, own onebotOwnMessages) (adapterapi.InboundMessage, error) {
 	var envelope onebotInboundEnvelope
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return adapterapi.InboundMessage{}, onebotEventRejected("malformed history entry")
 	}
 	groupID := ExtractQQEmitterGroupID(string(group))
-	if envelope.PostType != "message" || envelope.MessageType != "group" || groupID <= 0 || envelope.Time <= 0 {
+	if (envelope.PostType != "message" && envelope.PostType != "message_sent") || envelope.MessageType != "group" || groupID <= 0 || envelope.Time <= 0 {
 		return adapterapi.InboundMessage{}, onebotEventRejected("history entry is not a timed group message")
 	}
 	if _, hasSequence := onebotInboundSequence(envelope.MessageSeq); !hasSequence {
@@ -1950,7 +1990,19 @@ func onebotHistoryInbound(raw []byte, group adapterapi.ConversationID) (adaptera
 		envelope.GroupID = json.RawMessage(strconv.FormatInt(groupID, 10))
 	}
 	message := newOnebotInbound(&envelope)
-	if err := fillOnebotMessage(&message, &envelope); err != nil {
+	sender, _ := onebotInboundID(envelope.UserID)
+	reporter, _ := onebotInboundID(envelope.SelfID)
+	if envelope.PostType == "message_sent" || sender != "" && sender != "0" && (sender == reporter || sender == own.selfID) {
+		if _, err := fillOnebotSelfMessage(&message, &envelope); err != nil {
+			if errors.Is(err, errOnebotSelfUnplaceable) {
+				err = onebotEventRejected("history entry has no message id")
+			}
+			return adapterapi.InboundMessage{}, err
+		}
+		if own.known != nil && own.known(string(message.MessageID)) {
+			message.SelfOrigin = adapterapi.SelfMessageIssuedByCore
+		}
+	} else if err := fillOnebotMessage(&message, &envelope); err != nil {
 		return adapterapi.InboundMessage{}, err
 	}
 	if message.Conversation != group {
@@ -2109,7 +2161,7 @@ func (r *onebotRuntime) handleConnected(ctx context.Context, conn *socketio.Webs
 	if conn == nil || r.fenced.Load() {
 		return errors.New("onebot: connection was fenced")
 	}
-	e := emitter.NewEVEmitter(conn)
+	e := emitter.NewEVEmitter(conn, r.sentLedger())
 	r.mu.Lock()
 	previous := r.emitter
 	r.emitter, r.emitterConn = e, conn
@@ -2128,6 +2180,7 @@ func (r *onebotRuntime) handleConnected(ctx context.Context, conn *socketio.Webs
 	if r.fenced.Load() {
 		return errors.New("onebot: connection was fenced")
 	}
+	r.selfUserID.Store(info.UserId)
 	providerID, err := adapterapi.NewPrincipalID(fmt.Sprintf("QQ:%d", info.UserId))
 	if err != nil {
 		return err
@@ -2177,6 +2230,7 @@ func (r *onebotRuntime) cleanup() {
 	r.handlerMu.Unlock()
 	r.callbackMu.Unlock()
 	r.cancelOnebotMessageRecalls()
+	r.sentLedger().discard()
 	r.stopGlobalOnebotEventDelivery()
 	r.mu.Lock()
 	cancel, conn, manager, server, listener := r.cancel, r.conn, r.manager, r.server, r.listener

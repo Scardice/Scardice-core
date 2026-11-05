@@ -4,61 +4,32 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
+	"sync"
+	"time"
 
-	"Scardice-core/core/attributestate"
+	"Scardice-core/core/execution"
 	"Scardice-core/core/extensionstate"
-	"Scardice-core/core/groupstate"
-	"Scardice-core/core/messageflow"
-	"Scardice-core/core/playerstate"
 	"Scardice-core/eventstore"
-
-	ds "github.com/sealdice/dicescript"
 )
 
-type stagedExtensionState struct {
-	state    extensionstate.State
-	expected uint64
-	metadata eventstore.Metadata
-	events   []extensionstate.TypedEvent
+var ErrJSPluginKV = errors.New("dice: invalid JS plugin KV mutation")
+
+func validateJSPluginExtension(extensionID string) error {
+	if strings.TrimSpace(extensionID) == "" || strings.Contains(extensionID, "$t") {
+		return ErrJSPluginKV
+	}
+	if len(extensionID) > eventstore.MaxPluginExtensionBytes {
+		return &eventstore.OversizeError{Bound: "plugin extension bytes", Limit: eventstore.MaxPluginExtensionBytes, Actual: len(extensionID)}
+	}
+	return nil
 }
 
-type stagedAttributeSnapshot struct {
-	state    attributestate.State
-	event    eventstore.NewEvent
-	secret   eventstore.SecretUpdate
-	expected uint64
-}
-
-type stagedAttributeOverlay struct {
-	state    attributestate.State
-	item     *AttributesItem
-	metadata eventstore.Metadata
-}
-
-type stagedDelegatedPlayer struct {
-	state                      playerstate.PlayerState
-	player                     *GroupPlayerInfo
-	scope                      messageflow.CallbackScope
-	metadata                   eventstore.Metadata
-	found                      bool
-	initialName                string
-	initialAutoSetNameTemplate string
-	initialLastCommandTime     int64
-	initialDiceSideNum         int
-}
-
-type stagedCallbackGroupEvents struct {
-	expected uint64
-	metadata eventstore.Metadata
-	events   []groupstate.TypedEvent
-	terminal []groupstate.TypedEvent
-}
-
-type preparedGroupMembershipRemoval struct {
-	stream   eventstore.StreamID
-	expected uint64
-	metadata eventstore.Metadata
-	event    groupstate.TypedEvent
+func nextJSPluginVersion(version uint64) (uint64, error) {
+	if version >= ^uint64(0)>>1 {
+		return 0, eventstore.ErrVersionExhausted
+	}
+	return version + 1, nil
 }
 
 type callbackCommitFence interface {
@@ -66,162 +37,482 @@ type callbackCommitFence interface {
 	Unlock()
 }
 
-// DurableCallbackTransaction stages callback-owned mutations for the callback
-// service's terminal UnitOfWork. It never commits the store directly.
+// DurableCallbackTransaction is the controlled facade for exactly one
+// DomainTx. Durable state is owned by typed DomainTx participants; this wrapper
+// contains no parallel snapshots, overlays, or dirty-save queue.
 type DurableCallbackTransaction struct {
-	store                eventstore.Store
-	collector            *messageflow.MutationCollector
-	callbackCommitFence  callbackCommitFence
-	callbackAfterCommit  []func()
-	overlays             map[string]*JSPluginKVOverlay
-	attributes           map[string]stagedAttributeSnapshot
-	attributeOverlays    map[string]stagedAttributeOverlay
-	delegatedPlayers     map[string]stagedDelegatedPlayer
-	delegatedPlayerError error
-	groups               map[eventstore.StreamID]*stagedCallbackGroupEvents
-	groupError           error
-	extension            *stagedExtensionState
-	finalized            bool
-	executionContext     context.Context
+	store               eventstore.Store
+	collector           *execution.MutationCollector
+	domain              *execution.DomainTx
+	metadata            eventstore.Metadata
+	executionContext    context.Context
+	callbackCommitFence callbackCommitFence
+	callbackPublication []func()
+	callbackAfterCommit []func()
+
+	finalizeMu sync.Mutex
+	finalized  bool
 }
 
-func NewDurableCallbackTransaction(store eventstore.Store, collector *messageflow.MutationCollector) (*DurableCallbackTransaction, error) {
+func NewDurableCallbackTransaction(
+	ctx context.Context,
+	store eventstore.Store,
+	collector *execution.MutationCollector,
+	metadata eventstore.Metadata,
+) (*DurableCallbackTransaction, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if store == nil || collector == nil {
-		return nil, ErrJSPluginKV
+		return nil, execution.ErrDomainTxUnavailable
 	}
-	if _, ok := store.(JSPluginKVReadBackend); !ok {
-		return nil, ErrJSPluginKV
-	}
-	if _, ok := store.(JSPluginKVSealer); !ok {
-		return nil, ErrJSPluginKV
+	domain, err := execution.NewDomainTx(ctx, store, collector, metadata)
+	if err != nil {
+		return nil, err
 	}
 	return &DurableCallbackTransaction{
-		store: store, collector: collector,
-		overlays: map[string]*JSPluginKVOverlay{}, attributes: map[string]stagedAttributeSnapshot{},
-		attributeOverlays: map[string]stagedAttributeOverlay{}, delegatedPlayers: map[string]stagedDelegatedPlayer{},
-		groups: map[eventstore.StreamID]*stagedCallbackGroupEvents{},
+		store: store, collector: collector, domain: domain, metadata: metadata, executionContext: ctx,
 	}, nil
 }
 
-// ChangedAttributeIDs returns the unique, sorted IDs staged by this callback.
-func (t *DurableCallbackTransaction) ChangedAttributeIDs() []string {
+func (t *DurableCallbackTransaction) Domain() *execution.DomainTx {
 	if t == nil {
 		return nil
 	}
-	unique := make(map[string]struct{}, len(t.attributes)+len(t.attributeOverlays))
-	for _, attribute := range t.attributes {
-		unique[attribute.state.ID] = struct{}{}
-	}
-	for _, overlay := range t.attributeOverlays {
-		unique[overlay.state.ID] = struct{}{}
-	}
-	ids := make([]string, 0, len(unique))
-	for id := range unique {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	return ids
+	return t.domain
 }
 
-func (t *DurableCallbackTransaction) resolveDelegatedPlayer(
-	ctx context.Context,
-	scope messageflow.CallbackScope,
-	cached *GroupPlayerInfo,
-	metadata eventstore.Metadata,
-) (*GroupPlayerInfo, bool) {
-	if t == nil {
-		return cached, cached != nil
+func (t *DurableCallbackTransaction) occurredAt() time.Time {
+	if t != nil && !t.metadata.OccurredAt.IsZero() {
+		return t.metadata.OccurredAt
 	}
-	if t.finalized || t.collector == nil {
-		t.delegatedPlayerError = errors.Join(t.delegatedPlayerError, eventstore.ErrConflict)
-		return cached, cached != nil
+	return time.Now().UTC()
+}
+
+// Finalize closes mutation before contributing each canonical participant.
+// The wrapper invokes DomainTx.Seal exactly once even when callers duplicate
+// finalization or the first seal fails.
+func (t *DurableCallbackTransaction) Finalize(ctx context.Context) error {
+	if t == nil || t.domain == nil {
+		return execution.ErrDomainTxUnavailable
 	}
-	if t.store == nil {
-		t.delegatedPlayerError = errors.Join(t.delegatedPlayerError, playerstate.ErrRepositoryUnavailable)
-		return cached, cached != nil
+	t.finalizeMu.Lock()
+	if t.finalized {
+		t.finalizeMu.Unlock()
+		return execution.ErrDomainTxClosed
 	}
-	stream := playerstate.PlayerStream(scope.DiceID, scope.GroupID, scope.UserID)
-	if stream.AggregateID == "" {
-		t.delegatedPlayerError = errors.Join(t.delegatedPlayerError, playerstate.ErrInvalidIdentity)
-		return cached, cached != nil
+	t.finalized = true
+	t.finalizeMu.Unlock()
+	return t.domain.Seal(ctx)
+}
+
+func (t *DurableCallbackTransaction) AfterCommit(fn func()) error {
+	if t == nil || t.domain == nil || fn == nil {
+		return execution.ErrDomainTxUnavailable
 	}
-	if staged, ok := t.delegatedPlayers[stream.AggregateID]; ok {
-		return staged.player, staged.found
+	t.finalizeMu.Lock()
+	defer t.finalizeMu.Unlock()
+	if t.finalized {
+		return execution.ErrDomainTxClosed
 	}
-	state, err := playerstate.NewRepository(t.store).LoadPlayer(ctx, scope.DiceID, scope.GroupID, scope.UserID)
+	t.callbackAfterCommit = append(t.callbackAfterCommit, fn)
+	return nil
+}
+
+// AfterCommitPublication registers a trusted, nonblocking in-memory ownership
+// handoff. It runs after durable success while the commit fence is still held;
+// it must not perform I/O, call user code, or reload runtime state.
+func (t *DurableCallbackTransaction) AfterCommitPublication(fn func()) error {
+	if t == nil || t.domain == nil || fn == nil {
+		return execution.ErrDomainTxUnavailable
+	}
+	t.finalizeMu.Lock()
+	defer t.finalizeMu.Unlock()
+	if t.finalized {
+		return execution.ErrDomainTxClosed
+	}
+	if err := t.domain.CheckOpen(); err != nil {
+		return err
+	}
+	t.callbackPublication = append(t.callbackPublication, fn)
+	return nil
+}
+
+func (t *DurableCallbackTransaction) Abort() {
+	if t == nil || t.domain == nil {
+		return
+	}
+	t.finalizeMu.Lock()
+	if !t.finalized {
+		t.finalized = true
+		t.domain.Abort()
+	}
+	t.finalizeMu.Unlock()
+}
+
+type pluginKVEntry struct {
+	snapshot eventstore.PluginKVLookupSnapshot
+	item     eventstore.PluginKVItem
+	exists   bool
+	update   *eventstore.PluginKVUpdate
+	revision uint64
+}
+
+type pluginKVParticipant struct {
+	mu        sync.RWMutex
+	extension string
+	entries   map[string]*pluginKVEntry
+	namespace *eventstore.PluginKVListSnapshot
+	// namespaceObserved records that the namespace revision is already a read
+	// dependency of the unit of work (set by list reads only).
+	namespaceObserved bool
+}
+
+func (p *pluginKVParticipant) Contribute(context.Context) (eventstore.UnitOfWork, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	updates := make([]eventstore.PluginKVUpdate, 0, len(p.entries))
+	for _, entry := range p.entries {
+		if entry.update != nil {
+			updates = append(updates, *entry.update)
+		}
+	}
+	sort.Slice(updates, func(i, j int) bool { return updates[i].Key < updates[j].Key })
+	return eventstore.UnitOfWork{PluginKVUpdates: updates}, nil
+}
+
+func pluginKVParticipantKey(extensionID string) execution.ParticipantKey {
+	return execution.ParticipantKey{Kind: "plugin-kv", ID: extensionID}
+}
+
+func (t *DurableCallbackTransaction) pluginParticipant(ctx context.Context, extensionID string) (*pluginKVParticipant, error) {
+	if t == nil || t.domain == nil || validateJSPluginExtension(extensionID) != nil {
+		return nil, ErrJSPluginKV
+	}
+	// Plugin values are persisted as plaintext in schema v2.
+	key := pluginKVParticipantKey(extensionID)
+	participant, err := t.domain.Owner(ctx, key, func(context.Context) (execution.Participant, execution.ReadDependencies, error) {
+		return &pluginKVParticipant{extension: extensionID, entries: make(map[string]*pluginKVEntry)}, execution.ReadDependencies{}, nil
+	})
 	if err != nil {
-		t.delegatedPlayerError = errors.Join(t.delegatedPlayerError, err)
-		return cached, cached != nil
+		return nil, err
 	}
-	found := state.Version > 0 || cached != nil
-	if state.DiceID == "" {
-		state.DiceID = scope.DiceID
+	owner, ok := participant.(*pluginKVParticipant)
+	if !ok {
+		return nil, execution.ErrParticipantType
 	}
-	if state.GroupID == "" {
-		state.GroupID = scope.GroupID
-	}
-	if state.UserID == "" {
-		state.UserID = scope.UserID
-	}
-	player := cached
-	if player == nil {
-		player = compatibilityPlayerFromState(state)
-	} else {
-		if player.UserID == "" {
-			player.UserID = scope.UserID
-		}
-		if player.ValueMapTemp == nil {
-			player.ValueMapTemp = &ds.ValueMap{}
-		}
-	}
-	if t.delegatedPlayers == nil {
-		t.delegatedPlayers = map[string]stagedDelegatedPlayer{}
-	}
-	t.delegatedPlayers[stream.AggregateID] = stagedDelegatedPlayer{
-		state: state, player: player, scope: scope, metadata: metadata, found: found,
-		initialName: player.Name, initialAutoSetNameTemplate: player.AutoSetNameTemplate,
-		initialLastCommandTime: player.LastCommandTime, initialDiceSideNum: player.DiceSideNum,
-	}
-	return player, found
+	return owner, nil
 }
 
-func (t *DurableCallbackTransaction) AddLogUpdate(update eventstore.LogUpdate) error {
-	if t == nil || t.finalized || t.collector == nil {
-		return eventstore.ErrConflict
+func (t *DurableCallbackTransaction) ensurePluginKey(ctx context.Context, owner *pluginKVParticipant, key string) (*pluginKVEntry, error) {
+	if strings.Contains(key, "$t") {
+		return nil, ErrJSPluginKV
 	}
-	return t.collector.AddLogUpdate(update)
+	if len(key) > eventstore.MaxPluginKeyBytes {
+		return nil, &eventstore.OversizeError{Bound: "plugin key bytes", Limit: eventstore.MaxPluginKeyBytes, Actual: len(key)}
+	}
+	owner.mu.RLock()
+	entry := owner.entries[key]
+	owner.mu.RUnlock()
+	if entry != nil {
+		return entry, nil
+	}
+	backend, ok := t.store.(eventstore.PluginKVSnapshotRepository)
+	if !ok {
+		return nil, ErrJSPluginKV
+	}
+	snapshot, err := backend.LookupPluginKVSnapshot(ctx, owner.extension, key)
+	if err != nil {
+		return nil, err
+	}
+	if err = t.domain.AddReadDependencies(execution.ReadDependencies{
+		PluginKVReads: []eventstore.PluginKVReadExpectation{{
+			Namespace: snapshot.Namespace, Key: snapshot.Key,
+			ExpectedRevision: snapshot.KeyRevision, ExpectedExists: snapshot.Found,
+		}},
+		ProjectionReads: []eventstore.ProjectionReadExpectation{{
+			Generation: snapshot.Snapshot.ProjectionGeneration,
+		}},
+	}); err != nil {
+		return nil, err
+	}
+	participantKey := pluginKVParticipantKey(owner.extension)
+	err = t.domain.Mutate(participantKey, func(participant execution.Participant) error {
+		current, ok := participant.(*pluginKVParticipant)
+		if !ok || current != owner {
+			return execution.ErrParticipantType
+		}
+		current.mu.Lock()
+		defer current.mu.Unlock()
+		if current.entries[key] == nil {
+			item := snapshot.Item
+			item.Value = append([]byte(nil), item.Value...)
+			current.entries[key] = &pluginKVEntry{snapshot: snapshot, item: item, exists: snapshot.Found}
+		}
+		entry = current.entries[key]
+		return nil
+	})
+	return entry, err
 }
 
-func (t *DurableCallbackTransaction) HasStoryLogStateUpdate(diceID, groupID string) bool {
-	return t != nil && t.collector != nil && t.collector.HasStoryLogStateUpdate(diceID, groupID)
+// observePluginNamespace is the list path: the script observes the whole
+// namespace, so the snapshot revision becomes a commit-time read dependency.
+func (t *DurableCallbackTransaction) observePluginNamespace(ctx context.Context, owner *pluginKVParticipant) (*eventstore.PluginKVListSnapshot, error) {
+	owner.mu.RLock()
+	snapshot := owner.namespace
+	depends := owner.namespaceObserved
+	owner.mu.RUnlock()
+	if snapshot != nil && depends {
+		return snapshot, nil
+	}
+	if snapshot != nil {
+		if err := t.addPluginNamespaceDependency(owner, snapshot); err != nil {
+			return nil, err
+		}
+		return snapshot, nil
+	}
+	backend, ok := t.store.(eventstore.PluginKVSnapshotRepository)
+	if !ok {
+		return nil, ErrJSPluginKV
+	}
+	loaded, err := backend.ListPluginKVSnapshot(ctx, eventstore.PluginKVListRequest{
+		ExtensionID: owner.extension, Limit: eventstore.MaxPluginResults,
+	})
+	if err != nil {
+		return nil, err
+	}
+	participantKey := pluginKVParticipantKey(owner.extension)
+	err = t.domain.Mutate(participantKey, func(participant execution.Participant) error {
+		current, ok := participant.(*pluginKVParticipant)
+		if !ok || current != owner {
+			return execution.ErrParticipantType
+		}
+		current.mu.Lock()
+		defer current.mu.Unlock()
+		if current.namespace == nil {
+			copySnapshot := loaded
+			copySnapshot.Namespace = loaded.Namespace
+			copySnapshot.Items = make([]eventstore.PluginKVItem, len(loaded.Items))
+			for index, item := range loaded.Items {
+				item.Value = append([]byte(nil), item.Value...)
+				copySnapshot.Items[index] = item
+			}
+			current.namespace = &copySnapshot
+		}
+		snapshot = current.namespace
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err = t.addPluginNamespaceDependency(owner, snapshot); err != nil {
+		return nil, err
+	}
+	return snapshot, nil
+}
+
+func (t *DurableCallbackTransaction) addPluginNamespaceDependency(owner *pluginKVParticipant, snapshot *eventstore.PluginKVListSnapshot) error {
+	owner.mu.Lock()
+	if owner.namespaceObserved {
+		owner.mu.Unlock()
+		return nil
+	}
+	owner.namespaceObserved = true
+	owner.mu.Unlock()
+	return t.domain.AddReadDependencies(execution.ReadDependencies{
+		PluginKVNamespaceReads: []eventstore.PluginKVNamespaceReadExpectation{{
+			Namespace: snapshot.Namespace, ExpectedRevision: snapshot.NamespaceRevision,
+		}},
+		ProjectionReads: []eventstore.ProjectionReadExpectation{{
+			Generation: snapshot.Snapshot.ProjectionGeneration,
+		}},
+	})
+}
+
+func (t *DurableCallbackTransaction) pluginPut(ctx context.Context, extensionID, key string, value []byte) error {
+	if len(value) > eventstore.MaxPluginValueBytes {
+		return &eventstore.OversizeError{Bound: "plugin value bytes", Limit: eventstore.MaxPluginValueBytes, Actual: len(value)}
+	}
+	// The store checks namespace quotas atomically against the final batch.
+	owner, err := t.pluginParticipant(ctx, extensionID)
+	if err != nil {
+		return err
+	}
+	entry, err := t.ensurePluginKey(ctx, owner, key)
+	if err != nil {
+		return err
+	}
+	owner.mu.RLock()
+	baseVersion := uint64(0)
+	if entry.snapshot.Found {
+		baseVersion = entry.snapshot.Item.Version
+	}
+	revision := entry.revision
+	owner.mu.RUnlock()
+	version, err := nextJSPluginVersion(baseVersion)
+	if err != nil {
+		return err
+	}
+	update := eventstore.PluginKVUpdate{ExtensionID: extensionID, Key: key, ExpectedVersion: baseVersion, Version: version, Value: append([]byte(nil), value...), UpdatedAt: t.occurredAt()}
+	ownedValue := append([]byte(nil), value...)
+	return t.domain.Mutate(pluginKVParticipantKey(extensionID), func(participant execution.Participant) error {
+		current, ok := participant.(*pluginKVParticipant)
+		if !ok || current != owner {
+			return execution.ErrParticipantType
+		}
+		current.mu.Lock()
+		defer current.mu.Unlock()
+		currentEntry := current.entries[key]
+		if currentEntry == nil || currentEntry.revision != revision {
+			return eventstore.ErrConflict
+		}
+		currentEntry.item = eventstore.PluginKVItem{ExtensionID: extensionID, Key: key, Value: ownedValue, Version: version}
+		currentEntry.exists = true
+		currentEntry.update = &update
+		currentEntry.revision++
+		return nil
+	})
+}
+
+func (t *DurableCallbackTransaction) pluginDelete(ctx context.Context, extensionID, key string) error {
+	owner, err := t.pluginParticipant(ctx, extensionID)
+	if err != nil {
+		return err
+	}
+	entry, err := t.ensurePluginKey(ctx, owner, key)
+	if err != nil {
+		return err
+	}
+	owner.mu.RLock()
+	exists := entry.exists
+	baseExists := entry.snapshot.Found
+	baseVersion := uint64(0)
+	if baseExists {
+		baseVersion = entry.snapshot.Item.Version
+	}
+	revision := entry.revision
+	owner.mu.RUnlock()
+	version := uint64(0)
+	var update *eventstore.PluginKVUpdate
+	if exists {
+		version, err = nextJSPluginVersion(baseVersion)
+		if err != nil {
+			return err
+		}
+		prepared := eventstore.PluginKVUpdate{ExtensionID: extensionID, Key: key, ExpectedVersion: baseVersion, Version: version, Deleted: true, UpdatedAt: t.occurredAt()}
+		update = &prepared
+	}
+	return t.domain.Mutate(pluginKVParticipantKey(extensionID), func(participant execution.Participant) error {
+		current, ok := participant.(*pluginKVParticipant)
+		if !ok || current != owner {
+			return execution.ErrParticipantType
+		}
+		current.mu.Lock()
+		defer current.mu.Unlock()
+		currentEntry := current.entries[key]
+		if currentEntry == nil || currentEntry.revision != revision {
+			return eventstore.ErrConflict
+		}
+		if !currentEntry.exists {
+			return nil
+		}
+		currentEntry.exists = false
+		currentEntry.item = eventstore.PluginKVItem{ExtensionID: extensionID, Key: key, Version: version}
+		if baseExists {
+			currentEntry.update = update
+		} else {
+			currentEntry.update = nil
+		}
+		currentEntry.revision++
+		return nil
+	})
+}
+
+func (t *DurableCallbackTransaction) pluginGet(ctx context.Context, extensionID, key string) (eventstore.PluginKVItem, error) {
+	owner, err := t.pluginParticipant(ctx, extensionID)
+	if err != nil {
+		return eventstore.PluginKVItem{}, err
+	}
+	entry, err := t.ensurePluginKey(ctx, owner, key)
+	if err != nil {
+		return eventstore.PluginKVItem{}, err
+	}
+	owner.mu.RLock()
+	defer owner.mu.RUnlock()
+	if !entry.exists {
+		return eventstore.PluginKVItem{}, eventstore.ErrPluginKVNotFound
+	}
+	item := entry.item
+	item.Value = append([]byte(nil), item.Value...)
+	return item, nil
+}
+
+func (t *DurableCallbackTransaction) pluginList(ctx context.Context, extensionID, prefix string, limit int) ([]eventstore.PluginKVItem, error) {
+	if strings.Contains(prefix, "$t") || len(prefix) > eventstore.MaxPluginKeyBytes {
+		return nil, ErrJSPluginKV
+	}
+	if limit <= 0 {
+		limit = eventstore.MaxPluginResults
+	}
+	if limit > eventstore.MaxPluginResults {
+		return nil, &eventstore.OversizeError{Bound: "plugin results", Limit: eventstore.MaxPluginResults, Actual: limit}
+	}
+	owner, err := t.pluginParticipant(ctx, extensionID)
+	if err != nil {
+		return nil, err
+	}
+	snapshot, err := t.observePluginNamespace(ctx, owner)
+	if err != nil {
+		return nil, err
+	}
+	owner.mu.RLock()
+	merged := make(map[string]eventstore.PluginKVItem, len(snapshot.Items)+len(owner.entries))
+	for _, item := range snapshot.Items {
+		if strings.HasPrefix(item.Key, prefix) {
+			item.Value = append([]byte(nil), item.Value...)
+			merged[item.Key] = item
+		}
+	}
+	for key, entry := range owner.entries {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if !entry.exists {
+			delete(merged, key)
+			continue
+		}
+		item := entry.item
+		item.Value = append([]byte(nil), item.Value...)
+		merged[key] = item
+	}
+	owner.mu.RUnlock()
+	keys := make([]string, 0, len(merged))
+	for key := range merged {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	items := make([]eventstore.PluginKVItem, 0, min(limit, len(keys)))
+	responseBytes := 0
+	for _, key := range keys {
+		if len(items) == limit {
+			break
+		}
+		item := merged[key]
+		responseBytes += len(item.Key) + len(item.Value)
+		if responseBytes > eventstore.MaxPluginResponseBytes {
+			return nil, &eventstore.OversizeError{Bound: "plugin response bytes", Limit: eventstore.MaxPluginResponseBytes, Actual: responseBytes}
+		}
+		items = append(items, item)
+	}
+	return items, nil
 }
 
 func (t *DurableCallbackTransaction) StorageSet(ctx context.Context, extensionID, key, value string) error {
-	if t == nil || t.finalized {
-		return ErrJSPluginKV
-	}
-	if err := validateDurablePublicStorageExtensionID(extensionID); err != nil {
-		return err
-	}
-	overlay, err := t.pluginOverlay(extensionID)
-	if err != nil {
-		return err
-	}
-	return overlay.Put(ctx, key, []byte(value), 0)
+	return t.pluginPut(ctx, extensionID, key, []byte(value))
 }
 
 func (t *DurableCallbackTransaction) StorageGet(ctx context.Context, extensionID, key string) (string, error) {
-	if t == nil || t.finalized {
-		return "", ErrJSPluginKV
-	}
-	if err := validateDurablePublicStorageExtensionID(extensionID); err != nil {
-		return "", err
-	}
-	overlay, err := t.pluginOverlay(extensionID)
-	if err != nil {
-		return "", err
-	}
-	item, err := overlay.Get(ctx, key)
+	item, err := t.pluginGet(ctx, extensionID, key)
 	if errors.Is(err, eventstore.ErrPluginKVNotFound) {
 		return "", nil
 	}
@@ -231,18 +522,12 @@ func (t *DurableCallbackTransaction) StorageGet(ctx context.Context, extensionID
 	return string(item.Value), nil
 }
 
+func (t *DurableCallbackTransaction) StorageDelete(ctx context.Context, extensionID, key string) error {
+	return t.pluginDelete(ctx, extensionID, key)
+}
+
 func (t *DurableCallbackTransaction) StorageList(ctx context.Context, extensionID string) ([]string, error) {
-	if t == nil || t.finalized {
-		return nil, ErrJSPluginKV
-	}
-	if err := validateDurablePublicStorageExtensionID(extensionID); err != nil {
-		return nil, err
-	}
-	overlay, err := t.pluginOverlay(extensionID)
-	if err != nil {
-		return nil, err
-	}
-	items, err := overlay.List(ctx, "", eventstore.MaxPluginResults)
+	items, err := t.pluginList(ctx, extensionID, "", eventstore.MaxPluginResults)
 	if err != nil {
 		return nil, err
 	}
@@ -253,564 +538,68 @@ func (t *DurableCallbackTransaction) StorageList(ctx context.Context, extensionI
 	return keys, nil
 }
 
-func (t *DurableCallbackTransaction) encryptedConfigSet(
-	ctx context.Context,
-	pluginName string,
-	key string,
-	typ extensionstate.ConfigType,
-	value any,
-) error {
-	if t == nil || t.finalized {
-		return ErrJSPluginKV
-	}
-	payload, err := durableEncryptedConfigPayload(pluginName, key, typ, value)
-	if err != nil {
-		return err
-	}
-	overlay, err := t.pluginOverlay(durableConfigStorageExtensionID(pluginName))
-	if err != nil {
-		return err
-	}
-	return overlay.Put(ctx, durableConfigStorageKey(key), payload, 0)
-}
-
-func (t *DurableCallbackTransaction) encryptedConfigValue(
-	ctx context.Context,
-	pluginName string,
-	key string,
-	typ extensionstate.ConfigType,
-) (any, bool, error) {
-	if t == nil || t.finalized {
-		return nil, false, ErrJSPluginKV
-	}
-	overlay, err := t.pluginOverlay(durableConfigStorageExtensionID(pluginName))
-	if err != nil {
-		return nil, false, err
-	}
-	item, err := overlay.Get(ctx, durableConfigStorageKey(key))
-	if errors.Is(err, eventstore.ErrPluginKVNotFound) {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	value, err := durableDecodeEncryptedConfigValue(item.Value, pluginName, key, typ)
-	if err != nil {
-		return nil, false, err
-	}
-	return value, true, nil
-}
-
 func (ctx *MsgContext) ExtensionStorageSet(extensionID, key, value string) error {
 	if err := ctx.checkExecution(); err != nil {
 		return err
 	}
-	if ctx != nil && ctx.callbackTransaction != nil {
-		return ctx.callbackTransaction.StorageSet(context.Background(), extensionID, key, value)
-	}
-	if ctx == nil || ctx.Dice == nil {
+	if ctx == nil || ctx.callbackTransaction == nil {
 		return ErrDurableStateUnavailable
 	}
-	return ctx.Dice.durableStorageSet(extensionID, key, value)
+	return ctx.callbackTransaction.StorageSet(context.Background(), extensionID, key, value)
 }
 
 func (ctx *MsgContext) ExtensionStorageGet(extensionID, key string) (string, error) {
 	if err := ctx.checkExecution(); err != nil {
 		return "", err
 	}
-	if ctx != nil && ctx.callbackTransaction != nil {
-		return ctx.callbackTransaction.StorageGet(context.Background(), extensionID, key)
-	}
-	if ctx == nil || ctx.Dice == nil {
+	if ctx == nil || ctx.callbackTransaction == nil {
 		return "", ErrDurableStateUnavailable
 	}
-	return ctx.Dice.durableStorageGet(extensionID, key)
-}
-
-func (t *DurableCallbackTransaction) AttributeOverlay(state attributestate.State, source *AttributesItem, metadata eventstore.Metadata) (*AttributesItem, error) {
-	if t == nil || t.finalized || source == nil || source.valueMap == nil || !source.IsSaved {
-		return nil, eventstore.ErrConflict
-	}
-	key := state.DiceID + "\x00" + state.ID
-	if existing, ok := t.attributeOverlays[key]; ok {
-		return existing.item, nil
-	}
-	values := &ds.ValueMap{}
-	source.Range(func(name string, value *ds.VMValue) bool {
-		values.Store(name, value.Clone())
-		return true
-	})
-	item := &AttributesItem{
-		ID: source.ID, valueMap: values, LastModifiedTime: source.LastModifiedTime,
-		LastUsedTime: source.LastUsedTime, IsSaved: true, Name: source.Name, SheetType: source.SheetType,
-	}
-	t.attributeOverlays[key] = stagedAttributeOverlay{state: state, item: item, metadata: metadata}
-	return item, nil
-}
-
-func (t *DurableCallbackTransaction) AttributeState(diceID, id string) (attributestate.State, bool) {
-	if t == nil {
-		return attributestate.State{}, false
-	}
-	overlay, ok := t.attributeOverlays[diceID+"\x00"+id]
-	return overlay.state, ok
-}
-
-func (t *DurableCallbackTransaction) AttributeIDsWithBinding(diceID, bindingID string) []string {
-	if t == nil {
-		return nil
-	}
-	ids := make([]string, 0)
-	for _, overlay := range t.attributeOverlays {
-		if overlay.state.DiceID == diceID && overlay.state.BindingSheetID == bindingID {
-			ids = append(ids, overlay.state.ID)
-		}
-	}
-	sort.Strings(ids)
-	return ids
-}
-
-func (t *DurableCallbackTransaction) SetAttributeBinding(diceID, id, bindingID string) error {
-	if t == nil || t.finalized {
-		return eventstore.ErrConflict
-	}
-	key := diceID + "\x00" + id
-	overlay, ok := t.attributeOverlays[key]
-	if !ok {
-		return eventstore.ErrConflict
-	}
-	overlay.state.BindingSheetID = bindingID
-	overlay.item.SetModified()
-	t.attributeOverlays[key] = overlay
-	return nil
-}
-
-func (t *DurableCallbackTransaction) SetAttributeMetadata(diceID, id, name, sheetType string) error {
-	if t == nil || t.finalized {
-		return eventstore.ErrConflict
-	}
-	key := diceID + "\x00" + id
-	overlay, ok := t.attributeOverlays[key]
-	if !ok {
-		return eventstore.ErrConflict
-	}
-	overlay.state.Name = name
-	overlay.state.SheetType = sheetType
-
-	overlay.item.SetModified()
-	t.attributeOverlays[key] = overlay
-	return nil
-}
-func (t *DurableCallbackTransaction) ExtensionState() (extensionstate.State, bool) {
-	if t == nil || t.extension == nil {
-		return extensionstate.State{}, false
-	}
-	return t.extension.state.Clone(), true
+	return ctx.callbackTransaction.StorageGet(context.Background(), extensionID, key)
 }
 
 func (ctx *MsgContext) ExtensionConfigSet(extensionID, key string, value any) error {
-	if ctx == nil || ctx.Dice == nil {
+	if err := ctx.checkExecution(); err != nil {
+		return err
+	}
+	if ctx == nil || ctx.Dice == nil || ctx.callbackTransaction == nil {
 		return ErrDurableStateUnavailable
 	}
-	if ctx.callbackTransaction == nil {
-		return ctx.Dice.durableSetConfigByName(context.Background(), extensionID, key, value)
-	}
-	var state extensionstate.State
-	if staged, ok := ctx.callbackTransaction.ExtensionState(); ok {
-		state = staged
-	}
-	if state.DiceID == "" {
-		repository, diceID, err := ctx.Dice.durableExtensionRepository()
-		if err != nil {
-			return err
-		}
-		loaded, err := repository.Load(context.Background(), diceID)
-		if err != nil {
-			return err
-		}
-		state = loaded
+	state, err := ctx.Dice.ExtensionStateForDomain(context.Background(), ctx.callbackTransaction.Domain())
+	if err != nil {
+		return err
 	}
 	definition, ok := state.ConfigDefinitions[extensionID][key]
 	if !ok {
 		return extensionstate.ErrUnknownConfig
 	}
-	if durableEncryptedConfig(definition.Type, key) {
-		return ctx.callbackTransaction.encryptedConfigSet(context.Background(), extensionID, key, definition.Type, value)
-	}
-	configValue, err := durableConfigValue(definition.Type, value, key)
+	configValue, err := durableConfigValue(definition.Type, value)
 	if err != nil {
 		return err
 	}
-	return ctx.callbackTransaction.StageExtensionCommand(state, extensionstate.Command{
+	return ctx.Dice.ContributeExtensionCommand(context.Background(), ctx.callbackTransaction.Domain(), ctx.callbackMetadata, extensionstate.Command{
 		Kind: extensionstate.CommandSetConfig, ExtensionID: extensionID, Key: key, Value: configValue,
-	}, ctx.callbackMetadata)
+	})
 }
 
 func (ctx *MsgContext) ExtensionConfigValue(extensionID, key string) (any, bool, error) {
-	if ctx == nil || ctx.Dice == nil {
+	if err := ctx.checkExecution(); err != nil {
+		return nil, false, err
+	}
+	if ctx == nil || ctx.Dice == nil || ctx.callbackTransaction == nil {
 		return nil, false, ErrDurableStateUnavailable
 	}
-	var state extensionstate.State
-	if ctx.callbackTransaction != nil {
-		if staged, ok := ctx.callbackTransaction.ExtensionState(); ok {
-			state = staged
-		}
+	state, err := ctx.Dice.ExtensionStateForDomain(context.Background(), ctx.callbackTransaction.Domain())
+	if err != nil {
+		return nil, false, err
 	}
-	if state.DiceID == "" {
-		repository, diceID, err := ctx.Dice.durableExtensionRepository()
-		if err != nil {
-			return nil, false, err
-		}
-		loaded, err := repository.Load(context.Background(), diceID)
-		if err != nil {
-			return nil, false, err
-		}
-		state = loaded
-	}
-	definition, ok := state.ConfigDefinitions[extensionID][key]
+	_, ok := state.ConfigDefinitions[extensionID][key]
 	if !ok {
 		return nil, false, nil
-	}
-	if durableEncryptedConfig(definition.Type, key) {
-		if ctx.callbackTransaction != nil {
-			return ctx.callbackTransaction.encryptedConfigValue(context.Background(), extensionID, key, definition.Type)
-		}
-		return ctx.Dice.durableEncryptedConfigValue(context.Background(), extensionID, key, definition.Type)
 	}
 	value, ok := state.ConfigValues[extensionID][key]
 	if !ok {
 		return nil, false, nil
 	}
 	return durableLegacyValue(value), true, nil
-}
-
-func (t *DurableCallbackTransaction) DeleteAttribute(diceID, id string) error {
-	if t == nil || t.finalized {
-		return eventstore.ErrConflict
-	}
-	key := diceID + "\x00" + id
-	overlay, ok := t.attributeOverlays[key]
-	if !ok {
-		return eventstore.ErrConflict
-	}
-	overlay.state.AttrsType = ""
-	overlay.state.BindingSheetID = ""
-	overlay.state.Name = ""
-	overlay.state.SheetType = ""
-	overlay.item.Clear()
-	overlay.item.Name = ""
-	overlay.item.SheetType = ""
-	t.attributeOverlays[key] = overlay
-	return nil
-}
-
-func (t *DurableCallbackTransaction) StageAttributeSnapshot(ctx context.Context, state attributestate.State, plaintext []byte, metadata eventstore.Metadata) error {
-	if t == nil || t.finalized || len(plaintext) == 0 {
-		return ErrJSPluginKV
-	}
-	if state.SecretRef == "" {
-		state.SecretRef = attributestate.SecretRef(state.DiceID, state.ID)
-	}
-	nextVersion := state.Version + 1
-	if nextVersion == 0 {
-		return eventstore.ErrVersionExhausted
-	}
-	state.SecretVersion = nextVersion
-	payload, err := attributestate.MarshalBaselineImportedV1(attributestate.NewBaselineImportedV1(state))
-	if err != nil {
-		return err
-	}
-	eventType := attributestate.EventSnapshotReplaced
-	if state.Version == 0 {
-		eventType = attributestate.EventBaselineImported
-	}
-	event, err := (eventstore.EventFactory{Clock: eventstore.SystemClock{}, IDs: eventstore.UUIDGenerator{}}).NewEvent(eventType, attributestate.EventSchemaVersion, payload, metadata)
-	if err != nil {
-		return err
-	}
-	preparer, ok := t.store.(interface {
-		PrepareSecretUpdate(ctx context.Context, request eventstore.SecretPutRequest) (eventstore.SecretUpdate, error)
-	})
-	if !ok {
-		return attributestate.ErrRepositoryUnavailable
-	}
-	secret, err := preparer.PrepareSecretUpdate(ctx, eventstore.SecretPutRequest{
-		SecretRef: state.SecretRef, EndpointID: state.ID, AdapterID: attributestate.AggregateType,
-		SecretVersion: nextVersion, ExpectedVersion: state.Version, Plaintext: plaintext,
-	})
-	if err != nil {
-		return err
-	}
-	key := state.DiceID + "\x00" + state.ID
-	if _, exists := t.attributes[key]; exists {
-		return eventstore.ErrDuplicateParticipant
-	}
-	t.attributes[key] = stagedAttributeSnapshot{state: state, event: event, secret: secret, expected: state.Version}
-	return nil
-}
-
-func (t *DurableCallbackTransaction) StageExtensionCommand(state extensionstate.State, command extensionstate.Command, metadata eventstore.Metadata) error {
-	if t == nil || t.finalized {
-		return ErrJSPluginKV
-	}
-	staged := t.extension
-	if staged == nil {
-		staged = &stagedExtensionState{state: state.Clone(), expected: state.Version, metadata: metadata}
-		t.extension = staged
-	}
-	decision, err := extensionstate.Decide(staged.state, command)
-	if err != nil {
-		return err
-	}
-	for _, event := range decision.Events {
-		staged.state, err = extensionstate.Reduce(staged.state, event)
-		if err != nil {
-			return err
-		}
-		staged.events = append(staged.events, event)
-	}
-	return nil
-}
-
-func (t *DurableCallbackTransaction) prepareGroupMembershipRemoval(ctx context.Context, diceID, groupID, endpointID string, metadata eventstore.Metadata) (preparedGroupMembershipRemoval, error) {
-	if t == nil || t.finalized || t.store == nil || t.collector == nil {
-		return preparedGroupMembershipRemoval{}, ErrJSPluginKV
-	}
-	state, err := groupstate.NewRepository(t.store).Load(ctx, diceID, groupID)
-	if err != nil {
-		return preparedGroupMembershipRemoval{}, err
-	}
-	if state.Version == 0 {
-		return preparedGroupMembershipRemoval{}, eventstore.ErrNotFound
-	}
-	if state.Deleted {
-		return preparedGroupMembershipRemoval{}, groupstate.ErrDeletedGroup
-	}
-	stream := groupstate.GroupStream(diceID, groupID)
-	if staged := t.groups[stream]; staged != nil && staged.expected != state.Version {
-		return preparedGroupMembershipRemoval{}, eventstore.ErrConflict
-	}
-	prepared := preparedGroupMembershipRemoval{stream: stream, expected: state.Version, metadata: metadata}
-	if state.DiceIDExists[endpointID] {
-		prepared.event = groupstate.NewGroupActivationChangedV1(endpointID, state.DiceIDActive[endpointID], false)
-	}
-	return prepared, nil
-}
-
-func (t *DurableCallbackTransaction) stageGroupMembershipRemoval(prepared preparedGroupMembershipRemoval, afterCommit func()) {
-	if prepared.event != nil {
-		staged, err := t.callbackGroupEvents(prepared.stream, prepared.expected, prepared.metadata)
-		if err != nil {
-			t.groupError = err
-		} else {
-			staged.terminal = append(staged.terminal, prepared.event)
-		}
-	}
-	if afterCommit != nil {
-		t.callbackAfterCommit = append(t.callbackAfterCommit, afterCommit)
-	}
-}
-
-func (t *DurableCallbackTransaction) stageGroupEvents(stream eventstore.StreamID, expected uint64, metadata eventstore.Metadata, events []groupstate.TypedEvent) error {
-	if t == nil || t.finalized || t.collector == nil {
-		return ErrJSPluginKV
-	}
-	if len(events) == 0 {
-		return nil
-	}
-	staged, err := t.callbackGroupEvents(stream, expected, metadata)
-	if err != nil {
-		return err
-	}
-	staged.events = append(staged.events, events...)
-	return nil
-}
-
-func (t *DurableCallbackTransaction) callbackGroupEvents(stream eventstore.StreamID, expected uint64, metadata eventstore.Metadata) (*stagedCallbackGroupEvents, error) {
-	if t.groups == nil {
-		t.groups = map[eventstore.StreamID]*stagedCallbackGroupEvents{}
-	}
-	if staged := t.groups[stream]; staged != nil {
-		if staged.expected != expected {
-			return nil, eventstore.ErrConflict
-		}
-		return staged, nil
-	}
-	staged := &stagedCallbackGroupEvents{expected: expected, metadata: metadata}
-	t.groups[stream] = staged
-	return staged, nil
-}
-
-func (t *DurableCallbackTransaction) Finalize(ctx context.Context) error {
-	if t == nil || t.finalized {
-		return ErrJSPluginKV
-	}
-	if t.delegatedPlayerError != nil {
-		return t.delegatedPlayerError
-	}
-	if t.groupError != nil {
-		return t.groupError
-	}
-	if err := t.flushGroupEvents(); err != nil {
-		return err
-	}
-	if err := t.flushDelegatedPlayers(); err != nil {
-		return err
-	}
-	if err := t.flushAttributeOverlays(ctx); err != nil {
-		return err
-	}
-	if err := t.flushAttributeSnapshots(); err != nil {
-		return err
-	}
-	if err := t.flushExtensionState(); err != nil {
-		return err
-	}
-	ids := make([]string, 0, len(t.overlays))
-	for id := range t.overlays {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	for _, id := range ids {
-		if err := t.overlays[id].Commit(ctx); err != nil {
-			return err
-		}
-	}
-	t.finalized = true
-	return nil
-}
-
-func (t *DurableCallbackTransaction) flushGroupEvents() error {
-	streams := make([]eventstore.StreamID, 0, len(t.groups))
-	for stream := range t.groups {
-		streams = append(streams, stream)
-	}
-	sort.Slice(streams, func(i, j int) bool {
-		if streams[i].AggregateType != streams[j].AggregateType {
-			return streams[i].AggregateType < streams[j].AggregateType
-		}
-		return streams[i].AggregateID < streams[j].AggregateID
-	})
-	for _, stream := range streams {
-		staged := t.groups[stream]
-		events := make([]groupstate.TypedEvent, 0, len(staged.events)+len(staged.terminal))
-		events = append(events, staged.events...)
-		events = append(events, staged.terminal...)
-		if len(events) == 0 {
-			continue
-		}
-		if err := t.collector.AddGroupEvents(stream, staged.expected, staged.metadata, events); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (t *DurableCallbackTransaction) flushDelegatedPlayers() error {
-	keys := make([]string, 0, len(t.delegatedPlayers))
-	for key := range t.delegatedPlayers {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		staged := t.delegatedPlayers[key]
-		if staged.state.Version == 0 &&
-			staged.initialName == staged.player.Name &&
-			staged.initialAutoSetNameTemplate == staged.player.AutoSetNameTemplate &&
-			staged.initialLastCommandTime == staged.player.LastCommandTime &&
-			staged.initialDiceSideNum == staged.player.DiceSideNum {
-			continue
-		}
-		events := compatibilityPlayerEvents(staged.state, staged.scope, staged.player)
-		if len(events) == 0 {
-			continue
-		}
-		stream := playerstate.PlayerStream(staged.scope.DiceID, staged.scope.GroupID, staged.scope.UserID)
-		if err := t.collector.AddPlayerEvents(stream, staged.state.Version, staged.metadata, events); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (t *DurableCallbackTransaction) flushAttributeOverlays(ctx context.Context) error {
-	keys := make([]string, 0, len(t.attributeOverlays))
-	for key := range t.attributeOverlays {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		overlay := t.attributeOverlays[key]
-		if overlay.item.IsSaved {
-			continue
-		}
-		plaintext, err := ds.NewDictVal(overlay.item.valueMap).V().ToJSON()
-		if err != nil {
-			return err
-		}
-		if err := t.StageAttributeSnapshot(ctx, overlay.state, plaintext, overlay.metadata); err != nil {
-			return err
-		}
-		overlay.item.IsSaved = true
-	}
-	return nil
-}
-
-func (t *DurableCallbackTransaction) flushAttributeSnapshots() error {
-	keys := make([]string, 0, len(t.attributes))
-	for key := range t.attributes {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		item := t.attributes[key]
-		if err := t.collector.AddStream(attributestate.Stream(item.state.DiceID, item.state.ID), item.expected, []eventstore.NewEvent{item.event}); err != nil {
-			return err
-		}
-		if err := t.collector.AddSecretUpdate(item.secret); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (t *DurableCallbackTransaction) flushExtensionState() error {
-	staged := t.extension
-	if staged == nil || len(staged.events) == 0 {
-		return nil
-	}
-	encoded := make([]eventstore.NewEvent, 0, len(staged.events))
-	factory := eventstore.EventFactory{Clock: eventstore.SystemClock{}, IDs: eventstore.UUIDGenerator{}}
-	for index, typed := range staged.events {
-		metadata := staged.metadata
-		if index > 0 {
-			metadata.EventID = ""
-		}
-		event, err := extensionstate.NewEventWithFactory(factory, typed, metadata)
-		if err != nil {
-			return err
-		}
-		encoded = append(encoded, event)
-	}
-	return t.collector.AddStream(extensionstate.ExtensionStream(staged.state.DiceID), staged.expected, encoded)
-}
-
-func (t *DurableCallbackTransaction) pluginOverlay(extensionID string) (*JSPluginKVOverlay, error) {
-	if overlay := t.overlays[extensionID]; overlay != nil {
-		return overlay, nil
-	}
-	backend, ok := t.store.(JSPluginKVReadBackend)
-	if !ok {
-		return nil, ErrJSPluginKV
-	}
-	sealer, ok := t.store.(JSPluginKVSealer)
-	if !ok {
-		return nil, ErrJSPluginKV
-	}
-	overlay, err := NewJSPluginKVOverlayForCollectorWithBackend(extensionID, sealer, t.collector, backend)
-	if err != nil {
-		return nil, err
-	}
-	t.overlays[extensionID] = overlay
-	return overlay, nil
 }

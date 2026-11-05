@@ -22,7 +22,6 @@ func EnsureDataSchema(db *gorm.DB) error {
 		&model.BanInfo{},
 		&model.EndpointInfo{},
 		&model.AttributesItemModel{},
-		&model.OfficialQQIdentityMapping{},
 	); err != nil {
 		return fmt.Errorf("ensure data schema: %w", err)
 	}

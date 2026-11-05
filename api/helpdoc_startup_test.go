@@ -137,9 +137,7 @@ func runHelpDocHTTPStartupScenario(t *testing.T, root string) {
 	const startupScript = `// ==UserScript==
 // @name Help startup readiness fixture
 // ==/UserScript==
-seal.inst.config.jsEnable = false;
 console.log("help-startup-before-reload-gate");
-seal.inst.parent.reloadHelp();
 console.log("help-startup-after-reload-gate");
 const ext = seal.ext.new("startup-help-fixture", "test", "1.0.0");
 seal.ext.register(ext);
@@ -159,19 +157,28 @@ console.log("help-startup-script-done");
 	t.Cleanup(restoreLogger)
 
 	ctx := context.Background()
-	database, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(root, "events.sqlite")})
+	const databaseIdentity = "api-helpdoc-startup-test"
+	database, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
+		Type: "sqlite", DSN: filepath.Join(root, "events.sqlite"),
+		DatabaseIdentity: databaseIdentity,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := eventstore.NewStore(database, projectionset.StoreOptions()...)
+	store := eventstore.NewStore(database,
+		projectionset.StoreOptions()...,
+	)
+	if err = store.SetReadiness(ctx, eventstore.Readiness{
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: databaseIdentity,
+		CompletedAt: time.Unix(1, 0).UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	runtime := &dice.Dice{
 		BaseConfig:    dice.BaseConfig{Name: "default", DataDir: filepath.Join("data", "default")},
 		DurableStore:  store,
 		ContainerMode: true,
 	}
-	runtime.Config = dice.NewConfig(runtime)
-	runtime.Config.BaseConfig = runtime.BaseConfig
-	runtime.Config.JsEnable = false
 	manager := &dice.DiceManager{Dice: []*dice.Dice{runtime}, HelpDocEngineType: int(dice.BlugeSearch)}
 	if err := manager.InitializeRuntime(); err != nil {
 		t.Fatal(err)
@@ -179,8 +186,9 @@ console.log("help-startup-script-done");
 	if err := manager.PrepareEventSourcedState(ctx); err != nil {
 		t.Fatal(err)
 	}
-	runtime.AdvancedConfig.ExposeDangerousSealInst = true
-	runtime.Config.JsEnable = true
+	updateAPITestConfig(t, runtime, func(config *dice.Config) {
+		config.JsEnable = true
+	})
 	manager.AccessTokens.Store(helpStartupAPIToken, true)
 
 	oldMyDice, oldDM := myDice, dm
@@ -251,6 +259,9 @@ console.log("help-startup-script-done");
 	canceledResult := awaitHelpStartupTreeRequest(t, canceledTree)
 	if !errors.Is(canceledResult.err, context.Canceled) {
 		t.Errorf("cancelled startup tree request result = %#v, want context cancellation without waiting for startup", canceledResult)
+	}
+	if err := manager.ReloadHelp(); err != nil {
+		t.Fatalf("explicit HelpDoc reload during startup: %v", err)
 	}
 	logSyncer.releaseBeforeOnce.Do(func() { close(logSyncer.releaseBeforeReload) })
 

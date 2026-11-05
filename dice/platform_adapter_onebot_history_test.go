@@ -23,7 +23,7 @@ func TestOnebotHistoryMessageIsTheSameFactAsTheLiveOne(t *testing.T) {
 	}
 	live := <-core.inboundCh
 
-	history, err := onebotHistoryInbound([]byte(onebotGroupMessageJSON), "QQ-Group:2002")
+	history, err := onebotHistoryInbound([]byte(onebotGroupMessageJSON), "QQ-Group:2002", onebotOwnMessages{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestOnebotHistoryMessageIsTheSameFactAsTheLiveOne(t *testing.T) {
 func TestOnebotHistoryMessageTakesItsGroupFromTheRequest(t *testing.T) {
 	const withoutGroup = `{"user_id":1001,"time":1793116175,"message_id":9001,"message_seq":10272,"message_type":"group","post_type":"message",` +
 		`"sender":{"nickname":"Alice","role":"member"},"message":[{"type":"text","data":{"text":"hi"}}]}`
-	message, err := onebotHistoryInbound([]byte(withoutGroup), "QQ-Group:2002")
+	message, err := onebotHistoryInbound([]byte(withoutGroup), "QQ-Group:2002", onebotOwnMessages{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestOnebotHistoryRejectsWhatItCannotPlace(t *testing.T) {
 		"oversized sequence": `{"user_id":1001,"time":1793116175,"message_id":9001,"message_seq":99999999999999999999,"message_type":"group","post_type":"message","group_id":2002,"message":[]}`,
 	}
 	for name, raw := range cases {
-		if _, err := onebotHistoryInbound([]byte(raw), "QQ-Group:2002"); !errors.Is(err, ErrOnebotUnsupportedInboundEvent) {
+		if _, err := onebotHistoryInbound([]byte(raw), "QQ-Group:2002", onebotOwnMessages{}); !errors.Is(err, ErrOnebotUnsupportedInboundEvent) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}

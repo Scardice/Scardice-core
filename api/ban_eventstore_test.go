@@ -15,6 +15,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 
+	"Scardice-core/core/configstate"
 	"Scardice-core/core/playerstate"
 	"Scardice-core/dice"
 	"Scardice-core/eventstore"
@@ -32,21 +33,43 @@ func openAPIBanEventStore(t *testing.T, dsn string, initialize bool) (*eventstor
 		t.Fatal(err)
 	}
 	store := eventstore.NewStore(db,
-		eventstore.WithKeySource(endpointAPITestKeySource{}),
+		eventstore.WithProjection(configstate.ConfigProjection()),
 		eventstore.WithProjection(playerstate.ModerationProjection()),
 	)
 	if initialize {
 		if err = store.SetReadiness(ctx, eventstore.Readiness{
-			Mode: "import", SchemaVersion: 1, DatabaseIdentity: apiBanEventStoreTestDiceID,
-			IndexRootID: "api-test-index-v1", EncryptionRootIDs: []string{"api-test-root-v1"},
-			SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32),
+			Mode: "import", SchemaVersion: 2, DatabaseIdentity: apiBanEventStoreTestDiceID,
 			CompletedAt: time.Unix(1, 0).UTC(),
 		}); err != nil {
 			_ = db.Close()
 			t.Fatal(err)
 		}
 	}
-	if err = store.ValidateReadiness(ctx); err != nil {
+	if initialize {
+		configRepository := configstate.NewRepository(store)
+		if _, err = configRepository.DecideAndAppend(ctx, configstate.State{}, 0, eventstore.Metadata{}, configstate.Command{
+			Kind: configstate.CommandImportBaseline,
+			Baseline: &configstate.Baseline{
+				DiceID: apiBanEventStoreTestDiceID, ConfigVersion: 1,
+				Base: configstate.BaseConfig{
+					CommandCompatibleMode: true, MessageDelayRangeEnd: 1, UILogLimit: 100,
+				},
+				Rate: configstate.RateConfig{
+					PersonalReplenishRate: "@every 3s", GroupReplenishRate: "@every 3s",
+					PersonalBurst: 3, GroupBurst: 3, SpamSameCommandWindowSec: 30, SpamRecoveryMultiplierMax: 5,
+				},
+				Quit:          configstate.QuitConfig{QuitInactiveThreshold: "0s", QuitInactiveBatchSize: 10},
+				Extension:     configstate.ExtensionConfig{MaxExecuteTime: 12, MaxCocCardGen: 5},
+				StoryLog:      configstate.StoryLogConfig{LogSizeNoticeCount: 500},
+				Advanced:      configstate.AdvancedConfig{CustomReplyCooldown: 5},
+				CommandPrefix: []string{"."},
+			},
+		}); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	if _, err = store.GetReadiness(ctx); err != nil {
 		_ = db.Close()
 		t.Fatal(err)
 	}
@@ -54,7 +77,7 @@ func openAPIBanEventStore(t *testing.T, dsn string, initialize bool) (*eventstor
 	return db, store
 }
 
-func TestBanImportExportRoundTripsThroughEncryptedEventStore(t *testing.T) {
+func TestBanImportExportRoundTripsThroughEventStore(t *testing.T) {
 	previousDice, previousManager := myDice, dm
 	t.Cleanup(func() { myDice, dm = previousDice, previousManager })
 
@@ -65,9 +88,10 @@ func TestBanImportExportRoundTripsThroughEncryptedEventStore(t *testing.T) {
 	dsn := filepath.Join(root, "events.db")
 	db, store := openAPIBanEventStore(t, dsn, true)
 	runtime := &dice.Dice{BaseConfig: dice.BaseConfig{Name: apiBanEventStoreTestDiceID}, Parent: manager, DurableStore: store}
-	banList := &dice.BanListInfo{Parent: runtime}
-	banList.Init()
-	runtime.Config.BanList = banList
+	if err := runtime.ReloadConfigView(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	banList := runtime.Config().BanList
 	myDice = runtime
 	if err := banList.LoadsWithError(); err != nil {
 		t.Fatalf("load empty EventStore list: %v", err)

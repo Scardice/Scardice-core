@@ -9,16 +9,15 @@ import (
 	"time"
 )
 
-func openLogArchiveTestStore(t *testing.T, path string, source *MemoryKeySource) (*GORMStore, *Database) {
+func openLogArchiveTestStore(t *testing.T, path string) (*GORMStore, *Database) {
 	t.Helper()
-	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: path, KeySource: source, DatabaseIdentity: "log-archive-test"})
+	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: path, DatabaseIdentity: "log-archive-test"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := NewStore(db, WithKeySource(source))
+	store := NewStore(db)
 	if err := store.SetReadiness(context.Background(), Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "log-archive-test", IndexRootID: source.IndexID,
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32),
+		Mode: "import", SchemaVersion: supportedReadinessSchemaVersion, DatabaseIdentity: "log-archive-test",
 		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		db.Close()
@@ -27,11 +26,11 @@ func openLogArchiveTestStore(t *testing.T, path string, source *MemoryKeySource)
 	return store, db
 }
 
-func TestStoryLogArchivePersistsEncryptedAndIsolatesScope(t *testing.T) {
+func TestStoryLogArchivePersistsAndIsolatesScope(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "events.db")
-	source := newTestKeySource()
-	store, db := openLogArchiveTestStore(t, path, source)
+
+	store, db := openLogArchiveTestStore(t, path)
 	first, err := store.CreateStoryLog(ctx, "dice-a", "group-a", "session")
 	if err != nil {
 		t.Fatal(err)
@@ -56,21 +55,6 @@ func TestStoryLogArchivePersistsEncryptedAndIsolatesScope(t *testing.T) {
 	if err != nil || len(other) != 0 {
 		t.Fatalf("other dice entries=%#v err=%v", other, err)
 	}
-	var rows []logArchiveEntryRow
-	if err := db.GORM().Find(&rows).Error; err != nil {
-		t.Fatal(err)
-	}
-	if len(rows) != 1 || string(rows[0].Payload) == "" {
-		t.Fatalf("stored rows=%#v", rows)
-	}
-	for _, secret := range []string{"dice-a", "group-a", "Alice", "user-private", "private message body", "platform-message-id", "uniform-private"} {
-		if containsBytes(rows[0].Payload, []byte(secret)) {
-			t.Fatalf("plaintext %q leaked into archive payload", secret)
-		}
-	}
-	if len(rows[0].ScopeHMAC) == 0 || len(rows[0].OwnerHMAC) == 0 || len(rows[0].Nonce) == 0 {
-		t.Fatalf("incomplete protected row=%#v", rows[0])
-	}
 	state := StoryLogState{DiceID: "dice-a", GroupID: "group-a", SessionID: first.ID, Name: "session", On: true}
 	if err := store.SetStoryLogState(ctx, state); err != nil {
 		t.Fatal(err)
@@ -78,7 +62,7 @@ func TestStoryLogArchivePersistsEncryptedAndIsolatesScope(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, db = openLogArchiveTestStore(t, path, source)
+	store, db = openLogArchiveTestStore(t, path)
 	defer db.Close()
 	state, err = store.GetStoryLogState(ctx, "dice-a", "group-a")
 	if err != nil || !state.On || state.Name != "session" {
@@ -97,31 +81,9 @@ func TestStoryLogArchivePersistsEncryptedAndIsolatesScope(t *testing.T) {
 	}
 }
 
-func TestStoryLogArchiveRequiresEncryptionKey(t *testing.T) {
-	db, err := OpenDatabase(context.Background(), DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "events.db")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	if _, err := NewStore(db).CreateStoryLog(context.Background(), "dice", "group", "session"); !errors.Is(err, ErrKeySourceUnavailable) {
-		t.Fatalf("CreateStoryLog() err=%v, want key source unavailable", err)
-	}
-}
-
-func containsBytes(haystack, needle []byte) bool {
-	if len(needle) == 0 || len(needle) > len(haystack) {
-		return false
-	}
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if string(haystack[i:i+len(needle)]) == string(needle) {
-			return true
-		}
-	}
-	return false
-}
 func TestStoryLogIntentQueuesAndFinalizesAtomically(t *testing.T) {
 	ctx := context.Background()
-	store, db, _ := openEncryptedTestStore(t)
+	store, db := openPlainTestStore(t)
 	defer db.Close()
 	if _, err := store.CreateStoryLog(ctx, "dice-a", "group-a", "session"); err != nil {
 		t.Fatal(err)
@@ -160,33 +122,10 @@ func TestStoryLogIntentQueuesAndFinalizesAtomically(t *testing.T) {
 	if err := db.GORM().Model(&logArchiveIntentRow{}).Count(&queued).Error; err != nil || queued != 0 {
 		t.Fatalf("intents after terminal outcomes = %d, err = %v", queued, err)
 	}
-	subject, err := store.PrivacySubjectKey(ctx, "group-a")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.PrivacyCreateOperation(ctx, "purge", subject, PrivacyOperationContext{GroupID: "group-a"}); err != nil {
-		t.Fatal(err)
-	}
-	version, err := store.PrivacyFence(ctx, subject, privacyFenceScope, "purge")
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = store.QueueStoryLogIntent(ctx, StoryLogIntent{EffectID: "effect-fenced", Entry: StoryLogEntry{
-		DiceID: "dice-a", GroupID: "group-a", LogName: "session", Message: "must not queue",
-	}})
-	if !errors.Is(err, ErrParticipantFailure) {
-		t.Fatalf("QueueStoryLogIntent() under purge fence error = %v, want participant failure", err)
-	}
-	if err := db.GORM().Model(&logArchiveIntentRow{}).Count(&queued).Error; err != nil || queued != 0 {
-		t.Fatalf("queued intents after fenced attempt = %d, err = %v", queued, err)
-	}
-	if err := store.PrivacyUnfence(ctx, subject, privacyFenceScope, version, "purge"); err != nil {
-		t.Fatal(err)
-	}
 }
 func TestStoryLogRawIDMutationTargetsLatestSessionMatch(t *testing.T) {
 	ctx := context.Background()
-	store, db, _ := openEncryptedTestStore(t)
+	store, db := openPlainTestStore(t)
 	defer db.Close()
 	for _, name := range []string{"earlier", "latest"} {
 		if _, err := store.CreateStoryLog(ctx, "dice-a", "group-a", name); err != nil {
@@ -252,7 +191,7 @@ func TestStoryLogRawIDMutationTargetsLatestSessionMatch(t *testing.T) {
 
 func TestStoryLogRawIDDeletePreservesOlderHistoricalMatch(t *testing.T) {
 	ctx := context.Background()
-	store, db, _ := openEncryptedTestStore(t)
+	store, db := openPlainTestStore(t)
 	defer db.Close()
 	for _, name := range []string{"earlier", "latest"} {
 		if _, err := store.CreateStoryLog(ctx, "dice-a", "group-a", name); err != nil {
@@ -279,7 +218,7 @@ func TestStoryLogRawIDDeletePreservesOlderHistoricalMatch(t *testing.T) {
 }
 func TestDeletingHistoricalStoryLogPreservesSelectedSession(t *testing.T) {
 	ctx := context.Background()
-	store, db, _ := openEncryptedTestStore(t)
+	store, db := openPlainTestStore(t)
 	defer db.Close()
 	current, err := store.CreateStoryLog(ctx, "dice-a", "group-a", "current")
 	if err != nil {
@@ -322,8 +261,8 @@ func TestDeletingStoryLogDiscardsOnlyItsPendingArchiveIntents(t *testing.T) {
 	ctx := context.Background()
 	clock := &outboxRecoveryClock{now: time.Unix(900, 0).UTC()}
 	ids := &outboxRecoveryIDs{}
-	source := newTestKeySource()
-	store, db := openOutboxRecoveryStore(t, filepath.Join(t.TempDir(), "delete-log-intents.db"), source, clock, ids, true)
+
+	store, db := openOutboxRecoveryStore(t, filepath.Join(t.TempDir(), "delete-log-intents.db"), clock, ids, true)
 	defer db.Close()
 
 	deleted, err := store.CreateStoryLog(ctx, "dice-a", "group-a", "deleted")
@@ -341,7 +280,7 @@ func TestDeletingStoryLogDiscardsOnlyItsPendingArchiveIntents(t *testing.T) {
 	}
 	seedIntent := func(effectID, name, message string) {
 		t.Helper()
-		effect := newOutboxRecoveryEffect(t, source, clock, effectID, "lane-story-log-delete", RiskProviderIdempotent)
+		effect := newOutboxRecoveryEffect(t, clock, effectID, "lane-story-log-delete", RiskProviderIdempotent)
 		seedOutboxRecoveryEffect(t, store, effect, "operation-"+effectID, "event-"+effectID, clock.Now())
 		if err := store.QueueStoryLogIntent(ctx, StoryLogIntent{EffectID: effectID, Entry: StoryLogEntry{
 			DiceID: "dice-a", GroupID: "group-a", LogName: name, Message: message,
@@ -434,9 +373,9 @@ func TestStoryLogIntentFollowsOutboxTerminalCommit(t *testing.T) {
 	ctx := context.Background()
 	clock := &outboxRecoveryClock{now: time.Unix(700, 0).UTC()}
 	ids := &outboxRecoveryIDs{}
-	source := newTestKeySource()
+
 	path := filepath.Join(t.TempDir(), "story-log-outbox.db")
-	store, db := openOutboxRecoveryStore(t, path, source, clock, ids, true)
+	store, db := openOutboxRecoveryStore(t, path, clock, ids, true)
 	defer db.Close()
 	if _, err := store.CreateStoryLog(ctx, "dice-a", "group-a", "session"); err != nil {
 		t.Fatal(err)
@@ -464,7 +403,7 @@ func TestStoryLogIntentFollowsOutboxTerminalCommit(t *testing.T) {
 	}
 	seedAndQueue := func(id, operationID, eventID, message string) {
 		t.Helper()
-		effect := newOutboxRecoveryEffect(t, source, clock, id, "lane-"+id, RiskProviderIdempotent)
+		effect := newOutboxRecoveryEffect(t, clock, id, "lane-"+id, RiskProviderIdempotent)
 		seedOutboxRecoveryEffect(t, store, effect, operationID, eventID, clock.Now())
 		if err := store.QueueStoryLogIntent(ctx, StoryLogIntent{EffectID: id, Entry: StoryLogEntry{
 			DiceID: "dice-a", GroupID: "group-a", LogName: "session",
@@ -500,7 +439,7 @@ func TestStoryLogIntentFollowsOutboxTerminalCommit(t *testing.T) {
 	if err := db.GORM().Model(&logArchiveIntentRow{}).Where("effect_id = ?", "log-effect-tampered").Update("payload", []byte("tampered")).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := complete("log-effect-tampered", OutboxStatusSucceeded, "provider-message-2"); !errors.Is(err, ErrAuthenticationFailed) {
+	if err := complete("log-effect-tampered", OutboxStatusSucceeded, "provider-message-2"); !errors.Is(err, ErrInvalidMetadata) {
 		t.Fatalf("tampered intent completion error=%v", err)
 	}
 	if row := loadOutboxRecoveryRow(t, db, "log-effect-tampered"); row.Status != OutboxStatusDispatched {
@@ -545,8 +484,7 @@ func messages(entries []StoryLogEntry) []string {
 // one second the stored order says nothing, so the sequence decides, and a
 // reply sits next to the message that caused it wherever that message lands.
 func TestStoryLogReadsRecoveredMessagesInSequenceOrder(t *testing.T) {
-	source := newTestKeySource()
-	store, db := openLogArchiveTestStore(t, filepath.Join(t.TempDir(), "events.db"), source)
+	store, db := openLogArchiveTestStore(t, filepath.Join(t.TempDir(), "events.db"))
 	defer db.Close()
 
 	read := appendOrderedFixture(t, store, []StoryLogEntry{
@@ -567,8 +505,7 @@ func TestStoryLogReadsRecoveredMessagesInSequenceOrder(t *testing.T) {
 // Logs without sequence numbers (older data, other platforms) must read exactly
 // as before: by time, then by the order they were stored in.
 func TestStoryLogWithoutSequencesKeepsTimeThenStoredOrder(t *testing.T) {
-	source := newTestKeySource()
-	store, db := openLogArchiveTestStore(t, filepath.Join(t.TempDir(), "events.db"), source)
+	store, db := openLogArchiveTestStore(t, filepath.Join(t.TempDir(), "events.db"))
 	defer db.Close()
 
 	read := appendOrderedFixture(t, store, []StoryLogEntry{
@@ -612,14 +549,12 @@ func TestOrderStoryLogEntriesAnchorsAndDeterminism(t *testing.T) {
 	}
 }
 
-// The baseline marks where a log last resumed recording. It has to survive a
-// restart, travel inside the encrypted state, and read as zero for states that
-// were written before it existed.
+// The baseline marks where a log last resumed recording and survives a restart.
 func TestStoryLogStateKeepsBaselineSequence(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "events.db")
-	source := newTestKeySource()
-	store, db := openLogArchiveTestStore(t, path, source)
+
+	store, db := openLogArchiveTestStore(t, path)
 	session, err := store.CreateStoryLog(ctx, "dice", "group", "session")
 	if err != nil {
 		t.Fatal(err)
@@ -631,17 +566,10 @@ func TestStoryLogStateKeepsBaselineSequence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store, db = openLogArchiveTestStore(t, path, source)
+	store, db = openLogArchiveTestStore(t, path)
 	defer db.Close()
 	state, err := store.GetStoryLogState(ctx, "dice", "group")
 	if err != nil || state.BaselineSeq != 4242 || !state.On || state.Name != "session" {
 		t.Fatalf("state after restart = %+v err=%v", state, err)
-	}
-	var row storyLogStateRow
-	if err := db.GORM().Take(&row).Error; err != nil {
-		t.Fatal(err)
-	}
-	if containsBytes(row.Payload, []byte("4242")) || containsBytes(row.Payload, []byte("baseline")) {
-		t.Fatal("baseline is stored in the clear")
 	}
 }

@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"Scardice-core/utils/jsengine"
@@ -22,9 +21,12 @@ func newIncrementalFixture(t *testing.T) (*Dice, string) {
 		cleanup()
 	})
 	d.jsRuntimeManager = newJSRuntimeManagerForDice(d, false)
-	d.Config.JsEngine = string(jsengine.EngineGoja)
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.JsEngine = string(jsengine.EngineGoja)
+		config.JsEnable = true
+	})
 	d.JsInit()
-	if !d.Config.JsEnable {
+	if config := d.Config(); config == nil || !config.JsEnable {
 		t.Fatalf("JS initialization failed: %+v", d.jsRuntimeManagerInstance().Statuses())
 	}
 	return d, filepath.Join(d.BaseConfig.DataDir, "scripts")
@@ -88,9 +90,12 @@ func TestJsAddScriptLoadsNewPluginWithoutRebuildingTheRuntime(t *testing.T) {
 	}
 	baseExt, _ := d.JsExtRegistry.Load("AddBase")
 
-	// 另一个群曾手动关闭过 AddBase；局部新增不能把它重新打开，也不能重置群同步版本。
-	group := &GroupInfo{GroupID: "QQ-Group:manual-off", InactivatedExtSet: StringSet{"AddBase": {}}, ExtAppliedVersion: 7}
-	d.ImSession.ServiceAtNew.Store(group.GroupID, group)
+	// 另一个群曾手动关闭过 AddBase；局部新增不能把它重新打开。
+	endpoint := newCanonicalTestEndpoint(d, "QQ:incremental-bot")
+	groupMessage := newGroupMsg("QQ-Group:manual-off", "QQ:owner", "")
+	withCanonicalTestMessageContext(t, d, endpoint, groupMessage, "incremental-manual-off", func(ctx *MsgContext) error {
+		return ctx.Group.SetExtension("AddBase", false)
+	})
 
 	second, err := d.JsAddScript(writeIncrementalScript(t, dir, "c.js", "AddIndependent", "", pluginBody("AddIndependent")))
 	if err != nil || !slices.Equal(second.Loaded, []string{"AddIndependent"}) {
@@ -113,8 +118,16 @@ func TestJsAddScriptLoadsNewPluginWithoutRebuildingTheRuntime(t *testing.T) {
 	if wrapper == nil || !wrapper.IsWrapper || wrapper.GetRealExt() == nil || wrapper.DefaultSetting == nil {
 		t.Fatalf("new plugin wrapper = %#v", wrapper)
 	}
-	if _, kept := group.InactivatedExtSet["AddBase"]; !kept || group.ExtAppliedVersion != 7 {
-		t.Fatalf("group state was disturbed: inactivated=%v applied=%d", group.InactivatedExtSet, group.ExtAppliedVersion)
+	groupCheck := newCanonicalTestMessageContext(
+		t, d, endpoint, groupMessage, "incremental-manual-off-check",
+	)
+	if !groupCheck.Group.ExtensionInactivated("AddBase") {
+		t.Fatalf("group state was disturbed: inactivated=%v", groupCheck.Group.InactivatedExtensionIDs())
+	}
+	for _, activated := range groupCheck.Group.GetActivatedExtList(d) {
+		if activated != nil && activated.Name == "AddBase" {
+			t.Fatal("partial load reactivated an explicitly disabled extension")
+		}
 	}
 	var listed []string
 	for _, script := range d.JsScriptList {
@@ -190,7 +203,9 @@ func TestJsAddScriptLeavesUpdatesAndConflictsToFullReload(t *testing.T) {
 
 func TestJsAddScriptRegistersUserDisabledPluginWithoutRunningIt(t *testing.T) {
 	d, dir := newIncrementalFixture(t)
-	d.Config.DisabledJsScripts = map[string]bool{"AddOff": true}
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.DisabledJsScripts = map[string]bool{"AddOff": true}
+	})
 
 	result, err := d.JsAddScript(writeIncrementalScript(t, dir, "off.js", "AddOff", "", pluginBody("AddOff")))
 	if err != nil || !result.Disabled || len(result.Loaded) != 0 {
@@ -221,7 +236,7 @@ func TestJsAddScriptRefusesWhileTheEnvironmentIsBusy(t *testing.T) {
 		t.Fatalf("add while another reload holds the lock err = %v", err)
 	}
 
-	d.Config.JsEnable = false
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.JsEnable = false })
 	if _, err := d.JsAddScript(writeIncrementalScript(t, dir, "c.js", "AddThird", "", pluginBody("AddThird"))); !errors.As(err, &unavailable) {
 		t.Fatalf("add with JS disabled err = %v", err)
 	}
@@ -279,13 +294,17 @@ func boolText(value bool) string {
 }
 
 func TestApplyExtDefaultSettingsCanBeLimitedToNewExtensions(t *testing.T) {
-	oldExt := &ExtInfo{Name: "old", AutoActive: true}
-	newExt := &ExtInfo{Name: "new", AutoActive: true}
-	d := newTestDice([]*ExtInfo{oldExt, newExt})
-	d.ImSession = &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])}
-	group := &GroupInfo{GroupID: "QQ-Group:1", InactivatedExtSet: StringSet{"old": {}}, ExtAppliedVersion: 5}
-	atomic.StoreInt64(&group.ExtAppliedTime, 9)
-	d.ImSession.ServiceAtNew.Store(group.GroupID, group)
+	oldExt := &ExtInfo{Name: "old", Version: "1.0.0", AutoActive: true}
+	newExt := &ExtInfo{Name: "new", Version: "1.0.0", AutoActive: true}
+	d, _ := newCanonicalTestDice(t)
+	installCanonicalTestExtensions(d, oldExt, newExt)
+	persistCanonicalExtensionDefault(t, d, oldExt.Name, oldExt.AutoActive)
+	persistCanonicalExtensionDefault(t, d, newExt.Name, newExt.AutoActive)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:defaults-bot")
+	groupMessage := newGroupMsg("QQ-Group:1", "QQ:owner", "")
+	withCanonicalTestMessageContext(t, d, endpoint, groupMessage, "incremental-default-settings", func(ctx *MsgContext) error {
+		return ctx.Group.SetExtension("old", false)
+	})
 
 	d.applyExtDefaultSettings(map[string]struct{}{"new": {}}, false)
 
@@ -295,7 +314,15 @@ func TestApplyExtDefaultSettingsCanBeLimitedToNewExtensions(t *testing.T) {
 	if oldExt.DefaultSetting != nil {
 		t.Fatal("an extension outside the requested set was touched")
 	}
-	if _, kept := group.InactivatedExtSet["old"]; !kept || group.ExtAppliedVersion != 5 || atomic.LoadInt64(&group.ExtAppliedTime) != 9 {
-		t.Fatalf("group state changed: %v version=%d time=%d", group.InactivatedExtSet, group.ExtAppliedVersion, atomic.LoadInt64(&group.ExtAppliedTime))
+	groupCheck := newCanonicalTestMessageContext(
+		t, d, endpoint, groupMessage, "incremental-default-settings-check",
+	)
+	if !groupCheck.Group.ExtensionInactivated("old") {
+		t.Fatalf("group state changed: inactivated=%v", groupCheck.Group.InactivatedExtensionIDs())
+	}
+	for _, activated := range groupCheck.Group.GetActivatedExtList(d) {
+		if activated != nil && activated.Name == "old" {
+			t.Fatal("limited default application reactivated an explicitly disabled extension")
+		}
 	}
 }

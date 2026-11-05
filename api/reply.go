@@ -405,7 +405,7 @@ func customReplyDebugModeGet(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"value": myDice.Config.ReplyDebugMode,
+		"value": myDice.Config().ReplyDebugMode,
 	})
 }
 
@@ -422,9 +422,13 @@ func customReplyDebugModeSet(c echo.Context) error {
 		return c.String(430, err.Error())
 	}
 
-	myDice.Config.ReplyDebugMode = v.Value
-	myDice.MarkModified()
+	if err = myDice.DurableMutateConfig(c.Request().Context(), "reply-debug-mode", v, func(config *dice.Config) error {
+		config.ReplyDebugMode = v.Value
+		return nil
+	}); err != nil {
+		return c.JSON(http.StatusConflict, map[string]interface{}{"result": false, "err": err.Error()})
+	}
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"value": myDice.Config.ReplyDebugMode,
+		"value": myDice.Config().ReplyDebugMode,
 	})
 }

@@ -6,11 +6,11 @@
 #define SC_RUNTIME_ABI_MAJOR 1u
 #define SC_RUNTIME_ABI_MINOR 0u
 #define SC_HOST_ABI_MAJOR 1u
-#define SC_HOST_ABI_MINOR 1u
+#define SC_HOST_ABI_MINOR 2u
 
 /*
- * Runtime ABI remains v1. Host ABI minor 1 appends struct-size-gated
- * HostRef proxy retain/release callbacks.
+ * Runtime ABI remains v1. Host ABI minor 1 appends HostRef proxy lifecycle;
+ * minor 2 appends the owner-thread execution cancellation/deadline query.
  */
 
 #define SC_RUNTIME_EXTENSION_CONTEXT_V1 "scardice.runtime.context.v1"
@@ -76,7 +76,7 @@ typedef struct sc_service_event_v1 {
     uint32_t struct_size;
     uint32_t kind;
     uint32_t status;
-    uint32_t reserved;
+    uint32_t flags;
     sc_service_request_t request;
     sc_string_view string;
     const uint8_t *bytes;
@@ -110,6 +110,8 @@ typedef struct sc_service_event_v1 {
 #define SC_SERVICE_EVENT_DATA 1U
 #define SC_SERVICE_EVENT_COMPLETE 2U
 #define SC_SERVICE_EVENT_CLOSE 3U
+/* Host ABI 1.2: terminal retirement without running script continuations. */
+#define SC_SERVICE_EVENT_DISCARD_CONTINUATIONS UINT32_C(1)
 #define SC_SERVICE_OP_CONSOLE_LOG UINT32_C(0x0101)
 #define SC_SERVICE_OP_CONSOLE_INFO UINT32_C(0x0102)
 #define SC_SERVICE_OP_CONSOLE_WARN UINT32_C(0x0103)
@@ -399,6 +401,16 @@ typedef struct sc_host_api_v1 {
         sc_runtime_t,
         sc_host_func_t,
         sc_host_ref_t *out_owner);
+    /*
+     * Host ABI 1.2: read-only owner-thread query for the provider's current
+     * execution-context token. SC_OK permits execution, SC_ECLOSED reports
+     * cancellation/revocation, and SC_ETIMEOUT reports an expired deadline.
+     * Providers must stop the current execution on a non-OK result without
+     * stopping or destroying the runtime. A later live context may execute.
+     */
+    sc_status_t (SC_CALL *execution_status)(
+        sc_host_ctx_t,
+        sc_runtime_t);
 } sc_host_api_v1;
 
 /*

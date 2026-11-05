@@ -1,8 +1,12 @@
 package dice
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
+
+	"Scardice-core/eventstore"
 )
 
 type SenderChannel struct {
@@ -54,59 +58,100 @@ func (pa *PlatformAdapterGocq) QQChannelTrySolve(message string) {
 		return
 	}
 	msgQQ := new(MessageQQChannel)
-	err := json.Unmarshal([]byte(message), msgQQ)
-
-	if err == nil {
-		// fmt.Println("DDD", message)
-		ep := pa.EndPoint
-		session := pa.EndPoint.Session
-
-		msg := msgQQ.toStdMessage()
-		ctx := &MsgContext{ /* MessageType: msg.MessageType, EndPoint: ep, Session: pa.EndPoint.Session, */ Dice: pa.EndPoint.Session.Parent}
-
-		// 消息撤回
-		if msgQQ.PostType == "notice" && msgQQ.NoticeType == "guild_channel_recall" {
-			groupInfo, ok := session.ServiceAtNew.Load(msg.GroupID)
-			if ok {
-				if groupInfo.GetLogState().On && ctx.Dice != nil {
-					LogDeleteByID(ctx, groupInfo.GroupID, msgQQ.MessageID)
-				}
-			}
-			return
-		}
-
-		if msgQQ.PostType == "notice" && msgQQ.NoticeType == "message_reactions_updated" {
-			// 一大段的表情设置信息，我也搞不懂是什么
-			return
-		}
-
-		// 处理命令
-		if msgQQ.MessageType == "guild" || msgQQ.MessageType == "private" {
-			if msg.Sender.UserID == ep.UserID {
-				return
-			}
-
-			// fmt.Println("Recieved message1 " + message)
-			session.Execute(ep, msg, false)
-		}
+	if err := json.Unmarshal([]byte(message), msgQQ); err != nil {
+		return
 	}
-	// pa.SendToChannelGroup(ctx, msg.GroupId, msg.Message+"asdasd", "")
+	ep := pa.EndPoint
+	session := ep.Session
+	msg := msgQQ.toStdMessage()
+
+	if msgQQ.PostType == "notice" && msgQQ.NoticeType == "guild_channel_recall" {
+		d := session.Parent
+		if d == nil {
+			return
+		}
+		canonical, encodeErr := json.Marshal(struct {
+			EndpointID string `json:"endpointId"`
+			GroupID    string `json:"groupId"`
+			MessageID  string `json:"messageId"`
+			NoticeType string `json:"noticeType"`
+			Timestamp  int64  `json:"timestamp"`
+		}{
+			EndpointID: ep.ID,
+			GroupID:    msg.GroupID, MessageID: msgQQ.MessageID,
+			NoticeType: msgQQ.NoticeType, Timestamp: msgQQ.Time,
+		})
+		if encodeErr != nil {
+			if d.Logger != nil {
+				d.Logger.Errorf("编码 QQ 频道撤回事件失败: %v", encodeErr)
+			}
+			return
+		}
+		invocation := fmt.Sprintf("%s:%s:%s", ep.ID, msg.GroupID, msgQQ.MessageID)
+		runErr := d.WithDomainExecution(
+			context.Background(),
+			d.DomainExecutionIdentity("qq-channel-recall", invocation),
+			canonical,
+			func(transaction *DurableCallbackTransaction) error {
+				carrier := &MsgContext{
+					MessageType: "group", Dice: d, Session: session, EndPoint: ep,
+					executionContext:    transaction.executionContext,
+					callbackTransaction: transaction, callbackMetadata: transaction.metadata,
+				}
+				defer carrier.releaseExecutionState()
+				if err := carrier.ResolveExistingDomainConversation(msg.GroupID, ""); err != nil {
+					return err
+				}
+				if carrier.Group == nil {
+					return nil
+				}
+				state, err := carrier.Group.GetLogState()
+				if err != nil {
+					return err
+				}
+				if !state.On {
+					return nil
+				}
+				if err = transaction.AddLogUpdate(eventstore.NewStoryLogDeleteEntryUpdate(
+					d.BaseConfig.Name,
+					carrier.Group.GroupID(),
+					msgQQ.MessageID,
+				)); err != nil {
+					return err
+				}
+				return transaction.Domain().Err()
+			},
+		)
+		if runErr != nil && d.Logger != nil {
+			d.Logger.Errorf("处理 QQ 频道撤回事件失败: %v", runErr)
+		}
+		return
+	}
+
+	if msgQQ.PostType == "notice" && msgQQ.NoticeType == "message_reactions_updated" {
+		return
+	}
+	if msgQQ.MessageType == "guild" || msgQQ.MessageType == "private" {
+		if msg.Sender.UserID == ep.UserID {
+			return
+		}
+		session.Execute(ep, msg, false)
+	}
 }
 
 func (pa *PlatformAdapterGocq) SendToChannelGroup(ctx *MsgContext, userID string, text string, flag string) {
 	rawID, _ := pa.mustExtractChannelID(userID)
-	for _, i := range ctx.Dice.ExtList {
-		if i.HasOnMessageSend() {
-			i.CallOnMessageSend(ctx.Dice, ctx, &Message{
-				MessageType: "group",
-				Message:     text,
-				GroupID:     userID,
-				Sender: SenderBase{
-					UserID:   pa.EndPoint.UserID,
-					Nickname: pa.EndPoint.Nickname,
-				},
-			}, flag)
-		}
+	if err := notifyDirectMessageSend(ctx, &Message{
+		MessageType: "group",
+		Message:     text,
+		GroupID:     userID,
+		Sender: SenderBase{
+			UserID:   pa.EndPoint.UserID,
+			Nickname: pa.EndPoint.Nickname,
+		},
+	}, flag); err != nil {
+		ctx.setExecutionError(err)
+		return
 	}
 
 	lst := strings.Split(rawID, "-")

@@ -6,15 +6,17 @@ import (
 	"testing"
 
 	ds "github.com/sealdice/dicescript"
-	"go.uber.org/zap"
 )
 
-func newReplyExprCacheTestContext(value int64) *MsgContext {
-	ctx := &MsgContext{
-		Dice:   &Dice{Logger: zap.NewNop().Sugar(), AttrsManager: &AttrsManager{}},
-		Group:  &GroupInfo{},
-		Player: &GroupPlayerInfo{ValueMapTemp: &ds.ValueMap{}},
-	}
+func newReplyExprCacheTestContext(t *testing.T, d *Dice, label string, value int64) *MsgContext {
+	t.Helper()
+	ctx := newCanonicalTestMessageContext(
+		t,
+		d,
+		newCanonicalTestEndpoint(d, "QQ:reply-cache-bot"),
+		newGroupMsg("QQ-Group:reply-cache", "QQ:reply-cache-user", ""),
+		label,
+	)
 	ctx.SetSplitKey("###reply-expr-cache###")
 	ctx.CreateVmIfNotExists()
 	ctx.vm.Attrs.Store("value", ds.NewIntVal(ds.IntType(value)))
@@ -22,14 +24,15 @@ func newReplyExprCacheTestContext(value int64) *MsgContext {
 }
 
 func TestReplyExprProgramCacheReusesBytecodeWithoutCachingResult(t *testing.T) {
+	d, _ := newCanonicalTestDice(t)
 	cache := newReplyExprProgramCache(4)
 	flags := replyVMFlags(ReplyVMVersionV2)
 
-	first, _, err := cache.eval(newReplyExprCacheTestContext(1), "value == 1", flags)
+	first, _, err := cache.eval(newReplyExprCacheTestContext(t, d, "first-value", 1), "value == 1", flags)
 	if err != nil || first == nil || !first.AsBool() {
 		t.Fatalf("first evaluation=%#v err=%v", first, err)
 	}
-	second, _, err := cache.eval(newReplyExprCacheTestContext(0), "value == 1", flags)
+	second, _, err := cache.eval(newReplyExprCacheTestContext(t, d, "second-value", 0), "value == 1", flags)
 	if err != nil || second == nil || second.AsBool() {
 		t.Fatalf("second evaluation=%#v err=%v", second, err)
 	}
@@ -39,8 +42,9 @@ func TestReplyExprProgramCacheReusesBytecodeWithoutCachingResult(t *testing.T) {
 }
 
 func TestReplyExprProgramCachePreservesTrailingInput(t *testing.T) {
+	d, _ := newCanonicalTestDice(t)
 	cache := newReplyExprProgramCache(4)
-	result, _, err := cache.eval(newReplyExprCacheTestContext(1), "1 trailing", replyVMFlags(ReplyVMVersionV2))
+	result, _, err := cache.eval(newReplyExprCacheTestContext(t, d, "trailing-input", 1), "1 trailing", replyVMFlags(ReplyVMVersionV2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,8 +54,9 @@ func TestReplyExprProgramCachePreservesTrailingInput(t *testing.T) {
 }
 
 func TestReplyExprProgramCacheIsBounded(t *testing.T) {
+	d, _ := newCanonicalTestDice(t)
 	cache := newReplyExprProgramCache(2)
-	ctx := newReplyExprCacheTestContext(1)
+	ctx := newReplyExprCacheTestContext(t, d, "bounded-cache", 1)
 	for _, expression := range []string{"1", "2", "3"} {
 		if _, _, err := cache.eval(ctx, expression, replyVMFlags(ReplyVMVersionV2)); err != nil {
 			t.Fatalf("eval %q: %v", expression, err)
@@ -63,16 +68,22 @@ func TestReplyExprProgramCacheIsBounded(t *testing.T) {
 }
 
 func TestReplyExprProgramCacheConcurrentFirstUse(t *testing.T) {
+	d, _ := newCanonicalTestDice(t)
 	cache := newReplyExprProgramCache(4)
 	flags := replyVMFlags(ReplyVMVersionV2)
 	const workers = 32
+	contexts := make([]*MsgContext, workers)
+	for index := range contexts {
+		contexts[index] = newReplyExprCacheTestContext(t, d, fmt.Sprintf("concurrent-%d", index), 1)
+	}
+
 	var wait sync.WaitGroup
 	errs := make(chan error, workers)
-	for range workers {
+	for index := range workers {
 		wait.Add(1)
-		go func() {
+		go func(ctx *MsgContext) {
 			defer wait.Done()
-			result, _, err := cache.eval(newReplyExprCacheTestContext(1), "value == 1", flags)
+			result, _, err := cache.eval(ctx, "value == 1", flags)
 			if err != nil {
 				errs <- err
 				return
@@ -80,7 +91,7 @@ func TestReplyExprProgramCacheConcurrentFirstUse(t *testing.T) {
 			if result == nil || !result.AsBool() {
 				errs <- fmt.Errorf("cached expression returned %#v", result)
 			}
-		}()
+		}(contexts[index])
 	}
 	wait.Wait()
 	close(errs)

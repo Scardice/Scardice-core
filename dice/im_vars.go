@@ -9,23 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/samber/lo"
 	ds "github.com/sealdice/dicescript"
 )
-
-func callbackAttrsByID(ctx *MsgContext, manager *AttrsManager, id string) (*AttributesItem, error) {
-	if ctx != nil && ctx.callbackTransaction != nil {
-		return manager.callbackLoadByID(ctx, id)
-	}
-	return manager.LoadById(id)
-}
-
-func callbackAttrsByCtx(ctx *MsgContext, manager *AttrsManager) (*AttributesItem, error) {
-	if ctx != nil && ctx.callbackTransaction != nil {
-		return manager.callbackLoadByCtx(ctx)
-	}
-	return manager.LoadByCtx(ctx)
-}
 
 func aliasMapForCtx(ctx *MsgContext) map[string][]string {
 	if ctx != nil && ctx.SystemTemplate != nil {
@@ -59,38 +44,58 @@ func VarSetValue(ctx *MsgContext, s string, v *ds.VMValue) {
 	name := GetValueNameByAlias(s, aliasMapForCtx(ctx))
 	vClone := v.Clone()
 
-	// 临时变量
+	// Temporary values belong to this invocation's VM.
 	if strings.HasPrefix(s, "$t") {
-		// 如果是内部设置的临时变量，不需要长期存活
-		//  if ctx.Player.ValueMapTemp == nil {
-		//  	ctx.Player.ValueMapTemp = &ds.ValueMap{}
-		//  }
-		//  ctx.Player.ValueMapTemp.Store(s, vClone)
-		// 用这个替代 temp 吗？我不太确定
 		ctx.vm.StoreNameLocal(s, vClone)
+		return
+	}
+	if ctx.IsCompatibilityTest {
+		key := name
+		if strings.HasPrefix(s, "$g") {
+			key = s
+		}
+		ctx.vm.StoreNameLocal(key, vClone)
 		return
 	}
 
 	// 个人变量
 	if strings.HasPrefix(s, "$m") {
 		if ctx.Session != nil && ctx.Player != nil {
-			playerAttrs := lo.Must(callbackAttrsByID(ctx, am, ctx.Player.UserID))
-			playerAttrs.Store(name, vClone)
+			playerAttrs, err := am.LoadByIdForCtx(ctx, ctx.Player.UserID())
+			if err != nil {
+				ctx.setExecutionError(err)
+				return
+			}
+			if err = playerAttrs.Store(name, vClone); err != nil {
+				ctx.setExecutionError(err)
+			}
 		}
 		return
 	}
 
 	// 群变量
 	if ctx.Group != nil && strings.HasPrefix(s, "$g") {
-		groupAttrs := lo.Must(callbackAttrsByID(ctx, am, ctx.Group.GroupID))
-		groupAttrs.Store(s, vClone)
+		groupAttrs, err := am.LoadByIdForCtx(ctx, ctx.Group.GroupID())
+		if err != nil {
+			ctx.setExecutionError(err)
+			return
+		}
+		if err = groupAttrs.Store(s, vClone); err != nil {
+			ctx.setExecutionError(err)
+		}
 		return
 	}
 
 	// 个人属性
 	if ctx.Session != nil && ctx.Player != nil {
-		curAttrs := lo.Must(callbackAttrsByCtx(ctx, am))
-		curAttrs.Store(name, vClone)
+		curAttrs, err := am.LoadByCtx(ctx)
+		if err != nil {
+			ctx.setExecutionError(err)
+			return
+		}
+		if err = curAttrs.Store(name, vClone); err != nil {
+			ctx.setExecutionError(err)
+		}
 	}
 }
 
@@ -101,32 +106,65 @@ func VarDelValue(ctx *MsgContext, s string) {
 	am := ctx.Dice.AttrsManager
 	name := GetValueNameByAlias(s, aliasMapForCtx(ctx))
 
-	// 临时变量
+	// Temporary values never fall through to persistent attributes.
 	if strings.HasPrefix(s, "$t") {
-		ctx.Player.ValueMapTemp.Delete(s)
-		curAttrs := lo.Must(callbackAttrsByCtx(ctx, am))
-		curAttrs.Delete(name)
+		if ctx.vm != nil {
+			ctx.vm.Attrs.Delete(s)
+		}
+		if ctx.Player != nil {
+			if values := ctx.Player.tempValues(); values != nil {
+				values.Delete(s)
+			}
+		}
+		return
+	}
+	if ctx.IsCompatibilityTest {
+		if ctx.vm != nil {
+			key := name
+			if strings.HasPrefix(s, "$g") {
+				key = s
+			}
+			ctx.vm.Attrs.Delete(key)
+		}
 		return
 	}
 
 	// 个人变量
 	if strings.HasPrefix(s, "$m") {
 		if ctx.Session != nil && ctx.Player != nil {
-			playerAttrs := lo.Must(callbackAttrsByID(ctx, am, ctx.Player.UserID))
-			playerAttrs.Delete(name)
+			playerAttrs, err := am.LoadByIdForCtx(ctx, ctx.Player.UserID())
+			if err != nil {
+				ctx.setExecutionError(err)
+				return
+			}
+			if err = playerAttrs.Delete(name); err != nil {
+				ctx.setExecutionError(err)
+			}
 			return
 		}
 	}
 
 	// 群变量
 	if ctx.Group != nil && strings.HasPrefix(s, "$g") {
-		groupAttrs := lo.Must(callbackAttrsByID(ctx, am, ctx.Group.GroupID))
-		groupAttrs.Delete(s)
+		groupAttrs, err := am.LoadByIdForCtx(ctx, ctx.Group.GroupID())
+		if err != nil {
+			ctx.setExecutionError(err)
+			return
+		}
+		if err = groupAttrs.Delete(s); err != nil {
+			ctx.setExecutionError(err)
+		}
 		return
 	}
 
-	curAttrs := lo.Must(callbackAttrsByCtx(ctx, am))
-	curAttrs.Delete(name)
+	curAttrs, err := am.LoadByCtx(ctx)
+	if err != nil {
+		ctx.setExecutionError(err)
+		return
+	}
+	if err = curAttrs.Delete(name); err != nil {
+		ctx.setExecutionError(err)
+	}
 }
 
 func VarGetValueInt64(ctx *MsgContext, s string) (int64, bool) {
@@ -165,33 +203,54 @@ func VarGetValue(ctx *MsgContext, s string) (*ds.VMValue, bool) {
 				return v, ok
 			}
 		}
-		// 跟入群致辞闪退的一个bug有关，当时是报 _v, exists := ctx.Player.ValueMapTemp.Get(s) 这一行 nil pointer
-		if ctx.Player.ValueMapTemp == nil {
-			ctx.Player.ValueMapTemp = &ds.ValueMap{}
+		// 跟入群致辞闪退的一个bug有关：临时值表必须按请求初始化。
+		if values := ctx.Player.tempValues(); values != nil {
+			if v, ok := values.Load(s); ok {
+				return v, ok
+			}
+		}
+		return nil, false
+	}
+	if ctx.IsCompatibilityTest {
+		if ctx.vm == nil {
 			return nil, false
 		}
-		if v, ok := ctx.Player.ValueMapTemp.Load(s); ok {
-			return v, ok
+		key := name
+		if strings.HasPrefix(s, "$g") {
+			key = s
 		}
+		return ctx.vm.Attrs.Load(key)
 	}
 
 	// 个人全局变量
 	if strings.HasPrefix(s, "$m") {
 		if ctx.Session != nil && ctx.Player != nil {
-			playerAttrs := lo.Must(callbackAttrsByID(ctx, am, ctx.Player.UserID))
+			playerAttrs, err := am.LoadByIdForCtx(ctx, ctx.Player.UserID())
+			if err != nil {
+				ctx.setExecutionError(err)
+				return nil, false
+			}
 			return playerAttrs.LoadX(name)
 		}
 	}
 
 	// 群变量
 	if ctx.Group != nil && strings.HasPrefix(s, "$g") {
-		groupAttrs := lo.Must(callbackAttrsByID(ctx, am, ctx.Group.GroupID))
+		groupAttrs, err := am.LoadByIdForCtx(ctx, ctx.Group.GroupID())
+		if err != nil {
+			ctx.setExecutionError(err)
+			return nil, false
+		}
 		return groupAttrs.LoadX(s)
 	}
 
 	// 个人群变量
 	if ctx.Player != nil {
-		curAttrs := lo.Must(callbackAttrsByCtx(ctx, am))
+		curAttrs, err := am.LoadByCtx(ctx)
+		if err != nil {
+			ctx.setExecutionError(err)
+			return nil, false
+		}
 		return curAttrs.LoadX(name)
 	}
 
@@ -246,7 +305,7 @@ func GetValueNameByAlias(s string, alias map[string][]string) string {
 func SetTempVars(ctx *MsgContext, qqNickname string) {
 	// 设置临时变量
 	if ctx.Player != nil {
-		pcName := ctx.Player.Name
+		pcName := ctx.Player.Name()
 		pcName = strings.ReplaceAll(pcName, "\n", "")
 		pcName = strings.ReplaceAll(pcName, "\r", "")
 		pcName = strings.ReplaceAll(pcName, `\n`, "")
@@ -254,22 +313,23 @@ func SetTempVars(ctx *MsgContext, qqNickname string) {
 		pcName = strings.ReplaceAll(pcName, `\f`, "")
 
 		VarSetValueStr(ctx, "$t玩家", fmt.Sprintf("<%s>", pcName))
-		if ctx.Dice != nil && !ctx.Dice.Config.PlayerNameWrapEnable {
+		if ctx.Dice != nil && !ctx.Dice.Config().PlayerNameWrapEnable {
 			VarSetValueStr(ctx, "$t玩家", pcName)
 		}
 		VarSetValueStr(ctx, "$t玩家_RAW", pcName)
 		VarSetValueStr(ctx, "$tQQ昵称", fmt.Sprintf("<%s>", qqNickname))
 		VarSetValueStr(ctx, "$t帐号昵称", fmt.Sprintf("<%s>", qqNickname))
 		VarSetValueStr(ctx, "$t账号昵称", fmt.Sprintf("<%s>", qqNickname))
-		VarSetValueStr(ctx, "$t帐号ID", ctx.Player.UserID)
-		VarSetValueStr(ctx, "$t账号ID", ctx.Player.UserID)
-		VarSetValueInt64(ctx, "$t个人骰子面数", int64(ctx.Player.DiceSideNum))
-		VarSetValueStr(ctx, "$tQQ", ctx.Player.UserID)
+		playerID := ctx.Player.UserID()
+		VarSetValueStr(ctx, "$t帐号ID", playerID)
+		VarSetValueStr(ctx, "$t账号ID", playerID)
+		VarSetValueInt64(ctx, "$t个人骰子面数", ctx.Player.DiceSideNum())
+		VarSetValueStr(ctx, "$tQQ", playerID)
 		VarSetValueStr(ctx, "$t骰子帐号", ctx.EndPoint.UserID)
 		VarSetValueStr(ctx, "$t骰子账号", ctx.EndPoint.UserID)
 		VarSetValueStr(ctx, "$t骰子昵称", ctx.EndPoint.Nickname)
-		VarSetValueStr(ctx, "$t帐号ID_RAW", UserIDExtract(ctx.Player.UserID))
-		VarSetValueStr(ctx, "$t账号ID_RAW", UserIDExtract(ctx.Player.UserID))
+		VarSetValueStr(ctx, "$t帐号ID_RAW", UserIDExtract(playerID))
+		VarSetValueStr(ctx, "$t账号ID_RAW", UserIDExtract(playerID))
 
 		if ctx.EndPoint.ProtocolType != "official" {
 			VarSetValueStr(ctx, "$t平台", ctx.EndPoint.Platform)
@@ -279,7 +339,7 @@ func SetTempVars(ctx *MsgContext, qqNickname string) {
 
 		rpSeed := (time.Now().Unix() + (8 * 60 * 60)) / (24 * 60 * 60)
 		rpSeed += int64(fingerprint(ctx.EndPoint.UserID))
-		rpSeed += int64(fingerprint(ctx.Player.UserID))
+		rpSeed += int64(fingerprint(playerID))
 		randItem := rand.NewSource(rpSeed)
 		rp := randItem.Int63()%100 + 1
 		VarSetValueInt64(ctx, "$t人品", rp)
@@ -309,21 +369,30 @@ func SetTempVars(ctx *MsgContext, qqNickname string) {
 	}
 
 	if ctx.Group != nil {
+		groupID := ctx.Group.GroupID()
 		if ctx.MessageType == "group" {
-			VarSetValueStr(ctx, "$t群号", ctx.Group.GroupID)
-			VarSetValueStr(ctx, "$t群名", ctx.Group.GroupName)
-			VarSetValueStr(ctx, "$t群号_RAW", UserIDExtract(ctx.Group.GroupID))
+			VarSetValueStr(ctx, "$t群号", groupID)
+			VarSetValueStr(ctx, "$t群名", ctx.Group.GroupName())
+			VarSetValueStr(ctx, "$t群号_RAW", UserIDExtract(groupID))
 		}
-		VarSetValueInt64(ctx, "$t群组骰子面数", ctx.Group.DiceSideNum)
+		VarSetValueInt64(ctx, "$t群组骰子面数", ctx.Group.DiceSideNum())
 		VarSetValueInt64(ctx, "$t当前骰子面数", getDefaultDicePoints(ctx))
-		if ctx.Group.System == "" {
-			ctx.Group.System = "coc7"
-			ctx.Group.MarkDirty(ctx.Dice)
+		system := ctx.Group.System()
+		if system == "" {
+			if err := ctx.Group.SetSystem("coc7"); err != nil {
+				ctx.setExecutionError(err)
+				return
+			}
+			system = "coc7"
 		}
-		VarSetValueStr(ctx, "$t游戏模式", ctx.Group.System)
-		VarSetValueStr(ctx, "$t规则模板", ctx.Group.System)
-		VarSetValueStr(ctx, "$tSystem", ctx.Group.System)
-		logState := ctx.Group.GetLogState()
+		VarSetValueStr(ctx, "$t游戏模式", system)
+		VarSetValueStr(ctx, "$t规则模板", system)
+		VarSetValueStr(ctx, "$tSystem", system)
+		logState, err := ctx.Group.GetLogState()
+		if err != nil {
+			ctx.setExecutionError(err)
+			return
+		}
 		VarSetValueStr(ctx, "$t当前记录", logState.Name)
 		VarSetValueInt64(ctx, "$t权限等级", int64(ctx.PrivilegeLevel))
 

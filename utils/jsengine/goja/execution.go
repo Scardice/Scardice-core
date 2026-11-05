@@ -113,20 +113,20 @@ func asyncContextComparableKey(origin any) (any, bool) {
 }
 
 func (t *asyncContextTracker) tokenFor(origin any, execution context.Context) interface{} {
-	key, comparable := asyncContextComparableKey(origin)
+	key, cacheable := asyncContextComparableKey(origin)
 	t.mu.Lock()
 	if t.closed.Load() {
 		t.mu.Unlock()
 		return jsengine.RevokedExecutionScope{}
 	}
-	if comparable {
+	if cacheable {
 		if token := t.tokens[key]; token != nil && !token.revoked {
 			t.mu.Unlock()
 			return token
 		}
 	}
 	token := &asyncContextToken{tracker: t, origin: origin}
-	if comparable {
+	if cacheable {
 		token.key = key
 		if t.tokens == nil {
 			t.tokens = make(map[any]*asyncContextToken)
@@ -139,7 +139,7 @@ func (t *asyncContextTracker) tokenFor(origin any, execution context.Context) in
 	t.allTokens[token] = struct{}{}
 	t.mu.Unlock()
 
-	stop := context.AfterFunc(execution, func() { t.revokeToken(token) })
+	stop := t.watchToken(token, execution)
 	t.mu.Lock()
 	retired := token.revoked || t.closed.Load()
 	if !retired {
@@ -153,6 +153,39 @@ func (t *asyncContextTracker) tokenFor(origin any, execution context.Context) in
 		t.revokeToken(token)
 	}
 	return token
+}
+
+// watchToken revokes token when execution ends. A scope that implements
+// PersistentAsyncPromoter may hand its pending continuations to a longer-lived
+// scope at that moment (a promoted persistent root that finished normally
+// resumes under its binding's scheduler); the token then follows the
+// replacement instead of being revoked with the root.
+func (t *asyncContextTracker) watchToken(token *asyncContextToken, execution context.Context) func() bool {
+	return context.AfterFunc(execution, func() {
+		t.mu.Lock()
+		origin := token.origin
+		t.mu.Unlock()
+		if _, ok := origin.(jsengine.PersistentAsyncPromoter); ok {
+			replacement := jsengine.ContextForExecution(origin)
+			if replacement != execution && replacement.Err() == nil {
+				if replacement.Done() == nil {
+					return
+				}
+				stop := t.watchToken(token, replacement)
+				t.mu.Lock()
+				retired := token.revoked || t.closed.Load()
+				if !retired {
+					token.stop = stop
+				}
+				t.mu.Unlock()
+				if retired {
+					stop()
+				}
+				return
+			}
+		}
+		t.revokeToken(token)
+	})
 }
 
 func (t *asyncContextTracker) resolveTrackingObject(trackingObject any) any {
@@ -303,7 +336,7 @@ func (t *asyncContextTracker) finish(restore bool) {
 		// normally, preserve cancellation of the surrounding resolver scope.
 		t.vm.ClearInterrupt()
 		if restore {
-			if err := jsengine.ContextForExecution(previous).Err(); err != nil {
+			if err := jsengine.ExecutionErr(previous); err != nil {
 				t.vm.Interrupt(err)
 			}
 		}

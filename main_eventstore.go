@@ -16,12 +16,13 @@ import (
 )
 
 const (
-	eventCallbackWorkerCount    = 4
-	eventEffectWorkerCount      = 4
-	eventCallbackIdleDelay      = 50 * time.Millisecond
-	eventEffectIdleDelay        = 100 * time.Millisecond
-	eventWorkerMaximumIdleDelay = 500 * time.Millisecond
-	eventWorkSignalDrainLimit   = 64
+	eventCallbackWorkerCount      = 4
+	eventEffectWorkerCount        = 4
+	eventCallbackIdleDelay        = 50 * time.Millisecond
+	eventEffectIdleDelay          = 100 * time.Millisecond
+	eventWorkerMaximumIdleDelay   = 500 * time.Millisecond
+	eventWorkSignalDrainLimit     = 64
+	eventInboxMaintenanceInterval = time.Hour
 )
 
 var errEventWorkerGroupClosed = errors.New("event worker group is shutting down")
@@ -131,6 +132,60 @@ func startEventWorkerPool(group *eventWorkerGroup, count int, factory func(int) 
 	return nil
 }
 
+type terminalInboxMaintainer interface {
+	DeleteExpiredTerminalInbox(context.Context) (int64, error)
+}
+
+// Startup waits for the first cleanup; the hourly loop belongs to the same
+// worker group as callbacks and dispatch, so shutdown joins any in-flight SQL.
+func startEventInboxMaintenance(group *eventWorkerGroup, store terminalInboxMaintainer) error {
+	if group == nil || store == nil {
+		return errors.New("inbox maintenance: invalid configuration")
+	}
+	initialized := make(chan error, 1)
+	if !group.Go(func(ctx context.Context) {
+		if err := ctx.Err(); err != nil {
+			initialized <- err
+			return
+		}
+		if _, err := store.DeleteExpiredTerminalInbox(ctx); err != nil {
+			initialized <- err
+			return
+		}
+		ticker := time.NewTicker(eventInboxMaintenanceInterval)
+		defer ticker.Stop()
+		initialized <- nil
+		runEventInboxMaintenance(ctx, store, ticker.C)
+	}) {
+		return errEventWorkerGroupClosed
+	}
+	select {
+	case err := <-initialized:
+		return err
+	case <-group.ctx.Done():
+		return group.ctx.Err()
+	}
+}
+
+func runEventInboxMaintenance(ctx context.Context, store terminalInboxMaintainer, ticks <-chan time.Time) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-ticks:
+			if !ok || ctx.Err() != nil {
+				return
+			}
+			if _, err := store.DeleteExpiredTerminalInbox(ctx); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				logger.QueueFailures().Warnw("terminal inbox expiry cleanup failed", "error", err)
+			}
+		}
+	}
+}
+
 func (g *eventWorkerGroup) beginShutdown() {
 	if g == nil {
 		return
@@ -182,15 +237,14 @@ func shutdownEventRuntime(ctx context.Context, phases ...func(context.Context) e
 type eventEndpointResolver struct {
 	service  *endpoint.Service
 	registry *endpoint.Registry
-	store    *eventstore.GORMStore
 }
 
-func newEventEndpointResolver(service *endpoint.Service, registry *endpoint.Registry, store *eventstore.GORMStore) *eventEndpointResolver {
-	return &eventEndpointResolver{service: service, registry: registry, store: store}
+func newEventEndpointResolver(service *endpoint.Service, registry *endpoint.Registry) *eventEndpointResolver {
+	return &eventEndpointResolver{service: service, registry: registry}
 }
 
 func (r *eventEndpointResolver) Resolve(ctx context.Context, id adapterapi.EndpointID) (messageflow.EndpointSnapshot, error) {
-	if r == nil || r.service == nil || r.registry == nil || r.store == nil || !id.Valid() {
+	if r == nil || r.service == nil || r.registry == nil || !id.Valid() {
 		return messageflow.EndpointSnapshot{}, endpoint.ErrNotFound
 	}
 	view, err := r.service.Get(ctx, id)
@@ -201,10 +255,6 @@ func (r *eventEndpointResolver) Resolve(ctx context.Context, id adapterapi.Endpo
 	if !ok || descriptor == nil {
 		return messageflow.EndpointSnapshot{}, endpoint.ErrUnknownAdapter
 	}
-	_, rootID, err := r.store.KeyedDigest(ctx, "endpoint-snapshot/v1", string(id))
-	if err != nil {
-		return messageflow.EndpointSnapshot{}, err
-	}
 	capabilities := descriptor.Capabilities(view.Config)
 	actions := descriptor.SupportedActions(view.Config)
 	return messageflow.EndpointSnapshot{
@@ -214,8 +264,6 @@ func (r *eventEndpointResolver) Resolve(ctx context.Context, id adapterapi.Endpo
 		ObservedState: view.ObservedState,
 		Capabilities:  capabilities,
 		Actions:       actions,
-		IndexRootID:   rootID,
-		IndexSigner:   r.store,
 	}, nil
 }
 
@@ -330,7 +378,7 @@ func runEventEffectDispatcher(ctx context.Context, dispatcher *endpoint.EffectDi
 		}
 		_, err := dispatcher.DispatchOnce(ctx)
 		switch {
-		case err == nil, errors.Is(err, eventstore.ErrPayloadExpired):
+		case err == nil:
 			continue
 		case errors.Is(err, eventstore.ErrNotFound):
 			if !waitEventQueue(ctx, wake) {
@@ -359,7 +407,7 @@ func runEventCallbackProcessor(ctx context.Context, callback *messageflow.Callba
 		}
 		summary, err := callback.ProcessOne(ctx)
 		switch {
-		case err == nil, errors.Is(err, eventstore.ErrPayloadExpired):
+		case err == nil:
 			continue
 		case errors.Is(err, eventstore.ErrNotFound):
 			if !waitEventQueue(ctx, wake) {

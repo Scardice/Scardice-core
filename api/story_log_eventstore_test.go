@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"testing"
@@ -25,17 +26,16 @@ func newStoryEventStoreFixture(t *testing.T) (*dice.Dice, *eventstore.GORMStore)
 	ctx := context.Background()
 	database, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
 		Type: "sqlite", DSN: filepath.Join(t.TempDir(), "story-api.db"),
-		KeySource: endpointAPITestKeySource{}, DatabaseIdentity: "story-api-test",
+		DatabaseIdentity: "story-api-test",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	store := eventstore.NewStore(database, eventstore.WithKeySource(endpointAPITestKeySource{}))
+	store := eventstore.NewStore(database)
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "story-api-test", IndexRootID: "api-test-index-v1",
-		EncryptionRootIDs: []string{"api-test-root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "story-api-test",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,8 @@ func TestStoryDeleteRemovesEventStoreRepositorySession(t *testing.T) {
 	_, store := newStoryEventStoreFixture(t)
 	_, groupID, name := seedStoryEventStoreLog(t, store)
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodDelete, "/sd-api/story/log?groupId="+groupID+"&name="+name, nil)
+	query := url.Values{"groupId": {groupID}, "name": {name}}
+	request := httptest.NewRequest(http.MethodDelete, "/sd-api/story/log?"+query.Encode(), nil)
 	request.Header.Set("Token", storyEventStoreTestToken)
 	ctx := echo.New().NewContext(request, recorder)
 	if err := storyDelLog(ctx); err != nil {

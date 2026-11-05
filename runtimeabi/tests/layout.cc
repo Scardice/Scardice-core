@@ -47,7 +47,8 @@ static_assert(offsetof(sc_host_api_v1, service_cancel) == offsetof(sc_host_api_v
 static_assert(offsetof(sc_host_api_v1, host_ref_retain) == offsetof(sc_host_api_v1, service_cancel) + sizeof(void *), "host ref retain tail order");
 static_assert(offsetof(sc_host_api_v1, host_ref_release) == offsetof(sc_host_api_v1, host_ref_retain) + sizeof(void *), "host ref release tail order");
 static_assert(offsetof(sc_host_api_v1, host_function_owner) == offsetof(sc_host_api_v1, host_ref_release) + sizeof(void *), "host function owner tail order");
-static_assert(sizeof(sc_host_api_v1) == offsetof(sc_host_api_v1, host_function_owner) + sizeof(void *), "host api lifecycle tail size");
+static_assert(offsetof(sc_host_api_v1, execution_status) == offsetof(sc_host_api_v1, host_function_owner) + sizeof(void *), "host execution status tail order");
+static_assert(sizeof(sc_host_api_v1) == offsetof(sc_host_api_v1, execution_status) + sizeof(void *), "host api execution status tail size");
 static_assert(offsetof(sc_runtime_plugin_v1, descriptor) == 8, "plugin descriptor prefix");
 static_assert(offsetof(sc_runtime_plugin_v1, api) == 72, "plugin api prefix");
 

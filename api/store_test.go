@@ -28,19 +28,13 @@ func TestStorePackageInfoListAllowsMultipleVersionsOfSamePackage(t *testing.T) {
 	defer server.Close()
 
 	token := "test-token"
-	manager := &dice.DiceManager{}
+	_, manager, testDice, _ := newDiceConfigDurableHandlerTest(t)
 	manager.AccessTokens.Store(token, true)
-	testDice := &dice.Dice{
-		Parent: manager,
-		Config: dice.Config{StoreConfig: dice.StoreConfig{
-			BackendUrls: []string{server.URL + "/dice/api/store"},
-		}},
-	}
+	updateAPITestConfig(t, testDice, func(config *dice.Config) {
+		config.BackendUrls = []string{server.URL + "/dice/api/store"}
+	})
 	testDice.PackageManager = dice.NewPackageManager(testDice)
 	testDice.StoreManager = dice.NewStoreManager(testDice)
-	previousDice := myDice
-	myDice = testDice
-	t.Cleanup(func() { myDice = previousDice })
 
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/sd-api/store/package-info-list", strings.NewReader(
@@ -98,13 +92,11 @@ func TestStorePackageFilePreviewSecuresUpstreamResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
-	testDice := &dice.Dice{Config: dice.Config{StoreConfig: dice.StoreConfig{
-		BackendUrls: []string{server.URL + "/dice/api/store"},
-	}}}
+	_, _, testDice, _ := newDiceConfigDurableHandlerTest(t)
+	updateAPITestConfig(t, testDice, func(config *dice.Config) {
+		config.BackendUrls = []string{server.URL + "/dice/api/store"}
+	})
 	testDice.StoreManager = dice.NewStoreManager(testDice)
-	previousDice := myDice
-	myDice = testDice
-	defer func() { myDice = previousDice }()
 
 	request := func(path string) *httptest.ResponseRecorder {
 		e := echo.New()

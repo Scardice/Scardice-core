@@ -6,6 +6,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"Scardice-core/dice/service"
+	"Scardice-core/eventstore"
+	"Scardice-core/model"
 )
 
 // `.log end` answers at once and uploads in the background. The command's
@@ -17,19 +21,32 @@ func TestLogEndUploadReportsTheLinkAfterTheCommandHasReturned(t *testing.T) {
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 
-	mockDB := newLogAliasTestDB(t)
-	d.DBOperator = mockDB
-	d.BaseConfig.DataDir = t.TempDir()
+	store, ok := d.DurableStore.(*eventstore.GORMStore)
+	if !ok {
+		t.Fatal("canonical fixture store is unavailable")
+	}
+	repository := service.NewEventStoreLogRepository(store, d.BaseConfig.Name)
+	d.DBOperator = nil
+	d.LogRepository = repository
 
 	const groupID = "UI-Group:9101"
 	const logName = "after-return"
-	_, _ = newQuitCommandTestContext(t, d, ep, "QQ:9001", groupID, "LogEndGroup")
-	group, ok := d.ImSession.ServiceAtNew.Load(groupID)
-	if !ok {
-		t.Fatal("group fixture missing")
+	logID, err := repository.GetOrCreate(groupID, logName)
+	if err != nil {
+		t.Fatal(err)
 	}
-	group.LogCurName, group.LogOn = logName, true
-	appendTestLog(t, mockDB, groupID, logName)
+	if err = repository.AppendByID(groupID, logID, &model.LogOneItem{
+		Nickname: "Tester", IMUserID: "QQ:9001", Message: "fixture",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stateRepository, ok := repository.(service.LogStateRepository)
+	if !ok {
+		t.Fatal("event-store log repository does not expose canonical state")
+	}
+	if err = stateRepository.SetState(groupID, service.LogState{ID: logID, Name: logName, On: true}); err != nil {
+		t.Fatal(err)
+	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"url":"https://example.com/uploaded-story"}`))
@@ -39,7 +56,7 @@ func TestLogEndUploadReportsTheLinkAfterTheCommandHasReturned(t *testing.T) {
 	BackendUrls = []string{server.URL}
 	t.Cleanup(func() { BackendUrls = oldBackends })
 
-	d.ImSession.ExecuteNew(ep, newGroupMsg(groupID, "QQ:9001", ".log end"))
+	executeNewAndWaitForCanonicalCommit(t, d, ep, newGroupMsg(groupID, "QQ:9001", ".log end"))
 
 	if _, ok := adapter.waitForMsg(3 * time.Second); !ok {
 		t.Fatal("no reply to .log end")

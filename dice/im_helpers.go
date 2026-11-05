@@ -1,17 +1,16 @@
 package dice
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
-	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/time/rate"
-
-	ds "github.com/sealdice/dicescript"
 
 	"Scardice-core/adapterapi"
 	"Scardice-core/logger"
@@ -55,22 +54,26 @@ func buildForwardNodes(senderName string, senderUin string, title string, conten
 	return nodes
 }
 
-func BuildForwardNodesFromContext(ctx *MsgContext, title string, contents []string) []message.ForwardNode {
+// forwardSenderFromContext derives the QQ-numeric sender identity merged-forward
+// nodes need from the endpoint. ok is false when the endpoint has no such id.
+func forwardSenderFromContext(ctx *MsgContext) (name string, uin string, ok bool) {
 	if ctx == nil || ctx.EndPoint == nil {
-		return nil
+		return "", "", false
 	}
-	name := ctx.EndPoint.Nickname
-
 	trimmed := strings.TrimPrefix(ctx.EndPoint.UserID, "PG-")
 	trimmed = strings.TrimPrefix(trimmed, "QQ-Group:")
 	trimmed = strings.TrimPrefix(trimmed, "QQ-CH-Group:")
 	trimmed = strings.TrimPrefix(trimmed, "QQ-CH:")
 	trimmed = strings.TrimPrefix(trimmed, "QQ:")
-	if trimmed == ctx.EndPoint.UserID {
-		return nil
+	if trimmed == ctx.EndPoint.UserID || trimmed == "" {
+		return "", "", false
 	}
-	uin := trimmed
-	if uin == "" {
+	return ctx.EndPoint.Nickname, trimmed, true
+}
+
+func BuildForwardNodesFromContext(ctx *MsgContext, title string, contents []string) []message.ForwardNode {
+	name, uin, ok := forwardSenderFromContext(ctx)
+	if !ok {
 		return nil
 	}
 	return buildForwardNodes(name, uin, title, contents)
@@ -117,8 +120,9 @@ func TryReplyToSenderMergedForward(ctx *MsgContext, msg *Message, title string, 
 	if len(contents) == 0 {
 		return false
 	}
+	config := ctx.Dice.Config()
 
-	if ctx.Dice.Config.EnableCensor && ctx.Dice.Config.CensorMode == OnlyOutputReply {
+	if config.EnableCensor && config.CensorMode == OnlyOutputReply {
 		for i, content := range contents {
 			checkText := sealCodeRe.ReplaceAllString(content, "")
 			checkText = cqCodeRe.ReplaceAllString(checkText, "")
@@ -139,7 +143,7 @@ func TryReplyToSenderMergedForward(ctx *MsgContext, msg *Message, title string, 
 		}
 	}
 
-	if ctx.Dice.Config.RateLimitEnabled && msg.Platform == "QQ" {
+	if config.RateLimitEnabled && msg.Platform == "QQ" {
 		if msg.MessageType == "group" {
 			if !spamCheckPerson(ctx, msg) {
 				spamCheckGroup(ctx, msg)
@@ -171,8 +175,7 @@ func TryReplyToSenderMergedForward(ctx *MsgContext, msg *Message, title string, 
 	case "group":
 		ok := s.SendGroupForwardMsg(ctx, msg.GroupID, nodes)
 		if ok && ctx.Group != nil {
-			atomic.StoreInt64(&ctx.Group.RecentDiceSendTime, time.Now().Unix())
-			ctx.Group.MarkDirty(ctx.Dice)
+			ctx.Group.SetRecentDiceSendTime(time.Now().Unix())
 		}
 		return ok
 	case "private":
@@ -193,9 +196,8 @@ func ReplyForward(ctx *MsgContext, msg *Message, nodes []message.ForwardNode) bo
 			nodes[i].SenderName = ctx.EndPoint.Nickname
 		}
 		if nodes[i].SenderID == "" {
-			normalized := BuildForwardNodesFromContext(ctx, "", []string{"placeholder"})
-			if len(normalized) > 0 {
-				nodes[i].SenderID = normalized[0].SenderID
+			if _, uin, ok := forwardSenderFromContext(ctx); ok {
+				nodes[i].SenderID = uin
 			}
 		}
 	}
@@ -227,97 +229,77 @@ func ReplyForward(ctx *MsgContext, msg *Message, nodes []message.ForwardNode) bo
 	return false
 }
 
-func IsCurGroupBotOnByID(session *IMSession, ep *EndPointInfo, messageType string, groupID string) bool {
-	// Pinenutn: 总觉得这里还能优化，但是又想不到怎么优化，可恶，要长脑子了
-	a := messageType == "group" && session.ServiceAtNew.Exists(groupID)
-	if !a {
-		return false
+func IsCurGroupBotOnByID(ctx *MsgContext, messageType, groupID string) (bool, error) {
+	if messageType != "group" {
+		return false, nil
 	}
-	groupInfo, ok := session.ServiceAtNew.Load(groupID)
-	if !ok {
-		// Pinenutn: 这里是否要打一下日志呢……
-		return false
+	if ctx == nil || ctx.EndPoint == nil {
+		return false, errors.New("dice: endpoint unavailable for group activation lookup")
 	}
-	_, exists := groupInfo.DiceIDActiveMap.Load(ep.UserID)
-	return exists
+	group, err := ctx.ResolveGroup(ctx.domainContext(), groupID)
+	if err != nil {
+		return false, err
+	}
+	return group.Version() != 0 && group.DiceIDActive(ctx.EndPoint.UserID), nil
 }
 
-func SetBotOffAtGroup(ctx *MsgContext, groupID string) {
-	session := ctx.Session
-	groupInfo, ok := session.ServiceAtNew.Load(groupID)
-	if ok {
-		if groupInfo.DiceIDActiveMap == nil {
-			groupInfo.DiceIDActiveMap = new(SyncMap[string, bool])
-		}
-
-		// TODO: 进行更好的是否变更的检查
-		groupInfo.DiceIDActiveMap.Delete(ctx.EndPoint.UserID)
-		if groupInfo.DiceIDActiveMap.Len() == 0 {
-			groupInfo.Active = false
-		}
-		groupInfo.MarkDirty(ctx.Dice)
+func SetBotOffAtGroup(ctx *MsgContext, groupID string) error {
+	if ctx == nil || ctx.EndPoint == nil {
+		return errors.New("dice: endpoint unavailable for group deactivation")
 	}
+	group, err := ctx.ResolveGroup(ctx.domainContext(), groupID)
+	if err != nil {
+		return err
+	}
+	if group.Version() == 0 {
+		return fmt.Errorf("dice: cannot deactivate unknown group %q", groupID)
+	}
+	return group.SetActivation(ctx.EndPoint.UserID, false, true)
 }
 
-// SetBotOnAtGroup 在群内开启
-func SetBotOnAtGroup(ctx *MsgContext, groupID string) *GroupInfo {
-	session := ctx.Session
-	group, ok := session.ServiceAtNew.Load(groupID)
-	if ok {
-		if group.DiceIDActiveMap == nil {
-			group.DiceIDActiveMap = new(SyncMap[string, bool])
+// SetBotOnAtGroup enables one endpoint in the canonical group aggregate.
+func ensureGroupActivation(ctx *MsgContext, groupID string, active bool) (*GroupInfo, error) {
+	if ctx == nil || ctx.Dice == nil || ctx.EndPoint == nil {
+		return nil, errors.New("dice: endpoint unavailable for group activation")
+	}
+	group, err := ctx.ResolveGroup(ctx.domainContext(), groupID)
+	if err != nil {
+		return nil, err
+	}
+	if group.Version() == 0 {
+		if err = group.create(ctx.Dice.BaseConfig.Name, groupID, "", "", time.Now().Unix()); err != nil {
+			return nil, err
 		}
-		if group.DiceIDExistsMap == nil {
-			group.DiceIDExistsMap = new(SyncMap[string, bool])
+		if err = group.SetCocRuleIndex(int(ctx.Dice.Config().DefaultCocRuleIndex)); err != nil {
+			return nil, err
 		}
-		if group.InactivatedExtSet == nil {
-			group.InactivatedExtSet = StringSet{}
-		}
-		group.DiceIDActiveMap.Store(ctx.EndPoint.UserID, true)
-		group.Active = true
-	} else {
-		// 设定扩展情况
-		sort.Sort(ExtDefaultSettingItemSlice(session.Parent.Config.ExtDefaultSettings))
-		var extLst []*ExtInfo
-		for _, i := range session.Parent.Config.ExtDefaultSettings {
-			if i.ExtItem != nil {
-				if i.AutoActive {
-					extLst = append(extLst, i.ExtItem)
-				}
+		for _, extension := range ctx.Dice.ExtList {
+			if extension == nil || extension.Name == "" {
+				continue
+			}
+			enabled := extension.AutoActive ||
+				(extension.DefaultSetting != nil && extension.DefaultSetting.AutoActive)
+			if err = group.SetExtension(extension.Name, enabled); err != nil {
+				return nil, err
 			}
 		}
-		group = &GroupInfo{
-			Active:            true,
-			activatedExtList:  extLst,
-			ExtAppliedTime:    session.Parent.ExtUpdateTime, // 标记已初始化
-			InactivatedExtSet: StringSet{},
-			Players:           new(SyncMap[string, *GroupPlayerInfo]),
-			GroupID:           groupID,
-			DiceIDActiveMap:   new(SyncMap[string, bool]),
-			DiceIDExistsMap:   new(SyncMap[string, bool]),
-			CocRuleIndex:      int(session.Parent.Config.DefaultCocRuleIndex),
-			UpdatedAtTime:     time.Now().Unix(),
-		}
-		session.ServiceAtNew.Store(groupID, group)
 	}
-
-	if group.DiceIDActiveMap == nil {
-		group.DiceIDActiveMap = new(SyncMap[string, bool])
+	if err = group.SetActivation(ctx.EndPoint.UserID, active, true); err != nil {
+		return nil, err
 	}
-	if group.DiceIDExistsMap == nil {
-		group.DiceIDExistsMap = new(SyncMap[string, bool])
-	}
-	if group.BotList == nil {
-		group.BotList = new(SyncMap[string, bool])
-	}
-
-	group.DiceIDActiveMap.Store(ctx.EndPoint.UserID, true)
-	group.MarkDirty(ctx.Dice)
-	return group
+	return group, nil
 }
 
-// GetPlayerInfoBySender 获取玩家群内信息，没有就创建
-func GetPlayerInfoBySender(ctx *MsgContext, msg *Message) (*GroupInfo, *GroupPlayerInfo) {
+func SetBotOnAtGroup(ctx *MsgContext, groupID string) (*GroupInfo, error) {
+	return ensureGroupActivation(ctx, groupID, true)
+}
+
+// GetPlayerInfoBySender resolves request-local facades and creates missing
+// canonical group/player aggregates in the current root transaction.
+func GetPlayerInfoBySender(ctx *MsgContext, msg *Message) (*GroupInfo, *GroupPlayerInfo, error) {
+	if msg == nil {
+		return nil, nil, errors.New("dice: message unavailable")
+	}
 	wrapper := MessageWrapper{
 		MessageType: msg.MessageType,
 		GroupID:     msg.GroupID,
@@ -334,50 +316,52 @@ func GetPlayerInfoBySender(ctx *MsgContext, msg *Message) (*GroupInfo, *GroupPla
 	return GetPlayerInfoBySenderRaw(ctx, &wrapper)
 }
 
-// GetPlayerInfoBySenderRaw 获取玩家群内信息的轻量版，不依赖完整的msg信息，因为实质上，大部分数据并没什么卵用。
-func GetPlayerInfoBySenderRaw(ctx *MsgContext, msg *MessageWrapper) (*GroupInfo, *GroupPlayerInfo) {
-	session := ctx.Session
-	var groupID string
-	if msg.MessageType == "group" {
-		// 群信息
-		groupID = msg.GroupID
-	} else {
-		// 私聊信息 PrivateGroup
+// GetPlayerInfoBySenderRaw is the allocation-light resolver used by command
+// contexts which already have normalized message identity.
+func GetPlayerInfoBySenderRaw(ctx *MsgContext, msg *MessageWrapper) (*GroupInfo, *GroupPlayerInfo, error) {
+	if ctx == nil || ctx.Dice == nil || msg == nil || msg.Sender.UserID == "" {
+		return nil, nil, errors.New("dice: incomplete player identity")
+	}
+	groupID := msg.GroupID
+	if msg.MessageType != "group" {
 		groupID = "PG-" + msg.Sender.UserID
-		SetBotOnAtGroup(ctx, groupID)
 	}
-
-	// Pinenutn:ServiceAtNew
-	groupInfo, ok := session.ServiceAtNew.Load(groupID)
-	if !ok {
-		groupInfo = SetBotOnAtGroup(ctx, groupID)
+	group, err := ctx.ResolveGroup(ctx.domainContext(), groupID)
+	if err != nil {
+		return nil, nil, err
 	}
-	if msg.GuildID != "" {
-		groupInfo.GuildID = msg.GuildID
-	}
-	if msg.ChannelID != "" {
-		groupInfo.ChannelID = msg.ChannelID
-	}
-
-	if ctx.Dice != nil {
-		groupInfo.SyncWrapperStatus(ctx.Dice)       // 移除无效 wrapper
-		groupInfo.SyncExtensionsOnMessage(ctx.Dice) // 新增 AutoActive 扩展
-	}
-
-	p := groupInfo.PlayerGet(ctx.Dice.DBOperator, msg.Sender.UserID)
-	if p == nil {
-		p = &GroupPlayerInfo{
-			Name:         msg.Sender.Nickname,
-			UserID:       msg.Sender.UserID,
-			ValueMapTemp: &ds.ValueMap{},
+	if group.Version() == 0 {
+		group, err = SetBotOnAtGroup(ctx, groupID)
+		if err != nil {
+			return nil, nil, err
 		}
-		groupInfo.Players.Store(msg.Sender.UserID, p)
 	}
-	if p.ValueMapTemp == nil {
-		p.ValueMapTemp = &ds.ValueMap{}
+	switch {
+	case msg.GuildID != "" && msg.ChannelID != "":
+		err = group.SetIdentity(msg.GuildID, msg.ChannelID)
+	case msg.GuildID != "":
+		err = group.SetGuildID(msg.GuildID)
+	case msg.ChannelID != "":
+		err = group.SetChannelID(msg.ChannelID)
 	}
-	p.InGroup = true
-	return groupInfo, p
+	if err != nil {
+		return nil, nil, err
+	}
+	group.SyncWrapperStatus(ctx.Dice)
+	if err = group.SyncExtensionsOnMessage(ctx.Dice); err != nil {
+		return nil, nil, err
+	}
+	player, err := ctx.ResolvePlayer(ctx.domainContext(), groupID, msg.Sender.UserID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if player.Version() == 0 {
+		if err = player.create(ctx.Dice.BaseConfig.Name, groupID, msg.Sender.UserID, msg.Sender.Nickname); err != nil {
+			return nil, nil, err
+		}
+	}
+	player.SetInGroup(true)
+	return group, player, nil
 }
 
 type MessageWrapper struct {
@@ -452,8 +436,9 @@ func ReplyGroupRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 		text = ctx.DelegateText + text
 		ctx.DelegateText = ""
 	}
+	config := ctx.Dice.Config()
 
-	if ctx.Dice.Config.RateLimitEnabled && msg.Platform == "QQ" {
+	if config.RateLimitEnabled && msg.Platform == "QQ" {
 		if !spamCheckPerson(ctx, msg) {
 			spamCheckGroup(ctx, msg)
 		}
@@ -464,7 +449,7 @@ func ReplyGroupRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 		visibleText := visibleReplyText(ctx, text)
 		d.Logger.Infof("发给(群%s): %s", msg.GroupID, visibleText)
 		// 敏感词拦截：回复（群）
-		if d.Config.EnableCensor && d.Config.CensorMode == OnlyOutputReply {
+		if config.EnableCensor && config.CensorMode == OnlyOutputReply {
 			// 先拿掉余烬码和CQ码再检查敏感词
 			checkText := sealCodeRe.ReplaceAllString(visibleText, "")
 			checkText = cqCodeRe.ReplaceAllString(checkText, "")
@@ -503,8 +488,7 @@ func replyGroupRawNoCheck(ctx *MsgContext, msg *Message, text string, flag strin
 	}
 	accepted := deliverReplyPlan(ctx, msg, strings.TrimSpace(text), flag, true)
 	if accepted && ctx != nil && ctx.Group != nil {
-		atomic.StoreInt64(&ctx.Group.RecentDiceSendTime, time.Now().Unix())
-		ctx.Group.MarkDirty(ctx.Dice)
+		ctx.Group.SetRecentDiceSendTime(time.Now().Unix())
 	}
 	if ctx != nil && accepted {
 		ctx.SetCommandReplied(true)
@@ -524,8 +508,9 @@ func ReplyPersonRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 		text = ctx.DelegateText + text
 		ctx.DelegateText = ""
 	}
+	config := ctx.Dice.Config()
 
-	if ctx.Dice.Config.RateLimitEnabled && msg.Platform == "QQ" {
+	if config.RateLimitEnabled && msg.Platform == "QQ" {
 		spamCheckPerson(ctx, msg)
 	}
 
@@ -534,7 +519,7 @@ func ReplyPersonRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 		visibleText := visibleReplyText(ctx, text)
 		d.Logger.Infof("发给(帐号%s): %s", msg.Sender.UserID, visibleText)
 		// 敏感词拦截：回复（个人）
-		if d.Config.EnableCensor && d.Config.CensorMode == OnlyOutputReply {
+		if config.EnableCensor && config.CensorMode == OnlyOutputReply {
 			// 先拿掉余烬码和CQ码再检查敏感词
 			checkText := sealCodeRe.ReplaceAllString(visibleText, "")
 			checkText = cqCodeRe.ReplaceAllString(checkText, "")
@@ -592,6 +577,66 @@ func submitDurableText(ctx *MsgContext, bridge OutboundBridgePort, msg *Message,
 	return false
 }
 
+func submitDurableForward(ctx *MsgContext, bridge durableOutboundForwardPort, msg *Message, nodes []message.ForwardNode, flag string, group bool) bool {
+	err := bridge.submitForward(ctx, msg, nodes, flag, group)
+	if err == nil {
+		return true
+	}
+	target := ""
+	if msg != nil {
+		target = msg.Sender.UserID
+	}
+	if msg != nil && group {
+		target = msg.GroupID
+	}
+	ctx.Dice.Logger.Errorf("合并转发未能发出: 目标=%s: %v", target, err)
+	return false
+}
+
+func deliverForwardReplyNow(ctx *MsgContext, bridge OutboundBridgePort, msg *Message, text, flag string, group, durable bool) bool {
+	parts := ctx.SplitText(text)
+	contents := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			contents = append(contents, part)
+		}
+	}
+	if len(contents) == 0 {
+		return false
+	}
+	if durable && isPureOnebotEndpoint(ctx.EndPoint) {
+		if forwardBridge, ok := bridge.(durableOutboundForwardPort); ok {
+			nodes := BuildForwardNodesFromContext(ctx, "", contents)
+			if len(nodes) > 0 {
+				return submitDurableForward(ctx, forwardBridge, msg, nodes, flag, group)
+			}
+		}
+	}
+	if !durable {
+		if sender, ok := ctx.EndPoint.Adapter.(forwardMsgSender); ok {
+			nodes := BuildForwardNodesFromContext(ctx, "", contents)
+			if group {
+				return sender.SendGroupForwardMsg(ctx, msg.GroupID, nodes)
+			}
+			return sender.SendPrivateForwardMsg(ctx, msg.Sender.UserID, nodes)
+		}
+	}
+	// SPLIT controls forward nodes, not ordinary fallback messages.
+	fallbackText := strings.TrimSpace(stripForwardSplitMarkers(text, ctx.getSplitKey()))
+	if fallbackText == "" {
+		return false
+	}
+	if durable {
+		return submitDurableText(ctx, bridge, msg, fallbackText, flag, group)
+	}
+	if group {
+		ctx.EndPoint.Adapter.SendToGroup(ctx, msg.GroupID, fallbackText, flag)
+	} else {
+		ctx.EndPoint.Adapter.SendToPerson(ctx, msg.Sender.UserID, fallbackText, flag)
+	}
+	return true
+}
+
 func deliverReplyPlan(ctx *MsgContext, msg *Message, text string, flag string, group bool) bool {
 	if ctx == nil || !ctx.standaloneSendScope {
 		return deliverReplyPlanNow(ctx, msg, text, flag, group)
@@ -625,65 +670,7 @@ func deliverReplyPlanNow(ctx *MsgContext, msg *Message, text string, flag string
 	accepted := false
 	for _, item := range ctx.compileReplyPlan(text) {
 		if item.Forward {
-			parts := ctx.SplitText(item.Text)
-			contents := make([]string, 0, len(parts))
-			for _, part := range parts {
-				if part = strings.TrimSpace(part); part != "" {
-					contents = append(contents, part)
-				}
-			}
-			if len(contents) == 0 {
-				continue
-			}
-			if durable {
-				if isPureOnebotEndpoint(ctx.EndPoint) {
-					if forwardBridge, ok := bridge.(durableOutboundForwardPort); ok {
-						nodes := BuildForwardNodesFromContext(ctx, "", contents)
-						if len(nodes) > 0 {
-							if err := forwardBridge.submitForward(ctx, msg, nodes, flag, group); err != nil {
-								target := ""
-								if msg != nil {
-									target = msg.Sender.UserID
-									if group {
-										target = msg.GroupID
-									}
-								}
-								ctx.Dice.Logger.Errorf("合并转发未能发出: 目标=%s: %v", target, err)
-							} else {
-								accepted = true
-							}
-							continue
-						}
-					}
-				}
-				fallbackText := strings.TrimSpace(stripForwardSplitMarkers(item.Text, ctx.getSplitKey()))
-				if fallbackText != "" && submitDurableText(ctx, bridge, msg, fallbackText, flag, group) {
-					accepted = true
-				}
-				continue
-			}
-			if sender, ok := ctx.EndPoint.Adapter.(forwardMsgSender); ok {
-				nodes := BuildForwardNodesFromContext(ctx, "", contents)
-				if group {
-					accepted = sender.SendGroupForwardMsg(ctx, msg.GroupID, nodes) || accepted
-				} else {
-					accepted = sender.SendPrivateForwardMsg(ctx, msg.Sender.UserID, nodes) || accepted
-				}
-				continue
-			}
-			// Unsupported platforms receive the whole block as one ordinary
-			// message. SPLIT only controls forward nodes, so remove its marker
-			// without splitting the fallback message.
-			fallbackText := strings.TrimSpace(stripForwardSplitMarkers(item.Text, ctx.getSplitKey()))
-			if fallbackText == "" {
-				continue
-			}
-			if group {
-				ctx.EndPoint.Adapter.SendToGroup(ctx, msg.GroupID, fallbackText, flag)
-			} else {
-				ctx.EndPoint.Adapter.SendToPerson(ctx, msg.Sender.UserID, fallbackText, flag)
-			}
-			accepted = true
+			accepted = deliverForwardReplyNow(ctx, bridge, msg, item.Text, flag, group, durable) || accepted
 			continue
 		}
 		parts := ctx.SplitText(item.Text)
@@ -727,30 +714,62 @@ func visibleReplyText(ctx *MsgContext, text string) string {
 // 在 se 中找到第一个平台等于 p 且启用的 EndPointInfo, 并向目标 t 发送消息,
 // pr 判断是否为私聊消息
 func CrossMsgBySearch(se *IMSession, p, t, txt string, pr bool) bool {
-	ep := se.GetEpByPlatform(p)
-	if ep == nil {
+	if se == nil || se.Parent == nil {
 		return false
 	}
-	mctx := &MsgContext{
-		EndPoint: ep,
-		Session:  ep.Session,
-		Dice:     ep.Session.Parent,
+	ep := se.GetEpByPlatform(p)
+	if ep == nil || ep.Session == nil || ep.Session.Parent == nil {
+		return false
 	}
-
-	if groupInfo, ok := mctx.Session.ServiceAtNew.Load(t); ok {
-		mctx.IsCurGroupBotOn = groupInfo.Active
-		mctx.Group = groupInfo
+	request, err := json.Marshal(struct {
+		EndpointID string `json:"endpointId"`
+		Target     string `json:"target"`
+		Text       string `json:"text"`
+		Private    bool   `json:"private"`
+	}{EndpointID: ep.ID, Target: t, Text: txt, Private: pr})
+	if err != nil {
+		se.Parent.Logger.Errorf("跨会话消息请求编码失败: %v", err)
+		return false
 	}
-
-	if !pr {
-		mctx.MessageType = "group"
-		ReplyGroup(mctx, &Message{GroupID: t}, txt)
-	} else {
-		mctx.IsPrivate = true
-		mctx.MessageType = "private"
-		ReplyPerson(mctx, &Message{Sender: SenderBase{UserID: t}}, txt)
+	identity := se.Parent.DomainExecutionIdentity("cross-message", uuid.NewString())
+	var messageContext *MsgContext
+	runErr := se.Parent.WithDomainExecution(context.Background(), identity, request, func(transaction *DurableCallbackTransaction) error {
+		messageContext = &MsgContext{
+			EndPoint: ep, Session: ep.Session, Dice: ep.Session.Parent,
+			callbackTransaction: transaction, callbackMetadata: transaction.metadata,
+			executionContext: transaction.executionContext,
+		}
+		conversationID := t
+		if pr {
+			conversationID = "PG-" + t
+			messageContext.IsPrivate = true
+			messageContext.MessageType = "private"
+		} else {
+			messageContext.MessageType = "group"
+		}
+		if resolveErr := messageContext.ResolveExistingDomainConversation(conversationID, ""); resolveErr != nil {
+			return resolveErr
+		}
+		if messageContext.Group != nil && !pr {
+			messageContext.IsCurGroupBotOn = messageContext.Group.IsActive(messageContext)
+		}
+		if pr {
+			ReplyPerson(messageContext, &Message{MessageType: "private", Sender: SenderBase{UserID: t}}, txt)
+		} else {
+			ReplyGroup(messageContext, &Message{MessageType: "group", GroupID: t}, txt)
+		}
+		if executionErr := messageContext.getExecutionError(); executionErr != nil {
+			return executionErr
+		}
+		return transaction.Domain().Err()
+	})
+	if messageContext != nil {
+		messageContext.releaseExecutionState()
 	}
-
+	if runErr != nil {
+		se.Parent.Logger.Errorf("跨会话消息执行失败: %v", runErr)
+		return false
+	}
 	return true
 }
 func ReplyPerson(ctx *MsgContext, msg *Message, text string) {
@@ -1048,57 +1067,65 @@ func spamCheckPerson(ctx *MsgContext, msg *Message) bool {
 		return false
 	}
 
-	if ctx.Player.RateLimiter == nil {
-		ctx.Player.RateLimitWarned = false
-		if ctx.Dice.Config.PersonalReplenishRateStr == "" {
-			ctx.Dice.Config.PersonalReplenishRateStr = DefaultConfig.PersonalReplenishRateStr
-			ctx.Dice.Config.PersonalReplenishRate = DefaultConfig.PersonalReplenishRate
-		}
-		if ctx.Dice.Config.PersonalBurst == 0 {
-			ctx.Dice.Config.PersonalBurst = DefaultConfig.PersonalBurst
-		}
-		ctx.Player.RateLimiter = rate.NewLimiter(
-			ctx.Dice.Config.PersonalReplenishRate,
-			int(ctx.Dice.Config.PersonalBurst),
-		)
-	}
-
-	now := time.Now().Unix()
-	lastCmd, lastAt, sameCount, recoveryMultiplier := calcSpamRecoveryMultiplier(
-		ctx.Player.SpamLastCommand,
-		ctx.Player.SpamLastCommandAt,
-		ctx.Player.SpamSameCommandCount,
-		ctx.CurrentCommand,
-		now,
-		ctx.Dice.Config.SpamSameCommandWindowSec,
-		int(ctx.Dice.Config.SpamRecoveryMultiplierMax),
-	)
-	ctx.Player.SpamLastCommand = lastCmd
-	ctx.Player.SpamLastCommandAt = lastAt
-	ctx.Player.SpamSameCommandCount = sameCount
-	applyRateLimiterPenalty(ctx.Player.RateLimiter, ctx.Dice.Config.PersonalReplenishRate, recoveryMultiplier)
-
-	if ctx.Player.RateLimiter.Allow() {
-		ctx.Player.RateLimitWarned = false
+	if ctx.Player == nil || ctx.Player.requireRuntimeAuthority() != nil {
 		return false
 	}
+	resources := ctx.Player.runtime
+	config := ctx.Dice.Config()
+	personalRate := config.PersonalReplenishRate
+	if config.PersonalReplenishRateStr == "" {
+		personalRate = DefaultConfig.PersonalReplenishRate
+	}
+	personalBurst := config.PersonalBurst
+	if personalBurst == 0 {
+		personalBurst = DefaultConfig.PersonalBurst
+	}
+	resources.limiterMu.Lock()
+	if resources.limiter == nil {
+		resources.rateLimitWarned = false
+		resources.limiter = rate.NewLimiter(
+			personalRate,
+			int(personalBurst),
+		)
+	}
+	now := time.Now().Unix()
+	var recoveryMultiplier int
+	resources.spamLastCommand, resources.spamLastCommandAt, resources.spamSameCommandCount, recoveryMultiplier =
+		calcSpamRecoveryMultiplier(
+			resources.spamLastCommand,
+			resources.spamLastCommandAt,
+			resources.spamSameCommandCount,
+			ctx.CurrentCommand,
+			now,
+			config.SpamSameCommandWindowSec,
+			int(config.SpamRecoveryMultiplierMax),
+		)
+	applyRateLimiterPenalty(resources.limiter, personalRate, recoveryMultiplier)
+	if resources.limiter.Allow() {
+		resources.rateLimitWarned = false
+		resources.limiterMu.Unlock()
+		return false
+	}
+	wasWarned := resources.rateLimitWarned
+	resources.rateLimitWarned = true
+	resources.limiterMu.Unlock()
 
+	userID := ctx.Player.UserID()
 	// Check if user is already banned to avoid sending multiple warnings in concurrent scenarios
-	if banItem, exists := ctx.Dice.Config.BanList.GetByID(ctx.Player.UserID); exists && banItem.Rank == BanRankBanned {
+	if banItem, exists := config.BanList.GetByID(userID); exists && banItem.Rank == BanRankBanned {
 		return true
 	}
-
-	if ctx.Player.RateLimitWarned {
-		ctx.Dice.Config.BanList.AddScoreByCommandSpam(ctx.Player.UserID, msg.GroupID, ctx)
+	if wasWarned {
+		if err := config.BanList.AddScoreByCommandSpamForContext(userID, msg.GroupID, ctx); err != nil {
+			ctx.setExecutionError(err)
+		}
 	} else {
-		ctx.Player.RateLimitWarned = true
 		replyToSenderRawNoCheck(
 			ctx, msg,
 			DiceFormatTmpl(ctx, "核心:刷屏_警告内容_个人"),
 			"",
 		)
 	}
-
 	return true
 }
 
@@ -1112,65 +1139,71 @@ func spamCheckGroup(ctx *MsgContext, msg *Message) bool {
 		ctx.SpamCheckedGroup = true
 	}()
 
+	if ctx.Group == nil || ctx.Group.requireRuntimeAuthority() != nil {
+		return false
+	}
 	// Skip privileged groups
-	for _, g := range ctx.Dice.DiceMasters {
-		if ctx.Group.GroupID == g {
+	for _, groupID := range ctx.Dice.DiceMasterIDs() {
+		if ctx.Group.GroupID() == groupID {
 			return false
 		}
 	}
-
-	if ctx.Group.RateLimiter == nil {
-		ctx.Group.RateLimitWarned = false
-		if ctx.Dice.Config.GroupReplenishRateStr == "" {
-			ctx.Dice.Config.GroupReplenishRateStr = DefaultConfig.GroupReplenishRateStr
-			ctx.Dice.Config.GroupReplenishRate = DefaultConfig.GroupReplenishRate
-		}
-		if ctx.Dice.Config.GroupBurst == 0 {
-			ctx.Dice.Config.GroupBurst = DefaultConfig.GroupBurst
-		}
-		ctx.Group.RateLimiter = rate.NewLimiter(
-			ctx.Dice.Config.GroupReplenishRate,
-			int(ctx.Dice.Config.GroupBurst),
+	resources := ctx.Group.runtime
+	config := ctx.Dice.Config()
+	groupRate := config.GroupReplenishRate
+	if config.GroupReplenishRateStr == "" {
+		groupRate = DefaultConfig.GroupReplenishRate
+	}
+	groupBurst := config.GroupBurst
+	if groupBurst == 0 {
+		groupBurst = DefaultConfig.GroupBurst
+	}
+	resources.limiterMu.Lock()
+	if resources.limiter == nil {
+		resources.rateLimitWarned = false
+		resources.limiter = rate.NewLimiter(
+			groupRate,
+			int(groupBurst),
 		)
 	}
-
 	now := time.Now().Unix()
-	lastCmd, lastAt, sameCount, recoveryMultiplier := calcSpamRecoveryMultiplier(
-		ctx.Group.SpamLastCommand,
-		ctx.Group.SpamLastCommandAt,
-		ctx.Group.SpamSameCommandCount,
-		ctx.CurrentCommand,
-		now,
-		ctx.Dice.Config.SpamSameCommandWindowSec,
-		int(ctx.Dice.Config.SpamRecoveryMultiplierMax),
-	)
-	ctx.Group.SpamLastCommand = lastCmd
-	ctx.Group.SpamLastCommandAt = lastAt
-	ctx.Group.SpamSameCommandCount = sameCount
-	applyRateLimiterPenalty(ctx.Group.RateLimiter, ctx.Dice.Config.GroupReplenishRate, recoveryMultiplier)
-
-	if ctx.Group.RateLimiter.Allow() {
-		ctx.Group.RateLimitWarned = false
+	var recoveryMultiplier int
+	resources.spamLastCommand, resources.spamLastCommandAt, resources.spamSameCommandCount, recoveryMultiplier =
+		calcSpamRecoveryMultiplier(
+			resources.spamLastCommand,
+			resources.spamLastCommandAt,
+			resources.spamSameCommandCount,
+			ctx.CurrentCommand,
+			now,
+			config.SpamSameCommandWindowSec,
+			int(config.SpamRecoveryMultiplierMax),
+		)
+	applyRateLimiterPenalty(resources.limiter, groupRate, recoveryMultiplier)
+	if resources.limiter.Allow() {
+		resources.rateLimitWarned = false
+		resources.limiterMu.Unlock()
 		return false
 	}
+	wasWarned := resources.rateLimitWarned
+	resources.rateLimitWarned = true
+	resources.limiterMu.Unlock()
 
+	groupID := ctx.Group.GroupID()
 	// Check if group is already banned to avoid sending multiple warnings in concurrent scenarios
-	if banItem, exists := ctx.Dice.Config.BanList.GetByID(ctx.Group.GroupID); exists && banItem.Rank == BanRankBanned {
+	if banItem, exists := config.BanList.GetByID(groupID); exists && banItem.Rank == BanRankBanned {
 		return true
 	}
-
-	// If not allow
-	if ctx.Group.RateLimitWarned {
-		ctx.Dice.Config.BanList.AddScoreByCommandSpam(ctx.Group.GroupID, msg.GroupID, ctx)
+	if wasWarned {
+		if err := config.BanList.AddScoreByCommandSpamForContext(groupID, msg.GroupID, ctx); err != nil {
+			ctx.setExecutionError(err)
+		}
 	} else {
-		ctx.Group.RateLimitWarned = true
 		replyToSenderRawNoCheck(
 			ctx, msg,
 			DiceFormatTmpl(ctx, "核心:刷屏_警告内容_群组"),
 			"",
 		)
 	}
-
 	return true
 }
 

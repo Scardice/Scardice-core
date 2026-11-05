@@ -2,9 +2,7 @@ package endpoint
 
 import (
 	"context"
-	"crypto/hmac"
 	crand "crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,9 +45,6 @@ type effectWire struct {
 	Effect    adapterapi.OutboundEffect `json:"effect"`
 	RawTarget string                    `json:"rawTarget,omitempty"`
 }
-type DispatcherDecryptor interface {
-	DecryptBound(ctx context.Context, domain, identity, owner string, version uint64, ciphertext, nonce []byte, keyID string) ([]byte, error)
-}
 type DispatcherClock interface{ Now() time.Time }
 type dispatcherClock struct{}
 
@@ -67,6 +62,10 @@ type EffectResultNotifier interface {
 	NotifyOutboundEffectResult(ctx context.Context, effect adapterapi.OutboundEffect, result adapterapi.EffectResult)
 }
 
+type DispatcherNotificationOwner interface {
+	Go(run func(context.Context)) bool
+}
+
 func uniformJitter(upperBound time.Duration) time.Duration {
 	if upperBound <= 0 {
 		return 0
@@ -80,7 +79,6 @@ func uniformJitter(upperBound time.Duration) time.Duration {
 
 type EffectDispatcher struct {
 	store           DispatcherStore
-	decrypt         DispatcherDecryptor
 	executor        EffectExecutor
 	ids             eventstore.IDGenerator
 	clock           DispatcherClock
@@ -90,6 +88,7 @@ type EffectDispatcher struct {
 	random          func(time.Duration) time.Duration
 	successNotifier EffectSuccessNotifier
 	resultNotifier  EffectResultNotifier
+	notifications   DispatcherNotificationOwner
 }
 type DispatcherOption func(*EffectDispatcher)
 
@@ -144,18 +143,27 @@ func WithEffectSuccessNotifier(notifier EffectSuccessNotifier) DispatcherOption 
 	}
 }
 
-func NewEffectDispatcher(store DispatcherStore, decrypt DispatcherDecryptor, executor EffectExecutor, workerID string, options ...DispatcherOption) (*EffectDispatcher, error) {
-	if store == nil || decrypt == nil || executor == nil || workerID == "" {
+func WithDispatcherNotificationOwner(owner DispatcherNotificationOwner) DispatcherOption {
+	return func(d *EffectDispatcher) {
+		d.notifications = owner
+	}
+}
+
+func NewEffectDispatcher(store DispatcherStore, executor EffectExecutor, workerID string, options ...DispatcherOption) (*EffectDispatcher, error) {
+	if store == nil || executor == nil || workerID == "" {
 		return nil, ErrDispatcherDependencies
 	}
 	if _, ok := store.(eventstore.OutboxQuarantineRepository); !ok {
 		return nil, ErrDispatcherDependencies
 	}
-	d := &EffectDispatcher{store: store, decrypt: decrypt, executor: executor, workerID: workerID, lease: time.Minute, executeTimeout: 30 * time.Second, clock: dispatcherClock{}, ids: eventstore.UUIDGenerator{}, random: uniformJitter}
+	d := &EffectDispatcher{store: store, executor: executor, workerID: workerID, lease: time.Minute, executeTimeout: 30 * time.Second, clock: dispatcherClock{}, ids: eventstore.UUIDGenerator{}, random: uniformJitter}
 	for _, option := range options {
 		if option != nil {
 			option(d)
 		}
+	}
+	if (d.resultNotifier != nil || d.successNotifier != nil) && d.notifications == nil {
+		return nil, ErrDispatcherDependencies
 	}
 	return d, nil
 }
@@ -186,25 +194,11 @@ func (d *EffectDispatcher) DispatchOnce(ctx context.Context) (result adapterapi.
 				if dispatched {
 					quarantineResult = adapterapi.AmbiguousResult("dispatcher-quarantine", "")
 				}
-				go d.notifyResult(context.WithoutCancel(ctx), quarantineEffect, quarantineResult)
+				d.scheduleNotification(func(ctx context.Context) { d.notifyResult(ctx, quarantineEffect, quarantineResult) })
 			}
 		}
 	}()
-	payloadVersion := claimed.Effect.PayloadVersion
-	if payloadVersion == 0 {
-		payloadVersion = 1
-	}
-	plain, err := d.decrypt.DecryptBound(ctx, "outbox/v1", claimed.Effect.EffectID, claimed.Effect.EndpointID, payloadVersion, claimed.Effect.PayloadCiphertext, claimed.Effect.PayloadNonce, claimed.Effect.PayloadEncryptionKeyID)
-	if err != nil {
-		return adapterapi.EffectResult{}, err
-	}
-	defer func() {
-		for i := range plain {
-			plain[i] = 0
-		}
-	}()
-	wire = effectWire{}
-	if err := json.Unmarshal(plain, &wire); err != nil {
+	if err := json.Unmarshal(claimed.Effect.Payload, &wire); err != nil {
 		return adapterapi.EffectResult{}, fmt.Errorf("endpoint dispatcher: decode effect: %w", err)
 	}
 	if wire.Effect.Payload.Target.Kind == adapterapi.TargetRaw && wire.RawTarget != "" {
@@ -226,11 +220,8 @@ func (d *EffectDispatcher) DispatchOnce(ctx context.Context) (result adapterapi.
 	if expectedRisk != "" && claimed.Effect.RiskClass != expectedRisk {
 		return adapterapi.EffectResult{}, errors.New("endpoint dispatcher: effect risk mismatch")
 	}
-	if wire.Effect.Lane.MAC != "" && len(claimed.Effect.LaneHMAC) > 0 {
-		mac, decodeErr := hex.DecodeString(wire.Effect.Lane.MAC)
-		if decodeErr != nil || !hmac.Equal(mac, claimed.Effect.LaneHMAC) {
-			return adapterapi.EffectResult{}, errors.New("endpoint dispatcher: effect lane mismatch")
-		}
+	if wire.Effect.Lane.Key != claimed.Effect.Lane {
+		return adapterapi.EffectResult{}, errors.New("endpoint dispatcher: effect lane mismatch")
 	}
 	eventStream := eventstore.StreamID{AggregateType: "outbound-effect", AggregateID: claimed.Effect.EffectID}
 	previous, err := d.store.Load(ctx, eventStream, 1)
@@ -384,7 +375,7 @@ func (d *EffectDispatcher) DispatchOnce(ctx context.Context) (result adapterapi.
 			if artifactID == "" {
 				return result, errors.New("endpoint dispatcher: artifact id required")
 			}
-			work.ArtifactUpdates = []eventstore.ArtifactUpdate{{ArtifactID: artifactID, OperationID: operation.OperationID, MediaType: result.Artifact.ContentType, SafeFilename: result.Artifact.Filename, Size: int64(len(bytes)), Plaintext: bytes, PlaintextSet: true}}
+			work.ArtifactUpdates = []eventstore.ArtifactUpdate{{ArtifactID: artifactID, OperationID: operation.OperationID, MediaType: result.Artifact.ContentType, SafeFilename: result.Artifact.Filename, Size: int64(len(bytes)), Data: bytes}}
 			work.Operations[0].ArtifactID = artifactID
 			result.Artifact.ID = adapterapi.ArtifactID(artifactID)
 		}
@@ -462,12 +453,20 @@ func (d *EffectDispatcher) DispatchOnce(ctx context.Context) (result adapterapi.
 		)
 	}
 	if d.resultNotifier != nil {
-		go d.notifyResult(context.WithoutCancel(ctx), wire.Effect, result)
+		d.scheduleNotification(func(ctx context.Context) { d.notifyResult(ctx, wire.Effect, result) })
 	}
 	if terminalErr == nil && result.Outcome == adapterapi.EffectSucceeded && d.successNotifier != nil {
-		go d.notifySuccess(context.WithoutCancel(ctx), wire.Effect, result)
+		d.scheduleNotification(func(ctx context.Context) { d.notifySuccess(ctx, wire.Effect, result) })
 	}
 	return result, terminalErr
+}
+
+func (d *EffectDispatcher) scheduleNotification(notify func(context.Context)) {
+	d.notifications.Go(func(ownerCtx context.Context) {
+		ctx, cancel := context.WithTimeout(ownerCtx, 30*time.Second)
+		defer cancel()
+		notify(ctx)
+	})
 }
 
 func (d *EffectDispatcher) notifyResult(ctx context.Context, effect adapterapi.OutboundEffect, result adapterapi.EffectResult) {

@@ -4,14 +4,18 @@ This directory defines the C ABI used by Scardice Core to discover and drive a n
 
 ## Status
 
-The repository exposes Runtime ABI v1 and Host ABI v1 through
+The repository exposes Runtime ABI v1 and Host ABI 1.2 through
 [`include/scardice_runtime_v1.h`](include/scardice_runtime_v1.h). Runtime
-minor remains reserved at zero; Host ABI 1.1 adds an append-only,
-`struct_size`-gated HostRef proxy retain/release tail and a method-owner query.
+minor remains reserved at zero. Host ABI 1.1 adds the append-only HostRef proxy
+retain/release tail and a function-owner query; Host ABI 1.2 appends the read-only
+`execution_status` callback for cancellation and deadlines during native execution.
+It also uses the existing service-event flags field for terminal-only cleanup
+that releases request values without running script continuations.
 
 The service callbacks, `tick`, and extension descriptor array remain optional
-v1 tails. QuickJS requires Host ABI 1.1: providers retain each HostRef proxy
-until finalization and retain a method's owner while its function remains
+v1 tails. Core and QuickJS require Host ABI 1.2 and reject an older Host contract
+rather than execute uncancellable code. Providers retain each HostRef proxy
+until finalization and retain a function's owner while the function remains
 reachable. Consumers validate every field they use through `struct_size`.
 
 There is no second public compatibility header. Runtime and Host ABI versions
@@ -66,6 +70,12 @@ The fixtures compile without linking a runtime plugin. Their `_Static_assert`/
   execution-context tokens for script, timer, Promise, and service callbacks.
   Providers declare this guarantee with `SC_CAP_CONTEXT_PROPAGATION` (bit 10).
   Core rejects that declaration unless the context extension is valid.
+- Host ABI 1.2 providers query `execution_status` on the owner thread while
+  executing JavaScript, including CPU-only loops. The host resolves the
+  provider's current context token: `SC_OK` permits execution, `SC_ECLOSED`
+  reports cancellation/revocation, and `SC_ETIMEOUT` reports an expired deadline.
+  A canceled operation stops without destroying the runtime; a later live entry
+  can run normally.
 - Handle `0` is invalid/null. `sc_runtime_t`, `sc_value_t`, `sc_host_ref_t`,
   `sc_host_func_t`, `sc_host_ctx_t`, and `sc_service_request_t` are opaque
   `uint64_t` values.

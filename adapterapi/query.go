@@ -120,7 +120,7 @@ func (result QueryResult) validateHistory(request QueryRequest) error {
 		if err := message.Validate(); err != nil {
 			return err
 		}
-		if message.Kind != InboundKindMessage || message.ConversationKind != ConversationKindGroup ||
+		if (message.Kind != InboundKindMessage && message.Kind != InboundKindSelfMessage) || message.ConversationKind != ConversationKindGroup ||
 			message.Conversation != request.Group || message.History != InboundHistoryNone {
 			return fmt.Errorf("%w: history answer holds something other than the asked group's live-shaped messages", ErrInvalidContract)
 		}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,7 +73,7 @@ func TestLegacyImportSourceFromEnvUsesRemoteSQLSnapshot(t *testing.T) {
 		"DB_DSN":        "postgres://db.example/legacy?sslmode=verify-full",
 		"DB_TLS_VERIFY": "true",
 	}
-	source, err := legacyImportSourceFromEnv("/srv/scardice/data", func(key string) string { return values[key] }, nil)
+	source, err := legacyImportSourceFromEnv("/srv/scardice/data", func(key string) string { return values[key] })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,8 +98,6 @@ func TestLegacyImportTargetFromEnvBuildsInactiveRemoteSlot(t *testing.T) {
 		"SCARDICE_ENDPOINT_DB_GREEN_TYPE":       "postgres",
 		"SCARDICE_ENDPOINT_DB_GREEN_ID":         "target-green",
 		"SCARDICE_ENDPOINT_DB_GREEN_TLS_VERIFY": "true",
-		"SCARDICE_ENDPOINT_KEY_INDEX":           "/var/lib/scardice/index.key",
-		"SCARDICE_ENDPOINT_KEY_ROOTS":           "/var/lib/scardice/roots",
 	}
 	target, identity, err := legacyImportTargetFromEnv(eventstore.DatabaseConfig{
 		Type: "postgres", DSN: "postgres://db.example/blue?sslmode=verify-full", DatabaseIdentity: "target-blue",
@@ -147,20 +146,16 @@ func TestCaptureImportPersistentStateFailsClosedWithoutCapability(t *testing.T) 
 func TestLegacyImportReusesFreshTargetIdentityEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	keySource := writeLegacyImportKeyMaterial(t, root)
 	activePath := filepath.Join(root, "events.db")
 
 	active := eventstore.DatabaseConfig{
-		Type: "sqlite", DSN: activePath, KeySource: keySource, DatabaseIdentity: "import-smoke",
+		Type: "sqlite", DSN: activePath, DatabaseIdentity: "import-smoke",
 	}
 	database, err := eventstore.OpenDatabase(ctx, active)
 	if err != nil {
 		t.Fatal(err)
 	}
 	store := eventstore.NewStore(database)
-	if err = store.ValidateReadiness(ctx); err != nil {
-		t.Fatalf("fresh store readiness: %v", err)
-	}
 	readiness, err := store.GetReadiness(ctx)
 	if err != nil || readiness.DatabaseIdentity != "import-smoke" {
 		t.Fatalf("fresh readiness = %#v, err=%v", readiness, err)
@@ -180,8 +175,8 @@ func TestLegacyImportReusesFreshTargetIdentityEndToEnd(t *testing.T) {
 	candidatePath := activePath + ".import"
 	result, err := eventsourcing.NewImporter(eventsourcing.ImporterOptions{
 		Readiness:      importReadinessSnapshot{value: readiness, persistentState: persistentState},
-		Source:         eventsourcing.NewLegacySourceWithKeySource(fixtureRoot, keySource),
-		Target:         eventsourcing.NewSQLitePublicationTarget(candidatePath, activePath, keySource),
+		Source:         eventsourcing.NewLegacySource(fixtureRoot),
+		Target:         eventsourcing.NewSQLitePublicationTarget(candidatePath, activePath),
 		SnapshotRoot:   filepath.Join(root, "snapshot"),
 		TargetIdentity: "import-smoke",
 	}).Run(ctx, eventsourcing.Request{Mode: eventsourcing.ModeImport})
@@ -215,20 +210,16 @@ func TestLegacyImportReusesFreshTargetIdentityEndToEnd(t *testing.T) {
 func TestLegacyImportStillRejectsPopulatedFreshTarget(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	keySource := writeLegacyImportKeyMaterial(t, root)
 	activePath := filepath.Join(root, "events.db")
 
 	active := eventstore.DatabaseConfig{
-		Type: "sqlite", DSN: activePath, KeySource: keySource, DatabaseIdentity: "import-smoke",
+		Type: "sqlite", DSN: activePath, DatabaseIdentity: "import-smoke",
 	}
 	database, err := eventstore.OpenDatabase(ctx, active)
 	if err != nil {
 		t.Fatal(err)
 	}
 	store := eventstore.NewStore(database)
-	if err = store.ValidateReadiness(ctx); err != nil {
-		t.Fatalf("fresh store readiness: %v", err)
-	}
 	readiness, err := store.GetReadiness(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -260,8 +251,8 @@ func TestLegacyImportStillRejectsPopulatedFreshTarget(t *testing.T) {
 	fixtureRoot := writeLegacyImportFixture(t, root)
 	result, err := eventsourcing.NewImporter(eventsourcing.ImporterOptions{
 		Readiness:      importReadinessSnapshot{value: readiness, persistentState: persistentState},
-		Source:         eventsourcing.NewLegacySourceWithKeySource(fixtureRoot, keySource),
-		Target:         eventsourcing.NewSQLitePublicationTarget(activePath+".import", activePath, keySource),
+		Source:         eventsourcing.NewLegacySource(fixtureRoot),
+		Target:         eventsourcing.NewSQLitePublicationTarget(activePath+".import", activePath),
 		SnapshotRoot:   filepath.Join(root, "snapshot"),
 		TargetIdentity: "import-smoke",
 	}).Run(ctx, eventsourcing.Request{Mode: eventsourcing.ModeImport})
@@ -271,28 +262,6 @@ func TestLegacyImportStillRejectsPopulatedFreshTarget(t *testing.T) {
 	if result.QuarantineMarker == "" {
 		t.Fatalf("populated target was not quarantined: %#v", result)
 	}
-}
-
-func writeLegacyImportKeyMaterial(t *testing.T, root string) eventstore.KeySource {
-	t.Helper()
-	keys := filepath.Join(root, "keys")
-	roots := filepath.Join(keys, "roots")
-	if err := os.MkdirAll(roots, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(keys, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(keys, "index"), []byte("01234567890123456789012345678901"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(roots, "root-v1.key"), []byte("abcdefghijklmnopqrstuvwxyz123456"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(roots, "current"), []byte("root-v1"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return eventstore.NewLocalFileKeySource(filepath.Join(keys, "index"), roots)
 }
 
 func writeLegacyImportFixture(t *testing.T, root string) string {
@@ -340,4 +309,166 @@ func writeLegacyImportFixture(t *testing.T, root string) string {
 		t.Fatal(err)
 	}
 	return fixtureRoot
+}
+
+// legacyImportFixtureWithBadRows is a fresh-target import whose legacy data
+// holds, next to the good group, rows the importer cannot decide.
+type legacyImportFixture struct {
+	root, activePath, fixtureRoot string
+	active                        eventstore.DatabaseConfig
+	options                       eventsourcing.ImporterOptions
+}
+
+func newLegacyImportFixtureWithBadRows(t *testing.T) legacyImportFixture {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	activePath := filepath.Join(root, "events.db")
+	active := eventstore.DatabaseConfig{Type: "sqlite", DSN: activePath, DatabaseIdentity: "import-smoke"}
+	database, err := eventstore.OpenDatabase(ctx, active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := eventstore.NewStore(database)
+	readiness, err := store.GetReadiness(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistentState, err := captureImportPersistentState(ctx, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	fixtureRoot := writeLegacyImportFixture(t, root)
+	legacy, err := sql.Open("sqlite", filepath.Join(fixtureRoot, "default", "data.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacy.Close()
+	for _, statement := range []string{
+		`INSERT INTO group_info (id, created_at, updated_at, data) VALUES ('QQ-Group:scalar', 7, 8, '{"active":"yes"}')`,
+		`INSERT INTO group_info (id, created_at, updated_at, data) VALUES ('QQ-Group:null-data', 7, 8, NULL)`,
+		`INSERT INTO group_info (id, created_at, updated_at, data) VALUES ('QQ-Group:zero-created', 0, 8, '{"active":true}')`,
+		`INSERT INTO group_info (id, created_at, updated_at, data) VALUES ('QQ-Group:bad-log', 7, 8, '{"logCurName":3}')`,
+		`INSERT INTO ban_info (id, ban_updated_at, data) VALUES ('QQ:empty-ban', 9, X'')`,
+		`INSERT INTO ban_info (id, ban_updated_at, data) VALUES ('QQ:garbage-ban', 9, 'not json')`,
+		`INSERT INTO attrs (id, data, created_at, updated_at) VALUES ('', '{"t":7,"v":{"dict":{"hp":{"t":0,"v":60}}}}', 1, 2)`,
+		`INSERT INTO group_player_info (name, user_id, group_id) VALUES ('NoUser', '', 'QQ-Group:100')`,
+		`INSERT INTO group_info (id, created_at, updated_at, data) VALUES ('QQ-Group:nosession', 7, 8, '{"logCurName":"gone","logOn":true}')`,
+	} {
+		if _, err = legacy.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return legacyImportFixture{
+		root: root, activePath: activePath, fixtureRoot: fixtureRoot, active: active,
+		options: eventsourcing.ImporterOptions{
+			Readiness:      importReadinessSnapshot{value: readiness, persistentState: persistentState},
+			Source:         eventsourcing.NewLegacySource(fixtureRoot),
+			Target:         eventsourcing.NewSQLitePublicationTarget(activePath+".import", activePath),
+			SnapshotRoot:   filepath.Join(root, "snapshot"),
+			TargetIdentity: "import-smoke",
+			DropRecordsDir: fixtureRoot,
+		},
+	}
+}
+
+// Rows the importer cannot decide no longer abort the import: the other
+// groups publish, and one record file lists every dropped row.
+func TestLegacyImportDropsUndecidableRowsAndRecordsThemEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	fixture := newLegacyImportFixtureWithBadRows(t)
+	result, err := eventsourcing.NewImporter(fixture.options).Run(ctx, eventsourcing.Request{Mode: eventsourcing.ModeImport})
+	if err != nil {
+		t.Fatalf("legacy import aborted on undecidable rows: %v", err)
+	}
+	if result.Dropped != 9 {
+		t.Fatalf("dropped rows = %d, want 9 (%#v)", result.Dropped, result)
+	}
+	recordsDir := filepath.Join(fixture.fixtureRoot, "migration-drops")
+	if filepath.Dir(result.DropRecordsPath) != recordsDir || !strings.HasPrefix(filepath.Base(result.DropRecordsPath), "legacy-import-") ||
+		!strings.HasSuffix(result.DropRecordsPath, ".jsonl") {
+		t.Fatalf("drop record path = %q", result.DropRecordsPath)
+	}
+	entries, err := os.ReadDir(recordsDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("record directory = %v/%v, want exactly one file", entries, err)
+	}
+	content, err := os.ReadFile(result.DropRecordsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reasons := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSuffix(string(content), "\n"), "\n") {
+		var record struct {
+			Source, Kind, Identity, Reason string
+			Detail                         map[string]any
+		}
+		if err = json.Unmarshal([]byte(line), &record); err != nil || record.Source != "legacy-import" {
+			t.Fatalf("drop record line %q: %v", line, err)
+		}
+		reasons[record.Kind+"/"+record.Identity] = record.Reason
+	}
+	want := map[string]string{
+		"group_info/QQ-Group:scalar":       "invalid-data",
+		"group_info/QQ-Group:null-data":    "data-null",
+		"group_info/QQ-Group:zero-created": "created-at-not-positive",
+		"group_info/QQ-Group:bad-log":      "invalid-story-log-state",
+		"ban_info/QQ:empty-ban":            "data-empty",
+		"ban_info/QQ:garbage-ban":          "invalid-data",
+		"attrs/":                           "attrs-missing-id",
+		"group_player_info/QQ-Group:100|":  "player-missing-identity",
+		"group_info/QQ-Group:nosession":    "story-log-session-missing",
+	}
+	if len(reasons) != len(want) {
+		t.Fatalf("drop reasons = %v, want %v", reasons, want)
+	}
+	for key, reason := range want {
+		if reasons[key] != reason {
+			t.Fatalf("drop reasons = %v, want %v", reasons, want)
+		}
+	}
+
+	published, err := eventstore.OpenDatabase(ctx, fixture.active)
+	if err != nil {
+		t.Fatalf("reopen published target: %v", err)
+	}
+	defer published.Close()
+	readiness, err := eventstore.NewStore(published).GetReadiness(ctx)
+	if err != nil || readiness.Mode != "import" {
+		t.Fatalf("published readiness = %#v/%v", readiness, err)
+	}
+	warning := legacyImportDropWarning(result)
+	if !strings.Contains(warning, "dropped 9") || !strings.Contains(warning, result.DropRecordsPath) {
+		t.Fatalf("drop warning = %q", warning)
+	}
+	if legacyImportDropWarning(eventsourcing.ImportResult{}) != "" {
+		t.Fatal("a run without drops produced a warning")
+	}
+}
+
+// A record file that cannot be written aborts the import before publication:
+// no row may be dropped without a durable record.
+func TestLegacyImportAbortsWhenDropRecordsCannotBeWritten(t *testing.T) {
+	ctx := context.Background()
+	fixture := newLegacyImportFixtureWithBadRows(t)
+	if err := os.WriteFile(filepath.Join(fixture.fixtureRoot, "migration-drops"), []byte("in the way"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := eventsourcing.NewImporter(fixture.options).Run(ctx, eventsourcing.Request{Mode: eventsourcing.ModeImport})
+	if err == nil || !errors.Is(err, eventsourcing.ErrQuarantined) || result.QuarantineMarker == "" {
+		t.Fatalf("import with unwritable drop records = %#v / %v", result, err)
+	}
+	database, openErr := eventstore.OpenDatabase(ctx, fixture.active)
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	defer database.Close()
+	readiness, readErr := eventstore.NewStore(database).GetReadiness(ctx)
+	if readErr != nil || readiness.Mode == "import" {
+		t.Fatalf("event database was published despite the failed record: %#v/%v", readiness, readErr)
+	}
 }

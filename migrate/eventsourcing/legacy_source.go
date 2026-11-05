@@ -2,10 +2,8 @@ package eventsourcing
 
 import (
 	"context"
-	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -36,18 +34,19 @@ import (
 // LegacySource reads a stopped pre-event-store installation. It never starts
 // Dice, adapters, scripts, or timers, and never writes source database files.
 type LegacySource struct {
-	Root      string
-	keySource eventstore.KeySource
+	Root string
 	// snapshotDataDirs pins copied instances to paths inside Root.
 	snapshotDataDirs map[legacyDataDirKey]legacySnapshotDataDir
+	// drops records group rows the stream cannot import. Without a recorder
+	// such rows abort the stream, because a drop must never be silent.
+	drops *dropRecorder
 }
+
+// bindDropRecorder lets the importer own the single drop record file of a run.
+func (s *LegacySource) bindDropRecorder(drops *dropRecorder) { s.drops = drops }
 
 func NewLegacySource(root string) *LegacySource {
 	return &LegacySource{Root: filepath.Clean(root)}
-}
-
-func NewLegacySourceWithKeySource(root string, keySource eventstore.KeySource) *LegacySource {
-	return &LegacySource{Root: filepath.Clean(root), keySource: keySource}
 }
 
 type legacyInstance struct {
@@ -71,11 +70,10 @@ func legacyConfigDataDirKey(config dice.BaseConfig) legacyDataDirKey {
 
 func newLegacySnapshotSource(
 	target string,
-	keySource eventstore.KeySource,
 	root *legacySourceRoot,
 	instances []legacyInstance,
 ) (*LegacySource, error) {
-	source := NewLegacySourceWithKeySource(target, keySource)
+	source := NewLegacySource(target)
 	source.snapshotDataDirs = make(map[legacyDataDirKey]legacySnapshotDataDir, len(instances))
 	for _, instance := range instances {
 		relative, err := root.relative(instance.dir)
@@ -138,8 +136,129 @@ type legacyEndpointDatabaseStatistics struct {
 
 type legacyGroupRow struct {
 	ID        string
-	CreatedAt int64
+	IDNull    bool
+	CreatedAt sql.NullInt64
+	UpdatedAt sql.NullInt64
 	Data      []byte
+	DataNull  bool
+}
+
+// legacyGroupSnapshot is the persisted group_info JSON shape from before
+// GroupInfo became a live execution facade. It contains detached scalar and
+// collection snapshots only; no mutex, runtime handle, extension object, or
+// mutation authority crosses the import boundary.
+type legacyGroupSnapshot struct {
+	GroupID               string
+	GuildID               string
+	ChannelID             string
+	GroupName             string
+	InviteUserID          string
+	EnteredTime           int64
+	Active                bool
+	NotInGroup            bool
+	DiceIDActiveMap       map[string]bool
+	DiceIDExistsMap       map[string]bool
+	ActivatedExtensions   []string
+	InactivatedExtensions map[string]bool
+	System                string
+	DiceSideNum           int64
+	DiceSideExpr          string
+	RollShaperMode        string
+	CocRuleIndex          int
+	DefaultHelpGroup      string
+	HelpPackages          []string
+	ShowGroupWelcome      bool
+	GroupWelcomeMessage   string
+	BotList               map[string]bool
+	Privileges            map[string]int
+	PlayerGroups          map[string][]string
+
+	activePresent     bool
+	notInGroupPresent bool
+	activeMapPresent  bool
+	existsMapPresent  bool
+}
+
+func decodeLegacyGroupSnapshot(data []byte) (legacyGroupSnapshot, error) {
+	fields, err := decodeLegacyGroupJSONFields(data)
+	if err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	legacyGroupJSONDropNulls(fields)
+	var group legacyGroupSnapshot
+	if group.GroupID, _, err = legacyGroupJSONString(fields, "groupId"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.GuildID, _, err = legacyGroupJSONString(fields, "guildId"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.ChannelID, _, err = legacyGroupJSONString(fields, "channelId"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.GroupName, _, err = legacyGroupJSONString(fields, "groupName"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.InviteUserID, _, err = legacyGroupJSONString(fields, "inviteUserId"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.EnteredTime, _, err = legacyGroupJSONInt64(fields, "enteredTime"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.Active, group.activePresent, err = legacyGroupJSONBool(fields, "active"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.NotInGroup, group.notInGroupPresent, err = legacyGroupJSONBool(fields, "notInGroup"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.DiceIDActiveMap, group.activeMapPresent, err = legacyGroupJSONCollection[map[string]bool](fields, "diceIdActiveMap"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.DiceIDExistsMap, group.existsMapPresent, err = legacyGroupJSONCollection[map[string]bool](fields, "diceIdExistsMap"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.ActivatedExtensions, _, err = legacyGroupJSONExtensions(fields, "activatedExtList"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.InactivatedExtensions, _, err = legacyGroupJSONStringSet(fields, "inactivatedExtSet"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.System, _, err = legacyGroupJSONString(fields, "system"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.DiceSideNum, _, err = legacyGroupJSONInt64(fields, "diceSideNum"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.DiceSideExpr, _, err = legacyGroupJSONString(fields, "diceSideExpr"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.RollShaperMode, _, err = legacyGroupJSONString(fields, "rollShaperMode"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.CocRuleIndex, _, err = legacyGroupJSONInt(fields, "cocRuleIndex"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.DefaultHelpGroup, _, err = legacyGroupJSONString(fields, "defaultHelpGroup"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.HelpPackages, _, err = legacyGroupJSONCollection[[]string](fields, "helpPackages"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.ShowGroupWelcome, _, err = legacyGroupJSONBool(fields, "showGroupWelcome"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.GroupWelcomeMessage, _, err = legacyGroupJSONString(fields, "groupWelcomeMessage"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.BotList, _, err = legacyGroupJSONCollection[map[string]bool](fields, "botList"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.Privileges, _, err = legacyGroupJSONCollection[map[string]int](fields, "privileges"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	if group.PlayerGroups, _, err = legacyGroupJSONCollection[map[string][]string](fields, "playerGroups"); err != nil {
+		return legacyGroupSnapshot{}, err
+	}
+	return group, nil
 }
 
 type legacyPlayerRow struct {
@@ -243,7 +362,7 @@ func (s *LegacySource) StreamRecords(ctx context.Context, yield func([]SourceRec
 				return fmt.Errorf("flush state: %w", flushErr)
 			}
 			diceID := instance.config.Name
-			if databaseErr := streamLegacySQLiteDatabase(ctx, dataDB, diceID, s.keySource, yield); databaseErr != nil {
+			if databaseErr := streamLegacySQLiteDatabase(ctx, dataDB, diceID, s.drops, yield); databaseErr != nil {
 				return fmt.Errorf("database: %w", databaseErr)
 			}
 			if logErr := streamLegacyStoryLogRecords(
@@ -253,6 +372,7 @@ func (s *LegacySource) StreamRecords(ctx context.Context, yield func([]SourceRec
 				filepath.Join(instance.dir, "data-logs.db"),
 				diceID,
 				before.Identity,
+				s.drops,
 				yield,
 			); logErr != nil {
 				return fmt.Errorf("story logs: %w", logErr)
@@ -314,7 +434,7 @@ func (s *LegacySource) Snapshot(ctx context.Context, target string) (SnapshotRes
 		}
 		files = append(files, destination)
 	}
-	snapshotSource, err := newLegacySnapshotSource(target, s.keySource, root, instances)
+	snapshotSource, err := newLegacySnapshotSource(target, root, instances)
 	if err != nil {
 		return SnapshotResult{}, err
 	}
@@ -787,61 +907,27 @@ func legacyEndpointRecords(ctx context.Context, diceID string, serveData []byte,
 		if persisted, ok := endpointStatistics[strings.TrimSpace(legacy.BaseInfo.UserID)]; ok {
 			statistics = applyLegacyEndpointDatabaseStatistics(statistics, persisted)
 		}
-		state := endpoint.State{}
-		create, err := endpoint.Decide(state, endpoint.Command{
-			Kind: endpoint.CommandCreate, CommandID: "legacy-create-" + string(endpointID),
-			CorrelationID: "legacy-import-" + diceID, EndpointID: endpointID,
-			DisplayName: strings.TrimSpace(legacy.BaseInfo.Nickname), ProviderID: providerID,
-			Statistics: statistics, AdapterKey: key, Config: config,
-		})
+		desired := endpoint.DesiredStateDisabled
+		if legacy.BaseInfo.Enable {
+			desired = endpoint.DesiredStateEnabled
+		}
+		event, err := endpoint.NewBaselineImported(endpoint.EndpointView{
+			EndpointID: endpointID, DisplayName: strings.TrimSpace(legacy.BaseInfo.Nickname), ProviderID: providerID,
+			Statistics: statistics, AdapterKey: key, Config: config, DesiredState: desired,
+		}, "legacy-baseline-"+string(endpointID), "legacy-import-"+diceID)
 		if err != nil {
+			clearSensitiveSourceRecords(records)
 			return nil, err
 		}
-		events := append([]endpoint.Event(nil), create.Events...)
-		for _, event := range create.Events {
-			state, err = endpoint.Apply(state, event)
-			if err != nil {
-				return nil, err
-			}
-		}
-		if legacy.BaseInfo.Enable {
-			enable, decideErr := endpoint.Decide(state, endpoint.Command{
-				Kind: endpoint.CommandEnable, CommandID: "legacy-enable-" + string(endpointID),
-				CorrelationID: "legacy-import-" + diceID,
-			})
-			if decideErr != nil {
-				return nil, decideErr
-			}
-			events = append(events, enable.Events...)
-			for _, event := range enable.Events {
-				state, err = endpoint.Apply(state, event)
-				if err != nil {
-					return nil, err
-				}
-			}
-			completed, decideErr := endpoint.Decide(state, endpoint.Command{
-				Kind: endpoint.CommandComplete, CommandID: "legacy-complete-" + string(endpointID),
-				CorrelationID: "legacy-import-" + diceID, OperationID: state.OperationID,
-				Generation: state.Generation, DesiredVersion: state.DesiredVersion,
-				ObservedState: adapterapi.ObservedStateStopped, CompletionState: endpoint.OperationStateSucceeded,
-			})
-			if decideErr != nil {
-				return nil, decideErr
-			}
-			events = append(events, completed.Events...)
+		payload, err := json.Marshal(event)
+		if err != nil {
+			clearSensitiveSourceRecords(records)
+			return nil, err
 		}
 		stream := eventstore.StreamID{AggregateType: endpoint.EndpointAggregateType, AggregateID: string(endpointID)}
-		for index, event := range events {
-			payload, marshalErr := json.Marshal(event)
-			if marshalErr != nil {
-				return nil, marshalErr
-			}
-			record := legacyEventRecord(stream, string(event.Type), 1, uint64(index+1), payload)
-			record.EventID = event.EventID
-			record.CommandID = event.CommandID
-			record.CorrelationID = event.CorrelationID
-			records = append(records, record)
-		}
+		record := legacyEventRecord(stream, string(event.Type), 1, 1, payload)
+		record.EventID, record.CommandID, record.CorrelationID = event.EventID, event.CommandID, event.CorrelationID
+		records = append(records, record)
 	}
 	return records, nil
 }
@@ -1010,10 +1096,10 @@ func legacyString(value any) string {
 }
 
 func streamLegacySQLite(ctx context.Context, path, diceID string, yield func([]SourceRecord) error) error {
-	return streamLegacySQLiteWithKeySource(ctx, path, diceID, nil, yield)
+	return streamLegacySQLiteWithDrops(ctx, path, diceID, nil, yield)
 }
 
-func streamLegacySQLiteWithKeySource(ctx context.Context, path, diceID string, keySource eventstore.KeySource, yield func([]SourceRecord) error) (streamErr error) {
+func streamLegacySQLiteWithDrops(ctx context.Context, path, diceID string, drops *dropRecorder, yield func([]SourceRecord) error) (streamErr error) {
 	if yield == nil {
 		return ErrValidation
 	}
@@ -1027,10 +1113,10 @@ func streamLegacySQLiteWithKeySource(ctx context.Context, path, diceID string, k
 		return err
 	}
 	defer func() { streamErr = errors.Join(streamErr, cleanup()) }()
-	return streamLegacySQLiteDatabase(ctx, database, diceID, keySource, yield)
+	return streamLegacySQLiteDatabase(ctx, database, diceID, drops, yield)
 }
 
-func streamLegacySQLiteDatabase(ctx context.Context, database *sql.DB, diceID string, keySource eventstore.KeySource, yield func([]SourceRecord) error) error {
+func streamLegacySQLiteDatabase(ctx context.Context, database *sql.DB, diceID string, drops *dropRecorder, yield func([]SourceRecord) error) error {
 	if database == nil || yield == nil {
 		return ErrValidation
 	}
@@ -1038,16 +1124,16 @@ func streamLegacySQLiteDatabase(ctx context.Context, database *sql.DB, diceID st
 		return err
 	}
 	batcher := sourceRecordBatcher{yield: yield}
-	if err := streamLegacyGroups(ctx, database, diceID, &batcher); err != nil {
+	if err := streamLegacyGroups(ctx, database, diceID, drops, &batcher); err != nil {
 		return fmt.Errorf("legacy group_info: %w", err)
 	}
-	if err := streamLegacyPlayers(ctx, database, diceID, &batcher); err != nil {
+	if err := streamLegacyPlayers(ctx, database, diceID, drops, &batcher); err != nil {
 		return fmt.Errorf("legacy group_player_info: %w", err)
 	}
-	if err := streamLegacyAttrs(ctx, database, diceID, &batcher); err != nil {
+	if err := streamLegacyAttrs(ctx, database, diceID, drops, &batcher); err != nil {
 		return fmt.Errorf("legacy attrs: %w", err)
 	}
-	if err := streamLegacyBans(ctx, database, diceID, keySource, &batcher); err != nil {
+	if err := streamLegacyBans(ctx, database, diceID, drops, &batcher); err != nil {
 		return fmt.Errorf("legacy ban_info: %w", err)
 	}
 	return batcher.flush()
@@ -1165,10 +1251,10 @@ func (b *sourceRecordBatcher) flush() error {
 	return nil
 }
 
-func legacyBanRecords(ctx context.Context, diceID string, keySource eventstore.KeySource, row legacyBanRow) ([]SourceRecord, error) {
+func legacyBanRecords(diceID string, row legacyBanRow) ([]SourceRecord, error) {
 	var item dice.BanListInfoItem
 	if err := json.Unmarshal(row.Data, &item); err != nil {
-		return nil, fmt.Errorf("legacy ban %q: %w", row.ID, err)
+		return nil, fmt.Errorf("legacy ban %q: %w: %w", row.ID, errLegacyBanInvalidData, err)
 	}
 	if item.ID == "" {
 		item.ID = row.ID
@@ -1190,10 +1276,7 @@ func legacyBanRecords(ctx context.Context, diceID string, keySource eventstore.K
 	stream := playerstate.ModerationStream(diceID, "global", item.ID)
 	records := []SourceRecord{legacyEventRecord(stream, string(event.EventType()), playerstate.EventSchemaVersion, 1, payload)}
 	if len(reason) != 0 {
-		digest, digestErr := legacyModerationReasonDigest(ctx, keySource, reason)
-		if digestErr != nil {
-			return nil, digestErr
-		}
+		digest := legacyModerationReasonDigest(reason)
 		changed := playerstate.NewModerationScoreChangedV1(item.Score, digest)
 		payload, err = playerstate.MarshalModerationEvent(changed)
 		if err != nil {
@@ -1221,30 +1304,14 @@ func moderationDetailsSecretRef(diceID, subjectID string) (string, error) {
 	if stream.AggregateID == "" {
 		return "", playerstate.ErrInvalidIdentity
 	}
-	digest := sha256.Sum256([]byte(stream.AggregateID))
-	return "vault:moderation-details:" + hex.EncodeToString(digest[:16]), nil
+	return "vault:moderation-details:" + stream.AggregateID, nil
 }
 
-func legacyModerationReasonDigest(ctx context.Context, keySource eventstore.KeySource, reason []byte) (string, error) {
-	if keySource == nil {
-		return "", eventstore.ErrKeySourceUnavailable
-	}
-	key, err := keySource.IndexRootMaterial(ctx)
-	if err != nil || len(key) < sha256.Size {
-		clear(key)
-		return "", eventstore.ErrKeySourceUnavailable
-	}
-	defer clear(key)
-	mac := hmac.New(sha256.New, key)
-	_, _ = mac.Write([]byte("legacy-moderation-reason/v1\x00"))
-	var length [8]byte
-	binary.BigEndian.PutUint64(length[:], uint64(len(reason)))
-	_, _ = mac.Write(length[:])
-	_, _ = mac.Write(reason)
-	return hex.EncodeToString(mac.Sum(nil)), nil
+func legacyModerationReasonDigest(reason []byte) string {
+	return hex.EncodeToString(eventstore.DigestBytes("moderation-history/v1", reason))
 }
 
-func legacyGroupRecords(diceID string, group *dice.GroupInfo, createdAt int64) ([]SourceRecord, error) {
+func legacyGroupRecords(diceID string, group legacyGroupSnapshot, createdAt int64) ([]SourceRecord, error) {
 	enteredAt := group.EnteredTime
 	if enteredAt == 0 {
 		enteredAt = createdAt
@@ -1253,24 +1320,43 @@ func legacyGroupRecords(diceID string, group *dice.GroupInfo, createdAt int64) (
 	if group.GuildID != "" || group.ChannelID != "" {
 		events = append(events, groupstate.NewGroupIdentityChangedV1(group.GuildID, group.ChannelID))
 	}
-	active := legacyBoolMap(group.DiceIDActiveMap)
-	exists := legacyBoolMap(group.DiceIDExistsMap)
-	keys := unionLegacyKeys(active, exists)
-	for _, key := range keys {
+	active, exists, err := legacyGroupActivationMaps(group)
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range unionLegacyKeys(active, exists) {
 		events = append(events, groupstate.NewGroupActivationChangedV1(key, active[key], exists[key]))
 	}
-	for _, ext := range group.GetActivatedExtListRaw() {
-		if ext != nil && strings.TrimSpace(ext.Name) != "" {
-			events = append(events, groupstate.NewGroupExtensionChangedV1(ext.Name, true))
+	// The historical loader kept the activated list as the effective
+	// extension set: duplicate entries collapse to one membership, and the
+	// inactivated set only decides whether an extension is auto-activated
+	// later. A name present in both therefore stays enabled, matching what
+	// HEAD dispatch used. A blank name was skipped by the historical decoder.
+	extensionSet := make(map[string]struct{}, len(group.ActivatedExtensions))
+	for _, extensionID := range group.ActivatedExtensions {
+		if extensionID == "" {
+			continue
 		}
+		if strings.TrimSpace(extensionID) == "" {
+			return nil, fmt.Errorf("%w: legacy group has a whitespace-only activated extension", ErrValidation)
+		}
+		if _, duplicate := extensionSet[extensionID]; duplicate {
+			continue
+		}
+		extensionSet[extensionID] = struct{}{}
+		events = append(events, groupstate.NewGroupExtensionChangedV1(extensionID, true))
 	}
-	inactive := make([]string, 0, len(group.InactivatedExtSet))
-	for name := range group.InactivatedExtSet {
-		inactive = append(inactive, name)
-	}
-	sort.Strings(inactive)
-	for _, name := range inactive {
-		events = append(events, groupstate.NewGroupExtensionChangedV1(name, false))
+	for _, extensionID := range sortedLegacyBoolKeys(group.InactivatedExtensions) {
+		if extensionID == "" {
+			continue
+		}
+		if strings.TrimSpace(extensionID) == "" {
+			return nil, fmt.Errorf("%w: legacy group has a whitespace-only inactivated extension", ErrValidation)
+		}
+		if _, enabled := extensionSet[extensionID]; enabled {
+			continue
+		}
+		events = append(events, groupstate.NewGroupExtensionChangedV1(extensionID, false))
 	}
 	if group.System != "" {
 		events = append(events, groupstate.NewGroupSystemChangedV1(group.System))
@@ -1284,25 +1370,65 @@ func legacyGroupRecords(diceID string, group *dice.GroupInfo, createdAt int64) (
 	if group.ShowGroupWelcome || group.GroupWelcomeMessage != "" {
 		events = append(events, groupstate.NewGroupWelcomeChangedV1(group.ShowGroupWelcome, group.GroupWelcomeMessage))
 	}
-	bots := legacyBoolMap(group.BotList)
-	for _, key := range sortedLegacyBoolKeys(bots) {
-		events = append(events, groupstate.NewGroupBotListChangedV1(key, bots[key]))
+	for _, key := range sortedLegacyBoolKeys(group.BotList) {
+		events = append(events, groupstate.NewGroupBotListChangedV1(key, group.BotList[key]))
+	}
+	for _, key := range sortedLegacyMapKeys(group.Privileges) {
+		events = append(events, groupstate.NewGroupPrivilegeChangedV1(key, group.Privileges[key]))
+	}
+	for _, name := range sortedLegacyMapKeys(group.PlayerGroups) {
+		events = append(events, groupstate.NewGroupTeamChangedV1(name, group.PlayerGroups[name], false))
+	}
+	if _, replayErr := groupstate.Replay(events); replayErr != nil {
+		return nil, fmt.Errorf("%w: invalid legacy group snapshot: %w", ErrValidation, replayErr)
 	}
 	stream := groupstate.GroupStream(diceID, group.GroupID)
 	records := make([]SourceRecord, 0, len(events))
 	for index, event := range events {
-		payload, err := groupstate.MarshalTypedEvent(event)
-		if err != nil {
-			return nil, err
+		payload, marshalErr := groupstate.MarshalTypedEvent(event)
+		if marshalErr != nil {
+			return nil, marshalErr
 		}
 		records = append(records, legacyEventRecord(stream, string(event.EventType()), groupstate.GroupEventSchemaVersion, uint64(index+1), payload))
 	}
 	return records, nil
 }
 
+// legacyGroupActivationMaps maps the persisted activation fields with the
+// semantics the historical runtime used (GroupInfo.IsActive): Active is the
+// effective master switch and diceIdActiveMap selects the endpoints under it.
+// A group with Active=false is therefore inactive for every endpoint even when
+// the map still lists one; that is the exact row QQ-CH auto-created groups
+// persisted while QQChannelAutoOn was false (SetBotOnAtGroup stored the
+// endpoint, then Active was reset to false). The historical loader also
+// ignored notInGroup, did not require an active endpoint to be listed in
+// diceIdExistsMap (automatic quit removes only the exists entry), and dropped
+// "QQ-Group:" keys from the exists map.
+func legacyGroupActivationMaps(group legacyGroupSnapshot) (map[string]bool, map[string]bool, error) {
+	active := cloneLegacyBoolMap(group.DiceIDActiveMap)
+	exists := cloneLegacyBoolMap(group.DiceIDExistsMap)
+	for key := range exists {
+		if strings.HasPrefix(key, "QQ-Group:") {
+			delete(exists, key)
+		}
+	}
+	for key := range active {
+		if !group.Active {
+			active[key] = false
+		}
+	}
+	// A missing map is missing membership, not the Dice instance's name.
+	// Retain the established undecidable-row rule for contradictory flags;
+	// do not manufacture an endpoint merely to detect that contradiction.
+	if !group.existsMapPresent && group.notInGroupPresent && group.NotInGroup && group.Active {
+		return nil, nil, fmt.Errorf("%w: legacy group is active but marked outside the group", ErrValidation)
+	}
+	return active, exists, nil
+}
+
 func legacyPlayerRecords(diceID string, player legacyPlayerRow) ([]SourceRecord, error) {
 	if player.GroupID == "" || player.UserID == "" {
-		return nil, ErrValidation
+		return nil, errLegacyPlayerNoIdentity
 	}
 	events := []playerstate.PlayerEvent{playerstate.NewPlayerCreatedV1(diceID, player.GroupID, player.UserID, player.Name)}
 	if player.AutoSetNameTemplate != "" {
@@ -1346,10 +1472,9 @@ func legacyAttrsRecords(diceID string, row legacyAttrsRow) ([]SourceRecord, erro
 			// no identity, metadata, or values. It has no semantic state to import.
 			return nil, nil
 		}
-		return nil, fmt.Errorf("legacy attrs %q has semantic state but no identity: %w", row.ID, ErrValidation)
+		return nil, fmt.Errorf("legacy attrs %q has semantic state but no identity: %w", row.ID, errLegacyAttrsNoIdentity)
 	}
-	refDigest := sha256.Sum256([]byte(diceID + "\x00" + row.ID))
-	secretRef := "vault:legacy-attrs-" + hex.EncodeToString(refDigest[:16])
+	secretRef := attributestate.SecretRef(diceID, row.ID)
 	state := attributestate.State{
 		DiceID: diceID, ID: row.ID, AttrsType: row.AttrsType, BindingSheetID: row.BindingSheetID,
 		Name: row.Name, OwnerID: row.OwnerID, SheetType: row.SheetType, Hidden: row.Hidden,
@@ -1366,27 +1491,29 @@ func legacyAttrsRecords(diceID string, row legacyAttrsRow) ([]SourceRecord, erro
 	}, nil
 }
 
-func streamLegacyGroups(ctx context.Context, database *sql.DB, diceID string, batcher *sourceRecordBatcher) (streamErr error) {
-	rows, err := database.QueryContext(ctx, "SELECT id, COALESCE(created_at, 0), data FROM group_info ORDER BY id")
+func streamLegacyGroups(ctx context.Context, database *sql.DB, diceID string, drops *dropRecorder, batcher *sourceRecordBatcher) (streamErr error) {
+	rows, err := queryLegacyGroupRows(ctx, database)
 	if err != nil {
 		return err
 	}
 	defer func() { streamErr = errors.Join(streamErr, rows.Close()) }()
 	for rows.Next() {
-		var row legacyGroupRow
-		if err = rows.Scan(&row.ID, &row.CreatedAt, &row.Data); err != nil {
-			return err
+		row, scanErr := scanLegacyGroupRow(rows)
+		if scanErr != nil {
+			return scanErr
 		}
-		var group dice.GroupInfo
-		if err = json.Unmarshal(row.Data, &group); err != nil {
-			return fmt.Errorf("legacy group %q: %w", row.ID, err)
-		}
-		if group.GroupID == "" {
-			group.GroupID = row.ID
-		}
-		records, convertErr := legacyGroupRecords(diceID, &group, row.CreatedAt)
+		records, drop, convertErr := legacyGroupRowRecords(diceID, row)
 		if convertErr != nil {
-			return fmt.Errorf("legacy group %q: %w", row.ID, convertErr)
+			return convertErr
+		}
+		if drop != nil {
+			if drops == nil {
+				return drop.abortError(row)
+			}
+			if err = recordLegacyGroupDrop(drops, diceID, row, *drop, false); err != nil {
+				return err
+			}
+			continue
 		}
 		if err = batcher.add(records...); err != nil {
 			return err
@@ -1395,7 +1522,7 @@ func streamLegacyGroups(ctx context.Context, database *sql.DB, diceID string, ba
 	return rows.Err()
 }
 
-func streamLegacyPlayers(ctx context.Context, database *sql.DB, diceID string, batcher *sourceRecordBatcher) (streamErr error) {
+func streamLegacyPlayers(ctx context.Context, database *sql.DB, diceID string, drops *dropRecorder, batcher *sourceRecordBatcher) (streamErr error) {
 	rows, err := database.QueryContext(ctx, "SELECT COALESCE(name, ''), COALESCE(user_id, ''), COALESCE(last_command_time, 0), COALESCE(auto_set_name_template, ''), COALESCE(dice_side_num, 0), COALESCE(group_id, '') FROM group_player_info ORDER BY group_id, user_id")
 	if err != nil {
 		return err
@@ -1408,6 +1535,15 @@ func streamLegacyPlayers(ctx context.Context, database *sql.DB, diceID string, b
 		}
 		records, convertErr := legacyPlayerRecords(diceID, row)
 		if convertErr != nil {
+			if drops != nil && errors.Is(convertErr, errLegacyPlayerNoIdentity) {
+				if err = recordLegacyRowDrop(drops, legacyPlayerTable, diceID, row.GroupID+"|"+row.UserID, legacyDropPlayerNoID, nil, map[string]any{
+					"name": row.Name, "userId": row.UserID, "groupId": row.GroupID,
+					"lastCommandTime": row.LastCommandTime, "autoSetNameTemplate": row.AutoSetNameTemplate, "diceSideNum": row.DiceSideNum,
+				}); err != nil {
+					return fmt.Errorf("record dropped legacy player group=%q user=%q: %w", row.GroupID, row.UserID, err)
+				}
+				continue
+			}
 			return fmt.Errorf("legacy player group=%q user=%q: %w", row.GroupID, row.UserID, convertErr)
 		}
 		if err = batcher.add(records...); err != nil {
@@ -1417,8 +1553,8 @@ func streamLegacyPlayers(ctx context.Context, database *sql.DB, diceID string, b
 	return rows.Err()
 }
 
-func streamLegacyAttrs(ctx context.Context, database *sql.DB, diceID string, batcher *sourceRecordBatcher) (streamErr error) {
-	rows, err := database.QueryContext(ctx, `SELECT id, data, COALESCE(attrs_type, ''), COALESCE(binding_sheet_id, ''), COALESCE(name, ''), COALESCE(owner_id, ''), COALESCE(sheet_type, ''), COALESCE(is_hidden, false), COALESCE(created_at, 0), COALESCE(updated_at, 0) FROM attrs ORDER BY id`)
+func streamLegacyAttrs(ctx context.Context, database *sql.DB, diceID string, drops *dropRecorder, batcher *sourceRecordBatcher) (streamErr error) {
+	rows, err := database.QueryContext(ctx, `SELECT COALESCE(id, ''), data, COALESCE(attrs_type, ''), COALESCE(binding_sheet_id, ''), COALESCE(name, ''), COALESCE(owner_id, ''), COALESCE(sheet_type, ''), COALESCE(is_hidden, false), COALESCE(created_at, 0), COALESCE(updated_at, 0) FROM attrs ORDER BY id`)
 	if err != nil {
 		return err
 	}
@@ -1428,8 +1564,32 @@ func streamLegacyAttrs(ctx context.Context, database *sql.DB, diceID string, bat
 		if err = rows.Scan(&row.ID, &row.Data, &row.AttrsType, &row.BindingSheetID, &row.Name, &row.OwnerID, &row.SheetType, &row.Hidden, &row.CreatedAt, &row.UpdatedAt); err != nil {
 			return err
 		}
+		if len(row.Data) == 0 && drops != nil {
+			// v151 deleted attrs rows with NULL or empty data; they hold no
+			// dictionary to import, so record and skip rather than abort.
+			if err = recordLegacyEmptyDataDrop(drops, legacyAttrsTable, diceID, row.ID, map[string]any{
+				"attrsType": row.AttrsType, "bindingSheetId": row.BindingSheetID, "name": row.Name,
+				"ownerId": row.OwnerID, "sheetType": row.SheetType, "hidden": row.Hidden,
+				"createdAt": row.CreatedAt, "updatedAt": row.UpdatedAt,
+			}); err != nil {
+				return fmt.Errorf("record dropped legacy attrs %q: %w", row.ID, err)
+			}
+			continue
+		}
 		records, convertErr := legacyAttrsRecords(diceID, row)
 		if convertErr != nil {
+			if drops != nil && errors.Is(convertErr, errLegacyAttrsNoIdentity) {
+				// An addressless non-empty sheet cannot be placed; keep its
+				// full content in the record for manual repair.
+				if err = recordLegacyRowDrop(drops, legacyAttrsTable, diceID, row.ID, legacyDropAttrsNoID, row.Data, map[string]any{
+					"attrsType": row.AttrsType, "bindingSheetId": row.BindingSheetID, "name": row.Name,
+					"ownerId": row.OwnerID, "sheetType": row.SheetType, "hidden": row.Hidden,
+					"createdAt": row.CreatedAt, "updatedAt": row.UpdatedAt,
+				}); err != nil {
+					return fmt.Errorf("record dropped legacy attrs %q: %w", row.ID, err)
+				}
+				continue
+			}
 			return fmt.Errorf("legacy attrs %q: %w", row.ID, convertErr)
 		}
 		if err = batcher.add(records...); err != nil {
@@ -1439,11 +1599,11 @@ func streamLegacyAttrs(ctx context.Context, database *sql.DB, diceID string, bat
 	return rows.Err()
 }
 
-func streamLegacyBans(ctx context.Context, database *sql.DB, diceID string, keySource eventstore.KeySource, batcher *sourceRecordBatcher) (streamErr error) {
+func streamLegacyBans(ctx context.Context, database *sql.DB, diceID string, drops *dropRecorder, batcher *sourceRecordBatcher) (streamErr error) {
 	query := "SELECT id, COALESCE(ban_updated_at, 0), data FROM ban_info ORDER BY id"
 	probe, probeErr := database.QueryContext(ctx, "SELECT ban_updated_at FROM ban_info WHERE 1=0")
 	if probeErr != nil {
-		if !isMissingBanUpdatedAtColumn(probeErr) {
+		if !isMissingColumn(probeErr, "ban_updated_at") {
 			return probeErr
 		}
 		query = "SELECT id, data FROM ban_info ORDER BY id"
@@ -1471,8 +1631,23 @@ func streamLegacyBans(ctx context.Context, database *sql.DB, diceID string, keyS
 		if err != nil {
 			return err
 		}
-		records, convertErr := legacyBanRecords(ctx, diceID, keySource, row)
+		if len(row.Data) == 0 && drops != nil {
+			// v151 deleted ban_info rows with NULL or empty data.
+			if err = recordLegacyEmptyDataDrop(drops, legacyBanTable, diceID, row.ID, map[string]any{"banUpdatedAt": row.BanUpdatedAt}); err != nil {
+				return fmt.Errorf("record dropped legacy ban %q: %w", row.ID, err)
+			}
+			continue
+		}
+		records, convertErr := legacyBanRecords(diceID, row)
 		if convertErr != nil {
+			if drops != nil && errors.Is(convertErr, errLegacyBanInvalidData) {
+				if err = recordLegacyRowDrop(drops, legacyBanTable, diceID, row.ID, legacyDropBanInvalidData, row.Data, map[string]any{
+					"banUpdatedAt": row.BanUpdatedAt, "error": convertErr.Error(),
+				}); err != nil {
+					return fmt.Errorf("record dropped legacy ban %q: %w", row.ID, err)
+				}
+				continue
+			}
 			return fmt.Errorf("legacy ban %q: %w", row.ID, convertErr)
 		}
 		if err = batcher.add(records...); err != nil {
@@ -1634,13 +1809,10 @@ func safeLegacyID(value string) string {
 	return strings.Trim(value, "-")
 }
 
-func legacyBoolMap(value *dice.SyncMap[string, bool]) map[string]bool {
-	result := map[string]bool{}
-	if value != nil {
-		value.Range(func(key string, enabled bool) bool {
-			result[key] = enabled
-			return true
-		})
+func cloneLegacyBoolMap(value map[string]bool) map[string]bool {
+	result := make(map[string]bool, len(value))
+	for key, enabled := range value {
+		result[key] = enabled
 	}
 	return result
 }
@@ -1662,6 +1834,15 @@ func unionLegacyKeys(first, second map[string]bool) []string {
 }
 
 func sortedLegacyBoolKeys(values map[string]bool) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedLegacyMapKeys[V any](values map[string]V) []string {
 	keys := make([]string, 0, len(values))
 	for key := range values {
 		keys = append(keys, key)

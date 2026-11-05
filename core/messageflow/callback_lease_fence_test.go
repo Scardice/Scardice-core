@@ -11,21 +11,20 @@ import (
 	"time"
 
 	"Scardice-core/adapterapi"
-	"Scardice-core/core/groupstate"
+	"Scardice-core/core/execution"
 	"Scardice-core/core/playerstate"
 	"Scardice-core/endpoint"
 	"Scardice-core/eventstore"
 )
 
-func TestCallbackSQLiteA6RenewsAcrossCommitFenceAndCommitsHostMutation(t *testing.T) {
+func TestCallbackSQLiteRenewsAcrossCommitFenceAndCommitsHostMutation(t *testing.T) {
 	// Keep lease deadlines independent of SQLite and race-instrumentation CPU time.
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
-		source := defaultIntegrationKeySource()
 		db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
 			Type: "sqlite", DSN: filepath.Join(t.TempDir(), "callback-lease-fence.db"),
-			KeySource: source, DatabaseIdentity: "callback-lease-fence",
+			DatabaseIdentity: "callback-lease-fence",
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -35,7 +34,7 @@ func TestCallbackSQLiteA6RenewsAcrossCommitFenceAndCommitsHostMutation(t *testin
 		store := eventstore.NewStore(db)
 		observedInbox := &callbackLeaseObservedInbox{InboxRepository: store}
 		observedStore := &callbackLeaseObservedStore{Store: store}
-		inbound, err := NewInboundService(observedInbox, store)
+		inbound, err := NewInboundService(observedInbox)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -61,9 +60,9 @@ func TestCallbackSQLiteA6RenewsAcrossCommitFenceAndCommitsHostMutation(t *testin
 		stream := eventstore.StreamID{AggregateType: "callback-lease-test", AggregateID: "host-mutation"}
 		host := &callbackLeaseFenceHost{fence: fence, stream: stream, hookOrder: make(chan string, 2)}
 		service, err := NewCallbackService(CallbackConfig{
-			Inbox: observedInbox, Store: observedStore, BoundCodec: store,
-			Resolver: callbackTestResolver{}, Group: groupstate.NewRepository(store), Player: playerstate.NewRepository(store),
-			Host: host, WorkerID: "lease-worker", LeaseDuration: 300 * time.Millisecond,
+			Inbox: observedInbox, Store: observedStore,
+			Resolver: callbackTestResolver{},
+			Host:     host, WorkerID: "lease-worker", LeaseDuration: 300 * time.Millisecond,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -173,7 +172,7 @@ func TestCallbackFenceCancellationReturnsWithoutLateCommit(t *testing.T) {
 	fence := newCallbackBlockingCommitFence()
 	var afterCommit atomic.Int64
 	released := make(chan struct{}, 1)
-	host := &callbackTestHost{fn: func(context.Context, CallbackRequest, *playerstate.LocalOverlay, *MutationCollector) (CallbackResult, error) {
+	host := &callbackTestHost{fn: func(context.Context, CallbackRequest, *playerstate.LocalOverlay, *execution.MutationCollector) (CallbackResult, error) {
 		return CallbackResult{
 			CommitFence: fence,
 			AfterCommit: func() { afterCommit.Add(1) },
@@ -181,9 +180,9 @@ func TestCallbackFenceCancellationReturnsWithoutLateCommit(t *testing.T) {
 		}, nil
 	}}
 	service, err := NewCallbackService(CallbackConfig{
-		Inbox: inbox, Store: store, Codec: callbackTestCodec{}, AllowUnboundCodec: true,
-		Resolver: callbackTestResolver{}, Group: callbackTestGroupLoader{}, Player: callbackTestPlayerLoader{},
-		Host: host, WorkerID: "worker", LeaseDuration: 300 * time.Millisecond,
+		Inbox: inbox, Store: store,
+		Resolver: callbackTestResolver{},
+		Host:     host, WorkerID: "worker", LeaseDuration: 300 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -257,13 +256,13 @@ func TestCallbackFenceHandoffUsesLastRenewedVersionWithoutTerminalRace(t *testin
 	}
 	store := newCallbackBlockingStore()
 	fence := newCallbackBlockingCommitFence()
-	host := &callbackTestHost{fn: func(context.Context, CallbackRequest, *playerstate.LocalOverlay, *MutationCollector) (CallbackResult, error) {
+	host := &callbackTestHost{fn: func(context.Context, CallbackRequest, *playerstate.LocalOverlay, *execution.MutationCollector) (CallbackResult, error) {
 		return CallbackResult{CommitFence: fence}, nil
 	}}
 	service, err := NewCallbackService(CallbackConfig{
-		Inbox: inbox, Store: store, Codec: callbackTestCodec{}, AllowUnboundCodec: true,
-		Resolver: callbackTestResolver{}, Group: callbackTestGroupLoader{}, Player: callbackTestPlayerLoader{},
-		Host: host, WorkerID: "worker", LeaseDuration: 300 * time.Millisecond,
+		Inbox: inbox, Store: store,
+		Resolver: callbackTestResolver{},
+		Host:     host, WorkerID: "worker", LeaseDuration: 300 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -330,14 +329,13 @@ func TestCallbackFenceHandoffUsesLastRenewedVersionWithoutTerminalRace(t *testin
 	}
 }
 
-func TestCallbackSQLiteA6CommitConnectionWaitBecomesAmbiguousWithoutReplay(t *testing.T) {
+func TestCallbackSQLiteCommitConnectionWaitBecomesAmbiguousWithoutReplay(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		source := defaultIntegrationKeySource()
 		db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
 			Type: "sqlite", DSN: filepath.Join(t.TempDir(), "callback-commit-wait.db"),
-			KeySource: source, DatabaseIdentity: "callback-commit-wait",
+			DatabaseIdentity: "callback-commit-wait",
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -345,7 +343,7 @@ func TestCallbackSQLiteA6CommitConnectionWaitBecomesAmbiguousWithoutReplay(t *te
 		defer db.Close()
 
 		store := eventstore.NewStore(db)
-		inbound, err := NewInboundService(store, store)
+		inbound, err := NewInboundService(store)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -371,7 +369,7 @@ func TestCallbackSQLiteA6CommitConnectionWaitBecomesAmbiguousWithoutReplay(t *te
 
 		stream := eventstore.StreamID{AggregateType: "callback-lease-test", AggregateID: "blocked-host-mutation"}
 		host := &callbackTestHost{}
-		host.fn = func(_ context.Context, _ CallbackRequest, _ *playerstate.LocalOverlay, collector *MutationCollector) (CallbackResult, error) {
+		host.fn = func(_ context.Context, _ CallbackRequest, _ *playerstate.LocalOverlay, collector *execution.MutationCollector) (CallbackResult, error) {
 			if host.calls == 1 {
 				if addErr := collector.AddStream(stream, 0, []eventstore.NewEvent{callbackEvent("callback.blocked-commit", `{"committed":true}`)}); addErr != nil {
 					return CallbackResult{}, addErr
@@ -381,9 +379,9 @@ func TestCallbackSQLiteA6CommitConnectionWaitBecomesAmbiguousWithoutReplay(t *te
 		}
 		gatedStore := newCallbackConnectionWaitStore(store)
 		service, err := NewCallbackService(CallbackConfig{
-			Inbox: store, Store: gatedStore, BoundCodec: store,
-			Resolver: callbackTestResolver{}, Group: groupstate.NewRepository(store), Player: playerstate.NewRepository(store),
-			Host: host, WorkerID: "commit-wait-worker", LeaseDuration: 300 * time.Millisecond,
+			Inbox: store, Store: gatedStore,
+			Resolver: callbackTestResolver{},
+			Host:     host, WorkerID: "commit-wait-worker", LeaseDuration: 300 * time.Millisecond,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -435,7 +433,7 @@ func TestCallbackSQLiteA6CommitConnectionWaitBecomesAmbiguousWithoutReplay(t *te
 		if err := db.GORM().Table("inbox_messages").Where("inbox_id = ?", inboxIDs[0]).Scan(&row).Error; err != nil {
 			t.Fatal(err)
 		}
-		if row.Status != eventstore.InboxStatusAmbiguous || len(row.PayloadCiphertext) != 0 {
+		if row.Status != eventstore.InboxStatusAmbiguous || len(row.Payload) == 0 {
 			t.Fatalf("blocked commit inbox row=%#v", row)
 		}
 		events, err := store.Load(ctx, stream, 0)
@@ -552,7 +550,7 @@ type callbackLeaseFenceHost struct {
 	releases    atomic.Int64
 }
 
-func (h *callbackLeaseFenceHost) HandleCallback(_ context.Context, _ CallbackRequest, _ *playerstate.LocalOverlay, collector *MutationCollector) (CallbackResult, error) {
+func (h *callbackLeaseFenceHost) HandleCallback(_ context.Context, _ CallbackRequest, _ *playerstate.LocalOverlay, collector *execution.MutationCollector) (CallbackResult, error) {
 	if h.calls.Add(1) != 1 {
 		return CallbackResult{}, nil
 	}
@@ -562,8 +560,8 @@ func (h *callbackLeaseFenceHost) HandleCallback(_ context.Context, _ CallbackReq
 	return CallbackResult{
 		CommitFence: h.fence,
 		AfterCommit: func() {
-			if !h.fence.locked.Load() {
-				panic("AfterCommit ran outside commit fence")
+			if h.fence.locked.Load() {
+				panic("AfterCommit retained commit fence")
 			}
 			h.afterCommit.Add(1)
 			h.hookOrder <- "after-commit"

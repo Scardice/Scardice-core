@@ -195,18 +195,17 @@ func (pa *PlatformAdapterWalleQ) SendToPerson(ctx *MsgContext, userID string, te
 		return
 	}
 
-	for _, i := range ctx.Dice.ExtList {
-		if i.HasOnMessageSend() {
-			i.CallOnMessageSend(ctx.Dice, ctx, &Message{
-				Platform:    "QQ",
-				Message:     text,
-				MessageType: "private",
-				Sender: SenderBase{
-					UserID:   pa.EndPoint.UserID,
-					Nickname: pa.EndPoint.Nickname,
-				},
-			}, flag)
-		}
+	if err := notifyDirectMessageSend(ctx, &Message{
+		Platform:    "QQ",
+		Message:     text,
+		MessageType: "private",
+		Sender: SenderBase{
+			UserID:   pa.EndPoint.UserID,
+			Nickname: pa.EndPoint.Nickname,
+		},
+	}, flag); err != nil {
+		ctx.setExecutionError(err)
+		return
 	}
 
 	text = textAssetsConvert(text)
@@ -227,21 +226,19 @@ func (pa *PlatformAdapterWalleQ) SendToGroup(ctx *MsgContext, groupID string, te
 		return
 	}
 
-	// 触发扩展钩子
-	if groupInfo, ok := ctx.Session.ServiceAtNew.Load(groupID); ok {
-		msgToSend := &Message{
-			Platform:    "QQ",
-			Message:     text,
-			MessageType: "group",
-			GroupID:     groupID,
-			Sender: SenderBase{
-				UserID:   pa.EndPoint.UserID,
-				Nickname: pa.EndPoint.Nickname,
-			},
-		}
-		for _, wrapper := range groupInfo.GetActivatedExtList(ctx.Dice) {
-			wrapper.CallOnMessageSend(ctx.Dice, ctx, msgToSend, flag)
-		}
+	msgToSend := &Message{
+		Platform:    "QQ",
+		Message:     text,
+		MessageType: "group",
+		GroupID:     groupID,
+		Sender: SenderBase{
+			UserID:   pa.EndPoint.UserID,
+			Nickname: pa.EndPoint.Nickname,
+		},
+	}
+	if err := notifyDirectMessageSend(ctx, msgToSend, flag); err != nil {
+		ctx.setExecutionError(err)
+		return
 	}
 
 	text = textAssetsConvert(text)

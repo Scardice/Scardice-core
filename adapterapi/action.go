@@ -104,8 +104,8 @@ type ActionRequest struct {
 	Payload    ActionPayload
 }
 
-// ActionArtifact is ephemeral action output. Callers must encrypt and persist
-// it through eventstore before returning it to an administrator.
+// ActionArtifact is ephemeral action output. Callers must persist it through
+// eventstore before returning it to an administrator.
 type ActionArtifact struct {
 	MediaType    string
 	SafeFilename string

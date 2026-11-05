@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"Scardice-core/core/execution"
 	"Scardice-core/core/playerstate"
 	"Scardice-core/eventstore"
 )
@@ -19,7 +20,7 @@ func TestCallbackCancelsInFlightRenewalBeforeJoiningHeartbeat(t *testing.T) {
 	}
 	var afterCommit atomic.Bool
 	releasedAfterCommit := make(chan bool, 1)
-	host := &callbackTestHost{fn: func(context.Context, CallbackRequest, *playerstate.LocalOverlay, *MutationCollector) (CallbackResult, error) {
+	host := &callbackTestHost{fn: func(context.Context, CallbackRequest, *playerstate.LocalOverlay, *execution.MutationCollector) (CallbackResult, error) {
 		<-inbox.started
 		return CallbackResult{
 			AfterCommit: func() { afterCommit.Store(true) },
@@ -28,9 +29,9 @@ func TestCallbackCancelsInFlightRenewalBeforeJoiningHeartbeat(t *testing.T) {
 	}}
 	store := &callbackTestStore{}
 	service, err := NewCallbackService(CallbackConfig{
-		Inbox: inbox, Store: store, Codec: callbackTestCodec{}, AllowUnboundCodec: true,
-		Resolver: callbackTestResolver{}, Group: callbackTestGroupLoader{}, Player: callbackTestPlayerLoader{},
-		Host: host, WorkerID: "worker", LeaseDuration: callbackMinimumLeaseDuration,
+		Inbox: inbox, Store: store,
+		Resolver: callbackTestResolver{},
+		Host:     host, WorkerID: "worker", LeaseDuration: callbackMinimumLeaseDuration,
 	})
 	if err != nil {
 		t.Fatal(err)

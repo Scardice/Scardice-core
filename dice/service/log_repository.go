@@ -14,7 +14,6 @@ import (
 
 	"Scardice-core/eventstore"
 	"Scardice-core/model"
-	engine "Scardice-core/utils/dboperator/engine"
 )
 
 // LogRepository is the runtime-facing log contract. A repository is bound to
@@ -58,90 +57,6 @@ type LogState struct {
 type LogStateRepository interface {
 	GetState(groupID string) (LogState, error)
 	SetState(groupID string, state LogState) error
-}
-
-type legacyLogRepository struct {
-	diceID   string
-	operator engine.DatabaseOperator
-}
-
-func NewLegacyLogRepository(operator engine.DatabaseOperator, diceID string) LogRepository {
-	if operator == nil {
-		return nil
-	}
-	return &legacyLogRepository{diceID: diceID, operator: operator}
-}
-
-func (r *legacyLogRepository) DiceID() string { return r.diceID }
-func (r *legacyLogRepository) GetOrCreate(groupID, name string) (uint64, error) {
-	return LogGetOrCreate(r.operator, groupID, name)
-}
-func (r *legacyLogRepository) List(groupID string) ([]string, error) {
-	return LogGetList(r.operator, groupID)
-}
-func (r *legacyLogRepository) Count(groupID, name string) (int64, bool) {
-	return LogLinesCountGet(r.operator, groupID, name)
-}
-func (r *legacyLogRepository) StoryLogStats(groupID, name string) (int64, error) {
-	if count, ok := LogLinesCountGet(r.operator, groupID, name); ok {
-		return count, nil
-	}
-	return 0, ErrLogNotFound
-}
-func (r *legacyLogRepository) Delete(groupID, name string) error {
-	return LogDelete(r.operator, groupID, name)
-}
-func (r *legacyLogRepository) Append(groupID, name string, item *model.LogOneItem) error {
-	if !LogAppend(r.operator, groupID, name, item) {
-		return errors.New("story log append failed")
-	}
-	return nil
-}
-func (r *legacyLogRepository) AppendByID(groupID string, logID uint64, item *model.LogOneItem) error {
-	if !LogAppendByID(r.operator, logID, groupID, item) {
-		return errors.New("story log append failed")
-	}
-	return nil
-}
-func (r *legacyLogRepository) Entries(groupID, name string) ([]*model.LogOneItem, error) {
-	return LogGetAllLines(r.operator, groupID, name)
-}
-func (r *legacyLogRepository) CommandInfo(groupID, name string) ([]string, error) {
-	return LogGetCommandInfoStrList(r.operator, groupID, name)
-}
-func (r *legacyLogRepository) LastSeq(logID uint64) (int64, error) {
-	return LogGetLastSeq(r.operator, logID)
-}
-func (r *legacyLogRepository) DeleteByRawID(groupID string, rawID interface{}) error {
-	return LogMarkDeleteByRawMsgID(r.operator, groupID, rawID)
-}
-func (r *legacyLogRepository) EditByRawID(groupID string, rawID interface{}, message string) error {
-	return LogEditByRawMsgID(r.operator, groupID, message, rawID)
-}
-func (r *legacyLogRepository) CursorEntries(groupID, name string, cursor paginator.Cursor) ([]model.LogOneItem, paginator.Cursor, error) {
-	return LogGetCursorLines(r.operator, groupID, name, cursor)
-}
-func (r *legacyLogRepository) ExportCursorEntries(groupID, name string, cursor paginator.Cursor) ([]model.LogOneItemParquet, paginator.Cursor, error) {
-	return LogGetExportCursorLines(r.operator, groupID, name, cursor)
-}
-
-func (r *legacyLogRepository) StorageInfo() ([]int, error) {
-	return LogGetInfo(r.operator)
-}
-func (r *legacyLogRepository) AllLogs() ([]*model.LogInfo, error) {
-	return LogGetLogs(r.operator)
-}
-func (r *legacyLogRepository) LogsPage(query *QueryLogPage) (int, []*model.LogInfo, error) {
-	return LogGetLogPage(r.operator, query)
-}
-func (r *legacyLogRepository) ItemsPage(groupID, name string, page, pageSize int) ([]*model.LogOneItem, error) {
-	return LogGetLinePage(r.operator, &QueryLogLinePage{GroupID: groupID, LogName: name, PageNum: page, PageSize: pageSize})
-}
-func (r *legacyLogRepository) UploadInfo(groupID, name string) (string, int64, int64, error) {
-	return LogGetUploadInfo(r.operator, groupID, name)
-}
-func (r *legacyLogRepository) SetUploadInfo(groupID, name, url string) error {
-	return LogSetUploadInfo(r.operator, groupID, name, url)
 }
 
 type eventStoreLogRepository struct {

@@ -2,10 +2,7 @@ package eventsourcing
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -224,7 +221,7 @@ customReplyCooldown: 3
 		t.Fatal(err)
 	}
 
-	source := NewLegacySourceWithKeySource(root, sqliteTargetKeySource{})
+	source := NewLegacySource(root)
 	inventory, err := source.Inventory(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -239,9 +236,9 @@ customReplyCooldown: 3
 	if !inventory.LegacyOwnershipComplete || inventory.Kind != SourceKindLegacy || len(inventory.Records) != 0 || streamed < 8 {
 		t.Fatalf("legacy inventory/stream = %#v/%d", inventory, streamed)
 	}
-	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "events.db"), sqliteTargetKeySource{})
+	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "events.db"))
 	result, err := NewImporter(ImporterOptions{
-		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old", IndexRootID: "old-index"}},
+		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old"}},
 		Source:    source, Target: target, SnapshotRoot: filepath.Join(t.TempDir(), "snapshot"), TargetIdentity: "legacy-smoke",
 	}).Run(ctx, Request{Mode: ModeImport})
 	if err != nil {
@@ -263,6 +260,14 @@ customReplyCooldown: 3
 		endpointState.Statistics != (endpoint.Statistics{GroupCount: 7, CommandCount: 84, LastCommandAt: 12345, OnlineSeconds: 789}) {
 		t.Fatalf("imported endpoint identity and statistics = %#v", endpointState)
 	}
+	if endpointState.Version != 1 || endpointState.Generation != 0 || endpointState.OperationID != "" ||
+		endpointState.OperationState != endpoint.OperationStateIdle || endpointState.PendingEffectID != "" {
+		t.Fatalf("legacy import manufactured transient endpoint lifecycle work: %#v", endpointState)
+	}
+	var operations int64
+	if err := target.database.GORM().Table("projection_read_models").Where("projection_name = ?", endpoint.OperationProjectionName).Count(&operations).Error; err != nil || operations != 0 {
+		t.Fatalf("legacy import manufactured operation read models: %d/%v", operations, err)
+	}
 
 	manager, err := managerstate.ReadProjected(ctx, target.store)
 	if err != nil || manager.Public.ServeAddress != "127.0.0.1:4321" ||
@@ -274,7 +279,7 @@ customReplyCooldown: 3
 	if err != nil {
 		t.Fatal(err)
 	}
-	auth, err := managerstate.DecodeAuth(managerSecret.Plaintext)
+	auth, err := managerstate.DecodeAuth(managerSecret.Value)
 	if err != nil || auth.UIPasswordSalt != "legacy-salt" || auth.UIPasswordHash != "legacy-hash" || len(auth.AccessTokens) != 1 || auth.AccessTokens[0] != "legacy-token" {
 		t.Fatalf("manager auth = %#v, err=%v", auth, err)
 	}
@@ -304,18 +309,18 @@ customReplyCooldown: 3
 	if err != nil {
 		t.Fatal(err)
 	}
-	attrValue, err := ds.VMValueFromJSON(attrSecret.Plaintext)
+	attrValue, err := ds.VMValueFromJSON(attrSecret.Value)
 	if err != nil {
 		t.Fatal(err)
 	}
 	attrDict, ok := attrValue.ReadDictData()
 	if !ok {
-		t.Fatalf("attrs secret=%q", attrSecret.Plaintext)
+		t.Fatalf("attrs secret=%q", attrSecret.Value)
 	}
 	hp, hpExists := attrDict.Dict.Load("hp")
 	san, sanExists := attrDict.Dict.Load("san")
 	if !hpExists || !sanExists || hp.ToString() != "60" || san.ToString() != "45" {
-		t.Fatalf("attrs secret=%q", attrSecret.Plaintext)
+		t.Fatalf("attrs secret=%q", attrSecret.Value)
 	}
 	endpointRow, err := target.store.ReadProjectionRow(ctx, endpoint.EndpointProjectionName, "legacy-onebot")
 	if err != nil {
@@ -334,8 +339,8 @@ customReplyCooldown: 3
 		t.Fatalf("projected endpoint account hint = %#v, err=%v", endpointConfig, err)
 	}
 	endpointSecret, err := target.store.ResolveSecret(ctx, "vault:legacy-default-endpoint-legacy-onebot-token", 1)
-	if err != nil || string(endpointSecret.Plaintext) != "endpoint-secret" {
-		t.Fatalf("endpoint secret=%q err=%v", endpointSecret.Plaintext, err)
+	if err != nil || string(endpointSecret.Value) != "endpoint-secret" {
+		t.Fatalf("endpoint secret=%q err=%v", endpointSecret.Value, err)
 	}
 	moderation, err := playerstate.ReadProjectedModeration(ctx, target.store, "default", "global", "QQ:bad")
 	if err != nil || moderation.Score != 42 || moderation.Rank != int(dice.BanRankBanned) || moderation.ReasonDigest == "" {
@@ -349,18 +354,11 @@ customReplyCooldown: 3
 	if err != nil {
 		t.Fatal(err)
 	}
-	mac := hmac.New(sha256.New, []byte("01234567890123456789012345678901"))
-	_, _ = mac.Write([]byte("legacy-moderation-reason/v1\x00"))
-	var reasonLength [8]byte
-	binary.BigEndian.PutUint64(reasonLength[:], uint64(len(reason)))
-	_, _ = mac.Write(reasonLength[:])
-	_, _ = mac.Write(reason)
-	if moderation.ReasonDigest != hex.EncodeToString(mac.Sum(nil)) {
+	if moderation.ReasonDigest != hex.EncodeToString(eventstore.DigestBytes("moderation-history/v1", reason)) {
 		t.Fatalf("moderation reason digest = %q", moderation.ReasonDigest)
 	}
 	stream := playerstate.ModerationStream("default", "global", "QQ:bad")
-	detailsDigest := sha256.Sum256([]byte(stream.AggregateID))
-	detailsRef := "vault:moderation-details:" + hex.EncodeToString(detailsDigest[:16])
+	detailsRef := "vault:moderation-details:" + stream.AggregateID
 	detailsSecret, err := target.store.ResolveSecret(ctx, detailsRef, 1)
 	if err != nil {
 		t.Fatalf("resolve imported moderation history: %v", err)
@@ -369,7 +367,7 @@ customReplyCooldown: 3
 		dice.BanListInfoItem
 		BanUpdatedAt int64 `json:"banUpdatedAt"`
 	}
-	if err = json.Unmarshal(detailsSecret.Plaintext, &details); err != nil {
+	if err = json.Unmarshal(detailsSecret.Value, &details); err != nil {
 		t.Fatalf("decode imported moderation history: %v", err)
 	}
 	if details.ID != "QQ:bad" || details.Name != "Bad" || details.BanUpdatedAt != 100 ||
@@ -378,12 +376,12 @@ customReplyCooldown: 3
 		t.Fatalf("imported moderation history = %#v", details)
 	}
 	mail, err := target.store.ResolveSecret(ctx, "vault:legacy-default-mail", 1)
-	if err != nil || string(mail.Plaintext) != "mail-secret" {
-		t.Fatalf("mail secret=%q err=%v", mail.Plaintext, err)
+	if err != nil || string(mail.Value) != "mail-secret" {
+		t.Fatalf("mail secret=%q err=%v", mail.Value, err)
 	}
 	story, err := target.store.ResolveSecret(ctx, "vault:legacy-default-story-log", 1)
-	if err != nil || string(story.Plaintext) != "story-secret" {
-		t.Fatalf("story secret=%q err=%v", story.Plaintext, err)
+	if err != nil || string(story.Value) != "story-secret" {
+		t.Fatalf("story secret=%q err=%v", story.Value, err)
 	}
 	plugin, err := target.store.GetPluginKV(ctx, "test-ext", "campaign")
 	if err != nil || string(plugin.Value) != `{"round":7}` {
@@ -410,12 +408,12 @@ func TestLegacyImporterReadsInstallationRelativeDataDirFromSnapshot(t *testing.T
 	writeLegacyFixtureFile(t, filepath.Join(instanceDir, "serve.yaml"), []byte("{}\n"))
 	createLegacySQLiteFixture(t, filepath.Join(instanceDir, "data.db"))
 
-	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "events.db"), sqliteTargetKeySource{})
+	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "events.db"))
 	result, err := NewImporter(ImporterOptions{
 		Readiness: &readinessFake{value: eventstore.Readiness{
-			Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old", IndexRootID: "old-index",
+			Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old",
 		}},
-		Source:         NewLegacySourceWithKeySource(root, sqliteTargetKeySource{}),
+		Source:         NewLegacySource(root),
 		Target:         target,
 		SnapshotRoot:   filepath.Join(t.TempDir(), "snapshot"),
 		TargetIdentity: "installation-relative-data-dir",
@@ -508,11 +506,14 @@ func TestRemoteSQLSourceSnapshotsIntoLocalReadOnlyImportSource(t *testing.T) {
 	if _, err = remoteDB.Exec(`UPDATE group_player_info SET name = NULL, last_command_time = NULL, auto_set_name_template = NULL, dice_side_num = NULL`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = remoteDB.Exec(`INSERT INTO group_info (id, created_at, updated_at, data) VALUES ('QQ-Group:nodata', 5, 5, NULL)`); err != nil {
+		t.Fatal(err)
+	}
 	if err = remoteDB.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	source := NewRemoteSQLSourceWithKeySource(root, eventstore.DatabaseConfig{Type: "mysql", DSN: "unused"}, sqliteTargetKeySource{})
+	source := NewRemoteSQLSource(root, eventstore.DatabaseConfig{Type: "mysql", DSN: "unused"})
 	source.open = func(context.Context, eventstore.DatabaseConfig) (*sql.DB, error) {
 		return sql.Open("sqlite", "file:"+filepath.ToSlash(remotePath)+"?mode=ro")
 	}
@@ -531,12 +532,17 @@ func TestRemoteSQLSourceSnapshotsIntoLocalReadOnlyImportSource(t *testing.T) {
 	if !ok {
 		t.Fatalf("snapshot source %T is not streaming", snapshot.Source)
 	}
+	drops := newDropRecorder(t.TempDir(), dropSourceLegacyImport, legacyDropFixedNow)
+	snapshot.Source.(interface{ bindDropRecorder(*dropRecorder) }).bindDropRecorder(drops)
 	records := 0
 	if err = streamer.StreamRecords(ctx, func(batch []SourceRecord) error {
 		records += len(batch)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if _, dropped, closeErr := drops.Close(); closeErr != nil || dropped != 1 {
+		t.Fatalf("remote NULL-data group drops = %d/%v, want 1", dropped, closeErr)
 	}
 	if inventory.Kind != SourceKindLegacy || !inventory.LegacyOwnershipComplete || records == 0 {
 		t.Fatalf("snapshot inventory/records = %#v/%d", inventory, records)
@@ -546,9 +552,14 @@ func TestRemoteSQLSourceSnapshotsIntoLocalReadOnlyImportSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var createdAt, lastCommandTime, diceSideNum int64
+	var createdAt sql.NullInt64
+	var lastCommandTime, diceSideNum int64
 	var playerName, autoSetNameTemplate string
+	var nullData bool
 	if err = snapshotDB.QueryRow(`SELECT created_at FROM group_info WHERE id = 'QQ-Group:100'`).Scan(&createdAt); err != nil {
+		t.Fatal(err)
+	}
+	if err = snapshotDB.QueryRow(`SELECT data IS NULL FROM group_info WHERE id = 'QQ-Group:nodata'`).Scan(&nullData); err != nil {
 		t.Fatal(err)
 	}
 	if err = snapshotDB.QueryRow(`SELECT name, last_command_time, auto_set_name_template, dice_side_num FROM group_player_info WHERE user_id = 'QQ:200'`).
@@ -558,8 +569,8 @@ func TestRemoteSQLSourceSnapshotsIntoLocalReadOnlyImportSource(t *testing.T) {
 	if err = snapshotDB.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if createdAt != 0 || playerName != "" || lastCommandTime != 0 || autoSetNameTemplate != "" || diceSideNum != 0 {
-		t.Fatalf("normalized remote NULL values = %d/%q/%d/%q/%d", createdAt, playerName, lastCommandTime, autoSetNameTemplate, diceSideNum)
+	if createdAt.Valid || !nullData || playerName != "" || lastCommandTime != 0 || autoSetNameTemplate != "" || diceSideNum != 0 {
+		t.Fatalf("remote snapshot NULL values = created_at:%v data-null:%t player:%q/%d/%q/%d", createdAt, nullData, playerName, lastCommandTime, autoSetNameTemplate, diceSideNum)
 	}
 
 	database, err := sql.Open("sqlite", remotePath)
@@ -634,5 +645,65 @@ func TestLegacyGoCQReverseConfigMigratesToListenerRuntime(t *testing.T) {
 	}
 	if runtime == nil {
 		t.Fatal("new migrated reverse runtime returned nil")
+	}
+}
+
+// A remote group_info table without updated_at imports like the local one
+// does: the missing column reads as NULL, so v150's updated_at rule never
+// applies and no group is dropped or rejected.
+func TestRemoteSQLSourceSnapshotToleratesGroupInfoWithoutUpdatedAt(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(t.TempDir(), "data")
+	instanceDir := filepath.Join(root, "default")
+	if err := os.MkdirAll(instanceDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeLegacyFixtureFile(t, filepath.Join(root, "dice.yaml"), []byte("diceConfigs:\n  - name: default\n    dataDir: data/default\n"))
+	writeLegacyFixtureFile(t, filepath.Join(instanceDir, "serve.yaml"), []byte("{}\n"))
+	remotePath := filepath.Join(t.TempDir(), "remote.db")
+	createLegacySQLiteFixture(t, remotePath)
+	remoteDB, err := sql.Open("sqlite", remotePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = remoteDB.Exec(`ALTER TABLE group_info DROP COLUMN updated_at`); err != nil {
+		t.Fatal(err)
+	}
+	if err = remoteDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	source := NewRemoteSQLSource(root, eventstore.DatabaseConfig{Type: "mysql", DSN: "unused"})
+	source.open = func(context.Context, eventstore.DatabaseConfig) (*sql.DB, error) {
+		return sql.Open("sqlite", "file:"+filepath.ToSlash(remotePath)+"?mode=ro")
+	}
+	snapshot, err := source.Snapshot(ctx, filepath.Join(t.TempDir(), "snapshot"))
+	if err != nil {
+		t.Fatalf("remote group_info without updated_at was rejected: %v", err)
+	}
+	drops := newDropRecorder(t.TempDir(), dropSourceLegacyImport, legacyDropFixedNow)
+	snapshot.Source.(interface{ bindDropRecorder(*dropRecorder) }).bindDropRecorder(drops)
+	groupCreated := 0
+	if err = snapshot.Source.(RecordStreamer).StreamRecords(ctx, func(batch []SourceRecord) error {
+		for _, record := range batch {
+			if record.Kind == string(groupstate.EventGroupCreated) {
+				groupCreated++
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, dropped, closeErr := drops.Close(); closeErr != nil || dropped != 0 || groupCreated != 1 {
+		t.Fatalf("imported groups/drops = %d/%d (%v), want 1/0", groupCreated, dropped, closeErr)
+	}
+	snapshotDB, err := sql.Open("sqlite", filepath.Join(snapshot.Root, "default", "data.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshotDB.Close()
+	var updatedAt sql.NullInt64
+	if err = snapshotDB.QueryRow(`SELECT updated_at FROM group_info WHERE id = 'QQ-Group:100'`).Scan(&updatedAt); err != nil || updatedAt.Valid {
+		t.Fatalf("snapshot updated_at = %v/%v, want NULL", updatedAt, err)
 	}
 }

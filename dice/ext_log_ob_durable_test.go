@@ -3,6 +3,7 @@ package dice
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"reflect"
@@ -10,12 +11,13 @@ import (
 	"time"
 
 	"Scardice-core/adapterapi"
+	"Scardice-core/core/configstate"
 	"Scardice-core/core/groupstate"
 	"Scardice-core/core/messageflow"
 	"Scardice-core/core/playerstate"
 	endpointcore "Scardice-core/endpoint"
 	"Scardice-core/eventstore"
-	"Scardice-core/message"
+	"Scardice-core/projectionset"
 )
 
 const (
@@ -28,12 +30,13 @@ type durableOBHarness struct {
 	ctx      context.Context
 	dice     *Dice
 	endpoint *EndPointInfo
-	keys     groupCardSQLiteKeySource
 	dsn      string
 	database *eventstore.Database
 	store    *eventstore.GORMStore
 	inbound  *messageflow.InboundService
 	callback *messageflow.CallbackService
+	fence    endpointcore.State
+	baseline struct{ operations, effects int64 }
 	sequence int
 }
 
@@ -45,8 +48,7 @@ func newDurableOBHarness(t *testing.T) *durableOBHarness {
 
 	harness := &durableOBHarness{
 		t: t, ctx: ctx, dice: d, endpoint: endpoint,
-		keys: groupCardSQLiteKeySource{},
-		dsn:  filepath.Join(t.TempDir(), "durable-ob.db"),
+		dsn: filepath.Join(t.TempDir(), "durable-ob.db"),
 	}
 	harness.database = harness.openDatabase()
 	t.Cleanup(func() {
@@ -54,16 +56,33 @@ func newDurableOBHarness(t *testing.T) *durableOBHarness {
 			_ = harness.database.Close()
 		}
 	})
-	harness.store = eventstore.NewStore(harness.database, eventstore.WithKeySource(harness.keys))
+	options := projectionset.StoreOptions()
+	harness.store = eventstore.NewStore(harness.database, options...)
 	if err := harness.store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "durable-ob-test",
-		IndexRootID: "card-index-v1", EncryptionRootIDs: []string{"card-root-v1"},
-		SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "durable-ob-test",
 		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	d.DurableStore = harness.store
+	baseline := configstate.Baseline{
+		DiceID: d.BaseConfig.Name, ConfigVersion: 1, CommandPrefix: []string{"."},
+	}
+	if _, err := configstate.NewRepository(harness.store).DecideAndAppend(
+		ctx, configstate.State{}, 0, eventstore.Metadata{},
+		configstate.Command{Kind: configstate.CommandImportBaseline, Baseline: &baseline},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ReloadConfigView(ctx); err != nil {
+		t.Fatal(err)
+	}
+	d.AttrsManager.Stop()
+	d.AttrsManager = &AttrsManager{}
+	if err := d.AttrsManager.InitDurable(d); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.AttrsManager.Stop)
 
 	resolver := groupCardSQLiteResolver{snapshot: messageflow.EndpointSnapshot{
 		EndpointID: adapterapi.EndpointID(endpoint.ID), AdapterKey: OnebotAdapterKey,
@@ -73,13 +92,15 @@ func newDurableOBHarness(t *testing.T) *durableOBHarness {
 			adapterapi.ActionKindSendMessage,
 			adapterapi.ActionKindSetGroupCard,
 		),
-		IndexRootID: "card-index-v1", IndexSigner: groupCardSQLiteIndexSigner{},
 	}}
-	outbound, err := messageflow.NewOutboundService(harness.store, resolver, harness.store, eventstore.UUIDGenerator{})
+	ids := &canonicalFixtureIDs{prefix: canonicalFixtureLabel(t, "durable-ob-outbound")}
+	outbound, err := messageflow.NewOutboundService(harness.store, resolver, ids)
 	if err != nil {
 		t.Fatal(err)
 	}
-	d.OutboundBridge = NewDurableOutboundBridge(outbound, resolver, eventstore.UUIDGenerator{})
+	d.OutboundBridge = NewDurableOutboundBridge(outbound, resolver, ids, newBridgeTestNotificationOwner(t))
+	harness.fence = projectCallbackTestEndpoint(t, d, harness.store, endpoint).state
+	_, harness.baseline.operations, harness.baseline.effects = groupCardSQLiteRowCounts(t, harness.database)
 
 	metadata := eventstore.Metadata{
 		CommandID: "seed-durable-ob", CorrelationID: "seed-durable-ob",
@@ -100,15 +121,14 @@ func newDurableOBHarness(t *testing.T) *durableOBHarness {
 		t.Fatal(err)
 	}
 
-	harness.inbound, err = messageflow.NewInboundService(harness.store, harness.store)
+	harness.inbound, err = messageflow.NewInboundService(harness.store)
 	if err != nil {
 		t.Fatal(err)
 	}
 	harness.callback, err = messageflow.NewCallbackService(messageflow.CallbackConfig{
-		Inbox: harness.store, Store: harness.store, BoundCodec: harness.store,
+		Inbox: harness.store, Store: harness.store,
 		Resolver: NewDurableCallbackScopeResolver(d),
-		Group:    groupRepository, Player: playerRepository,
-		Host: NewDurableCallbackHost(d), WorkerID: "durable-ob-worker",
+		Host:     NewDurableCallbackHost(d), WorkerID: "durable-ob-worker",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -119,7 +139,7 @@ func newDurableOBHarness(t *testing.T) *durableOBHarness {
 func (h *durableOBHarness) openDatabase() *eventstore.Database {
 	h.t.Helper()
 	database, err := eventstore.OpenDatabase(h.ctx, eventstore.DatabaseConfig{
-		Type: "sqlite", DSN: h.dsn, KeySource: h.keys, DatabaseIdentity: "durable-ob-test",
+		Type: "sqlite", DSN: h.dsn, DatabaseIdentity: "durable-ob-test",
 	})
 	if err != nil {
 		h.t.Fatal(err)
@@ -136,7 +156,7 @@ func (h *durableOBHarness) processInbound(command, senderRole string, segments [
 	h.sequence++
 	providerEventID := fmt.Sprintf("provider-ob-%d", h.sequence)
 	receipt, err := h.inbound.HandleInbound(h.ctx, endpointcore.FencedInbound{
-		EndpointID: adapterapi.EndpointID(h.endpoint.ID), Generation: 1, DesiredVersion: 1,
+		EndpointID: h.fence.EndpointID, Generation: h.fence.Generation, DesiredVersion: h.fence.DesiredVersion,
 		Message: adapterapi.InboundMessage{
 			ProviderEventID:  adapterapi.ProviderEventID(providerEventID),
 			MessageID:        adapterapi.MessageID(providerEventID + "-message"),
@@ -175,6 +195,14 @@ func (h *durableOBHarness) playerByID(userID string) playerstate.PlayerState {
 	return state
 }
 
+// outboundRowsSinceSeed reports operation/effect rows added after the fixture
+// projected its endpoint (endpoint lifecycle operations are fixture setup).
+func (h *durableOBHarness) outboundRowsSinceSeed() (operations, effects int64) {
+	h.t.Helper()
+	_, operations, effects = groupCardSQLiteRowCounts(h.t, h.database)
+	return operations - h.baseline.operations, effects - h.baseline.effects
+}
+
 func (h *durableOBHarness) reopen() {
 	h.t.Helper()
 	database := h.database
@@ -183,8 +211,9 @@ func (h *durableOBHarness) reopen() {
 		h.t.Fatal(err)
 	}
 	h.database = h.openDatabase()
-	h.store = eventstore.NewStore(h.database, eventstore.WithKeySource(h.keys))
-	if err := h.store.ValidateReadiness(h.ctx); err != nil {
+	options := projectionset.StoreOptions()
+	h.store = eventstore.NewStore(h.database, options...)
+	if _, err := h.store.GetReadiness(h.ctx); err != nil {
 		h.t.Fatalf("validate reopened durable store: %v", err)
 	}
 	h.dice.DurableStore = h.store
@@ -193,26 +222,26 @@ func (h *durableOBHarness) reopen() {
 func (h *durableOBHarness) outboundEffects() []adapterapi.OutboundEffect {
 	h.t.Helper()
 	var rows []struct {
-		EffectID          string `gorm:"column:effect_id"`
-		EndpointID        string `gorm:"column:endpoint_id"`
-		PayloadCiphertext []byte `gorm:"column:payload_ciphertext"`
-		PayloadNonce      []byte `gorm:"column:payload_nonce"`
-		EncryptionKeyID   string `gorm:"column:encryption_key_id"`
+		EffectID   string `gorm:"column:effect_id"`
+		EndpointID string `gorm:"column:endpoint_id"`
+		Subject    string `gorm:"column:subject"`
+		Payload    []byte `gorm:"column:payload"`
 	}
 	if err := h.database.GORM().Table("outbox_effects").Order("effect_id").Find(&rows).Error; err != nil {
 		h.t.Fatal(err)
 	}
 	effects := make([]adapterapi.OutboundEffect, 0, len(rows))
 	for _, row := range rows {
-		plain, err := h.store.DecryptBound(h.ctx, "outbox/v1", row.EffectID, row.EndpointID, 1, row.PayloadCiphertext, row.PayloadNonce, row.EncryptionKeyID)
-		if err != nil {
-			h.t.Fatalf("decrypt outbound effect %q after reopen: %v", row.EffectID, err)
-		}
 		var wire struct {
 			Effect adapterapi.OutboundEffect `json:"effect"`
 		}
-		if err := json.Unmarshal(plain, &wire); err != nil {
+		if err := json.Unmarshal(row.Payload, &wire); err != nil {
 			h.t.Fatal(err)
+		}
+		// Every harness callback originates in obTestGroupID, even when it
+		// sends a private reply or targets another group.
+		if string(wire.Effect.ID) != row.EffectID || string(wire.Effect.EndpointID) != row.EndpointID || row.Subject != obTestGroupID {
+			h.t.Fatalf("persisted observer effect identity mismatch: row=%#v effect=%#v", row, wire.Effect)
 		}
 		effects = append(effects, wire.Effect)
 	}
@@ -294,9 +323,6 @@ func TestDurableCallbackOBDelegateLoadsAndPersistsTargetPlayerAcrossRestart(t *t
 		},
 	); err != nil {
 		t.Fatal(err)
-	}
-	if group, exists := harness.dice.ImSession.ServiceAtNew.Load(obTestGroupID); exists && group.Players.Exists(targetUserID) {
-		t.Fatal("durable target player unexpectedly preloaded into compatibility cache")
 	}
 
 	delegated := func(command string) {
@@ -382,60 +408,42 @@ func TestDurableOBDelegateStagesTargetCardInCallbackCollector(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	transaction, err := NewDurableCallbackTransaction(harness.store, collector)
+	endpointValue := *harness.endpoint
+	endpointValue.Adapter = nil
+	endpointValue.Session = harness.dice.ImSession
+	endpoint := &endpointValue
+	root := newCanonicalTestRoot(t, harness.dice, "durable-ob-delegate")
+	msg := newGroupMsg(obTestGroupID, obTestUserID, ".ob [CQ:at,qq=2002]")
+	msg.Sender.Nickname = "Admin"
+	msg.Sender.GroupRole = "admin"
+	ctx, err := NewDomainMsgContext(root.Transaction, harness.dice, harness.dice.ImSession, endpoint, msg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	endpoint := compatibilityCallbackEndpoint(harness.dice.ImSession, messageflow.CallbackRequest{
-		EndpointID: harness.endpoint.ID,
-		Message: adapterapi.InboundMessage{
-			Platform: "QQ",
-			Target:   harness.endpoint.UserID,
-		},
-	})
-	if endpoint.Adapter != nil {
-		t.Fatal("delegated callback fixture unexpectedly has a legacy adapter")
-	}
-
-	sender := &GroupPlayerInfo{UserID: obTestUserID, Name: "Admin"}
-	target := &GroupPlayerInfo{UserID: targetUserID, Name: "Target"}
-	group := &GroupInfo{GroupID: obTestGroupID, Players: new(SyncMap[string, *GroupPlayerInfo])}
-	group.Players.Store(sender.UserID, sender)
-	group.Players.Store(target.UserID, target)
-	ctx := &MsgContext{
-		Dice: harness.dice, Session: harness.dice.ImSession, EndPoint: endpoint,
-		Group: group, Player: sender, MessageType: "group", PrivilegeLevel: 50,
-		callbackTransaction: transaction,
-		callbackMetadata: eventstore.Metadata{
-			CommandID: "durable-ob-delegate", CorrelationID: "durable-ob-delegate",
-			OccurredAt: time.Unix(10, 0).UTC(),
-		},
-	}
-	msg := &Message{
-		Platform: "QQ", MessageType: "group", GroupID: obTestGroupID,
-		Sender:  SenderBase{UserID: sender.UserID, Nickname: sender.Name},
-		Message: ".ob [CQ:at,qq=2002]",
-	}
+	defer ctx.releaseExecutionState()
+	ctx.PrivilegeLevel = 50
 	extension := harness.dice.ExtFind("log", false)
 	if extension == nil || extension.GetCmdMap()["ob"] == nil {
 		t.Fatal("built-in observer command is unavailable")
 	}
-	result := extension.GetCmdMap()["ob"].Solve(ctx, msg, &CmdArgs{At: []*AtInfo{{UserID: target.UserID}}})
+	result := extension.GetCmdMap()["ob"].Solve(ctx, msg, &CmdArgs{At: []*AtInfo{{UserID: targetUserID}}})
 	if !result.Matched || !result.Solved {
 		t.Fatalf("delegated .ob result = %#v", result)
 	}
-	if target.Name != "obTarget" {
-		t.Fatalf("delegated player name = %q, want %q", target.Name, "obTarget")
-	}
-	if _, operations, effects := groupCardSQLiteRowCounts(t, harness.database); operations != 0 || effects != 0 {
-		t.Fatalf("delegated .ob persisted outside callback collector: operations=%d effects=%d", operations, effects)
-	}
-	if err := transaction.Finalize(harness.ctx); err != nil {
+	target, err := root.Transaction.Domain().Player(harness.ctx, harness.dice.BaseConfig.Name, obTestGroupID, targetUserID)
+	if err != nil {
 		t.Fatal(err)
 	}
-
-	work, err := collector.UnitOfWork()
+	if target.Name() != "obTarget" {
+		t.Fatalf("delegated player name = %q, want %q", target.Name(), "obTarget")
+	}
+	if operations, effects := harness.outboundRowsSinceSeed(); operations != 0 || effects != 0 {
+		t.Fatalf("delegated .ob persisted outside callback collector: operations=%d effects=%d", operations, effects)
+	}
+	if err := root.Transaction.Finalize(harness.ctx); err != nil {
+		t.Fatal(err)
+	}
+	work, err := root.Collector.UnitOfWork()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,17 +452,10 @@ func TestDurableOBDelegateStagesTargetCardInCallbackCollector(t *testing.T) {
 	}
 	var cardEffects int
 	for _, pending := range work.Effects {
-		plain, err := harness.store.DecryptBound(
-			harness.ctx, "outbox/v1", pending.EffectID, pending.EndpointID, 1,
-			pending.PayloadCiphertext, pending.PayloadNonce, pending.PayloadEncryptionKeyID,
-		)
-		if err != nil {
-			t.Fatal(err)
-		}
 		var wire struct {
 			Effect adapterapi.OutboundEffect `json:"effect"`
 		}
-		if err := json.Unmarshal(plain, &wire); err != nil {
+		if err := json.Unmarshal(pending.Payload, &wire); err != nil {
 			t.Fatal(err)
 		}
 		if wire.Effect.Payload.Kind != adapterapi.EffectPayloadSetGroupCard {
@@ -463,7 +464,7 @@ func TestDurableOBDelegateStagesTargetCardInCallbackCollector(t *testing.T) {
 		cardEffects++
 		payload := wire.Effect.Payload
 		if payload.Card != "obTarget" || payload.Target.Conversation != adapterapi.ConversationID(obTestGroupID) ||
-			payload.Target.Member != adapterapi.PrincipalID(target.UserID) {
+			payload.Target.Member != adapterapi.PrincipalID(targetUserID) {
 			t.Fatalf("delegated observer card effect = %#v", wire.Effect)
 		}
 	}
@@ -485,10 +486,10 @@ func TestDurableOBDelegateStagesTargetCardInCallbackCollector(t *testing.T) {
 	if !targetStaged {
 		t.Fatal("delegated callback did not stage the target player stream")
 	}
-	if _, err := harness.store.Commit(harness.ctx, work); err == nil {
-		t.Fatal("delegated callback conflict unexpectedly committed")
+	if _, err := harness.store.Commit(harness.ctx, work); !errors.Is(err, eventstore.ErrConflict) {
+		t.Fatalf("delegated callback conflict error = %v, want conflict", err)
 	}
-	if _, operations, effects := groupCardSQLiteRowCounts(t, harness.database); operations != 0 || effects != 0 {
+	if operations, effects := harness.outboundRowsSinceSeed(); operations != 0 || effects != 0 {
 		t.Fatalf("failed delegated callback left durable outbound rows: operations=%d effects=%d", operations, effects)
 	}
 	if state := harness.playerByID(targetUserID); state.Name != "Target" || state.Version != 1 {
@@ -503,83 +504,5 @@ func TestDurableOBDelegateStagesTargetCardInCallbackCollector(t *testing.T) {
 	bridge.mu.Unlock()
 	if pendingNotifications != 0 {
 		t.Fatalf("failed delegated callback registered %d outbound notifications", pendingNotifications)
-	}
-}
-
-type obCardUpdate struct {
-	userID string
-	name   string
-}
-
-type obCardCaptureAdapter struct {
-	*mockPlatformAdapter
-	updates []obCardUpdate
-}
-
-func (a *obCardCaptureAdapter) SetGroupCardName(ctx *MsgContext, name string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.updates = append(a.updates, obCardUpdate{userID: ctx.Player.UserID, name: name})
-}
-
-func (a *obCardCaptureAdapter) cardUpdates() []obCardUpdate {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return append([]obCardUpdate(nil), a.updates...)
-}
-
-func TestLegacyOBEnterAndExitUsesAdapterCardUpdates(t *testing.T) {
-	d, endpoint, adapter, cleanup := newExecuteNewTestDice(t)
-	defer cleanup()
-	capture := &obCardCaptureAdapter{mockPlatformAdapter: adapter}
-	endpoint.Adapter = capture
-
-	d.ImSession.ExecuteNew(endpoint, newGroupMsg("QQ-Group:legacy-ob", "QQ:1001", ".ob"))
-	if reply, ok := capture.waitForMsg(2 * time.Second); !ok {
-		t.Fatal("timeout waiting for .ob reply")
-	} else if reply != "你将成为观众（自动修改昵称和群名片[如有权限]，并不会给观众发送暗骰结果）。" {
-		t.Fatalf(".ob reply = %q", reply)
-	}
-
-	d.ImSession.ExecuteNew(endpoint, newGroupMsg("QQ-Group:legacy-ob", "QQ:1001", ".ob exit"))
-	if reply, ok := capture.waitForMsg(2 * time.Second); !ok {
-		t.Fatal("timeout waiting for .ob exit reply")
-	} else if reply != "你不再是观众了（自动修改昵称和群名片[如有权限]）。" {
-		t.Fatalf(".ob exit reply = %q", reply)
-	}
-
-	if updates, want := capture.cardUpdates(), []obCardUpdate{{userID: "QQ:1001", name: "obTester"}, {userID: "QQ:1001", name: "Tester"}}; !reflect.DeepEqual(updates, want) {
-		t.Fatalf("legacy observer card updates = %#v, want %#v", updates, want)
-	}
-}
-
-func TestLegacyOBDelegateUsesTargetPlayerContextForCardUpdate(t *testing.T) {
-	d, endpoint, adapter, cleanup := newExecuteNewTestDice(t)
-	defer cleanup()
-	capture := &obCardCaptureAdapter{mockPlatformAdapter: adapter}
-	endpoint.Adapter = capture
-
-	const groupID = "QQ-Group:legacy-ob-delegate"
-	targetMessage := newGroupMsg(groupID, "QQ:2002", ".r 1d1")
-	targetMessage.Sender.Nickname = "Target"
-	d.ImSession.ExecuteNew(endpoint, targetMessage)
-	if _, ok := capture.waitForMsg(2 * time.Second); !ok {
-		t.Fatal("timeout seeding delegated observer player")
-	}
-
-	delegated := newGroupMsg(groupID, "QQ:1001", ".ob [CQ:at,qq=2002]")
-	delegated.Sender.Nickname = "Admin"
-	delegated.Sender.GroupRole = "admin"
-	delegated.Segment = []message.IMessageElement{
-		&message.TextElement{Content: ".ob "},
-		&message.AtElement{Target: "2002"},
-	}
-	d.ImSession.ExecuteNew(endpoint, delegated)
-	if _, ok := capture.waitForMsg(2 * time.Second); !ok {
-		t.Fatal("timeout waiting for delegated .ob reply")
-	}
-
-	if updates, want := capture.cardUpdates(), []obCardUpdate{{userID: "QQ:2002", name: "obTarget"}}; !reflect.DeepEqual(updates, want) {
-		t.Fatalf("delegated observer card updates = %#v, want %#v", updates, want)
 	}
 }

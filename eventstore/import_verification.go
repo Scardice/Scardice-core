@@ -2,10 +2,10 @@ package eventstore
 
 import (
 	"context"
-	"crypto/hmac"
 	"crypto/sha256"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const importVerificationPageSize = MaxUnitOfWorkEvents
@@ -24,27 +24,26 @@ type ImportVerificationEvent struct {
 	PayloadSize   uint64
 }
 
-// ImportVerificationSecret contains one decrypted adapter secret. Plaintext is
-// valid only during the visitor call and is cleared immediately afterwards.
+// ImportVerificationSecret contains one persisted plaintext adapter secret.
+// Value is valid only during the visitor call and is cleared immediately afterwards.
 type ImportVerificationSecret struct {
 	SecretRef     string
 	SecretVersion uint64
 	EndpointID    string
 	AdapterID     string
-	Plaintext     []byte
+	Value         []byte
 }
 
-// ImportVerificationVisitor receives a consistent, integrity-checked view of
-// the records whose plaintext cannot be validated through SQL alone.
+// ImportVerificationVisitor compares actual persisted contents during offline
+// conversion. Values are borrowed for the duration of their callback.
 type ImportVerificationVisitor struct {
 	Event    func(ImportVerificationEvent) error
 	Secret   func(ImportVerificationSecret) error
 	PluginKV func(PluginKVItem) error
 }
 
-// VisitImportVerification validates readiness once, holds one consistent read
-// transaction, and visits persisted events and encrypted values in bounded
-// pages. It avoids per-record readiness, transaction, and key-file lookups.
+// VisitImportVerification reads one consistent snapshot in bounded pages and
+// verifies event checksums before passing actual plaintext contents to callers.
 func (s *GORMStore) VisitImportVerification(ctx context.Context, visitor ImportVerificationVisitor) error {
 	if s == nil || s.db == nil || s.db.GORM() == nil {
 		return ErrParticipantFailure
@@ -55,47 +54,27 @@ func (s *GORMStore) VisitImportVerification(ctx context.Context, visitor ImportV
 	if err := s.requireReady(ctx); err != nil {
 		return err
 	}
-	tx := s.db.GORM().WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return ErrParticipantFailure
-	}
-	defer tx.Rollback()
-	if err := s.lockMutationPublication(ctx, tx); err != nil {
-		return err
-	}
-	readiness, err := readinessFromDB(ctx, tx)
-	if err != nil {
-		return err
-	}
-	admittedRoots := make(map[string]struct{}, len(readiness.EncryptionRootIDs))
-	for _, rootID := range readiness.EncryptionRootIDs {
-		admittedRoots[rootID] = struct{}{}
-	}
-	roots := newStoryLogImportRootCache()
-	defer roots.clear()
-
-	if visitor.Event != nil {
-		if err := visitImportVerificationEvents(ctx, tx, visitor.Event); err != nil {
+	return s.db.ReadSnapshot(ctx, func(tx *gorm.DB) error {
+		if _, err := readPublishedProjectionControl(tx); err != nil {
 			return err
 		}
-	}
-	if visitor.Secret != nil {
-		if err := s.visitImportVerificationSecrets(ctx, tx, admittedRoots, roots, visitor.Secret); err != nil {
-			return err
+		if visitor.Event != nil {
+			if err := visitImportVerificationEvents(ctx, tx, visitor.Event); err != nil {
+				return err
+			}
 		}
-	}
-	if visitor.PluginKV != nil {
-		_, material, err := keySourceIndex(ctx, s.keySource)
-		if err != nil {
-			return err
+		if visitor.Secret != nil {
+			if err := visitImportVerificationSecrets(ctx, tx, visitor.Secret); err != nil {
+				return err
+			}
 		}
-		indexMaterial := append([]byte(nil), material...)
-		defer clear(indexMaterial)
-		if err := s.visitImportVerificationPluginKV(ctx, tx, admittedRoots, roots, indexMaterial, visitor.PluginKV); err != nil {
-			return err
+		if visitor.PluginKV != nil {
+			if err := visitImportVerificationPluginKV(ctx, tx, visitor.PluginKV); err != nil {
+				return err
+			}
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 func visitImportVerificationEvents(ctx context.Context, tx *gorm.DB, visit func(ImportVerificationEvent) error) error {
@@ -150,11 +129,9 @@ func visitImportVerificationEvents(ctx context.Context, tx *gorm.DB, visit func(
 	}
 }
 
-func (s *GORMStore) visitImportVerificationSecrets(
+func visitImportVerificationSecrets(
 	ctx context.Context,
 	tx *gorm.DB,
-	admittedRoots map[string]struct{},
-	roots *storyLogImportRootCache,
 	visit func(ImportVerificationSecret) error,
 ) error {
 	var cursorRef string
@@ -163,7 +140,7 @@ func (s *GORMStore) visitImportVerificationSecrets(
 	for {
 		query := tx.WithContext(ctx).Order("secret_ref ASC, secret_version ASC").Limit(importVerificationPageSize)
 		if hasCursor {
-			query = query.Where("secret_ref > ? OR (secret_ref = ? AND secret_version > ?)", cursorRef, cursorRef, cursorVersion)
+			query = query.Where("secret_ref > ? OR (secret_ref = ? AND secret_version > ?)", []byte(cursorRef), []byte(cursorRef), cursorVersion)
 		}
 		var rows []adapterSecretRow
 		if err := query.Find(&rows).Error; err != nil {
@@ -173,25 +150,11 @@ func (s *GORMStore) visitImportVerificationSecrets(
 			return nil
 		}
 		for _, row := range rows {
-			if len(row.Ciphertext) > MaxSecretBytes+16 {
-				return &OversizeError{Bound: "encrypted secret bytes", Limit: MaxSecretBytes + 16, Actual: len(row.Ciphertext)}
+			if len(row.Value) > MaxSecretBytes {
+				return &OversizeError{Bound: "secret bytes", Limit: MaxSecretBytes, Actual: len(row.Value)}
 			}
-			if len(row.Nonce) != 12 {
-				return ErrInvalidMetadata
-			}
-			if _, ok := admittedRoots[row.EncryptionKeyID]; !ok {
-				return ErrKeyUnavailable
-			}
-			plain, err := s.openA6WithRootCache(ctx, roots, "adapter-secret/v1", row.SecretRef, row.EndpointID+"/"+row.AdapterID, row.SecretVersion, row.EncryptionKeyID, row.Ciphertext, row.Nonce)
-			if err != nil {
-				return ErrAuthenticationFailed
-			}
-			if len(plain) > MaxSecretBytes {
-				clear(plain)
-				return &OversizeError{Bound: "secret bytes", Limit: MaxSecretBytes, Actual: len(plain)}
-			}
-			visitErr := visit(ImportVerificationSecret{SecretRef: row.SecretRef, SecretVersion: row.SecretVersion, EndpointID: row.EndpointID, AdapterID: row.AdapterID, Plaintext: plain})
-			clear(plain)
+			visitErr := visit(ImportVerificationSecret{SecretRef: row.SecretRef, SecretVersion: row.SecretVersion, EndpointID: row.EndpointID, AdapterID: row.AdapterID, Value: row.Value})
+			clear(row.Value)
 			if visitErr != nil {
 				return visitErr
 			}
@@ -204,21 +167,16 @@ func (s *GORMStore) visitImportVerificationSecrets(
 	}
 }
 
-func (s *GORMStore) visitImportVerificationPluginKV(
-	ctx context.Context,
-	tx *gorm.DB,
-	admittedRoots map[string]struct{},
-	roots *storyLogImportRootCache,
-	indexMaterial []byte,
-	visit func(PluginKVItem) error,
-) error {
-	var cursorExtension string
-	var cursorKey []byte
+func visitImportVerificationPluginKV(ctx context.Context, tx *gorm.DB, visit func(PluginKVItem) error) error {
+	var cursorExtension, cursorKey string
 	hasCursor := false
 	for {
-		query := tx.WithContext(ctx).Order("extension_id ASC, key_hmac ASC").Limit(importVerificationPageSize)
+		query := orderPluginKeys(tx.WithContext(ctx).Order(clause.OrderByColumn{Column: clause.Column{Name: "extension_id"}})).Limit(importVerificationPageSize)
 		if hasCursor {
-			query = query.Where("extension_id > ? OR (extension_id = ? AND key_hmac > ?)", cursorExtension, cursorExtension, cursorKey)
+			query = query.Where(clause.Or(
+				clause.Gt{Column: clause.Column{Name: "extension_id"}, Value: []byte(cursorExtension)},
+				clause.And(clause.Eq{Column: clause.Column{Name: "extension_id"}, Value: []byte(cursorExtension)}, clause.Gt{Column: clause.Column{Name: "key"}, Value: []byte(cursorKey)}),
+			))
 		}
 		var rows []pluginKVRow
 		if err := query.Find(&rows).Error; err != nil {
@@ -228,50 +186,18 @@ func (s *GORMStore) visitImportVerificationPluginKV(
 			return nil
 		}
 		for _, row := range rows {
-			if row.ValueSize < 0 || row.ValueSize > MaxPluginValueBytes {
-				return &OversizeError{Bound: "plugin value bytes", Limit: MaxPluginValueBytes, Actual: int(row.ValueSize)}
-			}
-			if len(row.EncryptedKey) > MaxPluginKeyBytes+16 || len(row.EncryptedValue) > MaxPluginValueBytes+16 {
-				return ErrOversizeInput
-			}
-			if len(row.KeyNonce) != 12 || len(row.ValueNonce) != 12 {
+			if len(row.ExtensionID) == 0 || len(row.ExtensionID) > MaxPluginExtensionBytes || len(row.Key) > MaxPluginKeyBytes || len(row.Value) > MaxPluginValueBytes {
 				return ErrInvalidMetadata
 			}
-			if _, ok := admittedRoots[row.EncryptionKeyID]; !ok {
-				return ErrKeyUnavailable
+			item := PluginKVItem{ExtensionID: row.ExtensionID, Key: row.Key, Value: row.Value, Version: row.RowVersion}
+			if err := visit(item); err != nil {
+				clear(item.Value)
+				return err
 			}
-			key, err := s.openA6WithRootCache(ctx, roots, "plugin-kv-key/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedKey, row.KeyNonce)
-			if err != nil {
-				return ErrAuthenticationFailed
-			}
-			value, err := s.openA6WithRootCache(ctx, roots, "plugin-kv-value/v1", string(row.KeyHMAC), row.ExtensionID, row.RowVersion, row.EncryptionKeyID, row.EncryptedValue, row.ValueNonce)
-			if err != nil {
-				clear(key)
-				return ErrAuthenticationFailed
-			}
-			if len(row.ExtensionID) == 0 || len(row.ExtensionID) > MaxPluginExtensionBytes || len(key) > MaxPluginKeyBytes || len(value) > MaxPluginValueBytes || int64(len(value)) != row.ValueSize {
-				clear(key)
-				clear(value)
-				return ErrInvalidMetadata
-			}
-			expected, err := privacyHMACWithMaterial(indexMaterial, "plugin-key-index/v1", row.ExtensionID, string(key))
-			if err != nil || !hmac.Equal(expected, row.KeyHMAC) {
-				clear(key)
-				clear(value)
-				return ErrAuthenticationFailed
-			}
-			item := PluginKVItem{ExtensionID: row.ExtensionID, Key: string(key), Value: value, Version: row.RowVersion}
-			visitErr := visit(item)
-			clear(key)
-			clear(value)
-			if visitErr != nil {
-				return visitErr
-			}
+			clear(item.Value)
 		}
 		last := rows[len(rows)-1]
-		cursorExtension = last.ExtensionID
-		cursorKey = append(cursorKey[:0], last.KeyHMAC...)
-		hasCursor = true
+		cursorExtension, cursorKey, hasCursor = last.ExtensionID, last.Key, true
 		if len(rows) < importVerificationPageSize {
 			return nil
 		}

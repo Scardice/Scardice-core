@@ -9,7 +9,7 @@ import (
 func adapterAPIEffectForTest(t *testing.T, raw string) OutboundEffect {
 	t.Helper()
 	target := EffectTarget{Kind: TargetRaw, Raw: "adapter-api"}
-	lane, err := NewLaneMetadata("endpoint-1", target, []byte("adapter-api-index-root"), 1)
+	lane, err := NewLaneMetadata("endpoint-1", target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

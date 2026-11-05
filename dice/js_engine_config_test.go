@@ -8,6 +8,14 @@ import (
 	"Scardice-core/utils/jsengine"
 )
 
+func newJSConfigReadTestDice(config JsConfig) *Dice {
+	d := &Dice{}
+	view := newDefaultConfigReadView(d)
+	view.config.JsConfig = config
+	d.configView.Store(view)
+	return d
+}
+
 func TestConfiguredJSEngine(t *testing.T) {
 	tests := []struct {
 		name string
@@ -21,7 +29,7 @@ func TestConfiguredJSEngine(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			d := &Dice{Config: Config{JsConfig: JsConfig{JsEngine: tt.raw}}}
+			d := newJSConfigReadTestDice(JsConfig{JsEngine: tt.raw})
 			if got := d.configuredJSEngine(); got != tt.want {
 				t.Fatalf("configuredJSEngine() = %q, want %q", got, tt.want)
 			}
@@ -34,7 +42,7 @@ func TestConfiguredJSEngine_ReadsManualYAML(t *testing.T) {
 	if err := yaml.Unmarshal([]byte("jsEngine: quickjs\n"), &config); err != nil {
 		t.Fatal(err)
 	}
-	d := &Dice{Config: Config{JsConfig: config}}
+	d := newJSConfigReadTestDice(config)
 	engine := d.configuredJSEngine()
 	if engine != "quickjs" {
 		t.Fatalf("configuredJSEngine() = %q, want quickjs", engine)

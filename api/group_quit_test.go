@@ -16,10 +16,12 @@ import (
 	"go.uber.org/zap"
 
 	"Scardice-core/adapterapi"
+	"Scardice-core/core/groupstate"
 	"Scardice-core/core/messageflow"
 	"Scardice-core/dice"
 	"Scardice-core/endpoint"
 	"Scardice-core/eventstore"
+	"Scardice-core/projectionset"
 )
 
 const (
@@ -28,27 +30,6 @@ const (
 	groupQuitAPIDiceID     = "discord:group-quit-bot"
 	groupQuitAPIGroupID    = "discord:group-quit-target"
 )
-
-type groupQuitAPIKeySource struct{}
-
-func (groupQuitAPIKeySource) IndexRootID(context.Context) (string, error) {
-	return "group-quit-index-v1", nil
-}
-
-func (groupQuitAPIKeySource) IndexRootMaterial(context.Context) ([]byte, error) {
-	return []byte("01234567890123456789012345678901"), nil
-}
-
-func (groupQuitAPIKeySource) CurrentEncryptionRoot(context.Context) (eventstore.EncryptionRoot, error) {
-	return eventstore.EncryptionRoot{ID: "group-quit-root-v1", Material: []byte("abcdefghijklmnopqrstuvwxyz123456")}, nil
-}
-
-func (groupQuitAPIKeySource) EncryptionRoot(_ context.Context, id string) ([]byte, error) {
-	if id != "group-quit-root-v1" {
-		return nil, eventstore.ErrKeyUnavailable
-	}
-	return []byte("abcdefghijklmnopqrstuvwxyz123456"), nil
-}
 
 type groupQuitAPIDescriptor struct {
 	supportsQuit bool
@@ -79,16 +60,11 @@ func (groupQuitAPIDescriptor) NewRuntime(adapterapi.RuntimeInit) (adapterapi.Ada
 
 type groupQuitAPIResolver struct {
 	service    *endpoint.Service
-	store      *eventstore.GORMStore
 	descriptor groupQuitAPIDescriptor
 }
 
 func (r groupQuitAPIResolver) Resolve(ctx context.Context, endpointID adapterapi.EndpointID) (messageflow.EndpointSnapshot, error) {
 	view, err := r.service.Get(ctx, endpointID)
-	if err != nil {
-		return messageflow.EndpointSnapshot{}, err
-	}
-	_, rootID, err := r.store.KeyedDigest(ctx, "group-quit-endpoint-snapshot/v1", string(endpointID))
 	if err != nil {
 		return messageflow.EndpointSnapshot{}, err
 	}
@@ -99,8 +75,6 @@ func (r groupQuitAPIResolver) Resolve(ctx context.Context, endpointID adapterapi
 		ObservedState: view.ObservedState,
 		Capabilities:  r.descriptor.Capabilities(view.Config),
 		Actions:       r.descriptor.SupportedActions(view.Config),
-		IndexRootID:   rootID,
-		IndexSigner:   r.store,
 	}, nil
 }
 
@@ -143,28 +117,23 @@ type groupQuitAPIFixture struct {
 	store    *eventstore.GORMStore
 	runtime  *dice.Dice
 	manager  *dice.DiceManager
-	group    *dice.GroupInfo
 }
 
 func newGroupQuitAPIFixture(t *testing.T, supportsQuit bool, bridgeErr, secondSubmitErr error) *groupQuitAPIFixture {
 	t.Helper()
 	ctx := context.Background()
-	keys := groupQuitAPIKeySource{}
 	database, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
 		Type:             "sqlite",
 		DSN:              filepath.Join(t.TempDir(), "group-quit-api.db"),
-		KeySource:        keys,
 		DatabaseIdentity: "group-quit-api-test",
 	})
 	if err != nil {
 		t.Fatalf("open group quit EventStore: %v", err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	store := eventstore.NewStore(database, eventstore.WithKeySource(keys))
+	store := eventstore.NewStore(database, projectionset.StoreOptions()...)
 	if err = store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "group-quit-api-test",
-		IndexRootID: "group-quit-index-v1", EncryptionRootIDs: []string{"group-quit-root-v1"},
-		SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "group-quit-api-test",
 		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatalf("initialize group quit EventStore readiness: %v", err)
@@ -212,28 +181,49 @@ func newGroupQuitAPIFixture(t *testing.T, supportsQuit bool, bridgeErr, secondSu
 		DurableStore: store,
 		Logger:       zap.NewNop().Sugar(),
 	}
-	runtime.Config = dice.NewConfig(runtime)
 	manager := &dice.DiceManager{Dice: []*dice.Dice{runtime}}
-	manager.AccessTokens.Store(groupQuitAPIToken, true)
 	runtime.Parent = manager
+	if err = manager.InitializeRuntime(); err != nil {
+		t.Fatalf("initialize group quit runtime: %v", err)
+	}
+	t.Cleanup(func() {
+		if manager.Cron != nil {
+			manager.Cron.Stop()
+		}
+	})
+	if err = manager.PrepareEventSourcedState(ctx); err != nil {
+		t.Fatalf("prepare group quit runtime: %v", err)
+	}
+	manager.AccessTokens.Store(groupQuitAPIToken, true)
 	session := &dice.IMSession{
-		Parent:       runtime,
-		ServiceAtNew: new(dice.SyncMap[string, *dice.GroupInfo]),
-		PendingQuits: new(dice.SyncMap[string, *dice.PendingQuitInfo]),
+		Parent: runtime, PendingQuits: new(dice.SyncMap[string, *dice.PendingQuitInfo]),
 	}
 	runtime.ImSession = session
-	group := &dice.GroupInfo{
-		GroupID:         groupQuitAPIGroupID,
-		GroupName:       "Group Quit Target",
-		DiceIDActiveMap: new(dice.SyncMap[string, bool]),
-		DiceIDExistsMap: new(dice.SyncMap[string, bool]),
+	if err = runtime.WithDomainExecution(
+		ctx,
+		runtime.DomainExecutionIdentity("api-test-fixture", "group-quit-membership"),
+		[]byte("group-quit-membership"),
+		func(transaction *dice.DurableCallbackTransaction) error {
+			group, groupErr := transaction.Domain().Group(ctx, runtime.BaseConfig.Name, groupQuitAPIGroupID)
+			if groupErr != nil {
+				return groupErr
+			}
+			for _, command := range []groupstate.Command{
+				{Kind: groupstate.CommandCreate, DiceID: runtime.BaseConfig.Name, GroupID: groupQuitAPIGroupID, GroupName: "Group Quit Target"},
+				{Kind: groupstate.CommandActivation, DiceIDForActivation: groupQuitAPIDiceID, Active: true, Exists: true},
+			} {
+				if groupErr = group.Decide(command); groupErr != nil {
+					return groupErr
+				}
+			}
+			return nil
+		},
+	); err != nil {
+		t.Fatalf("seed group quit membership: %v", err)
 	}
-	group.DiceIDActiveMap.Store(groupQuitAPIDiceID, true)
-	group.DiceIDExistsMap.Store(groupQuitAPIDiceID, true)
-	session.ServiceAtNew.Store(groupQuitAPIGroupID, group)
 
-	resolver := groupQuitAPIResolver{service: endpointService, store: store, descriptor: descriptor}
-	outbound, err := messageflow.NewOutboundService(store, resolver, store, eventstore.UUIDGenerator{})
+	resolver := groupQuitAPIResolver{service: endpointService, descriptor: descriptor}
+	outbound, err := messageflow.NewOutboundService(store, resolver, eventstore.UUIDGenerator{})
 	if err != nil {
 		t.Fatalf("construct group quit outbound service: %v", err)
 	}
@@ -241,14 +231,15 @@ func newGroupQuitAPIFixture(t *testing.T, supportsQuit bool, bridgeErr, secondSu
 	if secondSubmitErr != nil {
 		failErr, failAt = secondSubmitErr, 2
 	}
+	notifications := newAPITestOutboundNotificationOwner(t)
 	if failErr != nil {
 		runtime.OutboundBridge = dice.NewDurableOutboundBridge(&groupQuitAPIFailingSubmitter{
 			delegate: outbound,
 			err:      failErr,
 			failAt:   failAt,
-		}, resolver, eventstore.UUIDGenerator{})
+		}, resolver, eventstore.UUIDGenerator{}, notifications)
 	} else {
-		runtime.OutboundBridge = dice.NewDurableOutboundBridge(outbound, resolver, eventstore.UUIDGenerator{})
+		runtime.OutboundBridge = dice.NewDurableOutboundBridge(outbound, resolver, eventstore.UUIDGenerator{}, notifications)
 	}
 
 	endpoints := session.EndPointsReadOnly()
@@ -262,7 +253,7 @@ func newGroupQuitAPIFixture(t *testing.T, supportsQuit bool, bridgeErr, secondSu
 	previousDice, previousManager := myDice, dm
 	myDice, dm = runtime, manager
 	t.Cleanup(func() { myDice, dm = previousDice, previousManager })
-	return &groupQuitAPIFixture{t: t, database: database, store: store, runtime: runtime, manager: manager, group: group}
+	return &groupQuitAPIFixture{t: t, database: database, store: store, runtime: runtime, manager: manager}
 }
 
 func (f *groupQuitAPIFixture) request(diceID string, silence bool, extraText string) *httptest.ResponseRecorder {
@@ -291,47 +282,50 @@ func (f *groupQuitAPIFixture) requestContext(requestCtx context.Context, diceID 
 	return recorder
 }
 
+func (f *groupQuitAPIFixture) membershipExists() bool {
+	f.t.Helper()
+	state, err := groupstate.ReadProjected(
+		context.Background(), f.store, f.runtime.BaseConfig.Name, groupQuitAPIGroupID,
+	)
+	if err != nil {
+		f.t.Fatalf("read group quit membership: %v", err)
+	}
+	return state.DiceIDExists[groupQuitAPIDiceID]
+}
+
 type groupQuitStoredEffect struct {
 	effect           adapterapi.OutboundEffect
 	orderingSequence uint64
-	laneHMAC         []byte
+	lane             string
 }
 
 func (f *groupQuitAPIFixture) storedEffects() []groupQuitStoredEffect {
 	f.t.Helper()
 	var rows []struct {
-		EffectID          string `gorm:"column:effect_id"`
-		EndpointID        string `gorm:"column:endpoint_id"`
-		OrderingSequence  uint64 `gorm:"column:ordering_sequence"`
-		LaneHMAC          []byte `gorm:"column:lane_hmac"`
-		PayloadVersion    uint64 `gorm:"column:payload_version"`
-		PayloadCiphertext []byte `gorm:"column:payload_ciphertext"`
-		PayloadNonce      []byte `gorm:"column:payload_nonce"`
-		EncryptionKeyID   string `gorm:"column:encryption_key_id"`
+		EffectID         string `gorm:"column:effect_id"`
+		EndpointID       string `gorm:"column:endpoint_id"`
+		OrderingSequence uint64 `gorm:"column:ordering_sequence"`
+		Lane             string `gorm:"column:lane"`
+		Subject          string `gorm:"column:subject"`
+		Payload          []byte `gorm:"column:payload"`
 	}
 	if err := f.database.GORM().Table("outbox_effects").Order("ordering_sequence ASC").Find(&rows).Error; err != nil {
 		f.t.Fatalf("list group quit outbox effects: %v", err)
 	}
 	result := make([]groupQuitStoredEffect, 0, len(rows))
 	for _, row := range rows {
-		if bytes.Contains(row.PayloadCiphertext, []byte(groupQuitAPIGroupID)) {
-			f.t.Fatalf("outbox ciphertext leaked group target: %q", row.PayloadCiphertext)
-		}
-		version := row.PayloadVersion
-		if version == 0 {
-			version = 1
-		}
-		plain, err := f.store.DecryptBound(context.Background(), "outbox/v1", row.EffectID, row.EndpointID, version, row.PayloadCiphertext, row.PayloadNonce, row.EncryptionKeyID)
-		if err != nil {
-			f.t.Fatalf("decrypt group quit effect %q: %v", row.EffectID, err)
-		}
 		var wire struct {
 			Effect adapterapi.OutboundEffect `json:"effect"`
 		}
-		if err = json.Unmarshal(plain, &wire); err != nil {
+		if err := json.Unmarshal(row.Payload, &wire); err != nil {
 			f.t.Fatalf("decode group quit effect %q: %v", row.EffectID, err)
 		}
-		result = append(result, groupQuitStoredEffect{effect: wire.Effect, orderingSequence: row.OrderingSequence, laneHMAC: row.LaneHMAC})
+		if string(wire.Effect.ID) != row.EffectID || string(wire.Effect.EndpointID) != row.EndpointID ||
+			wire.Effect.Lane.Key != row.Lane ||
+			row.Subject != groupQuitAPIGroupID {
+			f.t.Fatalf("persisted group quit identity mismatch: row=%#v effect=%#v", row, wire.Effect)
+		}
+		result = append(result, groupQuitStoredEffect{effect: wire.Effect, orderingSequence: row.OrderingSequence, lane: row.Lane})
 	}
 	return result
 }
@@ -356,7 +350,7 @@ func requireGroupQuitAPIError(t *testing.T, recorder *httptest.ResponseRecorder,
 	}
 }
 
-func TestGroupQuitAPIQueuesEncryptedDurableQuitWithNilAdapter(t *testing.T) {
+func TestGroupQuitAPIQueuesDurableQuitWithNilAdapter(t *testing.T) {
 	fixture := newGroupQuitAPIFixture(t, true, nil, nil)
 	started := time.Now()
 	recorder := fixture.request(groupQuitAPIDiceID, false, "api durable goodbye")
@@ -366,7 +360,7 @@ func TestGroupQuitAPIQueuesEncryptedDurableQuitWithNilAdapter(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("group quit status=%d body=%q, want 200", recorder.Code, recorder.Body.String())
 	}
-	if fixture.group.DiceIDExistsMap.Exists(groupQuitAPIDiceID) {
+	if fixture.membershipExists() {
 		t.Fatal("accepted durable quit retained the local group-existence marker")
 	}
 
@@ -384,20 +378,36 @@ func TestGroupQuitAPIQueuesEncryptedDurableQuitWithNilAdapter(t *testing.T) {
 	if quit.effect.EndpointID != groupQuitAPIEndpointID || quit.effect.Payload.Target.Kind != adapterapi.TargetGroup || quit.effect.Payload.Target.Conversation != adapterapi.ConversationID(groupQuitAPIGroupID) {
 		t.Fatalf("quit effect target=%#v endpoint=%q, want group %q on %q", quit.effect.Payload.Target, quit.effect.EndpointID, groupQuitAPIGroupID, groupQuitAPIEndpointID)
 	}
-	if farewell.orderingSequence+1 != quit.orderingSequence || !bytes.Equal(farewell.laneHMAC, quit.laneHMAC) {
-		t.Fatalf("farewell lane=(%d,%x) quit lane=(%d,%x), want consecutive effects on one FIFO lane", farewell.orderingSequence, farewell.laneHMAC, quit.orderingSequence, quit.laneHMAC)
+	if farewell.orderingSequence+1 != quit.orderingSequence || farewell.lane == "" || farewell.lane != quit.lane {
+		t.Fatalf("farewell lane=(%d,%q) quit lane=(%d,%q), want consecutive effects on one FIFO lane", farewell.orderingSequence, farewell.lane, quit.orderingSequence, quit.lane)
 	}
 }
 
 func TestSubmitDurableGroupQuitAcceptsIdenticalFarewellSegments(t *testing.T) {
 	fixture := newGroupQuitAPIFixture(t, true, nil, nil)
 	endpointView := fixture.runtime.ImSession.EndPointsReadOnly()[0]
-	messageContext := &dice.MsgContext{
-		Dice: fixture.runtime, Session: fixture.runtime.ImSession, EndPoint: endpointView,
-		CommandID: 7002, CurrentCommand: "api/group-quit:identical-segments",
-	}
-	messageContext.SetSplitKey("#{SPLIT}")
-	if err := dice.SubmitDurableGroupQuit(context.Background(), messageContext, groupQuitAPIGroupID, "A#{SPLIT}A"); err != nil {
+	requestCtx := context.Background()
+	if err := fixture.runtime.WithDomainExecution(
+		requestCtx,
+		fixture.runtime.DomainExecutionIdentity("api-test-fixture", "identical-group-quit-segments"),
+		[]byte("identical-group-quit-segments"),
+		func(transaction *dice.DurableCallbackTransaction) error {
+			message := &dice.Message{
+				Platform: "DISCORD", MessageType: "group", GroupID: groupQuitAPIGroupID,
+				Sender: dice.SenderBase{UserID: "discord:group-quit-operator", Nickname: "Operator"},
+			}
+			messageContext, err := dice.NewDomainMsgContext(
+				transaction, fixture.runtime, fixture.runtime.ImSession, endpointView, message,
+			)
+			if err != nil {
+				return err
+			}
+			messageContext.CommandID = 7002
+			messageContext.CurrentCommand = "api/group-quit:identical-segments"
+			messageContext.SetSplitKey("#{SPLIT}")
+			return dice.SubmitDurableGroupQuit(requestCtx, messageContext, groupQuitAPIGroupID, "A#{SPLIT}A")
+		},
+	); err != nil {
 		t.Fatalf("submit identical farewell segments: %v", err)
 	}
 	effects := fixture.storedEffects()
@@ -434,11 +444,13 @@ func TestGroupQuitAPIFailureDoesNotSendAcceptedNotice(t *testing.T) {
 	fixture := newGroupQuitAPIFixture(t, true, nil, nil)
 	capture := &groupQuitAPINoticeCaptureBridge{texts: make(chan string, 1)}
 	fixture.runtime.OutboundBridge = capture
-	fixture.runtime.Config.NoticeIDs = []string{"discord:notice-owner:only=group"}
+	updateAPITestConfig(t, fixture.runtime, func(config *dice.Config) {
+		config.NoticeIDs = []string{"discord:notice-owner:only=group"}
+	})
 
 	recorder := fixture.request(groupQuitAPIDiceID, true, "")
 	requireGroupQuitAPIError(t, recorder, "")
-	if !fixture.group.DiceIDExistsMap.Exists(groupQuitAPIDiceID) {
+	if !fixture.membershipExists() {
 		t.Fatal("rejected quit deleted the local group-existence marker")
 	}
 	if effects := fixture.storedEffects(); len(effects) != 0 {
@@ -456,7 +468,7 @@ func TestGroupQuitAPIRejectsUnacceptedQuitWithoutDeletingMembership(t *testing.T
 		fixture := newGroupQuitAPIFixture(t, true, nil, nil)
 		recorder := fixture.request("discord:other-bot", true, "")
 		requireGroupQuitAPIError(t, recorder, "")
-		if !fixture.group.DiceIDExistsMap.Exists(groupQuitAPIDiceID) {
+		if !fixture.membershipExists() {
 			t.Fatal("unmatched endpoint deleted the local group-existence marker")
 		}
 		if effects := fixture.storedEffects(); len(effects) != 0 {
@@ -468,7 +480,7 @@ func TestGroupQuitAPIRejectsUnacceptedQuitWithoutDeletingMembership(t *testing.T
 		fixture := newGroupQuitAPIFixture(t, false, nil, nil)
 		recorder := fixture.request(groupQuitAPIDiceID, false, "unsupported quit farewell")
 		requireGroupQuitAPIError(t, recorder, "capability")
-		if !fixture.group.DiceIDExistsMap.Exists(groupQuitAPIDiceID) {
+		if !fixture.membershipExists() {
 			t.Fatal("unsupported quit deleted the local group-existence marker")
 		}
 		if effects := fixture.storedEffects(); len(effects) != 0 {
@@ -481,7 +493,7 @@ func TestGroupQuitAPIRejectsUnacceptedQuitWithoutDeletingMembership(t *testing.T
 		fixture := newGroupQuitAPIFixture(t, true, forced, nil)
 		recorder := fixture.request(groupQuitAPIDiceID, true, "")
 		requireGroupQuitAPIError(t, recorder, forced.Error())
-		if !fixture.group.DiceIDExistsMap.Exists(groupQuitAPIDiceID) {
+		if !fixture.membershipExists() {
 			t.Fatal("failed quit submission deleted the local group-existence marker")
 		}
 		if effects := fixture.storedEffects(); len(effects) != 0 {
@@ -494,7 +506,7 @@ func TestGroupQuitAPIRejectsUnacceptedQuitWithoutDeletingMembership(t *testing.T
 		fixture := newGroupQuitAPIFixture(t, true, nil, forced)
 		recorder := fixture.request(groupQuitAPIDiceID, false, "atomic farewell")
 		requireGroupQuitAPIError(t, recorder, forced.Error())
-		if !fixture.group.DiceIDExistsMap.Exists(groupQuitAPIDiceID) {
+		if !fixture.membershipExists() {
 			t.Fatal("partially submitted quit deleted the local group-existence marker")
 		}
 		if effects := fixture.storedEffects(); len(effects) != 0 {
@@ -508,7 +520,7 @@ func TestGroupQuitAPIRejectsUnacceptedQuitWithoutDeletingMembership(t *testing.T
 		cancel()
 		recorder := fixture.requestContext(requestCtx, groupQuitAPIDiceID, false, "canceled farewell")
 		requireGroupQuitAPIError(t, recorder, context.Canceled.Error())
-		if !fixture.group.DiceIDExistsMap.Exists(groupQuitAPIDiceID) {
+		if !fixture.membershipExists() {
 			t.Fatal("canceled quit deleted the local group-existence marker")
 		}
 		if effects := fixture.storedEffects(); len(effects) != 0 {

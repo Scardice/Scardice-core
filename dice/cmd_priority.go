@@ -39,11 +39,11 @@ func commandExtensionOrder(group *GroupInfo, d *Dice) []*ExtInfo {
 // commandPreferredExtNames 返回当前规则模板关联的扩展名集合（含链式关联，全部小写）。
 // 该集合即 commandExtensionOrder 提升到前列的那一层，同时用于指令候选择优。
 func commandPreferredExtNames(group *GroupInfo, d *Dice) map[string]struct{} {
-	if group == nil || d == nil || group.System == "" || d.GameSystemMap == nil {
+	if group == nil || d == nil || group.System() == "" || d.GameSystemMap == nil {
 		return nil
 	}
 
-	tmpl, ok := d.GameSystemMap.Load(group.System)
+	tmpl, ok := d.GameSystemMap.Load(group.System())
 	if !ok || tmpl == nil {
 		return nil
 	}

@@ -2,12 +2,14 @@ package messageflow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"Scardice-core/adapterapi"
+	"Scardice-core/core/execution"
 	"Scardice-core/core/groupstate"
 	"Scardice-core/core/playerstate"
 	"Scardice-core/core/privacypurge"
@@ -17,8 +19,7 @@ import (
 
 func TestSQLiteMessageFlowThroughScopedPrivacyPurge(t *testing.T) {
 	ctx := context.Background()
-	source := integrationKeySource{indexID: "scenario-index", index: []byte("01234567890123456789012345678901"), rootID: "scenario-root", root: []byte("abcdefghijklmnopqrstuvwxyz123456")}
-	db, databaseErr := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "privacy-purge-scenario.db"), KeySource: source, DatabaseIdentity: "privacy-purge-scenario"})
+	db, databaseErr := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "privacy-purge-scenario.db"), DatabaseIdentity: "privacy-purge-scenario"})
 	if databaseErr != nil {
 		t.Fatal(databaseErr)
 	}
@@ -28,12 +29,12 @@ func TestSQLiteMessageFlowThroughScopedPrivacyPurge(t *testing.T) {
 		eventstore.WithProjection(playerstate.PlayerProjection()),
 		eventstore.WithProjection(playerstate.GroupUserAttrsProjection()),
 	)
-	if err := store.SetReadiness(ctx, eventstore.Readiness{Mode: "import", SchemaVersion: 1, DatabaseIdentity: "privacy-purge-scenario", IndexRootID: source.indexID, EncryptionRootIDs: []string{source.rootID}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
+	if err := store.SetReadiness(ctx, eventstore.Readiness{Mode: "import", SchemaVersion: 2, DatabaseIdentity: "privacy-purge-scenario", CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
 		t.Fatal(err)
 	}
 
 	now := time.Now().UTC()
-	inbound, databaseErr := NewInboundService(store, store, WithIngressClock(fixedIngressClock{now: now}))
+	inbound, databaseErr := NewInboundService(store, WithIngressClock(fixedIngressClock{now: now}))
 	if databaseErr != nil {
 		t.Fatal(databaseErr)
 	}
@@ -47,7 +48,7 @@ func TestSQLiteMessageFlowThroughScopedPrivacyPurge(t *testing.T) {
 	if databaseErr != nil || duplicate.Outcome != adapterapi.IngressDuplicate || duplicate.InboxID != first.InboxID {
 		t.Fatalf("duplicate=%+v err=%v", duplicate, databaseErr)
 	}
-	host := &callbackTestHost{fn: func(_ context.Context, request CallbackRequest, _ *playerstate.LocalOverlay, collector *MutationCollector) (CallbackResult, error) {
+	host := &callbackTestHost{fn: func(_ context.Context, request CallbackRequest, _ *playerstate.LocalOverlay, collector *execution.MutationCollector) (CallbackResult, error) {
 		metadata := eventstore.Metadata{EventID: "scenario-group-created", CommandID: "scenario-command", CorrelationID: "scenario-correlation", OccurredAtUnixNanoUTC: 101, OccurredAtUnixNanoSet: true}
 		if err := collector.AddGroupEvents(groupstate.GroupStream(request.Scope.DiceID, request.Scope.GroupID), 0, metadata, []groupstate.TypedEvent{
 			groupstate.NewGroupCreatedV1(request.Scope.DiceID, request.Scope.GroupID, "Scenario Group", 101),
@@ -68,13 +69,13 @@ func TestSQLiteMessageFlowThroughScopedPrivacyPurge(t *testing.T) {
 		attrsMetadata.EventID = "scenario-attrs-created"
 		if err := collector.AddGroupUserAttrsEvents(playerstate.GroupUserAttrsStream(request.Scope.DiceID, request.Scope.GroupID, request.Scope.UserID), 0, attrsMetadata, []playerstate.GroupUserAttrsEvent{
 			playerstate.NewGroupUserAttrsCreatedV1(request.Scope.DiceID, request.Scope.GroupID, request.Scope.UserID),
-			playerstate.NewGroupUserAttrsSetV1("role", []byte("encrypted-role"), source.rootID),
+			playerstate.NewGroupUserAttrsSetV1("role", []byte("plain-role-value")),
 		}); err != nil {
 			return CallbackResult{}, err
 		}
 		return CallbackResult{}, nil
 	}}
-	callback, databaseErr := NewCallbackService(CallbackConfig{Inbox: store, Store: store, BoundCodec: store, Resolver: callbackTestResolver{}, Group: callbackTestGroupLoader{}, Player: callbackTestPlayerLoader{}, Host: host, WorkerID: "scenario-worker", Clock: fixedIngressClock{now: now}})
+	callback, databaseErr := NewCallbackService(CallbackConfig{Inbox: store, Store: store, Resolver: callbackTestResolver{}, Host: host, WorkerID: "scenario-worker", Clock: fixedIngressClock{now: now}})
 	if databaseErr != nil {
 		t.Fatal(databaseErr)
 	}
@@ -91,24 +92,24 @@ func TestSQLiteMessageFlowThroughScopedPrivacyPurge(t *testing.T) {
 		t.Fatalf("player=%+v err=%v", player, databaseErr)
 	}
 	attrs, databaseErr := playerstate.ReadProjectedGroupUserAttrs(ctx, store, "dice", "group", "user")
-	if databaseErr != nil || len(attrs.Values) != 1 || string(attrs.Values["role"].Ciphertext) != "encrypted-role" {
+	if databaseErr != nil || len(attrs.Values) != 1 || string(attrs.Values["role"]) != "plain-role-value" {
 		t.Fatalf("attrs=%+v err=%v", attrs, databaseErr)
 	}
 	var inboxBody struct {
-		PayloadCiphertext []byte `gorm:"column:payload_ciphertext"`
-		PayloadNonce      []byte `gorm:"column:payload_nonce"`
-		SubjectKey        []byte `gorm:"column:subject_key"`
+		Payload []byte
+		Subject string
+		Status  string
 	}
 	if err := db.GORM().Table("inbox_messages").Where("inbox_id = ?", first.InboxID).First(&inboxBody).Error; err != nil {
 		t.Fatal(err)
 	}
-	groupSubjectKey := append([]byte(nil), inboxBody.SubjectKey...)
-	if len(inboxBody.PayloadCiphertext) != 0 || len(inboxBody.PayloadNonce) != 0 {
-		t.Fatal("terminal callback retained encrypted body")
+	var retained ingressPayload
+	if err := json.Unmarshal(inboxBody.Payload, &retained); err != nil || retained.Message.Text != "hello group" || inboxBody.Subject != "group" || inboxBody.Status != eventstore.InboxStatusConfirmedConsumed {
+		t.Fatalf("terminal callback lost its plaintext body or subject: row=%+v payload=%+v err=%v", inboxBody, retained, err)
 	}
 
-	resolver := testResolver{snap: EndpointSnapshot{EndpointID: "endpoint-1", DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound | adapterapi.CapabilityRichMessages | adapterapi.CapabilityArtifacts, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage), IndexRootID: source.indexID, IndexSigner: store}}
-	outbound, databaseErr := NewOutboundService(store, resolver, store, eventstore.UUIDGenerator{})
+	resolver := testResolver{snap: EndpointSnapshot{EndpointID: "endpoint-1", DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound | adapterapi.CapabilityRichMessages | adapterapi.CapabilityArtifacts, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage)}}
+	outbound, databaseErr := NewOutboundService(store, resolver, eventstore.UUIDGenerator{})
 	if databaseErr != nil {
 		t.Fatal(databaseErr)
 	}
@@ -119,7 +120,7 @@ func TestSQLiteMessageFlowThroughScopedPrivacyPurge(t *testing.T) {
 		effect.CorrelationID = adapterapi.CorrelationID("scenario-correlation-" + string(rune('1'+i)))
 		effect.CausationID = adapterapi.CausationID("scenario-causation-" + string(rune('1'+i)))
 		effect.Deadline = time.Now().Add(time.Minute).UTC()
-		effect.Lane, databaseErr = adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, source.index, uint64(i+1))
+		effect.Lane, databaseErr = adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, uint64(i+1))
 		if databaseErr != nil {
 			t.Fatal(databaseErr)
 		}
@@ -153,6 +154,33 @@ func TestSQLiteMessageFlowThroughScopedPrivacyPurge(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Both retained terminal and still-pending ingress rows belong to the group.
+	// A different group's plaintext queue must survive the same transaction.
+	groupPending := fenced
+	groupPending.Message.ProviderEventID = "provider-group-pending"
+	if _, err := inbound.HandleInbound(ctx, groupPending); err != nil {
+		t.Fatal(err)
+	}
+	unrelatedPending := fenced
+	unrelatedPending.Message.ProviderEventID = "provider-unrelated-pending"
+	unrelatedPending.Message.Conversation = "other-group"
+	unrelatedPending.Message.Target = "other-group"
+	if _, err := inbound.HandleInbound(ctx, unrelatedPending); err != nil {
+		t.Fatal(err)
+	}
+	groupEffect := testEffect()
+	groupEffect.ID, groupEffect.OperationID = "scenario-group-pending", "scenario-group-operation"
+	groupEffect.Deadline = time.Now().Add(time.Minute).UTC()
+	groupEffect.Payload.Kind = adapterapi.EffectPayloadGroupText
+	groupEffect.Payload.Target = adapterapi.EffectTarget{Kind: adapterapi.TargetGroup, Conversation: "group"}
+	groupEffect.Lane, databaseErr = adapterapi.NewLaneMetadata(groupEffect.EndpointID, groupEffect.Payload.Target, 1)
+	if databaseErr != nil {
+		t.Fatal(databaseErr)
+	}
+	if _, err := outbound.Submit(ctx, SubmitRequest{Effect: groupEffect, CommandID: "scenario-group-pending", PrincipalID: "scenario-principal"}); err != nil {
+		t.Fatal(err)
+	}
+
 	var beforeControl struct {
 		ActiveGeneration string `gorm:"column:active_generation"`
 	}
@@ -173,17 +201,19 @@ func TestSQLiteMessageFlowThroughScopedPrivacyPurge(t *testing.T) {
 	if databaseErr != nil {
 		t.Fatal(databaseErr)
 	}
+	if dry.Counts.Inbox != 2 || dry.Counts.Outbox != 1 {
+		t.Fatalf("dry-run queue counts=%+v", dry.Counts)
+	}
 	result, databaseErr := purge.Confirm(ctx, privacypurge.Request{GroupID: "group", DiceIDs: []string{"dice"}, Scopes: []string{"group_record", "players", "attrs"}, ActiveDiceIDs: []string{"dice"}, AllowActive: true, ConfirmationDigest: dry.ConfirmationDigest, ConfirmationVersion: dry.ConfirmationVersion})
-	if !errors.Is(databaseErr, privacypurge.ErrUncoveredData) || !result.Completed || result.Deleted.GroupRecord != 3 || result.Deleted.Players != 2 || result.Deleted.Attrs != 2 {
+	if !errors.Is(databaseErr, privacypurge.ErrUncoveredData) || !result.Completed || result.Deleted.GroupRecord != 3 || result.Deleted.Players != 2 || result.Deleted.Attrs != 2 || result.Deleted.Inbox != 2 || result.Deleted.Outbox != 1 {
 		t.Fatalf("purge result=%+v err=%v", result, databaseErr)
 	}
 	var unrelatedEffects []struct {
-		EffectID          string
-		Status            string
-		SubjectKey        []byte
-		ResultCode        string
-		PayloadCiphertext []byte `gorm:"column:payload_ciphertext"`
-		PayloadNonce      []byte `gorm:"column:payload_nonce"`
+		EffectID   string
+		Status     string
+		Subject    string
+		ResultCode string
+		Payload    []byte
 	}
 	effectIDs := []string{"scenario-effect-1", "scenario-effect-2"}
 	if err := db.GORM().Table("outbox_effects").Where("effect_id IN ?", effectIDs).Find(&unrelatedEffects).Error; err != nil {
@@ -193,22 +223,32 @@ func TestSQLiteMessageFlowThroughScopedPrivacyPurge(t *testing.T) {
 		t.Fatalf("unrelated effects=%d want=2", len(unrelatedEffects))
 	}
 	for _, effect := range unrelatedEffects {
-		if effect.Status != eventstore.OutboxStatusSucceeded || effect.ResultCode != "sent" || string(effect.SubjectKey) == string(groupSubjectKey) {
+		if effect.Status != eventstore.OutboxStatusSucceeded || effect.ResultCode != "sent" || effect.Subject != "person-1" {
 			t.Fatalf("unrelated effect was purged or changed: %+v", effect)
 		}
-		if len(effect.PayloadCiphertext) != 0 || len(effect.PayloadNonce) != 0 {
-			t.Fatalf("terminal unrelated effect retained encrypted payload: %s", effect.EffectID)
+		var wire effectWire
+		if err := json.Unmarshal(effect.Payload, &wire); err != nil || wire.Effect.Payload.Text != "hello" {
+			t.Fatalf("terminal unrelated effect lost its plaintext payload: %s err=%v", effect.EffectID, err)
 		}
 	}
 	var unrelatedOutbox, unrelatedInbox int64
-	if err := db.GORM().Table("outbox_effects").Where("subject_key <> ?", groupSubjectKey).Count(&unrelatedOutbox).Error; err != nil {
+	if err := db.GORM().Table("outbox_effects").Where("subject <> ?", "group").Count(&unrelatedOutbox).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.GORM().Table("inbox_messages").Where("subject_key <> ?", groupSubjectKey).Count(&unrelatedInbox).Error; err != nil {
+	if err := db.GORM().Table("inbox_messages").Where("subject <> ?", "group").Count(&unrelatedInbox).Error; err != nil {
 		t.Fatal(err)
 	}
-	if unrelatedOutbox != 2 || unrelatedInbox != 0 {
+	if unrelatedOutbox != 2 || unrelatedInbox != 1 {
 		t.Fatalf("unrelated scope counts outbox=%d inbox=%d", unrelatedOutbox, unrelatedInbox)
+	}
+	for _, table := range []string{"inbox_messages", "outbox_effects"} {
+		var remaining int64
+		if err := db.GORM().Table(table).Where("subject = ?", "group").Count(&remaining).Error; err != nil {
+			t.Fatal(err)
+		}
+		if remaining != 0 {
+			t.Fatalf("%s still contains %d group rows after completed purge", table, remaining)
+		}
 	}
 	if _, err := groupstate.ReadProjected(ctx, store, "dice", "group"); err == nil {
 		t.Fatal("purged group remained readable")

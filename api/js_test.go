@@ -3,7 +3,6 @@ package api //nolint:testpackage
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,37 +17,47 @@ import (
 
 	"Scardice-core/dice"
 	"Scardice-core/utils/jsengine"
-	gojaengine "Scardice-core/utils/jsengine/goja"
 )
 
 func newJSExecDice(t *testing.T) (*dice.Dice, string) {
 	t.Helper()
 
-	oldMyDice, oldDM := myDice, dm
-	testDice := &dice.Dice{
-		Logger: zap.NewNop().Sugar(),
-		BaseConfig: dice.BaseConfig{
-			DataDir: t.TempDir(),
-		},
-		ImSession:    &dice.IMSession{ServiceAtNew: new(dice.SyncMap[string, *dice.GroupInfo])},
-		DirtyGroups:  new(dice.SyncMap[string, int64]),
-		AttrsManager: &dice.AttrsManager{},
-		ExtRegistry:  new(dice.SyncMap[string, *dice.ExtInfo]),
+	_, manager, testDice, _ := newDiceConfigDurableHandlerTest(t)
+	token := configureJSExecDice(t, testDice, manager)
+	return testDice, token
+}
+
+// configureJSExecDice turns a canonical durable Dice fixture into a JS-capable
+// runtime and publishes it as the API globals. It returns the JS API token.
+func configureJSExecDice(t *testing.T, testDice *dice.Dice, manager *dice.DiceManager) string {
+	t.Helper()
+
+	testDice.Logger = zap.NewNop().Sugar()
+	testDice.ImSession = &dice.IMSession{
+		Parent:       testDice,
+		PendingQuits: new(dice.SyncMap[string, *dice.PendingQuitInfo]),
 	}
-	testDice.Config.JsEngine = string(jsengine.EngineGoja)
-	manager := &dice.DiceManager{Dice: []*dice.Dice{testDice}}
+	testDice.AttrsManager = &dice.AttrsManager{}
+	if err := testDice.AttrsManager.InitDurable(testDice); err != nil {
+		t.Fatalf("initialize JS API durable attributes: %v", err)
+	}
+	t.Cleanup(testDice.AttrsManager.Stop)
+	testDice.ExtRegistry = new(dice.SyncMap[string, *dice.ExtInfo])
+	testDice.ExtList = nil
+	updateAPITestConfig(t, testDice, func(config *dice.Config) {
+		config.JsEngine = string(jsengine.EngineGoja)
+		config.JsEnable = true
+	})
 	const token = "js-api-token"
 	manager.AccessTokens.Store(token, true)
-	testDice.Parent = manager
 	myDice, dm = testDice, manager
 	t.Cleanup(func() {
 		if testDice.ExtLoopManager != nil {
 			testDice.ExtLoopManager.SetLoop(nil)
 		}
-		myDice, dm = oldMyDice, oldDM
 	})
 	testDice.JsInit()
-	return testDice, token
+	return token
 }
 
 func TestJSExecUsesConfiguredEngineLoop(t *testing.T) {
@@ -71,6 +80,24 @@ func TestJSExecUsesConfiguredEngineLoop(t *testing.T) {
 	}
 	if len(response.Outputs) != 1 || response.Outputs[0] != "configured api" {
 		t.Fatalf("outputs = %#v", response.Outputs)
+	}
+}
+
+func TestJSExecAwaitsReturnedPromiseBeforeCompletingRoot(t *testing.T) {
+	_, token := newJSExecDice(t)
+	rec := performReplyAPIRequest(t, http.MethodPost, "/sd-api/js/execute", `{"value":"return new Promise(resolve => setTimeout(() => resolve(43), 1));"}`, token, jsExec)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Ret float64 `json:"ret"`
+		Err *string `json:"err"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Err != nil || response.Ret != 43 {
+		t.Fatalf("returned Promise did not settle in the API root: %s", rec.Body.String())
 	}
 }
 
@@ -119,7 +146,9 @@ func TestJSExecProvidesCommonJSRequire(t *testing.T) {
 
 func TestJSExecRejectsConfiguredEngineMismatch(t *testing.T) {
 	testDice, token := newJSExecDice(t)
-	testDice.Config.JsEngine = "quickjs"
+	updateAPITestConfig(t, testDice, func(config *dice.Config) {
+		config.JsEngine = "quickjs"
+	})
 	rec := performReplyAPIRequest(t, http.MethodPost, "/sd-api/js/execute", `{"value":"return 42;"}`, token, jsExec)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
@@ -135,27 +164,20 @@ func TestJSExecRejectsConfiguredEngineMismatch(t *testing.T) {
 	}
 }
 
-func TestExportJSAPIValueRejectsInvalidValues(t *testing.T) {
-	if _, err := exportJSAPIValue(nil); !errors.Is(err, jsengine.ErrPrimitiveExportUnsupported) {
-		t.Fatalf("nil value error = %v, want unsupported primitive export", err)
+func TestJSExecReportsUnsupportedObjectResult(t *testing.T) {
+	_, token := newJSExecDice(t)
+	rec := performReplyAPIRequest(t, http.MethodPost, "/sd-api/js/execute", `{"value":"return {answer: 42};"}`, token, jsExec)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-
-	loop := gojaengine.New()
-	defer loop.Close()
-
-	err := loop.Run(func(runtime jsengine.Runtime) error {
-		value, err := runtime.RunString("api.js", "({ answer: 42 })")
-		if err != nil {
-			return err
-		}
-		_, err = exportJSAPIValue(value)
-		if !errors.Is(err, jsengine.ErrPrimitiveExportUnsupported) {
-			t.Fatalf("error = %v, want unsupported primitive export", err)
-		}
-		return nil
-	})
-	if err != nil {
+	var response struct {
+		Err *string `json:"err"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
+	}
+	if response.Err == nil || !strings.Contains(*response.Err, jsengine.ErrPrimitiveExportUnsupported.Error()) {
+		t.Fatalf("unsupported result error = %s", rec.Body.String())
 	}
 }
 func TestJSRuntimeStatusExposesProviderDiagnostics(t *testing.T) {
@@ -215,7 +237,6 @@ func TestJSDisablePersistsAcrossHydrationAndReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime.BaseConfig.DataDir = dataDir
-	runtime.Config.DataDir = dataDir
 	closeRuntime := func(instance *dice.Dice) {
 		if instance.JsScriptCron != nil {
 			instance.JsScriptCron.Stop()
@@ -227,8 +248,11 @@ func TestJSDisablePersistsAcrossHydrationAndReload(t *testing.T) {
 	t.Cleanup(func() { closeRuntime(runtime) })
 	server.Use(middleware.Recover())
 	runtime.Logger = zap.NewNop().Sugar()
-	runtime.Config.JsEngine = "goja"
-	runtime.Config.JsEnable = true
+	updateAPITestConfig(t, runtime, func(config *dice.Config) {
+		config.DataDir = dataDir
+		config.JsEngine = "goja"
+		config.JsEnable = true
+	})
 	runtime.ConfigManager = dice.NewConfigManager(filepath.Join(runtime.BaseConfig.DataDir, "plugin-configs.json"))
 	runtime.ConfigManager.SetOwner(runtime)
 	runtime.ExtRegistry = new(dice.SyncMap[string, *dice.ExtInfo])
@@ -320,8 +344,7 @@ seal.ext.register(ext);
 		Logger:       zap.NewNop().Sugar(),
 	}
 	restartedManager := &dice.DiceManager{
-		EventSourcedMode: true,
-		Dice:             []*dice.Dice{restarted},
+		Dice: []*dice.Dice{restarted},
 	}
 	restarted.Parent = restartedManager
 	if err := restartedManager.RestoreEventSourcedManager(context.Background(), store); err != nil {

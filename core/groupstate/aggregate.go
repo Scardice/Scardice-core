@@ -12,41 +12,33 @@ import (
 // group attrs, group-user attrs, player bindings, moderation, runtime maps, or
 // provider pointers.
 type State struct {
-	Version               uint64          `json:"version"`
-	DiceID                string          `json:"diceId"`
-	GroupID               string          `json:"groupId"`
-	GroupName             string          `json:"groupName,omitempty"`
-	InviteUserID          string          `json:"inviteUserId,omitempty"`
-	GuildID               string          `json:"guildId,omitempty"`
-	ChannelID             string          `json:"channelId,omitempty"`
-	Active                bool            `json:"active"`
-	DiceIDActive          map[string]bool `json:"diceIdActive,omitempty"`
-	DiceIDExists          map[string]bool `json:"diceIdExists,omitempty"`
-	ActivatedExtensions   []string        `json:"activatedExtensions,omitempty"`
-	InactivatedExtensions map[string]bool `json:"inactivatedExtensions,omitempty"`
-	System                string          `json:"system,omitempty"`
-	DiceSideNum           int64           `json:"diceSideNum,omitempty"`
-	DiceSideExpr          string          `json:"diceSideExpr,omitempty"`
-	RollShaperMode        string          `json:"rollShaperMode,omitempty"`
-	CocRuleIndex          int             `json:"cocRuleIndex,omitempty"`
-	HelpPackages          []string        `json:"helpPackages,omitempty"`
-	DefaultHelpGroup      string          `json:"defaultHelpGroup,omitempty"`
-	ShowGroupWelcome      bool            `json:"showGroupWelcome"`
-	GroupWelcomeMessage   string          `json:"groupWelcomeMessage,omitempty"`
-	BotList               map[string]bool `json:"botList,omitempty"`
-	Privileges            map[string]int  `json:"privileges,omitempty"`
-	EnteredAt             int64           `json:"enteredAt,omitempty"`
-	Deleted               bool            `json:"deleted"`
+	Version               uint64              `json:"version"`
+	DiceID                string              `json:"diceId"`
+	GroupID               string              `json:"groupId"`
+	GroupName             string              `json:"groupName,omitempty"`
+	InviteUserID          string              `json:"inviteUserId,omitempty"`
+	GuildID               string              `json:"guildId,omitempty"`
+	ChannelID             string              `json:"channelId,omitempty"`
+	Active                bool                `json:"active"`
+	DiceIDActive          map[string]bool     `json:"diceIdActive,omitempty"`
+	DiceIDExists          map[string]bool     `json:"diceIdExists,omitempty"`
+	ActivatedExtensions   []string            `json:"activatedExtensions,omitempty"`
+	InactivatedExtensions map[string]bool     `json:"inactivatedExtensions,omitempty"`
+	System                string              `json:"system,omitempty"`
+	DiceSideNum           int64               `json:"diceSideNum,omitempty"`
+	DiceSideExpr          string              `json:"diceSideExpr,omitempty"`
+	RollShaperMode        string              `json:"rollShaperMode,omitempty"`
+	CocRuleIndex          int                 `json:"cocRuleIndex,omitempty"`
+	HelpPackages          []string            `json:"helpPackages,omitempty"`
+	DefaultHelpGroup      string              `json:"defaultHelpGroup,omitempty"`
+	ShowGroupWelcome      bool                `json:"showGroupWelcome"`
+	GroupWelcomeMessage   string              `json:"groupWelcomeMessage,omitempty"`
+	BotList               map[string]bool     `json:"botList,omitempty"`
+	PlayerGroups          map[string][]string `json:"playerGroups,omitempty"`
+	Privileges            map[string]int      `json:"privileges,omitempty"`
+	EnteredAt             int64               `json:"enteredAt,omitempty"`
+	Deleted               bool                `json:"deleted"`
 }
-
-// GroupRecord and Aggregate are aliases for callers that name the ownership
-// boundary explicitly. They remain value state, never mutable compatibility
-// pointers.
-type GroupRecord = State
-type Aggregate = State
-type GroupState = State
-type GroupAggregate = State
-type GroupEvent = TypedEvent
 
 func (s State) Clone() State {
 	copyState := s
@@ -55,6 +47,7 @@ func (s State) Clone() State {
 	copyState.BotList = cloneBoolMap(s.BotList)
 	copyState.InactivatedExtensions = cloneBoolMap(s.InactivatedExtensions)
 	copyState.Privileges = cloneIntMap(s.Privileges)
+	copyState.PlayerGroups = cloneStringSliceMap(s.PlayerGroups)
 	copyState.ActivatedExtensions = append([]string(nil), s.ActivatedExtensions...)
 	copyState.HelpPackages = append([]string(nil), s.HelpPackages...)
 	return copyState
@@ -80,6 +73,16 @@ func cloneIntMap(input map[string]int) map[string]int {
 	}
 	return output
 }
+func cloneStringSliceMap(input map[string][]string) map[string][]string {
+	if input == nil {
+		return nil
+	}
+	output := make(map[string][]string, len(input))
+	for key, value := range input {
+		output[key] = append([]string(nil), value...)
+	}
+	return output
+}
 func ensureStateMaps(s *State) {
 	if s.DiceIDActive == nil {
 		s.DiceIDActive = map[string]bool{}
@@ -93,13 +96,16 @@ func ensureStateMaps(s *State) {
 	if s.InactivatedExtensions == nil {
 		s.InactivatedExtensions = map[string]bool{}
 	}
+	if s.PlayerGroups == nil {
+		s.PlayerGroups = map[string][]string{}
+	}
 	if s.Privileges == nil {
 		s.Privileges = map[string]int{}
 	}
 }
 
 // Reduce applies one typed fact to a copied state. The input state's maps are
-// never mutated, which keeps compatibility reads from becoming authorities.
+// never mutated, so detached reads cannot become mutation authorities.
 func Reduce(state State, event TypedEvent) (State, error) {
 	if isNilTypedEvent(event) || !event.EventType().Valid() {
 		return State{}, ErrInvalidEvent
@@ -262,13 +268,6 @@ func NewEventWithFactory(factory eventstore.EventFactory, event TypedEvent, meta
 	return factory.NewEvent(string(event.EventType()), GroupEventSchemaVersion, payload, metadata)
 }
 
-// CompatibilityView is a deep-copy read DTO. Mutating it cannot affect the
-// reducer state or any repository cache.
-type CompatibilityView struct {
-	State
-}
-
-func (s State) CompatibilityView() CompatibilityView { return CompatibilityView{State: s.Clone()} }
 func ValidateState(state State) error {
 	if state.Version == 0 {
 		return nil
@@ -304,6 +303,16 @@ func ValidateState(state State) error {
 	for userID := range state.BotList {
 		if !validScopedIdentifier(userID) {
 			return ErrInvalidState
+		}
+	}
+	for name, members := range state.PlayerGroups {
+		if !validScopedIdentifier(name) {
+			return ErrInvalidState
+		}
+		for _, userID := range members {
+			if !validScopedIdentifier(userID) {
+				return ErrInvalidState
+			}
 		}
 	}
 	for userID, level := range state.Privileges {

@@ -1,11 +1,11 @@
 package endpoint
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 
 	"Scardice-core/adapterapi"
 	"Scardice-core/eventstore"
@@ -16,24 +16,14 @@ const EndpointAggregateType = "endpoint"
 // Repository is the endpoint aggregate's event-store boundary. It deliberately
 // deals in eventstore.Store only; projections and participants remain owned by
 // the store transaction.
-type BoundPayloadCodec interface {
-	EncryptBound(ctx context.Context, domain, identity, owner string, version uint64, plaintext []byte) ([]byte, []byte, string, error)
-}
 type Repository struct {
-	Store       eventstore.Store
-	Clock       eventstore.Clock
-	Producer    string
-	EffectCodec BoundPayloadCodec
+	Store    eventstore.Store
+	Clock    eventstore.Clock
+	Producer string
 }
 
-func NewRepository(store eventstore.Store, codecs ...BoundPayloadCodec) *Repository {
-	repository := &Repository{Store: store, Clock: eventstore.SystemClock{}, Producer: "endpoint"}
-	if len(codecs) > 0 {
-		repository.EffectCodec = codecs[0]
-	} else if provider, ok := store.(BoundPayloadCodec); ok {
-		repository.EffectCodec = provider
-	}
-	return repository
+func NewRepository(store eventstore.Store) *Repository {
+	return &Repository{Store: store, Clock: eventstore.SystemClock{}, Producer: "endpoint"}
 }
 
 func endpointStream(id adapterapi.EndpointID) eventstore.StreamID {
@@ -77,9 +67,7 @@ func (r *Repository) Load(ctx context.Context, id adapterapi.EndpointID) (State,
 			return State{}, fmt.Errorf("%w: persisted event version mismatch", ErrInvalidState)
 		}
 		if event.CommandID != "" && event.CommandID != envelope.Metadata.CommandID || event.CorrelationID != "" && event.CorrelationID != envelope.Metadata.CorrelationID {
-			if !acceptsEarlyImporterEnvelopeMetadata(event, envelopeType, envelope) {
-				return State{}, fmt.Errorf("%w: persisted event metadata mismatch", ErrInvalidState)
-			}
+			return State{}, fmt.Errorf("%w: persisted event metadata mismatch", ErrInvalidState)
 		}
 		if event.ID == "" {
 			event.ID = envelope.EventID
@@ -124,30 +112,6 @@ func validateLoadedEvent(event Event, envelope eventstore.Envelope) error {
 		return fmt.Errorf("endpoint: event stream mismatch: %w", ErrInvalidState)
 	}
 	return nil
-}
-
-func acceptsEarlyImporterEnvelopeMetadata(event Event, eventType EventType, envelope eventstore.Envelope) bool {
-	if envelope.Metadata.Producer != "eventsourcing-importer" ||
-		envelope.Metadata.CommandID != envelope.EventID+"-command" ||
-		envelope.Metadata.CorrelationID != envelope.EventID+"-correlation" {
-		return false
-	}
-	endpointID := string(event.EndpointID)
-	var expectedCommandID string
-	switch eventType {
-	case EventEndpointCreated:
-		expectedCommandID = "legacy-create-" + endpointID
-	case EventDesiredEnabled:
-		expectedCommandID = "legacy-enable-" + endpointID
-	case EventOperationCompleted:
-		expectedCommandID = "legacy-complete-" + endpointID
-	default:
-		return false
-	}
-	const correlationPrefix = "legacy-import-"
-	return event.CommandID == expectedCommandID &&
-		strings.HasPrefix(event.CorrelationID, correlationPrefix) &&
-		len(event.CorrelationID) > len(correlationPrefix)
 }
 
 func validateDecisionEffects(decision Decision) error {
@@ -198,7 +162,7 @@ func validateDecisionEvent(previous State, streamID adapterapi.EndpointID, event
 	if event.Sequence == 0 || event.AggregateVersion == 0 || event.Sequence != event.AggregateVersion || event.Sequence != previous.Version+uint64(index)+1 {
 		return fmt.Errorf("%w: decision event version mismatch", ErrInvalidState)
 	}
-	if event.CommandID == "" || event.CorrelationID == "" || event.OperationID == "" || event.CommandDigest == "" {
+	if event.CommandID == "" || event.CorrelationID == "" || !validEventOperation(event.Type, event.OperationState, event.OperationID) || event.CommandDigest == "" {
 		return fmt.Errorf("%w: decision event metadata missing", ErrInvalidState)
 	}
 	expectedID := eventID(event.EndpointID, event.CommandID, event.CorrelationID, event.Sequence, event.Type)
@@ -211,9 +175,8 @@ func (r *Repository) Commit(ctx context.Context, previous State, decision Decisi
 	return r.commitWithSecrets(ctx, previous, decision, nil)
 }
 
-// CommitWithSecret encrypts one transient secret and adds its SecretUpdate to
-// the same UnitOfWork as the endpoint event. It never stores or serializes the
-// plaintext. A Store.Commit failure therefore rolls back both participants.
+// CommitWithSecret atomically persists one transient secret together with the
+// endpoint event, then scrubs the caller-owned plaintext before returning.
 func (r *Repository) CommitWithSecret(ctx context.Context, previous State, decision Decision, input *SecretInput) (eventstore.CommitResult, error) {
 	if input == nil {
 		return r.commitWithSecrets(ctx, previous, decision, nil)
@@ -221,9 +184,9 @@ func (r *Repository) CommitWithSecret(ctx context.Context, previous State, decis
 	return r.commitWithSecrets(ctx, previous, decision, []SecretInput{*input})
 }
 
-// CommitWithSecrets atomically encrypts all transient secret updates together
-// with the endpoint event. The caller owns the plaintext lifetime; this method
-// scrubs every input before returning.
+// CommitWithSecrets atomically persists transient secrets together with the
+// endpoint event. The caller owns the plaintext lifetime; this method scrubs
+// every input before returning.
 func (r *Repository) CommitWithSecrets(ctx context.Context, previous State, decision Decision, inputs []SecretInput) (eventstore.CommitResult, error) {
 	return r.commitWithSecrets(ctx, previous, decision, inputs)
 }
@@ -293,7 +256,7 @@ func (r *Repository) commitWithSecrets(ctx context.Context, previous State, deci
 			return eventstore.CommitResult{}, err
 		}
 		appendEvents = append(appendEvents, newEvent)
-		if event.Type == EventEndpointIdentityObserved || event.Type == EventLegacyMetadataRestored {
+		if event.Type == EventBaselineImported || event.Type == EventEndpointIdentityObserved {
 			continue
 		}
 		status := string(event.OperationState)
@@ -344,9 +307,6 @@ func (r *Repository) commitWithSecrets(ctx context.Context, previous State, deci
 		if input.Ref == "" || input.Version == 0 || len(input.Plaintext) == 0 || len(input.Plaintext) > eventstore.MaxSecretBytes {
 			return eventstore.CommitResult{}, fmt.Errorf("%w: invalid transient secret input", ErrInvalidState)
 		}
-		if r.EffectCodec == nil {
-			return eventstore.CommitResult{}, eventstore.ErrEncryptionUnavailable
-		}
 		matched := false
 		adapterID := ""
 		for _, event := range decision.Events {
@@ -362,20 +322,17 @@ func (r *Repository) commitWithSecrets(ctx context.Context, previous State, deci
 		if !matched || adapterID == "" {
 			return eventstore.CommitResult{}, fmt.Errorf("%w: transient secret reference is not part of endpoint config", ErrInvalidState)
 		}
-		plaintext := append([]byte(nil), input.Plaintext...)
-		ciphertext, nonce, keyID, err := r.EffectCodec.EncryptBound(ctx, "adapter-secret/v1", input.Ref, string(streamID)+"/"+adapterID, input.Version, plaintext)
-		for clearIndex := range plaintext {
-			plaintext[clearIndex] = 0
-		}
-		if err != nil {
-			return eventstore.CommitResult{}, eventstore.ErrEncryptionUnavailable
-		}
 		work.SecretUpdates = append(work.SecretUpdates, eventstore.SecretUpdate{
 			SecretRef: input.Ref, ExpectedVersion: input.ExpectedVersion,
 			EndpointID: string(streamID), AdapterID: adapterID, SecretVersion: input.Version,
-			Ciphertext: ciphertext, Nonce: nonce, EncryptionKeyID: keyID,
+			Value: bytes.Clone(input.Plaintext), ValueSet: true,
 		})
 	}
+	defer func() {
+		for i := range work.SecretUpdates {
+			clear(work.SecretUpdates[i].Value)
+		}
+	}()
 	return r.Store.Commit(ctx, work)
 }
 func (r *Repository) Save(ctx context.Context, previous State, decision Decision) (eventstore.CommitResult, error) {

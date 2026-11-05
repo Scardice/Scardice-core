@@ -2,32 +2,31 @@ package dice
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"Scardice-core/adapterapi"
 	"Scardice-core/core/messageflow"
 	"Scardice-core/endpoint"
+	"Scardice-core/eventstore"
 	"Scardice-core/logger"
 )
 
-// bindAdapterEventConversation supplies the already-projected compatibility
-// scope used to select extensions. It never creates a group or player.
-func (h *DurableCallbackHost) bindAdapterEventConversation(mctx *MsgContext, scope messageflow.CallbackScope) {
+// bindAdapterEventConversation resolves only existing canonical owners. A
+// protocol event cannot manufacture a conversation merely to select hooks.
+func (h *DurableCallbackHost) bindAdapterEventConversation(mctx *MsgContext, scope messageflow.CallbackScope) error {
 	if h == nil || h.dice == nil || h.dice.ImSession == nil || mctx == nil {
-		return
+		return messageflow.ErrCallbackUnavailable
 	}
-	if mctx.Group == nil {
-		mctx.Group, _ = h.dice.ImSession.ServiceAtNew.Load(scope.GroupID)
-	}
-	if mctx.Player == nil && mctx.Group != nil {
-		mctx.Player, _ = mctx.Group.Players.Load(scope.UserID)
+	if err := mctx.ResolveExistingDomainConversation(scope.GroupID, scope.UserID); err != nil {
+		return err
 	}
 	mctx.IsCurGroupBotOn = mctx.MessageType == "group" && mctx.Group != nil && mctx.Group.IsActive(mctx)
+	return nil
 }
 
-// HandleAdapterEvent delivers a conversation-free event without manufacturing
-// compatibility group/player state. Admission serializes it with durable
-// callbacks, while the worker context bounds every awaited JavaScript task.
+// HandleAdapterEvent gives an endpoint-only event its own durable invocation;
+// it has no fabricated group/player and does not hold an execution-wide lock.
 func (h *DurableCallbackHost) HandleAdapterEvent(ctx context.Context, fenced endpoint.FencedAdapterEvent) (adapterapi.IngressReceipt, error) {
 	if h == nil || h.dice == nil || h.dice.ImSession == nil {
 		return adapterapi.IngressReceipt{}, messageflow.ErrCallbackUnavailable
@@ -41,28 +40,30 @@ func (h *DurableCallbackHost) HandleAdapterEvent(ctx context.Context, fenced end
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	callbackCtx, releaseAdmission, err := h.BeginCallback(ctx)
+	request, err := json.Marshal(fenced)
 	if err != nil {
 		return adapterapi.IngressReceipt{}, err
 	}
-	defer releaseAdmission()
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if err := callbackCtx.Err(); err != nil {
+	invocation, err := (eventstore.UUIDGenerator{}).NewID()
+	if err != nil {
 		return adapterapi.IngressReceipt{}, err
 	}
-
-	endpointInfo := compatibilityAdapterEventEndpoint(h.dice.ImSession, string(fenced.EndpointID))
-	carrier := &MsgContext{
-		Dice: h.dice, Session: h.dice.ImSession, EndPoint: endpointInfo,
-		executionContext: callbackCtx,
-	}
-	defer carrier.releaseExecutionState()
-	dispatchErr := safeDispatchGlobalAdapterEvent(h.dice, carrier, fenced.Event, endpointInfo)
-	if stopErr := carrier.stopJSExecution(); dispatchErr == nil {
-		dispatchErr = stopErr
-	}
+	dispatchErr := h.dice.WithDomainExecution(ctx, h.dice.DomainExecutionIdentity("adapter-event", invocation), request, func(transaction *DurableCallbackTransaction) error {
+		if err := transaction.checkEndpointFence(transaction.executionContext, fenced.EndpointID, fenced.Generation, fenced.DesiredVersion); err != nil {
+			return err
+		}
+		endpointInfo := compatibilityAdapterEventEndpoint(h.dice.ImSession, string(fenced.EndpointID))
+		carrier := &MsgContext{
+			Dice: h.dice, Session: h.dice.ImSession, EndPoint: endpointInfo,
+			executionContext:    transaction.executionContext,
+			callbackTransaction: transaction, callbackMetadata: transaction.metadata,
+		}
+		defer carrier.releaseExecutionState()
+		if err := safeDispatchGlobalAdapterEvent(h.dice, carrier, fenced.Event, endpointInfo); err != nil {
+			return err
+		}
+		return carrier.stopJSExecution()
+	})
 	if dispatchErr != nil {
 		log := h.dice.Logger
 		if log == nil {
@@ -87,7 +88,6 @@ func compatibilityAdapterEventEndpoint(session *IMSession, endpointID string) *E
 	if session != nil {
 		for _, endpointInfo := range session.EndPointsReadOnly() {
 			if endpointInfo != nil && endpointInfo.ID == endpointID {
-				endpointInfo.Session = session
 				return endpointInfo
 			}
 		}

@@ -119,7 +119,7 @@ func TestLifecycleSinkIgnoresStaleDesiredVersionWithinGeneration(t *testing.T) {
 	store, db := serviceStore(t)
 	defer db.Close()
 	key := adapterapi.AdapterKey("fake")
-	service := NewService(store, serviceRegistry{key: serviceDescriptor{key: key}}, &lifecycleCodec{})
+	service := NewService(store, serviceRegistry{key: serviceDescriptor{key: key}})
 	id := adapterapi.EndpointID("bootstrap-stale-version")
 	if _, err := service.Create(ctx, Command{CommandID: "create", CorrelationID: "create", EndpointID: id, AdapterKey: key, Config: adapterapi.ValidatedConfig{Version: 1, Canonical: json.RawMessage(`{"x":1}`)}}); err != nil {
 		t.Fatal(err)
@@ -172,7 +172,7 @@ func TestLifecycleSinkPersistsRepeatedObservedStateTransition(t *testing.T) {
 	store, db := serviceStore(t)
 	defer db.Close()
 	key := adapterapi.AdapterKey("fake")
-	service := NewService(store, serviceRegistry{key: serviceDescriptor{key: key}}, &lifecycleCodec{})
+	service := NewService(store, serviceRegistry{key: serviceDescriptor{key: key}})
 	id := adapterapi.EndpointID("bootstrap-repeated-observation")
 	if _, err := service.Create(ctx, Command{CommandID: "create", CorrelationID: "create", EndpointID: id, AdapterKey: key, Config: adapterapi.ValidatedConfig{Version: 1, Canonical: json.RawMessage(`{"x":1}`)}}); err != nil {
 		t.Fatal(err)
@@ -208,7 +208,7 @@ func TestLifecycleSinkPersistsReconnectionWithinOneRuntime(t *testing.T) {
 	store, db := serviceStore(t)
 	defer db.Close()
 	key := adapterapi.AdapterKey("fake")
-	service := NewService(store, serviceRegistry{key: serviceDescriptor{key: key}}, &lifecycleCodec{})
+	service := NewService(store, serviceRegistry{key: serviceDescriptor{key: key}})
 	id := adapterapi.EndpointID("bootstrap-runtime-reconnection")
 	if _, err := service.Create(ctx, Command{CommandID: "create", CorrelationID: "create", EndpointID: id, AdapterKey: key, Config: adapterapi.ValidatedConfig{Version: 1, Canonical: json.RawMessage(`{"x":1}`)}}); err != nil {
 		t.Fatal(err)

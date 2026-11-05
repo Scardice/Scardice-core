@@ -17,27 +17,16 @@ type lifecycleStartupSource struct {
 	ready  error
 }
 
-func (s *lifecycleStartupSource) ValidateReadiness(context.Context) error { return s.ready }
+func (s *lifecycleStartupSource) GetReadiness(context.Context) (eventstore.Readiness, error) {
+	return eventstore.Readiness{Mode: "import"}, s.ready
+}
+func (*lifecycleStartupSource) SetReadiness(context.Context, eventstore.Readiness) error {
+	return nil
+}
 func (s *lifecycleStartupSource) ListEndpointStates(context.Context) ([]State, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]State(nil), s.states...), nil
-}
-
-type lifecycleMetadataStartupSource struct {
-	lifecycleStartupSource
-	metadataCalls   int
-	validationCalls int
-}
-
-func (s *lifecycleMetadataStartupSource) GetReadinessMetadata(context.Context) (eventstore.Readiness, error) {
-	s.metadataCalls++
-	return eventstore.Readiness{Mode: "import"}, nil
-}
-
-func (s *lifecycleMetadataStartupSource) ValidateReadiness(context.Context) error {
-	s.validationCalls++
-	return errors.New("exhaustive validation must be opt-in")
 }
 
 type lifecycleTestRebuilder struct {
@@ -111,17 +100,6 @@ func TestStartupRequiresStoreReadinessBeforeReplay(t *testing.T) {
 	}
 	if got := descriptor.RuntimeCount(); got != 0 {
 		t.Fatalf("runtime constructed before readiness: %d", got)
-	}
-}
-
-func TestStartupUsesLightweightReadinessMetadataByDefault(t *testing.T) {
-	source := &lifecycleMetadataStartupSource{}
-	lifecycle := NewEndpointLifecycle(NewSupervisor(nil), source)
-	if _, err := lifecycle.Startup(context.Background()); err != nil {
-		t.Fatalf("startup with valid metadata: %v", err)
-	}
-	if source.metadataCalls != 1 || source.validationCalls != 0 {
-		t.Fatalf("readiness calls: metadata=%d exhaustive=%d", source.metadataCalls, source.validationCalls)
 	}
 }
 
@@ -207,10 +185,10 @@ type blockingLifecycleStore struct {
 	once    sync.Once
 }
 
-func (s *blockingLifecycleStore) ValidateReadiness(context.Context) error {
+func (s *blockingLifecycleStore) GetReadiness(context.Context) (eventstore.Readiness, error) {
 	s.once.Do(func() { close(s.entered) })
 	<-s.release
-	return nil
+	return eventstore.Readiness{Mode: "import"}, nil
 }
 
 func TestLifecycleShutdownWaitsForStartupAndRejectsAfterClose(t *testing.T) {

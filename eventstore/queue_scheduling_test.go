@@ -10,13 +10,6 @@ import (
 	"gorm.io/gorm"
 )
 
-func queueSchedulingMigrateFixture(t testing.TB, db *Database) {
-	t.Helper()
-	if err := migrateQueueScheduling(db.GORM()); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestQueueSchedulingMigrationBatchPlansUseVersionIndexesWithoutTempSort(t *testing.T) {
 	_, db, _ := openQueueTestStore(t)
 	defer db.Close()
@@ -201,7 +194,6 @@ func TestQueueSchedulingPreservesInflightBlockingAndIsolationProgress(t *testing
 		defer db.Close()
 		ctx := context.Background()
 		head := newInboxTestUpdate("isolated-inbox-head", "isolated-inbox-head-provider", "isolated-inbox-lane")
-		head.PayloadExpiresAt = clock.Now().Add(time.Minute)
 		if _, err := store.AcceptInbox(ctx, head); err != nil {
 			t.Fatal(err)
 		}
@@ -329,11 +321,10 @@ func queueSchedulingRestoreLegacyLaneHeadSchema(t *testing.T, db *Database) {
 	}
 	defer tx.Rollback()
 	for _, statement := range []string{
-		`CREATE TABLE lane_heads_legacy (kind varchar(32) NOT NULL, lane_hmac blob NOT NULL, next_sequence integer NOT NULL, updated_at datetime NOT NULL, PRIMARY KEY (kind, lane_hmac))`,
-		`INSERT INTO lane_heads_legacy(kind, lane_hmac, next_sequence, updated_at) SELECT kind, lane_hmac, next_sequence, updated_at FROM lane_heads`,
+		`CREATE TABLE lane_heads_legacy (id integer PRIMARY KEY AUTOINCREMENT, kind varchar(32) NOT NULL, lane text NOT NULL, lookup_digest blob NOT NULL, next_sequence integer NOT NULL, updated_at datetime NOT NULL)`,
+		`INSERT INTO lane_heads_legacy(id, kind, lane, lookup_digest, next_sequence, updated_at) SELECT id, kind, lane, lookup_digest, next_sequence, updated_at FROM lane_heads`,
 		`DROP TABLE lane_heads`,
 		`ALTER TABLE lane_heads_legacy RENAME TO lane_heads`,
-		`CREATE UNIQUE INDEX pk_lane_heads ON lane_heads(kind, lane_hmac)`,
 	} {
 		if err := tx.Exec(statement).Error; err != nil {
 			t.Fatal(err)
@@ -352,7 +343,7 @@ func TestQueueSchedulingMigratesLegacyLaneCursors(t *testing.T) {
 			t.Fatal(err)
 		}
 		clock := &queueTestClock{now: time.Unix(100, 0).UTC()}
-		store := NewStore(db, WithClock(clock), WithPayloadCodec(queueTestCodec{}))
+		store := NewStore(db, WithClock(clock))
 		for _, id := range []string{"legacy-inbox-first", "legacy-inbox-ready"} {
 			if _, err := store.AcceptInbox(context.Background(), newInboxTestUpdate(id, id+"-provider", "legacy-inbox-old-lane")); err != nil {
 				t.Fatal(err)
@@ -373,7 +364,7 @@ func TestQueueSchedulingMigratesLegacyLaneCursors(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer db.Close()
-		store = NewStore(db, WithClock(clock), WithPayloadCodec(queueTestCodec{}))
+		store = NewStore(db, WithClock(clock))
 		third, err := store.AcceptInbox(context.Background(), newInboxTestUpdate("legacy-inbox-third", "legacy-inbox-third-provider", "legacy-inbox-old-lane"))
 		if err != nil || third.OrderingSequence != 3 {
 			t.Fatalf("post-migration lane cursor = %#v, %v; want sequence 3", third, err)
@@ -395,7 +386,7 @@ func TestQueueSchedulingMigratesLegacyLaneCursors(t *testing.T) {
 			t.Fatal(err)
 		}
 		clock := &queueTestClock{now: time.Unix(100, 0).UTC()}
-		store := NewStore(db, WithClock(clock), WithPayloadCodec(queueTestCodec{}))
+		store := NewStore(db, WithClock(clock))
 		for _, id := range []string{"legacy-outbox-first", "legacy-outbox-ready"} {
 			if _, err := store.AcceptOutbox(context.Background(), newOutboxTestEffect(id, "legacy-outbox-old-lane")); err != nil {
 				t.Fatal(err)
@@ -416,7 +407,7 @@ func TestQueueSchedulingMigratesLegacyLaneCursors(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer db.Close()
-		store = NewStore(db, WithClock(clock), WithPayloadCodec(queueTestCodec{}))
+		store = NewStore(db, WithClock(clock))
 		third, err := store.AcceptOutbox(context.Background(), newOutboxTestEffect("legacy-outbox-third", "legacy-outbox-old-lane"))
 		if err != nil || third.OrderingSequence != 3 {
 			t.Fatalf("post-migration lane cursor = %#v, %v; want sequence 3", third, err)
@@ -432,9 +423,9 @@ func TestQueueSchedulingMigratesLegacyLaneCursors(t *testing.T) {
 	})
 }
 
-func queueSchedulingForceReadyCursor(t *testing.T, db *Database, kind string, lane []byte, id string, sequence uint64, now time.Time) {
+func queueSchedulingForceReadyCursor(t *testing.T, db *Database, kind string, lane string, id string, sequence uint64, now time.Time) {
 	t.Helper()
-	if err := db.GORM().Model(&laneHeadRow{}).Where("kind = ? AND lane_hmac = ?", kind, lane).Updates(map[string]any{
+	if err := laneQuery(db.GORM().Model(&laneHeadRow{}), kind, lane).Updates(map[string]any{
 		"active_id": id, "active_sequence": sequence, "active_since": now,
 		"ready_at": now, "ready_action": queueReadyActionClaim,
 		"scheduling_version": queueSchedulingVersion,
@@ -461,7 +452,7 @@ func TestQueueSchedulingClaimValidatesCursorAgainstCurrentRow(t *testing.T) {
 		if err := db.GORM().Where("inbox_id = ?", update.InboxID).First(&before).Error; err != nil {
 			t.Fatal(err)
 		}
-		queueSchedulingForceReadyCursor(t, db, inboxLaneKind, before.LaneHMAC, before.InboxID, before.OrderingSequence, clock.Now())
+		queueSchedulingForceReadyCursor(t, db, inboxLaneKind, before.Lane, before.InboxID, before.OrderingSequence, clock.Now())
 		if _, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "stale-terminal-inbox-claim"}); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("terminal cursor claim err = %v, want not found", err)
 		}
@@ -491,7 +482,7 @@ func TestQueueSchedulingClaimValidatesCursorAgainstCurrentRow(t *testing.T) {
 		if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&before).Error; err != nil {
 			t.Fatal(err)
 		}
-		queueSchedulingForceReadyCursor(t, db, outboxLaneKind, before.LaneHMAC, before.EffectID, before.OrderingSequence, clock.Now())
+		queueSchedulingForceReadyCursor(t, db, outboxLaneKind, before.Lane, before.EffectID, before.OrderingSequence, clock.Now())
 		if _, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "stale-terminal-outbox-claim"}); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("terminal cursor claim err = %v, want not found", err)
 		}
@@ -517,7 +508,7 @@ func TestQueueSchedulingClaimValidatesCursorAgainstCurrentRow(t *testing.T) {
 		if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&before).Error; err != nil {
 			t.Fatal(err)
 		}
-		queueSchedulingForceReadyCursor(t, db, outboxLaneKind, before.LaneHMAC, before.EffectID, before.OrderingSequence, clock.Now())
+		queueSchedulingForceReadyCursor(t, db, outboxLaneKind, before.Lane, before.EffectID, before.OrderingSequence, clock.Now())
 		if _, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "stale-future-outbox-claim"}); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("future cursor claim err = %v, want not found", err)
 		}

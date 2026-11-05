@@ -18,17 +18,6 @@ import (
 	"Scardice-core/utils/jsengine"
 )
 
-func exportJSAPIValue(value jsengine.Value) (interface{}, error) {
-	if value == nil {
-		return nil, jsengine.ErrPrimitiveExportUnsupported
-	}
-	primitive, err := value.ExportPrimitive()
-	if errors.Is(err, jsengine.ErrNoPrimitiveValue) {
-		return primitive, nil
-	}
-	return primitive, err
-}
-
 func jsExec(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
@@ -38,7 +27,7 @@ func jsExec(c echo.Context) error {
 			"testMode": true,
 		})
 	}
-	if !myDice.Config.JsEnable {
+	if !myDice.Config().JsEnable {
 		resp := c.JSON(200, map[string]interface{}{
 			"result": false,
 			"err":    "js扩展支持已关闭",
@@ -55,7 +44,7 @@ func jsExec(c echo.Context) error {
 	}
 
 	source := "(function(exports, require, module) {" + v.Value + "\n})({}, globalThis.require, {exports: {}})"
-	engine := jsengine.NormalizeEngineID(myDice.Config.JsEngine)
+	engine := jsengine.NormalizeEngineID(myDice.Config().JsEngine)
 	if engine == "" {
 		engine = jsengine.EngineGoja
 	}
@@ -74,14 +63,7 @@ func jsExec(c echo.Context) error {
 	} else if loop.Engine() != engine {
 		err = fmt.Errorf("JS运行时与配置不匹配: configured=%s active=%s", engine, loop.Engine())
 	} else {
-		err = loop.Run(func(runtime jsengine.Runtime) error {
-			ret, runErr := runtime.RunString("api-js-exec.js", source)
-			if runErr != nil {
-				return runErr
-			}
-			retFinal, runErr = exportJSAPIValue(ret)
-			return runErr
-		})
+		retFinal, err = myDice.ExecuteJS(c.Request().Context(), "api-js-exec.js", source)
 	}
 	outputs := myDice.JsPrinter.RecordEnd()
 
@@ -104,7 +86,7 @@ func jsGetRecord(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
 	}
-	if !myDice.Config.JsEnable {
+	if !myDice.Config().JsEnable {
 		resp := c.JSON(200, map[string]interface{}{
 			"outputs": []string{},
 		})
@@ -127,7 +109,7 @@ func jsDelete(c echo.Context) error {
 			"testMode": true,
 		})
 	}
-	if !myDice.Config.JsEnable {
+	if !myDice.Config().JsEnable {
 		resp := c.JSON(200, map[string]interface{}{
 			"result": false,
 			"err":    "js扩展支持已关闭",
@@ -256,7 +238,7 @@ func applyUploadedJs(destination string, overwritten bool) jsUploadResponse {
 		response.Reason = "覆盖了已有文件，需要手动重载插件"
 		return response
 	}
-	if !myDice.Config.JsEnable {
+	if !myDice.Config().JsEnable {
 		response.Reason = "JS 支持未开启"
 		return response
 	}
@@ -295,7 +277,7 @@ func jsList(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
 	}
-	if !myDice.Config.JsEnable {
+	if !myDice.Config().JsEnable {
 		resp := c.JSON(200, []*dice.JsScriptInfo{})
 		return resp
 	}
@@ -381,7 +363,13 @@ func jsShutdown(c echo.Context) error {
 		})
 	}
 
-	if myDice.Config.JsEnable {
+	if myDice.Config().JsEnable {
+		if err := myDice.DurableMutateConfig(c.Request().Context(), "js-shutdown", false, func(config *dice.Config) error {
+			config.JsEnable = false
+			return nil
+		}); err != nil {
+			return Error(&c, err.Error(), Response{"code": "config_update_failed"})
+		}
 		myDice.JsShutdown()
 	}
 
@@ -393,7 +381,7 @@ func jsShutdown(c echo.Context) error {
 func jsStatus(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]interface{}{
 		"result": true,
-		"status": myDice.Config.JsEnable,
+		"status": myDice.Config().JsEnable,
 	})
 }
 
@@ -486,7 +474,7 @@ func jsUpdate(c echo.Context) error {
 	if dm.JustForTest {
 		return Error(&c, "展示模式不支持该操作", Response{"testMode": true})
 	}
-	if !myDice.Config.JsEnable {
+	if !myDice.Config().JsEnable {
 		return Error(&c, "js扩展支持已关闭", Response{})
 	}
 

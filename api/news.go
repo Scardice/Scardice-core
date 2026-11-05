@@ -9,6 +9,8 @@ import (
 	"github.com/monaco-io/request"
 	"github.com/tdewolff/minify/v2"
 	hm "github.com/tdewolff/minify/v2/html"
+
+	"Scardice-core/dice"
 )
 
 func getNews(c echo.Context) error {
@@ -29,7 +31,7 @@ func getNews(c echo.Context) error {
 		}
 		return c.JSON(http.StatusOK, map[string]interface{}{
 			"result":   true,
-			"checked":  mark == myDice.Config.NewsMark,
+			"checked":  mark == myDice.Config().NewsMark,
 			"news":     news,
 			"newsMark": mark,
 		})
@@ -55,8 +57,13 @@ func checkNews(c echo.Context) error {
 	err := c.Bind(&v)
 
 	if err == nil {
-		(&myDice.Config).NewsMark = v.NewsMark
-		myDice.MarkModified()
+		err = myDice.DurableMutateConfig(c.Request().Context(), "news-mark", v, func(config *dice.Config) error {
+			config.NewsMark = v.NewsMark
+			return nil
+		})
+		if err != nil {
+			return c.JSON(http.StatusConflict, map[string]interface{}{"result": false, "err": err.Error()})
+		}
 		return c.JSON(http.StatusOK, map[string]interface{}{
 			"result":   true,
 			"newsMark": v.NewsMark,

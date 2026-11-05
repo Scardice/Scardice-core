@@ -11,13 +11,15 @@ import (
 	"strings"
 	"time"
 
-	milky "github.com/Szzrain/Milky-go-sdk"
-	"go.uber.org/zap"
-
 	"Scardice-core/adapterapi"
+	"Scardice-core/core/groupstate"
 	"Scardice-core/logger"
 	"Scardice-core/message"
 	"Scardice-core/utils/procs"
+
+	milky "github.com/Szzrain/Milky-go-sdk"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
 )
 
 // Merged-forward expansion is bounded so a hostile or cyclic forward cannot
@@ -44,13 +46,14 @@ type PlatformAdapterMilky struct {
 
 type MilkyLoginState int64
 
+// MilkyLoginState values reach the WebUI as loginState, so the numbers are
+// fixed; 1 is not produced by the Milky login flow.
 const (
-	MilkyLoginStateInit MilkyLoginState = iota
-	MilkyLoginStatePlaceholder
-	MilkyLoginStateQRWaitingForScan
-	MilkyLoginStateConnecting
-	MilkyLoginStateQRConnected
-	MilkyLoginStateFailed
+	MilkyLoginStateInit                MilkyLoginState = 0
+	MilkyLoginStateQRWaitingForScan    MilkyLoginState = 2
+	MilkyLoginStateConnecting          MilkyLoginState = 3
+	MilkyLoginStateQRConnected         MilkyLoginState = 4
+	MilkyLoginStateFailed              MilkyLoginState = 5
 	MilkyLoginStateQRWaitingForConfirm MilkyLoginState = 8
 	MilkyLoginStateCancelled           MilkyLoginState = 9
 	MilkyLoginStateCodeExpired         MilkyLoginState = 12
@@ -131,20 +134,56 @@ func (pa *PlatformAdapterMilky) GetGroupInfoAsync(groupID string) {
 		log.Warnf("Group info for %s is nil", groupID)
 		return
 	}
-	dm := pa.EndPoint.Session.Parent.Parent
-	dm.GroupNameCache.Store(groupID, &GroupNameCacheItem{
-		Name: groupInfoMilky.Name,
-		time: time.Now().Unix(),
-	})
 	session := pa.EndPoint.Session
-	groupInfo, ok := session.ServiceAtNew.Load(groupID)
-	if ok {
-		if groupInfoMilky.Name != groupInfo.GroupName {
-			// 更新群名
-			groupInfo.GroupName = groupInfoMilky.Name
-			groupInfo.MarkDirty(session.Parent)
-		}
+	if session == nil || session.Parent == nil {
+		log.Errorf("Cannot persist group info for %s: Dice session unavailable", groupID)
+		return
 	}
+	if err = pa.applyMilkyGroupInfoObservation(context.Background(), groupID, groupInfoMilky.Name); err != nil {
+		log.Errorf("Failed to persist group info for %s: %v", groupID, err)
+		return
+	}
+	if manager := session.Parent.Parent; manager != nil {
+		manager.GroupNameCache.Store(groupID, &GroupNameCacheItem{
+			Name: groupInfoMilky.Name,
+			time: time.Now().Unix(),
+		})
+	}
+}
+
+func (pa *PlatformAdapterMilky) applyMilkyGroupInfoObservation(ctx context.Context, groupID, groupName string) error {
+	if pa == nil || pa.EndPoint == nil || pa.EndPoint.Session == nil || pa.EndPoint.Session.Parent == nil {
+		return errors.New("milky: Dice session unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	d := pa.EndPoint.Session.Parent
+	request, err := json.Marshal(struct {
+		GroupID   string `json:"groupId"`
+		GroupName string `json:"groupName"`
+	}{GroupID: groupID, GroupName: groupName})
+	if err != nil {
+		return err
+	}
+	identity := d.DomainExecutionIdentity("milky-group-info", uuid.NewString())
+	return d.WithDomainExecution(ctx, identity, request, func(transaction *DurableCallbackTransaction) error {
+		runCtx := transaction.executionContext
+		if runCtx == nil {
+			runCtx = ctx
+		}
+		group, loadErr := transaction.Domain().Group(runCtx, d.BaseConfig.Name, groupID)
+		if loadErr != nil {
+			return loadErr
+		}
+		if group.Version() == 0 || group.Deleted() || group.GroupName() == groupName {
+			return nil
+		}
+		if loadErr = group.Decide(groupstate.Command{Kind: groupstate.CommandName, GroupName: groupName}); loadErr != nil {
+			return loadErr
+		}
+		return transaction.Domain().Err()
+	})
 }
 
 func (pa *PlatformAdapterMilky) convertMilkyReceivedSegments(segments []milky.IMessageElement, depth int) []message.IMessageElement {
@@ -367,7 +406,9 @@ func (pa *PlatformAdapterMilky) SendToGroup(ctx *MsgContext, groupID string, tex
 	go func(targets []int64) {
 		for _, userID := range targets {
 			log.Debugf("Sending group Nudge: %d", userID)
-			_ = pa.IntentSession.SendGroupNudge(id, userID)
+			if nudgeErr := pa.IntentSession.SendGroupNudge(id, userID); nudgeErr != nil {
+				log.Errorf("Failed to send group Nudge to %d: %v", userID, nudgeErr)
+			}
 			doSleepQQ(ctx)
 		}
 	}(nudgeTargets)
@@ -475,14 +516,18 @@ func (pa *PlatformAdapterMilky) getGroupMemberInfo(groupID string, userID string
 
 func (pa *PlatformAdapterMilky) SetGroupCardName(ctx *MsgContext, cardName string) {
 	log := zap.S().Named(logger.LogKeyAdapter)
-	groupID := ctx.Group.GroupID
+	if ctx == nil || ctx.Group == nil || ctx.Player == nil {
+		log.Error("Cannot set Milky group card: group/player context unavailable")
+		return
+	}
+	groupID := ctx.Group.GroupID()
 	rawGroupID := ExtractQQGroupID(groupID)
 	rawGroupIDInt, err := strconv.ParseInt(rawGroupID, 10, 64)
 	if err != nil {
 		log.Errorf("Invalid group ID %s: %v", groupID, err)
 		return
 	}
-	userID := ctx.Player.UserID
+	userID := ctx.Player.UserID()
 	rawUserID := ExtractQQUserID(userID)
 	rawUserIDInt, err := strconv.ParseInt(rawUserID, 10, 64)
 	if err != nil {

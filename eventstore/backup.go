@@ -11,12 +11,6 @@ import (
 
 var ErrSnapshotUnsupported = errors.New("eventstore: consistent backup snapshot unsupported")
 
-// BackupKeyFile is a configured local key-source file packaged at Name.
-type BackupKeyFile struct {
-	Name string
-	Data []byte
-}
-
 // SnapshotSQLite writes a consistent SQLite snapshot, including committed WAL
 // transactions, using SQLite's VACUUM INTO operation.
 func (s *GORMStore) SnapshotSQLite(ctx context.Context, destination string) error {
@@ -90,75 +84,4 @@ func (s *GORMStore) SnapshotSQLite(ctx context.Context, destination string) erro
 		return fmt.Errorf("eventstore: close SQLite snapshot: %w", closeErr)
 	}
 	return nil
-}
-
-// BackupKeyFiles exports the configured local file-backed keys. Other key
-// sources remain external and are reported as such to the backup caller.
-func (s *GORMStore) BackupKeyFiles(ctx context.Context) ([]BackupKeyFile, bool, error) {
-	if s == nil || s.db == nil || s.keySource == nil {
-		return nil, false, ErrKeySourceUnavailable
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	readiness, err := s.GetReadiness(ctx)
-	if err != nil {
-		return nil, false, fmt.Errorf("eventstore: read backup key readiness: %w", err)
-	}
-	indexID, _, err := keySourceIndex(ctx, s.keySource)
-	if err != nil || indexID != readiness.IndexRootID {
-		return nil, false, ErrKeyUnavailable
-	}
-	current, err := s.keySource.CurrentEncryptionRoot(ctx)
-	if err != nil {
-		return nil, false, ErrKeyUnavailable
-	}
-	local, ok := s.keySource.(*LocalFileKeySource)
-	if !ok {
-		for _, id := range readiness.EncryptionRootIDs {
-			if _, err := s.keySource.EncryptionRoot(ctx, id); err != nil {
-				return nil, false, ErrKeyUnavailable
-			}
-		}
-		return nil, true, nil
-	}
-	index, err := backupLocalKeyFile(local.IndexPath)
-	if err != nil {
-		return nil, false, fmt.Errorf("eventstore: export configured index key: %w", err)
-	}
-	roots, err := local.EncryptionRoots(ctx)
-	if err != nil {
-		return nil, false, fmt.Errorf("eventstore: export configured encryption roots: %w", err)
-	}
-	files := make([]BackupKeyFile, 0, len(roots)+2)
-	files = append(files, BackupKeyFile{Name: "data/endpoint/keys/index.key", Data: index})
-	rootIDs := make(map[string]struct{}, len(roots))
-	for _, root := range roots {
-		if root.ID == "" || strings.ContainsAny(root.ID, `/\\`) || root.ID == "." {
-			return nil, false, ErrKeyUnavailable
-		}
-		rootIDs[root.ID] = struct{}{}
-		rootFile := filepath.Join(local.RootsDir, root.ID+".key")
-		material, err := backupLocalKeyFile(rootFile)
-		if err != nil {
-			return nil, false, fmt.Errorf("eventstore: export configured encryption root %q: %w", root.ID, err)
-		}
-		files = append(files, BackupKeyFile{
-			Name: filepath.ToSlash(filepath.Join("data", "endpoint", "keys", "roots", root.ID+".key")),
-			Data: material,
-		})
-	}
-	for _, id := range readiness.EncryptionRootIDs {
-		if _, ok := rootIDs[id]; !ok {
-			return nil, false, ErrKeyUnavailable
-		}
-	}
-	if _, ok := rootIDs[current.ID]; !ok {
-		return nil, false, ErrKeyUnavailable
-	}
-	files = append(files, BackupKeyFile{
-		Name: "data/endpoint/keys/roots/current",
-		Data: []byte(current.ID + "\n"),
-	})
-	return files, false, nil
 }

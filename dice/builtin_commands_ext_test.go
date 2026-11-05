@@ -96,14 +96,12 @@ func TestExtActivateCompanionDetection(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// 创建测试环境
-			dice := newTestDice(tt.extensions)
-			dice.rebuildActiveWithGraph() // 构建伴随激活图
-			group := newTestGroupInfo()
+			dice, group := newTestExtensionGroup(t, tt.extensions)
+			dice.rebuildActiveWithGraph()
 
 			// 记录激活前的扩展列表（模拟 builtin_commands.go 中的逻辑）
 			beforeActivate := make(map[string]bool)
-			for _, ext := range group.GetActivatedExtListRaw() {
+			for _, ext := range group.GetActivatedExtList(dice) {
 				beforeActivate[ext.Name] = true
 			}
 			userActivatedNames := make(map[string]bool)
@@ -115,14 +113,15 @@ func TestExtActivateCompanionDetection(t *testing.T) {
 				if ext := dice.ExtFind(extName, false); ext != nil {
 					activatedExtNames = append(activatedExtNames, ext.Name)
 					userActivatedNames[ext.Name] = true
-					group.RemoveFromInactivated(ext.Name)
-					group.ExtActive(ext)
+					if err := group.ExtActive(ext); err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
 
 			// 检查新激活的伴随扩展（模拟 builtin_commands.go 中的检测逻辑）
 			var companionExtNames []string
-			for _, ext := range group.GetActivatedExtListRaw() {
+			for _, ext := range group.GetActivatedExtList(dice) {
 				if !beforeActivate[ext.Name] && !userActivatedNames[ext.Name] {
 					companionExtNames = append(companionExtNames, ext.Name)
 				}
@@ -205,12 +204,11 @@ func TestExtActivateChainedCompanions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dice := newTestDice(tt.extensions)
-			dice.rebuildActiveWithGraph() // 构建伴随激活图
-			group := newTestGroupInfo()
+			dice, group := newTestExtensionGroup(t, tt.extensions)
+			dice.rebuildActiveWithGraph()
 
 			beforeActivate := make(map[string]bool)
-			for _, ext := range group.GetActivatedExtListRaw() {
+			for _, ext := range group.GetActivatedExtList(dice) {
 				beforeActivate[ext.Name] = true
 			}
 			userActivatedNames := make(map[string]bool)
@@ -219,13 +217,14 @@ func TestExtActivateChainedCompanions(t *testing.T) {
 				extName = strings.ToLower(extName)
 				if ext := dice.ExtFind(extName, false); ext != nil {
 					userActivatedNames[ext.Name] = true
-					group.RemoveFromInactivated(ext.Name)
-					group.ExtActive(ext)
+					if err := group.ExtActive(ext); err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
 
 			var companionExtNames []string
-			for _, ext := range group.GetActivatedExtListRaw() {
+			for _, ext := range group.GetActivatedExtList(dice) {
 				if !beforeActivate[ext.Name] && !userActivatedNames[ext.Name] {
 					companionExtNames = append(companionExtNames, ext.Name)
 				}

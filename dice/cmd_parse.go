@@ -1,20 +1,15 @@
 package dice
 
 import (
-	"context"
 	"fmt"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 	"unicode"
 
-	ds "github.com/sealdice/dicescript"
 	"github.com/tidwall/gjson"
 
-	"Scardice-core/core/messageflow"
-	"Scardice-core/dice/service"
 	"Scardice-core/message"
 )
 
@@ -47,56 +42,32 @@ func (i *AtInfo) CopyCtx(ctx *MsgContext) (*MsgContext, bool) {
 		return mctx, false
 	}
 	playerUserID := i.UserID
-	if provider, ok := ctx.EndPoint.Adapter.(officialQQIdentityAccountProvider); ok && ctx.Dice.DBOperator != nil {
-		key := service.OfficialQQIdentityMappingKey{
-			MigrationID: service.OfficialQQExplicitIdentityMigrationID,
-			Account:     provider.officialQQIdentityAccount(),
-			Store:       service.OfficialQQIdentityStoreDelegate,
-			Keyspace:    service.OfficialQQIdentityKeyspacePlayerUserID,
-			OldID:       i.UserID,
-		}
-		journal := service.NewOfficialQQIdentityJournal(ctx.Dice.DBOperator, time.Now)
-		if resolvedID, applied, err := journal.ResolveApplied(context.Background(), key); err == nil && applied {
-			playerUserID = resolvedID
-		}
+	if ctx.Player != nil && ctx.Player.UserID() == playerUserID {
+		mctx.Player = ctx.Player
+		return mctx, true
 	}
-	var player *GroupPlayerInfo
-	var found bool
-	if ctx.callbackTransaction != nil {
-		if ctx.Player != nil && ctx.Player.UserID == playerUserID {
-			player, found = ctx.Player, true
-		} else {
-			cached, _ := ctx.Group.Players.Load(playerUserID)
-			player, found = ctx.callbackTransaction.resolveDelegatedPlayer(
-				context.Background(),
-				messageflow.CallbackScope{
-					DiceID: ctx.Dice.BaseConfig.Name, GroupID: ctx.Group.GroupID, UserID: playerUserID,
-				},
-				cached,
-				ctx.callbackMetadata,
-			)
-			if player != nil {
-				ctx.Group.Players.Store(playerUserID, player)
-			}
-		}
-	} else {
-		player = ctx.Group.PlayerGet(ctx.Dice.DBOperator, playerUserID)
-		found = player != nil
+	if ctx.Group == nil {
+		return mctx, false
 	}
-	if player == nil {
-		// TODO: 主动获取用户名
-		player = &GroupPlayerInfo{
-			Name:         "",
-			UserID:       playerUserID,
-			ValueMapTemp: &ds.ValueMap{},
-		}
+	player, err := mctx.ResolvePlayer(mctx.domainContext(), ctx.Group.GroupID(), playerUserID)
+	if err != nil {
+		ctx.setExecutionError(err)
+		ctx.Dice.Logger.Errorf("解析代骰目标 %s 失败: %v", playerUserID, err)
+		return mctx, false
 	}
+	found := player.Version() != 0
 	if !found {
+		name := ""
 		// 特殊处理 official qq
 		if strings.HasPrefix(playerUserID, "OpenQQCH:") {
-			player.Name = "<@!" + strings.TrimPrefix(playerUserID, "OpenQQCH:") + ">"
+			name = "<@!" + strings.TrimPrefix(playerUserID, "OpenQQCH:") + ">"
 		} else if strings.HasPrefix(playerUserID, "OpenQQ-Member-T:") {
-			player.Name = playerUserID[len(playerUserID)-4:]
+			name = playerUserID[len(playerUserID)-4:]
+		}
+		if err = player.create(ctx.Dice.BaseConfig.Name, ctx.Group.GroupID(), playerUserID, name); err != nil {
+			ctx.setExecutionError(err)
+			ctx.Dice.Logger.Errorf("创建代骰目标 %s 失败: %v", playerUserID, err)
+			return mctx, false
 		}
 	}
 	mctx.Player = player
@@ -395,7 +366,7 @@ func (cmdArgs *CmdArgs) commandParseNew(ctx *MsgContext, msg *Message, isParseEx
 	}
 
 	// 检测命令前缀（如 . ! 等）
-	prefixStr := detectCommandPrefix(restText, ctx.Session.Parent.CommandPrefix)
+	prefixStr := detectCommandPrefix(restText, ctx.Session.Parent.CommandPrefixes())
 	if prefixStr == "" {
 		return nil // 没有有效前缀，不是命令
 	}

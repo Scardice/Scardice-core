@@ -6,9 +6,6 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"Scardice-core/eventstore"
-	"Scardice-core/projectionset"
 )
 
 func TestEventSourcedInitDiceLoadsHelpDocs(t *testing.T) {
@@ -16,21 +13,14 @@ func TestEventSourcedInitDiceLoadsHelpDocs(t *testing.T) {
 	writeTestHelpDocFile(t, root, "startup.json", map[string]string{"event-sourced-help-startup": "available"})
 
 	ctx := context.Background()
-	database, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(root, "events.db")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = database.Close() })
-	store := eventstore.NewStore(database, projectionset.StoreOptions()...)
-	t.Cleanup(func() { _ = store.Close() })
-
-	runtime := &Dice{
-		BaseConfig:    BaseConfig{Name: "default", DataDir: filepath.Join(root, "data", "default")},
-		DurableStore:  store,
-		ContainerMode: true,
-	}
-	runtime.Config = NewConfig(runtime)
-	runtime.Config.BaseConfig = runtime.BaseConfig
+	runtime, _ := newDomainExecutionFixture(t)
+	runtime.BaseConfig.DataDir = filepath.Join(root, "data", runtime.BaseConfig.Name)
+	runtime.ContainerMode = true
+	updateCanonicalTestConfig(t, runtime, func(config *Config) {
+		config.BaseConfig.Name = runtime.BaseConfig.Name
+		config.DataDir = runtime.BaseConfig.DataDir
+		config.JsEnable = false
+	})
 	manager := &DiceManager{Dice: []*Dice{runtime}}
 	if err := manager.InitializeRuntime(); err != nil {
 		t.Fatal(err)
@@ -38,7 +28,6 @@ func TestEventSourcedInitDiceLoadsHelpDocs(t *testing.T) {
 	if err := manager.PrepareEventSourcedState(ctx); err != nil {
 		t.Fatal(err)
 	}
-	runtime.Config.JsEnable = false
 	t.Cleanup(func() {
 		if manager.Cron != nil {
 			manager.Cron.Stop()

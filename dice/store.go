@@ -407,24 +407,29 @@ func normalizeStorePackageLocator(namespace, packageName, version string) (strin
 	return namespace, packageName, version, nil
 }
 
-func (m *StoreManager) normalizeStoreConfigLocked() (enabledUrls []string, disabledUrls []string, changed bool) {
-	enabledUrls = normalizeConfiguredStoreBackendURLs(m.parent.Config.BackendUrls)
-	disabledUrls = normalizeConfiguredStoreBackendURLs(m.parent.Config.DisabledBackendUrls)
+func (m *StoreManager) normalizedStoreConfig() (enabledUrls []string, disabledUrls []string) {
+	if m == nil || m.parent == nil {
+		return nil, nil
+	}
+	config := m.parent.Config()
+	if config == nil {
+		return nil, nil
+	}
+	return normalizedStoreConfigForMutation(config)
+}
 
+func normalizedStoreConfigForMutation(config *Config) (enabledUrls []string, disabledUrls []string) {
+	if config == nil {
+		return nil, nil
+	}
+	enabledUrls = normalizeConfiguredStoreBackendURLs(config.BackendUrls)
+	disabledUrls = normalizeConfiguredStoreBackendURLs(config.DisabledBackendUrls)
 	for _, enabledURL := range enabledUrls {
 		if containsStoreBackendURL(disabledUrls, enabledURL) {
 			disabledUrls = removeStoreBackendURL(disabledUrls, enabledURL)
 		}
 	}
-
-	changed = strings.Join(m.parent.Config.BackendUrls, "\n") != strings.Join(enabledUrls, "\n") ||
-		strings.Join(m.parent.Config.DisabledBackendUrls, "\n") != strings.Join(disabledUrls, "\n")
-	if changed {
-		m.parent.Config.BackendUrls = enabledUrls
-		m.parent.Config.DisabledBackendUrls = disabledUrls
-		m.parent.MarkModified()
-	}
-	return enabledUrls, disabledUrls, changed
+	return enabledUrls, disabledUrls
 }
 
 func (m *StoreManager) invalidateStoreBackendLocked() {
@@ -436,13 +441,7 @@ func (m *StoreManager) invalidateStoreBackendLocked() {
 }
 
 func (m *StoreManager) storeConfigSnapshot() (enabledUrls []string, disabledUrls []string) {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	enabledUrls, disabledUrls, changed := m.normalizeStoreConfigLocked()
-	if changed {
-		m.invalidateStoreBackendLocked()
-	}
-	return append([]string(nil), enabledUrls...), append([]string(nil), disabledUrls...)
+	return m.normalizedStoreConfig()
 }
 
 func storeBackendCacheKey(backendType StoreBackendType, rawURL string) string {
@@ -670,81 +669,135 @@ func (m *StoreManager) StoreBackendList() []*StoreBackend {
 	return result
 }
 
+func (m *StoreManager) finishStoreConfigMutation(err error) error {
+	if err != nil {
+		var applyErr *ConfigRuntimeApplyError
+		if !errors.As(err, &applyErr) {
+			return err
+		}
+	}
+	m.lock.Lock()
+	m.invalidateStoreBackendLocked()
+	m.lock.Unlock()
+	return err
+}
+
 func (m *StoreManager) StoreAddBackend(rawURL string) error {
 	normalizedURL, err := validateStoreBackendURL(rawURL)
 	if err != nil {
 		return err
 	}
-
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	enabledUrls, disabledUrls, _ := m.normalizeStoreConfigLocked()
-	if containsStoreBackendURL(enabledUrls, normalizedURL) {
-		return fmt.Errorf("后端 `%s` 已经是当前商店来源", normalizedURL)
-	}
-	if containsStoreBackendURL(disabledUrls, normalizedURL) {
-		disabledUrls = removeStoreBackendURL(disabledUrls, normalizedURL)
-	}
-	enabledUrls = append(enabledUrls, normalizedURL)
-	m.parent.Config.BackendUrls = enabledUrls
-	m.parent.Config.DisabledBackendUrls = disabledUrls
-	m.parent.MarkModified()
-	m.invalidateStoreBackendLocked()
-	return nil
+	err = m.parent.DurableMutateConfig(
+		context.Background(),
+		"store-add-backend",
+		struct {
+			URL string `json:"url"`
+		}{URL: normalizedURL},
+		func(config *Config) error {
+			enabledUrls, disabledUrls := normalizedStoreConfigForMutation(config)
+			if containsStoreBackendURL(enabledUrls, normalizedURL) {
+				return fmt.Errorf("后端 `%s` 已经是当前商店来源", normalizedURL)
+			}
+			disabledUrls = removeStoreBackendURL(disabledUrls, normalizedURL)
+			enabledUrls = append(enabledUrls, normalizedURL)
+			config.BackendUrls = enabledUrls
+			config.DisabledBackendUrls = disabledUrls
+			return nil
+		},
+	)
+	return m.finishStoreConfigMutation(err)
 }
 
 func (m *StoreManager) StoreRemoveBackend(id, rawURL string) error {
 	id = strings.TrimSpace(id)
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	enabledUrls, disabledUrls, _ := m.normalizeStoreConfigLocked()
-	targetURL, err := m.resolveStoreBackendActionURL(id, rawURL, enabledUrls, disabledUrls)
-	if err != nil {
-		return err
+	normalizedURL := ""
+	var err error
+	if rawURL != "" {
+		normalizedURL, err = validateStoreBackendURL(rawURL)
+		if err != nil {
+			return err
+		}
 	}
-	if targetURL == "" {
-		return errors.New("cannot remove official backend")
-	}
-	enabledUrls = removeStoreBackendURL(enabledUrls, targetURL)
-	disabledUrls = removeStoreBackendURL(disabledUrls, targetURL)
-	m.parent.Config.BackendUrls = enabledUrls
-	m.parent.Config.DisabledBackendUrls = disabledUrls
-	m.parent.MarkModified()
-	m.invalidateStoreBackendLocked()
-	return nil
+	err = m.parent.DurableMutateConfig(
+		context.Background(),
+		"store-remove-backend",
+		struct {
+			ID  string `json:"id"`
+			URL string `json:"url,omitempty"`
+		}{ID: id, URL: normalizedURL},
+		func(config *Config) error {
+			enabledUrls, disabledUrls := normalizedStoreConfigForMutation(config)
+			targetURL := normalizedURL
+			if targetURL == "" {
+				resolvedURL, resolveErr := m.resolveStoreBackendActionURL(id, "", enabledUrls, disabledUrls)
+				if resolveErr != nil {
+					return resolveErr
+				}
+				targetURL = resolvedURL
+			}
+			if targetURL == "" {
+				return errors.New("cannot remove official backend")
+			}
+			config.BackendUrls = removeStoreBackendURL(enabledUrls, targetURL)
+			config.DisabledBackendUrls = removeStoreBackendURL(disabledUrls, targetURL)
+			return nil
+		},
+	)
+	return m.finishStoreConfigMutation(err)
 }
 
 func (m *StoreManager) StoreSetBackendEnabled(id, rawURL string, enabled bool) error {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	enabledUrls, disabledUrls, _ := m.normalizeStoreConfigLocked()
-	targetURL, err := m.resolveStoreBackendActionURL(strings.TrimSpace(id), rawURL, enabledUrls, disabledUrls)
-	if err != nil {
-		return err
-	}
-	if targetURL == "" {
-		return errors.New("官方商店后端不支持禁用")
-	}
-	if enabled {
-		if !containsStoreBackendURL(enabledUrls, targetURL) {
-			enabledUrls = append(enabledUrls, targetURL)
-		}
-		disabledUrls = removeStoreBackendURL(disabledUrls, targetURL)
-	} else {
-		_, officialErr := officialStoreBackendURL()
-		if officialErr != nil && len(enabledUrls) == 1 && containsStoreBackendURL(enabledUrls, targetURL) {
-			return errors.New("至少需要保留一个启用的自定义商店后端；可删除该后端以恢复默认官方商店")
-		}
-		enabledUrls = removeStoreBackendURL(enabledUrls, targetURL)
-		if !containsStoreBackendURL(disabledUrls, targetURL) {
-			disabledUrls = append(disabledUrls, targetURL)
+	id = strings.TrimSpace(id)
+	normalizedURL := ""
+	var err error
+	if rawURL != "" {
+		normalizedURL, err = validateStoreBackendURL(rawURL)
+		if err != nil {
+			return err
 		}
 	}
-	m.parent.Config.BackendUrls = enabledUrls
-	m.parent.Config.DisabledBackendUrls = disabledUrls
-	m.parent.MarkModified()
-	m.invalidateStoreBackendLocked()
-	return nil
+	err = m.parent.DurableMutateConfig(
+		context.Background(),
+		"store-set-backend-enabled",
+		struct {
+			ID      string `json:"id"`
+			URL     string `json:"url,omitempty"`
+			Enabled bool   `json:"enabled"`
+		}{ID: id, URL: normalizedURL, Enabled: enabled},
+		func(config *Config) error {
+			enabledUrls, disabledUrls := normalizedStoreConfigForMutation(config)
+			targetURL := normalizedURL
+			if targetURL == "" {
+				resolvedURL, resolveErr := m.resolveStoreBackendActionURL(id, "", enabledUrls, disabledUrls)
+				if resolveErr != nil {
+					return resolveErr
+				}
+				targetURL = resolvedURL
+			}
+			if targetURL == "" {
+				return errors.New("官方商店后端不支持禁用")
+			}
+			if enabled {
+				if !containsStoreBackendURL(enabledUrls, targetURL) {
+					enabledUrls = append(enabledUrls, targetURL)
+				}
+				disabledUrls = removeStoreBackendURL(disabledUrls, targetURL)
+			} else {
+				_, officialErr := officialStoreBackendURL()
+				if officialErr != nil && len(enabledUrls) == 1 && containsStoreBackendURL(enabledUrls, targetURL) {
+					return errors.New("至少需要保留一个启用的自定义商店后端；可删除该后端以恢复默认官方商店")
+				}
+				enabledUrls = removeStoreBackendURL(enabledUrls, targetURL)
+				if !containsStoreBackendURL(disabledUrls, targetURL) {
+					disabledUrls = append(disabledUrls, targetURL)
+				}
+			}
+			config.BackendUrls = enabledUrls
+			config.DisabledBackendUrls = disabledUrls
+			return nil
+		},
+	)
+	return m.finishStoreConfigMutation(err)
 }
 
 func (m *StoreManager) resolveStoreBackendActionURL(id, rawURL string, enabledUrls, disabledUrls []string) (string, error) {

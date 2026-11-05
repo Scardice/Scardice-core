@@ -137,7 +137,6 @@ func (s State) Clone() State {
 	}
 	return out
 }
-func (s State) CompatibilityView() State { return s.Clone() }
 
 func Reduce(state State, event TypedEvent) (State, error) {
 	if isNilEvent(event) || !event.EventType().Valid() {
@@ -424,9 +423,14 @@ func Decide(state State, command Command) (Decision, error) {
 			if reflectDefinitionEqual(existing, def) {
 				return Decision{}, nil
 			}
-			return Decision{}, ErrInvalidState
 		}
 		events := []TypedEvent{NewConfigDefinitionRegisteredV1(def)}
+		if current, exists := state.ConfigValues[def.ExtensionID][def.Key]; exists {
+			if err := validateConfigValue(current, def); err != nil {
+				return Decision{}, err
+			}
+			return Decision{Events: events}, nil
+		}
 		if def.DefaultSet {
 			events = append(events, NewConfigValueChangedV1(def.ExtensionID, def.Key, def.Default))
 		}

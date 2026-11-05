@@ -19,8 +19,9 @@ import (
 	"github.com/golang-module/carbon"
 	"github.com/juliangruber/go-intersect"
 	cp "github.com/otiai10/copy"
-	"github.com/samber/lo"
 	ds "github.com/sealdice/dicescript"
+
+	"Scardice-core/core/groupstate"
 
 	"Scardice-core/dice/docengine"
 )
@@ -188,60 +189,24 @@ func isDismissConfirmCode(text string) bool {
 	return true
 }
 
-func prepareGroupQuitMembership(ctx *MsgContext, groupID string) (*preparedGroupMembershipRemoval, error) {
-	if ctx == nil || ctx.callbackTransaction == nil {
-		//nolint:nilnil // Outside a durable callback there is no membership mutation to stage.
-		return nil, nil
-	}
-	if ctx.Dice == nil || ctx.EndPoint == nil {
+func resolveGroupQuitTarget(ctx *MsgContext, groupID string) (*GroupInfo, error) {
+	if ctx == nil || ctx.callbackTransaction == nil || ctx.Dice == nil || ctx.EndPoint == nil {
 		return nil, ErrDurableStateUnavailable
 	}
-	prepared, err := ctx.callbackTransaction.prepareGroupMembershipRemoval(
-		context.Background(),
-		ctx.Dice.BaseConfig.Name,
-		groupID,
-		ctx.EndPoint.UserID,
-		ctx.callbackMetadata,
-	)
+	group, err := ctx.ResolveGroup(ctx.domainContext(), groupID)
 	if err != nil {
 		return nil, err
 	}
-	return &prepared, nil
+	if group.Version() == 0 || group.Deleted() {
+		return nil, fmt.Errorf("群组 %s 不存在", groupID)
+	}
+	return group, nil
 }
 
-func recordAcceptedGroupQuitMembership(ctx *MsgContext, groupID string, targetGroup *GroupInfo, prepared *preparedGroupMembershipRemoval) {
-	dice := ctx.Dice
-	session := ctx.Session
-	endpointID := ctx.EndPoint.UserID
-	apply := func() {
-		current := targetGroup
-		if session != nil && session.ServiceAtNew != nil {
-			if loaded, exists := session.ServiceAtNew.Load(groupID); exists && loaded != nil {
-				current = loaded
-			}
-		}
-		remove := func(group *GroupInfo) {
-			if group == nil || group.DiceIDExistsMap == nil {
-				return
-			}
-			group.DiceIDExistsMap.Delete(endpointID)
-			group.MarkDirty(dice)
-		}
-		remove(current)
-		if targetGroup != current {
-			remove(targetGroup)
-		}
-	}
-	if prepared != nil && ctx.callbackTransaction != nil {
-		ctx.callbackTransaction.stageGroupMembershipRemoval(*prepared, apply)
-		return
-	}
-	apply()
-}
-
-func (d *Dice) executeDismissOperation(ctx *MsgContext, msg *Message, targetGroupID string, targetGroup *GroupInfo) CmdExecuteResult {
-	membership, membershipErr := prepareGroupQuitMembership(ctx, targetGroupID)
+func (d *Dice) executeDismissOperation(ctx *MsgContext, msg *Message, targetGroupID string) CmdExecuteResult {
+	targetGroup, membershipErr := resolveGroupQuitTarget(ctx, targetGroupID)
 	if membershipErr != nil {
+		ctx.setExecutionError(membershipErr)
 		d.Logger.Errorf("退群状态准备失败: group=%s error=%v", targetGroupID, membershipErr)
 		ReplyToSender(ctx, msg, fmt.Sprintf("退群请求提交失败：%v", membershipErr))
 		return CmdExecuteResult{Matched: true, Solved: true}
@@ -250,8 +215,8 @@ func (d *Dice) executeDismissOperation(ctx *MsgContext, msg *Message, targetGrou
 
 	userName := ctx.Dice.Parent.TryGetUserName(msg.Sender.UserID)
 	groupName := targetGroupID
-	if targetGroup != nil && targetGroup.GroupName != "" {
-		groupName = targetGroup.GroupName
+	if targetGroup.GroupName() != "" {
+		groupName = targetGroup.GroupName()
 	} else if name := ctx.Dice.Parent.TryGetGroupName(targetGroupID); name != "" {
 		groupName = name
 	}
@@ -264,21 +229,28 @@ func (d *Dice) executeDismissOperation(ctx *MsgContext, msg *Message, targetGrou
 		time.Sleep(3 * time.Second)
 	}
 	if err := QuitGroup(ctx, targetGroupID); err != nil {
+		ctx.setExecutionError(err)
 		d.Logger.Errorf("退群请求提交失败: group=%s error=%v", targetGroupID, err)
 		ReplyToSender(ctx, msg, fmt.Sprintf("退群请求提交失败：%v", err))
 		return CmdExecuteResult{Matched: true, Solved: true}
 	}
-	recordAcceptedGroupQuitMembership(ctx, targetGroupID, targetGroup, membership)
+	if err := targetGroup.SetActivation(ctx.EndPoint.UserID, false, false); err != nil {
+		ctx.setExecutionError(err)
+		d.Logger.Errorf("退群状态写入失败: group=%s error=%v", targetGroupID, err)
+		ReplyToSender(ctx, msg, fmt.Sprintf("退群请求提交失败：%v", err))
+		return CmdExecuteResult{Matched: true, Solved: true}
+	}
 
 	return CmdExecuteResult{Matched: true, Solved: true}
 }
 
-func (d *Dice) executeDismissWithConfirm(ctx *MsgContext, msg *Message, targetGroupID string, targetGroup *GroupInfo, inputCode string, hasExtraArgs bool, confirmCommand string) CmdExecuteResult {
+func (d *Dice) executeDismissWithConfirm(ctx *MsgContext, msg *Message, targetGroupID string, inputCode string, hasExtraArgs bool, confirmCommand string) CmdExecuteResult {
 	processDismissConfirmation := func(roleDetail string, issueLogTpl string, issueReplyTpl string, successLogTpl string) CmdExecuteResult {
 		confirmKey := getDismissConfirmKeyForGroup(ctx, msg.Sender.UserID, targetGroupID)
 		if inputCode == "" || hasExtraArgs {
 			confirmCode, err := generateFourDigitCode()
 			if err != nil {
+				ctx.setExecutionError(err)
 				d.Logger.Errorf("生成退群确认码失败: %v", err)
 				ReplyToSender(ctx, msg, "无法生成安全确认码，请稍后重试")
 				return CmdExecuteResult{Matched: true, Solved: true}
@@ -299,7 +271,7 @@ func (d *Dice) executeDismissWithConfirm(ctx *MsgContext, msg *Message, targetGr
 
 		d.Logger.Infof(successLogTpl, targetGroupID, msg.Sender.UserID, ctx.EndPoint.UserID, roleDetail)
 		dismissConfirmCodes.Delete(confirmKey)
-		return d.executeDismissOperation(ctx, msg, targetGroupID, targetGroup)
+		return d.executeDismissOperation(ctx, msg, targetGroupID)
 	}
 
 	if needConfirm, checked, detail := shouldDismissRequireOwnerConfirm(ctx, targetGroupID); checked {
@@ -324,7 +296,7 @@ func (d *Dice) executeDismissWithConfirm(ctx *MsgContext, msg *Message, targetGr
 		return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 	}
 
-	return d.executeDismissOperation(ctx, msg, targetGroupID, targetGroup)
+	return d.executeDismissOperation(ctx, msg, targetGroupID)
 }
 
 /** 这几条指令不能移除 */
@@ -350,6 +322,11 @@ func (d *Dice) registerCoreCommands() {
 			if ctx.PrivilegeLevel < 100 {
 				ReplyToSender(ctx, msg, "你不具备Master权限")
 				return CmdExecuteResult{Matched: true, Solved: true}
+			}
+			ban := d.Config().BanList
+			fail := func(prefix string, err error) {
+				ctx.setExecutionError(err)
+				ReplyToSender(ctx, msg, fmt.Sprintf("%s：%v", prefix, err))
 			}
 
 			getID := func() string {
@@ -382,8 +359,13 @@ func (d *Dice) registerCoreCommands() {
 				if reason == "" {
 					reason = "骰主指令"
 				}
-				if _, err := (&d.Config).BanList.AddScoreBaseWithError(uid, (&d.Config).BanList.ThresholdBan, "骰主指令", reason, ctx); err != nil {
-					ReplyToSender(ctx, msg, fmt.Sprintf("加入黑名单失败：%v", err))
+				settings, err := ban.settingsForContext(ctx)
+				if err != nil {
+					fail("读取黑名单设置失败", err)
+					break
+				}
+				if _, err := ban.AddScoreBaseWithError(uid, settings.ThresholdBan, "骰主指令", reason, ctx); err != nil {
+					fail("加入黑名单失败", err)
 					break
 				}
 				ReplyToSender(ctx, msg, fmt.Sprintf("已将用户/群组 %s 加入黑名单，原因: %s", uid, reason))
@@ -393,14 +375,18 @@ func (d *Dice) registerCoreCommands() {
 					return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 				}
 
-				item, ok := (&d.Config).BanList.GetByID(uid)
+				item, ok, err := ban.GetByIDForContext(ctx, uid)
+				if err != nil {
+					fail("读取名单失败", err)
+					break
+				}
 				if !ok || (item.Rank != BanRankBanned && item.Rank != BanRankTrusted && item.Rank != BanRankWarn) {
 					ReplyToSender(ctx, msg, "找不到用户/群组")
 					break
 				}
 
-				if err := (&d.Config).BanList.SetRankByID(d, uid, BanRankNormal, item.Name, "", ""); err != nil {
-					ReplyToSender(ctx, msg, fmt.Sprintf("移出名单失败：%v", err))
+				if err = ban.SetRankByIDForContext(ctx, d, uid, BanRankNormal, item.Name, "", ""); err != nil {
+					fail("移出名单失败", err)
 					break
 				}
 				ReplyToSender(ctx, msg, fmt.Sprintf("已将用户/群组 %s 移出%s列表", uid, BanRankText[item.Rank]))
@@ -411,8 +397,8 @@ func (d *Dice) registerCoreCommands() {
 					return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 				}
 
-				if err := (&d.Config).BanList.SetTrustByIDWithError(uid, "骰主指令", "骰主指令"); err != nil {
-					ReplyToSender(ctx, msg, fmt.Sprintf("加入信任列表失败：%v", err))
+				if err := ban.SetTrustByIDForContext(ctx, uid, "骰主指令", "骰主指令"); err != nil {
+					fail("加入信任列表失败", err)
 					break
 				}
 				ReplyToSender(ctx, msg, fmt.Sprintf("已将用户/群组 %s 加入信任列表", uid))
@@ -420,9 +406,13 @@ func (d *Dice) registerCoreCommands() {
 				// ban/warn/trust
 				var extra string
 				var text strings.Builder
-
 				extra = cmdArgs.GetArgN(2)
-				for _, v := range (&d.Config).BanList.Snapshot() {
+				items, err := ban.SnapshotForContext(ctx)
+				if err != nil {
+					fail("读取名单失败", err)
+					break
+				}
+				for _, v := range items {
 					if v.Rank == BanRankNormal {
 						continue
 					}
@@ -445,7 +435,11 @@ func (d *Dice) registerCoreCommands() {
 					break
 				}
 
-				v, exists := (&d.Config).BanList.GetByID(targetID)
+				v, exists, err := ban.GetByIDForContext(ctx, targetID)
+				if err != nil {
+					fail("读取名单失败", err)
+					break
+				}
 				if !exists {
 					ReplyToSender(ctx, msg, fmt.Sprintf("所查询的<%s>情况：正常(0)", targetID))
 					break
@@ -514,9 +508,11 @@ func (d *Dice) registerCoreCommands() {
 				}
 
 				if _config := cmdArgs.GetArgN(1); _config == "config" {
-					oldDefault := ctx.Group.DefaultHelpGroup
+					oldDefault := ctx.Group.DefaultHelpGroup()
 					if cmdArgs.GetKwarg("groupclr") != nil {
-						ctx.Group.SetDefaultHelpGroup("")
+						if err := ctx.Group.SetDefaultHelpGroup(""); err != nil {
+							return err
+						}
 						if oldDefault != "" {
 							commandReply = "已清空默认搜索分组，原分组为" + oldDefault
 						} else {
@@ -541,7 +537,9 @@ func (d *Dice) registerCoreCommands() {
 								realGroup = _g
 							}
 							// 使用转换后的原名设置默认分组
-							ctx.Group.SetDefaultHelpGroup(realGroup)
+							if err := ctx.Group.SetDefaultHelpGroup(realGroup); err != nil {
+								return err
+							}
 							if oldDefault != "" {
 								commandReply = fmt.Sprintf("默认搜索分组由%s切换到%s", oldDefault, defaultGroup)
 							} else {
@@ -653,13 +651,14 @@ func (d *Dice) registerCoreCommands() {
 				}
 				if group == "" {
 					// 未指定搜索分组时，取当前群指定的分组
-					group = ctx.Group.DefaultHelpGroup
+					group = ctx.Group.DefaultHelpGroup()
 				}
 				// 进行结果搜索
 				search, total, pgStart, pgEnd, err := help.Search(ctx, text, false, numLimit, page, group)
 				if err != nil {
+					ctx.setExecutionError(err)
 					commandReply = groupStr + "搜索故障: " + err.Error()
-					//nolint:nilerr // The search error has been converted to the command's user-visible reply.
+					//nolint:nilerr // The callback root carries the error while the command preserves its failure reply.
 					return nil
 				}
 				if len(search.Hits) == 0 {
@@ -718,6 +717,7 @@ func (d *Dice) registerCoreCommands() {
 				return nil
 			})
 			if err != nil {
+				ctx.setExecutionError(err)
 				ReplyToSender(ctx, msg, "搜索故障: "+err.Error())
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
@@ -762,6 +762,7 @@ func (d *Dice) registerCoreCommands() {
 
 					if !dm.IsHelpReloading.Load() {
 						if err := dm.ReloadHelp(); err != nil {
+							ctx.setExecutionError(err)
 							ReplyToSender(ctx, msg, "帮助文档重载失败: "+err.Error())
 						} else {
 							ReplyToSender(ctx, msg, "帮助文档已经重新装载")
@@ -818,8 +819,9 @@ func (d *Dice) registerCoreCommands() {
 				}
 				search, _, _, _, err := help.Search(ctx, cmdArgs.CleanArgs, true, 1, 1, "")
 				if err != nil {
+					ctx.setExecutionError(err)
 					helpReply = "搜索故障: " + err.Error()
-					//nolint:nilerr // The search error has been converted to the command's user-visible reply.
+					//nolint:nilerr // The callback root carries the error while the command preserves its failure reply.
 					return nil
 				}
 				if len(search.Hits) == 0 {
@@ -842,6 +844,7 @@ func (d *Dice) registerCoreCommands() {
 				return nil
 			})
 			if err != nil {
+				ctx.setExecutionError(err)
 				helpReply = "搜索故障: " + err.Error()
 			}
 			ReplyToSender(ctx, msg, helpReply)
@@ -860,7 +863,7 @@ func (d *Dice) registerCoreCommands() {
 
 			if inGroup {
 				// 不响应裸指令选项
-				if len(cmdArgs.At) < 1 && ctx.Dice.Config.IgnoreUnaddressedBotCmd {
+				if len(cmdArgs.At) < 1 && ctx.Dice.Config().IgnoreUnaddressedBotCmd {
 					return CmdExecuteResult{Matched: false, Solved: false}
 				}
 				// 不响应at其他人
@@ -894,7 +897,7 @@ func (d *Dice) registerCoreCommands() {
 				}
 
 				if cmdArgs.IsArgEqual(1, "on") {
-					if msg.Platform != "QQ-CH" && !ctx.Dice.Config.BotExtFreeSwitch && ctx.PrivilegeLevel < 40 {
+					if msg.Platform != "QQ-CH" && !ctx.Dice.Config().BotExtFreeSwitch && ctx.PrivilegeLevel < 40 {
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:提示_无权限_非master/管理/邀请者"))
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
@@ -904,20 +907,24 @@ func (d *Dice) registerCoreCommands() {
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 
-					SetBotOnAtGroup(ctx, msg.GroupID)
-					// TODO：ServiceAtNew此处忽略是否合理？
-					ctx.Group, _ = ctx.Session.ServiceAtNew.Load(msg.GroupID)
+					group, err := SetBotOnAtGroup(ctx, msg.GroupID)
+					if err != nil {
+						ctx.setExecutionError(err)
+						ReplyToSender(ctx, msg, fmt.Sprintf("开启失败：%v", err))
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
+					ctx.Group = group
 					ctx.IsCurGroupBotOn = true
 
 					text := DiceFormatTmpl(ctx, "核心:骰子开启")
-					if ctx.Group.GetLogState().On {
+					if state, stateErr := ctx.ReadGroupLogState(); stateErr == nil && state.On {
 						text += "\n请特别注意: 日志记录处于开启状态"
 					}
 					ReplyToSender(ctx, msg, text)
 
 					return CmdExecuteResult{Matched: true, Solved: true}
 				} else if cmdArgs.IsArgEqual(1, "off") {
-					if msg.Platform != "QQ-CH" && !ctx.Dice.Config.BotExtFreeSwitch && ctx.PrivilegeLevel < 40 {
+					if msg.Platform != "QQ-CH" && !ctx.Dice.Config().BotExtFreeSwitch && ctx.PrivilegeLevel < 40 {
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:提示_无权限_非master/管理/邀请者"))
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
@@ -927,7 +934,11 @@ func (d *Dice) registerCoreCommands() {
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 
-					SetBotOffAtGroup(ctx, ctx.Group.GroupID)
+					if err := SetBotOffAtGroup(ctx, ctx.Group.GroupID()); err != nil {
+						ctx.setExecutionError(err)
+						ReplyToSender(ctx, msg, fmt.Sprintf("关闭失败：%v", err))
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰子关闭"))
 					return CmdExecuteResult{Matched: true, Solved: true}
 				} else if cmdArgs.IsArgEqual(1, "bye", "exit", "quit") {
@@ -941,7 +952,7 @@ func (d *Dice) registerCoreCommands() {
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 
-					if !cmdArgs.AmIBeMentioned && !ctx.Dice.Config.BotExitWithoutAt {
+					if !cmdArgs.AmIBeMentioned && !ctx.Dice.Config().BotExitWithoutAt {
 						// 裸指令，如果当前群内开启，予以提示
 						if ctx.IsCurGroupBotOn {
 							ReplyToSender(ctx, msg, "[退群指令] 请@我使用这个命令，以进行确认")
@@ -950,7 +961,6 @@ func (d *Dice) registerCoreCommands() {
 					}
 
 					targetGroupID := msg.GroupID
-					targetGroup := ctx.Group
 					inputCode := ""
 					hasExtraArgs := false
 					confirmCommand := ".bot bye"
@@ -978,13 +988,10 @@ func (d *Dice) registerCoreCommands() {
 					if targetGroupID == "" {
 						return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 					}
-					if targetGroupID != msg.GroupID {
-						targetGroup, _ = ctx.Session.ServiceAtNew.Load(targetGroupID)
-					}
 
-					return d.executeDismissWithConfirm(ctx, msg, targetGroupID, targetGroup, inputCode, hasExtraArgs, confirmCommand)
+					return d.executeDismissWithConfirm(ctx, msg, targetGroupID, inputCode, hasExtraArgs, confirmCommand)
 				} else if cmdArgs.IsArgEqual(1, "save") {
-					d.Save(false)
+					// 当前执行统一提交，回复只会在提交成功后投递。
 
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰子保存设置"))
 					return CmdExecuteResult{Matched: true, Solved: true}
@@ -999,19 +1006,22 @@ func (d *Dice) registerCoreCommands() {
 
 			activeCount := 0
 			serveCount := 0
-			// Pinenutn: Range模板 ServiceAtNew重构代码
-			d.ImSession.ServiceAtNew.Range(func(_ string, gp *GroupInfo) bool {
-				// Pinenutn: ServiceAtNew重构
-				if gp.GroupID != "" &&
-					!strings.HasPrefix(gp.GroupID, "PG-") &&
-					gp.DiceIDExistsMap.Exists(ctx.EndPoint.UserID) {
+			projected, projectionErr := groupstate.ListProjected(ctx.domainContext(), d.DurableStore, d.BaseConfig.Name)
+			if projectionErr != nil {
+				ctx.setExecutionError(projectionErr)
+				ReplyToSender(ctx, msg, fmt.Sprintf("读取群组状态失败：%v", projectionErr))
+				return CmdExecuteResult{Matched: true, Solved: true}
+			}
+			for _, group := range projected {
+				if group.GroupID != "" && !group.Deleted &&
+					!strings.HasPrefix(group.GroupID, "PG-") &&
+					group.DiceIDExists[ctx.EndPoint.UserID] {
 					serveCount++
-					if gp.DiceIDActiveMap.Exists(ctx.EndPoint.UserID) {
+					if group.DiceIDActive[ctx.EndPoint.UserID] {
 						activeCount++
 					}
 				}
-				return true
-			})
+			}
 
 			var groupWorkInfo, activeText string
 			if inGroup {
@@ -1051,7 +1061,7 @@ func (d *Dice) registerCoreCommands() {
 				// 如果是别人被at，置之不理
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
-			if !cmdArgs.AmIBeMentioned && !ctx.Dice.Config.BotExitWithoutAt {
+			if !cmdArgs.AmIBeMentioned && !ctx.Dice.Config().BotExitWithoutAt {
 				// 裸指令，如果当前群内开启，予以提示
 				if ctx.IsCurGroupBotOn {
 					ReplyToSender(ctx, msg, "[退群指令] 请@我使用这个命令，以进行确认")
@@ -1059,7 +1069,7 @@ func (d *Dice) registerCoreCommands() {
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
 
-			return d.executeDismissWithConfirm(ctx, msg, msg.GroupID, ctx.Group, cmdArgs.GetArgN(1), cmdArgs.GetArgN(2) != "", ".dismiss")
+			return d.executeDismissWithConfirm(ctx, msg, msg.GroupID, cmdArgs.GetArgN(1), cmdArgs.GetArgN(2) != "", ".dismiss")
 		},
 	}
 	d.CmdMap["dismiss"] = cmdDismiss
@@ -1077,7 +1087,7 @@ func (d *Dice) registerCoreCommands() {
 		if len(cmdArgs.Args) > 1 {
 			for _, i := range cmdArgs.Args[1:] {
 				if i == "me" {
-					uidLst = append(uidLst, ctx.Player.UserID)
+					uidLst = append(uidLst, ctx.Player.UserID())
 					continue
 				}
 				uid := FormatDiceIDQQ(i)
@@ -1119,12 +1129,16 @@ func (d *Dice) registerCoreCommands() {
 				newCount := 0
 				for _, uid := range readIDList(ctx, msg, cmdArgs) {
 					allCount++
-					if ctx.Group.BotList.Exists(uid) {
+					if ctx.Group.BotExists(uid) {
 						existsCount++
-					} else {
-						ctx.Group.BotList.Store(uid, true)
-						newCount++
+						continue
 					}
+					if err := ctx.Group.SetBot(uid, true); err != nil {
+						ctx.setExecutionError(err)
+						ReplyToSender(ctx, msg, fmt.Sprintf("机器人列表写入失败：%v", err))
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
+					newCount++
 				}
 
 				reply = fmt.Sprintf(
@@ -1136,9 +1150,14 @@ func (d *Dice) registerCoreCommands() {
 				existsCount := 0
 				for _, uid := range readIDList(ctx, msg, cmdArgs) {
 					allCount++
-					if ctx.Group.BotList.Exists(uid) {
-						existsCount++
-						ctx.Group.BotList.Delete(uid)
+					if !ctx.Group.BotExists(uid) {
+						continue
+					}
+					existsCount++
+					if err := ctx.Group.SetBot(uid, false); err != nil {
+						ctx.setExecutionError(err)
+						ReplyToSender(ctx, msg, fmt.Sprintf("机器人列表写入失败：%v", err))
+						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 				}
 
@@ -1151,15 +1170,16 @@ func (d *Dice) registerCoreCommands() {
 					break
 				}
 
-				text := ""
-				ctx.Group.BotList.Range(func(k string, _ bool) bool {
-					text += "- " + k + "\n"
-					return true
-				})
-				if text == "" {
-					text = "无"
+				var text strings.Builder
+				for _, id := range ctx.Group.BotIDs() {
+					text.WriteString("- ")
+					text.WriteString(id)
+					text.WriteByte('\n')
 				}
-				reply = fmt.Sprintf("群内其他机器人列表:\n%s", text)
+				if text.Len() == 0 {
+					text.WriteString("无")
+				}
+				reply = fmt.Sprintf("群内其他机器人列表:\n%s", text.String())
 			default:
 				showHelp = !cmdArgs.SomeoneBeMentionedButNotMe
 			}
@@ -1228,18 +1248,6 @@ func (d *Dice) registerCoreCommands() {
 			if subCmd == "unlock" {
 				// NOTE(lyjjl): master unlock 已禁用，避免绕过 master 列表的权限检查。
 				ReplyToSender(ctx, msg, "该指令已禁用")
-				if false { // NOTE(lyjjl): 保留旧逻辑以便后续审计
-					code := cmdArgs.GetArgN(2)
-					if ctx.Dice.UnlockCodeVerify(code) {
-						ctx.Dice.MasterRefresh()
-						ctx.Dice.MasterAdd(ctx.Player.UserID)
-
-						ctx.Dice.UnlockCodeUpdate(true) // 强制刷新解锁码
-						ReplyToSender(ctx, msg, "你已成为Master")
-					} else {
-						ReplyToSender(ctx, msg, "错误的解锁码")
-					}
-				}
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
 
@@ -1258,21 +1266,33 @@ func (d *Dice) registerCoreCommands() {
 				}
 				var count int
 				for _, uid := range readIDList(ctx, msg, cmdArgs) {
-					if uid != ctx.EndPoint.UserID {
-						ctx.Dice.MasterAdd(uid)
+					if uid == ctx.EndPoint.UserID {
+						continue
+					}
+					changed, err := ctx.Dice.SetDiceMasterForContext(ctx, uid, true)
+					if err != nil {
+						ctx.setExecutionError(err)
+						ReplyToSender(ctx, msg, "新增Master失败："+err.Error())
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
+					if changed {
 						count++
 					}
 				}
-				ctx.Dice.Save(false)
 				ReplyToSender(ctx, msg, fmt.Sprintf("余烬将新增%d位master", count))
 			case "del", "rm":
 				var count int
 				for _, uid := range readIDList(ctx, msg, cmdArgs) {
-					if ctx.Dice.MasterRemove(uid) {
+					changed, err := ctx.Dice.SetDiceMasterForContext(ctx, uid, false)
+					if err != nil {
+						ctx.setExecutionError(err)
+						ReplyToSender(ctx, msg, "移除Master失败："+err.Error())
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
+					if changed {
 						count++
 					}
 				}
-				ctx.Dice.Save(false)
 				ReplyToSender(ctx, msg, fmt.Sprintf("余烬移除了%d名master", count))
 			case "relogin":
 				var kw *Kwarg
@@ -1334,6 +1354,7 @@ func (d *Dice) registerCoreCommands() {
 				if err == nil {
 					ReplyToSender(ctx, msg, "备份成功！请到UI界面(综合设置-备份)处下载备份，或在骰子backup目录下读取")
 				} else {
+					ctx.setExecutionError(err)
 					d.Logger.Error("骰子备份:", err)
 					ReplyToSender(ctx, msg, "备份失败！错误已写入日志。可能是磁盘已满所致，建议立即进行处理！")
 				}
@@ -1373,6 +1394,7 @@ func (d *Dice) registerCoreCommands() {
 						if dm.AppVersionCode != dm.AppVersionOnline.VersionLatestCode {
 							generatedCode, err := generateFourDigitCode()
 							if err != nil {
+								ctx.setExecutionError(err)
 								updateCode = "0000"
 								text += "\n无法生成安全确认码，请稍后重试"
 							} else {
@@ -1399,15 +1421,16 @@ func (d *Dice) registerCoreCommands() {
 				reply := ctx.detachReply(msg)
 				upgradeWindowID := msg.Sender.UserID
 				if !ctx.IsPrivate {
-					upgradeWindowID = ctx.Group.GroupID
+					upgradeWindowID = ctx.Group.GroupID()
 				}
 				upgradeEndpointID := ctx.EndPoint.ID
+				if err := d.SetUpgradeTargetForContext(ctx, upgradeWindowID, upgradeEndpointID); err != nil {
+					ctx.setExecutionError(err)
+					ReplyToSender(ctx, msg, fmt.Sprintf("保存升级回复目标失败：%v", err))
+					break
+				}
 				go func() {
 					ret := <-dm.UpdateDownloadedChan
-
-					d.Config.UpgradeWindowID = upgradeWindowID
-					d.Config.UpgradeEndpointID = upgradeEndpointID
-					d.Save(true)
 
 					bakFn, _ := dm.Backup(BackupSelectionAll, false)
 					tmpPath := path.Join(os.TempDir(), bakFn)
@@ -1433,6 +1456,7 @@ func (d *Dice) registerCoreCommands() {
 				if code == "" {
 					generatedCode, err := generateFourDigitCode()
 					if err != nil {
+						ctx.setExecutionError(err)
 						updateCode = "0000"
 						ReplyToSender(ctx, msg, "无法生成安全确认码，请稍后重试")
 						break
@@ -1452,7 +1476,13 @@ func (d *Dice) registerCoreCommands() {
 				}
 			case "list":
 				var textBuilder strings.Builder
-				for _, i := range ctx.Dice.DiceMasters {
+				masters, err := ctx.Dice.DiceMasterIDsForContext(ctx)
+				if err != nil {
+					ctx.setExecutionError(err)
+					ReplyToSender(ctx, msg, "读取Master列表失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
+				for _, i := range masters {
 					// uid := FormatDiceIdQQ(i)
 					textBuilder.WriteString("- ")
 					textBuilder.WriteString(i)
@@ -1476,6 +1506,7 @@ func (d *Dice) registerCoreCommands() {
 					dm := dice.Parent
 					if !dm.IsHelpReloading.Load() {
 						if err := dm.ReloadHelp(); err != nil {
+							ctx.setExecutionError(err)
 							ReplyToSender(ctx, msg, "帮助文档重载失败: "+err.Error())
 						} else {
 							ReplyToSender(ctx, msg, "帮助文档已重载")
@@ -1490,11 +1521,16 @@ func (d *Dice) registerCoreCommands() {
 					return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 				}
 
-				n := strings.Split(gid, ":") // 不验证是否合法，反正下面会检查是否在 ServiceAtNew
+				n := strings.Split(gid, ":")
 				platform := strings.Split(n[0], "-")[0]
 
-				gp, ok := ctx.Session.ServiceAtNew.Load(gid)
-				if !ok || len(n[0]) < 2 {
+				gp, err := ctx.ResolveGroup(ctx.domainContext(), gid)
+				if err != nil {
+					ctx.setExecutionError(err)
+					ReplyToSender(ctx, msg, fmt.Sprintf("读取群组%s失败：%v", gid, err))
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
+				if gp.Version() == 0 || gp.Deleted() || len(n[0]) < 2 {
 					ReplyToSender(ctx, msg, fmt.Sprintf("群组列表中没有找到%s", gid))
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
@@ -1506,7 +1542,7 @@ func (d *Dice) registerCoreCommands() {
 
 				// 既然是骰主自己操作，就不通知了
 				// 除非有多骰主……
-				ReplyToSender(ctx, msg, fmt.Sprintf("收到指令，将在5秒后退出群组%s", gp.GroupID))
+				ReplyToSender(ctx, msg, fmt.Sprintf("收到指令，将在5秒后退出群组%s", gp.GroupID()))
 
 				txt := "注意，收到骰主指令，5秒后将从该群组退出。"
 				wherefore := cmdArgs.GetArgN(3)
@@ -1516,26 +1552,15 @@ func (d *Dice) registerCoreCommands() {
 
 				mctx := ctx.ShallowCopy()
 				mctx.MessageType = "group"
-				mctx.Group = gp
+				mctx.Group = nil
 				mctx.Player = nil
 				mctx.IsPrivate = false
-				membership, membershipErr := prepareGroupQuitMembership(mctx, gp.GroupID)
-				if membershipErr != nil {
-					d.Logger.Errorf("骰主退群状态准备失败: group=%s error=%v", gp.GroupID, membershipErr)
-					ReplyToSender(ctx, msg, fmt.Sprintf("退群请求提交失败：%v", membershipErr))
-					return CmdExecuteResult{Matched: true, Solved: true}
-				}
-				ReplyGroup(mctx, &Message{GroupID: gp.GroupID}, txt)
-				// SetBotOffAtGroup(mctx, gp.GroupID)
-				if mctx.Dice.OutboundBridge == nil && mctx.EndPoint != nil && mctx.EndPoint.Adapter != nil && !isPureOnebotEndpoint(mctx.EndPoint) {
-					time.Sleep(3 * time.Second)
-				}
-				if err := QuitGroup(mctx, gp.GroupID); err != nil {
-					d.Logger.Errorf("骰主退群请求提交失败: group=%s error=%v", gp.GroupID, err)
+				if err := SubmitDurableGroupQuit(ctx.domainContext(), mctx, gp.GroupID(), txt); err != nil {
+					ctx.setExecutionError(err)
+					d.Logger.Errorf("骰主退群请求提交失败: group=%s error=%v", gp.GroupID(), err)
 					ReplyToSender(ctx, msg, fmt.Sprintf("退群请求提交失败：%v", err))
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-				recordAcceptedGroupQuitMembership(mctx, gp.GroupID, gp, membership)
 
 				return CmdExecuteResult{Matched: true, Solved: true}
 			case "jsclear":
@@ -1556,6 +1581,7 @@ func (d *Dice) registerCoreCommands() {
 
 				err := ClearExtStorage(ctx.Dice, ext, extName)
 				if err != nil {
+					ctx.setExecutionError(err)
 					ctx.Dice.Logger.Errorf("jsclear: %v", err)
 					ReplyToSender(ctx, msg, "清除数据失败，请查看日志")
 					return CmdExecuteResult{Matched: true, Solved: true}
@@ -1588,7 +1614,7 @@ func (d *Dice) registerCoreCommands() {
 			}
 
 			ctx.SystemTemplate = ctx.Group.GetCharTemplate(ctx.Dice)
-			if ctx.Dice.Config.CommandCompatibleMode {
+			if ctx.Dice.Config().CommandCompatibleMode {
 				if (cmdArgs.Command == "rd" || cmdArgs.Command == "rhd" || cmdArgs.Command == "rdh") && len(cmdArgs.Args) >= 1 {
 					if m, _ := regexp.MatchString(`^\d|优势|劣势|\+|-`, cmdArgs.CleanArgs); m {
 						if cmdArgs.IsSpaceBeforeArgs {
@@ -1743,7 +1769,7 @@ func (d *Dice) registerCoreCommands() {
 
 			if cmdArgs.SpecialExecuteTimes > 1 {
 				VarSetValueInt64(ctx, "$t次数", int64(cmdArgs.SpecialExecuteTimes))
-				if cmdArgs.SpecialExecuteTimes > int(ctx.Dice.Config.MaxExecuteTime) {
+				if cmdArgs.SpecialExecuteTimes > int(ctx.Dice.Config().MaxExecuteTime) {
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰点_轮数过多警告"))
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
@@ -1771,7 +1797,7 @@ func (d *Dice) registerCoreCommands() {
 			// 指令信息
 			commandInfo := map[string]any{
 				"cmd":    "roll",
-				"pcName": ctx.Player.Name,
+				"pcName": ctx.Player.Name(),
 				"items":  commandInfoItems,
 			}
 			if isHide {
@@ -1805,7 +1831,7 @@ func (d *Dice) registerCoreCommands() {
 					if ctx.IsPrivate {
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:提示_私聊不可用"))
 					} else {
-						ctx.CommandHideFlag = ctx.Group.GroupID
+						ctx.CommandHideFlag = ctx.Group.GroupID()
 						prefix := DiceFormatTmpl(ctx, "核心:暗骰_私聊_前缀")
 						ReplyGroup(ctx, msg, DiceFormatTmpl(ctx, "核心:暗骰_群内"))
 						ReplyPerson(ctx, msg, prefix+text)
@@ -1851,6 +1877,11 @@ func (d *Dice) registerCoreCommands() {
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			if cmdArgs.IsArgEqual(1, "help") {
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
+			}
+			fail := func(action string, err error) CmdExecuteResult {
+				ctx.setExecutionError(err)
+				ReplyToSender(ctx, msg, fmt.Sprintf("%s失败：%v", action, err))
+				return CmdExecuteResult{Matched: true, Solved: true}
 			}
 
 			showList := func() {
@@ -1898,7 +1929,7 @@ func (d *Dice) registerCoreCommands() {
 			if cmdArgs.IsArgEqual(1, "list") {
 				showList()
 			} else if cmdArgs.IsArgEqual(last, "on") {
-				if !ctx.Dice.Config.BotExtFreeSwitch && ctx.PrivilegeLevel < 40 {
+				if !ctx.Dice.Config().BotExtFreeSwitch && ctx.PrivilegeLevel < 40 {
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:提示_无权限_非master/管理/邀请者"))
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
@@ -1935,8 +1966,9 @@ func (d *Dice) registerCoreCommands() {
 						if !isActive {
 							extNames = append(extNames, ext.Name)
 							conflictsAll = append(conflictsAll, checkConflict(ext)...)
-							ctx.Group.RemoveFromInactivated(ext.Name)
-							ctx.Group.ExtActive(ext)
+							if err := ctx.Group.ExtActive(ext); err != nil {
+								return fail("开启扩展", err)
+							}
 						}
 					}
 
@@ -1970,8 +2002,9 @@ func (d *Dice) registerCoreCommands() {
 						extNames = append(extNames, i.Name)
 						userActivatedNames[i.Name] = true
 						conflictsAll = append(conflictsAll, checkConflict(i)...)
-						ctx.Group.RemoveFromInactivated(i.Name)
-						ctx.Group.ExtActive(i)
+						if err := ctx.Group.ExtActive(i); err != nil {
+							return fail("开启扩展", err)
+						}
 					}
 				}
 
@@ -1996,7 +2029,7 @@ func (d *Dice) registerCoreCommands() {
 					ReplyToSender(ctx, msg, text)
 				}
 			} else if cmdArgs.IsArgEqual(last, "off") {
-				if !ctx.Dice.Config.BotExtFreeSwitch && ctx.PrivilegeLevel < 40 {
+				if !ctx.Dice.Config().BotExtFreeSwitch && ctx.PrivilegeLevel < 40 {
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:提示_无权限_非master/管理/邀请者"))
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
@@ -2017,7 +2050,9 @@ func (d *Dice) registerCoreCommands() {
 					}
 
 					for _, name := range beforeNames {
-						_ = ctx.Group.ExtInactiveByName(name)
+						if _, err := ctx.Group.ExtInactiveByName(name); err != nil {
+							return fail("关闭扩展", err)
+						}
 					}
 
 					after := ctx.Group.GetActivatedExtList(ctx.Dice)
@@ -2068,7 +2103,10 @@ func (d *Dice) registerCoreCommands() {
 					extName := cmdArgs.Args[index]
 					extName = d.ExtAliasToName(extName)
 
-					ei := ctx.Group.ExtInactiveByName(extName)
+					ei, err := ctx.Group.ExtInactiveByName(extName)
+					if err != nil {
+						return fail("关闭扩展", err)
+					}
 					if ei != nil {
 						closed = append(closed, ei.Name)
 						directlyClosed[ei.Name] = struct{}{}
@@ -2131,6 +2169,19 @@ func (d *Dice) registerCoreCommands() {
 		ShortHelp: helpNN,
 		Help:      "角色名设置:\n" + helpNN,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
+			fail := func(prefix string, err error) CmdExecuteResult {
+				ctx.setExecutionError(err)
+				ReplyToSender(ctx, msg, fmt.Sprintf("%s：%v", prefix, err))
+				return CmdExecuteResult{Matched: true, Solved: true}
+			}
+			updatePlayerGroupCard := func() error {
+				template := ctx.Player.AutoSetNameTemplate()
+				if template == "" {
+					return nil
+				}
+				_, err := SetPlayerGroupCardByTemplate(ctx, template)
+				return err
+			}
 			val := strings.ToLower(cmdArgs.GetArgN(1))
 			switch val {
 			case "":
@@ -2138,37 +2189,32 @@ func (d *Dice) registerCoreCommands() {
 			case "help":
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 			case "clr", "reset":
-				p := ctx.Player
-				VarSetValueStr(ctx, "$t旧昵称", fmt.Sprintf("<%s>", ctx.Player.Name))
-				VarSetValueStr(ctx, "$t旧昵称_RAW", ctx.Player.Name)
-				p.Name = msg.Sender.Nickname
-				if ctx.Group != nil {
-					ctx.Group.MarkDirty(ctx.Dice)
+				oldName := ctx.Player.Name()
+				VarSetValueStr(ctx, "$t旧昵称", fmt.Sprintf("<%s>", oldName))
+				VarSetValueStr(ctx, "$t旧昵称_RAW", oldName)
+				if err := ctx.Player.SetName(msg.Sender.Nickname); err != nil {
+					return fail("重置昵称失败", err)
 				}
-				VarSetValueStr(ctx, "$t玩家", fmt.Sprintf("<%s>", ctx.Player.Name))
-				VarSetValueStr(ctx, "$t玩家_RAW", ctx.Player.Name)
+				VarSetValueStr(ctx, "$t玩家", fmt.Sprintf("<%s>", ctx.Player.Name()))
+				VarSetValueStr(ctx, "$t玩家_RAW", ctx.Player.Name())
+				if err := updatePlayerGroupCard(); err != nil {
+					return fail("更新群名片失败", err)
+				}
 				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:昵称_重置"))
-				if ctx.Player.AutoSetNameTemplate != "" {
-					_, _ = SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
-				}
 			default:
-				p := ctx.Player
-				VarSetValueStr(ctx, "$t旧昵称", fmt.Sprintf("<%s>", ctx.Player.Name))
-				VarSetValueStr(ctx, "$t旧昵称_RAW", ctx.Player.Name)
-
-				p.Name = cmdArgs.Args[0]
-				if ctx.Group != nil {
-					ctx.Group.MarkDirty(ctx.Dice)
+				oldName := ctx.Player.Name()
+				VarSetValueStr(ctx, "$t旧昵称", fmt.Sprintf("<%s>", oldName))
+				VarSetValueStr(ctx, "$t旧昵称_RAW", oldName)
+				if err := ctx.Player.SetName(cmdArgs.Args[0]); err != nil {
+					return fail("修改昵称失败", err)
 				}
-				VarSetValueStr(ctx, "$t玩家", fmt.Sprintf("<%s>", ctx.Player.Name))
-				VarSetValueStr(ctx, "$t玩家_RAW", ctx.Player.Name)
-
+				VarSetValueStr(ctx, "$t玩家", fmt.Sprintf("<%s>", ctx.Player.Name()))
+				VarSetValueStr(ctx, "$t玩家_RAW", ctx.Player.Name())
+				if err := updatePlayerGroupCard(); err != nil {
+					return fail("更新群名片失败", err)
+				}
 				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:昵称_改名"))
-				if ctx.Player.AutoSetNameTemplate != "" {
-					_, _ = SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
-				}
 			}
-
 			return CmdExecuteResult{Matched: true, Solved: true}
 		},
 	}
@@ -2182,9 +2228,9 @@ func (d *Dice) registerCoreCommands() {
 			if cmdArgs.IsArgEqual(1, "help") {
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 			}
-			text := fmt.Sprintf("个人账号ID为 %s", ctx.Player.UserID)
+			text := fmt.Sprintf("个人账号ID为 %s", ctx.Player.UserID())
 			if !ctx.IsPrivate {
-				text += fmt.Sprintf("\n当前群组ID为 %s", ctx.Group.GroupID)
+				text += fmt.Sprintf("\n当前群组ID为 %s", ctx.Group.GroupID())
 			}
 
 			ReplyToSender(ctx, msg, text)
@@ -2234,11 +2280,13 @@ func (d *Dice) registerCoreCommands() {
 				}
 				manager := ctx.Dice.Parent
 				if manager == nil {
+					ctx.setExecutionError(errors.New("DiceManager 未初始化"))
 					ReplyToSender(ctx, msg, "随机模式配置不可用：DiceManager 未初始化")
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-				effectiveMode, err := manager.SetDiceRandomMode(mode)
+				effectiveMode, err := manager.SetDiceRandomModeForContext(ctx, mode)
 				if err != nil {
+					ctx.setExecutionError(err)
 					if effectiveMode != "" && effectiveMode != mode {
 						ReplyToSender(ctx, msg, fmt.Sprintf("随机模式 %s 当前不可用，仍使用 %s: %v", mode, effectiveMode, err))
 					} else {
@@ -2247,7 +2295,6 @@ func (d *Dice) registerCoreCommands() {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 
-				manager.Save()
 				ReplyToSender(ctx, msg, formatDiceRandomModeSetSuccessText(mode))
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
@@ -2291,68 +2338,71 @@ func (d *Dice) registerCoreCommands() {
 			return "设定骰子面数:\n" + text
 		},
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
-			p := ctx.Player
-			isSetGroup := true
-			my := cmdArgs.GetKwarg("my")
-			if my != nil {
-				isSetGroup = false
+			fail := func(prefix string, err error) CmdExecuteResult {
+				ctx.setExecutionError(err)
+				ReplyToSender(ctx, msg, fmt.Sprintf("%s：%v", prefix, err))
+				return CmdExecuteResult{Matched: true, Solved: true}
 			}
-
+			isSetGroup := cmdArgs.GetKwarg("my") == nil
 			arg1 := cmdArgs.GetArgN(1)
-			modSwitch := false
 			if arg1 == "" {
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 			}
 
+			modSwitch := false
 			tipText := "\n提示:"
+			var switchErr error
 			ctx.Dice.GameSystemMap.Range(func(key string, tmpl *GameSystemTemplate) bool {
 				isMatch := false
-				for _, k := range tmpl.SetConfig.Keys {
-					if strings.EqualFold(arg1, k) {
+				for _, candidate := range tmpl.SetConfig.Keys {
+					if strings.EqualFold(arg1, candidate) {
 						isMatch = true
 						break
 					}
 				}
+				if !isMatch {
+					return true
+				}
 
-				if isMatch {
-					modSwitch = true
-					ctx.Group.System = key
-					ctx.Group.DiceSideNum = tmpl.SetConfig.DiceSides
-					ctx.Group.MarkDirty(ctx.Dice)
-
-					// 兼容性设定
-					if tmpl.SetConfig.EnableTip == "" {
-						extNames := []string{}
-						extNames = append(extNames, tmpl.Commands.Set.RelatedExt...)
-						tmpl.SetConfig.EnableTip = fmt.Sprintf("已切换至 %s(%s) 规则，默认骰子面数 %s，自动启用关联扩展: %s", tmpl.FullName, tmpl.Name, tmpl.Commands.Set.DiceSideExpr, strings.Join(extNames, ", "))
-					}
-
-					tipText += tmpl.SetConfig.EnableTip
-
-					// TODO: 命令该要进步啦
-					cmdArgs.Args[0] = strconv.FormatInt(tmpl.SetConfig.DiceSides, 10)
-
-					for _, name := range tmpl.SetConfig.RelatedExt {
-						// 开启相关扩展
-						ei := ctx.Dice.ExtFind(name, false)
-						if ei != nil {
-							ctx.Group.ExtActive(ei)
-						}
-					}
+				modSwitch = true
+				if switchErr = ctx.Group.SetSystem(key); switchErr != nil {
 					return false
 				}
-				return true
+				if switchErr = ctx.Group.SetDiceSideNum(tmpl.SetConfig.DiceSides); switchErr != nil {
+					return false
+				}
+
+				enableTip := tmpl.SetConfig.EnableTip
+				if enableTip == "" {
+					extNames := append([]string(nil), tmpl.Commands.Set.RelatedExt...)
+					enableTip = fmt.Sprintf("已切换至 %s(%s) 规则，默认骰子面数 %s，自动启用关联扩展: %s", tmpl.FullName, tmpl.Name, tmpl.Commands.Set.DiceSideExpr, strings.Join(extNames, ", "))
+				}
+				tipText += enableTip
+				cmdArgs.Args[0] = strconv.FormatInt(tmpl.SetConfig.DiceSides, 10)
+
+				for _, name := range tmpl.SetConfig.RelatedExt {
+					if extension := ctx.Dice.ExtFind(name, false); extension != nil {
+						if switchErr = ctx.Group.ExtActive(extension); switchErr != nil {
+							return false
+						}
+					}
+				}
+				return false
 			})
+			if switchErr != nil {
+				return fail("切换规则失败", switchErr)
+			}
 
 			num, err := strconv.ParseInt(cmdArgs.Args[0], 10, 64)
 			if num < 0 {
 				num = 0
 			}
-			//nolint:nestif
 			if err == nil {
 				if isSetGroup {
-					ctx.Group.DiceSideNum = num
 					if !modSwitch {
+						if err = ctx.Group.SetDiceSideNum(num); err != nil {
+							return fail("设置群组骰子面数失败", err)
+						}
 						switch num {
 						case 20:
 							tipText += "20面骰。如果要进行DND游戏，建议执行.set dnd以确保开启dnd5e指令"
@@ -2363,16 +2413,14 @@ func (d *Dice) registerCoreCommands() {
 					if tipText == "\n提示:" {
 						tipText = ""
 					}
-
-					VarSetValueInt64(ctx, "$t群组骰子面数", ctx.Group.DiceSideNum)
+					VarSetValueInt64(ctx, "$t群组骰子面数", ctx.Group.DiceSideNum())
 					VarSetValueInt64(ctx, "$t当前骰子面数", getDefaultDicePoints(ctx))
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:设定默认群组骰子面数")+tipText)
 				} else {
-					p.DiceSideNum = int(num)
-					if ctx.Group != nil {
-						ctx.Group.MarkDirty(ctx.Dice)
+					if err = ctx.Player.SetDiceSideNum(num); err != nil {
+						return fail("设置个人骰子面数失败", err)
 					}
-					VarSetValueInt64(ctx, "$t个人骰子面数", int64(ctx.Player.DiceSideNum))
+					VarSetValueInt64(ctx, "$t个人骰子面数", ctx.Player.DiceSideNum())
 					VarSetValueInt64(ctx, "$t当前骰子面数", getDefaultDicePoints(ctx))
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:设定默认骰子面数"))
 				}
@@ -2380,13 +2428,11 @@ func (d *Dice) registerCoreCommands() {
 				switch arg1 {
 				case "clr":
 					if isSetGroup {
-						ctx.Group.DiceSideNum = 0
-						ctx.Group.MarkDirty(ctx.Dice)
-					} else {
-						p.DiceSideNum = 0
-						if ctx.Group != nil {
-							ctx.Group.MarkDirty(ctx.Dice)
+						if err = ctx.Group.SetDiceSideNum(0); err != nil {
+							return fail("清除群组骰子面数失败", err)
 						}
+					} else if err = ctx.Player.SetDiceSideNum(0); err != nil {
+						return fail("清除个人骰子面数失败", err)
 					}
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:设定默认骰子面数_重置"))
 				case "help":
@@ -2419,65 +2465,93 @@ func (d *Dice) registerCoreCommands() {
 		Name:      "pc",
 		ShortHelp: helpCh,
 		Help:      "角色管理:\n" + helpCh,
-		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) (result CmdExecuteResult) {
+		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			cmdArgs.ChopPrefixToArgsWith("list", "lst", "load", "save", "del", "rm", "new", "tag", "untagAll", "rename")
 			val1 := cmdArgs.GetArgN(1)
 			am := d.AttrsManager
+			userID := ctx.Player.UserID()
+			groupID := ctx.Group.GroupID()
 
-			defer func() {
-				if err, ok := recover().(error); ok {
-					ReplyToSender(ctx, msg, fmt.Sprintf("错误: %s\n", err.Error()))
-					result = CmdExecuteResult{Matched: true, Solved: true}
+			fail := func(prefix string, err error) CmdExecuteResult {
+				ctx.setExecutionError(err)
+				ReplyToSender(ctx, msg, fmt.Sprintf("%s: %v", prefix, err))
+				return CmdExecuteResult{Matched: true, Solved: true}
+			}
+			copyValues := func(source, target *AttributesItem) error {
+				snapshot := make(map[string]*ds.VMValue)
+				source.Range(func(key string, value *ds.VMValue) bool {
+					snapshot[key] = value
+					return true
+				})
+				return target.MutateValues(func(values *ds.ValueMap) {
+					values.Clear()
+					for key, value := range snapshot {
+						values.Store(key, value)
+					}
+				})
+			}
+			updatePlayerGroupCard := func() error {
+				template := ctx.Player.AutoSetNameTemplate()
+				if template == "" {
+					return nil
 				}
-			}()
-
-			getNicknameRaw := func(usePlayerName bool, tryIndex bool) string {
-				// name := cmdArgs.GetArgN(2)
+				_, err := SetPlayerGroupCardByTemplate(ctx, template)
+				return err
+			}
+			getNicknameRaw := func(usePlayerName bool, tryIndex bool) (string, error) {
 				name := cmdArgs.CleanArgsChopRest
-
 				if tryIndex {
 					index, err := strconv.ParseInt(name, 10, 64)
 					if err == nil && index > 0 {
-						items, _ := am.GetCharacterList(ctx.Player.UserID)
+						items, listErr := am.GetCharacterListForCtx(ctx, userID)
+						if listErr != nil {
+							return "", listErr
+						}
 						if index <= int64(len(items)) {
-							item := items[index-1]
-							return item.Name
+							return items[index-1].Name, nil
 						}
 					}
 				}
-
 				if usePlayerName && name == "" {
-					name = ctx.Player.Name
+					name = ctx.Player.Name()
 				}
 				name = strings.ReplaceAll(name, "\n", "")
 				name = strings.ReplaceAll(name, "\r", "")
-
 				if len(name) > 90 {
 					name = name[:90]
 				}
-				return name
+				return name, nil
 			}
-
-			getNickname := func() string {
-				return getNicknameRaw(true, true)
-			}
-
-			getBindingId := func() string {
-				id, _ := am.CharGetBindingIdForCtx(ctx, ctx.Group.GroupID, ctx.Player.UserID)
-				return id
-			}
-
-			setCurPlayerName := func(name string) {
-				ctx.Player.Name = name
-				if ctx.Group != nil {
-					ctx.Group.MarkDirty(ctx.Dice)
+			resolveCharacterID := func(name string) (string, error) {
+				index, err := strconv.ParseInt(name, 10, 64)
+				if err == nil && index > 0 {
+					items, listErr := am.GetCharacterListForCtx(ctx, userID)
+					if listErr != nil {
+						return "", listErr
+					}
+					if index <= int64(len(items)) {
+						return items[index-1].Id, nil
+					}
 				}
+				return am.CharIdGetByNameForCtx(ctx, userID, name)
+			}
+			getBindingID := func() (string, error) {
+				return am.CharGetBindingIdForCtx(ctx, groupID, userID)
+			}
+			setCurPlayerName := func(name string) error {
+				return ctx.Player.SetName(name)
 			}
 
 			switch val1 {
 			case "list", "lst":
-				list := lo.Must(am.GetCharacterList(ctx.Player.UserID))
-				bindingId := getBindingId()
+				list, err := am.GetCharacterListForCtx(ctx, userID)
+				if err != nil {
+					return fail("读取角色列表失败", err)
+				}
+				bindingID, err := getBindingID()
+				if err != nil {
+					return fail("读取当前绑定失败", err)
+				}
 
 				var newChars []string
 				for idx, item := range list {
@@ -2485,274 +2559,340 @@ func (d *Dice) registerCoreCommands() {
 					if item.BindingGroupsNum > 0 {
 						prefix = "[★]"
 					}
-					if bindingId == item.Id {
+					if bindingID == item.Id {
 						prefix = "[√]"
 					}
 					suffix := ""
 					if item.SheetType != "" {
 						suffix = fmt.Sprintf(" #%s", item.SheetType)
 					}
-
-					// 格式参考:
-					// 01[×] 张三 #dnd5e
-					// 02[★] 李四 #coc7
-					// 03[√] 王五 #coc7
-					// 04[×] 赵六
 					newChars = append(newChars, fmt.Sprintf("%2d %s %s%s", idx+1, prefix, item.Name, suffix))
 				}
 
 				if len(list) == 0 {
-					ReplyToSender(ctx, msg, fmt.Sprintf("<%s>当前还没有角色列表", ctx.Player.Name))
+					ReplyToSender(ctx, msg, fmt.Sprintf("<%s>当前还没有角色列表", ctx.Player.Name()))
 				} else {
-					ReplyToSender(ctx, msg, fmt.Sprintf("<%s>的角色列表为:\n%s\n[√]已绑 [×]未绑 [★]其他群绑定", ctx.Player.Name, strings.Join(newChars, "\n")))
+					ReplyToSender(ctx, msg, fmt.Sprintf("<%s>的角色列表为:\n%s\n[√]已绑 [×]未绑 [★]其他群绑定", ctx.Player.Name(), strings.Join(newChars, "\n")))
 				}
 				return CmdExecuteResult{Matched: true, Solved: true}
 
 			case "new":
-				name := getNicknameRaw(true, false)
-
+				name, err := getNicknameRaw(true, false)
+				if err != nil {
+					return fail("读取角色名失败", err)
+				}
 				VarSetValueStr(ctx, "$t角色名", name)
-				if !am.CharCheckExists(ctx.Player.UserID, name) {
-					item := lo.Must(am.CharNewForCtx(ctx, ctx.Player.UserID, name, ctx.Group.System))
-					lo.Must0(am.CharBindForCtx(ctx, item.Id, ctx.Group.GroupID, ctx.Player.UserID))
-					setCurPlayerName(name) // 修改当前角色名
-
+				exists, err := am.CharCheckExistsForCtx(ctx, userID, name)
+				if err != nil {
+					return fail("检查角色失败", err)
+				}
+				if !exists {
+					item, createErr := am.CharNewForCtx(ctx, userID, name, ctx.Group.System())
+					if createErr != nil {
+						return fail("新建角色失败", createErr)
+					}
+					if err = am.CharBindForCtx(ctx, item.Id, groupID, userID); err != nil {
+						return fail("绑定角色失败", err)
+					}
+					if err = setCurPlayerName(name); err != nil {
+						return fail("更新当前角色名失败", err)
+					}
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_新建"))
 				} else {
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_新建_已存在"))
 				}
-
-				if ctx.Player.AutoSetNameTemplate != "" {
-					_, _ = SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
+				if err = updatePlayerGroupCard(); err != nil {
+					return fail("更新群名片失败", err)
 				}
 				return CmdExecuteResult{Matched: true, Solved: true}
+
 			case "rename":
-				var charId string
+				var charID string
 				a := cmdArgs.GetArgN(2)
 				b := cmdArgs.GetArgN(3)
-
+				var err error
 				if b == "" {
 					b = a
-					charId = getBindingId()
+					charID, err = getBindingID()
 				} else {
-					charId, _ = am.CharIdGetByName(ctx.Player.UserID, a)
+					charID, err = resolveCharacterID(a)
 				}
-
+				if err != nil {
+					return fail("读取角色失败", err)
+				}
 				if a != "" && b != "" {
-					if charId != "" {
-						if !am.CharCheckExists(ctx.Player.UserID, b) {
-							attrs := lo.Must(am.LoadByIdForCtx(ctx, charId))
-							attrs.Name = b
-							if charId == getBindingId() {
-								// 如果是当前绑定的ID，连名字一起改
-								setCurPlayerName(b)
-							}
-							attrs.LastModifiedTime = time.Now().Unix()
-							lo.Must0(am.SaveForCtx(ctx, attrs))
-							ReplyToSender(ctx, msg, "操作完成")
-						} else {
-							ReplyToSender(ctx, msg, "此角色名已存在")
-						}
-					} else {
+					if charID == "" {
 						ReplyToSender(ctx, msg, "未找到此角色")
+						return CmdExecuteResult{Matched: true, Solved: true}
 					}
+					exists, existsErr := am.CharCheckExistsForCtx(ctx, userID, b)
+					if existsErr != nil {
+						return fail("检查角色名失败", existsErr)
+					}
+					if exists {
+						ReplyToSender(ctx, msg, "此角色名已存在")
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
+					attrs, loadErr := am.LoadByIdForCtx(ctx, charID)
+					if loadErr != nil {
+						return fail("读取角色失败", loadErr)
+					}
+					if err = attrs.SetName(b); err != nil {
+						return fail("角色改名失败", err)
+					}
+					bindingID, bindingErr := getBindingID()
+					if bindingErr != nil {
+						return fail("读取当前绑定失败", bindingErr)
+					}
+					if charID == bindingID {
+						if err = setCurPlayerName(b); err != nil {
+							return fail("更新当前角色名失败", err)
+						}
+					}
+					ReplyToSender(ctx, msg, "操作完成")
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-			case "tag":
-				// 当不输入角色的时候，用当前角色填充，因此做到不写角色名就取消绑定的效果
-				name := getNicknameRaw(false, true)
 
+			case "tag":
+				name, err := getNicknameRaw(false, true)
+				if err != nil {
+					return fail("读取角色名失败", err)
+				}
 				VarSetValueStr(ctx, "$t角色名", name)
 				if name != "" {
-					VarSetValueStr(ctx, "$t角色名", name)
-					charId := lo.Must(am.CharIdGetByName(ctx.Player.UserID, name))
-
-					if charId == "" {
+					charID, lookupErr := am.CharIdGetByNameForCtx(ctx, userID, name)
+					if lookupErr != nil {
+						return fail("读取角色失败", lookupErr)
+					}
+					if charID == "" {
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_绑定_失败"))
 					} else {
-						lo.Must0(am.CharBindForCtx(ctx, charId, ctx.Group.GroupID, ctx.Player.UserID))
-						setCurPlayerName(name)
+						if err = am.CharBindForCtx(ctx, charID, groupID, userID); err != nil {
+							return fail("绑定角色失败", err)
+						}
+						if err = setCurPlayerName(name); err != nil {
+							return fail("更新当前角色名失败", err)
+						}
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_绑定_成功"))
 					}
 				} else {
-					charId := getBindingId()
-
-					if charId == "" {
+					charID, bindingErr := getBindingID()
+					if bindingErr != nil {
+						return fail("读取当前绑定失败", bindingErr)
+					}
+					if charID == "" {
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_绑定_并未绑定"))
 					} else {
-						lo.Must0(am.CharBindForCtx(ctx, "", ctx.Group.GroupID, ctx.Player.UserID))
-						attrs := lo.Must(am.LoadByIdForCtx(ctx, charId))
-
-						name := attrs.Name
-						setCurPlayerName(name)
+						attrs, loadErr := am.LoadByIdForCtx(ctx, charID)
+						if loadErr != nil {
+							return fail("读取角色失败", loadErr)
+						}
+						name = attrs.Name()
+						if err = am.CharBindForCtx(ctx, "", groupID, userID); err != nil {
+							return fail("解除绑定失败", err)
+						}
+						if err = setCurPlayerName(name); err != nil {
+							return fail("更新当前角色名失败", err)
+						}
 						VarSetValueStr(ctx, "$t角色名", name)
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_绑定_解除"))
 					}
 				}
-				if ctx.Player.AutoSetNameTemplate != "" {
-					_, _ = SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
+				if err = updatePlayerGroupCard(); err != nil {
+					return fail("更新群名片失败", err)
 				}
 				return CmdExecuteResult{Matched: true, Solved: true}
+
 			case "load":
-				name := getNicknameRaw(false, true)
-				VarSetValueStr(ctx, "$t角色名", name)
-
-				charId := lo.Must(am.CharIdGetByName(ctx.Player.UserID, name))
-				attrsCur := lo.Must(d.AttrsManager.LoadByCtx(ctx))
-
-				if attrsCur == nil {
-					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_角色不存在"))
-					// ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_序列化失败"))
-				} else {
-					attrs := lo.Must(am.LoadByIdForCtx(ctx, charId))
-
-					attrsCur.Clear()
-					attrs.Range(func(key string, value *ds.VMValue) bool {
-						attrsCur.Store(key, value)
-						return true
-					})
-
-					setCurPlayerName(name)
-
-					if ctx.Player.AutoSetNameTemplate != "" {
-						_, _ = SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
-					}
-
-					VarSetValueStr(ctx, "$t玩家", fmt.Sprintf("<%s>", ctx.Player.Name))
-					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_加载成功"))
+				name, err := getNicknameRaw(false, true)
+				if err != nil {
+					return fail("读取角色名失败", err)
 				}
+				VarSetValueStr(ctx, "$t角色名", name)
+				charID, err := am.CharIdGetByNameForCtx(ctx, userID, name)
+				if err != nil {
+					return fail("读取角色失败", err)
+				}
+				if charID == "" {
+					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_角色不存在"))
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
+				source, err := am.LoadByIdForCtx(ctx, charID)
+				if err != nil {
+					return fail("读取角色失败", err)
+				}
+				sourceName, sourceSheet := source.Name(), source.SheetType()
+				current, err := d.AttrsManager.LoadByCtx(ctx)
+				if err != nil {
+					return fail("读取当前角色卡失败", err)
+				}
+				if err = copyValues(source, current); err != nil {
+					return fail("加载角色数据失败", err)
+				}
+				if err = current.SetName(sourceName); err != nil {
+					return fail("加载角色名失败", err)
+				}
+				if err = current.SetSheetType(sourceSheet); err != nil {
+					return fail("加载角色卡类型失败", err)
+				}
+				if err = setCurPlayerName(name); err != nil {
+					return fail("更新当前角色名失败", err)
+				}
+				if err = updatePlayerGroupCard(); err != nil {
+					return fail("更新群名片失败", err)
+				}
+				VarSetValueStr(ctx, "$t玩家", fmt.Sprintf("<%s>", ctx.Player.Name()))
+				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_加载成功"))
 				return CmdExecuteResult{Matched: true, Solved: true}
+
 			case "save":
-				name := getNickname()
-
-				if !am.CharCheckExists(ctx.Player.UserID, name) {
-					newItem, _ := am.CharNewForCtx(ctx, ctx.Player.UserID, name, ctx.Group.System)
-					attrs := lo.Must(am.LoadByCtx(ctx))
-
-					if newItem != nil {
-						attrsNew, err := am.LoadByIdForCtx(ctx, newItem.Id)
-						if err != nil {
-							// ReplyToSender(ctx, msg, fmt.Sprintf("错误: %s\n", err.Error()))
-							ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_序列化失败"))
-							return CmdExecuteResult{Matched: true, Solved: true}
-						}
-
-						attrs.Range(func(key string, value *ds.VMValue) bool {
-							attrsNew.Store(key, value)
-							return true
-						})
-
-						VarSetValueStr(ctx, "$t角色名", name)
-						VarSetValueStr(ctx, "$t新角色名", fmt.Sprintf("<%s>", name))
-						// replyToSender(ctx, msg, fmt.Sprintf("角色<%s>储存成功", Name))
-						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_储存成功"))
-					} else {
-						VarSetValueStr(ctx, "$t角色名", name)
-						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_储存失败_已绑定"))
+				name, err := getNicknameRaw(true, true)
+				if err != nil {
+					return fail("读取角色名失败", err)
+				}
+				exists, err := am.CharCheckExistsForCtx(ctx, userID, name)
+				if err != nil {
+					return fail("检查角色失败", err)
+				}
+				current, err := am.LoadByCtx(ctx)
+				if err != nil {
+					return fail("读取当前角色卡失败", err)
+				}
+				if !exists {
+					newItem, createErr := am.CharNewForCtx(ctx, userID, name, ctx.Group.System())
+					if createErr != nil {
+						return fail("新建角色失败", createErr)
 					}
+					target, loadErr := am.LoadByIdForCtx(ctx, newItem.Id)
+					if loadErr != nil {
+						return fail("读取新角色失败", loadErr)
+					}
+					if err = copyValues(current, target); err != nil {
+						return fail("储存角色失败", err)
+					}
+					if err = target.SetName(name); err != nil {
+						return fail("储存角色名失败", err)
+					}
+					if err = target.SetSheetType(ctx.Group.System()); err != nil {
+						return fail("储存角色卡类型失败", err)
+					}
+					VarSetValueStr(ctx, "$t角色名", name)
+					VarSetValueStr(ctx, "$t新角色名", fmt.Sprintf("<%s>", name))
+					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_储存成功"))
 				} else {
 					VarSetValueStr(ctx, "$t角色名", name)
-
-					charId, _ := am.CharIdGetByName(ctx.Player.UserID, name)
-					if charId == "" {
-						// 可能有点过于谨慎，因为已经判断过了，还是留着吧
+					charID, lookupErr := am.CharIdGetByNameForCtx(ctx, userID, name)
+					if lookupErr != nil {
+						return fail("读取角色失败", lookupErr)
+					}
+					if charID == "" {
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_角色不存在"))
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
-
-					bindingGroups := am.CharGetBindingGroupIdList(charId)
+					bindingGroups, bindingErr := am.CharGetBindingGroupIDListForCtx(ctx, charID)
+					if bindingErr != nil {
+						return fail("读取角色绑定失败", bindingErr)
+					}
 					if len(bindingGroups) == 0 {
-						attrs := lo.Must(am.LoadByCtx(ctx))
-						attrsExisting := lo.Must(am.LoadByIdForCtx(ctx, charId))
-
-						attrsExisting.Clear()
-						attrs.Range(func(key string, value *ds.VMValue) bool {
-							attrsExisting.Store(key, value)
-							return true
-						})
-
-						attrsExisting.Name = name
-						attrsExisting.SetSheetType(ctx.Group.System)
+						target, loadErr := am.LoadByIdForCtx(ctx, charID)
+						if loadErr != nil {
+							return fail("读取角色失败", loadErr)
+						}
+						if err = copyValues(current, target); err != nil {
+							return fail("储存角色失败", err)
+						}
+						if err = target.SetName(name); err != nil {
+							return fail("储存角色名失败", err)
+						}
+						if err = target.SetSheetType(ctx.Group.System()); err != nil {
+							return fail("储存角色卡类型失败", err)
+						}
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_储存成功"))
 					} else {
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_储存失败_已绑定"))
 					}
 				}
 				return CmdExecuteResult{Matched: true, Solved: true}
+
 			case "untagAll":
-				var charId string
-				name := getNicknameRaw(false, true)
+				name, err := getNicknameRaw(false, true)
+				if err != nil {
+					return fail("读取角色名失败", err)
+				}
+				var charID string
 				if name == "" {
-					charId = getBindingId()
+					charID, err = getBindingID()
 				} else {
-					charId, _ = am.CharIdGetByName(ctx.Player.UserID, name)
+					charID, err = am.CharIdGetByNameForCtx(ctx, userID, name)
 				}
-
-				var lst []string
-				if charId != "" {
-					lst = am.CharUnbindAllForCtx(ctx, charId)
+				if err != nil {
+					return fail("读取角色失败", err)
 				}
-
-				for _, i := range lst {
-					if i == ctx.Group.GroupID {
-						ctx.Player.Name = msg.Sender.Nickname
-						if ctx.Group != nil {
-							ctx.Group.MarkDirty(ctx.Dice)
+				var groups []string
+				if charID != "" {
+					groups, err = am.CharUnbindAllForCtx(ctx, charID)
+					if err != nil {
+						return fail("解除全部绑定失败", err)
+					}
+				}
+				for _, boundGroupID := range groups {
+					if boundGroupID == groupID {
+						if err = setCurPlayerName(msg.Sender.Nickname); err != nil {
+							return fail("重置当前角色名失败", err)
 						}
-
-						// TODO: 其他群的设置sn的怎么办？先不管了。。
-						if ctx.Player.AutoSetNameTemplate != "" {
-							_, _ = SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
+						if err = updatePlayerGroupCard(); err != nil {
+							return fail("更新群名片失败", err)
 						}
 					}
 				}
-
-				if len(lst) > 0 {
-					ReplyToSender(ctx, msg, "绑定已全部解除:\n"+strings.Join(lst, "\n"))
+				if len(groups) > 0 {
+					ReplyToSender(ctx, msg, "绑定已全部解除:\n"+strings.Join(groups, "\n"))
 				} else {
 					ReplyToSender(ctx, msg, "这张卡片并未绑定到任何群")
 				}
 				return CmdExecuteResult{Matched: true, Solved: true}
+
 			case "del", "rm":
-				name := getNicknameRaw(false, true)
+				name, err := getNicknameRaw(false, true)
+				if err != nil {
+					return fail("读取角色名失败", err)
+				}
 				if name == "" {
 					return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 				}
 				VarSetValueStr(ctx, "$t角色名", name)
-
-				charId, _ := am.CharIdGetByName(ctx.Player.UserID, name)
-				if charId == "" {
+				charID, err := am.CharIdGetByNameForCtx(ctx, userID, name)
+				if err != nil {
+					return fail("读取角色失败", err)
+				}
+				if charID == "" {
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_角色不存在"))
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-
-				lst := am.CharGetBindingGroupIdList(charId)
-				if len(lst) > 0 {
-					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_删除失败_已绑定"))
-					// ReplyToSender(ctx, msg, "角色已绑定到以下群:\n"+strings.Join(lst, "\n"))
-					return CmdExecuteResult{Matched: true, Solved: true}
-				}
-
-				err := am.CharDeleteForCtx(ctx, charId)
+				groups, err := am.CharGetBindingGroupIDListForCtx(ctx, charID)
 				if err != nil {
-					ReplyToSender(ctx, msg, "角色删除失败")
+					return fail("读取角色绑定失败", err)
+				}
+				if len(groups) > 0 {
+					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:角色管理_删除失败_已绑定"))
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-
+				bindingCharID, err := getBindingID()
+				if err != nil {
+					return fail("读取当前绑定失败", err)
+				}
+				if err = am.CharDeleteForCtx(ctx, charID); err != nil {
+					return fail("角色删除失败", err)
+				}
 				VarSetValueStr(ctx, "$t角色名", name)
 				VarSetValueStr(ctx, "$t新角色名", fmt.Sprintf("<%s>", name))
-
-				// 如果name原是序号，这里将被更新为角色名
-				VarSetValueStr(ctx, "$t角色名", name)
-				VarSetValueStr(ctx, "$t新角色名", fmt.Sprintf("<%s>", name))
-
 				text := DiceFormatTmpl(ctx, "核心:角色管理_删除成功")
-				bindingCharId := getBindingId()
-				if bindingCharId == charId {
+				if bindingCharID == charID {
 					VarSetValueStr(ctx, "$t新角色名", fmt.Sprintf("<%s>", msg.Sender.Nickname))
 					text += "\n" + DiceFormatTmpl(ctx, "核心:角色管理_删除成功_当前卡")
-					p := ctx.Player
-					p.Name = msg.Sender.Nickname
+					if err = setCurPlayerName(msg.Sender.Nickname); err != nil {
+						return fail("重置当前角色名失败", err)
+					}
 				}
 				ReplyToSender(ctx, msg, text)
 				return CmdExecuteResult{Matched: true, Solved: true}
@@ -2780,14 +2920,22 @@ func (d *Dice) registerCoreCommands() {
 					onText = "关"
 				}
 				extReply := ctx.Dice.ExtFind("reply", false)
-				ctx.Group.ExtActive(extReply)
+				if err := ctx.Group.ExtActive(extReply); err != nil {
+					ctx.setExecutionError(err)
+					ReplyToSender(ctx, msg, fmt.Sprintf("开启自定义回复失败：%v", err))
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				ReplyToSender(ctx, msg, fmt.Sprintf("已在当前群开启自定义回复(%s➯开)。\n此指令等价于.ext reply on", onText))
 			case "off":
 				onText := "开"
 				if ctx.Group.ExtGetActive("reply") == nil {
 					onText = "关"
 				}
-				ctx.Group.ExtInactiveByName("reply")
+				if _, err := ctx.Group.ExtInactiveByName("reply"); err != nil {
+					ctx.setExecutionError(err)
+					ReplyToSender(ctx, msg, fmt.Sprintf("关闭自定义回复失败：%v", err))
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				ReplyToSender(ctx, msg, fmt.Sprintf("已在当前群关闭自定义回复(%s➯关)。\n此指令等价于.ext reply off", onText))
 			default:
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
@@ -2801,10 +2949,10 @@ func (d *Dice) registerCoreCommands() {
 func getDefaultDicePoints(ctx *MsgContext) int64 {
 	diceSides := int64(0)
 	if ctx.Player != nil {
-		diceSides = int64(ctx.Player.DiceSideNum)
+		diceSides = ctx.Player.DiceSideNum()
 	}
 	if diceSides == 0 && ctx.Group != nil {
-		diceSides = ctx.Group.DiceSideNum
+		diceSides = ctx.Group.DiceSideNum()
 	}
 	if diceSides <= 0 {
 		diceSides = 100
@@ -2812,63 +2960,37 @@ func getDefaultDicePoints(ctx *MsgContext) int64 {
 	return diceSides
 }
 
-func setRuleByName(ctx *MsgContext, name string) {
+func setRuleByName(ctx *MsgContext, name string) error {
 	if name == "" {
-		return
+		return nil
 	}
-	diceFaces := ""
-	d := ctx.Dice
-
-	modSwitch := false
-	tipText := "\n提示:"
-
-	d.GameSystemMap.Range(func(key string, tmpl *GameSystemTemplate) bool {
+	var applyErr error
+	ctx.Dice.GameSystemMap.Range(func(key string, tmpl *GameSystemTemplate) bool {
 		isMatch := false
-		for _, k := range tmpl.SetConfig.Keys {
-			if strings.EqualFold(name, k) {
+		for _, candidate := range tmpl.SetConfig.Keys {
+			if strings.EqualFold(name, candidate) {
 				isMatch = true
 				break
 			}
 		}
-
-		if isMatch {
-			modSwitch = true
-			ctx.Group.System = key
-			ctx.Group.DiceSideNum = tmpl.SetConfig.DiceSides
-			ctx.Group.MarkDirty(ctx.Dice)
-			tipText += tmpl.SetConfig.EnableTip
-
-			// TODO: 命令该要进步啦
-			diceFaces = strconv.FormatInt(tmpl.SetConfig.DiceSides, 10)
-
-			for _, name := range tmpl.SetConfig.RelatedExt {
-				// 开启相关扩展
-				ei := ctx.Dice.ExtFind(name, false)
-				if ei != nil {
-					ctx.Group.ExtActive(ei)
-				}
-			}
+		if !isMatch {
+			return true
+		}
+		if applyErr = ctx.Group.SetSystem(key); applyErr != nil {
 			return false
 		}
-		return true
-	})
-
-	num, err := strconv.ParseInt(diceFaces, 10, 64)
-	if num < 0 {
-		num = 0
-	}
-	if err == nil {
-		ctx.Group.DiceSideNum = num
-		if !modSwitch {
-			switch num {
-			case 20:
-				tipText += "20面骰。如果要进行DND游戏，建议执行.set dnd以确保开启dnd5e指令"
-			case 100:
-				tipText += "100面骰。如果要进行COC游戏，建议执行.set coc以确保开启coc7指令"
+		if applyErr = ctx.Group.SetDiceSideNum(tmpl.SetConfig.DiceSides); applyErr != nil {
+			return false
+		}
+		for _, extensionName := range tmpl.SetConfig.RelatedExt {
+			extension := ctx.Dice.ExtFind(extensionName, false)
+			if extension != nil {
+				if applyErr = ctx.Group.ExtActive(extension); applyErr != nil {
+					return false
+				}
 			}
 		}
-		if tipText == "\n提示:" {
-			tipText = ""
-		}
-	}
+		return false
+	})
+	return applyErr
 }

@@ -2,14 +2,13 @@ package dice
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"Scardice-core/adapterapi"
-	"Scardice-core/core/groupstate"
-	"Scardice-core/core/messageflow"
-	"Scardice-core/core/playerstate"
 	"Scardice-core/dice/service"
 	"Scardice-core/eventstore"
 )
@@ -17,32 +16,45 @@ import (
 // StartLogGapCheck is the authenticated management entry point. Chat commands
 // must use newLogGapCheck with their actual sender privilege instead.
 func (d *Dice) StartLogGapCheck(endpointID, groupID string, after, before int64) error {
-	if d == nil || d.ImSession == nil || d.ImSession.ServiceAtNew == nil {
+	if d == nil || d.ImSession == nil || d.DurableStore == nil {
 		return errors.New("运行时尚未就绪")
 	}
-	for _, ep := range d.ImSession.EndPointsReadOnly() {
-		if ep == nil || ep.ID != endpointID || !ep.Enable {
+	for _, endpoint := range d.ImSession.EndPointsReadOnly() {
+		if endpoint == nil || endpoint.ID != endpointID || !endpoint.Enable {
 			continue
 		}
-		group, ok := d.ImSession.ServiceAtNew.Load(groupID)
-		if !ok || group == nil {
-			if d.DurableStore == nil {
-				return service.ErrLogRepositoryUnavailable
-			}
-			state, err := groupstate.NewRepository(d.DurableStore).Load(context.Background(), d.BaseConfig.Name, groupID)
-			if err != nil {
-				return err
-			}
-			scope := messageflow.CallbackScope{DiceID: d.BaseConfig.Name, GroupID: groupID, UserID: ep.UserID}
-			group = compatibilityGroupFromState(d, state, playerstate.PlayerState{}, scope)
-			group, _ = d.ImSession.ServiceAtNew.LoadOrStore(groupID, group)
-		}
-		task, err := newLogGapCheck(&MsgContext{Dice: d, EndPoint: ep, Group: group, PrivilegeLevel: 100}, after, before)
+		invocationID, err := (eventstore.UUIDGenerator{}).NewID()
 		if err != nil {
 			return err
 		}
-		task.start()
-		return nil
+		canonical, err := json.Marshal(struct {
+			EndpointID string `json:"endpointId"`
+			GroupID    string `json:"groupId"`
+			After      int64  `json:"after"`
+			Before     int64  `json:"before"`
+		}{EndpointID: endpointID, GroupID: groupID, After: after, Before: before})
+		if err != nil {
+			return err
+		}
+		identity := d.DomainExecutionIdentity("log-gap-check", invocationID)
+		return d.WithDomainExecution(context.Background(), identity, canonical, func(transaction *DurableCallbackTransaction) error {
+			scope := &MsgContext{
+				Dice: d, Session: d.ImSession, EndPoint: endpoint, PrivilegeLevel: 100,
+				callbackTransaction: transaction, callbackMetadata: transaction.metadata,
+				executionContext: transaction.executionContext,
+			}
+			if err := scope.ResolveExistingDomainConversation(groupID, ""); err != nil {
+				return err
+			}
+			if scope.Group == nil {
+				return errors.New("目标群不存在")
+			}
+			task, err := newLogGapCheck(scope, after, before)
+			if err != nil {
+				return err
+			}
+			return transaction.AfterCommit(task.start)
+		})
 	}
 	return errors.New("目标连接不可用")
 }
@@ -70,47 +82,82 @@ func newLogGapCheck(ctx *MsgContext, after, before int64) (logGapFillTask, error
 	if after < state.BaselineSeq {
 		return logGapFillTask{}, errors.New("检查区间不能早于本次开启日志的 seq 基线")
 	}
+	invocationID, err := newLogGapTaskID(ctx, after, before)
+	if err != nil {
+		return logGapFillTask{}, err
+	}
+	if ctx.Group.runtime == nil || ctx.Group.runtime.logSequence == nil {
+		return logGapFillTask{}, errors.New("群运行时资源不可用")
+	}
 	return logGapFillTask{
-		dice: ctx.Dice, endpoint: ctx.EndPoint, group: ctx.Group,
+		dice: ctx.Dice, endpoint: ctx.EndPoint,
+		groupID: ctx.Group.GroupID(), runtime: ctx.Group.runtime, invocationID: invocationID,
 		logID: state.ID, logName: state.Name, fromSeq: after, toSeq: before,
 		gap: before - after - 1, manualCheck: true,
 	}, nil
 }
 
+func newLogGapTaskID(ctx *MsgContext, fromSeq, toSeq int64) (string, error) {
+	base := ""
+	groupID := ""
+	if ctx != nil {
+		base = ctx.callbackMetadata.CommandID
+		if ctx.Group != nil {
+			groupID = ctx.Group.GroupID()
+		}
+	}
+	if base == "" {
+		var err error
+		base, err = (eventstore.UUIDGenerator{}).NewID()
+		if err != nil {
+			return "", err
+		}
+	}
+	return base + "|" + groupID + "|" + strconv.FormatInt(fromSeq, 10) + "|" + strconv.FormatInt(toSeq, 10), nil
+}
+
 func (t logGapFillTask) start() { go t.run() }
 
 func (t logGapFillTask) run() {
-	defer func() {
-		if value := recover(); value != nil {
-			t.dice.Logger.Errorf("日志补全异常: 群=%s err=%v", t.group.GroupID, value)
-		}
-	}()
-	if t.dice.ProviderQuery == nil || t.dice.InboundReplay == nil {
+	if t.dice == nil {
 		return
 	}
-	lock := &t.group.logSequence().fillMu
+	defer func() {
+		if value := recover(); value != nil {
+			t.dice.Logger.Errorf("日志补全异常: 群=%s err=%v", t.groupID, value)
+		}
+	}()
+	if t.endpoint == nil || t.dice.ProviderQuery == nil || t.dice.InboundReplay == nil ||
+		t.runtime == nil || t.runtime.revoked.Load() || t.runtime.logSequence == nil {
+		return
+	}
+	lock := &t.runtime.logSequence.fillMu
 	if !lock.TryLock() {
 		return
 	}
 	defer lock.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), logGapFillTimeout)
 	defer cancel()
-	t.dice.Logger.Infof("检测到日志seq断层: 群=%s 上条seq=%d 本条seq=%d 缺失=%d", t.group.GroupID, t.fromSeq, t.toSeq, t.gap)
-	request := adapterapi.QueryRequest{EndpointID: adapterapi.EndpointID(t.endpoint.ID), Kind: adapterapi.QueryKindGroupHistory, Group: adapterapi.ConversationID(t.group.GroupID), AfterSequence: t.fromSeq, BeforeSequence: t.toSeq, Limit: adapterapi.MaxHistoryQueryMessages}
+	t.dice.Logger.Infof("检测到日志seq断层: 群=%s 上条seq=%d 本条seq=%d 缺失=%d", t.groupID, t.fromSeq, t.toSeq, t.gap)
+	request := adapterapi.QueryRequest{EndpointID: adapterapi.EndpointID(t.endpoint.ID), Kind: adapterapi.QueryKindGroupHistory, Group: adapterapi.ConversationID(t.groupID), AfterSequence: t.fromSeq, BeforeSequence: t.toSeq, Limit: adapterapi.MaxHistoryQueryMessages}
 	result, err := t.dice.ProviderQuery.Query(ctx, request)
 	if err == nil {
 		err = result.Validate(request)
 	}
 	if err != nil {
-		t.dice.Logger.Warnf("日志补全拉取失败: 群=%s err=%v", t.group.GroupID, err)
+		t.dice.Logger.Warnf("日志补全拉取失败: 群=%s err=%v", t.groupID, err)
 		return
 	}
 	missing := t.filterHistory(result.History)
 	archived := 0
 	if t.manualCheck {
-		entries, readErr := logRepositoryForDice(t.dice).Entries(t.group.GroupID, t.logName)
+		repository := logRepositoryForDice(t.dice)
+		if repository == nil {
+			return
+		}
+		entries, readErr := repository.Entries(t.groupID, t.logName)
 		if readErr != nil {
-			t.dice.Logger.Warnf("日志补全比对失败: 群=%s err=%v", t.group.GroupID, readErr)
+			t.dice.Logger.Warnf("日志补全比对失败: 群=%s err=%v", t.groupID, readErr)
 			return
 		}
 		known := make(map[string]struct{}, len(entries))
@@ -133,10 +180,16 @@ func (t logGapFillTask) run() {
 		return
 	}
 	if t.toSeq-t.fromSeq-1 > adapterapi.MaxHistoryQueryMessages {
-		t.dice.Logger.Warnf("日志补全区间超过上限，仅检查最近 %d 条: 群=%s", adapterapi.MaxHistoryQueryMessages, t.group.GroupID)
+		t.dice.Logger.Warnf("日志补全区间超过上限，仅检查最近 %d 条: 群=%s", adapterapi.MaxHistoryQueryMessages, t.groupID)
 	}
 	mode := adapterapi.InboundHistoryExecute
-	if len(missing) > logGapFillSilentThreshold {
+	others := 0
+	for _, m := range missing {
+		if m.Kind != adapterapi.InboundKindSelfMessage {
+			others++
+		}
+	}
+	if others > logGapFillSilentThreshold {
 		mode = adapterapi.InboundHistoryRecordOnly
 	}
 	pending := make(map[string]adapterapi.InboundMessage, len(missing))
@@ -148,7 +201,7 @@ func (t logGapFillTask) run() {
 			break
 		}
 		if !t.currentLog() {
-			t.dice.Logger.Infof("日志补全停止: 日志已暂停或切换，群=%s", t.group.GroupID)
+			t.dice.Logger.Infof("日志补全停止: 日志已暂停或切换，群=%s", t.groupID)
 			return
 		}
 		m.History = mode
@@ -203,14 +256,70 @@ func (t logGapFillTask) run() {
 			}
 		}
 	}
-	t.dice.Logger.Infof("日志补全处理结束: 群=%s 成功=%d 失败=%d 待处理=%d 已存在=%d", t.group.GroupID, confirmed, failed, len(pending), existing)
+	t.dice.Logger.Infof("日志补全处理结束: 群=%s 成功=%d 失败=%d 待处理=%d 已存在=%d", t.groupID, confirmed, failed, len(pending), existing)
 	if (!t.manualCheck && mode != adapterapi.InboundHistoryRecordOnly) || !t.currentLog() {
 		return
 	}
-	msg := &Message{MessageType: "group", GroupID: t.group.GroupID, Platform: t.endpoint.Platform, Sender: SenderBase{UserID: t.endpoint.UserID}}
-	report := CreateTempCtx(t.endpoint, msg)
-	_ = report.runStandaloneMessageScope(func() {
-		ReplyToSenderRaw(report, msg, t.buildNotice(confirmed, failed, len(pending), existing, stats, names), "skip")
+	if err := t.reportNotice(confirmed, failed, len(pending), existing, stats, names); err != nil {
+		t.dice.Logger.Warnf("日志补全结果发送失败: 群=%s err=%v", t.groupID, err)
+	}
+}
+
+func (t logGapFillTask) reportNotice(
+	confirmed, failed, pending, existing int,
+	stats map[string]map[string]int,
+	names map[string]string,
+) error {
+	if t.dice == nil || t.dice.ImSession == nil || t.endpoint == nil ||
+		t.endpoint.Session == nil || t.endpoint.Session != t.dice.ImSession || t.invocationID == "" {
+		return errors.New("日志补全汇报上下文不可用")
+	}
+	notice := t.buildNotice(confirmed, failed, pending, existing, stats, names)
+	canonical, err := json.Marshal(struct {
+		TaskID    string                    `json:"taskId"`
+		GroupID   string                    `json:"groupId"`
+		LogID     uint64                    `json:"logId"`
+		Confirmed int                       `json:"confirmed"`
+		Failed    int                       `json:"failed"`
+		Pending   int                       `json:"pending"`
+		Existing  int                       `json:"existing"`
+		Stats     map[string]map[string]int `json:"stats,omitempty"`
+		Names     map[string]string         `json:"names,omitempty"`
+		Notice    string                    `json:"notice"`
+	}{
+		TaskID: t.invocationID, GroupID: t.groupID, LogID: t.logID,
+		Confirmed: confirmed, Failed: failed, Pending: pending, Existing: existing,
+		Stats: stats, Names: names, Notice: notice,
+	})
+	if err != nil {
+		return err
+	}
+	identity := t.dice.DomainExecutionIdentity("log-gap-report", t.invocationID)
+	return t.dice.WithDomainExecution(context.Background(), identity, canonical, func(transaction *DurableCallbackTransaction) error {
+		msg := &Message{
+			MessageType: "group", GroupID: t.groupID, Platform: t.endpoint.Platform,
+			Sender: SenderBase{UserID: t.endpoint.UserID},
+		}
+		report := &MsgContext{
+			Dice: t.dice, Session: t.dice.ImSession, EndPoint: t.endpoint, MessageType: "group",
+			callbackTransaction: transaction, callbackMetadata: transaction.metadata,
+			executionContext: transaction.executionContext,
+		}
+		if err := report.ResolveExistingDomainConversation(t.groupID, ""); err != nil {
+			return err
+		}
+		if report.Group == nil {
+			return errors.New("日志补全汇报目标群不存在")
+		}
+		if err := report.runStandaloneMessageScope(func() {
+			ReplyToSenderRaw(report, msg, notice, "skip")
+		}); err != nil {
+			return err
+		}
+		if err := report.getExecutionError(); err != nil {
+			return err
+		}
+		return transaction.Domain().Err()
 	})
 }
 
@@ -219,14 +328,16 @@ func (t logGapFillTask) currentLog() bool {
 	if !ok {
 		return false
 	}
-	state, err := repository.GetState(t.group.GroupID)
+	state, err := repository.GetState(t.groupID)
 	return err == nil && state.On && state.ID == t.logID && state.Name == t.logName && state.BaselineSeq <= t.fromSeq
 }
 
 func (t logGapFillTask) filterHistory(messages []adapterapi.InboundMessage) []adapterapi.InboundMessage {
 	out := messages[:0]
 	for _, m := range messages {
-		if m.Sequence <= t.fromSeq || m.Sequence >= t.toSeq || m.Sender == adapterapi.PrincipalID(t.endpoint.UserID) || m.OccurredAt.IsZero() || m.MessageID == "" {
+		// The account's own messages come back as own messages (never executed);
+		// one that did not arrive as such is not the account's to replay.
+		if m.Sequence <= t.fromSeq || m.Sequence >= t.toSeq || (m.Kind != adapterapi.InboundKindSelfMessage && m.Sender == adapterapi.PrincipalID(t.endpoint.UserID)) || m.OccurredAt.IsZero() || m.MessageID == "" {
 			continue
 		}
 		out = append(out, m)
@@ -257,8 +368,11 @@ func (t logGapFillTask) submitHistory(ctx context.Context, m adapterapi.InboundM
 }
 
 func (t logGapFillTask) countHistoryCommand(m adapterapi.InboundMessage, stats map[string]map[string]int, names map[string]string) {
+	if m.Kind == adapterapi.InboundKindSelfMessage {
+		return
+	}
 	msg := compatibilityCallbackMessageForHistory(m)
-	cmd := extractCommandName(t.dice.CommandPrefix, msg.Platform, msg.Message)
+	cmd := extractCommandName(t.dice.CommandPrefixes(), msg.Platform, msg.Message)
 	if cmd == "" {
 		return
 	}

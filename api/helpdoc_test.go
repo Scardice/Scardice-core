@@ -16,6 +16,27 @@ import (
 	"Scardice-core/dice"
 )
 
+func newCanonicalHelpDocAPIFixture(t *testing.T, token string) (*dice.DiceManager, *dice.Dice) {
+	t.Helper()
+	previousDice, previousManager := myDice, dm
+	t.Cleanup(func() {
+		myDice, dm = previousDice, previousManager
+	})
+
+	_, manager, runtime, _ := newDiceConfigDurableHandlerTest(t)
+	manager.HelpDocEngineType = int(dice.BlugeSearch)
+	manager.AccessTokens.Store(token, true)
+	runtime.CmdMap = dice.CmdMapCls{}
+	runtime.ExtList = nil
+	myDice, dm = runtime, manager
+	t.Cleanup(func() {
+		if manager.Help != nil {
+			manager.Help.Close()
+		}
+	})
+	return manager, runtime
+}
+
 func TestHelpDocReloadAPIReflectsDeletedHelpDoc(t *testing.T) {
 	root := switchAPIToTempWorkdir(t)
 
@@ -30,24 +51,7 @@ func TestHelpDocReloadAPIReflectsDeletedHelpDoc(t *testing.T) {
 	writeAPIHelpDocFile(t, root, keepRelPath, map[string]string{keepTitle: "keep content"})
 	removePath := writeAPIHelpDocFile(t, root, removeRelPath, map[string]string{removeTitle: "remove content"})
 
-	manager := &dice.DiceManager{HelpDocEngineType: int(dice.BlugeSearch)}
-	manager.AccessTokens.Store(token, true)
-	testDice := &dice.Dice{
-		Parent: manager,
-		Config: dice.Config{},
-		CmdMap: dice.CmdMapCls{},
-	}
-	manager.Dice = []*dice.Dice{testDice}
-
-	oldMyDice, oldDM := myDice, dm
-	myDice, dm = testDice, manager
-	t.Cleanup(func() {
-		if manager.Help != nil {
-			manager.Help.Close()
-		}
-		myDice = oldMyDice
-		dm = oldDM
-	})
+	manager, _ := newCanonicalHelpDocAPIFixture(t, token)
 
 	manager.InitHelp()
 
@@ -124,19 +128,7 @@ func TestHelpDocReadAPIsWaitForManagerReplacement(t *testing.T) {
 	writeAPIHelpDocFile(t, root, "api-group/startup.json", map[string]string{"startup-entry": "ready"})
 
 	const token = "helpdoc-read-lock-test"
-	manager := &dice.DiceManager{HelpDocEngineType: int(dice.BlugeSearch)}
-	manager.AccessTokens.Store(token, true)
-	testDice := &dice.Dice{Parent: manager, Config: dice.Config{}, CmdMap: dice.CmdMapCls{}}
-	manager.Dice = []*dice.Dice{testDice}
-
-	oldMyDice, oldDM := myDice, dm
-	myDice, dm = testDice, manager
-	t.Cleanup(func() {
-		if manager.Help != nil {
-			manager.Help.Close()
-		}
-		myDice, dm = oldMyDice, oldDM
-	})
+	manager, _ := newCanonicalHelpDocAPIFixture(t, token)
 
 	manager.InitHelp()
 	if manager.Help == nil {

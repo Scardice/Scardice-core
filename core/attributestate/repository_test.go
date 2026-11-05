@@ -1,8 +1,10 @@
 package attributestate
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"Scardice-core/eventstore"
@@ -26,7 +28,7 @@ func (store *batchSecretStore) ResolveSecrets(_ context.Context, lookups []event
 	resolved := make([]eventstore.SecretResolution, len(lookups))
 	for index, lookup := range lookups {
 		resolved[index] = eventstore.SecretResolution{
-			SecretRef: lookup.SecretRef, SecretVersion: lookup.SecretVersion, Plaintext: []byte("{}"),
+			SecretRef: lookup.SecretRef, SecretVersion: lookup.SecretVersion, Value: []byte("{}"),
 		}
 	}
 	return resolved, nil
@@ -60,5 +62,28 @@ func TestLoadBatchPagesBeyondResolverLimit(t *testing.T) {
 	}
 	if len(store.calls) != 2 || store.calls[0] != 100000 || store.calls[1] != 1 {
 		t.Fatalf("resolver batch sizes = %v, want [100000 1]", store.calls)
+	}
+}
+
+func TestPlainReferencePreservesLongestAttributeIdentityAcrossReload(t *testing.T) {
+	ctx := context.Background()
+	store, database := attributeProjectionTestStore(t)
+	defer database.Close()
+	repository, err := NewRepository(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.Repeat("x", 248)
+	want := []byte(`{"hp":60}`)
+	saved, err := repository.Save(ctx, State{DiceID: "d", ID: id}, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.SecretRef != "vault:attributes:"+Stream("d", id).AggregateID {
+		t.Fatalf("reference lost its plaintext identity: %q", saved.SecretRef)
+	}
+	loaded, value, err := repository.Load(ctx, "d", id)
+	if err != nil || loaded.ID != id || !bytes.Equal(value, want) {
+		t.Fatalf("long identity reload failed: id=%q value=%q err=%v", loaded.ID, value, err)
 	}
 }

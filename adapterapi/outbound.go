@@ -1,11 +1,7 @@
 package adapterapi
 
 import (
-	"bytes"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/binary"
-	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -331,118 +327,71 @@ func payloadContract(kind EffectPayloadKind) (EffectKind, CapabilitySet, ActionK
 	}
 	return 0, 0, 0, 0, 0, false
 }
-func canonicalTarget(target EffectTarget) []byte {
-	var buf bytes.Buffer
-	_ = buf.WriteByte(byte(target.Kind))
-	for _, value := range []string{string(target.Conversation), string(target.Member), target.Raw} {
-		_ = binary.Write(&buf, binary.BigEndian, uint32(len(value)))
-		_, _ = buf.WriteString(value)
-	}
-	return buf.Bytes()
-}
 
+// LaneMetadata identifies an endpoint's destination queue. Sequence is transport
+// metadata; the store allocates the durable FIFO sequence when it accepts work.
 type LaneMetadata struct {
-	EndpointID   EndpointID `json:"endpointId"`
-	TargetDigest string     `json:"targetDigest"`
-	Key          string     `json:"key"`
-	Sequence     uint64     `json:"sequence"`
-	MAC          string     `json:"mac"`
+	EndpointID EndpointID `json:"endpointId"`
+	Key        string     `json:"key"`
+	Sequence   uint64     `json:"sequence"`
 }
 
-// LaneSigner performs a domain-separated MAC without exposing the index-root
-// material to the caller. The payload is the exact byte sequence covered by
-// the returned MAC.
-type LaneSigner func(label string, payload []byte) ([]byte, error)
-
-func appendLaneLength(dst, value []byte) []byte {
-	var length [4]byte
-	binary.BigEndian.PutUint32(length[:], uint32(len(value)))
-	dst = append(dst, length[:]...)
-	return append(dst, value...)
-}
-
-func NewLaneMetadataWithSigner(endpoint EndpointID, target EffectTarget, sequence uint64, signer LaneSigner) (LaneMetadata, error) {
-	if !endpoint.Valid() || sequence == 0 || signer == nil {
+func NewLaneMetadata(endpoint EndpointID, target EffectTarget, sequence uint64) (LaneMetadata, error) {
+	if !endpoint.Valid() || sequence == 0 {
 		return LaneMetadata{}, fmt.Errorf("%w: invalid lane inputs", ErrInvalidContract)
 	}
 	if err := target.Validate(); err != nil {
 		return LaneMetadata{}, err
 	}
-	targetInput := appendLaneLength(nil, []byte(endpoint))
-	targetInput = append(targetInput, canonicalTarget(target)...)
-	targetDigest, err := signer("target/v1\x00", targetInput)
-	if err != nil || len(targetDigest) == 0 {
-		return LaneMetadata{}, fmt.Errorf("%w: lane target signing failed", ErrInvalidContract)
+	kind, destination := "person", string(target.Conversation)
+	switch target.Kind {
+	case TargetInvalid, TargetPerson:
+	case TargetGroup:
+		kind = "group"
+	case TargetRaw:
+		kind, destination = "raw", target.Raw
 	}
-	targetDigestHex := hex.EncodeToString(targetDigest)
-	laneInput := make([]byte, 0, 1+4+len(endpoint)+4+len(targetDigestHex))
-	laneInput = append(laneInput, 1)
-	laneInput = appendLaneLength(laneInput, []byte(endpoint))
-	laneInput = appendLaneLength(laneInput, []byte(targetDigestHex))
-	keyDigest, err := signer("lane/v1\x00", laneInput)
-	if err != nil || len(keyDigest) == 0 {
-		return LaneMetadata{}, fmt.Errorf("%w: lane key signing failed", ErrInvalidContract)
+	// Member-specific actions serialize with messages to their conversation.
+	// JSON string framing keeps identifiers readable and unambiguous.
+	key, err := json.Marshal([3]string{string(endpoint), kind, destination})
+	if err != nil {
+		return LaneMetadata{}, err
 	}
-	key := hex.EncodeToString(keyDigest)
-	authInput := append(append([]byte(nil), laneInput...), []byte(key)...)
-	authDigest, err := signer("lane-metadata/v1\x00", authInput)
-	if err != nil || len(authDigest) == 0 {
-		return LaneMetadata{}, fmt.Errorf("%w: lane authentication signing failed", ErrInvalidContract)
-	}
-	return LaneMetadata{
-		EndpointID:   endpoint,
-		TargetDigest: targetDigestHex,
-		Key:          key,
-		Sequence:     sequence,
-		MAC:          hex.EncodeToString(authDigest),
-	}, nil
-}
-
-func NewLaneMetadata(endpoint EndpointID, target EffectTarget, indexRoot []byte, sequence uint64) (LaneMetadata, error) {
-	if len(indexRoot) == 0 {
-		return LaneMetadata{}, fmt.Errorf("%w: invalid lane inputs", ErrInvalidContract)
-	}
-	return NewLaneMetadataWithSigner(endpoint, target, sequence, func(label string, payload []byte) ([]byte, error) {
-		mac := hmac.New(sha256.New, indexRoot)
-		_, _ = mac.Write([]byte(label))
-		_, _ = mac.Write(payload)
-		return mac.Sum(nil), nil
-	})
+	return LaneMetadata{EndpointID: endpoint, Key: string(key), Sequence: sequence}, nil
 }
 
 func (lane LaneMetadata) Validate() error {
-	if !lane.EndpointID.Valid() || len(lane.TargetDigest) != 64 || len(lane.Key) != 64 || lane.Sequence == 0 || len(lane.MAC) != 64 {
+	const maxLaneKeyBytes = 6*(MaxIdentifierBytes+MaxEffectFieldBytes) + 32
+	if !lane.EndpointID.Valid() || lane.Sequence == 0 || len(lane.Key) == 0 || len(lane.Key) > maxLaneKeyBytes {
 		return fmt.Errorf("%w: invalid lane metadata", ErrInvalidContract)
 	}
-	for _, value := range []string{lane.TargetDigest, lane.Key, lane.MAC} {
-		if _, err := hex.DecodeString(value); err != nil {
-			return fmt.Errorf("%w: invalid lane digest", ErrInvalidContract)
-		}
+	var identity [3]string
+	if err := json.Unmarshal([]byte(lane.Key), &identity); err != nil || identity[0] != string(lane.EndpointID) {
+		return fmt.Errorf("%w: invalid lane identity", ErrInvalidContract)
 	}
-	return nil
+	target := EffectTarget{Conversation: ConversationID(identity[2])}
+	switch identity[1] {
+	case "person":
+		target.Kind = TargetPerson
+	case "group":
+		target.Kind = TargetGroup
+	case "raw":
+		target = EffectTarget{Kind: TargetRaw, Raw: identity[2]}
+	default:
+		return fmt.Errorf("%w: invalid lane target kind", ErrInvalidContract)
+	}
+	return lane.Verify(lane.EndpointID, target)
 }
 
-func (lane LaneMetadata) VerifyWithSigner(signer LaneSigner, endpoint EndpointID, target EffectTarget) error {
-	expected, err := NewLaneMetadataWithSigner(endpoint, target, lane.Sequence, signer)
+func (lane LaneMetadata) Verify(endpoint EndpointID, target EffectTarget) error {
+	expected, err := NewLaneMetadata(endpoint, target, lane.Sequence)
 	if err != nil {
 		return err
 	}
-	if expected.EndpointID != lane.EndpointID || expected.TargetDigest != lane.TargetDigest || expected.Key != lane.Key || expected.MAC != lane.MAC {
-		return fmt.Errorf("%w: lane authentication mismatch", ErrInvalidContract)
+	if lane != expected {
+		return fmt.Errorf("%w: lane identity mismatch", ErrInvalidContract)
 	}
 	return nil
-}
-
-func (lane LaneMetadata) Verify(indexRoot []byte, endpoint EndpointID, target EffectTarget) error {
-	if len(indexRoot) == 0 {
-		return fmt.Errorf("%w: invalid lane inputs", ErrInvalidContract)
-	}
-	return lane.VerifyWithSigner(func(label string, payload []byte) ([]byte, error) {
-		mac := hmac.New(sha256.New, indexRoot)
-		_, _ = mac.Write([]byte(label))
-		_, _ = mac.Write(payload)
-		return mac.Sum(nil), nil
-	}, endpoint, target)
 }
 
 type ImmutableArtifactMetadata struct {

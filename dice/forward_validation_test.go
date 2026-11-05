@@ -71,11 +71,13 @@ func TestForwardMixedDeliveryUsesSelfIdentityAndInternalSplit(t *testing.T) {
 
 func TestWelcomeReplyKeepsForwardBoundariesUntilDelivery(t *testing.T) {
 	adapter := newForwardCaptureAdapter()
-	endpoint := &EndPointInfo{EndPointInfoBase: EndPointInfoBase{
-		UserID: "QQ:4242", Nickname: "SelfBot", Platform: "TEST",
-	}, Adapter: adapter}
-	ctx := &MsgContext{EndPoint: endpoint, Dice: &Dice{Logger: zap.NewNop().Sugar()}}
-	msg := &Message{MessageType: "group", GroupID: "QQ-Group:9000"}
+	d, _ := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:4242")
+	endpoint.Nickname = "SelfBot"
+	endpoint.Platform = "TEST"
+	endpoint.Adapter = adapter
+	msg := newGroupMsg("QQ-Group:9000", "QQ:forward-user", "")
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, msg, "welcome-forward")
 	inside := ctx.TranslateSplit("notice one#{SPLIT}\nnotice two#{SPLIT}\nnotice three")
 
 	ReplyGroup(ctx, msg, "ordinary welcome\n"+ctx.wrapForward(inside))
@@ -284,14 +286,17 @@ func TestForwardFallbackPreservesInlineSplitLayout(t *testing.T) {
 
 func TestPluginForwardAPIBindingsCanConstructAndSend(t *testing.T) {
 	adapter := newForwardCaptureAdapter()
-	d := &Dice{
-		Logger: zap.NewNop().Sugar(), BaseConfig: BaseConfig{DataDir: t.TempDir()},
-		ImSession:   &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
-		DirtyGroups: new(SyncMap[string, int64]), AttrsManager: &AttrsManager{},
-	}
-	endpoint := &EndPointInfo{EndPointInfoBase: EndPointInfoBase{UserID: "QQ:4242", Nickname: "SelfBot", Platform: "TEST"}, Adapter: adapter}
-	ctx := &MsgContext{Dice: d, EndPoint: endpoint}
-	msg := &Message{MessageType: "group", GroupID: "QQ-Group:9000"}
+	d, _ := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:4242")
+	endpoint.Nickname = "SelfBot"
+	endpoint.Platform = "TEST"
+	endpoint.Adapter = adapter
+	msg := newGroupMsg("QQ-Group:9000", "QQ:forward-user", "")
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, msg, "plugin-forward")
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.JsEnable = true
+		config.JsEngine = string(jsengine.EngineGoja)
+	})
 	d.JsInit()
 	defer func() {
 		if d.JsScriptCron != nil {

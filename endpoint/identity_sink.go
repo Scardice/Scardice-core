@@ -10,13 +10,10 @@ import (
 	"Scardice-core/eventstore"
 )
 
-// IdentityObservationHook runs after the matching identity fact is durable.
-type IdentityObservationHook func(context.Context, FencedIdentityObservation) error
-
 // NewIdentityObservationSink persists every provider identity behind the
 // generation and desired-version fence. Stale and removed endpoints are
 // intentionally ignored because their runtime no longer owns current state.
-func NewIdentityObservationSink(service *Service, hooks ...IdentityObservationHook) IdentityObservationSink {
+func NewIdentityObservationSink(service *Service) IdentityObservationSink {
 	return IdentityObservationSinkFunc(func(ctx context.Context, observation FencedIdentityObservation) error {
 		if service == nil || service.Repository == nil {
 			return ErrInvalid
@@ -58,13 +55,6 @@ func NewIdentityObservationSink(service *Service, hooks ...IdentityObservationHo
 				ProviderID: observation.Observation.ProviderID, DisplayName: commandDisplayName,
 			}); err != nil {
 				return err
-			}
-		}
-		for _, hook := range hooks {
-			if hook != nil {
-				if err := hook(ctx, observation); err != nil {
-					return err
-				}
 			}
 		}
 		return nil

@@ -142,7 +142,7 @@ func TestPromiseObservationReportsUnprintableRejection(t *testing.T) {
 	}
 }
 
-type promiseObserverRetentionProbe struct{ data [256]byte }
+type promiseObserverRetentionProbe [256]byte
 
 func TestCanceledPromiseObservationReleasesHostCallback(t *testing.T) {
 	checkPromiseObserverRelease(t, false)

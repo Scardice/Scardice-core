@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -59,14 +60,16 @@ func TestAliasExecutionRebuildsSegmentsForGroupAndPersonalTargetsWithCQCode(t *t
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			attrs, err := d.AttrsManager.LoadById(test.attrID)
-			if err != nil {
-				t.Fatalf("load alias attributes: %v", err)
-			}
-			attrs.Store(test.attrKey, ds.NewStrVal(test.target))
+			withCanonicalTestRoot(t, d, "seed-alias:"+test.name, func(transaction *DurableCallbackTransaction) error {
+				attrs, err := d.AttrsManager.LoadByTransaction(context.Background(), transaction, test.attrID)
+				if err != nil {
+					return err
+				}
+				return attrs.Store(test.attrKey, ds.NewStrVal(test.target))
+			})
 
 			// When
-			d.ImSession.ExecuteNew(ep, test.incoming)
+			executeNewAndWaitForCanonicalCommit(t, d, ep, test.incoming)
 
 			// Then
 			var capture aliasTargetCapture

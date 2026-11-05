@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"Scardice-core/message"
@@ -19,10 +21,176 @@ func jsExtensionSourceDescription(source *JsScriptInfo) string {
 	return fmt.Sprintf("name=%q filename=%q packageID=%q homepage=%q", source.Name, source.Filename, source.PackageID, source.HomePage)
 }
 
+// jsExtensionResource is the VM-facing extension receiver. It keeps normal
+// ExtInfo fields and callbacks reflectable while routing storage through the
+// invocation proven by the loop that created or returned the receiver.
+type jsExtensionResource struct {
+	*ExtInfo
+	loop jsengine.Loop
+}
+
+func newJSExtensionResource(extension *ExtInfo, loop jsengine.Loop) *jsExtensionResource {
+	if extension == nil {
+		return nil
+	}
+	return &jsExtensionResource{ExtInfo: extension, loop: loop}
+}
+
+func (r *jsExtensionResource) target() (*ExtInfo, error) {
+	if r == nil || r.ExtInfo == nil {
+		return nil, errors.New("[扩展]:目标扩展不存在")
+	}
+	target := r.ExtInfo.GetRealExt()
+	if target == nil {
+		return nil, errors.New("[扩展]:目标扩展不存在")
+	}
+	return target, nil
+}
+
+func (r *jsExtensionResource) registered() (*ExtInfo, error) {
+	if r == nil || r.ExtInfo == nil || r.dice == nil {
+		return nil, errors.New("请先完成此扩展的注册")
+	}
+	return r.ExtInfo, nil
+}
+
+func (r *jsExtensionResource) transaction() (*DurableCallbackTransaction, context.Context, error) {
+	execution, domainCtx := jsDomainExecutionFor(r.loop)
+	if execution == nil || execution.Transaction == nil {
+		return nil, domainCtx, ErrJSInvocationExpired
+	}
+	if err := execution.ExecutionContext().Err(); err != nil {
+		return nil, domainCtx, errors.Join(ErrJSInvocationExpired, err)
+	}
+	domain := execution.Transaction.Domain()
+	if domain == nil {
+		return nil, domainCtx, ErrJSInvocationExpired
+	}
+	if err := domain.CheckOpen(); err != nil {
+		return nil, domainCtx, errors.Join(ErrJSInvocationExpired, err)
+	}
+	return execution.Transaction, domainCtx, nil
+}
+
+func (r *jsExtensionResource) StorageSet(key, value string) error {
+	target, err := r.target()
+	if err != nil {
+		return err
+	}
+	transaction, domainCtx, err := r.transaction()
+	if err != nil {
+		return err
+	}
+	return transaction.StorageSet(domainCtx, target.Name, key, value)
+}
+
+func (r *jsExtensionResource) StorageGet(key string) (string, error) {
+	target, err := r.target()
+	if err != nil {
+		return "", err
+	}
+	transaction, domainCtx, err := r.transaction()
+	if err != nil {
+		return "", err
+	}
+	return transaction.StorageGet(domainCtx, target.Name, key)
+}
+
+func (r *jsExtensionResource) StorageList() ([]string, error) {
+	target, err := r.target()
+	if err != nil {
+		return nil, err
+	}
+	transaction, domainCtx, err := r.transaction()
+	if err != nil {
+		return nil, err
+	}
+	return transaction.StorageList(domainCtx, target.Name)
+}
+
+func (r *jsExtensionResource) GetRealExt() *jsExtensionResource {
+	if r == nil || r.ExtInfo == nil {
+		return nil
+	}
+	return newJSExtensionResource(r.ExtInfo.GetRealExt(), r.loop)
+}
+
+func jsHostMessageContext(d *Dice, loop jsengine.Loop) *MsgContext {
+	execution, _ := jsDomainExecutionFor(loop)
+	if execution == nil {
+		return nil
+	}
+	if execution.Message != nil {
+		return execution.Message
+	}
+	transaction := execution.Transaction
+	if transaction == nil {
+		return nil
+	}
+	return &MsgContext{
+		Dice:                d,
+		callbackTransaction: transaction,
+		callbackMetadata:    transaction.metadata,
+		executionContext:    transaction.executionContext,
+	}
+}
+
+// jsCreateTempContext creates a message authority for message-less roots so
+// cron, task, and persistent async callbacks retain their proven DomainTx.
+func jsCreateTempContext(
+	execution *jsExecutionContext,
+	d *Dice,
+	ep *EndPointInfo,
+	msg *Message,
+) (*MsgContext, error) {
+	if execution == nil {
+		return nil, ErrJSInvocationExpired
+	}
+	if d == nil || (execution.Dice != nil && execution.Dice != d) {
+		return nil, ErrJSInvocationCrossRealm
+	}
+	if ep != nil && ep.Session != nil && ep.Session.Parent != nil && ep.Session.Parent != d {
+		return nil, ErrJSInvocationCrossRealm
+	}
+	authority := execution.Message
+	if authority == nil {
+		registry := execution.invocationRegistry()
+		registry.mu.Lock()
+		authority = registry.message
+		if authority == nil {
+			authority = &MsgContext{
+				Dice:                d,
+				callbackTransaction: execution.Transaction,
+				executionContext:    execution.ExecutionContext(),
+				jsExecution:         execution.executionScope(),
+			}
+			if execution.Transaction != nil {
+				authority.callbackMetadata = execution.Transaction.metadata
+				if execution.Transaction.executionContext != nil {
+					authority.executionContext = execution.Transaction.executionContext
+				}
+			}
+			registry.message = authority
+		}
+		registry.mu.Unlock()
+		execution.Message = authority
+	}
+	if execution.Transaction != nil {
+		return CreateTempCtxInExecution(authority, ep, msg)
+	}
+	temporary, err := CreateTempCtxInExecution(nil, ep, msg)
+	if err != nil {
+		return nil, err
+	}
+	temporary.executionParent = authority
+	temporary.executionContext = authority.domainContext()
+	return temporary, nil
+}
+
 // installJSHostAPI exposes the engine-neutral base of the seal host object.
 // installJSExtHostAPI adds extension registration and callbacks once the
 // runtime generation is known.
-func (d *Dice) installJSHostAPI(runtime jsengine.Runtime) error {
+func (d *Dice) installJSHostAPI(runtime jsengine.Runtime, loop jsengine.Loop) error {
 	seal := runtime.NewObject()
 
 	vars := runtime.NewObject()
@@ -53,31 +221,83 @@ func (d *Dice) installJSHostAPI(runtime jsengine.Runtime) error {
 		name  string
 		value interface{}
 	}{
-		{name: "addBan", value: func(ctx *MsgContext, id string, place string, reason string) {
-			(&d.Config).BanList.AddScoreBase(id, d.Config.BanList.ThresholdBan, place, reason, ctx)
-		}},
-		{name: "addTrust", value: func(ctx *MsgContext, id string, place string, reason string) {
-			(&d.Config).BanList.SetTrustByID(id, place, reason)
-		}},
-		{name: "remove", value: func(ctx *MsgContext, id string) {
-			if _, ok := (&d.Config).BanList.GetByID(id); ok {
-				(&d.Config).BanList.DeleteByID(d, id)
+		{name: "addBan", value: func(ctx *MsgContext, id string, place string, reason string) error {
+			config := d.Config()
+			if config == nil || config.BanList == nil {
+				return errors.New("黑白名单服务不可用")
 			}
-		}},
-		{name: "getList", value: func() []BanListInfoItem {
-			var list []BanListInfoItem
-			for _, value := range (&d.Config).BanList.Snapshot() {
-				list = append(list, *value)
+			if ctx == nil {
+				ctx = jsHostMessageContext(d, loop)
 			}
-			return list
+			settings, err := config.BanList.settingsForContext(ctx)
+			if err != nil {
+				return err
+			}
+			_, err = config.BanList.AddScoreBaseWithError(id, settings.ThresholdBan, place, reason, ctx)
+			return err
 		}},
-		{name: "getUser", value: func(id string) *BanListInfoItem {
-			i, ok := (&d.Config).BanList.GetByID(id)
+		{name: "addTrust", value: func(ctx *MsgContext, id string, place string, reason string) error {
+			config := d.Config()
+			if config == nil || config.BanList == nil {
+				return errors.New("黑白名单服务不可用")
+			}
+			if ctx == nil {
+				ctx = jsHostMessageContext(d, loop)
+			}
+			return config.BanList.SetTrustByIDForContext(ctx, id, place, reason)
+		}},
+		{name: "remove", value: func(ctx *MsgContext, id string) error {
+			config := d.Config()
+			if config == nil || config.BanList == nil {
+				return errors.New("黑白名单服务不可用")
+			}
+			// 显式 ctx 优先；否则继承当前 JS 执行的 DomainTx；二者都没有时
+			// DeleteByIDForContext 会开启独立的 moderation-delete typed root。
+			if ctx == nil {
+				ctx = jsHostMessageContext(d, loop)
+			}
+			_, ok, err := config.BanList.GetByIDForContext(ctx, id)
+			if err != nil {
+				return err
+			}
 			if !ok {
 				return nil
 			}
-			itemCopy := *i
-			return &itemCopy
+			return config.BanList.DeleteByIDForContext(ctx, d, id)
+		}},
+		{name: "getList", value: func() ([]BanListInfoItem, error) {
+			config := d.Config()
+			if config == nil || config.BanList == nil {
+				return nil, nil
+			}
+			message := jsHostMessageContext(d, loop)
+			snapshots, err := config.BanList.SnapshotForContext(message)
+			if err != nil {
+				return nil, err
+			}
+			list := make([]BanListInfoItem, 0, len(snapshots))
+			for _, item := range snapshots {
+				if item != nil {
+					list = append(list, *item)
+				}
+			}
+			return list, nil
+		}},
+		{name: "getUser", value: func(id string) (*BanListInfoItem, error) {
+			// Missing services and subjects are intentional JS null values.
+			// A repository failure remains a JavaScript exception.
+			var result *BanListInfoItem
+			if config := d.Config(); config != nil && config.BanList != nil {
+				item, found, err := config.BanList.GetByIDForContext(jsHostMessageContext(d, loop), id)
+				if err != nil {
+					return nil, err
+				}
+				if found && item != nil {
+					itemCopy := *item
+					result = &itemCopy
+				}
+			}
+			return result, nil
 		}},
 	} {
 		if err := setJSHostObject(ban, binding.name, binding.value); err != nil {
@@ -141,16 +361,24 @@ func (d *Dice) installJSHostAPI(runtime jsengine.Runtime) error {
 		{name: "formatTmpl", value: DiceFormatTmpl},
 		{name: "getCtxProxyFirst", value: GetCtxProxyFirst},
 		{name: "newMessage", value: func() *Message { return &Message{} }},
-		{name: "createTempCtx", value: CreateTempCtx},
-		{name: "applyPlayerGroupCardByTemplate", value: func(ctx *MsgContext, tmpl string) string {
+		{name: "createTempCtx", value: func(ep *EndPointInfo, msg *Message) (*MsgContext, error) {
+			execution, _ := jsDomainExecutionFor(loop)
+			return jsCreateTempContext(execution, d, ep, msg)
+		}},
+		{name: "applyPlayerGroupCardByTemplate", value: func(ctx *MsgContext, tmpl string) (string, error) {
+			if ctx == nil || ctx.Player == nil {
+				return "", ErrPlayerHandleUnavailable
+			}
 			if tmpl != "" {
-				ctx.Player.AutoSetNameTemplate = tmpl
+				if err := ctx.Player.SetAutoSetNameTemplate(tmpl); err != nil {
+					return "", err
+				}
 			}
-			if ctx.Player.AutoSetNameTemplate == "" {
-				return ""
+			current := ctx.Player.AutoSetNameTemplate()
+			if current == "" {
+				return "", nil
 			}
-			text, _ := SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
-			return text
+			return SetPlayerGroupCardByTemplate(ctx, current)
 		}},
 		{name: "getCtxProxyAtPos", value: GetCtxProxyAtPos},
 		{name: "getVersion", value: jsHostVersion},
@@ -212,6 +440,22 @@ func configValueTypeMismatch(ei *ExtInfo, key string, config *ConfigItem) string
 	)
 }
 
+func jsDomainExecutionFor(loop jsengine.Loop) (*jsExecutionContext, context.Context) {
+	execution := jsExecutionContextFor(loop)
+	if execution.persistentScope() {
+		if active, err := execution.persistentInvocation(); err == nil {
+			execution = active
+		}
+	}
+	if execution != nil && execution.Message != nil {
+		return execution, execution.Message.domainContext()
+	}
+	if execution != nil && execution.Transaction != nil && execution.Transaction.executionContext != nil {
+		return execution, execution.Transaction.executionContext
+	}
+	return execution, context.Background()
+}
+
 func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop, seal jsengine.Object, versionID int64, sourceLocation func() string) error {
 	ext := runtime.NewObject()
 	if err := seal.Set("ext", ext); err != nil {
@@ -219,6 +463,73 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 	}
 	if sourceLocation == nil {
 		sourceLocation = func() string { return "" }
+	}
+	registerPluginConfig := func(ei *ExtInfo, items ...*ConfigItem) error {
+		execution, domainCtx := jsDomainExecutionFor(loop)
+		if execution != nil && execution.Transaction != nil {
+			return d.ConfigManager.RegisterPluginConfigInDomain(
+				domainCtx, execution.Transaction, ei.Name, items...,
+			)
+		}
+		if d.DurableStore != nil {
+			return ErrJSInvocationExpired
+		}
+		return d.ConfigManager.RegisterPluginConfig(ei.Name, items...)
+	}
+	unregisterPluginConfig := func(ei *ExtInfo, keys ...string) error {
+		execution, domainCtx := jsDomainExecutionFor(loop)
+		if execution != nil && execution.Transaction != nil {
+			return d.ConfigManager.UnregisterConfigInDomain(
+				domainCtx, execution.Transaction, ei.Name, keys...,
+			)
+		}
+		if d.DurableStore != nil {
+			return ErrJSInvocationExpired
+		}
+		return d.ConfigManager.UnregisterConfig(ei.Name, keys...)
+	}
+	configItem := func(ei *ExtInfo, key string) (*ConfigItem, error) {
+		execution, domainCtx := jsDomainExecutionFor(loop)
+		if execution != nil && execution.Transaction != nil {
+			return d.configItemForDomain(domainCtx, execution.Transaction, ei.Name, key)
+		}
+		if d.DurableStore != nil {
+			return nil, ErrJSInvocationExpired
+		}
+		return d.compatibilityConfigItemWithError(ei, key)
+	}
+	pluginConfigItems := func(ei *ExtInfo) (map[string]*ConfigItem, bool, error) {
+		execution, domainCtx := jsDomainExecutionFor(loop)
+		if execution != nil && execution.Transaction != nil {
+			state, err := d.ExtensionStateForDomain(domainCtx, execution.Transaction.Domain())
+			if err != nil {
+				return nil, false, err
+			}
+			definitions, found := state.ConfigDefinitions[ei.Name]
+			if !found {
+				return nil, false, nil
+			}
+			items := make(map[string]*ConfigItem, len(definitions))
+			for key := range definitions {
+				item, itemErr := d.configItemForDomain(domainCtx, execution.Transaction, ei.Name, key)
+				if itemErr != nil {
+					return nil, false, itemErr
+				}
+				items[key] = item
+			}
+			return items, true, nil
+		}
+		if d.DurableStore != nil {
+			return nil, false, ErrJSInvocationExpired
+		}
+		configs, err := d.ConfigManager.PluginConfigs(domainCtx)
+		if err != nil {
+			return nil, false, err
+		}
+		if config := configs[ei.Name]; config != nil {
+			return config.Configs, true, nil
+		}
+		return nil, false, nil
 	}
 	_ = ext.Set("newCmdItemInfo", func() *CmdItemInfo {
 		return &CmdItemInfo{
@@ -233,14 +544,14 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			Solved:  solved,
 		}
 	})
-	_ = ext.Set("new", func(name, author, version string) *ExtInfo {
-		context := jsExecutionContextFor(loop)
-		source := jsContextScript(context)
+	_ = ext.Set("new", func(name, author, version string) *jsExtensionResource {
+		execution := jsExecutionContextFor(loop)
+		source := jsContextScript(execution)
 		var official bool
 		if source != nil {
 			official = source.Official
 		}
-		return &ExtInfo{
+		return newJSExtensionResource(&ExtInfo{
 			Name: name, Author: author, Version: version,
 			GetDescText:   GetExtensionDesc,
 			AutoActive:    true,
@@ -250,23 +561,24 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			CmdMap:        CmdMapCls{},
 			Source:        source,
 			JSLoopVersion: versionID,
-		}
+		}, loop)
 	})
 	// TODO(局部重载/更新同名插件): 这里是“谁观察了谁”的天然采集点。依赖方可能持有 find 返回的旧 ExtInfo，
 	//   局部更新时需要整链重载；应在此记录“调用方脚本 -> 被查找扩展”的边，补充 @depends 未声明的耦合。
 	//   subTODO(局部重载): 调用方脚本取自 jsExecutionContextFor(loop)；跨插件 storage 访问同理。
-	_ = ext.Set("find", func(name string) *ExtInfo {
-		return d.ExtFind(name, true)
+	_ = ext.Set("find", func(name string) *jsExtensionResource {
+		return newJSExtensionResource(d.ExtFind(name, true), loop)
 	})
-	_ = ext.Set("register", func(realExt *ExtInfo) (returnErr error) {
+	_ = ext.Set("register", func(resource *jsExtensionResource) (returnErr error) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				returnErr = fmt.Errorf("注册扩展失败: %v", recovered)
 			}
 		}()
-		if realExt == nil {
+		if resource == nil || resource.ExtInfo == nil {
 			return errors.New("注册扩展失败: 扩展为空")
 		}
+		realExt := resource.ExtInfo
 
 		if strings.EqualFold(realExt.Name, "help") || strings.EqualFold(realExt.Name, "all") {
 			return errors.New("help 和 all 为保留关键字，无法作为插件名使用")
@@ -280,7 +592,13 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			return fmt.Errorf("注册扩展失败: 扩展名 %q 已被占用", extName)
 		}
 		if d.DurableStore != nil {
-			if err := d.DurableDiscoverExtension(context.Background(), realExt); err != nil {
+			execution, domainCtx := jsDomainExecutionFor(loop)
+			if execution == nil || execution.Transaction == nil {
+				return ErrJSInvocationExpired
+			}
+			if err := d.ensureExtensionInDomain(
+				domainCtx, execution.Transaction.Domain(), execution.Transaction.metadata, realExt,
+			); err != nil {
 				return fmt.Errorf("注册扩展 %q 的持久身份失败: %w", extName, err)
 			}
 		}
@@ -337,7 +655,7 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 		d.JsExtRegistry.Store(extName, realExt)
 
 		// 4. 更新全局扩展变更时间戳
-		d.ExtUpdateTime = time.Now().Unix()
+		atomic.StoreInt64(&d.ExtUpdateTime, time.Now().Unix())
 
 		// 5. 触发 OnLoad 回调
 		if realExt.OnLoad != nil {
@@ -345,9 +663,10 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 		}
 		return nil
 	})
-	_ = ext.Set("registerStringConfig", func(ei *ExtInfo, key string, defaultValue string, description string, group string) error {
-		if ei.dice == nil {
-			return errors.New("请先完成此扩展的注册")
+	_ = ext.Set("registerStringConfig", func(resource *jsExtensionResource, key string, defaultValue string, description string, group string) error {
+		ei, err := resource.registered()
+		if err != nil {
+			return err
 		}
 		config := &ConfigItem{
 			Key:          key,
@@ -357,11 +676,12 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			DefaultValue: defaultValue,
 			Description:  description,
 		}
-		return d.ConfigManager.RegisterPluginConfig(ei.Name, config)
+		return registerPluginConfig(ei, config)
 	})
-	_ = ext.Set("registerIntConfig", func(ei *ExtInfo, key string, defaultValue int64, description string, group string) error {
-		if ei.dice == nil {
-			return errors.New("请先完成此扩展的注册")
+	_ = ext.Set("registerIntConfig", func(resource *jsExtensionResource, key string, defaultValue int64, description string, group string) error {
+		ei, err := resource.registered()
+		if err != nil {
+			return err
 		}
 		config := &ConfigItem{
 			Key:          key,
@@ -371,11 +691,12 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			DefaultValue: defaultValue,
 			Description:  description,
 		}
-		return d.ConfigManager.RegisterPluginConfig(ei.Name, config)
+		return registerPluginConfig(ei, config)
 	})
-	_ = ext.Set("registerBoolConfig", func(ei *ExtInfo, key string, defaultValue bool, description string, group string) error {
-		if ei.dice == nil {
-			return errors.New("请先完成此扩展的注册")
+	_ = ext.Set("registerBoolConfig", func(resource *jsExtensionResource, key string, defaultValue bool, description string, group string) error {
+		ei, err := resource.registered()
+		if err != nil {
+			return err
 		}
 		config := &ConfigItem{
 			Key:          key,
@@ -385,11 +706,12 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			DefaultValue: defaultValue,
 			Description:  description,
 		}
-		return d.ConfigManager.RegisterPluginConfig(ei.Name, config)
+		return registerPluginConfig(ei, config)
 	})
-	_ = ext.Set("registerFloatConfig", func(ei *ExtInfo, key string, defaultValue float64, description string, group string) error {
-		if ei.dice == nil {
-			return errors.New("请先完成此扩展的注册")
+	_ = ext.Set("registerFloatConfig", func(resource *jsExtensionResource, key string, defaultValue float64, description string, group string) error {
+		ei, err := resource.registered()
+		if err != nil {
+			return err
 		}
 		config := &ConfigItem{
 			Key:          key,
@@ -399,11 +721,12 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			DefaultValue: defaultValue,
 			Description:  description,
 		}
-		return d.ConfigManager.RegisterPluginConfig(ei.Name, config)
+		return registerPluginConfig(ei, config)
 	})
-	_ = ext.Set("registerTemplateConfig", func(ei *ExtInfo, key string, defaultValue []string, description string, group string) error {
-		if ei.dice == nil {
-			return errors.New("请先完成此扩展的注册")
+	_ = ext.Set("registerTemplateConfig", func(resource *jsExtensionResource, key string, defaultValue []string, description string, group string) error {
+		ei, err := resource.registered()
+		if err != nil {
+			return err
 		}
 		config := &ConfigItem{
 			Key:          key,
@@ -413,11 +736,12 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			DefaultValue: defaultValue,
 			Description:  description,
 		}
-		return d.ConfigManager.RegisterPluginConfig(ei.Name, config)
+		return registerPluginConfig(ei, config)
 	})
-	_ = ext.Set("registerOptionConfig", func(ei *ExtInfo, key string, defaultValue string, option []string, description string, group string) error {
-		if ei.dice == nil {
-			return errors.New("请先完成此扩展的注册")
+	_ = ext.Set("registerOptionConfig", func(resource *jsExtensionResource, key string, defaultValue string, option []string, description string, group string) error {
+		ei, err := resource.registered()
+		if err != nil {
+			return err
 		}
 		config := &ConfigItem{
 			Key:          key,
@@ -428,32 +752,42 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			Option:       option,
 			Description:  description,
 		}
-		return d.ConfigManager.RegisterPluginConfig(ei.Name, config)
+		return registerPluginConfig(ei, config)
 	})
-	_ = ext.Set("newConfigItem", func(ei *ExtInfo, key string, defaultValue interface{}, description string) *ConfigItem {
-		if ei.dice == nil {
-			panic(errors.New("请先完成此扩展的注册"))
+	_ = ext.Set("newConfigItem", func(resource *jsExtensionResource, key string, defaultValue interface{}, description string) *ConfigItem {
+		if _, err := resource.registered(); err != nil {
+			panic(err)
 		}
 		return d.ConfigManager.NewConfigItem(key, defaultValue, description)
 	})
-	_ = ext.Set("registerConfig", func(ei *ExtInfo, config ...*ConfigItem) error {
-		if ei.dice == nil {
-			return errors.New("请先完成此扩展的注册")
+	_ = ext.Set("registerConfig", func(resource *jsExtensionResource, config ...*ConfigItem) error {
+		ei, err := resource.registered()
+		if err != nil {
+			return err
 		}
-		return d.ConfigManager.RegisterPluginConfig(ei.Name, config...)
+		return registerPluginConfig(ei, config...)
 	})
-	_ = ext.Set("getConfig", func(ei *ExtInfo, key string) *ConfigItem {
-		if ei == nil || ei.dice == nil {
+	_ = ext.Set("getConfig", func(resource *jsExtensionResource, key string) *ConfigItem {
+		ei, err := resource.registered()
+		if err != nil {
 			return nil
 		}
-		return d.compatibilityConfigItem(ei, key)
+		item, err := configItem(ei, key)
+		if err != nil {
+			panic(err)
+		}
+		return item
 	})
-	_ = ext.Set("getStringConfig", func(ei *ExtInfo, key string) (string, error) {
-		cfg, err := d.compatibilityConfigItemWithError(ei, key)
+	_ = ext.Set("getStringConfig", func(resource *jsExtensionResource, key string) (string, error) {
+		ei, err := resource.registered()
 		if err != nil {
 			return "", err
 		}
-		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "string" {
+		cfg, err := configItem(ei, key)
+		if err != nil {
+			return "", err
+		}
+		if cfg == nil || cfg.Type != "string" {
 			return "", errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
 		value, ok := cfg.Value.(string)
@@ -462,12 +796,16 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 		}
 		return value, nil
 	})
-	_ = ext.Set("getIntConfig", func(ei *ExtInfo, key string) (int64, error) {
-		cfg, err := d.compatibilityConfigItemWithError(ei, key)
+	_ = ext.Set("getIntConfig", func(resource *jsExtensionResource, key string) (int64, error) {
+		ei, err := resource.registered()
 		if err != nil {
 			return 0, err
 		}
-		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "int" {
+		cfg, err := configItem(ei, key)
+		if err != nil {
+			return 0, err
+		}
+		if cfg == nil || cfg.Type != "int" {
 			return 0, errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
 		value, ok := cfg.Value.(int64)
@@ -476,12 +814,16 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 		}
 		return value, nil
 	})
-	_ = ext.Set("getBoolConfig", func(ei *ExtInfo, key string) (bool, error) {
-		cfg, err := d.compatibilityConfigItemWithError(ei, key)
+	_ = ext.Set("getBoolConfig", func(resource *jsExtensionResource, key string) (bool, error) {
+		ei, err := resource.registered()
 		if err != nil {
 			return false, err
 		}
-		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "bool" {
+		cfg, err := configItem(ei, key)
+		if err != nil {
+			return false, err
+		}
+		if cfg == nil || cfg.Type != "bool" {
 			return false, errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
 		value, ok := cfg.Value.(bool)
@@ -490,12 +832,16 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 		}
 		return value, nil
 	})
-	_ = ext.Set("getFloatConfig", func(ei *ExtInfo, key string) (float64, error) {
-		cfg, err := d.compatibilityConfigItemWithError(ei, key)
+	_ = ext.Set("getFloatConfig", func(resource *jsExtensionResource, key string) (float64, error) {
+		ei, err := resource.registered()
 		if err != nil {
 			return 0, err
 		}
-		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "float" {
+		cfg, err := configItem(ei, key)
+		if err != nil {
+			return 0, err
+		}
+		if cfg == nil || cfg.Type != "float" {
 			return 0, errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
 		value, ok := cfg.Value.(float64)
@@ -504,12 +850,16 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 		}
 		return value, nil
 	})
-	_ = ext.Set("getTemplateConfig", func(ei *ExtInfo, key string) ([]string, error) {
-		cfg, err := d.compatibilityConfigItemWithError(ei, key)
+	_ = ext.Set("getTemplateConfig", func(resource *jsExtensionResource, key string) ([]string, error) {
+		ei, err := resource.registered()
 		if err != nil {
 			return nil, err
 		}
-		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "template" {
+		cfg, err := configItem(ei, key)
+		if err != nil {
+			return nil, err
+		}
+		if cfg == nil || cfg.Type != "template" {
 			return nil, errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
 		value, ok := cfg.Value.([]string)
@@ -518,12 +868,16 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 		}
 		return append([]string(nil), value...), nil
 	})
-	_ = ext.Set("getOptionConfig", func(ei *ExtInfo, key string) (string, error) {
-		cfg, err := d.compatibilityConfigItemWithError(ei, key)
+	_ = ext.Set("getOptionConfig", func(resource *jsExtensionResource, key string) (string, error) {
+		ei, err := resource.registered()
 		if err != nil {
 			return "", err
 		}
-		if ei == nil || ei.dice == nil || cfg == nil || cfg.Type != "option" {
+		cfg, err := configItem(ei, key)
+		if err != nil {
+			return "", err
+		}
+		if cfg == nil || cfg.Type != "option" {
 			return "", errors.New(configValueTypeMismatch(ei, key, cfg))
 		}
 		value, ok := cfg.Value.(string)
@@ -532,141 +886,134 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 		}
 		return value, nil
 	})
-	_ = ext.Set("unregisterConfig", func(ei *ExtInfo, key ...string) {
-		if ei.dice == nil {
-			return
+	_ = ext.Set("unregisterConfig", func(resource *jsExtensionResource, key ...string) error {
+		ei, err := resource.registered()
+		if err != nil {
+			return err
 		}
-		d.ConfigManager.UnregisterConfig(ei.Name, key...)
+		return unregisterPluginConfig(ei, key...)
 	})
-	_ = ext.Set("storageList", func(ei *ExtInfo) []string {
-		keys, err := ei.StorageList()
+	_ = ext.Set("storageList", func(resource *jsExtensionResource) []string {
+		keys, err := resource.StorageList()
 		if err != nil {
 			panic(err)
 		}
 		return keys
 	})
 
-	_ = ext.Set("registerTask", func(ei *ExtInfo, taskType string, value string, fn func(taskCtx JsScriptTaskCtx), key string, desc string, group string) *JsScriptTask {
-		if ei.dice == nil {
-			panic(errors.New("请先完成此扩展的注册"))
+	runAfterDomainCommit := func(run func()) error {
+		execution, _ := jsDomainExecutionFor(loop)
+		if execution != nil && execution.Transaction != nil {
+			return execution.Transaction.AfterCommit(run)
+		}
+		if d.DurableStore != nil {
+			return ErrJSInvocationExpired
+		}
+		run()
+		return nil
+	}
+	_ = ext.Set("registerTask", func(resource *jsExtensionResource, taskType string, value string, fn func(taskCtx JsScriptTaskCtx) (jsengine.Value, error), key string, desc string, group string) *JsScriptTask {
+		ei, err := resource.registered()
+		if err != nil {
+			panic(err)
 		}
 		owner := ei.dice
 		owner.jsScriptCronMu.Lock()
-		defer owner.jsScriptCronMu.Unlock()
 		scriptCron := owner.JsScriptCron
+		owner.jsScriptCronMu.Unlock()
 		if scriptCron == nil {
-			panic(errors.New("插件cron未成功初始化")) // 按理是不会发生的
+			panic(errors.New("插件cron未成功初始化"))
 		}
 
-		task := JsScriptTask{cron: scriptCron, key: key, task: fn, lock: owner.JsScriptCronLock, logger: owner.Logger, dice: owner, ext: ei}
+		task := &JsScriptTask{cron: scriptCron, key: key, taskCallback: fn, lock: owner.JsScriptCronLock, logger: owner.Logger, dice: owner, ext: ei}
 		expr := value
+		var previous *JsScriptTask
 		if key != "" && taskType != "once" {
-			if config := d.compatibilityConfigItem(ei, key); config != nil {
-				expr = config.Value.(string)
-				// Stop old task
-				if config.task != nil {
-					config.task.Off()
-					ei.taskList = removeTaskFromList(ei.taskList, config.task)
+			config, configErr := configItem(ei, key)
+			if configErr != nil {
+				panic(configErr)
+			}
+			if config != nil {
+				configured, ok := config.Value.(string)
+				if !ok {
+					panic(configValueTypeMismatch(ei, key, config))
 				}
+				expr = configured
+				previous = config.task
 			}
 		}
 
 		switch taskType {
 		case "cron":
-			cronExpr, err := parseTaskCronExpr(expr)
-			if err != nil {
-				panic("插件注册定时任务失败：" + err.Error())
-			}
-
-			entryID, err := scriptCron.AddFunc(cronExpr, func() {
-				task.run()
-			})
-			if err != nil {
-				panic("插件注册定时任务失败：" + err.Error())
+			cronExpr, parseErr := parseTaskCronExpr(expr)
+			if parseErr != nil {
+				panic("插件注册定时任务失败：" + parseErr.Error())
 			}
 			task.taskType = taskType
 			task.rawValue = expr
 			task.cronExpr = cronExpr
-			expr = cronExpr // 保持配置值为规范化后的有效表达式
-			task.entryID = &entryID
-			scriptCron.Start()
-			ei.dice.Logger.Infof("插件注册定时任务：cron=%s", cronExpr)
+			expr = cronExpr
 		case "daily":
-			// 支持每天定时触发，24 小时表示
-			cronExpr, err := parseTaskTime(expr)
-			if err != nil {
-				panic("插件注册定时任务失败：" + err.Error())
-			}
-
-			entryID, err := scriptCron.AddFunc(cronExpr, func() {
-				task.run()
-			})
-			if err != nil {
-				panic("插件注册定时任务失败：" + err.Error())
+			cronExpr, parseErr := parseTaskTime(expr)
+			if parseErr != nil {
+				panic("插件注册定时任务失败：" + parseErr.Error())
 			}
 			task.taskType = taskType
 			task.rawValue = expr
 			task.cronExpr = cronExpr
-			task.entryID = &entryID
-			ei.dice.Logger.Infof("插件注册定时任务：daily=%s", expr)
-			scriptCron.Start()
 		case "once":
-			onceAt, normalizedExpr, err := parseTaskOnceExpr(expr)
-			if err != nil {
-				panic("插件注册定时任务失败：" + err.Error())
+			onceAt, normalizedExpr, parseErr := parseTaskOnceExpr(expr)
+			if parseErr != nil {
+				panic("插件注册定时任务失败：" + parseErr.Error())
 			}
 			task.taskType = taskType
 			task.rawValue = expr
 			task.onceAt = onceAt
-			expr = normalizedExpr // 保存为绝对执行时间戳，避免重载后延迟重复计算
-			if !task.on() {
-				panic("插件注册定时任务失败：一次任务注册失败")
-			}
-			ei.dice.Logger.Infof("插件注册定时任务：once=%s", expr)
+			expr = normalizedExpr
 		default:
 			panic(fmt.Sprintf("错误的任务类型：%s，当前仅支持 cron|daily|once", taskType))
 		}
 
 		if key != "" && taskType != "once" {
-			config := d.compatibilityConfigItem(ei, key)
-
-			switch taskType {
-			case "cron":
-				config = &ConfigItem{
-					Key:          key,
-					Type:         "task:cron",
-					Group:        group,
-					Value:        expr,
-					DefaultValue: value,
-					Description:  desc,
-					task:         &task,
-				}
-			case "daily":
-				config = &ConfigItem{
-					Key:          key,
-					Type:         "task:daily",
-					Group:        group,
-					Value:        expr,
-					DefaultValue: value,
-					Description:  desc,
-					task:         &task,
-				}
+			config := &ConfigItem{
+				Key:          key,
+				Type:         "task:" + taskType,
+				Group:        group,
+				Value:        expr,
+				DefaultValue: value,
+				Description:  desc,
+				task:         task,
 			}
-			if err := d.ConfigManager.RegisterPluginConfig(ei.Name, config); err != nil {
+			if err := registerPluginConfig(ei, config); err != nil {
 				panic("插件注册定时任务配置失败：" + err.Error())
 			}
 		}
 
-		if ei.taskList == nil {
-			ei.taskList = make([]*JsScriptTask, 0)
+		if err := runAfterDomainCommit(func() {
+			if previous != nil {
+				previous.Off()
+				ei.taskList = removeTaskFromList(ei.taskList, previous)
+			}
+			if !task.On() {
+				if owner.Logger != nil {
+					owner.Logger.Errorf("插件注册定时任务提交后激活失败：type=%s key=%s value=%s", taskType, key, expr)
+				}
+				return
+			}
+			ei.taskList = append(ei.taskList, task)
+			if owner.Logger != nil {
+				owner.Logger.Infof("插件注册定时任务：%s=%s", taskType, expr)
+			}
+		}); err != nil {
+			panic("插件注册定时任务提交失败：" + err.Error())
 		}
-		ei.taskList = append(ei.taskList, &task)
 
-		return &task
+		return task
 	})
-	_ = ext.Set("removeTask", func(ei *ExtInfo, taskType string, key string) int {
-		if ei.dice == nil {
-			panic(errors.New("请先完成此扩展的注册"))
+	_ = ext.Set("removeTask", func(resource *jsExtensionResource, taskType string, key string) (int, error) {
+		ei, err := resource.registered()
+		if err != nil {
+			return 0, err
 		}
 
 		taskType, key = normalizeTaskSelector(taskType, key)
@@ -682,11 +1029,12 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 			}
 		}
 
-		cm := d.ConfigManager
-		cm.lock.RLock()
-		pluginConfig := cm.Plugins[ei.Name]
-		if pluginConfig != nil {
-			for cfgKey, cfgItem := range pluginConfig.Configs {
+		pluginConfig, found, err := pluginConfigItems(ei)
+		if err != nil {
+			return 0, err
+		}
+		if found {
+			for cfgKey, cfgItem := range pluginConfig {
 				if cfgItem == nil {
 					continue
 				}
@@ -700,13 +1048,25 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 				}
 			}
 		}
-		cm.lock.RUnlock()
 
-		for task := range taskSet {
-			_ = task.Off()
+		if len(configKeySet) > 0 {
+			keys := make([]string, 0, len(configKeySet))
+			for cfgKey := range configKeySet {
+				keys = append(keys, cfgKey)
+			}
+			sort.Strings(keys)
+			if err := unregisterPluginConfig(ei, keys...); err != nil {
+				return 0, err
+			}
 		}
 
-		if len(taskSet) > 0 {
+		if err := runAfterDomainCommit(func() {
+			for task := range taskSet {
+				_ = task.Off()
+			}
+			if len(taskSet) == 0 {
+				return
+			}
 			filtered := make([]*JsScriptTask, 0, len(ei.taskList))
 			for _, task := range ei.taskList {
 				if _, hit := taskSet[task]; !hit {
@@ -714,21 +1074,16 @@ func (d *Dice) installJSExtHostAPI(runtime jsengine.Runtime, loop jsengine.Loop,
 				}
 			}
 			ei.taskList = filtered
+		}); err != nil {
+			return 0, err
 		}
 
-		if len(configKeySet) > 0 {
-			keys := make([]string, 0, len(configKeySet))
-			for cfgKey := range configKeySet {
-				keys = append(keys, cfgKey)
-			}
-			d.ConfigManager.UnregisterConfig(ei.Name, keys...)
-		}
-
-		return len(taskSet)
+		return len(taskSet), nil
 	})
-	_ = ext.Set("listTasks", func(ei *ExtInfo) []*JsScriptTaskInfo {
-		if ei.dice == nil {
-			panic(errors.New("请先完成此扩展的注册"))
+	_ = ext.Set("listTasks", func(resource *jsExtensionResource) []*JsScriptTaskInfo {
+		ei, err := resource.registered()
+		if err != nil {
+			panic(err)
 		}
 
 		tasks := make([]*JsScriptTaskInfo, 0, len(ei.taskList))

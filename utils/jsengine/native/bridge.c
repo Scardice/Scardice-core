@@ -376,6 +376,8 @@ extern sc_status_t SC_CALL sc_native_go_host_function_owner(sc_host_ctx_t,
                                                               sc_runtime_t,
                                                               sc_host_func_t,
                                                               sc_host_ref_t *);
+extern sc_status_t SC_CALL sc_native_go_execution_status(sc_host_ctx_t,
+                                                         sc_runtime_t);
 
 static sc_status_t SC_CALL host_get(sc_host_ctx_t c, sc_runtime_t r,
                                     sc_host_ref_t h, sc_string_view k,
@@ -438,6 +440,9 @@ static sc_status_t SC_CALL host_function_owner(sc_host_ctx_t c, sc_runtime_t r,
                                                 sc_host_ref_t *owner) {
   return sc_native_go_host_function_owner(c, r, function, owner);
 }
+static sc_status_t SC_CALL execution_status(sc_host_ctx_t c, sc_runtime_t r) {
+  return sc_native_go_execution_status(c, r);
+}
 
 static const sc_host_api_v1 host_api_current = {
     .struct_size = sizeof(sc_host_api_v1),
@@ -455,7 +460,8 @@ static const sc_host_api_v1 host_api_current = {
     .service_cancel = host_service_cancel,
     .host_ref_retain = host_ref_retain,
     .host_ref_release = host_ref_release,
-    .host_function_owner = host_function_owner};
+    .host_function_owner = host_function_owner,
+    .execution_status = execution_status};
 
 int sc_native_create(uint64_t library, uint64_t host_ctx, const char *options,
                      uint64_t options_len, uint64_t *out_runtime, char *error,
@@ -917,7 +923,7 @@ int sc_native_last_error_copy(uint64_t library, uint64_t runtime, char *buffer,
       error, capacity);
 }
 int sc_native_service_event(uint64_t library, uint64_t runtime, uint32_t kind,
-                            uint32_t status, uint64_t request,
+                            uint32_t status, uint32_t flags, uint64_t request,
                             const char *string, uint64_t string_len,
                             const uint8_t *bytes, uint64_t bytes_len,
                             uint32_t bool_value, int64_t int64_value,
@@ -946,6 +952,7 @@ int sc_native_service_event(uint64_t library, uint64_t runtime, uint32_t kind,
   event.struct_size = (uint32_t)sizeof(event);
   event.kind = kind;
   event.status = status;
+  event.flags = flags;
   event.request = (sc_service_request_t)request;
   event.string.data = string;
   event.string.len = string_len;

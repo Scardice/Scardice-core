@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -14,8 +16,10 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"go.uber.org/zap"
 
 	"Scardice-core/adapterapi"
+	"Scardice-core/logger"
 )
 
 const DiscordAdapterKey adapterapi.AdapterKey = "discord"
@@ -304,6 +308,7 @@ type discordRuntime struct {
 	selfID     string
 	httpClient *http.Client
 	dialer     *websocket.Dialer
+	timing     discordTiming
 }
 
 type discordReadResult struct {
@@ -746,7 +751,14 @@ func (runtime *discordRuntime) discoverGateway(ctx context.Context, token string
 	if decodeErr := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&result); decodeErr != nil {
 		return "", decodeErr
 	}
-	gateway, err := url.Parse(result.URL)
+	return discordGatewayURL(result.URL)
+}
+
+// discordGatewayURL validates a gateway address (the one discovery returns or
+// the resume_gateway_url of a session) and pins the protocol version and
+// encoding, which a resumed connection must repeat.
+func discordGatewayURL(raw string) (string, error) {
+	gateway, err := url.Parse(raw)
 	if err != nil || gateway.Host == "" || (gateway.Scheme != "ws" && gateway.Scheme != "wss") || gateway.User != nil || gateway.Fragment != "" {
 		return "", errors.New("discord: invalid gateway URL")
 	}
@@ -757,6 +769,155 @@ func (runtime *discordRuntime) discoverGateway(ctx context.Context, token string
 	return gateway.String(), nil
 }
 
+const (
+	defaultDiscordHelloTimeout      = 10 * time.Second
+	defaultDiscordReconnectBase     = 2 * time.Second
+	defaultDiscordReconnectMax      = 2 * time.Minute
+	defaultDiscordStableAfter       = 30 * time.Second
+	defaultDiscordInboundRetryDelay = 200 * time.Millisecond
+	discordWriteTimeout             = 10 * time.Second
+	discordInboundQueueSize         = 512
+	maxDiscordInboundRetries        = 2
+)
+
+// discordTiming holds every interval of the gateway session so a test can
+// shrink them. The zero value means the defaults.
+//
+// The reconnect ceiling is two minutes, not one: Discord allows 1000 IDENTIFY
+// calls per 24 hours for the whole application and resets the bot token beyond
+// that, so a session that can only re-identify must never be retried faster
+// than about one every 86 seconds on average.
+type discordTiming struct {
+	helloTimeout      time.Duration
+	reconnectBase     time.Duration
+	reconnectMax      time.Duration
+	stableAfter       time.Duration
+	inboundRetryDelay time.Duration
+	// jitter returns the fraction of the heartbeat interval to wait before the
+	// first heartbeat, in [0, 1).
+	jitter func() float64
+	// invalidSessionWait is the pause Discord asks for after opcode 9 and
+	// before reconnecting (1 to 5 seconds).
+	invalidSessionWait func() time.Duration
+}
+
+func (timing discordTiming) withDefaults() discordTiming {
+	if timing.helloTimeout <= 0 {
+		timing.helloTimeout = defaultDiscordHelloTimeout
+	}
+	if timing.reconnectBase <= 0 {
+		timing.reconnectBase = defaultDiscordReconnectBase
+	}
+	if timing.reconnectMax <= 0 {
+		timing.reconnectMax = defaultDiscordReconnectMax
+	}
+	if timing.stableAfter <= 0 {
+		timing.stableAfter = defaultDiscordStableAfter
+	}
+	if timing.inboundRetryDelay <= 0 {
+		timing.inboundRetryDelay = defaultDiscordInboundRetryDelay
+	}
+	if timing.jitter == nil {
+		timing.jitter = rand.Float64
+	}
+	if timing.invalidSessionWait == nil {
+		timing.invalidSessionWait = func() time.Duration {
+			return time.Second + time.Duration(rand.Int64N(int64(4*time.Second)))
+		}
+	}
+	return timing
+}
+
+// redialDelay is the wait before redial number attempt (0-based): the base,
+// doubled per consecutive failure, capped at the maximum.
+func (timing discordTiming) redialDelay(attempt int) time.Duration {
+	if attempt >= 30 {
+		return timing.reconnectMax
+	}
+	if delay := timing.reconnectBase << attempt; delay > 0 && delay < timing.reconnectMax {
+		return delay
+	}
+	return timing.reconnectMax
+}
+
+// discordSessionError is the failure of one gateway connection. Run redials
+// after it unless it is fatal. A directed error is the gateway telling a
+// healthy client to reconnect (opcode 7 or 9): Run redials without reporting
+// an outage, after wait.
+type discordSessionError struct {
+	code     string
+	err      error
+	directed bool
+	fatal    bool
+	wait     time.Duration
+}
+
+func (e *discordSessionError) Error() string { return e.code + ": " + e.err.Error() }
+func (e *discordSessionError) Unwrap() error { return e.err }
+
+func discordSessionFailure(code string, err error) *discordSessionError {
+	return &discordSessionError{code: code, err: err}
+}
+
+// discordSessionState is what survives a dropped connection and lets the next
+// one resume instead of identifying again.
+type discordSessionState struct {
+	id        string
+	resumeURL string
+	sequence  int64
+}
+
+func (state *discordSessionState) resumable() bool {
+	return state.id != "" && state.resumeURL != ""
+}
+
+func (state *discordSessionState) clear() { *state = discordSessionState{} }
+
+type discordJob struct {
+	eventType string
+	data      json.RawMessage
+}
+
+func discordRuntimeLogger() *zap.SugaredLogger { return zap.S().Named(logger.LogKeyAdapter) }
+
+// discordCloseFailure turns the error that ended a read into a session
+// failure. A close code the gateway documents as "do not reconnect" (a bad
+// token, bad intents, a bad shard or version) is fatal: retrying cannot help and
+// would only burn IDENTIFY calls. A code that invalidates the session leaves
+// nothing to resume.
+func discordCloseFailure(err error, state *discordSessionState) *discordSessionError {
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) {
+		return discordSessionFailure("remote_closed", err)
+	}
+	detail := fmt.Errorf("discord: gateway closed the connection (code %d)", closeErr.Code)
+	if closeErr.Text != "" {
+		detail = fmt.Errorf("discord: gateway closed the connection (code %d: %s)", closeErr.Code, closeErr.Text)
+	}
+	switch closeErr.Code {
+	case 4004:
+		failure := discordSessionFailure("authentication_failed", fmt.Errorf("%w: the bot token was rejected", detail))
+		failure.fatal = true
+		return failure
+	case 4010, 4011, 4012, 4013, 4014:
+		hint := "the connection settings are invalid"
+		if closeErr.Code == 4014 {
+			hint = "an intent is not enabled for this bot; enable Message Content Intent in the Discord developer portal"
+		}
+		failure := discordSessionFailure("invalid_configuration", fmt.Errorf("%w: %s", detail, hint))
+		failure.fatal = true
+		return failure
+	case 1000, 1001, 4003, 4007, 4009:
+		state.clear()
+	}
+	return discordSessionFailure("remote_closed", detail)
+}
+
+// Run keeps one gateway session open until Stop. A connection that fails
+// (gateway unreachable, no hello, no heartbeat ACK, a reconnect request, a
+// closed transport) is reported once as failed per outage and redialed with
+// exponential backoff, resuming the session whenever the gateway still has it.
+// Only a fatal gateway close code or a local fault ends Run.
 func (runtime *discordRuntime) Run(ctx context.Context, core adapterapi.CorePort) (runErr error) {
 	if runtime == nil || core == nil {
 		return errors.New("discord: runtime or core is unavailable")
@@ -774,8 +935,9 @@ func (runtime *discordRuntime) Run(ctx context.Context, core adapterapi.CorePort
 	runtime.cancel = cancel
 	runtime.running = true
 	runtime.mu.Unlock()
+	fatalReported := false
 	defer func() {
-		if runErr != nil && !errors.Is(runErr, context.Canceled) {
+		if runErr != nil && !errors.Is(runErr, context.Canceled) && !fatalReported {
 			_ = core.ReportObservation(context.Background(), adapterapi.LifecycleObservation{Kind: adapterapi.LifecycleObservationState, State: adapterapi.ObservedStateFailed, Code: "runtime_failed", Detail: "Discord runtime failed", Retryable: true, OccurredAt: time.Now().UTC()})
 		}
 		_ = runtime.Stop(context.Background())
@@ -787,35 +949,149 @@ func (runtime *discordRuntime) Run(ctx context.Context, core adapterapi.CorePort
 	if err != nil {
 		return err
 	}
-	gateway, err := runtime.discoverGateway(runCtx, token)
-	if err != nil {
-		return err
+	timing := runtime.timing.withDefaults()
+	// One worker serves every connection of this Run, so events reach Core in
+	// arrival order and a slow Core never stalls the socket or its heartbeat.
+	jobs := make(chan discordJob, discordInboundQueueSize)
+	runtime.mu.Lock()
+	if !runtime.running {
+		runtime.mu.Unlock()
+		return nil
 	}
-	connection, response, err := runtime.dialer.DialContext(runCtx, gateway, nil)
+	runtime.wg.Add(1)
+	runtime.mu.Unlock()
+	go runtime.inboundWorker(runCtx, core, jobs, timing)
+	log := discordRuntimeLogger()
+	var state discordSessionState
+	outage, attempts := false, 0
+	var connectedAt time.Time
+	onConnected := func() {
+		if outage {
+			log.Infof("Discord 连接已恢复")
+		}
+		outage = false
+		connectedAt = time.Now()
+	}
+	sleep := func(delay time.Duration) bool {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-runCtx.Done():
+			return false
+		case <-timer.C:
+			return true
+		}
+	}
+	for {
+		connectedAt = time.Time{}
+		err := runtime.runSession(runCtx, core, token, timing, jobs, &state, onConnected)
+		if runCtx.Err() != nil || errors.Is(err, context.Canceled) {
+			return nil
+		}
+		var failure *discordSessionError
+		if !errors.As(err, &failure) {
+			return err
+		}
+		cause := sanitizeOnebotProviderCause(failure.err.Error())
+		if failure.fatal {
+			fatalReported = true
+			_ = core.ReportObservation(context.Background(), adapterapi.LifecycleObservation{Kind: adapterapi.LifecycleObservationState, State: adapterapi.ObservedStateFailed, Code: failure.code, Detail: cause, Retryable: false, OccurredAt: time.Now().UTC()})
+			log.Errorf("Discord 连接失败且无法自动恢复（%s）：%s", failure.code, cause)
+			return failure
+		}
+		stable := !connectedAt.IsZero() && time.Since(connectedAt) >= timing.stableAfter
+		if stable {
+			attempts = 0
+		}
+		if failure.directed && stable {
+			// A healthy session was told to reconnect: an instruction, not an
+			// outage. A session that did not last (a gateway ordering a
+			// reconnect right after every connect) is backed off instead.
+			log.Infof("Discord 网关要求重新连接（%s）：%s；正在重新连接", failure.code, cause)
+			if !sleep(failure.wait) {
+				return nil
+			}
+			continue
+		}
+		if !outage {
+			outage = true
+			_ = core.ReportObservation(runCtx, adapterapi.LifecycleObservation{Kind: adapterapi.LifecycleObservationState, State: adapterapi.ObservedStateFailed, Code: failure.code, Detail: cause, Retryable: true, OccurredAt: time.Now().UTC()})
+			log.Warnf("Discord 连接中断（%s）：%s；将自动重连", failure.code, cause)
+		} else {
+			log.Debugf("Discord 重连失败（%s）：%s", failure.code, cause)
+		}
+		delay := timing.redialDelay(attempts)
+		attempts++
+		if !sleep(delay) {
+			return nil
+		}
+	}
+}
+
+// runSession connects, resumes or identifies, and serves the connection until
+// it fails. It writes to the socket only from this goroutine, so heartbeats,
+// identify and resume can never interleave.
+func (runtime *discordRuntime) runSession(ctx context.Context, core adapterapi.CorePort, token string, timing discordTiming, jobs chan<- discordJob, state *discordSessionState, onConnected func()) (sessionErr error) {
+	resuming := state.resumable()
+	gateway := state.resumeURL
+	if !resuming {
+		state.clear()
+		var err error
+		if gateway, err = runtime.discoverGateway(ctx, token); err != nil {
+			return discordSessionFailure("connect_failed", err)
+		}
+	}
+	connection, response, err := runtime.dialer.DialContext(ctx, gateway, nil)
 	if response != nil && response.Body != nil {
 		_ = response.Body.Close()
 	}
 	if err != nil {
-		return err
+		if resuming {
+			// An unusable resume address falls back to a fresh session.
+			state.clear()
+		}
+		return discordSessionFailure("connect_failed", err)
 	}
+	defer connection.Close()
 	connection.SetReadLimit(adapterapi.MaxInboundTextBytes + 64*1024)
 	runtime.mu.Lock()
+	if !runtime.running {
+		runtime.mu.Unlock()
+		return context.Canceled
+	}
 	runtime.conn = connection
 	runtime.mu.Unlock()
-	var hello discordGatewayPayload
-	if err := connection.ReadJSON(&hello); err != nil {
-		return err
+	defer func() {
+		runtime.mu.Lock()
+		if runtime.conn == connection {
+			runtime.conn = nil
+		}
+		runtime.mu.Unlock()
+	}()
+
+	_ = connection.SetReadDeadline(time.Now().Add(timing.helloTimeout))
+	messageType, helloBytes, err := connection.ReadMessage()
+	if err != nil {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return discordSessionFailure("hello_timeout", errors.New("discord: gateway did not send hello in time"))
+		}
+		return discordCloseFailure(err, state)
 	}
-	if hello.Op != 10 {
-		return errors.New("discord: gateway did not send hello")
+	_ = connection.SetReadDeadline(time.Time{})
+	var hello discordGatewayPayload
+	if messageType != websocket.TextMessage || json.Unmarshal(helloBytes, &hello) != nil || hello.Op != 10 {
+		return discordSessionFailure("hello_failed", errors.New("discord: gateway did not send hello"))
 	}
 	var helloData struct {
 		HeartbeatInterval float64 `json:"heartbeat_interval"`
 	}
 	if err := json.Unmarshal(hello.Data, &helloData); err != nil || helloData.HeartbeatInterval <= 0 {
-		return errors.New("discord: invalid heartbeat interval")
+		return discordSessionFailure("hello_failed", errors.New("discord: invalid heartbeat interval"))
 	}
-	identify := map[string]any{
+	interval := time.Duration(helloData.HeartbeatInterval * float64(time.Millisecond))
+
+	opening := map[string]any{
 		"op": 2,
 		"d": map[string]any{
 			"token":   token,
@@ -827,65 +1103,178 @@ func (runtime *discordRuntime) Run(ctx context.Context, core adapterapi.CorePort
 			},
 		},
 	}
-	if err := connection.WriteJSON(identify); err != nil {
-		return err
+	if resuming {
+		opening = map[string]any{"op": 6, "d": map[string]any{"token": token, "session_id": state.id, "seq": state.sequence}}
 	}
+	_ = connection.SetWriteDeadline(time.Now().Add(discordWriteTimeout))
+	if err := connection.WriteJSON(opening); err != nil {
+		return discordSessionFailure("remote_closed", err)
+	}
+
 	reads := make(chan discordReadResult, 1)
 	runtime.mu.Lock()
 	if !runtime.running {
 		runtime.mu.Unlock()
-		return nil
+		return context.Canceled
 	}
 	runtime.wg.Add(1)
 	runtime.mu.Unlock()
-	go runtime.readLoop(runCtx, connection, reads)
-	heartbeat := time.NewTicker(time.Duration(helloData.HeartbeatInterval * float64(time.Millisecond)))
+	sessionCtx, cancelSession := context.WithCancel(ctx)
+	readerDone := make(chan struct{})
+	var readErr error
+	go func() {
+		defer close(readerDone)
+		readErr = runtime.readLoop(sessionCtx, connection, reads)
+	}()
+	defer func() {
+		cancelSession()
+		_ = connection.Close()
+		<-readerDone
+		// A close acknowledgement can fail a heartbeat write before the
+		// reader publishes its CloseError, including when a queued frame
+		// blocks that publication. Preserve the actual gateway close after
+		// joining the reader, not the secondary session failure. Code 1006
+		// is synthesized for transport loss, never received from a peer.
+		var failure *discordSessionError
+		var closeErr *websocket.CloseError
+		if ctx.Err() == nil && errors.As(sessionErr, &failure) &&
+			errors.As(readErr, &closeErr) && closeErr.Code != websocket.CloseAbnormalClosure {
+			sessionErr = discordCloseFailure(readErr, state)
+		}
+	}()
+
+	// The first heartbeat is offset by a random fraction of the interval, then
+	// one goes out per interval. A heartbeat the gateway never acknowledged by
+	// the next one marks a failed ("zombied") connection.
+	heartbeat := time.NewTimer(time.Duration(float64(interval) * timing.jitter()))
 	defer heartbeat.Stop()
-	var sequence int64
+	awaitingAck := false
+	sendHeartbeat := func() error {
+		var sequence any
+		if state.sequence > 0 {
+			sequence = state.sequence
+		}
+		_ = connection.SetWriteDeadline(time.Now().Add(discordWriteTimeout))
+		if err := connection.WriteJSON(map[string]any{"op": 1, "d": sequence}); err != nil {
+			return err
+		}
+		awaitingAck = true
+		return nil
+	}
 	connected := false
 	for {
 		select {
-		case <-runCtx.Done():
-			return nil
+		case <-ctx.Done():
+			return ctx.Err()
 		case result := <-reads:
 			if result.err != nil {
-				if runCtx.Err() != nil {
-					return nil
-				}
-				return result.err
+				return discordCloseFailure(result.err, state)
 			}
 			if result.messageType != websocket.TextMessage {
 				continue
 			}
 			var payload discordGatewayPayload
 			if err := json.Unmarshal(result.data, &payload); err != nil {
-				return err
+				return discordSessionFailure("frame_invalid", err)
 			}
-			if payload.Sequence != nil {
-				sequence = *payload.Sequence
-			}
-			if payload.Op == 7 || payload.Op == 9 {
-				return errors.New("discord: gateway requested reconnect")
-			}
-			if payload.Op != 0 {
-				continue
-			}
-			if payload.Type == "READY" {
-				if connected {
-					continue
+			switch payload.Op {
+			case 0:
+				if payload.Sequence != nil && *payload.Sequence > state.sequence {
+					state.sequence = *payload.Sequence
 				}
-				if err := runtime.handleReady(runCtx, core, token, payload.Data); err != nil {
-					return err
+				switch payload.Type {
+				case "READY":
+					if connected {
+						continue
+					}
+					var ready struct {
+						SessionID        string `json:"session_id"`
+						ResumeGatewayURL string `json:"resume_gateway_url"`
+					}
+					_ = json.Unmarshal(payload.Data, &ready)
+					state.id, state.resumeURL = ready.SessionID, ""
+					if resumeURL, urlErr := discordGatewayURL(ready.ResumeGatewayURL); urlErr == nil {
+						state.resumeURL = resumeURL
+					}
+					if err := runtime.handleReady(ctx, core, token, payload.Data); err != nil {
+						return err
+					}
+					connected = true
+					onConnected()
+				case "RESUMED":
+					if connected {
+						continue
+					}
+					if err := runtime.reportResumed(ctx, core); err != nil {
+						return err
+					}
+					connected = true
+					onConnected()
+				default:
+					select {
+					case jobs <- discordJob{eventType: payload.Type, data: payload.Data}:
+					default:
+						discordRuntimeLogger().Warnf("Discord 消息队列已满，丢弃一条事件（%s，s=%d）", payload.Type, state.sequence)
+					}
 				}
-				connected = true
-				continue
-			}
-			if err := runtime.handleDispatch(runCtx, core, payload.Type, payload.Data); err != nil {
-				return err
+			case 1:
+				// The gateway asks for a heartbeat right now.
+				if err := sendHeartbeat(); err != nil {
+					return discordSessionFailure("heartbeat_failed", err)
+				}
+			case 7:
+				failure := discordSessionFailure("reconnect_requested", errors.New("discord: gateway requested reconnect"))
+				failure.directed, failure.wait = true, 0
+				return failure
+			case 9:
+				var resumable bool
+				_ = json.Unmarshal(payload.Data, &resumable)
+				if !resumable {
+					state.clear()
+				}
+				failure := discordSessionFailure("session_invalidated", fmt.Errorf("discord: gateway invalidated the session (resumable: %t)", resumable))
+				failure.directed, failure.wait = true, timing.invalidSessionWait()
+				return failure
+			case 11:
+				awaitingAck = false
 			}
 		case <-heartbeat.C:
-			if err := connection.WriteJSON(map[string]any{"op": 1, "d": sequence}); err != nil {
-				return err
+			if awaitingAck {
+				return discordSessionFailure("heartbeat_timeout", errors.New("discord: gateway did not acknowledge the heartbeat"))
+			}
+			if err := sendHeartbeat(); err != nil {
+				return discordSessionFailure("heartbeat_failed", err)
+			}
+			heartbeat.Reset(interval)
+		}
+	}
+}
+
+// inboundWorker hands queued gateway events to Core one at a time. A message
+// Core refuses is a fact about that message, not about the connection: it is
+// retried when Core reports a transient condition, then dropped and logged,
+// and never ends the session.
+func (runtime *discordRuntime) inboundWorker(ctx context.Context, core adapterapi.CorePort, jobs <-chan discordJob, timing discordTiming) {
+	defer runtime.wg.Done()
+	log := discordRuntimeLogger()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job := <-jobs:
+			err := runtime.handleDispatch(ctx, core, job.eventType, job.data)
+			for attempt := 0; err != nil && isRetryableInboundError(err) && attempt < maxDiscordInboundRetries; attempt++ {
+				retry := time.NewTimer(timing.inboundRetryDelay)
+				select {
+				case <-ctx.Done():
+					retry.Stop()
+					return
+				case <-retry.C:
+				}
+				err = runtime.handleDispatch(ctx, core, job.eventType, job.data)
+			}
+			if err != nil && ctx.Err() == nil {
+				log.Warnf("Discord 消息未能交给核心，已丢弃：%s", sanitizeOnebotProviderCause(err.Error()))
 			}
 		}
 	}
@@ -902,10 +1291,26 @@ func (runtime *discordRuntime) handleReady(ctx context.Context, core adapterapi.
 	runtime.token = token
 	runtime.selfID = ready.User.ID
 	runtime.mu.Unlock()
+	return runtime.reportConnection(ctx, core, ready.User.ID)
+}
+
+// reportResumed publishes the connection state again after a successful
+// resume; the identity is the one the session already established.
+func (runtime *discordRuntime) reportResumed(ctx context.Context, core adapterapi.CorePort) error {
+	runtime.mu.Lock()
+	selfID := runtime.selfID
+	runtime.mu.Unlock()
+	if selfID == "" {
+		return errors.New("discord: resumed a session without a known identity")
+	}
+	return runtime.reportConnection(ctx, core, selfID)
+}
+
+func (runtime *discordRuntime) reportConnection(ctx context.Context, core adapterapi.CorePort, selfID string) error {
 	if err := core.ReportObservation(ctx, adapterapi.LifecycleObservation{Kind: adapterapi.LifecycleObservationState, State: adapterapi.ObservedStateConnected, Code: "connected", Detail: "Discord connection established", OccurredAt: time.Now().UTC()}); err != nil {
 		return err
 	}
-	providerID, err := adapterapi.NewPrincipalID(FormatDiceIDDiscord(ready.User.ID))
+	providerID, err := adapterapi.NewPrincipalID(FormatDiceIDDiscord(selfID))
 	if err != nil {
 		return err
 	}
@@ -946,17 +1351,17 @@ func (runtime *discordRuntime) handleDispatch(ctx context.Context, core adaptera
 	return nil
 }
 
-func (runtime *discordRuntime) readLoop(ctx context.Context, connection *websocket.Conn, results chan<- discordReadResult) {
+func (runtime *discordRuntime) readLoop(ctx context.Context, connection *websocket.Conn, results chan<- discordReadResult) error {
 	defer runtime.wg.Done()
 	for {
 		messageType, data, err := connection.ReadMessage()
 		select {
 		case results <- discordReadResult{messageType: messageType, data: data, err: err}:
 		case <-ctx.Done():
-			return
+			return err
 		}
 		if err != nil {
-			return
+			return err
 		}
 	}
 }

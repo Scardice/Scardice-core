@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"strconv"
 	"sync/atomic"
-	"time"
 	"unicode/utf8"
 
 	"Scardice-core/adapterapi"
@@ -18,7 +17,6 @@ import (
 	"Scardice-core/eventstore"
 )
 
-const IngressPayloadTTL = 7 * 24 * time.Hour
 const defaultIngressCapacity = 32
 
 var (
@@ -26,11 +24,6 @@ var (
 	ErrIngressUnavailable  = errors.New("messageflow: inbound service unavailable")
 	ErrIngressPayload      = errors.New("messageflow: inbound payload exceeds bound")
 )
-
-type IngressSecurity interface {
-	EncryptBound(ctx context.Context, domain, identity, owner string, version uint64, plaintext []byte) ([]byte, []byte, string, error)
-	KeyedDigest(ctx context.Context, domain string, parts ...string) ([]byte, string, error)
-}
 
 type IngressCollision struct {
 	EndpointID       string
@@ -61,7 +54,6 @@ func WithIngressCollisionObserver(observer func(IngressCollision)) IngressOption
 
 type InboundService struct {
 	repo              eventstore.InboxRepository
-	security          IngressSecurity
 	clock             eventstore.Clock
 	capacity          int
 	admission         chan struct{}
@@ -70,11 +62,11 @@ type InboundService struct {
 	collisionObserver func(IngressCollision)
 }
 
-func NewInboundService(repo eventstore.InboxRepository, security IngressSecurity, options ...IngressOption) (*InboundService, error) {
-	if repo == nil || security == nil {
+func NewInboundService(repo eventstore.InboxRepository, options ...IngressOption) (*InboundService, error) {
+	if repo == nil {
 		return nil, ErrIngressUnavailable
 	}
-	s := &InboundService{repo: repo, security: security, clock: eventstore.SystemClock{}}
+	s := &InboundService{repo: repo, clock: eventstore.SystemClock{}}
 	for _, option := range options {
 		if option != nil {
 			option(s)
@@ -86,7 +78,6 @@ func NewInboundService(repo eventstore.InboxRepository, security IngressSecurity
 	s.admission = make(chan struct{}, s.capacity)
 	return s, nil
 }
-
 func (s *InboundService) InFlight() int          { return int(s.inFlight.Load()) }
 func (s *InboundService) CollisionCount() uint64 { return s.collisions.Load() }
 
@@ -137,11 +128,11 @@ func inboundJSONUpperBound(message adapterapi.InboundMessage) int {
 	return fixed + total
 }
 
-func ingressPayloadJSONUpperBound(endpointID adapterapi.EndpointID, digestKeyID string, messageBound, contentDigestBytes int) int {
+func ingressPayloadJSONUpperBound(endpointID adapterapi.EndpointID, messageBound, contentDigestBytes int) int {
 	const fixedJSONOverhead = 512
 	const jsonEscapeUpperBound = 6
 	const numericAndDigestOverhead = 128
-	rawEnvelope := len(endpointID) + len(digestKeyID) + len(eventstore.InboxStatusPending)
+	rawEnvelope := len(endpointID) + len(eventstore.InboxStatusPending)
 	envelopeBound := fixedJSONOverhead + numericAndDigestOverhead + rawEnvelope*jsonEscapeUpperBound + contentDigestBytes*2
 	if envelopeBound > eventstore.MaxEventPayloadBytes || messageBound > eventstore.MaxEventPayloadBytes-envelopeBound {
 		return eventstore.MaxEventPayloadBytes + 1
@@ -161,10 +152,10 @@ func inboundContentDigestJSON(message adapterapi.InboundMessage) ([]byte, error)
 }
 
 // HandleInbound durably accepts one normalized provider fact. It never invokes
-// IMSession, Core, plugins, or callbacks; consumers claim the encrypted inbox
+// IMSession, Core, plugins, or callbacks; consumers claim the plaintext inbox
 // row in a later workflow.
 func (s *InboundService) HandleInbound(ctx context.Context, fenced endpoint.FencedInbound) (adapterapi.IngressReceipt, error) {
-	if s == nil || s.repo == nil || s.security == nil {
+	if s == nil || s.repo == nil {
 		return adapterapi.IngressReceipt{}, ErrIngressUnavailable
 	}
 	if ctx == nil {
@@ -195,10 +186,7 @@ func (s *InboundService) HandleInbound(ctx context.Context, fenced endpoint.Fenc
 	if len(contentBytes) > adapterapi.MaxInboundTextBytes+adapterapi.MaxInboundSegments*adapterapi.MaxInboundFieldBytes {
 		return adapterapi.IngressReceipt{}, ErrIngressPayload
 	}
-	contentDigest, digestKeyID, err := s.security.KeyedDigest(ctx, "content-digest/v1", string(contentBytes))
-	if err != nil {
-		return adapterapi.IngressReceipt{}, err
-	}
+	contentDigest := eventstore.Digest("content-digest/v1", string(contentBytes))
 	conversation := string(message.Conversation)
 	if conversation == "" {
 		conversation = message.Target
@@ -207,29 +195,24 @@ func (s *InboundService) HandleInbound(ctx context.Context, fenced endpoint.Fenc
 	// group's live lane they would hold its live messages back, so they queue
 	// in a lane of their own. The conversation, and with it the privacy subject
 	// below, is the same.
-	laneParts := []string{string(fenced.EndpointID), conversation}
+	conversationKind := "person"
+	if message.ConversationKind == adapterapi.ConversationKindGroup {
+		conversationKind = "group"
+	}
+	laneKind := "live"
 	if message.History == adapterapi.InboundHistoryRecordOnly {
-		laneParts = append(laneParts, "recorded-history")
+		laneKind = "recorded-history"
 	}
-	laneDigest, _, err := s.security.KeyedDigest(ctx, "inbound-lane/v1", canonicalIngressTuple(laneParts...))
+	lane, err := json.Marshal([4]string{string(fenced.EndpointID), conversationKind, conversation, laneKind})
 	if err != nil {
 		return adapterapi.IngressReceipt{}, err
 	}
-	subjectKey, _, err := s.security.KeyedDigest(ctx, "privacy-subject/v1", conversation)
-	if err != nil {
-		return adapterapi.IngressReceipt{}, err
-	}
-	providerKey, err := s.providerKey(ctx, fenced.EndpointID, message, contentDigest)
-	if err != nil {
-		return adapterapi.IngressReceipt{}, err
-	}
-	inboxDigest, _, err := s.security.KeyedDigest(ctx, "inbox-id/v1", string(fenced.EndpointID), providerKey)
-	if err != nil {
-		return adapterapi.IngressReceipt{}, err
-	}
+	subject := conversation
+	providerKey := ingressProviderKey(fenced.EndpointID, message, contentDigest)
+	inboxDigest := eventstore.Digest("inbox-id/v1", string(fenced.EndpointID), providerKey)
 	inboxID := "inbox-" + hex.EncodeToString(inboxDigest)
-	payload := ingressPayload{EndpointID: fenced.EndpointID, Generation: fenced.Generation, DesiredVersion: fenced.DesiredVersion, Message: message, ContentDigest: contentDigest, ContentDigestKeyID: digestKeyID, Status: eventstore.InboxStatusPending}
-	if ingressPayloadJSONUpperBound(fenced.EndpointID, digestKeyID, inboundJSONUpperBound(message), len(contentDigest)) > eventstore.MaxEventPayloadBytes {
+	payload := ingressPayload{EndpointID: fenced.EndpointID, Generation: fenced.Generation, DesiredVersion: fenced.DesiredVersion, Message: message, ContentDigest: contentDigest, Status: eventstore.InboxStatusPending}
+	if ingressPayloadJSONUpperBound(fenced.EndpointID, inboundJSONUpperBound(message), len(contentDigest)) > eventstore.MaxEventPayloadBytes {
 		return adapterapi.IngressReceipt{}, ErrIngressPayload
 	}
 	plaintext, err := json.Marshal(payload)
@@ -239,17 +222,10 @@ func (s *InboundService) HandleInbound(ctx context.Context, fenced endpoint.Fenc
 	if len(plaintext) > eventstore.MaxEventPayloadBytes {
 		return adapterapi.IngressReceipt{}, ErrIngressPayload
 	}
-	ciphertext, nonce, encryptionKeyID, err := s.security.EncryptBound(ctx, "inbox/v1", inboxID, string(fenced.EndpointID), 1, plaintext)
-	if err != nil {
-		return adapterapi.IngressReceipt{}, err
-	}
-	now := s.clock.Now().UTC()
 	result, err := s.repo.AcceptInbox(ctx, eventstore.InboxUpdate{
 		InboxID: inboxID, EndpointID: string(fenced.EndpointID), ProviderEventKey: providerKey,
-		LaneHMAC: laneDigest, SubjectKey: subjectKey, Status: eventstore.InboxStatusPending,
-		PayloadCiphertext: ciphertext, PayloadNonce: nonce,
-		ContentDigest: contentDigest, ContentDigestKeyID: digestKeyID,
-		PayloadEncryptionKeyID: encryptionKeyID, PayloadExpiresAt: now.Add(IngressPayloadTTL), AllowExpiredDedupe: true,
+		Lane: string(lane), Subject: subject, Status: eventstore.InboxStatusPending,
+		Payload: plaintext, ContentDigest: contentDigest,
 	})
 	if err != nil {
 		if errors.Is(err, eventstore.ErrConflict) {
@@ -268,18 +244,17 @@ func (s *InboundService) HandleInbound(ctx context.Context, fenced endpoint.Fenc
 }
 
 type ingressPayload struct {
-	EndpointID         adapterapi.EndpointID     `json:"endpointId"`
-	Generation         uint64                    `json:"generation"`
-	DesiredVersion     uint64                    `json:"desiredVersion"`
-	Message            adapterapi.InboundMessage `json:"message"`
-	ContentDigest      []byte                    `json:"contentDigest"`
-	ContentDigestKeyID string                    `json:"contentDigestKeyId"`
-	Status             string                    `json:"status"`
+	EndpointID     adapterapi.EndpointID     `json:"endpointId"`
+	Generation     uint64                    `json:"generation"`
+	DesiredVersion uint64                    `json:"desiredVersion"`
+	Message        adapterapi.InboundMessage `json:"message"`
+	ContentDigest  []byte                    `json:"contentDigest"`
+	Status         string                    `json:"status"`
 }
 
-func (s *InboundService) providerKey(ctx context.Context, endpointID adapterapi.EndpointID, message adapterapi.InboundMessage, contentDigest []byte) (string, error) {
+func ingressProviderKey(endpointID adapterapi.EndpointID, message adapterapi.InboundMessage, contentDigest []byte) string {
 	if message.ProviderEventID != "" {
-		return string(message.ProviderEventID), nil
+		return string(message.ProviderEventID)
 	}
 	target := message.Target
 	if target == "" {
@@ -293,11 +268,8 @@ func (s *InboundService) providerKey(ctx context.Context, endpointID adapterapi.
 	if message.OccurredAt.IsZero() || message.Kind == adapterapi.InboundKindAdapterEvent {
 		identityParts = append(identityParts, hex.EncodeToString(contentDigest))
 	}
-	identityDigest, _, err := s.security.KeyedDigest(ctx, "fallback-provider-key/v1", canonicalIngressTuple(identityParts...))
-	if err != nil {
-		return "", err
-	}
-	return "fallback:" + hex.EncodeToString(identityDigest), nil
+	identityDigest := eventstore.Digest("fallback-provider-key/v1", canonicalIngressTuple(identityParts...))
+	return "fallback:" + hex.EncodeToString(identityDigest)
 }
 
 func canonicalIngressTuple(parts ...string) string {

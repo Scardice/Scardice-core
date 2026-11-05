@@ -22,14 +22,13 @@ func endpointA6Config(t *testing.T, ref string, version uint64) adapterapi.Valid
 }
 func TestCommitWithSecretUsesA6AADAndRollsBackEventAndSecret(t *testing.T) {
 	ctx := context.Background()
-	source := &endpointKeySource{}
-	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "endpoint-secret.db"), KeySource: source})
+	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "endpoint-secret.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(source))
-	if err := store.SetReadiness(ctx, eventstore.Readiness{Mode: "import", SchemaVersion: 1, DatabaseIdentity: "endpoint-secret", IndexRootID: "index-v1", EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
+	store := eventstore.NewStore(db)
+	if err := store.SetReadiness(ctx, eventstore.Readiness{Mode: "import", SchemaVersion: 2, DatabaseIdentity: "endpoint-secret", CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
 		t.Fatal(err)
 	}
 	repository := NewRepository(store)
@@ -44,8 +43,8 @@ func TestCommitWithSecretUsesA6AADAndRollsBackEventAndSecret(t *testing.T) {
 		t.Fatal(err)
 	}
 	resolved, err := store.ResolveSecret(ctx, "token-a6", 1)
-	if err != nil || string(resolved.Plaintext) != "a6-token" {
-		t.Fatalf("resolved secret=%q err=%v", resolved.Plaintext, err)
+	if err != nil || string(resolved.Value) != "a6-token" {
+		t.Fatalf("resolved secret=%q err=%v", resolved.Value, err)
 	}
 	for _, value := range input.Plaintext {
 		if value != 0 {

@@ -14,12 +14,6 @@ import (
 	"Scardice-core/eventstore"
 )
 
-type lifecycleCodec struct{}
-
-func (*lifecycleCodec) EncryptBound(context.Context, string, string, string, uint64, []byte) ([]byte, []byte, string, error) {
-	return []byte("ciphertext"), []byte("nonce"), "test-key", nil
-}
-
 type overflowOperationStore struct {
 	eventstore.Store
 	committed bool
@@ -52,25 +46,11 @@ func (s *envelopeLoadStore) Load(context.Context, eventstore.StreamID, uint64) (
 	return append([]eventstore.Envelope(nil), s.envelopes...), nil
 }
 
-type endpointKeySource struct{}
-
-func (*endpointKeySource) IndexRootID(context.Context) (string, error) { return "index-v1", nil }
-func (*endpointKeySource) IndexRootMaterial(context.Context) ([]byte, error) {
-	return []byte("01234567890123456789012345678901"), nil
-}
-func (*endpointKeySource) CurrentEncryptionRoot(context.Context) (eventstore.EncryptionRoot, error) {
-	return eventstore.EncryptionRoot{ID: "root-v1", Material: []byte("abcdefghijklmnopqrstuvwxyz123456")}, nil
-}
-func (*endpointKeySource) EncryptionRoot(context.Context, string) ([]byte, error) {
-	return []byte("abcdefghijklmnopqrstuvwxyz123456"), nil
-}
-
 func TestEndpointServiceLifecycleCompletionAndStaleConflict(t *testing.T) {
 	store, db := serviceStore(t)
 	defer db.Close()
 	key := adapterapi.AdapterKey("fake")
-	codec := &lifecycleCodec{}
-	svc := NewService(store, serviceRegistry{key: serviceDescriptor{key: key}}, codec)
+	svc := NewService(store, serviceRegistry{key: serviceDescriptor{key: key}})
 	id := adapterapi.EndpointID("lifecycle")
 	if _, err := svc.Create(context.Background(), Command{CommandID: "lc-create", CorrelationID: "lc-c", EndpointID: id, AdapterKey: key, Config: adapterapi.ValidatedConfig{Version: 1, Canonical: json.RawMessage(`{"x":1}`)}}); err != nil {
 		t.Fatal(err)
@@ -164,7 +144,7 @@ func TestEndpointRepositoryRejectsZeroSchemaVersionOnLoad(t *testing.T) {
 	}
 }
 
-func TestEndpointRepositoryAcceptsBoundedEarlyImporterEnvelopeMetadata(t *testing.T) {
+func TestEndpointRepositoryRequiresMatchingEnvelopeMetadata(t *testing.T) {
 	ctx := context.Background()
 	id := adapterapi.EndpointID("legacy-envelope")
 	decision, err := Decide(State{}, Command{
@@ -188,9 +168,14 @@ func TestEndpointRepositoryAcceptsBoundedEarlyImporterEnvelopeMetadata(t *testin
 		},
 	}
 	repository := NewRepository(&envelopeLoadStore{envelopes: []eventstore.Envelope{envelope}})
+	if _, err := repository.Load(ctx, id); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("mismatched importer metadata error = %v, want invalid state", err)
+	}
+	envelope.Metadata.CommandID, envelope.Metadata.CorrelationID = event.CommandID, event.CorrelationID
+	repository = NewRepository(&envelopeLoadStore{envelopes: []eventstore.Envelope{envelope}})
 	state, err := repository.Load(ctx, id)
 	if err != nil || state.EndpointID != id || state.Version != 1 {
-		t.Fatalf("early importer envelope state = %#v, %v", state, err)
+		t.Fatalf("matching envelope metadata state = %#v, %v", state, err)
 	}
 
 	envelope.Metadata.CommandID = "unrecognized-wrapper"
@@ -199,30 +184,29 @@ func TestEndpointRepositoryAcceptsBoundedEarlyImporterEnvelopeMetadata(t *testin
 		t.Fatalf("arbitrary metadata mismatch error = %v, want invalid state", err)
 	}
 }
-func TestEndpointServiceKeyedLifecycleEffectRoundTrip(t *testing.T) {
+func TestEndpointServiceDurableLifecycleEffectRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	source := &endpointKeySource{}
-	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "keyed-endpoint.db"), KeySource: source, DatabaseIdentity: "endpoint-keyed"})
+	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "durable-endpoint.db"), DatabaseIdentity: "endpoint-durable"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(source))
-	if err := store.SetReadiness(ctx, eventstore.Readiness{Mode: "import", SchemaVersion: 1, DatabaseIdentity: "endpoint-keyed", IndexRootID: "index-v1", EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
+	store := eventstore.NewStore(db)
+	if err := store.SetReadiness(ctx, eventstore.Readiness{Mode: "import", SchemaVersion: 2, DatabaseIdentity: "endpoint-durable", CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
 		t.Fatal(err)
 	}
 	key := adapterapi.AdapterKey("fake")
 	svc := NewService(store, serviceRegistry{key: serviceDescriptor{key: key}})
-	id := adapterapi.EndpointID("keyed-endpoint")
-	if _, err := svc.Create(ctx, Command{CommandID: "keyed-create", CorrelationID: "keyed-c", EndpointID: id, AdapterKey: key, Config: adapterapi.ValidatedConfig{Version: 1, Canonical: json.RawMessage(`{"x":1}`)}}); err != nil {
+	id := adapterapi.EndpointID("durable-endpoint")
+	if _, err := svc.Create(ctx, Command{CommandID: "durable-create", CorrelationID: "durable-c", EndpointID: id, AdapterKey: key, Config: adapterapi.ValidatedConfig{Version: 1, Canonical: json.RawMessage(`{"x":1}`)}}); err != nil {
 		t.Fatal(err)
 	}
-	enabled, err := svc.Enable(ctx, Command{CommandID: "keyed-enable", CorrelationID: "keyed-e", EndpointID: id})
+	enabled, err := svc.Enable(ctx, Command{CommandID: "durable-enable", CorrelationID: "durable-e", EndpointID: id})
 	if err != nil {
 		t.Fatal(err)
 	}
 	restarted := NewService(store, serviceRegistry{key: serviceDescriptor{key: key}})
-	replayed, err := restarted.Enable(ctx, Command{CommandID: "keyed-enable", CorrelationID: "keyed-e", EndpointID: id})
+	replayed, err := restarted.Enable(ctx, Command{CommandID: "durable-enable", CorrelationID: "durable-e", EndpointID: id})
 	if err != nil {
 		t.Fatal(err)
 	}

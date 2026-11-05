@@ -10,10 +10,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-module/carbon"
@@ -33,15 +35,11 @@ var ErrGroupCardOverlong = errors.New("群名片长度超过限制")
 
 const logStorageUnavailableMessage = "日志存储未初始化，当前存储模式不可用"
 
-func getGroupLogState(group *GroupInfo) GroupLogState {
+func getGroupLogState(group *GroupInfo) (GroupLogState, error) {
 	if group == nil {
-		return GroupLogState{}
+		return GroupLogState{}, ErrGroupHandleUnavailable
 	}
 	return group.GetLogState()
-}
-
-func getGroupLogName(group *GroupInfo) string {
-	return getGroupLogState(group).Name
 }
 
 func logRepositoryForDice(dice *Dice) service.LogRepository {
@@ -51,9 +49,6 @@ func logRepositoryForDice(dice *Dice) service.LogRepository {
 	if dice.LogRepository != nil {
 		return dice.LogRepository
 	}
-	if dice.DBOperator != nil {
-		return service.NewLegacyLogRepository(dice.DBOperator, dice.BaseConfig.Name)
-	}
 	return nil
 }
 
@@ -62,78 +57,90 @@ func logCallbackStorageAvailable(ctx *MsgContext) bool {
 }
 
 func loadGroupLogState(ctx *MsgContext, group *GroupInfo) (GroupLogState, error) {
-	state := getGroupLogState(group)
-	if group == nil || ctx == nil || ctx.Dice == nil {
-		return state, nil
+	if group == nil || ctx == nil || ctx.Dice == nil || ctx.callbackTransaction == nil ||
+		group.transaction != ctx.callbackTransaction {
+		return GroupLogState{}, ErrDomainTxUnavailable
 	}
-	diceID := ctx.Dice.BaseConfig.Name
-	if ctx.callbackTransaction != nil && ctx.callbackTransaction.HasStoryLogStateUpdate(diceID, group.GroupID) {
-		return state, nil
+	return getGroupLogState(group)
+}
+
+func ReadCommittedGroupLogState(ctx context.Context, d *Dice, groupID string) (GroupLogState, error) {
+	if d == nil || d.DurableStore == nil {
+		return GroupLogState{}, ErrDurableStateUnavailable
 	}
-	repository := logRepositoryForDice(ctx.Dice)
-	stateRepository, ok := repository.(service.LogStateRepository)
+	reader, ok := d.DurableStore.(storyLogSnapshotRepository)
 	if !ok {
-		return state, nil
+		return GroupLogState{}, ErrDurableStateUnavailable
 	}
-	stored, err := stateRepository.GetState(group.GroupID)
+	stored, _, err := reader.GetStoryLogStateSnapshot(ctx, d.BaseConfig.Name, groupID)
 	if err != nil {
 		return GroupLogState{}, err
 	}
-	group.SetLogState(stored.ID, stored.Name, stored.On)
-	group.SetLogBaselineSeq(stored.BaselineSeq)
-	return getGroupLogState(group), nil
+	return GroupLogState{ID: stored.SessionID, Name: stored.Name, On: stored.On, BaselineSeq: stored.BaselineSeq}, nil
 }
 
 func persistGroupLogState(ctx *MsgContext, group *GroupInfo, state GroupLogState) error {
-	if group == nil || ctx == nil || ctx.Dice == nil {
-		return errors.New("日志状态上下文缺失")
+	if group == nil || ctx == nil || ctx.Dice == nil || ctx.callbackTransaction == nil ||
+		group.transaction != ctx.callbackTransaction {
+		return ErrDomainTxUnavailable
 	}
-	if stateRepository, ok := ctx.Dice.LogRepository.(service.LogStateRepository); ok {
-		if ctx.callbackTransaction != nil {
-			update := eventstore.NewStoryLogStateUpdate(eventstore.StoryLogState{
-				DiceID: ctx.Dice.BaseConfig.Name, GroupID: group.GroupID,
-				SessionID: state.ID, Name: state.Name, On: state.On, BaselineSeq: state.BaselineSeq,
-			})
-			if err := ctx.callbackTransaction.AddLogUpdate(update); err != nil {
-				return err
-			}
-		} else if err := stateRepository.SetState(group.GroupID, service.LogState{ID: state.ID, Name: state.Name, On: state.On, BaselineSeq: state.BaselineSeq}); err != nil {
-			return err
-		}
+	if err := group.requireRuntimeAuthority(); err != nil {
+		return err
 	}
-	group.SetLogState(state.ID, state.Name, state.On)
-	group.SetLogBaselineSeq(state.BaselineSeq)
-	group.MarkDirty(ctx.Dice)
-	return nil
+	return ctx.callbackTransaction.SetStoryLogState(ctx.domainContext(), eventstore.StoryLogState{
+		DiceID: ctx.Dice.BaseConfig.Name, GroupID: group.GroupID(),
+		SessionID: state.ID, Name: state.Name, On: state.On, BaselineSeq: state.BaselineSeq,
+	})
 }
 
-func ensureGroupLogState(ctx *MsgContext, group *GroupInfo) (GroupLogState, error) {
-	state, err := loadGroupLogState(ctx, group)
-	if err != nil {
-		return state, err
+func (ctx *MsgContext) ReadGroupLogState() (GroupLogState, error) {
+	if ctx == nil || ctx.Group == nil {
+		return GroupLogState{}, errors.New("日志状态上下文缺失")
 	}
-	if group == nil || !state.On || state.Name == "" || state.ID > 0 {
-		return state, nil
+	return loadGroupLogState(ctx, ctx.Group)
+}
+
+func (ctx *MsgContext) SetGroupLogOn(enabled bool) error {
+	state, err := ctx.ReadGroupLogState()
+	if err != nil {
+		return err
+	}
+	if enabled && state.Name == "" {
+		return errors.New("未选择日志")
+	}
+	state.On = enabled
+	return persistGroupLogState(ctx, ctx.Group, state)
+}
+
+func (ctx *MsgContext) SetGroupLogName(name string) error {
+	if ctx == nil || ctx.Group == nil || ctx.Dice == nil {
+		return errors.New("日志状态上下文缺失")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return persistGroupLogState(ctx, ctx.Group, GroupLogState{})
 	}
 	repository := logRepositoryForDice(ctx.Dice)
 	if repository == nil {
-		return state, errors.New(logStorageUnavailableMessage)
+		return errors.New(logStorageUnavailableMessage)
 	}
-	logID, err := repository.GetOrCreate(group.GroupID, state.Name)
+	names, err := repository.List(ctx.Group.GroupID())
 	if err != nil {
-		if ctx.Dice.Logger != nil {
-			ctx.Dice.Logger.Warnf("日志状态修复失败: 群=%s 名称=%s err=%v", group.GroupID, state.Name, err)
-		}
-		return state, err
+		return err
 	}
-	state.ID = logID
-	if err := persistGroupLogState(ctx, group, state); err != nil {
-		return getGroupLogState(group), err
+	if !slices.Contains(names, name) {
+		return fmt.Errorf("日志 %q 不存在", name)
 	}
-	if ctx.Dice.Logger != nil {
-		ctx.Dice.Logger.Infof("日志状态修复: 群=%s 记录=%s 补全logID=%d", group.GroupID, state.Name, logID)
+	state, err := ctx.ReadGroupLogState()
+	if err != nil {
+		return err
 	}
-	return getGroupLogState(group), nil
+	state.ID, state.Name = 0, name
+	return persistGroupLogState(ctx, ctx.Group, state)
+}
+
+func ensureGroupLogState(ctx *MsgContext, group *GroupInfo) (GroupLogState, error) {
+	return loadGroupLogState(ctx, group)
 }
 
 func setPlayerGroupCardName(ctx *MsgContext, text string) error {
@@ -141,7 +148,7 @@ func setPlayerGroupCardName(ctx *MsgContext, text string) error {
 		if ctx.Group == nil || ctx.Player == nil {
 			return ErrDurableOutboundUnsupported
 		}
-		target, ok := durableManagementTarget(ctx, ctx.Group.GroupID, ctx.Player.UserID)
+		target, ok := durableManagementTarget(ctx, ctx.Group.GroupID(), ctx.Player.UserID())
 		if !ok {
 			return ErrDurableOutboundUnsupported
 		}
@@ -219,17 +226,14 @@ func RegisterBuiltinExtLog(self *Dice) {
 
 	// 避免群信息重复记录
 	groupMsgInfo := SyncMap[any, int64]{}
-	groupMsgInfoLastClean := int64(0)
+	var groupMsgInfoLastClean atomic.Int64
 	groupMsgInfoClean := func() {
 		// 清理过久的消息
 		now := time.Now().Unix()
-
-		if now-groupMsgInfoLastClean < 60 {
-			// 60s清理一次
+		last := groupMsgInfoLastClean.Load()
+		if now-last < 60 || !groupMsgInfoLastClean.CompareAndSwap(last, now) {
 			return
 		}
-
-		groupMsgInfoLastClean = now
 		var toDelete []any
 		groupMsgInfo.Range(func(key any, t int64) bool {
 			if now-t > 5 { // 5秒内如果有此消息，那么不记录
@@ -267,11 +271,13 @@ func RegisterBuiltinExtLog(self *Dice) {
 		if !groupMsgInfoCheckOk(msg.RawID) {
 			return
 		}
-		item := receivedLogItem(msg, ctx.Player.Name, ctx.Player.UserID, ctx.CommandID)
-		if LogAppend(ctx, ctx.Group.GroupID, state.ID, state.Name, item) {
+		item := receivedLogItem(msg, ctx.Player.Name(), ctx.Player.UserID(), ctx.CommandID)
+		if LogAppend(ctx, ctx.Group.GroupID(), state.ID, state.Name, item) {
 			rawID := msg.RawID
 			if ctx.callbackTransaction != nil {
-				ctx.callbackTransaction.callbackAfterCommit = append(ctx.callbackTransaction.callbackAfterCommit, func() { groupMsgInfoSet(rawID) })
+				if err := ctx.callbackTransaction.AfterCommit(func() { groupMsgInfoSet(rawID) }); err != nil {
+					ctx.setExecutionError(err)
+				}
 			} else {
 				groupMsgInfoSet(rawID)
 			}
@@ -279,12 +285,15 @@ func RegisterBuiltinExtLog(self *Dice) {
 	}
 
 	// 获取logname，第一项是默认名字
-	getLogName := func(ctx *MsgContext, _ *Message, cmdArgs *CmdArgs, index int) (string, string) {
-		bakLogCurName := getGroupLogName(ctx.Group)
-		if newName := cmdArgs.GetArgN(index); newName != "" {
-			return bakLogCurName, newName
+	getLogName := func(ctx *MsgContext, _ *Message, cmdArgs *CmdArgs, index int) (string, string, error) {
+		state, err := ctx.ReadGroupLogState()
+		if err != nil {
+			return "", "", err
 		}
-		return bakLogCurName, bakLogCurName
+		if newName := cmdArgs.GetArgN(index); newName != "" {
+			return state.Name, newName, nil
+		}
+		return state.Name, state.Name, nil
 	}
 
 	const helpLog = `.log new [<日志名>] // 新建日志并开始记录，注意new后跟空格！
@@ -311,7 +320,9 @@ func RegisterBuiltinExtLog(self *Dice) {
 		Help:      "日志指令:\n" + helpLog,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			group := ctx.Group
-			if _, err := loadGroupLogState(ctx, group); err != nil {
+			currentLogState, err := loadGroupLogState(ctx, group)
+			if err != nil {
+				ctx.setExecutionError(err)
 				ReplyToSender(ctx, msg, "读取日志状态失败: "+err.Error())
 				return CmdExecuteResult{Matched: true, Solved: true}
 			}
@@ -330,7 +341,10 @@ func RegisterBuiltinExtLog(self *Dice) {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 				if ctx.callbackTransaction != nil {
-					ctx.callbackTransaction.callbackAfterCommit = append(ctx.callbackTransaction.callbackAfterCommit, task.start)
+					if err := ctx.callbackTransaction.AfterCommit(task.start); err != nil {
+						ctx.setExecutionError(err)
+						ReplyToSender(ctx, msg, "日志检查安排失败: "+err.Error())
+					}
 				} else {
 					task.start()
 				}
@@ -354,14 +368,14 @@ func RegisterBuiltinExtLog(self *Dice) {
 
 			if len(cmdArgs.Args) == 0 {
 				onText := "关闭"
-				state := getGroupLogState(group)
+				state := currentLogState
 				if state.On {
 					onText = "开启"
 				}
 				if !logStorageAvailable() {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-				lines, _ := logRepositoryForDice(ctx.Dice).Count(group.GroupID, state.Name)
+				lines, _ := logRepositoryForDice(ctx.Dice).Count(group.GroupID(), state.Name)
 				text := fmt.Sprintf("当前故事: %s\n当前状态: %s\n已记录文本%d条", state.Name, onText, lines)
 				ReplyToSender(ctx, msg, text)
 				return CmdExecuteResult{Matched: true, Solved: true}
@@ -438,7 +452,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 				}
 
 				// 如果日志已经开启，报错返回
-				currentState := getGroupLogState(group)
+				currentState := currentLogState
 				if currentState.On {
 					VarSetValueStr(ctx, "$t记录名称", currentState.Name)
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_开启_失败_未结束的记录"))
@@ -454,14 +468,14 @@ func RegisterBuiltinExtLog(self *Dice) {
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 					var ok bool
-					name, ok = resolveLogNameWithReply(ctx, msg, group.GroupID, name)
+					name, ok = resolveLogNameWithReply(ctx, msg, group.GroupID(), name)
 					if !ok {
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 				}
 
 				if name != "" {
-					lines, err := logRepositoryForDice(ctx.Dice).StoryLogStats(group.GroupID, name)
+					lines, err := logRepositoryForDice(ctx.Dice).StoryLogStats(group.GroupID(), name)
 					if err != nil {
 						if errors.Is(err, service.ErrLogNotFound) {
 							VarSetValueStr(ctx, "$t记录名称", name)
@@ -475,17 +489,11 @@ func RegisterBuiltinExtLog(self *Dice) {
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 
-					logID, err := logRepositoryForDice(ctx.Dice).GetOrCreate(group.GroupID, name)
-					if err != nil {
-						ReplyToSender(ctx, msg, "日志开启失败: "+err.Error())
-						ctx.Dice.Logger.Errorf("日志开启失败: group=%s name=%s err=%v", group.GroupID, name, err)
-						return CmdExecuteResult{Matched: true, Solved: true}
-					}
-					if err := persistGroupLogState(ctx, group, GroupLogState{ID: logID, Name: name, On: true, BaselineSeq: msg.Seq}); err != nil {
+					if err := persistGroupLogState(ctx, group, GroupLogState{Name: name, On: true, BaselineSeq: msg.Seq}); err != nil {
 						ReplyToSender(ctx, msg, "日志开启失败: "+err.Error())
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
-					ctx.Dice.Logger.Infof("日志状态切换: 群=%s 开启日志 name=%s id=%d", group.GroupID, name, logID)
+					ctx.Dice.Logger.Infof("日志状态切换: 群=%s 开启日志 name=%s", group.GroupID(), name)
 
 					VarSetValueStr(ctx, "$t记录名称", name)
 					VarSetValueInt64(ctx, "$t当前记录条数", lines)
@@ -495,7 +503,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 				}
 				return CmdExecuteResult{Matched: true, Solved: true}
 			} else if cmdArgs.IsArgEqual(1, "off") {
-				state := getGroupLogState(group)
+				state := currentLogState
 				if state.Name != "" && state.On {
 					if !logStorageAvailable() {
 						return CmdExecuteResult{Matched: true, Solved: true}
@@ -505,8 +513,8 @@ func RegisterBuiltinExtLog(self *Dice) {
 						ReplyToSender(ctx, msg, "暂停日志失败: "+err.Error())
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
-					ctx.Dice.Logger.Infof("日志状态切换: 群=%s 暂停日志 name=%s id=%d", group.GroupID, state.Name, state.ID)
-					lines, _ := logRepositoryForDice(ctx.Dice).Count(group.GroupID, state.Name)
+					ctx.Dice.Logger.Infof("日志状态切换: 群=%s 暂停日志 name=%s id=%d", group.GroupID(), state.Name, state.ID)
+					lines, _ := logRepositoryForDice(ctx.Dice).Count(group.GroupID(), state.Name)
 					VarSetValueStr(ctx, "$t记录名称", state.Name)
 					VarSetValueInt64(ctx, "$t当前记录条数", lines)
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_关闭_成功"))
@@ -523,20 +531,18 @@ func RegisterBuiltinExtLog(self *Dice) {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 				var ok bool
-				name, ok = resolveLogNameWithReply(ctx, msg, group.GroupID, name)
+				name, ok = resolveLogNameWithReply(ctx, msg, group.GroupID(), name)
 				if !ok {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 
 				VarSetValueStr(ctx, "$t记录名称", name)
-				if name == getGroupLogName(group) {
+				if name == currentLogState.Name {
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_删除_失败_正在进行"))
 				} else {
-					err := logRepositoryForDice(ctx.Dice).Delete(group.GroupID, name)
+					err := ctx.callbackTransaction.AddLogUpdate(eventstore.NewStoryLogDeleteSessionUpdate(ctx.Dice.BaseConfig.Name, group.GroupID(), name))
 					if err == nil {
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_删除_成功"))
-					} else if errors.Is(err, service.ErrLogNotFound) {
-						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_删除_失败_找不到"))
 					} else {
 						ReplyToSender(ctx, msg, "日志删除失败: "+err.Error())
 					}
@@ -566,7 +572,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 
-				logName := getGroupLogName(group)
+				logName := currentLogState.Name
 				if newName := cmdArgs.GetArgN(2); newName != "" {
 					logName = newName
 				}
@@ -580,10 +586,10 @@ func RegisterBuiltinExtLog(self *Dice) {
 				if !logStorageAvailable() {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-				getAndUpload(ctx, msg, group.GroupID, logName)
+				getAndUpload(ctx, msg, group.GroupID(), logName)
 				return CmdExecuteResult{Matched: true, Solved: true}
 			} else if cmdArgs.IsArgEqual(1, "end") {
-				state := getGroupLogState(group)
+				state := currentLogState
 				if state.Name == "" {
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_关闭_失败"))
 					return CmdExecuteResult{Matched: true, Solved: true}
@@ -591,7 +597,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 				if !logStorageAvailable() {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-				lines, _ := logRepositoryForDice(ctx.Dice).Count(group.GroupID, state.Name)
+				lines, _ := logRepositoryForDice(ctx.Dice).Count(group.GroupID(), state.Name)
 				VarSetValueInt64(ctx, "$t当前记录条数", lines)
 				VarSetValueStr(ctx, "$t记录名称", state.Name)
 				text := DiceFormatTmpl(ctx, "日志:记录_结束")
@@ -604,26 +610,26 @@ func RegisterBuiltinExtLog(self *Dice) {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 				ReplyToSender(ctx, msg, text)
-				ctx.Dice.Logger.Infof("日志状态切换: 群=%s 结束日志 name=%s id=%d，准备上传", group.GroupID, state.Name, state.ID)
+				ctx.Dice.Logger.Infof("日志状态切换: 群=%s 结束日志 name=%s id=%d，准备上传", group.GroupID(), state.Name, state.ID)
 
 				time.Sleep(time.Duration(0.3 * float64(time.Second)))
 				// Note: 2024-10-15 经过简单测试，似乎能缓解#1034的问题，但无法根本解决。
 				// The upload outlives this command, which releases its context on
 				// return, so it reports through a detached one.
 				report := ctx.detach(msg)
-				uploadGroupID := group.GroupID
+				uploadGroupID := group.GroupID()
 				uploadName := state.Name
 				go report(func(reportCtx *MsgContext, reportMsg *Message) {
 					getAndUpload(reportCtx, reportMsg, uploadGroupID, uploadName)
 				})
 				return CmdExecuteResult{Matched: true, Solved: true}
 			} else if cmdArgs.IsArgEqual(1, "halt") {
-				state := getGroupLogState(group)
+				state := currentLogState
 				if len(state.Name) > 0 {
 					if !logStorageAvailable() {
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
-					lines, _ := logRepositoryForDice(ctx.Dice).Count(group.GroupID, state.Name)
+					lines, _ := logRepositoryForDice(ctx.Dice).Count(group.GroupID(), state.Name)
 					VarSetValueInt64(ctx, "$t当前记录条数", lines)
 					VarSetValueStr(ctx, "$t记录名称", state.Name)
 				}
@@ -633,7 +639,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 				ReplyToSender(ctx, msg, text)
-				ctx.Dice.Logger.Infof("日志状态切换: 群=%s 强制终止当前日志", group.GroupID)
+				ctx.Dice.Logger.Infof("日志状态切换: 群=%s 强制终止当前日志", group.GroupID())
 				return CmdExecuteResult{Matched: true, Solved: true}
 			} else if cmdArgs.IsArgEqual(1, "list") {
 				groupID, requestForAnotherGroup := getSpecifiedGroupIfMaster(ctx, msg, cmdArgs)
@@ -641,7 +647,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 				if groupID == "" {
-					groupID = ctx.Group.GroupID
+					groupID = ctx.Group.GroupID()
 				}
 
 				if !logStorageAvailable() {
@@ -672,7 +678,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 				}
 
 				name := cmdArgs.GetArgN(2)
-				currentState := getGroupLogState(group)
+				currentState := currentLogState
 				if currentState.Name != "" && name == "" {
 					VarSetValueStr(ctx, "$t记录名称", currentState.Name)
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_新建_失败_未结束的记录"))
@@ -695,18 +701,19 @@ func RegisterBuiltinExtLog(self *Dice) {
 				if !logStorageAvailable() {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-				logID, err := logRepositoryForDice(ctx.Dice).GetOrCreate(group.GroupID, name)
-				if err != nil {
+				if err := ctx.callbackTransaction.AddLogUpdate(
+					eventstore.NewStoryLogCreateSessionUpdate(ctx.Dice.BaseConfig.Name, group.GroupID(), name),
+				); err != nil {
 					ReplyToSender(ctx, msg, "日志新建失败: "+err.Error())
-					ctx.Dice.Logger.Errorf("日志新建失败: group=%s name=%s err=%v", group.GroupID, name, err)
+					ctx.Dice.Logger.Errorf("日志会话创建失败: group=%s name=%s err=%v", group.GroupID(), name, err)
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-				if err := persistGroupLogState(ctx, group, GroupLogState{ID: logID, Name: name, On: true, BaselineSeq: msg.Seq}); err != nil {
+				if err := persistGroupLogState(ctx, group, GroupLogState{Name: name, On: true, BaselineSeq: msg.Seq}); err != nil {
 					ReplyToSender(ctx, msg, "日志新建失败: "+err.Error())
-					ctx.Dice.Logger.Errorf("日志状态保存失败: group=%s name=%s err=%v", group.GroupID, name, err)
+					ctx.Dice.Logger.Errorf("日志状态保存失败: group=%s name=%s err=%v", group.GroupID(), name, err)
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-				ctx.Dice.Logger.Infof("日志状态切换: 群=%s 新建并开启日志 name=%s id=%d", group.GroupID, name, logID)
+				ctx.Dice.Logger.Infof("日志状态切换: 群=%s 新建并开启日志 name=%s", group.GroupID(), name)
 
 				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_新建"))
 				return CmdExecuteResult{Matched: true, Solved: true}
@@ -716,15 +723,20 @@ func RegisterBuiltinExtLog(self *Dice) {
 					ReplyToSender(ctx, msg, logStorageUnavailableMessage)
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-				_, name := getLogName(ctx, msg, cmdArgs, 2)
+				_, name, err := getLogName(ctx, msg, cmdArgs, 2)
+				if err != nil {
+					ctx.setExecutionError(err)
+					ReplyToSender(ctx, msg, "读取日志状态失败: "+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				if name != "" {
 					var ok bool
-					name, ok = resolveLogNameWithReply(ctx, msg, group.GroupID, name)
+					name, ok = resolveLogNameWithReply(ctx, msg, group.GroupID(), name)
 					if !ok {
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 				}
-				items, err := logRepositoryForDice(ctx.Dice).CommandInfo(group.GroupID, name)
+				items, err := logRepositoryForDice(ctx.Dice).CommandInfo(group.GroupID(), name)
 				if err == nil && len(items) > 0 {
 					// showDetail := cmdArgs.GetKwarg("detail")
 					// var showDetail *Kwarg
@@ -739,12 +751,12 @@ func RegisterBuiltinExtLog(self *Dice) {
 						}
 					} else */{
 						isShowAll := showAll != nil
-						text := LogRollBriefByPCV2(ctx, items, isShowAll, ctx.Player.Name)
+						text := LogRollBriefByPCV2(ctx, items, isShowAll, ctx.Player.Name())
 						if text == "" {
 							if isShowAll {
 								ReplyToSender(ctx, msg, fmt.Sprintf("没有找到故事“%s”的检定记录", name))
 							} else {
-								ReplyToSender(ctx, msg, fmt.Sprintf("没有找到角色<%s>的任何记录\n若需查看全团，请在指令后加 --all", ctx.Player.Name))
+								ReplyToSender(ctx, msg, fmt.Sprintf("没有找到角色<%s>的任何记录\n若需查看全团，请在指令后加 --all", ctx.Player.Name()))
 							}
 						} else {
 							if !isShowAll {
@@ -764,7 +776,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 
-				logName := getGroupLogName(group)
+				logName := currentLogState.Name
 				if newName := cmdArgs.GetArgN(2); newName != "" {
 					logName = newName
 				}
@@ -776,7 +788,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 				var ok bool
-				logName, ok = resolveLogNameWithReply(ctx, msg, group.GroupID, logName)
+				logName, ok = resolveLogNameWithReply(ctx, msg, group.GroupID(), logName)
 				if !ok {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
@@ -786,7 +798,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 				VarSetValueStr(ctx, "$t日期", now.ToShortDateString())
 				VarSetValueStr(ctx, "$t时间", now.ToShortTimeString())
 				logFileNamePrefix := DiceFormatTmpl(ctx, "日志:记录_导出_文件名前缀")
-				logFile, notice, err := GetLogTxt(ctx, group.GroupID, logName, logFileNamePrefix)
+				logFile, notice, err := GetLogTxt(ctx, group.GroupID(), logName, logFileNamePrefix)
 				if err != nil {
 					reply := err.Error()
 					if strings.Contains(reply, "此log不存在") || strings.Contains(reply, "名字是否正确") {
@@ -889,16 +901,21 @@ func RegisterBuiltinExtLog(self *Dice) {
 					ReplyToSender(ctx, msg, "读取日志状态失败: "+err.Error())
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-				_, name := getLogName(ctx, msg, cmdArgs, 2)
+				_, name, err := getLogName(ctx, msg, cmdArgs, 2)
+				if err != nil {
+					ctx.setExecutionError(err)
+					ReplyToSender(ctx, msg, "读取日志状态失败: "+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				if name != "" {
-					resolved, err := resolveLogNameForGroup(logRepositoryForDice(ctx.Dice), group.GroupID, name)
+					resolved, err := resolveLogNameForGroup(logRepositoryForDice(ctx.Dice), group.GroupID(), name)
 					if err != nil {
 						ReplyToSender(ctx, msg, "获取记录出错: "+err.Error())
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 					name = resolved
 				}
-				items, err := logRepositoryForDice(ctx.Dice).CommandInfo(group.GroupID, name)
+				items, err := logRepositoryForDice(ctx.Dice).CommandInfo(group.GroupID(), name)
 				if err == nil && len(items) > 0 {
 					// showDetail := cmdArgs.GetKwarg("detail")
 					// var showDetail *Kwarg
@@ -913,12 +930,12 @@ func RegisterBuiltinExtLog(self *Dice) {
 						}
 					} else */{
 						isShowAll := showAll != nil
-						text := LogRollBriefByPCV2(ctx, items, isShowAll, ctx.Player.Name)
+						text := LogRollBriefByPCV2(ctx, items, isShowAll, ctx.Player.Name())
 						if text == "" {
 							if isShowAll {
 								ReplyToSender(ctx, msg, fmt.Sprintf("没有找到故事“%s”的检定记录", name))
 							} else {
-								ReplyToSender(ctx, msg, fmt.Sprintf("没有找到角色<%s>的任何记录\n若需查看全团，请在指令后加 --all", ctx.Player.Name))
+								ReplyToSender(ctx, msg, fmt.Sprintf("没有找到角色<%s>的任何记录\n若需查看全团，请在指令后加 --all", ctx.Player.Name()))
 							}
 						} else {
 							if !isShowAll {
@@ -948,12 +965,12 @@ func RegisterBuiltinExtLog(self *Dice) {
 		Help:          "观众指令:\n" + helpOb,
 		AllowDelegate: true,
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
-			ctx.DelegateText = fmt.Sprintf("由<%s>操作:\n", ctx.Player.Name)
+			ctx.DelegateText = fmt.Sprintf("由<%s>操作:\n", ctx.Player.Name())
 			mctx := GetCtxProxyFirst(ctx, cmdArgs)
 			subcommand := cmdArgs.GetArgN(1)
 
 			c := ctx
-			if mctx != nil && mctx.Player.UserID != ctx.Player.UserID {
+			if mctx != nil && mctx.Player.UserID() != ctx.Player.UserID() {
 				if ctx.PrivilegeLevel < 50 && subcommand != "help" {
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "通用:提示_无权限_非master/管理"))
 					return CmdExecuteResult{Matched: true, Solved: true}
@@ -965,22 +982,26 @@ func RegisterBuiltinExtLog(self *Dice) {
 			case "help":
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 			case "exit":
-				if strings.HasPrefix(strings.ToLower(c.Player.Name), "ob") {
-					c.Player.Name = c.Player.Name[len("ob"):]
-					if c.Group != nil {
-						c.Group.MarkDirty(c.Dice)
+				name := c.Player.Name()
+				if strings.HasPrefix(strings.ToLower(name), "ob") {
+					name = name[len("ob"):]
+					if err := c.Player.SetName(name); err != nil {
+						ReplyToSender(ctx, msg, "观众模式关闭失败")
+						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 				}
-				_ = setPlayerGroupCardName(c, c.Player.Name)
+				_ = setPlayerGroupCardName(c, name)
 				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:OB_关闭"))
 			default:
-				if !strings.HasPrefix(strings.ToLower(c.Player.Name), "ob") {
-					c.Player.Name = "ob" + c.Player.Name
-					if c.Group != nil {
-						c.Group.MarkDirty(c.Dice)
+				name := c.Player.Name()
+				if !strings.HasPrefix(strings.ToLower(name), "ob") {
+					name = "ob" + name
+					if err := c.Player.SetName(name); err != nil {
+						ReplyToSender(ctx, msg, "观众模式开启失败")
+						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 				}
-				_ = setPlayerGroupCardName(c, c.Player.Name)
+				_ = setPlayerGroupCardName(c, name)
 				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:OB_开启"))
 			}
 			return CmdExecuteResult{Matched: true, Solved: true}
@@ -1045,7 +1066,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 			// 若明确无管理权限则给出明确提示, 由于协议端问题，目前只能做提示。不支持角色检查的适配器
 			// 返回 ok=false, 此时保持原有行为(直接尝试设置)不做阻断。
 			if valLower != "help" && ctx.Group != nil {
-				if detail, ok := checkBotGroupRole(ctx, ctx.Group.GroupID); ok && detail != "owner" && detail != "admin" {
+				if detail, ok := checkBotGroupRole(ctx, ctx.Group.GroupID()); ok && detail != "owner" && detail != "admin" {
 					ReplyToSender(ctx, msg, "【警告】骰子当前可能不具备管理员权限，请检查，若确认具备管理员权限可无视此误报。")
 				}
 			}
@@ -1054,11 +1075,12 @@ func RegisterBuiltinExtLog(self *Dice) {
 			case "help":
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 			case "coc", "coc7":
-				ctx.Player.AutoSetNameTemplate = "{$t玩家_RAW} SAN{理智} HP{生命值}/{生命值上限} DEX{敏捷}"
-				if ctx.Group != nil {
-					ctx.Group.MarkDirty(ctx.Dice)
+				template := "{$t玩家_RAW} SAN{理智} HP{生命值}/{生命值上限} DEX{敏捷}"
+				if err := ctx.Player.SetAutoSetNameTemplate(template); err != nil {
+					ReplyToSender(ctx, msg, "名片模板设置失败")
+					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-				text, err := SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
+				text, err := SetPlayerGroupCardByTemplate(ctx, template)
 				if errors.Is(err, ErrGroupCardOverlong) {
 					return handleOverlong(ctx, msg, text)
 				}
@@ -1068,11 +1090,12 @@ func RegisterBuiltinExtLog(self *Dice) {
 				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:名片_自动设置"))
 			case "dnd", "dnd5e":
 				// PW{pw}
-				ctx.Player.AutoSetNameTemplate = "{$t玩家_RAW} HP{hp}/{hpmax} AC{ac} DC{dc} PP{pp}"
-				if ctx.Group != nil {
-					ctx.Group.MarkDirty(ctx.Dice)
+				template := "{$t玩家_RAW} HP{hp}/{hpmax} AC{ac} DC{dc} PP{pp}"
+				if err := ctx.Player.SetAutoSetNameTemplate(template); err != nil {
+					ReplyToSender(ctx, msg, "名片模板设置失败")
+					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-				text, err := SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
+				text, err := SetPlayerGroupCardByTemplate(ctx, template)
 				if errors.Is(err, ErrGroupCardOverlong) {
 					return handleOverlong(ctx, msg, text)
 				}
@@ -1081,11 +1104,12 @@ func RegisterBuiltinExtLog(self *Dice) {
 				// 玩家 HP10/10 AC15 DC15 PW10
 				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:名片_自动设置"))
 			case "none":
-				ctx.Player.AutoSetNameTemplate = "{$t玩家_RAW}"
-				if ctx.Group != nil {
-					ctx.Group.MarkDirty(ctx.Dice)
+				template := "{$t玩家_RAW}"
+				if err := ctx.Player.SetAutoSetNameTemplate(template); err != nil {
+					ReplyToSender(ctx, msg, "名片模板设置失败")
+					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-				text, err := SetPlayerGroupCardByTemplate(ctx, "{$t玩家_RAW}")
+				text, err := SetPlayerGroupCardByTemplate(ctx, template)
 				if errors.Is(err, ErrGroupCardOverlong) { // 大约不至于会走到这里，但是为了统一也这样写了
 					return handleOverlong(ctx, msg, text)
 				}
@@ -1094,9 +1118,9 @@ func RegisterBuiltinExtLog(self *Dice) {
 				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:名片_自动设置"))
 			case "off", "cancel":
 				_, _ = SetPlayerGroupCardByTemplate(ctx, "{$t玩家_RAW}")
-				ctx.Player.AutoSetNameTemplate = ""
-				if ctx.Group != nil {
-					ctx.Group.MarkDirty(ctx.Dice)
+				if err := ctx.Player.SetAutoSetNameTemplate(""); err != nil {
+					ReplyToSender(ctx, msg, "名片模板设置失败")
+					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:名片_取消设置"))
 			case "expr":
@@ -1106,23 +1130,23 @@ func RegisterBuiltinExtLog(self *Dice) {
 				}
 				if t == "" {
 					_, _ = SetPlayerGroupCardByTemplate(ctx, "{$t玩家_RAW}")
-					ctx.Player.AutoSetNameTemplate = ""
-					if ctx.Group != nil {
-						ctx.Group.MarkDirty(ctx.Dice)
+					if err := ctx.Player.SetAutoSetNameTemplate(""); err != nil {
+						ReplyToSender(ctx, msg, "名片模板设置失败")
+						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 					ReplyToSender(ctx, msg, "玩家自设内容为空，已自动关闭此功能")
 				} else {
-					last := ctx.Player.AutoSetNameTemplate
-					ctx.Player.AutoSetNameTemplate = t
-					text, err := SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
+					last := ctx.Player.AutoSetNameTemplate()
+					text, err := SetPlayerGroupCardByTemplate(ctx, t)
 					if err != nil && !errors.Is(err, ErrGroupCardOverlong) {
-						ctx.Player.AutoSetNameTemplate = last
 						ReplyToSender(ctx, msg, "玩家自设sn格式错误，已自动还原之前模板")
 					} else if errors.Is(err, ErrGroupCardOverlong) {
 						return handleOverlong(ctx, msg, text)
 					} else {
-						if ctx.Group != nil {
-							ctx.Group.MarkDirty(ctx.Dice)
+						if err = ctx.Player.SetAutoSetNameTemplate(t); err != nil {
+							_ = ctx.Player.SetAutoSetNameTemplate(last)
+							ReplyToSender(ctx, msg, "名片模板设置失败")
+							return CmdExecuteResult{Matched: true, Solved: true}
 						}
 						VarSetValueStr(ctx, "$t名片格式", "玩家自设")
 						VarSetValueStr(ctx, "$t名片预览", text)
@@ -1155,7 +1179,11 @@ func RegisterBuiltinExtLog(self *Dice) {
 						ok = true
 						return false
 					}
-					ctx.Player.AutoSetNameTemplate = t.Template
+					if err := ctx.Player.SetAutoSetNameTemplate(t.Template); err != nil {
+						ReplyToSender(ctx, msg, "名片模板设置失败")
+						ok = true
+						return false
+					}
 					VarSetValueStr(ctx, "$t名片格式", val)
 					VarSetValueStr(ctx, "$t名片预览", text)
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:名片_自动设置"))
@@ -1190,7 +1218,8 @@ func RegisterBuiltinExtLog(self *Dice) {
 
 			// 无论是否入日志，群内发言都会占用一个seq，故计数要在 skip 之前
 			if msg.MessageType == "group" && msg.GroupID != "" {
-				if groupInfo, ok := ctx.Session.ServiceAtNew.Load(msg.GroupID); ok {
+				groupInfo, err := ctx.ResolveGroup(ctx.domainContext(), msg.GroupID)
+				if err == nil && groupInfo.Version() != 0 {
 					groupInfo.noteLogSelfSent()
 				}
 			}
@@ -1198,11 +1227,14 @@ func RegisterBuiltinExtLog(self *Dice) {
 			if ctx.skipLogArchive && msg.MessageType == "group" && ctx.CommandHideFlag != "" {
 				privateCommandListenCheck()
 				if ctx.Session != nil && ctx.EndPoint != nil &&
-					canonicalOnebotGroupID(ctx.CommandHideFlag) == canonicalOnebotGroupID(msg.GroupID) &&
-					IsCurGroupBotOnByID(ctx.Session, ctx.EndPoint, msg.MessageType, msg.GroupID) {
-					if groupInfo, ok := ctx.Session.ServiceAtNew.Load(msg.GroupID); ok {
-						if state, err := loadGroupLogState(ctx, groupInfo); err == nil && state.On && state.Name != "" {
-							privateCommandListenSet(ctx.CommandID, time.Now().Unix())
+					canonicalOnebotGroupID(ctx.CommandHideFlag) == canonicalOnebotGroupID(msg.GroupID) {
+					active, err := IsCurGroupBotOnByID(ctx, msg.MessageType, msg.GroupID)
+					if err == nil && active {
+						groupInfo, resolveErr := ctx.ResolveGroup(ctx.domainContext(), msg.GroupID)
+						if resolveErr == nil {
+							if state, stateErr := loadGroupLogState(ctx, groupInfo); stateErr == nil && state.On && state.Name != "" {
+								privateCommandListenSet(ctx.CommandID, time.Now().Unix())
+							}
 						}
 					}
 				}
@@ -1219,15 +1251,14 @@ func RegisterBuiltinExtLog(self *Dice) {
 			privateCommandListenCheck()
 			if msg.MessageType == "private" && ctx.CommandHideFlag != "" {
 				if privateCommandListenHas(ctx.CommandID) {
-					session := ctx.Session
-					groupInfo, ok := session.ServiceAtNew.Load(ctx.CommandHideFlag)
-					if !ok {
-						ctx.Dice.Logger.Warn("ServiceAtNew ext_log加载groupInfo异常")
+					groupInfo, resolveErr := ctx.ResolveGroup(ctx.domainContext(), ctx.CommandHideFlag)
+					if resolveErr != nil || groupInfo.Version() == 0 {
+						ctx.Dice.Logger.Warnf("暗骰日志群状态读取失败: %v", resolveErr)
 						return
 					}
 					logState, stateErr := ensureGroupLogState(ctx, groupInfo)
 					if stateErr != nil {
-						ctx.Dice.Logger.Warnf("日志状态读取失败: group=%s err=%v", groupInfo.GroupID, stateErr)
+						ctx.Dice.Logger.Warnf("日志状态读取失败: group=%s err=%v", groupInfo.GroupID(), stateErr)
 						return
 					}
 					a := model.LogOneItem{
@@ -1243,20 +1274,24 @@ func RegisterBuiltinExtLog(self *Dice) {
 						RawMsgID:    msg.RawID,
 					}
 
-					LogAppend(ctx, groupInfo.GroupID, logState.ID, logState.Name, &a)
+					LogAppend(ctx, groupInfo.GroupID(), logState.ID, logState.Name, &a)
 				}
 			}
 
-			if IsCurGroupBotOnByID(ctx.Session, ctx.EndPoint, msg.MessageType, msg.GroupID) {
-				session := ctx.Session
-				groupInfo, ok := session.ServiceAtNew.Load(msg.GroupID)
-				if !ok {
-					ctx.Dice.Logger.Warn("ServiceAtNew ext_log加载groupInfo异常")
+			active, activeErr := IsCurGroupBotOnByID(ctx, msg.MessageType, msg.GroupID)
+			if activeErr != nil {
+				ctx.Dice.Logger.Warnf("日志群启用状态读取失败: %v", activeErr)
+				return
+			}
+			if active {
+				groupInfo, resolveErr := ctx.ResolveGroup(ctx.domainContext(), msg.GroupID)
+				if resolveErr != nil || groupInfo.Version() == 0 {
+					ctx.Dice.Logger.Warnf("日志群状态读取失败: %v", resolveErr)
 					return
 				}
 				logState, stateErr := ensureGroupLogState(ctx, groupInfo)
 				if stateErr != nil {
-					ctx.Dice.Logger.Warnf("日志状态读取失败: group=%s err=%v", groupInfo.GroupID, stateErr)
+					ctx.Dice.Logger.Warnf("日志状态读取失败: group=%s err=%v", groupInfo.GroupID(), stateErr)
 					return
 				}
 				if logState.On && logState.Name != "" {
@@ -1278,7 +1313,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 						CommandInfo: ctx.CommandInfo,
 						RawMsgID:    msg.RawID,
 					}
-					LogAppend(ctx, groupInfo.GroupID, logState.ID, logState.Name, &a)
+					LogAppend(ctx, groupInfo.GroupID(), logState.ID, logState.Name, &a)
 				}
 			}
 		},
@@ -1291,45 +1326,20 @@ func RegisterBuiltinExtLog(self *Dice) {
 			if ctx.Group != nil {
 				logState, stateErr := ensureGroupLogState(ctx, ctx.Group)
 				if stateErr != nil {
-					ctx.Dice.Logger.Warnf("日志状态读取失败: group=%s err=%v", ctx.Group.GroupID, stateErr)
+					ctx.Dice.Logger.Warnf("日志状态读取失败: group=%s err=%v", ctx.Group.GroupID(), stateErr)
 					return
 				}
 				if logState.On && logState.Name != "" {
 					if msg.Seq > 0 && !msg.recovered {
-						span, adopt := detectLogGap(ctx.Group, logState, msg, func() (int64, error) {
-							repository := logRepositoryForDice(ctx.Dice)
-							if repository == nil {
-								return 0, nil
-							}
-							seq, err := repository.LastSeq(logState.ID)
-							if err != nil {
-								ctx.Dice.Logger.Warnf("日志序号恢复失败: group=%s log_id=%d err=%v", ctx.Group.GroupID, logState.ID, err)
-							}
-							return seq, err
-						})
+						span, adopt := detectLogGap(ctx.Group.runtime, logState, msg, logStoredSeqReader(ctx, logState))
 						if adopt > 0 {
 							logState.BaselineSeq = adopt
 							if err := persistGroupLogState(ctx, ctx.Group, logState); err != nil {
-								ctx.Dice.Logger.Warnf("日志基线保存失败: group=%s log_id=%d err=%v", ctx.Group.GroupID, logState.ID, err)
+								ctx.Dice.Logger.Warnf("日志基线保存失败: group=%s log_id=%d err=%v", ctx.Group.GroupID(), logState.ID, err)
 							}
 						}
-						if span.missing > 0 {
-							task := logGapFillTask{
-								dice:      ctx.Dice,
-								endpoint:  ctx.EndPoint,
-								group:     ctx.Group,
-								logID:     logState.ID,
-								logName:   logState.Name,
-								fromSeq:   span.fromSeq,
-								toSeq:     span.toSeq,
-								gap:       span.missing,
-								lastMsgID: span.lastMsgID,
-							}
-							if ctx.callbackTransaction != nil {
-								ctx.callbackTransaction.callbackAfterCommit = append(ctx.callbackTransaction.callbackAfterCommit, task.start)
-							} else {
-								task.start()
-							}
+						if span.missing > 0 && !startLogGapFill(ctx, logState, span) {
+							return
 						}
 					}
 
@@ -1347,11 +1357,11 @@ func RegisterBuiltinExtLog(self *Dice) {
 			}
 			state, err := loadGroupLogState(ctx, ctx.Group)
 			if err != nil {
-				ctx.Dice.Logger.Warnf("读取撤回日志状态失败: group=%s err=%v", ctx.Group.GroupID, err)
+				ctx.Dice.Logger.Warnf("读取撤回日志状态失败: group=%s err=%v", ctx.Group.GroupID(), err)
 				return
 			}
 			if state.On && state.Name != "" {
-				LogDeleteByID(ctx, ctx.Group.GroupID, msg.RawID)
+				LogDeleteByID(ctx, ctx.Group.GroupID(), msg.RawID)
 			}
 		},
 		OnMessageEdit: func(ctx *MsgContext, msg *Message) {
@@ -1365,11 +1375,11 @@ func RegisterBuiltinExtLog(self *Dice) {
 
 			state, err := loadGroupLogState(ctx, ctx.Group)
 			if err != nil {
-				ctx.Dice.Logger.Warnf("读取编辑日志状态失败: group=%s err=%v", ctx.Group.GroupID, err)
+				ctx.Dice.Logger.Warnf("读取编辑日志状态失败: group=%s err=%v", ctx.Group.GroupID(), err)
 				return
 			}
 			if state.On && state.Name != "" {
-				LogEditByID(ctx, ctx.Group.GroupID, msg.Message, msg.RawID)
+				LogEditByID(ctx, ctx.Group.GroupID(), msg.Message, msg.RawID)
 			}
 		},
 		GetDescText: GetExtensionDesc,
@@ -1398,11 +1408,6 @@ func getSpecifiedGroupIfMaster(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) 
 			data = prefix + ":" + data
 		}
 
-		// _newGroup := ctx.Session.ServiceAtNew[data]
-		// if _newGroup == nil {
-		// 	ReplyToSender(ctx, msg, "找不到指定的群组，请输入正确群号。如在非QQ平台取log，群号请写 QQ-Group:12345")
-		// 	return nil, true
-		// }
 		return data, true
 	}
 	// 对应的组，是否存在第二个参数
@@ -1430,7 +1435,7 @@ func receivedLogItem(msg *Message, nickname, userID string, commandID int64) *mo
 }
 
 func LogAppend(ctx *MsgContext, groupID string, logID uint64, logName string, logItem *model.LogOneItem) bool {
-	if ctx == nil || ctx.Dice == nil || logItem == nil {
+	if ctx == nil || ctx.Dice == nil || ctx.callbackTransaction == nil || logItem == nil {
 		reportLogAppendFailure(ctx, groupID, logID, logName)
 		return false
 	}
@@ -1444,29 +1449,21 @@ func LogAppend(ctx *MsgContext, groupID string, logID uint64, logName string, lo
 		reportLogAppendFailure(ctx, groupID, logID, logName)
 		return false
 	}
-	if ctx.callbackTransaction != nil {
-		err = ctx.callbackTransaction.AddLogUpdate(eventstore.NewStoryLogAppendUpdate(entry))
-	} else if logID > 0 {
-		err = repository.AppendByID(groupID, logID, logItem)
-	} else if logName != "" {
-		err = repository.Append(groupID, logName, logItem)
-	} else {
-		err = service.ErrLogNotFound
-	}
+	err = ctx.callbackTransaction.AddLogUpdate(eventstore.NewStoryLogAppendUpdate(entry))
 	if err != nil {
+		ctx.setExecutionError(err)
 		reportLogAppendFailure(ctx, groupID, logID, logName)
 		return false
 	}
 	if size, okCount := repository.Count(groupID, logName); okCount {
-		if ctx.callbackTransaction != nil {
-			size++
-		}
-		// 默认每记录500条发出提示
-		if ctx.Dice.Config.LogSizeNoticeEnable {
-			if ctx.Dice.Config.LogSizeNoticeCount == 0 {
-				ctx.Dice.Config.LogSizeNoticeCount = DefaultConfig.LogSizeNoticeCount
+		size++
+		config := ctx.Dice.Config()
+		if config.LogSizeNoticeEnable {
+			count := config.LogSizeNoticeCount
+			if count == 0 {
+				count = DefaultConfig.LogSizeNoticeCount
 			}
-			if size > 0 && int(size)%ctx.Dice.Config.LogSizeNoticeCount == 0 {
+			if size > 0 && int(size)%count == 0 {
 				VarSetValueInt64(ctx, "$t条数", size)
 				text := DiceFormatTmpl(ctx, "日志:记录_条数提醒")
 				ReplyToSenderRaw(ctx, &Message{MessageType: "group", GroupID: groupID}, text, "skip")
@@ -1557,11 +1554,11 @@ type logGapSpan struct {
 //     只从这条消息开始量，并返回 adoptBaseline，由调用方持久化，之后重启也能检测。
 //
 // storedSeq 返回日志里已存的最大 seq。
-func detectLogGap(group *GroupInfo, state GroupLogState, msg *Message, storedSeq func() (int64, error)) (span logGapSpan, adoptBaseline int64) {
-	if group == nil || msg == nil || msg.Seq <= 0 {
+func detectLogGap(runtime *GroupRuntimeResources, state GroupLogState, msg *Message, storedSeq func() (int64, error)) (span logGapSpan, adoptBaseline int64) {
+	if runtime == nil || runtime.revoked.Load() || runtime.logSequence == nil || msg == nil || msg.Seq <= 0 {
 		return logGapSpan{}, 0
 	}
-	pos := group.updateLogSeq(state.ID, state.BaselineSeq, msg.Seq, msg.RawID)
+	pos := updateLogGapSequence(runtime.logSequence, state.ID, state.BaselineSeq, msg.Seq, msg.RawID)
 	if pos.rebuilt && state.BaselineSeq > 0 {
 		if stored, err := storedSeq(); err == nil && stored > pos.lastSeq {
 			pos.lastSeq, pos.lastMsgID, pos.selfSent = stored, nil, 0
@@ -1580,17 +1577,151 @@ func detectLogGap(group *GroupInfo, state GroupLogState, msg *Message, storedSeq
 	return span, adoptBaseline
 }
 
+func updateLogGapSequence(state *groupLogRuntime, logID uint64, floor, seq int64, rawID interface{}) logSeqPosition {
+	if state == nil {
+		return logSeqPosition{}
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.logID != logID {
+		state.logID, state.lastSeq, state.lastMsgID, state.selfSent = logID, 0, nil, 0
+	}
+	pos := logSeqPosition{lastSeq: state.lastSeq, lastMsgID: state.lastMsgID, selfSent: state.selfSent, rebuilt: state.lastSeq == 0}
+	if floor > pos.lastSeq {
+		pos.lastSeq, pos.lastMsgID, pos.selfSent = floor, nil, 0
+	}
+	if seq > pos.lastSeq {
+		state.lastSeq, state.lastMsgID, state.selfSent = seq, rawID, 0
+	}
+	return pos
+}
+
+// logStoredSeqReader reads the largest sequence the log has stored, for
+// rebuilding the in-memory position after a restart.
+func logStoredSeqReader(ctx *MsgContext, logState GroupLogState) func() (int64, error) {
+	return func() (int64, error) {
+		repository := logRepositoryForDice(ctx.Dice)
+		if repository == nil {
+			return 0, nil
+		}
+		seq, err := repository.LastSeq(logState.ID)
+		if err != nil {
+			ctx.Dice.Logger.Warnf("日志序号恢复失败: group=%s log_id=%d err=%v", ctx.Group.GroupID(), logState.ID, err)
+		}
+		return seq, err
+	}
+}
+
+// startLogGapFill queues recovery of a detected gap for after the invocation
+// commits. It reports false when the task could not be created.
+func startLogGapFill(ctx *MsgContext, logState GroupLogState, span logGapSpan) bool {
+	invocationID, idErr := newLogGapTaskID(ctx, span.fromSeq, span.toSeq)
+	if idErr != nil {
+		ctx.setExecutionError(idErr)
+		ctx.Dice.Logger.Warnf("日志补全任务创建失败: group=%s err=%v", ctx.Group.GroupID(), idErr)
+		return false
+	}
+	task := logGapFillTask{
+		dice:         ctx.Dice,
+		endpoint:     ctx.EndPoint,
+		groupID:      ctx.Group.GroupID(),
+		runtime:      ctx.Group.runtime,
+		invocationID: invocationID,
+		logID:        logState.ID,
+		logName:      logState.Name,
+		fromSeq:      span.fromSeq,
+		toSeq:        span.toSeq,
+		gap:          span.missing,
+		lastMsgID:    span.lastMsgID,
+	}
+	if ctx.callbackTransaction != nil {
+		if err := ctx.callbackTransaction.AfterCommit(task.start); err != nil {
+			ctx.setExecutionError(err)
+		}
+	} else {
+		task.start()
+	}
+	return true
+}
+
+// detectSelfLogGap records where a message the bot's own account sent sits in
+// the group and reports a gap it reveals. Only live reports count: a recovered
+// message never moves the position.
+//
+// Core's own group sends are counted when they are sent (selfSent), before the
+// provider's report of them can exist, and the report must not deduct them a
+// second time. selfSent counts the own messages since lastSeq whose numbers are
+// not known; a report at seq above lastSeq reveals one of them:
+//   - issuedByCore, with selfSent > 0: the report is one of those counted sends,
+//     so the others still hidden below seq are selfSent-1;
+//   - otherwise (typed by hand, or a Core send nobody counted, such as plugin
+//     callApi) it is not among them and all selfSent may lie below seq.
+//
+// Of the width = seq-lastSeq-1 numbers below seq, the hidden own sends fill up
+// to that many; the rest are other people's messages missed. Sends counted
+// beyond what the width can hold are above seq and stay in selfSent. lastSeq
+// then moves to seq, so a report arriving after a later message (seq <=
+// lastSeq) changes nothing: that later message already deducted every send
+// counted before it.
+func detectSelfLogGap(runtime *GroupRuntimeResources, state GroupLogState, seq int64, rawID interface{}, issuedByCore bool, storedSeq func() (int64, error)) logGapSpan {
+	if runtime == nil || runtime.revoked.Load() || runtime.logSequence == nil || seq <= 0 {
+		return logGapSpan{}
+	}
+	ls := runtime.logSequence
+	ls.mu.Lock()
+	rebuild := ls.logID != state.ID || ls.lastSeq == 0
+	ls.mu.Unlock()
+	var stored int64
+	if rebuild && state.BaselineSeq > 0 {
+		// Read outside the lock: it walks the whole persisted log.
+		stored, _ = storedSeq()
+	}
+
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	if ls.logID != state.ID {
+		ls.logID, ls.lastSeq, ls.lastMsgID, ls.selfSent = state.ID, 0, nil, 0
+	}
+	pos := logSeqPosition{lastSeq: ls.lastSeq, lastMsgID: ls.lastMsgID, selfSent: ls.selfSent, rebuilt: ls.lastSeq == 0}
+	if state.BaselineSeq > pos.lastSeq {
+		pos.lastSeq, pos.lastMsgID, pos.selfSent = state.BaselineSeq, nil, 0
+	}
+	if pos.rebuilt && stored > pos.lastSeq {
+		pos.lastSeq, pos.lastMsgID, pos.selfSent = stored, nil, 0
+	}
+	if seq <= pos.lastSeq {
+		return logGapSpan{}
+	}
+	if pos.lastSeq <= 0 {
+		ls.lastSeq, ls.lastMsgID, ls.selfSent = seq, rawID, 0
+		return logGapSpan{}
+	}
+	hidden := pos.selfSent
+	if issuedByCore && hidden > 0 {
+		hidden--
+	}
+	width := seq - pos.lastSeq - 1
+	inside := min(hidden, width)
+	ls.lastSeq, ls.lastMsgID, ls.selfSent = seq, rawID, hidden-inside
+	if missing := width - inside; missing > 0 {
+		return logGapSpan{fromSeq: pos.lastSeq, toSeq: seq, missing: missing, lastMsgID: pos.lastMsgID}
+	}
+	return logGapSpan{}
+}
+
 type logGapFillTask struct {
-	dice        *Dice
-	endpoint    *EndPointInfo
-	group       *GroupInfo
-	logID       uint64
-	logName     string
-	fromSeq     int64
-	toSeq       int64
-	gap         int64 // 已扣除骰子自身发言的净遗漏条数，仅用于阈值判定，不可当作拉取条数
-	lastMsgID   interface{}
-	manualCheck bool
+	dice         *Dice
+	endpoint     *EndPointInfo
+	groupID      string
+	runtime      *GroupRuntimeResources
+	invocationID string
+	logID        uint64
+	logName      string
+	fromSeq      int64
+	toSeq        int64
+	gap          int64 // 已扣除骰子自身发言的净遗漏条数，仅用于阈值判定，不可当作拉取条数
+	lastMsgID    interface{}
+	manualCheck  bool
 }
 
 func (t logGapFillTask) buildNotice(appended, failed, pending, existing int, stats map[string]map[string]int, nicknames map[string]string) string {
@@ -1658,20 +1789,16 @@ func ptrInt64(v int64) *int64 {
 }
 
 func LogDeleteByID(ctx *MsgContext, groupID string, messageID interface{}) bool {
-	if ctx == nil || ctx.Dice == nil {
+	if ctx == nil || ctx.Dice == nil || ctx.callbackTransaction == nil {
 		return false
 	}
 	repository := logRepositoryForDice(ctx.Dice)
 	if repository == nil {
 		return false
 	}
-	var err error
-	if ctx.callbackTransaction != nil {
-		err = ctx.callbackTransaction.AddLogUpdate(eventstore.NewStoryLogDeleteEntryUpdate(repository.DiceID(), groupID, rawStoryLogMessageID(messageID)))
-	} else {
-		err = repository.DeleteByRawID(groupID, messageID)
-	}
+	err := ctx.callbackTransaction.AddLogUpdate(eventstore.NewStoryLogDeleteEntryUpdate(repository.DiceID(), groupID, rawStoryLogMessageID(messageID)))
 	if err != nil {
+		ctx.setExecutionError(err)
 		ctx.Dice.Logger.Error("LogDeleteById:", zap.Error(err))
 		return false
 	}
@@ -1680,20 +1807,16 @@ func LogDeleteByID(ctx *MsgContext, groupID string, messageID interface{}) bool 
 
 // LogEditByID replaces the message content for the latest matching raw ID.
 func LogEditByID(ctx *MsgContext, groupID, content string, messageID interface{}) bool {
-	if ctx == nil || ctx.Dice == nil {
+	if ctx == nil || ctx.Dice == nil || ctx.callbackTransaction == nil {
 		return false
 	}
 	repository := logRepositoryForDice(ctx.Dice)
 	if repository == nil {
 		return false
 	}
-	var err error
-	if ctx.callbackTransaction != nil {
-		err = ctx.callbackTransaction.AddLogUpdate(eventstore.NewStoryLogEditUpdate(repository.DiceID(), groupID, rawStoryLogMessageID(messageID), content))
-	} else {
-		err = repository.EditByRawID(groupID, messageID, content)
-	}
+	err := ctx.callbackTransaction.AddLogUpdate(eventstore.NewStoryLogEditUpdate(repository.DiceID(), groupID, rawStoryLogMessageID(messageID), content))
 	if err != nil {
+		ctx.setExecutionError(err)
 		ctx.Dice.Logger.Error("LogEditByID:", zap.Error(err))
 		return false
 	}
@@ -1791,7 +1914,6 @@ func logSendToBackend(ctx *MsgContext, groupID string, logName string, skipResol
 		return false, "", "", service.ErrLogRepositoryUnavailable
 	}
 	dirPath := filepath.Join(dice.BaseConfig.DataDir, "log-exports")
-
 	if !skipResolve {
 		resolvedName, err := resolveLogNameForGroup(repository, groupID, logName)
 		if err != nil {
@@ -1818,15 +1940,16 @@ func logSendToBackend(ctx *MsgContext, groupID string, logName string, skipResol
 	}
 	uploadCtx.Version = storylog.StoryVersionV1
 
+	advanced := dice.AdvancedConfig()
 	var unofficial bool
-	if dice.AdvancedConfig.Enable && dice.AdvancedConfig.StoryLogBackendUrl != "" {
+	if advanced.Enable && advanced.StoryLogBackendUrl != "" {
 		unofficial = true
-		uploadCtx.Backends = []string{dice.AdvancedConfig.StoryLogBackendUrl}
-		uploadCtx.Token = dice.AdvancedConfig.StoryLogBackendToken
+		uploadCtx.Backends = []string{advanced.StoryLogBackendUrl}
+		uploadCtx.Token = advanced.StoryLogBackendToken
 	}
 	// 原则上1.5支持兼容V1的上传接口，只是需要木落改改代码
-	if dice.AdvancedConfig.Enable && dice.AdvancedConfig.StoryLogApiVersion != "" {
-		switch dice.AdvancedConfig.StoryLogApiVersion {
+	if advanced.Enable && advanced.StoryLogApiVersion != "" {
+		switch advanced.StoryLogApiVersion {
 		case storylog.StoryVersionV1Str:
 			uploadCtx.Version = storylog.StoryVersionV1
 		case storylog.StoryVersionV105Str:
@@ -2363,6 +2486,7 @@ func LogRollBriefDetail(items []*model.LogOneItem) []string {
 				}
 				continue
 			}
+
 			if info["rule"] == "coc7" {
 				switch info["cmd"] {
 				case "ra":

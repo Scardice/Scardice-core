@@ -284,9 +284,8 @@ func TestEventQueueCoordinatorStopsWhenWorkSignalCloses(t *testing.T) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestEventQueueCoordinatorStopsWhenWorkSignalCloses$")
+	// Bound the helper's test body, not native startup plus the race runtime's exit delay.
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestEventQueueCoordinatorStopsWhenWorkSignalCloses$", "-test.timeout=5s")
 	cmd.Env = append(os.Environ(), helperEnv+"=1")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -340,7 +339,7 @@ func TestEventQueueNotificationCrossingClaimWakesCapturedGeneration(t *testing.T
 		firstRelease: make(chan struct{}),
 		second:       make(chan struct{}),
 	}
-	dispatcher, err := endpoint.NewEffectDispatcher(store, store, crossingNoOpEffectExecutor{}, "crossing-notification")
+	dispatcher, err := endpoint.NewEffectDispatcher(store, crossingNoOpEffectExecutor{}, "crossing-notification")
 	if err != nil {
 		t.Fatal(err)
 	}

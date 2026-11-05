@@ -24,41 +24,26 @@ import (
 	"Scardice-core/utils/jsengine"
 
 	"github.com/robfig/cron/v3"
-	ds "github.com/sealdice/dicescript"
 	"github.com/xuri/excelize/v2"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
-type lightweightReadinessStore struct {
-	eventstore.Store
-	metadataCalls int
-	fullCalls     int
-}
-
-func (s *lightweightReadinessStore) GetReadiness(context.Context) (eventstore.Readiness, error) {
-	s.fullCalls++
-	return eventstore.Readiness{}, context.Canceled
-}
-
-func (s *lightweightReadinessStore) GetReadinessMetadata(context.Context) (eventstore.Readiness, error) {
-	s.metadataCalls++
-	return eventstore.Readiness{Mode: "import"}, nil
-}
-
-func (*lightweightReadinessStore) SetReadiness(context.Context, eventstore.Readiness) error {
-	return nil
-}
-
-func TestDefaultDiceMasterSeedUsesLightweightReadinessMetadata(t *testing.T) {
-	store := &lightweightReadinessStore{}
-	seed, err := shouldSeedDefaultDiceMasters(context.Background(), store, "default")
-	if err != nil || seed {
-		t.Fatalf("seed=%t err=%v", seed, err)
+// openEventSourcedRuntimeStore opens an isolated SQLite EventStore with the
+// full projection set. The Dice under test seeds its own config baseline.
+func openEventSourcedRuntimeStore(t *testing.T, dsn string) *eventstore.GORMStore {
+	t.Helper()
+	database, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{
+		Type: "sqlite", DSN: dsn, DatabaseIdentity: "event-sourced-runtime-test",
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if store.metadataCalls != 1 || store.fullCalls != 0 {
-		t.Fatalf("readiness calls: metadata=%d full=%d", store.metadataCalls, store.fullCalls)
-	}
+	t.Cleanup(func() { _ = database.Close() })
+	options := projectionset.StoreOptions()
+	store := eventstore.NewStore(database, options...)
+	t.Cleanup(func() { _ = store.Close() })
+	return store
 }
 
 func TestRestoreEventSourcedDiceUsesConfigProjectionWithoutLegacyFiles(t *testing.T) {
@@ -161,7 +146,7 @@ func TestWaitStartupJsLoadedWaitsAfterJsEnableCleared(t *testing.T) {
 	previousMaxProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(previousMaxProcs)
 
-	d := &Dice{Config: Config{JsConfig: JsConfig{JsEnable: false}}}
+	d := &Dice{}
 	d.beginStartupJsLoad()
 	waitStarted := make(chan struct{})
 	waitFinished := make(chan struct{})
@@ -227,25 +212,13 @@ func TestEventSourcedInitDiceLoadsNamesForPrivateNameCommand(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	database, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
-		Type: "sqlite",
-		DSN:  filepath.Join(root, "events.db"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = database.Close() })
-	store := eventstore.NewStore(database, projectionset.StoreOptions()...)
-	t.Cleanup(func() { _ = store.Close() })
+	store := openEventSourcedRuntimeStore(t, filepath.Join(root, "events.db"))
 
 	runtime := &Dice{
 		BaseConfig:    BaseConfig{Name: "default", DataDir: filepath.Join(root, "dice")},
 		DurableStore:  store,
 		ContainerMode: true,
 	}
-	runtime.Config = NewConfig(runtime)
-	runtime.Config.BaseConfig = runtime.BaseConfig
-	runtime.Config.JsEnable = false
 	manager := &DiceManager{Dice: []*Dice{runtime}}
 	if err := manager.InitializeRuntime(); err != nil {
 		t.Fatal(err)
@@ -253,6 +226,9 @@ func TestEventSourcedInitDiceLoadsNamesForPrivateNameCommand(t *testing.T) {
 	if err := manager.PrepareEventSourcedState(ctx); err != nil {
 		t.Fatal(err)
 	}
+	updateCanonicalTestConfig(t, runtime, func(config *Config) {
+		config.JsEnable = false
+	})
 	t.Cleanup(func() {
 		manager.WaitNamesLoaded()
 		runtime.WaitStartupJsLoaded()
@@ -289,23 +265,15 @@ func TestEventSourcedInitDiceLoadsNamesForPrivateNameCommand(t *testing.T) {
 	}
 	replies := &nameCommandReplyCapture{texts: make(chan string, 1)}
 	runtime.OutboundBridge = replies
-	endpoint := &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Platform: "test"}}
-	player := &GroupPlayerInfo{Name: "Tester", UserID: "test:private", ValueMapTemp: &ds.ValueMap{}}
+	endpoint := newCanonicalTestEndpoint(runtime, "UI:name-bot")
+	endpoint.Platform = "test"
 	msg := &Message{
 		Platform:    "test",
 		MessageType: "private",
-		Sender:      SenderBase{UserID: player.UserID, Nickname: player.Name},
+		Sender:      SenderBase{UserID: "UI:name-user", Nickname: "Tester"},
 	}
-	msgCtx := &MsgContext{
-		Dice:                runtime,
-		Session:             runtime.ImSession,
-		EndPoint:            endpoint,
-		Group:               &GroupInfo{GroupID: "test:private-group"},
-		Player:              player,
-		MessageType:         "private",
-		IsPrivate:           true,
-		IsCompatibilityTest: true,
-	}
+	msgCtx := newCanonicalTestMessageContext(t, runtime, endpoint, msg, "private-name-command")
+	msgCtx.IsCompatibilityTest = true
 	result := ext.CmdMap["name"].Solve(msgCtx, msg, &CmdArgs{Args: []string{"cn", "2"}, RawArgs: "cn 2"})
 	if !result.Matched || !result.Solved {
 		t.Fatalf(".name cn 2 result = %#v, want solved", result)
@@ -336,34 +304,25 @@ func TestEventSourcedInitDiceLoadsNamesForPrivateNameCommand(t *testing.T) {
 }
 
 const (
-	startupHelpReloadChildEnv = "SCARDICE_STARTUP_HELP_RELOAD_FIXTURE"
-	startupHelpReloadTestName = "TestEventSourcedStartupScriptReloadHelpCompletes"
+	startupPluginChildEnv = "SCARDICE_STARTUP_PLUGIN_FIXTURE"
+	startupPluginTestName = "TestEventSourcedStartupScriptRegistersExtensionBeforeHelpCompletes"
 )
 
-func TestEventSourcedStartupScriptReloadHelpCompletes(t *testing.T) {
-	if root := os.Getenv(startupHelpReloadChildEnv); root != "" {
+func TestEventSourcedStartupScriptRegistersExtensionBeforeHelpCompletes(t *testing.T) {
+	if root := os.Getenv(startupPluginChildEnv); root != "" {
 		script := `// ==UserScript==
-// @name EventStore startup ReloadHelp
+// @name EventStore startup extension
 // ==/UserScript==
-seal.inst.config.jsEnable = false;
-seal.inst.parent.reloadHelp();
 const ext = seal.ext.new("startup-help-fixture", "test", "1.0.0");
 seal.ext.register(ext);
 `
-		loadComplete := runEventSourcedInitDiceLoadsDecksWithScript(t, root, true, script, true)
-		for i := range 2 {
-			select {
-			case <-loadComplete.helpCompleted:
-			case <-time.After(5 * time.Second):
-				t.Fatalf("help reload %d did not complete", i+1)
-			}
-		}
+		loadComplete := runEventSourcedInitDiceLoadsDecksWithScript(t, root, true, script, false)
 		loadComplete.orderMu.Lock()
 		jsCompleteOrder := loadComplete.jsCompleteOrder
 		helpCompleteOrders := append([]int(nil), loadComplete.helpCompleteOrders...)
 		loadComplete.orderMu.Unlock()
-		if len(helpCompleteOrders) < 2 || helpCompleteOrders[0] >= jsCompleteOrder || helpCompleteOrders[1] <= jsCompleteOrder {
-			t.Fatalf("explicit and initial help completion order = %v, startup JS completion = %d", helpCompleteOrders, jsCompleteOrder)
+		if len(helpCompleteOrders) == 0 || helpCompleteOrders[len(helpCompleteOrders)-1] <= jsCompleteOrder {
+			t.Fatalf("initial help completion order = %v, startup JS completion = %d", helpCompleteOrders, jsCompleteOrder)
 		}
 		manager := loadComplete.manager
 		manager.helpReloadLock.Lock()
@@ -378,21 +337,21 @@ seal.ext.register(ext);
 				return
 			}
 		}
-		t.Fatalf("final help index did not include extension registered after explicit ReloadHelp: %#v", items)
+		t.Fatalf("final help index did not include the startup extension: %#v", items)
 		return
 	}
 
 	root := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^"+startupHelpReloadTestName+"$", "-test.count=1")
-	cmd.Env = append(os.Environ(), startupHelpReloadChildEnv+"="+root)
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^"+startupPluginTestName+"$", "-test.count=1")
+	cmd.Env = append(os.Environ(), startupPluginChildEnv+"="+root)
 	output, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
-		t.Fatalf("isolated startup fixture exceeded its %s deadline; child terminated to contain blocked goroutines:\\n%s", 8*time.Second, output)
+		t.Fatalf("isolated startup fixture exceeded its %s deadline; child terminated to contain blocked goroutines:\n%s", 8*time.Second, output)
 	}
 	if err != nil {
-		t.Fatalf("isolated startup fixture failed: %v\\n%s", err, output)
+		t.Fatalf("isolated startup fixture failed: %v\n%s", err, output)
 	}
 }
 
@@ -403,26 +362,25 @@ func TestEventSourcedInitDiceLoadsDecksFromOnLoad(t *testing.T) {
 			name = "js-enabled"
 		}
 		t.Run(name, func(t *testing.T) {
-			runEventSourcedInitDiceLoadsDecksFromOnLoad(t, jsEnabled, false)
+			runEventSourcedInitDiceLoadsDecksFromOnLoad(t, jsEnabled)
 		})
 	}
 }
 
-func TestEventSourcedInitDiceLoadsDecksAfterJSDisablesJsEnable(t *testing.T) {
-	runEventSourcedInitDiceLoadsDecksFromOnLoad(t, true, true)
+func TestEventSourcedStartupSealInstIsUnavailable(t *testing.T) {
+	script := `// ==UserScript==
+// @name EventStore unsupported seal.inst
+// ==/UserScript==
+seal.inst.config.jsEnable = false;
+`
+	runEventSourcedInitDiceLoadsDecksWithScript(t, t.TempDir(), true, script, true)
 }
 
-func runEventSourcedInitDiceLoadsDecksFromOnLoad(t *testing.T, jsEnabled, disableJsOnStartup bool) *deckLoadCompletionSyncer {
-	root := t.TempDir()
-	startupScript := ""
-	if disableJsOnStartup {
-		startupScript = "// ==UserScript==\n// @name EventStore disables JS during startup\n// ==/UserScript==\n" +
-			"seal.inst.config.jsEnable = false;\n"
-	}
-	return runEventSourcedInitDiceLoadsDecksWithScript(t, root, jsEnabled, startupScript, disableJsOnStartup)
+func runEventSourcedInitDiceLoadsDecksFromOnLoad(t *testing.T, jsEnabled bool) *deckLoadCompletionSyncer {
+	return runEventSourcedInitDiceLoadsDecksWithScript(t, t.TempDir(), jsEnabled, "", false)
 }
 
-func runEventSourcedInitDiceLoadsDecksWithScript(t *testing.T, root string, jsEnabled bool, startupScript string, expectJsDisabled bool) *deckLoadCompletionSyncer {
+func runEventSourcedInitDiceLoadsDecksWithScript(t *testing.T, root string, jsEnabled bool, startupScript string, expectScriptFailure bool) *deckLoadCompletionSyncer {
 	t.Chdir(root)
 	decksDir := filepath.Join(root, "data", "decks")
 	if err := os.MkdirAll(decksDir, 0o700); err != nil {
@@ -449,16 +407,7 @@ func runEventSourcedInitDiceLoadsDecksWithScript(t *testing.T, root string, jsEn
 	t.Cleanup(restoreLogger)
 
 	ctx := context.Background()
-	database, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
-		Type: "sqlite",
-		DSN:  filepath.Join(root, "events.db"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = database.Close() })
-	store := eventstore.NewStore(database, projectionset.StoreOptions()...)
-	t.Cleanup(func() { _ = store.Close() })
+	store := openEventSourcedRuntimeStore(t, filepath.Join(root, "events.db"))
 
 	dataDir := filepath.Join("data", "default")
 	if startupScript != "" {
@@ -475,9 +424,6 @@ func runEventSourcedInitDiceLoadsDecksWithScript(t *testing.T, root string, jsEn
 		DurableStore:  store,
 		ContainerMode: true,
 	}
-	runtime.Config = NewConfig(runtime)
-	runtime.Config.BaseConfig = runtime.BaseConfig
-	runtime.Config.JsEnable = false
 	manager := &DiceManager{Dice: []*Dice{runtime}}
 	loadComplete.manager = manager
 	if err := manager.InitializeRuntime(); err != nil {
@@ -486,8 +432,9 @@ func runEventSourcedInitDiceLoadsDecksWithScript(t *testing.T, root string, jsEn
 	if err := manager.PrepareEventSourcedState(ctx); err != nil {
 		t.Fatal(err)
 	}
-	runtime.AdvancedConfig.ExposeDangerousSealInst = startupScript != ""
-	runtime.Config.JsEnable = jsEnabled
+	updateCanonicalTestConfig(t, runtime, func(config *Config) {
+		config.JsEnable = jsEnabled
+	})
 	t.Cleanup(func() {
 		runtime.WaitStartupJsLoaded()
 		if runtime.ExtLoopManager != nil {
@@ -524,17 +471,22 @@ func runEventSourcedInitDiceLoadsDecksWithScript(t *testing.T, root string, jsEn
 		case <-time.After(5 * time.Second):
 			t.Fatal("startup JS completion was not observed")
 		}
-		if expectJsDisabled && runtime.Config.JsEnable {
-			var scriptStatus string
-			if len(runtime.JsScriptList) > 0 {
-				script := runtime.JsScriptList[0]
-				scriptStatus = script.Name + " enable=" + strconv.FormatBool(script.Enable) + " err=" + script.ErrText
-			}
-			t.Fatalf("local startup script did not disable JsEnable: exposed=%v script=%q", runtime.JsSealInstExposed, scriptStatus)
-		}
+		scriptFailed := false
 		for _, script := range runtime.JsScriptList {
-			if script != nil && script.ErrText != "" {
+			if script == nil || script.ErrText == "" {
+				continue
+			}
+			scriptFailed = true
+			if !expectScriptFailure {
 				t.Fatalf("startup script %q failed: %s", script.Name, script.ErrText)
+			}
+		}
+		if expectScriptFailure {
+			if !scriptFailed {
+				t.Fatal("seal.inst unexpectedly remained available to a startup script")
+			}
+			if !runtime.Config().JsEnable {
+				t.Fatal("unsupported seal.inst config mutation changed the canonical JsEnable setting")
 			}
 		}
 	}
@@ -550,23 +502,15 @@ func runEventSourcedInitDiceLoadsDecksWithScript(t *testing.T, root string, jsEn
 	}
 	replies := &nameCommandReplyCapture{texts: make(chan string, 1)}
 	runtime.OutboundBridge = replies
-	endpoint := &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Platform: "test"}}
-	player := &GroupPlayerInfo{Name: "Tester", UserID: "test:private", ValueMapTemp: &ds.ValueMap{}}
+	endpoint := newCanonicalTestEndpoint(runtime, "UI:deck-bot")
+	endpoint.Platform = "test"
 	msg := &Message{
 		Platform:    "test",
 		MessageType: "private",
-		Sender:      SenderBase{UserID: player.UserID, Nickname: player.Name},
+		Sender:      SenderBase{UserID: "UI:deck-user", Nickname: "Tester"},
 	}
-	msgCtx := &MsgContext{
-		Dice:                runtime,
-		Session:             runtime.ImSession,
-		EndPoint:            endpoint,
-		Group:               &GroupInfo{GroupID: "test:private-group"},
-		Player:              player,
-		MessageType:         "private",
-		IsPrivate:           true,
-		IsCompatibilityTest: true,
-	}
+	msgCtx := newCanonicalTestMessageContext(t, runtime, endpoint, msg, "private-deck-command")
+	msgCtx.IsCompatibilityTest = true
 	result := ext.CmdMap["draw"].Solve(msgCtx, msg, &CmdArgs{Args: []string{"list"}, RawArgs: "list"})
 	if !result.Matched || !result.Solved {
 		t.Fatalf(".draw list result = %#v, want solved", result)
@@ -612,16 +556,7 @@ func TestInitEventSourcedRuntimeUsesUserTextTemplatesWithoutBuiltinBackfill(t *t
 	}
 
 	ctx := context.Background()
-	database, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
-		Type: "sqlite",
-		DSN:  filepath.Join(root, "events.db"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
-	store := eventstore.NewStore(database, projectionset.StoreOptions()...)
-	defer store.Close()
+	store := openEventSourcedRuntimeStore(t, filepath.Join(root, "events.db"))
 
 	parent := &DiceManager{Cron: cron.New()}
 	parent.Cron.Start()
@@ -631,10 +566,13 @@ func TestInitEventSourcedRuntimeUsesUserTextTemplatesWithoutBuiltinBackfill(t *t
 		BaseConfig:   BaseConfig{Name: "default", DataDir: dataDir},
 		DurableStore: store,
 	}
-	runtime.Config = NewConfig(runtime)
-	runtime.Config.BaseConfig = runtime.BaseConfig
-	// Keep the test focused on text initialization, not the JS event loop.
-	runtime.Config.JsEnable = false
+	if err := runtime.prepareEventSourcedConfig(ctx, nil); err != nil {
+		t.Fatalf("prepare event-sourced config: %v", err)
+	}
+	updateCanonicalTestConfig(t, runtime, func(config *Config) {
+		// Keep the test focused on text initialization, not the JS event loop.
+		config.JsEnable = false
+	})
 	defer func() {
 		if runtime.AttrsManager != nil {
 			runtime.AttrsManager.Stop()
@@ -681,8 +619,8 @@ func TestPrepareEventSourcedConfigSeedsDefaultDiceMasters(t *testing.T) {
 	if err := runtime.prepareEventSourcedConfig(ctx, nil); err != nil {
 		t.Fatalf("prepare event-sourced config: %v", err)
 	}
-	if want := []string{"UI:1001"}; !slices.Equal(runtime.DiceMasters, want) {
-		t.Fatalf("fresh DiceMasters = %#v, want %#v", runtime.DiceMasters, want)
+	if want, got := []string{"UI:1001"}, runtime.DiceMasterIDs(); !slices.Equal(got, want) {
+		t.Fatalf("fresh DiceMasters = %#v, want %#v", got, want)
 	}
 }
 
@@ -732,16 +670,7 @@ func TestInitEventSourcedRuntimeLoadsPackageAndStoreManagers(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	database, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
-		Type: "sqlite",
-		DSN:  filepath.Join(root, "events.db"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
-	store := eventstore.NewStore(database, projectionset.StoreOptions()...)
-	defer store.Close()
+	store := openEventSourcedRuntimeStore(t, filepath.Join(root, "events.db"))
 
 	parent := &DiceManager{Cron: cron.New()}
 	parent.Cron.Start()
@@ -751,11 +680,14 @@ func TestInitEventSourcedRuntimeLoadsPackageAndStoreManagers(t *testing.T) {
 		BaseConfig:   BaseConfig{Name: "default", DataDir: dataDir},
 		DurableStore: store,
 	}
-	runtime.Config = NewConfig(runtime)
-	runtime.Config.BaseConfig = runtime.BaseConfig
-	runtime.Config.JsEnable = true
-	runtime.Config.EnableCensor = true
-	runtime.Config.BackendUrls = []string{server.URL + "/custom"}
+	if err := runtime.prepareEventSourcedConfig(ctx, nil); err != nil {
+		t.Fatalf("prepare event-sourced config: %v", err)
+	}
+	updateCanonicalTestConfig(t, runtime, func(config *Config) {
+		config.JsEnable = true
+		config.EnableCensor = true
+		config.BackendUrls = []string{server.URL + "/custom"}
+	})
 	defer func() {
 		runtime.WaitStartupJsLoaded()
 		if runtime.ExtLoopManager != nil {
@@ -776,7 +708,7 @@ func TestInitEventSourcedRuntimeLoadsPackageAndStoreManagers(t *testing.T) {
 
 	runtime.initEventSourcedRuntime(nil)
 	runtime.WaitStartupJsLoaded()
-	if !runtime.Config.JsEnable {
+	if !runtime.Config().JsEnable {
 		t.Fatal("JS support was disabled during event-sourced initialization")
 	}
 	if runtime.CensorManager == nil || runtime.CensorManager.DB != nil {
@@ -858,8 +790,8 @@ func TestPrepareEventSourcedConfigBackfillsDefaultMastersForUntouchedFreshStore(
 	if err := runtime.prepareEventSourcedConfig(ctx, nil); err != nil {
 		t.Fatalf("prepare old fresh configuration: %v", err)
 	}
-	if want := []string{"UI:1001"}; !slices.Equal(runtime.DiceMasters, want) {
-		t.Fatalf("migrated DiceMasters = %#v, want %#v", runtime.DiceMasters, want)
+	if want, got := []string{"UI:1001"}, runtime.DiceMasterIDs(); !slices.Equal(got, want) {
+		t.Fatalf("migrated DiceMasters = %#v, want %#v", got, want)
 	}
 }
 
@@ -908,8 +840,8 @@ func TestPrepareEventSourcedConfigPreservesExplicitlyClearedMasters(t *testing.T
 	if err := runtime.prepareEventSourcedConfig(ctx, nil); err != nil {
 		t.Fatalf("prepare explicitly cleared configuration: %v", err)
 	}
-	if len(runtime.DiceMasters) != 0 {
-		t.Fatalf("explicitly cleared DiceMasters restored unexpectedly: %#v", runtime.DiceMasters)
+	if got := runtime.DiceMasterIDs(); len(got) != 0 {
+		t.Fatalf("explicitly cleared DiceMasters restored unexpectedly: %#v", got)
 	}
 }
 func TestCensorCheckTracksThresholdWithoutLegacyLogStorage(t *testing.T) {
@@ -956,6 +888,21 @@ func TestCensorCheckTracksThresholdWithoutLegacyLogStorage(t *testing.T) {
 		t.Fatalf("repeat in-memory hit counts = %#v, want Danger: 2", result.HitCounts)
 	}
 }
+func newCanonicalCensorRuntime(t *testing.T, engine *censor.Censor, threshold int) (*Dice, *CensorManager) {
+	t.Helper()
+	d, _ := newCanonicalTestDice(t)
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.CensorThresholds = map[censor.Level]int{
+			censor.Ignore: 0, censor.Notice: 0, censor.Caution: 0,
+			censor.Warning: 0, censor.Danger: threshold,
+		}
+		config.CensorHandlers = make(map[censor.Level]uint8)
+	})
+	manager := &CensorManager{Censor: engine}
+	d.CensorManager = manager
+	return d, manager
+}
+
 func TestCensorThresholdWithoutLegacyLogStorageTriggersAndClears(t *testing.T) {
 	engine := &censor.Censor{
 		SensitiveKeys: map[string]censor.WordInfo{
@@ -965,23 +912,7 @@ func TestCensorThresholdWithoutLegacyLogStorageTriggersAndClears(t *testing.T) {
 	if err := engine.Load(); err != nil {
 		t.Fatalf("load censor rules: %v", err)
 	}
-	d := &Dice{
-		Logger: zap.NewNop().Sugar(),
-		Config: Config{
-			CensorConfig: CensorConfig{
-				CensorThresholds: map[censor.Level]int{
-					censor.Ignore:  0,
-					censor.Notice:  0,
-					censor.Caution: 0,
-					censor.Warning: 0,
-					censor.Danger:  1,
-				},
-				CensorHandlers: make(map[censor.Level]uint8),
-			},
-		},
-		CensorManager: &CensorManager{Censor: engine},
-	}
-	session := &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])}
+	d, _ := newCanonicalCensorRuntime(t, engine, 1)
 	message := &Message{
 		MessageType: "private",
 		Sender:      SenderBase{UserID: "user-1"},
@@ -989,7 +920,7 @@ func TestCensorThresholdWithoutLegacyLogStorageTriggersAndClears(t *testing.T) {
 	}
 
 	for index, wantTerminate := range []bool{false, true, false} {
-		mctx := &MsgContext{Dice: d, Session: session, MessageType: "private"}
+		mctx := &MsgContext{Dice: d, Session: d.ImSession, MessageType: "private"}
 		_, _, gotTerminate, _ := d.CensorMsg(mctx, message, message.Message, "")
 		if gotTerminate != wantTerminate {
 			t.Fatalf("CensorMsg() hit %d termination = %v, want %v", index+1, gotTerminate, wantTerminate)
@@ -1015,24 +946,7 @@ func TestCensorConcurrentMemoryThresholdsDoNotLoseHits(t *testing.T) {
 	if err := engine.Load(); err != nil {
 		t.Fatalf("load censor rules: %v", err)
 	}
-	manager := &CensorManager{Censor: engine}
-	d := &Dice{
-		Logger: zap.NewNop().Sugar(),
-		Config: Config{
-			CensorConfig: CensorConfig{
-				CensorThresholds: map[censor.Level]int{
-					censor.Ignore:  0,
-					censor.Notice:  0,
-					censor.Caution: 0,
-					censor.Warning: 0,
-					censor.Danger:  threshold,
-				},
-				CensorHandlers: make(map[censor.Level]uint8),
-			},
-		},
-		CensorManager: manager,
-	}
-	session := &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])}
+	d, manager := newCanonicalCensorRuntime(t, engine, threshold)
 	message := &Message{
 		MessageType: "private",
 		Sender:      SenderBase{UserID: "concurrent-user"},
@@ -1048,7 +962,7 @@ func TestCensorConcurrentMemoryThresholdsDoNotLoseHits(t *testing.T) {
 			defer workers.Done()
 			<-start
 			for range hitsPerWorker {
-				mctx := &MsgContext{Dice: d, Session: session, MessageType: "private"}
+				mctx := &MsgContext{Dice: d, Session: d.ImSession, MessageType: "private"}
 				_, _, shouldTerminate, _ := d.CensorMsg(mctx, message, message.Message, "")
 				if shouldTerminate {
 					terminated.Add(1)

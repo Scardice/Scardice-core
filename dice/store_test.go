@@ -598,10 +598,12 @@ func TestStoreBackendListReturnsEnabledAndDisabledBackends(t *testing.T) {
 
 	enabledURL := server.URL + "/dice/api/store"
 	disabledURL := server.URL + "/disabled/dice/api/store"
-	manager := NewStoreManager(&Dice{Config: Config{StoreConfig: StoreConfig{
-		BackendUrls:         []string{enabledURL + "/"},
-		DisabledBackendUrls: []string{disabledURL + "/"},
-	}}})
+	d, _ := newCanonicalTestDice(t)
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.BackendUrls = []string{enabledURL + "/"}
+		config.DisabledBackendUrls = []string{disabledURL + "/"}
+	})
+	manager := NewStoreManager(d)
 	backends := manager.StoreBackendList()
 	if len(backends) != 3 {
 		t.Fatalf("len(backends) = %d", len(backends))
@@ -618,33 +620,37 @@ func TestStoreBackendListReturnsEnabledAndDisabledBackends(t *testing.T) {
 }
 
 func TestStoreSetBackendEnabledMovesURLBetweenLists(t *testing.T) {
-	manager := NewStoreManager(&Dice{Config: Config{StoreConfig: StoreConfig{
-		BackendUrls: []string{
+	d, _ := newCanonicalTestDice(t)
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.BackendUrls = []string{
 			"https://enabled.example/dice/api/store",
 			"https://other.example/dice/api/store",
-		},
-	}}})
+		}
+	})
+	manager := NewStoreManager(d)
 
 	if err := manager.StoreSetBackendEnabled("", "https://enabled.example/dice/api/store", false); err != nil {
 		t.Fatalf("StoreSetBackendEnabled(false) error = %v", err)
 	}
-	if got := manager.parent.Config.BackendUrls; len(got) != 1 || got[0] != "https://other.example/dice/api/store" {
+	config := d.Config()
+	if got := config.BackendUrls; len(got) != 1 || got[0] != "https://other.example/dice/api/store" {
 		t.Fatalf("BackendUrls = %#v", got)
 	}
-	if got := manager.parent.Config.DisabledBackendUrls; len(got) != 1 || got[0] != "https://enabled.example/dice/api/store" {
+	if got := config.DisabledBackendUrls; len(got) != 1 || got[0] != "https://enabled.example/dice/api/store" {
 		t.Fatalf("DisabledBackendUrls = %#v", got)
 	}
 
 	if err := manager.StoreSetBackendEnabled("", "https://enabled.example/dice/api/store", true); err != nil {
 		t.Fatalf("StoreSetBackendEnabled(true) error = %v", err)
 	}
-	if got := manager.parent.Config.BackendUrls; len(got) != 2 ||
+	config = d.Config()
+	if got := config.BackendUrls; len(got) != 2 ||
 		got[0] != "https://other.example/dice/api/store" ||
 		got[1] != "https://enabled.example/dice/api/store" {
 		t.Fatalf("BackendUrls = %#v", got)
 	}
-	if len(manager.parent.Config.DisabledBackendUrls) != 0 {
-		t.Fatalf("DisabledBackendUrls = %#v, want empty", manager.parent.Config.DisabledBackendUrls)
+	if len(config.DisabledBackendUrls) != 0 {
+		t.Fatalf("DisabledBackendUrls = %#v, want empty", config.DisabledBackendUrls)
 	}
 }
 
@@ -662,14 +668,16 @@ func TestStoreSetBackendEnabledRejectsDisablingOnlyCustomBackendWithoutOfficial(
 
 	withOfficialStoreBackendBaseURL(t, "")
 
-	manager := NewStoreManager(&Dice{Config: Config{StoreConfig: StoreConfig{
-		BackendUrls: []string{customURL},
-	}}})
+	d, _ := newCanonicalTestDice(t)
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.BackendUrls = []string{customURL}
+	})
+	manager := NewStoreManager(d)
 
 	if err := manager.StoreSetBackendEnabled("", customURL, false); err == nil {
 		t.Fatal("expected disabling only custom backend to fail")
 	}
-	if got := manager.parent.Config.BackendUrls; len(got) != 1 || got[0] != customURL {
+	if got := d.Config().BackendUrls; len(got) != 1 || got[0] != customURL {
 		t.Fatalf("BackendUrls = %#v", got)
 	}
 }
@@ -688,17 +696,20 @@ func TestStoreSetBackendEnabledAllowsDisablingOnlyCustomBackendWithOfficial(t *t
 
 	withOfficialStoreBackendBaseURL(t, "https://official.example")
 
-	manager := NewStoreManager(&Dice{Config: Config{StoreConfig: StoreConfig{
-		BackendUrls: []string{customURL},
-	}}})
+	d, _ := newCanonicalTestDice(t)
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.BackendUrls = []string{customURL}
+	})
+	manager := NewStoreManager(d)
 
 	if err := manager.StoreSetBackendEnabled("", customURL, false); err != nil {
 		t.Fatalf("StoreSetBackendEnabled(false) error = %v", err)
 	}
-	if got := manager.parent.Config.BackendUrls; len(got) != 0 {
+	config := d.Config()
+	if got := config.BackendUrls; len(got) != 0 {
 		t.Fatalf("BackendUrls = %#v, want empty", got)
 	}
-	if got := manager.parent.Config.DisabledBackendUrls; len(got) != 1 || got[0] != customURL {
+	if got := config.DisabledBackendUrls; len(got) != 1 || got[0] != customURL {
 		t.Fatalf("DisabledBackendUrls = %#v", got)
 	}
 }

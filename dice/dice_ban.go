@@ -2,7 +2,6 @@ package dice
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -11,7 +10,9 @@ import (
 
 	"github.com/robfig/cron/v3"
 
-	"Scardice-core/dice/service"
+	"Scardice-core/core/configstate"
+	"Scardice-core/core/execution"
+	"Scardice-core/eventstore"
 )
 
 type BanRankType int
@@ -56,35 +57,33 @@ func (i *BanListInfoItem) toText(_ *Dice) string {
 	return ""
 }
 
+type banListRuntime struct {
+	noticeMu sync.Mutex
+	noticeAt map[blacklistedUserNoticeKey]time.Time
+	cronID   cron.EntryID
+}
+
 type BanListInfo struct {
-	Parent                                 *Dice                              `json:"-"                                      yaml:"-"`
-	Map                                    *SyncMap[string, *BanListInfoItem] `json:"-"                                      yaml:"-"`
-	BanBehaviorRefuseReply                 bool                               `json:"banBehaviorRefuseReply"                 yaml:"banBehaviorRefuseReply"`                 // 拉黑行为: 拒绝回复
-	BanBehaviorRefuseInvite                bool                               `json:"banBehaviorRefuseInvite"                yaml:"banBehaviorRefuseInvite"`                // 拉黑行为: 拒绝邀请
-	BanBehaviorQuitLastPlace               bool                               `json:"banBehaviorQuitLastPlace"               yaml:"banBehaviorQuitLastPlace"`               // 拉黑行为: 退出事发群
-	BanBehaviorQuitPlaceImmediately        bool                               `json:"banBehaviorQuitPlaceImmediately"        yaml:"banBehaviorQuitPlaceImmediately"`        // 拉黑行为: 使用时立即退出群
-	BanBehaviorQuitIfAdmin                 bool                               `json:"banBehaviorQuitIfAdmin"                 yaml:"banBehaviorQuitIfAdmin"`                 // 拉黑行为: 邀请者以上权限使用时立即退群，否则发出警告信息
-	BanBehaviorQuitIfAdminSilentIfNotAdmin bool                               `json:"banBehaviorQuitIfAdminSilentIfNotAdmin" yaml:"banBehaviorQuitIfAdminSilentIfNotAdmin"` // 拉黑行为: 邀请者以上权限使用时立即退群，否则仅拒绝回复
-	ThresholdWarn                          int64                              `json:"thresholdWarn"                          yaml:"thresholdWarn"`                          // 警告阈值
-	ThresholdBan                           int64                              `json:"thresholdBan"                           yaml:"thresholdBan"`                           // 错误阈值
-	AutoBanMinutes                         int64                              `json:"autoBanMinutes"                         yaml:"autoBanMinutes"`                         // 自动禁止时长
+	source                                 configViewSource
+	Parent                                 *Dice   `json:"-"                                      yaml:"-"`
+	BanBehaviorRefuseReply                 bool    `json:"banBehaviorRefuseReply"                 yaml:"banBehaviorRefuseReply"`                 // 拉黑行为: 拒绝回复
+	BanBehaviorRefuseInvite                bool    `json:"banBehaviorRefuseInvite"                yaml:"banBehaviorRefuseInvite"`                // 拉黑行为: 拒绝邀请
+	BanBehaviorQuitLastPlace               bool    `json:"banBehaviorQuitLastPlace"               yaml:"banBehaviorQuitLastPlace"`               // 拉黑行为: 退出事发群
+	BanBehaviorQuitPlaceImmediately        bool    `json:"banBehaviorQuitPlaceImmediately"        yaml:"banBehaviorQuitPlaceImmediately"`        // 拉黑行为: 使用时立即退出群
+	BanBehaviorQuitIfAdmin                 bool    `json:"banBehaviorQuitIfAdmin"                 yaml:"banBehaviorQuitIfAdmin"`                 // 拉黑行为: 邀请者以上权限使用时立即退群，否则发出警告信息
+	BanBehaviorQuitIfAdminSilentIfNotAdmin bool    `json:"banBehaviorQuitIfAdminSilentIfNotAdmin" yaml:"banBehaviorQuitIfAdminSilentIfNotAdmin"` // 邀请者以上权限使用时立即退群，否则仅拒绝回复
+	ThresholdWarn                          int64   `json:"thresholdWarn"                          yaml:"thresholdWarn"`                          // 警告阈值
+	ThresholdBan                           int64   `json:"thresholdBan"                           yaml:"thresholdBan"`                           // 错误阈值
+	AutoBanMinutes                         int64   `json:"autoBanMinutes"                         yaml:"autoBanMinutes"`                         // 自动禁止时长
+	ScoreReducePerMinute                   int64   `json:"scoreReducePerMinute"                   yaml:"scoreReducePerMinute"`
+	ScoreGroupMuted                        int64   `json:"scoreGroupMuted"                        yaml:"scoreGroupMuted"`
+	ScoreGroupKicked                       int64   `json:"scoreGroupKicked"                       yaml:"scoreGroupKicked"`
+	ScoreTooManyCommand                    int64   `json:"scoreTooManyCommand"                    yaml:"scoreTooManyCommand"`
+	BanNotifyIntervalMinutes               int64   `json:"banNotifyIntervalMinutes"               yaml:"banNotifyIntervalMinutes"`
+	JointScorePercentOfGroup               float64 `json:"jointScorePercentOfGroup"               yaml:"jointScorePercentOfGroup"`
+	JointScorePercentOfInviter             float64 `json:"jointScorePercentOfInviter"             yaml:"jointScorePercentOfInviter"`
 
-	ScoreReducePerMinute     int64 `json:"scoreReducePerMinute" yaml:"scoreReducePerMinute"`         // 每分钟下降
-	ScoreGroupMuted          int64 `json:"scoreGroupMuted"      yaml:"scoreGroupMuted"`              // 群组禁言
-	ScoreGroupKicked         int64 `json:"scoreGroupKicked"     yaml:"scoreGroupKicked"`             // 群组踢出
-	ScoreTooManyCommand      int64 `json:"scoreTooManyCommand"  yaml:"scoreTooManyCommand"`          // 刷指令
-	BanNotifyIntervalMinutes int64 `json:"banNotifyIntervalMinutes" yaml:"banNotifyIntervalMinutes"` // 同一用户同一群内通报间隔；0 为默认 20 分钟，负数表示每次通报
-
-	JointScorePercentOfGroup   float64 `json:"jointScorePercentOfGroup"   yaml:"jointScorePercentOfGroup"`   // 群组连带责任
-	JointScorePercentOfInviter float64 `json:"jointScorePercentOfInviter" yaml:"jointScorePercentOfInviter"` // 邀请人连带责任
-
-	banNoticeMu sync.Mutex                             `json:"-" yaml:"-"`
-	banNoticeAt map[blacklistedUserNoticeKey]time.Time `json:"-" yaml:"-"`
-	// SyncMap protects map operations; itemsMu protects mutable item values.
-	itemsMu            sync.RWMutex `json:"-" yaml:"-"`
-	persistenceMu      sync.Mutex   `json:"-" yaml:"-"`
-	persistenceLoadErr error        `json:"-" yaml:"-"`
-	cronID             cron.EntryID `json:"-" yaml:"-"`
+	runtime *banListRuntime `json:"-" yaml:"-"`
 }
 
 func (i *BanListInfo) Init() {
@@ -104,13 +103,75 @@ func (i *BanListInfo) Init() {
 
 	i.JointScorePercentOfGroup = 0.5
 	i.JointScorePercentOfInviter = 0.3
-	i.Map = new(SyncMap[string, *BanListInfoItem])
-	i.banNoticeAt = map[blacklistedUserNoticeKey]time.Time{}
+	if i.runtime == nil {
+		i.runtime = &banListRuntime{noticeAt: map[blacklistedUserNoticeKey]time.Time{}}
+	}
+}
+
+func (i *BanListInfo) cloneReadView(owner *Dice) *BanListInfo {
+	if i == nil {
+		return nil
+	}
+	cloned := *i
+	cloned.Parent = owner
+	if cloned.runtime == nil {
+		cloned.runtime = &banListRuntime{noticeAt: map[blacklistedUserNoticeKey]time.Time{}}
+	}
+	return &cloned
+}
+
+func banListSettingsFromState(parent *Dice, state configstate.State) BanListInfo {
+	return BanListInfo{
+		Parent:                                 parent,
+		BanBehaviorRefuseReply:                 state.Ban.RefuseReply,
+		BanBehaviorRefuseInvite:                state.Ban.RefuseInvite,
+		BanBehaviorQuitLastPlace:               state.Ban.QuitLastPlace,
+		BanBehaviorQuitPlaceImmediately:        state.Ban.QuitPlaceImmediately,
+		BanBehaviorQuitIfAdmin:                 state.Ban.QuitIfAdmin,
+		BanBehaviorQuitIfAdminSilentIfNotAdmin: state.Ban.QuitIfAdminSilentIfNotAdmin,
+		ThresholdWarn:                          state.Ban.ThresholdWarn,
+		ThresholdBan:                           state.Ban.ThresholdBan,
+		AutoBanMinutes:                         state.Ban.AutoBanMinutes,
+		ScoreReducePerMinute:                   state.Ban.ScoreReducePerMinute,
+		ScoreGroupMuted:                        state.Ban.ScoreGroupMuted,
+		ScoreGroupKicked:                       state.Ban.ScoreGroupKicked,
+		ScoreTooManyCommand:                    state.Ban.ScoreTooManyCommand,
+		BanNotifyIntervalMinutes:               state.Ban.BanNotifyIntervalMinutes,
+		JointScorePercentOfGroup:               state.Ban.JointScorePercentOfGroup,
+		JointScorePercentOfInviter:             state.Ban.JointScorePercentOfInviter,
+	}
+}
+
+func (i *BanListInfo) settingsForTransaction(
+	ctx context.Context,
+	transaction *DurableCallbackTransaction,
+) (BanListInfo, error) {
+	if i == nil || i.Parent == nil || transaction == nil {
+		return BanListInfo{}, execution.ErrDomainTxUnavailable
+	}
+	participant, _, err := i.Parent.configOwner(ctx, transaction.Domain())
+	if err != nil {
+		return BanListInfo{}, err
+	}
+	return banListSettingsFromState(i.Parent, participant.state), nil
+}
+
+func (i *BanListInfo) settingsForContext(ctx *MsgContext) (BanListInfo, error) {
+	if i == nil || i.Parent == nil {
+		return BanListInfo{}, execution.ErrDomainTxUnavailable
+	}
+	if ctx != nil && ctx.callbackTransaction != nil {
+		if ctx.Dice != nil && ctx.Dice != i.Parent {
+			return BanListInfo{}, errors.New("ban list message context belongs to another dice")
+		}
+		return i.settingsForTransaction(ctx.domainContext(), ctx.callbackTransaction)
+	}
+	return *i, nil
 }
 
 func (i *BanListInfo) Loads() {
 	if err := i.LoadsWithError(); err != nil && i != nil && i.Parent != nil && i.Parent.Logger != nil {
-		i.Parent.Logger.Errorf("黑白名单加载失败: %v", err)
+		i.Parent.Logger.Errorf("黑白名单读取校验失败: %v", err)
 	}
 }
 
@@ -119,108 +180,158 @@ func (i *BanListInfo) LoadsWithError() error {
 		return nil
 	}
 	repository, err := newModerationBanRepository(i.Parent)
-	if err == nil {
-		var loaded map[string]*BanListInfoItem
-		loaded, err = repository.load(context.Background())
-		if err == nil {
-			i.itemsMu.Lock()
-			if i.Map == nil {
-				i.Map = new(SyncMap[string, *BanListInfoItem])
-			}
-			i.Map.Range(func(id string, _ *BanListInfoItem) bool {
-				i.Map.Delete(id)
-				return true
-			})
-			for id, item := range loaded {
-				i.Map.Store(id, item)
-			}
-			i.itemsMu.Unlock()
-		}
+	if err != nil {
+		return err
 	}
-	i.persistenceMu.Lock()
-	i.persistenceLoadErr = err
-	i.persistenceMu.Unlock()
+	_, err = repository.load(context.Background())
 	return err
 }
 
 func (i *BanListInfo) AfterLoads() {
+	if i == nil {
+		return
+	}
+	if i.runtime == nil {
+		i.runtime = &banListRuntime{noticeAt: map[blacklistedUserNoticeKey]time.Time{}}
+	}
 	d := i.Parent
 	if d == nil || d.Parent == nil || d.Parent.Cron == nil {
 		return
 	}
-	i.cronID, _ = d.Parent.Cron.AddFunc("@every 1m", func() {
-		i.cleanupBlacklistedUserNotices(time.Now())
-		if d.DBOperator == nil && d.DurableStore == nil {
+	i.runtime.noticeMu.Lock()
+	if i.runtime.cronID != 0 {
+		i.runtime.noticeMu.Unlock()
+		return
+	}
+	entryID, err := d.Parent.Cron.AddFunc("@every 1m", func() {
+		view := d.currentConfigView()
+		if view == nil || view.config.BanList == nil {
 			return
 		}
-		now := time.Now().Unix()
-		if d.DurableStore != nil {
-			_, err := i.decayEventSourced(d, now)
-			if err != nil && d.Logger != nil {
-				d.Logger.Errorf("黑白名单衰减失败: %v", err)
-			}
-			return
-		}
-		changed, _, err := i.decayScoresWithDelete(now, func(id string) error {
-			return service.BanItemDel(d.DBOperator, id)
-		})
-		if err != nil && d.Logger != nil {
-			d.Logger.Errorf("黑白名单衰减失败: %v", err)
-		}
-		if changed {
-			if err = i.SaveChangedWithError(d); err != nil && d.Logger != nil {
-				d.Logger.Errorf("黑白名单保存失败: %v", err)
-			}
+		current := view.config.BanList
+		current.cleanupBlacklistedUserNotices(time.Now())
+		_, decayErr := current.decayEventSourced(d, time.Now().Unix())
+		if decayErr != nil && d.Logger != nil {
+			d.Logger.Errorf("黑白名单衰减失败: %v", decayErr)
 		}
 	})
+	if err == nil {
+		i.runtime.cronID = entryID
+	}
+	i.runtime.noticeMu.Unlock()
 }
 
-func (i *BanListInfo) decayScores(now int64) (bool, []string) {
-	changed, toDelete, _ := i.decayScoresWithDelete(now, nil)
-	return changed, toDelete
-}
-
-func (i *BanListInfo) decayScoresWithDelete(now int64, deleteItem func(string) error) (bool, []string, error) {
-	if i == nil {
-		return false, nil, nil
+func (i *BanListInfo) decayEventSourced(d *Dice, now int64) (bool, error) {
+	if i == nil || d == nil || d.DurableStore == nil {
+		return false, nil
 	}
-	i.itemsMu.Lock()
-	defer i.itemsMu.Unlock()
-	if i.Map == nil {
-		return false, nil, nil
+	repository, err := newModerationBanRepository(d)
+	if err != nil {
+		return false, err
 	}
-	var (
-		toDelete []string
-		changed  bool
-		saveErr  error
-	)
-	i.Map.Range(func(id string, item *BanListInfoItem) bool {
-		if item == nil || (item.Rank != BanRankNormal && item.Rank != BanRankWarn) {
-			return true
+	items, err := repository.load(context.Background())
+	if err != nil {
+		return false, err
+	}
+	subjects := make([]string, 0, len(items))
+	for id, item := range items {
+		if item != nil && (item.Rank == BanRankNormal || item.Rank == BanRankWarn) {
+			subjects = append(subjects, id)
 		}
-		previousScore, previousUpdatedAt := item.Score, item.UpdatedAt
-		item.Score -= i.ScoreReducePerMinute
-		scoreChanged := item.Score != previousScore
-		if scoreChanged {
-			item.UpdatedAt = now
+	}
+	if len(subjects) == 0 {
+		return false, nil
+	}
+	changed := false
+	request := struct {
+		At       int64    `json:"at"`
+		Subjects []string `json:"subjects"`
+	}{now, subjects}
+	err = d.withFreshDomainExecution(context.Background(), "moderation-decay", request, func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		if validateErr := i.validateConfigSource(context.Background(), transaction); validateErr != nil {
+			return validateErr
 		}
-		if item.Score > 0 {
-			changed = changed || scoreChanged
-			return true
+		settings, settingsErr := i.settingsForTransaction(context.Background(), transaction)
+		if settingsErr != nil {
+			return settingsErr
 		}
-		if deleteItem != nil {
-			if err := deleteItem(id); err != nil {
-				item.Score, item.UpdatedAt = previousScore, previousUpdatedAt
-				saveErr = errors.Join(saveErr, err)
-				return true
+		if settings.ScoreReducePerMinute == 0 {
+			return nil
+		}
+		for _, subjectID := range subjects {
+			item, exists, readErr := d.ModerationItemForDomain(context.Background(), transaction.Domain(), subjectID)
+			if readErr != nil {
+				return readErr
 			}
+			if !exists || (item.Rank != BanRankNormal && item.Rank != BanRankWarn) {
+				continue
+			}
+			nextScore := item.Score - settings.ScoreReducePerMinute
+			if nextScore <= 0 {
+				if deleteErr := d.ContributeModerationDelete(context.Background(), transaction.Domain(), metadata, subjectID); deleteErr != nil {
+					return deleteErr
+				}
+			} else {
+				if updateErr := d.ContributeModerationMutation(context.Background(), transaction.Domain(), metadata, subjectID, func(current *BanListInfoItem, exists bool) error {
+					if !exists || (current.Rank != BanRankNormal && current.Rank != BanRankWarn) {
+						return nil
+					}
+					current.Score -= settings.ScoreReducePerMinute
+					current.UpdatedAt = now
+					return nil
+				}); updateErr != nil {
+					return updateErr
+				}
+			}
+			changed = true
 		}
-		toDelete = append(toDelete, id)
-		i.Map.Delete(id)
-		changed = true
-		return true
+		return nil
 	})
-	return changed, toDelete, saveErr
+	return changed && err == nil, err
+}
+
+func (i *BanListInfo) validateConfigSource(ctx context.Context, transaction *DurableCallbackTransaction) error {
+	if i == nil || i.Parent == nil || transaction == nil {
+		return execution.ErrDomainTxUnavailable
+	}
+	participant, _, err := i.Parent.configOwner(ctx, transaction.Domain())
+	if err != nil {
+		return err
+	}
+	if !configSourceMatchesParticipant(i.source, participant) {
+		return ErrConfigViewChanged
+	}
+	return nil
+}
+
+func (i *BanListInfo) runMutation(
+	ctx context.Context,
+	message *MsgContext,
+	operation string,
+	request any,
+	run func(context.Context, *DurableCallbackTransaction, eventstore.Metadata) error,
+) error {
+	if i == nil || i.Parent == nil {
+		return errors.New("ban list parent is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if message != nil && message.Dice != nil && message.Dice != i.Parent {
+		return errors.New("ban list message context belongs to another dice")
+	}
+	runValidated := func(callCtx context.Context, transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		if err := i.validateConfigSource(callCtx, transaction); err != nil {
+			return err
+		}
+		return run(callCtx, transaction, metadata)
+	}
+	if message != nil && message.callbackTransaction != nil {
+		return runValidated(message.domainContext(), message.callbackTransaction, message.callbackMetadata)
+	}
+	return i.Parent.withFreshDomainExecution(ctx, operation, request, func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		return runValidated(ctx, transaction, metadata)
+	})
 }
 
 // AddScoreBase
@@ -237,9 +348,6 @@ func (i *BanListInfo) AddScoreBaseWithError(uid string, score int64, place strin
 	if i == nil || i.Parent == nil || uid == "" {
 		return nil, errors.New("ban list, parent, and ID are required")
 	}
-	if err := i.PersistenceError(); err != nil {
-		return nil, err
-	}
 	d := i.Parent
 	name := ""
 	if d.Parent != nil {
@@ -249,118 +357,148 @@ func (i *BanListInfo) AddScoreBaseWithError(uid string, score int64, place strin
 		}
 	}
 	now := time.Now().Unix()
-
-	i.itemsMu.Lock()
-	if i.Map == nil {
-		i.Map = new(SyncMap[string, *BanListInfoItem])
-	}
-	item, _ := i.Map.Load(uid)
-	if item == nil {
-		item = &BanListInfoItem{ID: uid}
-	} else {
-		item = cloneBanListItem(item)
-	}
-	item.Score += score
-	item.Name = name
-	item.Places = append(item.Places, place)
-	item.Reasons = append(item.Reasons, reason)
-	item.Times = append(item.Times, now)
-	oldRank := item.Rank
-	removeFriend := false
-
-	switch item.Rank {
-	case BanRankTrusted, BanRankBanned: /* no-op */
-	case BanRankNormal, BanRankWarn:
-		if item.Score < i.ThresholdWarn {
-			item.Rank = BanRankNormal
+	var (
+		updatedItem  *BanListInfoItem
+		removeFriend bool
+	)
+	request := struct {
+		SubjectID string `json:"subjectId"`
+		Score     int64  `json:"score"`
+		Place     string `json:"place"`
+		Reason    string `json:"reason"`
+		At        int64  `json:"at"`
+	}{uid, score, place, reason, now}
+	err := i.runMutation(context.Background(), ctx, "moderation-score", request, func(callCtx context.Context, transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		settings, settingsErr := i.settingsForTransaction(callCtx, transaction)
+		if settingsErr != nil {
+			return settingsErr
 		}
-		if item.Score >= i.ThresholdWarn {
-			item.Rank = BanRankWarn
-		}
-		if item.Score >= i.ThresholdBan {
-			item.Rank = BanRankBanned
-			item.BanTime = now
-			removeFriend = ctx != nil && ctx.EndPoint != nil && ctx.EndPoint.Platform == "QQ"
-		}
-		if oldRank != item.Rank {
-			item.BanUpdatedAt = now
-		}
-	}
-	item.UpdatedAt = now
-
-	if d.DurableStore != nil {
-		repository, err := newModerationBanRepository(d)
-		if err == nil {
-			err = repository.save(context.Background(), item)
-		}
+		err := d.ContributeModerationMutation(callCtx, transaction.Domain(), metadata, uid, func(item *BanListInfoItem, _ bool) error {
+			item.Score += score
+			item.Name = name
+			item.Places = append(item.Places, place)
+			item.Reasons = append(item.Reasons, reason)
+			item.Times = append(item.Times, now)
+			oldRank := item.Rank
+			switch item.Rank {
+			case BanRankTrusted, BanRankBanned:
+			case BanRankNormal, BanRankWarn:
+				if item.Score < settings.ThresholdWarn {
+					item.Rank = BanRankNormal
+				}
+				if item.Score >= settings.ThresholdWarn {
+					item.Rank = BanRankWarn
+				}
+				if item.Score >= settings.ThresholdBan {
+					item.Rank = BanRankBanned
+					item.BanTime = now
+					removeFriend = ctx != nil && ctx.EndPoint != nil && ctx.EndPoint.Platform == "QQ"
+				}
+				if oldRank != item.Rank {
+					item.BanUpdatedAt = now
+				}
+			}
+			item.UpdatedAt = now
+			updatedItem = cloneBanListItem(item)
+			return nil
+		})
 		if err != nil {
-			i.itemsMu.Unlock()
-			return nil, err
+			return err
 		}
-	} else if d.DBOperator != nil {
-		if err := persistSQLBanListItem(d, item); err != nil {
-			i.itemsMu.Unlock()
-			return nil, err
+		if removeFriend {
+			if err = transaction.AfterCommit(func() {
+				if adapter, ok := ctx.EndPoint.Adapter.(interface {
+					DeleteFriend(ctx *MsgContext, id string)
+				}); ok {
+					adapter.DeleteFriend(ctx, uid)
+				} else if d.Logger != nil {
+					d.Logger.Warn("当前 QQ 适配器不支持删除好友")
+				}
+			}); err != nil {
+				return err
+			}
 		}
-		item.UpdatedAt = 0
-	}
-	i.Map.Store(uid, item)
-	updatedItem := cloneBanListItem(item)
-	i.itemsMu.Unlock()
-
-	if removeFriend {
-		if adapter, ok := ctx.EndPoint.Adapter.(interface {
-			DeleteFriend(ctx *MsgContext, id string)
-		}); ok {
-			adapter.DeleteFriend(ctx, uid)
-		} else if d.Logger != nil {
-			d.Logger.Warn("当前 QQ 适配器不支持删除好友")
-		}
-	}
-	if ctx != nil {
-		// 警告: XXX 因为等行为，进入警告列表
-		// 黑名单: XXX 因为等行为，进入黑名单。将作出以下惩罚：拒绝回复、拒绝邀请、退出事发群
-		// TODO
-		//nolint:forbidigo // that is a todo
-		fmt.Println("TODO Alert")
-	}
-	return updatedItem, nil
+		return nil
+	})
+	return updatedItem, err
 }
 
-// 返回连带责任人
-func (i *BanListInfo) addJointScore(_ string, score int64, place string, reason string, ctx *MsgContext) (string, BanRankType) {
-	d := i.Parent
-	if i.JointScorePercentOfGroup > 0 {
-		score := i.JointScorePercentOfGroup * float64(score)
-		i.AddScoreBase(place, int64(score), place, reason, ctx)
+func (i *BanListInfo) addJointScoreWithError(score int64, place string, reason string, ctx *MsgContext) (string, BanRankType, error) {
+	settings, err := i.settingsForContext(ctx)
+	if err != nil {
+		return "", BanRankNormal, err
 	}
-	if i.JointScorePercentOfInviter > 0 {
-		groupInfo, ok := d.ImSession.ServiceAtNew.Load(place)
-		if ok && groupInfo.InviteUserID != "" {
-			rank := i.NoticeCheckPrepare(groupInfo.InviteUserID)
-			score := i.JointScorePercentOfInviter * float64(score)
-			i.AddScoreBase(groupInfo.InviteUserID, int64(score), place, reason, ctx)
-
-			// text := fmt.Sprintf("提醒: 你邀请的骰子在群组<%s>中被禁言/踢出/指令刷屏了", groupInfo.GroupName)
-			// ReplyPersonRaw(ctx, &Message{Sender: SenderBase{UserId: groupInfo.InviteUserId}}, text, "")
-			return groupInfo.InviteUserID, rank
+	if settings.JointScorePercentOfGroup > 0 {
+		groupScore := settings.JointScorePercentOfGroup * float64(score)
+		if _, err := i.AddScoreBaseWithError(place, int64(groupScore), place, reason, ctx); err != nil {
+			return "", BanRankNormal, err
 		}
 	}
-	return "", BanRankNormal
+	if settings.JointScorePercentOfInviter > 0 && ctx != nil && ctx.Group != nil && ctx.Group.GroupID() == place {
+		inviterID := ctx.Group.InviteUserID()
+		if inviterID != "" {
+			rank, rankErr := i.noticeRankForContext(ctx, inviterID)
+			if rankErr != nil {
+				return "", BanRankNormal, rankErr
+			}
+			inviterScore := settings.JointScorePercentOfInviter * float64(score)
+			if _, err := i.AddScoreBaseWithError(inviterID, int64(inviterScore), place, reason, ctx); err != nil {
+				return "", BanRankNormal, err
+			}
+			return inviterID, rank, nil
+		}
+	}
+	return "", BanRankNormal, nil
+}
+func (i *BanListInfo) noticeRankForContext(ctx *MsgContext, uid string) (BanRankType, error) {
+	item, ok, err := i.GetByIDForContext(ctx, uid)
+	if err != nil {
+		return BanRankNormal, err
+	}
+	if ok {
+		return item.Rank, nil
+	}
+	return BanRankNormal, nil
 }
 
 func (i *BanListInfo) NoticeCheckPrepare(uid string) BanRankType {
-	item, ok := i.GetByID(uid)
-	if ok {
-		return item.Rank
+	return i.NoticeCheckPrepareForContext(nil, uid)
+}
+
+func (i *BanListInfo) NoticeCheckPrepareForContext(ctx *MsgContext, uid string) BanRankType {
+	rank, err := i.noticeRankForContext(ctx, uid)
+	if err != nil {
+		if ctx != nil {
+			ctx.setExecutionError(err)
+		}
+		if i != nil && i.Parent != nil && i.Parent.Logger != nil {
+			i.Parent.Logger.Errorf("黑白名单读取失败: %v", err)
+		}
+		return BanRankNormal
 	}
-	return BanRankNormal
+	return rank
 }
 
 func (i *BanListInfo) NoticeCheck(uid string, place string, oldRank BanRankType, ctx *MsgContext) BanRankType {
 	log := i.Parent.Logger
-	item, ok := i.GetByID(uid)
+	item, ok, err := i.GetByIDForContext(ctx, uid)
+	if err != nil {
+		if ctx != nil {
+			ctx.setExecutionError(err)
+		}
+		return 0
+	}
 	if !ok {
+		return 0
+	}
+	settings, settingsErr := i.settingsForContext(ctx)
+	if settingsErr != nil {
+		if ctx != nil {
+			ctx.setExecutionError(settingsErr)
+		}
+		if log != nil {
+			log.Errorf("读取黑名单设置失败: %v", settingsErr)
+		}
 		return 0
 	}
 
@@ -373,10 +511,17 @@ func (i *BanListInfo) NoticeCheck(uid string, place string, oldRank BanRankType,
 	log.Info(txt)
 
 	// If user is banned and we should quit immediately, do it first before sending notifications
-	if curRank == BanRankBanned && i.BanBehaviorQuitLastPlace && ctx != nil {
+	if curRank == BanRankBanned && settings.BanBehaviorQuitLastPlace && ctx != nil {
 		var isWhiteGroup bool
 		d := ctx.Dice
-		value, exists := (&d.Config).BanList.GetByID(place)
+		value, exists, readErr := i.GetByIDForContext(ctx, place)
+		if readErr != nil {
+			ctx.setExecutionError(readErr)
+			if log != nil {
+				log.Errorf("读取事发群信任状态失败: %v", readErr)
+			}
+			return 0
+		}
 		if exists && value.Rank == BanRankTrusted {
 			isWhiteGroup = true
 		}
@@ -391,6 +536,7 @@ func (i *BanListInfo) NoticeCheck(uid string, place string, oldRank BanRankType,
 				time.Sleep(1 * time.Second)
 			}
 			if err := QuitGroup(ctx, place); err != nil {
+				ctx.setExecutionError(err)
 				d.Logger.Errorf("黑名单触发退群请求提交失败: group=%s error=%v", place, err)
 			}
 			return 0
@@ -403,7 +549,14 @@ func (i *BanListInfo) NoticeCheck(uid string, place string, oldRank BanRankType,
 		ctx.Notice(txt, NoticeTypeBan)
 
 		if ctx.Player == nil {
-			ctx.Player = &GroupPlayerInfo{} // 为了能存 $t 变量，God bless this design
+			diceID, playerName := "", ""
+			if ctx.Dice != nil {
+				diceID = ctx.Dice.BaseConfig.Name
+			}
+			if i.Parent != nil && i.Parent.Parent != nil {
+				playerName = i.Parent.Parent.TryGetUserName(uid)
+			}
+			ctx.Player = newDetachedGroupPlayerInfo(diceID, place, uid, playerName)
 		}
 
 		VarSetValueStr(ctx, "$t黑名单事件", txt)
@@ -423,88 +576,140 @@ func (i *BanListInfo) NoticeCheck(uid string, place string, oldRank BanRankType,
 
 		// 发给邀请者
 		time.Sleep(1 * time.Second)
-		groupInfo, ok := i.Parent.ImSession.ServiceAtNew.Load(place)
-		if ok && groupInfo.InviteUserID != "" {
-			VarSetValueStr(ctx, "$t事发群名", groupInfo.GroupName)
-			VarSetValueStr(ctx, "$t事发群号", groupInfo.GroupID)
-			text := DiceFormatTmpl(ctx, "核心:黑名单触发_邀请人")
-			ReplyPersonRaw(ctx, &Message{Sender: SenderBase{UserID: groupInfo.InviteUserID}}, text, "")
+		if ctx.Group != nil && ctx.Group.GroupID() == place {
+			inviterID := ctx.Group.InviteUserID()
+			if inviterID != "" {
+				VarSetValueStr(ctx, "$t事发群名", ctx.Group.GroupName())
+				VarSetValueStr(ctx, "$t事发群号", ctx.Group.GroupID())
+				text := DiceFormatTmpl(ctx, "核心:黑名单触发_邀请人")
+				ReplyPersonRaw(ctx, &Message{Sender: SenderBase{UserID: inviterID}}, text, "")
+			}
 		}
 	}
 
 	return 0
 }
 
-// AddScoreByGroupMuted 群组禁言
-func (i *BanListInfo) AddScoreByGroupMuted(uid string, place string, ctx *MsgContext) {
-	rank := i.NoticeCheckPrepare(uid)
-
-	i.AddScoreBase(uid, i.ScoreGroupMuted, place, "禁言骰子", ctx)
-	inviterID, inviterRank := i.addJointScore(uid, i.ScoreGroupMuted, place, "连带责任:禁言骰子", ctx)
-
+func (i *BanListInfo) addScoreWithJointAndNotice(
+	uid string,
+	score int64,
+	place, reason, jointReason string,
+	ctx *MsgContext,
+) error {
+	rank, err := i.noticeRankForContext(ctx, uid)
+	if err != nil {
+		return err
+	}
+	if _, err := i.AddScoreBaseWithError(uid, score, place, reason, ctx); err != nil {
+		return err
+	}
+	inviterID, inviterRank, err := i.addJointScoreWithError(score, place, jointReason, ctx)
+	if err != nil {
+		return err
+	}
 	i.NoticeCheck(uid, place, rank, ctx)
 	if inviterID != "" && inviterID != uid {
-		// 如果连带责任人与操作者不是同一人，进行单独计算
 		i.NoticeCheck(inviterID, place, inviterRank, ctx)
 	}
+	if ctx != nil {
+		if err = ctx.getExecutionError(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// AddScoreByGroupMuted 群组禁言
+func (i *BanListInfo) AddScoreByGroupMuted(uid string, place string, ctx *MsgContext) {
+	if err := i.AddScoreByGroupMutedForContext(uid, place, ctx); err != nil && i != nil && i.Parent != nil && i.Parent.Logger != nil {
+		i.Parent.Logger.Errorf("黑白名单禁言评分失败: %v", err)
+	}
+}
+
+func (i *BanListInfo) AddScoreByGroupMutedForContext(uid string, place string, ctx *MsgContext) error {
+	settings, err := i.settingsForContext(ctx)
+	if err != nil {
+		return err
+	}
+	return i.addScoreWithJointAndNotice(uid, settings.ScoreGroupMuted, place, "禁言骰子", "连带责任:禁言骰子", ctx)
 }
 
 // AddScoreByGroupKicked 群组踢出
 func (i *BanListInfo) AddScoreByGroupKicked(uid string, place string, ctx *MsgContext) {
-	rank := i.NoticeCheckPrepare(uid)
-
-	i.AddScoreBase(uid, i.ScoreGroupKicked, place, "踢出骰子", ctx)
-	inviterID, inviterRank := i.addJointScore(uid, i.ScoreGroupKicked, place, "连带责任:踢出骰子", ctx)
-
-	i.NoticeCheck(uid, place, rank, ctx)
-	if inviterID != "" && inviterID != uid {
-		// 如果连带责任人与操作者不是同一人，进行单独计算
-		i.NoticeCheck(inviterID, place, inviterRank, ctx)
+	if err := i.AddScoreByGroupKickedForContext(uid, place, ctx); err != nil && i != nil && i.Parent != nil && i.Parent.Logger != nil {
+		i.Parent.Logger.Errorf("黑白名单踢出评分失败: %v", err)
 	}
+}
+
+func (i *BanListInfo) AddScoreByGroupKickedForContext(uid string, place string, ctx *MsgContext) error {
+	settings, err := i.settingsForContext(ctx)
+	if err != nil {
+		return err
+	}
+	return i.addScoreWithJointAndNotice(uid, settings.ScoreGroupKicked, place, "踢出骰子", "连带责任:踢出骰子", ctx)
 }
 
 // AddScoreByCommandSpam 指令刷屏
 func (i *BanListInfo) AddScoreByCommandSpam(uid string, place string, ctx *MsgContext) {
-	rank := i.NoticeCheckPrepare(uid)
-
-	i.AddScoreBase(uid, i.ScoreTooManyCommand, place, "指令刷屏", ctx)
-	inviterID, inviterRank := i.addJointScore(uid, i.ScoreTooManyCommand, place, "连带责任:指令刷屏", ctx)
-
-	i.NoticeCheck(uid, place, rank, ctx)
-	if inviterID != "" && inviterID != uid {
-		// 如果连带责任人与操作者不是同一人，进行单独计算
-		i.NoticeCheck(inviterID, place, inviterRank, ctx)
+	if err := i.AddScoreByCommandSpamForContext(uid, place, ctx); err != nil && i != nil && i.Parent != nil && i.Parent.Logger != nil {
+		i.Parent.Logger.Errorf("黑白名单刷屏评分失败: %v", err)
 	}
+}
+
+func (i *BanListInfo) AddScoreByCommandSpamForContext(uid string, place string, ctx *MsgContext) error {
+	settings, err := i.settingsForContext(ctx)
+	if err != nil {
+		return err
+	}
+	return i.addScoreWithJointAndNotice(uid, settings.ScoreTooManyCommand, place, "指令刷屏", "连带责任:指令刷屏", ctx)
 }
 
 // AddScoreByCensor 敏感词审查
 func (i *BanListInfo) AddScoreByCensor(uid string, score int64, place string, level string, ctx *MsgContext) {
-	rank := i.NoticeCheckPrepare(uid)
-
-	i.AddScoreBase(uid, score, place, "触发<"+level+">敏感词", ctx)
-	inviterID, inviterRank := i.addJointScore(uid, score, place, "连带责任:触发<"+level+">敏感词", ctx)
-
-	i.NoticeCheck(uid, place, rank, ctx)
-	if inviterID != "" && inviterID != uid {
-		// 如果连带责任人与操作者不是同一人，进行单独计算
-		i.NoticeCheck(inviterID, place, inviterRank, ctx)
+	if err := i.AddScoreByCensorForContext(uid, score, place, level, ctx); err != nil && i != nil && i.Parent != nil && i.Parent.Logger != nil {
+		i.Parent.Logger.Errorf("黑白名单敏感词评分失败: %v", err)
 	}
 }
 
+func (i *BanListInfo) AddScoreByCensorForContext(uid string, score int64, place string, level string, ctx *MsgContext) error {
+	return i.addScoreWithJointAndNotice(
+		uid, score, place, "触发<"+level+">敏感词", "连带责任:触发<"+level+">敏感词", ctx,
+	)
+}
+
 func (i *BanListInfo) GetByID(uid string) (*BanListInfoItem, bool) {
-	if i == nil || uid == "" {
+	if i == nil || i.Parent == nil || uid == "" {
 		return nil, false
 	}
-	i.itemsMu.RLock()
-	defer i.itemsMu.RUnlock()
-	if i.Map == nil {
+	repository, err := newModerationBanRepository(i.Parent)
+	if err != nil {
 		return nil, false
 	}
-	item, ok := i.Map.Load(uid)
-	if !ok || item == nil {
+	item, exists, err := repository.loadItem(context.Background(), uid)
+	if err != nil {
+		if i.Parent.Logger != nil {
+			i.Parent.Logger.Errorf("黑白名单读取失败: %v", err)
+		}
 		return nil, false
 	}
-	return cloneBanListItem(item), true
+	return item, exists
+}
+
+func (i *BanListInfo) GetByIDForContext(ctx *MsgContext, uid string) (*BanListInfoItem, bool, error) {
+	if i == nil || i.Parent == nil || uid == "" {
+		return nil, false, nil
+	}
+	if ctx != nil && ctx.Dice != nil && ctx.Dice != i.Parent {
+		return nil, false, errors.New("ban list message context belongs to another dice")
+	}
+	if ctx != nil && ctx.callbackTransaction != nil {
+		return i.Parent.ModerationItemForDomain(ctx.domainContext(), ctx.callbackTransaction.Domain(), uid)
+	}
+	repository, err := newModerationBanRepository(i.Parent)
+	if err != nil {
+		return nil, false, err
+	}
+	return repository.loadItem(context.Background(), uid)
 }
 
 func (i *BanListInfo) SetTrustByID(uid string, place string, reason string) {
@@ -514,143 +719,115 @@ func (i *BanListInfo) SetTrustByID(uid string, place string, reason string) {
 }
 
 func (i *BanListInfo) SetTrustByIDWithError(uid string, place string, reason string) error {
-	if i == nil || uid == "" {
-		return nil
-	}
-	if err := i.PersistenceError(); err != nil {
-		return err
+	return i.SetTrustByIDForContext(nil, uid, place, reason)
+}
+
+func (i *BanListInfo) SetTrustByIDForContext(ctx *MsgContext, uid string, place string, reason string) error {
+	if i == nil || i.Parent == nil || uid == "" {
+		return errors.New("ban list, parent, and ID are required")
 	}
 	d := i.Parent
-	var name string
-	if d != nil && d.Parent != nil {
+	name := ""
+	if d.Parent != nil {
 		name = d.Parent.TryGetUserName(uid)
 		if strings.Contains(uid, "-Group:") {
 			name = d.Parent.TryGetGroupName(uid)
 		}
 	}
 	now := time.Now().Unix()
-
-	i.itemsMu.Lock()
-	if i.Map == nil {
-		i.Map = new(SyncMap[string, *BanListInfoItem])
-	}
-	item, _ := i.Map.Load(uid)
-	if item == nil {
-		item = &BanListInfoItem{ID: uid}
-	} else {
-		item = cloneBanListItem(item)
-	}
-	item.Rank = BanRankTrusted
-	item.Name = name
-	item.Places = append(item.Places, place)
-	item.Reasons = append(item.Reasons, reason)
-	item.Times = append(item.Times, now)
-	item.BanUpdatedAt = now
-	item.UpdatedAt = now
-	if d != nil && d.DurableStore != nil {
-		repository, err := newModerationBanRepository(d)
-		if err == nil {
-			err = repository.save(context.Background(), item)
-		}
-		if err != nil {
-			i.itemsMu.Unlock()
-			return err
-		}
-	} else if d != nil && d.DBOperator != nil {
-		if err := persistSQLBanListItem(d, item); err != nil {
-			i.itemsMu.Unlock()
-			return err
-		}
-		item.UpdatedAt = 0
-	}
-	i.Map.Store(uid, item)
-	i.itemsMu.Unlock()
-	return nil
+	request := struct {
+		SubjectID string `json:"subjectId"`
+		Place     string `json:"place"`
+		Reason    string `json:"reason"`
+		At        int64  `json:"at"`
+	}{uid, place, reason, now}
+	return i.runMutation(context.Background(), ctx, "moderation-trust", request, func(callCtx context.Context, transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		return d.ContributeModerationMutation(callCtx, transaction.Domain(), metadata, uid, func(item *BanListInfoItem, _ bool) error {
+			item.Rank = BanRankTrusted
+			item.Name = name
+			item.Places = append(item.Places, place)
+			item.Reasons = append(item.Reasons, reason)
+			item.Times = append(item.Times, now)
+			item.BanUpdatedAt = now
+			item.UpdatedAt = now
+			return nil
+		})
+	})
 }
 
 func (i *BanListInfo) SetRankByID(d *Dice, uid string, rank BanRankType, name string, place string, reason string) error {
+	return i.SetRankByIDForContext(nil, d, uid, rank, name, place, reason)
+}
+
+func (i *BanListInfo) SetRankByIDForContext(ctx *MsgContext, d *Dice, uid string, rank BanRankType, name string, place string, reason string) error {
 	if i == nil || uid == "" {
 		return errors.New("ban list and ID are required")
 	}
 	if d == nil {
 		d = i.Parent
 	}
-	if err := i.PersistenceError(); err != nil {
-		return err
+	if d == nil || d != i.Parent {
+		return errors.New("ban list parent does not match dice")
 	}
 	switch rank {
 	case BanRankBanned, BanRankWarn, BanRankTrusted, BanRankNormal:
 	default:
 		return fmt.Errorf("invalid ban rank %d", rank)
 	}
-
 	now := time.Now().Unix()
 	fallbackName := ""
-	if name == "" && d != nil && d.Parent != nil {
+	if name == "" && d.Parent != nil {
 		if strings.Contains(uid, "-Group:") {
 			fallbackName = d.Parent.TryGetGroupName(uid)
 		} else {
 			fallbackName = d.Parent.TryGetUserName(uid)
 		}
 	}
-	i.itemsMu.Lock()
-	if i.Map == nil {
-		i.Map = new(SyncMap[string, *BanListInfoItem])
-	}
-	item, exists := i.Map.Load(uid)
-	if item == nil {
-		exists = false
-		item = &BanListInfoItem{ID: uid}
-	} else {
-		item = cloneBanListItem(item)
-	}
-	if name != "" {
-		item.Name = name
-	} else if !exists {
-		item.Name = fallbackName
-	}
-	switch rank {
-	case BanRankBanned:
-		item.Rank = rank
-		item.Score = i.ThresholdBan
-		item.BanTime = now
-	case BanRankWarn:
-		item.Rank = rank
-		item.Score = i.ThresholdWarn
-		item.BanTime = 0
-	case BanRankTrusted:
-		item.Rank = rank
-	case BanRankNormal:
-		item.Rank = rank
-		item.Score = 0
-		item.BanTime = 0
-	}
-	if place != "" || reason != "" {
-		item.Reasons = append(item.Reasons, reason)
-		item.Places = append(item.Places, place)
-		item.Times = append(item.Times, now)
-	}
-	item.BanUpdatedAt = now
-	item.UpdatedAt = now
-	if d != nil && d.DurableStore != nil {
-		repository, err := newModerationBanRepository(d)
-		if err == nil {
-			err = repository.save(context.Background(), item)
+	request := struct {
+		SubjectID string      `json:"subjectId"`
+		Rank      BanRankType `json:"rank"`
+		Name      string      `json:"name"`
+		Place     string      `json:"place"`
+		Reason    string      `json:"reason"`
+		At        int64       `json:"at"`
+	}{uid, rank, name, place, reason, now}
+	return i.runMutation(context.Background(), ctx, "moderation-rank", request, func(callCtx context.Context, transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		settings, settingsErr := i.settingsForTransaction(callCtx, transaction)
+		if settingsErr != nil {
+			return settingsErr
 		}
-		if err != nil {
-			i.itemsMu.Unlock()
-			return err
-		}
-	} else if d != nil && d.DBOperator != nil {
-		if err := persistSQLBanListItem(d, item); err != nil {
-			i.itemsMu.Unlock()
-			return err
-		}
-		item.UpdatedAt = 0
-	}
-	i.Map.Store(uid, item)
-	i.itemsMu.Unlock()
-	return nil
+		return d.ContributeModerationMutation(callCtx, transaction.Domain(), metadata, uid, func(item *BanListInfoItem, exists bool) error {
+			if name != "" {
+				item.Name = name
+			} else if !exists {
+				item.Name = fallbackName
+			}
+			switch rank {
+			case BanRankBanned:
+				item.Rank = rank
+				item.Score = settings.ThresholdBan
+				item.BanTime = now
+			case BanRankWarn:
+				item.Rank = rank
+				item.Score = settings.ThresholdWarn
+				item.BanTime = 0
+			case BanRankTrusted:
+				item.Rank = rank
+			case BanRankNormal:
+				item.Rank = rank
+				item.Score = 0
+				item.BanTime = 0
+			}
+			if place != "" || reason != "" {
+				item.Reasons = append(item.Reasons, reason)
+				item.Places = append(item.Places, place)
+				item.Times = append(item.Times, now)
+			}
+			item.BanUpdatedAt = now
+			item.UpdatedAt = now
+			return nil
+		})
+	})
 }
 
 func (i *BanListInfo) ImportItems(d *Dice, items []*BanListInfoItem) error {
@@ -660,8 +837,8 @@ func (i *BanListInfo) ImportItems(d *Dice, items []*BanListInfoItem) error {
 	if d == nil {
 		d = i.Parent
 	}
-	if err := i.PersistenceError(); err != nil {
-		return err
+	if d == nil || d != i.Parent {
+		return errors.New("ban list parent does not match dice")
 	}
 	now := time.Now().Unix()
 	imported := make([]*BanListInfoItem, len(items))
@@ -670,122 +847,58 @@ func (i *BanListInfo) ImportItems(d *Dice, items []*BanListInfoItem) error {
 			return errors.New("ban list item ID is required")
 		}
 		imported[index] = cloneBanListItem(item)
+		imported[index].EventStoreVersion = 0
 		imported[index].UpdatedAt = now
 		if imported[index].BanUpdatedAt == 0 {
 			imported[index].BanUpdatedAt = now
 		}
 	}
+	return i.runMutation(context.Background(), nil, "moderation-import", imported, func(callCtx context.Context, transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		for _, importedItem := range imported {
+			copyItem := cloneBanListItem(importedItem)
+			if err := d.ContributeModerationMutation(callCtx, transaction.Domain(), metadata, copyItem.ID, func(item *BanListInfoItem, _ bool) error {
+				*item = *copyItem
+				item.Times = append([]int64(nil), copyItem.Times...)
+				item.Reasons = append([]string(nil), copyItem.Reasons...)
+				item.Places = append([]string(nil), copyItem.Places...)
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
 
-	var repository *moderationBanRepository
-	if d != nil && d.DurableStore != nil {
-		var err error
-		repository, err = newModerationBanRepository(d)
-		if err != nil {
-			return err
-		}
+func (d *Dice) GetBanListWithError(ctx context.Context) ([]*BanListInfoItem, error) {
+	if d == nil {
+		return []*BanListInfoItem{}, nil
 	}
-	i.itemsMu.Lock()
-	if i.Map == nil {
-		i.Map = new(SyncMap[string, *BanListInfoItem])
+	repository, err := newModerationBanRepository(d)
+	if err != nil {
+		return nil, err
 	}
-	for _, item := range imported {
-		if repository != nil {
-			item.EventStoreVersion = 0
-			if current, ok := i.Map.Load(item.ID); ok && current != nil {
-				item.EventStoreVersion = current.EventStoreVersion
-			}
-			if err := repository.save(context.Background(), item); err != nil {
-				i.itemsMu.Unlock()
-				return err
-			}
-		} else if d != nil && d.DBOperator != nil {
-			if err := persistSQLBanListItem(d, item); err != nil {
-				i.itemsMu.Unlock()
-				return err
-			}
-			item.UpdatedAt = 0
-		}
-		i.Map.Store(item.ID, item)
+	items, err := repository.load(ctx)
+	if err != nil {
+		return nil, err
 	}
-	i.itemsMu.Unlock()
-	return nil
+	list := make([]*BanListInfoItem, 0, len(items))
+	for _, item := range items {
+		list = append(list, cloneBanListItem(item))
+	}
+	sortBanListItems(list)
+	return list, nil
 }
 
 func (d *Dice) GetBanList() []*BanListInfoItem {
-	if d == nil || d.Config.BanList == nil {
+	list, err := d.GetBanListWithError(context.Background())
+	if err != nil {
+		if d != nil && d.Logger != nil {
+			d.Logger.Errorf("黑白名单读取失败: %v", err)
+		}
 		return []*BanListInfoItem{}
 	}
-	if d.DurableStore != nil || d.DBOperator == nil {
-		return d.Config.BanList.snapshot()
-	}
-	var list []*BanListInfoItem
-	_ = service.BanItemList(d.DBOperator, func(id string, banUpdatedAt int64, data []byte) {
-		var item BanListInfoItem
-		if err := json.Unmarshal(data, &item); err != nil {
-			item = BanListInfoItem{}
-		}
-		item.ID = id
-		item.BanUpdatedAt = banUpdatedAt
-		list = append(list, &item)
-	})
 	return list
-}
-
-func persistSQLBanListItem(d *Dice, item *BanListInfoItem) error {
-	if d == nil || d.DBOperator == nil || item == nil || item.ID == "" {
-		return errors.New("ban list SQL persistence is unavailable")
-	}
-	data, err := json.Marshal(item)
-	if err != nil {
-		return err
-	}
-	return service.BanItemSave(d.DBOperator, item.ID, item.UpdatedAt, item.BanUpdatedAt, data)
-}
-
-func (i *BanListInfo) SaveChanged(d *Dice) {
-	if err := i.SaveChangedWithError(d); err != nil && d != nil && d.Logger != nil {
-		d.Logger.Errorf("黑白名单保存失败: %v", err)
-	}
-}
-
-func (i *BanListInfo) SaveChangedWithError(d *Dice) error {
-	if i == nil {
-		return nil
-	}
-	if d == nil {
-		d = i.Parent
-	}
-	if d == nil {
-		return nil
-	}
-	if d.DurableStore != nil {
-		return i.PersistenceError()
-	}
-	if d.DBOperator == nil {
-		return nil
-	}
-	i.itemsMu.Lock()
-	defer i.itemsMu.Unlock()
-	if i.Map == nil {
-		return nil
-	}
-	var saveErr error
-	i.Map.Range(func(id string, item *BanListInfoItem) bool {
-		if item == nil || item.UpdatedAt == 0 {
-			return true
-		}
-		data, err := json.Marshal(item)
-		if err == nil {
-			err = service.BanItemSave(d.DBOperator, id, item.UpdatedAt, item.BanUpdatedAt, data)
-		}
-		if err != nil {
-			saveErr = errors.Join(saveErr, err)
-			return true
-		}
-		item.UpdatedAt = 0
-		return true
-	})
-	return saveErr
 }
 
 func (i *BanListInfo) DeleteByID(d *Dice, id string) {
@@ -795,51 +908,26 @@ func (i *BanListInfo) DeleteByID(d *Dice, id string) {
 }
 
 func (i *BanListInfo) DeleteByIDWithError(d *Dice, id string) error {
+	return i.DeleteByIDForContext(nil, d, id)
+}
+
+func (i *BanListInfo) DeleteByIDForContext(ctx *MsgContext, d *Dice, id string) error {
 	if i == nil || id == "" {
 		return nil
 	}
 	if d == nil {
 		d = i.Parent
 	}
-	if err := i.PersistenceError(); err != nil && d != nil && d.DurableStore != nil {
-		return err
+	if d == nil || d != i.Parent {
+		return errors.New("ban list parent does not match dice")
 	}
-	if d != nil && d.DurableStore != nil {
-		repository, err := newModerationBanRepository(d)
-		if err != nil {
-			return err
-		}
-		i.itemsMu.Lock()
-		defer i.itemsMu.Unlock()
-		item := &BanListInfoItem{ID: id}
-		if i.Map != nil {
-			if current, ok := i.Map.Load(id); ok && current != nil {
-				item = cloneBanListItem(current)
-			}
-		}
-		if err = repository.delete(context.Background(), item); err != nil {
-			return err
-		}
-		if i.Map != nil {
-			i.Map.Delete(id)
-		}
-		return nil
+	callCtx := context.Background()
+	if ctx != nil {
+		callCtx = ctx.domainContext()
 	}
-	if d != nil && d.DBOperator != nil {
-		i.itemsMu.Lock()
-		defer i.itemsMu.Unlock()
-		if err := service.BanItemDel(d.DBOperator, id); err != nil {
-			return err
-		}
-		if i.Map != nil {
-			i.Map.Delete(id)
-		}
-		return nil
-	}
-	i.itemsMu.Lock()
-	if i.Map != nil {
-		i.Map.Delete(id)
-	}
-	i.itemsMu.Unlock()
-	return nil
+	return i.runMutation(callCtx, ctx, "moderation-delete", struct {
+		SubjectID string `json:"subjectId"`
+	}{id}, func(domainCtx context.Context, transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		return d.ContributeModerationDelete(domainCtx, transaction.Domain(), metadata, id)
+	})
 }

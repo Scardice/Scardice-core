@@ -101,7 +101,7 @@ func deckEnable(c echo.Context) error {
 		}
 	}
 
-	return c.JSON(http.StatusOK, myDice.Config.BanList)
+	return c.JSON(http.StatusOK, myDice.Config().BanList)
 }
 
 func deckDelete(c echo.Context) error {

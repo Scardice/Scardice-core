@@ -39,6 +39,9 @@ func (r *onebotRuntime) handleProtocolInbound(ctx context.Context, raw []byte) e
 	}
 	event := adapterapi.AdapterEvent{Protocol: onebotAdapterEventProtocol, Type: envelope.PostType, RawJSON: string(raw)}
 
+	if onebotIsSelfMessage(&envelope) {
+		return r.handleSelfMessage(ctx, raw, event, &envelope)
+	}
 	message := newOnebotInbound(&envelope)
 	switch envelope.PostType {
 	case "message":
@@ -200,7 +203,18 @@ func opaqueOnebotInbound(raw []byte, event adapterapi.AdapterEvent, envelope *on
 		}
 		message.ConversationKind, message.Conversation = adapterapi.ConversationKindGroup, conversation
 	case user != "" && envelope.PostType != "meta_event" && !onebotEventRequiresGroup(envelope):
-		conversation, err := adapterapi.NewConversationID(string(user))
+		peer := user
+		if onebotIsSelfMessage(envelope) {
+			// The account's own private message belongs to the conversation with
+			// its recipient; without one it has no conversation to be scoped to.
+			if peer, err = onebotEventPrincipal(envelope.TargetID, "target_id"); err != nil {
+				return adapterapi.InboundMessage{}, false, err
+			}
+			if peer == "" {
+				return adapterapi.InboundMessage{}, false, nil
+			}
+		}
+		conversation, err := adapterapi.NewConversationID(string(peer))
 		if err != nil {
 			return adapterapi.InboundMessage{}, false, onebotEventRejected("invalid user_id")
 		}
@@ -318,6 +332,9 @@ func (r *onebotRuntime) runGlobalOnebotEventDelivery(
 				continue
 			}
 			switch receipt.Outcome {
+			case adapterapi.IngressOutcomeInvalid:
+				r.globalEventFailed.Add(1)
+				onebotRuntimeLogger().Error("OneBot global adapter event returned an invalid ingress outcome")
 			case adapterapi.IngressAccepted:
 				r.globalEventAccepted.Add(1)
 			case adapterapi.IngressDuplicate:

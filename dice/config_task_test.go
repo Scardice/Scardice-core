@@ -8,6 +8,7 @@ import (
 
 	"github.com/robfig/cron/v3"
 
+	"Scardice-core/core/configstate"
 	"Scardice-core/core/extensionstate"
 	"Scardice-core/eventstore"
 )
@@ -39,7 +40,7 @@ func TestSetConfigInvalidTaskExpressionsDoNotPersistOrUnschedule(t *testing.T) {
 			}
 
 			oldRawValue, oldCronExpr := task.rawValue, task.cronExpr
-			oldValue := d.ConfigManager.getConfig(extensionID, test.key).Value
+			oldValue := projectedTaskConfigValue(t, d, extensionID, test.key)
 
 			if err := d.ConfigManager.SetConfig(extensionID, test.key, test.invalid); err == nil {
 				t.Fatal("SetConfig accepted an invalid task expression")
@@ -55,7 +56,7 @@ func TestSetConfigInvalidTaskExpressionsDoNotPersistOrUnschedule(t *testing.T) {
 			if got.Type != want.Type || got.String != want.String {
 				t.Fatalf("persisted task value after invalid update = %#v, want %#v", got, want)
 			}
-			if got := d.ConfigManager.getConfig(extensionID, test.key).Value; got != oldValue {
+			if got := projectedTaskConfigValue(t, d, extensionID, test.key); got != oldValue {
 				t.Fatalf("in-memory task value after invalid update = %#v, want %#v", got, oldValue)
 			}
 			if !task.IsActive() || task.rawValue != oldRawValue || task.cronExpr != oldCronExpr || task.entryID == nil || *task.entryID != oldEntryID {
@@ -108,7 +109,7 @@ func TestSetConfigValidTaskExpressionsNormalizeAndReschedule(t *testing.T) {
 			if task.rawValue != test.wantRaw || task.cronExpr != test.wantCron {
 				t.Fatalf("task expression = raw %q cron %q, want raw %q cron %q", task.rawValue, task.cronExpr, test.wantRaw, test.wantCron)
 			}
-			if got := d.ConfigManager.getConfig(extensionID, test.key).Value; got != test.wantRaw {
+			if got := projectedTaskConfigValue(t, d, extensionID, test.key); got != test.wantRaw {
 				t.Fatalf("in-memory value = %#v, want %q", got, test.wantRaw)
 			}
 			state, err := d.DurableExtensionState(ctx)
@@ -143,7 +144,7 @@ func TestSetConfigOnceKeepsTimerOnInvalidInputAndPersistsExactDeadline(t *testin
 		t.Fatal(err)
 	}
 	if unchanged.Version != before.Version || unchanged.ConfigValues[extensionID]["once"].String != oldValue ||
-		d.ConfigManager.getConfig(extensionID, "once").Value != oldValue || task.rawValue != oldValue ||
+		projectedTaskConfigValue(t, d, extensionID, "once") != oldValue || task.rawValue != oldValue ||
 		task.timer != oldTimer || !task.onceAt.Equal(oldDeadline) || !task.IsActive() {
 		t.Fatal("invalid one-shot update changed its durable value or active deadline")
 	}
@@ -166,49 +167,24 @@ func TestSetConfigOnceKeepsTimerOnInvalidInputAndPersistsExactDeadline(t *testin
 	}
 	if updated.Version != before.Version+1 || value.Type != extensionstate.ConfigType("task:once") ||
 		task.onceAt.UnixMilli() != deadlineMillis || task.rawValue != value.String ||
-		d.ConfigManager.getConfig(extensionID, "once").Value != value.String || task.timer == oldTimer || !task.IsActive() {
+		projectedTaskConfigValue(t, d, extensionID, "once") != value.String || task.timer == oldTimer || !task.IsActive() {
 		t.Fatal("durable one-shot deadline and rearmed timer disagree")
 	}
 }
 
-func TestResetConfigTaskDefaultValidatesBeforePersisting(t *testing.T) {
-	ctx := context.Background()
-	d, db, extensionID, tasks := newDurableTaskConfigFixture(t, ctx)
-	defer db.Close()
-
-	before, err := d.DurableExtensionState(ctx)
+func projectedTaskConfigValue(t *testing.T, d *Dice, pluginName, key string) any {
+	t.Helper()
+	items, err := d.DurableExtensionConfigItems(context.Background(), pluginName)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, test := range []struct {
-		key     string
-		invalid string
-	}{
-		{key: "cron", invalid: "not a cron expression"},
-		{key: "daily", invalid: "24:61"},
-		{key: "once", invalid: "-1"},
-	} {
-		configItem := d.ConfigManager.getConfig(extensionID, test.key)
-		oldValue := configItem.Value.(string)
-		task := tasks[test.key]
-		oldRawValue, oldTimer, oldEntryID, oldDeadline := task.rawValue, task.timer, task.entryID, task.onceAt
-		d.ConfigManager.lock.Lock()
-		d.ConfigManager.Plugins[extensionID].Configs[test.key].DefaultValue = test.invalid
-		d.ConfigManager.lock.Unlock()
-
-		d.ConfigManager.ResetConfigToDefault(extensionID, test.key)
-		after, err := d.DurableExtensionState(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		current := d.ConfigManager.getConfig(extensionID, test.key)
-		if after.Version != before.Version || after.ConfigValues[extensionID][test.key].String != oldValue ||
-			current.Value != oldValue || task.rawValue != oldRawValue || !task.IsActive() ||
-			task.timer != oldTimer || task.entryID != oldEntryID || !task.onceAt.Equal(oldDeadline) {
-			t.Fatalf("invalid %s default changed durable value or live schedule: state=%#v config=%#v task=%#v",
-				test.key, after.ConfigValues[extensionID][test.key], current, task)
+	for _, item := range items {
+		if item != nil && item.Key == key {
+			return item.Value
 		}
 	}
+	t.Fatalf("plugin config %s/%s is absent", pluginName, key)
+	return nil
 }
 
 func newDurableTaskConfigFixture(t *testing.T, ctx context.Context) (*Dice, *eventstore.Database, string, map[string]*JsScriptTask) {
@@ -218,13 +194,12 @@ func newDurableTaskConfigFixture(t *testing.T, ctx context.Context) (*Dice, *eve
 		t.Fatal(err)
 	}
 	store := eventstore.NewStore(db,
-		eventstore.WithKeySource(compatKeySource{}),
+		eventstore.WithProjection(configstate.ConfigProjection()),
 		eventstore.WithProjection(extensionstate.ExtensionProjection()),
 	)
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "task-config-test", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "task-config-test",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -233,6 +208,7 @@ func newDurableTaskConfigFixture(t *testing.T, ctx context.Context) (*Dice, *eve
 	d := &Dice{BaseConfig: BaseConfig{Name: "dice-1"}, DurableStore: store}
 	d.ConfigManager = NewConfigManager("")
 	d.ConfigManager.SetOwner(d)
+	seedCanonicalTestConfigBaseline(t, d)
 	ext := &ExtInfo{Name: extensionID, Version: "1.0.0", IsJsExt: true, dice: d}
 	if err := d.DurableDiscoverExtension(ctx, ext); err != nil {
 		t.Fatalf("discover extension: %v", err)

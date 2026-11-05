@@ -34,7 +34,6 @@ func TestSQLiteEngineInitCreatesMissingTables(t *testing.T) {
 		&model.BanInfo{},
 		&model.EndpointInfo{},
 		&model.AttributesItemModel{},
-		&model.OfficialQQIdentityMapping{},
 	} {
 		if !dataDB.Migrator().HasTable(m) {
 			t.Fatalf("data table missing for %T", m)

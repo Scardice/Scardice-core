@@ -63,10 +63,10 @@ var dndAttrParent = map[string]string{
 const NULL_INIT_VAL = math.MaxInt32 // 不使用 MAX_INT64 以保证 JS 环境使用时不会出现潜在问题
 
 func getPlayerNameTempFunc(mctx *MsgContext) string {
-	if mctx.Dice.Config.PlayerNameWrapEnable {
-		return fmt.Sprintf("<%s>", mctx.Player.Name)
+	if mctx.Dice.Config().PlayerNameWrapEnable {
+		return fmt.Sprintf("<%s>", mctx.Player.Name())
 	}
-	return mctx.Player.Name
+	return mctx.Player.Name()
 }
 
 func isAbilityScores(name string) bool {
@@ -83,15 +83,25 @@ func stpFormat(attrName string) string {
 }
 
 func RegisterBuiltinExtDnd5e(self *Dice) {
-	deathSavingStable := func(ctx *MsgContext) {
-		VarDelValue(ctx, "DSS")
-		VarDelValue(ctx, "DSF")
-		if ctx.Player.AutoSetNameTemplate != "" {
-			_, _ = SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
+	updatePlayerGroupCard := func(ctx *MsgContext) error {
+		template := ctx.Player.AutoSetNameTemplate()
+		if template == "" {
+			return nil
 		}
+		_, err := SetPlayerGroupCardByTemplate(ctx, template)
+		if err != nil {
+			ctx.setExecutionError(err)
+		}
+		return err
 	}
 
-	deathSaving := func(ctx *MsgContext, successPlus int64, failurePlus int64) (int64, int64) {
+	deathSavingStable := func(ctx *MsgContext) error {
+		VarDelValue(ctx, "DSS")
+		VarDelValue(ctx, "DSF")
+		return updatePlayerGroupCard(ctx)
+	}
+
+	deathSaving := func(ctx *MsgContext, successPlus int64, failurePlus int64) (int64, int64, error) {
 		readAndAssign := func(name string) int64 {
 			var val int64
 			v, exists := _VarGetValueV1(ctx, name)
@@ -117,24 +127,24 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 			VarSetValueInt64(ctx, "DSF", val2)
 		}
 
-		if ctx.Player.AutoSetNameTemplate != "" {
-			_, _ = SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
-		}
-
-		return val1, val2
+		return val1, val2, updatePlayerGroupCard(ctx)
 	}
 
-	deathSavingResultCheck := func(ctx *MsgContext, a int64, b int64) string {
+	deathSavingResultCheck := func(ctx *MsgContext, a int64, b int64) (string, error) {
 		text := ""
 		if a >= 3 {
 			text = DiceFormatTmpl(ctx, "DND:死亡豁免_结局_伤势稳定")
-			deathSavingStable(ctx)
+			if err := deathSavingStable(ctx); err != nil {
+				return "", err
+			}
 		}
 		if b >= 3 {
 			text = DiceFormatTmpl(ctx, "DND:死亡豁免_结局_角色死亡")
-			deathSavingStable(ctx)
+			if err := deathSavingStable(ctx); err != nil {
+				return "", err
+			}
 		}
-		return text
+		return text, nil
 	}
 
 	helpSt := ".st 模板 // 录卡模板\n"
@@ -153,7 +163,7 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 	helpSt += "特别的，扣除hp时，会先将其buff值扣除到0。以及增加hp时，hp的值不会超过hpmax\n"
 	helpSt += "需要使用coc版本st，请执行.set coc"
 
-	toExport := func(ctx *MsgContext, key string, val *ds.VMValue, tmpl *GameSystemTemplate) string {
+	toExport := func(ctx *MsgContext, key string, val *ds.VMValue, tmpl *GameSystemTemplate) (string, error) {
 		if dndAttrParent[key] != "" && val.TypeId == ds.VMTypeComputedValue {
 			cd, _ := val.ReadComputed()
 			base, _ := cd.Attrs.Load("base")
@@ -161,30 +171,30 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 			if base != nil {
 				if factor != nil {
 					if ds.ValueEqual(factor, ds.NewIntVal(1), true) {
-						return fmt.Sprintf("%s*:%s", key, base.ToRepr())
-					} else {
-						return fmt.Sprintf("%s*%s:%s", key, factor.ToRepr(), base.ToRepr())
+						return fmt.Sprintf("%s*:%s", key, base.ToRepr()), nil
 					}
-				} else {
-					return fmt.Sprintf("%s:%s", key, base.ToRepr())
+					return fmt.Sprintf("%s*%s:%s", key, factor.ToRepr(), base.ToRepr()), nil
 				}
+				return fmt.Sprintf("%s:%s", key, base.ToRepr()), nil
 			}
 		}
 
 		if isAbilityScores(key) {
 			// 如果为主要属性，同时读取豁免值
-			attrs, _ := ctx.Dice.AttrsManager.LoadByCtx(ctx)
+			attrs, err := ctx.Dice.AttrsManager.LoadByCtx(ctx)
+			if err != nil {
+				return "", err
+			}
 			stpKey := stpFormat(key)
 			// 注: 如果这里改成 eval，是不是即使原始值为computed也可以？
 			if v, exists := attrs.LoadX(stpKey); exists && (v.TypeId == ds.VMTypeInt || v.TypeId == ds.VMTypeFloat) {
 				if ds.ValueEqual(v, ds.NewIntVal(1), true) {
-					return fmt.Sprintf("%s*:%s", key, val.ToRepr())
-				} else {
-					return fmt.Sprintf("%s*%s:%s", key, v.ToRepr(), val.ToRepr())
+					return fmt.Sprintf("%s*:%s", key, val.ToRepr()), nil
 				}
+				return fmt.Sprintf("%s*%s:%s", key, v.ToRepr(), val.ToRepr()), nil
 			}
 		}
-		return ""
+		return "", nil
 	}
 
 	cmdSt := getCmdStBase(CmdStOverrideInfo{
@@ -228,7 +238,7 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 
 			return fmt.Sprintf("%s:%s%s", k, v.ToString(), suffixText)
 		},
-		ToMod: func(ctx *MsgContext, args *CmdArgs, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate) bool {
+		ToMod: func(ctx *MsgContext, args *CmdArgs, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate) (bool, error) {
 			over := args.GetKwarg("over")
 			attrName := tmpl.GetAlias(i.name)
 			if attrName == "hp" && over == nil {
@@ -244,11 +254,15 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 					val := vHpBuffVal - i.value.MustReadInt()
 					if val >= 0 {
 						// 有充足的盾，扣掉，当前伤害改为0
-						attrs.Store("$buff_hp", ds.NewIntVal(val))
+						if err := attrs.Store("$buff_hp", ds.NewIntVal(val)); err != nil {
+							return false, err
+						}
 						i.value = ds.NewIntVal(0)
 					} else {
 						// 没有充足的盾，盾扣到0，剩下的继续造成伤害
-						attrs.Delete("$buff_hp")
+						if err := attrs.Delete("$buff_hp"); err != nil {
+							return false, err
+						}
 						// 传入 -val, 因为 op 是减法，不然会变成加血
 						i.value = ds.NewIntVal(-val)
 					}
@@ -271,7 +285,9 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 						Expr:  fmt.Sprintf("pbCalc(this.base, this.factor, %s)", parent),
 						Attrs: &m,
 					})
-					attrs.Store(attrName, val)
+					if err := attrs.Store(attrName, val); err != nil {
+						return false, err
+					}
 				}
 
 				if val.TypeId == ds.VMTypeComputedValue {
@@ -289,14 +305,14 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 					}
 					if vNew != nil {
 						cd.Attrs.Store("base", vNew)
-						return true
+						return true, nil
 					}
 				}
 			}
 
-			return false
+			return false, nil
 		},
-		ToModResult: func(ctx *MsgContext, args *CmdArgs, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate, theOldValue, theNewValue *ds.VMValue) *ds.VMValue {
+		ToModResult: func(ctx *MsgContext, args *CmdArgs, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate, theOldValue, theNewValue *ds.VMValue) (*ds.VMValue, error) {
 			attrName := tmpl.GetAlias(i.name)
 			if attrName == "hp" {
 				// 获取hpmax
@@ -329,41 +345,50 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 
 					// 情况1: 超过生命上限，寄了
 					if maxExists && -newHp >= curHpMax {
-						deathSavingStable(ctx)
+						if err := deathSavingStable(ctx); err != nil {
+							return nil, err
+						}
 						VarSetValue(ctx, "$t伤害点数", ds.NewIntVal(-newHp))
 						i.appendedText = DiceFormatTmpl(ctx, "DND:受到伤害_超过HP上限_附加语")
-						return ds.NewIntVal(0)
+						return ds.NewIntVal(0), nil
 					}
 
 					if oldValue == 0 {
 						// 情况2: 已经在昏迷了
 						VarSetValue(ctx, "$t伤害点数", ds.NewIntVal(-newHp))
 						i.appendedText = DiceFormatTmpl(ctx, "DND:受到伤害_昏迷中_附加语")
-						a, b := deathSaving(ctx, 0, 1)
-						exText := deathSavingResultCheck(ctx, a, b)
+						a, b, err := deathSaving(ctx, 0, 1)
+						if err != nil {
+							return nil, err
+						}
+						exText, err := deathSavingResultCheck(ctx, a, b)
+						if err != nil {
+							return nil, err
+						}
 						if exText != "" {
 							i.appendedText += "\n" + exText
 						}
-						return ds.NewIntVal(0)
-					} else {
-						// 情况3: 进入昏迷
-						VarSetValue(ctx, "$t伤害点数", ds.NewIntVal(-newHp))
-						i.appendedText = DiceFormatTmpl(ctx, "DND:受到伤害_进入昏迷_附加语")
-						return ds.NewIntVal(0)
+						return ds.NewIntVal(0), nil
 					}
-				} else {
-					// 生命值变为大于0，移除死亡豁免标记
-					deathSavingStable(ctx)
-					if newHp > curHpMax {
-						// 限制不超过hpmax
-						return ds.NewIntVal(curHpMax)
-					}
+					// 情况3: 进入昏迷
+					VarSetValue(ctx, "$t伤害点数", ds.NewIntVal(-newHp))
+					i.appendedText = DiceFormatTmpl(ctx, "DND:受到伤害_进入昏迷_附加语")
+					return ds.NewIntVal(0), nil
+				}
+
+				// 生命值变为大于0，移除死亡豁免标记
+				if err := deathSavingStable(ctx); err != nil {
+					return nil, err
+				}
+				if newHp > curHpMax {
+					// 限制不超过hpmax
+					return ds.NewIntVal(curHpMax), nil
 				}
 			}
 
-			return theNewValue
+			return theNewValue, nil
 		},
-		ToSet: func(ctx *MsgContext, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate) bool {
+		ToSet: func(ctx *MsgContext, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate) (bool, error) {
 			attrName := tmpl.GetAlias(i.name)
 			parent := dndAttrParent[attrName]
 			if parent != "" {
@@ -383,12 +408,14 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 			} else if isAbilityScores(attrName) {
 				// 如果为主要属性，同时读取豁免值
 				if i.extra != nil {
-					attrs.Store(stpFormat(attrName), i.extra)
-				} else {
-					attrs.Delete(stpFormat(attrName))
+					if err := attrs.Store(stpFormat(attrName), i.extra); err != nil {
+						return false, err
+					}
+				} else if err := attrs.Delete(stpFormat(attrName)); err != nil {
+					return false, err
 				}
 			}
-			return false
+			return false, nil
 		},
 	})
 
@@ -450,7 +477,7 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 					round = cmdArgs.SpecialExecuteTimes
 				}
 				// 从COC复制来的轮数检查，同时特判一次的情况，防止完全骰不出去点
-				if cmdArgs.SpecialExecuteTimes > int(ctx.Dice.Config.MaxExecuteTime) && cmdArgs.SpecialExecuteTimes != 1 {
+				if cmdArgs.SpecialExecuteTimes > int(ctx.Dice.Config().MaxExecuteTime) && cmdArgs.SpecialExecuteTimes != 1 {
 					VarSetValueStr(mctx, "$t次数", strconv.Itoa(cmdArgs.SpecialExecuteTimes))
 					ReplyToSender(mctx, msg, DiceFormatTmpl(mctx, "DND:检定_轮数过多警告"))
 					return CmdExecuteResult{Matched: true, Solved: true}
@@ -459,7 +486,7 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 				var commandInfo = map[string]interface{}{
 					"cmd":    "rc",
 					"rule":   "dnd5e",
-					"pcName": mctx.Player.Name,
+					"pcName": mctx.Player.Name(),
 					// items的赋值转移到下面
 					// "items":  []interface{}{},
 				}
@@ -571,7 +598,7 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 						if ctx.IsPrivate {
 							ReplyToSender(ctx, msg, DiceFormatTmpl(mctx, "核心:提示_私聊不可用"))
 						} else {
-							ctx.CommandHideFlag = ctx.Group.GroupID
+							ctx.CommandHideFlag = ctx.Group.GroupID()
 							prefix := DiceFormatTmpl(mctx, "核心:暗骰_私聊_前缀")
 							ReplyGroup(ctx, msg, DiceFormatTmpl(mctx, "核心:暗骰_群内"))
 							ReplyPerson(ctx, msg, prefix+text)
@@ -606,7 +633,12 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 			if tmpl2, _ := ctx.Dice.GameSystemMap.Load("dnd5e"); tmpl2 != nil {
 				tmpl = tmpl2
 			}
-			attrs, _ := ctx.Dice.AttrsManager.LoadByCtx(ctx)
+			attrs, err := ctx.Dice.AttrsManager.LoadByCtx(ctx)
+			if err != nil {
+				ctx.setExecutionError(err)
+				ReplyToSender(ctx, msg, "读取临时属性失败："+err.Error())
+				return &CmdExecuteResult{Matched: true, Solved: true}
+			}
 
 			switch val {
 			case "export":
@@ -621,8 +653,12 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 					realname := "$buff_" + vname
 
 					if _, exists := attrs.LoadX(realname); exists {
+						if err = attrs.Delete(realname); err != nil {
+							ctx.setExecutionError(err)
+							ReplyToSender(ctx, msg, "删除临时属性失败："+err.Error())
+							return &CmdExecuteResult{Matched: true, Solved: true}
+						}
 						nums = append(nums, vname)
-						attrs.Delete(realname)
 					} else {
 						failed = append(failed, vname)
 					}
@@ -642,7 +678,11 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 					return true
 				})
 				for _, i := range toDelete {
-					attrs.Delete(i)
+					if err = attrs.Delete(i); err != nil {
+						ctx.setExecutionError(err)
+						ReplyToSender(ctx, msg, "清除临时属性失败："+err.Error())
+						return &CmdExecuteResult{Matched: true, Solved: true}
+					}
 				}
 				VarSetValueInt64(ctx, "$t数量", int64(len(toDelete)))
 				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "COC:属性设置_清除"))
@@ -702,7 +742,7 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 			ctx.setDndReadForVM(false)
 			return nil
 		},
-		ToSet: func(ctx *MsgContext, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate) bool {
+		ToSet: func(ctx *MsgContext, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate) (bool, error) {
 			attrName := tmpl.GetAlias(i.name)
 			i.name = "$buff_" + attrName
 
@@ -723,15 +763,17 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 			} else if isAbilityScores(attrName) {
 				// 如果为主要属性，同时读取豁免值
 				if i.extra != nil {
-					attrs.Store("$buff_"+stpFormat(attrName), i.extra)
-				} else {
-					attrs.Delete("$buff_" + stpFormat(attrName))
+					if err := attrs.Store("$buff_"+stpFormat(attrName), i.extra); err != nil {
+						return false, err
+					}
+				} else if err := attrs.Delete("$buff_" + stpFormat(attrName)); err != nil {
+					return false, err
 				}
 			}
 
-			return false
+			return false, nil
 		},
-		ToMod: func(ctx *MsgContext, args *CmdArgs, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate) bool {
+		ToMod: func(ctx *MsgContext, args *CmdArgs, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate) (bool, error) {
 			attrName := tmpl.GetAlias(i.name)
 			i.name = "$buff_" + attrName
 
@@ -750,7 +792,9 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 						Expr:  "[this.base, this.factor]",
 						Attrs: &m,
 					})
-					attrs.Store(attrName, val)
+					if err := attrs.Store(attrName, val); err != nil {
+						return false, err
+					}
 				}
 
 				if val.TypeId == ds.VMTypeComputedValue {
@@ -768,20 +812,20 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 					}
 					if vNew != nil {
 						cd.Attrs.Store("base", vNew)
-						return true
+						return true, nil
 					}
 				}
 			}
 
-			return false
+			return false, nil
 		},
-		ToModResult: func(ctx *MsgContext, args *CmdArgs, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate, theOldValue, theNewValue *ds.VMValue) *ds.VMValue {
+		ToModResult: func(ctx *MsgContext, args *CmdArgs, i *stSetOrModInfoItem, attrs *AttributesItem, tmpl *GameSystemTemplate, theOldValue, theNewValue *ds.VMValue) (*ds.VMValue, error) {
 			if !strings.HasPrefix(i.name, "$buff_") {
-				return theNewValue
+				return theNewValue, nil
 			}
 
 			if i.op != "+" && i.op != "-" {
-				return theNewValue
+				return theNewValue, nil
 			}
 
 			delta := i.value
@@ -795,11 +839,11 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 
 			switch i.op {
 			case "+":
-				return buffValOld.OpAdd(ctx.vm, delta)
+				return buffValOld.OpAdd(ctx.vm, delta), nil
 			case "-":
-				return buffValOld.OpSub(ctx.vm, delta)
+				return buffValOld.OpSub(ctx.vm, delta), nil
 			default:
-				return theNewValue
+				return theNewValue, nil
 			}
 		},
 	})
@@ -817,14 +861,14 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 		return num
 	}
 
-	spellSlotsChange := func(mctx *MsgContext, msg *Message, spellLevel int64, num int64) *CmdExecuteResult {
+	spellSlotsChange := func(mctx *MsgContext, msg *Message, spellLevel int64, num int64) (*CmdExecuteResult, error) {
 		spellLevelCur, _ := VarGetValueInt64(mctx, fmt.Sprintf("$法术位_%d", spellLevel))
 		spellLevelMax, _ := VarGetValueInt64(mctx, fmt.Sprintf("$法术位上限_%d", spellLevel))
 
 		newLevel := spellLevelCur + num
 		if newLevel < 0 {
 			ReplyToSender(mctx, msg, fmt.Sprintf(`%s无法消耗%d个%d环法术位，当前%d个`, getPlayerNameTempFunc(mctx), -num, spellLevel, spellLevelCur))
-			return &CmdExecuteResult{Matched: true, Solved: true}
+			return &CmdExecuteResult{Matched: true, Solved: true}, nil
 		}
 		if newLevel > spellLevelMax {
 			newLevel = spellLevelMax
@@ -835,10 +879,7 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 		} else {
 			ReplyToSender(mctx, msg, fmt.Sprintf(`%s的%d环法术位恢复至%d个，上限%d个`, getPlayerNameTempFunc(mctx), spellLevel, newLevel, spellLevelMax))
 		}
-		if mctx.Player.AutoSetNameTemplate != "" {
-			_, _ = SetPlayerGroupCardByTemplate(mctx, mctx.Player.AutoSetNameTemplate)
-		}
-		return nil
+		return nil, updatePlayerGroupCard(mctx)
 	}
 
 	helpSS := "" +
@@ -875,22 +916,37 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 						texts = append(texts, fmt.Sprintf("%d环%d个", index+1, val))
 					}
 					ReplyToSender(mctx, msg, "为"+getPlayerNameTempFunc(mctx)+"设置法术位: "+strings.Join(texts, ", "))
-					if ctx.Player.AutoSetNameTemplate != "" {
-						_, _ = SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
+					if err := updatePlayerGroupCard(mctx); err != nil {
+						ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 				} else {
 					return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 				}
 
 			case "clr":
-				attrs, _ := mctx.Dice.AttrsManager.LoadByCtx(mctx)
+				attrs, err := mctx.Dice.AttrsManager.LoadByCtx(mctx)
+				if err != nil {
+					mctx.setExecutionError(err)
+					ReplyToSender(mctx, msg, "读取法术位失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				for i := 1; i < 10; i++ {
-					attrs.Delete(fmt.Sprintf("$法术位_%d", i))
-					attrs.Delete(fmt.Sprintf("$法术位上限_%d", i))
+					if err = attrs.Delete(fmt.Sprintf("$法术位_%d", i)); err != nil {
+						mctx.setExecutionError(err)
+						ReplyToSender(mctx, msg, "清除法术位失败："+err.Error())
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
+					if err = attrs.Delete(fmt.Sprintf("$法术位上限_%d", i)); err != nil {
+						mctx.setExecutionError(err)
+						ReplyToSender(mctx, msg, "清除法术位失败："+err.Error())
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
 				}
 				ReplyToSender(mctx, msg, fmt.Sprintf(`%s法术位数据已清除`, getPlayerNameTempFunc(mctx)))
-				if ctx.Player.AutoSetNameTemplate != "" {
-					_, _ = SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
+				if err = updatePlayerGroupCard(mctx); err != nil {
+					ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 
 			case "rest":
@@ -900,8 +956,9 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 				} else {
 					ReplyToSender(mctx, msg, fmt.Sprintf(`%s并没有设置过法术位`, getPlayerNameTempFunc(mctx)))
 				}
-				if ctx.Player.AutoSetNameTemplate != "" {
-					_, _ = SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
+				if err := updatePlayerGroupCard(mctx); err != nil {
+					ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 
 			case "set":
@@ -968,7 +1025,11 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 							iLevelVal = -iLevelVal
 						}
 
-						ret := spellSlotsChange(mctx, msg, iLevel, iLevelVal)
+						ret, err := spellSlotsChange(mctx, msg, iLevel, iLevelVal)
+						if err != nil {
+							ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+							return CmdExecuteResult{Matched: true, Solved: true}
+						}
 						if ret != nil {
 							return *ret
 						}
@@ -1016,7 +1077,11 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 						iLevel, _ := strconv.ParseInt(level, 10, 64)
 						iLevelVal, _ := strconv.ParseInt(levelVal, 10, 64)
 
-						ret := spellSlotsChange(mctx, msg, iLevel, -iLevelVal)
+						ret, err := spellSlotsChange(mctx, msg, iLevel, -iLevelVal)
+						if err != nil {
+							ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+							return CmdExecuteResult{Matched: true, Solved: true}
+						}
 						if ret != nil {
 							return *ret
 						}
@@ -1060,8 +1125,9 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 				if n > 0 {
 					ssText = "。法术位得到了恢复"
 				}
-				if ctx.Player.AutoSetNameTemplate != "" {
-					_, _ = SetPlayerGroupCardByTemplate(ctx, ctx.Player.AutoSetNameTemplate)
+				if err := updatePlayerGroupCard(mctx); err != nil {
+					ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 				ReplyToSender(mctx, msg, fmt.Sprintf(`%s的长休: `+hpText+ssText, getPlayerNameTempFunc(mctx)))
 			default:
@@ -1110,14 +1176,23 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 				}
 
 				var a, b int64
+				var err error
 				switch m[1] {
 				case "s", "S", "成功":
-					a, b = deathSaving(mctx, v, 0)
+					a, b, err = deathSaving(mctx, v, 0)
 				case "f", "F", "失败":
-					a, b = deathSaving(mctx, 0, v)
+					a, b, err = deathSaving(mctx, 0, v)
+				}
+				if err != nil {
+					ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 				text := fmt.Sprintf("%s当前的死亡豁免情况: 成功%d 失败%d", getPlayerNameTempFunc(mctx), a, b)
-				exText := deathSavingResultCheck(mctx, a, b)
+				exText, err := deathSavingResultCheck(mctx, a, b)
+				if err != nil {
+					ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				if exText != "" {
 					text += "\n" + exText
 				}
@@ -1129,7 +1204,11 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 			val := cmdArgs.GetArgN(1)
 			switch val {
 			case "stat":
-				a, b := deathSaving(mctx, 0, 0)
+				a, b, err := deathSaving(mctx, 0, 0)
+				if err != nil {
+					ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				text := fmt.Sprintf("%s当前的死亡豁免情况: 成功%d 失败%d", getPlayerNameTempFunc(mctx), a, b)
 				ReplyToSender(mctx, msg, text)
 			case "help":
@@ -1176,15 +1255,26 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 				}
 
 				if d20 == 20 {
-					deathSavingStable(mctx)
+					if err := deathSavingStable(mctx); err != nil {
+						ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
 					VarSetValueInt64(mctx, "hp", 1)
 					suffix := DiceFormatTmpl(mctx, "DND:死亡豁免_D20_附加语")
 					ReplyToSender(mctx, msg, fmt.Sprintf(`%s的死亡豁免检定: %s=%d %s`, getPlayerNameTempFunc(mctx), exprToShow, d20, suffix))
 				} else if d20 == 1 {
 					suffix := DiceFormatTmpl(mctx, "DND:死亡豁免_D1_附加语")
 					text := fmt.Sprintf(`%s的死亡豁免检定: %s=%d %s`, getPlayerNameTempFunc(mctx), exprToShow, d20, suffix)
-					a, b := deathSaving(mctx, 0, 2)
-					exText := deathSavingResultCheck(mctx, a, b)
+					a, b, err := deathSaving(mctx, 0, 2)
+					if err != nil {
+						ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
+					exText, err := deathSavingResultCheck(mctx, a, b)
+					if err != nil {
+						ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
 					if exText != "" {
 						text += "\n" + exText
 					}
@@ -1193,8 +1283,16 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 				} else if d20 >= 10 {
 					suffix := DiceFormatTmpl(mctx, "DND:死亡豁免_成功_附加语")
 					text := fmt.Sprintf(`%s的死亡豁免检定: %s=%d %s`, getPlayerNameTempFunc(mctx), exprToShow, d20, suffix)
-					a, b := deathSaving(mctx, 1, 0)
-					exText := deathSavingResultCheck(mctx, a, b)
+					a, b, err := deathSaving(mctx, 1, 0)
+					if err != nil {
+						ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
+					exText, err := deathSavingResultCheck(mctx, a, b)
+					if err != nil {
+						ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
 					if exText != "" {
 						text += "\n" + exText
 					}
@@ -1203,8 +1301,16 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 				} else {
 					suffix := DiceFormatTmpl(mctx, "DND:死亡豁免_失败_附加语")
 					text := fmt.Sprintf(`%s的死亡豁免检定: %s=%d %s`, getPlayerNameTempFunc(mctx), exprToShow, d20, suffix)
-					a, b := deathSaving(mctx, 0, 1)
-					exText := deathSavingResultCheck(mctx, a, b)
+					a, b, err := deathSaving(mctx, 0, 1)
+					if err != nil {
+						ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
+					exText, err := deathSavingResultCheck(mctx, a, b)
+					if err != nil {
+						ReplyToSender(mctx, msg, "更新群名片失败："+err.Error())
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
 					if exText != "" {
 						text += "\n" + exText
 					}
@@ -1375,7 +1481,7 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 					text = strings.TrimPrefix(text, ",")
 					text = strings.TrimPrefix(text, "，")
 					// 情况1，名字是自己
-					name = mctx.Player.Name
+					name = mctx.Player.Name()
 					// replace any space or \n with _
 					name = strings.ReplaceAll(name, " ", "_")
 					name = strings.ReplaceAll(name, "\n", "_")
@@ -1383,7 +1489,7 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 					if !exprExists {
 						val = int64(mctx.Roll(20))
 					}
-					uid = mctx.Player.UserID
+					uid = mctx.Player.UserID()
 					return 0, name, val, detail, uid
 				}
 
@@ -1420,8 +1526,11 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 			}
 
 			if solved {
-				riList := (RIList{}).LoadByCurGroup(ctx)
-
+				riList, err := (RIList{}).LoadByCurGroup(ctx)
+				if err != nil {
+					ReplyToSender(ctx, msg, "读取先攻列表失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				var textOut strings.Builder
 				textOut.WriteString(DiceFormatTmpl(mctx, "DND:先攻_设置_前缀"))
 				sort.Sort(items)
@@ -1450,7 +1559,10 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 				}
 
 				sort.Sort(riList)
-				riList.SaveToGroup(ctx)
+				if err = riList.SaveToGroup(ctx); err != nil {
+					ReplyToSender(ctx, msg, "保存先攻列表失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				ReplyToSender(ctx, msg, textOut.String())
 			} else {
 				ReplyToSender(ctx, msg, DiceFormatTmpl(mctx, "DND:先攻_设置_格式错误"))
@@ -1484,8 +1596,11 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 			case "", "list":
 				var textOut strings.Builder
 				textOut.WriteString(DiceFormatTmpl(ctx, "DND:先攻_查看_前缀"))
-				riList := (RIList{}).LoadByCurGroup(ctx)
-
+				riList, err := (RIList{}).LoadByCurGroup(ctx)
+				if err != nil {
+					ReplyToSender(ctx, msg, "读取先攻列表失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				round, _ := VarGetValueInt64(ctx, "$g回合数")
 
 				for order, i := range riList {
@@ -1504,7 +1619,11 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 
 				ReplyToSender(ctx, msg, textOut.String())
 			case "ed", "end":
-				lst := (RIList{}).LoadByCurGroup(ctx)
+				lst, err := (RIList{}).LoadByCurGroup(ctx)
+				if err != nil {
+					ReplyToSender(ctx, msg, "读取先攻列表失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				round, _ := VarGetValueInt64(ctx, "$g回合数")
 				if len(lst) == 0 {
 					ReplyToSender(ctx, msg, "先攻列表为空")
@@ -1556,7 +1675,6 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 						return newList, textOut, false
 					}
 
-					newList.SaveToGroup(ctx)
 					if currentDeleted {
 						if len(newList) == 0 {
 							VarSetValueInt64(ctx, "$g当前回合先攻值", NULL_INIT_VAL)
@@ -1573,10 +1691,20 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 				}
 
 				nameWithSpace, _ := cmdArgs.EatPrefixWith("del", "rm")
-				riList := (RIList{}).LoadByCurGroup(ctx)
-				_, textOut, ok := tryDeleteMembersInInitList([]string{nameWithSpace}, riList)
+				riList, err := (RIList{}).LoadByCurGroup(ctx)
+				if err != nil {
+					ReplyToSender(ctx, msg, "读取先攻列表失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
+				newList, textOut, ok := tryDeleteMembersInInitList([]string{nameWithSpace}, riList)
 				if !ok {
-					_, textOut, _ = tryDeleteMembersInInitList(cmdArgs.Args[1:], riList)
+					newList, textOut, ok = tryDeleteMembersInInitList(cmdArgs.Args[1:], riList)
+				}
+				if ok {
+					if err = newList.SaveToGroup(ctx); err != nil {
+						ReplyToSender(ctx, msg, "保存先攻列表失败："+err.Error())
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
 				}
 				textToSend := DiceFormatTmpl(ctx, "DND:先攻_移除_前缀") + textOut.String()
 
@@ -1598,7 +1726,11 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 
-				riList := (RIList{}).LoadByCurGroup(ctx)
+				riList, err := (RIList{}).LoadByCurGroup(ctx)
+				if err != nil {
+					ReplyToSender(ctx, msg, "读取先攻列表失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				added := false
 				for _, i := range riList {
 					if i.name == name {
@@ -1628,10 +1760,16 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 				VarSetValue(ctx, "$t点数", &r.VMValue)
 				textOut := DiceFormatTmpl(ctx, "DND:先攻_设置_指定单位")
 
-				riList.SaveToGroup(ctx)
+				if err = riList.SaveToGroup(ctx); err != nil {
+					ReplyToSender(ctx, msg, "保存先攻列表失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				ReplyToSender(ctx, msg, textOut)
 			case "clr", "clear":
-				(RIList{}).SaveToGroup(ctx)
+				if err := (RIList{}).SaveToGroup(ctx); err != nil {
+					ReplyToSender(ctx, msg, "清除先攻列表失败："+err.Error())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				VarSetValueInt64(ctx, "$g当前回合先攻值", NULL_INIT_VAL)
 				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "DND:先攻_清除列表"))
 				VarSetValueInt64(ctx, "$g回合数", 0)
@@ -1691,17 +1829,19 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 var dndRiLock sync.Mutex
 
 // LoadByCurGroup 从群信息中加载
-func (lst RIList) LoadByCurGroup(ctx *MsgContext) RIList {
-	am := ctx.Dice.AttrsManager
-	attrs, _ := am.LoadByIdForCtx(ctx, ctx.Group.GroupID)
+func (lst RIList) LoadByCurGroup(ctx *MsgContext) (RIList, error) {
+	attrs, err := ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Group.GroupID())
+	if err != nil {
+		ctx.setExecutionError(err)
+		return nil, err
+	}
 
 	dndRiLock.Lock()
 	riList := attrs.Load("riList")
-	if riList == nil || riList.TypeId != ds.VMTypeArray {
-		riList = ds.NewArrayVal()
-		attrs.Store("riList", riList)
-	}
 	dndRiLock.Unlock()
+	if riList == nil || riList.TypeId != ds.VMTypeArray {
+		return RIList{}, nil
+	}
 
 	ret := RIList{}
 	for _, i := range riList.MustReadArray().List {
@@ -1734,13 +1874,16 @@ func (lst RIList) LoadByCurGroup(ctx *MsgContext) RIList {
 		})
 	}
 
-	return ret
+	return ret, nil
 }
 
 // SaveToGroup 写入群信息中
-func (lst RIList) SaveToGroup(ctx *MsgContext) {
-	am := ctx.Dice.AttrsManager
-	attrs, _ := am.LoadByIdForCtx(ctx, ctx.Group.GroupID)
+func (lst RIList) SaveToGroup(ctx *MsgContext) error {
+	attrs, err := ctx.Dice.AttrsManager.LoadByIdForCtx(ctx, ctx.Group.GroupID())
+	if err != nil {
+		ctx.setExecutionError(err)
+		return err
+	}
 	riList := ds.NewArrayVal()
 
 	ad := riList.MustReadArray()
@@ -1755,8 +1898,12 @@ func (lst RIList) SaveToGroup(ctx *MsgContext) {
 	}
 
 	dndRiLock.Lock()
-	attrs.Store("riList", riList)
+	err = attrs.Store("riList", riList)
 	dndRiLock.Unlock()
+	if err != nil {
+		ctx.setExecutionError(err)
+	}
+	return err
 }
 
 func (lst RIList) GetExists(name string) *RIListItem {

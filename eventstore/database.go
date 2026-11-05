@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,35 +43,38 @@ type DatabaseConfig struct {
 	Type string
 	DSN  string
 
-	// KeySource is required for remote databases and is carried to stores
-	// opened from this database. SQLite callers may supply it explicitly when
-	// using A6 encrypted repositories.
-	KeySource        KeySource
 	DatabaseIdentity string
 
 	TLSVerify             bool
 	AllowInsecureLoopback bool
 
-	ConnectTimeout  time.Duration
-	QueryTimeout    time.Duration
+	ConnectTimeout time.Duration
+	QueryTimeout   time.Duration
+
+	// Pool limits apply to remote databases and to the file-SQLite reader.
+	// The SQLite writer remains pinned to one connection.
 	MaxOpenConns    int
 	MaxIdleConns    int
 	ConnMaxLifetime time.Duration
 }
 
-// Database owns exactly one GORM database and its underlying SQL pool.
+// Database owns one writer GORM database and, when the engine can support it,
+// a separately owned read pool.
 type Database struct {
 	gormDB           *gorm.DB
 	sqlDB            *sql.DB
+	readerGORM       *gorm.DB
+	readerSQLDB      *sql.DB
+	ownsReaderPool   bool
 	databaseIdentity string
-	keySource        KeySource
 
-	mu       sync.Mutex
-	closed   bool
-	closeErr error
+	mu        sync.Mutex
+	closed    bool
+	closeDone chan struct{}
+	closeErr  error
 }
 
-// GORM returns the database handle owned by this instance.
+// GORM returns the writer database handle owned by this instance.
 func (db *Database) GORM() *gorm.DB {
 	if db == nil {
 		return nil
@@ -77,31 +82,12 @@ func (db *Database) GORM() *gorm.DB {
 	return db.gormDB
 }
 
-// SQLDB returns the underlying pool for settings and dialect-specific work.
+// SQLDB returns the writer pool for settings and dialect-specific work.
 func (db *Database) SQLDB() *sql.DB {
 	if db == nil {
 		return nil
 	}
 	return db.sqlDB
-}
-
-// Close releases the pool. It is safe to call more than once on the same
-// Database; only the first call closes the owned pool.
-func (db *Database) Close() error {
-	if db == nil {
-		return nil
-	}
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.closed {
-		return db.closeErr
-	}
-	db.closed = true
-	if db.sqlDB == nil {
-		return nil
-	}
-	db.closeErr = db.sqlDB.Close()
-	return db.closeErr
 }
 
 // statementTimeoutParent preserves caller cancellation and values while hiding
@@ -131,9 +117,6 @@ func OpenDatabase(ctx context.Context, config DatabaseConfig) (*Database, error)
 	if dbType == "" {
 		dbType = "sqlite"
 	}
-	if dbType != "sqlite" && dbType != "sqlite3" && config.KeySource == nil {
-		return nil, ErrKeySourceUnavailable
-	}
 	connectTimeout := config.ConnectTimeout
 	if connectTimeout <= 0 {
 		connectTimeout = defaultDatabaseConnectTimeout
@@ -144,10 +127,11 @@ func OpenDatabase(ctx context.Context, config DatabaseConfig) (*Database, error)
 	}
 
 	var (
-		gormDB       *gorm.DB
-		err          error
-		sqlitePath   string
-		sqliteExists bool
+		gormDB          *gorm.DB
+		err             error
+		sqliteSourceDSN string
+		sqlitePath      string
+		sqliteExists    bool
 	)
 	switch dbType {
 	case "sqlite", "sqlite3":
@@ -159,6 +143,7 @@ func OpenDatabase(ctx context.Context, config DatabaseConfig) (*Database, error)
 			}
 			dsn = filepath.Join(dataDir, "events.db")
 		}
+		sqliteSourceDSN = dsn
 		sqlitePath = sqliteDatabaseFilePath(dsn)
 		sqliteExists = databaseFileExists(sqlitePath)
 		gormDB, err = gorm.Open(sqlite.Open(sqliteDSN(dsn)), &gorm.Config{
@@ -191,7 +176,11 @@ func OpenDatabase(ctx context.Context, config DatabaseConfig) (*Database, error)
 	if err != nil {
 		return nil, safeDatabaseError("acquire pool", dbType, err)
 	}
-	owned := &Database{gormDB: gormDB, sqlDB: sqlDB, keySource: config.KeySource, databaseIdentity: config.DatabaseIdentity}
+	owned := &Database{
+		gormDB: gormDB, sqlDB: sqlDB,
+		readerGORM: gormDB, readerSQLDB: sqlDB,
+		databaseIdentity: config.DatabaseIdentity,
+	}
 	if dbType == "sqlite" || dbType == "sqlite3" {
 		sqlDB.SetMaxOpenConns(1)
 		sqlDB.SetMaxIdleConns(1)
@@ -224,7 +213,7 @@ func OpenDatabase(ctx context.Context, config DatabaseConfig) (*Database, error)
 		return nil, safeDatabaseError("connect", dbType, err)
 	}
 	if dbType == "sqlite" || dbType == "sqlite3" {
-		if err := configureAndValidateSQLite(pingCtx, sqlDB); err != nil {
+		if err := configureAndValidateSQLite(pingCtx, sqlDB, sqlitePath != ""); err != nil {
 			_ = sqlDB.Close()
 			return nil, safeDatabaseError("configure sqlite", dbType, err)
 		}
@@ -235,7 +224,7 @@ func OpenDatabase(ctx context.Context, config DatabaseConfig) (*Database, error)
 		_ = sqlDB.Close()
 		return nil, safeDatabaseError("migrate schema", dbType, databaseLifecycleError(ctx, err))
 	}
-	if err := initializeSingletons(schemaDB); err != nil {
+	if err := initializeSingletons(schemaDB, config.DatabaseIdentity); err != nil {
 		_ = sqlDB.Close()
 		return nil, safeDatabaseError("initialize schema", dbType, databaseLifecycleError(ctx, err))
 	}
@@ -246,6 +235,16 @@ func OpenDatabase(ctx context.Context, config DatabaseConfig) (*Database, error)
 	if err := validateRequiredIndexes(schemaDB); err != nil {
 		_ = sqlDB.Close()
 		return nil, safeDatabaseError("validate indexes", dbType, databaseLifecycleError(ctx, err))
+	}
+	if sqlitePath != "" {
+		readerGORM, readerSQLDB, readerErr := openSQLiteReader(ctx, sqliteSourceDSN, sqlitePath, config, connectTimeout, queryTimeout)
+		if readerErr != nil {
+			_ = sqlDB.Close()
+			return nil, safeDatabaseError("open sqlite reader", dbType, readerErr)
+		}
+		owned.readerGORM = readerGORM
+		owned.readerSQLDB = readerSQLDB
+		owned.ownsReaderPool = true
 	}
 	if sqlitePath != "" {
 		logDatabaseFileState(sealdicelogger.M(), dbType, sqlitePath, sqliteExists)
@@ -280,14 +279,32 @@ func sqliteDatabaseFilePath(dsn string) string {
 	if dsn == "" || dsn == ":memory:" {
 		return ""
 	}
-	dsn = strings.TrimPrefix(dsn, "file:")
-	if queryIndex := strings.IndexByte(dsn, '?'); queryIndex >= 0 {
-		dsn = dsn[:queryIndex]
-	}
-	if dsn == "" || strings.HasPrefix(dsn, ":memory:") {
+	base, rawQuery, _ := strings.Cut(dsn, "?")
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil || strings.EqualFold(query.Get("mode"), "memory") {
 		return ""
 	}
-	return filepath.Clean(dsn)
+	if strings.HasPrefix(strings.ToLower(base), "file:") {
+		parsed, err := url.Parse(dsn)
+		if err != nil || parsed.Host != "" && !strings.EqualFold(parsed.Host, "localhost") {
+			return ""
+		}
+		if parsed.Opaque != "" {
+			base, err = url.PathUnescape(parsed.Opaque)
+			if err != nil {
+				return ""
+			}
+		} else {
+			base = parsed.Path
+		}
+	}
+	if base == "" || strings.HasPrefix(base, ":memory:") {
+		return ""
+	}
+	if runtime.GOOS == "windows" && len(base) >= 3 && base[0] == '/' && base[2] == ':' {
+		base = base[1:]
+	}
+	return filepath.Clean(filepath.FromSlash(base))
 }
 
 func databaseFileExists(path string) bool {
@@ -312,13 +329,16 @@ func logDatabaseFileState(log databaseInitializationLogger, dbType, path string,
 	log.Infof("复用%s事件数据库文件：path=%s", dbType, path)
 }
 
-func configureAndValidateSQLite(ctx context.Context, sqlDB *sql.DB) error {
-	for _, statement := range []string{
-		"PRAGMA journal_mode = WAL",
+func configureAndValidateSQLite(ctx context.Context, sqlDB *sql.DB, requireWAL bool) error {
+	statements := []string{
 		"PRAGMA foreign_keys = ON",
 		"PRAGMA busy_timeout = 15000",
 		"PRAGMA synchronous = FULL",
-	} {
+	}
+	if requireWAL {
+		statements = append([]string{"PRAGMA journal_mode = WAL"}, statements...)
+	}
+	for _, statement := range statements {
 		if _, err := sqlDB.ExecContext(ctx, statement); err != nil {
 			return err
 		}
@@ -327,7 +347,7 @@ func configureAndValidateSQLite(ctx context.Context, sqlDB *sql.DB) error {
 	if err := sqlDB.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&journalMode); err != nil {
 		return err
 	}
-	if !strings.EqualFold(journalMode, "wal") {
+	if requireWAL && !strings.EqualFold(journalMode, "wal") {
 		return errors.New("journal mode is not WAL")
 	}
 	var foreignKeys, busyTimeout, synchronous int
@@ -697,247 +717,51 @@ const sqliteOperationArtifactsDDL = `CREATE TABLE operation_artifacts (
 	safe_filename TEXT,
 	size INTEGER NOT NULL,
 	status TEXT NOT NULL,
-	ciphertext BLOB,
-	nonce BLOB,
-	encryption_key_id TEXT,
-	payload_version INTEGER NOT NULL DEFAULT 1,
+	data BLOB,
 	expires_at DATETIME NOT NULL,
 	consumed_at DATETIME,
 	FOREIGN KEY(operation_id) REFERENCES operations(operation_id) ON UPDATE RESTRICT ON DELETE RESTRICT
 )`
 
 func ensureSQLiteOperationArtifacts(db *gorm.DB) error {
-	var tableCount int
-	if err := db.Raw(
-		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'operation_artifacts'`,
-	).Scan(&tableCount).Error; err != nil {
-		return err
-	}
-	if tableCount == 0 {
+	if !db.Migrator().HasTable(&operationArtifactRow{}) {
 		return db.Exec(sqliteOperationArtifactsDDL).Error
 	}
-
-	type columnRow struct {
+	var columns []struct {
 		Name    string
 		NotNull int `gorm:"column:notnull"`
 	}
-	var columnRows []columnRow
-	if err := db.Raw(
-		`SELECT name, "notnull" FROM pragma_table_info('operation_artifacts')`,
-	).Scan(&columnRows).Error; err != nil {
+	if err := db.Raw(`SELECT name, "notnull" FROM pragma_table_info('operation_artifacts')`).Scan(&columns).Error; err != nil {
 		return err
 	}
-	type columnInfo struct{ notNull int }
-	columns := make(map[string]columnInfo, len(columnRows))
-	for _, column := range columnRows {
-		columns[column.Name] = columnInfo{notNull: column.NotNull}
+	names := make(map[string]int, len(columns))
+	for _, column := range columns {
+		names[column.Name] = column.NotNull
 	}
-	required := []string{"artifact_id", "operation_id", "owner_principal_id", "media_type", "safe_filename", "size", "status", "ciphertext", "nonce", "encryption_key_id", "payload_version", "expires_at", "consumed_at"}
-	for _, column := range required {
-		if _, ok := columns[column]; !ok {
-			if column == "payload_version" {
-				continue
-			}
-			return fmt.Errorf("SQLite operation_artifacts schema is missing %s", column)
+	for _, name := range []string{"artifact_id", "version", "operation_id", "owner_principal_id", "media_type", "safe_filename", "size", "status", "data", "expires_at", "consumed_at"} {
+		if _, ok := names[name]; !ok {
+			return ErrUnsupportedSchema
 		}
 	}
-	versionPresent := false
-	versionNotNull := false
-	if info, ok := columns["version"]; ok {
-		versionPresent = true
-		versionNotNull = info.notNull == 1
+	if names["version"] != 1 {
+		return ErrUnsupportedSchema
 	}
-
-	type foreignKeyRow struct {
+	var keys []struct {
 		Table    string `gorm:"column:table"`
 		From     string `gorm:"column:from"`
 		To       string `gorm:"column:to"`
 		OnUpdate string `gorm:"column:on_update"`
 		OnDelete string `gorm:"column:on_delete"`
 	}
-	var foreignKeys []foreignKeyRow
-	if err := db.Raw(
-		`SELECT "table", "from", "to", on_update, on_delete FROM pragma_foreign_key_list('operation_artifacts')`,
-	).Scan(&foreignKeys).Error; err != nil {
+	if err := db.Raw(`SELECT "table", "from", "to", on_update, on_delete FROM pragma_foreign_key_list('operation_artifacts')`).Scan(&keys).Error; err != nil {
 		return err
 	}
-	fkReady := false
-	for _, foreignKey := range foreignKeys {
-		if foreignKey.Table == tableOperations && foreignKey.From == "operation_id" && foreignKey.To == "operation_id" &&
-			strings.EqualFold(foreignKey.OnUpdate, "RESTRICT") && strings.EqualFold(foreignKey.OnDelete, "RESTRICT") {
-			fkReady = true
-			break
+	for _, key := range keys {
+		if key.Table == tableOperations && key.From == "operation_id" && key.To == "operation_id" && strings.EqualFold(key.OnUpdate, "RESTRICT") && strings.EqualFold(key.OnDelete, "RESTRICT") {
+			return nil
 		}
 	}
-	payloadVersionPresent := false
-	if info, ok := columns["payload_version"]; ok {
-		payloadVersionPresent = info.notNull == 1
-	}
-	if versionPresent && versionNotNull && payloadVersionPresent && fkReady {
-		return nil
-	}
-
-	var indexOwner struct {
-		Table string `gorm:"column:tbl_name"`
-	}
-	indexQuery := db.Raw(
-		`SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?`,
-		"ux_operation_artifacts_artifact_id",
-	).Scan(&indexOwner)
-	if indexQuery.Error != nil {
-		return indexQuery.Error
-	}
-	if indexQuery.RowsAffected != 0 && indexOwner.Table != tableOperationArtifacts {
-		return fmt.Errorf("SQLite index name ux_operation_artifacts_artifact_id is owned by %s", indexOwner.Table)
-	}
-	if versionPresent && !versionNotNull {
-		var nullVersions int
-		if err := db.Raw(
-			`SELECT COUNT(*) FROM operation_artifacts WHERE version IS NULL`,
-		).Scan(&nullVersions).Error; err != nil {
-			return err
-		}
-		if nullVersions != 0 {
-			return errors.New("SQLite operation_artifacts contains NULL versions")
-		}
-	}
-	var orphanCount int
-	if err := db.Raw(
-		`SELECT COUNT(*) FROM operation_artifacts AS a LEFT JOIN operations AS o ON o.operation_id = a.operation_id WHERE o.operation_id IS NULL`,
-	).Scan(&orphanCount).Error; err != nil {
-		return err
-	}
-	if orphanCount != 0 {
-		return errors.New("SQLite operation_artifacts contains orphan operation references")
-	}
-
-	tx := db.Begin()
-	if tx.Error != nil {
-		return tx.Error
-	}
-	rollback := func(cause error) error {
-		_ = tx.Rollback().Error
-		return cause
-	}
-	if err := tx.Exec(`DROP INDEX IF EXISTS ux_operation_artifacts_artifact_id`).Error; err != nil {
-		return rollback(err)
-	}
-	if err := tx.Exec(`ALTER TABLE operation_artifacts RENAME TO operation_artifacts_legacy`).Error; err != nil {
-		return rollback(err)
-	}
-	if err := tx.Exec(sqliteOperationArtifactsDDL).Error; err != nil {
-		return rollback(err)
-	}
-	selectColumns := make([]string, 0, len(required)+1)
-	for _, column := range required {
-		if column == "payload_version" && !payloadVersionPresent {
-			selectColumns = append(selectColumns, "1")
-		} else {
-			selectColumns = append(selectColumns, `"`+column+`"`)
-		}
-	}
-	if versionPresent {
-		selectColumns = append([]string{`"version"`}, selectColumns...)
-	} else {
-		selectColumns = append([]string{"1"}, selectColumns...)
-	}
-	if err := tx.Exec(`INSERT INTO operation_artifacts (` + strings.Join(append([]string{"version"}, required...), ", ") + `) SELECT ` + strings.Join(selectColumns, ", ") + ` FROM operation_artifacts_legacy`).Error; err != nil {
-		return rollback(err)
-	}
-	if err := tx.Exec(`DROP TABLE operation_artifacts_legacy`).Error; err != nil {
-		return rollback(err)
-	}
-	if err := tx.Exec(`CREATE UNIQUE INDEX ux_operation_artifacts_artifact_id ON operation_artifacts(artifact_id)`).Error; err != nil {
-		return rollback(err)
-	}
-	if err := tx.Commit().Error; err != nil {
-		return err
-	}
-	return nil
-}
-
-const (
-	sqliteSchemaMigrationsTable           = "eventstore_schema_migrations"
-	projectionPayloadPresenceMigrationKey = "projection_payload_presence_v1"
-	sqliteSchemaMigrationsDDL             = `CREATE TABLE IF NOT EXISTS eventstore_schema_migrations (
-		migration_key TEXT NOT NULL PRIMARY KEY,
-		completed_at DATETIME NOT NULL
-	)`
-	projectionPayloadPresenceBackfillStatement = `UPDATE projection_read_models
-		SET payload_present = CASE WHEN payload IS NULL THEN FALSE ELSE TRUE END
-		WHERE (payload IS NULL AND payload_present <> FALSE)
-		   OR (payload IS NOT NULL AND payload_present <> TRUE)`
-)
-
-func sqliteSchemaMigrationCompleted(db *gorm.DB, migrationKey string) (bool, error) {
-	var tableCount int
-	if err := db.Raw(
-		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`,
-		sqliteSchemaMigrationsTable,
-	).Scan(&tableCount).Error; err != nil {
-		return false, err
-	}
-	if tableCount == 0 {
-		return false, nil
-	}
-	var completed bool
-	if err := db.Raw(
-		`SELECT EXISTS(SELECT 1 FROM eventstore_schema_migrations WHERE migration_key = ?)`,
-		migrationKey,
-	).Scan(&completed).Error; err != nil {
-		return false, err
-	}
-	return completed, nil
-}
-
-func migrateSQLiteProjectionPayloadPresence(db *gorm.DB) error {
-	if !db.Migrator().HasTable(&projectionReadModelRow{}) {
-		return nil
-	}
-	completed, err := sqliteSchemaMigrationCompleted(db, projectionPayloadPresenceMigrationKey)
-	if err != nil {
-		return err
-	}
-	if completed && db.Migrator().HasColumn(&projectionReadModelRow{}, "payload_present") {
-		return nil
-	}
-
-	tx := db.Begin()
-	if tx.Error != nil {
-		return tx.Error
-	}
-	rollback := func(cause error) error {
-		_ = tx.Rollback().Error
-		return cause
-	}
-	completed, err = sqliteSchemaMigrationCompleted(tx, projectionPayloadPresenceMigrationKey)
-	if err != nil {
-		return rollback(err)
-	}
-	columnPresent := tx.Migrator().HasColumn(&projectionReadModelRow{}, "payload_present")
-	if completed && columnPresent {
-		return tx.Rollback().Error
-	}
-	if err := tx.Exec(sqliteSchemaMigrationsDDL).Error; err != nil {
-		return rollback(err)
-	}
-	if !columnPresent {
-		if err := tx.Migrator().AddColumn(&projectionReadModelRow{}, "PayloadPresent"); err != nil {
-			return rollback(err)
-		}
-	}
-	if err := tx.Exec(projectionPayloadPresenceBackfillStatement).Error; err != nil {
-		return rollback(err)
-	}
-	if err := tx.Exec(
-		`INSERT INTO eventstore_schema_migrations (migration_key, completed_at)
-		 VALUES (?, CURRENT_TIMESTAMP)
-		 ON CONFLICT(migration_key) DO UPDATE SET completed_at = excluded.completed_at`,
-		projectionPayloadPresenceMigrationKey,
-	).Error; err != nil {
-		return rollback(err)
-	}
-	return tx.Commit().Error
+	return ErrUnsupportedSchema
 }
 
 func sqliteQueueSchedulingSchemaUpgradeNeeded(db *gorm.DB) bool {
@@ -964,8 +788,23 @@ func sqliteQueueSchedulingSchemaUpgradeNeeded(db *gorm.DB) bool {
 }
 
 func migrateSchema(db *gorm.DB) error {
-	sqliteProjectionMigrationDeferred := false
-	projectionPayloadPresenceMigrationNeeded := false
+	// Old stores are converted offline into a separate candidate, never
+	// incrementally upgraded by the runtime's AutoMigrate.
+	if db.Migrator().HasTable(&storeReadinessRow{}) {
+		var readiness struct{ SchemaVersion string }
+		if err := db.Model(&storeReadinessRow{}).Select("schema_version").Where("singleton_id = ?", "default").Take(&readiness).Error; err != nil {
+			return ErrReadinessQuarantined
+		}
+		if parseSchemaVersion(readiness.SchemaVersion) != supportedReadinessSchemaVersion {
+			return ErrUnsupportedSchema
+		}
+	} else {
+		for _, table := range requiredEventStoreTables {
+			if db.Migrator().HasTable(table) {
+				return ErrUnsupportedSchema
+			}
+		}
+	}
 	queueSchemaUpgradeNeeded := false
 	if db.Name() == "sqlite" {
 		queueSchemaUpgradeNeeded = sqliteQueueSchedulingSchemaUpgradeNeeded(db)
@@ -975,16 +814,6 @@ func migrateSchema(db *gorm.DB) error {
 		if err := ensureSQLiteOperationArtifacts(db); err != nil {
 			return databaseStage("operation artifacts schema", err)
 		}
-		if db.Migrator().HasTable(&projectionReadModelRow{}) {
-			if err := migrateSQLiteProjectionPayloadPresence(db); err != nil {
-				return databaseStage("projection payload presence migration", err)
-			}
-		} else {
-			sqliteProjectionMigrationDeferred = true
-		}
-	} else {
-		projectionPayloadPresenceMigrationNeeded = db.Migrator().HasTable(&projectionReadModelRow{}) &&
-			!db.Migrator().HasColumn(&projectionReadModelRow{}, "payload_present")
 	}
 
 	models := schemaModels()
@@ -1003,18 +832,6 @@ func migrateSchema(db *gorm.DB) error {
 			"事件数据库 schema 升级完成：phase=queue-schema elapsed=%s",
 			time.Since(schemaUpgradeStarted).Round(time.Millisecond),
 		)
-	}
-	if sqliteProjectionMigrationDeferred {
-		if err := migrateSQLiteProjectionPayloadPresence(db); err != nil {
-			return databaseStage("deferred projection payload presence migration", err)
-		}
-	} else if projectionPayloadPresenceMigrationNeeded {
-		if err := db.Exec(projectionPayloadPresenceBackfillStatement).Error; err != nil {
-			return databaseStage("projection payload presence backfill", err)
-		}
-	}
-	if err := db.AutoMigrate(&privacyAuditRow{}); err != nil {
-		return databaseStage("privacy audit schema", err)
 	}
 	if err := migrateQueueScheduling(db); err != nil {
 		return databaseStage("queue scheduling migration", err)
@@ -1036,12 +853,6 @@ func migrateSchema(db *gorm.DB) error {
 			statement: "ALTER TABLE operation_artifacts ADD CONSTRAINT fk_operation_artifacts_operation " +
 				"FOREIGN KEY (operation_id) REFERENCES operations(operation_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
 		},
-		{
-			model: &subjectFenceRow{},
-			name:  "fk_subject_fences_purge_operation",
-			statement: "ALTER TABLE subject_fences ADD CONSTRAINT fk_subject_fences_purge_operation " +
-				"FOREIGN KEY (purge_operation_id) REFERENCES operations(operation_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
-		},
 	} {
 		if !db.Migrator().HasConstraint(constraint.model, constraint.name) {
 			if err := db.Exec(constraint.statement).Error; err != nil {
@@ -1052,7 +863,7 @@ func migrateSchema(db *gorm.DB) error {
 	return nil
 }
 
-func initializeSingletons(db *gorm.DB) error {
+func initializeSingletons(db *gorm.DB, databaseIdentity string) error {
 	now := time.Now().UTC()
 	if err := db.Where("singleton_id = ?", "default").FirstOrCreate(&eventGlobalSequenceRow{SingletonID: "default", NextPosition: 1, UpdatedAt: now}).Error; err != nil {
 		return err
@@ -1060,7 +871,11 @@ func initializeSingletons(db *gorm.DB) error {
 	if err := db.Where("singleton_id = ?", "default").FirstOrCreate(&projectionControlRow{SingletonID: "default", ActiveGeneration: "initial", ProjectorSetVersion: "initial", PublicationState: "published", UpdatedAt: now}).Error; err != nil {
 		return err
 	}
-	if err := db.Where("singleton_id = ?", "default").FirstOrCreate(&storeReadinessRow{SingletonID: "default", Mode: "fresh", SchemaVersion: "1", DatabaseIdentity: "eventstore", IndexRootID: "unconfigured", EncryptionRootIDs: []byte("[]")}).Error; err != nil {
+	identity := strings.TrimSpace(databaseIdentity)
+	if identity == "" {
+		identity = "eventstore"
+	}
+	if err := db.Where("singleton_id = ?", "default").FirstOrCreate(&storeReadinessRow{SingletonID: "default", Mode: "fresh", SchemaVersion: strconv.FormatUint(uint64(supportedReadinessSchemaVersion), 10), DatabaseIdentity: identity}).Error; err != nil {
 		return err
 	}
 	return nil
@@ -1097,7 +912,8 @@ func validateRequiredIndexes(db *gorm.DB) error {
 		tableInboxMessages:       &inboxMessageRow{},
 		tableOutboxEffects:       &outboxEffectRow{},
 		tableAdapterSecrets:      &adapterSecretRow{},
-		tableSubjectFences:       &subjectFenceRow{},
+		tableRevisionHeads:       &revisionHeadRow{},
+		tableExecutionReceipts:   &executionReceiptRow{},
 		tableManagementActivity:  &managementActivityRow{},
 		tableStoryLogSessions:    &storyLogSessionRow{},
 		tableStoryLogStates:      &storyLogStateRow{},

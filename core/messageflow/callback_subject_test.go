@@ -1,20 +1,20 @@
 package messageflow
 
 import (
-	"bytes"
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
 	"Scardice-core/adapterapi"
+	"Scardice-core/core/execution"
+	"Scardice-core/core/playerstate"
+	"Scardice-core/endpoint"
 	"Scardice-core/eventstore"
 )
 
-// A callback's outputs belong to the subject of the message it handles, so a
-// purge of that subject reaches everything derived from it. That has to hold for
-// output addressed to another conversation too: a hidden roll answers a group
-// command in the sender's private chat, and a notice goes to the owner's group.
-// Rejecting those as "forged" made the bot log them as sent and never send them.
+// Hidden rolls and owner notices remain derived from the originating group,
+// even when the destination conversation is different.
 func TestCallbackOutboundInheritsTheMessageSubjectWhereverItIsAddressed(t *testing.T) {
 	ctx := context.Background()
 	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/subject.db"})
@@ -22,62 +22,83 @@ func TestCallbackOutboundInheritsTheMessageSubjectWhereverItIsAddressed(t *testi
 		t.Fatal(err)
 	}
 	defer db.Close()
-	source := defaultIntegrationKeySource()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(source))
-	if err := store.SetReadiness(ctx, eventstore.Readiness{Mode: "import", SchemaVersion: 1, DatabaseIdentity: "db-1", IndexRootID: "index-v1", EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
-		t.Fatal(err)
-	}
-	service, err := NewOutboundService(store, testResolver{snap: EndpointSnapshot{EndpointID: "endpoint-1", DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected, Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage), IndexRootID: "index-v1", IndexSigner: store}}, store, eventstore.UUIDGenerator{})
+	store := eventstore.NewStore(db)
+	inbound, err := NewInboundService(store)
 	if err != nil {
 		t.Fatal(err)
 	}
-	messageSubject, _, err := store.KeyedDigest(ctx, "privacy-subject/v1", "group-1")
+	if _, err := inbound.HandleInbound(ctx, endpoint.FencedInbound{
+		EndpointID: "endpoint-1", Generation: 1, DesiredVersion: 1,
+		Message: adapterapi.InboundMessage{ProviderEventID: "subject-message", Kind: adapterapi.InboundKindMessage, ConversationKind: adapterapi.ConversationKindGroup, Sender: "user", Conversation: "group", Platform: "test", Text: "hidden roll"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	outbound, err := NewOutboundService(store, testResolver{snap: EndpointSnapshot{
+		EndpointID: "endpoint-1", DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected,
+		Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage),
+	}}, eventstore.UUIDGenerator{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	collector := NewMutationCollector(eventstore.EventFactory{})
-	collector.subjectKey = messageSubject
-	root, _ := source.IndexRootMaterial(ctx)
-
-	// The first effect answers the message in its own conversation, the second
-	// goes elsewhere.
-	for _, conversation := range []string{"group-1", "person-1"} {
-		effect := testEffect()
-		effect.ID, effect.OperationID = adapterapi.EffectID("effect-"+conversation), adapterapi.OperationID("op-"+conversation)
-		effect.Payload.Target.Conversation = adapterapi.ConversationID(conversation)
-		effect.Deadline = time.Now().Add(time.Minute).UTC()
-		if effect.Lane, err = adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, root, 1); err != nil {
-			t.Fatal(err)
-		}
-		prepared, err := service.Prepare(ctx, SubmitRequest{Effect: effect, CommandID: "command-" + conversation, PrincipalID: "principal"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := collector.AddPreparedOutbound(prepared); err != nil {
-			t.Fatalf("effect addressed to %q was refused: %v", conversation, err)
-		}
+	targets := []adapterapi.EffectTarget{
+		{Kind: adapterapi.TargetGroup, Conversation: "group"},
+		{Kind: adapterapi.TargetPerson, Conversation: "person-1"},
+		{Kind: adapterapi.TargetGroup, Conversation: "owner-group"},
 	}
-
-	work, err := collector.UnitOfWork()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(work.Effects) != 2 || len(work.Streams) != 2 {
-		t.Fatalf("staged %d effects and %d streams, want two of each", len(work.Effects), len(work.Streams))
-	}
-	for _, effect := range work.Effects {
-		if !bytes.Equal(effect.SubjectKey, messageSubject) {
-			t.Fatalf("effect %s carries a subject other than the message's", effect.EffectID)
-		}
-	}
-	for _, stream := range work.Streams {
-		for _, event := range stream.Events {
-			if !bytes.Equal(event.Metadata.SubjectKey, messageSubject) {
-				t.Fatalf("stream %s event carries a subject other than the message's", stream.Stream.AggregateID)
+	host := &callbackTestHost{fn: func(ctx context.Context, _ CallbackRequest, _ *playerstate.LocalOverlay, collector *execution.MutationCollector) (CallbackResult, error) {
+		for _, target := range targets {
+			effect := testEffect()
+			effect.ID = adapterapi.EffectID("derived-" + target.Conversation)
+			effect.OperationID = adapterapi.OperationID("operation-" + target.Conversation)
+			effect.Payload.Target = target
+			if target.Kind == adapterapi.TargetGroup {
+				effect.Payload.Kind = adapterapi.EffectPayloadGroupText
+			}
+			effect.Deadline = time.Now().Add(time.Minute).UTC()
+			var err error
+			effect.Lane, err = adapterapi.NewLaneMetadata(effect.EndpointID, target, 1)
+			if err != nil {
+				return CallbackResult{}, err
+			}
+			prepared, err := outbound.Prepare(ctx, SubmitRequest{Effect: effect, CommandID: "command-" + string(target.Conversation), PrincipalID: "principal"})
+			if err != nil {
+				return CallbackResult{}, err
+			}
+			if err := collector.AddPreparedOutbound(prepared.OwnedWork()); err != nil {
+				return CallbackResult{}, err
 			}
 		}
+		return CallbackResult{}, nil
+	}}
+	callback, err := NewCallbackService(CallbackConfig{Inbox: store, Store: store, Resolver: callbackTestResolver{}, Host: host, WorkerID: "worker"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := store.Commit(ctx, work); err != nil {
-		t.Fatalf("commit: %v", err)
+	if _, err := callback.ProcessOne(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var effects []struct {
+		EffectID string
+		Subject  string
+		Lane     string
+		Payload  []byte
+	}
+	if err := db.GORM().Table("outbox_effects").Order("effect_id").Find(&effects).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(effects) != len(targets) || host.calls != 1 {
+		t.Fatalf("effects=%d host calls=%d", len(effects), host.calls)
+	}
+	for _, effect := range effects {
+		var wire effectWire
+		if err := json.Unmarshal(effect.Payload, &wire); err != nil {
+			t.Fatal(err)
+		}
+		if effect.Subject != "group" || effect.Lane != wire.Effect.Lane.Key || wire.Effect.Payload.Text != "hello" {
+			t.Fatalf("derived effect=%+v wire=%+v", effect, wire)
+		}
+		if err := wire.Effect.Validate(); err != nil {
+			t.Fatalf("derived effect %s invalid: %v", effect.EffectID, err)
+		}
 	}
 }

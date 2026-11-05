@@ -54,36 +54,9 @@ globalThis.pluginCompatFixture = {
   },
 
   callbacks(ext) {
-    ext.onMessagePreprocess = function () { globalThis.pluginCompatOrder.push("preprocess"); };
-    ext.onMessageReceived = function () { globalThis.pluginCompatOrder.push("received"); };
-    ext.onCommandReceived = function () { globalThis.pluginCompatOrder.push("command"); };
-    ext.onMessageSend = function () { globalThis.pluginCompatOrder.push("send"); };
-  },
-  durableSmoke(probe) {
-    const plan = {
-      transient: "$t",
-      owners: ["$m", "$g"],
-      attrs: "player",
-      ban: ["add", "remove"],
-      config: "extension",
-      storage: "opaque",
-      callbacks: ["preprocess", "command", "reply", "send"],
-      lifecycle: ["group", "member"],
-    };
-    if (!probe) {
-      return plan;
-    }
-    const transientBefore = probe.transientGet();
-    probe.transientSet("changed");
-    const storageBefore = probe.storageGet();
-    probe.storageSet("opaque-after");
-    return {
-      transient: [transientBefore, probe.transientGet()],
-      owners: [probe.ownerM(), probe.ownerG()],
-      ban: [probe.banAdd(), probe.banRemove()],
-      config: probe.config(),
-      storage: [storageBefore, probe.storageGet()],
-      callbacks: plan.callbacks,
-    };
+    ext.onMessagePreprocess = function () {};
+    ext.onMessageReceived = function () {};
+    ext.onCommandReceived = function () {};
+    ext.onMessageSend = function () {};
   },
 };

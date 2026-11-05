@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"Scardice-core/adapterapi"
 	"Scardice-core/core/messageflow"
 	"Scardice-core/eventstore"
+	"Scardice-core/logger"
 	"Scardice-core/message"
 )
 
@@ -70,21 +72,50 @@ func (*FailClosedOutboundBridge) SubmitAction(*MsgContext, adapterapi.EffectPayl
 }
 
 type outboundSuccessNotification struct {
-	callbackCtx *MsgContext
-	session     *IMSession
-	msg         Message
-	text        string
-	flag        string
-	group       bool
+	dice     *Dice
+	session  *IMSession
+	endpoint *EndPointInfo
+
+	sourceGroupID    string
+	sourcePlayerID   string
+	expectedEndpoint adapterapi.EndpointID
+	expectedTarget   adapterapi.EffectTarget
+	expectedKind     adapterapi.EffectPayloadKind
+	messageType      string
+
+	msg   Message
+	text  string
+	flag  string
+	group bool
+
+	isCurGroupBotOn bool
+	isPrivate       bool
+	commandID       int64
+	currentCommand  string
+	commandHideFlag string
+	privilegeLevel  int
+	groupRoleLevel  int
+	logReplyTime    int64
+	logReplySeq     int64
+	skipLogArchive  bool
 }
+
+// OutboundNotificationOwner admits completion work under a runtime lifetime.
+// Its shutdown boundary must cancel and join every admitted function.
+type OutboundNotificationOwner interface {
+	Go(run func(ctx context.Context)) bool
+}
+
+const outboundSuccessNotificationTimeout = 30 * time.Second
 
 // submits them through messageflow. It intentionally has no provider access.
 type DurableOutboundBridge struct {
-	submitter durableOutboundSubmitter
-	resolver  messageflow.EndpointResolver
-	ids       messageflow.IDGenerator
-	now       func() time.Time
-	mu        sync.Mutex
+	notifications OutboundNotificationOwner
+	submitter     durableOutboundSubmitter
+	resolver      messageflow.EndpointResolver
+	ids           messageflow.IDGenerator
+	now           func() time.Time
+	mu            sync.Mutex
 	// submitMu fences pending registration/reconciliation against terminal
 	// notifications. The notifier waits for Submit to reconcile the committed
 	// effect ID before consuming the callback record.
@@ -92,11 +123,14 @@ type DurableOutboundBridge struct {
 	pending  map[string]outboundSuccessNotification
 }
 
-func NewDurableOutboundBridge(submitter durableOutboundSubmitter, resolver messageflow.EndpointResolver, ids messageflow.IDGenerator) *DurableOutboundBridge {
+func NewDurableOutboundBridge(submitter durableOutboundSubmitter, resolver messageflow.EndpointResolver, ids messageflow.IDGenerator, notifications OutboundNotificationOwner) *DurableOutboundBridge {
 	if ids == nil {
 		ids = eventstore.UUIDGenerator{}
 	}
-	return &DurableOutboundBridge{submitter: submitter, resolver: resolver, ids: ids, now: func() time.Time { return time.Now().UTC() }, pending: make(map[string]outboundSuccessNotification)}
+	return &DurableOutboundBridge{
+		notifications: notifications, submitter: submitter, resolver: resolver, ids: ids,
+		now: func() time.Time { return time.Now().UTC() }, pending: make(map[string]outboundSuccessNotification),
+	}
 }
 
 func (b *DurableOutboundBridge) SubmitText(ctx *MsgContext, msg *Message, text, flag string, group bool) error {
@@ -126,7 +160,7 @@ func (b *DurableOutboundBridge) submitText(requestCtx context.Context, ctx *MsgC
 	if group {
 		payloadKind = adapterapi.EffectPayloadGroupText
 	}
-	return b.submitResolved(requestCtx, ctx, msg, adapterapi.EffectPayload{Kind: payloadKind, Target: target, Text: text}, flag, group, text, endpointID, snapshot, ids, nil)
+	return b.submitResolved(requestCtx, ctx, msg, adapterapi.EffectPayload{Kind: payloadKind, Target: target, Text: text}, flag, group, text, endpointID, ids, nil)
 }
 
 func (b *DurableOutboundBridge) submitForward(ctx *MsgContext, msg *Message, nodes []message.ForwardNode, flag string, group bool) error {
@@ -151,7 +185,7 @@ func (b *DurableOutboundBridge) submitForward(ctx *MsgContext, msg *Message, nod
 		Target:       target,
 		ForwardNodes: payloadNodes,
 	}
-	return b.submitResolved(requestCtx, ctx, msg, payload, flag, group, forwardNodesToText(nodes), endpointID, snapshot, nil, nil)
+	return b.submitResolved(requestCtx, ctx, msg, payload, flag, group, forwardNodesToText(nodes), endpointID, nil, nil)
 }
 
 func outboundTextTarget(adapterKey adapterapi.AdapterKey, endpoint *EndPointInfo, msg *Message, group bool) (adapterapi.EffectTarget, error) {
@@ -207,11 +241,11 @@ func (b *DurableOutboundBridge) submitAction(requestCtx context.Context, ctx *Ms
 }
 
 func (b *DurableOutboundBridge) submit(requestCtx context.Context, ctx *MsgContext, msg *Message, payload adapterapi.EffectPayload, flag string, group bool, text string, ids durableOutboundIDAllocator) error {
-	endpointID, snapshot, err := b.resolveEndpoint(requestCtx, ctx)
+	endpointID, _, err := b.resolveEndpoint(requestCtx, ctx)
 	if err != nil {
 		return err
 	}
-	return b.submitResolved(requestCtx, ctx, msg, payload, flag, group, text, endpointID, snapshot, ids, nil)
+	return b.submitResolved(requestCtx, ctx, msg, payload, flag, group, text, endpointID, ids, nil)
 }
 
 func (b *DurableOutboundBridge) resolveEndpoint(requestCtx context.Context, ctx *MsgContext) (adapterapi.EndpointID, messageflow.EndpointSnapshot, error) {
@@ -241,7 +275,7 @@ func (b *DurableOutboundBridge) resolveExplicitEndpoint(requestCtx context.Conte
 	if err != nil {
 		return "", messageflow.EndpointSnapshot{}, err
 	}
-	if snapshot.IndexSigner == nil || snapshot.IndexRootID == "" || snapshot.EndpointID != endpointID {
+	if snapshot.EndpointID != endpointID {
 		return "", messageflow.EndpointSnapshot{}, ErrDurableOutboundUnsupported
 	}
 	return endpointID, snapshot, nil
@@ -249,12 +283,12 @@ func (b *DurableOutboundBridge) resolveExplicitEndpoint(requestCtx context.Conte
 
 // EnqueueAdapterAPI durably admits an exact native adapter request. Callback
 // invocations stage into their existing collector; standalone calls commit the
-// same encrypted Prepare/Submit shape immediately.
+// same durable Prepare/Submit shape immediately.
 func (b *DurableOutboundBridge) EnqueueAdapterAPI(requestCtx context.Context, ctx *MsgContext, endpointID adapterapi.EndpointID, rawJSON string) (AdapterAPIOperation, error) {
 	if err := adapterapi.ValidateProtocolJSON(rawJSON); err != nil {
 		return AdapterAPIOperation{}, err
 	}
-	endpointID, snapshot, err := b.resolveExplicitEndpoint(requestCtx, ctx, endpointID)
+	endpointID, _, err := b.resolveExplicitEndpoint(requestCtx, ctx, endpointID)
 	if err != nil {
 		return AdapterAPIOperation{}, err
 	}
@@ -272,7 +306,6 @@ func (b *DurableOutboundBridge) EnqueueAdapterAPI(requestCtx context.Context, ct
 		false,
 		"",
 		endpointID,
-		snapshot,
 		nil,
 		&result,
 	)
@@ -308,7 +341,6 @@ func (b *DurableOutboundBridge) submitResolved(
 	group bool,
 	text string,
 	endpointID adapterapi.EndpointID,
-	snapshot messageflow.EndpointSnapshot,
 	newID durableOutboundIDAllocator,
 	resultOut *messageflow.SubmitResult,
 ) error {
@@ -318,7 +350,8 @@ func (b *DurableOutboundBridge) submitResolved(
 	if err := requestCtx.Err(); err != nil {
 		return err
 	}
-	if payload.Kind == adapterapi.EffectPayloadAdapterAPI {
+	switch payload.Kind {
+	case adapterapi.EffectPayloadAdapterAPI:
 		if ctx == nil || ctx.Dice == nil {
 			return ErrDurableOutboundUnsupported
 		}
@@ -328,7 +361,7 @@ func (b *DurableOutboundBridge) submitResolved(
 		if err := ctx.Dice.checkAdapterOutboundCensor(ctx, payload.RequestJSON); err != nil {
 			return err
 		}
-	} else if payload.Kind == adapterapi.EffectPayloadForward {
+	case adapterapi.EffectPayloadForward:
 		if ctx == nil || ctx.Dice == nil {
 			return ErrDurableOutboundUnsupported
 		}
@@ -339,17 +372,10 @@ func (b *DurableOutboundBridge) submitResolved(
 		if err := ctx.Dice.checkAdapterOutboundCensor(ctx, string(requestJSON)); err != nil {
 			return err
 		}
+	default:
+		// Typed payloads have no raw protocol request to pass through the censor.
 	}
-	lane, err := adapterapi.NewLaneMetadataWithSigner(endpointID, payload.Target, 1, func(label string, covered []byte) ([]byte, error) {
-		digest, keyID, signErr := snapshot.IndexSigner.KeyedDigest(requestCtx, label, string(covered))
-		if signErr != nil {
-			return nil, signErr
-		}
-		if keyID != snapshot.IndexRootID {
-			return nil, ErrDurableOutboundUnsupported
-		}
-		return digest, nil
-	})
+	lane, err := adapterapi.NewLaneMetadata(endpointID, payload.Target, 1)
 	if err != nil {
 		return err
 	}
@@ -425,30 +451,33 @@ func (b *DurableOutboundBridge) submitResolved(
 		var notification outboundSuccessNotification
 		if msg != nil {
 			notification = snapshotOutboundNotification(ctx, msg, text, flag, group)
+			notification.expectedEndpoint, notification.expectedTarget, notification.expectedKind = endpointID, payload.Target, payload.Kind
 		}
 		intentUpdate, hasIntent, err := outboundStoryLogIntentUpdate(ctx, msg, payload, text, effectID, b.now())
 		if err != nil {
 			return fmt.Errorf("story log intent: %w", err)
 		}
 		if hasIntent {
-			if err := ctx.callbackTransaction.collector.AddPreparedOutboundWithLog(prepared, intentUpdate); err != nil {
+			if err := ctx.callbackTransaction.collector.AddPreparedOutboundWithLog(prepared.OwnedWork(), intentUpdate); err != nil {
 				return fmt.Errorf("stage outbound effect with log intent: %w", err)
 			}
-			if notification.callbackCtx != nil {
-				notification.callbackCtx.skipLogArchive = true
+			if notification.dice != nil {
+				notification.skipLogArchive = true
 			}
-		} else if err := ctx.callbackTransaction.collector.AddPreparedOutbound(prepared); err != nil {
+		} else if err := ctx.callbackTransaction.collector.AddPreparedOutbound(prepared.OwnedWork()); err != nil {
 			return fmt.Errorf("stage outbound effect: %w", err)
 		}
 		if msg != nil {
 			ctx.callbackTransaction.callbackCommitFence = &b.submitMu
-			ctx.callbackTransaction.callbackAfterCommit = append(ctx.callbackTransaction.callbackAfterCommit, func() {
+			if err := ctx.callbackTransaction.AfterCommitPublication(func() {
 				b.mu.Lock()
 				if _, exists := b.pending[effectID]; !exists {
 					b.pending[effectID] = notification
 				}
 				b.mu.Unlock()
-			})
+			}); err != nil {
+				return fmt.Errorf("register outbound completion: %w", err)
+			}
 		}
 		return nil
 	}
@@ -456,6 +485,7 @@ func (b *DurableOutboundBridge) submitResolved(
 	registered := false
 	if msg != nil {
 		notification = snapshotOutboundNotification(ctx, msg, text, flag, group)
+		notification.expectedEndpoint, notification.expectedTarget, notification.expectedKind = endpointID, payload.Target, payload.Kind
 		b.submitMu.Lock()
 		b.mu.Lock()
 		if _, exists := b.pending[effectID]; !exists {
@@ -516,7 +546,8 @@ func prepareStandaloneGroupFarewell(ctx *MsgContext, msg *Message, text string) 
 	d := ctx.Dice
 	visibleText := visibleReplyText(ctx, text)
 	d.Logger.Infof("发给(群%s): %s", msg.GroupID, visibleText)
-	if d.Config.EnableCensor && d.Config.CensorMode == OnlyOutputReply {
+	config := d.Config()
+	if config != nil && config.EnableCensor && config.CensorMode == OnlyOutputReply {
 		checkText := sealCodeRe.ReplaceAllString(visibleText, "")
 		checkText = cqCodeRe.ReplaceAllString(checkText, "")
 		hit, words, terminate, _ := d.CensorMsg(ctx, msg, checkText, text)
@@ -560,67 +591,107 @@ func standaloneGroupFarewellParts(ctx *MsgContext, text string) []string {
 	return parts
 }
 
-// SubmitDurableGroupQuit atomically accepts an optional farewell followed by a
-// group-quit action. It is only for standalone management requests; callback
-// handlers already own a wider transaction and must stage into that transaction.
+// SubmitDurableGroupQuit atomically stages an optional farewell, endpoint
+// membership removal, and the provider quit action. An active callback keeps
+// its root; an independent management invocation receives a durable root.
 func SubmitDurableGroupQuit(requestCtx context.Context, mctx *MsgContext, groupID, farewell string) error {
-	if requestCtx == nil || mctx == nil || mctx.Dice == nil || mctx.EndPoint == nil || mctx.Dice.DurableStore == nil || strings.TrimSpace(groupID) == "" || mctx.CommandID <= 0 {
+	if requestCtx == nil || mctx == nil || mctx.Dice == nil || mctx.EndPoint == nil ||
+		mctx.Session == nil || mctx.Dice.DurableStore == nil || strings.TrimSpace(groupID) == "" {
 		return adapterapi.ErrInvalidContract
 	}
 	if err := requestCtx.Err(); err != nil {
 		return err
 	}
-	if mctx.callbackTransaction != nil {
-		return ErrDurableOutboundUnsupported
+	if err := mctx.checkExecution(); err != nil {
+		return err
 	}
 	bridge, ok := mctx.Dice.OutboundBridge.(*DurableOutboundBridge)
 	if !ok || bridge == nil {
 		return ErrDurableOutboundUnsupported
 	}
-
 	groupID = strings.TrimSpace(groupID)
-	msg := &Message{MessageType: "group", GroupID: groupID}
-	endpointID, snapshot, err := bridge.resolveEndpoint(requestCtx, mctx)
+	stage := func(transaction *DurableCallbackTransaction) error {
+		return bridge.stageDurableGroupQuit(requestCtx, mctx, transaction, groupID, farewell)
+	}
+	if transaction := mctx.callbackTransaction; transaction != nil {
+		return stage(transaction)
+	}
+	if mctx.CommandID <= 0 {
+		return adapterapi.ErrInvalidContract
+	}
+	canonical, err := json.Marshal(struct {
+		EndpointID string `json:"endpointId"`
+		GroupID    string `json:"groupId"`
+		Farewell   string `json:"farewell,omitempty"`
+		CommandID  int64  `json:"commandId"`
+		Command    string `json:"command,omitempty"`
+	}{
+		EndpointID: mctx.EndPoint.ID, GroupID: groupID, Farewell: farewell,
+		CommandID: mctx.CommandID, Command: strings.TrimSpace(mctx.CurrentCommand),
+	})
 	if err != nil {
 		return err
 	}
-	target, err := outboundTextTarget(snapshot.AdapterKey, mctx.EndPoint, msg, true)
+	invocation := fmt.Sprintf("%s:%s:%d:%s", mctx.EndPoint.ID, groupID, mctx.CommandID, strings.TrimSpace(mctx.CurrentCommand))
+	identity := mctx.Dice.DomainExecutionIdentity("standalone-group-quit", invocation)
+	return mctx.Dice.WithDomainExecution(requestCtx, identity, canonical, stage)
+}
+
+func (b *DurableOutboundBridge) stageDurableGroupQuit(
+	requestCtx context.Context,
+	source *MsgContext,
+	transaction *DurableCallbackTransaction,
+	groupID, farewell string,
+) error {
+	if transaction == nil || transaction.Domain() == nil {
+		return ErrDomainExecutionUnavailable
+	}
+	staged := &MsgContext{
+		MessageType: "group", Dice: source.Dice, Session: source.Session, EndPoint: source.EndPoint,
+		IsCurGroupBotOn: source.IsCurGroupBotOn, IsPrivate: false,
+		CommandID: source.CommandID, CurrentCommand: source.CurrentCommand,
+		CommandHideFlag: source.CommandHideFlag, PrivilegeLevel: source.PrivilegeLevel,
+		GroupRoleLevel: source.GroupRoleLevel, DelegateText: source.DelegateText,
+		callbackTransaction: transaction, callbackMetadata: transaction.metadata,
+		executionContext: transaction.executionContext,
+	}
+	staged.SetSplitKey(source.getSplitKey())
+	sourcePlayerID := ""
+	if source.Group != nil && source.Group.GroupID() == groupID && source.Player != nil {
+		sourcePlayerID = source.Player.UserID()
+	}
+	if err := staged.ResolveExistingDomainConversation(groupID, sourcePlayerID); err != nil {
+		return err
+	}
+	if staged.Group == nil {
+		return fmt.Errorf("group %s does not exist", groupID)
+	}
+	msg := &Message{
+		MessageType: "group", GroupID: groupID,
+		Sender: SenderBase{UserID: source.EndPoint.UserID, Nickname: source.EndPoint.Nickname},
+	}
+	endpointID, snapshot, err := b.resolveEndpoint(requestCtx, staged)
+	if err != nil {
+		return err
+	}
+	target, err := outboundTextTarget(snapshot.AdapterKey, staged.EndPoint, msg, true)
 	if err != nil {
 		return err
 	}
 	var farewellParts []string
 	if farewell != "" {
-		if prepared := prepareStandaloneGroupFarewell(mctx, msg, farewell); prepared != "" {
-			farewellParts = standaloneGroupFarewellParts(mctx, prepared)
+		if prepared := prepareStandaloneGroupFarewell(staged, msg, farewell); prepared != "" {
+			farewellParts = standaloneGroupFarewellParts(staged, prepared)
 		}
 	}
-
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	transaction, err := NewDurableCallbackTransaction(mctx.Dice.DurableStore, collector)
+	effectBase, err := b.ids.NewID()
 	if err != nil {
 		return err
 	}
-	staged := mctx.ShallowCopy()
-	staged.CurrentCommand = mctx.CurrentCommand
-	staged.callbackTransaction = transaction
-	metadataID := fmt.Sprintf("standalone-group-quit:%d", staged.CommandID)
-	if current := strings.TrimSpace(staged.CurrentCommand); current != "" {
-		metadataID += ":" + current
-	}
-	staged.callbackMetadata = eventstore.Metadata{
-		CommandID: metadataID, CorrelationID: metadataID,
-		Producer: "dice/standalone-group-quit", OccurredAt: bridge.now().UTC(),
-	}
-
-	effectBase, err := bridge.ids.NewID()
+	operationBase, err := b.ids.NewID()
 	if err != nil {
 		return err
 	}
-	operationBase, err := bridge.ids.NewID()
-	if err != nil {
-		return err
-	}
-	// 为本次退群操作分配独立身份；分段告别与退群顺序由 collector 的追加顺序保证。
 	var idIndex uint64
 	nextID := func() (string, error) {
 		base := effectBase
@@ -631,73 +702,28 @@ func SubmitDurableGroupQuit(requestCtx context.Context, mctx *MsgContext, groupI
 		idIndex++
 		return id, nil
 	}
-
 	identityBase := strings.TrimSpace(staged.CurrentCommand)
 	if identityBase == "" {
-		identityBase = metadataID
+		identityBase = fmt.Sprintf("standalone-group-quit:%d", staged.CommandID)
 	}
 	for index, part := range farewellParts {
 		staged.CurrentCommand = fmt.Sprintf("%s:farewell:%016x", identityBase, index)
-		if err = bridge.submitResolved(requestCtx, staged, msg, adapterapi.EffectPayload{
+		if err = b.submitResolved(requestCtx, staged, msg, adapterapi.EffectPayload{
 			Kind: adapterapi.EffectPayloadGroupText, Target: target, Text: part,
-		}, "", true, part, endpointID, snapshot, nextID, nil); err != nil {
+		}, "", true, part, endpointID, nextID, nil); err != nil {
 			return err
 		}
 	}
 	staged.CurrentCommand = identityBase + ":quit"
-	if err = bridge.submitResolved(requestCtx, staged, nil, adapterapi.EffectPayload{
+	if err = b.submitResolved(requestCtx, staged, nil, adapterapi.EffectPayload{
 		Kind: adapterapi.EffectPayloadQuit, Target: target,
-	}, "", true, "", endpointID, snapshot, nextID, nil); err != nil {
+	}, "", true, "", endpointID, nextID, nil); err != nil {
 		return err
 	}
-	if err = transaction.Finalize(requestCtx); err != nil {
+	if err := staged.Group.SetActivation(staged.EndPoint.UserID, false, false); err != nil {
 		return err
 	}
-	work, err := collector.UnitOfWork()
-	if err != nil {
-		return err
-	}
-	if err = eventstore.ValidateUnitOfWork(work); err != nil {
-		if errors.Is(err, eventstore.ErrEmptyUnitOfWork) {
-			return nil
-		}
-		return err
-	}
-
-	unlock, err := acquireDurableOutboundCommitFence(requestCtx, transaction.callbackCommitFence)
-	if err != nil {
-		return err
-	}
-	defer unlock()
-	if _, err = mctx.Dice.DurableStore.Commit(requestCtx, work); err != nil {
-		return err
-	}
-	for _, afterCommit := range transaction.callbackAfterCommit {
-		afterCommit()
-	}
-	return nil
-}
-
-func acquireDurableOutboundCommitFence(ctx context.Context, fence callbackCommitFence) (func(), error) {
-	if fence == nil {
-		return func() {}, nil
-	}
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		if fence.TryLock() {
-			if err := ctx.Err(); err != nil {
-				fence.Unlock()
-				return nil, err
-			}
-			return fence.Unlock, nil
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-ticker.C:
-		}
-	}
+	return transaction.Domain().Err()
 }
 
 func outboundStoryLogIntentUpdate(ctx *MsgContext, msg *Message, payload adapterapi.EffectPayload, text, effectID string, createdAt time.Time) (eventstore.LogUpdate, bool, error) {
@@ -711,24 +737,36 @@ func outboundStoryLogIntentUpdate(ctx *MsgContext, msg *Message, payload adapter
 	if !privateHiddenReply && !groupReply {
 		return eventstore.LogUpdate{}, false, nil
 	}
-	if msg == nil || canonicalOnebotGroupID(msg.GroupID) != canonicalOnebotGroupID(ctx.Group.GroupID) {
+	groupID := ctx.Group.GroupID()
+	if msg == nil {
+		return eventstore.LogUpdate{}, false, ErrDurableOutboundUnsupported
+	}
+	if canonicalOnebotGroupID(msg.GroupID) != canonicalOnebotGroupID(groupID) {
+		if groupReply && msg.MessageType == "group" &&
+			strings.TrimSpace(payload.Target.Conversation.String()) == strings.TrimSpace(msg.GroupID) {
+			// A send to another group is not part of this group's story log.
+			return eventstore.LogUpdate{}, false, nil
+		}
 		return eventstore.LogUpdate{}, false, ErrDurableOutboundUnsupported
 	}
 	if privateHiddenReply {
 		if msg.MessageType != "group" ||
-			canonicalOnebotGroupID(ctx.CommandHideFlag) != canonicalOnebotGroupID(ctx.Group.GroupID) ||
+			canonicalOnebotGroupID(ctx.CommandHideFlag) != canonicalOnebotGroupID(groupID) ||
 			strings.TrimSpace(payload.Target.Conversation.String()) != strings.TrimSpace(msg.Sender.UserID) {
 			return eventstore.LogUpdate{}, false, ErrDurableOutboundUnsupported
 		}
 	} else if strings.TrimSpace(payload.Target.Conversation.String()) != strings.TrimSpace(msg.GroupID) {
 		return eventstore.LogUpdate{}, false, ErrDurableOutboundUnsupported
 	}
-	if ctx.callbackTransaction == nil || !ctx.callbackTransaction.HasStoryLogStateUpdate(ctx.Dice.BaseConfig.Name, ctx.Group.GroupID) {
+	if ctx.callbackTransaction == nil || !ctx.callbackTransaction.HasStoryLogStateUpdate(ctx.Dice.BaseConfig.Name, groupID) {
 		if _, err := loadGroupLogState(ctx, ctx.Group); err != nil {
 			return eventstore.LogUpdate{}, false, err
 		}
 	}
-	state := getGroupLogState(ctx.Group)
+	state, err := ctx.Group.GetLogState()
+	if err != nil {
+		return eventstore.LogUpdate{}, false, err
+	}
 	if !state.On || state.Name == "" {
 		return eventstore.LogUpdate{}, false, nil
 	}
@@ -741,7 +779,7 @@ func outboundStoryLogIntentUpdate(ctx *MsgContext, msg *Message, payload adapter
 		return eventstore.LogUpdate{}, false, err
 	}
 	entry := eventstore.StoryLogEntry{
-		DiceID: repository.DiceID(), GroupID: ctx.Group.GroupID, LogName: state.Name,
+		DiceID: repository.DiceID(), GroupID: groupID, LogName: state.Name,
 		Nickname: ctx.EndPoint.Nickname, IMUserID: UserIDExtract(ctx.EndPoint.UserID),
 		Time: ctx.replyLogTime(createdAt), Message: text, IsDice: true, CommandID: ctx.CommandID,
 		CommandInfo: commandInfo, UniformID: ctx.EndPoint.UserID,
@@ -796,9 +834,9 @@ func actionContract(kind adapterapi.EffectPayloadKind) (adapterapi.CapabilitySet
 
 // NotifyOutboundEffectResult is installed as the dispatcher's post-commit
 // notifier. Every terminal outcome consumes the in-memory acceptance record;
-// only a committed success schedules the user hook. Production dispatchers
-// invoke this asynchronously, and submitMu fences it behind Submit's durable
-// result reconciliation.
+// only a committed success schedules the user hook on its runtime owner.
+// submitMu fences notification admission behind Submit's durable result
+// reconciliation.
 func (b *DurableOutboundBridge) NotifyOutboundEffectResult(_ context.Context, effect adapterapi.OutboundEffect, result adapterapi.EffectResult) {
 	if b == nil {
 		return
@@ -811,53 +849,176 @@ func (b *DurableOutboundBridge) NotifyOutboundEffectResult(_ context.Context, ef
 		delete(b.pending, string(effect.ID))
 	}
 	b.mu.Unlock()
-	if !ok || result.Outcome != adapterapi.EffectSucceeded || notification.session == nil {
+	if !ok {
+		return
+	}
+	if err := result.Validate(); err != nil {
+		b.logOutboundSuccessNotificationError(effect.ID, fmt.Errorf("invalid provider completion: %w", err), notification)
+		return
+	}
+	if err := effect.Validate(); err != nil {
+		b.logOutboundSuccessNotificationError(effect.ID, fmt.Errorf("invalid completed effect: %w", err), notification)
+		return
+	}
+	if effect.EndpointID != notification.expectedEndpoint ||
+		effect.Payload.Target != notification.expectedTarget ||
+		effect.Payload.Kind != notification.expectedKind ||
+		result.Artifact != nil || result.GroupInfo != nil {
+		b.logOutboundSuccessNotificationError(effect.ID, errors.New("provider completion does not match accepted effect"), notification)
+		return
+	}
+	if result.Outcome != adapterapi.EffectSucceeded || notification.dice == nil ||
+		notification.session == nil || notification.endpoint == nil {
 		return
 	}
 	sent := notification.msg
-	sent.Platform = "QQ"
+	sent.Platform = notification.endpoint.Platform
 	sent.Message = notification.text
 	sent.RawID = result.ProviderID
 	if notification.group {
 		sent.MessageType = "group"
+		sent.GroupID = effect.Payload.Target.Conversation.String()
 	} else {
 		sent.MessageType = "private"
+		sent.GroupID = ""
 	}
-	if notification.callbackCtx != nil && notification.callbackCtx.EndPoint != nil {
-		sent.Sender = SenderBase{UserID: notification.callbackCtx.EndPoint.UserID, Nickname: notification.callbackCtx.EndPoint.Nickname}
+	if notification.endpoint != nil {
+		sent.Sender = SenderBase{UserID: notification.endpoint.UserID, Nickname: notification.endpoint.Nickname}
 	}
-	callbackCtx := notification.callbackCtx
-	session := notification.session
-	flag := notification.flag
-	go func() {
-		defer func() { _ = recover() }()
-		_ = callbackCtx.runStandaloneMessageScope(func() {
-			session.OnMessageSend(callbackCtx, &sent, flag)
-		})
-	}()
+	if !b.notifications.Go(func(ownerCtx context.Context) {
+		ctx, cancel := context.WithTimeout(ownerCtx, outboundSuccessNotificationTimeout)
+		defer cancel()
+		b.runOutboundSuccessNotification(ctx, effect, result, notification, sent)
+	}) {
+		b.logOutboundSuccessNotificationError(effect.ID, errors.New("outbound notification owner stopped"), notification)
+	}
 }
+
+func (b *DurableOutboundBridge) runOutboundSuccessNotification(
+	ctx context.Context,
+	effect adapterapi.OutboundEffect,
+	result adapterapi.EffectResult,
+	notification outboundSuccessNotification,
+	sent Message,
+) {
+	canonical, err := json.Marshal(struct {
+		EffectID     adapterapi.EffectID     `json:"effectId"`
+		EndpointID   adapterapi.EndpointID   `json:"endpointId"`
+		Target       adapterapi.EffectTarget `json:"target"`
+		ProviderID   string                  `json:"providerId"`
+		SourceGroup  string                  `json:"sourceGroup,omitempty"`
+		SourcePlayer string                  `json:"sourcePlayer,omitempty"`
+		MessageType  string                  `json:"messageType"`
+		MessageText  string                  `json:"messageText"`
+		Notification string                  `json:"notification"`
+	}{
+		EffectID: effect.ID, EndpointID: effect.EndpointID, Target: effect.Payload.Target,
+		ProviderID: result.ProviderID, SourceGroup: notification.sourceGroupID,
+		SourcePlayer: notification.sourcePlayerID, MessageType: sent.MessageType,
+		MessageText: sent.Message, Notification: notification.flag,
+	})
+	if err != nil {
+		b.logOutboundSuccessNotificationError(effect.ID, err, notification)
+		return
+	}
+	identity := notification.dice.DomainExecutionIdentity("outbound-provider-completion", string(effect.ID))
+	err = notification.dice.WithDomainExecution(ctx, identity, canonical, func(transaction *DurableCallbackTransaction) error {
+		callbackCtx, buildErr := notification.newContext(transaction)
+		if buildErr != nil {
+			return buildErr
+		}
+		return runOutboundSuccessHooks(callbackCtx, transaction, notification.session, &sent, notification.flag)
+	})
+	if err != nil {
+		b.logOutboundSuccessNotificationError(effect.ID, err, notification)
+	}
+}
+
+func (*DurableOutboundBridge) logOutboundSuccessNotificationError(effectID adapterapi.EffectID, err error, notification outboundSuccessNotification) {
+	log := logger.M()
+	if notification.dice != nil && notification.dice.Logger != nil {
+		log = notification.dice.Logger
+	}
+	log.Errorf("出站成功回调失败: effect=%s err=%v", effectID, err)
+}
+
+func (notification outboundSuccessNotification) newContext(transaction *DurableCallbackTransaction) (*MsgContext, error) {
+	if transaction == nil || notification.dice == nil || notification.session == nil || notification.endpoint == nil {
+		return nil, ErrDomainExecutionUnavailable
+	}
+	callbackCtx := &MsgContext{
+		MessageType: notification.messageType, EndPoint: notification.endpoint,
+		Session: notification.session, Dice: notification.dice,
+		IsCurGroupBotOn: notification.isCurGroupBotOn, IsPrivate: notification.isPrivate,
+		CommandID: notification.commandID, CurrentCommand: notification.currentCommand,
+		CommandHideFlag: notification.commandHideFlag, PrivilegeLevel: notification.privilegeLevel,
+		GroupRoleLevel: notification.groupRoleLevel,
+		logReplyTime:   notification.logReplyTime, logReplySeq: notification.logReplySeq,
+		skipLogArchive:      notification.skipLogArchive,
+		callbackTransaction: transaction, callbackMetadata: transaction.metadata,
+		executionContext: transaction.executionContext,
+	}
+	if notification.sourceGroupID != "" {
+		if err := callbackCtx.ResolveExistingDomainConversation(notification.sourceGroupID, notification.sourcePlayerID); err != nil {
+			return nil, err
+		}
+		if callbackCtx.Group == nil || (notification.sourcePlayerID != "" && callbackCtx.Player == nil) {
+			return nil, fmt.Errorf("outbound completion source no longer exists: group=%s player=%s", notification.sourceGroupID, notification.sourcePlayerID)
+		}
+	}
+	return callbackCtx, nil
+}
+
+func runOutboundSuccessHooks(
+	callbackCtx *MsgContext,
+	transaction *DurableCallbackTransaction,
+	session *IMSession,
+	sent *Message,
+	flag string,
+) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("outbound completion hook panic: %v", recovered)
+		}
+	}()
+	if err = callbackCtx.runStandaloneMessageScope(func() {
+		session.OnMessageSend(callbackCtx, sent, flag)
+	}); err != nil {
+		return err
+	}
+	if err = callbackCtx.getExecutionError(); err != nil {
+		return err
+	}
+	return transaction.Domain().Err()
+}
+
 func snapshotOutboundNotification(ctx *MsgContext, msg *Message, text, flag string, group bool) outboundSuccessNotification {
+	if ctx == nil || msg == nil {
+		return outboundSuccessNotification{}
+	}
 	session := ctx.Session
 	if session == nil && ctx.EndPoint != nil {
 		session = ctx.EndPoint.Session
 	}
-	endpoint := &EndPointInfo{}
-	if ctx.EndPoint != nil {
-		endpoint.EndPointInfoBase = EndPointInfoBase{
-			ID: ctx.EndPoint.ID, Nickname: ctx.EndPoint.Nickname, UserID: ctx.EndPoint.UserID,
-			Platform: ctx.EndPoint.Platform, ProtocolType: ctx.EndPoint.ProtocolType, Session: session,
-		}
+	snapshot := *msg
+	if msg.Segment != nil {
+		snapshot.Segment = append([]message.IMessageElement(nil), msg.Segment...)
 	}
-	callbackCtx := &MsgContext{
-		MessageType: ctx.MessageType, Group: ctx.Group, Player: ctx.Player,
-		EndPoint: endpoint, Session: session, Dice: ctx.Dice,
-		IsCurGroupBotOn: ctx.IsCurGroupBotOn, IsPrivate: ctx.IsPrivate,
-		CommandID: ctx.CommandID, CurrentCommand: ctx.CurrentCommand,
-		CommandHideFlag: ctx.CommandHideFlag, PrivilegeLevel: ctx.PrivilegeLevel,
-		GroupRoleLevel: ctx.GroupRoleLevel,
-		logReplyTime:   ctx.logReplyTime, logReplySeq: ctx.logReplySeq,
+	notification := outboundSuccessNotification{
+		dice: ctx.Dice, session: session, endpoint: ctx.EndPoint,
+		messageType: ctx.MessageType, msg: snapshot, text: text, flag: flag, group: group,
+		isCurGroupBotOn: ctx.IsCurGroupBotOn, isPrivate: ctx.IsPrivate,
+		commandID: ctx.CommandID, currentCommand: ctx.CurrentCommand,
+		commandHideFlag: ctx.CommandHideFlag, privilegeLevel: ctx.PrivilegeLevel,
+		groupRoleLevel: ctx.GroupRoleLevel, logReplyTime: ctx.logReplyTime, logReplySeq: ctx.logReplySeq,
 	}
-	return outboundSuccessNotification{callbackCtx: callbackCtx, session: session, msg: *msg, text: text, flag: flag, group: group}
+	if ctx.Group != nil {
+		notification.sourceGroupID = ctx.Group.GroupID()
+	}
+	if ctx.Player != nil {
+		notification.sourcePlayerID = ctx.Player.UserID()
+	}
+	return notification
 }
 
 // NotifyOutboundEffectSucceeded retains compatibility with the success-only

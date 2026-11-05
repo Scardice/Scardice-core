@@ -82,21 +82,27 @@ func TestReplyConfigSavePreservesV2Declaration(t *testing.T) {
 func TestReplyConfigVMVersionForExecution(t *testing.T) {
 	t.Parallel()
 
-	testDice := &Dice{}
+	testDice, _ := newCanonicalTestDice(t)
 	legacy := &ReplyConfig{}
 	explicitV2 := &ReplyConfig{VMVersion: ReplyVMVersionV2}
 
-	testDice.Config.VMVersionForReply = ReplyVMVersionV1
+	updateCanonicalTestConfig(t, testDice, func(config *Config) {
+		config.VMVersionForReply = ReplyVMVersionV1
+	})
 	if got := legacy.vmVersionForExecution(testDice); got != ReplyVMVersionV1 {
 		t.Fatalf("legacy file with global V1 resolved to %q", got)
 	}
 
-	testDice.Config.VMVersionForReply = ReplyVMVersionV2
+	updateCanonicalTestConfig(t, testDice, func(config *Config) {
+		config.VMVersionForReply = ReplyVMVersionV2
+	})
 	if got := legacy.vmVersionForExecution(testDice); got != ReplyVMVersionV2 {
 		t.Fatalf("legacy file with global V2 resolved to %q", got)
 	}
 
-	testDice.Config.VMVersionForReply = ReplyVMVersionV1
+	updateCanonicalTestConfig(t, testDice, func(config *Config) {
+		config.VMVersionForReply = ReplyVMVersionV1
+	})
 	if got := explicitV2.vmVersionForExecution(testDice); got != ReplyVMVersionV2 {
 		t.Fatalf("explicit V2 file resolved to %q", got)
 	}

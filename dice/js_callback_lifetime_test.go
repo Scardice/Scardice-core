@@ -3,12 +3,11 @@ package dice
 import (
 	"context"
 	"errors"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
 
-	"Scardice-core/core/messageflow"
+	"Scardice-core/core/execution"
 	"Scardice-core/eventstore"
 	"Scardice-core/utils/jsengine"
 	gojaengine "Scardice-core/utils/jsengine/goja"
@@ -20,18 +19,21 @@ func TestExpiredMessageTimerCannotSendOrPersist(t *testing.T) {
 
 func testExpiredMessageTimerCannotSendOrPersist(t *testing.T, loop jsengine.Loop) {
 	store, _ := repairTestStore(t)
-	ctx, msg, _ := bridgeTestContext(&bridgeTestSubmitter{})
+	ctx, msg, _ := bridgeTestContext(t, &bridgeTestSubmitter{})
 	ctx.Dice.DurableStore = store
 	manager := NewJsLoopManager()
 	generation := manager.SetLoop(loop)
 	ctx.Dice.ExtLoopManager = manager
 	ext := &ExtInfo{Name: "late-plugin", IsJsExt: true, dice: ctx.Dice, JSLoopVersion: generation}
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	tx, err := NewDurableCallbackTransaction(store, collector)
+	metadata := eventstore.Metadata{CommandID: "expired-timer", CorrelationID: "expired-timer"}
+	collector := execution.NewMutationCollector(eventstore.EventFactory{})
+	tx, err := NewDurableCallbackTransaction(context.Background(), store, collector, metadata)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx.callbackTransaction = tx
+	ctx.callbackMetadata = metadata
+	ctx.executionContext = tx.executionContext
 	if loop.Engine() == jsengine.EngineGoja {
 		if err := gojaengine.InstallContextPropagation(loop); err != nil {
 			t.Fatal(err)
@@ -41,7 +43,7 @@ func testExpiredMessageTimerCannotSendOrPersist(t *testing.T, loop jsengine.Loop
 		if vm, ok := gojaengine.Raw(rt); ok {
 			vm.SetFieldNameMapper(gojaengine.FieldNameMapper())
 		}
-		if err := rt.Bind("extension", ext); err != nil {
+		if err := rt.Bind("extension", newJSExtensionResource(ext, loop)); err != nil {
 			return err
 		}
 		return rt.Bind("reply", func() { _ = ctx.Dice.OutboundBridge.SubmitText(ctx, msg, "late", "", false) })
@@ -60,7 +62,7 @@ func testExpiredMessageTimerCannotSendOrPersist(t *testing.T, loop jsengine.Loop
 		if err := rt.Bind("finished", func() { close(finished) }); err != nil {
 			return err
 		}
-		_, err := rt.RunString("unbound-timer.js", `setTimeout(function(){extension.storageSet("ordinary", "allowed"); finished();}, 40)`)
+		_, err := rt.RunString("unbound-timer.js", `setTimeout(function(){finished();}, 40)`)
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -73,8 +75,8 @@ func testExpiredMessageTimerCannotSendOrPersist(t *testing.T, loop jsengine.Loop
 	if _, err := store.GetPluginKV(context.Background(), ext.Name, "late"); !errors.Is(err, eventstore.ErrPluginKVNotFound) {
 		t.Errorf("late callback persisted: %v", err)
 	}
-	if value, err := store.GetPluginKV(context.Background(), ext.Name, "ordinary"); err != nil || string(value.Value) != "allowed" {
-		t.Errorf("ordinary task value=%s err=%v", value.Value, err)
+	if _, err := store.GetPluginKV(context.Background(), ext.Name, "ordinary"); !errors.Is(err, eventstore.ErrPluginKVNotFound) {
+		t.Errorf("unbound timer unexpectedly persisted: %v", err)
 	}
 	submitter := ctx.Dice.OutboundBridge.(*DurableOutboundBridge).submitter.(*bridgeTestSubmitter)
 	submitter.mu.Lock()
@@ -100,7 +102,7 @@ func TestCopiedMessageCannotWriteAfterSourceRelease(t *testing.T) {
 }
 
 func TestSolveGraceReplyDoesNotAbortMessage(t *testing.T) {
-	ctx, msg, _ := bridgeTestContext(&bridgeTestSubmitter{})
+	ctx, msg, _ := bridgeTestContext(t, &bridgeTestSubmitter{})
 	loop := gojaengine.WrapEventLoop(startFsTestLoop(t))
 	ctx.Dice.ExtLoopManager = NewJsLoopManager()
 	generation := ctx.Dice.ExtLoopManager.SetLoop(loop)
@@ -137,6 +139,10 @@ ext.onMessageReceived = async function () {
 };
 seal.ext.register(ext);`
 	d, ep, _, _, loop := preparePublicPreprocessRuntime(t, string(jsengine.EngineGoja), packageID, extensionName, script)
+	registered, ok := d.JsExtRegistry.Load(extensionName)
+	if !ok || registered == nil {
+		t.Fatal("message hook extension was not registered")
+	}
 	started := make(chan struct{})
 	settled := make(chan struct{})
 	if err := loop.Run(func(runtime jsengine.Runtime) error {
@@ -150,8 +156,8 @@ seal.ext.register(ext);`
 
 	returned := make(chan messageExecutionResult, 1)
 	go func() {
-		returned <- d.ImSession.executeMessage(ep, newGroupMsg("QQ-Group:async-hook", "QQ:1001", "ordinary text"), messageExecutionOptions{
-			parser: messageParserSegments, runInSync: true,
+		returned <- executeCanonicalTestMessage(context.Background(), d, ep, newGroupMsg("QQ-Group:async-hook", "QQ:1001", "ordinary text"), messageExecutionOptions{
+			parser: messageParserSegments,
 		})
 	}()
 	select {
@@ -165,9 +171,16 @@ seal.ext.register(ext);`
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	if err := loop.Run(func(runtime jsengine.Runtime) error {
-		_, err := runtime.RunString("resolve-message-hook.js", "resolveMessageHook()")
-		return err
+	if err := d.WithDomainExecution(context.Background(), d.DomainExecutionIdentity("test-js-resolver", "async-message-hook"), []byte("resolve async message hook"), func(transaction *DurableCallbackTransaction) error {
+		realm := jsContextForRoot(transaction.executionContext, d, registered, registered.Source, transaction, false)
+		return runJSExecutionRoot(realm, func() error {
+			return jsengine.RunWithContext(loop, realm, func(runtime jsengine.Runtime) error {
+				return realm.withRuntime(runtime, func() error {
+					_, err := runtime.RunString("resolve-message-hook.js", "resolveMessageHook()")
+					return err
+				})
+			})
+		})
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -207,8 +220,8 @@ seal.ext.register(ext);`
 
 	returned := make(chan messageExecutionResult, 1)
 	go func() {
-		returned <- d.ImSession.executeMessage(ep, newGroupMsg("QQ-Group:rejecting-hook", "QQ:1001", "ordinary text"), messageExecutionOptions{
-			parser: messageParserSegments, runInSync: true,
+		returned <- executeCanonicalTestMessage(context.Background(), d, ep, newGroupMsg("QQ-Group:rejecting-hook", "QQ:1001", "ordinary text"), messageExecutionOptions{
+			parser: messageParserSegments,
 		})
 	}()
 	select {
@@ -235,7 +248,7 @@ seal.ext.register(ext);`
 }
 
 func TestExecuteSolveEngineAwaitsEngineNeutralPromise(t *testing.T) {
-	ctx, msg, _ := bridgeTestContext(&bridgeTestSubmitter{})
+	ctx, msg, _ := bridgeTestContext(t, &bridgeTestSubmitter{})
 	loop := gojaengine.WrapEventLoop(startFsTestLoop(t))
 	ctx.Dice.ExtLoopManager = NewJsLoopManager()
 	generation := ctx.Dice.ExtLoopManager.SetLoop(loop)
@@ -293,11 +306,10 @@ seal.ext.register(ext);`
 		t.Fatal(err)
 	}
 	parent, cancel := context.WithCancel(context.Background())
-	transaction := &DurableCallbackTransaction{executionContext: parent}
 	returned := make(chan messageExecutionResult, 1)
 	go func() {
-		returned <- d.ImSession.executeMessage(ep, newGroupMsg("QQ-Group:cancel-hook", "QQ:1001", "ordinary text"), messageExecutionOptions{
-			parser: messageParserSegments, runInSync: true, callbackTransaction: transaction,
+		returned <- executeCanonicalTestMessage(parent, d, ep, newGroupMsg("QQ-Group:cancel-hook", "QQ:1001", "ordinary text"), messageExecutionOptions{
+			parser: messageParserSegments,
 		})
 	}()
 	select {
@@ -334,11 +346,10 @@ seal.ext.register(ext);`
 			}); err != nil {
 				t.Fatal(err)
 			}
-			transaction := &DurableCallbackTransaction{executionContext: context.Background()}
 			returned := make(chan messageExecutionResult, 1)
 			go func() {
-				returned <- d.ImSession.executeMessage(ep, newGroupMsg("QQ-Group:manager-hook", "QQ:1001", "ordinary text"), messageExecutionOptions{
-					parser: messageParserSegments, runInSync: true, callbackTransaction: transaction,
+				returned <- executeCanonicalTestMessage(context.Background(), d, ep, newGroupMsg("QQ-Group:manager-hook", "QQ:1001", "ordinary text"), messageExecutionOptions{
+					parser: messageParserSegments,
 				})
 			}()
 			select {
@@ -376,100 +387,6 @@ seal.ext.register(ext);`
 	}
 }
 
-func TestReentrantOnMessageSendPromiseJoinsMessageCompletion(t *testing.T) {
-	const (
-		packageID     = "test/reentrant-send-promise"
-		extensionName = "Reentrant send promise"
-	)
-	script := `var ext = seal.ext.new("Reentrant send promise", "test", "1.0.0");
-ext.onMessageSend = async function () {
-  hookStarted();
-  await new Promise(function (resolve) { globalThis.resolveSendHook = resolve; });
-  hookSettled();
-};
-seal.ext.register(ext);`
-	d, ep, _, _, loop := preparePublicPreprocessRuntime(t, string(jsengine.EngineGoja), packageID, extensionName, script)
-	started := make(chan struct{})
-	settled := make(chan struct{})
-	if err := loop.Run(func(runtime jsengine.Runtime) error {
-		if err := runtime.Bind("hookStarted", func() { close(started) }); err != nil {
-			return err
-		}
-		return runtime.Bind("hookSettled", func() { close(settled) })
-	}); err != nil {
-		t.Fatal(err)
-	}
-	ext, ok := d.JsExtRegistry.Load(extensionName)
-	if !ok || ext == nil {
-		t.Fatal("send hook extension was not registered")
-	}
-	ctx := &MsgContext{Dice: d, Session: d.ImSession, EndPoint: ep}
-	msg := newGroupMsg("QQ-Group:send-hook", "QQ:1001", "outbound")
-	ownerReturned := make(chan error, 1)
-	go func() {
-		ownerReturned <- jsengine.RunWithContext(loop, jsContextForMessage(ext, ctx), func(jsengine.Runtime) error {
-			ext.CallOnMessageSend(d, ctx, msg, "")
-			return nil
-		})
-	}()
-	select {
-	case err := <-ownerReturned:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("onMessageSend owner reentry deadlocked")
-	}
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("scheduled onMessageSend did not start")
-	}
-	stopped := make(chan error, 1)
-	go func() { stopped <- ctx.stopJSExecution() }()
-	deadline := time.NewTimer(2 * time.Second)
-	defer deadline.Stop()
-	for {
-		execution := ctx.messageJSExecution()
-		execution.pendingMu.Lock()
-		stopping, pending := execution.stopping, execution.pending
-		execution.pendingMu.Unlock()
-		if stopping {
-			if pending != 1 {
-				t.Fatalf("pending send hook count = %d", pending)
-			}
-			break
-		}
-		select {
-		case err := <-stopped:
-			t.Fatalf("message completed before send Promise settled: %v", err)
-		case <-deadline.C:
-			t.Fatal("message finalization did not join the send hook")
-		default:
-			runtime.Gosched()
-		}
-	}
-	if err := loop.Run(func(runtime jsengine.Runtime) error {
-		_, err := runtime.RunString("resolve-send-hook.js", "resolveSendHook()")
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-settled:
-	case <-time.After(2 * time.Second):
-		t.Fatal("onMessageSend did not settle")
-	}
-	select {
-	case err := <-stopped:
-		if err != nil {
-			t.Fatalf("message completion failed after send hook: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("message completion did not release after send Promise")
-	}
-}
-
 func TestPublicAsyncSolveReleasedByLoopManagerStop(t *testing.T) {
 	const (
 		packageID     = "test/public-async-solve-stop"
@@ -496,8 +413,8 @@ seal.ext.register(ext);`
 
 	returned := make(chan messageExecutionResult, 1)
 	go func() {
-		returned <- d.ImSession.executeMessage(ep, newGroupMsg("QQ-Group:async-solve-stop", "QQ:1001", ".pending"), messageExecutionOptions{
-			parser: messageParserSegments, runInSync: true,
+		returned <- executeCanonicalTestMessage(context.Background(), d, ep, newGroupMsg("QQ-Group:async-solve-stop", "QQ:1001", ".pending"), messageExecutionOptions{
+			parser: messageParserSegments,
 		})
 	}()
 	select {

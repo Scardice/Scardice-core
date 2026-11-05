@@ -9,9 +9,8 @@ import (
 )
 
 var DefaultConfig = Config{
-	nil,
-	ConfigVersion,
-	BaseConfig{
+	ConfigVersion: ConfigVersion,
+	BaseConfig: BaseConfig{
 		CommandCompatibleMode:   true, // 一直为true即可
 		LastSavedTime:           nil,
 		NoticeIDs:               []string{"UI:1001"},
@@ -48,7 +47,7 @@ var DefaultConfig = Config{
 		Name:                    "default",
 		DataDir:                 "data/default",
 	},
-	RateLimitConfig{
+	RateLimitConfig: RateLimitConfig{
 		RateLimitEnabled:          false,
 		PersonalReplenishRateStr:  "@every 3s",
 		PersonalReplenishRate:     rate.Every(time.Second * 3),
@@ -59,24 +58,24 @@ var DefaultConfig = Config{
 		SpamSameCommandWindowSec:  30,
 		SpamRecoveryMultiplierMax: 5,
 	},
-	QuitInactiveConfig{
+	QuitInactiveConfig: QuitInactiveConfig{
 		QuitInactiveThreshold:         0,
 		quitInactiveCronEntry:         0,
 		QuitInactiveNoticeSummaryMode: false,
 		QuitInactiveBatchSize:         10,
 		QuitInactiveBatchWait:         30,
 	},
-	ExtConfig{
+	ExtConfig: ExtConfig{
 		DefaultCocRuleIndex: 0,
 		MaxExecuteTime:      12,
 		MaxCocCardGen:       5,
 		CocCardMergeForward: false,
 		ExtDefaultSettings:  make([]*ExtDefaultSettingItem, 0),
 	},
-	BanConfig{
+	BanConfig: BanConfig{
 		BanList: nil,
 	},
-	JsConfig{
+	JsConfig: JsConfig{
 		JsEnable:               true,
 		JsEngine:               "goja",
 		QuickJSMemoryLimitMiB:  256,
@@ -84,20 +83,20 @@ var DefaultConfig = Config{
 		QuickJSMaxStackSizeKiB: 1024,
 		DisabledJsScripts:      make(map[string]bool),
 	},
-	StoryLogConfig{
+	StoryLogConfig: StoryLogConfig{
 		LogSizeNoticeEnable: true,
 		LogSizeNoticeCount:  500,
 	},
-	MailConfig{
+	MailConfig: MailConfig{
 		MailEnable:   false,
 		MailFrom:     "",
 		MailPassword: "",
 		MailSMTP:     "",
 	},
-	NewsConfig{
+	NewsConfig: NewsConfig{
 		NewsMark: "",
 	},
-	CensorConfig{
+	CensorConfig: CensorConfig{
 		EnableCensor:         false,
 		CensorMode:           0,
 		CensorThresholds:     make(map[censor.Level]int),
@@ -107,14 +106,14 @@ var DefaultConfig = Config{
 		CensorMatchPinyin:    false,
 		CensorFilterRegexStr: "",
 	},
-	PublicDiceConfig{
+	PublicDiceConfig: PublicDiceConfig{
 		Enable: false,
 	},
-	StoreConfig{
+	StoreConfig: StoreConfig{
 		BackendUrls:         []string{},
 		DisabledBackendUrls: []string{},
 	},
-	DirtyConfig{
+	DirtyConfig: DirtyConfig{
 		DeckList: nil,
 		CommandPrefix: []string{
 			"!",

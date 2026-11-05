@@ -45,47 +45,71 @@ type diceRollShaper struct {
 }
 
 func (g *GroupInfo) getDiceRollShaper() *diceRollShaper {
-	if g == nil {
+	if g == nil || g.requireRuntimeAuthority() != nil {
 		return nil
 	}
-	g.rollShaperMu.Lock()
-	defer g.rollShaperMu.Unlock()
-	mode, ok := parseDiceRollShaperMode(g.RollShaperMode)
+	mode, ok := parseDiceRollShaperMode(g.RollShaperMode())
 	if !ok {
 		mode = DiceRollShaperModeRaw
 	}
-	if g.rollShaper == nil {
-		g.rollShaper = newDiceRollShaper(mode)
-	} else if g.rollShaper.getMode() != mode {
-		g.rollShaper.setMode(mode)
+
+	g.rollShaperCacheMu.Lock()
+	defer g.rollShaperCacheMu.Unlock()
+	if g.localRollShaper != nil && g.localRollShaper.getMode() == mode {
+		return g.localRollShaper
 	}
-	return g.rollShaper
+
+	resources := g.runtime
+	resources.rollShaperMu.Lock()
+	shared := resources.rollShaper
+	resources.rollShaperMu.Unlock()
+	if shared != nil && shared.getMode() == mode {
+		return shared
+	}
+
+	local := newDiceRollShaper(mode)
+	g.localRollShaper = local
+	if g.transaction != nil {
+		_ = g.transaction.AfterCommit(func() {
+			currentMode, valid := parseDiceRollShaperMode(g.RollShaperMode())
+			if !valid {
+				currentMode = DiceRollShaperModeRaw
+			}
+			if resources.revoked.Load() || currentMode != mode {
+				return
+			}
+			resources.rollShaperMu.Lock()
+			if !resources.revoked.Load() {
+				resources.rollShaper = local
+			}
+			resources.rollShaperMu.Unlock()
+		})
+	}
+	return local
 }
 
-func (g *GroupInfo) setDiceRollShaperMode(raw string) (DiceRollShaperMode, bool) {
+func (g *GroupInfo) setDiceRollShaperMode(raw string) (DiceRollShaperMode, bool, error) {
 	mode, ok := parseDiceRollShaperMode(raw)
 	if !ok {
-		return DiceRollShaperModeRaw, false
+		return DiceRollShaperModeRaw, false, nil
 	}
-
-	g.rollShaperMu.Lock()
-	defer g.rollShaperMu.Unlock()
-	g.RollShaperMode = string(mode)
-	if g.rollShaper == nil {
-		g.rollShaper = newDiceRollShaper(mode)
-	} else {
-		g.rollShaper.setMode(mode)
+	if g == nil {
+		return DiceRollShaperModeRaw, false, ErrGroupHandleUnavailable
 	}
-	return mode, true
+	if err := g.SetRollShaperMode(string(mode)); err != nil {
+		return DiceRollShaperModeRaw, false, err
+	}
+	if g.getDiceRollShaper() == nil {
+		return DiceRollShaperModeRaw, false, ErrGroupRuntimeRevoked
+	}
+	return mode, true, nil
 }
 
 func (g *GroupInfo) getDiceRollShaperMode() DiceRollShaperMode {
 	if g == nil {
 		return DiceRollShaperModeRaw
 	}
-	g.rollShaperMu.Lock()
-	defer g.rollShaperMu.Unlock()
-	mode, ok := parseDiceRollShaperMode(g.RollShaperMode)
+	mode, ok := parseDiceRollShaperMode(g.RollShaperMode())
 	if !ok {
 		return DiceRollShaperModeRaw
 	}
@@ -100,20 +124,7 @@ func newDiceRollShaper(mode DiceRollShaperMode) *diceRollShaper {
 	return &diceRollShaper{mode: normalized, bags: make(map[int64][]int64)}
 }
 
-func (s *diceRollShaper) setMode(mode DiceRollShaperMode) {
-	normalized, ok := parseDiceRollShaperMode(string(mode))
-	if !ok {
-		normalized = DiceRollShaperModeRaw
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.mode = normalized
-	s.bags = make(map[int64][]int64)
-}
-
 func (s *diceRollShaper) getMode() DiceRollShaperMode {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.mode
 }
 

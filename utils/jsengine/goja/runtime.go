@@ -20,8 +20,9 @@ import (
 var realms sync.Map
 
 var (
-	errJSONParseUnavailable = errors.New("Goja JSON.parse intrinsic is unavailable")
-	errGojaStaleValue       = errors.New("Goja value belongs to an expired runtime callback")
+	errJSONParseUnavailable = errors.New("goja JSON.parse intrinsic is unavailable")
+	errGojaStaleValue       = errors.New("goja value belongs to an expired runtime callback")
+	errGojaLoopClosed       = errors.New("goja event loop is closed")
 )
 
 type fieldNameMapper struct {
@@ -115,13 +116,15 @@ func (s *contextState) with(context any, run func() error) (err error) {
 }
 
 type realm struct {
-	vm          *goja.Runtime
-	state       *contextState
-	tracker     *asyncContextTracker
-	promiseThen goja.Callable
-	jsonParse   goja.Callable
-	jsonMu      sync.RWMutex
-	closed      atomic.Bool
+	vm             *goja.Runtime
+	state          *contextState
+	tracker        *asyncContextTracker
+	host           *gojaHostState
+	promiseThen    goja.Callable
+	jsonParse      goja.Callable
+	jsonMu         sync.RWMutex
+	closed         atomic.Bool
+	asyncCallbacks asyncCallbackRegistry
 
 	promiseMu     sync.Mutex
 	promises      map[*promiseObservation]struct{}
@@ -142,6 +145,10 @@ func (r *realm) attach(vm *goja.Runtime) {
 	}
 	r.vm = vm
 	r.tracker.vm = vm
+	if r.host != nil {
+		r.host.close()
+	}
+	r.host = newGojaHostState(vm, r)
 	r.promiseThen = nil
 	var jsonParse goja.Callable
 	_ = vm.Try(func() {
@@ -167,6 +174,10 @@ func (r *realm) close() {
 	r.jsonMu.Lock()
 	r.jsonParse = nil
 	r.jsonMu.Unlock()
+	if r.host != nil {
+		r.host.close()
+	}
+	r.asyncCallbacks.close()
 	r.closePromiseObservations()
 	if r.tracker != nil {
 		r.tracker.close()
@@ -210,7 +221,6 @@ type eventLoop struct {
 	realm     atomic.Pointer[realm]
 	closed    atomic.Bool
 	running   atomic.Bool
-	once      sync.Once
 	context   atomic.Bool
 	observer  atomic.Pointer[observerBox]
 	depth     atomic.Int32
@@ -218,6 +228,10 @@ type eventLoop struct {
 	started   chan struct{}
 	startOnce sync.Once
 	vm        atomic.Pointer[goja.Runtime]
+
+	lifecycleMu sync.Mutex
+	active      sync.WaitGroup
+	closeDone   chan struct{}
 }
 
 func currentGoroutineID() uint64 {
@@ -252,10 +266,16 @@ func (r *runtime) enterValueScope() uint64 {
 		next = r.nextValueScope.Add(1)
 	}
 	r.activeValueScope.Store(next)
+	if r.realm != nil && r.realm.host != nil {
+		r.realm.host.enter(r)
+	}
 	return previous
 }
 
 func (r *runtime) leaveValueScope(previous uint64) {
+	if r.realm != nil && r.realm.host != nil {
+		r.realm.host.leave(r)
+	}
 	r.activeValueScope.Store(previous)
 }
 
@@ -294,8 +314,9 @@ func WrapEventLoop(loop *eventloop.EventLoop) jsengine.Loop {
 		return existing.(*eventLoop)
 	}
 	created := &eventLoop{
-		loop:    loop,
-		started: make(chan struct{}),
+		loop:      loop,
+		started:   make(chan struct{}),
+		closeDone: make(chan struct{}),
 	}
 	created.realm.Store(newRealm())
 	actual, _ := eventRealms.LoadOrStore(loop, created)
@@ -309,14 +330,20 @@ func (l *eventLoop) currentRealm() *realm {
 	return l.realm.Load()
 }
 
-func (l *eventLoop) attachRealm(vm *goja.Runtime) *realm {
+func (l *eventLoop) attachRealm(vm *goja.Runtime) (*realm, error) {
+	l.lifecycleMu.Lock()
+	defer l.lifecycleMu.Unlock()
+	if l.closed.Load() {
+		return nil, errGojaLoopClosed
+	}
+	l.vm.Store(vm)
 	candidate := l.currentRealm()
 	if candidate == nil {
 		candidate = newRealm()
 	}
 	realm := publishRealm(vm, candidate)
 	l.realm.Store(realm)
-	return realm
+	return realm, nil
 }
 
 // signalStarted releases callers waiting for StartInForeground to claim the
@@ -334,14 +361,20 @@ func StartInForeground(loop jsengine.Loop) error {
 	if !ok || adapter.loop == nil {
 		return errors.New("goja event loop is required")
 	}
+	adapter.lifecycleMu.Lock()
 	if adapter.closed.Load() {
+		adapter.lifecycleMu.Unlock()
 		adapter.signalStarted()
-		return errors.New("goja event loop is closed")
+		return errGojaLoopClosed
 	}
 	if !adapter.running.CompareAndSwap(false, true) {
+		adapter.lifecycleMu.Unlock()
 		adapter.signalStarted()
 		return errors.New("goja event loop is already running")
 	}
+	adapter.active.Add(1)
+	adapter.lifecycleMu.Unlock()
+	defer adapter.active.Done()
 	adapter.signalStarted()
 	owner := currentGoroutineID()
 	previousOwner := adapter.ownerGID.Load()
@@ -410,9 +443,18 @@ func (l *eventLoop) observe(context any, phase jsengine.InvocationPhase, run fun
 	return box.ObserveInvocation(context, phase, run)
 }
 
-func (l *eventLoop) invoke(context any, phase jsengine.InvocationPhase, run func(jsengine.Runtime) error, vm *goja.Runtime) error {
-	l.vm.Store(vm)
-	realm := l.attachRealm(vm)
+func (l *eventLoop) invoke(context any, phase jsengine.InvocationPhase, run func(jsengine.Runtime) error, vm *goja.Runtime) (err error) {
+	// Recover inside the callback supplied to raw Run: a panic escaping its
+	// initial callback bypasses the fork's running-state cleanup.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("goja runtime callback panic: %v", recovered)
+		}
+	}()
+	realm, err := l.attachRealm(vm)
+	if err != nil {
+		return err
+	}
 	rootBoundary := realm.tracker.enterBoundary()
 	defer realm.tracker.exitBoundary(rootBoundary)
 	owner := currentGoroutineID()
@@ -438,28 +480,30 @@ func (l *eventLoop) runWithContext(context any, phase jsengine.InvocationPhase, 
 		return errors.New("goja runtime callback is nil")
 	}
 	if l == nil || l.loop == nil || l.closed.Load() {
-		return errors.New("goja event loop is closed")
+		return errGojaLoopClosed
 	}
 	execution := jsengine.ContextForExecution(context)
 	if err := execution.Err(); err != nil {
 		return err
 	}
+	l.lifecycleMu.Lock()
+	if l.closed.Load() {
+		l.lifecycleMu.Unlock()
+		return errGojaLoopClosed
+	}
 	if l.running.Load() {
 		done := make(chan error, 1)
 		var state atomic.Int32 // queued=0, running=1, canceled=2
-		if !l.loop.RunOnLoop(func(vm *goja.Runtime) {
+		accepted := l.loop.RunOnLoop(func(vm *goja.Runtime) {
 			if !state.CompareAndSwap(0, 1) {
 				done <- execution.Err()
 				return
 			}
-			defer func() {
-				if recovered := recover(); recovered != nil {
-					done <- fmt.Errorf("goja runtime callback panic: %v", recovered)
-				}
-			}()
 			done <- l.invoke(context, phase, run, vm)
-		}) {
-			return errors.New("goja event loop is closed")
+		})
+		l.lifecycleMu.Unlock()
+		if !accepted {
+			return errGojaLoopClosed
 		}
 		select {
 		case err := <-done:
@@ -471,6 +515,15 @@ func (l *eventLoop) runWithContext(context any, phase jsengine.InvocationPhase, 
 			<-done //nolint:errcheck // Join the callback; cancellation takes precedence over its result.
 			return execution.Err()
 		}
+	}
+	l.active.Add(1)
+	l.lifecycleMu.Unlock()
+	defer l.active.Done()
+	owner := currentGoroutineID()
+	previousOwner := l.ownerGID.Load()
+	if owner != 0 {
+		l.ownerGID.Store(owner)
+		defer l.ownerGID.Store(previousOwner)
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -491,15 +544,17 @@ func (l *eventLoop) scheduleWithContext(context any, run func(jsengine.Runtime) 
 		return errors.New("goja runtime callback is nil")
 	}
 	if l == nil || l.loop == nil || l.closed.Load() {
-		return errors.New("goja event loop is closed")
+		return errGojaLoopClosed
+	}
+	l.lifecycleMu.Lock()
+	defer l.lifecycleMu.Unlock()
+	if l.closed.Load() {
+		return errGojaLoopClosed
 	}
 	if !l.loop.RunOnLoop(func(vm *goja.Runtime) {
-		defer func() {
-			_ = recover()
-		}()
 		_ = l.invoke(context, jsengine.InvocationSchedule, run, vm)
 	}) {
-		return errors.New("goja event loop is closed")
+		return errGojaLoopClosed
 	}
 	return nil
 }
@@ -601,26 +656,50 @@ func (l *eventLoop) LoadEntryWithContext(context any, entry jsengine.Entry) erro
 	})
 }
 
+// Close seals user work before asking the original loop to stop. An owner
+// callback cannot join itself; a later non-owner Close still joins teardown.
 func (l *eventLoop) Close() error {
 	if l == nil || l.loop == nil {
 		return nil
 	}
-	l.once.Do(func() {
-		l.closed.Store(true)
-		realm := l.currentRealm()
-		if realm != nil {
+	l.lifecycleMu.Lock()
+	first := !l.closed.Swap(true)
+	if first {
+		if vm := l.vm.Load(); vm != nil {
+			vm.Interrupt(errGojaLoopClosed)
+		}
+		if realm := l.currentRealm(); realm != nil {
 			realm.close()
 		}
-		if vm := l.vm.Load(); vm != nil {
-			vm.Interrupt(errors.New("goja event loop is closed"))
-			if realm != nil {
-				realms.CompareAndDelete(vm, realm)
-			}
+		// Queue the stop on the existing loop so a racing raw Start/Run
+		// cannot miss it by starting after an external StopNoWait call.
+		l.loop.RunOnLoop(func(*goja.Runtime) { l.loop.StopNoWait() })
+	}
+	l.lifecycleMu.Unlock()
+	if first {
+		if l.InOwner() {
+			go l.finishClose()
+		} else {
+			l.finishClose()
 		}
-		eventRealms.Delete(l.loop)
-		l.loop.Terminate()
-	})
+	} else if !l.InOwner() {
+		<-l.closeDone
+	}
 	return nil
+}
+
+func (l *eventLoop) finishClose() {
+	defer close(l.closeDone)
+	// Start/Run register before releasing lifecycleMu. No new registration is
+	// possible after closed, including a startup that has not reached raw yet.
+	l.active.Wait()
+	l.loop.Terminate()
+	if vm := l.vm.Load(); vm != nil {
+		if realm := l.currentRealm(); realm != nil {
+			realms.CompareAndDelete(vm, realm)
+		}
+	}
+	eventRealms.CompareAndDelete(l.loop, l)
 }
 
 func (r *runtime) Engine() jsengine.EngineID {
@@ -715,14 +794,14 @@ func WrapValueForRuntime(engine jsengine.Runtime, raw goja.Value) (jsengine.Valu
 func UnwrapValueForRuntime(engine jsengine.Runtime, adapted jsengine.Value) (goja.Value, error) {
 	owner, ok := engine.(*runtime)
 	if !ok || owner == nil || owner.vm == nil || owner.realm == nil || owner.realm.closed.Load() {
-		return nil, errors.New("Goja runtime is required")
+		return nil, errors.New("goja runtime is required")
 	}
 	wrapped, ok := adapted.(value)
 	if !ok || wrapped.realm == nil || wrapped.value == nil {
-		return nil, errors.New("Goja value is required")
+		return nil, errors.New("goja value is required")
 	}
 	if wrapped.realm != owner.realm || owner.realm.vm != owner.vm {
-		return nil, errors.New("Goja value belongs to another realm")
+		return nil, errors.New("goja value belongs to another realm")
 	}
 	_, ownerScope := owner.valueScope()
 	if err := validateValueScope(wrapped.owner, wrapped.scope, owner, ownerScope); err != nil {
@@ -747,7 +826,7 @@ func (r *runtime) RunString(filename, source string) (jsengine.Value, error) {
 
 func (r *runtime) ParseJSON(raw string) (jsengine.Value, error) {
 	if r == nil || r.vm == nil || r.realm == nil || r.realm.vm != r.vm {
-		return nil, errors.New("Goja runtime is closed")
+		return nil, errors.New("goja runtime is closed")
 	}
 	owner, scope := r.valueScope()
 	if owner == nil {
@@ -756,7 +835,7 @@ func (r *runtime) ParseJSON(raw string) (jsengine.Value, error) {
 	r.realm.jsonMu.RLock()
 	defer r.realm.jsonMu.RUnlock()
 	if r.realm.closed.Load() {
-		return nil, errors.New("Goja runtime is closed")
+		return nil, errors.New("goja runtime is closed")
 	}
 	if r.realm.jsonParse == nil {
 		return nil, errJSONParseUnavailable
@@ -784,7 +863,7 @@ func (r *runtime) Get(name string) jsengine.Value {
 
 func (r *runtime) Set(name string, raw interface{}) error {
 	owner, scope := r.valueScope()
-	value, err := unwrapObject(raw, r.realm, owner, scope)
+	value, err := prepareGojaHostValue(raw, r.realm, owner, scope)
 	if err != nil {
 		return err
 	}
@@ -795,7 +874,7 @@ func (o object) Set(name string, raw interface{}) error {
 	if !o.usable() {
 		return errGojaStaleValue
 	}
-	value, err := unwrapObject(raw, o.realm, o.owner, o.scope)
+	value, err := prepareGojaHostValue(raw, o.realm, o.owner, o.scope)
 	if err != nil {
 		return err
 	}
@@ -834,7 +913,7 @@ func validateValueScope(valueOwner *runtime, valueScope uint64, owner *runtime, 
 		return errGojaStaleValue
 	}
 	if valueOwner != owner || valueScope != ownerScope {
-		return errors.New("Goja value belongs to another runtime callback")
+		return errors.New("goja value belongs to another runtime callback")
 	}
 	return nil
 }
@@ -870,7 +949,7 @@ func unwrapObject(raw interface{}, realm *realm, owner *runtime, scope uint64) (
 
 func (r *runtime) Bind(name string, raw interface{}) error {
 	owner, scope := r.valueScope()
-	value, err := unwrapObject(raw, r.realm, owner, scope)
+	value, err := prepareGojaHostValue(raw, r.realm, owner, scope)
 	if err != nil {
 		return err
 	}
@@ -965,59 +1044,7 @@ func InstallContextPropagation(loop jsengine.Loop) error {
 		if realm == nil {
 			return errors.New("goja realm is required")
 		}
-		if err := vm.Set("__scardiceWrapAsync", func(call goja.FunctionCall) goja.Value {
-			callback, ok := goja.AssertFunction(call.Argument(0))
-			if !ok {
-				return call.Argument(0)
-			}
-			context := adapter.CurrentContext()
-			return vm.ToValue(func(callbackCall goja.FunctionCall) goja.Value {
-				rootBoundary := realm.tracker.enterBoundary()
-				defer realm.tracker.exitBoundary(rootBoundary)
-				var result goja.Value
-				if jsengine.ContextForExecution(context).Err() != nil {
-					return goja.Undefined()
-				}
-				if err := realm.state.with(context, func() error {
-					return runWithExecutionContext(jsengine.ContextForExecution(context), vm, func() error {
-						return adapter.observe(context, jsengine.InvocationReaction, func() error {
-							var err error
-							result, err = callback(callbackCall.This, callbackCall.Arguments...)
-							return err
-						})
-					})
-				}); err != nil {
-					if jsengine.ContextForExecution(context).Err() != nil {
-						return goja.Undefined()
-					}
-					panic(err)
-				}
-				return result
-			})
-		}); err != nil {
-			return err
-		}
-		if _, err := vm.RunString(`(function () {
-			var wrap = globalThis.__scardiceWrapAsync;
-			for (const name of ["setTimeout", "setInterval", "setImmediate"]) {
-				const original = globalThis[name];
-				if (typeof original !== "function") continue;
-				globalThis[name] = function (callback) {
-					var args = Array.prototype.slice.call(arguments, 1);
-					args.unshift(wrap(callback));
-					return original.apply(this, args);
-				};
-			}
-			if (typeof globalThis.queueMicrotask === "function") {
-				var originalQueueMicrotask = globalThis.queueMicrotask;
-				globalThis.queueMicrotask = function (callback) {
-					return originalQueueMicrotask.call(this, wrap(callback));
-				};
-			}
-		})();`); err != nil {
-			return err
-		}
-		return nil
+		return adapter.installContextTimers(vm, realm)
 	}); err != nil {
 		return err
 	}

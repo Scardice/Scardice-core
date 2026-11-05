@@ -348,6 +348,25 @@ func (discardAsyncSink) Event(RequestID, Response) error    { return nil }
 func (discardAsyncSink) Complete(RequestID, Response) error { return nil }
 func (discardAsyncSink) Close(RequestID, Response) error    { return nil }
 
+// Match the native provider's bounded history without retaining completed
+// request contexts, services, or callback sinks.
+const maxCompletedRequests = 1024
+
+type completedRequest struct {
+	kind EventKind
+	err  error
+}
+
+func (p completedRequest) deliver(kind EventKind) error {
+	if kind != EventData && kind != EventComplete && kind != EventClose {
+		return fmt.Errorf("%w: event kind %d", ErrInvalidService, kind)
+	}
+	if kind == p.kind && kind != EventData {
+		return nil
+	}
+	return p.err
+}
+
 type asyncRequest struct {
 	registry    *Registry
 	id          RequestID
@@ -367,23 +386,15 @@ func cloneResponse(response Response) Response {
 	return response
 }
 func (p *asyncRequest) deliver(kind EventKind, response Response) error {
-	if kind != EventData && kind != EventComplete && kind != EventClose {
-		return fmt.Errorf("%w: event kind %d", ErrInvalidService, kind)
-	}
-	response = cloneResponse(response)
-	if response.Status == 0 {
-		response.Status = StatusOK
-	}
-
 	p.mu.Lock()
 	if p.terminal {
-		err := p.terminalError
-		terminalKind := p.terminalKind
+		completed := completedRequest{kind: p.terminalKind, err: p.terminalError}
 		p.mu.Unlock()
-		if kind == terminalKind && kind != EventData {
-			return nil
-		}
-		return err
+		return completed.deliver(kind)
+	}
+	if kind != EventData && kind != EventComplete && kind != EventClose {
+		p.mu.Unlock()
+		return fmt.Errorf("%w: event kind %d", ErrInvalidService, kind)
 	}
 	terminal := kind == EventComplete || kind == EventClose
 	if terminal {
@@ -392,8 +403,10 @@ func (p *asyncRequest) deliver(kind EventKind, response Response) error {
 		p.terminalError = asyncTerminalError(p, response.Status)
 	}
 	sink := p.sink
+	registry := p.registry
 	p.mu.Unlock()
 
+	response = cloneResponse(response)
 	var err error
 	switch kind {
 	case EventData:
@@ -403,8 +416,8 @@ func (p *asyncRequest) deliver(kind EventKind, response Response) error {
 	case EventClose:
 		err = sink.Close(p.id, response)
 	}
-	if terminal && p.registry != nil {
-		p.registry.finishRequest(p)
+	if terminal && registry != nil {
+		registry.finishRequest(p)
 	}
 	return err
 }
@@ -429,23 +442,39 @@ func (p *asyncRequest) Close(id RequestID, response Response) error {
 	return p.deliver(EventClose, response)
 }
 
-func (p *asyncRequest) cancel(status Status) (bool, error) {
+func (p *asyncRequest) cancel(status Status) error {
 	p.mu.Lock()
 	if p.terminal {
 		p.mu.Unlock()
-		return false, nil
+		return nil
 	}
 	p.terminal = true
 	p.terminalKind = EventClose
 	p.terminalError = asyncTerminalError(p, status)
 	sink := p.sink
+	service := p.service
+	registry := p.registry
 	p.mu.Unlock()
 
-	err := sink.Close(p.id, Response{Status: status})
-	if p.registry != nil {
-		p.registry.finishRequest(p)
+	sinkErr := sink.Close(p.id, Response{Status: status})
+	if registry != nil {
+		registry.finishRequest(p)
 	}
-	return true, err
+	// This local owns the provider through cancellation even after terminal
+	// delivery has removed the full request from the registry.
+	cancelErr := service.Cancel(p.id)
+	if sinkErr != nil {
+		return sinkErr
+	}
+	if cancelErr != nil {
+		return &CallError{
+			Status:    StatusInternal,
+			Service:   p.serviceName,
+			Operation: p.operation,
+			Cause:     cancelErr,
+		}
+	}
+	return nil
 }
 
 func (p *asyncRequest) fail(err error) {
@@ -453,6 +482,9 @@ func (p *asyncRequest) fail(err error) {
 	p.terminal = true
 	p.terminalKind = EventClose
 	p.terminalError = err
+	p.sink = discardAsyncSink{}
+	p.service = nil
+	p.registry = nil
 	p.mu.Unlock()
 }
 
@@ -487,11 +519,30 @@ func (r *Registry) finishRequest(request *asyncRequest) {
 		return
 	}
 	request.mu.Lock()
-	// Keep the service reference for the in-flight Cancel call that may follow
-	// a terminal transition; release the callback sink once no more callbacks
-	// can be delivered.
+	completed := completedRequest{kind: request.terminalKind, err: request.terminalError}
 	request.sink = discardAsyncSink{}
+	request.service = nil
+	request.registry = nil
 	request.mu.Unlock()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.requests[request.id] != request {
+		return
+	}
+	delete(r.requests, request.id)
+	if r.completed == nil {
+		r.completed = make(map[RequestID]completedRequest, maxCompletedRequests)
+		r.completedOrder = make([]RequestID, 0, maxCompletedRequests)
+	}
+	if len(r.completedOrder) < maxCompletedRequests {
+		r.completedOrder = append(r.completedOrder, request.id)
+	} else {
+		delete(r.completed, r.completedOrder[r.completedNext])
+		r.completedOrder[r.completedNext] = request.id
+		r.completedNext = (r.completedNext + 1) % maxCompletedRequests
+	}
+	r.completed[request.id] = completed
 }
 
 // PolicyProvider supplies the default policy for a call when the caller did
@@ -507,6 +558,9 @@ type Registry struct {
 	owners         map[string]*Installation
 	installations  []*Installation
 	requests       map[RequestID]*asyncRequest
+	completed      map[RequestID]completedRequest
+	completedOrder []RequestID
+	completedNext  int
 	nextRequest    RequestID
 	policyProvider PolicyProvider
 	closed         bool
@@ -704,24 +758,15 @@ func (r *Registry) Close() error {
 	r.owners = make(map[string]*Installation)
 	r.installations = nil
 	r.requests = nil
+	r.completed = nil
+	r.completedOrder = nil
+	r.completedNext = 0
 	r.mu.Unlock()
 
 	var firstErr error
 	for _, request := range requests {
-		active, sinkErr := request.cancel(StatusClosed)
-		if !active {
-			continue
-		}
-		if sinkErr != nil && firstErr == nil {
-			firstErr = sinkErr
-		}
-		if err := request.service.Cancel(request.id); err != nil && firstErr == nil {
-			firstErr = &CallError{
-				Status:    StatusInternal,
-				Service:   request.serviceName,
-				Operation: request.operation,
-				Cause:     err,
-			}
+		if err := request.cancel(StatusClosed); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	for _, installation := range installations {
@@ -852,17 +897,17 @@ func (r *Registry) start(call Call, sink AsyncSink) (RequestID, error) {
 	if r.requests == nil {
 		r.requests = make(map[RequestID]*asyncRequest)
 	}
-	var id RequestID
-	for {
-		r.nextRequest++
-		if r.nextRequest == 0 {
-			continue
-		}
-		if _, exists := r.requests[r.nextRequest]; !exists {
-			id = r.nextRequest
-			break
+	if r.nextRequest == ^RequestID(0) {
+		r.mu.Unlock()
+		return 0, &CallError{
+			Status:    StatusInternal,
+			Service:   serviceName,
+			Operation: call.Request.Operation,
+			Cause:     errors.New("service request IDs exhausted"),
 		}
 	}
+	r.nextRequest++
+	id := r.nextRequest
 	request := &asyncRequest{
 		registry:    r,
 		id:          id,
@@ -886,13 +931,15 @@ func (r *Registry) start(call Call, sink AsyncSink) (RequestID, error) {
 		if r.requests[id] == request {
 			delete(r.requests, id)
 		}
+		delete(r.completed, id)
 		r.mu.Unlock()
 		return 0, callErr
 	}
 	return id, nil
 }
 
-// Deliver routes one provider event to a pending request.
+// Deliver routes one provider event to an active request or its retained
+// terminal evidence. Requests outside the completion window are not found.
 func (r *Registry) Deliver(id RequestID, kind EventKind, response Response) error {
 	if r == nil {
 		return ErrRegistryClosed
@@ -905,15 +952,21 @@ func (r *Registry) Deliver(id RequestID, kind EventKind, response Response) erro
 		r.mu.RUnlock()
 		return ErrRegistryClosed
 	}
-	request, ok := r.requests[id]
+	request := r.requests[id]
+	if request != nil {
+		r.mu.RUnlock()
+		return request.deliver(kind, response)
+	}
+	completed, ok := r.completed[id]
 	r.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("%w: %d", ErrRequestNotFound, id)
 	}
-	return request.deliver(kind, response)
+	return completed.deliver(kind)
 }
 
-// Cancel requests termination and closes the request sink exactly once.
+// Cancel requests termination and closes the request sink exactly once. A
+// completed request remains idempotent only while its terminal evidence is kept.
 func (r *Registry) Cancel(id RequestID) error {
 	if r == nil {
 		return ErrRegistryClosed
@@ -926,28 +979,17 @@ func (r *Registry) Cancel(id RequestID) error {
 		r.mu.RUnlock()
 		return ErrRegistryClosed
 	}
-	request, ok := r.requests[id]
-	r.mu.RUnlock()
-	if !ok {
-		return fmt.Errorf("%w: %d", ErrRequestNotFound, id)
+	request := r.requests[id]
+	if request != nil {
+		r.mu.RUnlock()
+		return request.cancel(StatusCancelled)
 	}
-	active, sinkErr := request.cancel(StatusCancelled)
-	if !active {
+	_, completed := r.completed[id]
+	r.mu.RUnlock()
+	if completed {
 		return nil
 	}
-	cancelErr := request.service.Cancel(id)
-	if sinkErr != nil {
-		return sinkErr
-	}
-	if cancelErr != nil {
-		return &CallError{
-			Status:    StatusInternal,
-			Service:   request.serviceName,
-			Operation: request.operation,
-			Cause:     cancelErr,
-		}
-	}
-	return nil
+	return fmt.Errorf("%w: %d", ErrRequestNotFound, id)
 }
 
 // Invoke dispatches a concrete service or returns deterministic unsupported

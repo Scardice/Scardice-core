@@ -28,7 +28,7 @@ func check(c echo.Context) (bool, error) {
 	if dm.JustForTest {
 		return false, Error(&c, "展示模式不支持该操作", Response{"testMode": true})
 	}
-	if !myDice.Config.EnableCensor {
+	if !myDice.Config().EnableCensor {
 		return false, Error(&c, "未启用拦截引擎", Response{})
 	}
 	if myDice.CensorManager == nil {
@@ -51,12 +51,16 @@ func censorRestart(c echo.Context) error {
 		return Error(&c, "展示模式不支持该操作", Response{"testMode": true})
 	}
 
+	if err := myDice.DurableMutateConfig(c.Request().Context(), "censor-enable", true, func(config *dice.Config) error {
+		config.EnableCensor = true
+		return nil
+	}); err != nil {
+		return Error(&c, err.Error(), Response{"code": "config_update_failed"})
+	}
 	myDice.NewCensorManager()
-	(&myDice.Config).EnableCensor = true
-	myDice.MarkModified()
 
 	return Success(&c, Response{
-		"enable":    myDice.Config.EnableCensor,
+		"enable":    myDice.Config().EnableCensor,
 		"isLoading": myDice.CensorManager.IsLoading,
 	})
 }
@@ -67,16 +71,11 @@ func censorStop(c echo.Context) error {
 		return err
 	}
 
-	(&myDice.Config).EnableCensor = false
-	myDice.MarkModified()
-	// 数据库统一管理，不再单独管理
-	// db, err2 := myDice.CensorManager.DB.DB()
-	// if err2 != nil {
-	//	return Error(&c, "关闭拦截引擎失败", Response{})
-	// }
-	// err = db.Close()
-	if err != nil {
-		return err
+	if err = myDice.DurableMutateConfig(c.Request().Context(), "censor-enable", false, func(config *dice.Config) error {
+		config.EnableCensor = false
+		return nil
+	}); err != nil {
+		return Error(&c, err.Error(), Response{"code": "config_update_failed"})
 	}
 	myDice.CensorManager = nil
 
@@ -89,13 +88,13 @@ func censorGetStatus(c echo.Context) error {
 		isLoading = myDice.CensorManager.IsLoading
 	}
 	return Success(&c, Response{
-		"enable":    myDice.Config.EnableCensor,
+		"enable":    myDice.Config().EnableCensor,
 		"isLoading": isLoading,
 	})
 }
 
 func censorGetConfig(c echo.Context) error {
-	config := myDice.Config
+	config := myDice.Config()
 	levelConfig := map[string]LevelConfig{
 		"notice":  getLevelConfig(censor.Notice, config.CensorThresholds, config.CensorHandlers, config.CensorScores),
 		"caution": getLevelConfig(censor.Caution, config.CensorThresholds, config.CensorHandlers, config.CensorScores),
@@ -173,7 +172,7 @@ func censorSetConfig(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, err)
 	}
 
-	config := &myDice.Config
+	config, _ := myDice.ConfigEditSnapshot()
 	if val, ok := jsonMap["filterRegex"]; ok {
 		filterRegex, ok := val.(string)
 		if ok {
@@ -237,7 +236,7 @@ func censorSetConfig(c echo.Context) error {
 					}
 					if val, ok = confMap["handlers"]; ok {
 						handlers := stringConvert(val)
-						setLevelHandlers(level, handlers)
+						config.CensorHandlers[level] = levelHandlersValue(handlers)
 					}
 					if val, ok = confMap["score"]; ok {
 						score := val.(float64)
@@ -247,13 +246,14 @@ func censorSetConfig(c echo.Context) error {
 			}
 		}
 	}
-	myDice.MarkModified()
-	myDice.Parent.Save()
+	if err = myDice.DurableCommitConfigSnapshot(c.Request().Context(), config, config.CommandPrefix, config.DiceMasters, nil); err != nil {
+		return Error(&c, err.Error(), Response{"code": "config_update_failed"})
+	}
 
 	return Success(&c, Response{})
 }
 
-func setLevelHandlers(level censor.Level, handlers []string) {
+func levelHandlersValue(handlers []string) uint8 {
 	newHandlers := make(map[dice.CensorHandler]bool)
 	for _, newH := range handlers {
 		switch newH {
@@ -282,8 +282,7 @@ func setLevelHandlers(level censor.Level, handlers []string) {
 	handlerVal = newHandlerVal(handlerVal, dice.BanInviter, newHandlers)
 	handlerVal = newHandlerVal(handlerVal, dice.AddScore, newHandlers)
 	handlerVal = newHandlerVal(handlerVal, dice.SendEncodedDetails, newHandlers)
-
-	(&myDice.Config).CensorHandlers[level] = handlerVal
+	return handlerVal
 }
 
 func newHandlerVal(val uint8, handle dice.CensorHandler, newHandlers map[dice.CensorHandler]bool) uint8 {

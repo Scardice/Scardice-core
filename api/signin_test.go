@@ -1,9 +1,11 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -12,21 +14,25 @@ import (
 	"Scardice-core/dice"
 )
 
-func TestSignInLegacyModeReturnsToken(t *testing.T) {
-	previousDice := myDice
-	t.Cleanup(func() { myDice = previousDice })
-
+func TestSignInReturnsPersistedToken(t *testing.T) {
 	for _, test := range []struct {
-		name     string
-		password string
-		hash     string
+		name          string
+		password      string
+		clearPassword bool
 	}{
-		{name: "empty password hash", password: "ignored"},
-		{name: "matching password", password: "legacy-password-hash", hash: "legacy-password-hash"},
+		{name: "empty password hash", password: "ignored", clearPassword: true},
+		{name: "matching password", password: "old-password-hash"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			manager := &dice.DiceManager{UIPasswordHash: test.hash}
-			myDice = &dice.Dice{Parent: manager}
+			_, manager, runtime, store := newDiceConfigDurableHandlerTest(t)
+			if test.clearPassword {
+				empty := ""
+				if err := runtime.DurableCommitConfigRequest(context.Background(), dice.DurableConfigRequest{
+					Manager: &dice.DurableManagerConfigPatch{UIPasswordHash: &empty},
+				}); err != nil {
+					t.Fatalf("clear manager password hash: %v", err)
+				}
+			}
 			request := httptest.NewRequest(http.MethodPost, "/sd-api/signin", strings.NewReader(`{"password":"`+test.password+`"}`))
 			request.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
 			recorder := httptest.NewRecorder()
@@ -44,6 +50,9 @@ func TestSignInLegacyModeReturnsToken(t *testing.T) {
 			}
 			if response.Token == "" || !manager.AccessTokens.Exists(response.Token) {
 				t.Fatalf("sign-in token %q was not stored", response.Token)
+			}
+			if _, auth := loadDiceConfigManagerState(t, store); !slices.Contains(auth.AccessTokens, response.Token) {
+				t.Fatalf("sign-in token %q was not persisted", response.Token)
 			}
 		})
 	}

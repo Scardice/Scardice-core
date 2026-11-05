@@ -562,7 +562,7 @@ func (s *Supervisor) reconcileStart(c context.Context, state State, e LifecycleE
 		secrets = resolverFactory(state.EndpointID, state.AdapterKey)
 	}
 	if len(config.SecretRefs) > 0 && (state.EndpointID == "" || state.AdapterKey == "" || secrets == nil) {
-		return eventstore.ErrKeyUnavailable
+		return errors.New("endpoint: secret resolver is not configured")
 	}
 	runtime, err := descriptor.NewRuntime(adapterapi.RuntimeInit{
 		EndpointID:           e.EndpointID,

@@ -2,79 +2,78 @@ package dice
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
-	"time"
 
 	ds "github.com/sealdice/dicescript"
-	"go.uber.org/zap"
 
 	"Scardice-core/core/attributestate"
-	"Scardice-core/dice/service"
-	"Scardice-core/eventstore"
 )
 
-func TestAttrsManagerLoadsAndPersistsEncryptedEventState(t *testing.T) {
+func TestAttributeRepositorySaveAdvancesCharacterCatalog(t *testing.T) {
+	manager, store := newAttributeExecutionFixture(t)
 	ctx := context.Background()
-	database, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "attrs.db")})
+	const ownerID = "QQ:catalog-writer"
+	const characterID = "catalog-card"
+	catalogOwner := attributestate.CatalogOwner(manager.diceID, ownerID)
+	before, err := store.ReadCatalogRevision(ctx, attributestate.CharacterCatalog, catalogOwner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
-	store := eventstore.NewStore(database, eventstore.WithKeySource(compatKeySource{}), eventstore.WithProjection(attributestate.Projection()))
-	if err = store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "attrs-test", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	repository, err := attributestate.NewRepository(store)
+	payload, err := ds.NewDictVal(&ds.ValueMap{}).V().ToJSON()
 	if err != nil {
 		t.Fatal(err)
 	}
-	values := &ds.ValueMap{}
-	values.Store("hp", ds.NewIntVal(60))
-	payload, err := ds.NewDictVal(values).V().ToJSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	state, err := repository.Save(ctx, attributestate.State{
-		DiceID: "dice-1", ID: "QQ-Group:100-QQ:200", AttrsType: service.AttrsTypeGroupUser,
-		SecretRef: attributestate.SecretRef("dice-1", "QQ-Group:100-QQ:200"), CreatedAt: 1, UpdatedAt: 1,
+	state, err := manager.durable.Save(ctx, attributestate.State{
+		DiceID: manager.diceID, ID: characterID, AttrsType: attributestate.AttrsTypeCharacter,
+		OwnerID: ownerID, Name: "before", SheetType: "coc7", CreatedAt: 1, UpdatedAt: 1,
 	}, payload)
-	if err != nil || state.Version != 1 {
-		t.Fatalf("seed attributes state=%#v err=%v", state, err)
-	}
-
-	manager := &AttrsManager{}
-	die := &Dice{BaseConfig: BaseConfig{Name: "dice-1"}, DurableStore: store, Logger: zap.NewNop().Sugar()}
-	if err = manager.InitDurable(die); err != nil {
-		t.Fatal(err)
-	}
-	defer manager.Stop()
-	item, err := manager.Load("QQ-Group:100", "QQ:200")
-	if err != nil || item.Load("hp").ToString() != "60" {
-		t.Fatalf("loaded attributes=%v err=%v", item, err)
-	}
-	item.Store("hp", ds.NewIntVal(42))
-	if err = manager.CheckForSave(); err != nil {
-		t.Fatal(err)
-	}
-	persisted, plaintext, err := repository.Load(ctx, "dice-1", item.ID)
-	if err != nil || persisted.Version != 2 {
-		t.Fatalf("persisted state=%#v err=%v", persisted, err)
-	}
-	decoded, err := ds.VMValueFromJSON(plaintext)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dict, ok := decoded.ReadDictData()
-	if !ok {
-		t.Fatal("persisted attributes are not a dictionary")
+	afterCreate, err := store.ReadCatalogRevision(ctx, attributestate.CharacterCatalog, catalogOwner)
+	if err != nil {
+		t.Fatal(err)
 	}
-	hp, ok := dict.Dict.Load("hp")
-	if !ok || hp.ToString() != "42" {
-		t.Fatalf("persisted hp=%v exists=%v", hp, ok)
+	if afterCreate.Revision != before.Revision+1 {
+		t.Fatalf("catalog revision after create = %d, want %d", afterCreate.Revision, before.Revision+1)
+	}
+	state.Name = "after"
+	state.UpdatedAt = 2
+	_, err = manager.durable.Save(ctx, state, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterRename, err := store.ReadCatalogRevision(ctx, attributestate.CharacterCatalog, catalogOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRename.Revision != afterCreate.Revision+1 {
+		t.Fatalf("catalog revision after rename = %d, want %d", afterRename.Revision, afterCreate.Revision+1)
+	}
+	snapshot, err := attributestate.ListCatalogProjected(ctx, store, manager.diceID, attributestate.CharacterCatalog, ownerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.States) != 1 || snapshot.States[0].ID != characterID || snapshot.States[0].Name != "after" {
+		t.Fatalf("character catalog snapshot = %#v", snapshot.States)
+	}
+	if snapshot.Revision != afterRename.Revision {
+		t.Fatalf("catalog snapshot revision = %d, want %d", snapshot.Revision, afterRename.Revision)
+	}
+	// A catalog read dependency is held together with a write. A current
+	// snapshot must be accepted next to an unrelated attribute write.
+	transaction, collector := newAttributeTransaction(t, store)
+	if _, err = manager.GetCharacterListForTransaction(ctx, transaction, ownerID); err != nil {
+		t.Fatal(err)
+	}
+	unrelated, err := manager.LoadByTransaction(ctx, transaction, "QQ-Group:catalog-dependency-QQ:catalog-dependency")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = unrelated.Store("seen", ds.NewIntVal(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err = commitAttributeTransaction(t, store, transaction, collector); err != nil {
+		t.Fatalf("current catalog dependency rejected: %v", err)
 	}
 }

@@ -112,10 +112,7 @@ func TestJSRuntimeManagerReportsDiscoveredMetadataWithoutLoading(t *testing.T) {
 }
 
 func TestJSRuntimeManagerResolvesInstalledQuickJS(t *testing.T) {
-	root := os.Getenv("SCARDICE_QUICKJS_PACKAGE")
-	if root == "" {
-		t.Skip("SCARDICE_QUICKJS_PACKAGE is not set")
-	}
+	root := requireNativeQuickJSRoot(t)
 
 	manager := NewJSRuntimeManager(root)
 	loop, err := manager.Resolve(context.Background(), "quickjs", jsengine.RuntimeOptions{})

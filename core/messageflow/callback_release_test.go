@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"Scardice-core/core/execution"
 	"Scardice-core/core/playerstate"
 	"Scardice-core/eventstore"
 )
@@ -29,10 +30,10 @@ func TestCallbackReleasesHostFenceOnEveryHostOutcome(t *testing.T) {
 					t.Fatal("host fence released before durable commit")
 				}
 			}}
-			host := &callbackTestHost{inbox: inbox, fn: func(context.Context, CallbackRequest, *playerstate.LocalOverlay, *MutationCollector) (CallbackResult, error) {
+			host := &callbackTestHost{inbox: inbox, fn: func(context.Context, CallbackRequest, *playerstate.LocalOverlay, *execution.MutationCollector) (CallbackResult, error) {
 				return CallbackResult{Release: func() { released = true }}, test.hostErr
 			}}
-			service := newCallbackTestService(t, inbox, store, host, callbackTestCodec{})
+			service := newCallbackTestService(t, inbox, store, host)
 			_, err := service.ProcessOne(context.Background())
 			if test.hostErr == nil && test.commitErr == nil && err != nil {
 				t.Fatalf("ProcessOne: %v", err)

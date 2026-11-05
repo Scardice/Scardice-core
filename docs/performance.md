@@ -6,8 +6,8 @@ Scardice Core 通过有界读取、索引化调度、事务内复用和显式生
 
 性能机制遵循以下数据安全与一致性约束。
 
-- SQLite 事件库使用 `synchronous=FULL`，事件信封使用 SHA-256 校验，敏感载荷使用 AES-GCM。
-- `Commit`、队列领取和投影发布均在数据库事务内完成授权；privacy fence、readiness 和 publication lock 共同约束写入。
+- SQLite 事件库使用 `synchronous=FULL`，事件信封使用 SHA-256 校验；载荷和身份原样保存，不经过加密 codec。
+- `Commit`、队列领取、投影发布与群删除均受数据库事务和 publication lock 约束；必要的 stream、projection、catalog 与 plugin 读依赖保留。
 - Inbox 与 outbox 通过 lane 顺序、幂等标识、版本、租约 epoch、TTL 和 `ambiguous` 隔离状态表达处理进度。
 - 写库与协议发送均绑定唯一 operation、inbox 或 effect 标识，并通过耐久状态转换记录执行边界；恢复流程读取耐久状态后决定下一次动作。
 - 属性写入以 revision 和缓存代际为发布条件；保存成功且 revision 保持一致时，`IsSaved` 转为 `true`，其余结果持续保留脏状态。
@@ -22,33 +22,31 @@ Scardice Core 通过有界读取、索引化调度、事务内复用和显式生
 | `GroupInfo.UnmarshalJSON` | `sonic.Unmarshal` 一次解码 alias 字段和 `activatedExtList` 名称；扩展注册表就绪后加载群配置 | 已注册名称解析为共享 `ExtInfo`；其余名称解析为占位对象；序列化继续保存扩展名称与启用状态 |
 | `censor.trie.Match` | 直接遍历字符串 rune 起点，并从当前字节偏移继续 trie 匹配 | 每个起点采用首个终止词；结果按词键归并，`Censor.Check` 再映射到原词并计算最高等级 |
 
-## Readiness 与密钥读取
+## Readiness 校验
 
-事件库将高频校验和完整审计分配到各自的数据范围。
+事件库的 readiness 校验只在提交与启动路径上做有界检查。
 
-- `Commit` 先锁定 `store_readiness` 与 `projection_control`，随后把同一行传给 `validateReadinessSnapshotOnDB`。内部校验借用行内 manifest 字节；`GetReadiness` 为调用方复制所有字节切片。
-- 运行时 readiness 查询读取元数据、摘要和 manifest 长度；`ValidateReadiness` 与投影重建执行完整 manifest、终点和加密根引用审计。
-- `readinessRootReferences` 通过七个 `DISTINCT` 分支组成 `UNION ALL`，覆盖 adapter secret、operation private context、artifact、inbox、outbox 以及 plugin key/value 密文。Go 以区分大小写的字符串集合归并 root ID。
-- `LocalFileKeySource` 在首次成功读取后保存 32 字节 index root。encryption root 与 `current` root ID 使用默认 5 秒 TTL，读取调用负责到期刷新；所有公开返回值均为材料副本。
+- 运行时只读取 readiness 的模式、schema 版本、数据库身份与完成时间，不携带或校验 manifest，不扫描 payload 表。
+- 密钥、轮换、HMAC 身份和 codec 已移除。普通 SHA-256 仅承担完整性、去重和非唯一索引候选定位；身份判断始终比较原始值。
 
 ## 耐久队列调度
 
 Inbox 与 outbox 各使用一个协调器管理空闲探测，worker 池继续并发处理可领取 lane。
 
-- `lane_heads` 为每个 queue kind 与 lane 保存 active ID、序列、就绪动作和就绪时间；`ix_lane_heads_action_ready` 支持按 `ready_at`、`active_since` 和 `lane_hmac` 选择候选。
+- `lane_heads` 保存每个 queue kind 与原始 lane 的 active ID、序列、就绪动作和时间；候选摘要只用于查找，实际调度索引使用内部数字 lane ID，避免长 JSON lane 超过远程数据库的 btree 限制。
 - 提交后的容量 4 通知通道触发协调器广播；定时探测从 inbox 50 ms、outbox 100 ms 开始退避，上限为 500 ms。
 - 每个协调器持续执行探测与广播。四个 callback worker 和四个 effect worker 分别执行回调与发送；单次执行占用一个 worker，其余 worker 继续领取可用 lane。
-- `HasInboxWork` 与 `HasOutboxWork` 提供唤醒判定；`ClaimInbox` 与 `ClaimOutbox` 在 publication lock 下完成行锁、载荷认证、版本条件更新和 lane head 刷新。
-- TTL 清理按状态分支执行 `UNION ALL`，每批最多选择 128 个 ID，再按主键锁定实体行并更新调度头。
+- `HasInboxWork` 与 `HasOutboxWork` 提供唤醒判定；`ClaimInbox` 与 `ClaimOutbox` 在 publication lock 下完成行锁、版本条件更新和 lane head 刷新。
+- 终态 inbox 正文保留 30 天；housekeeping 按完成时间索引分页选择 ID/lanes，在一个事务中整行删除并刷新调度头，不读取旧正文，也不保留 payload-presence/过期正文状态。
 
 ## 投影与属性恢复
 
 属性投影通过 keyset 游标和完整快照令牌保持分页一致性。
 
 - `ProjectionPageRequest` 每页范围为 1 到 `MaxProjectionReadPageRows`，当前上限为 5000。查询按 `row_key` 升序读取，并以 `AfterRowKey` 推进游标。
-- `ProjectionSnapshot` 组合 generation、terminal position 和 history revision。后续页携带 `ExpectedSnapshot`；发布、实时终点或隐私修订变化返回 `ErrParticipantConflict`。
+- `ProjectionSnapshot` 组合 generation 与 terminal position。后续页携带 `ExpectedSnapshot`；发布或实时终点变化返回 `ErrParticipantConflict`。群删除在同一事务中切换 generation，旧快照不能跨越删除继续提交。
 - Dice 属性范围使用长度前缀编码和半开区间定位；返回前再次校验完整 row key 与 `DiceID`，数据库 collation 与公开身份语义保持分离。
-- 启动先通过 `ValidateProjected` 分页校验全局投影，再按同一快照读取当前 Dice 的元数据。密文恢复以 5000 条为一批，明文字节在批处理结束时清理。
+- 启动通过 `ValidateProjected` 分页校验全局投影，再按同一快照读取当前 Dice 的元数据。属性值批量读取保留原始字节，没有逐行解密或额外密钥查询。
 - 普通角色列表在单次事务内按 Dice row-key 前缀读取，并逐行校验完整编码身份。
 
 ## 属性缓存生命周期

@@ -1230,7 +1230,7 @@ func RegisterBuiltinExtDeck(d *Dice) {
 					// if times > 5 {
 					// 	times = 5
 					// }
-					if times > int(ctx.Dice.Config.MaxExecuteTime) {
+					if times > int(ctx.Dice.Config().MaxExecuteTime) {
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰点_轮数过多警告"))
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
@@ -1313,7 +1313,7 @@ func deckStringFormat(ctx *MsgContext, deckInfo *DeckInfo, s string) (string, er
 		// 特殊变量检查
 		if deckName == "{player}" {
 			if ctx.Player != nil {
-				text = ctx.Player.Name
+				text = ctx.Player.Name()
 			} else {
 				text = "%未知用户%"
 			}

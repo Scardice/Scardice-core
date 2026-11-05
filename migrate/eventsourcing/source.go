@@ -206,7 +206,7 @@ type RecordStreamer interface {
 
 // Target owns the fresh event database used by one import attempt. Initialize
 // must reject a non-empty or previously initialized target. ImportBatch must
-// commit the supplied records atomically and encrypt secret-bearing payloads.
+// commit the supplied plaintext records atomically.
 // Reopen verifies the exact target after projection rebuild, before readiness
 // can be published.
 type Target interface {

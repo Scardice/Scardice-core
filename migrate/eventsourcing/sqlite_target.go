@@ -1,32 +1,36 @@
 package eventsourcing
 
 import (
+	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
 	"Scardice-core/eventstore"
+	"Scardice-core/migrate/eventsourcing/v1reader"
 	"Scardice-core/projectionset"
 )
 
 // SQLiteTarget imports into one new SQLite event database. A failed target is
 // never reopened for another attempt; callers must choose a new path and
-// identity. Sensitive plaintext is retained only for each encryption call;
-// reopen verification uses a per-attempt in-memory HMAC key.
+// identity. Reopen verification compares migration-local SHA-256 digests against
+// actual plaintext rows before publication.
 type SQLiteTarget struct {
 	path            string
 	publishPath     string
 	databaseConfig  eventstore.DatabaseConfig
 	activate        func(context.Context, string) error
 	replaceDatabase func(string, string) error
+	ownedCandidate  bool
+	published       bool
+	legacyV1        *legacyV1Publication
 
 	mu                            sync.Mutex
 	identity                      string
@@ -37,7 +41,6 @@ type SQLiteTarget struct {
 	seenPluginKV                  map[pluginKVIdentity]struct{}
 	seenLogImports                map[string][sha256.Size]byte
 	records                       []targetRecord
-	verificationKey               []byte
 	relaxedSQLiteImportDurability bool
 	deferredStoryLogIndexes       bool
 }
@@ -64,22 +67,21 @@ type pendingStoryLogImport struct {
 	semanticDigest []byte
 }
 
-func NewSQLiteTarget(path string, keySource eventstore.KeySource) *SQLiteTarget {
+func NewSQLiteTarget(path string) *SQLiteTarget {
 	clean := filepath.Clean(path)
 	return &SQLiteTarget{
 		path: clean,
 		databaseConfig: eventstore.DatabaseConfig{
-			Type:      "sqlite",
-			DSN:       clean,
-			KeySource: keySource,
+			Type: "sqlite",
+			DSN:  clean,
 		},
 	}
 }
 
 // NewSQLitePublicationTarget imports into candidatePath, then atomically
 // replaces activePath only after readiness and semantic validation succeed.
-func NewSQLitePublicationTarget(candidatePath, activePath string, keySource eventstore.KeySource) *SQLiteTarget {
-	target := NewSQLiteTarget(candidatePath, keySource)
+func NewSQLitePublicationTarget(candidatePath, activePath string) *SQLiteTarget {
+	target := NewSQLiteTarget(candidatePath)
 	target.publishPath = filepath.Clean(activePath)
 	return target
 }
@@ -99,7 +101,7 @@ func NewRemoteSQLTarget(config eventstore.DatabaseConfig, activate func(context.
 }
 
 func (t *SQLiteTarget) Initialize(ctx context.Context, identity string) error {
-	if t == nil || t.databaseConfig.KeySource == nil {
+	if t == nil {
 		return ErrTargetRequired
 	}
 	dbType := strings.ToLower(strings.TrimSpace(t.databaseConfig.Type))
@@ -118,10 +120,24 @@ func (t *SQLiteTarget) Initialize(ctx context.Context, identity string) error {
 	if strings.TrimSpace(identity) == "" || strings.ContainsAny(identity, "/\\\x00") {
 		return ErrTargetIdentity
 	}
+	if t.legacyV1 != nil {
+		if err := validateV1SelectedIdentity(t.legacyV1.state, identity); err != nil {
+			return err
+		}
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.store != nil || t.identity != "" {
 		return ErrTargetIdentity
+	}
+	if dbType != "sqlite" {
+		format, err := DetectRemoteFormat(ctx, t.databaseConfig)
+		if err != nil {
+			return err
+		}
+		if format != v1reader.FormatEmpty {
+			return ErrTargetIdentity
+		}
 	}
 	if dbType == "sqlite" {
 		if err := secureDestination(DefaultFileSystem(), filepath.Dir(t.path)); err != nil {
@@ -130,6 +146,9 @@ func (t *SQLiteTarget) Initialize(ctx context.Context, identity string) error {
 		if t.publishPath != "" {
 			if t.publishPath == "." || t.publishPath == t.path || filepath.Dir(t.publishPath) != filepath.Dir(t.path) {
 				return ErrTargetIdentity
+			}
+			if err := CheckUnfinishedV1Publication(t.publishPath); err != nil {
+				return err
 			}
 			if info, statErr := os.Lstat(t.publishPath); statErr == nil && info.Mode()&os.ModeSymlink != 0 {
 				return ErrTargetIdentity
@@ -151,6 +170,7 @@ func (t *SQLiteTarget) Initialize(ctx context.Context, identity string) error {
 		if reserveErr != nil {
 			return reserveErr
 		}
+		t.ownedCandidate = true
 		if closeErr := reservation.Close(); closeErr != nil {
 			return closeErr
 		}
@@ -201,12 +221,6 @@ func (t *SQLiteTarget) Initialize(ctx context.Context, identity string) error {
 			t.identity = ""
 			return err
 		}
-	}
-	t.verificationKey = make([]byte, sha256.Size)
-	if _, err := rand.Read(t.verificationKey); err != nil {
-		_ = t.closeLocked()
-		t.identity = ""
-		return err
 	}
 	t.versions = make(map[eventstore.StreamID]uint64)
 	t.seenSecrets = make(map[string]struct{})
@@ -278,7 +292,7 @@ func (t *SQLiteTarget) ImportBatch(ctx context.Context, records []SourceRecord) 
 			}
 			update, err := t.store.PrepareSecretUpdate(ctx, eventstore.SecretPutRequest{
 				SecretRef: record.Identity, EndpointID: record.Kind, AdapterID: record.Domain,
-				SecretVersion: record.Version, Plaintext: record.Payload,
+				SecretVersion: record.Version, Value: record.Payload,
 			})
 			if err != nil {
 				return err
@@ -348,8 +362,8 @@ func (t *SQLiteTarget) ImportBatch(ctx context.Context, records []SourceRecord) 
 			copy(digest[:], semanticDigest)
 			priorDigest, alreadyImported := t.seenLogImports[candidate.record.SourceID]
 			batchDigest, duplicateInBatch := newLogImports[candidate.record.SourceID]
-			if alreadyImported && !hmac.Equal(priorDigest[:], digest[:]) ||
-				duplicateInBatch && !hmac.Equal(batchDigest[:], digest[:]) {
+			if alreadyImported && !bytes.Equal(priorDigest[:], digest[:]) ||
+				duplicateInBatch && !bytes.Equal(batchDigest[:], digest[:]) {
 				clear(digest[:])
 				return ErrValidation
 			}
@@ -396,7 +410,7 @@ func (t *SQLiteTarget) ImportBatch(ctx context.Context, records []SourceRecord) 
 			stored.correlationID = metadata.CorrelationID
 		}
 		if record.Sensitive && record.RecordType != RecordTypeLogArchive {
-			stored.sensitiveDigest = sensitiveRecordDigest(t.verificationKey, record.Payload)
+			stored.sensitiveDigest = sensitiveRecordDigest(record.Payload)
 		}
 		if record.RecordType == RecordTypeLogArchive {
 			pendingIndex, ok := pendingLogBySource[record.Identity]
@@ -491,7 +505,8 @@ func (t *SQLiteTarget) Reopen(ctx context.Context) error {
 	if err := t.openLocked(ctx); err != nil {
 		return err
 	}
-	return t.store.ValidateReadiness(ctx)
+	_, err := t.store.GetReadiness(ctx)
+	return err
 }
 
 func (t *SQLiteTarget) Manifest(ctx context.Context) (SemanticManifest, error) {
@@ -503,10 +518,6 @@ func (t *SQLiteTarget) Manifest(ctx context.Context) (SemanticManifest, error) {
 	if t.store == nil {
 		return SemanticManifest{}, ErrTargetRequired
 	}
-	defer func() {
-		clear(t.verificationKey)
-		t.verificationKey = nil
-	}()
 	type eventKey struct {
 		aggregateType string
 		aggregateID   string
@@ -573,7 +584,7 @@ func (t *SQLiteTarget) Manifest(ctx context.Context) (SemanticManifest, error) {
 				field = "schema_version"
 			case actual.PayloadSize != expected.manifest.Size:
 				field = "payload_size"
-			case !hmac.Equal(actual.PayloadDigest[:], expected.manifest.ContentDigest):
+			case !bytes.Equal(actual.PayloadDigest[:], expected.manifest.ContentDigest):
 				field = "payload_digest"
 			}
 			if field != "" {
@@ -591,8 +602,8 @@ func (t *SQLiteTarget) Manifest(ctx context.Context) (SemanticManifest, error) {
 			if actual.EndpointID != expected.manifest.Kind || actual.AdapterID != expected.manifest.Domain {
 				return fmt.Errorf("%w: imported secret binding mismatch version=%d", ErrValidation, actual.SecretVersion)
 			}
-			digest := sensitiveRecordDigest(t.verificationKey, actual.Plaintext)
-			if !hmac.Equal(digest[:], expected.sensitiveDigest[:]) {
+			digest := sensitiveRecordDigest(actual.Value)
+			if !bytes.Equal(digest[:], expected.sensitiveDigest[:]) {
 				return fmt.Errorf("%w: imported secret digest mismatch version=%d", ErrValidation, actual.SecretVersion)
 			}
 			delete(expectedSecrets, key)
@@ -607,8 +618,8 @@ func (t *SQLiteTarget) Manifest(ctx context.Context) (SemanticManifest, error) {
 			if actual.Version != expected.manifest.Version {
 				return fmt.Errorf("%w: imported plugin value version mismatch", ErrValidation)
 			}
-			digest := sensitiveRecordDigest(t.verificationKey, actual.Value)
-			if !hmac.Equal(digest[:], expected.sensitiveDigest[:]) {
+			digest := sensitiveRecordDigest(actual.Value)
+			if !bytes.Equal(digest[:], expected.sensitiveDigest[:]) {
 				return fmt.Errorf("%w: imported plugin value digest mismatch", ErrValidation)
 			}
 			delete(expectedPluginKV, key)
@@ -673,7 +684,7 @@ func (t *SQLiteTarget) validateStoryLogImportReadback(ctx context.Context) error
 			expected[key] = group
 		}
 		if prior, exists := group[stored.manifest.Identity]; exists {
-			if prior.logKind != stored.logKind || !hmac.Equal(prior.logSemanticDigest, stored.logSemanticDigest) {
+			if prior.logKind != stored.logKind || !bytes.Equal(prior.logSemanticDigest, stored.logSemanticDigest) {
 				return ErrValidation
 			}
 			continue
@@ -691,7 +702,7 @@ func (t *SQLiteTarget) validateStoryLogImportReadback(ctx context.Context) error
 			if !ok {
 				return fmt.Errorf("%w: imported story-log receipt is unexpected or duplicated", ErrValidation)
 			}
-			if receipt.Kind != stored.logKind || !hmac.Equal(receipt.SemanticDigest, stored.logSemanticDigest) {
+			if receipt.Kind != stored.logKind || !bytes.Equal(receipt.SemanticDigest, stored.logSemanticDigest) {
 				return fmt.Errorf("%w: imported story-log receipt digest mismatch kind=%s", ErrValidation, receipt.Kind)
 			}
 			switch receipt.Kind {
@@ -772,19 +783,20 @@ func (t *SQLiteTarget) Publish(ctx context.Context) error {
 	if strings.ToLower(strings.TrimSpace(t.databaseConfig.Type)) != "sqlite" {
 		return ErrPublication
 	}
-	if err := t.closeLocked(); err != nil {
+	if err := t.closeForPublicationLocked(ctx); err != nil {
 		return err
-	}
-	for _, sidecar := range []string{t.path + "-wal", t.path + "-shm"} {
-		if _, err := os.Lstat(sidecar); err == nil {
-			return ErrPublication
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
 	}
 	err := syncSQLiteDatabaseFile(t.path)
 	if err != nil {
 		return err
+	}
+	if t.legacyV1 != nil {
+		if _, err := publishV1Candidate(ctx, V1ConvertOptions{}, t.path, t.publishPath, t.legacyV1.stamp, t.legacyV1.state.proof); err != nil {
+			return err
+		}
+		t.published = true
+		t.path, t.databaseConfig.DSN = t.publishPath, t.publishPath
+		return nil
 	}
 	parentPath := filepath.Dir(t.publishPath)
 
@@ -793,6 +805,13 @@ func (t *SQLiteTarget) Publish(ctx context.Context) error {
 	if active, statErr := os.Lstat(t.publishPath); statErr == nil {
 		if active.Mode()&os.ModeSymlink != 0 || !active.Mode().IsRegular() {
 			return ErrPublication
+		}
+		for _, suffix := range []string{"-wal", "-shm"} {
+			if info, err := os.Lstat(t.publishPath + suffix); err == nil && info.Size() != 0 {
+				return ErrPublication
+			} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
 		}
 		hadActive = true
 		if _, backupErr := os.Lstat(backupPath); !errors.Is(backupErr, os.ErrNotExist) {
@@ -819,8 +838,13 @@ func (t *SQLiteTarget) Publish(ctx context.Context) error {
 	rollback := func(publicationErr error) error {
 		_ = t.closeLocked()
 		var rollbackErr error
+		for _, suffix := range []string{"-wal", "-shm"} {
+			if err := os.Remove(t.publishPath + suffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+				rollbackErr = errors.Join(rollbackErr, err)
+			}
+		}
 		if hadActive {
-			rollbackErr = replace(backupPath, t.publishPath)
+			rollbackErr = errors.Join(rollbackErr, replaceSQLiteDatabase(backupPath, t.publishPath))
 		} else if removeErr := os.Remove(t.publishPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 			rollbackErr = removeErr
 		}
@@ -848,6 +872,7 @@ func (t *SQLiteTarget) Publish(ctx context.Context) error {
 		_ = os.Remove(backupPath)
 		_ = syncSQLiteDatabaseParent(parentPath)
 	}
+	t.published = true
 	return nil
 }
 
@@ -879,13 +904,20 @@ func (t *SQLiteTarget) openLocked(ctx context.Context) error {
 	}
 	config := t.databaseConfig
 	config.DatabaseIdentity = t.identity
+	if dbType == "sqlite" {
+		absolute, err := filepath.Abs(t.path)
+		if err != nil {
+			return err
+		}
+		config.DSN = (&url.URL{Scheme: "file", Path: filepath.ToSlash(absolute)}).String()
+	}
 	database, err := eventstore.OpenDatabase(ctx, config)
 	if err != nil {
 		return err
 	}
 	t.database = database
 	t.store = eventstore.NewStore(database, projectionset.StoreOptions()...)
-	if err := t.store.ValidateReadiness(ctx); err != nil {
+	if _, err := t.store.GetReadiness(ctx); err != nil {
 		_ = t.closeLocked()
 		return err
 	}
@@ -904,23 +936,19 @@ var deferredStoryLogIndexDDL = []struct {
 }{
 	{
 		drop:   "DROP INDEX IF EXISTS ix_story_log_entries_scope_session",
-		create: "CREATE INDEX IF NOT EXISTS ix_story_log_entries_scope_session ON story_log_entries(scope_hmac, session_id)",
+		create: "CREATE INDEX IF NOT EXISTS ix_story_log_entries_scope_session ON story_log_entries(scope_lookup, session_id)",
 	},
 	{
 		drop:   "DROP INDEX IF EXISTS ix_story_log_entries_raw",
-		create: "CREATE INDEX IF NOT EXISTS ix_story_log_entries_raw ON story_log_entries(scope_hmac, session_id, raw_msg_hmac)",
-	},
-	{
-		drop:   "DROP INDEX IF EXISTS ix_story_log_entries_owner",
-		create: "CREATE INDEX IF NOT EXISTS ix_story_log_entries_owner ON story_log_entries(owner_hmac)",
+		create: "CREATE INDEX IF NOT EXISTS ix_story_log_entries_raw ON story_log_entries(scope_lookup, session_id, raw_msg_lookup)",
 	},
 	{
 		drop:   "DROP INDEX IF EXISTS ix_story_log_import_owner",
-		create: "CREATE INDEX IF NOT EXISTS ix_story_log_import_owner ON story_log_imports(owner_hmac, scope_hmac)",
+		create: "CREATE INDEX IF NOT EXISTS ix_story_log_import_owner ON story_log_imports(scope_lookup)",
 	},
 	{
 		drop:   "DROP INDEX IF EXISTS ix_story_log_import_dice_identity",
-		create: "CREATE INDEX IF NOT EXISTS ix_story_log_import_dice_identity ON story_log_imports(dice_hmac, identity_hmac)",
+		create: "CREATE INDEX IF NOT EXISTS ix_story_log_import_dice_identity ON story_log_imports(dice_lookup, id)",
 	},
 }
 
@@ -1039,11 +1067,9 @@ func importMetadata(record SourceRecord) eventstore.Metadata {
 	}
 }
 
-func sensitiveRecordDigest(key, plaintext []byte) [sha256.Size]byte {
-	mac := hmac.New(sha256.New, key)
-	_, _ = mac.Write(plaintext)
+func sensitiveRecordDigest(plaintext []byte) [sha256.Size]byte {
 	var digest [sha256.Size]byte
-	copy(digest[:], mac.Sum(nil))
+	copy(digest[:], eventstore.DigestBytes("sensitive-record-verify/v1", plaintext))
 	return digest
 }
 
@@ -1064,4 +1090,65 @@ func secureSQLiteTargetFiles(path string) error {
 		}
 	}
 	return nil
+}
+
+// discardCandidate removes only a path reserved by this target. A collision
+// with somebody else's candidate never makes that file ours to remove.
+func (t *SQLiteTarget) discardCandidate() error {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	closeErr := t.closeLocked()
+	if !t.ownedCandidate || t.published {
+		return closeErr
+	}
+	var removeErr error
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if err := os.Remove(t.path + suffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+			removeErr = errors.Join(removeErr, err)
+		}
+	}
+	t.ownedCandidate = false
+	return errors.Join(closeErr, removeErr)
+}
+
+func (t *SQLiteTarget) closeForPublicationLocked(ctx context.Context) error {
+	if t.database == nil {
+		return ErrTargetRequired
+	}
+	var busy, frames, checkpointed int
+	if err := t.database.SQLDB().QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &frames, &checkpointed); err != nil {
+		return err
+	}
+	if busy != 0 || frames != checkpointed {
+		return ErrPublication
+	}
+	if err := t.closeLocked(); err != nil {
+		return err
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		path := t.path + suffix
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if suffix == "-wal" && info.Size() != 0 {
+			return ErrPublication
+		}
+		if err = os.Remove(path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *SQLiteTarget) closeForPublication(ctx context.Context) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closeForPublicationLocked(ctx)
 }

@@ -2,58 +2,71 @@
 package dice
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"Scardice-core/dice/service"
-	sealdiceLogger "Scardice-core/logger"
+	"Scardice-core/eventstore"
 	"Scardice-core/model"
-	"Scardice-core/utils/constant"
 )
 
-func newLogAliasTestDB(t *testing.T) *mockDatabaseOperator {
+// useCanonicalTestStoryLogRepository binds d's log repository to the real
+// EventStore story-log archive of its durable store.
+func useCanonicalTestStoryLogRepository(t *testing.T, d *Dice) {
 	t.Helper()
-
-	mockDB, err := newMockDatabaseOperator(filepath.Join(t.TempDir(), "logs.db"))
-	if err != nil {
-		t.Fatalf("newMockDatabaseOperator: %v", err)
+	archive, ok := d.DurableStore.(eventstore.LogRepository)
+	if !ok {
+		t.Fatal("canonical fixture store does not provide the story-log archive")
 	}
-	t.Cleanup(mockDB.Close)
-
-	db := mockDB.GetLogDB(constant.WRITE)
-	if err := db.AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}); err != nil {
-		t.Fatalf("AutoMigrate: %v", err)
-	}
-	return mockDB
+	d.LogRepository = service.NewEventStoreLogRepository(archive, d.BaseConfig.Name)
 }
 
-func appendTestLog(t *testing.T, mockDB *mockDatabaseOperator, groupID, logName string) {
+// newCanonicalTestLogDice returns a canonical Dice whose log repository reads
+// the real EventStore story-log archive.
+func newCanonicalTestLogDice(t *testing.T) *Dice {
 	t.Helper()
+	d, _ := newCanonicalTestDice(t)
+	useCanonicalTestStoryLogRepository(t, d)
+	return d
+}
 
-	ok := LogAppend(&MsgContext{Dice: &Dice{DBOperator: mockDB}}, groupID, 0, logName, &model.LogOneItem{
+// seedCanonicalTestStoryLog appends one entry to a story log through the same
+// LogAppend path production uses, and commits it in its own root.
+func seedCanonicalTestStoryLog(t *testing.T, d *Dice, groupID, logName string, item *model.LogOneItem) {
+	t.Helper()
+	endpoint := newCanonicalTestEndpoint(d, "UI:1000")
+	label := fmt.Sprintf("seed-story-log-%d", canonicalTestMessageSequence.Add(1))
+	withCanonicalTestMessageContext(t, d, endpoint, newPrivateMsg("UI:log-seed", ""), label, func(ctx *MsgContext) error {
+		if !LogAppend(ctx, groupID, 0, logName, item) {
+			return errors.New("LogAppend failed for " + strconv.Quote(logName))
+		}
+		return nil
+	})
+}
+
+func appendTestLog(t *testing.T, d *Dice, groupID, logName string) {
+	t.Helper()
+	seedCanonicalTestStoryLog(t, d, groupID, logName, &model.LogOneItem{
 		Nickname: "tester",
 		IMUserID: "user",
 		Message:  "line",
 	})
-	if !ok {
-		t.Fatalf("LogAppend failed for %q", logName)
-	}
 }
 
 func TestBuildLogNameAliasIndexUsesWrappedKeysAndResolvesInput(t *testing.T) {
-	mockDB := newLogAliasTestDB(t)
+	d := newCanonicalTestLogDice(t)
 	groupID := "QQ-Group:1001"
 
-	appendTestLog(t, mockDB, groupID, "normal-log")
-	appendTestLog(t, mockDB, groupID, " spaced\nname ")
+	appendTestLog(t, d, groupID, "normal-log")
+	appendTestLog(t, d, groupID, " spaced\nname ")
 
-	index, err := buildLogNameAliasIndex(service.NewLegacyLogRepository(mockDB, ""), groupID)
+	index, err := buildLogNameAliasIndex(d.LogRepository, groupID)
 	if err != nil {
 		t.Fatalf("buildLogNameAliasIndex: %v", err)
 	}
@@ -125,13 +138,13 @@ func TestBuildLogNameAliasEntriesExtendsConflictingPrefixes(t *testing.T) {
 }
 
 func TestResolveLogNameForGroupPrefersExactNameBeforeAlias(t *testing.T) {
-	mockDB := newLogAliasTestDB(t)
+	d := newCanonicalTestLogDice(t)
 	groupID := "QQ-Group:1002"
 
-	appendTestLog(t, mockDB, groupID, "abcdef12")
-	appendTestLog(t, mockDB, groupID, "other-log")
+	appendTestLog(t, d, groupID, "abcdef12")
+	appendTestLog(t, d, groupID, "other-log")
 
-	index, err := buildLogNameAliasIndex(service.NewLegacyLogRepository(mockDB, ""), groupID)
+	index, err := buildLogNameAliasIndex(d.LogRepository, groupID)
 	if err != nil {
 		t.Fatalf("buildLogNameAliasIndex: %v", err)
 	}
@@ -150,7 +163,7 @@ func TestResolveLogNameForGroupPrefersExactNameBeforeAlias(t *testing.T) {
 		t.Fatal("test setup produced ambiguous exact-name collision")
 	}
 
-	got, err := resolveLogNameForGroup(service.NewLegacyLogRepository(mockDB, ""), groupID, "abcdef12")
+	got, err := resolveLogNameForGroup(d.LogRepository, groupID, "abcdef12")
 	if err != nil {
 		t.Fatalf("resolveLogNameForGroup exact: %v", err)
 	}
@@ -160,12 +173,12 @@ func TestResolveLogNameForGroupPrefersExactNameBeforeAlias(t *testing.T) {
 }
 
 func TestLogSendToBackendAcceptsAliasKey(t *testing.T) {
-	mockDB := newLogAliasTestDB(t)
+	d := newCanonicalTestLogDice(t)
 	groupID := "QQ-Group:1003"
 	logName := "special name"
-	appendTestLog(t, mockDB, groupID, logName)
+	appendTestLog(t, d, groupID, logName)
 
-	index, err := buildLogNameAliasIndex(service.NewLegacyLogRepository(mockDB, ""), groupID)
+	index, err := buildLogNameAliasIndex(d.LogRepository, groupID)
 	if err != nil {
 		t.Fatalf("buildLogNameAliasIndex: %v", err)
 	}
@@ -198,14 +211,10 @@ func TestLogSendToBackendAcceptsAliasKey(t *testing.T) {
 	BackendUrls = []string{server.URL}
 	t.Cleanup(func() { BackendUrls = oldBackends })
 
-	ctx := &MsgContext{
-		Dice: &Dice{
-			BaseConfig: BaseConfig{DataDir: t.TempDir()},
-			DBOperator: mockDB,
-			Logger:     sealdiceLogger.M(),
-		},
-		EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{UserID: "UI:1000"}},
-	}
+	endpoint := newCanonicalTestEndpoint(d, "UI:1000")
+	ctx := newCanonicalTestMessageContext(
+		t, d, endpoint, newPrivateMsg("UI:log-alias-user", ""), "log-send-backend",
+	)
 
 	unofficial, url, notice, err := LogSendToBackend(ctx, groupID, alias)
 	if err != nil {
@@ -222,38 +231,6 @@ func TestLogSendToBackendAcceptsAliasKey(t *testing.T) {
 	}
 }
 
-func TestEnsureGroupLogStateBackfillsLegacyLogID(t *testing.T) {
-	mockDB := newLogAliasTestDB(t)
-	groupID := "QQ-Group:2001"
-	logName := "legacy-log"
-
-	ctx := &MsgContext{
-		Dice: &Dice{DBOperator: mockDB},
-		Group: &GroupInfo{
-			GroupID:    groupID,
-			LogCurName: logName,
-			LogOn:      true,
-		},
-	}
-
-	logState, err := ensureGroupLogState(ctx, ctx.Group)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !logState.On {
-		t.Fatal("expected legacy log state to stay on")
-	}
-	if logState.Name != logName {
-		t.Fatalf("logState.Name = %q, want %q", logState.Name, logName)
-	}
-	if logState.ID == 0 {
-		t.Fatal("expected legacy log state to backfill non-zero log id")
-	}
-	if got := ctx.Group.GetLogState().ID; got != logState.ID {
-		t.Fatalf("group LogCurID = %d, want %d", got, logState.ID)
-	}
-}
-
 func TestLogListWithoutDatabaseOperatorReportsUnavailableStorage(t *testing.T) {
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
@@ -262,7 +239,7 @@ func TestLogListWithoutDatabaseOperatorReportsUnavailableStorage(t *testing.T) {
 	_, _ = newQuitCommandTestContext(t, d, ep, "QQ:9001", groupID, "EventSourceGroup")
 	d.DBOperator = nil
 
-	d.ImSession.ExecuteNew(ep, newGroupMsg(groupID, "QQ:9001", ".log list"))
+	executeNewAndWaitForCanonicalCommit(t, d, ep, newGroupMsg(groupID, "QQ:9001", ".log list"))
 
 	reply, ok := adapter.waitForMsg(2 * time.Second)
 	if !ok {

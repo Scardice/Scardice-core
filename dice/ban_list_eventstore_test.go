@@ -3,8 +3,6 @@ package dice
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -13,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"Scardice-core/core/configstate"
 	"Scardice-core/core/playerstate"
 	"Scardice-core/eventstore"
 )
@@ -29,21 +28,49 @@ func openBanListEventStore(t *testing.T, dsn string, initialize bool) (*eventsto
 		t.Fatal(err)
 	}
 	store := eventstore.NewStore(db,
-		eventstore.WithKeySource(compatKeySource{}),
+		eventstore.WithProjection(configstate.ConfigProjection()),
 		eventstore.WithProjection(playerstate.ModerationProjection()),
 	)
 	if initialize {
 		if err = store.SetReadiness(ctx, eventstore.Readiness{
-			Mode: "import", SchemaVersion: 1, DatabaseIdentity: banListEventStoreTestDiceID,
-			IndexRootID: "index-v1", EncryptionRootIDs: []string{"root-v1"},
-			SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32),
+			Mode: "import", SchemaVersion: 2, DatabaseIdentity: banListEventStoreTestDiceID,
 			CompletedAt: time.Unix(1, 0).UTC(),
 		}); err != nil {
 			_ = db.Close()
 			t.Fatal(err)
 		}
 	}
-	if err = store.ValidateReadiness(ctx); err != nil {
+	if initialize {
+		configRepository := configstate.NewRepository(store)
+		if _, err = configRepository.DecideAndAppend(ctx, configstate.State{}, 0, eventstore.Metadata{}, configstate.Command{
+			Kind: configstate.CommandImportBaseline,
+			Baseline: &configstate.Baseline{
+				DiceID: banListEventStoreTestDiceID, ConfigVersion: 1,
+				Base: configstate.BaseConfig{
+					CommandCompatibleMode: true, MessageDelayRangeEnd: 1, UILogLimit: 100,
+				},
+				Rate: configstate.RateConfig{
+					PersonalReplenishRate: "@every 3s", GroupReplenishRate: "@every 3s",
+					PersonalBurst: 3, GroupBurst: 3, SpamSameCommandWindowSec: 30, SpamRecoveryMultiplierMax: 5,
+				},
+				Quit:          configstate.QuitConfig{QuitInactiveThreshold: "0s", QuitInactiveBatchSize: 10},
+				Extension:     configstate.ExtensionConfig{MaxExecuteTime: 12, MaxCocCardGen: 5},
+				StoryLog:      configstate.StoryLogConfig{LogSizeNoticeCount: 500},
+				Advanced:      configstate.AdvancedConfig{CustomReplyCooldown: 5},
+				CommandPrefix: []string{"."},
+				Ban: configstate.BanConfig{
+					RefuseReply: true, RefuseInvite: true, ThresholdWarn: 100, ThresholdBan: 200,
+					AutoBanMinutes: 720, ScoreReducePerMinute: 1, ScoreGroupMuted: 100, ScoreGroupKicked: 200,
+					ScoreTooManyCommand: 100, BanNotifyIntervalMinutes: 5,
+					JointScorePercentOfGroup: 0.5, JointScorePercentOfInviter: 0.3,
+				},
+			},
+		}); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	if _, err = store.GetReadiness(ctx); err != nil {
 		_ = db.Close()
 		t.Fatal(err)
 	}
@@ -51,25 +78,41 @@ func openBanListEventStore(t *testing.T, dsn string, initialize bool) (*eventsto
 	return db, store
 }
 
-func newBanListEventStoreTestDice(dataDir string, store eventstore.Store) (*Dice, *BanListInfo) {
+func newBanListEventStoreTestDice(t *testing.T, dataDir string, store eventstore.Store) (*Dice, *BanListInfo) {
+	t.Helper()
 	d := &Dice{
 		BaseConfig:   BaseConfig{Name: banListEventStoreTestDiceID, DataDir: dataDir},
 		DurableStore: store,
 		Parent:       &DiceManager{},
 	}
-	list := &BanListInfo{Parent: d}
-	list.Init()
-	d.Config.BanList = list
-	return d, list
+	if err := d.ReloadConfigView(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return d, d.Config().BanList
+}
+
+type failingModerationStore struct {
+	*eventstore.GORMStore
+	fail bool
+}
+
+func (s *failingModerationStore) Commit(ctx context.Context, work eventstore.UnitOfWork) (eventstore.CommitResult, error) {
+	if s.fail {
+		for _, stream := range work.Streams {
+			if stream.Stream.AggregateType == playerstate.ModerationAggregateType {
+				return eventstore.CommitResult{}, errors.New("injected moderation commit failure")
+			}
+		}
+	}
+	return s.GORMStore.Commit(ctx, work)
 }
 
 func banListEventStoreTestSecretRef(id string) string {
 	stream := playerstate.ModerationStream(banListEventStoreTestDiceID, "global", id)
-	digest := sha256.Sum256([]byte(stream.AggregateID))
-	return "vault:moderation-details:" + hex.EncodeToString(digest[:16])
+	return "vault:moderation-details:" + stream.AggregateID
 }
 
-func TestEventSourcedBanListUsesEncryptedEventStoreAcrossRestart(t *testing.T) {
+func TestEventSourcedBanListPreservesDetailsAcrossRestart(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	dsn := filepath.Join(root, "events.db")
@@ -78,7 +121,7 @@ func TestEventSourcedBanListUsesEncryptedEventStoreAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	db, store := openBanListEventStore(t, dsn, true)
-	dice, list := newBanListEventStoreTestDice(dataDir, store)
+	dice, list := newBanListEventStoreTestDice(t, dataDir, store)
 	list.Loads()
 	if err := list.PersistenceError(); err != nil {
 		t.Fatalf("load empty EventStore list: %v", err)
@@ -100,23 +143,18 @@ func TestEventSourcedBanListUsesEncryptedEventStoreAcrossRestart(t *testing.T) {
 	}
 	secret, err := store.ResolveSecret(ctx, banListEventStoreTestSecretRef(id), 1)
 	if err != nil {
-		t.Fatalf("resolve encrypted moderation details: %v", err)
+		t.Fatalf("resolve moderation details: %v", err)
 	}
 	var restored struct {
 		BanListInfoItem
 		BanUpdatedAt int64 `json:"banUpdatedAt"`
 	}
-	if err = json.Unmarshal(secret.Plaintext, &restored); err != nil {
+	if err = json.Unmarshal(secret.Value, &restored); err != nil {
 		t.Fatalf("decode moderation details: %v", err)
 	}
 	if restored.ID != id || restored.Name != seed.Name || restored.BanUpdatedAt != seed.BanUpdatedAt ||
 		!slices.Equal(restored.Times, seed.Times) || !slices.Equal(restored.Reasons, seed.Reasons) || !slices.Equal(restored.Places, seed.Places) {
-		t.Fatalf("encrypted details did not preserve history: %#v", restored)
-	}
-	if data, readErr := os.ReadFile(dsn); readErr != nil {
-		t.Fatal(readErr)
-	} else if bytes.Contains(data, []byte(seed.Name)) || bytes.Contains(data, []byte(seed.Reasons[0])) {
-		t.Fatal("moderation details were stored in plaintext in the EventStore database")
+		t.Fatalf("persisted details did not preserve history: %#v", restored)
 	}
 	if _, statErr := os.Stat(filepath.Join(dataDir, "ban-list.json")); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("legacy JSON sidecar exists: stat err=%v", statErr)
@@ -126,7 +164,7 @@ func TestEventSourcedBanListUsesEncryptedEventStoreAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, reopenedStore := openBanListEventStore(t, dsn, false)
-	restartedDice, restartedList := newBanListEventStoreTestDice(dataDir, reopenedStore)
+	restartedDice, restartedList := newBanListEventStoreTestDice(t, dataDir, reopenedStore)
 	restartedList.Loads()
 	if err = restartedList.PersistenceError(); err != nil {
 		t.Fatalf("load EventStore list after restart: %v", err)
@@ -144,8 +182,8 @@ func TestEventSourcedBanListUsesEncryptedEventStoreAcrossRestart(t *testing.T) {
 	if err != nil || !state.Deleted {
 		t.Fatalf("deleted moderation state = %#v, err=%v", state, err)
 	}
-	if previous, resolveErr := reopenedStore.ResolveSecret(ctx, banListEventStoreTestSecretRef(id), 1); resolveErr != nil || !bytes.Equal(previous.Plaintext, secret.Plaintext) {
-		t.Fatalf("delete discarded encrypted history: err=%v", resolveErr)
+	if previous, resolveErr := reopenedStore.ResolveSecret(ctx, banListEventStoreTestSecretRef(id), 1); resolveErr != nil || !bytes.Equal(previous.Value, secret.Value) {
+		t.Fatalf("delete discarded moderation history: err=%v", resolveErr)
 	}
 	if err = restartedList.SetRankByID(restartedDice, id, BanRankTrusted, seed.Name, "admin", "restored"); err != nil {
 		t.Fatalf("restore EventStore ban item: %v", err)
@@ -156,13 +194,13 @@ func TestEventSourcedBanListUsesEncryptedEventStoreAcrossRestart(t *testing.T) {
 	}
 	latest, err := reopenedStore.ResolveSecret(ctx, banListEventStoreTestSecretRef(id), 0)
 	if err != nil || latest.SecretVersion != 2 {
-		t.Fatalf("restored encrypted history version=%d err=%v", latest.SecretVersion, err)
+		t.Fatalf("restored moderation history version=%d err=%v", latest.SecretVersion, err)
 	}
 	var latestDetails struct {
 		BanListInfoItem
 		BanUpdatedAt int64 `json:"banUpdatedAt"`
 	}
-	if err = json.Unmarshal(latest.Plaintext, &latestDetails); err != nil {
+	if err = json.Unmarshal(latest.Value, &latestDetails); err != nil {
 		t.Fatal(err)
 	}
 	if latestDetails.ID != id || !slices.Contains(latestDetails.Reasons, "restored") {
@@ -172,7 +210,7 @@ func TestEventSourcedBanListUsesEncryptedEventStoreAcrossRestart(t *testing.T) {
 func TestEventSourcedBanListPersistsAutomaticScore(t *testing.T) {
 	root := t.TempDir()
 	_, store := openBanListEventStore(t, filepath.Join(root, "events.db"), true)
-	_, list := newBanListEventStoreTestDice(filepath.Join(root, "dice-data"), store)
+	_, list := newBanListEventStoreTestDice(t, filepath.Join(root, "dice-data"), store)
 	list.Loads()
 	list.AddScoreBase("QQ:scored-member", 17, "QQ-Group:10", "automatic moderation", nil)
 
@@ -182,48 +220,75 @@ func TestEventSourcedBanListPersistsAutomaticScore(t *testing.T) {
 	}
 }
 
-func TestEventSourcedBanListRejectsStaleWriters(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	_, store := openBanListEventStore(t, filepath.Join(root, "events.db"), true)
-	firstDice, firstList := newBanListEventStoreTestDice(filepath.Join(root, "first"), store)
-	firstList.Loads()
-	const subjectID = "QQ:shared-writer"
-	if err := firstList.SetRankByID(firstDice, subjectID, BanRankNormal, "Member", "seed", "initial"); err != nil {
-		t.Fatal(err)
+func TestModerationFailedCommitDoesNotPublishBusinessState(t *testing.T) {
+	_, baseStore := openBanListEventStore(t, filepath.Join(t.TempDir(), "failed-commit.db"), true)
+	store := &failingModerationStore{GORMStore: baseStore, fail: true}
+	d, list := newBanListEventStoreTestDice(t, "", store)
+	err := list.SetRankByID(d, "QQ:failed", BanRankBanned, "member", "admin", "must roll back")
+	if err == nil {
+		t.Fatal("moderation mutation unexpectedly committed")
 	}
+	if item, exists := list.GetByID("QQ:failed"); exists {
+		t.Fatalf("failed moderation commit became readable: %#v", item)
+	}
+}
 
-	secondDice, secondList := newBanListEventStoreTestDice(filepath.Join(root, "second"), store)
-	secondList.Loads()
-	staleItem, exists := secondList.GetByID(subjectID)
-	if !exists {
-		t.Fatal("second runtime did not load the seeded moderation item")
-	}
-	if err := firstList.SetRankByID(firstDice, subjectID, BanRankBanned, "Member", "admin", "latest change"); err != nil {
-		t.Fatal(err)
-	}
-	if err := secondList.SetRankByID(secondDice, subjectID, BanRankWarn, "Member", "stale admin", "stale change"); !errors.Is(err, eventstore.ErrConflict) {
-		t.Fatalf("stale rank update error = %v, want EventStore conflict", err)
-	}
+func TestModerationSnapshotTracksSameRootCreatesAndDeletes(t *testing.T) {
+	_, store := openBanListEventStore(t, filepath.Join(t.TempDir(), "same-root-list.db"), true)
+	d, list := newBanListEventStoreTestDice(t, "", store)
+	const subjectID = "QQ:same-root"
 
-	repository, err := newModerationBanRepository(secondDice)
+	err := d.WithDomainExecution(context.Background(), "test-moderation-create-list", []byte(subjectID), func(transaction *DurableCallbackTransaction) error {
+		messageCtx := &MsgContext{Dice: d, callbackTransaction: transaction}
+		if mutateErr := list.SetRankByIDForContext(
+			messageCtx, d, subjectID, BanRankBanned, "created", "admin", "same root create",
+		); mutateErr != nil {
+			return mutateErr
+		}
+		items, readErr := list.SnapshotForContext(messageCtx)
+		if readErr != nil {
+			return readErr
+		}
+		if len(items) != 1 || items[0].ID != subjectID || items[0].Rank != BanRankBanned {
+			t.Fatalf("same-root create snapshot = %#v", items)
+		}
+		if _, exists := list.GetByID(subjectID); exists {
+			t.Fatal("uncommitted same-root create leaked into committed reads")
+		}
+		return nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = repository.delete(ctx, staleItem); !errors.Is(err, eventstore.ErrConflict) {
-		t.Fatalf("stale delete error = %v, want EventStore conflict", err)
-	}
-	if err = repository.setScore(ctx, staleItem, 1); !errors.Is(err, eventstore.ErrConflict) {
-		t.Fatalf("stale score update error = %v, want EventStore conflict", err)
+	if _, exists := list.GetByID(subjectID); !exists {
+		t.Fatal("committed same-root create is missing")
 	}
 
-	_, restartedList := newBanListEventStoreTestDice(filepath.Join(root, "restarted"), store)
-	restartedList.Loads()
-	latest, exists := restartedList.GetByID(subjectID)
-	if !exists || latest.Rank != BanRankBanned || slices.Contains(latest.Reasons, "stale change") {
-		t.Fatalf("stale writer changed persisted moderation state: item=%#v exists=%v", latest, exists)
+	err = d.WithDomainExecution(context.Background(), "test-moderation-delete-list", []byte(subjectID), func(transaction *DurableCallbackTransaction) error {
+		messageCtx := &MsgContext{Dice: d, callbackTransaction: transaction}
+		if deleteErr := list.DeleteByIDForContext(messageCtx, d, subjectID); deleteErr != nil {
+			return deleteErr
+		}
+		items, readErr := list.SnapshotForContext(messageCtx)
+		if readErr != nil {
+			return readErr
+		}
+		if len(items) != 0 {
+			t.Fatalf("same-root delete snapshot = %#v", items)
+		}
+		if _, exists := list.GetByID(subjectID); !exists {
+			t.Fatal("uncommitted same-root delete leaked into committed reads")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item, exists := list.GetByID(subjectID); exists {
+		t.Fatalf("committed same-root delete remains readable: %#v", item)
 	}
 }
+
 func TestBanListLoadFailsClosedOnCorruptEventProjection(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -241,7 +306,7 @@ func TestBanListLoadFailsClosedOnCorruptEventProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, list := newBanListEventStoreTestDice(filepath.Join(root, "dice-data"), store)
+	_, list := newBanListEventStoreTestDice(t, filepath.Join(root, "dice-data"), store)
 	list.Loads()
 	if err := list.PersistenceError(); err == nil {
 		t.Fatal("corrupt EventStore moderation projection did not fail closed")
@@ -254,7 +319,7 @@ func TestBanListLoadFailsClosedOnCorruptEventProjection(t *testing.T) {
 func TestBanListLoadFailsClosedWhenProjectionRowIsMissing(t *testing.T) {
 	root := t.TempDir()
 	db, store := openBanListEventStore(t, filepath.Join(root, "events.db"), true)
-	dice, list := newBanListEventStoreTestDice(filepath.Join(root, "dice-data"), store)
+	dice, list := newBanListEventStoreTestDice(t, filepath.Join(root, "dice-data"), store)
 	const subjectID = "QQ:projection-row-missing"
 	if err := list.SetRankByID(dice, subjectID, BanRankBanned, "Private Member", "seed", "seed reason"); err != nil {
 		t.Fatal(err)
@@ -267,7 +332,7 @@ func TestBanListLoadFailsClosedWhenProjectionRowIsMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, restartedList := newBanListEventStoreTestDice(filepath.Join(root, "restarted-data"), store)
+	_, restartedList := newBanListEventStoreTestDice(t, filepath.Join(root, "restarted-data"), store)
 	restartedList.Loads()
 	if err := restartedList.PersistenceError(); err == nil {
 		t.Fatal("missing moderation projection row did not fail closed")
@@ -281,7 +346,7 @@ func TestBanListLoadFailsClosedOnProjectionStateMismatch(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	db, store := openBanListEventStore(t, filepath.Join(root, "events.db"), true)
-	dice, list := newBanListEventStoreTestDice(filepath.Join(root, "dice-data"), store)
+	dice, list := newBanListEventStoreTestDice(t, filepath.Join(root, "dice-data"), store)
 	const subjectID = "QQ:projection-state-mismatch"
 	if err := list.SetRankByID(dice, subjectID, BanRankBanned, "Private Member", "seed", "seed reason"); err != nil {
 		t.Fatal(err)
@@ -303,7 +368,7 @@ func TestBanListLoadFailsClosedOnProjectionStateMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, restartedList := newBanListEventStoreTestDice(filepath.Join(root, "restarted-data"), store)
+	_, restartedList := newBanListEventStoreTestDice(t, filepath.Join(root, "restarted-data"), store)
 	restartedList.Loads()
 	if err := restartedList.PersistenceError(); err == nil {
 		t.Fatal("moderation projection that differs from its stream did not fail closed")
@@ -312,7 +377,7 @@ func TestBanListLoadFailsClosedOnProjectionStateMismatch(t *testing.T) {
 		t.Fatal("mismatched moderation projection exposed a partial ban list")
 	}
 }
-func TestBanListLoadFailsClosedWhenEncryptedHistoryIsMissing(t *testing.T) {
+func TestBanListLoadFailsClosedWhenHistoryIsMissing(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	_, store := openBanListEventStore(t, filepath.Join(root, "events.db"), true)
@@ -324,13 +389,13 @@ func TestBanListLoadFailsClosedWhenEncryptedHistoryIsMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, list := newBanListEventStoreTestDice(filepath.Join(root, "dice-data"), store)
+	_, list := newBanListEventStoreTestDice(t, filepath.Join(root, "dice-data"), store)
 	list.Loads()
 	if err := list.PersistenceError(); err == nil {
-		t.Fatal("active moderation projection without encrypted history did not fail closed")
+		t.Fatal("active moderation projection without history did not fail closed")
 	}
 	if _, exists := list.GetByID("QQ:missing-secret"); exists {
-		t.Fatal("projection without encrypted history populated a partial ban list")
+		t.Fatal("projection without history populated a partial ban list")
 	}
 }
 
@@ -344,11 +409,15 @@ func (s *banListDeleteFriendSpy) DeleteFriend(_ *MsgContext, id string) {
 }
 
 func TestAddScoreBaseDeletesQQPersonNotPlace(t *testing.T) {
-	_, list := newBanListEventStoreTestDice("", nil)
-	list.ThresholdWarn = 1
-	list.ThresholdBan = 1
+	_, store := openBanListEventStore(t, filepath.Join(t.TempDir(), "delete-friend.db"), true)
+	d, _ := newBanListEventStoreTestDice(t, "", store)
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.BanList.ThresholdWarn = 1
+		config.BanList.ThresholdBan = 1
+	})
+	list := d.Config().BanList
 	adapter := &banListDeleteFriendSpy{}
-	ctx := &MsgContext{EndPoint: &EndPointInfo{
+	ctx := &MsgContext{Dice: d, EndPoint: &EndPointInfo{
 		EndPointInfoBase: EndPointInfoBase{Platform: "QQ"},
 		Adapter:          adapter,
 	}}
@@ -361,12 +430,17 @@ func TestAddScoreBaseDeletesQQPersonNotPlace(t *testing.T) {
 }
 
 func TestSetTrustRefreshesBanListOrderingTimestamp(t *testing.T) {
-	list := &BanListInfo{}
-	list.Init()
-	list.Map.Store("QQ:older", &BanListInfoItem{ID: "QQ:older", Rank: BanRankNormal, BanUpdatedAt: 1})
-	list.Map.Store("QQ:newer", &BanListInfoItem{ID: "QQ:newer", Rank: BanRankTrusted, BanUpdatedAt: 100})
-
-	list.SetTrustByID("QQ:older", "admin", "manual trust")
+	_, store := openBanListEventStore(t, filepath.Join(t.TempDir(), "ordering.db"), true)
+	d, list := newBanListEventStoreTestDice(t, "", store)
+	if err := list.ImportItems(d, []*BanListInfoItem{
+		{ID: "QQ:older", Rank: BanRankNormal, BanUpdatedAt: 1},
+		{ID: "QQ:newer", Rank: BanRankTrusted, BanUpdatedAt: 100},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := list.SetTrustByIDWithError("QQ:older", "admin", "manual trust"); err != nil {
+		t.Fatal(err)
+	}
 	item, ok := list.GetByID("QQ:older")
 	if !ok || item.BanUpdatedAt <= 100 {
 		t.Fatalf("trust update ordering timestamp = %#v, exists=%v", item, ok)

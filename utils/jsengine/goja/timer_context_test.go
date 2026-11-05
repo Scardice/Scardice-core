@@ -1,11 +1,27 @@
 package goja
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"Scardice-core/utils/jsengine"
 )
+
+type persistentTimerPromotionScope struct {
+	context.Context
+	loop     jsengine.Loop
+	promoted any
+}
+
+func (s *persistentTimerPromotionScope) ExecutionContext() context.Context { return s.Context }
+
+func (s *persistentTimerPromotionScope) PromotePersistentAsync(run func() (jsengine.Value, error)) error {
+	return jsengine.ScheduleWithContext(s.loop, s.promoted, func(jsengine.Runtime) error {
+		_, err := run()
+		return err
+	})
+}
 
 func TestContextPropagationPreservesTimerKindsDelaysAndCancellation(t *testing.T) {
 	loop := startedTestLoop(t)
@@ -71,5 +87,50 @@ func TestContextPropagationPreservesTimerKindsDelaysAndCancellation(t *testing.T
 		return err
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPersistentAsyncPromotionRunsTimerUnderFreshContext(t *testing.T) {
+	loop := startedTestLoop(t)
+	if err := InstallContextPropagation(loop); err != nil {
+		t.Fatal(err)
+	}
+	if err := jsengine.InstallPersistentAsyncPromotion(loop); err != nil {
+		t.Fatal(err)
+	}
+	if err := jsengine.InstallPersistentAsyncPromotion(loop); err != nil {
+		t.Fatal(err)
+	}
+	promoted := &struct{ name string }{name: "fresh"}
+	scope := &persistentTimerPromotionScope{
+		Context:  context.Background(),
+		loop:     loop,
+		promoted: promoted,
+	}
+	seen := make(chan any, 1)
+	if err := jsengine.RunWithContext(loop, scope, func(runtime jsengine.Runtime) error {
+		if err := runtime.Bind("capturePromotedTimer", func(argument string) {
+			if argument == "argument" {
+				seen <- jsengine.CurrentContext(loop)
+			}
+		}); err != nil {
+			return err
+		}
+		_, err := runtime.RunString("persistent-timer.js", `
+			setTimeout(function (argument) {
+				capturePromotedTimer(argument);
+			}, 0, "argument");
+		`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case context := <-seen:
+		if context != promoted {
+			t.Fatalf("timer context = %v, want promoted context", context)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("promoted timer did not run")
 	}
 }

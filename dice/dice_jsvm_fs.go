@@ -92,7 +92,7 @@ func jsFsResolveAbsoluteWithContext(d *Dice, raw string, context *jsExecutionCon
 		return jsFsResolvedPath{abs: absTarget, base: absBase, isData: true}, nil
 	}
 
-	if !d.AdvancedConfig.AllowFilesystemUnrestrictedAccess {
+	if !d.AdvancedConfig().AllowFilesystemUnrestrictedAccess {
 		return jsFsResolvedPath{}, errors.New("当前未开启 AllowFilesystemUnrestrictedAccess,仅支持 data:// 路径")
 	}
 
@@ -260,7 +260,7 @@ func jsFsRunAsync(vm *goja.Runtime, rawLoop *eventloop.EventLoop, engineLoop jse
 	promise, resolve, reject := vm.NewPromise()
 	go func() {
 		value, err := work()
-		_ = jsengine.ScheduleWithContext(engineLoop, jsCompletionContext(executionContext), func(runtime jsengine.Runtime) error {
+		_ = scheduleJSCompletion(engineLoop, executionContext, func(runtime jsengine.Runtime) error {
 			loopVM, ok := gojaengine.Raw(runtime)
 			if !ok {
 				return errors.New("goja runtime adapter unavailable")

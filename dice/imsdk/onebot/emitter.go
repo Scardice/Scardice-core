@@ -126,14 +126,44 @@ type emitterSocket struct {
 	waiters sync.Map // map[string]chan []byte
 
 	droppedEchoCount uint64
+
+	// emit replaces the connection write; tests use it to stand in for the
+	// protocol end.
+	emit func(frame []byte)
+
+	observer ActionObserver
 }
 
-func NewEVEmitter(conn *socketio.WebsocketWrapper) *emitterSocket {
+// ActionObserver sees every action frame the emitter writes, whichever API
+// produced it (typed helpers, Raw or RawJSON). BeginAction runs before the
+// frame is written; the returned function runs exactly once after the action
+// ends with the provider's whole response frame, or nil when none arrived
+// (transport failure, timeout, cancellation). Neither may block.
+type ActionObserver interface {
+	BeginAction(action string, frame []byte) (finish func(response []byte))
+}
+
+// NewEVEmitter wraps a connection. At most one observer may be supplied.
+func NewEVEmitter(conn *socketio.WebsocketWrapper, observers ...ActionObserver) *emitterSocket {
 	emitter := &emitterSocket{
 		conn: conn,
 		done: make(chan struct{}),
 	}
+	if len(observers) > 0 {
+		emitter.observer = observers[0]
+	}
 	return emitter
+}
+
+// observeAction reports a frame to the observer and returns the completion
+// callback, which is never nil.
+func (e *emitterSocket) observeAction(action string, frame []byte) func(response []byte) {
+	if e.observer != nil {
+		if finish := e.observer.BeginAction(action, frame); finish != nil {
+			return finish
+		}
+	}
+	return func([]byte) {}
 }
 
 func (e *emitterSocket) HandleEcho(echo string, raw []byte) {
@@ -208,10 +238,16 @@ func (e *emitterSocket) waitEchoBytes(ctx context.Context, echoID string, send f
 }
 
 func (e *emitterSocket) waitEchoAfterSend(ctx context.Context, action Action, echoID string, params any, send func() error) (Response[sonic.NoCopyRawMessage], error) {
+	return e.waitEchoAfterSendObserved(ctx, action, echoID, params, send, func([]byte) {})
+}
+
+func (e *emitterSocket) waitEchoAfterSendObserved(ctx context.Context, action Action, echoID string, params any, send func() error, finish func([]byte)) (Response[sonic.NoCopyRawMessage], error) {
 	raw, err := e.waitEchoBytes(ctx, echoID, send)
 	if err != nil {
+		finish(nil)
 		return Response[sonic.NoCopyRawMessage]{}, wrapActionError(err, action, echoID, params)
 	}
+	finish(raw)
 	var response Response[sonic.NoCopyRawMessage]
 	if err := sonic.Unmarshal(raw, &response); err != nil {
 		return response, fmt.Errorf("decode OneBot response: %w", err)
@@ -430,7 +466,7 @@ func (e *emitterSocket) Raw(ctx context.Context, action Action, params any) ([]b
 	if err != nil {
 		return nil, err
 	}
-	return e.sendRawRequest(ctx, echoID, request)
+	return e.sendRawRequest(ctx, action, echoID, request)
 }
 
 // RawJSON preserves all provider fields. Only the reserved correlation echo is
@@ -454,41 +490,47 @@ func (e *emitterSocket) RawJSON(ctx context.Context, request []byte) ([]byte, er
 	if len(wire) > adapterapi.MaxProtocolJSONBytes {
 		return nil, fmt.Errorf("%w: request with correlation echo exceeds bounds", ErrInvalidRawRequest)
 	}
-	return e.sendRawRequest(ctx, echoID, wire)
+	return e.sendRawRequest(ctx, action, echoID, wire)
 }
 
-func (e *emitterSocket) sendRawRequest(ctx context.Context, echoID string, wire []byte) ([]byte, error) {
-	return e.waitEchoBytes(ctx, echoID, func() error {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		if e.closed || e.conn == nil || !e.conn.IsAlive() {
-			return errors.New("OneBot connection unavailable")
-		}
-		if ctx != nil {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-		}
-		e.conn.Emit(wire, socketio.TextMessage)
+func (e *emitterSocket) sendRawRequest(ctx context.Context, action, echoID string, wire []byte) ([]byte, error) {
+	finish := e.observeAction(action, wire)
+	raw, err := e.waitEchoBytes(ctx, echoID, func() error { return e.writeFrame(ctx, wire) })
+	if err != nil {
+		finish(nil)
+		return nil, err
+	}
+	finish(raw)
+	return raw, nil
+}
+
+// writeFrame emits one frame on the live connection.
+func (e *emitterSocket) writeFrame(ctx context.Context, frame []byte) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.emit != nil {
+		e.emit(frame)
 		return nil
-	})
+	}
+	if e.closed || e.conn == nil || !e.conn.IsAlive() {
+		return errors.New("OneBot connection unavailable")
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	e.conn.Emit(frame, socketio.TextMessage)
+	return nil
 }
 
 func doAction(ctx context.Context, e *emitterSocket, action string, params any) (Response[sonic.NoCopyRawMessage], error) {
 	echoId := uuid.New().String()
-	resp, err := e.waitEchoAfterSend(ctx, action, echoId, params, func() error {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		if e.closed || e.conn == nil || !e.conn.IsAlive() {
-			return errors.New("OneBot connection unavailable")
-		}
-		if ctx != nil {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-		}
-		return wsEmitWithEcho(e.conn, action, params, echoId)
-	})
+	frame, err := sonic.Marshal(Request[any]{Action: action, Echo: echoId, Params: params})
+	if err != nil {
+		return Response[sonic.NoCopyRawMessage]{}, wrapActionError(err, action, echoId, params)
+	}
+	resp, err := e.waitEchoAfterSendObserved(ctx, action, echoId, params, func() error { return e.writeFrame(ctx, frame) }, e.observeAction(action, frame))
 	if err != nil {
 		return Response[sonic.NoCopyRawMessage]{}, err
 	}
@@ -513,17 +555,4 @@ func marshalForError(value any) string {
 		return fmt.Sprintf("%#v", value)
 	}
 	return string(data)
-}
-
-func wsEmitWithEcho(w *socketio.WebsocketWrapper, action string, params any, echoId string) error {
-	marshal, err := sonic.Marshal(Request[any]{
-		Action: action,
-		Echo:   echoId,
-		Params: params,
-	})
-	if err != nil {
-		return err
-	}
-	w.Emit(marshal, socketio.TextMessage)
-	return nil
 }

@@ -13,11 +13,23 @@ import (
 
 	"github.com/labstack/echo/v4"
 
+	"Scardice-core/core/groupstate"
 	"Scardice-core/dice"
 	"Scardice-core/dice/service"
 	"Scardice-core/eventstore"
 	"Scardice-core/projectionset"
 )
+
+func updateAPITestConfig(t *testing.T, d *dice.Dice, mutate func(*dice.Config)) {
+	t.Helper()
+	config, _ := d.ConfigEditSnapshot()
+	if mutate != nil {
+		mutate(&config)
+	}
+	if err := d.DurableCommitConfigSnapshot(context.Background(), config, config.CommandPrefix, config.DiceMasters, nil); err != nil {
+		t.Fatalf("persist API test config: %v", err)
+	}
+}
 
 func TestDiceExecRequestDistinguishesUnlimitedFromOmittedSplitLength(t *testing.T) {
 	for _, test := range []struct {
@@ -132,19 +144,17 @@ func TestDiceExecArchivesDistinctSyntheticIncomingMessages(t *testing.T) {
 	const databaseIdentity = "api-ui-exec-test"
 	database, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
 		Type: "sqlite", DSN: filepath.Join(root, "events.db"),
-		KeySource: endpointAPITestKeySource{}, DatabaseIdentity: databaseIdentity,
+		DatabaseIdentity: databaseIdentity,
 	})
 	if err != nil {
 		t.Fatalf("open EventStore database: %v", err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
 	store := eventstore.NewStore(database,
-		append(projectionset.StoreOptions(), eventstore.WithKeySource(endpointAPITestKeySource{}))...,
+		projectionset.StoreOptions()...,
 	)
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: databaseIdentity,
-		IndexRootID: "api-test-index-v1", EncryptionRootIDs: []string{"api-test-root-v1"},
-		SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: databaseIdentity,
 		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatalf("set EventStore readiness: %v", err)
@@ -200,7 +210,9 @@ func TestDiceExecArchivesDistinctSyntheticIncomingMessages(t *testing.T) {
 	if err := manager.PrepareEventSourcedState(ctx); err != nil {
 		t.Fatalf("prepare EventStore runtime: %v", err)
 	}
-	d.Config.JsEnable = false
+	updateAPITestConfig(t, d, func(config *dice.Config) {
+		config.JsEnable = false
+	})
 	manager.InitDice(nil)
 	manager.JustForTest = true
 	if len(manager.Dice) == 0 || manager.Dice[0] != d {
@@ -211,22 +223,34 @@ func TestDiceExecArchivesDistinctSyntheticIncomingMessages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create EventStore log session: %v", err)
 	}
-	if err := store.SetStoryLogState(ctx, eventstore.StoryLogState{
-		DiceID: d.BaseConfig.Name, GroupID: groupID, SessionID: session.ID, Name: logName, On: true,
-	}); err != nil {
-		t.Fatalf("activate EventStore log session: %v", err)
+	if err := d.WithDomainExecution(
+		ctx,
+		d.DomainExecutionIdentity("api-test-fixture", "dice-exec-group"),
+		[]byte("dice-exec-group"),
+		func(transaction *dice.DurableCallbackTransaction) error {
+			group, groupErr := transaction.Domain().Group(ctx, d.BaseConfig.Name, groupID)
+			if groupErr != nil {
+				return groupErr
+			}
+			for _, command := range []groupstate.Command{
+				{Kind: groupstate.CommandCreate, DiceID: d.BaseConfig.Name, GroupID: groupID, GroupName: "UI-Group 2001"},
+				{Kind: groupstate.CommandActivation, DiceIDForActivation: d.UIEndpoint.UserID, Active: true, Exists: true},
+				{Kind: groupstate.CommandExtension, ExtensionID: "log", Enabled: true},
+			} {
+				if groupErr = group.Decide(command); groupErr != nil {
+					return groupErr
+				}
+			}
+			return transaction.SetStoryLogState(ctx, eventstore.StoryLogState{
+				DiceID: d.BaseConfig.Name, GroupID: groupID,
+				SessionID: session.ID, Name: logName, On: true,
+			})
+		},
+	); err != nil {
+		t.Fatalf("seed UI execution group: %v", err)
 	}
-
-	group := &dice.GroupInfo{
-		Active: true, GroupID: groupID, GroupName: "UI-Group 2001",
-		DiceIDActiveMap: new(dice.SyncMap[string, bool]),
-	}
-	group.DiceIDActiveMap.Store("UI:1000", true)
-	group.SetLogState(session.ID, logName, true)
-	group.ExtActive(d.ExtFind("log", false))
-	d.ImSession.ServiceAtNew.Store(groupID, group)
-	if d.CmdMap["r"] == nil || !dice.CommandCheckPrefix(".r 1d1", d.CommandPrefix, "UI") {
-		t.Fatalf("runtime is not ready for a UI roll command: prefix=%#v rollCommand=%t", d.CommandPrefix, d.CmdMap["r"] != nil)
+	if d.CmdMap["r"] == nil || !dice.CommandCheckPrefix(".r 1d1", d.CommandPrefixes(), "UI") {
+		t.Fatalf("runtime is not ready for a UI roll command: prefix=%#v rollCommand=%t", d.CommandPrefixes(), d.CmdMap["r"] != nil)
 	}
 	uiExecLastAt.Lock()
 	uiExecLastAt.byConversation = map[string]int64{}
@@ -235,6 +259,7 @@ func TestDiceExecArchivesDistinctSyntheticIncomingMessages(t *testing.T) {
 	Bind(e, manager)
 	replyCursor := d.UIEndpoint.Adapter.(*dice.PlatformAdapterHTTP).RecentMessagesSince("").Cursor
 	var lastPost time.Time
+	posted := 0
 	postExec := func(message string) {
 		t.Helper()
 		if wait := time.Until(lastPost.Add(81 * time.Millisecond)); !lastPost.IsZero() && wait > 0 {
@@ -255,6 +280,29 @@ func TestDiceExecArchivesDistinctSyntheticIncomingMessages(t *testing.T) {
 		lastPost = time.Now()
 		if recorder.Code != http.StatusOK || recorder.Body.String() != "\"ok\"\n" {
 			t.Fatalf("DiceExec response = %d %q, want 200 \"ok\"", recorder.Code, recorder.Body.String())
+		}
+		// The HTTP acknowledgement precedes the independent callback commit.
+		// Finish this submission before testing the next synthetic identity.
+		posted++
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			entries, err := store.GetStoryLogEntries(ctx, d.BaseConfig.Name, groupID, logName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			incoming := 0
+			for _, entry := range entries {
+				if !entry.IsDice {
+					incoming++
+				}
+			}
+			if incoming == posted {
+				break
+			}
+			if !time.Now().Before(deadline) {
+				t.Fatalf("submission %d did not commit its incoming archive entry", posted)
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 	postExec(marker)

@@ -42,15 +42,16 @@ func TestRevokedExecutionScopeResolvesToExpiredMessageContext(t *testing.T) {
 	}
 }
 func TestRevokedNativeCallbackCannotFallbackToStandaloneStorage(t *testing.T) {
-	store, _ := repairTestStore(t)
+	d, store := newCanonicalTestDice(t)
 	loop := revokedOwnerLoop{}
 	manager := NewJsLoopManager()
 	manager.instances[1] = &jsRuntimeInstance{loop: loop, generation: 1}
-	d := &Dice{DurableStore: store, ExtLoopManager: manager}
-	ext := &ExtInfo{Name: "revoked-native-callback", dice: d}
+	d.ExtLoopManager = manager
+	ext := &ExtInfo{Name: "revoked-native-callback", dice: d, JSLoopVersion: 1}
+	resource := newJSExtensionResource(ext, loop)
 
-	if err := ext.StorageSet("escaped", "value"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("revoked storage write error = %v, want context cancellation", err)
+	if err := resource.StorageSet("escaped", "value"); !errors.Is(err, ErrJSInvocationExpired) {
+		t.Fatalf("revoked storage write error = %v, want expired invocation", err)
 	}
 	if _, err := store.GetPluginKV(context.Background(), ext.Name, "escaped"); !errors.Is(err, eventstore.ErrPluginKVNotFound) {
 		t.Fatalf("revoked callback wrote through standalone fallback: %v", err)
@@ -70,10 +71,9 @@ func TestJSCompatibilityReplayDecisionSuppressesCallbacksSchedulingAndEffects(t 
 		t.Fatalf("replay schedule err=%v", err)
 	}
 	request := JSEffectRequest{
-		EffectID: "effect", EndpointID: "endpoint", LaneHMAC: []byte("lane"),
+		EffectID: "effect", EndpointID: "endpoint", Lane: "lane",
 		EffectType: "send", RiskClass: eventstore.RiskPreDispatchRetryable,
-		Status: eventstore.OutboxStatusPending, PayloadCiphertext: []byte("cipher"),
-		PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key",
+		Status: eventstore.OutboxStatusPending, Payload: []byte("payload"),
 	}
 	if _, err := boundary.BuildEffect(request); !errors.Is(err, ErrJSCompatibilityReplaySuppressed) {
 		t.Fatalf("replay effect build err=%v", err)

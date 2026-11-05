@@ -46,6 +46,46 @@ func ContextForExecution(value any) context.Context {
 	return context.Background()
 }
 
+// ExecutionErr reports whether the execution scope of value has ended. A scope
+// may hand its pending work to a longer-lived context at the moment its root
+// finishes normally, so a context observed as cancelled is resolved once more:
+// only a scope that still resolves to that same ended context is reported as
+// ended. Checking ContextForExecution(value).Err() directly races that handoff.
+func ExecutionErr(value any) error {
+	ctx := ContextForExecution(value)
+	err := ctx.Err()
+	if err == nil {
+		return nil
+	}
+	if again := ContextForExecution(value); again != ctx {
+		return again.Err()
+	}
+	return err
+}
+
+// AsyncWorkScope supplies the lifetime of host I/O (fetch, sockets, ...) that
+// an invocation starts. It differs from ExecutionScope when the invocation may
+// finish normally while its unawaited I/O stays valid; explicit cancellation
+// and the owning runtime's shutdown still end it. The returned release function
+// MUST be called once the I/O no longer needs the context.
+type AsyncWorkScope interface {
+	AsyncWorkContext() (context.Context, context.CancelFunc)
+}
+
+// ContextForAsyncWork returns the lifetime for host I/O started under value.
+// Scopes without an AsyncWorkScope keep the invocation lifetime.
+func ContextForAsyncWork(value any) (context.Context, context.CancelFunc) {
+	if scope, ok := value.(AsyncWorkScope); ok {
+		if ctx, release := scope.AsyncWorkContext(); ctx != nil {
+			if release == nil {
+				release = func() {}
+			}
+			return ctx, release
+		}
+	}
+	return ContextForExecution(value), func() {}
+}
+
 type GuardedExecutionScope interface {
 	ExecutionScope
 	EnterExecution() (func(), error)
@@ -59,7 +99,7 @@ func EnterExecution(value, previous any) (func(), error) {
 		}
 		return scope.EnterExecution()
 	}
-	return func() {}, ContextForExecution(value).Err()
+	return func() {}, ExecutionErr(value)
 }
 
 var revokedExecutionContext = func() context.Context {

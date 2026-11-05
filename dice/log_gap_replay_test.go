@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"Scardice-core/adapterapi"
-	"Scardice-core/core/groupstate"
 	"Scardice-core/core/messageflow"
 	"Scardice-core/core/playerstate"
 	"Scardice-core/dice/service"
@@ -19,7 +18,7 @@ import (
 )
 
 // stored stands in for the highest sequence found in the log's stored entries.
-// Reading it costs a pass over the whole encrypted log, so the tests also count
+// Reading it costs a pass over the whole persisted log, so the tests also count
 // how often it is asked for.
 type storedSeq struct {
 	value int64
@@ -33,39 +32,48 @@ func (s *storedSeq) read() (int64, error) {
 
 func seqMessage(seq int64) *Message { return &Message{Seq: seq, RawID: seq} }
 
+func newLogGapRuntime() *GroupRuntimeResources {
+	return &GroupRuntimeResources{logSequence: &groupLogRuntime{}}
+}
+
+func noteLogGapSelfSent(runtime *GroupRuntimeResources) {
+	runtime.logSequence.mu.Lock()
+	runtime.logSequence.selfSent++
+	runtime.logSequence.mu.Unlock()
+}
+
 func TestDetectLogGapAdoptsBaselineForLogsThatHaveNone(t *testing.T) {
-	group := &GroupInfo{}
+	runtime := newLogGapRuntime()
 	state := GroupLogState{ID: 7, Name: "run", On: true}
 	stored := &storedSeq{value: 5}
 
-	span, adopt := detectLogGap(group, state, seqMessage(100), stored.read)
+	span, adopt := detectLogGap(runtime, state, seqMessage(100), stored.read)
 	if span.missing != 0 || adopt != 99 {
 		t.Fatalf("first message: span=%+v adopt=%d, want no gap and baseline 99", span, adopt)
 	}
 	if stored.calls != 0 {
 		t.Fatal("a log without a baseline must not trust stored sequences: they may predate a pause")
 	}
-	// Once persisted the baseline is passed back in, and measuring starts from it.
 	state.BaselineSeq = adopt
-	if span, _ := detectLogGap(group, state, seqMessage(101), stored.read); span.missing != 0 {
+	if span, _ := detectLogGap(runtime, state, seqMessage(101), stored.read); span.missing != 0 {
 		t.Fatalf("consecutive message reported a gap: %+v", span)
 	}
-	span, adopt = detectLogGap(group, state, seqMessage(110), stored.read)
+	span, adopt = detectLogGap(runtime, state, seqMessage(110), stored.read)
 	if span.fromSeq != 101 || span.toSeq != 110 || span.missing != 8 || adopt != 0 {
 		t.Fatalf("gap = %+v adopt=%d, want 101..110 missing 8", span, adopt)
 	}
 }
 
 func TestDetectLogGapAfterRestartUsesPersistedBaselineOnce(t *testing.T) {
-	group := &GroupInfo{} // a fresh process knows nothing in memory
+	runtime := newLogGapRuntime()
 	state := GroupLogState{ID: 7, Name: "run", On: true, BaselineSeq: 99}
 	stored := &storedSeq{value: 105}
 
-	span, adopt := detectLogGap(group, state, seqMessage(120), stored.read)
+	span, adopt := detectLogGap(runtime, state, seqMessage(120), stored.read)
 	if span.fromSeq != 105 || span.missing != 14 || adopt != 0 {
 		t.Fatalf("gap after restart = %+v adopt=%d, want 105..120 missing 14", span, adopt)
 	}
-	if span, _ := detectLogGap(group, state, seqMessage(121), stored.read); span.missing != 0 {
+	if span, _ := detectLogGap(runtime, state, seqMessage(121), stored.read); span.missing != 0 {
 		t.Fatalf("message after the gap reported another: %+v", span)
 	}
 	if stored.calls != 1 {
@@ -74,92 +82,89 @@ func TestDetectLogGapAfterRestartUsesPersistedBaselineOnce(t *testing.T) {
 }
 
 func TestDetectLogGapIgnoresMessagesBeforeTheLogResumed(t *testing.T) {
-	group := &GroupInfo{}
+	runtime := newLogGapRuntime()
 	stored := &storedSeq{}
 	state := GroupLogState{ID: 7, Name: "run", On: true, BaselineSeq: 90}
-	detectLogGap(group, state, seqMessage(300), stored.read)
+	detectLogGap(runtime, state, seqMessage(300), stored.read)
 
-	// The log is paused for a long while, then switched on again by message 500.
 	state.BaselineSeq = 500
-	if span, _ := detectLogGap(group, state, seqMessage(501), stored.read); span.missing != 0 {
+	if span, _ := detectLogGap(runtime, state, seqMessage(501), stored.read); span.missing != 0 {
 		t.Fatalf("messages from the paused period were treated as a gap: %+v", span)
 	}
-	span, _ := detectLogGap(group, state, seqMessage(505), stored.read)
+	span, _ := detectLogGap(runtime, state, seqMessage(505), stored.read)
 	if span.fromSeq != 501 || span.missing != 3 {
 		t.Fatalf("gap after resuming = %+v, want 501..505 missing 3", span)
 	}
 }
 
 func TestDetectLogGapDoesNotReachIntoAnEarlierLog(t *testing.T) {
-	group := &GroupInfo{}
+	runtime := newLogGapRuntime()
 	stored := &storedSeq{}
-	detectLogGap(group, GroupLogState{ID: 7, Name: "old", On: true, BaselineSeq: 90}, seqMessage(300), stored.read)
+	detectLogGap(runtime, GroupLogState{ID: 7, Name: "old", On: true, BaselineSeq: 90}, seqMessage(300), stored.read)
 
 	fresh := GroupLogState{ID: 8, Name: "new", On: true}
-	if span, adopt := detectLogGap(group, fresh, seqMessage(900), stored.read); span.missing != 0 || adopt != 899 {
+	if span, adopt := detectLogGap(runtime, fresh, seqMessage(900), stored.read); span.missing != 0 || adopt != 899 {
 		t.Fatalf("a new log inherited the previous one's position: span=%+v adopt=%d", span, adopt)
 	}
 }
 
 func TestDetectLogGapDiscountsTheBotsOwnMessages(t *testing.T) {
-	group := &GroupInfo{}
+	runtime := newLogGapRuntime()
 	state := GroupLogState{ID: 7, Name: "run", On: true, BaselineSeq: 9}
 	stored := &storedSeq{value: 10}
-	detectLogGap(group, state, seqMessage(10), stored.read)
+	detectLogGap(runtime, state, seqMessage(10), stored.read)
 
-	group.noteLogSelfSent()
-	group.noteLogSelfSent()
-	// 11 and 12 were the bot's own replies, 13 is missing, 14 is this message.
-	span, _ := detectLogGap(group, state, seqMessage(14), stored.read)
+	noteLogGapSelfSent(runtime)
+	noteLogGapSelfSent(runtime)
+	span, _ := detectLogGap(runtime, state, seqMessage(14), stored.read)
 	if span.fromSeq != 10 || span.toSeq != 14 || span.missing != 1 {
 		t.Fatalf("gap = %+v, want 10..14 missing 1", span)
 	}
 }
 
 func TestDetectLogGapNeverMovesBackwards(t *testing.T) {
-	group := &GroupInfo{}
+	runtime := newLogGapRuntime()
 	state := GroupLogState{ID: 7, Name: "run", On: true, BaselineSeq: 19}
 	stored := &storedSeq{}
-	detectLogGap(group, state, seqMessage(20), stored.read)
+	detectLogGap(runtime, state, seqMessage(20), stored.read)
 
-	// A late delivery or a recovered message is older than what is known.
-	if span, _ := detectLogGap(group, state, seqMessage(18), stored.read); span.missing != 0 {
+	if span, _ := detectLogGap(runtime, state, seqMessage(18), stored.read); span.missing != 0 {
 		t.Fatalf("an older message reported a gap: %+v", span)
 	}
-	span, _ := detectLogGap(group, state, seqMessage(22), stored.read)
+	span, _ := detectLogGap(runtime, state, seqMessage(22), stored.read)
 	if span.fromSeq != 20 || span.missing != 1 {
 		t.Fatalf("gap = %+v, want 20..22 missing 1", span)
 	}
 }
 
 func TestDetectLogGapNeedsASequence(t *testing.T) {
-	group := &GroupInfo{}
+	runtime := newLogGapRuntime()
 	stored := &storedSeq{}
-	span, adopt := detectLogGap(group, GroupLogState{ID: 7, Name: "run", On: true}, &Message{}, stored.read)
+	span, adopt := detectLogGap(runtime, GroupLogState{ID: 7, Name: "run", On: true}, &Message{}, stored.read)
 	if span.missing != 0 || adopt != 0 || stored.calls != 0 {
 		t.Fatalf("a message without a sequence changed state: span=%+v adopt=%d reads=%d", span, adopt, stored.calls)
 	}
 }
 
 func TestLogSequenceSurvivesCallbackGroupReconstruction(t *testing.T) {
-	d, _, _, cleanup := newExecuteNewTestDice(t)
-	defer cleanup()
-	scope := messageflow.CallbackScope{DiceID: d.BaseConfig.Name, GroupID: "QQ-Group:321", UserID: "QQ:123"}
+	registry := NewGroupPlayerRuntimeRegistry()
+	first := registry.Group("dice-1", "QQ-Group:321")
 	state := GroupLogState{ID: 7, Name: "run", On: true, BaselineSeq: 100}
 	stored := &storedSeq{value: 100}
-	first := compatibilityGroupFromState(d, groupstate.State{}, playerstate.PlayerState{}, scope)
-	d.ImSession.ServiceAtNew.Store(scope.GroupID, first)
 	detectLogGap(first, state, seqMessage(101), stored.read)
-	first.noteLogSelfSent()
-	second := compatibilityGroupFromState(d, groupstate.State{}, playerstate.PlayerState{}, scope)
+	noteLogGapSelfSent(first)
+
+	second := registry.Group("dice-1", "QQ-Group:321")
+	if first != second {
+		t.Fatal("callback reconstruction replaced group runtime resources")
+	}
 	span, _ := detectLogGap(second, state, seqMessage(103), stored.read)
 	if span.missing != 0 || stored.calls != 1 {
 		t.Fatalf("callback rebuilt runtime baseline: gap=%+v repository reads=%d", span, stored.calls)
 	}
-	// A delayed send notification holding the prior view updates the same tracker.
-	first.noteLogSelfSent()
+	noteLogGapSelfSent(first)
 	if span, _ := detectLogGap(second, state, seqMessage(105), stored.read); span.missing != 0 {
-		t.Fatalf("old callback view lost self-message accounting: %+v", span)
+		t.Fatalf("old callback runtime lost self-message accounting: %+v", span)
 	}
 }
 
@@ -182,7 +187,7 @@ func (p *replayTestPort) SubmitInbound(ctx context.Context, id adapterapi.Endpoi
 	if p.backpressure && p.calls == 1 {
 		return adapterapi.IngressReceipt{}, messageflow.ErrIngressBackpressure
 	}
-	return p.h.inbound.HandleInbound(ctx, endpointcore.FencedInbound{EndpointID: id, Generation: 1, DesiredVersion: 1, Message: m})
+	return p.h.inbound.HandleInbound(ctx, endpointcore.FencedInbound{EndpointID: id, Generation: p.h.fence.Generation, DesiredVersion: p.h.fence.DesiredVersion, Message: m})
 }
 func (p *replayTestPort) InboxStatuses(ctx context.Context, ids []string) (map[string]string, error) {
 	p.reads++
@@ -224,7 +229,7 @@ func TestLogGapReplayUsesDurableInboxAndWaitsForCommit(t *testing.T) {
 			if scenario.preloaded {
 				for _, m := range port.messages[:count] {
 					m.History = adapterapi.InboundHistoryRecordOnly
-					if _, err := h.inbound.HandleInbound(h.ctx, endpointcore.FencedInbound{EndpointID: adapterapi.EndpointID(h.endpoint.ID), Generation: 1, DesiredVersion: 1, Message: m}); err != nil {
+					if _, err := h.inbound.HandleInbound(h.ctx, endpointcore.FencedInbound{EndpointID: adapterapi.EndpointID(h.endpoint.ID), Generation: h.fence.Generation, DesiredVersion: h.fence.DesiredVersion, Message: m}); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -238,7 +243,12 @@ func TestLogGapReplayUsesDurableInboxAndWaitsForCommit(t *testing.T) {
 				}
 			}
 			h.dice.InboundReplay = port
-			task := logGapFillTask{dice: h.dice, endpoint: h.endpoint, group: &GroupInfo{GroupID: obTestGroupID}, logID: log.ID, logName: "gap", fromSeq: 100, toSeq: int64(102 + count), gap: int64(count)}
+			task := logGapFillTask{
+				dice: h.dice, endpoint: h.endpoint, groupID: obTestGroupID,
+				runtime:      h.dice.ImSession.runtimeResources().Group(h.dice.BaseConfig.Name, obTestGroupID),
+				invocationID: canonicalFixtureLabel(t, "replay-task"),
+				logID:        log.ID, logName: "gap", fromSeq: 100, toSeq: int64(102 + count), gap: int64(count),
+			}
 			task.run()
 			entries, err := h.store.GetStoryLogEntries(h.ctx, h.dice.BaseConfig.Name, obTestGroupID, "gap")
 			if err != nil {
@@ -290,7 +300,7 @@ func TestHistoryLaneDoesNotHoldLiveMessagesBehindBackfill(t *testing.T) {
 	submit := func(id string, mode adapterapi.InboundHistory, seq int64) string {
 		t.Helper()
 		msg := adapterapi.InboundMessage{ProviderEventID: adapterapi.ProviderEventID(id), MessageID: adapterapi.MessageID(id), Kind: adapterapi.InboundKindMessage, ConversationKind: adapterapi.ConversationKindGroup, Platform: "QQ", Sender: obTestUserID, Conversation: obTestGroupID, Target: h.endpoint.UserID, Text: ".r 1d1", OccurredAt: time.Unix(1234567890, 0).UTC(), Sequence: seq, History: mode}
-		receipt, err := h.inbound.HandleInbound(h.ctx, endpointcore.FencedInbound{EndpointID: adapterapi.EndpointID(h.endpoint.ID), Generation: 1, DesiredVersion: 1, Message: msg})
+		receipt, err := h.inbound.HandleInbound(h.ctx, endpointcore.FencedInbound{EndpointID: adapterapi.EndpointID(h.endpoint.ID), Generation: h.fence.Generation, DesiredVersion: h.fence.DesiredVersion, Message: msg})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -325,6 +335,55 @@ func (p *historyCommitProbe) Query(ctx context.Context, request adapterapi.Query
 	return adapterapi.QueryResult{}, err
 }
 
+type concurrentHistoryQuery struct {
+	started chan adapterapi.ConversationID
+	release <-chan struct{}
+}
+
+func (query *concurrentHistoryQuery) Query(_ context.Context, request adapterapi.QueryRequest) (adapterapi.QueryResult, error) {
+	query.started <- request.Group
+	<-query.release
+	return adapterapi.QueryResult{}, errors.New("stop after concurrency probe")
+}
+
+func TestLogGapReplayRunsDifferentGroupsConcurrently(t *testing.T) {
+	h := newDurableOBHarness(t)
+	release := make(chan struct{})
+	query := &concurrentHistoryQuery{started: make(chan adapterapi.ConversationID, 2), release: release}
+	h.dice.ProviderQuery = query
+	h.dice.InboundReplay = &replayTestPort{h: h}
+	registry := h.dice.ImSession.runtimeResources()
+	done := make(chan struct{}, 2)
+	for _, groupID := range []string{"QQ-Group:2002", "QQ-Group:3003"} {
+		task := logGapFillTask{
+			dice: h.dice, endpoint: h.endpoint, groupID: groupID,
+			runtime:      registry.Group(h.dice.BaseConfig.Name, groupID),
+			invocationID: "concurrent|" + groupID,
+			logID:        1, logName: "concurrent", fromSeq: 1, toSeq: 10, gap: 8,
+		}
+		go func() {
+			task.run()
+			done <- struct{}{}
+		}()
+	}
+	seen := map[adapterapi.ConversationID]bool{}
+	for range 2 {
+		select {
+		case groupID := <-query.started:
+			seen[groupID] = true
+		case <-time.After(time.Second):
+			close(release)
+			t.Fatal("different group recovery was serialized behind another group")
+		}
+	}
+	close(release)
+	<-done
+	<-done
+	if !seen["QQ-Group:2002"] || !seen["QQ-Group:3003"] {
+		t.Fatalf("concurrent history groups = %#v", seen)
+	}
+}
+
 func TestLogGapFetchStartsOnlyAfterTriggerCommits(t *testing.T) {
 	h := newDurableOBHarness(t)
 	h.dice.LogRepository = service.NewEventStoreLogRepository(h.store, h.dice.BaseConfig.Name)
@@ -336,7 +395,7 @@ func TestLogGapFetchStartsOnlyAfterTriggerCommits(t *testing.T) {
 		t.Fatal(err)
 	}
 	msg := adapterapi.InboundMessage{ProviderEventID: "gap-trigger", MessageID: "gap-trigger", Kind: adapterapi.InboundKindMessage, ConversationKind: adapterapi.ConversationKindGroup, Platform: "QQ", Sender: obTestUserID, Conversation: obTestGroupID, Target: h.endpoint.UserID, Text: "after gap", OccurredAt: time.Now().UTC(), Sequence: 103}
-	receipt, err := h.inbound.HandleInbound(h.ctx, endpointcore.FencedInbound{EndpointID: adapterapi.EndpointID(h.endpoint.ID), Generation: 1, DesiredVersion: 1, Message: msg})
+	receipt, err := h.inbound.HandleInbound(h.ctx, endpointcore.FencedInbound{EndpointID: adapterapi.EndpointID(h.endpoint.ID), Generation: h.fence.Generation, DesiredVersion: h.fence.DesiredVersion, Message: msg})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -378,7 +437,11 @@ func TestManualLogCheckSkipsArchivedMessagesBeforeChoosingMode(t *testing.T) {
 		}
 	}
 	h.dice.ProviderQuery, h.dice.InboundReplay = port, port
-	ctx := &MsgContext{Dice: h.dice, EndPoint: h.endpoint, Group: &GroupInfo{GroupID: obTestGroupID}, PrivilegeLevel: 100}
+	ctx := newCanonicalTestMessageContext(t, h.dice, h.endpoint, &Message{
+		MessageType: "group", GroupID: obTestGroupID,
+		Sender: SenderBase{UserID: obTestUserID, Nickname: "Alice"},
+	}, "manual-log-check")
+	ctx.PrivilegeLevel = 100
 	task, err := newLogGapCheck(ctx, 100, 108)
 	if err != nil {
 		t.Fatal(err)
@@ -418,7 +481,11 @@ func TestManualLogCheckRequiresMasterAndActiveBaseline(t *testing.T) {
 			if err := h.store.SetStoryLogState(h.ctx, eventstore.StoryLogState{DiceID: h.dice.BaseConfig.Name, GroupID: obTestGroupID, SessionID: log.ID, Name: "manual-guards", On: tc.on, BaselineSeq: 100}); err != nil {
 				t.Fatal(err)
 			}
-			ctx := &MsgContext{Dice: h.dice, EndPoint: h.endpoint, Group: &GroupInfo{GroupID: obTestGroupID}, PrivilegeLevel: tc.privilege}
+			ctx := newCanonicalTestMessageContext(t, h.dice, h.endpoint, &Message{
+				MessageType: "group", GroupID: obTestGroupID,
+				Sender: SenderBase{UserID: obTestUserID, Nickname: "Alice"},
+			}, "manual-log-check-"+tc.name)
+			ctx.PrivilegeLevel = tc.privilege
 			if _, err := newLogGapCheck(ctx, tc.after, tc.before); err == nil {
 				t.Fatal("unsafe manual recovery accepted")
 			}
@@ -440,10 +507,12 @@ func TestHistoryCallbackRecordOnlyDoesNotExecute(t *testing.T) {
 				t.Fatal(err)
 			}
 			// Every append would normally issue a size reminder. RecordOnly must not.
-			h.dice.Config.LogSizeNoticeEnable = true
-			h.dice.Config.LogSizeNoticeCount = 1
+			updateCanonicalTestConfig(t, h.dice, func(config *Config) {
+				config.LogSizeNoticeEnable = true
+				config.LogSizeNoticeCount = 1
+			})
 			msg := adapterapi.InboundMessage{ProviderEventID: adapterapi.ProviderEventID("history-" + strconv.FormatBool(on)), MessageID: adapterapi.MessageID("history-" + strconv.FormatBool(on)), Kind: adapterapi.InboundKindMessage, ConversationKind: adapterapi.ConversationKindGroup, Platform: "QQ", Sender: "QQ:987654321", SenderName: "Recovered player", Conversation: obTestGroupID, Target: h.endpoint.UserID, Text: ".r 1d1", OccurredAt: time.Unix(1234567890, 0).UTC(), Sequence: 101, History: adapterapi.InboundHistoryRecordOnly}
-			receipt, err := h.inbound.HandleInbound(h.ctx, endpointcore.FencedInbound{EndpointID: adapterapi.EndpointID(h.endpoint.ID), Generation: 1, DesiredVersion: 1, Message: msg})
+			receipt, err := h.inbound.HandleInbound(h.ctx, endpointcore.FencedInbound{EndpointID: adapterapi.EndpointID(h.endpoint.ID), Generation: h.fence.Generation, DesiredVersion: h.fence.DesiredVersion, Message: msg})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -493,7 +562,7 @@ func TestHistoryCallbackExecuteArchivesReplyAtOriginalTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	msg := adapterapi.InboundMessage{ProviderEventID: "history-execute", MessageID: "history-execute", Kind: adapterapi.InboundKindMessage, ConversationKind: adapterapi.ConversationKindGroup, Platform: "QQ", Sender: obTestUserID, Conversation: obTestGroupID, Target: h.endpoint.UserID, Text: ".r 1d1", OccurredAt: time.Unix(1234567890, 0).UTC(), Sequence: 101, History: adapterapi.InboundHistoryExecute}
-	if _, err := h.inbound.HandleInbound(h.ctx, endpointcore.FencedInbound{EndpointID: adapterapi.EndpointID(h.endpoint.ID), Generation: 1, DesiredVersion: 1, Message: msg}); err != nil {
+	if _, err := h.inbound.HandleInbound(h.ctx, endpointcore.FencedInbound{EndpointID: adapterapi.EndpointID(h.endpoint.ID), Generation: h.fence.Generation, DesiredVersion: h.fence.DesiredVersion, Message: msg}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.callback.ProcessOne(h.ctx); err != nil {
@@ -530,7 +599,7 @@ func TestHistoryCallbackExecuteDoesNotRunAfterLogPaused(t *testing.T) {
 		t.Fatal(err)
 	}
 	msg := adapterapi.InboundMessage{ProviderEventID: "paused-execute", MessageID: "paused-execute", Kind: adapterapi.InboundKindMessage, ConversationKind: adapterapi.ConversationKindGroup, Platform: "QQ", Sender: obTestUserID, Conversation: obTestGroupID, Target: h.endpoint.UserID, Text: ".r 1d1", OccurredAt: time.Unix(1234567890, 0).UTC(), Sequence: 101, History: adapterapi.InboundHistoryExecute}
-	if _, err := h.inbound.HandleInbound(h.ctx, endpointcore.FencedInbound{EndpointID: adapterapi.EndpointID(h.endpoint.ID), Generation: 1, DesiredVersion: 1, Message: msg}); err != nil {
+	if _, err := h.inbound.HandleInbound(h.ctx, endpointcore.FencedInbound{EndpointID: adapterapi.EndpointID(h.endpoint.ID), Generation: h.fence.Generation, DesiredVersion: h.fence.DesiredVersion, Message: msg}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.callback.ProcessOne(h.ctx); err != nil {

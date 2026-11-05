@@ -1,132 +1,66 @@
 package dice
 
-import (
-	"context"
-	"path/filepath"
-	"testing"
-	"time"
+import "testing"
 
-	"Scardice-core/dice/service"
-	"Scardice-core/model"
-)
-
-func TestOfficialQQDelegateIdentityCutover_usesOnlyAppliedMapping(t *testing.T) {
-	operator, err := newMockDatabaseOperator(filepath.Join(t.TempDir(), "delegate-cutover.db"))
-	if err != nil {
-		t.Fatalf("newMockDatabaseOperator() error = %v", err)
+func TestOfficialQQDelegateKeepsCanonicalIdentitiesDistinct(t *testing.T) {
+	d, _ := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "OpenQQ:fixture-bot")
+	endpoint.Platform = "OpenQQ"
+	endpoint.Adapter = &PlatformAdapterOfficialQQ{AppID: 123456789}
+	message := newGroupMsg(officialQQIdentityGroupID, officialQQIdentityMemberID, "")
+	message.Platform = "OpenQQ"
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, message, "official-qq-canonical-delegates")
+	targets := []struct {
+		userID string
+		name   string
+	}{
+		{userID: "OpenQQ-Member-T:123456789-group-open-id-other-member", name: "AppID-scoped player"},
+		{userID: "OpenQQ:member-open-id", name: "imported unscoped player"},
+		{userID: "OpenQQ:99887766-member-open-id", name: "distinct UIN-scoped player"},
 	}
-	t.Cleanup(operator.Close)
-	if err := operator.db.AutoMigrate(&model.GroupInfo{}); err != nil {
-		t.Fatalf("migrate group_info: %v", err)
+	for _, target := range targets {
+		requireOfficialQQCanonicalPlayer(t, ctx, target.userID, target.name)
 	}
-	const oldID = "OpenQQ:member-open-id"
-	const newID = "OpenQQ:1-member-open-id"
-	updatedAt := int64(1)
-	if err := operator.db.Create(&model.GroupInfo{ID: "OpenQQ-Group-T:123456789-group-open-id", CreatedAt: 1, UpdatedAt: &updatedAt}).Error; err != nil {
-		t.Fatalf("seed group_info: %v", err)
-	}
-	migrator := service.NewOfficialQQIdentityMigrator(operator, time.Now)
-	source := service.OfficialQQVerifiedIdentitySource{
-		AppID:       123456789,
-		VerifiedUIN: "1",
-		Groups: []service.OfficialQQGroupIdentitySource{{
-			GroupOpenID:   "group-open-id",
-			MemberOpenIDs: []string{"member-open-id"},
-		}},
-	}
-	if result, err := migrator.MigrateVerifiedSource(context.Background(), source, 1); err != nil || result.Processed != 1 {
-		t.Fatalf("prepare pending delegate mapping = %#v, %v", result, err)
-	}
-
-	oldPlayer := &GroupPlayerInfo{Name: "old", UserID: oldID}
-	newPlayer := &GroupPlayerInfo{Name: "new", UserID: newID}
-	group := &GroupInfo{Players: new(SyncMap[string, *GroupPlayerInfo])}
-	group.Players.Store(oldID, oldPlayer)
-	group.Players.Store(newID, newPlayer)
-	ctx := &MsgContext{
-		Dice:  &Dice{DBOperator: operator},
-		Group: group,
-		EndPoint: &EndPointInfo{Adapter: &PlatformAdapterOfficialQQ{
-			AppID: 123456789,
-		}},
-	}
-
-	pendingCtx, found := (&AtInfo{UserID: oldID}).CopyCtx(ctx)
-	if !found || pendingCtx.Player != oldPlayer {
-		t.Fatalf("pending delegate player = %#v, found %t, want old player", pendingCtx.Player, found)
-	}
-	if result, err := migrator.MigrateVerifiedSource(context.Background(), source, 1); err != nil || result.Processed != 1 {
-		t.Fatalf("apply delegate mapping = %#v, %v", result, err)
-	}
-
-	appliedCtx, found := (&AtInfo{UserID: oldID}).CopyCtx(ctx)
-	if !found || appliedCtx.Player != newPlayer {
-		t.Fatalf("applied delegate player = %#v, found %t, want new player", appliedCtx.Player, found)
+	for _, target := range targets {
+		delegated, found := (&AtInfo{UserID: target.userID}).CopyCtx(ctx)
+		if !found || delegated.Player == nil {
+			t.Fatalf("canonical delegate %q not found: %#v", target.userID, delegated.Player)
+		}
+		if delegated.Player.UserID() != target.userID || delegated.Player.Name() != target.name {
+			t.Fatalf("delegate %q resolved to %q (%q)", target.userID, delegated.Player.UserID(), delegated.Player.Name())
+		}
 	}
 }
 
-func TestOfficialQQDelegateIdentityCutover_keepsBlockedAndUnmappedIDs(t *testing.T) {
-	operator, err := newMockDatabaseOperator(filepath.Join(t.TempDir(), "delegate-fallback.db"))
+func TestOfficialQQDelegateCreatesUnmappedCanonicalIdentity(t *testing.T) {
+	d, _ := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "OpenQQ:fixture-bot")
+	endpoint.Platform = "OpenQQ"
+	endpoint.Adapter = &PlatformAdapterOfficialQQ{AppID: 123456789}
+	message := newGroupMsg(officialQQIdentityGroupID, officialQQIdentityMemberID, "")
+	message.Platform = "OpenQQ"
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, message, "official-qq-new-canonical-delegate")
+	const targetID = "OpenQQ-Member-T:123456789-group-open-id-new-member"
+	delegated, found := (&AtInfo{UserID: targetID}).CopyCtx(ctx)
+	if found || delegated.Player == nil || delegated.Player.UserID() != targetID {
+		t.Fatalf("unmapped delegate = %#v, found=%t", delegated.Player, found)
+	}
+	again, found := (&AtInfo{UserID: targetID}).CopyCtx(ctx)
+	if !found || again.Player != delegated.Player {
+		t.Fatalf("created canonical delegate not reused: %#v, found=%t", again.Player, found)
+	}
+}
+
+func requireOfficialQQCanonicalPlayer(t *testing.T, ctx *MsgContext, userID, name string) *GroupPlayerInfo {
+	t.Helper()
+	player, err := ctx.ResolvePlayer(ctx.domainContext(), ctx.Group.GroupID(), userID)
 	if err != nil {
-		t.Fatalf("newMockDatabaseOperator() error = %v", err)
+		t.Fatalf("resolve canonical player %q: %v", userID, err)
 	}
-	t.Cleanup(operator.Close)
-	journal := service.NewOfficialQQIdentityJournal(operator, time.Now)
-	if err := operator.db.AutoMigrate(&model.GroupInfo{}); err != nil {
-		t.Fatalf("migrate group_info: %v", err)
+	if player.Version() == 0 {
+		if err = player.create(ctx.Dice.BaseConfig.Name, ctx.Group.GroupID(), userID, name); err != nil {
+			t.Fatalf("create canonical player %q: %v", userID, err)
+		}
 	}
-	const blockedID = "OpenQQ:blocked-member"
-	const unmappedID = "OpenQQ:unmapped-member"
-	updatedAt := int64(1)
-	if err := operator.db.Create(&model.GroupInfo{ID: "OpenQQ-Group-T:123456789-group-open-id", CreatedAt: 1, UpdatedAt: &updatedAt}).Error; err != nil {
-		t.Fatalf("seed group_info: %v", err)
-	}
-	migrator := service.NewOfficialQQIdentityMigrator(operator, time.Now)
-	source := service.OfficialQQVerifiedIdentitySource{
-		AppID:       123456789,
-		VerifiedUIN: "1",
-		Groups: []service.OfficialQQGroupIdentitySource{{
-			GroupOpenID:   "group-open-id",
-			MemberOpenIDs: []string{"blocked-member"},
-		}},
-	}
-	if result, err := migrator.MigrateVerifiedSource(context.Background(), source, 1); err != nil || result.Processed != 1 {
-		t.Fatalf("prepare blocked delegate mapping = %#v, %v", result, err)
-	}
-	key := service.OfficialQQIdentityMappingKey{
-		MigrationID: service.OfficialQQExplicitIdentityMigrationID,
-		Account:     "123456789",
-		Store:       service.OfficialQQIdentityStoreDelegate,
-		Keyspace:    service.OfficialQQIdentityKeyspacePlayerUserID,
-		OldID:       blockedID,
-	}
-	if err := journal.Transition(context.Background(), service.OfficialQQIdentityMappingTransition{
-		Key:   key,
-		State: model.OfficialQQIdentityMappingBlocked,
-		Error: "target exists",
-	}); err != nil {
-		t.Fatalf("Transition() error = %v", err)
-	}
-	blockedPlayer := &GroupPlayerInfo{Name: "blocked", UserID: blockedID}
-	unmappedPlayer := &GroupPlayerInfo{Name: "unmapped", UserID: unmappedID}
-	group := &GroupInfo{Players: new(SyncMap[string, *GroupPlayerInfo])}
-	group.Players.Store(blockedID, blockedPlayer)
-	group.Players.Store(unmappedID, unmappedPlayer)
-	ctx := &MsgContext{
-		Dice:  &Dice{DBOperator: operator},
-		Group: group,
-		EndPoint: &EndPointInfo{Adapter: &PlatformAdapterOfficialQQ{
-			AppID: 123456789,
-		}},
-	}
-
-	blockedCtx, blockedFound := (&AtInfo{UserID: blockedID}).CopyCtx(ctx)
-	unmappedCtx, unmappedFound := (&AtInfo{UserID: unmappedID}).CopyCtx(ctx)
-
-	if !blockedFound || blockedCtx.Player != blockedPlayer {
-		t.Fatalf("blocked delegate player = %#v, found %t", blockedCtx.Player, blockedFound)
-	}
-	if !unmappedFound || unmappedCtx.Player != unmappedPlayer {
-		t.Fatalf("unmapped delegate player = %#v, found %t", unmappedCtx.Player, unmappedFound)
-	}
+	return player
 }

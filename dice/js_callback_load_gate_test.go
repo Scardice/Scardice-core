@@ -19,11 +19,10 @@ func newJSLoadGateFixture(t *testing.T) (*Dice, *ExtInfo, jsengine.Loop, *observ
 	manager := NewJsLoopManager()
 	loop := gojaengine.WrapEventLoop(startFsTestLoop(t))
 	generation := manager.SetLoop(loop)
-	d := &Dice{
-		Logger:         zap.New(core).Sugar(),
-		ExtLoopManager: manager,
-		Config:         Config{JsConfig: JsConfig{JsEnable: true}},
-	}
+	d, _ := newCanonicalTestDice(t)
+	d.Logger = zap.New(core).Sugar()
+	d.ExtLoopManager = manager
+	updateCanonicalTestConfig(t, d, func(config *Config) { config.JsEnable = true })
 	ext := &ExtInfo{Name: "late-plugin", IsJsExt: true, JSLoopVersion: generation}
 	return d, ext, loop, logs
 }
@@ -158,17 +157,25 @@ func TestJSCommandsIssuedDuringScriptLoadAreDroppedAndLogged(t *testing.T) {
 		DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
 	}
 	core, logs := observer.New(zapcore.WarnLevel)
-	d := newTestDice([]*ExtInfo{wrapper})
+	d, _ := newCanonicalTestDice(t)
+	installCanonicalTestExtensions(d, wrapper)
 	d.Logger = zap.New(core).Sugar()
 	d.CmdMap = CmdMapCls{}
 	d.JsExtRegistry = new(SyncMap[string, *ExtInfo])
+	pluginExt.dice = d
 	d.JsExtRegistry.Store("cmd-plugin", pluginExt)
-	group := newTestGroupInfo()
-	group.SetActivatedExtList([]*ExtInfo{wrapper}, d)
-	group.Active = true
-	session := &IMSession{Parent: d}
-	ctx := &MsgContext{Dice: d, Session: session, Group: group, IsPrivate: true}
-	msg := &Message{}
+	endpoint := newCanonicalTestEndpoint(d, "QQ:load-gate-bot")
+	msg := newGroupMsg("QQ-Group:load-gate", "QQ:load-gate-user", "")
+	withCanonicalTestMessageContext(t, d, endpoint, msg, "load-gate-group", func(ctx *MsgContext) error {
+		if err := ctx.Group.SetActivation(endpoint.UserID, true, true); err != nil {
+			return err
+		}
+		return ctx.Group.SetExtension(wrapper.Name, true)
+	})
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, msg, "load-gate-command")
+	ctx.IsPrivate = true
+	ctx.MessageType = "private"
+	session := d.ImSession
 
 	d.setJsReloading(true)
 	if result := session.commandSolve(ctx, msg, &CmdArgs{Command: "probecmd"}); result.Status == commandSolveSolved || calls != 0 {

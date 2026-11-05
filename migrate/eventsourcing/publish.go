@@ -8,33 +8,20 @@ import (
 	"Scardice-core/eventstore"
 )
 
-func buildFreshReadiness(previous eventstore.Readiness, target string) eventstore.Readiness {
+// readinessSchemaVersion 是无密钥的 v2 事件库就绪行 schema 版本,
+// 与 v1reader 对 schema_version == "2" 的识别保持一致。
+const readinessSchemaVersion = 2
+
+func buildFreshReadiness(target string) eventstore.Readiness {
 	return eventstore.Readiness{
-		Mode: string(ModeFresh), SchemaVersion: 1, DatabaseIdentity: target,
-		IndexRootID: previous.IndexRootID, IndexRootFingerprint: append([]byte(nil), previous.IndexRootFingerprint...),
-		EncryptionRootIDs: append([]string(nil), previous.EncryptionRootIDs...),
+		Mode: string(ModeFresh), SchemaVersion: readinessSchemaVersion, DatabaseIdentity: target,
 	}
 }
 
-func buildImportReadiness(
-	previous eventstore.Readiness,
-	target string,
-	semanticManifest, digest, projectionManifest, projectionDigest []byte,
-	terminalPosition uint64,
-	completed time.Time,
-) eventstore.Readiness {
+func buildImportReadiness(target string, completed time.Time) eventstore.Readiness {
 	return eventstore.Readiness{
-		Mode: string(ModeImport), SchemaVersion: 1, DatabaseIdentity: target,
-		IndexRootID: previous.IndexRootID, IndexRootFingerprint: append([]byte(nil), previous.IndexRootFingerprint...),
-		EncryptionRootIDs:          append([]string(nil), previous.EncryptionRootIDs...),
-		SourceManifestDigest:       append([]byte(nil), digest...),
-		TargetManifestDigest:       append([]byte(nil), digest...),
-		SemanticManifest:           append([]byte(nil), semanticManifest...),
-		ProjectionManifest:         append([]byte(nil), projectionManifest...),
-		ProjectionManifestDigest:   append([]byte(nil), projectionDigest...),
-		TerminalGlobalPosition:     terminalPosition,
-		TerminalProjectionPosition: terminalPosition,
-		CompletedAt:                completed.UTC(),
+		Mode: string(ModeImport), SchemaVersion: readinessSchemaVersion, DatabaseIdentity: target,
+		CompletedAt: completed.UTC(),
 	}
 }
 

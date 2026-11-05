@@ -1,0 +1,54 @@
+{
+  "default_group": "default",
+  "groups": {
+    "default": {
+      "version_main": null,
+      "version_prerelease": "-dev",
+      "app_channel": "dev",
+      "appname": "Scardice",
+      "build_mode": "single",
+      "targets": [
+        "host/host"
+      ],
+      "cgo": false,
+      "redownload_runtime_assets": false,
+      "compatible_names": false,
+      "upx": null,
+      "development": false,
+      "update_submodules": true,
+      "pack_runtime_assets": true,
+      "strict_runtime_assets": true,
+      "output_dir": "output",
+      "dev_output_dir": ".",
+      "ui_submodule_dir": "Scardice-ui",
+      "builtins_submodule_dir": "sealdice-builtins",
+      "static_frontend_dir": "static/frontend",
+      "build_cache_dir": ".build-cache",
+      "private_key_file": "signature/seal_trusted_private_key.pem",
+      "sign_key_file": "signature/seal_sign_private_key.bin",
+      "sign_v3_url_file": "signature/SealSignV3Url"
+    },
+    "spark-linux-amd64": {
+      "version_main": "1.6.7",
+      "version_prerelease": "-spark",
+      "app_channel": "spark",
+      "targets": [
+        "linux/amd64"
+      ],
+      "update_submodules": false,
+      "ui_submodule_dir": "../Scardice-ui",
+      "compatible_names": true,
+      "pack_runtime_assets": true,
+      "strict_runtime_assets": true
+    },
+    "dev": {
+      "development": true,
+      "update_submodules": false,
+      "pack_runtime_assets": false,
+      "strict_runtime_assets": false,
+      "redownload_runtime_assets": false,
+      "compatible_names": false,
+      "upx": false
+    }
+  }
+}

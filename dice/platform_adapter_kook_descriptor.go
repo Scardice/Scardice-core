@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -15,8 +16,10 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"go.uber.org/zap"
 
 	"Scardice-core/adapterapi"
+	"Scardice-core/logger"
 )
 
 const KookAdapterKey adapterapi.AdapterKey = "kook"
@@ -53,6 +56,38 @@ type kookRuntime struct {
 	selfID     string
 	httpClient *http.Client
 	dialer     *websocket.Dialer
+	// timing overrides the protocol timers; the zero value selects the
+	// documented defaults.
+	timing kookTiming
+}
+
+// KOOK websocket timers, https://developer.kookapp.cn/doc/websocket: a ping
+// every 30s, a pong within 6s, a hello within 6s, and an exponential redial
+// backoff that starts at 2s and is capped at 60s.
+const (
+	defaultKookHeartbeatInterval = 30 * time.Second
+	defaultKookPongTimeout       = 6 * time.Second
+	defaultKookHelloTimeout      = 6 * time.Second
+	defaultKookReconnectBase     = 2 * time.Second
+	defaultKookReconnectMax      = 60 * time.Second
+	// A gateway-directed reconnect that arrives sooner than this after the
+	// connection was established counts as a loop, not an instruction.
+	defaultKookReconnectLoopWindow = 5 * time.Second
+	defaultKookInboundRetryDelay   = 200 * time.Millisecond
+	kookInboundQueueSize           = 512
+	maxKookInboundRetries          = 2
+)
+
+type kookTiming struct {
+	heartbeatInterval time.Duration
+	pongTimeout       time.Duration
+	helloTimeout      time.Duration
+	reconnectBase     time.Duration
+	reconnectMax      time.Duration
+	inboundRetryDelay time.Duration
+	// reconnectLoopWindow is how long a session must have lived for a
+	// gateway-directed reconnect to be redialed at once.
+	reconnectLoopWindow time.Duration
 }
 
 type kookReadResult struct {
@@ -544,6 +579,90 @@ func (runtime *kookRuntime) resolveToken(ctx context.Context) (string, error) {
 	return string(value.Bytes), nil
 }
 
+// kookSessionError is the failure of one gateway session. Run redials after
+// it; any other error ends Run. A directed error is the gateway telling a
+// healthy client to reconnect (signal 5): Run redials at once and does not
+// report an outage.
+type kookSessionError struct {
+	code     string
+	err      error
+	directed bool
+}
+
+func (e *kookSessionError) Error() string { return e.code + ": " + e.err.Error() }
+func (e *kookSessionError) Unwrap() error { return e.err }
+
+func kookSessionFailure(code string, err error) error { return &kookSessionError{code: code, err: err} }
+
+// kookReconnectReason describes the reconnect codes the gateway documents.
+func kookReconnectReason(code int64) string {
+	switch code {
+	case 40106:
+		return "resume failed: missing parameters"
+	case 40107:
+		return "session expired"
+	case 40108:
+		return "invalid or expired sn"
+	}
+	return ""
+}
+
+// kookReconnectRequest reads the code and message of a signal-5 payload. The
+// documented code is a number; a string, a missing or a malformed payload must
+// not stop the client from reconnecting, so every failure yields zero values.
+func kookReconnectRequest(data json.RawMessage) (code int64, message string) {
+	var payload struct {
+		Code json.Number `json:"code"`
+		Err  string      `json:"err"`
+	}
+	_ = json.Unmarshal(data, &payload)
+	code, _ = payload.Code.Int64()
+	return code, payload.Err
+}
+
+func (timing kookTiming) withDefaults() kookTiming {
+	if timing.heartbeatInterval <= 0 {
+		timing.heartbeatInterval = defaultKookHeartbeatInterval
+	}
+	if timing.pongTimeout <= 0 {
+		timing.pongTimeout = defaultKookPongTimeout
+	}
+	if timing.helloTimeout <= 0 {
+		timing.helloTimeout = defaultKookHelloTimeout
+	}
+	if timing.reconnectBase <= 0 {
+		timing.reconnectBase = defaultKookReconnectBase
+	}
+	if timing.reconnectLoopWindow <= 0 {
+		timing.reconnectLoopWindow = defaultKookReconnectLoopWindow
+	}
+	if timing.reconnectMax <= 0 {
+		timing.reconnectMax = defaultKookReconnectMax
+	}
+	if timing.inboundRetryDelay <= 0 {
+		timing.inboundRetryDelay = defaultKookInboundRetryDelay
+	}
+	return timing
+}
+
+// redialDelay is the wait before redial number attempt (0-based): the base,
+// doubled per consecutive failure, capped at the maximum.
+func (timing kookTiming) redialDelay(attempt int) time.Duration {
+	if attempt >= 30 {
+		return timing.reconnectMax
+	}
+	if delay := timing.reconnectBase << attempt; delay > 0 && delay < timing.reconnectMax {
+		return delay
+	}
+	return timing.reconnectMax
+}
+
+func kookRuntimeLogger() *zap.SugaredLogger { return zap.S().Named(logger.LogKeyAdapter) }
+
+// Run keeps one gateway session open until Stop. A session that fails (gateway
+// unreachable, no hello, no pong, reconnect signal, closed transport) is
+// reported once as failed per outage, then redialed with exponential backoff;
+// only a local, non-retryable fault ends Run.
 func (runtime *kookRuntime) Run(ctx context.Context, core adapterapi.CorePort) (runErr error) {
 	if runtime == nil || core == nil {
 		return errors.New("kook: runtime or core is unavailable")
@@ -573,115 +692,245 @@ func (runtime *kookRuntime) Run(ctx context.Context, core adapterapi.CorePort) (
 	if err != nil {
 		return err
 	}
-	gatewayData, err := runtime.request(runCtx, token, http.MethodGet, "/gateway/index?compress=0", nil)
-	if err != nil {
-		return err
-	}
-	var gatewayResult struct {
-		URL string `json:"url"`
-	}
-	if decodeErr := json.Unmarshal(gatewayData, &gatewayResult); decodeErr != nil {
-		return decodeErr
-	}
-	gatewayURL, err := url.Parse(gatewayResult.URL)
-	if err != nil || gatewayURL.Host == "" || (gatewayURL.Scheme != "ws" && gatewayURL.Scheme != "wss") || gatewayURL.User != nil || gatewayURL.Fragment != "" {
-		return errors.New("kook: invalid gateway URL")
-	}
-	headers := http.Header{"Authorization": []string{"Bot " + token}}
-	connection, response, err := runtime.dialer.DialContext(runCtx, gatewayURL.String(), headers)
-	if response != nil && response.Body != nil {
-		_ = response.Body.Close()
-	}
-	if err != nil {
-		return err
-	}
-	connection.SetReadLimit(adapterapi.MaxInboundTextBytes + 64*1024)
-	runtime.mu.Lock()
-	runtime.conn = connection
-	runtime.mu.Unlock()
-	messageType, helloBytes, err := connection.ReadMessage()
-	if err != nil {
-		return err
-	}
-	helloBytes, err = decodeKookFrame(messageType, helloBytes)
-	if err != nil {
-		return err
-	}
-	var hello kookGatewayPayload
-	if decodeErr := json.Unmarshal(helloBytes, &hello); decodeErr != nil || hello.Signal != 1 {
-		return errors.New("kook: gateway did not send hello")
-	}
-	var helloData struct {
-		Code int `json:"code"`
-	}
-	if decodeErr := json.Unmarshal(hello.Data, &helloData); decodeErr != nil || helloData.Code != 0 {
-		return errors.New("kook: invalid gateway hello")
-	}
-	selfData, err := runtime.request(runCtx, token, http.MethodGet, "/user/me", nil)
-	if err != nil {
-		return err
-	}
-	var self kookGatewayUser
-	if decodeErr := json.Unmarshal(selfData, &self); decodeErr != nil || self.ID == "" {
-		return errors.New("kook: invalid self identity")
-	}
-	reads := make(chan kookReadResult, 1)
+	timing := runtime.timing.withDefaults()
+	// One worker serves every session of this Run, so events reach Core in
+	// arrival order and a slow Core never stalls the socket.
+	jobs := make(chan json.RawMessage, kookInboundQueueSize)
 	runtime.mu.Lock()
 	if !runtime.running {
 		runtime.mu.Unlock()
 		return nil
 	}
+	runtime.wg.Add(1)
+	runtime.mu.Unlock()
+	go runtime.inboundWorker(runCtx, core, jobs, timing)
+	log := kookRuntimeLogger()
+	outage, attempts := false, 0
+	var connectedAt time.Time
+	onConnected := func() {
+		if outage {
+			log.Infof("Kook 连接已恢复")
+		}
+		outage, attempts = false, 0
+		connectedAt = time.Now()
+	}
+	for {
+		connectedAt = time.Time{}
+		err := runtime.runSession(runCtx, core, token, timing, jobs, onConnected)
+		if runCtx.Err() != nil || errors.Is(err, context.Canceled) {
+			return nil
+		}
+		var failure *kookSessionError
+		if !errors.As(err, &failure) {
+			return err
+		}
+		cause := sanitizeOnebotProviderCause(failure.err.Error())
+		if failure.directed && !connectedAt.IsZero() && time.Since(connectedAt) >= timing.reconnectLoopWindow {
+			// The gateway told a healthy session to reconnect. Events still
+			// queued from it are real messages (Core de-duplicates by provider
+			// message ID) and stay queued; only the sequence is discarded, with
+			// the session.
+			log.Infof("Kook 网关要求重新连接（%s）：%s；正在重新连接", failure.code, cause)
+			attempts = 0
+			continue
+		}
+		if !outage {
+			outage = true
+			_ = core.ReportObservation(runCtx, adapterapi.LifecycleObservation{Kind: adapterapi.LifecycleObservationState, State: adapterapi.ObservedStateFailed, Code: failure.code, Detail: cause, Retryable: true, OccurredAt: time.Now().UTC()})
+			log.Warnf("Kook 连接中断（%s）：%s；将自动重连", failure.code, cause)
+		} else {
+			log.Debugf("Kook 重连失败（%s）：%s", failure.code, cause)
+		}
+		redial := time.NewTimer(timing.redialDelay(attempts))
+		attempts++
+		select {
+		case <-runCtx.Done():
+			redial.Stop()
+			return nil
+		case <-redial.C:
+		}
+	}
+}
+
+// runSession fetches a fresh gateway, connects and serves it until it fails.
+// Each session starts from sn 0: a new gateway session numbers its events
+// afresh, and after a reconnect signal the local sequence must not survive.
+func (runtime *kookRuntime) runSession(ctx context.Context, core adapterapi.CorePort, token string, timing kookTiming, jobs chan<- json.RawMessage, onConnected func()) error {
+	gatewayData, err := runtime.request(ctx, token, http.MethodGet, "/gateway/index?compress=0", nil)
+	if err != nil {
+		return kookSessionFailure("connect_failed", err)
+	}
+	var gatewayResult struct {
+		URL string `json:"url"`
+	}
+	if decodeErr := json.Unmarshal(gatewayData, &gatewayResult); decodeErr != nil {
+		return kookSessionFailure("connect_failed", decodeErr)
+	}
+	gatewayURL, err := url.Parse(gatewayResult.URL)
+	if err != nil || gatewayURL.Host == "" || (gatewayURL.Scheme != "ws" && gatewayURL.Scheme != "wss") || gatewayURL.User != nil || gatewayURL.Fragment != "" {
+		return kookSessionFailure("connect_failed", errors.New("kook: invalid gateway URL"))
+	}
+	selfData, err := runtime.request(ctx, token, http.MethodGet, "/user/me", nil)
+	if err != nil {
+		return kookSessionFailure("connect_failed", err)
+	}
+	var self kookGatewayUser
+	if decodeErr := json.Unmarshal(selfData, &self); decodeErr != nil || self.ID == "" {
+		return kookSessionFailure("connect_failed", errors.New("kook: invalid self identity"))
+	}
+	headers := http.Header{"Authorization": []string{"Bot " + token}}
+	connection, response, err := runtime.dialer.DialContext(ctx, gatewayURL.String(), headers)
+	if response != nil && response.Body != nil {
+		_ = response.Body.Close()
+	}
+	if err != nil {
+		return kookSessionFailure("connect_failed", err)
+	}
+	defer connection.Close()
+	connection.SetReadLimit(adapterapi.MaxInboundTextBytes + 64*1024)
+	runtime.mu.Lock()
+	if !runtime.running {
+		runtime.mu.Unlock()
+		return context.Canceled
+	}
+	runtime.conn = connection
+	runtime.mu.Unlock()
+	defer func() {
+		runtime.mu.Lock()
+		if runtime.conn == connection {
+			runtime.conn = nil
+		}
+		runtime.mu.Unlock()
+	}()
+
+	_ = connection.SetReadDeadline(time.Now().Add(timing.helloTimeout))
+	messageType, helloBytes, err := connection.ReadMessage()
+	if err != nil {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return kookSessionFailure("hello_timeout", errors.New("kook: gateway did not send hello in time"))
+		}
+		return kookSessionFailure("remote_closed", err)
+	}
+	_ = connection.SetReadDeadline(time.Time{})
+	helloBytes, err = decodeKookFrame(messageType, helloBytes)
+	if err != nil {
+		return kookSessionFailure("hello_failed", err)
+	}
+	var hello kookGatewayPayload
+	if decodeErr := json.Unmarshal(helloBytes, &hello); decodeErr != nil || hello.Signal != 1 {
+		return kookSessionFailure("hello_failed", errors.New("kook: gateway did not send hello"))
+	}
+	var helloData struct {
+		Code int `json:"code"`
+	}
+	if decodeErr := json.Unmarshal(hello.Data, &helloData); decodeErr != nil || helloData.Code != 0 {
+		return kookSessionFailure("hello_failed", fmt.Errorf("kook: invalid gateway hello (code %d)", helloData.Code))
+	}
+	reads := make(chan kookReadResult, 1)
+	runtime.mu.Lock()
+	if !runtime.running {
+		runtime.mu.Unlock()
+		return context.Canceled
+	}
 	runtime.token, runtime.selfID = token, self.ID
 	runtime.wg.Add(1)
 	runtime.mu.Unlock()
-	go runtime.readLoop(runCtx, connection, reads)
-	if reportErr := core.ReportObservation(runCtx, adapterapi.LifecycleObservation{Kind: adapterapi.LifecycleObservationState, State: adapterapi.ObservedStateConnected, Code: "connected", Detail: "Kook connection established", OccurredAt: time.Now().UTC()}); reportErr != nil {
+	sessionCtx, cancelSession := context.WithCancel(ctx)
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		runtime.readLoop(sessionCtx, connection, reads)
+	}()
+	defer func() {
+		cancelSession()
+		_ = connection.Close()
+		<-readerDone
+	}()
+	// The first ping is due one interval after the hello, not after the
+	// observations below have been published.
+	heartbeat := time.NewTimer(timing.heartbeatInterval)
+	defer heartbeat.Stop()
+	if reportErr := core.ReportObservation(ctx, adapterapi.LifecycleObservation{Kind: adapterapi.LifecycleObservationState, State: adapterapi.ObservedStateConnected, Code: "connected", Detail: "Kook connection established", OccurredAt: time.Now().UTC()}); reportErr != nil {
 		return reportErr
 	}
+	onConnected()
 	providerID, err := adapterapi.NewPrincipalID(FormatDiceIDKook(self.ID))
 	if err != nil {
 		return err
 	}
-	if err := core.ReportObservation(runCtx, adapterapi.LifecycleObservation{Kind: adapterapi.LifecycleObservationIdentity, State: adapterapi.ObservedStateConnected, ProviderID: providerID, Code: "identity", OccurredAt: time.Now().UTC()}); err != nil {
+	if err := core.ReportObservation(ctx, adapterapi.LifecycleObservation{Kind: adapterapi.LifecycleObservationIdentity, State: adapterapi.ObservedStateConnected, ProviderID: providerID, Code: "identity", OccurredAt: time.Now().UTC()}); err != nil {
 		return err
 	}
-	heartbeat := time.NewTicker(30 * time.Second)
-	defer heartbeat.Stop()
+
+	// A ping goes out every heartbeat interval; the gateway must answer it
+	// with a pong (s=3) within the pong timeout, or the session is dead.
+	var pongTimer *time.Timer
+	var pongDeadline <-chan time.Time
+	defer func() {
+		if pongTimer != nil {
+			pongTimer.Stop()
+		}
+	}()
 	var sequence int64
 	for {
 		select {
-		case <-runCtx.Done():
-			return nil
+		case <-ctx.Done():
+			return ctx.Err()
 		case result := <-reads:
 			if result.err != nil {
-				if runCtx.Err() != nil {
-					return nil
-				}
-				return result.err
+				return kookSessionFailure("remote_closed", result.err)
 			}
 			payloadBytes, err := decodeKookFrame(result.messageType, result.data)
 			if err != nil {
-				return err
+				return kookSessionFailure("frame_invalid", err)
 			}
 			var payload kookGatewayPayload
 			if err := json.Unmarshal(payloadBytes, &payload); err != nil {
-				return err
-			}
-			if payload.Sequence > sequence {
-				sequence = payload.Sequence
+				return kookSessionFailure("frame_invalid", err)
 			}
 			switch payload.Signal {
 			case 0:
-				if err := runtime.handleEvent(runCtx, core, payload.Data); err != nil {
-					return err
+				// An sn at or below the processed maximum was handled already.
+				if payload.Sequence > 0 && payload.Sequence <= sequence {
+					continue
+				}
+				select {
+				case jobs <- payload.Data:
+				default:
+					kookRuntimeLogger().Warnf("Kook 消息队列已满，丢弃一条消息（sn=%d）", payload.Sequence)
+				}
+				if payload.Sequence > sequence {
+					sequence = payload.Sequence
+				}
+			case 3:
+				if pongTimer != nil {
+					pongTimer.Stop()
+					pongTimer, pongDeadline = nil, nil
 				}
 			case 5:
-				return errors.New("kook: gateway requested reconnect")
+				code, message := kookReconnectRequest(payload.Data)
+				detail := fmt.Sprintf("kook: gateway requested reconnect (code %d", code)
+				if reason := kookReconnectReason(code); reason != "" {
+					detail += ": " + reason
+				}
+				if message != "" {
+					detail += "; " + message
+				}
+				return &kookSessionError{code: "reconnect_requested", err: errors.New(detail + ")"), directed: true}
 			}
 		case <-heartbeat.C:
+			_ = connection.SetWriteDeadline(time.Now().Add(timing.pongTimeout))
 			if err := connection.WriteJSON(map[string]any{"s": 2, "sn": sequence}); err != nil {
-				return err
+				return kookSessionFailure("heartbeat_failed", err)
 			}
+			if pongTimer == nil {
+				pongTimer = time.NewTimer(timing.pongTimeout)
+				pongDeadline = pongTimer.C
+			}
+			heartbeat.Reset(timing.heartbeatInterval)
+		case <-pongDeadline:
+			return kookSessionFailure("heartbeat_timeout", errors.New("kook: gateway did not answer the heartbeat"))
 		}
 	}
 }
@@ -756,9 +1005,41 @@ func (runtime *kookRuntime) handleEvent(ctx context.Context, core adapterapi.Cor
 		return err
 	}
 	if receipt.Outcome == adapterapi.IngressRejected {
-		return errors.New("kook: ingress rejected")
+		return errKookIngressRejected
 	}
 	return nil
+}
+
+var errKookIngressRejected = errors.New("kook: ingress rejected")
+
+// inboundWorker hands queued gateway events to Core one at a time. A message
+// Core refuses is a fact about that message, not about the connection: it is
+// retried when Core reports a transient condition, then dropped and logged,
+// and never ends the session.
+func (runtime *kookRuntime) inboundWorker(ctx context.Context, core adapterapi.CorePort, jobs <-chan json.RawMessage, timing kookTiming) {
+	defer runtime.wg.Done()
+	log := kookRuntimeLogger()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case data := <-jobs:
+			err := runtime.handleEvent(ctx, core, data)
+			for attempt := 0; err != nil && isRetryableInboundError(err) && attempt < maxKookInboundRetries; attempt++ {
+				retry := time.NewTimer(timing.inboundRetryDelay)
+				select {
+				case <-ctx.Done():
+					retry.Stop()
+					return
+				case <-retry.C:
+				}
+				err = runtime.handleEvent(ctx, core, data)
+			}
+			if err != nil && ctx.Err() == nil {
+				log.Warnf("Kook 消息未能交给核心，已丢弃：%s", sanitizeOnebotProviderCause(err.Error()))
+			}
+		}
+	}
 }
 func normalizeKookInboundText(text string) string {
 	for {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"Scardice-core/adapterapi"
+	"Scardice-core/core/execution"
 	"Scardice-core/core/playerstate"
 	"Scardice-core/endpoint"
 	"Scardice-core/eventstore"
@@ -20,14 +21,13 @@ func TestCallbackStoryLogAppendSharesInboxCommitAndRollback(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
-			source := integrationKeySource{indexID: "callback-log-index", index: []byte("01234567890123456789012345678901"), rootID: "callback-log-root", root: []byte("abcdefghijklmnopqrstuvwxyz123456")}
-			db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "callback-log.db"), KeySource: source, DatabaseIdentity: "callback-log"})
+			db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(t.TempDir(), "callback-log.db"), DatabaseIdentity: "callback-log"})
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer db.Close()
 			store := eventstore.NewStore(db)
-			if err := store.SetReadiness(ctx, eventstore.Readiness{Mode: "import", SchemaVersion: 1, DatabaseIdentity: "callback-log", IndexRootID: source.indexID, EncryptionRootIDs: []string{source.rootID}, SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
+			if err := store.SetReadiness(ctx, eventstore.Readiness{Mode: "import", SchemaVersion: 2, DatabaseIdentity: "callback-log", CompletedAt: time.Unix(1, 0).UTC()}); err != nil {
 				t.Fatal(err)
 			}
 			if failLogInsert {
@@ -37,7 +37,7 @@ func TestCallbackStoryLogAppendSharesInboxCommitAndRollback(t *testing.T) {
 			}
 
 			now := time.Now().UTC()
-			inbound, err := NewInboundService(store, store, WithIngressClock(fixedIngressClock{now: now}))
+			inbound, err := NewInboundService(store, WithIngressClock(fixedIngressClock{now: now}))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -55,7 +55,7 @@ func TestCallbackStoryLogAppendSharesInboxCommitAndRollback(t *testing.T) {
 				t.Fatalf("duplicate ingress=%+v err=%v first=%+v", duplicate, err, first)
 			}
 
-			host := &callbackTestHost{fn: func(_ context.Context, request CallbackRequest, _ *playerstate.LocalOverlay, collector *MutationCollector) (CallbackResult, error) {
+			host := &callbackTestHost{fn: func(_ context.Context, request CallbackRequest, _ *playerstate.LocalOverlay, collector *execution.MutationCollector) (CallbackResult, error) {
 				if err := collector.AddStream(eventstore.StreamID{AggregateType: "callback-test", AggregateID: "message"}, 0, []eventstore.NewEvent{callbackEvent("callback.test", `{}`)}); err != nil {
 					return CallbackResult{}, err
 				}
@@ -68,8 +68,8 @@ func TestCallbackStoryLogAppendSharesInboxCommitAndRollback(t *testing.T) {
 				return CallbackResult{}, nil
 			}}
 			callback, err := NewCallbackService(CallbackConfig{
-				Inbox: store, Store: store, BoundCodec: store, Resolver: callbackTestResolver{},
-				Group: callbackTestGroupLoader{}, Player: callbackTestPlayerLoader{}, Host: host, WorkerID: "callback-log",
+				Inbox: store, Store: store, Resolver: callbackTestResolver{},
+				Host: host, WorkerID: "callback-log",
 			})
 			if err != nil {
 				t.Fatal(err)

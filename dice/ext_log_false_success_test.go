@@ -7,45 +7,36 @@ import (
 	"testing"
 
 	"Scardice-core/adapterapi"
-	"Scardice-core/logger"
 	"Scardice-core/model"
-	"Scardice-core/utils/constant"
 
 	"gopkg.in/gomail.v2"
 )
 
-func runLogExportWithMockFileResult(t *testing.T, groupID string, fileResult *adapterapi.EffectResult) (files []string, replies []string, fileDir string) {
+// runLogExport runs `.log export` inside a canonical durable root. A durable
+// root never hands an unpersisted file path to a platform adapter, so the
+// adapter must see no file-send dispatch.
+func runLogExport(t *testing.T, groupID string) (files []string, replies []string, fileDir string) {
 	t.Helper()
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 
 	fileDir = t.TempDir()
 	t.Setenv("TMPDIR", fileDir)
-	adapter.fileResult = fileResult
-	if err := d.DBOperator.GetLogDB(constant.WRITE).AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}); err != nil {
-		t.Fatalf("AutoMigrate log fixtures: %v", err)
-	}
-	if !LogAppend(&MsgContext{Dice: d}, groupID, 0, "local-story", &model.LogOneItem{
+	accepted := adapterapi.SucceededResult("synthetic-upload-id")
+	adapter.fileResult = &accepted
+	useCanonicalTestStoryLogRepository(t, d)
+	seedCanonicalTestStoryLog(t, d, groupID, "local-story", &model.LogOneItem{
 		Nickname: "Tester",
 		IMUserID: "QQ:tester",
 		Message:  "local log fixture",
-	}) {
-		t.Fatal("LogAppend failed for local fixture")
-	}
+	})
 
-	ctx := &MsgContext{
-		Dice:        d,
-		EndPoint:    ep,
-		Session:     d.ImSession,
-		MessageType: "group",
-		Group:       &GroupInfo{GroupID: groupID},
-		Player:      &GroupPlayerInfo{Name: "Tester"},
-	}
+	msg := newGroupMsg(groupID, "QQ:tester", ".log export local-story")
+	ctx := newCanonicalTestMessageContext(t, d, ep, msg, "log-export")
 	logExt, ok := d.ExtRegistry.Load("log")
 	if !ok || logExt.CmdMap["log"] == nil {
 		t.Fatal("registered .log command is unavailable")
 	}
-	msg := newGroupMsg(groupID, "QQ:tester", ".log export local-story")
 	result := logExt.CmdMap["log"].Solve(ctx, msg, &CmdArgs{Args: []string{"export", "local-story"}, RawArgs: "export local-story"})
 	if !result.Matched || !result.Solved {
 		t.Fatalf(".log export result = %#v, want matched and solved", result)
@@ -58,20 +49,18 @@ func runLogExportWithMockFileResult(t *testing.T, groupID string, fileResult *ad
 	return files, replies, fileDir
 }
 
-func TestLogExportReportsSuccessAfterAdapterAcceptance(t *testing.T) {
-	accepted := adapterapi.SucceededResult("synthetic-upload-id")
-	files, replies, fileDir := runLogExportWithMockFileResult(t, "QQ-Group:log-export-accepted", &accepted)
-	if len(files) != 1 || !strings.HasPrefix(files[0], "file://") {
-		t.Fatalf("legacy file-send dispatches = %v, want one synthetic file:// export", files)
+func TestLogExportDoesNotReportSuccessWhenDurableRootRefusesFileSend(t *testing.T) {
+	files, replies, fileDir := runLogExport(t, "QQ-Group:log-export-durable-refusal")
+	if len(files) != 0 {
+		t.Fatalf("file-send dispatches = %v, want none: a durable root must not send unpersisted file paths", files)
 	}
-
 	var reportedFailure, reportedSuccess bool
 	for _, reply := range replies {
-		reportedFailure = reportedFailure || strings.Contains(reply, "文件发送不可用") || strings.Contains(reply, "导出失败") || strings.Contains(reply, "未确认")
+		reportedFailure = reportedFailure || strings.Contains(reply, "文件发送不可用") || strings.Contains(reply, "导出失败")
 		reportedSuccess = reportedSuccess || strings.Contains(reply, "成功") || strings.Contains(reply, "已导出") || strings.Contains(reply, "已上传")
 	}
-	if reportedFailure || !reportedSuccess {
-		t.Fatalf(".log export replies = %q, want success only after adapter acceptance", replies)
+	if reportedSuccess || !reportedFailure {
+		t.Fatalf(".log export replies = %q, want an explicit failure and no success claim", replies)
 	}
 
 	entries, err := os.ReadDir(fileDir)
@@ -83,37 +72,6 @@ func TestLogExportReportsSuccessAfterAdapterAcceptance(t *testing.T) {
 	}
 }
 
-func TestLogExportDoesNotReportSuccessWithoutFileAcknowledgement(t *testing.T) {
-	files, replies, _ := runLogExportWithMockFileResult(t, "QQ-Group:log-export-no-ack", nil)
-	if len(files) != 1 {
-		t.Fatalf("legacy file-send dispatches = %v, want exactly one synthetic adapter call", files)
-	}
-	var reportedFailure, reportedSuccess bool
-	for _, reply := range replies {
-		reportedFailure = reportedFailure || strings.Contains(reply, "未确认") || strings.Contains(reply, "导出失败")
-		reportedSuccess = reportedSuccess || strings.Contains(reply, "成功") || strings.Contains(reply, "已导出") || strings.Contains(reply, "已上传")
-	}
-	if reportedSuccess || !reportedFailure {
-		t.Fatalf(".log export replies = %q, want no success claim and an explicit unconfirmed/failure result", replies)
-	}
-}
-
-func TestLogExportDoesNotReportSuccessWhenAdapterUnsupported(t *testing.T) {
-	unsupported := adapterapi.UnsupportedResult("mock_file_send_unsupported")
-	files, replies, _ := runLogExportWithMockFileResult(t, "QQ-Group:log-export-unsupported", &unsupported)
-	if len(files) != 1 {
-		t.Fatalf("legacy file-send dispatches = %v, want exactly one synthetic adapter call", files)
-	}
-	var reportedFailure, reportedSuccess bool
-	for _, reply := range replies {
-		reportedFailure = reportedFailure || strings.Contains(reply, "不支持") || strings.Contains(reply, "导出失败")
-		reportedSuccess = reportedSuccess || strings.Contains(reply, "成功") || strings.Contains(reply, "已导出") || strings.Contains(reply, "已上传")
-	}
-	if reportedSuccess || !reportedFailure {
-		t.Fatalf(".log export replies = %q, want no success claim and explicit unsupported result", replies)
-	}
-}
-
 func TestLogExportDoesNotReportEmailSuccessWhenDeliveryFails(t *testing.T) {
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
@@ -122,20 +80,14 @@ func TestLogExportDoesNotReportEmailSuccessWhenDeliveryFails(t *testing.T) {
 	t.Setenv("TMPDIR", fileDir)
 
 	groupID := "QQ-Group:log-export-mail-failure"
-	if err := d.DBOperator.GetLogDB(constant.WRITE).AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}); err != nil {
-		t.Fatalf("AutoMigrate log fixtures: %v", err)
-	}
-	if !LogAppend(&MsgContext{Dice: d}, groupID, 0, "local-story", &model.LogOneItem{
+	useCanonicalTestStoryLogRepository(t, d)
+	seedCanonicalTestStoryLog(t, d, groupID, "local-story", &model.LogOneItem{
 		Nickname: "Tester",
 		IMUserID: "QQ:tester",
 		Message:  "local log fixture",
-	}) {
-		t.Fatal("LogAppend failed for local fixture")
-	}
+	})
 
-	d.Config.MailFrom = "sender@example.com"
-	d.Config.MailPassword = "synthetic-password"
-	d.Config.MailSMTP = "smtp.invalid"
+	configureCanonicalTestMail(t, d, nil)
 	deliveryErr := errors.New("synthetic delivery failure")
 	mailCalls := 0
 	d.mailSend = func(_ *gomail.Dialer, _ *gomail.Message) error {
@@ -143,19 +95,12 @@ func TestLogExportDoesNotReportEmailSuccessWhenDeliveryFails(t *testing.T) {
 		return deliveryErr
 	}
 
-	ctx := &MsgContext{
-		Dice:        d,
-		EndPoint:    ep,
-		Session:     d.ImSession,
-		MessageType: "group",
-		Group:       &GroupInfo{GroupID: groupID},
-		Player:      &GroupPlayerInfo{Name: "Tester"},
-	}
+	msg := newGroupMsg(groupID, "QQ:tester", ".log export local-story recipient@example.com")
+	ctx := newCanonicalTestMessageContext(t, d, ep, msg, "log-export-mail")
 	logExt, ok := d.ExtRegistry.Load("log")
 	if !ok || logExt.CmdMap["log"] == nil {
 		t.Fatal("registered .log command is unavailable")
 	}
-	msg := newGroupMsg(groupID, "QQ:tester", ".log export local-story recipient@example.com")
 	result := logExt.CmdMap["log"].Solve(ctx, msg, &CmdArgs{
 		Args:    []string{"export", "local-story", "recipient@example.com"},
 		RawArgs: "export local-story recipient@example.com",
@@ -181,17 +126,10 @@ func TestLogExportDoesNotReportEmailSuccessWhenDeliveryFails(t *testing.T) {
 }
 
 func TestSendMailPropagatesDeliveryFailure(t *testing.T) {
-	d := &Dice{
-		Logger: logger.M(),
-		Config: Config{
-			BaseConfig: BaseConfig{NoticeIDs: []string{"Mail:recipient@example.com"}},
-			MailConfig: MailConfig{
-				MailFrom:     "sender@example.com",
-				MailPassword: "synthetic-password",
-				MailSMTP:     "smtp.invalid",
-			},
-		},
-	}
+	d, _ := newCanonicalTestDice(t)
+	configureCanonicalTestMail(t, d, func(config *Config) {
+		config.NoticeIDs = []string{"Mail:recipient@example.com"}
+	})
 	deliveryErr := errors.New("synthetic delivery failure")
 	d.mailSend = func(_ *gomail.Dialer, _ *gomail.Message) error {
 		return deliveryErr

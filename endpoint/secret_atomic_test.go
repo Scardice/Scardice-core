@@ -19,24 +19,16 @@ type secretAtomicStore struct {
 func (s *secretAtomicStore) Commit(_ context.Context, work eventstore.UnitOfWork) (eventstore.CommitResult, error) {
 	s.calls++
 	s.work = work
+	s.work.SecretUpdates = append([]eventstore.SecretUpdate(nil), work.SecretUpdates...)
+	for i := range s.work.SecretUpdates {
+		s.work.SecretUpdates[i].Value = append([]byte(nil), work.SecretUpdates[i].Value...)
+	}
 	return eventstore.CommitResult{}, s.err
 }
 func (*secretAtomicStore) Load(context.Context, eventstore.StreamID, uint64) ([]eventstore.Envelope, error) {
 	return nil, eventstore.ErrNotFound
 }
 func (*secretAtomicStore) Close() error { return nil }
-
-type secretAtomicCodec struct {
-	domain   string
-	identity string
-	owner    string
-	version  uint64
-}
-
-func (c *secretAtomicCodec) EncryptBound(_ context.Context, domain, identity, owner string, version uint64, _ []byte) ([]byte, []byte, string, error) {
-	c.domain, c.identity, c.owner, c.version = domain, identity, owner, version
-	return []byte("opaque-ciphertext"), make([]byte, 12), "key", nil
-}
 
 type strictSecretDescriptor struct{}
 
@@ -61,8 +53,7 @@ func (strictSecretDescriptor) NewRuntime(adapterapi.RuntimeInit) (adapterapi.Ada
 
 func TestEndpointCommandSecretInputSharesAtomicCommit(t *testing.T) {
 	store := &secretAtomicStore{err: errors.New("rollback")}
-	codec := &secretAtomicCodec{}
-	repository := NewRepository(store, codec)
+	repository := NewRepository(store)
 	configCanonical, err := adapterapi.CanonicalizeJSON([]byte(`{"mode":"server","listenAddress":"127.0.0.1:6700","reverseSuffix":"/ws","friendRequestPolicy":"accept","insecureSkipVerify":false,"token":{"secretRef":"token-ref","version":1}}`))
 	if err != nil {
 		t.Fatal(err)
@@ -87,14 +78,11 @@ func TestEndpointCommandSecretInputSharesAtomicCommit(t *testing.T) {
 	if len(store.work.Streams) != 1 || len(store.work.SecretUpdates) != 1 {
 		t.Fatalf("atomic UoW = streams=%d secrets=%d", len(store.work.Streams), len(store.work.SecretUpdates))
 	}
-	if string(store.work.SecretUpdates[0].Ciphertext) == "token-bytes" || string(store.work.SecretUpdates[0].Ciphertext) == "" {
-		t.Fatalf("secret plaintext reached UoW ciphertext field: %#v", store.work.SecretUpdates[0].Ciphertext)
+	if string(store.work.SecretUpdates[0].Value) != "token-bytes" {
+		t.Fatalf("secret value in UoW = %q, want the raw value", store.work.SecretUpdates[0].Value)
 	}
 	if string(store.work.Streams[0].Events[0].Payload) == "" || string(store.work.Streams[0].Events[0].Payload) == "token-bytes" {
 		t.Fatalf("event payload missing or leaked secret: %s", store.work.Streams[0].Events[0].Payload)
-	}
-	if codec.domain != "adapter-secret/v1" || codec.identity != "token-ref" || codec.owner != "endpoint-secret/pureonebot" || codec.version != 1 {
-		t.Fatalf("secret AAD = %q/%q/%q/%d", codec.domain, codec.identity, codec.owner, codec.version)
 	}
 	for index, value := range command.SecretInput.Plaintext {
 		if value != 0 {
@@ -110,7 +98,7 @@ func TestEndpointServiceRejectsSecretReferenceAliasMismatch(t *testing.T) {
 	}
 	store := &secretAtomicStore{}
 	service := &Service{
-		Repository: NewRepository(store, &secretAtomicCodec{}),
+		Repository: NewRepository(store),
 		Store:      store,
 		Registry:   serviceRegistry{descriptor.Key(): descriptor},
 	}

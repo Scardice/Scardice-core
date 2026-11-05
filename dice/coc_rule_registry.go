@@ -53,8 +53,7 @@ func (d *Dice) CocExtraRulesAdd(rule *CocRuleInfo) bool {
 			return false
 		}
 		if realm := jsExecutionContextFor(rule.jsLoop); realm != nil {
-			registered.jsRealm = *realm
-			registered.jsRealm.Message = nil
+			registered.jsRealm = jsExecutionContext{Dice: realm.Dice, Plugin: realm.Plugin, Script: realm.Script}
 		}
 	}
 	d.cocRulesMu.Lock()
@@ -100,15 +99,26 @@ func (rule CocRuleInfo) check(ctx *MsgContext, d100, value int64, difficulty int
 	if !rule.jsBound {
 		return rule.Check(ctx, d100, value, difficulty)
 	}
-	realm := rule.jsRealm
-	realm.Message = ctx
+	// The registration realm only identifies the owning script; each check gets
+	// its own message-bound invocation registry.
+	realm := &jsExecutionContext{
+		Dice: rule.jsRealm.Dice, Plugin: rule.jsRealm.Plugin, Script: rule.jsRealm.Script,
+		Message: ctx, Transaction: ctx.callbackTransaction,
+	}
+	if ctx.Dice != nil {
+		realm.Dice = ctx.Dice
+	}
+	if script := jsContextScript(realm); script != nil {
+		realm.binding = script.currentPersistentBinding()
+	}
 	ctx.messageJSExecution()
+	realm.invocationRegistry()
 	var result CocRuleCheckRet
 	manager := ctx.Dice.ExtLoopManager
 	err := errJSCallbackStaleGeneration
 	if manager != nil {
 		err = manager.dispatchJSCallback(jsCallbackRequest{
-			Generation: rule.jsGeneration, Realm: &realm, Kind: jsCallbackCommand,
+			Generation: rule.jsGeneration, Realm: realm, Kind: jsCallbackCommand,
 			Callback: func() { result = rule.Check(ctx, d100, value, difficulty) },
 		}, false)
 	}

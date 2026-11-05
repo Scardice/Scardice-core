@@ -111,7 +111,7 @@ func TestJSUploadStillAsksForReloadWhenJSIsOff(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(testDice.BaseConfig.DataDir, "scripts"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	testDice.Config.JsEnable = false
+	updateAPITestConfig(t, testDice, func(config *dice.Config) { config.JsEnable = false })
 
 	response := uploadJSPlugin(t, token, "later.js", uploadTestPlugin("UploadLater", "__laterRuns"))
 	if response.Incremental || !response.NeedReload {

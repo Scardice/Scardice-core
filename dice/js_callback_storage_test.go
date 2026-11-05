@@ -7,7 +7,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"Scardice-core/core/messageflow"
+	"Scardice-core/core/execution"
 	"Scardice-core/eventstore"
 	"Scardice-core/utils/jsengine"
 	gojaengine "Scardice-core/utils/jsengine/goja"
@@ -20,31 +20,35 @@ func TestJSPublicStorageJoinsCallbackTransaction(t *testing.T) {
 			name = "commit"
 		}
 		t.Run(name, func(t *testing.T) {
-			store, _ := repairTestStore(t)
+			d, store := newCanonicalTestDice(t)
 			loop := gojaengine.WrapEventLoop(startFsTestLoop(t))
 			manager := NewJsLoopManager()
 			generation := manager.SetLoop(loop)
-			d := &Dice{DurableStore: store, ExtLoopManager: manager, Logger: zap.NewNop().Sugar()}
-			session := &IMSession{Parent: d}
-			d.ImSession = session
+			d.ExtLoopManager = manager
+			d.Logger = zap.NewNop().Sugar()
+			session := d.ImSession
 			ext := &ExtInfo{Name: "writer", IsJsExt: true, dice: d, JSLoopVersion: generation}
 			other := &ExtInfo{Name: "other-plugin", IsJsExt: true, dice: d, JSLoopVersion: generation}
 			if err := loop.Run(func(runtime jsengine.Runtime) error {
 				vm, _ := gojaengine.Raw(runtime)
 				vm.SetFieldNameMapper(gojaengine.FieldNameMapper())
-				if err := runtime.Bind("extension", ext); err != nil {
+				if err := runtime.Bind("extension", newJSExtensionResource(ext, loop)); err != nil {
 					return err
 				}
-				return runtime.Bind("other", other)
+				return runtime.Bind("other", newJSExtensionResource(other, loop))
 			}); err != nil {
 				t.Fatal(err)
 			}
-			collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-			tx, err := NewDurableCallbackTransaction(store, collector)
+			metadata := eventstore.Metadata{CommandID: name, CorrelationID: name}
+			collector := execution.NewMutationCollector(eventstore.EventFactory{})
+			tx, err := NewDurableCallbackTransaction(context.Background(), store, collector, metadata)
 			if err != nil {
 				t.Fatal(err)
 			}
-			ctx := &MsgContext{Dice: d, Session: session, callbackTransaction: tx}
+			ctx := &MsgContext{
+				Dice: d, Session: session, callbackTransaction: tx, callbackMetadata: metadata,
+				executionContext: tx.executionContext,
+			}
 			item := &CmdItemInfo{Name: "write", JSLoopVersion: generation, SolveEngine: func(runtime jsengine.Runtime, _ *MsgContext, _ *Message, _ *CmdArgs) (jsengine.Value, error) {
 				return runtime.RunString("storage.js", `extension.storageSet("key", "staged"); other.storageSet("key", "separate"); if (extension.storageGet("key") !== "staged" || other.storageGet("key") !== "separate" || extension.storageList()[0] !== "key") throw Error("read-your-writes lost"); ({matched:true, solved:true})`)
 			}}

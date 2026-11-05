@@ -21,7 +21,6 @@ import (
 
 type eventStoreBackupSnapshotter interface {
 	SnapshotSQLite(ctx context.Context, destination string) error
-	BackupKeyFiles(ctx context.Context) ([]eventstore.BackupKeyFile, bool, error)
 }
 
 type eventStoreBackupEntry struct {
@@ -66,21 +65,11 @@ func (dm *DiceManager) backupEventStore(sel BackupSelection, fromAuto bool, prog
 	}
 
 	progress.update(BackupJobStageCollecting, 0, 0)
-	keyFiles, externalKeySource, err := snapshotter.BackupKeyFiles(ctx)
-	if err != nil {
-		return "", fmt.Errorf("collect EventStore backup key files: %w", err)
-	}
 	entries, config, err := eventStoreBackupFiles(dm.Dice, sel)
 	if err != nil {
 		return "", err
 	}
 	entries = append(entries, eventStoreBackupEntry{name: "data/endpoint/events.db", source: snapshotPath, mode: 0o600})
-	for _, keyFile := range keyFiles {
-		if keyFile.Name == "" || len(keyFile.Data) == 0 {
-			return "", errors.New("eventstore: incomplete configured key file for backup")
-		}
-		entries = append(entries, eventStoreBackupEntry{name: keyFile.Name, data: keyFile.Data, mode: 0o600})
-	}
 
 	bakFn := "bak_" + time.Now().Format("060102_150405")
 	if fromAuto {
@@ -117,10 +106,6 @@ func (dm *DiceManager) backupEventStore(sel BackupSelection, fromAuto bool, prog
 		completedFiles++
 		progress.update(BackupJobStageArchiving, completedFiles, totalFiles)
 	}
-	keyBoundary := "bundled-local-key-files"
-	if externalKeySource {
-		keyBoundary = "external-configured-key-source"
-	}
 	metadata, err := json.Marshal(map[string]any{
 		"config":      config,
 		"version":     VERSION.String(),
@@ -128,7 +113,6 @@ func (dm *DiceManager) backupEventStore(sel BackupSelection, fromAuto bool, prog
 		"eventStore": map[string]any{
 			"database":                "data/endpoint/events.db",
 			"snapshot":                "sqlite-vacuum-into",
-			"keyMaterial":             keyBoundary,
 			"storyLogArchiveIncluded": true,
 		},
 	})

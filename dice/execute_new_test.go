@@ -19,19 +19,20 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/dop251/goja"
-	"github.com/panjf2000/ants/v2"
 	"github.com/robfig/cron/v3"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"gorm.io/gorm"
 
 	"Scardice-core/adapterapi"
+	"Scardice-core/core/groupstate"
 	sealdiceLogger "Scardice-core/logger"
 	"Scardice-core/message"
 	"Scardice-core/utils/constant"
@@ -143,11 +144,9 @@ func mockFileSendResult(result *adapterapi.EffectResult) adapterapi.EffectResult
 // ---------------------------------------------------------------------------
 // mockDatabaseOperator
 // ---------------------------------------------------------------------------
-
-// mockDatabaseOperator wraps a single SQLite file that has no pre-existing
-// tables.  All service calls that try to read player / attr data will receive
-// "table not found" errors and gracefully fall back to creating in-memory
-// objects, which is all a smoke test needs.
+// mockDatabaseOperator supplies the legacy log/censor SQL boundary used by
+// command consumers. Canonical group, player, config, and attribute fixtures
+// use the separate durable EventStore created by newCanonicalTestDice.
 type mockDatabaseOperator struct {
 	db *gorm.DB
 }
@@ -177,12 +176,11 @@ func (m *mockDatabaseOperator) Close() {
 // ---------------------------------------------------------------------------
 
 // newExecuteNewTestDice constructs a Dice with enough infrastructure for
-// ExecuteNew to run end-to-end: commands are registered, text templates are
-// loaded, the ban list is initialised, and the AttrsManager goroutine is
-// started.
+// ExecuteNew to run end-to-end. Durable group, player, config, and attribute
+// state use the real SQLite EventStore and synchronous projections.
 //
-// The returned cleanup function must be deferred by every caller to stop the
-// AttrsManager background goroutine and close the database.
+// Cleanup is registered automatically. The returned function is retained for
+// existing callers and is idempotent.
 func newExecuteNewTestDice(t *testing.T) (*Dice, *EndPointInfo, *mockPlatformAdapter, func()) {
 	t.Helper()
 
@@ -193,6 +191,8 @@ func newExecuteNewTestDice(t *testing.T) (*Dice, *EndPointInfo, *mockPlatformAda
 		}
 	}
 
+	d, _ := newCanonicalTestDice(t)
+	d.BaseConfig.DataDir = tmpDir
 	mockDB, err := newMockDatabaseOperator(filepath.Join(tmpDir, "test.db"))
 	if err != nil {
 		t.Fatalf("newMockDatabaseOperator: %v", err)
@@ -201,43 +201,23 @@ func newExecuteNewTestDice(t *testing.T) (*Dice, *EndPointInfo, *mockPlatformAda
 	// Minimal DiceManager – Cron is created but NOT started to avoid background
 	// goroutines that would trigger goleak.
 	dm := &DiceManager{Cron: cron.New()}
-
-	d := &Dice{
-		BaseConfig: BaseConfig{
-			DataDir: tmpDir,
-			Name:    "test",
-		},
-		Logger:        sealdiceLogger.M(),
-		LogWriter:     sealdiceLogger.NewUIWriter(),
-		DBOperator:    mockDB,
-		CmdMap:        CmdMapCls{},
-		ExtRegistry:   new(SyncMap[string, *ExtInfo]),
-		GameSystemMap: new(SyncMap[string, *GameSystemTemplate]),
-		DirtyGroups:   new(SyncMap[string, int64]),
-		// Cron is not started to keep the goroutine count predictable.
-		Cron:   cron.New(),
-		Parent: dm,
-	}
+	d.Logger = sealdiceLogger.M()
+	d.LogWriter = sealdiceLogger.NewUIWriter()
+	d.DBOperator = mockDB
+	d.Cron = cron.New()
+	d.Parent = dm
 	dm.Dice = []*Dice{d}
-
-	// Config – use defaults so CommandCompatibleMode, BanList, rate-limit
-	// settings, and other fields are properly initialised.
-	d.Config = NewConfig(d)
-	// Disable the per-message QQ sleep so tests are fast.
-	d.Config.MessageDelayRangeEnd = 0
-
-	// Command prefix used by CommandParseNew.
-	d.CommandPrefix = DefaultConfig.CommandPrefix
-
-	// IMSession
-	d.ImSession = &IMSession{}
 	d.ImSession.Parent = d
-	d.ImSession.ServiceAtNew = new(SyncMap[string, *GroupInfo])
-	d.ImSession.PendingQuits = new(SyncMap[string, *PendingQuitInfo])
 
-	// AttrsManager – starts one background goroutine; stopped in cleanup.
-	d.AttrsManager = &AttrsManager{}
-	d.AttrsManager.Init(d)
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		// Disable the per-message QQ sleep so tests are fast. Command prefixes
+		// remain in the source-versioned config view.
+		config.BaseConfig.Name = d.BaseConfig.Name
+		config.DataDir = tmpDir
+		config.MessageDelayRangeStart = 0
+		config.MessageDelayRangeEnd = 0
+		config.CommandPrefix = append([]string(nil), DefaultConfig.CommandPrefix...)
+	})
 
 	// ConfigManager
 	d.ConfigManager = NewConfigManager(filepath.Join(tmpDir, "configs", "plugin-configs.json"))
@@ -270,22 +250,16 @@ func newExecuteNewTestDice(t *testing.T) (*Dice, *EndPointInfo, *mockPlatformAda
 	}
 	ep.Session = d.ImSession
 
+	var cleanupOnce sync.Once
 	cleanup := func() {
-		// Stop package-owned workers first.
-		d.AttrsManager.Stop()
-
-		if d.Parent != nil && d.Parent.Help != nil {
-			d.Parent.Help.Close()
-		}
-
-		// Release ants default pool (stops purge/ticktock goroutines).
-		ants.Release()
-
-		mockDB.Close()
-
-		// Give async workers a short window to observe cancellation and exit.
-		time.Sleep(2 * time.Second)
+		cleanupOnce.Do(func() {
+			if d.Parent != nil && d.Parent.Help != nil {
+				d.Parent.Help.Close()
+			}
+			mockDB.Close()
+		})
 	}
+	t.Cleanup(cleanup)
 	return d, ep, adapter, cleanup
 }
 
@@ -336,6 +310,40 @@ func registerAutoActivePreprocessExt(d *Dice, name string, fn func(ctx *MsgConte
 	d.ApplyExtDefaultSettings()
 }
 
+func activateCanonicalTestGroupExtensions(t *testing.T, d *Dice, endpoint *EndPointInfo, groupID, label string, extensions ...*ExtInfo) {
+	t.Helper()
+	for _, extension := range extensions {
+		d.RegisterExtension(extension)
+	}
+	message := newGroupMsg(groupID, "QQ:fixture-owner", "")
+	withCanonicalTestMessageContext(t, d, endpoint, message, label, func(ctx *MsgContext) error {
+		for _, extension := range extensions {
+			if err := ctx.Group.SetExtension(extension.Name, true); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func awaitCanonicalGroupProjection(t *testing.T, d *Dice, groupID string, ready func(groupstate.State) bool) groupstate.State {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var (
+		state groupstate.State
+		err   error
+	)
+	for time.Now().Before(deadline) {
+		state, err = groupstate.ReadProjected(context.Background(), d.DurableStore, d.BaseConfig.Name, groupID)
+		if err == nil && (ready == nil || ready(state)) {
+			return state
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("canonical group %q did not reach expected projection: state=%#v err=%v", groupID, state, err)
+	return groupstate.State{}
+}
+
 // ---------------------------------------------------------------------------
 // Smoke Tests
 // ---------------------------------------------------------------------------
@@ -346,7 +354,7 @@ func TestExecuteNew_GroupCommand_Roll(t *testing.T) {
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 
-	d.ImSession.ExecuteNew(ep, newGroupMsg("QQ-Group:111", "QQ:999", ".r 1d6"))
+	executeNewAndWaitForCanonicalCommit(t, d, ep, newGroupMsg("QQ-Group:111", "QQ:999", ".r 1d6"))
 
 	_, ok := adapter.waitForMsg(2 * time.Second)
 	if !ok {
@@ -358,7 +366,7 @@ func TestExecuteNew_GroupCommand_RollShapeStatus(t *testing.T) {
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 
-	d.ImSession.ExecuteNew(ep, newGroupMsg("QQ-Group:112", "QQ:999", ".rollshape"))
+	executeNewAndWaitForCanonicalCommit(t, d, ep, newGroupMsg("QQ-Group:112", "QQ:999", ".rollshape"))
 
 	reply, ok := adapter.waitForMsg(2 * time.Second)
 	if !ok {
@@ -373,7 +381,7 @@ func TestExecuteNew_PrivateCommand_RollShapeSet(t *testing.T) {
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 
-	d.ImSession.ExecuteNew(ep, newPrivateMsg("QQ:999", ".rollshape set soft"))
+	executeNewAndWaitForCanonicalCommit(t, d, ep, newPrivateMsg("QQ:999", ".rollshape set soft"))
 
 	reply, ok := adapter.waitForMsg(2 * time.Second)
 	if !ok {
@@ -382,9 +390,11 @@ func TestExecuteNew_PrivateCommand_RollShapeSet(t *testing.T) {
 	if !strings.Contains(reply, "Soft / Beta(1.35,1.35)") {
 		t.Fatalf("rollshape reply = %q, want Soft mode", reply)
 	}
-	group, ok := d.ImSession.ServiceAtNew.Load("PG-QQ:999")
-	if !ok || group.RollShaperMode != string(DiceRollShaperModeSoft) {
-		t.Fatalf("private rollshape mode = %#v, want soft", group)
+	state := awaitCanonicalGroupProjection(t, d, "PG-QQ:999", func(state groupstate.State) bool {
+		return state.RollShaperMode == string(DiceRollShaperModeSoft)
+	})
+	if state.RollShaperMode != string(DiceRollShaperModeSoft) {
+		t.Fatalf("private rollshape state = %#v, want soft", state)
 	}
 }
 
@@ -394,7 +404,7 @@ func TestExecuteNew_GroupCommand_Roll_NoArgs(t *testing.T) {
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 
-	d.ImSession.ExecuteNew(ep, newGroupMsg("QQ-Group:111", "QQ:999", ".r"))
+	executeNewAndWaitForCanonicalCommit(t, d, ep, newGroupMsg("QQ-Group:111", "QQ:999", ".r"))
 
 	_, ok := adapter.waitForMsg(2 * time.Second)
 	if !ok {
@@ -408,7 +418,7 @@ func TestExecuteNew_PrivateCommand_Roll(t *testing.T) {
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 
-	d.ImSession.ExecuteNew(ep, newPrivateMsg("QQ:999", ".r 1d6"))
+	executeNewAndWaitForCanonicalCommit(t, d, ep, newPrivateMsg("QQ:999", ".r 1d6"))
 
 	_, ok := adapter.waitForMsg(2 * time.Second)
 	if !ok {
@@ -439,7 +449,7 @@ func TestExecuteNew_CustomHelpSections(t *testing.T) {
 			}
 			d.TextMapRaw["核心"][test.key] = TextTemplateItemList{{test.custom, 1}}
 			d.GenerateTextMap()
-			d.ImSession.ExecuteNew(ep, newPrivateMsg("QQ:999", ".help "+test.arg))
+			executeNewAndWaitForCanonicalCommit(t, d, ep, newPrivateMsg("QQ:999", ".help "+test.arg))
 
 			reply, ok := adapter.waitForMsg(2 * time.Second)
 			if !ok {
@@ -461,7 +471,7 @@ func TestExecuteNew_GroupMessage_NonCommand(t *testing.T) {
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 
-	d.ImSession.ExecuteNew(ep, newGroupMsg("QQ-Group:111", "QQ:999", "just chatting"))
+	executeNewAndWaitForCanonicalCommit(t, d, ep, newGroupMsg("QQ-Group:111", "QQ:999", "just chatting"))
 
 	select {
 	case unexpected := <-adapter.msgCh:
@@ -471,27 +481,26 @@ func TestExecuteNew_GroupMessage_NonCommand(t *testing.T) {
 	}
 }
 
-// TestExecuteNew_GroupInfo_Created verifies that ExecuteNew automatically
-// creates and stores a GroupInfo entry for a previously-unseen group.
-func TestExecuteNew_GroupInfo_Created(t *testing.T) {
-	d, ep, _, cleanup := newExecuteNewTestDice(t)
+// TestExecuteNew_GroupStateCreated verifies that ExecuteNew creates the
+// canonical aggregate for a previously unseen group.
+func TestExecuteNew_GroupStateCreated(t *testing.T) {
+	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 
 	const groupID = "QQ-Group:654321"
-	d.ImSession.ExecuteNew(ep, newGroupMsg(groupID, "QQ:111", ".r"))
-
-	// Give the async goroutine time to complete.
-	time.Sleep(200 * time.Millisecond)
-
-	groupInfo, ok := d.ImSession.ServiceAtNew.Load(groupID)
-	if !ok {
-		t.Fatal("GroupInfo was not created for the new group")
+	executeNewAndWaitForCanonicalCommit(t, d, ep, newGroupMsg(groupID, "QQ:111", ".r"))
+	if _, ok := adapter.waitForMsg(2 * time.Second); !ok {
+		t.Fatal("timeout waiting for group command")
 	}
-	if groupInfo.GroupID != groupID {
-		t.Errorf("GroupID = %q, want %q", groupInfo.GroupID, groupID)
+
+	state := awaitCanonicalGroupProjection(t, d, groupID, func(state groupstate.State) bool {
+		return state.GroupID == groupID && state.Active
+	})
+	if state.GroupID != groupID {
+		t.Errorf("GroupID = %q, want %q", state.GroupID, groupID)
 	}
-	if !groupInfo.Active {
-		t.Error("new GroupInfo should have Active=true")
+	if !state.Active {
+		t.Error("new canonical group should be active")
 	}
 }
 
@@ -507,14 +516,6 @@ func TestOnMessageDeletedWritesUILog(t *testing.T) {
 	core := zapcore.NewCore(zapcore.NewJSONEncoder(encoderConfig), zapcore.AddSync(d.LogWriter), zapcore.InfoLevel)
 	d.Logger = zap.New(core).Named(sealdiceLogger.LogKeyMain).Sugar()
 
-	ctx := &MsgContext{
-		Dice:     d,
-		EndPoint: ep,
-		Session:  d.ImSession,
-	}
-	group := SetBotOnAtGroup(ctx, "QQ-Group:10001")
-	group.GroupName = "TestGroup"
-
 	msg := &Message{
 		Platform:    "QQ",
 		MessageType: "group",
@@ -527,6 +528,10 @@ func TestOnMessageDeletedWritesUILog(t *testing.T) {
 		},
 		Message: "这是一条被撤回的消息",
 		RawID:   "raw-delete-1",
+	}
+	ctx := newCanonicalTestMessageContext(t, d, ep, msg, "message-deleted")
+	if err := ctx.Group.SetGroupName(msg.GroupName); err != nil {
+		t.Fatal(err)
 	}
 
 	d.ImSession.OnMessageDeleted(ctx, msg)
@@ -569,12 +574,30 @@ func TestExecuteNew_Segment_TextReconstructed(t *testing.T) {
 		},
 	}
 
-	d.ImSession.ExecuteNew(ep, msg)
+	executeNewAndWaitForCanonicalCommit(t, d, ep, msg)
 
 	_, ok := adapter.waitForMsg(2 * time.Second)
 	if !ok {
 		t.Fatal("timeout: command in text segment was not processed")
 	}
+}
+
+// observeCommandMessages records, per delivery, the message the command hook of
+// every activated extension sees. ExecuteNew preprocesses a private copy of the
+// caller's message, and this hook runs after that rewrite.
+func observeCommandMessages(d *Dice, name string) <-chan Message {
+	received := make(chan Message, 4)
+	d.RegisterExtension(&ExtInfo{
+		Name:       name,
+		AutoActive: true,
+		OnCommandReceived: func(_ *MsgContext, msg *Message, _ *CmdArgs) {
+			snapshot := *msg
+			snapshot.Segment = slices.Clone(msg.Segment)
+			received <- snapshot
+		},
+	})
+	d.ApplyExtDefaultSettings()
+	return received
 }
 
 func TestExecuteNew_MessagePreprocess_RewritesBeforeCommandParse(t *testing.T) {
@@ -588,16 +611,22 @@ func TestExecuteNew_MessagePreprocess_RewritesBeforeCommandParse(t *testing.T) {
 		}
 		return vm.ToValue(map[string]interface{}{"message": ".r 1d6"})
 	})
+	received := observeCommandMessages(d, "preprocess-rewrite-observer")
 
 	msg := newGroupMsg("QQ-Group:rewrite", "QQ:999", "roll-alias")
-	d.ImSession.ExecuteNew(ep, msg)
+	executeNewAndWaitForCanonicalCommit(t, d, ep, msg)
 
 	_, ok := adapter.waitForMsg(2 * time.Second)
 	if !ok {
 		t.Fatal("timeout: expected rewritten command to produce a reply")
 	}
-	if msg.Message != ".r 1d6" {
-		t.Fatalf("message was not rewritten, got %q", msg.Message)
+	select {
+	case got := <-received:
+		if got.Message != ".r 1d6" {
+			t.Fatalf("message was not rewritten, got %q", got.Message)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("command hook did not observe the preprocessed message")
 	}
 }
 
@@ -612,19 +641,25 @@ func TestExecuteNew_MessagePreprocess_RebuildsSegmentFromCQCode(t *testing.T) {
 		}
 		return vm.ToValue(map[string]interface{}{"message": "[CQ:at,qq=100000] .r 1d6"})
 	})
+	received := observeCommandMessages(d, "preprocess-cq-observer")
 
 	msg := newGroupMsg("QQ-Group:cq", "QQ:999", "mention-roll")
-	d.ImSession.ExecuteNew(ep, msg)
+	executeNewAndWaitForCanonicalCommit(t, d, ep, msg)
 
 	_, ok := adapter.waitForMsg(2 * time.Second)
 	if !ok {
 		t.Fatal("timeout: expected rewritten CQ-at command to produce a reply")
 	}
-	if len(msg.Segment) < 2 {
-		t.Fatalf("expected rewritten message to rebuild segments, got %d segment(s)", len(msg.Segment))
-	}
-	if _, ok := msg.Segment[0].(*message.AtElement); !ok {
-		t.Fatalf("first segment = %T, want *message.AtElement", msg.Segment[0])
+	select {
+	case got := <-received:
+		if len(got.Segment) < 2 {
+			t.Fatalf("expected rewritten message to rebuild segments, got %d segment(s)", len(got.Segment))
+		}
+		if _, ok := got.Segment[0].(*message.AtElement); !ok {
+			t.Fatalf("first segment = %T, want *message.AtElement", got.Segment[0])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("command hook did not observe the preprocessed message")
 	}
 }
 
@@ -637,7 +672,7 @@ func TestExecuteNew_MessagePreprocess_EmptyMessageIntercepts(t *testing.T) {
 		return vm.ToValue(map[string]interface{}{"message": ""})
 	})
 
-	d.ImSession.ExecuteNew(ep, newGroupMsg("QQ-Group:intercept-empty", "QQ:999", ".r 1d6"))
+	executeNewAndWaitForCanonicalCommit(t, d, ep, newGroupMsg("QQ-Group:intercept-empty", "QQ:999", ".r 1d6"))
 
 	select {
 	case got := <-adapter.msgCh:
@@ -662,7 +697,7 @@ func TestExecuteNew_InvalidMessageType(t *testing.T) {
 		Segment:     []message.IMessageElement{&message.TextElement{Content: ".r"}},
 	}
 
-	d.ImSession.ExecuteNew(ep, msg)
+	executeNewAndWaitForCanonicalCommit(t, d, ep, msg)
 
 	select {
 	case got := <-adapter.msgCh:
@@ -672,9 +707,8 @@ func TestExecuteNew_InvalidMessageType(t *testing.T) {
 	}
 }
 
-// TestExecuteNew_MultipleGroups verifies that two independent groups each get
-// their own GroupInfo and that commands in one group do not bleed into the
-// other.
+// TestExecuteNew_MultipleGroups verifies that two independent canonical
+// aggregates are created and commands do not bleed between them.
 func TestExecuteNew_MultipleGroups(t *testing.T) {
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
@@ -684,10 +718,10 @@ func TestExecuteNew_MultipleGroups(t *testing.T) {
 		groupB = "QQ-Group:BBBB"
 	)
 
-	d.ImSession.ExecuteNew(ep, newGroupMsg(groupA, "QQ:001", ".r"))
+	executeNewAndWaitForCanonicalCommit(t, d, ep, newGroupMsg(groupA, "QQ:001", ".r"))
 	_, okA := adapter.waitForMsg(2 * time.Second)
 
-	d.ImSession.ExecuteNew(ep, newGroupMsg(groupB, "QQ:002", ".r"))
+	executeNewAndWaitForCanonicalCommit(t, d, ep, newGroupMsg(groupB, "QQ:002", ".r"))
 	_, okB := adapter.waitForMsg(2 * time.Second)
 
 	if !okA {
@@ -697,13 +731,17 @@ func TestExecuteNew_MultipleGroups(t *testing.T) {
 		t.Error("group B: timeout waiting for reply")
 	}
 
-	_, existsA := d.ImSession.ServiceAtNew.Load(groupA)
-	_, existsB := d.ImSession.ServiceAtNew.Load(groupB)
-	if !existsA {
-		t.Error("GroupInfo not created for group A")
+	stateA := awaitCanonicalGroupProjection(t, d, groupA, func(state groupstate.State) bool {
+		return state.Active && state.GroupID == groupA
+	})
+	stateB := awaitCanonicalGroupProjection(t, d, groupB, func(state groupstate.State) bool {
+		return state.Active && state.GroupID == groupB
+	})
+	if !stateA.Active || stateA.GroupID != groupA {
+		t.Errorf("group A state = %#v", stateA)
 	}
-	if !existsB {
-		t.Error("GroupInfo not created for group B")
+	if !stateB.Active || stateB.GroupID != groupB {
+		t.Errorf("group B state = %#v", stateB)
 	}
 }
 func TestExecuteWrappersShareCommandReplyAndUnsupportedOutcome(t *testing.T) {
@@ -712,7 +750,7 @@ func TestExecuteWrappersShareCommandReplyAndUnsupportedOutcome(t *testing.T) {
 		defer cleanup()
 		msg := newPrivateMsg("QQ:999", ".help 骰点")
 		if useNew {
-			d.ImSession.ExecuteNew(ep, msg)
+			executeNewAndWaitForCanonicalCommit(t, d, ep, msg)
 		} else {
 			d.ImSession.Execute(ep, msg, true)
 		}
@@ -732,7 +770,7 @@ func TestExecuteWrappersShareCommandReplyAndUnsupportedOutcome(t *testing.T) {
 		d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 		msg := newPrivateMsg("QQ:999", ".unsupported-command")
 		if useNew {
-			d.ImSession.ExecuteNew(ep, msg)
+			executeNewAndWaitForCanonicalCommit(t, d, ep, msg)
 		} else {
 			d.ImSession.Execute(ep, msg, true)
 		}
@@ -754,7 +792,7 @@ func TestExecuteNewPreservesSegmentMentionCommand(t *testing.T) {
 		&message.AtElement{Target: "100000"},
 		&message.TextElement{Content: ".help 骰点"},
 	}
-	d.ImSession.ExecuteNew(ep, msg)
+	executeNewAndWaitForCanonicalCommit(t, d, ep, msg)
 	if _, ok := adapter.waitForMsg(2 * time.Second); !ok {
 		t.Fatal("segment-aware mention command did not produce a reply")
 	}
@@ -764,13 +802,12 @@ func TestExecuteRunInSyncControlsNonCommandHookScheduling(t *testing.T) {
 	d, ep, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 	groupID := "QQ-Group:sync-hook"
-	setupCtx := &MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession}
-	group := SetBotOnAtGroup(setupCtx, groupID)
 	hookCalls := make(chan struct{}, 2)
-	group.SetActivatedExtList([]*ExtInfo{{
+	extension := &ExtInfo{
 		Name:                 "execute-sync-hook-test",
 		OnNotCommandReceived: func(_ *MsgContext, _ *Message) { hookCalls <- struct{}{} },
-	}}, nil)
+	}
+	activateCanonicalTestGroupExtensions(t, d, ep, groupID, "seed-sync-hook", extension)
 
 	d.ImSession.Execute(ep, newGroupMsg(groupID, "QQ:999", "plain text"), true)
 	select {
@@ -779,33 +816,37 @@ func TestExecuteRunInSyncControlsNonCommandHookScheduling(t *testing.T) {
 		t.Fatal("Execute(..., true) returned before non-command hook ran")
 	}
 
-	d.ImSession.Execute(ep, newGroupMsg(groupID, "QQ:998", "plain text"), false)
+	asyncMessage := newGroupMsg(groupID, "QQ:998", "plain text")
+	asyncIdentity := canonicalTestMessageExecutionIdentity(t, d, ep, asyncMessage, messageParserLegacy)
+	d.ImSession.Execute(ep, asyncMessage, false)
 	select {
 	case <-hookCalls:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Execute(..., false) did not schedule non-command hook")
 	}
+	awaitCanonicalTestExecutionCommit(t, d, asyncIdentity)
 }
 
 func TestExecuteMessageReleasesExecutionStateAfterSynchronousHooks(t *testing.T) {
 	d, ep, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 	groupID := "QQ-Group:sync-release"
-	setupCtx := &MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession}
-	group := SetBotOnAtGroup(setupCtx, groupID)
-	group.SetActivatedExtList([]*ExtInfo{{
+	extension := &ExtInfo{
 		Name: "execute-sync-release-test",
 		OnNotCommandReceived: func(ctx *MsgContext, _ *Message) {
 			ctx.CreateVmIfNotExists()
 			ctx.CommandInfo = make([]byte, 1024)
 			ctx.DeckPools = map[*DeckInfo]map[string]*ShuffleRandomPool{}
 		},
-	}}, nil)
-
-	result := d.ImSession.executeMessage(ep, newGroupMsg(groupID, "QQ:999", "plain text"), messageExecutionOptions{
+	}
+	activateCanonicalTestGroupExtensions(t, d, ep, groupID, "seed-sync-release", extension)
+	result := executeCanonicalTestMessage(context.Background(), d, ep, newGroupMsg(groupID, "QQ:999", "plain text"), messageExecutionOptions{
 		parser:    messageParserLegacy,
 		runInSync: true,
 	})
+	if result.err != nil {
+		t.Fatalf("synchronous execution failed: %v", result.err)
+	}
 	if result.context == nil || !result.context.executionReleased.Load() {
 		t.Fatal("synchronous execution returned before releasing transient state")
 	}
@@ -818,36 +859,35 @@ func TestExecuteMessageReleasesExecutionStateAfterLastAsynchronousHook(t *testin
 	d, ep, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 	groupID := "QQ-Group:async-release"
-	setupCtx := &MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession}
-	group := SetBotOnAtGroup(setupCtx, groupID)
 	started := make(chan int, 2)
 	finished := make(chan int, 2)
 	releaseFirst := make(chan struct{})
 	releaseSecond := make(chan struct{})
-	group.SetActivatedExtList([]*ExtInfo{
-		{
-			Name: "execute-async-release-first",
-			OnNotCommandReceived: func(ctx *MsgContext, _ *Message) {
-				ctx.CreateVmIfNotExists()
-				ctx.CommandInfo = make([]byte, 1024)
-				started <- 1
-				<-releaseFirst
-				finished <- 1
-			},
+	first := &ExtInfo{
+		Name: "execute-async-release-first",
+		OnNotCommandReceived: func(ctx *MsgContext, _ *Message) {
+			ctx.CreateVmIfNotExists()
+			ctx.CommandInfo = make([]byte, 1024)
+			started <- 1
+			<-releaseFirst
+			finished <- 1
 		},
-		{
-			Name: "execute-async-release-second",
-			OnNotCommandReceived: func(_ *MsgContext, _ *Message) {
-				started <- 2
-				<-releaseSecond
-				finished <- 2
-			},
+	}
+	second := &ExtInfo{
+		Name: "execute-async-release-second",
+		OnNotCommandReceived: func(_ *MsgContext, _ *Message) {
+			started <- 2
+			<-releaseSecond
+			finished <- 2
 		},
-	}, nil)
+	}
+	activateCanonicalTestGroupExtensions(t, d, ep, groupID, "seed-async-release", first, second)
+	root := newCanonicalTestRoot(t, d, "async-release-execution")
 
 	result := d.ImSession.executeMessage(ep, newGroupMsg(groupID, "QQ:999", "plain text"), messageExecutionOptions{
-		parser:    messageParserLegacy,
-		runInSync: false,
+		parser:              messageParserLegacy,
+		runInSync:           false,
+		callbackTransaction: root.Transaction,
 	})
 	for range 2 {
 		select {
@@ -919,16 +959,15 @@ func TestExecuteSetsTempVarsBeforeNonCommandHook(t *testing.T) {
 	d, ep, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 	groupID := "QQ-Group:temp-vars-hook"
-	setupCtx := &MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession}
-	group := SetBotOnAtGroup(setupCtx, groupID)
 	seen := make(chan string, 1)
-	group.SetActivatedExtList([]*ExtInfo{{
+	extension := &ExtInfo{
 		Name: "execute-temp-vars-test",
 		OnNotCommandReceived: func(ctx *MsgContext, _ *Message) {
 			value, _ := VarGetValueStr(ctx, "$tQQ昵称")
 			seen <- value
 		},
-	}}, nil)
+	}
+	activateCanonicalTestGroupExtensions(t, d, ep, groupID, "seed-temp-vars", extension)
 
 	d.ImSession.Execute(ep, newGroupMsg(groupID, "QQ:999", "plain text"), true)
 	select {

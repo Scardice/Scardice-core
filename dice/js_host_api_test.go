@@ -2,6 +2,9 @@ package dice
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +13,7 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 
+	"Scardice-core/core/execution"
 	"Scardice-core/core/extensionstate"
 	"Scardice-core/eventstore"
 	"Scardice-core/utils/jsengine"
@@ -31,7 +35,7 @@ func TestInstallJSHostAPI(t *testing.T) {
 
 			if err := loop.Run(func(runtime jsengine.Runtime) error {
 				d := &Dice{}
-				if err := d.installJSHostAPI(runtime); err != nil {
+				if err := d.installJSHostAPI(runtime, loop); err != nil {
 					return err
 				}
 				value, err := runtime.RunString("host-api.js", `
@@ -102,7 +106,7 @@ func TestJSExtensionReplacementWarnsWithBothSources(t *testing.T) {
 
 	first := &JsScriptInfo{Name: "first", Filename: "first.js"}
 	if err := jsengine.RunWithContext(loop, &jsExecutionContext{Script: first}, func(runtime jsengine.Runtime) error {
-		if err := dice.installJSHostAPI(runtime); err != nil {
+		if err := dice.installJSHostAPI(runtime, loop); err != nil {
 			return err
 		}
 		if err := dice.installJSExtHostAPI(runtime, loop, runtime.Get("seal").Object(), 1, nil); err != nil {
@@ -149,13 +153,11 @@ func TestJSExtensionRegistrationAdoptsImportedIdentityBeforeConfig(t *testing.T)
 	}
 	defer db.Close()
 	store := eventstore.NewStore(db,
-		eventstore.WithKeySource(compatKeySource{}),
 		eventstore.WithProjection(extensionstate.ExtensionProjection()),
 	)
 	if err = store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "js-host-db", IndexRootID: "index-v1",
-		EncryptionRootIDs: []string{"root-v1"}, SourceManifestDigest: make([]byte, 32),
-		TargetManifestDigest: make([]byte, 32), CompletedAt: time.Unix(1, 0).UTC(),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "js-host-db",
+		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -176,29 +178,133 @@ func TestJSExtensionRegistrationAdoptsImportedIdentityBeforeConfig(t *testing.T)
 	}
 	d.ConfigManager.SetOwner(d)
 	loop := gojaengine.New()
+	manager := NewJsLoopManager()
+	d.ExtLoopManager = manager
+	generation := manager.AddLoop(loop)
 	defer loop.Close()
-	script := &JsScriptInfo{Name: "imported", Filename: "imported.js"}
-	if err = jsengine.RunWithContext(loop, &jsExecutionContext{Script: script}, func(runtime jsengine.Runtime) error {
-		if hostErr := d.installJSHostAPI(runtime); hostErr != nil {
-			return hostErr
-		}
-		if hostErr := d.installJSExtHostAPI(runtime, loop, runtime.Get("seal").Object(), 1, nil); hostErr != nil {
-			return hostErr
-		}
-		_, runErr := runtime.RunString("imported.js", `
-			const imported = seal.ext.new("imported-ext", "test", "1.0.0");
-			seal.ext.register(imported);
-			seal.ext.registerStringConfig(imported, "mode", "fast", "mode", "general");
-		`)
-		return runErr
-	}); err != nil {
+	script := &JsScriptInfo{Name: "imported", Filename: "imported.js", runtimeGeneration: generation}
+	collector := execution.NewMutationCollector(eventstore.EventFactory{})
+	transaction, err := NewDurableCallbackTransaction(ctx, store, collector, eventstore.Metadata{CommandID: "imported-load"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	realm := jsContextForRoot(transaction.executionContext, d, nil, script, transaction, true)
+	err = runJSExecutionRoot(realm, func() error {
+		defer realm.activatePersistentScheduler()
+		return jsengine.RunWithContext(loop, realm, func(runtime jsengine.Runtime) error {
+			if hostErr := d.installJSHostAPI(runtime, loop); hostErr != nil {
+				return hostErr
+			}
+			if hostErr := d.installJSExtHostAPI(runtime, loop, runtime.Get("seal").Object(), generation, nil); hostErr != nil {
+				return hostErr
+			}
+			_, runErr := runtime.RunString("imported.js", `
+				const imported = seal.ext.new("imported-ext", "test", "1.0.0");
+				seal.ext.register(imported);
+				seal.ext.registerStringConfig(imported, "mode", "fast", "mode", "general");
+			`)
+			return runErr
+		})
+	})
+	if err != nil {
+		realm.completePersistentBinding(err)
 		t.Fatalf("register imported extension and config: %v", err)
 	}
+	if err = transaction.Finalize(ctx); err != nil {
+		t.Fatal(err)
+	}
+	work, err := collector.UnitOfWork()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Commit(ctx, work); err != nil {
+		t.Fatal(err)
+	}
+	notifyDomainCommit(transaction)
+	script.replacePersistentBinding(realm.binding)
+	realm.completePersistentBinding(nil)
 	state, err := d.DurableExtensionState(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if state.Extensions["imported-ext"].Version != "1.0.0" || state.ConfigDefinitions["imported-ext"]["mode"].Key != "mode" {
 		t.Fatalf("durable imported extension state = %#v", state)
+	}
+}
+
+func TestJSBanRemoveInheritsAmbientDomainTransaction(t *testing.T) {
+	_, store := openBanListEventStore(t, filepath.Join(t.TempDir(), "js-ban-remove-ambient.db"), true)
+	d, list := newBanListEventStoreTestDice(t, "", store)
+	const subjectID = "QQ:js-ban-ambient"
+	if err := list.SetRankByID(d, subjectID, BanRankBanned, "member", "admin", "seed"); err != nil {
+		t.Fatal(err)
+	}
+	loop := gojaengine.New()
+	defer loop.Close()
+
+	err := d.WithDomainExecution(context.Background(), "test-js-ban-remove-ambient", []byte(subjectID), func(transaction *DurableCallbackTransaction) error {
+		execution := &jsExecutionContext{Dice: d, Transaction: transaction}
+		return jsengine.RunWithContext(loop, execution, func(runtime jsengine.Runtime) error {
+			if hostErr := d.installJSHostAPI(runtime, loop); hostErr != nil {
+				return hostErr
+			}
+			if _, runErr := runtime.RunString("ban-remove.js", `seal.ban.remove(null, "`+subjectID+`")`); runErr != nil {
+				return runErr
+			}
+			if _, exists := list.GetByID(subjectID); !exists {
+				return errors.New("JS ban removal committed independently of the ambient DomainTx")
+			}
+			items, snapshotErr := list.SnapshotForContext(jsHostMessageContext(d, loop))
+			if snapshotErr != nil {
+				return snapshotErr
+			}
+			if len(items) != 0 {
+				return fmt.Errorf("ambient snapshot after JS removal = %#v", items)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item, exists := list.GetByID(subjectID); exists {
+		t.Fatalf("committed JS ban removal remains readable: %#v", item)
+	}
+}
+
+func TestJSBanRemoveWithoutAmbientRootPropagatesCommitError(t *testing.T) {
+	_, baseStore := openBanListEventStore(t, filepath.Join(t.TempDir(), "js-ban-remove-root.db"), true)
+	store := &failingModerationStore{GORMStore: baseStore}
+	d, list := newBanListEventStoreTestDice(t, "", store)
+	const subjectID = "QQ:js-ban-root"
+	if err := list.SetRankByID(d, subjectID, BanRankBanned, "member", "admin", "seed"); err != nil {
+		t.Fatal(err)
+	}
+	loop := gojaengine.New()
+	defer loop.Close()
+	run := func() error {
+		return loop.Run(func(runtime jsengine.Runtime) error {
+			if hostErr := d.installJSHostAPI(runtime, loop); hostErr != nil {
+				return hostErr
+			}
+			_, runErr := runtime.RunString("ban-remove-root.js", `seal.ban.remove(null, "`+subjectID+`")`)
+			return runErr
+		})
+	}
+
+	store.fail = true
+	if err := run(); err == nil || !strings.Contains(err.Error(), "injected moderation commit failure") {
+		t.Fatalf("JS ban removal commit failure = %v, want propagated error", err)
+	}
+	if _, exists := list.GetByID(subjectID); !exists {
+		t.Fatal("failed JS ban removal changed committed state")
+	}
+
+	store.fail = false
+	if err := run(); err != nil {
+		t.Fatalf("JS ban removal in an independent root: %v", err)
+	}
+	if item, exists := list.GetByID(subjectID); exists {
+		t.Fatalf("independent-root JS ban removal remains readable: %#v", item)
 	}
 }

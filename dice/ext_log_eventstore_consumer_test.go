@@ -23,39 +23,27 @@ func TestEventStoreBackedLogNewThenList(t *testing.T) {
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 	ctx := context.Background()
-	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
-		Type: "sqlite", DSN: filepath.Join(t.TempDir(), "events.db"),
-		KeySource: groupCardSQLiteKeySource{}, DatabaseIdentity: "log-consumer-test",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(groupCardSQLiteKeySource{}))
-	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "log-consumer-test",
-		IndexRootID: "card-index-v1", EncryptionRootIDs: []string{"card-root-v1"},
-		SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32),
-		CompletedAt: time.Unix(1, 0).UTC(),
-	}); err != nil {
-		t.Fatal(err)
+	store, ok := d.DurableStore.(*eventstore.GORMStore)
+	if !ok {
+		t.Fatal("canonical fixture store is unavailable")
 	}
 	const groupID = "UI-Group:9001"
-	groupCtx, _ := newQuitCommandTestContext(t, d, ep, "QQ:9001", groupID, "EventSourceGroup")
-	groupCtx.Group.SetLogState(0, "", false)
 	d.DBOperator = nil
 	d.LogRepository = service.NewEventStoreLogRepository(store, d.BaseConfig.Name)
 
-	d.ImSession.ExecuteNew(ep, newGroupMsg(groupID, "QQ:9001", ".log new eventstore-session"))
+	executeNewAndWaitForCanonicalCommit(t, d, ep, newGroupMsg(groupID, "QQ:9001", ".log new eventstore-session"))
 	if _, ok := adapter.waitForMsg(2 * time.Second); !ok {
 		t.Fatal("timeout waiting for '.log new' reply")
 	}
-	state := groupCtx.Group.GetLogState()
+	state, err := ReadCommittedGroupLogState(ctx, d, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !state.On || state.Name != "eventstore-session" || state.ID == 0 {
 		t.Fatalf(".log new did not create and activate its EventStore session: %#v", state)
 	}
 
-	d.ImSession.ExecuteNew(ep, newGroupMsg(groupID, "QQ:9001", ".log list"))
+	executeNewAndWaitForCanonicalCommit(t, d, ep, newGroupMsg(groupID, "QQ:9001", ".log list"))
 	reply, ok := adapter.waitForMsg(2 * time.Second)
 	if !ok {
 		t.Fatal("timeout waiting for '.log list' reply")
@@ -68,27 +56,13 @@ func TestEventStoreBackedLogNewThenList(t *testing.T) {
 func TestEventStoreStoryLogStatsRejectsMissingSession(t *testing.T) {
 	d, _, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
-	ctx := context.Background()
-	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
-		Type: "sqlite", DSN: filepath.Join(t.TempDir(), "events.db"),
-		KeySource: groupCardSQLiteKeySource{}, DatabaseIdentity: "log-stats-test",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(groupCardSQLiteKeySource{}))
-	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "log-stats-test",
-		IndexRootID: "card-index-v1", EncryptionRootIDs: []string{"card-root-v1"},
-		SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32),
-		CompletedAt: time.Unix(1, 0).UTC(),
-	}); err != nil {
-		t.Fatal(err)
+	store, ok := d.DurableStore.(*eventstore.GORMStore)
+	if !ok {
+		t.Fatal("canonical fixture store is unavailable")
 	}
 	d.DBOperator = nil
 	d.LogRepository = service.NewEventStoreLogRepository(store, d.BaseConfig.Name)
-	_, err = d.LogRepository.StoryLogStats("UI-Group:missing", "absent")
+	_, err := d.LogRepository.StoryLogStats("UI-Group:missing", "absent")
 	if !errors.Is(err, service.ErrLogNotFound) {
 		t.Fatalf("StoryLogStats(missing) error=%v, want not found", err)
 	}
@@ -98,30 +72,15 @@ func TestEventStoreLogOnDoesNotCreateMissingSession(t *testing.T) {
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
 	ctx := context.Background()
-	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
-		Type: "sqlite", DSN: filepath.Join(t.TempDir(), "events.db"),
-		KeySource: groupCardSQLiteKeySource{}, DatabaseIdentity: "log-on-missing-test",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	store := eventstore.NewStore(db, eventstore.WithKeySource(groupCardSQLiteKeySource{}))
-	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "log-on-missing-test",
-		IndexRootID: "card-index-v1", EncryptionRootIDs: []string{"card-root-v1"},
-		SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32),
-		CompletedAt: time.Unix(1, 0).UTC(),
-	}); err != nil {
-		t.Fatal(err)
+	store, ok := d.DurableStore.(*eventstore.GORMStore)
+	if !ok {
+		t.Fatal("canonical fixture store is unavailable")
 	}
 	const groupID = "UI-Group:missing-session"
-	groupCtx, _ := newQuitCommandTestContext(t, d, ep, "QQ:9001", groupID, "MissingSession")
-	groupCtx.Group.SetLogState(0, "", false)
 	d.DBOperator = nil
 	d.LogRepository = service.NewEventStoreLogRepository(store, d.BaseConfig.Name)
 
-	d.ImSession.ExecuteNew(ep, newGroupMsg(groupID, "QQ:9001", ".log on absent-session"))
+	executeNewAndWaitForCanonicalCommit(t, d, ep, newGroupMsg(groupID, "QQ:9001", ".log on absent-session"))
 	if _, ok := adapter.waitForMsg(2 * time.Second); !ok {
 		t.Fatal("timeout waiting for '.log on' reply")
 	}
@@ -140,7 +99,7 @@ func TestEventStoreLogOnDoesNotCreateMissingSession(t *testing.T) {
 	if _, err := store.CreateStoryLog(ctx, d.BaseConfig.Name, groupID, "empty-session"); err != nil {
 		t.Fatal(err)
 	}
-	d.ImSession.ExecuteNew(ep, newGroupMsg(groupID, "QQ:9001", ".log on empty-session"))
+	executeNewAndWaitForCanonicalCommit(t, d, ep, newGroupMsg(groupID, "QQ:9001", ".log on empty-session"))
 	if _, ok := adapter.waitForMsg(2 * time.Second); !ok {
 		t.Fatal("timeout waiting for existing empty-session '.log on' reply")
 	}
@@ -161,17 +120,15 @@ func newEventStoreLogUploadRepository(t *testing.T) (*Dice, *eventstore.Database
 	ctx := context.Background()
 	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
 		Type: "sqlite", DSN: filepath.Join(t.TempDir(), "story-upload.db"),
-		KeySource: groupCardSQLiteKeySource{}, DatabaseIdentity: "story-upload-test",
+		DatabaseIdentity: "story-upload-test",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	store := eventstore.NewStore(db, eventstore.WithKeySource(groupCardSQLiteKeySource{}))
+	store := eventstore.NewStore(db)
 	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "story-upload-test",
-		IndexRootID: "card-index-v1", EncryptionRootIDs: []string{"card-root-v1"},
-		SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32),
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: "story-upload-test",
 		CompletedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatal(err)
@@ -445,7 +402,7 @@ func TestEventStoreStoryLogUploadReportsMetadataCommitFailure(t *testing.T) {
 	d, db, store, repository := newEventStoreLogUploadRepository(t)
 	const groupID, name = "QQ-Group:upload-failure", "upload-failure-session"
 	seedEventStoreUploadLog(t, store, d.BaseConfig.Name, groupID, name)
-	if err := db.GORM().Exec(`CREATE TRIGGER block_story_log_upload BEFORE UPDATE OF payload ON story_log_sessions BEGIN SELECT RAISE(ABORT, 'test upload metadata failure'); END`).Error; err != nil {
+	if err := db.GORM().Exec(`CREATE TRIGGER block_story_log_upload BEFORE UPDATE ON story_log_sessions BEGIN SELECT RAISE(ABORT, 'test upload metadata failure'); END`).Error; err != nil {
 		t.Fatal(err)
 	}
 	var requests atomic.Int64

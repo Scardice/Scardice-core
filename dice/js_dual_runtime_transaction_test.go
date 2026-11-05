@@ -10,19 +10,28 @@ import (
 
 	"go.uber.org/zap"
 
-	"Scardice-core/core/messageflow"
+	"Scardice-core/core/execution"
 	"Scardice-core/eventstore"
 	"Scardice-core/utils/jsengine"
 	gojaengine "Scardice-core/utils/jsengine/goja"
 	"Scardice-core/utils/jsengine/native"
 )
 
-func callbackQuickJSLoop(t *testing.T) jsengine.Loop {
+func requireNativeQuickJSRoot(t *testing.T) string {
 	t.Helper()
 	root := os.Getenv("SCARDICE_QUICKJS_PACKAGE")
 	if root == "" {
-		t.Skip("SCARDICE_QUICKJS_PACKAGE is not configured")
+		root = os.Getenv("SCARDICE_RUNTIME_ROOT")
 	}
+	if root == "" {
+		t.Skip("native QuickJS package is not configured")
+	}
+	return root
+}
+
+func callbackQuickJSLoop(t *testing.T) jsengine.Loop {
+	t.Helper()
+	root := requireNativeQuickJSRoot(t)
 	candidates, err := native.Discover(root)
 	if err != nil {
 		t.Fatal(err)
@@ -49,12 +58,13 @@ func TestNativeExpiredMessageTimerCannotSendOrPersist(t *testing.T) {
 func TestConcurrentGojaQuickJSCallbacksKeepTransactionsIsolated(t *testing.T) {
 	nativeLoop := callbackQuickJSLoop(t)
 	gojaLoop := gojaengine.WrapEventLoop(startFsTestLoop(t))
-	store, _ := repairTestStore(t)
+	d, store := newCanonicalTestDice(t)
 	manager := NewJsLoopManager()
-	d := &Dice{DurableStore: store, ExtLoopManager: manager, Logger: zap.NewNop().Sugar()}
+	d.ExtLoopManager = manager
+	d.Logger = zap.NewNop().Sugar()
 	loops := []jsengine.Loop{gojaLoop, nativeLoop}
 	messages := make([]*MsgContext, 2)
-	collectors := make([]*messageflow.MutationCollector, 2)
+	collectors := make([]*execution.MutationCollector, 2)
 	arrived := make(chan string, 2)
 	release := make(chan struct{})
 	returned := make(chan error, 2)
@@ -63,17 +73,21 @@ func TestConcurrentGojaQuickJSCallbacksKeepTransactionsIsolated(t *testing.T) {
 	for i, loop := range loops {
 		generation := manager.AddLoop(loop)
 		ext := &ExtInfo{Name: string(loop.Engine()), dice: d, IsJsExt: true, JSLoopVersion: generation}
-		collectors[i] = messageflow.NewMutationCollector(eventstore.EventFactory{})
-		tx, err := NewDurableCallbackTransaction(store, collectors[i])
+		metadata := eventstore.Metadata{CommandID: ext.Name, CorrelationID: ext.Name}
+		collectors[i] = execution.NewMutationCollector(eventstore.EventFactory{})
+		tx, err := NewDurableCallbackTransaction(context.Background(), store, collectors[i], metadata)
 		if err != nil {
 			t.Fatal(err)
 		}
-		messages[i] = &MsgContext{Dice: d, callbackTransaction: tx}
+		messages[i] = &MsgContext{
+			Dice: d, callbackTransaction: tx, callbackMetadata: metadata,
+			executionContext: tx.executionContext,
+		}
 		if err := loop.Run(func(rt jsengine.Runtime) error {
 			if vm, ok := gojaengine.Raw(rt); ok {
 				vm.SetFieldNameMapper(gojaengine.FieldNameMapper())
 			}
-			if err := rt.Bind("extension", ext); err != nil {
+			if err := rt.Bind("extension", newJSExtensionResource(ext, loop)); err != nil {
 				return err
 			}
 			return rt.Bind("barrier", func() { arrived <- ext.Name; <-release })

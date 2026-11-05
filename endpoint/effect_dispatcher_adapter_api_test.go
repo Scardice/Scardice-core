@@ -26,7 +26,7 @@ func (e *adapterAPIRetryableExecutor) ExecutePinned(_ context.Context, _ adapter
 func TestAdapterAPIRetryableProviderResultSettlesAmbiguousWithoutRequeue(t *testing.T) {
 	raw := "{\n\"action\":\"vendor.non_idempotent_action\",\"params\":{\"value\":900719925474099312345}\n}"
 	target := adapterapi.EffectTarget{Kind: adapterapi.TargetRaw, Raw: "adapter-api"}
-	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, []byte("adapter-api-root"), 1)
+	lane, err := adapterapi.NewLaneMetadata("endpoint-1", target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,18 +43,11 @@ func TestAdapterAPIRetryableProviderResultSettlesAmbiguousWithoutRequeue(t *test
 		t.Fatal(err)
 	}
 	store := &dispatcherTestStore{
-		claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{
-			EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1",
-			PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), PayloadEncryptionKeyID: "key",
-			DeadlineAt: effect.Deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch,
-		}},
-		marked: eventstore.OutboxLease{Effect: eventstore.NewEffect{
-			EffectID: "effect-1", EndpointID: "endpoint-1", PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"),
-			PayloadEncryptionKeyID: "key", RiskClass: eventstore.RiskNonIdempotentAfterDispatch,
-		}},
+		claimed: eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", Version: 1, EndpointID: "endpoint-1", Lane: lane.Key, LeaseOwner: "worker", LeaseEpoch: 1, AttemptID: "attempt-1", Payload: plain, DeadlineAt: effect.Deadline, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}},
+		marked:  eventstore.OutboxLease{Effect: eventstore.NewEffect{EffectID: "effect-1", EndpointID: "endpoint-1", Payload: plain, RiskClass: eventstore.RiskNonIdempotentAfterDispatch}},
 	}
 	executor := &adapterAPIRetryableExecutor{}
-	dispatcher, err := NewEffectDispatcher(store, dispatcherTestDecrypt{plain: plain}, executor, "worker", WithDispatcherIDGenerator(&dispatcherTestIDs{}), WithDispatcherRandom(func(time.Duration) time.Duration { return 0 }))
+	dispatcher, err := NewEffectDispatcher(store, executor, "worker", WithDispatcherIDGenerator(&dispatcherTestIDs{}), WithDispatcherRandom(func(time.Duration) time.Duration { return 0 }))
 	if err != nil {
 		t.Fatal(err)
 	}

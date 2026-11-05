@@ -22,8 +22,6 @@ func NewRepositoryWithFactory(store eventstore.Store, factory eventstore.EventFa
 	return &Repository{Store: store, Factory: factory}
 }
 
-type GroupRepository = Repository
-
 func (r *Repository) Load(ctx context.Context, diceID, groupID string) (State, error) {
 	if r == nil || r.Store == nil {
 		return State{}, ErrRepositoryUnavailable
@@ -156,11 +154,7 @@ func (r *Repository) DecideAndAppend(ctx context.Context, state State, expectedV
 		return eventstore.CommitResult{}, err
 	}
 	diceID, groupID := state.DiceID, state.GroupID
-	kind := command.Kind
-	if kind == "" {
-		kind = command.Type
-	}
-	if kind == CommandCreate {
+	if command.Kind == CommandCreate {
 		diceID, groupID = command.DiceID, command.GroupID
 	}
 	if ValidateIdentity(diceID, groupID) != nil {

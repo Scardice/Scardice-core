@@ -80,7 +80,6 @@ func TestRuntimeBindMutatesLiveStringMap(t *testing.T) {
 }
 
 func TestRuntimeLoadsCachedCommonJSModule(t *testing.T) {
-
 	loop := gojaengine.New()
 	defer loop.Close()
 	var got interface{}
@@ -114,7 +113,6 @@ func TestRuntimeLoadsCachedCommonJSModule(t *testing.T) {
 }
 
 func TestRuntimeResolvesRelativeCommonJSModules(t *testing.T) {
-
 	loop := gojaengine.New()
 	defer loop.Close()
 	var got interface{}
@@ -275,7 +273,6 @@ func TestRuntimeBindAssignsJavaScriptFunctionToGoCallback(t *testing.T) {
 }
 
 func TestRuntimeBuildsObjectsFromGoFunctions(t *testing.T) {
-
 	loop := gojaengine.New()
 	defer loop.Close()
 	var got interface{}
@@ -309,7 +306,6 @@ func TestRuntimeBuildsObjectsFromGoFunctions(t *testing.T) {
 }
 
 func TestRuntimeReadsObjectValuesInsideOwnerLoop(t *testing.T) {
-
 	loop := gojaengine.New()
 	defer loop.Close()
 	err := loop.Run(func(runtime jsengine.Runtime) error {

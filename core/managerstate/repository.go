@@ -37,7 +37,7 @@ func (repository *Repository) Load(ctx context.Context) (State, Auth, error) {
 	if err != nil {
 		return State{}, Auth{}, err
 	}
-	auth, err := DecodeAuth(secret.Plaintext)
+	auth, err := DecodeAuth(secret.Value)
 	if err != nil {
 		return State{}, Auth{}, err
 	}
@@ -64,7 +64,7 @@ type PreparedSave struct {
 	Secret eventstore.SecretUpdate
 }
 
-// PrepareSave creates a manager snapshot append and its encrypted auth update
+// PrepareSave creates a manager snapshot append and its auth value update
 // without publishing either. It is intended for composition into a larger
 // atomic UnitOfWork.
 func (repository *Repository) PrepareSave(ctx context.Context, state State, public PublicConfig, auth Auth) (PreparedSave, error) {
@@ -91,7 +91,7 @@ func (repository *Repository) PrepareSave(ctx context.Context, state State, publ
 	}
 	secret, err := repository.store.PrepareSecretUpdate(ctx, eventstore.SecretPutRequest{
 		SecretRef: AuthSecretRef, EndpointID: AggregateID, AdapterID: AggregateType,
-		SecretVersion: nextVersion, ExpectedVersion: state.Version, Plaintext: plaintext,
+		SecretVersion: nextVersion, ExpectedVersion: state.Version, Value: plaintext,
 	})
 	if err != nil {
 		return PreparedSave{}, err

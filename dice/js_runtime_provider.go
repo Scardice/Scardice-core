@@ -96,11 +96,8 @@ func (p *diceGojaProvider) Open(ctx context.Context, _ jsengine.RuntimeOptions) 
 		CurrentContext: func() any {
 			return jsengine.CurrentContext(engineLoop)
 		},
-		ScheduleOnLoop: func(context any, run func(*goja.Runtime) error) error {
-			if err := jsCompatibilitySchedulingAllowed(context); err != nil {
-				return err
-			}
-			return jsengine.ScheduleWithContext(engineLoop, jsCompletionContext(context), func(runtime jsengine.Runtime) error {
+		ScheduleOnLoop: func(owner any, run func(*goja.Runtime) error) error {
+			return scheduleJSCompletion(engineLoop, owner, func(runtime jsengine.Runtime) error {
 				vm, ok := gojaengine.Raw(runtime)
 				if !ok {
 					return errors.New("goja runtime adapter unavailable")

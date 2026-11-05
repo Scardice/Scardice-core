@@ -90,8 +90,8 @@ type CommandRequest struct {
 	RequestID   string
 }
 
-func NewService(store eventstore.Store, registry DescriptorRegistry, codecs ...BoundPayloadCodec) *Service {
-	s := &Service{Repository: NewRepository(store, codecs...), Store: store, Registry: registry}
+func NewService(store eventstore.Store, registry DescriptorRegistry) *Service {
+	s := &Service{Repository: NewRepository(store), Store: store, Registry: registry}
 	if registrar, ok := store.(projectionRegistrar); ok {
 		s.InitError = registerEndpointProjections(registrar)
 	}
@@ -193,8 +193,7 @@ func (s *Service) Execute(ctx context.Context, command Command) (Result, error) 
 	}
 	replayCandidate := false
 	kind := commandKind(command)
-	metadataOnly := kind == CommandRestoreLegacyMetadata
-	registryIndependent := kind == CommandComplete || kind == CommandResolve || metadataOnly
+	registryIndependent := kind == CommandComplete || kind == CommandResolve
 	if state.Version > 0 {
 		_, replayCandidate = state.ProcessedCommands[commandID(command)]
 		if !replayCandidate && !registryIndependent {
@@ -227,9 +226,6 @@ func (s *Service) Execute(ctx context.Context, command Command) (Result, error) 
 		if state.OperationState == OperationStatePending || state.OperationState == OperationStateAmbiguous || state.OperationState == OperationStateFailed {
 			result.Effects = pendingLifecycleEffect(state)
 		}
-		if metadataOnly {
-			return result, nil
-		}
 		operationID := operationForCommand(command)
 		if registryIndependent && state.OperationID != "" {
 			operationID = state.OperationID
@@ -256,9 +252,6 @@ func (s *Service) Execute(ctx context.Context, command Command) (Result, error) 
 		return Result{}, nextErr
 	}
 	result := Result{State: next, Commit: commit, Effects: append([]LifecycleEffect(nil), decision.Effects...)}
-	if metadataOnly {
-		return result, nil
-	}
 	operation, operationErr := s.operation(ctx, next.OperationID)
 	if operationErr != nil {
 		return Result{}, mapOperationError(operationErr)

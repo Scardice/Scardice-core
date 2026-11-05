@@ -8,7 +8,6 @@ import (
 	"Scardice-core/adapterapi"
 	"Scardice-core/core/groupstate"
 	"Scardice-core/core/messageflow"
-	"Scardice-core/core/playerstate"
 	"Scardice-core/eventstore"
 )
 
@@ -24,16 +23,16 @@ func enableDurableQuitForHarness(t *testing.T, harness *durableOBHarness) {
 			adapterapi.ActionKindSendMessage,
 			adapterapi.ActionKindQuit,
 		),
-		IndexRootID: "card-index-v1", IndexSigner: groupCardSQLiteIndexSigner{},
 	}}
-	outbound, err := messageflow.NewOutboundService(harness.store, resolver, harness.store, eventstore.UUIDGenerator{})
+	ids := &canonicalFixtureIDs{prefix: canonicalFixtureLabel(t, "durable-quit-outbound")}
+	outbound, err := messageflow.NewOutboundService(harness.store, resolver, ids)
 	if err != nil {
 		t.Fatal(err)
 	}
-	harness.dice.OutboundBridge = NewDurableOutboundBridge(outbound, resolver, eventstore.UUIDGenerator{})
+	harness.dice.OutboundBridge = NewDurableOutboundBridge(outbound, resolver, ids, newBridgeTestNotificationOwner(t))
 }
 
-func seedDurableQuitTarget(t *testing.T, harness *durableOBHarness) (groupstate.State, *GroupInfo) {
+func seedDurableQuitTarget(t *testing.T, harness *durableOBHarness) groupstate.State {
 	t.Helper()
 	metadata := eventstore.Metadata{
 		CommandID: "seed-durable-quit-target", CorrelationID: "seed-durable-quit-target",
@@ -50,46 +49,37 @@ func seedDurableQuitTarget(t *testing.T, harness *durableOBHarness) (groupstate.
 	if err != nil {
 		t.Fatal(err)
 	}
-	group := compatibilityGroupFromState(harness.dice, state, playerstate.PlayerState{
-		DiceID: harness.dice.BaseConfig.Name, GroupID: durableQuitTargetGroupID,
-		UserID: obTestUserID, Name: "Quit Operator",
-	}, messageflow.CallbackScope{
-		DiceID: harness.dice.BaseConfig.Name, GroupID: durableQuitTargetGroupID, UserID: obTestUserID,
-	})
-	harness.dice.ImSession.ServiceAtNew.Store(durableQuitTargetGroupID, group)
-	return state, group
+	return state
 }
 
 func TestDurableDismissCommitConflictKeepsTargetMembership(t *testing.T) {
 	harness := newDurableOBHarness(t)
 	enableDurableQuitForHarness(t, harness)
-	state, group := seedDurableQuitTarget(t, harness)
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	transaction, err := NewDurableCallbackTransaction(harness.store, collector)
+	state := seedDurableQuitTarget(t, harness)
+	root := newCanonicalTestRoot(t, harness.dice, "dismiss-conflict")
+	message := newGroupMsg(durableQuitTargetGroupID, obTestUserID, ".dismiss")
+	messageContext, err := NewDomainMsgContext(
+		root.Transaction, harness.dice, harness.dice.ImSession, harness.endpoint, message,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	metadata := eventstore.Metadata{
-		CommandID: "inbox-dismiss-conflict", CorrelationID: "inbox-dismiss-conflict",
-		OccurredAt: time.Unix(21, 0).UTC(),
-	}
-	messageContext := &MsgContext{
-		Dice: harness.dice, Session: harness.dice.ImSession, EndPoint: harness.endpoint,
-		Group: group, MessageType: "group", IsCurGroupBotOn: true, PrivilegeLevel: 100,
-		CommandID: 21, CurrentCommand: "dismiss", callbackTransaction: transaction, callbackMetadata: metadata,
-	}
-	message := newGroupMsg(durableQuitTargetGroupID, obTestUserID, ".dismiss")
-	result := harness.dice.executeDismissOperation(messageContext, message, durableQuitTargetGroupID, group)
+	defer messageContext.releaseExecutionState()
+	messageContext.IsCurGroupBotOn = true
+	messageContext.PrivilegeLevel = 100
+	messageContext.CommandID = 21
+	messageContext.CurrentCommand = "dismiss"
+	result := harness.dice.executeDismissOperation(messageContext, message, durableQuitTargetGroupID)
 	if !result.Matched || !result.Solved {
 		t.Fatalf("dismiss result = %#v", result)
 	}
-	if !group.DiceIDExistsMap.Exists(harness.endpoint.UserID) {
-		t.Fatal("dismiss removed membership before callback commit")
+	if messageContext.Group.DiceIDExists(harness.endpoint.UserID) {
+		t.Fatal("dismiss was not visible inside the active domain transaction")
 	}
-	if err = transaction.Finalize(harness.ctx); err != nil {
+	if err = root.Transaction.Finalize(harness.ctx); err != nil {
 		t.Fatal(err)
 	}
-	work, err := collector.UnitOfWork()
+	work, err := root.Collector.UnitOfWork()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,8 +95,12 @@ func TestDurableDismissCommitConflictKeepsTargetMembership(t *testing.T) {
 	if _, err = harness.store.Commit(harness.ctx, work); !errors.Is(err, eventstore.ErrConflict) {
 		t.Fatalf("stale callback commit error = %v, want conflict", err)
 	}
-	if !group.DiceIDExistsMap.Exists(harness.endpoint.UserID) {
-		t.Fatal("failed callback commit removed target membership")
+	persisted, err := groupstate.NewRepository(harness.store).Load(harness.ctx, harness.dice.BaseConfig.Name, durableQuitTargetGroupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !persisted.DiceIDExists[harness.endpoint.UserID] {
+		t.Fatal("failed callback commit removed durable target membership")
 	}
 	if effects := harness.outboundEffects(); len(effects) != 0 {
 		t.Fatalf("failed callback commit persisted effects: %#v", effects)
@@ -116,71 +110,18 @@ func TestDurableDismissCommitConflictKeepsTargetMembership(t *testing.T) {
 func TestDurableMasterQuitPersistsCrossGroupMembershipRemoval(t *testing.T) {
 	harness := newDurableOBHarness(t)
 	enableDurableQuitForHarness(t, harness)
-	_, targetGroup := seedDurableQuitTarget(t, harness)
-	harness.dice.DiceMasters = []string{obTestUserID}
-
-	groupRepository := groupstate.NewRepository(harness.store)
-	sourceState, err := groupRepository.Load(harness.ctx, harness.dice.BaseConfig.Name, obTestGroupID)
+	seedDurableQuitTarget(t, harness)
+	updateCanonicalTestConfig(t, harness.dice, func(config *Config) {
+		config.DiceMasters = []string{obTestUserID}
+	})
+	harness.process(".master quitgroup " + durableQuitTargetGroupID)
+	removed, err := groupstate.NewRepository(harness.store).Load(harness.ctx, harness.dice.BaseConfig.Name, durableQuitTargetGroupID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	playerState, err := playerstate.NewRepository(harness.store).LoadPlayer(harness.ctx, harness.dice.BaseConfig.Name, obTestGroupID, obTestUserID)
-	if err != nil {
-		t.Fatal(err)
+	if removed.DiceIDExists[harness.endpoint.UserID] {
+		t.Fatalf("committed master quit retained membership: %#v", removed.DiceIDExists)
 	}
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	request := messageflow.CallbackRequest{
-		InboxID: "inbox-master-cross-group-quit", EndpointID: harness.endpoint.ID,
-		Message: adapterapi.InboundMessage{
-			ProviderEventID: "provider-master-cross-group-quit", MessageID: "message-master-cross-group-quit",
-			Kind: adapterapi.InboundKindMessage, ConversationKind: adapterapi.ConversationKindGroup,
-			Platform: "QQ", Sender: adapterapi.PrincipalID(obTestUserID), Conversation: adapterapi.ConversationID(obTestGroupID),
-			Target: harness.endpoint.UserID, Text: ".master quitgroup " + durableQuitTargetGroupID,
-			OccurredAt: time.Unix(23, 0).UTC(),
-		},
-		Scope: messageflow.CallbackScope{DiceID: harness.dice.BaseConfig.Name, GroupID: obTestGroupID, UserID: obTestUserID},
-		Group: sourceState.CompatibilityView(), Player: playerState.CompatibilityView(),
-	}
-	callbackResult, err := NewDurableCallbackHost(harness.dice).HandleCallback(harness.ctx, request, playerstate.NewLocalOverlay(), collector)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if callbackResult.Release != nil {
-		defer callbackResult.Release()
-	}
-	if !targetGroup.DiceIDExistsMap.Exists(harness.endpoint.UserID) {
-		t.Fatal("master quit removed cross-group membership before callback commit")
-	}
-	work, err := collector.UnitOfWork()
-	if err != nil {
-		t.Fatal(err)
-	}
-	fenceLocked := false
-	if callbackResult.CommitFence != nil {
-		if !callbackResult.CommitFence.TryLock() {
-			t.Fatal("callback commit fence was unexpectedly busy")
-		}
-		fenceLocked = true
-		defer func() {
-			if fenceLocked {
-				callbackResult.CommitFence.Unlock()
-			}
-		}()
-	}
-	if _, err = harness.store.Commit(harness.ctx, work); err != nil {
-		t.Fatal(err)
-	}
-	if callbackResult.AfterCommit != nil {
-		callbackResult.AfterCommit()
-	}
-	if fenceLocked {
-		callbackResult.CommitFence.Unlock()
-		fenceLocked = false
-	}
-	if targetGroup.DiceIDExistsMap.Exists(harness.endpoint.UserID) {
-		t.Fatal("committed master quit retained cross-group membership")
-	}
-
 	harness.reopen()
 	restored, err := groupstate.NewRepository(harness.store).Load(harness.ctx, harness.dice.BaseConfig.Name, durableQuitTargetGroupID)
 	if err != nil {

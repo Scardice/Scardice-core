@@ -128,7 +128,7 @@ func TestPersistedVersionWidthOverflowFailsClosed(t *testing.T) {
 	if _, err := store.AcceptInbox(context.Background(), laneInbox); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.GORM().Model(&laneHeadRow{}).Where("kind = ? AND lane_hmac = ?", "inbox", laneInbox.LaneHMAC).Update("next_sequence", maxPersistedVersion).Error; err != nil {
+	if err := laneQuery(db.GORM().Model(&laneHeadRow{}), "inbox", laneInbox.Lane).Update("next_sequence", maxPersistedVersion).Error; err != nil {
 		t.Fatal(err)
 	}
 	laneInbox.InboxID = "persisted-width-lane-inbox-2"
@@ -143,8 +143,8 @@ func TestUnitOfWorkParticipantsUseLaneInvariants(t *testing.T) {
 	defer db.Close()
 	work := UnitOfWork{InboxUpdates: []InboxUpdate{{
 		InboxID: "uow-inbox", EndpointID: "endpoint", ProviderEventKey: "uow-provider",
-		LaneHMAC: []byte("uow-lane"), OrderingSequence: 99, Status: InboxStatusPending,
-		PayloadCiphertext: []byte("cipher"), PayloadNonce: []byte("nonce"), DigestKeyID: "uow-key",
+		Lane: "uow-lane", OrderingSequence: 99, Status: InboxStatusPending,
+		Payload: []byte("uow-payload"),
 	}}}
 	result, err := store.Commit(context.Background(), work)
 	if err != nil {
@@ -228,120 +228,6 @@ func TestLeaseMutationsRejectExpiredAttempt(t *testing.T) {
 		t.Fatalf("expired outbox renew err = %v", err)
 	}
 }
-func TestExpiredLeasedMutationScrubsBeforeStaleLease(t *testing.T) {
-	store, db, clock := openQueueTestStore(t)
-	defer db.Close()
-	ctx := context.Background()
-	inbox := newInboxTestUpdate("expired-observed-inbox", "expired-observed-provider", "expired-observed-lane")
-	inbox.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
-		t.Fatal(err)
-	}
-	inboxLease, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "expired-worker", LeaseDuration: time.Minute})
-	if err != nil {
-		t.Fatal(err)
-	}
-	effect := newOutboxTestEffect("expired-observed-effect", "expired-observed-lane")
-	effect.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
-		t.Fatal(err)
-	}
-	effectLease, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "expired-worker", LeaseDuration: time.Minute})
-	if err != nil {
-		t.Fatal(err)
-	}
-	clock.Advance(2 * time.Minute)
-	if _, err := store.UpdateInbox(ctx, InboxUpdate{InboxID: inboxLease.Update.InboxID, ExpectedVersion: inboxLease.Update.Version, Status: InboxStatusCallbackStarted, LeaseOwner: inboxLease.Update.LeaseOwner, LeaseEpoch: inboxLease.Update.LeaseEpoch, AttemptID: inboxLease.Update.AttemptID}); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("expired inbox mutation err = %v", err)
-	}
-	if _, err := store.RenewOutbox(ctx, OutboxRenewRequest{EffectID: effectLease.Effect.EffectID, WorkerID: effectLease.Effect.LeaseOwner, LeaseEpoch: effectLease.Effect.LeaseEpoch, AttemptID: effectLease.Effect.AttemptID, LeaseDuration: time.Minute}); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("expired outbox renewal err = %v", err)
-	}
-	var inboxRow inboxMessageRow
-	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&inboxRow).Error; err != nil {
-		t.Fatal(err)
-	}
-	if len(inboxRow.PayloadCiphertext) != 0 || len(inboxRow.PayloadNonce) != 0 {
-		t.Fatal("expired inbox payload was not scrubbed")
-	}
-	var effectRow outboxEffectRow
-	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&effectRow).Error; err != nil {
-		t.Fatal(err)
-	}
-	if effectRow.Status != OutboxStatusFailed || effectRow.CompletedAt == nil || len(effectRow.PayloadCiphertext) != 0 || len(effectRow.PayloadNonce) != 0 {
-		t.Fatalf("expired outbox was not terminalized: %#v", effectRow)
-	}
-}
-func TestExpiredRowsPrecedeVersionConflicts(t *testing.T) {
-	store, db, clock := openQueueTestStore(t)
-	defer db.Close()
-	ctx := context.Background()
-	inbox := newInboxTestUpdate("expired-version-inbox", "expired-version-provider", "expired-version-inbox-lane")
-	inbox.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
-		t.Fatal(err)
-	}
-	effect := newOutboxTestEffect("expired-version-effect", "expired-version-effect-lane")
-	effect.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
-		t.Fatal(err)
-	}
-	resolveInbox := newInboxTestUpdate("expired-version-resolve-inbox", "expired-version-resolve-provider", "expired-version-resolve-inbox-lane")
-	resolveInbox.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.AcceptInbox(ctx, resolveInbox); err != nil {
-		t.Fatal(err)
-	}
-	resolveEffect := newOutboxTestEffect("expired-version-resolve-effect", "expired-version-resolve-effect-lane")
-	resolveEffect.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.AcceptOutbox(ctx, resolveEffect); err != nil {
-		t.Fatal(err)
-	}
-	uowInbox := newInboxTestUpdate("expired-version-uow-inbox", "expired-version-uow-provider", "expired-version-uow-inbox-lane")
-	uowInbox.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.AcceptInbox(ctx, uowInbox); err != nil {
-		t.Fatal(err)
-	}
-	uowEffect := newOutboxTestEffect("expired-version-uow-effect", "expired-version-uow-effect-lane")
-	uowEffect.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.AcceptOutbox(ctx, uowEffect); err != nil {
-		t.Fatal(err)
-	}
-	clock.Advance(2 * time.Minute)
-	if _, err := store.UpdateInbox(ctx, InboxUpdate{InboxID: inbox.InboxID, ExpectedVersion: 99, Status: InboxStatusPending}); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("expired inbox version err = %v", err)
-	}
-	if _, err := store.UpdateOutbox(ctx, NewEffect{EffectID: effect.EffectID, ExpectedVersion: 99, Status: OutboxStatusPending}); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("expired outbox version err = %v", err)
-	}
-	if _, err := store.ResolveInbox(ctx, InboxResolutionRequest{InboxID: resolveInbox.InboxID, ExpectedVersion: 99, Resolution: InboxResolutionRetry, PrincipalID: "operator", Reason: "expired"}); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("expired inbox resolution version err = %v", err)
-	}
-	if _, err := store.ResolveOutbox(ctx, OutboxResolutionRequest{EffectID: resolveEffect.EffectID, ExpectedVersion: 99, Resolution: OutboxResolutionRetry, PrincipalID: "operator", Reason: "expired"}); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("expired outbox resolution version err = %v", err)
-	}
-	var resolvedExpired outboxEffectRow
-	if err := db.GORM().Where("effect_id = ?", resolveEffect.EffectID).First(&resolvedExpired).Error; err != nil {
-		t.Fatal(err)
-	}
-	if resolvedExpired.Status != OutboxStatusFailed || resolvedExpired.CompletedAt == nil || resolvedExpired.ResolutionReason != "payload-expired" {
-		t.Fatalf("expired manual resolution left pending row: %#v", resolvedExpired)
-	}
-	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{{InboxID: uowInbox.InboxID, ExpectedVersion: 99, Status: InboxStatusPending}}}); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("expired UoW inbox version err = %v", err)
-	}
-	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{EffectID: uowEffect.EffectID, ExpectedVersion: 99, Status: OutboxStatusPending}}}); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("expired UoW outbox version err = %v", err)
-	}
-	for _, table := range []string{"inbox_messages", "outbox_effects"} {
-		var count int64
-		if err := db.GORM().Table(table).Where("(payload_ciphertext IS NOT NULL AND length(payload_ciphertext) > 0) OR (payload_nonce IS NOT NULL AND length(payload_nonce) > 0)").Count(&count).Error; err != nil {
-			t.Fatal(err)
-		}
-		if count != 0 {
-			t.Fatalf("expired %s payloads remain: %d", table, count)
-		}
-	}
-}
 
 func TestStrictIngressAndParticipantContracts(t *testing.T) {
 	store, db, _ := openQueueTestStore(t)
@@ -354,7 +240,7 @@ func TestStrictIngressAndParticipantContracts(t *testing.T) {
 		t.Fatal(err)
 	}
 	conflicting := inbox
-	conflicting.PayloadCiphertext = []byte("different")
+	conflicting.Payload = []byte("different")
 	conflicting.ContentDigest = []byte("different-digest")
 	if _, err := store.AcceptInbox(ctx, conflicting); !errors.Is(err, ErrConflict) {
 		t.Fatalf("inbox content conflict err = %v", err)
@@ -383,12 +269,8 @@ func TestStrictIngressAndParticipantContracts(t *testing.T) {
 		t.Fatalf("forged outbox lease transition err = %v", err)
 	}
 	if _, err := store.Commit(ctx, UnitOfWork{
-		Operations: []OperationUpdate{{OperationID: "artifact-uow-roundtrip", PrincipalID: "artifact-owner"}},
-		ArtifactUpdates: []ArtifactUpdate{{
-			ArtifactID: "artifact-uow-roundtrip", OperationID: "artifact-uow-roundtrip",
-			Size: 3, Ciphertext: []byte("sealed:abc"), Nonce: []byte("nonce"), EncryptionKeyID: "artifact-key",
-			Status: "ready",
-		}},
+		Operations:      []OperationUpdate{{OperationID: "artifact-uow-roundtrip", PrincipalID: "artifact-owner"}},
+		ArtifactUpdates: []ArtifactUpdate{{ArtifactID: "artifact-uow-roundtrip", OperationID: "artifact-uow-roundtrip", Size: 3, Data: []byte("abc"), Status: "ready"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -427,16 +309,6 @@ func TestStableDedupeAfterScrubAndLeaseRequiredTransitions(t *testing.T) {
 	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{{InboxID: inbox.InboxID, Status: InboxStatusFailed, ExpectedVersion: 3}}}); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("terminal inbox participant update err = %v", err)
 	}
-	replayInbox := inbox
-	replayInbox.PayloadCiphertext = []byte("re-encrypted")
-	if result, err := store.AcceptInbox(ctx, replayInbox); err != nil || !result.Deduplicated {
-		t.Fatalf("scrubbed inbox replay = %#v err=%v", result, err)
-	}
-	conflictingInbox := replayInbox
-	conflictingInbox.ContentDigest = []byte("different-digest")
-	if _, err := store.AcceptInbox(ctx, conflictingInbox); !errors.Is(err, ErrConflict) {
-		t.Fatalf("scrubbed inbox digest conflict err = %v", err)
-	}
 
 	effect := newOutboxTestEffect("stable-effect", "stable-effect-lane")
 	effect.ContentDigest = []byte("stable-effect-digest")
@@ -461,16 +333,6 @@ func TestStableDedupeAfterScrubAndLeaseRequiredTransitions(t *testing.T) {
 	if _, err := store.UpdateOutbox(ctx, terminalEffectUpdate); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("terminal outbox generic update err = %v", err)
 	}
-	replayEffect := effect
-	replayEffect.PayloadCiphertext = []byte("re-encrypted")
-	if result, err := store.AcceptOutbox(ctx, replayEffect); err != nil || !result.Deduplicated {
-		t.Fatalf("scrubbed outbox replay = %#v err=%v", result, err)
-	}
-	conflictingEffect := replayEffect
-	conflictingEffect.ContentDigest = []byte("different-effect-digest")
-	if _, err := store.AcceptOutbox(ctx, conflictingEffect); !errors.Is(err, ErrConflict) {
-		t.Fatalf("scrubbed outbox digest conflict err = %v", err)
-	}
 }
 func TestPublicIngressRejectsImmutableFieldsAndVersions(t *testing.T) {
 	store, db, _ := openQueueTestStore(t)
@@ -480,10 +342,10 @@ func TestPublicIngressRejectsImmutableFieldsAndVersions(t *testing.T) {
 	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.AcceptInbox(ctx, InboxUpdate{InboxID: "new-inbox", EndpointID: "endpoint", ProviderEventKey: "provider", LaneHMAC: []byte("lane"), Version: 1, PayloadCiphertext: []byte("sealed"), PayloadNonce: []byte("nonce"), DigestKeyID: "key"}); !errors.Is(err, ErrInvalidTransition) {
+	if _, err := store.AcceptInbox(ctx, InboxUpdate{InboxID: "new-inbox", EndpointID: "endpoint", ProviderEventKey: "provider", Lane: "lane", Version: 1, Payload: []byte("new-payload")}); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("accept inbox version err = %v", err)
 	}
-	if _, err := store.UpdateInbox(ctx, InboxUpdate{InboxID: inbox.InboxID, ExpectedVersion: 1, Status: InboxStatusPending, PayloadCiphertext: []byte("sealed")}); !errors.Is(err, ErrInvalidTransition) {
+	if _, err := store.UpdateInbox(ctx, InboxUpdate{InboxID: inbox.InboxID, ExpectedVersion: 1, Status: InboxStatusPending, Payload: []byte("sealed")}); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("update inbox payload err = %v", err)
 	}
 	if _, err := store.UpdateInbox(ctx, InboxUpdate{InboxID: inbox.InboxID, ExpectedVersion: 1, Version: 9, Status: InboxStatusPending}); !errors.Is(err, ErrParticipantConflict) {
@@ -496,7 +358,7 @@ func TestPublicIngressRejectsImmutableFieldsAndVersions(t *testing.T) {
 	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.AcceptOutbox(ctx, NewEffect{EffectID: "new-effect", EndpointID: "endpoint", LaneHMAC: []byte("lane"), EffectType: "send", RiskClass: RiskPreDispatchRetryable, Version: 1, PayloadCiphertext: []byte("sealed"), PayloadNonce: []byte("nonce"), DigestKeyID: "key"}); !errors.Is(err, ErrInvalidTransition) {
+	if _, err := store.AcceptOutbox(ctx, NewEffect{EffectID: "new-effect", EndpointID: "endpoint", Lane: "lane", EffectType: "send", RiskClass: RiskPreDispatchRetryable, Version: 1, Payload: []byte("new-payload")}); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("accept outbox version err = %v", err)
 	}
 	if _, err := store.UpdateOutbox(ctx, NewEffect{EffectID: effect.EffectID, ExpectedVersion: 1, Status: OutboxStatusPending, EndpointID: "forged"}); !errors.Is(err, ErrInvalidTransition) {
@@ -507,41 +369,64 @@ func TestPublicIngressRejectsImmutableFieldsAndVersions(t *testing.T) {
 	}
 }
 
-func TestPendingTerminationAndNonceBound(t *testing.T) {
+func TestInboxUOWSameIDAcceptanceReplayReturnsStoredID(t *testing.T) {
 	store, db, _ := openQueueTestStore(t)
 	defer db.Close()
 	ctx := context.Background()
-
-	inbox := newInboxTestUpdate("pending-termination-inbox", "pending-termination-provider", "pending-termination-lane")
-	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
+	inbox := newInboxTestUpdate("same-id", "same-provider", "same-lane")
+	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{inbox}}); err != nil {
 		t.Fatal(err)
 	}
-	failedInbox := InboxUpdate{InboxID: inbox.InboxID, Status: InboxStatusFailed, ExpectedVersion: 1}
-	if _, err := store.UpdateInbox(ctx, failedInbox); !errors.Is(err, ErrStaleLease) {
-		t.Fatalf("pending inbox termination err = %v", err)
-	}
-	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{{InboxID: inbox.InboxID, Status: InboxStatusFailed, ExpectedVersion: 1}}}); !errors.Is(err, ErrStaleLease) {
-		t.Fatalf("pending inbox participant termination err = %v", err)
-	}
-
-	effect := newOutboxTestEffect("pending-termination-effect", "pending-termination-effect-lane")
-	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
-		t.Fatal(err)
-	}
-	failedEffect := NewEffect{EffectID: effect.EffectID, Status: OutboxStatusFailed, ExpectedVersion: 1}
-	if _, err := store.UpdateOutbox(ctx, failedEffect); !errors.Is(err, ErrStaleLease) {
-		t.Fatalf("pending outbox termination err = %v", err)
-	}
-	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{EffectID: effect.EffectID, Status: OutboxStatusFailed, ExpectedVersion: 1}}}); !errors.Is(err, ErrStaleLease) {
-		t.Fatalf("pending outbox participant termination err = %v", err)
-	}
-
-	invalidNonce := newInboxTestUpdate("nonce-bound", "nonce-bound-provider", "nonce-bound-lane")
-	invalidNonce.PayloadNonce = make([]byte, task5NonceLimit+1)
-	if _, err := store.AcceptInbox(ctx, invalidNonce); !errors.Is(err, ErrInvalidMetadata) {
-		t.Fatalf("nonce bound err = %v", err)
+	result, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{inbox}})
+	if err != nil || !result.Deduplicated || !result.Idempotent ||
+		!reflect.DeepEqual(result.InboxIDs, []string{"same-id"}) || result.Version != 1 || result.OrderingSequence != 1 {
+		t.Fatalf("same-ID acceptance replay result=%+v err=%v", result, err)
 	}
 }
+
+func TestInboxUOWSameIDAcceptanceReplayPreservesProgressedEnvelope(t *testing.T) {
+	for _, status := range []string{InboxStatusLeased, InboxStatusCallbackStarted, InboxStatusFailed} {
+		t.Run(status, func(t *testing.T) {
+			store, db, _ := openQueueTestStore(t)
+			defer db.Close()
+			ctx := context.Background()
+			inbox := newInboxTestUpdate("progressed-id", "progressed-provider", "progressed-lane")
+			if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{inbox}}); err != nil {
+				t.Fatal(err)
+			}
+			lease, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "worker"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status != InboxStatusLeased {
+				if _, err := store.UpdateInbox(ctx, InboxUpdate{
+					InboxID: inbox.InboxID, ExpectedVersion: lease.Update.Version, Status: status,
+					LeaseOwner: lease.Update.LeaseOwner, LeaseEpoch: lease.Update.LeaseEpoch, AttemptID: lease.Update.AttemptID,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var before inboxMessageRow
+			if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).Take(&before).Error; err != nil {
+				t.Fatal(err)
+			}
+			result, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{inbox}})
+			if err != nil || !result.Deduplicated || !result.Idempotent ||
+				!reflect.DeepEqual(result.InboxIDs, []string{"progressed-id"}) || result.Version != before.Version ||
+				result.OrderingSequence != before.OrderingSequence {
+				t.Fatalf("progressed same-ID replay result=%+v err=%v", result, err)
+			}
+			var after inboxMessageRow
+			if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).Take(&after).Error; err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(before, after) {
+				t.Fatalf("acceptance replay changed progressed envelope: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
 func TestParticipantVersionContract(t *testing.T) {
 	store, db, _ := openQueueTestStore(t)
 	defer db.Close()
@@ -567,7 +452,7 @@ func TestParticipantVersionContract(t *testing.T) {
 		t.Fatalf("existing inbox full replay = %#v err=%v", result, err)
 	}
 	oversizedInboxReplay := replayInbox
-	oversizedInboxReplay.PayloadCiphertext = make([]byte, task5PayloadLimit+1)
+	oversizedInboxReplay.Payload = make([]byte, task5PayloadLimit+1)
 	var bound *OversizeError
 	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{oversizedInboxReplay}}); !errors.As(err, &bound) {
 		t.Fatalf("oversized inbox replay err = %v", err)
@@ -599,7 +484,7 @@ func TestParticipantVersionContract(t *testing.T) {
 		t.Fatalf("existing effect full replay = %#v err=%v", result, err)
 	}
 	oversizedEffectReplay := replayEffect
-	oversizedEffectReplay.PayloadCiphertext = make([]byte, task5PayloadLimit+1)
+	oversizedEffectReplay.Payload = make([]byte, task5PayloadLimit+1)
 	bound = nil
 	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{oversizedEffectReplay}}); !errors.As(err, &bound) {
 		t.Fatalf("oversized effect replay err = %v", err)
@@ -624,7 +509,7 @@ func TestParticipantVersionContract(t *testing.T) {
 	if _, err := store.Commit(ctx, UnitOfWork{Operations: []OperationUpdate{{OperationID: "participant-version-operation", PrincipalID: "participant-version-principal"}}}); err != nil {
 		t.Fatal(err)
 	}
-	artifact := ArtifactUpdate{ArtifactID: "participant-version-artifact", OperationID: "participant-version-operation", OwnerPrincipalID: "participant-version-principal", Size: 8, Ciphertext: []byte("sealed:artifact"), Nonce: []byte("nonce"), EncryptionKeyID: "test-key"}
+	artifact := ArtifactUpdate{ArtifactID: "participant-version-artifact", OperationID: "participant-version-operation", OwnerPrincipalID: "participant-version-principal", Size: 8, Data: []byte("artifact")}
 	artifact.Version = 2
 	if _, err := store.Commit(ctx, UnitOfWork{ArtifactUpdates: []ArtifactUpdate{artifact}}); !errors.Is(err, ErrParticipantConflict) {
 		t.Fatalf("new artifact supplied version err = %v", err)
@@ -638,163 +523,5 @@ func TestParticipantVersionContract(t *testing.T) {
 	}
 	if _, err := store.Commit(ctx, UnitOfWork{ArtifactUpdates: []ArtifactUpdate{{ArtifactID: artifact.ArtifactID, ExpectedVersion: 1, Version: 2}}}); err != nil {
 		t.Fatalf("existing artifact version 2: %v", err)
-	}
-}
-func TestUOWExpiryScrubsBeforeError(t *testing.T) {
-	store, db, clock := openQueueTestStore(t)
-	defer db.Close()
-	ctx := context.Background()
-
-	inbox := newInboxTestUpdate("uow-expired-inbox", "uow-expired-provider", "uow-expired-lane")
-	inbox.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
-		t.Fatal(err)
-	}
-	inboxLease, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "uow-expiry-worker", LeaseDuration: time.Hour})
-	if err != nil {
-		t.Fatal(err)
-	}
-	clock.Advance(2 * time.Minute)
-	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{{InboxID: inbox.InboxID, ExpectedVersion: inboxLease.Update.Version, Version: inboxLease.Update.Version + 1, Status: InboxStatusCallbackStarted, LeaseOwner: inboxLease.Update.LeaseOwner, LeaseEpoch: inboxLease.Update.LeaseEpoch, AttemptID: inboxLease.Update.AttemptID}}}); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("uow callback expiry err = %v", err)
-	}
-	var inboxRow inboxMessageRow
-	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&inboxRow).Error; err != nil {
-		t.Fatal(err)
-	}
-	if len(inboxRow.PayloadCiphertext) != 0 || len(inboxRow.PayloadNonce) != 0 {
-		t.Fatalf("uow inbox expiry retained payload: %#v", inboxRow)
-	}
-
-	effect := newOutboxTestEffect("uow-expired-effect", "uow-expired-effect-lane")
-	effect.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
-		t.Fatal(err)
-	}
-	effectLease, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "uow-expiry-worker", LeaseDuration: time.Hour})
-	if err != nil {
-		t.Fatal(err)
-	}
-	clock.Advance(2 * time.Minute)
-	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{EffectID: effect.EffectID, ExpectedVersion: effectLease.Effect.Version, Version: effectLease.Effect.Version + 1, Status: OutboxStatusPending, LeaseOwner: effectLease.Effect.LeaseOwner, LeaseEpoch: effectLease.Effect.LeaseEpoch, AttemptID: effectLease.Effect.AttemptID}}}); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("uow pending expiry err = %v", err)
-	}
-	var effectRow outboxEffectRow
-	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&effectRow).Error; err != nil {
-		t.Fatal(err)
-	}
-	if effectRow.Status != OutboxStatusFailed || effectRow.CompletedAt == nil || len(effectRow.PayloadCiphertext) != 0 || len(effectRow.PayloadNonce) != 0 {
-		t.Fatalf("uow effect expiry was not terminalized: %#v", effectRow)
-	}
-
-	ambiguous := newOutboxTestEffect("uow-expired-ambiguous", "uow-expired-ambiguous-lane")
-	ambiguous.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.AcceptOutbox(ctx, ambiguous); err != nil {
-		t.Fatal(err)
-	}
-	ambiguousLease, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "uow-expiry-worker", LeaseDuration: time.Hour})
-	if err != nil {
-		t.Fatal(err)
-	}
-	clock.Advance(2 * time.Minute)
-	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{{EffectID: ambiguous.EffectID, ExpectedVersion: ambiguousLease.Effect.Version, Version: ambiguousLease.Effect.Version + 1, Status: OutboxStatusAmbiguous, LeaseOwner: ambiguousLease.Effect.LeaseOwner, LeaseEpoch: ambiguousLease.Effect.LeaseEpoch, AttemptID: ambiguousLease.Effect.AttemptID}}}); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("uow ambiguous expiry err = %v", err)
-	}
-	effectRow = outboxEffectRow{}
-	if err := db.GORM().Where("effect_id = ?", ambiguous.EffectID).First(&effectRow).Error; err != nil {
-		t.Fatalf("query ambiguous effect %q err=%v", ambiguous.EffectID, err)
-	}
-	if effectRow.Status != OutboxStatusFailed || effectRow.CompletedAt == nil || len(effectRow.PayloadCiphertext) != 0 || len(effectRow.PayloadNonce) != 0 {
-		t.Fatalf("uow leased expiry was not terminalized: %#v", effectRow)
-	}
-}
-func TestPublicExpiredReplayScrubsBeforeDedupe(t *testing.T) {
-	store, db, clock := openQueueTestStore(t)
-	defer db.Close()
-	ctx := context.Background()
-	inbox := newInboxTestUpdate("expired-replay-inbox", "expired-replay-provider", "expired-replay-inbox-lane")
-	inbox.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
-		t.Fatal(err)
-	}
-	effect := newOutboxTestEffect("expired-replay-effect", "expired-replay-effect-lane")
-	effect.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
-		t.Fatal(err)
-	}
-	clock.Advance(2 * time.Minute)
-	sameInbox := inbox
-	sameInbox.PayloadExpiresAt = clock.Now().Add(-time.Minute)
-	if _, err := store.AcceptInbox(ctx, sameInbox); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("same expired inbox replay err = %v", err)
-	}
-	changedInbox := inbox
-	changedInbox.PayloadExpiresAt = time.Time{}
-	changedInbox.PayloadCiphertext = []byte("changed")
-	if _, err := store.AcceptInbox(ctx, changedInbox); !errors.Is(err, ErrConflict) {
-		t.Fatalf("changed expired inbox replay err = %v", err)
-	}
-	sameEffect := effect
-	sameEffect.PayloadExpiresAt = clock.Now().Add(-time.Minute)
-	if _, err := store.AcceptOutbox(ctx, sameEffect); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("same expired outbox replay err = %v", err)
-	}
-	changedEffect := effect
-	changedEffect.PayloadExpiresAt = time.Time{}
-	changedEffect.PayloadCiphertext = []byte("changed")
-	if _, err := store.AcceptOutbox(ctx, changedEffect); !errors.Is(err, ErrConflict) {
-		t.Fatalf("changed expired outbox replay err = %v", err)
-	}
-	var inboxRow inboxMessageRow
-	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&inboxRow).Error; err != nil {
-		t.Fatal(err)
-	}
-	if len(inboxRow.PayloadCiphertext) != 0 || len(inboxRow.PayloadNonce) != 0 {
-		t.Fatal("expired inbox replay retained payload")
-	}
-	var effectRow outboxEffectRow
-	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&effectRow).Error; err != nil {
-		t.Fatal(err)
-	}
-	if len(effectRow.PayloadCiphertext) != 0 || len(effectRow.PayloadNonce) != 0 {
-		t.Fatal("expired outbox replay retained payload")
-	}
-}
-func TestUOWExpiredInitialDedupePrecedesReplay(t *testing.T) {
-	store, db, clock := openQueueTestStore(t)
-	defer db.Close()
-	ctx := context.Background()
-	inbox := newInboxTestUpdate("uow-dedupe-expired-inbox", "uow-dedupe-expired-provider", "uow-dedupe-expired-lane")
-	inbox.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.AcceptInbox(ctx, inbox); err != nil {
-		t.Fatal(err)
-	}
-	effect := newOutboxTestEffect("uow-dedupe-expired-effect", "uow-dedupe-expired-effect-lane")
-	effect.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
-		t.Fatal(err)
-	}
-	clock.Advance(2 * time.Minute)
-	replayInbox := newInboxTestUpdate("uow-dedupe-expired-new-id", inbox.ProviderEventKey, string(inbox.LaneHMAC))
-	replayInbox.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{replayInbox}}); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("uow expired inbox dedupe err = %v", err)
-	}
-	if _, err := store.Commit(ctx, UnitOfWork{Effects: []NewEffect{effect}}); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("uow expired effect dedupe err = %v", err)
-	}
-	var inboxRow inboxMessageRow
-	if err := db.GORM().Where("inbox_id = ?", inbox.InboxID).First(&inboxRow).Error; err != nil {
-		t.Fatal(err)
-	}
-	if len(inboxRow.PayloadCiphertext) != 0 || len(inboxRow.PayloadNonce) != 0 {
-		t.Fatal("uow expired inbox dedupe retained payload")
-	}
-	var effectRow outboxEffectRow
-	if err := db.GORM().Where("effect_id = ?", effect.EffectID).First(&effectRow).Error; err != nil {
-		t.Fatal(err)
-	}
-	if len(effectRow.PayloadCiphertext) != 0 || len(effectRow.PayloadNonce) != 0 {
-		t.Fatal("uow expired effect dedupe retained payload")
 	}
 }

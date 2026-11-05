@@ -3,6 +3,7 @@ package eventsourcing
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"os"
@@ -15,25 +16,10 @@ import (
 	"Scardice-core/eventstore"
 )
 
-type sqliteTargetKeySource struct{}
-
-func (sqliteTargetKeySource) IndexRootID(context.Context) (string, error) {
-	return "index-v1", nil
-}
-func (sqliteTargetKeySource) IndexRootMaterial(context.Context) ([]byte, error) {
-	return []byte("01234567890123456789012345678901"), nil
-}
-func (sqliteTargetKeySource) CurrentEncryptionRoot(context.Context) (eventstore.EncryptionRoot, error) {
-	return eventstore.EncryptionRoot{ID: "root-v1", Material: []byte("abcdefghijklmnopqrstuvwxyz123456")}, nil
-}
-func (sqliteTargetKeySource) EncryptionRoot(context.Context, string) ([]byte, error) {
-	return []byte("abcdefghijklmnopqrstuvwxyz123456"), nil
-}
-
 func TestSQLiteTargetImportsRebuildsAndVerifiesReopenedEvents(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "target.db")
-	target := NewSQLiteTarget(path, sqliteTargetKeySource{})
+	target := NewSQLiteTarget(path)
 	payload, marshalErr := json.Marshal(groupstate.NewGroupCreatedV1("dice-1", "QQ-Group:1", "group", 1))
 	if marshalErr != nil {
 		t.Fatal(marshalErr)
@@ -89,20 +75,6 @@ func TestSQLiteTargetImportsRebuildsAndVerifiesReopenedEvents(t *testing.T) {
 	if !eventFound {
 		t.Fatalf("event missing from manifest: %#v", manifest)
 	}
-	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
-		raw, readErr := os.ReadFile(candidate)
-		if errors.Is(readErr, os.ErrNotExist) {
-			continue
-		}
-		if readErr != nil {
-			t.Fatal(readErr)
-		}
-		for _, plaintext := range [][]byte{secret, []byte(pluginKey), pluginValue} {
-			if bytes.Contains(raw, plaintext) {
-				t.Fatalf("%s contains sensitive plaintext %q", candidate, plaintext)
-			}
-		}
-	}
 	readiness, err := target.GetReadiness(ctx)
 	if err != nil || readiness.Mode != "fresh" || readiness.DatabaseIdentity != "target-1" {
 		t.Fatalf("readiness = %#v, err = %v", readiness, err)
@@ -111,7 +83,7 @@ func TestSQLiteTargetImportsRebuildsAndVerifiesReopenedEvents(t *testing.T) {
 
 func TestSQLiteTargetPreservesEventMetadataAndReportsReadbackField(t *testing.T) {
 	ctx := context.Background()
-	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "target.db"), sqliteTargetKeySource{})
+	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "target.db"))
 	if err := target.Initialize(ctx, "metadata-target"); err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +117,7 @@ func TestSQLiteTargetPreservesEventMetadataAndReportsReadbackField(t *testing.T)
 
 func TestSQLiteTargetImportsEmptyPluginKey(t *testing.T) {
 	ctx := context.Background()
-	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "target.db"), sqliteTargetKeySource{})
+	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "target.db"))
 	if err := target.Initialize(ctx, "empty-plugin-key"); err != nil {
 		t.Fatal(err)
 	}
@@ -168,14 +140,14 @@ func TestSQLiteTargetImportsEmptyPluginKey(t *testing.T) {
 func TestSQLiteTargetRejectsExistingOrReusedTarget(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "target.db")
-	first := NewSQLiteTarget(path, sqliteTargetKeySource{})
+	first := NewSQLiteTarget(path)
 	if err := first.Initialize(ctx, "target-1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := first.Initialize(ctx, "target-1"); !errors.Is(err, ErrTargetIdentity) {
 		t.Fatalf("same target retry err = %v", err)
 	}
-	second := NewSQLiteTarget(path, sqliteTargetKeySource{})
+	second := NewSQLiteTarget(path)
 	if err := second.Initialize(ctx, "target-2"); !errors.Is(err, ErrTargetIdentity) {
 		t.Fatalf("existing target err = %v", err)
 	}
@@ -183,7 +155,7 @@ func TestSQLiteTargetRejectsExistingOrReusedTarget(t *testing.T) {
 
 func TestSQLiteTargetRejectsWholeBatchWhenSecretConflicts(t *testing.T) {
 	ctx := context.Background()
-	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "target.db"), sqliteTargetKeySource{})
+	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "target.db"))
 	if err := target.Initialize(ctx, "target-1"); err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +199,7 @@ func TestSQLiteTargetRejectsWholeBatchWhenSecretConflicts(t *testing.T) {
 
 func TestSQLiteTargetRejectsTamperedPersistedEvent(t *testing.T) {
 	ctx := context.Background()
-	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "target.db"), sqliteTargetKeySource{})
+	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "target.db"))
 	if err := target.Initialize(ctx, "target-1"); err != nil {
 		t.Fatal(err)
 	}
@@ -278,8 +250,8 @@ func TestImporterRunsAgainstRealSQLiteTargetWithoutChangingCurrentReadiness(t *t
 			},
 		},
 	}}
-	current := &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "current", IndexRootID: "current-index"}}
-	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "target.db"), sqliteTargetKeySource{})
+	current := &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "current"}}
+	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "target.db"))
 	result, runErr := NewImporter(ImporterOptions{
 		Readiness: current, Source: source, Target: target,
 		SnapshotRoot: filepath.Join(t.TempDir(), "snapshot"), TargetIdentity: "target-1",
@@ -297,7 +269,7 @@ func TestImporterRunsAgainstRealSQLiteTargetWithoutChangingCurrentReadiness(t *t
 		t.Fatal(err)
 	}
 	published, err := target.GetReadiness(ctx)
-	if err != nil || published.Mode != "import" || published.DatabaseIdentity != "target-1" || !bytes.Equal(published.SourceManifestDigest, result.ManifestDigest) {
+	if err != nil || published.Mode != "import" || published.DatabaseIdentity != "target-1" || published.CompletedAt.IsZero() || len(result.ManifestDigest) != sha256.Size {
 		t.Fatalf("published = %#v, err = %v", published, err)
 	}
 	if err := target.Close(); err != nil {
@@ -307,7 +279,7 @@ func TestImporterRunsAgainstRealSQLiteTargetWithoutChangingCurrentReadiness(t *t
 func TestSQLitePublicationTargetRelaxesCandidateSyncOnlyUntilReopen(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	target := NewSQLitePublicationTarget(filepath.Join(root, "candidate.db"), filepath.Join(root, "active.db"), sqliteTargetKeySource{})
+	target := NewSQLitePublicationTarget(filepath.Join(root, "candidate.db"), filepath.Join(root, "active.db"))
 	if err := target.Initialize(ctx, "target-fast-import"); err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +324,7 @@ func TestImporterPublishesSQLiteCandidateByAtomicRename(t *testing.T) {
 	root := t.TempDir()
 	candidate := filepath.Join(root, "candidate.db")
 	active := filepath.Join(root, "active.db")
-	oldTarget := NewSQLiteTarget(active, sqliteTargetKeySource{})
+	oldTarget := NewSQLiteTarget(active)
 	if err := oldTarget.Initialize(ctx, "target-atomic"); err != nil {
 		t.Fatal(err)
 	}
@@ -370,9 +342,9 @@ func TestImporterPublishesSQLiteCandidateByAtomicRename(t *testing.T) {
 		Kind: SourceKindLegacy, Identity: "legacy-1", LegacyOwnershipComplete: true,
 		Metadata: SourceMetadata{Identity: "legacy-1"}, Records: []SourceRecord{record},
 	}}
-	target := NewSQLitePublicationTarget(candidate, active, sqliteTargetKeySource{})
+	target := NewSQLitePublicationTarget(candidate, active)
 	result, err := NewImporter(ImporterOptions{
-		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "target-atomic", IndexRootID: "old-index"}},
+		Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "target-atomic"}},
 		Source:    source, Target: target, SnapshotRoot: filepath.Join(root, "snapshot"), TargetIdentity: "target-atomic",
 	}).Run(ctx, Request{Mode: ModeImport})
 	if err != nil {
@@ -387,7 +359,7 @@ func TestImporterPublishesSQLiteCandidateByAtomicRename(t *testing.T) {
 	if _, err = os.Stat(active + ".pre-import-" + result.TargetIdentity); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("publication backup still exists: %v", err)
 	}
-	reopened := NewSQLiteTarget(active, sqliteTargetKeySource{})
+	reopened := NewSQLiteTarget(active)
 	reopened.identity = result.TargetIdentity
 	if err = reopened.openLocked(ctx); err != nil {
 		t.Fatal(err)
@@ -403,7 +375,7 @@ func TestImporterFailureAfterCandidateBatchLeavesActiveDatabaseUntouched(t *test
 	ctx := context.Background()
 	root := t.TempDir()
 	activePath := filepath.Join(root, "active.db")
-	active := NewSQLiteTarget(activePath, sqliteTargetKeySource{})
+	active := NewSQLiteTarget(activePath)
 	if err := active.Initialize(ctx, "target-atomic"); err != nil {
 		t.Fatal(err)
 	}
@@ -435,13 +407,12 @@ func TestImporterFailureAfterCandidateBatchLeavesActiveDatabaseUntouched(t *test
 	secondBatchFailure := errors.New("forced second candidate batch failure")
 	result, err := NewImporter(ImporterOptions{
 		Readiness: &readinessFake{value: eventstore.Readiness{
-			Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "target-atomic", IndexRootID: "index-v1",
+			Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "target-atomic",
 		}},
 		Source: source,
 		Target: NewSQLitePublicationTarget(
 			filepath.Join(root, "candidate.db"),
 			activePath,
-			sqliteTargetKeySource{},
 		),
 		SnapshotRoot:   filepath.Join(root, "snapshot"),
 		TargetIdentity: "target-atomic",
@@ -469,7 +440,7 @@ func TestImporterFailureAfterCandidateBatchLeavesActiveDatabaseUntouched(t *test
 		t.Fatal("active database changed after candidate import failure")
 	}
 
-	reopened := NewSQLiteTarget(activePath, sqliteTargetKeySource{})
+	reopened := NewSQLiteTarget(activePath)
 	reopened.identity = "target-atomic"
 	if err = reopened.openLocked(ctx); err != nil {
 		t.Fatal(err)
@@ -488,14 +459,14 @@ func TestSQLitePublicationReplacementFailureLeavesActiveAvailable(t *testing.T) 
 	ctx := context.Background()
 	root := t.TempDir()
 	active := filepath.Join(root, "active.db")
-	oldTarget := NewSQLiteTarget(active, sqliteTargetKeySource{})
+	oldTarget := NewSQLiteTarget(active)
 	if err := oldTarget.Initialize(ctx, "target-old"); err != nil {
 		t.Fatal(err)
 	}
 	if err := oldTarget.Close(); err != nil {
 		t.Fatal(err)
 	}
-	target := NewSQLitePublicationTarget(filepath.Join(root, "candidate.db"), active, sqliteTargetKeySource{})
+	target := NewSQLitePublicationTarget(filepath.Join(root, "candidate.db"), active)
 	if err := target.Initialize(ctx, "target-new"); err != nil {
 		t.Fatal(err)
 	}
@@ -507,7 +478,7 @@ func TestSQLitePublicationReplacementFailureLeavesActiveAvailable(t *testing.T) 
 	if _, err := os.Stat(active); err != nil {
 		t.Fatalf("active database disappeared: %v", err)
 	}
-	reopened := NewSQLiteTarget(active, sqliteTargetKeySource{})
+	reopened := NewSQLiteTarget(active)
 	reopened.identity = "target-old"
 	if err := reopened.openLocked(ctx); err != nil {
 		t.Fatal(err)
@@ -546,14 +517,14 @@ func TestRemoteSQLTargetImportsPublishesAndReopens(t *testing.T) {
 			}}
 			activated := ""
 			target := NewRemoteSQLTarget(eventstore.DatabaseConfig{
-				Type: test.dbType, DSN: dsn, KeySource: sqliteTargetKeySource{},
+				Type: test.dbType, DSN: dsn,
 				AllowInsecureLoopback: true,
 			}, func(_ context.Context, identity string) error {
 				activated = identity
 				return nil
 			})
 			result, err := NewImporter(ImporterOptions{
-				Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old", IndexRootID: "old-index"}},
+				Readiness: &readinessFake{value: eventstore.Readiness{Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "old"}},
 				Source:    source, Target: target, SnapshotRoot: filepath.Join(t.TempDir(), "snapshot"),
 				TargetIdentity: "target-" + test.name,
 			}).Run(ctx, Request{Mode: ModeImport})
@@ -577,7 +548,7 @@ func TestRemoteSQLTargetImportsPublishesAndReopens(t *testing.T) {
 
 func TestSQLiteTargetStoryLogImportRetriesAreIdempotent(t *testing.T) {
 	ctx := context.Background()
-	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "logs.db"), sqliteTargetKeySource{})
+	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "logs.db"))
 	if err := target.Initialize(ctx, "log-import-retry"); err != nil {
 		t.Fatal(err)
 	}
@@ -640,7 +611,7 @@ func TestSQLiteTargetStoryLogImportRetriesAreIdempotent(t *testing.T) {
 
 func TestSQLiteTargetStoryLogFailureRollsBackOtherParticipants(t *testing.T) {
 	ctx := context.Background()
-	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "atomic.db"), sqliteTargetKeySource{})
+	target := NewSQLiteTarget(filepath.Join(t.TempDir(), "atomic.db"))
 	if err := target.Initialize(ctx, "log-import-atomic"); err != nil {
 		t.Fatal(err)
 	}

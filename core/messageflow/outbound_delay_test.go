@@ -10,13 +10,12 @@ import (
 	"Scardice-core/eventstore"
 )
 
-func delayedOutboundService(t *testing.T, effect adapterapi.OutboundEffect, root []byte) *OutboundService {
+func delayedOutboundService(t *testing.T, effect adapterapi.OutboundEffect) *OutboundService {
 	t.Helper()
 	service, err := NewOutboundService(&testStore{}, testResolver{snap: EndpointSnapshot{
 		EndpointID: effect.EndpointID, DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected,
 		Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage),
-		IndexRootID: "index-root-1", IndexSigner: testIndexSigner{root: root, id: "index-root-1"},
-	}}, &testEncryptor{}, &testIDs{})
+	}}, &testIDs{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,16 +23,15 @@ func delayedOutboundService(t *testing.T, effect adapterapi.OutboundEffect, root
 }
 
 func TestOutboundNotBeforeBecomesTheOutboxDueTime(t *testing.T) {
-	root := []byte(strings.Repeat("r", 32))
 	effect := testEffect()
 	effect.Deadline = time.Now().Add(time.Hour).UTC()
 	effect.NotBefore = time.Now().Add(5 * time.Second).UTC()
-	lane, err := adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, root, 1)
+	lane, err := adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	effect.Lane = lane
-	service := delayedOutboundService(t, effect, root)
+	service := delayedOutboundService(t, effect)
 
 	prepared, err := service.Prepare(context.Background(), SubmitRequest{Effect: effect, CommandID: "cmd-delayed", PrincipalID: "principal-a"})
 	if err != nil {
@@ -55,11 +53,10 @@ func TestOutboundNotBeforeBecomesTheOutboxDueTime(t *testing.T) {
 }
 
 func TestOutboundReplayDeduplicatesWhenTheRecomputedDelayDiffers(t *testing.T) {
-	root := []byte(strings.Repeat("r", 32))
 	effect := testEffect()
 	effect.Deadline = time.Now().Add(time.Hour).UTC()
 	effect.NotBefore = time.Now().Add(5 * time.Second).UTC()
-	lane, err := adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, root, 1)
+	lane, err := adapterapi.NewLaneMetadata(effect.EndpointID, effect.Payload.Target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,8 +65,7 @@ func TestOutboundReplayDeduplicatesWhenTheRecomputedDelayDiffers(t *testing.T) {
 	service, err := NewOutboundService(store, testResolver{snap: EndpointSnapshot{
 		EndpointID: effect.EndpointID, DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected,
 		Capabilities: adapterapi.CapabilityOutbound, Actions: adapterapi.ActionSet(0).With(adapterapi.ActionKindSendMessage),
-		IndexRootID: "index-root-1", IndexSigner: testIndexSigner{root: root, id: "index-root-1"},
-	}}, &testEncryptor{}, &testIDs{})
+	}}, &testIDs{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +76,7 @@ func TestOutboundReplayDeduplicatesWhenTheRecomputedDelayDiffers(t *testing.T) {
 	replay := effect
 	replay.ID, replay.OperationID = "effect-replay", "operation-replay"
 	replay.NotBefore = effect.NotBefore.Add(3 * time.Second)
-	if replay.Lane, err = adapterapi.NewLaneMetadata(replay.EndpointID, replay.Payload.Target, root, 2); err != nil {
+	if replay.Lane, err = adapterapi.NewLaneMetadata(replay.EndpointID, replay.Payload.Target, 2); err != nil {
 		t.Fatal(err)
 	}
 	second, err := service.Submit(context.Background(), SubmitRequest{Effect: replay, CommandID: "cmd-replay-delay", PrincipalID: "principal-a"})

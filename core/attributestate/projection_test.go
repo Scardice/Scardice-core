@@ -208,7 +208,7 @@ func TestListProjectedRejectsCorruptScopedRowsWithoutPartialResult(t *testing.T)
 	}
 }
 
-func TestValidatedProjectionSnapshotFencesPrivacyChangeBeforeScopedPage(t *testing.T) {
+func TestValidatedProjectionSnapshotRejectsGenerationChangeBeforeScopedPage(t *testing.T) {
 	store, database := attributeProjectionTestStore(t)
 	defer database.Close()
 	appendProjectedTestState(t, store, 0, projectedTestState("dice-a", "aa"))
@@ -236,7 +236,7 @@ func TestValidatedProjectionSnapshotFencesPrivacyChangeBeforeScopedPage(t *testi
 		_ = tx.Rollback().Error
 		t.Fatal(err)
 	}
-	if err := tx.Table("projection_control").Where("singleton_id = ?", "default").Update("history_revision", snapshot.HistoryRevision+1).Error; err != nil {
+	if err := tx.Table("projection_control").Where("singleton_id = ?", "default").Update("active_generation", "changed-generation").Error; err != nil {
 		_ = tx.Rollback().Error
 		t.Fatal(err)
 	}

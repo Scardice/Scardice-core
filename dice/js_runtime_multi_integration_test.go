@@ -26,22 +26,21 @@ func TestJsLoadScriptRawRoutesExplicitScriptsAcrossRuntimeLoops(t *testing.T) {
 	if err := os.WriteFile(quickJSPath, []byte(quickJSSource), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	d := &Dice{
-		Logger:       zap.NewNop().Sugar(),
-		BaseConfig:   BaseConfig{DataDir: dataDir},
-		ImSession:    &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
-		DirtyGroups:  new(SyncMap[string, int64]),
-		AttrsManager: &AttrsManager{},
-		ExtRegistry:  new(SyncMap[string, *ExtInfo]),
-	}
-	d.Config.JsEngine = "quickjs"
+	d, _ := newCanonicalTestDice(t)
+	d.Logger = zap.NewNop().Sugar()
+	d.BaseConfig.DataDir = dataDir
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.DataDir = dataDir
+		config.JsEngine = "quickjs"
+		config.JsEnable = true
+	})
 	d.JsInit()
 	t.Cleanup(func() {
 		if d.ExtLoopManager != nil {
 			d.ExtLoopManager.SetLoop(nil)
 		}
 	})
-	if !d.Config.JsEnable {
+	if config := d.Config(); config == nil || !config.JsEnable {
 		t.Fatal("QuickJS initialization failed")
 	}
 

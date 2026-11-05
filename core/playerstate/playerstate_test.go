@@ -3,6 +3,7 @@ package playerstate
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -37,7 +38,7 @@ func TestOwnershipStreamsAndPurgeScopesAreDisjoint(t *testing.T) {
 	}
 }
 
-func TestPlayerReplayAndCompatibilityReadExcludeLocalOverlayAndOtherOwners(t *testing.T) {
+func TestPlayerReplayExcludesLocalOverlayAndOtherOwners(t *testing.T) {
 	events := []PlayerEvent{NewPlayerCreatedV1("dice-1", "group-1", "user-1", "old"), NewPlayerNameChangedV1("new"), NewPlayerPrivilegeChangedV1(60), NewPlayerAutoSetNameTemplateChangedV1("HP{hp}")}
 	state, err := ReplayPlayer(events)
 	if err != nil {
@@ -51,11 +52,6 @@ func TestPlayerReplayAndCompatibilityReadExcludeLocalOverlayAndOtherOwners(t *te
 	payload, err := MarshalPlayerEvents(events)
 	if err != nil || strings.Contains(string(payload), "attrs") || strings.Contains(string(payload), "character") || strings.Contains(string(payload), "valueMap") {
 		t.Fatalf("player payload leaked another owner/local value: %s", payload)
-	}
-	view := state.CompatibilityView()
-	view.Name = "mutated"
-	if state.Name != "new" {
-		t.Fatal("compatibility read aliases authoritative state")
 	}
 }
 
@@ -83,28 +79,90 @@ func TestPlayerDiceSideChangeRoundTripsThroughCommandAndCodec(t *testing.T) {
 	}
 }
 
-func TestOpaqueAttrsAndCharacterReplayPreserveSemanticsWithoutPlaintext(t *testing.T) {
-	secret := []byte("encrypted-attrs-ciphertext")
-	attrsEvents := []GroupUserAttrsEvent{NewGroupUserAttrsCreatedV1("dice-1", "group-1", "user-1"), NewGroupUserAttrsBindingChangedV1("character-1"), NewGroupUserAttrsSetV1("hp", secret, "key-v1"), NewGroupUserAttrsIncrementedV1("hp", 2), NewGroupUserAttrsDeletedV1("old")}
+func TestAttrsAndCharacterReplayPreservePlaintextValues(t *testing.T) {
+	value := []byte("plain-attrs-value")
+	attrsEvents := []GroupUserAttrsEvent{
+		NewGroupUserAttrsCreatedV1("dice-1", "group-1", "user-1"),
+		NewGroupUserAttrsBindingChangedV1("character-1"),
+		NewGroupUserAttrsSetV1("hp", value),
+		NewGroupUserAttrsIncrementedV1("hp", 2),
+		NewGroupUserAttrsDeletedV1("old"),
+	}
 	attrs, err := ReplayGroupUserAttrs(attrsEvents)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if attrs.BindingSheetID != "character-1" || string(attrs.Values["hp"].Ciphertext) != string(secret) || len(attrs.Operations) != 3 {
+	if attrs.BindingSheetID != "character-1" || string(attrs.Values["hp"]) != string(value) || len(attrs.Operations) != 3 {
 		t.Fatalf("attrs state = %#v", attrs)
 	}
-	encoded, err := MarshalGroupUserAttrsEvents(attrsEvents)
-	if err != nil || strings.Contains(string(encoded), "encrypted-attrs-ciphertext") {
-		t.Fatalf("attrs payload exposed sensitive plaintext: %s", encoded)
-	}
-	characters := []CharacterEvent{NewCharacterCreatedV1("dice-1", "user-1", "character-1", "Hero", "coc7"), NewCharacterSheetReplacedV1([]byte("encrypted-character-sheet"), "key-v1")}
+	characterValue := []byte("plain-character-sheet")
+	characters := []CharacterEvent{NewCharacterCreatedV1("dice-1", "user-1", "character-1", "Hero", "coc7"), NewCharacterSheetReplacedV1(characterValue)}
 	character, err := ReplayCharacters(characters)
-	if err != nil || string(character.Sheet.Ciphertext) != "encrypted-character-sheet" {
+	if err != nil || string(character.Sheet) != string(characterValue) {
 		t.Fatalf("character replay = %#v, err = %v", character, err)
 	}
-	characterPayload, err := MarshalCharacterEvents(characters)
-	if err != nil || strings.Contains(string(characterPayload), "encrypted-character-sheet") {
-		t.Fatalf("character payload exposed ciphertext as plaintext field: %s", characterPayload)
+	sheetEvent, err := MarshalCharacterEvent(NewCharacterSheetReplacedV1(characterValue))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeCharacterEvent(EventCharacterSheetReplaced, sheetEvent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundtrip, err := ReplayCharacters([]CharacterEvent{characters[0], decoded})
+	if err != nil || !bytes.Equal(roundtrip.Sheet, characterValue) {
+		t.Fatalf("character roundtrip = %#v, err = %v", roundtrip, err)
+	}
+}
+
+func TestEmptyAttributeValuesRoundTripWithoutBecomingMissing(t *testing.T) {
+	set := NewGroupUserAttrsSetV1("note", []byte{})
+	payload, err := MarshalGroupUserAttrsEvent(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeGroupUserAttrsEvent(EventGroupUserAttrsSet, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attrs, err := ReplayGroupUserAttrs([]GroupUserAttrsEvent{
+		NewGroupUserAttrsCreatedV1("dice", "group", "user"), decoded,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, found := attrs.Clone().Values["note"]
+	if !found || value == nil || !bytes.Equal(value, []byte{}) {
+		t.Fatalf("empty attribute became missing: value=%v found=%v", value, found)
+	}
+	sheet := NewCharacterSheetReplacedV1([]byte{})
+	payload, err = MarshalCharacterEvent(sheet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedSheet, err := DecodeCharacterEvent(EventCharacterSheetReplaced, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	character, err := ReplayCharacters([]CharacterEvent{
+		NewCharacterCreatedV1("dice", "user", "sheet", "Hero", "coc7"), decodedSheet,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cloned := character.Clone(); cloned.Sheet == nil || !bytes.Equal(cloned.Sheet, []byte{}) {
+		t.Fatalf("empty sheet became missing: %v", cloned.Sheet)
+	}
+	payload, err = json.Marshal(character)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projected CharacterState
+	if err := json.Unmarshal(payload, &projected); err != nil {
+		t.Fatal(err)
+	}
+	if projected.Sheet == nil {
+		t.Fatal("empty sheet became missing in persisted character state")
 	}
 }
 
@@ -126,7 +184,7 @@ func TestPlayerRepositoryReplaysProjectionAndScopedCharacterSurvival(t *testing.
 		t.Fatal(err)
 	}
 	meta.EventID, meta.CommandID, meta.CorrelationID = "a-create", "a-command", "a-correlation"
-	if _, err := repo.AppendGroupUserAttrsTyped(ctx, "dice-1", "group-1", "user-1", 0, meta, []GroupUserAttrsEvent{NewGroupUserAttrsCreatedV1("dice-1", "group-1", "user-1"), NewGroupUserAttrsSetV1("hp", []byte("ciphertext"), "key-v1")}); err != nil {
+	if _, err := repo.AppendGroupUserAttrsTyped(ctx, "dice-1", "group-1", "user-1", 0, meta, []GroupUserAttrsEvent{NewGroupUserAttrsCreatedV1("dice-1", "group-1", "user-1"), NewGroupUserAttrsSetV1("hp", []byte("ciphertext"))}); err != nil {
 		t.Fatal(err)
 	}
 	meta.EventID, meta.CommandID, meta.CorrelationID = "c-create", "c-command", "c-correlation"
@@ -142,7 +200,7 @@ func TestPlayerRepositoryReplaysProjectionAndScopedCharacterSurvival(t *testing.
 		t.Fatalf("player projection = %#v, err = %v", projected, err)
 	}
 	attrsProjected, err := ReadProjectedGroupUserAttrs(ctx, store, "dice-1", "group-1", "user-1")
-	if err != nil || string(attrsProjected.Values["hp"].Ciphertext) != "ciphertext" {
+	if err != nil || string(attrsProjected.Values["hp"]) != "ciphertext" {
 		t.Fatalf("attrs projection = %#v, err = %v", attrsProjected, err)
 	}
 	characterProjected, err := ReadProjectedCharacter(ctx, store, "dice-1", "user-1", "character-1")
@@ -150,7 +208,7 @@ func TestPlayerRepositoryReplaysProjectionAndScopedCharacterSurvival(t *testing.
 		t.Fatalf("character projection = %#v, err = %v", characterProjected, err)
 	}
 	attrs, err := repo.LoadGroupUserAttrs(ctx, "dice-1", "group-1", "user-1")
-	if err != nil || string(attrs.Values["hp"].Ciphertext) != "ciphertext" {
+	if err != nil || string(attrs.Values["hp"]) != "ciphertext" {
 		t.Fatalf("attrs before purge = %#v, err = %v", attrs, err)
 	}
 	if _, err := repo.LoadCharacter(ctx, "dice-1", "user-1", "character-1"); err != nil {

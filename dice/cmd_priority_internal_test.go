@@ -1,7 +1,6 @@
 package dice
 
 import (
-	"encoding/json"
 	"reflect"
 	"testing"
 )
@@ -20,6 +19,23 @@ func addTestGameSystem(d *Dice, name string, relatedExt ...string) {
 		d.GameSystemMap = new(SyncMap[string, *GameSystemTemplate])
 	}
 	d.GameSystemMap.Store(name, tmpl)
+}
+
+func newPriorityTestGroup(t *testing.T, d *Dice, system string, activated []string, label string) *MsgContext {
+	t.Helper()
+	endpoint := newCanonicalTestEndpoint(d, "QQ:priority-bot")
+	message := newGroupMsg("QQ-Group:priority", "QQ:priority-user", "")
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, message, label)
+	if err := ctx.Group.SetSystem(system); err != nil {
+		t.Fatalf("set priority fixture system: %v", err)
+	}
+	for _, name := range activated {
+		if err := ctx.Group.SetExtension(name, true); err != nil {
+			t.Fatalf("activate priority fixture extension %q: %v", name, err)
+		}
+	}
+	ctx.IsPrivate = true
+	return ctx
 }
 
 func TestCommandExtensionOrder(t *testing.T) {
@@ -74,19 +90,14 @@ func TestCommandExtensionOrder(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			d := newTestDice(tt.exts)
+			d, _ := newCanonicalTestDice(t)
+			installCanonicalTestExtensions(d, tt.exts...)
 			if tt.system != "" {
 				addTestGameSystem(d, tt.system, tt.relatedExt...)
 			}
-			group := newTestGroupInfo()
-			activated := make([]*ExtInfo, 0, len(tt.activated))
-			for _, name := range tt.activated {
-				activated = append(activated, d.ExtFind(name, false))
-			}
-			group.SetActivatedExtList(activated, d)
-			group.System = tt.system
+			ctx := newPriorityTestGroup(t, d, tt.system, tt.activated, "extension-order")
 
-			got := extListToNames(commandExtensionOrder(group, d))
+			got := extListToNames(commandExtensionOrder(ctx.Group, d))
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("commandExtensionOrder() = %v, want %v", got, tt.want)
 			}
@@ -105,38 +116,10 @@ func TestCommandPriorityFollowsSelectedGameSystem(t *testing.T) {
 		command       string
 		wantExtension string
 	}{
-		{
-			name:          "coc ra wins over cpr",
-			system:        "coc7",
-			relatedExt:    []string{"coc7"},
-			activated:     []string{"cpr", "coc7", "dnd5e"},
-			command:       "ra",
-			wantExtension: "coc7",
-		},
-		{
-			name:          "cpr ra wins inside cpr tier",
-			system:        "cpr",
-			relatedExt:    []string{"coc7", "cpr"},
-			activated:     []string{"cpr", "coc7", "dnd5e"},
-			command:       "ra",
-			wantExtension: "cpr",
-		},
-		{
-			name:          "dnd st wins over generic coc st",
-			system:        "dnd5e",
-			relatedExt:    []string{"dnd5e"},
-			activated:     []string{"coc7", "dnd5e", "cpr"},
-			command:       "st",
-			wantExtension: "dnd5e",
-		},
-		{
-			name:          "cpr falls back to generic coc st in its tier",
-			system:        "cpr",
-			relatedExt:    []string{"coc7", "cpr"},
-			activated:     []string{"dnd5e", "cpr", "coc7"},
-			command:       "st",
-			wantExtension: "coc7",
-		},
+		{name: "coc ra wins over cpr", system: "coc7", relatedExt: []string{"coc7"}, activated: []string{"cpr", "coc7", "dnd5e"}, command: "ra", wantExtension: "coc7"},
+		{name: "cpr ra wins inside cpr tier", system: "cpr", relatedExt: []string{"coc7", "cpr"}, activated: []string{"cpr", "coc7", "dnd5e"}, command: "ra", wantExtension: "cpr"},
+		{name: "dnd st wins over generic coc st", system: "dnd5e", relatedExt: []string{"dnd5e"}, activated: []string{"coc7", "dnd5e", "cpr"}, command: "st", wantExtension: "dnd5e"},
+		{name: "cpr falls back to generic coc st in its tier", system: "cpr", relatedExt: []string{"coc7", "cpr"}, activated: []string{"dnd5e", "cpr", "coc7"}, command: "st", wantExtension: "coc7"},
 	}
 
 	for _, tt := range tests {
@@ -157,16 +140,12 @@ func TestCommandPriorityFollowsSelectedGameSystem(t *testing.T) {
 						},
 					}
 				}
-				exts = append(exts, &ExtInfo{
-					Name:           name,
-					CmdMap:         cmdMap,
-					DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
-				})
+				exts = append(exts, &ExtInfo{Name: name, CmdMap: cmdMap, DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}}})
 			}
 
-			d := newTestDice(exts)
+			d, _ := newCanonicalTestDice(t)
+			installCanonicalTestExtensions(d, exts...)
 			d.CmdMap = CmdMapCls{}
-			// 真实运行期三套规则模板都会注册，仅当前规则由 group.System 选定。
 			for _, name := range []string{"coc7", "dnd5e", "cpr"} {
 				if name == tt.system {
 					addTestGameSystem(d, name, tt.relatedExt...)
@@ -174,23 +153,9 @@ func TestCommandPriorityFollowsSelectedGameSystem(t *testing.T) {
 				}
 				addTestGameSystem(d, name, name)
 			}
-			group := newTestGroupInfo()
-			activated := make([]*ExtInfo, 0, len(tt.activated))
-			for _, name := range tt.activated {
-				activated = append(activated, d.ExtFind(name, false))
-			}
-			group.SetActivatedExtList(activated, d)
-			group.Active = true
-			group.System = tt.system
-			session := &IMSession{Parent: d}
-			ctx := &MsgContext{
-				Dice:      d,
-				Session:   session,
-				Group:     group,
-				IsPrivate: true,
-			}
+			ctx := newPriorityTestGroup(t, d, tt.system, tt.activated, "selected-system")
 
-			if session.commandSolve(ctx, &Message{}, &CmdArgs{Command: tt.command}).Status != commandSolveSolved {
+			if d.ImSession.commandSolve(ctx, &Message{}, &CmdArgs{Command: tt.command}).Status != commandSolveSolved {
 				t.Fatal("expected command to be solved")
 			}
 			if calls[tt.wantExtension] != 1 {
@@ -210,25 +175,26 @@ func TestCommandPrioritySurvivesGroupReload(t *testing.T) {
 
 	coc := &ExtInfo{Name: "coc7"}
 	cpr := &ExtInfo{Name: "cpr"}
-	d := newTestDice([]*ExtInfo{coc, cpr})
+	d, _ := newCanonicalTestDice(t)
+	installCanonicalTestExtensions(d, coc, cpr)
 	addTestGameSystem(d, "cpr", "coc7", "cpr")
+	endpoint := newCanonicalTestEndpoint(d, "QQ:priority-bot")
+	message := newGroupMsg("QQ-Group:priority-reload", "QQ:priority-user", "")
+	withCanonicalTestMessageContext(t, d, endpoint, message, "seed-priority-reload", func(ctx *MsgContext) error {
+		if err := ctx.Group.SetSystem("cpr"); err != nil {
+			return err
+		}
+		if err := ctx.Group.SetExtension("cpr", true); err != nil {
+			return err
+		}
+		return ctx.Group.SetExtension("coc7", true)
+	})
 
-	group := newTestGroupInfo()
-	group.System = "cpr"
-	group.SetActivatedExtList([]*ExtInfo{cpr, coc}, d)
-	data, err := json.Marshal(group)
-	if err != nil {
-		t.Fatalf("marshal group: %v", err)
-	}
-
-	reloaded := &GroupInfo{}
-	if err := json.Unmarshal(data, reloaded); err != nil {
-		t.Fatalf("unmarshal group: %v", err)
-	}
-	got := extListToNames(commandExtensionOrder(reloaded, d))
+	reloaded := newCanonicalTestMessageContext(t, d, endpoint, message, "read-priority-reload")
+	got := extListToNames(commandExtensionOrder(reloaded.Group, d))
 	want := []string{"cpr", "coc7"}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("command order after reload = %v, want %v", got, want)
+		t.Fatalf("command order after projection reload = %v, want %v", got, want)
 	}
 }
 
@@ -242,16 +208,15 @@ func TestCommandPrioritySurvivesJSWrapperRefresh(t *testing.T) {
 		IsWrapper:      true,
 		DefaultSetting: &ExtDefaultSettingItem{DisabledCommand: map[string]bool{}},
 	}
-	d := newTestDice([]*ExtInfo{coc, cprWrapper})
+	d, _ := newCanonicalTestDice(t)
+	installCanonicalTestExtensions(d, coc, cprWrapper)
 	d.JsExtRegistry = new(SyncMap[string, *ExtInfo])
 	d.JsExtRegistry.Store("cpr", &ExtInfo{Name: "cpr", CmdMap: CmdMapCls{"ra": {Name: "old"}}})
 	addTestGameSystem(d, "cpr", "coc7", "cpr")
-	group := newTestGroupInfo()
-	group.System = "cpr"
-	group.SetActivatedExtList([]*ExtInfo{cprWrapper, coc}, d)
+	ctx := newPriorityTestGroup(t, d, "cpr", []string{"cpr", "coc7"}, "wrapper-refresh")
 
 	d.JsExtRegistry.Store("cpr", &ExtInfo{Name: "cpr", CmdMap: CmdMapCls{"ra": {Name: "reloaded"}}})
-	got := extListToNames(commandExtensionOrder(group, d))
+	got := extListToNames(commandExtensionOrder(ctx.Group, d))
 	want := []string{"cpr", "coc7"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("command order after JS wrapper refresh = %v, want %v", got, want)
@@ -309,17 +274,13 @@ func TestCommandReceivedHooksStillUseAllActivatedExtensions(t *testing.T) {
 		},
 	}
 	lowPriority := newExt("unrelated")
-	d := newTestDice([]*ExtInfo{coc, lowPriority})
+	d, _ := newCanonicalTestDice(t)
+	installCanonicalTestExtensions(d, coc, lowPriority)
 	d.CmdMap = CmdMapCls{}
 	addTestGameSystem(d, "fu", "coc7")
-	group := newTestGroupInfo()
-	group.Active = true
-	group.System = "fu"
-	group.SetActivatedExtList([]*ExtInfo{lowPriority, coc}, d)
-	session := &IMSession{Parent: d}
-	ctx := &MsgContext{Dice: d, Session: session, Group: group, IsPrivate: true}
+	ctx := newPriorityTestGroup(t, d, "fu", []string{"unrelated", "coc7"}, "all-hooks")
 
-	if session.commandSolve(ctx, &Message{}, &CmdArgs{Command: "st"}).Status != commandSolveSolved {
+	if d.ImSession.commandSolve(ctx, &Message{}, &CmdArgs{Command: "st"}).Status != commandSolveSolved {
 		t.Fatal("expected st command to be solved")
 	}
 	if hookCalls["coc7"] != 1 || hookCalls["unrelated"] != 1 {

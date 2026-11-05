@@ -63,25 +63,17 @@ type CensorManager struct {
 }
 
 func (d *Dice) NewCensorManager() {
+	config := d.Config()
 	cm := CensorManager{
 		Censor: &censor.Censor{
-			CaseSensitive:  d.Config.CensorCaseSensitive,
-			MatchPinyin:    d.Config.CensorMatchPinyin,
-			FilterRegexStr: d.Config.CensorFilterRegexStr,
+			CaseSensitive:  config.CensorCaseSensitive,
+			MatchPinyin:    config.CensorMatchPinyin,
+			FilterRegexStr: config.CensorFilterRegexStr,
 		},
 		DB: d.DBOperator,
 	}
 	cm.Parent = d
 	d.CensorManager = &cm
-	if d.Config.CensorThresholds == nil {
-		(&d.Config).CensorThresholds = make(map[censor.Level]int)
-	}
-	if d.Config.CensorHandlers == nil {
-		(&d.Config).CensorHandlers = make(map[censor.Level]uint8)
-	}
-	if d.Config.CensorScores == nil {
-		(&d.Config).CensorScores = make(map[censor.Level]int)
-	}
 	cm.Load(d)
 }
 
@@ -225,7 +217,8 @@ type MsgCheckResult struct {
 
 func (d *Dice) CensorMsg(mctx *MsgContext, msg *Message, checkContent string, sendContent string) (hit bool, hitWords []string, needToTerminate bool, newContent string) {
 	log := d.Logger
-	checkResult, err := d.CensorManager.checkForCensorMsg(mctx, msg, checkContent, d.Config.CensorThresholds)
+	config := d.Config()
+	checkResult, err := d.CensorManager.checkForCensorMsg(mctx, msg, checkContent, config.CensorThresholds)
 	if err != nil {
 		// FIXME: 尽管这种情况比较少，但是是否要提供一个配置项，用来控制默认是跳过还是拦截吗？
 		log.Warnf("拦截系统出错(%s)，来自<%s>(%s)的消息跳过了检查", err.Error(), msg.Sender.Nickname, msg.Sender.UserID)
@@ -254,11 +247,22 @@ func (d *Dice) applyCensorResult(mctx *MsgContext, msg *Message, checkContent, s
 	}
 
 	mctx.Censored = true
-	groupInfo, ok := mctx.Session.ServiceAtNew.Load(msg.GroupID)
-	if !ok {
-		d.Logger.Warn("Dice CenSor获取GroupInfo失败")
+	var groupInfo *GroupInfo
+	if msg.MessageType == "group" {
+		var err error
+		groupInfo, err = mctx.ResolveGroup(mctx.domainContext(), msg.GroupID)
+		if err == nil && groupInfo.Version() == 0 {
+			err = fmt.Errorf("censor: group %s is unavailable", msg.GroupID)
+		}
+		if err != nil {
+			mctx.setExecutionError(err)
+			d.Logger.Errorf("敏感词处理读取群状态失败: %v", err)
+			return hit, hitWords, needToTerminate, newContent
+		}
 	}
-	thresholds := d.Config.CensorThresholds
+	config := d.Config()
+	thresholds := config.CensorThresholds
+	ban := config.BanList
 
 	// 保证按程度依次降低来处理
 	var tempLevels censor.Levels
@@ -273,107 +277,128 @@ func (d *Dice) applyCensorResult(mctx *MsgContext, msg *Message, checkContent, s
 		if d.CensorManager.DB == nil {
 			thresholdExceeded = checkResult.memoryThresholdExceeded && checkResult.memoryThresholdLevel == level
 		}
-		if thresholdExceeded {
-			// 处理完跳出，多个等级超过阈值的处理仅进行最高的处理
-			// 需要终止后续动作
-			needToTerminate = true
-			// 清空此用户该等级计数
-			if d.CensorManager.DB != nil {
-				service.CensorClearLevelCount(d.CensorManager.DB, msg.Sender.UserID, level)
+		if !thresholdExceeded {
+			continue
+		}
+		// 处理完跳出，多个等级超过阈值的处理仅进行最高的处理
+		// 需要终止后续动作
+		needToTerminate = true
+		// 清空此用户该等级计数
+		if d.CensorManager.DB != nil {
+			service.CensorClearLevelCount(d.CensorManager.DB, msg.Sender.UserID, level)
+		}
+		// 该等级敏感词超过阈值，执行操作
+		handler := config.CensorHandlers[level]
+		levelText := censor.LevelText[level]
+		var banSettings BanListInfo
+		if handler&((1<<BanUser)|(1<<BanGroup)|(1<<BanInviter)) != 0 {
+			var settingsErr error
+			banSettings, settingsErr = ban.settingsForContext(mctx)
+			if settingsErr != nil {
+				mctx.setExecutionError(settingsErr)
+				d.Logger.Errorf("敏感词处理读取名单设置失败: %v", settingsErr)
+				return hit, hitWords, needToTerminate, newContent
 			}
-			// 该等级敏感词超过阈值，执行操作
-			handler := d.Config.CensorHandlers[level]
-			levelText := censor.LevelText[level]
-			if handler&(1<<SendWarning) != 0 {
-				tmplText := fmt.Sprintf("核心:拦截_警告内容_%s级", censor.LevelText[level])
-				ReplyToSenderNoCheck(mctx, msg, DiceFormatTmpl(mctx, tmplText))
-			}
-			if handler&(1<<SendEncodedDetails) != 0 {
-				ReplyToSenderNoCheck(mctx, msg, formatCensorHitDetails(levelText, checkResult.CurSensitiveWords, checkContent))
-			}
-			if handler&(1<<SendNotice) != 0 {
-				// 向通知列表/邮件发送通知
-				var text string
-				switch msg.MessageType {
-				case "group":
-					text = fmt.Sprintf(
-						"群(%s)内<%s>(%s)触发<%s>敏感词拦截",
-						groupInfo.GroupID,
-						msg.Sender.Nickname,
-						msg.Sender.UserID,
-						levelText,
-					)
-				case "private":
-					text = fmt.Sprintf(
-						"<%s>(%s)触发<%s>敏感词拦截",
-						msg.Sender.Nickname,
-						msg.Sender.UserID,
-						levelText,
-					)
-				}
-				mctx.Notice(text, NoticeTypeCensor)
-			}
-			if handler&(1<<BanUser) != 0 {
-				// 拉黑用户
-				(&d.Config).BanList.AddScoreBase(
+		}
+		if handler&(1<<SendWarning) != 0 {
+			tmplText := fmt.Sprintf("核心:拦截_警告内容_%s级", censor.LevelText[level])
+			ReplyToSenderNoCheck(mctx, msg, DiceFormatTmpl(mctx, tmplText))
+		}
+		if handler&(1<<SendEncodedDetails) != 0 {
+			ReplyToSenderNoCheck(mctx, msg, formatCensorHitDetails(levelText, checkResult.CurSensitiveWords, checkContent))
+		}
+		if handler&(1<<SendNotice) != 0 {
+			// 向通知列表/邮件发送通知
+			var text string
+			switch msg.MessageType {
+			case "group":
+				text = fmt.Sprintf(
+					"群(%s)内<%s>(%s)触发<%s>敏感词拦截",
+					groupInfo.GroupID(),
+					msg.Sender.Nickname,
 					msg.Sender.UserID,
-					d.Config.BanList.ThresholdBan,
-					"敏感词审查",
-					"触发<"+levelText+">敏感词",
-					mctx,
+					levelText,
+				)
+			case "private":
+				text = fmt.Sprintf(
+					"<%s>(%s)触发<%s>敏感词拦截",
+					msg.Sender.Nickname,
+					msg.Sender.UserID,
+					levelText,
 				)
 			}
-			if handler&(1<<BanGroup) != 0 {
-				// 拉黑群
-				if msg.MessageType == "group" {
-					(&d.Config).BanList.AddScoreBase(
-						msg.GroupID,
-						d.Config.BanList.ThresholdBan,
-						"敏感词审查",
-						"触发<"+levelText+">敏感词",
-						mctx,
-					)
-				}
-			}
-			if handler&(1<<BanInviter) != 0 {
-				// 拉黑邀请人
-				if msg.MessageType == "group" {
-					(&d.Config).BanList.AddScoreBase(
-						groupInfo.InviteUserID,
-						d.Config.BanList.ThresholdBan,
-						"敏感词审查",
-						"触发<"+levelText+">敏感词",
-						mctx,
-					)
-				}
-			}
-			if handler&(1<<AddScore) != 0 {
-				score, ok := d.Config.CensorScores[level]
-				if !ok {
-					score = 100
-				}
-				// 仅增加怒气值
-				if msg.MessageType == "group" {
-					(&d.Config).BanList.AddScoreByCensor(
-						msg.Sender.UserID,
-						int64(score),
-						groupInfo.GroupID,
-						levelText,
-						mctx,
-					)
-				}
-			}
-			// 只处理一次
-			d.Logger.Infof(
-				"<%s>(%s)发送的「%s」触发最高<%s>级敏感词（%s），触发次数已经超过阈值，进行处理",
-				msg.Sender.Nickname,
-				msg.Sender.UserID,
-				msg.Message,
-				censor.LevelText[level],
-				strings.Join(checkResult.CurSensitiveWords, "|"),
-			)
-			break
+			mctx.Notice(text, NoticeTypeCensor)
 		}
+		if handler&(1<<BanUser) != 0 {
+			// 拉黑用户
+			if _, err := ban.AddScoreBaseWithError(
+				msg.Sender.UserID,
+				banSettings.ThresholdBan,
+				"敏感词审查",
+				"触发<"+levelText+">敏感词",
+				mctx,
+			); err != nil {
+				mctx.setExecutionError(err)
+				d.Logger.Errorf("敏感词处理拉黑用户失败: %v", err)
+				return hit, hitWords, needToTerminate, newContent
+			}
+		}
+		if handler&(1<<BanGroup) != 0 && msg.MessageType == "group" {
+			// 拉黑群
+			if _, err := ban.AddScoreBaseWithError(
+				msg.GroupID,
+				banSettings.ThresholdBan,
+				"敏感词审查",
+				"触发<"+levelText+">敏感词",
+				mctx,
+			); err != nil {
+				mctx.setExecutionError(err)
+				d.Logger.Errorf("敏感词处理拉黑群组失败: %v", err)
+				return hit, hitWords, needToTerminate, newContent
+			}
+		}
+		if handler&(1<<BanInviter) != 0 && msg.MessageType == "group" {
+			// 拉黑邀请人
+			if _, err := ban.AddScoreBaseWithError(
+				groupInfo.InviteUserID(),
+				banSettings.ThresholdBan,
+				"敏感词审查",
+				"触发<"+levelText+">敏感词",
+				mctx,
+			); err != nil {
+				mctx.setExecutionError(err)
+				d.Logger.Errorf("敏感词处理拉黑邀请人失败: %v", err)
+				return hit, hitWords, needToTerminate, newContent
+			}
+		}
+		if handler&(1<<AddScore) != 0 && msg.MessageType == "group" {
+			score, ok := config.CensorScores[level]
+			if !ok {
+				score = 100
+			}
+			// 仅增加怒气值
+			if err := ban.AddScoreByCensorForContext(
+				msg.Sender.UserID,
+				int64(score),
+				groupInfo.GroupID(),
+				levelText,
+				mctx,
+			); err != nil {
+				mctx.setExecutionError(err)
+				d.Logger.Errorf("敏感词处理累计评分失败: %v", err)
+				return hit, hitWords, needToTerminate, newContent
+			}
+		}
+		// 只处理一次
+		d.Logger.Infof(
+			"<%s>(%s)发送的「%s」触发最高<%s>级敏感词（%s），触发次数已经超过阈值，进行处理",
+			msg.Sender.Nickname,
+			msg.Sender.UserID,
+			msg.Message,
+			censor.LevelText[level],
+			strings.Join(checkResult.CurSensitiveWords, "|"),
+		)
+		break
 	}
 	return hit, hitWords, needToTerminate, newContent
 }

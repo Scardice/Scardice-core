@@ -21,12 +21,11 @@ func TestExpiredDispatchIsSettledWhileProjectorsAreRegistered(t *testing.T) {
 	}
 	defer db.Close()
 	clock := &queueTestClock{now: time.Unix(100, 0).UTC()}
-	store := NewStore(db, WithClock(clock), WithPayloadCodec(queueTestCodec{}), WithProjection(projectionDescriptor("v1", projectionApply)))
+	store := NewStore(db, WithClock(clock), WithProjection(projectionDescriptor("v1", projectionApply)))
 	ctx := context.Background()
 
 	effect := newOutboxTestEffect("stopped-mid-dispatch", "stopped-lane")
 	effect.RiskClass = RiskNonIdempotentAfterDispatch
-	effect.PayloadExpiresAt = clock.Now().Add(5 * time.Minute)
 	if _, err := store.AcceptOutbox(ctx, effect); err != nil {
 		t.Fatal(err)
 	}

@@ -17,7 +17,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/samber/lo"
+	ds "github.com/sealdice/dicescript"
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
 	"gopkg.in/yaml.v3"
@@ -267,35 +267,39 @@ func GetRandomFreePort() (int, error) {
 	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
-// SetCardType 这几个先不动，后面改名字或者移除
-func SetCardType(mctx *MsgContext, curType string) {
-	am := mctx.Dice.AttrsManager
-	curAttrs := lo.Must(am.LoadByCtx(mctx))
-	curAttrs.SetSheetType(curType)
+// SetCardType updates the current character sheet type and template version.
+func SetCardType(mctx *MsgContext, curType string) error {
+	curAttrs, err := mctx.Dice.AttrsManager.LoadByCtx(mctx)
+	if err != nil {
+		return err
+	}
+	if err = curAttrs.SetSheetType(curType); err != nil {
+		return err
+	}
 	if tmpl, _ := mctx.Dice.GameSystemMap.Load(curType); tmpl != nil && strings.TrimSpace(tmpl.Version) != "" {
-		writeAttrsTemplateVersion(curAttrs, tmpl.Version)
+		return curAttrs.Store(attrsTemplateVersionKey, ds.NewStrVal(tmpl.Version))
 	}
+	return nil
 }
 
-func ReadCardType(mctx *MsgContext) string {
-	am := mctx.Dice.AttrsManager
-	curAttrs := lo.Must(am.LoadByCtx(mctx))
-	return curAttrs.SheetType
+func ReadCardType(mctx *MsgContext) (string, error) {
+	curAttrs, err := mctx.Dice.AttrsManager.LoadByCtx(mctx)
+	if err != nil {
+		return "", err
+	}
+	return curAttrs.SheetType(), nil
 }
 
-func ReadCardTypeEx(mctx *MsgContext, curType string) string {
-	var extra string
-
-	am := mctx.Dice.AttrsManager
-	curAttrs := lo.Must(am.LoadByCtx(mctx))
-	cardType := curAttrs.SheetType
-
-	if cardType != "" {
-		if cardType != curType {
-			extra = fmt.Sprintf("\n这似乎是一张 %s 人物卡，请确认当前游戏类型", cardType)
-		}
+func ReadCardTypeEx(mctx *MsgContext, curType string) (string, error) {
+	curAttrs, err := mctx.Dice.AttrsManager.LoadByCtx(mctx)
+	if err != nil {
+		return "", err
 	}
-	return extra
+	cardType := curAttrs.SheetType()
+	if cardType != "" && cardType != curType {
+		return fmt.Sprintf("\n这似乎是一张 %s 人物卡，请确认当前游戏类型", cardType), nil
+	}
+	return "", nil
 }
 
 // IsBot reports whether a user is manually marked as a bot or reported as one
@@ -304,7 +308,7 @@ func (group *GroupInfo) IsBot(userID string, detectedAsRobot bool) bool {
 	if detectedAsRobot {
 		return true
 	}
-	if group != nil && group.BotList != nil && group.BotList.Exists(userID) {
+	if group != nil && group.BotExists(userID) {
 		return true
 	}
 	return false
@@ -351,11 +355,11 @@ func GetCtxProxyAtPosRaw(ctx *MsgContext, cmdArgs *CmdArgs, pos int, setTempVar 
 			if mctx.Player != ctx.Player {
 				SetTempVars(mctx, "???")
 			} else {
-				SetTempVars(mctx, mctx.Player.Name)
+				SetTempVars(mctx, mctx.Player.Name())
 			}
 		}
 
-		if mctx.Player.UserID == ctx.Player.UserID {
+		if mctx.Player.UserID() == ctx.Player.UserID() {
 			// 并非代骰
 			ctx.DelegateText = ""
 		}
@@ -533,63 +537,78 @@ func CheckDialErr(err error) syscall.Errno {
 	return 1 // 失败 但是原因不明
 }
 
-// CreateTempCtx 制作ctx，需要msg.MessageType和msg.Sender.UserId，以及ep.Session
+// CreateTempCtx constructs a detached formatting context. It deliberately
+// does not inherit a concurrently executing JS callback or open a durable
+// root. Callers with a proven message execution must use
+// CreateTempCtxInExecution explicitly.
 func CreateTempCtx(ep *EndPointInfo, msg *Message) *MsgContext {
-	if ep == nil {
-		panic("CreateTempCtx: endpoint is nil")
-	}
-	if msg == nil {
-		panic("CreateTempCtx: message is nil")
-	}
-
-	session := ep.Session
-	if session == nil {
-		panic(fmt.Sprintf("CreateTempCtx: endpoint %s (%s) has nil session", ep.ID, ep.UserID))
-	}
-
-	liveEp, err := session.ResolveLiveEndpoint(ep)
+	ctx, err := CreateTempCtxInExecution(nil, ep, msg)
 	if err != nil {
 		panic("CreateTempCtx: " + err.Error())
 	}
-	session = liveEp.Session
-	if session == nil || session.Parent == nil {
-		panic(fmt.Sprintf("CreateTempCtx: endpoint %s (%s) runtime not bound", liveEp.ID, liveEp.UserID))
-	}
-	// if msg.Sender.UserID == "" {
-	//	return nil
-	// }
-
-	ctx := &MsgContext{
-		MessageType: msg.MessageType, EndPoint: liveEp, Session: session, Dice: session.Parent,
-		uiTestSplitLength: msg.TestUIOutputSplitLength, uiTestSplitLengthSet: msg.TestUIOutputSplitLengthSet,
-	}
-
-	switch msg.MessageType {
-	case "private":
-		// msg.Sender.UserId 确保存在
-		ctx.Group, ctx.Player = GetPlayerInfoBySender(ctx, msg)
-		if ctx.Player == nil {
-			ctx.Player = &GroupPlayerInfo{}
-		}
-		if ctx.Player.Name == "" {
-			ctx.Player.Name = "未知用户"
-		}
-		SetTempVars(ctx, ctx.Player.Name)
-	case "group":
-		ctx.Group, ctx.Player = GetPlayerInfoBySender(ctx, msg)
-		if ctx.Player == nil {
-			ctx.Player = &GroupPlayerInfo{}
-		}
-		if ctx.Player.Name == "" {
-			ctx.Player.Name = "未知用户"
-		}
-		SetTempVars(ctx, ctx.Player.Name)
-	default:
-		SetTempVars(ctx, ctx.Player.Name)
-		return ctx
-	}
-
 	return ctx
+}
+
+func CreateTempCtxInExecution(parent *MsgContext, ep *EndPointInfo, msg *Message) (*MsgContext, error) {
+	if ep == nil {
+		return nil, errors.New("endpoint is nil")
+	}
+	if msg == nil {
+		return nil, errors.New("message is nil")
+	}
+	session := ep.Session
+	if session == nil {
+		return nil, fmt.Errorf("endpoint %s (%s) has nil session", ep.ID, ep.UserID)
+	}
+	liveEndpoint, err := session.ResolveLiveEndpoint(ep)
+	if err != nil {
+		return nil, err
+	}
+	session = liveEndpoint.Session
+	if session == nil || session.Parent == nil {
+		return nil, fmt.Errorf("endpoint %s (%s) runtime not bound", liveEndpoint.ID, liveEndpoint.UserID)
+	}
+	ctx := &MsgContext{
+		MessageType:          msg.MessageType,
+		EndPoint:             liveEndpoint,
+		Session:              session,
+		Dice:                 session.Parent,
+		uiTestSplitLength:    msg.TestUIOutputSplitLength,
+		uiTestSplitLengthSet: msg.TestUIOutputSplitLengthSet,
+	}
+	if parent != nil {
+		ctx.callbackTransaction = parent.callbackTransaction
+		ctx.callbackMetadata = parent.callbackMetadata
+		ctx.facadeRegistry = parent.facadeRegistry
+		ctx.executionContext = parent.domainContext()
+		ctx.executionParent = parent
+	}
+	switch msg.MessageType {
+	case "private", "group":
+		if parent != nil {
+			ctx.Group, ctx.Player, err = GetPlayerInfoBySender(ctx, msg)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			name := msg.Sender.Nickname
+			if name == "" {
+				name = "未知用户"
+			}
+			ctx.Player = newDetachedGroupPlayerInfo(session.Parent.BaseConfig.Name, msg.GroupID, msg.Sender.UserID, name)
+		}
+		name := ctx.Player.Name()
+		if name == "" {
+			name = "未知用户"
+			if err = ctx.Player.SetName(name); err != nil {
+				return nil, err
+			}
+		}
+		SetTempVars(ctx, name)
+	default:
+		SetTempVars(ctx, "")
+	}
+	return ctx, nil
 }
 
 // UnpackGroupUserId 分离群组ID和用户ID的连写
@@ -650,7 +669,6 @@ func UnpackGroupUserId(id string) (groupIdPart, userIdPart string, ok bool) {
 			}
 		}
 	}
-
 	return "", "", false
 }
 
@@ -662,15 +680,16 @@ const (
 )
 
 func (d *Dice) getTargetVmEngineVersion(targetType string) string {
+	config := d.Config()
 	switch targetType {
 	case VMVersionReply:
-		return d.Config.VMVersionForReply
+		return config.VMVersionForReply
 	case VMVersionDeck:
-		return d.Config.VMVersionForDeck
+		return config.VMVersionForDeck
 	case VMVersionCustomText:
-		return d.Config.VMVersionForCustomText
+		return config.VMVersionForCustomText
 	case VmVersionMsg:
-		return d.Config.VMVersionForMsg
+		return config.VMVersionForMsg
 	default:
 		return "v2"
 	}

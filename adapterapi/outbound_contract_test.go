@@ -10,7 +10,7 @@ import (
 
 func testLane(t *testing.T, target EffectTarget) LaneMetadata {
 	t.Helper()
-	lane, err := NewLaneMetadata("endpoint-1", target, []byte("index-root"), 1)
+	lane, err := NewLaneMetadata("endpoint-1", target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,46 +32,102 @@ func TestVersionedOutboundPayloadsValidateAndBuildLaneMetadata(t *testing.T) {
 	if effect.Payload.Kind != EffectPayloadPersonText || effect.Payload.Target.Conversation != "person-1" {
 		t.Fatalf("payload = %#v", effect.Payload)
 	}
+	effect.Payload.Target.Conversation = "person-2"
+	if !errors.Is(effect.Validate(), ErrInvalidContract) {
+		t.Fatal("effect target changed without changing its lane")
+	}
 }
 func TestLaneMetadataIdentityUsesEndpointAndTargetNotSequence(t *testing.T) {
-	root := []byte("index-root")
 	target := EffectTarget{Kind: TargetGroup, Conversation: "group-1"}
-	sameLane, err := NewLaneMetadata("endpoint-1", target, root, 7)
+	sameLane, err := NewLaneMetadata("endpoint-1", target, 7)
 	if err != nil {
 		t.Fatal(err)
 	}
-	retriedLane, err := NewLaneMetadata("endpoint-1", target, root, 8)
+	retriedLane, err := NewLaneMetadata("endpoint-1", target, 8)
 	if err != nil {
 		t.Fatal(err)
 	}
-	otherTargetLane, err := NewLaneMetadata("endpoint-1", EffectTarget{Kind: TargetGroup, Conversation: "group-2"}, root, 7)
+	otherTargetLane, err := NewLaneMetadata("endpoint-1", EffectTarget{Kind: TargetGroup, Conversation: "group-2"}, 7)
 	if err != nil {
 		t.Fatal(err)
 	}
-	otherEndpointLane, err := NewLaneMetadata("endpoint-2", target, root, 7)
+	otherEndpointLane, err := NewLaneMetadata("endpoint-2", target, 7)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if sameLane.TargetDigest != retriedLane.TargetDigest || sameLane.Key != retriedLane.Key || sameLane.MAC != retriedLane.MAC {
+	if sameLane.Key != retriedLane.Key {
 		t.Fatalf("sequence changed lane identity: first=%+v retry=%+v", sameLane, retriedLane)
 	}
 	if sameLane.Sequence == retriedLane.Sequence {
 		t.Fatal("sequence did not remain transport metadata")
 	}
 	for _, lane := range []LaneMetadata{sameLane, retriedLane} {
-		if err := lane.Verify(root, "endpoint-1", target); err != nil {
+		if err := lane.Verify("endpoint-1", target); err != nil {
 			t.Fatalf("lane verification failed: %+v: %v", lane, err)
 		}
 	}
-	if sameLane.TargetDigest == otherTargetLane.TargetDigest || sameLane.Key == otherTargetLane.Key || sameLane.MAC == otherTargetLane.MAC {
+	if sameLane.Key == otherTargetLane.Key {
 		t.Fatalf("target collision: same=%+v other=%+v", sameLane, otherTargetLane)
 	}
-	if sameLane.TargetDigest == otherEndpointLane.TargetDigest || sameLane.Key == otherEndpointLane.Key || sameLane.MAC == otherEndpointLane.MAC {
+	if sameLane.Key == otherEndpointLane.Key {
 		t.Fatalf("endpoint collision: same=%+v other=%+v", sameLane, otherEndpointLane)
 	}
 	if err := sameLane.Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLaneMetadataUsesCanonicalPlaintextConversationIdentity(t *testing.T) {
+	tests := []struct {
+		name   string
+		target EffectTarget
+		want   string
+	}{
+		{"person", EffectTarget{Kind: TargetPerson, Conversation: "same-id"}, `["endpoint-1","person","same-id"]`},
+		{"group", EffectTarget{Kind: TargetGroup, Conversation: "same-id"}, `["endpoint-1","group","same-id"]`},
+		{"member action", EffectTarget{Kind: TargetGroup, Conversation: "same-id", Member: "member-1"}, `["endpoint-1","group","same-id"]`},
+		{"other member action", EffectTarget{Kind: TargetGroup, Conversation: "same-id", Member: "member-2"}, `["endpoint-1","group","same-id"]`},
+		{"raw", EffectTarget{Kind: TargetRaw, Raw: "same-id"}, `["endpoint-1","raw","same-id"]`},
+		{"escaped target", EffectTarget{Kind: TargetRaw, Raw: `provider:"target"\path`}, `["endpoint-1","raw","provider:\"target\"\\path"]`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			lane, err := NewLaneMetadata("endpoint-1", test.target, 9)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lane.Key != test.want {
+				t.Fatalf("lane=%q want=%q", lane.Key, test.want)
+			}
+			if err := lane.Verify("endpoint-1", test.target); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestLaneMetadataRejectsNoncanonicalAndMismatchedIdentities(t *testing.T) {
+	for _, key := range []string{
+		"",
+		`["endpoint-1","group","group-1","extra"]`,
+		`[ "endpoint-1", "group", "group-1" ]`,
+		`["endpoint-2","group","group-1"]`,
+		`["endpoint-1","invalid","group-1"]`,
+		`["endpoint-1","group",""]`,
+	} {
+		lane := LaneMetadata{EndpointID: "endpoint-1", Key: key, Sequence: 1}
+		if !errors.Is(lane.Validate(), ErrInvalidContract) {
+			t.Fatalf("invalid lane accepted: %+v", lane)
+		}
+	}
+	lane := testLane(t, EffectTarget{Kind: TargetGroup, Conversation: "group-1"})
+	if !errors.Is(lane.Verify("endpoint-1", EffectTarget{Kind: TargetGroup, Conversation: "group-2"}), ErrInvalidContract) {
+		t.Fatal("lane for another target accepted")
+	}
+	lane.Sequence = 0
+	if !errors.Is(lane.Validate(), ErrInvalidContract) {
+		t.Fatal("zero sequence accepted")
 	}
 }
 

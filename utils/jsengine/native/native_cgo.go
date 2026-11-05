@@ -203,6 +203,9 @@ type nativeServiceEvent struct {
 	kind     jsservices.EventKind
 	request  jsservices.RequestID
 	response jsservices.Response
+	// context is the invocation that started the request. Nil for events with
+	// no invocation to consult.
+	context any
 }
 
 // nativeScheduledCall carries a callback queued for the owner thread. The token
@@ -211,6 +214,11 @@ type nativeScheduledCall struct {
 	token   uint64
 	context any
 	fn      func(*nativeRuntime) error
+}
+
+type nativeContextWatcher struct {
+	done <-chan struct{}
+	stop func() bool
 }
 
 type nativeLoop struct {
@@ -259,6 +267,7 @@ type nativeLoop struct {
 	contextMu          sync.RWMutex
 	contexts           map[uint64]any
 	contextTokens      map[any]uint64
+	contextWatchers    map[uint64]*nativeContextWatcher
 	currentContext     any
 	currentToken       uint64
 	nextToken          uint64
@@ -290,9 +299,13 @@ func (l *nativeLoop) registerContext(opaque any) uint64 {
 	key, keyed := nativeContextKey(opaque)
 	l.contextMu.Lock()
 	defer l.contextMu.Unlock()
+	if l.closed.Load() {
+		return 0
+	}
 	if keyed {
 		if token, ok := l.contextTokens[key]; ok {
 			l.contexts[token] = opaque
+			l.retireContextAfter(jsengine.ContextForExecution(opaque), token, key, keyed)
 			return token
 		}
 	}
@@ -305,17 +318,53 @@ func (l *nativeLoop) registerContext(opaque any) uint64 {
 	if keyed {
 		l.contextTokens[key] = token
 	}
-	if execution := jsengine.ContextForExecution(opaque); execution.Done() != nil {
-		context.AfterFunc(execution, func() {
-			l.contextMu.Lock()
-			delete(l.contexts, token)
-			if keyed && l.contextTokens[key] == token {
-				delete(l.contextTokens, key)
-			}
-			l.contextMu.Unlock()
-		})
-	}
+	l.retireContextAfter(jsengine.ContextForExecution(opaque), token, key, keyed)
 	return token
+}
+
+// retireContextAfter runs with contextMu held. The token owns exactly one
+// cancellation hook, including when a persistent binding replaces its load
+// context. Its cell identity fences callbacks already started before a stop.
+func (l *nativeLoop) retireContextAfter(execution context.Context, token uint64, key any, keyed bool) {
+	done := execution.Done()
+	if previous := l.contextWatchers[token]; previous != nil {
+		if previous.done == done {
+			return
+		}
+		previous.stop()
+		delete(l.contextWatchers, token)
+	}
+	if done == nil || l.closed.Load() {
+		return
+	}
+	if l.contextWatchers == nil {
+		l.contextWatchers = make(map[uint64]*nativeContextWatcher)
+	}
+	watcher := &nativeContextWatcher{done: done}
+	l.contextWatchers[token] = watcher
+	watcher.stop = context.AfterFunc(execution, func() {
+		l.contextMu.Lock()
+		defer l.contextMu.Unlock()
+		if l.closed.Load() || l.contextWatchers[token] != watcher {
+			return
+		}
+		delete(l.contextWatchers, token)
+		// Consult the latest interned scope, not the one replaced by a later
+		// entry. A persistent load can transfer cancellation to its scheduler.
+		if opaque := l.contexts[token]; opaque != nil {
+			if _, ok := opaque.(jsengine.PersistentAsyncPromoter); ok {
+				replacement := jsengine.ContextForExecution(opaque)
+				if replacement.Err() == nil {
+					l.retireContextAfter(replacement, token, key, keyed)
+					return
+				}
+			}
+		}
+		delete(l.contexts, token)
+		if keyed && l.contextTokens[key] == token {
+			delete(l.contextTokens, key)
+		}
+	})
 }
 
 // nativeContextKey resolves the interning identity of a context. A context that
@@ -354,6 +403,12 @@ func (l *nativeLoop) CurrentContext() any {
 	if token != 0 {
 		if value, ok := l.contexts[token]; ok {
 			return value
+		}
+		// A canceled context may retire while its synchronous owner entry is
+		// still unwinding. Keep that entry's real deadline/cancel reason, but
+		// never lend it to a provider job restoring a different expired token.
+		if token == l.currentToken && l.currentContext != nil {
+			return l.currentContext
 		}
 		return jsengine.RevokedExecutionScope{}
 	}
@@ -434,13 +489,22 @@ func (l *nativeLoop) discardServiceEvents() {
 func (l *nativeLoop) drainServiceEvents() {
 	l.runPromiseJobs(func() {
 		for _, event := range l.takeServiceEvents() {
-			if err := l.deliverServiceEvent(event); err != nil && l.host != nil {
+			if err := l.dispatchServiceEvent(event); err != nil && l.host != nil {
 				l.host.setError(err)
 			}
 		}
 	})
 }
 
+// dispatchServiceEvent delivers an event on the owner thread. A request started
+// by a scope that decides its own completion lifetime (a promoted persistent
+// root that may have ended while the I/O was in flight) is delivered through it.
+func (l *nativeLoop) dispatchServiceEvent(event nativeServiceEvent) error {
+	if scope, ok := event.context.(jsengine.HostCompletionDeliverer); ok {
+		return scope.DeliverHostCompletion(func() error { return l.deliverServiceEvent(event) })
+	}
+	return l.deliverServiceEvent(event)
+}
 func (l *nativeLoop) deliverServiceEvent(event nativeServiceEvent) error {
 	if l == nil || l.provider == nil || l.closed.Load() {
 		return ErrNativeClosed
@@ -460,11 +524,18 @@ func (l *nativeLoop) deliverServiceEvent(event nativeServiceEvent) error {
 	if event.response.Bool {
 		boolValue = 1
 	}
+	flags := C.uint32_t(0)
+	if cleanup, ok := l.currentContext.(interface{ DiscardHostServiceContinuations() bool }); ok &&
+		cleanup.DiscardHostServiceContinuations() &&
+		(event.kind == jsservices.EventComplete || event.kind == jsservices.EventClose) {
+		flags = C.SC_SERVICE_EVENT_DISCARD_CONTINUATIONS
+	}
 	status := C.sc_native_service_event(
 		C.uint64_t(l.provider.library),
 		C.uint64_t(l.runtime),
 		C.uint32_t(event.kind),
 		C.uint32_t(event.response.Status),
+		flags,
 		C.uint64_t(event.request),
 		stringPtr,
 		C.uint64_t(len(stringBytes)),
@@ -799,7 +870,7 @@ func (l *nativeLoop) ScheduleWithContext(context any, run func(jsengine.Runtime)
 	if run == nil {
 		return errors.New("native runtime callback is nil")
 	}
-	if err := jsengine.ContextForExecution(context).Err(); err != nil {
+	if err := jsengine.ExecutionErr(context); err != nil {
 		return err
 	}
 	if l.closed.Load() {
@@ -910,6 +981,7 @@ func (l *nativeLoop) Close() error {
 }
 
 func (l *nativeLoop) shutdown() error {
+	l.closed.Store(true)
 	errorBuffer := make([]byte, 512)
 	var first error
 	l.discardServiceEvents()
@@ -938,6 +1010,10 @@ func (l *nativeLoop) shutdown() error {
 		l.host.closeCallbacks()
 	}
 	l.contextMu.Lock()
+	for _, watcher := range l.contextWatchers {
+		watcher.stop()
+	}
+	l.contextWatchers = nil
 	l.contexts = make(map[uint64]any)
 	l.contextTokens = make(map[any]uint64)
 	l.currentContext = nil
@@ -1170,6 +1246,9 @@ func (r *nativeRuntime) undefined() jsengine.Value {
 }
 
 func (r *nativeRuntime) coerce(raw interface{}) (*nativeValue, error) {
+	if r == nil || r.loop == nil || r.scope == nil || r.scope.released.Load() {
+		return nil, ErrNativeClosed
+	}
 	if raw == nil {
 		return r.newNull()
 	}
@@ -1255,6 +1334,22 @@ func (r *nativeRuntime) coerceReflect(value reflect.Value) (*nativeValue, error)
 			return r.newNull()
 		}
 		value = value.Elem()
+	}
+	if (value.Kind() == reflect.Pointer || value.Kind() == reflect.Map || value.Kind() == reflect.Slice || value.Kind() == reflect.Func) && value.IsNil() {
+		return r.newNull()
+	}
+	if value.CanInterface() {
+		object, wrapped, err := hostbridge.Wrap(hostbridge.Scope(r.loop.CurrentContext()), value.Interface())
+		if err != nil {
+			return nil, err
+		}
+		if wrapped {
+			ref, err := r.loop.host.session.BindObject(object)
+			if err != nil {
+				return nil, err
+			}
+			return r.newHostObject(ref, uint32(hostbridge.KindHostObject))
+		}
 	}
 	switch value.Kind() {
 	case reflect.Bool:
@@ -1355,9 +1450,14 @@ func (r *nativeRuntime) newHostFunction(ref hostbridge.HostFuncRef) (*nativeValu
 	if ref == 0 {
 		return nil, errors.New("invalid HostFuncRef 0")
 	}
-	return r.makeValue(func(output *C.uint64_t, errorBuffer *C.char, capacity C.uint64_t) C.int {
-		return C.sc_native_host_function_new(C.uint64_t(r.loop.provider.library), C.uint64_t(r.loop.runtime), C.uint64_t(ref), output, errorBuffer, capacity)
-	})
+	if r == nil || r.loop == nil || r.scope == nil || r.scope.released.Load() {
+		return nil, ErrNativeClosed
+	}
+	handle, err := r.loop.host.encodeValue(r.loop.runtime, hostbridge.HostFunctionValue(ref))
+	if err != nil {
+		return nil, err
+	}
+	return r.scope.value(handle), nil
 }
 func (r *nativeRuntime) makeValue(call func(*C.uint64_t, *C.char, C.uint64_t) C.int) (*nativeValue, error) {
 	if r == nil || r.loop == nil || r.scope == nil || r.scope.released.Load() {

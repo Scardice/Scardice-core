@@ -65,23 +65,25 @@ const (
 )
 
 type Baseline struct {
-	DiceID        string
-	ConfigVersion int
-	Base          BaseConfig
-	Rate          RateConfig
-	Quit          QuitConfig
-	Extension     ExtensionConfig
-	Ban           BanConfig
-	JS            JSConfig
-	StoryLog      StoryLogConfig
-	Mail          MailConfig
-	News          NewsConfig
-	PublicDice    PublicDiceConfig
-	Censor        CensorConfig
-	Store         StoreConfig
-	Advanced      AdvancedConfig
-	CommandPrefix []string
-	DiceMasters   []string
+	DiceID            string
+	ConfigVersion     int
+	Base              BaseConfig
+	Rate              RateConfig
+	Quit              QuitConfig
+	Extension         ExtensionConfig
+	Ban               BanConfig
+	JS                JSConfig
+	StoryLog          StoryLogConfig
+	Mail              MailConfig
+	News              NewsConfig
+	PublicDice        PublicDiceConfig
+	Censor            CensorConfig
+	Store             StoreConfig
+	Advanced          AdvancedConfig
+	CommandPrefix     []string
+	DiceMasters       []string
+	UpgradeWindowID   string
+	UpgradeEndpointID string
 }
 type ConfigPatch struct {
 	Base             *BaseConfig
@@ -183,7 +185,7 @@ func decide(state State, command Command) (Decision, error) {
 		if !validID(b.DiceID) {
 			return Decision{}, ErrInvalidCommand
 		}
-		events := []TypedEvent{BaseChangedV1{DiceID: b.DiceID, ConfigVersion: b.ConfigVersion, BaseConfig: b.Base}, RateChangedV1{b.Rate}, QuitChangedV1{b.Quit}, ExtensionChangedV1{b.Extension}, BanChangedV1{b.Ban}, NewJSChangedV1(b.JS), StoryLogChangedV1{b.StoryLog}, MailChangedV1{b.Mail}, NewsChangedV1{b.News}, NewPublicDiceChangedV1(b.PublicDice), CensorChangedV1{b.Censor}, StoreChangedV1{b.Store}, AdvancedChangedV1{b.Advanced}, OuterChangedV1{OuterConfig{CommandPrefix: b.CommandPrefix, DiceMasters: b.DiceMasters}}}
+		events := []TypedEvent{BaseChangedV1{DiceID: b.DiceID, ConfigVersion: b.ConfigVersion, BaseConfig: b.Base}, RateChangedV1{b.Rate}, QuitChangedV1{b.Quit}, ExtensionChangedV1{b.Extension}, BanChangedV1{b.Ban}, NewJSChangedV1(b.JS), StoryLogChangedV1{b.StoryLog}, MailChangedV1{b.Mail}, NewsChangedV1{b.News}, NewPublicDiceChangedV1(b.PublicDice), CensorChangedV1{b.Censor}, StoreChangedV1{b.Store}, AdvancedChangedV1{b.Advanced}, OuterChangedV1{OuterConfig{CommandPrefix: b.CommandPrefix, DiceMasters: b.DiceMasters, UpgradeWindowID: b.UpgradeWindowID, UpgradeEndpointID: b.UpgradeEndpointID}}}
 		for _, e := range events {
 			if err := validateEvent(e); err != nil {
 				return Decision{}, err
@@ -271,13 +273,17 @@ func decide(state State, command Command) (Decision, error) {
 			return Decision{}, err
 		}
 	}
-	if p.SetCommandPrefix || p.SetDiceMasters {
+	if p.Outer != nil || p.SetCommandPrefix || p.SetDiceMasters {
 		outer := state.Outer
-		if p.SetCommandPrefix {
-			outer.CommandPrefix = append([]string(nil), p.CommandPrefix...)
-		}
-		if p.SetDiceMasters {
-			outer.DiceMasters = normalizeSlices(p.DiceMasters, true)
+		if p.Outer != nil {
+			outer = *p.Outer
+		} else {
+			if p.SetCommandPrefix {
+				outer.CommandPrefix = p.CommandPrefix
+			}
+			if p.SetDiceMasters {
+				outer.DiceMasters = p.DiceMasters
+			}
 		}
 		if err := add(OuterChangedV1{outer}, equalOuter(state.Outer, outer)); err != nil {
 			return Decision{}, err
@@ -286,17 +292,6 @@ func decide(state State, command Command) (Decision, error) {
 	return Decision{Events: events, Replay: len(events) == 0}, nil
 }
 func Decide(state State, command Command) (Decision, error) {
-	if command.Patch != nil {
-		patch := *command.Patch
-		if patch.Outer != nil {
-			outer := patch.Outer
-			patch.SetCommandPrefix = true
-			patch.CommandPrefix = append([]string(nil), outer.CommandPrefix...)
-			patch.SetDiceMasters = true
-			patch.DiceMasters = append([]string(nil), outer.DiceMasters...)
-		}
-		command.Patch = &patch
-	}
 	return decide(state, command)
 }
 func equalBase(a, b BaseConfig) bool {
@@ -413,7 +408,7 @@ func u8MapEqual(a, b map[string]uint8) bool {
 	return true
 }
 func equalStore(a, b StoreConfig) bool {
-	return sliceSetEqual(a.BackendURLs, b.BackendURLs) && sliceSetEqual(a.DisabledBackendURLs, b.DisabledBackendURLs)
+	return sliceEqual(a.BackendURLs, b.BackendURLs) && sliceEqual(a.DisabledBackendURLs, b.DisabledBackendURLs)
 }
 func sliceSetEqual(a, b []string) bool {
 	aa := normalizeSlices(a, true)
@@ -421,7 +416,8 @@ func sliceSetEqual(a, b []string) bool {
 	return sliceEqual(aa, bb)
 }
 func equalOuter(a, b OuterConfig) bool {
-	return sliceEqual(a.CommandPrefix, b.CommandPrefix) && sliceSetEqual(a.DiceMasters, b.DiceMasters)
+	return sliceEqual(a.CommandPrefix, b.CommandPrefix) && sliceSetEqual(a.DiceMasters, b.DiceMasters) &&
+		a.UpgradeWindowID == b.UpgradeWindowID && a.UpgradeEndpointID == b.UpgradeEndpointID
 }
 
 func Reduce(state State, event TypedEvent) (State, error) {

@@ -8,8 +8,8 @@ _Static_assert(SC_RUNTIME_ABI_MAJOR == 1, "runtime ABI major changed");
 _Static_assert(SC_RUNTIME_ABI_MINOR == 0,
                "runtime ABI minor is reserved and must remain zero");
 _Static_assert(SC_HOST_ABI_MAJOR == 1, "host ABI major changed");
-_Static_assert(SC_HOST_ABI_MINOR == 1,
-               "host ABI minor must include HostRef proxy lifecycle");
+_Static_assert(SC_HOST_ABI_MINOR == 2,
+               "host ABI minor must include execution status");
 
 _Static_assert(SC_ENTRY_SCRIPT == 0, "script entry kind changed");
 _Static_assert(SC_ENTRY_COMMONJS == 1, "CommonJS entry kind changed");

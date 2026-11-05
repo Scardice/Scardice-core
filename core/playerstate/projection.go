@@ -38,6 +38,9 @@ type projectionReader interface {
 type projectionFragmentLister interface {
 	ListProjectionRowsByRowKeyFragments(ctx context.Context, projectionName string, fragments []string) ([]eventstore.ProjectionRow, error)
 }
+type projectionPrefixLister interface {
+	ListProjectionRowsByRowKeyPrefix(ctx context.Context, projectionName, prefix string) ([]eventstore.ProjectionRow, error)
+}
 
 func PlayerProjection() eventstore.ProjectionDescriptor {
 	return eventstore.ProjectionDescriptor{Name: PlayerProjectionName, Version: PlayerProjectionVersion, Apply: applyPlayerProjection}
@@ -212,6 +215,43 @@ func ReadProjectedPlayer(ctx context.Context, store any, diceID, groupID, userID
 		return PlayerState{}, ErrInvalidState
 	}
 	return s.Clone(), nil
+}
+
+// ListProjectedPlayers returns detached committed player records for one
+// Dice/group owner. Every row is decoded and identity-checked before exposure.
+func ListProjectedPlayers(ctx context.Context, store any, diceID, groupID string) ([]PlayerState, error) {
+	if !validParts(diceID, groupID) {
+		return nil, ErrInvalidIdentity
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lister, ok := store.(projectionPrefixLister)
+	if !ok || lister == nil {
+		return nil, ErrRepositoryUnavailable
+	}
+	rows, err := lister.ListProjectionRowsByRowKeyPrefix(
+		ctx,
+		PlayerProjectionName,
+		PlayerStreamPrefix(diceID, groupID).Prefix,
+	)
+	if err != nil {
+		return nil, err
+	}
+	states := make([]PlayerState, 0, len(rows))
+	for _, row := range rows {
+		var state PlayerState
+		if row.ProjectionName != PlayerProjectionName || decodeProjection(row.Payload, &state) != nil {
+			return nil, ErrInvalidState
+		}
+		stream := PlayerStream(state.DiceID, state.GroupID, state.UserID)
+		if state.Version == 0 || stream.AggregateID == "" || stream.AggregateID != row.RowKey ||
+			state.DiceID != diceID || state.GroupID != groupID {
+			return nil, ErrInvalidState
+		}
+		states = append(states, state.Clone())
+	}
+	return states, nil
 }
 
 // CountProjectedGroupProfiles returns the number of distinct, non-deleted

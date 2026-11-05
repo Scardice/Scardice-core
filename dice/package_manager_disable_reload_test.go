@@ -8,8 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"go.uber.org/zap"
-
 	"Scardice-core/dice/sealpack"
 )
 
@@ -324,10 +322,9 @@ func newDisableDeckTestPackageManager(t *testing.T) (*Dice, *PackageManager) {
 		t.Fatalf("MkdirAll(data/decks) error = %v", err)
 	}
 
-	testDice := &Dice{
-		BaseConfig: BaseConfig{DataDir: "."},
-		Logger:     zap.NewNop().Sugar(),
-	}
+	testDice, _ := newCanonicalTestDice(t)
+	testDice.BaseConfig.DataDir = "."
+	updateCanonicalTestConfig(t, testDice, func(config *Config) { config.DataDir = "." })
 	pm := NewPackageManager(testDice)
 	testDice.PackageManager = pm
 	return testDice, pm
@@ -471,10 +468,10 @@ func TestClearDetachedReloadScopeLockedPreservesNewerGeneration(t *testing.T) {
 
 func TestPackageManagerReloadAllPreservesFailedDetachedScope(t *testing.T) {
 	testDice, pm := newDisableDeckTestPackageManager(t)
-	if testDice.Parent != nil {
-		t.Fatal("测试要求 Dice.Parent 为空，以确保帮助文档重载因缺少 DiceManager 而失败")
+	// 牌堆应重载成功；DiceManager 没有登记任何 Dice 实例，帮助文档重载因此真实失败，用于验证只保留失败的重载范围。
+	if len(testDice.Parent.Dice) != 0 {
+		t.Fatal("测试要求 DiceManager 没有 Dice 实例，以确保帮助文档重载失败")
 	}
-	// 牌堆应重载成功；帮助文档因缺少 DiceManager 失败，用于验证只保留失败的重载范围。
 	pm.detachedReload = packageReloadContentFlags{decks: true, helpdoc: true}
 	pm.detachedReloadGen = 1
 
@@ -488,8 +485,8 @@ func TestPackageManagerReloadAllPreservesFailedDetachedScope(t *testing.T) {
 	if got := result.ReloadedItems["decks"]; got != "牌堆已重载" {
 		t.Fatalf("ReloadAll() decks result = %q, want successful reload", got)
 	}
-	if got := result.ReloadedItems["helpdoc"]; !strings.Contains(got, "help manager is unavailable") {
-		t.Fatalf("ReloadAll() helpdoc result = %q, want missing help manager failure", got)
+	if got := result.ReloadedItems["helpdoc"]; !strings.Contains(got, "Dice实例不存在") {
+		t.Fatalf("ReloadAll() helpdoc result = %q, want missing Dice instance failure", got)
 	}
 	if pm.detachedReload.decks || !pm.detachedReload.helpdoc {
 		t.Fatalf("detachedReload = %#v, want only helpdoc", pm.detachedReload)
@@ -521,16 +518,10 @@ func newScriptReloadTestPackageManager(t *testing.T) (*Dice, *PackageManager) {
 	tmpDir := t.TempDir()
 	t.Chdir(tmpDir)
 
-	testDice := &Dice{
-		BaseConfig:         BaseConfig{DataDir: "."},
-		Logger:             zap.NewNop().Sugar(),
-		ImSession:          &IMSession{ServiceAtNew: new(SyncMap[string, *GroupInfo])},
-		DirtyGroups:        new(SyncMap[string, int64]),
-		AttrsManager:       &AttrsManager{},
-		JsBuiltinDigestSet: map[string]bool{},
-	}
-	testDice.Config = NewConfig(testDice)
-	testDice.ConfigManager = NewConfigManager(filepath.Join(tmpDir, "plugin-configs.json"))
+	testDice, _ := newCanonicalTestDice(t)
+	testDice.BaseConfig.DataDir = "."
+	testDice.JsBuiltinDigestSet = map[string]bool{}
+	updateCanonicalTestConfig(t, testDice, func(config *Config) { config.DataDir = "." })
 	pm := NewPackageManager(testDice)
 	testDice.PackageManager = pm
 

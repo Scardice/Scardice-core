@@ -8,110 +8,206 @@ import (
 	"time"
 
 	"Scardice-core/adapterapi"
+	"Scardice-core/core/execution"
 	"Scardice-core/core/groupstate"
 	"Scardice-core/core/messageflow"
 	"Scardice-core/core/playerstate"
-	"Scardice-core/endpoint"
+	"Scardice-core/eventstore"
 )
 
-type observedCallbackAdmission struct {
-	*DurableCallbackHost
-	waiting chan struct{}
-	entries atomic.Int32
+type callbackProcessResult struct {
+	summary messageflow.CallbackResultSummary
+	err     error
 }
 
-func (h *observedCallbackAdmission) BeginCallback(ctx context.Context) (context.Context, func(), error) {
-	if h.entries.Add(1) == 2 {
-		close(h.waiting)
+func callbackCommandMessage(providerID, messageID, groupID, text string) adapterapi.InboundMessage {
+	return adapterapi.InboundMessage{
+		ProviderEventID:  adapterapi.ProviderEventID(providerID),
+		MessageID:        adapterapi.MessageID(messageID),
+		Kind:             adapterapi.InboundKindMessage,
+		ConversationKind: adapterapi.ConversationKindGroup,
+		Conversation:     adapterapi.ConversationID(groupID),
+		Sender:           "QQ:1001",
+		Text:             text,
 	}
-	return any(h.DurableCallbackHost).(interface {
-		BeginCallback(context.Context) (context.Context, func(), error)
-	}).BeginCallback(ctx)
 }
 
-type observedCallbackLoader struct {
-	messageflow.CallbackGroupLoader
-	second chan struct{}
-	loads  atomic.Int32
-}
-
-func (l *observedCallbackLoader) Load(ctx context.Context, diceID, groupID string) (groupstate.State, error) {
-	state, err := l.CallbackGroupLoader.Load(ctx, diceID, groupID)
-	if l.loads.Add(1) == 2 {
-		close(l.second)
+func awaitCallbackResult(t *testing.T, results <-chan callbackProcessResult) callbackProcessResult {
+	t.Helper()
+	select {
+	case result := <-results:
+		return result
+	case <-time.After(5 * time.Second):
+		t.Fatal("callback did not finish")
+		return callbackProcessResult{}
 	}
-	return state, err
 }
 
-func TestDurableCallbacksAcrossEndpointsLoadInsideAdmission(t *testing.T) {
-	store, _ := repairTestStore(t)
-	d, ep, _, cleanup := newExecuteNewTestDice(t)
-	defer cleanup()
-	d.DurableStore = store
-	started, release := make(chan struct{}), make(chan struct{})
-	var once sync.Once
-	defer once.Do(func() { close(release) })
-	var calls atomic.Int32
-	d.CmdMap["increment"] = &CmdItemInfo{Name: "increment", Raw: true, Solve: func(ctx *MsgContext, _ *Message, _ *CmdArgs) CmdExecuteResult {
-		if calls.Add(1) == 1 {
-			close(started)
-			<-release
+func TestDurableCallbacksForDifferentGroupsDoNotBlockEachOther(t *testing.T) {
+	fixture := newEventFixture(t)
+	const firstGroup = "QQ-Group:admission-one"
+	const secondGroup = "QQ-Group:admission-two"
+	firstEntered := make(chan struct{})
+	secondEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseFirst) })
+
+	fixture.dice.CmdMap["increment"] = &CmdItemInfo{Name: "increment", Raw: true, Solve: func(ctx *MsgContext, _ *Message, _ *CmdArgs) CmdExecuteResult {
+		switch ctx.Group.GroupID() {
+		case firstGroup:
+			close(firstEntered)
+			<-releaseFirst
+		case secondGroup:
+			close(secondEntered)
 		}
-		ctx.Group.DiceSideNum++
+		if err := ctx.Group.SetDiceSideNum(ctx.Group.DiceSideNum() + 1); err != nil {
+			ctx.setExecutionError(err)
+		}
 		return CmdExecuteResult{Matched: true, Solved: true}
 	}}
-	inbound, err := messageflow.NewInboundService(store, store)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, id := range []string{ep.ID, "second-endpoint"} {
-		_, err := inbound.HandleInbound(context.Background(), endpoint.FencedInbound{EndpointID: adapterapi.EndpointID(id), Generation: 1, DesiredVersion: 1, Message: adapterapi.InboundMessage{ProviderEventID: adapterapi.ProviderEventID(id), MessageID: adapterapi.MessageID(id), Kind: adapterapi.InboundKindMessage, ConversationKind: adapterapi.ConversationKindGroup, Platform: "QQ", Sender: "QQ:1001", Conversation: "QQ-Group:2002", Target: ep.UserID, Text: ".increment"}})
+
+	initialSides := make(map[string]int64, 2)
+	for _, inbound := range []adapterapi.InboundMessage{
+		callbackCommandMessage("admission-one", "admission-message-one", firstGroup, ".increment"),
+		callbackCommandMessage("admission-two", "admission-message-two", secondGroup, ".increment"),
+	} {
+		receipt, err := fixture.enqueue(inbound, fixture.activeGroup())
+		if err != nil || receipt.Outcome != adapterapi.IngressAccepted {
+			t.Fatalf("enqueue %s = %#v, %v", inbound.Conversation, receipt, err)
+		}
+		state, err := groupstate.ReadProjected(context.Background(), fixture.store, fixture.dice.BaseConfig.Name, string(inbound.Conversation))
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("read seeded group %s: %v", inbound.Conversation, err)
 		}
+		initialSides[string(inbound.Conversation)] = state.DiceSideNum
 	}
-	host := &observedCallbackAdmission{DurableCallbackHost: NewDurableCallbackHost(d), waiting: make(chan struct{})}
-	loader := &observedCallbackLoader{CallbackGroupLoader: groupstate.NewRepository(store), second: make(chan struct{})}
-	makeService := func(worker string) *messageflow.CallbackService {
-		service, err := messageflow.NewCallbackService(messageflow.CallbackConfig{Inbox: store, Store: store, BoundCodec: store, Resolver: NewDurableCallbackScopeResolver(d), Group: loader, Player: playerstate.NewRepository(store), Host: host, WorkerID: worker})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return service
-	}
-	first, second := makeService("one"), makeService("two")
-	results := make(chan error, 2)
-	go func() { _, err := first.ProcessOne(context.Background()); results <- err }()
+
+	first := fixture.newCallbackService("admission-worker-one", fixture.host)
+	second := fixture.newCallbackService("admission-worker-two", fixture.host)
+	firstResults := make(chan callbackProcessResult, 1)
+	secondResults := make(chan callbackProcessResult, 1)
+	go func() {
+		summary, err := first.ProcessOne(context.Background())
+		firstResults <- callbackProcessResult{summary: summary, err: err}
+	}()
 	select {
-	case <-started:
-	case err := <-results:
-		t.Fatalf("first callback: %v", err)
+	case <-firstEntered:
+	case result := <-firstResults:
+		t.Fatalf("first callback returned before entering command: %#v, %v", result.summary, result.err)
 	case <-time.After(5 * time.Second):
-		t.Fatal("first callback did not execute")
+		t.Fatal("first callback did not enter its command")
 	}
-	go func() { _, err := second.ProcessOne(context.Background()); results <- err }()
+
+	go func() {
+		summary, err := second.ProcessOne(context.Background())
+		secondResults <- callbackProcessResult{summary: summary, err: err}
+	}()
+	var secondResult callbackProcessResult
 	select {
-	case <-host.waiting:
-	case <-loader.second:
+	case <-secondEntered:
+		secondResult = awaitCallbackResult(t, secondResults)
+	case secondResult = <-secondResults:
 	case <-time.After(5 * time.Second):
-		t.Fatal("second callback did not enter admission or loading")
+		t.Fatal("second group was blocked by the first group's callback")
 	}
-	once.Do(func() { close(release) })
-	for range 2 {
-		select {
-		case err := <-results:
-			if err != nil {
-				t.Errorf("callback failed: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("callback stuck")
+	if secondResult.err != nil || secondResult.summary.Status != eventstore.InboxStatusConfirmedConsumed {
+		t.Fatalf("second callback = %#v, %v", secondResult.summary, secondResult.err)
+	}
+
+	releaseOnce.Do(func() { close(releaseFirst) })
+	firstResult := awaitCallbackResult(t, firstResults)
+	if firstResult.err != nil || firstResult.summary.Status != eventstore.InboxStatusConfirmedConsumed {
+		t.Fatalf("first callback = %#v, %v", firstResult.summary, firstResult.err)
+	}
+	for _, groupID := range []string{firstGroup, secondGroup} {
+		state, err := groupstate.ReadProjected(context.Background(), fixture.store, fixture.dice.BaseConfig.Name, groupID)
+		if err != nil || state.DiceSideNum != initialSides[groupID]+1 {
+			t.Fatalf("group %s state = %#v, %v; want one committed increment from %d", groupID, state, err, initialSides[groupID])
 		}
-	}
-	state, err := groupstate.NewRepository(store).Load(context.Background(), d.BaseConfig.Name, "QQ-Group:2002")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if calls.Load() != 2 || state.DiceSideNum != 2 {
-		t.Fatalf("callbacks=%d final dice sides=%d, want two committed increments", calls.Load(), state.DiceSideNum)
 	}
 }
+
+type conflictAfterCallbackHost struct {
+	delegate messageflow.CallbackHost
+	store    *eventstore.GORMStore
+	diceID   string
+	groupID  string
+	injected atomic.Bool
+}
+
+func (h *conflictAfterCallbackHost) HandleCallback(
+	ctx context.Context,
+	request messageflow.CallbackRequest,
+	overlay *playerstate.LocalOverlay,
+	collector *execution.MutationCollector,
+) (messageflow.CallbackResult, error) {
+	result, err := h.delegate.HandleCallback(ctx, request, overlay, collector)
+	if err != nil || request.Scope.GroupID != h.groupID || !h.injected.CompareAndSwap(false, true) {
+		return result, err
+	}
+	repository := groupstate.NewRepository(h.store)
+	state, err := repository.Load(ctx, h.diceID, h.groupID)
+	if err != nil {
+		return messageflow.CallbackResult{}, err
+	}
+	_, err = repository.DecideAndAppend(ctx, state, state.Version, eventstore.Metadata{
+		CommandID: "concurrent-group-write", CorrelationID: "concurrent-group-write",
+		Producer: "dice/callback-admission-test", OccurredAt: time.Unix(2, 0).UTC(),
+	}, groupstate.Command{Kind: groupstate.CommandName, GroupName: "concurrent-winner"})
+	if err != nil {
+		return messageflow.CallbackResult{}, err
+	}
+	return result, nil
+}
+
+func TestFailedCallbackCommitDoesNotLeakStateIntoAnotherGroup(t *testing.T) {
+	fixture := newEventFixture(t)
+	const conflictedGroup = "QQ-Group:failed-commit"
+	const independentGroup = "QQ-Group:after-failed-commit"
+	fixture.dice.CmdMap["setside"] = &CmdItemInfo{Name: "setside", Raw: true, Solve: func(ctx *MsgContext, _ *Message, _ *CmdArgs) CmdExecuteResult {
+		if err := ctx.Group.SetDiceSideNum(77); err != nil {
+			ctx.setExecutionError(err)
+		}
+		return CmdExecuteResult{Matched: true, Solved: true}
+	}}
+
+	failedInbound := callbackCommandMessage("failed-commit", "failed-commit-message", conflictedGroup, ".setside")
+	receipt, err := fixture.enqueue(failedInbound, fixture.activeGroup())
+	if err != nil || receipt.Outcome != adapterapi.IngressAccepted {
+		t.Fatalf("enqueue conflicted callback = %#v, %v", receipt, err)
+	}
+	conflictingHost := &conflictAfterCallbackHost{
+		delegate: fixture.host, store: fixture.store,
+		diceID: fixture.dice.BaseConfig.Name, groupID: conflictedGroup,
+	}
+	failedService := fixture.newCallbackService("failed-commit-worker", conflictingHost)
+	failedSummary, processErr := failedService.ProcessOne(context.Background())
+	if processErr == nil || failedSummary.Status != eventstore.InboxStatusAmbiguous {
+		t.Fatalf("conflicted callback = %#v, %v; want an ambiguous failed commit", failedSummary, processErr)
+	}
+	conflicted, err := groupstate.ReadProjected(context.Background(), fixture.store, fixture.dice.BaseConfig.Name, conflictedGroup)
+	if err != nil {
+		t.Fatalf("read conflicted group: %v", err)
+	}
+	if conflicted.DiceSideNum == 77 || conflicted.GroupName != "concurrent-winner" {
+		t.Fatalf("failed callback leaked state: %#v", conflicted)
+	}
+
+	independentInbound := callbackCommandMessage("after-failed-commit", "after-failed-commit-message", independentGroup, ".setside")
+	receipt, err = fixture.enqueue(independentInbound, fixture.activeGroup())
+	if err != nil || receipt.Outcome != adapterapi.IngressAccepted {
+		t.Fatalf("enqueue independent callback = %#v, %v", receipt, err)
+	}
+	independentService := fixture.newCallbackService("after-failed-commit-worker", fixture.host)
+	independentSummary, err := independentService.ProcessOne(context.Background())
+	if err != nil || independentSummary.Status != eventstore.InboxStatusConfirmedConsumed {
+		t.Fatalf("independent callback = %#v, %v", independentSummary, err)
+	}
+	independent, err := groupstate.ReadProjected(context.Background(), fixture.store, fixture.dice.BaseConfig.Name, independentGroup)
+	if err != nil || independent.DiceSideNum != 77 {
+		t.Fatalf("independent state = %#v, %v; want committed side 77", independent, err)
+	}
+}
+
+var _ messageflow.CallbackHost = (*conflictAfterCallbackHost)(nil)

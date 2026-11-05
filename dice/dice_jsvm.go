@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Masterminds/semver/v3"
@@ -27,6 +28,7 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/zap"
 
+	"Scardice-core/eventstore"
 	"Scardice-core/static"
 	"Scardice-core/utils"
 	"Scardice-core/utils/crypto"
@@ -299,8 +301,8 @@ func (d *Dice) initializeJSLoop(loop jsengine.Loop, versionID int64) error {
 	if loop == nil {
 		return errors.New("JavaScript runtime is unavailable")
 	}
-	return loop.Run(func(runtime jsengine.Runtime) error {
-		if err := d.installJSHostAPI(runtime); err != nil {
+	if err := loop.Run(func(runtime jsengine.Runtime) error {
+		if err := d.installJSHostAPI(runtime, loop); err != nil {
 			return fmt.Errorf("install JS host API: %w", err)
 		}
 		seal := runtime.Get("seal").Object()
@@ -310,14 +312,19 @@ func (d *Dice) initializeJSLoop(loop jsengine.Loop, versionID int64) error {
 		if err := d.installJSExtHostAPI(runtime, loop, seal, versionID, nil); err != nil {
 			return fmt.Errorf("install JS extension host API: %w", err)
 		}
-		if err := d.installDangerousJSInstance(runtime, seal); err != nil {
-			return fmt.Errorf("install dangerous JS host API: %w", err)
-		}
+		// seal.inst is intentionally absent. Historical references are still
+		// detected in metadata, but no live runtime receives reflective access.
 		if err := runtime.Set("__dirname", ""); err != nil {
 			return fmt.Errorf("set JS __dirname: %w", err)
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	if err := jsengine.InstallPersistentAsyncPromotion(loop); err != nil {
+		return fmt.Errorf("install persistent JS async promotion: %w", err)
+	}
+	return nil
 }
 
 func (d *Dice) JsInit() {
@@ -365,12 +372,9 @@ func (d *Dice) jsInit() {
 	}
 	d.startJSScriptCron()
 
-	(&d.Config).JsEnable = true
 	if d.Logger != nil {
 		d.Logger.Infof("已加载 JS runtime (%s)", engine)
 	}
-	d.MarkModified()
-	d.Save(false)
 }
 
 func (d *Dice) JsShutdown() {
@@ -378,14 +382,11 @@ func (d *Dice) JsShutdown() {
 		return
 	}
 	defer d.finishStartupJsLoad()
-	(&d.Config).JsEnable = false
 	d.stopJSScriptCron()
 	d.jsClear()
 	if d.Logger != nil {
 		d.Logger.Info("已关闭JS环境")
 	}
-	d.MarkModified()
-	d.Save(false)
 }
 
 // StopJSRuntime releases process-owned JS resources without changing the
@@ -516,6 +517,11 @@ func (d *Dice) cancelJSScriptTasks() {
 // subTODO(局部重载): JsExtRegistry、JS 模板（clearJSTemplates）、CoC 规则（clearCocExtraRules）、
 // 插件存储都只能整体清空，缺少“按脚本归属”的摘除接口。
 func (d *Dice) jsClear() {
+	for _, script := range d.JsScriptList {
+		if script != nil {
+			script.replacePersistentBinding(nil)
+		}
+	}
 	// 先撤销旧 generation 并等待 owner 退出，再替换注册表与关闭插件存储。
 	if d.ExtLoopManager != nil {
 		d.ExtLoopManager.SetLoop(nil)
@@ -523,7 +529,6 @@ func (d *Dice) jsClear() {
 	// Wrapper 架构：不再调用 ExtRemove，只清空 JsExtRegistry
 	// 注意：不标记 wrapper 为 IsDeleted，否则重载期间消息到达会导致 wrapper 被移除
 	// IsDeleted 只在 JsDelete/ExtRemove（永久删除脚本）时设置
-	d.JsSealInstExposed = false
 	d.clearJSTemplates()
 
 	// 清空/初始化 JsExtRegistry
@@ -929,6 +934,14 @@ func isCompatibleJsMetaCacheEntry(entry jsMetaCacheEntry) bool {
 	return entry.Meta.DangerousAPIUsages != nil
 }
 
+func jsScriptEnabledByConfig(d *Dice, name string) bool {
+	if d == nil {
+		return false
+	}
+	config := d.Config()
+	return config == nil || !config.DisabledJsScripts[name]
+}
+
 func buildJsScriptInfoFromCache(d *Dice, path string, entry jsMetaCacheEntry) (*JsScriptInfo, error) {
 	if entry.ParseErr != "" {
 		return nil, errors.New(entry.ParseErr)
@@ -970,7 +983,7 @@ func buildJsScriptInfoFromCache(d *Dice, path string, entry jsMetaCacheEntry) (*
 			RawKey:     dep.RawKey,
 		})
 	}
-	jsInfo.Enable = !(&d.Config).DisabledJsScripts[jsInfo.Name]
+	jsInfo.Enable = jsScriptEnabledByConfig(d, jsInfo.Name)
 	d.JsScriptList = append(d.JsScriptList, jsInfo)
 	return jsInfo, nil
 }
@@ -1379,11 +1392,8 @@ func (d *Dice) JsReload() {
 	d.ApplyExtDefaultSettings()
 
 	// 更新扩展变更时间戳，触发延迟更新
-	d.UpdateJsReloadProgress("finalizing", "正在保存 JS 重载结果", 0, 0, 97, "")
-	d.ExtUpdateTime = time.Now().Unix()
-
-	d.MarkModified()
-	d.Save(false)
+	d.UpdateJsReloadProgress("finalizing", "正在完成 JS 重载", 0, 0, 97, "")
+	atomic.StoreInt64(&d.ExtUpdateTime, time.Now().Unix())
 
 	d.Logger.Infof("JsReload: 重载完成，耗时 %dms", time.Since(startTime).Milliseconds())
 	d.FinishJsReloadProgress(fmt.Sprintf("JS 重载完成，耗时 %dms", time.Since(startTime).Milliseconds()))
@@ -1393,32 +1403,6 @@ func (d *Dice) JsReload() {
 //
 // Deprecated: bug
 func (d *Dice) JsExtSettingVacuum() {
-	// NOTE(Xiangze Li): 这里jsInfo中的Name字段是JS文件头中定义的@name,
-	// 而ExtDefaultSettings中的Name字段是插件的名称,
-	// 这两者的内容没有任何关联, 也没有字段在两者之间建立关系, 因此不能用来匹配.
-	//
-	// 另外, 对于已经删除/禁用的JS, ExtDefaultSetting中的ExtItem指针可能是nil
-
-	jsMap := map[string]bool{}
-	for _, jsInfo := range d.JsScriptList {
-		jsMap[jsInfo.Name] = true
-	}
-
-	idxToDel := []int{}
-	for k, v := range d.Config.ExtDefaultSettings {
-		if !v.ExtItem.IsJsExt {
-			continue
-		}
-		if !jsMap[v.Name] {
-			idxToDel = append(idxToDel, k)
-		}
-	}
-
-	for i := len(idxToDel) - 1; i >= 0; i-- {
-		idx := idxToDel[i]
-		(&d.Config).ExtDefaultSettings = append((&d.Config).ExtDefaultSettings[:idx], (&d.Config).ExtDefaultSettings[idx+1:]...)
-	}
-
 	panic("DONT USE ME")
 }
 
@@ -1504,6 +1488,31 @@ type JsScriptInfo struct {
 	runtimeDeleted bool // permanent whole-script tombstone; per-extension removal does not set it
 	/** 当前重载中已固定的 runtime generation */
 	runtimeGeneration int64 `json:"-"`
+	persistentBinding *jsPersistentBindingLifecycle
+}
+
+func (s *JsScriptInfo) currentPersistentBinding() *jsPersistentBindingLifecycle {
+	if s == nil {
+		return nil
+	}
+	s.runtimeStateMu.RLock()
+	binding := s.persistentBinding
+	s.runtimeStateMu.RUnlock()
+	return binding
+}
+
+func (s *JsScriptInfo) replacePersistentBinding(binding *jsPersistentBindingLifecycle) {
+	if s == nil {
+		binding.retire()
+		return
+	}
+	s.runtimeStateMu.Lock()
+	previous := s.persistentBinding
+	s.persistentBinding = binding
+	s.runtimeStateMu.Unlock()
+	if previous != nil && previous != binding {
+		previous.retire()
+	}
 }
 
 type JsScriptDepends struct {
@@ -1648,7 +1657,7 @@ func (d *Dice) JsParseMeta(s string, installTime time.Time, rawData []byte, buil
 		jsInfo.ErrText = strings.Join(errMsg, "\n")
 		return nil, errors.New(strings.Join(errMsg, "|"))
 	}
-	jsInfo.Enable = !(&d.Config).DisabledJsScripts[jsInfo.Name]
+	jsInfo.Enable = jsScriptEnabledByConfig(d, jsInfo.Name)
 	return jsInfo, nil
 }
 
@@ -1780,6 +1789,357 @@ func (d *Dice) prepareJSScriptRuntimes(jsInfos []*JsScriptInfo) []*JsScriptInfo 
 	return prepared
 }
 
+// Persistent service requests preserve their per-request order even when they
+// were started by a timer root rather than directly by the load entry.
+func (c *jsExecutionContext) PersistentAsyncPromotionEnabled() bool {
+	return c.persistentLineage()
+}
+
+func (c *jsExecutionContext) PromotePersistentAsync(run func() (jsengine.Value, error)) error {
+	return c.promotePersistentAsync(0, false, run)
+}
+
+func (c *jsExecutionContext) PromotePersistentAsyncRequest(request uint64, terminal bool, run func() (jsengine.Value, error)) error {
+	if request == 0 {
+		return ErrJSInvocationExpired
+	}
+	return c.promotePersistentAsync(request, terminal, run)
+}
+
+func (c *jsExecutionContext) promotePersistentAsync(request uint64, terminal bool, run func() (jsengine.Value, error)) error {
+	if c == nil || run == nil {
+		return ErrJSInvocationExpired
+	}
+	if !c.persistentLineage() {
+		_, err := run()
+		return err
+	}
+	d := c.Dice
+	source := jsContextSource(c)
+	binding := c.binding
+	generation := jsContextGeneration(c)
+	if d == nil || source == nil || binding == nil || generation == 0 || d.ExtLoopManager == nil {
+		return ErrJSInvocationExpired
+	}
+	plugin := jsContextPlugin(c)
+	work := func() {
+		valid := binding.wait() == nil && source.currentPersistentBinding() == binding
+		if !valid && !terminal {
+			return
+		}
+		if !valid {
+			binding.cancel(ErrJSInvocationExpired)
+		}
+		loop, loopErr := d.ExtLoopManager.GetLoop(generation)
+		if loopErr == nil && loop == nil {
+			loopErr = errors.New("JavaScript runtime is unavailable")
+		}
+		if loopErr == nil {
+			delivered := false
+			invoke := func() (jsengine.Value, error) {
+				delivered = true
+				return run()
+			}
+			if valid {
+				handled := false
+				if request != 0 {
+					handled, loopErr = c.deliverPersistentRequestInOrigin(loop, terminal, invoke)
+				}
+				if !handled {
+					loopErr = d.runJSPersistentAsyncRoot(loop, source, plugin, binding, invoke)
+				}
+			}
+			if terminal && !delivered {
+				loopErr = deliverJSPersistentRequestTerminal(loop, run)
+			}
+		}
+		if loopErr != nil && d.Logger != nil {
+			d.Logger.Errorf("插件持久异步回调异常: %v", loopErr)
+		}
+	}
+	if request != 0 {
+		err := binding.enqueueRequest(request, terminal, work)
+		if err != nil && terminal && binding.context.Err() != nil {
+			loop, loopErr := d.ExtLoopManager.GetLoop(generation)
+			if loopErr != nil {
+				return loopErr
+			}
+			return deliverJSPersistentRequestTerminal(loop, run)
+		}
+		return err
+	}
+	return binding.startRoot(work)
+}
+
+// An awaited completion still belongs to its live originating transaction.
+// Holding admission prevents that root from ending between this check and the
+// owner turn. Only normally completed roots hand off to a fresh domain root.
+func (c *jsExecutionContext) deliverPersistentRequestInOrigin(loop jsengine.Loop, terminal bool, run func() (jsengine.Value, error)) (bool, error) {
+	if !c.PersistentAsync {
+		return false, nil
+	}
+	execution := c.executionScope()
+	if execution == nil {
+		return true, ErrJSInvocationExpired
+	}
+	leave, err := execution.enter()
+	if err != nil {
+		if c.persistentScope() {
+			return false, nil
+		}
+		if terminal {
+			return true, deliverJSPersistentRequestTerminal(loop, run)
+		}
+		return true, err
+	}
+	defer leave()
+	completion := jsOpaqueExecutionContext(jsCompletionContext(c))
+	delivered := false
+	err = jsengine.RunWithContext(loop, completion, func(runtime jsengine.Runtime) error {
+		return completion.withRuntime(runtime, func() error {
+			delivered = true
+			_, err := run()
+			return err
+		})
+	})
+	// Cancellation can also win after admission but before the owner turn.
+	// Only retry an event that the execution guard never handed to the engine.
+	if err != nil && terminal && !delivered {
+		return true, deliverJSPersistentRequestTerminal(loop, run)
+	}
+	return true, err
+}
+
+type jsPersistentTerminalCleanupScope struct{}
+
+func (jsPersistentTerminalCleanupScope) DiscardHostServiceContinuations() bool { return true }
+
+// Terminal protocol delivery retires the provider's request values even after
+// its invocation, binding, or durable admission has failed. The cleanup scope
+// explicitly discards continuations; it carries no domain authority.
+func deliverJSPersistentRequestTerminal(loop jsengine.Loop, run func() (jsengine.Value, error)) error {
+	return jsengine.RunWithContext(loop, jsPersistentTerminalCleanupScope{}, func(jsengine.Runtime) error {
+		_, err := run()
+		return err
+	})
+}
+
+func (d *Dice) runJSPersistentAsyncRoot(
+	loop jsengine.Loop,
+	source *JsScriptInfo,
+	plugin *ExtInfo,
+	binding *jsPersistentBindingLifecycle,
+	run func() (jsengine.Value, error),
+) error {
+	rootContext, cancel := context.WithTimeout(binding.context, jsSolveAwaitTimeout)
+	defer cancel()
+	execute := func(transaction *DurableCallbackTransaction) error {
+		parent := rootContext
+		if transaction != nil && transaction.executionContext != nil {
+			parent = transaction.executionContext
+		}
+		realm := jsContextForRoot(parent, d, plugin, source, transaction, false)
+		realm.PersistentAsync = true
+		return runJSExecutionRoot(realm, func() error {
+			if realm.binding != binding {
+				return ErrJSInvocationCrossRealm
+			}
+			return executeJSPersistentAsyncInRealm(loop, realm, run)
+		})
+	}
+	if d.DurableStore == nil {
+		return execute(nil)
+	}
+	nonce, err := (eventstore.UUIDGenerator{}).NewID()
+	if err != nil {
+		return err
+	}
+	identity := d.DomainExecutionIdentity("js-persistent-async", nonce)
+	canonical := []byte("js-persistent-async\x00" + nonce)
+	return d.WithDomainExecution(rootContext, identity, canonical, execute)
+}
+
+func executeJSPersistentAsyncInRealm(
+	loop jsengine.Loop,
+	realm *jsExecutionContext,
+	run func() (jsengine.Value, error),
+) error {
+	completed := make(chan error, 1)
+	request := jsCallbackRequest{
+		Realm: realm,
+		ValueCallback: func(jsengine.Runtime) (jsengine.Value, error) {
+			return run()
+		},
+	}
+	err := jsengine.RunWithContext(loop, realm, func(runtime jsengine.Runtime) error {
+		_, callbackErr := executeJSCallbackInRealm(runtime, request, func(consume func() error) {
+			completed <- consume()
+		})
+		return callbackErr
+	})
+	if err != nil {
+		return err
+	}
+	select {
+	case err := <-completed:
+		return err
+	case <-realm.ExecutionContext().Done():
+		return context.Cause(realm.ExecutionContext())
+	}
+}
+
+type jsExecutionResult struct {
+	value any
+	err   error
+}
+
+// ExecuteJS runs one externally requested script inside its own admitted
+// domain root. Engine values are exported before leaving the owning loop.
+func (d *Dice) ExecuteJS(ctx context.Context, filename, source string) (any, error) {
+	if d == nil || d.ExtLoopManager == nil {
+		return nil, errJSRuntimeUnavailable
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(filename) == "" {
+		filename = "api-js-exec.js"
+	}
+	loop, _ := d.ExtLoopManager.CurrentLoop()
+	if loop == nil {
+		return nil, errJSRuntimeUnavailable
+	}
+	if jsengine.InOwner(loop) {
+		return nil, errors.New("JavaScript execution root cannot start from the runtime owner")
+	}
+	config := d.Config()
+	configuredEngine := jsengine.EngineGoja
+	if config != nil {
+		if selected := jsengine.NormalizeEngineID(config.JsEngine); selected != "" {
+			configuredEngine = selected
+		}
+	}
+	if loop.Engine() != configuredEngine {
+		return nil, fmt.Errorf("JavaScript runtime does not match configuration: configured=%s active=%s", configuredEngine, loop.Engine())
+	}
+	nonce, err := (eventstore.UUIDGenerator{}).NewID()
+	if err != nil {
+		return nil, err
+	}
+	requestHash := sha256.New()
+	_, _ = io.WriteString(requestHash, strconv.Itoa(len(filename)))
+	_, _ = io.WriteString(requestHash, "\x00")
+	_, _ = io.WriteString(requestHash, filename)
+	_, _ = io.WriteString(requestHash, strconv.Itoa(len(source)))
+	_, _ = io.WriteString(requestHash, "\x00")
+	_, _ = io.WriteString(requestHash, source)
+	canonical := requestHash.Sum([]byte("js-execute/v1\x00"))
+	identity := d.DomainExecutionIdentity("js-execute", nonce+"\x00"+hex.EncodeToString(canonical))
+
+	var result any
+	err = d.WithDomainExecution(ctx, identity, canonical, func(transaction *DurableCallbackTransaction) error {
+		parent := ctx
+		if transaction != nil && transaction.executionContext != nil {
+			parent = transaction.executionContext
+		}
+		realm := jsContextForRoot(parent, d, nil, nil, transaction, false)
+		return runJSExecutionRoot(realm, func() error {
+			var executeErr error
+			result, executeErr = executeJSInRealm(loop, realm, filename, source)
+			return executeErr
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func executeJSInRealm(loop jsengine.Loop, realm *jsExecutionContext, filename, source string) (any, error) {
+	completed := make(chan jsExecutionResult, 1)
+	var settled any
+	request := jsCallbackRequest{
+		Realm: realm,
+		ValueCallback: func(runtime jsengine.Runtime) (jsengine.Value, error) {
+			return runtime.RunString(filename, source)
+		},
+		ConsumeValue: func(value jsengine.Value) error {
+			if value == nil {
+				return jsengine.ErrPrimitiveExportUnsupported
+			}
+			exported, err := value.ExportPrimitive()
+			if errors.Is(err, jsengine.ErrNoPrimitiveValue) {
+				settled = nil
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			settled = exported
+			return nil
+		},
+	}
+	err := jsengine.RunWithContext(loop, realm, func(runtime jsengine.Runtime) error {
+		_, callbackErr := executeJSCallbackInRealm(runtime, request, func(consume func() error) {
+			consumeErr := consume()
+			completed <- jsExecutionResult{value: settled, err: consumeErr}
+		})
+		return callbackErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	select {
+	case result := <-completed:
+		return result.value, result.err
+	case <-realm.ExecutionContext().Done():
+		return nil, context.Cause(realm.ExecutionContext())
+	}
+}
+
+func (d *Dice) loadJSScriptInRoot(loop jsengine.Loop, jsInfo *JsScriptInfo, targetPath string, data []byte) error {
+	loadContext, cancelLoad := context.WithTimeout(d.jsRuntimeContext(), jsSolveAwaitTimeout)
+	defer cancelLoad()
+	nonce, err := (eventstore.UUIDGenerator{}).NewID()
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(data)
+	generation := jsContextGeneration(&jsExecutionContext{Script: jsInfo})
+	identity := d.DomainExecutionIdentity("js-load", fmt.Sprintf("%s\x00%d\x00%x", nonce, generation, sum[:]))
+	canonical := []byte(fmt.Sprintf("js-load\x00%d\x00%s\x00%x", generation, targetPath, sum[:]))
+	var realm *jsExecutionContext
+	run := func(transaction *DurableCallbackTransaction) error {
+		parent := loadContext
+		if transaction != nil && transaction.executionContext != nil {
+			parent = transaction.executionContext
+		}
+		realm = jsContextForRoot(parent, d, nil, jsInfo, transaction, true)
+		return runJSExecutionRoot(realm, func() error {
+			return jsengine.LoadEntryWithContext(loop, realm, jsengine.Entry{
+				Filename: targetPath,
+				Source:   string(data),
+				Kind:     jsengine.EntryExtension,
+			})
+		})
+	}
+	if d.DurableStore == nil {
+		err = run(nil)
+	} else {
+		err = d.WithDomainExecution(loadContext, identity, canonical, run)
+	}
+	if realm != nil {
+		if err == nil {
+			jsInfo.replacePersistentBinding(realm.binding)
+		}
+		realm.completePersistentBinding(err)
+	}
+	return err
+}
+
 // TODO(局部重载/更新同名插件): 加载失败时模块缓存里会残留半成品（见 CommonJSProgram），局部重载需要在失败时驱逐并回滚注册。
 func (d *Dice) JsLoadScriptRaw(jsInfo *JsScriptInfo) {
 	var err error
@@ -1818,18 +2178,16 @@ func (d *Dice) JsLoadScriptRaw(jsInfo *JsScriptInfo) {
 			} else if loop == nil {
 				err = errors.New("JavaScript runtime is unavailable")
 			} else {
-				err = jsengine.LoadEntryWithContext(loop, &jsExecutionContext{Script: jsInfo}, jsengine.Entry{
-					Filename: targetPath,
-					Source:   string(data),
-					Kind:     jsengine.EntryExtension,
-				})
+				err = d.loadJSScriptInRoot(loop, jsInfo, targetPath, data)
 			}
 		}
 	} else {
 		d.Logger.Infof("脚本<%s>已被禁用，跳过加载", jsInfo.Name)
+		jsInfo.replacePersistentBinding(nil)
 	}
 
 	if err != nil {
+		jsInfo.replacePersistentBinding(nil)
 		errText := err.Error()
 		jsInfo.ErrText = errText
 		jsInfo.Enable = false
@@ -1914,7 +2272,12 @@ func CheckJsSign(rawData []byte) (bool, SignStatus) {
 // subTODO(局部重载): 脚本资源归属表、脚本级生命周期上下文、反向依赖闭包，见 js_incremental_load.go 顶部。
 func JsDelete(d *Dice, jsInfo *JsScriptInfo) {
 	jsInfo.runtimeStateMu.Lock()
-	defer jsInfo.runtimeStateMu.Unlock()
+	binding := jsInfo.persistentBinding
+	jsInfo.persistentBinding = nil
+	defer func() {
+		jsInfo.runtimeStateMu.Unlock()
+		binding.retire()
+	}()
 	jsInfo.Enable = false
 	jsInfo.runtimeDeleted = true
 	dirpath := filepath.Dir(jsInfo.Filename)
@@ -1947,14 +2310,46 @@ func JsDelete(d *Dice, jsInfo *JsScriptInfo) {
 		}
 
 		// 更新时间戳
-		d.ExtUpdateTime = time.Now().Unix()
+		atomic.StoreInt64(&d.ExtUpdateTime, time.Now().Unix())
 	}
+}
+
+// setJSScriptDisabled commits the user-visible enablement set before the
+// in-memory script metadata is changed.
+func setJSScriptDisabled(d *Dice, scriptName string, disabled bool) bool {
+	if d == nil || scriptName == "" {
+		return false
+	}
+	config, _ := d.ConfigEditSnapshot()
+	if config.DisabledJsScripts == nil {
+		config.DisabledJsScripts = make(map[string]bool)
+	}
+	if disabled {
+		config.DisabledJsScripts[scriptName] = true
+	} else {
+		delete(config.DisabledJsScripts, scriptName)
+	}
+	if err := d.DurableCommitConfigSnapshot(
+		context.Background(),
+		config,
+		config.CommandPrefix,
+		config.DiceMasters,
+		nil,
+	); err != nil {
+		if d.Logger != nil {
+			d.Logger.Errorf("更新 JS 脚本启用状态失败: %v", err)
+		}
+		return false
+	}
+	return true
 }
 
 // TODO(局部重载/禁用与删除): 启用一个已禁用的插件应走局部加载；若它禁用前已加载过，模块缓存里仍留有旧实例，
 // 需要先有模块缓存驱逐原语。目前只改配置，需要手动重载才生效。
 func JsEnable(d *Dice, jsInfoName string) {
-	delete((&d.Config).DisabledJsScripts, jsInfoName)
+	if !setJSScriptDisabled(d, jsInfoName, false) {
+		return
+	}
 	for _, jsInfo := range d.JsScriptList {
 		if jsInfo.Name == jsInfoName {
 			jsInfo.runtimeStateMu.Lock()
@@ -1965,17 +2360,15 @@ func JsEnable(d *Dice, jsInfoName string) {
 		}
 	}
 	d.LastUpdatedTime = time.Now().Unix()
-	d.Save(false)
 }
 
 // TODO(局部重载/禁用与删除): 禁用应局部卸载该插件及其反向依赖闭包，依赖方标记为 depsBlocked。
 // 目前只改配置，已加载的实例会一直运行到下一次全量重载。
 // subTODO(局部重载): 脚本资源归属表、脚本级生命周期上下文、反向依赖闭包，见 js_incremental_load.go 顶部。
 func JsDisable(d *Dice, jsInfoName string) {
-	if d.Config.DisabledJsScripts == nil {
-		d.Config.DisabledJsScripts = make(map[string]bool)
+	if !setJSScriptDisabled(d, jsInfoName, true) {
+		return
 	}
-	d.Config.DisabledJsScripts[jsInfoName] = true
 	for _, jsInfo := range d.JsScriptList {
 		if jsInfo.Name == jsInfoName {
 			jsInfo.runtimeStateMu.Lock()
@@ -1984,7 +2377,6 @@ func JsDisable(d *Dice, jsInfoName string) {
 		}
 	}
 	d.LastUpdatedTime = time.Now().Unix()
-	d.Save(false)
 }
 
 func (d *Dice) JsCheckUpdate(jsScriptInfo *JsScriptInfo) (string, string, string, error) {
@@ -2213,13 +2605,14 @@ type JsScriptTask struct {
 	key      string
 	rawValue string
 
-	cron     *cron.Cron
-	cronExpr string
-	onceAt   time.Time
-	timer    *time.Timer
-	task     func(JsScriptTaskCtx)
-	entryID  *cron.EntryID
-	lock     *sync.Mutex
+	cron         *cron.Cron
+	cronExpr     string
+	onceAt       time.Time
+	timer        *time.Timer
+	task         func(JsScriptTaskCtx)
+	taskCallback func(JsScriptTaskCtx) (jsengine.Value, error)
+	entryID      *cron.EntryID
+	lock         *sync.Mutex
 
 	stateLock sync.Mutex
 	stateCond *sync.Cond
@@ -2262,39 +2655,100 @@ func (t *JsScriptTask) run() {
 		}
 		t.stateLock.Unlock()
 	}()
+	startedAt := time.Now().UTC()
 	taskCtx := JsScriptTaskCtx{
-		Now: time.Now().Unix(),
+		Now: startedAt.Unix(),
 		Key: t.key,
 	}
-	defer t.lock.Unlock()
-	t.lock.Lock()
 	if t.dice == nil || t.ext == nil {
+		if t.lock != nil {
+			t.lock.Lock()
+			defer t.lock.Unlock()
+		}
 		defer func() {
-			if r := recover(); r != nil {
+			if r := recover(); r != nil && t.logger != nil {
 				t.logger.Errorf("插件定时任务异常: %v", r)
 			}
 		}()
-		t.task(taskCtx)
+		if t.task != nil {
+			t.task(taskCtx)
+		}
 		return
 	}
 	if t.dice.ExtLoopManager == nil {
-		t.logger.Errorf("插件定时任务获取JS事件循环失败: runtime manager is nil")
+		if t.logger != nil {
+			t.logger.Errorf("插件定时任务获取JS事件循环失败: runtime manager is nil")
+		}
 		return
 	}
 	loop, err := t.dice.ExtLoopManager.GetLoop(t.ext.JSLoopVersion)
 	if err == nil && loop == nil {
 		err = errors.New("JavaScript runtime is unavailable")
 	}
-	if err != nil {
-		t.logger.Errorf("插件定时任务获取JS事件循环失败: %v", err)
-		return
+	if err == nil {
+		err = t.runInDomainRoot(loop, taskCtx, startedAt)
 	}
-	err = jsengine.RunWithContext(loop, jsContextForPlugin(t.ext), func(jsengine.Runtime) error {
-		t.task(taskCtx)
-		return nil
+	if err != nil && t.logger != nil {
+		t.logger.Errorf("插件定时任务异常: %v", err)
+	}
+}
+
+func (t *JsScriptTask) runInDomainRoot(loop jsengine.Loop, taskCtx JsScriptTaskCtx, startedAt time.Time) error {
+	rootContext, cancel := context.WithTimeout(t.dice.jsRuntimeContext(), jsSolveAwaitTimeout)
+	defer cancel()
+	nonce, err := (eventstore.UUIDGenerator{}).NewID()
+	if err != nil {
+		return err
+	}
+	scope := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s", t.ext.Name, t.taskType, t.key)))
+	occurrence := startedAt.UnixNano()
+	invocation := fmt.Sprintf("%x\x00%d\x00%s", scope[:], occurrence, nonce)
+	identity := t.dice.DomainExecutionIdentity("js-task", invocation)
+	canonical := []byte(fmt.Sprintf("js-task\x00%x\x00%d", scope[:], occurrence))
+	run := func(transaction *DurableCallbackTransaction) error {
+		parent := rootContext
+		if transaction != nil && transaction.executionContext != nil {
+			parent = transaction.executionContext
+		}
+		realm := jsContextForRoot(parent, t.dice, t.ext, t.ext.Source, transaction, false)
+		return runJSExecutionRoot(realm, func() error {
+			return t.executeInRealm(loop, realm, taskCtx)
+		})
+	}
+	if t.dice.DurableStore == nil {
+		return run(nil)
+	}
+	return t.dice.WithDomainExecution(rootContext, identity, canonical, run)
+}
+
+func (t *JsScriptTask) executeInRealm(loop jsengine.Loop, realm *jsExecutionContext, taskCtx JsScriptTaskCtx) error {
+	completed := make(chan error, 1)
+	request := jsCallbackRequest{Realm: realm}
+	if t.taskCallback != nil {
+		request.ValueCallback = func(jsengine.Runtime) (jsengine.Value, error) {
+			return t.taskCallback(taskCtx)
+		}
+	} else {
+		request.Callback = func() {
+			if t.task != nil {
+				t.task(taskCtx)
+			}
+		}
+	}
+	err := jsengine.RunWithContext(loop, realm, func(runtime jsengine.Runtime) error {
+		_, callbackErr := executeJSCallbackInRealm(runtime, request, func(consume func() error) {
+			completed <- consume()
+		})
+		return callbackErr
 	})
 	if err != nil {
-		t.logger.Errorf("插件定时任务异常: %v", err)
+		return err
+	}
+	select {
+	case err := <-completed:
+		return err
+	case <-realm.ExecutionContext().Done():
+		return context.Cause(realm.ExecutionContext())
 	}
 }
 
@@ -2691,6 +3145,5 @@ func (d *Dice) JsDownload(name string, url string, hash map[string]string) error
 	}
 	d.Logger.Infof("JS 插件“%s”下载成功", name)
 	d.JsReload()
-	d.MarkModified()
 	return nil
 }

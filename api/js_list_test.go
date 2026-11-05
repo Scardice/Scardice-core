@@ -15,8 +15,7 @@ import (
 
 func TestJsListReportsRuntimeExtensionNamesBySourceScript(t *testing.T) {
 	t.Setenv(adminAuthBypassEnv, "1")
-	previousDice := myDice
-	t.Cleanup(func() { myDice = previousDice })
+	runtime, _ := newJSExecDice(t)
 
 	script := &dice.JsScriptInfo{Name: "脚本元数据名", Filename: "data/scripts/plugin.js"}
 	extensions := new(dice.SyncMap[string, *dice.ExtInfo])
@@ -32,12 +31,10 @@ func TestJsListReportsRuntimeExtensionNamesBySourceScript(t *testing.T) {
 		Name:   "other-script-extension",
 		Source: &dice.JsScriptInfo{Filename: "data/scripts/other.js"},
 	})
-	myDice = &dice.Dice{
-		Config:             dice.Config{JsConfig: dice.JsConfig{JsEnable: true}},
-		JsScriptList:       []*dice.JsScriptInfo{script},
-		JsExtRegistry:      extensions,
-		JsBuiltinDigestSet: map[string]bool{},
-	}
+	runtime.JsScriptList = []*dice.JsScriptInfo{script}
+	runtime.JsExtRegistry = extensions
+	runtime.JsBuiltinDigestSet = map[string]bool{}
+	myDice = runtime
 
 	e := echo.New()
 	recorder := httptest.NewRecorder()
@@ -67,20 +64,17 @@ func TestJsListReportsRuntimeExtensionNamesBySourceScript(t *testing.T) {
 
 func TestJsListReportsMemoryOnlyForRunningScriptsByRuntime(t *testing.T) {
 	t.Setenv(adminAuthBypassEnv, "1")
-	previousDice := myDice
-	t.Cleanup(func() { myDice = previousDice })
+	runtime, _ := newJSExecDice(t)
 
-	myDice = &dice.Dice{
-		Config: dice.Config{JsConfig: dice.JsConfig{JsEnable: true}},
-		JsScriptList: []*dice.JsScriptInfo{
-			{Name: "disabled", Filename: "data/scripts/disabled.js", RuntimeID: "goja"},
-			{Name: "unloaded", Filename: "data/scripts/unloaded.js", Enable: true},
-			{Name: "quick", Filename: "data/scripts/quick.js", Enable: true, RuntimeID: "quickjs"},
-			{Name: "goja", Filename: "data/scripts/goja.js", Enable: true, RuntimeID: "goja"},
-		},
-		JsExtRegistry:      new(dice.SyncMap[string, *dice.ExtInfo]),
-		JsBuiltinDigestSet: map[string]bool{},
+	runtime.JsScriptList = []*dice.JsScriptInfo{
+		{Name: "disabled", Filename: "data/scripts/disabled.js", RuntimeID: "goja"},
+		{Name: "unloaded", Filename: "data/scripts/unloaded.js", Enable: true},
+		{Name: "quick", Filename: "data/scripts/quick.js", Enable: true, RuntimeID: "quickjs"},
+		{Name: "goja", Filename: "data/scripts/goja.js", Enable: true, RuntimeID: "goja"},
 	}
+	runtime.JsExtRegistry = new(dice.SyncMap[string, *dice.ExtInfo])
+	runtime.JsBuiltinDigestSet = map[string]bool{}
+	myDice = runtime
 
 	e := echo.New()
 	recorder := httptest.NewRecorder()

@@ -10,18 +10,18 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/bytedance/sonic"
 	wr "github.com/mroth/weightedrand/v3"
 	"gopkg.in/yaml.v3"
 
-	"Scardice-core/dice/service"
-	"Scardice-core/logger"
+	"Scardice-core/core/execution"
+	"Scardice-core/eventstore"
 	"Scardice-core/utils"
 )
 
@@ -188,17 +188,13 @@ type PluginConfig struct {
 }
 
 type ConfigManager struct {
-	filename string
-	Plugins  map[string]*PluginConfig
-	lock     sync.RWMutex
-	owner    *Dice
+	taskMu sync.RWMutex
+	tasks  map[string]*JsScriptTask
+	owner  *Dice
 }
 
-func NewConfigManager(filename string) *ConfigManager {
-	return &ConfigManager{
-		filename: filename,
-		Plugins:  make(map[string]*PluginConfig),
-	}
+func NewConfigManager(_ string) *ConfigManager {
+	return &ConfigManager{tasks: make(map[string]*JsScriptTask)}
 }
 
 func (cm *ConfigManager) SetOwner(owner *Dice) {
@@ -217,310 +213,297 @@ func (cm *ConfigManager) NewConfigItem(key string, defaultValue interface{}, des
 	}
 }
 
+func pluginConfigTaskKey(pluginName, key string) string {
+	return pluginName + "\x00" + key
+}
+
+func (cm *ConfigManager) taskFor(pluginName, key string) *JsScriptTask {
+	if cm == nil {
+		return nil
+	}
+	cm.taskMu.RLock()
+	task := cm.tasks[pluginConfigTaskKey(pluginName, key)]
+	cm.taskMu.RUnlock()
+	return task
+}
+
+func (cm *ConfigManager) rememberTasks(pluginName string, items []*ConfigItem) {
+	if cm == nil {
+		return
+	}
+	cm.taskMu.Lock()
+	if cm.tasks == nil {
+		cm.tasks = make(map[string]*JsScriptTask)
+	}
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		key := pluginConfigTaskKey(pluginName, item.Key)
+		if item.task == nil {
+			delete(cm.tasks, key)
+		} else {
+			cm.tasks[key] = item.task
+		}
+	}
+	cm.taskMu.Unlock()
+}
+
+func (cm *ConfigManager) attachTask(pluginName string, item *ConfigItem) *ConfigItem {
+	if item == nil {
+		return nil
+	}
+	item.task = cm.taskFor(pluginName, item.Key)
+	return item
+}
+
 func (cm *ConfigManager) RegisterPluginConfig(pluginName string, configItems ...*ConfigItem) error {
-	if cm == nil {
-		return errors.New("config manager is nil")
+	if cm == nil || cm.owner == nil {
+		return errors.New("config manager owner is unavailable")
 	}
-	if cm.owner != nil && cm.owner.DurableStore != nil {
-		for _, item := range configItems {
-			if err := cm.owner.durableRegisterConfigByName(context.Background(), pluginName, item); err != nil {
-				return err
-			}
-		}
+	if err := cm.owner.durableRegisterConfigsByName(context.Background(), pluginName, configItems); err != nil {
+		return err
 	}
-
-	cm.lock.Lock()
-	defer cm.lock.Unlock()
-	if cm.Plugins == nil {
-		cm.Plugins = make(map[string]*PluginConfig)
-	}
-	if existingPlugin, ok := cm.Plugins[pluginName]; ok {
-		for _, newItem := range configItems {
-			if existingItem, itemExists := existingPlugin.Configs[newItem.Key]; itemExists {
-				typeChanged := newItem.Type != "" && existingItem.Type != newItem.Type
-				if newItem.Type != "" {
-					existingItem.Type = newItem.Type
-				}
-				if newItem.Group != "" {
-					existingItem.Group = newItem.Group
-				}
-				existingItem.DefaultValue = newItem.DefaultValue
-				existingItem.Option = newItem.Option
-				existingItem.Description = newItem.Description
-				existingItem.Deprecated = false
-				existingItem.task = newItem.task
-				if typeChanged {
-					existingItem.Value = newItem.DefaultValue
-				}
-				existingPlugin.Configs[newItem.Key] = existingItem
-				for i, configKey := range existingPlugin.OrderedConfigKeys {
-					if configKey == existingItem.Key {
-						existingPlugin.OrderedConfigKeys = append(existingPlugin.OrderedConfigKeys[:i], existingPlugin.OrderedConfigKeys[i+1:]...)
-						break
-					}
-				}
-				existingPlugin.OrderedConfigKeys = append(existingPlugin.OrderedConfigKeys, existingItem.Key)
-			} else {
-				existingPlugin.Configs[newItem.Key] = newItem
-				existingPlugin.OrderedConfigKeys = append(existingPlugin.OrderedConfigKeys, newItem.Key)
-			}
-		}
-		cm.Plugins[pluginName] = existingPlugin
-	} else {
-		configs := make(map[string]*ConfigItem)
-		orderedConfigKeys := make([]string, 0, len(configItems))
-		for _, item := range configItems {
-			configs[item.Key] = item
-			orderedConfigKeys = append(orderedConfigKeys, item.Key)
-		}
-		cm.Plugins[pluginName] = &PluginConfig{
-			PluginName:        pluginName,
-			Configs:           configs,
-			OrderedConfigKeys: orderedConfigKeys,
-		}
-	}
-	return cm.save()
+	cm.rememberTasks(pluginName, configItems)
+	return nil
 }
 
-func (cm *ConfigManager) UnregisterConfig(pluginName string, keys ...string) {
-	if cm == nil {
-		return
+func (cm *ConfigManager) RegisterPluginConfigInDomain(
+	ctx context.Context,
+	transaction *DurableCallbackTransaction,
+	pluginName string,
+	configItems ...*ConfigItem,
+) error {
+	if cm == nil || cm.owner == nil || transaction == nil {
+		return execution.ErrDomainTxUnavailable
 	}
-	if cm.owner != nil && cm.owner.DurableStore != nil {
-		for _, key := range keys {
-			if err := cm.owner.durableUnregisterConfigByName(context.Background(), pluginName, key); err != nil {
-				logger.M().Error("durable config unregister failed", pluginName, key, err)
-				return
-			}
-		}
+	if ctx == nil {
+		ctx = context.Background()
 	}
-
-	cm.lock.Lock()
-	defer cm.lock.Unlock()
-
-	plugin, ok := cm.Plugins[pluginName]
-	if !ok {
-		return
-	}
-
-	for _, key := range keys {
-		if config, exist := plugin.Configs[key]; exist && strings.HasPrefix(config.Type, "task:") && config.task != nil {
-			config.task.Off()
-		}
-		delete(plugin.Configs, key)
-	}
-	newOrderedConfigKeys := make([]string, 0, len(plugin.OrderedConfigKeys))
-	for _, configKey := range plugin.OrderedConfigKeys {
-		if _, ok := plugin.Configs[configKey]; ok {
-			newOrderedConfigKeys = append(newOrderedConfigKeys, configKey)
-		}
-	}
-	plugin.OrderedConfigKeys = newOrderedConfigKeys
-	if cm.Plugins[pluginName] == nil || len(cm.Plugins[pluginName].Configs) == 0 {
-		delete(cm.Plugins, pluginName)
-	} else {
-		cm.Plugins[pluginName] = plugin
-	}
-	_ = cm.save()
-}
-
-func (cm *ConfigManager) SetConfig(pluginName, key string, value interface{}) error {
-	if cm == nil {
-		return errors.New("config manager is nil")
-	}
-	var validatedTaskType string
-
-	if cm.owner != nil && cm.owner.DurableStore != nil {
-		cm.lock.RLock()
-		plugin := cm.Plugins[pluginName]
-		var configType string
-		if plugin != nil && plugin.Configs[key] != nil {
-			configType = plugin.Configs[key].Type
-		}
-		cm.lock.RUnlock()
-		if configType == "" {
-			return fmt.Errorf("plugin config %s/%s not found", pluginName, key)
-		}
-		durableValue := value
-
-		switch configType {
-		case "task:cron", "task:daily", "task:once":
-			text, ok := value.(string)
-			if !ok {
-				return errors.New("task config value must be a string")
-			}
-			normalized, err := normalizeTaskConfigValue(configType, text)
-			if err != nil {
-				return err
-			}
-			durableValue = normalized
-			value = normalized
-			validatedTaskType = configType
-		}
-		if err := cm.owner.durableSetConfigByName(context.Background(), pluginName, key, durableValue); err != nil {
+	for _, item := range configItems {
+		if err := cm.owner.registerConfigInDomain(ctx, transaction, transaction.metadata, pluginName, item); err != nil {
 			return err
 		}
 	}
-
-	cm.lock.Lock()
-	defer cm.lock.Unlock()
-	plugin, ok := cm.Plugins[pluginName]
-	if !ok {
-		return fmt.Errorf("plugin: %v not found", pluginName)
-	}
-
-	configItem, exists := plugin.Configs[key]
-	if exists {
-		switch configItem.Type {
-		case "task:cron", "task:daily", "task:once":
-			val, ok := value.(string)
-			if !ok {
-				return errors.New("task config value must be a string")
-			}
-			if configItem.Type != validatedTaskType {
-				normalized, err := normalizeTaskConfigValue(configItem.Type, val)
-				if err != nil {
-					return err
-				}
-				val = normalized
-			}
-			configItem.Value = val
-			if configItem.task != nil {
-				if err := configItem.task.reset(val); err != nil {
-					return err
-				}
-			}
-		default:
-			configItem.Value = value
-		}
-		plugin.Configs[key] = configItem
-		cm.Plugins[pluginName] = plugin
-	}
-	return cm.save()
+	items := append([]*ConfigItem(nil), configItems...)
+	return transaction.AfterCommit(func() { cm.rememberTasks(pluginName, items) })
 }
 
-func (cm *ConfigManager) getConfig(pluginName, key string) *ConfigItem {
-	cm.lock.RLock()
-	defer cm.lock.RUnlock()
+func (cm *ConfigManager) UnregisterConfig(pluginName string, keys ...string) error {
+	if cm == nil || cm.owner == nil {
+		return errors.New("config manager owner is unavailable")
+	}
+	keys = append([]string(nil), keys...)
+	if err := cm.owner.durableUnregisterConfigsByName(context.Background(), pluginName, keys); err != nil {
+		return err
+	}
+	cm.removeConfigTasks(pluginName, keys)
+	return nil
+}
 
-	plugin, ok := cm.Plugins[pluginName]
-	if !ok {
+func (cm *ConfigManager) UnregisterConfigInDomain(
+	ctx context.Context,
+	transaction *DurableCallbackTransaction,
+	pluginName string,
+	keys ...string,
+) error {
+	if cm == nil || cm.owner == nil || transaction == nil {
+		return execution.ErrDomainTxUnavailable
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	keys = append([]string(nil), keys...)
+	for _, key := range keys {
+		if err := cm.owner.unregisterConfigInDomain(ctx, transaction, transaction.metadata, pluginName, key); err != nil {
+			return err
+		}
+	}
+	return transaction.AfterCommit(func() { cm.removeConfigTasks(pluginName, keys) })
+}
+
+func (cm *ConfigManager) removeConfigTasks(pluginName string, keys []string) {
+	cm.taskMu.Lock()
+	for _, key := range keys {
+		taskKey := pluginConfigTaskKey(pluginName, key)
+		if task := cm.tasks[taskKey]; task != nil {
+			task.Off()
+		}
+		delete(cm.tasks, taskKey)
+	}
+	cm.taskMu.Unlock()
+}
+
+type PluginConfigUpdate struct {
+	PluginName string      `json:"pluginName"`
+	Key        string      `json:"key"`
+	Value      interface{} `json:"value"`
+}
+
+func (cm *ConfigManager) SetConfig(pluginName, key string, value interface{}) error {
+	return cm.SetConfigs(context.Background(), []PluginConfigUpdate{{
+		PluginName: pluginName, Key: key, Value: value,
+	}})
+}
+
+func (cm *ConfigManager) SetConfigs(ctx context.Context, updates []PluginConfigUpdate) error {
+	if cm == nil || cm.owner == nil {
+		return errors.New("config manager owner is unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	normalized := append([]PluginConfigUpdate(nil), updates...)
+	sort.Slice(normalized, func(a, b int) bool {
+		if normalized[a].PluginName != normalized[b].PluginName {
+			return normalized[a].PluginName < normalized[b].PluginName
+		}
+		return normalized[a].Key < normalized[b].Key
+	})
+	taskItems := make([]*ConfigItem, len(normalized))
+	err := cm.owner.withOwnedConfigExecution(ctx, "extension-config-set-batch", normalized, func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		state, stateErr := cm.owner.ExtensionStateForDomain(ctx, transaction.Domain())
+		if stateErr != nil {
+			return stateErr
+		}
+		for index := range normalized {
+			update := &normalized[index]
+			definition, ok := state.ConfigDefinitions[update.PluginName][update.Key]
+			if !ok {
+				return fmt.Errorf("plugin config %s/%s not found", update.PluginName, update.Key)
+			}
+			item := cm.attachTask(update.PluginName, durableConfigItem(definition))
+			taskItems[index] = item
+			switch item.Type {
+			case "task:cron", "task:daily", "task:once":
+				text, textOK := update.Value.(string)
+				if !textOK {
+					return errors.New("task config value must be a string")
+				}
+				update.Value, stateErr = normalizeTaskConfigValue(item.Type, text)
+				if stateErr != nil {
+					return stateErr
+				}
+			}
+			if stateErr = cm.owner.setConfigInDomain(ctx, transaction, metadata, update.PluginName, update.Key, update.Value); stateErr != nil {
+				return stateErr
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	applyTasks := func() error {
+		for index, item := range taskItems {
+			if item == nil || !strings.HasPrefix(item.Type, "task:") || item.task == nil {
+				continue
+			}
+			taskValue, ok := normalized[index].Value.(string)
+			if !ok {
+				return errors.New("committed task config value is not a string")
+			}
+			if resetErr := item.task.reset(taskValue); resetErr != nil {
+				return resetErr
+			}
+		}
 		return nil
 	}
-
-	configItem, exists := plugin.Configs[key]
-	if exists {
-		n := *configItem
-		return &n
+	if err = applyTasks(); err != nil {
+		return &ConfigRuntimeApplyError{Err: err}
 	}
 	return nil
 }
 
-func (cm *ConfigManager) ResetConfigToDefault(pluginName, key string) {
-	if cm == nil {
-		return
+func (cm *ConfigManager) ResetConfigToDefault(ctx context.Context, pluginName, key string) error {
+	if cm == nil || cm.owner == nil {
+		return errors.New("config manager owner is unavailable")
 	}
-	cm.lock.RLock()
-	plugin := cm.Plugins[pluginName]
-	var defaultValue any
-	configType := ""
-	if plugin != nil && plugin.Configs[key] != nil {
-		defaultValue = plugin.Configs[key].DefaultValue
-		configType = plugin.Configs[key].Type
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	cm.lock.RUnlock()
-	if defaultValue == nil {
-		logger.M().Debug("plugin config default not found", pluginName, key)
-		return
-	}
-	if strings.HasPrefix(configType, "task:") {
-		taskValue, ok := defaultValue.(string)
+	request := struct {
+		PluginName string `json:"pluginName"`
+		Key        string `json:"key"`
+	}{PluginName: pluginName, Key: key}
+	var task *JsScriptTask
+	var taskValue string
+	err := cm.owner.withOwnedConfigExecution(ctx, "extension-config-reset", request, func(transaction *DurableCallbackTransaction, metadata eventstore.Metadata) error {
+		state, stateErr := cm.owner.ExtensionStateForDomain(ctx, transaction.Domain())
+		if stateErr != nil {
+			return stateErr
+		}
+		definition, ok := state.ConfigDefinitions[pluginName][key]
 		if !ok {
-			logger.M().Error("plugin task config default must be a string", pluginName, key)
-			return
+			return fmt.Errorf("plugin config %s/%s not found", pluginName, key)
 		}
-		normalized, err := normalizeTaskConfigValue(configType, taskValue)
-		if err != nil {
-			logger.M().Error("invalid plugin task config default", pluginName, key, err)
-			return
-		}
-		defaultValue = normalized
-	}
-	if cm.owner != nil && cm.owner.DurableStore != nil {
-		if err := cm.owner.durableSetConfigByName(context.Background(), pluginName, key, defaultValue); err != nil {
-			logger.M().Error("durable config reset failed", pluginName, key, err)
-			return
-		}
-	}
-
-	cm.lock.Lock()
-	defer cm.lock.Unlock()
-	log := logger.M()
-	log.Debug("try reset config to default", pluginName, key)
-	plugin = cm.Plugins[pluginName]
-	if plugin == nil {
-		log.Debug("plugin not found", pluginName)
-		return
-	}
-	configItem, exists := plugin.Configs[key]
-	if exists {
-		if strings.HasPrefix(configItem.Type, "task:") {
-			taskValue, ok := defaultValue.(string)
-			if !ok {
-				return
+		item := cm.attachTask(pluginName, durableConfigItem(definition))
+		defaultValue := item.DefaultValue
+		if strings.HasPrefix(item.Type, "task:") {
+			text, textOK := defaultValue.(string)
+			if !textOK {
+				return errors.New("plugin task config default must be a string")
 			}
-			if configItem.task != nil {
-				if err := configItem.task.reset(taskValue); err != nil {
-					log.Error("reset plugin task config failed", pluginName, key, err)
-					return
-				}
+			taskValue, stateErr = normalizeTaskConfigValue(item.Type, text)
+			if stateErr != nil {
+				return stateErr
 			}
+			defaultValue = taskValue
+			task = item.task
 		}
-		configItem.Value = defaultValue
-		plugin.Configs[key] = configItem
-		cm.Plugins[pluginName] = plugin
-	}
-	_ = cm.save()
-}
-
-func (cm *ConfigManager) save() error {
-	if cm != nil && cm.owner != nil && cm.owner.DurableStore != nil {
-		return nil
-	}
-	data, err := json.MarshalIndent(cm.Plugins, "", "\t")
+		return cm.owner.setConfigInDomain(ctx, transaction, metadata, pluginName, key, defaultValue)
+	})
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
-
-	return utils.AtomicWriteFile(cm.filename, data, 0o644)
-}
-
-func (cm *ConfigManager) Load() error {
-	cm.lock.Lock()
-	defer cm.lock.Unlock()
-	file, err := os.Open(cm.filename)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // File doesn't exist, maybe first run.
+	applyTask := func() error {
+		if task == nil {
+			return nil
 		}
-		return err
+		return task.reset(taskValue)
 	}
-	defer func(file *os.File) {
-		_ = file.Close()
-	}(file)
-
-	decoder := json.NewDecoder(file)
-	err = decoder.Decode(&cm.Plugins)
-	if err != nil {
-		return err
-	}
-	for i := range cm.Plugins {
-		for j := range cm.Plugins[i].Configs {
-			cm.Plugins[i].Configs[j].Deprecated = true
-		}
+	if err = applyTask(); err != nil {
+		return &ConfigRuntimeApplyError{Err: err}
 	}
 	return nil
+}
+
+func (cm *ConfigManager) PluginConfigs(ctx context.Context) (map[string]*PluginConfig, error) {
+	if cm == nil || cm.owner == nil {
+		return nil, errors.New("config manager owner is unavailable")
+	}
+	state, err := cm.owner.durableExtensionStateShared(ctx)
+	if err != nil {
+		return nil, err
+	}
+	plugins := make(map[string]*PluginConfig, len(state.ExtensionOrder))
+	for _, pluginName := range state.ExtensionOrder {
+		items, itemErr := cm.owner.extensionConfigItemsFromState(ctx, state, pluginName)
+		if itemErr != nil {
+			return nil, itemErr
+		}
+		configs := make(map[string]*ConfigItem, len(items))
+		keys := make([]string, 0, len(items))
+		for _, item := range items {
+			item = cm.attachTask(pluginName, item)
+			configs[item.Key] = item
+			keys = append(keys, item.Key)
+		}
+		plugins[pluginName] = &PluginConfig{
+			PluginName: pluginName, Configs: configs, OrderedConfigKeys: keys,
+		}
+	}
+	return plugins, nil
+}
+
+// Load validates that the authoritative extension projection is readable.
+// It never hydrates a second mutable durability mirror.
+func (cm *ConfigManager) Load() error {
+	if cm == nil || cm.owner == nil || cm.owner.DurableStore == nil {
+		return nil
+	}
+	_, err := cm.owner.durableExtensionStateShared(context.Background())
+	return err
 }
 
 func (i *TextTemplateItemList) toRandomPool() *wr.Chooser[string, uint] {
@@ -2266,101 +2249,8 @@ func getNumVal(i interface{}) uint {
 	}
 }
 
-// loadGroups 加载群组数据。
-// 必须在内置扩展、JS 插件、扩展包全部注册完成后调用：
-// 此时 ExtRegistry 完整，反序列化 activatedExtList 可直接解析为全局共享的 ExtInfo 指针。
-func (d *Dice) loadGroups() {
-	d.ImSession.ServiceAtNew = new(SyncMap[string, *GroupInfo])
-
-	// 显式预热 sonic 编译缓存，避免首个群反序列化时 JIT 编译卡顿。
-	_ = sonic.Pretouch(reflect.TypeOf(groupInfoDecodeJSON{}))
-
-	// json 解码无法传递 Dice 上下文，加载期间临时提供 name -> *ExtInfo 解析器。
-	prevResolver := extJSONResolver
-	extJSONResolver = func(name string) *ExtInfo {
-		if d.ExtRegistry == nil {
-			return nil
-		}
-		if ext, ok := d.ExtRegistry.Load(name); ok && ext != nil {
-			return ext
-		}
-		return nil
-	}
-	defer func() { extJSONResolver = prevResolver }()
-
-	err := service.GroupInfoListGet(d.DBOperator, func(id string, _ int64, data []byte) {
-		var groupInfo GroupInfo
-		if err := sonic.Unmarshal(data, &groupInfo); err != nil {
-			d.Logger.Errorf("加载群信息失败: %s", id)
-			return
-		}
-		groupInfo.GroupID = id
-		groupInfo.UpdatedAtTime = 0
-
-		if groupInfo.DiceIDActiveMap == nil {
-			groupInfo.DiceIDActiveMap = new(SyncMap[string, bool])
-		}
-		if groupInfo.DiceIDExistsMap == nil {
-			groupInfo.DiceIDExistsMap = new(SyncMap[string, bool])
-		}
-		if groupInfo.BotList == nil {
-			groupInfo.BotList = new(SyncMap[string, bool])
-		}
-		if groupInfo.InactivatedExtSet == nil {
-			groupInfo.InactivatedExtSet = StringSet{}
-		}
-
-		var toDelete []string
-		groupInfo.DiceIDExistsMap.Range(func(key string, _ bool) bool {
-			if strings.HasPrefix(key, "QQ-Group:") {
-				toDelete = append(toDelete, key)
-			}
-			return true
-		})
-		for _, key := range toDelete {
-			groupInfo.DiceIDExistsMap.Delete(key)
-		}
-		d.ImSession.ServiceAtNew.Store(id, &groupInfo)
-	})
-	if err != nil {
-		d.Logger.Errorf("加载群信息失败 %s", err)
-	}
-
-	dm := d.Parent
-	now := time.Now().Unix()
-	d.ImSession.ServiceAtNew.Range(func(key string, groupInfo *GroupInfo) bool {
-		dm.GroupNameCache.Store(key, &GroupNameCacheItem{Name: groupInfo.GroupName, time: now})
-		return true
-	})
-}
-
-func (d *Dice) loadAdvanced() {
-	d.Logger.Info("开始读取 advanced.yaml")
-	advancedConfig := AdvancedConfig{
-		Show:                false,
-		Enable:              false,
-		CustomReplyCooldown: DefaultCustomReplyCooldown,
-	} // default value
-
-	data, err := os.ReadFile(filepath.Join(d.BaseConfig.DataDir, "advanced.yaml"))
-	if errors.Is(err, os.ErrNotExist) {
-		d.AdvancedConfig = advancedConfig
-		return
-	} else if err != nil {
-		d.Logger.Error("读取 advanced.yaml 失败 ", err.Error())
-		return
-	}
-
-	err = yaml.Unmarshal(data, &advancedConfig)
-	if err != nil {
-		d.Logger.Error("解析 advanced.yaml 失败 ", err.Error())
-		return
-	}
-	if advancedConfig.CustomReplyCooldown <= 0 {
-		advancedConfig.CustomReplyCooldown = DefaultCustomReplyCooldown
-	}
-
-	d.AdvancedConfig = advancedConfig
+func noticeTargetMatchesEndpoint(target NoticeTarget, endpoint *EndPointInfo) bool {
+	return endpoint != nil && target.MatchesEndpoint(endpoint.Platform, endpoint.ProtocolType)
 }
 
 func (d *Dice) SaveText() {
@@ -2418,8 +2308,56 @@ func saveTextTemplateFile(filename string, data []byte) error {
 	return nil
 }
 
-// ApplyExtDefaultSettings 应用扩展默认配置，同时处理插件的启用和禁用
-// 新扩展激活采用延迟模式，在群组收到消息时通过 GetActivatedExtList 按需激活
+// ExtensionDefaultSettingsView derives detached runtime settings from the
+// authoritative extension projection and the currently loaded definitions.
+func (d *Dice) ExtensionDefaultSettingsView(ctx context.Context) ([]*ExtDefaultSettingItem, error) {
+	state, err := d.durableExtensionStateShared(ctx)
+	if err != nil {
+		return nil, err
+	}
+	settings := make([]*ExtDefaultSettingItem, 0, len(state.ExtensionOrder)+len(d.ExtList))
+	seen := make(map[string]struct{}, len(state.ExtensionOrder))
+	for _, extensionID := range state.ExtensionOrder {
+		defaults, ok := state.DefaultCommands[extensionID]
+		if !ok {
+			continue
+		}
+		disabled := make(map[string]bool, len(defaults.DisabledCommands))
+		for command := range defaults.DisabledCommands {
+			disabled[command] = true
+		}
+		settings = append(settings, &ExtDefaultSettingItem{
+			Name: extensionID, AutoActive: defaults.AutoActive, DisabledCommand: disabled,
+		})
+		seen[extensionID] = struct{}{}
+	}
+	for _, extension := range d.ExtList {
+		if extension == nil {
+			continue
+		}
+		if _, exists := seen[extension.Name]; exists {
+			continue
+		}
+		autoActive := extension.AutoActive
+		disabled := map[string]bool{}
+		if source := extension.DefaultSetting; source != nil {
+			autoActive = source.AutoActive
+			disabled = make(map[string]bool, len(source.DisabledCommand))
+			for command, isDisabled := range source.DisabledCommand {
+				if isDisabled {
+					disabled[command] = true
+				}
+			}
+		}
+		settings = append(settings, &ExtDefaultSettingItem{
+			Name: extension.Name, AutoActive: autoActive, DisabledCommand: disabled,
+		})
+	}
+	return settings, nil
+}
+
+// ApplyExtDefaultSettings applies the projection-derived settings to runtime
+// extension definitions. Group state catches up lazily in its next root.
 func (d *Dice) ApplyExtDefaultSettings() {
 	d.applyExtDefaultSettings(nil, true)
 }
@@ -2432,127 +2370,43 @@ func extensionSelected(only map[string]struct{}, name string) bool {
 	return ok
 }
 
-// applyExtDefaultSettings 是 ApplyExtDefaultSettings 的可限定版本。
-// only 为 nil 时处理全部扩展；否则只处理其中列出的扩展，用于局部加载新插件。
-// resetGroups 为 false 时不触碰各群的手动关闭记录与扩展同步版本：新扩展靠
-// RegisterExtension 递增的 ExtRegistryVersion 让各群在下一条消息时懒同步。
-func (d *Dice) applyExtDefaultSettings(only map[string]struct{}, resetGroups bool) {
-	// 遍历两个列表
-	exts1 := map[string]*ExtDefaultSettingItem{}
-	for _, i := range d.Config.ExtDefaultSettings {
-		exts1[i.Name] = i
-	}
-
-	exts2 := map[string]*ExtInfo{}
-	for _, i := range d.ExtList {
-		exts2[i.Name] = i
-	}
-
-	// 如果存在于扩展列表，但不存在于默认列表中的，添加到默认列表末尾
-	for k, v := range exts2 {
-		if !extensionSelected(only, k) {
-			continue
+func (d *Dice) applyExtDefaultSettings(only map[string]struct{}, defaultsChanged bool) {
+	settings, err := d.ExtensionDefaultSettingsView(context.Background())
+	if err != nil {
+		if d.Logger != nil {
+			d.Logger.Errorf("读取扩展默认设置失败: %v", err)
 		}
-		if _, exists := exts1[k]; !exists {
-			item := &ExtDefaultSettingItem{Name: k, AutoActive: v.AutoActive, DisabledCommand: map[string]bool{}}
-			(&d.Config).ExtDefaultSettings = append((&d.Config).ExtDefaultSettings, item)
-			exts1[k] = item
-		}
-	}
-
-	// 先绑定默认设置到扩展，确保后续激活逻辑能读取AutoActive等
-	// 遍历设置表，将其插入扩展信息
-	for k, v := range exts1 {
-		if !extensionSelected(only, k) {
-			continue
-		}
-		extInfo, exists := exts2[k]
-		if exists {
-			v.ExtItem = extInfo
-			v.Loaded = true
-			extInfo.DefaultSetting = v
-
-			// 为了避免锁问题，这里做一个新的map
-			m := map[string]bool{}
-
-			// 将改扩展拥有的指令，塞入DisabledCommand
-			names := map[string]bool{}
-			for _, v := range extInfo.GetCmdMap() {
-				names[v.Name] = true
-			}
-			// 去掉无效指令
-			for k, v := range v.DisabledCommand {
-				if names[k] {
-					m[k] = v
-				}
-			}
-			// 塞入之前没有的指令
-			for k := range names {
-				if _, exists := m[k]; !exists {
-					m[k] = false // false 因为默认不禁用
-				}
-			}
-			v.DisabledCommand = m
-		} else {
-			// 需要吗?
-			// 也许需要, 模糊地感觉可能造成内存泄漏
-			// v.ExtItem = nil
-			v.Loaded = false
-		}
-	}
-
-	// 新扩展激活已改为延迟模式：在 GetActivatedExtList 中按需激活
-	// 不再遍历所有群组，避免大量群组被标记为 dirty 导致 Save 耗时过长
-	//
-	// 但当默认设置从关闭改为开启（AutoActive=true）时，需要清理群组中的关闭记录，
-	// 并重置群组扩展应用版本，让后续消息触发的延迟同步按新默认配置生效。
-	if resetGroups && d.ImSession != nil && d.ImSession.ServiceAtNew != nil {
-		autoActiveNames := make(map[string]struct{}, len(exts1))
-		for name, setting := range exts1 {
-			if setting != nil && setting.AutoActive {
-				autoActiveNames[name] = struct{}{}
-			}
-		}
-
-		if len(autoActiveNames) > 0 {
-			d.ImSession.ServiceAtNew.Range(func(_ string, group *GroupInfo) bool {
-				if group == nil {
-					return true
-				}
-				group.extInitMu.Lock()
-				group.ensureInactivatedSet()
-				changed := false
-				for name := range autoActiveNames {
-					if _, exists := group.InactivatedExtSet[name]; exists {
-						delete(group.InactivatedExtSet, name)
-						changed = true
-					}
-				}
-				// 触发下一次消息时重新按新默认配置同步扩展状态
-				group.ExtAppliedVersion = 0
-				atomic.StoreInt64(&group.ExtAppliedTime, 0)
-				group.extInitMu.Unlock()
-				if changed {
-					group.MarkDirty(d)
-				}
-				return true
-			})
-		}
-	}
-
-	// 不好分辨，直接标记
-	d.MarkModified()
-}
-
-func (d *Dice) Save(_ bool) {
-	if d == nil || d.DurableStore == nil {
 		return
 	}
-	if err := d.saveEventSourcedConfig(context.Background()); err != nil {
-		if d.Logger != nil {
-			d.Logger.Errorf("保存事件源骰子配置失败: %v", err)
-		} else {
-			logger.M().Errorf("保存事件源骰子配置失败: %v", err)
+	extensions := make(map[string]*ExtInfo, len(d.ExtList))
+	for _, extension := range d.ExtList {
+		if extension != nil {
+			extensions[extension.Name] = extension
+		}
+	}
+	for _, setting := range settings {
+		if setting == nil || !extensionSelected(only, setting.Name) {
+			continue
+		}
+		extension := extensions[setting.Name]
+		if extension == nil {
+			continue
+		}
+		cloned := *setting
+		cloned.ExtItem = extension
+		cloned.Loaded = true
+		disabled := make(map[string]bool)
+		for _, command := range extension.GetCmdMap() {
+			disabled[command.Name] = setting.DisabledCommand[command.Name]
+		}
+		cloned.DisabledCommand = disabled
+		extension.DefaultSetting = &cloned
+	}
+	if defaultsChanged {
+		atomic.AddInt64(&d.ExtRegistryVersion, 1)
+		atomic.StoreInt64(&d.ExtUpdateTime, time.Now().Unix())
+		if only == nil && d.ImSession != nil {
+			d.ImSession.runtimeResources().AdvanceExtensionDefaultsEpoch()
 		}
 	}
 }

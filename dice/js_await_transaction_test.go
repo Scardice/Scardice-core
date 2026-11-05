@@ -5,38 +5,48 @@ import (
 	"errors"
 	"testing"
 
-	"Scardice-core/core/messageflow"
+	"Scardice-core/core/execution"
 	"Scardice-core/eventstore"
 	"Scardice-core/utils/jsengine"
 	gojaengine "Scardice-core/utils/jsengine/goja"
 )
 
 func TestAwaitStorageRemainsInOriginTransaction(t *testing.T) {
-	store, _ := repairTestStore(t)
+	d, store := newCanonicalTestDice(t)
 	loop := gojaengine.WrapEventLoop(startFsTestLoop(t))
 	if err := gojaengine.InstallContextPropagation(loop); err != nil {
 		t.Fatal(err)
 	}
 	manager := NewJsLoopManager()
 	generation := manager.SetLoop(loop)
-	d := &Dice{DurableStore: store, ExtLoopManager: manager}
+	d.ExtLoopManager = manager
 	ext := &ExtInfo{Name: "await-transaction-owner", IsJsExt: true, dice: d, JSLoopVersion: generation}
-	makeMessage := func() (*MsgContext, *messageflow.MutationCollector) {
-		collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-		transaction, err := NewDurableCallbackTransaction(store, collector)
+	// Independent roots writing one plugin namespace conflict on its namespace
+	// revision by design, so the resolver owns a separate namespace.
+	resolverExt := &ExtInfo{Name: "await-transaction-resolver", IsJsExt: true, dice: d, JSLoopVersion: generation}
+	makeMessage := func(label string) (*MsgContext, *execution.MutationCollector) {
+		metadata := eventstore.Metadata{CommandID: label, CorrelationID: label}
+		collector := execution.NewMutationCollector(eventstore.EventFactory{})
+		transaction, err := NewDurableCallbackTransaction(context.Background(), store, collector, metadata)
 		if err != nil {
 			t.Fatal(err)
 		}
-		ctx := &MsgContext{Dice: d, callbackTransaction: transaction}
+		ctx := &MsgContext{
+			Dice: d, callbackTransaction: transaction, callbackMetadata: metadata,
+			executionContext: transaction.executionContext,
+		}
 		t.Cleanup(ctx.releaseExecutionState)
 		return ctx, collector
 	}
-	origin, originCollector := makeMessage()
-	resolver, resolverCollector := makeMessage()
+	origin, originCollector := makeMessage("await-origin")
+	resolver, resolverCollector := makeMessage("await-resolver")
 	if err := loop.Run(func(runtime jsengine.Runtime) error {
 		vm, _ := gojaengine.Raw(runtime)
 		vm.SetFieldNameMapper(gojaengine.FieldNameMapper())
-		return runtime.Bind("extension", ext)
+		if err := runtime.Bind("resolverExtension", newJSExtensionResource(resolverExt, loop)); err != nil {
+			return err
+		}
+		return runtime.Bind("extension", newJSExtensionResource(ext, loop))
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -52,13 +62,13 @@ func TestAwaitStorageRemainsInOriginTransaction(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := jsengine.RunWithContext(loop, jsContextForMessage(ext, resolver), func(runtime jsengine.Runtime) error {
-		_, err := runtime.RunString("resolver.js", `extension.storageSet("resolver", "own"); resolveOrigin();`)
+	if err := jsengine.RunWithContext(loop, jsContextForMessage(resolverExt, resolver), func(runtime jsengine.Runtime) error {
+		_, err := runtime.RunString("resolver.js", `resolverExtension.storageSet("resolver", "own"); resolveOrigin();`)
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
-	commit := func(ctx *MsgContext, collector *messageflow.MutationCollector) {
+	commit := func(ctx *MsgContext, collector *execution.MutationCollector) {
 		if err := ctx.stopJSExecution(); err != nil {
 			t.Fatal(err)
 		}
@@ -70,7 +80,7 @@ func TestAwaitStorageRemainsInOriginTransaction(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := store.Commit(context.Background(), work); err != nil {
-			t.Fatal(err)
+			t.Fatalf("commit %s: %v", ctx.callbackMetadata.CommandID, err)
 		}
 	}
 	commit(resolver, resolverCollector)

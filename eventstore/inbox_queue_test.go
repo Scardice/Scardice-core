@@ -1,6 +1,7 @@
 package eventstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -35,6 +36,199 @@ func TestInboxAcceptanceDedupeAndLaneAllocation(t *testing.T) {
 		t.Fatalf("caller sequence bypassed allocation: %#v", third)
 	}
 }
+
+func TestInboxRedeliveryDeduplicatesStableContentAcrossEnvelopeChanges(t *testing.T) {
+	for _, path := range []string{"accept", "uow-new-id", "uow-same-id"} {
+		t.Run(path, func(t *testing.T) {
+			store, db, _ := openQueueTestStore(t)
+			defer db.Close()
+			ctx := context.Background()
+			original := newInboxTestUpdate("original", "provider", "lane")
+			original.Subject = "group"
+			original.ContentDigest = []byte{1, 2, 3}
+			original.Payload = []byte(`{"endpointId":"endpoint","generation":1,"desiredVersion":1,"message":{"body":"same","providerData":"first"}}`)
+			if _, err := store.AcceptInbox(ctx, original); err != nil {
+				t.Fatal(err)
+			}
+			redelivery := original
+			redelivery.InboxID = "redelivery"
+			redelivery.Payload = []byte(`{"endpointId":"endpoint","generation":2,"desiredVersion":3,"message":{"body":"same","providerData":"redelivered"}}`)
+			var result CommitResult
+			var err error
+			if path == "accept" {
+				result, err = store.AcceptInbox(ctx, redelivery)
+			} else {
+				if path == "uow-same-id" {
+					redelivery.InboxID = original.InboxID
+				}
+				result, err = store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{redelivery}})
+			}
+			if err != nil || !result.Deduplicated || !result.Idempotent || result.OrderingSequence != 1 || result.Version != 1 {
+				t.Fatalf("redelivery=%+v err=%v", result, err)
+			}
+			conflict := redelivery
+			conflict.ContentDigest = []byte{4, 5, 6}
+			if path == "accept" {
+				_, err = store.AcceptInbox(ctx, conflict)
+			} else {
+				_, err = store.Commit(ctx, UnitOfWork{InboxUpdates: []InboxUpdate{conflict}})
+			}
+			if err == nil {
+				t.Fatal("different stable content was accepted as a duplicate")
+			}
+			lease, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "worker"})
+			if err != nil || lease.Update.InboxID != original.InboxID || !bytes.Equal(lease.Update.Payload, original.Payload) || !bytes.Equal(lease.Update.ContentDigest, original.ContentDigest) {
+				t.Fatalf("duplicate replaced the accepted envelope: %+v %v", lease, err)
+			}
+			if _, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "other"}); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("redelivery allocated another row: %v", err)
+			}
+		})
+	}
+}
+
+func TestInboxDigestDedupePreservesExactLaneSubjectAndContent(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		lane    string
+		subject string
+		digest  []byte
+	}{
+		{name: "lane", lane: "Lane", subject: "group", digest: []byte{1}},
+		{name: "subject", lane: "lane", subject: "Group", digest: []byte{1}},
+		{name: "content", lane: "lane", subject: "group", digest: []byte{2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, db, _ := openQueueTestStore(t)
+			defer db.Close()
+			original := newInboxTestUpdate("original", "provider", "lane")
+			original.Subject, original.ContentDigest = "group", []byte{1}
+			if _, err := store.AcceptInbox(context.Background(), original); err != nil {
+				t.Fatal(err)
+			}
+			redelivery := original
+			redelivery.InboxID, redelivery.Lane, redelivery.Subject, redelivery.ContentDigest = "redelivery", tc.lane, tc.subject, tc.digest
+			if _, err := store.AcceptInbox(context.Background(), redelivery); !errors.Is(err, ErrConflict) {
+				t.Fatalf("conflicting redelivery=%v", err)
+			}
+		})
+	}
+}
+
+func TestInboxDigestlessRedeliveryComparesRawPayload(t *testing.T) {
+	for _, digest := range [][]byte{nil, {1}} {
+		t.Run(fmt.Sprintf("stored-digest-%x", digest), func(t *testing.T) {
+			store, db, _ := openQueueTestStore(t)
+			defer db.Close()
+			original := newInboxTestUpdate("original", "provider", "lane")
+			original.ContentDigest = digest
+			if _, err := store.AcceptInbox(context.Background(), original); err != nil {
+				t.Fatal(err)
+			}
+			redelivery := original
+			redelivery.InboxID, redelivery.ContentDigest = "redelivery", nil
+			if result, err := store.AcceptInbox(context.Background(), redelivery); err != nil || !result.Deduplicated {
+				t.Fatalf("digestless duplicate=%+v err=%v", result, err)
+			}
+			redelivery.Payload = []byte("different raw body")
+			if _, err := store.AcceptInbox(context.Background(), redelivery); !errors.Is(err, ErrConflict) {
+				t.Fatalf("digestless content conflict=%v", err)
+			}
+			if len(digest) == 0 {
+				redelivery.Payload = original.Payload
+				redelivery.ContentDigest = []byte{1}
+				if _, err := store.AcceptInbox(context.Background(), redelivery); !errors.Is(err, ErrConflict) {
+					t.Fatalf("supplied digest matched a digestless stored row: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestInboxExpiredCallbackRecoveryRollsBackAndNeverReplays(t *testing.T) {
+	store, db, clock := openQueueTestStore(t)
+	defer db.Close()
+	ctx := context.Background()
+	original := newInboxTestUpdate("callback", "provider", "lane")
+	if _, err := store.AcceptInbox(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcceptInbox(ctx, newInboxTestUpdate("successor", "next-provider", "lane")); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "worker", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateInbox(ctx, InboxUpdate{
+		InboxID: lease.Update.InboxID, ExpectedVersion: lease.Update.Version, Status: InboxStatusCallbackStarted,
+		LeaseOwner: lease.Update.LeaseOwner, LeaseEpoch: lease.Update.LeaseEpoch, AttemptID: lease.Update.AttemptID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(30 * time.Second)
+	renewed, err := store.RenewInbox(ctx, InboxRenewRequest{
+		InboxID: original.InboxID, WorkerID: lease.Update.LeaseOwner, LeaseEpoch: lease.Update.LeaseEpoch,
+		AttemptID: lease.Update.AttemptID, LeaseDuration: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(30 * time.Second)
+	if _, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "blocked"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("recovery ignored renewed expiry: %v", err)
+	}
+	clock.Advance(30 * time.Second)
+	if available, err := store.HasInboxWork(ctx); err != nil || !available {
+		t.Fatalf("expired callback was not scheduled: %v %v", available, err)
+	}
+	if err := db.GORM().Exec("CREATE TRIGGER reject_callback_recovery BEFORE UPDATE ON lane_heads WHEN NEW.active_id = 'successor' BEGIN SELECT RAISE(ABORT, 'injected'); END").Error; err != nil {
+		t.Fatal(err)
+	}
+	if recovered, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "restarted"}); err == nil || recovered.Update.InboxID != "" {
+		t.Fatalf("failed recovery returned a lease: %+v %v", recovered, err)
+	}
+	var before inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", original.InboxID).Take(&before).Error; err != nil {
+		t.Fatal(err)
+	}
+	if before.Status != InboxStatusCallbackStarted || before.Version != renewed.Update.Version || before.CompletedAt != nil ||
+		before.LeaseExpiry == nil || !before.LeaseExpiry.Equal(renewed.Update.LeaseExpiresAt) || before.CallbackStartedAt == nil || !bytes.Equal(before.Payload, original.Payload) {
+		t.Fatalf("failed recovery escaped rollback: %+v", before)
+	}
+	if err := db.GORM().Exec("DROP TRIGGER reject_callback_recovery").Error; err != nil {
+		t.Fatal(err)
+	}
+	next, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "restarted"})
+	if err != nil || next.Update.InboxID != "successor" {
+		t.Fatalf("recovery did not advance the lane: %+v %v", next, err)
+	}
+	var recovered inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", original.InboxID).Take(&recovered).Error; err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Status != InboxStatusAmbiguous || recovered.Version != renewed.Update.Version+1 || recovered.LeaseExpiry != nil ||
+		recovered.CompletedAt == nil || !recovered.CompletedAt.Equal(clock.Now()) || !bytes.Equal(recovered.Payload, original.Payload) ||
+		recovered.LeaseOwner != lease.Update.LeaseOwner || recovered.LeaseEpoch != lease.Update.LeaseEpoch || recovered.AttemptID != lease.Update.AttemptID ||
+		recovered.CallbackStartedAt == nil || !recovered.CallbackStartedAt.Equal(*before.CallbackStartedAt) {
+		t.Fatalf("recovered callback metadata/body=%+v", recovered)
+	}
+	if _, err := store.RenewInbox(ctx, InboxRenewRequest{
+		InboxID: original.InboxID, WorkerID: lease.Update.LeaseOwner, LeaseEpoch: lease.Update.LeaseEpoch, AttemptID: lease.Update.AttemptID,
+	}); !errors.Is(err, ErrStaleLease) {
+		t.Fatalf("recovered callback owner renewed its lease: %v", err)
+	}
+	if _, err := store.UpdateInbox(ctx, InboxUpdate{
+		InboxID: next.Update.InboxID, ExpectedVersion: next.Update.Version, Status: InboxStatusFailed,
+		LeaseOwner: next.Update.LeaseOwner, LeaseEpoch: next.Update.LeaseEpoch, AttemptID: next.Update.AttemptID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "replay-check"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired callback was replayed: %v", err)
+	}
+}
+
 func TestInboxIsolatedFailuresDoNotBlockSuccessorsOrReplay(t *testing.T) {
 	store, db, _ := openQueueTestStore(t)
 	defer db.Close()
@@ -98,8 +292,8 @@ func TestInboxIsolatedFailuresDoNotBlockSuccessorsOrReplay(t *testing.T) {
 	if err := db.GORM().Where("inbox_id = ?", "inbox-1").First(&row).Error; err != nil {
 		t.Fatal(err)
 	}
-	if row.Status != InboxStatusConfirmedConsumed || len(row.PayloadCiphertext) != 0 || len(row.PayloadNonce) != 0 {
-		t.Fatalf("resolved isolated inbox = %#v", row)
+	if row.Status != InboxStatusConfirmedConsumed || string(row.Payload) != "inbound-payload" {
+		t.Fatalf("resolved inbox payload/status = %q/%q", row.Payload, row.Status)
 	}
 }
 func TestInboxLeaseRenewalRequiresCurrentOwnerEpochAndAttempt(t *testing.T) {
@@ -160,7 +354,7 @@ func TestInboxConcurrentAcceptanceAllocatesUniqueSequences(t *testing.T) {
 		}
 	}
 	var rows []inboxMessageRow
-	if err := db.GORM().Where("lane_hmac = ?", []byte("shared-lane")).Order("ordering_sequence ASC").Find(&rows).Error; err != nil {
+	if err := db.GORM().Where("lane = ?", "shared-lane").Order("ordering_sequence ASC").Find(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
 	if len(rows) != count {
@@ -170,84 +364,6 @@ func TestInboxConcurrentAcceptanceAllocatesUniqueSequences(t *testing.T) {
 		if row.OrderingSequence != uint64(i+1) {
 			t.Fatalf("sequence[%d] = %d", i, row.OrderingSequence)
 		}
-	}
-}
-func TestInboxPayloadExpiryScrubsWithoutUnblockingRetry(t *testing.T) {
-	store, db, clock := openQueueTestStore(t)
-	defer db.Close()
-	expiry := clock.Now().Add(time.Minute)
-	u := newInboxTestUpdate("expiry-inbox", "expiry-provider", "expiry-lane")
-	u.PayloadExpiresAt = expiry
-	if _, err := store.AcceptInbox(context.Background(), u); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.ClaimInbox(context.Background(), InboxClaimRequest{WorkerID: "worker", LeaseDuration: time.Minute}); err != nil {
-		t.Fatal(err)
-	}
-	clock.Advance(2 * time.Minute)
-	if _, err := store.ClaimInbox(context.Background(), InboxClaimRequest{WorkerID: "worker", LeaseDuration: time.Minute}); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("expired claim err = %v", err)
-	}
-	var row inboxMessageRow
-	if err := db.GORM().Where("inbox_id = ?", "expiry-inbox").First(&row).Error; err != nil {
-		t.Fatal(err)
-	}
-	if row.Status != InboxStatusLeased || len(row.PayloadCiphertext) != 0 || len(row.PayloadNonce) != 0 {
-		t.Fatalf("expired row = %#v", row)
-	}
-}
-func TestInboxIngressRejectsPayloadTTLBypass(t *testing.T) {
-	store, db, clock := openQueueTestStore(t)
-	defer db.Close()
-	update := newInboxTestUpdate("ttl-inbox", "ttl-provider", "ttl-lane")
-	update.PayloadExpiresAt = clock.Now().Add(InboxPayloadTTL + time.Second)
-	if _, err := store.AcceptInbox(context.Background(), update); !errors.Is(err, ErrInvalidTTL) {
-		t.Fatalf("inbox ttl err = %v", err)
-	}
-	expired := newInboxTestUpdate("ttl-expired-inbox", "ttl-expired-provider", "ttl-expired-lane")
-	expired.PayloadExpiresAt = clock.Now().Add(-time.Second)
-	if _, err := store.AcceptInbox(context.Background(), expired); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("expired inbox ttl err = %v", err)
-	}
-}
-func TestInboxCallbackExpiryScrubsWithoutUnblockingRetry(t *testing.T) {
-	store, db, clock := openQueueTestStore(t)
-	defer db.Close()
-	update := newInboxTestUpdate("callback-expired", "callback-provider", "callback-lane")
-	update.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.AcceptInbox(context.Background(), update); err != nil {
-		t.Fatal(err)
-	}
-	claimed, err := store.ClaimInbox(context.Background(), InboxClaimRequest{WorkerID: "worker", LeaseDuration: time.Hour})
-	if err != nil {
-		t.Fatal(err)
-	}
-	callback := InboxUpdate{InboxID: claimed.Update.InboxID, ExpectedVersion: claimed.Update.Version, Status: InboxStatusCallbackStarted, LeaseOwner: claimed.Update.LeaseOwner, LeaseEpoch: claimed.Update.LeaseEpoch, AttemptID: claimed.Update.AttemptID}
-	if _, err := store.UpdateInbox(context.Background(), callback); err != nil {
-		t.Fatal(err)
-	}
-	clock.Advance(2 * time.Minute)
-	if _, err := store.ClaimInbox(context.Background(), InboxClaimRequest{WorkerID: "other", LeaseDuration: time.Minute}); !errors.Is(err, ErrPayloadExpired) {
-		t.Fatalf("callback expiry err = %v", err)
-	}
-	var row inboxMessageRow
-	if err := db.GORM().Where("inbox_id = ?", update.InboxID).First(&row).Error; err != nil {
-		t.Fatal(err)
-	}
-	if row.Status != InboxStatusCallbackStarted || len(row.PayloadCiphertext) != 0 || len(row.PayloadNonce) != 0 {
-		t.Fatalf("callback expiry row = %#v", row)
-	}
-	if _, err := store.ResolveInbox(context.Background(), InboxResolutionRequest{
-		InboxID: row.InboxID, ExpectedVersion: row.Version, Resolution: InboxResolutionSkip,
-		PrincipalID: "operator", Reason: "callback expired",
-	}); err != nil {
-		t.Fatalf("callback expiry resolve err = %v", err)
-	}
-	if err := db.GORM().Where("inbox_id = ?", row.InboxID).First(&row).Error; err != nil {
-		t.Fatal(err)
-	}
-	if row.Status != InboxStatusSkipped {
-		t.Fatalf("callback expiry resolved status = %q", row.Status)
 	}
 }
 func TestUOWCallbackStartedTimestamp(t *testing.T) {
@@ -273,53 +389,43 @@ func TestUOWCallbackStartedTimestamp(t *testing.T) {
 		t.Fatalf("callback-started participant row = %#v", row)
 	}
 }
-func TestInboxIngressAllowsExplicitReacceptAfterDedupeTTL(t *testing.T) {
-	store, db, clock := openQueueTestStore(t)
+
+func TestInboxPersistsPlaintextSubjectAndOmitsSubjectOnDuplicate(t *testing.T) {
+	store, db, _ := openQueueTestStore(t)
 	defer db.Close()
-	ctx := context.Background()
-	first := newInboxTestUpdate("ttl-reaccept-first", "ttl-reaccept-provider", "ttl-reaccept-lane")
-	first.PayloadExpiresAt = clock.Now().Add(7 * 24 * time.Hour)
-	if _, err := store.AcceptInbox(ctx, first); err != nil {
+
+	update := newInboxTestUpdate("subject-inbox", "subject-provider", "subject-lane")
+	update.Subject = "group:plain"
+	if _, err := store.AcceptInbox(context.Background(), update); err != nil {
 		t.Fatal(err)
 	}
-	clock.Advance(7*24*time.Hour + time.Second)
-	second := newInboxTestUpdate("ttl-reaccept-second", "ttl-reaccept-provider", "ttl-reaccept-lane")
-	second.PayloadExpiresAt = clock.Now().Add(7 * 24 * time.Hour)
-	second.AllowExpiredDedupe = true
-	result, err := store.AcceptInbox(ctx, second)
+	lease, err := store.ClaimInbox(context.Background(), InboxClaimRequest{WorkerID: "subject-worker", LeaseDuration: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Deduplicated || len(result.InboxIDs) != 1 || result.InboxIDs[0] != second.InboxID {
-		t.Fatalf("post-TTL result = %#v", result)
+	if lease.Update.Subject != update.Subject {
+		t.Fatalf("claimed subject = %q, want %q", lease.Update.Subject, update.Subject)
 	}
-}
-func TestInboxIngressAllowsExplicitReacceptAfterTerminalDedupeTTL(t *testing.T) {
-	store, db, clock := openQueueTestStore(t)
-	defer db.Close()
-	ctx := context.Background()
-	first := newInboxTestUpdate("ttl-terminal-first", "ttl-terminal-provider", "ttl-terminal-lane")
-	first.PayloadExpiresAt = clock.Now().Add(7 * 24 * time.Hour)
-	if _, err := store.AcceptInbox(ctx, first); err != nil {
+	if _, err := store.UpdateInbox(context.Background(), InboxUpdate{
+		InboxID: lease.Update.InboxID, ExpectedVersion: lease.Update.Version,
+		Status: InboxStatusCallbackStarted, LeaseOwner: lease.Update.LeaseOwner,
+		LeaseEpoch: lease.Update.LeaseEpoch, AttemptID: lease.Update.AttemptID,
+	}); err != nil {
 		t.Fatal(err)
 	}
-	lease, claimErr := store.ClaimInbox(ctx, InboxClaimRequest{WorkerID: "ttl-terminal-worker", LeaseDuration: time.Minute})
-	if claimErr != nil {
-		t.Fatal(claimErr)
-	}
-	if _, err := store.ResolveInbox(ctx, InboxResolutionRequest{InboxID: lease.Update.InboxID, ExpectedVersion: lease.Update.Version, Resolution: InboxResolutionConfirmedConsumed, PrincipalID: "test", Reason: "terminal"}); err != nil {
+	if _, err := store.Commit(context.Background(), UnitOfWork{InboxUpdates: []InboxUpdate{{
+		InboxID: lease.Update.InboxID, ExpectedVersion: lease.Update.Version + 1,
+		Status: InboxStatusConfirmedConsumed, LeaseOwner: lease.Update.LeaseOwner,
+		LeaseEpoch: lease.Update.LeaseEpoch, AttemptID: lease.Update.AttemptID,
+	}}}); err != nil {
 		t.Fatal(err)
 	}
-	clock.Advance(7*24*time.Hour + time.Second)
-	second := newInboxTestUpdate("ttl-terminal-second", "ttl-terminal-provider", "ttl-terminal-lane")
-	second.PayloadExpiresAt = clock.Now().Add(7 * 24 * time.Hour)
-	second.AllowExpiredDedupe = true
-	result, claimErr := store.AcceptInbox(ctx, second)
-	if claimErr != nil {
-		t.Fatal(claimErr)
+	var row inboxMessageRow
+	if err := db.GORM().Where("inbox_id = ?", update.InboxID).First(&row).Error; err != nil {
+		t.Fatal(err)
 	}
-	if result.Deduplicated || len(result.InboxIDs) != 1 || result.InboxIDs[0] != second.InboxID {
-		t.Fatalf("post-terminal-TTL result = %#v", result)
+	if row.Subject != update.Subject || string(row.Payload) != string(update.Payload) {
+		t.Fatalf("terminal inbox metadata = %#v", row)
 	}
 }
 func TestInboxStatusesReportWhatBecameOfEachRow(t *testing.T) {

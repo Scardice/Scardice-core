@@ -26,19 +26,14 @@ import (
 // repeatable-read; the importer consumes only the resulting owner-only local
 // SQLite snapshot.
 type RemoteSQLSource struct {
-	Root      string
-	Config    eventstore.DatabaseConfig
-	keySource eventstore.KeySource
+	Root   string
+	Config eventstore.DatabaseConfig
 
 	open func(context.Context, eventstore.DatabaseConfig) (*sql.DB, error)
 }
 
 func NewRemoteSQLSource(root string, config eventstore.DatabaseConfig) *RemoteSQLSource {
 	return &RemoteSQLSource{Root: filepath.Clean(root), Config: config}
-}
-
-func NewRemoteSQLSourceWithKeySource(root string, config eventstore.DatabaseConfig, keySource eventstore.KeySource) *RemoteSQLSource {
-	return &RemoteSQLSource{Root: filepath.Clean(root), Config: config, keySource: keySource}
 }
 
 func (s *RemoteSQLSource) Inventory(ctx context.Context) (SourceInventory, error) {
@@ -123,7 +118,7 @@ func (s *RemoteSQLSource) Snapshot(ctx context.Context, target string) (result S
 	if !filesystemBefore.Equal(filesystemAfter) {
 		return result, ErrSourceDrift
 	}
-	snapshotSource, err := newLegacySnapshotSource(target, s.keySource, root, instances)
+	snapshotSource, err := newLegacySnapshotSource(target, root, instances)
 	if err != nil {
 		return result, err
 	}
@@ -178,7 +173,7 @@ func (s *RemoteSQLSource) layout(ctx context.Context) (*LegacySource, *legacySou
 	if s == nil || strings.TrimSpace(s.Root) == "" || s.Root == "." {
 		return nil, nil, nil, nil, ErrSourceRequired
 	}
-	legacy := NewLegacySourceWithKeySource(s.Root, s.keySource)
+	legacy := NewLegacySource(s.Root)
 	root, err := openLegacySourceRoot(legacy.Root)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -247,9 +242,7 @@ func validateRemoteLegacySchema(ctx context.Context, queryer interface {
 	return nil
 }
 
-func remoteLegacyMetadata(ctx context.Context, queryer interface {
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-}) (FileMetadata, error) {
+func remoteLegacyMetadata(ctx context.Context, queryer *sql.Tx) (FileMetadata, error) {
 	digest := sha256.New()
 	var size int64
 	if err := digestRemoteGroups(ctx, queryer, digest, &size); err != nil {
@@ -279,29 +272,77 @@ func combineRemoteMetadata(filesystem SourceMetadata, remote FileMetadata) Sourc
 }
 
 const (
-	remoteLegacyGroupsQuery  = "SELECT id, COALESCE(created_at, 0), data FROM group_info ORDER BY id"
-	remoteLegacyPlayersQuery = "SELECT COALESCE(name, ''), COALESCE(user_id, ''), COALESCE(last_command_time, 0), COALESCE(auto_set_name_template, ''), COALESCE(dice_side_num, 0), COALESCE(group_id, '') FROM group_player_info ORDER BY group_id, user_id"
+	// Group copying and source proofs read the same nullable fields. The
+	// without-column variant preserves the historical optional updated_at.
+	remoteLegacyGroupRowsQuery          = "SELECT id, created_at, updated_at, data IS NULL, data FROM group_info ORDER BY id"
+	remoteLegacyGroupRowsNoUpdatedQuery = "SELECT id, created_at, NULL, data IS NULL, data FROM group_info ORDER BY id"
+	remoteLegacyPlayersQuery            = "SELECT COALESCE(name, ''), COALESCE(user_id, ''), COALESCE(last_command_time, 0), COALESCE(auto_set_name_template, ''), COALESCE(dice_side_num, 0), COALESCE(group_id, '') FROM group_player_info ORDER BY group_id, user_id"
 )
 
-func digestRemoteGroups(ctx context.Context, queryer interface {
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-}, digest hash.Hash, size *int64) (resultErr error) {
-	rows, err := queryer.QueryContext(ctx, remoteLegacyGroupsQuery)
+type remoteGroupRow struct {
+	id        string
+	createdAt sql.NullInt64
+	updatedAt sql.NullInt64
+	dataNull  bool
+	data      []byte
+}
+
+func queryRemoteGroupRows(ctx context.Context, source *sql.Tx) (*sql.Rows, bool, error) {
+	hasUpdatedAt, err := remoteGroupUpdatedAtExists(ctx, source)
+	if err != nil {
+		return nil, false, err
+	}
+	query := remoteLegacyGroupRowsQuery
+	if !hasUpdatedAt {
+		query = remoteLegacyGroupRowsNoUpdatedQuery
+	}
+	rows, err := source.QueryContext(ctx, query)
+	return rows, hasUpdatedAt, err
+}
+
+func scanRemoteGroupRow(rows *sql.Rows) (remoteGroupRow, error) {
+	var row remoteGroupRow
+	err := rows.Scan(&row.id, &row.createdAt, &row.updatedAt, &row.dataNull, &row.data)
+	// Some drivers scan an empty BLOB into a nil slice. Preserve its SQL
+	// presence when binding it into the snapshot instead of creating NULL.
+	if err == nil && !row.dataNull && row.data == nil {
+		row.data = []byte{}
+	}
+	return row, err
+}
+
+func digestRemoteGroups(ctx context.Context, source *sql.Tx, digest hash.Hash, size *int64) (resultErr error) {
+	rows, hasUpdatedAt, err := queryRemoteGroupRows(ctx, source)
 	if err != nil {
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, rows.Close()) }()
 	writeDigestField(digest, []byte("group_info"), size)
+	var presence [1]byte
+	if hasUpdatedAt {
+		presence[0] = 1
+	}
+	writeDigestField(digest, presence[:], size)
 	for rows.Next() {
-		var id string
-		var createdAt int64
-		var data []byte
-		if err = rows.Scan(&id, &createdAt, &data); err != nil {
+		row, err := scanRemoteGroupRow(rows)
+		if err != nil {
 			return err
 		}
-		writeDigestField(digest, []byte(id), size)
-		writeDigestField(digest, []byte(strconv.FormatInt(createdAt, 10)), size)
-		writeDigestField(digest, data, size)
+		writeDigestField(digest, []byte(row.id), size)
+		for _, timestamp := range [...]sql.NullInt64{row.createdAt, row.updatedAt} {
+			var field [9]byte
+			if timestamp.Valid {
+				field[0] = 1
+				binary.BigEndian.PutUint64(field[1:], uint64(timestamp.Int64))
+			}
+			writeDigestField(digest, field[:], size)
+		}
+		presence[0] = 0
+		if !row.dataNull {
+			presence[0] = 1
+		}
+		writeDigestField(digest, presence[:], size)
+		writeDigestField(digest, row.data, size)
 	}
 	return rows.Err()
 }
@@ -331,7 +372,7 @@ func digestRemotePlayers(ctx context.Context, queryer interface {
 func digestRemoteAttrs(ctx context.Context, queryer interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }, digest hash.Hash, size *int64) (resultErr error) {
-	rows, err := queryer.QueryContext(ctx, "SELECT id, data, COALESCE(attrs_type, ''), COALESCE(binding_sheet_id, ''), COALESCE(name, ''), COALESCE(owner_id, ''), COALESCE(sheet_type, ''), COALESCE(is_hidden, false), COALESCE(created_at, 0), COALESCE(updated_at, 0) FROM attrs ORDER BY id")
+	rows, err := queryer.QueryContext(ctx, "SELECT COALESCE(id, ''), data, COALESCE(attrs_type, ''), COALESCE(binding_sheet_id, ''), COALESCE(name, ''), COALESCE(owner_id, ''), COALESCE(sheet_type, ''), COALESCE(is_hidden, false), COALESCE(created_at, 0), COALESCE(updated_at, 0) FROM attrs ORDER BY id")
 	if err != nil {
 		return err
 	}
@@ -354,7 +395,8 @@ func digestRemoteAttrs(ctx context.Context, queryer interface {
 	return rows.Err()
 }
 
-func isMissingBanUpdatedAtColumn(err error) bool {
+// isMissingColumn reports whether err says the named column does not exist.
+func isMissingColumn(err error, column string) bool {
 	if err == nil {
 		return false
 	}
@@ -367,7 +409,7 @@ func isMissingBanUpdatedAtColumn(err error) bool {
 		return postgresErr.Code == "42703"
 	}
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "ban_updated_at") &&
+	return strings.Contains(message, column) &&
 		(strings.Contains(message, "no such column") ||
 			strings.Contains(message, "unknown column") ||
 			strings.Contains(message, "does not exist"))
@@ -380,7 +422,7 @@ func queryRemoteBanRows(ctx context.Context, queryer interface {
 	if err == nil {
 		return rows, true, nil
 	}
-	if !isMissingBanUpdatedAtColumn(err) {
+	if !isMissingColumn(err, "ban_updated_at") {
 		return nil, false, err
 	}
 	rows, err = queryer.QueryContext(ctx, "SELECT id, data FROM ban_info ORDER BY id")
@@ -447,10 +489,10 @@ func writeRemoteLegacySQLiteSnapshot(ctx context.Context, source *sql.Tx, path s
 	}
 	defer func() { resultErr = errors.Join(resultErr, destination.Close()) }()
 	for _, statement := range []string{
-		`CREATE TABLE group_info (id TEXT PRIMARY KEY, created_at INTEGER, updated_at INTEGER DEFAULT 0, data BLOB NOT NULL)`,
+		`CREATE TABLE group_info (id TEXT PRIMARY KEY, created_at INTEGER, updated_at INTEGER, data BLOB)`,
 		`CREATE TABLE group_player_info (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, user_id TEXT, last_command_time INTEGER, auto_set_name_template TEXT, dice_side_num INTEGER, group_id TEXT)`,
 		`CREATE TABLE attrs (id TEXT, data BLOB, attrs_type TEXT, binding_sheet_id TEXT, name TEXT, owner_id TEXT, sheet_type TEXT, is_hidden INTEGER, created_at INTEGER, updated_at INTEGER)`,
-		`CREATE TABLE ban_info (id TEXT PRIMARY KEY, data BLOB NOT NULL, ban_updated_at INTEGER NOT NULL DEFAULT 0)`,
+		`CREATE TABLE ban_info (id TEXT PRIMARY KEY, data BLOB, ban_updated_at INTEGER NOT NULL DEFAULT 0)`,
 	} {
 		if _, err = destination.ExecContext(ctx, statement); err != nil {
 			return err
@@ -481,24 +523,22 @@ func writeRemoteLegacySQLiteSnapshot(ctx context.Context, source *sql.Tx, path s
 }
 
 func copyRemoteGroups(ctx context.Context, source *sql.Tx, destination *sql.Tx) (resultErr error) {
-	rows, err := source.QueryContext(ctx, remoteLegacyGroupsQuery)
+	rows, _, err := queryRemoteGroupRows(ctx, source)
 	if err != nil {
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, rows.Close()) }()
-	statement, err := destination.PrepareContext(ctx, "INSERT INTO group_info (id, created_at, data) VALUES (?, ?, ?)")
+	statement, err := destination.PrepareContext(ctx, "INSERT INTO group_info (id, created_at, updated_at, data) VALUES (?, ?, ?, ?)")
 	if err != nil {
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, statement.Close()) }()
 	for rows.Next() {
-		var id string
-		var createdAt int64
-		var data []byte
-		if err = rows.Scan(&id, &createdAt, &data); err != nil {
+		row, err := scanRemoteGroupRow(rows)
+		if err != nil {
 			return err
 		}
-		if _, err = statement.ExecContext(ctx, id, createdAt, data); err != nil {
+		if _, err = statement.ExecContext(ctx, row.id, row.createdAt, row.updatedAt, row.data); err != nil {
 			return err
 		}
 	}
@@ -530,7 +570,7 @@ func copyRemotePlayers(ctx context.Context, source *sql.Tx, destination *sql.Tx)
 }
 
 func copyRemoteAttrs(ctx context.Context, source *sql.Tx, destination *sql.Tx) (resultErr error) {
-	rows, err := source.QueryContext(ctx, "SELECT id, data, COALESCE(attrs_type, ''), COALESCE(binding_sheet_id, ''), COALESCE(name, ''), COALESCE(owner_id, ''), COALESCE(sheet_type, ''), COALESCE(is_hidden, false), COALESCE(created_at, 0), COALESCE(updated_at, 0) FROM attrs ORDER BY id")
+	rows, err := source.QueryContext(ctx, "SELECT COALESCE(id, ''), data, COALESCE(attrs_type, ''), COALESCE(binding_sheet_id, ''), COALESCE(name, ''), COALESCE(owner_id, ''), COALESCE(sheet_type, ''), COALESCE(is_hidden, false), COALESCE(created_at, 0), COALESCE(updated_at, 0) FROM attrs ORDER BY id")
 	if err != nil {
 		return err
 	}
@@ -585,4 +625,37 @@ func copyRemoteBans(ctx context.Context, source *sql.Tx, destination *sql.Tx) (r
 		}
 	}
 	return rows.Err()
+}
+
+// remoteGroupUpdatedAtExists probes the optional group_info.updated_at column
+// inside the snapshot transaction. The probe runs under a savepoint so that a
+// missing column (an error that aborts a PostgreSQL transaction) leaves the
+// snapshot transaction usable.
+func remoteGroupUpdatedAtExists(ctx context.Context, source *sql.Tx) (exists bool, resultErr error) {
+	const savepoint = "scardice_group_updated_at_probe"
+	if _, err := source.ExecContext(ctx, "SAVEPOINT "+savepoint); err != nil {
+		return false, err
+	}
+	probeErr := func() (readErr error) {
+		rows, err := source.QueryContext(ctx, "SELECT updated_at FROM group_info WHERE 1=0")
+		if err != nil {
+			return err
+		}
+		defer func() { readErr = errors.Join(readErr, rows.Close()) }()
+		return rows.Err()
+	}()
+	if probeErr == nil {
+		_, releaseErr := source.ExecContext(ctx, "RELEASE SAVEPOINT "+savepoint)
+		return true, releaseErr
+	}
+	if _, err := source.ExecContext(ctx, "ROLLBACK TO SAVEPOINT "+savepoint); err != nil {
+		return false, errors.Join(probeErr, err)
+	}
+	if _, err := source.ExecContext(ctx, "RELEASE SAVEPOINT "+savepoint); err != nil {
+		return false, err
+	}
+	if !isMissingColumn(probeErr, "updated_at") {
+		return false, probeErr
+	}
+	return false, nil
 }

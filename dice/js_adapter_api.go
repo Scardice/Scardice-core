@@ -31,7 +31,7 @@ func (d *Dice) checkAdapterAPIExecution(loop jsengine.Loop, generation int64, ex
 	switch active := jsengine.CurrentContext(loop).(type) {
 	case nil:
 	case *jsExecutionContext:
-		if err := jsengine.ContextForExecution(active).Err(); err != nil {
+		if err := jsengine.ExecutionErr(active); err != nil {
 			return err
 		}
 	default:
@@ -41,7 +41,8 @@ func (d *Dice) checkAdapterAPIExecution(loop jsengine.Loop, generation int64, ex
 		// The trusted administrator console has no script or message scope.
 		return nil
 	}
-	if !d.Config.JsEnable {
+	config := d.Config()
+	if config == nil || !config.JsEnable {
 		return errAdapterExtensionUnavailable
 	}
 	if err := execution.ExecutionContext().Err(); err != nil {

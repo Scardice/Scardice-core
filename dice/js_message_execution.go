@@ -4,26 +4,46 @@ import (
 	"context"
 	"errors"
 	"sync"
+
+	"Scardice-core/utils/jsengine"
 )
 
-// Shared by every realm entered for one message, including delayed callbacks.
-// Revocation joins active JS entries before the host snapshots or releases state.
+// Shared by every realm entered for one invocation, including delayed
+// callbacks. The root and its admitted children use one completion barrier,
+// but no callback holds the realm while a Promise is pending.
 type jsMessageExecution struct {
 	ctx            context.Context
 	cancel         context.CancelCauseFunc
 	cancelDeadline context.CancelFunc
-	gate           sync.RWMutex
+	stopBinding    func() bool
 	errMu          sync.Mutex
 	err            error
 
+	registryMu    sync.Mutex
+	registries    map[jsInvocationRegistryKey]*jsInvocationRegistry
 	pendingMu     sync.Mutex
 	pending       int
+	running       int
 	stopping      bool
 	pendingDone   chan struct{}
 	pendingClosed bool
 }
 
 var errJSExecutionCompleted = errors.New("javascript execution completed")
+
+func newJSMessageExecution(parent context.Context) *jsMessageExecution {
+	if parent == nil {
+		parent = context.Background()
+	}
+	deadline, cancelDeadline := context.WithTimeout(parent, jsSolveAwaitTimeout)
+	lifetime, cancel := context.WithCancelCause(deadline)
+	return &jsMessageExecution{
+		ctx:            lifetime,
+		cancel:         cancel,
+		cancelDeadline: cancelDeadline,
+		pendingDone:    make(chan struct{}),
+	}
+}
 
 func (ctx *MsgContext) messageJSExecution() *jsMessageExecution {
 	if ctx == nil {
@@ -36,51 +56,31 @@ func (ctx *MsgContext) messageJSExecution() *jsMessageExecution {
 	defer ctx.jsExecutionMu.Unlock()
 	if ctx.jsExecution == nil {
 		parent := ctx.executionContext
-		if parent == nil {
-			parent = context.Background()
-		}
 		if ctx.callbackTransaction != nil && ctx.callbackTransaction.executionContext != nil {
 			parent = ctx.callbackTransaction.executionContext
 		}
-		deadline, cancelDeadline := context.WithTimeout(parent, jsSolveAwaitTimeout)
-		lifetime, cancel := context.WithCancelCause(deadline)
-		ctx.jsExecution = &jsMessageExecution{
-			ctx:            lifetime,
-			cancel:         cancel,
-			cancelDeadline: cancelDeadline,
-			pendingDone:    make(chan struct{}),
-		}
+		ctx.jsExecution = newJSMessageExecution(parent)
 		if ctx.executionReleased.Load() {
-			cancel(context.Canceled)
-			cancelDeadline()
+			ctx.jsExecution.cancel(context.Canceled)
+			ctx.jsExecution.cancelDeadline()
 		}
 	}
 	return ctx.jsExecution
 }
 
-// beginJSCallbackChild accounts for a scheduled or owner-reentrant hook until
-// its returned Promise settles. Descendants may join while another child is
-// still pending; once the count drains during stop, admission stays closed.
-func (ctx *MsgContext) beginJSCallbackChild() (func(), error) {
-	if ctx == nil {
+// beginChild accounts for an admitted asynchronous child until its Promise or
+// host completion settles. During stop, descendants may still join while an
+// admitted child/turn is alive; admission closes atomically at zero.
+func (execution *jsMessageExecution) beginChild() (func(), error) {
+	if execution == nil {
 		return func() {}, nil
 	}
-	if ctx.executionParent != nil {
-		return ctx.executionParent.beginJSCallbackChild()
-	}
-	if ctx.executionReleased.Load() {
-		return nil, context.Canceled
-	}
-	execution := ctx.messageJSExecution()
 	execution.pendingMu.Lock()
-	if execution.pendingDone == nil {
-		execution.pendingDone = make(chan struct{})
-	}
 	if err := execution.ctx.Err(); err != nil {
 		execution.pendingMu.Unlock()
 		return nil, err
 	}
-	if execution.stopping && execution.pending == 0 {
+	if execution.stopping && execution.pending == 0 && execution.running == 0 {
 		execution.pendingMu.Unlock()
 		return nil, context.Canceled
 	}
@@ -92,43 +92,90 @@ func (ctx *MsgContext) beginJSCallbackChild() (func(), error) {
 		once.Do(func() {
 			execution.pendingMu.Lock()
 			execution.pending--
-			if execution.stopping && execution.pending == 0 && !execution.pendingClosed {
-				// Revoke the scope on the owner before the event loop can run
-				// a floated timer queued by the just-settled child.
-				execution.cancel(errJSExecutionCompleted)
-				execution.cancelDeadline()
-				close(execution.pendingDone)
-				execution.pendingClosed = true
-			}
+			execution.finishIfDrainedLocked()
 			execution.pendingMu.Unlock()
 		})
 	}, nil
 }
 
-// beginJSCallbackOwnerScope creates a host-owned completion root. Descendant
-// hooks may join while the root is active, and the last release revokes the
-// standalone scope synchronously before floated work can run.
-func (ctx *MsgContext) beginJSCallbackOwnerScope() (func(), error) {
-	if ctx == nil {
+func (execution *jsMessageExecution) finishIfDrainedLocked() {
+	if execution == nil || !execution.stopping || execution.pending != 0 || execution.running != 0 || execution.pendingClosed {
+		return
+	}
+	execution.cancel(errJSExecutionCompleted)
+	execution.cancelDeadline()
+	close(execution.pendingDone)
+	execution.pendingClosed = true
+}
+
+func (execution *jsMessageExecution) beginStop() <-chan struct{} {
+	execution.pendingMu.Lock()
+	if execution.pendingDone == nil {
+		execution.pendingDone = make(chan struct{})
+	}
+	execution.stopping = true
+	execution.finishIfDrainedLocked()
+	done := execution.pendingDone
+	execution.pendingMu.Unlock()
+	return done
+}
+
+func (execution *jsMessageExecution) enter() (func(), error) {
+	if execution == nil {
 		return func() {}, nil
 	}
-	release, err := ctx.beginJSCallbackChild()
-	if err != nil {
+	execution.pendingMu.Lock()
+	if err := execution.ctx.Err(); err != nil {
+		execution.pendingMu.Unlock()
 		return nil, err
 	}
-	execution := ctx.messageJSExecution()
-	// Keep scheduled children behind the owner gate until the host has admitted
-	// every hook. Otherwise a synchronously settled hook could queue floated
-	// work before the owner root has a chance to close admission.
-	execution.gate.Lock()
-	execution.pendingMu.Lock()
-	execution.stopping = true
+	if execution.stopping && execution.pending == 0 && execution.running == 0 {
+		execution.pendingMu.Unlock()
+		return nil, context.Canceled
+	}
+	execution.running++
 	execution.pendingMu.Unlock()
 	var once sync.Once
 	return func() {
 		once.Do(func() {
+			execution.pendingMu.Lock()
+			execution.running--
+			execution.finishIfDrainedLocked()
+			execution.pendingMu.Unlock()
+		})
+	}, nil
+}
+
+func (ctx *MsgContext) beginJSCallbackChild() (func(), error) {
+	if ctx == nil {
+		return func() {}, nil
+	}
+	if ctx.executionParent != nil {
+		return ctx.executionParent.beginJSCallbackChild()
+	}
+	if ctx.executionReleased.Load() {
+		return nil, context.Canceled
+	}
+	return ctx.messageJSExecution().beginChild()
+}
+
+// beginJSCallbackOwnerScope creates a host-owned completion root. Its sentinel
+// keeps admission open while the host discovers hooks, without holding the
+// realm or blocking Promise continuations.
+func (ctx *MsgContext) beginJSCallbackOwnerScope() (func(), error) {
+	if ctx == nil {
+		return func() {}, nil
+	}
+	execution := ctx.messageJSExecution()
+	release, err := execution.beginChild()
+	if err != nil {
+		return nil, err
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			execution.beginStop()
 			release()
-			execution.gate.Unlock()
 		})
 	}, nil
 }
@@ -153,27 +200,112 @@ func (ctx *MsgContext) runStandaloneMessageScope(run func()) error {
 	return ctx.stopJSExecution()
 }
 
-// TODO(局部重载/禁用与删除): 没有消息的脚本级上下文返回 context.Background()，永不取消，
-// 所以脚本顶层注册的 setTimeout/setInterval/Promise 回调无法随脚本卸载而撤销。
-// subTODO(局部重载): 为每个脚本提供可取消的生命周期上下文（卸载时取消），并登记定时器句柄以便 clearInterval。
+func (c *jsExecutionContext) executionScope() *jsMessageExecution {
+	if c == nil {
+		return nil
+	}
+	if c.execution != nil {
+		return c.execution
+	}
+	if c.Message != nil {
+		return c.Message.messageJSExecution()
+	}
+	return nil
+}
+
 func (c *jsExecutionContext) ExecutionContext() context.Context {
-	if c != nil && c.Message != nil {
-		return c.Message.messageJSExecution().ctx
+	if c.persistentScope() {
+		// The load's execution remains deadline-bound until its successful
+		// handoff. Host I/O uses AsyncWorkContext instead of borrowing this
+		// scheduler lifetime while the entry is still evaluating.
+		if scheduler, active := c.binding.schedulerContext(); active {
+			// Providers restore the token captured when a timer or service
+			// handler was registered. While that handler runs inside a new
+			// root, its binding token must not bypass that root's deadline.
+			// Retirement watchers run off-owner and follow the stable binding
+			// lifetime, never the unrelated request currently occupying the VM.
+			if jsengine.InOwner(c.binding.loop) {
+				if active := c.binding.activeInvocation(); active != nil && active != c && active.binding == c.binding && !active.persistentScope() {
+					return active.ExecutionContext()
+				}
+			}
+			return scheduler
+		}
+	}
+	if execution := c.executionScope(); execution != nil {
+		return execution.ctx
 	}
 	return context.Background()
 }
 
 func (c *jsExecutionContext) EnterExecution() (func(), error) {
-	if c == nil || c.Message == nil {
-		return func() {}, nil
+	if c.persistentScope() {
+		if leave, ok, err := c.enterPersistentScheduler(); ok {
+			return leave, err
+		}
 	}
-	execution := c.Message.messageJSExecution()
-	execution.gate.RLock()
-	if err := execution.ctx.Err(); err != nil {
-		execution.gate.RUnlock()
-		return nil, err
+	if execution := c.executionScope(); execution != nil {
+		leave, err := execution.enter()
+		// A promoted root can finish normally between the scope check above and
+		// the admission attempt. Its pending continuations then belong to the
+		// binding, exactly as if they had been resumed a moment later.
+		if err != nil && c.persistentScope() {
+			if leave, ok, err := c.enterPersistentScheduler(); ok {
+				return leave, err
+			}
+		}
+		return leave, err
 	}
-	return execution.gate.RUnlock, nil
+	return func() {}, nil
+}
+
+// enterPersistentScheduler admits work under the binding's scheduler once it is
+// active; ok is false while the binding has not started scheduling yet.
+func (c *jsExecutionContext) enterPersistentScheduler() (leave func(), ok bool, err error) {
+	scheduler, active := c.binding.schedulerContext()
+	if !active {
+		return nil, false, nil
+	}
+	if err := scheduler.Err(); err != nil {
+		return nil, true, err
+	}
+	return func() {}, true, nil
+}
+
+func runJSExecutionRoot(realm *jsExecutionContext, run func() error) error {
+	if realm == nil {
+		return context.Canceled
+	}
+	execution := realm.executionScope()
+	if execution == nil {
+		return ErrJSInvocationExpired
+	}
+	if execution.stopBinding != nil {
+		defer execution.stopBinding()
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			execution.cancel(context.Canceled)
+			_ = execution.stop()
+			if realm.PersistentBinding {
+				realm.completePersistentBinding(context.Canceled)
+			}
+			panic(recovered)
+		}
+	}()
+	var runErr error
+	if run != nil {
+		runErr = run()
+	}
+	if runErr != nil {
+		execution.cancel(runErr)
+		_ = execution.stop()
+		return runErr
+	}
+	if realm.PersistentBinding {
+		realm.activatePersistentScheduler()
+	}
+	return execution.stop()
 }
 
 func (ctx *MsgContext) recordJSExecutionError(err error) {
@@ -222,6 +354,29 @@ func (ctx *MsgContext) abortAfterJSCallback() bool {
 	return true
 }
 
+func (execution *jsMessageExecution) stop() error {
+	if execution == nil {
+		return nil
+	}
+	done := execution.beginStop()
+	// Cancellation seals admission, but does not mean an admitted owner entry
+	// has returned from its Go host call. Finalizers run outside the VM owner
+	// and must join the same pending-and-running barrier on every exit.
+	<-done
+	contextErr := context.Cause(execution.ctx)
+	execution.cancel(errJSExecutionCompleted)
+	execution.cancelDeadline()
+	execution.errMu.Lock()
+	defer execution.errMu.Unlock()
+	if execution.err != nil {
+		return execution.err
+	}
+	if errors.Is(contextErr, errJSExecutionCompleted) {
+		return nil
+	}
+	return contextErr
+}
+
 func (ctx *MsgContext) stopJSExecution() error {
 	if ctx == nil {
 		return nil
@@ -232,43 +387,7 @@ func (ctx *MsgContext) stopJSExecution() error {
 	ctx.jsExecutionMu.Lock()
 	execution := ctx.jsExecution
 	ctx.jsExecutionMu.Unlock()
-	if execution == nil {
-		return nil
-	}
-	contextErr := context.Cause(execution.ctx)
-	execution.pendingMu.Lock()
-	if execution.pendingDone == nil {
-		execution.pendingDone = make(chan struct{})
-	}
-	execution.stopping = true
-	if execution.pending == 0 && !execution.pendingClosed {
-		execution.cancel(errJSExecutionCompleted)
-		execution.cancelDeadline()
-		close(execution.pendingDone)
-		execution.pendingClosed = true
-	}
-	pendingDone := execution.pendingDone
-	execution.pendingMu.Unlock()
-	if contextErr == nil {
-		select {
-		case <-pendingDone:
-		case <-execution.ctx.Done():
-			contextErr = context.Cause(execution.ctx)
-		}
-	}
-	execution.cancel(errJSExecutionCompleted)
-	execution.cancelDeadline()
-	execution.gate.Lock()
-	defer execution.gate.Unlock()
-	execution.errMu.Lock()
-	defer execution.errMu.Unlock()
-	if execution.err != nil {
-		return execution.err
-	}
-	if errors.Is(contextErr, errJSExecutionCompleted) {
-		return nil
-	}
-	return contextErr
+	return execution.stop()
 }
 
 func (ctx *MsgContext) checkExecution() error {
@@ -285,9 +404,6 @@ func (ctx *MsgContext) checkExecution() error {
 		if err := execution.ctx.Err(); err != nil {
 			return err
 		}
-	}
-	if active := ctx.Dice.currentJSMessageContext(); active != nil {
-		return active.messageJSExecution().ctx.Err()
 	}
 	return nil
 }

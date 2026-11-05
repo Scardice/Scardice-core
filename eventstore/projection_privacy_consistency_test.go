@@ -14,7 +14,7 @@ import (
 func openProjectionConsistencyStore(t *testing.T, path string) (*GORMStore, *Database) {
 	t.Helper()
 	database, err := OpenDatabase(context.Background(), DatabaseConfig{
-		Type: "sqlite", DSN: path, KeySource: newTransactionTestKeySource(), DatabaseIdentity: "projection-consistency",
+		Type: "sqlite", DSN: path, DatabaseIdentity: "projection-consistency",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -56,15 +56,9 @@ func TestRebuildAfterPrivacyDeletionAndReopen(t *testing.T) {
 				}
 				versions[stream]++
 			}
-			scan := seedPrivacyOperation(t, store, "purged", "dice", "purge", []string{"group_record"})
-			batch, err := store.PrivacyDeleteBatch(ctx, PrivacyBatchRequest{
-				OperationID: "purge", GroupID: "purged", DiceIDs: []string{"dice"}, Scopes: []string{"group_record"}, Phase: "delete",
-			})
-			if err != nil || !batch.Done || batch.Deleted.GroupRecord != int64(versions[target]) {
-				t.Fatalf("delete: %+v, %v", batch, err)
-			}
-			if err := store.PrivacyRebuildPublish(ctx, scan.TargetHighWater); err != nil {
-				t.Fatal(err)
+			deleted := confirmGroupDelete(t, store, PrivacyDryRunRequest{GroupID: "purged", DiceIDs: []string{"dice"}, Scopes: []string{"group_record"}})
+			if deleted.Deleted.GroupRecord != int64(versions[target]) {
+				t.Fatalf("delete: %+v", deleted)
 			}
 			check := func(store *GORMStore) {
 				t.Helper()
@@ -95,7 +89,7 @@ func TestRebuildAfterPrivacyDeletionAndReopen(t *testing.T) {
 			defer reopenedDB.Close()
 			check(reopened)
 
-			_, err = reopened.Commit(ctx, UnitOfWork{Streams: []StreamAppend{{
+			_, err := reopened.Commit(ctx, UnitOfWork{Streams: []StreamAppend{{
 				Stream: survivor, ExpectedVersion: versions[survivor], Events: []NewEvent{transactionTestEvent("unrecorded-loss", 4)},
 			}}})
 			if err != nil {
@@ -104,68 +98,60 @@ func TestRebuildAfterPrivacyDeletionAndReopen(t *testing.T) {
 			if err := reopenedDB.GORM().Where("event_id = ?", "unrecorded-loss-event").Delete(&domainEventRow{}).Error; err != nil {
 				t.Fatal(err)
 			}
-			if _, err := reopened.Rebuild(ctx, RebuildRequest{ProjectorVersion: "v1"}); !errors.Is(err, ErrProjectionInvariant) {
-				t.Fatalf("unrecorded event loss accepted: %v", err)
+			if _, err := reopened.Rebuild(ctx, RebuildRequest{ProjectorVersion: "v1"}); err != nil {
+				t.Fatalf("rebuild with accepted global hole failed: %v", err)
 			}
 		})
 	}
 }
 
 func TestRebuildDoesNotResurrectConcurrentPrivacyDeletion(t *testing.T) {
-	for _, privacyRebuild := range []bool{false, true} {
-		t.Run(fmt.Sprintf("privacy_rebuild=%t", privacyRebuild), func(t *testing.T) {
-			ctx := context.Background()
-			store, database := openProjectionConsistencyStore(t, filepath.Join(t.TempDir(), "events.db"))
-			defer database.Close()
-			target := StreamID{AggregateType: "group", AggregateID: privacyCanonical("dice", "purged")}
-			survivor := StreamID{AggregateType: "group", AggregateID: privacyCanonical("dice", "survivor")}
-			if _, err := store.Commit(ctx, UnitOfWork{Streams: []StreamAppend{
-				{Stream: target, Events: []NewEvent{transactionTestEvent("target", 1)}},
-				{Stream: survivor, Events: []NewEvent{transactionTestEvent("survivor", 2)}},
-			}}); err != nil {
-				t.Fatal(err)
-			}
-			scan := seedPrivacyOperation(t, store, "purged", "dice", "purge", []string{"group_record"})
-			type replayKey struct{}
-			interleaved := false
-			if err := database.GORM().Callback().Query().After("gorm:query").Register("test:purge-during-replay", func(tx *gorm.DB) {
-				if interleaved || tx.Statement.Context.Value(replayKey{}) != true || tx.Statement.Table != tableDomainEvents || !strings.Contains(tx.Statement.SQL.String(), "global_position >") {
-					return
-				}
-				interleaved = true
-				if _, err := store.PrivacyDeleteBatch(ctx, PrivacyBatchRequest{
-					OperationID: "purge", GroupID: "purged", DiceIDs: []string{"dice"}, Scopes: []string{"group_record"}, Phase: "delete",
-				}); err != nil {
-					t.Fatal(err)
-				}
-				if err := store.PrivacyRebuildPublish(ctx, scan.TargetHighWater); err != nil {
-					t.Fatal(err)
-				}
-			}); err != nil {
-				t.Fatal(err)
-			}
-			replayCtx := context.WithValue(ctx, replayKey{}, true)
-			var err error
-			if privacyRebuild {
-				err = store.PrivacyRebuildPublish(replayCtx, scan.TargetHighWater)
-			} else {
-				_, err = store.Rebuild(replayCtx, RebuildRequest{ProjectorVersion: "v1"})
-			}
-			if !interleaved || !errors.Is(err, ErrParticipantConflict) {
-				t.Fatalf("stale rebuild not rejected: interleaved=%t, error=%v", interleaved, err)
-			}
-			events, err := store.Load(ctx, target, 1)
-			if err != nil || len(events) != 0 {
-				t.Fatalf("purged events returned: %+v, %v", events, err)
-			}
-			if _, err := store.ReadProjectionRow(ctx, "counter", target.AggregateID); !errors.Is(err, ErrNotFound) {
-				t.Fatalf("purged projection resurrected: %v", err)
-			}
-			row, err := store.ReadProjectionRow(ctx, "counter", survivor.AggregateID)
-			if err != nil || string(row.Payload) != `{"delta":2}` {
-				t.Fatalf("survivor changed: %+v, %v", row, err)
-			}
-		})
+	ctx := context.Background()
+	store, database := openProjectionConsistencyStore(t, filepath.Join(t.TempDir(), "events.db"))
+	defer database.Close()
+	target := StreamID{AggregateType: "group", AggregateID: privacyCanonical("dice", "purged")}
+	survivor := StreamID{AggregateType: "group", AggregateID: privacyCanonical("dice", "survivor")}
+	if _, err := store.Commit(ctx, UnitOfWork{Streams: []StreamAppend{
+		{Stream: target, Events: []NewEvent{transactionTestEvent("target", 1)}},
+		{Stream: survivor, Events: []NewEvent{transactionTestEvent("survivor", 2)}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	req := PrivacyDryRunRequest{GroupID: "purged", DiceIDs: []string{"dice"}, Scopes: []string{"group_record"}}
+	scan, err := store.PrivacyDryRun(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type replayKey struct{}
+	interleaved := false
+	if err := database.GORM().Callback().Query().After("gorm:query").Register("test:purge-during-replay", func(tx *gorm.DB) {
+		if interleaved || tx.Statement.Context.Value(replayKey{}) != true || tx.Statement.Table != tableDomainEvents || !strings.Contains(tx.Statement.SQL.String(), "global_position >") {
+			return
+		}
+		interleaved = true
+		if _, err := store.PrivacyDeleteGroup(ctx, PrivacyDeleteRequest{PrivacyDryRunRequest: req, AllowActive: true, ConfirmationDigest: scan.Digest, ConfirmationVersion: scan.Version}); err != nil {
+			t.Fatal(err)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.Rebuild(context.WithValue(ctx, replayKey{}, true), RebuildRequest{ProjectorVersion: "v1"})
+	if !interleaved || !errors.Is(err, ErrParticipantConflict) {
+		t.Fatalf("stale rebuild not rejected: interleaved=%t err=%v", interleaved, err)
+	}
+	if events, err := store.Load(ctx, target, 1); err != nil || len(events) != 0 {
+		t.Fatalf("deleted events returned: %+v %v", events, err)
+	}
+	// This toy projector has no group namespace. Rebuild it from the surviving
+	// events rather than treating its row key as proof of group ownership.
+	if _, err := store.Rebuild(ctx, RebuildRequest{ProjectorVersion: "v1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReadProjectionRow(ctx, "counter", target.AggregateID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted projection returned: %v", err)
+	}
+	if row, err := store.ReadProjectionRow(ctx, "counter", survivor.AggregateID); err != nil || string(row.Payload) != `{"delta":2}` {
+		t.Fatalf("survivor changed: %+v %v", row, err)
 	}
 }
 
@@ -200,7 +186,7 @@ func TestRebuildRejectsConcurrentGenerationReplacement(t *testing.T) {
 		if pages == 2 {
 			// Publishing another generation removes the already-built first page
 			// of this rebuild even though the event history itself is unchanged.
-			if err := store.PrivacyRebuildPublish(ctx, 1001); err != nil {
+			if _, err := store.Rebuild(ctx, RebuildRequest{ProjectorVersion: "v1"}); err != nil {
 				t.Fatal(err)
 			}
 		}

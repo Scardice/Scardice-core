@@ -18,8 +18,10 @@ func banConfigGet(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
 	}
-
-	return c.JSON(http.StatusOK, myDice.Config.BanList)
+	if myDice == nil || myDice.Config() == nil {
+		return c.JSON(http.StatusServiceUnavailable, Response{"code": "ban_storage_unavailable", "message": "黑白名单存储不可用"})
+	}
+	return c.JSON(http.StatusOK, myDice.Config().BanList)
 }
 
 func banConfigSet(c echo.Context) error {
@@ -41,7 +43,10 @@ func banConfigSet(c echo.Context) error {
 		v.ThresholdBan = 200
 	}
 
-	config := &myDice.Config
+	config, _ := myDice.ConfigEditSnapshot()
+	if config.BanList == nil {
+		return c.JSON(http.StatusServiceUnavailable, Response{"code": "ban_storage_unavailable", "message": "黑白名单存储不可用"})
+	}
 	config.BanList.BanBehaviorRefuseReply = v.BanBehaviorRefuseReply
 	config.BanList.BanBehaviorRefuseInvite = v.BanBehaviorRefuseInvite
 	config.BanList.BanBehaviorQuitLastPlace = v.BanBehaviorQuitLastPlace
@@ -54,32 +59,33 @@ func banConfigSet(c echo.Context) error {
 	config.BanList.ScoreGroupMuted = v.ScoreGroupMuted
 	config.BanList.ScoreGroupKicked = v.ScoreGroupKicked
 	config.BanList.ScoreTooManyCommand = v.ScoreTooManyCommand
-
 	config.BanList.JointScorePercentOfGroup = v.JointScorePercentOfGroup
 	config.BanList.JointScorePercentOfInviter = v.JointScorePercentOfInviter
 	config.BanList.BanNotifyIntervalMinutes = v.BanNotifyIntervalMinutes
-	myDice.MarkModified()
-
-	return c.JSON(http.StatusOK, myDice.Config.BanList)
+	if err = myDice.DurableCommitConfigSnapshot(c.Request().Context(), config, config.CommandPrefix, config.DiceMasters, nil); err != nil {
+		return c.JSON(http.StatusInternalServerError, Response{"code": "ban_config_failed", "message": err.Error()})
+	}
+	return c.JSON(http.StatusOK, myDice.Config().BanList)
 }
 
 func banMapList(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
 	}
-	if myDice == nil || myDice.Config.BanList == nil {
+	if myDice == nil || myDice.Config() == nil || myDice.Config().BanList == nil {
 		return c.JSON(http.StatusServiceUnavailable, Response{
 			"code":    "ban_storage_unavailable",
 			"message": "黑白名单存储不可用",
 		})
 	}
-	if err := myDice.Config.BanList.PersistenceError(); err != nil {
+	list, err := myDice.GetBanListWithError(c.Request().Context())
+	if err != nil {
 		return c.JSON(http.StatusServiceUnavailable, Response{
 			"code":    "ban_storage_unavailable",
 			"message": err.Error(),
 		})
 	}
-	return c.JSON(http.StatusOK, myDice.GetBanList())
+	return c.JSON(http.StatusOK, list)
 }
 
 func banMapDeleteOne(c echo.Context) error {
@@ -96,13 +102,10 @@ func banMapDeleteOne(c echo.Context) error {
 	if v.ID == "" {
 		return c.JSON(http.StatusBadRequest, Response{"code": "invalid_ban_id", "message": "ID 不能为空"})
 	}
-	if myDice == nil || myDice.Config.BanList == nil {
+	if myDice == nil || myDice.Config() == nil || myDice.Config().BanList == nil {
 		return c.JSON(http.StatusServiceUnavailable, Response{"code": "ban_storage_unavailable", "message": "黑白名单存储不可用"})
 	}
-	if err := myDice.Config.BanList.PersistenceError(); err != nil {
-		return c.JSON(http.StatusServiceUnavailable, Response{"code": "ban_storage_unavailable", "message": err.Error()})
-	}
-	if err := myDice.Config.BanList.DeleteByIDWithError(myDice, v.ID); err != nil {
+	if err := myDice.Config().BanList.DeleteByIDWithError(myDice, v.ID); err != nil {
 		return c.JSON(http.StatusInternalServerError, Response{"code": "ban_storage_failed", "message": err.Error()})
 	}
 	return c.JSON(http.StatusOK, nil)
@@ -122,13 +125,10 @@ func banMapAddOne(c echo.Context) error {
 	if v.ID == "" {
 		return c.JSON(http.StatusBadRequest, Response{"code": "invalid_ban_id", "message": "ID 不能为空"})
 	}
-	if myDice == nil || myDice.Config.BanList == nil {
+	if myDice == nil || myDice.Config() == nil || myDice.Config().BanList == nil {
 		return c.JSON(http.StatusServiceUnavailable, Response{"code": "ban_storage_unavailable", "message": "黑白名单存储不可用"})
 	}
-	banList := myDice.Config.BanList
-	if err := banList.PersistenceError(); err != nil {
-		return c.JSON(http.StatusServiceUnavailable, Response{"code": "ban_storage_unavailable", "message": err.Error()})
-	}
+	banList := myDice.Config().BanList
 	reason := "骰主后台设置"
 	if len(v.Reasons) > 0 && v.Reasons[0] != "" {
 		reason = v.Reasons[0]
@@ -144,24 +144,6 @@ func banMapAddOne(c echo.Context) error {
 	return c.JSON(http.StatusOK, nil)
 }
 
-//
-// func banMapSet(c echo.Context) error {
-//	if !doAuth(c) {
-//		return c.JSON(http.StatusForbidden, nil)
-//	}
-//
-//	v := struct {
-//		data []byte
-//	}{}
-//	err := c.Bind(&v)
-//	if err != nil {
-//		return c.String(430, err.Error())
-//	}
-//
-//	(&myDice.Config).BanList.LoadMapFromJSON(v.data)
-//	return c.JSON(http.StatusOK, nil)
-//}
-
 func banExport(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
@@ -169,13 +151,13 @@ func banExport(c echo.Context) error {
 	if dm != nil && dm.JustForTest {
 		return Error(&c, "展示模式不支持该操作", Response{"testMode": true})
 	}
-	if myDice == nil || myDice.Config.BanList == nil {
+	if myDice == nil || myDice.Config() == nil || myDice.Config().BanList == nil {
 		return Error(&c, "黑白名单存储不可用", Response{"code": "ban_storage_unavailable"})
 	}
-	if err := myDice.Config.BanList.PersistenceError(); err != nil {
+	lst, err := myDice.GetBanListWithError(c.Request().Context())
+	if err != nil {
 		return Error(&c, err.Error(), Response{"code": "ban_storage_unavailable"})
 	}
-	lst := myDice.GetBanList()
 
 	temp, err := os.CreateTemp("", "黑白名单-*.json")
 	if err != nil {
@@ -207,11 +189,8 @@ func banImport(c echo.Context) error {
 	if dm != nil && dm.JustForTest {
 		return Error(&c, "展示模式不支持该操作", Response{"testMode": true})
 	}
-	if myDice == nil || myDice.Config.BanList == nil {
+	if myDice == nil || myDice.Config() == nil || myDice.Config().BanList == nil {
 		return Error(&c, "黑白名单存储不可用", Response{"code": "ban_storage_unavailable"})
-	}
-	if err := myDice.Config.BanList.PersistenceError(); err != nil {
-		return Error(&c, err.Error(), Response{"code": "ban_storage_unavailable"})
 	}
 
 	file, err := c.FormFile("file")
@@ -251,7 +230,7 @@ func banImport(c echo.Context) error {
 		}
 		item.Reasons = newReasons
 	}
-	if err = myDice.Config.BanList.ImportItems(myDice, lst); err != nil {
+	if err = myDice.Config().BanList.ImportItems(myDice, lst); err != nil {
 		return Error(&c, err.Error(), Response{"code": "ban_storage_failed"})
 	}
 

@@ -60,23 +60,27 @@ func requireNoAdapterEventHit(t *testing.T, hits <-chan adapterEventTestHit) {
 
 func adapterEventGroupScope(t *testing.T, d *Dice, endpoint *EndPointInfo, extensionNames ...string) (*MsgContext, *GroupInfo) {
 	t.Helper()
-	setup := &MsgContext{Dice: d, Session: d.ImSession, EndPoint: endpoint}
-	group := SetBotOnAtGroup(setup, "QQ-Group:adapter-event-test")
-	wrappers := make([]*ExtInfo, 0, len(extensionNames))
+	groupID := "QQ-Group:adapter-event-test"
+	message := newGroupMsg(groupID, "QQ:adapter-event-user", "")
 	for _, name := range extensionNames {
-		wrapper := d.ExtFind(name, false)
-		if wrapper == nil {
+		if d.ExtFind(name, false) == nil {
 			t.Fatalf("registered extension %q is unavailable", name)
 		}
-		wrappers = append(wrappers, wrapper)
 	}
-	group.SetActivatedExtList(wrappers, d)
-	scope := &MsgContext{
-		Dice: d, Session: d.ImSession, EndPoint: endpoint, Group: group,
-		MessageType: "group", IsCurGroupBotOn: true,
-	}
-	t.Cleanup(scope.releaseExecutionState)
-	return scope, group
+	withCanonicalTestMessageContext(t, d, endpoint, message, "adapter-event-scope-setup", func(ctx *MsgContext) error {
+		if err := ctx.Group.SetActivation(endpoint.UserID, true, true); err != nil {
+			return err
+		}
+		for _, name := range extensionNames {
+			if err := ctx.Group.SetExtension(name, true); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	scope := newCanonicalTestMessageContext(t, d, endpoint, message, "adapter-event-scope")
+	scope.IsCurGroupBotOn = true
+	return scope, scope.Group
 }
 
 func TestJSAdapterEventFilterDefaultNullEmptyAndExplicitAll(t *testing.T) {
@@ -322,8 +326,7 @@ seal.ext.register(nativeJSONSecondExt);`
 				t, engine, "test/adapter-event-native-json-"+engine, firstName, script,
 			)
 			hits := bindAdapterEventTestRecorder(t, loop)
-			scope := &MsgContext{Dice: d, Session: d.ImSession, EndPoint: endpoint}
-			t.Cleanup(scope.releaseExecutionState)
+			scope := newCanonicalTestGlobalAdapterCarrier(t, d, endpoint, "adapter-native-json:"+engine)
 
 			strictMismatch := adapterapi.AdapterEvent{
 				Protocol: "onebot11",
@@ -368,7 +371,7 @@ lifecycleAdapterExt.onAdapterEvent = function (ctx, event) {
 seal.ext.register(lifecycleAdapterExt);`
 	d, endpoint, _, _, loop := preparePublicPreprocessRuntime(t, string(jsengine.EngineGoja), packageID, extensionName, script)
 	hits := bindAdapterEventTestRecorder(t, loop)
-	scope, group := adapterEventGroupScope(t, d, endpoint, extensionName)
+	scope, _ := adapterEventGroupScope(t, d, endpoint, extensionName)
 	event := adapterapi.AdapterEvent{Protocol: "onebot11", Type: "request", RawJSON: `{"post_type":"request","request_type":"friend"}`}
 
 	if err := d.dispatchAdapterEvent(scope, scope, event, endpoint); err != nil {
@@ -378,7 +381,11 @@ seal.ext.register(lifecycleAdapterExt);`
 		t.Fatalf("group callback context = %#v", hit)
 	}
 
-	group.Active = false
+	groupMessage := newGroupMsg("QQ-Group:adapter-event-test", "QQ:adapter-event-user", "")
+	withCanonicalTestMessageContext(t, d, endpoint, groupMessage, "adapter-event-deactivate-bot", func(ctx *MsgContext) error {
+		return ctx.Group.SetActivation(endpoint.UserID, false, true)
+	})
+	scope = newCanonicalTestMessageContext(t, d, endpoint, groupMessage, "adapter-event-inactive-scope")
 	if err := d.dispatchAdapterEvent(scope, scope, event, endpoint); err != nil {
 		t.Fatal(err)
 	}
@@ -390,14 +397,17 @@ seal.ext.register(lifecycleAdapterExt);`
 	}
 	requireAdapterEventHit(t, hits)
 
-	group.SetActivatedExtList(nil, d)
+	withCanonicalTestMessageContext(t, d, endpoint, groupMessage, "adapter-event-disable-extension", func(ctx *MsgContext) error {
+		return ctx.Group.SetExtension(extensionName, false)
+	})
+	scope = newCanonicalTestMessageContext(t, d, endpoint, groupMessage, "adapter-event-disabled-extension-scope")
+	scope.MessageType, scope.IsPrivate = "private", true
 	if err := d.dispatchAdapterEvent(scope, scope, event, endpoint); err != nil {
 		t.Fatal(err)
 	}
 	requireNoAdapterEventHit(t, hits)
 
-	globalScope := &MsgContext{Dice: d, Session: d.ImSession, EndPoint: endpoint}
-	t.Cleanup(globalScope.releaseExecutionState)
+	globalScope := newCanonicalTestGlobalAdapterCarrier(t, d, endpoint, "adapter-event-global-scope")
 	if err := d.dispatchAdapterEvent(globalScope, nil, event, endpoint); err != nil {
 		t.Fatal(err)
 	}
@@ -410,8 +420,12 @@ seal.ext.register(lifecycleAdapterExt);`
 		t.Fatal("original extension has no live script identity")
 	}
 	d.JsScriptList = append(d.JsScriptList, original.Source)
-	if err := jsengine.RunWithContext(loop, jsContextForPlugin(original), func(runtime jsengine.Runtime) error {
-		_, err := runtime.RunString("adapter-replacement.js", `
+	replacementIdentity := d.DomainExecutionIdentity("js-test-adapter-replacement", extensionName)
+	if err := d.WithDomainExecution(context.Background(), replacementIdentity, []byte("adapter-event-replacement"), func(transaction *DurableCallbackTransaction) error {
+		realm := jsContextForRoot(transaction.executionContext, d, original, original.Source, transaction, false)
+		return runJSExecutionRoot(realm, func() error {
+			return jsengine.RunWithContext(loop, realm, func(runtime jsengine.Runtime) error {
+				_, err := runtime.RunString("adapter-replacement.js", `
 var replacementAdapterExt = seal.ext.new("Adapter event lifecycle", "test", "2.0.0");
 replacementAdapterExt.adapterEventFilter = { events: "all" };
 replacementAdapterExt.onAdapterEvent = function (ctx, event) {
@@ -419,7 +433,9 @@ replacementAdapterExt.onAdapterEvent = function (ctx, event) {
     event.rawJson, event.endPoint.id, "");
 };
 seal.ext.register(replacementAdapterExt);`)
-		return err
+				return err
+			})
+		})
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -648,11 +664,18 @@ seal.ext.register(cancelAdapterExt);`
 			t.Fatal(err)
 		}
 		parent, cancel := context.WithCancel(context.Background())
-		scope := &MsgContext{Dice: d, Session: d.ImSession, EndPoint: endpoint, executionContext: parent}
-		t.Cleanup(scope.releaseExecutionState)
+		endpoint.Session = d.ImSession
 		returned := make(chan error, 1)
 		go func() {
-			returned <- d.dispatchAdapterEvent(scope, nil, adapterapi.AdapterEvent{Protocol: "onebot11", Type: "notice", RawJSON: `{"post_type":"notice"}`}, endpoint)
+			returned <- d.WithDomainExecution(parent, d.DomainExecutionIdentity("test-adapter-global-cancel", extensionName), []byte(extensionName), func(transaction *DurableCallbackTransaction) error {
+				carrier := &MsgContext{
+					Dice: d, Session: d.ImSession, EndPoint: endpoint,
+					executionContext:    transaction.executionContext,
+					callbackTransaction: transaction, callbackMetadata: transaction.metadata,
+				}
+				defer carrier.releaseExecutionState()
+				return d.dispatchAdapterEvent(carrier, nil, adapterapi.AdapterEvent{Protocol: "onebot11", Type: "notice", RawJSON: `{"post_type":"notice"}`}, endpoint)
+			})
 		}()
 		select {
 		case <-started:
@@ -734,4 +757,22 @@ seal.ext.find("Adapter event filter types").adapterEventFilter = `+tc.filter)
 			}
 		})
 	}
+}
+
+// newCanonicalTestGlobalAdapterCarrier mirrors the production global adapter
+// event carrier: it owns a canonical DomainTx but no group or player state.
+func newCanonicalTestGlobalAdapterCarrier(t *testing.T, d *Dice, endpoint *EndPointInfo, label string) *MsgContext {
+	t.Helper()
+	if d == nil || d.ImSession == nil || endpoint == nil {
+		t.Fatal("canonical global adapter carrier fixture is incomplete")
+	}
+	endpoint.Session = d.ImSession
+	root := newCanonicalTestRoot(t, d, label)
+	carrier := &MsgContext{
+		Dice: d, Session: d.ImSession, EndPoint: endpoint,
+		executionContext:    root.Context,
+		callbackTransaction: root.Transaction, callbackMetadata: root.Metadata,
+	}
+	t.Cleanup(carrier.releaseExecutionState)
+	return carrier
 }

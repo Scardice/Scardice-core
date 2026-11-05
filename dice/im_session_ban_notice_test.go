@@ -10,15 +10,19 @@ func TestCheckBanThrottlesRepeatedBlacklistedMemberNotice(t *testing.T) {
 	// Given
 	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
-	d.Config.BanList.BanBehaviorQuitIfAdmin = true
-	d.Config.BanList.BanNotifyIntervalMinutes = 10
-	d.Config.BanList.Map.Store("QQ:200001", &BanListInfoItem{
+	updateCanonicalTestConfig(t, d, func(config *Config) {
+		config.BanList.BanBehaviorQuitIfAdmin = true
+		config.BanList.BanNotifyIntervalMinutes = 10
+	})
+	if err := d.Config().BanList.ImportItems(d, []*BanListInfoItem{{
 		ID:      "QQ:200001",
 		Rank:    BanRankBanned,
 		Reasons: []string{"test reason"},
 		Places:  []string{"QQ-Group:100001"},
 		Times:   []int64{time.Unix(1_700_000_000, 0).Unix()},
-	})
+	}}); err != nil {
+		t.Fatal(err)
+	}
 	ctx := &MsgContext{
 		Dice:            d,
 		Session:         d.ImSession,

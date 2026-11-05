@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -25,11 +26,36 @@ const (
 	MailTest
 )
 
+// resolveMailPassword reads the committed mail password reference and resolves
+// its stored value. The immutable config view never carries the password.
+func (d *Dice) resolveMailPassword() (string, error) {
+	ctx := context.Background()
+	state, err := d.DurableConfigState(ctx)
+	if err != nil {
+		return "", err
+	}
+	ref := state.Mail.MailPasswordRef
+	if ref == "" {
+		return "", nil
+	}
+	resolver, ok := d.DurableStore.(secretResolver)
+	if !ok {
+		return "", errors.New("邮件密码存储不可用")
+	}
+	secret, err := resolver.ResolveSecret(ctx, ref, 0)
+	if err != nil {
+		return "", fmt.Errorf("读取邮件密码失败: %w", err)
+	}
+	return string(secret.Value), nil
+}
+
 func (d *Dice) CanSendMail() bool {
-	if d.Config.MailFrom == "" || d.Config.MailPassword == "" || d.Config.MailSMTP == "" {
+	config := d.Config()
+	if config.MailFrom == "" || config.MailSMTP == "" {
 		return false
 	}
-	return true
+	password, err := d.resolveMailPassword()
+	return err == nil && password != ""
 }
 
 func (d *Dice) SendMail(body string, m MailCode, noticeTypes ...NoticeType) error {
@@ -54,7 +80,7 @@ func (d *Dice) SendMail(body string, m MailCode, noticeTypes ...NoticeType) erro
 		sub += "Test 测试邮件"
 	}
 	var to []string
-	for _, target := range filterNoticeTargets(d.Config.NoticeIDs, noticeType) {
+	for _, target := range filterNoticeTargets(d.Config().NoticeIDs, noticeType) {
 		if strings.HasPrefix(target.ID, "QQ:") {
 			to = append(to, target.ID[3:]+"@qq.com")
 		}
@@ -79,7 +105,8 @@ func (d *Dice) SendMailRow(subject string, to []string, content string, attachme
 		}
 	}
 	m.SetHeader("Subject", fmt.Sprintf("[%s] %s", diceName, subject))
-	m.SetHeader("From", d.Config.MailFrom)
+	config := d.Config()
+	m.SetHeader("From", config.MailFrom)
 	m.SetHeader("To", to...)
 	if content == "" {
 		m.SetBody("text/plain", "***自动邮件，无需回复***")
@@ -92,8 +119,15 @@ func (d *Dice) SendMailRow(subject string, to []string, content string, attachme
 		}
 	}
 
-	dialer := gomail.NewDialer(d.Config.MailSMTP, 25, d.Config.MailFrom, d.Config.MailPassword)
-	var err error
+	password, err := d.resolveMailPassword()
+	if err != nil {
+		d.Logger.Error(err)
+		return err
+	}
+	if password == "" {
+		return errors.New("邮件配置不完整")
+	}
+	dialer := gomail.NewDialer(config.MailSMTP, 25, config.MailFrom, password)
 	if d.mailSend != nil {
 		err = d.mailSend(dialer, m)
 	} else {

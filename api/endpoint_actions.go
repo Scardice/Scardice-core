@@ -176,7 +176,8 @@ func validateActionRequest(action adapterapi.ActionKind, request EndpointActionR
 		adapterapi.ActionKindBan,
 		adapterapi.ActionKindKick,
 		adapterapi.ActionKindGroupInfoRefresh,
-		adapterapi.ActionKindAnswerRequest:
+		adapterapi.ActionKindAnswerRequest,
+		adapterapi.ActionKindAdapterAPI:
 		return validateActionTTL(request.TTLSeconds)
 	}
 	return validateActionTTL(request.TTLSeconds)

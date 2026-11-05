@@ -40,6 +40,10 @@ func DecidePlayer(state PlayerState, command PlayerCommand) (Decision, error) {
 	switch kind {
 	case CommandPlayerCreate:
 		if state.Version != 0 {
+			if !state.Deleted && state.DiceID == command.DiceID &&
+				state.GroupID == command.GroupID && state.UserID == command.UserID {
+				return Decision{}, nil
+			}
 			return Decision{}, ErrInvalidCommand
 		}
 		if err := validateIdentity(command.DiceID, command.GroupID, command.UserID); err != nil {
@@ -47,16 +51,52 @@ func DecidePlayer(state PlayerState, command PlayerCommand) (Decision, error) {
 		}
 		return Decision{[]PlayerEvent{NewPlayerCreatedV1(command.DiceID, command.GroupID, command.UserID, command.Name)}}, nil
 	case CommandPlayerName:
+		if state.Version == 0 || state.Deleted {
+			return Decision{}, ErrInvalidCommand
+		}
+		if state.Name == command.Name {
+			return Decision{}, nil
+		}
 		return Decision{[]PlayerEvent{NewPlayerNameChangedV1(command.Name)}}, nil
 	case CommandPlayerPrivilege:
+		if state.Version == 0 || state.Deleted {
+			return Decision{}, ErrInvalidCommand
+		}
+		if state.Privilege == command.Privilege {
+			return Decision{}, nil
+		}
 		return Decision{[]PlayerEvent{NewPlayerPrivilegeChangedV1(command.Privilege)}}, nil
 	case CommandPlayerTemplate:
+		if state.Version == 0 || state.Deleted {
+			return Decision{}, ErrInvalidCommand
+		}
+		if state.AutoSetNameTemplate == command.Template {
+			return Decision{}, nil
+		}
 		return Decision{[]PlayerEvent{NewPlayerAutoSetNameTemplateChangedV1(command.Template)}}, nil
 	case CommandPlayerLastCommand:
+		if state.Version == 0 || state.Deleted {
+			return Decision{}, ErrInvalidCommand
+		}
+		if state.LastCommandAt == command.LastCommandAt {
+			return Decision{}, nil
+		}
 		return Decision{[]PlayerEvent{NewPlayerLastCommandChangedV1(command.LastCommandAt)}}, nil
 	case CommandPlayerDiceSide:
+		if state.Version == 0 || state.Deleted {
+			return Decision{}, ErrInvalidCommand
+		}
+		if state.DiceSideNum == command.DiceSideNum {
+			return Decision{}, nil
+		}
 		return Decision{[]PlayerEvent{NewPlayerDiceSideChangedV1(command.DiceSideNum)}}, nil
 	case CommandPlayerDelete:
+		if state.Version == 0 {
+			return Decision{}, ErrInvalidCommand
+		}
+		if state.Deleted {
+			return Decision{}, nil
+		}
 		return Decision{[]PlayerEvent{NewPlayerDeletedV1()}}, nil
 	default:
 		return Decision{}, ErrInvalidCommand

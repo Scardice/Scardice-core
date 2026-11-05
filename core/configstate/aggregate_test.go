@@ -134,3 +134,47 @@ func TestRepositoryGeneratesDistinctIDsForExplicitMultiEventMetadata(t *testing.
 		seen[event.EventID] = true
 	}
 }
+
+func TestOuterPatchPersistsUpgradeTargetAcrossReplay(t *testing.T) {
+	baseline := testBaseline()
+	events := decideEvents(t, State{}, Command{Kind: CommandImportBaseline, Baseline: &baseline})
+	state, err := Replay(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []struct {
+		name     string
+		window   string
+		endpoint string
+	}{
+		{"initial target", "QQ-Group:upgrade", "QQ:bot"},
+		{"endpoint only", "QQ-Group:upgrade", "QQ:replacement"},
+		{"window only", "QQ-Group:other", "QQ:replacement"},
+		{"cleared target", "", ""},
+	} {
+		t.Run(target.name, func(t *testing.T) {
+			outer := state.Outer
+			outer.UpgradeWindowID, outer.UpgradeEndpointID = target.window, target.endpoint
+			command := Command{Kind: CommandPatch, Patch: &ConfigPatch{Outer: &outer}}
+			decision, decideErr := Decide(state, command)
+			if decideErr != nil {
+				t.Fatal(decideErr)
+			}
+			events = append(events, decision.Events...)
+			state, err = Replay(events)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.Outer.UpgradeWindowID != target.window || state.Outer.UpgradeEndpointID != target.endpoint {
+				t.Fatalf("upgrade target was lost after replay: window=%q endpoint=%q", state.Outer.UpgradeWindowID, state.Outer.UpgradeEndpointID)
+			}
+			if !sliceEqual(state.Outer.CommandPrefix, baseline.CommandPrefix) || !sliceSetEqual(state.Outer.DiceMasters, baseline.DiceMasters) {
+				t.Fatal("upgrade target patch changed unrelated outer configuration")
+			}
+			repeat, repeatErr := Decide(state, command)
+			if repeatErr != nil || len(repeat.Events) != 0 {
+				t.Fatalf("unchanged upgrade target was not idempotent: decision=%+v err=%v", repeat, repeatErr)
+			}
+		})
+	}
+}

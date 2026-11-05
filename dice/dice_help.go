@@ -1133,7 +1133,7 @@ func (m *HelpManager) IsAvailable() bool {
 }
 
 func (m *HelpManager) Search(ctx *MsgContext, text string, titleOnly bool, pageSize, pageNum int, group string) (res *docengine.GeneralSearchResult, total, pageStart, pageEnd int, err error) {
-	return m.searchEngine.Search(ctx.Group.HelpPackages, text, titleOnly, pageSize, pageNum, group)
+	return m.searchEngine.Search(ctx.Group.HelpPackageIDs(), text, titleOnly, pageSize, pageNum, group)
 }
 
 func (m *HelpManager) GetSuffixText() string {
@@ -1582,6 +1582,3 @@ func (m *HelpManager) GetHelpItemPage(pageNum, pageSize int, id, group, from, ti
 }
 
 // SetDefaultHelpGroup 设置群默认搜索分组
-func (group *GroupInfo) SetDefaultHelpGroup(target string) {
-	group.DefaultHelpGroup = target
-}

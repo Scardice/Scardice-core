@@ -3,7 +3,6 @@ package endpoint
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -83,16 +82,6 @@ func (g *dispatcherRecoveryIDs) NewID() (string, error) {
 	defer g.mu.Unlock()
 	g.n++
 	return "dispatcher-recovery-id-" + strconv.Itoa(g.n), nil
-}
-
-type dispatcherRecoveryDecryptor struct{ plain map[string][]byte }
-
-func (d dispatcherRecoveryDecryptor) DecryptBound(_ context.Context, _ string, effectID, _ string, _ uint64, _ []byte, _ []byte, _ string) ([]byte, error) {
-	plain, ok := d.plain[effectID]
-	if !ok {
-		return nil, eventstore.ErrNotFound
-	}
-	return append([]byte(nil), plain...), nil
 }
 
 type dispatcherRecoveryNotifier struct {
@@ -205,17 +194,13 @@ func (s *dispatcherRecoveryStore) AcceptOutbox(_ context.Context, effect eventst
 		effect.Status = eventstore.OutboxStatusPending
 	}
 	if effect.OrderingSequence == 0 {
-		s.nextLane[string(effect.LaneHMAC)]++
-		effect.OrderingSequence = s.nextLane[string(effect.LaneHMAC)]
+		s.nextLane[effect.Lane]++
+		effect.OrderingSequence = s.nextLane[effect.Lane]
 	}
 	if effect.Version == 0 {
 		effect.Version = 1
 	}
-	if effect.PayloadVersion == 0 {
-		effect.PayloadVersion = 1
-	}
-	effect.PayloadCiphertext = append([]byte(nil), effect.PayloadCiphertext...)
-	effect.PayloadNonce = append([]byte(nil), effect.PayloadNonce...)
+	effect.Payload = append([]byte(nil), effect.Payload...)
 	s.effects[effect.EffectID] = effect
 	return eventstore.CommitResult{EffectIDs: []string{effect.EffectID}, OrderingSequence: effect.OrderingSequence, Version: effect.Version}, nil
 }
@@ -241,7 +226,6 @@ func (s *dispatcherRecoveryStore) ClaimOutbox(_ context.Context, req eventstore.
 			row.Status = eventstore.OutboxStatusAmbiguous
 			row.Version++
 			row.CompletedAt, row.LeaseExpiresAt = now, time.Time{}
-			row.PayloadCiphertext, row.PayloadNonce = nil, nil
 			s.effects[id] = row
 			s.opsForEffectLocked(row, eventstore.OutboxStatusAmbiguous, "expired-after-dispatch")
 			continue
@@ -273,7 +257,7 @@ func (s *dispatcherRecoveryStore) ClaimOutbox(_ context.Context, req eventstore.
 
 func (s *dispatcherRecoveryStore) laneBlocked(candidate eventstore.NewEffect) bool {
 	for _, row := range s.effects {
-		if string(row.LaneHMAC) != string(candidate.LaneHMAC) || row.OrderingSequence >= candidate.OrderingSequence {
+		if row.Lane != candidate.Lane || row.OrderingSequence >= candidate.OrderingSequence {
 			continue
 		}
 		switch row.Status {
@@ -357,7 +341,6 @@ func (s *dispatcherRecoveryStore) QuarantineOutbox(_ context.Context, req events
 	}
 	row.Status, row.Version = status, row.Version+1
 	row.CompletedAt, row.LeaseExpiresAt = s.clock.Now(), time.Time{}
-	row.PayloadCiphertext, row.PayloadNonce = nil, nil
 	row.ErrorCode = req.ErrorCode
 	row.LeaseOwner = req.WorkerID
 	s.effects[row.EffectID] = row
@@ -404,7 +387,6 @@ func (s *dispatcherRecoveryStore) Commit(_ context.Context, work eventstore.Unit
 	}
 	if terminal != "" {
 		row.CompletedAt, row.LeaseExpiresAt = s.clock.Now(), time.Time{}
-		row.PayloadCiphertext, row.PayloadNonce = nil, nil
 	}
 	if update.Status == eventstore.OutboxStatusPending {
 		row.LeaseOwner, row.LeaseEpoch, row.AttemptID, row.LeaseExpiresAt = "", 0, "", time.Time{}
@@ -471,8 +453,7 @@ func (s *dispatcherRecoveryStore) GetOperation(_ context.Context, operationID st
 }
 
 func cloneDispatcherRecoveryEffect(effect eventstore.NewEffect) eventstore.NewEffect {
-	effect.PayloadCiphertext = append([]byte(nil), effect.PayloadCiphertext...)
-	effect.PayloadNonce = append([]byte(nil), effect.PayloadNonce...)
+	effect.Payload = append([]byte(nil), effect.Payload...)
 	return effect
 }
 
@@ -496,11 +477,7 @@ func (s *dispatcherRecoveryStore) seed(t *testing.T, effect adapterapi.OutboundE
 	if err != nil {
 		t.Fatal(err)
 	}
-	laneHMAC, err := hex.DecodeString(effect.Lane.MAC)
-	if err != nil {
-		t.Fatal(err)
-	}
-	newEffect := eventstore.NewEffect{EffectID: string(effect.ID), EndpointID: string(effect.EndpointID), LaneHMAC: laneHMAC, EffectType: effectTypeForKind(effect.Kind), RiskClass: dispatcherRecoveryRiskClass(effect.RetryClass), DeadlineAt: effect.Deadline, PayloadCiphertext: []byte("ciphertext-recovery"), PayloadNonce: []byte("nonce-recovery"), PayloadEncryptionKeyID: "key-recovery"}
+	newEffect := eventstore.NewEffect{EffectID: string(effect.ID), EndpointID: string(effect.EndpointID), Lane: effect.Lane.Key, EffectType: effectTypeForKind(effect.Kind), RiskClass: dispatcherRecoveryRiskClass(effect.RetryClass), DeadlineAt: effect.Deadline, Payload: plain}
 	if _, err := s.AcceptOutbox(context.Background(), newEffect); err != nil {
 		t.Fatal(err)
 	}
@@ -527,7 +504,7 @@ func (s *dispatcherRecoveryStore) events(id string) []eventstore.Envelope {
 
 func dispatcherRecoveryEffect(t *testing.T, id, operation string, retry adapterapi.EffectRetryClass) adapterapi.OutboundEffect {
 	target := adapterapi.EffectTarget{Kind: adapterapi.TargetPerson, Conversation: "person-dispatcher-recovery"}
-	lane, err := adapterapi.NewLaneMetadata("endpoint-dispatcher-recovery", target, []byte("dispatcher-index-root"), 1)
+	lane, err := adapterapi.NewLaneMetadata("endpoint-dispatcher-recovery", target, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -537,7 +514,7 @@ func dispatcherRecoveryEffect(t *testing.T, id, operation string, retry adaptera
 		effect.RequiredCapabilities = adapterapi.CapabilityOutbound | adapterapi.CapabilityActions
 		effect.RequiredAction = adapterapi.ActionKindGroupInfoRefresh
 		effect.Payload = adapterapi.EffectPayload{Kind: adapterapi.EffectPayloadGroupInfoRefresh, Target: adapterapi.EffectTarget{Kind: adapterapi.TargetGroup, Conversation: "group-dispatcher-recovery"}}
-		effect.Lane, err = adapterapi.NewLaneMetadata("endpoint-dispatcher-recovery", effect.Payload.Target, []byte("dispatcher-index-root"), 1)
+		effect.Lane, err = adapterapi.NewLaneMetadata("endpoint-dispatcher-recovery", effect.Payload.Target, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -550,7 +527,7 @@ func dispatcherRecoveryEffect(t *testing.T, id, operation string, retry adaptera
 
 func newRecoveryDispatcher(t *testing.T, store *dispatcherRecoveryStore, clock *dispatcherRecoveryClock, ids *dispatcherRecoveryIDs, provider *dispatcherRecoveryProvider, notifier *dispatcherRecoveryNotifier) *EffectDispatcher {
 	t.Helper()
-	dispatcher, err := NewEffectDispatcher(store, dispatcherRecoveryDecryptor{plain: store.plain}, provider, "dispatcher-recovery-worker", WithDispatcherClock(clock), WithDispatcherIDGenerator(ids), WithDispatcherRandom(func(time.Duration) time.Duration { return 0 }), WithEffectResultNotifier(notifier), WithEffectSuccessNotifier(notifier))
+	dispatcher, err := NewEffectDispatcher(store, provider, "dispatcher-recovery-worker", WithDispatcherClock(clock), WithDispatcherIDGenerator(ids), WithDispatcherRandom(func(time.Duration) time.Duration { return 0 }), WithEffectResultNotifier(notifier), WithEffectSuccessNotifier(notifier), WithDispatcherNotificationOwner(newDispatcherTestNotificationOwner(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -577,8 +554,11 @@ func assertDispatcherDurableState(t *testing.T, store *dispatcherRecoveryStore, 
 	if row.Status != status || !row.CompletedAt.Equal(store.clock.Now()) {
 		t.Fatalf("durable effect = %#v, want status %q at %v", row, status, store.clock.Now())
 	}
-	if len(row.PayloadCiphertext) != 0 || len(row.PayloadNonce) != 0 || bytes.Contains(row.PayloadCiphertext, []byte("do not retain")) {
-		t.Fatalf("durable effect retained plaintext/ciphertext: %#v", row)
+	store.mu.Lock()
+	originalPayload := store.plain[effectID]
+	store.mu.Unlock()
+	if !bytes.Equal(row.Payload, originalPayload) {
+		t.Fatalf("durable effect payload was lost or changed: %#v", row)
 	}
 	op, err := store.GetOperation(context.Background(), operationID)
 	if err != nil || op.Status != status {
@@ -814,8 +794,8 @@ func TestDispatcherCrashAtDispatchedMarkerLeavesRecoveryBoundary(t *testing.T) {
 		t.Fatalf("successor after isolated expired marker = %#v, %v", next, claimErr)
 	}
 	row = store.row(string(effect.ID))
-	if row.Status != eventstore.OutboxStatusAmbiguous || row.CompletedAt.IsZero() || len(row.PayloadCiphertext) != 0 || len(row.PayloadNonce) != 0 {
-		t.Fatalf("expired marker row = %#v, want ambiguous scrubbed row", row)
+	if row.Status != eventstore.OutboxStatusAmbiguous || row.CompletedAt.IsZero() || len(row.Payload) == 0 {
+		t.Fatalf("expired marker row=%#v, want ambiguous row retaining payload", row)
 	}
 	if _, err := store.ClaimOutbox(context.Background(), eventstore.OutboxClaimRequest{WorkerID: "second-restart-worker", LeaseDuration: time.Minute}); !errors.Is(err, eventstore.ErrNotFound) {
 		t.Fatalf("ambiguous effect was replayed or successor bypassed its active lease: %v", err)
@@ -887,8 +867,6 @@ func TestDispatcherNotificationSchedulingFaultIsBestEffort(t *testing.T) {
 }
 
 var _ DispatcherStore = (*dispatcherRecoveryStore)(nil)
-var _ EffectExecutor = (*dispatcherRecoveryProvider)(nil)
-var _ DispatcherDecryptor = dispatcherRecoveryDecryptor{}
 var _ EffectResultNotifier = (*dispatcherRecoveryNotifier)(nil)
 var _ EffectSuccessNotifier = (*dispatcherRecoveryNotifier)(nil)
 

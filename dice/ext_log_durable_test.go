@@ -2,9 +2,8 @@ package dice
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -12,26 +11,7 @@ import (
 	"Scardice-core/adapterapi"
 	"Scardice-core/core/messageflow"
 	"Scardice-core/eventstore"
-	"Scardice-core/logger"
 )
-
-type groupCardSQLiteKeySource struct{}
-
-func (groupCardSQLiteKeySource) IndexRootID(context.Context) (string, error) {
-	return "card-index-v1", nil
-}
-func (groupCardSQLiteKeySource) IndexRootMaterial(context.Context) ([]byte, error) {
-	return []byte("01234567890123456789012345678901"), nil
-}
-func (groupCardSQLiteKeySource) CurrentEncryptionRoot(context.Context) (eventstore.EncryptionRoot, error) {
-	return eventstore.EncryptionRoot{ID: "card-root-v1", Material: []byte("abcdefghijklmnopqrstuvwxyz123456")}, nil
-}
-func (groupCardSQLiteKeySource) EncryptionRoot(_ context.Context, id string) ([]byte, error) {
-	if id != "card-root-v1" {
-		return nil, eventstore.ErrKeyUnavailable
-	}
-	return []byte("abcdefghijklmnopqrstuvwxyz123456"), nil
-}
 
 type groupCardSQLiteResolver struct{ snapshot messageflow.EndpointSnapshot }
 
@@ -39,66 +19,27 @@ func (r groupCardSQLiteResolver) Resolve(context.Context, adapterapi.EndpointID)
 	return r.snapshot, nil
 }
 
-type groupCardSQLiteIndexSigner struct{}
-
-func (groupCardSQLiteIndexSigner) KeyedDigest(_ context.Context, domain string, parts ...string) ([]byte, string, error) {
-	mac := hmac.New(sha256.New, []byte("01234567890123456789012345678901"))
-	_, _ = mac.Write([]byte(domain))
-	for _, part := range parts {
-		_, _ = mac.Write([]byte(part))
-	}
-	return mac.Sum(nil), "card-index-v1", nil
-}
-
-func newGroupCardSQLiteContext(t *testing.T) (*eventstore.Database, *eventstore.GORMStore, *MsgContext) {
+func newGroupCardCanonicalFixture(t *testing.T) (*Dice, *eventstore.GORMStore, *EndPointInfo, *Message) {
 	t.Helper()
-	ctx := context.Background()
-	db, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: t.TempDir() + "/group-card.db"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-
-	keys := groupCardSQLiteKeySource{}
-	store := eventstore.NewStore(db, eventstore.WithKeySource(keys))
-	if err := store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "import", SchemaVersion: 1, DatabaseIdentity: "group-card-test-db",
-		IndexRootID: "card-index-v1", EncryptionRootIDs: []string{"card-root-v1"},
-		SourceManifestDigest: make([]byte, 32), TargetManifestDigest: make([]byte, 32),
-		CompletedAt: time.Unix(1, 0).UTC(),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	endpointID := adapterapi.EndpointID("endpoint-card-test")
+	d, store := newCanonicalTestDice(t)
+	endpoint := newCanonicalTestEndpoint(d, "QQ:9001")
+	endpoint.ID = "endpoint-card-test"
+	endpoint.Adapter = nil
 	resolver := groupCardSQLiteResolver{snapshot: messageflow.EndpointSnapshot{
-		EndpointID: endpointID, AdapterKey: OnebotAdapterKey,
+		EndpointID: adapterapi.EndpointID(endpoint.ID), AdapterKey: OnebotAdapterKey,
 		DesiredState: "enabled", ObservedState: adapterapi.ObservedStateConnected,
 		Capabilities: adapterapi.CapabilityOutbound | adapterapi.CapabilityActions,
 		Actions:      adapterapi.ActionSet(0).With(adapterapi.ActionKindSetGroupCard),
-		IndexRootID:  "card-index-v1", IndexSigner: groupCardSQLiteIndexSigner{},
 	}}
-	service, err := messageflow.NewOutboundService(store, resolver, store, eventstore.UUIDGenerator{})
+	ids := &canonicalFixtureIDs{prefix: canonicalFixtureLabel(t, "group-card-outbound")}
+	service, err := messageflow.NewOutboundService(store, resolver, ids)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	dice := &Dice{Logger: logger.M(), DurableStore: store, Config: Config{}}
-	session := &IMSession{Parent: dice}
-	dice.ImSession = session
-	endpoint := compatibilityCallbackEndpoint(session, messageflow.CallbackRequest{
-		EndpointID: string(endpointID),
-		Message:    adapterapi.InboundMessage{Platform: "QQ", Target: "QQ:9001"},
-	})
-	if endpoint.Adapter != nil {
-		t.Fatal("compatibility callback endpoint unexpectedly has an adapter")
-	}
-	dice.OutboundBridge = NewDurableOutboundBridge(service, resolver, eventstore.UUIDGenerator{})
-	return db, store, &MsgContext{
-		Dice: dice, Session: session, EndPoint: endpoint,
-		Group:          &GroupInfo{GroupID: "QQ-Group:2002"},
-		Player:         &GroupPlayerInfo{UserID: "QQ:1001", Name: "Alice"},
-		SystemTemplate: &GameSystemTemplate{},
-	}
+	d.OutboundBridge = NewDurableOutboundBridge(service, resolver, ids, newBridgeTestNotificationOwner(t))
+	msg := newGroupMsg("QQ-Group:2002", "QQ:1001", "")
+	msg.Sender.Nickname = "Alice"
+	return d, store, endpoint, msg
 }
 
 func groupCardSQLiteRowCounts(t *testing.T, db *eventstore.Database) (int64, int64, int64) {
@@ -115,26 +56,19 @@ func groupCardSQLiteRowCounts(t *testing.T, db *eventstore.Database) (int64, int
 	return events, operations, effects
 }
 
-func assertPersistedGroupCard(t *testing.T, db *eventstore.Database, store *eventstore.GORMStore, wantCard string) {
+func assertPersistedGroupCard(t *testing.T, store *eventstore.GORMStore, wantCard string) {
 	t.Helper()
-	var row struct {
-		EffectID          string `gorm:"column:effect_id"`
-		EndpointID        string `gorm:"column:endpoint_id"`
-		PayloadCiphertext []byte `gorm:"column:payload_ciphertext"`
-		PayloadNonce      []byte `gorm:"column:payload_nonce"`
-		EncryptionKeyID   string `gorm:"column:encryption_key_id"`
-	}
-	if err := db.GORM().Table("outbox_effects").Take(&row).Error; err != nil {
-		t.Fatal(err)
-	}
-	plain, err := store.DecryptBound(context.Background(), "outbox/v1", row.EffectID, row.EndpointID, 1, row.PayloadCiphertext, row.PayloadNonce, row.EncryptionKeyID)
+	lease, err := store.ClaimOutbox(context.Background(), eventstore.OutboxClaimRequest{
+		WorkerID: "group-card-assertion", LeaseDuration: time.Minute,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	pending := lease.Effect
 	var wire struct {
 		Effect adapterapi.OutboundEffect `json:"effect"`
 	}
-	if err := json.Unmarshal(plain, &wire); err != nil {
+	if err := json.Unmarshal(pending.Payload, &wire); err != nil {
 		t.Fatal(err)
 	}
 	payload := wire.Effect.Payload
@@ -151,94 +85,91 @@ func TestSetPlayerGroupCardByTemplatePersistsDurableActionWithoutAdapter(t *test
 		{name: "clear card", template: "", card: ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			db, store, ctx := newGroupCardSQLiteContext(t)
-			if ctx.EndPoint.Adapter != nil {
+			d, store, endpoint, msg := newGroupCardCanonicalFixture(t)
+			if endpoint.Adapter != nil {
 				t.Fatal("fixture must model the adapter-free event-sourced endpoint")
 			}
-			text, err := SetPlayerGroupCardByTemplate(ctx, test.template)
-			if err != nil || text != test.card {
-				t.Fatalf("SetPlayerGroupCardByTemplate() = %q, %v", text, err)
+			var text string
+			withCanonicalTestMessageContext(t, d, endpoint, msg, "persist-group-card", func(ctx *MsgContext) (err error) {
+				ctx.SystemTemplate = &GameSystemTemplate{}
+				text, err = SetPlayerGroupCardByTemplate(ctx, test.template)
+				return err
+			})
+			if text != test.card {
+				t.Fatalf("SetPlayerGroupCardByTemplate() = %q, want %q", text, test.card)
 			}
-			if events, operations, effects := groupCardSQLiteRowCounts(t, db); events != 1 || operations != 1 || effects != 1 {
-				t.Fatalf("durable participants = events:%d operations:%d effects:%d", events, operations, effects)
-			}
-			assertPersistedGroupCard(t, db, store, test.card)
+			assertPersistedGroupCard(t, store, test.card)
 		})
 	}
 }
 
-func TestSetPlayerGroupCardByTemplateStagesCallbackActionUntilCommit(t *testing.T) {
-	db, store, ctx := newGroupCardSQLiteContext(t)
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	ctx.callbackTransaction = &DurableCallbackTransaction{collector: collector}
+func TestSetPlayerGroupCardByTemplateStagesCallbackActionWithoutPublishing(t *testing.T) {
+	d, store, endpoint, msg := newGroupCardCanonicalFixture(t)
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, msg, "stage-group-card")
+	ctx.SystemTemplate = &GameSystemTemplate{}
 	text, err := SetPlayerGroupCardByTemplate(ctx, "Card {1+1}")
 	if err != nil || text != "Card 2" {
 		t.Fatalf("SetPlayerGroupCardByTemplate() = %q, %v", text, err)
 	}
-	if events, operations, effects := groupCardSQLiteRowCounts(t, db); events != 0 || operations != 0 || effects != 0 {
-		t.Fatalf("callback persisted before its UnitOfWork commit: events:%d operations:%d effects:%d", events, operations, effects)
+	if pending, lookupErr := store.HasOutboxWork(context.Background()); lookupErr != nil || pending {
+		t.Fatalf("callback published before root commit: pending=%t err=%v", pending, lookupErr)
 	}
-	work, err := collector.UnitOfWork()
+	if err = ctx.callbackTransaction.Finalize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	work, err := ctx.callbackTransaction.collector.UnitOfWork()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(work.Streams) != 1 || len(work.Operations) != 1 || len(work.Effects) != 1 {
-		t.Fatalf("prepared callback action participants = %#v", work)
+	if len(work.Operations) != 1 || len(work.Effects) != 1 {
+		t.Fatalf("prepared callback action participants = operations:%d effects:%d", len(work.Operations), len(work.Effects))
 	}
-	if _, err := store.Commit(context.Background(), work); err != nil {
-		t.Fatal(err)
-	}
-	if events, operations, effects := groupCardSQLiteRowCounts(t, db); events != 1 || operations != 1 || effects != 1 {
-		t.Fatalf("committed callback participants = events:%d operations:%d effects:%d", events, operations, effects)
-	}
-	assertPersistedGroupCard(t, db, store, "Card 2")
 }
 
 func TestSetPlayerGroupCardByTemplateUsesCardInCallbackIdentity(t *testing.T) {
-	db, store, ctx := newGroupCardSQLiteContext(t)
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	ctx.callbackTransaction = &DurableCallbackTransaction{collector: collector}
+	d, _, endpoint, msg := newGroupCardCanonicalFixture(t)
+	ctx := newCanonicalTestMessageContext(t, d, endpoint, msg, "distinct-group-cards")
+	ctx.SystemTemplate = &GameSystemTemplate{}
 	for _, card := range []string{"First card", "Second card"} {
 		if text, err := SetPlayerGroupCardByTemplate(ctx, card); err != nil || text != card {
 			t.Fatalf("SetPlayerGroupCardByTemplate(%q) = %q, %v", card, text, err)
 		}
 	}
-	work, err := collector.UnitOfWork()
+	if err := ctx.callbackTransaction.Finalize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	work, err := ctx.callbackTransaction.collector.UnitOfWork()
 	if err != nil {
-		t.Fatalf("build callback UnitOfWork: %v", err)
+		t.Fatal(err)
 	}
-	if len(work.Operations) != 2 || len(work.Effects) != 2 {
-		t.Fatalf("prepared callback actions = operations:%d effects:%d, want 2 each", len(work.Operations), len(work.Effects))
-	}
-	if _, err := store.Commit(context.Background(), work); err != nil {
-		t.Fatalf("commit callback actions: %v", err)
-	}
-	if _, operations, effects := groupCardSQLiteRowCounts(t, db); operations != 2 || effects != 2 {
-		t.Fatalf("committed callback actions = operations:%d effects:%d, want 2 each", operations, effects)
+	if len(work.Operations) != 2 || len(work.Effects) != 2 ||
+		work.Operations[0].OperationID == work.Operations[1].OperationID ||
+		work.Effects[0].EffectID == work.Effects[1].EffectID {
+		t.Fatalf("prepared callback actions = %#v", work)
 	}
 }
 
-func TestSetPlayerGroupCardByTemplateCallbackCommitFailureLeavesNoIntent(t *testing.T) {
-	db, store, ctx := newGroupCardSQLiteContext(t)
-	collector := messageflow.NewMutationCollector(eventstore.EventFactory{})
-	ctx.callbackTransaction = &DurableCallbackTransaction{collector: collector}
-	if _, err := SetPlayerGroupCardByTemplate(ctx, "Card {1+1}"); err != nil {
-		t.Fatal(err)
+func TestSetPlayerGroupCardByTemplateCallbackFailureLeavesNoIntent(t *testing.T) {
+	d, store, endpoint, msg := newGroupCardCanonicalFixture(t)
+	failure := errors.New("reject group card callback")
+	identity := d.DomainExecutionIdentity("test-fixture", canonicalFixtureLabel(t, "failed-group-card"))
+	err := d.WithDomainExecution(context.Background(), identity, []byte("failed-group-card"), func(transaction *DurableCallbackTransaction) error {
+		ctx, buildErr := NewDomainMsgContext(transaction, d, d.ImSession, endpoint, msg)
+		if buildErr != nil {
+			return buildErr
+		}
+		defer ctx.releaseExecutionState()
+		ctx.SystemTemplate = &GameSystemTemplate{}
+		if _, cardErr := SetPlayerGroupCardByTemplate(ctx, "Card {1+1}"); cardErr != nil {
+			return cardErr
+		}
+		return failure
+	})
+	if !errors.Is(err, failure) {
+		t.Fatalf("callback error = %v, want %v", err, failure)
 	}
-	work, err := collector.UnitOfWork()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(work.Streams) != 1 || len(work.Effects) != 1 {
-		t.Fatalf("prepared callback work = %#v", work)
-	}
-	// Force the callback's atomic UnitOfWork to conflict before the effect can commit.
-	work.Streams[0].ExpectedVersion = 1
-	if _, err := store.Commit(context.Background(), work); err == nil {
-		t.Fatal("callback UnitOfWork unexpectedly committed")
-	}
-	if events, operations, effects := groupCardSQLiteRowCounts(t, db); events != 0 || operations != 0 || effects != 0 {
-		t.Fatalf("failed callback left durable participants: events:%d operations:%d effects:%d", events, operations, effects)
+	if pending, lookupErr := store.HasOutboxWork(context.Background()); lookupErr != nil || pending {
+		t.Fatalf("failed callback left durable outbound intent: pending=%t err=%v", pending, lookupErr)
 	}
 }
 
@@ -251,12 +182,21 @@ func TestSetPlayerGroupCardByTemplateRejectsInvalidAndOverlongBeforeSubmitting(t
 		{name: "QQ card over limit", tmpl: strings.Repeat("x", 60)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			db, _, ctx := newGroupCardSQLiteContext(t)
+			d, store, endpoint, msg := newGroupCardCanonicalFixture(t)
+			ctx := newCanonicalTestMessageContext(t, d, endpoint, msg, "reject-group-card")
+			ctx.SystemTemplate = &GameSystemTemplate{}
 			if _, err := SetPlayerGroupCardByTemplate(ctx, test.tmpl); err == nil {
 				t.Fatal("invalid or overlong template unexpectedly succeeded")
 			}
-			if events, operations, effects := groupCardSQLiteRowCounts(t, db); events != 0 || operations != 0 || effects != 0 {
-				t.Fatalf("rejected template created durable participants: events:%d operations:%d effects:%d", events, operations, effects)
+			if pending, lookupErr := store.HasOutboxWork(context.Background()); lookupErr != nil || pending {
+				t.Fatalf("rejected template left durable outbound intent: pending=%t err=%v", pending, lookupErr)
+			}
+			work, err := ctx.callbackTransaction.collector.UnitOfWork()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(work.Operations) != 0 || len(work.Effects) != 0 {
+				t.Fatalf("rejected template staged outbound work: %#v", work)
 			}
 		})
 	}

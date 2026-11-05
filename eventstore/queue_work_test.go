@@ -1,51 +1,11 @@
 package eventstore
 
 import (
-	"context"
 	"strings"
 	"testing"
-	"time"
 
 	"gorm.io/gorm"
 )
-
-func TestOutboxWorkProbeFindsLegacyScrubbedExpiredPending(t *testing.T) {
-	store, db, clock := openQueueTestStore(t)
-	defer db.Close()
-	ctx := context.Background()
-	head := newOutboxTestEffect("legacy-expired-head", "legacy-expired-lane")
-	head.NextAttemptAt = clock.Now().Add(time.Hour)
-	head.PayloadExpiresAt = clock.Now().Add(time.Minute)
-	if _, err := store.AcceptOutbox(ctx, head); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.AcceptOutbox(ctx, newOutboxTestEffect("legacy-expired-successor", "legacy-expired-lane")); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.GORM().Model(&outboxEffectRow{}).Where("effect_id = ?", head.EffectID).Updates(map[string]any{
-		"version": 2, "payload_ciphertext": nil, "payload_nonce": nil, "payload_present": false,
-	}).Error; err != nil {
-		t.Fatal(err)
-	}
-	if available, err := store.HasOutboxWork(ctx); err != nil || available {
-		t.Fatalf("work before payload expiry = %v, %v; want false", available, err)
-	}
-	clock.Advance(2 * time.Minute)
-	if available, err := store.HasOutboxWork(ctx); err != nil || !available {
-		t.Fatalf("work after payload expiry = %v, %v; want true", available, err)
-	}
-	next, err := store.ClaimOutbox(ctx, OutboxClaimRequest{WorkerID: "legacy-expired-worker", LeaseDuration: time.Minute})
-	if err != nil || next.Effect.EffectID != "legacy-expired-successor" {
-		t.Fatalf("successor claim = %#v, %v", next, err)
-	}
-	var isolated outboxEffectRow
-	if err := db.GORM().Where("effect_id = ?", head.EffectID).First(&isolated).Error; err != nil {
-		t.Fatal(err)
-	}
-	if isolated.Status != OutboxStatusFailed || isolated.Version != 3 || isolated.CompletedAt == nil {
-		t.Fatalf("isolated legacy head = %#v", isolated)
-	}
-}
 
 func TestInboxClaimPlanUsesReadyLaneIndex(t *testing.T) {
 	_, db, clock := openQueueTestStore(t)
@@ -71,28 +31,6 @@ func TestOutboxClaimPlanUsesReadyLaneIndex(t *testing.T) {
 		return scanOutboxClaimable(tx, clock.Now(), &candidate)
 	})
 	assertSQLiteOrderedPlan(t, db.GORM(), sql, "ix_lane_heads_action_ready")
-}
-
-func TestInboxPayloadScrubPlanUsesOrderedUnionWithoutTempSort(t *testing.T) {
-	_, db, clock := openQueueTestStore(t)
-	defer db.Close()
-
-	var candidates []task5ExpiredPayloadCandidate
-	sql := db.GORM().ToSQL(func(tx *gorm.DB) *gorm.DB {
-		return inboxExpiredPayloadCandidates(tx, clock.Now(), task5PayloadScrubBatchSize).Scan(&candidates)
-	})
-	assertSQLiteOrderedPlan(t, db.GORM(), sql, "ix_inbox_status_payload_expiry")
-}
-
-func TestOutboxPayloadScrubPlanUsesOrderedUnionWithoutTempSort(t *testing.T) {
-	_, db, clock := openQueueTestStore(t)
-	defer db.Close()
-
-	var candidates []task5ExpiredPayloadCandidate
-	sql := db.GORM().ToSQL(func(tx *gorm.DB) *gorm.DB {
-		return outboxExpiredPayloadCandidates(tx, clock.Now(), task5PayloadScrubBatchSize).Scan(&candidates)
-	})
-	assertSQLiteOrderedPlan(t, db.GORM(), sql, "ix_outbox_status_payload_expiry")
 }
 
 func sqlitePlanDetails(t *testing.T, db *gorm.DB, sql string) string {

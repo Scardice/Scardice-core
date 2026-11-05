@@ -50,14 +50,15 @@ var cmdTeam = &CmdItemInfo{
 		}
 
 		group := context.Group
-		if group.PlayerGroups == nil {
-			group.PlayerGroups = new(SyncMap[string, []string])
-		}
 		if teamIsListRequest(arguments) {
-			teamReplyList(context, message, group)
+			if err := teamReplyList(context, message, group); err != nil {
+				context.setExecutionError(err)
+				ReplyToSender(context, message, fmt.Sprintf("读取团队失败：%v", err))
+			}
 			return execResult
 		}
-		playerGroup, groupExists := group.PlayerGroups.Load(groupName)
+		playerGroup := group.TeamMembers(groupName)
+		groupExists := slices.Contains(group.TeamNames(), groupName)
 
 		switch subcommand := arguments.GetArgN(2); subcommand {
 		case "add":
@@ -77,7 +78,11 @@ var cmdTeam = &CmdItemInfo{
 					count++
 				}
 			}
-			group.PlayerGroups.Store(groupName, playerGroup)
+			if err := group.SetTeam(groupName, playerGroup); err != nil {
+				context.setExecutionError(err)
+				ReplyToSender(context, message, fmt.Sprintf("团队写入失败：%v", err))
+				break
+			}
 			ReplyToSender(context, message, fmt.Sprintf("已经添加%d名玩家至团队%s", count, groupName))
 		case "del", "rm", "delete", "remove":
 			if teamIsAtNoneOrSelf(context.EndPoint, arguments.At) {
@@ -100,14 +105,22 @@ var cmdTeam = &CmdItemInfo{
 					count++
 				}
 			}
-			group.PlayerGroups.Store(groupName, playerGroup)
+			if err := group.SetTeam(groupName, playerGroup); err != nil {
+				context.setExecutionError(err)
+				ReplyToSender(context, message, fmt.Sprintf("团队写入失败：%v", err))
+				break
+			}
 			ReplyToSender(context, message, fmt.Sprintf("已经从团队%s删除%d名玩家", groupName, count))
 		case "clear":
 			if !groupExists {
 				ReplyToSender(context, message, fmt.Sprintf("没有叫%s的团队或它已经被清除", groupName))
 				break
 			}
-			group.PlayerGroups.Delete(groupName)
+			if err := group.DeleteTeam(groupName); err != nil {
+				context.setExecutionError(err)
+				ReplyToSender(context, message, fmt.Sprintf("团队清除失败：%v", err))
+				break
+			}
 			ReplyToSender(context, message, fmt.Sprintf("清空了团队%s", groupName))
 		case "call", "":
 			if !groupExists {
@@ -168,9 +181,11 @@ var cmdTeam = &CmdItemInfo{
 				break
 			}
 
-			currentGameSystem, exists := context.Dice.GameSystemMap.Load(context.Group.System)
+			currentGameSystem, exists := context.Dice.GameSystemMap.Load(context.Group.System())
 			if !exists {
-				context.Dice.Logger.Errorf("Group game system %s not found", context.Group.System)
+				err := fmt.Errorf("group game system %q not found", context.Group.System())
+				context.setExecutionError(err)
+				context.Dice.Logger.Error(err)
 				ReplyToSender(context, message, DiceFormatTmpl(context, "核心:骰子执行异常"))
 				break
 			}
@@ -180,9 +195,9 @@ var cmdTeam = &CmdItemInfo{
 
 			containers := make([]attributeContainer, 0, len(playerGroup))
 			for _, userID := range playerGroup {
-				characterAttributes, err := attributeManager.Load(group.GroupID, userID)
+				characterAttributes, err := attributeManager.LoadForCtx(context, group.GroupID(), userID)
 				if err != nil {
-					// Most likely, no such user
+					context.setExecutionError(err)
 					context.Dice.Logger.Error(err)
 					tmpl := DiceFormatTmpl(context, "核心:骰子执行异常")
 					ReplyToSender(context, message, tmpl)
@@ -242,36 +257,40 @@ func teamIsListRequest(arguments *CmdArgs) bool {
 	return arguments.GetArgN(1) == "list" && arguments.GetArgN(2) == ""
 }
 
-func teamReplyList(context *MsgContext, message *Message, group *GroupInfo) {
-	text := teamListText(context, group)
+func teamReplyList(context *MsgContext, message *Message, group *GroupInfo) error {
+	text, err := teamListText(context, group)
+	if err != nil {
+		return err
+	}
 	for _, page := range teamListPages(text) {
 		ReplyToSender(context, message, page)
 	}
+	return nil
 }
 
 func teamListPages(text string) []string {
 	return utils.SplitLongText(text, teamListPageMaxLength, "团队列表（%d/%d）\n")
 }
 
-func teamListText(context *MsgContext, group *GroupInfo) string {
-	teamNames := make([]string, 0, group.PlayerGroups.Len())
-	group.PlayerGroups.Range(func(teamName string, _ []string) bool {
-		teamNames = append(teamNames, teamName)
-		return true
-	})
+func teamListText(context *MsgContext, group *GroupInfo) (string, error) {
+	teamNames := group.TeamNames()
 	slices.Sort(teamNames)
 
 	if len(teamNames) == 0 {
-		return "当前群尚未创建团队"
+		return "当前群尚未创建团队", nil
 	}
 
 	lines := make([]string, 0, len(teamNames)+1)
 	lines = append(lines, fmt.Sprintf("当前群共有%d个团队：", len(teamNames)))
 	for _, teamName := range teamNames {
-		members, _ := group.PlayerGroups.Load(teamName)
+		members := group.TeamMembers(teamName)
 		formattedMembers := make([]string, 0, len(members))
 		for _, userID := range members {
-			formattedMembers = append(formattedMembers, teamMemberDisplayName(context, group, userID))
+			displayName, err := teamMemberDisplayName(context, group, userID)
+			if err != nil {
+				return "", err
+			}
+			formattedMembers = append(formattedMembers, displayName)
 		}
 
 		memberText := "无成员"
@@ -280,23 +299,26 @@ func teamListText(context *MsgContext, group *GroupInfo) string {
 		}
 		lines = append(lines, fmt.Sprintf("%s（%d人）：%s", teamSanitizeDisplayName(teamName), len(members), memberText))
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(lines, "\n"), nil
 }
 
-func teamMemberDisplayName(context *MsgContext, group *GroupInfo, userID string) string {
+func teamMemberDisplayName(context *MsgContext, group *GroupInfo, userID string) (string, error) {
 	name := ""
-	player := group.PlayerGet(context.Dice.DBOperator, userID)
-	if player != nil {
-		name = teamSanitizeDisplayName(player.Name)
+	player, err := context.ResolvePlayer(context.domainContext(), group.GroupID(), userID)
+	if err != nil {
+		return "", err
+	}
+	if player.Version() != 0 && !player.Deleted() {
+		name = teamSanitizeDisplayName(player.Name())
 	}
 
 	if name == "" || name == "%未知用户%" {
 		name = teamSanitizeDisplayName(context.Dice.Parent.TryGetUserName(userID))
 	}
 	if name == "" || name == "%未知用户%" {
-		return userID
+		return userID, nil
 	}
-	return fmt.Sprintf("%s（%s）", name, userID)
+	return fmt.Sprintf("%s（%s）", name, userID), nil
 }
 
 func teamSanitizeDisplayName(name string) string {

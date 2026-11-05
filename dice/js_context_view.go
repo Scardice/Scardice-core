@@ -3,539 +3,1034 @@ package dice
 import (
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
-	"sort"
-	"strings"
+	"sync"
+
+	ds "github.com/sealdice/dicescript"
+
+	"Scardice-core/utils/jsengine/hostbridge"
 )
 
-// The JS*View types are request-local copies. They intentionally contain no
-// Dice, session, adapter, database, lock, channel, or provider references.
-// Mutating one of these values cannot mutate the callback's authoritative
-// objects.
-type JSSenderView struct {
-	Nickname string `jsbind:"nickname" json:"nickname"`
-	UserID   string `jsbind:"userId" json:"userId"`
-	IsRobot  bool   `jsbind:"isRobot" json:"isRobot"`
+var (
+	ErrJSInvocationExpired       = errors.New("javascript invocation expired")
+	ErrJSInvocationCrossRealm    = errors.New("javascript invocation belongs to another realm")
+	ErrJSImmutableHostProperty   = errors.New("javascript host property is immutable")
+	ErrJSUnsupportedHostProperty = errors.New("javascript host property is unsupported")
+)
+
+var jsInvocationRegistryInitMu sync.Mutex
+
+type jsInvocationRegistryKey struct {
+	source      *JsScriptInfo
+	plugin      *ExtInfo
+	generation  int64
+	transaction *DurableCallbackTransaction
+	binding     *jsPersistentBindingLifecycle
 }
 
-type JSSegmentView map[string]any
+type jsEndpointIdentity struct{ id string }
 
-type JSMessageView struct {
-	Time        int64           `jsbind:"time" json:"time"`
-	MessageType string          `jsbind:"messageType" json:"messageType"`
-	GroupID     string          `jsbind:"groupId" json:"groupId"`
-	GuildID     string          `jsbind:"guildId" json:"guildId"`
-	ChannelID   string          `jsbind:"channelId" json:"channelId"`
-	Sender      JSSenderView    `jsbind:"sender" json:"sender"`
-	Message     string          `jsbind:"message" json:"message"`
-	RawID       any             `jsbind:"rawId" json:"rawId"`
-	Platform    string          `jsbind:"platform" json:"platform"`
-	GroupName   string          `json:"groupName"`
-	Seq         int64           `jsbind:"seq" json:"seq"`
-	Segment     []JSSegmentView `jsbind:"segment" json:"segment"`
+type jsInvocationRegistry struct {
+	dice        *Dice
+	source      *JsScriptInfo
+	plugin      *ExtInfo
+	generation  int64
+	message     *MsgContext
+	binding     *jsPersistentBindingLifecycle
+	transaction *DurableCallbackTransaction
+
+	mu      sync.Mutex
+	objects map[any]hostbridge.ControlledObject
+	groups  map[*GroupInfo]*MsgContext
+	players map[*GroupPlayerInfo]struct{}
 }
 
-type JSGroupView struct {
-	Active                bool                `jsbind:"active" json:"active"`
-	GroupID               string              `jsbind:"groupId" json:"groupId"`
-	GuildID               string              `jsbind:"guildId" json:"guildId"`
-	ChannelID             string              `jsbind:"channelId" json:"channelId"`
-	GroupName             string              `jsbind:"groupName" json:"groupName"`
-	CocRuleIndex          int                 `jsbind:"cocRuleIndex" json:"cocRuleIndex"`
-	DiceIDActive          map[string]bool     `json:"diceIdActive,omitempty"`
-	DiceIDExists          map[string]bool     `json:"diceIdExists,omitempty"`
-	BotList               map[string]bool     `json:"botList,omitempty"`
-	InactivatedExtensions map[string]bool     `json:"inactivatedExtensions,omitempty"`
-	ActivatedExtensions   []string            `json:"activatedExtensions,omitempty"`
-	HelpPackages          []string            `json:"helpPackages,omitempty"`
-	PlayerGroups          map[string][]string `json:"playerGroups,omitempty"`
+func newJSInvocationRegistry(c *jsExecutionContext, source *JsScriptInfo, generation int64) *jsInvocationRegistry {
+	plugin := jsContextPlugin(c)
+	if source != nil {
+		plugin = nil
+	}
+	registry := &jsInvocationRegistry{
+		dice: c.Dice, source: source, plugin: plugin, generation: generation, message: c.Message, binding: c.binding,
+		transaction: c.Transaction,
+		objects:     make(map[any]hostbridge.ControlledObject),
+		groups:      make(map[*GroupInfo]*MsgContext),
+		players:     make(map[*GroupPlayerInfo]struct{}),
+	}
+	if registry.dice == nil && c.Message != nil {
+		registry.dice = c.Message.Dice
+	}
+	registry.allowContext(c.Message)
+	return registry
 }
 
-type JSPlayerView struct {
-	Name                string `jsbind:"name" json:"name"`
-	UserID              string `jsbind:"userId" json:"userId"`
-	InGroup             bool   `json:"inGroup"`
-	LastCommandTime     int64  `jsbind:"lastCommandTime" json:"lastCommandTime"`
-	AutoSetNameTemplate string `jsbind:"autoSetNameTemplate" json:"autoSetNameTemplate"`
-	DiceSideNum         int    `json:"diceSideNum"`
-	GroupID             string `json:"groupId"`
-}
-
-type JSEndPointView struct {
-	ID                  string        `jsbind:"id" json:"id"`
-	Nickname            string        `jsbind:"nickname" json:"nickname"`
-	State               EndpointState `jsbind:"state" json:"state"`
-	UserID              string        `jsbind:"userId" json:"userId"`
-	GroupNum            int64         `jsbind:"groupNum" json:"groupNum"`
-	CmdExecutedNum      int64         `jsbind:"cmdExecutedNum" json:"cmdExecutedNum"`
-	CmdExecutedLastTime int64         `jsbind:"cmdExecutedLastTime" json:"cmdExecutedLastTime"`
-	OnlineTotalTime     int64         `jsbind:"onlineTotalTime" json:"onlineTotalTime"`
-	Platform            string        `jsbind:"platform" json:"platform"`
-	RelWorkDir          string        `json:"relWorkDir"`
-	Enable              bool          `jsbind:"enable" json:"enable"`
-	ProtocolType        string        `json:"protocolType"`
-	IsPublic            bool          `json:"isPublic"`
-}
-
-type JSContextView struct {
-	MessageType     string          `json:"messageType"`
-	Group           *JSGroupView    `jsbind:"group" json:"group"`
-	Player          *JSPlayerView   `jsbind:"player" json:"player"`
-	EndPoint        *JSEndPointView `jsbind:"endPoint" json:"endPoint"`
-	IsCurGroupBotOn bool            `jsbind:"isCurGroupBotOn" json:"isCurGroupBotOn"`
-	IsPrivate       bool            `jsbind:"isPrivate" json:"isPrivate"`
-	CommandHideFlag string          `jsbind:"commandHideFlag" json:"commandHideFlag"`
-	PrivilegeLevel  int             `jsbind:"privilegeLevel" json:"privilegeLevel"`
-	DelegateText    string          `jsbind:"delegateText" json:"delegateText"`
-}
-
-type JSCallbackContext struct {
-	Context JSContextView  `json:"context"`
-	Message *JSMessageView `json:"message"`
-}
-
-func NewJSSenderView(sender SenderBase) JSSenderView {
-	return JSSenderView{Nickname: sender.Nickname, UserID: sender.UserID, IsRobot: sender.IsRobot}
-}
-
-func NewJSMessageView(msg *Message) *JSMessageView {
-	if msg == nil {
+func (c *jsExecutionContext) invocationRegistry() *jsInvocationRegistry {
+	if c == nil {
 		return nil
 	}
-	view := &JSMessageView{
-		Time: msg.Time, MessageType: msg.MessageType, GroupID: msg.GroupID,
-		GuildID: msg.GuildID, ChannelID: msg.ChannelID, Sender: NewJSSenderView(msg.Sender),
-		Message: msg.Message, RawID: cloneJSValue(msg.RawID), Platform: msg.Platform,
-		GroupName: msg.GroupName, Seq: msg.Seq,
+	if c.registry != nil {
+		return c.registry
 	}
-	if len(msg.Segment) != 0 {
-		view.Segment = make([]JSSegmentView, 0, len(msg.Segment))
-		for _, segment := range msg.Segment {
-			if copied, ok := cloneJSStruct(segment); ok {
-				view.Segment = append(view.Segment, JSSegmentView(copied))
-			}
+	source := jsContextSource(c)
+	generation := jsContextGeneration(c)
+	if c.Message != nil {
+		execution := c.Message.messageJSExecution()
+		plugin := jsContextPlugin(c)
+		if source != nil {
+			plugin = nil
 		}
-	}
-	return view
-}
-
-func NewJSGroupView(group *GroupInfo) *JSGroupView {
-	if group == nil {
-		return nil
-	}
-	view := &JSGroupView{
-		Active: group.Active, GroupID: group.GroupID, GuildID: group.GuildID,
-		ChannelID: group.ChannelID, GroupName: group.GroupName, CocRuleIndex: group.CocRuleIndex,
-		InactivatedExtensions: cloneStringSet(group.InactivatedExtSet),
-		HelpPackages:          append([]string(nil), group.HelpPackages...),
-	}
-	for _, extension := range group.GetActivatedExtListRaw() {
-		if extension != nil && extension.Name != "" {
-			view.ActivatedExtensions = append(view.ActivatedExtensions, extension.Name)
+		key := jsInvocationRegistryKey{
+			source: source, plugin: plugin, generation: generation, transaction: c.Transaction, binding: c.binding,
 		}
+		execution.registryMu.Lock()
+		if execution.registries == nil {
+			execution.registries = make(map[jsInvocationRegistryKey]*jsInvocationRegistry)
+		}
+		registry := execution.registries[key]
+		if registry == nil {
+			registry = newJSInvocationRegistry(c, source, generation)
+			execution.registries[key] = registry
+		}
+		c.registry = registry
+		execution.registryMu.Unlock()
+		return registry
 	}
-	if group.DiceIDActiveMap != nil {
-		view.DiceIDActive = map[string]bool{}
-		group.DiceIDActiveMap.Range(func(key string, value bool) bool { view.DiceIDActive[key] = value; return true })
+	jsInvocationRegistryInitMu.Lock()
+	defer jsInvocationRegistryInitMu.Unlock()
+	if c.registry == nil {
+		c.registry = newJSInvocationRegistry(c, source, generation)
 	}
-	if group.DiceIDExistsMap != nil {
-		view.DiceIDExists = map[string]bool{}
-		group.DiceIDExistsMap.Range(func(key string, value bool) bool { view.DiceIDExists[key] = value; return true })
-	}
-	if group.BotList != nil {
-		view.BotList = map[string]bool{}
-		group.BotList.Range(func(key string, value bool) bool { view.BotList[key] = value; return true })
-	}
-	if group.PlayerGroups != nil {
-		view.PlayerGroups = map[string][]string{}
-		group.PlayerGroups.Range(func(key string, value []string) bool {
-			view.PlayerGroups[key] = append([]string(nil), value...)
-			return true
-		})
-	}
-	return view
+	return c.registry
 }
 
-func NewJSPlayerView(player *GroupPlayerInfo) *JSPlayerView {
-	if player == nil {
-		return nil
+func jsContextGeneration(c *jsExecutionContext) int64 {
+	if c == nil {
+		return 0
 	}
-	return &JSPlayerView{
-		Name: player.Name, UserID: player.UserID, InGroup: player.InGroup,
-		LastCommandTime: player.LastCommandTime, AutoSetNameTemplate: player.AutoSetNameTemplate,
-		DiceSideNum: player.DiceSideNum, GroupID: player.GroupID,
+	if plugin := jsContextPlugin(c); plugin != nil && plugin.JSLoopVersion != 0 {
+		return plugin.JSLoopVersion
 	}
+	if script := jsContextSource(c); script != nil {
+		script.runtimeStateMu.RLock()
+		generation := script.runtimeGeneration
+		script.runtimeStateMu.RUnlock()
+		return generation
+	}
+	return 0
 }
 
-func NewJSEndPointView(endpoint *EndPointInfo) *JSEndPointView {
-	if endpoint == nil {
-		return nil
+func (c *jsExecutionContext) persistentInvocation() (*jsExecutionContext, error) {
+	if c == nil {
+		return nil, ErrJSInvocationExpired
 	}
-	base := endpoint.EndPointInfoBase
-	return &JSEndPointView{
-		ID: base.ID, Nickname: base.Nickname, State: base.State, UserID: base.UserID,
-		GroupNum: base.GroupNum, CmdExecutedNum: base.CmdExecutedNum,
-		CmdExecutedLastTime: base.CmdExecutedLastTime, OnlineTotalTime: base.OnlineTotalTime,
-		Platform: base.Platform, RelWorkDir: base.RelWorkDir, Enable: base.Enable,
-		ProtocolType: base.ProtocolType, IsPublic: base.IsPublic,
+	if !c.persistentScope() {
+		return c, nil
 	}
+	registry := c.invocationRegistry()
+	if registry == nil || registry.dice == nil {
+		return nil, ErrJSInvocationExpired
+	}
+	if registry.dice.ExtLoopManager == nil {
+		return nil, ErrJSInvocationExpired
+	}
+	loop, err := registry.dice.ExtLoopManager.GetLoop(registry.generation)
+	if err != nil {
+		return nil, errors.Join(ErrJSInvocationExpired, err)
+	}
+	active := jsExecutionContextFor(loop)
+	if active == nil {
+		return nil, ErrJSInvocationExpired
+	}
+	if active.persistentScope() {
+		if active.invocationRegistry() != registry {
+			return nil, ErrJSInvocationExpired
+		}
+		delegated := registry.binding.activeInvocation()
+		if delegated == nil || delegated == active {
+			return active, nil
+		}
+		if err := delegated.ExecutionContext().Err(); err != nil {
+			return nil, errors.Join(ErrJSInvocationExpired, err)
+		}
+		active = delegated
+	}
+	activeRegistry := active.invocationRegistry()
+	if registry.source != nil && activeRegistry.source != registry.source {
+		return nil, ErrJSInvocationCrossRealm
+	}
+	if registry.source == nil && registry.plugin != nil && activeRegistry.plugin != registry.plugin {
+		return nil, ErrJSInvocationCrossRealm
+	}
+	if registry.binding != nil && activeRegistry.binding != registry.binding {
+		return nil, ErrJSInvocationCrossRealm
+	}
+	if registry.generation != 0 && activeRegistry.generation != registry.generation {
+		return nil, ErrJSInvocationCrossRealm
+	}
+	return active, nil
 }
 
-func NewJSContextView(ctx *MsgContext) *JSContextView {
-	view := &JSContextView{}
-	if ctx == nil {
-		return view
+// HostWrap implements hostbridge.ControlledObjectScope. Persistent load-time
+// binding scopes resolve the invocation currently entering the same generation;
+// ordinary message/task scopes stay pinned to their originating root.
+func (c *jsExecutionContext) HostWrap(value any) (hostbridge.ControlledObject, bool, error) {
+	target, err := c.persistentInvocation()
+	if err != nil {
+		return nil, false, err
 	}
-	view.MessageType = ctx.MessageType
-	view.Group = NewJSGroupView(ctx.Group)
-	view.Player = NewJSPlayerView(ctx.Player)
-	view.EndPoint = NewJSEndPointView(ctx.EndPoint)
-	view.IsCurGroupBotOn = ctx.IsCurGroupBotOn
-	view.IsPrivate = ctx.IsPrivate
-	view.CommandHideFlag = ctx.CommandHideFlag
-	view.PrivilegeLevel = ctx.PrivilegeLevel
-	view.DelegateText = ctx.DelegateText
-	return view
+	if target != c {
+		return target.HostWrap(value)
+	}
+	if err := c.ExecutionContext().Err(); err != nil {
+		return nil, false, errors.Join(ErrJSInvocationExpired, err)
+	}
+	return c.invocationRegistry().wrap(value)
 }
 
-func NewJSCallbackContext(ctx *MsgContext, msg *Message) *JSCallbackContext {
-	return &JSCallbackContext{Context: *NewJSContextView(ctx), Message: NewJSMessageView(msg)}
-}
-
-func cloneStringSet(values StringSet) map[string]bool {
-	if values == nil {
-		return nil
-	}
-	result := make(map[string]bool, len(values))
-	for key := range values {
-		result[key] = true
-	}
-	return result
-}
-
-// cloneJSValue keeps only JSON-like values and always allocates fresh maps and
-// slices. Unsupported values (including pointers to runtime objects) are not
-// exposed to the callback facade.
-func cloneJSValue(value any) any {
+func (r *jsInvocationRegistry) wrap(value any) (hostbridge.ControlledObject, bool, error) {
 	if value == nil {
-		return nil
+		return nil, false, nil
 	}
-	state := &jsCloneState{active: make(map[jsCloneReference]struct{})}
-	return cloneJSReflectValueWithState(reflect.ValueOf(value), 0, state)
-}
-
-const maxJSCloneDepth = 16
-
-type jsCloneReference struct {
-	kind  reflect.Kind
-	type_ reflect.Type
-	ptr   uintptr
-	len   int
-	cap   int
-}
-
-type jsCloneState struct {
-	active map[jsCloneReference]struct{}
-}
-
-func cloneJSReflectValueWithState(value reflect.Value, depth int, state *jsCloneState) any {
-	if !value.IsValid() || depth > maxJSCloneDepth {
-		return nil
+	if controlled, ok := value.(hostbridge.ControlledObject); ok {
+		return controlled, true, nil
 	}
-	switch value.Kind() {
-	case reflect.Interface:
-		if value.IsNil() {
-			return nil
+	switch typed := value.(type) {
+	case *MsgContext:
+		if typed == nil {
+			return nil, false, nil
 		}
-		return cloneJSReflectValueWithState(value.Elem(), depth+1, state)
-	case reflect.Pointer, reflect.Invalid, reflect.Uintptr, reflect.Complex64, reflect.Complex128,
-		reflect.Chan, reflect.Func, reflect.UnsafePointer:
-		return nil
-	case reflect.Map:
-		if value.IsNil() || value.Type().Key().Kind() != reflect.String {
-			return nil
+		if err := r.authorizeContext(typed); err != nil {
+			return nil, false, err
 		}
-		reference := jsCloneReference{kind: value.Kind(), type_: value.Type(), ptr: value.Pointer()}
-		if !state.enter(reference) {
-			return nil
+		r.allowContext(typed)
+		return r.object(typed, func() hostbridge.ControlledObject {
+			return &jsControlledContext{registry: r, value: typed}
+		}), true, nil
+	case *GroupInfo:
+		if typed == nil {
+			return nil, false, nil
 		}
-		defer state.leave(reference)
-		result := make(map[string]any, value.Len())
-		keys := value.MapKeys()
-		sort.Slice(keys, func(i, j int) bool { return keys[i].String() < keys[j].String() })
-		for _, key := range keys {
-			result[key.String()] = cloneJSReflectValueWithState(value.MapIndex(key), depth+1, state)
+		context, ok := r.groupContext(typed)
+		if !ok {
+			return nil, false, fmt.Errorf("%w: group facade changed", ErrJSInvocationCrossRealm)
 		}
-		return result
-	case reflect.Slice:
-		if value.IsNil() {
-			return nil
+		return r.object(typed, func() hostbridge.ControlledObject {
+			return &jsControlledGroup{registry: r, context: context, value: typed}
+		}), true, nil
+	case *GroupPlayerInfo:
+		if typed == nil {
+			return nil, false, nil
 		}
-		if value.Type() == reflect.TypeOf([]byte(nil)) {
-			result := make([]byte, value.Len())
-			reflect.Copy(reflect.ValueOf(result), value)
-			return result
+		if !r.ownsPlayer(typed) {
+			return nil, false, fmt.Errorf("%w: player facade changed", ErrJSInvocationCrossRealm)
 		}
-		reference := jsCloneReference{
-			kind: value.Kind(), type_: value.Type(), ptr: value.Pointer(),
-			len: value.Len(), cap: value.Cap(),
+		return r.object(typed, func() hostbridge.ControlledObject {
+			return &jsControlledPlayer{registry: r, value: typed}
+		}), true, nil
+	case *EndPointInfo:
+		if typed == nil {
+			return nil, false, nil
 		}
-		if !state.enter(reference) {
-			return nil
+		// Endpoint DTOs are detached projections rebuilt on every read, so the
+		// endpoint ID is the identity: one invocation exposes one JavaScript
+		// object per endpoint no matter which view reached the host boundary.
+		var key any = typed
+		if typed.ID != "" {
+			key = jsEndpointIdentity{id: typed.ID}
 		}
-		defer state.leave(reference)
-		result := make([]any, value.Len())
-		for index := range value.Len() {
-			result[index] = cloneJSReflectValueWithState(value.Index(index), depth+1, state)
-		}
-		return result
-	case reflect.Array:
-		result := make([]any, value.Len())
-		for index := range value.Len() {
-			result[index] = cloneJSReflectValueWithState(value.Index(index), depth+1, state)
-		}
-		return result
-	case reflect.Struct:
-		result, _ := cloneJSReflectStruct(value, depth, state)
-		return result
-	case reflect.String:
-		return value.String()
-	case reflect.Bool:
-		return value.Bool()
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return value.Int()
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return value.Uint()
-	case reflect.Float32, reflect.Float64:
-		return value.Float()
+		return r.object(key, func() hostbridge.ControlledObject {
+			return &jsControlledEndpoint{registry: r, value: typed}
+		}), true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func (r *jsInvocationRegistry) object(key any, create func() hostbridge.ControlledObject) hostbridge.ControlledObject {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if object := r.objects[key]; object != nil {
+		return object
+	}
+	object := create()
+	r.objects[key] = object
+	return object
+}
+
+func jsRootMessage(message *MsgContext) *MsgContext {
+	for message != nil && message.executionParent != nil {
+		message = message.executionParent
+	}
+	return message
+}
+
+func (r *jsInvocationRegistry) authorizeContext(message *MsgContext) error {
+	if r == nil || message == nil {
+		return ErrJSInvocationExpired
+	}
+	if r.message == nil {
+		return fmt.Errorf("%w: root has no message authority", ErrJSInvocationCrossRealm)
+	}
+	if jsRootMessage(message) != jsRootMessage(r.message) {
+		return fmt.Errorf("%w: message root changed", ErrJSInvocationCrossRealm)
+	}
+	if message.callbackTransaction != r.transaction {
+		return fmt.Errorf("%w: transaction changed", ErrJSInvocationCrossRealm)
 	}
 	return nil
 }
 
-func (state *jsCloneState) enter(reference jsCloneReference) bool {
-	if _, exists := state.active[reference]; exists {
+func (r *jsInvocationRegistry) allowContext(message *MsgContext) {
+	if r == nil || message == nil {
+		return
+	}
+	r.mu.Lock()
+	if message.Group != nil {
+		if _, exists := r.groups[message.Group]; !exists {
+			r.groups[message.Group] = message
+		}
+	}
+	if message.Player != nil {
+		r.players[message.Player] = struct{}{}
+	}
+	r.mu.Unlock()
+}
+
+func (r *jsInvocationRegistry) groupContext(group *GroupInfo) (*MsgContext, bool) {
+	if r == nil || group == nil {
+		return nil, false
+	}
+	r.mu.Lock()
+	context, ok := r.groups[group]
+	r.mu.Unlock()
+	return context, ok
+}
+
+func (r *jsInvocationRegistry) ownsPlayer(player *GroupPlayerInfo) bool {
+	if r == nil || player == nil {
 		return false
 	}
-	state.active[reference] = struct{}{}
-	return true
+	r.mu.Lock()
+	_, ok := r.players[player]
+	r.mu.Unlock()
+	return ok
 }
 
-func (state *jsCloneState) leave(reference jsCloneReference) {
-	delete(state.active, reference)
+func (r *jsInvocationRegistry) authorizeMutation() error {
+	if r == nil || r.dice == nil {
+		return ErrJSInvocationExpired
+	}
+	if r.dice.ExtLoopManager == nil {
+		return ErrJSInvocationExpired
+	}
+	loop, err := r.dice.ExtLoopManager.GetLoop(r.generation)
+	if err != nil {
+		return errors.Join(ErrJSInvocationExpired, err)
+	}
+	active := jsExecutionContextFor(loop)
+	if active == nil || active.invocationRegistry() != r {
+		return ErrJSInvocationExpired
+	}
+	if err := active.ExecutionContext().Err(); err != nil {
+		return errors.Join(ErrJSInvocationExpired, err)
+	}
+	if r.message != nil {
+		if err := r.message.checkExecution(); err != nil {
+			return errors.Join(ErrJSInvocationExpired, err)
+		}
+	}
+	if r.transaction != nil {
+		domain := r.transaction.Domain()
+		if domain == nil {
+			return ErrJSInvocationExpired
+		}
+		if err := domain.CheckOpen(); err != nil {
+			return errors.Join(ErrJSInvocationExpired, err)
+		}
+	}
+	return nil
 }
-func cloneJSStruct(value any) (map[string]any, bool) {
+
+func (r *jsInvocationRegistry) unwrap(target reflect.Type, expected reflect.Type, value any) (any, error) {
+	if target != expected {
+		return nil, fmt.Errorf("%w: cannot unwrap %s as %s", ErrJSInvocationCrossRealm, expected, target)
+	}
+	if err := r.authorizeMutation(); err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+func controlledObject(r *jsInvocationRegistry, value any) (hostbridge.ControlledObject, error) {
+	object, wrapped, err := r.wrap(value)
+	if err != nil {
+		return nil, err
+	}
+	if !wrapped {
+		return nil, fmt.Errorf("%w: %T", ErrJSUnsupportedHostProperty, value)
+	}
+	return object, nil
+}
+
+type jsControlledContext struct {
+	registry *jsInvocationRegistry
+	value    *MsgContext
+}
+
+var jsContextHostKeys = []string{
+	"commandHideFlag", "createVmIfNotExists", "delegateText", "endPoint", "eval", "evalFString",
+	"extensionConfigSet", "extensionConfigValue", "extensionStorageGet", "extensionStorageSet",
+	"genDefaultRollVmConfig", "group", "initSplitKey", "isCommandReplied", "isCurGroupBotOn",
+	"isPrivate", "notice", "noticeCrossPlatform", "player", "privilegeLevel", "randIntn", "roll",
+	"roll64", "setCommandReplied", "setSplitKey", "shallowCopy", "shuffle", "splitText", "translateSplit",
+}
+
+func (o *jsControlledContext) HostGet(name string) (any, bool, error) {
+	if o == nil || o.value == nil || o.registry == nil {
+		return nil, false, ErrJSInvocationExpired
+	}
+	ctx := o.value
+	switch name {
+	case "group":
+		if ctx.Group == nil {
+			return nil, true, nil
+		}
+		value := o.registry.object(ctx.Group, func() hostbridge.ControlledObject {
+			return &jsControlledGroup{registry: o.registry, context: ctx, value: ctx.Group}
+		})
+		return value, true, nil
+	case "player":
+		if ctx.Player == nil {
+			return nil, true, nil
+		}
+		value := o.registry.object(ctx.Player, func() hostbridge.ControlledObject {
+			return &jsControlledPlayer{registry: o.registry, value: ctx.Player}
+		})
+		return value, true, nil
+	case "endPoint":
+		if ctx.EndPoint == nil {
+			return nil, true, nil
+		}
+		value, err := controlledObject(o.registry, ctx.EndPoint)
+		return value, true, err
+	case "isCurGroupBotOn":
+		return ctx.IsCurGroupBotOn, true, nil
+	case "isPrivate":
+		return ctx.IsPrivate, true, nil
+	case "commandHideFlag":
+		return ctx.CommandHideFlag, true, nil
+	case "privilegeLevel":
+		return ctx.PrivilegeLevel, true, nil
+	case "delegateText":
+		return ctx.DelegateText, true, nil
+	case "roll":
+		return ctx.Roll, true, nil
+	case "roll64":
+		return ctx.Roll64, true, nil
+	case "randIntn":
+		return ctx.RandIntn, true, nil
+	case "shuffle":
+		return ctx.Shuffle, true, nil
+	case "isCommandReplied":
+		return ctx.IsCommandReplied, true, nil
+	case "setCommandReplied":
+		return func(replied bool) error {
+			if err := o.registry.authorizeMutation(); err != nil {
+				return err
+			}
+			ctx.SetCommandReplied(replied)
+			return nil
+		}, true, nil
+	case "setSplitKey":
+		return func(key string) error {
+			if err := o.registry.authorizeMutation(); err != nil {
+				return err
+			}
+			ctx.SetSplitKey(key)
+			return nil
+		}, true, nil
+	case "initSplitKey":
+		return func() error {
+			if err := o.registry.authorizeMutation(); err != nil {
+				return err
+			}
+			ctx.InitSplitKey()
+			return nil
+		}, true, nil
+	case "translateSplit":
+		return func(text string) (string, error) {
+			if err := o.registry.authorizeMutation(); err != nil {
+				return "", err
+			}
+			return ctx.TranslateSplit(text), nil
+		}, true, nil
+	case "splitText":
+		return func(text string) ([]string, error) {
+			if err := o.registry.authorizeMutation(); err != nil {
+				return nil, err
+			}
+			return ctx.SplitText(text), nil
+		}, true, nil
+	case "shallowCopy":
+		return func() (*MsgContext, error) {
+			if err := o.registry.authorizeMutation(); err != nil {
+				return nil, err
+			}
+			return ctx.ShallowCopy(), nil
+		}, true, nil
+	case "notice":
+		return func(text string, kinds ...NoticeType) error {
+			if err := o.registry.authorizeMutation(); err != nil {
+				return err
+			}
+			ctx.Notice(text, kinds...)
+			return nil
+		}, true, nil
+	case "noticeCrossPlatform":
+		return func(text string, kinds ...NoticeType) error {
+			if err := o.registry.authorizeMutation(); err != nil {
+				return err
+			}
+			ctx.NoticeCrossPlatform(text, kinds...)
+			return nil
+		}, true, nil
+	case "extensionStorageSet":
+		return func(extensionID, key, value string) error {
+			if err := o.registry.authorizeMutation(); err != nil {
+				return err
+			}
+			return ctx.ExtensionStorageSet(extensionID, key, value)
+		}, true, nil
+	case "extensionStorageGet":
+		return func(extensionID, key string) (string, error) {
+			if err := o.registry.authorizeMutation(); err != nil {
+				return "", err
+			}
+			return ctx.ExtensionStorageGet(extensionID, key)
+		}, true, nil
+	case "extensionConfigSet":
+		return func(extensionID, key string, value any) error {
+			if err := o.registry.authorizeMutation(); err != nil {
+				return err
+			}
+			return ctx.ExtensionConfigSet(extensionID, key, value)
+		}, true, nil
+	case "extensionConfigValue":
+		return func(extensionID, key string) (any, bool, error) {
+			if err := o.registry.authorizeMutation(); err != nil {
+				return nil, false, err
+			}
+			return ctx.ExtensionConfigValue(extensionID, key)
+		}, true, nil
+	case "genDefaultRollVmConfig":
+		return ctx.GenDefaultRollVmConfig, true, nil
+	case "eval":
+		return func(expression string, config *ds.RollConfig) (*VMResultV2, error) {
+			if err := o.registry.authorizeMutation(); err != nil {
+				return nil, err
+			}
+			return ctx.Eval(expression, config), nil
+		}, true, nil
+	case "evalFString":
+		return func(expression string, config *ds.RollConfig) (*VMResultV2, error) {
+			if err := o.registry.authorizeMutation(); err != nil {
+				return nil, err
+			}
+			return ctx.EvalFString(expression, config), nil
+		}, true, nil
+	case "createVmIfNotExists":
+		return func() error {
+			if err := o.registry.authorizeMutation(); err != nil {
+				return err
+			}
+			ctx.CreateVmIfNotExists()
+			return nil
+		}, true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func (o *jsControlledContext) HostSet(name string, value any) error {
+	if o == nil || o.value == nil || o.registry == nil {
+		return ErrJSInvocationExpired
+	}
+	if err := o.registry.authorizeMutation(); err != nil {
+		return err
+	}
+	ctx := o.value
+	switch name {
+	case "isCurGroupBotOn":
+		converted, ok := value.(bool)
+		if !ok {
+			return jsHostTypeError(name, "boolean", value)
+		}
+		ctx.IsCurGroupBotOn = converted
+	case "isPrivate":
+		converted, ok := value.(bool)
+		if !ok {
+			return jsHostTypeError(name, "boolean", value)
+		}
+		ctx.IsPrivate = converted
+	case "commandHideFlag":
+		converted, ok := value.(string)
+		if !ok {
+			return jsHostTypeError(name, "string", value)
+		}
+		ctx.CommandHideFlag = converted
+	case "privilegeLevel":
+		converted, ok := jsHostInt(value)
+		if !ok {
+			return jsHostTypeError(name, "integer", value)
+		}
+		ctx.PrivilegeLevel = converted
+	case "delegateText":
+		converted, ok := value.(string)
+		if !ok {
+			return jsHostTypeError(name, "string", value)
+		}
+		ctx.DelegateText = converted
+	case "group", "player", "endPoint":
+		return fmt.Errorf("%w: %s", ErrJSImmutableHostProperty, name)
+	default:
+		return fmt.Errorf("%w: %s", ErrJSUnsupportedHostProperty, name)
+	}
+	return nil
+}
+
+func (o *jsControlledContext) HostKeys() []string { return jsContextHostKeys }
+func (o *jsControlledContext) HostUnwrap(target reflect.Type) (any, error) {
+	return o.registry.unwrap(target, reflect.TypeFor[*MsgContext](), o.value)
+}
+
+type jsControlledGroup struct {
+	registry *jsInvocationRegistry
+	context  *MsgContext
+	value    *GroupInfo
+}
+
+var jsGroupHostKeys = []string{
+	"active", "channelId", "cocRuleIndex", "defaultHelpGroup", "diceId", "diceSideExpr", "diceSideNum",
+	"enteredTime", "groupId", "groupName", "groupWelcomeMessage", "guildId", "helpPackages", "inviteUserId",
+	"logCurName", "logOn", "recentDiceSendTime", "rollShaperMode", "showGroupWelcome", "system",
+}
+
+func (o *jsControlledGroup) HostGet(name string) (any, bool, error) {
+	if o == nil || o.value == nil {
+		return nil, false, ErrJSInvocationExpired
+	}
+	group := o.value
+	switch name {
+	case "active":
+		return group.Active(), true, nil
+	case "diceId":
+		return group.DiceID(), true, nil
+	case "groupId":
+		return group.GroupID(), true, nil
+	case "guildId":
+		return group.GuildID(), true, nil
+	case "channelId":
+		return group.ChannelID(), true, nil
+	case "groupName":
+		return group.GroupName(), true, nil
+	case "system":
+		return group.System(), true, nil
+	case "diceSideNum":
+		return group.DiceSideNum(), true, nil
+	case "diceSideExpr":
+		return group.DiceSideExpr(), true, nil
+	case "rollShaperMode":
+		return group.RollShaperMode(), true, nil
+	case "cocRuleIndex":
+		return group.CocRuleIndex(), true, nil
+	case "defaultHelpGroup":
+		return group.DefaultHelpGroup(), true, nil
+	case "helpPackages":
+		return group.HelpPackageIDs(), true, nil
+	case "showGroupWelcome":
+		return group.ShowGroupWelcome(), true, nil
+	case "groupWelcomeMessage":
+		return group.GroupWelcomeMessage(), true, nil
+	case "enteredTime":
+		return group.EnteredAt(), true, nil
+	case "inviteUserId":
+		return group.InviteUserID(), true, nil
+	case "recentDiceSendTime":
+		return group.RecentDiceSendTime(), true, nil
+	case "logOn":
+		state, err := o.logState()
+		return state.On, true, err
+	case "logCurName":
+		state, err := o.logState()
+		return state.Name, true, err
+	default:
+		return nil, false, nil
+	}
+}
+
+func (o *jsControlledGroup) logState() (GroupLogState, error) {
+	if o.registry.authorizeMutation() == nil && o.context != nil {
+		return o.context.ReadGroupLogState()
+	}
+	return o.value.GetLogState()
+}
+
+func (o *jsControlledGroup) HostSet(name string, value any) error {
+	if o == nil || o.value == nil || o.registry == nil {
+		return ErrJSInvocationExpired
+	}
+	if err := o.registry.authorizeMutation(); err != nil {
+		return err
+	}
+	group := o.value
+	switch name {
+	case "active":
+		converted, ok := value.(bool)
+		if !ok {
+			return jsHostTypeError(name, "boolean", value)
+		}
+		if o.context == nil || o.context.EndPoint == nil {
+			return ErrJSInvocationExpired
+		}
+		return group.SetDiceActive(o.context.EndPoint.UserID, converted)
+	case "groupName":
+		converted, ok := value.(string)
+		if !ok {
+			return jsHostTypeError(name, "string", value)
+		}
+		return group.SetGroupName(converted)
+	case "guildId":
+		converted, ok := value.(string)
+		if !ok {
+			return jsHostTypeError(name, "string", value)
+		}
+		return group.SetGuildID(converted)
+	case "channelId":
+		converted, ok := value.(string)
+		if !ok {
+			return jsHostTypeError(name, "string", value)
+		}
+		return group.SetChannelID(converted)
+	case "system":
+		converted, ok := value.(string)
+		if !ok {
+			return jsHostTypeError(name, "string", value)
+		}
+		return group.SetSystem(converted)
+	case "diceSideNum":
+		converted, ok := jsHostInt64(value)
+		if !ok {
+			return jsHostTypeError(name, "integer", value)
+		}
+		return group.SetDiceSideNum(converted)
+	case "diceSideExpr":
+		converted, ok := value.(string)
+		if !ok {
+			return jsHostTypeError(name, "string", value)
+		}
+		return group.SetDiceSideExpr(converted)
+	case "rollShaperMode":
+		converted, ok := value.(string)
+		if !ok {
+			return jsHostTypeError(name, "string", value)
+		}
+		return group.SetRollShaperMode(converted)
+	case "cocRuleIndex":
+		converted, ok := jsHostInt(value)
+		if !ok {
+			return jsHostTypeError(name, "integer", value)
+		}
+		return group.SetCocRuleIndex(converted)
+	case "defaultHelpGroup":
+		converted, ok := value.(string)
+		if !ok {
+			return jsHostTypeError(name, "string", value)
+		}
+		return group.SetDefaultHelpGroup(converted)
+	case "helpPackages":
+		converted, ok := jsHostStrings(value)
+		if !ok {
+			return jsHostTypeError(name, "string array", value)
+		}
+		return group.SetHelpPackageIDs(converted)
+	case "showGroupWelcome":
+		converted, ok := value.(bool)
+		if !ok {
+			return jsHostTypeError(name, "boolean", value)
+		}
+		return group.SetShowGroupWelcome(converted)
+	case "groupWelcomeMessage":
+		converted, ok := value.(string)
+		if !ok {
+			return jsHostTypeError(name, "string", value)
+		}
+		return group.SetGroupWelcomeMessage(converted)
+	case "enteredTime":
+		converted, ok := jsHostInt64(value)
+		if !ok {
+			return jsHostTypeError(name, "integer", value)
+		}
+		return group.SetEnteredAt(converted)
+	case "inviteUserId":
+		converted, ok := value.(string)
+		if !ok {
+			return jsHostTypeError(name, "string", value)
+		}
+		return group.SetInviteUserID(converted)
+	case "recentDiceSendTime":
+		converted, ok := jsHostInt64(value)
+		if !ok {
+			return jsHostTypeError(name, "integer", value)
+		}
+		group.SetRecentDiceSendTime(converted)
+		return nil
+	case "logOn":
+		converted, ok := value.(bool)
+		if !ok {
+			return jsHostTypeError(name, "boolean", value)
+		}
+		if o.context == nil {
+			return ErrJSInvocationExpired
+		}
+		return o.context.SetGroupLogOn(converted)
+	case "logCurName":
+		converted, ok := value.(string)
+		if !ok {
+			return jsHostTypeError(name, "string", value)
+		}
+		if o.context == nil {
+			return ErrJSInvocationExpired
+		}
+		return o.context.SetGroupLogName(converted)
+	case "diceId", "groupId":
+		return fmt.Errorf("%w: %s", ErrJSImmutableHostProperty, name)
+	default:
+		return fmt.Errorf("%w: %s", ErrJSUnsupportedHostProperty, name)
+	}
+}
+
+func (o *jsControlledGroup) HostKeys() []string { return jsGroupHostKeys }
+func (o *jsControlledGroup) HostUnwrap(target reflect.Type) (any, error) {
+	return o.registry.unwrap(target, reflect.TypeFor[*GroupInfo](), o.value)
+}
+
+type jsControlledPlayer struct {
+	registry *jsInvocationRegistry
+	value    *GroupPlayerInfo
+}
+
+var jsPlayerHostKeys = []string{
+	"autoSetNameTemplate", "diceId", "diceSideNum", "groupId", "inGroup", "lastCommandTime", "name", "privilege", "userId",
+}
+
+func (o *jsControlledPlayer) HostGet(name string) (any, bool, error) {
+	if o == nil || o.value == nil {
+		return nil, false, ErrJSInvocationExpired
+	}
+	player := o.value
+	switch name {
+	case "diceId":
+		return player.DiceID(), true, nil
+	case "groupId":
+		return player.GroupID(), true, nil
+	case "userId":
+		return player.UserID(), true, nil
+	case "name":
+		return player.Name(), true, nil
+	case "privilege":
+		return player.Privilege(), true, nil
+	case "autoSetNameTemplate":
+		return player.AutoSetNameTemplate(), true, nil
+	case "lastCommandTime":
+		return player.LastCommandAt(), true, nil
+	case "diceSideNum":
+		return player.DiceSideNum(), true, nil
+	case "inGroup":
+		return player.InGroup(), true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func (o *jsControlledPlayer) HostSet(name string, value any) error {
+	if o == nil || o.value == nil || o.registry == nil {
+		return ErrJSInvocationExpired
+	}
+	if err := o.registry.authorizeMutation(); err != nil {
+		return err
+	}
+	player := o.value
+	switch name {
+	case "name":
+		converted, ok := value.(string)
+		if !ok {
+			return jsHostTypeError(name, "string", value)
+		}
+		return player.SetName(converted)
+	case "privilege":
+		converted, ok := jsHostInt(value)
+		if !ok {
+			return jsHostTypeError(name, "integer", value)
+		}
+		return player.SetPrivilege(converted)
+	case "autoSetNameTemplate":
+		converted, ok := value.(string)
+		if !ok {
+			return jsHostTypeError(name, "string", value)
+		}
+		return player.SetAutoSetNameTemplate(converted)
+	case "lastCommandTime":
+		converted, ok := jsHostInt64(value)
+		if !ok {
+			return jsHostTypeError(name, "integer", value)
+		}
+		return player.SetLastCommandAt(converted)
+	case "diceSideNum":
+		converted, ok := jsHostInt64(value)
+		if !ok {
+			return jsHostTypeError(name, "integer", value)
+		}
+		return player.SetDiceSideNum(converted)
+	case "inGroup":
+		converted, ok := value.(bool)
+		if !ok {
+			return jsHostTypeError(name, "boolean", value)
+		}
+		player.SetInGroup(converted)
+		return nil
+	case "diceId", "groupId", "userId":
+		return fmt.Errorf("%w: %s", ErrJSImmutableHostProperty, name)
+	default:
+		return fmt.Errorf("%w: %s", ErrJSUnsupportedHostProperty, name)
+	}
+}
+
+func (o *jsControlledPlayer) HostKeys() []string { return jsPlayerHostKeys }
+func (o *jsControlledPlayer) HostUnwrap(target reflect.Type) (any, error) {
+	return o.registry.unwrap(target, reflect.TypeFor[*GroupPlayerInfo](), o.value)
+}
+
+type jsControlledEndpoint struct {
+	registry *jsInvocationRegistry
+	value    *EndPointInfo
+}
+
+var jsEndpointHostKeys = []string{
+	"baseInfo", "cmdExecutedLastTime", "cmdExecutedNum", "enable", "groupNum", "id", "nickname", "onlineTotalTime", "platform", "state", "userId",
+}
+
+func (o *jsControlledEndpoint) HostGet(name string) (any, bool, error) {
+	if o == nil || o.value == nil {
+		return nil, false, ErrJSInvocationExpired
+	}
+	endpoint := o.value
+	switch name {
+	case "baseInfo":
+		return o, true, nil
+	case "id":
+		return endpoint.ID, true, nil
+	case "nickname":
+		return endpoint.Nickname, true, nil
+	case "state":
+		return endpoint.State, true, nil
+	case "userId":
+		return endpoint.UserID, true, nil
+	case "groupNum":
+		return endpoint.GroupNum, true, nil
+	case "cmdExecutedNum":
+		return endpoint.CmdExecutedNum, true, nil
+	case "cmdExecutedLastTime":
+		return endpoint.CmdExecutedLastTime, true, nil
+	case "onlineTotalTime":
+		return endpoint.OnlineTotalTime, true, nil
+	case "platform":
+		return endpoint.Platform, true, nil
+	case "enable":
+		return endpoint.Enable, true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func (o *jsControlledEndpoint) HostSet(name string, _ any) error {
+	if o == nil || o.registry == nil {
+		return ErrJSInvocationExpired
+	}
+	if err := o.registry.authorizeMutation(); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: %s", ErrJSImmutableHostProperty, name)
+}
+
+func (o *jsControlledEndpoint) HostKeys() []string {
+	return jsEndpointHostKeys
+}
+
+func (o *jsControlledEndpoint) HostUnwrap(target reflect.Type) (any, error) {
+	return o.registry.unwrap(target, reflect.TypeFor[*EndPointInfo](), o.value)
+}
+
+func jsHostTypeError(name, want string, value any) error {
+	return fmt.Errorf("%s requires %s, got %T", name, want, value)
+}
+
+func jsHostInt(value any) (int, bool) {
+	converted, ok := jsHostInt64(value)
+	if !ok || int64(int(converted)) != converted {
+		return 0, false
+	}
+	return int(converted), true
+}
+
+func jsHostInt64(value any) (int64, bool) {
+	if value == nil {
+		return 0, false
+	}
 	reflected := reflect.ValueOf(value)
-	depth := 0
-	for reflected.IsValid() && (reflected.Kind() == reflect.Pointer || reflected.Kind() == reflect.Interface) {
-		if reflected.IsNil() || depth > maxJSCloneDepth {
-			return nil, false
+	switch reflected.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return reflected.Int(), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		converted := reflected.Uint()
+		if converted > math.MaxInt64 {
+			return 0, false
 		}
-		reflected = reflected.Elem()
-		depth++
+		return int64(converted), true
+	case reflect.Float32, reflect.Float64:
+		converted := reflected.Float()
+		if math.IsNaN(converted) || math.IsInf(converted, 0) || math.Trunc(converted) != converted || converted < math.MinInt64 || converted >= math.MaxInt64 {
+			return 0, false
+		}
+		return int64(converted), true
+	default:
+		return 0, false
 	}
-	if !reflected.IsValid() || reflected.Kind() != reflect.Struct {
-		return nil, false
-	}
-	state := &jsCloneState{active: make(map[jsCloneReference]struct{})}
-	return cloneJSReflectStruct(reflected, depth, state)
 }
 
-func cloneJSReflectStruct(value reflect.Value, depth int, state *jsCloneState) (map[string]any, bool) {
-	if !value.IsValid() || value.Kind() != reflect.Struct || depth > maxJSCloneDepth {
+func jsHostStrings(value any) ([]string, bool) {
+	switch converted := value.(type) {
+	case []string:
+		return converted, true
+	case []any:
+		values := make([]string, len(converted))
+		for index, item := range converted {
+			text, ok := item.(string)
+			if !ok {
+				return nil, false
+			}
+			values[index] = text
+		}
+		return values, true
+	default:
 		return nil, false
 	}
-	result := make(map[string]any)
-	typeOfValue := value.Type()
-	for index := range value.NumField() {
-		field := typeOfValue.Field(index)
-		if field.PkgPath != "" || field.Name == "Stream" {
-			continue
-		}
-		name := field.Name
-		if tag := field.Tag.Get("jsbind"); tag != "" && tag != "-" {
-			name = strings.Split(tag, ",")[0]
-		}
-		if name == "" || name == "-" {
-			continue
-		}
-		result[name] = cloneJSReflectValueWithState(value.Field(index), depth+1, state)
-	}
-	return result, true
 }
 
 var (
-	ErrJSContextMutationRejected = errors.New("js context mutation rejected")
-	ErrJSContextFieldNotWritable = errors.New("js context field is not writable")
-	ErrJSContextValueType        = errors.New("js context mutation has invalid type")
+	_ hostbridge.ControlledObjectScope = (*jsExecutionContext)(nil)
+	_ hostbridge.ControlledObject      = (*jsControlledContext)(nil)
+	_ hostbridge.ControlledObject      = (*jsControlledGroup)(nil)
+	_ hostbridge.ControlledObject      = (*jsControlledPlayer)(nil)
+	_ hostbridge.ControlledObject      = (*jsControlledEndpoint)(nil)
 )
-
-// JSContextDiff is the only state that a callback may request to write back.
-// Nil means unchanged, so setting a field to its zero value remains observable.
-type JSContextDiff struct {
-	IsPrivate       *bool   `json:"isPrivate,omitempty"`
-	IsCurGroupBotOn *bool   `json:"isCurGroupBotOn,omitempty"`
-	CommandHideFlag *string `json:"commandHideFlag,omitempty"`
-	PrivilegeLevel  *int    `json:"privilegeLevel,omitempty"`
-	DelegateText    *string `json:"delegateText,omitempty"`
-}
-
-func (d JSContextDiff) Empty() bool {
-	return d.IsPrivate == nil && d.IsCurGroupBotOn == nil && d.CommandHideFlag == nil && d.PrivilegeLevel == nil && d.DelegateText == nil
-}
-
-type JSContextOverlay struct {
-	base JSContextView
-
-	// These are the only exported writable fields. A JS binding can safely
-	// bind the overlay and assign them directly; Diff observes those changes.
-	IsPrivate       bool   `jsbind:"isPrivate" json:"isPrivate"`
-	IsCurGroupBotOn bool   `jsbind:"isCurGroupBotOn" json:"isCurGroupBotOn"`
-	CommandHideFlag string `jsbind:"commandHideFlag" json:"commandHideFlag"`
-	PrivilegeLevel  int    `jsbind:"privilegeLevel" json:"privilegeLevel"`
-	DelegateText    string `jsbind:"delegateText" json:"delegateText"`
-}
-
-func NewJSContextOverlay(ctx *MsgContext) *JSContextOverlay {
-	base := *NewJSContextView(ctx)
-	return &JSContextOverlay{
-		base: base, IsPrivate: base.IsPrivate, IsCurGroupBotOn: base.IsCurGroupBotOn,
-		CommandHideFlag: base.CommandHideFlag, PrivilegeLevel: base.PrivilegeLevel,
-		DelegateText: base.DelegateText,
-	}
-}
-
-func (o *JSContextOverlay) View() JSContextView {
-	if o == nil {
-		return JSContextView{}
-	}
-	view := o.base
-	view.IsPrivate = o.IsPrivate
-	view.IsCurGroupBotOn = o.IsCurGroupBotOn
-	view.CommandHideFlag = o.CommandHideFlag
-	view.PrivilegeLevel = o.PrivilegeLevel
-	view.DelegateText = o.DelegateText
-	return view
-}
-
-func (o *JSContextOverlay) Diff() JSContextDiff {
-	if o == nil {
-		return JSContextDiff{}
-	}
-	diff := JSContextDiff{}
-	if o.IsPrivate != o.base.IsPrivate {
-		diff.IsPrivate = &o.IsPrivate
-	}
-	if o.IsCurGroupBotOn != o.base.IsCurGroupBotOn {
-		diff.IsCurGroupBotOn = &o.IsCurGroupBotOn
-	}
-	if o.CommandHideFlag != o.base.CommandHideFlag {
-		diff.CommandHideFlag = &o.CommandHideFlag
-	}
-	if o.PrivilegeLevel != o.base.PrivilegeLevel {
-		diff.PrivilegeLevel = &o.PrivilegeLevel
-	}
-	if o.DelegateText != o.base.DelegateText {
-		diff.DelegateText = &o.DelegateText
-	}
-	return diff
-}
-func (o *JSContextOverlay) Set(field string, value any) error {
-	if o == nil {
-		return ErrJSContextMutationRejected
-	}
-	switch field {
-	case "isPrivate":
-		v, ok := value.(bool)
-		if !ok {
-			return fmt.Errorf("%w: %s", ErrJSContextValueType, field)
-		}
-		o.IsPrivate = v
-	case "isCurGroupBotOn":
-		v, ok := value.(bool)
-		if !ok {
-			return fmt.Errorf("%w: %s", ErrJSContextValueType, field)
-		}
-		o.IsCurGroupBotOn = v
-	case "commandHideFlag":
-		v, ok := value.(string)
-		if !ok {
-			return fmt.Errorf("%w: %s", ErrJSContextValueType, field)
-		}
-		o.CommandHideFlag = v
-	case "privilegeLevel":
-		v, ok := contextInt(value)
-		if !ok {
-			return fmt.Errorf("%w: %s", ErrJSContextValueType, field)
-		}
-		o.PrivilegeLevel = v
-	case "delegateText":
-		v, ok := value.(string)
-		if !ok {
-			return fmt.Errorf("%w: %s", ErrJSContextValueType, field)
-		}
-		o.DelegateText = v
-	default:
-		return fmt.Errorf("%w: %s", ErrJSContextFieldNotWritable, field)
-	}
-	return nil
-}
-
-func contextInt(value any) (int, bool) {
-	reflected := reflect.ValueOf(value)
-	if !reflected.IsValid() {
-		return 0, false
-	}
-	switch reflected.Kind() {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		converted := reflected.Int()
-		maxInt := int64(^uint(0) >> 1)
-		if converted < -maxInt-1 || converted > maxInt {
-			return 0, false
-		}
-		return int(converted), true
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		converted := reflected.Uint()
-		maxInt := uint64(^uint(0) >> 1)
-		if converted > maxInt {
-			return 0, false
-		}
-		return int(converted), true
-	case reflect.Float32, reflect.Float64:
-		converted := reflected.Float()
-		integer := int(converted)
-		return integer, float64(integer) == converted
-	default:
-		return 0, false
-	}
-}
-
-// DiffEntries presents the diff in a stable whitelist order for collectors and
-// logs. Values contain only primitive types.
-type JSContextMutation struct {
-	Field string `json:"field"`
-	Value any    `json:"value"`
-}
-
-func (o *JSContextOverlay) DiffEntries() []JSContextMutation {
-	if o == nil {
-		return nil
-	}
-	diff := o.Diff()
-	entries := make([]JSContextMutation, 0, 5)
-	if diff.IsPrivate != nil {
-		entries = append(entries, JSContextMutation{Field: "isPrivate", Value: *diff.IsPrivate})
-	}
-	if diff.IsCurGroupBotOn != nil {
-		entries = append(entries, JSContextMutation{Field: "isCurGroupBotOn", Value: *diff.IsCurGroupBotOn})
-	}
-	if diff.CommandHideFlag != nil {
-		entries = append(entries, JSContextMutation{Field: "commandHideFlag", Value: *diff.CommandHideFlag})
-	}
-	if diff.PrivilegeLevel != nil {
-		entries = append(entries, JSContextMutation{Field: "privilegeLevel", Value: *diff.PrivilegeLevel})
-	}
-	if diff.DelegateText != nil {
-		entries = append(entries, JSContextMutation{Field: "delegateText", Value: *diff.DelegateText})
-	}
-	return entries
-}

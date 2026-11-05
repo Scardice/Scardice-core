@@ -2,6 +2,7 @@ package groupstate
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -15,6 +16,48 @@ type fakeProjectionReader struct{ payload []byte }
 
 func (r fakeProjectionReader) ReadProjectionRow(context.Context, string, string) (eventstore.ProjectionRow, error) {
 	return eventstore.ProjectionRow{Payload: append([]byte(nil), r.payload...)}, nil
+}
+
+type fakeProjectionListReader struct {
+	rows   []eventstore.ProjectionRow
+	prefix string
+}
+
+func (r *fakeProjectionListReader) ListProjectionRowsByRowKeyPrefix(_ context.Context, _ string, prefix string) ([]eventstore.ProjectionRow, error) {
+	r.prefix = prefix
+	return append([]eventstore.ProjectionRow(nil), r.rows...), nil
+}
+
+func TestListProjectedReturnsDetachedStatesForOneDice(t *testing.T) {
+	state := State{
+		Version: 1, DiceID: "dice-1", GroupID: "group-1",
+		DiceIDActive: map[string]bool{}, DiceIDExists: map[string]bool{"bot-1": true},
+		BotList: map[string]bool{}, InactivatedExtensions: map[string]bool{},
+		PlayerGroups: map[string][]string{"team": {"user-1"}}, Privileges: map[string]int{},
+	}
+	payload, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &fakeProjectionListReader{rows: []eventstore.ProjectionRow{{
+		ProjectionName: GroupProjectionName,
+		RowKey:         GroupStream(state.DiceID, state.GroupID).AggregateID,
+		Payload:        payload,
+	}}}
+	states, err := ListProjected(context.Background(), reader, state.DiceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != 1 || states[0].GroupID != state.GroupID {
+		t.Fatalf("projected groups = %#v", states)
+	}
+	if reader.prefix != "6:dice-1" {
+		t.Fatalf("projection prefix = %q", reader.prefix)
+	}
+	states[0].PlayerGroups["team"][0] = "changed"
+	if state.PlayerGroups["team"][0] != "user-1" {
+		t.Fatal("projected result aliases caller state")
+	}
 }
 
 func TestGroupEventsReplayIntoRecordWithoutAttrsOrModeration(t *testing.T) {
@@ -186,20 +229,6 @@ func TestTypedEventRejectsNilOversizeAndInvalidPrivilege(t *testing.T) {
 	}
 }
 
-func TestCompatibilityViewDoesNotExposeMutableAuthoritativeMaps(t *testing.T) {
-	state, err := Reduce(State{}, NewGroupCreatedV1("dice-1", "group-1", "", 0))
-	if err == nil {
-		state, err = Reduce(state, NewGroupBotListChangedV1("bot-1", true))
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	view := state.CompatibilityView()
-	view.BotList["bot-1"] = false
-	if !state.BotList["bot-1"] {
-		t.Fatal("compatibility view mutated authoritative state")
-	}
-}
 func TestReadProjectedRejectsCorruptRows(t *testing.T) {
 	for _, payload := range []string{
 		"null",
@@ -242,6 +271,86 @@ func TestDecideWelcomeUsesExplicitEnabledField(t *testing.T) {
 	}
 }
 
+func TestDecideInvitationUpdatesExistingGroup(t *testing.T) {
+	state := State{Version: 1, DiceID: "dice-1", GroupID: "group-1"}
+	decision, err := Decide(state, Command{Kind: CommandInvitation, InviteUserID: "user-1", EnteredAt: 42})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := Reduce(state, decision.Events[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.InviteUserID != "user-1" || next.EnteredAt != 42 {
+		t.Fatalf("invitation facts = %#v", next)
+	}
+}
+
+func TestDecideTeamReplacesAndDeletesMembersWithoutAliasing(t *testing.T) {
+	state := State{Version: 1, DiceID: "dice-1", GroupID: "group-1"}
+	members := []string{"user-1", "user-2"}
+	decision, err := Decide(state, Command{Kind: CommandTeam, TeamName: "investigators", TeamMembers: members})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := Reduce(state, decision.Events[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	members[0] = "mutated"
+	if got := next.PlayerGroups["investigators"][0]; got != "user-1" {
+		t.Fatalf("team members aliased command input: %q", got)
+	}
+	clone := next.Clone()
+	clone.PlayerGroups["investigators"][0] = "changed"
+	if got := next.PlayerGroups["investigators"][0]; got != "user-1" {
+		t.Fatalf("team members aliased clone: %q", got)
+	}
+
+	decision, err = Decide(next, Command{Kind: CommandTeam, TeamName: "investigators", TeamDelete: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err = Reduce(next, decision.Events[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := next.PlayerGroups["investigators"]; exists {
+		t.Fatal("deleted team remained in state")
+	}
+}
+
+func TestDecideTemplatePatchesPreserveSiblingFields(t *testing.T) {
+	state := State{
+		Version: 1, DiceID: "dice-1", GroupID: "group-1",
+		DiceSideNum: 100, DiceSideExpr: "1d100", RollShaperMode: "off", CocRuleIndex: 1,
+	}
+	numDecision, err := Decide(state, Command{
+		Kind: CommandTemplate, DiceSideNum: 20, DiceSideNumSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = Reduce(state, numDecision.Events[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	modeDecision, err := Decide(state, Command{
+		Kind: CommandTemplate, RollShaperMode: "advantage", RollShaperModeSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = Reduce(state, modeDecision.Events[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.DiceSideNum != 20 || state.DiceSideExpr != "1d100" ||
+		state.RollShaperMode != "advantage" || state.CocRuleIndex != 1 {
+		t.Fatalf("sibling template fields were overwritten: %#v", state)
+	}
+}
+
 func TestGroupCreatedAndTemplateReplayInviteAndCocRuleFacts(t *testing.T) {
 	created := NewGroupCreatedWithInviteV1("dice-1", "group-1", "name", "user-1", 1)
 	template := NewGroupTemplateWithCocRuleV1(20, "1d20", "soft", 7)
@@ -255,6 +364,42 @@ func TestGroupCreatedAndTemplateReplayInviteAndCocRuleFacts(t *testing.T) {
 	payload, err := MarshalTypedEvents([]TypedEvent{created, template})
 	if err != nil || !strings.Contains(string(payload), "user-1") || !strings.Contains(string(payload), "cocRuleIndex") {
 		t.Fatalf("typed payload = %s, err = %v", payload, err)
+	}
+}
+
+func TestDecideExtensionPriorityPromotesAtomically(t *testing.T) {
+	state := State{
+		Version: 3, DiceID: "dice-1", GroupID: "group-1",
+		ActivatedExtensions: []string{"ext1", "ext2", "ext3"},
+	}
+	decision, err := Decide(state, Command{
+		Kind: CommandExtensionPriority, ExtensionIDs: []string{"ext1", "ext3"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decision.Events) != 1 {
+		t.Fatalf("priority event count = %d", len(decision.Events))
+	}
+	payload, err := MarshalTypedEvent(decision.Events[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeTypedEvent(decision.Events[0].EventType(), payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := Reduce(state, decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"ext1", "ext3", "ext2"}; !reflect.DeepEqual(next.ActivatedExtensions, want) {
+		t.Fatalf("extension priority = %v, want %v", next.ActivatedExtensions, want)
+	}
+	if _, err = Decide(state, Command{
+		Kind: CommandExtensionPriority, ExtensionIDs: []string{"missing"},
+	}); !errors.Is(err, ErrInvalidCommand) {
+		t.Fatalf("inactive promotion error = %v", err)
 	}
 }
 

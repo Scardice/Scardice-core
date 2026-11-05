@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 
 	"Scardice-core/adapterapi"
 	"Scardice-core/dice/censor"
+	"Scardice-core/eventstore"
 	"Scardice-core/message"
 )
 
@@ -17,17 +19,19 @@ var (
 )
 
 func (d *Dice) checkAdapterOutboundCensor(ctx *MsgContext, raw string) error {
-	if !d.Config.EnableCensor || d.Config.CensorMode != OnlyOutputReply {
+	config := d.Config()
+	if !config.EnableCensor || config.CensorMode != OnlyOutputReply {
 		return nil
 	}
 	return d.checkAdapterProtocolCensor(ctx, raw)
 }
 
 func (d *Dice) checkAdapterInboundCensor(ctx *MsgContext, event adapterapi.AdapterEvent) error {
-	if !d.Config.EnableCensor {
+	config := d.Config()
+	if !config.EnableCensor {
 		return nil
 	}
-	switch d.Config.CensorMode {
+	switch config.CensorMode {
 	case AllInput:
 	case OnlyInputCommand:
 		if event.Type != "message" || ctx == nil || ctx.CommandID == 0 {
@@ -55,41 +59,124 @@ func (d *Dice) checkAdapterProtocolCensor(ctx *MsgContext, raw string) error {
 		return err
 	}
 	matcher := adapterCensorMatcher{engine: manager.Censor, result: censor.CheckResult{HighestLevel: censor.Ignore}}
-	if err := matcher.visit(body, false); err != nil {
+	if err = matcher.visit(body, false); err != nil {
 		return err
 	}
 	if matcher.result.HighestLevel <= censor.Ignore {
 		return nil
 	}
 
-	// 责任身份来自宿主会话；请求中的 user_id/group_id 是协议目标。
-	if ctx != nil && !ctx.adapterEventUnattributed && ctx.Dice == d && ctx.Session != nil && ctx.EndPoint != nil && ctx.Player != nil && ctx.Player.UserID != "" {
-		msg := &Message{
-			MessageType: ctx.MessageType,
-			Message:     "adapter protocol content",
-			Sender:      SenderBase{UserID: ctx.Player.UserID, Nickname: ctx.Player.Name},
+	// The protocol payload's user/group fields are targets, never the
+	// responsible identity. Enforcement is attributed only to a proven
+	// conversational context and commits in an independent root so rejecting
+	// the invoking plugin callback cannot roll it back.
+	if ctx != nil && !ctx.adapterEventUnattributed && ctx.Dice == d && ctx.Session != nil && ctx.EndPoint != nil && ctx.Player != nil {
+		playerID := ctx.Player.UserID()
+		groupID := ""
+		if ctx.MessageType == "group" && ctx.Group != nil && ctx.Group.Version() != 0 {
+			groupID = ctx.Group.GroupID()
 		}
-		canHandle := ctx.MessageType == "private"
-		if ctx.MessageType == "group" && ctx.Group != nil && ctx.Session.ServiceAtNew != nil {
-			msg.GroupID = ctx.Group.GroupID
-			group, exists := ctx.Session.ServiceAtNew.Load(msg.GroupID)
-			canHandle = exists && group != nil
-		}
-		if canHandle {
-			result := manager.recordCensorCheck(ctx, msg, matcher.result, d.Config.CensorThresholds, true)
-			handlerCtx := ctx
-			if ctx.callbackTransaction != nil {
-				handlerCtx = ctx.ShallowCopy()
-				handlerCtx.callbackTransaction = nil
+		if playerID != "" && (ctx.MessageType == "private" || groupID != "") {
+			if enforcementErr := d.enforceAdapterProtocolCensor(ctx, raw, playerID, groupID, matcher.result, manager); enforcementErr != nil && d.Logger != nil {
+				d.Logger.Errorf("适配器敏感词独立处置失败: %v", enforcementErr)
 			}
-			// 处置采用独立提交，先于插件错误完成；通知内容使用命中词。
-			d.applyCensorResult(handlerCtx, msg, strings.Join(result.CurSensitiveWords, "\n"), "", result)
 		}
 	}
 	if ctx != nil {
 		ctx.Censored = true
 	}
 	return errAdapterCensorBlocked
+}
+
+func (d *Dice) enforceAdapterProtocolCensor(
+	source *MsgContext,
+	raw, playerID, groupID string,
+	result censor.CheckResult,
+	manager *CensorManager,
+) error {
+	if source == nil || source.Session == nil || source.EndPoint == nil || source.Player == nil {
+		return errors.New("adapter censor enforcement context is unavailable")
+	}
+	session := source.Session
+	endpoint := source.EndPoint
+	messageType := source.MessageType
+	commandID := source.CommandID
+	currentCommand := source.CurrentCommand
+	privilegeLevel := source.PrivilegeLevel
+	alreadyCensored := source.Censored
+	playerName := source.Player.Name()
+	invocationID, err := (eventstore.UUIDGenerator{}).NewID()
+	if err != nil {
+		return err
+	}
+	request, err := json.Marshal(struct {
+		InvocationID string `json:"invocationId"`
+		EndpointID   string `json:"endpointId"`
+		MessageType  string `json:"messageType"`
+		PlayerID     string `json:"playerId"`
+		GroupID      string `json:"groupId,omitempty"`
+		Raw          string `json:"raw"`
+	}{
+		InvocationID: invocationID,
+		EndpointID:   endpoint.ID,
+		MessageType:  messageType,
+		PlayerID:     playerID,
+		GroupID:      groupID,
+		Raw:          raw,
+	})
+	if err != nil {
+		return err
+	}
+	identity := d.DomainExecutionIdentity("adapter-censor", invocationID)
+	return d.WithDomainExecution(context.Background(), identity, request, func(transaction *DurableCallbackTransaction) error {
+		enforcement := &MsgContext{
+			Dice:                d,
+			Session:             session,
+			EndPoint:            endpoint,
+			MessageType:         messageType,
+			IsPrivate:           messageType == "private",
+			CommandID:           commandID,
+			CurrentCommand:      currentCommand,
+			PrivilegeLevel:      privilegeLevel,
+			Censored:            alreadyCensored,
+			callbackTransaction: transaction,
+			callbackMetadata:    transaction.metadata,
+			executionContext:    transaction.executionContext,
+		}
+		defer enforcement.releaseExecutionState()
+
+		conversationID := groupID
+		if enforcement.IsPrivate {
+			conversationID = "PG-" + playerID
+		}
+		if err := enforcement.ResolveExistingDomainConversation(conversationID, playerID); err != nil {
+			return err
+		}
+		msg := &Message{
+			MessageType: messageType,
+			Message:     "adapter protocol content",
+			GroupID:     groupID,
+			Sender:      SenderBase{UserID: playerID, Nickname: playerName},
+		}
+		checkResult := manager.recordCensorCheck(
+			enforcement,
+			msg,
+			result,
+			d.Config().CensorThresholds,
+			true,
+		)
+		d.applyCensorResult(
+			enforcement,
+			msg,
+			strings.Join(checkResult.CurSensitiveWords, "\n"),
+			"",
+			checkResult,
+		)
+		if err := enforcement.getExecutionError(); err != nil {
+			return err
+		}
+		return transaction.Domain().Err()
+	})
 }
 
 type adapterCensorMatcher struct {

@@ -62,10 +62,7 @@ func BenchmarkDiceRandomSourceRollD100(b *testing.B) {
 }
 
 func BenchmarkNISTContextSourceBinding(b *testing.B) {
-	cfg := DefaultConfig
-	cfg.DiceRandomMode = string(DiceRandomModeNIST)
-	d := &Dice{Config: cfg}
-	ctx := &MsgContext{Dice: d}
+	ctx := &MsgContext{}
 
 	b.Run("reuse_global_source", func(b *testing.B) {
 		benchSrcSink = globalRandSource

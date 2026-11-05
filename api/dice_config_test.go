@@ -7,7 +7,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -16,7 +15,6 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v4"
-	"go.uber.org/zap"
 
 	"Scardice-core/core/configstate"
 	"Scardice-core/core/extensionstate"
@@ -28,7 +26,7 @@ import (
 
 func snapshotDiceConfigMemory(t *testing.T, runtime *dice.Dice) []byte {
 	t.Helper()
-	data, err := json.Marshal(&runtime.Config)
+	data, err := json.Marshal(runtime.Config())
 	if err != nil {
 		t.Fatalf("snapshot in-memory Dice config: %v", err)
 	}
@@ -36,87 +34,67 @@ func snapshotDiceConfigMemory(t *testing.T, runtime *dice.Dice) []byte {
 }
 
 func TestDiceConfigSetAcceptsCRNGRandomMode(t *testing.T) {
-	t.Chdir(t.TempDir())
-
-	previousDice := myDice
-	previousDM := dm
-	t.Cleanup(func() {
-		myDice = previousDice
-		dm = previousDM
-	})
-
-	testDice := &dice.Dice{
-		BaseConfig: dice.BaseConfig{DataDir: "."},
-		Config:     dice.NewConfig(nil),
-		Logger:     zap.NewNop().Sugar(),
-	}
-	manager := &dice.DiceManager{
-		Dice:           []*dice.Dice{testDice},
-		DiceRandomMode: string(dice.DiceRandomModePCG),
-		JustForTest:    true,
-	}
-	token := "test-token"
-	manager.AccessTokens.Store(token, true)
-	testDice.Parent = manager
-	myDice = testDice
-	dm = manager
-
-	e := echo.New()
-	req := httptest.NewRequest(http.MethodPost, "/sd-api/configs/dice", strings.NewReader(`{"diceRandomMode":"crng"}`))
-	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
-	req.Header.Set("Token", token)
-	rec := httptest.NewRecorder()
-
-	if err := DiceConfigSet(e.NewContext(req, rec)); err != nil {
-		t.Fatalf("DiceConfigSet() error = %v", err)
-	}
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	echoServer, manager, testDice, _ := newDiceConfigDurableHandlerTest(t)
+	recorder := postDiceConfigDurableRequest(
+		echoServer,
+		`{"diceRandomMode":"crng"}`,
+		"dice-config-owner-token",
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 	if got := manager.DiceRandomMode; got != string(dice.DiceRandomModeCRNG) {
 		t.Fatalf("manager DiceRandomMode = %q, want %q", got, dice.DiceRandomModeCRNG)
 	}
-	if got := testDice.Config.DiceRandomMode; got != string(dice.DiceRandomModeCRNG) {
-		t.Fatalf("Dice mirror DiceRandomMode = %q, want %q", got, dice.DiceRandomModeCRNG)
+	if got := testDice.Config().DiceRandomMode; got != string(dice.DiceRandomModeCRNG) {
+		t.Fatalf("Dice config DiceRandomMode = %q, want %q", got, dice.DiceRandomModeCRNG)
 	}
 }
 func TestDiceConfigUsesRuntimeExtensionDefaultsAndDurableOverrides(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
+	const databaseIdentity = "api-dice-config-extension-defaults"
 	database, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{
-		Type: "sqlite",
-		DSN:  filepath.Join(root, "events.db"),
+		Type:             "sqlite",
+		DSN:              filepath.Join(root, "events.db"),
+		DatabaseIdentity: databaseIdentity,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	store := eventstore.NewStore(database, projectionset.StoreOptions()...)
+	store := eventstore.NewStore(database,
+		projectionset.StoreOptions()...,
+	)
 	defer store.Close()
-
+	if err = store.SetReadiness(ctx, eventstore.Readiness{
+		Mode: "import", SchemaVersion: 2, DatabaseIdentity: databaseIdentity,
+		CompletedAt: time.Unix(1, 0).UTC(),
+	}); err != nil {
+		t.Fatalf("set EventStore readiness: %v", err)
+	}
 	runtime := &dice.Dice{
 		BaseConfig:   dice.BaseConfig{Name: "api-test", DataDir: filepath.Join(root, "api-test")},
 		DurableStore: store,
 	}
 	manager := &dice.DiceManager{
-		EventSourcedMode: true,
-		Dice:             []*dice.Dice{runtime},
-		DiceRandomMode:   string(dice.DiceRandomModePCG),
+		Dice:           []*dice.Dice{runtime},
+		DiceRandomMode: string(dice.DiceRandomModePCG),
 	}
 	if err := manager.PrepareEventSourcedState(ctx); err != nil {
 		t.Fatalf("prepare event-sourced state: %v", err)
 	}
 	runtime.Parent = manager
 	manager.AccessTokens.Store("dice-config-token", true)
-	extension := &dice.ExtInfo{Name: "test-extension", Version: "1.0.0"}
+	extension := &dice.ExtInfo{
+		Name: "test-extension", Version: "1.0.0", AutoActive: true,
+		DefaultSetting: &dice.ExtDefaultSettingItem{
+			Name:            "test-extension",
+			AutoActive:      true,
+			DisabledCommand: map[string]bool{"runtime-disabled": true},
+		},
+	}
 	runtime.ExtList = []*dice.ExtInfo{extension}
-	runtime.Config.ExtDefaultSettings = []*dice.ExtDefaultSettingItem{{
-		Name:            extension.Name,
-		AutoActive:      true,
-		DisabledCommand: map[string]bool{"runtime-disabled": true},
-		ExtItem:         extension,
-		Loaded:          true,
-	}}
 
 	previousDice, previousManager := myDice, dm
 	t.Cleanup(func() {
@@ -181,7 +159,7 @@ func TestDiceConfigSetDurablePersistsManagerConfigAndExtensionOwnersAtomically(t
 			t.Fatalf("owner transaction commits = %d, want one UnitOfWork", store.commitCalls)
 		}
 
-		restored := &dice.DiceManager{EventSourcedMode: true}
+		restored := &dice.DiceManager{}
 		if err := restored.RestoreEventSourcedManager(context.Background(), store); err != nil {
 			t.Fatalf("restore event-sourced manager: %v", err)
 		}
@@ -260,7 +238,7 @@ func TestDiceConfigSetDurablePersistsManagerConfigAndExtensionOwnersAtomically(t
 			!bytes.Equal(snapshotDiceConfigMemory(t, runtime), oldConfig) {
 			t.Fatalf("failed commit changed memory: address=%q tooltip=%q password=%q token=%v comment=%q",
 				manager.ServeAddress, manager.GetTrayTooltip(), manager.UIPasswordHash,
-				manager.AccessTokens.Exists("dice-config-owner-token"), runtime.Config.FriendAddComment)
+				manager.AccessTokens.Exists("dice-config-owner-token"), runtime.Config().FriendAddComment)
 		}
 
 		store.failCommit = false
@@ -318,7 +296,7 @@ func TestDiceConfigSetDurablePersistsManagerConfigAndExtensionOwnersAtomically(t
 			!reflect.DeepEqual(afterConfig, beforeConfig) ||
 			!reflect.DeepEqual(afterExtensions, beforeExtensions) {
 			t.Fatalf("invalid extension defaults partially published: memory manager=%#v config=%#v; persisted manager=%#v config=%#v extensions=%#v",
-				manager, runtime.Config, afterManager, afterConfig, afterExtensions)
+				manager, runtime.Config(), afterManager, afterConfig, afterExtensions)
 		}
 	})
 
@@ -389,8 +367,8 @@ func TestDiceConfigManagerCommitPreservesConcurrentDiceConfigAndSignIn(t *testin
 	if configResponse.Code != http.StatusOK {
 		t.Fatalf("concurrent Dice update status = %d, body = %s", configResponse.Code, configResponse.Body.String())
 	}
-	if runtime.Config.FriendAddComment != "concurrent config" {
-		t.Fatalf("concurrent Dice update missing in memory: %q", runtime.Config.FriendAddComment)
+	if runtime.Config().FriendAddComment != "concurrent config" {
+		t.Fatalf("concurrent Dice update missing in memory: %q", runtime.Config().FriendAddComment)
 	}
 
 	releaseManagerCommit()
@@ -406,8 +384,8 @@ func TestDiceConfigManagerCommitPreservesConcurrentDiceConfigAndSignIn(t *testin
 	store.beforeCommit = nil
 	store.mu.Unlock()
 
-	if manager.ServeAddress != "concurrent-address:1234" || runtime.Config.FriendAddComment != "concurrent config" {
-		t.Fatalf("concurrent publication lost owner state: address=%q comment=%q", manager.ServeAddress, runtime.Config.FriendAddComment)
+	if manager.ServeAddress != "concurrent-address:1234" || runtime.Config().FriendAddComment != "concurrent config" {
+		t.Fatalf("concurrent publication lost owner state: address=%q comment=%q", manager.ServeAddress, runtime.Config().FriendAddComment)
 	}
 	var loginBody struct {
 		Token string `json:"token"`
@@ -479,30 +457,15 @@ func newDiceConfigDurableHandlerTest(t *testing.T) (*echo.Echo, *dice.DiceManage
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
-	rootsDir := filepath.Join(root, "roots")
-	if err := os.MkdirAll(rootsDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	indexPath := filepath.Join(root, "index.key")
-	if err := os.WriteFile(indexPath, bytes.Repeat([]byte{1}, 32), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(rootsDir, "root-v1.key"), bytes.Repeat([]byte{2}, 32), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	keys := eventstore.NewLocalFileKeySource(indexPath, rootsDir)
-	keys.CurrentID = "root-v1"
 	database, err := eventstore.OpenDatabase(ctx, eventstore.DatabaseConfig{Type: "sqlite", DSN: filepath.Join(root, "events.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	options := projectionset.StoreOptions()
-	store := &diceConfigDurableTestStore{GORMStore: eventstore.NewStore(database, append([]eventstore.StoreOption{eventstore.WithKeySource(keys)}, options...)...)}
+	store := &diceConfigDurableTestStore{GORMStore: eventstore.NewStore(database, projectionset.StoreOptions()...)}
 	t.Cleanup(func() { _ = store.Close() })
 	if err = store.SetReadiness(ctx, eventstore.Readiness{
-		Mode: "fresh", SchemaVersion: 1, DatabaseIdentity: "api-dice-config-atomic",
-		IndexRootID: filepath.Base(indexPath), EncryptionRootIDs: []string{"root-v1"},
+		Mode: "fresh", SchemaVersion: 2, DatabaseIdentity: "api-dice-config-atomic",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -512,12 +475,11 @@ func newDiceConfigDurableHandlerTest(t *testing.T) (*echo.Echo, *dice.DiceManage
 		DurableStore: store,
 	}
 	manager := &dice.DiceManager{
-		EventSourcedMode: true,
-		Dice:             []*dice.Dice{runtime},
-		ServeAddress:     "old-address:1234",
-		UIPasswordSalt:   "old-salt",
-		UIPasswordHash:   "old-password-hash",
-		DiceRandomMode:   string(dice.DiceRandomModePCG),
+		Dice:           []*dice.Dice{runtime},
+		ServeAddress:   "old-address:1234",
+		UIPasswordSalt: "old-salt",
+		UIPasswordHash: "old-password-hash",
+		DiceRandomMode: string(dice.DiceRandomModePCG),
 	}
 	manager.SetTrayTooltip("old tray text")
 	runtime.Parent = manager
@@ -528,7 +490,6 @@ func newDiceConfigDurableHandlerTest(t *testing.T) (*echo.Echo, *dice.DiceManage
 		t.Fatalf("initialize event-sourced Dice config: %v", err)
 	}
 	manager.AccessTokens.Store("dice-config-owner-token", true)
-	manager.Save()
 
 	extension := &dice.ExtInfo{Name: "test-extension", Version: "1.0.0"}
 	runtime.ExtList = []*dice.ExtInfo{extension}
@@ -553,8 +514,6 @@ func reopenDiceConfigDurableTestStore(t *testing.T, runtime *dice.Dice) *diceCon
 		t.Fatal(err)
 	}
 	root = filepath.Dir(root)
-	keys := eventstore.NewLocalFileKeySource(filepath.Join(root, "index.key"), filepath.Join(root, "roots"))
-	keys.CurrentID = "root-v1"
 	database, err := eventstore.OpenDatabase(context.Background(), eventstore.DatabaseConfig{
 		Type: "sqlite",
 		DSN:  filepath.Join(root, "events.db"),
@@ -563,9 +522,8 @@ func reopenDiceConfigDurableTestStore(t *testing.T, runtime *dice.Dice) *diceCon
 		t.Fatalf("reopen durable event database: %v", err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	options := projectionset.StoreOptions()
 	store := &diceConfigDurableTestStore{
-		GORMStore: eventstore.NewStore(database, append([]eventstore.StoreOption{eventstore.WithKeySource(keys)}, options...)...),
+		GORMStore: eventstore.NewStore(database, projectionset.StoreOptions()...),
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return store
