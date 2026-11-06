@@ -95,7 +95,7 @@ func TestOfficialQQMemoryGroupMergeKeepsNewGroup(t *testing.T) {
 	if player, ok := got.Players.Load(newUser2); !ok || player == nil || player.Name != "old-player-2" {
 		t.Fatalf("old-only player was not merged: %#v", player)
 	}
-	if !got.Active || !got.ShowGroupWelcome || got.GroupWelcomeMessage != "欢迎" ||
+	if !got.IsActiveRaw() || !got.ShowGroupWelcome || got.GroupWelcomeMessage != "欢迎" ||
 		got.CocRuleIndex != 2 || !got.LogOn || got.LogCurName != "old-log" || got.LogCurID != 42 {
 		t.Fatalf("old-only group settings were not merged: %#v", got)
 	}

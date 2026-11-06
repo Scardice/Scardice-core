@@ -180,7 +180,7 @@ func TestCommandPriorityFollowsSelectedGameSystem(t *testing.T) {
 				activated = append(activated, d.ExtFind(name, false))
 			}
 			group.SetActivatedExtList(activated, d)
-			group.Active = true
+			group.SetActiveRaw(true)
 			group.System = tt.system
 			session := &IMSession{Parent: d}
 			ctx := &MsgContext{
@@ -313,7 +313,7 @@ func TestCommandReceivedHooksStillUseAllActivatedExtensions(t *testing.T) {
 	d.CmdMap = CmdMapCls{}
 	addTestGameSystem(d, "fu", "coc7")
 	group := newTestGroupInfo()
-	group.Active = true
+	group.SetActiveRaw(true)
 	group.System = "fu"
 	group.SetActivatedExtList([]*ExtInfo{lowPriority, coc}, d)
 	session := &IMSession{Parent: d}

@@ -264,7 +264,7 @@ func SetBotOffAtGroup(ctx *MsgContext, groupID string) {
 		// TODO: 进行更好的是否变更的检查
 		groupInfo.DiceIDActiveMap.Delete(ctx.EndPoint.UserID)
 		if groupInfo.DiceIDActiveMap.Len() == 0 {
-			groupInfo.Active = false
+			groupInfo.SetActiveRaw(false)
 		}
 		groupInfo.MarkDirty(ctx.Dice)
 	}
@@ -285,7 +285,7 @@ func SetBotOnAtGroup(ctx *MsgContext, groupID string) *GroupInfo {
 			group.InactivatedExtSet = StringSet{}
 		}
 		group.DiceIDActiveMap.Store(ctx.EndPoint.UserID, true)
-		group.Active = true
+		group.SetActiveRaw(true)
 	} else {
 		// 设定扩展情况
 		sort.Sort(ExtDefaultSettingItemSlice(session.Parent.Config.ExtDefaultSettings))
@@ -675,7 +675,7 @@ func CrossMsgBySearch(se *IMSession, p, t, txt string, pr bool) bool {
 	}
 
 	if groupInfo, ok := mctx.Session.ServiceAtNew.Load(t); ok {
-		mctx.IsCurGroupBotOn = groupInfo.Active
+		mctx.IsCurGroupBotOn = groupInfo.IsActiveRaw()
 		mctx.Group = groupInfo
 	}
 

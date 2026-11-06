@@ -3,6 +3,7 @@ package dice
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -225,7 +226,7 @@ type kookResumeFile struct {
 func (pa *PlatformAdapterKook) kookTokenHash() string {
 	// 与 kook.New 写入 Identify.Token 的格式保持一致。
 	sum := sha256.Sum256([]byte("Bot " + pa.Token))
-	return fmt.Sprintf("%x", sum[:])
+	return hex.EncodeToString(sum[:])
 }
 
 func kookSessionTokenHash(session *kook.Session) string {
@@ -233,7 +234,7 @@ func kookSessionTokenHash(session *kook.Session) string {
 		return ""
 	}
 	sum := sha256.Sum256([]byte(session.Identify.Token))
-	return fmt.Sprintf("%x", sum[:])
+	return hex.EncodeToString(sum[:])
 }
 
 func (pa *PlatformAdapterKook) resumeStatePath() string {
@@ -416,15 +417,6 @@ func (pa *PlatformAdapterKook) setSessionStateIfCurrent(session *kook.Session, e
 	return true
 }
 
-func (pa *PlatformAdapterKook) setEndpointState(enable bool, state EndpointState) {
-	pa.sessionMu.Lock()
-	if pa.EndPoint != nil {
-		pa.EndPoint.Enable = enable
-		pa.EndPoint.State = state
-	}
-	pa.sessionMu.Unlock()
-}
-
 func (pa *PlatformAdapterKook) setEndpointStateIfIdle(enable bool, state EndpointState) bool {
 	pa.sessionMu.Lock()
 	defer pa.sessionMu.Unlock()
@@ -482,7 +474,7 @@ const kookUserMeMaxAttempts = 3
 // 每次重试前后都检查会话所有权，用户禁用/重登时立即退出。
 func (pa *PlatformAdapterKook) fetchKookSelf(s *kook.Session, log *zap.SugaredLogger) (*kook.User, error) {
 	var lastErr error
-	for attempt := 0; attempt < kookUserMeMaxAttempts; attempt++ {
+	for attempt := range kookUserMeMaxAttempts {
 		if !pa.isCurrentSession(s) {
 			return nil, errors.New("KOOK 会话已被替换")
 		}
@@ -799,7 +791,7 @@ func (pa *PlatformAdapterKook) Serve() int {
 		ok := mctx.Session.ServiceAtNew.Exists(msg.GroupID)
 		if !ok {
 			channel := SetBotOnAtGroup(mctx, msg.GroupID)
-			channel.Active = true
+			channel.SetActiveRaw(true)
 			_, _, selfID, _ := pa.endpointSnapshot()
 			channel.DiceIDExistsMap.Store(selfID, true)
 			now := time.Now().Unix()
@@ -1203,7 +1195,7 @@ func (pa *PlatformAdapterKook) SendFileToChannelRaw(id string, path string, priv
 	log := zap.S().Named(logger.LogKeyAdapter)
 	bot := pa.getSession()
 	if bot == nil {
-		return nil, fmt.Errorf("KOOK 会话未建立")
+		return nil, errors.New("KOOK 会话未建立")
 	}
 	e, err := message.FilepathToFileElement(path)
 	if err != nil {
@@ -1258,7 +1250,7 @@ func (pa *PlatformAdapterKook) SendToChannelRaw(id string, text string, private 
 	log := zap.S().Named(logger.LogKeyAdapter)
 	bot := pa.getSession()
 	if bot == nil {
-		return nil, fmt.Errorf("KOOK 会话未建立")
+		return nil, errors.New("KOOK 会话未建立")
 	}
 	elem := message.ConvertStringMessage(text)
 	// var err error
@@ -1385,7 +1377,7 @@ func antiMarkdownFormat(text string) string {
 func (pa *PlatformAdapterKook) MessageCreateRaw(base kook.MessageCreateBase, id string, isPrivate bool) (*kook.MessageResp, error) {
 	bot := pa.getSession()
 	if bot == nil {
-		return nil, fmt.Errorf("KOOK 会话未建立")
+		return nil, errors.New("KOOK 会话未建立")
 	}
 	if isPrivate {
 		resp, err := bot.DirectMessageCreate(&kook.DirectMessageCreate{ChatCode: id, MessageCreateBase: base})

@@ -14,7 +14,7 @@ func TestOfficialQQLegacyFingerprintDetectsSameCountDifferentRows(t *testing.T) 
 		t.Fatal(err)
 	}
 	t.Cleanup(dbOperator.Close)
-	if err := dbOperator.db.AutoMigrate(&model.GroupInfo{}); err != nil {
+	if err = dbOperator.db.AutoMigrate(&model.GroupInfo{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -27,7 +27,7 @@ func TestOfficialQQLegacyFingerprintDetectsSameCountDifferentRows(t *testing.T) 
 	oldA := "OpenQQ-Group-T:app-a"
 	oldB := "OpenQQ-Group-T:app-b"
 	updatedAt := int64(1)
-	if err := dbOperator.db.Create(&model.GroupInfo{
+	if err = dbOperator.db.Create(&model.GroupInfo{
 		ID: oldA, CreatedAt: 1, UpdatedAt: &updatedAt, Data: []byte(`{"groupId":"` + oldA + `"}`),
 	}).Error; err != nil {
 		t.Fatal(err)
@@ -39,10 +39,10 @@ func TestOfficialQQLegacyFingerprintDetectsSameCountDifferentRows(t *testing.T) 
 	if countA != 1 {
 		t.Fatalf("count = %d, want 1", countA)
 	}
-	if err := dbOperator.db.Delete(&model.GroupInfo{}, "id = ?", oldA).Error; err != nil {
+	if err = dbOperator.db.Delete(&model.GroupInfo{}, "id = ?", oldA).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := dbOperator.db.Create(&model.GroupInfo{
+	if err = dbOperator.db.Create(&model.GroupInfo{
 		ID: oldB, CreatedAt: 2, UpdatedAt: &updatedAt, Data: []byte(`{"groupId":"` + oldB + `"}`),
 	}).Error; err != nil {
 		t.Fatal(err)

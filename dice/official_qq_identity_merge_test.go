@@ -29,7 +29,7 @@ func TestOfficialQQIdentityMigrationMergesSingleSourceCollisions(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(operator.Close)
-	if err := operator.db.AutoMigrate(&model.AttributesItemModel{}, &model.BanInfo{}); err != nil {
+	if err = operator.db.AutoMigrate(&model.AttributesItemModel{}, &model.BanInfo{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -42,12 +42,12 @@ func TestOfficialQQIdentityMigrationMergesSingleSourceCollisions(t *testing.T) {
 	oldGroupID := "OpenQQ-Group-T:" + appID + "-group-open-id"
 	newGroupID := "OpenQQ-Group:" + uin + "-group-open-id"
 
-	if err := operator.db.Create(&model.AttributesItemModel{
+	if err = operator.db.Create(&model.AttributesItemModel{
 		Id: newUserID, AttrsType: "user", Data: newOfficialQQMergeTestAttrs(t, map[string]int64{"shared": 2, "new-only": 2}), CreatedAt: 2, UpdatedAt: 2,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := operator.db.Create(&model.AttributesItemModel{
+	if err = operator.db.Create(&model.AttributesItemModel{
 		Id: oldUserID, AttrsType: "user", Data: newOfficialQQMergeTestAttrs(t, map[string]int64{"shared": 1, "old-only": 1}), CreatedAt: 1, UpdatedAt: 1,
 	}).Error; err != nil {
 		t.Fatal(err)
@@ -70,10 +70,10 @@ func TestOfficialQQIdentityMigrationMergesSingleSourceCollisions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := operator.db.Create(&model.BanInfo{ID: oldUserID, BanUpdatedAt: 1, UpdatedAt: 1, Data: oldBanData}).Error; err != nil {
+	if err = operator.db.Create(&model.BanInfo{ID: oldUserID, BanUpdatedAt: 1, UpdatedAt: 1, Data: oldBanData}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := operator.db.Create(&model.BanInfo{ID: newUserID, BanUpdatedAt: 2, UpdatedAt: 2, Data: newBanData}).Error; err != nil {
+	if err = operator.db.Create(&model.BanInfo{ID: newUserID, BanUpdatedAt: 2, UpdatedAt: 2, Data: newBanData}).Error; err != nil {
 		t.Fatal(err)
 	}
 
@@ -85,16 +85,16 @@ func TestOfficialQQIdentityMigrationMergesSingleSourceCollisions(t *testing.T) {
 		groups:      map[string]string{},
 		users:       map[string]string{oldUserID: newUserID},
 	}
-	if err := migration.run(&Dice{DBOperator: operator}); err != nil {
+	if err = migration.run(&Dice{DBOperator: operator}); err != nil {
 		t.Fatalf("run() error = %v", err)
 	}
 
 	var attrs model.AttributesItemModel
-	if err := operator.db.Where("id = ?", newUserID).Take(&attrs).Error; err != nil {
+	if err = operator.db.Where("id = ?", newUserID).Take(&attrs).Error; err != nil {
 		t.Fatalf("merged attrs not found: %v", err)
 	}
 	var oldCount int64
-	if err := operator.db.Model(&model.AttributesItemModel{}).Where("id = ?", oldUserID).Count(&oldCount).Error; err != nil {
+	if err = operator.db.Model(&model.AttributesItemModel{}).Where("id = ?", oldUserID).Count(&oldCount).Error; err != nil {
 		t.Fatal(err)
 	}
 	if oldCount != 0 {
@@ -151,13 +151,13 @@ func TestOfficialQQIdentityMigrationMovesCorruptBanPrimaryKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(operator.Close)
-	if err := operator.db.AutoMigrate(&model.BanInfo{}); err != nil {
+	if err = operator.db.AutoMigrate(&model.BanInfo{}); err != nil {
 		t.Fatal(err)
 	}
 
 	oldID := "OpenQQ-Member-T:123456789-group-open-id-member-open-id"
 	newID := "OpenQQ:1-member-open-id"
-	if err := operator.db.Create(&model.BanInfo{ID: oldID, Data: []byte("{")}).Error; err != nil {
+	if err = operator.db.Create(&model.BanInfo{ID: oldID, Data: []byte("{")}).Error; err != nil {
 		t.Fatal(err)
 	}
 	migration := &officialQQIdentityMigration{
@@ -168,7 +168,7 @@ func TestOfficialQQIdentityMigrationMovesCorruptBanPrimaryKey(t *testing.T) {
 		groups:      map[string]string{},
 		users:       map[string]string{oldID: newID},
 	}
-	if err := migration.run(&Dice{DBOperator: operator}); err != nil {
+	if err = migration.run(&Dice{DBOperator: operator}); err != nil {
 		t.Fatalf("run() error = %v", err)
 	}
 	var count int64

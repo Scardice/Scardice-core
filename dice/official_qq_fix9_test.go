@@ -82,7 +82,7 @@ func TestQQBotIDStringAvoidsScientificNotation(t *testing.T) {
 
 func TestPaginationCacheEvictionKeepsFreshEntries(t *testing.T) {
 	pa := &PlatformAdapterOfficialQQ{}
-	for i := 0; i < 1001; i++ {
+	for i := range 1001 {
 		pa.addToPaginationCache(fmt.Sprintf("id-%d", i), []string{"page"})
 	}
 	pa.paginationMu.Lock()

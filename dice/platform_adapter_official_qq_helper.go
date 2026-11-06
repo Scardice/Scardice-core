@@ -3,6 +3,7 @@ package dice
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,6 +19,8 @@ import (
 )
 
 // OfficialQQAppID 使用字符串保存，同时兼容旧配置里以数字形式写入的 appID。
+//
+//nolint:recvcheck // 序列化用值接收者以兼容非地址值，反序列化必须用指针接收者写回字段。
 type OfficialQQAppID string
 
 func (a OfficialQQAppID) String() string {
@@ -33,6 +36,7 @@ func (a OfficialQQAppID) MarshalJSON() ([]byte, error) {
 	return json.Marshal(a.String())
 }
 
+//nolint:recvcheck // 反序列化必须使用指针接收者才能写回字段。
 func (a *OfficialQQAppID) UnmarshalJSON(data []byte) error {
 	data = bytes.TrimSpace(data)
 	if len(data) == 0 || bytes.Equal(data, []byte("null")) {
@@ -55,9 +59,10 @@ func (a *OfficialQQAppID) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+//nolint:recvcheck // 反序列化必须使用指针接收者才能写回字段。
 func (a *OfficialQQAppID) UnmarshalYAML(value *yaml.Node) error {
 	if value.Kind != yaml.ScalarNode {
-		return fmt.Errorf("official QQ appID must be a scalar")
+		return errors.New("official QQ appID must be a scalar")
 	}
 	*a = OfficialQQAppID(strings.TrimSpace(value.Value))
 	return nil

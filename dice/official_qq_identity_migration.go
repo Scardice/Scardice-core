@@ -2,6 +2,7 @@ package dice
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -519,7 +520,7 @@ func (m *officialQQIdentityMigration) legacyRowFingerprint(operator engine.Datab
 			_, _ = hash.Write([]byte{0})
 		}
 	}
-	return total, fmt.Sprintf("%x", hash.Sum(nil)), nil
+	return total, hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // legacyRowCount 统计各表中仍带旧身份前缀的行数。
@@ -1765,8 +1766,8 @@ func mergeOfficialQQGroupMemory(target, source *GroupInfo, d *Dice) bool {
 	}
 	// 这些群设置同样只存在于旧群时会被删除；补齐零值字段，避免迁移后
 	// 群失去启用状态、欢迎语、帮助包、COC 规则或日志开关。
-	if !target.Active && source.Active {
-		target.Active = true
+	if !target.IsActiveRaw() && source.IsActiveRaw() {
+		target.SetActiveRaw(true)
 		changed = true
 	}
 	if !target.ShowGroupWelcome && source.ShowGroupWelcome {
@@ -1913,6 +1914,11 @@ func mergeOfficialQQGroupMemory(target, source *GroupInfo, d *Dice) bool {
 				continue
 			}
 			if _, exists := seen[ext.Name]; exists {
+				continue
+			}
+			// 新群（规范 ID）里用户手动关闭的扩展不能被旧群的启用状态覆盖，
+			// 否则合并后扩展会在用户没有操作的情况下重新生效。
+			if target.IsExtInactivated(ext.Name) {
 				continue
 			}
 			seen[ext.Name] = struct{}{}

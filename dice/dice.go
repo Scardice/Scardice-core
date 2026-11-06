@@ -485,7 +485,7 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 					d.ImSession.ServiceAtNew.Range(func(key string, groupInfo *GroupInfo) bool {
 						// Pinenutn: ServiceAtNew重构
 						// TODO: 注意这里的Active可能不需要改
-						if !strings.HasPrefix(key, "PG-") && groupInfo.Active {
+						if !strings.HasPrefix(key, "PG-") && groupInfo.IsActiveRaw() {
 							diceID := i.UserID
 							now := time.Now().Unix()
 

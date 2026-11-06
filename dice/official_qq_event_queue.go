@@ -44,7 +44,8 @@ func (q *officialQQEventQueue) Enqueue(event func()) bool {
 	return q.enqueue(event, nil)
 }
 
-// EnqueueWait 入队并等待事件执行完成。队列在事件执行前被 Abandon 时返回 false。
+// EnqueueWait 入队并等待事件执行完成。队列在事件执行前被 Abandon，
+// 或事件执行时 panic 被隔离时返回 false。
 func (q *officialQQEventQueue) EnqueueWait(event func()) bool {
 	done := make(chan bool, 1)
 	if !q.enqueue(event, done) {
@@ -87,25 +88,28 @@ func (q *officialQQEventQueue) work() {
 		q.executing = true
 		q.mu.Unlock()
 
-		runOfficialQQEvent(event.run)
+		ok := runOfficialQQEvent(event.run)
 
 		q.mu.Lock()
 		q.executing = false
 		if event.done != nil {
-			event.done <- true
+			event.done <- ok
 		}
 		q.mu.Unlock()
 	}
 }
 
 // runOfficialQQEvent 隔离单个事件的 panic，避免一个坏插件/坏消息把 worker 带崩。
-func runOfficialQQEvent(event func()) {
+// 返回 false 表示事件因 panic 未能正常执行完成，等待者必须把它当作失败。
+func runOfficialQQEvent(event func()) (ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
+			ok = false
 			zap.S().Named(logger.LogKeyAdapter).Errorf("official qq event panic: %v\n%s", r, debug.Stack())
 		}
 	}()
 	event()
+	return true
 }
 
 // Close 停止接收新事件；worker 会继续执行已经入队的事件，然后退出。
@@ -161,11 +165,11 @@ type officialQQEventDeduper struct {
 	max  int
 }
 
-func newOfficialQQEventDeduper(ttl time.Duration, max int) *officialQQEventDeduper {
+func newOfficialQQEventDeduper(ttl time.Duration, maxEntries int) *officialQQEventDeduper {
 	return &officialQQEventDeduper{
 		seen: make(map[string]time.Time),
 		ttl:  ttl,
-		max:  max,
+		max:  maxEntries,
 	}
 }
 

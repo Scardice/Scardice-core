@@ -17,7 +17,7 @@ func TestOfficialQQEventQueueSerializes(t *testing.T) {
 	var wg sync.WaitGroup
 	const n = 64
 	wg.Add(n)
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			if !q.Enqueue(func() {
 				if atomic.AddInt32(&active, 1) > 1 {

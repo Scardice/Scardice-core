@@ -771,12 +771,6 @@ func (pa *PlatformAdapterOfficialQQ) stopSessionContextIf(expected context.Conte
 	return true
 }
 
-// stopSessionContext 停止当前会话；仅用于确实需要无条件清理的路径。
-// 调用方若持有旧会话引用，应优先使用 stopSessionContextIf。
-func (pa *PlatformAdapterOfficialQQ) stopSessionContext() {
-	pa.stopSessionContextIf(pa.currentSessionContext())
-}
-
 func (pa *PlatformAdapterOfficialQQ) failConnect(ctx context.Context) int {
 	// 启动期间用户可能禁用/重登；旧 connect 协程不能回置新会话的状态或关掉新队列。
 	// failSessionIfCurrent 在 sessionMu 内完成“确认所有权 + 停止 + 取队列”，
@@ -2144,7 +2138,7 @@ func (pa *PlatformAdapterOfficialQQ) DoRelogin() bool {
 	ctx := pa.currentSessionContext()
 	queue := pa.currentEventQueue()
 	pa.cancelServeLoop()
-	stopped := false
+	var stopped bool
 	if ctx != nil {
 		pa.setStateIfCurrent(ctx, false, StateDisconnected)
 		stopped = pa.stopSessionContextIf(ctx)
@@ -2201,7 +2195,7 @@ func (pa *PlatformAdapterOfficialQQ) SetEnable(enable bool) {
 		ctx := pa.currentSessionContext()
 		queue := pa.currentEventQueue()
 		pa.cancelServeLoop()
-		stopped := false
+		var stopped bool
 		if ctx != nil {
 			pa.setStateIfCurrent(ctx, false, StateDisconnected)
 			stopped = pa.stopSessionContextIf(ctx)
@@ -3576,14 +3570,6 @@ func (pa *PlatformAdapterOfficialQQ) parseBotSelfOpenIDs(event *dto.WSPayload) [
 	return nil
 }
 
-func (pa *PlatformAdapterOfficialQQ) parseBotSelfOpenID(event *dto.WSPayload) string {
-	ids := pa.parseBotSelfOpenIDs(event)
-	if len(ids) == 0 {
-		return ""
-	}
-	return ids[0]
-}
-
 func officialQQBotSelfMention(botSelfIDs []string, target string) bool {
 	if target == "" {
 		return false
@@ -4039,7 +4025,7 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 					return
 				}
 
-				probeCtx, probeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+				probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 				probe, probeErr := ProbeOfficialQQAccount(probeCtx, pa.getAppID().String(), pa.getAppSecret())
 				probeCancel()
 				if probeErr != nil {
@@ -4116,6 +4102,7 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 				if !pa.isCurrentQrGeneration(generation) {
 					return
 				}
+				//nolint:staticcheck // nil 表示由 connect 内部为扫码结果创建新的会话 context。
 				if pa.connect(nil, probe) != 0 {
 					// beginSession 失败说明已有新会话接管，不能把它的 Enable 改掉。
 					if pa.setEndpointStateIfIdle(false, StateConnectionFailed) {
