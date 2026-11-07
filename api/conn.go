@@ -1002,10 +1002,8 @@ type imConnectionsAddOfficialQQRequest struct {
 }
 
 var (
-	officialQQProbe = func(ctx context.Context, appID, appSecret string) (*dice.OfficialQQAccountProbeResult, error) {
-		return dice.ProbeOfficialQQAccount(ctx, appID, appSecret)
-	}
-	officialQQSave = func(d *dice.Dice) {
+	officialQQProbe = dice.ProbeOfficialQQAccount
+	officialQQSave  = func(d *dice.Dice) {
 		d.Save(false)
 	}
 	officialQQStart = func(d *dice.Dice, conn *dice.EndPointInfo) {
