@@ -1240,7 +1240,10 @@ func (p *PlatformAdapterOnebot) resolveLocalAsset(rel string) (string, error) {
 	rel = strings.TrimPrefix(rel, "./")
 	rel = filepath.Clean(rel)
 	rel = filepath.FromSlash(rel)
-	if filepath.IsAbs(rel) {
+	// Windows 下 "/etc/passwd" 这类 root-relative 路径 filepath.IsAbs 可能为 false，
+	// 但同样不能当作相对 data/ 路径使用。
+	if filepath.IsAbs(rel) || filepath.VolumeName(rel) != "" ||
+		strings.HasPrefix(rel, "/") || strings.HasPrefix(rel, "\\") {
 		return "", fmt.Errorf("refuse absolute path: %s", rel)
 	}
 	// 防止裸 data/ 自身被当作文件访问

@@ -66,6 +66,9 @@ type Message struct {
 	GroupName   string      `json:"groupName"`
 	TmpUID      string      `json:"-"             yaml:"-"`
 	Seq         int64       `jsbind:"seq"         json:"seq"` // 平台消息序号，0=不可用/不支持
+	// MentionedInfo carries platform-provided display names keyed by normalized
+	// user ID, used to fill @ mention names without extra API calls.
+	MentionedInfo map[string]string `json:"-" yaml:"-"`
 	// Note(Szzrain): 这里是消息段，为了支持多种消息类型，目前只有 Milky 支持，其他平台也应该尽快迁移支持，并使用 Session.ExecuteNew 方法
 	Segment []message.IMessageElement `jsbind:"segment" json:"-" yaml:"-"`
 }
@@ -96,6 +99,7 @@ func extNamePlaceholder(name string) *ExtInfo {
 
 type GroupInfo struct {
 	Active    bool                               `jsbind:"active" json:"active" yaml:"active"` // 是否在群内开启 - 过渡为象征意义
+	activeMu  sync.RWMutex                       `json:"-" yaml:"-"`                           // 保护 Active，消息处理与保存/通知协程会并发访问
 	extInitMu sync.Mutex                         `json:"-" yaml:"-"`                           // 延迟初始化锁
 	Players   *SyncMap[string, *GroupPlayerInfo] `json:"-" yaml:"-"`                           // 群员角色数据
 
@@ -321,6 +325,26 @@ type extNameRefsJSON struct {
 	} `json:"activatedExtList"`
 }
 
+// IsActiveRaw 返回群组启用标志本身。
+func (g *GroupInfo) IsActiveRaw() bool {
+	if g == nil {
+		return false
+	}
+	g.activeMu.RLock()
+	defer g.activeMu.RUnlock()
+	return g.Active
+}
+
+// SetActiveRaw 更新群组启用标志。Active 会被消息处理与保存/通知协程并发访问。
+func (g *GroupInfo) SetActiveRaw(active bool) {
+	if g == nil {
+		return
+	}
+	g.activeMu.Lock()
+	g.Active = active
+	g.activeMu.Unlock()
+}
+
 // MarshalJSON 自定义序列化，处理私有字段 activatedExtList。
 // 已删除 wrapper 的名字同样保留：群开启状态不因插件删除而丢失。
 func (g *GroupInfo) MarshalJSON() ([]byte, error) {
@@ -334,6 +358,8 @@ func (g *GroupInfo) MarshalJSON() ([]byte, error) {
 	}
 	g.extInitMu.Unlock()
 
+	g.activeMu.RLock()
+	defer g.activeMu.RUnlock()
 	return json.Marshal(&groupInfoJSON{
 		groupInfoAlias:   (*groupInfoAlias)(g),
 		ActivatedExtList: filteredList,
@@ -342,6 +368,8 @@ func (g *GroupInfo) MarshalJSON() ([]byte, error) {
 
 // UnmarshalJSON 自定义反序列化，处理私有字段 activatedExtList
 func (g *GroupInfo) UnmarshalJSON(data []byte) error {
+	g.activeMu.Lock()
+	defer g.activeMu.Unlock()
 	if err := sonic.Unmarshal(data, &groupInfoDecodeJSON{groupInfoAlias: (*groupInfoAlias)(g)}); err != nil {
 		return err
 	}
@@ -433,7 +461,7 @@ func (group *GroupInfo) IsActive(ctx *MsgContext) bool {
 	if strings.HasPrefix(group.GroupID, "UI-Group:") {
 		return true
 	}
-	firstCheck := group.Active && group.DiceIDActiveMap.Len() >= 1
+	firstCheck := group.IsActiveRaw() && group.DiceIDActiveMap.Len() >= 1
 	if firstCheck {
 		v, _ := group.DiceIDActiveMap.Load(ctx.EndPoint.UserID)
 		return v
@@ -1106,7 +1134,7 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 				autoOn = d.Config.QQChannelAutoOn
 			}
 			groupInfo = SetBotOnAtGroup(mctx, msg.GroupID)
-			groupInfo.Active = autoOn
+			groupInfo.SetActiveRaw(autoOn)
 			groupInfo.DiceIDExistsMap.Store(ep.UserID, true)
 			if msg.GroupName != "" {
 				groupInfo.GroupName = msg.GroupName
@@ -1236,6 +1264,7 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 		platformPrefix := msg.Platform
 		cmdArgs := CommandParse(msg.Message, cmdLst, d.CommandPrefix, platformPrefix, false)
 		if cmdArgs != nil {
+			cmdArgs.applyMentionedInfo(msg)
 			mctx.CommandID = getNextCommandID()
 
 			var tmpUID string
@@ -1491,7 +1520,7 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 			autoOn = d.Config.QQChannelAutoOn
 		}
 		groupInfo = SetBotOnAtGroup(mctx, msg.GroupID)
-		groupInfo.Active = autoOn
+		groupInfo.SetActiveRaw(autoOn)
 		groupInfo.DiceIDExistsMap.Store(ep.UserID, true)
 		if msg.GroupName != "" {
 			groupInfo.GroupName = msg.GroupName
@@ -1913,6 +1942,9 @@ func (s *IMSession) OnGroupJoined(ctx *MsgContext, msg *Message) {
 	}
 	time.Sleep(2 * time.Second)
 	groupName := dm.TryGetGroupName(msg.GroupID)
+	// ctx 与随后的通知、扩展钩子共享，不能在致辞协程里修改 Player，
+	// 否则通知路径读取名片时会与之竞争。致辞语义仍使用空玩家。
+	ctx.Player = &GroupPlayerInfo{}
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -1923,7 +1955,6 @@ func (s *IMSession) OnGroupJoined(ctx *MsgContext, msg *Message) {
 		// 稍作等待后发送入群致词
 		time.Sleep(2 * time.Second)
 
-		ctx.Player = &GroupPlayerInfo{}
 		log.Infof("发送入群致辞，群: <%s>(%s)", groupName, msg.GroupID)
 		text := DiceFormatTmpl(ctx, "核心:骰子进群")
 		// forward() 的边界必须先由统一回复规划器解析；提前按 SPLIT
@@ -3074,15 +3105,8 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 			// 允许代骰时，发一句话
 			cur := -1
 			for index, i := range cmdArgs.At {
-				if i.UserID == ctx.EndPoint.UserID {
+				if cmdArgs.isBotSelfMention(ctx, i.UserID) {
 					continue
-				} else if strings.HasPrefix(ctx.EndPoint.UserID, "OpenQQ:") {
-					// 特殊处理 OpenQQ频道
-					uid := strings.TrimPrefix(i.UserID, "OpenQQCH:")
-					diceId := strings.TrimPrefix(ctx.EndPoint.UserID, "OpenQQ:")
-					if uid == diceId {
-						continue
-					}
 				}
 				cur = index
 			}
@@ -3222,7 +3246,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 		candidates = append(candidates, commandSolveCandidate{Ext: nil, Item: item})
 	}
 
-	if group != nil && (group.Active || ctx.IsCurGroupBotOn) {
+	if group != nil && (group.IsActiveRaw() || ctx.IsCurGroupBotOn) {
 		for _, wrapper := range group.GetActivatedExtList(ctx.Dice) {
 			cmdMap := wrapper.GetCmdMap()
 			item = cmdMap[cmdArgs.Command]
@@ -3306,7 +3330,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 		}
 	}
 
-	if group != nil && (group.Active || ctx.IsCurGroupBotOn) {
+	if group != nil && (group.IsActiveRaw() || ctx.IsCurGroupBotOn) {
 		for _, wrapper := range group.GetActivatedExtList(ctx.Dice) {
 			ext := wrapper.GetRealExt()
 			if ext == nil {
@@ -3470,7 +3494,7 @@ func (s *IMSession) OnMessageEdit(ctx *MsgContext, msg *Message) {
 	}
 
 	group := ctx.Group
-	if group.Active || ctx.IsCurGroupBotOn {
+	if group.IsActiveRaw() || ctx.IsCurGroupBotOn {
 		for _, wrapper := range group.GetActivatedExtList(ctx.Dice) {
 			ext := wrapper.GetRealExt()
 			if ext == nil {

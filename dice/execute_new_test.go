@@ -426,7 +426,7 @@ func TestExecuteNew_GroupInfo_Created(t *testing.T) {
 	if groupInfo.GroupID != groupID {
 		t.Errorf("GroupID = %q, want %q", groupInfo.GroupID, groupID)
 	}
-	if !groupInfo.Active {
+	if !groupInfo.IsActiveRaw() {
 		t.Error("new GroupInfo should have Active=true")
 	}
 }

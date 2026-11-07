@@ -1,80 +1,225 @@
 package dice
 
-import "sync"
+import (
+	"runtime/debug"
+	"sync"
+	"time"
 
+	"go.uber.org/zap"
+
+	"Scardice-core/logger"
+)
+
+// maxOfficialQQQueuedEvents 限制 webhook 并发突发时的排队上限，
+// 避免异常流量把内存撑爆。WS 模式下列队通常不会超过 1。
+const maxOfficialQQQueuedEvents = 1024
+
+type queuedOfficialQQEvent struct {
+	run func()
+	// done 非空时表示调用方在等待该事件执行完成（WS 模式）。
+	// buffered=1，避免 Abandon 与 worker 同时发送时阻塞。
+	done chan bool
+}
+
+// officialQQEventQueue 用单独的 worker 串行执行事件。
+// Webhook 模式只负责入队，HTTP 层可以立即 ACK；WS 模式用 EnqueueWait
+// 等到事件真正执行后再返回，让 botgo 的 SeqAfterHandle 仍然有意义。
 type officialQQEventQueue struct {
-	mu      sync.Mutex
-	idle    *sync.Cond
-	events  []func()
-	running bool
-	closed  bool
+	mu        sync.Mutex
+	cond      *sync.Cond
+	events    []queuedOfficialQQEvent
+	closed    bool
+	executing bool
 }
 
 func newOfficialQQEventQueue() *officialQQEventQueue {
-	queue := new(officialQQEventQueue)
-	queue.idle = sync.NewCond(&queue.mu)
-	return queue
+	q := new(officialQQEventQueue)
+	q.cond = sync.NewCond(&q.mu)
+	go q.work()
+	return q
 }
 
+// Enqueue 只入队，返回是否被接收；事件由 worker 异步执行。
 func (q *officialQQEventQueue) Enqueue(event func()) bool {
-	q.mu.Lock()
-	if q.closed {
-		q.mu.Unlock()
+	return q.enqueue(event, nil)
+}
+
+// EnqueueWait 入队并等待事件执行完成。队列在事件执行前被 Abandon，
+// 或事件执行时 panic 被隔离时返回 false。
+func (q *officialQQEventQueue) EnqueueWait(event func()) bool {
+	done := make(chan bool, 1)
+	if !q.enqueue(event, done) {
 		return false
 	}
-	q.events = append(q.events, event)
-	if q.running {
-		q.mu.Unlock()
-		return true
-	}
-	q.running = true
-	q.mu.Unlock()
+	return <-done
+}
 
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			q.mu.Lock()
-			q.events = nil
-			q.running = false
-			q.closed = true
-			q.idle.Broadcast()
-			q.mu.Unlock()
-			panic(recovered)
+func (q *officialQQEventQueue) enqueue(event func(), done chan bool) bool {
+	if event == nil {
+		return false
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed || len(q.events) >= maxOfficialQQQueuedEvents {
+		if q.closed {
+			return false
 		}
-	}()
-	q.drain()
+		zap.S().Named(logger.LogKeyAdapter).Warnf("official qq event queue is full (%d), rejecting event", maxOfficialQQQueuedEvents)
+		return false
+	}
+	q.events = append(q.events, queuedOfficialQQEvent{run: event, done: done})
+	q.cond.Signal()
 	return true
 }
 
-func (q *officialQQEventQueue) drain() {
+func (q *officialQQEventQueue) work() {
 	for {
 		q.mu.Lock()
+		for len(q.events) == 0 && !q.closed {
+			q.cond.Wait()
+		}
 		if len(q.events) == 0 {
-			q.running = false
-			q.idle.Broadcast()
 			q.mu.Unlock()
 			return
 		}
 		event := q.events[0]
-		q.events[0] = nil
+		q.events[0] = queuedOfficialQQEvent{}
 		q.events = q.events[1:]
+		q.executing = true
 		q.mu.Unlock()
 
-		event()
+		ok := runOfficialQQEvent(event.run)
+
+		q.mu.Lock()
+		q.executing = false
+		if event.done != nil {
+			event.done <- ok
+		}
+		q.mu.Unlock()
 	}
 }
 
+// runOfficialQQEvent 隔离单个事件的 panic，避免一个坏插件/坏消息把 worker 带崩。
+// 返回 false 表示事件因 panic 未能正常执行完成，等待者必须把它当作失败。
+func runOfficialQQEvent(event func()) (ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			ok = false
+			zap.S().Named(logger.LogKeyAdapter).Errorf("official qq event panic: %v\n%s", r, debug.Stack())
+		}
+	}()
+	event()
+	return true
+}
+
+// Close 停止接收新事件；worker 会继续执行已经入队的事件，然后退出。
 func (q *officialQQEventQueue) Close() {
 	q.mu.Lock()
-	q.closed = true
+	if !q.closed {
+		q.closed = true
+		q.cond.Broadcast()
+	}
 	q.mu.Unlock()
 }
 
-func (q *officialQQEventQueue) closeAndWait() {
-	q.Close()
+// Abandon 立即丢弃尚未执行的事件，并让等待者得到失败结果。
+// 正在执行的事件无法取消，只能等它自己返回。
+func (q *officialQQEventQueue) Abandon() int {
 	q.mu.Lock()
-	for q.running {
-		q.idle.Wait()
-	}
+	q.closed = true
+	pending := q.events
 	q.events = nil
+	q.cond.Broadcast()
 	q.mu.Unlock()
+	for _, event := range pending {
+		if event.done != nil {
+			event.done <- false
+		}
+	}
+	return len(pending)
+}
+
+// WaitForIdle 在有限时间内等待所有已入队事件执行完成。
+func (q *officialQQEventQueue) WaitForIdle(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		q.mu.Lock()
+		idle := len(q.events) == 0 && !q.executing
+		q.mu.Unlock()
+		if idle {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// officialQQEventDeduper 给 webhook 路径提供按 event id/msg id 的短 TTL 去重。
+// botgo 的 HandlerOptions 支持 Deduper，但不会提供默认实现；不配置时平台重复推送会重复执行。
+type officialQQEventDeduper struct {
+	mu   sync.Mutex
+	seen map[string]time.Time
+	ttl  time.Duration
+	max  int
+}
+
+func newOfficialQQEventDeduper(ttl time.Duration, maxEntries int) *officialQQEventDeduper {
+	return &officialQQEventDeduper{
+		seen: make(map[string]time.Time),
+		ttl:  ttl,
+		max:  maxEntries,
+	}
+}
+
+func (d *officialQQEventDeduper) pruneLocked(now time.Time) {
+	for key, at := range d.seen {
+		if now.Sub(at) > d.ttl {
+			delete(d.seen, key)
+		}
+	}
+}
+
+func (d *officialQQEventDeduper) Seen(key string) bool {
+	if d == nil || key == "" {
+		return false
+	}
+	now := time.Now()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	at, ok := d.seen[key]
+	if !ok {
+		return false
+	}
+	if now.Sub(at) > d.ttl {
+		delete(d.seen, key)
+		return false
+	}
+	return true
+}
+
+func (d *officialQQEventDeduper) Mark(key string) {
+	if d == nil || key == "" {
+		return
+	}
+	now := time.Now()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.max > 0 && len(d.seen) >= d.max {
+		d.pruneLocked(now)
+		if len(d.seen) >= d.max {
+			d.seen = make(map[string]time.Time)
+		}
+	}
+	d.seen[key] = now
+}
+
+func (d *officialQQEventDeduper) Unmark(key string) {
+	if d == nil || key == "" {
+		return
+	}
+	d.mu.Lock()
+	delete(d.seen, key)
+	d.mu.Unlock()
 }

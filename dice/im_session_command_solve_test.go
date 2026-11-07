@@ -381,7 +381,7 @@ func TestCommandSolveIgnoreReasonBotOffForCoreCommand(t *testing.T) {
 	commandName := "rolltest"
 	session, ctx := newCommandSolveTestSessionAndContext("", nil)
 	ctx.IsCurGroupBotOn = false
-	ctx.Group.Active = false
+	ctx.Group.SetActiveRaw(false)
 	session.Parent.CmdMap[commandName] = &CmdItemInfo{Name: commandName}
 
 	result := session.commandSolve(ctx, &Message{Sender: SenderBase{Nickname: "tester"}}, &CmdArgs{Command: commandName})

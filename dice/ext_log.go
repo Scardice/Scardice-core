@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -64,8 +65,22 @@ func ensureGroupLogState(ctx *MsgContext, group *GroupInfo) GroupLogState {
 	return getGroupLogState(group)
 }
 
-func SetPlayerGroupCardByTemplate(ctx *MsgContext, tmpl string) (string, error) {
-	if ctx.SystemTemplate == nil {
+// EvalPlayerGroupCardTemplate 只求值 .sn 模板，不调用平台改名接口。
+// 求值 panic 转为 error，避免名片异常中断正文回复。
+func EvalPlayerGroupCardTemplate(ctx *MsgContext, tmpl string) (result string, err error) {
+	if ctx == nil || ctx.Dice == nil {
+		return "", errors.New("无法求值名片模板：上下文为空")
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			result = ""
+			err = fmt.Errorf("名片模板求值异常: %v", r)
+			if ctx.Dice.Logger != nil {
+				ctx.Dice.Logger.Errorf("%v\n%s", err, debug.Stack())
+			}
+		}
+	}()
+	if ctx.SystemTemplate == nil && ctx.Group != nil {
 		ctx.SystemTemplate = ctx.Group.GetCharTemplate(ctx.Dice)
 	}
 	config := ctx.GenDefaultRollVmConfig()
@@ -74,11 +89,26 @@ func SetPlayerGroupCardByTemplate(ctx *MsgContext, tmpl string) (string, error) 
 	}
 	v := ctx.EvalFString(tmpl, config)
 	if v.vm.Error != nil {
-		ctx.Dice.Logger.Infof("SN指令模板错误: %v", v.vm.Error.Error())
 		return "", v.vm.Error
 	}
 
-	text := v.ToString()
+	return v.ToString(), nil
+}
+
+func SetPlayerGroupCardByTemplate(ctx *MsgContext, tmpl string) (string, error) {
+	text, err := EvalPlayerGroupCardTemplate(ctx, tmpl)
+	if err != nil {
+		if ctx != nil && ctx.Dice != nil && ctx.Dice.Logger != nil {
+			ctx.Dice.Logger.Infof("SN指令模板错误: %v", err.Error())
+		}
+		return "", err
+	}
+
+	// 官方 QQ 没有修改群名片的能力，名片改由回复顶部的状态栏承载。
+	if ctx.EndPoint == nil || ctx.EndPoint.Adapter == nil || isOfficialQQEndpoint(ctx.EndPoint) {
+		return text, nil
+	}
+
 	if ctx.EndPoint.Platform == "QQ" && len(text) >= 60 { // Note(Xiangze-Li): 2023-08-09实测群名片长度限制为59个英文字符, 20个中文字符是可行的, 但分别判断过于繁琐
 		return text, ErrGroupCardOverlong
 	}
