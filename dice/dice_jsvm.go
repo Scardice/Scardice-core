@@ -380,6 +380,10 @@ func (d *Dice) JsInit() {
 	// 初始化
 	loop.Run(func(vm *goja.Runtime) {
 		vm.SetFieldNameMapper(goja.TagFieldNameMapper("jsbind", true))
+		// ctx.group.active 走加锁访问器，避免脚本直接读写 GroupInfo.Active 绕过 activeMu。
+		if err := installJSGroupActiveAccessor(vm); err != nil {
+			d.Logger.Errorf("安装 ctx.group.active 访问器失败: %v", err)
+		}
 		// 直接绑定进程内唯一全局随机源，避免再包一层无意义的适配。
 		vm.SetRandSource(func() float64 {
 			return float64(globalRandSource.Uint64()>>11) / (1 << 53)

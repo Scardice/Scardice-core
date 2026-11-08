@@ -315,7 +315,9 @@ func runFsLoopSync(t *testing.T, loop *eventloop.EventLoop, f func(*goja.Runtime
 
 func waitFsLoopBool(t *testing.T, loop *eventloop.EventLoop, name string) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	// 20 个并发写 + 20 个并发读在 Windows/CI 慢盘上可能超过 2 秒；
+	// 放宽到 10 秒，避免把“慢”误报成异步 fs 卡死。
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if fsLoopBool(t, loop, name) {
 			return

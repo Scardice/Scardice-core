@@ -81,7 +81,7 @@ func jsFsResolveAbsolute(d *Dice, raw string) (jsFsResolvedPath, error) {
 		if err != nil {
 			return jsFsResolvedPath{}, err
 		}
-		if strings.Contains(rest, "\\") || jsFsHasWindowsVolumeName(rest) {
+		if strings.Contains(rest, "\\") || strings.HasPrefix(rest, "/") || jsFsHasWindowsVolumeName(rest) {
 			return jsFsResolvedPath{}, fmt.Errorf("data:// 路径不允许穿越或绝对: %s", raw)
 		}
 		clean := filepath.Clean(rest)

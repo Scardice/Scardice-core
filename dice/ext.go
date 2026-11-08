@@ -671,9 +671,25 @@ func (group *GroupInfo) ensureInactivatedSet() {
 	if group.InactivatedExtSet == nil {
 		group.InactivatedExtSet = StringSet{}
 	}
+	// 旧对象可能只有 InactivatedExtSet；先保守回填，再保证新集合非 nil。
+	group.backfillUserInactivatedExtSet()
 }
 
-// IsExtInactivated 判断扩展是否被标记为手动关闭。
+// backfillUserInactivatedExtSet 为旧数据回填用户手动关闭集合。
+// 旧数据没有 UserInactivatedExtSet，无法区分手动关闭与未自动启用，保守地
+// 把 InactivatedExtSet 全部视为手动关闭；这样升级后的迁移合并不会重新启用
+// 用户之前关闭的扩展。新数据会保存非 nil 的 UserInactivatedExtSet（即使是空集合）。
+func (group *GroupInfo) backfillUserInactivatedExtSet() {
+	if group.UserInactivatedExtSet != nil {
+		return
+	}
+	group.UserInactivatedExtSet = StringSet{}
+	for name := range group.InactivatedExtSet {
+		group.UserInactivatedExtSet[name] = struct{}{}
+	}
+}
+
+// IsExtInactivated 判断扩展是否处于关闭状态（手动关闭或尚未自动启用）。
 func (group *GroupInfo) IsExtInactivated(name string) bool {
 	if group.InactivatedExtSet == nil {
 		return false
@@ -682,16 +698,34 @@ func (group *GroupInfo) IsExtInactivated(name string) bool {
 	return ok
 }
 
-func (group *GroupInfo) RemoveFromInactivated(name string) {
-	if group.InactivatedExtSet == nil {
-		return
+// IsUserInactivated 判断扩展是否由用户手动关闭。
+// 旧对象/旧数据没有 UserInactivatedExtSet 时保守地回退到 InactivatedExtSet。
+func (group *GroupInfo) IsUserInactivated(name string) bool {
+	if group == nil {
+		return false
 	}
+	if group.UserInactivatedExtSet == nil {
+		return group.IsExtInactivated(name)
+	}
+	_, ok := group.UserInactivatedExtSet[name]
+	return ok
+}
+
+func (group *GroupInfo) RemoveFromInactivated(name string) {
 	delete(group.InactivatedExtSet, name)
+	delete(group.UserInactivatedExtSet, name)
 }
 
 func (group *GroupInfo) AddToInactivated(name string) {
 	group.ensureInactivatedSet()
 	group.InactivatedExtSet[name] = struct{}{}
+}
+
+// AddToUserInactivated 记录用户手动关闭，同时写入两个集合。
+func (group *GroupInfo) AddToUserInactivated(name string) {
+	group.ensureInactivatedSet()
+	group.InactivatedExtSet[name] = struct{}{}
+	group.UserInactivatedExtSet[name] = struct{}{}
 }
 
 func (group *GroupInfo) indexOfActivated(name string) int {
@@ -893,7 +927,7 @@ func (group *GroupInfo) extDeactivateInternal(ei *ExtInfo, reason DeactivateReas
 	var removed *ExtInfo
 	for _, name := range names {
 		if markInactivated {
-			group.AddToInactivated(name)
+			group.AddToUserInactivated(name)
 		}
 		if ext := d.ExtFind(name, false); ext != nil {
 			if target := ext.GetRealExt(); target != nil && target.Storage != nil {

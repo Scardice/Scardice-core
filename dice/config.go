@@ -2485,9 +2485,7 @@ func (d *Dice) loadGroups() {
 		if groupInfo.BotList == nil {
 			groupInfo.BotList = new(SyncMap[string, bool])
 		}
-		if groupInfo.InactivatedExtSet == nil {
-			groupInfo.InactivatedExtSet = StringSet{}
-		}
+		groupInfo.ensureInactivatedSet()
 
 		var toDelete []string
 		groupInfo.DiceIDExistsMap.Range(func(key string, _ bool) bool {
@@ -2704,8 +2702,11 @@ func (d *Dice) ApplyExtDefaultSettings() {
 				group.ensureInactivatedSet()
 				changed := false
 				for name := range autoActiveNames {
-					if _, exists := group.InactivatedExtSet[name]; exists {
+					_, inUnion := group.InactivatedExtSet[name]
+					_, inUser := group.UserInactivatedExtSet[name]
+					if inUnion || inUser {
 						delete(group.InactivatedExtSet, name)
+						delete(group.UserInactivatedExtSet, name)
 						changed = true
 					}
 				}

@@ -144,35 +144,40 @@ func (c *Config) migrateOld2Version1() {
 }
 
 type BaseConfig struct {
-	CommandCompatibleMode   bool       `json:"-"                       yaml:"commandCompatibleMode"`
-	LastSavedTime           *time.Time `json:"-"                       yaml:"lastSavedTime"`
-	NoticeIDs               []string   `json:"noticeIds"               yaml:"noticeIds"`               // 通知ID
-	OnlyLogCommandInGroup   bool       `json:"onlyLogCommandInGroup"   yaml:"onlyLogCommandInGroup"`   // 日志中仅记录命令
-	OnlyLogCommandInPrivate bool       `json:"onlyLogCommandInPrivate" yaml:"onlyLogCommandInPrivate"` // 日志中仅记录命令
-	VersionCode             int        `json:"versionCode"             yaml:"versionCode"`             // 版本ID(配置文件)
-	MessageDelayRangeStart  float64    `json:"messageDelayRangeStart"  yaml:"messageDelayRangeStart"`  // 指令延迟区间
-	MessageDelayRangeEnd    float64    `json:"messageDelayRangeEnd"    yaml:"messageDelayRangeEnd"`
-	WorkInQQChannel         bool       `json:"workInQQChannel"         yaml:"workInQQChannel"`
-	QQChannelAutoOn         bool       `json:"QQChannelAutoOn"         yaml:"QQChannelAutoOn"`         // QQ频道中自动开启(默认不开)
-	QQChannelLogMessage     bool       `json:"QQChannelLogMessage"     yaml:"QQChannelLogMessage"`     // QQ频道中记录消息(默认不开)
-	QQEnablePoke            bool       `json:"QQEnablePoke"            yaml:"QQEnablePoke"`            // 启用戳一戳
-	TextCmdTrustOnly        bool       `json:"textCmdTrustOnly"        yaml:"textCmdTrustOnly"`        // 只允许信任用户或master使用text指令
-	IgnoreUnaddressedBotCmd bool       `json:"ignoreUnaddressedBotCmd" yaml:"ignoreUnaddressedBotCmd"` // 不响应群聊裸bot指令
-	UILogLimit              int64      `json:"-"                       yaml:"UILogLimit"`
-	FriendAddComment        string     `json:"friendAddComment"        yaml:"friendAddComment"` // 加好友验证信息
-	CustomReplyConfigEnable bool       `json:"customReplyConfigEnable" yaml:"customReplyConfigEnable"`
-	AutoReloginEnable       bool       `json:"autoReloginEnable"       yaml:"autoReloginEnable"`    // 启用自动重新登录
-	RefuseGroupInvite       bool       `json:"refuseGroupInvite"       yaml:"refuseGroupInvite"`    // 拒绝加入新群
-	UpgradeWindowID         string     `json:"-"                       yaml:"upgradeWindowId"`      // 执行升级指令的窗口
-	UpgradeEndpointID       string     `json:"-"                       yaml:"upgradeEndpointId"`    // 执行升级指令的端点
-	BotExtFreeSwitch        bool       `json:"botExtFreeSwitch"        yaml:"botExtFreeSwitch"`     // 允许任意人员开关: 否则邀请者、群主、管理员、master有权限
-	BotExitWithoutAt        bool       `json:"botExitWithoutAt"        yaml:"botExitWithoutAt"`     // 不@骰娘即可执行退群指令
-	TrustOnlyMode           bool       `json:"trustOnlyMode"           yaml:"trustOnlyMode"`        // 只有信任的用户/master可以拉群和使用
-	AliveNoticeEnable       bool       `json:"aliveNoticeEnable"       yaml:"aliveNoticeEnable"`    // 定时通知
-	AliveNoticeValue        string     `json:"aliveNoticeValue"        yaml:"aliveNoticeValue"`     // 定时通知间隔
-	ReplyDebugMode          bool       `json:"replyDebugMode"          yaml:"replyDebugMode"`       // 回复调试
-	PlayerNameWrapEnable    bool       `json:"playerNameWrapEnable"    yaml:"playerNameWrapEnable"` // 启用玩家名称外框
-	DiceRandomMode          string     `json:"diceRandomMode"          yaml:"diceRandomMode"`       // 骰点随机模式
+	CommandCompatibleMode     bool       `json:"-"                       yaml:"commandCompatibleMode"`
+	LastSavedTime             *time.Time `json:"-"                       yaml:"lastSavedTime"`
+	NoticeIDs                 []string   `json:"noticeIds"               yaml:"noticeIds"`               // 通知ID
+	OnlyLogCommandInGroup     bool       `json:"onlyLogCommandInGroup"   yaml:"onlyLogCommandInGroup"`   // 日志中仅记录命令
+	OnlyLogCommandInPrivate   bool       `json:"onlyLogCommandInPrivate" yaml:"onlyLogCommandInPrivate"` // 日志中仅记录命令
+	VersionCode               int        `json:"versionCode"             yaml:"versionCode"`             // 版本ID(配置文件)
+	MessageDelayRangeStart    float64    `json:"messageDelayRangeStart"  yaml:"messageDelayRangeStart"`  // 指令延迟区间
+	MessageDelayRangeEnd      float64    `json:"messageDelayRangeEnd"    yaml:"messageDelayRangeEnd"`
+	WorkInQQChannel           bool       `json:"workInQQChannel"         yaml:"workInQQChannel"`
+	QQChannelAutoOn           bool       `json:"QQChannelAutoOn"         yaml:"QQChannelAutoOn"`                             // QQ频道中自动开启(默认不开)
+	QQChannelLogMessage       bool       `json:"QQChannelLogMessage"     yaml:"QQChannelLogMessage"`                         // QQ频道中记录消息(默认不开)
+	QQEnablePoke              bool       `json:"QQEnablePoke"            yaml:"QQEnablePoke"`                                // 启用戳一戳
+	OfficialQQFileSendBase64  bool       `json:"officialQQFileSendBase64" yaml:"officialQQFileSendBase64"`                   // 是否使用base64发送本地/非公网文件
+	OfficialQQUseMarkdown     bool       `json:"officialQQUseMarkdown"    yaml:"officialQQUseMarkdown"`                      // 是否自动把消息全转为markdown类型消息
+	OfficialQQUseNameCard     bool       `json:"officialQQUseNameCard"    yaml:"officialQQUseNameCard"`                      // 是否在官方QQ回复顶部显示玩家.sn名片，需要同时启用Markdown
+	OfficialQQNameCardTmpl    string     `json:"officialQQUseNameCardTemplate" yaml:"officialQQUseNameCardTemplate"`         // 名片渲染模板，{card} 为名片内容占位符
+	OfficialQQMigrationEnable bool       `json:"officialQQEnableIdentityMigration" yaml:"officialQQEnableIdentityMigration"` // 启动 QQ 官方旧身份数据迁移
+	TextCmdTrustOnly          bool       `json:"textCmdTrustOnly"        yaml:"textCmdTrustOnly"`                            // 只允许信任用户或master使用text指令
+	IgnoreUnaddressedBotCmd   bool       `json:"ignoreUnaddressedBotCmd" yaml:"ignoreUnaddressedBotCmd"`                     // 不响应群聊裸bot指令
+	UILogLimit                int64      `json:"-"                       yaml:"UILogLimit"`
+	FriendAddComment          string     `json:"friendAddComment"        yaml:"friendAddComment"` // 加好友验证信息
+	CustomReplyConfigEnable   bool       `json:"customReplyConfigEnable" yaml:"customReplyConfigEnable"`
+	AutoReloginEnable         bool       `json:"autoReloginEnable"       yaml:"autoReloginEnable"`    // 启用自动重新登录
+	RefuseGroupInvite         bool       `json:"refuseGroupInvite"       yaml:"refuseGroupInvite"`    // 拒绝加入新群
+	UpgradeWindowID           string     `json:"-"                       yaml:"upgradeWindowId"`      // 执行升级指令的窗口
+	UpgradeEndpointID         string     `json:"-"                       yaml:"upgradeEndpointId"`    // 执行升级指令的端点
+	BotExtFreeSwitch          bool       `json:"botExtFreeSwitch"        yaml:"botExtFreeSwitch"`     // 允许任意人员开关: 否则邀请者、群主、管理员、master有权限
+	BotExitWithoutAt          bool       `json:"botExitWithoutAt"        yaml:"botExitWithoutAt"`     // 不@骰娘即可执行退群指令
+	TrustOnlyMode             bool       `json:"trustOnlyMode"           yaml:"trustOnlyMode"`        // 只有信任的用户/master可以拉群和使用
+	AliveNoticeEnable         bool       `json:"aliveNoticeEnable"       yaml:"aliveNoticeEnable"`    // 定时通知
+	AliveNoticeValue          string     `json:"aliveNoticeValue"        yaml:"aliveNoticeValue"`     // 定时通知间隔
+	ReplyDebugMode            bool       `json:"replyDebugMode"          yaml:"replyDebugMode"`       // 回复调试
+	PlayerNameWrapEnable      bool       `json:"playerNameWrapEnable"    yaml:"playerNameWrapEnable"` // 启用玩家名称外框
+	DiceRandomMode            string     `json:"diceRandomMode"          yaml:"diceRandomMode"`       // 骰点随机模式
 
 	VMVersionForReply      string `json:"VMVersionForReply"      yaml:"VMVersionForReply"`      // 自定义回复使用的vm版本
 	VMVersionForDeck       string `json:"VMVersionForDeck"       yaml:"VMVersionForDeck"`       // 牌堆使用的vm版本

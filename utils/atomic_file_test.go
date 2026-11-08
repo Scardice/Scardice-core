@@ -4,11 +4,15 @@ package utils
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
 
 func TestAtomicWriteFileCreatesFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not preserve Unix permission bits")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 
@@ -34,6 +38,9 @@ func TestAtomicWriteFileCreatesFile(t *testing.T) {
 }
 
 func TestAtomicWriteFileOverwritesAndKeepsExistingMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not preserve Unix permission bits")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
 	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {

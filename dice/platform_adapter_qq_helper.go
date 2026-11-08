@@ -218,40 +218,64 @@ func serverSatori(d *Dice, ep *EndPointInfo, conn *PlatformAdapterSatori) {
 }
 
 func serverOfficialQQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterOfficialQQ) {
-	if conn.Ctx != nil {
+	// Ctx 非空表示会话已经建立或正在运行，不能重复启动并覆盖端点状态。
+	if conn.isSessionRunning() {
 		return
 	}
-	if conn.DiceServing {
+	if conn.isDiceServing() {
 		return
 	}
-	conn.DiceServing = true
 
-	ep.Enable = true
-	ep.State = 2 // 连接中
+	epoch, stop := conn.beginServeLoop()
+	if !conn.setDiceServingIfEpoch(true, epoch) {
+		return
+	}
+
+	conn.setEndpointStateIfIdle(true, StateConnecting)
 	d.LastUpdatedTime = time.Now().Unix()
 	d.Save(false)
 	waitTimes := 0
 
 	for {
+		if !conn.serveLoopCurrent(epoch, stop) {
+			// 用户已禁用/重登或新的 Serve 循环已接管；不要回写状态。
+			conn.setDiceServingIfEpoch(false, epoch)
+			return
+		}
 		// 骰子开始连接
 		d.Logger.Infof("开始连接 official qq，帐号 <%s>(%s)，重试计数[%d/%d]", ep.Nickname, ep.UserID, waitTimes, 5)
 		ret := ep.Adapter.Serve()
 
 		if ret == 0 {
-			if conn.QRLoginState == OfficialQQQRWaitingForScan {
-				ep.Enable = false
-				ep.State = StateConnecting
-			}
-			break
+			return
 		}
 
 		waitTimes += 1
 		if waitTimes > 5 {
 			d.Logger.Infof("official qq 连接重试次数过多，先行中断: <%s>(%s)", ep.Nickname, ep.UserID)
-			conn.DiceServing = false
-			break
+			conn.setDiceServingIfEpoch(false, epoch)
+			// 没有新会话接管时，把端点明确回置为失败，避免 UI 显示“已启用但连不上”。
+			conn.setEndpointStateIfIdle(false, StateConnectionFailed)
+			d.LastUpdatedTime = time.Now().Unix()
+			d.Save(false)
+			return
 		}
 
-		time.Sleep(15 * time.Second)
+		if !waitOfficialQQRetry(stop, 15*time.Second) {
+			conn.setDiceServingIfEpoch(false, epoch)
+			return
+		}
+	}
+}
+
+// waitOfficialQQRetry 等待下一次重试，用户禁用/重登时立即返回 false。
+func waitOfficialQQRetry(stop <-chan struct{}, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-stop:
+		return false
 	}
 }

@@ -68,7 +68,8 @@ require (
 	github.com/sahilm/fuzzy v0.1.1
 	github.com/samber/lo v1.52.0
 	github.com/schollz/progressbar/v3 v3.19.1
-	github.com/sealdice/botgo v0.0.0-20260724133029-df949851f30b
+	github.com/sealdice/botgo v0.0.0-20261021133756-7994a476e417
+	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/slack-go/slack v0.17.3
 	github.com/sunshineplan/imgconv v1.1.14
 	github.com/tailscale/hujson v0.0.0-20250605163823-992244df8c5a
@@ -84,6 +85,7 @@ require (
 	go.uber.org/zap v1.27.0
 	golang.org/x/crypto v0.54.0
 	golang.org/x/exp v0.0.0-20250911091902-df9299821621
+	golang.org/x/oauth2 v0.23.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/text v0.40.0
 	golang.org/x/time v0.15.0
@@ -101,9 +103,10 @@ require (
 	github.com/axiomhq/hyperloglog v0.2.6 // indirect
 	github.com/blevesearch/bleve_index_api v1.4.0 // indirect
 	github.com/caio/go-tdigest/v4 v4.1.0 // indirect
+	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/dgryski/go-metro v0.0.0-20250106013310-edb8663e5e33 // indirect
+	github.com/jellydator/ttlcache/v3 v3.1.0 // indirect
 	github.com/kamstrup/intmap v0.5.2 // indirect
-	golang.org/x/oauth2 v0.23.0 // indirect
 )
 
 require (
@@ -168,7 +171,7 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/labstack/gommon v0.4.2 // indirect
-	github.com/lxzan/gws v1.9.1 // indirect
+	github.com/lxzan/gws v1.10.2 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/mattn/go-runewidth v0.0.16 // indirect
@@ -235,7 +238,7 @@ replace (
 	// Try to fix sqlite in cgofree
 	// github.com/glebarez/sqlite v1.11.0 => github.com/PaienNate/sqlite v0.0.0-20241102151933-067d82f14685
 	github.com/dop251/goja_nodejs v0.0.0-20250409162600-f7acab6894b0 => github.com/PaienNate/goja_nodejs v0.0.0-20250924024212-bac2e5ba5231
-	github.com/lonelyevil/kook v0.0.31 => github.com/sealdice/kook v0.0.3
+	github.com/lonelyevil/kook v0.0.31 => ./third_party/kook
 	github.com/sacOO7/gowebsocket v0.0.0-20221109081133-70ac927be105 => github.com/fy0/GoWebsocket v0.0.0-20231128163937-aa5c110b25c6
 )
 
