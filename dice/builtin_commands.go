@@ -839,27 +839,31 @@ func (d *Dice) registerCoreCommands() {
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 
-					wasPausedLog := ctx.Group != nil && ctx.Group.isLogPausedByBotOff()
+					wasAutoOffLog := ctx.Group != nil && ctx.Group.isLogPausedByBotOff()
 					SetBotOnAtGroup(ctx, msg.GroupID)
 					// TODO：ServiceAtNew此处忽略是否合理？
 					ctx.Group, _ = ctx.Session.ServiceAtNew.Load(msg.GroupID)
 					ctx.IsCurGroupBotOn = true
 
+					// .bot off 时日志被自动关闭，这里按 .log on 的语义自动开启。
 					// 用 .bot on 指令消息的 seq 直接重建基线，替代“跳过下一条消息”的
 					// 布尔标记：恢复后一条消息都没来就再次掉线/重启时，布尔标记会把
 					// 真实的离线窗口吞掉。没有 seq 的平台仍保留原标记兜底。
-					// 只在“本次确实从 .bot off 暂停中恢复”时重建；普通 .bot on 是
-					// 空操作，不能让 resetLogSeq 取消掉正在进行的合法补全。
-					if wasPausedLog && ctx.Group != nil && msg.Seq > 0 {
+					// 只在“本次确实从 .bot off 自动关闭中恢复”时重建；普通 .bot on
+					// 是空操作，不能让 resetLogSeq 取消掉正在进行的合法补全。
+					autoOnLog := wasAutoOffLog && ctx.Group != nil && ctx.Group.GetLogState().On
+					if autoOnLog && msg.Seq > 0 {
 						ctx.Group.resetLogSeq(msg.Seq, msg.RawID)
 						ctx.Group.clearLogResumeSkipGap()
 					}
 
 					text := DiceFormatTmpl(ctx, "核心:骰子开启")
-					if wasPausedLog && ctx.Group.GetLogState().On {
-						// .bot off 时日志被自动暂停，这里刚恢复；静默段不补录。
-						text += "\n日志已随骰子恢复（暂停期间的消息不会补录）"
-					} else if ctx.Group.GetLogState().On {
+					if autoOnLog {
+						// .bot off 时日志被自动关闭，这里刚自动开启；关闭段不补录。
+						text += "\n日志已随骰子自动开启（关闭期间的消息不会补录）"
+					} else if !ctx.Group.GetLogState().On {
+						text += "\n日志记录处于关闭状态"
+					} else {
 						text += "\n请特别注意: 日志记录处于开启状态"
 					}
 					ReplyToSender(ctx, msg, text)
@@ -878,9 +882,10 @@ func (d *Dice) registerCoreCommands() {
 
 					SetBotOffAtGroup(ctx, ctx.Group.GroupID)
 					text := DiceFormatTmpl(ctx, "核心:骰子关闭")
-					// 群真正变为未激活时日志会被自动暂停（不结束、不上传）。
-					if state := ctx.Group.GetLogState(); !state.On && state.Name != "" {
-						text += "\n日志记录已同时暂停（未结束，.bot on 后自动恢复）"
+					// 只有本次真的把日志自动关闭时才提示；用户本来就 .log off 的
+					// 群不应被谎报“会自动开启”。
+					if ctx.Group.isLogPausedByBotOff() {
+						text += "\n日志记录已自动关闭（未结束，.bot on 后自动开启）"
 					}
 					ReplyToSender(ctx, msg, text)
 					return CmdExecuteResult{Matched: true, Solved: true}

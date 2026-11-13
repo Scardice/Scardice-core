@@ -16,7 +16,7 @@ var (
 	// VERSION_PRERELEASE 先行版本号
 	VERSION_PRERELEASE = "-qianqian"
 	// VERSION_BUILD_METADATA 版本编译信息
-	VERSION_BUILD_METADATA = "+20261113fix6"
+	VERSION_BUILD_METADATA = "+20261113fix7"
 
 	// APP_CHANNEL 更新频道，stable/dev，在 action 构建时自动注入
 	APP_CHANNEL = "stable" //nolint:revive

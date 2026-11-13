@@ -217,6 +217,22 @@ func serverSatori(d *Dice, ep *EndPointInfo, conn *PlatformAdapterSatori) {
 	}
 }
 
+// officialQQMaxConnectAttempts 是连续连接失败的终态上限。超过后必须把端点
+// 明确置为失败并停止重试，否则错误的 AppID/白名单会让 UI 永远显示“连接中”。
+// 设为 var 便于测试缩短等待。
+var officialQQMaxConnectAttempts = 5
+
+// officialQQServe 抽出 Serve 调用，便于测试注入“始终失败”的连接。
+// 默认 nil，调用时回退到 defaultOfficialQQServe，避免与 Serve 形成初始化环。
+var officialQQServe func(conn *PlatformAdapterOfficialQQ) int
+
+func defaultOfficialQQServe(conn *PlatformAdapterOfficialQQ) int {
+	return conn.Serve()
+}
+
+// officialQQInitialBackoff 是首次连接失败后的等待时间；测试可缩短。
+var officialQQInitialBackoff = 15 * time.Second
+
 func serverOfficialQQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterOfficialQQ) {
 	// Ctx 非空表示会话已经建立或正在运行，不能重复启动并覆盖端点状态。
 	if conn.isSessionRunning() {
@@ -235,7 +251,7 @@ func serverOfficialQQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterOfficialQQ
 	d.LastUpdatedTime = time.Now().Unix()
 	d.Save(false)
 	waitTimes := 0
-	backoff := 15 * time.Second
+	backoff := officialQQInitialBackoff
 
 	for {
 		if !conn.serveLoopCurrent(epoch, stop) {
@@ -244,8 +260,12 @@ func serverOfficialQQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterOfficialQQ
 			return
 		}
 		// 骰子开始连接
-		d.Logger.Infof("开始连接 official qq，帐号 <%s>(%s)，重试计数[%d]", ep.Nickname, ep.UserID, waitTimes)
-		ret := ep.Adapter.Serve()
+		d.Logger.Infof("开始连接 official qq，帐号 <%s>(%s)，重试计数[%d/%d]", ep.Nickname, ep.UserID, waitTimes, officialQQMaxConnectAttempts)
+		serve := officialQQServe
+		if serve == nil {
+			serve = defaultOfficialQQServe
+		}
+		ret := serve(conn)
 
 		if ret == 0 {
 			return
@@ -267,6 +287,16 @@ func serverOfficialQQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterOfficialQQ
 		}
 
 		waitTimes++
+		if waitTimes >= officialQQMaxConnectAttempts {
+			// 连续失败达到上限：置失败态并停止，避免端点永远停在“连接中”。
+			d.Logger.Infof("official qq 连接重试次数过多，先行中断: <%s>(%s)", ep.Nickname, ep.UserID)
+			conn.setDiceServingIfEpoch(false, epoch)
+			conn.setEndpointStateIfIdle(false, StateConnectionFailed)
+			d.LastUpdatedTime = time.Now().Unix()
+			d.Save(false)
+			return
+		}
+
 		d.Logger.Warnf("official qq 连接失败，%s 后重试: 帐号 <%s>(%s)", backoff, ep.Nickname, ep.UserID)
 		if !waitOfficialQQRetry(stop, backoff) {
 			conn.setDiceServingIfEpoch(false, epoch)

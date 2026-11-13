@@ -265,10 +265,10 @@ func SetBotOffAtGroup(ctx *MsgContext, groupID string) {
 		groupInfo.DiceIDActiveMap.Delete(ctx.EndPoint.UserID)
 		if groupInfo.DiceIDActiveMap.Len() == 0 {
 			groupInfo.SetActiveRaw(false)
-			// 群变为未激活时同时暂停日志（不结束、不上传）：静默期间的消息
-			// 不记录，.bot on 恢复后也不会被当成断层补录。
+			// 群变为未激活时同时自动 .log off（不结束、不上传）：关闭期间的
+			// 消息不记录，.bot on 自动开启后也不会被当成断层补录。
 			if groupInfo.suspendLogForBotOff() && ctx.Dice != nil && ctx.Dice.Logger != nil {
-				ctx.Dice.Logger.Infof("日志随 .bot off 暂停: 群=%s 记录=%s", groupID, groupInfo.GetLogState().Name)
+				ctx.Dice.Logger.Infof("日志随 .bot off 自动关闭: 群=%s 记录=%s", groupID, groupInfo.GetLogState().Name)
 			}
 		}
 		groupInfo.MarkDirty(ctx.Dice)
@@ -291,12 +291,12 @@ func SetBotOnAtGroup(ctx *MsgContext, groupID string) *GroupInfo {
 		wasActive := group.IsActiveRaw()
 		group.SetActiveRaw(true)
 		if !wasActive {
-			// .bot off → .bot on：恢复被自动暂停的日志，并标记下一条消息
-			// 只重建 seq 基线，静默段既不补录也不重放。
-			group.setLogResumeSkipGap()
+			// .bot off 时日志被自动 .log off；这里按 .log on 的语义自动开启，
+			// 并标记下一条消息只重建 seq 基线：关闭段既不补录也不重放。
+			// 只有本次真的自动开启日志时才置标记；普通激活不能吞掉真实缺口。
 			if group.resumeLogPausedByBotOff() {
 				if ctx.Dice != nil && ctx.Dice.Logger != nil {
-					ctx.Dice.Logger.Infof("日志随 .bot on 恢复: 群=%s 记录=%s", groupID, group.GetLogState().Name)
+					ctx.Dice.Logger.Infof("日志随 .bot on 自动开启: 群=%s 记录=%s", groupID, group.GetLogState().Name)
 				}
 				group.MarkDirty(ctx.Dice)
 			}

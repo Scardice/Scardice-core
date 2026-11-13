@@ -118,7 +118,10 @@ func TestCalibrateLogSeqBaselineUsesDBMax(t *testing.T) {
 	g.initLogSeqFromPersisted()
 
 	d := &Dice{Logger: zap.NewNop().Sugar(), DBOperator: op}
-	lastSeq, lastMsgID := calibrateLogSeqBaseline(d, g, 7, 100, "msg-100")
+	lastSeq, lastMsgID, ok := calibrateLogSeqBaseline(d, g, 7, 100, "msg-100")
+	if !ok {
+		t.Fatal("calibration with a working DB should report ok")
+	}
 	if lastSeq != 900 {
 		t.Fatalf("calibrated lastSeq = %d, want 900 (DB MAX(seq))", lastSeq)
 	}
@@ -137,9 +140,9 @@ func TestCalibrateLogSeqBaselineUsesDBMax(t *testing.T) {
 	}
 
 	// 第二条消息不能再改写已校准的结果。
-	again, _ := calibrateLogSeqBaseline(d, g, 7, lastSeq, nil)
-	if again != 900 {
-		t.Fatalf("second calibration = %d, want unchanged 900", again)
+	again, _, ok := calibrateLogSeqBaseline(d, g, 7, lastSeq, nil)
+	if !ok || again != 900 {
+		t.Fatalf("second calibration = %d, ok=%v, want unchanged 900", again, ok)
 	}
 }
 
@@ -152,9 +155,9 @@ func TestCalibrateLogSeqBaselineKeepsNewerBaseline(t *testing.T) {
 	g := &GroupInfo{GroupID: "QQ-Group:1"}
 	d := &Dice{Logger: zap.NewNop().Sugar(), DBOperator: op}
 
-	lastSeq, lastMsgID := calibrateLogSeqBaseline(d, g, 7, 5000, "msg-5000")
-	if lastSeq != 5000 || lastMsgID != "msg-5000" {
-		t.Fatalf("calibration moved baseline backwards: (%d,%v), want (5000,msg-5000)", lastSeq, lastMsgID)
+	lastSeq, lastMsgID, ok := calibrateLogSeqBaseline(d, g, 7, 5000, "msg-5000")
+	if !ok || lastSeq != 5000 || lastMsgID != "msg-5000" {
+		t.Fatalf("calibration moved baseline backwards: (%d,%v,ok=%v), want (5000,msg-5000)", lastSeq, lastMsgID, ok)
 	}
 }
 
@@ -162,11 +165,12 @@ func TestCalibrateLogSeqBaselineKeepsNewerBaseline(t *testing.T) {
 func TestCalibrateLogSeqBaselineSkipsWithoutDB(t *testing.T) {
 	g := &GroupInfo{GroupID: "QQ-Group:1"}
 	d := &Dice{Logger: zap.NewNop().Sugar()}
-	if seq, id := calibrateLogSeqBaseline(d, g, 7, 10, "m"); seq != 10 || id != "m" {
-		t.Fatalf("nil DB should not change baseline, got (%d,%v)", seq, id)
+	seq, id, ok := calibrateLogSeqBaseline(d, g, 7, 10, "m")
+	if !ok || seq != 10 || id != "m" {
+		t.Fatalf("nil DB should not change baseline, got (%d,%v,ok=%v)", seq, id, ok)
 	}
-	if !g.needLogSeqCalibration() {
-		t.Fatal("failed calibration must stay pending for the next message")
+	if g.needLogSeqCalibration() || !g.isLogSeqCalibrated() {
+		t.Fatal("no DB/log id means calibration is not applicable and must be marked done")
 	}
 }
 

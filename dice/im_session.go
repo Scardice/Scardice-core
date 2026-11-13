@@ -122,8 +122,8 @@ type GroupInfo struct {
 	DiceSideExpr    string                 `json:"diceSideExpr"    yaml:"diceSideExpr"` //
 	System          string                 `json:"system"          yaml:"system"`       // 规则系统，概念同bcdice的gamesystem，距离如dnd5e coc7
 
-	HelpPackages []string      `json:"helpPackages"   yaml:"-"`
-	CocRuleIndex int           `jsbind:"cocRuleIndex" json:"cocRuleIndex" yaml:"cocRuleIndex"`
+	HelpPackages []string `json:"helpPackages"   yaml:"-"`
+	CocRuleIndex int      `jsbind:"cocRuleIndex" json:"cocRuleIndex" yaml:"cocRuleIndex"`
 	// logStateMu 保护 LogCurID/LogCurName/LogOn/LogPausedByBotOff/LogResumeSkipGap。
 	// 必须是值类型：GroupInfo 由数据库反序列化/运行时新建得到，指针版懒初始化在
 	// “两个消息协程同时首次访问”时会各建一把锁，等于没有锁（-race 可直接复现）。
@@ -310,6 +310,18 @@ func (g *GroupInfo) needLogSeqCalibration() bool {
 		return false
 	}
 	return g.logSeqCalibrationRetryAt <= time.Now().Unix()
+}
+
+// isLogSeqCalibrated 报告本进程是否已成功校准（或确认无需校准）。
+// 未校准时不能用持久基线直接算缺口：持久基线可能停在很久以前的 .log on，
+// 会把已经落库的历史当成断层重复补录。
+func (g *GroupInfo) isLogSeqCalibrated() bool {
+	if g == nil {
+		return false
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	return g.logSeqCalibrated
 }
 
 // markLogSeqCalibrated 记录本进程已完成校准，避免每条消息都查数据库。

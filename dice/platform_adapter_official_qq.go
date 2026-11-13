@@ -850,15 +850,35 @@ func (pa *PlatformAdapterOfficialQQ) failConnect(ctx context.Context) int {
 
 // isOfficialQQConnectAuthError 识别明确的凭据/鉴权失败，避免 AppID/AppSecret
 // 错误时无限重试；网络超时、5xx、EOF 等仍交给 failConnectTransient 退避。
+//
+// botgo 的错误有三种常见形态：
+//   - token 非 200：`retrieve token http status 401, traceID ...`
+//   - token 200 业务错误：`100007.appid invalid, traceID: ...`
+//   - OpenAPI/WS：`code:401, text:..., traceID:...` / `code:4004, ...`
+//
+// 只靠 "http status 401" 会漏掉后两种，导致错填凭据时端点永远“连接中”。
 func isOfficialQQConnectAuthError(err error) bool {
 	if err == nil {
 		return false
+	}
+	// 优先用 botgo 的结构化错误码（errs.Err 有 Code() int）。
+	var coder interface{ Code() int }
+	if errors.As(err, &coder) {
+		switch coder.Code() {
+		case http.StatusUnauthorized, http.StatusForbidden,
+			4004, // WS 身份校验失败
+			4914, // 机器人已下架
+			4915: // 机器人被封禁
+			return true
+		}
 	}
 	msg := strings.ToLower(err.Error())
 	for _, needle := range []string{
 		"http status 401", "http status 403",
 		"401 unauthorized", "403 forbidden",
-		"invalid appid", "invalid app secret", "invalid appsecret",
+		"code:401,", "code:403,", "code:4004,", "code:4914,", "code:4915,",
+		"100007.", "100016.", // token 接口的 appid/secret 业务码
+		"invalid appid", "appid invalid", "invalid app secret", "invalid appsecret",
 		"authentication fail", "鉴权失败",
 	} {
 		if strings.Contains(msg, needle) {
@@ -2247,7 +2267,16 @@ func (pa *PlatformAdapterOfficialQQ) shutdownWebhookServer() {
 	}
 }
 
+// DoRelogin 请求后台重连。返回值表示“重登循环已受理”，不代表已经连接成功：
+// 真正的连接结果由端点状态（Connecting/Connected/ConnectionFailed）反映。
 func (pa *PlatformAdapterOfficialQQ) DoRelogin() bool {
+	if pa == nil || pa.EndPoint == nil {
+		return false
+	}
+	if !pa.EndPoint.Enable {
+		// 用户已禁用端点：不要因为一次重登请求把它重新拉起来。
+		return false
+	}
 	d := pa.EndPoint.Session.Parent
 	ctx := pa.currentSessionContext()
 	queue := pa.currentEventQueue()
@@ -3838,6 +3867,28 @@ func (pa *PlatformAdapterOfficialQQ) setQrCodeIfCurrent(generation uint64, qrURL
 	return true
 }
 
+// setQrStateIfCurrent 在同一把 qrMu 内校验代次并写扫码状态。
+// 只做 isCurrentQrGeneration + 单独加锁写入仍会留下 check-then-act 窗口：
+// 禁用端点推进代次后，迟到的 Connecting 状态会让 UI 永远停在“正在连接”。
+func (pa *PlatformAdapterOfficialQQ) setQrStateIfCurrent(
+	generation uint64,
+	state OfficialQQLoginState,
+	clearFields bool,
+) bool {
+	pa.qrMu.Lock()
+	defer pa.qrMu.Unlock()
+	if pa.qrGeneration != generation {
+		return false
+	}
+	pa.QrLoginState = state
+	if clearFields {
+		pa.QrURL = ""
+		pa.QrCodeData = nil
+		pa.qrSession = nil
+	}
+	return true
+}
+
 // shouldRetryAfterQrConnect 判断扫码成功后首次 connect 失败是否应转入后台重试。
 // failConnectTransient 保留 Enable=true 并把状态置为 Connecting（凭据已由扫码验证，
 // 只是网络/额度暂时不可用）；永久失败走 failConnect（Enable=false）或用户禁用
@@ -4103,9 +4154,9 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 	log := d.Logger
 
 	generation := pa.nextQrGeneration()
-	pa.qrMu.Lock()
-	pa.QrLoginState = OfficialQQLoginStateInit
-	pa.qrMu.Unlock()
+	if !pa.setQrStateIfCurrent(generation, OfficialQQLoginStateInit, false) {
+		return
+	}
 
 	// 启动扫码会话
 	taskID, key, err := qqBotCreateBindTask()
@@ -4186,12 +4237,10 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 					return
 				}
 				pa.setAppSecret(secret)
-				pa.qrMu.Lock()
-				pa.QrLoginState = OfficialQQLoginStateConnecting
-				pa.QrURL = ""
-				pa.QrCodeData = nil
-				pa.qrSession = nil
-				pa.qrMu.Unlock()
+				if !pa.setQrStateIfCurrent(generation, OfficialQQLoginStateConnecting, true) {
+					// 解密/写凭据期间用户已禁用或换了一轮扫码：不要再写回状态。
+					return
+				}
 				d.LastUpdatedTime = time.Now().Unix()
 				d.Save(false)
 				log.Infof("official qq 扫码成功，AppID=%s，开始探测凭据", pa.getAppID())
@@ -4249,9 +4298,11 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 					}
 					reloginOK := existingAdapter.DoRelogin()
 					if !reloginOK {
-						log.Errorf("official qq 替换后重连已有端点失败: UIN=%s", probe.UIN)
+						log.Errorf("official qq 替换后重连请求未被受理（端点已禁用或已有新会话）: UIN=%s", probe.UIN)
 					} else {
-						log.Infof("official qq 重复账号替换成功，已有端点已开始重连: UIN=%s", probe.UIN)
+						// DoRelogin 只保证“重连循环已受理”，连接结果看端点状态；
+						// 不能在这里宣称替换/连接成功。
+						log.Infof("official qq 重复账号替换完成，已开始重连: UIN=%s", probe.UIN)
 					}
 					pa.setAppID("")
 					pa.setAppSecret("")

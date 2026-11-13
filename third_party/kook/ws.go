@@ -264,6 +264,11 @@ func setHeartbeatTiming(ack, first, second time.Duration) {
 // 保持为 var 以便测试缩短，生产默认 15 秒。
 var gapResyncTimeout = 15 * time.Second
 
+// resumeAckTimeout 是等待 s=6 RESUME ACK 的上限。手册只说 ACK 表示缺失消息
+// 已全部下发，没有给超时；这里用 60 秒兜底：积压较多时服务端补发可能超过
+// 15 秒，不能过早重连；ACK 永久丢失时 60 秒内也能自愈。保持为 var 以便测试缩短。
+var resumeAckTimeout = 60 * time.Second
+
 const (
 	// wsMaxMessageBytes 限制单个 gateway 帧的大小。KOOK 事件本身很小，
 	// 上限用于防止异常网关/代理让进程无限分配内存。
@@ -508,6 +513,12 @@ func (s *Session) open(resetClosed bool, resume bool) (err error) {
 	// connection is expected to continue an existing session. A brand-new
 	// session accepts its restarting sequence normally.
 	s.resumePending = resume && !newSession
+	var resumeWatchGen uint64
+	watchResume := s.resumePending
+	if watchResume {
+		s.resumeWatchGen++
+		resumeWatchGen = s.resumeWatchGen
+	}
 	s.preAck = nil
 	// 首个 PONG 必须真实到达；不能用建连时间伪装成 ACK。
 	s.LastHeartbeatAck = time.Time{}
@@ -534,6 +545,9 @@ func (s *Session) open(resetClosed bool, resume bool) (err error) {
 	}
 	if startDispatcher {
 		go s.dispatchEvents(dispatcher)
+	}
+	if watchResume {
+		go s.watchResumeAck(wsConn, resumeWatchGen)
 	}
 	go s.heartbeat(wsConn, listening)
 	go s.listen(wsConn, listening)
@@ -628,7 +642,15 @@ func (s *Session) onEvent(wsConn *websocket.Conn, messageType int, message []byt
 		if !closed {
 			return
 		}
-		// s=5 是服务端要求重新建 session，必须清空旧 sn/session/gateway。
+		// s=5 是服务端要求重新建 session，必须清空旧 sn/session/gateway 和
+		// 本地消息队列。先关闭 dispatcher 立即停止消费排队事件；open 里仍会
+		// 关闭并等待旧 dispatcher（close 幂等），保证旧 handler 不会与新会话并发。
+		s.RLock()
+		dispatcher := s.dispatcher
+		s.RUnlock()
+		if dispatcher != nil {
+			dispatcher.close()
+		}
 		s.resetSessionState(true)
 		s.reconnect()
 		return
@@ -689,20 +711,27 @@ func (s *Session) onEvent(wsConn *websocket.Conn, messageType int, message []byt
 		return nil, nil
 	}
 
-	// While a resume is in flight, an event at or below the processed sn may be
-	// the new session's offline message replayed before its RESUME ACK. Keep a
-	// bounded copy instead of letting the dispatcher drop it as a duplicate.
+	// While a resume is in flight, buffer every event (sn > 0) until the
+	// RESUME ACK arrives. We do not know yet whether the session will continue
+	// or restart; executing an event before the ACK can replay it twice when
+	// the session_id changes. The buffer is bounded; overflow drops the new
+	// event and lets post-ACK gap detection request a resend.
 	if sn := e.SequenceNumber; sn > 0 {
 		s.RLock()
 		resuming := s.resumePending
-		seq := atomic.LoadInt64(s.sequence)
 		s.RUnlock()
-		if resuming && sn <= seq {
+		if resuming {
 			s.Lock()
-			if s.resumePending && sn <= atomic.LoadInt64(s.sequence) && len(s.preAck) < maxPreAckEvents {
+			if s.resumePending && len(s.preAck) < maxPreAckEvents {
 				s.preAck = append(s.preAck, &queuedEvent{conn: wsConn, epoch: epoch, event: e, data: data})
+				s.Unlock()
+				return nil, nil
 			}
+			pending := s.resumePending
 			s.Unlock()
+			if pending {
+				addCaller(s.Logger.Error()).Int64("seq", sn).Msg("pre-ack buffer full, dropping event")
+			}
 			return nil, nil
 		}
 	}
@@ -1255,9 +1284,11 @@ func (s *Session) sendResumeSignal(wsConn *websocket.Conn, sn int64) error {
 		return errors.New("resume signal connection is unavailable")
 	}
 	s.Lock()
-	// The server may replay offline messages before the RESUME ACK; keep the
-	// duplicates so a session switch can restore them.
+	// The server may replay offline messages before the RESUME ACK; buffer them
+	// so a session switch can dispatch them exactly once.
 	s.resumePending = true
+	s.resumeWatchGen++
+	resumeWatchGen := s.resumeWatchGen
 	s.preAck = nil
 	s.Unlock()
 	s.wsMutex.Lock()
@@ -1271,8 +1302,38 @@ func (s *Session) sendResumeSignal(wsConn *websocket.Conn, sn int64) error {
 		addCaller(s.Logger.Error()).Err("err", err).Int64("seq", sn).Msg("error sending resume signal")
 		return err
 	}
+	go s.watchResumeAck(wsConn, resumeWatchGen)
 	addCaller(s.Logger.Info()).Int64("seq", sn).Msg("sent resume signal to fill sn gap")
 	return nil
+}
+
+// watchResumeAck 在 s=6 ACK 久久不到达时强制重连，避免 preAck 一直缓冲、
+// 事件无法执行。gen 用于区分同一连接上的多轮 resume，旧 watcher 不会误伤
+// 新一轮等待。
+func (s *Session) watchResumeAck(wsConn *websocket.Conn, gen uint64) {
+	if wsConn == nil || wsConn.UnderlyingConn() == nil {
+		return
+	}
+	s.RLock()
+	done := s.closedCh
+	s.RUnlock()
+	timer := time.NewTimer(resumeAckTimeout)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-done:
+		return
+	}
+	s.RLock()
+	pending := s.resumePending && s.resumeWatchGen == gen && s.wsConn == wsConn
+	s.RUnlock()
+	if !pending {
+		return
+	}
+	addCaller(s.Logger.Error()).Msg("resume ack timeout, reconnecting")
+	if closed, _ := s.closeConnIf(wsConn, websocket.CloseGoingAway); closed {
+		s.reconnectAfterDisconnect()
+	}
 }
 
 // watchGap 在 sn 空洞持续存在时强制一次 resync，避免丢包导致永久等待。
@@ -1458,50 +1519,70 @@ func (s *Session) applyResumeAckSessionID(wsConn *websocket.Conn, sessionID stri
 	buffered := s.preAck
 	s.preAck = nil
 	dispatcher := s.dispatcher
+	epoch := s.sessionEpoch.Load()
 	var newEpoch uint64
+	var processedSeq int64
 	if changed {
 		atomic.StoreInt64(s.sequence, 0)
 		// 旧 session 的 handler 可能仍在执行。必须推进 epoch，否则它结束时
-		// finishEvent 会把 sequence 写回旧的高 sn，补放的事件又会被当重复丢弃
-		// （K-B 修复在这种时序下失效，表现为换 session 后仍然不回复）。
+		// finishEvent 会把 sequence 写回旧的高 sn，补放的事件又会被当重复丢弃。
 		newEpoch = s.sessionEpoch.Add(1)
+	} else {
+		processedSeq = atomic.LoadInt64(s.sequence)
 	}
 	s.Unlock()
 
-	if !changed {
+	if changed {
+		s.eventMu.Lock()
+		if s.sessionEpoch.Load() == newEpoch {
+			s.inFlight = make(map[int64]struct{})
+		}
+		s.eventMu.Unlock()
+		epoch = newEpoch
+	}
+
+	if dispatcher == nil || len(buffered) == 0 {
+		if changed {
+			addCaller(s.Logger.Warn()).
+				Str("new_session_id", sessionID).
+				Msg("resume ack changed session_id, reset sn (no pre-ack events)")
+		}
 		return
 	}
 
-	s.eventMu.Lock()
-	if s.sessionEpoch.Load() == newEpoch {
-		s.inFlight = make(map[int64]struct{})
-	}
-	s.eventMu.Unlock()
-
-	if dispatcher != nil && len(buffered) > 0 {
-		valid := make([]*queuedEvent, 0, len(buffered))
-		for _, q := range buffered {
-			if q == nil || q.event == nil || q.conn != wsConn {
-				continue
-			}
-			// 这些事件是在旧 epoch 下暂存的，按新 session 的 epoch 补放。
-			q.epoch = newEpoch
-			valid = append(valid, q)
+	valid := make([]*queuedEvent, 0, len(buffered))
+	for _, q := range buffered {
+		if q == nil || q.event == nil || q.conn != wsConn {
+			continue
 		}
-		sort.SliceStable(valid, func(i, j int) bool {
-			return valid[i].event.SequenceNumber < valid[j].event.SequenceNumber
-		})
-		for _, q := range valid {
-			if !dispatcher.push(q) {
-				addCaller(s.Logger.Error()).Int64("seq", q.event.SequenceNumber).
-					Msg("event queue is full or closed, dropping replayed pre-ack event")
-			}
+		sn := q.event.SequenceNumber
+		if !changed && sn <= processedSeq {
+			// 同一 session：这些是已处理 sn 的重复补发，丢掉。
+			continue
+		}
+		// session 变化时全部按新 epoch 重投；同一 session 时只重投
+		// resume 期间新到达的事件（sn > 已处理高水位）。
+		q.epoch = epoch
+		valid = append(valid, q)
+	}
+	sort.SliceStable(valid, func(i, j int) bool {
+		return valid[i].event.SequenceNumber < valid[j].event.SequenceNumber
+	})
+	for _, q := range valid {
+		if !dispatcher.push(q) {
+			addCaller(s.Logger.Error()).Int64("seq", q.event.SequenceNumber).
+				Msg("event queue is full or closed, dropping replayed pre-ack event")
 		}
 	}
 	if changed {
 		addCaller(s.Logger.Warn()).
 			Str("new_session_id", sessionID).
-			Msg("resume ack changed session_id, reset sn and replay pre-ack events")
+			Int("pre_ack", len(valid)).
+			Msg("resume ack changed session_id, reset sn and dispatch pre-ack events once")
+	} else if len(valid) > 0 {
+		addCaller(s.Logger.Info()).
+			Int("pre_ack", len(valid)).
+			Msg("resume ack: dispatching events received before ack")
 	}
 }
 
