@@ -712,7 +712,7 @@ func (pa *PlatformAdapterKook) abortServeAfterPanic(session *kook.Session) {
 	}
 }
 
-func (pa *PlatformAdapterKook) Serve() int {
+func (pa *PlatformAdapterKook) Serve() (ret int) {
 	log := zap.S().Named(logger.LogKeyAdapter)
 	// 本次 Serve 自己创建的 session。panic 清理必须用它，不能用 pa.getSession()：
 	// 用户快速“禁用→启用”后，旧 Serve 的 defer 会取到新会话并把它误杀。
@@ -721,6 +721,9 @@ func (pa *PlatformAdapterKook) Serve() int {
 	// 未预期的 panic 只能终止本次连接，不能让进程退出或让端点永久停在“连接中”。
 	defer func() {
 		if r := recover(); r != nil {
+			// 未命名返回值时 panic 会返回 0，调用方会当成“连接成功”
+			// （DoRelogin 返回 true、ServeKook 不写失败态）。
+			ret = 1
 			log.Errorf("KOOK 连接协程异常: %v 堆栈: %v", r, string(debug.Stack()))
 			pa.abortServeAfterPanic(serveSession)
 			pa.saveState()

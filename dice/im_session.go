@@ -124,7 +124,10 @@ type GroupInfo struct {
 
 	HelpPackages []string      `json:"helpPackages"   yaml:"-"`
 	CocRuleIndex int           `jsbind:"cocRuleIndex" json:"cocRuleIndex" yaml:"cocRuleIndex"`
-	logStateMu   *sync.RWMutex `json:"-" yaml:"-"`
+	// logStateMu 保护 LogCurID/LogCurName/LogOn/LogPausedByBotOff/LogResumeSkipGap。
+	// 必须是值类型：GroupInfo 由数据库反序列化/运行时新建得到，指针版懒初始化在
+	// “两个消息协程同时首次访问”时会各建一把锁，等于没有锁（-race 可直接复现）。
+	logStateMu sync.RWMutex `json:"-" yaml:"-"`
 	// LogCurID 是当前日志在 log_items 表里的主键。
 	// 必须持久化：重启后 config.go 要用它把 seq 基线校准到数据库 MAX(seq)，
 	// 否则基线停留在 .log on 那一刻，重启后首条消息会把已记录的整段历史误判成断层。
@@ -551,6 +554,10 @@ func (g *GroupInfo) MarshalJSON() ([]byte, error) {
 
 	g.activeMu.RLock()
 	defer g.activeMu.RUnlock()
+	// 日志状态会被消息协程与保存协程并发修改；不在锁内序列化会写出
+	// “新 logCurId + 旧 logCurName”这种撕裂状态（重启后触发误自愈/改名）。
+	g.logStateMu.RLock()
+	defer g.logStateMu.RUnlock()
 	return json.Marshal(&groupInfoJSON{
 		groupInfoAlias:   (*groupInfoAlias)(g),
 		ActivatedExtList: filteredList,
@@ -611,17 +618,9 @@ type GroupLogState struct {
 	On   bool
 }
 
-func (g *GroupInfo) ensureLogStateMu() *sync.RWMutex {
-	if g.logStateMu == nil {
-		g.logStateMu = &sync.RWMutex{}
-	}
-	return g.logStateMu
-}
-
 func (g *GroupInfo) GetLogState() GroupLogState {
-	mu := g.ensureLogStateMu()
-	mu.RLock()
-	defer mu.RUnlock()
+	g.logStateMu.RLock()
+	defer g.logStateMu.RUnlock()
 	return GroupLogState{
 		ID:   g.LogCurID,
 		Name: g.LogCurName,
@@ -630,28 +629,25 @@ func (g *GroupInfo) GetLogState() GroupLogState {
 }
 
 func (g *GroupInfo) SetLogState(logID uint64, logName string, logOn bool) {
-	mu := g.ensureLogStateMu()
-	mu.Lock()
+	g.logStateMu.Lock()
 	g.LogCurID = logID
 	g.LogCurName = logName
 	g.LogOn = logOn
-	mu.Unlock()
+	g.logStateMu.Unlock()
 }
 
 func (g *GroupInfo) SetLogOn(logOn bool) {
-	mu := g.ensureLogStateMu()
-	mu.Lock()
+	g.logStateMu.Lock()
 	g.LogOn = logOn
-	mu.Unlock()
+	g.logStateMu.Unlock()
 }
 
 func (g *GroupInfo) ClearLogState() {
-	mu := g.ensureLogStateMu()
-	mu.Lock()
+	g.logStateMu.Lock()
 	g.LogCurID = 0
 	g.LogCurName = ""
 	g.LogOn = false
-	mu.Unlock()
+	g.logStateMu.Unlock()
 }
 
 func (group *GroupInfo) IsActive(ctx *MsgContext) bool {
@@ -1121,6 +1117,10 @@ type MsgContext struct {
 	Player      *GroupPlayerInfo `jsbind:"player"` // 当前群的玩家数据
 
 	IsCompatibilityTest bool // 是否为兼容性测试环境，用于跳过不必要的数据库查询
+
+	// SuppressLogSizeNotice 供日志断层补录使用：批量写入历史消息时既不往群里发
+	// “记录条数提醒”，也跳过逐条的条数统计查询（2000 条补录会因此少 2000 次查库）。
+	SuppressLogSizeNotice bool
 
 	EndPoint        *EndPointInfo `jsbind:"endPoint"` // 对应的Endpoint
 	Session         *IMSession    // 对应的IMSession
