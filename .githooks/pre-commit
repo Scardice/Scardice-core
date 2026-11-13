@@ -1,0 +1,38 @@
+#!/usr/bin/env sh
+set -eu
+
+go_files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.go')
+if [ -z "$go_files" ]; then
+  exit 0
+fi
+
+fmt_tool=gofmt
+if command -v goimports >/dev/null 2>&1; then
+  fmt_tool=goimports
+fi
+
+unformatted=$($fmt_tool -l $go_files)
+if [ -n "$unformatted" ]; then
+  echo "pre-commit: Go files need formatting with $fmt_tool:" >&2
+  echo "$unformatted" >&2
+  exit 1
+fi
+
+if ! command -v golangci-lint >/dev/null 2>&1; then
+  echo "pre-commit: golangci-lint is required. Install it with: task install" >&2
+  exit 1
+fi
+
+lint_targets=$(echo "$go_files" | xargs -I{} dirname {} | sort -u | while IFS= read -r dir; do
+  if [ "$dir" = "." ]; then
+    echo "."
+  else
+    echo "./$dir"
+  fi
+done)
+
+patch_file="${TMPDIR:-/tmp}/golangci-lint-staged-$$.patch"
+trap 'rm -f "$patch_file"' EXIT HUP INT TERM
+git diff --cached -- '*.go' > "$patch_file"
+
+golangci-lint run --new-from-patch="$patch_file" --timeout 2m $lint_targets

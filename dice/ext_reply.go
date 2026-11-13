@@ -1,0 +1,315 @@
+package dice
+
+import (
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"runtime/debug"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+func CustomReplyConfigRead(dice *Dice, filename string) (*ReplyConfig, error) {
+	attrConfigFn := dice.GetExtConfigFilePath("reply", filename)
+	return CustomReplyConfigReadFromPath(dice, attrConfigFn, filename)
+}
+
+// CustomReplyConfigReadFromPath 从指定路径读取自定义回复配置
+func CustomReplyConfigReadFromPath(dice *Dice, filePath string, filename string) (*ReplyConfig, error) {
+	rc := &ReplyConfig{Enable: false, Filename: filename}
+
+	if _, err := os.Stat(filePath); err == nil {
+		// 如果文件存在，那么读取
+		af, err := os.ReadFile(filePath)
+		if err == nil {
+			ext := strings.ToLower(filepath.Ext(filePath))
+			switch ext {
+			case ".json", ".jsonc", ".hjson":
+				err = unmarshalJSONLike(af, rc, ext != ".json")
+			default:
+				err = yaml.Unmarshal(af, rc)
+			}
+			if err != nil {
+				dice.Logger.Error("读取自定义回复配置文件发生异常，请检查格式是否正确")
+				return nil, err
+			}
+			if normalizeReplyVMVersion(rc.VMVersion) == ReplyVMVersionV2 || hasReplyVMVersionV2Marker(af) {
+				rc.VMVersion = ReplyVMVersionV2
+			} else {
+				rc.VMVersion = ""
+			}
+		}
+	}
+
+	if rc.Items == nil {
+		rc.Items = []*ReplyItem{}
+	}
+	if rc.Conditions == nil {
+		rc.Conditions = []ReplyConditionBase{}
+	}
+
+	return rc, nil
+}
+
+func CustomReplyConfigCheckExists(dice *Dice, filename string) bool {
+	attrConfigFn := dice.GetExtConfigFilePath("reply", filename)
+	if _, err := os.Stat(attrConfigFn); err == nil {
+		return true
+	}
+	return false
+}
+
+func hasReplyVMVersionV2Marker(data []byte) bool {
+	text := strings.TrimPrefix(string(data), "\ufeff")
+	firstLine, _, _ := strings.Cut(text, "\n")
+	return strings.TrimSpace(firstLine) == ReplyVMVersionV2Marker
+}
+
+func (c *ReplyConfig) vmVersionForExecution(dice *Dice) string {
+	if normalizeReplyVMVersion(c.VMVersion) == ReplyVMVersionV2 {
+		return ReplyVMVersionV2
+	}
+	return dice.getTargetVmEngineVersion(VMVersionReply)
+}
+
+func CustomReplyConfigNew(dice *Dice, filename string) *ReplyConfig {
+	return CustomReplyConfigNewWithVMVersion(dice, filename, ReplyVMVersionV2)
+}
+
+func CustomReplyConfigNewWithVMVersion(dice *Dice, filename string, vmVersion string) *ReplyConfig {
+	for _, i := range dice.CustomReplyConfig {
+		if i.PackageID == "" && strings.EqualFold(i.Filename, filename) {
+			return nil
+		}
+	}
+
+	nowTime := time.Now().Unix()
+	rc := &ReplyConfig{
+		VMVersion:       normalizeReplyVMVersion(vmVersion),
+		Enable:          true,
+		Filename:        filename,
+		Name:            filename,
+		Items:           []*ReplyItem{},
+		UpdateTimestamp: nowTime,
+		CreateTimestamp: nowTime,
+		Author:          []string{"无名余烬"},
+		Conditions:      []ReplyConditionBase{},
+	}
+	dice.CustomReplyConfig = append(dice.CustomReplyConfig, rc)
+	rc.Save(dice)
+	return rc
+}
+
+func CustomReplyConfigDelete(dice *Dice, filename string) bool {
+	attrConfigFn := dice.GetExtConfigFilePath("reply", filename)
+	if _, err := os.Stat(attrConfigFn); err == nil {
+		err := os.Remove(attrConfigFn)
+		if err == nil {
+			var rcs []*ReplyConfig
+			for _, i := range dice.CustomReplyConfig {
+				if i.Filename != filename {
+					rcs = append(rcs, i)
+				}
+			}
+			dice.CustomReplyConfig = rcs
+		}
+		return true
+	}
+	return false
+}
+
+func ReplyReload(dice *Dice) {
+	var rcs []*ReplyConfig
+
+	// 1. 从全局 extensions/reply 目录加载
+	filenames := []string{"reply.yaml"}
+	_ = filepath.Walk(dice.GetExtDataDir("reply"), func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			dice.Logger.Warnf("扫描自定义回复目录失败: %v", err)
+			return err
+		}
+		if info == nil {
+			return nil
+		}
+		if info.IsDir() && strings.EqualFold(info.Name(), "assets") {
+			return fs.SkipDir
+		}
+		if info.IsDir() && strings.EqualFold(info.Name(), "images") {
+			return fs.SkipDir
+		}
+		if !info.IsDir() && strings.HasPrefix(info.Name(), ".reply") {
+			return nil
+		}
+		if info.Name() == "info.yaml" {
+			return nil
+		}
+
+		if !info.IsDir() {
+			ext := strings.ToLower(filepath.Ext(path))
+			if ext == ".yaml" || ext == ".yml" || ext == ".json" || ext == ".jsonc" || ext == ".hjson" || ext == "" {
+				if info.Name() != "reply.yaml" {
+					filenames = append(filenames, info.Name())
+				}
+			}
+		}
+		return nil
+	})
+
+	for _, i := range filenames {
+		rc, err := CustomReplyConfigRead(dice, i)
+		if err == nil {
+			dice.Logger.Info("读取自定义回复配置:", i)
+			rc.Save(dice)
+			rcs = append(rcs, rc)
+		} else {
+			dice.Logger.Info("读取自定义回复配置 - 失败:", i)
+			dice.Logger.Error(err)
+		}
+	}
+
+	// 2. 从已启用扩展包加载自定义回复配置
+	if dice.PackageManager != nil {
+		for _, replyFile := range dice.PackageManager.GetEnabledContentFiles("reply") {
+			ext := strings.ToLower(filepath.Ext(replyFile.Path))
+			if ext != ".yaml" && ext != ".yml" && ext != ".json" && ext != ".jsonc" && ext != ".hjson" {
+				continue
+			}
+			rc, err := CustomReplyConfigReadFromPath(dice, replyFile.Path, filepath.Base(replyFile.Path))
+			if err == nil {
+				rc.PackageID = replyFile.PackageID
+				rc.CacheBacked = true
+				dice.Logger.Infof("读取扩展包自定义回复配置: %s", replyFile.Path)
+				rcs = append(rcs, rc)
+			} else {
+				dice.Logger.Warnf("读取扩展包自定义回复配置失败: %s, %v", replyFile.Path, err)
+			}
+		}
+	}
+
+	dice.CustomReplyConfig = rcs
+}
+
+func RegisterBuiltinExtReply(dice *Dice) {
+	ReplyReload(dice)
+
+	theExt := &ExtInfo{
+		Name:       "reply", // 扩展的名称，需要用于开启和关闭指令中，写简短点
+		Version:    "1.2.0",
+		Brief:      "自定义回复模块，支持各种文本匹配和简易脚本",
+		Author:     "木落",
+		AutoActive: true, // 是否自动开启
+		Official:   true,
+		OnNotCommandReceived: func(ctx *MsgContext, msg *Message) {
+			// 当前，只有非指令才会匹配
+			rcs := ctx.Dice.CustomReplyConfig
+			if !ctx.Dice.Config.CustomReplyConfigEnable {
+				return
+			}
+			executed := false
+			log := ctx.Dice.Logger
+
+			cleanText, _ := AtParse(msg.Message, "")
+			cleanText = strings.TrimSpace(cleanText)
+			VarSetValueInt64(ctx, "$t文本长度", int64(len(cleanText)))
+
+			if dice.Config.ReplyDebugMode {
+				log.Infof("[回复调试]当前文本:“%s” hex: %x 字节形式: %v", cleanText, cleanText, []byte(cleanText))
+			}
+
+			// 在判定条件前，先设置一轮变量，以免条件中的变量出问题
+			SetTempVars(ctx, msg.Sender.Nickname)
+
+			for _, rc := range rcs {
+				if executed {
+					break
+				}
+				if !rc.Enable {
+					continue
+				}
+				vmVersion := rc.vmVersionForExecution(ctx.Dice)
+				condIndex := -1
+				defer func() {
+					if r := recover(); r != nil {
+						log.Errorf("异常: %v 堆栈: %v", r, string(debug.Stack()))
+						if condIndex != -1 {
+							ReplyToSender(ctx, msg, fmt.Sprintf(
+								"自定义回复匹配成功(序号%d)，但回复内容触发异常，请联系骰主修改:\n%s",
+								condIndex, DiceFormatTmpl(ctx, "核心:骰子执行异常")))
+						}
+					}
+				}()
+
+				{
+					commonCondOK := true
+					for _, cond := range rc.Conditions {
+						if !cond.Check(ctx, msg, nil, cleanText, vmVersion) {
+							commonCondOK = false
+							break
+						}
+					}
+					if !commonCondOK {
+						continue
+					}
+				}
+
+				checkInCoolDown := func() bool {
+					lastTime := ctx.Group.LastCustomReplyTime
+					now := float64(time.Now().UnixMilli()) / 1000
+					// 自定义回复作为内建能力，统一使用高级设置中的全局冷却时间，不再混用文件内 interval。
+					// 这是有意修改语义以换取全局一致性；若配置非法，则回退到默认冷却时间。
+					interval := ctx.Dice.AdvancedConfig.CustomReplyCooldown
+					if interval <= 0 {
+						interval = DefaultCustomReplyCooldown
+					}
+
+					if now-lastTime < interval {
+						return true // 未达到冷却，退出
+					}
+					ctx.Group.LastCustomReplyTime = now
+					return false
+				}
+
+				for index, i := range rc.Items {
+					if !i.Enable {
+						continue
+					}
+
+					checkTrue := true
+					for _, i := range i.Conditions {
+						if !i.Check(ctx, msg, nil, cleanText, vmVersion) {
+							checkTrue = false
+							break
+						}
+					}
+
+					condIndex = index
+					if len(i.Conditions) == 0 || !checkTrue {
+						continue
+					}
+
+					if checkInCoolDown() {
+						// 仍在冷却，拒绝回复
+						log.Infof("自定义回复[%s]: 条件满足，但正处于冷却", rc.Filename)
+						return
+					}
+					log.Infof("自定义回复[%s]: 条件满足", rc.Filename)
+
+					SetTempVars(ctx, msg.Sender.Nickname)
+					VarSetValueStr(ctx, "$tMsgID", fmt.Sprintf("%v", msg.RawID))
+					for _, j := range i.Results {
+						j.Execute(ctx, msg, nil, vmVersion)
+					}
+					executed = true
+					break
+				}
+			}
+		},
+		GetDescText: GetExtensionDesc,
+		CmdMap:      CmdMapCls{},
+	}
+
+	dice.RegisterExtension(theExt)
+}

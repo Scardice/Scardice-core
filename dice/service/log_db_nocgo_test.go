@@ -1,0 +1,15 @@
+//go:build !cgo
+
+package service_test
+
+import (
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
+)
+
+func openLogInfoTestDB(path string) (*gorm.DB, error) {
+	return gorm.Open(sqlite.Open(path), &gorm.Config{
+		Logger: gormlogger.Default.LogMode(gormlogger.Silent),
+	})
+}

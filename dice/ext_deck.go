@@ -1,0 +1,1804 @@
+// 抽牌模块
+// Dice牌堆参考资料 https://forum.kokona.tech/d/167-json-pai-dui-bian-xie-cong-ru-men-dao-jin-jie
+
+package dice
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"math"
+	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	hjson "github.com/hjson/hjson-go/v4"
+	"github.com/mitchellh/mapstructure"
+	wr "github.com/mroth/weightedrand/v3"
+	"github.com/pelletier/go-toml/v2"
+	"github.com/sahilm/fuzzy"
+	ds "github.com/sealdice/dicescript"
+	"github.com/tailscale/hujson"
+	"gopkg.in/yaml.v3"
+
+	"Scardice-core/utils"
+)
+
+const (
+	deckParseCacheDir        = "./data/.cache/decks"
+	deckIndexManifestPath    = "./data/.cache/decks/index_manifest.json"
+	deckIndexManifestVersion = 1
+	deckParseCacheVersion    = 2
+	deckParseSchemaVersion   = 1
+	deckParseCacheFileSuffix = ".gob.zst"
+)
+
+type deckParseCache struct {
+	Version       int      `json:"version"`
+	SchemaVersion int      `json:"schemaVersion"`
+	Size          int64    `json:"size"`
+	ModTime       int64    `json:"modTime"`
+	Hash          string   `json:"hash"`
+	DeckInfo      DeckInfo `json:"deckInfo"`
+}
+
+type deckSourceFileInfo struct {
+	Path    string `json:"path"`
+	Size    int64  `json:"size"`
+	ModTime int64  `json:"modTime"`
+	Hash    string `json:"hash"`
+}
+
+type deckIndexManifest struct {
+	Version            int                  `json:"version"`
+	ParseCacheVersion  int                  `json:"parseCacheVersion"`
+	ParseSchemaVersion int                  `json:"parseSchemaVersion"`
+	Files              []deckSourceFileInfo `json:"files"`
+}
+
+type DeckDiceEFormat struct {
+	Title      []string `json:"_title"`
+	Author     []string `json:"_author"`
+	Date       []string `json:"_date"`
+	UpdateDate []string `json:"_updateDate"`
+	Brief      []string `json:"_brief"`
+	Version    []string `json:"_version"`
+	License    []string `json:"_license"`
+	// Export  []string `json:"_export"` // 导出项，类似command
+	// Keys  []string `json:"_keys"` // 导出项，类似command
+	// 一组牌        []string `json:"一组牌"`
+
+	// 更新支持字段
+	StoreID    []string `json:"_storeID"`
+	UpdateUrls []string `json:"_updateUrls"`
+	Etag       []string `json:"_etag"`
+}
+
+type DeckSinaNyaFormat struct {
+	Name    string   `json:"name"    yaml:"name"`
+	Author  string   `json:"author"  yaml:"author"`
+	Version int      `json:"version" yaml:"version"`
+	Command string   `json:"command" yaml:"command"`
+	License string   `json:"license" yaml:"license"`
+	Desc    string   `json:"desc"    yaml:"desc"`
+	Info    []string `json:"info"    yaml:"info"`
+	Default []string `json:"default" yaml:"default"`
+	// 一组牌        []string `json:"一组牌"`
+
+	// 更新支持字段
+	StoreID    string   `json:"store_id"    yaml:"store_id"`
+	UpdateUrls []string `json:"update_urls" yaml:"update_urls"`
+	Etag       string   `json:"etag"        yaml:"etag"`
+}
+
+type SealMeta struct {
+	Title         string    `toml:"title"`
+	Author        string    `toml:"author"`
+	Authors       []string  `toml:"authors"`
+	Version       string    `toml:"version"`
+	License       string    `toml:"license"`
+	Date          time.Time `toml:"date"`
+	UpdateDate    time.Time `toml:"update_date"`
+	Desc          string    `toml:"desc"`
+	FormatVersion int64     `toml:"format_version"`
+
+	StoreID    string   `toml:"store_id"`
+	UpdateUrls []string `toml:"update_urls"`
+	Etag       string   `toml:"etag"`
+}
+
+type SealComplexSingleDeck struct {
+	Export  bool     `mapstructure:"export"  toml:"export"`
+	Visible bool     `mapstructure:"visible" toml:"visible"`
+	Aliases []string `mapstructure:"aliases" toml:"aliases"`
+	Replace bool     `mapstructure:"replace" toml:"replace"` // 是否放回
+
+	// 文本牌组项
+	Options []string `mapstructure:"options" toml:"options"`
+
+	// 云牌组项
+	CloudExtra  bool     `mapstructure:"cloud_extra"  toml:"cloud_extra"`
+	Distinct    bool     `mapstructure:"distinct"     toml:"distinct"`
+	OptionsUrls []string `mapstructure:"options_urls" toml:"options_urls"`
+}
+
+type DeckSealFormat struct {
+	Meta  SealMeta            `toml:"meta"`
+	Decks map[string][]string `toml:"decks"`
+}
+
+type CloudDeckItemInfo struct {
+	Distinct    bool
+	OptionsUrls []string
+}
+
+type DeckInfo struct {
+	Enable             bool                          `json:"enable"        yaml:"enable"`
+	ErrText            string                        `json:"errText"       yaml:"errText"`
+	Filename           string                        `json:"filename"      yaml:"filename"`
+	Format             string                        `json:"format"        yaml:"format"`        // 几种：“SinaNya” ”Dice!“ "Seal"
+	FormatVersion      int64                         `json:"formatVersion" yaml:"formatVersion"` // 格式版本，默认都是1
+	FileFormat         string                        `json:"fileFormat"    yaml:"-"`             // json / yaml / toml / jsonc / hjson
+	Name               string                        `json:"name"          yaml:"name"`
+	Version            string                        `json:"version"       yaml:"-"`
+	Author             string                        `json:"author"        yaml:"-"`
+	License            string                        `json:"license"       yaml:"-"` // 许可协议，如cc-by-nc等
+	Command            map[string]bool               `json:"command"       yaml:"-"` // 牌堆命令名
+	DeckItems          map[string][]string           `json:"-"             yaml:"-"`
+	Date               string                        `json:"date"          yaml:"-"`
+	UpdateDate         string                        `json:"updateDate"    yaml:"-"`
+	Desc               string                        `json:"desc"          yaml:"-"`
+	Info               []string                      `json:"-"             yaml:"-"`
+	RawData            *map[string][]string          `json:"-"             yaml:"-"`
+	UpdateUrls         []string                      `json:"updateUrls"    yaml:"updateUrls"`
+	Etag               string                        `json:"etag"          yaml:"etag"`
+	Cloud              bool                          `json:"cloud"         yaml:"cloud"` // 含有云端内容
+	CloudDeckItemInfos map[string]*CloudDeckItemInfo `json:"-"             yaml:"-"`
+	StoreID            string                        `json:"storeID"       yaml:"storeID"`
+	PackageID          string                        `json:"packageID"     yaml:"packageID"` // 所属扩展包ID
+}
+
+func tryParseDiceE(content []byte, deckInfo *DeckInfo, jsoncDirectly bool) error {
+	var jsonErr error
+	if !jsoncDirectly {
+		if err := parseDiceEJSON(content, deckInfo, "json"); err == nil {
+			return nil
+		} else {
+			jsonErr = err
+		}
+	}
+
+	standardJson, _, jsoncErr := standardizeJson(content)
+	if jsoncErr == nil {
+		return parseDiceEJSON(standardJson, deckInfo, "jsonc")
+	}
+
+	hjsonJSON, hjsonErr := hjsonToStandardJSON(content)
+	if hjsonErr != nil {
+		if jsonErr != nil {
+			return fmt.Errorf("json parse failed: %w; jsonc parse failed: %w; hjson parse failed: %w", jsonErr, jsoncErr, hjsonErr)
+		}
+		return fmt.Errorf("jsonc parse failed: %w; hjson parse failed: %w", jsoncErr, hjsonErr)
+	}
+	return parseDiceEJSON(hjsonJSON, deckInfo, "hjson")
+}
+
+func parseDiceEJSON(standardJson []byte, deckInfo *DeckInfo, fileFormat string) error {
+	jsonData := map[string][]string{}
+	rawJsonData := map[string]any{}
+	err := json.Unmarshal(standardJson, &rawJsonData)
+	if err != nil {
+		return err
+	}
+	for k, value := range rawJsonData {
+		if k == "$schema" {
+			continue
+		} else if k == "helpdoc" {
+			if _, ok := value.(map[string]any); ok {
+				return errors.New("该文件疑似为帮助文档，而不是牌堆文件")
+			}
+		}
+		if val, ok := value.([]any); ok {
+			v := make([]string, 0, len(val))
+			for _, elem := range val {
+				if vv, ok := elem.(string); ok {
+					v = append(v, vv)
+				}
+			}
+			jsonData[k] = v
+		}
+	}
+
+	jsonData2 := DeckDiceEFormat{}
+	err = json.Unmarshal(standardJson, &jsonData2)
+	if err != nil {
+		return err
+	}
+
+	// 存在 _export
+	exports, exportsExists := jsonData["_export"]
+	if !exportsExists {
+		exports, exportsExists = jsonData["_exports"]
+	}
+	if exportsExists {
+		for _, i := range exports {
+			deckInfo.Command[i] = true
+		}
+	}
+
+	// 存在 _keys，仅显示keys但都能抽
+	keysInfo, keysExists := jsonData["_keys"]
+	if keysExists { //nolint:nestif
+		for _, i := range keysInfo {
+			deckInfo.Command[i] = true
+		}
+
+		for k, v := range jsonData {
+			deckInfo.DeckItems[k] = v
+
+			// 不存在 _export
+			if !exportsExists {
+				if !strings.HasPrefix(k, "_") {
+					_, exists := deckInfo.Command[k]
+					if !exists {
+						deckInfo.Command[k] = false
+					}
+				}
+			}
+		}
+	} else {
+		// 不存在 _keys 默认为全部显示
+		for k, v := range jsonData {
+			deckInfo.DeckItems[k] = v
+
+			// 不存在 _export
+			if !exportsExists {
+				if !strings.HasPrefix(k, "_") {
+					deckInfo.Command[k] = true
+				}
+			}
+		}
+	}
+
+	deckInfo.Name = strings.Join(jsonData2.Title, " / ")
+	deckInfo.Author = strings.Join(jsonData2.Author, " / ")
+	deckInfo.Version = strings.Join(jsonData2.Version, " / ")
+	deckInfo.License = strings.Join(jsonData2.License, " / ")
+	deckInfo.Date = strings.Join(jsonData2.Date, " / ")
+	deckInfo.UpdateDate = strings.Join(jsonData2.UpdateDate, " / ")
+	deckInfo.Desc = strings.Join(jsonData2.Brief, "\n")
+	deckInfo.Format = "Dice!"
+	deckInfo.FormatVersion = 1
+	deckInfo.FileFormat = fileFormat
+	deckInfo.Enable = true
+	if len(jsonData2.StoreID) > 0 {
+		deckInfo.StoreID = jsonData2.StoreID[0]
+	}
+	deckInfo.UpdateUrls = jsonData2.UpdateUrls
+	if len(jsonData2.Etag) > 0 {
+		deckInfo.Etag = jsonData2.Etag[0]
+	}
+	deckInfo.RawData = &jsonData
+	return nil
+}
+
+func standardizeJson(src []byte) (converted []byte, isRFC bool, err error) {
+	jsonValue, err := hujson.Parse(src)
+	if err != nil {
+		return nil, false, err
+	}
+	isRFC = jsonValue.IsStandard()
+	if !isRFC {
+		jsonValue.Standardize()
+	}
+	return jsonValue.Pack(), isRFC, nil
+}
+
+func hjsonToStandardJSON(src []byte) ([]byte, error) {
+	var value any
+	if err := hjson.Unmarshal(src, &value); err != nil {
+		return nil, err
+	}
+	return json.Marshal(value)
+}
+
+func unmarshalJSONLike(src []byte, dst any, jsoncDirectly bool) error {
+	var jsonErr error
+	if !jsoncDirectly {
+		if err := json.Unmarshal(src, dst); err == nil {
+			return nil
+		} else {
+			jsonErr = err
+		}
+	}
+
+	standardJSON, _, jsoncErr := standardizeJson(src)
+	if jsoncErr == nil {
+		if err := json.Unmarshal(standardJSON, dst); err == nil {
+			return nil
+		} else {
+			jsoncErr = err
+		}
+	}
+
+	hjsonJSON, hjsonErr := hjsonToStandardJSON(src)
+	if hjsonErr == nil {
+		if err := json.Unmarshal(hjsonJSON, dst); err == nil {
+			return nil
+		} else {
+			hjsonErr = err
+		}
+	}
+
+	if jsonErr != nil {
+		return fmt.Errorf("json parse failed: %w; jsonc parse failed: %w; hjson parse failed: %w", jsonErr, jsoncErr, hjsonErr)
+	}
+	return fmt.Errorf("jsonc parse failed: %w; hjson parse failed: %w", jsoncErr, hjsonErr)
+}
+
+func tryParseSinaNya(content []byte, deckInfo *DeckInfo) error {
+	yamlData := map[string]interface{}{}
+	err := yaml.Unmarshal(content, &yamlData)
+	if err != nil {
+		return err
+	}
+	yamlData2 := DeckSinaNyaFormat{}
+	err = yaml.Unmarshal(content, &yamlData2)
+	if err != nil {
+		return err
+	}
+
+	yamlDataFix := map[string][]string{}
+	for k, v := range yamlData {
+		vs1, ok := v.([]interface{})
+		if ok {
+			vs2 := make([]string, len(vs1))
+			for i, v := range vs1 {
+				vs2[i], _ = v.(string)
+			}
+
+			yamlDataFix[k] = vs2
+		}
+	}
+
+	if yamlData2.Default != nil {
+		deckInfo.Command[yamlData2.Command] = true
+		deckInfo.DeckItems[yamlData2.Command] = yamlData2.Default
+		for k, v := range yamlDataFix {
+			deckInfo.DeckItems[k] = v
+		}
+	} else {
+		for k, v := range yamlDataFix {
+			deckInfo.DeckItems[k] = v
+			deckInfo.Command[k] = true
+		}
+	}
+
+	deckInfo.Name = yamlData2.Name
+	deckInfo.Author = yamlData2.Author
+	deckInfo.Version = strconv.Itoa(yamlData2.Version)
+	deckInfo.License = yamlData2.License
+	deckInfo.Desc = yamlData2.Desc
+	deckInfo.Info = yamlData2.Info
+	deckInfo.RawData = &yamlDataFix
+	deckInfo.Format = "SinaNya"
+	deckInfo.FormatVersion = 1
+	deckInfo.FileFormat = "yaml"
+	deckInfo.Enable = true
+	deckInfo.StoreID = yamlData2.StoreID
+	deckInfo.UpdateUrls = yamlData2.UpdateUrls
+	deckInfo.Etag = yamlData2.Etag
+	return nil
+}
+
+func tryParseSeal(content []byte, deckInfo *DeckInfo) error {
+	tomlData := map[string]interface{}{}
+	err := toml.Unmarshal(content, &tomlData)
+	if err != nil {
+		return err
+	}
+	deckData := DeckSealFormat{}
+	err = toml.Unmarshal(content, &deckData)
+	if err != nil {
+		return err
+	}
+
+	tomlDataFix := map[string][]string{}
+
+	// 简单牌组
+	for name, deckItems := range deckData.Decks {
+		deckInfo.DeckItems[name] = deckItems
+		tomlDataFix[name] = deckItems
+		if strings.HasPrefix(name, "__") {
+			continue
+		} else if strings.HasPrefix(name, "_") {
+			deckInfo.Command[name] = false
+		} else {
+			deckInfo.Command[name] = true
+		}
+	}
+
+	// 复杂牌组
+	for k, v := range tomlData {
+		if k == "" || k == "meta" || k == "decks" {
+			continue
+		}
+
+		item := SealComplexSingleDeck{}
+		itemData, ok := v.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		err := mapstructure.Decode(itemData, &item)
+		if err == nil {
+			deckItemName := k
+			deckInfo.DeckItems[deckItemName] = item.Options
+			tomlDataFix[deckItemName] = item.Options
+			if !item.Export {
+				continue
+			} else if !item.Visible {
+				deckInfo.Command[deckItemName] = false
+			} else {
+				deckInfo.Command[deckItemName] = true
+			}
+
+			// 别名
+			fakeData := []string{"{" + deckItemName + "}"}
+			for _, alias := range item.Aliases {
+				deckInfo.DeckItems[alias] = fakeData
+				tomlDataFix[alias] = fakeData
+				if !item.Export {
+					continue
+				} else if !item.Visible {
+					deckInfo.Command[alias] = false
+				} else {
+					deckInfo.Command[alias] = true
+				}
+			}
+
+			// 云牌组项
+			if item.CloudExtra {
+				deckInfo.Cloud = true
+				deckInfo.CloudDeckItemInfos[deckItemName] = &CloudDeckItemInfo{
+					Distinct:    item.Distinct,
+					OptionsUrls: item.OptionsUrls,
+				}
+			}
+		}
+	}
+
+	meta := deckData.Meta
+	deckInfo.Name = meta.Title
+	var author string
+	if meta.Authors != nil {
+		author = strings.Join(meta.Authors, " / ")
+	} else {
+		author = meta.Author
+	}
+	if meta.FormatVersion == 0 {
+		meta.FormatVersion = 1
+	}
+
+	deckInfo.Author = author
+	deckInfo.Version = meta.Version
+	deckInfo.License = meta.License
+	deckInfo.Date = meta.Date.Format("2006-01-02")
+	deckInfo.UpdateDate = meta.UpdateDate.Format("2006-01-02")
+	deckInfo.Desc = meta.Desc
+	deckInfo.Format = "Seal"
+	deckInfo.FormatVersion = meta.FormatVersion
+	deckInfo.FileFormat = "toml"
+	deckInfo.Enable = true
+	deckInfo.StoreID = meta.StoreID
+	deckInfo.UpdateUrls = meta.UpdateUrls
+	deckInfo.Etag = meta.Etag
+	deckInfo.RawData = &tomlDataFix
+	return nil
+}
+
+func isPrefixWithUtf8Bom(buf []byte) bool {
+	return len(buf) >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF
+}
+
+func deckParseCachePath(fn string) string {
+	sum := sha256.Sum256([]byte(filepath.ToSlash(fn)))
+	return filepath.Join(deckParseCacheDir, hex.EncodeToString(sum[:])+deckParseCacheFileSuffix)
+}
+
+func deckSourceFileHash(fn string) (string, error) {
+	f, err := os.Open(fn)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func removeDeckParseCache(fn string) {
+	_ = os.Remove(deckParseCachePath(fn))
+}
+
+func loadDeckParseCache(fn string, st fs.FileInfo) (*DeckInfo, bool) {
+	if st == nil {
+		return nil, false
+	}
+	hash, err := deckSourceFileHash(fn)
+	if err != nil {
+		return nil, false
+	}
+	cachePath := deckParseCachePath(fn)
+	var cache deckParseCache
+	if err := loadGobCacheFile(cachePath, &cache); err != nil {
+		return nil, false
+	}
+	if cache.Version != deckParseCacheVersion || cache.SchemaVersion != deckParseSchemaVersion {
+		_ = os.Remove(cachePath)
+		return nil, false
+	}
+	if cache.Hash == "" || cache.Hash != hash {
+		_ = os.Remove(cachePath)
+		return nil, false
+	}
+	return &cache.DeckInfo, true
+}
+
+func saveDeckParseCache(fn string, st fs.FileInfo, deckInfo *DeckInfo) {
+	if st == nil || deckInfo == nil || !deckInfo.Enable {
+		return
+	}
+	hash, err := deckSourceFileHash(fn)
+	if err != nil {
+		return
+	}
+	cache := &deckParseCache{
+		Version:       deckParseCacheVersion,
+		SchemaVersion: deckParseSchemaVersion,
+		Size:          st.Size(),
+		ModTime:       st.ModTime().Unix(),
+		Hash:          hash,
+		DeckInfo:      *deckInfo,
+	}
+	cachePath := deckParseCachePath(fn)
+	_ = saveGobCacheFile(cachePath, cache)
+}
+
+func DeckTryParse(d *Dice, fn string) {
+	st, statErr := os.Stat(fn)
+	if statErr != nil {
+		d.Logger.Infof("牌堆文件“%s”加载失败", fn)
+		return
+	}
+
+	deckInfo := new(DeckInfo)
+
+	if cached, ok := loadDeckParseCache(fn, st); ok {
+		*deckInfo = *cached
+	} else {
+		content, err := os.ReadFile(fn)
+		if err != nil {
+			d.Logger.Infof("牌堆文件“%s”加载失败", fn)
+			return
+		}
+		if deckInfo.DeckItems == nil {
+			deckInfo.DeckItems = map[string][]string{}
+		}
+		if deckInfo.Command == nil {
+			deckInfo.Command = map[string]bool{}
+		}
+		if deckInfo.CloudDeckItemInfos == nil {
+			deckInfo.CloudDeckItemInfos = map[string]*CloudDeckItemInfo{}
+		}
+		removeDeckParseCache(fn)
+		_ = parseDeck(d, fn, content, deckInfo)
+		saveDeckParseCache(fn, st, deckInfo)
+	}
+
+	if deckInfo.DeckItems == nil {
+		deckInfo.DeckItems = map[string][]string{}
+	}
+	if deckInfo.Command == nil {
+		deckInfo.Command = map[string]bool{}
+	}
+	if deckInfo.CloudDeckItemInfos == nil {
+		deckInfo.CloudDeckItemInfos = map[string]*CloudDeckItemInfo{}
+	}
+
+	deckInfo.Filename = fn
+
+	if deckInfo.Name == "" {
+		deckInfo.Name = filepath.Base(fn)
+	}
+
+	d.DeckList = append(d.DeckList, deckInfo)
+	if len(deckInfo.StoreID) > 0 {
+		d.StoreManager.InstalledDecks[deckInfo.StoreID] = true
+	}
+	d.MarkModified()
+}
+
+func DeckTryParseWithPackage(d *Dice, fn string, packageID string) {
+	content, err := os.ReadFile(fn)
+	if err != nil {
+		d.Logger.Infof("牌堆文件 %s 加载失败", fn)
+		return
+	}
+	deckInfo := new(DeckInfo)
+	if deckInfo.DeckItems == nil {
+		deckInfo.DeckItems = map[string][]string{}
+	}
+	if deckInfo.Command == nil {
+		deckInfo.Command = map[string]bool{}
+	}
+	if deckInfo.CloudDeckItemInfos == nil {
+		deckInfo.CloudDeckItemInfos = map[string]*CloudDeckItemInfo{}
+	}
+	_ = parseDeck(d, fn, content, deckInfo)
+	deckInfo.Filename = fn
+	deckInfo.PackageID = packageID
+
+	if deckInfo.Name == "" {
+		deckInfo.Name = filepath.Base(fn)
+	}
+
+	d.DeckList = append(d.DeckList, deckInfo)
+	d.MarkModified()
+}
+
+func parseDeck(d *Dice, fn string, content []byte, deckInfo *DeckInfo) bool {
+	if isPrefixWithUtf8Bom(content) {
+		content = content[3:]
+	}
+	ext := strings.ToLower(path.Ext(fn))
+	var err error
+
+	switch ext {
+	case ".json":
+		err = tryParseDiceE(content, deckInfo, false)
+	case ".jsonc", ".hjson":
+		err = tryParseDiceE(content, deckInfo, true)
+	case ".yaml", ".yml":
+		err = tryParseSinaNya(content, deckInfo)
+	case ".toml":
+		err = tryParseSeal(content, deckInfo)
+	default:
+		d.Logger.Infof("牌堆文件“%s”是未知格式，尝试以json和yaml格式解析", fn)
+		if tryParseDiceE(content, deckInfo, false) != nil {
+			err = tryParseSinaNya(content, deckInfo)
+		}
+	}
+
+	if err != nil {
+		d.Logger.Errorf("牌堆文件“%s”解析失败 %v", fn, err)
+		deckInfo.Enable = false
+		deckInfo.ErrText = err.Error()
+		return false
+	}
+	return true
+}
+
+// DecksDetect 检查牌堆
+func collectDeckSourceFiles(root string) []string {
+	files := make([]string, 0)
+	_ = filepath.Walk(root, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info == nil {
+			return nil
+		}
+		if info.IsDir() && strings.EqualFold(info.Name(), "assets") {
+			return fs.SkipDir
+		}
+		if info.IsDir() && strings.EqualFold(info.Name(), "images") {
+			return fs.SkipDir
+		}
+		if !info.IsDir() && strings.HasPrefix(info.Name(), ".deck") {
+			return nil
+		}
+		if info.Name() == "info.yaml" {
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		ext := filepath.Ext(path)
+		if ext == ".json" || ext == ".jsonc" || ext == ".hjson" || ext == ".yml" || ext == ".yaml" || ext == ".toml" || ext == "" {
+			files = append(files, path)
+		}
+		return nil
+	})
+	sort.Strings(files)
+	return files
+}
+
+func collectDeckSourceFileInfos(root string) ([]deckSourceFileInfo, error) {
+	files := collectDeckSourceFiles(root)
+	infos := make([]deckSourceFileInfo, 0, len(files))
+	for _, file := range files {
+		st, err := os.Stat(file)
+		if err != nil {
+			return nil, err
+		}
+		hash, err := deckSourceFileHash(file)
+		if err != nil {
+			return nil, err
+		}
+		infos = append(infos, deckSourceFileInfo{
+			Path:    filepath.ToSlash(file),
+			Size:    st.Size(),
+			ModTime: st.ModTime().Unix(),
+			Hash:    hash,
+		})
+	}
+	return infos, nil
+}
+
+func loadDeckIndexManifest() (*deckIndexManifest, error) {
+	data, err := os.ReadFile(deckIndexManifestPath)
+	if err != nil {
+		return nil, err
+	}
+	var manifest deckIndexManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil, err
+	}
+	return &manifest, nil
+}
+
+func buildDeckIndexManifest(files []deckSourceFileInfo) deckIndexManifest {
+	return deckIndexManifest{
+		Version:            deckIndexManifestVersion,
+		ParseCacheVersion:  deckParseCacheVersion,
+		ParseSchemaVersion: deckParseSchemaVersion,
+		Files:              files,
+	}
+}
+
+func canReuseDeckIndexManifest(old *deckIndexManifest, cur *deckIndexManifest) bool {
+	if old == nil || cur == nil {
+		return false
+	}
+	if old.Version != deckIndexManifestVersion {
+		return false
+	}
+	if old.ParseCacheVersion != deckParseCacheVersion {
+		return false
+	}
+	if old.ParseSchemaVersion != deckParseSchemaVersion {
+		return false
+	}
+	return true
+}
+
+func writeDeckIndexManifest(manifest deckIndexManifest) error {
+	_ = os.MkdirAll(filepath.Dir(deckIndexManifestPath), 0o755)
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		return err
+	}
+	return utils.AtomicWriteFile(deckIndexManifestPath, data, 0o644)
+}
+
+func diffDeckSourceFiles(oldFiles, curFiles []deckSourceFileInfo) (deletedPaths []string, changedPaths []string) {
+	oldMap := map[string]deckSourceFileInfo{}
+	for _, file := range oldFiles {
+		oldMap[file.Path] = file
+	}
+	curMap := map[string]deckSourceFileInfo{}
+	for _, file := range curFiles {
+		curMap[file.Path] = file
+	}
+	for path := range oldMap {
+		if _, ok := curMap[path]; !ok {
+			deletedPaths = append(deletedPaths, path)
+		}
+	}
+	for path, cur := range curMap {
+		old, exists := oldMap[path]
+		if !exists || old.Hash == "" || old.Hash != cur.Hash {
+			changedPaths = append(changedPaths, path)
+		}
+	}
+	sort.Strings(deletedPaths)
+	sort.Strings(changedPaths)
+	return deletedPaths, changedPaths
+}
+
+func cleanupStaleDeckParseCaches(files []string) {
+	entries, err := os.ReadDir(deckParseCacheDir)
+	if err != nil {
+		return
+	}
+	expected := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		expected[filepath.Base(deckParseCachePath(file))] = struct{}{}
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if _, ok := expected[entry.Name()]; ok {
+			continue
+		}
+		_ = os.Remove(filepath.Join(deckParseCacheDir, entry.Name()))
+	}
+}
+
+func DecksDetect(d *Dice) bool {
+	// 先进行zip解压
+	_ = filepath.Walk("data/decks", func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info == nil {
+			return nil
+		}
+		if info.IsDir() && strings.EqualFold(info.Name(), "assets") {
+			return fs.SkipDir
+		}
+		if info.IsDir() && strings.EqualFold(info.Name(), "images") {
+			return fs.SkipDir
+		}
+
+		if !info.IsDir() {
+			if strings.HasSuffix(info.Name(), ".deck") {
+				dest := filepath.Join(filepath.Dir(path), "_"+info.Name())
+				if _, err := os.Stat(dest); err != nil {
+					d.Logger.Info("检测到可能是新的压缩牌堆文件，准备自动解压:", info.Name())
+					if isDeckFile(path) {
+						_ = unzipSource(path, dest)
+					} else {
+						d.Logger.Info("目标并非压缩牌堆文件:", info.Name())
+					}
+				}
+			}
+		}
+
+		return nil
+	})
+
+	fileInfos, err := collectDeckSourceFileInfos("data/decks")
+	if err != nil {
+		d.Logger.Warnf("[牌堆] 扫描牌堆文件失败，改为普通加载: %v", err)
+		fileInfos = nil
+	}
+	curManifest := buildDeckIndexManifest(fileInfos)
+	oldManifest, _ := loadDeckIndexManifest()
+	reuse := err == nil && canReuseDeckIndexManifest(oldManifest, &curManifest)
+	if reuse {
+		d.Logger.Infof("[牌堆] 尝试复用索引并进行增量更新")
+	} else {
+		d.Logger.Infof("从此目录加载牌堆: %s", "data/decks")
+	}
+
+	files := make([]string, 0, len(fileInfos))
+	for _, file := range fileInfos {
+		files = append(files, file.Path)
+	}
+	if err != nil {
+		files = collectDeckSourceFiles("data/decks")
+	}
+	cleanupStaleDeckParseCaches(files)
+	deletedPaths, changedPaths := []string{}, []string{}
+	changedSet := map[string]struct{}{}
+	if reuse {
+		deletedPaths, changedPaths = diffDeckSourceFiles(oldManifest.Files, curManifest.Files)
+		for _, path := range changedPaths {
+			changedSet[path] = struct{}{}
+		}
+	}
+	totalOps := len(deletedPaths) + len(changedPaths)
+	progress := 0
+	logStep := func(action, path string) {
+		progress++
+		percent := 100.0
+		if totalOps > 0 {
+			percent = float64(progress) / float64(totalOps) * 100
+		}
+		d.Logger.Infof("[牌堆] 增量更新进度: %s %s %.2f%% (%d/%d)", action, path, percent, progress, totalOps)
+	}
+	for _, path := range deletedPaths {
+		logStep("删除", path)
+		removeDeckParseCache(path)
+	}
+	total := len(files)
+	for idx, path := range files {
+		if reuse {
+			if _, ok := changedSet[path]; ok {
+				logStep("更新", path)
+				removeDeckParseCache(path)
+			}
+		} else {
+			progress := 100.0
+			if total > 0 {
+				progress = float64(idx+1) / float64(total) * 100
+			}
+			d.Logger.Infof("牌堆加载进度: %s %.2f%% (%d/%d)", path, progress, idx+1, total)
+		}
+		DeckTryParse(d, path)
+	}
+	if err == nil {
+		if writeErr := writeDeckIndexManifest(curManifest); writeErr != nil {
+			d.Logger.Warnf("[牌堆] 写入索引清单失败: %v", writeErr)
+		}
+	}
+	if reuse {
+		d.Logger.Infof("[牌堆] 增量更新完成，变更: %v", totalOps > 0)
+		d.Logger.Infof("[牌堆] 复用现有索引完成，共计加载牌堆数量:%d 条目数量:%d", len(d.DeckList), countDeckItemEntries(d.DeckList))
+	}
+
+	if d.PackageManager != nil {
+		for _, deckFile := range d.PackageManager.GetEnabledContentFiles("decks") {
+			ext := filepath.Ext(deckFile.Path)
+			if ext == ".json" || ext == ".jsonc" || ext == ".hjson" || ext == ".yml" || ext == ".yaml" || ext == ".toml" {
+				d.Logger.Infof("正在加载扩展包 %s 的牌堆: %s", deckFile.PackageID, deckFile.Path)
+				DeckTryParseWithPackage(d, deckFile.Path, deckFile.PackageID)
+			}
+		}
+	}
+
+	return reuse
+}
+
+func countDeckItemEntries(decks []*DeckInfo) int {
+	total := 0
+	for _, deck := range decks {
+		for _, items := range deck.DeckItems {
+			total += len(items)
+		}
+	}
+	return total
+}
+
+func DeckDelete(_ *Dice, deck *DeckInfo) {
+	dirPath := filepath.Dir(deck.Filename)
+	dirName := filepath.Base(dirPath)
+
+	var topPath, topName string
+	for filepath.ToSlash(dirPath) != "data/decks" && dirPath != "." {
+		if strings.HasPrefix(dirName, "_") && strings.HasSuffix(dirName, ".deck") {
+			topPath = dirPath
+			topName = dirName
+		}
+		dirPath = filepath.Dir(dirPath)
+		dirName = filepath.Base(dirPath)
+	}
+	if topPath != "" {
+		_ = os.RemoveAll(topPath)
+		zipFilename := filepath.Join(filepath.Dir(topPath), topName[1:])
+		os.Remove(zipFilename)
+	} else {
+		_ = os.Remove(deck.Filename)
+	}
+}
+
+type DeckCommandListItem struct {
+	command string
+	deck    *DeckInfo
+	visible bool // 是否可见: 指定了_key列表的牌堆, 没有在_key中的visible=false
+}
+
+type DeckCommandListItems []*DeckCommandListItem
+
+func (e DeckCommandListItems) String(i int) string {
+	// 如果可见, 返回牌组名; 否则, 返回空字符串以避免模糊匹配命中
+	if e[i].visible {
+		return e[i].command
+	}
+	return ""
+}
+
+func (e DeckCommandListItems) Len() int {
+	return len(e)
+}
+
+func deckReloadRun(d *Dice) {
+	d.DeckList = d.DeckList[:0]
+	if d.StoreManager != nil {
+		d.StoreManager.InstalledDecks = map[string]bool{}
+	}
+	reuse := DecksDetect(d)
+	if !reuse {
+		d.Logger.Infof("加载完成，现有牌堆 %d 个", len(d.DeckList))
+	}
+
+	lst := DeckCommandListItems{}
+	for _, i := range d.DeckList {
+		for k, v := range i.Command {
+			lst = append(lst, &DeckCommandListItem{
+				command: k,
+				deck:    i,
+				visible: v,
+			})
+		}
+	}
+	d.deckCommandItemsList = lst
+	d.IsDeckLoading = false
+	d.MarkModified()
+}
+
+func DeckReload(d *Dice) {
+	if d.IsDeckLoading {
+		return
+	}
+	d.IsDeckLoading = true
+	deckReloadRun(d)
+}
+
+func DeckReloadAsync(d *Dice) {
+	if d.IsDeckLoading {
+		return
+	}
+	d.IsDeckLoading = true
+	go func() {
+		d.Logger.Info("牌堆开始异步加载")
+		deckReloadRun(d)
+		d.Logger.Info("牌堆异步加载完成")
+	}()
+}
+
+func deckDraw(ctx *MsgContext, deckName string, shufflePool bool) (bool, string, error) {
+	for _, i := range ctx.Dice.DeckList {
+		if i.Enable {
+			_, deckExists := i.Command[deckName]
+			if deckExists {
+				a, b := executeDeck(ctx, i, deckName, shufflePool)
+				return true, a, b
+			}
+		}
+	}
+	return false, "", nil
+}
+
+func RegisterBuiltinExtDeck(d *Dice) {
+	helpDraw := "" +
+		".draw help // 显示本帮助\n" +
+		".draw keys // 查看可抽取的牌组列表\n" +
+		".draw keys <牌堆> // 查看特定牌堆可抽取的牌组列表\n" +
+		".draw search <牌组名称> // 搜索相关牌组\n" +
+		".draw reload // 从硬盘重新装载牌堆，仅Master可用\n" +
+		".draw list // 查看载入的牌堆文件\n" +
+		".draw <牌组名称> // 进行抽牌"
+
+	cmdDraw := &CmdItemInfo{
+		EnableExecuteTimesParse: true,
+		Name:                    "draw",
+		ShortHelp:               helpDraw,
+		Help:                    "抽牌命令: \n" + helpDraw,
+		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
+			if d.IsDeckLoading {
+				ReplyToSender(ctx, msg, "牌堆尚未就绪，可能正在重新装载")
+				return CmdExecuteResult{Matched: true, Solved: true}
+			}
+
+			cmdArgs.ChopPrefixToArgsWith("list", "help", "reload", "search", "keys", "desc")
+			deckName := cmdArgs.GetArgN(1)
+
+			if deckName == "" {
+				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
+			}
+
+			if strings.EqualFold(deckName, "list") { //nolint:nestif
+				var textBuilder strings.Builder
+				for _, i := range ctx.Dice.DeckList {
+					if i.Enable {
+						author := fmt.Sprintf(" 作者:%s", i.Author)
+						version := fmt.Sprintf(" 版本:%s", i.Version)
+						count := 0
+						for _, vis := range i.Command {
+							if vis {
+								count++
+							}
+						}
+						fmt.Fprintf(&textBuilder, "- %s 格式: %s%s%s 牌组数量: %d\n", i.Name, i.Format, author, version, count)
+					}
+				}
+				text := textBuilder.String()
+				VarSetValueStr(ctx, "$t牌堆列表", text)
+				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "其它:抽牌_牌堆列表"))
+			} else if strings.EqualFold(deckName, "desc") {
+				// 查看详情
+				text := cmdArgs.GetArgN(2)
+				matches := fuzzy.FindFrom(text, d.deckCommandItemsList)
+				if len(matches) > 0 {
+					text := "牌堆信息:\n"
+					i := ctx.Dice.deckCommandItemsList[matches[0].Index].deck
+					author := fmt.Sprintf("作者: %s", i.Author)
+					version := fmt.Sprintf("版本: %s", i.Version)
+					var cmds []string
+					for j, vis := range i.Command {
+						if vis {
+							cmds = append(cmds, j)
+						}
+					}
+					text += fmt.Sprintf("牌堆: %s\n格式: %s\n%s\n%s\n牌组数量: %d\n", i.Name, i.Format, author, version, len(cmds))
+					if i.Date != "" {
+						time := fmt.Sprintf("时间: %s\n", i.Date)
+						text += time
+					}
+					if i.UpdateDate != "" {
+						time := fmt.Sprintf("更新时间: %s\n", i.UpdateDate)
+						text += time
+					}
+
+					text += "牌组: " + strings.Join(cmds, "/")
+					ReplyToSender(ctx, msg, text)
+				} else {
+					ReplyToSender(ctx, msg, "此关键字未找到牌堆")
+				}
+			} else if strings.EqualFold(deckName, "help") {
+				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
+			} else if strings.EqualFold(deckName, "keys") {
+				specified := cmdArgs.GetArgN(2)
+				text := "牌组关键字列表:\n"
+				var keys []string
+				for _, i := range ctx.Dice.DeckList {
+					if i.Enable {
+						if strings.Contains(i.Name, specified) {
+							for j, isShow := range i.Command {
+								if isShow {
+									keys = append(keys, j)
+								}
+							}
+						}
+					}
+				}
+				VarSetValueStr(ctx, "$t原始列表", strings.Join(keys, "/"))
+
+				keysStr := DiceFormatTmpl(ctx, "其它:抽牌_列表")
+				if keysStr == "" {
+					text += DiceFormatTmpl(ctx, "其它:抽牌_列表_没有牌组")
+				} else {
+					text += keysStr
+				}
+				ReplyToSender(ctx, msg, text)
+			} else if strings.EqualFold(deckName, "reload") {
+				if ctx.PrivilegeLevel < 100 {
+					ReplyToSender(ctx, msg, "你不具备Master权限")
+				} else {
+					if ctx.Dice.Parent.JustForTest {
+						ReplyToSender(ctx, msg, "此指令在展示模式下不可用")
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
+
+					DeckReload(d)
+					ReplyToSender(ctx, msg, "牌堆已经重新装载")
+				}
+			} else if strings.EqualFold(deckName, "search") {
+				text := cmdArgs.GetArgN(2)
+				if text != "" {
+					matches := fuzzy.FindFrom(text, d.deckCommandItemsList)
+
+					right := len(matches)
+					if right == 0 {
+						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "其它:抽牌_找不到牌组"))
+					} else {
+						if right > 10 {
+							right = 3
+						}
+						var reply strings.Builder
+						reply.WriteString("找到以下牌组:\n")
+						for _, i := range matches[:right] {
+							reply.WriteString("- ")
+							reply.WriteString(i.Str)
+							reply.WriteString("\n")
+						}
+						ReplyToSender(ctx, msg, reply.String())
+					}
+				} else {
+					ReplyToSender(ctx, msg, "请给出要搜索的关键字")
+				}
+			} else {
+				exists, result, err := deckDraw(ctx, deckName, true)
+				if err != nil {
+					result = fmt.Sprintf("<%s>", err.Error())
+				}
+				VarSetValueStr(ctx, "$t牌组", deckName)
+
+				if exists {
+					results := []string{result}
+
+					// 多抽限额为5
+					var times int
+					if t := cmdArgs.GetArgN(2); t != "" {
+						times64, _ := strconv.ParseInt(t, 10, 64)
+						times = int(times64)
+					}
+					if cmdArgs.SpecialExecuteTimes > times {
+						times = cmdArgs.SpecialExecuteTimes
+					}
+
+					// 信任骰主设置的执行次数上限
+					// if times > 5 {
+					// 	times = 5
+					// }
+					if times > int(ctx.Dice.Config.MaxExecuteTime) {
+						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰点_轮数过多警告"))
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
+
+					for i := 1; i < times; i++ {
+						_, r2, errDraw := deckDraw(ctx, deckName, true)
+						if errDraw != nil {
+							r2 = fmt.Sprintf("<%s>", errDraw.Error())
+						}
+						results = append(results, r2)
+					}
+
+					sep := DiceFormatTmpl(ctx, "其它:抽牌_分隔符")
+					result = strings.Join(results, sep)
+					prefix := DiceFormatTmpl(ctx, "其它:抽牌_结果前缀")
+					ReplyToSender(ctx, msg, prefix+result)
+				} else {
+					matches := fuzzy.FindFrom(deckName, d.deckCommandItemsList)
+					right := len(matches)
+					if right > 10 {
+						right = 4
+					}
+					if right > 0 {
+						var textBuilder strings.Builder
+						textBuilder.WriteString(DiceFormatTmpl(ctx, "其它:抽牌_找不到牌组_存在类似"))
+						textBuilder.WriteString("\n")
+						for _, i := range matches[:right] {
+							textBuilder.WriteString("- ")
+							textBuilder.WriteString(i.Str)
+							textBuilder.WriteString("\n")
+						}
+						ReplyToSender(ctx, msg, textBuilder.String())
+					} else {
+						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "其它:抽牌_找不到牌组"))
+					}
+				}
+			}
+			return CmdExecuteResult{Matched: true, Solved: true}
+		},
+	}
+
+	theExt := &ExtInfo{
+		Name:       "deck", // 扩展的名称，需要用于开启和关闭指令中，写简短点
+		Version:    "1.0.0",
+		Author:     "木落",
+		Brief:      "牌堆扩展，提供.deck指令支持，兼容Dice!和塔系牌堆",
+		Official:   true,
+		AutoActive: true, // 是否自动开启
+		OnCommandReceived: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) {
+		},
+		OnLoad: func() {
+			DeckReloadAsync(d)
+		},
+		GetDescText: GetExtensionDesc,
+		CmdMap: CmdMapCls{
+			"draw": cmdDraw,
+			"deck": cmdDraw,
+		},
+	}
+
+	d.RegisterExtension(theExt)
+}
+
+func deckStringFormat(ctx *MsgContext, deckInfo *DeckInfo, s string) (string, error) {
+	//  ***n***
+	// 规则参考: https://sinanya.com/#/MakeFile
+	// 1. 提取 {}
+	re := regexp.MustCompile(`{[$%]?.+?}`)
+	s = CompatibleReplace(ctx, s)
+	m := re.FindAllStringIndex(s, -1)
+
+	for _i := len(m) - 1; _i >= 0; _i-- {
+		i := m[_i]
+
+		var text string
+		var err error
+
+		deckName := s[i[0]:i[1]]
+
+		// 特殊变量检查
+		if deckName == "{player}" {
+			if ctx.Player != nil {
+				text = ctx.Player.Name
+			} else {
+				text = "%未知用户%"
+			}
+			s = s[:i[0]] + text + s[i[1]:]
+			continue
+		}
+		if deckName == "{self}" {
+			text = DiceFormatTmpl(ctx, "核心:骰子名字")
+			s = s[:i[0]] + text + s[i[1]:]
+			continue
+		}
+
+		sign := deckName[1]
+		signLength := 0
+		hasSign := sign == '$' || sign == '%'
+		if hasSign {
+			signLength++
+		}
+
+		deckName = deckName[1+signLength : len(deckName)-1]
+
+		deck := deckInfo.DeckItems[deckName]
+
+		if deck == nil {
+			text = "<%未知牌组-" + deckName + "%>"
+		} else {
+			useShufflePool := sign != '%'
+			if deckInfo.Format == "SinaNya" {
+				useShufflePool = !useShufflePool
+			}
+
+			text, err = executeDeck(ctx, deckInfo, deckName, useShufflePool)
+			if err != nil {
+				if err.Error() == "超出遍历次数" {
+					text = "<%抽取错误-可能死循环-" + deckName + "%>"
+					// 触发错误，回滚文本。避免出现:
+					//  draw keys能看到我 draw keys能看到我 draw keys能看到我 draw keys能看到我 <%抽取错误-超出遍历次数-导出牌组%>
+					return text, err
+				}
+				text = "<%抽取错误-" + deckName + "%>"
+			}
+		}
+
+		s = s[:i[0]] + text + s[i[1]:]
+	}
+
+	s = strings.ReplaceAll(s, "【name】", "{$t玩家}")
+	s = strings.ReplaceAll(s, "[name]", "{$t玩家}")
+
+	re = regexp.MustCompile(`\[.+?]`)
+	m = re.FindAllStringIndex(s, -1)
+
+	for _i := len(m) - 1; _i >= 0; _i-- {
+		i := m[_i]
+
+		text := s[i[0]:i[1]]
+		if strings.HasPrefix(text, "[CQ:") {
+			continue
+		}
+
+		if isResourceCode(text) {
+			continue
+		}
+
+		runeText, rest := extractExecuteContent(s[i[0]:])
+		text = "{" + runeText + "}"
+		if runeText == "" {
+			text = ""
+		}
+		s = s[:i[0]] + text + rest
+		// fmt.Println("!!!!", text, "|", rest)
+		// text = "{" + text[1:len(text)-1] + "}"
+		// s = s[:i[0]] + text + s[i[1]:]
+	}
+
+	// 在进入消息解析前，按牌堆文件位置固定 ./ 资源路径。
+	s = rewriteRelativeResourcePaths(deckInfo.Filename, s)
+
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	if ctx.Dice.getTargetVmEngineVersion(VMVersionDeck) == "v1" {
+		return DiceFormatV1(ctx, s)
+	} else {
+		return DiceFormatV2(ctx, s)
+	}
+}
+
+func executeDeck(ctx *MsgContext, deckInfo *DeckInfo, deckName string, shufflePool bool) (string, error) {
+	var key string
+	ctx.deckDepth++
+	if ctx.deckDepth > 20000 {
+		return "", errors.New("超出遍历次数")
+	}
+
+	if shufflePool {
+		var pool *ShuffleRandomPool
+		if ctx.DeckPools == nil {
+			ctx.DeckPools = map[*DeckInfo]map[string]*ShuffleRandomPool{}
+		}
+
+		if ctx.DeckPools[deckInfo] == nil {
+			ctx.DeckPools[deckInfo] = map[string]*ShuffleRandomPool{}
+		}
+
+		deckGroup := getDeckGroup(deckInfo, deckName)
+		if len(deckGroup) == 0 {
+			return "", errors.New("牌组为空，请检查格式是否正确")
+		}
+		pool = ctx.DeckPools[deckInfo][deckName]
+		if pool == nil || len(pool.data) == 0 || pool.max < 1 {
+			pool = DeckToShuffleRandomPoolWithSource(ctx.getDiceSource(), deckGroup)
+			ctx.DeckPools[deckInfo][deckName] = pool
+		}
+		if pool == nil {
+			return "", errors.New("牌组无有效条目，请检查权重配置")
+		}
+		var pickErr error
+		key, pickErr = pool.TryPickWithSource(ctx.getDiceSource())
+		if errors.Is(pickErr, errShuffleRandomPoolExhausted) {
+			pool = DeckToShuffleRandomPoolWithSource(ctx.getDiceSource(), deckGroup)
+			ctx.DeckPools[deckInfo][deckName] = pool
+			if pool == nil {
+				return "", errors.New("牌组无有效条目，请检查权重配置")
+			}
+			key, pickErr = pool.TryPickWithSource(ctx.getDiceSource())
+		}
+		if pickErr != nil {
+			return "", fmt.Errorf("牌组抽取失败: %w", pickErr)
+		}
+	} else {
+		deckGroup := getDeckGroup(deckInfo, deckName)
+		if len(deckGroup) == 0 {
+			return "", errors.New("牌组为空，请检查格式是否正确")
+		}
+		pool := DeckToRandomPool(deckGroup)
+		if pool == nil {
+			return "", errors.New("牌组为空，可能尚未加载完成")
+		}
+		key = pickChooserWithRand(pool, ctx.getChooserRand())
+	}
+	cmd, err := deckStringFormat(ctx, deckInfo, key)
+	return cmd, err
+}
+
+func getDeckGroup(deckInfo *DeckInfo, deckName string) (deckGroup []string) {
+	deckGroup = deckInfo.DeckItems[deckName]
+	if !deckInfo.Cloud {
+		return deckGroup
+	}
+
+	// 含有云端内容时，查看是否需要补充
+	cloudInfo, ok := deckInfo.CloudDeckItemInfos[deckName]
+	if !ok {
+		return deckGroup
+	}
+
+	statusCode, newData, err := GetCloudContent(cloudInfo.OptionsUrls, "")
+	if err != nil || statusCode != http.StatusOK {
+		return deckGroup
+	}
+	cloudItems := make([]string, 0)
+	err = json.Unmarshal(newData, &cloudItems)
+	if err != nil {
+		return deckGroup
+	}
+	deckGroup = append(deckGroup, cloudItems...)
+	if cloudInfo.Distinct {
+		// 内容去重
+		tempSet := map[string]bool{}
+		for _, item := range deckGroup {
+			tempSet[item] = true
+		}
+		temp := make([]string, 0, len(tempSet))
+		for item := range tempSet {
+			temp = append(temp, item)
+		}
+		deckGroup = temp
+	}
+	return deckGroup
+}
+
+func extractWeight(s string) (uint, string) {
+	weight := int64(100)
+	m := deckWeightPrefixRe.FindStringSubmatch(s)
+	if m != nil {
+		value, err := strconv.ParseFloat(m[1], 64)
+		if err == nil {
+			// 权重允许浮点，统一按四舍五入到小数点后两位后参与计算。
+			scaled := math.Round(value * 100)
+			if math.IsNaN(scaled) || math.IsInf(scaled, 0) {
+				scaled = 0
+			}
+			if scaled > float64(math.MaxInt64) {
+				scaled = float64(math.MaxInt64)
+			}
+			weight = int64(scaled)
+			if weight < 0 {
+				weight = 0
+			}
+		}
+		s = s[len(m[0]):]
+	}
+	return uint(weight), s
+}
+
+func gcdUint(a, b uint) uint {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+var deckWeightPrefixRe = regexp.MustCompile(`^::([+-]?\d+(?:\.\d+)?)::`)
+
+func buildNormalizedWeightedChoices(deck []string) []wr.Choice[string, uint] {
+	choices := make([]wr.Choice[string, uint], 0, len(deck))
+	var divisor uint
+	for _, item := range deck {
+		weight, text := extractWeight(item)
+		if weight == 0 {
+			continue
+		}
+		if divisor == 0 {
+			divisor = weight
+		} else {
+			divisor = gcdUint(divisor, weight)
+		}
+		choices = append(choices, wr.NewChoice(text, weight))
+	}
+	if len(choices) == 0 {
+		return nil
+	}
+	if divisor > 1 {
+		for i := range choices {
+			choices[i].Weight /= divisor
+		}
+	}
+	return choices
+}
+
+func DeckToRandomPool(deck []string) *wr.Chooser[string, uint] {
+	choices := buildNormalizedWeightedChoices(deck)
+	if len(choices) == 0 {
+		return nil
+	}
+	randomPool, _ := wr.NewChooser(choices...)
+	return randomPool
+}
+
+type ShuffleRandomPool struct {
+	data   []wr.Choice[string, uint]
+	totals []int
+	max    int
+}
+
+var errShuffleRandomPoolExhausted = errors.New("shuffle random pool exhausted")
+
+func NewChooser(choices ...wr.Choice[string, uint]) (*ShuffleRandomPool, error) {
+	return NewChooserWithSource(globalRandSource, choices...)
+}
+
+func NewChooserWithSource(src ds.DiceSource, choices ...wr.Choice[string, uint]) (*ShuffleRandomPool, error) {
+	shuffled := append([]wr.Choice[string, uint](nil), choices...)
+	shuffleWithSource(src, len(shuffled), func(i, j int) {
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	})
+
+	totals := make([]int, len(shuffled))
+	runningTotal := 0
+	for i, c := range shuffled {
+		weight := int(c.Weight)
+		runningTotal += weight
+		totals[i] = runningTotal
+	}
+	if runningTotal < 1 {
+		return nil, errors.New("zero Choices with Weight >= 1")
+	}
+	return &ShuffleRandomPool{data: shuffled, totals: totals, max: runningTotal}, nil
+}
+
+// Pick returns a single weighted random Choice.Item from the pool.
+func (c *ShuffleRandomPool) Pick() interface{} {
+	return c.PickWithSource(globalRandSource)
+}
+
+func (c *ShuffleRandomPool) TryPickWithSource(src ds.DiceSource) (string, error) {
+	if c == nil {
+		return "", errors.New("shuffle random pool unavailable")
+	}
+	if len(c.data) == 0 || c.max < 1 {
+		return "", errShuffleRandomPoolExhausted
+	}
+	r := randIntnFromSource(src, c.max) + 1
+	i := searchInts(c.totals, r)
+	theOne := c.data[i]
+	weight := int(theOne.Weight)
+	for j := i + 1; j < len(c.totals); j++ {
+		c.totals[j] -= weight
+	}
+	c.max -= weight
+	c.totals = append(c.totals[:i], c.totals[i+1:]...)
+	c.data = append(c.data[:i], c.data[i+1:]...)
+	return theOne.Item, nil
+}
+
+func (c *ShuffleRandomPool) PickWithSource(src ds.DiceSource) interface{} {
+	item, err := c.TryPickWithSource(src)
+	if err != nil {
+		panic(err.Error())
+	}
+	return item
+}
+
+func searchInts(a []int, x int) int {
+	// Possible further future optimization for searchInts via SIMD if we want
+	// to write some Go assembly code: http://0x80.pl/articles/simd-search.html
+	i, j := 0, len(a)
+	for i < j {
+		h := int(uint(i+j) >> 1)
+		if a[h] < x {
+			i = h + 1
+		} else {
+			j = h
+		}
+	}
+	return i
+}
+
+func DeckToShuffleRandomPool(deck []string) *ShuffleRandomPool {
+	return DeckToShuffleRandomPoolWithSource(globalRandSource, deck)
+}
+
+func DeckToShuffleRandomPoolWithSource(src ds.DiceSource, deck []string) *ShuffleRandomPool {
+	choices := make([]wr.Choice[string, uint], 0, len(deck))
+	for _, item := range deck {
+		weight, text := extractWeight(item)
+		choices = append(choices, wr.NewChoice(text, weight))
+	}
+	randomPool, _ := NewChooserWithSource(src, choices...)
+	return randomPool
+}
+
+// extractExecuteContent 抽出需要执行代码的部分，支持嵌套，返回的第一项为匹配内容。第二项为剩余文本
+func extractExecuteContent(s string) (string, string) {
+	start := strings.Index(s, "[")
+	if start == -1 {
+		return "", ""
+	}
+	end := start
+	count := 1
+	for i := start + 1; i < len(s); i++ {
+		switch s[i] {
+		case '[':
+			count++
+		case ']':
+			count--
+		}
+		if count == 0 {
+			end = i
+			break
+		}
+	}
+	if end == 0 {
+		return "", s
+	}
+	return s[start+1 : end], s[end+1:]
+}
+
+func (d *Dice) DeckCheckUpdate(deckInfo *DeckInfo) (string, string, string, error) {
+	if len(deckInfo.UpdateUrls) == 0 {
+		return "", "", "", errors.New("牌堆未提供更新链接")
+	}
+
+	statusCode, newData, err := GetCloudContent(deckInfo.UpdateUrls, deckInfo.Etag)
+	if err != nil {
+		return "", "", "", err
+	}
+	if statusCode == http.StatusNotModified {
+		return "", "", "", errors.New("牌堆没有更新")
+	}
+	if statusCode != http.StatusOK {
+		return "", "", "", errors.New("未获取到牌堆更新")
+	}
+
+	oldData, err := os.ReadFile(deckInfo.Filename)
+	if err != nil {
+		return "", "", "", err
+	}
+
+	// 内容预处理
+	if isPrefixWithUtf8Bom(oldData) {
+		oldData = oldData[3:]
+	}
+	oldDeck := strings.ReplaceAll(string(oldData), "\r\n", "\n")
+	if isPrefixWithUtf8Bom(newData) {
+		newData = newData[3:]
+	}
+	newDeck := strings.ReplaceAll(string(newData), "\r\n", "\n")
+
+	temp, err := os.CreateTemp("", "new-*-"+filepath.Base(deckInfo.Filename))
+	if err != nil {
+		return "", "", "", err
+	}
+	defer func(temp *os.File) {
+		_ = temp.Close()
+	}(temp)
+
+	_, err = temp.WriteString(newDeck)
+	if err != nil {
+		return "", "", "", err
+	}
+	return oldDeck, newDeck, temp.Name(), nil
+}
+
+func (d *Dice) DeckUpdate(deckInfo *DeckInfo, tempFileName string) error {
+	newData, err := os.ReadFile(tempFileName)
+	_ = os.Remove(tempFileName)
+	if err != nil {
+		return err
+	}
+	if len(newData) == 0 {
+		return errors.New("new data is empty")
+	}
+	// 更新牌堆
+	ok := parseDeck(d, tempFileName, newData, deckInfo)
+	if !ok {
+		d.Logger.Errorf("牌堆“%s”更新失败，无法解析获取到的牌堆数据", deckInfo.Name)
+		return errors.New("无法解析获取到的牌堆数据")
+	}
+
+	// 更新牌堆，验证文件路径在牌堆目录内以防止路径穿越
+	decksDirAbs, err := filepath.Abs("data/decks")
+	if err != nil {
+		return fmt.Errorf("获取牌堆目录绝对路径失败: %w", err)
+	}
+	filenameAbs, err := filepath.Abs(deckInfo.Filename)
+	if err != nil {
+		return fmt.Errorf("获取牌堆文件绝对路径失败: %w", err)
+	}
+	if !strings.HasPrefix(filenameAbs, decksDirAbs+string(filepath.Separator)) {
+		return fmt.Errorf("deck filename %q is outside decks directory", deckInfo.Filename)
+	}
+	err = utils.AtomicWriteFile(filenameAbs, newData, 0755)
+	if err != nil {
+		d.Logger.Errorf("牌堆“%s”更新时保存文件出错，%s", deckInfo.Name, err.Error())
+		return err
+	}
+	d.Logger.Infof("牌堆“%s”更新成功", deckInfo.Name)
+	return nil
+}
+
+func (d *Dice) DeckDownload(name string, ext string, url string, hash map[string]string) error {
+	if len(url) == 0 {
+		return errors.New("未提供下载链接")
+	}
+	statusCode, data, err := GetCloudContent([]string{url}, "")
+	if err != nil {
+		return err
+	}
+	if statusCode != http.StatusOK {
+		return errors.New("无法获取牌堆内容")
+	}
+
+	// TODO 检查 hash
+
+	// 内容预处理
+	if isPrefixWithUtf8Bom(data) {
+		data = data[3:]
+	}
+	deck := bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
+
+	// TODO 检查签名
+
+	target := filepath.Join("data/decks", name+ext)
+	_, err = os.Stat(target)
+	if !errors.Is(err, os.ErrNotExist) {
+		d.Logger.Errorf("牌堆“%s”下载时检查到同名文件", name)
+		return errors.New("存在文件名相同的牌堆")
+	}
+	err = utils.AtomicWriteFile(target, deck, 0755)
+	if err != nil {
+		d.Logger.Errorf("牌堆“%s”下载时保存文件出错，%s", name, err.Error())
+		return err
+	}
+	d.Logger.Infof("牌堆“%s”下载成功", name)
+	DeckReload(d)
+	d.MarkModified()
+	return nil
+}

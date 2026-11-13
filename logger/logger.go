@@ -1,0 +1,266 @@
+package logger
+
+import (
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"gopkg.in/natefinch/lumberjack.v2"
+)
+
+const (
+	LogKeyMain          = "main"
+	LogKeyDatabase      = "database"
+	LogKeyDatabaseQuery = "database.query"
+	LogKeyWeb           = "web"
+	LogKeyAdapter       = "adapter"
+)
+
+var DefaultSealLogger = NewGormLogger(zap.NewNop())
+
+func InitLogger(level zapcore.Level, ui *UIWriter) *zap.SugaredLogger {
+	core := newLoggerCore(level, ui, zapcore.AddSync(os.Stdout), "data")
+	logger := zap.New(core, zap.AddCaller(), zap.AddStacktrace(zap.ErrorLevel))
+
+	DefaultSealLogger = NewGormLogger(logger)
+
+	zap.ReplaceGlobals(logger)
+	return logger.Sugar()
+}
+
+func newLoggerCore(level zapcore.Level, ui *UIWriter, consoleSink zapcore.WriteSyncer, rootDir string) zapcore.Core {
+	consoleEncoder := newEncoder(true)
+	jsonEncoder := newEncoder(false)
+
+	consoleWriter := zapcore.NewCore(consoleEncoder, consoleSink, level)
+	uiWriter := zapcore.NewCore(jsonEncoder, zapcore.AddSync(ui), level)
+
+	levelConfig := map[string]zapcore.Level{
+		LogKeyMain:          level,
+		LogKeyDatabase:      zapcore.DebugLevel,
+		LogKeyDatabaseQuery: zapcore.DebugLevel,
+		LogKeyWeb:           zapcore.DebugLevel,
+		LogKeyAdapter:       level,
+	}
+
+	return zapcore.NewTee(
+		newDynamicFileCore(rootDir, consoleEncoder, levelConfig, level),
+		newVisibilityCore(consoleWriter, level),
+		newVisibilityCore(uiWriter, level),
+	)
+}
+
+func M() *zap.SugaredLogger {
+	return zap.S().Named(LogKeyMain)
+}
+
+type dynamicFileCore struct {
+	rootDir        string
+	encoder        zapcore.Encoder
+	mu             sync.RWMutex
+	writerMap      map[string]zapcore.WriteSyncer
+	closerMap      map[string]io.Closer
+	levelEnablers  map[string]zapcore.LevelEnabler
+	defaultName    string
+	defaultEnabler zapcore.LevelEnabler
+}
+
+var _ zapcore.Core = (*dynamicFileCore)(nil)
+
+func newDynamicFileCore(rootDir string, encoder zapcore.Encoder, levelConfig map[string]zapcore.Level, defaultEnabler zapcore.LevelEnabler) *dynamicFileCore {
+	enablers := make(map[string]zapcore.LevelEnabler)
+	for name, level := range levelConfig {
+		enablers[strings.ToLower(name)] = level
+	}
+	return &dynamicFileCore{
+		rootDir:        rootDir,
+		encoder:        encoder,
+		writerMap:      make(map[string]zapcore.WriteSyncer),
+		closerMap:      make(map[string]io.Closer),
+		levelEnablers:  enablers,
+		defaultName:    LogKeyMain,
+		defaultEnabler: defaultEnabler,
+	}
+}
+
+func (c *dynamicFileCore) Enabled(_ zapcore.Level) bool {
+	return true // the actual logic is in `Check` method
+}
+
+func (c *dynamicFileCore) With(_ []zapcore.Field) zapcore.Core {
+	return c // not implemented but not needed currently
+}
+
+func (c *dynamicFileCore) Check(entry zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+	loggerName := c.getLoggerName(entry)
+
+	c.mu.RLock()
+	enabler, ok := c.levelEnablers[loggerName]
+	c.mu.RUnlock()
+	if !ok {
+		enabler = c.defaultEnabler
+	}
+
+	if enabler.Enabled(entry.Level) {
+		return ce.AddCore(entry, c)
+	}
+	return nil
+}
+
+func (c *dynamicFileCore) getLoggerName(entry zapcore.Entry) string {
+	var loggerName string
+	if entry.LoggerName != "" {
+		loggerName = entry.LoggerName
+	} else {
+		loggerName = c.defaultName
+	}
+	return strings.ToLower(loggerName)
+}
+
+func (c *dynamicFileCore) Write(entry zapcore.Entry, fields []zapcore.Field) error {
+	loggerName := c.getLoggerName(entry)
+	fileLoggerName := c.getFileLoggerName(loggerName)
+
+	c.mu.RLock()
+	writer, ok := c.writerMap[fileLoggerName]
+	c.mu.RUnlock()
+
+	if !ok {
+		c.mu.Lock()
+		writer, ok = c.writerMap[fileLoggerName]
+		if !ok {
+			logFile := filepath.Join(c.rootDir, fileLoggerName+".log")
+			important := true
+			if fileLoggerName == LogKeyWeb {
+				important = false
+			}
+			logWriter := newLumberjackWriter(logFile, important)
+			writer = zapcore.AddSync(logWriter)
+			c.writerMap[fileLoggerName] = writer
+			c.closerMap[fileLoggerName] = logWriter
+		}
+		c.mu.Unlock()
+	}
+
+	buf, err := c.encoder.EncodeEntry(entry, fields)
+	if err != nil {
+		return err
+	}
+	_, err = writer.Write(buf.Bytes())
+	buf.Free()
+	return err
+}
+
+func (c *dynamicFileCore) getFileLoggerName(loggerName string) string {
+	switch loggerName {
+	case LogKeyDatabaseQuery:
+		return LogKeyDatabase
+	default:
+		return loggerName
+	}
+}
+
+func (c *dynamicFileCore) Sync() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var err error
+	for _, writer := range c.writerMap {
+		if e := writer.Sync(); e != nil {
+			err = e
+		}
+	}
+	return err
+}
+
+func (c *dynamicFileCore) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var err error
+	for name, closer := range c.closerMap {
+		if closeErr := closer.Close(); closeErr != nil {
+			err = closeErr
+		}
+		delete(c.closerMap, name)
+		delete(c.writerMap, name)
+	}
+	return err
+}
+
+func newLumberjackWriter(filepath string, important bool) io.WriteCloser {
+	if important {
+		return &lumberjack.Logger{
+			Filename:   filepath,
+			MaxSize:    10, // 每个日志文件最大 10 MB
+			MaxBackups: 3,  // 最多保留 3 个旧日志文件
+			MaxAge:     7,  // 日志文件保存 7 天
+		}
+	}
+	return &lumberjack.Logger{
+		Filename:   filepath,
+		MaxSize:    5, // 每个日志文件最大 5 MB
+		MaxBackups: 3, // 最多保留 3 个旧日志文件
+		MaxAge:     3, // 日志文件保存 3 天
+	}
+}
+
+func newEncoder(console bool) zapcore.Encoder {
+	encoderConfig := zap.NewProductionEncoderConfig()
+	encoderConfig.TimeKey = "time"
+	encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	encoderConfig.EncodeLevel = zapcore.CapitalLevelEncoder
+	encoderConfig.NameKey = "module"
+	encoderConfig.EncodeName = zapcore.FullNameEncoder
+	if console {
+		return zapcore.NewConsoleEncoder(encoderConfig)
+	}
+	return zapcore.NewJSONEncoder(encoderConfig)
+}
+
+type visibilityCore struct {
+	inner       zapcore.Core
+	globalLevel zapcore.Level
+}
+
+func newVisibilityCore(inner zapcore.Core, globalLevel zapcore.Level) zapcore.Core {
+	return &visibilityCore{
+		inner:       inner,
+		globalLevel: globalLevel,
+	}
+}
+
+func (c *visibilityCore) Enabled(level zapcore.Level) bool {
+	return c.inner.Enabled(level)
+}
+
+func (c *visibilityCore) With(fields []zapcore.Field) zapcore.Core {
+	return &visibilityCore{
+		inner:       c.inner.With(fields),
+		globalLevel: c.globalLevel,
+	}
+}
+
+func (c *visibilityCore) Check(entry zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+	if !c.shouldWrite(entry) {
+		return ce
+	}
+	return c.inner.Check(entry, ce)
+}
+
+func (c *visibilityCore) Write(entry zapcore.Entry, fields []zapcore.Field) error {
+	if !c.shouldWrite(entry) {
+		return nil
+	}
+	return c.inner.Write(entry, fields)
+}
+
+func (c *visibilityCore) Sync() error {
+	return c.inner.Sync()
+}
+
+func (c *visibilityCore) shouldWrite(entry zapcore.Entry) bool {
+	return !strings.EqualFold(entry.LoggerName, LogKeyDatabaseQuery)
+}

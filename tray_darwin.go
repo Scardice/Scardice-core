@@ -1,0 +1,140 @@
+//go:build darwin
+
+package main
+
+import (
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"syscall"
+	"time"
+
+	"github.com/fy0/systray"
+	"github.com/gen2brain/beeep"
+	"github.com/labstack/echo/v4"
+
+	"Scardice-core/dice"
+	"Scardice-core/icon"
+	"Scardice-core/logger"
+)
+
+var theDm *dice.DiceManager
+
+func trayInit(dm *dice.DiceManager) {
+	theDm = dm
+	runtime.LockOSThread()
+	systray.Run(onReady, onExit)
+}
+
+func hideWindow() {
+}
+
+func showWindow() {
+}
+
+func TestRunning() bool {
+	return false
+}
+
+func tempDirWarn() {
+	logger.M().Info("当前工作路径为临时目录，因此拒绝继续执行。")
+}
+
+func showMsgBox(title string, message string) {
+	logger.M().Info(title, message)
+}
+
+func executeWin(name string, arg ...string) *exec.Cmd {
+	cmd := exec.Command(name, arg...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+		Pgid:    os.Getppid(),
+	}
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
+	cmd.Stdin = os.Stdin
+	return cmd
+}
+
+var systrayQuited bool = false
+
+func onReady() {
+	ver := dice.VERSION_MAIN + dice.VERSION_PRERELEASE
+	systray.SetIcon(icon.Data)
+	systray.SetTitle("余烬核心")
+	systray.SetTooltip(formatTrayTooltip(theDm, ver, getTrayPort()))
+
+	mOpen := systray.AddMenuItem("打开界面", "开启WebUI")
+	mOpen.SetIcon(icon.Data)
+	mOpenExeDir := systray.AddMenuItem("打开余烬目录", "访达访问程序所在目录")
+	startTrayAccountMenu(theDm, func() {
+		_ = exec.Command(`open`, `http://localhost:`+getTrayPort()+`/#/connect`).Start()
+	})
+	mQuit := systray.AddMenuItem("退出", "退出程序")
+
+	go func() {
+		_ = beeep.Notify("Scardice", "我藏在托盘区域了，点我的小图标可以快速打开UI", "icon/icon.ico")
+	}()
+
+	for {
+		select {
+		case <-mOpen.ClickedCh:
+			_ = exec.Command(`open`, `http://localhost:`+getTrayPort()).Start()
+		case <-mOpenExeDir.ClickedCh:
+			_ = exec.Command(`open`, filepath.Dir(os.Args[0])).Start()
+		case <-mQuit.ClickedCh:
+			systrayQuited = true
+			cleanupCreate(theDm, nil)()
+			systray.Quit()
+			time.Sleep(3 * time.Second)
+			os.Exit(0)
+		}
+	}
+}
+
+func onExit() {
+	// clean up hear
+}
+
+func httpServe(e *echo.Echo, dm *dice.DiceManager, hideUI bool) {
+	log := logger.M()
+	portStr := defaultTrayPort
+	ver := dice.VERSION_MAIN + dice.VERSION_PRERELEASE
+
+	go func() {
+		for {
+			time.Sleep(5 * time.Second)
+			if systrayQuited {
+				break
+			}
+			runtime.LockOSThread()
+			systray.SetTooltip(formatTrayTooltip(dm, ver, getTrayPort()))
+			runtime.UnlockOSThread()
+		}
+	}()
+
+	rePort := regexp.MustCompile(`:(\d+)$`)
+	m := rePort.FindStringSubmatch(dm.ServeAddress)
+	if len(m) > 0 {
+		portStr = m[1]
+		setTrayPort(portStr)
+	}
+
+	ln, err := net.Listen("tcp", ":"+portStr)
+	if err != nil {
+		log.Errorf("端口已被占用，即将自动退出: %s", dm.ServeAddress)
+		runtime.Goexit()
+	}
+	_ = ln.Close()
+
+	// exec.Command(`cmd`, `/c`, `start`, fmt.Sprintf(`http://localhost:%s`, portStr)).Start()
+	log.Infof("如果浏览器没有自动打开，请手动访问:\nhttp://localhost:%s", portStr)
+	err = e.Start(dm.ServeAddress)
+	if err != nil {
+		log.Errorf("端口已被占用，即将自动退出: %s", dm.ServeAddress)
+		return
+	}
+}

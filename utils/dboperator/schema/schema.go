@@ -1,0 +1,66 @@
+package schema
+
+import (
+	"errors"
+	"fmt"
+
+	"gorm.io/gorm"
+
+	"Scardice-core/model"
+	"Scardice-core/utils/constant"
+)
+
+// EnsureDataSchema creates core data tables if missing.
+// Safe to call on every startup; GORM AutoMigrate is additive.
+func EnsureDataSchema(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("data db is nil")
+	}
+	if err := db.AutoMigrate(
+		&model.GroupPlayerInfoBase{},
+		&model.GroupInfo{},
+		&model.BanInfo{},
+		&model.EndpointInfo{},
+		&model.AttributesItemModel{},
+		&model.OfficialQQIdentityMapping{},
+	); err != nil {
+		return fmt.Errorf("ensure data schema: %w", err)
+	}
+	return nil
+}
+
+// EnsureLogSchema creates log tables if missing.
+// MySQL uses hook models to avoid full-length indexes that require prefix indexes.
+func EnsureLogSchema(db *gorm.DB, engineType string) error {
+	if db == nil {
+		return errors.New("log db is nil")
+	}
+	var (
+		logModel  any = &model.LogInfo{}
+		itemModel any = &model.LogOneItem{}
+	)
+	if engineType == constant.MYSQL {
+		logModel = &model.LogInfoHookMySQL{}
+		itemModel = &model.LogOneItemHookMySQL{}
+	}
+	if err := db.AutoMigrate(logModel, itemModel); err != nil {
+		return fmt.Errorf("ensure log schema: %w", err)
+	}
+	if db.Migrator().HasTable(itemModel) && !db.Migrator().HasColumn(itemModel, "seq") {
+		if err := db.Migrator().AddColumn(itemModel, "Seq"); err != nil {
+			return fmt.Errorf("ensure log schema seq column: %w", err)
+		}
+	}
+	return nil
+}
+
+// EnsureCensorSchema creates censor_log if missing.
+func EnsureCensorSchema(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("censor db is nil")
+	}
+	if err := db.AutoMigrate(&model.CensorLog{}); err != nil {
+		return fmt.Errorf("ensure censor schema: %w", err)
+	}
+	return nil
+}

@@ -1,0 +1,34 @@
+name: Review Dog
+
+on:
+  pull_request:
+    paths:
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+      - ".golangci.toml"
+      - ".github/workflows/reviewdog.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  review-dog:
+    name: Review Dog
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - run: go mod download
+      - run: go generate ./...
+      - name: GolangCI-Lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+          args: "--timeout 10m"

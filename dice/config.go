@@ -1,0 +1,2874 @@
+package dice
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/bytedance/sonic"
+	wr "github.com/mroth/weightedrand/v3"
+	"gopkg.in/yaml.v3"
+
+	"Scardice-core/dice/service"
+	"Scardice-core/logger"
+	"Scardice-core/model"
+	"Scardice-core/utils"
+)
+
+// type TextTemplateWithWeight = map[string]map[string]uint
+type (
+	TextTemplateItem     = []any // 实际上是 [](string | int) 类型
+	TextTemplateItemList []TextTemplateItem
+)
+
+type TextItemCompatibleInfo struct {
+	Version      string `json:"version"` // v1 v2 默认为v2(如果为空)
+	TextV2       string `json:"textV2"`
+	TextV1       string `json:"textV1"`
+	ErrV1        string `json:"errV1"`
+	ErrV2        string `json:"errV2"`
+	PresetExists bool   `json:"presetExists"` // 是否存在预设变量(即指令执行后环境的模拟)
+}
+
+type (
+	TextTemplateWithWeight     = map[string][]TextTemplateItem
+	TextTemplateWithWeightDict = map[string]TextTemplateWithWeight
+	TextTemplateCompatibleDict = SyncMap[string, *SyncMap[string, TextItemCompatibleInfo]]
+)
+
+// TextTemplateHelpItem 辅助信息，用于UI中，大部分自动生成
+type TextTemplateHelpItem = struct {
+	Filename        []string           `json:"filename"` // 文件名
+	Origin          []TextTemplateItem `json:"origin"`   // 初始文本
+	Vars            []string           `json:"vars"`     // 可用变量
+	Commands        []string           `json:"commands"` // 所属指令
+	Modified        bool               `json:"modified"` // 跟初始相比是否有修改
+	SubType         string             `json:"subType"`
+	ExtraText       string             `json:"extraText"`       // 额外解说
+	ExampleCommands []string           `json:"exampleCommands"` // 案例命令
+	NotBuiltin      bool               `json:"notBuiltin"`      // 非内置
+	TopOrder        int                `json:"topOrder"`        // 置顶序号，越高越靠前
+}
+
+type (
+	TextTemplateHelpGroup    = map[string]*TextTemplateHelpItem
+	TextTemplateWithHelpDict = map[string]TextTemplateHelpGroup
+)
+
+// const CONFIG_TEXT_TEMPLATE_FILE = "./data/configs/text-template.yaml"
+
+// ConfigItem 供插件使用的配置项
+type ConfigItem struct {
+	Key          string      `jsbind:"key"          json:"key"`
+	Type         string      `jsbind:"type"         json:"type"`
+	Group        string      `jsbind:"group"        json:"group,omitempty"`
+	DefaultValue interface{} `jsbind:"defaultValue" json:"defaultValue"`
+	Value        interface{} `jsbind:"value"        json:"value,omitempty"`
+	Option       interface{} `jsbind:"option"       json:"option,omitempty"`
+	Deprecated   bool        `jsbind:"deprecated"   json:"deprecated,omitempty"`
+
+	Description string `jsbind:"description" json:"description"`
+
+	task *JsScriptTask
+}
+
+func (i *ConfigItem) UnmarshalJSON(data []byte) error {
+	raw := map[string]json.RawMessage{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(raw["key"], &i.Key); err != nil {
+		return fmt.Errorf("ConfigItem: unmarshal 'key' failed as %w", err)
+	}
+	if err := json.Unmarshal(raw["type"], &i.Type); err != nil {
+		return fmt.Errorf("ConfigItem (%s): unmarshal 'type' failed as %w", i.Key, err)
+	}
+	if err := json.Unmarshal(raw["description"], &i.Description); err != nil {
+		return fmt.Errorf("ConfigItem (%s): unmarshal 'description' failed as %w", i.Key, err)
+	}
+	if v, ok := raw["group"]; ok {
+		if err := json.Unmarshal(v, &i.Group); err != nil {
+			return fmt.Errorf("ConfigItem (%s): unmarshal 'group' failed as %w", i.Key, err)
+		}
+	}
+	if v, ok := raw["deprecated"]; ok {
+		if err := json.Unmarshal(v, &i.Deprecated); err != nil {
+			return fmt.Errorf("ConfigItem (%s): unmarshal 'deprecated' failed as %w", i.Key, err)
+		}
+	}
+
+	switch i.Type {
+	case "string", "task:cron", "task:daily", "task:once":
+		var stringVal string
+		if err := json.Unmarshal(raw["defaultValue"], &stringVal); err != nil {
+			return fmt.Errorf("ConfigItem (%s-%s): unmarshal 'defaultValue' failed as %w", i.Key, i.Type, err)
+		}
+		i.DefaultValue = stringVal
+		if err := json.Unmarshal(raw["value"], &stringVal); err != nil {
+			return fmt.Errorf("ConfigItem (%s-%s): unmarshal 'value' failed as %w", i.Key, i.Type, err)
+		}
+		i.Value = stringVal
+	case "bool":
+		var boolVal bool
+		if err := json.Unmarshal(raw["defaultValue"], &boolVal); err != nil {
+			return fmt.Errorf("ConfigItem (%s-%s): unmarshal 'defaultValue' failed as %w", i.Key, i.Type, err)
+		}
+		i.DefaultValue = boolVal
+		if err := json.Unmarshal(raw["value"], &boolVal); err != nil {
+			return fmt.Errorf("ConfigItem (%s-%s): unmarshal 'value' failed as %w", i.Key, i.Type, err)
+		}
+		i.Value = boolVal
+	case "float":
+		var floatVal float64
+		if err := json.Unmarshal(raw["defaultValue"], &floatVal); err != nil {
+			return fmt.Errorf("ConfigItem (%s-%s): unmarshal 'defaultValue' failed as %w", i.Key, i.Type, err)
+		}
+		i.DefaultValue = floatVal
+		if err := json.Unmarshal(raw["value"], &floatVal); err != nil {
+			return fmt.Errorf("ConfigItem (%s-%s): unmarshal 'value' failed as %w", i.Key, i.Type, err)
+		}
+		i.Value = floatVal
+	case "int":
+		var intVal int64
+		if err := json.Unmarshal(raw["defaultValue"], &intVal); err != nil {
+			return fmt.Errorf("ConfigItem (%s-%s): unmarshal 'defaultValue' failed as %w", i.Key, i.Type, err)
+		}
+		i.DefaultValue = intVal
+		if err := json.Unmarshal(raw["value"], &intVal); err != nil {
+			return fmt.Errorf("ConfigItem (%s-%s): unmarshal 'value' failed as %w", i.Key, i.Type, err)
+		}
+		i.Value = intVal
+	case "template":
+		var templateVal []string
+		if err := json.Unmarshal(raw["defaultValue"], &templateVal); err != nil {
+			return fmt.Errorf("ConfigItem (%s-%s): unmarshal 'defaultValue' failed as %w", i.Key, i.Type, err)
+		}
+		i.DefaultValue = templateVal
+		if err := json.Unmarshal(raw["value"], &templateVal); err != nil {
+			return fmt.Errorf("ConfigItem (%s-%s): unmarshal 'value' failed as %w", i.Key, i.Type, err)
+		}
+		i.Value = templateVal
+	case "option":
+		var stringVal string
+		var optionVal []string
+		if err := json.Unmarshal(raw["defaultValue"], &stringVal); err != nil {
+			return fmt.Errorf("ConfigItem (%s-%s): unmarshal 'defaultValue' failed as %w", i.Key, i.Type, err)
+		}
+		i.DefaultValue = stringVal
+		if err := json.Unmarshal(raw["value"], &stringVal); err != nil {
+			return fmt.Errorf("ConfigItem (%s-%s): unmarshal 'value' failed as %w", i.Key, i.Type, err)
+		}
+		i.Value = stringVal
+		if err := json.Unmarshal(raw["option"], &optionVal); err != nil {
+			return fmt.Errorf("ConfigItem (%s-%s): unmarshal 'option' failed as %w", i.Key, i.Type, err)
+		}
+		i.Option = optionVal
+	default:
+		return errors.New("ConfigItem.UnmarshalJSON: unsupported type " + i.Type)
+	}
+	return nil
+}
+
+var _ json.Unmarshaler = (*ConfigItem)(nil)
+
+type PluginConfig struct {
+	PluginName        string                 `json:"pluginName"`
+	Configs           map[string]*ConfigItem `jsbind:"configs"           json:"configs"`
+	OrderedConfigKeys []string               `jsbind:"orderedConfigKeys" json:"orderedConfigKeys"`
+}
+
+type ConfigManager struct {
+	filename string
+	Plugins  map[string]*PluginConfig
+	lock     sync.RWMutex
+}
+
+func NewConfigManager(filename string) *ConfigManager {
+	return &ConfigManager{
+		filename: filename,
+		Plugins:  make(map[string]*PluginConfig),
+	}
+}
+
+func (cm *ConfigManager) NewConfigItem(key string, defaultValue interface{}, description string) *ConfigItem {
+	return &ConfigItem{
+		Key:          key,
+		DefaultValue: defaultValue,
+		Value:        defaultValue,
+		Description:  description,
+	}
+}
+
+func (cm *ConfigManager) RegisterPluginConfig(pluginName string, configItems ...*ConfigItem) {
+	cm.lock.Lock()
+	defer cm.lock.Unlock()
+	// var allowedTypes = map[string]bool{
+	//	"string": true,
+	//	"bool":   true,
+	//	"int":    true,
+	//	"float":  true,
+	//	"array":  true,
+	// }
+
+	// var isValidType = func(t string) bool {
+	//	return allowedTypes[t]
+	// }
+
+	// Check if the plugin already exists
+	if existingPlugin, ok := cm.Plugins[pluginName]; ok {
+		// Create a set of new keys for easy lookup
+		newKeys := make(map[string]bool)
+		for _, item := range configItems {
+			newKeys[item.Key] = true
+		}
+
+		// Update or add new config items
+		for _, newItem := range configItems {
+			// if isValidType(newItem.Type) {
+			if existingItem, itemExists := existingPlugin.Configs[newItem.Key]; itemExists {
+				typeChanged := newItem.Type != "" && existingItem.Type != newItem.Type
+				if newItem.Type != "" {
+					existingItem.Type = newItem.Type
+				}
+				if newItem.Group != "" {
+					existingItem.Group = newItem.Group
+				}
+				existingItem.DefaultValue = newItem.DefaultValue
+				existingItem.Option = newItem.Option
+				existingItem.Description = newItem.Description
+				existingItem.Deprecated = false // Reset deprecated flag
+				existingItem.task = newItem.task
+				if typeChanged {
+					existingItem.Value = newItem.DefaultValue
+				}
+				existingPlugin.Configs[newItem.Key] = existingItem
+				// Extension can reorder config by re-registering it
+				// Time complexity of removing the old position is O(1) if the order doesn't change
+				for i, configKey := range existingPlugin.OrderedConfigKeys {
+					if configKey == existingItem.Key {
+						existingPlugin.OrderedConfigKeys = append(existingPlugin.OrderedConfigKeys[:i], existingPlugin.OrderedConfigKeys[i+1:]...)
+						break
+					}
+				}
+				existingPlugin.OrderedConfigKeys = append(existingPlugin.OrderedConfigKeys, existingItem.Key)
+			} else {
+				existingPlugin.Configs[newItem.Key] = newItem
+				existingPlugin.OrderedConfigKeys = append(existingPlugin.OrderedConfigKeys, newItem.Key)
+			}
+		}
+
+		cm.Plugins[pluginName] = existingPlugin
+	} else {
+		configs := make(map[string]*ConfigItem)
+		orderedConfigKeys := make([]string, 0, len(configItems))
+		for _, item := range configItems {
+			configs[item.Key] = item
+			orderedConfigKeys = append(orderedConfigKeys, item.Key)
+		}
+		cm.Plugins[pluginName] = &PluginConfig{
+			PluginName:        pluginName,
+			Configs:           configs,
+			OrderedConfigKeys: orderedConfigKeys,
+		}
+	}
+	_ = cm.save()
+}
+
+func (cm *ConfigManager) UnregisterConfig(pluginName string, keys ...string) {
+	cm.lock.Lock()
+	defer cm.lock.Unlock()
+
+	plugin, ok := cm.Plugins[pluginName]
+	if !ok {
+		return
+	}
+
+	for _, key := range keys {
+		if config, exist := plugin.Configs[key]; exist && strings.HasPrefix(config.Type, "task:") && config.task != nil {
+			config.task.Off()
+		}
+		delete(plugin.Configs, key)
+	}
+	// Remove from orderedConfigKeys
+	newOrderedConfigKeys := make([]string, 0, len(plugin.OrderedConfigKeys))
+	for _, configKey := range plugin.OrderedConfigKeys {
+		if _, ok := plugin.Configs[configKey]; ok {
+			newOrderedConfigKeys = append(newOrderedConfigKeys, configKey)
+		}
+	}
+	plugin.OrderedConfigKeys = newOrderedConfigKeys
+	if cm.Plugins[pluginName] == nil || len(cm.Plugins[pluginName].Configs) == 0 {
+		delete(cm.Plugins, pluginName)
+	} else {
+		cm.Plugins[pluginName] = plugin
+	}
+	_ = cm.save()
+}
+
+func (cm *ConfigManager) SetConfig(pluginName, key string, value interface{}) error {
+	cm.lock.Lock()
+	defer cm.lock.Unlock()
+
+	plugin, ok := cm.Plugins[pluginName]
+	if !ok {
+		return fmt.Errorf("plugin: %v not found", pluginName)
+	}
+
+	configItem, exists := plugin.Configs[key]
+	if exists {
+		switch configItem.Type {
+		case "task:cron", "task:daily", "task:once":
+			val := value.(string)
+			if configItem.Type == "task:once" {
+				_, normalized, err := parseTaskOnceExpr(val)
+				if err != nil {
+					return err
+				}
+				val = normalized
+			}
+			configItem.Value = val
+			// 立即生效
+			if configItem.task != nil {
+				err := configItem.task.reset(val)
+				if err != nil {
+					return err
+				}
+			}
+		default:
+			configItem.Value = value
+		}
+		plugin.Configs[key] = configItem
+		cm.Plugins[pluginName] = plugin
+	}
+	return cm.save()
+}
+
+func (cm *ConfigManager) getConfig(pluginName, key string) *ConfigItem {
+	cm.lock.RLock()
+	defer cm.lock.RUnlock()
+
+	plugin, ok := cm.Plugins[pluginName]
+	if !ok {
+		return nil
+	}
+
+	configItem, exists := plugin.Configs[key]
+	if exists {
+		n := *configItem
+		return &n
+	}
+	return nil
+}
+
+func (cm *ConfigManager) ResetConfigToDefault(pluginName, key string) {
+	cm.lock.Lock()
+	defer cm.lock.Unlock()
+	log := logger.M()
+	log.Debug("try reset config to default", pluginName, key)
+	plugin, ok := cm.Plugins[pluginName]
+	if !ok {
+		log.Debug("plugin not found", pluginName)
+		return
+	}
+
+	configItem, exists := plugin.Configs[key]
+	if exists {
+		log.Debug("reset config to default", pluginName, key)
+		configItem.Value = configItem.DefaultValue
+		if strings.HasPrefix(configItem.Type, "task:") {
+			taskVal := configItem.Value.(string)
+			if configItem.Type == "task:once" {
+				_, normalized, err := parseTaskOnceExpr(taskVal)
+				if err == nil {
+					taskVal = normalized
+					configItem.Value = normalized
+				}
+			}
+			if configItem.task != nil {
+				_ = configItem.task.reset(taskVal)
+			}
+		}
+		plugin.Configs[key] = configItem
+		cm.Plugins[pluginName] = plugin
+	}
+	_ = cm.save()
+}
+
+func (cm *ConfigManager) save() error {
+	data, err := json.MarshalIndent(cm.Plugins, "", "\t")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+
+	return utils.AtomicWriteFile(cm.filename, data, 0o644)
+}
+
+func (cm *ConfigManager) Load() error {
+	cm.lock.Lock()
+	defer cm.lock.Unlock()
+	file, err := os.Open(cm.filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // File doesn't exist, maybe first run.
+		}
+		return err
+	}
+	defer func(file *os.File) {
+		_ = file.Close()
+	}(file)
+
+	decoder := json.NewDecoder(file)
+	err = decoder.Decode(&cm.Plugins)
+	if err != nil {
+		return err
+	}
+	for i := range cm.Plugins {
+		for j := range cm.Plugins[i].Configs {
+			cm.Plugins[i].Configs[j].Deprecated = true
+		}
+	}
+	return nil
+}
+
+func (i *TextTemplateItemList) toRandomPool() *wr.Chooser[string, uint] {
+	var choices []wr.Choice[string, uint]
+	for _, i := range *i {
+		// weight, text := extractWeight(i)
+		if len(i) == 1 {
+			// 一种奇怪的情况，没有第二个值，见过一例，不知道怎么触发的
+			i = append(i, 1)
+		}
+
+		if w, ok := i[1].(int); ok {
+			choices = append(choices, wr.NewChoice(i[0].(string), uint(w)))
+		}
+
+		if w, ok := i[1].(float64); ok {
+			choices = append(choices, wr.NewChoice(i[0].(string), uint(w)))
+		}
+	}
+	randomPool, _ := wr.NewChooser(choices...)
+	return randomPool
+}
+
+func (i *TextTemplateItemList) Clean() {
+	for _, i := range *i {
+		i[0] = strings.TrimSpace(i[0].(string))
+	}
+}
+
+func setupBaseTextTemplate(d *Dice) {
+	reGugu := regexp.MustCompile(`[\r\n]+`)
+	var guguReason []TextTemplateItem
+
+	for _, i := range reGugu.Split(strings.TrimSpace(guguText), -1) {
+		guguReason = append(guguReason, []interface{}{i, 1})
+	}
+
+	texts := TextTemplateWithWeightDict{
+		"COC": {
+			"设置房规_当前": {
+				{`当前房规: {$t房规}\n{$t房规文本}`, 1},
+			},
+			"判定_大失败": {
+				{"大失败！", 1},
+			},
+			"判定_失败": {
+				{"失败！", 1},
+			},
+			"判定_成功_普通": {
+				{"成功", 1},
+			},
+			"判定_成功_困难": {
+				{"困难成功", 1},
+			},
+			"判定_成功_极难": {
+				{"极难成功", 1},
+			},
+			"判定_大成功": {
+				{"运气不错，大成功！", 1},
+				{"大成功!", 1},
+			},
+
+			"判定_必须_困难_成功": {
+				{"成功了！这要费点力气{$t附加判定结果}", 1},
+			},
+			"判定_必须_困难_失败": {
+				{"失败！还是有点难吧？{$t附加判定结果}", 1},
+			},
+			"判定_必须_极难_成功": {
+				{"居然成功了！运气不错啊！{$t附加判定结果}", 1},
+			},
+			"判定_必须_极难_失败": {
+				{"失败了，不要太勉强自己{$t附加判定结果}", 1},
+			},
+			"判定_必须_大成功_成功": {
+				{"大成功！越过无数失败的命运，你握住了唯一的胜机！", 1},
+				{"大成功！这一定是命运石之门的选择！", 1},
+			},
+			"判定_必须_大成功_失败": {
+				{"失败了，不出所料{$t附加判定结果}", 1},
+			},
+
+			"判定_简短_大失败": {
+				{"大失败", 1},
+			},
+			"判定_简短_失败": {
+				{"失败", 1},
+			},
+			"判定_简短_成功_普通": {
+				{"成功", 1},
+			},
+			"判定_简短_成功_困难": {
+				{"困难成功", 1},
+			},
+			"判定_简短_成功_极难": {
+				{"极难成功", 1},
+			},
+			"判定_简短_大成功": {
+				{"大成功", 1},
+			},
+
+			"检定_单项结果文本": {
+				{`{$t检定表达式文本}={$t骰子出目}/{$t判定值}{$t检定计算过程} {$t判定结果}`, 1},
+			},
+			"检定": {
+				{`{$t原因 ? '由于' + $t原因 + '，'}{$t玩家}的"{$t属性表达式文本}"检定结果为: {$t结果文本}`, 1},
+			},
+			"检定_多轮": {
+				{`对{$t玩家}的"{$t属性表达式文本}"进行了{$t次数}次检定，结果为:\n{$t结果文本}`, 1},
+			},
+			"检定_轮数过多警告": {
+				{`你真的需要这么多轮检定？{核心:骰子名字}将对你提高警惕！`, 1},
+				{`不支持连续检定{$t次数}次，{核心:骰子名字}觉得这太多了。`, 1},
+			},
+
+			"检定_暗中_私聊_前缀": {
+				{`来自群<{$t群名}>({$t群号})的暗中检定:\n`, 1},
+			},
+			"检定_暗中_群内": {
+				{"{$t玩家}悄悄进行了一项{$t属性表达式文本}检定", 1},
+			},
+			"检定_格式错误": {
+				{`检定命令格式错误`, 1},
+			},
+
+			// -------------------- sc --------------------------
+			"提示_永久疯狂": {
+				{`提示：理智归零，已永久疯狂(可用.ti或.li抽取症状)`, 1},
+			},
+			"提示_临时疯狂": {
+				{`提示：单次损失理智超过5点，若智力检定(.ra 智力)通过，将进入临时性疯狂(可用.ti或.li抽取症状)`, 1},
+			},
+
+			"理智检定_单项结果文本": {
+				{`{$t检定表达式文本}={$t骰子出目}/{$t判定值}{$t检定计算过程} {$t判定结果}`, 1},
+			},
+			"理智检定": {
+				{"{$t玩家}的理智检定:\n{$t结果文本}\n理智变化: {$t旧值} ➯ {$t新值} (扣除{$t表达式文本}={$t表达式原始值}{ $t表达式原始值 != $t表达式调整值 ? `➯{$t表达式调整值}` : '' }点){$t附加语}\n{$t提示_角色疯狂}", 1},
+			},
+
+			"理智检定_附加语_成功": {
+				{"", 1},
+			},
+			"理智检定_附加语_失败": {
+				{"", 1},
+			},
+			"理智检定_附加语_大成功": {
+				{`\n不错的结果，可惜毫无意义`, 1},
+			},
+			"理智检定_附加语_大失败": {
+				{`\n你很快就能洞悉一切`, 1},
+				{`\n精彩的演出，希望主演不要太快谢幕`, 1},
+			},
+			"理智检定_格式错误": {
+				{`理智检定命令格式错误`, 1},
+			},
+			// -------------------- sc end --------------------------
+
+			// -------------------- st --------------------------
+			"属性设置_删除": {
+				{`{$t玩家}的如下属性被成功删除:{$t属性列表}，失败{$t失败数量}项`, 1},
+			},
+			"属性设置_清除": {
+				{`{$t玩家}的属性数据已经清除，共计{$t数量}条`, 1},
+			},
+			"属性设置_增减_单项": {
+				{"{$t属性}: {$t旧值} ➯ {$t新值} ({$t增加或扣除}{$t表达式文本}={$t变化量})", 1},
+			},
+			"属性设置_增减": {
+				{"{$t玩家}的属性变化:\n{$t变更列表}\n{COC:属性设置_保存提醒}", 1},
+			},
+			"属性设置_增减_错误的值": {
+				{`"{$t玩家}: 错误的增减值: {$t表达式文本}"`, 1},
+			},
+			"属性设置_列出": {
+				{"{$t玩家}的个人属性为:\n{$t属性信息}", 1},
+			},
+			"属性设置_列出_未发现记录": {
+				{`未发现属性记录`, 1},
+			},
+			"属性设置_列出_隐藏提示": {
+				{`\n注：{$t数量}条属性因<{$t判定值}被隐藏`, 1},
+			},
+			"属性设置": {
+				{`{$t玩家}的{$t规则模板}属性录入完成，本次录入了{$t有效数量}条数据`, 1},
+			},
+			"属性设置_保存提醒": {
+				{`{ $t当前绑定角色 ? '[√] 已绑卡' : '' }`, 1},
+			},
+			// -------------------- st end --------------------------
+
+			// -------------------- en --------------------------
+			"技能成长_导入语": {
+				{"{$t玩家}的“{$t技能}”成长检定：", 1},
+			},
+			"技能成长_错误的属性类型": {
+				{"{COC:技能成长_导入语}\n{COC:技能成长_错误的属性类型_无前缀}", 1},
+			},
+			"技能成长_错误的属性类型_无前缀": {
+				{"该属性不能成长", 1},
+			},
+			"技能成长_错误的失败成长值": {
+				{"{COC:技能成长_导入语}\n{COC:技能成长_错误的失败成长值_无前缀}", 1},
+			},
+			"技能成长_错误的失败成长值_无前缀": {
+				{"错误的失败成长值: {$t表达式文本}", 1},
+			},
+			"技能成长_错误的成功成长值": {
+				{"{COC:技能成长_导入语}\n{COC:技能成长_错误的成功成长值_无前缀}", 1},
+			},
+			"技能成长_错误的成功成长值_无前缀": {
+				{"错误的成功成长值: {$t表达式文本}", 1},
+			},
+			"技能成长_属性未录入": {
+				{"{COC:技能成长_导入语}\n{COC:技能成长_属性未录入_无前缀}", 1},
+			},
+			"技能成长_属性未录入_无前缀": {
+				{"你没有使用st录入这个属性，或在en指令中指定属性的值", 1},
+			},
+			"技能成长_结果_成功": {
+				{"{COC:技能成长_结果_成功_无后缀}\n{COC:属性设置_保存提醒}", 1},
+			},
+			"技能成长_结果_成功_无后缀": {
+				{"“{$t技能}”增加了{$t表达式文本}={$t增量}点，当前为{$t新值}点", 1},
+			},
+			"技能成长_结果_失败": {
+				{"“{$t技能}”成长失败了！", 1},
+			},
+			"技能成长_结果_失败变更": {
+				{"{COC:技能成长_结果_失败变更_无后缀}\n{COC:属性设置_保存提醒}", 1},
+			},
+			"技能成长_结果_失败变更_无后缀": {
+				{"“{$t技能}”变化{$t表达式文本}={$t增量}点，当前为{$t新值}点", 1},
+			},
+			"技能成长": {
+				{"{COC:技能成长_导入语}\nD100={$t骰子出目}/{$t判定值} {$t判定结果}\n{$t结果文本}", 1},
+			},
+			"技能成长_批量_分隔符": {
+				{`\n\n`, 1},
+			},
+			"技能成长_批量_导入语": {
+				{"{$t玩家}的{$t数量}项技能的批量成长检定：", 1},
+			},
+			"技能成长_批量_单条": {
+				{"“{$t技能}”：D100={$t骰子出目}/{$t判定值} {$t判定结果}\n{$t结果文本}", 1},
+			},
+			"技能成长_批量_单条错误前缀": {
+				{"“{$t技能}”：", 1},
+			},
+			"技能成长_批量": {
+				{"{COC:技能成长_批量_导入语}\n{$t总结果文本}\n{COC:属性设置_保存提醒}", 1},
+			},
+			"技能成长_批量_技能过多警告": {
+				{`试图成长{$t数量}项技能，但{核心:骰子名字}没有这么多骰子。`, 1},
+			},
+			// -------------------- en end --------------------------
+			"制卡": {
+				{"{$t玩家}的七版COC人物作成:\n{$t制卡结果文本}", 1},
+			},
+			"制卡_分隔符": {
+				{"#{SPLIT}", 1},
+			},
+			"对抗检定": {
+				{`对抗检定:
+{$t玩家A} {$t玩家A判定式}-> 属性值:{$t玩家A属性} 判定值:{$t玩家A出目}{$t玩家A判定过程} {$t玩家A判定结果}
+{$t玩家B} {$t玩家B判定式}-> 属性值:{$t玩家B属性} 判定值:{$t玩家B出目}{$t玩家B判定过程} {$t玩家B判定结果}
+{% $tWinFlag == -1 ? $t玩家A + '胜出！',
+   $tWinFlag == +1 ? $t玩家B + '胜出！',
+   $tWinFlag == 0 ? '平手！(请自行根据场景，如属性比较、攻击对反击，攻击对闪避)做出判断'
+%}`, 1},
+			},
+			// -------------------- ti li --------------------------
+			"疯狂发作_即时症状": {
+				{"{$t玩家}的疯狂发作-即时症状:\n{$t表达式文本}\n{$t疯狂描述}", 1},
+			},
+			"疯狂发作_总结症状": {
+				{"{$t玩家}的疯狂发作-总结症状:\n{$t表达式文本}\n{$t疯狂描述}", 1},
+			},
+			// -------------------- ti li end --------------------------
+		},
+
+		"DND": {
+			"属性设置_删除": {
+				{`{$t玩家}的如下属性被成功删除:{$t属性列表}，失败{$t失败数量}项`, 1},
+			},
+			"属性设置_清除": {
+				{`{$t玩家}的属性数据已经清除，共计{$t数量}条`, 1},
+			},
+			"属性设置_列出": {
+				{`{$t玩家}的个人属性为:\n{$t属性信息}`, 1},
+			},
+			"属性设置_列出_未发现记录": {
+				{`未发现属性记录`, 1},
+			},
+			"属性设置_列出_隐藏提示": {
+				{`\n注：{$t数量}条属性因<{$t判定值}被隐藏`, 1},
+			},
+			"BUFF设置_删除": {
+				{`{$t玩家}的如下BUFF被成功删除:{$t属性列表}，失败{$t失败数量}项`, 1},
+			},
+			"BUFF设置_清除": {
+				{`{$t玩家}的BUFF数据已经清除，共计{$t数量}条`, 1},
+			},
+			"先攻_查看_前缀": {
+				{`当前先攻列表为:\n`, 1},
+			},
+			"先攻_移除_前缀": {
+				{`{$t玩家}将以下单位从先攻列表中移除:\n`, 1},
+			},
+			"先攻_清除列表": {
+				{`先攻列表已清除`, 1},
+			},
+			"先攻_设置_指定单位": {
+				{"{$t玩家}已设置 {$t目标} 的先攻点为{$t表达式}{% $t计算过程 ? `{$t计算过程} =` %} {$t点数}\\n", 1},
+			},
+			"先攻_设置_前缀": {
+				{`{$t玩家}对先攻点数设置如下:\n`, 1},
+			},
+			"先攻_设置_格式错误": {
+				{`{$t玩家}的ri格式不正确!`, 1},
+			},
+			"先攻_下一回合": {
+				{"【{$t当前回合角色名}】戏份结束了。\n{$t新轮开始提示}下面该【{$t下一回合角色名}】{$t下一回合at}出场了！\n同时请【{$t下下一回合角色名}】{$t下下一回合at}做好准备", 1},
+			},
+			"先攻_新轮开始提示": {
+				{"新的一轮开始了！\n", 1},
+			},
+			"死亡豁免_D20_附加语": {
+				{`你觉得你还可以抢救一下！HP回复1点！`, 1},
+			},
+			"死亡豁免_D1_附加语": {
+				{`伤势莫名加重了！死亡豁免失败+2！`, 1},
+			},
+			"死亡豁免_成功_附加语": {
+				{`伤势暂时得到控制！死亡豁免成功+1`, 1},
+			},
+			"死亡豁免_失败_附加语": {
+				{`有些不妙！死亡豁免失败+1`, 1},
+			},
+			"死亡豁免_结局_伤势稳定": {
+				{`累计获得了3次死亡豁免检定成功，伤势稳定了！`, 1},
+			},
+			"死亡豁免_结局_角色死亡": {
+				{`累计获得了3次死亡豁免检定失败，不幸去世了！`, 1},
+			},
+			"受到伤害_超过HP上限_附加语": {
+				{`\n{$t玩家}遭受了{$t伤害点数}点过量伤害，超过了他的承受能力，一命呜呼了！`, 1},
+			},
+			"受到伤害_昏迷中_附加语": {
+				{`\n{$t玩家}在昏迷状态下遭受了{$t伤害点数}点过量伤害，死亡豁免失败+1！`, 1},
+			},
+			"受到伤害_进入昏迷_附加语": {
+				{`\n{$t玩家}遭受了{$t伤害点数}点过量伤害，生命值降至0，陷入了昏迷！`, 1},
+			},
+			"制卡_预设模式": {
+				{"{$t玩家}使用预设模板的DND5E人物作成:\n{$t制卡结果文本}", 1},
+			},
+			"制卡_自由分配模式": {
+				{"{$t玩家}使用自由分配的DND5E人物作成:\n{$t制卡结果文本}", 1},
+			},
+			"制卡_分隔符": {
+				{`\n`, 1},
+			},
+			"检定_单项结果文本": {
+				{`{$t检定过程文本} = {$t检定结果}`, 1},
+			},
+			"检定": {
+				{`{$t玩家}的"{$t技能}"检定（DND5E）结果为: {$t检定过程文本} = {$t检定结果}`, 1},
+			},
+			"检定_多轮": {
+				{`对{$t玩家}的"{$t技能}"进行了{$t次数}次检定（DND5E），结果为:\n{$t结果文本}`, 1},
+			},
+			"检定_轮数过多警告": {
+				{`你真的需要这么多轮检定？{核心:骰子名字}将对你提高警惕！`, 1},
+				{`不支持连续检定{$t次数}次，{核心:骰子名字}觉得这太多了。`, 1},
+			},
+		},
+		"核心": {
+			"骰子名字": {
+				{"余烬核心", 1},
+			},
+			"骰子帮助文本": {
+				{"{常量:APPNAME} {常量:VERSION} {常量:ARCH}\n官方一群: 1084726031\n========\n.help 骰点/房规/骰主/协议/娱乐/特色功能/跑团/扩展/查询/其他\n========\n只是余烬罢了", 1},
+			},
+			"骰子帮助文本_骰点": {
+				{"骰主可以在这里写骰子的骰点命令使用教程", 1},
+			},
+			"骰子帮助文本_房规": {
+				{"骰主可以在这里写骰子的房规说明", 1},
+			},
+			"骰子帮助文本_骰主": {
+				{"骰主很神秘，什么都没有说——", 1},
+			},
+			"骰子帮助文本_协议": {
+				{"请在遵守以下规则前提下使用:\n1. 遵守国家法律法规\n2. 在跑团相关群进行使用\n3. 不要随意踢出、禁言、刷屏\n4. 务必信任骰主，有事留言\n如不同意使用.bot bye使其退群，谢谢。\n祝玩得愉快。", 1},
+			},
+			"骰子帮助文本_娱乐": {
+				{"帮助:娱乐\n.gugu // 随机召唤一只鸽子\n.jrrp 今日人品", 1},
+			},
+			"骰子帮助文本_特色功能": {
+				{"骰主可以在这里写骰子的额外功能命令的使用教程", 1},
+			},
+			"骰子帮助文本_其他": {
+				{"帮助:其他\n.find 克苏鲁星之眷族 //查找对应怪物资料\n.find 70尺 法术 // 查找关联资料（仅在全文搜索开启时可用）", 1},
+			},
+			"骰子执行异常": {
+				{"指令执行异常，请联系开发者，群号524364253，非常感谢。", 1},
+			},
+			"骰子开启": {
+				{"{常量:APPNAME} 已启用 {常量:VERSION}", 1},
+			},
+			"骰子关闭": {
+				{"<{核心:骰子名字}> 停止服务", 1},
+			},
+			"骰子进群": {
+				{`<{核心:骰子名字}> 已经就绪。可通过.help查看手册\n[图:data/images/Scardice.png]\nCOC/DND玩家可以使用.set coc/dnd在两种模式中切换\n已搭载自动重连，如遇风控不回可稍作等待`, 1},
+			},
+			"骰子成为好友": {
+				{`<{核心:骰子名字}> 已经就绪。可通过.help查看手册，请拉群测试，私聊容易被企鹅吃掉。\n[图:data/images/Scardice.png]`, 1},
+			},
+			"骰子退群预告": {
+				{"收到指令，5s后将退出当前群组", 1},
+			},
+			"骰子自动退群告别语": {
+				{"由于长时间不使用，{核心:骰子名字}将退出本群，感谢您的使用。", 1},
+			},
+			"骰子保存设置": {
+				{"数据已保存", 1},
+			},
+			"骰子状态文本": {
+				{"{常量:APPNAME} {常量:VERSION} {常量:ARCH}\n供职于{$t供职群数}个群，其中{$t启用群数}个处于开启状态。{$t群内工作状态}", 1},
+			},
+			// -------------------- roll --------------------------
+			"骰点_原因": {
+				{"由于{$t原因}，", 1},
+			},
+			"骰点_单项结果文本": {
+				{`{$t表达式文本}{$t计算过程}={$t计算结果}`, 1},
+			},
+			"骰点": {
+				{"{$t原因句子}{$t玩家}掷出了 {$t结果文本}", 1},
+			},
+			"骰点_多轮": {
+				{`{$t原因句子}{$t玩家}掷骰{$t次数}次:\n{$t结果文本}`, 1},
+			},
+			"骰点_轮数过多警告": {
+				{`骰点的轮数多到异常，{核心:骰子名字}将对你提高警惕！`, 1},
+				{`骰点{$t次数}轮？{核心:骰子名字}没有这么多骰子。`, 1},
+			},
+			// -------------------- roll end --------------------------
+			"暗骰_群内": {
+				{"黑暗的角落里，传来命运转动的声音", 1},
+				{"诸行无常，命数无定，答案只有少数人知晓", 1},
+				{"命运正在低语！", 1},
+			},
+			"暗骰_私聊_前缀": {
+				{`来自群<{$t群名}>({$t群号})的暗骰:\n`, 1},
+			},
+			"昵称_当前": {
+				{"玩家的当前昵称为: {$t玩家}", 1},
+			},
+			"昵称_重置": {
+				{"{$t旧昵称}({$t帐号ID})的昵称已重置为{$t玩家}", 1},
+			},
+			"昵称_改名": {
+				{"{$t旧昵称}({$t帐号ID})的昵称被设定为{$t玩家}", 1},
+			},
+			"设定默认骰子面数": {
+				{"设定个人默认骰子面数为 {$t个人骰子面数}", 1},
+			},
+			"设定默认群组骰子面数": {
+				{"设定群组默认骰子面数为 {$t群组骰子面数}", 1},
+			},
+			"设定默认骰子面数_错误": {
+				{"设定默认骰子面数: 格式错误", 1},
+			},
+			"设定默认骰子面数_重置": {
+				{"重设默认骰子面数为默认值", 1},
+			},
+			// -------------------- ch --------------------------
+			"角色管理_新建": {
+				{"新建角色且自动绑定: {$t角色名}", 1},
+			},
+			"角色管理_新建_已存在": {
+				{"已存在同名角色", 1},
+			},
+			"角色管理_绑定_成功": {
+				{"切换角色\"{$t角色名}\"，绑定成功", 1},
+			},
+			"角色管理_绑定_失败": {
+				{"角色\"{$t角色名}\"绑定失败，角色不存在", 1},
+			},
+			"角色管理_绑定_解除": {
+				{"角色\"{$t角色名}\"绑定已解除，切换至群内角色卡", 1},
+			},
+			"角色管理_绑定_并未绑定": {
+				{"当前群内并未绑定角色", 1},
+			},
+			"角色管理_加载成功": {
+				{"角色{$t玩家}加载成功，欢迎回来", 1},
+			},
+			"角色管理_加载失败_已绑定": {
+				{"当前群内是绑卡状态，请解除绑卡后进行此操作！", 1},
+			},
+			"角色管理_角色不存在": {
+				{"无法加载/删除角色：你所指定的角色不存在", 1},
+			},
+			"角色管理_序列化失败": {
+				{"无法加载/保存角色：序列化失败", 1},
+			},
+			"角色管理_储存成功": {
+				{"角色\"{$t角色名}\"储存成功\n注: 非秘密团不用开团前存卡，跑团后save即可", 1},
+			},
+			"角色管理_储存失败_已绑定": {
+				{"角色卡\"{$t角色名}\"是绑定状态，无法进行save操作", 1},
+			},
+			"角色管理_删除成功": {
+				{"角色\"{$t角色名}\"删除成功", 1},
+			},
+			"角色管理_删除失败_已绑定": {
+				{"角色卡\"{$t角色名}\"是绑定状态，\".pc untagAll {$t角色名}\"解除绑卡后再操作吧", 1},
+			},
+			"角色管理_删除成功_当前卡": {
+				{"由于你删除的角色是当前角色，昵称和属性将被一同清空", 1},
+			},
+			// -------------------- pc end --------------------------
+			"提示_私聊不可用": {
+				{"该指令只在群组中可用", 1},
+			},
+			"提示_无权限": {
+				{"你没有权限这样做", 1},
+			},
+			"提示_无权限_非master/管理/邀请者": {
+				{"你不是管理员、邀请者或master", 1},
+			},
+			"提示_无权限_非master/管理": {
+				{"你不是管理员或master", 1},
+			},
+			"提示_手动退群前缀": {
+				{"因长期不使用等原因，骰主后台操作退群", 1},
+			},
+			"留言_已记录": {
+				{"您的留言已被记录，另外注意不要滥用此功能，祝您生活愉快，再会。", 1},
+			},
+			"拦截_完全拦截_收到的所有消息": {
+				{"", 1},
+			},
+			"拦截_完全拦截_收到的指令": {
+				{"命令包含不当内容，{核心:骰子名字}拒绝响应。", 1},
+			},
+			"拦截_完全拦截_发出的消息": { // 未来可加入“部分拦截”，如仅替换敏感词
+				{"试图使{核心:骰子名字}回复不当内容，拒绝响应。", 1},
+			},
+			"拦截_警告内容_提醒级": {
+				{"你已多次触发不当内容拦截，{核心:骰子名字}已经无法忍受！", 1},
+			},
+			"拦截_警告内容_注意级": {
+				{"你已多次触发不当内容拦截，{核心:骰子名字}已经无法忍受！", 1},
+			},
+			"拦截_警告内容_警告级": {
+				{"你已多次触发不当内容拦截，{核心:骰子名字}已经无法忍受！", 1},
+			},
+			"拦截_警告内容_危险级": {
+				{"你已多次触发不当内容拦截，{核心:骰子名字}已经无法忍受！", 1},
+			},
+			"刷屏_警告内容_个人": {
+				{"警告：您的指令频率过高，请注意。", 1},
+			},
+			"刷屏_警告内容_群组": {
+				{"警告：该群组内指令频率过高，请注意。", 1},
+			},
+			"快捷指令_新增": {
+				{`已成功定义指令「{$t指令}」的{$t指令来源}快捷方式「{$t快捷指令名}」，触发方式：\n.&{$t快捷指令名} 或\n.a {$t快捷指令名}`, 1},
+			},
+			"快捷指令_新增_无指令": {
+				{"未指定要定义{$t指令来源}快捷方式的指令", 1},
+			},
+			"快捷指令_替换": {
+				{`{$t指令来源}快捷指令「{$t快捷指令名}」被替换为指令「{$t指令}」，其旧指令为「{$t旧指令}」，触发方式：\n.&{$t快捷指令名} 或\n.a {$t快捷指令名}`, 1},
+			},
+			"快捷指令_删除": {
+				{"已成功删除{$t指令来源}快捷指令「{$t快捷指令名}」，曾对应指令「{$t旧指令}」", 1},
+			},
+			"快捷指令_删除_未定义": {
+				{"尝试删除{$t指令来源}快捷指令「{$t快捷指令名}」，但并未定义过", 1},
+			},
+			"快捷指令_列表": {
+				{`可用的快捷指令如下：\n{$t列表内容}\n（群快捷指令优先于个人）`, 1},
+			},
+			"快捷指令_列表_空": {
+				{"未定义任何快捷指令", 1},
+			},
+			"快捷指令_列表_单行": {
+				{"[{$t指令来源}].&{$t快捷指令名} => {$t指令}", 1},
+			},
+			"快捷指令_列表_分隔符": {
+				{`\n`, 1},
+			},
+			"快捷指令_非群聊": {
+				{"不在群聊中，群快捷指令相关命令不可用", 1},
+			},
+			"快捷指令_禁止": {
+				{"不允许定义这样的快捷指令", 1},
+			},
+			"快捷指令触发_前缀": {
+				{`※ {$t指令来源}快捷指令 {$t目标指令}\n`, 1},
+			},
+			"快捷指令触发_无指令": {
+				{"未设置快捷指令 {$t目标指令名}，或该快捷指令不对应一个命令", 1},
+			},
+			"黑名单触发_当事人": {
+				{"提醒：你引发了黑名单事件:\n{$t黑名单事件}", 1},
+			},
+			"黑名单触发_所在群": {
+				{"提醒：当前群组发生了黑名单事件:\n{$t黑名单事件}", 1},
+			},
+			"黑名单触发_邀请人": {
+				{"提醒: 你邀请的骰子在群组<{$t事发群名}>({$t事发群号})中遭遇黑名单事件:\n{$t黑名单事件}", 1},
+			},
+			"黑名单惩罚_退群": {
+				{"因拉黑惩罚选项中有“退出事发群”，即将自动退群。", 1},
+			},
+		},
+		"娱乐": {
+			"今日人品": {
+				{"{$t玩家} 今日人品为{$t人品}，{%\n    $t人品 > 95 ? '人品爆表！',\n    $t人品 > 80 ? '运气还不错！',\n    $t人品 > 50 ? '人品还行吧',\n    $t人品 > 10 ? '今天不太行',\n    1 ? '流年不利啊！'\n%}", 1},
+			},
+			"鸽子理由": guguReason,
+		},
+		"其它": {
+			"抽牌_牌堆列表": {
+				{"载入并开启的牌堆:\n{$t牌堆列表}", 1},
+			},
+			"抽牌_列表": {
+				{"{$t原始列表}", 1},
+			},
+			"抽牌_列表_没有牌组": {
+				{`呃，没有发现任何牌组`, 1},
+			},
+			"抽牌_找不到牌组": {
+				{"找不到这个牌组", 1},
+			},
+			"抽牌_找不到牌组_存在类似": {
+				{"未找到牌组，但发现一些相似的:", 1},
+			},
+			"抽牌_分隔符": {
+				{`\n\n`, 1},
+			},
+			"抽牌_结果前缀": {
+				{``, 1},
+			},
+			"随机名字": {
+				{"为{$t玩家}生成以下名字：\n{$t随机名字文本}", 1},
+			},
+			"随机名字_分隔符": {
+				{"、", 1},
+			},
+			"戳一戳": {
+				{"{核心:骰子名字}咕踊了一下", 1},
+			},
+			"ping响应": {
+				{"pong！这里是{核心:骰子名字}", 1},
+			},
+		},
+		"日志": {
+			"记录_新建": {
+				{`新的故事开始了，祝旅途愉快！\n记录已经开启`, 1},
+			},
+			"记录_开启_成功": {
+				{`故事"{$t记录名称}"的记录已经继续开启，当前已记录文本{$t当前记录条数}`, 1},
+			},
+			"记录_开启_失败_无此记录": {
+				{`无法继续，没能找到记录: {$t记录名称}`, 1},
+			},
+			"记录_开启_失败_尚未新建": {
+				{`找不到记录，请使用.log new新建记录`, 1},
+			},
+			"记录_开启_失败_未结束的记录": {
+				{`当前已有记录中的日志{$t记录名称}，请先将其结束。`, 1},
+			},
+			"记录_关闭_成功": {
+				{`当前记录"{$t记录名称}"已经暂停，已记录文本{$t当前记录条数}条\n结束故事并传送日志请用.log end`, 1},
+			},
+			"记录_关闭_失败": {
+				{`没有找到正在进行的记录，已经是关闭状态。这可能表示您忘记了开启记录。`, 1},
+			},
+			"记录_取出_未指定记录": {
+				{`命令格式错误：当前没有开启状态的记录，或没有通过参数指定要取出的日志。请参考帮助。`, 1},
+			},
+			"记录_列出_导入语": {
+				{`正在列出存在于此群的记录:`, 1},
+			},
+			"记录_结束": {
+				{`故事落下了帷幕。\n记录已经关闭。`, 1},
+			},
+			"记录_新建_失败_未结束的记录": {
+				{`上一段旅程{$t记录名称}还未结束，请先使用.log end结束故事。`, 1},
+			},
+			"记录_条数提醒": {
+				{`提示: 当前故事的文本已经记录了 {$t条数} 条`, 1},
+			},
+			"记录_导出_邮箱发送前缀": {
+				{`已向以下邮箱发送记录邮件：\n`, 1},
+			},
+			"记录_导出_无格式有效邮箱": {
+				{`未提供格式有效的邮箱，将直接发送记录文件`, 1},
+			},
+			"记录_导出_未指定记录": {
+				{`未指定记录名`, 1},
+			},
+			"记录_导出_文件名前缀": {
+				{`【{$t记录名}】{$t日期}{$t时间}`, 1},
+			},
+			"记录_导出_邮件附言": {
+				{"log文件见附件。", 1},
+			},
+			"记录_删除_成功": {
+				{"删除记录 {$t记录名称} 成功", 1},
+			},
+			"记录_删除_失败_找不到": {
+				{"删除记录 {$t记录名称} 失败，可能是名字不对", 1},
+			},
+			"记录_删除_失败_正在进行": {
+				{"记录 {$t记录名称} 正在进行，无法删除。请先用 log end 结束记录，如不希望上传请用 log halt。", 1},
+			},
+			"OB_开启": {
+				{"你将成为观众（自动修改昵称和群名片[如有权限]，并不会给观众发送暗骰结果）。", 1},
+			},
+			"OB_关闭": {
+				{"你不再是观众了（自动修改昵称和群名片[如有权限]）。", 1},
+			},
+			// 1.4.2+
+			"记录_上传_成功": {
+				{`跑团日志已上传服务器，链接如下：{$t日志链接}`, 1},
+			},
+			"记录_上传_失败": {
+				{`跑团日志上传失败：{$t错误原因}\n若未出现线上日志地址，可换时间重试，或联系骰主在data/default/log-exports路径下取出日志\n文件名: 群号_日志名_随机数.zip\n注意此文件log end/get后才会生成`, 1},
+			},
+			// 1.5.0+
+			"名片_自动设置": {
+				{`已自动设置名片格式为{$t名片格式}：{$t名片预览}\n如有权限会在属性更新时自动更新名片。使用.sn off可关闭。`, 1},
+			},
+			"名片_取消设置": {
+				{`已关闭对{$t玩家}的名片自动修改。`, 1},
+			},
+			"记录_导出_成功": {
+				{`日志文件《{$t文件名字}》已上传至群文件，请自行到群文件查看。`, 1},
+			},
+		},
+	}
+
+	helpInfo := TextTemplateWithHelpDict{
+		"COC": {
+			"设置房规_当前": {
+				SubType: ".setcoc",
+			},
+			"判定_大失败": {
+				SubType: "判定-常规",
+			},
+			"判定_失败": {
+				SubType: "判定-常规",
+			},
+			"判定_成功_普通": {
+				SubType: "判定-常规",
+			},
+			"判定_成功_困难": {
+				SubType: "判定-常规",
+			},
+			"判定_成功_极难": {
+				SubType: "判定-常规",
+			},
+			"判定_大成功": {
+				SubType: "判定-常规",
+			},
+
+			"判定_必须_困难_成功": {
+				SubType: "判定-常规",
+			},
+			"判定_必须_困难_失败": {
+				SubType: "判定-常规",
+			},
+			"判定_必须_极难_成功": {
+				SubType: "判定-常规",
+			},
+			"判定_必须_极难_失败": {
+				SubType: "判定-常规",
+			},
+			"判定_必须_大成功_成功": {
+				SubType: "判定-常规",
+			},
+			"判定_必须_大成功_失败": {
+				SubType: "判定-常规",
+			},
+
+			"判定_简短_大失败": {
+				SubType: "判定-简短",
+			},
+			"判定_简短_失败": {
+				SubType: "判定-简短",
+			},
+			"判定_简短_成功_普通": {
+				SubType: "判定-简短",
+			},
+			"判定_简短_成功_困难": {
+				SubType: "判定-简短",
+			},
+			"判定_简短_成功_极难": {
+				SubType: "判定-简短",
+			},
+			"判定_简短_大成功": {
+				SubType: "判定-简短",
+			},
+
+			"检定_单项结果文本": {
+				SubType: ".ra/rc",
+				Vars:    []string{"$t检定表达式文本", "$t骰子出目", "$t判定值", "$t检定计算过程", "$t判定结果", "$t判定结果_详细", "$t判定结果_简短", "$tSuccessRank"},
+			},
+			"检定": {
+				SubType: ".ra/rc 射击",
+				Vars:    []string{"$t原因", "$t玩家", "$t属性表达式文本", "$t结果文本"},
+			},
+			"检定_多轮": {
+				SubType: ".ra/rc 3#射击",
+			},
+			"检定_轮数过多警告": {
+				SubType: ".ra/rc 30#",
+			},
+
+			"检定_暗中_私聊_前缀": {
+				SubType: ".rah/rch",
+			},
+			"检定_暗中_群内": {
+				SubType: ".rah/rch",
+			},
+			"检定_格式错误": {
+				SubType: ".ra/rc",
+			},
+
+			// -------------------- sc --------------------------
+			"提示_永久疯狂": {
+				SubType: ".sc",
+			},
+			"提示_临时疯狂": {
+				SubType: ".sc",
+			},
+
+			"理智检定_单项结果文本": {
+				SubType: ".sc",
+				Vars:    []string{"$t检定表达式文本", "$t骰子出目", "$t判定值", "$t检定计算过程", "$t判定结果", "$t判定结果_详细", "$t判定结果_简短", "$tSuccessRank"},
+			},
+			"理智检定": {
+				SubType: ".sc",
+				Vars:    []string{"$t结果文本", "$t旧值", "$t新值", "$t表达式文本", "$t表达式原始值", "$t表达式调整值", "$t附加语", "$t提示_角色疯狂"},
+			},
+
+			"理智检定_附加语_成功": {
+				SubType: ".sc",
+			},
+			"理智检定_附加语_失败": {
+				SubType: ".sc",
+			},
+			"理智检定_附加语_大成功": {
+				SubType: ".sc",
+			},
+			"理智检定_附加语_大失败": {
+				SubType: ".sc",
+			},
+			"理智检定_格式错误": {
+				SubType: ".sc",
+			},
+			// -------------------- sc end --------------------------
+
+			// -------------------- st --------------------------
+			"属性设置_删除": {
+				SubType: ".st rm A B C",
+			},
+			"属性设置_清除": {
+				SubType: ".st clr",
+			},
+			"属性设置_增减": {
+				SubType: ".st hp+1",
+			},
+			"属性设置_增减_单项": {
+				SubType: ".st hp+1 san-1",
+			},
+			"属性设置_增减_错误的值": {
+				SubType: ".st hp+?",
+			},
+			"属性设置_列出": {
+				SubType: ".st show",
+			},
+			"属性设置_列出_未发现记录": {
+				SubType: ".st show",
+			},
+			"属性设置_列出_隐藏提示": {
+				SubType: ".st show",
+			},
+			"属性设置": {
+				SubType:         ".st 力量70",
+				Vars:            []string{"$t玩家", "$t规则模板", "$t有效数量", "$t数量", "$t同义词数量"},
+				ExampleCommands: []string{".st 力量70"},
+			},
+			"属性设置_保存提醒": {
+				SubType:         ".st hp+1",
+				ExampleCommands: []string{".st hp70", ".st hp+1"},
+			},
+			// -------------------- st end --------------------------
+
+			// -------------------- en --------------------------
+			"技能成长_导入语": {
+				SubType: ".en",
+			},
+			"技能成长_错误的属性类型": {
+				SubType: ".en $t玩家",
+			},
+			"技能成长_错误的属性类型_无前缀": {
+				SubType: ".en $t玩家",
+			},
+			"技能成长_错误的失败成长值": {
+				SubType: ".en 斗殴 +?",
+			},
+			"技能成长_错误的失败成长值_无前缀": {
+				SubType: ".en 斗殴 +?",
+			},
+			"技能成长_错误的成功成长值": {
+				SubType: ".en 斗殴 +?",
+			},
+			"技能成长_错误的成功成长值_无前缀": {
+				SubType: ".en 斗殴 +?",
+			},
+			"技能成长_属性未录入": {
+				SubType: ".en 斗殴",
+			},
+			"技能成长_属性未录入_无前缀": {
+				SubType: ".en 斗殴",
+			},
+			"技能成长_结果_成功": {
+				SubType: ".en 斗殴",
+			},
+			"技能成长_结果_成功_无后缀": {
+				SubType: ".en 斗殴",
+			},
+			"技能成长_结果_失败": {
+				SubType: ".en 斗殴",
+			},
+			"技能成长_结果_失败变更": {
+				SubType: ".en 斗殴",
+			},
+			"技能成长_结果_失败变更_无后缀": {
+				SubType: ".en 斗殴",
+			},
+			"技能成长": {
+				SubType: ".en",
+			},
+			"技能成长_批量_分隔符": {
+				SubType: ".en 批量",
+			},
+			"技能成长_批量_导入语": {
+				SubType: ".en 批量",
+			},
+			"技能成长_批量_单条": {
+				SubType: ".en 批量",
+			},
+			"技能成长_批量_单条错误前缀": {
+				SubType: ".en 批量",
+			},
+			"技能成长_批量": {
+				SubType: ".en 批量",
+			},
+			"技能成长_批量_技能过多警告": {
+				SubType: ".en 批量",
+			},
+			// -------------------- en end --------------------------
+			"制卡": {
+				SubType: ".coc 2",
+			},
+			"制卡_分隔符": {
+				SubType: ".coc 2",
+			},
+			"对抗检定": {
+				SubType: ".rav/.rcv",
+			},
+			// -------------------- ti li --------------------------
+			"疯狂发作_即时症状": {
+				Vars:    []string{"$t玩家", "$t表达式文本", "$t疯狂描述", "$t选项值", "$t附加值1", "$t附加值2"},
+				SubType: ".ti",
+			},
+			"疯狂发作_总结症状": {
+				Vars:    []string{"$t玩家", "$t表达式文本", "$t疯狂描述", "$t选项值", "$t附加值1", "$t附加值2"},
+				SubType: ".li",
+			},
+			// -------------------- ti li end --------------------------
+		},
+		"娱乐": {
+			"今日人品": {
+				Vars:     []string{"$t玩家", "$t人品"},
+				Commands: []string{"jrrp"},
+				SubType:  ".jrrp",
+			},
+			"鸽子理由": {
+				SubType: ".gugu",
+			},
+		},
+		"DND": {
+			"属性设置_删除": {
+				SubType: ".st rm",
+			},
+			"属性设置_清除": {
+				SubType: ".st clr",
+			},
+			"属性设置_列出": {
+				SubType: ".st show",
+			},
+			"属性设置_列出_未发现记录": {
+				SubType: ".st show",
+			},
+			"属性设置_列出_隐藏提示": {
+				SubType: ".st show",
+			},
+			"BUFF设置_删除": {
+				SubType: ".buff rm",
+			},
+			"BUFF设置_清除": {
+				SubType: ".buff clr",
+			},
+			"先攻_查看_前缀": {
+				SubType: ".init",
+			},
+			"先攻_下一回合": {
+				SubType: ".init ed",
+				Vars: []string{"$t当前回合角色名", "$t当前回合at", "$t新轮开始提示", "$t下一回合角色名",
+					"$t下一回合at", "$t下下一回合角色名", "$t下下一回合at"},
+			},
+			"先攻_新轮开始提示": {
+				SubType: ".init ed",
+			},
+			"先攻_移除_前缀": {
+				SubType: ".init rm",
+			},
+			"先攻_清除列表": {
+				SubType: ".init clr",
+			},
+			"先攻_设置_指定单位": {
+				SubType: ".init set",
+			},
+			"先攻_设置_前缀": {
+				SubType: ".ri",
+			},
+			"先攻_设置_格式错误": {
+				SubType: ".ri",
+			},
+			"死亡豁免_D20_附加语": {
+				SubType: ".ds/死亡豁免",
+			},
+			"死亡豁免_D1_附加语": {
+				SubType: ".ds/死亡豁免",
+			},
+			"死亡豁免_成功_附加语": {
+				SubType: ".ds/死亡豁免",
+			},
+			"死亡豁免_失败_附加语": {
+				SubType: ".ds/死亡豁免",
+			},
+			"死亡豁免_结局_伤势稳定": {
+				SubType: ".ds/死亡豁免",
+			},
+			"死亡豁免_结局_角色死亡": {
+				SubType: ".ds/死亡豁免",
+			},
+			"制卡_分隔符": {
+				SubType: ".dnd 2/.dndx 3",
+			},
+			"受到伤害_昏迷中_附加语": {
+				SubType:   ".st hp-1d4",
+				ExtraText: "hp已经为0时扣血",
+			},
+			"受到伤害_超过HP上限_附加语": {
+				SubType:   ".st hp-50",
+				ExtraText: "造成伤害大于生命上限",
+			},
+			"受到伤害_进入昏迷_附加语": {
+				SubType:   ".st hp-1d4",
+				ExtraText: "hp在st后从正数变为0",
+			},
+			"制卡_预设模式": {
+				SubType:   ".dnd",
+				ExtraText: "不带属性名"},
+			"制卡_自由分配模式": {
+				SubType:   ".dndx",
+				ExtraText: "带属性名",
+			},
+			"检定_单项结果文本": {
+				SubType: ".rc",
+				Vars:    []string{"$t骰子出目", "$t检定过程文本", "$t检定结果"},
+			},
+			"检定": {
+				SubType: ".rc 力量",
+				Vars:    []string{"$t骰子出目", "$t检定过程文本", "$t检定结果"},
+			},
+			"检定_多轮": {
+				SubType: ".rc 3#力量",
+			},
+			"检定_轮数过多警告": {
+				SubType: ".rc 30#",
+			},
+		},
+		"核心": {
+			"骰子名字": {
+				SubType:  "通用",
+				TopOrder: 1,
+			},
+			"骰子帮助文本": {
+				SubType:  ".help",
+				TopOrder: 1,
+			},
+			"骰子帮助文本_骰点": {
+				SubType: ".help",
+			},
+			"骰子帮助文本_房规": {
+				SubType: ".help",
+			},
+			"骰子帮助文本_骰主": {
+				SubType: ".help",
+			},
+			"骰子帮助文本_协议": {
+				SubType: ".help",
+			},
+			"骰子帮助文本_娱乐": {
+				SubType: ".help",
+			},
+			"骰子帮助文本_特色功能": {
+				SubType: ".help",
+			},
+			"骰子帮助文本_其他": {
+				SubType: ".help",
+			},
+			"骰子执行异常": {
+				SubType:  "通用",
+				TopOrder: 1,
+			},
+			"骰子开启": {
+				SubType:  ".bot on",
+				TopOrder: 1,
+			},
+			"骰子关闭": {
+				SubType:  ".bot off",
+				TopOrder: 1,
+			},
+			"骰子进群": {
+				SubType:  "通用",
+				TopOrder: 1,
+			},
+			"骰子成为好友": {
+				SubType:  "通用",
+				TopOrder: 1,
+			},
+			"骰子退群预告": {
+				SubType:  ".bot bye",
+				TopOrder: 1,
+			},
+			"骰子自动退群告别语": {
+				SubType:  "通用",
+				TopOrder: 1,
+			},
+			"骰子保存设置": {
+				SubType: ".bot save",
+			},
+			"骰子状态文本": {
+				SubType: ".bot about",
+				Vars:    []string{"$t供职群数", "$t启用群数", "$t群内工作状态", "$t群内工作状态_仅状态"},
+			},
+			// -------------------- roll --------------------------
+			"骰点_原因": {
+				SubType: ".r",
+			},
+			"骰点_单项结果文本": {
+				SubType: ".r",
+			},
+			"骰点": {
+				SubType: ".r",
+			},
+			"骰点_多轮": {
+				SubType: ".r 3#",
+			},
+			"骰点_轮数过多警告": {
+				SubType: ".r 30#",
+			},
+			// -------------------- roll end --------------------------
+			"暗骰_群内": {
+				SubType: ".rh",
+			},
+			"暗骰_私聊_前缀": {
+				SubType: ".rh",
+			},
+			"昵称_当前": {
+				SubType: ".nn",
+			},
+			"昵称_重置": {
+				SubType: ".nn clr",
+				Vars:    []string{"$t旧昵称", "$t帐号昵称", "$t帐号ID", "$t玩家"},
+			},
+			"昵称_改名": {
+				SubType: ".nn",
+				Vars:    []string{"$t旧昵称", "$t帐号ID", "$t玩家"},
+			},
+			"设定默认骰子面数": {
+				SubType: ".set 30 --my",
+			},
+			"设定默认群组骰子面数": {
+				SubType: ".set 100",
+			},
+			"设定默认骰子面数_错误": {
+				SubType: ".set ?",
+			},
+			"设定默认骰子面数_重置": {
+				SubType: ".set clr",
+			},
+			// -------------------- ch --------------------------
+			"角色管理_新建": {
+				SubType: ".pc new",
+				Vars:    []string{"$t角色名"},
+			},
+			"角色管理_新建_已存在": {
+				SubType: ".pc new",
+				Vars:    []string{"$t角色名"},
+			},
+			"角色管理_绑定_成功": {
+				SubType: ".pc tag",
+				Vars:    []string{"$t角色名"},
+			},
+			"角色管理_绑定_失败": {
+				SubType: ".pc tag",
+				Vars:    []string{"$t角色名"},
+			},
+			"角色管理_绑定_解除": {
+				SubType: ".pc tag",
+				Vars:    []string{"$t角色名"},
+			},
+			"角色管理_绑定_并未绑定": {
+				SubType: ".pc tag",
+				Vars:    []string{"$t角色名"},
+			},
+			"角色管理_加载成功": {
+				SubType: ".pc load",
+				Vars:    []string{"$t角色名", "$t玩家"},
+			},
+			"角色管理_角色不存在": {
+				SubType: ".pc load",
+			},
+			"角色管理_加载失败_已绑定": {
+				SubType: ".pc load",
+			},
+			"角色管理_序列化失败": {
+				SubType: ".pc load/save",
+			},
+			"角色管理_储存成功": {
+				SubType: ".pc save",
+			},
+			"角色管理_储存失败_已绑定": {
+				SubType: ".pc save",
+			},
+			"角色管理_删除成功": {
+				SubType: ".pc rm",
+			},
+			"角色管理_删除失败_已绑定": {
+				SubType: ".pc rm",
+			},
+			"角色管理_删除成功_当前卡": {
+				SubType: ".pc rm",
+			},
+			// -------------------- pc end --------------------------
+			"提示_私聊不可用": {
+				SubType: "通用",
+			},
+			"提示_无权限": {
+				SubType: "通用",
+			},
+			"提示_无权限_非master/管理/邀请者": {
+				SubType: "通用",
+			},
+			"提示_无权限_非master/管理": {
+				SubType: "通用",
+			},
+			"提示_手动退群前缀": {
+				SubType: "通用",
+			},
+			"留言_已记录": {
+				SubType: ".send",
+			},
+			"拦截_完全拦截_收到的所有消息": {
+				SubType: "拦截",
+			},
+			"拦截_完全拦截_收到的指令": {
+				SubType: "拦截",
+			},
+			"拦截_完全拦截_发出的消息": {
+				SubType: "拦截",
+			},
+			"拦截_警告内容_提醒级": {
+				SubType: "拦截",
+			},
+			"拦截_警告内容_注意级": {
+				SubType: "拦截",
+			},
+			"拦截_警告内容_警告级": {
+				SubType: "拦截",
+			},
+			"拦截_警告内容_危险级": {
+				SubType: "拦截",
+			},
+			"刷屏_警告内容_个人": {
+				SubType: "刷屏",
+			},
+			"刷屏_警告内容_群组": {
+				SubType: "刷屏",
+			},
+			"快捷指令_新增": {
+				SubType: ".alias",
+			},
+			"快捷指令_新增_无指令": {
+				SubType: ".alias",
+			},
+			"快捷指令_替换": {
+				SubType: ".alias",
+			},
+			"快捷指令_删除": {
+				SubType: ".alias",
+			},
+			"快捷指令_删除_未定义": {
+				SubType: ".alias",
+			},
+			"快捷指令_列表": {
+				SubType: ".alias",
+			},
+			"快捷指令_列表_空": {
+				SubType: ".alias",
+			},
+			"快捷指令_列表_单行": {
+				SubType: ".alias",
+			},
+			"快捷指令_列表_分隔符": {
+				SubType: ".alias",
+			},
+			"快捷指令_非群聊": {
+				SubType: ".alias",
+			},
+			"快捷指令_禁止": {
+				SubType: ".alias",
+			},
+			"快捷指令触发_前缀": {
+				SubType: ".&/.a",
+			},
+			"快捷指令触发_无指令": {
+				SubType: ".&/.a",
+			},
+			"黑名单触发_当事人": {
+				SubType: "黑名单",
+				Vars:    []string{"$t黑名单事件"},
+			},
+			"黑名单触发_所在群": {
+				SubType: "黑名单",
+				Vars:    []string{"$t黑名单事件"},
+			},
+			"黑名单触发_邀请人": {
+				SubType: "黑名单",
+				Vars:    []string{"$t黑名单事件", "$t事发群名", "$t事发群号"},
+			},
+			"黑名单惩罚_退群": {
+				SubType: "黑名单",
+			},
+		},
+		"其它": {
+			"抽牌_牌堆列表": {
+				SubType: ".draw list",
+			},
+			"抽牌_列表": {
+				SubType: ".draw keys",
+			},
+			"抽牌_列表_没有牌组": {
+				SubType: ".draw keys",
+			},
+			"抽牌_找不到牌组": {
+				SubType: ".draw",
+				Vars:    []string{"$t牌组"},
+			},
+			"抽牌_找不到牌组_存在类似": {
+				SubType: ".draw",
+				Vars:    []string{"$t牌组"},
+			},
+			"抽牌_结果前缀": {
+				SubType:   ".draw",
+				ExtraText: "举例: 你从牌堆抽出 xxxx",
+				Vars:      []string{"$t牌组"},
+			},
+			"抽牌_分隔符": {
+				SubType:   ".draw",
+				ExtraText: "多个抽取结果之间的分隔符",
+			},
+			"随机名字": {
+				SubType: ".name/.namednd",
+			},
+			"随机名字_分隔符": {
+				SubType: ".name/.namednd",
+			},
+			"戳一戳": {
+				SubType: "手机QQ功能",
+			},
+			"ping响应": {
+				SubType:   ".ping",
+				ExtraText: ".ping命令的响应语",
+			},
+		},
+		"日志": {
+			"记录_新建": {
+				SubType:   ".log new",
+				Vars:      []string{"$t记录名称", "$t存在开启记录", "$t上一记录名称"},
+				ExtraText: "如果通过 log new 替换掉了某个进行中的记录，$t存在开启记录 为 1，$t上一记录名称 为被替换的记录名；否则，$t存在开启记录 为 0，$t上一记录名称 为空字符串",
+			},
+			"记录_开启_成功": {
+				SubType: ".log on",
+			},
+			"记录_开启_失败_无此记录": {
+				SubType: ".log on",
+			},
+			"记录_开启_失败_尚未新建": {
+				SubType:   ".log on",
+				ExtraText: "当 log new 之后，会有一个默认的记录名。此时可以直接log on和log off而不加参数。\n一旦log end之后，默认记录名没有了，就会出这个提示。",
+			},
+			"记录_开启_失败_未结束的记录": {
+				SubType: ".log on",
+				Vars:    []string{"$t记录名称"},
+			},
+			"记录_关闭_成功": {
+				SubType: ".log off",
+			},
+			"记录_关闭_失败": {
+				SubType: ".log off",
+			},
+			"记录_取出_未指定记录": {
+				SubType: ".log get",
+			},
+			"记录_列出_导入语": {
+				SubType: ".log list",
+			},
+			"记录_结束": {
+				SubType: ".log end",
+				Vars:    []string{"$t记录名称", "$t当前记录条数"},
+			},
+			"记录_新建_失败_未结束的记录": {
+				SubType: ".log new",
+				Vars:    []string{"$t记录名称"},
+			},
+			"记录_条数提醒": {
+				SubType: ".log",
+			},
+			"记录_导出_邮箱发送前缀": {
+				SubType: ".log export",
+			},
+			"记录_导出_无格式有效邮箱": {
+				SubType: ".log export",
+			},
+			"记录_导出_未指定记录": {
+				SubType: ".log export",
+			},
+			"记录_导出_文件名前缀": {
+				SubType: ".log export",
+			},
+			"记录_导出_邮件附言": {
+				SubType:   ".log export",
+				ExtraText: "发送的跑团log提取邮件附带的文案。",
+			},
+			"记录_删除_成功": {
+				SubType: ".log del",
+				Vars:    []string{"$t记录名称"},
+			},
+			"记录_删除_失败_找不到": {
+				SubType: ".log del",
+				Vars:    []string{"$t记录名称"},
+			},
+			"记录_删除_失败_正在进行": {
+				SubType: ".log del",
+				Vars:    []string{"$t记录名称"},
+			},
+			"OB_开启": {
+				SubType: ".ob",
+			},
+			"OB_关闭": {
+				SubType: ".ob exit",
+			},
+
+			// 1.4.2+
+			"记录_上传_成功": {
+				SubType: ".log end",
+				Vars:    []string{"$t日志链接"},
+			},
+			"记录_上传_失败": {
+				SubType: ".log end",
+				Vars:    []string{"$t错误原因"},
+			},
+
+			// 1.5.0+
+			"名片_自动设置": {
+				SubType: ".sn",
+			},
+			"名片_取消设置": {
+				SubType: ".sn",
+			},
+			"记录_导出_成功": {
+				SubType: ".log export",
+			},
+		},
+	}
+	d.TextMapRaw = texts
+	d.TextMapHelpInfo = helpInfo
+
+	SetupTextHelpInfo(d, helpInfo, texts, "configs/text-template.yaml")
+}
+
+func SetupTextHelpInfo(d *Dice, helpInfo TextTemplateWithHelpDict, texts TextTemplateWithWeightDict, fn string) {
+	diceTexts := d.TextMapRaw
+
+	for groupName, v := range texts {
+		v1, exists := helpInfo[groupName]
+		if !exists {
+			v1 = TextTemplateHelpGroup{}
+			helpInfo[groupName] = v1
+		}
+
+		if diceTexts[groupName] == nil {
+			// 如果TextMapRaw没有此分类，将其创建
+			diceTexts[groupName] = TextTemplateWithWeight{}
+		}
+
+		for keyName, v2 := range v {
+			helpInfoItem, exists := v1[keyName]
+
+			if !exists {
+				helpInfoItem = &TextTemplateHelpItem{}
+
+				// 检测到新词条，将其写入
+				diceTexts[groupName][keyName] = v2
+
+				// 创建信息
+				helpInfoItem.Origin = v2
+				helpInfoItem.Modified = false
+				helpInfoItem.Filename = []string{fn}
+				helpInfoItem.NotBuiltin = true
+				v1[keyName] = helpInfoItem
+			} else {
+				// d.Logger.Debugf("词条覆盖: %s, %s", keyName, fn)
+				// 如果和最初有变化，标记为修改
+				var modified bool
+
+				if len(helpInfoItem.Origin) == 0 {
+					// 判断为初次
+					helpInfoItem.Origin = append([]TextTemplateItem{}, v2...)
+				}
+
+				if len(v2) != len(helpInfoItem.Origin) {
+					modified = true
+				} else {
+					for index := range v2 {
+						a := v2[index]
+						b := helpInfoItem.Origin[index]
+						if a[0] != b[0] || a[1] != b[1] {
+							modified = true
+							break
+						}
+					}
+				}
+
+				diceTexts[groupName][keyName] = v2 // 不管怎样都要复制，以免出现a改b改a，而留下b的情况
+				helpInfoItem.Modified = modified
+
+				// 添加到文件属性中
+				filenameExists := false
+				for _, i := range helpInfoItem.Filename {
+					if i == fn {
+						filenameExists = true
+						break
+					}
+				}
+
+				if !filenameExists {
+					helpInfoItem.Filename = append(helpInfoItem.Filename, fn)
+				}
+			}
+
+			if len(helpInfoItem.Vars) == 0 {
+				var vars []string
+				existsMap := map[string]bool{}
+				for _, i := range v2 {
+					re := regexp.MustCompile(`{(\S+?)}`)
+					m := re.FindAllStringSubmatch(i[0].(string), -1)
+					for _, j := range m {
+						if !existsMap[j[1]] {
+							existsMap[j[1]] = true
+							vars = append(vars, j[1])
+						}
+					}
+				}
+				helpInfoItem.Vars = vars
+			}
+		}
+	}
+}
+
+// RestoreMissingBuiltinTextEntries restores builtin text entries that were
+// omitted by an older WebUI payload or an imported text-template category.
+// Builtin entries cannot be deleted in the WebUI, so treating their absence as
+// an outdated partial payload is safe. Custom/deprecated entries are left
+// untouched so users can still remove them deliberately.
+func RestoreMissingBuiltinTextEntries(d *Dice, category string) bool {
+	helpGroup, exists := d.TextMapHelpInfo[category]
+	if !exists {
+		return false
+	}
+
+	textGroup, exists := d.TextMapRaw[category]
+	if !exists || textGroup == nil {
+		textGroup = TextTemplateWithWeight{}
+		d.TextMapRaw[category] = textGroup
+	}
+
+	changed := false
+	for key, item := range helpGroup {
+		if item == nil || item.NotBuiltin || len(item.Origin) == 0 {
+			continue
+		}
+		if _, exists := textGroup[key]; exists {
+			continue
+		}
+
+		textGroup[key] = append([]TextTemplateItem{}, item.Origin...)
+		item.Modified = false
+		changed = true
+	}
+	return changed
+}
+
+// RestoreAllMissingBuiltinTextEntries applies RestoreMissingBuiltinTextEntries
+// to every builtin text category.
+func RestoreAllMissingBuiltinTextEntries(d *Dice) bool {
+	changed := false
+	for category := range d.TextMapHelpInfo {
+		if RestoreMissingBuiltinTextEntries(d, category) {
+			changed = true
+		}
+	}
+	return changed
+}
+
+func loadTextTemplate(d *Dice, fn string) {
+	textPath := filepath.Join(d.BaseConfig.DataDir, fn)
+
+	if _, err := os.Stat(textPath); err == nil {
+		data, err := os.ReadFile(textPath)
+		if err != nil {
+			panic(err)
+		}
+		texts := TextTemplateWithWeightDict{}
+		err = yaml.Unmarshal(data, &texts)
+		if err != nil {
+			panic(err)
+		}
+
+		if texts["牌堆"] != nil {
+			texts["其它"] = texts["牌堆"]
+			delete(texts, "牌堆")
+		}
+
+		SetupTextHelpInfo(d, d.TextMapHelpInfo, texts, fn)
+	} else {
+		d.Logger.Info("未检测到自定义文本文件，即将进行创建。")
+	}
+}
+
+func migrateHelpTextKey(d *Dice) bool {
+	coreTexts, exists := d.TextMapRaw["核心"]
+	if !exists || coreTexts == nil {
+		return false
+	}
+
+	const oldKey = "骰子帮助文本_附加说明"
+	const newKey = "骰子帮助文本"
+
+	oldVal, oldExists := coreTexts[oldKey]
+	if !oldExists || len(oldVal) == 0 {
+		return false
+	}
+	// 迁移时优先保留旧键内容，避免被预设新键默认值覆盖
+	coreTexts[newKey] = oldVal
+	delete(coreTexts, oldKey)
+	if coreHelpInfo, ok := d.TextMapHelpInfo["核心"]; ok {
+		delete(coreHelpInfo, oldKey)
+	}
+	return true
+}
+
+func migrateCoreTextKey(d *Dice, oldKey string, newKey string) bool {
+	coreTexts, exists := d.TextMapRaw["核心"]
+	if !exists || coreTexts == nil {
+		return false
+	}
+
+	oldVal, oldExists := coreTexts[oldKey]
+	if !oldExists || len(oldVal) == 0 {
+		return false
+	}
+	// 迁移时优先保留旧键内容，避免被预设新键默认值覆盖
+	coreTexts[newKey] = oldVal
+	delete(coreTexts, oldKey)
+	if coreHelpInfo, ok := d.TextMapHelpInfo["核心"]; ok {
+		delete(coreHelpInfo, oldKey)
+	}
+	return true
+}
+
+func setupTextTemplate(d *Dice) {
+	// 加载预设
+	setupBaseTextTemplate(d)
+
+	// 加载硬盘设置
+	loadTextTemplate(d, "configs/text-template.yaml")
+	if migrateHelpTextKey(d) {
+		d.Logger.Info("检测到旧文案键“核心:骰子帮助文本_附加说明”，已自动迁移为“核心:骰子帮助文本”")
+	}
+	if migrateCoreTextKey(d, "骰子帮助文本_特殊功能", "骰子帮助文本_特色功能") {
+		d.Logger.Info("检测到旧文案键“核心:骰子帮助文本_特殊功能”，已自动迁移为“核心:骰子帮助文本_特色功能”")
+	}
+	if migrateCoreTextKey(d, "骰子状态附加文本", "骰子状态文本") {
+		d.Logger.Info("检测到旧文案键“核心:骰子状态附加文本”，已自动迁移为“核心:骰子状态文本”")
+	}
+	if migrateCoreTextKey(d, "投掷状态附加文本", "骰子状态文本") {
+		d.Logger.Info("检测到旧文案键“核心:投掷状态附加文本”，已自动迁移为“核心:骰子状态文本”")
+	}
+
+	d.SaveText()
+	d.GenerateTextMap()
+}
+
+func (d *Dice) GenerateTextMap() {
+	// 生成TextMap
+	newTextMap := map[string]*wr.Chooser[string, uint]{}
+
+	for category, item := range d.TextMapRaw {
+		for k, v := range item {
+			var choices []wr.Choice[string, uint]
+			for _, textItem := range v {
+				choices = append(choices, wr.NewChoice(textItem[0].(string), getNumVal(textItem[1])))
+			}
+
+			pool, _ := wr.NewChooser(choices...)
+			newTextMap[fmt.Sprintf("%s:%s", category, k)] = pool
+		}
+	}
+
+	picker, _ := wr.NewChooser(wr.NewChoice(APPNAME, uint(1)))
+	newTextMap["常量:APPNAME"] = picker
+
+	picker, _ = wr.NewChooser(wr.NewChoice(VERSION.String(), uint(1)))
+	newTextMap["常量:VERSION"] = picker
+
+	picker, _ = wr.NewChooser(wr.NewChoice(runtime.GOARCH, uint(1)))
+	newTextMap["常量:ARCH"] = picker
+
+	d.TextMap = newTextMap
+}
+
+func getNumVal(i interface{}) uint {
+	switch reflect.TypeOf(i).Kind() {
+	case reflect.Int:
+		return uint(i.(int))
+	case reflect.Int8:
+		return uint(i.(int8))
+	case reflect.Int16:
+		return uint(i.(int16))
+	case reflect.Int32:
+		return uint(i.(int32))
+	case reflect.Int64:
+		return uint(i.(int64))
+	case reflect.Uint:
+		return i.(uint)
+	case reflect.Uint8:
+		return uint(i.(uint8))
+	case reflect.Uint16:
+		return uint(i.(uint16))
+	case reflect.Uint32:
+		return uint(i.(uint32))
+	case reflect.Uint64:
+		return uint(i.(uint64))
+	case reflect.Uintptr:
+		return uint(i.(uintptr))
+	case reflect.Float32:
+		return uint(i.(float32))
+	case reflect.Float64:
+		return uint(i.(float64))
+	case reflect.String:
+		v, _ := strconv.ParseInt(i.(string), 10, 64)
+		return uint(v)
+	default:
+		return 0
+	}
+}
+
+func (d *Dice) loads() {
+	config := NewConfig(d)
+	missingPlatformConfigInServe := false
+	data, err := os.ReadFile(filepath.Join(d.BaseConfig.DataDir, "serve.yaml"))
+	if err == nil { //nolint:nestif
+		err3 := config.LoadYamlConfig(data)
+		if err3 != nil {
+			d.Logger.Error("serve.yaml parse failed")
+			panic(err3)
+		}
+
+		// 有一些配置项被用 jsbind 导出了，只能先留在 Dice 不迁移了
+		dNew := Dice{}
+		err2 := yaml.Unmarshal(data, &dNew)
+		if err2 != nil {
+			d.Logger.Error("serve.yaml parse failed")
+			panic(err2)
+		}
+		missingPlatformConfigInServe = d.loadIMSessionEndpoints(dNew.ImSession)
+		d.DiceMasters = dNew.DiceMasters
+		if len(d.DiceMasters) == 0 {
+			d.DiceMasters = DefaultConfig.DiceMasters
+		}
+		d.CommandPrefix = dNew.CommandPrefix
+		if len(d.CommandPrefix) == 0 {
+			d.CommandPrefix = DefaultConfig.CommandPrefix
+		}
+		d.DeckList = dNew.DeckList
+		var newDiceMasters []string
+		for _, i := range d.DiceMasters {
+			if i != "<平台,如QQ>:<帐号,如QQ号>" {
+				newDiceMasters = append(newDiceMasters, i)
+			}
+		}
+		d.DiceMasters = newDiceMasters
+
+		if config.VersionCode != 0 && config.VersionCode < 10005 {
+			d.RunAfterLoaded = append(d.RunAfterLoaded, func() {
+				d.Logger.Info("正在自动升级自定义文案文件")
+				for index, text := range d.TextMapRaw["核心"]["昵称_重置"] {
+					srcText := text[0].(string)
+					srcText = strings.ReplaceAll(srcText, "{$tQQ昵称}", "{$t旧昵称}")
+					srcText = strings.ReplaceAll(srcText, "{$t帐号昵称}", "{$t旧昵称}")
+					d.TextMapRaw["核心"]["昵称_重置"][index][0] = srcText
+				}
+
+				for index, text := range d.TextMapRaw["核心"]["角色管理_删除成功"] {
+					srcText := text[0].(string)
+					srcText = strings.ReplaceAll(srcText, "{$t新角色名}", "{$t角色名}")
+					d.TextMapRaw["核心"]["角色管理_删除成功"][index][0] = srcText
+				}
+
+				SetupTextHelpInfo(d, d.TextMapHelpInfo, d.TextMapRaw, "configs/text-template.yaml")
+				d.GenerateTextMap()
+				d.SaveText()
+			})
+		}
+
+		// 1.2 版本
+		if config.VersionCode != 0 && config.VersionCode < 10200 {
+			config.TextCmdTrustOnly = DefaultConfig.TextCmdTrustOnly
+			config.QQEnablePoke = DefaultConfig.QQEnablePoke
+			config.PlayerNameWrapEnable = DefaultConfig.PlayerNameWrapEnable
+
+			isUI1001Master := false
+			for _, i := range d.DiceMasters {
+				if i == "UI:1001" {
+					isUI1001Master = true
+					break
+				}
+			}
+			if !isUI1001Master {
+				d.DiceMasters = append(d.DiceMasters, "UI:1001")
+			}
+
+			d.RunAfterLoaded = append(d.RunAfterLoaded, func() {
+				// 更正写反的部分
+				d.Logger.Info("正在自动升级自定义文案文件")
+				for index := range d.TextMapRaw["COC"]["属性设置_保存提醒"] {
+					srcText := `{ $t当前绑定角色 ? '[√] 已绑卡' : '' }`
+					d.TextMapRaw["COC"]["属性设置_保存提醒"][index][0] = srcText
+				}
+
+				SetupTextHelpInfo(d, d.TextMapHelpInfo, d.TextMapRaw, "configs/text-template.yaml")
+				d.GenerateTextMap()
+				d.SaveText()
+			})
+		}
+
+		// 1.2 版本
+		if config.VersionCode != 0 && config.VersionCode < 10203 {
+			d.RunAfterLoaded = append(d.RunAfterLoaded, func() {
+				// 更正写反的部分
+				d.Logger.Info("正在自动升级自定义文案文件")
+				for index := range d.TextMapRaw["COC"]["属性设置_增减_单项"] {
+					srcText := "{$t属性}: {$t旧值} ➯ {$t新值} ({$t增加或扣除}{$t表达式文本}={$t变化量})"
+					d.TextMapRaw["COC"]["属性设置_增减_单项"][index][0] = srcText
+				}
+
+				SetupTextHelpInfo(d, d.TextMapHelpInfo, d.TextMapRaw, "configs/text-template.yaml")
+				d.GenerateTextMap()
+				d.SaveText()
+			})
+		}
+
+		// 1.3 版本
+		if config.VersionCode != 0 && config.VersionCode < 10300 {
+			config.JsEnable = DefaultConfig.JsEnable
+
+			d.RunAfterLoaded = append(d.RunAfterLoaded, func() {
+				// 更正写反的部分
+				d.Logger.Info("正在自动升级自定义文案文件")
+				for index, text := range d.TextMapRaw["娱乐"]["鸽子理由"] {
+					srcText := text[0].(string)
+					srcText = strings.ReplaceAll(srcText, "在互联网上约到可爱美少女不惜搁置跑团前去约会的{$t玩家}，还不知道这个叫奈亚的妹子隐藏着什么", "空山不见人，但闻咕咕声。 —— {$t玩家}")
+					d.TextMapRaw["娱乐"]["鸽子理由"][index][0] = srcText
+				}
+
+				SetupTextHelpInfo(d, d.TextMapHelpInfo, d.TextMapRaw, "configs/text-template.yaml")
+				d.GenerateTextMap()
+				d.SaveText()
+			})
+		}
+
+		// 1.4.3 版本 - 这个migrate应当持续运行几个版本，因为随时可能导入旧文案，而不是升级到143就结束
+		d.RunAfterLoaded = append(d.RunAfterLoaded, func() {
+			d.Logger.Info("正在自动升级自定义文案文件")
+			for index, text := range d.TextMapRaw["COC"]["对抗检定"] {
+				srcText := text[0].(string)
+				srcText = strings.ReplaceAll(srcText, "{$t玩家A判定值}", "{$t玩家A出目}")
+				srcText = strings.ReplaceAll(srcText, "{$t玩家B判定值}", "{$t玩家B出目}")
+				d.TextMapRaw["COC"]["对抗检定"][index][0] = srcText
+			}
+			SetupTextHelpInfo(d, d.TextMapHelpInfo, d.TextMapRaw, "configs/text-template.yaml")
+			d.GenerateTextMap()
+			d.SaveText()
+		})
+
+		d.Config = config
+
+		// 1.4.5 版本 - 覆写lagrange配置
+		// for _, i := range d.ImSession.EndPoints {
+		// 	if i.ProtocolType == "onebot" {
+		// 		pa := i.Adapter.(*PlatformAdapterGocq)
+		// 		if pa.BuiltinMode == "lagrange" {
+		// 			signServerUrl, signServerVersion := RWLagrangeSignServerUrl(d, i, "sealdice", false, "30366")
+		// 			if signServerUrl != "" {
+		// 				// 版本为空，覆写为 "30366"
+		// 				if signServerVersion == "" {
+		// 					RWLagrangeSignServerUrl(d, i, "sealdice", true, "30366")
+		// 				}
+		// 			}
+		// 		}
+		// 	}
+		// }
+
+		// 设置全局群名缓存和用户名缓存
+		dm := d.Parent
+		now := time.Now().Unix()
+		// Pinenutn: Range模板 ServiceAtNew重构代码
+		d.ImSession.ServiceAtNew.Range(func(key string, groupInfo *GroupInfo) bool {
+			// Pinenutn: ServiceAtNew重构
+			// Pinenutn: 这里曾经可能是个Lockfree.hashmap？ 函数有变动
+			dm.GroupNameCache.Store(key, &GroupNameCacheItem{Name: groupInfo.GroupName, time: now})
+			return true
+		})
+		d.Logger.Info("serve.yaml loaded")
+	} else {
+		d.Logger.Info("serve.yaml not found")
+		// 这里是没有加载到配置文件，所以写默认设置项
+		d.DeckList = config.DeckList
+		d.CommandPrefix = config.CommandPrefix
+		d.DiceMasters = config.DiceMasters
+		d.Config = config
+	}
+
+	_ = service.BanItemList(d.DBOperator, func(id string, banUpdatedAt int64, data []byte) {
+		var v BanListInfoItem
+		err := json.Unmarshal(data, &v)
+		if err == nil {
+			v.BanUpdatedAt = banUpdatedAt
+			(&d.Config).BanList.Map.Store(id, &v)
+		}
+	})
+
+	for _, i := range d.ImSession.EndPoints {
+		i.BindRuntime(d.ImSession)
+	}
+	d.warnIfNoPlatformEndpoint(missingPlatformConfigInServe)
+
+	d.LogWriter.SetLogLimit(int(d.Config.UILogLimit))
+
+	// 设置扩展选项（新扩展激活采用延迟模式）
+	d.ApplyExtDefaultSettings()
+
+	// 读取文本模板
+	setupTextTemplate(d)
+	d.MarkModified()
+}
+
+// loadGroups 加载群组数据。
+// 必须在内置扩展、JS 插件、扩展包全部注册完成后调用：
+// 此时 ExtRegistry 完整，反序列化 activatedExtList 可直接解析为全局共享的 ExtInfo 指针。
+func (d *Dice) loadGroups() {
+	d.ImSession.ServiceAtNew = new(SyncMap[string, *GroupInfo])
+
+	// 显式预热 sonic 编译缓存，避免首个群反序列化时 JIT 编译卡顿。
+	_ = sonic.Pretouch(reflect.TypeOf(groupInfoDecodeJSON{}))
+	_ = sonic.Pretouch(reflect.TypeOf(extNameRefsJSON{}))
+
+	// json 解码无法传递 Dice 上下文，加载期间临时提供 name -> *ExtInfo 解析器。
+	prevResolver := extJSONResolver
+	extJSONResolver = func(name string) *ExtInfo {
+		if d.ExtRegistry == nil {
+			return nil
+		}
+		if ext, ok := d.ExtRegistry.Load(name); ok && ext != nil {
+			return ext
+		}
+		return nil
+	}
+	defer func() { extJSONResolver = prevResolver }()
+
+	err := service.GroupInfoListGet(d.DBOperator, func(id string, _ int64, data []byte) {
+		var groupInfo GroupInfo
+		if err := sonic.Unmarshal(data, &groupInfo); err != nil {
+			d.Logger.Errorf("加载群信息失败: %s", id)
+			return
+		}
+		groupInfo.GroupID = id
+		groupInfo.UpdatedAtTime = 0
+
+		if groupInfo.DiceIDActiveMap == nil {
+			groupInfo.DiceIDActiveMap = new(SyncMap[string, bool])
+		}
+		if groupInfo.DiceIDExistsMap == nil {
+			groupInfo.DiceIDExistsMap = new(SyncMap[string, bool])
+		}
+		if groupInfo.BotList == nil {
+			groupInfo.BotList = new(SyncMap[string, bool])
+		}
+		groupInfo.ensureInactivatedSet()
+		// 恢复日志 seq 持久基线：否则重启后会回退到 DB MAX(seq)，
+		// 把 log off 期间的消息当成断层补录。
+		groupInfo.initLogSeqFromPersisted()
+		if groupInfo.LogOn && groupInfo.LogCurID > 0 {
+			// 重启前已经落库的消息比持久基线更新；用 DB MAX(seq) 校准，
+			// 否则会把已记录消息再次算入 gap。
+			if seq, err := service.LogGetLastSeq(d.DBOperator, groupInfo.LogCurID); err == nil && seq > 0 {
+				groupInfo.advanceLogSeq(seq, nil)
+			}
+		}
+
+		var toDelete []string
+		groupInfo.DiceIDExistsMap.Range(func(key string, _ bool) bool {
+			if strings.HasPrefix(key, "QQ-Group:") {
+				toDelete = append(toDelete, key)
+			}
+			return true
+		})
+		for _, key := range toDelete {
+			groupInfo.DiceIDExistsMap.Delete(key)
+		}
+		d.ImSession.ServiceAtNew.Store(id, &groupInfo)
+	})
+	if err != nil {
+		d.Logger.Errorf("加载群信息失败 %s", err)
+	}
+
+	dm := d.Parent
+	now := time.Now().Unix()
+	d.ImSession.ServiceAtNew.Range(func(key string, groupInfo *GroupInfo) bool {
+		dm.GroupNameCache.Store(key, &GroupNameCacheItem{Name: groupInfo.GroupName, time: now})
+		return true
+	})
+}
+
+func (d *Dice) loadIMSessionEndpoints(imSession *IMSession) bool {
+	if imSession == nil || imSession.EndPoints == nil {
+		d.ImSession.EndPoints = make([]*EndPointInfo, 0)
+		d.ImSession.RefreshEndPointsSnapshot()
+		return true
+	}
+
+	d.ImSession.EndPoints = imSession.EndPoints
+	d.ImSession.RefreshEndPointsSnapshot()
+	return false
+}
+
+func (d *Dice) warnIfNoPlatformEndpoint(missingPlatformConfigInServe bool) {
+	if len(d.ImSession.EndPoints) != 0 {
+		return
+	}
+
+	if missingPlatformConfigInServe {
+		d.Logger.Warn("serve.yaml 中未找到平台账号配置，余烬将不会连接聊天平台。请检查 serve.yaml，或在界面中重新添加账号。")
+		return
+	}
+
+	d.Logger.Warn("当前没有可用的平台账号，余烬将不会连接聊天平台，也无法收发消息。请检查账号设置或 serve.yaml 配置。")
+}
+func (d *Dice) loadAdvanced() {
+	d.Logger.Info("开始读取 advanced.yaml")
+	advancedConfig := AdvancedConfig{
+		Show:                false,
+		Enable:              false,
+		CustomReplyCooldown: DefaultCustomReplyCooldown,
+	} // default value
+
+	data, err := os.ReadFile(filepath.Join(d.BaseConfig.DataDir, "advanced.yaml"))
+	if errors.Is(err, os.ErrNotExist) {
+		d.AdvancedConfig = advancedConfig
+		return
+	} else if err != nil {
+		d.Logger.Error("读取 advanced.yaml 失败 ", err.Error())
+		return
+	}
+
+	err = yaml.Unmarshal(data, &advancedConfig)
+	if err != nil {
+		d.Logger.Error("解析 advanced.yaml 失败 ", err.Error())
+		return
+	}
+	if advancedConfig.CustomReplyCooldown <= 0 {
+		advancedConfig.CustomReplyCooldown = DefaultCustomReplyCooldown
+	}
+
+	d.AdvancedConfig = advancedConfig
+}
+
+func (d *Dice) SaveText() {
+	buf, err := marshalTextTemplate(d.TextMapRaw)
+	if err != nil {
+		d.Logger.Error("Dice.SaveText", err)
+		return
+	}
+
+	newFn := filepath.Join(d.BaseConfig.DataDir, "configs/text-template.yaml")
+	if err := saveTextTemplateFile(newFn, buf); err != nil {
+		d.Logger.Error("Dice.SaveText", err)
+	}
+}
+
+func marshalTextTemplate(texts TextTemplateWithWeightDict) (buf []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			buf = nil
+			err = fmt.Errorf("序列化文案失败: %v", recovered)
+		}
+	}()
+
+	buf, err = yaml.Marshal(texts)
+	if err != nil {
+		return nil, fmt.Errorf("序列化文案失败: %w", err)
+	}
+
+	// 再次解析序列化结果，避免异常数据覆盖掉现有文案文件。
+	var parsed TextTemplateWithWeightDict
+	if err := yaml.Unmarshal(buf, &parsed); err != nil {
+		return nil, fmt.Errorf("校验生成的文案 YAML 失败: %w", err)
+	}
+	return buf, nil
+}
+
+func saveTextTemplateFile(filename string, data []byte) error {
+	dir := filepath.Dir(filename)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("创建文案目录失败: %w", err)
+	}
+
+	current, err := os.ReadFile(filename)
+	if err == nil {
+		if backupErr := utils.AtomicWriteFile(filename+".bak", current, 0o644); backupErr != nil {
+			return fmt.Errorf("备份文案文件失败: %w", backupErr)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("读取现有文案文件失败: %w", err)
+	}
+
+	if err := utils.AtomicWriteFile(filename, data, 0o644); err != nil {
+		return fmt.Errorf("写入文案文件失败: %w", err)
+	}
+	return nil
+}
+
+// ApplyExtDefaultSettings 应用扩展默认配置，同时处理插件的启用和禁用
+// 新扩展激活采用延迟模式，在群组收到消息时通过 GetActivatedExtList 按需激活
+func (d *Dice) ApplyExtDefaultSettings() {
+	// 遍历两个列表
+	exts1 := map[string]*ExtDefaultSettingItem{}
+	for _, i := range d.Config.ExtDefaultSettings {
+		exts1[i.Name] = i
+	}
+
+	exts2 := map[string]*ExtInfo{}
+	for _, i := range d.ExtList {
+		exts2[i.Name] = i
+	}
+
+	// 如果存在于扩展列表，但不存在于默认列表中的，添加到默认列表末尾
+	for k, v := range exts2 {
+		if _, exists := exts1[k]; !exists {
+			item := &ExtDefaultSettingItem{Name: k, AutoActive: v.AutoActive, DisabledCommand: map[string]bool{}}
+			(&d.Config).ExtDefaultSettings = append((&d.Config).ExtDefaultSettings, item)
+			exts1[k] = item
+		}
+	}
+
+	// 先绑定默认设置到扩展，确保后续激活逻辑能读取AutoActive等
+	// 遍历设置表，将其插入扩展信息
+	for k, v := range exts1 {
+		extInfo, exists := exts2[k]
+		if exists {
+			v.ExtItem = extInfo
+			v.Loaded = true
+			extInfo.DefaultSetting = v
+
+			// 为了避免锁问题，这里做一个新的map
+			m := map[string]bool{}
+
+			// 将改扩展拥有的指令，塞入DisabledCommand
+			names := map[string]bool{}
+			for _, v := range extInfo.GetCmdMap() {
+				names[v.Name] = true
+			}
+			// 去掉无效指令
+			for k, v := range v.DisabledCommand {
+				if names[k] {
+					m[k] = v
+				}
+			}
+			// 塞入之前没有的指令
+			for k := range names {
+				if _, exists := m[k]; !exists {
+					m[k] = false // false 因为默认不禁用
+				}
+			}
+			v.DisabledCommand = m
+		} else {
+			// 需要吗?
+			// 也许需要, 模糊地感觉可能造成内存泄漏
+			// v.ExtItem = nil
+			v.Loaded = false
+		}
+	}
+
+	// 新扩展激活已改为延迟模式：在 GetActivatedExtList 中按需激活
+	// 不再遍历所有群组，避免大量群组被标记为 dirty 导致 Save 耗时过长
+	//
+	// 但当默认设置从关闭改为开启（AutoActive=true）时，需要清理群组中的关闭记录，
+	// 并重置群组扩展应用版本，让后续消息触发的延迟同步按新默认配置生效。
+	if d.ImSession != nil && d.ImSession.ServiceAtNew != nil {
+		autoActiveNames := make(map[string]struct{}, len(exts1))
+		for name, setting := range exts1 {
+			if setting != nil && setting.AutoActive {
+				autoActiveNames[name] = struct{}{}
+			}
+		}
+
+		if len(autoActiveNames) > 0 {
+			d.ImSession.ServiceAtNew.Range(func(_ string, group *GroupInfo) bool {
+				if group == nil {
+					return true
+				}
+				group.extInitMu.Lock()
+				group.ensureInactivatedSet()
+				changed := false
+				for name := range autoActiveNames {
+					_, inUnion := group.InactivatedExtSet[name]
+					_, inUser := group.UserInactivatedExtSet[name]
+					if inUnion || inUser {
+						delete(group.InactivatedExtSet, name)
+						delete(group.UserInactivatedExtSet, name)
+						changed = true
+					}
+				}
+				// 触发下一次消息时重新按新默认配置同步扩展状态
+				group.ExtAppliedVersion = 0
+				atomic.StoreInt64(&group.ExtAppliedTime, 0)
+				group.extInitMu.Unlock()
+				if changed {
+					group.MarkDirty(d)
+				}
+				return true
+			})
+		}
+	}
+
+	// 不好分辨，直接标记
+	d.MarkModified()
+}
+
+func (d *Dice) Save(isAuto bool) {
+	d.ImSession.RefreshEndPointsSnapshot()
+	saveStartTime := time.Now()
+
+	configStartTime := time.Now()
+	if d.LastUpdatedTime != 0 {
+		totalConf := &struct {
+			// copy from Dice
+			ImSession     *IMSession  `jsbind:"imSession"     json:"-"             yaml:"imSession"`
+			DeckList      []*DeckInfo `jsbind:"deckList"      yaml:"deckList"`      // 牌堆信息
+			CommandPrefix []string    `jsbind:"commandPrefix" yaml:"commandPrefix"` // 指令前导
+			DiceMasters   []string    `jsbind:"diceMasters"   yaml:"diceMasters"`   // 骰主设置，需要格式: 平台:帐号
+
+			Config `yaml:",inline"`
+		}{
+			// 这些都是由于导出到 goja 无法拆分的字段
+			d.ImSession,
+			d.DeckList,
+			d.CommandPrefix,
+			d.DiceMasters,
+
+			d.Config,
+		}
+		a, err1 := yaml.Marshal(totalConf)
+		advancedData, err2 := yaml.Marshal(d.AdvancedConfig)
+
+		if err1 == nil && err2 == nil {
+			err1 := utils.AtomicWriteFile(filepath.Join(d.BaseConfig.DataDir, "serve.yaml"), a, 0o644)
+			err2 := utils.AtomicWriteFile(filepath.Join(d.BaseConfig.DataDir, "advanced.yaml"), advancedData, 0o644)
+			if err1 == nil && err2 == nil {
+				now := time.Now()
+				d.Config.LastSavedTime = &now
+				if isAuto {
+					d.Logger.Info("自动保存")
+				} else {
+					d.Logger.Info("保存数据")
+				}
+				d.LastUpdatedTime = 0
+			} else if err1 != nil && err2 != nil {
+				d.Logger.Error("保存 serve.yaml 和 advanced.yaml 出错", err2)
+			} else if err1 != nil {
+				d.Logger.Error("保存 serve.yaml 出错", err1)
+			} else {
+				d.Logger.Error("保存 advanced.yaml 出错", err2)
+			}
+		}
+	}
+	configDuration := time.Since(configStartTime)
+
+	groupStartTime := time.Now()
+	var groupCount, playerCount, groupSavedCount, playerSavedCount int
+	if d.DirtyGroups != nil {
+		var dirtyIDs []string
+		d.DirtyGroups.Range(func(groupID string, _ int64) bool {
+			dirtyIDs = append(dirtyIDs, groupID)
+			return true
+		})
+
+		for _, groupID := range dirtyIDs {
+			groupCount++
+			groupInfo, ok := d.ImSession.ServiceAtNew.Load(groupID)
+			if !ok || groupInfo == nil {
+				d.DirtyGroups.Delete(groupID)
+				continue
+			}
+
+			if groupInfo.Players != nil {
+				groupInfo.Players.Range(func(key string, value *GroupPlayerInfo) bool {
+					playerCount++
+					if value.UpdatedAtTime != 0 {
+						playerSavedCount++
+						now := int(time.Now().Unix())
+						value.UserID = key
+						value.GroupID = groupInfo.GroupID
+						value.UpdatedAt = now
+						_ = service.GroupPlayerInfoSave(d.DBOperator, (*model.GroupPlayerInfoBase)(value))
+						value.UpdatedAtTime = 0
+					}
+					return true
+				})
+			}
+
+			if groupInfo.UpdatedAtTime != 0 {
+				groupSavedCount++
+				data, err := json.Marshal(groupInfo)
+				if err == nil {
+					err := service.GroupInfoSave(d.DBOperator, groupInfo.GroupID, groupInfo.UpdatedAtTime, data)
+					if err != nil {
+						d.Logger.Warnf("保存群组数据失败 %v : %v", groupInfo.GroupID, err.Error())
+					}
+					groupInfo.UpdatedAtTime = 0
+				}
+			}
+
+			d.DirtyGroups.Delete(groupID)
+		}
+	}
+	groupDuration := time.Since(groupStartTime)
+
+	attrsStartTime := time.Now()
+	// 同步全部属性数据：个人角色卡、群内角色卡、群数据、个人全局数据
+	err := d.AttrsManager.CheckForSave()
+	if err != nil {
+		d.Logger.Errorf("保存属性数据失败 %v", err)
+	}
+	attrsDuration := time.Since(attrsStartTime)
+
+	// 保存黑名单数据
+	// TODO: 增加更新时间检测
+	// model.BanMapSet(d.DBData, d.Config.BanList.MapToJSON())
+
+	// endpoint数据额外更新到数据库
+	epStartTime := time.Now()
+	var epCount int
+	for _, ep := range d.ImSession.EndPoints {
+		// 为了避免Restore时没有UserId, Dump时有UserId, 导致空白数据被错误落库的情况, 这里提前做判断
+		if len(ep.UserID) > 0 {
+			epCount++
+			/* NOTE(Xiangze Li): 按理说Restore只需要在每个ep新增时做一次. 但是许多ep都是异步
+			   连接, 并且在连接真正完成之后才有UserId. 所以干脆每次保存数据都尝试一次Restore. */
+			ep.StatsRestore(d)
+			ep.StatsDump(d)
+		}
+	}
+	epDuration := time.Since(epStartTime)
+
+	totalDuration := time.Since(saveStartTime)
+	if playerSavedCount >= 1 || groupSavedCount >= 1 {
+		d.Logger.Infof("Save 完成，耗时统计: 总计 %dms | 配置文件 %dms | 群组/玩家 %dms (群%d/%d, 玩家%d/%d) | 属性 %dms | EP %dms (%d个)",
+			totalDuration.Milliseconds(),
+			configDuration.Milliseconds(),
+			groupDuration.Milliseconds(), groupSavedCount, groupCount, playerSavedCount, playerCount,
+			attrsDuration.Milliseconds(),
+			epDuration.Milliseconds(), epCount)
+	}
+}

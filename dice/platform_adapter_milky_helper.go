@@ -1,0 +1,608 @@
+package dice
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"Scardice-core/logger"
+	"Scardice-core/utils"
+	"Scardice-core/utils/procs"
+)
+
+var defaultLagrangeV2Config = `{
+    "$schema": "https://raw.githubusercontent.com/LagrangeDev/LagrangeV2/refs/heads/main/Lagrange.Milky/Resources/appsettings_schema.json",
+    "Logging": {
+        "LogLevel": {
+            "Default": "Information",
+        },
+    },
+    "Core": {
+        // "Server": {
+        //     Whether to automatically reconnect to the server
+        //     "AutoReconnect": true,
+
+        //     Whether to use IPv6 to connect to the server
+        //     "UseIPv6Network": false,
+
+        //     Whether to automatically select the fastest server
+        //     "GetOptimumServer": true,
+        // },
+        "Signer": {
+            // Signer URL
+            "Url": "{NTSignServer地址}",
+
+            // Signer token
+            // "Token": null
+
+            // Proxy for connect signer
+            // only supports Http proxy
+            // "ProxyUrl": null,
+        },
+        "Login": {
+            // Account uin
+            // If the Uin is inconsistent with the actual login account, quick login will not be possible
+            "Uin": {账号UIN},
+            
+            // Account password
+            // Set to null to login via QrCode
+            // "Password": null,
+
+            // Device Name
+            // Only valid when logging in without Keystore
+            "DeviceName": "Ubuntu 22.04",
+
+            // Whether to try to log in automatically after disconnection
+            // "AutoReLogin": true,
+
+            // Whether to use ASCII compatible QrCode
+            // "CompatibleQrCode": false,
+
+            // Whether to use the online validating parser provided by the mysterious person
+            // "UseOnlineCaptchaResolver": true,
+        },
+    },
+    "Milky": {
+        // The host that Milky service listens on
+        // Look https://learn.microsoft.com/zh-cn/dotnet/fundamentals/runtime-libraries/system-net-httplistener
+        // If you use * to expose your data to all networks, please ensure proper security settings
+        // e.g. setting a access token, configuring a firewall
+        "Host": "127.0.0.1",
+
+        // The port that the Milky service listens on
+        "Port": {WS端口},
+
+        // The path prefix that Milky service listens on
+        // "Prefix": "/",
+
+        // Token for verification, Set to null to disable
+        "AccessToken": "{访问Token}",
+
+        // Whether to enable WebSocket service
+        // "EnabledWebSocket": true,
+
+        // Set to null to disable the WebHook service
+        // "WebHook": null, // Default
+        // "WebHook": {
+        //     // WebHook Target URL
+        //     "Url": "http://127.0.0.1:3001/webhook"
+        // }
+
+        // "Message": {
+        //     // Whether to ignore messages sent by Bot
+        //     "IgnoreBotMessage": false,
+        //     "Cache": {
+        //         "Policy": "LRU",
+        //         // Maximum cache capacity
+        //         "Capacity": 1000,
+        //     },
+        // },
+    },
+}
+`
+
+var defaultYogurtConfig = `{
+    "configVersion": 3,
+    "protocol": {
+        "uin": {账号UIN},
+        "password": "",
+        "os": "Linux",
+        "version": "46494",
+        "signApiUrl": "{NTSignServer地址}",
+        "pcLagrangeSignToken": "placeholder",
+        "androidUseLegacySign": false
+    },
+    "milky": {
+        "http": {
+            "host": "127.0.0.1",
+            "port": {WS端口},
+            "prefix": "",
+            "accessToken": "{访问Token}",
+            "corsOrigins": []
+        },
+        "webhook": {
+            "endpoints": []
+        },
+        "reportSelfMessage": true,
+        "preloadContacts": false,
+        "ffmpegPath": ""
+    },
+    "logging": {
+        "ansiLevel": "ANSI256",
+        "coreLogLevel": "DEBUG"
+    },
+    "security": {
+        "skipOnLaunchListenAddressCheck": false
+    },
+    "debug": {
+        "enableFaceDetailsApi": false
+    }
+}`
+
+var SealSignV3Url = ``
+
+type milkyBuiltInSignals struct {
+	qrcode                  string
+	qrcodeWaitingForScan    string
+	qrcodeWaitingForConfirm string
+	qrcodeCancelled         string
+	online                  string
+	qrcodeExpired           string
+}
+
+func milkyBuiltInConfigFileName(mode string) string {
+	switch mode {
+	case "lagrangeV2":
+		return "appsettings.jsonc"
+	case "yogurt":
+		return "config.json"
+	default:
+		return ""
+	}
+}
+
+func getMilkyBuiltInSignals(mode string) milkyBuiltInSignals {
+	switch mode {
+	case "lagrangeV2":
+		return milkyBuiltInSignals{
+			qrcode:                  "Fetch QrCode Success",
+			qrcodeWaitingForScan:    "Fetch QrCode Success",
+			qrcodeWaitingForConfirm: "QrCode State: 53",
+			qrcodeCancelled:         "QrCode State: 54",
+			online:                  "successfully logged in",
+			qrcodeExpired:           "QrCode State: 17",
+		}
+	case "yogurt":
+		return milkyBuiltInSignals{
+			qrcode:                  "二维码文件已保存",
+			qrcodeWaitingForScan:    "二维码状态：WAITING_FOR_SCAN",
+			qrcodeWaitingForConfirm: "二维码状态：WAITING_FOR_CONFIRMATION",
+			qrcodeCancelled:         "用户取消了登录",
+			online:                  "已上线",
+			qrcodeExpired:           "二维码已过期",
+		}
+	default:
+		return milkyBuiltInSignals{}
+	}
+}
+
+func containsMilkyBuiltInSignal(line string, signal string) bool {
+	return signal != "" && strings.Contains(line, signal)
+}
+
+func getMilkyBuiltInLoginStateFromLine(line string, signals milkyBuiltInSignals) MilkyLoginState {
+	switch {
+	case containsMilkyBuiltInSignal(line, signals.online):
+		return MilkyLoginStateQRConnected
+	case containsMilkyBuiltInSignal(line, signals.qrcodeWaitingForConfirm) || strings.Contains(line, "WAITING_FOR_CONFIRMATION") || strings.Contains(line, "QrCode State: 53"):
+		return MilkyLoginStateQRWaitingForConfirm
+	case containsMilkyBuiltInSignal(line, signals.qrcodeCancelled) || strings.Contains(line, "CANCELLED") || strings.Contains(line, "QrCode State: 54"):
+		return MilkyLoginStateCancelled
+	case containsMilkyBuiltInSignal(line, signals.qrcodeExpired) || strings.Contains(line, "CODE_EXPIRED") || strings.Contains(line, "QrCode State: 17"):
+		return MilkyLoginStateCodeExpired
+	case containsMilkyBuiltInSignal(line, signals.qrcodeWaitingForScan) || strings.Contains(line, "WAITING_FOR_SCAN"):
+		return MilkyLoginStateQRWaitingForScan
+	default:
+		return MilkyLoginStateInit
+	}
+}
+
+func applyMilkyBuiltInLoginTerminalState(d *Dice, ep *EndPointInfo, state MilkyLoginState) {
+	pa := ep.Adapter.(*PlatformAdapterMilky)
+	pa.BuiltInLoginState = state
+	pa.QrCodeData = nil
+	ep.Enable = false
+	ep.State = StateDisconnected
+	if d != nil {
+		d.LastUpdatedTime = time.Now().Unix()
+		d.Save(false)
+	}
+}
+
+type AddMilkyEcho struct {
+	Token       string
+	WsGateway   string
+	RestGateway string
+	BuiltInMode string
+}
+
+func NewMilkyConnItem(v AddMilkyEcho) *EndPointInfo {
+	conn := new(EndPointInfo)
+	conn.ID = uuid.New().String()
+	conn.Platform = "QQ"
+	conn.ProtocolType = "milky"
+	conn.Enable = false
+	conn.RelWorkDir = "extra/milky-" + conn.ID
+	conn.Adapter = &PlatformAdapterMilky{
+		EndPoint:    conn,
+		Token:       v.Token,
+		WsGateway:   v.WsGateway,
+		RestGateway: v.RestGateway,
+		BuiltInMode: v.BuiltInMode,
+	}
+	return conn
+}
+
+func ServeMilky(d *Dice, ep *EndPointInfo) {
+	defer CrashLog()
+	if ep.Platform == "QQ" {
+		conn := ep.Adapter.(*PlatformAdapterMilky)
+		ep.BindRuntime(d.ImSession)
+		d.Logger.Infof("Milky 尝试连接")
+		if conn.Serve() != 0 {
+			d.Logger.Errorf("连接Milky失败")
+			ep.State = 3
+			d.LastUpdatedTime = time.Now().Unix()
+			d.Save(false)
+		}
+	}
+}
+
+func BuiltinMilkyClientKill(dice *Dice, conn *EndPointInfo) {
+	defer func() {
+		if r := recover(); r != nil {
+			dice.Logger.Error("内置 Milky 客户端清理报错: ", r)
+		}
+	}()
+	pa, ok := conn.Adapter.(*PlatformAdapterMilky)
+	if !ok {
+		return
+	}
+	if pa.BuiltInMode == "" {
+		return
+	}
+	defer func() {
+		pa.MilkyProcess = nil
+	}()
+	if pa.MilkyProcess != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		go func() {
+			<-ctx.Done()
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				dice.Logger.Error("Milky 进程未能在 5 秒内退出，可能需要手动结束")
+			}
+		}()
+		err := pa.MilkyProcess.Stop()
+		if err != nil {
+			dice.Logger.Error("停止 Milky 进程失败: ", err)
+		}
+		_ = pa.MilkyProcess.Wait()
+	}
+}
+
+func ServeMilkyBuiltIn(d *Dice, ep *EndPointInfo) {
+	defer CrashLog()
+	if d.ContainerMode {
+		d.Logger.Warnf("当前处于容器模式，Milky 内置版本不可用")
+		ep.State = 3
+		d.LastUpdatedTime = time.Now().Unix()
+		d.Save(false)
+		return
+	}
+	uin, err := strconv.ParseInt(ExtractQQUserID(ep.UserID), 10, 64)
+	if err != nil {
+		d.Logger.Errorf("解析QQ号失败: %s", ep.UserID)
+		ep.State = 3
+		d.LastUpdatedTime = time.Now().Unix()
+		d.Save(false)
+		return
+	}
+	conn := ep.Adapter.(*PlatformAdapterMilky)
+	doServe := func() {
+		if ep.Platform == "QQ" {
+			d.Logger.Infof("Milky 尝试连接")
+			if conn.Serve() != 0 {
+				d.Logger.Errorf("连接Milky失败")
+				ep.State = 3
+				d.LastUpdatedTime = time.Now().Unix()
+				d.Save(false)
+				BuiltinMilkyClientKill(d, ep)
+			}
+		}
+	}
+	pa := conn
+	ep.BindRuntime(d.ImSession)
+	log := zap.S().Named(logger.LogKeyAdapter)
+
+	workDir := filepath.Join(d.BaseConfig.DataDir, ep.RelWorkDir)
+	diceWorkdir, _ := os.Getwd()
+	milkyExePath, _ := filepath.Abs(filepath.Join(diceWorkdir, fmt.Sprintf("milky/%s", pa.BuiltInMode)))
+	configFilePath := filepath.Join(workDir, milkyBuiltInConfigFileName(pa.BuiltInMode))
+	qrcodeFilePath := filepath.Join(workDir, "qrcode.png")
+	milkyExePath = filepath.ToSlash(milkyExePath) // windows平台需要这个替换
+	if runtime.GOOS == "windows" {
+		milkyExePath += ".exe" //nolint:ineffassign
+	}
+	_ = os.MkdirAll(workDir, 0o755)
+	_ = os.Chmod(milkyExePath, 0o755)
+	if pa.MilkyProcess != nil {
+		BuiltinMilkyClientKill(d, ep)
+	}
+	// 临时监听器在子进程绑定前已释放，重登时必须重新申请端口，
+	// 否则旧端口可能已被其他进程占用。
+	port, err := GetRandomFreePort()
+	if err != nil {
+		log.Errorf("获取随机端口失败: %s", err)
+		ep.State = 3
+		d.LastUpdatedTime = time.Now().Unix()
+		d.Save(false)
+		return
+	}
+	wsGateway := fmt.Sprintf("ws://127.0.0.1:%d/event", port)
+	restGateway := fmt.Sprintf("http://127.0.0.1:%d/api", port)
+	accessToken := pa.Token
+	if accessToken == "" {
+		accessToken = uuid.NewString()
+	}
+	config := GenerateMilkyConfig(port, SealSignV3Url, accessToken, ep)
+	if len(config) == 0 {
+		log.Errorf("不支持的内置 Milky 模式: %s", pa.BuiltInMode)
+		ep.State = 3
+		d.LastUpdatedTime = time.Now().Unix()
+		d.Save(false)
+		return
+	}
+	if err := utils.AtomicWriteFile(configFilePath, config, 0o644); err != nil {
+		log.Errorf("写入 Milky 配置文件失败: %s", err)
+		ep.State = 3
+		d.LastUpdatedTime = time.Now().Unix()
+		d.Save(false)
+		return
+	}
+	pa.WsGateway = wsGateway
+	pa.RestGateway = restGateway
+	pa.Token = accessToken
+	command := fmt.Sprintf(`"%s"`, milkyExePath)
+	p := procs.NewProcess(command)
+	p.Dir = workDir
+	p.Env = []string{
+		fmt.Sprintf("APP_LAUNCHER_SIG=%s", BuildSignature(uint64(uin))),
+	}
+	// OutputHandler 可能在 Start 返回前收到二维码过期信号；
+	// 进程注册完成前不能调用停止逻辑。
+	processRegistered := make(chan struct{})
+	chQrCode := make(chan int, 1)
+	qrSignalCalled := atomic.Bool{}
+	qrSignalCalled.Store(false)
+	var loginStateMu sync.Mutex
+	var qrTimeout *time.Timer
+	stopQrTimeout := func() {
+		loginStateMu.Lock()
+		defer loginStateMu.Unlock()
+		if qrTimeout != nil {
+			qrTimeout.Stop()
+			qrTimeout = nil
+		}
+	}
+	setLoginState := func(state MilkyLoginState) {
+		loginStateMu.Lock()
+		if pa.BuiltInLoginState == state || pa.BuiltInLoginState == MilkyLoginStateCancelled || pa.BuiltInLoginState == MilkyLoginStateCodeExpired {
+			loginStateMu.Unlock()
+			return
+		}
+		pa.BuiltInLoginState = state
+		loginStateMu.Unlock()
+		d.LastUpdatedTime = time.Now().Unix()
+		d.Save(false)
+	}
+	finishLogin := func(state MilkyLoginState, message string) {
+		loginStateMu.Lock()
+		if pa.BuiltInLoginState == MilkyLoginStateQRConnected || pa.BuiltInLoginState == MilkyLoginStateCancelled || pa.BuiltInLoginState == MilkyLoginStateCodeExpired {
+			loginStateMu.Unlock()
+			return
+		}
+		applyMilkyBuiltInLoginTerminalState(nil, ep, state)
+		d.LastUpdatedTime = time.Now().Unix()
+		if qrTimeout != nil {
+			qrTimeout.Stop()
+			qrTimeout = nil
+		}
+		loginStateMu.Unlock()
+		d.Save(false)
+		log.Infof("Milky %s，已禁用账号：%s", message, ep.UserID)
+		if state == MilkyLoginStateCodeExpired {
+			<-processRegistered
+		}
+		BuiltinMilkyClientKill(d, ep)
+	}
+	startQrTimeout := func() {
+		loginStateMu.Lock()
+		if qrTimeout != nil {
+			qrTimeout.Stop()
+		}
+		qrTimeout = time.AfterFunc(120*time.Second, func() {
+			finishLogin(MilkyLoginStateCodeExpired, "二维码超时")
+		})
+		loginStateMu.Unlock()
+	}
+	pa.BuiltInLoginState = MilkyLoginStateInit
+	p.OutputHandler = func(line string, _type string) string {
+		signals := getMilkyBuiltInSignals(pa.BuiltInMode)
+		if containsMilkyBuiltInSignal(line, signals.qrcode) && !qrSignalCalled.Load() {
+			qrSignalCalled.Store(true)
+			chQrCode <- 1
+		}
+
+		switch getMilkyBuiltInLoginStateFromLine(line, signals) {
+		case MilkyLoginStateQRWaitingForScan:
+			setLoginState(MilkyLoginStateQRWaitingForScan)
+		case MilkyLoginStateQRWaitingForConfirm:
+			setLoginState(MilkyLoginStateQRWaitingForConfirm)
+		case MilkyLoginStateQRConnected:
+			stopQrTimeout()
+			setLoginState(MilkyLoginStateQRConnected)
+			log.Infof("Milky 登录成功，账号：<%s>(%s)", ep.Nickname, ep.UserID)
+			// 经测试，若不延时，登录成功的同一时刻进行ws正向连接有几率导致第一次连接失败
+			time.Sleep(1 * time.Second)
+			go doServe()
+		case MilkyLoginStateCancelled:
+			finishLogin(MilkyLoginStateCancelled, "用户取消登录")
+		case MilkyLoginStateCodeExpired:
+			finishLogin(MilkyLoginStateCodeExpired, "二维码过期")
+		case MilkyLoginStateInit, MilkyLoginStatePlaceholder, MilkyLoginStateConnecting, MilkyLoginStateFailed:
+		}
+
+		if _type == "stderr" {
+			log.Error("Milky Internal: ", strings.TrimSpace(line))
+		} else {
+			if ep.State != 1 {
+				log.Info("Milky Internal: ", strings.TrimSpace(line))
+			} else {
+				log.Debug("Milky Internal: ", strings.TrimSpace(line))
+			}
+		}
+
+		return ""
+	}
+
+	go func() {
+		<-chQrCode
+		time.Sleep(3 * time.Second)
+		if _, err := os.Stat(qrcodeFilePath); err == nil {
+			log.Info("Milky 二维码已就绪")
+			qrdata, err := os.ReadFile(qrcodeFilePath)
+			if err == nil {
+				loginStateMu.Lock()
+				pa.BuiltInLoginState = MilkyLoginStateQRWaitingForScan
+				pa.QrCodeData = qrdata
+				loginStateMu.Unlock()
+				startQrTimeout()
+				log.Info("Milky 读取二维码成功")
+				d.LastUpdatedTime = time.Now().Unix()
+				d.Save(false)
+			} else {
+				pa.BuiltInLoginState = MilkyLoginStateFailed
+				pa.QrCodeData = nil
+				d.LastUpdatedTime = time.Now().Unix()
+				d.Save(false)
+				log.Infof("Milky 读取二维码失败：%s", err)
+			}
+		}
+	}()
+
+	run := func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Errorf("MilkyInternal 异常: %v 堆栈: %v", r, string(debug.Stack()))
+			}
+		}()
+
+		errRun := p.Start()
+		if errRun != nil {
+			log.Info("Milky 进程启动失败: ", errRun)
+			ep.State = 3
+			d.LastUpdatedTime = time.Now().Unix()
+			d.Save(false)
+			close(processRegistered)
+			return
+		}
+
+		conn.MilkyProcess = p
+		close(processRegistered)
+
+		if d.Parent.progressExitGroupWin != 0 && p.Cmd != nil {
+			errAdd := d.Parent.progressExitGroupWin.AddProcess(p.Cmd.Process)
+			if errAdd != nil {
+				log.Warn("添加到进程组失败，若主进程崩溃，Milky 进程可能需要手动结束")
+			}
+		}
+		errRun = p.Wait() //nolint:ineffassign
+
+		if errRun != nil {
+			log.Info("Milky 进程异常退出: ", errRun)
+			// Maybe some state change here
+		} else {
+			log.Info("Milky 进程退出")
+		}
+	}
+
+	go run()
+}
+
+// GenerateMilkyConfig 似乎暂时不需要 APPInfo, 如果以后需要了再改成双返回值
+func GenerateMilkyConfig(port int, signServerUrl string, accessToken string, info *EndPointInfo) []byte {
+	pa := info.Adapter.(*PlatformAdapterMilky)
+	switch pa.BuiltInMode {
+	case "lagrangeV2":
+		conf := strings.ReplaceAll(defaultLagrangeV2Config, "{WS端口}", strconv.Itoa(port))
+		conf = strings.ReplaceAll(conf, "{NTSignServer地址}", signServerUrl)
+		conf = strings.ReplaceAll(conf, "{账号UIN}", info.UserID[3:])
+		conf = strings.ReplaceAll(conf, "{访问Token}", accessToken)
+		return []byte(conf)
+	case "yogurt":
+		conf := strings.ReplaceAll(defaultYogurtConfig, "{WS端口}", strconv.Itoa(port))
+		conf = strings.ReplaceAll(conf, "{NTSignServer地址}", signServerUrl)
+		conf = strings.ReplaceAll(conf, "{账号UIN}", info.UserID[3:])
+		conf = strings.ReplaceAll(conf, "{访问Token}", accessToken)
+		return []byte(conf)
+	default:
+		return nil
+	}
+}
+
+func findKeystoreFiles(root string) ([]string, error) {
+	var matches []string
+	re := regexp.MustCompile(`^\d+\.keystore$`)
+
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if !d.IsDir() && re.MatchString(d.Name()) {
+			matches = append(matches, path)
+		}
+
+		return nil
+	})
+
+	return matches, err
+}
+
+func MilkyRemoveSession(dice *Dice, conn *EndPointInfo) {
+	workDir := filepath.Join(dice.BaseConfig.DataDir, conn.RelWorkDir)
+	keyStores, err := findKeystoreFiles(workDir)
+	if err != nil {
+		dice.Logger.Errorf("查找 keystore 文件失败: %v", err)
+	}
+	for _, file := range keyStores {
+		if _, err := os.Stat(file); err == nil {
+			_ = os.Remove(file)
+		}
+	}
+}
