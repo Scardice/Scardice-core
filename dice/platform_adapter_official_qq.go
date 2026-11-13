@@ -3805,6 +3805,39 @@ func (pa *PlatformAdapterOfficialQQ) isCurrentQrGeneration(generation uint64) bo
 	return pa.qrGeneration == generation
 }
 
+// setQrLoginSessionIfCurrent 在同一把 qrMu 内校验代次并写回首张二维码。
+// 拆成 isCurrentQrGeneration + 单独加锁写入会留下 check-then-act 窗口：
+// 禁用端点推进代次后，迟到的写入仍会把二维码挂回 UI，而轮询协程已退出。
+func (pa *PlatformAdapterOfficialQQ) setQrLoginSessionIfCurrent(
+	generation uint64,
+	session *QQOfficialQrLoginSession,
+	qrCodeData []byte,
+) bool {
+	pa.qrMu.Lock()
+	defer pa.qrMu.Unlock()
+	if pa.qrGeneration != generation {
+		return false
+	}
+	pa.qrSession = session
+	pa.QrURL = session.QrURL
+	pa.QrCodeData = qrCodeData
+	pa.QrLoginState = OfficialQQLoginStateQRWaitingForScan
+	return true
+}
+
+// setQrCodeIfCurrent 在同一把 qrMu 内校验代次并写回刷新后的二维码。
+func (pa *PlatformAdapterOfficialQQ) setQrCodeIfCurrent(generation uint64, qrURL string, qrCodeData []byte) bool {
+	pa.qrMu.Lock()
+	defer pa.qrMu.Unlock()
+	if pa.qrGeneration != generation {
+		return false
+	}
+	pa.QrURL = qrURL
+	pa.QrCodeData = qrCodeData
+	pa.QrLoginState = OfficialQQLoginStateQRWaitingForScan
+	return true
+}
+
 // shouldRetryAfterQrConnect 判断扫码成功后首次 connect 失败是否应转入后台重试。
 // failConnectTransient 保留 Enable=true 并把状态置为 Connecting（凭据已由扫码验证，
 // 只是网络/额度暂时不可用）；永久失败走 failConnect（Enable=false）或用户禁用
@@ -4097,18 +4130,12 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 	}
 
 	// 生成二维码（含最多 10 秒的建任务请求）期间用户可能已经禁用端点，
-	// clearQrLoginState 会推进代次。此时不能再把二维码写回 UI：轮询协程
-	// 已经因代次变化退出，二维码会永远停在那里且不可用。
-	if !pa.isCurrentQrGeneration(generation) {
+	// clearQrLoginState 会推进代次。此处必须“校验代次 + 写入”在同一把 qrMu 内完成：
+	// 分成 isCurrentQrGeneration + 单独加锁写入时，禁用恰好在两者之间就会让
+	// 一个永远不可用的二维码重新显示到 UI 上（轮询协程已经退出）。
+	if !pa.setQrLoginSessionIfCurrent(generation, session, qrCodeData) {
 		return
 	}
-
-	pa.qrMu.Lock()
-	pa.qrSession = session
-	pa.QrURL = session.QrURL
-	pa.QrCodeData = qrCodeData
-	pa.QrLoginState = OfficialQQLoginStateQRWaitingForScan
-	pa.qrMu.Unlock()
 	log.Info("official qq 扫码二维码已就绪")
 
 	go func() {
@@ -4295,14 +4322,10 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 				curSession.mu.Unlock()
 
 				// 刷新期间可能已被禁用/失败处理（代次变化），不要再写回状态。
-				if !pa.isCurrentQrGeneration(generation) {
+				// 代次校验与写入必须在同一把 qrMu 内，避免 check-then-act 竞态。
+				if !pa.setQrCodeIfCurrent(generation, newQrURL, newQrCodeData) {
 					return
 				}
-				pa.qrMu.Lock()
-				pa.QrURL = newQrURL
-				pa.QrCodeData = newQrCodeData
-				pa.QrLoginState = OfficialQQLoginStateQRWaitingForScan
-				pa.qrMu.Unlock()
 				log.Info("official qq 二维码已刷新")
 
 			default:

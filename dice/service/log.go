@@ -570,14 +570,22 @@ func LogGetLastSeq(operator engine2.DatabaseOperator, logID uint64) (int64, erro
 // 用于校验持久化的当前日志 ID 是否仍指向同一本日志：日志被 Web UI 删除时返回
 // ErrLogNotFound，ID 被复用（数据库恢复）时返回另一个名字，调用方据此自愈。
 func LogGetNameByID(operator engine2.DatabaseOperator, logID uint64) (string, error) {
+	_, name, err := LogGetOwnerByID(operator, logID)
+	return name, err
+}
+
+// LogGetOwnerByID 查询指定 log_id 的归属群与日志名称。
+// 只查名字发现不了“ID 被复用成另一个群的同名日志”：那种情况下运行期会被
+// LogAppendByID 的归属校验拒绝，启动时应按名字重建本群自己的日志。
+func LogGetOwnerByID(operator engine2.DatabaseOperator, logID uint64) (groupID string, name string, err error) {
 	if logID == 0 {
-		return "", ErrLogNotFound
+		return "", "", ErrLogNotFound
 	}
 	logInfo, err := getLogInfoByID(operator.GetLogDB(constant.READ), logID)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return logInfo.Name, nil
+	return logInfo.GroupID, logInfo.Name, nil
 }
 
 // LogRawMsgIDsInSeqRange 返回指定 log 在 (fromSeq, toSeq) 区间内已记录的 raw_msg_id 集合。

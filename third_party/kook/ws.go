@@ -754,6 +754,7 @@ func (s *Session) dispatchEvents(dispatcher *eventDispatcher) {
 	defer close(dispatcher.done)
 	pending := make(map[int64]*queuedEvent)
 	var lastConn *websocket.Conn
+	var lastEpoch uint64
 	lastGapExpected := int64(-1)
 	var gapFilled chan struct{}
 	closeGap := func() {
@@ -770,6 +771,15 @@ func (s *Session) dispatchEvents(dispatcher *eventDispatcher) {
 			return
 		}
 		epoch := s.sessionEpoch.Load()
+		if epoch != lastEpoch {
+			// 会话代次变化（s=6 ACK 换了 session）时，旧代次的暂存事件必须丢弃：
+			// 新 session 的 sn 从 1 重新开始，留下的旧 sn 会吞掉新 session 的同号
+			// 事件，或在 drainPending 里被当成新会话事件执行一遍（旧命令重放）。
+			pending = make(map[int64]*queuedEvent)
+			closeGap()
+			lastGapExpected = -1
+			lastEpoch = epoch
+		}
 		if q.epoch != epoch {
 			pending = make(map[int64]*queuedEvent)
 			closeGap()
@@ -811,8 +821,13 @@ func (s *Session) dispatchEvents(dispatcher *eventDispatcher) {
 			}
 			continue
 		}
-		if _, exists := pending[sn]; exists {
-			continue
+		if p, exists := pending[sn]; exists {
+			if p.epoch == epoch {
+				continue
+			}
+			// 旧代次的暂存项与新 session 的同号事件不是一回事，
+			// 不能让它把新事件静默吞掉。
+			delete(pending, sn)
 		}
 		// 缺口事件已经收到：在进入可能很慢的 handler 之前解除超时，
 		// 避免“命令耗时 > 15s”被误判为链路丢包而强制重连。
@@ -861,6 +876,11 @@ func (s *Session) drainPending(epoch uint64, pending map[int64]*queuedEvent) {
 		q, ok := pending[next]
 		if !ok {
 			return
+		}
+		if q.epoch != epoch {
+			// 换 session 后残留的旧代次事件：不能当成新会话的下一条执行。
+			delete(pending, next)
+			continue
 		}
 		s.RLock()
 		currentConn := s.wsConn
