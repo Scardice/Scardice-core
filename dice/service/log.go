@@ -566,6 +566,20 @@ func LogGetLastSeq(operator engine2.DatabaseOperator, logID uint64) (int64, erro
 	return maxSeq.Int64, nil
 }
 
+// LogGetNameByID 查询指定 log_id 的日志名称。
+// 用于校验持久化的当前日志 ID 是否仍指向同一本日志：日志被 Web UI 删除时返回
+// ErrLogNotFound，ID 被复用（数据库恢复）时返回另一个名字，调用方据此自愈。
+func LogGetNameByID(operator engine2.DatabaseOperator, logID uint64) (string, error) {
+	if logID == 0 {
+		return "", ErrLogNotFound
+	}
+	logInfo, err := getLogInfoByID(operator.GetLogDB(constant.READ), logID)
+	if err != nil {
+		return "", err
+	}
+	return logInfo.Name, nil
+}
+
 // LogRawMsgIDsInSeqRange 返回指定 log 在 (fromSeq, toSeq) 区间内已记录的 raw_msg_id 集合。
 // 用于日志补全前去重：平台补发/重连时同一消息可能既走过正常事件路径，又被历史拉取到。
 func LogRawMsgIDsInSeqRange(operator engine2.DatabaseOperator, logID uint64, fromSeq, toSeq int64) (map[string]struct{}, error) {
