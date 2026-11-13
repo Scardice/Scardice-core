@@ -845,6 +845,16 @@ func (d *Dice) registerCoreCommands() {
 					ctx.Group, _ = ctx.Session.ServiceAtNew.Load(msg.GroupID)
 					ctx.IsCurGroupBotOn = true
 
+					// 用 .bot on 指令消息的 seq 直接重建基线，替代“跳过下一条消息”的
+					// 布尔标记：恢复后一条消息都没来就再次掉线/重启时，布尔标记会把
+					// 真实的离线窗口吞掉。没有 seq 的平台仍保留原标记兜底。
+					// 只在“本次确实从 .bot off 暂停中恢复”时重建；普通 .bot on 是
+					// 空操作，不能让 resetLogSeq 取消掉正在进行的合法补全。
+					if wasPausedLog && ctx.Group != nil && msg.Seq > 0 {
+						ctx.Group.resetLogSeq(msg.Seq, msg.RawID)
+						ctx.Group.clearLogResumeSkipGap()
+					}
+
 					text := DiceFormatTmpl(ctx, "核心:骰子开启")
 					if wasPausedLog && ctx.Group.GetLogState().On {
 						// .bot off 时日志被自动暂停，这里刚恢复；静默段不补录。

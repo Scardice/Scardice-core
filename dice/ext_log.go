@@ -126,6 +126,70 @@ func (g *GroupInfo) consumeLogResumeSkipGap() bool {
 	return true
 }
 
+// clearLogResumeSkipGap 清除“跳过下一次缺口”标记。
+// .bot on 的指令消息自带 seq 时，调用方应直接用 resetLogSeq 重建基线并清掉本标记：
+// 恢复后一条消息都没来就再次掉线/重启时，这个持久标记会把真实的离线窗口吞掉。
+func (g *GroupInfo) clearLogResumeSkipGap() {
+	if g == nil {
+		return
+	}
+	mu := g.ensureLogStateMu()
+	mu.Lock()
+	g.LogResumeSkipGap = false
+	mu.Unlock()
+}
+
+// repairPersistedLogState 校验持久化的 LogCurID 是否仍指向 LogCurName。
+//
+// LogCurID 持久化后不会再像上游那样“重启即为 0、按名字 LogGetOrCreate 自愈”。
+// 如果当前日志在 Web UI 被删除，或数据库恢复后同一 ID 指向了同群的另一本日志，
+// LogAppendByID 会永久失败/写进错误日志。这里在加载时显式恢复上游的自愈语义：
+// 按名字找回（不存在则重建）日志，并清掉属于旧日志的 seq 基线。
+func repairPersistedLogState(d *Dice, group *GroupInfo) {
+	if d == nil || group == nil || group.LogCurID == 0 {
+		return
+	}
+	name, err := service.LogGetNameByID(d.DBOperator, group.LogCurID)
+	if err == nil && name == group.LogCurName {
+		return
+	}
+	if err != nil && !errors.Is(err, service.ErrLogNotFound) {
+		if d.Logger != nil {
+			d.Logger.Warnf("日志状态校验失败，暂不处理: 群=%s logID=%d err=%v", group.GroupID, group.LogCurID, err)
+		}
+		return
+	}
+
+	oldID := group.LogCurID
+	oldName := group.LogCurName
+	if oldName == "" {
+		group.ClearLogState()
+		group.resetLogSeqBaseline()
+		group.MarkDirty(d)
+		if d.Logger != nil {
+			d.Logger.Warnf("日志状态自愈: 群=%s 旧ID=%d 没有日志名，已清理", group.GroupID, oldID)
+		}
+		return
+	}
+
+	// 先清掉旧 ID，再按名字找回/重建。日志关闭时不主动创建，等 .log on 再处理。
+	group.SetLogState(0, oldName, group.LogOn)
+	group.resetLogSeqBaseline()
+	newID := uint64(0)
+	if group.LogOn {
+		if id, createErr := service.LogGetOrCreate(d.DBOperator, group.GroupID, oldName); createErr == nil {
+			newID = id
+			group.SetLogState(id, oldName, true)
+		} else if d.Logger != nil {
+			d.Logger.Warnf("日志状态修复失败: 群=%s 名称=%s err=%v", group.GroupID, oldName, createErr)
+		}
+	}
+	group.MarkDirty(d)
+	if d.Logger != nil {
+		d.Logger.Warnf("日志状态自愈: 群=%s 旧ID=%d(%s) 新ID=%d 记录=%s", group.GroupID, oldID, name, newID, oldName)
+	}
+}
+
 func ensureGroupLogState(ctx *MsgContext, group *GroupInfo) GroupLogState {
 	state := getGroupLogState(group)
 	if group == nil || !state.On || state.Name == "" || state.ID > 0 {
@@ -435,6 +499,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 						}
 						group.SetLogState(logID, name, true)
 						group.resetLogSeq(msg.Seq, msg.RawID)
+						group.clearLogResumeSkipGap()
 						group.MarkDirty(ctx.Dice)
 						ctx.Dice.Logger.Infof("日志状态切换: 群=%s 开启日志 name=%s id=%d", group.GroupID, name, logID)
 
@@ -624,6 +689,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 				}
 				group.SetLogState(logID, name, true)
 				group.resetLogSeq(msg.Seq, msg.RawID)
+				group.clearLogResumeSkipGap()
 				group.MarkDirty(ctx.Dice)
 				ctx.Dice.Logger.Infof("日志状态切换: 群=%s 新建并开启日志 name=%s id=%d", group.GroupID, name, logID)
 
@@ -1161,14 +1227,15 @@ func RegisterBuiltinExtLog(self *Dice) {
 								group:     ctx.Group,
 								logID:     logState.ID,
 								logName:   logState.Name,
+								epoch:     ctx.Group.logEpoch.Load(),
 								fromSeq:   fromSeq,
 								toSeq:     msg.Seq,
 								gap:       gap,
 								lastMsgID: lastMsgID,
 							}
-							// 补全内部会调用 CreateTempCtx，它以 panic 报告端点未就绪；
-							// 断层补全恰好运行在刚重连之后，裸 goroutine 里的 panic 会直接终止进程
-							panicHandler.Once(ctx.Dice.Logger, task.run)
+							// 队列化：同一群只跑一个 worker，相邻断层合并，避免抖动时
+							// 每个断层一个 goroutine 排队、越补越晚。
+							ctx.Group.enqueueLogGapFill(task)
 						}
 					}
 
@@ -1268,6 +1335,9 @@ func LogAppend(ctx *MsgContext, groupID string, logID uint64, logName string, lo
 	ok := false
 	if logID > 0 {
 		ok = service.LogAppendByID(ctx.Dice.DBOperator, logID, groupID, logItem)
+		if !ok && ctx.Group != nil && groupID != "" && logName != "" {
+			ok = healLogAppendByID(ctx, groupID, logName, logItem)
+		}
 	} else if logName != "" {
 		ok = service.LogAppend(ctx.Dice.DBOperator, groupID, logName, logItem)
 	}
@@ -1291,6 +1361,33 @@ func LogAppend(ctx *MsgContext, groupID string, logID uint64, logName string, lo
 	return true
 }
 
+// healLogAppendByID 在按 ID 写入失败时按名字找回/重建日志并重试一次。
+//
+// 持久化的 LogCurID 不会像上游运行时字段那样在重启后自动归零：
+// Web UI 删除当前日志、数据库恢复导致 ID 失配后，不在这里兜底就会一直写不进日志
+// （并且每 5 分钟误报一次“数据库结构未升级”）。
+func healLogAppendByID(ctx *MsgContext, groupID, logName string, logItem *model.LogOneItem) bool {
+	if ctx == nil || ctx.Dice == nil || ctx.Dice.DBOperator == nil || ctx.Group == nil {
+		return false
+	}
+	state := ctx.Group.GetLogState()
+	// 期间用户已经切日志/关日志：不要把手里的旧条目写进别的日志。
+	if state.Name != logName || !state.On {
+		return false
+	}
+	newID, err := service.LogGetOrCreate(ctx.Dice.DBOperator, groupID, logName)
+	if err != nil || newID == 0 {
+		return false
+	}
+	ctx.Group.SetLogState(newID, logName, state.On)
+	ctx.Group.resetLogSeqBaseline()
+	ctx.Group.MarkDirty(ctx.Dice)
+	if ctx.Dice.Logger != nil {
+		ctx.Dice.Logger.Warnf("日志写入自愈: 群=%s 记录=%s 新ID=%d", groupID, logName, newID)
+	}
+	return service.LogAppendByID(ctx.Dice.DBOperator, newID, groupID, logItem)
+}
+
 func reportLogAppendFailure(ctx *MsgContext, groupID string, logID uint64, logName string) {
 	if ctx == nil || ctx.Dice == nil {
 		return
@@ -1311,17 +1408,20 @@ func reportLogAppendFailure(ctx *MsgContext, groupID string, logID uint64, logNa
 	logAppendFailLast[groupID] = now
 	logAppendFailMu.Unlock()
 	ReplyToSenderRaw(ctx, &Message{MessageType: "group", GroupID: groupID},
-		"日志写入失败，请联系骰主检查后台错误日志（可能是数据库结构未升级）", "skip")
+		"日志写入失败，请联系骰主检查后台错误日志", "skip")
 }
 
 // 缺失条数不超过该阈值时静默补全并照常执行指令，超过则只补录日志并汇报未执行的指令
 const logGapFillSilentThreshold = 5
 
 const (
-	logGapFillTimeout      = 30 * time.Second
-	logGapFillPageSize     = 100  // 单次 get_group_msg_history 的拉取上限
-	logGapFillMaxMessages  = 2000 // 单次断层最多补录的消息数，避免离线数天时无限拉取
-	logGapFillFetchRetries = 3    // 瞬时网络错误的重试次数
+	// 一次断层补全的总预算：最多 2000 条、每页 100 条，即 20 次接口调用。
+	// 30s 在慢线路/大群上不够，给到 60s。
+	logGapFillTimeout      = 60 * time.Second
+	logGapFillPageTimeout  = 15 * time.Second // 单页拉取超时，避免一页卡住耗尽总预算
+	logGapFillPageSize     = 100              // 单次 get_group_msg_history 的拉取上限
+	logGapFillMaxMessages  = 2000             // 单次断层最多补录的消息数，避免离线数天时无限拉取
+	logGapFillFetchRetries = 3                // 瞬时网络错误的重试次数
 )
 
 // logGapReplayDeniedCommands 是静默重放时不允许执行的管理指令。
@@ -1405,7 +1505,8 @@ func calibrateLogSeqBaseline(d *Dice, group *GroupInfo, logID uint64, lastSeq in
 	}
 	seq, err := service.LogGetLastSeq(d.DBOperator, logID)
 	if err != nil {
-		// 查不到就保持原基线，下一条消息再试；不能把 failed 当成校准完成。
+		// 查不到就保持原基线；退避一分钟再试，避免数据库异常时每条消息都查库。
+		group.deferLogSeqCalibration(time.Minute)
 		return lastSeq, lastMsgID
 	}
 	group.markLogSeqCalibrated()
@@ -1424,6 +1525,7 @@ type logGapFillTask struct {
 	group     *GroupInfo
 	logID     uint64
 	logName   string
+	epoch     uint64 // 创建时的日志基线代次；epoch 变化说明基线已重建，任务必须取消
 	fromSeq   int64
 	toSeq     int64
 	gap       int64 // 已扣除骰子自身发言的净遗漏条数，仅用于阈值判定，不可当作拉取条数
@@ -1440,7 +1542,16 @@ func (t logGapFillTask) logStateStillValid() bool {
 		return false
 	}
 	state := t.group.GetLogState()
-	return state.On && state.ID == t.logID && state.Name == t.logName
+	if !state.On || state.ID != t.logID || state.Name != t.logName {
+		return false
+	}
+	// epoch 变化说明 .log on/new、.bot on 或日志重建已经重置了 seq 基线：
+	// 在途/排队的旧区间不能再写，否则会把 off/静默期间的消息补进日志。
+	// epoch==0 兼容测试里手工构造的任务。
+	if t.epoch != 0 && t.group.logEpoch.Load() != t.epoch {
+		return false
+	}
+	return true
 }
 
 // forEachMissing 按顺序遍历缺失消息，并在处理每条之前确认日志仍然有效。
@@ -1459,12 +1570,86 @@ func (t logGapFillTask) forEachMissing(missing []*Message, fn func(*Message)) in
 	return len(missing)
 }
 
-func (t logGapFillTask) run() {
-	// 使用阻塞锁而不是 TryLock：每个任务都对应一个已检测到的断层，
-	// 跳过就意味着这段聊天永久缺失。并发任务排队执行，由 RawID 去重防止重复。
-	t.group.logGapFillMu.Lock()
-	defer t.group.logGapFillMu.Unlock()
+// enqueueLogGapFill 把断层加入队列；相邻/重叠区间会合并，由单 worker 串行补全。
+func (g *GroupInfo) enqueueLogGapFill(task logGapFillTask) {
+	if g == nil || task.dice == nil {
+		return
+	}
+	if !g.mergeLogGapTask(task) {
+		return
+	}
+	panicHandler.Once(task.dice.Logger, g.runLogGapWorker)
+}
 
+// mergeLogGapTask 合并待处理区间，返回是否需要启动 worker。
+func (g *GroupInfo) mergeLogGapTask(task logGapFillTask) bool {
+	g.logGapQueueMu.Lock()
+	defer g.logGapQueueMu.Unlock()
+
+	pending := g.logGapPending
+	// 日志切换（ID/名称变化）或基线重建（epoch 变化）时旧区间已无意义：
+	// 用新任务替换，避免把新日志/新基线的断层合并进旧任务后一起取消，
+	// 也避免把 off/静默段合并进旧任务补进日志。
+	if pending == nil || pending.logID != task.logID || pending.logName != task.logName || pending.epoch != task.epoch {
+		t := task
+		g.logGapPending = &t
+	} else {
+		if task.fromSeq < pending.fromSeq {
+			pending.fromSeq = task.fromSeq
+			pending.lastMsgID = task.lastMsgID
+		}
+		if task.toSeq > pending.toSeq {
+			pending.toSeq = task.toSeq
+			pending.gap += task.gap
+		}
+		// 重连后 endpoint 可能已更换，总是使用最新任务的状态。
+		pending.endpoint = task.endpoint
+		pending.dice = task.dice
+	}
+
+	if g.logGapWorkerRunning {
+		return false
+	}
+	g.logGapWorkerRunning = true
+	return true
+}
+
+// runLogGapWorker 串行消费合并后的断层。
+// 单个任务 panic 只丢这一段，不能让 worker 标志卡死：CreateTempCtx 在端点
+// 尚未就绪时会 panic，而断层补全恰好运行在刚重连之后。
+func (g *GroupInfo) runLogGapWorker() {
+	for {
+		g.logGapQueueMu.Lock()
+		task := g.logGapPending
+		g.logGapPending = nil
+		if task == nil {
+			g.logGapWorkerRunning = false
+			g.logGapQueueMu.Unlock()
+			return
+		}
+		g.logGapQueueMu.Unlock()
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if task.dice != nil && task.dice.Logger != nil {
+						groupID := ""
+						if task.group != nil {
+							groupID = task.group.GroupID
+						}
+						task.dice.Logger.Errorf("日志补全任务异常: 群=%s %v\n%s", groupID, r, debug.Stack())
+					}
+				}
+			}()
+			task.run()
+		}()
+	}
+}
+
+func (t logGapFillTask) run() {
+	if t.group == nil || t.dice == nil || t.endpoint == nil {
+		return
+	}
 	if !t.logStateStillValid() {
 		t.dice.Logger.Infof("日志补全已取消: 群=%s 记录=%s 已关闭或被切换", t.group.GroupID, t.logName)
 		return
@@ -1472,6 +1657,8 @@ func (t logGapFillTask) run() {
 
 	fetcher, ok := t.endpoint.Adapter.(HistoryFetcher)
 	if !ok {
+		t.dice.Logger.Infof("日志补全跳过: 平台未实现历史消息拉取: 群=%s 平台=%s",
+			t.group.GroupID, t.endpoint.Platform)
 		return
 	}
 
@@ -1561,7 +1748,9 @@ func (t logGapFillTask) fetchHistoryOnce(ctx context.Context, fetcher HistoryFet
 			break
 		}
 
-		page, err := fetcher.FetchGroupMsgHistory(ctx, t.group.GroupID, from, count)
+		pageCtx, cancel := context.WithTimeout(ctx, logGapFillPageTimeout)
+		page, err := fetcher.FetchGroupMsgHistory(pageCtx, t.group.GroupID, from, count)
+		cancel()
 		if err != nil {
 			return nil, err
 		}

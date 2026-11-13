@@ -2486,14 +2486,22 @@ func (d *Dice) loadGroups() {
 			groupInfo.BotList = new(SyncMap[string, bool])
 		}
 		groupInfo.ensureInactivatedSet()
+		// 先校验持久化的 LogCurID 是否仍指向当前日志。Web UI 删除当前日志或
+		// 数据库恢复后，旧 ID 会让 LogAppendByID 永久失败，必须在这里按名字自愈。
+		repairPersistedLogState(d, &groupInfo)
 		// 恢复日志 seq 持久基线：否则重启后会回退到 DB MAX(seq)，
 		// 把 log off 期间的消息当成断层补录。
 		groupInfo.initLogSeqFromPersisted()
 		if groupInfo.LogOn && groupInfo.LogCurID > 0 {
 			// 重启前已经落库的消息比持久基线更新；用 DB MAX(seq) 校准，
 			// 否则会把已记录消息再次算入 gap。
-			if seq, err := service.LogGetLastSeq(d.DBOperator, groupInfo.LogCurID); err == nil && seq > 0 {
-				groupInfo.advanceLogSeq(seq, nil)
+			if seq, err := service.LogGetLastSeq(d.DBOperator, groupInfo.LogCurID); err == nil {
+				if seq > 0 {
+					groupInfo.advanceLogSeq(seq, nil)
+				}
+				// 校准成功（包括空日志的 0）就无需在首条消息时再查一次库。
+				// 失败则保持未校准，由 ext_log 的 calibrateLogSeqBaseline 重试。
+				groupInfo.markLogSeqCalibrated()
 			}
 		}
 

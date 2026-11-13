@@ -175,7 +175,12 @@ type GroupInfo struct {
 	logLastSeq   int64       `json:"-" yaml:"-"` // 上条已记录消息的seq，0=未初始化
 	logLastMsgID interface{} `json:"-" yaml:"-"` // 上条已记录消息的RawID，用于断层通知的引用回复
 	logSelfSent  int64       `json:"-" yaml:"-"` // 自 logLastSeq 以来骰子自身的群内发言数
-	logGapFillMu sync.Mutex  `json:"-" yaml:"-"` // 补全防重入
+	// 补全任务队列：同一群同时只跑一个 worker，新断层并入待处理区间。
+	// 不能用“每个断层一个 goroutine + 阻塞锁”排队：网络反复抖动时会积压任务，
+	// 越靠后的任务越晚执行，可能重放几分钟前的指令。
+	logGapQueueMu       sync.Mutex      `json:"-" yaml:"-"`
+	logGapPending       *logGapFillTask `json:"-" yaml:"-"`
+	logGapWorkerRunning bool            `json:"-" yaml:"-"`
 	// logGapFilling 标记当前是否正在执行小断层的静默重放。
 	// OnMessageReceived 用它给补录条目打 is_gap_fill 标记；正常实时消息不受影响。
 	logGapFilling atomic.Bool `json:"-" yaml:"-"`
@@ -186,6 +191,14 @@ type GroupInfo struct {
 	logGapFillTo   atomic.Int64 `json:"-" yaml:"-"`
 	// logSeqCalibrated 表示本进程内是否已用数据库 MAX(seq) 校准过 seq 基线。
 	logSeqCalibrated bool `json:"-" yaml:"-"`
+	// logSeqCalibrationRetryAt 是校准失败后的下次重试时间(unix)。
+	// 数据库持续异常时不能每条消息都查一次库。
+	logSeqCalibrationRetryAt int64 `json:"-" yaml:"-"`
+
+	// logEpoch 在每次重建 seq 基线（.log on/new、.bot on 恢复、日志重建）时 +1。
+	// 补全任务携带 epoch：epoch 变了就取消在途任务、替换 pending，
+	// 避免把 off/静默期间的消息合并进旧任务补进日志。
+	logEpoch atomic.Uint64 `json:"-" yaml:"-"`
 
 	// LogSeqBaseline 是日志开启/恢复时的持久seq基线。
 	// logLastSeq 只在内存中，重启后会归零；若没有这个字段，启动时会回退到
@@ -252,6 +265,7 @@ func (g *GroupInfo) resetLogSeq(seq int64, rawID interface{}) {
 	g.logSelfSent = 0
 	g.LogSeqBaseline = seq
 	g.LogSeqBaselineMsgID = msgID
+	g.logEpoch.Add(1)
 }
 
 // initLogSeqFromPersisted 在群数据加载完成后恢复持久基线。
@@ -289,16 +303,47 @@ func (g *GroupInfo) needLogSeqCalibration() bool {
 	}
 	g.logSeqMu.Lock()
 	defer g.logSeqMu.Unlock()
-	return !g.logSeqCalibrated
+	if g.logSeqCalibrated {
+		return false
+	}
+	return g.logSeqCalibrationRetryAt <= time.Now().Unix()
 }
 
 // markLogSeqCalibrated 记录本进程已完成校准，避免每条消息都查数据库。
+// config.go 加载群信息时已经用 DB MAX(seq) 校准过，也调用这里跳过重复查询。
 func (g *GroupInfo) markLogSeqCalibrated() {
 	if g == nil {
 		return
 	}
 	g.logSeqMu.Lock()
 	g.logSeqCalibrated = true
+	g.logSeqCalibrationRetryAt = 0
+	g.logSeqMu.Unlock()
+}
+
+// deferLogSeqCalibration 记录校准失败后的退避时间，避免 DB 异常时每条消息都查库。
+func (g *GroupInfo) deferLogSeqCalibration(delay time.Duration) {
+	if g == nil {
+		return
+	}
+	if delay <= 0 {
+		delay = time.Minute
+	}
+	g.logSeqMu.Lock()
+	g.logSeqCalibrationRetryAt = time.Now().Add(delay).Unix()
+	g.logSeqMu.Unlock()
+}
+
+// resetLogSeqBaseline 清除持久基线。日志 ID 变化/被重建后旧基线不再有效：
+// 新日志的 seq 锚点只能来自新日志自己的 DB MAX(seq)，不能沿用旧日志的序号。
+func (g *GroupInfo) resetLogSeqBaseline() {
+	if g == nil {
+		return
+	}
+	g.logSeqMu.Lock()
+	g.LogSeqBaseline = 0
+	g.LogSeqBaselineMsgID = ""
+	g.logEpoch.Add(1)
 	g.logSeqMu.Unlock()
 }
 
