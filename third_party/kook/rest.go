@@ -1706,6 +1706,9 @@ func (s *Session) request(method, url string, data interface{}) (response []byte
 	if s.RetryTimeout > 0 {
 		deadline = time.Now().Add(s.RetryTimeout)
 	}
+	// 只对幂等请求重试。消息发送、上传、删除等 POST 一旦在“服务端已处理、
+	// 响应丢失”时重试，就会产生重复消息/重复上传；宁可把错误交给调用方。
+	idempotent := method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions
 
 	for attempt := 0; ; attempt++ {
 		req, reqErr := http.NewRequest(method, url, bytes.NewBuffer(body))
@@ -1734,7 +1737,7 @@ func (s *Session) request(method, url string, data interface{}) (response []byte
 		resp, doErr := s.Client.Do(req)
 		if doErr != nil {
 			addCaller(s.Logger.Error()).Err("err", doErr).Msg("http request failed")
-			if attempt >= maxRetry || (!deadline.IsZero() && time.Now().After(deadline)) {
+			if !idempotent || attempt >= maxRetry || (!deadline.IsZero() && time.Now().After(deadline)) {
 				return nil, doErr
 			}
 			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
@@ -1765,6 +1768,9 @@ func (s *Session) request(method, url string, data interface{}) (response []byte
 				Dur("wait", wait).
 				Int("attempt", attempt).
 				Msg("kook rate limited, backing off")
+			if !idempotent {
+				return nil, fmt.Errorf("kook api rate limited (non-idempotent %s), retry after %s", method, wait)
+			}
 			if attempt >= maxRetry {
 				return nil, fmt.Errorf("kook api rate limited after %d retries", attempt)
 			}
@@ -1776,6 +1782,13 @@ func (s *Session) request(method, url string, data interface{}) (response []byte
 		}
 
 		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			// 非 2xx 也可能带 KOOK 业务码（例如 401 + {"code":40103}）。
+			// 先尝试解析 body，保住 401xx 等鉴权码，供 IsPermanentAuthError 使用。
+			var r EndpointGeneralResponse
+			if json.Unmarshal(respByte, &r) == nil && r.Code != 0 {
+				addCaller(s.Logger.Error()).Int("code", r.Code).Str("error_msg", r.Message).Msg("api response error")
+				return nil, newRestErrorFromGeneralResp(&r)
+			}
 			msg := strings.TrimSpace(string(respByte))
 			if len(msg) > 512 {
 				msg = msg[:512]

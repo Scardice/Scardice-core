@@ -307,11 +307,14 @@ type Session struct {
 	dispatcher   *eventDispatcher
 
 	// resumePending is true while a resume is in flight (s=4 or a resume
-	// handshake). Events with sn <= sequence are kept in preAck: a live
-	// session switch may restart the sequence before its RESUME ACK arrives,
-	// and those events would otherwise be dropped as duplicates forever.
+	// handshake). Every event with sn > 0 is kept in preAck until the RESUME
+	// ACK arrives: a live session switch may restart the sequence before its
+	// ACK, and executing pre-ACK events would replay them twice.
 	resumePending bool
 	preAck        []*queuedEvent
+	// resumeWatchGen 每次进入 resume 等待时递增，防止旧的 ACK 超时 watcher
+	// 误伤新一轮 resume。
+	resumeWatchGen uint64
 
 	// eventMu 保护 inFlight。
 	eventMu  sync.Mutex

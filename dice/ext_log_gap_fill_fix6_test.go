@@ -66,8 +66,11 @@ func TestLogGapReplayDeniedCommandsCoverAdmin(t *testing.T) {
 		{".ext off log", true},
 		{".set 骰子 名字", true},
 		{".black add 123", true},
+		{".reply off", true},
+		{".randalgo set pcg", true},
 		{"。ext off log", true},
 		{"。log new 另一个记录", true},
+		{"。reply off", true},
 		{".st 力量50", false},
 		{".ra 侦查", false},
 		{".draw 卡组", false},
@@ -94,7 +97,7 @@ func TestLogGapFetchWindowClampsToNewest(t *testing.T) {
 		{"empty", 100, 101, 100, 0},
 		{"one", 100, 102, 100, 1},
 		{"small", 100, 150, 100, 49},
-		{"exact-max", 100, 100+logGapFillMaxMessages+1, 100, logGapFillMaxMessages},
+		{"exact-max", 100, 100 + logGapFillMaxMessages + 1, 100, logGapFillMaxMessages},
 		{"over-max", 100, 100000, 100000 - 1 - logGapFillMaxMessages, logGapFillMaxMessages},
 	}
 	for _, c := range cases {

@@ -40,15 +40,10 @@ func getGroupLogName(group *GroupInfo) string {
 	return getGroupLogState(group).Name
 }
 
-func getGroupLogOn(group *GroupInfo) bool {
-	state := getGroupLogState(group)
-	return state.On && state.Name != ""
-}
-
-// suspendLogForBotOff 在 .bot off 让群变为“未激活”时暂停日志记录。
+// suspendLogForBotOff 在 .bot off 让群变为“未激活”时自动执行 .log off：
 // 只把 LogOn 置 false（不结束、不上传，LogCurID/LogCurName 保留），
-// 并记下“这是 .bot off 造成的暂停”，供 .bot on 恢复。
-// 返回是否真的暂停了（原本日志就是关的则返回 false）。
+// 并记下“这次关闭是 .bot off 自动造成的”，供 .bot on 自动开启。
+// 返回是否真的关闭了（原本日志就是关的则返回 false）。
 func (g *GroupInfo) suspendLogForBotOff() bool {
 	if g == nil {
 		return false
@@ -63,9 +58,10 @@ func (g *GroupInfo) suspendLogForBotOff() bool {
 	return true
 }
 
-// resumeLogPausedByBotOff 在群重新激活（.bot on）时恢复被 .bot off 暂停的日志。
-// 无论是否由本次恢复，都会标记“下一条消息只重建基线”，让静默段不被补录；
-// 若期间用户已经 .log on / .log new / .log end，则以用户操作为准。
+// resumeLogPausedByBotOff 在群重新激活（.bot on）时按 .log on 的语义
+// 自动开启被 .bot off 关闭的日志，并标记“下一条消息只重建基线”，
+// 让关闭段不被补录；若期间用户已经 .log on / .log new / .log end，
+// 则以用户操作为准。
 // 返回值表示本次是否真的把日志重新打开了。
 func (g *GroupInfo) resumeLogPausedByBotOff() bool {
 	if g == nil {
@@ -77,16 +73,17 @@ func (g *GroupInfo) resumeLogPausedByBotOff() bool {
 		return false
 	}
 	g.LogPausedByBotOff = false
-	g.LogResumeSkipGap = true
 	if g.LogOn || g.LogCurName == "" {
 		// 用户已经重新开启，或已经 end/new 换了一本日志：不要覆盖用户的操作。
 		return false
 	}
 	g.LogOn = true
+	// 只有本次真的自动开启了日志，才需要跳过下一次缺口计算。
+	g.LogResumeSkipGap = true
 	return true
 }
 
-// isLogPausedByBotOff 报告当前日志关闭是否由 .bot off 自动暂停造成。
+// isLogPausedByBotOff 报告当前日志关闭是否由 .bot off 自动关闭造成。
 func (g *GroupInfo) isLogPausedByBotOff() bool {
 	if g == nil {
 		return false
@@ -97,8 +94,8 @@ func (g *GroupInfo) isLogPausedByBotOff() bool {
 }
 
 // clearLogPausedByBotOff 在用户显式操作日志（.log on/new/off/end/halt）后清除
-// “暂停由 .bot off 造成”的标记。否则用户已经换了/结束了日志，下一次 .bot on
-// 仍会被当成“从暂停中恢复”，用指令 seq 覆盖刚建立的基线。
+// “本次关闭由 .bot off 自动造成”的标记。否则用户已经换了/结束了日志，下一次
+// .bot on 仍会被当成“从自动关闭中恢复”，用指令 seq 覆盖刚建立的基线。
 func (g *GroupInfo) clearLogPausedByBotOff() {
 	if g == nil {
 		return
@@ -106,6 +103,29 @@ func (g *GroupInfo) clearLogPausedByBotOff() {
 	g.logStateMu.Lock()
 	g.LogPausedByBotOff = false
 	g.logStateMu.Unlock()
+}
+
+// logOffForUser 处理用户显式的 .log off：
+//   - 日志开启：关闭，并清除“由 .bot off 自动关闭”的标记；
+//   - 日志已由 .bot off 自动关闭：只清标记，让下一次 .bot on 不再自动开启；
+//   - 日志本来就没开、或没有日志名：返回 false。
+//
+// 用同一把 logStateMu 完成“判断 + 写入”，避免 .bot on 并发把日志重新打开。
+func (g *GroupInfo) logOffForUser() (name string, ok bool) {
+	if g == nil {
+		return "", false
+	}
+	g.logStateMu.Lock()
+	defer g.logStateMu.Unlock()
+	if g.LogCurName == "" {
+		return "", false
+	}
+	if !g.LogOn && !g.LogPausedByBotOff {
+		return g.LogCurName, false
+	}
+	g.LogOn = false
+	g.LogPausedByBotOff = false
+	return g.LogCurName, true
 }
 
 // setLogResumeSkipGap 标记“下一次记日志只重建基线、不算缺口”。
@@ -529,11 +549,11 @@ func RegisterBuiltinExtLog(self *Dice) {
 				return CmdExecuteResult{Matched: true, Solved: true}
 			} else if cmdArgs.IsArgEqual(1, "off") {
 				state := getGroupLogState(group)
-				if state.Name != "" && state.On {
-					group.SetLogOn(false)
-					group.clearLogPausedByBotOff()
+				if _, ok := group.logOffForUser(); ok {
+					// 显式 .log off 优先于 .bot off 的自动关闭：即使日志已经是
+					// 关的，也要清掉“自动开启”标记，避免下一次 .bot on 把它重新打开。
 					group.MarkDirty(ctx.Dice)
-					ctx.Dice.Logger.Infof("日志状态切换: 群=%s 暂停日志 name=%s id=%d", group.GroupID, state.Name, state.ID)
+					ctx.Dice.Logger.Infof("日志状态切换: 群=%s 关闭日志 name=%s id=%d", group.GroupID, state.Name, state.ID)
 					lines, _ := service.LogLinesCountGet(ctx.Dice.DBOperator, group.GroupID, state.Name)
 					VarSetValueStr(ctx, "$t记录名称", state.Name)
 					VarSetValueInt64(ctx, "$t当前记录条数", lines)
@@ -703,12 +723,12 @@ func RegisterBuiltinExtLog(self *Dice) {
 					ctx.Dice.Logger.Errorf("日志新建失败: group=%s name=%s err=%v", group.GroupID, name, err)
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
-					group.SetLogState(logID, name, true)
-					group.resetLogSeq(msg.Seq, msg.RawID)
-					group.clearLogResumeSkipGap()
-					group.clearLogPausedByBotOff()
-					group.MarkDirty(ctx.Dice)
-					ctx.Dice.Logger.Infof("日志状态切换: 群=%s 新建并开启日志 name=%s id=%d", group.GroupID, name, logID)
+				group.SetLogState(logID, name, true)
+				group.resetLogSeq(msg.Seq, msg.RawID)
+				group.clearLogResumeSkipGap()
+				group.clearLogPausedByBotOff()
+				group.MarkDirty(ctx.Dice)
+				ctx.Dice.Logger.Infof("日志状态切换: 群=%s 新建并开启日志 name=%s id=%d", group.GroupID, name, logID)
 
 				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_新建"))
 				return CmdExecuteResult{Matched: true, Solved: true}
@@ -1237,7 +1257,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 						// 只有“日志正在记录”时才会走到这里；off 期间整段不进来，
 						// 所以 off 的消息永远不会被算成缺口。
 						fromSeq, lastMsgID, gap := logGapFromMessage(ctx.Dice, ctx.Group, logState, msg.Seq, msg.RawID)
-						if gap > 0 {
+						if gap > 0 && endpointSupportsLogGapFill(ctx.EndPoint) {
 							task := logGapFillTask{
 								dice:      ctx.Dice,
 								endpoint:  ctx.EndPoint,
@@ -1284,20 +1304,17 @@ func RegisterBuiltinExtLog(self *Dice) {
 		},
 		OnMessageDeleted: func(ctx *MsgContext, msg *Message) {
 			if ctx.Group != nil {
-				if getGroupLogOn(ctx.Group) {
-					LogDeleteByID(ctx, ctx.Group.GroupID, msg.RawID)
-					// ctx.Session.Parent.Logger.Infof("删除日志 %s %s", ctx.Group.GroupId, msg.RawId.(string))
-				}
+				// 不按 LogOn 门控：.bot off 会把日志自动关闭，但停用前已记录、
+				// 停用期间被撤回的消息仍应从日志删除（找不到行是 no-op）。
+				LogDeleteByID(ctx, ctx.Group.GroupID, msg.RawID)
 			}
 		},
 		OnMessageEdit: func(ctx *MsgContext, msg *Message) {
 			if ctx.Group == nil {
 				return
 			}
-
-			if getGroupLogOn(ctx.Group) {
-				LogEditByID(ctx, ctx.Group.GroupID, msg.Message, msg.RawID)
-			}
+			// 同上：编辑事件不因日志处于关闭状态而丢失。
+			LogEditByID(ctx, ctx.Group.GroupID, msg.Message, msg.RawID)
 		},
 		GetDescText: GetExtensionDesc,
 		CmdMap: CmdMapCls{
@@ -1452,17 +1469,22 @@ const (
 //   - ext：开关扩展（重放 .ext off log 会直接把日志关掉）
 //   - set：改全局配置（.set 是 master 指令）
 //   - black：黑名单管理
-// 跑团类指令（st/ra/draw/name 等）仍然重放，它们是补录的意义所在。
+//   - reply：.reply on/off 等价于 .ext reply on/off，可绕过上面的 ext
+//   - randalgo：master 修改全局随机算法（.randalgo set）
+//
+// 跑团类指令（st/ra/draw/name/ch/pc 等）仍然重放，它们是补录的意义所在。
 var logGapReplayDeniedCommands = map[string]struct{}{
-	"log":     {},
-	"bot":     {},
-	"master":  {},
-	"dismiss": {},
-	"ban":     {},
-	"unban":   {},
-	"ext":     {},
-	"set":     {},
-	"black":   {},
+	"log":      {},
+	"bot":      {},
+	"master":   {},
+	"dismiss":  {},
+	"ban":      {},
+	"unban":    {}, // 实际由 ban 处理；保留以兼容旧写法
+	"ext":      {},
+	"set":      {},
+	"black":    {},
+	"reply":    {},
+	"randalgo": {},
 }
 
 // logGapFromMessage 记录本条消息的 seq，并返回它与“上一条已记录消息”之间的缺口。
@@ -1489,10 +1511,21 @@ func logGapFromMessage(d *Dice, group *GroupInfo, logState GroupLogState, msgSeq
 		group.updateLogSeq(msgSeq, rawID)
 		return 0, nil, 0
 	}
+	// 未校准（或正在退避）时，持久基线可能是很久以前的 .log on，直接算缺口
+	// 会把已经落库的历史当成断层重复补录。先校准；失败就本条不补、不推进基线，
+	// 等 DB 恢复后由 DB MAX(seq) 一次性对齐。
+	if !group.isLogSeqCalibrated() {
+		if !group.needLogSeqCalibration() {
+			return 0, nil, 0
+		}
+		baseSeq, baseMsgID := group.logSeqBaselineSnapshot()
+		if _, _, ok := calibrateLogSeqBaseline(d, group, logState.ID, baseSeq, baseMsgID); !ok {
+			return 0, nil, 0
+		}
+	}
 	lastSeq, lastMsgID, selfSent := group.updateLogSeq(msgSeq, rawID)
 	if lastSeq == 0 && logState.ID > 0 {
-		// 优先使用持久基线；它记录的是 .log on/.log new 的边界，
-		// 比 DB MAX(seq) 更能防止把 log off 期间的消息补进日志。
+		// 没有数据库/日志 ID 时校准不适用，持久基线仍是最后一道依据。
 		persistedSeq, persistedMsgID := group.logSeqBaselineSnapshot()
 		if persistedSeq > lastSeq {
 			lastSeq = persistedSeq
@@ -1501,10 +1534,6 @@ func logGapFromMessage(d *Dice, group *GroupInfo, logState GroupLogState, msgSeq
 			}
 		}
 	}
-	// 重启后 logLastSeq 只来自持久基线（.log on 那一刻），可能远旧于数据库里
-	// 实际记录的最后一条。每进程首次记日志时用 DB MAX(seq) 校准一次，否则首条
-	// 消息会算出巨大假缺口：补的是早已记录的历史，真正的离线缺口反而漏补。
-	lastSeq, lastMsgID = calibrateLogSeqBaseline(d, group, logState.ID, lastSeq, lastMsgID)
 	if lastSeq <= 0 {
 		return 0, nil, 0
 	}
@@ -1525,26 +1554,47 @@ func logGapFromMessage(d *Dice, group *GroupInfo, logState GroupLogState, msgSeq
 // 因为基线被 updateLogSeq 直接推到最新而永远补不上。
 //
 // 每个进程只查一次（成功后置 logSeqCalibrated），不会给消息主路径增加常态开销。
-func calibrateLogSeqBaseline(d *Dice, group *GroupInfo, logID uint64, lastSeq int64, lastMsgID interface{}) (int64, interface{}) {
-	if d == nil || d.DBOperator == nil || group == nil || logID == 0 {
-		return lastSeq, lastMsgID
+func calibrateLogSeqBaseline(d *Dice, group *GroupInfo, logID uint64, lastSeq int64, lastMsgID interface{}) (int64, interface{}, bool) {
+	if group == nil {
+		return lastSeq, lastMsgID, false
+	}
+	if d == nil || d.DBOperator == nil || logID == 0 {
+		// 没有数据库/日志 ID，校准不适用；标记已校准，避免每条消息重复判断。
+		group.markLogSeqCalibrated()
+		return lastSeq, lastMsgID, true
 	}
 	if !group.needLogSeqCalibration() {
-		return lastSeq, lastMsgID
+		return lastSeq, lastMsgID, true
 	}
 	seq, err := service.LogGetLastSeq(d.DBOperator, logID)
 	if err != nil {
 		// 查不到就保持原基线；退避一分钟再试，避免数据库异常时每条消息都查库。
+		// 返回 false 让调用方不要用陈旧基线算缺口（否则会重复补录）。
 		group.deferLogSeqCalibration(time.Minute)
-		return lastSeq, lastMsgID
+		return lastSeq, lastMsgID, false
 	}
 	group.markLogSeqCalibrated()
 	if seq <= lastSeq {
-		return lastSeq, lastMsgID
+		return lastSeq, lastMsgID, true
 	}
 	group.advanceLogSeq(seq, nil)
 	// 数据库里最后一条消息没有携带 RawID，避免断层通知引用错误的消息。
-	return seq, nil
+	return seq, nil, true
+}
+
+// endpointSupportsLogGapFill 判断平台是否具备“按 seq 拉取群历史”的能力。
+//
+// 日志断层补全依赖 per-group 的 Message.Seq：只有 pureonebot / gocq 这类
+// OneBot 实现会填充 Seq 并实现 HistoryFetcher。KOOK、官方 QQ 等平台的 Seq
+// 恒为 0（KOOK 的 sn 是 per-session 的 WebSocket 序号，不是群消息序号），
+// 既无法判断缺口，也没有可复用的历史拉取语义，因此不参与补全。
+// 这里显式挡在入队之前，避免以后给不支持的平台误建补全任务。
+func endpointSupportsLogGapFill(ep *EndPointInfo) bool {
+	if ep == nil || ep.Adapter == nil {
+		return false
+	}
+	_, ok := ep.Adapter.(HistoryFetcher)
+	return ok
 }
 
 // logGapFillTask 描述一次 seq 断层补全。
@@ -1576,8 +1626,9 @@ func (t logGapFillTask) logStateStillValid() bool {
 	}
 	// epoch 变化说明 .log on/new、.bot on 或日志重建已经重置了 seq 基线：
 	// 在途/排队的旧区间不能再写，否则会把 off/静默期间的消息补进日志。
-	// epoch==0 兼容测试里手工构造的任务。
-	if t.epoch != 0 && t.group.logEpoch.Load() != t.epoch {
+	// 注意：epoch 可能本来就是 0（老群数据首次加载），不能用 0 当“跳过校验”
+	// 的哨兵；任务必须携带创建时的真实 epoch。
+	if t.group.logEpoch.Load() != t.epoch {
 		return false
 	}
 	return true
@@ -1856,15 +1907,21 @@ func (t logGapFillTask) isBotSender(m *Message) bool {
 // log_items 对 raw_msg_id 没有唯一约束，必须在补录前查一次。
 func (t logGapFillTask) filterAlreadyLogged(msgs []*Message) []*Message {
 	if t.dice == nil || t.dice.DBOperator == nil {
-		return msgs
+		// 无数据库时无法判断哪些消息已经落库；宁可跳过本次补录，也不能重复写。
+		if t.dice != nil && t.dice.Logger != nil {
+			t.dice.Logger.Warnf("日志补全跳过: 无法查询已记录消息（数据库不可用）: 群=%s", t.group.GroupID)
+		}
+		return nil
 	}
 	// 与 fetchHistoryOnce 使用同一窗口：超大断层只补最近 2000 条时，
 	// 去重集合也只需覆盖这一段，避免为几十万 seq 建 map。
 	windowFrom, _ := logGapFetchWindow(t.fromSeq, t.toSeq)
 	existing, err := service.LogRawMsgIDsInSeqRange(t.dice.DBOperator, t.logID, windowFrom, t.toSeq)
 	if err != nil {
-		t.dice.Logger.Warnf("日志补全查询已记录消息失败，继续补录: 群=%s err=%v", t.group.GroupID, err)
-		return msgs
+		// fail-closed：去重查询失败时不能“继续补录”，否则 log_items 没有唯一约束，
+		// READ 库故障（读写分离）会直接产生重复日志行。
+		t.dice.Logger.Warnf("日志补全跳过: 查询已记录消息失败: 群=%s err=%v", t.group.GroupID, err)
+		return nil
 	}
 	if len(existing) == 0 {
 		return msgs
