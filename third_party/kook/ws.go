@@ -212,6 +212,29 @@ func (s *Session) SetReconnectHandler(h func()) {
 	s.Unlock()
 }
 
+// SetReconnectStartHandler 设置后台重连开始前的回调。
+// 每次重连周期只调用一次，用于让上层把端点状态从 Connected 回置为 Connecting。
+func (s *Session) SetReconnectStartHandler(h func()) {
+	s.Lock()
+	s.ReconnectStartHandler = h
+	s.Unlock()
+}
+
+func (s *Session) reportReconnectStart() {
+	s.RLock()
+	h := s.ReconnectStartHandler
+	s.RUnlock()
+	if h == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			addCaller(s.Logger.Error()).Interface("panic", r).Msg("reconnect start handler panicked")
+		}
+	}()
+	h()
+}
+
 func (s *Session) reportReconnected() {
 	s.RLock()
 	h := s.ReconnectHandler
@@ -1674,6 +1697,10 @@ func (s *Session) reconnect() {
 		}
 		s.Unlock()
 	}()
+
+	// 重连开始：通知上层把端点从 Connected 回置为 Connecting。
+	// 已在上面的 closed/reconnecting 检查中排除重复进入，这里每个重连周期只调一次。
+	s.reportReconnectStart()
 
 	// 断线后先尝试 resume，保留未确认的 sn，便于服务端补发离线事件。
 	// 网络错误使用文档要求的 8/16 秒退避；只有明确的永久错误才立即转新 session。

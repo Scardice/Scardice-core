@@ -91,8 +91,10 @@ func serverGocq(d *Dice, ep *EndPointInfo, conn *PlatformAdapterGocq) {
 		conn.reconnectTimes++
 		if conn.reconnectTimes > 5 {
 			d.Logger.Infof("onebot 连接重试次数过多，先行中断: <%s>(%s)", ep.Nickname, ep.UserID)
-			ep.State = 0
+			ep.State = StateDisconnected
 			conn.GoCqhttpState = StateCodeLoginFailed
+			d.LastUpdatedTime = time.Now().Unix()
+			d.Save(false)
 			break
 		}
 
@@ -146,6 +148,10 @@ func serverWalleQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterWalleQ) {
 		if waitTimes > 5 {
 			d.Logger.Infof("onebot 连接重试次数过多，先行中断: <%s>(%s)", ep.Nickname, ep.UserID)
 			conn.DiceServing = false
+			// 重试预算耗尽后必须回置状态，避免 UI 永远停在“连接中”。
+			ep.State = StateDisconnected
+			d.LastUpdatedTime = time.Now().Unix()
+			d.Save(false)
 			break
 		}
 
@@ -178,6 +184,9 @@ func serverRed(d *Dice, ep *EndPointInfo, conn *PlatformAdapterRed) {
 		if waitTimes > 5 {
 			d.Logger.Infof("red 连接重试次数过多，先行中断: <%s>(%s)", ep.Nickname, ep.UserID)
 			conn.DiceServing = false
+			ep.State = StateDisconnected
+			d.LastUpdatedTime = time.Now().Unix()
+			d.Save(false)
 			break
 		}
 
@@ -210,6 +219,9 @@ func serverSatori(d *Dice, ep *EndPointInfo, conn *PlatformAdapterSatori) {
 		if waitTimes > 5 {
 			d.Logger.Infof("satori 连接重试次数过多，先行中断: <%s>(%s)", ep.Nickname, ep.UserID)
 			conn.DiceServing = false
+			ep.State = StateDisconnected
+			d.LastUpdatedTime = time.Now().Unix()
+			d.Save(false)
 			break
 		}
 
@@ -233,7 +245,31 @@ func defaultOfficialQQServe(conn *PlatformAdapterOfficialQQ) int {
 // officialQQInitialBackoff 是首次连接失败后的等待时间；测试可缩短。
 var officialQQInitialBackoff = 15 * time.Second
 
+// officialQQReadyTimeout 是 WebSocket 已提交后等待 READY 的上限。
+// 超时按瞬时失败重启连接，避免端点永远停在“连接中”。测试可缩短。
+var officialQQReadyTimeout = 60 * time.Second
+
+// officialQQStart 启动 Serve 重试循环；测试可替换为不建真实连接的空实现。
+var officialQQStart func(d *Dice, ep *EndPointInfo)
+
+func defaultOfficialQQStart(d *Dice, ep *EndPointInfo) {
+	go ServerOfficialQQ(d, ep)
+}
+
+func startOfficialQQ(d *Dice, ep *EndPointInfo) {
+	start := officialQQStart
+	if start == nil {
+		start = defaultOfficialQQStart
+	}
+	start(d, ep)
+}
+
 func serverOfficialQQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterOfficialQQ) {
+	// 用户可能在“SetEnable(true) → 后台 goroutine 真正启动”之间点禁用。
+	// 异步启动必须尊重当下的 Enable=false，否则会把刚被禁用的端点重新连上。
+	if enabled, _ := conn.endpointStateSnapshot(); !enabled {
+		return
+	}
 	// Ctx 非空表示会话已经建立或正在运行，不能重复启动并覆盖端点状态。
 	if conn.isSessionRunning() {
 		return

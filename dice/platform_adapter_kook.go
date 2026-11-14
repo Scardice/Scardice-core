@@ -355,8 +355,13 @@ func (pa *PlatformAdapterKook) saveKookResumeState(session *kook.Session) {
 }
 
 func (pa *PlatformAdapterKook) clearKookResumeState() {
-	pa.resumeStateMu.Lock()
-	defer pa.resumeStateMu.Unlock()
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	// 已有新会话接管时，旧 Serve/DoRelogin 的迟到清理不能删掉新会话刚写入的
+	// resume 快照；只有当前没有会话时才允许删除。
+	if pa.IntentSession != nil {
+		return
+	}
 	path := pa.resumeStatePath()
 	if path != "" {
 		_ = os.Remove(path)
@@ -977,6 +982,13 @@ func (pa *PlatformAdapterKook) Serve() (ret int) {
 	s.SetReconnectHandler(func() {
 		if pa.setSessionStateIfCurrent(s, true, StateConnected) {
 			pa.saveKookResumeState(s)
+			pa.saveState()
+		}
+	})
+	// 断线进入后台重连时立即把端点从“已连接”回置为“连接中”，
+	// 避免网络中断的几十秒/几分钟里 UI 仍显示在线、发送守卫误判可发。
+	s.SetReconnectStartHandler(func() {
+		if pa.setSessionStateIfCurrent(s, true, StateConnecting) {
 			pa.saveState()
 		}
 	})

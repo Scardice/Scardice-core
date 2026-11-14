@@ -287,6 +287,10 @@ type Session struct {
 	// ReconnectHandler 在后台 resume/重连成功后回调，用于把端点从
 	// “连接中”恢复为“已连接”。必须通过 SetReconnectHandler 设置。
 	ReconnectHandler func()
+	// ReconnectStartHandler 在后台重连真正开始前回调（每次重连周期一次）。
+	// 适配器用它把端点从 Connected 回置为 Connecting，避免断线/重连期间
+	// UI 继续显示“已连接”。必须通过 SetReconnectStartHandler 设置。
+	ReconnectStartHandler func()
 
 	wsConn  *websocket.Conn
 	wsMutex sync.Mutex
