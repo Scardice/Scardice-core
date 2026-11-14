@@ -899,7 +899,19 @@ func sqliteColumnNamesMatch(actual []sqlitePragmaColumn, expected []string) bool
 }
 
 func recreateSQLiteLogItemsTable(db *gorm.DB, actual []sqlitePragmaColumn) error {
-	if err := dropSQLiteIndexes(db, []string{"idx_log_items_group_id", "idx_log_items_log_id", "idx_raw_msg_id"}); err != nil {
+	// 必须先删掉 log_items 上的全部模型索引，再在临时表上重建同名索引。
+	// SQLite 的索引名是库级唯一的：只删旧的三件套会漏掉后来新增的
+	// idx_log_delete_by_id / idx_log_items_gap_fill / idx_log_raw，
+	// CreateTable 在临时表上建这些索引时会报“index ... already exists”，
+	// 并中断后续索引创建，导致新表缺少 gap_fill/去重索引。
+	if err := dropSQLiteIndexes(db, []string{
+		"idx_log_items_group_id",
+		"idx_log_items_log_id",
+		"idx_raw_msg_id",
+		"idx_log_delete_by_id",
+		"idx_log_items_gap_fill",
+		"idx_log_raw",
+	}); err != nil {
 		return err
 	}
 	actualMap := make(map[string]sqlitePragmaColumn, len(actual))
