@@ -48,6 +48,8 @@ func (g *GroupInfo) suspendLogForBotOff() bool {
 	if g == nil {
 		return false
 	}
+	g.logWriteMu.Lock()
+	defer g.logWriteMu.Unlock()
 	g.logStateMu.Lock()
 	defer g.logStateMu.Unlock()
 	if !g.LogOn || g.LogCurName == "" {
@@ -67,6 +69,8 @@ func (g *GroupInfo) resumeLogPausedByBotOff() bool {
 	if g == nil {
 		return false
 	}
+	g.logWriteMu.Lock()
+	defer g.logWriteMu.Unlock()
 	g.logStateMu.Lock()
 	defer g.logStateMu.Unlock()
 	if !g.LogPausedByBotOff {
@@ -110,11 +114,14 @@ func (g *GroupInfo) clearLogPausedByBotOff() {
 //   - 日志已由 .bot off 自动关闭：只清标记，让下一次 .bot on 不再自动开启；
 //   - 日志本来就没开、或没有日志名：返回 false。
 //
-// 用同一把 logStateMu 完成“判断 + 写入”，避免 .bot on 并发把日志重新打开。
+// 用 logWriteMu + logStateMu 完成“判断 + 写入”：logWriteMu 让在途补录写入
+// 先完成（或被这次 off 看到已关闭而跳过），logStateMu 保护字段本身。
 func (g *GroupInfo) logOffForUser() (name string, ok bool) {
 	if g == nil {
 		return "", false
 	}
+	g.logWriteMu.Lock()
+	defer g.logWriteMu.Unlock()
 	g.logStateMu.Lock()
 	defer g.logStateMu.Unlock()
 	if g.LogCurName == "" {
@@ -177,15 +184,17 @@ func (g *GroupInfo) resetLogSeqForNewSegment(seq int64, rawID interface{}) {
 	if g == nil {
 		return
 	}
-	g.clearLogResumeSkipGap()
 	if seq > 0 {
+		g.clearLogResumeSkipGap()
 		g.resetLogSeq(seq, rawID)
 		return
 	}
 	// 没有 seq 时，下一条带 seq 的消息消费该标记后只执行 updateLogSeq，
-	// 不再计算缺口。epoch++ 让旧基线下的在途/排队补全任务失效。
+	// 不再计算缺口。直接 set（不要先 clear）避免并发消息在 clear/set 之间
+	// 看到 false 而用旧基线算 gap；resetLogSeqBaseline 同时清掉旧持久基线、
+	// 排队区间并推进 epoch，重启后不会拿旧日志基线给新日志补旧段。
 	g.setLogResumeSkipGap()
-	g.logEpoch.Add(1)
+	g.resetLogSeqBaseline()
 }
 
 // repairPersistedLogState 校验持久化的 LogCurID 是否仍指向 LogCurName。
@@ -552,9 +561,11 @@ func RegisterBuiltinExtLog(self *Dice) {
 							ctx.Dice.Logger.Errorf("日志开启失败: group=%s name=%s err=%v", group.GroupID, name, err)
 							return CmdExecuteResult{Matched: true, Solved: true}
 						}
+						group.logWriteMu.Lock()
 						group.SetLogState(logID, name, true)
 						group.resetLogSeqForNewSegment(msg.Seq, msg.RawID)
 						group.clearLogPausedByBotOff()
+						group.logWriteMu.Unlock()
 						group.MarkDirty(ctx.Dice)
 						ctx.Dice.Logger.Infof("日志状态切换: 群=%s 开启日志 name=%s id=%d", group.GroupID, name, logID)
 
@@ -745,9 +756,11 @@ func RegisterBuiltinExtLog(self *Dice) {
 					ctx.Dice.Logger.Errorf("日志新建失败: group=%s name=%s err=%v", group.GroupID, name, err)
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
+				group.logWriteMu.Lock()
 				group.SetLogState(logID, name, true)
 				group.resetLogSeqForNewSegment(msg.Seq, msg.RawID)
 				group.clearLogPausedByBotOff()
+				group.logWriteMu.Unlock()
 				group.MarkDirty(ctx.Dice)
 				ctx.Dice.Logger.Infof("日志状态切换: 群=%s 新建并开启日志 name=%s id=%d", group.GroupID, name, logID)
 
@@ -1544,7 +1557,24 @@ func logGapFromMessage(d *Dice, group *GroupInfo, logState GroupLogState, msgSeq
 			return 0, nil, 0
 		}
 	}
+	// 重启前有未完成的补全区间：把内存基线压回区间起点，让这条消息重新
+	// 触发补全。只在没有排队/在途任务时生效，正常补全过程不会被反复拉回。
+	group.applyLogGapPendingFloor()
 	lastSeq, lastMsgID, selfSent := group.updateLogSeq(msgSeq, rawID)
+	// 平台 seq 重置（OneBot 实现重装、群迁移等）后 msgSeq 会长期小于旧基线；
+	// 连续多条明显回退时重建基线，避免缺口检测永久失效。普通前进/小幅乱序
+	// 会清零计数，不会误重置。
+	if group.noteLogSeqRegression(msgSeq, lastSeq) {
+		group.resetLogSeq(msgSeq, rawID)
+		if d != nil {
+			group.MarkDirty(d)
+			if d.Logger != nil {
+				d.Logger.Warnf("检测到平台 seq 重置: 群=%s 旧基线=%d 新seq=%d，已重建基线",
+					group.GroupID, lastSeq, msgSeq)
+			}
+		}
+		return 0, nil, 0
+	}
 	if lastSeq == 0 && logState.ID > 0 {
 		// 没有数据库/日志 ID 时校准不适用，持久基线仍是最后一道依据。
 		persistedSeq, persistedMsgID := group.logSeqBaselineSnapshot()
@@ -1707,6 +1737,14 @@ func (g *GroupInfo) mergeLogGapTask(task logGapFillTask) bool {
 		pending.endpoint = task.endpoint
 		pending.dice = task.dice
 	}
+	// 持久化“尚未完成的补全区间”：进程在 worker 完成前重启时，下一次消息
+	// 会把基线压回起点重新补，避免这段缺口永久丢失。
+	if p := g.logGapPending; p != nil {
+		g.setLogGapPendingRange(p.fromSeq, p.toSeq)
+	}
+	if task.dice != nil {
+		g.MarkDirty(task.dice)
+	}
 
 	if g.logGapWorkerRunning {
 		return false
@@ -1753,6 +1791,7 @@ func (t logGapFillTask) run() {
 	}
 	if !t.logStateStillValid() {
 		t.dice.Logger.Infof("日志补全已取消: 群=%s 记录=%s 已关闭或被切换", t.group.GroupID, t.logName)
+		t.group.clearLogGapPendingIfIdle(t.dice)
 		return
 	}
 
@@ -1760,6 +1799,8 @@ func (t logGapFillTask) run() {
 	if !ok {
 		t.dice.Logger.Infof("日志补全跳过: 平台未实现历史消息拉取: 群=%s 平台=%s",
 			t.group.GroupID, t.endpoint.Platform)
+		// 平台永远补不了这段；不要让它每次重启都把基线拉回。
+		t.group.clearLogGapPendingIfIdle(t.dice)
 		return
 	}
 
@@ -1779,20 +1820,29 @@ func (t logGapFillTask) run() {
 	missing = t.filterAlreadyLogged(missing)
 	if len(missing) == 0 {
 		t.dice.Logger.Infof("日志补全无需处理: 群=%s 缺失区间内没有需要补录的他人发言", t.group.GroupID)
+		t.group.clearLogGapPendingIfIdle(t.dice)
 		return
 	}
 
 	// 拉取历史可能耗时数十秒，写入前必须再确认一次日志状态。
 	if !t.logStateStillValid() {
 		t.dice.Logger.Infof("日志补全已取消: 群=%s 记录=%s 在拉取期间已关闭或被切换", t.group.GroupID, t.logName)
+		t.group.clearLogGapPendingIfIdle(t.dice)
 		return
 	}
 
+	done := true
 	if t.gap <= logGapFillSilentThreshold {
-		t.replaySilently(missing)
-		return
+		done = t.replaySilently(missing)
+	} else {
+		t.backfillWithNotice(missing)
 	}
-	t.backfillWithNotice(missing)
+	// 补全完成或中途因日志关闭/切换而停止：这段区间不再需要在重启后恢复。
+	// 端点会话未绑定（replaySilently 返回 false）时保留 pending，等下次启动重试；
+	// 若期间又合并了新的 pending，clearIfIdle 也会保留它。
+	if done {
+		t.group.clearLogGapPendingIfIdle(t.dice)
+	}
 }
 
 // fetchHistory 按页拉取 (fromSeq, toSeq) 区间，直到覆盖到 toSeq-1 或达到上限。
@@ -1898,16 +1948,42 @@ func (t logGapFillTask) fetchHistoryOnce(ctx context.Context, fetcher HistoryFet
 }
 
 // filterMissing 保留断层区间内的他人发言。
-// 骰子自身发言已由 OnMessageSend 记录，重复入库或被当成玩家指令执行都是错的；
-// 自身发言计数虽已在断层估算时扣除，但计数可能因重启丢失，故这里仍按发送者兜底剔除。
-// 其他机器人同样剔除：历史消息里的 bot 指令不应在本群重新执行。
+// isGroupDiceSender 判断历史消息是否由本群的任一骰子端点发出。
+// 只比较当前 endpoint 会漏掉同群其他端点：它们的骰子发言已经由各自的
+// OnMessageSend 记过日志，补录时再当玩家消息写一遍会造成重复/归属错误。
+func (t logGapFillTask) isGroupDiceSender(userID string) bool {
+	if userID == "" {
+		return false
+	}
+	if t.endpoint != nil && userID == t.endpoint.UserID {
+		return true
+	}
+	if t.group == nil {
+		return false
+	}
+	if t.group.DiceIDExistsMap != nil {
+		if _, ok := t.group.DiceIDExistsMap.Load(userID); ok {
+			return true
+		}
+	}
+	if t.group.DiceIDActiveMap != nil {
+		if _, ok := t.group.DiceIDActiveMap.Load(userID); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// filterMissing 保留区间内、且不是本群任一骰子端点的消息。
+// 骰子自身发言已由 OnMessageSend 记录，任何端点都不能再当玩家消息补录；
+// 自身发言计数可能因重启丢失，所以这里按发送者兜底。
 func (t logGapFillTask) filterMissing(msgs []*Message) []*Message {
 	missing := make([]*Message, 0, len(msgs))
 	for _, m := range msgs {
 		if m == nil || m.Seq <= t.fromSeq || m.Seq >= t.toSeq {
 			continue
 		}
-		if t.endpoint != nil && m.Sender.UserID == t.endpoint.UserID {
+		if t.isGroupDiceSender(m.Sender.UserID) {
 			continue
 		}
 		missing = append(missing, m)
@@ -1998,15 +2074,18 @@ func (t logGapFillTask) playerDisplayName(uid, fallback string, cache map[string
 // replaySilently 让缺失消息重走完整消息流程，日志记录与指令执行都由 ExecuteNew 内部完成。
 // 管理指令（log/bot/master/dismiss/ban 等）只补日志、不执行，避免掉线期间的旧指令
 // 在恢复后改变骰子状态；普通跑团指令仍然按小断层策略自动补执行。
-func (t logGapFillTask) replaySilently(missing []*Message) {
+//
+// 返回值表示“这段补全已经结束，可以清除持久化的 pending 区间”。
+// 端点会话未绑定是暂时状态，返回 false 让 pending 保留到下次启动/重试。
+func (t logGapFillTask) replaySilently(missing []*Message) bool {
 	session := t.endpoint.Session
 	if session == nil {
 		t.dice.Logger.Warnf("日志补全无法重放: 群=%s 端点会话未绑定", t.group.GroupID)
-		return
+		return false
 	}
 	if !t.logStateStillValid() {
 		t.dice.Logger.Infof("日志补全已取消(静默重放): 群=%s 日志已关闭或切换", t.group.GroupID)
-		return
+		return true
 	}
 	endGapFillWindow := t.group.beginLogGapFillWindow(t.fromSeq, t.toSeq)
 	defer endGapFillWindow()
@@ -2022,9 +2101,19 @@ func (t logGapFillTask) replaySilently(missing []*Message) {
 	processed := t.forEachMissing(missing, func(m *Message) {
 		if t.isBotSender(m) || t.isDeniedReplayCommand(m) {
 			// 其他机器人与管理指令只补日志，不执行；日志仍需保持完整。
+			// 写入与日志状态在同一把锁里：.log off/new 不会让这条迟到的
+			// 写入落进已关闭/已切换的日志。
 			item := t.logItem(m)
-			LogAppend(logCtx, t.group.GroupID, t.logID, t.logName, &item)
-			skipped++
+			if t.group.withLogStateRead(t.logID, t.logName, func() {
+				LogAppend(logCtx, t.group.GroupID, t.logID, t.logName, &item)
+			}) {
+				skipped++
+			}
+			return
+		}
+		// 命令执行的临界区无法长期持锁（命令内部可能 .log off），这里在
+		// 执行前再做一次最终校验；写入路径已由 withLogStateRead 原子化。
+		if !t.logStateStillValid() {
 			return
 		}
 		session.ExecuteNew(t.endpoint, m)
@@ -2033,9 +2122,10 @@ func (t logGapFillTask) replaySilently(missing []*Message) {
 	if processed < len(missing) {
 		t.dice.Logger.Warnf("日志补全中止(静默重放): 群=%s 日志在重放过程中被关闭或切换，已重放=%d条 仅补日志=%d条 剩余=%d条",
 			t.group.GroupID, executed, skipped, len(missing)-processed)
-		return
+		return true
 	}
 	t.dice.Logger.Infof("日志补全完成(静默重放): 群=%s 重放=%d条 仅补日志=%d条", t.group.GroupID, executed, skipped)
+	return true
 }
 
 func (t logGapFillTask) isDeniedReplayCommand(m *Message) bool {
@@ -2091,7 +2181,11 @@ func (t logGapFillTask) backfillWithNotice(missing []*Message) {
 
 	processed := t.forEachMissing(missing, func(m *Message) {
 		item := t.logItem(m)
-		if LogAppend(mctx, t.group.GroupID, t.logID, t.logName, &item) {
+		appendedOK := false
+		t.group.withLogStateRead(t.logID, t.logName, func() {
+			appendedOK = LogAppend(mctx, t.group.GroupID, t.logID, t.logName, &item)
+		})
+		if appendedOK {
 			appended++
 		}
 

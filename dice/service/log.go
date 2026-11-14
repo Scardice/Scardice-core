@@ -28,6 +28,11 @@ type LogOne struct {
 
 var ErrLogNotFound = errors.New("日志不存在")
 
+// logAppendDedupeMu 串行化“按 raw_msg_id 查重 + 插入”，防止实时消息与补录
+// 在同一进程内交错写入同一条平台消息。跨进程/多实例仍需要数据库唯一约束；
+// 这里不建唯一索引，避免历史库里已有重复行导致迁移失败。
+var logAppendDedupeMu sync.Mutex
+
 // LogGetInfo 查询日志简略信息（近似估算）
 // 返回值保持原结构：logs 最大 ID、log_items 最大 ID、logs 近似行数、log_items 近似行数。
 func LogGetInfo(operator engine2.DatabaseOperator) ([]int, error) {
@@ -680,6 +685,8 @@ func logAppendDBErr(op string, groupID, logName string, logID uint64, err error)
 
 // LogAppend 向指定的log中添加一条信息
 func LogAppend(operator engine2.DatabaseOperator, groupID string, logName string, logItem *model.LogOneItem) bool {
+	logAppendDedupeMu.Lock()
+	defer logAppendDedupeMu.Unlock()
 	err := logAppendOnce(operator, groupID, logName, logItem)
 	if err != nil && maybeHealLogSchema(operator, err) {
 		err = logAppendOnce(operator, groupID, logName, logItem)
@@ -689,6 +696,32 @@ func LogAppend(operator engine2.DatabaseOperator, groupID string, logName string
 		return false
 	}
 	return true
+}
+
+// logItemRawMsgID 返回与 model.LogOneItem.BeforeSave 一致的 raw_msg_id 字符串。
+func logItemRawMsgID(item *model.LogOneItem) string {
+	if item == nil {
+		return ""
+	}
+	if item.RawMsgID != nil {
+		return fmt.Sprintf("%v", item.RawMsgID)
+	}
+	return item.RawMsgIDStr
+}
+
+// logAppendDuplicate 在事务内检查同一日志是否已经写入过该平台消息。
+// 调用方需持有 logAppendDedupeMu，保证“查重+插入”在进程内串行。
+func logAppendDuplicate(tx *gorm.DB, logID uint64, rawID string) (bool, error) {
+	if rawID == "" {
+		return false, nil
+	}
+	var count int64
+	if err := tx.Model(&model.LogOneItem{}).
+		Where("log_id = ? AND raw_msg_id = ?", logID, rawID).
+		Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 func logAppendOnce(operator engine2.DatabaseOperator, groupID string, logName string, logItem *model.LogOneItem) error {
@@ -739,6 +772,13 @@ func logAppendOnce(operator engine2.DatabaseOperator, groupID string, logName st
 			}
 		}
 		newLogItem.LogID = logID
+		// 同一平台消息只落一行：实时路径与补录路径可能几乎同时写入同一条
+		// raw_msg_id，log_items 没有唯一约束，必须在事务内查重。
+		if dup, dupErr := logAppendDuplicate(tx, logID, logItemRawMsgID(&newLogItem)); dupErr != nil {
+			return dupErr
+		} else if dup {
+			return nil
+		}
 		if createErr := tx.Create(&newLogItem).Error; createErr != nil {
 			return createErr
 		}
@@ -759,6 +799,8 @@ func LogAppendByID(operator engine2.DatabaseOperator, logID uint64, groupID stri
 	if logID == 0 {
 		return false
 	}
+	logAppendDedupeMu.Lock()
+	defer logAppendDedupeMu.Unlock()
 	err := logAppendByIDOnce(operator, logID, groupID, logItem)
 	if err != nil && maybeHealLogSchema(operator, err) {
 		err = logAppendByIDOnce(operator, logID, groupID, logItem)
@@ -804,6 +846,11 @@ func logAppendByIDOnce(operator engine2.DatabaseOperator, logID uint64, groupID 
 		}
 		if logInfo.GroupID != groupID {
 			return fmt.Errorf("log append by id: log %d 不属于群 %s", logID, groupID)
+		}
+		if dup, dupErr := logAppendDuplicate(tx, logID, logItemRawMsgID(&newLogItem)); dupErr != nil {
+			return dupErr
+		} else if dup {
+			return nil
 		}
 		if err := tx.Create(&newLogItem).Error; err != nil {
 			return err
