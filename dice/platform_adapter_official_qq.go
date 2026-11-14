@@ -132,6 +132,10 @@ type PlatformAdapterOfficialQQ struct {
 	tokenSource oauth2.TokenSource `json:"-" yaml:"-"`
 	botID       string             `json:"-" yaml:"-"`
 
+	// readyCh 在当前会话收到 READY 时关闭；watchOfficialQQReady 用它判断
+	// “WebSocket 已提交、但 READY 迟迟不到”的假在线状态。由 sessionMu 保护。
+	readyCh chan struct{} `json:"-" yaml:"-"`
+
 	// Webhook服务
 	webhookMu     sync.Mutex   `json:"-" yaml:"-"`
 	webhookServer *http.Server `json:"-" yaml:"-"`
@@ -323,6 +327,7 @@ func (pa *PlatformAdapterOfficialQQ) serveLoopCurrent(epoch uint64, stop <-chan 
 func (pa *PlatformAdapterOfficialQQ) stopSessionLocked() (context.CancelFunc, *officialQQEventQueue) {
 	cancel := pa.CancelFunc
 	pa.Ctx, pa.CancelFunc = nil, nil
+	pa.readyCh = nil
 	pa.eventQueueMu.Lock()
 	queue := pa.eventQueue
 	pa.eventQueueAccepting = false
@@ -484,6 +489,9 @@ func (pa *PlatformAdapterOfficialQQ) markOfficialQQReady(ctx context.Context, da
 	if ctx == nil || !pa.isCurrentSession(ctx) {
 		return
 	}
+	// 先唤醒 READY watchdog：WebSocket 已提交但 READY 迟到时，watchdog 会
+	// 把这次连接判为瞬时失败并重启，这里收到 READY 就取消该判定。
+	pa.markReadyIfCurrent(ctx)
 	if data != nil && data.User.ID != "" {
 		pa.setBotID(data.User.ID)
 		currentID, currentName := pa.identitySnapshot()
@@ -506,6 +514,70 @@ func (pa *PlatformAdapterOfficialQQ) markOfficialQQReady(ctx context.Context, da
 		d.Save(false)
 		d.Logger.Infof("official qq 连接成功（READY）；QQ 官方续期重连会自动恢复，不需要手动重启")
 	}
+}
+
+// markReadyIfCurrent 在当前会话收到 READY 时关闭 readyCh（只关一次）。
+// 会话已被替换/停止时什么都不做，旧 watchdog 会通过 ctx.Done 退出。
+func (pa *PlatformAdapterOfficialQQ) markReadyIfCurrent(ctx context.Context) {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	if pa.Ctx != ctx || pa.readyCh == nil {
+		return
+	}
+	select {
+	case <-pa.readyCh:
+	default:
+		close(pa.readyCh)
+	}
+}
+
+// currentReadyCh 返回当前会话的 READY 信号通道；会话已不是 ctx 时返回 nil。
+func (pa *PlatformAdapterOfficialQQ) currentReadyCh(ctx context.Context) <-chan struct{} {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	if pa.Ctx != ctx {
+		return nil
+	}
+	return pa.readyCh
+}
+
+// watchOfficialQQReady 兜底“WebSocket 已提交、READY 永不到达”的假在线：
+// 超时后按瞬时失败停止本次会话（保留 Enable=true/StateConnecting），
+// 再启动新的 Serve 重试循环。收到 READY 或会话被替换/禁用则直接退出。
+func (pa *PlatformAdapterOfficialQQ) watchOfficialQQReady(ctx context.Context, readyCh <-chan struct{}) {
+	if readyCh == nil {
+		return
+	}
+	timer := time.NewTimer(officialQQReadyTimeout)
+	defer timer.Stop()
+	select {
+	case <-readyCh:
+		return
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+
+	if !pa.isCurrentSession(ctx) {
+		return
+	}
+	enabled, state := pa.endpointStateSnapshot()
+	if !enabled || state != StateConnecting {
+		return
+	}
+	ep := pa.EndPoint
+	if ep == nil || ep.Session == nil || ep.Session.Parent == nil {
+		return
+	}
+	d := ep.Session.Parent
+	d.Logger.Warnf("official qq READY 超时，重启连接: 帐号 <%s>(%s)", ep.Nickname, ep.UserID)
+	if pa.failConnectTransient(ctx) == 0 {
+		return
+	}
+	pa.setDiceServing(false)
+	d.LastUpdatedTime = time.Now().Unix()
+	d.Save(false)
+	startOfficialQQ(d, ep)
 }
 
 func (pa *PlatformAdapterOfficialQQ) setEndpointStateForCurrent(enable bool, state EndpointState) bool {
@@ -789,6 +861,7 @@ func (pa *PlatformAdapterOfficialQQ) beginSession(ctx context.Context, cancel co
 		return false
 	}
 	pa.Ctx, pa.CancelFunc = ctx, cancel
+	pa.readyCh = make(chan struct{})
 	return true
 }
 
@@ -1194,6 +1267,9 @@ func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *Officia
 	registerOfficialQQReadySink(pa.getAppID().String(), func(data *dto.WSReadyData) {
 		pa.markOfficialQQReady(ctx, data)
 	})
+	if readyCh := pa.currentReadyCh(ctx); readyCh != nil {
+		go pa.watchOfficialQQReady(ctx, readyCh)
+	}
 
 	go func() {
 		currentCtx := ctx
@@ -2311,9 +2387,16 @@ func (pa *PlatformAdapterOfficialQQ) DoRelogin() bool {
 		d.Save(false)
 		return false
 	}
+	// 重登流程会先把端点置为 Disconnected（Enable=false）；serverOfficialQQ
+	// 现在会拒绝启动已禁用的端点，启动前必须恢复 Connecting/Enable=true。
+	if !pa.setEndpointStateIfIdle(true, StateConnecting) {
+		d.LastUpdatedTime = time.Now().Unix()
+		d.Save(false)
+		return false
+	}
 	// 走统一的 Serve 重试循环：Serve 本身只建一次连，瞬时失败会直接返回 1；
 	// 由 ServerOfficialQQ 按退避持续重试，避免重登遇到网络抖动后停在 Connecting。
-	go ServerOfficialQQ(d, pa.EndPoint)
+	startOfficialQQ(d, pa.EndPoint)
 	d.LastUpdatedTime = time.Now().Unix()
 	d.Save(false)
 	return true
@@ -2325,15 +2408,20 @@ func (pa *PlatformAdapterOfficialQQ) SetEnable(enable bool) {
 	if enable {
 		if !pa.isSessionRunning() {
 			pa.setDiceServing(false)
-			pa.setEndpointState(false, StateConnecting)
+			// 保持 Enable=true：后台启动是异步的，如果这里先置 false，用户在
+			// “点击启用→Serve 真正启动”之间点禁用时，EndPointInfo.SetEnable
+			// 会因值相等而不转发，挂起的 Serve 仍会把端点连起来。
+			pa.setEndpointState(true, StateConnecting)
 			// 必须在后台启动：ServerOfficialQQ 内部是按退避持续重试的循环，
 			// 同步调用会让 /im_connections/set_enable 请求一直挂到连接成功为止
 			// （网络不通时永远不返回），连点还会叠加多个重试循环。
-			go ServerOfficialQQ(d, ep)
+			startOfficialQQ(d, ep)
 		} else {
 			qrState, _, _ := pa.QrLoginSnapshot()
 			if qrState == OfficialQQLoginStateQRWaitingForScan {
-				pa.setEndpointStateForCurrent(false, StateConnecting)
+				// 扫码等待期间同样保持 Enable=true，用户点禁用才能传达到适配器，
+				// 由 SetEnable(false) 取消轮询/关闭二维码。
+				pa.setEndpointStateForCurrent(true, StateConnecting)
 			} else {
 				pa.setEndpointStateForCurrent(true, StateConnected)
 			}
@@ -4143,6 +4231,19 @@ func (pa *PlatformAdapterOfficialQQ) failQrLogin(ctx context.Context, generation
 	d.Save(false)
 }
 
+// qrLoginMaxAge 限制扫码登录的总时长。无人扫码时轮询每 2 秒调用一次外部接口，
+// 没有上限会永久占用协程和额度；超时后按失败收尾，用户可重新启用再扫。
+// 设为 var 便于测试缩短。
+var qrLoginMaxAge = 5 * time.Minute
+
+// qrLoginExpired 判断扫码会话是否超过最大存活时间；CreatedAt 为零时不做限制。
+func qrLoginExpired(createdAt, now time.Time, maxAge time.Duration) bool {
+	if createdAt.IsZero() || maxAge <= 0 {
+		return false
+	}
+	return now.Sub(createdAt) > maxAge
+}
+
 // serveQrLogin 在 adapter 内执行扫码登录全流程：
 //   - 生成二维码后写入 QrCodeData，状态置为 QRWaitingForScan
 //   - 二维码过期自动刷新
@@ -4208,6 +4309,11 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 			curSession := pa.qrSession
 			pa.qrMu.Unlock()
 			if curSession == nil {
+				return
+			}
+			// 无人扫码时不能永远每 2 秒轮询外部接口；超过总时长就按失败收尾。
+			if qrLoginExpired(curSession.CreatedAt, time.Now(), qrLoginMaxAge) {
+				pa.failQrLogin(ctx, generation, "official qq 扫码超时: ", nil)
 				return
 			}
 
@@ -4342,7 +4448,7 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 						if !pa.isSessionRunning() {
 							pa.setDiceServing(false)
 						}
-						go ServerOfficialQQ(d, ep)
+						startOfficialQQ(d, ep)
 						return
 					}
 					// beginSession 失败说明已有新会话接管，不能把它的 Enable 改掉。

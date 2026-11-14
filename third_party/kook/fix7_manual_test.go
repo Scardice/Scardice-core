@@ -272,3 +272,24 @@ func TestManualComplianceConstants(t *testing.T) {
 		}
 	}
 }
+
+// TestReconnectStartHandlerInvoked 锁定后台重连开始时通知上层：
+// 适配器据此把端点从 Connected 回置为 Connecting，避免断线期间假在线。
+func TestReconnectStartHandlerInvoked(t *testing.T) {
+	s := New("token", nopLogger{})
+	s.sessionID = "sess-1"
+	s.closedCh = make(chan struct{})
+	s.Client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("gateway unavailable")
+	})}
+	called := make(chan struct{}, 1)
+	s.SetReconnectStartHandler(func() { called <- struct{}{} })
+
+	go s.reconnect()
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconnect start handler was not invoked")
+	}
+	s.Close()
+}
