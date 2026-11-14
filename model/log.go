@@ -138,6 +138,10 @@ func (*LogInfoHookMySQL) TableName() string {
 	return "logs"
 }
 
+// LogOneItemHookMySQL 只用于 MySQL 的 AutoMigrate。
+// 注意：不要给 RawMsgIDStr 加 idx_log_raw。MySQL 上 raw_msg_id 是 TEXT，
+// 直接建 (log_id, raw_msg_id) 普通索引会失败；去重查询带 group_id，
+// 复用已有的 idx_log_delete_by_id(group_id(20), raw_msg_id(20), id) 前缀索引。
 type LogOneItemHookMySQL struct {
 	ID             uint64      `gorm:"primaryKey;autoIncrement;column:id;index:idx_log_delete_by_id,priority:3" json:"id"`
 	LogID          uint64      `gorm:"column:log_id"                      json:"-"`

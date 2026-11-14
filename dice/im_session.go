@@ -195,8 +195,12 @@ type GroupInfo struct {
 	// logGapFillFrom/To 是当前静默重放的 seq 区间（开区间）。
 	// 重放的消息会重走 OnMessageReceived，必须按 seq 是否落在区间内打标记；
 	// 只看布尔标记会把重放期间实时到达的正常消息也标成补录。
-	logGapFillFrom atomic.Int64 `json:"-" yaml:"-"`
-	logGapFillTo   atomic.Int64 `json:"-" yaml:"-"`
+	logGapFillFrom atomic.Int64 `json:"-" yaml:"-"` // 静默重放区间起点（不含）
+	logGapFillTo   atomic.Int64 `json:"-" yaml:"-"` // 静默重放区间终点（不含）
+	// logGapRetryAt 是补全拉取失败后的退避截止时间(unix)。
+	// 拉取失败时 pending 区间会保留以便重试；若没有退避，每条新消息都会重新
+	// 发起一次最长 60s 的历史拉取，平台持续异常时会形成重试风暴。
+	logGapRetryAt atomic.Int64 `json:"-" yaml:"-"`
 	// logSeqCalibrated 表示本进程内是否已用数据库 MAX(seq) 校准过 seq 基线。
 	logSeqCalibrated bool `json:"-" yaml:"-"`
 	// logSeqCalibrationRetryAt 是校准失败后的下次重试时间(unix)。
@@ -222,7 +226,7 @@ type GroupInfo struct {
 	// 进程在补全完成前重启时，启动校准会把基线推到触发消息的 DB MAX；
 	// 用这段区间在下次收到消息时把内存基线压回起点，重新触发补全。
 	LogGapPendingFrom int64 `json:"logGapPendingFrom,omitempty" yaml:"logGapPendingFrom,omitempty"`
-	LogGapPendingTo   int64 `json:"logGapPendingTo,omitempty" yaml:"logGapPendingTo,omitempty"`
+	LogGapPendingTo   int64 `json:"logGapPendingTo,omitempty"   yaml:"logGapPendingTo,omitempty"`
 }
 
 // noteLogSelfSent 记录一条骰子自身的群内发言。
@@ -287,6 +291,7 @@ func (g *GroupInfo) clearLogGapPendingRange() bool {
 	g.logSeqMu.Lock()
 	changed := g.LogGapPendingFrom != 0 || g.LogGapPendingTo != 0
 	g.LogGapPendingFrom, g.LogGapPendingTo = 0, 0
+	g.logGapRetryAt.Store(0)
 	g.logSeqMu.Unlock()
 	return changed
 }
@@ -311,11 +316,38 @@ func (g *GroupInfo) clearLogGapPendingIfIdle(d *Dice) {
 	}
 }
 
+// cancelLogGapFill 清除未完成的补全区间并推进 epoch，取消在途/排队的补全任务。
+// 用于 .bot off / .bot on 的边界：暂停与恢复之间的消息不属于要补的断层，
+// 不能在恢复后靠 pending 区间重新补录。
+// 调用方不得持有 logStateMu：本函数会取 logSeqMu，而 MarshalJSON 的加锁顺序
+// 是 logSeqMu -> logStateMu，反过来会死锁。
+func (g *GroupInfo) cancelLogGapFill() {
+	if g == nil {
+		return
+	}
+	g.clearLogGapPendingRange()
+	g.logEpoch.Add(1)
+}
+
+// deferLogGapRetry 在补全拉取失败后设置退避，避免每条新消息都重新发起一次
+// 最长 60s 的历史拉取。退避只影响 pending floor，已合并的任务仍会继续执行。
+func (g *GroupInfo) deferLogGapRetry(delay time.Duration) {
+	if g == nil || delay <= 0 {
+		return
+	}
+	g.logGapRetryAt.Store(time.Now().Add(delay).Unix())
+}
+
 // applyLogGapPendingFloor 在没有排队/在途任务时，把内存基线压回未完成区间的
 // 起点，让下一条消息重新计算这段缺口。只在重启后（worker/pending 均为空）
 // 生效，正常补全过程中不会把已经推进的基线反复拉回。
 func (g *GroupInfo) applyLogGapPendingFloor() {
 	if g == nil {
+		return
+	}
+	// 拉取失败后的退避期内不要反复把基线压回起点，否则每条新消息都会
+	// 重新触发一次完整历史拉取。
+	if time.Now().Unix() < g.logGapRetryAt.Load() {
 		return
 	}
 	g.logGapQueueMu.Lock()
@@ -384,6 +416,7 @@ func (g *GroupInfo) resetLogSeq(seq int64, rawID interface{}) {
 	g.LogSeqBaselineMsgID = msgID
 	g.LogGapPendingFrom, g.LogGapPendingTo = 0, 0
 	g.logSeqRegressCount = 0
+	g.logGapRetryAt.Store(0)
 	g.logEpoch.Add(1)
 }
 
@@ -476,6 +509,7 @@ func (g *GroupInfo) resetLogSeqBaseline() {
 	g.LogSeqBaselineMsgID = ""
 	g.LogGapPendingFrom, g.LogGapPendingTo = 0, 0
 	g.logSeqRegressCount = 0
+	g.logGapRetryAt.Store(0)
 	g.logEpoch.Add(1)
 	g.logSeqMu.Unlock()
 }

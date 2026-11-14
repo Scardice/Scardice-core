@@ -604,13 +604,15 @@ func LogRawMsgIDsInSeqRange(operator engine2.DatabaseOperator, logID uint64, fro
 
 	var rawIDs []string
 	err := db.Model(&model.LogOneItem{}).
-		Where("log_id = ? AND seq IS NOT NULL AND raw_msg_id IS NOT NULL AND seq > ? AND seq < ?", logID, fromSeq, toSeq).
+		Where("log_id = ? AND seq IS NOT NULL AND raw_msg_id IS NOT NULL AND is_dice IS NOT TRUE AND seq > ? AND seq < ?", logID, fromSeq, toSeq).
 		Pluck("raw_msg_id", &rawIDs).Error
 	if err != nil {
 		return nil, err
 	}
 	for _, rawID := range rawIDs {
-		if rawID != "" {
+		// "0" 表示平台没有返回真实消息 ID（见 logItemRawMsgID），不能当成
+		// 已记录过的消息，否则会跳过之后所有缺 ID 的补录。
+		if rawID != "" && rawID != "0" {
 			result[rawID] = struct{}{}
 		}
 	}
@@ -699,25 +701,42 @@ func LogAppend(operator engine2.DatabaseOperator, groupID string, logName string
 }
 
 // logItemRawMsgID 返回与 model.LogOneItem.BeforeSave 一致的 raw_msg_id 字符串。
+// "0" 与空值都视为“平台没有提供可用的消息 ID”：部分 OneBot 实现在缺失
+// message_id 时会序列化成 0，若拿 "0" 去重，会把之后所有同类消息都误判成重复。
 func logItemRawMsgID(item *model.LogOneItem) string {
 	if item == nil {
 		return ""
 	}
+	rawID := item.RawMsgIDStr
 	if item.RawMsgID != nil {
-		return fmt.Sprintf("%v", item.RawMsgID)
+		rawID = fmt.Sprintf("%v", item.RawMsgID)
 	}
-	return item.RawMsgIDStr
+	if rawID == "0" {
+		return ""
+	}
+	return rawID
 }
 
 // logAppendDuplicate 在事务内检查同一日志是否已经写入过该平台消息。
 // 调用方需持有 logAppendDedupeMu，保证“查重+插入”在进程内串行。
-func logAppendDuplicate(tx *gorm.DB, logID uint64, rawID string) (bool, error) {
+//
+// 只比较 is_dice=false 的条目：去重的目标是“玩家/其他机器人的群消息”
+// 在实时路径与历史补录路径之间去重。骰子自身发言（is_dice=true）不会进入
+// 补录路径，而且私聊暗骰回显到群日志时 raw_msg_id 来自私聊会话，与群消息
+// ID 不是同一命名空间；把它排除后，两边都不会被对方误判为重复。
+//
+// group_id 参与条件是给 MySQL 用的：MySQL 的 log_items 由
+// LogOneItemHookMySQL 建表，raw_msg_id 是 TEXT 列，不能直接建
+// (log_id, raw_msg_id) 普通索引；带上 group_id 可以复用已有的
+// idx_log_delete_by_id(group_id(20), raw_msg_id(20), id) 前缀索引。
+// SQLite/PostgreSQL 仍会走 idx_log_raw(log_id, raw_msg_id)。
+func logAppendDuplicate(tx *gorm.DB, logID uint64, groupID, rawID string) (bool, error) {
 	if rawID == "" {
 		return false, nil
 	}
 	var count int64
 	if err := tx.Model(&model.LogOneItem{}).
-		Where("log_id = ? AND raw_msg_id = ?", logID, rawID).
+		Where("log_id = ? AND group_id = ? AND raw_msg_id = ? AND is_dice IS NOT TRUE", logID, groupID, rawID).
 		Count(&count).Error; err != nil {
 		return false, err
 	}
@@ -774,10 +793,14 @@ func logAppendOnce(operator engine2.DatabaseOperator, groupID string, logName st
 		newLogItem.LogID = logID
 		// 同一平台消息只落一行：实时路径与补录路径可能几乎同时写入同一条
 		// raw_msg_id，log_items 没有唯一约束，必须在事务内查重。
-		if dup, dupErr := logAppendDuplicate(tx, logID, logItemRawMsgID(&newLogItem)); dupErr != nil {
-			return dupErr
-		} else if dup {
-			return nil
+		// 只对 is_dice=false 的玩家/机器人消息去重；骰子自身发言（含私聊暗骰
+		// 回显到群日志）不参与，避免跨会话 ID 命名空间互相顶掉。
+		if !logItem.IsDice {
+			if dup, dupErr := logAppendDuplicate(tx, logID, groupID, logItemRawMsgID(&newLogItem)); dupErr != nil {
+				return dupErr
+			} else if dup {
+				return nil
+			}
 		}
 		if createErr := tx.Create(&newLogItem).Error; createErr != nil {
 			return createErr
@@ -847,10 +870,12 @@ func logAppendByIDOnce(operator engine2.DatabaseOperator, logID uint64, groupID 
 		if logInfo.GroupID != groupID {
 			return fmt.Errorf("log append by id: log %d 不属于群 %s", logID, groupID)
 		}
-		if dup, dupErr := logAppendDuplicate(tx, logID, logItemRawMsgID(&newLogItem)); dupErr != nil {
-			return dupErr
-		} else if dup {
-			return nil
+		if !logItem.IsDice {
+			if dup, dupErr := logAppendDuplicate(tx, logID, groupID, logItemRawMsgID(&newLogItem)); dupErr != nil {
+				return dupErr
+			} else if dup {
+				return nil
+			}
 		}
 		if err := tx.Create(&newLogItem).Error; err != nil {
 			return err

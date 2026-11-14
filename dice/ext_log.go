@@ -44,6 +44,9 @@ func getGroupLogName(group *GroupInfo) string {
 // 只把 LogOn 置 false（不结束、不上传，LogCurID/LogCurName 保留），
 // 并记下“这次关闭是 .bot off 自动造成的”，供 .bot on 自动开启。
 // 返回是否真的关闭了（原本日志就是关的则返回 false）。
+//
+// 暂停时同时取消未完成的补全区间：掉线前的 pending 若留到 .bot on 之后，
+// pending floor 会把关闭期间的聊天重新补进日志，违背“关闭段不补录”。
 func (g *GroupInfo) suspendLogForBotOff() bool {
 	if g == nil {
 		return false
@@ -51,12 +54,16 @@ func (g *GroupInfo) suspendLogForBotOff() bool {
 	g.logWriteMu.Lock()
 	defer g.logWriteMu.Unlock()
 	g.logStateMu.Lock()
-	defer g.logStateMu.Unlock()
 	if !g.LogOn || g.LogCurName == "" {
+		g.logStateMu.Unlock()
 		return false
 	}
 	g.LogOn = false
 	g.LogPausedByBotOff = true
+	g.logStateMu.Unlock()
+	// 注意：必须在释放 logStateMu 之后再取 logSeqMu。
+	// MarshalJSON 的顺序是 logSeqMu -> logStateMu，反过来会形成死锁。
+	g.cancelLogGapFill()
 	return true
 }
 
@@ -72,18 +79,23 @@ func (g *GroupInfo) resumeLogPausedByBotOff() bool {
 	g.logWriteMu.Lock()
 	defer g.logWriteMu.Unlock()
 	g.logStateMu.Lock()
-	defer g.logStateMu.Unlock()
 	if !g.LogPausedByBotOff {
+		g.logStateMu.Unlock()
 		return false
 	}
 	g.LogPausedByBotOff = false
 	if g.LogOn || g.LogCurName == "" {
 		// 用户已经重新开启，或已经 end/new 换了一本日志：不要覆盖用户的操作。
+		g.logStateMu.Unlock()
 		return false
 	}
 	g.LogOn = true
 	// 只有本次真的自动开启了日志，才需要跳过下一次缺口计算。
 	g.LogResumeSkipGap = true
+	g.logStateMu.Unlock()
+	// 关闭段不补录：清掉暂停前遗留的 pending 区间并取消在途任务。
+	// 同样必须在释放 logStateMu 之后再取 logSeqMu，避免与 MarshalJSON 死锁。
+	g.cancelLogGapFill()
 	return true
 }
 
@@ -1246,6 +1258,9 @@ func RegisterBuiltinExtLog(self *Dice) {
 						CommandID:   ctx.CommandID,
 						CommandInfo: ctx.CommandInfo,
 						RawMsgID:    msg.RawID,
+						// IsDice=true 不参与 raw_msg_id 去重：私聊暗骰回显的
+						// 消息 ID 来自私聊会话，与群消息 ID 不是同一命名空间
+						// （Telegram 等平台按会话独立编号），同 ID 时两条都要留。
 					}
 
 					LogAppend(ctx, groupInfo.GroupID, logState.ID, logState.Name, &a)
@@ -1492,6 +1507,9 @@ const (
 	logGapFillPageSize     = 100              // 单次 get_group_msg_history 的拉取上限
 	logGapFillMaxMessages  = 2000             // 单次断层最多补录的消息数，避免离线数天时无限拉取
 	logGapFillFetchRetries = 3                // 瞬时网络错误的重试次数
+	// logGapFillRetryBackoff 是拉取整体失败后，pending 区间重新触发补全的
+	// 最小间隔。pending 会保留到补全完成，没有退避时每条新消息都会重试。
+	logGapFillRetryBackoff = 2 * time.Minute
 )
 
 // logGapReplayDeniedCommands 是静默重放时不允许执行的管理指令。
@@ -1813,6 +1831,9 @@ func (t logGapFillTask) run() {
 	msgs, err := t.fetchHistory(fetchCtx, fetcher)
 	if err != nil {
 		t.dice.Logger.Errorf("日志补全拉取历史消息失败: 群=%s 起始seq=%d err=%v", t.group.GroupID, t.fromSeq, err)
+		// 保留 pending 区间以便之后重试，但必须退避：否则每条新消息都会
+		// 重新触发一次最长 60s 的拉取，平台历史接口持续异常时会打爆连接。
+		t.group.deferLogGapRetry(logGapFillRetryBackoff)
 		return
 	}
 
