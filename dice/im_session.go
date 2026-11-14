@@ -128,6 +128,11 @@ type GroupInfo struct {
 	// 必须是值类型：GroupInfo 由数据库反序列化/运行时新建得到，指针版懒初始化在
 	// “两个消息协程同时首次访问”时会各建一把锁，等于没有锁（-race 可直接复现）。
 	logStateMu sync.RWMutex `json:"-" yaml:"-"`
+	// logWriteMu 串行化“补录写入”和“日志状态切换”。补录写入持读锁，
+	// .log on/new/off/end/halt、.bot off/on 持写锁。不能复用 logStateMu：
+	// LogAppend 自愈会调用 SetLogState（写 logStateMu），同一 goroutine 已持
+	// logStateMu.RLock 时会等不到写锁而死锁。
+	logWriteMu sync.RWMutex `json:"-" yaml:"-"`
 	// LogCurID 是当前日志在 log_items 表里的主键。
 	// 必须持久化：重启后 config.go 要用它把 seq 基线校准到数据库 MAX(seq)，
 	// 否则基线停留在 .log on 那一刻，重启后首条消息会把已记录的整段历史误判成断层。
@@ -203,12 +208,21 @@ type GroupInfo struct {
 	// 避免把 off/静默期间的消息合并进旧任务补进日志。
 	logEpoch atomic.Uint64 `json:"-" yaml:"-"`
 
+	// logSeqRegressCount 连续“明显回退”的 seq 计数，用于平台 seq 重置自愈。
+	// 由 logSeqMu 保护；连续 3 次且回退超过阈值才重建基线，避免误伤乱序消息。
+	logSeqRegressCount int
+
 	// LogSeqBaseline 是日志开启/恢复时的持久seq基线。
 	// logLastSeq 只在内存中，重启后会归零；若没有这个字段，启动时会回退到
 	// 数据库 MAX(seq)（停在 log off 之前），把暂停期间的聊天重新补进日志。
 	LogSeqBaseline int64 `json:"logSeqBaseline,omitempty" yaml:"logSeqBaseline,omitempty"`
 	// LogSeqBaselineMsgID 与 LogSeqBaseline 配套，用于断层通知的引用回复。
 	LogSeqBaselineMsgID string `json:"logSeqBaselineMsgID,omitempty" yaml:"logSeqBaselineMsgID,omitempty"`
+	// LogGapPendingFrom/To 持久化“尚未完成的补全区间”（seq 开区间）。
+	// 进程在补全完成前重启时，启动校准会把基线推到触发消息的 DB MAX；
+	// 用这段区间在下次收到消息时把内存基线压回起点，重新触发补全。
+	LogGapPendingFrom int64 `json:"logGapPendingFrom,omitempty" yaml:"logGapPendingFrom,omitempty"`
+	LogGapPendingTo   int64 `json:"logGapPendingTo,omitempty" yaml:"logGapPendingTo,omitempty"`
 }
 
 // noteLogSelfSent 记录一条骰子自身的群内发言。
@@ -249,6 +263,106 @@ func (g *GroupInfo) advanceLogSeq(seq int64, rawID interface{}) {
 	}
 }
 
+// setLogGapPendingRange 记录尚未完成的补全区间（seq 开区间）。
+// 多次 merge 时保留更早的起点和更晚的终点。
+func (g *GroupInfo) setLogGapPendingRange(fromSeq, toSeq int64) {
+	if g == nil || fromSeq <= 0 || toSeq <= fromSeq {
+		return
+	}
+	g.logSeqMu.Lock()
+	if g.LogGapPendingFrom == 0 || fromSeq < g.LogGapPendingFrom {
+		g.LogGapPendingFrom = fromSeq
+	}
+	if toSeq > g.LogGapPendingTo {
+		g.LogGapPendingTo = toSeq
+	}
+	g.logSeqMu.Unlock()
+}
+
+// clearLogGapPendingRange 清除尚未完成的补全区间；返回是否发生变化。
+func (g *GroupInfo) clearLogGapPendingRange() bool {
+	if g == nil {
+		return false
+	}
+	g.logSeqMu.Lock()
+	changed := g.LogGapPendingFrom != 0 || g.LogGapPendingTo != 0
+	g.LogGapPendingFrom, g.LogGapPendingTo = 0, 0
+	g.logSeqMu.Unlock()
+	return changed
+}
+
+// clearLogGapPendingIfIdle 在一个任务结束时清除持久化的补全区间。
+// 调用方是 worker 里的 run()，此时 logGapWorkerRunning 必为 true，不能拿它
+// 判断“空闲”；只要没有新合并进来的 pending 任务，就清除已完成/已取消的区间。
+// 先持 logGapQueueMu 再清区间，避免和 mergeLogGapTask 的新区间交错。
+func (g *GroupInfo) clearLogGapPendingIfIdle(d *Dice) {
+	if g == nil {
+		return
+	}
+	g.logGapQueueMu.Lock()
+	if g.logGapPending != nil {
+		g.logGapQueueMu.Unlock()
+		return
+	}
+	changed := g.clearLogGapPendingRange()
+	g.logGapQueueMu.Unlock()
+	if changed && d != nil {
+		g.MarkDirty(d)
+	}
+}
+
+// applyLogGapPendingFloor 在没有排队/在途任务时，把内存基线压回未完成区间的
+// 起点，让下一条消息重新计算这段缺口。只在重启后（worker/pending 均为空）
+// 生效，正常补全过程中不会把已经推进的基线反复拉回。
+func (g *GroupInfo) applyLogGapPendingFloor() {
+	if g == nil {
+		return
+	}
+	g.logGapQueueMu.Lock()
+	defer g.logGapQueueMu.Unlock()
+	if g.logGapWorkerRunning || g.logGapPending != nil {
+		return
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	if g.LogGapPendingFrom <= 0 || g.LogGapPendingTo <= g.LogGapPendingFrom {
+		return
+	}
+	if g.LogGapPendingFrom < g.logLastSeq {
+		g.logLastSeq = g.LogGapPendingFrom
+		g.logLastMsgID = nil
+		g.logSelfSent = 0
+	}
+}
+
+const (
+	// logSeqRegressThreshold 是判定“平台 seq 重置”的最小回退幅度。
+	// 取 1000 是为了避免把重连后的少量乱序/补发误判成重置。
+	logSeqRegressThreshold int64 = 1000
+	// logSeqRegressLimit 是连续回退多少条后触发重建基线。
+	logSeqRegressLimit = 3
+)
+
+// noteLogSeqRegression 记录一次 seq 回退，连续多次且幅度明显时返回 true。
+// 普通前进/小幅乱序都会清零计数，避免正常消息把基线误重置。
+func (g *GroupInfo) noteLogSeqRegression(msgSeq, lastSeq int64) bool {
+	if g == nil {
+		return false
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	if msgSeq <= 0 || lastSeq <= 0 || msgSeq >= lastSeq || lastSeq-msgSeq < logSeqRegressThreshold {
+		g.logSeqRegressCount = 0
+		return false
+	}
+	g.logSeqRegressCount++
+	if g.logSeqRegressCount < logSeqRegressLimit {
+		return false
+	}
+	g.logSeqRegressCount = 0
+	return true
+}
+
 // resetLogSeq 在日志开启/恢复时把seq基线重置到当前消息。
 // 日志关闭期间 updateLogSeq 不会被调用，基线停在关闭前；若不重置，
 // 恢复后第一条消息会被误判为断层，补全任务会把 log off 期间的消息也补进日志。
@@ -268,6 +382,8 @@ func (g *GroupInfo) resetLogSeq(seq int64, rawID interface{}) {
 	g.logSelfSent = 0
 	g.LogSeqBaseline = seq
 	g.LogSeqBaselineMsgID = msgID
+	g.LogGapPendingFrom, g.LogGapPendingTo = 0, 0
+	g.logSeqRegressCount = 0
 	g.logEpoch.Add(1)
 }
 
@@ -358,6 +474,8 @@ func (g *GroupInfo) resetLogSeqBaseline() {
 	g.logSeqMu.Lock()
 	g.LogSeqBaseline = 0
 	g.LogSeqBaselineMsgID = ""
+	g.LogGapPendingFrom, g.LogGapPendingTo = 0, 0
+	g.logSeqRegressCount = 0
 	g.logEpoch.Add(1)
 	g.logSeqMu.Unlock()
 }
@@ -640,6 +758,27 @@ func (g *GroupInfo) GetLogState() GroupLogState {
 	}
 }
 
+// withLogStateRead 在持有“补录写入/日志切换”读锁时执行 fn；只有日志仍是
+// 同一本且开启才执行。它持的是 logWriteMu，不是 logStateMu：fn 里的
+// LogAppend 可能走 healLogAppendByID，而 heal 会调用 SetLogState
+// （logStateMu.Lock）。若这里持 logStateMu.RLock，同一 goroutine 会死锁。
+// fn 内不得调用需要 logWriteMu 写锁的方法（.log on/new/off/end/halt、.bot off/on）。
+func (g *GroupInfo) withLogStateRead(logID uint64, logName string, fn func()) bool {
+	if g == nil || fn == nil {
+		return false
+	}
+	g.logWriteMu.RLock()
+	defer g.logWriteMu.RUnlock()
+	g.logStateMu.RLock()
+	ok := g.LogOn && g.LogCurID == logID && g.LogCurName == logName
+	g.logStateMu.RUnlock()
+	if !ok {
+		return false
+	}
+	fn()
+	return true
+}
+
 func (g *GroupInfo) SetLogState(logID uint64, logName string, logOn bool) {
 	g.logStateMu.Lock()
 	g.LogCurID = logID
@@ -649,12 +788,16 @@ func (g *GroupInfo) SetLogState(logID uint64, logName string, logOn bool) {
 }
 
 func (g *GroupInfo) SetLogOn(logOn bool) {
+	g.logWriteMu.Lock()
+	defer g.logWriteMu.Unlock()
 	g.logStateMu.Lock()
 	g.LogOn = logOn
 	g.logStateMu.Unlock()
 }
 
 func (g *GroupInfo) ClearLogState() {
+	g.logWriteMu.Lock()
+	defer g.logWriteMu.Unlock()
 	g.logStateMu.Lock()
 	g.LogCurID = 0
 	g.LogCurName = ""

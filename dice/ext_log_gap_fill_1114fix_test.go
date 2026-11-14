@@ -30,8 +30,8 @@ func TestLogOnWithoutSeqDefersBaselineReset_1114fix(t *testing.T) {
 	if got := g.logLastSeq; got != 1050 {
 		t.Fatalf("baseline after Seq=0 .log on = %d, want 1050", got)
 	}
-	if g.LogSeqBaseline != 1000 {
-		t.Fatalf("persisted baseline = %d, want 1000 (unchanged)", g.LogSeqBaseline)
+	if g.LogSeqBaseline != 0 {
+		t.Fatalf("persisted baseline = %d, want 0 (old baseline must be cleared)", g.LogSeqBaseline)
 	}
 	if !g.LogResumeSkipGap {
 		t.Fatal("Seq=0 .log on must set LogResumeSkipGap")
