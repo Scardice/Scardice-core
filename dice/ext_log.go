@@ -165,6 +165,29 @@ func (g *GroupInfo) clearLogResumeSkipGap() {
 	g.logStateMu.Unlock()
 }
 
+// resetLogSeqForNewSegment 在 .log on / .log new 成功时重建日志 seq 基线。
+//
+// 有 seq 时把基线锚定到当前指令消息（原行为，不变）；没有 seq（部分 OneBot
+// 实现或合成消息）时无法锚定本条指令的位置，退化为“下一条带 seq 的消息只
+// 重建基线”，避免把 off 段/旧日志段当成缺口补录。该退化只影响没有 seq 的
+// 边界情况，正常群消息路径仍走 resetLogSeq。
+//
+// 只修改基线/恢复标记/epoch，不修改日志开关；调用方负责 MarkDirty。
+func (g *GroupInfo) resetLogSeqForNewSegment(seq int64, rawID interface{}) {
+	if g == nil {
+		return
+	}
+	g.clearLogResumeSkipGap()
+	if seq > 0 {
+		g.resetLogSeq(seq, rawID)
+		return
+	}
+	// 没有 seq 时，下一条带 seq 的消息消费该标记后只执行 updateLogSeq，
+	// 不再计算缺口。epoch++ 让旧基线下的在途/排队补全任务失效。
+	g.setLogResumeSkipGap()
+	g.logEpoch.Add(1)
+}
+
 // repairPersistedLogState 校验持久化的 LogCurID 是否仍指向 LogCurName。
 //
 // LogCurID 持久化后不会再像上游那样“重启即为 0、按名字 LogGetOrCreate 自愈”。
@@ -530,8 +553,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 							return CmdExecuteResult{Matched: true, Solved: true}
 						}
 						group.SetLogState(logID, name, true)
-						group.resetLogSeq(msg.Seq, msg.RawID)
-						group.clearLogResumeSkipGap()
+						group.resetLogSeqForNewSegment(msg.Seq, msg.RawID)
 						group.clearLogPausedByBotOff()
 						group.MarkDirty(ctx.Dice)
 						ctx.Dice.Logger.Infof("日志状态切换: 群=%s 开启日志 name=%s id=%d", group.GroupID, name, logID)
@@ -724,8 +746,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 				group.SetLogState(logID, name, true)
-				group.resetLogSeq(msg.Seq, msg.RawID)
-				group.clearLogResumeSkipGap()
+				group.resetLogSeqForNewSegment(msg.Seq, msg.RawID)
 				group.clearLogPausedByBotOff()
 				group.MarkDirty(ctx.Dice)
 				ctx.Dice.Logger.Infof("日志状态切换: 群=%s 新建并开启日志 name=%s id=%d", group.GroupID, name, logID)
