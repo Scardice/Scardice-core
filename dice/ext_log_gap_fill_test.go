@@ -184,10 +184,13 @@ func TestLogGapFilterAlreadyLogged(t *testing.T) {
 		fromSeq: 10,
 		toSeq:   30,
 	}
-	filtered := task.filterAlreadyLogged([]*Message{
+	filtered, ok := task.filterAlreadyLogged([]*Message{
 		{Seq: 20, RawID: "m-20", Sender: SenderBase{UserID: "QQ:100"}},
 		{Seq: 21, RawID: "m-21", Sender: SenderBase{UserID: "QQ:100"}},
 	})
+	if !ok {
+		t.Fatal("filterAlreadyLogged reported a query failure for an available database")
+	}
 	if len(filtered) != 1 || filtered[0].RawID != "m-21" {
 		t.Fatalf("filtered = %#v, want only m-21", filtered)
 	}

@@ -124,8 +124,9 @@ func TestLogGapCalibrationRecoveryFillsCorrectGap(t *testing.T) {
 	}
 }
 
-// TestFilterAlreadyLoggedFailsClosed 锁定去重查询失败时跳过补录：
-// log_items 没有唯一约束，fail-open 会在 READ 库故障时写出重复日志行。
+// TestFilterAlreadyLoggedFailsClosed 锁定去重查询失败与“无数据库”的区别：
+// log_items 没有唯一约束，查询失败必须 fail-closed 并让调用方保留 pending；
+// 无数据库是永久状态，跳过本次补录即可，不能让 pending 永久卡在退避里。
 func TestFilterAlreadyLoggedFailsClosed(t *testing.T) {
 	op, err := newMockDatabaseOperator(filepath.Join(t.TempDir(), "dedupe-fail.db"))
 	if err != nil {
@@ -142,13 +143,13 @@ func TestFilterAlreadyLoggedFailsClosed(t *testing.T) {
 		toSeq:   10,
 	}
 	msgs := []*Message{{Seq: 5, RawID: "m-5"}}
-	if got := task.filterAlreadyLogged(msgs); got != nil {
-		t.Fatalf("dedupe query failure returned %d messages, want nil (fail-closed)", len(got))
+	if got, ok := task.filterAlreadyLogged(msgs); got != nil || ok {
+		t.Fatalf("dedupe query failure = %d messages, ok=%v; want nil,false (fail-closed)", len(got), ok)
 	}
 
 	d.DBOperator = nil
-	if got := task.filterAlreadyLogged(msgs); got != nil {
-		t.Fatalf("nil DB returned %d messages, want nil (fail-closed)", len(got))
+	if got, ok := task.filterAlreadyLogged(msgs); got != nil || !ok {
+		t.Fatalf("nil DB = %d messages, ok=%v; want nil,true (permanent, skip)", len(got), ok)
 	}
 }
 
