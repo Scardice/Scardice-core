@@ -163,7 +163,8 @@ func TestLogAppendNoDedupForPrivateListen_1115(t *testing.T) {
 		t.Fatalf("rows after duplicate group append = %d, want 2", count)
 	}
 
-	// LogAppendByID 路径也必须跳过骰子发言的去重。
+	// 骰子自身发言不参与库级去重：同一 raw_msg_id 的重复回调会被保留。
+	// 这是为了不丢“不同会话同号”的骰子发言而接受的取舍（见下方用例）。
 	privateEcho2 := &model.LogOneItem{
 		Nickname: "骰子", Time: 3, Message: "private echo 2", IsDice: true,
 		RawMsgID: "shared-id",
@@ -176,7 +177,28 @@ func TestLogAppendNoDedupForPrivateListen_1115(t *testing.T) {
 		t.Fatal(err)
 	}
 	if count != 3 {
-		t.Fatalf("rows after LogAppendByID private listen = %d, want 3", count)
+		t.Fatalf("rows after repeated private listen = %d, want 3 (dice rows are not deduped)", count)
+	}
+
+	// 骰子 vs 骰子：群内骰子回复与私聊回显的 raw_msg_id 来自不同会话命名空间，
+	// 同号时两条都必须保留，不能被 is_dice 分桶去重顶掉。
+	diceGroup := &model.LogOneItem{
+		Nickname: "骰子", Time: 6, Message: "group dice reply", IsDice: true,
+		RawMsgID: "shared-dice",
+	}
+	dicePrivate := &model.LogOneItem{
+		Nickname: "骰子", Time: 7, Message: "private echo", IsDice: true,
+		RawMsgID: "shared-dice",
+	}
+	if !service.LogAppend(op, groupID, logName, diceGroup) || !service.LogAppend(op, groupID, logName, dicePrivate) {
+		t.Fatal("dice cross-namespace appends failed")
+	}
+	if err := op.db.Model(&model.LogOneItem{}).
+		Where("log_id = ? AND raw_msg_id = ?", logID, "shared-dice").Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("dice cross-namespace rows = %d, want 2 (must not dedupe across chats)", count)
 	}
 
 	// 反向顺序：私聊回显先写、群消息后写，也不能被对方的 ID 顶掉。
@@ -234,5 +256,49 @@ func TestLogGapRetryBackoff_1115(t *testing.T) {
 	g.clearLogGapPendingIfIdle(d)
 	if g.logGapRetryAt.Load() != 0 {
 		t.Fatalf("retry backoff after pending cleared = %d, want 0", g.logGapRetryAt.Load())
+	}
+}
+
+// TestLogGapFetchRespectsRetryBackoff_1115fix 锁定退避覆盖实际拉取：
+// fetch 失败后的退避期内，已合并任务/新产生的断层也不能立刻再拉一次；
+// pending 区间保留，退避结束后下一次 run() 才真正拉取。
+func TestLogGapFetchRespectsRetryBackoff_1115fix(t *testing.T) {
+	op, d := newFix5LogTestDB(t)
+	const groupID = "QQ-Group:11005"
+	const logName = "run-a"
+	logID, err := service.LogGetOrCreate(op, groupID, logName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := &GroupInfo{GroupID: groupID}
+	g.SetLogState(logID, logName, true)
+	g.markLogSeqCalibrated()
+
+	fetcher := &recordingHistoryFetcher{empty: true}
+	ep := newGapFillTestEndpoint(fetcher)
+	task := logGapFillTask{
+		dice: d, endpoint: ep, group: g, logID: logID, logName: logName,
+		epoch: g.logEpoch.Load(), fromSeq: 1000, toSeq: 1100, gap: 9,
+	}
+	g.LogGapPendingFrom, g.LogGapPendingTo = 1000, 1100
+	g.deferLogGapRetry(time.Minute)
+
+	task.run()
+	if fetcher.calls != 0 {
+		t.Fatalf("fetch calls during retry backoff = %d, want 0", fetcher.calls)
+	}
+	if g.LogGapPendingFrom != 1000 || g.LogGapPendingTo != 1100 {
+		t.Fatalf("pending range during backoff = %d..%d, want 1000..1100",
+			g.LogGapPendingFrom, g.LogGapPendingTo)
+	}
+
+	g.logGapRetryAt.Store(0)
+	task.run()
+	if fetcher.calls == 0 {
+		t.Fatal("fetch was not attempted after retry backoff expired")
+	}
+	if g.LogGapPendingFrom != 0 || g.LogGapPendingTo != 0 {
+		t.Fatalf("pending range after backoff fetch = %d..%d, want 0..0",
+			g.LogGapPendingFrom, g.LogGapPendingTo)
 	}
 }

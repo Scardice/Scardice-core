@@ -721,9 +721,12 @@ func logItemRawMsgID(item *model.LogOneItem) string {
 // 调用方需持有 logAppendDedupeMu，保证“查重+插入”在进程内串行。
 //
 // 只比较 is_dice=false 的条目：去重的目标是“玩家/其他机器人的群消息”
-// 在实时路径与历史补录路径之间去重。骰子自身发言（is_dice=true）不会进入
-// 补录路径，而且私聊暗骰回显到群日志时 raw_msg_id 来自私聊会话，与群消息
-// ID 不是同一命名空间；把它排除后，两边都不会被对方误判为重复。
+// 在实时路径与历史补录路径之间去重。骰子自身发言（is_dice=true）不参与：
+//   - 它不会进入补录路径（logItem/replay 写入的都是非骰子消息）；
+//   - 私聊暗骰回显、群内骰子回复、不同私聊会话的回显来自不同的消息 ID
+//     命名空间（Telegram 等平台按会话独立编号），同号时会互相顶掉。
+//
+// 代价是同一骰子回调被重复触发时会多落一行；这里优先保证不丢日志。
 //
 // group_id 参与条件是给 MySQL 用的：MySQL 的 log_items 由
 // LogOneItemHookMySQL 建表，raw_msg_id 是 TEXT 列，不能直接建
@@ -793,8 +796,8 @@ func logAppendOnce(operator engine2.DatabaseOperator, groupID string, logName st
 		newLogItem.LogID = logID
 		// 同一平台消息只落一行：实时路径与补录路径可能几乎同时写入同一条
 		// raw_msg_id，log_items 没有唯一约束，必须在事务内查重。
-		// 只对 is_dice=false 的玩家/机器人消息去重；骰子自身发言（含私聊暗骰
-		// 回显到群日志）不参与，避免跨会话 ID 命名空间互相顶掉。
+		// 只对 is_dice=false 的玩家/机器人消息去重；骰子自身发言（含私聊
+		// 暗骰回显）不参与，避免跨会话 ID 命名空间互相顶掉。
 		if !logItem.IsDice {
 			if dup, dupErr := logAppendDuplicate(tx, logID, groupID, logItemRawMsgID(&newLogItem)); dupErr != nil {
 				return dupErr

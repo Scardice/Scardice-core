@@ -1822,6 +1822,14 @@ func (t logGapFillTask) run() {
 		return
 	}
 
+	// 拉取整体失败后的退避期内不再发起历史拉取。pending 区间保留，退避
+	// 结束后由下一条消息的 pending floor / 新任务重新触发；这样退避对
+	// “已合并任务”和“新产生的断层”同样生效，而不只是挡住 floor。
+	if retryAt := t.group.logGapRetryAt.Load(); retryAt > time.Now().Unix() {
+		t.dice.Logger.Debugf("日志补全退避中: 群=%s 下次重试=%d", t.group.GroupID, retryAt)
+		return
+	}
+
 	t.dice.Logger.Infof("检测到日志seq断层: 群=%s 上条seq=%d 本条seq=%d 缺失=%d",
 		t.group.GroupID, t.fromSeq, t.toSeq, t.gap)
 

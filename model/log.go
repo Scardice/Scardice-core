@@ -142,10 +142,11 @@ func (*LogInfoHookMySQL) TableName() string {
 // 注意：不要给 RawMsgIDStr 加 idx_log_raw。MySQL 上 raw_msg_id 是 TEXT，
 // 直接建 (log_id, raw_msg_id) 普通索引会失败；去重查询带 group_id，
 // 复用已有的 idx_log_delete_by_id(group_id(20), raw_msg_id(20), id) 前缀索引。
+// 下面两个 length:20 是显式声明前缀长度，保证新库/迁移建出的索引与查询匹配。
 type LogOneItemHookMySQL struct {
 	ID             uint64      `gorm:"primaryKey;autoIncrement;column:id;index:idx_log_delete_by_id,priority:3" json:"id"`
 	LogID          uint64      `gorm:"column:log_id"                      json:"-"`
-	GroupID        string      `gorm:"column:group_id;index:idx_log_delete_by_id,priority:1"`
+	GroupID        string      `gorm:"column:group_id;index:idx_log_delete_by_id,priority:1,length:20"`
 	Nickname       string      `gorm:"column:nickname"                    json:"nickname"`
 	IMUserID       string      `gorm:"column:im_userid"                   json:"IMUserId"`
 	Time           int64       `gorm:"column:time"                        json:"time"`
@@ -155,7 +156,7 @@ type LogOneItemHookMySQL struct {
 	CommandInfo    interface{} `gorm:"-"                                  json:"commandInfo"`
 	CommandInfoStr string      `gorm:"column:command_info"                json:"-"`
 	RawMsgID       interface{} `gorm:"-"                                  json:"rawMsgId"`
-	RawMsgIDStr    string      `gorm:"column:raw_msg_id;index:idx_log_delete_by_id,priority:2" json:"-"`
+	RawMsgIDStr    string      `gorm:"column:raw_msg_id;index:idx_log_delete_by_id,priority:2,length:20" json:"-"`
 	UniformID      string      `gorm:"column:user_uniform_id"             json:"uniformId"`
 	Channel        string      `gorm:"-"                                  json:"channel"`
 	Removed        *int        `gorm:"column:removed"                     json:"-"`
