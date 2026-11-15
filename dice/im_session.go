@@ -97,6 +97,18 @@ func extNamePlaceholder(name string) *ExtInfo {
 	return p
 }
 
+// logOffGapAuth 是“日志关闭前已经创建的补全任务”的运行时授权。
+//
+// 只用于 .log off / .bot off 的精确边界：任务窗口完全位于 off 指令之前
+// (toSeq <= offSeq)，因此即使在 LogOn=false 之后也允许把这段 off 前窗口
+// 补进日志。不持久化：进程重启后授权失效，由现有 pending/生命周期语义处理。
+type logOffGapAuth struct {
+	logID   uint64
+	logName string
+	epoch   uint64
+	offSeq  int64 // .log off / .bot off 指令 seq，补全窗口上界（不含）
+}
+
 type GroupInfo struct {
 	// Active 不直接暴露给 goja（jsbind:"-"）；JS 侧由 dice_jsvm_group_active.go 中的
 	// Object.prototype 访问器转发到 IsActiveRaw/SetActiveRaw，避免脚本绕过 activeMu。
@@ -217,6 +229,11 @@ type GroupInfo struct {
 	// 避免把 off/静默期间的消息合并进旧任务补进日志。
 	logEpoch atomic.Uint64 `json:"-" yaml:"-"`
 
+	// logOffGapAuth 在 .log off/.bot off 真正关闭日志时，授权“off 前窗口”
+	// 的补全任务继续完成；只在任务窗口完全位于 offSeq 之前时生效。
+	// 运行时字段，不参与序列化。
+	logOffGapAuth atomic.Pointer[logOffGapAuth] `json:"-" yaml:"-"`
+
 	// logSeqRegressCount 连续“明显回退”的 seq 计数，用于平台 seq 重置自愈。
 	// 由 logSeqMu 保护；连续 3 次且回退超过阈值才重建基线，避免误伤乱序消息。
 	logSeqRegressCount int
@@ -288,6 +305,54 @@ func (g *GroupInfo) setLogGapPendingRange(fromSeq, toSeq int64) {
 	g.logSeqMu.Unlock()
 }
 
+// armLogOffGapAuth 在 .log off/.bot off 关闭日志前，为“窗口完全位于指令
+// seq 之前”的在途补全任务建立运行时授权。要求任务确实存在，避免给没有任务的
+// 陈旧 pending 授权。
+//
+// 不要求 pending.To == offSeq：off 指令本身可能没有缺口（gap=0），但更早
+// 触发的任务仍在拉取/写入，它的窗口同样属于 off 前、应被补完。只要
+// pending.To <= offSeq，任务窗口就不可能包含 off 指令或之后的消息。
+//
+// 锁序：logGapQueueMu -> logSeqMu，与 mergeLogGapTask/clearLogGapPendingIfIdle
+// 保持一致；不要反过来。
+func (g *GroupInfo) armLogOffGapAuth(logID uint64, logName string, epoch uint64, offSeq int64) bool {
+	if g == nil || logID == 0 || logName == "" || offSeq <= 0 {
+		return false
+	}
+	g.logGapQueueMu.Lock()
+	active := g.logGapWorkerRunning || g.logGapPending != nil
+	g.logSeqMu.Lock()
+	fromSeq, toSeq := g.LogGapPendingFrom, g.LogGapPendingTo
+	g.logSeqMu.Unlock()
+	g.logGapQueueMu.Unlock()
+	if !active || fromSeq <= 0 || toSeq <= fromSeq || toSeq > offSeq {
+		return false
+	}
+	g.logOffGapAuth.Store(&logOffGapAuth{
+		logID:   logID,
+		logName: logName,
+		epoch:   epoch,
+		offSeq:  offSeq,
+	})
+	return true
+}
+
+// clearLogOffGapAuth 清除 off 前窗口的补全授权。
+func (g *GroupInfo) clearLogOffGapAuth() {
+	if g == nil {
+		return
+	}
+	g.logOffGapAuth.Store(nil)
+}
+
+// logOffGapAuthSnapshot 读取当前 off 授权；nil 表示没有授权。
+func (g *GroupInfo) logOffGapAuthSnapshot() *logOffGapAuth {
+	if g == nil {
+		return nil
+	}
+	return g.logOffGapAuth.Load()
+}
+
 // clearLogGapPendingRange 清除尚未完成的补全区间；返回是否发生变化。
 func (g *GroupInfo) clearLogGapPendingRange() bool {
 	if g == nil {
@@ -298,6 +363,9 @@ func (g *GroupInfo) clearLogGapPendingRange() bool {
 	g.LogGapPendingFrom, g.LogGapPendingTo = 0, 0
 	g.logGapRetryAt.Store(0)
 	g.logSeqMu.Unlock()
+	if changed {
+		g.clearLogOffGapAuth()
+	}
 	return changed
 }
 
@@ -315,6 +383,8 @@ func (g *GroupInfo) clearLogGapPendingIfIdle(d *Dice) {
 		return
 	}
 	changed := g.clearLogGapPendingRange()
+	// 没有新 pending 了，off 前窗口授权也不再需要。
+	g.clearLogOffGapAuth()
 	g.logGapQueueMu.Unlock()
 	if changed && d != nil {
 		g.MarkDirty(d)
@@ -331,6 +401,7 @@ func (g *GroupInfo) cancelLogGapFill() {
 		return
 	}
 	g.clearLogGapPendingRange()
+	g.clearLogOffGapAuth()
 	g.logEpoch.Add(1)
 }
 
@@ -436,7 +507,6 @@ func (g *GroupInfo) resetLogSeq(seq int64, rawID interface{}) {
 		msgID = fmt.Sprintf("%v", rawID)
 	}
 	g.logSeqMu.Lock()
-	defer g.logSeqMu.Unlock()
 	g.logLastSeq = seq
 	g.logLastMsgID = rawID
 	g.logSelfSent = 0
@@ -446,6 +516,8 @@ func (g *GroupInfo) resetLogSeq(seq int64, rawID interface{}) {
 	g.logSeqRegressCount = 0
 	g.logGapRetryAt.Store(0)
 	g.logEpoch.Add(1)
+	g.logSeqMu.Unlock()
+	g.clearLogOffGapAuth()
 }
 
 // initLogSeqFromPersisted 在群数据加载完成后恢复持久基线。
@@ -566,6 +638,7 @@ func (g *GroupInfo) resetLogSeqBaseline() {
 	g.logGapRetryAt.Store(0)
 	g.logEpoch.Add(1)
 	g.logSeqMu.Unlock()
+	g.clearLogOffGapAuth()
 }
 
 // beginLogGapFillWindow 进入静默重放：窗口内的消息在日志里标记为补录。
@@ -867,6 +940,30 @@ func (g *GroupInfo) withLogStateRead(logID uint64, logName string, fn func()) bo
 	return true
 }
 
+// withLogGapFillWrite 是 withLogStateRead 的补录专用变体：
+// 日志开启时与旧函数一致；日志已由 .log off/.bot off 关闭时，只有任务持有
+// 有效的 off 前窗口授权才允许写入。仍然持 logWriteMu.RLock，保证写完之前
+// .log on/new/off/end/halt、.bot off/on 不能完成切换。
+func (g *GroupInfo) withLogGapFillWrite(t logGapFillTask, fn func()) bool {
+	if g == nil || fn == nil {
+		return false
+	}
+	g.logWriteMu.RLock()
+	defer g.logWriteMu.RUnlock()
+	g.logStateMu.RLock()
+	sameLog := g.LogCurID == t.logID && g.LogCurName == t.logName
+	on := g.LogOn
+	g.logStateMu.RUnlock()
+	if !sameLog {
+		return false
+	}
+	if !on && !t.logOffGapFillAllowed() {
+		return false
+	}
+	fn()
+	return true
+}
+
 func (g *GroupInfo) SetLogState(logID uint64, logName string, logOn bool) {
 	g.logStateMu.Lock()
 	g.LogCurID = logID
@@ -891,6 +988,7 @@ func (g *GroupInfo) ClearLogState() {
 	g.LogCurName = ""
 	g.LogOn = false
 	g.logStateMu.Unlock()
+	g.clearLogOffGapAuth()
 }
 
 func (group *GroupInfo) IsActive(ctx *MsgContext) bool {
@@ -1364,6 +1462,9 @@ type MsgContext struct {
 	// SuppressLogSizeNotice 供日志断层补录使用：批量写入历史消息时既不往群里发
 	// “记录条数提醒”，也跳过逐条的条数统计查询（2000 条补录会因此少 2000 次查库）。
 	SuppressLogSizeNotice bool
+	// SuppressLogAppendFailureNotice 供 off 前窗口补录使用：日志关闭后补写
+	// 历史行时，写入失败只保留 pending/退避，不再往群里发“日志写入失败”提示。
+	SuppressLogAppendFailureNotice bool
 
 	EndPoint        *EndPointInfo `jsbind:"endPoint"` // 对应的Endpoint
 	Session         *IMSession    // 对应的IMSession
