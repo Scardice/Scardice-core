@@ -302,3 +302,56 @@ func TestLogGapFetchRespectsRetryBackoff_1115fix(t *testing.T) {
 			g.LogGapPendingFrom, g.LogGapPendingTo)
 	}
 }
+
+// TestLogGapDedupeQueryFailureKeepsPending_1115fix2 锁定去重查询失败的收尾：
+// 历史拉取成功、但查询已记录消息失败时，run() 不能走
+// “missing == 0 -> clearLogGapPendingIfIdle” 分支，否则一次 READ 库抖动
+// 就会让 pending 区间被永久清掉。正确行为是保留 pending 并设置退避。
+func TestLogGapDedupeQueryFailureKeepsPending_1115fix2(t *testing.T) {
+	op, d := newFix5LogTestDB(t)
+	const groupID = "QQ-Group:11006"
+	const logName = "run-a"
+	logID, err := service.LogGetOrCreate(op, groupID, logName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 模拟 READ 库故障：去重查询会返回 “no such table”，而不是空结果。
+	if err := op.db.Exec("DROP TABLE log_items").Error; err != nil {
+		t.Fatal(err)
+	}
+
+	g := &GroupInfo{GroupID: groupID}
+	g.SetLogState(logID, logName, true)
+	g.markLogSeqCalibrated()
+	g.LogGapPendingFrom, g.LogGapPendingTo = 1000, 1100
+
+	fetcher := &recordingHistoryFetcher{empty: true}
+	task := logGapFillTask{
+		dice: d, endpoint: newGapFillTestEndpoint(fetcher), group: g,
+		logID: logID, logName: logName, epoch: g.logEpoch.Load(),
+		fromSeq: 1000, toSeq: 1100, gap: 9,
+	}
+	task.run()
+
+	if fetcher.calls != 1 {
+		t.Fatalf("fetch calls = %d, want 1", fetcher.calls)
+	}
+	if g.LogGapPendingFrom != 1000 || g.LogGapPendingTo != 1100 {
+		t.Fatalf("pending range after dedupe failure = %d..%d, want 1000..1100",
+			g.LogGapPendingFrom, g.LogGapPendingTo)
+	}
+	retryAt := g.logGapRetryAt.Load()
+	if retryAt < time.Now().Add(time.Minute).Unix() {
+		t.Fatalf("retry backoff after dedupe failure = %d, want about 2 minutes ahead", retryAt)
+	}
+
+	// 退避期内再次 run() 不应拉取，pending 仍保留。
+	task.run()
+	if fetcher.calls != 1 {
+		t.Fatalf("fetch calls during dedupe-failure backoff = %d, want 1", fetcher.calls)
+	}
+	if g.LogGapPendingFrom != 1000 || g.LogGapPendingTo != 1100 {
+		t.Fatalf("pending range during dedupe-failure backoff = %d..%d, want 1000..1100",
+			g.LogGapPendingFrom, g.LogGapPendingTo)
+	}
+}

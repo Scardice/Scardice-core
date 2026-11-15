@@ -1846,7 +1846,13 @@ func (t logGapFillTask) run() {
 	}
 
 	missing := t.filterMissing(msgs)
-	missing = t.filterAlreadyLogged(missing)
+	missing, dedupeOK := t.filterAlreadyLogged(missing)
+	if !dedupeOK {
+		// 去重查询失败不能当成“没有缺失消息”清掉 pending：否则一次 READ
+		// 库抖动就会让这段缺口永久丢失。保留 pending，按 2 分钟退避重试。
+		t.group.deferLogGapRetry(logGapFillRetryBackoff)
+		return
+	}
 	if len(missing) == 0 {
 		t.dice.Logger.Infof("日志补全无需处理: 群=%s 缺失区间内没有需要补录的他人发言", t.group.GroupID)
 		t.group.clearLogGapPendingIfIdle(t.dice)
@@ -2031,13 +2037,16 @@ func (t logGapFillTask) isBotSender(m *Message) bool {
 // filterAlreadyLogged 跳过已经写入同一日志的消息。
 // 平台重连补发、或补全任务与正常事件并发时，同一条消息可能既走事件路径又被历史拉取到；
 // log_items 对 raw_msg_id 没有唯一约束，必须在补录前查一次。
-func (t logGapFillTask) filterAlreadyLogged(msgs []*Message) []*Message {
+// 返回值 ok=false 表示查询失败：调用方必须保留 pending 并退避重试，
+// 不能把“查不到”当成“没有缺失消息”而清掉区间。
+func (t logGapFillTask) filterAlreadyLogged(msgs []*Message) ([]*Message, bool) {
 	if t.dice == nil || t.dice.DBOperator == nil {
 		// 无数据库时无法判断哪些消息已经落库；宁可跳过本次补录，也不能重复写。
+		// 无 DB 是永久状态，返回 ok=true 让调用方按“无法补录”收尾，避免无限退避。
 		if t.dice != nil && t.dice.Logger != nil {
 			t.dice.Logger.Warnf("日志补全跳过: 无法查询已记录消息（数据库不可用）: 群=%s", t.group.GroupID)
 		}
-		return nil
+		return nil, true
 	}
 	// 与 fetchHistoryOnce 使用同一窗口：超大断层只补最近 2000 条时，
 	// 去重集合也只需覆盖这一段，避免为几十万 seq 建 map。
@@ -2045,12 +2054,13 @@ func (t logGapFillTask) filterAlreadyLogged(msgs []*Message) []*Message {
 	existing, err := service.LogRawMsgIDsInSeqRange(t.dice.DBOperator, t.logID, windowFrom, t.toSeq)
 	if err != nil {
 		// fail-closed：去重查询失败时不能“继续补录”，否则 log_items 没有唯一约束，
-		// READ 库故障（读写分离）会直接产生重复日志行。
-		t.dice.Logger.Warnf("日志补全跳过: 查询已记录消息失败: 群=%s err=%v", t.group.GroupID, err)
-		return nil
+		// READ 库故障（读写分离）会直接产生重复日志行。ok=false 让 run() 保留
+		// pending 并设置退避，而不是把本次当成“没有缺失消息”清掉区间。
+		t.dice.Logger.Warnf("日志补全暂缓: 查询已记录消息失败: 群=%s err=%v", t.group.GroupID, err)
+		return nil, false
 	}
 	if len(existing) == 0 {
-		return msgs
+		return msgs, true
 	}
 	filtered := msgs[:0]
 	for _, m := range msgs {
@@ -2062,7 +2072,7 @@ func (t logGapFillTask) filterAlreadyLogged(msgs []*Message) []*Message {
 		}
 		filtered = append(filtered, m)
 	}
-	return filtered
+	return filtered, true
 }
 
 // lookupPlayerName 读取玩家在本群的标注名（角色名/名片）。
