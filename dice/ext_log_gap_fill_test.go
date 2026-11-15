@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -210,7 +211,9 @@ func TestGocqMessageCarriesSequence(t *testing.T) {
 	}
 }
 
-func TestLogLinePageFiltersGapFill(t *testing.T) {
+// TestLogLinePageNoGapFillFilter_1115fix4 锁定 1115.fix4 的移除项：
+// 日志行分页不再按 is_gap_fill 过滤，也不会把 isGapFill 暴露到 JSON。
+func TestLogLinePageNoGapFillFilter_1115fix4(t *testing.T) {
 	db, err := newMockDatabaseOperator(filepath.Join(t.TempDir(), "log-filter.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -233,6 +236,7 @@ func TestLogLinePageFiltersGapFill(t *testing.T) {
 	items := []*model.LogOneItem{
 		{Nickname: "正常", IMUserID: "100", UniformID: "QQ:100", Message: "实时", RawMsgID: "m-1", Seq: ptrInt64(1)},
 		{Nickname: "补录", IMUserID: "100", UniformID: "QQ:100", Message: "补录", RawMsgID: "m-2", Seq: ptrInt64(2), IsGapFill: true},
+		{Nickname: "其他", IMUserID: "200", UniformID: "QQ:200", Message: "其他玩家", RawMsgID: "m-3", Seq: ptrInt64(3)},
 	}
 	for _, item := range items {
 		if !LogAppend(mctx, groupID, logID, logName, item) {
@@ -240,30 +244,38 @@ func TestLogLinePageFiltersGapFill(t *testing.T) {
 		}
 	}
 
-	yes := true
 	lines, err := service.LogGetLinePage(db, &service.QueryLogLinePage{
-		PageNum: 1, PageSize: 10, GroupID: groupID, LogName: logName, GapFill: &yes,
+		PageNum: 1, PageSize: 10, GroupID: groupID, LogName: logName,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(lines) != 1 || !lines[0].IsGapFill || lines[0].Message != "补录" {
-		t.Fatalf("gapFill filter returned %#v", lines)
+	if len(lines) != 3 {
+		t.Fatalf("unfiltered log page returned %d lines, want 3", len(lines))
+	}
+	data, err := json.Marshal(lines[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("isGapFill")) {
+		t.Fatalf("isGapFill must not be exposed in JSON: %s", data)
 	}
 
-	no := false
+	// 玩家筛选（playerId）保留：两条 QQ:100，另一条 QQ:200 不返回。
 	lines, err = service.LogGetLinePage(db, &service.QueryLogLinePage{
-		PageNum: 1, PageSize: 10, GroupID: groupID, LogName: logName, GapFill: &no,
+		PageNum: 1, PageSize: 10, GroupID: groupID, LogName: logName, PlayerID: "QQ:100",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(lines) != 1 || lines[0].IsGapFill {
-		t.Fatalf("non-gapFill filter returned %#v", lines)
+	if len(lines) != 2 {
+		t.Fatalf("player filter returned %d lines, want 2", len(lines))
 	}
 }
 
-func TestQueryLogLinePageBindsGapFill(t *testing.T) {
+// TestQueryLogLinePageBindsPlayerIDOnly_1115fix4 确认玩家筛选保留，
+// 同时 gapFill 查询参数不再有对应字段（旧 URL 不会报错，也不会过滤）。
+func TestQueryLogLinePageBindsPlayerIDOnly_1115fix4(t *testing.T) {
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodGet, "/story/items/page?gapFill=true&playerId=QQ%3A100", nil)
 	rec := httptest.NewRecorder()
@@ -271,9 +283,6 @@ func TestQueryLogLinePageBindsGapFill(t *testing.T) {
 	var q service.QueryLogLinePage
 	if err := c.Bind(&q); err != nil {
 		t.Fatal(err)
-	}
-	if q.GapFill == nil || !*q.GapFill {
-		t.Fatalf("gapFill not bound: %#v", q.GapFill)
 	}
 	if q.PlayerID != "QQ:100" {
 		t.Fatalf("playerId = %q, want QQ:100", q.PlayerID)

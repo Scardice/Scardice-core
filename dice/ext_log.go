@@ -510,7 +510,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 						return
 					}
 				}
-				unofficial, fn, notice, err := logSendToBackend(ctx, gid, lname, true)
+				fn, notice, err := logSendToBackend(ctx, gid, lname, true)
 				if err != nil {
 					reason := strings.TrimPrefix(err.Error(), "#")
 					VarSetValueStr(ctx, "$t错误原因", reason)
@@ -523,9 +523,6 @@ func RegisterBuiltinExtLog(self *Dice) {
 				} else {
 					VarSetValueStr(ctx, "$t日志链接", fn)
 					tmpl := DiceFormatTmpl(ctx, "日志:记录_上传_成功")
-					if unofficial {
-						tmpl += "\n[注意：该链接非余烬官方染色器]"
-					}
 					if notice != "" {
 						tmpl += "\n" + notice
 					}
@@ -2420,11 +2417,7 @@ func GetLogTxt(ctx *MsgContext, groupID string, logName string, fileNamePrefix s
 				// 写入当前批次的数据
 				for _, line := range cursorLines {
 					timeTxt := time.Unix(line.Time, 0).Format("2006-01-02 15:04:05")
-					marker := ""
-					if line.IsGapFill {
-						marker = "[补录] "
-					}
-					text := fmt.Sprintf("%s%s(%v) %s\n%s\n\n", marker, line.Nickname, line.IMUserID, timeTxt, line.Message)
+					text := fmt.Sprintf("%s(%v) %s\n%s\n\n", line.Nickname, line.IMUserID, timeTxt, line.Message)
 					if _, err = tempLog.WriteString(text); err != nil {
 						resultCh <- fmt.Errorf("写入日志导出临时文件失败: %w", err)
 						return
@@ -2466,18 +2459,18 @@ func GetLogTxt(ctx *MsgContext, groupID string, logName string, fileNamePrefix s
 	return tempLog.Name(), notice, nil
 }
 
-func LogSendToBackend(ctx *MsgContext, groupID string, logName string) (bool, string, string, error) {
+func LogSendToBackend(ctx *MsgContext, groupID string, logName string) (string, string, error) {
 	return logSendToBackend(ctx, groupID, logName, false)
 }
 
-func logSendToBackend(ctx *MsgContext, groupID string, logName string, skipResolve bool) (bool, string, string, error) {
+func logSendToBackend(ctx *MsgContext, groupID string, logName string, skipResolve bool) (string, string, error) {
 	dice := ctx.Dice
 	dirPath := filepath.Join(dice.BaseConfig.DataDir, "log-exports")
 
 	if !skipResolve {
 		resolvedName, err := resolveLogNameForGroup(dice.DBOperator, groupID, logName)
 		if err != nil {
-			return false, "", "", err
+			return "", "", err
 		}
 		if resolvedName != "" {
 			logName = resolvedName
@@ -2502,9 +2495,7 @@ func logSendToBackend(ctx *MsgContext, groupID string, logName string, skipResol
 	}
 	uploadCtx.Version = storylog.StoryVersionV1
 
-	var unofficial bool
 	if dice.AdvancedConfig.Enable && dice.AdvancedConfig.StoryLogBackendUrl != "" {
-		unofficial = true
 		uploadCtx.Backends = []string{dice.AdvancedConfig.StoryLogBackendUrl}
 		uploadCtx.Token = dice.AdvancedConfig.StoryLogBackendToken
 	}
@@ -2522,12 +2513,12 @@ func logSendToBackend(ctx *MsgContext, groupID string, logName string, skipResol
 
 	url, notice, err := storylog.Upload(uploadCtx)
 	if err != nil {
-		return unofficial, "", notice, err
+		return "", notice, err
 	}
 	if len(url) == 0 {
-		return unofficial, "", notice, errors.New("上传 log 到服务器失败，未能获取染色器链接")
+		return "", notice, errors.New("上传 log 到服务器失败，未能获取染色器链接")
 	}
-	return unofficial, url, notice, nil
+	return url, notice, nil
 }
 
 // LogRollBriefByPCV2 根据log生成骰点简报 采用gjson进行解析 拒绝一次性加载所有数据库数据
