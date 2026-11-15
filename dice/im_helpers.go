@@ -254,6 +254,13 @@ func IsCurGroupBotOnByID(session *IMSession, ep *EndPointInfo, messageType strin
 }
 
 func SetBotOffAtGroup(ctx *MsgContext, groupID string) {
+	SetBotOffAtGroupAtSeq(ctx, groupID, 0)
+}
+
+// SetBotOffAtGroupAtSeq 是 .bot off 指令的入口；seq 用于给“窗口完全位于
+// 本次 .bot off 之前”的在途补全任务建立 off 前窗口授权。Web UI 等没有消息
+// seq 的调用继续使用 SetBotOffAtGroup。
+func SetBotOffAtGroupAtSeq(ctx *MsgContext, groupID string, seq int64) {
 	session := ctx.Session
 	groupInfo, ok := session.ServiceAtNew.Load(groupID)
 	if ok {
@@ -267,7 +274,9 @@ func SetBotOffAtGroup(ctx *MsgContext, groupID string) {
 			groupInfo.SetActiveRaw(false)
 			// 群变为未激活时同时自动 .log off（不结束、不上传）：关闭期间的
 			// 消息不记录，.bot on 自动开启后也不会被当成断层补录。
-			if groupInfo.suspendLogForBotOff() && ctx.Dice != nil && ctx.Dice.Logger != nil {
+			// 若有本次 .bot off 之前触发的掉线窗口，suspend 会建立授权并让
+			// 该窗口只补日志、补完即止。
+			if groupInfo.suspendLogForBotOffAtSeq(seq) && ctx.Dice != nil && ctx.Dice.Logger != nil {
 				ctx.Dice.Logger.Infof("日志随 .bot off 自动关闭: 群=%s 记录=%s", groupID, groupInfo.GetLogState().Name)
 			}
 		}

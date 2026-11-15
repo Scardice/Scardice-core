@@ -880,7 +880,7 @@ func (d *Dice) registerCoreCommands() {
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 
-					SetBotOffAtGroup(ctx, ctx.Group.GroupID)
+					SetBotOffAtGroupAtSeq(ctx, ctx.Group.GroupID, msg.Seq)
 					text := DiceFormatTmpl(ctx, "核心:骰子关闭")
 					// 只有本次真的把日志自动关闭时才提示；用户本来就 .log off 的
 					// 群不应被谎报“会自动开启”。
