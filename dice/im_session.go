@@ -201,6 +201,11 @@ type GroupInfo struct {
 	// 拉取失败时 pending 区间会保留以便重试；若没有退避，每条新消息都会重新
 	// 发起一次最长 60s 的历史拉取，平台持续异常时会形成重试风暴。
 	logGapRetryAt atomic.Int64 `json:"-" yaml:"-"`
+	// logGapWriteFailed 标记本次补录期间是否发生过日志写入失败。
+	// 任务开始时由 beginLogGapWriteTracking 重置；LogAppend 失败时置位。
+	// 补录结束时据此决定是否保留 pending 并退避，避免“没写进去”被当成
+	// “补全完成”而永久丢掉这段缺口。
+	logGapWriteFailed atomic.Bool `json:"-" yaml:"-"`
 	// logSeqCalibrated 表示本进程内是否已用数据库 MAX(seq) 校准过 seq 基线。
 	logSeqCalibrated bool `json:"-" yaml:"-"`
 	// logSeqCalibrationRetryAt 是校准失败后的下次重试时间(unix)。
@@ -336,6 +341,29 @@ func (g *GroupInfo) deferLogGapRetry(delay time.Duration) {
 		return
 	}
 	g.logGapRetryAt.Store(time.Now().Add(delay).Unix())
+}
+
+// beginLogGapWriteTracking 在补录开始前重置“本次补录写入失败”标记。
+// 补录期间任何 LogAppend 失败（包括 replaySilently 里 ExecuteNew 内部的
+// 日志写入）都会置位，任务结束时据此决定是否保留 pending。
+func (g *GroupInfo) beginLogGapWriteTracking() {
+	if g == nil {
+		return
+	}
+	g.logGapWriteFailed.Store(false)
+}
+
+// markLogGapWriteFailure 记录本次补录期间至少有一次日志写入失败。
+func (g *GroupInfo) markLogGapWriteFailure() {
+	if g == nil {
+		return
+	}
+	g.logGapWriteFailed.Store(true)
+}
+
+// logGapWritesOK 报告本次补录是否全部写入成功；nil group 视为成功。
+func (g *GroupInfo) logGapWritesOK() bool {
+	return g == nil || !g.logGapWriteFailed.Load()
 }
 
 // applyLogGapPendingFloor 在没有排队/在途任务时，把内存基线压回未完成区间的
@@ -496,6 +524,32 @@ func (g *GroupInfo) deferLogSeqCalibration(delay time.Duration) {
 	g.logSeqMu.Lock()
 	g.logSeqCalibrationRetryAt = time.Now().Add(delay).Unix()
 	g.logSeqMu.Unlock()
+}
+
+// recordLogSeqCalibrationFailure 在读取 DB MAX(seq) 校准失败时，把校准前的
+// 基线记录成占位 pending 区间 (floor, floor+1)。校准失败/退避期间消息仍会
+// 正常写入；等校准恢复或进程重启后，applyLogGapPendingFloor 会把内存基线
+// 压回 floor，重新计算这段真实断层，而不是让新的 DB MAX 把它吞掉。
+//
+// 复用 pending 而不是新增持久字段：pending 已有持久化、floor、清理以及
+// .log on/new、.bot off/on、日志重建时的重置路径。
+func (g *GroupInfo) recordLogSeqCalibrationFailure(d *Dice) {
+	if g == nil {
+		return
+	}
+	g.logSeqMu.Lock()
+	floor := g.logLastSeq
+	if floor <= 0 {
+		floor = g.LogSeqBaseline
+	}
+	g.logSeqMu.Unlock()
+	if floor <= 0 {
+		return
+	}
+	g.setLogGapPendingRange(floor, floor+1)
+	if d != nil {
+		g.MarkDirty(d)
+	}
 }
 
 // resetLogSeqBaseline 清除持久基线。日志 ID 变化/被重建后旧基线不再有效：
