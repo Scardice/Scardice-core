@@ -386,7 +386,7 @@ func LogGetAllLines(operator engine2.DatabaseOperator, groupID string, logName s
 
 	// 查询行数据
 	err = db.Model(&model.LogOneItem{}).
-		Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id, is_gap_fill").
+		Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id").
 		Where("log_id = ?", logID).
 		Order("time ASC").
 		Find(&items).Error
@@ -434,7 +434,7 @@ func LogGetCursorLines(operator engine2.DatabaseOperator, groupID string, logNam
 	}
 	var items []model.LogOneItem
 	stmt := db.Model(&model.LogOneItem{}).
-		Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id, is_gap_fill").
+		Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id").
 		Where("log_id = ?", logID)
 	// 获取游标分页器
 	p := CreateLoggerPaginator(cursor, nil)
@@ -462,7 +462,7 @@ func LogGetExportCursorLines(operator engine2.DatabaseOperator, groupID string, 
 	}
 	var items []model.LogOneItemParquet
 	stmt := db.Model(&model.LogOneItemParquet{}).
-		Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id, is_gap_fill").
+		Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id").
 		Where("log_id = ?", logID)
 	// 获取游标分页器
 	p := CreateLoggerPaginator(cursor, nil)
@@ -483,8 +483,6 @@ type QueryLogLinePage struct {
 	PageSize int    `query:"pageSize"`
 	GroupID  string `query:"groupId"`
 	LogName  string `query:"logName"`
-	// GapFill 非空时只返回补录/非补录条目（用于日志查看器筛选）
-	GapFill *bool `query:"gapFill"`
 	// PlayerID 按玩家过滤（同时匹配 im_userid 与 user_uniform_id）
 	PlayerID string `query:"playerId"`
 }
@@ -505,15 +503,8 @@ func LogGetLinePage(operator engine2.DatabaseOperator, param *QueryLogLinePage) 
 
 	// 查询行数据
 	stmt := db.Model(&model.LogOneItem{}).
-		Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id, is_gap_fill").
+		Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id").
 		Where("log_id = ?", logID)
-	if param.GapFill != nil {
-		if *param.GapFill {
-			stmt = stmt.Where("is_gap_fill = ?", true)
-		} else {
-			stmt = stmt.Where("(is_gap_fill = ? OR is_gap_fill IS NULL)", false)
-		}
-	}
 	if param.PlayerID != "" {
 		stmt = stmt.Where("(im_userid = ? OR user_uniform_id = ?)", param.PlayerID, param.PlayerID)
 	}

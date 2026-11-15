@@ -17,7 +17,6 @@ type LogOneItemParquet struct {
 	CommandID      int64  `gorm:"column:command_id"      json:"commandId" parquet:"commandId, type=INT_64"`
 	CommandInfoStr string `gorm:"column:command_info"    json:"-"         parquet:"commandInfo, type=UTF8"`
 	UniformID      string `gorm:"column:user_uniform_id" json:"uniformId" parquet:"uniformId, type=UTF8"`
-	IsGapFill      bool   `gorm:"column:is_gap_fill;not null;default:false" json:"isGapFill" parquet:"isGapFill, type=BOOLEAN"`
 }
 
 // 兼容旧版本的数据库设计
@@ -50,8 +49,10 @@ type LogOneItem struct {
 	// Seq 平台消息序号，用于掉线期间的日志断层检测与补全
 	// 允许default=NULL，历史记录与不支持seq的平台均为NULL
 	Seq *int64 `gorm:"column:seq" json:"seq,omitempty"`
-	// IsGapFill 表示该条记录由日志断层自动补全写入，便于在日志查看/导出中筛选。
-	IsGapFill bool `gorm:"column:is_gap_fill;not null;default:false;index:idx_log_items_gap_fill" json:"isGapFill"`
+	// IsGapFill 是日志断层自动补全写入的内部标记。
+	// 1115.fix4 起不再对外暴露（JSON/导出/API 筛选均已移除），仅保留数据库列与
+	// 内部写入，保证旧库结构和 V150 重建兼容；新代码不要再把它用于用户侧功能。
+	IsGapFill bool `gorm:"column:is_gap_fill;not null;default:false;index:idx_log_items_gap_fill" json:"-"`
 }
 
 // 兼容旧版本的数据库设计
@@ -162,7 +163,8 @@ type LogOneItemHookMySQL struct {
 	Removed        *int        `gorm:"column:removed"                     json:"-"`
 	ParentID       *int        `gorm:"column:parent_id"                   json:"-"`
 	Seq            *int64      `gorm:"column:seq"                         json:"seq,omitempty"`
-	IsGapFill      bool        `gorm:"column:is_gap_fill;not null;default:false" json:"isGapFill"`
+	// IsGapFill 仅保留数据库列以兼容旧库；不再对外输出。
+	IsGapFill bool `gorm:"column:is_gap_fill;not null;default:false" json:"-"`
 }
 
 func (*LogOneItemHookMySQL) TableName() string {
