@@ -1425,6 +1425,11 @@ func LogAppend(ctx *MsgContext, groupID string, logID uint64, logName string, lo
 		ok = service.LogAppend(ctx.Dice.DBOperator, groupID, logName, logItem)
 	}
 	if !ok {
+		// 补录期间任何写入失败都要让任务保留 pending：否则“没写进去”会被
+		// 当成“补全完成”而永久丢掉这段缺口。
+		if ctx != nil && ctx.Group != nil {
+			ctx.Group.markLogGapWriteFailure()
+		}
 		reportLogAppendFailure(ctx, groupID, logID, logName)
 		return false
 	}
@@ -1572,6 +1577,10 @@ func logGapFromMessage(d *Dice, group *GroupInfo, logState GroupLogState, msgSeq
 		}
 		baseSeq, baseMsgID := group.logSeqBaselineSnapshot()
 		if _, _, ok := calibrateLogSeqBaseline(d, group, logState.ID, baseSeq, baseMsgID); !ok {
+			// 校准失败期间消息仍会正常入库；把校准前基线持久化成 pending，
+			// 等校准恢复/重启后把基线压回这里，避免 DB MAX 把失败窗口前的
+			// 真实断层一起吞掉。
+			group.recordLogSeqCalibrationFailure(d)
 			return 0, nil, 0
 		}
 	}
@@ -1866,18 +1875,33 @@ func (t logGapFillTask) run() {
 		return
 	}
 
+	// 记录本次补录期间是否发生过日志写入失败。失败不能当成“补全完成”：
+	// 写入侧短暂故障（磁盘满、锁超时、只读库）恢复后，这段缺口仍应可重试。
+	t.group.beginLogGapWriteTracking()
 	done := true
 	if t.gap <= logGapFillSilentThreshold {
 		done = t.replaySilently(missing)
 	} else {
 		t.backfillWithNotice(missing)
 	}
-	// 补全完成或中途因日志关闭/切换而停止：这段区间不再需要在重启后恢复。
-	// 端点会话未绑定（replaySilently 返回 false）时保留 pending，等下次启动重试；
-	// 若期间又合并了新的 pending，clearIfIdle 也会保留它。
-	if done {
+	// 日志在补录过程中被关闭/切换是明确取消，pending 不再需要恢复。
+	if !t.logStateStillValid() {
 		t.group.clearLogGapPendingIfIdle(t.dice)
+		return
 	}
+	// 端点会话未绑定（replaySilently 返回 false）是暂时状态，保留 pending
+	// 等下次启动/重试，但不能清区间。
+	if !done {
+		return
+	}
+	if t.group.logGapWritesOK() {
+		t.group.clearLogGapPendingIfIdle(t.dice)
+		return
+	}
+	// 有消息没写进日志：保留 pending 并退避，避免每条新消息都重新拉取历史；
+	// 退避到期后由 pending floor / 新任务恢复，已写入的行会由去重跳过。
+	t.dice.Logger.Warnf("日志补全写入失败，保留 pending 并退避: 群=%s 记录=%s", t.group.GroupID, t.logName)
+	t.group.deferLogGapRetry(logGapFillRetryBackoff)
 }
 
 // fetchHistory 按页拉取 (fromSeq, toSeq) 区间，直到覆盖到 toSeq-1 或达到上限。
@@ -2143,9 +2167,14 @@ func (t logGapFillTask) replaySilently(missing []*Message) bool {
 			// 写入与日志状态在同一把锁里：.log off/new 不会让这条迟到的
 			// 写入落进已关闭/已切换的日志。
 			item := t.logItem(m)
-			if t.group.withLogStateRead(t.logID, t.logName, func() {
-				LogAppend(logCtx, t.group.GroupID, t.logID, t.logName, &item)
-			}) {
+			appendedOK := false
+			ran := t.group.withLogStateRead(t.logID, t.logName, func() {
+				appendedOK = LogAppend(logCtx, t.group.GroupID, t.logID, t.logName, &item)
+			})
+			if !ran || !appendedOK {
+				t.group.markLogGapWriteFailure()
+			}
+			if ran && appendedOK {
 				skipped++
 			}
 			return
@@ -2221,9 +2250,12 @@ func (t logGapFillTask) backfillWithNotice(missing []*Message) {
 	processed := t.forEachMissing(missing, func(m *Message) {
 		item := t.logItem(m)
 		appendedOK := false
-		t.group.withLogStateRead(t.logID, t.logName, func() {
+		ran := t.group.withLogStateRead(t.logID, t.logName, func() {
 			appendedOK = LogAppend(mctx, t.group.GroupID, t.logID, t.logName, &item)
 		})
+		if !ran || !appendedOK {
+			t.group.markLogGapWriteFailure()
+		}
 		if appendedOK {
 			appended++
 		}

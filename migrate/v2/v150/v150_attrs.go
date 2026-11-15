@@ -686,6 +686,10 @@ var expectedSQLiteLogItemsColumns = []sqliteExpectedColumn{
 	{Name: "user_uniform_id", Type: "TEXT"},
 	{Name: "removed", Type: "INTEGER"},
 	{Name: "parent_id", Type: "INTEGER"},
+	// 后加的列也必须纳入期望列，否则现代库每次都会被判成“列不匹配”而重建；
+	// 重建时 bulkCopy 只复制期望列，会把 seq / is_gap_fill 的值丢掉。
+	{Name: "seq", Type: "INTEGER"},
+	{Name: "is_gap_fill", Type: "NUMERIC"},
 }
 
 func ensureSQLiteLogSchema(db *gorm.DB) error {
@@ -1166,6 +1170,9 @@ func quoteSQLiteString(name string) string {
 func defaultValueForMissingColumn(name string) string {
 	switch name {
 	case "log_id", "command_id", "time", "is_dice", "removed", "parent_id", "created_at", "updated_at", "size", "upload_time":
+		return "0"
+	case "is_gap_fill":
+		// 该列有 NOT NULL DEFAULT false；不能像其他缺失列一样返回 NULL。
 		return "0"
 	case "name", "group_id", "attrs_type", "binding_sheet_id", "owner_id", "sheet_type", "upload_url":
 		return "''"
