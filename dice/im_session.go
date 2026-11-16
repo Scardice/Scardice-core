@@ -201,6 +201,10 @@ type GroupInfo struct {
 	logGapQueueMu       sync.Mutex      `json:"-" yaml:"-"`
 	logGapPending       *logGapFillTask `json:"-" yaml:"-"`
 	logGapWorkerRunning bool            `json:"-" yaml:"-"`
+	// logGapRunningOffDiscovery 表示 worker 当前执行的正是 off 状态历史发现任务。
+	// 用于让 .log off / .log on 及时感知“离线补录还在跑”，避免实时命令和
+	// 异步任务互相覆盖状态。
+	logGapRunningOffDiscovery atomic.Bool `json:"-" yaml:"-"`
 	// logGapFilling 标记当前是否正在执行小断层的静默重放。
 	// OnMessageReceived 用它给补录条目打 is_gap_fill 标记；正常实时消息不受影响。
 	logGapFilling atomic.Bool `json:"-" yaml:"-"`
@@ -229,6 +233,17 @@ type GroupInfo struct {
 	// 避免把 off/静默期间的消息合并进旧任务补进日志。
 	logEpoch atomic.Uint64 `json:"-" yaml:"-"`
 
+	// logOffRequestedSeq 记录用户在 live 日志已关闭时再次发送 .log off 的 seq。
+	// 此时 logOffForUserAtSeq 不会改变任何日志字段，但必须在途的 off 状态
+	// 历史发现任务知道“用户明确要求保持关闭”，不能在任务结束时把日志重新
+	// 打开。运行时字段；.log on/.bot on/end/halt 时清除。
+	logOffRequestedSeq atomic.Int64 `json:"-" yaml:"-"`
+
+	// logAutoResumedAt 记录 off 发现任务最近一次自动恢复日志的时间(unix)。
+	// 实时 .log on 与异步任务竞态时，若任务先恢复，命令处理器看到日志
+	// 已经开启：30 秒内消费此标记，回复“已恢复”而不是“已有记录”误报。
+	logAutoResumedAt atomic.Int64 `json:"-" yaml:"-"`
+
 	// logOffGapAuth 在 .log off/.bot off 真正关闭日志时，授权“off 前窗口”
 	// 的补全任务继续完成；只在任务窗口完全位于 offSeq 之前时生效。
 	// 运行时字段，不参与序列化。
@@ -249,6 +264,10 @@ type GroupInfo struct {
 	// 用这段区间在下次收到消息时把内存基线压回起点，重新触发补全。
 	LogGapPendingFrom int64 `json:"logGapPendingFrom,omitempty" yaml:"logGapPendingFrom,omitempty"`
 	LogGapPendingTo   int64 `json:"logGapPendingTo,omitempty"   yaml:"logGapPendingTo,omitempty"`
+	// LogGapPendingOffDiscovery 表示上面的 pending 区间来自“off 状态历史发现”，
+	// 起点状态是 off，不能按 on 状态做 pending floor。进程重启后仍保留，
+	// 下一条消息会据此重建 log-only 历史补录任务。
+	LogGapPendingOffDiscovery bool `json:"logGapPendingOffDiscovery,omitempty" yaml:"logGapPendingOffDiscovery,omitempty"`
 	// LogSeenSeq 是“live 日志关闭期间核心最后看到的群消息 seq”。
 	// 用于 off 状态断层检测：核心离线后第一条消息的 seq 会跳过这段时间，
 	// 从 LogSeenSeq 开始拉历史，以 off 为起点扫描 .log on/.log off。
@@ -351,6 +370,13 @@ func (g *GroupInfo) logLastSeqSnapshot() int64 {
 // setLogGapPendingRange 记录尚未完成的补全区间（seq 开区间）。
 // 多次 merge 时保留更早的起点和更晚的终点。
 func (g *GroupInfo) setLogGapPendingRange(fromSeq, toSeq int64) {
+	g.setLogGapPendingRangeMode(fromSeq, toSeq, false)
+}
+
+// setLogGapPendingRangeMode 记录 pending 区间，并标记它是否来自 off 状态
+// 历史发现。off 起点任务不能在 on 状态做 pending floor，否则会被当成
+// “从 on 开始的缺口”，把 off 段补进日志。
+func (g *GroupInfo) setLogGapPendingRangeMode(fromSeq, toSeq int64, offDiscovery bool) {
 	if g == nil || fromSeq <= 0 || toSeq <= fromSeq {
 		return
 	}
@@ -361,7 +387,94 @@ func (g *GroupInfo) setLogGapPendingRange(fromSeq, toSeq int64) {
 	if toSeq > g.LogGapPendingTo {
 		g.LogGapPendingTo = toSeq
 	}
+	if offDiscovery {
+		g.LogGapPendingOffDiscovery = true
+	}
 	g.logSeqMu.Unlock()
+}
+
+// replaceLogGapPendingRange 在任务被替换（日志/epoch/模式变化）时重置
+// pending 区间，避免旧模式的区间和新任务混在一起。
+func (g *GroupInfo) replaceLogGapPendingRange(fromSeq, toSeq int64, offDiscovery bool) {
+	if g == nil {
+		return
+	}
+	g.logSeqMu.Lock()
+	g.LogGapPendingFrom, g.LogGapPendingTo = 0, 0
+	g.LogGapPendingOffDiscovery = offDiscovery
+	if fromSeq > 0 && toSeq > fromSeq {
+		g.LogGapPendingFrom, g.LogGapPendingTo = fromSeq, toSeq
+	}
+	g.logSeqMu.Unlock()
+}
+
+// pendingLogGapRangeSnapshot 读取 pending 区间及它是否来自 off 发现。
+func (g *GroupInfo) pendingLogGapRangeSnapshot() (fromSeq, toSeq int64, offDiscovery bool) {
+	if g == nil {
+		return 0, 0, false
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	return g.LogGapPendingFrom, g.LogGapPendingTo, g.LogGapPendingOffDiscovery
+}
+
+// hasOffDiscoveryContext 报告当前是否有 off 状态历史发现任务在排队/运行，
+// 或留有可重试的 off 发现 pending 区间。用于 .log on/.log off 与异步任务
+// 的交接，避免实时命令覆盖离线补录、或任务把用户明确关闭的日志重新打开。
+func (g *GroupInfo) hasOffDiscoveryContext() bool {
+	if g == nil {
+		return false
+	}
+	g.logGapQueueMu.Lock()
+	pending := g.logGapPending != nil && g.logGapPending.discoverFromOff
+	active := g.logGapRunningOffDiscovery.Load()
+	g.logGapQueueMu.Unlock()
+	if pending || active {
+		return true
+	}
+	fromSeq, toSeq, offDiscovery := g.pendingLogGapRangeSnapshot()
+	return offDiscovery && fromSeq > 0 && toSeq > fromSeq
+}
+
+// hasAnyLogGapTask 报告当前是否有排队或运行中的补全任务。
+func (g *GroupInfo) hasAnyLogGapTask() bool {
+	if g == nil {
+		return false
+	}
+	g.logGapQueueMu.Lock()
+	defer g.logGapQueueMu.Unlock()
+	return g.logGapWorkerRunning || g.logGapPending != nil
+}
+
+// markLogOffRequested 记录用户明确要求关闭日志。即使 live 日志已经是
+// 关闭状态（logOffForUserAtSeq 不会改字段），在途的 off 发现任务也必须
+// 在 adopt 前看到这个标记，不能把日志重新打开。
+func (g *GroupInfo) markLogOffRequested(seq int64) {
+	if g == nil {
+		return
+	}
+	if seq <= 0 {
+		seq = 1
+	}
+	if seq > g.logOffRequestedSeq.Load() {
+		g.logOffRequestedSeq.Store(seq)
+	}
+}
+
+// logOffRequested 报告用户是否明确要求过关闭日志。
+func (g *GroupInfo) logOffRequested() bool {
+	if g == nil {
+		return false
+	}
+	return g.logOffRequestedSeq.Load() > 0
+}
+
+// clearLogOffRequested 在 .log on/.bot on/end/halt 后清除关闭请求标记。
+func (g *GroupInfo) clearLogOffRequested() {
+	if g == nil {
+		return
+	}
+	g.logOffRequestedSeq.Store(0)
 }
 
 // armLogOffGapAuth 在 .log off/.bot off 关闭日志前，为“窗口完全位于指令
@@ -418,8 +531,9 @@ func (g *GroupInfo) clearLogGapPendingRange() bool {
 		return false
 	}
 	g.logSeqMu.Lock()
-	changed := g.LogGapPendingFrom != 0 || g.LogGapPendingTo != 0
+	changed := g.LogGapPendingFrom != 0 || g.LogGapPendingTo != 0 || g.LogGapPendingOffDiscovery
 	g.LogGapPendingFrom, g.LogGapPendingTo = 0, 0
+	g.LogGapPendingOffDiscovery = false
 	g.logGapRetryAt.Store(0)
 	g.logSeqMu.Unlock()
 	if changed {
@@ -531,6 +645,11 @@ func (g *GroupInfo) applyLogGapPendingFloor() {
 	if g.LogGapPendingFrom <= 0 || g.LogGapPendingTo <= g.LogGapPendingFrom {
 		return
 	}
+	if g.LogGapPendingOffDiscovery {
+		// off 起点窗口不能压回 on 基线：否则后续会按 on 状态重算缺口，
+		// 把 off 段补进日志。off 发现任务由 OnMessageReceived 单独重建。
+		return
+	}
 	if g.LogGapPendingFrom < g.logLastSeq {
 		g.logLastSeq = g.LogGapPendingFrom
 		g.logLastMsgID = nil
@@ -585,12 +704,15 @@ func (g *GroupInfo) resetLogSeq(seq int64, rawID interface{}) {
 	g.LogSeqBaseline = seq
 	g.LogSeqBaselineMsgID = msgID
 	g.LogGapPendingFrom, g.LogGapPendingTo = 0, 0
+	g.LogGapPendingOffDiscovery = false
 	g.logSeqRegressCount = 0
 	g.logGapRetryAt.Store(0)
 	g.logEpoch.Add(1)
 	g.logSeqMu.Unlock()
 	g.clearLogOffGapAuth()
 	g.clearLogSeenSeq()
+	g.clearLogOffRequested()
+	g.logAutoResumedAt.Store(0)
 }
 
 // initLogSeqFromPersisted 在群数据加载完成后恢复持久基线。
@@ -707,12 +829,15 @@ func (g *GroupInfo) resetLogSeqBaseline() {
 	g.LogSeqBaseline = 0
 	g.LogSeqBaselineMsgID = ""
 	g.LogGapPendingFrom, g.LogGapPendingTo = 0, 0
+	g.LogGapPendingOffDiscovery = false
 	g.logSeqRegressCount = 0
 	g.logGapRetryAt.Store(0)
 	g.logEpoch.Add(1)
 	g.logSeqMu.Unlock()
 	g.clearLogOffGapAuth()
 	g.clearLogSeenSeq()
+	g.clearLogOffRequested()
+	g.logAutoResumedAt.Store(0)
 }
 
 // beginLogGapFillWindow 进入静默重放：窗口内的消息在日志里标记为补录。
@@ -1064,6 +1189,9 @@ func (g *GroupInfo) ClearLogState() {
 	g.logStateMu.Unlock()
 	g.clearLogOffGapAuth()
 	g.clearLogSeenSeq()
+	g.clearLogOffRequested()
+	g.logAutoResumedAt.Store(0)
+	g.clearLogGapPendingRange()
 }
 
 func (group *GroupInfo) IsActive(ctx *MsgContext) bool {
