@@ -137,6 +137,8 @@ func (g *GroupInfo) resumeLogPausedByBotOff() bool {
 	// 关闭段不补录：清掉暂停前遗留的 pending 区间并取消在途任务。
 	// 同样必须在释放 logStateMu 之后再取 logSeqMu，避免与 MarshalJSON 死锁。
 	g.cancelLogGapFill()
+	g.clearLogOffRequested()
+	g.logAutoResumedAt.Store(0)
 	return true
 }
 
@@ -148,6 +150,22 @@ func (g *GroupInfo) isLogPausedByBotOff() bool {
 	g.logStateMu.RLock()
 	defer g.logStateMu.RUnlock()
 	return g.LogPausedByBotOff
+}
+
+// setLogPausedByBotOff 在“日志本来已关闭，但离线历史确认它应当处于开启”
+// 且群已经失活时，补上自动恢复标记：下一次 .bot on 按原语义恢复记录，
+// 但当前绝不会把日志重新打开。
+func (g *GroupInfo) setLogPausedByBotOff() bool {
+	if g == nil {
+		return false
+	}
+	g.logStateMu.Lock()
+	defer g.logStateMu.Unlock()
+	if g.LogOn || g.LogCurName == "" || g.LogPausedByBotOff {
+		return false
+	}
+	g.LogPausedByBotOff = true
+	return true
 }
 
 // clearLogPausedByBotOff 在用户显式操作日志（.log on/new/off/end/halt）后清除
@@ -181,6 +199,10 @@ func (g *GroupInfo) logOffForUserAtSeq(seq int64) (name string, ok bool) {
 	if g == nil {
 		return "", false
 	}
+	// 即使用户重复发送 .log off 且 live 日志已经是关闭状态，也要记下
+	// “用户明确要求关闭”，阻止在途的 off 发现任务在结束时恢复日志。
+	g.markLogOffRequested(seq)
+	g.logAutoResumedAt.Store(0)
 	g.logWriteMu.Lock()
 	defer g.logWriteMu.Unlock()
 
@@ -610,9 +632,30 @@ func RegisterBuiltinExtLog(self *Dice) {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 
-				// 如果日志已经开启，报错返回
+				// 如果日志已经开启，报错返回。但如果刚才是 off 发现任务先一步
+				// 把日志恢复（实时 .log on 与异步任务竞态），这条命令其实已经
+				// 生效，只补一条说明，不再谎报“已有记录”。
 				currentState := getGroupLogState(group)
 				if currentState.On {
+					// 异步 off 发现任务可能先一步把日志恢复；此时用户的
+					// .log on 已经生效，不能回复“已有记录”的失败文案。
+					if ts := group.logAutoResumedAt.Load(); ts > 0 && time.Now().Unix()-ts <= 30 {
+						group.logAutoResumedAt.Store(0)
+						ReplyToSender(ctx, msg, "日志已从离线记录恢复开启。")
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
+					bfFrom, bfTo, _ := group.pendingLogGapRangeSnapshot()
+					if bfFrom <= 0 {
+						bfFrom = group.logSeenSeqSnapshot()
+					}
+					if bfTo <= bfFrom {
+						bfTo = msg.Seq
+					}
+					if group.hasOffDiscoveryContext() &&
+						group.enqueueOffDiscoveryBackfill(ctx.Dice, ctx.EndPoint, currentState, group.logEpoch.Load(), bfFrom, bfTo) {
+						ReplyToSender(ctx, msg, "日志已开启，离线期间的记录正在补录，完成后会通知。")
+						return CmdExecuteResult{Matched: true, Solved: true}
+					}
 					VarSetValueStr(ctx, "$t记录名称", currentState.Name)
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_开启_失败_未结束的记录"))
 					return CmdExecuteResult{Matched: true, Solved: true}
@@ -644,17 +687,41 @@ func RegisterBuiltinExtLog(self *Dice) {
 							ctx.Dice.Logger.Errorf("日志开启失败: group=%s name=%s err=%v", group.GroupID, name, err)
 							return CmdExecuteResult{Matched: true, Solved: true}
 						}
+						// 实时 .log on 会 reset 基线/epoch，原有的 off 发现任务会被
+						// 取消。先把待补录窗口抓下来，reset 之后再挂一个 backfillOnly
+						// 任务，避免离线 on 段随 epoch 变化一起丢失。
+						bfFrom, bfTo, _ := group.pendingLogGapRangeSnapshot()
+						if bfFrom <= 0 {
+							bfFrom = group.logSeenSeqSnapshot()
+						}
+						if bfTo <= bfFrom {
+							bfTo = msg.Seq
+						}
+						needBackfill := group.hasOffDiscoveryContext() && bfFrom > 0 && bfTo > bfFrom
+						var stateAfter GroupLogState
+						var epochAfter uint64
 						group.logWriteMu.Lock()
 						group.SetLogState(logID, name, true)
 						group.resetLogSeqForNewSegment(msg.Seq, msg.RawID)
 						group.clearLogPausedByBotOff()
+						stateAfter = group.GetLogState()
+						epochAfter = group.logEpoch.Load()
 						group.logWriteMu.Unlock()
 						group.MarkDirty(ctx.Dice)
 						ctx.Dice.Logger.Infof("日志状态切换: 群=%s 开启日志 name=%s id=%d", group.GroupID, name, logID)
 
+						backfillNotice := ""
+						if needBackfill {
+							if group.enqueueOffDiscoveryBackfill(ctx.Dice, ctx.EndPoint, stateAfter, epochAfter, bfFrom, bfTo) {
+								backfillNotice = "\n离线期间的记录正在补录，完成后会通知。"
+							} else {
+								ctx.Dice.Logger.Warnf("日志开启后未能重建离线补录任务: 群=%s 窗口=%d..%d", group.GroupID, bfFrom, bfTo)
+							}
+						}
+
 						VarSetValueStr(ctx, "$t记录名称", name)
 						VarSetValueInt64(ctx, "$t当前记录条数", lines)
-						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_开启_成功"))
+						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_开启_成功")+backfillNotice)
 					} else {
 						VarSetValueStr(ctx, "$t记录名称", name)
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_开启_失败_无此记录"))
@@ -665,6 +732,16 @@ func RegisterBuiltinExtLog(self *Dice) {
 				return CmdExecuteResult{Matched: true, Solved: true}
 			} else if cmdArgs.IsArgEqual(1, "off") {
 				state := getGroupLogState(group)
+				if !state.On && group.hasOffDiscoveryContext() {
+					// live 日志已经是 off，但离线发现任务还在补录历史 on 段。
+					// 这不是用户“忘记开启”，而是离线期间的 .log on 尚未处理完；
+					// 记下明确的关闭请求（阻止任务结束时 adopt），并给出正确提示。
+					if _, ok := group.logOffForUserAtSeq(msg.Seq); ok {
+						group.MarkDirty(ctx.Dice)
+					}
+					ReplyToSender(ctx, msg, "当前记录已关闭；离线期间的记录正在补录，完成后会通知。")
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				if _, ok := group.logOffForUserAtSeq(msg.Seq); ok {
 					// 显式 .log off 优先于 .bot off 的自动关闭：即使日志已经是
 					// 关的，也要清掉“自动开启”标记，避免下一次 .bot on 把它重新打开。
@@ -1373,7 +1450,16 @@ func RegisterBuiltinExtLog(self *Dice) {
 			if ctx.Group != nil {
 				logState := ensureGroupLogState(ctx, ctx.Group)
 				if logState.On && logState.Name != "" {
-					if msg.Seq > 0 {
+					// 实时 .log on 之后可能还有 off 发现窗口待补录（实时处理器
+					// 先执行、或失败后重试）。优先让 backfillOnly 任务补齐历史；
+					// 这条消息本身仍然正常写入日志，只是暂不走 on 状态缺口逻辑，
+					// 避免 on 任务把 off 起点窗口合并替换掉。
+					skipGap := false
+					if ctx.Group.hasOffDiscoveryContext() {
+						ctx.Group.enqueuePendingOffDiscoveryBackfill(ctx.Dice, ctx.EndPoint, logState)
+						skipGap = true
+					}
+					if msg.Seq > 0 && !skipGap {
 						// 只有“日志正在记录”时才会走到这里；off 期间整段不进来，
 						// 所以 off 的消息永远不会被算成缺口。
 						fromSeq, lastMsgID, gap := logGapFromMessage(ctx.Dice, ctx.Group, logState, msg.Seq, msg.RawID)
@@ -1585,12 +1671,13 @@ func reportLogAppendFailure(ctx *MsgContext, groupID string, logID uint64, logNa
 const logGapFillSilentThreshold = 5
 
 const (
-	// 一次断层补全的总预算：最多 2000 条、每页 100 条，即 20 次接口调用。
-	// 30s 在慢线路/大群上不够，给到 60s。
-	logGapFillTimeout      = 60 * time.Second
+	// 一次断层补全的总预算：从缺口起点分段扫描，每段最多
+	// logGapFillMaxMessages 条、每页 100 条。离线较久时需要多段拉取，
+	// 60s 在慢线路/大群上容易只扫到一半，给到 120s。
+	logGapFillTimeout      = 120 * time.Second
 	logGapFillPageTimeout  = 15 * time.Second // 单页拉取超时，避免一页卡住耗尽总预算
 	logGapFillPageSize     = 100              // 单次 get_group_msg_history 的拉取上限
-	logGapFillMaxMessages  = 2000             // 单次断层最多补录的消息数，避免离线数天时无限拉取
+	logGapFillMaxMessages  = 2000             // 单段历史拉取的最大消息数；run() 从缺口起点分段覆盖整个缺口
 	logGapFillFetchRetries = 3                // 瞬时网络错误的重试次数
 	// logGapFillRetryBackoff 是拉取整体失败后，pending 区间重新触发补全的
 	// 最小间隔。pending 会保留到补全完成，没有退避时每条新消息都会重试。
@@ -1757,6 +1844,82 @@ func (g *GroupInfo) detectOffStateLogGap(d *Dice, ep *EndPointInfo, logState Gro
 	g.enqueueLogGapFill(task)
 }
 
+// enqueueOffDiscoveryBackfill 在实时 .log on 已经把 live 日志打开后，
+// 为指定的 off 发现窗口创建一个 log-only 历史补录任务。
+//
+// 实时处理器会 resetLogSeq/epoch++，原来的 off 发现任务因此被取消；
+// 这里用 reset 之后的新 epoch 重新挂一个 backfillOnly 任务，确保离线期间
+// 已经在历史里确认的 on 段不会丢。
+func (g *GroupInfo) enqueueOffDiscoveryBackfill(d *Dice, ep *EndPointInfo, logState GroupLogState, epoch uint64, fromSeq, toSeq int64) bool {
+	if g == nil || d == nil || ep == nil || !logState.On || logState.ID == 0 || logState.Name == "" {
+		return false
+	}
+	if fromSeq <= 0 || toSeq <= fromSeq {
+		return false
+	}
+	// 在 logWriteMu 读锁下确认日志没有被并发切换；拿到 epoch 后再入队。
+	// 如果入队后用户又 .log new，epoch 变化会让任务自动取消，避免把旧
+	// 日志的历史写进新日志。
+	g.logWriteMu.RLock()
+	current := g.GetLogState()
+	currentEpoch := g.logEpoch.Load()
+	g.logWriteMu.RUnlock()
+	if !current.On || current.ID != logState.ID || current.Name != logState.Name || currentEpoch != epoch {
+		return false
+	}
+	task := logGapFillTask{
+		dice:            d,
+		endpoint:        ep,
+		group:           g,
+		logID:           current.ID,
+		logName:         current.Name,
+		epoch:           currentEpoch,
+		fromSeq:         fromSeq,
+		toSeq:           toSeq,
+		gap:             toSeq - fromSeq - 1,
+		discoverFromOff: true,
+		backfillOnly:    true,
+	}
+	g.enqueueLogGapFill(task)
+	return true
+}
+
+// enqueuePendingOffDiscoveryBackfill 用于失败/重启后的重试：只读持久化的
+// off 发现 pending 区间，在没有其它补全任务时重建 log-only 任务。
+func (g *GroupInfo) enqueuePendingOffDiscoveryBackfill(d *Dice, ep *EndPointInfo, logState GroupLogState) bool {
+	if g == nil || d == nil || ep == nil || !logState.On || logState.ID == 0 || logState.Name == "" {
+		return false
+	}
+	// 与当前日志状态一致才重建；并发 .log new/off 时宁可让下一条消息再试，
+	// 也不能把旧日志的 pending 窗口写进新日志。
+	g.logWriteMu.RLock()
+	current := g.GetLogState()
+	currentEpoch := g.logEpoch.Load()
+	g.logWriteMu.RUnlock()
+	if !current.On || current.ID != logState.ID || current.Name != logState.Name {
+		return false
+	}
+	fromSeq, toSeq, offDiscovery := g.pendingLogGapRangeSnapshot()
+	if !offDiscovery || fromSeq <= 0 || toSeq <= fromSeq || g.hasAnyLogGapTask() {
+		return false
+	}
+	task := logGapFillTask{
+		dice:            d,
+		endpoint:        ep,
+		group:           g,
+		logID:           current.ID,
+		logName:         current.Name,
+		epoch:           currentEpoch,
+		fromSeq:         fromSeq,
+		toSeq:           toSeq,
+		gap:             toSeq - fromSeq - 1,
+		discoverFromOff: true,
+		backfillOnly:    true,
+	}
+	g.enqueueLogGapFill(task)
+	return true
+}
+
 // calibrateLogSeqBaseline 在进程内首次记日志时，用数据库里该日志的 MAX(seq)
 // 校准 seq 基线，返回校准后的上一条 seq 与 RawID。
 //
@@ -1840,6 +2003,11 @@ type logGapFillTask struct {
 	// 从 LogSeenSeq 开始扫描，起点状态为 off；找到 .log on 后补 on 段，
 	// 最终 on 时恢复 live 日志。
 	discoverFromOff bool
+	// backfillOnly 表示 live 日志已经被实时 .log on 打开，任务只负责把
+	// (fromSeq, toSeq) 之间历史记录确认的 on 段补进当前日志：
+	// 不写触发消息、不改变 live 状态、不 adopt。用于实时命令先执行、
+	// 异步发现任务被 epoch 变化取消时保住离线 on 段。
+	backfillOnly bool
 }
 
 // logStateStillValid 校验补全任务对应的日志仍是该群当前开启的日志。
@@ -1903,16 +2071,33 @@ func (t logGapFillTask) logHistoricalDiscoveryAllowed() bool {
 	return t.group.logEpoch.Load() == t.epoch
 }
 
+// logOffDiscoveryBackfillAllowed 判断“实时 .log on 已先执行”后的历史补录
+// 任务是否仍可继续：只要求仍是同一本日志且 epoch 未变（任务在 reset 之后
+// 创建），不要求 LogOn=false。这样实时处理器打开日志后，离线 on 段仍能
+// 以 log-only 方式补进来，不会被 epoch 变化一并取消。
+func (t logGapFillTask) logOffDiscoveryBackfillAllowed() bool {
+	if !t.discoverFromOff || !t.backfillOnly || t.group == nil || t.toSeq <= 0 {
+		return false
+	}
+	state := t.group.GetLogState()
+	if state.ID != t.logID || state.Name != t.logName {
+		return false
+	}
+	return t.group.logEpoch.Load() == t.epoch
+}
+
 // logFillWritable 是补录写入的统一放行判断：日志正常开启，或持有 off 前窗口
 // 授权，或这是 off 状态下的历史 .log on 发现任务。
 func (t logGapFillTask) logFillWritable() bool {
-	return t.logStateStillValid() || t.logOffGapFillAllowed() || t.logHistoricalDiscoveryAllowed()
+	return t.logStateStillValid() || t.logOffGapFillAllowed() ||
+		t.logHistoricalDiscoveryAllowed() || t.logOffDiscoveryBackfillAllowed()
 }
 
 // forEachMissing 按顺序遍历缺失消息，并在处理每条之前确认日志仍然有效。
 //
-// 只在任务开始/拉取结束时校验是不够的：补录最多 2000 条、静默重放还要执行指令，
-// 期间用户完全可能 .log off / .log new。不逐条校验的话，关掉的日志仍会被继续
+// 只在任务开始/拉取结束时校验是不够的：缺口可能跨多段、每段最多
+// logGapFillMaxMessages 条，静默重放还要执行指令，期间用户完全可能
+// .log off / .log new。不逐条校验的话，关掉的日志仍会被继续
 // 写入（用户看到的就是“off 之后内容还在进日志”），静默重放还会在日志关闭后
 // 继续执行历史指令却不留记录。返回实际处理条数，小于 len(missing) 表示被中止。
 //
@@ -1952,6 +2137,9 @@ func (g *GroupInfo) mergeLogGapTask(task logGapFillTask) bool {
 		pending.epoch != task.epoch || pending.discoverFromOff != task.discoverFromOff {
 		t := task
 		g.logGapPending = &t
+		// 替换任务时重置 pending 区间，避免旧模式（on/off 起点）的区间
+		// 和新任务混在一起，被后续 pending floor 按错误状态重算。
+		g.replaceLogGapPendingRange(t.fromSeq, t.toSeq, t.discoverFromOff)
 	} else {
 		if task.fromSeq < pending.fromSeq {
 			pending.fromSeq = task.fromSeq
@@ -1968,6 +2156,7 @@ func (g *GroupInfo) mergeLogGapTask(task logGapFillTask) bool {
 		// 重连后 endpoint 可能已更换，总是使用最新任务的状态。
 		pending.endpoint = task.endpoint
 		pending.dice = task.dice
+		pending.backfillOnly = pending.backfillOnly || task.backfillOnly
 	}
 	if p := g.logGapPending; p != nil {
 		// off 状态发现任务每次都以同一个 LogSeenSeq 为起点，合并时不能累加
@@ -1977,7 +2166,7 @@ func (g *GroupInfo) mergeLogGapTask(task logGapFillTask) bool {
 		}
 		// 持久化“尚未完成的补全区间”：进程在 worker 完成前重启时，下一次消息
 		// 会把基线压回起点重新补，避免这段缺口永久丢失。
-		g.setLogGapPendingRange(p.fromSeq, p.toSeq)
+		g.setLogGapPendingRangeMode(p.fromSeq, p.toSeq, p.discoverFromOff)
 	}
 	if task.dice != nil {
 		g.MarkDirty(task.dice)
@@ -2000,9 +2189,13 @@ func (g *GroupInfo) runLogGapWorker() {
 		g.logGapPending = nil
 		if task == nil {
 			g.logGapWorkerRunning = false
+			g.logGapRunningOffDiscovery.Store(false)
 			g.logGapQueueMu.Unlock()
 			return
 		}
+		// 在队列锁内标记“正在跑 off 发现”，避免 .log on/.log off 在
+		// take 任务与标记之间看到空档。
+		g.logGapRunningOffDiscovery.Store(task.discoverFromOff)
 		g.logGapQueueMu.Unlock()
 
 		func() {
@@ -2019,6 +2212,7 @@ func (g *GroupInfo) runLogGapWorker() {
 			}()
 			task.run()
 		}()
+		g.logGapRunningOffDiscovery.Store(false)
 	}
 }
 
@@ -2027,7 +2221,13 @@ func (t logGapFillTask) run() {
 		return
 	}
 	if t.discoverFromOff {
-		if !t.logHistoricalDiscoveryAllowed() {
+		allowed := t.logHistoricalDiscoveryAllowed()
+		if t.backfillOnly {
+			// live 已被实时 .log on 打开：只要求同一本日志、epoch 未变，
+			// 不要求 LogOn=false，否则离线 on 段会被实时处理器一起取消。
+			allowed = t.logOffDiscoveryBackfillAllowed()
+		}
+		if !allowed {
 			t.dice.Logger.Infof("日志补全已取消(off 状态历史发现): 群=%s 记录=%s 日志已开启或被切换",
 				t.group.GroupID, t.logName)
 			t.group.clearLogGapPendingIfIdle(t.dice)
@@ -2071,33 +2271,69 @@ func (t logGapFillTask) run() {
 	fetchCtx, cancel := context.WithTimeout(context.Background(), logGapFillTimeout)
 	defer cancel()
 
-	msgs, err := t.fetchHistory(fetchCtx, fetcher)
-	if err != nil {
-		t.dice.Logger.Errorf("日志补全拉取历史消息失败: 群=%s 起始seq=%d err=%v", t.group.GroupID, t.fromSeq, err)
-		// 保留 pending 区间以便之后重试，但必须退避：否则每条新消息都会
-		// 重新触发一次最长 60s 的拉取，平台历史接口持续异常时会打爆连接。
-		t.group.deferLogGapRetry(logGapFillRetryBackoff)
-		return
+	// 从缺口起点向终点分段扫描：每段最多 logGapFillMaxMessages 条，
+	// on/off 状态跨段传递。不能只拉最近一段再按 startOn 过滤——如果
+	// .log off 在最近窗口之前，窗口内的 off 段会被误当成 on 段补录；
+	// 反过来 off 起点任务也会漏掉窗口之前开始的 on 段。
+	allMissing := make([]*Message, 0)
+	hist := logGapLifecycleInfo{finalOn: !t.discoverFromOff}
+	stateOn := !t.discoverFromOff
+	if total := t.toSeq - t.fromSeq - 1; total > logGapFillMaxMessages {
+		t.dice.Logger.Infof("日志缺口较大(共%d条)，按%d条一段分段扫描: 群=%s",
+			total, logGapFillMaxMessages, t.group.GroupID)
 	}
-
-	missing := t.filterMissing(msgs)
-	// 先按历史 .log off/.log on 重建 on/off 区间，再做“已落库”去重。
-	// 顺序不能反：如果某条 .log off 在之前失败的补录里已经写入数据库，
-	// 去重会把它从列表里删掉；但它仍必须参与状态推断，否则后面的 off 段
-	// 会被误当成 on 段补进来。
-	filteredAll, hist := t.filterHistoricalLogOffOn(missing, !t.discoverFromOff)
-	// 必须总是使用过滤结果：startOn=false 且没有 .log on 时过滤结果为空，
-	// 不能退回原始 missing，否则 off 段会被全部补进去。
-	missing = filteredAll
-	missing, dedupeOK := t.filterAlreadyLogged(missing)
-	if !dedupeOK {
-		// 去重查询失败不能当成“没有缺失消息”清掉 pending：否则一次 READ
-		// 库抖动就会让这段缺口永久丢失。保留 pending，按 2 分钟退避重试。
-		t.group.deferLogGapRetry(logGapFillRetryBackoff)
-		return
+	for curFrom := t.fromSeq; curFrom < t.toSeq-1; {
+		segTo := curFrom + logGapFillMaxMessages + 1
+		if segTo > t.toSeq {
+			segTo = t.toSeq
+		}
+		seg := t
+		seg.fromSeq = curFrom
+		seg.toSeq = segTo
+		msgs, err := seg.fetchHistory(fetchCtx, fetcher)
+		if err != nil {
+			t.dice.Logger.Errorf("日志补全拉取历史消息失败: 群=%s 起始seq=%d err=%v",
+				t.group.GroupID, seg.fromSeq, err)
+			// 保留 pending 区间以便之后重试，但必须退避：否则每条新消息都会
+			// 重新触发一次最长 120s 的拉取，平台历史接口持续异常时会打爆连接。
+			t.group.deferLogGapRetry(logGapFillRetryBackoff)
+			return
+		}
+		missing := seg.filterMissing(msgs)
+		// 先按历史 .log off/.log on 重建 on/off 区间，再做“已落库”去重。
+		// 顺序不能反：如果某条 .log off 在之前失败的补录里已经写入数据库，
+		// 去重会把它从列表里删掉；但它仍必须参与状态推断，否则后面的 off 段
+		// 会被误当成 on 段补进来。
+		filtered, info := seg.filterHistoricalLogOffOn(missing, stateOn)
+		filtered, dedupeOK := seg.filterAlreadyLogged(filtered)
+		if !dedupeOK {
+			// 去重查询失败不能当成“没有缺失消息”清掉 pending：否则一次 READ
+			// 库抖动就会让这段缺口永久丢失。保留 pending，按 2 分钟退避重试。
+			t.group.deferLogGapRetry(logGapFillRetryBackoff)
+			return
+		}
+		allMissing = append(allMissing, filtered...)
+		hist.found = hist.found || info.found
+		hist.finalOn = info.finalOn
+		stateOn = info.finalOn
+		if info.stopped {
+			hist.stopped = true
+			hist.unsupported = info.unsupported
+			break
+		}
+		if len(msgs) == 0 {
+			// 平台没有返回更多历史：继续翻页只会空转。
+			break
+		}
+		curFrom = segTo - 1
 	}
+	missing := allMissing
 
 	if t.discoverFromOff {
+		if t.backfillOnly {
+			t.runOffBackfillOnly(missing, hist)
+			return
+		}
 		t.runOffDiscovery(missing, hist)
 		return
 	}
@@ -2162,8 +2398,19 @@ func (t logGapFillTask) run() {
 	done := true
 	if forceLogOnly || !t.logStateStillValid() {
 		// 拉取/排队期间已经 .log off/.bot off，或历史 .log off/.log on
-		// 推断要求只补日志：绝不执行历史指令，也不发“已补全”通知。
-		done = t.backfillLogOnly(missing)
+		// 推断要求只补日志：不执行历史指令，但补录完成后要告知用户。
+		appended, backfillDone := t.backfillLogOnlyCount(missing)
+		done = backfillDone
+		if appended > 0 || hist.found {
+			notice := fmt.Sprintf("检测到seq不连贯，已补录 %d 条记录。", appended)
+			if !t.logStateStillValid() {
+				notice = fmt.Sprintf("日志已关闭，已补录关闭前的 %d 条记录。", appended)
+			}
+			if hist.stopped {
+				notice += fmt.Sprintf("\n遇到 %s 后停止补录。", hist.unsupported)
+			}
+			t.sendGroupNotice(notice)
+		}
 	} else if t.gap <= logGapFillSilentThreshold {
 		done = t.replaySilently(missing)
 	} else {
@@ -2532,6 +2779,25 @@ func (t logGapFillTask) lifecycleCommandValid(m *Message, cmdArgs *CmdArgs) bool
 	return !t.mentionsOtherUser(cmdArgs)
 }
 
+// historicalLogNameMatches 判断历史 .log on 的目标是否就是当前日志。
+// 用户的日志名可能很长，.log list 会展示 hash key，.log on <key> 在实时
+// 命令里会先解析成真实名称；历史扫描也必须用同一套解析，否则同一本日志
+// 的 key/别名会被误判成“切换到另一本日志”，导致后续 on 段不补或直接停止。
+func (t logGapFillTask) historicalLogNameMatches(name string) bool {
+	if name == "" || name == t.logName {
+		return true
+	}
+	if t.dice == nil || t.dice.DBOperator == nil || t.group == nil {
+		return false
+	}
+	resolved, err := resolveLogNameForGroup(t.dice.DBOperator, t.group.GroupID, name)
+	if err != nil {
+		// 无法确认时保守视为不匹配，宁可停止也不猜错日志。
+		return false
+	}
+	return resolved == t.logName
+}
+
 // filterHistoricalLogOffOn 按历史 .log off/.log on 重建 on/off 区间，
 // 只保留“发送时日志应处于 on”的消息。
 //
@@ -2596,7 +2862,7 @@ func (t logGapFillTask) filterHistoricalLogOffOn(msgs []*Message, startOn bool) 
 				filtered = append(filtered, m)
 				continue
 			}
-			if name != "" && name != t.logName {
+			if name != "" && !t.historicalLogNameMatches(name) {
 				// 切换到另一本日志，当前任务无法把后续消息写进正确的日志。
 				info.stopped = true
 				info.unsupported = "log on " + name
@@ -2670,7 +2936,7 @@ func (t logGapFillTask) decideHistoricalLogState(info logGapLifecycleInfo) logGa
 	case "off":
 		finalOn = false
 	case "on":
-		if !stateBefore && triggerName != "" && triggerName != t.logName {
+		if !stateBefore && triggerName != "" && !t.historicalLogNameMatches(triggerName) {
 			d.stopped = true
 			d.reason = "log on " + triggerName
 			d.forceLogOnly = true
@@ -2747,7 +3013,7 @@ func (t logGapFillTask) decideOffDiscovery(info logGapLifecycleInfo) logOffDisco
 		d.triggerShouldLog = stateBefore
 		d.adoptLiveOn = false
 	case "on":
-		if !stateBefore && triggerName != "" && triggerName != t.logName {
+		if !stateBefore && triggerName != "" && !t.historicalLogNameMatches(triggerName) {
 			d.stopped = true
 			d.reason = "log on " + triggerName
 			d.triggerShouldLog = false
@@ -2778,6 +3044,11 @@ func (t logGapFillTask) adoptHistoricalLogOn() bool {
 	if g == nil || t.toSeq <= 0 || t.dice == nil {
 		return false
 	}
+	// 群已经失活（.bot off）或用户明确 .log off 时绝不能再打开日志。
+	// 调用方通常已经拦截；这里作为最后一道防线，防止交接间隙的状态覆盖。
+	if !g.IsActiveRaw() || g.logOffRequested() {
+		return false
+	}
 	var rawID interface{}
 	msgID := ""
 	if t.trigger != nil {
@@ -2805,6 +3076,7 @@ func (t logGapFillTask) adoptHistoricalLogOn() bool {
 	g.LogSeqBaselineMsgID = msgID
 	g.LogSeenSeq = 0
 	g.LogGapPendingFrom, g.LogGapPendingTo = 0, 0
+	g.LogGapPendingOffDiscovery = false
 	g.logGapRetryAt.Store(0)
 	g.logSelfSent = 0
 	g.logSeqRegressCount = 0
@@ -2813,8 +3085,50 @@ func (t logGapFillTask) adoptHistoricalLogOn() bool {
 	g.logSeqMu.Unlock()
 	g.logWriteMu.Unlock()
 	g.clearLogOffGapAuth()
+	g.clearLogOffRequested()
+	g.logAutoResumedAt.Store(time.Now().Unix())
 	g.MarkDirty(t.dice)
 	return true
+}
+
+// sendGroupNotice 向群内补发一条异步任务结果提示。任务可能在重连后运行，
+// 发送失败只记日志，不影响补录状态。
+func (t logGapFillTask) sendGroupNotice(text string) {
+	if text == "" || t.group == nil || t.endpoint == nil || t.dice == nil {
+		return
+	}
+	mctx := &MsgContext{
+		Group:    t.group,
+		EndPoint: t.endpoint,
+		Dice:     t.dice,
+		Session:  t.endpoint.Session,
+	}
+	ReplyToSenderRaw(mctx, &Message{
+		MessageType: "group",
+		GroupID:     t.group.GroupID,
+		Platform:    t.endpoint.Platform,
+	}, text, "skip")
+}
+
+// offDiscoveryNotice 生成 off 状态历史发现任务的用户提示。
+func (t logGapFillTask) offDiscoveryNotice(appended int, finalOn, paused, stopped bool) string {
+	var b strings.Builder
+	b.WriteString("检测到离线期间的日志记录")
+	if appended > 0 {
+		_, _ = fmt.Fprintf(&b, "，已补录 %d 条", appended)
+	}
+	switch {
+	case paused:
+		b.WriteString("。日志保持关闭，.bot on 后自动恢复记录。")
+	case finalOn:
+		b.WriteString("。日志已恢复记录。")
+	default:
+		b.WriteString("。日志保持关闭。")
+	}
+	if stopped {
+		b.WriteString("\n离线期间有 .log new/end/halt 或切换日志，之后未继续补录。")
+	}
+	return b.String()
 }
 
 // runOffDiscovery 处理 live 日志关闭期间的历史 .log on 发现任务：
@@ -2830,10 +3144,14 @@ func (t logGapFillTask) runOffDiscovery(missing []*Message, hist logGapLifecycle
 			t.group.GroupID, d.reason)
 	}
 
+	appended := 0
 	if len(missing) > 0 {
-		_ = t.backfillLogOnly(missing)
+		appended, _ = t.backfillLogOnlyCount(missing)
 	}
-	if d.triggerShouldLog && t.trigger != nil && t.logFillWritable() {
+	// 群已经被 .bot off/.log off 关闭时，触发消息本身不应再写进日志：
+	// 实时处理器看到的是关闭状态，写进去会制造一条本不该存在的行。
+	triggerAppended := false
+	if d.triggerShouldLog && t.trigger != nil && t.logFillWritable() && t.group.IsActiveRaw() {
 		item := t.logItem(t.trigger)
 		mctx := &MsgContext{Group: t.group, EndPoint: t.endpoint, Dice: t.dice}
 		mctx.SuppressLogSizeNotice = true
@@ -2844,6 +3162,9 @@ func (t logGapFillTask) runOffDiscovery(missing []*Message, hist logGapLifecycle
 		})
 		if !ran || !appendedOK {
 			t.group.markLogGapWriteFailure()
+		} else {
+			appended++
+			triggerAppended = true
 		}
 	}
 
@@ -2861,12 +3182,52 @@ func (t logGapFillTask) runOffDiscovery(missing []*Message, hist logGapLifecycle
 	if d.stopped {
 		t.group.advanceLogSeenSeq(t.dice, t.toSeq)
 		t.group.clearLogGapPendingIfIdle(t.dice)
+		if hist.found || appended > 0 {
+			t.sendGroupNotice(t.offDiscoveryNotice(appended, false, false, true))
+		}
+		return
+	}
+	// 用户明确 .log off：即使历史里有 .log on，也不能在任务结束时恢复。
+	// logOffForUserAtSeq 在 live 日志已经关闭时不会改字段，但会留下这个标记。
+	if t.group.logOffRequested() {
+		t.group.advanceLogSeenSeq(t.dice, t.toSeq)
+		t.group.clearLogGapPendingIfIdle(t.dice)
+		if hist.found || appended > 0 {
+			t.sendGroupNotice(t.offDiscoveryNotice(appended, false, false, false))
+		}
+		return
+	}
+	// 群已经失活（典型是 .bot off）：不要重新打开日志，否则 bot off 期间
+	// 日志会保持 on，.bot on 后还会把关闭期间的消息当成缺口补进来。
+	// 这里保留“由 bot off 暂停”的标记，让下一次 .bot on 按原语义自动恢复。
+	if d.finalOn && d.adoptLiveOn && !t.group.IsActiveRaw() {
+		paused := t.group.setLogPausedByBotOff()
+		if paused {
+			t.group.MarkDirty(t.dice)
+		}
+		t.group.advanceLogSeenSeq(t.dice, t.toSeq)
+		t.group.clearLogGapPendingIfIdle(t.dice)
+		if hist.found || appended > 0 || paused {
+			t.sendGroupNotice(t.offDiscoveryNotice(appended, false, paused, false))
+		}
 		return
 	}
 	if d.finalOn && d.adoptLiveOn {
 		if t.adoptHistoricalLogOn() {
 			t.group.clearLogGapPendingIfIdle(t.dice)
 			t.dice.Logger.Infof("日志补全按历史 .log on 恢复记录: 群=%s seq=%d", t.group.GroupID, t.toSeq)
+			if hist.found || appended > 0 || triggerAppended {
+				t.sendGroupNotice(t.offDiscoveryNotice(appended, true, false, false))
+			}
+			return
+		}
+		// adopt 与实时 .log off 的交接间隙：用户已明确要求关闭，按最终 off 收尾。
+		if t.group.logOffRequested() {
+			t.group.advanceLogSeenSeq(t.dice, t.toSeq)
+			t.group.clearLogGapPendingIfIdle(t.dice)
+			if hist.found || appended > 0 {
+				t.sendGroupNotice(t.offDiscoveryNotice(appended, false, false, false))
+			}
 			return
 		}
 		if !t.logHistoricalDiscoveryAllowed() {
@@ -2879,6 +3240,45 @@ func (t logGapFillTask) runOffDiscovery(missing []*Message, hist logGapLifecycle
 	// 最终 off / 没有有效 .log on：保持关闭，但把已确认处理到的窗口记为已见。
 	t.group.advanceLogSeenSeq(t.dice, t.toSeq)
 	t.group.clearLogGapPendingIfIdle(t.dice)
+	if hist.found || appended > 0 {
+		t.sendGroupNotice(t.offDiscoveryNotice(appended, false, false, false))
+	}
+}
+
+// runOffBackfillOnly 处理“实时 .log on 已经先把 live 日志打开”的历史补录
+// 任务：只把 (fromSeq,toSeq) 之间确认的 on 段写进当前日志，不写触发消息、
+// 不改变 live 状态、不 adopt。这样实时处理器先执行时，离线 on 段不会
+// 因 epoch 变化被一并取消。
+func (t logGapFillTask) runOffBackfillOnly(missing []*Message, hist logGapLifecycleInfo) {
+	t.group.beginLogGapWriteTracking()
+	appended := 0
+	if len(missing) > 0 {
+		appended, _ = t.backfillLogOnlyCount(missing)
+	}
+	if t.group.hasPendingLogGapTask() {
+		// 后续任务会处理更大的窗口；不在这里清 pending。
+		return
+	}
+	if !t.logOffDiscoveryBackfillAllowed() {
+		t.dice.Logger.Infof("日志补全(实时 .log on 后历史补录)已取消: 群=%s 记录=%s 日志已切换", t.group.GroupID, t.logName)
+		t.group.clearLogGapPendingIfIdle(t.dice)
+		return
+	}
+	if !t.group.logGapWritesOK() {
+		t.dice.Logger.Warnf("日志补全(实时 .log on 后历史补录)写入失败，保留 pending 并退避: 群=%s 记录=%s",
+			t.group.GroupID, t.logName)
+		t.group.deferLogGapRetry(logGapFillRetryBackoff)
+		return
+	}
+	t.group.clearLogGapPendingIfIdle(t.dice)
+	t.dice.Logger.Infof("日志补全完成(实时 .log on 后历史补录): 群=%s 补录=%d条", t.group.GroupID, appended)
+	if appended > 0 || hist.found {
+		t.sendGroupNotice(fmt.Sprintf("检测到离线期间的 .log on，已补录 %d 条记录。", appended))
+	} else {
+		// 实时 .log on 的回复已经承诺“完成后会通知”，即使没有可补的
+		// on 段也要给一个收尾提示。
+		t.sendGroupNotice("离线期间的记录补录完成，没有需要补录的 on 段。")
+	}
 }
 
 // deleteTriggerRow 删除实时路径已经写入、但按历史状态本不该记录的第一条
@@ -3012,6 +3412,11 @@ func (t logGapFillTask) replaySilently(missing []*Message) bool {
 		return true
 	}
 	t.dice.Logger.Infof("日志补全完成(静默重放): 群=%s 重放=%d条 仅补日志=%d条", t.group.GroupID, executed, skipped)
+	if len(missing) > 0 {
+		// 小缺口过去是静默重放；按“发现掉线并补全要告知用户”的要求，
+		// 补完之后补一条简短汇总（重放指令自身的回复仍会单独发出）。
+		t.sendGroupNotice(fmt.Sprintf("检测到seq不连贯，已补全 %d 条遗漏消息。", len(missing)))
+	}
 	return true
 }
 
@@ -3019,6 +3424,13 @@ func (t logGapFillTask) replaySilently(missing []*Message) bool {
 // 也不发“已补全”通知。用于 .log off/.bot off 已经关闭日志、但任务持有
 // off 前窗口授权的场景。
 func (t logGapFillTask) backfillLogOnly(missing []*Message) bool {
+	_, done := t.backfillLogOnlyCount(missing)
+	return done
+}
+
+// backfillLogOnlyCount 是 backfillLogOnly 的计数版本，供需要向用户汇报
+// 补录条数的场景使用。
+func (t logGapFillTask) backfillLogOnlyCount(missing []*Message) (appended int, done bool) {
 	mctx := &MsgContext{
 		Group:    t.group,
 		EndPoint: t.endpoint,
@@ -3027,7 +3439,6 @@ func (t logGapFillTask) backfillLogOnly(missing []*Message) bool {
 	mctx.SuppressLogSizeNotice = true
 	mctx.SuppressLogAppendFailureNotice = true
 
-	appended := 0
 	processed := t.forEachMissing(missing, func(m *Message) {
 		item := t.logItem(m)
 		appendedOK := false
@@ -3044,11 +3455,11 @@ func (t logGapFillTask) backfillLogOnly(missing []*Message) bool {
 	if processed < len(missing) {
 		t.dice.Logger.Warnf("日志补全中止(off 前窗口): 群=%s 已补录=%d条 剩余=%d条",
 			t.group.GroupID, appended, len(missing)-processed)
-		return true
+		return appended, true
 	}
 	t.dice.Logger.Infof("日志补全完成(off 前窗口，仅补日志): 群=%s 补录=%d条",
 		t.group.GroupID, appended)
-	return true
+	return appended, true
 }
 
 func (t logGapFillTask) isDeniedReplayCommand(m *Message) bool {
