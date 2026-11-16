@@ -2292,22 +2292,19 @@ func (t logGapFillTask) parseLogLifecycleCommand(m *Message) (kind, name string,
 	return "", "", nil
 }
 
-// parseUnsupportedLogLifecycleCommand 识别本轮不模拟、但会影响日志状态/
-// 日志归属的命令：.log new/end/halt、.bot off/on、.ext off/on log。
-// 命中后补录在命令处停止，避免猜错日志名/机器人/扩展状态。
+// parseUnsupportedLogLifecycleCommand 识别本轮不模拟、但会影响日志归属/
+// 日志扩展状态的命令：.log new/end/halt、.ext off/on log。
+//
+// 1115.fix7 起不再把 .bot off/.bot on 当作边界：核心离线期间这些命令
+// 没有被执行，不可能暂停/恢复日志，也不会改变群激活状态；它们只是发过但
+// 未被处理的消息，因此按普通消息处理，不改变日志状态、不停止扫描、不影响
+// live。这样本次 2000 条窗口里的 .log off/.log on 都能被看到。
 func (t logGapFillTask) parseUnsupportedLogLifecycleCommand(m *Message) (kind string, cmdArgs *CmdArgs, privilegedRequired bool) {
 	if t.dice == nil || m == nil {
 		return "", nil, false
 	}
 	if kind, _, ca := t.parseLogLifecycleCommand(m); kind == "new" || kind == "end" || kind == "halt" {
 		return "log " + kind, ca, false
-	}
-	if ca := CommandParse(m.Message, []string{"bot"}, t.dice.CommandPrefix, m.Platform, false); ca != nil &&
-		strings.EqualFold(ca.Command, "bot") {
-		switch strings.ToLower(ca.GetArgN(1)) {
-		case "off", "on":
-			return "bot " + strings.ToLower(ca.GetArgN(1)), ca, true
-		}
 	}
 	if ca := CommandParse(m.Message, []string{"ext"}, t.dice.CommandPrefix, m.Platform, false); ca != nil &&
 		strings.EqualFold(ca.Command, "ext") {
@@ -2328,6 +2325,26 @@ func (t logGapFillTask) parseUnsupportedLogLifecycleCommand(m *Message) (kind st
 		}
 	}
 	return "", nil, false
+}
+
+// parseBotLifecycleCommand 识别实时触发消息本身是不是 .bot off/.bot on。
+// 历史缺口里的 .bot 命令按普通消息忽略；但实时触发消息会由真实 .bot 命令
+// 处理器负责，历史补录决策不能抢先删除/关闭它。
+func (t logGapFillTask) parseBotLifecycleCommand(m *Message) (kind, botNum string, cmdArgs *CmdArgs) {
+	if t.dice == nil || m == nil {
+		return "", "", nil
+	}
+	ca := CommandParse(m.Message, []string{"bot"}, t.dice.CommandPrefix, m.Platform, false)
+	if ca == nil || !strings.EqualFold(ca.Command, "bot") {
+		return "", "", nil
+	}
+	switch strings.ToLower(ca.GetArgN(1)) {
+	case "off":
+		return "off", ca.GetArgN(2), ca
+	case "on":
+		return "on", ca.GetArgN(2), ca
+	}
+	return "", "", nil
 }
 
 // mentionsOtherUser 判断历史消息是否 @ 了当前骰子以外的人。
@@ -2493,6 +2510,22 @@ func (t logGapFillTask) decideHistoricalLogState(info logGapLifecycleInfo) logGa
 		triggerKind, triggerName = "", ""
 	}
 	if triggerKind == "" {
+		if botKind, botNum, botCA := t.parseBotLifecycleCommand(t.trigger); botKind != "" {
+			// 实时触发消息是 .bot off/.bot on：由真实命令处理器负责。
+			// 历史补录只按 .log off/.log on 过滤缺口，不抢先删行/关日志。
+			targetsCurrent := t.endpoint != nil &&
+				(len(botNum) < 4 || strings.HasSuffix(t.endpoint.UserID, botNum))
+			if targetsCurrent &&
+				t.trigger != nil && t.trigger.MessageType != "private" &&
+				(t.dice == nil || !t.dice.Config.IgnoreUnaddressedBotCmd || len(botCA.At) > 0) &&
+				t.isHistoricalPrivilegedSender(t.trigger) &&
+				t.lifecycleCommandValid(t.trigger, botCA) {
+				d.stopped = true
+				d.reason = "live bot " + botKind
+				d.forceLogOnly = true
+				return d
+			}
+		}
 		if unsup, ca, needPriv := t.parseUnsupportedLogLifecycleCommand(t.trigger); unsup != "" {
 			privileged := !needPriv || t.isHistoricalPrivilegedSender(t.trigger)
 			if privileged && t.lifecycleCommandValid(t.trigger, ca) {
