@@ -386,7 +386,8 @@ func TestHistoricalLogOffMentionOtherIgnored_1115fix6(t *testing.T) {
 }
 
 // TestHistoricalUnsupportedLifecycleParse_1115fix6 锁定停止边界的识别：
-// .log new/end/halt、.bot off/on、.ext off/on log 会停止推断；无关扩展不停止。
+// .log new/end/halt、.ext off/on log 会停止推断；.bot off/on 自 1115.fix7
+// 起完全按普通消息处理，不再停止；无关扩展也不停止。
 func TestHistoricalUnsupportedLifecycleParse_1115fix6(t *testing.T) {
 	task := logGapFillTask{
 		dice:     &Dice{CommandPrefix: []string{"!", ".", "。", "/"}},
@@ -402,8 +403,8 @@ func TestHistoricalUnsupportedLifecycleParse_1115fix6(t *testing.T) {
 		{".log new run-b", "log new", false},
 		{".log end", "log end", false},
 		{".log halt", "log halt", false},
-		{".bot off", "bot off", true},
-		{".bot on", "bot on", true},
+		{".bot off", "", false},
+		{".bot on", "", false},
 		{".ext off log", "ext off log", true},
 		{".ext on log", "ext on log", true},
 		{".ext off all", "ext off all", true},
