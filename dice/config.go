@@ -2503,6 +2503,16 @@ func (d *Dice) loadGroups() {
 				// 失败则保持未校准，由 ext_log 的 calibrateLogSeqBaseline 重试。
 				groupInfo.markLogSeqCalibrated()
 			}
+		} else if !groupInfo.LogOn && groupInfo.LogCurID > 0 && groupInfo.LogCurName != "" {
+			// 日志关闭但保留了日志名：同样用 DB MAX(seq) 校准“最后记录到哪”，
+			// 供 off 状态断层检测使用。LogSeenSeq 可能比 DB MAX 新（关闭期间
+			// 看到过消息），但那是运行时/持久化的已见游标，不覆盖它。
+			if seq, err := service.LogGetLastSeq(d.DBOperator, groupInfo.LogCurID); err == nil {
+				if seq > 0 {
+					groupInfo.advanceLogSeq(seq, nil)
+				}
+				groupInfo.markLogSeqCalibrated()
+			}
 		}
 
 		var toDelete []string

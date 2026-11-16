@@ -249,6 +249,11 @@ type GroupInfo struct {
 	// 用这段区间在下次收到消息时把内存基线压回起点，重新触发补全。
 	LogGapPendingFrom int64 `json:"logGapPendingFrom,omitempty" yaml:"logGapPendingFrom,omitempty"`
 	LogGapPendingTo   int64 `json:"logGapPendingTo,omitempty"   yaml:"logGapPendingTo,omitempty"`
+	// LogSeenSeq 是“live 日志关闭期间核心最后看到的群消息 seq”。
+	// 用于 off 状态断层检测：核心离线后第一条消息的 seq 会跳过这段时间，
+	// 从 LogSeenSeq 开始拉历史，以 off 为起点扫描 .log on/.log off。
+	// 进程重启后仍能知道离线前看到了哪里；0 表示尚未建立。
+	LogSeenSeq int64 `json:"logSeenSeq,omitempty" yaml:"logSeenSeq,omitempty"`
 }
 
 // noteLogSelfSent 记录一条骰子自身的群内发言。
@@ -287,6 +292,60 @@ func (g *GroupInfo) advanceLogSeq(seq int64, rawID interface{}) {
 		g.logLastMsgID = rawID
 		g.logSelfSent = 0
 	}
+}
+
+// logSeenSeqSnapshot 读取 live 日志关闭期间最后看到的群消息 seq。
+func (g *GroupInfo) logSeenSeqSnapshot() int64 {
+	if g == nil {
+		return 0
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	return g.LogSeenSeq
+}
+
+// setLogSeenSeq 只在前进时更新已见 seq；调用方负责 MarkDirty。
+func (g *GroupInfo) setLogSeenSeq(seq int64) bool {
+	if g == nil || seq <= 0 {
+		return false
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	if seq <= g.LogSeenSeq {
+		return false
+	}
+	g.LogSeenSeq = seq
+	return true
+}
+
+// advanceLogSeenSeq 更新已见 seq 并持久化脏标记。
+func (g *GroupInfo) advanceLogSeenSeq(d *Dice, seq int64) {
+	if g == nil || seq <= 0 {
+		return
+	}
+	if g.setLogSeenSeq(seq) && d != nil {
+		g.MarkDirty(d)
+	}
+}
+
+// clearLogSeenSeq 清除已见 seq。日志重新开启/切换/结束时不再需要。
+func (g *GroupInfo) clearLogSeenSeq() {
+	if g == nil {
+		return
+	}
+	g.logSeqMu.Lock()
+	g.LogSeenSeq = 0
+	g.logSeqMu.Unlock()
+}
+
+// logLastSeqSnapshot 读取内存中的上条已记录/已处理 seq。
+func (g *GroupInfo) logLastSeqSnapshot() int64 {
+	if g == nil {
+		return 0
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	return g.logLastSeq
 }
 
 // setLogGapPendingRange 记录尚未完成的补全区间（seq 开区间）。
@@ -369,6 +428,18 @@ func (g *GroupInfo) clearLogGapPendingRange() bool {
 	return changed
 }
 
+// hasPendingLogGapTask 报告队列里是否已有合并进来的后续任务。
+// off 状态历史发现任务据此决定：先让 worker 继续处理更大窗口，暂不推进
+// LogSeenSeq/恢复 live，避免后续缺口被 live 恢复后的 epoch 变化吞掉。
+func (g *GroupInfo) hasPendingLogGapTask() bool {
+	if g == nil {
+		return false
+	}
+	g.logGapQueueMu.Lock()
+	defer g.logGapQueueMu.Unlock()
+	return g.logGapPending != nil
+}
+
 // clearLogGapPendingIfIdle 在一个任务结束时清除持久化的补全区间。
 // 调用方是 worker 里的 run()，此时 logGapWorkerRunning 必为 true，不能拿它
 // 判断“空闲”；只要没有新合并进来的 pending 任务，就清除已完成/已取消的区间。
@@ -402,6 +473,7 @@ func (g *GroupInfo) cancelLogGapFill() {
 	}
 	g.clearLogGapPendingRange()
 	g.clearLogOffGapAuth()
+	g.clearLogSeenSeq()
 	g.logEpoch.Add(1)
 }
 
@@ -518,6 +590,7 @@ func (g *GroupInfo) resetLogSeq(seq int64, rawID interface{}) {
 	g.logEpoch.Add(1)
 	g.logSeqMu.Unlock()
 	g.clearLogOffGapAuth()
+	g.clearLogSeenSeq()
 }
 
 // initLogSeqFromPersisted 在群数据加载完成后恢复持久基线。
@@ -639,6 +712,7 @@ func (g *GroupInfo) resetLogSeqBaseline() {
 	g.logEpoch.Add(1)
 	g.logSeqMu.Unlock()
 	g.clearLogOffGapAuth()
+	g.clearLogSeenSeq()
 }
 
 // beginLogGapFillWindow 进入静默重放：窗口内的消息在日志里标记为补录。
@@ -957,7 +1031,7 @@ func (g *GroupInfo) withLogGapFillWrite(t logGapFillTask, fn func()) bool {
 	if !sameLog {
 		return false
 	}
-	if !on && !t.logOffGapFillAllowed() {
+	if !on && !t.logOffGapFillAllowed() && !t.logHistoricalDiscoveryAllowed() {
 		return false
 	}
 	fn()
@@ -989,6 +1063,7 @@ func (g *GroupInfo) ClearLogState() {
 	g.LogOn = false
 	g.logStateMu.Unlock()
 	g.clearLogOffGapAuth()
+	g.clearLogSeenSeq()
 }
 
 func (group *GroupInfo) IsActive(ctx *MsgContext) bool {
