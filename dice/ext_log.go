@@ -1376,6 +1376,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 								toSeq:     msg.Seq,
 								gap:       gap,
 								lastMsgID: lastMsgID,
+								trigger:   msg,
 							}
 							// 队列化：同一群只跑一个 worker，相邻断层合并，避免抖动时
 							// 每个断层一个 goroutine 排队、越补越晚。
@@ -1747,6 +1748,9 @@ type logGapFillTask struct {
 	toSeq     int64
 	gap       int64 // 已扣除骰子自身发言的净遗漏条数，仅用于阈值判定，不可当作拉取条数
 	lastMsgID interface{}
+	// trigger 是触发本任务的实时消息（toSeq 对应它）。历史 .log off/.log on
+	// 过滤后，需要用它判断“实时路径是否已经把不该记录的第一条消息写进日志”。
+	trigger *Message
 }
 
 // logStateStillValid 校验补全任务对应的日志仍是该群当前开启的日志。
@@ -1851,6 +1855,10 @@ func (g *GroupInfo) mergeLogGapTask(task logGapFillTask) bool {
 		if task.toSeq > pending.toSeq {
 			pending.toSeq = task.toSeq
 			pending.gap += task.gap
+			// toSeq 最大的任务对应最新的实时触发消息。
+			pending.trigger = task.trigger
+		} else if pending.trigger == nil {
+			pending.trigger = task.trigger
 		}
 		// 重连后 endpoint 可能已更换，总是使用最新任务的状态。
 		pending.endpoint = task.endpoint
@@ -1952,6 +1960,14 @@ func (t logGapFillTask) run() {
 	}
 
 	missing := t.filterMissing(msgs)
+	// 先按历史 .log off/.log on 重建 on/off 区间，再做“已落库”去重。
+	// 顺序不能反：如果某条 .log off 在之前失败的补录里已经写入数据库，
+	// 去重会把它从列表里删掉；但它仍必须参与状态推断，否则后面的 off 段
+	// 会被误当成 on 段补进来。
+	filteredAll, hist := t.filterHistoricalLogOffOn(missing)
+	if hist.found {
+		missing = filteredAll
+	}
 	missing, dedupeOK := t.filterAlreadyLogged(missing)
 	if !dedupeOK {
 		// 去重查询失败不能当成“没有缺失消息”清掉 pending：否则一次 READ
@@ -1959,6 +1975,47 @@ func (t logGapFillTask) run() {
 		t.group.deferLogGapRetry(logGapFillRetryBackoff)
 		return
 	}
+
+	forceLogOnly := false
+	if hist.found {
+		if hist.stopped {
+			forceLogOnly = true
+			t.dice.Logger.Warnf("日志补全历史状态推断已停止: 群=%s 命令=%s，后续缺口不补",
+				t.group.GroupID, hist.unsupported)
+		} else if t.logStateStillValid() {
+			decision := t.decideHistoricalLogState(hist)
+			if decision.stopped {
+				forceLogOnly = true
+				t.dice.Logger.Warnf("日志补全历史状态推断已停止: 群=%s 命令=%s，后续缺口不补",
+					t.group.GroupID, decision.reason)
+			} else {
+				if decision.deleteTrigger {
+					t.deleteTriggerRow()
+				}
+				if decision.applyLiveOff {
+					if _, ok := t.group.logOffForUserAtSeq(t.toSeq); ok {
+						t.group.MarkDirty(t.dice)
+						t.dice.Logger.Infof("日志补全按历史 .log off 关闭当前日志: 群=%s seq=%d",
+							t.group.GroupID, t.toSeq)
+					}
+				}
+				forceLogOnly = decision.forceLogOnly
+			}
+		} else {
+			// live 已被 .log off/.bot off 关闭，当前任务走 off 前窗口授权；
+			// 只需要用过滤后的消息列表，不再改 live 状态。
+			forceLogOnly = true
+			// 历史缺口已经处于 off，实时再收到的 .log off 只是重复命令：
+			// 它不该被记录，但实时路径在本地仍认为 on 时会先写进去。
+			if !hist.finalOn {
+				if kind, _, ca := t.parseLogLifecycleCommand(t.trigger); kind == "off" &&
+					t.lifecycleCommandValid(t.trigger, ca) {
+					t.deleteTriggerRow()
+				}
+			}
+		}
+	}
+
 	if len(missing) == 0 {
 		t.dice.Logger.Infof("日志补全无需处理: 群=%s 缺失区间内没有需要补录的他人发言", t.group.GroupID)
 		t.group.clearLogGapPendingIfIdle(t.dice)
@@ -1977,9 +2034,9 @@ func (t logGapFillTask) run() {
 	// 写入侧短暂故障（磁盘满、锁超时、只读库）恢复后，这段缺口仍应可重试。
 	t.group.beginLogGapWriteTracking()
 	done := true
-	if !t.logStateStillValid() {
-		// 拉取/排队期间已经 .log off/.bot off：只补日志，绝不执行历史指令，
-		// 也不发“已补全”通知。
+	if forceLogOnly || !t.logStateStillValid() {
+		// 拉取/排队期间已经 .log off/.bot off，或历史 .log off/.log on
+		// 推断要求只补日志：绝不执行历史指令，也不发“已补全”通知。
 		done = t.backfillLogOnly(missing)
 	} else if t.gap <= logGapFillSilentThreshold {
 		done = t.replaySilently(missing)
@@ -2200,6 +2257,300 @@ func (t logGapFillTask) filterAlreadyLogged(msgs []*Message) ([]*Message, bool) 
 		filtered = append(filtered, m)
 	}
 	return filtered, true
+}
+
+// logGapLifecycleInfo 是缺口内历史 .log off/.log on 扫描结果。
+type logGapLifecycleInfo struct {
+	found       bool
+	finalOn     bool
+	stopped     bool
+	unsupported string
+}
+
+// parseLogLifecycleCommand 用真实命令解析器识别 .log off/.log on/.log new/
+// .log end/.log halt。只解析语法，不执行命令。
+func (t logGapFillTask) parseLogLifecycleCommand(m *Message) (kind, name string, cmdArgs *CmdArgs) {
+	if t.dice == nil || m == nil {
+		return "", "", nil
+	}
+	ca := CommandParse(m.Message, []string{"log"}, t.dice.CommandPrefix, m.Platform, false)
+	if ca == nil || !strings.EqualFold(ca.Command, "log") {
+		return "", "", nil
+	}
+	switch strings.ToLower(ca.GetArgN(1)) {
+	case "off":
+		return "off", "", ca
+	case "on":
+		return "on", ca.GetArgN(2), ca
+	case "new":
+		return "new", ca.GetArgN(2), ca
+	case "end":
+		return "end", "", ca
+	case "halt":
+		return "halt", "", ca
+	}
+	return "", "", nil
+}
+
+// parseUnsupportedLogLifecycleCommand 识别本轮不模拟、但会影响日志状态/
+// 日志归属的命令：.log new/end/halt、.bot off/on、.ext off/on log。
+// 命中后补录在命令处停止，避免猜错日志名/机器人/扩展状态。
+func (t logGapFillTask) parseUnsupportedLogLifecycleCommand(m *Message) (kind string, cmdArgs *CmdArgs, privilegedRequired bool) {
+	if t.dice == nil || m == nil {
+		return "", nil, false
+	}
+	if kind, _, ca := t.parseLogLifecycleCommand(m); kind == "new" || kind == "end" || kind == "halt" {
+		return "log " + kind, ca, false
+	}
+	if ca := CommandParse(m.Message, []string{"bot"}, t.dice.CommandPrefix, m.Platform, false); ca != nil &&
+		strings.EqualFold(ca.Command, "bot") {
+		switch strings.ToLower(ca.GetArgN(1)) {
+		case "off", "on":
+			return "bot " + strings.ToLower(ca.GetArgN(1)), ca, true
+		}
+	}
+	if ca := CommandParse(m.Message, []string{"ext"}, t.dice.CommandPrefix, m.Platform, false); ca != nil &&
+		strings.EqualFold(ca.Command, "ext") {
+		switch strings.ToLower(ca.GetArgN(1)) {
+		case "off", "on":
+			for _, arg := range ca.Args[1:] {
+				name := strings.ToLower(strings.TrimSpace(arg))
+				if name == "log" {
+					return "ext " + strings.ToLower(ca.GetArgN(1)) + " log", ca, true
+				}
+				if name == "all" {
+					return "ext " + strings.ToLower(ca.GetArgN(1)) + " all", ca, true
+				}
+			}
+			if ca.GetKwarg("all") != nil {
+				return "ext " + strings.ToLower(ca.GetArgN(1)) + " all", ca, true
+			}
+		}
+	}
+	return "", nil, false
+}
+
+// mentionsOtherUser 判断历史消息是否 @ 了当前骰子以外的人。
+// @ 了别人时真实命令分发可能因 SomeoneBeMentionedButNotMe 拒绝执行，
+// 因此不能把它当成会改变日志状态的生命周期命令。
+func (t logGapFillTask) mentionsOtherUser(cmdArgs *CmdArgs) bool {
+	if cmdArgs == nil || t.endpoint == nil {
+		return false
+	}
+	botUniform := UserIDExtract(t.endpoint.UserID)
+	for _, at := range cmdArgs.At {
+		if at == nil || at.UserID == "" {
+			continue
+		}
+		if at.UserID == t.endpoint.UserID {
+			continue
+		}
+		if UserIDExtract(at.UserID) == botUniform {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// isHistoricalPrivilegedSender 近似判断历史发送者是否有权执行 .bot/.ext。
+// 历史消息没有完整 MsgContext，只能用群角色近似；不确定时宁可停止补录。
+func (t logGapFillTask) isHistoricalPrivilegedSender(m *Message) bool {
+	if t.dice == nil || t.group == nil || m == nil {
+		return false
+	}
+	if t.dice.Config.BotExtFreeSwitch || m.Platform == "QQ-CH" {
+		return true
+	}
+	if m.Sender.UserID != "" && t.dice.MasterCheck(t.group.GroupID, m.Sender.UserID) {
+		return true
+	}
+	ctx := &MsgContext{
+		Dice:        t.dice,
+		Group:       t.group,
+		MessageType: m.MessageType,
+		IsPrivate:   m.MessageType == "private",
+	}
+	if t.dice.DBOperator != nil && m.Sender.UserID != "" {
+		ctx.Player = t.group.PlayerGet(t.dice.DBOperator, m.Sender.UserID)
+	}
+	// 复用真实权限计算：群主/管理/邀请者/信任/骰主/黑名单。
+	return ctx.fillPrivilege(m) >= 40
+}
+
+// lifecycleCommandValid 判断历史生命周期命令是否可能是当前骰子执行的那一条。
+func (t logGapFillTask) lifecycleCommandValid(m *Message, cmdArgs *CmdArgs) bool {
+	if m == nil || t.endpoint == nil {
+		return false
+	}
+	if t.isBotSender(m) {
+		return false
+	}
+	return !t.mentionsOtherUser(cmdArgs)
+}
+
+// filterHistoricalLogOffOn 按历史 .log off/.log on 重建 on/off 区间，
+// 只保留“发送时日志应处于 on”的消息。
+//
+// 起点按 on 处理：缺口开始于最后一条已记录消息之后，而那一条是在日志开启时
+// 写入的。
+func (t logGapFillTask) filterHistoricalLogOffOn(msgs []*Message) ([]*Message, logGapLifecycleInfo) {
+	info := logGapLifecycleInfo{finalOn: true}
+	filtered := make([]*Message, 0, len(msgs))
+	stateOn := true
+
+	for _, m := range msgs {
+		if m == nil {
+			continue
+		}
+		if kind, ca, needPriv := t.parseUnsupportedLogLifecycleCommand(m); kind != "" {
+			if needPriv && !t.isHistoricalPrivilegedSender(m) {
+				// 没有权限的 .bot/.ext 文本不会改变日志状态，按普通消息处理。
+				if stateOn {
+					filtered = append(filtered, m)
+				}
+				continue
+			}
+			if !t.lifecycleCommandValid(m, ca) {
+				if stateOn {
+					filtered = append(filtered, m)
+				}
+				continue
+			}
+			info.found = true
+			info.stopped = true
+			info.unsupported = kind
+			if stateOn {
+				// .log new/end/halt、.bot off 等在实际执行前会先被正常
+				// OnMessageReceived 记录；保留这一行。
+				filtered = append(filtered, m)
+			}
+			info.finalOn = stateOn
+			return filtered, info
+		}
+
+		kind, name, ca := t.parseLogLifecycleCommand(m)
+		if kind == "" || !t.lifecycleCommandValid(m, ca) {
+			if stateOn {
+				filtered = append(filtered, m)
+			}
+			continue
+		}
+
+		info.found = true
+		switch kind {
+		case "off":
+			if stateOn {
+				// 实时路径在关闭执行前会记录 .log off 本身。
+				filtered = append(filtered, m)
+				stateOn = false
+			}
+		case "on":
+			if stateOn {
+				// 已经开启时 .log on 失败，但命令消息本身会被记录。
+				filtered = append(filtered, m)
+				continue
+			}
+			if name != "" && name != t.logName {
+				// 切换到另一本日志，当前任务无法把后续消息写进正确的日志。
+				info.stopped = true
+				info.unsupported = "log on " + name
+				info.finalOn = false
+				return filtered, info
+			}
+			// 关闭期间的 .log on 本身不会被记录；之后恢复记录。
+			stateOn = true
+		}
+	}
+
+	info.finalOn = stateOn
+	return filtered, info
+}
+
+// logGapHistoricalDecision 是“历史缺口 + 实时触发消息”合并后的状态决策。
+type logGapHistoricalDecision struct {
+	finalOn       bool
+	forceLogOnly  bool
+	applyLiveOff  bool
+	deleteTrigger bool
+	stopped       bool
+	reason        string
+}
+
+// decideHistoricalLogState 把缺口扫描结果与实时触发消息合并，决定：
+//   - 最终历史状态是否 on；
+//   - 是否必须只补日志（不能执行命令）；
+//   - 是否要把 live 日志关掉；
+//   - 实时路径是否已经把“历史 off 段”的首条消息写进了日志，需要删除。
+//
+// 只应在 live 日志仍开启、且缺口扫描未 stopped 时调用。
+func (t logGapFillTask) decideHistoricalLogState(info logGapLifecycleInfo) logGapHistoricalDecision {
+	d := logGapHistoricalDecision{finalOn: info.finalOn, forceLogOnly: !info.finalOn}
+	stateBefore := info.finalOn
+
+	triggerKind, triggerName, triggerCA := t.parseLogLifecycleCommand(t.trigger)
+	if triggerKind != "" && !t.lifecycleCommandValid(t.trigger, triggerCA) {
+		triggerKind, triggerName = "", ""
+	}
+	if triggerKind == "" {
+		if unsup, ca, needPriv := t.parseUnsupportedLogLifecycleCommand(t.trigger); unsup != "" {
+			privileged := !needPriv || t.isHistoricalPrivilegedSender(t.trigger)
+			if privileged && t.lifecycleCommandValid(t.trigger, ca) {
+				d.stopped = true
+				d.reason = unsup
+				d.forceLogOnly = true
+				return d
+			}
+		}
+	}
+
+	finalOn := stateBefore
+	switch triggerKind {
+	case "off":
+		finalOn = false
+	case "on":
+		if !stateBefore && triggerName != "" && triggerName != t.logName {
+			d.stopped = true
+			d.reason = "log on " + triggerName
+			d.forceLogOnly = true
+			return d
+		}
+		finalOn = true
+	case "new", "end", "halt":
+		d.stopped = true
+		d.reason = "log " + triggerKind
+		d.forceLogOnly = true
+		return d
+	}
+
+	d.finalOn = finalOn
+	if !stateBefore && t.trigger != nil {
+		// 历史状态为 off 时，实时路径本来不应该记录这条触发消息。
+		d.deleteTrigger = true
+	}
+	if !finalOn {
+		d.forceLogOnly = true
+		// 触发消息本身是 .log off 时交给实时命令处理器关闭日志，
+		// 避免我们提前关闭导致命令回复“关闭失败”。
+		if triggerKind != "off" {
+			d.applyLiveOff = true
+		}
+	}
+	return d
+}
+
+// deleteTriggerRow 删除实时路径已经写入、但按历史状态本不该记录的第一条
+// 恢复消息。只按当前 log_id + seq 精确删除，避免跨日志误删。
+func (t logGapFillTask) deleteTriggerRow() {
+	if t.group == nil || t.logID == 0 || t.toSeq <= 0 || t.dice == nil || t.dice.DBOperator == nil {
+		return
+	}
+	if err := service.LogDeleteByLogIDSeq(t.dice.DBOperator, t.logID, t.toSeq); err != nil {
+		if t.dice != nil && t.dice.Logger != nil {
+			t.dice.Logger.Warnf("日志补全纠正失败: 删除历史 off 段首条消息: 群=%s logID=%d seq=%d err=%v",
+				t.group.GroupID, t.logID, t.toSeq, err)
+		}
+	}
 }
 
 // lookupPlayerName 读取玩家在本群的标注名（角色名/名片）。

@@ -916,6 +916,31 @@ func LogMarkDeleteByMsgID(operator engine2.DatabaseOperator, groupID string, log
 	return err
 }
 
+// LogDeleteByLogIDSeq 删除指定日志中 seq 对应的一行（历史补录纠正用）。
+// 只按 log_id + seq 精确删除，不做跨日志的 raw_msg_id 反查，避免误删同名消息。
+func LogDeleteByLogIDSeq(operator engine2.DatabaseOperator, logID uint64, seq int64) error {
+	if logID == 0 || seq <= 0 {
+		return nil
+	}
+	// 与实时/补录写入串行，避免删除后并发补写又把同一行插回来。
+	logAppendDedupeMu.Lock()
+	defer logAppendDedupeMu.Unlock()
+	db := operator.GetLogDB(constant.WRITE)
+	return db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Where("log_id = ? AND seq = ?", logID, seq).Delete(&model.LogOneItem{})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return nil
+		}
+		return tx.Model(&model.LogInfo{}).Where("id = ?", logID).Updates(map[string]interface{}{
+			"updated_at": time.Now().Unix(),
+			"size":       gorm.Expr("COALESCE(size, 0) - ?", res.RowsAffected),
+		}).Error
+	})
+}
+
 // LogMarkDeleteByRawMsgID 根据消息 ID 反查所属日志并删除，避免依赖当前日志名。
 func LogMarkDeleteByRawMsgID(operator engine2.DatabaseOperator, groupID string, rawID interface{}) error {
 	db := operator.GetLogDB(constant.WRITE)
