@@ -1376,7 +1376,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 								toSeq:     msg.Seq,
 								gap:       gap,
 								lastMsgID: lastMsgID,
-								trigger:   msg,
+								trigger:   cloneGapTriggerMessage(msg),
 							}
 							// 队列化：同一群只跑一个 worker，相邻断层合并，避免抖动时
 							// 每个断层一个 goroutine 排队、越补越晚。
@@ -1734,6 +1734,18 @@ func endpointSupportsLogGapFill(ep *EndPointInfo) bool {
 	}
 	_, ok := ep.Adapter.(HistoryFetcher)
 	return ok
+}
+
+// cloneGapTriggerMessage 复制触发补全任务的实时消息。
+// 任务异步执行时，命令处理器/扩展可能继续改写原 msg（如 st 的指令别名替换）；
+// 历史状态判断只依赖 trigger 的 Message/Platform/Sender/Seq，复制标量即可避免
+// 读到被后续改写的命令文本。
+func cloneGapTriggerMessage(msg *Message) *Message {
+	if msg == nil {
+		return nil
+	}
+	cp := *msg
+	return &cp
 }
 
 // logGapFillTask 描述一次 seq 断层补全。
