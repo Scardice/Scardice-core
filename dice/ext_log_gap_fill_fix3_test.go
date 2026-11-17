@@ -31,7 +31,7 @@ func (f *recordingHistoryFetcher) FetchGroupMsgHistory(_ context.Context, _ stri
 		return nil, nil
 	}
 	msgs := make([]*Message, 0, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		seq := fromSeq + 1 + int64(i)
 		msgs = append(msgs, &Message{
 			Seq:      seq,

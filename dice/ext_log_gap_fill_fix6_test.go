@@ -20,13 +20,13 @@ func TestLogStateConcurrentAccess(t *testing.T) {
 	wg.Add(3)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 200; i++ {
+		for i := range 200 {
 			g.SetLogState(uint64(i+1), "run-a", i%2 == 0)
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 200; i++ {
+		for range 200 {
 			state := g.GetLogState()
 			if state.ID == 0 && state.Name != "" {
 				t.Errorf("torn state: %+v", state)
@@ -36,7 +36,7 @@ func TestLogStateConcurrentAccess(t *testing.T) {
 	}()
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 200; i++ {
+		for range 200 {
 			if _, err := g.MarshalJSON(); err != nil {
 				t.Errorf("marshal: %v", err)
 				return

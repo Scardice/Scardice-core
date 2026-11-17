@@ -19,6 +19,7 @@ var (
 	officialQQReadySinks = map[string]func(*dto.WSReadyData){}
 )
 
+//nolint:gochecknoinits // botgo 的全局 READY 分发器必须在包初始化时注册
 func init() {
 	qqevent.DefaultHandlers.Ready = func(payload *dto.WSPayload, data *dto.WSReadyData) {
 		if payload == nil || payload.Session == nil {

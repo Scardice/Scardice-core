@@ -2441,7 +2441,7 @@ func (t logGapFillTask) run() {
 // 单次 get_group_msg_history 的 count 有实现上限（常见 100），不能一次性传整个断层。
 func (t logGapFillTask) fetchHistory(ctx context.Context, fetcher HistoryFetcher) ([]*Message, error) {
 	var lastErr error
-	for attempt := 0; attempt < logGapFillFetchRetries; attempt++ {
+	for attempt := range logGapFillFetchRetries {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():

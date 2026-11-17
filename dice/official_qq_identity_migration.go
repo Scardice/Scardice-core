@@ -424,7 +424,7 @@ func officialQQIdentityMigrationQuiet(db *gorm.DB) *gorm.DB {
 	if db == nil {
 		return db
 	}
-	gl, ok := db.Config.Logger.(logger.GORMLogger)
+	gl, ok := db.Logger.(logger.GORMLogger)
 	if !ok {
 		return db
 	}

@@ -50,8 +50,8 @@ func TestLogGapCalibrationFailureKeepsGap_1115fix3(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(op.Close)
-	if err := schema.EnsureLogSchema(op.db, "mock-sqlite"); err != nil {
-		t.Fatal(err)
+	if schemaErr := schema.EnsureLogSchema(op.db, "mock-sqlite"); schemaErr != nil {
+		t.Fatal(schemaErr)
 	}
 	const groupID = "QQ-Group:fix3-calib"
 	const logName = "run-a"

@@ -75,8 +75,8 @@ func TestOfficialQQIdentityFingerprintCountsUnionOfAttrsProbes(t *testing.T) {
 	// 指纹必须与旧版单条 OR 查询逐字节一致，否则升级后会误判“旧行变了”
 	// 而重跑一次身份迁移。这里用仍保留的 legacyAttrsQuery 作为参照实现。
 	var referenceIDs []string
-	if err := m.legacyAttrsQuery(op.db.Model(&model.AttributesItemModel{})).Order("id").Pluck("id", &referenceIDs).Error; err != nil {
-		t.Fatal(err)
+	if refErr := m.legacyAttrsQuery(op.db.Model(&model.AttributesItemModel{})).Order("id").Pluck("id", &referenceIDs).Error; refErr != nil {
+		t.Fatal(refErr)
 	}
 	sort.Strings(referenceIDs)
 	referenceHash := sha256.New()
@@ -108,8 +108,8 @@ func TestOfficialQQIdentityFingerprintCountsUnionOfAttrsProbes(t *testing.T) {
 		t.Fatalf("fingerprint not stable: (%d,%s) -> (%d,%s)", count, fingerprint, countAgain, fingerprintAgain)
 	}
 
-	if err := op.db.Delete(&model.AttributesItemModel{}, "id = ?", "nanoid-plain").Error; err != nil {
-		t.Fatal(err)
+	if deleteErr := op.db.Delete(&model.AttributesItemModel{}, "id = ?", "nanoid-plain").Error; deleteErr != nil {
+		t.Fatal(deleteErr)
 	}
 	countAfterDelete, fingerprintAfterDelete, err := m.legacyRowFingerprint(op)
 	if err != nil {
@@ -155,7 +155,7 @@ func TestOfficialQQIdentityProbesSuppressSlowSQLWarning(t *testing.T) {
 	}
 
 	core, logs := observer.New(zapcore.WarnLevel)
-	db.Config.Logger = seallogger.GORMLogger{
+	db.Logger = seallogger.GORMLogger{
 		ZapLogger:                 zap.New(core),
 		LogLevel:                  gormlogger.Warn,
 		SlowThreshold:             time.Nanosecond,

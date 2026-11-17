@@ -32,22 +32,25 @@ func TestLogAppendZeroRawMsgIDNotDeduped_1115(t *testing.T) {
 		t.Fatal("appends with zero raw id failed")
 	}
 	var count int64
-	if err := op.db.Model(&model.LogOneItem{}).
-		Where("log_id = ? AND raw_msg_id = ?", logID, "0").Count(&count).Error; err != nil {
-		t.Fatal(err)
+	if countErr := op.db.Model(&model.LogOneItem{}).
+		Where("log_id = ? AND raw_msg_id = ?", logID, "0").Count(&count).Error; countErr != nil {
+		t.Fatal(countErr)
 	}
 	if count != 2 {
 		t.Fatalf("zero raw id rows = %d, want 2 (0 must not dedupe)", count)
 	}
 
 	// 正常的非零 raw id 仍然去重。
-	real := &model.LogOneItem{Nickname: "玩家", Time: 3, Message: "real", RawMsgID: "raw-1", Seq: &seq}
-	if !service.LogAppend(op, groupID, logName, real) || !service.LogAppend(op, groupID, logName, real) {
-		t.Fatal("real raw id appends failed")
+	realItem := &model.LogOneItem{Nickname: "玩家", Time: 3, Message: "real", RawMsgID: "raw-1", Seq: &seq}
+	if !service.LogAppend(op, groupID, logName, realItem) {
+		t.Fatal("real raw id first append failed")
 	}
-	if err := op.db.Model(&model.LogOneItem{}).
-		Where("log_id = ? AND raw_msg_id = ?", logID, "raw-1").Count(&count).Error; err != nil {
-		t.Fatal(err)
+	if !service.LogAppend(op, groupID, logName, realItem) {
+		t.Fatal("real raw id duplicate append failed")
+	}
+	if countErr := op.db.Model(&model.LogOneItem{}).
+		Where("log_id = ? AND raw_msg_id = ?", logID, "raw-1").Count(&count).Error; countErr != nil {
+		t.Fatal(countErr)
 	}
 	if count != 1 {
 		t.Fatalf("real raw id rows = %d, want 1", count)
