@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 
 	"go.uber.org/zap"
 
@@ -91,7 +92,7 @@ func (pa *PlatformAdapterGocq) FetchGroupMsgHistory(ctx context.Context, groupID
 			msg.MessageType = "group"
 		}
 		if msg.GroupID == "" {
-			msg.GroupID = FormatDiceIDQQGroup(fmt.Sprintf("%d", gid))
+			msg.GroupID = FormatDiceIDQQGroup(strconv.FormatInt(gid, 10))
 			msg.MessageType = "group"
 		}
 		messages = append(messages, msg)

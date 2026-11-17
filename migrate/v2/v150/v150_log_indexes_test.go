@@ -29,8 +29,8 @@ func TestRecreateSQLiteLogItemsTableKeepsModelIndexes_1115(t *testing.T) {
 	t.Cleanup(func() { _ = sqlDB.Close() })
 
 	// 模拟启动顺序：先用当前模型建表（会创建全部索引）。
-	if err := db.Migrator().CreateTable(&model.LogOneItem{}); err != nil {
-		t.Fatalf("create modern log_items: %v", err)
+	if createErr := db.Migrator().CreateTable(&model.LogOneItem{}); createErr != nil {
+		t.Fatalf("create modern log_items: %v", createErr)
 	}
 	columns, err := loadSQLiteTableColumns(db, "log_items")
 	if err != nil {

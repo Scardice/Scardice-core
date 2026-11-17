@@ -55,7 +55,7 @@ func (f *fakeHistoryFetcher) FetchGroupMsgHistory(_ context.Context, _ string, f
 		count = f.pageLimit
 	}
 	msgs := make([]*Message, 0, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		seq := fromSeq + 1 + int64(i)
 		msgs = append(msgs, &Message{
 			Seq:      seq,
@@ -156,8 +156,8 @@ func TestLogGapFilterAlreadyLogged(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if err := db.db.AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}); err != nil {
-		t.Fatal(err)
+	if migrateErr := db.db.AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}); migrateErr != nil {
+		t.Fatal(migrateErr)
 	}
 
 	const groupID = "QQ-Group:1"
@@ -219,8 +219,8 @@ func TestLogLinePageNoGapFillFilter_1115fix4(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if err := db.db.AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}); err != nil {
-		t.Fatal(err)
+	if migrateErr := db.db.AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}); migrateErr != nil {
+		t.Fatal(migrateErr)
 	}
 
 	const (

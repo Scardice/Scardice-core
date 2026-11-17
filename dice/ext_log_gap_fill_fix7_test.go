@@ -83,8 +83,8 @@ func TestLogGapCalibrationRecoveryFillsCorrectGap(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer op.Close()
-	if err := schema.EnsureLogSchema(op.db, "mock-sqlite"); err != nil {
-		t.Fatalf("EnsureLogSchema: %v", err)
+	if schemaErr := schema.EnsureLogSchema(op.db, "mock-sqlite"); schemaErr != nil {
+		t.Fatalf("EnsureLogSchema: %v", schemaErr)
 	}
 	const groupID = "QQ-Group:fix7"
 	const logName = "run-a"
