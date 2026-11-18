@@ -1205,6 +1205,7 @@ func (pa *PlatformAdapterKook) SendToPerson(ctx *MsgContext, userID string, text
 	}
 	resp, err := pa.SendToChannelRaw(channel.Code, text, true)
 	if err != nil {
+		log.Errorf("Kook私聊消息发送失败: user=%s err=%v", userID, err)
 		return
 	}
 	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
@@ -1227,6 +1228,7 @@ func (pa *PlatformAdapterKook) SendToGroup(ctx *MsgContext, groupID string, text
 	}
 	resp, err := pa.SendToChannelRaw(ExtractKookChannelID(groupID), text, false)
 	if err != nil {
+		zap.S().Named(logger.LogKeyAdapter).Errorf("Kook群聊消息发送失败: group=%s err=%v", groupID, err)
 		return
 	}
 	pa.EndPoint.Session.OnMessageSend(ctx, &Message{

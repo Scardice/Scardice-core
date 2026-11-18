@@ -6,6 +6,7 @@ import (
 	"github.com/sealdice/botgo/dto"
 	qqevent "github.com/sealdice/botgo/event"
 	"go.uber.org/zap"
+	"golang.org/x/oauth2"
 
 	"Scardice-core/logger"
 )
@@ -16,8 +17,16 @@ import (
 // that AppID.
 var (
 	officialQQReadyMu    sync.Mutex
-	officialQQReadySinks = map[string]func(*dto.WSReadyData){}
+	officialQQReadySinks = map[string]officialQQReadySink{}
 )
+
+type officialQQReadySink struct {
+	// tokenSource 是该次连接传给 botgo 的 token source。1118: READY 全局
+	// 回调只带 AppID，同一 AppID 新旧连接短时并存时，旧连接的迟到 READY
+	// 会命中新注册的 sink。比较 token source 指针可以精确忽略旧连接。
+	tokenSource oauth2.TokenSource
+	sink        func(*dto.WSReadyData)
+}
 
 //nolint:gochecknoinits // botgo 的全局 READY 分发器必须在包初始化时注册
 func init() {
@@ -26,9 +35,13 @@ func init() {
 			return
 		}
 		officialQQReadyMu.Lock()
-		sink := officialQQReadySinks[payload.Session.AppID]
+		entry, ok := officialQQReadySinks[payload.Session.AppID]
 		officialQQReadyMu.Unlock()
-		if sink == nil {
+		if !ok || entry.sink == nil {
+			return
+		}
+		if entry.tokenSource != nil && payload.Session.TokenSource != nil &&
+			entry.tokenSource != payload.Session.TokenSource {
 			return
 		}
 		func() {
@@ -39,16 +52,19 @@ func init() {
 					zap.S().Named(logger.LogKeyAdapter).Errorf("official qq READY 回调异常: %v", r)
 				}
 			}()
-			sink(data)
+			entry.sink(data)
 		}()
 	}
 }
 
-func registerOfficialQQReadySink(appID string, sink func(*dto.WSReadyData)) {
+func registerOfficialQQReadySink(appID string, tokenSource oauth2.TokenSource, sink func(*dto.WSReadyData)) {
 	if appID == "" || sink == nil {
 		return
 	}
 	officialQQReadyMu.Lock()
-	officialQQReadySinks[appID] = sink
+	officialQQReadySinks[appID] = officialQQReadySink{
+		tokenSource: tokenSource,
+		sink:        sink,
+	}
 	officialQQReadyMu.Unlock()
 }

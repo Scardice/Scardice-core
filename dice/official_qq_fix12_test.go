@@ -5,7 +5,15 @@ import (
 
 	"github.com/sealdice/botgo/dto"
 	qqevent "github.com/sealdice/botgo/event"
+	"golang.org/x/oauth2"
 )
+
+type fakeReadyTokenSource struct{ id byte }
+
+func (f *fakeReadyTokenSource) Token() (*oauth2.Token, error) {
+	_ = f.id // 非零大小，保证不同实例的 interface 指针可区分
+	return &oauth2.Token{}, nil
+}
 
 func TestOfficialQQCanSendDuringReadyWindow(t *testing.T) {
 	ep := &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Enable: true, State: StateConnecting}}
@@ -33,7 +41,8 @@ func TestOfficialQQReadySinkDispatchesByAppID(t *testing.T) {
 		t.Fatal("botgo READY dispatcher is not installed")
 	}
 	var got *dto.WSReadyData
-	registerOfficialQQReadySink("ready-app", func(data *dto.WSReadyData) {
+	tokenSource := &fakeReadyTokenSource{}
+	registerOfficialQQReadySink("ready-app", tokenSource, func(data *dto.WSReadyData) {
 		got = data
 	})
 
@@ -45,9 +54,18 @@ func TestOfficialQQReadySinkDispatchesByAppID(t *testing.T) {
 		t.Fatal("READY for a different AppID reached the sink")
 	}
 
+	// 1118: 旧连接（不同 token source）的迟到 READY 必须被忽略。
+	qqevent.DefaultHandlers.Ready(
+		&dto.WSPayload{Session: &dto.Session{AppID: "ready-app", TokenSource: &fakeReadyTokenSource{}}},
+		&dto.WSReadyData{SessionID: "stale-session"},
+	)
+	if got != nil {
+		t.Fatal("READY from a replaced session reached the sink")
+	}
+
 	want := &dto.WSReadyData{SessionID: "session-1"}
 	qqevent.DefaultHandlers.Ready(
-		&dto.WSPayload{Session: &dto.Session{AppID: "ready-app"}},
+		&dto.WSPayload{Session: &dto.Session{AppID: "ready-app", TokenSource: tokenSource}},
 		want,
 	)
 	if got != want {

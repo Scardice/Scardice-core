@@ -200,6 +200,7 @@ type GroupInfo struct {
 	// 越靠后的任务越晚执行，可能重放几分钟前的指令。
 	logGapQueueMu       sync.Mutex      `json:"-" yaml:"-"`
 	logGapPending       *logGapFillTask `json:"-" yaml:"-"`
+	logGapRunningTask   *logGapFillTask `json:"-" yaml:"-"`
 	logGapWorkerRunning bool            `json:"-" yaml:"-"`
 	// logGapRunningOffDiscovery 表示 worker 当前执行的正是 off 状态历史发现任务。
 	// 用于让 .log off / .log on 及时感知“离线补录还在跑”，避免实时命令和
@@ -387,10 +388,56 @@ func (g *GroupInfo) setLogGapPendingRangeMode(fromSeq, toSeq int64, offDiscovery
 	if toSeq > g.LogGapPendingTo {
 		g.LogGapPendingTo = toSeq
 	}
+	// 1118: 这里必须双向赋值。原先只在 offDiscovery=true 时置位，
+	// 正常的 setLogGapPendingRange(false) 无法清掉旧的 off 标记，
+	// 会让 pending floor / off 发现重建按错误状态处理。
+	g.LogGapPendingOffDiscovery = offDiscovery
+	g.logSeqMu.Unlock()
+}
+
+// mergeLogGapPendingRangeMode 只扩大 pending 区间，不缩短；用于失败重试
+// 和运行中任务合并。offDiscovery 只置位不清除，避免把混合窗口误当成纯
+// on 窗口做 pending floor。
+func (g *GroupInfo) mergeLogGapPendingRangeMode(fromSeq, toSeq int64, offDiscovery bool) {
+	if g == nil || fromSeq <= 0 || toSeq <= fromSeq {
+		return
+	}
+	g.logSeqMu.Lock()
+	if g.LogGapPendingFrom == 0 || fromSeq < g.LogGapPendingFrom {
+		g.LogGapPendingFrom = fromSeq
+	}
+	if toSeq > g.LogGapPendingTo {
+		g.LogGapPendingTo = toSeq
+	}
 	if offDiscovery {
 		g.LogGapPendingOffDiscovery = true
 	}
 	g.logSeqMu.Unlock()
+}
+
+// advanceLogGapPendingStart 在分段补录成功写入一段后，把 pending 起点前移，
+// 这样后续段失败/进程重启时不会从原始 fromSeq 重扫已经处理过的部分。
+// 只在新区间起点更晚时前移，绝不越过更早的 pending 任务。
+func (g *GroupInfo) advanceLogGapPendingStart(fromSeq, toSeq int64, offDiscovery bool) bool {
+	if g == nil || fromSeq <= 0 || toSeq <= fromSeq {
+		return false
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	changed := false
+	if g.LogGapPendingFrom == 0 || fromSeq > g.LogGapPendingFrom {
+		g.LogGapPendingFrom = fromSeq
+		changed = true
+	}
+	if toSeq > g.LogGapPendingTo {
+		g.LogGapPendingTo = toSeq
+		changed = true
+	}
+	if offDiscovery && !g.LogGapPendingOffDiscovery {
+		g.LogGapPendingOffDiscovery = true
+		changed = true
+	}
+	return changed
 }
 
 // replaceLogGapPendingRange 在任务被替换（日志/epoch/模式变化）时重置
@@ -443,7 +490,55 @@ func (g *GroupInfo) hasAnyLogGapTask() bool {
 	}
 	g.logGapQueueMu.Lock()
 	defer g.logGapQueueMu.Unlock()
-	return g.logGapWorkerRunning || g.logGapPending != nil
+	return g.logGapWorkerRunning || g.logGapPending != nil || g.logGapRunningTask != nil
+}
+
+// hasAuthorizedPreOffGapTask 报告是否存在“off 前窗口”授权的在途/排队任务。
+// 1118: .log off 之后如果又来了 off 状态消息，不能立刻用 off 发现任务把
+// 这个已授权的 on 任务替换掉；先等它补完 off 前窗口，再由后续消息重建
+// off 发现任务（LogSeenSeq 保持不动，窗口不会丢）。
+func (g *GroupInfo) hasAuthorizedPreOffGapTask() bool {
+	if g == nil {
+		return false
+	}
+	auth := g.logOffGapAuthSnapshot()
+	if auth == nil {
+		return false
+	}
+	g.logGapQueueMu.Lock()
+	pending := g.logGapPending
+	running := g.logGapRunningTask
+	g.logGapQueueMu.Unlock()
+	for _, task := range []*logGapFillTask{pending, running} {
+		if task == nil || task.discoverFromOff || task.toSeq <= 0 {
+			continue
+		}
+		if auth.logID == task.logID && auth.logName == task.logName &&
+			auth.epoch == task.epoch && task.toSeq <= auth.offSeq {
+			return true
+		}
+	}
+	return false
+}
+
+// logOffRequestedSeqSnapshot 读取用户明确关闭日志的 seq；0 表示没有。
+func (g *GroupInfo) logOffRequestedSeqSnapshot() int64 {
+	if g == nil {
+		return 0
+	}
+	return g.logOffRequestedSeq.Load()
+}
+
+// markLogSeqUncalibrated 让下一次补录重新用 DB MAX(seq) 校准基线。
+// 身份迁移换了日志 ID 时必须调用；否则会拿旧日志的 seq 基线去算新日志缺口。
+func (g *GroupInfo) markLogSeqUncalibrated() {
+	if g == nil {
+		return
+	}
+	g.logSeqMu.Lock()
+	g.logSeqCalibrated = false
+	g.logSeqCalibrationRetryAt = 0
+	g.logSeqMu.Unlock()
 }
 
 // markLogOffRequested 记录用户明确要求关闭日志。即使 live 日志已经是
@@ -1169,6 +1264,28 @@ func (g *GroupInfo) SetLogState(logID uint64, logName string, logOn bool) {
 	g.LogCurName = logName
 	g.LogOn = logOn
 	g.logStateMu.Unlock()
+}
+
+// setLogCurNameLocked 只改日志名，供身份迁移在并发修改 GroupInfo 时使用。
+func (g *GroupInfo) setLogCurNameLocked(name string) {
+	g.logStateMu.Lock()
+	g.LogCurName = name
+	g.logStateMu.Unlock()
+}
+
+// setMergedLogState 在身份迁移合并日志状态时使用：
+//   - 持 logWriteMu，避免和在途日志写入/.log 切换并发；
+//   - 成对设置 ID/名称/开关，避免拼出“新群日志名 + 旧群日志 ID”；
+//   - 重置 seq 基线和校准标记，之后用新 log 的 DB MAX(seq) 重新校准。
+func (g *GroupInfo) setMergedLogState(logID uint64, logName string, logOn bool) {
+	if g == nil {
+		return
+	}
+	g.logWriteMu.Lock()
+	g.SetLogState(logID, logName, logOn)
+	g.resetLogSeqBaseline()
+	g.markLogSeqUncalibrated()
+	g.logWriteMu.Unlock()
 }
 
 func (g *GroupInfo) SetLogOn(logOn bool) {

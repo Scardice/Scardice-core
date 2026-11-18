@@ -26,7 +26,7 @@ func (*LogOneItemParquet) TableName() string {
 
 type LogOneItem struct {
 	ID             uint64      `gorm:"primaryKey;autoIncrement;column:id;index:idx_log_delete_by_id,priority:3" json:"id"`
-	LogID          uint64      `gorm:"column:log_id;index:idx_log_items_log_id;index:idx_log_raw,priority:1" json:"-"`
+	LogID          uint64      `gorm:"column:log_id;index:idx_log_items_log_id;index:idx_log_raw,priority:1;index:idx_log_items_log_seq,priority:1" json:"-"`
 	GroupID        string      `gorm:"index:idx_log_items_group_id;column:group_id;index:idx_log_delete_by_id,priority:1"`
 	Nickname       string      `gorm:"column:nickname"                                                         json:"nickname"`
 	IMUserID       string      `gorm:"column:im_userid"                                                        json:"IMUserId"`
@@ -48,7 +48,7 @@ type LogOneItem struct {
 	ParentID *int `gorm:"column:parent_id" json:"-"`
 	// Seq 平台消息序号，用于掉线期间的日志断层检测与补全
 	// 允许default=NULL，历史记录与不支持seq的平台均为NULL
-	Seq *int64 `gorm:"column:seq" json:"seq,omitempty"`
+	Seq *int64 `gorm:"column:seq;index:idx_log_items_log_seq,priority:2" json:"seq,omitempty"`
 	// IsGapFill 是日志断层自动补全写入的内部标记。
 	// 1115.fix4 起不再对外暴露（JSON/导出/API 筛选均已移除），仅保留数据库列与
 	// 内部写入，保证旧库结构和 V150 重建兼容；新代码不要再把它用于用户侧功能。
@@ -146,7 +146,7 @@ func (*LogInfoHookMySQL) TableName() string {
 // 下面两个 length:20 是显式声明前缀长度，保证新库/迁移建出的索引与查询匹配。
 type LogOneItemHookMySQL struct {
 	ID             uint64      `gorm:"primaryKey;autoIncrement;column:id;index:idx_log_delete_by_id,priority:3" json:"id"`
-	LogID          uint64      `gorm:"column:log_id"                      json:"-"`
+	LogID          uint64      `gorm:"column:log_id;index:idx_log_items_log_seq,priority:1" json:"-"`
 	GroupID        string      `gorm:"column:group_id;index:idx_log_delete_by_id,priority:1,length:20"`
 	Nickname       string      `gorm:"column:nickname"                    json:"nickname"`
 	IMUserID       string      `gorm:"column:im_userid"                   json:"IMUserId"`
@@ -162,7 +162,7 @@ type LogOneItemHookMySQL struct {
 	Channel        string      `gorm:"-"                                  json:"channel"`
 	Removed        *int        `gorm:"column:removed"                     json:"-"`
 	ParentID       *int        `gorm:"column:parent_id"                   json:"-"`
-	Seq            *int64      `gorm:"column:seq"                         json:"seq,omitempty"`
+	Seq            *int64      `gorm:"column:seq;index:idx_log_items_log_seq,priority:2" json:"seq,omitempty"`
 	// IsGapFill 仅保留数据库列以兼容旧库；不再对外输出。
 	IsGapFill bool `gorm:"column:is_gap_fill;not null;default:false" json:"-"`
 }
