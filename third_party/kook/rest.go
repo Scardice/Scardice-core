@@ -1676,6 +1676,37 @@ func rateLimitReset(header http.Header) time.Duration {
 	return time.Duration(seconds * float64(time.Second))
 }
 
+// sleepUnlessClosed 等待 d；Session 被 Close/禁用时立即返回 false。
+// 429 与网络重试都在事件分发协程里执行，不能对关闭无感地睡满 60 秒。
+func (s *Session) sleepUnlessClosed(d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	if s == nil {
+		time.Sleep(d)
+		return true
+	}
+	s.RLock()
+	closed := s.closed
+	done := s.closedCh
+	s.RUnlock()
+	if closed {
+		return false
+	}
+	if done == nil {
+		time.Sleep(d)
+		return true
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-done:
+		return false
+	}
+}
+
 func (s *Session) request(method, url string, data interface{}) (response []byte, err error) {
 	var body []byte
 	var dataMultipart bool
@@ -1742,7 +1773,9 @@ func (s *Session) request(method, url string, data interface{}) (response []byte
 			if !idempotent || attempt >= maxRetry || (!deadline.IsZero() && time.Now().After(deadline)) {
 				return nil, doErr
 			}
-			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
+			if !s.sleepUnlessClosed(time.Duration(1<<uint(attempt)) * time.Second) {
+				return nil, fmt.Errorf("kook session closed during retry backoff")
+			}
 			continue
 		}
 
@@ -1777,7 +1810,9 @@ func (s *Session) request(method, url string, data interface{}) (response []byte
 			if !deadline.IsZero() && time.Now().Add(wait).After(deadline) {
 				return nil, fmt.Errorf("kook api rate limited, wait %s exceeds RetryTimeout", wait)
 			}
-			time.Sleep(wait)
+			if !s.sleepUnlessClosed(wait) {
+				return nil, fmt.Errorf("kook session closed while rate limited")
+			}
 			continue
 		}
 

@@ -829,7 +829,7 @@ func (d *Dice) registerCoreCommands() {
 				}
 
 				if cmdArgs.IsArgEqual(1, "on") {
-					if msg.Platform != "QQ-CH" && !ctx.Dice.Config.BotExtFreeSwitch && ctx.PrivilegeLevel < 40 {
+					if !isQQChannelPlatform(msg.Platform) && !ctx.Dice.Config.BotExtFreeSwitch && ctx.PrivilegeLevel < 40 {
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:提示_无权限_非master/管理/邀请者"))
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
@@ -837,6 +837,15 @@ func (d *Dice) registerCoreCommands() {
 					if ctx.IsPrivate {
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:提示_私聊不可用"))
 						return CmdExecuteResult{Matched: true, Solved: true}
+					}
+
+					// off 前窗口任务仍在排队/运行时，.bot on 的 resume/reset 会
+					// 推进 epoch，旧任务必停。先记下窗口，恢复后重新挂一个
+					// 只补日志的任务，避免 off 之前的 on 段永久丢失。
+					var preOffFrom, preOffTo int64
+					var preOffOK bool
+					if ctx.Group != nil {
+						preOffFrom, preOffTo, preOffOK = ctx.Group.authorizedPreOffGapRange()
 					}
 
 					wasAutoOffLog := ctx.Group != nil && ctx.Group.isLogPausedByBotOff()
@@ -857,6 +866,12 @@ func (d *Dice) registerCoreCommands() {
 						ctx.Group.clearLogResumeSkipGap()
 					}
 
+					preOffNotice := ""
+					if preOffOK && autoOnLog && ctx.Group != nil &&
+						ctx.Group.enqueuePreOffBackfillAfterResume(ctx.Dice, ctx.EndPoint, preOffFrom, preOffTo) {
+						preOffNotice = "\n关闭前的遗漏记录正在补录，完成后会通知。"
+					}
+
 					text := DiceFormatTmpl(ctx, "核心:骰子开启")
 					if autoOnLog {
 						// .bot off 时日志被自动关闭，这里刚自动开启；关闭段不补录。
@@ -866,11 +881,12 @@ func (d *Dice) registerCoreCommands() {
 					} else {
 						text += "\n请特别注意: 日志记录处于开启状态"
 					}
+					text += preOffNotice
 					ReplyToSender(ctx, msg, text)
 
 					return CmdExecuteResult{Matched: true, Solved: true}
 				} else if cmdArgs.IsArgEqual(1, "off") {
-					if msg.Platform != "QQ-CH" && !ctx.Dice.Config.BotExtFreeSwitch && ctx.PrivilegeLevel < 40 {
+					if !isQQChannelPlatform(msg.Platform) && !ctx.Dice.Config.BotExtFreeSwitch && ctx.PrivilegeLevel < 40 {
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:提示_无权限_非master/管理/邀请者"))
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}

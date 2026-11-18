@@ -238,6 +238,12 @@ func ReplyForward(ctx *MsgContext, msg *Message, nodes []message.ForwardNode) bo
 	return false
 }
 
+// isQQChannelPlatform 同时覆盖 QQ 频道（QQ-CH）和官方 QQ 频道（OpenQQCH）。
+// 很多配置项/权限豁免原来只判断 "QQ-CH"，官方 QQ 频道因此被漏掉。
+func isQQChannelPlatform(platform string) bool {
+	return platform == "QQ-CH" || platform == "OpenQQCH"
+}
+
 func IsCurGroupBotOnByID(session *IMSession, ep *EndPointInfo, messageType string, groupID string) bool {
 	// Pinenutn: 总觉得这里还能优化，但是又想不到怎么优化，可恶，要长脑子了
 	a := messageType == "group" && session.ServiceAtNew.Exists(groupID)
@@ -257,6 +263,48 @@ func SetBotOffAtGroup(ctx *MsgContext, groupID string) {
 	SetBotOffAtGroupAtSeq(ctx, groupID, 0)
 }
 
+// groupHasOtherLiveDice 清理 DiceIDActiveMap 中已删除/已禁用端点的残留 ID，
+// 并报告是否还有其它“启用的端点”仍在该群激活。
+//
+// 只按 Len()==0 判断“群已完全关闭”会被残留 ID 骗过：用户删除/禁用某个账号后，
+// 它的 ID 仍留在群的 DiceIDActiveMap 里，导致 .bot off 不 deactivate、不暂停
+// 日志、也不提示；随后 .bot on 因 Active 仍为 true 而不走自动恢复。
+func groupHasOtherLiveDice(session *IMSession, group *GroupInfo, excludeUserID string) bool {
+	if session == nil || group == nil || group.DiceIDActiveMap == nil {
+		return false
+	}
+	// 无法取得端点列表时保持旧行为，避免误判为“没有其它骰子”。
+	if len(session.EndPoints) == 0 {
+		return group.DiceIDActiveMap.Len() > 0
+	}
+
+	live := make(map[string]struct{}, len(session.EndPoints))
+	for _, ep := range session.EndPoints {
+		if ep == nil || !ep.Enable || ep.UserID == "" || ep.UserID == excludeUserID {
+			continue
+		}
+		live[ep.UserID] = struct{}{}
+	}
+
+	hasOther := false
+	var stale []string
+	group.DiceIDActiveMap.Range(func(id string, _ bool) bool {
+		if id == excludeUserID {
+			return true
+		}
+		if _, ok := live[id]; ok {
+			hasOther = true
+		} else {
+			stale = append(stale, id)
+		}
+		return true
+	})
+	for _, id := range stale {
+		group.DiceIDActiveMap.Delete(id)
+	}
+	return hasOther
+}
+
 // SetBotOffAtGroupAtSeq 是 .bot off 指令的入口；seq 用于给“窗口完全位于
 // 本次 .bot off 之前”的在途补全任务建立 off 前窗口授权。Web UI 等没有消息
 // seq 的调用继续使用 SetBotOffAtGroup。
@@ -268,9 +316,10 @@ func SetBotOffAtGroupAtSeq(ctx *MsgContext, groupID string, seq int64) {
 			groupInfo.DiceIDActiveMap = new(SyncMap[string, bool])
 		}
 
-		// TODO: 进行更好的是否变更的检查
 		groupInfo.DiceIDActiveMap.Delete(ctx.EndPoint.UserID)
-		if groupInfo.DiceIDActiveMap.Len() == 0 {
+		// 残留/禁用端点的 ID 不能算“还有别的骰子在服务”：否则群不会
+		// deactivate，日志也不会随 .bot off 暂停。
+		if !groupHasOtherLiveDice(session, groupInfo, ctx.EndPoint.UserID) {
 			groupInfo.SetActiveRaw(false)
 			// 群变为未激活时同时自动 .log off（不结束、不上传）：关闭期间的
 			// 消息不记录，.bot on 自动开启后也不会被当成断层补录。
@@ -297,18 +346,16 @@ func SetBotOnAtGroup(ctx *MsgContext, groupID string) *GroupInfo {
 		}
 		group.ensureInactivatedSet()
 		group.DiceIDActiveMap.Store(ctx.EndPoint.UserID, true)
-		wasActive := group.IsActiveRaw()
 		group.SetActiveRaw(true)
-		if !wasActive {
-			// .bot off 时日志被自动 .log off；这里按 .log on 的语义自动开启，
-			// 并标记下一条消息只重建 seq 基线：关闭段既不补录也不重放。
-			// 只有本次真的自动开启日志时才置标记；普通激活不能吞掉真实缺口。
-			if group.resumeLogPausedByBotOff() {
-				if ctx.Dice != nil && ctx.Dice.Logger != nil {
-					ctx.Dice.Logger.Infof("日志随 .bot on 自动开启: 群=%s 记录=%s", groupID, group.GetLogState().Name)
-				}
-				group.MarkDirty(ctx.Dice)
+		// .bot off 时日志被自动 .log off；这里按 .log on 的语义自动开启，
+		// 并标记下一条消息只重建 seq 基线：关闭段既不补录也不重放。
+		// 不能只看 wasActive：残留/禁用端点会让群 Active 仍为 true，
+		// 但日志确实处于“由 .bot off 自动暂停”状态，也必须恢复。
+		if group.resumeLogPausedByBotOff() {
+			if ctx.Dice != nil && ctx.Dice.Logger != nil {
+				ctx.Dice.Logger.Infof("日志随 .bot on 自动开启: 群=%s 记录=%s", groupID, group.GetLogState().Name)
 			}
+			group.MarkDirty(ctx.Dice)
 		}
 	} else {
 		// 设定扩展情况
