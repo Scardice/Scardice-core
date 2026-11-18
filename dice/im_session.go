@@ -218,6 +218,9 @@ type GroupInfo struct {
 	// 拉取失败时 pending 区间会保留以便重试；若没有退避，每条新消息都会重新
 	// 发起一次最长 60s 的历史拉取，平台持续异常时会形成重试风暴。
 	logGapRetryAt atomic.Int64 `json:"-" yaml:"-"`
+	// logGapFailureNoticeAt 是补全失败群内提示的最近发送时间(unix)。
+	// 失败路径只写日志会让用户以为已经补完；这里限频提示，避免每 2 分钟刷屏。
+	logGapFailureNoticeAt atomic.Int64 `json:"-" yaml:"-"`
 	// logGapWriteFailed 标记本次补录期间是否发生过日志写入失败。
 	// 任务开始时由 beginLogGapWriteTracking 重置；LogAppend 失败时置位。
 	// 补录结束时据此决定是否保留 pending 并退避，避免“没写进去”被当成
@@ -274,6 +277,54 @@ type GroupInfo struct {
 	// 从 LogSeenSeq 开始拉历史，以 off 为起点扫描 .log on/.log off。
 	// 进程重启后仍能知道离线前看到了哪里；0 表示尚未建立。
 	LogSeenSeq int64 `json:"logSeenSeq,omitempty" yaml:"logSeenSeq,omitempty"`
+}
+
+// groupLogPhase 是从 LogOn/LogCurName/LogPausedByBotOff 推导出的日志生命周期阶段。
+// 1120: 这些字段是同一状态机的不同投影，不能再让各调用点各自解释。
+// 新增代码应优先用 logPhase() 判断，而不是直接拼 LogOn/PausedByBotOff。
+type groupLogPhase uint8
+
+const (
+	groupLogPhaseOff groupLogPhase = iota
+	groupLogPhaseRecording
+	groupLogPhasePausedByBotOff
+)
+
+// logPhase 返回当前日志生命周期阶段。只读取状态字段，不改变状态。
+func (g *GroupInfo) logPhase() groupLogPhase {
+	if g == nil {
+		return groupLogPhaseOff
+	}
+	g.logStateMu.RLock()
+	defer g.logStateMu.RUnlock()
+	switch {
+	case g.LogOn && g.LogCurName != "":
+		return groupLogPhaseRecording
+	case !g.LogOn && g.LogPausedByBotOff && g.LogCurName != "":
+		return groupLogPhasePausedByBotOff
+	default:
+		return groupLogPhaseOff
+	}
+}
+
+// logPhaseValid 检查 LogOn/LogCurName/LogPausedByBotOff 是否处于合法组合。
+// 只用于测试/诊断；生产路径不应因状态不合法而中断用户操作。
+func (g *GroupInfo) logPhaseValid() bool {
+	if g == nil {
+		return false
+	}
+	g.logStateMu.RLock()
+	defer g.logStateMu.RUnlock()
+	if g.LogOn && g.LogCurName == "" {
+		return false
+	}
+	if g.LogPausedByBotOff && g.LogOn {
+		return false
+	}
+	if g.LogPausedByBotOff && g.LogCurName == "" {
+		return false
+	}
+	return true
 }
 
 // noteLogSelfSent 记录一条骰子自身的群内发言。
@@ -1279,6 +1330,14 @@ func (g *GroupInfo) SetLogState(logID uint64, logName string, logOn bool) {
 	g.LogCurID = logID
 	g.LogCurName = logName
 	g.LogOn = logOn
+	// 1120: 维持生命周期不变量：记录中不可能同时“由 bot off 暂停”；
+	// 没有日志名时也不允许保留暂停/跳过标记。
+	if logOn || logName == "" {
+		g.LogPausedByBotOff = false
+	}
+	if logName == "" {
+		g.LogResumeSkipGap = false
+	}
 	g.logStateMu.Unlock()
 }
 
@@ -1319,6 +1378,10 @@ func (g *GroupInfo) ClearLogState() {
 	g.LogCurID = 0
 	g.LogCurName = ""
 	g.LogOn = false
+	// 1120: ClearLogState 必须把日志生命周期标记一并清掉，否则会留下
+	// “没有日志名但仍标记为 bot off 暂停”的非法阶段。
+	g.LogPausedByBotOff = false
+	g.LogResumeSkipGap = false
 	g.logStateMu.Unlock()
 	g.clearLogOffGapAuth()
 	g.clearLogSeenSeq()

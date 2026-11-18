@@ -89,9 +89,9 @@ func TestHistoricalBotOffWithoutLogOffKeepsRecording_1115fix7(t *testing.T) {
 	g.logGapWorkerRunning = false
 }
 
-// TestHistoricalExtOffLogStillStops_1115fix7 .ext off log 仍按停止边界处理：
-// 它直接禁用日志扩展，不能像 .bot 一样忽略。
-func TestHistoricalExtOffLogStillStops_1115fix7(t *testing.T) {
+// TestHistoricalExtOffLogIgnoredNotStop_1120 离线 .ext off log 未执行：
+// 不能当停止边界，后续消息仍按实际日志状态补录。
+func TestHistoricalExtOffLogIgnoredNotStop_1120(t *testing.T) {
 	const groupID = "QQ-Group:fix7-ext"
 	const senderID = "QQ:fix7-user"
 	msgs := []*Message{
@@ -120,8 +120,8 @@ func TestHistoricalExtOffLogStillStops_1115fix7(t *testing.T) {
 	if got := countFix5LogRows(t, d, logID, 1051, 1052); got != 2 {
 		t.Fatalf("pre-.ext off log rows = %d, want 2", got)
 	}
-	if got := countFix5LogRows(t, d, logID, 1053, 1053); got != 0 {
-		t.Fatalf("post-.ext off log rows = %d, want 0", got)
+	if got := countFix5LogRows(t, d, logID, 1053, 1053); got != 1 {
+		t.Fatalf("post-.ext off log rows = %d, want 1 (command not executed)", got)
 	}
 	if !g.GetLogState().On {
 		t.Fatal("ext stop boundary must not change live log state")
@@ -130,8 +130,8 @@ func TestHistoricalExtOffLogStillStops_1115fix7(t *testing.T) {
 }
 
 // TestHistoricalBotOffLiveTriggerWithHistoricalOff_1115fix7 实时第一条是
-// .bot off、缺口历史已经 .log off：真实处理器把日志暂停，历史补录只补
-// 历史 on 段，不删除 .bot off 行、不与实时处理器抢状态。
+// .bot off、缺口历史已经 .log off：历史最终 off 必须覆盖 .bot off 的自动暂停，
+// 下次 .bot on 不能把日志重新打开。
 func TestHistoricalBotOffLiveTriggerWithHistoricalOff_1115fix7(t *testing.T) {
 	const groupID = "QQ-Group:fix7-live-botoff"
 	const senderID = "QQ:fix7-user"
@@ -157,8 +157,8 @@ func TestHistoricalBotOffLiveTriggerWithHistoricalOff_1115fix7(t *testing.T) {
 
 	task.run()
 
-	if g.GetLogState().On || !g.isLogPausedByBotOff() {
-		t.Fatalf("live .bot off should pause the log: on=%v paused=%v",
+	if g.GetLogState().On || g.isLogPausedByBotOff() {
+		t.Fatalf("historical .log off should clear bot-off pause: on=%v paused=%v",
 			g.GetLogState().On, g.isLogPausedByBotOff())
 	}
 	if got := countFix5LogRows(t, d, logID, 1051, 1052); got != 2 {
@@ -167,8 +167,13 @@ func TestHistoricalBotOffLiveTriggerWithHistoricalOff_1115fix7(t *testing.T) {
 	if got := countFix5LogRows(t, d, logID, 1053, 1053); got != 0 {
 		t.Fatalf("historical off rows = %d, want 0", got)
 	}
-	if got := countFix5LogRows(t, d, logID, 1054, 1054); got != 1 {
-		t.Fatalf("live .bot off row = %d, want 1 (kept)", got)
+	if got := countFix5LogRows(t, d, logID, 1054, 1054); got != 0 {
+		t.Fatalf("live .bot off row = %d, want 0 (historical off applies)", got)
+	}
+	// 模拟随后 .bot on：历史 .log off 已清除暂停标记，不得自动恢复。
+	SetBotOnAtGroup(ctx, groupID)
+	if g.GetLogState().On {
+		t.Fatal(".bot on must not reopen a log that historical .log off closed")
 	}
 	g.logGapWorkerRunning = false
 }

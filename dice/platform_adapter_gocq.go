@@ -457,6 +457,10 @@ func (pa *PlatformAdapterGocq) Serve() int {
 		pa.lagrangeRebootTimes = 0
 		//  {"data":{"nickname":"闃斧鐗岃�佽檸鏈�","user_id":1001},"retcode":0,"status":"ok"}
 		pa.GetLoginInfo()
+		// 1120: 重连后主动对账一次最新历史 seq，不依赖下一条群消息。
+		if pa.EndPoint != nil && pa.EndPoint.Session != nil && pa.EndPoint.Session.Parent != nil {
+			pa.EndPoint.Session.Parent.scheduleLogGapReconcile(3 * time.Second)
+		}
 	}
 
 	socket.OnConnectError = func(err error, socket gowebsocket.Socket) {

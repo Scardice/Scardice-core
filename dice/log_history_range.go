@@ -22,8 +22,8 @@ var errLogGapHistoryNoProgress = errors.New("历史拉取没有取得可用的�
 
 const (
 	logHistoryRangePageSize    = 100
-	logHistoryRangeMaxPageSize = 200 // SnowLuma/NapCat 等实现的单页上限
-	logHistoryRangeMaxPages    = 200 // 单段最多翻 200 页，避免病态实现死循环
+	logHistoryRangeMaxPageSize = 200  // SnowLuma/NapCat 等实现的单页上限
+	logHistoryRangeMaxPages    = 2000 // 单次最多翻 2000 页；20k 缺口在 200/页下约 100 页，go-cqhttp 19/页约 1053 页
 )
 
 // rawIDToInt64 把各平台 Message.RawID 的常见表示转成 int64。
@@ -118,6 +118,20 @@ func historyRangeFilter(msgs []*Message, fromSeq, toSeq int64) []*Message {
 	return out
 }
 
+// historyRangeOldestSeq 返回消息集合中的最小 seq；空集合返回 0。
+func historyRangeOldestSeq(msgs []*Message) int64 {
+	var oldest int64
+	for _, m := range msgs {
+		if m == nil || m.Seq <= 0 {
+			continue
+		}
+		if oldest == 0 || m.Seq < oldest {
+			oldest = m.Seq
+		}
+	}
+	return oldest
+}
+
 // mergeHistoryRangeMessages 合并两条翻页路径的结果，按 seq 去重后升序返回。
 // 1119.fix1: message_id 路径与 message_seq 回退路径可能各拿到一部分区间，
 // 不能因为 message_id 路径“非空”就完全丢弃 seq 路径的结果。
@@ -165,19 +179,20 @@ func fetchHistoryBySeqBackward(
 	ctx context.Context,
 	fromSeq, toSeq int64,
 	fetch func(context.Context, int64, int) ([]*Message, error),
-) ([]*Message, bool, error) {
+) ([]*Message, bool, bool, error) {
 	if toSeq <= fromSeq+1 {
-		return nil, true, nil
+		return nil, true, false, nil
 	}
 	anchor := toSeq
 	lastOldest := int64(0)
 	collected := make([]*Message, 0, historyRangeCapHint(fromSeq, toSeq))
 	seen := make(map[int64]struct{}, historyRangeCapHint(fromSeq, toSeq))
-	complete := false
+	reachedStart := false
+	boundary := false
 
 	for page := 0; page < logHistoryRangeMaxPages; page++ {
 		if err := ctx.Err(); err != nil {
-			return historyRangeFilter(collected, fromSeq, toSeq), false, err
+			return historyRangeFilter(collected, fromSeq, toSeq), false, false, err
 		}
 		count := logHistoryRangePageSize
 		if page == 0 {
@@ -195,11 +210,15 @@ func fetchHistoryBySeqBackward(
 
 		pageMsgs, err := fetch(ctx, anchor, count)
 		if err != nil {
-			return historyRangeFilter(collected, fromSeq, toSeq), false, err
+			return historyRangeFilter(collected, fromSeq, toSeq), false, false, err
 		}
 		if len(pageMsgs) == 0 {
-			// 平台明确表示这一段没有更多历史（保留期/已删除/空群）。
-			complete = true
+			// 向旧翻页实现返回空页：只有已经取到过消息时才视为“平台没有
+			// 更早历史”。首屏就是空页时无法区分“确实空群/保留期截断”和
+			// “平台瞬时失败返回空”，按 fail-closed 保留 pending。
+			if len(collected) > 0 {
+				boundary = true
+			}
 			break
 		}
 
@@ -223,7 +242,7 @@ func fetchHistoryBySeqBackward(
 			break
 		}
 		if oldest <= fromSeq+1 {
-			complete = true
+			reachedStart = true
 			break
 		}
 		if lastOldest > 0 && oldest >= lastOldest {
@@ -233,12 +252,12 @@ func fetchHistoryBySeqBackward(
 		lastOldest = oldest
 		next := oldest - 1
 		if next <= fromSeq {
-			complete = true
+			reachedStart = true
 			break
 		}
 		anchor = next
 	}
-	return historyRangeFilter(collected, fromSeq, toSeq), complete, nil
+	return historyRangeFilter(collected, fromSeq, toSeq), reachedStart, boundary, nil
 }
 
 // onebotHistoryParams 同时覆盖两种主流 get_group_msg_history 方言：
@@ -304,16 +323,17 @@ type onebotHistoryPageFetcher func(context.Context, onebotHistoryParams) ([]*Mes
 // 后因 oldest 不前进而退出，由调用方回退到 message_seq。
 func fetchOnebotRangeByMessageID(
 	ctx context.Context, req HistoryRangeRequest, fetch onebotHistoryPageFetcher,
-) ([]*Message, bool, error) {
+) ([]*Message, bool, bool, error) {
 	anchor, hasAnchor := rawIDToInt64(req.ToRawID)
 	lastOldest := int64(0)
 	collected := make([]*Message, 0, historyRangeCapHint(req.FromSeq, req.ToSeq))
 	seen := make(map[int64]struct{}, historyRangeCapHint(req.FromSeq, req.ToSeq))
-	complete := false
+	reachedStart := false
+	boundary := false
 
 	for page := 0; page < logHistoryRangeMaxPages; page++ {
 		if err := ctx.Err(); err != nil {
-			return historyRangeFilter(collected, req.FromSeq, req.ToSeq), false, err
+			return historyRangeFilter(collected, req.FromSeq, req.ToSeq), false, false, err
 		}
 		count := logHistoryRangePageSize
 		if page == 0 {
@@ -334,10 +354,12 @@ func fetchOnebotRangeByMessageID(
 		}
 		pageMsgs, err := fetch(ctx, params)
 		if err != nil {
-			return historyRangeFilter(collected, req.FromSeq, req.ToSeq), false, err
+			return historyRangeFilter(collected, req.FromSeq, req.ToSeq), false, false, err
 		}
 		if len(pageMsgs) == 0 {
-			complete = true
+			// message_id 方言的空页可能是“平台没有更早历史”，也可能是
+			// 服务端瞬时失败后回退到空本地库。这里不把它当成可清除
+			// pending 的边界；由调用方保留 pending，交给 seq 路径或重试。
 			break
 		}
 
@@ -360,7 +382,7 @@ func fetchOnebotRangeByMessageID(
 			break
 		}
 		if oldest.Seq <= req.FromSeq+1 {
-			complete = true
+			reachedStart = true
 			break
 		}
 		if lastOldest > 0 && oldest.Seq >= lastOldest {
@@ -373,12 +395,12 @@ func fetchOnebotRangeByMessageID(
 		}
 		anchor, hasAnchor = next, true
 	}
-	return historyRangeFilter(collected, req.FromSeq, req.ToSeq), complete, nil
+	return historyRangeFilter(collected, req.FromSeq, req.ToSeq), reachedStart, boundary, nil
 }
 
 func fetchOnebotRangeBySeq(
 	ctx context.Context, req HistoryRangeRequest, fetch onebotHistoryPageFetcher,
-) ([]*Message, bool, error) {
+) ([]*Message, bool, bool, error) {
 	return fetchHistoryBySeqBackward(ctx, req.FromSeq, req.ToSeq,
 		func(ctx context.Context, anchor int64, count int) ([]*Message, error) {
 			return fetch(ctx, onebotHistoryParams{
@@ -398,50 +420,54 @@ func fetchOnebotRangeBySeq(
 // go-cqhttp 这类忽略 message_id 的实现永远走不到 seq 回退；1119.fix1 修复。
 func fetchOnebotHistoryRange(
 	ctx context.Context, req HistoryRangeRequest, fetch onebotHistoryPageFetcher,
-) ([]*Message, bool, error) {
-	msgIDMsgs, msgIDComplete, msgIDErr := fetchOnebotRangeByMessageID(ctx, req, fetch)
-	if msgIDErr == nil && msgIDComplete {
-		return msgIDMsgs, true, nil
+) (HistoryRangeResult, error) {
+	msgIDMsgs, msgIDReached, msgIDBoundary, msgIDErr := fetchOnebotRangeByMessageID(ctx, req, fetch)
+	if msgIDErr == nil && msgIDReached {
+		return HistoryRangeResult{Messages: msgIDMsgs, ReachedStart: true, Boundary: msgIDBoundary}, nil
 	}
 
-	seqMsgs, seqComplete, seqErr := fetchOnebotRangeBySeq(ctx, req, fetch)
-	if seqComplete {
-		// 1119.fix1: seq 路径空页只能说明“这一页没有数据”，不能反过来
-		// 给 message_id 路径的非空部分页升级成“已覆盖整段”。否则平台把
-		// 瞬时空页/未知参数返回成空页时，会把部分结果误报为完成。
+	seqMsgs, seqReached, seqBoundary, seqErr := fetchOnebotRangeBySeq(ctx, req, fetch)
+	result := HistoryRangeResult{
+		Messages:     mergeHistoryRangeMessages(msgIDMsgs, seqMsgs),
+		ReachedStart: msgIDReached || seqReached,
+		Boundary:     msgIDBoundary || seqBoundary,
+	}
+	if seqBoundary {
+		// seq 路径的空页不能给 message_id 路径的非空部分页升级边界。
 		if len(seqMsgs) == 0 && len(msgIDMsgs) > 0 {
-			return msgIDMsgs, false, nil
+			result.Boundary = msgIDBoundary
+		} else if len(seqMsgs) > 0 && len(msgIDMsgs) > 0 &&
+			historyRangeOldestSeq(seqMsgs) >= historyRangeOldestSeq(msgIDMsgs) {
+			// seq 路径没有比 message_id 路径更靠前，不能仅凭它的一条
+			// 空页就宣布平台边界。
+			result.Boundary = msgIDBoundary
 		}
-		return mergeHistoryRangeMessages(msgIDMsgs, seqMsgs), true, nil
 	}
-
-	merged := mergeHistoryRangeMessages(msgIDMsgs, seqMsgs)
-	if len(merged) > 0 {
-		// 有进展但没覆盖到起点：调用方必须保留 pending，不能把 maxSeq 当覆盖。
-		return merged, false, nil
+	if result.ReachedStart || result.Boundary || len(result.Messages) > 0 {
+		return result, nil
 	}
 	if msgIDErr != nil {
-		return nil, false, msgIDErr
+		return HistoryRangeResult{}, msgIDErr
 	}
 	if seqErr != nil {
-		return nil, false, seqErr
+		return HistoryRangeResult{}, seqErr
 	}
-	return nil, false, errLogGapHistoryNoProgress
+	return HistoryRangeResult{}, errLogGapHistoryNoProgress
 }
 
 // FetchGroupMsgHistoryRange 实现 HistoryRangeFetcher。
 func (p *PlatformAdapterOnebot) FetchGroupMsgHistoryRange(
 	ctx context.Context, req HistoryRangeRequest,
-) ([]*Message, bool, error) {
+) (HistoryRangeResult, error) {
 	if p == nil || p.sendEmitter == nil {
-		return nil, false, errors.New("emitter 未初始化")
+		return HistoryRangeResult{}, errors.New("emitter 未初始化")
 	}
 	gid := ExtractQQEmitterGroupID(req.GroupID)
 	if gid == 0 {
-		return nil, false, fmt.Errorf("无效的群ID: %s", req.GroupID)
+		return HistoryRangeResult{}, fmt.Errorf("无效的群ID: %s", req.GroupID)
 	}
 	if req.ToSeq <= req.FromSeq+1 {
-		return nil, true, nil
+		return HistoryRangeResult{ReachedStart: true}, nil
 	}
 
 	// 闭包补上真实 group_id；自由函数只负责翻页策略，便于单测注入方言。
@@ -450,4 +476,30 @@ func (p *PlatformAdapterOnebot) FetchGroupMsgHistoryRange(
 		return p.fetchOnebotHistoryPage(ctx, req.GroupID, gid, params)
 	}
 	return fetchOnebotHistoryRange(ctx, req, fetch)
+}
+
+// FetchLatestHistorySeq 取当前群最新一条历史消息的 seq/raw id。
+// SnowLuma 的 message_id=0 表示最新页；只取 1 条。
+func (p *PlatformAdapterOnebot) FetchLatestHistorySeq(ctx context.Context, groupID string) (int64, interface{}, error) {
+	if p == nil || p.sendEmitter == nil {
+		return 0, nil, errors.New("emitter 未初始化")
+	}
+	gid := ExtractQQEmitterGroupID(groupID)
+	if gid == 0 {
+		return 0, nil, fmt.Errorf("无效的群ID: %s", groupID)
+	}
+	msgs, err := p.fetchOnebotHistoryPage(ctx, groupID, gid, onebotHistoryParams{Count: 1})
+	if err != nil {
+		return 0, nil, err
+	}
+	var latest *Message
+	for _, m := range msgs {
+		if m != nil && m.Seq > 0 && (latest == nil || m.Seq > latest.Seq) {
+			latest = m
+		}
+	}
+	if latest == nil {
+		return 0, nil, nil
+	}
+	return latest.Seq, latest.RawID, nil
 }

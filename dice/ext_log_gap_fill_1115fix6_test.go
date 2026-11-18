@@ -313,9 +313,9 @@ func TestHistoricalLogOnTriggerKeepsLiveOn_1115fix6(t *testing.T) {
 	g.logGapWorkerRunning = false
 }
 
-// TestHistoricalLogNewStopsGap_1115fix6 遇到 .log new 停止推断：
-// 只补它之前的 on 段，之后不猜新日志，live 状态不变。
-func TestHistoricalLogNewStopsGap_1115fix6(t *testing.T) {
+// TestHistoricalLogNewIgnoredNotStop_1120 离线 .log new 未执行：
+// 不能当停止边界，后续消息仍属于当前实际日志并补录。
+func TestHistoricalLogNewIgnoredNotStop_1120(t *testing.T) {
 	const groupID = "QQ-Group:fix6-new"
 	const senderID = "QQ:fix6-user"
 	msgs := make([]*Message, 0, 30)
@@ -343,8 +343,8 @@ func TestHistoricalLogNewStopsGap_1115fix6(t *testing.T) {
 	if got := countFix5LogRows(t, d, logID, 1051, 1061); got != 11 {
 		t.Fatalf("pre-.log new rows = %d, want 11", got)
 	}
-	if got := countFix5LogRows(t, d, logID, 1062, 1070); got != 0 {
-		t.Fatalf("post-.log new rows = %d, want 0", got)
+	if got := countFix5LogRows(t, d, logID, 1062, 1070); got != 9 {
+		t.Fatalf("post-.log new rows = %d, want 9 (command not executed)", got)
 	}
 	if !g.GetLogState().On {
 		t.Fatal("unsupported .log new must not change live log state")

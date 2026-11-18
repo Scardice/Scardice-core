@@ -67,7 +67,7 @@ func TestOnebotRangeMessageIDKeepsFirstMissing_1119(t *testing.T) {
 		ToRawID:   fmt.Sprintf("%d", store.ids[1081]),
 		FromRawID: fmt.Sprintf("%d", store.ids[1050]),
 	}
-	msgs, complete, err := fetchOnebotRangeByMessageID(context.Background(), req, store.fetch)
+	msgs, complete, _, err := fetchOnebotRangeByMessageID(context.Background(), req, store.fetch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestOnebotRangeMessageIDPagesLargeGap_1119(t *testing.T) {
 		ToSeq:   501,
 		ToRawID: fmt.Sprintf("%d", store.ids[501]),
 	}
-	msgs, complete, err := fetchOnebotRangeByMessageID(context.Background(), req, store.fetch)
+	msgs, complete, _, err := fetchOnebotRangeByMessageID(context.Background(), req, store.fetch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func (s *gocqHistoryStore) fetch(_ context.Context, anchor int64, _ int) ([]*Mes
 
 func TestFetchHistoryBySeqBackwardGocq_1119(t *testing.T) {
 	store := newGocqHistoryStore(1, 300)
-	msgs, complete, err := fetchHistoryBySeqBackward(context.Background(), 100, 301, store.fetch)
+	msgs, complete, _, err := fetchHistoryBySeqBackward(context.Background(), 100, 301, store.fetch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,10 +174,10 @@ func TestOnebotRangeFallsBackToSeq_1119(t *testing.T) {
 	req := HistoryRangeRequest{FromSeq: 100, ToSeq: 301, ToRawID: 300}
 
 	// message_id 语义下会反复拿到最新页，oldest 不前进 → 无进度/空结果。
-	if msgs, complete, _ := fetchOnebotRangeByMessageID(context.Background(), req, store.fetch); complete || len(msgs) > 0 {
+	if msgs, complete, _, _ := fetchOnebotRangeByMessageID(context.Background(), req, store.fetch); complete || len(msgs) > 0 {
 		t.Fatalf("message_id path should not make progress: complete=%v msgs=%d", complete, len(msgs))
 	}
-	msgs, complete, err := fetchOnebotRangeBySeq(context.Background(), req, store.fetch)
+	msgs, complete, _, err := fetchOnebotRangeBySeq(context.Background(), req, store.fetch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,8 +302,8 @@ func (a *rangeOnlyStubAdapter) FetchGroupMsgHistory(context.Context, string, int
 	return nil, nil
 }
 
-func (a *rangeOnlyStubAdapter) FetchGroupMsgHistoryRange(context.Context, HistoryRangeRequest) ([]*Message, bool, error) {
-	return a.msgs, a.complete, nil
+func (a *rangeOnlyStubAdapter) FetchGroupMsgHistoryRange(context.Context, HistoryRangeRequest) (HistoryRangeResult, error) {
+	return HistoryRangeResult{Messages: a.msgs, ReachedStart: a.complete}, nil
 }
 
 func TestLogGapRangeFetcherKeepsFirstMissing_1119(t *testing.T) {

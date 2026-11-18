@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	socketio "github.com/PaienNate/pineutil/evsocket/v2"
@@ -59,6 +60,13 @@ type PlatformAdapterOnebot struct {
 	isRetrying     bool         // 是否正在重试
 	retryMutex     sync.RWMutex // 重试状态锁
 	isShuttingDown bool         // 是否正在主动关闭连接
+
+	// 1120: 用实际群消息判断当前 OneBot 实现是否提供 message_seq。
+	// 纯 OneBot 接不带 message_seq 的实现时，endpointSupportsLogGapFill 不能
+	// 仅凭适配器类型就宣称支持补全。
+	seqSeen     atomic.Bool
+	seqMissing  atomic.Bool
+	seqZeroSeen atomic.Int64
 
 	// 连接建立互斥锁，确保同时只有一个连接建立过程
 	connectionMutex sync.Mutex
@@ -698,6 +706,33 @@ func (p *PlatformAdapterOnebot) isServer() bool {
 	return p.Mode == "server" //nolint:goconst
 }
 
+// noteIncomingSeq 记录一条收到的群消息是否有 message_seq。
+// 连续 3 条无 seq 且从未见过 seq 时，标记当前实现不提供 message_seq。
+func (p *PlatformAdapterOnebot) noteIncomingSeq(seq int64) {
+	if p == nil {
+		return
+	}
+	if seq > 0 {
+		p.seqSeen.Store(true)
+		p.seqZeroSeen.Store(0)
+		return
+	}
+	if p.seqZeroSeen.Add(1) >= 3 && !p.seqSeen.Load() {
+		p.seqMissing.Store(true)
+	}
+}
+
+// hasMessageSeq 报告是否仍可认为当前实现提供群消息 seq。
+func (p *PlatformAdapterOnebot) hasMessageSeq() bool {
+	if p == nil {
+		return false
+	}
+	if p.seqSeen.Load() {
+		return true
+	}
+	return !p.seqMissing.Load()
+}
+
 // onConnected 连接成功的回调函数
 func (p *PlatformAdapterOnebot) onConnected(kws *socketio.WebsocketWrapper) {
 	// 连接成功，获取当前登录状态
@@ -718,6 +753,9 @@ func (p *PlatformAdapterOnebot) onConnected(kws *socketio.WebsocketWrapper) {
 	p.EndPoint.UserID = fmt.Sprintf("QQ:%d", info.UserId)
 	p.EndPoint.Nickname = info.NickName
 	_ = p.sm.Event(context.Background(), "connect_ok")
+	if p.EndPoint != nil && p.EndPoint.Session != nil {
+		p.EndPoint.Session.Parent.scheduleLogGapReconcile(3 * time.Second)
+	}
 }
 
 // initializeCommonResources 初始化公共资源（移除sync.Once限制，允许重新初始化）

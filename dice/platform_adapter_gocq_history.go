@@ -113,16 +113,46 @@ func (pa *PlatformAdapterGocq) FetchGroupMsgHistory(ctx context.Context, groupID
 
 // FetchGroupMsgHistoryRange 实现 HistoryRangeFetcher：
 // 以 ToSeq 为锚点向旧翻页，直到覆盖 FromSeq+1 或平台没有更多历史。
-func (pa *PlatformAdapterGocq) FetchGroupMsgHistoryRange(ctx context.Context, req HistoryRangeRequest) ([]*Message, bool, error) {
+func (pa *PlatformAdapterGocq) FetchGroupMsgHistoryRange(ctx context.Context, req HistoryRangeRequest) (HistoryRangeResult, error) {
 	if pa == nil || pa.Socket == nil {
-		return nil, false, errors.New("gocq socket 未连接")
+		return HistoryRangeResult{}, errors.New("gocq socket 未连接")
 	}
 	gid := ExtractQQEmitterGroupID(req.GroupID)
 	if gid == 0 {
-		return nil, false, fmt.Errorf("无效的群ID: %s", req.GroupID)
+		return HistoryRangeResult{}, fmt.Errorf("无效的群ID: %s", req.GroupID)
 	}
-	return fetchHistoryBySeqBackward(ctx, req.FromSeq, req.ToSeq,
+	msgs, reachedStart, boundary, err := fetchHistoryBySeqBackward(ctx, req.FromSeq, req.ToSeq,
 		func(ctx context.Context, anchor int64, count int) ([]*Message, error) {
 			return pa.fetchGocqHistoryPage(ctx, gid, anchor, count)
 		})
+	if err != nil {
+		return HistoryRangeResult{}, err
+	}
+	return HistoryRangeResult{Messages: msgs, ReachedStart: reachedStart, Boundary: boundary}, nil
+}
+
+// FetchLatestHistorySeq 取 go-cqhttp 当前群最新一条历史消息。
+// message_seq=0 表示从最新开始；实现忽略/不支持时返回空，由下一条消息触发。
+func (pa *PlatformAdapterGocq) FetchLatestHistorySeq(ctx context.Context, groupID string) (int64, interface{}, error) {
+	if pa == nil || pa.Socket == nil {
+		return 0, nil, errors.New("gocq socket 未连接")
+	}
+	gid := ExtractQQEmitterGroupID(groupID)
+	if gid == 0 {
+		return 0, nil, fmt.Errorf("无效的群ID: %s", groupID)
+	}
+	msgs, err := pa.fetchGocqHistoryPage(ctx, gid, 0, 1)
+	if err != nil {
+		return 0, nil, err
+	}
+	var latest *Message
+	for _, m := range msgs {
+		if m != nil && m.Seq > 0 && (latest == nil || m.Seq > latest.Seq) {
+			latest = m
+		}
+	}
+	if latest == nil {
+		return 0, nil, nil
+	}
+	return latest.Seq, latest.RawID, nil
 }

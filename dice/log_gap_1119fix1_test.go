@@ -58,18 +58,19 @@ func TestOnebotRangePartialFallsBackToSeq_1119fix1(t *testing.T) {
 	req := HistoryRangeRequest{FromSeq: 100, ToSeq: 301, ToRawID: 300}
 
 	// message_id 路径单独跑只会拿到最新 20 条，不能宣称完成。
-	msgIDMsgs, msgIDComplete, _ := fetchOnebotRangeByMessageID(context.Background(), req, store.fetch)
+	msgIDMsgs, msgIDComplete, _, _ := fetchOnebotRangeByMessageID(context.Background(), req, store.fetch)
 	if msgIDComplete || len(msgIDMsgs) == 0 {
 		t.Fatalf("message_id path = %d msgs, complete=%v; want non-empty partial", len(msgIDMsgs), msgIDComplete)
 	}
 
-	msgs, complete, err := fetchOnebotHistoryRange(context.Background(), req, store.fetch)
+	result, err := fetchOnebotHistoryRange(context.Background(), req, store.fetch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !complete {
+	if !result.ReachedStart {
 		t.Fatal("expected seq fallback to cover the whole range")
 	}
+	msgs := result.Messages
 	if len(msgs) != 200 || msgs[0].Seq != 101 || msgs[len(msgs)-1].Seq != 300 {
 		t.Fatalf("range = %d..%d (%d), want 101..300 (200)",
 			msgs[0].Seq, msgs[len(msgs)-1].Seq, len(msgs))
@@ -86,14 +87,15 @@ func TestOnebotRangeEmptySeqDoesNotUpgradePartial_1119fix1(t *testing.T) {
 	}
 	req := HistoryRangeRequest{FromSeq: 100, ToSeq: 301, ToRawID: 300}
 
-	msgs, complete, err := fetchOnebotHistoryRange(context.Background(), req, store.fetch)
+	result, err := fetchOnebotHistoryRange(context.Background(), req, store.fetch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if complete {
-		t.Fatalf("empty seq page must not upgrade partial message_id result: %d msgs", len(msgs))
+	if result.Boundary || result.ReachedStart {
+		t.Fatalf("empty seq page must not upgrade partial message_id result: reached=%v boundary=%v msgs=%d",
+			result.ReachedStart, result.Boundary, len(result.Messages))
 	}
-	if len(msgs) == 0 {
+	if len(result.Messages) == 0 {
 		t.Fatal("expected the partial message_id result to be kept")
 	}
 }
@@ -194,8 +196,8 @@ func TestLogGapMultiSegmentPartialDoesNotAdvancePending_1119fix1(t *testing.T) {
 	if from != 1050 || to != 3600 {
 		t.Fatalf("pending = %d..%d, want 1050..3600 (must not advance to partial top)", from, to)
 	}
-	if got := countFix5LogRows(t, d, logID, 3031, 3050); got != 20 {
-		t.Fatalf("partial segment rows = %d, want 20", got)
+	if got := countFix5LogRows(t, d, logID, 3031, 3050); got != 0 {
+		t.Fatalf("partial segment rows = %d, want 0 (prefetch incomplete: write nothing)", got)
 	}
 }
 
