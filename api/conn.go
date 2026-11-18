@@ -1034,6 +1034,11 @@ func ImConnectionsAddOfficialQQ(c echo.Context) error {
 		}
 		conn := dice.NewOfficialQQConnItem("", "", "", v.OnlyQQGuild)
 		conn.BindRuntime(myDice.ImSession)
+		// 1118: NewOfficialQQConnItem 默认 Enable=false，而 ServerOfficialQQ
+		// 现在会拒绝启动禁用端点。添加接口必须先把端点置为启用/连接中，
+		// 否则扫码登录的 Serve() 永远不会开始，二维码也不会生成。
+		conn.Enable = true
+		conn.State = dice.StateConnecting
 		pa := conn.Adapter.(*dice.PlatformAdapterOfficialQQ)
 		pa.UseWebhook = v.UseWebhook
 		pa.WebhookPath = v.WebhookPath
@@ -1080,6 +1085,10 @@ func ImConnectionsAddOfficialQQ(c echo.Context) error {
 	conn.UserID = userID
 	conn.Nickname = probe.Nickname
 	conn.BindRuntime(myDice.ImSession)
+	// 1118: 同扫码分支，添加后必须立即启用，否则 serverOfficialQQ 的
+	// 禁用守卫会直接返回，新增账号不会自动连接。
+	conn.Enable = true
+	conn.State = dice.StateConnecting
 	pa := conn.Adapter.(*dice.PlatformAdapterOfficialQQ)
 	pa.Token = v.Token // Deprecated: preserve values submitted by old clients, but do not use them.
 	pa.UseWebhook = v.UseWebhook

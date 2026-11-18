@@ -1264,7 +1264,7 @@ func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *Officia
 		pa.closeOfficialQQEventQueueInstance(queue)
 		return 0
 	}
-	registerOfficialQQReadySink(pa.getAppID().String(), func(data *dto.WSReadyData) {
+	registerOfficialQQReadySink(pa.getAppID().String(), pa.getTokenSource(), func(data *dto.WSReadyData) {
 		pa.markOfficialQQReady(ctx, data)
 	})
 	if readyCh := pa.currentReadyCh(ctx); readyCh != nil {
@@ -1696,6 +1696,16 @@ func officialQQSplitTextList(textList []string) ([]officialQQMsgUnit, bool) {
 		}
 	}
 	return units, hasMedia
+}
+
+// limitOfficialQQUnits 按“消息单元”而不是“文本块”执行被动回复条数上限。
+// 1118: 一个文本块可能含多个图片/媒体，被拆成多条 API 消息；旧实现只截断
+// textList，导致 6+ 条媒体消息超过每 event_id 5 条的限制，后续被平台丢弃。
+func limitOfficialQQUnits(units []officialQQMsgUnit, limit int) []officialQQMsgUnit {
+	if limit <= 0 || len(units) <= limit {
+		return units
+	}
+	return units[:limit]
 }
 
 // packAndCacheBatchPages 将消息单元按 4+1 打包为分页并写入翻页缓存，
@@ -2476,14 +2486,13 @@ func (pa *PlatformAdapterOfficialQQ) SendToPerson(ctx *MsgContext, uid string, t
 		}
 	}
 	textList := utils.SplitLongText(text, maxLen, utils.DefaultSplitPaginationHint)
-	if !pa.EndPoint.Session.Parent.Config.OfficialQQUseMarkdown {
-		if len(textList) > officialQQPassiveMsgLimit {
-			textList = textList[:officialQQPassiveMsgLimit]
-		}
-	}
-
 	// 将文本块进一步拆分为消息单元，并统计是否包含富媒体
 	units, hasMedia := officialQQSplitTextList(textList)
+	if !pa.EndPoint.Session.Parent.Config.OfficialQQUseMarkdown {
+		// 1118: 被动回复条数限制必须按拆分后的消息单元计算；
+		// 只截断 textList 会让含多张图片的单个文本块发出 6+ 条消息。
+		units = limitOfficialQQUnits(units, officialQQPassiveMsgLimit)
+	}
 
 	var activeCtx *MsgContext = nil
 	var activeRowID = ""
@@ -2567,7 +2576,8 @@ func (pa *PlatformAdapterOfficialQQ) SendToPerson(ctx *MsgContext, uid string, t
 	}
 
 	if !pa.EndPoint.Session.Parent.Config.OfficialQQUseMarkdown {
-		for _, t := range textList {
+		for _, unit := range units {
+			t := unit.text
 			if idType == OpenQQUserOpenid {
 				msg, err := pa.sendC2CMsgRaw(activeCtx, activeRowID, userID, t, nil)
 				if err == nil && msg != nil {
@@ -3110,13 +3120,11 @@ func (pa *PlatformAdapterOfficialQQ) SendToGroup(ctx *MsgContext, uid string, te
 		}
 	}
 	textList := utils.SplitLongText(text, maxLen, utils.DefaultSplitPaginationHint)
-	if !pa.EndPoint.Session.Parent.Config.OfficialQQUseMarkdown {
-		if len(textList) > officialQQPassiveMsgLimit {
-			textList = textList[:officialQQPassiveMsgLimit]
-		}
-	}
-
 	units, hasMedia := officialQQSplitTextList(textList)
+	if !pa.EndPoint.Session.Parent.Config.OfficialQQUseMarkdown {
+		// 1118: 同私聊路径，按消息单元而不是文本块限制 5 条被动回复。
+		units = limitOfficialQQUnits(units, officialQQPassiveMsgLimit)
+	}
 
 	var activeCtx *MsgContext = nil
 	var activeRowID = ""
@@ -3180,7 +3188,8 @@ func (pa *PlatformAdapterOfficialQQ) SendToGroup(ctx *MsgContext, uid string, te
 	}
 
 	if !pa.EndPoint.Session.Parent.Config.OfficialQQUseMarkdown {
-		for _, t := range textList {
+		for _, unit := range units {
+			t := unit.text
 			switch idType {
 			case OpenQQGroupOpenid:
 				msg, err := pa.sendQQGroupMsgRaw(activeCtx, activeRowID, groupId, t, nil)

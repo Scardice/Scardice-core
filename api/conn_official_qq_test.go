@@ -168,12 +168,39 @@ func Test_ImConnectionsAddOfficialQQ_preserves_add_save_and_start_when_not_test_
 	if len(testDice.ImSession.EndPoints) != 1 || effects.saveCalls != 1 || effects.startCalls != 1 || effects.started != testDice.ImSession.EndPoints[0] || testDice.LastUpdatedTime == 0 {
 		t.Fatalf("non-test side effects: endpoints=%d save=%d start=%d updated=%d", len(testDice.ImSession.EndPoints), effects.saveCalls, effects.startCalls, testDice.LastUpdatedTime)
 	}
+	// 1118: 添加后必须处于启用状态，否则 ServerOfficialQQ 的禁用守卫直接 return，
+	// 新账号不会自动连接（扫码登录则永远不开始生成二维码）。
+	added := testDice.ImSession.EndPoints[0]
+	if !added.Enable || added.State != dice.StateConnecting {
+		t.Fatalf("added endpoint not started: enable=%t state=%d", added.Enable, added.State)
+	}
 	adapter := testDice.ImSession.EndPoints[0].Adapter.(*dice.PlatformAdapterOfficialQQ)
 	if adapter.AppID.String() != "12345" || adapter.Token != "submitted-token" || adapter.AppSecret != "submitted-secret" || !adapter.OnlyQQGuild || adapter.UIN != "123456789" {
 		t.Fatal("non-test endpoint did not retain the submitted configuration")
 	}
 	if testDice.ImSession.EndPoints[0].UserID != "OpenQQ:123456789" {
 		t.Fatalf("endpoint UserID = %q", testDice.ImSession.EndPoints[0].UserID)
+	}
+}
+
+func Test_ImConnectionsAddOfficialQQ_qr_endpoint_enabled_before_start(t *testing.T) {
+	// Given
+	testDice, effects := setupOfficialQQHandlerTest(t, nil)
+
+	// When: AppID=0 走扫码登录
+	_, response := requestAddOfficialQQ(t, `{"appID":0,"onlyQQGuild":false,"testOnly":false}`)
+
+	// Then
+	if !response.Result || response.TestOnly || response.Err != "" {
+		t.Fatalf("response = %#v", response)
+	}
+	if len(testDice.ImSession.EndPoints) != 1 || effects.startCalls != 1 || effects.saveCalls != 1 {
+		t.Fatalf("qr add side effects: endpoints=%d start=%d save=%d",
+			len(testDice.ImSession.EndPoints), effects.startCalls, effects.saveCalls)
+	}
+	added := testDice.ImSession.EndPoints[0]
+	if !added.Enable || added.State != dice.StateConnecting {
+		t.Fatalf("qr endpoint not started: enable=%t state=%d", added.Enable, added.State)
 	}
 }
 

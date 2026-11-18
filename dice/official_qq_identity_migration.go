@@ -1592,7 +1592,7 @@ func (m *officialQQIdentityMigration) migrateGroup(group *GroupInfo, oldGroupID 
 	}
 	group.GroupID = m.migrateGroupID(oldGroupID)
 	if newName, ok := m.logNames[oldGroupID+"\x00"+group.LogCurName]; ok {
-		group.LogCurName = newName
+		group.setLogCurNameLocked(newName)
 	}
 	group.GuildID = m.migrateAnyID(group.GuildID)
 	group.ChannelID = m.migrateAnyID(group.ChannelID)
@@ -1843,16 +1843,19 @@ func mergeOfficialQQGroupMemory(target, source *GroupInfo, d *Dice) bool {
 			changed = true
 		}
 	}
-	if !target.LogOn && source.LogOn {
-		target.LogOn = true
+	// 1118: LogCurID 和 LogCurName 必须成对迁移。分别补零会拼出
+	// “新群日志名 + 旧群日志 ID”的错误状态，之后 LogAppendByID 会写进
+	// 另一本日志。只有目标完全没有日志时才整组采用来源日志；采用后
+	// 重置 seq 基线并标记未校准，避免用旧日志的 seq 算新日志缺口。
+	targetHasLog := target.LogCurName != "" && target.LogCurID != 0
+	sourceHasLog := source.LogCurName != "" && source.LogCurID != 0
+	if !targetHasLog && sourceHasLog {
+		target.setMergedLogState(source.LogCurID, source.LogCurName, source.LogOn)
 		changed = true
-	}
-	if target.LogCurName == "" && source.LogCurName != "" {
-		target.LogCurName = source.LogCurName
-		changed = true
-	}
-	if target.LogCurID == 0 && source.LogCurID != 0 {
-		target.LogCurID = source.LogCurID
+	} else if targetHasLog && !target.LogOn && source.LogOn {
+		// 保留原有“来源开启、目标关闭则恢复”的合并语义，但走加锁路径
+		// 并重置基线，避免直接改字段造成撕裂状态。
+		target.setMergedLogState(target.LogCurID, target.LogCurName, true)
 		changed = true
 	}
 	if source.RecentDiceSendTime > target.RecentDiceSendTime {

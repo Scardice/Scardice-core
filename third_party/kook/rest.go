@@ -1706,8 +1706,10 @@ func (s *Session) request(method, url string, data interface{}) (response []byte
 	if s.RetryTimeout > 0 {
 		deadline = time.Now().Add(s.RetryTimeout)
 	}
-	// 只对幂等请求重试。消息发送、上传、删除等 POST 一旦在“服务端已处理、
-	// 响应丢失”时重试，就会产生重复消息/重复上传；宁可把错误交给调用方。
+	// 网络错误只对幂等请求重试：消息发送、上传、删除等 POST 一旦在
+	// “服务端已处理、响应丢失”时重试，就会产生重复消息/重复上传。
+	// 429 是例外：服务端明确说明请求被限流、尚未处理，按 reset 等待后
+	// 重试是安全的（见下方 StatusTooManyRequests 分支）。
 	idempotent := method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions
 
 	for attempt := 0; ; attempt++ {
@@ -1768,9 +1770,7 @@ func (s *Session) request(method, url string, data interface{}) (response []byte
 				Dur("wait", wait).
 				Int("attempt", attempt).
 				Msg("kook rate limited, backing off")
-			if !idempotent {
-				return nil, fmt.Errorf("kook api rate limited (non-idempotent %s), retry after %s", method, wait)
-			}
+			// 429 表示服务端未处理该请求，POST/上传也可以安全重试。
 			if attempt >= maxRetry {
 				return nil, fmt.Errorf("kook api rate limited after %d retries", attempt)
 			}

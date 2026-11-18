@@ -40,6 +40,42 @@ func TestRequestRetriesOnRateLimit(t *testing.T) {
 	}
 }
 
+func TestRequestRetriesPostOnRateLimit(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.Header().Set("X-Rate-Limit-Reset", "0.05")
+			w.Header().Set("X-Rate-Limit-Bucket", "message/create")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"code":0,"message":"rate limited"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"ok":true}}`))
+	}))
+	defer server.Close()
+
+	s := New("token", nopLogger{})
+	s.Client = server.Client()
+	s.MaxRetry = 2
+	s.RetryTimeout = 2 * time.Second
+
+	// 429 表示服务端未处理，POST 也应等待 reset 后重试。
+	resp, err := s.Request(http.MethodPost, server.URL, map[string]string{"content": "hi"})
+	if err != nil {
+		t.Fatalf("Request returned error: %v", err)
+	}
+	if string(resp) != `{"ok":true}` {
+		t.Fatalf("response = %s", resp)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("calls = %d, want 2", got)
+	}
+}
+
 func TestRequestRateLimitExhaustsRetryBudget(t *testing.T) {
 	var calls int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

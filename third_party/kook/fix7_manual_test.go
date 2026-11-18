@@ -71,9 +71,9 @@ func TestRequestDoesNotRetryNonIdempotentTransportError(t *testing.T) {
 	}
 }
 
-// TestRequestDoesNotRetryNonIdempotentRateLimit 锁定 429 时非幂等请求直接返回，
-// 不在调用方协程里睡眠重试（否则会堵住唯一的事件分发协程）。
-func TestRequestDoesNotRetryNonIdempotentRateLimit(t *testing.T) {
+// TestRequestRetriesNonIdempotentRateLimit 锁定 1118 语义：429 表示服务端
+// 未处理，POST 也按 X-Rate-Limit-Reset 重试；耗尽预算后返回错误。
+func TestRequestRetriesNonIdempotentRateLimit(t *testing.T) {
 	var calls int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&calls, 1)
@@ -89,11 +89,11 @@ func TestRequestDoesNotRetryNonIdempotentRateLimit(t *testing.T) {
 	s.RetryTimeout = time.Second
 
 	_, err := s.Request(http.MethodPost, server.URL, map[string]string{"content": "hi"})
-	if err == nil || !strings.Contains(err.Error(), "retry after") {
-		t.Fatalf("POST 429 error = %v, want a retry-after error", err)
+	if err == nil || !strings.Contains(err.Error(), "after 3 retries") {
+		t.Fatalf("POST 429 error = %v, want retry budget exhausted", err)
 	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("POST attempts = %d, want 1", got)
+	if got := atomic.LoadInt32(&calls); got != 4 {
+		t.Fatalf("POST attempts = %d, want 4 (initial + 3 retries)", got)
 	}
 }
 

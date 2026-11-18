@@ -584,30 +584,57 @@ func LogGetOwnerByID(operator engine2.DatabaseOperator, logID uint64) (groupID s
 	return logInfo.GroupID, logInfo.Name, nil
 }
 
-// LogRawMsgIDsInSeqRange 返回指定 log 在 (fromSeq, toSeq) 区间内已记录的 raw_msg_id 集合。
-// 用于日志补全前去重：平台补发/重连时同一消息可能既走过正常事件路径，又被历史拉取到。
-func LogRawMsgIDsInSeqRange(operator engine2.DatabaseOperator, logID uint64, fromSeq, toSeq int64) (map[string]struct{}, error) {
-	result := make(map[string]struct{})
+// LoggedSeqKeys 是补录去重所需的已记录键集合。
+type LoggedSeqKeys struct {
+	RawMsgIDs map[string]struct{}
+	Seqs      map[int64]struct{}
+}
+
+// LoggedKeysInSeqRange 返回指定 log 在 (fromSeq, toSeq) 区间内已记录的
+// raw_msg_id 与 seq 集合。1118: seq 也参与去重，解决平台不返回 raw_msg_id
+// 时重试/分段汇总产生重复行的问题。
+func LoggedKeysInSeqRange(operator engine2.DatabaseOperator, logID uint64, fromSeq, toSeq int64) (LoggedSeqKeys, error) {
+	result := LoggedSeqKeys{
+		RawMsgIDs: make(map[string]struct{}),
+		Seqs:      make(map[int64]struct{}),
+	}
 	if logID == 0 || toSeq <= fromSeq+1 {
 		return result, nil
 	}
 	db := operator.GetLogDB(constant.READ)
 
-	var rawIDs []string
-	err := db.Model(&model.LogOneItem{}).
-		Where("log_id = ? AND seq IS NOT NULL AND raw_msg_id IS NOT NULL AND is_dice IS NOT TRUE AND seq > ? AND seq < ?", logID, fromSeq, toSeq).
-		Pluck("raw_msg_id", &rawIDs).Error
-	if err != nil {
-		return nil, err
+	var rows []struct {
+		RawMsgID sql.NullString `gorm:"column:raw_msg_id"`
+		Seq      sql.NullInt64  `gorm:"column:seq"`
 	}
-	for _, rawID := range rawIDs {
+	err := db.Model(&model.LogOneItem{}).
+		Select("raw_msg_id, seq").
+		Where("log_id = ? AND seq IS NOT NULL AND is_dice IS NOT TRUE AND seq > ? AND seq < ?", logID, fromSeq, toSeq).
+		Scan(&rows).Error
+	if err != nil {
+		return result, err
+	}
+	for _, row := range rows {
+		if row.Seq.Valid {
+			result.Seqs[row.Seq.Int64] = struct{}{}
+		}
 		// "0" 表示平台没有返回真实消息 ID（见 logItemRawMsgID），不能当成
 		// 已记录过的消息，否则会跳过之后所有缺 ID 的补录。
-		if rawID != "" && rawID != "0" {
-			result[rawID] = struct{}{}
+		if row.RawMsgID.Valid && row.RawMsgID.String != "" && row.RawMsgID.String != "0" {
+			result.RawMsgIDs[row.RawMsgID.String] = struct{}{}
 		}
 	}
 	return result, nil
+}
+
+// LogRawMsgIDsInSeqRange 返回指定 log 在 (fromSeq, toSeq) 区间内已记录的 raw_msg_id 集合。
+// 用于日志补全前去重：平台补发/重连时同一消息可能既走过正常事件路径，又被历史拉取到。
+func LogRawMsgIDsInSeqRange(operator engine2.DatabaseOperator, logID uint64, fromSeq, toSeq int64) (map[string]struct{}, error) {
+	keys, err := LoggedKeysInSeqRange(operator, logID, fromSeq, toSeq)
+	if err != nil {
+		return nil, err
+	}
+	return keys.RawMsgIDs, nil
 }
 
 // LogDelete 删除log
@@ -724,7 +751,21 @@ func logItemRawMsgID(item *model.LogOneItem) string {
 // (log_id, raw_msg_id) 普通索引；带上 group_id 可以复用已有的
 // idx_log_delete_by_id(group_id(20), raw_msg_id(20), id) 前缀索引。
 // SQLite/PostgreSQL 仍会走 idx_log_raw(log_id, raw_msg_id)。
-func logAppendDuplicate(tx *gorm.DB, logID uint64, groupID, rawID string) (bool, error) {
+func logAppendDuplicate(tx *gorm.DB, logID uint64, groupID, rawID string, seq *int64, isGapFill bool) (bool, error) {
+	// 1118: 补录条目按 (log_id, seq) 再去重一次。平台不返回 raw_msg_id
+	// （"0"/空）时，分段补录 + 失败重试/最终汇总会重复写同一 seq；
+	// seq 在同一本日志内唯一，比 raw id 更可靠。
+	if isGapFill && seq != nil && *seq > 0 {
+		var seqCount int64
+		if err := tx.Model(&model.LogOneItem{}).
+			Where("log_id = ? AND seq = ?", logID, *seq).
+			Count(&seqCount).Error; err != nil {
+			return false, err
+		}
+		if seqCount > 0 {
+			return true, nil
+		}
+	}
 	if rawID == "" {
 		return false, nil
 	}
@@ -790,7 +831,7 @@ func logAppendOnce(operator engine2.DatabaseOperator, groupID string, logName st
 		// 只对 is_dice=false 的玩家/机器人消息去重；骰子自身发言（含私聊
 		// 暗骰回显）不参与，避免跨会话 ID 命名空间互相顶掉。
 		if !logItem.IsDice {
-			if dup, dupErr := logAppendDuplicate(tx, logID, groupID, logItemRawMsgID(&newLogItem)); dupErr != nil {
+			if dup, dupErr := logAppendDuplicate(tx, logID, groupID, logItemRawMsgID(&newLogItem), newLogItem.Seq, newLogItem.IsGapFill); dupErr != nil {
 				return dupErr
 			} else if dup {
 				return nil
@@ -865,7 +906,7 @@ func logAppendByIDOnce(operator engine2.DatabaseOperator, logID uint64, groupID 
 			return fmt.Errorf("log append by id: log %d 不属于群 %s", logID, groupID)
 		}
 		if !logItem.IsDice {
-			if dup, dupErr := logAppendDuplicate(tx, logID, groupID, logItemRawMsgID(&newLogItem)); dupErr != nil {
+			if dup, dupErr := logAppendDuplicate(tx, logID, groupID, logItemRawMsgID(&newLogItem), newLogItem.Seq, newLogItem.IsGapFill); dupErr != nil {
 				return dupErr
 			} else if dup {
 				return nil
