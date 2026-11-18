@@ -23,6 +23,7 @@ import (
 
 	"Scardice-core/dice/service"
 	"Scardice-core/dice/storylog"
+	"Scardice-core/message"
 	"Scardice-core/model"
 	"Scardice-core/utils/panicHandler"
 )
@@ -320,6 +321,35 @@ func (g *GroupInfo) resetLogSeqForNewSegment(seq int64, rawID interface{}) {
 	g.resetLogSeqBaseline()
 }
 
+// repairLogIDByName 在持久化 LogCurID 丢失时，按群号+日志名找回现有日志 ID。
+//
+// 1119.fix1: 旧数据可能只有 LogCurName/LogOn 而没有 LogCurId（升级前从未写过；
+// 或 repairPersistedLogState 校验失败后被清成 0）。日志关闭时 ensureGroupLogState
+// 不会补 ID，detectOffStateLogGap 又在 ID==0 时直接返回，导致“离线 .log on”
+// 永远扫描不到。这里只读查找、不创建日志：日志被删除时保持 0，等 .log on 处理。
+func repairLogIDByName(d *Dice, group *GroupInfo, state GroupLogState) bool {
+	if d == nil || group == nil || d.DBOperator == nil || state.ID != 0 || state.Name == "" {
+		return false
+	}
+	id, err := service.LogGetIDByName(d.DBOperator, group.GroupID, state.Name)
+	if err != nil {
+		if !errors.Is(err, service.ErrLogNotFound) && d.Logger != nil {
+			d.Logger.Warnf("日志状态自愈失败: 群=%s 名称=%s err=%v", group.GroupID, state.Name, err)
+		}
+		return false
+	}
+	if id == 0 {
+		return false
+	}
+	group.SetLogState(id, state.Name, state.On)
+	group.MarkDirty(d)
+	if d.Logger != nil {
+		d.Logger.Infof("日志状态自愈: 群=%s 名称=%s 按名字补全 logID=%d (记录=%v)",
+			group.GroupID, state.Name, id, state.On)
+	}
+	return true
+}
+
 // repairPersistedLogState 校验持久化的 LogCurID 是否仍指向 LogCurName。
 //
 // LogCurID 持久化后不会再像上游那样“重启即为 0、按名字 LogGetOrCreate 自愈”。
@@ -332,6 +362,8 @@ func repairPersistedLogState(d *Dice, group *GroupInfo) {
 	}
 	state := group.GetLogState()
 	if state.ID == 0 {
+		// 1119.fix1: 关闭的日志也要补 ID，否则离线 .log on 发现失效。
+		repairLogIDByName(d, group, state)
 		return
 	}
 	owner, name, err := service.LogGetOwnerByID(d.DBOperator, state.ID)
@@ -369,6 +401,14 @@ func repairPersistedLogState(d *Dice, group *GroupInfo) {
 			group.SetLogState(id, oldName, true)
 		} else if d.Logger != nil {
 			d.Logger.Warnf("日志状态修复失败: 群=%s 名称=%s err=%v", group.GroupID, oldName, createErr)
+		}
+	} else {
+		// 1119.fix1: 关闭的日志不创建，但若同名日志仍存在则补回 ID。
+		if id, findErr := service.LogGetIDByName(d.DBOperator, group.GroupID, oldName); findErr == nil {
+			newID = id
+			group.SetLogState(id, oldName, false)
+		} else if !errors.Is(findErr, service.ErrLogNotFound) && d.Logger != nil {
+			d.Logger.Warnf("日志状态修复失败: 群=%s 名称=%s err=%v", group.GroupID, oldName, findErr)
 		}
 	}
 	group.MarkDirty(d)
@@ -552,7 +592,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 .log masterget <群号> <日志名> // 重新上传日志，并获取链接(无法取得日志时，找骰主做这个操作)
 .log export <日志名> // 直接取得日志txt(服务出问题或有其他需要时使用)
 .log export <日志名> <邮箱地址> // 通过邮件取得日志txt，多个邮箱用空格隔开
-注: KOOK、官方 QQ 等非 OneBot 渠道不支持掉线日志自动补全，请保持核心在线。`
+注: KOOK、官方 QQ、内置 Lagrange 等渠道不支持掉线日志自动补全，请保持核心在线。`
 
 	// const txtLogTip = "若未出现线上日志地址，可换时间获取，或联系骰主在data/default/log-exports路径下取出日志\n文件名: 群号_日志名_随机数.zip\n注意此文件log end/get后才会生成"
 
@@ -1591,7 +1631,13 @@ func getSpecifiedGroupIfMaster(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) 
 		prefix := ""
 		switch {
 		case isOfficialQQEndpoint(ctx.EndPoint):
-			prefix = "OpenQQ-Group"
+			// 1119.fix1: 官方 QQ 频道用的是 OpenQQCH-Channel，
+			// 不能统一补成 OpenQQ-Group，否则跨频道查日志会拼错群号。
+			if ctx.Group != nil && strings.HasPrefix(ctx.Group.GroupID, "OpenQQCH-Channel:") {
+				prefix = "OpenQQCH-Channel"
+			} else {
+				prefix = "OpenQQ-Group"
+			}
 		case ctx.EndPoint != nil && ctx.EndPoint.Platform == "QQ":
 			prefix = "QQ-Group"
 		case ctx.EndPoint != nil && ctx.EndPoint.Platform == "KOOK":
@@ -1991,10 +2037,21 @@ func (g *GroupInfo) enqueuePreOffBackfillAfterResume(d *Dice, ep *EndPointInfo, 
 	if g == nil || d == nil || ep == nil || fromSeq <= 0 || toSeq <= fromSeq {
 		return false
 	}
-	g.logWriteMu.RLock()
+	// 1119.fix1: 老数据可能在 LogCurID=0 时就被 .bot off 暂停；恢复后
+	// ensureGroupLogState 还没机会补 ID，直接返回会导致 off 前窗口不补录。
+	// 这里在锁内按名字找回/创建一次，后续任务才能用正确的 logID。
+	g.logWriteMu.Lock()
 	current := g.GetLogState()
+	if current.On && current.ID == 0 && current.Name != "" && d.DBOperator != nil {
+		if id, err := service.LogGetOrCreate(d.DBOperator, g.GroupID, current.Name); err == nil && id > 0 {
+			g.SetLogState(id, current.Name, true)
+			current.ID = id
+		} else if d.Logger != nil {
+			d.Logger.Warnf("off 前补录无法补全 logID: 群=%s 名称=%s err=%v", g.GroupID, current.Name, err)
+		}
+	}
 	currentEpoch := g.logEpoch.Load()
-	g.logWriteMu.RUnlock()
+	g.logWriteMu.Unlock()
 	if !current.On || current.ID == 0 || current.Name == "" {
 		return false
 	}
@@ -2088,7 +2145,7 @@ func logGapFillPlatformNotice(ep *EndPointInfo) string {
 	if !knownUnsupported || endpointSupportsLogGapFill(ep) {
 		return ""
 	}
-	return "\n当前渠道不支持掉线日志自动补全（KOOK、官方 QQ 等非 OneBot 渠道），请保持核心在线。"
+	return "\n当前渠道不支持掉线日志自动补全（KOOK、官方 QQ、内置 Lagrange 等未接入群消息历史序号/历史拉取的渠道），请保持核心在线。"
 }
 
 // cloneGapTriggerMessage 复制触发补全任务的实时消息。
@@ -2299,6 +2356,9 @@ func mergeLogGapTaskWindow(dst, src *logGapFillTask) {
 		dst.dice = src.dice
 	}
 	dst.backfillOnly = dst.backfillOnly || src.backfillOnly
+	// 1119.fix1: 只补日志的“off 前窗口”任务被普通任务合并时，限制不能丢；
+	// 否则合并后的任务可能重放历史指令或按历史 .log off 再次关闭 live 日志。
+	dst.forceLogOnly = dst.forceLogOnly || src.forceLogOnly
 	// gap 只用于静默阈值判定，沿用原合并语义累加净遗漏数；
 	// 不能用窗口跨度过早放大阈值。
 	dst.gap += src.gap
@@ -2576,8 +2636,8 @@ func (t logGapFillTask) run() {
 				// 扫完了。保留 pending 并退避，避免误报“补全成功”。
 				t.group.mergeLogGapPendingRangeMode(curFrom, t.toSeq, t.discoverFromOff)
 				t.group.MarkDirty(t.dice)
-				t.dice.Logger.Warnf("日志补全无法前进(历史消息缺少可用seq): 群=%s 起始seq=%d",
-					t.group.GroupID, curFrom)
+				t.dice.Logger.Warnf("日志补全无法前进(未覆盖到区间起点或历史消息缺少可用seq): 群=%s 起始seq=%d 已到seq=%d",
+					t.group.GroupID, curFrom, coveredTo)
 				t.group.deferLogGapRetry(logGapFillRetryBackoff)
 				return
 			}
@@ -2788,7 +2848,13 @@ func (t logGapFillTask) fetchHistoryOnceWithCoverage(ctx context.Context, fetche
 			// 必须保留 pending，不能当成空历史清掉。
 			return nil, from, errLogGapHistoryNoProgress
 		}
-		return msgs, historyRangeMaxSeq(msgs), nil
+		// 1119.fix1: complete=false 表示还没扫到区间起点。此时绝不能把
+		// 已取到消息的最大 seq 当作“已覆盖到段尾”：run() 会据此前移
+		// pending 起点并跳过未扫到的前半段，造成静默丢消息。返回起点
+		// 表示“本轮没有可前移的覆盖”，由 run() 保留 pending 并退避重试。
+		// 已取到的部分消息仍会返回；多段模式下 run() 会先按 on/off 过滤
+		// 后写库，单段模式下则等待下一次完整拉取，避免误写 off 段。
+		return msgs, from, nil
 	}
 
 	all := make([]*Message, 0, total)
@@ -2981,13 +3047,50 @@ type logGapLifecycleInfo struct {
 	lastOnSeq int64
 }
 
+// historicalCommandText 把历史消息还原成“可解析指令”的文本。
+//
+// 实时命令解析走 CommandParseNew 的 Segment 路径：引用、图片、表情等
+// 第一个文本段之前的非文本元素会被跳过；历史消息的 m.Message 是 CQ 文本，
+// 直接 CommandParse 会把这些前导 CQ 当成命令内容，导致引用回复发送的
+// .bot/.log 指令识别不到（1119.fix1）。
+//
+// 这里与实时路径保持一致：
+//   - 跳过第一个文本段之前的引用/图片/表情等非文本元素；
+//   - 保留前导 @，让 mentionsOtherUser 仍能判断“只 @ 别人”；
+//   - 第一个文本段之后的元素按 CQ 文本拼接，参数语义与实时一致。
+func historicalCommandText(m *Message) string {
+	if m == nil {
+		return ""
+	}
+	if len(m.Segment) == 0 {
+		return m.Message
+	}
+	var b strings.Builder
+	started := false
+	for _, elem := range m.Segment {
+		if elem == nil {
+			continue
+		}
+		if _, ok := elem.(*message.TextElement); ok {
+			started = true
+		}
+		if !started {
+			if _, ok := elem.(*message.AtElement); !ok {
+				continue
+			}
+		}
+		b.WriteString(message.MessageElementToString(elem))
+	}
+	return b.String()
+}
+
 // parseLogLifecycleCommand 用真实命令解析器识别 .log off/.log on/.log new/
 // .log end/.log halt。只解析语法，不执行命令。
 func (t logGapFillTask) parseLogLifecycleCommand(m *Message) (kind, name string, cmdArgs *CmdArgs) {
 	if t.dice == nil || m == nil {
 		return "", "", nil
 	}
-	ca := CommandParse(m.Message, []string{"log"}, t.dice.CommandPrefix, m.Platform, false)
+	ca := CommandParse(historicalCommandText(m), []string{"log"}, t.dice.CommandPrefix, m.Platform, false)
 	if ca == nil || !strings.EqualFold(ca.Command, "log") {
 		return "", "", nil
 	}
@@ -3020,7 +3123,7 @@ func (t logGapFillTask) parseUnsupportedLogLifecycleCommand(m *Message) (kind st
 	if kind, _, ca := t.parseLogLifecycleCommand(m); kind == "new" || kind == "end" || kind == "halt" {
 		return "log " + kind, ca, false
 	}
-	if ca := CommandParse(m.Message, []string{"ext"}, t.dice.CommandPrefix, m.Platform, false); ca != nil &&
+	if ca := CommandParse(historicalCommandText(m), []string{"ext"}, t.dice.CommandPrefix, m.Platform, false); ca != nil &&
 		strings.EqualFold(ca.Command, "ext") {
 		switch strings.ToLower(ca.GetArgN(1)) {
 		case "off", "on":
@@ -3048,7 +3151,7 @@ func (t logGapFillTask) parseBotLifecycleCommand(m *Message) (kind, botNum strin
 	if t.dice == nil || m == nil {
 		return "", "", nil
 	}
-	ca := CommandParse(m.Message, []string{"bot"}, t.dice.CommandPrefix, m.Platform, false)
+	ca := CommandParse(historicalCommandText(m), []string{"bot"}, t.dice.CommandPrefix, m.Platform, false)
 	if ca == nil || !strings.EqualFold(ca.Command, "bot") {
 		return "", "", nil
 	}
@@ -3120,6 +3223,14 @@ func (t logGapFillTask) lifecycleCommandValid(m *Message, cmdArgs *CmdArgs) bool
 	}
 	if t.isBotSender(m) {
 		return false
+	}
+	// 1119.fix1: 实时路径在命令分发前会 checkBan；历史扫描没有 MsgContext，
+	// 这里至少按骰主黑名单拦住“被 ban 用户”的 .log/.bot 生命周期指令，
+	// 避免其离线发言在恢复后改变日志/机器人状态。
+	if t.dice != nil && t.dice.Config.BanList != nil && t.dice.Config.BanList.Map != nil {
+		if item, ok := t.dice.Config.BanList.GetByID(m.Sender.UserID); ok && item.Rank == BanRankBanned {
+			return false
+		}
 	}
 	return !t.mentionsOtherUser(cmdArgs)
 }
@@ -3863,7 +3974,7 @@ func (t logGapFillTask) isDeniedReplayCommand(m *Message) bool {
 	if m == nil {
 		return false
 	}
-	cmd := extractCommandName(t.dice.CommandPrefix, m.Platform, m.Message)
+	cmd := extractCommandName(t.dice.CommandPrefix, m.Platform, historicalCommandText(m))
 	if cmd == "" {
 		return false
 	}
@@ -3929,7 +4040,7 @@ func (t logGapFillTask) backfillWithNotice(missing []*Message) {
 		if t.isBotSender(m) {
 			return
 		}
-		cmd := extractCommandName(t.dice.CommandPrefix, m.Platform, m.Message)
+		cmd := extractCommandName(t.dice.CommandPrefix, m.Platform, historicalCommandText(m))
 		if cmd == "" {
 			return
 		}

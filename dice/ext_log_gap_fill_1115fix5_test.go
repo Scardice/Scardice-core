@@ -257,6 +257,8 @@ func TestBotOffWithOtherBotActiveKeepsLog_1115fix5(t *testing.T) {
 
 	g.DiceIDActiveMap.Store("QQ:other-bot", true)
 	// 1119: “另一个 bot 仍活跃”必须对应一个已启用端点；只有残留 ID 不算。
+	// 1119.fix1: 还必须是本群成员（DiceIDExistsMap），仅退群但仍启用的端点不算。
+	g.DiceIDExistsMap.Store("QQ:other-bot", true)
 	d.ImSession.EndPoints = append(d.ImSession.EndPoints, &EndPointInfo{
 		EndPointInfoBase: EndPointInfoBase{UserID: "QQ:other-bot", Enable: true},
 	})
