@@ -263,12 +263,13 @@ func SetBotOffAtGroup(ctx *MsgContext, groupID string) {
 	SetBotOffAtGroupAtSeq(ctx, groupID, 0)
 }
 
-// groupHasOtherLiveDice 清理 DiceIDActiveMap 中已删除/已禁用端点的残留 ID，
-// 并报告是否还有其它“启用的端点”仍在该群激活。
+// groupHasOtherLiveDice 清理 DiceIDActiveMap 中已退群/已删除/已禁用的残留 ID，
+// 并报告是否还有其它“启用且仍在本群”的端点处于激活状态。
 //
 // 只按 Len()==0 判断“群已完全关闭”会被残留 ID 骗过：用户删除/禁用某个账号后，
-// 它的 ID 仍留在群的 DiceIDActiveMap 里，导致 .bot off 不 deactivate、不暂停
-// 日志、也不提示；随后 .bot on 因 Active 仍为 true 而不走自动恢复。
+// 它的 ID 仍留在群的 DiceIDActiveMap 里；账号只是退群、端点仍启用时更隐蔽。
+// 这些 ID 都会导致 .bot off 不 deactivate、不暂停日志、也不提示；随后 .bot on
+// 因 Active 仍为 true 而不走自动恢复。
 func groupHasOtherLiveDice(session *IMSession, group *GroupInfo, excludeUserID string) bool {
 	if session == nil || group == nil || group.DiceIDActiveMap == nil {
 		return false
@@ -286,13 +287,24 @@ func groupHasOtherLiveDice(session *IMSession, group *GroupInfo, excludeUserID s
 		live[ep.UserID] = struct{}{}
 	}
 
+	existsMap := group.DiceIDExistsMap
+	// ExistsMap 为空多半是老数据/加载未完成，不能据此把别的 bot 全判成退群；
+	// 保持旧行为，只按端点是否启用判断。
+	memberUnknown := existsMap == nil || existsMap.Len() == 0
 	hasOther := false
 	var stale []string
 	group.DiceIDActiveMap.Range(func(id string, _ bool) bool {
 		if id == excludeUserID {
 			return true
 		}
-		if _, ok := live[id]; ok {
+		_, endpointLive := live[id]
+		// 1119.fix1: 端点仍启用不代表它还在本群。退群/被踢只会删
+		// DiceIDExistsMap，ActiveMap 会留下脏 ID；必须以 ExistsMap 为准。
+		member := memberUnknown
+		if !memberUnknown {
+			_, member = existsMap.Load(id)
+		}
+		if endpointLive && member {
 			hasOther = true
 		} else {
 			stale = append(stale, id)

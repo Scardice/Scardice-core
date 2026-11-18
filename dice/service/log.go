@@ -208,6 +208,16 @@ func getIDByGroupIDAndName(db *gorm.DB, groupID string, logName string) (logID u
 	return logInfo.ID, nil
 }
 
+// LogGetIDByName 按群号和日志名查询已有日志的内部 ID。
+// 只读，不创建日志；日志不存在时返回 ErrLogNotFound。
+// 用于修复“日志关闭但持久化 LogCurID 丢失”的老数据（1119.fix1）。
+func LogGetIDByName(operator engine2.DatabaseOperator, groupID, logName string) (uint64, error) {
+	if operator == nil || groupID == "" || logName == "" {
+		return 0, ErrLogNotFound
+	}
+	return getIDByGroupIDAndName(operator.GetLogDB(constant.READ), groupID, logName)
+}
+
 func getLogInfoByID(db *gorm.DB, logID uint64) (*model.LogInfo, error) {
 	var logInfo model.LogInfo
 	err := db.Model(&model.LogInfo{}).

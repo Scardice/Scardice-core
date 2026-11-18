@@ -118,14 +118,30 @@ func historyRangeFilter(msgs []*Message, fromSeq, toSeq int64) []*Message {
 	return out
 }
 
-func historyRangeMaxSeq(msgs []*Message) int64 {
-	var maxSeq int64
-	for _, m := range msgs {
-		if m != nil && m.Seq > maxSeq {
-			maxSeq = m.Seq
+// mergeHistoryRangeMessages 合并两条翻页路径的结果，按 seq 去重后升序返回。
+// 1119.fix1: message_id 路径与 message_seq 回退路径可能各拿到一部分区间，
+// 不能因为 message_id 路径“非空”就完全丢弃 seq 路径的结果。
+func mergeHistoryRangeMessages(lists ...[]*Message) []*Message {
+	total := 0
+	for _, list := range lists {
+		total += len(list)
+	}
+	out := make([]*Message, 0, total)
+	seen := make(map[int64]struct{}, total)
+	for _, list := range lists {
+		for _, m := range list {
+			if m == nil || m.Seq <= 0 {
+				continue
+			}
+			if _, ok := seen[m.Seq]; ok {
+				continue
+			}
+			seen[m.Seq] = struct{}{}
+			out = append(out, m)
 		}
 	}
-	return maxSeq
+	sortMessagesBySeq(out)
+	return out
 }
 
 func historyRangeCapHint(fromSeq, toSeq int64) int {
@@ -372,9 +388,48 @@ func fetchOnebotRangeBySeq(
 		})
 }
 
+// fetchOnebotHistoryRange 是 OneBot 区间拉取的策略入口：
+//   - 先按 message_id + reverse_order 向旧翻页（SnowLuma/Lagrange）；
+//   - 只要 message_id 路径没有完整覆盖起点，就再试 message_seq 向旧翻页
+//     （go-cqhttp 及只认 message_seq 的实现）；
+//   - 两条路径都未完成时合并各自结果，交给调用方按 fail-closed 处理。
+//
+// 1119 的旧实现对“message_id 路径返回了非空部分页”直接 return，导致
+// go-cqhttp 这类忽略 message_id 的实现永远走不到 seq 回退；1119.fix1 修复。
+func fetchOnebotHistoryRange(
+	ctx context.Context, req HistoryRangeRequest, fetch onebotHistoryPageFetcher,
+) ([]*Message, bool, error) {
+	msgIDMsgs, msgIDComplete, msgIDErr := fetchOnebotRangeByMessageID(ctx, req, fetch)
+	if msgIDErr == nil && msgIDComplete {
+		return msgIDMsgs, true, nil
+	}
+
+	seqMsgs, seqComplete, seqErr := fetchOnebotRangeBySeq(ctx, req, fetch)
+	if seqComplete {
+		// 1119.fix1: seq 路径空页只能说明“这一页没有数据”，不能反过来
+		// 给 message_id 路径的非空部分页升级成“已覆盖整段”。否则平台把
+		// 瞬时空页/未知参数返回成空页时，会把部分结果误报为完成。
+		if len(seqMsgs) == 0 && len(msgIDMsgs) > 0 {
+			return msgIDMsgs, false, nil
+		}
+		return mergeHistoryRangeMessages(msgIDMsgs, seqMsgs), true, nil
+	}
+
+	merged := mergeHistoryRangeMessages(msgIDMsgs, seqMsgs)
+	if len(merged) > 0 {
+		// 有进展但没覆盖到起点：调用方必须保留 pending，不能把 maxSeq 当覆盖。
+		return merged, false, nil
+	}
+	if msgIDErr != nil {
+		return nil, false, msgIDErr
+	}
+	if seqErr != nil {
+		return nil, false, seqErr
+	}
+	return nil, false, errLogGapHistoryNoProgress
+}
+
 // FetchGroupMsgHistoryRange 实现 HistoryRangeFetcher。
-// 先按 message_id 语义（SnowLuma/Lagrange）拉取；若实现不认 message_id
-// （拿不到区间内消息且没有进度），回退到 message_seq 向旧翻页（go-cqhttp）。
 func (p *PlatformAdapterOnebot) FetchGroupMsgHistoryRange(
 	ctx context.Context, req HistoryRangeRequest,
 ) ([]*Message, bool, error) {
@@ -394,20 +449,5 @@ func (p *PlatformAdapterOnebot) FetchGroupMsgHistoryRange(
 		params.GroupID = gid
 		return p.fetchOnebotHistoryPage(ctx, req.GroupID, gid, params)
 	}
-	msgs, complete, err := fetchOnebotRangeByMessageID(ctx, req, fetch)
-	if err == nil && (complete || len(msgs) > 0) {
-		return msgs, complete, nil
-	}
-
-	seqMsgs, seqComplete, seqErr := fetchOnebotRangeBySeq(ctx, req, fetch)
-	if seqErr == nil && (seqComplete || len(seqMsgs) > 0) {
-		return seqMsgs, seqComplete, nil
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	if seqErr != nil {
-		return nil, false, seqErr
-	}
-	return nil, false, errLogGapHistoryNoProgress
+	return fetchOnebotHistoryRange(ctx, req, fetch)
 }

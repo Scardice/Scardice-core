@@ -896,11 +896,13 @@ func (d *Dice) registerCoreCommands() {
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 
+					wasLogPaused := ctx.Group.isLogPausedByBotOff()
 					SetBotOffAtGroupAtSeq(ctx, ctx.Group.GroupID, msg.Seq)
 					text := DiceFormatTmpl(ctx, "核心:骰子关闭")
 					// 只有本次真的把日志自动关闭时才提示；用户本来就 .log off 的
-					// 群不应被谎报“会自动开启”。
-					if ctx.Group.isLogPausedByBotOff() {
+					// 群不应被谎报“会自动开启”。1119.fix1: 已经因 .bot off 暂停过
+					// 的日志，重复 .bot off 不再重复提示。
+					if !wasLogPaused && ctx.Group.isLogPausedByBotOff() {
 						text += "\n日志记录已自动关闭（未结束，.bot on 后自动开启）"
 					}
 					ReplyToSender(ctx, msg, text)
