@@ -849,6 +849,7 @@ func (d *Dice) registerCoreCommands() {
 					}
 
 					wasAutoOffLog := ctx.Group != nil && ctx.Group.isLogPausedByBotOff()
+					wasLogOn := ctx.Group != nil && ctx.Group.GetLogState().On
 					SetBotOnAtGroup(ctx, msg.GroupID)
 					// TODO：ServiceAtNew此处忽略是否合理？
 					ctx.Group, _ = ctx.Session.ServiceAtNew.Load(msg.GroupID)
@@ -860,7 +861,9 @@ func (d *Dice) registerCoreCommands() {
 					// 真实的离线窗口吞掉。没有 seq 的平台仍保留原标记兜底。
 					// 只在“本次确实从 .bot off 自动关闭中恢复”时重建；普通 .bot on
 					// 是空操作，不能让 resetLogSeq 取消掉正在进行的合法补全。
-					autoOnLog := wasAutoOffLog && ctx.Group != nil && ctx.Group.GetLogState().On
+					// 1120: 如果日志在 SetBotOnAtGroup 之前已经是 on（别处已恢复），
+					// resume 实际不会执行；此时不能再 resetLogSeq 吞掉在途区间。
+					autoOnLog := !wasLogOn && wasAutoOffLog && ctx.Group != nil && ctx.Group.GetLogState().On
 					if autoOnLog && msg.Seq > 0 {
 						ctx.Group.resetLogSeq(msg.Seq, msg.RawID)
 						ctx.Group.clearLogResumeSkipGap()
@@ -896,13 +899,13 @@ func (d *Dice) registerCoreCommands() {
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 
-					wasLogPaused := ctx.Group.isLogPausedByBotOff()
+					wasLogPaused := ctx.Group.logPhase() == groupLogPhasePausedByBotOff
 					SetBotOffAtGroupAtSeq(ctx, ctx.Group.GroupID, msg.Seq)
 					text := DiceFormatTmpl(ctx, "核心:骰子关闭")
 					// 只有本次真的把日志自动关闭时才提示；用户本来就 .log off 的
 					// 群不应被谎报“会自动开启”。1119.fix1: 已经因 .bot off 暂停过
 					// 的日志，重复 .bot off 不再重复提示。
-					if !wasLogPaused && ctx.Group.isLogPausedByBotOff() {
+					if !wasLogPaused && ctx.Group.logPhase() == groupLogPhasePausedByBotOff {
 						text += "\n日志记录已自动关闭（未结束，.bot on 后自动开启）"
 					}
 					ReplyToSender(ctx, msg, text)

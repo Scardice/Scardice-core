@@ -30,14 +30,33 @@ type HistoryRangeRequest struct {
 	ToRawID   interface{}
 }
 
+// HistoryRangeResult 描述一次区间拉取的覆盖状态。
+//
+// 1119 只用 complete 一个 bool，导致“部分页非空”和“平台明确没有更早历史”
+// 混在一起，调用方无法判断能否前移 pending。1120 拆成两个明确事实：
+//   - ReachedStart：已经取到 (FromSeq, ToSeq) 的左边界，整段扫描完成；
+//   - Boundary：平台明确表示没有更早历史（保留期/空群/消息已删除），
+//     即使没到左边界，本段也可视为“平台能给的就这些”。首屏即空页时不
+//     置位（无法区分真实空群和瞬时失败），调用方保留 pending。
+//
+// 两者都为 false 表示“还没扫完，且平台没有给出边界”，调用方必须保留
+// pending 并退避，不能把已取到消息的最大 seq 当成整段覆盖。
+type HistoryRangeResult struct {
+	Messages     []*Message
+	ReachedStart bool
+	Boundary     bool
+}
+
 // HistoryRangeFetcher 是 HistoryFetcher 的可选增强：适配器自己负责按平台
 // 语义翻页（message_id + reverse_order、message_seq 向旧等），返回
-// (FromSeq, ToSeq) 内能拿到的消息，并报告是否已经覆盖到区间起点或平台历史
-// 边界。
-//
-// complete=true 表示调用方可以把本段视为已扫描完（包括“平台确实没有更多
-// 历史/消息已删除”）；complete=false 表示还没扫到起点，调用方必须保留
-// pending，不能用“拿到了最新一页”冒充补全完成。
+// (FromSeq, ToSeq) 内能拿到的消息，并报告覆盖状态。
 type HistoryRangeFetcher interface {
-	FetchGroupMsgHistoryRange(ctx context.Context, req HistoryRangeRequest) (msgs []*Message, complete bool, err error)
+	FetchGroupMsgHistoryRange(ctx context.Context, req HistoryRangeRequest) (HistoryRangeResult, error)
+}
+
+// HistoryLatestSeqFetcher 是启动对账的可选能力：不依赖新消息，直接取当前
+// 群最新历史消息的 seq 与 raw id。用于核心重启后 10s 主动发现离线缺口；
+// 未实现或平台不支持时跳过，仍由下一条群消息触发补全。
+type HistoryLatestSeqFetcher interface {
+	FetchLatestHistorySeq(ctx context.Context, groupID string) (seq int64, rawID interface{}, err error)
 }

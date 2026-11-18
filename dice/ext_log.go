@@ -437,6 +437,19 @@ func ensureGroupLogState(ctx *MsgContext, group *GroupInfo) GroupLogState {
 	return getGroupLogState(group)
 }
 
+// logGapIncompleteForUpload 判断当前日志是否还有未完成的补全任务/区间。
+// .log end/get/masterget/export 在补全未完成时上传会少一段；1120 起阻止并提示。
+func logGapIncompleteForUpload(group *GroupInfo) bool {
+	if group == nil {
+		return false
+	}
+	if group.hasAnyLogGapTask() {
+		return true
+	}
+	from, to, _ := group.pendingLogGapRangeSnapshot()
+	return from > 0 && to > from
+}
+
 // EvalPlayerGroupCardTemplate 只求值 .sn 模板，不调用平台改名接口。
 // 求值 panic 转为 error，避免名片异常中断正文回复。
 func EvalPlayerGroupCardTemplate(ctx *MsgContext, tmpl string) (result string, err error) {
@@ -655,6 +668,10 @@ func RegisterBuiltinExtLog(self *Dice) {
 			}
 
 			getAndUpload := func(gid, lname string) {
+				if target, ok := ctx.Session.ServiceAtNew.Load(gid); ok && logGapIncompleteForUpload(target) {
+					ReplyToSenderRaw(ctx, msg, "当前日志的离线补录尚未完成，为避免上传缺失，请等待补全完成后重试；如确认放弃补录，先 .log halt。", "skip")
+					return
+				}
 				if lname != "" {
 					var ok bool
 					lname, ok = resolveLogNameWithReply(gid, lname)
@@ -892,6 +909,10 @@ func RegisterBuiltinExtLog(self *Dice) {
 					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_关闭_失败"))
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
+				if logGapIncompleteForUpload(group) {
+					ReplyToSender(ctx, msg, "日志补全尚未完成，暂时不能结束日志。请等待补全完成通知后重试；如确认放弃补录，先 .log halt。")
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 				lines, _ := service.LogLinesCountGet(ctx.Dice.DBOperator, group.GroupID, state.Name)
 				VarSetValueInt64(ctx, "$t当前记录条数", lines)
 				VarSetValueStr(ctx, "$t记录名称", state.Name)
@@ -1063,6 +1084,10 @@ func RegisterBuiltinExtLog(self *Dice) {
 				var ok bool
 				logName, ok = resolveLogNameWithReply(group.GroupID, logName)
 				if !ok {
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
+				if logGapIncompleteForUpload(group) {
+					ReplyToSenderRaw(ctx, msg, "当前日志的离线补录尚未完成，为避免导出缺失，请等待补全完成后重试；如确认放弃补录，先 .log halt。", "skip")
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 
@@ -1522,6 +1547,12 @@ func RegisterBuiltinExtLog(self *Dice) {
 			}
 		},
 		OnMessageReceived: func(ctx *MsgContext, msg *Message) {
+			// 1120: 记录当前 OneBot 实现是否真的提供群消息 seq。
+			if msg != nil && msg.MessageType == "group" && ctx.EndPoint != nil {
+				if onebot, ok := ctx.EndPoint.Adapter.(*PlatformAdapterOnebot); ok {
+					onebot.noteIncomingSeq(msg.Seq)
+				}
+			}
 			// 处理日志
 			if ctx.Group != nil {
 				logState := ensureGroupLogState(ctx, ctx.Group)
@@ -1535,7 +1566,12 @@ func RegisterBuiltinExtLog(self *Dice) {
 						ctx.Group.enqueuePendingOffDiscoveryBackfill(ctx.Dice, ctx.EndPoint, logState)
 						skipGap = true
 					}
-					if msg.Seq > 0 && !skipGap {
+					if msg.Seq > 0 && skipGap {
+						// 1120: off 发现 backfill 期间实时消息照常写入，但不再
+						// 走缺口计算；仍要推进内存基线，避免下一条消息把已经
+						// 记录的区间再拉一次历史。
+						ctx.Group.updateLogSeq(msg.Seq, msg.RawID)
+					} else if msg.Seq > 0 {
 						// 只有“日志正在记录”时才会走到这里；off 期间整段不进来，
 						// 所以 off 的消息永远不会被算成缺口。
 						fromSeq, lastMsgID, gap := logGapFromMessage(ctx.Dice, ctx.Group, logState, msg.Seq, msg.RawID)
@@ -1640,6 +1676,10 @@ func getSpecifiedGroupIfMaster(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) 
 			}
 		case ctx.EndPoint != nil && ctx.EndPoint.Platform == "QQ":
 			prefix = "QQ-Group"
+		case ctx.EndPoint != nil && ctx.EndPoint.Platform == "QQ-CH":
+			// 1120: QQ 频道的群 ID 是 QQ-CH-Group:<guild>-<channel>，
+			// 不能沿用普通 QQ 的 QQ-Group 前缀。
+			prefix = "QQ-CH-Group"
 		case ctx.EndPoint != nil && ctx.EndPoint.Platform == "KOOK":
 			prefix = "KOOK-CH-Group"
 		}
@@ -1771,10 +1811,17 @@ const (
 	logGapFillPageSize     = 100              // 单次 get_group_msg_history 的拉取上限
 	logGapFillMaxMessages  = 2000             // 单段历史拉取的最大消息数；run() 从缺口起点分段覆盖整个缺口
 	logGapFillFetchRetries = 3                // 瞬时网络错误的重试次数
+	// logGapFillMaxTotalMessages 是大缺口“整段预取”的上限。超过时不再
+	// 分段硬拉：分段拉取会复用 trigger 锚点，越早的段重复拉取越多，且
+	// 可能在未覆盖段起点时按错误 on/off 状态写库。超限时保留 pending 并提示。
+	logGapFillMaxTotalMessages = 20000
 	// logGapFillRetryBackoff 是拉取整体失败后，pending 区间重新触发补全的
 	// 最小间隔。pending 会保留到补全完成，没有退避时每条新消息都会重试。
 	logGapFillRetryBackoff = 2 * time.Minute
 )
+
+// errLogGapTooLarge 表示缺口超过单次整段预取上限。
+var errLogGapTooLarge = errors.New("日志缺口超过单次补全上限")
 
 // logGapReplayDeniedCommands 是静默重放时不允许执行的管理指令。
 // 小断层会重走完整消息流程，若把漏掉的 .log off/.bot off 等指令也重放，
@@ -2066,6 +2113,8 @@ func (g *GroupInfo) enqueuePreOffBackfillAfterResume(d *Dice, ep *EndPointInfo, 
 		toSeq:        toSeq,
 		gap:          toSeq - fromSeq - 1,
 		forceLogOnly: true,
+		// .bot on/.log on 的回复已经承诺“完成后会通知”；0 条也要收尾。
+		notifyOnComplete: true,
 	}
 	g.enqueueLogGapFill(task)
 	return true
@@ -2120,7 +2169,17 @@ func endpointSupportsLogGapFill(ep *EndPointInfo) bool {
 	if ep == nil || ep.Adapter == nil {
 		return false
 	}
+	// 1120: QQ 频道的消息没有群消息 seq，不能因为适配器实现了 HistoryFetcher
+	// 就宣称支持补全。
+	if ep.Platform == "QQ-CH" {
+		return false
+	}
 	if gocq, ok := ep.Adapter.(*PlatformAdapterGocq); ok && gocq.BuiltinMode == "lagrange" {
+		return false
+	}
+	// 纯 OneBot 实现如果连续群消息都没有 message_seq，实际永远触发不了补全；
+	// 这里按“是否真的见过 seq”判能力，而不是只看适配器类型。
+	if onebot, ok := ep.Adapter.(*PlatformAdapterOnebot); ok && !onebot.hasMessageSeq() {
 		return false
 	}
 	if _, ok := ep.Adapter.(HistoryRangeFetcher); ok {
@@ -2137,7 +2196,12 @@ func logGapFillPlatformNotice(ep *EndPointInfo) string {
 	if ep == nil {
 		return ""
 	}
-	knownUnsupported := ep.Platform == "KOOK" || isOfficialQQEndpoint(ep) ||
+	onebotNoSeq := false
+	if onebot, ok := ep.Adapter.(*PlatformAdapterOnebot); ok {
+		onebotNoSeq = !onebot.hasMessageSeq()
+	}
+	knownUnsupported := ep.Platform == "KOOK" || ep.Platform == "QQ-CH" ||
+		isOfficialQQEndpoint(ep) || onebotNoSeq ||
 		func() bool {
 			gocq, ok := ep.Adapter.(*PlatformAdapterGocq)
 			return ok && gocq.BuiltinMode == "lagrange"
@@ -2145,7 +2209,129 @@ func logGapFillPlatformNotice(ep *EndPointInfo) string {
 	if !knownUnsupported || endpointSupportsLogGapFill(ep) {
 		return ""
 	}
-	return "\n当前渠道不支持掉线日志自动补全（KOOK、官方 QQ、内置 Lagrange 等未接入群消息历史序号/历史拉取的渠道），请保持核心在线。"
+	switch {
+	case ep.Platform == "QQ-CH":
+		return "\n当前渠道（QQ 频道）不支持掉线日志自动补全，请保持核心在线。"
+	case onebotNoSeq:
+		return "\n当前 OneBot 实现不提供群消息 message_seq，无法自动补全掉线日志，请保持核心在线。"
+	default:
+		return "\n当前渠道不支持掉线日志自动补全（KOOK、官方 QQ、内置 Lagrange 等未接入群消息历史序号/历史拉取的渠道），请保持核心在线。"
+	}
+}
+
+// scheduleLogGapReconcile 在端点连接/重连后延迟对账一次，不阻塞连接流程。
+func (d *Dice) scheduleLogGapReconcile(delay time.Duration) {
+	if d == nil {
+		return
+	}
+	go func() {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		d.reconcileLogGapsOnStartup()
+	}()
+}
+
+// reconcileLogGapsOnStartup 在核心启动/端点就绪后主动对账一次：
+// 不依赖新消息，直接取每个开启日志的群的最新历史 seq，和本地已记录 seq 比较，
+// 有缺口就入队补全。用于“核心恢复后群里暂时没人说话，用户直接 .log end”的场景；
+// 未实现 HistoryLatestSeqFetcher 或端点未连接时跳过，仍由下一条消息触发。
+func (d *Dice) reconcileLogGapsOnStartup() {
+	if d == nil || d.ImSession == nil {
+		return
+	}
+	count := 0
+	d.ImSession.ServiceAtNew.Range(func(_ string, group *GroupInfo) bool {
+		if d.reconcileLogGapForGroup(group) {
+			count++
+		}
+		return true
+	})
+	if d.Logger != nil && count > 0 {
+		d.Logger.Infof("启动日志缺口对账: 已入队 %d 个群", count)
+	}
+}
+
+func (d *Dice) reconcileLogGapForGroup(group *GroupInfo) bool {
+	if d == nil || group == nil || d.ImSession == nil || !group.IsActiveRaw() {
+		return false
+	}
+	state := group.GetLogState()
+	if !state.On || state.ID == 0 || state.Name == "" {
+		return false
+	}
+	if group.hasAnyLogGapTask() {
+		return false
+	}
+
+	var ep *EndPointInfo
+	for _, candidate := range d.ImSession.EndPoints {
+		if candidate == nil || !candidate.Enable || candidate.State != StateConnected || candidate.UserID == "" {
+			continue
+		}
+		// 必须是在本群激活/存在的端点；ExistsMap 偶有老数据缺失，ActiveMap 兜底。
+		active := group.DiceIDActiveMap != nil && group.DiceIDActiveMap.Exists(candidate.UserID)
+		member := group.DiceIDExistsMap != nil && group.DiceIDExistsMap.Exists(candidate.UserID)
+		if !active && !member {
+			continue
+		}
+		if _, ok := candidate.Adapter.(HistoryLatestSeqFetcher); !ok {
+			continue
+		}
+		if !endpointSupportsLogGapFill(candidate) {
+			continue
+		}
+		ep = candidate
+		break
+	}
+	if ep == nil {
+		return false
+	}
+
+	last := group.logLastSeqSnapshot()
+	if last <= 0 && d.DBOperator != nil {
+		if seq, err := service.LogGetLastSeq(d.DBOperator, state.ID); err == nil {
+			last = seq
+		}
+	}
+	if last <= 0 {
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	latest, rawID, err := ep.Adapter.(HistoryLatestSeqFetcher).FetchLatestHistorySeq(ctx, group.GroupID)
+	if err != nil || latest <= 0 || latest <= last+1 {
+		return false
+	}
+	trigger := &Message{
+		MessageType: "group",
+		GroupID:     group.GroupID,
+		Platform:    ep.Platform,
+		Seq:         latest,
+		RawID:       rawID,
+		Time:        time.Now().Unix(),
+		Sender:      SenderBase{UserID: ep.UserID, Nickname: ep.Nickname},
+	}
+	task := logGapFillTask{
+		dice:      d,
+		endpoint:  ep,
+		group:     group,
+		logID:     state.ID,
+		logName:   state.Name,
+		epoch:     group.logEpoch.Load(),
+		fromSeq:   last,
+		toSeq:     latest,
+		gap:       latest - last - 1,
+		lastMsgID: nil,
+		trigger:   trigger,
+	}
+	group.enqueueLogGapFill(task)
+	if d.Logger != nil {
+		d.Logger.Infof("启动日志缺口对账: 群=%s 上条seq=%d 最新seq=%d 缺失=%d",
+			group.GroupID, last, latest, task.gap)
+	}
+	return true
 }
 
 // cloneGapTriggerMessage 复制触发补全任务的实时消息。
@@ -2188,6 +2374,19 @@ type logGapFillTask struct {
 	// 在 off 前窗口任务完成前恢复日志：旧任务会因 epoch/LogOn 变化停止，
 	// 重新挂的任务沿用同一窗口，但不能再执行旧指令。
 	forceLogOnly bool
+	// notifyOnComplete 表示调用方已经向用户承诺“完成后会通知”。
+	// 即使本段没有可补消息，也要发一条收尾提示（1120）。
+	notifyOnComplete bool
+	// writtenSeq 记录本任务在分段扫描阶段已经写库的 seq，避免最终汇总
+	// 再次写入/重复计数。只在大缺口多段任务中初始化，map 在任务副本间共享。
+	writtenSeq map[int64]struct{}
+	// prewritten 是本次任务分段阶段已写入的条数，用于通知里的总补录数。
+	prewritten int
+	// prefetched/prefetchComplete 用于大缺口：先按整条缺口从 trigger 锚点
+	// 一次拉完，再在内存里分段过滤/写库。避免每段都从 trigger 重新向旧翻页，
+	// 也避免 incomplete 的部分页在 on/off 状态未知时先写库。
+	prefetched       []*Message
+	prefetchComplete bool
 }
 
 // logStateStillValid 校验补全任务对应的日志仍是该群当前开启的日志。
@@ -2544,6 +2743,28 @@ func (t logGapFillTask) run() {
 	if multiSegment {
 		t.dice.Logger.Infof("日志缺口较大(共%d条)，按%d条一段分段扫描: 群=%s",
 			totalGap, logGapFillMaxMessages, t.group.GroupID)
+		// 分段写库会先落一部分；记录已写 seq，最终汇总不再重复写入/计数。
+		t.writtenSeq = make(map[int64]struct{})
+		// 1120: 先按整条缺口预取一次，再在内存里分段。不能每段都复用
+		// trigger 锚点从最新消息向旧翻页：越早的段重复拉取越多，且
+		// incomplete 的部分页会在 on/off 状态未知时先写库。
+		if err := t.prefetchWholeGap(fetchCtx, fetcher); err != nil {
+			t.dice.Logger.Errorf("日志补全整段预取失败: 群=%s 窗口=%d..%d err=%v",
+				t.group.GroupID, t.fromSeq, t.toSeq, err)
+			t.group.mergeLogGapPendingRangeMode(t.fromSeq, t.toSeq, t.discoverFromOff)
+			t.group.MarkDirty(t.dice)
+			t.group.deferLogGapRetry(logGapFillRetryBackoff)
+			switch {
+			case errors.Is(err, errLogGapTooLarge):
+				t.notifyGapFailure(fmt.Sprintf("日志缺口过大（%d条，单次上限%d条），已保留待补记录，将自动重试。",
+					totalGap, logGapFillMaxTotalMessages))
+			case errors.Is(err, errLogGapHistoryNoProgress):
+				t.notifyGapFailure("日志补全未完成（平台历史没有覆盖到缺口起点），已保留待补记录，将自动重试。")
+			default:
+				t.notifyGapFailure("日志补全拉取失败，已保留待补记录，将自动重试。")
+			}
+			return
+		}
 		// 分段写库前重置写入失败标记；任一段写入失败都会保留 pending。
 		t.group.beginLogGapWriteTracking()
 	}
@@ -2564,6 +2785,7 @@ func (t logGapFillTask) run() {
 			t.group.mergeLogGapPendingRangeMode(curFrom, t.toSeq, t.discoverFromOff)
 			t.group.MarkDirty(t.dice)
 			t.group.deferLogGapRetry(logGapFillRetryBackoff)
+			t.notifyGapFailure("日志补全拉取失败，已保留待补记录，将自动重试。")
 			return
 		}
 		missing := seg.filterMissing(msgs)
@@ -2579,6 +2801,7 @@ func (t logGapFillTask) run() {
 			t.group.mergeLogGapPendingRangeMode(curFrom, t.toSeq, t.discoverFromOff)
 			t.group.MarkDirty(t.dice)
 			t.group.deferLogGapRetry(logGapFillRetryBackoff)
+			t.notifyGapFailure("日志补全暂缓（查询已记录消息失败），已保留待补记录，将自动重试。")
 			return
 		}
 
@@ -2596,6 +2819,7 @@ func (t logGapFillTask) run() {
 				t.dice.Logger.Warnf("日志补全分段写入失败，保留 pending 并退避: 群=%s 起始seq=%d",
 					t.group.GroupID, curFrom)
 				t.group.deferLogGapRetry(logGapFillRetryBackoff)
+				t.notifyGapFailure("日志补全写入失败，已保留待补记录，将自动重试。")
 				return
 			}
 			if segmentComplete && coveredTo > curFrom && !stateChanged && !info.found {
@@ -2639,6 +2863,7 @@ func (t logGapFillTask) run() {
 				t.dice.Logger.Warnf("日志补全无法前进(未覆盖到区间起点或历史消息缺少可用seq): 群=%s 起始seq=%d 已到seq=%d",
 					t.group.GroupID, curFrom, coveredTo)
 				t.group.deferLogGapRetry(logGapFillRetryBackoff)
+				t.notifyGapFailure("日志补全未完成（平台历史没有覆盖到缺口起点），已保留待补记录，将自动重试。")
 				return
 			}
 			// 段内只拉到一部分：从实际覆盖到的 seq 继续，不能直接跳到段尾。
@@ -2648,6 +2873,10 @@ func (t logGapFillTask) run() {
 		curFrom = segTo - 1
 	}
 	missing := allMissing
+	if t.writtenSeq != nil {
+		t.prewritten = len(t.writtenSeq)
+	}
+	t.notifyIgnoredCommands(hist.ignored)
 
 	if t.discoverFromOff {
 		if t.backfillOnly {
@@ -2670,6 +2899,18 @@ func (t logGapFillTask) run() {
 				forceLogOnly = true
 				t.dice.Logger.Warnf("日志补全历史状态推断已停止: 群=%s 命令=%s，后续缺口不补",
 					t.group.GroupID, decision.reason)
+				// 1120: 实时 .bot on/off 触发时，若历史最终 off，仍要应用
+				// 历史 .log off：关 live 日志并清掉 .bot off 的自动恢复标记。
+				if decision.applyLiveOff && !t.forceLogOnly {
+					if decision.deleteTrigger {
+						t.deleteTriggerRow()
+					}
+					if _, ok := t.group.logOffForHistoryAtSeq(t.toSeq); ok {
+						t.group.MarkDirty(t.dice)
+						t.dice.Logger.Infof("日志补全按历史 .log off 关闭当前日志(live bot 触发): 群=%s seq=%d",
+							t.group.GroupID, t.toSeq)
+					}
+				}
 			} else {
 				if decision.deleteTrigger {
 					t.deleteTriggerRow()
@@ -2691,11 +2932,24 @@ func (t logGapFillTask) run() {
 			// live 已被 .log off/.bot off 关闭，当前任务走 off 前窗口授权；
 			// 只需要用过滤后的消息列表，不再改 live 状态。
 			forceLogOnly = true
-			// 历史缺口已经处于 off，实时再收到的 .log off 只是重复命令：
-			// 它不该被记录，但实时路径在本地仍认为 on 时会先写进去。
+			// 1120: 历史最终 off 时，即使 live 已被 .bot off 暂停，也要清掉
+			// 自动恢复标记，避免下一次 .bot on 把日志重新打开。
+			if !hist.finalOn && !t.forceLogOnly {
+				if _, ok := t.group.logOffForHistoryAtSeq(t.toSeq); ok {
+					t.group.MarkDirty(t.dice)
+					t.dice.Logger.Infof("日志补全按历史 .log off 清除 bot off 暂停: 群=%s seq=%d",
+						t.group.GroupID, t.toSeq)
+				}
+			}
+			// 历史缺口已经处于 off，实时再收到的 .log off/.bot off 只是
+			// 重复命令：它不该被记录，但实时路径在本地仍认为 on 时会先写进去。
 			if !hist.finalOn {
 				if kind, _, ca := t.parseLogLifecycleCommand(t.trigger); kind == "off" &&
 					t.lifecycleCommandValid(t.trigger, ca) {
+					t.deleteTriggerRow()
+				} else if botKind, _, botCA := t.parseBotLifecycleCommand(t.trigger); botKind == "off" &&
+					t.isHistoricalPrivilegedSender(t.trigger) &&
+					t.lifecycleCommandValid(t.trigger, botCA) {
 					t.deleteTriggerRow()
 				}
 			}
@@ -2704,6 +2958,9 @@ func (t logGapFillTask) run() {
 
 	if len(missing) == 0 {
 		t.dice.Logger.Infof("日志补全无需处理: 群=%s 缺失区间内没有需要补录的他人发言", t.group.GroupID)
+		if t.notifyOnComplete {
+			t.sendGroupNotice("关闭前的遗漏记录补录完成，没有需要补录的消息。")
+		}
 		t.group.clearLogGapPendingIfIdle(t.dice)
 		return
 	}
@@ -2725,10 +2982,13 @@ func (t logGapFillTask) run() {
 		// 推断要求只补日志：不执行历史指令，但补录完成后要告知用户。
 		appended, backfillDone := t.backfillLogOnlyCount(missing)
 		done = backfillDone
-		if appended > 0 || hist.found {
-			notice := fmt.Sprintf("检测到seq不连贯，已补录 %d 条记录。", appended)
-			if !t.logStateStillValid() {
-				notice = fmt.Sprintf("日志已关闭，已补录关闭前的 %d 条记录。", appended)
+		totalAppended := appended + t.prewritten
+		if totalAppended > 0 || hist.found || t.notifyOnComplete {
+			notice := fmt.Sprintf("检测到seq不连贯，已补录 %d 条记录。", totalAppended)
+			if totalAppended == 0 && t.notifyOnComplete {
+				notice = "关闭前的遗漏记录补录完成，没有需要补录的消息。"
+			} else if !t.logStateStillValid() {
+				notice = fmt.Sprintf("日志已关闭，已补录关闭前的 %d 条记录。", totalAppended)
 			}
 			if hist.stopped {
 				notice += fmt.Sprintf("\n遇到 %s 后停止补录。", hist.unsupported)
@@ -2759,6 +3019,52 @@ func (t logGapFillTask) run() {
 	// 退避到期后由 pending floor / 新任务恢复，已写入的行会由去重跳过。
 	t.dice.Logger.Warnf("日志补全写入失败，保留 pending 并退避: 群=%s 记录=%s", t.group.GroupID, t.logName)
 	t.group.deferLogGapRetry(logGapFillRetryBackoff)
+	t.notifyGapFailure("日志补全写入失败，已保留待补记录，将自动重试。")
+}
+
+// prefetchWholeGap 在大缺口多段补录前，先按整条缺口一次拉完。
+//
+// 1119 的分段循环只改 seg.fromSeq/toSeq，trigger 仍是整条缺口的触发消息；
+// SnowLuma 的 message_id 路径每段都从 trigger 向旧翻页：越早的段重复拉取
+// 越多，缺口超过页数上限时第 1 段永远到不了起点；而且 incomplete 的部分页
+// 会在 on/off 状态未知时先写库，可能把 off 段写进日志。
+//
+// 1120 改为：先整段预取，拿到 ReachedStart/Boundary 后才在内存里分段过滤；
+// 预取不完整时一条都不写，保留 pending。
+func (t *logGapFillTask) prefetchWholeGap(ctx context.Context, fetcher HistoryFetcher) error {
+	rangeFetcher, ok := fetcher.(HistoryRangeFetcher)
+	if !ok {
+		// 旧 HistoryFetcher 没有反向区间语义；保留原分段路径。
+		return nil
+	}
+	total := t.toSeq - t.fromSeq - 1
+	if total <= 0 {
+		t.prefetched = nil
+		t.prefetchComplete = true
+		return nil
+	}
+	if total > logGapFillMaxTotalMessages {
+		return fmt.Errorf("%w: %d > %d", errLogGapTooLarge, total, logGapFillMaxTotalMessages)
+	}
+	req := HistoryRangeRequest{
+		GroupID: t.group.GroupID,
+		FromSeq: t.fromSeq,
+		ToSeq:   t.toSeq,
+		Count:   int(total),
+	}
+	if t.trigger != nil {
+		req.ToRawID = t.trigger.RawID
+	}
+	result, err := rangeFetcher.FetchGroupMsgHistoryRange(ctx, req)
+	if err != nil {
+		return err
+	}
+	if !result.ReachedStart && !result.Boundary {
+		return errLogGapHistoryNoProgress
+	}
+	t.prefetched = historyRangeFilter(result.Messages, t.fromSeq, t.toSeq)
+	t.prefetchComplete = true
+	return nil
 }
 
 // fetchHistory 按页拉取 (fromSeq, toSeq) 区间，直到覆盖到 toSeq-1 或达到上限。
@@ -2816,6 +3122,10 @@ func (t logGapFillTask) fetchHistoryOnceWithCoverage(ctx context.Context, fetche
 	if total <= 0 {
 		return nil, t.fromSeq, nil
 	}
+	if t.prefetchComplete {
+		// 大缺口已整段预取；每段只从内存里取自己的区间，不再请求平台。
+		return historyRangeFilter(t.prefetched, from, t.toSeq), t.toSeq - 1, nil
+	}
 	if from > t.fromSeq {
 		t.dice.Logger.Warnf("日志补全区间过大(共%d条)，仅补录最近%d条(seq %d-%d): 群=%s 上条seq=%d 本条seq=%d",
 			t.toSeq-t.fromSeq-1, total, from, t.toSeq-1, t.group.GroupID, t.fromSeq, t.toSeq)
@@ -2835,12 +3145,14 @@ func (t logGapFillTask) fetchHistoryOnceWithCoverage(ctx context.Context, fetche
 		if t.trigger != nil {
 			req.ToRawID = t.trigger.RawID
 		}
-		msgs, complete, err := rangeFetcher.FetchGroupMsgHistoryRange(ctx, req)
+		result, err := rangeFetcher.FetchGroupMsgHistoryRange(ctx, req)
 		if err != nil {
 			return nil, from, err
 		}
-		msgs = historyRangeFilter(msgs, from, t.toSeq)
-		if complete {
+		msgs := historyRangeFilter(result.Messages, from, t.toSeq)
+		// 1120 覆盖契约：只有“已到区间起点”或“平台明确没有更早历史”
+		// 才能把 coveredTo 推到段尾。部分页/空页但无边界时一律保留 pending。
+		if result.ReachedStart || result.Boundary {
 			return msgs, t.toSeq - 1, nil
 		}
 		if len(msgs) == 0 {
@@ -2848,12 +3160,9 @@ func (t logGapFillTask) fetchHistoryOnceWithCoverage(ctx context.Context, fetche
 			// 必须保留 pending，不能当成空历史清掉。
 			return nil, from, errLogGapHistoryNoProgress
 		}
-		// 1119.fix1: complete=false 表示还没扫到区间起点。此时绝不能把
-		// 已取到消息的最大 seq 当作“已覆盖到段尾”：run() 会据此前移
-		// pending 起点并跳过未扫到的前半段，造成静默丢消息。返回起点
-		// 表示“本轮没有可前移的覆盖”，由 run() 保留 pending 并退避重试。
-		// 已取到的部分消息仍会返回；多段模式下 run() 会先按 on/off 过滤
-		// 后写库，单段模式下则等待下一次完整拉取，避免误写 off 段。
+		// 还没扫到起点、平台也没给边界：本轮没有可前移的覆盖。
+		// 已取到的部分消息仍返回；多段模式 run() 会按 on/off 过滤后写库，
+		// 单段模式等待下一次完整拉取，避免误写 off 段。
 		return msgs, from, nil
 	}
 
@@ -3045,6 +3354,9 @@ type logGapLifecycleInfo struct {
 	// lastOnSeq 是扫描到的最晚一次有效 .log on 的 seq（0 表示没有）。
 	// 用于判断用户 .log off 标记是否晚于这次 on，避免陈旧标记拦住恢复。
 	lastOnSeq int64
+	// ignored 记录离线期间收到但未执行的 .log new/end/halt、.ext off/on log。
+	// 1120: 它们没有执行，不能当作日志边界；按实际 on 状态继续补录并告知用户。
+	ignored []string
 }
 
 // historicalCommandText 把历史消息还原成“可解析指令”的文本。
@@ -3058,11 +3370,36 @@ type logGapLifecycleInfo struct {
 //   - 跳过第一个文本段之前的引用/图片/表情等非文本元素；
 //   - 保留前导 @，让 mentionsOtherUser 仍能判断“只 @ 别人”；
 //   - 第一个文本段之后的元素按 CQ 文本拼接，参数语义与实时一致。
+var leadingCQCodeRe = regexp.MustCompile(`^\[CQ:([^,\]]+)(?:,[^\]]*)?\]`)
+
+// stripLeadingCQForCommand 处理没有 Segment 的 CQ 字符串历史（go-cqhttp）。
+// 与 Segment 路径保持一致：跳过前导引用/图片/表情等非 @ CQ，保留前导 @。
+func stripLeadingCQForCommand(text string) string {
+	rest := strings.TrimSpace(text)
+	var atPrefix strings.Builder
+	for {
+		m := leadingCQCodeRe.FindStringSubmatch(rest)
+		if m == nil {
+			break
+		}
+		if strings.EqualFold(m[1], "at") {
+			atPrefix.WriteString(m[0])
+			rest = strings.TrimSpace(rest[len(m[0]):])
+			continue
+		}
+		rest = strings.TrimSpace(rest[len(m[0]):])
+	}
+	return atPrefix.String() + rest
+}
+
 func historicalCommandText(m *Message) string {
 	if m == nil {
 		return ""
 	}
 	if len(m.Segment) == 0 {
+		if m.Platform == "QQ" {
+			return stripLeadingCQForCommand(m.Message)
+		}
 		return m.Message
 	}
 	var b strings.Builder
@@ -3285,15 +3622,13 @@ func (t logGapFillTask) filterHistoricalLogOffOn(msgs []*Message, startOn bool) 
 				continue
 			}
 			info.found = true
-			info.stopped = true
-			info.unsupported = kind
+			// 1120: 这些命令在核心离线期间没有执行，日志实际仍是原状态。
+			// 不能停止扫描（会漏掉后面的 on 段），按普通消息保留并继续。
+			info.ignored = append(info.ignored, kind)
 			if stateOn {
-				// .log new/end/halt、.bot off 等在实际执行前会先被正常
-				// OnMessageReceived 记录；保留这一行。
 				filtered = append(filtered, m)
 			}
-			info.finalOn = stateOn
-			return filtered, info
+			continue
 		}
 
 		kind, name, ca := t.parseLogLifecycleCommand(m)
@@ -3376,6 +3711,12 @@ func (t logGapFillTask) decideHistoricalLogState(info logGapLifecycleInfo) logGa
 				d.stopped = true
 				d.reason = "live bot " + botKind
 				d.forceLogOnly = true
+				// 1120: 实时 .bot on/off 本身仍交给真实命令处理器，但历史
+				// 最终状态为 off 时必须应用，否则离线 .log off 会被 .bot on
+				// 的自动恢复覆盖，或 .bot off 的暂停标记让下次 .bot on 重开。
+				d.finalOn = stateBefore
+				d.applyLiveOff = !stateBefore
+				d.deleteTrigger = !stateBefore && t.trigger != nil
 				return d
 			}
 		}
@@ -3562,6 +3903,45 @@ func (t logGapFillTask) adoptHistoricalLogOn() bool {
 	return true
 }
 
+// notifyIgnoredCommands 告知用户离线期间收到的 .log new/end/halt 等未执行。
+// 1120: 它们不再是补录边界；按实际 on 状态继续补录后，明确告诉用户命令未生效。
+func (t logGapFillTask) notifyIgnoredCommands(kinds []string) {
+	if len(kinds) == 0 {
+		return
+	}
+	seen := make(map[string]struct{}, len(kinds))
+	unique := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		if kind == "" {
+			continue
+		}
+		if _, ok := seen[kind]; ok {
+			continue
+		}
+		seen[kind] = struct{}{}
+		unique = append(unique, kind)
+	}
+	if len(unique) == 0 {
+		return
+	}
+	t.sendGroupNotice("离线期间收到的 " + strings.Join(unique, "、") +
+		" 未执行；已按实际记录状态继续补录。")
+}
+
+// notifyGapFailure 在补全失败时向群内发一次限频提示。
+// 只写核心日志会让用户以为已经补完；30 分钟一次避免退避重试刷屏。
+func (t logGapFillTask) notifyGapFailure(text string) {
+	if t.group == nil || text == "" {
+		return
+	}
+	now := time.Now().Unix()
+	if last := t.group.logGapFailureNoticeAt.Load(); last > 0 && now-last < 30*60 {
+		return
+	}
+	t.group.logGapFailureNoticeAt.Store(now)
+	t.sendGroupNotice(text)
+}
+
 // sendGroupNotice 向群内补发一条异步任务结果提示。任务可能在重连后运行，
 // 发送失败只记日志，不影响补录状态。
 func (t logGapFillTask) sendGroupNotice(text string) {
@@ -3618,6 +3998,8 @@ func (t logGapFillTask) runOffDiscovery(missing []*Message, hist logGapLifecycle
 	appended := 0
 	if len(missing) > 0 {
 		appended, _ = t.backfillLogOnlyCount(missing)
+		// 分段阶段已写入的条数也属于本次补录，通知里按总数展示。
+		appended += t.prewritten
 	}
 	// 群已经被 .bot off/.log off 关闭时，触发消息本身不应再写进日志：
 	// 实时处理器看到的是关闭状态，写进去会制造一条本不该存在的行。
@@ -3731,6 +4113,8 @@ func (t logGapFillTask) runOffBackfillOnly(missing []*Message, hist logGapLifecy
 	appended := 0
 	if len(missing) > 0 {
 		appended, _ = t.backfillLogOnlyCount(missing)
+		// 分段阶段已写入的条数也属于本次补录，通知里按总数展示。
+		appended += t.prewritten
 	}
 	if t.group.hasPendingLogGapTask() {
 		// 后续任务会处理更大的窗口；不在这里清 pending。
@@ -3923,9 +4307,22 @@ func (t logGapFillTask) appendSegmentLogOnly(msgs []*Message) (appended int, com
 		}
 		if appendedOK {
 			appended++
+			if t.writtenSeq != nil && m.Seq > 0 {
+				t.writtenSeq[m.Seq] = struct{}{}
+			}
 		}
 	})
 	return appended, processed == len(msgs)
+}
+
+// alreadyWritten 报告该消息是否已在本任务的分段扫描阶段写库。
+// 用于最终汇总时跳过重复写入和重复计数（1120）。
+func (t logGapFillTask) alreadyWritten(m *Message) bool {
+	if t.writtenSeq == nil || m == nil || m.Seq <= 0 {
+		return false
+	}
+	_, ok := t.writtenSeq[m.Seq]
+	return ok
 }
 
 // backfillLogOnly 只把 off 前窗口的消息写进日志，不执行任何历史指令，
@@ -3948,6 +4345,9 @@ func (t logGapFillTask) backfillLogOnlyCount(missing []*Message) (appended int, 
 	mctx.SuppressLogAppendFailureNotice = true
 
 	processed := t.forEachMissing(missing, func(m *Message) {
+		if t.alreadyWritten(m) {
+			return
+		}
 		item := t.logItem(m)
 		appendedOK := false
 		ran := t.group.withLogGapFillWrite(t, func() {
@@ -3974,7 +4374,7 @@ func (t logGapFillTask) isDeniedReplayCommand(m *Message) bool {
 	if m == nil {
 		return false
 	}
-	cmd := extractCommandName(t.dice.CommandPrefix, m.Platform, historicalCommandText(m))
+	cmd := extractCommandName(t.dice.CommandPrefix, m.Platform, m)
 	if cmd == "" {
 		return false
 	}
@@ -4022,25 +4422,27 @@ func (t logGapFillTask) backfillWithNotice(missing []*Message) {
 	appended := 0
 
 	processed := t.forEachMissing(missing, func(m *Message) {
-		item := t.logItem(m)
-		appendedOK := false
-		if !t.logStateStillValid() {
-			mctx.SuppressLogAppendFailureNotice = true
-		}
-		ran := t.group.withLogGapFillWrite(t, func() {
-			appendedOK = LogAppend(mctx, t.group.GroupID, t.logID, t.logName, &item)
-		})
-		if !ran || !appendedOK {
-			t.group.markLogGapWriteFailure()
-		}
-		if appendedOK {
-			appended++
+		if !t.alreadyWritten(m) {
+			item := t.logItem(m)
+			appendedOK := false
+			if !t.logStateStillValid() {
+				mctx.SuppressLogAppendFailureNotice = true
+			}
+			ran := t.group.withLogGapFillWrite(t, func() {
+				appendedOK = LogAppend(mctx, t.group.GroupID, t.logID, t.logName, &item)
+			})
+			if !ran || !appendedOK {
+				t.group.markLogGapWriteFailure()
+			}
+			if appendedOK {
+				appended++
+			}
 		}
 
 		if t.isBotSender(m) {
 			return
 		}
-		cmd := extractCommandName(t.dice.CommandPrefix, m.Platform, historicalCommandText(m))
+		cmd := extractCommandName(t.dice.CommandPrefix, m.Platform, m)
 		if cmd == "" {
 			return
 		}
@@ -4058,23 +4460,27 @@ func (t logGapFillTask) backfillWithNotice(missing []*Message) {
 		return
 	}
 
+	totalAppended := appended + t.prewritten
 	t.dice.Logger.Infof("日志补全完成(指令未执行): 群=%s 补录=%d条 涉及指令用户=%d",
-		t.group.GroupID, appended, len(stats))
+		t.group.GroupID, totalAppended, len(stats))
 
-	if appended == 0 {
+	if totalAppended == 0 {
+		if t.notifyOnComplete {
+			t.sendGroupNotice("关闭前的遗漏记录补录完成，没有需要补录的消息。")
+		}
 		return
 	}
 	// 补录期间日志被 .log off/.bot off 关闭：不再发“已补全”通知。
 	if !t.logStateStillValid() {
 		t.dice.Logger.Infof("日志补全完成(off 前窗口，未发通知): 群=%s 补录=%d条",
-			t.group.GroupID, appended)
+			t.group.GroupID, totalAppended)
 		return
 	}
 	ReplyToSenderRaw(mctx, &Message{
 		MessageType: "group",
 		GroupID:     t.group.GroupID,
 		Platform:    t.endpoint.Platform,
-	}, t.buildNotice(appended, stats, nicknames), "skip")
+	}, t.buildNotice(totalAppended, stats, nicknames), "skip")
 }
 
 func (t logGapFillTask) buildNotice(appended int, stats map[string]map[string]int, nicknames map[string]string) string {
@@ -4111,8 +4517,11 @@ func (t logGapFillTask) buildNotice(appended int, stats map[string]map[string]in
 
 // extractCommandName 提取消息中的指令名用于统计，非指令返回空串。
 // 仅做前导符与首个词的粗粒度识别，不解析参数，因此不依赖也不触发指令注册表。
-func extractCommandName(prefixes []string, platform string, text string) string {
-	rest, _ := AtParse(text, platform)
+// extractCommandName 提取消息中的指令名用于统计/禁执行判断，非指令返回空串。
+// 1120: 统一从 historicalCommandText 取文本，调用方不能再传原始 m.Message，
+// 避免引用回复/前置图片等 CQ 前缀绕过识别。
+func extractCommandName(prefixes []string, platform string, m *Message) string {
+	rest, _ := AtParse(historicalCommandText(m), platform)
 	rest, _ = SpecialExecuteTimesParse(strings.TrimSpace(rest))
 
 	matched := ""

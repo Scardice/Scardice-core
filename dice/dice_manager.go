@@ -347,6 +347,15 @@ func (dm *DiceManager) InitDice(writer *logger.UIWriter) {
 		i.Init(dm.Operator, writer)
 	}
 
+	// 1120: 端点连接/日志数据加载后主动对账一次离线缺口；不依赖新消息。
+	// 失败/未连接时跳过，下一条群消息仍按原路径触发。
+	go func() {
+		time.Sleep(10 * time.Second)
+		for _, d := range dm.Dice {
+			d.reconcileLogGapsOnStartup()
+		}
+	}()
+
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
