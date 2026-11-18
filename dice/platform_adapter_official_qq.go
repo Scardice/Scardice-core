@@ -1264,7 +1264,12 @@ func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *Officia
 		pa.closeOfficialQQEventQueueInstance(queue)
 		return 0
 	}
-	registerOfficialQQReadySink(pa.getAppID().String(), pa.getTokenSource(), func(data *dto.WSReadyData) {
+	// 注册 READY 过滤和 Start 必须使用同一个 token source。若在 goroutine
+	// 里重新读 pa.getTokenSource()，快速 disable→enable 时旧连接可能拿到
+	// 新 token source 启动，其迟到 READY 会通过新 sink 的指针过滤，把新
+	// 会话误置为已连接。
+	tokenSource := pa.getTokenSource()
+	registerOfficialQQReadySink(pa.getAppID().String(), tokenSource, func(data *dto.WSReadyData) {
 		pa.markOfficialQQReady(ctx, data)
 	})
 	if readyCh := pa.currentReadyCh(ctx); readyCh != nil {
@@ -1290,7 +1295,7 @@ func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *Officia
 			// 不在这里清空 pa.SessionManager：可能已有新会话接管，
 			// 本协程使用的是局部 manager，不会误启动新会话。
 		}()
-		if startErr := manager.Start(currentCtx, ws, pa.getTokenSource(), &intent); startErr != nil {
+		if startErr := manager.Start(currentCtx, ws, tokenSource, &intent); startErr != nil {
 			log.Error("official qq session manager 启动失败: ", startErr)
 		}
 	}()
@@ -1706,6 +1711,23 @@ func limitOfficialQQUnits(units []officialQQMsgUnit, limit int) []officialQQMsgU
 		return units
 	}
 	return units[:limit]
+}
+
+// officialQQDropUnsupportedMedia 在频道/频道私信上丢弃图片/语音/文件单元。
+// 这两个发送器不支持媒体；保留媒体单元会占用 5 条被动回复预算，并把后续
+// 文本挤出限制，表现为“空 content 消息 + 正文被截掉”。
+func officialQQDropUnsupportedMedia(units []officialQQMsgUnit, idType int) []officialQQMsgUnit {
+	if idType != OpenQQCHChannel && idType != OpenQQCHUser {
+		return units
+	}
+	out := make([]officialQQMsgUnit, 0, len(units))
+	for _, u := range units {
+		if u.media {
+			continue
+		}
+		out = append(out, u)
+	}
+	return out
 }
 
 // packAndCacheBatchPages 将消息单元按 4+1 打包为分页并写入翻页缓存，
@@ -2491,6 +2513,9 @@ func (pa *PlatformAdapterOfficialQQ) SendToPerson(ctx *MsgContext, uid string, t
 	if !pa.EndPoint.Session.Parent.Config.OfficialQQUseMarkdown {
 		// 1118: 被动回复条数限制必须按拆分后的消息单元计算；
 		// 只截断 textList 会让含多张图片的单个文本块发出 6+ 条消息。
+		// 1119: 频道/频道私信不支持媒体，先把媒体单元去掉再限 5 条，
+		// 避免空 content 占预算、后续正文被截掉。
+		units = officialQQDropUnsupportedMedia(units, idType)
 		units = limitOfficialQQUnits(units, officialQQPassiveMsgLimit)
 	}
 
@@ -3123,6 +3148,8 @@ func (pa *PlatformAdapterOfficialQQ) SendToGroup(ctx *MsgContext, uid string, te
 	units, hasMedia := officialQQSplitTextList(textList)
 	if !pa.EndPoint.Session.Parent.Config.OfficialQQUseMarkdown {
 		// 1118: 同私聊路径，按消息单元而不是文本块限制 5 条被动回复。
+		// 1119: 频道/频道私信先去掉不支持的媒体单元。
+		units = officialQQDropUnsupportedMedia(units, idType)
 		units = limitOfficialQQUnits(units, officialQQPassiveMsgLimit)
 	}
 

@@ -493,32 +493,48 @@ func (g *GroupInfo) hasAnyLogGapTask() bool {
 	return g.logGapWorkerRunning || g.logGapPending != nil || g.logGapRunningTask != nil
 }
 
-// hasAuthorizedPreOffGapTask 报告是否存在“off 前窗口”授权的在途/排队任务。
+// authorizedPreOffGapRange 返回“off 前窗口”授权对应的任务区间。
 // 1118: .log off 之后如果又来了 off 状态消息，不能立刻用 off 发现任务把
 // 这个已授权的 on 任务替换掉；先等它补完 off 前窗口，再由后续消息重建
 // off 发现任务（LogSeenSeq 保持不动，窗口不会丢）。
-func (g *GroupInfo) hasAuthorizedPreOffGapTask() bool {
+//
+// 任务字段必须在 logGapQueueMu 内拷贝后再读：mergeLogGapTask 会在同一把锁
+// 内改写 pending/running 的窗口，锁外读字段是数据竞争，也可能误判“没有
+// 已授权任务”，从而让 off 发现任务覆盖掉 off 前窗口。
+func (g *GroupInfo) authorizedPreOffGapRange() (fromSeq, toSeq int64, ok bool) {
 	if g == nil {
-		return false
+		return 0, 0, false
 	}
 	auth := g.logOffGapAuthSnapshot()
 	if auth == nil {
-		return false
+		return 0, 0, false
 	}
 	g.logGapQueueMu.Lock()
-	pending := g.logGapPending
-	running := g.logGapRunningTask
+	tasks := make([]logGapFillTask, 0, 2)
+	if g.logGapPending != nil {
+		tasks = append(tasks, *g.logGapPending)
+	}
+	if g.logGapRunningTask != nil {
+		tasks = append(tasks, *g.logGapRunningTask)
+	}
 	g.logGapQueueMu.Unlock()
-	for _, task := range []*logGapFillTask{pending, running} {
-		if task == nil || task.discoverFromOff || task.toSeq <= 0 {
+
+	for _, task := range tasks {
+		if task.discoverFromOff || task.toSeq <= 0 {
 			continue
 		}
 		if auth.logID == task.logID && auth.logName == task.logName &&
 			auth.epoch == task.epoch && task.toSeq <= auth.offSeq {
-			return true
+			return task.fromSeq, task.toSeq, true
 		}
 	}
-	return false
+	return 0, 0, false
+}
+
+// hasAuthorizedPreOffGapTask 报告是否存在“off 前窗口”授权的在途/排队任务。
+func (g *GroupInfo) hasAuthorizedPreOffGapTask() bool {
+	_, _, ok := g.authorizedPreOffGapRange()
+	return ok
 }
 
 // logOffRequestedSeqSnapshot 读取用户明确关闭日志的 seq；0 表示没有。
@@ -1991,7 +2007,7 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 		if !ok && msg.GroupID != "" {
 			// 注意: 此处必须开启，不然下面mctx.player取不到
 			autoOn := true
-			if msg.Platform == "QQ-CH" {
+			if isQQChannelPlatform(msg.Platform) {
 				autoOn = d.Config.QQChannelAutoOn
 			}
 			groupInfo = SetBotOnAtGroup(mctx, msg.GroupID)
@@ -2161,7 +2177,7 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 				}
 				if doLog {
 					// 检查QQ频道的独立选项
-					if msg.Platform == "QQ-CH" && (!d.Config.QQChannelLogMessage) {
+					if isQQChannelPlatform(msg.Platform) && (!d.Config.QQChannelLogMessage) {
 						doLog = false
 					}
 				}
@@ -2377,7 +2393,7 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 	if !ok && msg.GroupID != "" {
 		// 注意: 此处必须开启，不然下面mctx.player取不到
 		autoOn := true
-		if msg.Platform == "QQ-CH" {
+		if isQQChannelPlatform(msg.Platform) {
 			autoOn = d.Config.QQChannelAutoOn
 		}
 		groupInfo = SetBotOnAtGroup(mctx, msg.GroupID)
@@ -2510,7 +2526,7 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 			}
 			if doLog {
 				// 检查QQ频道的独立选项
-				if msg.Platform == "QQ-CH" && (!d.Config.QQChannelLogMessage) {
+				if isQQChannelPlatform(msg.Platform) && (!d.Config.QQChannelLogMessage) {
 					doLog = false
 				}
 			}

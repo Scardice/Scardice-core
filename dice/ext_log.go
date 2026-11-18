@@ -551,7 +551,8 @@ func RegisterBuiltinExtLog(self *Dice) {
 .log list <群号> // 查看指定群的日志列表(无法取得日志时，找骰主做这个操作)
 .log masterget <群号> <日志名> // 重新上传日志，并获取链接(无法取得日志时，找骰主做这个操作)
 .log export <日志名> // 直接取得日志txt(服务出问题或有其他需要时使用)
-.log export <日志名> <邮箱地址> // 通过邮件取得日志txt，多个邮箱用空格隔开`
+.log export <日志名> <邮箱地址> // 通过邮件取得日志txt，多个邮箱用空格隔开
+注: KOOK、官方 QQ 等非 OneBot 渠道不支持掉线日志自动补全，请保持核心在线。`
 
 	// const txtLogTip = "若未出现线上日志地址，可换时间获取，或联系骰主在data/default/log-exports路径下取出日志\n文件名: 群号_日志名_随机数.zip\n注意此文件log end/get后才会生成"
 
@@ -713,6 +714,14 @@ func RegisterBuiltinExtLog(self *Dice) {
 							bfTo = msg.Seq
 						}
 						needBackfill := group.hasOffDiscoveryContext() && bfFrom > 0 && bfTo > bfFrom
+						// .log off 之后立刻 .log on：off 前的 on 窗口任务仍持有授权，
+						// reset 会推进 epoch 让它停止。记下窗口，重新挂一个只补日志
+						// 的任务（与离线 off 发现窗口分开处理，避免两种模式互相替换）。
+						preOffFrom, preOffTo, preOffOK := group.authorizedPreOffGapRange()
+						if preOffOK {
+							auth := group.logOffGapAuthSnapshot()
+							preOffOK = auth != nil && auth.logID == logID && auth.logName == name
+						}
 						var stateAfter GroupLogState
 						var epochAfter uint64
 						group.logWriteMu.Lock()
@@ -722,6 +731,11 @@ func RegisterBuiltinExtLog(self *Dice) {
 						stateAfter = group.GetLogState()
 						epochAfter = group.logEpoch.Load()
 						group.logWriteMu.Unlock()
+						// 无 seq/不支持补全的平台不应留下永久 LogResumeSkipGap。
+						noFillNotice := logGapFillPlatformNotice(ctx.EndPoint)
+						if noFillNotice != "" {
+							group.clearLogResumeSkipGap()
+						}
 						group.MarkDirty(ctx.Dice)
 						ctx.Dice.Logger.Infof("日志状态切换: 群=%s 开启日志 name=%s id=%d", group.GroupID, name, logID)
 
@@ -732,11 +746,14 @@ func RegisterBuiltinExtLog(self *Dice) {
 							} else {
 								ctx.Dice.Logger.Warnf("日志开启后未能重建离线补录任务: 群=%s 窗口=%d..%d", group.GroupID, bfFrom, bfTo)
 							}
+						} else if preOffOK &&
+							group.enqueuePreOffBackfillAfterResume(ctx.Dice, ctx.EndPoint, preOffFrom, preOffTo) {
+							backfillNotice = "\n关闭前的遗漏记录正在补录，完成后会通知。"
 						}
 
 						VarSetValueStr(ctx, "$t记录名称", name)
 						VarSetValueInt64(ctx, "$t当前记录条数", lines)
-						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_开启_成功")+backfillNotice)
+						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_开启_成功")+backfillNotice+noFillNotice)
 					} else {
 						VarSetValueStr(ctx, "$t记录名称", name)
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_开启_失败_无此记录"))
@@ -936,10 +953,14 @@ func RegisterBuiltinExtLog(self *Dice) {
 				group.resetLogSeqForNewSegment(msg.Seq, msg.RawID)
 				group.clearLogPausedByBotOff()
 				group.logWriteMu.Unlock()
+				noFillNotice := logGapFillPlatformNotice(ctx.EndPoint)
+				if noFillNotice != "" {
+					group.clearLogResumeSkipGap()
+				}
 				group.MarkDirty(ctx.Dice)
 				ctx.Dice.Logger.Infof("日志状态切换: 群=%s 新建并开启日志 name=%s id=%d", group.GroupID, name, logID)
 
-				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_新建"))
+				ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "日志:记录_新建")+noFillNotice)
 				return CmdExecuteResult{Matched: true, Solved: true}
 			} else if cmdArgs.IsArgEqual(1, "stat") {
 				// group := ctx.Group
@@ -1562,11 +1583,21 @@ func getSpecifiedGroupIfMaster(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) 
 			return "", true
 		}
 
-		var prefix string
-		if ctx.EndPoint.Platform == "QQ" {
-			prefix = "QQ-Group"
+		// 已经带平台前缀（QQ-Group:/OpenQQ-Group:/KOOK-CH-Group: 等）时
+		// 原样使用，避免官方 QQ 被拼成 QQ-Group:OpenQQ-Group:...。
+		if strings.Contains(data, ":") {
+			return data, true
 		}
-		if !strings.HasPrefix(data, prefix) {
+		prefix := ""
+		switch {
+		case isOfficialQQEndpoint(ctx.EndPoint):
+			prefix = "OpenQQ-Group"
+		case ctx.EndPoint != nil && ctx.EndPoint.Platform == "QQ":
+			prefix = "QQ-Group"
+		case ctx.EndPoint != nil && ctx.EndPoint.Platform == "KOOK":
+			prefix = "KOOK-CH-Group"
+		}
+		if prefix != "" {
 			data = prefix + ":" + data
 		}
 
@@ -1950,6 +1981,39 @@ func (g *GroupInfo) enqueuePendingOffDiscoveryBackfill(d *Dice, ep *EndPointInfo
 	return true
 }
 
+// enqueuePreOffBackfillAfterResume 在 .bot on/.log on 取消掉“off 前窗口”
+// 授权任务后，用恢复后的新 epoch 重新挂一个只补日志的任务。
+//
+// .bot on 的 resetLogSeq 和 resume 都会推进 epoch/清 pending，旧任务因此
+// 停止；但 off 之前那段消息仍然属于应记录的 on 段，不能随旧任务一起丢。
+// 新任务只写日志、不执行历史指令，避免恢复后重放旧命令。
+func (g *GroupInfo) enqueuePreOffBackfillAfterResume(d *Dice, ep *EndPointInfo, fromSeq, toSeq int64) bool {
+	if g == nil || d == nil || ep == nil || fromSeq <= 0 || toSeq <= fromSeq {
+		return false
+	}
+	g.logWriteMu.RLock()
+	current := g.GetLogState()
+	currentEpoch := g.logEpoch.Load()
+	g.logWriteMu.RUnlock()
+	if !current.On || current.ID == 0 || current.Name == "" {
+		return false
+	}
+	task := logGapFillTask{
+		dice:         d,
+		endpoint:     ep,
+		group:        g,
+		logID:        current.ID,
+		logName:      current.Name,
+		epoch:        currentEpoch,
+		fromSeq:      fromSeq,
+		toSeq:        toSeq,
+		gap:          toSeq - fromSeq - 1,
+		forceLogOnly: true,
+	}
+	g.enqueueLogGapFill(task)
+	return true
+}
+
 // calibrateLogSeqBaseline 在进程内首次记日志时，用数据库里该日志的 MAX(seq)
 // 校准 seq 基线，返回校准后的上一条 seq 与 RawID。
 //
@@ -1989,17 +2053,42 @@ func calibrateLogSeqBaseline(d *Dice, group *GroupInfo, logID uint64, lastSeq in
 
 // endpointSupportsLogGapFill 判断平台是否具备“按 seq 拉取群历史”的能力。
 //
-// 日志断层补全依赖 per-group 的 Message.Seq：只有 pureonebot / gocq 这类
-// OneBot 实现会填充 Seq 并实现 HistoryFetcher。KOOK、官方 QQ 等平台的 Seq
-// 恒为 0（KOOK 的 sn 是 per-session 的 WebSocket 序号，不是群消息序号），
-// 既无法判断缺口，也没有可复用的历史拉取语义，因此不参与补全。
+// 日志断层补全依赖 per-group 的 Message.Seq：只有 OneBot 链路会填充 Seq
+// 并实现历史拉取。KOOK、官方 QQ 等平台的 Seq 恒为 0（KOOK 的 sn 是
+// per-session 的 WebSocket 序号，不是群消息序号），当前没有接入补全。
+// 内置 Lagrange.OneBot 的事件不携带 message_seq，历史接口也只认 message_id，
+// 因此显式排除，避免 README/UI 声称支持但实际永远不触发。
 // 这里显式挡在入队之前，避免以后给不支持的平台误建补全任务。
 func endpointSupportsLogGapFill(ep *EndPointInfo) bool {
 	if ep == nil || ep.Adapter == nil {
 		return false
 	}
+	if gocq, ok := ep.Adapter.(*PlatformAdapterGocq); ok && gocq.BuiltinMode == "lagrange" {
+		return false
+	}
+	if _, ok := ep.Adapter.(HistoryRangeFetcher); ok {
+		return true
+	}
 	_, ok := ep.Adapter.(HistoryFetcher)
 	return ok
+}
+
+// logGapFillPlatformNotice 在日志开启时明确告知用户：当前渠道不支持
+// 掉线自动补全。只对已知的无 seq 渠道提示（KOOK、官方 QQ、内置 Lagrange），
+// 避免给测试/未知适配器臆造限制。
+func logGapFillPlatformNotice(ep *EndPointInfo) string {
+	if ep == nil {
+		return ""
+	}
+	knownUnsupported := ep.Platform == "KOOK" || isOfficialQQEndpoint(ep) ||
+		func() bool {
+			gocq, ok := ep.Adapter.(*PlatformAdapterGocq)
+			return ok && gocq.BuiltinMode == "lagrange"
+		}()
+	if !knownUnsupported || endpointSupportsLogGapFill(ep) {
+		return ""
+	}
+	return "\n当前渠道不支持掉线日志自动补全（KOOK、官方 QQ 等非 OneBot 渠道），请保持核心在线。"
 }
 
 // cloneGapTriggerMessage 复制触发补全任务的实时消息。
@@ -2038,6 +2127,10 @@ type logGapFillTask struct {
 	// 不写触发消息、不改变 live 状态、不 adopt。用于实时命令先执行、
 	// 异步发现任务被 epoch 变化取消时保住离线 on 段。
 	backfillOnly bool
+	// forceLogOnly 表示任务只补日志、不执行历史指令。用于 .bot on/.log on
+	// 在 off 前窗口任务完成前恢复日志：旧任务会因 epoch/LogOn 变化停止，
+	// 重新挂的任务沿用同一窗口，但不能再执行旧指令。
+	forceLogOnly bool
 }
 
 // logStateStillValid 校验补全任务对应的日志仍是该群当前开启的日志。
@@ -2345,11 +2438,17 @@ func (t logGapFillTask) run() {
 		}
 	}
 
+	if !endpointSupportsLogGapFill(t.endpoint) {
+		t.dice.Logger.Infof("日志补全跳过: 平台不支持按 seq 拉取历史: 群=%s 平台=%s",
+			t.group.GroupID, t.endpoint.Platform)
+		// 平台永远补不了这段；不要让它每次重启都把基线拉回。
+		t.group.clearLogGapPendingIfIdle(t.dice)
+		return
+	}
 	fetcher, ok := t.endpoint.Adapter.(HistoryFetcher)
 	if !ok {
 		t.dice.Logger.Infof("日志补全跳过: 平台未实现历史消息拉取: 群=%s 平台=%s",
 			t.group.GroupID, t.endpoint.Platform)
-		// 平台永远补不了这段；不要让它每次重启都把基线拉回。
 		t.group.clearLogGapPendingIfIdle(t.dice)
 		return
 	}
@@ -2499,7 +2598,7 @@ func (t logGapFillTask) run() {
 		return
 	}
 
-	forceLogOnly := false
+	forceLogOnly := t.forceLogOnly
 	if hist.found {
 		if hist.stopped {
 			forceLogOnly = true
@@ -2515,7 +2614,9 @@ func (t logGapFillTask) run() {
 				if decision.deleteTrigger {
 					t.deleteTriggerRow()
 				}
-				if decision.applyLiveOff {
+				// 预恢复补录任务只写日志，不根据历史再改 live 状态：
+				// 日志刚刚由 .bot on/.log on 打开，不能被窗口里的旧命令关掉。
+				if decision.applyLiveOff && !t.forceLogOnly {
 					// 1118: 这是补录按历史 .log off 推断出的关闭，不是用户
 					// 此刻的显式命令，不能留下 logOffRequested 标记。
 					if _, ok := t.group.logOffForHistoryAtSeq(t.toSeq); ok {
@@ -2524,7 +2625,7 @@ func (t logGapFillTask) run() {
 							t.group.GroupID, t.toSeq)
 					}
 				}
-				forceLogOnly = decision.forceLogOnly
+				forceLogOnly = forceLogOnly || decision.forceLogOnly
 			}
 		} else {
 			// live 已被 .log off/.bot off 关闭，当前任务走 off 前窗口授权；
@@ -2660,6 +2761,36 @@ func (t logGapFillTask) fetchHistoryOnceWithCoverage(ctx context.Context, fetche
 			t.toSeq-t.fromSeq-1, total, from, t.toSeq-1, t.group.GroupID, t.fromSeq, t.toSeq)
 	}
 
+	// 新接口由适配器自己按平台语义翻页，调用方不再假设“fromSeq 之后”。
+	// 这是 1119 的核心修复：SnowLuma 只认 message_id、go-cqhttp 的
+	// message_seq 是窗口终点，统一按正向分页必然丢首条/误判覆盖。
+	if rangeFetcher, ok := fetcher.(HistoryRangeFetcher); ok {
+		req := HistoryRangeRequest{
+			GroupID:   t.group.GroupID,
+			FromSeq:   from,
+			ToSeq:     t.toSeq,
+			Count:     int(total),
+			FromRawID: t.lastMsgID,
+		}
+		if t.trigger != nil {
+			req.ToRawID = t.trigger.RawID
+		}
+		msgs, complete, err := rangeFetcher.FetchGroupMsgHistoryRange(ctx, req)
+		if err != nil {
+			return nil, from, err
+		}
+		msgs = historyRangeFilter(msgs, from, t.toSeq)
+		if complete {
+			return msgs, t.toSeq - 1, nil
+		}
+		if len(msgs) == 0 {
+			// 拿到了“最新一页”但没有任何区间内消息，且没有覆盖到起点：
+			// 必须保留 pending，不能当成空历史清掉。
+			return nil, from, errLogGapHistoryNoProgress
+		}
+		return msgs, historyRangeMaxSeq(msgs), nil
+	}
+
 	all := make([]*Message, 0, total)
 	seen := make(map[int64]struct{}, total)
 	coveredTo := from
@@ -2776,6 +2907,19 @@ func (t logGapFillTask) isBotSender(m *Message) bool {
 	return m.Sender.IsRobot || (t.group != nil && t.group.IsBot(m.Sender.UserID, m.Sender.IsRobot))
 }
 
+// rawMsgIDKey 返回可用于去重的平台 raw_msg_id；空值/"0"/"<nil>" 都表示
+// 平台没有提供可用的消息 ID。
+func rawMsgIDKey(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	s := strings.TrimSpace(fmt.Sprintf("%v", v))
+	if s == "" || s == "0" || s == "<nil>" {
+		return ""
+	}
+	return s
+}
+
 // filterAlreadyLogged 跳过已经写入同一日志的消息。
 // 平台重连补发、或补全任务与正常事件并发时，同一条消息可能既走事件路径又被历史拉取到；
 // log_items 对 raw_msg_id 没有唯一约束，必须在补录前查一次。
@@ -2809,11 +2953,14 @@ func (t logGapFillTask) filterAlreadyLogged(msgs []*Message) ([]*Message, bool) 
 		if m == nil {
 			continue
 		}
-		if _, ok := existing.RawMsgIDs[fmt.Sprintf("%v", m.RawID)]; ok {
-			continue
-		}
-		// 1118: 平台不返回 raw_msg_id 时用 seq 去重，避免重试/分段写重复。
-		if m.Seq > 0 {
+		// raw id 存在时它是权威去重键；平台 seq 重置后新消息可能撞上旧行，
+		// 不能仅凭 seq 相同就丢掉一条 raw id 不同的消息。
+		if rawKey := rawMsgIDKey(m.RawID); rawKey != "" {
+			if _, ok := existing.RawMsgIDs[rawKey]; ok {
+				continue
+			}
+		} else if m.Seq > 0 {
+			// 平台不返回 raw_msg_id 时才用 seq 去重，避免重试/分段写重复。
 			if _, ok := existing.Seqs[m.Seq]; ok {
 				continue
 			}
@@ -2914,27 +3061,31 @@ func (t logGapFillTask) parseBotLifecycleCommand(m *Message) (kind, botNum strin
 	return "", "", nil
 }
 
-// mentionsOtherUser 判断历史消息是否 @ 了当前骰子以外的人。
-// @ 了别人时真实命令分发可能因 SomeoneBeMentionedButNotMe 拒绝执行，
-// 因此不能把它当成会改变日志状态的生命周期命令。
+// mentionsOtherUser 判断历史消息是否会被真实命令分发拒绝。
+//
+// 真实语义是 cmd_parse.go 的 SomeoneBeMentionedButNotMe =
+// len(At) > 0 && !AmIBeMentioned：只要 @ 了当前骰子，即使同时 @ 了别人，
+// commandSolve 也不会拒绝；只有“只 @ 别人、没 @ 骰子”才会拒绝。
+// 1119: 旧实现只要看到别人就返回 true，导致“@骰子 + @别人”的 .log off/on
+// 实时会执行、历史却当普通消息，on/off 段判断错位。
 func (t logGapFillTask) mentionsOtherUser(cmdArgs *CmdArgs) bool {
 	if cmdArgs == nil || t.endpoint == nil {
 		return false
 	}
 	botUniform := UserIDExtract(t.endpoint.UserID)
+	botMentioned := false
+	otherMentioned := false
 	for _, at := range cmdArgs.At {
 		if at == nil || at.UserID == "" {
 			continue
 		}
-		if at.UserID == t.endpoint.UserID {
+		if at.UserID == t.endpoint.UserID || UserIDExtract(at.UserID) == botUniform {
+			botMentioned = true
 			continue
 		}
-		if UserIDExtract(at.UserID) == botUniform {
-			continue
-		}
-		return true
+		otherMentioned = true
 	}
-	return false
+	return otherMentioned && !botMentioned
 }
 
 // isHistoricalPrivilegedSender 近似判断历史发送者是否有权执行 .bot/.ext。
@@ -2943,7 +3094,7 @@ func (t logGapFillTask) isHistoricalPrivilegedSender(m *Message) bool {
 	if t.dice == nil || t.group == nil || m == nil {
 		return false
 	}
-	if t.dice.Config.BotExtFreeSwitch || m.Platform == "QQ-CH" {
+	if t.dice.Config.BotExtFreeSwitch || isQQChannelPlatform(m.Platform) {
 		return true
 	}
 	if m.Sender.UserID != "" && t.dice.MasterCheck(t.group.GroupID, m.Sender.UserID) {

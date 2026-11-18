@@ -144,9 +144,14 @@ func (*LogInfoHookMySQL) TableName() string {
 // 直接建 (log_id, raw_msg_id) 普通索引会失败；去重查询带 group_id，
 // 复用已有的 idx_log_delete_by_id(group_id(20), raw_msg_id(20), id) 前缀索引。
 // 下面两个 length:20 是显式声明前缀长度，保证新库/迁移建出的索引与查询匹配。
+//
+// idx_log_items_log_seq 不写 index tag：MySQL 的 AutoMigrate 在并发首启时
+// 两个实例都可能认为索引不存在并同时 CREATE INDEX，后一个会报 duplicate key
+// 并让迁移失败。该索引由 EnsureLogSchema 和 createMySQLIndexForLogOneItem
+// 显式创建，重复错误只记日志/忽略。SQLite/PostgreSQL 模型仍保留 tag。
 type LogOneItemHookMySQL struct {
 	ID             uint64      `gorm:"primaryKey;autoIncrement;column:id;index:idx_log_delete_by_id,priority:3" json:"id"`
-	LogID          uint64      `gorm:"column:log_id;index:idx_log_items_log_seq,priority:1" json:"-"`
+	LogID          uint64      `gorm:"column:log_id" json:"-"`
 	GroupID        string      `gorm:"column:group_id;index:idx_log_delete_by_id,priority:1,length:20"`
 	Nickname       string      `gorm:"column:nickname"                    json:"nickname"`
 	IMUserID       string      `gorm:"column:im_userid"                   json:"IMUserId"`
@@ -162,7 +167,7 @@ type LogOneItemHookMySQL struct {
 	Channel        string      `gorm:"-"                                  json:"channel"`
 	Removed        *int        `gorm:"column:removed"                     json:"-"`
 	ParentID       *int        `gorm:"column:parent_id"                   json:"-"`
-	Seq            *int64      `gorm:"column:seq;index:idx_log_items_log_seq,priority:2" json:"seq,omitempty"`
+	Seq            *int64      `gorm:"column:seq" json:"seq,omitempty"`
 	// IsGapFill 仅保留数据库列以兼容旧库；不再对外输出。
 	IsGapFill bool `gorm:"column:is_gap_fill;not null;default:false" json:"-"`
 }

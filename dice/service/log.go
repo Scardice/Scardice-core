@@ -755,7 +755,10 @@ func logAppendDuplicate(tx *gorm.DB, logID uint64, groupID, rawID string, seq *i
 	// 1118: 补录条目按 (log_id, seq) 再去重一次。平台不返回 raw_msg_id
 	// （"0"/空）时，分段补录 + 失败重试/最终汇总会重复写同一 seq；
 	// seq 在同一本日志内唯一，比 raw id 更可靠。
-	if isGapFill && seq != nil && *seq > 0 {
+	//
+	// 1119: 只在 raw id 不可用时才按 seq 去重。平台 seq 重置后，新消息可能
+	// 撞上旧日志行；raw id 不同说明是另一条消息，不能因此静默丢掉。
+	if isGapFill && seq != nil && *seq > 0 && rawID == "" {
 		var seqCount int64
 		if err := tx.Model(&model.LogOneItem{}).
 			Where("log_id = ? AND seq = ?", logID, *seq).

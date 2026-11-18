@@ -252,10 +252,14 @@ func TestOffCommandHandlersArmAuth_1115fix5(t *testing.T) {
 func TestBotOffWithOtherBotActiveKeepsLog_1115fix5(t *testing.T) {
 	const groupID = "QQ-Group:fix5-botoff-other"
 	const senderID = "QQ:fix5-user"
-	_, _, g, ctx, _, cleanup := newFix5LogGapEnv(t, groupID, senderID, &recordingHistoryFetcher{})
+	d, _, g, ctx, _, cleanup := newFix5LogGapEnv(t, groupID, senderID, &recordingHistoryFetcher{})
 	defer cleanup()
 
 	g.DiceIDActiveMap.Store("QQ:other-bot", true)
+	// 1119: “另一个 bot 仍活跃”必须对应一个已启用端点；只有残留 ID 不算。
+	d.ImSession.EndPoints = append(d.ImSession.EndPoints, &EndPointInfo{
+		EndPointInfoBase: EndPointInfoBase{UserID: "QQ:other-bot", Enable: true},
+	})
 	epochBefore := g.logEpoch.Load()
 	SetBotOffAtGroupAtSeq(ctx, groupID, 1201)
 
