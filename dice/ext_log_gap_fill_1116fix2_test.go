@@ -176,7 +176,8 @@ func TestOffDiscoveryResolvesLogAliasKey_1116fix2(t *testing.T) {
 }
 
 // TestOffStateLongSpanDiscoversLogOn_1116fix2 锁定 off 发现方向的长缺口：
-// .log on 在缺口起点附近，远超单段 2000 条，也必须跨段继续补到触发消息。
+// .log on 在缺口起点附近，远超单段 2000 条；跨段识别后只补最近 2000 条，
+// 超出补录上限的较早消息丢弃并告知。
 func TestOffStateLongSpanDiscoversLogOn_1116fix2(t *testing.T) {
 	const groupID = "QQ-Group:1116fix2-long-off-on"
 	const senderID = "QQ:1116.fix2-user"
@@ -193,8 +194,12 @@ func TestOffStateLongSpanDiscoversLogOn_1116fix2(t *testing.T) {
 	task.run()
 	g.logGapWorkerRunning = false
 
-	if got := countFix5LogRows(t, d, logID, 1101, 4001); got != 2901 {
-		t.Fatalf("long off-state on segment rows = %d, want 2901", got)
+	// 只补最近 2000 条 on chat（2001..4000）+ 触发消息 4001。
+	if got := countFix5LogRows(t, d, logID, 2001, 4001); got != 2001 {
+		t.Fatalf("long off-state on segment rows = %d, want 2001", got)
+	}
+	if got := countFix5LogRows(t, d, logID, 1101, 2000); got != 0 {
+		t.Fatalf("discarded early on rows = %d, want 0", got)
 	}
 	if !g.GetLogState().On {
 		t.Fatal("long off-state .log on should resume live logging")

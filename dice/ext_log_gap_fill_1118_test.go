@@ -148,8 +148,9 @@ func (f *flakySegmentFetcher) FetchGroupMsgHistory(_ context.Context, _ string, 
 	return out, nil
 }
 
-// TestLogGapSegmentFailureKeepsProgress_1118 锁定：分段扫描中途失败时，
-// 前面已写入的段保留，pending 起点前移到失败段，不再从原始 fromSeq 重来。
+// TestLogGapSegmentFailureKeepsProgress_1118 锁定：识别窗口中途拉取失败时
+// 不写半截数据（避免把状态未知的段写进日志），pending 保留整个识别窗口，
+// 下次从窗口起点重试。
 func TestLogGapSegmentFailureKeepsProgress_1118(t *testing.T) {
 	const groupID = "QQ-Group:1118-progress"
 	const senderID = "QQ:1118-progress-user"
@@ -172,11 +173,13 @@ func TestLogGapSegmentFailureKeepsProgress_1118(t *testing.T) {
 	task.run()
 	g.logGapWorkerRunning = false
 
-	if got := countFix5LogRows(t, d, logID, 1001, 5000); got != 4000 {
-		t.Fatalf("rows from completed segments = %d, want 4000", got)
+	// 原始缺口 1000..7500 超过识别上限，窗口裁剪为 2499..7500；
+	// 中途失败不写任何历史行（7500 触发消息由实时路径写入）。
+	if got := countFix5LogRows(t, d, logID, 1001, 7499); got != 0 {
+		t.Fatalf("rows written on incomplete scan = %d, want 0", got)
 	}
-	if g.LogGapPendingFrom != 5000 || g.LogGapPendingTo != 7500 {
-		t.Fatalf("pending = %d..%d, want 5000..7500", g.LogGapPendingFrom, g.LogGapPendingTo)
+	if g.LogGapPendingFrom != 2499 || g.LogGapPendingTo != 7500 {
+		t.Fatalf("pending = %d..%d, want 2499..7500", g.LogGapPendingFrom, g.LogGapPendingTo)
 	}
 }
 

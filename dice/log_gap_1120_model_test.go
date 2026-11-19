@@ -334,8 +334,8 @@ func TestPreOffZeroNotice_1120(t *testing.T) {
 	}
 }
 
-// TestMultiSegmentNoticeCount_1120 锁定：分段阶段已写入的消息不重复写、
-// 不重复计数，通知里的总数仍正确。
+// TestMultiSegmentNoticeCount_1120 锁定：整段只预取一次；补录上限 2000 条，
+// 超出部分丢弃并在通知里说明。
 func TestMultiSegmentNoticeCount_1120(t *testing.T) {
 	const groupID = "QQ-Group:1120-multi"
 	const senderID = "QQ:u"
@@ -354,8 +354,12 @@ func TestMultiSegmentNoticeCount_1120(t *testing.T) {
 	task.run()
 	g.logGapWorkerRunning = false
 
-	if got := countFix5LogRows(t, d, logID, 1051, 3550); got != 2500 {
-		t.Fatalf("rows = %d, want 2500 (no duplicates)", got)
+	// 只补最近的 2000 条：1051..1550 被丢弃，1551..3550 写入。
+	if got := countFix5LogRows(t, d, logID, 1551, 3550); got != 2000 {
+		t.Fatalf("rows = %d, want 2000 (backfill cap)", got)
+	}
+	if got := countFix5LogRows(t, d, logID, 1051, 1550); got != 0 {
+		t.Fatalf("discarded old rows = %d, want 0", got)
 	}
 	adapter.mu.Lock()
 	msgs := append([]string(nil), adapter.groupMsgs...)
@@ -363,13 +367,13 @@ func TestMultiSegmentNoticeCount_1120(t *testing.T) {
 	adapter.mu.Unlock()
 	found := false
 	for _, m := range msgs {
-		if strings.Contains(m, "2500 条") {
+		if strings.Contains(m, "2000 条") && strings.Contains(m, "500 条已丢弃") {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Fatalf("notice should report 2500 total, got %#v", msgs)
+		t.Fatalf("notice should report 2000 backfilled and 500 discarded, got %#v", msgs)
 	}
 	if len(reqs) != 1 {
 		t.Fatalf("prefetch requests = %d, want 1 (not one per segment)", len(reqs))
