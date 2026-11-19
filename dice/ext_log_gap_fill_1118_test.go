@@ -175,11 +175,12 @@ func TestLogGapSegmentFailureKeepsProgress_1118(t *testing.T) {
 
 	// 原始缺口 1000..7500 超过识别上限，窗口裁剪为 2499..7500；
 	// 中途失败不写任何历史行（7500 触发消息由实时路径写入）。
+	// pending 保留原始缺口，重试时重新裁剪并回看起点状态。
 	if got := countFix5LogRows(t, d, logID, 1001, 7499); got != 0 {
 		t.Fatalf("rows written on incomplete scan = %d, want 0", got)
 	}
-	if g.LogGapPendingFrom != 2499 || g.LogGapPendingTo != 7500 {
-		t.Fatalf("pending = %d..%d, want 2499..7500", g.LogGapPendingFrom, g.LogGapPendingTo)
+	if g.LogGapPendingFrom != 1000 || g.LogGapPendingTo != 7500 {
+		t.Fatalf("pending = %d..%d, want 1000..7500", g.LogGapPendingFrom, g.LogGapPendingTo)
 	}
 }
 

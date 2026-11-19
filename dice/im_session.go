@@ -230,6 +230,14 @@ type GroupInfo struct {
 	// 补录结束时据此决定是否保留 pending 并退避，避免“没写进去”被当成
 	// “补全完成”而永久丢掉这段缺口。
 	logGapWriteFailed atomic.Bool `json:"-" yaml:"-"`
+	// logGapNotifyOnComplete 表示 .bot on/off 已经向用户承诺“补录完成后
+	// 会再通知日志状态”。即使补录结果为 0 条，任务收尾时也必须发一条通知，
+	// 否则会出现“承诺了不通知”的自相矛盾。运行时字段。
+	logGapNotifyOnComplete atomic.Bool `json:"-" yaml:"-"`
+	// logOffReconcileAt 是 off 状态日志主动对账的最近尝试时间(unix)。
+	// 启动/重连会对 off 日志扫一遍历史，找离线期间的 .log on；限频避免
+	// 端点反复重连时对大量 off 群重复请求。
+	logOffReconcileAt atomic.Int64 `json:"-" yaml:"-"`
 	// logSeqCalibrated 表示本进程内是否已用数据库 MAX(seq) 校准过 seq 基线。
 	logSeqCalibrated bool `json:"-" yaml:"-"`
 	// logSeqCalibrationRetryAt 是校准失败后的下次重试时间(unix)。
@@ -470,31 +478,6 @@ func (g *GroupInfo) mergeLogGapPendingRangeMode(fromSeq, toSeq int64, offDiscove
 	g.logSeqMu.Unlock()
 }
 
-// advanceLogGapPendingStart 在分段补录成功写入一段后，把 pending 起点前移，
-// 这样后续段失败/进程重启时不会从原始 fromSeq 重扫已经处理过的部分。
-// 只在新区间起点更晚时前移，绝不越过更早的 pending 任务。
-func (g *GroupInfo) advanceLogGapPendingStart(fromSeq, toSeq int64, offDiscovery bool) bool {
-	if g == nil || fromSeq <= 0 || toSeq <= fromSeq {
-		return false
-	}
-	g.logSeqMu.Lock()
-	defer g.logSeqMu.Unlock()
-	changed := false
-	if g.LogGapPendingFrom == 0 || fromSeq > g.LogGapPendingFrom {
-		g.LogGapPendingFrom = fromSeq
-		changed = true
-	}
-	if toSeq > g.LogGapPendingTo {
-		g.LogGapPendingTo = toSeq
-		changed = true
-	}
-	if offDiscovery && !g.LogGapPendingOffDiscovery {
-		g.LogGapPendingOffDiscovery = true
-		changed = true
-	}
-	return changed
-}
-
 // replaceLogGapPendingRange 在任务被替换（日志/epoch/模式变化）时重置
 // pending 区间，避免旧模式的区间和新任务混在一起。
 func (g *GroupInfo) replaceLogGapPendingRange(fromSeq, toSeq int64, offDiscovery bool) {
@@ -546,6 +529,31 @@ func (g *GroupInfo) hasAnyLogGapTask() bool {
 	g.logGapQueueMu.Lock()
 	defer g.logGapQueueMu.Unlock()
 	return g.logGapWorkerRunning || g.logGapPending != nil || g.logGapRunningTask != nil
+}
+
+// requestLogGapNotifyOnComplete 记录“已经向用户承诺补录完成后通知”。
+// 补录任务收尾时即使 0 条可补，也要按这个标记发一条完成提示。
+func (g *GroupInfo) requestLogGapNotifyOnComplete() {
+	if g == nil {
+		return
+	}
+	g.logGapNotifyOnComplete.Store(true)
+}
+
+// logGapNotifyOnCompleteRequested 报告当前是否有未兑现的补录完成通知承诺。
+func (g *GroupInfo) logGapNotifyOnCompleteRequested() bool {
+	if g == nil {
+		return false
+	}
+	return g.logGapNotifyOnComplete.Load()
+}
+
+// clearLogGapNotifyOnComplete 在完成提示已经发出、或用户重置日志后清除承诺。
+func (g *GroupInfo) clearLogGapNotifyOnComplete() {
+	if g == nil {
+		return
+	}
+	g.logGapNotifyOnComplete.Store(false)
 }
 
 // authorizedPreOffGapRange 返回“off 前窗口”授权对应的任务区间。
@@ -769,6 +777,7 @@ func (g *GroupInfo) cancelLogGapFill() {
 	g.clearLogGapPendingRange()
 	g.clearLogOffGapAuth()
 	g.clearLogSeenSeq()
+	g.clearLogGapNotifyOnComplete()
 	g.logEpoch.Add(1)
 }
 
@@ -1409,6 +1418,7 @@ func (g *GroupInfo) ClearLogState() {
 	g.clearLogOffRequested()
 	g.logAutoResumedAt.Store(0)
 	g.clearLogGapPendingRange()
+	g.clearLogGapNotifyOnComplete()
 }
 
 func (group *GroupInfo) IsActive(ctx *MsgContext) bool {

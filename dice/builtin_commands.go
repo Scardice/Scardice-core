@@ -897,7 +897,11 @@ func (d *Dice) registerCoreCommands() {
 					// 有未完成补录时，当前状态可能被离线 .log on/.log off 改写；
 					// 明确告诉用户“完成后还会再通知”，避免把临时状态当最终结果。
 					if preOffNotice == "" {
-						text += logGapUserHint(ctx.Group)
+						if hint := logGapUserHint(ctx.Group); hint != "" {
+							text += hint
+							// 已经承诺过通知：即使补录 0 条，收尾也要发提示。
+							ctx.Group.requestLogGapNotifyOnComplete()
+						}
 					}
 					ReplyToSender(ctx, msg, text)
 
@@ -925,6 +929,8 @@ func (d *Dice) registerCoreCommands() {
 						text += "\n日志记录已自动关闭（未结束）"
 						if logGapUnsettled(ctx.Group) {
 							text += "；补录完成后会再通知日志状态。"
+							// 已经承诺过通知：即使补录 0 条，收尾也要发提示。
+							ctx.Group.requestLogGapNotifyOnComplete()
 						} else {
 							text += "，.bot on 后自动开启。"
 						}

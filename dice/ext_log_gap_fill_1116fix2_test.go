@@ -194,11 +194,12 @@ func TestOffStateLongSpanDiscoversLogOn_1116fix2(t *testing.T) {
 	task.run()
 	g.logGapWorkerRunning = false
 
-	// 只补最近 2000 条 on chat（2001..4000）+ 触发消息 4001。
-	if got := countFix5LogRows(t, d, logID, 2001, 4001); got != 2001 {
-		t.Fatalf("long off-state on segment rows = %d, want 2001", got)
+	// 补录上限 2000 包含触发消息：最近 1999 条 on chat（2002..4000）
+	// + 触发消息 4001；2001 让位给触发消息被丢弃。
+	if got := countFix5LogRows(t, d, logID, 2002, 4001); got != 2000 {
+		t.Fatalf("long off-state on segment rows = %d, want 2000", got)
 	}
-	if got := countFix5LogRows(t, d, logID, 1101, 2000); got != 0 {
+	if got := countFix5LogRows(t, d, logID, 1101, 2001); got != 0 {
 		t.Fatalf("discarded early on rows = %d, want 0", got)
 	}
 	if !g.GetLogState().On {
