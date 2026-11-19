@@ -94,8 +94,11 @@ func TestGapDetectAndBackfillLimits_1120fix2(t *testing.T) {
 	msgs := strings.Join(adapter.groupMsgs, "\n")
 	reqs := append([]HistoryRangeRequest(nil), adapter.requests...)
 	adapter.mu.Unlock()
-	if len(reqs) != 1 || reqs[0].FromSeq != 14999 || reqs[0].ToSeq != 20000 {
-		t.Fatalf("detect window requests = %#v, want one 14999..20000", reqs)
+	// 先回看 9999..15000 确认裁剪窗口起点状态，再预取 14999..20000。
+	if len(reqs) != 2 ||
+		reqs[0].FromSeq != 9999 || reqs[0].ToSeq != 15000 ||
+		reqs[1].FromSeq != 14999 || reqs[1].ToSeq != 20000 {
+		t.Fatalf("requests = %#v, want lookback 9999..15000 + prefetch 14999..20000", reqs)
 	}
 	for _, want := range []string{"14899 条已丢弃", "3000 条已丢弃", "识别上限 5000", "补录上限 2000"} {
 		if !strings.Contains(msgs, want) {
@@ -215,5 +218,8 @@ func TestBotOffReplyDoesNotPromiseAutoOnWhenGapUnsettled_1120fix2(t *testing.T) 
 	}
 	if !strings.Contains(text, "补录完成后会再通知日志状态") {
 		t.Fatalf("reply missing unsettled hint: %q", text)
+	}
+	if !g.logGapNotifyOnCompleteRequested() {
+		t.Fatal("bot off promise should set notify-on-complete flag")
 	}
 }
