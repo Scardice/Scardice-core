@@ -2381,19 +2381,13 @@ func (d *Dice) reconcileLogGapForGroup(group *GroupInfo) bool {
 		return false
 	}
 
-	latest, rawID, err := ep.Adapter.(HistoryLatestSeqFetcher).FetchLatestHistorySeq(ctx, group.GroupID)
+	latest, _, err := ep.Adapter.(HistoryLatestSeqFetcher).FetchLatestHistorySeq(ctx, group.GroupID)
 	if err != nil || latest <= 0 || latest <= last+1 {
 		return false
 	}
-	trigger := &Message{
-		MessageType: "group",
-		GroupID:     group.GroupID,
-		Platform:    ep.Platform,
-		Seq:         latest,
-		RawID:       rawID,
-		Time:        time.Now().Unix(),
-		Sender:      SenderBase{UserID: ep.UserID, Nickname: ep.Nickname},
-	}
+	// 用 latest+1 作为开区间终点，让 latest 本身也进入补录区间。
+	// 启动对账没有真实触发消息；正常 on 补录不会像 off discovery 那样
+	// 额外写 trigger，若用 toSeq=latest，最新一条会永远不落库。
 	task := logGapFillTask{
 		dice:      d,
 		endpoint:  ep,
@@ -2402,10 +2396,9 @@ func (d *Dice) reconcileLogGapForGroup(group *GroupInfo) bool {
 		logName:   state.Name,
 		epoch:     group.logEpoch.Load(),
 		fromSeq:   last,
-		toSeq:     latest,
-		gap:       latest - last - 1,
+		toSeq:     latest + 1,
+		gap:       latest - last,
 		lastMsgID: nil,
-		trigger:   trigger,
 	}
 	group.enqueueLogGapFill(task)
 	if d.Logger != nil {
@@ -3081,6 +3074,13 @@ func (t logGapFillTask) run() {
 				notice += "\n"
 			}
 			notice += discarded
+		}
+		// 0 条可补时也要告诉用户扫描因切换日志而停止，不能只留一条丢弃提示。
+		if hist.stopped {
+			if notice != "" {
+				notice += "\n"
+			}
+			notice += fmt.Sprintf("遇到 %s 后停止补录。", hist.unsupported)
 		}
 		if notice != "" {
 			t.sendGroupNotice(notice)
@@ -4249,10 +4249,26 @@ func (t logGapFillTask) offDiscoveryNotice(appended int, finalOn, paused, stoppe
 	return b.String()
 }
 
-// sendOffDiscoveryNotice 发送 off 状态发现结果，并兑现 .bot on/off 的
-// “补录完成后会再通知”承诺。
-func (t logGapFillTask) sendOffDiscoveryNotice(appended int, finalOn, paused, stopped bool) {
-	t.sendGroupNotice(t.offDiscoveryNotice(appended, finalOn, paused, stopped))
+// sendOffDiscoveryResult 发送 off 发现结果。
+//
+// 正常有发现时沿用 offDiscoveryNotice；若本轮没有任何发现（没有 .log on、
+// 没有补录、没有丢弃），但 .bot on/off 已经向用户承诺“补录完成后会再通知”，
+// 则补一条通用完成提示，避免承诺落空。
+func (t logGapFillTask) sendOffDiscoveryResult(appended int, finalOn, paused, stopped, hadResult bool) {
+	switch {
+	case hadResult:
+		t.sendGroupNotice(t.offDiscoveryNotice(appended, finalOn, paused, stopped))
+	case !t.wantsCompleteNotice():
+		return
+	case stopped:
+		t.sendGroupNotice("日志补录完成，离线期间有切换日志命令，之后未继续补录。")
+	case finalOn:
+		t.sendGroupNotice("日志补录完成，日志已恢复记录。")
+	case paused:
+		t.sendGroupNotice("日志补录完成，日志保持关闭，.bot on 后会恢复记录。")
+	default:
+		t.sendGroupNotice("日志补录完成，没有需要补录的消息。")
+	}
 	t.group.clearLogGapNotifyOnComplete()
 }
 
@@ -4314,9 +4330,8 @@ func (t logGapFillTask) runOffDiscovery(missing []*Message, hist logGapLifecycle
 	if d.stopped {
 		t.group.advanceLogSeenSeq(t.dice, t.toSeq)
 		t.group.clearLogGapPendingIfIdle(t.dice)
-		if hist.found || appended > 0 || discarded {
-			t.sendOffDiscoveryNotice(appended, false, false, true)
-		}
+		hadResult := hist.found || appended > 0 || discarded
+		t.sendOffDiscoveryResult(appended, false, false, true, hadResult)
 		return
 	}
 	// 用户明确 .log off：只有这次 off 不早于最终的历史/触发 .log on 时，
@@ -4326,9 +4341,8 @@ func (t logGapFillTask) runOffDiscovery(missing []*Message, hist logGapLifecycle
 		if d.lastOnSeq <= 0 || offSeq >= d.lastOnSeq {
 			t.group.advanceLogSeenSeq(t.dice, t.toSeq)
 			t.group.clearLogGapPendingIfIdle(t.dice)
-			if hist.found || appended > 0 || discarded {
-				t.sendOffDiscoveryNotice(appended, false, false, false)
-			}
+			hadResult := hist.found || appended > 0 || discarded
+			t.sendOffDiscoveryResult(appended, false, false, false, hadResult)
 			return
 		}
 		t.group.clearLogOffRequested()
@@ -4345,27 +4359,24 @@ func (t logGapFillTask) runOffDiscovery(missing []*Message, hist logGapLifecycle
 		}
 		t.group.advanceLogSeenSeq(t.dice, t.toSeq)
 		t.group.clearLogGapPendingIfIdle(t.dice)
-		if hist.found || appended > 0 || paused || discarded {
-			t.sendOffDiscoveryNotice(appended, false, paused, false)
-		}
+		hadResult := hist.found || appended > 0 || paused || discarded
+		t.sendOffDiscoveryResult(appended, false, paused, false, hadResult)
 		return
 	}
 	if d.finalOn && d.adoptLiveOn {
 		if t.adoptHistoricalLogOn() {
 			t.group.clearLogGapPendingIfIdle(t.dice)
 			t.dice.Logger.Infof("日志补全按历史 .log on 恢复记录: 群=%s seq=%d", t.group.GroupID, t.toSeq)
-			if hist.found || appended > 0 || triggerAppended || discarded {
-				t.sendOffDiscoveryNotice(appended, true, false, false)
-			}
+			hadResult := hist.found || appended > 0 || triggerAppended || discarded
+			t.sendOffDiscoveryResult(appended, true, false, false, hadResult)
 			return
 		}
 		// adopt 与实时 .log off 的交接间隙：用户已明确要求关闭，按最终 off 收尾。
 		if t.group.logOffRequested() {
 			t.group.advanceLogSeenSeq(t.dice, t.toSeq)
 			t.group.clearLogGapPendingIfIdle(t.dice)
-			if hist.found || appended > 0 || discarded {
-				t.sendOffDiscoveryNotice(appended, false, false, false)
-			}
+			hadResult := hist.found || appended > 0 || discarded
+			t.sendOffDiscoveryResult(appended, false, false, false, hadResult)
 			return
 		}
 		if !t.logHistoricalDiscoveryAllowed() {
@@ -4378,9 +4389,8 @@ func (t logGapFillTask) runOffDiscovery(missing []*Message, hist logGapLifecycle
 	// 最终 off / 没有有效 .log on：保持关闭，但把已确认处理到的窗口记为已见。
 	t.group.advanceLogSeenSeq(t.dice, t.toSeq)
 	t.group.clearLogGapPendingIfIdle(t.dice)
-	if hist.found || appended > 0 || discarded {
-		t.sendOffDiscoveryNotice(appended, false, false, false)
-	}
+	hadResult := hist.found || appended > 0 || discarded
+	t.sendOffDiscoveryResult(appended, false, false, false, hadResult)
 }
 
 // runOffBackfillOnly 处理“实时 .log on 已经先把 live 日志打开”的历史补录

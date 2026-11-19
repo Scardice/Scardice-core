@@ -672,7 +672,7 @@ func TestStartupReconcileEnqueuesGap_1120(t *testing.T) {
 		t.Fatal("reconcile should enqueue a gap task")
 	}
 	from, to, _ := g.pendingLogGapRangeSnapshot()
-	if from != 1050 || to != 1060 {
-		t.Fatalf("pending = %d..%d, want 1050..1060", from, to)
+	if from != 1050 || to != 1061 {
+		t.Fatalf("pending = %d..%d, want 1050..1061 (latest included)", from, to)
 	}
 }
