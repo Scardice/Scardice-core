@@ -876,15 +876,29 @@ func (d *Dice) registerCoreCommands() {
 					}
 
 					text := DiceFormatTmpl(ctx, "核心:骰子开启")
+					unsettled := logGapUnsettled(ctx.Group)
 					if autoOnLog {
 						// .bot off 时日志被自动关闭，这里刚自动开启；关闭段不补录。
 						text += "\n日志已随骰子自动开启（关闭期间的消息不会补录）"
 					} else if !ctx.Group.GetLogState().On {
-						text += "\n日志记录处于关闭状态"
+						if unsettled {
+							text += "\n日志当前处于关闭状态"
+						} else {
+							text += "\n日志记录处于关闭状态"
+						}
 					} else {
-						text += "\n请特别注意: 日志记录处于开启状态"
+						if unsettled {
+							text += "\n日志当前处于开启状态"
+						} else {
+							text += "\n请特别注意: 日志记录处于开启状态"
+						}
 					}
 					text += preOffNotice
+					// 有未完成补录时，当前状态可能被离线 .log on/.log off 改写；
+					// 明确告诉用户“完成后还会再通知”，避免把临时状态当最终结果。
+					if preOffNotice == "" {
+						text += logGapUserHint(ctx.Group)
+					}
 					ReplyToSender(ctx, msg, text)
 
 					return CmdExecuteResult{Matched: true, Solved: true}
@@ -905,8 +919,15 @@ func (d *Dice) registerCoreCommands() {
 					// 只有本次真的把日志自动关闭时才提示；用户本来就 .log off 的
 					// 群不应被谎报“会自动开启”。1119.fix1: 已经因 .bot off 暂停过
 					// 的日志，重复 .bot off 不再重复提示。
+					// 有未完成补录时，历史 .log off 可能让 .bot on 不再自动开启，
+					// 因此不承诺“会自动开启”，只说明状态稍后通知。
 					if !wasLogPaused && ctx.Group.logPhase() == groupLogPhasePausedByBotOff {
-						text += "\n日志记录已自动关闭（未结束，.bot on 后自动开启）"
+						text += "\n日志记录已自动关闭（未结束）"
+						if logGapUnsettled(ctx.Group) {
+							text += "；补录完成后会再通知日志状态。"
+						} else {
+							text += "，.bot on 后自动开启。"
+						}
 					}
 					ReplyToSender(ctx, msg, text)
 					return CmdExecuteResult{Matched: true, Solved: true}

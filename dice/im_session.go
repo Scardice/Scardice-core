@@ -155,6 +155,10 @@ type GroupInfo struct {
 	// LogPausedByBotOff 表示当前这次“日志关闭”是 .bot off 自动暂停造成的
 	// （只暂停、不 end、不上传），.bot on 时自动恢复。
 	LogPausedByBotOff bool `json:"logPausedByBotOff,omitempty" yaml:"logPausedByBotOff,omitempty"`
+	// LogPausedAtSeq 是 .bot off 自动暂停时最后已见的 seq。
+	// 持久化它才能在进程重启后判断“pending 是否完全位于暂停之前”，
+	// 从而继续补录 off 前窗口，而不是把整段 pending 当成关闭段清掉。
+	LogPausedAtSeq int64 `json:"logPausedAtSeq,omitempty" yaml:"logPausedAtSeq,omitempty"`
 	// LogResumeSkipGap 表示恢复后的第一条消息只重建基线、不计算缺口，
 	// 保证 .bot off 期间的消息既不被记录，也不会在恢复后被当成断层补录。
 	LogResumeSkipGap bool `json:"logResumeSkipGap,omitempty" yaml:"logResumeSkipGap,omitempty"`
@@ -558,7 +562,22 @@ func (g *GroupInfo) authorizedPreOffGapRange() (fromSeq, toSeq int64, ok bool) {
 	}
 	auth := g.logOffGapAuthSnapshot()
 	if auth == nil {
-		return 0, 0, false
+		// 进程重启后内存授权丢失，但“暂停位置 + 持久化 pending”仍能证明
+		// 这段 pending 完全位于 .bot off 之前：继续把它当作 off 前窗口补完，
+		// 避免重启后 .bot on 直接清掉本应补录的记录。
+		g.logStateMu.RLock()
+		paused := g.LogPausedByBotOff
+		pausedAtSeq := g.LogPausedAtSeq
+		logName := g.LogCurName
+		g.logStateMu.RUnlock()
+		if !paused || pausedAtSeq <= 0 || logName == "" {
+			return 0, 0, false
+		}
+		fromSeq, toSeq, offDiscovery := g.pendingLogGapRangeSnapshot()
+		if offDiscovery || fromSeq <= 0 || toSeq <= fromSeq || toSeq > pausedAtSeq {
+			return 0, 0, false
+		}
+		return fromSeq, toSeq, true
 	}
 	g.logGapQueueMu.Lock()
 	tasks := make([]logGapFillTask, 0, 2)
@@ -1334,6 +1353,7 @@ func (g *GroupInfo) SetLogState(logID uint64, logName string, logOn bool) {
 	// 没有日志名时也不允许保留暂停/跳过标记。
 	if logOn || logName == "" {
 		g.LogPausedByBotOff = false
+		g.LogPausedAtSeq = 0
 	}
 	if logName == "" {
 		g.LogResumeSkipGap = false
@@ -1381,6 +1401,7 @@ func (g *GroupInfo) ClearLogState() {
 	// 1120: ClearLogState 必须把日志生命周期标记一并清掉，否则会留下
 	// “没有日志名但仍标记为 bot off 暂停”的非法阶段。
 	g.LogPausedByBotOff = false
+	g.LogPausedAtSeq = 0
 	g.LogResumeSkipGap = false
 	g.logStateMu.Unlock()
 	g.clearLogOffGapAuth()

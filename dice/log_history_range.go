@@ -23,7 +23,7 @@ var errLogGapHistoryNoProgress = errors.New("历史拉取没有取得可用的�
 const (
 	logHistoryRangePageSize    = 100
 	logHistoryRangeMaxPageSize = 200  // SnowLuma/NapCat 等实现的单页上限
-	logHistoryRangeMaxPages    = 2000 // 单次最多翻 2000 页；20k 缺口在 200/页下约 100 页，go-cqhttp 19/页约 1053 页
+	logHistoryRangeMaxPages    = 2000 // 单次最多翻 2000 页；5000 缺口在 19/页下约 264 页
 )
 
 // rawIDToInt64 把各平台 Message.RawID 的常见表示转成 int64。
