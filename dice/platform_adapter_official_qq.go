@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -41,6 +42,17 @@ import (
 	"Scardice-core/message"
 	"Scardice-core/utils"
 )
+
+// officialQQBotgoLoggerOnce 保证 botgo 的全局 logger 只安装一次。
+// 正常连接路径也必须安装：否则重启后 SDK 日志直接打到 stdout，绕过
+// 应用日志文件；运行期 Probe 再改全局 logger 也不是并发安全的。
+var officialQQBotgoLoggerOnce sync.Once
+
+func ensureOfficialQQBotgoLogger() {
+	officialQQBotgoLoggerOnce.Do(func() {
+		qqbot.SetLogger(NewDummyLogger())
+	})
+}
 
 // Official QQ 当前使用 qqbot-at-user 标签表示提及；解析端继续兼容旧的
 // <@userID> 格式，以便平滑处理旧事件和已持久化消息。
@@ -135,10 +147,14 @@ type PlatformAdapterOfficialQQ struct {
 	// readyCh 在当前会话收到 READY 时关闭；watchOfficialQQReady 用它判断
 	// “WebSocket 已提交、但 READY 迟迟不到”的假在线状态。由 sessionMu 保护。
 	readyCh chan struct{} `json:"-" yaml:"-"`
+	// readyTimeoutStreak 记录连续 READY 超时次数；达到上限后置失败终态，
+	// 避免每 60 秒断开重连、UI 永远停在“连接中”。
+	readyTimeoutStreak atomic.Int32 `json:"-" yaml:"-"`
 
 	// Webhook服务
-	webhookMu     sync.Mutex   `json:"-" yaml:"-"`
-	webhookServer *http.Server `json:"-" yaml:"-"`
+	webhookMu     sync.Mutex      `json:"-" yaml:"-"`
+	webhookServer *http.Server    `json:"-" yaml:"-"`
+	webhookCtx    context.Context `json:"-" yaml:"-"`
 
 	paginationCache map[string]*PaginationItem `json:"-" yaml:"-"`
 	paginationMu    sync.Mutex                 `json:"-" yaml:"-"`
@@ -283,6 +299,28 @@ func (pa *PlatformAdapterOfficialQQ) setDiceServingIfEpoch(value bool, epoch uin
 		return false
 	}
 	pa.DiceServing = value
+	return true
+}
+
+// claimServe 把“启动代次仍有效 + 端点仍启用 + 写入 Connecting/DiceServing”
+// 做成一次原子操作。SetEnable(false) 先写 Enable=false 再 cancelServeLoop，
+// 因此任何 check-then-act 窗口里的启动都会在这里失败，不会把禁用吞掉，
+// 也不会把状态写回 Connected/Connecting。
+func (pa *PlatformAdapterOfficialQQ) claimServe(epoch uint64) bool {
+	pa.serveMu.Lock()
+	defer pa.serveMu.Unlock()
+	if pa.serveEpoch != epoch {
+		return false
+	}
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	ep := pa.EndPoint
+	if ep == nil || !ep.Enable {
+		return false
+	}
+	pa.DiceServing = true
+	ep.Enable = true
+	ep.State = StateConnecting
 	return true
 }
 
@@ -528,6 +566,7 @@ func (pa *PlatformAdapterOfficialQQ) markReadyIfCurrent(ctx context.Context) {
 	case <-pa.readyCh:
 	default:
 		close(pa.readyCh)
+		pa.readyTimeoutStreak.Store(0)
 	}
 }
 
@@ -541,9 +580,47 @@ func (pa *PlatformAdapterOfficialQQ) currentReadyCh(ctx context.Context) <-chan 
 	return pa.readyCh
 }
 
+// failReadyTimeoutIfCurrent 在 READY 仍未来到时原子地决定重试还是失败。
+// readyCh 的关闭也由 sessionMu 保护，因此这里在同一把锁内检查“是否已
+// READY”并停止会话，避免 READY 刚好在超时判定窗口到达时误杀健康连接。
+// 返回 handled=false 表示会话已换/已禁用/已 READY，调用方直接退出。
+func (pa *PlatformAdapterOfficialQQ) failReadyTimeoutIfCurrent(ctx context.Context) (handled, retry bool) {
+	pa.sessionMu.Lock()
+	if pa.Ctx != ctx || pa.readyCh == nil {
+		pa.sessionMu.Unlock()
+		return false, false
+	}
+	select {
+	case <-pa.readyCh:
+		pa.sessionMu.Unlock()
+		return false, false
+	default:
+	}
+	ep := pa.EndPoint
+	if ep != nil && (!ep.Enable || ep.State != StateConnecting) {
+		pa.sessionMu.Unlock()
+		return false, false
+	}
+	streak := pa.readyTimeoutStreak.Add(1)
+	fail := streak >= maxOfficialQQReadyTimeouts
+	cancel, queue := pa.stopSessionLocked()
+	if ep != nil {
+		if fail {
+			ep.Enable = false
+			ep.State = StateConnectionFailed
+		} else {
+			ep.State = StateConnecting
+		}
+	}
+	pa.sessionMu.Unlock()
+	pa.closeStoppedSession(cancel, queue)
+	return true, !fail
+}
+
 // watchOfficialQQReady 兜底“WebSocket 已提交、READY 永不到达”的假在线：
 // 超时后按瞬时失败停止本次会话（保留 Enable=true/StateConnecting），
 // 再启动新的 Serve 重试循环。收到 READY 或会话被替换/禁用则直接退出。
+// 连续 maxOfficialQQReadyTimeouts 次仍不 READY 时置失败终态。
 func (pa *PlatformAdapterOfficialQQ) watchOfficialQQReady(ctx context.Context, readyCh <-chan struct{}) {
 	if readyCh == nil {
 		return
@@ -558,23 +635,24 @@ func (pa *PlatformAdapterOfficialQQ) watchOfficialQQReady(ctx context.Context, r
 	case <-timer.C:
 	}
 
-	if !pa.isCurrentSession(ctx) {
-		return
-	}
-	enabled, state := pa.endpointStateSnapshot()
-	if !enabled || state != StateConnecting {
-		return
-	}
 	ep := pa.EndPoint
 	if ep == nil || ep.Session == nil || ep.Session.Parent == nil {
 		return
 	}
 	d := ep.Session.Parent
-	d.Logger.Warnf("official qq READY 超时，重启连接: 帐号 <%s>(%s)", ep.Nickname, ep.UserID)
-	if pa.failConnectTransient(ctx) == 0 {
+	handled, retry := pa.failReadyTimeoutIfCurrent(ctx)
+	if !handled {
 		return
 	}
-	pa.setDiceServing(false)
+	if !retry {
+		d.Logger.Errorf("official qq READY 连续超时，连接失败: 帐号 <%s>(%s)", ep.Nickname, ep.UserID)
+		pa.setDiceServingIfIdle(false)
+		d.LastUpdatedTime = time.Now().Unix()
+		d.Save(false)
+		return
+	}
+	d.Logger.Warnf("official qq READY 超时，重启连接: 帐号 <%s>(%s)", ep.Nickname, ep.UserID)
+	pa.setDiceServingIfIdle(false)
 	d.LastUpdatedTime = time.Now().Unix()
 	d.Save(false)
 	startOfficialQQ(d, ep)
@@ -735,7 +813,7 @@ func ProbeOfficialQQAccount(ctx context.Context, appID, appSecret string) (*Offi
 	if appSecret == "" {
 		return nil, errors.New("AppSecret 不能为空")
 	}
-	qqbot.SetLogger(NewDummyLogger())
+	ensureOfficialQQBotgoLogger()
 
 	tokenSource := qqtoken.NewQQBotTokenSource(&qqtoken.QQBotCredentials{
 		AppID:     appID,
@@ -988,6 +1066,10 @@ func (pa *PlatformAdapterOfficialQQ) failConnectTransient(ctx context.Context) i
 
 func (pa *PlatformAdapterOfficialQQ) Serve() int {
 	log := pa.EndPoint.Session.Parent.Logger
+	// 用户已禁用/重登期间不能被后台退避循环重新拉起来。
+	if enabled, _ := pa.endpointStateSnapshot(); !enabled {
+		return 0
+	}
 
 	pa.setAppID(OfficialQQAppID(pa.getAppID().String()))
 	pa.setAppSecret(strings.TrimSpace(pa.getAppSecret()))
@@ -1051,6 +1133,7 @@ func validateServeMuxPattern(pattern string) (err error) {
 // connect 建立正式连接。probe 非空时复用探测结果，避免重复拉取机器人信息。
 // 调用方需确保 AppID/AppSecret 已就绪；ctx 为空时（扫码完成后）自行创建会话上下文。
 func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *OfficialQQAccountProbeResult) int {
+	ensureOfficialQQBotgoLogger()
 	pa.connectMu.Lock()
 	defer pa.connectMu.Unlock()
 
@@ -1178,33 +1261,57 @@ func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *Officia
 		}))
 
 		addr := fmt.Sprintf(":%d", pa.WebhookPort)
+		// 先同步绑定端口，成功后再报 Connected。旧实现先报 Connected 再
+		// ListenAndServe：端口占用时会先出现短暂假在线，随后 Connect 返回 0
+		// 让重试循环退出，端口释放后也不会恢复。
+		listener, err := net.Listen("tcp", addr)
+		if err != nil {
+			log.Errorf("official qq webhook 端口监听失败 %s: %v", addr, err)
+			// 端口占用/权限属于本地可恢复问题：按瞬时失败退避重试，
+			// 端口释放后自动恢复；重试预算耗尽才置失败。
+			return pa.failConnectTransient(ctx)
+		}
 		server := &http.Server{
 			Addr:              addr,
 			Handler:           mux,
 			ReadHeaderTimeout: 3 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       60 * time.Second,
 		}
-		pa.setWebhookServer(server)
+		pa.setWebhookServer(server, ctx)
 
-		// 先置为已连接，避免监听协程刚启动时的首条事件回复被发送守卫丢弃；
-		// 监听失败由下面的协程回置为失败状态。
 		if !pa.setStateIfCurrent(ctx, true, StateConnected) {
-			_ = server.Close()
+			_ = listener.Close()
 			pa.closeOfficialQQEventQueueInstance(queue)
 			return 0
 		}
 
 		go func() {
 			log.Infof("official qq webhook: 监听地址 %s%s", addr, pa.WebhookPath)
-			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Error("official qq webhook服务器启动失败: ", err)
-				if pa.failSessionIfCurrent(ctx) {
-					pa.setDiceServing(false)
-					d.LastUpdatedTime = time.Now().Unix()
-					d.Save(false)
+			err := server.Serve(listener)
+			if err == nil || err == http.ErrServerClosed {
+				// 主动关闭会先清掉 webhookServer 指针；指针仍是本 server
+				// 说明监听被外部/异常关闭，不能当成正常退出。
+				if pa.webhookServerIsCurrent(server, ctx) {
+					log.Error("official qq webhook server closed unexpectedly")
+					if pa.failSessionIfCurrent(ctx) {
+						pa.setDiceServing(false)
+						d.LastUpdatedTime = time.Now().Unix()
+						d.Save(false)
+					}
+					pa.closeOfficialQQEventQueueInstance(queue)
 				}
-				// 只关闭本次连接的队列；旧服务器失败时不能误关新会话队列。
-				pa.closeOfficialQQEventQueueInstance(queue)
+				return
 			}
+			log.Error("official qq webhook服务器启动失败: ", err)
+			if pa.failSessionIfCurrent(ctx) {
+				pa.setDiceServing(false)
+				d.LastUpdatedTime = time.Now().Unix()
+				d.Save(false)
+			}
+			// 只关闭本次连接的队列；旧服务器失败时不能误关新会话队列。
+			pa.closeOfficialQQEventQueueInstance(queue)
 		}()
 
 		pa.clearQrLoginState()
@@ -2346,14 +2453,24 @@ func (pa *PlatformAdapterOfficialQQ) buildBatchTail(pageIndex, totalPages int, b
 	return fmt.Sprintf("已展示 %d/%d 条，还有 %d 条。", shown, totalUnits, remaining)
 }
 
-func (pa *PlatformAdapterOfficialQQ) setWebhookServer(server *http.Server) {
+func (pa *PlatformAdapterOfficialQQ) setWebhookServer(server *http.Server, ctx context.Context) {
 	pa.webhookMu.Lock()
 	old := pa.webhookServer
 	pa.webhookServer = server
+	pa.webhookCtx = ctx
 	pa.webhookMu.Unlock()
 	if old != nil && old != server {
 		pa.shutdownHTTPServer(old)
 	}
+}
+
+// webhookServerIsCurrent 判断 server 是否仍是 ctx 会话安装的当前 server。
+// 主动关闭会先清空指针，所以这里为 true 且 Serve 返回 ErrServerClosed
+// 代表监听被外部/异常关闭，应按失败处理。
+func (pa *PlatformAdapterOfficialQQ) webhookServerIsCurrent(server *http.Server, ctx context.Context) bool {
+	pa.webhookMu.Lock()
+	defer pa.webhookMu.Unlock()
+	return pa.webhookServer == server && (ctx == nil || pa.webhookCtx == ctx)
 }
 
 func (pa *PlatformAdapterOfficialQQ) shutdownHTTPServer(server *http.Server) {
@@ -2365,14 +2482,32 @@ func (pa *PlatformAdapterOfficialQQ) shutdownHTTPServer(server *http.Server) {
 	cancel()
 }
 
-func (pa *PlatformAdapterOfficialQQ) shutdownWebhookServer() {
+// shutdownWebhookServerFor 只关闭属于 ctx 的 webhook server。
+// 快速“禁用→启用”时，禁用请求可能在新会话安装新 server 之后才走到这里；
+// 如果只按“当前指针”关闭，会把新会话的监听关掉，形成永久假 Connected。
+// ctx 为 nil 表示调用方没有明确的旧会话，此时只在没有会话时关闭。
+func (pa *PlatformAdapterOfficialQQ) shutdownWebhookServerFor(ctx context.Context) {
 	pa.webhookMu.Lock()
+	if ctx != nil && pa.webhookCtx != ctx {
+		pa.webhookMu.Unlock()
+		return
+	}
+	if ctx == nil && pa.isSessionRunning() {
+		pa.webhookMu.Unlock()
+		return
+	}
 	server := pa.webhookServer
+	serverCtx := pa.webhookCtx
 	pa.webhookServer = nil
+	pa.webhookCtx = nil
 	pa.webhookMu.Unlock()
-	if server != nil {
+	if server != nil && (ctx == nil || serverCtx == ctx) {
 		pa.shutdownHTTPServer(server)
 	}
+}
+
+func (pa *PlatformAdapterOfficialQQ) shutdownWebhookServer() {
+	pa.shutdownWebhookServerFor(nil)
 }
 
 // DoRelogin 请求后台重连。返回值表示“重登循环已受理”，不代表已经连接成功：
@@ -2385,6 +2520,8 @@ func (pa *PlatformAdapterOfficialQQ) DoRelogin() bool {
 		// 用户已禁用端点：不要因为一次重登请求把它重新拉起来。
 		return false
 	}
+	// 用户主动重登时给 READY 看门狗一整轮预算。
+	pa.readyTimeoutStreak.Store(0)
 	d := pa.EndPoint.Session.Parent
 	ctx := pa.currentSessionContext()
 	queue := pa.currentEventQueue()
@@ -2406,7 +2543,7 @@ func (pa *PlatformAdapterOfficialQQ) DoRelogin() bool {
 	d.Logger.Infof("正在启用 official qq 服务")
 	if stopped && !pa.isSessionRunning() {
 		pa.clearQrLoginState()
-		pa.shutdownWebhookServer()
+		pa.shutdownWebhookServerFor(ctx)
 	} else if !stopped {
 		// 新会话已经接管，本次重登不应再启动第三个会话。
 		d.LastUpdatedTime = time.Now().Unix()
@@ -2438,6 +2575,8 @@ func (pa *PlatformAdapterOfficialQQ) SetEnable(enable bool) {
 	d := pa.EndPoint.Session.Parent
 	ep := pa.EndPoint
 	if enable {
+		// 用户重新启用时给 READY 看门狗一整轮预算。
+		pa.readyTimeoutStreak.Store(0)
 		if !pa.isSessionRunning() {
 			pa.setDiceServing(false)
 			// 保持 Enable=true：后台启动是异步的，如果这里先置 false，用户在
@@ -2459,13 +2598,14 @@ func (pa *PlatformAdapterOfficialQQ) SetEnable(enable bool) {
 			}
 		}
 	} else {
-		// 必须让正在退避的重试循环退出，否则 15 秒后 Serve() 会把端点重新拉起来。
+		// 必须先写 Enable=false，再推进 serveEpoch：并发启动路径 claimServe
+		// 在同一把锁里检查 Enable，先写 false 才能保证禁用不会被新循环吞掉。
 		ctx := pa.currentSessionContext()
 		queue := pa.currentEventQueue()
-		pa.cancelServeLoop()
 		var stopped bool
 		if ctx != nil {
 			pa.setStateIfCurrent(ctx, false, StateDisconnected)
+			pa.cancelServeLoop()
 			stopped = pa.stopSessionContextIf(ctx)
 			if stopped {
 				pa.setDiceServing(false)
@@ -2474,12 +2614,15 @@ func (pa *PlatformAdapterOfficialQQ) SetEnable(enable bool) {
 			// 无会话时用 idle 版本，避免覆盖并发启动的新会话状态。
 			pa.setEndpointStateIfIdle(false, StateDisconnected)
 			pa.setDiceServingIfIdle(false)
+			pa.cancelServeLoop()
 			stopped = true
 		}
 		pa.quiesceOfficialQQEventQueueInstance(queue, 2*time.Second)
 		// 如果已经有新会话接管，不要关闭它的 Webhook/二维码状态。
+		// 只关闭属于本次停止的 ctx 的 server；否则并发“禁用→启用”会把
+		// 新会话刚安装的监听关掉，形成永久假 Connected。
 		if stopped && !pa.isSessionRunning() {
-			pa.shutdownWebhookServer()
+			pa.shutdownWebhookServerFor(ctx)
 			pa.clearQrLoginState()
 		}
 	}
@@ -4231,14 +4374,16 @@ func removeOfficialQQEndpoint(session *IMSession, target *EndPointInfo) {
 }
 
 func (pa *PlatformAdapterOfficialQQ) setDiceServingIfIdle(value bool) bool {
+	// 统一锁序 serveMu -> sessionMu：claimServe 也是这个顺序。
+	// 反过来（sessionMu -> serveMu）会与启动路径形成死锁。
+	pa.serveMu.Lock()
+	defer pa.serveMu.Unlock()
 	pa.sessionMu.Lock()
 	defer pa.sessionMu.Unlock()
 	if pa.Ctx != nil {
 		return false
 	}
-	pa.serveMu.Lock()
 	pa.DiceServing = value
-	pa.serveMu.Unlock()
 	return true
 }
 

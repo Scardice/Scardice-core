@@ -14,6 +14,8 @@
    - “这个骰子还在这个群服务” = 端点 `Enable` + `DiceIDExistsMap` 中存在。
    - `DiceIDActiveMap` 只是“曾经激活”，不能单独作为活跃依据；退群只删 ExistsMap，ActiveMap 会留脏 ID。
    - ExistsMap 为空（老数据/加载未完成）时保留旧行为，避免误判。
+   - 唯一例外：启动对账 `reconcileLogGapForGroup` 在 ExistsMap 完全没有该端点时允许
+     用 ActiveMap 兜底（偶有老数据缺 ExistsMap）；不要在其它新路径复制这个兜底。
 
 3. **解析契约**
    - 实时命令走 Segment（`CommandParseNew`）；历史解析必须用 `historicalCommandText`：
@@ -32,6 +34,10 @@
 - **不要逐段复用 trigger 锚点**：SnowLuma 的 message_id 路径从触发消息向旧翻页；如果每段都从同一个 trigger 拉，越早的段重复拉取越多，缺口超过页数上限时第 1 段永远到不了起点。正确做法是先按整条缺口预取一次，再在内存里分段过滤。
 - **识别 5000 / 补录 2000**：识别窗口最多 5000 条，真正写日志最多 2000 条；超过上限的较早消息直接丢弃，并在群内说明丢弃条数，不能保留 pending 无限重试。
 - **预取不完整时一条都不要写**：只拿到段尾后缀、而 `.log off/.log on` 在没拉到的前缀里时，按 `startOn=true` 过滤会把 off 段写进日志。先确认 ReachedStart/Boundary，再写。
+- **旧 HistoryFetcher 的空页例外**：严格的 ReachedStart/Boundary 契约只对
+  `HistoryRangeFetcher` 成立。只实现旧 `HistoryFetcher` 的适配器没有边界信号，
+  首屏空页按“历史保留期已到”处理并跳过该窗口，否则会无限重试。生产
+  go-cqhttp/OneBot 都走 RangeFetcher；新增适配器不要再依赖旧接口。
 - **上传/导出前检查 pending**：`.log end/get/masterget/export` 在补全任务/区间未完成时阻止，并提示等待；否则会直接上传缺失的日志。
 - **启动后主动对账**：核心重启后不要等第一条群消息才检查；端点就绪后取最新历史 seq 与本地已记录 seq 比较，有缺口就入队。
 - **失败要告知**：拉取/去重/无进展/写入失败不能只写核心日志；群内限频提示“将自动重试”。

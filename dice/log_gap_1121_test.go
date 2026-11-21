@@ -120,7 +120,7 @@ func TestOffDiscoveryDiscardOnlyNotice_1121(t *testing.T) {
 		dice: d, endpoint: ep, group: g, logID: logID, logName: "run-a",
 		discardedByDetect: 500,
 	}
-	task.sendOffDiscoveryResult(0, false, false, false, false)
+	task.sendOffDiscoveryResult(0, false, false, false, false, false)
 
 	msgs := groupMsgsOf(ep)
 	if len(msgs) != 1 {
@@ -134,7 +134,7 @@ func TestOffDiscoveryDiscardOnlyNotice_1121(t *testing.T) {
 	}
 
 	g.requestLogGapNotifyOnComplete()
-	task.sendOffDiscoveryResult(0, false, false, false, false)
+	task.sendOffDiscoveryResult(0, false, false, false, false, false)
 	msgs = groupMsgsOf(ep)
 	if len(msgs) != 2 {
 		t.Fatalf("notices after promise = %#v, want two", msgs)
@@ -145,5 +145,77 @@ func TestOffDiscoveryDiscardOnlyNotice_1121(t *testing.T) {
 	}
 	if g.logGapNotifyOnCompleteRequested() {
 		t.Fatal("notify flag should be cleared after completion notice")
+	}
+}
+
+// TestOffDiscoveryStoppedOnlyLiveTrigger_1121fix1 锁定：实时触发消息本身是
+// .log end/new/halt、历史缺口里没有任何 .log on/off 时，stopped 不能单独
+// 被当成“发现了离线日志记录”。没有完成承诺时保持静默；有承诺时只发通用
+// 完成提示，不冒充离线发现。
+func TestOffDiscoveryStoppedOnlyLiveTrigger_1121fix1(t *testing.T) {
+	const groupID = "QQ-Group:1121fix1-stopped-live"
+	const senderID = "QQ:1121fix1-user"
+	d, ep, g, _, logID, cleanup := newFix6LogGapEnv(t, groupID, senderID, &scriptedHistoryFetcher{})
+	defer cleanup()
+
+	task := logGapFillTask{dice: d, endpoint: ep, group: g, logID: logID, logName: "run-a"}
+	task.sendOffDiscoveryResult(0, false, false, false, true, false)
+	if msgs := groupMsgsOf(ep); len(msgs) != 0 {
+		t.Fatalf("stopped-only without promise must stay silent, got %#v", msgs)
+	}
+
+	g.requestLogGapNotifyOnComplete()
+	task.sendOffDiscoveryResult(0, false, false, false, true, false)
+	msgs := groupMsgsOf(ep)
+	if len(msgs) != 1 {
+		t.Fatalf("notices = %#v, want one completion notice", msgs)
+	}
+	if strings.Contains(msgs[0], "检测到离线期间的日志记录") {
+		t.Fatalf("stopped-only live trigger must not claim a discovery, got %q", msgs[0])
+	}
+	if strings.Contains(msgs[0], "离线期间有") {
+		t.Fatalf("stopped-only live trigger must not claim offline log commands, got %q", msgs[0])
+	}
+	if !strings.Contains(msgs[0], "日志补录完成，没有需要补录的消息。") {
+		t.Fatalf("missing completion promise notice, got %q", msgs[0])
+	}
+	if g.logGapNotifyOnCompleteRequested() {
+		t.Fatal("notify flag should be cleared after completion notice")
+	}
+}
+
+// TestOffDiscoveryStoppedHistoricalNotice_1121fix1 锁定：历史扫描确实发现了
+// .log 命令并因此停止时，仍要发“检测到离线期间的日志记录”，并说明是
+// 离线期间的日志命令导致停止，不能和实时触发消息混为一谈。
+func TestOffDiscoveryStoppedHistoricalNotice_1121fix1(t *testing.T) {
+	const groupID = "QQ-Group:1121fix1-stopped-historical"
+	const senderID = "QQ:1121fix1-user"
+	d, ep, g, _, logID, cleanup := newFix6LogGapEnv(t, groupID, senderID, &scriptedHistoryFetcher{})
+	defer cleanup()
+
+	task := logGapFillTask{dice: d, endpoint: ep, group: g, logID: logID, logName: "run-a"}
+	task.sendOffDiscoveryResult(0, true, false, false, true, true)
+	msgs := groupMsgsOf(ep)
+	if len(msgs) != 1 {
+		t.Fatalf("notices = %#v, want one discovery notice", msgs)
+	}
+	if !strings.Contains(msgs[0], "检测到离线期间的日志记录") ||
+		!strings.Contains(msgs[0], "离线期间有 .log new/end/halt 或切换日志") {
+		t.Fatalf("historical stop notice mismatch: %q", msgs[0])
+	}
+
+	// 历史有发现，但停止来自实时触发的日志命令：仍说“检测到”，
+	// 但停止原因不能写成“离线期间有 .log ...”。
+	task.sendOffDiscoveryResult(0, true, false, false, true, false)
+	msgs = groupMsgsOf(ep)
+	if len(msgs) != 2 {
+		t.Fatalf("notices = %#v, want two", msgs)
+	}
+	if !strings.Contains(msgs[1], "检测到离线期间的日志记录") ||
+		!strings.Contains(msgs[1], "已遇到新的日志命令") {
+		t.Fatalf("live-trigger stop notice mismatch: %q", msgs[1])
+	}
+	if strings.Contains(msgs[1], "离线期间有 .log") {
+		t.Fatalf("live-trigger stop must not claim historical log commands: %q", msgs[1])
 	}
 }

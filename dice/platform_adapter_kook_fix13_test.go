@@ -15,7 +15,7 @@ func TestKookAbortServeAfterPanicClearsState(t *testing.T) {
 	pa.adminCache = map[string]kookAdminCacheEntry{"guild\x00user": {admin: true}}
 	pa.guildCache = map[string]kookGuildCacheEntry{"guild": {}}
 
-	pa.abortServeAfterPanic(nil)
+	pa.abortServeAfterPanic(0, nil)
 
 	if pa.serving {
 		t.Fatal("serving flag was not cleared after a panic")
@@ -37,7 +37,7 @@ func TestKookAbortServeAfterPanicKeepsNewerSession(t *testing.T) {
 	pa.IntentSession = newSession
 	pa.serving = true
 
-	pa.abortServeAfterPanic(&kook.Session{})
+	pa.abortServeAfterPanic(0, &kook.Session{})
 
 	if pa.IntentSession != newSession {
 		t.Fatal("newer session was cleared")
@@ -54,7 +54,7 @@ func TestKookAbortServeAfterPanicKeepsDisabledState(t *testing.T) {
 	pa := &PlatformAdapterKook{EndPoint: ep}
 	pa.serving = true
 
-	pa.abortServeAfterPanic(nil)
+	pa.abortServeAfterPanic(0, nil)
 
 	if pa.serving {
 		t.Fatal("serving flag should be cleared")

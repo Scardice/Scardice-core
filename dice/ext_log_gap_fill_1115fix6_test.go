@@ -385,9 +385,10 @@ func TestHistoricalLogOffMentionOtherIgnored_1115fix6(t *testing.T) {
 	g.logGapWorkerRunning = false
 }
 
-// TestHistoricalUnsupportedLifecycleParse_1115fix6 锁定停止边界的识别：
-// .log new/end/halt、.ext off/on log 会停止推断；.bot off/on 自 1115.fix7
-// 起完全按普通消息处理，不再停止；无关扩展也不停止。
+// TestHistoricalUnsupportedLifecycleParse_1115fix6 锁定生命周期命令的识别：
+// 1120 起 .log new/end/halt、.ext off/on log 在历史扫描中只记入 ignored 并
+// 继续扫描（核心离线期间它们没有执行），不再停止推断；.bot off/on 自
+// 1115.fix7 起完全按普通消息处理，不再停止；无关扩展也不停止。
 func TestHistoricalUnsupportedLifecycleParse_1115fix6(t *testing.T) {
 	task := logGapFillTask{
 		dice:     &Dice{CommandPrefix: []string{"!", ".", "。", "/"}},

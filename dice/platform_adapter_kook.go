@@ -163,6 +163,9 @@ type PlatformAdapterKook struct {
 	sessionMu sync.Mutex
 	// serving 防止并发 Serve 启动两套连接；会话被清空/禁用时复位。
 	serving bool
+	// serveToken 每次 Serve/禁用/重登递增。Serve 的每个阶段都要用自己
+	// 捕获的 token 校验所有权，避免启动期被禁用后旧协程又把端点拉起来。
+	serveToken uint64
 
 	adminCacheMu sync.Mutex
 	adminCache   map[string]kookAdminCacheEntry
@@ -355,17 +358,60 @@ func (pa *PlatformAdapterKook) saveKookResumeState(session *kook.Session) {
 }
 
 func (pa *PlatformAdapterKook) clearKookResumeState() {
+	// 与 saveKookResumeState 共用 resumeStateMu，且保持同样的锁序：
+	// resumeStateMu -> sessionMu。否则 save 在检查完归属后、rename 之前，
+	// clear 可以删掉文件，save 又把它写回来。
+	pa.resumeStateMu.Lock()
+	defer pa.resumeStateMu.Unlock()
 	pa.sessionMu.Lock()
-	defer pa.sessionMu.Unlock()
+	hasSession := pa.IntentSession != nil
+	pa.sessionMu.Unlock()
 	// 已有新会话接管时，旧 Serve/DoRelogin 的迟到清理不能删掉新会话刚写入的
 	// resume 快照；只有当前没有会话时才允许删除。
-	if pa.IntentSession != nil {
+	if hasSession {
 		return
 	}
 	path := pa.resumeStatePath()
 	if path != "" {
 		_ = os.Remove(path)
 	}
+}
+
+// removeKookResumeStateForSession 删除属于指定 session 的 resume 快照。
+// 只在快照的 token hash 与 session 匹配、且没有新会话接管时删除，避免
+// 旧协程/旧 session 的迟到清理误删新会话刚写入的文件。
+func (pa *PlatformAdapterKook) removeKookResumeStateForSession(session *kook.Session) {
+	if pa == nil || session == nil {
+		return
+	}
+	tokenHash := kookSessionTokenHash(session)
+	if tokenHash == "" {
+		return
+	}
+	pa.resumeStateMu.Lock()
+	defer pa.resumeStateMu.Unlock()
+	pa.sessionMu.Lock()
+	newer := pa.IntentSession != nil && pa.IntentSession != session
+	pa.sessionMu.Unlock()
+	if newer {
+		return
+	}
+	path := pa.resumeStatePath()
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var state kookResumeFile
+	if err := json.Unmarshal(data, &state); err != nil {
+		return
+	}
+	if state.TokenHash != tokenHash {
+		return
+	}
+	_ = os.Remove(path)
 }
 
 // persistKookResumeState 定期保存 sn；进程异常退出时最多丢 5 秒的进度，
@@ -391,7 +437,20 @@ func (pa *PlatformAdapterKook) clearSessionIf(session *kook.Session) bool {
 	}
 	pa.IntentSession = nil
 	pa.serving = false
+	// 使旧 Serve 的 defer/后续阶段失效，不能让它再改端点状态。
+	pa.serveToken++
 	return true
+}
+
+// abortServeSession 清理一次未成功接管的 Serve：只在仍是当前会话时清空
+// IntentSession/serving，然后关闭旧连接。新会话已接管时 clearSessionIf
+// 会 no-op，只关闭旧连接，不会影响新会话。
+func (pa *PlatformAdapterKook) abortServeSession(session *kook.Session) {
+	if session == nil {
+		return
+	}
+	pa.clearSessionIf(session)
+	_ = session.Close()
 }
 
 func (pa *PlatformAdapterKook) isCurrentSession(session *kook.Session) bool {
@@ -405,6 +464,15 @@ func (pa *PlatformAdapterKook) isServingSession(session *kook.Session) bool {
 	pa.sessionMu.Lock()
 	defer pa.sessionMu.Unlock()
 	return session != nil && pa.serving && pa.IntentSession == session
+}
+
+// isServingSessionToken 在 isServingSession 基础上校验 Serve 启动代次。
+// 禁用/重登会递增 serveToken；旧 Serve 即使还没走到 setSession，也会在
+// 后续阶段失败并清理自己，不能把端点重新写成 Connected。
+func (pa *PlatformAdapterKook) isServingSessionToken(session *kook.Session, token uint64) bool {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	return session != nil && pa.serving && pa.IntentSession == session && pa.serveToken == token
 }
 
 // setSessionStateIfCurrent 把“确认仍是当前会话”和“写端点状态”放在同一把锁里，
@@ -444,6 +512,7 @@ func (pa *PlatformAdapterKook) clearSessionAndSetState(session *kook.Session, en
 	}
 	pa.IntentSession = nil
 	pa.serving = false
+	pa.serveToken++
 	if pa.EndPoint != nil {
 		pa.EndPoint.Enable = enable
 		pa.EndPoint.State = state
@@ -684,16 +753,21 @@ func (pa *PlatformAdapterKook) updateGameStatus() {
 }
 
 // abortServeAfterPanic 清理一次 panic 的 Serve 留下的会话与状态。
-// 如果已有新会话接管（IntentSession 不是本次的 session），什么都不做，
-// 避免旧协程把新连接标记为失败。
-func (pa *PlatformAdapterKook) abortServeAfterPanic(session *kook.Session) {
+// token 是本次 Serve 启动时捕获的代次：如果已有更新的 Serve/禁用接管，
+// 什么都不做，避免旧协程把新连接标记为失败。
+func (pa *PlatformAdapterKook) abortServeAfterPanic(token uint64, session *kook.Session) {
 	pa.sessionMu.Lock()
-	if pa.IntentSession != session {
+	if pa.serveToken != token {
 		pa.sessionMu.Unlock()
 		return
 	}
-	// Serve 在创建 session 之前 panic 时传 nil；如果用户已经主动禁用
-	// （Disconnected/Enable=false），不要把状态改成“连接失败”。
+	// Serve 在创建/安装 session 之前 panic 时也要清 serving；
+	// 不能只按 IntentSession 判断，否则 serving 会永久卡在 true，
+	// 下一次 Serve 被 “already running” 挡住。
+	if pa.IntentSession != nil && pa.IntentSession != session {
+		pa.sessionMu.Unlock()
+		return
+	}
 	if session == nil && pa.EndPoint != nil && !pa.EndPoint.Enable && pa.EndPoint.State == StateDisconnected {
 		pa.serving = false
 		pa.sessionMu.Unlock()
@@ -701,7 +775,8 @@ func (pa *PlatformAdapterKook) abortServeAfterPanic(session *kook.Session) {
 	}
 	pa.IntentSession = nil
 	pa.serving = false
-	if pa.EndPoint != nil {
+	pa.serveToken++
+	if pa.EndPoint != nil && pa.EndPoint.Enable {
 		pa.EndPoint.Enable = false
 		pa.EndPoint.State = StateConnectionFailed
 	}
@@ -722,6 +797,8 @@ func (pa *PlatformAdapterKook) Serve() (ret int) {
 	// 本次 Serve 自己创建的 session。panic 清理必须用它，不能用 pa.getSession()：
 	// 用户快速“禁用→启用”后，旧 Serve 的 defer 会取到新会话并把它误杀。
 	var serveSession *kook.Session
+	// serveToken 是本次 Serve 的启动代次；禁用/重登/新 Serve 会递增它。
+	var serveToken uint64
 	// SetEnable/DoRelogin 会直接调用 Serve，不经过 ServeKook 的 recover。
 	// 未预期的 panic 只能终止本次连接，不能让进程退出或让端点永久停在“连接中”。
 	defer func() {
@@ -730,7 +807,7 @@ func (pa *PlatformAdapterKook) Serve() (ret int) {
 			// （DoRelogin 返回 true、ServeKook 不写失败态）。
 			ret = 1
 			log.Errorf("KOOK 连接协程异常: %v 堆栈: %v", r, string(debug.Stack()))
-			pa.abortServeAfterPanic(serveSession)
+			pa.abortServeAfterPanic(serveToken, serveSession)
 			pa.saveState()
 		}
 	}()
@@ -741,6 +818,8 @@ func (pa *PlatformAdapterKook) Serve() (ret int) {
 		log.Info("KOOK serve already running, skip duplicate Serve")
 		return 0
 	}
+	pa.serveToken++
+	serveToken = pa.serveToken
 	pa.serving = true
 	pa.sessionMu.Unlock()
 
@@ -965,9 +1044,9 @@ func (pa *PlatformAdapterKook) Serve() (ret int) {
 	// 这样 Open 刚开始推送事件时，EndPoint.UserID 已经是可用的，
 	// 不会出现“能回复但自我 @ 识别使用空 UserID”的窗口。
 	pa.setSession(s)
-	if !pa.isServingSession(s) {
+	if enabled, _, _, _ := pa.endpointSnapshot(); !enabled || !pa.isServingSessionToken(s, serveToken) {
 		// 启动期间被禁用/重登：不要继续拉连接或覆盖端点状态。
-		_ = s.Close()
+		pa.abortServeSession(s)
 		return 0
 	}
 	go pa.persistKookResumeState(s)
@@ -978,6 +1057,11 @@ func (pa *PlatformAdapterKook) Serve() (ret int) {
 	})
 	s.SetFatalHandler(func(fatalErr error) {
 		pa.handleKookFatal(s, fatalErr)
+	})
+	// resume/session 状态被丢弃时同步删除磁盘快照，避免下次启动先用
+	// 已失效的 session 走一轮 8/16 秒 resume 失败。
+	s.SetResumeResetHandler(func() {
+		pa.removeKookResumeStateForSession(s)
 	})
 	s.SetReconnectHandler(func() {
 		if pa.setSessionStateIfCurrent(s, true, StateConnected) {
@@ -1002,12 +1086,14 @@ func (pa *PlatformAdapterKook) Serve() (ret int) {
 		// 下次启动也不会再尝试连接）。
 		if kook.IsPermanentAuthError(err) {
 			log.Errorf("获取KOOK账号信息失败（鉴权错误）:%v", err)
-			pa.clearKookResumeState()
 			if !pa.clearSessionAndSetState(s, false, StateConnectionFailed) {
 				// 用户已禁用，或新的 Serve 已经接管；旧协程不能覆盖新状态。
-				_ = s.Close()
+				pa.abortServeSession(s)
 				return 0
 			}
+			// clearSessionAndSetState 已把 IntentSession 置空；此时删除
+			// 快照才不会被“仍有当前会话”的守卫拦成 no-op。
+			pa.clearKookResumeState()
 			pa.saveState()
 			_ = s.Close()
 			return 1
@@ -1016,33 +1102,34 @@ func (pa *PlatformAdapterKook) Serve() (ret int) {
 		go pa.refreshKookIdentity(s, log)
 	} else if !pa.applyIdentityIfCurrent(s, self) {
 		// UserMe 期间用户禁用/重登，旧会话直接退出。
-		_ = s.Close()
+		pa.abortServeSession(s)
 		return 0
 	}
 
 	// 身份就绪后再置为已连接，避免 Open() 刚启动时服务端推送的首条事件
 	// 因发送守卫看到 State/Enable 未就绪而被静默丢弃。
 	if !pa.setSessionStateIfCurrent(s, true, StateConnected) {
-		_ = s.Close()
+		pa.abortServeSession(s)
 		return 0
 	}
-	if !pa.isServingSession(s) {
-		_ = s.Close()
+	if !pa.isServingSessionToken(s, serveToken) {
+		pa.abortServeSession(s)
 		return 0
 	}
 	err = s.Open()
 	if err != nil && !errors.Is(err, kook.ErrWSAlreadyOpen) {
 		if errors.Is(err, kook.ErrSessionClosed) || s.IsClosed() {
 			// 用户禁用/新会话接管，不能覆盖新状态，也不要复活旧连接。
+			pa.abortServeSession(s)
 			return 0
 		}
 		if kook.IsPermanentAuthError(err) {
 			log.Errorf("与KOOK服务建立连接时出错:%s", err.Error())
-			pa.clearKookResumeState()
 			if !pa.clearSessionAndSetState(s, false, StateConnectionFailed) {
-				_ = s.Close()
+				pa.abortServeSession(s)
 				return 0
 			}
+			pa.clearKookResumeState()
 			pa.saveState()
 			_ = s.Close()
 			return 1
@@ -1050,8 +1137,8 @@ func (pa *PlatformAdapterKook) Serve() (ret int) {
 		// 网络抖动等瞬时错误：保留 session_id/sn，交给 SDK 后台 resume，
 		// 不能在这里 Close 掉刚由 Open 保留下来的恢复状态。
 		log.Warnf("与KOOK服务连接遇到瞬时错误，保留会话并后台重连: %v", err)
-		if !pa.isServingSession(s) {
-			_ = s.Close()
+		if !pa.isServingSessionToken(s, serveToken) {
+			pa.abortServeSession(s)
 			return 0
 		}
 		pa.setSessionStateIfCurrent(s, true, StateConnecting)
@@ -1067,7 +1154,7 @@ func (pa *PlatformAdapterKook) Serve() (ret int) {
 	pa.saveKookResumeState(s)
 	if !pa.setSessionStateIfCurrent(s, true, StateConnected) {
 		// 连接建立期间被禁用/替换，避免旧协程继续改状态。
-		_ = s.Close()
+		pa.abortServeSession(s)
 		return 0
 	}
 	go pa.updateGameStatus()
@@ -1097,6 +1184,8 @@ func (pa *PlatformAdapterKook) DoRelogin() bool {
 		}
 		pa.sessionMu.Lock()
 		pa.serving = false
+		// 让任何尚未 setSession 的旧 Serve 失效，重登只能有一个新代次。
+		pa.serveToken++
 		pa.sessionMu.Unlock()
 		pa.clearKookResumeState()
 	}
@@ -1113,13 +1202,24 @@ func (pa *PlatformAdapterKook) SetEnable(enable bool) {
 			pa.Serve()
 			return
 		}
+		if session.IsClosed() || !pa.isServingSession(session) {
+			// 启动期禁用可能留下“已关闭但仍挂在 IntentSession 上”的会话。
+			// 不能先把它写成 Connected 再发现 !serving 就返回；先清掉旧会话，
+			// 再按无会话路径重建，UI 才不会显示“已连接但收不到事件”。
+			pa.clearSessionIf(session)
+			_ = session.Close()
+			pa.setEndpointStateIfIdle(true, StateConnecting)
+			pa.saveState()
+			pa.Serve()
+			return
+		}
 		// 与 Serve 相同：先置已连接状态，避免 Open 启动期的首条事件回复被丢弃。
 		if !pa.setSessionStateIfCurrent(session, true, StateConnected) {
-			_ = session.Close()
+			pa.abortServeSession(session)
 			return
 		}
 		if !pa.isServingSession(session) {
-			_ = session.Close()
+			pa.abortServeSession(session)
 			return
 		}
 		err := session.Open()
@@ -1129,8 +1229,8 @@ func (pa *PlatformAdapterKook) SetEnable(enable bool) {
 			}
 			if kook.IsPermanentAuthError(err) {
 				log.Errorf("与KOOK服务进行连接时出错:%s", err)
-				pa.clearKookResumeState()
 				if pa.clearSessionAndSetState(session, false, StateConnectionFailed) {
+					pa.clearKookResumeState()
 					pa.saveState()
 				}
 				_ = session.Close()
@@ -1138,7 +1238,7 @@ func (pa *PlatformAdapterKook) SetEnable(enable bool) {
 			}
 			log.Warnf("与KOOK服务连接遇到瞬时错误，保留会话并后台重连: %v", err)
 			if !pa.isServingSession(session) {
-				_ = session.Close()
+				pa.abortServeSession(session)
 				return
 			}
 			pa.setSessionStateIfCurrent(session, true, StateConnecting)
@@ -1151,7 +1251,7 @@ func (pa *PlatformAdapterKook) SetEnable(enable bool) {
 			return
 		}
 		if !pa.setSessionStateIfCurrent(session, true, StateConnected) {
-			_ = session.Close()
+			pa.abortServeSession(session)
 			return
 		}
 		pa.updateGameStatus()
@@ -1163,6 +1263,8 @@ func (pa *PlatformAdapterKook) SetEnable(enable bool) {
 			if pa.setEndpointStateIfIdle(false, StateDisconnected) {
 				pa.sessionMu.Lock()
 				pa.serving = false
+				// 使尚未 setSession 的 Serve 失效，防止禁用后又被拉起来。
+				pa.serveToken++
 				pa.sessionMu.Unlock()
 				pa.clearKookResumeState()
 				pa.saveState()

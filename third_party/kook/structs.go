@@ -291,6 +291,11 @@ type Session struct {
 	// 适配器用它把端点从 Connected 回置为 Connecting，避免断线/重连期间
 	// UI 继续显示“已连接”。必须通过 SetReconnectStartHandler 设置。
 	ReconnectStartHandler func()
+	// ResumeResetHandler 在 resume/session 状态被丢弃时回调（永久 resume
+	// 失败、新 session、Close）。适配器用它删除磁盘上已失效的快照，避免
+	// 下次启动先用坏 session 走一轮 8/16 秒失败。必须通过
+	// SetResumeResetHandler 设置。
+	ResumeResetHandler func()
 
 	wsConn  *websocket.Conn
 	wsMutex sync.Mutex
@@ -316,9 +321,23 @@ type Session struct {
 	// ACK, and executing pre-ACK events would replay them twice.
 	resumePending bool
 	preAck        []*queuedEvent
+	preAckMaxSN   int64
+	// preAckTruncated 表示本轮 resume 等待期间 preAck 曾达到上限、有事件被
+	// 丢弃。ACK 到达后必须立即再发一次 s=4 补回尾部，不能等下一个新事件
+	// 触发缺口检测；否则客户端会在“已 ACK”状态永久少一段。
+	preAckTruncated bool
 	// resumeWatchGen 每次进入 resume 等待时递增，防止旧的 ACK 超时 watcher
 	// 误伤新一轮 resume。
 	resumeWatchGen uint64
+	// resumeAckStreak 记录连续 ACK 超时且 preAck/sequence 都没有进展的次数。
+	// 达到上限后清 resume 状态转新 session，避免同一 sn 无限重放。
+	resumeAckStreak    int
+	resumeAckSeqMark   int64
+	resumeAckMaxSNMark int64
+	// gapTimeoutStreak 记录同一 expected sn 连续空洞超时的次数。
+	// 达到上限后清 resume 状态转新 session，避免 15 秒一次无限重连。
+	gapTimeoutExpected int64
+	gapTimeoutStreak   int
 
 	// eventMu 保护 inFlight。
 	eventMu  sync.Mutex

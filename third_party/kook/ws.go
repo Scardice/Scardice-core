@@ -220,6 +220,14 @@ func (s *Session) SetReconnectStartHandler(h func()) {
 	s.Unlock()
 }
 
+// SetResumeResetHandler 设置 resume/session 状态被丢弃时的回调。
+// 用于让适配器删除已失效的磁盘快照。
+func (s *Session) SetResumeResetHandler(h func()) {
+	s.Lock()
+	s.ResumeResetHandler = h
+	s.Unlock()
+}
+
 func (s *Session) reportReconnectStart() {
 	s.RLock()
 	h := s.ReconnectStartHandler
@@ -312,6 +320,17 @@ var resumeRetryDelays = []time.Duration{
 // 首次 resume 立即执行，失败后 8s、16s 各重试一次，共 3 次。
 // 网络类错误也走这个预算，避免旧 session 已失效时在它上面耗数分钟。
 const maxAmbiguousResumeAttempts = 3
+
+const (
+	// maxGapResyncAttempts 是同一 expected sn 连续超时后转新 session 的次数。
+	// 15 秒一次，3 次约 45 秒；服务端仍不补这个 sn 时继续 resume 只会每
+	// 15 秒抖一次连接，清空 resume 状态重新建 session 更稳。
+	maxGapResyncAttempts = 3
+	// maxResumeAckTimeouts 是连续 ACK 超时且没有任何重放进度的上限。
+	// 60 秒一次，3 次约 3 分钟；期间 preAck 增长会重置计数，避免把
+	// 慢但仍在补发的服务端误判成永久失败。
+	maxResumeAckTimeouts = 3
+)
 
 // Open starts a websocket connection. It does not block the function.
 // 如果当前仍持有可 resume 的 session（例如正处于自动重连退避期），
@@ -745,17 +764,27 @@ func (s *Session) onEvent(wsConn *websocket.Conn, messageType int, message []byt
 		s.RUnlock()
 		if resuming {
 			s.Lock()
-			if s.resumePending && len(s.preAck) < maxPreAckEvents {
-				s.preAck = append(s.preAck, &queuedEvent{conn: wsConn, epoch: epoch, event: e, data: data})
+			if s.resumePending {
+				if len(s.preAck) < maxPreAckEvents {
+					s.preAck = append(s.preAck, &queuedEvent{conn: wsConn, epoch: epoch, event: e, data: data})
+					if sn > s.preAckMaxSN {
+						s.preAckMaxSN = sn
+					}
+					s.Unlock()
+					return nil, nil
+				}
+				// 记录截断，但继续丢弃新事件：ACK 到达后会用当前 sequence
+				// 立即再发一次 s=4 补回尾部，不能只依赖下一个新事件触发
+				// 缺口检测（群里安静时永远等不到）。
+				s.preAckTruncated = true
 				s.Unlock()
+				addCaller(s.Logger.Error()).Int64("seq", sn).Bool("truncated", true).
+					Msg("pre-ack buffer full, dropping event")
 				return nil, nil
 			}
-			pending := s.resumePending
 			s.Unlock()
-			if pending {
-				addCaller(s.Logger.Error()).Int64("seq", sn).Msg("pre-ack buffer full, dropping event")
-			}
-			return nil, nil
+			// ACK 在这两次检查之间到达：resumePending 已清，这条事件应当
+			// 按普通事件继续分发，不能在这里静默丢掉。
 		}
 	}
 
@@ -804,6 +833,14 @@ func (s *Session) handleEventNow(e *Event, data *EventData, epoch uint64) {
 // 从根上避免旧/新连接同时执行同一个 sn。
 func (s *Session) dispatchEvents(dispatcher *eventDispatcher) {
 	defer close(dispatcher.done)
+	// handler 自身有 recover，但 sn 排序/缓冲/epoch 代码没有；一个意外
+	// panic 不能带走整个进程。这里只记录，连接由心跳/下次事件自然恢复。
+	defer func() {
+		if r := recover(); r != nil {
+			addCaller(s.Logger.Error()).Str("panic", fmt.Sprint(r)).
+				Str("stack", string(debug.Stack())).Msg("event dispatcher panic")
+		}
+	}()
 	pending := make(map[int64]*queuedEvent)
 	var lastConn *websocket.Conn
 	var lastEpoch uint64
@@ -910,7 +947,9 @@ func (s *Session) dispatchEvents(dispatcher *eventDispatcher) {
 			if err := s.sendResumeSignal(q.conn, seq); err != nil {
 				closeGap()
 				lastGapExpected = -1
-				s.requestResyncThrottled(q.conn, "resume signal write failed")
+				// 写失败属于链路故障，不能按“队列满”的 10 秒冷却节流，
+				// 否则新事件会继续进 preAck 却没有 ACK watcher。
+				s.requestResync(q.conn, "resume signal write failed")
 				continue
 			}
 			go s.watchGap(q.conn, lastGapExpected, epoch, gapFilled)
@@ -1179,8 +1218,22 @@ func (s *Session) resetSessionState(clearGateway bool) {
 	atomic.StoreInt64(s.sequence, 0)
 	s.resumePending = false
 	s.preAck = nil
+	s.preAckTruncated = false
+	s.preAckMaxSN = 0
+	s.resumeAckStreak = 0
+	s.resumeAckSeqMark = 0
+	s.resumeAckMaxSNMark = 0
+	s.gapTimeoutExpected = 0
+	s.gapTimeoutStreak = 0
+	resetHandler := s.ResumeResetHandler
 	resetEpoch := s.sessionEpoch.Add(1)
 	s.Unlock()
+
+	// 通知适配器删除已失效的磁盘快照。放在锁外，避免适配器回调再取
+	// resumeState/session 锁时与 Session 锁形成嵌套。
+	if resetHandler != nil {
+		resetHandler()
+	}
 
 	s.eventMu.Lock()
 	// 另一个 Open/Close 可能已经进入下一次状态重置；不要清掉它的 inFlight。
@@ -1313,6 +1366,7 @@ func (s *Session) sendResumeSignal(wsConn *websocket.Conn, sn int64) error {
 	s.resumeWatchGen++
 	resumeWatchGen := s.resumeWatchGen
 	s.preAck = nil
+	s.preAckTruncated = false
 	s.Unlock()
 	s.wsMutex.Lock()
 	_ = wsConn.SetWriteDeadline(time.Now().Add(heartbeatWriteTTL))
@@ -1322,6 +1376,16 @@ func (s *Session) sendResumeSignal(wsConn *websocket.Conn, sn int64) error {
 	})
 	s.wsMutex.Unlock()
 	if err != nil {
+		// 写失败时不能留下 resumePending：否则新事件会一直进 preAck，
+		// 但没有任何 ACK watcher 会来消费，链路看起来还活着却永远不执行。
+		s.Lock()
+		if s.resumeWatchGen == resumeWatchGen {
+			s.resumePending = false
+			s.preAck = nil
+			s.preAckTruncated = false
+			s.resumeWatchGen++
+		}
+		s.Unlock()
 		addCaller(s.Logger.Error()).Err("err", err).Int64("seq", sn).Msg("error sending resume signal")
 		return err
 	}
@@ -1353,10 +1417,65 @@ func (s *Session) watchResumeAck(wsConn *websocket.Conn, gen uint64) {
 	if !pending {
 		return
 	}
+	forceNew := s.noteResumeAckTimeout()
+	if forceNew {
+		addCaller(s.Logger.Error()).Msg("resume ack timeout without replay progress, resetting resume state")
+		s.flushResumeState()
+	}
 	addCaller(s.Logger.Error()).Msg("resume ack timeout, reconnecting")
 	if closed, _ := s.closeConnIf(wsConn, websocket.CloseGoingAway); closed {
 		s.reconnectAfterDisconnect()
 	}
+}
+
+// noteGapTimeout 记录一次同一 expected sn 的空洞超时。
+// 连续 maxGapResyncAttempts 次仍未前进时返回 true，调用方应清空 resume
+// 状态并转新 session；不同 expected 会重置计数。
+func (s *Session) noteGapTimeout(expected int64) bool {
+	s.Lock()
+	defer s.Unlock()
+	if s.gapTimeoutExpected != expected {
+		s.gapTimeoutExpected = expected
+		s.gapTimeoutStreak = 1
+		return false
+	}
+	s.gapTimeoutStreak++
+	if s.gapTimeoutStreak < maxGapResyncAttempts {
+		return false
+	}
+	s.gapTimeoutStreak = 0
+	s.gapTimeoutExpected = 0
+	return true
+}
+
+// noteResumeAckTimeout 记录一次 RESUME ACK 超时。只有 sequence 和 preAck
+// 已收到的最大 sn 都没有变化才算“没有进展”；服务端仍在补发时重置计数，
+// 避免把慢重放误判成永久失败。达到上限返回 true，调用方转新 session。
+func (s *Session) noteResumeAckTimeout() bool {
+	s.Lock()
+	defer s.Unlock()
+	seq := atomic.LoadInt64(s.sequence)
+	maxSN := s.preAckMaxSN
+	if s.resumeAckSeqMark == seq && s.resumeAckMaxSNMark == maxSN {
+		s.resumeAckStreak++
+	} else {
+		s.resumeAckSeqMark = seq
+		s.resumeAckMaxSNMark = maxSN
+		s.resumeAckStreak = 1
+	}
+	if s.resumeAckStreak < maxResumeAckTimeouts {
+		return false
+	}
+	s.resumeAckStreak = 0
+	return true
+}
+
+// clearGapTimeout 在缺口真正补齐时清空连续超时计数。
+func (s *Session) clearGapTimeout() {
+	s.Lock()
+	s.gapTimeoutExpected = 0
+	s.gapTimeoutStreak = 0
+	s.Unlock()
 }
 
 // watchGap 在 sn 空洞持续存在时强制一次 resync，避免丢包导致永久等待。
@@ -1380,10 +1499,18 @@ func (s *Session) watchGap(wsConn *websocket.Conn, expected int64, epoch uint64,
 	if s.sessionEpoch.Load() != epoch || !s.connectionCurrent(wsConn) {
 		return
 	}
-	if atomic.LoadInt64(s.sequence) < expected {
-		addCaller(s.Logger.Error()).Int64("expected", expected).Int64("seq", atomic.LoadInt64(s.sequence)).Msg("sn gap timeout, forcing resync")
-		s.requestResync(wsConn, "sn gap timeout")
+	if atomic.LoadInt64(s.sequence) >= expected {
+		s.clearGapTimeout()
+		return
 	}
+	forceNew := s.noteGapTimeout(expected)
+	if forceNew {
+		addCaller(s.Logger.Error()).Int64("expected", expected).
+			Msg("sn gap persists without progress, resetting resume state")
+		s.flushResumeState()
+	}
+	addCaller(s.Logger.Error()).Int64("expected", expected).Int64("seq", atomic.LoadInt64(s.sequence)).Msg("sn gap timeout, forcing resync")
+	s.requestResync(wsConn, "sn gap timeout")
 }
 
 func (s *Session) heartbeat(wsConn *websocket.Conn, listening <-chan interface{}) {
@@ -1541,6 +1668,12 @@ func (s *Session) applyResumeAckSessionID(wsConn *websocket.Conn, sessionID stri
 	s.resumePending = false
 	buffered := s.preAck
 	s.preAck = nil
+	truncated := s.preAckTruncated
+	s.preAckTruncated = false
+	s.resumeAckStreak = 0
+	s.resumeAckSeqMark = 0
+	s.resumeAckMaxSNMark = 0
+	s.preAckMaxSN = 0
 	dispatcher := s.dispatcher
 	epoch := s.sessionEpoch.Load()
 	var newEpoch uint64
@@ -1554,6 +1687,21 @@ func (s *Session) applyResumeAckSessionID(wsConn *websocket.Conn, sessionID stri
 		processedSeq = atomic.LoadInt64(s.sequence)
 	}
 	s.Unlock()
+
+	// preAck 溢出时，ACK 只代表“已经收到的部分处理完”，被丢弃的尾部仍
+	// 缺失。必须立刻从当前 sequence 再发一次 s=4，不能等下一个新事件触发
+	// 缺口检测——群里安静时可能永远等不到。换 session 时 sn 归零，旧尾部
+	// 不属于新 session，不需要补。
+	requestOverflowTail := func() {
+		if !truncated || changed || processedSeq <= 0 {
+			return
+		}
+		addCaller(s.Logger.Warn()).Int64("seq", processedSeq).
+			Msg("pre-ack overflow detected, requesting missing tail after ack")
+		if err := s.sendResumeSignal(wsConn, processedSeq); err != nil {
+			s.requestResync(wsConn, "pre-ack overflow resume failed")
+		}
+	}
 
 	if changed {
 		s.eventMu.Lock()
@@ -1570,6 +1718,7 @@ func (s *Session) applyResumeAckSessionID(wsConn *websocket.Conn, sessionID stri
 				Str("new_session_id", sessionID).
 				Msg("resume ack changed session_id, reset sn (no pre-ack events)")
 		}
+		requestOverflowTail()
 		return
 	}
 
@@ -1607,6 +1756,7 @@ func (s *Session) applyResumeAckSessionID(wsConn *websocket.Conn, sessionID stri
 			Int("pre_ack", len(valid)).
 			Msg("resume ack: dispatching events received before ack")
 	}
+	requestOverflowTail()
 }
 
 func (s *Session) waitListening(d time.Duration, listening <-chan interface{}) bool {
@@ -1682,6 +1832,13 @@ func (s *Session) reconnect() {
 		s.Unlock()
 		return
 	}
+	// 已有活动连接时不能再进入“重连开始”：否则会把另一个 Open 刚写好的
+	// Connected 状态改回 Connecting，然后以 ErrWSAlreadyOpen 退出，端点
+	// 永久停在“连接中”。
+	if s.wsConn != nil {
+		s.Unlock()
+		return
+	}
 	s.reconnecting = true
 	s.reconnectSeq++
 	mySeq := s.reconnectSeq
@@ -1721,6 +1878,11 @@ func (s *Session) reconnect() {
 			} else {
 				if err == ErrWSAlreadyOpen {
 					addCaller(s.Logger.Info()).Msg("websocket already exists, no need to reconnect")
+					// 上面的入口检查之后仍可能出现另一个 Open 抢先建连；
+					// 此时这条连接已经在线，把端点状态补回 Connected。
+					if s.IsOpen() {
+						s.reportReconnected()
+					}
 					return
 				}
 				if err == errSessionClosed {
