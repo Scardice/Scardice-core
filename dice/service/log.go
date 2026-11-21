@@ -602,7 +602,7 @@ type LoggedSeqKeys struct {
 
 // LoggedKeysInSeqRange 返回指定 log 在 (fromSeq, toSeq) 区间内已记录的
 // raw_msg_id 与 seq 集合。1118: seq 也参与去重，解决平台不返回 raw_msg_id
-// 时重试/分段汇总产生重复行的问题。
+// 时重试/补录重扫产生重复行的问题。
 func LoggedKeysInSeqRange(operator engine2.DatabaseOperator, logID uint64, fromSeq, toSeq int64) (LoggedSeqKeys, error) {
 	result := LoggedSeqKeys{
 		RawMsgIDs: make(map[string]struct{}),

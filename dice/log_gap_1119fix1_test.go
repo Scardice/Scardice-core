@@ -165,7 +165,7 @@ func TestLogGapPartialRangeRetainsPending_1119fix1(t *testing.T) {
 }
 
 // TestLogGapMultiSegmentPartialDoesNotAdvancePending_1119fix1 锁定大缺口
-// 分段写入时最危险的一条：部分页不能把 pending 起点前移到段尾。
+// 多段识别/重试时最危险的一条：部分页不能把 pending 起点前移到段尾。
 func TestLogGapMultiSegmentPartialDoesNotAdvancePending_1119fix1(t *testing.T) {
 	const groupID = "QQ-Group:1119fix1-multi"
 	const senderID = "QQ:1119fix1-user"

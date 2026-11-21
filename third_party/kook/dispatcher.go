@@ -22,7 +22,10 @@ type queuedEvent struct {
 const maxQueuedEvents = 4096
 
 // maxPreAckEvents bounds the events kept while a resume is in flight. They are
-// only replayed if the RESUME ACK switches to a different session.
+// replayed after the RESUME ACK when the session is unchanged (sn above the
+// processed high-water mark) and after a session switch (all of them, under the
+// new epoch). Overflow is recorded in preAckTruncated and repaired with an
+// immediate follow-up s=4 after the ACK.
 const maxPreAckEvents = 1024
 
 // eventDispatcher 是每连接一个的无界（有上限）事件队列。

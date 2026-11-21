@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"runtime/debug"
 	"time"
 )
 
@@ -249,11 +250,35 @@ var officialQQInitialBackoff = 15 * time.Second
 // 超时按瞬时失败重启连接，避免端点永远停在“连接中”。测试可缩短。
 var officialQQReadyTimeout = 60 * time.Second
 
+// maxOfficialQQReadyTimeouts 是连续 READY 超时的上限。每次超时约 60 秒；
+// 超过后置 ConnectionFailed，避免无限重连、日志刷屏。
+const maxOfficialQQReadyTimeouts = 3
+
 // officialQQStart 启动 Serve 重试循环；测试可替换为不建真实连接的空实现。
 var officialQQStart func(d *Dice, ep *EndPointInfo)
 
 func defaultOfficialQQStart(d *Dice, ep *EndPointInfo) {
-	go ServerOfficialQQ(d, ep)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// 异步启动路径（SetEnable/DoRelogin/READY 看门狗）没有
+				// main.go 的 recover；这里必须兜住，否则一个 panic 会
+				// 带走整个进程，或让端点永久停在 Connecting。
+				if d != nil && d.Logger != nil {
+					d.Logger.Errorf("official qq 启动协程异常: %v\n%s", r, debug.Stack())
+				}
+				if conn, ok := ep.Adapter.(*PlatformAdapterOfficialQQ); ok {
+					conn.setDiceServingIfIdle(false)
+					conn.setEndpointStateIfIdle(false, StateConnectionFailed)
+				}
+				if d != nil {
+					d.LastUpdatedTime = time.Now().Unix()
+					d.Save(false)
+				}
+			}
+		}()
+		ServerOfficialQQ(d, ep)
+	}()
 }
 
 func startOfficialQQ(d *Dice, ep *EndPointInfo) {
@@ -279,11 +304,10 @@ func serverOfficialQQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterOfficialQQ
 	}
 
 	epoch, stop := conn.beginServeLoop()
-	if !conn.setDiceServingIfEpoch(true, epoch) {
+	// 原子校验代次/Enable 并写入 Connecting；禁用与启动并发时不会互相覆盖。
+	if !conn.claimServe(epoch) {
 		return
 	}
-
-	conn.setEndpointStateIfIdle(true, StateConnecting)
 	d.LastUpdatedTime = time.Now().Unix()
 	d.Save(false)
 	waitTimes := 0
@@ -295,6 +319,14 @@ func serverOfficialQQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterOfficialQQ
 			conn.setDiceServingIfEpoch(false, epoch)
 			return
 		}
+		// 退避期间用户可能已经禁用；每次 Serve 前再确认一次，不能把
+		// 已失败/已禁用的端点重新拉起来。
+		if enabled, _ := conn.endpointStateSnapshot(); !enabled {
+			conn.setDiceServingIfEpoch(false, epoch)
+			d.LastUpdatedTime = time.Now().Unix()
+			d.Save(false)
+			return
+		}
 		// 骰子开始连接
 		d.Logger.Infof("开始连接 official qq，帐号 <%s>(%s)，重试计数[%d/%d]", ep.Nickname, ep.UserID, waitTimes, officialQQMaxConnectAttempts)
 		serve := officialQQServe
@@ -304,6 +336,8 @@ func serverOfficialQQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterOfficialQQ
 		ret := serve(conn)
 
 		if ret == 0 {
+			// 会话已建立，本轮重试循环结束；只清自己的代次，不能清新循环。
+			conn.setDiceServingIfEpoch(false, epoch)
 			return
 		}
 
