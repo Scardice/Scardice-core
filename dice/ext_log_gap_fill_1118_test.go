@@ -148,10 +148,11 @@ func (f *flakySegmentFetcher) FetchGroupMsgHistory(_ context.Context, _ string, 
 	return out, nil
 }
 
-// TestLogGapSegmentFailureKeepsProgress_1118 锁定：识别窗口中途拉取失败时
+// TestLogGapIncompleteScanWritesNothing_1118 锁定：识别窗口中途拉取失败时
 // 不写半截数据（避免把状态未知的段写进日志），pending 保留整个识别窗口，
-// 下次从窗口起点重试。
-func TestLogGapSegmentFailureKeepsProgress_1118(t *testing.T) {
+// 下次从窗口起点重试。1120 起行为是 fail-closed，旧名字
+// TestLogGapSegmentFailureKeepsProgress 会让人误以为保留了已完成段。
+func TestLogGapIncompleteScanWritesNothing_1118(t *testing.T) {
 	const groupID = "QQ-Group:1118-progress"
 	const senderID = "QQ:1118-progress-user"
 	msgs := make([]*Message, 0, 6500)
