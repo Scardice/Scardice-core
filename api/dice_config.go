@@ -42,7 +42,7 @@ func DiceConfig(c echo.Context) error {
 
 	limit := myDice.Config.UILogLimit
 	if limit == 0 {
-		limit = 100
+		limit = 300
 	}
 	myDice.UnlockCodeUpdate(false)
 
