@@ -172,8 +172,8 @@ func (dm *DiceManager) reloadHelp(closeCurrent bool) error {
 	return nil
 }
 
-// LoadDice 初始化函数
-func (dm *DiceManager) LoadDice() {
+// LoadDice 初始化函数。返回是否成功读取到 data/dice.yaml，以及非“文件不存在”的读取错误。
+func (dm *DiceManager) LoadDice() (bool, error) {
 	log := logger.M()
 	dm.AppVersionCode = VERSION_CODE
 	dm.AppBootTime = time.Now().Unix()
@@ -207,7 +207,10 @@ func (dm *DiceManager) LoadDice() {
 	data, err := os.ReadFile("./data/dice.yaml")
 	if err != nil {
 		// 注意！！！！ 这里会退出，所以下面的都可能不执行！
-		return
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
 	}
 
 	var dc Configs
@@ -254,6 +257,7 @@ func (dm *DiceManager) LoadDice() {
 		newDice.ContainerMode = dm.ContainerMode
 		dm.appendDice(newDice)
 	}
+	return true, nil
 }
 
 func (dm *DiceManager) Save() {
