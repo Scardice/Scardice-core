@@ -129,7 +129,7 @@ func TestOffDiscoveryDiscardOnlyNotice_1121(t *testing.T) {
 	if strings.Contains(msgs[0], "检测到离线期间的日志记录") {
 		t.Fatalf("discard-only notice must not claim a discovery, got %q", msgs[0])
 	}
-	if !strings.Contains(msgs[0], "超过识别上限 5000 条，较早的 500 条已丢弃") {
+	if !strings.Contains(msgs[0], "超过识别上限 5000 条，较早的 500 条不补录") {
 		t.Fatalf("missing discard detail, got %q", msgs[0])
 	}
 

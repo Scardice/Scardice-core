@@ -100,7 +100,7 @@ func TestGapDetectAndBackfillLimits_1120fix2(t *testing.T) {
 		reqs[1].FromSeq != 14999 || reqs[1].ToSeq != 20000 {
 		t.Fatalf("requests = %#v, want lookback 9999..15000 + prefetch 14999..20000", reqs)
 	}
-	for _, want := range []string{"14899 条已丢弃", "3000 条已丢弃", "识别上限 5000", "补录上限 2000"} {
+	for _, want := range []string{"14899 条不补录", "3000 条不补录", "识别上限 5000", "补录上限 2000"} {
 		if !strings.Contains(msgs, want) {
 			t.Fatalf("notice %q missing %q", msgs, want)
 		}
@@ -118,13 +118,13 @@ func TestLogGapDiscardNoticeOnlyWhenCapped_1120fix2(t *testing.T) {
 	}
 
 	detect := (logGapFillTask{discardedByDetect: 3}).logGapDiscardNotice()
-	for _, want := range []string{"识别上限 5000", "3 条已丢弃"} {
+	for _, want := range []string{"识别上限 5000", "3 条不补录"} {
 		if !strings.Contains(detect, want) {
 			t.Fatalf("detect discard notice %q missing %q", detect, want)
 		}
 	}
 	limit := (logGapFillTask{discardedByLimit: 7}).logGapDiscardNotice()
-	for _, want := range []string{"补录上限 2000", "7 条已丢弃"} {
+	for _, want := range []string{"补录上限 2000", "7 条不补录"} {
 		if !strings.Contains(limit, want) {
 			t.Fatalf("limit discard notice %q missing %q", limit, want)
 		}

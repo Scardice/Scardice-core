@@ -995,6 +995,45 @@ func LogDeleteByLogIDSeq(operator engine2.DatabaseOperator, logID uint64, seq in
 	})
 }
 
+// LogDeleteAfterSeqTime 删除指定日志中 seq 晚于 afterSeq、且消息时间不早于
+// afterTime 的行，用于历史 .log off 生效后清理补录期间实时误写的关闭段消息。
+//
+// 为什么同时看 seq 和 time：
+//   - 只看 seq 会误删 seq 回退/复用后的旧段行；
+//   - 只看 time 会误删同一秒内 off 之前的 on 段行（seq < afterSeq）。
+//
+// off 命令本身（seq == afterSeq）与 on 段（seq < afterSeq）都不会被删。
+// afterTime <= 0 表示平台没有可信时间，直接跳过，宁可保留少量误记也不猜删。
+func LogDeleteAfterSeqTime(operator engine2.DatabaseOperator, logID uint64, afterSeq int64, afterTime int64) (int64, error) {
+	if logID == 0 || afterSeq <= 0 || afterTime <= 0 {
+		return 0, nil
+	}
+	// 与实时/补录写入串行，避免删除过程中又有同样的行插回来。
+	logAppendDedupeMu.Lock()
+	defer logAppendDedupeMu.Unlock()
+	db := operator.GetLogDB(constant.WRITE)
+	var removed int64
+	err := db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Where("log_id = ? AND seq > ? AND time >= ?", logID, afterSeq, afterTime).
+			Delete(&model.LogOneItem{})
+		if res.Error != nil {
+			return res.Error
+		}
+		removed = res.RowsAffected
+		if removed == 0 {
+			return nil
+		}
+		return tx.Model(&model.LogInfo{}).Where("id = ?", logID).Updates(map[string]interface{}{
+			"updated_at": time.Now().Unix(),
+			"size":       gorm.Expr("COALESCE(size, 0) - ?", removed),
+		}).Error
+	})
+	if err != nil {
+		return 0, err
+	}
+	return removed, nil
+}
+
 // LogMarkDeleteByRawMsgID 根据消息 ID 反查所属日志并删除，避免依赖当前日志名。
 func LogMarkDeleteByRawMsgID(operator engine2.DatabaseOperator, groupID string, rawID interface{}) error {
 	db := operator.GetLogDB(constant.WRITE)
