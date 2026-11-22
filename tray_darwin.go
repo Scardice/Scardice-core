@@ -131,6 +131,7 @@ func httpServe(e *echo.Echo, dm *dice.DiceManager, hideUI bool) {
 	_ = ln.Close()
 
 	// exec.Command(`cmd`, `/c`, `start`, fmt.Sprintf(`http://localhost:%s`, portStr)).Start()
+	log.Infof("[自检] WebUI 端口 %s 检查通过，开始监听", portStr)
 	log.Infof("如果浏览器没有自动打开，请手动访问:\nhttp://localhost:%s", portStr)
 	err = e.Start(dm.ServeAddress)
 	if err != nil {

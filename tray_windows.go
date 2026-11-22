@@ -233,6 +233,7 @@ func httpServe(e *echo.Echo, dm *dice.DiceManager, hideUI bool) {
 		// 同步托盘菜单使用的端口，确保自定义端口和自动换端口后链接正确。
 		setTrayPort(portStr)
 
+		log.Infof("[自检] WebUI 尝试监听端口 %s", portStr)
 		err := e.Start(dm.ServeAddress)
 
 		if err != nil {

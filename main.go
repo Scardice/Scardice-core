@@ -216,6 +216,51 @@ func deleteOldWrongFile() {
 	_ = os.Remove("./data/helpdoc/DND/子职列表大全.xlsx")
 }
 
+// formatEnabledEndpoints 生成启动日志用的已启用账号清单，格式：平台/协议 <昵称或账号>。
+func formatEnabledEndpoints(endpoints []*dice.EndPointInfo) (enabled int, total int, labels string) {
+	total = len(endpoints)
+	list := make([]string, 0, total)
+	for _, ep := range endpoints {
+		if !ep.Enable {
+			continue
+		}
+		platform := ep.Platform
+		if platform == "" {
+			platform = "未知平台"
+		}
+		if ep.ProtocolType != "" {
+			platform += "/" + ep.ProtocolType
+		}
+		name := ep.Nickname
+		if name == "" {
+			name = ep.UserID
+		}
+		if name == "" {
+			name = ep.ID
+		}
+		if name == "" {
+			name = "未知账号"
+		}
+		list = append(list, fmt.Sprintf("%s <%s>", platform, name))
+	}
+	return len(list), total, strings.Join(list, "、")
+}
+
+// checkDataDirWritable 在目标目录创建并删除一个临时文件，确认启动后确实可写。
+func checkDataDirWritable(dir string) error {
+	f, err := os.CreateTemp(dir, ".startup-check-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	defer func() { _ = os.Remove(name) }()
+	if _, err := f.WriteString("ok"); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
 func fixTimezone() {
 	out, err := exec.Command("/system/bin/getprop", "persist.sys.timezone").Output()
 	if err != nil {
@@ -279,6 +324,19 @@ func main() {
 	// 初始化PanicLog
 	paniclog.InitPanicLog()
 
+	// 启动自检计时与计数。日志会同时写入控制台、data/main.log 和 UI 日志面板。
+	startupCheckStart := time.Now()
+	startupCheckPassed := 0
+	startupCheckWarned := 0
+	startupCheckPass := func(format string, args ...any) {
+		log.Infof("[自检] "+format, args...)
+		startupCheckPassed++
+	}
+	startupCheckWarn := func(format string, args ...any) {
+		log.Warnf("[自检] "+format, args...)
+		startupCheckWarned++
+	}
+
 	// 3. 提示日志打印
 	log.Info("运行日志开始记录，余烬出现故障时可查看 data/main.log 与 data/panic.log 获取更多信息")
 	// 加载env相关
@@ -312,6 +370,7 @@ func main() {
 		showMsgBox("获取锁文件失败", "为避免数据损坏，拒绝继续启动。请检查是否启动多份余烬程序！")
 		return
 	}
+	startupCheckPass("实例锁获取成功，未发现重复启动")
 	judge, osr := oschecker.OldVersionCheck()
 	// 预留收集信息的接口，如果有需要可以考虑从这里拿数据。不从这里做提示的原因是Windows和Linux的展示方式不同。
 	if judge {
@@ -336,7 +395,13 @@ func main() {
 		fixTimezone()
 	}
 
-	_ = os.MkdirAll("./data", 0o755)
+	if err := os.MkdirAll("./data", 0o755); err != nil {
+		startupCheckWarn("数据目录创建失败：%v", err)
+	} else if err := checkDataDirWritable("./data"); err != nil {
+		startupCheckWarn("数据目录访问权限异常：%v", err)
+	} else {
+		startupCheckPass("数据目录访问权限通过（data 可读写）")
+	}
 
 	// 提早初始化是为了读取ServiceName
 
@@ -346,6 +411,7 @@ func main() {
 		log.Errorf("Failed to init database: %v", err)
 		return
 	}
+	startupCheckPass("数据库初始化成功")
 	diceManager := &dice.DiceManager{
 		Operator: operator,
 	}
@@ -355,7 +421,15 @@ func main() {
 		diceManager.ContainerMode = true
 	}
 
-	diceManager.LoadDice()
+	configLoaded, configErr := diceManager.LoadDice()
+	switch {
+	case configErr != nil:
+		startupCheckWarn("配置文件读取异常，将使用默认配置：%v", configErr)
+	case configLoaded:
+		startupCheckPass("配置文件加载完成：data/dice.yaml")
+	default:
+		startupCheckPass("未找到 data/dice.yaml，将创建默认配置")
+	}
 	diceManager.IsReady = true
 
 	pprofStop, recErr := startPprofRecordIfEnabled(opts.PprofRecord, log, diceManager.AppBootTime)
@@ -536,6 +610,14 @@ func main() {
 	diceManager.TryCreateDefault()
 	diceManager.InitDice(uiWriter)
 
+	if startupCheckWarned > 0 {
+		log.Warnf("[自检] 启动自检完成：核心组件 %d 项通过，%d 项警告，耗时 %dms，请查看上方警告",
+			startupCheckPassed, startupCheckWarned, time.Since(startupCheckStart).Milliseconds())
+	} else {
+		log.Infof("[自检] 启动自检完成：核心组件 %d 项通过，0 项警告，耗时 %dms",
+			startupCheckPassed, time.Since(startupCheckStart).Milliseconds())
+	}
+
 	if opts.JustForTest {
 		diceManager.JustForTest = true
 	}
@@ -598,6 +680,14 @@ func diceServe(d *dice.Dice) {
 	defer dice.CrashLog()
 	if len(d.ImSession.EndPoints) == 0 {
 		log.Infof("未检测到任何帐号，请先到“帐号设置”进行添加")
+	} else {
+		enabledCount, totalCount, labels := formatEnabledEndpoints(d.ImSession.EndPoints)
+		if enabledCount == 0 {
+			log.Infof("[连接] 未启用任何帐号，跳过连接")
+		} else {
+			log.Infof("[连接] 已启用账号 %d/%d 个：%s（各平台连接结果见后续“连接成功”日志）",
+				enabledCount, totalCount, labels)
+		}
 	}
 
 	d.UIEndpoint = new(dice.EndPointInfo)
