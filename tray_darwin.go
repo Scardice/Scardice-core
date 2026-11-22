@@ -126,7 +126,8 @@ func httpServe(e *echo.Echo, dm *dice.DiceManager, hideUI bool) {
 	ln, err := net.Listen("tcp", ":"+portStr)
 	if err != nil {
 		log.Errorf("端口已被占用，即将自动退出: %s", dm.ServeAddress)
-		runtime.Goexit()
+		exitAfterUIStartupFailure()
+		return
 	}
 	_ = ln.Close()
 
@@ -136,6 +137,6 @@ func httpServe(e *echo.Echo, dm *dice.DiceManager, hideUI bool) {
 	err = e.Start(dm.ServeAddress)
 	if err != nil {
 		log.Errorf("端口已被占用，即将自动退出: %s", dm.ServeAddress)
-		return
+		exitAfterUIStartupFailure()
 	}
 }

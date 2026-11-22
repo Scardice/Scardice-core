@@ -611,10 +611,10 @@ func main() {
 	diceManager.InitDice(uiWriter)
 
 	if startupCheckWarned > 0 {
-		log.Warnf("[自检] 启动自检完成：核心组件 %d 项通过，%d 项警告，耗时 %dms，请查看上方警告",
+		log.Warnf("[自检] 核心组件自检完成：%d 项通过，%d 项警告，耗时 %dms，请查看上方警告",
 			startupCheckPassed, startupCheckWarned, time.Since(startupCheckStart).Milliseconds())
 	} else {
-		log.Infof("[自检] 启动自检完成：核心组件 %d 项通过，0 项警告，耗时 %dms",
+		log.Infof("[自检] 核心组件自检完成：%d 项通过，耗时 %dms",
 			startupCheckPassed, time.Since(startupCheckStart).Milliseconds())
 	}
 
