@@ -2460,6 +2460,9 @@ type logGapFillTask struct {
 	// 仅用于群内通知，不参与补录状态。
 	discardedByDetect int64
 	discardedByLimit  int64
+	// removedOffRows 是历史 .log off 生效后，从当前日志清理掉的“关闭后实时
+	// 误记行”条数。只用于补录收尾通知。
+	removedOffRows int64
 	// prefetched/prefetchComplete 用于大缺口：先按整条缺口从 trigger 锚点
 	// 一次拉完，再在内存里分段过滤/写库。避免每段都从 trigger 重新向旧翻页，
 	// 也避免 incomplete 的部分页在 on/off 状态未知时先写库。
@@ -2819,7 +2822,7 @@ func (t logGapFillTask) run() {
 		t.discardedByDetect = totalGap - logGapDetectMaxMessages
 		t.fromSeq = t.toSeq - logGapDetectMaxMessages - 1
 		totalGap = logGapDetectMaxMessages
-		t.dice.Logger.Warnf("日志缺口超过识别上限，已丢弃较早部分: 群=%s 原始缺口=%d 丢弃=%d 识别窗口=%d..%d",
+		t.dice.Logger.Warnf("日志缺口超过识别上限，较早部分不补录（仅回看判断起点状态）: 群=%s 原始缺口=%d 不补录=%d 识别窗口=%d..%d",
 			t.group.GroupID, originalGap, t.discardedByDetect, t.fromSeq, t.toSeq)
 
 		// 裁剪窗口后不能沿用“原始起点状态”：更早的 .log off/.log on
@@ -2856,6 +2859,8 @@ func (t logGapFillTask) run() {
 	hist := logGapLifecycleInfo{finalOn: stateOn}
 	hist.found = lookHist.found
 	hist.lastOnSeq = lookHist.lastOnSeq
+	hist.lastOffSeq = lookHist.lastOffSeq
+	hist.lastOffTime = lookHist.lastOffTime
 	hist.ignored = append(hist.ignored, lookHist.ignored...)
 	hist.stopped = lookHist.stopped
 	hist.unsupported = lookHist.unsupported
@@ -2942,6 +2947,10 @@ func (t logGapFillTask) run() {
 		if info.lastOnSeq > hist.lastOnSeq {
 			hist.lastOnSeq = info.lastOnSeq
 		}
+		if info.lastOffSeq > hist.lastOffSeq {
+			hist.lastOffSeq = info.lastOffSeq
+			hist.lastOffTime = info.lastOffTime
+		}
 		stateOn = info.finalOn
 		if info.stopped {
 			hist.stopped = true
@@ -2978,7 +2987,7 @@ func (t logGapFillTask) run() {
 		// on/off 状态已经用完整的识别窗口（最多 5000 条）推算过，保留部分正确。
 		t.discardedByLimit = int64(len(missing) - logGapFillMaxMessages)
 		missing = missing[len(missing)-logGapFillMaxMessages:]
-		t.dice.Logger.Warnf("日志补录超过单次上限，已丢弃较早部分: 群=%s 可补录=%d 丢弃=%d 实际上限=%d",
+		t.dice.Logger.Warnf("日志补录超过单次上限，较早部分不补录: 群=%s 可补录=%d 不补录=%d 实际上限=%d",
 			t.group.GroupID, len(missing)+int(t.discardedByLimit), t.discardedByLimit, logGapFillMaxMessages)
 	}
 	t.notifyIgnoredCommands(hist.ignored)
@@ -3062,8 +3071,14 @@ func (t logGapFillTask) run() {
 	}
 
 	if len(missing) == 0 {
+		// 历史最终 off 时，补录期间实时路径仍可能写过 off 之后的消息。
+		// 即使没有可补消息，也要先清理这些误记行，再按实际状态通知。
+		if hist.found && !hist.finalOn && !hist.stopped && !t.logStateStillValid() {
+			t.removedOffRows = t.cleanupRowsAfterHistoricalOff(hist)
+		}
 		t.dice.Logger.Infof("日志补全无需处理: 群=%s 缺失区间内没有需要补录的他人发言", t.group.GroupID)
 		notice := ""
+		closedStateAdded := false
 		if notifyComplete := t.wantsCompleteNotice(); notifyComplete {
 			if t.notifyOnComplete {
 				notice = "关闭前的遗漏记录补录完成，没有需要补录的消息。"
@@ -3072,6 +3087,17 @@ func (t logGapFillTask) run() {
 			}
 			if !t.logStateStillValid() {
 				notice += "\n" + t.logGapClosedStateNotice(0, hist)
+				closedStateAdded = true
+			}
+		}
+		// 历史 .log off 已生效但本次没有可补消息时，不能静默关日志：
+		// 用户需要知道关闭状态，以及关闭后误记的行已被清理。
+		if hist.found && !hist.finalOn && !hist.stopped && !closedStateAdded && !t.logStateStillValid() {
+			if closed := t.logGapClosedStateNotice(0, hist); closed != "" {
+				if notice != "" {
+					notice += "\n"
+				}
+				notice += closed
 			}
 		}
 		if discarded := t.logGapDiscardNotice(); discarded != "" {
@@ -3113,6 +3139,11 @@ func (t logGapFillTask) run() {
 		appended, backfillDone := t.backfillLogOnlyCount(missing)
 		done = backfillDone
 		totalAppended := appended
+		// 历史最终 off：把补录期间实时误写的关闭段行清掉，再生成通知。
+		// 清理放在补录之后，才能覆盖整个任务窗口内新到的实时消息。
+		if hist.found && !hist.finalOn && !hist.stopped && !t.logStateStillValid() {
+			t.removedOffRows = t.cleanupRowsAfterHistoricalOff(hist)
+		}
 		notifyComplete := t.wantsCompleteNotice()
 		if totalAppended > 0 || hist.found || notifyComplete || t.logGapDiscardNotice() != "" {
 			notice := fmt.Sprintf("检测到seq不连贯，已补录 %d 条记录。", totalAppended)
@@ -3556,6 +3587,12 @@ type logGapLifecycleInfo struct {
 	// lastOnSeq 是扫描到的最晚一次有效 .log on 的 seq（0 表示没有）。
 	// 用于判断用户 .log off 标记是否晚于这次 on，避免陈旧标记拦住恢复。
 	lastOnSeq int64
+	// lastOffSeq/lastOffTime 是扫描到的最晚一次有效 .log off 的 seq 与消息时间。
+	// 历史最终为 off 时，补录期间实时路径可能已经把 off 之后的消息写进日志；
+	// 收尾用这两个边界清理这些误记行。lastOffTime 为 0 表示平台未提供时间，
+	// 此时宁可跳过清理，也不按 seq 猜删。
+	lastOffSeq  int64
+	lastOffTime int64
 	// ignored 记录离线期间收到但未执行的 .log new/end/halt、.ext off/on log。
 	// 1120: 它们没有执行，不能当作日志边界；按实际 on 状态继续补录并告知用户。
 	ignored []string
@@ -3848,6 +3885,10 @@ func (t logGapFillTask) filterHistoricalLogOffOn(msgs []*Message, startOn bool) 
 				// 实时路径在关闭执行前会记录 .log off 本身。
 				filtered = append(filtered, m)
 				stateOn = false
+				if m.Seq > info.lastOffSeq {
+					info.lastOffSeq = m.Seq
+					info.lastOffTime = m.Time
+				}
 			}
 		case "on":
 			if stateOn {
@@ -4183,7 +4224,59 @@ func (t logGapFillTask) logGapClosedStateNotice(appended int, hist logGapLifecyc
 	if appended > 0 {
 		_, _ = fmt.Fprintf(&b, "已补录关闭前 %d 条。", appended)
 	}
+	if t.removedOffRows > 0 {
+		_, _ = fmt.Fprintf(&b, "\n已移除关闭后误记的 %d 条。", t.removedOffRows)
+	}
 	return b.String()
+}
+
+// cleanupRowsAfterHistoricalOff 清理历史 .log off 生效后、补录收尾前
+// 实时路径误写进当前日志的消息。
+//
+// 场景：核心离线期间有人发了 .log off；重连后的第一条消息触发补录，但补录
+// 需要拉历史/预取，期间新到的消息仍按“日志开启”实时入库。任务确认历史
+// 最终为 off 并关闭 live 日志后，只删除触发消息是不够的，必须把 off 之后
+// 的实时行一并删掉，否则最终上传的日志会包含关闭期间的聊天。
+//
+// 只删除同时满足 seq > lastOffSeq 且 time >= lastOffTime 的行：
+//   - off 命令本身（seq == lastOffSeq）保留；
+//   - off 之前的 on 段（seq < lastOffSeq）保留；
+//   - 平台未提供时间（lastOffTime <= 0）时跳过，宁可留下少量误记也不猜删。
+//
+// 调用前日志必须仍处于关闭/暂停状态，且 epoch 未变；用户已经 .log on/new
+// 打开新段时不能再按旧 off 边界删除新段的行。
+func (t logGapFillTask) cleanupRowsAfterHistoricalOff(hist logGapLifecycleInfo) int64 {
+	if t.group == nil || t.dice == nil || t.dice.DBOperator == nil || t.logID == 0 ||
+		hist.lastOffSeq <= 0 {
+		return 0
+	}
+	if hist.lastOffTime <= 0 {
+		if t.dice.Logger != nil {
+			t.dice.Logger.Warnf("日志补录无法清理关闭后误记行: 平台未提供 .log off 时间: 群=%s offSeq=%d",
+				t.group.GroupID, hist.lastOffSeq)
+		}
+		return 0
+	}
+	state := t.group.GetLogState()
+	if state.On || state.ID != t.logID || state.Name != t.logName {
+		return 0
+	}
+	if t.group.logEpoch.Load() != t.epoch {
+		return 0
+	}
+	removed, err := service.LogDeleteAfterSeqTime(t.dice.DBOperator, t.logID, hist.lastOffSeq, hist.lastOffTime)
+	if err != nil {
+		if t.dice.Logger != nil {
+			t.dice.Logger.Warnf("日志补录清理关闭后误记行失败: 群=%s logID=%d offSeq=%d err=%v",
+				t.group.GroupID, t.logID, hist.lastOffSeq, err)
+		}
+		return 0
+	}
+	if removed > 0 && t.dice.Logger != nil {
+		t.dice.Logger.Infof("日志补录已清理关闭后误记行: 群=%s logID=%d offSeq=%d 条数=%d",
+			t.group.GroupID, t.logID, hist.lastOffSeq, removed)
+	}
+	return removed
 }
 
 // wantsCompleteNotice 报告本次补录收尾时是否必须发一条完成提示。
@@ -4195,15 +4288,18 @@ func (t logGapFillTask) wantsCompleteNotice() bool {
 		(t.group != nil && t.group.logGapNotifyOnCompleteRequested())
 }
 
-// logGapDiscardNotice 生成“超过识别/补录上限、已丢弃较早消息”的提示。
-// 只在确实丢弃时返回非空，正常缺口不会多出这行。
+// logGapDiscardNotice 生成“超过识别/补录上限、较早消息不补录”的提示。
+// 只在确实超限时返回非空，正常缺口不会多出这行。
+//
+// 识别上限裁剪后仍会回看一段前缀来判断窗口起点 on/off，因此不能写“不识别”；
+// 准确说法是“不补录，仅回看用于判断起点状态”，避免用户以为连状态推断都没做。
 func (t logGapFillTask) logGapDiscardNotice() string {
 	var parts []string
 	if t.discardedByDetect > 0 {
-		parts = append(parts, fmt.Sprintf("超过识别上限 %d 条，较早的 %d 条已丢弃", logGapDetectMaxMessages, t.discardedByDetect))
+		parts = append(parts, fmt.Sprintf("超过识别上限 %d 条，较早的 %d 条不补录（仅回看用于判断起点状态）", logGapDetectMaxMessages, t.discardedByDetect))
 	}
 	if t.discardedByLimit > 0 {
-		parts = append(parts, fmt.Sprintf("超过补录上限 %d 条，较早的 %d 条已丢弃", logGapFillMaxMessages, t.discardedByLimit))
+		parts = append(parts, fmt.Sprintf("超过补录上限 %d 条，较早的 %d 条不补录", logGapFillMaxMessages, t.discardedByLimit))
 	}
 	if len(parts) == 0 {
 		return ""

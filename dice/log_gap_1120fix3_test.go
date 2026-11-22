@@ -241,7 +241,7 @@ func TestOffDiscoveryFillCapIncludesTrigger_1120fix3(t *testing.T) {
 	}
 	found := false
 	for _, m := range groupMsgsOf(ep) {
-		if strings.Contains(m, "超过补录上限 2000 条，较早的 900 条已丢弃") {
+		if strings.Contains(m, "超过补录上限 2000 条，较早的 900 条不补录") {
 			found = true
 			break
 		}
@@ -277,7 +277,7 @@ func TestDiscardNoticeNotLostAcrossRetries_1120fix3(t *testing.T) {
 	g.logGapRetryAt.Store(0)
 	newTask(d, ep, g, logID, 100, 6000).run()
 	msgs := groupMsgsOf(ep)
-	if len(msgs) != 1 || !strings.Contains(msgs[0], "超过识别上限 5000 条，较早的 899 条已丢弃") {
+	if len(msgs) != 1 || !strings.Contains(msgs[0], "超过识别上限 5000 条，较早的 899 条不补录") {
 		t.Fatalf("retry should report discard after rate limit, got %#v", msgs)
 	}
 }

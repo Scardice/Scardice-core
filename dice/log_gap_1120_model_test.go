@@ -367,7 +367,7 @@ func TestMultiSegmentNoticeCount_1120(t *testing.T) {
 	adapter.mu.Unlock()
 	found := false
 	for _, m := range msgs {
-		if strings.Contains(m, "2000 条") && strings.Contains(m, "500 条已丢弃") {
+		if strings.Contains(m, "2000 条") && strings.Contains(m, "500 条不补录") {
 			found = true
 			break
 		}
