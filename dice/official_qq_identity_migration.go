@@ -414,13 +414,33 @@ func (m *officialQQIdentityMigration) stateValue(count int64, fingerprint string
 	return m.stateKey() + "|" + strconv.FormatInt(count, 10) + "|" + fingerprint
 }
 
+// officialQQIdentityMigrationQuiet 返回一个不输出 SLOW SQL 告警的会话。
+// 这些探测是启动阶段的一次性索引区间扫描（热缓存下 0.1~0.3ms），但启动时
+// 日志库建索引、扩展加载、Bluge 索引重建会挤占 IO，冷启动首触或 IO 抖动时
+// 偶发几百毫秒，就会被 GORM 误报成慢查询，把真正需要关注的慢 SQL 淹掉。
+// 这里只把慢查询告警降级：语句本身仍以 DEBUG 级别写入 database.log，
+// 错误日志不受影响。
+func officialQQIdentityMigrationQuiet(db *gorm.DB) *gorm.DB {
+	if db == nil {
+		return db
+	}
+	gl, ok := db.Config.Logger.(logger.GORMLogger)
+	if !ok {
+		return db
+	}
+	gl.SlowThreshold = 0
+	return db.Session(&gorm.Session{Logger: gl})
+}
+
 // legacyRowFingerprint 统计旧行数量并对其主键集合做哈希。
 // 仅用数量会在“删一条、加一条”时误判为已完成迁移；主键集合哈希能
 // 在同样的扫描成本下准确识别行集合变化。
 func (m *officialQQIdentityMigration) legacyRowFingerprint(operator engine.DatabaseOperator) (int64, string, error) {
 	type probe struct {
-		name    string
-		query   *gorm.DB
+		name string
+		// queries 允许一个逻辑探测拆成多条单索引查询（目前只有 attrs），
+		// 结果按 column 去重后与旧版单条 OR 查询的结果集合完全一致。
+		queries []*gorm.DB
 		column  string
 		numeric bool
 	}
@@ -431,16 +451,16 @@ func (m *officialQQIdentityMigration) legacyRowFingerprint(operator engine.Datab
 	dataDB := operator.GetDataDB(constant.READ)
 	if dataDB != nil && hasTable(dataDB, &model.GroupInfo{}) {
 		probes = append(probes, probe{
-			name:   "group_info",
-			query:  dataDB.Model(&model.GroupInfo{}).Where("id >= ? AND id < ?", groupPrefix, groupUpperBound).Order("id"),
-			column: "id",
+			name:    "group_info",
+			queries: []*gorm.DB{dataDB.Model(&model.GroupInfo{}).Where("id >= ? AND id < ?", groupPrefix, groupUpperBound)},
+			column:  "id",
 		})
 	}
 	logDB := operator.GetLogDB(constant.READ)
 	if logDB != nil && hasTable(logDB, &model.LogInfo{}) {
 		probes = append(probes, probe{
 			name:    "log_info",
-			query:   logDB.Model(&model.LogInfo{}).Where("group_id >= ? AND group_id < ?", groupPrefix, groupUpperBound).Order("id"),
+			queries: []*gorm.DB{logDB.Model(&model.LogInfo{}).Where("group_id >= ? AND group_id < ?", groupPrefix, groupUpperBound)},
 			column:  "id",
 			numeric: true,
 		})
@@ -448,7 +468,7 @@ func (m *officialQQIdentityMigration) legacyRowFingerprint(operator engine.Datab
 	if logDB != nil && hasTable(logDB, &model.LogOneItem{}) {
 		probes = append(probes, probe{
 			name:    "log_one_item",
-			query:   logDB.Model(&model.LogOneItem{}).Where("group_id >= ? AND group_id < ?", groupPrefix, groupUpperBound).Order("id"),
+			queries: []*gorm.DB{logDB.Model(&model.LogOneItem{}).Where("group_id >= ? AND group_id < ?", groupPrefix, groupUpperBound)},
 			column:  "id",
 			numeric: true,
 		})
@@ -456,40 +476,40 @@ func (m *officialQQIdentityMigration) legacyRowFingerprint(operator engine.Datab
 	if dataDB != nil && hasTable(dataDB, &model.GroupPlayerInfoBase{}) {
 		probes = append(probes, probe{
 			name:    "group_player_info",
-			query:   dataDB.Model(&model.GroupPlayerInfoBase{}).Where("group_id >= ? AND group_id < ?", groupPrefix, groupUpperBound).Order("id"),
+			queries: []*gorm.DB{dataDB.Model(&model.GroupPlayerInfoBase{}).Where("group_id >= ? AND group_id < ?", groupPrefix, groupUpperBound)},
 			column:  "id",
 			numeric: true,
 		})
 	}
 	if dataDB != nil && hasTable(dataDB, &model.AttributesItemModel{}) {
 		probes = append(probes, probe{
-			name:   "attributes",
-			query:  m.legacyAttrsQuery(dataDB.Model(&model.AttributesItemModel{})).Order("id"),
-			column: "id",
+			name:    "attributes",
+			queries: m.legacyAttrsFingerprintQueries(dataDB),
+			column:  "id",
 		})
 	}
 	if dataDB != nil && hasTable(dataDB, &model.BanInfo{}) {
 		probes = append(probes, probe{
 			name: "ban_info",
-			query: dataDB.Model(&model.BanInfo{}).Where(
+			queries: []*gorm.DB{dataDB.Model(&model.BanInfo{}).Where(
 				"(id >= ? AND id < ?) OR (id >= ? AND id < ?)",
 				groupPrefix, groupUpperBound, memberPrefix, memberUpperBound,
-			).Order("id"),
+			)},
 			column: "id",
 		})
 	}
 	if dataDB != nil && hasTable(dataDB, &model.EndpointInfo{}) {
 		probes = append(probes, probe{
-			name:   "endpoint_info",
-			query:  dataDB.Model(&model.EndpointInfo{}).Where("user_id = ?", m.oldEndpoint).Order("user_id"),
-			column: "user_id",
+			name:    "endpoint_info",
+			queries: []*gorm.DB{dataDB.Model(&model.EndpointInfo{}).Where("user_id = ?", m.oldEndpoint)},
+			column:  "user_id",
 		})
 	}
 	censorDB := operator.GetCensorDB(constant.READ)
 	if censorDB != nil && hasTable(censorDB, &model.CensorLog{}) {
 		probes = append(probes, probe{
 			name:    "censor_log",
-			query:   censorDB.Model(&model.CensorLog{}).Where("group_id >= ? AND group_id < ?", groupPrefix, groupUpperBound).Order("id"),
+			queries: []*gorm.DB{censorDB.Model(&model.CensorLog{}).Where("group_id >= ? AND group_id < ?", groupPrefix, groupUpperBound)},
 			column:  "id",
 			numeric: true,
 		})
@@ -498,18 +518,31 @@ func (m *officialQQIdentityMigration) legacyRowFingerprint(operator engine.Datab
 	var total int64
 	hash := sha256.New()
 	for _, item := range probes {
-		var ids []string
-		if item.numeric {
-			var numericIDs []int64
-			if err := item.query.Pluck(item.column, &numericIDs).Error; err != nil {
+		// 同一行可能同时命中 id 与 owner_id 两个区间（例如组成员卡），
+		// 去重后与旧版单条 OR 查询的结果集合一致，避免指纹漂移导致
+		// 每次启动都误判“旧行变了”而重跑迁移。
+		seen := make(map[string]struct{})
+		ids := make([]string, 0, 64)
+		for _, query := range item.queries {
+			batch := make([]string, 0, 64)
+			if item.numeric {
+				var numericIDs []int64
+				if err := officialQQIdentityMigrationQuiet(query).Pluck(item.column, &numericIDs).Error; err != nil {
+					return 0, "", err
+				}
+				for _, id := range numericIDs {
+					batch = append(batch, strconv.FormatInt(id, 10))
+				}
+			} else if err := officialQQIdentityMigrationQuiet(query).Pluck(item.column, &batch).Error; err != nil {
 				return 0, "", err
 			}
-			ids = make([]string, 0, len(numericIDs))
-			for _, id := range numericIDs {
-				ids = append(ids, strconv.FormatInt(id, 10))
+			for _, id := range batch {
+				if _, ok := seen[id]; ok {
+					continue
+				}
+				seen[id] = struct{}{}
+				ids = append(ids, id)
 			}
-		} else if err := item.query.Pluck(item.column, &ids).Error; err != nil {
-			return 0, "", err
 		}
 		sort.Strings(ids)
 		total += int64(len(ids))
@@ -521,6 +554,26 @@ func (m *officialQQIdentityMigration) legacyRowFingerprint(operator engine.Datab
 		}
 	}
 	return total, hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// legacyAttrsFingerprintQueries 把 attrs 的三段旧身份区间拆成三条单列查询。
+// 旧写法 (id …) OR (id …) OR (owner_id …) 会让 SQLite 走 MULTI-INDEX OR，
+// 再叠加 ORDER BY id 还需要一个临时 B 树：主键索引与 idx_attrs_owner_id_id
+// 各命中一段，排序却只能把三路结果全量归并。拆开后每段都是单索引范围扫描，
+// 且结果在 Go 侧排序，SQL 不再需要排序或临时表。
+func (m *officialQQIdentityMigration) legacyAttrsFingerprintQueries(dataDB *gorm.DB) []*gorm.DB {
+	groupPrefix, groupUpperBound := m.oldGroupBounds()
+	memberPrefix, memberUpperBound := m.oldMemberBounds()
+	// 每条查询都从独立会话构建。直接在同一 *gorm.DB 上连续调用 Where 会把
+	// 三个条件 AND 进同一个 Statement，结果一条都查不出来。
+	fresh := func() *gorm.DB {
+		return dataDB.Session(&gorm.Session{}).Model(&model.AttributesItemModel{})
+	}
+	return []*gorm.DB{
+		fresh().Where("id >= ? AND id < ?", groupPrefix, groupUpperBound),
+		fresh().Where("id >= ? AND id < ?", memberPrefix, memberUpperBound),
+		fresh().Where("owner_id >= ? AND owner_id < ?", memberPrefix, memberUpperBound),
+	}
 }
 
 // legacyRowCount 统计各表中仍带旧身份前缀的行数。
@@ -572,7 +625,8 @@ func (m *officialQQIdentityMigration) legacyRowCount(operator engine.DatabaseOpe
 	var total int64
 	for _, probe := range probes {
 		var count int64
-		result := officialQQIdentityMigrationWithoutCache(probe).Count(&count)
+		// 与 fingerprint 探测一致：启动阶段的 IO 抖动不应触发 SLOW SQL 告警。
+		result := officialQQIdentityMigrationQuiet(officialQQIdentityMigrationWithoutCache(probe)).Count(&count)
 		if result.Error != nil {
 			return 0, result.Error
 		}

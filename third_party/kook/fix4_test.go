@@ -117,11 +117,16 @@ func TestPermanentAuthErrorClassification(t *testing.T) {
 		EventStatusMissingArgument,
 		EventStatusInvalidToken,
 		EventStatusTokenAuthFailed,
-		EventStatusTokenExpired,
 	} {
 		if !isPermanentAuthError(&helloStatusError{code: code}) {
 			t.Errorf("status %d should be a permanent auth error", code)
 		}
+	}
+	// 手册把 40103 归为“需要重新连接”：gateway URL 会重新签发 token，
+	// 因此 HELLO 40103 不能作为终态；REST 40103（机器人 token 本身过期）
+	// 仍然无法通过重试恢复。
+	if isPermanentAuthError(&helloStatusError{code: EventStatusTokenExpired}) {
+		t.Fatal("HELLO 40103 must be retryable")
 	}
 	if isPermanentAuthError(&helloStatusError{code: EventStatusResumeFailed}) {
 		t.Fatal("resume failure must not be treated as a permanent auth error")
@@ -145,7 +150,7 @@ func TestFatalHandlerStopsReconnectOnAuthError(t *testing.T) {
 		atomic.AddInt32(&connections, 1)
 		_ = conn.WriteJSON(map[string]interface{}{
 			"s": EventSignalHello,
-			"d": map[string]interface{}{"code": EventStatusTokenExpired},
+			"d": map[string]interface{}{"code": EventStatusInvalidToken},
 		})
 		_ = conn.Close()
 	}))

@@ -374,10 +374,35 @@ func (pa *PlatformAdapterOfficialQQ) finishSessionIfCurrent(ctx context.Context)
 }
 
 // canSend 在 sessionMu 内读取 Enable/State，避免禁用/重登时读到半更新状态。
+// StateConnecting 也允许发送：WS 已提交但 READY 尚未到达时，首条事件的回复
+// 不应被发送守卫静默丢弃。
+// officialQQSendContext 返回本次发送应绑定的会话 context。
+// 用 Background 会让主动消息在禁用/重登后继续排队并发出，因此优先复用当前会话。
+func (pa *PlatformAdapterOfficialQQ) officialQQSendContext() context.Context {
+	if ctx := pa.currentSessionContext(); ctx != nil {
+		return ctx
+	}
+	return context.Background()
+}
+
 func (pa *PlatformAdapterOfficialQQ) canSend() bool {
 	pa.sessionMu.Lock()
 	defer pa.sessionMu.Unlock()
-	return pa.EndPoint != nil && pa.EndPoint.Enable && pa.EndPoint.State == StateConnected
+	if pa.EndPoint == nil || !pa.EndPoint.Enable {
+		return false
+	}
+	return pa.EndPoint.State == StateConnected || pa.EndPoint.State == StateConnecting
+}
+
+// endpointStateSnapshot 在同一把锁内读取 Enable/State，供重试循环判断
+// “用户是否还要求连接”以及区分永久失败与瞬时失败。
+func (pa *PlatformAdapterOfficialQQ) endpointStateSnapshot() (bool, EndpointState) {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	if pa.EndPoint == nil {
+		return false, StateDisconnected
+	}
+	return pa.EndPoint.Enable, pa.EndPoint.State
 }
 
 // identitySnapshot 返回当前端点身份快照，供发送消息时填充 Sender。
@@ -450,6 +475,37 @@ func (pa *PlatformAdapterOfficialQQ) setEndpointState(enable bool, state Endpoin
 		ep.State = state
 	}
 	pa.sessionMu.Unlock()
+}
+
+// markOfficialQQReady is called from botgo's READY callback (see
+// official_qq_ready.go). Only the connection that still owns pa.Ctx may update
+// the endpoint, so a late READY from a replaced session is ignored.
+func (pa *PlatformAdapterOfficialQQ) markOfficialQQReady(ctx context.Context, data *dto.WSReadyData) {
+	if ctx == nil || !pa.isCurrentSession(ctx) {
+		return
+	}
+	if data != nil && data.User.ID != "" {
+		pa.setBotID(data.User.ID)
+		currentID, currentName := pa.identitySnapshot()
+		if currentID == "" {
+			if data.User.Username != "" {
+				currentName = data.User.Username
+			}
+			pa.setEndpointIdentityIfCurrent(ctx, formatDiceIDOfficialQQ(data.User.ID), currentName)
+		} else if data.User.Username != "" {
+			pa.setEndpointIdentityIfCurrent(ctx, currentID, data.User.Username)
+		}
+	}
+	if !pa.setStateIfCurrent(ctx, true, StateConnected) {
+		return
+	}
+	pa.clearQrLoginState()
+	if ep := pa.EndPoint; ep != nil && ep.Session != nil && ep.Session.Parent != nil {
+		d := ep.Session.Parent
+		d.LastUpdatedTime = time.Now().Unix()
+		d.Save(false)
+		d.Logger.Infof("official qq 连接成功（READY）；QQ 官方续期重连会自动恢复，不需要手动重启")
+	}
 }
 
 func (pa *PlatformAdapterOfficialQQ) setEndpointStateForCurrent(enable bool, state EndpointState) bool {
@@ -792,6 +848,51 @@ func (pa *PlatformAdapterOfficialQQ) failConnect(ctx context.Context) int {
 	return 1
 }
 
+// isOfficialQQConnectAuthError 识别明确的凭据/鉴权失败，避免 AppID/AppSecret
+// 错误时无限重试；网络超时、5xx、EOF 等仍交给 failConnectTransient 退避。
+func isOfficialQQConnectAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, needle := range []string{
+		"http status 401", "http status 403",
+		"401 unauthorized", "403 forbidden",
+		"invalid appid", "invalid app secret", "invalid appsecret",
+		"authentication fail", "鉴权失败",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// failConnectTransient 用于网络抖动、平台 5xx、连接额度暂时耗尽等可恢复错误：
+// 释放本次会话/队列，但保持 Enable=true 和 StateConnecting，让 Serve 的重试循环
+// 继续按退避重连，而不是把端点永久禁用。
+func (pa *PlatformAdapterOfficialQQ) failConnectTransient(ctx context.Context) int {
+	pa.sessionMu.Lock()
+	if ctx == nil || pa.Ctx != ctx {
+		pa.sessionMu.Unlock()
+		return 0
+	}
+	if ep := pa.EndPoint; ep != nil {
+		if !ep.Enable {
+			// 用户已禁用：只清理本次会话/队列，不要把端点重新置为可重试。
+			cancel, queue := pa.stopSessionLocked()
+			pa.sessionMu.Unlock()
+			pa.closeStoppedSession(cancel, queue)
+			return 1
+		}
+		ep.State = StateConnecting
+	}
+	cancel, queue := pa.stopSessionLocked()
+	pa.sessionMu.Unlock()
+	pa.closeStoppedSession(cancel, queue)
+	return 1
+}
+
 func (pa *PlatformAdapterOfficialQQ) Serve() int {
 	log := pa.EndPoint.Session.Parent.Logger
 
@@ -904,7 +1005,10 @@ func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *Officia
 	// 启动 token 自动刷新
 	if err := qqtoken.StartRefreshAccessToken(ctx, pa.getTokenSource()); err != nil {
 		log.Error("official qq 启动 token 刷新失败: ", err)
-		return pa.failConnect(ctx)
+		if isOfficialQQConnectAuthError(err) {
+			return pa.failConnect(ctx)
+		}
+		return pa.failConnectTransient(ctx)
 	}
 
 	pa.setAPI(qqbot.NewOpenAPI(pa.getAppID().String(), pa.getTokenSource()).WithTimeout(officialQQAPITimeout))
@@ -915,7 +1019,10 @@ func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *Officia
 		botInfo, err = getOfficialQQBotInfo(ctx, pa.getAPI())
 		if err != nil {
 			log.Error("official qq 获取机器人信息失败: ", err)
-			return pa.failConnect(ctx)
+			if isOfficialQQConnectAuthError(err) {
+				return pa.failConnect(ctx)
+			}
+			return pa.failConnectTransient(ctx)
 		}
 	}
 
@@ -944,7 +1051,7 @@ func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *Officia
 			log.Error("official qq 身份数据迁移失败，将继续启动并在下次连接时重试: ", err)
 		} else {
 			log.Error("official qq 身份初始化失败: ", err)
-			return pa.failConnect(ctx)
+			return pa.failConnectTransient(ctx)
 		}
 	}
 
@@ -1024,7 +1131,10 @@ func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *Officia
 	if err != nil || ws == nil {
 		log.Error("official qq 获取 ws 接入点失败? ", err)
 		log.Error("official qq 提示：请确认在机器人后台配置 IP 白名单，并检查 AppID/AppSecret 是否正确")
-		return pa.failConnect(ctx)
+		if isOfficialQQConnectAuthError(err) {
+			return pa.failConnect(ctx)
+		}
+		return pa.failConnectTransient(ctx)
 	}
 	if ws.Shards == 0 {
 		ws.Shards = 1
@@ -1034,7 +1144,7 @@ func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *Officia
 			"official qq session limited: shards=%d remaining=%d resetAfter=%d maxConcurrency=%d",
 			ws.Shards, ws.SessionStartLimit.Remaining, ws.SessionStartLimit.ResetAfter, ws.SessionStartLimit.MaxConcurrency,
 		)
-		return pa.failConnect(ctx)
+		return pa.failConnectTransient(ctx)
 	}
 
 	var intent dto.Intent
@@ -1054,12 +1164,16 @@ func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *Officia
 
 	log.Info("official qq WebSocket 正在建立；QQ 官方可能约每小时要求一次连接续期，自动重连属于正常现象")
 
-	// 先置为已连接，避免 Start 协程启动初期的首条事件回复被发送守卫丢弃；
-	// 启动失败由 Start 协程回置为失败状态。
-	if !pa.setStateIfCurrent(ctx, true, StateConnected) {
+	// Keep the endpoint in "connecting" until botgo reports READY. The send
+	// guard allows StateConnecting, so a reply to the very first event is not
+	// dropped, while the UI/log no longer claim success before Identify.
+	if !pa.setStateIfCurrent(ctx, true, StateConnecting) {
 		pa.closeOfficialQQEventQueueInstance(queue)
 		return 0
 	}
+	registerOfficialQQReadySink(pa.getAppID().String(), func(data *dto.WSReadyData) {
+		pa.markOfficialQQReady(ctx, data)
+	})
 
 	go func() {
 		currentCtx := ctx
@@ -1088,7 +1202,7 @@ func (pa *PlatformAdapterOfficialQQ) connect(ctx context.Context, probe *Officia
 	pa.clearQrLoginState()
 	d.LastUpdatedTime = time.Now().Unix()
 	d.Save(false)
-	log.Info("official qq 连接成功（WebSocket）；QQ 官方续期重连会自动恢复，不需要手动重启")
+	log.Info("official qq WebSocket 已提交，等待 READY；完成前不代表已连接")
 	return 0
 }
 
@@ -2168,10 +2282,12 @@ func (pa *PlatformAdapterOfficialQQ) DoRelogin() bool {
 		d.Save(false)
 		return false
 	}
-	ok := pa.Serve() == 0
+	// 走统一的 Serve 重试循环：Serve 本身只建一次连，瞬时失败会直接返回 1；
+	// 由 ServerOfficialQQ 按退避持续重试，避免重登遇到网络抖动后停在 Connecting。
+	go ServerOfficialQQ(d, pa.EndPoint)
 	d.LastUpdatedTime = time.Now().Unix()
 	d.Save(false)
-	return ok
+	return true
 }
 
 func (pa *PlatformAdapterOfficialQQ) SetEnable(enable bool) {
@@ -2181,7 +2297,10 @@ func (pa *PlatformAdapterOfficialQQ) SetEnable(enable bool) {
 		if !pa.isSessionRunning() {
 			pa.setDiceServing(false)
 			pa.setEndpointState(false, StateConnecting)
-			ServerOfficialQQ(d, ep)
+			// 必须在后台启动：ServerOfficialQQ 内部是按退避持续重试的循环，
+			// 同步调用会让 /im_connections/set_enable 请求一直挂到连接成功为止
+			// （网络不通时永远不返回），连点还会叠加多个重试循环。
+			go ServerOfficialQQ(d, ep)
 		} else {
 			qrState, _, _ := pa.QrLoginSnapshot()
 			if qrState == OfficialQQLoginStateQRWaitingForScan {
@@ -2612,7 +2731,10 @@ func (pa *PlatformAdapterOfficialQQ) uploadGroupMedia(qctx context.Context, grou
 
 // sendC2CMsgRaw 发送单聊消息（使用msg_id被动回复）
 func (pa *PlatformAdapterOfficialQQ) sendC2CMsgRaw(ctx *MsgContext, rowMsgID, userOpenID string, text string, keyboardObj *keyboard.MessageKeyboard) (*dto.Message, error) {
-	qctx := context.Background()
+	if pa.currentSessionContext() == nil {
+		return nil, errors.New("官方 QQ 会话未运行")
+	}
+	qctx := pa.officialQQSendContext()
 	elems := message.ConvertStringMessage(text)
 	var (
 		content string
@@ -2634,6 +2756,11 @@ func (pa *PlatformAdapterOfficialQQ) sendC2CMsgRaw(ctx *MsgContext, rowMsgID, us
 			if err := pa.waitC2CActiveQuota(qctx, userOpenID); err != nil {
 				pa.EndPoint.Session.Parent.Logger.Error("official qq 发送单聊消息失败：" + err.Error())
 				lastErr = err
+				return
+			}
+			// 排队期间端点可能被禁用/重登；此时不能再发出旧会话的消息。
+			if !pa.canSend() || !pa.isCurrentSession(qctx) {
+				lastErr = errors.New("官方 QQ 会话已切换或端点已禁用，取消发送")
 				return
 			}
 		}
@@ -3016,7 +3143,10 @@ func (pa *PlatformAdapterOfficialQQ) SendToGroup(ctx *MsgContext, uid string, te
 }
 
 func (pa *PlatformAdapterOfficialQQ) sendQQGroupMsgRaw(ctx *MsgContext, rowMsgID, groupID string, text string, keyboardObj *keyboard.MessageKeyboard) (*dto.Message, error) {
-	qctx := context.Background()
+	if pa.currentSessionContext() == nil {
+		return nil, errors.New("官方 QQ 会话未运行")
+	}
+	qctx := pa.officialQQSendContext()
 	elems := message.ConvertStringMessage(text)
 	var (
 		content string
@@ -3038,6 +3168,11 @@ func (pa *PlatformAdapterOfficialQQ) sendQQGroupMsgRaw(ctx *MsgContext, rowMsgID
 			if err := pa.waitGroupActiveQuota(qctx, groupID); err != nil {
 				pa.EndPoint.Session.Parent.Logger.Error("official qq 发送群聊消息失败：" + err.Error())
 				lastErr = err
+				return
+			}
+			// 排队期间端点可能被禁用/重登；此时不能再发出旧会话的消息。
+			if !pa.canSend() || !pa.isCurrentSession(qctx) {
+				lastErr = errors.New("官方 QQ 会话已切换或端点已禁用，取消发送")
 				return
 			}
 		}
@@ -3670,6 +3805,15 @@ func (pa *PlatformAdapterOfficialQQ) isCurrentQrGeneration(generation uint64) bo
 	return pa.qrGeneration == generation
 }
 
+// shouldRetryAfterQrConnect 判断扫码成功后首次 connect 失败是否应转入后台重试。
+// failConnectTransient 保留 Enable=true 并把状态置为 Connecting（凭据已由扫码验证，
+// 只是网络/额度暂时不可用）；永久失败走 failConnect（Enable=false）或用户禁用
+// （Disconnected）。扫码路径没有 Serve 重试循环，只有这里能把它救回来。
+func (pa *PlatformAdapterOfficialQQ) shouldRetryAfterQrConnect(generation uint64) bool {
+	enabled, state := pa.endpointStateSnapshot()
+	return enabled && state == StateConnecting && pa.isCurrentQrGeneration(generation)
+}
+
 // qqBotGenerateBindKey 生成 32 字节随机密钥并 base64 编码
 func qqBotGenerateBindKey() (string, error) {
 	buf := make([]byte, 32)
@@ -3952,6 +4096,13 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 		return
 	}
 
+	// 生成二维码（含最多 10 秒的建任务请求）期间用户可能已经禁用端点，
+	// clearQrLoginState 会推进代次。此时不能再把二维码写回 UI：轮询协程
+	// 已经因代次变化退出，二维码会永远停在那里且不可用。
+	if !pa.isCurrentQrGeneration(generation) {
+		return
+	}
+
 	pa.qrMu.Lock()
 	pa.qrSession = session
 	pa.QrURL = session.QrURL
@@ -4104,7 +4255,18 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 					return
 				}
 				//nolint:staticcheck // nil 表示由 connect 内部为扫码结果创建新的会话 context。
-				if pa.connect(nil, probe) != 0 {
+				if rc := pa.connect(nil, probe); rc != 0 {
+					// failConnectTransient 会保留 Enable=true 并把状态置为 Connecting：
+					// 这说明凭据有效、只是网络瞬时失败。扫码路径没有 Serve 重试循环，
+					// 若在这里落失败态，用户刚扫完码的账号会被永久禁用。
+					if pa.shouldRetryAfterQrConnect(generation) {
+						log.Warnf("official qq 扫码后首次连接瞬时失败，转入后台重试: UIN=%s", probe.UIN)
+						if !pa.isSessionRunning() {
+							pa.setDiceServing(false)
+						}
+						go ServerOfficialQQ(d, ep)
+						return
+					}
 					// beginSession 失败说明已有新会话接管，不能把它的 Enable 改掉。
 					if pa.setEndpointStateIfIdle(false, StateConnectionFailed) {
 						d.LastUpdatedTime = time.Now().Unix()
@@ -4132,6 +4294,10 @@ func (pa *PlatformAdapterOfficialQQ) serveQrLogin(ctx context.Context, source st
 				curSession.QrURL = newQrURL
 				curSession.mu.Unlock()
 
+				// 刷新期间可能已被禁用/失败处理（代次变化），不要再写回状态。
+				if !pa.isCurrentQrGeneration(generation) {
+					return
+				}
 				pa.qrMu.Lock()
 				pa.QrURL = newQrURL
 				pa.QrCodeData = newQrCodeData

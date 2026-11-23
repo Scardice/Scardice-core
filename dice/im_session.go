@@ -125,9 +125,19 @@ type GroupInfo struct {
 	HelpPackages []string      `json:"helpPackages"   yaml:"-"`
 	CocRuleIndex int           `jsbind:"cocRuleIndex" json:"cocRuleIndex" yaml:"cocRuleIndex"`
 	logStateMu   *sync.RWMutex `json:"-" yaml:"-"`
-	LogCurID     uint64        `json:"-" yaml:"-"`
-	LogCurName   string        `jsbind:"logCurName"   json:"logCurName"   yaml:"logCurFile"`
-	LogOn        bool          `jsbind:"logOn"        json:"logOn"        yaml:"logOn"`
+	// LogCurID 是当前日志在 log_items 表里的主键。
+	// 必须持久化：重启后 config.go 要用它把 seq 基线校准到数据库 MAX(seq)，
+	// 否则基线停留在 .log on 那一刻，重启后首条消息会把已记录的整段历史误判成断层。
+	// 旧数据没有该字段时为 0，ensureGroupLogState 会按 LogCurName 重新补全。
+	LogCurID   uint64 `json:"logCurId,omitempty" yaml:"logCurId,omitempty"`
+	LogCurName string `jsbind:"logCurName"   json:"logCurName"   yaml:"logCurFile"`
+	LogOn      bool   `jsbind:"logOn"        json:"logOn"        yaml:"logOn"`
+	// LogPausedByBotOff 表示当前这次“日志关闭”是 .bot off 自动暂停造成的
+	// （只暂停、不 end、不上传），.bot on 时自动恢复。
+	LogPausedByBotOff bool `json:"logPausedByBotOff,omitempty" yaml:"logPausedByBotOff,omitempty"`
+	// LogResumeSkipGap 表示恢复后的第一条消息只重建基线、不计算缺口，
+	// 保证 .bot off 期间的消息既不被记录，也不会在恢复后被当成断层补录。
+	LogResumeSkipGap bool `json:"logResumeSkipGap,omitempty" yaml:"logResumeSkipGap,omitempty"`
 
 	QuitMarkAutoClean   bool   `json:"-"                     yaml:"-"` // 自动清群 - 播报，即将自动退出群组
 	QuitMarkMaster      bool   `json:"-"                     yaml:"-"` // 骰主命令退群 - 播报，即将自动退出群组
@@ -166,6 +176,23 @@ type GroupInfo struct {
 	logLastMsgID interface{} `json:"-" yaml:"-"` // 上条已记录消息的RawID，用于断层通知的引用回复
 	logSelfSent  int64       `json:"-" yaml:"-"` // 自 logLastSeq 以来骰子自身的群内发言数
 	logGapFillMu sync.Mutex  `json:"-" yaml:"-"` // 补全防重入
+	// logGapFilling 标记当前是否正在执行小断层的静默重放。
+	// OnMessageReceived 用它给补录条目打 is_gap_fill 标记；正常实时消息不受影响。
+	logGapFilling atomic.Bool `json:"-" yaml:"-"`
+	// logGapFillFrom/To 是当前静默重放的 seq 区间（开区间）。
+	// 重放的消息会重走 OnMessageReceived，必须按 seq 是否落在区间内打标记；
+	// 只看布尔标记会把重放期间实时到达的正常消息也标成补录。
+	logGapFillFrom atomic.Int64 `json:"-" yaml:"-"`
+	logGapFillTo   atomic.Int64 `json:"-" yaml:"-"`
+	// logSeqCalibrated 表示本进程内是否已用数据库 MAX(seq) 校准过 seq 基线。
+	logSeqCalibrated bool `json:"-" yaml:"-"`
+
+	// LogSeqBaseline 是日志开启/恢复时的持久seq基线。
+	// logLastSeq 只在内存中，重启后会归零；若没有这个字段，启动时会回退到
+	// 数据库 MAX(seq)（停在 log off 之前），把暂停期间的聊天重新补进日志。
+	LogSeqBaseline int64 `json:"logSeqBaseline,omitempty" yaml:"logSeqBaseline,omitempty"`
+	// LogSeqBaselineMsgID 与 LogSeqBaseline 配套，用于断层通知的引用回复。
+	LogSeqBaselineMsgID string `json:"logSeqBaselineMsgID,omitempty" yaml:"logSeqBaselineMsgID,omitempty"`
 }
 
 // noteLogSelfSent 记录一条骰子自身的群内发言。
@@ -189,6 +216,112 @@ func (g *GroupInfo) updateLogSeq(seq int64, rawID interface{}) (lastSeq int64, l
 		g.logSelfSent = 0
 	}
 	return lastSeq, lastMsgID, selfSent
+}
+
+// advanceLogSeq 在加载群数据时用 DB MAX(seq) 校准持久基线，避免重启后
+// 把已记录的消息再次算进断层（会放大 gap，导致本应静默重放的指令变成通知）。
+func (g *GroupInfo) advanceLogSeq(seq int64, rawID interface{}) {
+	if seq <= 0 {
+		return
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	if seq > g.logLastSeq {
+		g.logLastSeq = seq
+		g.logLastMsgID = rawID
+		g.logSelfSent = 0
+	}
+}
+
+// resetLogSeq 在日志开启/恢复时把seq基线重置到当前消息。
+// 日志关闭期间 updateLogSeq 不会被调用，基线停在关闭前；若不重置，
+// 恢复后第一条消息会被误判为断层，补全任务会把 log off 期间的消息也补进日志。
+// 同时写入持久字段：logLastSeq 是运行时字段，进程重启后会归零。
+func (g *GroupInfo) resetLogSeq(seq int64, rawID interface{}) {
+	if seq <= 0 {
+		return
+	}
+	msgID := ""
+	if rawID != nil {
+		msgID = fmt.Sprintf("%v", rawID)
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	g.logLastSeq = seq
+	g.logLastMsgID = rawID
+	g.logSelfSent = 0
+	g.LogSeqBaseline = seq
+	g.LogSeqBaselineMsgID = msgID
+}
+
+// initLogSeqFromPersisted 在群数据加载完成后恢复持久基线。
+// 旧版本没有该字段时保持 0，OnMessageReceived 会继续回退到 DB MAX(seq)。
+func (g *GroupInfo) initLogSeqFromPersisted() {
+	if g == nil {
+		return
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	if g.LogSeqBaseline <= 0 {
+		return
+	}
+	g.logLastSeq = g.LogSeqBaseline
+	if g.LogSeqBaselineMsgID != "" {
+		g.logLastMsgID = g.LogSeqBaselineMsgID
+	}
+}
+
+// logSeqBaselineSnapshot 读取持久基线，避免与 resetLogSeq 的写入形成数据竞争。
+func (g *GroupInfo) logSeqBaselineSnapshot() (int64, string) {
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	return g.LogSeqBaseline, g.LogSeqBaselineMsgID
+}
+
+// needLogSeqCalibration 报告本进程是否还需要用数据库 MAX(seq) 校准一次基线。
+// logLastSeq 是运行时字段，重启后只来自持久基线——而持久基线记录的是
+// .log on / .log new 那一刻的序号，可能远旧于数据库里实际记录到的最后一条。
+// 不校准的话，重启后首条消息会算出巨大的假缺口：既会去拉早已记录的历史，
+// 又会让真正的离线缺口因为 logLastSeq 被直接推到最新而永久漏补。
+func (g *GroupInfo) needLogSeqCalibration() bool {
+	if g == nil {
+		return false
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	return !g.logSeqCalibrated
+}
+
+// markLogSeqCalibrated 记录本进程已完成校准，避免每条消息都查数据库。
+func (g *GroupInfo) markLogSeqCalibrated() {
+	if g == nil {
+		return
+	}
+	g.logSeqMu.Lock()
+	g.logSeqCalibrated = true
+	g.logSeqMu.Unlock()
+}
+
+// beginLogGapFillWindow 进入静默重放：窗口内的消息在日志里标记为补录。
+// 返回的函数用于结束窗口，必须 defer 调用。
+func (g *GroupInfo) beginLogGapFillWindow(fromSeq, toSeq int64) func() {
+	g.logGapFillFrom.Store(fromSeq)
+	g.logGapFillTo.Store(toSeq)
+	g.logGapFilling.Store(true)
+	return func() {
+		g.logGapFilling.Store(false)
+		g.logGapFillFrom.Store(0)
+		g.logGapFillTo.Store(0)
+	}
+}
+
+// isLogGapFillSeq 判断一条消息是否属于正在重放的补录区间。
+// 重放期间实时到达的新消息 seq 在窗口之外，不会被误标为补录。
+func (g *GroupInfo) isLogGapFillSeq(seq int64) bool {
+	if g == nil || !g.logGapFilling.Load() || seq <= 0 {
+		return false
+	}
+	return seq > g.logGapFillFrom.Load() && seq < g.logGapFillTo.Load()
 }
 
 // GetActivatedExtList 获取激活的扩展列表，自动处理延迟初始化
@@ -359,6 +492,8 @@ func (g *GroupInfo) SetActiveRaw(active bool) {
 // MarshalJSON 自定义序列化，处理私有字段 activatedExtList。
 // 已删除 wrapper 的名字同样保留：群开启状态不因插件删除而丢失。
 func (g *GroupInfo) MarshalJSON() ([]byte, error) {
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
 	g.extInitMu.Lock()
 	// 过滤掉已删除的 wrapper
 	var filteredList []*ExtInfo
@@ -379,6 +514,8 @@ func (g *GroupInfo) MarshalJSON() ([]byte, error) {
 
 // UnmarshalJSON 自定义反序列化，处理私有字段 activatedExtList
 func (g *GroupInfo) UnmarshalJSON(data []byte) error {
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
 	g.activeMu.Lock()
 	defer g.activeMu.Unlock()
 	if err := sonic.Unmarshal(data, &groupInfoDecodeJSON{groupInfoAlias: (*groupInfoAlias)(g)}); err != nil {

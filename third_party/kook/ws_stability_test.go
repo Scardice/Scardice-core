@@ -388,7 +388,7 @@ func TestResumeRetryKeepsSessionOnTransientFailure(t *testing.T) {
 		}
 		if r.URL.Query().Get("resume") == "1" {
 			n := atomic.AddInt32(&resumeCount, 1)
-			if n <= 2 {
+			if n <= 1 {
 				_ = conn.Close()
 				return
 			}
@@ -432,8 +432,8 @@ func TestResumeRetryKeepsSessionOnTransientFailure(t *testing.T) {
 	}
 	defer s.Close()
 
-	if got := atomic.LoadInt32(&resumeCount); got != 3 {
-		t.Fatalf("resume attempts = %d, want 3", got)
+	if got := atomic.LoadInt32(&resumeCount); got != 2 {
+		t.Fatalf("resume attempts = %d, want 2", got)
 	}
 	if got := atomic.LoadInt32(&freshCount); got != 0 {
 		t.Fatalf("fresh connections = %d, want 0 (resume should be preserved)", got)

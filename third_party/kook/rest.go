@@ -3,13 +3,18 @@ package kook
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
+	"time"
 )
+
+const maxResponseBytes = 16 << 20
 
 // Gateway returns the url for websocket gateway.
 // FYI: https://developer.kookapp.cn/doc/http/gateway#%E8%8E%B7%E5%8F%96%E7%BD%91%E5%85%B3%E8%BF%9E%E6%8E%A5%E5%9C%B0%E5%9D%80
@@ -1645,7 +1650,7 @@ func (s *Session) RequestWithPage(method, u string, page *PageSetting) (response
 
 // Request is the wrapper for internal request method, you would prefer to use other method other than this.
 func (s *Session) Request(method, url string, data interface{}) (response []byte, err error) {
-	return s.request(method, url, data, 0)
+	return s.request(method, url, data)
 }
 
 type assetFile struct {
@@ -1653,7 +1658,25 @@ type assetFile struct {
 	ContentType string
 }
 
-func (s *Session) request(method, url string, data interface{}, sequence int) (response []byte, err error) {
+// rateLimitReset 解析 KOOK 的 X-Rate-Limit-Reset（秒）。
+// 文档：https://developer.kookapp.cn/doc/rate-limit
+func rateLimitReset(header http.Header) time.Duration {
+	raw := strings.TrimSpace(header.Get("X-Rate-Limit-Reset"))
+	if raw == "" {
+		return 0
+	}
+	seconds, err := strconv.ParseFloat(raw, 64)
+	if err != nil || seconds <= 0 {
+		return 0
+	}
+	// 防御异常值：单次最多等待 60 秒，避免把调用方长期挂住。
+	if seconds > 60 {
+		seconds = 60
+	}
+	return time.Duration(seconds * float64(time.Second))
+}
+
+func (s *Session) request(method, url string, data interface{}) (response []byte, err error) {
 	var body []byte
 	var dataMultipart bool
 	if data != nil {
@@ -1674,69 +1697,102 @@ func (s *Session) request(method, url string, data interface{}, sequence int) (r
 		e = e.Bytes("payload", body)
 	}
 	e.Msg("http api request")
-	req, err := http.NewRequest(method, url, bytes.NewBuffer(body))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Authorization", s.Identify.Token)
-	if len(body) > 0 {
-		if dataMultipart {
-			req.Header.Set("Content-Type", data.(*assetFile).ContentType)
-		} else {
-			req.Header.Set("Content-Type", "application/json")
-		}
-	}
-	e = addCaller(s.Logger.Trace())
-	for k, v := range req.Header {
-		e = e.Strs(k, v)
-		// s.log(LogTrace, "Api Request Header %s = %+v\n", k, v)
-	}
-	e.Msg("http api request headers")
-	resp, err := s.Client.Do(req)
-	if err != nil {
-		addCaller(s.Logger.Error()).Err("err", err).Msg("")
-		return
-	}
-	defer func() {
-		err2 := resp.Body.Close()
-		if err2 != nil {
-			addCaller(s.Logger.Error()).Msg("error closing resp body")
-			// s.log(LogError, "error closing resp body")
-		}
-	}()
 
-	var respByte []byte
+	maxRetry := s.MaxRetry
+	if maxRetry <= 0 {
+		maxRetry = 3
+	}
+	var deadline time.Time
+	if s.RetryTimeout > 0 {
+		deadline = time.Now().Add(s.RetryTimeout)
+	}
 
-	respByte, err = ioutil.ReadAll(resp.Body)
-	if err != nil {
-		addCaller(s.Logger.Error()).Err("err", err).Msg("")
+	for attempt := 0; ; attempt++ {
+		req, reqErr := http.NewRequest(method, url, bytes.NewBuffer(body))
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		req.Header.Set("Authorization", s.Identify.Token)
+		if len(body) > 0 {
+			if dataMultipart {
+				req.Header.Set("Content-Type", data.(*assetFile).ContentType)
+			} else {
+				req.Header.Set("Content-Type", "application/json")
+			}
+		}
+		// 只记录非敏感头；Authorization 必须脱敏，否则 trace 级别会泄露 bot token。
+		e = addCaller(s.Logger.Trace())
+		for k, v := range req.Header {
+			if strings.EqualFold(k, "Authorization") {
+				e = e.Strs(k, []string{"Bot ***"})
+				continue
+			}
+			e = e.Strs(k, v)
+		}
+		e.Msg("http api request headers")
+
+		resp, doErr := s.Client.Do(req)
+		if doErr != nil {
+			addCaller(s.Logger.Error()).Err("err", doErr).Msg("http request failed")
+			if attempt >= maxRetry || (!deadline.IsZero() && time.Now().After(deadline)) {
+				return nil, doErr
+			}
+			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
+			continue
+		}
+
+		// KOOK REST 响应都很小；限制读取上限，避免异常网关/代理让进程无限分配。
+		respByte, readErr := ioutil.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			addCaller(s.Logger.Error()).Err("err", readErr).Msg("read response failed")
+			return nil, readErr
+		}
+		addCaller(s.Logger.Trace()).Int("status_code", resp.StatusCode).
+			Str("status", resp.Status).
+			Bytes("body", respByte).
+			Msg("http response")
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			wait := rateLimitReset(resp.Header)
+			if wait <= 0 {
+				wait = time.Duration(1<<uint(attempt)) * time.Second
+			}
+			global := strings.TrimSpace(resp.Header.Get("X-Rate-Limit-Global"))
+			addCaller(s.Logger.Warn()).
+				Str("bucket", resp.Header.Get("X-Rate-Limit-Bucket")).
+				Str("global", global).
+				Dur("wait", wait).
+				Int("attempt", attempt).
+				Msg("kook rate limited, backing off")
+			if attempt >= maxRetry {
+				return nil, fmt.Errorf("kook api rate limited after %d retries", attempt)
+			}
+			if !deadline.IsZero() && time.Now().Add(wait).After(deadline) {
+				return nil, fmt.Errorf("kook api rate limited, wait %s exceeds RetryTimeout", wait)
+			}
+			time.Sleep(wait)
+			continue
+		}
+
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			msg := strings.TrimSpace(string(respByte))
+			if len(msg) > 512 {
+				msg = msg[:512]
+			}
+			return nil, fmt.Errorf("kook api http status %d: %s", resp.StatusCode, msg)
+		}
+
+		var r EndpointGeneralResponse
+		if err = json.Unmarshal(respByte, &r); err != nil {
+			addCaller(s.Logger.Error()).Err("err", err).Msg("response unmarshal error")
+			return nil, err
+		}
+		if r.Code != 0 {
+			addCaller(s.Logger.Error()).Int("code", r.Code).Str("error_msg", r.Message).Msg("api response error")
+			return nil, newRestErrorFromGeneralResp(&r)
+		}
+		response = r.Data
 		return
 	}
-	addCaller(s.Logger.Trace()).Int("status_code", resp.StatusCode).
-		Str("status", resp.Status).
-		Bytes("body", respByte).
-		Msg("http response")
-	// s.log(LogTrace, "Api Response Status %s\n", resp.Status)
-	e = s.Logger.Trace()
-	e = addCaller(e)
-	for k, v := range resp.Header {
-		e = e.Strs(k, v)
-		// s.log(LogTrace, "Api Response Header %s = %+v\n", k, v)
-	}
-	e.Msg("http response headers")
-	// s.log(LogTrace, "Api Response Body %s", respByte)
-	var r EndpointGeneralResponse
-	err = json.Unmarshal(respByte, &r)
-	if err != nil {
-		addCaller(s.Logger.Error()).Err("err", err).Msg("response unmarshal error")
-		// s.log(LogError, "Api Response Unmarshal Error %s", err)
-		return
-	}
-	if r.Code != 0 {
-		addCaller(s.Logger.Error()).Int("code", r.Code).Str("error_msg", r.Message).Msg("api response error")
-		// s.log(LogError, "Api Response Error Code %d, Message %s", r.Code, r.Message)
-		return nil, newRestErrorFromGeneralResp(&r)
-	}
-	response = r.Data
-	return
 }

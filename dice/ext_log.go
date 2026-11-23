@@ -45,6 +45,87 @@ func getGroupLogOn(group *GroupInfo) bool {
 	return state.On && state.Name != ""
 }
 
+// suspendLogForBotOff 在 .bot off 让群变为“未激活”时暂停日志记录。
+// 只把 LogOn 置 false（不结束、不上传，LogCurID/LogCurName 保留），
+// 并记下“这是 .bot off 造成的暂停”，供 .bot on 恢复。
+// 返回是否真的暂停了（原本日志就是关的则返回 false）。
+func (g *GroupInfo) suspendLogForBotOff() bool {
+	if g == nil {
+		return false
+	}
+	mu := g.ensureLogStateMu()
+	mu.Lock()
+	defer mu.Unlock()
+	if !g.LogOn || g.LogCurName == "" {
+		return false
+	}
+	g.LogOn = false
+	g.LogPausedByBotOff = true
+	return true
+}
+
+// resumeLogPausedByBotOff 在群重新激活（.bot on）时恢复被 .bot off 暂停的日志。
+// 无论是否由本次恢复，都会标记“下一条消息只重建基线”，让静默段不被补录；
+// 若期间用户已经 .log on / .log new / .log end，则以用户操作为准。
+// 返回值表示本次是否真的把日志重新打开了。
+func (g *GroupInfo) resumeLogPausedByBotOff() bool {
+	if g == nil {
+		return false
+	}
+	mu := g.ensureLogStateMu()
+	mu.Lock()
+	defer mu.Unlock()
+	if !g.LogPausedByBotOff {
+		return false
+	}
+	g.LogPausedByBotOff = false
+	g.LogResumeSkipGap = true
+	if g.LogOn || g.LogCurName == "" {
+		// 用户已经重新开启，或已经 end/new 换了一本日志：不要覆盖用户的操作。
+		return false
+	}
+	g.LogOn = true
+	return true
+}
+
+// isLogPausedByBotOff 报告当前日志关闭是否由 .bot off 自动暂停造成。
+func (g *GroupInfo) isLogPausedByBotOff() bool {
+	if g == nil {
+		return false
+	}
+	mu := g.ensureLogStateMu()
+	mu.RLock()
+	defer mu.RUnlock()
+	return g.LogPausedByBotOff
+}
+
+// setLogResumeSkipGap 标记“下一次记日志只重建基线、不算缺口”。
+// 用于 .bot off → .bot on 的边界：静默期间的消息不属于要补的断层。
+func (g *GroupInfo) setLogResumeSkipGap() {
+	if g == nil {
+		return
+	}
+	mu := g.ensureLogStateMu()
+	mu.Lock()
+	g.LogResumeSkipGap = true
+	mu.Unlock()
+}
+
+// consumeLogResumeSkipGap 读取并清除“跳过下一次缺口计算”标记。
+func (g *GroupInfo) consumeLogResumeSkipGap() bool {
+	if g == nil {
+		return false
+	}
+	mu := g.ensureLogStateMu()
+	mu.Lock()
+	defer mu.Unlock()
+	if !g.LogResumeSkipGap {
+		return false
+	}
+	g.LogResumeSkipGap = false
+	return true
+}
+
 func ensureGroupLogState(ctx *MsgContext, group *GroupInfo) GroupLogState {
 	state := getGroupLogState(group)
 	if group == nil || !state.On || state.Name == "" || state.ID > 0 {
@@ -353,6 +434,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 							return CmdExecuteResult{Matched: true, Solved: true}
 						}
 						group.SetLogState(logID, name, true)
+						group.resetLogSeq(msg.Seq, msg.RawID)
 						group.MarkDirty(ctx.Dice)
 						ctx.Dice.Logger.Infof("日志状态切换: 群=%s 开启日志 name=%s id=%d", group.GroupID, name, logID)
 
@@ -541,6 +623,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 				group.SetLogState(logID, name, true)
+				group.resetLogSeq(msg.Seq, msg.RawID)
 				group.MarkDirty(ctx.Dice)
 				ctx.Dice.Logger.Infof("日志状态切换: 群=%s 新建并开启日志 name=%s id=%d", group.GroupID, name, logID)
 
@@ -1068,33 +1151,24 @@ func RegisterBuiltinExtLog(self *Dice) {
 				logState := ensureGroupLogState(ctx, ctx.Group)
 				if logState.On && logState.Name != "" {
 					if msg.Seq > 0 {
-						lastSeq, lastMsgID, selfSent := ctx.Group.updateLogSeq(msg.Seq, msg.RawID)
-
-						if lastSeq == 0 && logState.ID > 0 {
-							if seq, err := service.LogGetLastSeq(ctx.Dice.DBOperator, logState.ID); err == nil && seq > 0 {
-								lastSeq = seq
+						// 只有“日志正在记录”时才会走到这里；off 期间整段不进来，
+						// 所以 off 的消息永远不会被算成缺口。
+						fromSeq, lastMsgID, gap := logGapFromMessage(ctx.Dice, ctx.Group, logState, msg.Seq, msg.RawID)
+						if gap > 0 {
+							task := logGapFillTask{
+								dice:      ctx.Dice,
+								endpoint:  ctx.EndPoint,
+								group:     ctx.Group,
+								logID:     logState.ID,
+								logName:   logState.Name,
+								fromSeq:   fromSeq,
+								toSeq:     msg.Seq,
+								gap:       gap,
+								lastMsgID: lastMsgID,
 							}
-						}
-
-						if lastSeq > 0 {
-							// 骰子自身发言同样占seq，扣除后剩下的才是真正遗漏的他人消息
-							gap := msg.Seq - lastSeq - 1 - selfSent
-							if gap > 0 {
-								task := logGapFillTask{
-									dice:      ctx.Dice,
-									endpoint:  ctx.EndPoint,
-									group:     ctx.Group,
-									logID:     logState.ID,
-									logName:   logState.Name,
-									fromSeq:   lastSeq,
-									toSeq:     msg.Seq,
-									gap:       gap,
-									lastMsgID: lastMsgID,
-								}
-								// 补全内部会调用 CreateTempCtx，它以 panic 报告端点未就绪；
-								// 断层补全恰好运行在刚重连之后，裸 goroutine 里的 panic 会直接终止进程
-								panicHandler.Once(ctx.Dice.Logger, task.run)
-							}
+							// 补全内部会调用 CreateTempCtx，它以 panic 报告端点未就绪；
+							// 断层补全恰好运行在刚重连之后，裸 goroutine 里的 panic 会直接终止进程
+							panicHandler.Once(ctx.Dice.Logger, task.run)
 						}
 					}
 
@@ -1115,6 +1189,9 @@ func RegisterBuiltinExtLog(self *Dice) {
 						CommandID: ctx.CommandID,
 						RawMsgID:  msg.RawID,
 						Seq:       ptrInt64(msg.Seq),
+						// 只有落在重放区间内的消息才算补录；重放期间实时到达的
+						// 正常消息 seq 在区间之外，不能被标成补录。
+						IsGapFill: ctx.Group.isLogGapFillSeq(msg.Seq),
 					}
 
 					LogAppend(ctx, ctx.Group.GroupID, logState.ID, logState.Name, &a)
@@ -1240,8 +1317,107 @@ func reportLogAppendFailure(ctx *MsgContext, groupID string, logID uint64, logNa
 // 缺失条数不超过该阈值时静默补全并照常执行指令，超过则只补录日志并汇报未执行的指令
 const logGapFillSilentThreshold = 5
 
-const logGapFillTimeout = 30 * time.Second
+const (
+	logGapFillTimeout      = 30 * time.Second
+	logGapFillPageSize     = 100  // 单次 get_group_msg_history 的拉取上限
+	logGapFillMaxMessages  = 2000 // 单次断层最多补录的消息数，避免离线数天时无限拉取
+	logGapFillFetchRetries = 3    // 瞬时网络错误的重试次数
+)
 
+// logGapReplayDeniedCommands 是静默重放时不允许执行的管理指令。
+// 小断层会重走完整消息流程，若把漏掉的 .log off/.bot off 等指令也重放，
+// 会在用户不知情的情况下改变日志/机器人状态；这些指令只补日志，不执行。
+var logGapReplayDeniedCommands = map[string]struct{}{
+	"log":     {},
+	"bot":     {},
+	"master":  {},
+	"dismiss": {},
+	"ban":     {},
+	"unban":   {},
+}
+
+// logGapFromMessage 记录本条消息的 seq，并返回它与“上一条已记录消息”之间的缺口。
+//
+// 只在日志开启时调用（OnMessageReceived 里的 Off 分支整段不进来），所以 log off
+// 期间的消息永远不会被算成缺口；恢复记录后 .log on/.log new 会把持久基线重置到
+// 当次消息，缺口从那一刻重新起算。
+//
+// 上一条的判定顺序：
+//  1. 内存 logLastSeq —— 进程内正常推进的值；
+//  2. 持久基线 LogSeqBaseline —— .log on/.log new 的边界，重启后恢复；
+//  3. DB MAX(seq) —— 每进程校准一次，用来跨进程重启找回“真正记录到哪”。
+//
+// gap > 0 才需要补全；返回的 fromSeq 是补全区间起点（不含），toSeq 由调用方补。
+func logGapFromMessage(d *Dice, group *GroupInfo, logState GroupLogState, msgSeq int64, rawID interface{}) (fromSeq int64, lastMsgID interface{}, gap int64) {
+	// 双重保险：调用方已经在 Off 时跳过整段逻辑，这里再判一次，
+	// 保证“off 期间的消息绝不进入缺口计算、也绝不推进 seq 基线”。
+	if group == nil || !logState.On || logState.Name == "" {
+		return 0, nil, 0
+	}
+	// .bot off → .bot on 之后的第一次记录：只重建基线，不把静默期间的聊天
+	// 当成断层。暂停期间的消息既不补日志，也不重放执行。
+	if group.consumeLogResumeSkipGap() {
+		group.updateLogSeq(msgSeq, rawID)
+		return 0, nil, 0
+	}
+	lastSeq, lastMsgID, selfSent := group.updateLogSeq(msgSeq, rawID)
+	if lastSeq == 0 && logState.ID > 0 {
+		// 优先使用持久基线；它记录的是 .log on/.log new 的边界，
+		// 比 DB MAX(seq) 更能防止把 log off 期间的消息补进日志。
+		persistedSeq, persistedMsgID := group.logSeqBaselineSnapshot()
+		if persistedSeq > lastSeq {
+			lastSeq = persistedSeq
+			if persistedMsgID != "" {
+				lastMsgID = persistedMsgID
+			}
+		}
+	}
+	// 重启后 logLastSeq 只来自持久基线（.log on 那一刻），可能远旧于数据库里
+	// 实际记录的最后一条。每进程首次记日志时用 DB MAX(seq) 校准一次，否则首条
+	// 消息会算出巨大假缺口：补的是早已记录的历史，真正的离线缺口反而漏补。
+	lastSeq, lastMsgID = calibrateLogSeqBaseline(d, group, logState.ID, lastSeq, lastMsgID)
+	if lastSeq <= 0 {
+		return 0, nil, 0
+	}
+	// 骰子自身发言同样占 seq，扣除后剩下的才是真正遗漏的他人消息。
+	gap = msgSeq - lastSeq - 1 - selfSent
+	if gap <= 0 {
+		return lastSeq, lastMsgID, 0
+	}
+	return lastSeq, lastMsgID, gap
+}
+
+// calibrateLogSeqBaseline 在进程内首次记日志时，用数据库里该日志的 MAX(seq)
+// 校准 seq 基线，返回校准后的上一条 seq 与 RawID。
+//
+// 为什么需要：logLastSeq 是运行时字段，重启后只由持久基线（.log on/.log new
+// 那一刻的序号）恢复。直接拿它算缺口会把 .log on 之后已经落库的整段历史当成
+// 断层（最多拉取 logGapFillMaxMessages 条已记录消息），同时真正的离线缺口
+// 因为基线被 updateLogSeq 直接推到最新而永远补不上。
+//
+// 每个进程只查一次（成功后置 logSeqCalibrated），不会给消息主路径增加常态开销。
+func calibrateLogSeqBaseline(d *Dice, group *GroupInfo, logID uint64, lastSeq int64, lastMsgID interface{}) (int64, interface{}) {
+	if d == nil || d.DBOperator == nil || group == nil || logID == 0 {
+		return lastSeq, lastMsgID
+	}
+	if !group.needLogSeqCalibration() {
+		return lastSeq, lastMsgID
+	}
+	seq, err := service.LogGetLastSeq(d.DBOperator, logID)
+	if err != nil {
+		// 查不到就保持原基线，下一条消息再试；不能把 failed 当成校准完成。
+		return lastSeq, lastMsgID
+	}
+	group.markLogSeqCalibrated()
+	if seq <= lastSeq {
+		return lastSeq, lastMsgID
+	}
+	group.advanceLogSeq(seq, nil)
+	// 数据库里最后一条消息没有携带 RawID，避免断层通知引用错误的消息。
+	return seq, nil
+}
+
+// logGapFillTask 描述一次 seq 断层补全。
 type logGapFillTask struct {
 	dice      *Dice
 	endpoint  *EndPointInfo
@@ -1254,14 +1430,45 @@ type logGapFillTask struct {
 	lastMsgID interface{}
 }
 
+// logStateStillValid 校验补全任务对应的日志仍是该群当前开启的日志。
+// 任务可能排在前一个补全后面几十秒，期间用户可能 .log off / .log new 或删除日志。
+// 不校验的话：静默重放会在日志关闭后执行指令（OnMessageReceived 不记日志），
+// 切换日志后补录内容会写进新日志，删除日志后每条 LogAppend 都会失败并误报
+// “数据库结构未升级”。
+func (t logGapFillTask) logStateStillValid() bool {
+	if t.group == nil {
+		return false
+	}
+	state := t.group.GetLogState()
+	return state.On && state.ID == t.logID && state.Name == t.logName
+}
+
+// forEachMissing 按顺序遍历缺失消息，并在处理每条之前确认日志仍然有效。
+//
+// 只在任务开始/拉取结束时校验是不够的：补录最多 2000 条、静默重放还要执行指令，
+// 期间用户完全可能 .log off / .log new。不逐条校验的话，关掉的日志仍会被继续
+// 写入（用户看到的就是“off 之后内容还在进日志”），静默重放还会在日志关闭后
+// 继续执行历史指令却不留记录。返回实际处理条数，小于 len(missing) 表示被中止。
+func (t logGapFillTask) forEachMissing(missing []*Message, fn func(*Message)) int {
+	for i, m := range missing {
+		if !t.logStateStillValid() {
+			return i
+		}
+		fn(m)
+	}
+	return len(missing)
+}
+
 func (t logGapFillTask) run() {
-	if !t.group.logGapFillMu.TryLock() {
-		// 已有补全在进行时直接跳过：logLastSeq 此时已推进到本条消息
-		// 若补全的这数秒窗口内再次掉线并产生新断层，该新断层不会被再次补全而永久丢失
-		t.dice.Logger.Infof("日志补全已在进行，跳过本次: 群=%s", t.group.GroupID)
+	// 使用阻塞锁而不是 TryLock：每个任务都对应一个已检测到的断层，
+	// 跳过就意味着这段聊天永久缺失。并发任务排队执行，由 RawID 去重防止重复。
+	t.group.logGapFillMu.Lock()
+	defer t.group.logGapFillMu.Unlock()
+
+	if !t.logStateStillValid() {
+		t.dice.Logger.Infof("日志补全已取消: 群=%s 记录=%s 已关闭或被切换", t.group.GroupID, t.logName)
 		return
 	}
-	defer t.group.logGapFillMu.Unlock()
 
 	fetcher, ok := t.endpoint.Adapter.(HistoryFetcher)
 	if !ok {
@@ -1274,16 +1481,22 @@ func (t logGapFillTask) run() {
 	fetchCtx, cancel := context.WithTimeout(context.Background(), logGapFillTimeout)
 	defer cancel()
 
-	// 按整个区间宽度拉取而非按 gap，因为 gap 已扣除骰子自身发言，直接用会漏掉区间尾部的消息
-	msgs, err := fetcher.FetchGroupMsgHistory(fetchCtx, t.group.GroupID, t.fromSeq, int(t.toSeq-t.fromSeq-1))
+	msgs, err := t.fetchHistory(fetchCtx, fetcher)
 	if err != nil {
 		t.dice.Logger.Errorf("日志补全拉取历史消息失败: 群=%s 起始seq=%d err=%v", t.group.GroupID, t.fromSeq, err)
 		return
 	}
 
 	missing := t.filterMissing(msgs)
+	missing = t.filterAlreadyLogged(missing)
 	if len(missing) == 0 {
-		t.dice.Logger.Infof("日志补全无需处理: 群=%s 缺失区间内没有他人发言", t.group.GroupID)
+		t.dice.Logger.Infof("日志补全无需处理: 群=%s 缺失区间内没有需要补录的他人发言", t.group.GroupID)
+		return
+	}
+
+	// 拉取历史可能耗时数十秒，写入前必须再确认一次日志状态。
+	if !t.logStateStillValid() {
+		t.dice.Logger.Infof("日志补全已取消: 群=%s 记录=%s 在拉取期间已关闭或被切换", t.group.GroupID, t.logName)
 		return
 	}
 
@@ -1294,16 +1507,105 @@ func (t logGapFillTask) run() {
 	t.backfillWithNotice(missing)
 }
 
+// fetchHistory 按页拉取 (fromSeq, toSeq) 区间，直到覆盖到 toSeq-1 或达到上限。
+// 单次 get_group_msg_history 的 count 有实现上限（常见 100），不能一次性传整个断层。
+func (t logGapFillTask) fetchHistory(ctx context.Context, fetcher HistoryFetcher) ([]*Message, error) {
+	var lastErr error
+	for attempt := 0; attempt < logGapFillFetchRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Duration(1<<uint(attempt-1)) * time.Second):
+			}
+		}
+		msgs, err := t.fetchHistoryOnce(ctx, fetcher)
+		if err == nil {
+			return msgs, nil
+		}
+		lastErr = err
+		t.dice.Logger.Warnf("日志补全拉取历史消息失败(第%d次): 群=%s err=%v", attempt+1, t.group.GroupID, err)
+	}
+	return nil, lastErr
+}
+
+func (t logGapFillTask) fetchHistoryOnce(ctx context.Context, fetcher HistoryFetcher) ([]*Message, error) {
+	if t.toSeq <= t.fromSeq {
+		return nil, nil
+	}
+	total := t.toSeq - t.fromSeq - 1
+	from := t.fromSeq
+	if total > logGapFillMaxMessages {
+		// 只补最近的一段。离线数天时用户关心的是刚发生的对话；补最旧的
+		// 两千条既看不到近期内容，还会把真正需要恢复的离线窗口挤掉。
+		total = logGapFillMaxMessages
+		from = t.toSeq - 1 - total
+		if from < t.fromSeq {
+			from = t.fromSeq
+		}
+		t.dice.Logger.Warnf("日志补全区间过大(共%d条)，仅补录最近%d条(seq %d-%d): 群=%s 上条seq=%d 本条seq=%d",
+			t.toSeq-t.fromSeq-1, total, from, t.toSeq-1, t.group.GroupID, t.fromSeq, t.toSeq)
+	}
+
+	all := make([]*Message, 0, total)
+	seen := make(map[int64]struct{}, total)
+	for int64(len(all)) < total && from < t.toSeq-1 {
+		count := int(t.toSeq - from - 1)
+		if count > logGapFillPageSize {
+			count = logGapFillPageSize
+		}
+		if remain := int(total) - len(all); count > remain {
+			count = remain
+		}
+		if count <= 0 {
+			break
+		}
+
+		page, err := fetcher.FetchGroupMsgHistory(ctx, t.group.GroupID, from, count)
+		if err != nil {
+			return nil, err
+		}
+		if len(page) == 0 {
+			break
+		}
+
+		maxSeq := from
+		for _, m := range page {
+			if m == nil {
+				continue
+			}
+			if m.Seq > from && m.Seq < t.toSeq {
+				if _, exists := seen[m.Seq]; !exists {
+					seen[m.Seq] = struct{}{}
+					all = append(all, m)
+				}
+			}
+			if m.Seq > maxSeq {
+				maxSeq = m.Seq
+			}
+		}
+		if maxSeq <= from {
+			// 实现没有返回可用的 seq，继续翻页只会死循环。
+			break
+		}
+		from = maxSeq
+	}
+
+	sort.SliceStable(all, func(i, j int) bool { return all[i].Seq < all[j].Seq })
+	return all, nil
+}
+
 // filterMissing 保留断层区间内的他人发言。
 // 骰子自身发言已由 OnMessageSend 记录，重复入库或被当成玩家指令执行都是错的；
 // 自身发言计数虽已在断层估算时扣除，但计数可能因重启丢失，故这里仍按发送者兜底剔除。
+// 其他机器人同样剔除：历史消息里的 bot 指令不应在本群重新执行。
 func (t logGapFillTask) filterMissing(msgs []*Message) []*Message {
 	missing := make([]*Message, 0, len(msgs))
 	for _, m := range msgs {
 		if m == nil || m.Seq <= t.fromSeq || m.Seq >= t.toSeq {
 			continue
 		}
-		if m.Sender.UserID == t.endpoint.UserID {
+		if t.endpoint != nil && m.Sender.UserID == t.endpoint.UserID {
 			continue
 		}
 		missing = append(missing, m)
@@ -1311,17 +1613,153 @@ func (t logGapFillTask) filterMissing(msgs []*Message) []*Message {
 	return missing
 }
 
-// replaySilently 让缺失消息重走完整消息流程，日志记录与指令执行都由 ExecuteNew 内部完成
+// isBotSender 判断历史消息是否由机器人发出（含其他骰子）。
+func (t logGapFillTask) isBotSender(m *Message) bool {
+	if m == nil {
+		return false
+	}
+	return m.Sender.IsRobot || (t.group != nil && t.group.IsBot(m.Sender.UserID, m.Sender.IsRobot))
+}
+
+// filterAlreadyLogged 跳过已经写入同一日志的消息。
+// 平台重连补发、或补全任务与正常事件并发时，同一条消息可能既走事件路径又被历史拉取到；
+// log_items 对 raw_msg_id 没有唯一约束，必须在补录前查一次。
+func (t logGapFillTask) filterAlreadyLogged(msgs []*Message) []*Message {
+	if t.dice == nil || t.dice.DBOperator == nil {
+		return msgs
+	}
+	existing, err := service.LogRawMsgIDsInSeqRange(t.dice.DBOperator, t.logID, t.fromSeq, t.toSeq)
+	if err != nil {
+		t.dice.Logger.Warnf("日志补全查询已记录消息失败，继续补录: 群=%s err=%v", t.group.GroupID, err)
+		return msgs
+	}
+	if len(existing) == 0 {
+		return msgs
+	}
+	filtered := msgs[:0]
+	for _, m := range msgs {
+		if m == nil {
+			continue
+		}
+		if _, ok := existing[fmt.Sprintf("%v", m.RawID)]; ok {
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+	return filtered
+}
+
+// lookupPlayerName 读取玩家在本群的标注名（角色名/名片）。
+// 先查运行时 Players，避免为历史消息逐条访问数据库；未命中再回退到数据库。
+func (t logGapFillTask) lookupPlayerName(uid string) string {
+	if t.group == nil || uid == "" {
+		return ""
+	}
+	if t.group.Players != nil {
+		if p, ok := t.group.Players.Load(uid); ok && p != nil {
+			return strings.TrimSpace(p.Name)
+		}
+	}
+	if t.dice != nil && t.dice.DBOperator != nil {
+		if p := t.group.PlayerGet(t.dice.DBOperator, uid); p != nil {
+			return strings.TrimSpace(p.Name)
+		}
+	}
+	return ""
+}
+
+// playerDisplayName 返回玩家标注名，与正常消息路径 OnMessageReceived 使用的
+// ctx.Player.Name 保持一致，日志按玩家筛选时才能命中；没有角色卡时用平台昵称兜底。
+func (t logGapFillTask) playerDisplayName(uid, fallback string, cache map[string]string) string {
+	if name, ok := cache[uid]; ok && name != "" {
+		return name
+	}
+	name := t.lookupPlayerName(uid)
+	if name == "" {
+		name = fallback
+	}
+	if uid != "" {
+		cache[uid] = name
+	}
+	return name
+}
+
+// replaySilently 让缺失消息重走完整消息流程，日志记录与指令执行都由 ExecuteNew 内部完成。
+// 管理指令（log/bot/master/dismiss/ban 等）只补日志、不执行，避免掉线期间的旧指令
+// 在恢复后改变骰子状态；普通跑团指令仍然按小断层策略自动补执行。
 func (t logGapFillTask) replaySilently(missing []*Message) {
 	session := t.endpoint.Session
 	if session == nil {
 		t.dice.Logger.Warnf("日志补全无法重放: 群=%s 端点会话未绑定", t.group.GroupID)
 		return
 	}
-	for _, m := range missing {
-		session.ExecuteNew(t.endpoint, m)
+	if !t.logStateStillValid() {
+		t.dice.Logger.Infof("日志补全已取消(静默重放): 群=%s 日志已关闭或切换", t.group.GroupID)
+		return
 	}
-	t.dice.Logger.Infof("日志补全完成(静默重放): 群=%s 补录=%d条", t.group.GroupID, len(missing))
+	endGapFillWindow := t.group.beginLogGapFillWindow(t.fromSeq, t.toSeq)
+	defer endGapFillWindow()
+
+	executed, skipped := 0, 0
+	logCtx := CreateTempCtx(t.endpoint, &Message{
+		MessageType: "group",
+		Sender:      SenderBase{UserID: t.endpoint.UserID},
+		GroupID:     t.group.GroupID,
+		Platform:    t.endpoint.Platform,
+	})
+	processed := t.forEachMissing(missing, func(m *Message) {
+		if t.isBotSender(m) || t.isDeniedReplayCommand(m) {
+			// 其他机器人与管理指令只补日志，不执行；日志仍需保持完整。
+			item := t.logItem(m)
+			LogAppend(logCtx, t.group.GroupID, t.logID, t.logName, &item)
+			skipped++
+			return
+		}
+		session.ExecuteNew(t.endpoint, m)
+		executed++
+	})
+	if processed < len(missing) {
+		t.dice.Logger.Warnf("日志补全中止(静默重放): 群=%s 日志在重放过程中被关闭或切换，已重放=%d条 仅补日志=%d条 剩余=%d条",
+			t.group.GroupID, executed, skipped, len(missing)-processed)
+		return
+	}
+	t.dice.Logger.Infof("日志补全完成(静默重放): 群=%s 重放=%d条 仅补日志=%d条", t.group.GroupID, executed, skipped)
+}
+
+func (t logGapFillTask) isDeniedReplayCommand(m *Message) bool {
+	if m == nil {
+		return false
+	}
+	cmd := extractCommandName(t.dice.CommandPrefix, m.Platform, m.Message)
+	if cmd == "" {
+		return false
+	}
+	for _, prefix := range t.dice.CommandPrefix {
+		if prefix != "" && strings.HasPrefix(cmd, prefix) {
+			name := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(cmd, prefix)))
+			_, denied := logGapReplayDeniedCommands[name]
+			return denied
+		}
+	}
+	return false
+}
+
+func (t logGapFillTask) logItem(m *Message) model.LogOneItem {
+	nickname := m.Sender.Nickname
+	if name := t.lookupPlayerName(m.Sender.UserID); name != "" {
+		nickname = name
+	}
+	return model.LogOneItem{
+		Nickname:  nickname,
+		IMUserID:  UserIDExtract(m.Sender.UserID),
+		UniformID: m.Sender.UserID,
+		Time:      m.Time,
+		Message:   m.Message,
+		IsDice:    false,
+		RawMsgID:  m.RawID,
+		Seq:       ptrInt64(m.Seq),
+		IsGapFill: true,
+	}
 }
 
 // backfillWithNotice 只补录日志并统计其中的指令，随后引用断层前最后一条消息汇报
@@ -1335,32 +1773,34 @@ func (t logGapFillTask) backfillWithNotice(missing []*Message) {
 
 	stats := map[string]map[string]int{}
 	nicknames := map[string]string{}
+	nameCache := map[string]string{}
 	appended := 0
 
-	for _, m := range missing {
-		item := model.LogOneItem{
-			Nickname:  m.Sender.Nickname,
-			IMUserID:  UserIDExtract(m.Sender.UserID),
-			UniformID: m.Sender.UserID,
-			Time:      m.Time,
-			Message:   m.Message,
-			IsDice:    false,
-			RawMsgID:  m.RawID,
-			Seq:       ptrInt64(m.Seq),
-		}
+	processed := t.forEachMissing(missing, func(m *Message) {
+		item := t.logItem(m)
 		if LogAppend(mctx, t.group.GroupID, t.logID, t.logName, &item) {
 			appended++
 		}
 
+		if t.isBotSender(m) {
+			return
+		}
 		cmd := extractCommandName(t.dice.CommandPrefix, m.Platform, m.Message)
 		if cmd == "" {
-			continue
+			return
 		}
 		if stats[m.Sender.UserID] == nil {
 			stats[m.Sender.UserID] = map[string]int{}
 		}
 		stats[m.Sender.UserID][cmd]++
-		nicknames[m.Sender.UserID] = m.Sender.Nickname
+		nicknames[m.Sender.UserID] = t.playerDisplayName(m.Sender.UserID, m.Sender.Nickname, nameCache)
+	})
+
+	if processed < len(missing) {
+		// 日志在补录过程中被关闭/切换：立刻停手，也不再发“已补全”通知。
+		t.dice.Logger.Warnf("日志补全中止(补录): 群=%s 日志在补录过程中被关闭或切换，已补录=%d条 剩余=%d条",
+			t.group.GroupID, appended, len(missing)-processed)
+		return
 	}
 
 	t.dice.Logger.Infof("日志补全完成(指令未执行): 群=%s 补录=%d条 涉及指令用户=%d",
@@ -1502,7 +1942,11 @@ func GetLogTxt(ctx *MsgContext, groupID string, logName string, fileNamePrefix s
 				// 写入当前批次的数据
 				for _, line := range cursorLines {
 					timeTxt := time.Unix(line.Time, 0).Format("2006-01-02 15:04:05")
-					text := fmt.Sprintf("%s(%v) %s\n%s\n\n", line.Nickname, line.IMUserID, timeTxt, line.Message)
+					marker := ""
+					if line.IsGapFill {
+						marker = "[补录] "
+					}
+					text := fmt.Sprintf("%s%s(%v) %s\n%s\n\n", marker, line.Nickname, line.IMUserID, timeTxt, line.Message)
 					if _, err = tempLog.WriteString(text); err != nil {
 						resultCh <- fmt.Errorf("写入日志导出临时文件失败: %w", err)
 						return

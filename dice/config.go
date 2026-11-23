@@ -2486,6 +2486,16 @@ func (d *Dice) loadGroups() {
 			groupInfo.BotList = new(SyncMap[string, bool])
 		}
 		groupInfo.ensureInactivatedSet()
+		// 恢复日志 seq 持久基线：否则重启后会回退到 DB MAX(seq)，
+		// 把 log off 期间的消息当成断层补录。
+		groupInfo.initLogSeqFromPersisted()
+		if groupInfo.LogOn && groupInfo.LogCurID > 0 {
+			// 重启前已经落库的消息比持久基线更新；用 DB MAX(seq) 校准，
+			// 否则会把已记录消息再次算入 gap。
+			if seq, err := service.LogGetLastSeq(d.DBOperator, groupInfo.LogCurID); err == nil && seq > 0 {
+				groupInfo.advanceLogSeq(seq, nil)
+			}
+		}
 
 		var toDelete []string
 		groupInfo.DiceIDExistsMap.Range(func(key string, _ bool) bool {

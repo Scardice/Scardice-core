@@ -381,7 +381,7 @@ func LogGetAllLines(operator engine2.DatabaseOperator, groupID string, logName s
 
 	// 查询行数据
 	err = db.Model(&model.LogOneItem{}).
-		Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id").
+		Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id, is_gap_fill").
 		Where("log_id = ?", logID).
 		Order("time ASC").
 		Find(&items).Error
@@ -429,7 +429,7 @@ func LogGetCursorLines(operator engine2.DatabaseOperator, groupID string, logNam
 	}
 	var items []model.LogOneItem
 	stmt := db.Model(&model.LogOneItem{}).
-		Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id").
+		Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id, is_gap_fill").
 		Where("log_id = ?", logID)
 	// 获取游标分页器
 	p := CreateLoggerPaginator(cursor, nil)
@@ -457,7 +457,7 @@ func LogGetExportCursorLines(operator engine2.DatabaseOperator, groupID string, 
 	}
 	var items []model.LogOneItemParquet
 	stmt := db.Model(&model.LogOneItemParquet{}).
-		Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id").
+		Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id, is_gap_fill").
 		Where("log_id = ?", logID)
 	// 获取游标分页器
 	p := CreateLoggerPaginator(cursor, nil)
@@ -478,6 +478,10 @@ type QueryLogLinePage struct {
 	PageSize int    `query:"pageSize"`
 	GroupID  string `query:"groupId"`
 	LogName  string `query:"logName"`
+	// GapFill 非空时只返回补录/非补录条目（用于日志查看器筛选）
+	GapFill *bool `query:"gapFill"`
+	// PlayerID 按玩家过滤（同时匹配 im_userid 与 user_uniform_id）
+	PlayerID string `query:"playerId"`
 }
 
 // LogGetLinePage 获取log的行分页
@@ -495,10 +499,20 @@ func LogGetLinePage(operator engine2.DatabaseOperator, param *QueryLogLinePage) 
 	var items []*model.LogOneItem
 
 	// 查询行数据
-	err = db.Model(&model.LogOneItem{}).
-		Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id").
-		Where("log_id = ?", logID).
-		Order("time ASC").
+	stmt := db.Model(&model.LogOneItem{}).
+		Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id, is_gap_fill").
+		Where("log_id = ?", logID)
+	if param.GapFill != nil {
+		if *param.GapFill {
+			stmt = stmt.Where("is_gap_fill = ?", true)
+		} else {
+			stmt = stmt.Where("(is_gap_fill = ? OR is_gap_fill IS NULL)", false)
+		}
+	}
+	if param.PlayerID != "" {
+		stmt = stmt.Where("(im_userid = ? OR user_uniform_id = ?)", param.PlayerID, param.PlayerID)
+	}
+	err = stmt.Order("time ASC").
 		Limit(param.PageSize).
 		Offset((param.PageNum - 1) * param.PageSize).
 		Scan(&items).Error
@@ -550,6 +564,30 @@ func LogGetLastSeq(operator engine2.DatabaseOperator, logID uint64) (int64, erro
 	}
 
 	return maxSeq.Int64, nil
+}
+
+// LogRawMsgIDsInSeqRange 返回指定 log 在 (fromSeq, toSeq) 区间内已记录的 raw_msg_id 集合。
+// 用于日志补全前去重：平台补发/重连时同一消息可能既走过正常事件路径，又被历史拉取到。
+func LogRawMsgIDsInSeqRange(operator engine2.DatabaseOperator, logID uint64, fromSeq, toSeq int64) (map[string]struct{}, error) {
+	result := make(map[string]struct{})
+	if logID == 0 || toSeq <= fromSeq+1 {
+		return result, nil
+	}
+	db := operator.GetLogDB(constant.READ)
+
+	var rawIDs []string
+	err := db.Model(&model.LogOneItem{}).
+		Where("log_id = ? AND seq IS NOT NULL AND raw_msg_id IS NOT NULL AND seq > ? AND seq < ?", logID, fromSeq, toSeq).
+		Pluck("raw_msg_id", &rawIDs).Error
+	if err != nil {
+		return nil, err
+	}
+	for _, rawID := range rawIDs {
+		if rawID != "" {
+			result[rawID] = struct{}{}
+		}
+	}
+	return result, nil
 }
 
 // LogDelete 删除log
@@ -663,6 +701,7 @@ func logAppendOnce(operator engine2.DatabaseOperator, groupID string, logName st
 		RawMsgID:    logItem.RawMsgID,
 		UniformID:   logItem.UniformID,
 		Seq:         logItem.Seq,
+		IsGapFill:   logItem.IsGapFill,
 	}
 	return db.Transaction(func(tx *gorm.DB) error {
 		if logID == 0 {
@@ -733,6 +772,7 @@ func logAppendByIDOnce(operator engine2.DatabaseOperator, logID uint64, groupID 
 		RawMsgID:    logItem.RawMsgID,
 		UniformID:   logItem.UniformID,
 		Seq:         logItem.Seq,
+		IsGapFill:   logItem.IsGapFill,
 	}
 
 	return db.Transaction(func(tx *gorm.DB) error {

@@ -145,3 +145,63 @@ func TestResumeWithEmptySessionIDResetsSn(t *testing.T) {
 	s.RUnlock()
 	t.Fatalf("state after empty-session resume = (seq=%d, session=%q), want (0, \"\")", seq, sessionID)
 }
+
+func TestResumeAckSessionChangeReplaysPreAckEvents(t *testing.T) {
+	s := New("token", nopLogger{})
+	conn := &websocket.Conn{}
+	s.wsConn = conn
+	s.sessionID = "sess-1"
+	atomic.StoreInt64(s.sequence, 5)
+	dispatcher := newEventDispatcher()
+	s.dispatcher = dispatcher
+	s.resumePending = true
+	s.preAck = []*queuedEvent{
+		{conn: conn, event: &Event{SequenceNumber: 2}},
+		{conn: conn, event: &Event{SequenceNumber: 1}},
+	}
+
+	s.applyResumeAckSessionID(conn, "sess-2")
+
+	if got := atomic.LoadInt64(s.sequence); got != 0 {
+		t.Fatalf("sequence = %d, want 0 after a session change", got)
+	}
+	if s.sessionID != "sess-2" {
+		t.Fatalf("session ID = %q, want sess-2", s.sessionID)
+	}
+	if s.resumePending || len(s.preAck) != 0 {
+		t.Fatal("pre-ack state was not cleared")
+	}
+	if len(dispatcher.queue) != 2 {
+		t.Fatalf("replayed %d events, want 2", len(dispatcher.queue))
+	}
+	if got := dispatcher.queue[0].event.SequenceNumber; got != 1 {
+		t.Fatalf("first replayed sn = %d, want 1", got)
+	}
+	if got := dispatcher.queue[1].event.SequenceNumber; got != 2 {
+		t.Fatalf("second replayed sn = %d, want 2", got)
+	}
+}
+
+func TestResumeAckSameSessionDropsPreAckEvents(t *testing.T) {
+	s := New("token", nopLogger{})
+	conn := &websocket.Conn{}
+	s.wsConn = conn
+	s.sessionID = "sess-1"
+	atomic.StoreInt64(s.sequence, 5)
+	dispatcher := newEventDispatcher()
+	s.dispatcher = dispatcher
+	s.resumePending = true
+	s.preAck = []*queuedEvent{{conn: conn, event: &Event{SequenceNumber: 3}}}
+
+	s.applyResumeAckSessionID(conn, "sess-1")
+
+	if got := atomic.LoadInt64(s.sequence); got != 5 {
+		t.Fatalf("sequence = %d, want 5 for a same-session ack", got)
+	}
+	if len(dispatcher.queue) != 0 {
+		t.Fatalf("replayed %d events for a same-session ack, want 0", len(dispatcher.queue))
+	}
+	if s.resumePending || len(s.preAck) != 0 {
+		t.Fatal("pre-ack state was not cleared")
+	}
+}

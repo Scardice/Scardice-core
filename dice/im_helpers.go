@@ -265,6 +265,11 @@ func SetBotOffAtGroup(ctx *MsgContext, groupID string) {
 		groupInfo.DiceIDActiveMap.Delete(ctx.EndPoint.UserID)
 		if groupInfo.DiceIDActiveMap.Len() == 0 {
 			groupInfo.SetActiveRaw(false)
+			// 群变为未激活时同时暂停日志（不结束、不上传）：静默期间的消息
+			// 不记录，.bot on 恢复后也不会被当成断层补录。
+			if groupInfo.suspendLogForBotOff() && ctx.Dice != nil && ctx.Dice.Logger != nil {
+				ctx.Dice.Logger.Infof("日志随 .bot off 暂停: 群=%s 记录=%s", groupID, groupInfo.GetLogState().Name)
+			}
 		}
 		groupInfo.MarkDirty(ctx.Dice)
 	}
@@ -283,7 +288,19 @@ func SetBotOnAtGroup(ctx *MsgContext, groupID string) *GroupInfo {
 		}
 		group.ensureInactivatedSet()
 		group.DiceIDActiveMap.Store(ctx.EndPoint.UserID, true)
+		wasActive := group.IsActiveRaw()
 		group.SetActiveRaw(true)
+		if !wasActive {
+			// .bot off → .bot on：恢复被自动暂停的日志，并标记下一条消息
+			// 只重建 seq 基线，静默段既不补录也不重放。
+			group.setLogResumeSkipGap()
+			if group.resumeLogPausedByBotOff() {
+				if ctx.Dice != nil && ctx.Dice.Logger != nil {
+					ctx.Dice.Logger.Infof("日志随 .bot on 恢复: 群=%s 记录=%s", groupID, group.GetLogState().Name)
+				}
+				group.MarkDirty(ctx.Dice)
+			}
+		}
 	} else {
 		// 设定扩展情况
 		sort.Sort(ExtDefaultSettingItemSlice(session.Parent.Config.ExtDefaultSettings))

@@ -494,6 +494,31 @@ func (pa *PlatformAdapterKook) fetchKookSelf(s *kook.Session, log *zap.SugaredLo
 	return nil, lastErr
 }
 
+// refreshKookIdentity 在 UserMe 瞬时失败时后台补齐身份。
+// 只影响 EndPoint 的 UserID/Nickname（发送记录、自我识别），不阻塞 WebSocket；
+// 会话被禁用/替换或出现鉴权错误时退出。
+func (pa *PlatformAdapterKook) refreshKookIdentity(s *kook.Session, log *zap.SugaredLogger) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !pa.isCurrentSession(s) || s.IsClosed() {
+			return
+		}
+		self, err := s.UserMe()
+		if err == nil && self != nil && self.ID != "" {
+			if pa.applyIdentityIfCurrent(s, self) {
+				log.Infof("KOOK 机器人身份补齐成功，账号<%s>(%s)", self.Nickname, FormatDiceIDKook(self.ID))
+				pa.saveState()
+			}
+			return
+		}
+		if err != nil && kook.IsPermanentAuthError(err) {
+			log.Errorf("KOOK 机器人身份补齐失败（鉴权错误）: %v", err)
+			return
+		}
+	}
+}
+
 func (pa *PlatformAdapterKook) cachedGuildAdmin(key string) (bool, bool) {
 	pa.adminCacheMu.Lock()
 	defer pa.adminCacheMu.Unlock()
@@ -653,8 +678,54 @@ func (pa *PlatformAdapterKook) updateGameStatus() {
 	}
 }
 
+// abortServeAfterPanic 清理一次 panic 的 Serve 留下的会话与状态。
+// 如果已有新会话接管（IntentSession 不是本次的 session），什么都不做，
+// 避免旧协程把新连接标记为失败。
+func (pa *PlatformAdapterKook) abortServeAfterPanic(session *kook.Session) {
+	pa.sessionMu.Lock()
+	if pa.IntentSession != session {
+		pa.sessionMu.Unlock()
+		return
+	}
+	// Serve 在创建 session 之前 panic 时传 nil；如果用户已经主动禁用
+	// （Disconnected/Enable=false），不要把状态改成“连接失败”。
+	if session == nil && pa.EndPoint != nil && !pa.EndPoint.Enable && pa.EndPoint.State == StateDisconnected {
+		pa.serving = false
+		pa.sessionMu.Unlock()
+		return
+	}
+	pa.IntentSession = nil
+	pa.serving = false
+	if pa.EndPoint != nil {
+		pa.EndPoint.Enable = false
+		pa.EndPoint.State = StateConnectionFailed
+	}
+	pa.adminCacheMu.Lock()
+	pa.adminCache = nil
+	pa.adminCacheMu.Unlock()
+	pa.guildCacheMu.Lock()
+	pa.guildCache = nil
+	pa.guildCacheMu.Unlock()
+	pa.sessionMu.Unlock()
+	if session != nil {
+		_ = session.Close()
+	}
+}
+
 func (pa *PlatformAdapterKook) Serve() int {
 	log := zap.S().Named(logger.LogKeyAdapter)
+	// 本次 Serve 自己创建的 session。panic 清理必须用它，不能用 pa.getSession()：
+	// 用户快速“禁用→启用”后，旧 Serve 的 defer 会取到新会话并把它误杀。
+	var serveSession *kook.Session
+	// SetEnable/DoRelogin 会直接调用 Serve，不经过 ServeKook 的 recover。
+	// 未预期的 panic 只能终止本次连接，不能让进程退出或让端点永久停在“连接中”。
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("KOOK 连接协程异常: %v 堆栈: %v", r, string(debug.Stack()))
+			pa.abortServeAfterPanic(serveSession)
+			pa.saveState()
+		}
+	}()
 
 	pa.sessionMu.Lock()
 	if pa.serving || pa.IntentSession != nil {
@@ -671,6 +742,7 @@ func (pa *PlatformAdapterKook) Serve() int {
 		Writer: &ConsoleWriterShutUp{},
 	}
 	s := kook.New(pa.Token, plog.NewLogger(&l))
+	serveSession = s
 	// 与当前/旧 Session 共用一把 handler 锁，禁用→启用期间旧命令不会和新命令并发。
 	s.SetHandlerLock(&pa.handlerMu)
 	pa.restoreKookResumeState(s)
@@ -713,6 +785,52 @@ func (pa *PlatformAdapterKook) Serve() int {
 		msg.Message = fmt.Sprintf("[CQ:image,file=someimage,url=%s]", ctx.Common.Content)
 		msg.Sender = *send
 		pa.EndPoint.Session.Execute(pa.EndPoint, msg, false)
+	})
+	// KOOK 客户端通常发 KMarkdown，但脚本、其他机器人或旧客户端会发纯文本(1)；
+	// 文件/语音/视频(4/8/3) 和卡片(10) 的 Content 是 URL 或 JSON。
+	// 没有这些 handler 时 SDK 解析后静默丢弃，表现为“发文件给骰子没反应”。
+	executePlain := func(common *kook.EventHandlerCommonContext, author kook.User, guildID, content string) {
+		if author.Bot || content == "" {
+			return
+		}
+		if msg := pa.kookPlainMessage(common, author, guildID, content); msg != nil {
+			pa.EndPoint.Session.Execute(pa.EndPoint, msg, false)
+		}
+	}
+	s.AddHandler(func(ctx *kook.TextMessageContext) {
+		defer pa.recoverKookEvent(log, "Text")
+		if ctx.Common == nil {
+			return
+		}
+		executePlain(ctx.EventHandlerCommonContext, ctx.Extra.Author, ctx.Extra.GuildID, ctx.Common.Content)
+	})
+	s.AddHandler(func(ctx *kook.VideoMessageContext) {
+		defer pa.recoverKookEvent(log, "Video")
+		if ctx.Common == nil {
+			return
+		}
+		executePlain(ctx.EventHandlerCommonContext, ctx.Extra.Author, ctx.Extra.GuildID, kookMediaCQCode("video", ctx.Common.Content))
+	})
+	s.AddHandler(func(ctx *kook.FileMessageContext) {
+		defer pa.recoverKookEvent(log, "File")
+		if ctx.Common == nil {
+			return
+		}
+		executePlain(ctx.EventHandlerCommonContext, ctx.Extra.Author, ctx.Extra.GuildID, kookMediaCQCode("file", ctx.Common.Content))
+	})
+	s.AddHandler(func(ctx *kook.AudioMessageContext) {
+		defer pa.recoverKookEvent(log, "Audio")
+		if ctx.Common == nil {
+			return
+		}
+		executePlain(ctx.EventHandlerCommonContext, ctx.Extra.Author, ctx.Extra.GuildID, kookMediaCQCode("record", ctx.Common.Content))
+	})
+	s.AddHandler(func(ctx *kook.EventCardMessageContext) {
+		defer pa.recoverKookEvent(log, "Card")
+		if ctx.Common == nil {
+			return
+		}
+		executePlain(ctx.EventHandlerCommonContext, ctx.Extra.Author, ctx.Extra.GuildID, ctx.Common.Content)
 	})
 	s.AddHandler(func(ctx *kook.MessageDeleteContext) {
 		defer pa.recoverKookEvent(log, "MessageDelete")
@@ -861,19 +979,27 @@ func (pa *PlatformAdapterKook) Serve() int {
 	})
 	self, err := pa.fetchKookSelf(s, log)
 	if err != nil || self == nil {
-		log.Errorf("获取KOOK账号信息失败:%v", err)
-		if !pa.clearSessionAndSetState(s, false, StateConnectionFailed) {
-			// 用户已禁用，或新的 Serve 已经接管；旧协程不能覆盖新状态。
-			_ = s.Close()
-			return 0
+		if err == nil {
+			err = errors.New("UserMe 返回空账号")
 		}
-		pa.saveState()
-		_ = s.Close()
-		// 保留 resume 文件：UserMe 失败可能是瞬时 REST 故障，
-		// 下次启用时仍可尝试 resume；真正过期时 SDK 会转新 session。
-		return 1
-	}
-	if !pa.applyIdentityIfCurrent(s, self) {
+		// 只有真正的凭据错误才让端点离线。REST 抖动/超时不影响 WebSocket，
+		// 先连接，身份由后台协程补齐（否则一次瞬时 5xx 就会把端点永久停用，
+		// 下次启动也不会再尝试连接）。
+		if kook.IsPermanentAuthError(err) {
+			log.Errorf("获取KOOK账号信息失败（鉴权错误）:%v", err)
+			pa.clearKookResumeState()
+			if !pa.clearSessionAndSetState(s, false, StateConnectionFailed) {
+				// 用户已禁用，或新的 Serve 已经接管；旧协程不能覆盖新状态。
+				_ = s.Close()
+				return 0
+			}
+			pa.saveState()
+			_ = s.Close()
+			return 1
+		}
+		log.Warnf("获取KOOK账号信息失败，先建立连接并在后台补齐身份: %v", err)
+		go pa.refreshKookIdentity(s, log)
+	} else if !pa.applyIdentityIfCurrent(s, self) {
 		// UserMe 期间用户禁用/重登，旧会话直接退出。
 		_ = s.Close()
 		return 0
@@ -1474,6 +1600,42 @@ func trimHTML(src string) string {
 	re = regexp.MustCompile(`\s{2,}`)
 	src = re.ReplaceAllString(src, "\n")
 	return strings.TrimSpace(src)
+}
+
+// kookPlainMessage builds the common envelope for message types that carry
+// their payload in Content (plain text and rich media).
+func (pa *PlatformAdapterKook) kookPlainMessage(common *kook.EventHandlerCommonContext, author kook.User, guildID, content string) *Message {
+	if common == nil || common.Common == nil {
+		return nil
+	}
+	msg := new(Message)
+	msg.Time = common.Common.MsgTimestamp
+	msg.RawID = common.Common.MsgID
+	msg.Platform = "KOOK"
+	msg.Message = content
+	send := new(SenderBase)
+	send.UserID = FormatDiceIDKook(common.Common.AuthorID)
+	send.Nickname = author.Nickname
+	send.IsRobot = author.Bot
+	if common.Common.ChannelType == "PERSON" {
+		msg.MessageType = "private"
+	} else {
+		msg.MessageType = "group"
+		msg.GroupID = FormatDiceIDKookChannel(common.Common.TargetID)
+		msg.GuildID = FormatDiceIDKookGuild(guildID)
+	}
+	msg.Sender = *send
+	return msg
+}
+
+// kookMediaCQCode renders an attachment URL as the CQ code the core and
+// extensions already understand for the matching media type.
+func kookMediaCQCode(kind, content string) string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return ""
+	}
+	return fmt.Sprintf("[CQ:%s,file=some%s,url=%s]", kind, kind, content)
 }
 
 func (pa *PlatformAdapterKook) toStdMessage(ctx *kook.KmarkdownMessageContext) *Message {

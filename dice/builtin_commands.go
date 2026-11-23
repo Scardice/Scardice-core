@@ -839,13 +839,17 @@ func (d *Dice) registerCoreCommands() {
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 
+					wasPausedLog := ctx.Group != nil && ctx.Group.isLogPausedByBotOff()
 					SetBotOnAtGroup(ctx, msg.GroupID)
 					// TODO：ServiceAtNew此处忽略是否合理？
 					ctx.Group, _ = ctx.Session.ServiceAtNew.Load(msg.GroupID)
 					ctx.IsCurGroupBotOn = true
 
 					text := DiceFormatTmpl(ctx, "核心:骰子开启")
-					if ctx.Group.GetLogState().On {
+					if wasPausedLog && ctx.Group.GetLogState().On {
+						// .bot off 时日志被自动暂停，这里刚恢复；静默段不补录。
+						text += "\n日志已随骰子恢复（暂停期间的消息不会补录）"
+					} else if ctx.Group.GetLogState().On {
 						text += "\n请特别注意: 日志记录处于开启状态"
 					}
 					ReplyToSender(ctx, msg, text)
@@ -863,7 +867,12 @@ func (d *Dice) registerCoreCommands() {
 					}
 
 					SetBotOffAtGroup(ctx, ctx.Group.GroupID)
-					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰子关闭"))
+					text := DiceFormatTmpl(ctx, "核心:骰子关闭")
+					// 群真正变为未激活时日志会被自动暂停（不结束、不上传）。
+					if state := ctx.Group.GetLogState(); !state.On && state.Name != "" {
+						text += "\n日志记录已同时暂停（未结束，.bot on 后自动恢复）"
+					}
+					ReplyToSender(ctx, msg, text)
 					return CmdExecuteResult{Matched: true, Solved: true}
 				} else if cmdArgs.IsArgEqual(1, "bye", "exit", "quit") {
 					if ctx.IsPrivate {

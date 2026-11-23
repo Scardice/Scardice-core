@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"net/url"
 	"runtime/debug"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,8 +46,7 @@ func permanentAuthStatusCode(code EventStatusCode) bool {
 	switch code {
 	case EventStatusMissingArgument,
 		EventStatusInvalidToken,
-		EventStatusTokenAuthFailed,
-		EventStatusTokenExpired:
+		EventStatusTokenAuthFailed:
 		return true
 	default:
 		return false
@@ -57,13 +58,32 @@ func permanentResumeStatusCode(code EventStatusCode) bool {
 		return true
 	}
 	switch code {
-	case EventStatusResumeFailed,
+	case EventStatusTokenExpired,
+		EventStatusResumeFailed,
 		EventStatusSessionExpired,
 		EventStatusInvalidSequenceNumber:
 		return true
 	default:
 		return false
 	}
+}
+
+// isPermanentAuthError distinguishes a HELLO 40103 (the gateway token expired;
+// the manual says reconnect, and a fresh gateway carries a new token) from a
+// REST 40103 (the bot token itself is expired; retrying cannot help).
+func isPermanentAuthError(err error) bool {
+	code, ok := eventStatusErrorCode(err)
+	if !ok {
+		return false
+	}
+	var helloErr *helloStatusError
+	if errors.As(err, &helloErr) {
+		return permanentAuthStatusCode(code)
+	}
+	if code == EventStatusTokenExpired {
+		return true
+	}
+	return permanentAuthStatusCode(code)
 }
 
 // eventStatusErrorCode 从 HELLO 或 REST 错误中提取 KOOK 状态码。
@@ -92,10 +112,7 @@ func isPermanentResumeError(err error) bool {
 
 // isPermanentAuthError 只把明确的凭据/握手错误视为不可恢复；
 // 网络抖动、网关 5xx 等仍交给指数退避处理。
-func isPermanentAuthError(err error) bool {
-	code, ok := eventStatusErrorCode(err)
-	return ok && permanentAuthStatusCode(code)
-}
+// （具体分类见 permanentAuthStatusCode；HELLO 40103 是可重连的。）
 
 // ResumeState 是进程重启后恢复 KOOK 连接所需的最小状态。
 type ResumeState struct {
@@ -247,21 +264,26 @@ func setHeartbeatTiming(ack, first, second time.Duration) {
 // 保持为 var 以便测试缩短，生产默认 15 秒。
 var gapResyncTimeout = 15 * time.Second
 
-// resumeRetryDelays 是 resume 失败后的重试间隔。文档要求前两次为 8/16 秒；
-// 之后对纯网络故障使用更长的退避继续保留 session_id/sn，
-// 等网络恢复后仍能 resume 补发离线事件，而不是过早转全新 session。
+const (
+	// wsMaxMessageBytes 限制单个 gateway 帧的大小。KOOK 事件本身很小，
+	// 上限用于防止异常网关/代理让进程无限分配内存。
+	wsMaxMessageBytes = 8 << 20
+
+	// wsMaxInflatedBytes 限制 zlib 解压后的流大小（压缩炸弹保护）。
+	wsMaxInflatedBytes = 64 << 20
+)
+
+// resumeRetryDelays 是 resume 失败后的重试间隔。KOOK 手册明确：
+// 两次 resume（间隔 8、16 秒）失败后，应回到第 1 步重新获取 Gateway。
 var resumeRetryDelays = []time.Duration{
 	8 * time.Second,
 	16 * time.Second,
-	30 * time.Second,
-	60 * time.Second,
 }
 
-// maxAmbiguousResumeAttempts 是“未收到明确永久错误”（拨号失败、握手后立即断开等）
-// 时的 resume 重试上限，超过后认为会话已不可恢复，转全新 session。
-// 服务端明确拒绝 resume（40106/40107/40108 等）不消耗该预算，立即转新 session。
-// 默认间隔下总时长约 6 分钟，与 KOOK 会话在服务端的存活时间同数量级。
-const maxAmbiguousResumeAttempts = 8
+// maxAmbiguousResumeAttempts 与手册的 8/16 秒间隔对齐：
+// 首次 resume 立即执行，失败后 8s、16s 各重试一次，共 3 次。
+// 网络类错误也走这个预算，避免旧 session 已失效时在它上面耗数分钟。
+const maxAmbiguousResumeAttempts = 3
 
 // Open starts a websocket connection. It does not block the function.
 // 如果当前仍持有可 resume 的 session（例如正处于自动重连退避期），
@@ -351,13 +373,13 @@ func (s *Session) open(resetClosed bool, resume bool) (err error) {
 		gateway = resumeURL
 	}
 
-	addCaller(s.Logger.Info()).Str("gateway_url", gateway).Msg("connecting to gateway")
+	addCaller(s.Logger.Info()).Str("gateway_url", redactGatewayURL(gateway)).Msg("connecting to gateway")
 	dialer := *websocket.DefaultDialer
 	dialer.HandshakeTimeout = 15 * time.Second
 	wsConn, _, err := dialer.Dial(gateway, http.Header{})
 	if err != nil {
 		addCaller(s.Logger.Error()).
-			Str("gateway_url", gateway).
+			Str("gateway_url", redactGatewayURL(gateway)).
 			Err("err", err).
 			Msg("error connecting to gateway")
 		s.Lock()
@@ -370,6 +392,7 @@ func (s *Session) open(resetClosed bool, resume bool) (err error) {
 	wsConn.SetCloseHandler(func(code int, text string) error {
 		return nil
 	})
+	wsConn.SetReadLimit(wsMaxMessageBytes)
 
 	// KOOK 要求 6 秒内收到 hello，否则视为握手超时。
 	_ = wsConn.SetReadDeadline(time.Now().Add(6 * time.Second))
@@ -481,6 +504,11 @@ func (s *Session) open(resetClosed bool, resume bool) (err error) {
 	if h.SessionID != "" {
 		s.sessionID = h.SessionID
 	}
+	// Capture events that arrive before the RESUME ACK only when this
+	// connection is expected to continue an existing session. A brand-new
+	// session accepts its restarting sequence normally.
+	s.resumePending = resume && !newSession
+	s.preAck = nil
 	// 首个 PONG 必须真实到达；不能用建连时间伪装成 ACK。
 	s.LastHeartbeatAck = time.Time{}
 	dispatcher := s.dispatcher
@@ -537,17 +565,23 @@ func (s *Session) onEvent(wsConn *websocket.Conn, messageType int, message []byt
 	if messageType == websocket.BinaryMessage {
 		z, err2 := zlib.NewReader(reader)
 		if err2 != nil {
-			addCaller(s.Logger.Error()).Err("err", err2).Msg("error decompressing websocket message")
-			return nil, err2
-		}
-		defer func() {
-			err3 := z.Close()
-			if err3 != nil {
-				addCaller(s.Logger.Warn()).Err("err", err3).Msg("error closing zlib")
-			}
-		}()
+			// compress=1 时服务端消息是 zlib 流，但有部署/代理会忽略 compress
+			// 参数，直接在 binary 帧里发未压缩 JSON。此时按原始帧解析，
+			// 不能把连接判死并反复重连。
+			addCaller(s.Logger.Debug()).Err("err", err2).
+				Msg("binary frame is not zlib, decoding as plain JSON")
+			reader = bytes.NewBuffer(message)
+		} else {
+			defer func() {
+				err3 := z.Close()
+				if err3 != nil {
+					addCaller(s.Logger.Warn()).Err("err", err3).Msg("error closing zlib")
+				}
+			}()
 
-		reader = z
+			// 帧大小已由 SetReadLimit 限制；zlib 可放大数量级，解压流也要设上限。
+			reader = io.LimitReader(z, wsMaxInflatedBytes)
+		}
 	}
 
 	jsonDecoder := json.NewDecoder(reader)
@@ -653,6 +687,24 @@ func (s *Session) onEvent(wsConn *websocket.Conn, messageType int, message []byt
 	s.RUnlock()
 	if !current || dispatcher == nil {
 		return nil, nil
+	}
+
+	// While a resume is in flight, an event at or below the processed sn may be
+	// the new session's offline message replayed before its RESUME ACK. Keep a
+	// bounded copy instead of letting the dispatcher drop it as a duplicate.
+	if sn := e.SequenceNumber; sn > 0 {
+		s.RLock()
+		resuming := s.resumePending
+		seq := atomic.LoadInt64(s.sequence)
+		s.RUnlock()
+		if resuming && sn <= seq {
+			s.Lock()
+			if s.resumePending && sn <= atomic.LoadInt64(s.sequence) && len(s.preAck) < maxPreAckEvents {
+				s.preAck = append(s.preAck, &queuedEvent{conn: wsConn, epoch: epoch, event: e, data: data})
+			}
+			s.Unlock()
+			return nil, nil
+		}
 	}
 
 	q := &queuedEvent{conn: wsConn, epoch: epoch, event: e, data: data}
@@ -1053,6 +1105,8 @@ func (s *Session) resetSessionState(clearGateway bool) {
 	}
 	s.sessionID = ""
 	atomic.StoreInt64(s.sequence, 0)
+	s.resumePending = false
+	s.preAck = nil
 	resetEpoch := s.sessionEpoch.Add(1)
 	s.Unlock()
 
@@ -1123,10 +1177,13 @@ func extractEventSequence(messageType int, message []byte) (int64, bool) {
 	if messageType == websocket.BinaryMessage {
 		z, err := zlib.NewReader(reader)
 		if err != nil {
-			return 0, false
+			// 与 onEvent 保持一致：有部署/代理会在 binary 帧里直接发未压缩 JSON。
+			// 这里若直接放弃，一个坏帧就会触发一次不必要的重连。
+			reader = bytes.NewBuffer(message)
+		} else {
+			defer func() { _ = z.Close() }()
+			reader = io.LimitReader(z, wsMaxInflatedBytes)
 		}
-		defer func() { _ = z.Close() }()
-		reader = z
 	}
 	var probe struct {
 		Signal interface{} `json:"s"`
@@ -1177,6 +1234,12 @@ func (s *Session) sendResumeSignal(wsConn *websocket.Conn, sn int64) error {
 	if !s.connectionCurrent(wsConn) {
 		return errors.New("resume signal connection is unavailable")
 	}
+	s.Lock()
+	// The server may replay offline messages before the RESUME ACK; keep the
+	// duplicates so a session switch can restore them.
+	s.resumePending = true
+	s.preAck = nil
+	s.Unlock()
 	s.wsMutex.Lock()
 	_ = wsConn.SetWriteDeadline(time.Now().Add(heartbeatWriteTTL))
 	err := wsConn.WriteJSON(resumeSignal{
@@ -1354,22 +1417,72 @@ func (s *Session) connectionCurrent(wsConn *websocket.Conn) bool {
 
 // applyResumeAckSessionID 应用 s=6 RESUME ACK 携带的 session_id。
 // 只在当前连接上生效，避免旧连接的迟到 ACK 覆盖新会话。
+//
+// 如果 ACK 报告的是另一个 session，sn 可能从 1 重新开始。此时必须把
+// sequence 归零，否则新 session 的每条事件都会被当成旧重复丢弃（表现为
+// 在线但不回复）；ACK 之前已经收到、因 sn 回退被暂存的事件按 sn 补放。
 func (s *Session) applyResumeAckSessionID(wsConn *websocket.Conn, sessionID string) {
-	if wsConn == nil || sessionID == "" {
+	if wsConn == nil {
 		return
 	}
 	s.Lock()
-	defer s.Unlock()
 	if s.wsConn != wsConn {
+		s.Unlock()
 		return
 	}
-	if s.sessionID != "" && s.sessionID != sessionID {
-		addCaller(s.Logger.Warn()).
-			Str("old_session_id", s.sessionID).
-			Str("new_session_id", sessionID).
-			Msg("resume ack changed session_id")
+	changed := sessionID != "" && s.sessionID != "" && s.sessionID != sessionID
+	if sessionID != "" {
+		s.sessionID = sessionID
 	}
-	s.sessionID = sessionID
+	s.resumePending = false
+	buffered := s.preAck
+	s.preAck = nil
+	dispatcher := s.dispatcher
+	var newEpoch uint64
+	if changed {
+		atomic.StoreInt64(s.sequence, 0)
+		// 旧 session 的 handler 可能仍在执行。必须推进 epoch，否则它结束时
+		// finishEvent 会把 sequence 写回旧的高 sn，补放的事件又会被当重复丢弃
+		// （K-B 修复在这种时序下失效，表现为换 session 后仍然不回复）。
+		newEpoch = s.sessionEpoch.Add(1)
+	}
+	s.Unlock()
+
+	if !changed {
+		return
+	}
+
+	s.eventMu.Lock()
+	if s.sessionEpoch.Load() == newEpoch {
+		s.inFlight = make(map[int64]struct{})
+	}
+	s.eventMu.Unlock()
+
+	if dispatcher != nil && len(buffered) > 0 {
+		valid := make([]*queuedEvent, 0, len(buffered))
+		for _, q := range buffered {
+			if q == nil || q.event == nil || q.conn != wsConn {
+				continue
+			}
+			// 这些事件是在旧 epoch 下暂存的，按新 session 的 epoch 补放。
+			q.epoch = newEpoch
+			valid = append(valid, q)
+		}
+		sort.SliceStable(valid, func(i, j int) bool {
+			return valid[i].event.SequenceNumber < valid[j].event.SequenceNumber
+		})
+		for _, q := range valid {
+			if !dispatcher.push(q) {
+				addCaller(s.Logger.Error()).Int64("seq", q.event.SequenceNumber).
+					Msg("event queue is full or closed, dropping replayed pre-ack event")
+			}
+		}
+	}
+	if changed {
+		addCaller(s.Logger.Warn()).
+			Str("new_session_id", sessionID).
+			Msg("resume ack changed session_id, reset sn and replay pre-ack events")
+	}
 }
 
 func (s *Session) waitListening(d time.Duration, listening <-chan interface{}) bool {
@@ -1601,10 +1714,28 @@ func (s *Session) isClosed() bool {
 }
 
 // gatewayURL 返回当前 gateway 的快照，避免日志读取与 open/flush 写入并发。
+// 只用于日志，因此去掉带 token 的查询串。
 func (s *Session) gatewayURL() string {
 	s.RLock()
 	defer s.RUnlock()
-	return s.gateway
+	return redactGatewayURL(s.gateway)
+}
+
+// redactGatewayURL 去掉 gateway URL 的查询串。KOOK 下发的地址形如
+// wss://host/gateway?compress=1&token=...，token 属于凭据，不能原样写日志。
+func redactGatewayURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return "invalid-gateway-url"
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	parsed.User = nil
+	return parsed.String()
 }
 
 // closeConn 只关闭当前底层连接，不设置用户关闭标记，供自动重连路径使用。

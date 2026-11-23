@@ -306,6 +306,13 @@ type Session struct {
 	sessionEpoch atomic.Uint64
 	dispatcher   *eventDispatcher
 
+	// resumePending is true while a resume is in flight (s=4 or a resume
+	// handshake). Events with sn <= sequence are kept in preAck: a live
+	// session switch may restart the sequence before its RESUME ACK arrives,
+	// and those events would otherwise be dropped as duplicates forever.
+	resumePending bool
+	preAck        []*queuedEvent
+
 	// eventMu 保护 inFlight。
 	eventMu  sync.Mutex
 	inFlight map[int64]struct{}

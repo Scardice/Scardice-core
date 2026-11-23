@@ -235,6 +235,7 @@ func serverOfficialQQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterOfficialQQ
 	d.LastUpdatedTime = time.Now().Unix()
 	d.Save(false)
 	waitTimes := 0
+	backoff := 15 * time.Second
 
 	for {
 		if !conn.serveLoopCurrent(epoch, stop) {
@@ -243,27 +244,37 @@ func serverOfficialQQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterOfficialQQ
 			return
 		}
 		// 骰子开始连接
-		d.Logger.Infof("开始连接 official qq，帐号 <%s>(%s)，重试计数[%d/%d]", ep.Nickname, ep.UserID, waitTimes, 5)
+		d.Logger.Infof("开始连接 official qq，帐号 <%s>(%s)，重试计数[%d]", ep.Nickname, ep.UserID, waitTimes)
 		ret := ep.Adapter.Serve()
 
 		if ret == 0 {
 			return
 		}
 
-		waitTimes += 1
-		if waitTimes > 5 {
-			d.Logger.Infof("official qq 连接重试次数过多，先行中断: <%s>(%s)", ep.Nickname, ep.UserID)
+		if !conn.serveLoopCurrent(epoch, stop) {
 			conn.setDiceServingIfEpoch(false, epoch)
-			// 没有新会话接管时，把端点明确回置为失败，避免 UI 显示“已启用但连不上”。
-			conn.setEndpointStateIfIdle(false, StateConnectionFailed)
+			return
+		}
+		// 永久失败（Webhook 配置非法、UIN 冲突、账号重复等）由 failConnect 置
+		// Enable=false；用户禁用也会置 false。两种情况都停止重试，不改写用户状态。
+		// Enable 由适配器的 sessionMu 保护，这里必须走加锁快照；直接读 ep.Enable
+		// 会与 SetEnable/failConnect 并发构成数据竞争。
+		if enabled, _ := conn.endpointStateSnapshot(); !enabled {
+			conn.setDiceServingIfEpoch(false, epoch)
 			d.LastUpdatedTime = time.Now().Unix()
 			d.Save(false)
 			return
 		}
 
-		if !waitOfficialQQRetry(stop, 15*time.Second) {
+		waitTimes++
+		d.Logger.Warnf("official qq 连接失败，%s 后重试: 帐号 <%s>(%s)", backoff, ep.Nickname, ep.UserID)
+		if !waitOfficialQQRetry(stop, backoff) {
 			conn.setDiceServingIfEpoch(false, epoch)
 			return
+		}
+		backoff *= 2
+		if backoff > 5*time.Minute {
+			backoff = 5 * time.Minute
 		}
 	}
 }

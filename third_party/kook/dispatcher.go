@@ -21,6 +21,10 @@ type queuedEvent struct {
 
 const maxQueuedEvents = 4096
 
+// maxPreAckEvents bounds the events kept while a resume is in flight. They are
+// only replayed if the RESUME ACK switches to a different session.
+const maxPreAckEvents = 1024
+
 // eventDispatcher 是每连接一个的无界（有上限）事件队列。
 // 读循环只负责收包和解析头部，handler 在独立协程执行，保证 PONG 不会被慢 handler 堵住。
 type eventDispatcher struct {

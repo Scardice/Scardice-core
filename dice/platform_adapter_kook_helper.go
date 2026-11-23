@@ -32,7 +32,9 @@ func ServeKook(d *Dice, ep *EndPointInfo) {
 		log.Infof("KOOK 尝试连接")
 		if conn.Serve() != 0 {
 			log.Errorf("连接KOOK服务失败")
-			ep.State = 3
+			// Serve 已写入精确状态（失败/禁用/被重登接管）；这里只在端点仍空闲时兜底，
+			// 不能覆盖并发启动的新会话状态。
+			conn.setEndpointStateIfIdle(false, StateConnectionFailed)
 			d.LastUpdatedTime = time.Now().Unix()
 			d.Save(false)
 		}

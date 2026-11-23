@@ -132,6 +132,7 @@ type OnebotUserInfo struct {
 
 type MessageQQBase struct {
 	MessageID     int64           `json:"message_id"`   // QQ信息此类型为int64，频道中为string
+	MessageSeq    int64           `json:"message_seq"`  // 群内消息序号，部分实现不提供；用于日志断层补全
 	MessageType   string          `json:"message_type"` // Group
 	Sender        *Sender         `json:"sender"`       // 发送者
 	RawMessage    string          `json:"raw_message"`
@@ -242,6 +243,7 @@ func (msgQQ *MessageQQ) toStdMessage() *Message {
 	msg.Message = strings.ReplaceAll(msg.Message, "&#93;", "]")
 	msg.Message = strings.ReplaceAll(msg.Message, "&amp;", "&")
 	msg.RawID = msgQQ.MessageID
+	msg.Seq = msgQQ.MessageSeq
 	msg.Platform = "QQ"
 
 	if msg.MessageType == "" {

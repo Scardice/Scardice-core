@@ -14,12 +14,12 @@ var (
 	// VERSION_MAIN 主版本号
 	VERSION_MAIN = "1.6.1"
 	// VERSION_PRERELEASE 先行版本号
-	VERSION_PRERELEASE = "-dev"
+	VERSION_PRERELEASE = "-qianqian"
 	// VERSION_BUILD_METADATA 版本编译信息
-	VERSION_BUILD_METADATA = ""
+	VERSION_BUILD_METADATA = "+20261113fix4"
 
 	// APP_CHANNEL 更新频道，stable/dev，在 action 构建时自动注入
-	APP_CHANNEL = "dev" //nolint:revive
+	APP_CHANNEL = "stable" //nolint:revive
 
 	VERSION_CODE = int64(1006001) //nolint:revive
 
