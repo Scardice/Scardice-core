@@ -31,6 +31,7 @@ var DefaultConfig = Config{
 		OfficialQQMigrationEnable: true, // 余烬旧版会自动迁移身份数据，升级后保持同样行为
 		TextCmdTrustOnly:          true,
 		IgnoreUnaddressedBotCmd:   false,
+		LogGapFillEnable:          true,
 		UILogLimit:                0,
 		FriendAddComment:          "",
 		CustomReplyConfigEnable:   false,

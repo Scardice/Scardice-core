@@ -781,6 +781,17 @@ func (g *GroupInfo) cancelLogGapFill() {
 	g.logEpoch.Add(1)
 }
 
+// clearPendingLogGapTask 清除内存里尚未被 worker 取走的补全任务。
+// 调用方必须确保当前不允许补全，否则任务会被直接丢弃。
+func (g *GroupInfo) clearPendingLogGapTask() {
+	if g == nil {
+		return
+	}
+	g.logGapQueueMu.Lock()
+	g.logGapPending = nil
+	g.logGapQueueMu.Unlock()
+}
+
 // deferLogGapRetry 在补全拉取失败后设置退避，避免每条新消息都重新发起一次
 // 最长 60s 的历史拉取。退避只影响 pending floor，已合并的任务仍会继续执行。
 func (g *GroupInfo) deferLogGapRetry(delay time.Duration) {

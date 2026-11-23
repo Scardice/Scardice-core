@@ -163,6 +163,7 @@ type BaseConfig struct {
 	OfficialQQMigrationEnable bool       `json:"officialQQEnableIdentityMigration" yaml:"officialQQEnableIdentityMigration"` // 启动 QQ 官方旧身份数据迁移
 	TextCmdTrustOnly          bool       `json:"textCmdTrustOnly"        yaml:"textCmdTrustOnly"`                            // 只允许信任用户或master使用text指令
 	IgnoreUnaddressedBotCmd   bool       `json:"ignoreUnaddressedBotCmd" yaml:"ignoreUnaddressedBotCmd"`                     // 不响应群聊裸bot指令
+	LogGapFillEnable          bool       `json:"logGapFillEnable"        yaml:"logGapFillEnable"`                            // 自动补全群消息 log（离线/漏记缺口）
 	UILogLimit                int64      `json:"-"                       yaml:"UILogLimit"`
 	FriendAddComment          string     `json:"friendAddComment"        yaml:"friendAddComment"` // 加好友验证信息
 	CustomReplyConfigEnable   bool       `json:"customReplyConfigEnable" yaml:"customReplyConfigEnable"`
