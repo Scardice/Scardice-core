@@ -221,7 +221,8 @@ func formatEnabledEndpoints(endpoints []*dice.EndPointInfo) (enabled int, total 
 	total = len(endpoints)
 	list := make([]string, 0, total)
 	for _, ep := range endpoints {
-		if !ep.Enable {
+		// 配置损坏/旧数据可能留下 nil 端点；启动日志不能因此 panic。
+		if ep == nil || !ep.Enable {
 			continue
 		}
 		platform := ep.Platform

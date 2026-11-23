@@ -108,7 +108,8 @@ func parseLogHistoryTimestamp(raw string) (float64, error) {
 		return 0, nil
 	}
 	value, err := strconv.ParseFloat(raw, 64)
-	if err != nil || value < 0 {
+	// ParseFloat 接受 NaN/Inf；它们会让筛选比较全部失效，必须拒绝。
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 		return 0, errors.New("时间戳参数无效")
 	}
 	return value, nil

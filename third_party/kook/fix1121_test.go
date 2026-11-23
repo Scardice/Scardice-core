@@ -2,6 +2,7 @@ package kook
 
 import (
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -87,6 +88,39 @@ func TestResumeAckTimeoutRequiresNoProgress_1121fix1(t *testing.T) {
 		if got := s.noteResumeAckTimeout(); got != want {
 			t.Fatalf("progress timeout %d = %v, want %v", i, got, want)
 		}
+	}
+}
+
+// TestDispatcherPanicClosesDispatcher_1123hotfix 锁定：分发协程 panic 后不能
+// 留下“心跳正常但不再消费事件”的僵尸连接；dispatcher 必须关闭，后续 push
+// 失败会触发 resync。
+func TestDispatcherPanicClosesDispatcher_1123hotfix(t *testing.T) {
+	s := New("token", nopLogger{})
+	conn := &websocket.Conn{}
+	s.Lock()
+	s.closed = true // 阻止 requestResync 启动真实重连
+	s.wsConn = conn
+	s.Unlock()
+
+	d := newEventDispatcher()
+	d.push(&queuedEvent{conn: conn, event: nil}) // 解引用 q.event 触发 panic
+
+	done := make(chan struct{})
+	go func() {
+		s.dispatchEvents(d)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatchEvents did not return after panic")
+	}
+
+	d.mu.Lock()
+	closed := d.closed
+	d.mu.Unlock()
+	if !closed {
+		t.Fatal("dispatcher must be closed after dispatch panic")
 	}
 }
 
