@@ -143,18 +143,16 @@ func (l *UIWriter) append(item *LogItem) {
 		}
 	}
 
-	subs := make([]chan *LogItem, 0, len(l.subscribed))
+	// 订阅者发送必须在锁内完成：Unsubscribe 也是在锁内 close(ch)，
+	// 若先解锁再发送，SSE 客户端断开时可能撞上已关闭的 channel，
+	// 触发 send on closed channel panic。发送是非阻塞的，不会拖慢日志写入。
 	for _, ch := range l.subscribed {
-		subs = append(subs, ch)
-	}
-	l.mu.Unlock()
-
-	for _, ch := range subs {
 		select {
 		case ch <- item:
 		default:
 		}
 	}
+	l.mu.Unlock()
 }
 
 func (l *UIWriter) SetLogLimit(limit int) {

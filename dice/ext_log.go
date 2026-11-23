@@ -4257,6 +4257,12 @@ func (t logGapFillTask) cleanupRowsAfterHistoricalOff(hist logGapLifecycleInfo) 
 		}
 		return 0
 	}
+	// 与 .log on/new/off/.bot on 串行化：这些操作持 logWriteMu 写锁并推进 epoch。
+	// 只做无锁复查的话，复查通过后用户 .log on 打开新段，紧接着的 DELETE
+	// 会把新段里 seq > lastOffSeq 的合法行删掉。
+	t.group.logWriteMu.RLock()
+	defer t.group.logWriteMu.RUnlock()
+
 	state := t.group.GetLogState()
 	if state.On || state.ID != t.logID || state.Name != t.logName {
 		return 0
