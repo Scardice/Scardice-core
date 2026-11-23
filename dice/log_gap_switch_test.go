@@ -1,5 +1,7 @@
 package dice
 
+// CI 触发：子模块指针补全后重跑 Test & Lint。
+
 import (
 	"testing"
 
