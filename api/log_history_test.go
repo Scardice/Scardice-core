@@ -94,6 +94,28 @@ func TestLogHistoryRejectsUnauthorized(t *testing.T) {
 	}
 }
 
+func TestLogHistoryRejectsNonFiniteTimestamps(t *testing.T) {
+	previousDice := myDice
+	t.Cleanup(func() { myDice = previousDice })
+	manager := &dice.DiceManager{}
+	manager.AccessTokens.Store("bad-ts-token", true)
+	myDice = &dice.Dice{Parent: manager, LogWriter: logger.NewUIWriter()}
+	manager.Dice = []*dice.Dice{myDice}
+
+	for _, raw := range []string{"NaN", "Inf", "-Inf"} {
+		e := echo.New()
+		request := httptest.NewRequest(http.MethodGet, "/sd-api/log/history?startTs="+raw, nil)
+		request.Header.Set("Token", "bad-ts-token")
+		recorder := httptest.NewRecorder()
+		if err := logHistory(e.NewContext(request, recorder)); err != nil {
+			t.Fatalf("call log history %s: %v", raw, err)
+		}
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("startTs=%s status = %d, want 400", raw, recorder.Code)
+		}
+	}
+}
+
 func callLogHistory(t *testing.T, target, token string) logHistoryResponse {
 	t.Helper()
 	e := echo.New()

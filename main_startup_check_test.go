@@ -35,11 +35,12 @@ func TestFormatEnabledEndpoints(t *testing.T) {
 		{EndPointInfoBase: dice.EndPointInfoBase{Platform: "KOOK", UserID: "kook-1", Enable: true}},
 		{EndPointInfoBase: dice.EndPointInfoBase{Platform: "DISCORD", Nickname: "未启用", Enable: false}},
 		{EndPointInfoBase: dice.EndPointInfoBase{Enable: true}},
+		nil, // 损坏配置/旧数据：启动日志必须跳过而不是 panic
 	}
 
 	enabled, total, labels := formatEnabledEndpoints(endpoints)
-	if enabled != 3 || total != 4 {
-		t.Fatalf("账号统计 = %d/%d, want 3/4", enabled, total)
+	if enabled != 3 || total != 5 {
+		t.Fatalf("账号统计 = %d/%d, want 3/5", enabled, total)
 	}
 	want := "QQ/official <千千>、KOOK <kook-1>、未知平台 <未知账号>"
 	if labels != want {

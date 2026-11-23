@@ -834,11 +834,20 @@ func (s *Session) handleEventNow(e *Event, data *EventData, epoch uint64) {
 func (s *Session) dispatchEvents(dispatcher *eventDispatcher) {
 	defer close(dispatcher.done)
 	// handler 自身有 recover，但 sn 排序/缓冲/epoch 代码没有；一个意外
-	// panic 不能带走整个进程。这里只记录，连接由心跳/下次事件自然恢复。
+	// panic 不能带走整个进程，也不能留下“心跳正常但不分发事件”的僵尸连接。
+	// 关闭 dispatcher 让后续 push 失败，并强制当前连接 resync；安静群里
+	// 没有新事件时也能靠重连恢复。
 	defer func() {
 		if r := recover(); r != nil {
 			addCaller(s.Logger.Error()).Str("panic", fmt.Sprint(r)).
 				Str("stack", string(debug.Stack())).Msg("event dispatcher panic")
+			dispatcher.close()
+			s.RLock()
+			conn := s.wsConn
+			s.RUnlock()
+			if conn != nil {
+				s.requestResync(conn, "event dispatcher panic")
+			}
 		}
 	}()
 	pending := make(map[int64]*queuedEvent)
@@ -2057,13 +2066,15 @@ func (s *Session) closeDetached(conn *websocket.Conn, listening chan interface{}
 	if conn == nil {
 		return nil
 	}
-	// 测试中可能存在没有底层 net.Conn 的零值 websocket.Conn；避免 WriteMessage panic。
-	if conn.UnderlyingConn() != nil {
-		s.wsMutex.Lock()
-		_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(code, ""))
-		s.wsMutex.Unlock()
+	// 测试中可能存在没有底层 net.Conn 的零值 websocket.Conn；WriteMessage 和
+	// Close 都会 panic，测试/异常路径直接跳过。
+	if conn.UnderlyingConn() == nil {
+		return nil
 	}
+	s.wsMutex.Lock()
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(code, ""))
+	s.wsMutex.Unlock()
 	return conn.Close()
 }
 
