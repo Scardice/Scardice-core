@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"Scardice-core/dice/service"
 	"Scardice-core/model"
@@ -139,4 +140,55 @@ func TestHistoricalOffEmptyMissingStillNotifies_1123(t *testing.T) {
 		t.Fatalf("closed-state notice missing, got %#v", msgsOut)
 	}
 	g.logGapWorkerRunning = false
+}
+
+// TestHistoricalOffCleanupWaitsForLogWriteLock_1123 锁定清理与 .log on 的串行化：
+// cleanup 必须在 logWriteMu 读锁内复查状态并删除；持有写锁时 cleanup 必须等待，
+// 不能先删行再让 .log on 打开新段。
+func TestHistoricalOffCleanupWaitsForLogWriteLock_1123(t *testing.T) {
+	const groupID = "QQ-Group:1123-cleanup-lock"
+	const senderID = "QQ:1123-user"
+	fetcher := &scriptedHistoryFetcher{}
+	d, _, g, _, logID, cleanup := newFix6LogGapEnv(t, groupID, senderID, fetcher)
+	defer cleanup()
+
+	const logName = "run-a"
+	g.SetLogState(logID, logName, false)
+	appendLiveLogRow_1123(t, d, logID, groupID, 1077, 1026, "new segment row")
+
+	task := logGapFillTask{
+		dice:    d,
+		group:   g,
+		logID:   logID,
+		logName: logName,
+		epoch:   g.logEpoch.Load(),
+	}
+	hist := logGapLifecycleInfo{found: true, lastOffSeq: 1061, lastOffTime: 1010}
+
+	g.logWriteMu.Lock()
+	done := make(chan int64, 1)
+	go func() {
+		done <- task.cleanupRowsAfterHistoricalOff(hist)
+	}()
+
+	select {
+	case removed := <-done:
+		g.logWriteMu.Unlock()
+		t.Fatalf("cleanup returned %d while logWriteMu was held; it must wait", removed)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	g.logWriteMu.Unlock()
+
+	select {
+	case removed := <-done:
+		if removed != 1 {
+			t.Fatalf("removed = %d, want 1", removed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup did not finish after logWriteMu was released")
+	}
+	if got := countFix5LogRows(t, d, logID, 1077, 1077); got != 0 {
+		t.Fatalf("row after off = %d, want 0", got)
+	}
 }
