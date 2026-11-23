@@ -3,8 +3,8 @@ package dice
 
 import (
 	"context"
-	"fmt"
 	"sort"
+	"strconv"
 	"testing"
 
 	"Scardice-core/model"
@@ -20,7 +20,7 @@ type snowLumaHistoryStore struct {
 func newSnowLumaHistoryStore(from, to int64) *snowLumaHistoryStore {
 	s := &snowLumaHistoryStore{ids: map[int64]int64{}}
 	for seq := from; seq <= to; seq++ {
-		m := &Message{Seq: seq, RawID: fmt.Sprintf("%d", 100000+seq)}
+		m := &Message{Seq: seq, RawID: strconv.FormatInt(100000+seq, 10)}
 		s.msgs = append(s.msgs, m)
 		s.ids[seq] = 100000 + seq
 	}
@@ -64,8 +64,8 @@ func TestOnebotRangeMessageIDKeepsFirstMissing_1119(t *testing.T) {
 	req := HistoryRangeRequest{
 		FromSeq:   1050,
 		ToSeq:     1081,
-		ToRawID:   fmt.Sprintf("%d", store.ids[1081]),
-		FromRawID: fmt.Sprintf("%d", store.ids[1050]),
+		ToRawID:   strconv.FormatInt(store.ids[1081], 10),
+		FromRawID: strconv.FormatInt(store.ids[1050], 10),
 	}
 	msgs, complete, _, err := fetchOnebotRangeByMessageID(context.Background(), req, store.fetch)
 	if err != nil {
@@ -87,7 +87,7 @@ func TestOnebotRangeMessageIDPagesLargeGap_1119(t *testing.T) {
 	req := HistoryRangeRequest{
 		FromSeq: 100,
 		ToSeq:   501,
-		ToRawID: fmt.Sprintf("%d", store.ids[501]),
+		ToRawID: strconv.FormatInt(store.ids[501], 10),
 	}
 	msgs, complete, _, err := fetchOnebotRangeByMessageID(context.Background(), req, store.fetch)
 	if err != nil {

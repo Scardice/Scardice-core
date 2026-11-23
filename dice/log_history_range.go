@@ -190,7 +190,7 @@ func fetchHistoryBySeqBackward(
 	reachedStart := false
 	boundary := false
 
-	for page := 0; page < logHistoryRangeMaxPages; page++ {
+	for page := range logHistoryRangeMaxPages {
 		if err := ctx.Err(); err != nil {
 			return historyRangeFilter(collected, fromSeq, toSeq), false, false, err
 		}
@@ -331,7 +331,7 @@ func fetchOnebotRangeByMessageID(
 	reachedStart := false
 	boundary := false
 
-	for page := 0; page < logHistoryRangeMaxPages; page++ {
+	for page := range logHistoryRangeMaxPages {
 		if err := ctx.Err(); err != nil {
 			return historyRangeFilter(collected, req.FromSeq, req.ToSeq), false, false, err
 		}

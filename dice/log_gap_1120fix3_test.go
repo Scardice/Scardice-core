@@ -72,7 +72,7 @@ func groupMsgsOf(ep *EndPointInfo) []string {
 	case *scriptedRangeAdapter:
 		mock = a.mockPlatformAdapter
 	case *offReconcileAdapter:
-		mock = a.scriptedRangeAdapter.mockPlatformAdapter
+		mock = a.mockPlatformAdapter
 	}
 	if mock == nil {
 		return nil

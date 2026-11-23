@@ -15,9 +15,9 @@ func TestUIWriterUnsubscribeDuringAppend(t *testing.T) {
 	)
 
 	w := NewUIWriter()
-	for i := 0; i < iterations; i++ {
+	for range iterations {
 		ids := make([]int64, 0, subsPerRun)
-		for j := 0; j < subsPerRun; j++ {
+		for range subsPerRun {
 			id, _, _ := w.Subscribe(1)
 			ids = append(ids, id)
 		}
