@@ -2507,7 +2507,7 @@ func (pa *PlatformAdapterOfficialQQ) shutdownWebhookServerFor(ctx context.Contex
 }
 
 func (pa *PlatformAdapterOfficialQQ) shutdownWebhookServer() {
-	pa.shutdownWebhookServerFor(nil)
+	pa.shutdownWebhookServerFor(nil) //nolint:staticcheck // nil 是“强制关闭”的哨兵值，不能替换为 context.TODO()
 }
 
 // DoRelogin 请求后台重连。返回值表示“重登循环已受理”，不代表已经连接成功：

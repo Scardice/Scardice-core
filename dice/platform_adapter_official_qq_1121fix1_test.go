@@ -34,7 +34,7 @@ func TestOfficialQQReadyTimeoutFailsAfterLimit_1121fix1(t *testing.T) {
 	ep := &EndPointInfo{EndPointInfoBase: EndPointInfoBase{Enable: true, State: StateConnecting}}
 	pa := &PlatformAdapterOfficialQQ{EndPoint: ep}
 
-	for i := 0; i < maxOfficialQQReadyTimeouts; i++ {
+	for i := range maxOfficialQQReadyTimeouts {
 		ctx, cancel := context.WithCancel(context.Background())
 		if !pa.beginSession(ctx, cancel) {
 			t.Fatalf("beginSession failed at %d", i)

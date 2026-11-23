@@ -98,7 +98,7 @@ func callLogHistory(t *testing.T, target, token string) logHistoryResponse {
 	t.Helper()
 	e := echo.New()
 	request := httptest.NewRequest(http.MethodGet, target, nil)
-	request.Header.Set("token", token)
+	request.Header.Set("Token", token)
 	recorder := httptest.NewRecorder()
 	if err := logHistory(e.NewContext(request, recorder)); err != nil {
 		t.Fatalf("call log history %s: %v", target, err)

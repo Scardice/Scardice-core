@@ -2426,7 +2426,7 @@ func cloneGapTriggerMessage(msg *Message) *Message {
 }
 
 // logGapFillTask 描述一次 seq 断层补全。
-type logGapFillTask struct {
+type logGapFillTask struct { //nolint:recvcheck // 只读方法用值接收者，prefetchWholeGap 用指针接收者写回预取缓存
 	dice      *Dice
 	endpoint  *EndPointInfo
 	group     *GroupInfo
@@ -2872,7 +2872,7 @@ func (t logGapFillTask) run() {
 		// incomplete 的部分页会在 on/off 状态未知时先写库。
 		// 预取要翻几十到几百页，瞬时网络错误不应让整段直接失败。
 		var prefetchErr error
-		for attempt := 0; attempt < logGapPrefetchAttempts; attempt++ {
+		for attempt := range logGapPrefetchAttempts {
 			if attempt > 0 {
 				if fetchCtx.Err() != nil {
 					break
@@ -3001,74 +3001,7 @@ func (t logGapFillTask) run() {
 		return
 	}
 
-	forceLogOnly := t.forceLogOnly
-	if hist.found {
-		if hist.stopped {
-			forceLogOnly = true
-			t.dice.Logger.Warnf("日志补全历史状态推断已停止: 群=%s 命令=%s，后续缺口不补",
-				t.group.GroupID, hist.unsupported)
-		} else if t.logStateStillValid() {
-			decision := t.decideHistoricalLogState(hist)
-			if decision.stopped {
-				forceLogOnly = true
-				t.dice.Logger.Warnf("日志补全历史状态推断已停止: 群=%s 命令=%s，后续缺口不补",
-					t.group.GroupID, decision.reason)
-				// 1120: 实时 .bot on/off 触发时，若历史最终 off，仍要应用
-				// 历史 .log off：关 live 日志并清掉 .bot off 的自动恢复标记。
-				if decision.applyLiveOff && !t.forceLogOnly {
-					if decision.deleteTrigger {
-						t.deleteTriggerRow()
-					}
-					if _, ok := t.group.logOffForHistoryAtSeq(t.toSeq); ok {
-						t.group.MarkDirty(t.dice)
-						t.dice.Logger.Infof("日志补全按历史 .log off 关闭当前日志(live bot 触发): 群=%s seq=%d",
-							t.group.GroupID, t.toSeq)
-					}
-				}
-			} else {
-				if decision.deleteTrigger {
-					t.deleteTriggerRow()
-				}
-				// 预恢复补录任务只写日志，不根据历史再改 live 状态：
-				// 日志刚刚由 .bot on/.log on 打开，不能被窗口里的旧命令关掉。
-				if decision.applyLiveOff && !t.forceLogOnly {
-					// 1118: 这是补录按历史 .log off 推断出的关闭，不是用户
-					// 此刻的显式命令，不能留下 logOffRequested 标记。
-					if _, ok := t.group.logOffForHistoryAtSeq(t.toSeq); ok {
-						t.group.MarkDirty(t.dice)
-						t.dice.Logger.Infof("日志补全按历史 .log off 关闭当前日志: 群=%s seq=%d",
-							t.group.GroupID, t.toSeq)
-					}
-				}
-				forceLogOnly = forceLogOnly || decision.forceLogOnly
-			}
-		} else {
-			// live 已被 .log off/.bot off 关闭，当前任务走 off 前窗口授权；
-			// 只需要用过滤后的消息列表，不再改 live 状态。
-			forceLogOnly = true
-			// 1120: 历史最终 off 时，即使 live 已被 .bot off 暂停，也要清掉
-			// 自动恢复标记，避免下一次 .bot on 把日志重新打开。
-			if !hist.finalOn && !t.forceLogOnly {
-				if _, ok := t.group.logOffForHistoryAtSeq(t.toSeq); ok {
-					t.group.MarkDirty(t.dice)
-					t.dice.Logger.Infof("日志补全按历史 .log off 清除 bot off 暂停: 群=%s seq=%d",
-						t.group.GroupID, t.toSeq)
-				}
-			}
-			// 历史缺口已经处于 off，实时再收到的 .log off/.bot off 只是
-			// 重复命令：它不该被记录，但实时路径在本地仍认为 on 时会先写进去。
-			if !hist.finalOn {
-				if kind, _, ca := t.parseLogLifecycleCommand(t.trigger); kind == "off" &&
-					t.lifecycleCommandValid(t.trigger, ca) {
-					t.deleteTriggerRow()
-				} else if botKind, _, botCA := t.parseBotLifecycleCommand(t.trigger); botKind == "off" &&
-					t.isHistoricalPrivilegedSender(t.trigger) &&
-					t.lifecycleCommandValid(t.trigger, botCA) {
-					t.deleteTriggerRow()
-				}
-			}
-		}
-	}
+	forceLogOnly := t.resolveForceLogOnly(hist)
 
 	if len(missing) == 0 {
 		// 历史最终 off 时，补录期间实时路径仍可能写过 off 之后的消息。
@@ -3196,6 +3129,95 @@ func (t logGapFillTask) run() {
 	t.dice.Logger.Warnf("日志补全写入失败，保留 pending 并退避: 群=%s 记录=%s", t.group.GroupID, t.logName)
 	t.group.deferLogGapRetry(logGapFillRetryBackoff)
 	t.notifyGapFailureWithDiscard("日志补全写入失败，已保留待补记录，将自动重试。")
+}
+
+// resolveForceLogOnly 根据历史 on/off 推断决定本任务是否只写日志。
+func (t logGapFillTask) resolveForceLogOnly(hist logGapLifecycleInfo) bool {
+	if !hist.found {
+		return t.forceLogOnly
+	}
+	if hist.stopped {
+		t.dice.Logger.Warnf("日志补全历史状态推断已停止: 群=%s 命令=%s，后续缺口不补",
+			t.group.GroupID, hist.unsupported)
+		return true
+	}
+	if t.logStateStillValid() {
+		return t.resolveForceLogOnlyLiveOn(hist)
+	}
+	return t.resolveForceLogOnlyLiveOff(hist)
+}
+
+// resolveForceLogOnlyLiveOn 处理 live 日志仍开启时的历史状态推断。
+func (t logGapFillTask) resolveForceLogOnlyLiveOn(hist logGapLifecycleInfo) bool {
+	decision := t.decideHistoricalLogState(hist)
+	if decision.stopped {
+		t.dice.Logger.Warnf("日志补全历史状态推断已停止: 群=%s 命令=%s，后续缺口不补",
+			t.group.GroupID, decision.reason)
+		// 1120: 实时 .bot on/off 触发时，若历史最终 off，仍要应用
+		// 历史 .log off：关 live 日志并清掉 .bot off 的自动恢复标记。
+		if decision.applyLiveOff && !t.forceLogOnly {
+			if decision.deleteTrigger {
+				t.deleteTriggerRow()
+			}
+			t.applyHistoricalLogOff("日志补全按历史 .log off 关闭当前日志(live bot 触发): 群=%s seq=%d")
+		}
+		return true
+	}
+	if decision.deleteTrigger {
+		t.deleteTriggerRow()
+	}
+	// 预恢复补录任务只写日志，不根据历史再改 live 状态：
+	// 日志刚刚由 .bot on/.log on 打开，不能被窗口里的旧命令关掉。
+	if decision.applyLiveOff && !t.forceLogOnly {
+		// 1118: 这是补录按历史 .log off 推断出的关闭，不是用户
+		// 此刻的显式命令，不能留下 logOffRequested 标记。
+		t.applyHistoricalLogOff("日志补全按历史 .log off 关闭当前日志: 群=%s seq=%d")
+	}
+	return t.forceLogOnly || decision.forceLogOnly
+}
+
+// resolveForceLogOnlyLiveOff 处理 live 日志已被 .log off/.bot off 关闭的情况。
+func (t logGapFillTask) resolveForceLogOnlyLiveOff(hist logGapLifecycleInfo) bool {
+	// live 已被 .log off/.bot off 关闭，当前任务走 off 前窗口授权；
+	// 只需要用过滤后的消息列表，不再改 live 状态。
+	// 1120: 历史最终 off 时，即使 live 已被 .bot off 暂停，也要清掉
+	// 自动恢复标记，避免下一次 .bot on 把日志重新打开。
+	if !hist.finalOn && !t.forceLogOnly {
+		if _, ok := t.group.logOffForHistoryAtSeq(t.toSeq); ok {
+			t.group.MarkDirty(t.dice)
+			t.dice.Logger.Infof("日志补全按历史 .log off 清除 bot off 暂停: 群=%s seq=%d",
+				t.group.GroupID, t.toSeq)
+		}
+	}
+	// 历史缺口已经处于 off，实时再收到的 .log off/.bot off 只是
+	// 重复命令：它不该被记录，但实时路径在本地仍认为 on 时会先写进去。
+	if !hist.finalOn {
+		t.deleteDuplicateOffCommand()
+	}
+	return true
+}
+
+// applyHistoricalLogOff 按历史 .log off 关闭当前日志，并写一条说明日志。
+func (t logGapFillTask) applyHistoricalLogOff(format string) {
+	if _, ok := t.group.logOffForHistoryAtSeq(t.toSeq); !ok {
+		return
+	}
+	t.group.MarkDirty(t.dice)
+	t.dice.Logger.Infof(format, t.group.GroupID, t.toSeq)
+}
+
+// deleteDuplicateOffCommand 删除实时路径在 off 段误写的重复 .log off/.bot off。
+func (t logGapFillTask) deleteDuplicateOffCommand() {
+	if kind, _, ca := t.parseLogLifecycleCommand(t.trigger); kind == "off" &&
+		t.lifecycleCommandValid(t.trigger, ca) {
+		t.deleteTriggerRow()
+		return
+	}
+	if botKind, _, botCA := t.parseBotLifecycleCommand(t.trigger); botKind == "off" &&
+		t.isHistoricalPrivilegedSender(t.trigger) &&
+		t.lifecycleCommandValid(t.trigger, botCA) {
+		t.deleteTriggerRow()
+	}
 }
 
 // detectWindowStartState 在识别窗口被裁剪时，回看窗口起点之前的一段前缀，

@@ -395,10 +395,10 @@ func main() {
 		fixTimezone()
 	}
 
-	if err := os.MkdirAll("./data", 0o755); err != nil {
-		startupCheckWarn("数据目录创建失败：%v", err)
-	} else if err := checkDataDirWritable("./data"); err != nil {
-		startupCheckWarn("数据目录访问权限异常：%v", err)
+	if dataDirErr := os.MkdirAll("./data", 0o755); dataDirErr != nil {
+		startupCheckWarn("数据目录创建失败：%v", dataDirErr)
+	} else if dataDirErr = checkDataDirWritable("./data"); dataDirErr != nil {
+		startupCheckWarn("数据目录访问权限异常：%v", dataDirErr)
 	} else {
 		startupCheckPass("数据目录访问权限通过（data 可读写）")
 	}
