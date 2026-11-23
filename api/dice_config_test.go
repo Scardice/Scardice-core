@@ -1,6 +1,7 @@
 package api //nolint:testpackage
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -51,5 +52,50 @@ func TestDiceConfigSetAcceptsCRNGRandomMode(t *testing.T) {
 	}
 	if got := testDice.Config.DiceRandomMode; got != string(dice.DiceRandomModeCRNG) {
 		t.Fatalf("DiceRandomMode = %q, want %q", got, dice.DiceRandomModeCRNG)
+	}
+}
+
+func TestDiceConfigSetLogGapFillEnable(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	previousDice := myDice
+	previousDM := dm
+	t.Cleanup(func() {
+		myDice = previousDice
+		dm = previousDM
+	})
+
+	testDice := &dice.Dice{
+		BaseConfig: dice.BaseConfig{DataDir: "."},
+		Config:     dice.NewConfig(nil),
+		Logger:     zap.NewNop().Sugar(),
+	}
+	manager := &dice.DiceManager{
+		Dice:        []*dice.Dice{testDice},
+		JustForTest: true,
+	}
+	token := "test-token"
+	manager.AccessTokens.Store(token, true)
+	testDice.Parent = manager
+	myDice = testDice
+	dm = manager
+
+	for _, enable := range []bool{false, true} {
+		e := echo.New()
+		body := fmt.Sprintf(`{"logGapFillEnable":%t}`, enable)
+		req := httptest.NewRequest(http.MethodPost, "/sd-api/configs/dice", strings.NewReader(body))
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		req.Header.Set("Token", token)
+		rec := httptest.NewRecorder()
+
+		if err := DiceConfigSet(e.NewContext(req, rec)); err != nil {
+			t.Fatalf("DiceConfigSet(%t) error = %v", enable, err)
+		}
+		if rec.Code != http.StatusOK {
+			t.Fatalf("DiceConfigSet(%t) status = %d, body = %s", enable, rec.Code, rec.Body.String())
+		}
+		if got := testDice.Config.LogGapFillEnable; got != enable {
+			t.Fatalf("LogGapFillEnable = %t, want %t", got, enable)
+		}
 	}
 }

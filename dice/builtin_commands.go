@@ -870,9 +870,13 @@ func (d *Dice) registerCoreCommands() {
 					}
 
 					preOffNotice := ""
-					if preOffOK && autoOnLog && ctx.Group != nil &&
-						ctx.Group.enqueuePreOffBackfillAfterResume(ctx.Dice, ctx.EndPoint, preOffFrom, preOffTo) {
-						preOffNotice = "\n关闭前的遗漏记录正在补录，完成后会通知。"
+					if preOffOK && autoOnLog && ctx.Group != nil {
+						if !ctx.Dice.LogGapFillEnabled() {
+							ctx.Group.cancelLogGapFill()
+							preOffNotice = "\n自动补全已关闭，关闭前的遗漏记录未补录。"
+						} else if ctx.Group.enqueuePreOffBackfillAfterResume(ctx.Dice, ctx.EndPoint, preOffFrom, preOffTo) {
+							preOffNotice = "\n关闭前的遗漏记录正在补录，完成后会通知。"
+						}
 					}
 
 					text := DiceFormatTmpl(ctx, "核心:骰子开启")

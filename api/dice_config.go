@@ -433,6 +433,16 @@ func DiceConfigSet(c echo.Context) error {
 	// 	myDice.CustomDrawKeysTextEnable = val.(bool)
 	// }
 
+	if val, ok := jsonMap["logGapFillEnable"]; ok {
+		if enable, ok2 := val.(bool); ok2 {
+			config.LogGapFillEnable = enable
+			if !enable {
+				// 关闭后立即取消排队/在途的自动补全任务，避免切换后还继续补录。
+				myDice.CancelLogGapFillTasks()
+			}
+		}
+	}
+
 	if val, ok := jsonMap["logSizeNoticeEnable"]; ok {
 		config.LogSizeNoticeEnable = val.(bool)
 	}
