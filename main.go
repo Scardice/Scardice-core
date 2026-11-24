@@ -17,6 +17,7 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -52,6 +53,9 @@ extensions/
 // LockFileName can be overridden via -ldflags "-X main.LockFileName=...".
 var LockFileName = "Scardice-lock.lock"
 var sealLock = flock.New(LockFileName)
+
+// processExitCode 记录启动失败等异常退出码；正常信号退出保持 0。
+var processExitCode atomic.Int32
 
 func cleanupCreate(diceManager *dice.DiceManager, extraCleanup func()) func() {
 	return func() {
@@ -642,7 +646,7 @@ func main() {
 		<-interrupt
 		cleanUp()
 		log.Info("程序即将退出，再见")
-		os.Exit(0)
+		os.Exit(int(processExitCode.Load()))
 	})()
 
 	if opts.Address != "" {
