@@ -636,6 +636,7 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 
 	e.GET(prefix+"/preInfo", preInfo)
 	e.GET(prefix+"/baseInfo", baseInfo)
+	e.GET(prefix+"/overview", overviewGet)
 	e.GET(prefix+"/hello", hello2)
 	e.GET(prefix+"/log/fetchAndClear", logFetchAndClear)
 	e.GET(prefix+"/log/stream", logStream)
