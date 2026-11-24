@@ -136,27 +136,33 @@ type QueryLogPage struct {
 // LogGetLogPage 获取分页
 func LogGetLogPage(operator engine2.DatabaseOperator, param *QueryLogPage) (int, []*model.LogInfo, error) {
 	db := operator.GetLogDB(constant.READ)
-	var lst []*model.LogInfo
+	lst := make([]*model.LogInfo, 0)
 
 	// 构建基础查询
-	query := db.Model(&model.LogInfo{}).Select("logs.id, logs.name, logs.group_id, logs.created_at, logs.updated_at,COALESCE(logs.size, 0) as size").Order("logs.updated_at desc")
-	// 添加条件
-	if param.Name != "" {
-		query = query.Where("logs.name LIKE ?", "%"+param.Name+"%")
+	newQuery := func() *gorm.DB {
+		query := db.Model(&model.LogInfo{})
+		// 添加条件
+		if param.Name != "" {
+			query = query.Where("logs.name LIKE ?", "%"+param.Name+"%")
+		}
+		if param.GroupID != "" {
+			query = query.Where("logs.group_id LIKE ?", "%"+param.GroupID+"%")
+		}
+		if param.CreatedTimeBegin != "" {
+			query = query.Where("logs.created_at >= ?", param.CreatedTimeBegin)
+		}
+		if param.CreatedTimeEnd != "" {
+			query = query.Where("logs.created_at <= ?", param.CreatedTimeEnd)
+		}
+		return query
 	}
-	if param.GroupID != "" {
-		query = query.Where("logs.group_id LIKE ?", "%"+param.GroupID+"%")
-	}
-	if param.CreatedTimeBegin != "" {
-		query = query.Where("logs.created_at >= ?", param.CreatedTimeBegin)
-	}
-	if param.CreatedTimeEnd != "" {
-		query = query.Where("logs.created_at <= ?", param.CreatedTimeEnd)
-	}
+	query := newQuery().
+		Select("logs.id, logs.name, logs.group_id, logs.created_at, logs.updated_at,COALESCE(logs.size, 0) as size").
+		Order("logs.updated_at desc")
 
-	// 获取总数
+	// 获取总数（与列表使用同一组筛选条件）
 	var count int64
-	if err := db.Model(&model.LogInfo{}).Count(&count).Error; err != nil {
+	if err := newQuery().Count(&count).Error; err != nil {
 		return 0, nil, err
 	}
 
