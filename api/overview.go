@@ -306,21 +306,21 @@ func collectOverviewStorage(dataDir string) overviewStorageInfo {
 	info := overviewStorageInfo{DataDir: dataDirAbs}
 	_ = filepath.WalkDir(dataRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			return nil //nolint:nilerr // 跳过不可读条目，继续统计
 		}
 		if d.IsDir() {
 			return nil
 		}
 		fileInfo, err := d.Info()
 		if err != nil {
-			return nil
+			return nil //nolint:nilerr // 跳过不可读条目，继续统计
 		}
 		size := fileInfo.Size()
 		info.DataBytes += size
 
 		rel, err := filepath.Rel(dataRoot, path)
 		if err != nil {
-			return nil
+			return nil //nolint:nilerr // 路径异常时跳过该条目
 		}
 		top := strings.Split(rel, string(os.PathSeparator))[0]
 		switch top {
@@ -390,7 +390,10 @@ func collectOverviewCounts(d *dice.Dice) overviewCounts {
 func dirSizeAbs(path string) int64 {
 	var total int64
 	_ = filepath.WalkDir(path, func(_ string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil {
+			return nil //nolint:nilerr // 跳过不可读条目，继续统计
+		}
+		if d.IsDir() {
 			return nil
 		}
 		if fileInfo, err := d.Info(); err == nil {

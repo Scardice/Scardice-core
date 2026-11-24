@@ -3,6 +3,7 @@
 package api
 
 import (
+	"bytes"
 	"os"
 	"strconv"
 	"strings"
@@ -115,7 +116,7 @@ func readProcSelfCPU() (uint64, bool) {
 		return 0, false
 	}
 	// comm 字段可能包含空格和括号，取最后一个 ')' 之后的字段。
-	idx := strings.LastIndexByte(string(data), ')')
+	idx := bytes.LastIndexByte(data, ')')
 	if idx < 0 || idx+2 >= len(data) {
 		return 0, false
 	}
@@ -168,8 +169,8 @@ func readProcLoadAvg() (load1, load5, load15 float64, ok bool) {
 }
 
 func readSystemMemory() (total, available uint64, ok bool) {
-	if total, available, ok := readProcMemInfo(); ok {
-		return total, available, true
+	if procTotal, procAvailable, procOK := readProcMemInfo(); procOK {
+		return procTotal, procAvailable, true
 	}
 
 	// /proc 不可用时用 sysinfo(2) 兜底；Unit 是每个内存单位对应的字节数。
@@ -181,8 +182,9 @@ func readSystemMemory() (total, available uint64, ok bool) {
 	if unit == 0 {
 		unit = 1
 	}
-	total = uint64(info.Totalram) * unit
-	available = (uint64(info.Freeram) + uint64(info.Bufferram)) * unit
+	// 386/arm 上 Sysinfo_t 的字段是 uint32，这里的转换是跨架构必需的。
+	total = uint64(info.Totalram) * unit                               //nolint:unconvert
+	available = (uint64(info.Freeram) + uint64(info.Bufferram)) * unit //nolint:unconvert
 	if available > total {
 		available = total
 	}
@@ -284,8 +286,9 @@ func readDiskUsage(path string) (total, free uint64, ok bool) {
 		return 0, 0, false
 	}
 	blockSize := uint64(stat.Bsize)
-	total = uint64(stat.Blocks) * blockSize
-	free = uint64(stat.Bavail) * blockSize
+	// 386/arm 上 Statfs_t 的 Blocks/Bavail 是 uint32，这里的转换是跨架构必需的。
+	total = uint64(stat.Blocks) * blockSize //nolint:unconvert
+	free = uint64(stat.Bavail) * blockSize  //nolint:unconvert
 	if free > total {
 		free = total
 	}
