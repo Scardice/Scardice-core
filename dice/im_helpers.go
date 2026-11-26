@@ -275,40 +275,42 @@ func groupHasOtherLiveDice(session *IMSession, group *GroupInfo, excludeUserID s
 		return false
 	}
 	// 无法取得端点列表时保持旧行为，避免误判为“没有其它骰子”。
-	if len(session.EndPoints) == 0 {
+	endpoints := session.EndPointsRawSnapshot()
+	if len(endpoints) == 0 {
 		return group.DiceIDActiveMap.Len() > 0
 	}
 
-	live := make(map[string]struct{}, len(session.EndPoints))
-	for _, ep := range session.EndPoints {
+	live := make(map[string]struct{}, len(endpoints))
+	for _, ep := range endpoints {
 		if ep == nil || !ep.Enable || ep.UserID == "" || ep.UserID == excludeUserID {
 			continue
 		}
 		live[ep.UserID] = struct{}{}
 	}
 
-	existsMap := group.DiceIDExistsMap
-	// ExistsMap 为空多半是老数据/加载未完成，不能据此把别的 bot 全判成退群；
-	// 保持旧行为，只按端点是否启用判断。
-	memberUnknown := existsMap == nil || existsMap.Len() == 0
 	hasOther := false
 	var stale []string
 	group.DiceIDActiveMap.Range(func(id string, _ bool) bool {
 		if id == excludeUserID {
 			return true
 		}
-		_, endpointLive := live[id]
-		// 1119.fix1: 端点仍启用不代表它还在本群。退群/被踢只会删
-		// DiceIDExistsMap，ActiveMap 会留下脏 ID；必须以 ExistsMap 为准。
-		member := memberUnknown
-		if !memberUnknown {
-			_, member = existsMap.Load(id)
+		if group.DiceIDDepartedMap != nil {
+			if _, departed := group.DiceIDDepartedMap.Load(id); departed {
+				// 适配器明确收到过退群/被踢事件：不再算“还在本群”。
+				stale = append(stale, id)
+				return true
+			}
 		}
-		if endpointLive && member {
-			hasOther = true
-		} else {
+		if _, endpointLive := live[id]; !endpointLive {
+			// 端点已删除/禁用：它的 ID 不会阻止群失活，可以安全清理。
 			stale = append(stale, id)
+			return true
 		}
+		// 端点仍启用：无论 ExistsMap 是否已记录，都算“可能有其它骰子”。
+		// ExistsMap 只在收消息/连接事件时写，新启用或重启后尚未收消息的
+		// 端点与“已退群”无法区分；宁可让群保持 active，也不能误删它的
+		// 激活态（否则 A 的 .bot off 会让 B 永久失活且无法自愈）。
+		hasOther = true
 		return true
 	})
 	for _, id := range stale {
@@ -356,7 +358,12 @@ func SetBotOnAtGroup(ctx *MsgContext, groupID string) *GroupInfo {
 		if group.DiceIDExistsMap == nil {
 			group.DiceIDExistsMap = new(SyncMap[string, bool])
 		}
+		if group.DiceIDDepartedMap == nil {
+			group.DiceIDDepartedMap = new(SyncMap[string, bool])
+		}
 		group.ensureInactivatedSet()
+		// 重新 .bot on 说明本骰子已回到本群服务，清除退群标记。
+		group.DiceIDDepartedMap.Delete(ctx.EndPoint.UserID)
 		group.DiceIDActiveMap.Store(ctx.EndPoint.UserID, true)
 		group.SetActiveRaw(true)
 		// .bot off 时日志被自动 .log off；这里按 .log on 的语义自动开启，
@@ -390,6 +397,7 @@ func SetBotOnAtGroup(ctx *MsgContext, groupID string) *GroupInfo {
 			GroupID:               groupID,
 			DiceIDActiveMap:       new(SyncMap[string, bool]),
 			DiceIDExistsMap:       new(SyncMap[string, bool]),
+			DiceIDDepartedMap:     new(SyncMap[string, bool]),
 			CocRuleIndex:          int(session.Parent.Config.DefaultCocRuleIndex),
 			UpdatedAtTime:         time.Now().Unix(),
 		}
@@ -401,6 +409,9 @@ func SetBotOnAtGroup(ctx *MsgContext, groupID string) *GroupInfo {
 	}
 	if group.DiceIDExistsMap == nil {
 		group.DiceIDExistsMap = new(SyncMap[string, bool])
+	}
+	if group.DiceIDDepartedMap == nil {
+		group.DiceIDDepartedMap = new(SyncMap[string, bool])
 	}
 	if group.BotList == nil {
 		group.BotList = new(SyncMap[string, bool])
@@ -525,10 +536,24 @@ func ReplyToSenderNoCheck(ctx *MsgContext, msg *Message, text string) {
 		logger.M().Errorf("ReplyToSenderNoCheck 被调用，但没有正确传递参数！请检查您的参数！: ctx=%v, msg=%v", ctx, msg)
 		return
 	}
-	text = withOfficialQQNameCard(ctx, text)
+	// 名片求值使用命令的 VM，必须在启动发送协程前完成。
+	nameCardLine := buildOfficialQQNameCardLine(ctx)
+	text = prependOfficialQQNameCard(nameCardLine, text)
+	sendCtx := withOfficialQQNameCardContext(ctx, nameCardLine)
 	panicHandler.Once(logger.M(), func() {
-		replyToSenderRawNoCheck(ctx, msg, text, "")
+		replyToSenderRawNoCheck(sendCtx, msg, text, "")
 	})
+}
+
+// withOfficialQQNameCardContext 为单次发送准备上下文，记录仅用于展示的名片前缀。
+// 使用副本避免并发回复之间互相覆盖该状态。
+func withOfficialQQNameCardContext(ctx *MsgContext, nameCardLine string) *MsgContext {
+	if ctx == nil || nameCardLine == "" {
+		return ctx
+	}
+	sendCtx := ctx.ShallowCopy()
+	sendCtx.officialQQNameCardLine = nameCardLine
+	return sendCtx
 }
 
 func ReplyGroupRaw(ctx *MsgContext, msg *Message, text string, flag string) {
@@ -580,7 +605,7 @@ func replyGroupRaw(ctx *MsgContext, msg *Message, text string, flag string, name
 			}
 		}
 	}
-	replyGroupRawNoCheck(ctx, msg, text, flag)
+	replyGroupRawNoCheck(withOfficialQQNameCardContext(ctx, nameCardLine), msg, text, flag)
 }
 
 func replyGroupRawNoCheck(ctx *MsgContext, msg *Message, text string, flag string) {
@@ -655,7 +680,7 @@ func replyPersonRaw(ctx *MsgContext, msg *Message, text string, flag string, nam
 			}
 		}
 	}
-	replyPersonRawNoCheck(ctx, msg, text, flag)
+	replyPersonRawNoCheck(withOfficialQQNameCardContext(ctx, nameCardLine), msg, text, flag)
 }
 
 func replyPersonRawNoCheck(ctx *MsgContext, msg *Message, text string, flag string) {
@@ -907,6 +932,11 @@ func applyRateLimiterPenalty(limiter *rate.Limiter, base rate.Limit, multiplier 
 }
 
 func spamCheckPerson(ctx *MsgContext, msg *Message) bool {
+	if ctx == nil || ctx.Player == nil {
+		// 补录完成提示等自造 MsgContext 只用于向群发消息，没有发送者 Player。
+		// 这类消息不参与个人限流，直接放行，避免 nil 解引用。
+		return false
+	}
 	if ctx.SpamCheckedPerson {
 		return false
 	}

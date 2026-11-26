@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -129,10 +130,14 @@ type GroupInfo struct {
 	GroupName       string                 `jsbind:"groupName"     json:"groupName"    yaml:"groupName"`
 	DiceIDActiveMap *SyncMap[string, bool] `json:"diceIdActiveMap" yaml:"diceIds,flow"` // 对应的骰子ID(格式 平台:ID)，对应单骰多号情况，例如骰A B都加了群Z，A退群不会影响B在群内服务
 	DiceIDExistsMap *SyncMap[string, bool] `json:"diceIdExistsMap" yaml:"-"`            // 对应的骰子ID(格式 平台:ID)是否存在于群内
-	BotList         *SyncMap[string, bool] `json:"botList"         yaml:"botList,flow"` // 其他骰子列表
-	DiceSideNum     int64                  `json:"diceSideNum"     yaml:"diceSideNum"`  // 以后可能会支持 1d4 这种默认面数，暂不开放给js
-	DiceSideExpr    string                 `json:"diceSideExpr"    yaml:"diceSideExpr"` //
-	System          string                 `json:"system"          yaml:"system"`       // 规则系统，概念同bcdice的gamesystem，距离如dnd5e coc7
+	// DiceIDDepartedMap 记录“明确收到退群/被踢事件”的骰子 ID。
+	// ExistsMap 缺失本身无法区分“已退群”和“刚启用还没发言”，不能据此删激活态；
+	// 只有这里明确标记过的 ID 才允许在 .bot off 时被清理。
+	DiceIDDepartedMap *SyncMap[string, bool] `json:"diceIdDepartedMap" yaml:"-"`
+	BotList           *SyncMap[string, bool] `json:"botList"         yaml:"botList,flow"` // 其他骰子列表
+	DiceSideNum       int64                  `json:"diceSideNum"     yaml:"diceSideNum"`  // 以后可能会支持 1d4 这种默认面数，暂不开放给js
+	DiceSideExpr      string                 `json:"diceSideExpr"    yaml:"diceSideExpr"` //
+	System            string                 `json:"system"          yaml:"system"`       // 规则系统，概念同bcdice的gamesystem，距离如dnd5e coc7
 
 	HelpPackages []string `json:"helpPackages"   yaml:"-"`
 	CocRuleIndex int      `jsbind:"cocRuleIndex" json:"cocRuleIndex" yaml:"cocRuleIndex"`
@@ -206,6 +211,10 @@ type GroupInfo struct {
 	logGapPending       *logGapFillTask `json:"-" yaml:"-"`
 	logGapRunningTask   *logGapFillTask `json:"-" yaml:"-"`
 	logGapWorkerRunning bool            `json:"-" yaml:"-"`
+	// worker 取消句柄：.log halt/.log end 时中断在途拉取，避免闸门一直
+	// 把用户挡在“先 .log halt”之后。
+	logGapWorkerCtx    context.Context    `json:"-" yaml:"-"`
+	logGapWorkerCancel context.CancelFunc `json:"-" yaml:"-"`
 	// logGapRunningOffDiscovery 表示 worker 当前执行的正是 off 状态历史发现任务。
 	// 用于让 .log off / .log on 及时感知“离线补录还在跑”，避免实时命令和
 	// 异步任务互相覆盖状态。
@@ -1411,6 +1420,18 @@ func (g *GroupInfo) SetLogOn(logOn bool) {
 	g.logStateMu.Unlock()
 }
 
+// MarkDiceDeparted 记录某个骰子已明确退群/被踢。只有这种明确事件，
+// 才允许 .bot off 时把它从激活态里清掉；单凭 ExistsMap 缺失不能。
+func (g *GroupInfo) MarkDiceDeparted(userID string) {
+	if g == nil || userID == "" {
+		return
+	}
+	if g.DiceIDDepartedMap == nil {
+		g.DiceIDDepartedMap = new(SyncMap[string, bool])
+	}
+	g.DiceIDDepartedMap.Store(userID, true)
+}
+
 func (g *GroupInfo) ClearLogState() {
 	g.logWriteMu.Lock()
 	defer g.logWriteMu.Unlock()
@@ -1430,6 +1451,7 @@ func (g *GroupInfo) ClearLogState() {
 	g.logAutoResumedAt.Store(0)
 	g.clearLogGapPendingRange()
 	g.clearLogGapNotifyOnComplete()
+	g.cancelLogGapWorker()
 }
 
 func (group *GroupInfo) IsActive(ctx *MsgContext) bool {
@@ -1753,6 +1775,7 @@ type IMSession struct {
 	PendingQuits *SyncMap[string, *PendingQuitInfo] `json:"-" yaml:"-"`
 
 	endPointsSnapshot      atomic.Pointer[[]*EndPointInfo]
+	endpointsMu            sync.RWMutex
 	groupMemberWelcomeMu   sync.Mutex
 	lastGroupMemberWelcome *LastWelcomeInfo
 	// LogGapLastReconcileAt 是最近一次启动/重连日志缺口对账的发起时间(unix)。
@@ -1772,8 +1795,48 @@ func (s *IMSession) RefreshEndPointsSnapshot() {
 	if s == nil {
 		return
 	}
+	s.endpointsMu.RLock()
 	snapshot := append([]*EndPointInfo(nil), s.EndPoints...)
+	s.endpointsMu.RUnlock()
 	s.endPointsSnapshot.Store(&snapshot)
+}
+
+// EndPointsRawSnapshot 返回端点指针列表的浅拷贝，供并发读取使用。
+// 增删端点必须走 AddEndPoint/RemoveEndPointByID，保证与快照一致。
+func (s *IMSession) EndPointsRawSnapshot() []*EndPointInfo {
+	if s == nil {
+		return nil
+	}
+	s.endpointsMu.RLock()
+	defer s.endpointsMu.RUnlock()
+	return append([]*EndPointInfo(nil), s.EndPoints...)
+}
+
+// AddEndPoint 并发安全地追加端点。
+func (s *IMSession) AddEndPoint(ep *EndPointInfo) {
+	if s == nil || ep == nil {
+		return
+	}
+	s.endpointsMu.Lock()
+	s.EndPoints = append(s.EndPoints, ep)
+	s.endpointsMu.Unlock()
+}
+
+// RemoveEndPointByID 并发安全地按 ID 删除端点，返回被删除的端点。
+func (s *IMSession) RemoveEndPointByID(id string) (*EndPointInfo, bool) {
+	if s == nil {
+		return nil, false
+	}
+	s.endpointsMu.Lock()
+	defer s.endpointsMu.Unlock()
+	for i, ep := range s.EndPoints {
+		if ep != nil && ep.ID == id {
+			removed := ep
+			s.EndPoints = append(s.EndPoints[:i], s.EndPoints[i+1:]...)
+			return removed, true
+		}
+	}
+	return nil, false
 }
 
 // EndPointsSnapshot 返回最近发布列表中各端点展示字段的单次采样。
@@ -1924,6 +1987,9 @@ type MsgContext struct {
 	DelegateText    string      `jsbind:"delegateText"`  // 代骰附加文本
 	AliasPrefixText string      `json:"aliasPrefixText"` // 快捷指令回复前缀文本
 	CommandReplied  bool        `json:"-"`               // 当前命令是否已通过统一回复路径发出消息
+
+	// officialQQNameCardLine 是本条发送中仅用于展示的名片前缀，日志等记录场景需要将其去掉。
+	officialQQNameCardLine string
 
 	commandRepliedMu  sync.RWMutex
 	deckDepth         int                                         // 抽牌递归深度
@@ -2169,6 +2235,10 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 			if _, exists := groupInfo.DiceIDExistsMap.Load(ep.UserID); !exists {
 				groupInfo.DiceIDExistsMap.Store(ep.UserID, true)
 				groupInfo.MarkDirty(d)
+			}
+			// 能收到消息说明它已回到本群，清除此前的退群标记。
+			if groupInfo.DiceIDDepartedMap != nil {
+				groupInfo.DiceIDDepartedMap.Delete(ep.UserID)
 			}
 		}
 
@@ -2559,6 +2629,9 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 		if _, exists := groupInfo.DiceIDExistsMap.Load(ep.UserID); !exists {
 			groupInfo.DiceIDExistsMap.Store(ep.UserID, true)
 			groupInfo.MarkDirty(mctx.Dice)
+		}
+		if groupInfo.DiceIDDepartedMap != nil {
+			groupInfo.DiceIDDepartedMap.Delete(ep.UserID)
 		}
 	}
 
@@ -3176,6 +3249,12 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 				Sender:      SenderBase{UserID: ep.UserID},
 				GroupID:     grp.GroupID,
 			})
+			// 自动退群前确认骰子账号不是群主，避免退群直接解散群聊。
+			if !canAutoQuitGroup(msgCtx, grp.GroupID) {
+				s.Parent.Logger.Infof("自动退群已取消: 当前账号是群主或身份检查未通过，避免解散群聊。group=%s endpoint=%s", grp.GroupID, ep.UserID)
+				cancelled++
+				continue
+			}
 			// 发送退群消息
 			msgText := DiceFormatTmpl(msgCtx, "核心:骰子自动退群告别语")
 			ep.Adapter.SendToGroup(msgCtx, grp.GroupID, msgText, "")
@@ -3183,6 +3262,12 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 			time.Sleep(2 * time.Second)
 			if !isAutoQuitEndpointReady(grp, ep, "QQ", "quit") {
 				s.Parent.Logger.Infof("自动退群已取消: 当前账号状态发生变化，本次不再继续退群。group=%s endpoint=%s", grp.GroupID, ep.UserID)
+				cancelled++
+				continue
+			}
+			// 告别消息发出后身份可能变化，退群前再核对一次。
+			if !canAutoQuitGroup(msgCtx, grp.GroupID) {
+				s.Parent.Logger.Infof("自动退群已取消: 当前账号身份发生变化，避免解散群聊。group=%s endpoint=%s", grp.GroupID, ep.UserID)
 				cancelled++
 				continue
 			}
@@ -3228,7 +3313,7 @@ func FormatBlacklistReasons(v *BanListInfoItem) string {
 	return reasontext
 }
 
-func checkBanBlacklistedUser(ctx *MsgContext, msg *Message, isWhiteGroup bool, banQuitGroup func()) bool {
+func checkBanBlacklistedUser(ctx *MsgContext, msg *Message, isWhiteGroup bool, banQuitGroup func(func(*MsgContext))) bool {
 	d := ctx.Dice
 	log := d.Logger
 	groupLevel := ctx.GroupRoleLevel
@@ -3241,13 +3326,14 @@ func checkBanBlacklistedUser(ctx *MsgContext, msg *Message, isWhiteGroup bool, b
 			if isWhiteGroup {
 				log.Infof("收到群(%s)内邀请者以上权限黑名单用户<%s>(%s)的消息，但在信任群所以不尝试退群", groupID, msg.Sender.Nickname, msg.Sender.UserID)
 			} else {
-				text := fmt.Sprintf("警告: <%s>(%s)是黑名单用户，将对骰主进行通知并退群。", msg.Sender.Nickname, msg.Sender.UserID)
-				ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
+				banQuitGroup(func(ctx *MsgContext) {
+					text := fmt.Sprintf("警告: <%s>(%s)是黑名单用户，将对骰主进行通知并退群。", msg.Sender.Nickname, msg.Sender.UserID)
+					ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
 
-				noticeMsg := fmt.Sprintf("检测到群(%s)内黑名单用户<%s>(%s)，因是管理以上权限，执行通告后自动退群\n%s", groupID, msg.Sender.Nickname, msg.Sender.UserID, reasontext)
-				log.Info(noticeMsg)
-				ctx.Notice(noticeMsg, NoticeTypeBan)
-				banQuitGroup()
+					noticeMsg := fmt.Sprintf("检测到群(%s)内黑名单用户<%s>(%s)，因是管理以上权限，执行通告后自动退群\n%s", groupID, msg.Sender.Nickname, msg.Sender.UserID, reasontext)
+					log.Info(noticeMsg)
+					ctx.Notice(noticeMsg, NoticeTypeBan)
+				})
 			}
 			return true
 		}
@@ -3278,7 +3364,7 @@ func checkBanBlacklistedUser(ctx *MsgContext, msg *Message, isWhiteGroup bool, b
 		if isWhiteGroup {
 			log.Infof("收到群(%s)内黑名单用户<%s>(%s)的消息，但在信任群所以不尝试退群", groupID, msg.Sender.Nickname, msg.Sender.UserID)
 		} else {
-			banQuitGroup()
+			banQuitGroup(nil)
 		}
 		return true
 	}
@@ -3308,20 +3394,21 @@ func checkBan(ctx *MsgContext, msg *Message) (notReply bool) {
 		}
 	}
 
-	banQuitGroup := func() {
+	banQuitGroup := func(beforeQuit func(*MsgContext)) {
 		banListInfoItem, _ := ctx.Dice.Config.BanList.GetByID(msg.Sender.UserID)
 		reasontext := FormatBlacklistReasons(banListInfoItem)
 		groupID := msg.GroupID
 		noticeMsg := fmt.Sprintf("检测到群(%s)内黑名单用户<%s>(%s)，自动退群\n%s", groupID, msg.Sender.Nickname, msg.Sender.UserID, reasontext)
-		log.Info(noticeMsg)
-
 		text := fmt.Sprintf("因<%s>(%s)是黑名单用户，将自动退群。", msg.Sender.Nickname, msg.Sender.UserID)
-		ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
-
-		ctx.Notice(noticeMsg, NoticeTypeBan)
-
-		time.Sleep(1 * time.Second)
-		ctx.EndPoint.Adapter.QuitGroup(ctx, groupID)
+		autoQuitGroupAsync(ctx, groupID, func(ctx *MsgContext) {
+			if beforeQuit != nil {
+				beforeQuit(ctx)
+			}
+			log.Info(noticeMsg)
+			ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
+			ctx.Notice(noticeMsg, NoticeTypeBan)
+			time.Sleep(1 * time.Second)
+		})
 	}
 
 	if ctx.PrivilegeLevel == -30 {
@@ -3339,14 +3426,15 @@ func checkBan(ctx *MsgContext, msg *Message) (notReply bool) {
 				log.Infof("群(%s)处于黑名单中，但在信任群所以不尝试退群", groupID)
 			} else {
 				noticeMsg := fmt.Sprintf("群(%s)处于黑名单中，自动退群\n%s", groupID, reasontext)
-				log.Info(noticeMsg)
+				autoQuitGroupAsync(ctx, groupID, func(ctx *MsgContext) {
+					log.Info(noticeMsg)
 
-				ReplyGroupRaw(ctx, &Message{GroupID: groupID}, "因本群处于黑名单中，将自动退群。", "")
+					ReplyGroupRaw(ctx, &Message{GroupID: groupID}, "因本群处于黑名单中，将自动退群。", "")
 
-				ctx.Notice(noticeMsg, NoticeTypeBan)
+					ctx.Notice(noticeMsg, NoticeTypeBan)
 
-				time.Sleep(1 * time.Second)
-				ctx.EndPoint.Adapter.QuitGroup(ctx, groupID)
+					time.Sleep(1 * time.Second)
+				})
 			}
 		} else if d.Config.BanList.BanBehaviorRefuseReply {
 			notReply = true

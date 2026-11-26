@@ -245,6 +245,7 @@ func (p *PlatformAdapterOnebot) handleGroupDecreaseAction(req gjson.Result, _ *e
 			return nil
 		}
 		group.DiceIDExistsMap.Delete(p.EndPoint.UserID)
+		group.MarkDiceDeparted(p.EndPoint.UserID)
 		group.MarkDirty(session.Parent)
 		p.logger.Info(txt)
 		if pendingQuit == nil || pendingQuit.Origin != QuitOriginAutoInactive || !session.Parent.Config.QuitInactiveNoticeSummaryMode {

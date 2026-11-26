@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,6 +31,7 @@ type onebotTestEmitter struct {
 	groupInfo      *emitterTypes.GroupInfo
 	groupInfoErr   error
 	groupReqCh     chan struct{}
+	quitGroupMu    sync.Mutex
 	quitGroupCalls []int64
 	loginInfo      *emitterTypes.LoginInfo
 	loginInfoErr   error
@@ -136,8 +138,28 @@ func (m *onebotTestEmitter) SetGroupSpecialTitle(context.Context, int64, int64, 
 }
 
 func (m *onebotTestEmitter) QuitGroup(_ context.Context, groupID int64) error {
+	m.quitGroupMu.Lock()
 	m.quitGroupCalls = append(m.quitGroupCalls, groupID)
+	m.quitGroupMu.Unlock()
 	return nil
+}
+
+func (m *onebotTestEmitter) quitGroupCallsSnapshot() []int64 {
+	m.quitGroupMu.Lock()
+	defer m.quitGroupMu.Unlock()
+	return append([]int64(nil), m.quitGroupCalls...)
+}
+
+func (m *onebotTestEmitter) waitForQuitGroupCalls(t *testing.T, want int) []int64 {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		calls := m.quitGroupCallsSnapshot()
+		if len(calls) >= want || time.Now().After(deadline) {
+			return calls
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func (m *onebotTestEmitter) SetGroupCard(context.Context, int64, int64, string) error { return nil }
@@ -152,8 +174,15 @@ func (m *onebotTestEmitter) GetGroupInfo(context.Context, int64, bool) (*emitter
 	return m.groupInfo, nil
 }
 
-func (m *onebotTestEmitter) GetGroupMemberInfo(context.Context, int64, int64, bool) (*emitterTypes.GroupMemberInfo, error) {
-	return &emitterTypes.GroupMemberInfo{}, nil
+func (m *onebotTestEmitter) GetGroupMemberInfo(_ context.Context, groupID int64, userID int64, _ bool) (*emitterTypes.GroupMemberInfo, error) {
+	// 返回一条可验证的真实成员记录，供群主/退群保护逻辑使用。
+	return &emitterTypes.GroupMemberInfo{
+		GroupId:  groupID,
+		UserId:   userID,
+		Nickname: "test-bot",
+		Role:     "member",
+		JoinTime: 1,
+	}, nil
 }
 
 func (m *onebotTestEmitter) GetGroupMsgHistory(context.Context, int64, int64, int) (*emitterTypes.GetGroupMsgHistoryRes, error) {
@@ -386,8 +415,8 @@ func TestPureOnebotGetGroupInfoSyncUsesGroupBanInfo(t *testing.T) {
 	if got := pa.GetGroupInfoSync(groupID); got == nil {
 		t.Fatalf("expected group info, got nil")
 	}
-	if len(em.quitGroupCalls) != 1 || em.quitGroupCalls[0] != 66666 {
-		t.Fatalf("expected banned group to be quit, got %v", em.quitGroupCalls)
+	if calls := em.waitForQuitGroupCalls(t, 1); len(calls) != 1 || calls[0] != 66666 {
+		t.Fatalf("expected banned group to be quit, got %v", calls)
 	}
 }
 
@@ -438,8 +467,10 @@ func TestPureOnebotGetGroupInfoSyncDoesNotQuitForInviteRestrictions(t *testing.T
 			if got := pa.GetGroupInfoSync(groupID); got == nil {
 				t.Fatal("expected group info, got nil")
 			}
-			if len(em.quitGroupCalls) != 0 {
-				t.Fatalf("invite restrictions must not cause blacklist quits, got %v", em.quitGroupCalls)
+			// 自动退群现在在独立 goroutine 中执行，留一个短暂窗口确认没有误退群。
+			time.Sleep(50 * time.Millisecond)
+			if calls := em.quitGroupCallsSnapshot(); len(calls) != 0 {
+				t.Fatalf("invite restrictions must not cause blacklist quits, got %v", calls)
 			}
 			select {
 			case <-em.sendGrCh:

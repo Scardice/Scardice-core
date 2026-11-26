@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 
@@ -15,6 +16,9 @@ import (
 )
 
 var errWebhookVerify = errors.New("web")
+
+// maxWebhookBodyBytes 限制 webhook 解压后的请求体，避免 zlib 炸弹撑爆内存。
+const maxWebhookBodyBytes = 64 << 20
 
 // WebhookHandler provides a http.HandlerFunc for webhook.
 func (s *Session) WebhookHandler() http.HandlerFunc {
@@ -26,19 +30,20 @@ func (s *Session) WebhookHandler() http.HandlerFunc {
 			writer.WriteHeader(http.StatusNotFound)
 			return
 		}
-		r := request.Body
-		defer r.Close()
+		var body io.Reader = io.LimitReader(request.Body, maxWebhookBodyBytes)
+		defer request.Body.Close()
 		buf := &bytes.Buffer{}
 		if !strings.Contains(request.RequestURI, "compress=0") {
-			r, err = zlib.NewReader(r)
-			if err != nil {
-				addCaller(s.Logger.Error().Err("error", err)).Msg("error in init zlib")
+			zr, zerr := zlib.NewReader(body)
+			if zerr != nil {
+				addCaller(s.Logger.Error().Err("error", zerr)).Msg("error in init zlib")
 				writer.WriteHeader(http.StatusInternalServerError)
 				return
 			}
-			defer r.Close()
+			defer zr.Close()
+			body = zr
 		}
-		_, err = buf.ReadFrom(r)
+		_, err = buf.ReadFrom(io.LimitReader(body, maxWebhookBodyBytes))
 		if err != nil {
 			addCaller(s.Logger.Error().Err("error", err)).Msg("error in reading body")
 			writer.WriteHeader(http.StatusInternalServerError)
@@ -68,11 +73,28 @@ func (s *Session) WebhookHandler() http.HandlerFunc {
 				writer.WriteHeader(http.StatusInternalServerError)
 				return
 			}
-			dec := cipher.NewCBCDecrypter(c, newBuf.Bytes()[:16])
-			payloadReader := base64.NewDecoder(base64.StdEncoding, bytes.NewReader(newBuf.Bytes()[16:]))
+			ciphertext := newBuf.Bytes()
+			if len(ciphertext) < aes.BlockSize {
+				addCaller(s.Logger.Warn()).Msg("encrypted payload too short")
+				writer.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			dec := cipher.NewCBCDecrypter(c, ciphertext[:aes.BlockSize])
+			payloadReader := base64.NewDecoder(base64.StdEncoding, bytes.NewReader(ciphertext[aes.BlockSize:]))
 			buf.Reset()
-			buf.ReadFrom(payloadReader)
-			dec.CryptBlocks(buf.Bytes(), buf.Bytes())
+			_, err = buf.ReadFrom(io.LimitReader(payloadReader, maxWebhookBodyBytes))
+			if err != nil {
+				addCaller(s.Logger.Error().Err("error", err)).Msg("error in reading payload")
+				writer.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			decrypted := buf.Bytes()
+			if len(decrypted) == 0 || len(decrypted)%aes.BlockSize != 0 {
+				addCaller(s.Logger.Warn()).Msg("invalid encrypted payload length")
+				writer.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			dec.CryptBlocks(decrypted, decrypted)
 		}
 		e, err := s.onEvent(nil, websocket.TextMessage, buf.Bytes())
 		if err == errWebhookVerify {

@@ -9,10 +9,11 @@ import (
 	"go.uber.org/zap"
 )
 
-// redactURIToken 把访问日志里的 token 查询参数替换为 ***。
-// 前端 EventSource 无法自定义请求头，只能在 URL 带 token；访问日志和
-// 反向代理日志不应因此记录管理员凭证。
+// redactURIToken 把访问日志里的 token 查询参数和 /assets-img/:token/ 路径参数
+// 替换为 ***。前端 EventSource 无法自定义请求头，只能在 URL 带 token；
+// 访问日志和反向代理日志不应因此记录管理员凭证。
 func redactURIToken(uri string) string {
+	uri = redactAssetPathToken(uri)
 	q := strings.IndexByte(uri, '?')
 	if q < 0 {
 		return uri
@@ -31,6 +32,23 @@ func redactURIToken(uri string) string {
 		return uri
 	}
 	return prefix + "?" + strings.Join(parts, "&")
+}
+
+// redactAssetPathToken 脱敏资源路由路径中的 token：
+// /assets-img/<token>/... → /assets-img/***/...
+func redactAssetPathToken(uri string) string {
+	const prefix = "/assets-img/"
+	if !strings.HasPrefix(uri, prefix) {
+		return uri
+	}
+	rest := uri[len(prefix):]
+	if slash := strings.IndexByte(rest, '/'); slash > 0 {
+		return prefix + "***" + rest[slash:]
+	}
+	if rest == "" || rest == "***" {
+		return uri
+	}
+	return prefix + "***"
 }
 
 func EchoLogMiddleware() echo.MiddlewareFunc {

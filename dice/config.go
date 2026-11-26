@@ -2482,6 +2482,9 @@ func (d *Dice) loadGroups() {
 		if groupInfo.DiceIDExistsMap == nil {
 			groupInfo.DiceIDExistsMap = new(SyncMap[string, bool])
 		}
+		if groupInfo.DiceIDDepartedMap == nil {
+			groupInfo.DiceIDDepartedMap = new(SyncMap[string, bool])
+		}
 		if groupInfo.BotList == nil {
 			groupInfo.BotList = new(SyncMap[string, bool])
 		}

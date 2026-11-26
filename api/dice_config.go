@@ -300,6 +300,29 @@ func DiceConfigSet(c echo.Context) error {
 		config.WorkInQQChannel = val.(bool)
 	}
 
+	if val, ok := jsonMap["officialQQUseMarkdown"]; ok {
+		if v, ok := val.(bool); ok {
+			config.OfficialQQUseMarkdown = v
+		}
+	}
+	if val, ok := jsonMap["officialQQUseNameCard"]; ok {
+		if v, ok := val.(bool); ok {
+			config.OfficialQQUseNameCard = v
+		}
+	}
+	if val, ok := jsonMap["officialQQUseNameCardTemplate"]; ok {
+		if v, ok := val.(string); ok {
+			v = dice.NormalizeOfficialQQNameCardTemplate(v)
+			if utf8.RuneCountInString(v) > dice.MaxOfficialQQNameCardTemplateRunes {
+				return c.JSON(http.StatusBadRequest, Response{
+					"result": false,
+					"err":    "名片模板不能超过" + strconv.Itoa(dice.MaxOfficialQQNameCardTemplateRunes) + "个字符",
+				})
+			}
+			config.OfficialQQNameCardTmpl = v
+		}
+	}
+
 	if val, ok := jsonMap["diceRandomMode"]; ok {
 		if v, ok := val.(string); ok {
 			switch strings.ToLower(strings.TrimSpace(v)) {

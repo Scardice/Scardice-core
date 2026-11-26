@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lonelyevil/kook"
 	"github.com/lonelyevil/kook/log_adapter/plog"
@@ -1169,7 +1170,9 @@ func (pa *PlatformAdapterKook) DoRelogin() bool {
 	log.Infof("正在重新登录KOOK服务……")
 	session := pa.getSession()
 	if session != nil {
-		if !pa.clearSessionAndSetState(session, false, StateDisconnected) {
+		// 重登的语义是保持端点启用；这里不能写 false，否则后面的 Serve
+		// 会被启动期禁用守卫静默拦下，重连永远拉不起来。
+		if !pa.clearSessionAndSetState(session, true, StateConnecting) {
 			// 新会话已经接管；不要覆盖它的状态，也不要再启动第三个会话。
 			_ = session.Close()
 			return false
@@ -1177,7 +1180,7 @@ func (pa *PlatformAdapterKook) DoRelogin() bool {
 		_ = session.Close()
 		pa.clearKookResumeState()
 	} else {
-		if !pa.setEndpointStateIfIdle(false, StateDisconnected) {
+		if !pa.setEndpointStateIfIdle(true, StateConnecting) {
 			// 检查期间已有新会话启动，本次重登不应覆盖它。
 			pa.saveState()
 			return false
@@ -1199,6 +1202,12 @@ func (pa *PlatformAdapterKook) SetEnable(enable bool) {
 		log.Infof("正在启用KOOK服务……")
 		session := pa.getSession()
 		if session == nil {
+			// Serve 要求端点已启用，否则会被启动期禁用守卫静默拦下
+			// （只留一条“正在启用”日志，实际不连接）。这里先置启用再启动。
+			if !pa.setEndpointStateIfIdle(true, StateConnecting) {
+				return
+			}
+			pa.saveState()
 			pa.Serve()
 			return
 		}
@@ -1491,11 +1500,64 @@ func (pa *PlatformAdapterKook) SendFileToChannelRaw(id string, path string, priv
 	return resp, err
 }
 
+// maxKookSingleMessageRunes 是单条 KOOK 文本消息的保守长度上限。
+// 卡片整条超限时会直接发送失败，超长回复改走纯文本分段。
+const maxKookSingleMessageRunes = 4000
+
+// splitKookText 按 rune 上限切分文本，优先在换行处断开。
+func splitKookText(text string, maxRunes int) []string {
+	if maxRunes <= 0 {
+		return []string{text}
+	}
+	runes := []rune(text)
+	var chunks []string
+	for len(runes) > maxRunes {
+		cut := maxRunes
+		for i := maxRunes - 1; i > 0; i-- {
+			if runes[i] == '\n' {
+				cut = i + 1
+				break
+			}
+		}
+		chunks = append(chunks, string(runes[:cut]))
+		runes = runes[cut:]
+	}
+	if len(runes) > 0 {
+		chunks = append(chunks, string(runes))
+	}
+	return chunks
+}
+
+// sendKookTextChunks 把超长回复拆成多条纯文本消息，避免单张卡片超限整条丢失。
+func (pa *PlatformAdapterKook) sendKookTextChunks(id, text string, private bool) (*kook.MessageResp, error) {
+	log := zap.S().Named(logger.LogKeyAdapter)
+	var last *kook.MessageResp
+	for _, chunk := range splitKookText(text, maxKookSingleMessageRunes) {
+		if strings.TrimSpace(chunk) == "" {
+			continue
+		}
+		resp, err := pa.MessageCreateRaw(kook.MessageCreateBase{
+			Content: chunk,
+			Type:    kook.MessageTypeText,
+		}, id, private)
+		if err != nil {
+			log.Errorf("向Kook频道#%s分段发送失败:%s", id, err)
+			return last, err
+		}
+		last = resp
+	}
+	return last, nil
+}
+
 func (pa *PlatformAdapterKook) SendToChannelRaw(id string, text string, private bool) (*kook.MessageResp, error) {
 	log := zap.S().Named(logger.LogKeyAdapter)
 	bot := pa.getSession()
 	if bot == nil {
 		return nil, errors.New("KOOK 会话未建立")
+	}
+	// 超长回复不塞单张卡片，按纯文本分段发送。
+	if utf8.RuneCountInString(text) > maxKookSingleMessageRunes {
+		return pa.sendKookTextChunks(id, text, private)
 	}
 	elem := message.ConvertStringMessage(text)
 	// var err error
@@ -1583,6 +1645,15 @@ func (pa *PlatformAdapterKook) SendToChannelRaw(id string, text string, private 
 	resp, err := pa.MessageCreateRaw(msgb, id, private)
 	if err != nil {
 		log.Errorf("向Kook频道#%s发送消息时出错:%s", id, err)
+		// 卡片发送失败（过长/格式/服务端拒绝）时回退纯文本，避免整条丢失。
+		fallbackResp, fallbackErr := pa.MessageCreateRaw(kook.MessageCreateBase{
+			Content: text,
+			Type:    kook.MessageTypeText,
+		}, id, private)
+		if fallbackErr == nil {
+			return fallbackResp, nil
+		}
+		log.Errorf("向Kook频道#%s纯文本回退失败:%s", id, fallbackErr)
 	}
 	return resp, err
 }

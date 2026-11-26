@@ -213,6 +213,7 @@ func TestGroupHasOtherLiveDiceIgnoresDeparted_1119fix1(t *testing.T) {
 	g.SetLogState(1, "run-a", true)
 	g.DiceIDActiveMap.Store("QQ:departed", true)
 	g.DiceIDExistsMap.Store(senderID, true)
+	g.MarkDiceDeparted("QQ:departed")
 	d.ImSession.EndPoints = append(d.ImSession.EndPoints, &EndPointInfo{
 		EndPointInfoBase: EndPointInfoBase{UserID: "QQ:departed", Enable: true},
 	})
@@ -230,6 +231,33 @@ func TestGroupHasOtherLiveDiceIgnoresDeparted_1119fix1(t *testing.T) {
 	if !g.GetLogState().On || g.isLogPausedByBotOff() {
 		t.Fatalf("log should auto-resume on .bot on: on=%v paused=%v",
 			g.GetLogState().On, g.isLogPausedByBotOff())
+	}
+}
+
+// TestGroupHasOtherLiveDiceKeepsUnconfirmedSecondDice 锁定误删修复：
+// 端点已启用但还没在本群发过消息（ExistsMap 缺失）时，A 的 .bot off
+// 不能删掉 B 的激活态，也不能让群失活。
+func TestGroupHasOtherLiveDiceKeepsUnconfirmedSecondDice(t *testing.T) {
+	const groupID = "QQ-Group:second-dice"
+	const senderID = "QQ:2274869319"
+	const secondID = "QQ:second-bot"
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	ctx, _ := newQuitCommandTestContext(t, d, ep, senderID, groupID, "SecondDiceGroup")
+	g := ctx.Group
+	g.SetLogState(1, "run-b", true)
+	g.DiceIDActiveMap.Store(secondID, true)
+	g.DiceIDExistsMap.Store(senderID, true)
+	d.ImSession.AddEndPoint(&EndPointInfo{
+		EndPointInfoBase: EndPointInfoBase{UserID: secondID, Enable: true},
+	})
+
+	SetBotOffAtGroupAtSeq(ctx, groupID, 100)
+	if !g.IsActiveRaw() || !g.GetLogState().On {
+		t.Fatalf("second live dice must keep group active: active=%v logOn=%v", g.IsActiveRaw(), g.GetLogState().On)
+	}
+	if !g.DiceIDActiveMap.Exists(secondID) {
+		t.Fatal("unconfirmed second dice id must not be pruned")
 	}
 }
 

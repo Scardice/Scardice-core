@@ -64,6 +64,7 @@ type EventWalleQBase struct {
 	UserID    string `json:"user_id"`
 	UserName  string `json:"user_name"`
 	UserCard  string `json:"user_card"` // 群名片
+	Role      string `json:"role"`      // 群成员角色: owner/admin/member
 	GroupID   string `json:"group_id"`
 	GroupName string `json:"group_name"`
 	GuildID   string `json:"guild_id"`
@@ -167,6 +168,7 @@ type OnebotV12UserInfo struct {
 	GroupName       string `json:"group_name"`
 	MaxMemberCount  int32  `json:"max_member_count"`
 	Card            string `json:"card"`
+	Role            string `json:"role"`
 }
 
 func (pa *PlatformAdapterWalleQ) Serve() int {
@@ -647,9 +649,10 @@ func (pa *PlatformAdapterWalleQ) Serve() int {
 							// 如果是被ban之后拉群，判定为强制拉群
 							if groupInfo.EnteredTime > 0 && groupInfo.EnteredTime > banInfo.BanTime {
 								text := fmt.Sprintf("本次入群为遭遇强制邀请，即将主动退群，因为邀请人%s正处于黑名单上。打扰各位还请见谅。感谢使用余烬核心。", groupInfo.InviteUserID)
-								ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
-								time.Sleep(1 * time.Second)
-								pa.QuitGroup(ctx, groupID)
+								autoQuitGroupAsync(ctx, groupID, func(ctx *MsgContext) {
+									ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
+									time.Sleep(1 * time.Second)
+								})
 							}
 							return
 						}
@@ -662,9 +665,10 @@ func (pa *PlatformAdapterWalleQ) Serve() int {
 							// 如果是被ban之后拉群，判定为强制拉群
 							if groupInfo.EnteredTime > 0 && groupInfo.EnteredTime > banInfo.BanTime {
 								text := fmt.Sprintf("被群已被拉黑，即将自动退出，解封请联系骰主。打扰各位还请见谅。感谢使用余烬核心:\n当前情况: %s", banInfo.toText(ctx.Dice))
-								ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
-								time.Sleep(1 * time.Second)
-								pa.QuitGroup(ctx, groupID)
+								autoQuitGroupAsync(ctx, groupID, func(ctx *MsgContext) {
+									ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
+									time.Sleep(1 * time.Second)
+								})
 							}
 							return
 						}
@@ -1053,6 +1057,7 @@ func (pa *PlatformAdapterWalleQ) GetGroupMemberInfo(groupID string, userID strin
 		UserID:   d.UserID,
 		GroupID:  d.GroupID,
 		Card:     d.UserCard,
+		Role:     d.Role,
 	}
 }
 

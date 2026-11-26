@@ -274,11 +274,24 @@ func TestGroupLiveDiceContract_1120(t *testing.T) {
 	g = newGroup()
 	g.DiceIDActiveMap.Store("QQ:other", true)
 	g.DiceIDExistsMap.Store("QQ:me", true)
+	g.MarkDiceDeparted("QQ:other")
 	if groupHasOtherLiveDice(session("QQ:other", true), g, "QQ:me") {
-		t.Fatal("enabled non-member must not count")
+		t.Fatal("departed member must not count")
 	}
 	if g.DiceIDActiveMap.Exists("QQ:other") {
-		t.Fatal("non-member active id should be pruned")
+		t.Fatal("departed active id should be pruned")
+	}
+
+	// 端点已启用但 ExistsMap 还没记录（新启用/重启后未发言）：
+	// 与退群无法区分，保守保留，不能让 .bot off 误删。
+	g = newGroup()
+	g.DiceIDActiveMap.Store("QQ:other", true)
+	g.DiceIDExistsMap.Store("QQ:me", true)
+	if !groupHasOtherLiveDice(session("QQ:other", true), g, "QQ:me") {
+		t.Fatal("unconfirmed live endpoint must keep group active")
+	}
+	if !g.DiceIDActiveMap.Exists("QQ:other") {
+		t.Fatal("unconfirmed active id must not be pruned")
 	}
 
 	g = newGroup()

@@ -128,6 +128,7 @@ type OnebotUserInfo struct {
 	MaxMemberCount  int32  `json:"max_member_count"`
 	Card            string `json:"card"`
 	Role            string `json:"role"`
+	JoinTime        int64  `json:"join_time"`
 }
 
 type MessageQQBase struct {
@@ -164,8 +165,9 @@ type MessageQQBase struct {
 		MaxMemberCount  int32           `json:"max_member_count"`
 
 		// 群成员信息
-		Card string `json:"card"`
-		Role string `json:"role"`
+		Card     string `json:"card"`
+		Role     string `json:"role"`
+		JoinTime int64  `json:"join_time"`
 	} `json:"data"`
 	Retcode int64 `json:"retcode"`
 	// Status string `json:"status"`
@@ -599,9 +601,10 @@ func (pa *PlatformAdapterGocq) Serve() int {
 							// 如果是被ban之后拉群，判定为强制拉群
 							if groupInfo.EnteredTime > 0 && groupInfo.EnteredTime > banInfo.BanTime {
 								text := fmt.Sprintf("本次入群为遭遇强制邀请，即将主动退群，因为邀请人%s正处于黑名单上。打扰各位还请见谅。感谢使用余烬核心。", groupInfo.InviteUserID)
-								ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
-								time.Sleep(1 * time.Second)
-								pa.QuitGroup(ctx, groupID)
+								autoQuitGroupAsync(ctx, groupID, func(ctx *MsgContext) {
+									ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
+									time.Sleep(1 * time.Second)
+								})
 							}
 							return
 						}
@@ -614,9 +617,10 @@ func (pa *PlatformAdapterGocq) Serve() int {
 							// 如果是被ban之后拉群，判定为强制拉群
 							if groupInfo.EnteredTime > 0 && groupInfo.EnteredTime > banInfo.BanTime {
 								text := fmt.Sprintf("被群已被拉黑，即将自动退出，解封请联系骰主。打扰各位还请见谅。感谢使用余烬核心:\n当前情况: %s", banInfo.toText(ctx.Dice))
-								ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
-								time.Sleep(1 * time.Second)
-								pa.QuitGroup(ctx, groupID)
+								autoQuitGroupAsync(ctx, groupID, func(ctx *MsgContext) {
+									ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
+									time.Sleep(1 * time.Second)
+								})
 							}
 							return
 						}
@@ -1005,6 +1009,7 @@ func (pa *PlatformAdapterGocq) Serve() int {
 			}
 			// TODO：存疑，根据DISMISS的代码复制而来
 			group.DiceIDExistsMap.Delete(ep.UserID)
+			group.MarkDiceDeparted(ep.UserID)
 			group.MarkDirty(ctx.Dice)
 			log.Info(txt)
 			if pendingQuit == nil || pendingQuit.Origin != QuitOriginAutoInactive || !session.Parent.Config.QuitInactiveNoticeSummaryMode {

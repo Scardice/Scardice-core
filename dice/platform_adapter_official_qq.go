@@ -2174,6 +2174,7 @@ func (pa *PlatformAdapterOfficialQQ) groupMemberRemoveReceive(event *dto.WSPaylo
 		if exists {
 			selfID, _ := pa.identitySnapshot()
 			group.DiceIDExistsMap.Delete(selfID)
+			group.MarkDiceDeparted(selfID)
 			group.MarkDirty(s.Parent)
 		}
 	}

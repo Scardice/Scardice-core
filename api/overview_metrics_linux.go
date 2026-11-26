@@ -83,13 +83,14 @@ func readProcCPU() (idle, total uint64, ok bool) {
 }
 
 // readProcSelfCPUSeconds 返回进程累计 CPU 秒数。
-// 优先使用 schedstat（纳秒，精度高且不依赖 USER_HZ）；老内核回退到 /proc/self/stat。
+// 以 /proc/self/stat 的全进程 utime+stime 为准；/proc/self/schedstat
+// 只统计当前线程（主线程），多线程下会严重低估，仅作老内核回退。
 func readProcSelfCPUSeconds() (float64, bool) {
-	if ns, ok := readProcSelfSchedstat(); ok && ns > 0 {
-		return float64(ns) / 1e9, true
-	}
 	if ticks, ok := readProcSelfCPU(); ok {
 		return float64(ticks) / procClockTicksFallback, true
+	}
+	if ns, ok := readProcSelfSchedstat(); ok && ns > 0 {
+		return float64(ns) / 1e9, true
 	}
 	return 0, false
 }

@@ -137,6 +137,9 @@ func storyDownloadLog(c echo.Context) error {
 	if groupID == "" || name == "" {
 		return Error(&c, "groupId 和 name 不能为空", Response{})
 	}
+	if group, ok := myDice.ImSession.ServiceAtNew.Load(groupID); ok && dice.LogGapIncompleteForUpload(group) {
+		return Error(&c, dice.LogGapUploadBlockText("下载日志"), Response{})
+	}
 
 	path, filename, err := storylog.ExportLocalZip(storylog.UploadEnv{
 		Db:      myDice.DBOperator,
@@ -158,6 +161,9 @@ func storyUploadLog(c echo.Context) error {
 	}
 	v := &model.LogInfo{}
 	_ = c.Bind(&v)
+	if group, ok := myDice.ImSession.ServiceAtNew.Load(v.GroupID); ok && dice.LogGapIncompleteForUpload(group) {
+		return Error(&c, dice.LogGapUploadBlockText("上传日志"), Response{})
+	}
 	url, notice, err := logSendToBackend(v.GroupID, v.Name)
 	if err != nil {
 		myDice.Logger.Error("storyUploadLog", err)

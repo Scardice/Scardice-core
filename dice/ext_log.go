@@ -465,12 +465,33 @@ func logGapUnsettled(group *GroupInfo) bool {
 // logGapIncompleteForUpload 判断当前日志是否还有未完成的补全任务/区间。
 // .log end/get/masterget/export 在补全未完成时上传会少一段；1120 起阻止并提示。
 func logGapIncompleteForUpload(group *GroupInfo) bool {
+	if group == nil {
+		return false
+	}
+	group.logStateMu.Lock()
+	noLog := group.LogCurID == 0 && group.LogCurName == ""
+	group.logStateMu.Unlock()
+	if noLog {
+		// .log halt/.log end 后已经没有可上传的当前日志；在途 worker 收尾
+		// 不应再把用户挡在闸门外。
+		return false
+	}
 	return logGapUnsettled(group)
 }
 
 // logGapUploadBlockText 生成上传闸门的用户提示。
 func logGapUploadBlockText(action string) string {
 	return "日志补全尚未完成，暂时不能" + action + "。请等待补全完成通知后重试；如确认放弃补录，先 .log halt。"
+}
+
+// LogGapIncompleteForUpload 是命令行补全闸门的导出包装，供 Web UI 复用。
+func LogGapIncompleteForUpload(group *GroupInfo) bool {
+	return logGapIncompleteForUpload(group)
+}
+
+// LogGapUploadBlockText 是补全闸门提示的导出包装，供 Web UI 复用。
+func LogGapUploadBlockText(action string) string {
+	return logGapUploadBlockText(action)
 }
 
 // logGapUserHint 返回 .bot on/off 回复里附加的补录状态提示。
@@ -1534,6 +1555,8 @@ func RegisterBuiltinExtLog(self *Dice) {
 			if flag == "skip" {
 				return
 			}
+			// 官方 QQ 名片是仅用于展示的前缀，跑团日志里保留干净正文。
+			message := stripOfficialQQNameCard(officialQQNameCardLineOf(ctx), msg.Message)
 			privateCommandListenCheck()
 			if msg.MessageType == "private" && ctx.CommandHideFlag != "" {
 				if privateCommandListenHas(ctx.CommandID) {
@@ -1552,7 +1575,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 						IMUserID:    UserIDExtract(ctx.EndPoint.UserID),
 						UniformID:   ctx.EndPoint.UserID,
 						Time:        time.Now().Unix(),
-						Message:     msg.Message,
+						Message:     message,
 						IsDice:      true,
 						CommandID:   ctx.CommandID,
 						CommandInfo: ctx.CommandInfo,
@@ -1586,7 +1609,7 @@ func RegisterBuiltinExtLog(self *Dice) {
 						IMUserID:    UserIDExtract(ctx.EndPoint.UserID),
 						UniformID:   ctx.EndPoint.UserID,
 						Time:        time.Now().Unix(),
-						Message:     msg.Message,
+						Message:     message,
 						IsDice:      true,
 						CommandID:   ctx.CommandID,
 						CommandInfo: ctx.CommandInfo,
@@ -1653,9 +1676,15 @@ func RegisterBuiltinExtLog(self *Dice) {
 					}
 					groupMsgInfoSet(msg.RawID)
 
+					// 官方 QQ 没有改名接口，平台昵称不会变成 .sn 名片，因此日志记录名片内容。
+					nickname := officialQQLogNickname(ctx, msg.Sender.Nickname)
+					if nickname == "" {
+						nickname = ctx.Player.Name
+					}
+
 					// <2022-02-15 09:54:14.0> [摸鱼king]: 有的 但我不知道
 					a := model.LogOneItem{
-						Nickname:  ctx.Player.Name,
+						Nickname:  nickname,
 						IMUserID:  UserIDExtract(ctx.Player.UserID),
 						UniformID: ctx.Player.UserID,
 						Time:      msg.Time,
@@ -2756,12 +2785,63 @@ func (g *GroupInfo) mergeLogGapTask(task logGapFillTask) bool {
 	return true
 }
 
+// logGapWorkerContext 返回当前补全 worker 的取消上下文；worker 未运行时返回
+// Background，保持旧行为（例如测试直接调用 run）。
+func (g *GroupInfo) logGapWorkerContext() context.Context {
+	if g == nil {
+		return context.Background()
+	}
+	g.logGapQueueMu.Lock()
+	defer g.logGapQueueMu.Unlock()
+	if g.logGapWorkerCtx != nil {
+		return g.logGapWorkerCtx
+	}
+	return context.Background()
+}
+
+// cancelLogGapWorker 取消在途补全拉取/重放（.log halt/.log end 使用）。
+// 只触发取消，不清 pending；调用方按需用 clearLogGapPendingRange 清区间。
+func (g *GroupInfo) cancelLogGapWorker() {
+	if g == nil {
+		return
+	}
+	g.logGapQueueMu.Lock()
+	cancel := g.logGapWorkerCancel
+	g.logGapQueueMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
 // runLogGapWorker 串行消费合并后的断层。
 // 单个任务 panic 只丢这一段，不能让 worker 标志卡死：CreateTempCtx 在端点
 // 尚未就绪时会 panic，而断层补全恰好运行在刚重连之后。
 func (g *GroupInfo) runLogGapWorker() {
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	g.logGapQueueMu.Lock()
+	g.logGapWorkerCtx = workerCtx
+	g.logGapWorkerCancel = workerCancel
+	g.logGapQueueMu.Unlock()
+	defer func() {
+		workerCancel()
+		g.logGapQueueMu.Lock()
+		if g.logGapWorkerCtx == workerCtx {
+			g.logGapWorkerCtx = nil
+			g.logGapWorkerCancel = nil
+		}
+		g.logGapQueueMu.Unlock()
+	}()
 	for {
 		g.logGapQueueMu.Lock()
+		if workerCtx.Err() != nil {
+			// .log halt / end 已取消在途补全：丢弃待处理任务并退出。
+			g.logGapPending = nil
+			g.logGapRunningTask = nil
+			g.logGapWorkerRunning = false
+			g.logGapRunningOffDiscovery.Store(false)
+			g.logGapQueueMu.Unlock()
+			return
+		}
 		task := g.logGapPending
 		g.logGapPending = nil
 		if task == nil {
@@ -2865,7 +2945,7 @@ func (t logGapFillTask) run() {
 	t.dice.Logger.Infof("检测到日志seq断层: 群=%s 上条seq=%d 本条seq=%d 缺失=%d",
 		t.group.GroupID, t.fromSeq, t.toSeq, t.gap)
 
-	fetchCtx, cancel := context.WithTimeout(context.Background(), logGapFillTimeout)
+	fetchCtx, cancel := context.WithTimeout(t.group.logGapWorkerContext(), logGapFillTimeout)
 	defer cancel()
 
 	// 从缺口起点向终点分段扫描：每段最多 logGapFillMaxMessages 条，
