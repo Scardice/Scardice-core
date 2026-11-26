@@ -2334,6 +2334,7 @@ func (d *Dice) reconcileLogGapsOnStartup() {
 		d.CancelLogGapFillTasks()
 		return
 	}
+	d.ImSession.LogGapLastReconcileAt.Store(time.Now().Unix())
 	count := 0
 	d.ImSession.ServiceAtNew.Range(func(_ string, group *GroupInfo) bool {
 		if d.reconcileLogGapForGroup(group) {

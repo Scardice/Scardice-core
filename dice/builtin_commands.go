@@ -1405,11 +1405,15 @@ func (d *Dice) registerCoreCommands() {
 					ctx.Dice.Config.UpgradeEndpointID = ctx.EndPoint.ID
 					ctx.Dice.Save(true)
 
-					bakFn, _ := ctx.Dice.Parent.Backup(BackupSelectionAll, false)
-					tmpPath := path.Join(os.TempDir(), bakFn)
-					_ = os.MkdirAll(tmpPath, 0755)
-					ctx.Dice.Logger.Infof("将备份文件复制到此路径: %s", tmpPath)
-					_ = cp.Copy(path.Join(BackupDir, bakFn), tmpPath)
+					bakFn, bakErr := ctx.Dice.Parent.Backup(BackupSelectionAll, false)
+					if bakErr != nil {
+						ctx.Dice.Logger.Errorf("升级前备份失败，跳过备份复制: %v", bakErr)
+					} else {
+						tmpPath := path.Join(os.TempDir(), bakFn)
+						_ = os.MkdirAll(path.Dir(tmpPath), 0o755)
+						ctx.Dice.Logger.Infof("将备份文件复制到此路径: %s", tmpPath)
+						_ = cp.Copy(bakFn, tmpPath)
+					}
 
 					if ret == "" {
 						ReplyToSender(ctx, msg, "准备开始升级，服务即将离线")

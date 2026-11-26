@@ -1755,6 +1755,8 @@ type IMSession struct {
 	endPointsSnapshot      atomic.Pointer[[]*EndPointInfo]
 	groupMemberWelcomeMu   sync.Mutex
 	lastGroupMemberWelcome *LastWelcomeInfo
+	// LogGapLastReconcileAt 是最近一次启动/重连日志缺口对账的发起时间(unix)。
+	LogGapLastReconcileAt atomic.Int64 `json:"-" yaml:"-"`
 }
 
 // EndPointDisplaySnapshot 是托盘菜单所需的端点展示值快照。

@@ -38,12 +38,16 @@ func upgrade(c echo.Context) error {
 			ret := <-dm.UpdateDownloadedChan
 			if ret == "" {
 				myDice.Save(true)
-				bakFn, _ := myDice.Parent.Backup(dice.BackupSelectionAll, false)
-				tmpParent := os.TempDir()
-				tmpPath := path.Join(tmpParent, bakFn)
-				_ = os.MkdirAll(filepath.Join(tmpParent, "backups"), 0644)
-				myDice.Logger.Infof("将备份文件复制到此路径: %s", tmpPath)
-				_ = cp.Copy(bakFn, tmpPath)
+				bakFn, bakErr := myDice.Parent.Backup(dice.BackupSelectionAll, false)
+				if bakErr != nil {
+					myDice.Logger.Errorf("升级前备份失败，跳过备份复制: %v", bakErr)
+				} else {
+					tmpParent := os.TempDir()
+					tmpPath := path.Join(tmpParent, bakFn)
+					_ = os.MkdirAll(filepath.Join(tmpParent, "backups"), 0o755)
+					myDice.Logger.Infof("将备份文件复制到此路径: %s", tmpPath)
+					_ = cp.Copy(bakFn, tmpPath)
+				}
 
 				dm.UpdateRequestChan <- myDice
 				return c.JSON(200, map[string]interface{}{

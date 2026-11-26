@@ -40,8 +40,16 @@ func backupGetList(c echo.Context) error {
 
 	var items []*backupFileItem
 	_ = filepath.Walk(dice.BackupDir, func(path string, info fs.FileInfo, err error) error {
+		// 单个文件/子目录不可读时跳过，不能让整个列表遍历中止。
+		if err != nil || info == nil {
+			return nil
+		}
 		if !info.IsDir() {
 			fn := info.Name()
+			// 打包中的临时文件大小还在变化，不展示给前端
+			if strings.HasSuffix(fn, dice.BackupTempSuffix) {
+				return nil
+			}
 			matches := reFn.FindStringSubmatch(fn)
 			selection := int64(0)
 			if len(matches) == 4 {
@@ -59,7 +67,7 @@ func backupGetList(c echo.Context) error {
 				Selection: selection,
 			})
 		}
-		return err
+		return nil
 	})
 
 	ReverseSlice(items)
@@ -160,9 +168,26 @@ func backupExec(c echo.Context) error {
 	}
 
 	_, err = dm.Backup(dice.BackupSelection(v.Selection), false)
-	return c.JSON(http.StatusOK, map[string]interface{}{
+	resp := map[string]interface{}{
 		"success": err == nil,
-	})
+	}
+	if err != nil {
+		resp["err"] = err.Error()
+	}
+	return c.JSON(http.StatusOK, resp)
+}
+
+// 备份进度
+func backupProgressStatus(c echo.Context) error {
+	if !doAuth(c) {
+		return c.JSON(http.StatusForbidden, nil)
+	}
+	if dm.JustForTest {
+		return c.JSON(200, map[string]interface{}{
+			"testMode": true,
+		})
+	}
+	return c.JSON(http.StatusOK, dm.BackupProgressSnapshot())
 }
 
 type backupConfig struct {

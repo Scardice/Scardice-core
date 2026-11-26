@@ -1355,6 +1355,8 @@ func (p *PlatformAdapterOnebot) convertSealMsgToMessageChain(msg []message.IMess
 			if fileVal == "" {
 				continue
 			}
+			// 海豹内部用 files:// 表示共享文件系统；OneBot 协议端只认 file://。
+			fileVal = normalizeOnebotFileValue(fileVal)
 			if !hasURLScheme(fileVal) {
 				if resolved, err := p.resolveLocalAsset(fileVal); err == nil {
 					fileVal = resolved
@@ -1567,4 +1569,14 @@ func (p *PlatformAdapterOnebot) makeCtx(req gjson.Result) *MsgContext {
 	}
 
 	return ctx
+}
+
+// normalizeOnebotFileValue 把海豹内部的 files:// 共享文件引用转成 OneBot
+// 协议端可识别的 file://；其它 URL 和普通路径原样返回。
+func normalizeOnebotFileValue(fileVal string) string {
+	const filesScheme = "files://"
+	if len(fileVal) >= len(filesScheme) && strings.EqualFold(fileVal[:len(filesScheme)], filesScheme) {
+		return "file://" + fileVal[len(filesScheme):]
+	}
+	return fileVal
 }

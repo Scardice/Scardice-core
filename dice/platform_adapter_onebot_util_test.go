@@ -116,3 +116,22 @@ func TestMessageOBQQToStdMessageUsesStringRawID(t *testing.T) {
 		t.Fatalf("unexpected RawID: %q", rawID)
 	}
 }
+
+func TestNormalizeOnebotFileValue(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"files:///tmp/scardice-log.txt", "file:///tmp/scardice-log.txt"},
+		{"FILES:///tmp/scardice-log.txt", "file:///tmp/scardice-log.txt"},
+		{"file:///tmp/scardice-log.txt", "file:///tmp/scardice-log.txt"},
+		{"https://example.com/a.txt", "https://example.com/a.txt"},
+		{"data/decks/a.json", "data/decks/a.json"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := normalizeOnebotFileValue(tc.in); got != tc.want {
+			t.Errorf("normalizeOnebotFileValue(%q)=%q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

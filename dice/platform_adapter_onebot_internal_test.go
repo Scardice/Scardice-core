@@ -30,6 +30,7 @@ type onebotTestEmitter struct {
 	groupInfo      *emitterTypes.GroupInfo
 	groupInfoErr   error
 	groupReqCh     chan struct{}
+	quitGroupCalls []int64
 	loginInfo      *emitterTypes.LoginInfo
 	loginInfoErr   error
 	sendPvtCh      chan time.Time
@@ -134,7 +135,10 @@ func (m *onebotTestEmitter) SetGroupSpecialTitle(context.Context, int64, int64, 
 	return nil
 }
 
-func (m *onebotTestEmitter) QuitGroup(context.Context, int64) error { return nil }
+func (m *onebotTestEmitter) QuitGroup(_ context.Context, groupID int64) error {
+	m.quitGroupCalls = append(m.quitGroupCalls, groupID)
+	return nil
+}
 
 func (m *onebotTestEmitter) SetGroupCard(context.Context, int64, int64, string) error { return nil }
 
@@ -381,6 +385,68 @@ func TestPureOnebotGetGroupInfoSyncUsesGroupBanInfo(t *testing.T) {
 
 	if got := pa.GetGroupInfoSync(groupID); got == nil {
 		t.Fatalf("expected group info, got nil")
+	}
+	if len(em.quitGroupCalls) != 1 || em.quitGroupCalls[0] != 66666 {
+		t.Fatalf("expected banned group to be quit, got %v", em.quitGroupCalls)
+	}
+}
+
+// 邀请限制（拒绝拉群、只允许信任的人拉群）不代表群被拉黑；
+// 已经加入的群不能因为 BanList 中有信任/常规/警告条目就被自动退出。
+func TestPureOnebotGetGroupInfoSyncDoesNotQuitForInviteRestrictions(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		rank         BanRankType
+		refuseInvite bool
+		trustOnly    bool
+	}{
+		{name: "trusted group", rank: BanRankTrusted},
+		{name: "trusted group with refused invites", rank: BanRankTrusted, refuseInvite: true},
+		{name: "trusted group with both restrictions", rank: BanRankTrusted, refuseInvite: true, trustOnly: true},
+		{name: "normal group with refused invites", rank: BanRankNormal, refuseInvite: true},
+		{name: "warned group with refused invites", rank: BanRankWarn, refuseInvite: true},
+		{name: "normal group in trust-only mode", rank: BanRankNormal, trustOnly: true},
+		{name: "warned group in trust-only mode", rank: BanRankWarn, trustOnly: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d, pa, em, cleanup := newPureOnebotTestAdapter(t)
+			defer cleanup()
+
+			d.Config.RefuseGroupInvite = tt.refuseInvite
+			d.Config.TrustOnlyMode = tt.trustOnly
+			const groupID = "QQ-Group:66666"
+			group := &GroupInfo{
+				GroupID:         groupID,
+				GroupName:       "group",
+				InviteUserID:    "QQ:55555",
+				EnteredTime:     123,
+				DiceIDExistsMap: new(SyncMap[string, bool]),
+			}
+			group.DiceIDExistsMap.Store(pa.EndPoint.UserID, true)
+			d.ImSession.ServiceAtNew.Store(groupID, group)
+			em.groupInfo = &emitterTypes.GroupInfo{
+				GroupId:        66666,
+				GroupName:      "group",
+				MemberCount:    10,
+				MaxMemberCount: 100,
+			}
+			d.Config.BanList.Map.Store(groupID, &BanListInfoItem{
+				ID:   groupID,
+				Rank: tt.rank,
+			})
+
+			if got := pa.GetGroupInfoSync(groupID); got == nil {
+				t.Fatal("expected group info, got nil")
+			}
+			if len(em.quitGroupCalls) != 0 {
+				t.Fatalf("invite restrictions must not cause blacklist quits, got %v", em.quitGroupCalls)
+			}
+			select {
+			case <-em.sendGrCh:
+				t.Fatal("expected no blacklist warning for a group that is not banned")
+			default:
+			}
+		})
 	}
 }
 
@@ -1105,4 +1171,26 @@ func waitPureOnebotInfoLogCount(t *testing.T, observed *observer.ObservedLogs, s
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %d log entries containing %q", count, snippet)
+}
+
+// 协议端比骰子晚起来时，首次连接被拒、状态机进入 failed，retryConnect 随后直接重连成功。
+// 这里用真实的状态转换表，确认重连成功会回到 connected，之后断线也还能再触发重连。
+func TestPureOnebotReconnectAfterInitialFailureMarksConnected(t *testing.T) {
+	pa := &PlatformAdapterOnebot{EndPoint: &EndPointInfo{}}
+	pa.ensureFSM()
+	pa.sm.SetState("failed")
+	pa.EndPoint.State = StateConnectionFailed
+
+	if err := pa.sm.Event(context.Background(), "connect_ok"); err != nil {
+		t.Fatalf("expected connect_ok to be accepted from failed, got %v", err)
+	}
+	if got := pa.sm.Current(); got != "connected" {
+		t.Fatalf("expected FSM to transition to connected, got %q", got)
+	}
+	if pa.EndPoint.State != StateConnected {
+		t.Fatalf("expected EndPoint.State to be StateConnected, got %v", pa.EndPoint.State)
+	}
+	if !pa.sm.Can("connection_lost") {
+		t.Fatal("expected connection_lost to be possible after reconnecting")
+	}
 }

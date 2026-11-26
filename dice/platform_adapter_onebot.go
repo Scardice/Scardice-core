@@ -595,7 +595,9 @@ func (p *PlatformAdapterOnebot) GetGroupInfoSync(diceGroupID string) *GroupCache
 	}
 	// 这群有问题
 	groupResult := checkBlackList(diceGroupID, "group", uid, ctx)
-	if !groupResult.Passed {
+	// 邀请限制（拒绝拉群、只允许信任的人拉群）不代表群被拉黑，
+	// 不能据此退出已经加入的群；只有真正 group_banned 才退群。
+	if groupResult.FailureType == "group_banned" {
 		// 如果是被ban之后拉群，判定为强制拉群
 		if groupResult.BanInfo != nil && groupInfo.EnteredTime > 0 && groupInfo.EnteredTime > groupResult.BanInfo.BanTime {
 			text := fmt.Sprintf("该群已被拉黑，即将自动退出，解封请联系骰主。打扰各位还请见谅。感谢使用余烬核心:\n当前情况: %s", groupResult.BanInfo.toText(ctx.Dice))
@@ -1168,7 +1170,10 @@ func (p *PlatformAdapterOnebot) ensureFSM() {
 		"disconnected",
 		loopfsm.Events{
 			{Name: "enable", Src: []string{"disconnected", "failed"}, Dst: "connecting"},
-			{Name: "connect_ok", Src: []string{"connecting"}, Dst: "connected"},
+			// 首次连接失败后，retryConnect 直接调用 startConnection 重连，不经过 enable，
+			// 重连成功时状态机仍停在 failed。不接受 failed 的话 connect_ok 会被拒：
+			// State 一直是「连接失败」，之后的 connection_lost 也被拒，断线不再重连。
+			{Name: "connect_ok", Src: []string{"connecting", "failed"}, Dst: "connected"},
 			{Name: "connect_fail", Src: []string{"connecting"}, Dst: "failed"},
 			{Name: "disable", Src: []string{"connecting", "connected", "failed", "disconnected"}, Dst: "disconnected"},
 			{Name: "connection_lost", Src: []string{"connected"}, Dst: "connecting"},

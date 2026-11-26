@@ -107,6 +107,7 @@ func (l *UIWriter) Write(p []byte) (int, error) {
 		Level  zapcore.Level `json:"level"`
 		Module string        `json:"module"`
 		Time   string        `json:"time"`
+		Caller string        `json:"caller"`
 		Msg    string        `json:"msg"`
 	}
 	err := json.Unmarshal(p, &a)
@@ -116,7 +117,7 @@ func (l *UIWriter) Write(p []byte) (int, error) {
 			Level:  a.Level.String(),
 			Module: a.Module,
 			TS:     float64(ts.Unix()),
-			Caller: "",
+			Caller: a.Caller,
 			Msg:    a.Msg,
 		})
 	}

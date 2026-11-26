@@ -30,6 +30,7 @@ import (
 	"go.uber.org/zap/zapcore"
 
 	"Scardice-core/api"
+	"Scardice-core/bootsound"
 	"Scardice-core/dice"
 	"Scardice-core/dice/service"
 	"Scardice-core/logger"
@@ -614,13 +615,16 @@ func main() {
 	// 初始化核心
 	diceManager.TryCreateDefault()
 	diceManager.InitDice(uiWriter)
+	// 先建立日志订阅，再写自检完成日志，确保这一行不会漏掉。
+	startStartupLogWatch(diceManager, uiWriter)
 
+	selfTestElapsed := time.Since(startupCheckStart)
 	if startupCheckWarned > 0 {
 		log.Warnf("[自检] 核心组件自检完成：%d 项通过，%d 项警告，耗时 %dms，请查看上方警告",
-			startupCheckPassed, startupCheckWarned, time.Since(startupCheckStart).Milliseconds())
+			startupCheckPassed, startupCheckWarned, selfTestElapsed.Milliseconds())
 	} else {
 		log.Infof("[自检] 核心组件自检完成：%d 项通过，耗时 %dms",
-			startupCheckPassed, time.Since(startupCheckStart).Milliseconds())
+			startupCheckPassed, selfTestElapsed.Milliseconds())
 	}
 
 	if opts.JustForTest {
@@ -798,6 +802,216 @@ func diceServe(d *dice.Dice) {
 			_conn.State = 0 // 重置状态
 		}
 	}
+}
+
+// startupSoundEnabled 返回是否至少有一个骰子实例开启了 UI 音频。
+// 配置属于核心设置，默认关闭；播放失败不影响启动。
+func startupSoundEnabled(dm *dice.DiceManager) bool {
+	for _, d := range dm.DiceSnapshot() {
+		if d.Config.StartupSoundEnable {
+			return true
+		}
+	}
+	return false
+}
+
+// startStartupLogWatch 订阅核心日志，按实际出现的成功日志触发 UI 音频。
+// 不同用户的平台和日志内容不同，因此不绑定具体适配器，只看成功/失败日志。
+func startStartupLogWatch(dm *dice.DiceManager, uiWriter *logger.UIWriter) {
+	if !startupSoundEnabled(dm) {
+		return
+	}
+	subID, ch, snapshot := uiWriter.Subscribe(1024)
+	go watchStartupLogs(dm, uiWriter, subID, ch, snapshot)
+}
+
+func watchStartupLogs(dm *dice.DiceManager, uiWriter *logger.UIWriter, subID int64, ch <-chan *logger.LogItem, snapshot []*logger.LogItem) {
+	defer uiWriter.Unsubscribe(subID)
+	defer func() {
+		// 音频判断绝不能影响核心运行。
+		_ = recover()
+	}()
+
+	var (
+		selfTestDone bool
+		uiDone       bool
+		passwordDone bool
+		accountDone  bool
+		deckStarted  bool
+		deckFailed   bool
+		deckDone     bool
+		jsStarted    bool
+		jsFailed     bool
+		jsDone       bool
+	)
+
+	handle := func(item *logger.LogItem) {
+		if item == nil {
+			return
+		}
+		msg := item.Msg
+		if !isStartupAudioLog(msg) {
+			return
+		}
+
+		// 自检完成：带“项警告”说明没有全部通过，不播成功句。
+		if !selfTestDone && strings.Contains(msg, "核心组件自检完成") {
+			selfTestDone = true
+			if !strings.Contains(msg, "项警告") {
+				bootsound.PlayEvent(bootsound.EventSelfTestComplete)
+			}
+		}
+
+		// UI 端口真正检查通过才算打开；未设置密码时紧接着播密码正确。
+		if !uiDone && strings.Contains(msg, "WebUI") && strings.Contains(msg, "检查通过") {
+			uiDone = true
+			bootsound.PlayEvent(bootsound.EventUIEnabled)
+			if dm.UIPasswordHash == "" {
+				passwordDone = true
+				bootsound.PlayEvent(bootsound.EventPasswordCorrect)
+			}
+		}
+
+		// 密码正确由登录接口在真正校验通过后写日志触发。
+		if !passwordDone && strings.Contains(msg, "密码校验通过") {
+			passwordDone = true
+			bootsound.PlayEvent(bootsound.EventPasswordCorrect)
+		}
+
+		// 任一平台账号连接成功；排除“已启用账号”等汇总提示。
+		if !accountDone && isAccountConnectedLog(item) {
+			accountDone = true
+			bootsound.PlayEvent(bootsound.EventAccountConnected)
+		}
+
+		// 牌堆：记录开始与失败，完成时只有全程无失败才播。
+		if strings.Contains(msg, "牌堆开始异步加载") {
+			deckStarted = true
+			deckFailed = false
+		}
+		if deckStarted && !deckDone && isDeckLoadFailureLog(msg) {
+			deckFailed = true
+		}
+		if deckStarted && !deckDone && strings.Contains(msg, "牌堆异步加载完成") {
+			deckDone = true
+			if !deckFailed {
+				bootsound.PlayEvent(bootsound.EventDeckLoaded)
+			}
+		}
+
+		// JS：同上，加载过程中出现失败就不播“JS plugin loaded”。
+		if strings.Contains(msg, "JS 扩展脚本开始异步加载") {
+			jsStarted = true
+			jsFailed = false
+		}
+		if jsStarted && !jsDone && isJSLoadFailureLog(msg) {
+			jsFailed = true
+		}
+		if jsStarted && !jsDone && strings.Contains(msg, "JS 扩展脚本异步加载完成") {
+			jsDone = true
+			if !jsFailed {
+				bootsound.PlayEvent(bootsound.EventJSLoaded)
+			}
+		}
+	}
+
+	for _, item := range snapshot {
+		handle(item)
+	}
+	for item := range ch {
+		handle(item)
+	}
+}
+
+// isStartupAudioLog 只保留可能触发 UI 音频的日志，避免逐条扫描所有消息。
+func isStartupAudioLog(msg string) bool {
+	return strings.Contains(msg, "核心组件自检完成") ||
+		strings.Contains(msg, "WebUI") ||
+		strings.Contains(msg, "密码校验通过") ||
+		strings.Contains(msg, "连接成功") ||
+		strings.Contains(msg, "牌堆") ||
+		strings.Contains(msg, "脚本") ||
+		strings.Contains(msg, "JS")
+}
+
+// isAccountConnectedLog 判断一条日志是否代表账号真正连接成功。
+// 平台适配器的成功日志调用点都在 platform_adapter_* 文件中，用 caller
+// 区分平台账号和插件自己打印的“连接成功”，避免误报。
+func isAccountConnectedLog(item *logger.LogItem) bool {
+	msg := item.Msg
+	if !strings.Contains(msg, "连接成功") {
+		return false
+	}
+	// 汇总提示、失败描述和音频自身日志不算账号连接成功。
+	if strings.Contains(msg, "[连接]") || strings.Contains(msg, "已启用账号") ||
+		strings.Contains(msg, "各平台连接结果") || strings.Contains(msg, "播放 UI 音频") {
+		return false
+	}
+	if strings.Contains(msg, "未连接成功") || strings.Contains(msg, "连接失败") ||
+		strings.Contains(msg, "连接不成功") {
+		return false
+	}
+	if strings.Contains(item.Caller, "platform_adapter_") {
+		return true
+	}
+	// 只有拿不到调用文件时才按消息格式兜底；有 caller 的插件日志不算。
+	if item.Caller == "" {
+		return isPlatformConnectedMessage(msg)
+	}
+	return false
+}
+
+// isPlatformConnectedMessage 在没有 caller 时按平台成功日志的常见格式兜底。
+func isPlatformConnectedMessage(msg string) bool {
+	if strings.Contains(msg, "账号") || strings.Contains(msg, "（READY）") ||
+		strings.Contains(msg, "反向ws连接成功") || strings.Contains(msg, "连接成功 >>>") ||
+		strings.Contains(msg, "服务连接成功") || strings.Contains(msg, "v11 连接成功") {
+		return true
+	}
+	for _, platform := range []string{
+		"onebot", "OneBot", "KOOK", "Dodo", "Minecraft", "Dingtalk",
+		"SealChat", "Slack", "satori", "Telegram", "Discord", "Milky", "red",
+	} {
+		if strings.Contains(msg, platform+" 连接成功") {
+			return true
+		}
+	}
+	return false
+}
+
+// isDeckLoadFailureLog 判断牌堆加载过程中是否出现了失败日志。
+func isDeckLoadFailureLog(msg string) bool {
+	if !strings.Contains(msg, "牌堆") {
+		return false
+	}
+	return strings.Contains(msg, "失败") || strings.Contains(msg, "解析失败")
+}
+
+// isJSLoadFailureLog 判断 JS 加载过程中是否出现了失败日志。
+func isJSLoadFailureLog(msg string) bool {
+	if !strings.Contains(msg, "脚本") && !strings.Contains(msg, "JS") && !strings.Contains(msg, "插件") {
+		return false
+	}
+	// “失败 0 个”是扫描汇总，不算失败；“失败 N 个”才算。
+	if idx := strings.Index(msg, "失败 "); idx >= 0 {
+		rest := msg[idx+len("失败 "):]
+		n := 0
+		for _, r := range rest {
+			if r < '0' || r > '9' {
+				break
+			}
+			n = n*10 + int(r-'0')
+		}
+		if n > 0 {
+			return true
+		}
+	}
+	return strings.Contains(msg, "读取脚本失败") ||
+		strings.Contains(msg, "读取内置脚本失败") ||
+		strings.Contains(msg, "拒绝加载") ||
+		strings.Contains(msg, "校验未通过") ||
+		strings.Contains(msg, "JS 核心执行异常") ||
+		strings.Contains(msg, "解析失败")
 }
 
 func uiServe(dm *dice.DiceManager, hideUI bool, useBuiltin bool) {

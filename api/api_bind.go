@@ -20,6 +20,7 @@ import (
 	"github.com/samber/lo"
 
 	"Scardice-core/dice"
+	"Scardice-core/logger"
 )
 
 const CodeAlreadyExists = 602
@@ -260,6 +261,7 @@ func doSignIn(c echo.Context) error {
 	}
 
 	if myDice.Parent.UIPasswordHash == v.Password {
+		logger.M().Infof("[UI] 密码校验通过")
 		return generateToken()
 	}
 
@@ -697,9 +699,11 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 
 	e.GET(prefix+"/dice/config/get", DiceConfig)
 	e.POST(prefix+"/dice/config/set", DiceConfigSet)
+	e.GET(prefix+"/dice/startup-sound/status", StartupSoundStatus)
 	e.GET(prefix+"/dice/config/advanced/get", DiceAdvancedConfigGet)
 	e.POST(prefix+"/dice/config/advanced/set", DiceAdvancedConfigSet)
 	e.POST(prefix+"/dice/config/mail_test", DiceMailTest)
+	e.GET(prefix+"/dice/log-gap/status", logGapFillStatusGet)
 	e.POST(prefix+"/dice/exec", DiceExec)
 	e.GET(prefix+"/dice/recentMessage", DiceRecentMessage)
 	e.GET(prefix+"/dice/cmdList", DiceAllCommand)
@@ -715,6 +719,7 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 
 	e.GET(prefix+"/backup/list", backupGetList)
 	e.POST(prefix+"/backup/do_backup", backupExec)
+	e.GET(prefix+"/backup/progress", backupProgressStatus)
 	e.GET(prefix+"/backup/config_get", backupConfigGet)
 	e.POST(prefix+"/backup/config_set", backupConfigSave)
 	e.GET(prefix+"/backup/download", backupDownload)
@@ -783,6 +788,7 @@ func Bind(e *echo.Echo, _myDice *dice.DiceManager) {
 	e.GET(prefix+"/story/items/page", storyGetItemPage)
 	e.GET(prefix+"/story/items/browse", storyBrowseItemPage)
 	e.DELETE(prefix+"/story/log", storyDelLog)
+	e.GET(prefix+"/story/downloadLog", storyDownloadLog)
 	e.POST(prefix+"/story/uploadLog", storyUploadLog)
 	e.GET(prefix+"/story/backup/list", storyGetLogBackupList)
 	e.GET(prefix+"/story/backup/download", storyDownloadLogBackup)

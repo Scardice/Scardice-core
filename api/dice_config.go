@@ -443,6 +443,12 @@ func DiceConfigSet(c echo.Context) error {
 		}
 	}
 
+	if val, ok := jsonMap["startupSoundEnable"]; ok {
+		if enable, ok2 := val.(bool); ok2 {
+			config.StartupSoundEnable = enable
+		}
+	}
+
 	if val, ok := jsonMap["logSizeNoticeEnable"]; ok {
 		config.LogSizeNoticeEnable = val.(bool)
 	}

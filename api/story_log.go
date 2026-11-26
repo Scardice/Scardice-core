@@ -4,12 +4,15 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/labstack/echo/v4"
 
 	"Scardice-core/dice"
 	"Scardice-core/dice/service"
+	"Scardice-core/dice/storylog"
 	"Scardice-core/model"
 )
 
@@ -123,6 +126,30 @@ func storyDelLog(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, false)
 	}
 	return c.JSON(http.StatusOK, true)
+}
+
+func storyDownloadLog(c echo.Context) error {
+	if !doAuth(c) {
+		return c.JSON(http.StatusForbidden, nil)
+	}
+	groupID := strings.TrimSpace(c.QueryParam("groupId"))
+	name := strings.TrimSpace(c.QueryParam("name"))
+	if groupID == "" || name == "" {
+		return Error(&c, "groupId 和 name 不能为空", Response{})
+	}
+
+	path, filename, err := storylog.ExportLocalZip(storylog.UploadEnv{
+		Db:      myDice.DBOperator,
+		Log:     myDice.Logger,
+		GroupID: groupID,
+		LogName: name,
+	})
+	if err != nil {
+		myDice.Logger.Warn("storyDownloadLog", err)
+		return Error(&c, "导出日志失败："+err.Error(), Response{})
+	}
+	defer func() { _ = os.RemoveAll(filepath.Dir(path)) }()
+	return c.Attachment(path, filename)
 }
 
 func storyUploadLog(c echo.Context) error {

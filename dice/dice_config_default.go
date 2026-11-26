@@ -78,6 +78,7 @@ var DefaultConfig = Config{
 		MaxCocCardGen:       5,
 		CocCardMergeForward: false,
 		ExtDefaultSettings:  make([]*ExtDefaultSettingItem, 0),
+		StartupSoundEnable:  false,
 	},
 	BanConfig{
 		BanList: nil,

@@ -220,7 +220,8 @@ type ExtConfig struct {
 	MaxCocCardGen       int64 `jsbind:"maxCocCardGen"       json:"-" yaml:"maxCocCardGen"`                         // 最大coc制卡数
 	CocCardMergeForward bool  `jsbind:"cocCardMergeForward" json:"cocCardMergeForward" yaml:"cocCardMergeForward"` // COC制卡是否使用合并转发（默认关闭）
 
-	ExtDefaultSettings []*ExtDefaultSettingItem `json:"extDefaultSettings" yaml:"extDefaultSettings"` // 新群扩展按此顺序加载
+	ExtDefaultSettings []*ExtDefaultSettingItem `json:"extDefaultSettings" yaml:"extDefaultSettings"`                             // 新群扩展按此顺序加载
+	StartupSoundEnable bool                     `jsbind:"startupSoundEnable" json:"startupSoundEnable" yaml:"startupSoundEnable"` // 启动流程中播放 UI 音频
 }
 
 type BanConfig struct {

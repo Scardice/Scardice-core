@@ -76,6 +76,9 @@ type DiceManager struct { //nolint:revive
 	BackupCleanCron      string              // 如果使用cron触发, 表达式
 	backupCleanCronID    cron.EntryID
 
+	backupLock     sync.Mutex
+	backupProgress backupProgressTracker
+
 	AppBootTime      int64
 	AppVersionCode   int64
 	AppVersionOnline *VersionInfo

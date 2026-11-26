@@ -22,6 +22,7 @@ import (
 	"github.com/tidwall/buntdb"
 	"go.uber.org/zap"
 
+	"Scardice-core/bootsound"
 	"Scardice-core/dice/events"
 	"Scardice-core/logger"
 	"Scardice-core/utils/dboperator/engine"
@@ -389,6 +390,12 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 	d.registerCoreCommands()
 	d.RegisterBuiltinExt()
 	d.loads()
+	// 配置（含 UI 音频开关）加载完成，立即入队核心启动与自检开始音频，
+	// 确保它们排在任何异步加载完成事件（插件/牌堆/账号）之前。
+	if d.Config.StartupSoundEnable {
+		bootsound.PlayEvent(bootsound.EventStartup)
+		bootsound.PlayEvent(bootsound.EventSelfTestStart)
+	}
 	if err := d.ActivateDiceRandomMode(); err != nil && d.Logger != nil {
 		d.Logger.Warnf("[随机源] 激活配置模式失败，已使用 PCG 回退: %v", err)
 	}
