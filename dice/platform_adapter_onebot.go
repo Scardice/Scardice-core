@@ -13,7 +13,6 @@ import (
 	"time"
 
 	socketio "github.com/PaienNate/pineutil/evsocket/v2"
-	"github.com/avast/retry-go"
 	"github.com/bytedance/sonic"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
@@ -1074,7 +1073,28 @@ func (p *PlatformAdapterOnebot) startConnection() error {
 	}
 }
 
-// retryConnect 重试连接方法
+// onebotRetryDelay 返回第 attempt 次失败后的等待时间。前 5 次指数退避
+// （2/4/8/16/32 秒），之后逐步拉长到 10 分钟封顶，断网期间不会刷屏。
+func onebotRetryDelay(attempt uint) time.Duration {
+	if attempt <= 5 {
+		return time.Duration(1<<(attempt-1)) * 2 * time.Second
+	}
+	switch attempt {
+	case 6:
+		return time.Minute
+	case 7:
+		return 2 * time.Minute
+	case 8:
+		return 5 * time.Minute
+	default:
+		return 10 * time.Minute
+	}
+}
+
+// retryConnect 重试连接方法。
+// 前 5 次按 2s 指数退避快速重连；之后等待时间逐步拉长到 10 分钟封顶，
+// 持续重试直到连接成功或用户禁用适配器。这样协议端（例如 SnowLuma）挂起
+// 后恢复监听时余烬能自动连回，又不会在长时间断网时反复刷日志。
 func (p *PlatformAdapterOnebot) retryConnect() {
 	// 检查适配器是否已被禁用
 	if !p.desiredEnabled {
@@ -1097,60 +1117,44 @@ func (p *PlatformAdapterOnebot) retryConnect() {
 		p.retryMutex.Unlock()
 	}()
 
-	const maxRetries = 5
-	const baseDelay = 2 * time.Second
+	const maxFastRetries = 5
 
-	err := retry.Do(
-		func() error {
-			// 在每次重试前再次检查适配器是否已被禁用
+	for attempt := uint(1); ; attempt++ {
+		if !p.desiredEnabled {
+			p.logger.Info("重连已停止：适配器被禁用")
+			return
+		}
+
+		p.retryMutex.Lock()
+		p.retryAttempts = attempt
+		p.retryMutex.Unlock()
+
+		if attempt <= maxFastRetries {
+			p.logger.Infof("尝试重新连接 OneBot [%d/%d]", attempt, maxFastRetries)
+		} else {
+			p.logger.Infof("尝试重新连接 OneBot [第%d次，失败后等待 %v]", attempt, onebotRetryDelay(attempt))
+		}
+
+		// 调用startConnection重新建立连接，确保遵循连接互斥锁机制
+		err := p.startConnection()
+		if err == nil {
+			p.logger.Infof("OneBot 重连成功")
+			return
+		}
+
+		p.EndPoint.State = StateConnectionFailed
+
+		wait := onebotRetryDelay(attempt)
+		p.logger.Warnf("重连失败 (第%d次): %v，%v后进行下次重试", attempt, err, wait)
+
+		// 分片等待：禁用后最多 1 秒内停止，不必等满当前间隔。
+		for slept := time.Duration(0); slept < wait; slept += time.Second {
 			if !p.desiredEnabled {
-				return errors.New("适配器已被禁用，停止重连")
-			}
-
-			p.retryMutex.Lock()
-			p.retryAttempts++
-			currentAttempt := p.retryAttempts
-			p.retryMutex.Unlock()
-
-			// 计算下次重试时间（指数退避）
-			nextRetryDelay := time.Duration(1<<(currentAttempt-1)) * baseDelay
-			if currentAttempt < maxRetries {
-				p.logger.Infof("尝试重新连接 OneBot [%d/%d]，下次重试间隔: %v", currentAttempt, maxRetries, nextRetryDelay)
-			} else {
-				p.logger.Infof("尝试重新连接 OneBot [%d/%d]，最后一次尝试", currentAttempt, maxRetries)
-			}
-
-			// 调用startConnection重新建立连接，确保遵循连接互斥锁机制
-			return p.startConnection()
-		},
-		retry.Attempts(maxRetries),
-		retry.Delay(baseDelay),
-		retry.DelayType(retry.BackOffDelay),
-		retry.OnRetry(func(n uint, err error) {
-			// 在重试前再次检查适配器是否已被禁用
-			if !p.desiredEnabled {
-				p.logger.Info("适配器已被禁用，停止重试")
+				p.logger.Info("重连已停止：适配器被禁用")
 				return
 			}
-			nextDelay := time.Duration(1<<n) * baseDelay
-			p.logger.Warnf("重连失败 (第%d次): %v，%v后进行下次重试", n+1, err, nextDelay)
-		}),
-	)
-
-	if err != nil {
-		// 检查是否是因为适配器被禁用而失败
-		if strings.Contains(err.Error(), "适配器已被禁用") {
-			p.logger.Info("重连已停止：适配器被禁用")
-		} else {
-			p.logger.Errorf("重连最终失败，已达到最大重试次数 %d: %v", maxRetries, err)
-			p.EndPoint.State = StateConnectionFailed
+			time.Sleep(time.Second)
 		}
-	} else {
-		p.logger.Infof("OneBot 重连成功")
-		// 重置重试状态
-		p.retryMutex.Lock()
-		p.retryAttempts = 0
-		p.retryMutex.Unlock()
 	}
 }
 
