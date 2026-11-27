@@ -3,7 +3,7 @@
 package service_test
 
 import (
-	gormsqlite "gorm.io/driver/sqlite"
+	gormsqlite "github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 )

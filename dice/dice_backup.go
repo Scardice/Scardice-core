@@ -24,6 +24,13 @@ import (
 
 const BackupDir = "./backups"
 
+// BackupTempSuffix 备份打包期间使用的临时文件后缀。
+// 只有在 zip 完整写入并关闭后才会改名为正式文件名，列表与清理逻辑会忽略该后缀。
+const BackupTempSuffix = ".part"
+
+// ErrBackupInProgress 表示已有一个备份任务正在执行，同一时间只允许一个备份，避免并发写坏同一目录。
+var ErrBackupInProgress = errors.New("已有备份正在进行中，请稍候")
+
 type BackupCleanStrategy int
 
 const (
@@ -81,8 +88,50 @@ const (
 		BackupSelectionResources
 )
 
+// cleanupStaleBackupTempFiles 清理异常退出遗留的临时备份文件，避免长期占用磁盘。
+// 只清理超过 24 小时的临时文件，正常执行中的备份不会受影响。
+func cleanupStaleBackupTempFiles() {
+	entries, err := os.ReadDir(BackupDir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-24 * time.Hour)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), BackupTempSuffix) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(BackupDir, entry.Name())); err != nil {
+			logger.M().Warnf("清理过期备份临时文件失败: %s, 原因: %s", entry.Name(), err.Error())
+		}
+	}
+}
+
 func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error) {
+	if !dm.backupLock.TryLock() {
+		return "", ErrBackupInProgress
+	}
+	defer dm.backupLock.Unlock()
+
+	dm.BeginBackupProgress("正在准备备份数据")
+	completed := false
+	progressErr := ""
+	defer func() {
+		if completed {
+			dm.FinishBackupProgress("备份完成")
+			return
+		}
+		if progressErr == "" {
+			progressErr = "备份失败"
+		}
+		dm.FailBackupProgress(progressErr)
+	}()
+
 	_ = os.MkdirAll(BackupDir, 0o755)
+	cleanupStaleBackupTempFiles()
 	logger := dm.Dice[0].Logger
 
 	cfgGlb := backupConfigGlobal{
@@ -105,17 +154,26 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 	fnHashed := crypto.CalculateSHA512Str([]byte(bakFn))[:8]
 	bakFn += "_" + fnHashed + ".zip"
 
-	fzip, err := os.OpenFile(filepath.Join(BackupDir, bakFn),
-		os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
+	finalPath := filepath.Join(BackupDir, bakFn)
+	partPath := finalPath + BackupTempSuffix
+
+	fzip, err := os.OpenFile(partPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
 	if err != nil {
+		progressErr = "创建备份文件失败: " + err.Error()
 		return "", err
 	}
-	defer func() { _ = fzip.Close() }()
+	defer func() {
+		if completed {
+			return
+		}
+		_ = fzip.Close()
+		_ = os.Remove(partPath)
+	}()
 
 	writer := zip.NewWriter(fzip)
-	defer func(writer *zip.Writer) {
-		_ = writer.Close()
-	}(writer)
+
+	copiedFiles := 0
+	var copiedBytes int64
 
 	fileOK := func(fn string) bool {
 		stat, err := os.Stat(fn)
@@ -126,17 +184,23 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 		return err == nil && stat.IsDir()
 	}
 
+	stageLabel := "正在备份基础配置"
 	backup := func(d *Dice, fn string) {
 		file, err := os.Open(fn)
-		if err != nil && !strings.Contains(fn, "session.token") {
-			if d != nil {
-				d.Logger.Errorf("备份文件失败: %s, 原因: %s", fn, err.Error())
-			} else {
-				logger.Errorf("备份文件失败: %s, 原因: %s", fn, err.Error())
+		if err != nil {
+			// session.token 不存在是正常情况，静默跳过，不要写入空条目
+			if !strings.Contains(fn, "session.token") {
+				if d != nil {
+					d.Logger.Errorf("备份文件失败: %s, 原因: %s", fn, err.Error())
+				} else {
+					logger.Errorf("备份文件失败: %s, 原因: %s", fn, err.Error())
+				}
 			}
 			return
 		}
 		defer file.Close()
+
+		dm.UpdateBackupProgress("packing", stageLabel, "", copiedFiles, copiedBytes)
 
 		h := &zip.FileHeader{Name: fn, Method: zip.Deflate, Flags: 0x800}
 		fileWriter, err := writer.CreateHeader(h)
@@ -149,7 +213,10 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 			return
 		}
 
-		_, err = io.Copy(fileWriter, file)
+		written, err := io.Copy(fileWriter, file)
+		copiedFiles++
+		copiedBytes += written
+		dm.UpdateBackupProgress("packing", stageLabel, "", copiedFiles, copiedBytes)
 		if err != nil {
 			if d != nil {
 				d.Logger.Errorf("备份文件失败: %s, 原因: %s", fn, err.Error())
@@ -159,7 +226,10 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 		}
 	}
 
-	backupDir := func(path string, info fs.FileInfo, _ error) error {
+	backupDir := func(path string, info fs.FileInfo, err error) error {
+		if err != nil || info == nil {
+			return nil
+		}
 		if !info.IsDir() {
 			backup(nil, path)
 		}
@@ -170,7 +240,11 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 
 	if sel&BackupSelectionDecks != 0 {
 		cfgGlb.Decks = true
-		_ = filepath.Walk("data/decks", func(path string, info fs.FileInfo, _ error) error {
+		stageLabel = "正在备份牌堆"
+		_ = filepath.Walk("data/decks", func(path string, info fs.FileInfo, err error) error {
+			if err != nil || info == nil {
+				return nil
+			}
 			if !info.IsDir() {
 				backup(nil, path)
 				return nil
@@ -191,6 +265,7 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 			logger.Warn("备份 helpdoc 失败: 不存在或不是目录")
 		} else {
 			cfgGlb.HelpDoc = true
+			stageLabel = "正在备份帮助文档"
 			_ = filepath.Walk("data/helpdoc", backupDir)
 		}
 	}
@@ -200,6 +275,7 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 			logger.Warn("备份 censor 失败: 不存在或不是目录")
 		} else {
 			cfgGlb.Censor = true
+			stageLabel = "正在备份敏感词库"
 			_ = filepath.Walk("data/censor", backupDir)
 		}
 	}
@@ -209,6 +285,7 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 			logger.Warn("备份 names 失败: 不存在或不是目录")
 		} else {
 			cfgGlb.Names = true
+			stageLabel = "正在备份人名信息"
 			_ = filepath.Walk("data/names", backupDir)
 		}
 	}
@@ -218,6 +295,7 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 			logger.Warn("备份 images 失败: 不存在或不是目录")
 		} else {
 			cfgGlb.Images = true
+			stageLabel = "正在备份图片"
 			_ = filepath.Walk("data/images", backupDir)
 		}
 	}
@@ -229,6 +307,7 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 		cfgGlb.Dices[d.BaseConfig.Name] = &cfgDice
 		dataDir := d.BaseConfig.DataDir
 
+		stageLabel = "正在备份骰子配置"
 		backup(d, filepath.Join(dataDir, "serve.yaml"))
 		if fn := filepath.Join(dataDir, "advanced.yaml"); fileOK(fn) {
 			backup(d, fn)
@@ -237,6 +316,7 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 			backup(d, fn)
 		}
 
+		stageLabel = "正在备份用户数据"
 		err := service.FlushWAL(d.DBOperator.GetDataDB(constant.WRITE))
 		if err != nil {
 			d.Logger.Errorf("备份时data数据库flush出错 错误为:%v", err.Error())
@@ -258,10 +338,15 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 			}
 		}
 
+		stageLabel = "正在备份文案模板"
 		backup(d, filepath.Join(dataDir, "configs/text-template.yaml"))
 
-		_ = filepath.WalkDir(filepath.Join(dataDir, "extensions/reply"), func(path string, info fs.DirEntry, _ error) error {
+		stageLabel = "正在备份自定义回复"
+		_ = filepath.WalkDir(filepath.Join(dataDir, "extensions/reply"), func(path string, info fs.DirEntry, err error) error {
 			// NOTE(Xiangze Li): copied from dice.ReplyReload. Should extract as function, but I'm lazy
+			if err != nil || info == nil {
+				return nil
+			}
 			if info.IsDir() {
 				if strings.EqualFold(info.Name(), "assets") || strings.EqualFold(info.Name(), "images") {
 					return fs.SkipDir
@@ -279,6 +364,7 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 			return nil
 		})
 
+		stageLabel = "正在备份账号配置"
 		for _, i := range d.ImSession.EndPoints {
 			if i.Platform == "QQ" {
 				if pa, ok := i.Adapter.(*PlatformAdapterGocq); ok && pa.UseInPackClient {
@@ -297,7 +383,11 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 		}
 
 		if withJS {
-			_ = filepath.WalkDir(filepath.Join(dataDir, "scripts"), func(path string, info fs.DirEntry, _ error) error {
+			stageLabel = "正在备份 JS 插件"
+			_ = filepath.WalkDir(filepath.Join(dataDir, "scripts"), func(path string, info fs.DirEntry, err error) error {
+				if err != nil || info == nil {
+					return nil
+				}
 				if info.IsDir() {
 					if info.Name() == "_builtin" {
 						return filepath.SkipDir
@@ -311,6 +401,9 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 			})
 			extDataDir := filepath.Join(dataDir, "extensions")
 			_ = filepath.WalkDir(extDataDir, func(path string, info fs.DirEntry, err error) error {
+				if err != nil || info == nil {
+					return nil
+				}
 				if info.IsDir() {
 					if filepath.Dir(path) == extDataDir {
 						if ext := d.ExtFind(info.Name(), false); ext == nil || !ext.IsJsExt {
@@ -326,6 +419,7 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 	}
 
 	// 写入文件信息
+	dm.UpdateBackupProgress("finishing", "正在写入备份信息", "", copiedFiles, copiedBytes)
 	data, _ := json.Marshal(map[string]interface{}{
 		"config":      cfgGlb,
 		"version":     VERSION.String(),
@@ -333,10 +427,41 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 	})
 
 	h := &zip.FileHeader{Name: "backup_info.json", Method: zip.Deflate, Flags: 0x800}
-	fileWriter, _ := writer.CreateHeader(h)
-	_, _ = fileWriter.Write(data)
+	fileWriter, err := writer.CreateHeader(h)
+	if err != nil {
+		progressErr = "写入备份信息失败: " + err.Error()
+		return "", err
+	}
+	if _, err := fileWriter.Write(data); err != nil {
+		progressErr = "写入备份信息失败: " + err.Error()
+		return "", err
+	}
 
-	return fzip.Name(), nil
+	if err := writer.Close(); err != nil {
+		progressErr = "完成备份文件失败: " + err.Error()
+		return "", err
+	}
+	if err := fzip.Close(); err != nil {
+		progressErr = "完成备份文件失败: " + err.Error()
+		return "", err
+	}
+
+	// 正式文件名只精确到秒，进程内已有备份锁；这里仍拒绝覆盖已存在的备份。
+	if _, err := os.Stat(finalPath); err == nil {
+		progressErr = "备份文件已存在，未覆盖: " + bakFn
+		return "", fmt.Errorf("备份文件已存在: %s", bakFn)
+	} else if !os.IsNotExist(err) {
+		progressErr = "检查备份文件失败: " + err.Error()
+		return "", err
+	}
+
+	if err := os.Rename(partPath, finalPath); err != nil {
+		progressErr = "保存备份文件失败: " + err.Error()
+		return "", err
+	}
+
+	completed = true
+	return finalPath, nil
 }
 
 func (dm *DiceManager) BackupAuto() error {
@@ -373,6 +498,10 @@ func (dm *DiceManager) BackupClean(fromAuto bool) (err error) {
 	fileInfos := make([]os.FileInfo, 0, len(files))
 	for _, f := range files {
 		if f.IsDir() {
+			continue
+		}
+		// 正在打包的临时文件不参与保留数量/时间统计
+		if strings.HasSuffix(f.Name(), BackupTempSuffix) {
 			continue
 		}
 		if fi, err := f.Info(); err == nil {

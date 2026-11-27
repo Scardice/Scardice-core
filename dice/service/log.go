@@ -28,6 +28,11 @@ type LogOne struct {
 
 var ErrLogNotFound = errors.New("日志不存在")
 
+// logAppendDedupeMu 串行化“按 raw_msg_id 查重 + 插入”，防止实时消息与补录
+// 在同一进程内交错写入同一条平台消息。跨进程/多实例仍需要数据库唯一约束；
+// 这里不建唯一索引，避免历史库里已有重复行导致迁移失败。
+var logAppendDedupeMu sync.Mutex
+
 // LogGetInfo 查询日志简略信息（近似估算）
 // 返回值保持原结构：logs 最大 ID、log_items 最大 ID、logs 近似行数、log_items 近似行数。
 func LogGetInfo(operator engine2.DatabaseOperator) ([]int, error) {
@@ -131,27 +136,33 @@ type QueryLogPage struct {
 // LogGetLogPage 获取分页
 func LogGetLogPage(operator engine2.DatabaseOperator, param *QueryLogPage) (int, []*model.LogInfo, error) {
 	db := operator.GetLogDB(constant.READ)
-	var lst []*model.LogInfo
+	lst := make([]*model.LogInfo, 0)
 
 	// 构建基础查询
-	query := db.Model(&model.LogInfo{}).Select("logs.id, logs.name, logs.group_id, logs.created_at, logs.updated_at,COALESCE(logs.size, 0) as size").Order("logs.updated_at desc")
-	// 添加条件
-	if param.Name != "" {
-		query = query.Where("logs.name LIKE ?", "%"+param.Name+"%")
+	newQuery := func() *gorm.DB {
+		query := db.Model(&model.LogInfo{})
+		// 添加条件
+		if param.Name != "" {
+			query = query.Where("logs.name LIKE ?", "%"+param.Name+"%")
+		}
+		if param.GroupID != "" {
+			query = query.Where("logs.group_id LIKE ?", "%"+param.GroupID+"%")
+		}
+		if param.CreatedTimeBegin != "" {
+			query = query.Where("logs.created_at >= ?", param.CreatedTimeBegin)
+		}
+		if param.CreatedTimeEnd != "" {
+			query = query.Where("logs.created_at <= ?", param.CreatedTimeEnd)
+		}
+		return query
 	}
-	if param.GroupID != "" {
-		query = query.Where("logs.group_id LIKE ?", "%"+param.GroupID+"%")
-	}
-	if param.CreatedTimeBegin != "" {
-		query = query.Where("logs.created_at >= ?", param.CreatedTimeBegin)
-	}
-	if param.CreatedTimeEnd != "" {
-		query = query.Where("logs.created_at <= ?", param.CreatedTimeEnd)
-	}
+	query := newQuery().
+		Select("logs.id, logs.name, logs.group_id, logs.created_at, logs.updated_at,COALESCE(logs.size, 0) as size").
+		Order("logs.updated_at desc")
 
-	// 获取总数
+	// 获取总数（与列表使用同一组筛选条件）
 	var count int64
-	if err := db.Model(&model.LogInfo{}).Count(&count).Error; err != nil {
+	if err := newQuery().Count(&count).Error; err != nil {
 		return 0, nil, err
 	}
 
@@ -201,6 +212,16 @@ func getIDByGroupIDAndName(db *gorm.DB, groupID string, logName string) (logID u
 		return 0, ErrLogNotFound
 	}
 	return logInfo.ID, nil
+}
+
+// LogGetIDByName 按群号和日志名查询已有日志的内部 ID。
+// 只读，不创建日志；日志不存在时返回 ErrLogNotFound。
+// 用于修复“日志关闭但持久化 LogCurID 丢失”的老数据（1119.fix1）。
+func LogGetIDByName(operator engine2.DatabaseOperator, groupID, logName string) (uint64, error) {
+	if operator == nil || groupID == "" || logName == "" {
+		return 0, ErrLogNotFound
+	}
+	return getIDByGroupIDAndName(operator.GetLogDB(constant.READ), groupID, logName)
 }
 
 func getLogInfoByID(db *gorm.DB, logID uint64) (*model.LogInfo, error) {
@@ -478,6 +499,8 @@ type QueryLogLinePage struct {
 	PageSize int    `query:"pageSize"`
 	GroupID  string `query:"groupId"`
 	LogName  string `query:"logName"`
+	// PlayerID 按玩家过滤（同时匹配 im_userid 与 user_uniform_id）
+	PlayerID string `query:"playerId"`
 }
 
 // LogGetLinePage 获取log的行分页
@@ -495,10 +518,13 @@ func LogGetLinePage(operator engine2.DatabaseOperator, param *QueryLogLinePage) 
 	var items []*model.LogOneItem
 
 	// 查询行数据
-	err = db.Model(&model.LogOneItem{}).
+	stmt := db.Model(&model.LogOneItem{}).
 		Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id").
-		Where("log_id = ?", logID).
-		Order("time ASC").
+		Where("log_id = ?", logID)
+	if param.PlayerID != "" {
+		stmt = stmt.Where("(im_userid = ? OR user_uniform_id = ?)", param.PlayerID, param.PlayerID)
+	}
+	err = stmt.Order("time ASC").
 		Limit(param.PageSize).
 		Offset((param.PageNum - 1) * param.PageSize).
 		Scan(&items).Error
@@ -550,6 +576,81 @@ func LogGetLastSeq(operator engine2.DatabaseOperator, logID uint64) (int64, erro
 	}
 
 	return maxSeq.Int64, nil
+}
+
+// LogGetNameByID 查询指定 log_id 的日志名称。
+// 用于校验持久化的当前日志 ID 是否仍指向同一本日志：日志被 Web UI 删除时返回
+// ErrLogNotFound，ID 被复用（数据库恢复）时返回另一个名字，调用方据此自愈。
+func LogGetNameByID(operator engine2.DatabaseOperator, logID uint64) (string, error) {
+	_, name, err := LogGetOwnerByID(operator, logID)
+	return name, err
+}
+
+// LogGetOwnerByID 查询指定 log_id 的归属群与日志名称。
+// 只查名字发现不了“ID 被复用成另一个群的同名日志”：那种情况下运行期会被
+// LogAppendByID 的归属校验拒绝，启动时应按名字重建本群自己的日志。
+func LogGetOwnerByID(operator engine2.DatabaseOperator, logID uint64) (groupID string, name string, err error) {
+	if logID == 0 {
+		return "", "", ErrLogNotFound
+	}
+	logInfo, err := getLogInfoByID(operator.GetLogDB(constant.READ), logID)
+	if err != nil {
+		return "", "", err
+	}
+	return logInfo.GroupID, logInfo.Name, nil
+}
+
+// LoggedSeqKeys 是补录去重所需的已记录键集合。
+type LoggedSeqKeys struct {
+	RawMsgIDs map[string]struct{}
+	Seqs      map[int64]struct{}
+}
+
+// LoggedKeysInSeqRange 返回指定 log 在 (fromSeq, toSeq) 区间内已记录的
+// raw_msg_id 与 seq 集合。1118: seq 也参与去重，解决平台不返回 raw_msg_id
+// 时重试/补录重扫产生重复行的问题。
+func LoggedKeysInSeqRange(operator engine2.DatabaseOperator, logID uint64, fromSeq, toSeq int64) (LoggedSeqKeys, error) {
+	result := LoggedSeqKeys{
+		RawMsgIDs: make(map[string]struct{}),
+		Seqs:      make(map[int64]struct{}),
+	}
+	if logID == 0 || toSeq <= fromSeq+1 {
+		return result, nil
+	}
+	db := operator.GetLogDB(constant.READ)
+
+	var rows []struct {
+		RawMsgID sql.NullString `gorm:"column:raw_msg_id"`
+		Seq      sql.NullInt64  `gorm:"column:seq"`
+	}
+	err := db.Model(&model.LogOneItem{}).
+		Select("raw_msg_id, seq").
+		Where("log_id = ? AND seq IS NOT NULL AND is_dice IS NOT TRUE AND seq > ? AND seq < ?", logID, fromSeq, toSeq).
+		Scan(&rows).Error
+	if err != nil {
+		return result, err
+	}
+	for _, row := range rows {
+		if row.Seq.Valid {
+			result.Seqs[row.Seq.Int64] = struct{}{}
+		}
+		// "0" 表示平台没有返回真实消息 ID（见 logItemRawMsgID），不能当成
+		// 已记录过的消息，否则会跳过之后所有缺 ID 的补录。
+		if row.RawMsgID.Valid && row.RawMsgID.String != "" && row.RawMsgID.String != "0" {
+			result.RawMsgIDs[row.RawMsgID.String] = struct{}{}
+		}
+	}
+	return result, nil
+}
+
+// LogRawMsgIDsInSeqRange 返回指定 log 在 (fromSeq, toSeq) 区间内已记录的 raw_msg_id 集合。
+// 用于日志补全前去重：平台补发/重连时同一消息可能既走过正常事件路径，又被历史拉取到。
+func LogRawMsgIDsInSeqRange(operator engine2.DatabaseOperator, logID uint64, fromSeq, toSeq int64) (map[string]struct{}, error) {
+	keys, err := LoggedKeysInSeqRange(operator, logID, fromSeq, toSeq)
+	if err != nil {
+		return nil, err
+	}
+	return keys.RawMsgIDs, nil
 }
 
 // LogDelete 删除log
@@ -620,6 +721,8 @@ func logAppendDBErr(op string, groupID, logName string, logID uint64, err error)
 
 // LogAppend 向指定的log中添加一条信息
 func LogAppend(operator engine2.DatabaseOperator, groupID string, logName string, logItem *model.LogOneItem) bool {
+	logAppendDedupeMu.Lock()
+	defer logAppendDedupeMu.Unlock()
 	err := logAppendOnce(operator, groupID, logName, logItem)
 	if err != nil && maybeHealLogSchema(operator, err) {
 		err = logAppendOnce(operator, groupID, logName, logItem)
@@ -629,6 +732,69 @@ func LogAppend(operator engine2.DatabaseOperator, groupID string, logName string
 		return false
 	}
 	return true
+}
+
+// logItemRawMsgID 返回与 model.LogOneItem.BeforeSave 一致的 raw_msg_id 字符串。
+// "0" 与空值都视为“平台没有提供可用的消息 ID”：部分 OneBot 实现在缺失
+// message_id 时会序列化成 0，若拿 "0" 去重，会把之后所有同类消息都误判成重复。
+func logItemRawMsgID(item *model.LogOneItem) string {
+	if item == nil {
+		return ""
+	}
+	rawID := item.RawMsgIDStr
+	if item.RawMsgID != nil {
+		rawID = fmt.Sprintf("%v", item.RawMsgID)
+	}
+	if rawID == "0" {
+		return ""
+	}
+	return rawID
+}
+
+// logAppendDuplicate 在事务内检查同一日志是否已经写入过该平台消息。
+// 调用方需持有 logAppendDedupeMu，保证“查重+插入”在进程内串行。
+//
+// 只比较 is_dice=false 的条目：去重的目标是“玩家/其他机器人的群消息”
+// 在实时路径与历史补录路径之间去重。骰子自身发言（is_dice=true）不参与：
+//   - 它不会进入补录路径（logItem/replay 写入的都是非骰子消息）；
+//   - 私聊暗骰回显、群内骰子回复、不同私聊会话的回显来自不同的消息 ID
+//     命名空间（Telegram 等平台按会话独立编号），同号时会互相顶掉。
+//
+// 代价是同一骰子回调被重复触发时会多落一行；这里优先保证不丢日志。
+//
+// group_id 参与条件是给 MySQL 用的：MySQL 的 log_items 由
+// LogOneItemHookMySQL 建表，raw_msg_id 是 TEXT 列，不能直接建
+// (log_id, raw_msg_id) 普通索引；带上 group_id 可以复用已有的
+// idx_log_delete_by_id(group_id(20), raw_msg_id(20), id) 前缀索引。
+// SQLite/PostgreSQL 仍会走 idx_log_raw(log_id, raw_msg_id)。
+func logAppendDuplicate(tx *gorm.DB, logID uint64, groupID, rawID string, seq *int64, isGapFill bool) (bool, error) {
+	// 1118: 补录条目按 (log_id, seq) 再去重一次。平台不返回 raw_msg_id
+	// （"0"/空）时，分段补录 + 失败重试/最终汇总会重复写同一 seq；
+	// seq 在同一本日志内唯一，比 raw id 更可靠。
+	//
+	// 1119: 只在 raw id 不可用时才按 seq 去重。平台 seq 重置后，新消息可能
+	// 撞上旧日志行；raw id 不同说明是另一条消息，不能因此静默丢掉。
+	if isGapFill && seq != nil && *seq > 0 && rawID == "" {
+		var seqCount int64
+		if err := tx.Model(&model.LogOneItem{}).
+			Where("log_id = ? AND seq = ?", logID, *seq).
+			Count(&seqCount).Error; err != nil {
+			return false, err
+		}
+		if seqCount > 0 {
+			return true, nil
+		}
+	}
+	if rawID == "" {
+		return false, nil
+	}
+	var count int64
+	if err := tx.Model(&model.LogOneItem{}).
+		Where("log_id = ? AND group_id = ? AND raw_msg_id = ? AND is_dice IS NOT TRUE", logID, groupID, rawID).
+		Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 func logAppendOnce(operator engine2.DatabaseOperator, groupID string, logName string, logItem *model.LogOneItem) error {
@@ -663,6 +829,7 @@ func logAppendOnce(operator engine2.DatabaseOperator, groupID string, logName st
 		RawMsgID:    logItem.RawMsgID,
 		UniformID:   logItem.UniformID,
 		Seq:         logItem.Seq,
+		IsGapFill:   logItem.IsGapFill,
 	}
 	return db.Transaction(func(tx *gorm.DB) error {
 		if logID == 0 {
@@ -678,6 +845,17 @@ func logAppendOnce(operator engine2.DatabaseOperator, groupID string, logName st
 			}
 		}
 		newLogItem.LogID = logID
+		// 同一平台消息只落一行：实时路径与补录路径可能几乎同时写入同一条
+		// raw_msg_id，log_items 没有唯一约束，必须在事务内查重。
+		// 只对 is_dice=false 的玩家/机器人消息去重；骰子自身发言（含私聊
+		// 暗骰回显）不参与，避免跨会话 ID 命名空间互相顶掉。
+		if !logItem.IsDice {
+			if dup, dupErr := logAppendDuplicate(tx, logID, groupID, logItemRawMsgID(&newLogItem), newLogItem.Seq, newLogItem.IsGapFill); dupErr != nil {
+				return dupErr
+			} else if dup {
+				return nil
+			}
+		}
 		if createErr := tx.Create(&newLogItem).Error; createErr != nil {
 			return createErr
 		}
@@ -698,6 +876,8 @@ func LogAppendByID(operator engine2.DatabaseOperator, logID uint64, groupID stri
 	if logID == 0 {
 		return false
 	}
+	logAppendDedupeMu.Lock()
+	defer logAppendDedupeMu.Unlock()
 	err := logAppendByIDOnce(operator, logID, groupID, logItem)
 	if err != nil && maybeHealLogSchema(operator, err) {
 		err = logAppendByIDOnce(operator, logID, groupID, logItem)
@@ -733,6 +913,7 @@ func logAppendByIDOnce(operator engine2.DatabaseOperator, logID uint64, groupID 
 		RawMsgID:    logItem.RawMsgID,
 		UniformID:   logItem.UniformID,
 		Seq:         logItem.Seq,
+		IsGapFill:   logItem.IsGapFill,
 	}
 
 	return db.Transaction(func(tx *gorm.DB) error {
@@ -742,6 +923,13 @@ func logAppendByIDOnce(operator engine2.DatabaseOperator, logID uint64, groupID 
 		}
 		if logInfo.GroupID != groupID {
 			return fmt.Errorf("log append by id: log %d 不属于群 %s", logID, groupID)
+		}
+		if !logItem.IsDice {
+			if dup, dupErr := logAppendDuplicate(tx, logID, groupID, logItemRawMsgID(&newLogItem), newLogItem.Seq, newLogItem.IsGapFill); dupErr != nil {
+				return dupErr
+			} else if dup {
+				return nil
+			}
 		}
 		if err := tx.Create(&newLogItem).Error; err != nil {
 			return err
@@ -786,6 +974,70 @@ func LogMarkDeleteByMsgID(operator engine2.DatabaseOperator, groupID string, log
 		return nil
 	})
 	return err
+}
+
+// LogDeleteByLogIDSeq 删除指定日志中 seq 对应的一行（历史补录纠正用）。
+// 只按 log_id + seq 精确删除，不做跨日志的 raw_msg_id 反查，避免误删同名消息。
+func LogDeleteByLogIDSeq(operator engine2.DatabaseOperator, logID uint64, seq int64) error {
+	if logID == 0 || seq <= 0 {
+		return nil
+	}
+	// 与实时/补录写入串行，避免删除后并发补写又把同一行插回来。
+	logAppendDedupeMu.Lock()
+	defer logAppendDedupeMu.Unlock()
+	db := operator.GetLogDB(constant.WRITE)
+	return db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Where("log_id = ? AND seq = ?", logID, seq).Delete(&model.LogOneItem{})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return nil
+		}
+		return tx.Model(&model.LogInfo{}).Where("id = ?", logID).Updates(map[string]interface{}{
+			"updated_at": time.Now().Unix(),
+			"size":       gorm.Expr("COALESCE(size, 0) - ?", res.RowsAffected),
+		}).Error
+	})
+}
+
+// LogDeleteAfterSeqTime 删除指定日志中 seq 晚于 afterSeq、且消息时间不早于
+// afterTime 的行，用于历史 .log off 生效后清理补录期间实时误写的关闭段消息。
+//
+// 为什么同时看 seq 和 time：
+//   - 只看 seq 会误删 seq 回退/复用后的旧段行；
+//   - 只看 time 会误删同一秒内 off 之前的 on 段行（seq < afterSeq）。
+//
+// off 命令本身（seq == afterSeq）与 on 段（seq < afterSeq）都不会被删。
+// afterTime <= 0 表示平台没有可信时间，直接跳过，宁可保留少量误记也不猜删。
+func LogDeleteAfterSeqTime(operator engine2.DatabaseOperator, logID uint64, afterSeq int64, afterTime int64) (int64, error) {
+	if logID == 0 || afterSeq <= 0 || afterTime <= 0 {
+		return 0, nil
+	}
+	// 与实时/补录写入串行，避免删除过程中又有同样的行插回来。
+	logAppendDedupeMu.Lock()
+	defer logAppendDedupeMu.Unlock()
+	db := operator.GetLogDB(constant.WRITE)
+	var removed int64
+	err := db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Where("log_id = ? AND seq > ? AND time >= ?", logID, afterSeq, afterTime).
+			Delete(&model.LogOneItem{})
+		if res.Error != nil {
+			return res.Error
+		}
+		removed = res.RowsAffected
+		if removed == 0 {
+			return nil
+		}
+		return tx.Model(&model.LogInfo{}).Where("id = ?", logID).Updates(map[string]interface{}{
+			"updated_at": time.Now().Unix(),
+			"size":       gorm.Expr("COALESCE(size, 0) - ?", removed),
+		}).Error
+	})
+	if err != nil {
+		return 0, err
+	}
+	return removed, nil
 }
 
 // LogMarkDeleteByRawMsgID 根据消息 ID 反查所属日志并删除，避免依赖当前日志名。

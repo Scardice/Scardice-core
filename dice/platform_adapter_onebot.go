@@ -9,10 +9,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	socketio "github.com/PaienNate/pineutil/evsocket/v2"
-	"github.com/avast/retry-go"
 	"github.com/bytedance/sonic"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
@@ -59,6 +59,13 @@ type PlatformAdapterOnebot struct {
 	isRetrying     bool         // 是否正在重试
 	retryMutex     sync.RWMutex // 重试状态锁
 	isShuttingDown bool         // 是否正在主动关闭连接
+
+	// 1120: 用实际群消息判断当前 OneBot 实现是否提供 message_seq。
+	// 纯 OneBot 接不带 message_seq 的实现时，endpointSupportsLogGapFill 不能
+	// 仅凭适配器类型就宣称支持补全。
+	seqSeen     atomic.Bool
+	seqMissing  atomic.Bool
+	seqZeroSeen atomic.Int64
 
 	// 连接建立互斥锁，确保同时只有一个连接建立过程
 	connectionMutex sync.Mutex
@@ -580,20 +587,24 @@ func (p *PlatformAdapterOnebot) GetGroupInfoSync(diceGroupID string) *GroupCache
 	if !userResult.Passed {
 		if userResult.BanInfo != nil && groupInfo.EnteredTime > 0 && groupInfo.EnteredTime > userResult.BanInfo.BanTime {
 			text := fmt.Sprintf("本次入群为遭遇强制邀请，即将主动退群，因为邀请人%s正处于黑名单上。打扰各位还请见谅。感谢使用余烬核心。", groupInfo.InviteUserID)
-			ReplyGroupRaw(ctx, &Message{GroupID: diceGroupID}, text, "")
-			time.Sleep(1 * time.Second)
-			p.QuitGroup(ctx, diceGroupID)
+			autoQuitGroupAsync(ctx, diceGroupID, func(ctx *MsgContext) {
+				ReplyGroupRaw(ctx, &Message{GroupID: diceGroupID}, text, "")
+				time.Sleep(1 * time.Second)
+			})
 		}
 	}
 	// 这群有问题
 	groupResult := checkBlackList(diceGroupID, "group", uid, ctx)
-	if !groupResult.Passed {
+	// 邀请限制（拒绝拉群、只允许信任的人拉群）不代表群被拉黑，
+	// 不能据此退出已经加入的群；只有真正 group_banned 才退群。
+	if groupResult.FailureType == "group_banned" {
 		// 如果是被ban之后拉群，判定为强制拉群
 		if groupResult.BanInfo != nil && groupInfo.EnteredTime > 0 && groupInfo.EnteredTime > groupResult.BanInfo.BanTime {
 			text := fmt.Sprintf("该群已被拉黑，即将自动退出，解封请联系骰主。打扰各位还请见谅。感谢使用余烬核心:\n当前情况: %s", groupResult.BanInfo.toText(ctx.Dice))
-			ReplyGroupRaw(ctx, &Message{GroupID: diceGroupID}, text, "")
-			time.Sleep(1 * time.Second)
-			p.QuitGroup(ctx, diceGroupID)
+			autoQuitGroupAsync(ctx, diceGroupID, func(ctx *MsgContext) {
+				ReplyGroupRaw(ctx, &Message{GroupID: diceGroupID}, text, "")
+				time.Sleep(1 * time.Second)
+			})
 		}
 	}
 	return result
@@ -698,6 +709,33 @@ func (p *PlatformAdapterOnebot) isServer() bool {
 	return p.Mode == "server" //nolint:goconst
 }
 
+// noteIncomingSeq 记录一条收到的群消息是否有 message_seq。
+// 连续 3 条无 seq 且从未见过 seq 时，标记当前实现不提供 message_seq。
+func (p *PlatformAdapterOnebot) noteIncomingSeq(seq int64) {
+	if p == nil {
+		return
+	}
+	if seq > 0 {
+		p.seqSeen.Store(true)
+		p.seqZeroSeen.Store(0)
+		return
+	}
+	if p.seqZeroSeen.Add(1) >= 3 && !p.seqSeen.Load() {
+		p.seqMissing.Store(true)
+	}
+}
+
+// hasMessageSeq 报告是否仍可认为当前实现提供群消息 seq。
+func (p *PlatformAdapterOnebot) hasMessageSeq() bool {
+	if p == nil {
+		return false
+	}
+	if p.seqSeen.Load() {
+		return true
+	}
+	return !p.seqMissing.Load()
+}
+
 // onConnected 连接成功的回调函数
 func (p *PlatformAdapterOnebot) onConnected(kws *socketio.WebsocketWrapper) {
 	// 连接成功，获取当前登录状态
@@ -718,6 +756,9 @@ func (p *PlatformAdapterOnebot) onConnected(kws *socketio.WebsocketWrapper) {
 	p.EndPoint.UserID = fmt.Sprintf("QQ:%d", info.UserId)
 	p.EndPoint.Nickname = info.NickName
 	_ = p.sm.Event(context.Background(), "connect_ok")
+	if p.EndPoint != nil && p.EndPoint.Session != nil {
+		p.EndPoint.Session.Parent.scheduleLogGapReconcile(3 * time.Second)
+	}
 }
 
 // initializeCommonResources 初始化公共资源（移除sync.Once限制，允许重新初始化）
@@ -1032,7 +1073,28 @@ func (p *PlatformAdapterOnebot) startConnection() error {
 	}
 }
 
-// retryConnect 重试连接方法
+// onebotRetryDelay 返回第 attempt 次失败后的等待时间。前 5 次指数退避
+// （2/4/8/16/32 秒），之后逐步拉长到 10 分钟封顶，断网期间不会刷屏。
+func onebotRetryDelay(attempt uint) time.Duration {
+	if attempt <= 5 {
+		return time.Duration(1<<(attempt-1)) * 2 * time.Second
+	}
+	switch attempt {
+	case 6:
+		return time.Minute
+	case 7:
+		return 2 * time.Minute
+	case 8:
+		return 5 * time.Minute
+	default:
+		return 10 * time.Minute
+	}
+}
+
+// retryConnect 重试连接方法。
+// 前 5 次按 2s 指数退避快速重连；之后等待时间逐步拉长到 10 分钟封顶，
+// 持续重试直到连接成功或用户禁用适配器。这样协议端（例如 SnowLuma）挂起
+// 后恢复监听时余烬能自动连回，又不会在长时间断网时反复刷日志。
 func (p *PlatformAdapterOnebot) retryConnect() {
 	// 检查适配器是否已被禁用
 	if !p.desiredEnabled {
@@ -1055,60 +1117,44 @@ func (p *PlatformAdapterOnebot) retryConnect() {
 		p.retryMutex.Unlock()
 	}()
 
-	const maxRetries = 5
-	const baseDelay = 2 * time.Second
+	const maxFastRetries = 5
 
-	err := retry.Do(
-		func() error {
-			// 在每次重试前再次检查适配器是否已被禁用
+	for attempt := uint(1); ; attempt++ {
+		if !p.desiredEnabled {
+			p.logger.Info("重连已停止：适配器被禁用")
+			return
+		}
+
+		p.retryMutex.Lock()
+		p.retryAttempts = attempt
+		p.retryMutex.Unlock()
+
+		if attempt <= maxFastRetries {
+			p.logger.Infof("尝试重新连接 OneBot [%d/%d]", attempt, maxFastRetries)
+		} else {
+			p.logger.Infof("尝试重新连接 OneBot [第%d次，失败后等待 %v]", attempt, onebotRetryDelay(attempt))
+		}
+
+		// 调用startConnection重新建立连接，确保遵循连接互斥锁机制
+		err := p.startConnection()
+		if err == nil {
+			p.logger.Infof("OneBot 重连成功")
+			return
+		}
+
+		p.EndPoint.State = StateConnectionFailed
+
+		wait := onebotRetryDelay(attempt)
+		p.logger.Warnf("重连失败 (第%d次): %v，%v后进行下次重试", attempt, err, wait)
+
+		// 分片等待：禁用后最多 1 秒内停止，不必等满当前间隔。
+		for slept := time.Duration(0); slept < wait; slept += time.Second {
 			if !p.desiredEnabled {
-				return errors.New("适配器已被禁用，停止重连")
-			}
-
-			p.retryMutex.Lock()
-			p.retryAttempts++
-			currentAttempt := p.retryAttempts
-			p.retryMutex.Unlock()
-
-			// 计算下次重试时间（指数退避）
-			nextRetryDelay := time.Duration(1<<(currentAttempt-1)) * baseDelay
-			if currentAttempt < maxRetries {
-				p.logger.Infof("尝试重新连接 OneBot [%d/%d]，下次重试间隔: %v", currentAttempt, maxRetries, nextRetryDelay)
-			} else {
-				p.logger.Infof("尝试重新连接 OneBot [%d/%d]，最后一次尝试", currentAttempt, maxRetries)
-			}
-
-			// 调用startConnection重新建立连接，确保遵循连接互斥锁机制
-			return p.startConnection()
-		},
-		retry.Attempts(maxRetries),
-		retry.Delay(baseDelay),
-		retry.DelayType(retry.BackOffDelay),
-		retry.OnRetry(func(n uint, err error) {
-			// 在重试前再次检查适配器是否已被禁用
-			if !p.desiredEnabled {
-				p.logger.Info("适配器已被禁用，停止重试")
+				p.logger.Info("重连已停止：适配器被禁用")
 				return
 			}
-			nextDelay := time.Duration(1<<n) * baseDelay
-			p.logger.Warnf("重连失败 (第%d次): %v，%v后进行下次重试", n+1, err, nextDelay)
-		}),
-	)
-
-	if err != nil {
-		// 检查是否是因为适配器被禁用而失败
-		if strings.Contains(err.Error(), "适配器已被禁用") {
-			p.logger.Info("重连已停止：适配器被禁用")
-		} else {
-			p.logger.Errorf("重连最终失败，已达到最大重试次数 %d: %v", maxRetries, err)
-			p.EndPoint.State = StateConnectionFailed
+			time.Sleep(time.Second)
 		}
-	} else {
-		p.logger.Infof("OneBot 重连成功")
-		// 重置重试状态
-		p.retryMutex.Lock()
-		p.retryAttempts = 0
-		p.retryMutex.Unlock()
 	}
 }
 
@@ -1130,7 +1176,10 @@ func (p *PlatformAdapterOnebot) ensureFSM() {
 		"disconnected",
 		loopfsm.Events{
 			{Name: "enable", Src: []string{"disconnected", "failed"}, Dst: "connecting"},
-			{Name: "connect_ok", Src: []string{"connecting"}, Dst: "connected"},
+			// 首次连接失败后，retryConnect 直接调用 startConnection 重连，不经过 enable，
+			// 重连成功时状态机仍停在 failed。不接受 failed 的话 connect_ok 会被拒：
+			// State 一直是「连接失败」，之后的 connection_lost 也被拒，断线不再重连。
+			{Name: "connect_ok", Src: []string{"connecting", "failed"}, Dst: "connected"},
 			{Name: "connect_fail", Src: []string{"connecting"}, Dst: "failed"},
 			{Name: "disable", Src: []string{"connecting", "connected", "failed", "disconnected"}, Dst: "disconnected"},
 			{Name: "connection_lost", Src: []string{"connected"}, Dst: "connecting"},

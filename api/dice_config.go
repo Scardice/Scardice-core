@@ -42,7 +42,7 @@ func DiceConfig(c echo.Context) error {
 
 	limit := myDice.Config.UILogLimit
 	if limit == 0 {
-		limit = 100
+		limit = 300
 	}
 	myDice.UnlockCodeUpdate(false)
 
@@ -300,6 +300,29 @@ func DiceConfigSet(c echo.Context) error {
 		config.WorkInQQChannel = val.(bool)
 	}
 
+	if val, ok := jsonMap["officialQQUseMarkdown"]; ok {
+		if v, ok := val.(bool); ok {
+			config.OfficialQQUseMarkdown = v
+		}
+	}
+	if val, ok := jsonMap["officialQQUseNameCard"]; ok {
+		if v, ok := val.(bool); ok {
+			config.OfficialQQUseNameCard = v
+		}
+	}
+	if val, ok := jsonMap["officialQQUseNameCardTemplate"]; ok {
+		if v, ok := val.(string); ok {
+			v = dice.NormalizeOfficialQQNameCardTemplate(v)
+			if utf8.RuneCountInString(v) > dice.MaxOfficialQQNameCardTemplateRunes {
+				return c.JSON(http.StatusBadRequest, Response{
+					"result": false,
+					"err":    "名片模板不能超过" + strconv.Itoa(dice.MaxOfficialQQNameCardTemplateRunes) + "个字符",
+				})
+			}
+			config.OfficialQQNameCardTmpl = v
+		}
+	}
+
 	if val, ok := jsonMap["diceRandomMode"]; ok {
 		if v, ok := val.(string); ok {
 			switch strings.ToLower(strings.TrimSpace(v)) {
@@ -351,6 +374,65 @@ func DiceConfigSet(c echo.Context) error {
 	}
 	if aliveNoticeMod {
 		myDice.ApplyAliveNotice()
+	}
+
+	diskSpaceNoticeMod := false
+	if val, ok := jsonMap["diskSpaceNoticeEnable"]; ok {
+		if v, ok := val.(bool); ok {
+			config.DiskSpaceNoticeEnable = v
+			diskSpaceNoticeMod = true
+		}
+	}
+	if val, ok := jsonMap["diskSpaceNoticeThresholdMB"]; ok {
+		threshold := int64(0)
+		switch v := val.(type) {
+		case float64:
+			threshold = int64(v)
+		case string:
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				threshold = n
+			}
+		}
+		if threshold <= 0 {
+			threshold = dice.DefaultConfig.DiskSpaceNoticeThresholdMB
+		}
+		if threshold > 1<<20 {
+			threshold = 1 << 20
+		}
+		config.DiskSpaceNoticeThresholdMB = threshold
+		diskSpaceNoticeMod = true
+	}
+	if val, ok := jsonMap["diskSpaceNoticeInterval"]; ok {
+		if v, ok := val.(string); ok {
+			v = strings.TrimSpace(v)
+			if v == "" {
+				v = dice.DefaultConfig.DiskSpaceNoticeInterval
+			}
+			config.DiskSpaceNoticeInterval = v
+			diskSpaceNoticeMod = true
+		}
+	}
+	if val, ok := jsonMap["diskSpaceNoticeCooldownMinutes"]; ok {
+		cooldown := 0
+		switch v := val.(type) {
+		case float64:
+			cooldown = int(v)
+		case string:
+			if n, err := strconv.Atoi(v); err == nil {
+				cooldown = n
+			}
+		}
+		if cooldown <= 0 {
+			cooldown = dice.DefaultConfig.DiskSpaceNoticeCooldownMinutes
+		}
+		if cooldown > 10080 {
+			cooldown = 10080
+		}
+		config.DiskSpaceNoticeCooldownMinutes = cooldown
+		diskSpaceNoticeMod = true
+	}
+	if diskSpaceNoticeMod {
+		myDice.ApplyDiskSpaceNotice()
 	}
 
 	if val, ok := jsonMap["UILogLimit"]; ok {
@@ -432,6 +514,22 @@ func DiceConfigSet(c echo.Context) error {
 	// if val, ok := jsonMap["customDrawKeysTextEnable"]; ok {
 	// 	myDice.CustomDrawKeysTextEnable = val.(bool)
 	// }
+
+	if val, ok := jsonMap["logGapFillEnable"]; ok {
+		if enable, ok2 := val.(bool); ok2 {
+			config.LogGapFillEnable = enable
+			if !enable {
+				// 关闭后立即取消排队/在途的自动补全任务，避免切换后还继续补录。
+				myDice.CancelLogGapFillTasks()
+			}
+		}
+	}
+
+	if val, ok := jsonMap["startupSoundEnable"]; ok {
+		if enable, ok2 := val.(bool); ok2 {
+			config.StartupSoundEnable = enable
+		}
+	}
 
 	if val, ok := jsonMap["logSizeNoticeEnable"]; ok {
 		config.LogSizeNoticeEnable = val.(bool)

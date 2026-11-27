@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,6 +31,8 @@ type onebotTestEmitter struct {
 	groupInfo      *emitterTypes.GroupInfo
 	groupInfoErr   error
 	groupReqCh     chan struct{}
+	quitGroupMu    sync.Mutex
+	quitGroupCalls []int64
 	loginInfo      *emitterTypes.LoginInfo
 	loginInfoErr   error
 	sendPvtCh      chan time.Time
@@ -134,7 +137,30 @@ func (m *onebotTestEmitter) SetGroupSpecialTitle(context.Context, int64, int64, 
 	return nil
 }
 
-func (m *onebotTestEmitter) QuitGroup(context.Context, int64) error { return nil }
+func (m *onebotTestEmitter) QuitGroup(_ context.Context, groupID int64) error {
+	m.quitGroupMu.Lock()
+	m.quitGroupCalls = append(m.quitGroupCalls, groupID)
+	m.quitGroupMu.Unlock()
+	return nil
+}
+
+func (m *onebotTestEmitter) quitGroupCallsSnapshot() []int64 {
+	m.quitGroupMu.Lock()
+	defer m.quitGroupMu.Unlock()
+	return append([]int64(nil), m.quitGroupCalls...)
+}
+
+func (m *onebotTestEmitter) waitForQuitGroupCalls(t *testing.T, want int) []int64 {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		calls := m.quitGroupCallsSnapshot()
+		if len(calls) >= want || time.Now().After(deadline) {
+			return calls
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
 
 func (m *onebotTestEmitter) SetGroupCard(context.Context, int64, int64, string) error { return nil }
 
@@ -148,8 +174,15 @@ func (m *onebotTestEmitter) GetGroupInfo(context.Context, int64, bool) (*emitter
 	return m.groupInfo, nil
 }
 
-func (m *onebotTestEmitter) GetGroupMemberInfo(context.Context, int64, int64, bool) (*emitterTypes.GroupMemberInfo, error) {
-	return &emitterTypes.GroupMemberInfo{}, nil
+func (m *onebotTestEmitter) GetGroupMemberInfo(_ context.Context, groupID int64, userID int64, _ bool) (*emitterTypes.GroupMemberInfo, error) {
+	// 返回一条可验证的真实成员记录，供群主/退群保护逻辑使用。
+	return &emitterTypes.GroupMemberInfo{
+		GroupId:  groupID,
+		UserId:   userID,
+		Nickname: "test-bot",
+		Role:     "member",
+		JoinTime: 1,
+	}, nil
 }
 
 func (m *onebotTestEmitter) GetGroupMsgHistory(context.Context, int64, int64, int) (*emitterTypes.GetGroupMsgHistoryRes, error) {
@@ -381,6 +414,70 @@ func TestPureOnebotGetGroupInfoSyncUsesGroupBanInfo(t *testing.T) {
 
 	if got := pa.GetGroupInfoSync(groupID); got == nil {
 		t.Fatalf("expected group info, got nil")
+	}
+	if calls := em.waitForQuitGroupCalls(t, 1); len(calls) != 1 || calls[0] != 66666 {
+		t.Fatalf("expected banned group to be quit, got %v", calls)
+	}
+}
+
+// 邀请限制（拒绝拉群、只允许信任的人拉群）不代表群被拉黑；
+// 已经加入的群不能因为 BanList 中有信任/常规/警告条目就被自动退出。
+func TestPureOnebotGetGroupInfoSyncDoesNotQuitForInviteRestrictions(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		rank         BanRankType
+		refuseInvite bool
+		trustOnly    bool
+	}{
+		{name: "trusted group", rank: BanRankTrusted},
+		{name: "trusted group with refused invites", rank: BanRankTrusted, refuseInvite: true},
+		{name: "trusted group with both restrictions", rank: BanRankTrusted, refuseInvite: true, trustOnly: true},
+		{name: "normal group with refused invites", rank: BanRankNormal, refuseInvite: true},
+		{name: "warned group with refused invites", rank: BanRankWarn, refuseInvite: true},
+		{name: "normal group in trust-only mode", rank: BanRankNormal, trustOnly: true},
+		{name: "warned group in trust-only mode", rank: BanRankWarn, trustOnly: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d, pa, em, cleanup := newPureOnebotTestAdapter(t)
+			defer cleanup()
+
+			d.Config.RefuseGroupInvite = tt.refuseInvite
+			d.Config.TrustOnlyMode = tt.trustOnly
+			const groupID = "QQ-Group:66666"
+			group := &GroupInfo{
+				GroupID:         groupID,
+				GroupName:       "group",
+				InviteUserID:    "QQ:55555",
+				EnteredTime:     123,
+				DiceIDExistsMap: new(SyncMap[string, bool]),
+			}
+			group.DiceIDExistsMap.Store(pa.EndPoint.UserID, true)
+			d.ImSession.ServiceAtNew.Store(groupID, group)
+			em.groupInfo = &emitterTypes.GroupInfo{
+				GroupId:        66666,
+				GroupName:      "group",
+				MemberCount:    10,
+				MaxMemberCount: 100,
+			}
+			d.Config.BanList.Map.Store(groupID, &BanListInfoItem{
+				ID:   groupID,
+				Rank: tt.rank,
+			})
+
+			if got := pa.GetGroupInfoSync(groupID); got == nil {
+				t.Fatal("expected group info, got nil")
+			}
+			// 自动退群现在在独立 goroutine 中执行，留一个短暂窗口确认没有误退群。
+			time.Sleep(50 * time.Millisecond)
+			if calls := em.quitGroupCallsSnapshot(); len(calls) != 0 {
+				t.Fatalf("invite restrictions must not cause blacklist quits, got %v", calls)
+			}
+			select {
+			case <-em.sendGrCh:
+				t.Fatal("expected no blacklist warning for a group that is not banned")
+			default:
+			}
+		})
 	}
 }
 
@@ -1105,4 +1202,26 @@ func waitPureOnebotInfoLogCount(t *testing.T, observed *observer.ObservedLogs, s
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %d log entries containing %q", count, snippet)
+}
+
+// 协议端比骰子晚起来时，首次连接被拒、状态机进入 failed，retryConnect 随后直接重连成功。
+// 这里用真实的状态转换表，确认重连成功会回到 connected，之后断线也还能再触发重连。
+func TestPureOnebotReconnectAfterInitialFailureMarksConnected(t *testing.T) {
+	pa := &PlatformAdapterOnebot{EndPoint: &EndPointInfo{}}
+	pa.ensureFSM()
+	pa.sm.SetState("failed")
+	pa.EndPoint.State = StateConnectionFailed
+
+	if err := pa.sm.Event(context.Background(), "connect_ok"); err != nil {
+		t.Fatalf("expected connect_ok to be accepted from failed, got %v", err)
+	}
+	if got := pa.sm.Current(); got != "connected" {
+		t.Fatalf("expected FSM to transition to connected, got %q", got)
+	}
+	if pa.EndPoint.State != StateConnected {
+		t.Fatalf("expected EndPoint.State to be StateConnected, got %v", pa.EndPoint.State)
+	}
+	if !pa.sm.Can("connection_lost") {
+		t.Fatal("expected connection_lost to be possible after reconnecting")
+	}
 }

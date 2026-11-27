@@ -26,7 +26,7 @@ func (*LogOneItemParquet) TableName() string {
 
 type LogOneItem struct {
 	ID             uint64      `gorm:"primaryKey;autoIncrement;column:id;index:idx_log_delete_by_id,priority:3" json:"id"`
-	LogID          uint64      `gorm:"column:log_id;index:idx_log_items_log_id"                                json:"-"`
+	LogID          uint64      `gorm:"column:log_id;index:idx_log_items_log_id;index:idx_log_raw,priority:1;index:idx_log_items_log_seq,priority:1" json:"-"`
 	GroupID        string      `gorm:"index:idx_log_items_group_id;column:group_id;index:idx_log_delete_by_id,priority:1"`
 	Nickname       string      `gorm:"column:nickname"                                                         json:"nickname"`
 	IMUserID       string      `gorm:"column:im_userid"                                                        json:"IMUserId"`
@@ -38,7 +38,7 @@ type LogOneItem struct {
 	CommandInfoStr string      `gorm:"column:command_info"                                                     json:"-"`
 	// 这里的RawMsgID 真的什么都有可能
 	RawMsgID    interface{} `gorm:"-"                                                                 json:"rawMsgId"  parquet:"-"`
-	RawMsgIDStr string      `gorm:"column:raw_msg_id;index:idx_raw_msg_id;index:idx_log_delete_by_id,priority:2" json:"-"`
+	RawMsgIDStr string      `gorm:"column:raw_msg_id;index:idx_raw_msg_id;index:idx_log_delete_by_id,priority:2;index:idx_log_raw,priority:2" json:"-"`
 	UniformID   string      `gorm:"column:user_uniform_id"                                            json:"uniformId"`
 	// 数据库里没有的
 	Channel string `gorm:"-" json:"channel"`
@@ -48,7 +48,11 @@ type LogOneItem struct {
 	ParentID *int `gorm:"column:parent_id" json:"-"`
 	// Seq 平台消息序号，用于掉线期间的日志断层检测与补全
 	// 允许default=NULL，历史记录与不支持seq的平台均为NULL
-	Seq *int64 `gorm:"column:seq" json:"seq,omitempty"`
+	Seq *int64 `gorm:"column:seq;index:idx_log_items_log_seq,priority:2" json:"seq,omitempty"`
+	// IsGapFill 是日志断层自动补全写入的内部标记。
+	// 1115.fix4 起不再对外暴露（JSON/导出/API 筛选均已移除），仅保留数据库列与
+	// 内部写入，保证旧库结构和 V150 重建兼容；新代码不要再把它用于用户侧功能。
+	IsGapFill bool `gorm:"column:is_gap_fill;not null;default:false;index:idx_log_items_gap_fill" json:"-"`
 }
 
 // 兼容旧版本的数据库设计
@@ -135,10 +139,20 @@ func (*LogInfoHookMySQL) TableName() string {
 	return "logs"
 }
 
+// LogOneItemHookMySQL 只用于 MySQL 的 AutoMigrate。
+// 注意：不要给 RawMsgIDStr 加 idx_log_raw。MySQL 上 raw_msg_id 是 TEXT，
+// 直接建 (log_id, raw_msg_id) 普通索引会失败；去重查询带 group_id，
+// 复用已有的 idx_log_delete_by_id(group_id(20), raw_msg_id(20), id) 前缀索引。
+// 下面两个 length:20 是显式声明前缀长度，保证新库/迁移建出的索引与查询匹配。
+//
+// idx_log_items_log_seq 不写 index tag：MySQL 的 AutoMigrate 在并发首启时
+// 两个实例都可能认为索引不存在并同时 CREATE INDEX，后一个会报 duplicate key
+// 并让迁移失败。该索引由 EnsureLogSchema 和 createMySQLIndexForLogOneItem
+// 显式创建，重复错误只记日志/忽略。SQLite/PostgreSQL 模型仍保留 tag。
 type LogOneItemHookMySQL struct {
 	ID             uint64      `gorm:"primaryKey;autoIncrement;column:id;index:idx_log_delete_by_id,priority:3" json:"id"`
-	LogID          uint64      `gorm:"column:log_id"                      json:"-"`
-	GroupID        string      `gorm:"column:group_id;index:idx_log_delete_by_id,priority:1"`
+	LogID          uint64      `gorm:"column:log_id" json:"-"`
+	GroupID        string      `gorm:"column:group_id;index:idx_log_delete_by_id,priority:1,length:20"`
 	Nickname       string      `gorm:"column:nickname"                    json:"nickname"`
 	IMUserID       string      `gorm:"column:im_userid"                   json:"IMUserId"`
 	Time           int64       `gorm:"column:time"                        json:"time"`
@@ -148,12 +162,14 @@ type LogOneItemHookMySQL struct {
 	CommandInfo    interface{} `gorm:"-"                                  json:"commandInfo"`
 	CommandInfoStr string      `gorm:"column:command_info"                json:"-"`
 	RawMsgID       interface{} `gorm:"-"                                  json:"rawMsgId"`
-	RawMsgIDStr    string      `gorm:"column:raw_msg_id;index:idx_log_delete_by_id,priority:2" json:"-"`
+	RawMsgIDStr    string      `gorm:"column:raw_msg_id;index:idx_log_delete_by_id,priority:2,length:20" json:"-"`
 	UniformID      string      `gorm:"column:user_uniform_id"             json:"uniformId"`
 	Channel        string      `gorm:"-"                                  json:"channel"`
 	Removed        *int        `gorm:"column:removed"                     json:"-"`
 	ParentID       *int        `gorm:"column:parent_id"                   json:"-"`
-	Seq            *int64      `gorm:"column:seq"                         json:"seq,omitempty"`
+	Seq            *int64      `gorm:"column:seq" json:"seq,omitempty"`
+	// IsGapFill 仅保留数据库列以兼容旧库；不再对外输出。
+	IsGapFill bool `gorm:"column:is_gap_fill;not null;default:false" json:"-"`
 }
 
 func (*LogOneItemHookMySQL) TableName() string {

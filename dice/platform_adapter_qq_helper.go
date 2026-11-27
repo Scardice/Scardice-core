@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"runtime/debug"
 	"time"
 )
 
@@ -91,8 +92,10 @@ func serverGocq(d *Dice, ep *EndPointInfo, conn *PlatformAdapterGocq) {
 		conn.reconnectTimes++
 		if conn.reconnectTimes > 5 {
 			d.Logger.Infof("onebot 连接重试次数过多，先行中断: <%s>(%s)", ep.Nickname, ep.UserID)
-			ep.State = 0
+			ep.State = StateDisconnected
 			conn.GoCqhttpState = StateCodeLoginFailed
+			d.LastUpdatedTime = time.Now().Unix()
+			d.Save(false)
 			break
 		}
 
@@ -146,6 +149,10 @@ func serverWalleQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterWalleQ) {
 		if waitTimes > 5 {
 			d.Logger.Infof("onebot 连接重试次数过多，先行中断: <%s>(%s)", ep.Nickname, ep.UserID)
 			conn.DiceServing = false
+			// 重试预算耗尽后必须回置状态，避免 UI 永远停在“连接中”。
+			ep.State = StateDisconnected
+			d.LastUpdatedTime = time.Now().Unix()
+			d.Save(false)
 			break
 		}
 
@@ -178,6 +185,9 @@ func serverRed(d *Dice, ep *EndPointInfo, conn *PlatformAdapterRed) {
 		if waitTimes > 5 {
 			d.Logger.Infof("red 连接重试次数过多，先行中断: <%s>(%s)", ep.Nickname, ep.UserID)
 			conn.DiceServing = false
+			ep.State = StateDisconnected
+			d.LastUpdatedTime = time.Now().Unix()
+			d.Save(false)
 			break
 		}
 
@@ -210,6 +220,9 @@ func serverSatori(d *Dice, ep *EndPointInfo, conn *PlatformAdapterSatori) {
 		if waitTimes > 5 {
 			d.Logger.Infof("satori 连接重试次数过多，先行中断: <%s>(%s)", ep.Nickname, ep.UserID)
 			conn.DiceServing = false
+			ep.State = StateDisconnected
+			d.LastUpdatedTime = time.Now().Unix()
+			d.Save(false)
 			break
 		}
 
@@ -217,41 +230,163 @@ func serverSatori(d *Dice, ep *EndPointInfo, conn *PlatformAdapterSatori) {
 	}
 }
 
-func serverOfficialQQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterOfficialQQ) {
-	if conn.Ctx != nil {
-		return
-	}
-	if conn.DiceServing {
-		return
-	}
-	conn.DiceServing = true
+// officialQQMaxConnectAttempts 是连续连接失败的终态上限。超过后必须把端点
+// 明确置为失败并停止重试，否则错误的 AppID/白名单会让 UI 永远显示“连接中”。
+// 设为 var 便于测试缩短等待。
+var officialQQMaxConnectAttempts = 5
 
-	ep.Enable = true
-	ep.State = 2 // 连接中
+// officialQQServe 抽出 Serve 调用，便于测试注入“始终失败”的连接。
+// 默认 nil，调用时回退到 defaultOfficialQQServe，避免与 Serve 形成初始化环。
+var officialQQServe func(conn *PlatformAdapterOfficialQQ) int
+
+func defaultOfficialQQServe(conn *PlatformAdapterOfficialQQ) int {
+	return conn.Serve()
+}
+
+// officialQQInitialBackoff 是首次连接失败后的等待时间；测试可缩短。
+var officialQQInitialBackoff = 15 * time.Second
+
+// officialQQReadyTimeout 是 WebSocket 已提交后等待 READY 的上限。
+// 超时按瞬时失败重启连接，避免端点永远停在“连接中”。测试可缩短。
+var officialQQReadyTimeout = 60 * time.Second
+
+// maxOfficialQQReadyTimeouts 是连续 READY 超时的上限。每次超时约 60 秒；
+// 超过后置 ConnectionFailed，避免无限重连、日志刷屏。
+const maxOfficialQQReadyTimeouts = 3
+
+// officialQQStart 启动 Serve 重试循环；测试可替换为不建真实连接的空实现。
+var officialQQStart func(d *Dice, ep *EndPointInfo)
+
+func defaultOfficialQQStart(d *Dice, ep *EndPointInfo) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// 异步启动路径（SetEnable/DoRelogin/READY 看门狗）没有
+				// main.go 的 recover；这里必须兜住，否则一个 panic 会
+				// 带走整个进程，或让端点永久停在 Connecting。
+				if d != nil && d.Logger != nil {
+					d.Logger.Errorf("official qq 启动协程异常: %v\n%s", r, debug.Stack())
+				}
+				if conn, ok := ep.Adapter.(*PlatformAdapterOfficialQQ); ok {
+					conn.setDiceServingIfIdle(false)
+					conn.setEndpointStateIfIdle(false, StateConnectionFailed)
+				}
+				if d != nil {
+					d.LastUpdatedTime = time.Now().Unix()
+					d.Save(false)
+				}
+			}
+		}()
+		ServerOfficialQQ(d, ep)
+	}()
+}
+
+func startOfficialQQ(d *Dice, ep *EndPointInfo) {
+	start := officialQQStart
+	if start == nil {
+		start = defaultOfficialQQStart
+	}
+	start(d, ep)
+}
+
+func serverOfficialQQ(d *Dice, ep *EndPointInfo, conn *PlatformAdapterOfficialQQ) {
+	// 用户可能在“SetEnable(true) → 后台 goroutine 真正启动”之间点禁用。
+	// 异步启动必须尊重当下的 Enable=false，否则会把刚被禁用的端点重新连上。
+	if enabled, _ := conn.endpointStateSnapshot(); !enabled {
+		return
+	}
+	// Ctx 非空表示会话已经建立或正在运行，不能重复启动并覆盖端点状态。
+	if conn.isSessionRunning() {
+		return
+	}
+	if conn.isDiceServing() {
+		return
+	}
+
+	epoch, stop := conn.beginServeLoop()
+	// 原子校验代次/Enable 并写入 Connecting；禁用与启动并发时不会互相覆盖。
+	if !conn.claimServe(epoch) {
+		return
+	}
 	d.LastUpdatedTime = time.Now().Unix()
 	d.Save(false)
 	waitTimes := 0
+	backoff := officialQQInitialBackoff
 
 	for {
+		if !conn.serveLoopCurrent(epoch, stop) {
+			// 用户已禁用/重登或新的 Serve 循环已接管；不要回写状态。
+			conn.setDiceServingIfEpoch(false, epoch)
+			return
+		}
+		// 退避期间用户可能已经禁用；每次 Serve 前再确认一次，不能把
+		// 已失败/已禁用的端点重新拉起来。
+		if enabled, _ := conn.endpointStateSnapshot(); !enabled {
+			conn.setDiceServingIfEpoch(false, epoch)
+			d.LastUpdatedTime = time.Now().Unix()
+			d.Save(false)
+			return
+		}
 		// 骰子开始连接
-		d.Logger.Infof("开始连接 official qq，帐号 <%s>(%s)，重试计数[%d/%d]", ep.Nickname, ep.UserID, waitTimes, 5)
-		ret := ep.Adapter.Serve()
+		d.Logger.Infof("开始连接 official qq，帐号 <%s>(%s)，重试计数[%d/%d]", ep.Nickname, ep.UserID, waitTimes, officialQQMaxConnectAttempts)
+		serve := officialQQServe
+		if serve == nil {
+			serve = defaultOfficialQQServe
+		}
+		ret := serve(conn)
 
 		if ret == 0 {
-			if conn.QRLoginState == OfficialQQQRWaitingForScan {
-				ep.Enable = false
-				ep.State = StateConnecting
-			}
-			break
+			// 会话已建立，本轮重试循环结束；只清自己的代次，不能清新循环。
+			conn.setDiceServingIfEpoch(false, epoch)
+			return
 		}
 
-		waitTimes += 1
-		if waitTimes > 5 {
+		if !conn.serveLoopCurrent(epoch, stop) {
+			conn.setDiceServingIfEpoch(false, epoch)
+			return
+		}
+		// 永久失败（Webhook 配置非法、UIN 冲突、账号重复等）由 failConnect 置
+		// Enable=false；用户禁用也会置 false。两种情况都停止重试，不改写用户状态。
+		// Enable 由适配器的 sessionMu 保护，这里必须走加锁快照；直接读 ep.Enable
+		// 会与 SetEnable/failConnect 并发构成数据竞争。
+		if enabled, _ := conn.endpointStateSnapshot(); !enabled {
+			conn.setDiceServingIfEpoch(false, epoch)
+			d.LastUpdatedTime = time.Now().Unix()
+			d.Save(false)
+			return
+		}
+
+		waitTimes++
+		if waitTimes >= officialQQMaxConnectAttempts {
+			// 连续失败达到上限：置失败态并停止，避免端点永远停在“连接中”。
 			d.Logger.Infof("official qq 连接重试次数过多，先行中断: <%s>(%s)", ep.Nickname, ep.UserID)
-			conn.DiceServing = false
-			break
+			conn.setDiceServingIfEpoch(false, epoch)
+			conn.setEndpointStateIfIdle(false, StateConnectionFailed)
+			d.LastUpdatedTime = time.Now().Unix()
+			d.Save(false)
+			return
 		}
 
-		time.Sleep(15 * time.Second)
+		d.Logger.Warnf("official qq 连接失败，%s 后重试: 帐号 <%s>(%s)", backoff, ep.Nickname, ep.UserID)
+		if !waitOfficialQQRetry(stop, backoff) {
+			conn.setDiceServingIfEpoch(false, epoch)
+			return
+		}
+		backoff *= 2
+		if backoff > 5*time.Minute {
+			backoff = 5 * time.Minute
+		}
+	}
+}
+
+// waitOfficialQQRetry 等待下一次重试，用户禁用/重登时立即返回 false。
+func waitOfficialQQRetry(stop <-chan struct{}, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-stop:
+		return false
 	}
 }

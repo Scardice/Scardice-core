@@ -1,6 +1,7 @@
 package dice
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -66,6 +67,9 @@ type Message struct {
 	GroupName   string      `json:"groupName"`
 	TmpUID      string      `json:"-"             yaml:"-"`
 	Seq         int64       `jsbind:"seq"         json:"seq"` // 平台消息序号，0=不可用/不支持
+	// MentionedInfo carries platform-provided display names keyed by normalized
+	// user ID, used to fill @ mention names without extra API calls.
+	MentionedInfo map[string]string `json:"-" yaml:"-"`
 	// Note(Szzrain): 这里是消息段，为了支持多种消息类型，目前只有 Milky 支持，其他平台也应该尽快迁移支持，并使用 Session.ExecuteNew 方法
 	Segment []message.IMessageElement `jsbind:"segment" json:"-" yaml:"-"`
 }
@@ -94,13 +98,31 @@ func extNamePlaceholder(name string) *ExtInfo {
 	return p
 }
 
+// logOffGapAuth 是“日志关闭前已经创建的补全任务”的运行时授权。
+//
+// 只用于 .log off / .bot off 的精确边界：任务窗口完全位于 off 指令之前
+// (toSeq <= offSeq)，因此即使在 LogOn=false 之后也允许把这段 off 前窗口
+// 补进日志。不持久化：进程重启后授权失效，由现有 pending/生命周期语义处理。
+type logOffGapAuth struct {
+	logID   uint64
+	logName string
+	epoch   uint64
+	offSeq  int64 // .log off / .bot off 指令 seq，补全窗口上界（不含）
+}
+
 type GroupInfo struct {
-	Active    bool                               `jsbind:"active" json:"active" yaml:"active"` // 是否在群内开启 - 过渡为象征意义
-	extInitMu sync.Mutex                         `json:"-" yaml:"-"`                           // 延迟初始化锁
-	Players   *SyncMap[string, *GroupPlayerInfo] `json:"-" yaml:"-"`                           // 群员角色数据
+	// Active 不直接暴露给 goja（jsbind:"-"）；JS 侧由 dice_jsvm_group_active.go 中的
+	// Object.prototype 访问器转发到 IsActiveRaw/SetActiveRaw，避免脚本绕过 activeMu。
+	Active    bool                               `jsbind:"-" json:"active" yaml:"active"` // 是否在群内开启 - 过渡为象征意义
+	activeMu  sync.RWMutex                       `json:"-" yaml:"-"`                      // 保护 Active，消息处理与保存/通知协程会并发访问
+	extInitMu sync.Mutex                         `json:"-" yaml:"-"`                      // 延迟初始化锁
+	Players   *SyncMap[string, *GroupPlayerInfo] `json:"-" yaml:"-"`                      // 群员角色数据
 
 	activatedExtList  []*ExtInfo // 当前群开启的扩展列表（私有，通过 Getter 访问，由 MarshalJSON/UnmarshalJSON 处理序列化）
 	InactivatedExtSet StringSet  `json:"inactivatedExtSet" yaml:"inactivatedExtSet,flow"` // 手动关闭或尚未启用的扩展
+	// UserInactivatedExtSet 只记录用户手动关闭的扩展；与 InactivatedExtSet 的区别是
+	// 它不包含“从未自动启用”的扩展，迁移合并时只应尊重用户手动关闭的状态。
+	UserInactivatedExtSet StringSet `json:"userInactivatedExtSet" yaml:"userInactivatedExtSet,flow"`
 
 	GroupID         string                 `jsbind:"groupId"       json:"groupId"      yaml:"groupId"`
 	GuildID         string                 `jsbind:"guildId"       json:"guildId"      yaml:"guildId"`
@@ -108,17 +130,43 @@ type GroupInfo struct {
 	GroupName       string                 `jsbind:"groupName"     json:"groupName"    yaml:"groupName"`
 	DiceIDActiveMap *SyncMap[string, bool] `json:"diceIdActiveMap" yaml:"diceIds,flow"` // 对应的骰子ID(格式 平台:ID)，对应单骰多号情况，例如骰A B都加了群Z，A退群不会影响B在群内服务
 	DiceIDExistsMap *SyncMap[string, bool] `json:"diceIdExistsMap" yaml:"-"`            // 对应的骰子ID(格式 平台:ID)是否存在于群内
-	BotList         *SyncMap[string, bool] `json:"botList"         yaml:"botList,flow"` // 其他骰子列表
-	DiceSideNum     int64                  `json:"diceSideNum"     yaml:"diceSideNum"`  // 以后可能会支持 1d4 这种默认面数，暂不开放给js
-	DiceSideExpr    string                 `json:"diceSideExpr"    yaml:"diceSideExpr"` //
-	System          string                 `json:"system"          yaml:"system"`       // 规则系统，概念同bcdice的gamesystem，距离如dnd5e coc7
+	// DiceIDDepartedMap 记录“明确收到退群/被踢事件”的骰子 ID。
+	// ExistsMap 缺失本身无法区分“已退群”和“刚启用还没发言”，不能据此删激活态；
+	// 只有这里明确标记过的 ID 才允许在 .bot off 时被清理。
+	DiceIDDepartedMap *SyncMap[string, bool] `json:"diceIdDepartedMap" yaml:"-"`
+	BotList           *SyncMap[string, bool] `json:"botList"         yaml:"botList,flow"` // 其他骰子列表
+	DiceSideNum       int64                  `json:"diceSideNum"     yaml:"diceSideNum"`  // 以后可能会支持 1d4 这种默认面数，暂不开放给js
+	DiceSideExpr      string                 `json:"diceSideExpr"    yaml:"diceSideExpr"` //
+	System            string                 `json:"system"          yaml:"system"`       // 规则系统，概念同bcdice的gamesystem，距离如dnd5e coc7
 
-	HelpPackages []string      `json:"helpPackages"   yaml:"-"`
-	CocRuleIndex int           `jsbind:"cocRuleIndex" json:"cocRuleIndex" yaml:"cocRuleIndex"`
-	logStateMu   *sync.RWMutex `json:"-" yaml:"-"`
-	LogCurID     uint64        `json:"-" yaml:"-"`
-	LogCurName   string        `jsbind:"logCurName"   json:"logCurName"   yaml:"logCurFile"`
-	LogOn        bool          `jsbind:"logOn"        json:"logOn"        yaml:"logOn"`
+	HelpPackages []string `json:"helpPackages"   yaml:"-"`
+	CocRuleIndex int      `jsbind:"cocRuleIndex" json:"cocRuleIndex" yaml:"cocRuleIndex"`
+	// logStateMu 保护 LogCurID/LogCurName/LogOn/LogPausedByBotOff/LogResumeSkipGap。
+	// 必须是值类型：GroupInfo 由数据库反序列化/运行时新建得到，指针版懒初始化在
+	// “两个消息协程同时首次访问”时会各建一把锁，等于没有锁（-race 可直接复现）。
+	logStateMu sync.RWMutex `json:"-" yaml:"-"`
+	// logWriteMu 串行化“补录写入”和“日志状态切换”。补录写入持读锁，
+	// .log on/new/off/end/halt、.bot off/on 持写锁。不能复用 logStateMu：
+	// LogAppend 自愈会调用 SetLogState（写 logStateMu），同一 goroutine 已持
+	// logStateMu.RLock 时会等不到写锁而死锁。
+	logWriteMu sync.RWMutex `json:"-" yaml:"-"`
+	// LogCurID 是当前日志在 log_items 表里的主键。
+	// 必须持久化：重启后 config.go 要用它把 seq 基线校准到数据库 MAX(seq)，
+	// 否则基线停留在 .log on 那一刻，重启后首条消息会把已记录的整段历史误判成断层。
+	// 旧数据没有该字段时为 0，ensureGroupLogState 会按 LogCurName 重新补全。
+	LogCurID   uint64 `json:"logCurId,omitempty" yaml:"logCurId,omitempty"`
+	LogCurName string `jsbind:"logCurName"   json:"logCurName"   yaml:"logCurFile"`
+	LogOn      bool   `jsbind:"logOn"        json:"logOn"        yaml:"logOn"`
+	// LogPausedByBotOff 表示当前这次“日志关闭”是 .bot off 自动暂停造成的
+	// （只暂停、不 end、不上传），.bot on 时自动恢复。
+	LogPausedByBotOff bool `json:"logPausedByBotOff,omitempty" yaml:"logPausedByBotOff,omitempty"`
+	// LogPausedAtSeq 是 .bot off 自动暂停时最后已见的 seq。
+	// 持久化它才能在进程重启后判断“pending 是否完全位于暂停之前”，
+	// 从而继续补录 off 前窗口，而不是把整段 pending 当成关闭段清掉。
+	LogPausedAtSeq int64 `json:"logPausedAtSeq,omitempty" yaml:"logPausedAtSeq,omitempty"`
+	// LogResumeSkipGap 表示恢复后的第一条消息只重建基线、不计算缺口，
+	// 保证 .bot off 期间的消息既不被记录，也不会在恢复后被当成断层补录。
+	LogResumeSkipGap bool `json:"logResumeSkipGap,omitempty" yaml:"logResumeSkipGap,omitempty"`
 
 	QuitMarkAutoClean   bool   `json:"-"                     yaml:"-"` // 自动清群 - 播报，即将自动退出群组
 	QuitMarkMaster      bool   `json:"-"                     yaml:"-"` // 骰主命令退群 - 播报，即将自动退出群组
@@ -156,7 +204,148 @@ type GroupInfo struct {
 	logLastSeq   int64       `json:"-" yaml:"-"` // 上条已记录消息的seq，0=未初始化
 	logLastMsgID interface{} `json:"-" yaml:"-"` // 上条已记录消息的RawID，用于断层通知的引用回复
 	logSelfSent  int64       `json:"-" yaml:"-"` // 自 logLastSeq 以来骰子自身的群内发言数
-	logGapFillMu sync.Mutex  `json:"-" yaml:"-"` // 补全防重入
+	// 补全任务队列：同一群同时只跑一个 worker，新断层并入待处理区间。
+	// 不能用“每个断层一个 goroutine + 阻塞锁”排队：网络反复抖动时会积压任务，
+	// 越靠后的任务越晚执行，可能重放几分钟前的指令。
+	logGapQueueMu       sync.Mutex      `json:"-" yaml:"-"`
+	logGapPending       *logGapFillTask `json:"-" yaml:"-"`
+	logGapRunningTask   *logGapFillTask `json:"-" yaml:"-"`
+	logGapWorkerRunning bool            `json:"-" yaml:"-"`
+	// worker 取消句柄：.log halt/.log end 时中断在途拉取，避免闸门一直
+	// 把用户挡在“先 .log halt”之后。
+	logGapWorkerCtx    context.Context    `json:"-" yaml:"-"`
+	logGapWorkerCancel context.CancelFunc `json:"-" yaml:"-"`
+	// logGapRunningOffDiscovery 表示 worker 当前执行的正是 off 状态历史发现任务。
+	// 用于让 .log off / .log on 及时感知“离线补录还在跑”，避免实时命令和
+	// 异步任务互相覆盖状态。
+	logGapRunningOffDiscovery atomic.Bool `json:"-" yaml:"-"`
+	// logGapFilling 标记当前是否正在执行小断层的静默重放。
+	// OnMessageReceived 用它给补录条目打 is_gap_fill 标记；正常实时消息不受影响。
+	logGapFilling atomic.Bool `json:"-" yaml:"-"`
+	// logGapFillFrom/To 是当前静默重放的 seq 区间（开区间）。
+	// 重放的消息会重走 OnMessageReceived，必须按 seq 是否落在区间内打标记；
+	// 只看布尔标记会把重放期间实时到达的正常消息也标成补录。
+	logGapFillFrom atomic.Int64 `json:"-" yaml:"-"` // 静默重放区间起点（不含）
+	logGapFillTo   atomic.Int64 `json:"-" yaml:"-"` // 静默重放区间终点（不含）
+	// logGapRetryAt 是补全拉取失败后的退避截止时间(unix)。
+	// 拉取失败时 pending 区间会保留以便重试；若没有退避，每条新消息都会重新
+	// 发起一次最长 60s 的历史拉取，平台持续异常时会形成重试风暴。
+	logGapRetryAt atomic.Int64 `json:"-" yaml:"-"`
+	// logGapFailureNoticeAt 是补全失败群内提示的最近发送时间(unix)。
+	// 失败路径只写日志会让用户以为已经补完；这里限频提示，避免每 2 分钟刷屏。
+	logGapFailureNoticeAt atomic.Int64 `json:"-" yaml:"-"`
+	// logGapWriteFailed 标记本次补录期间是否发生过日志写入失败。
+	// 任务开始时由 beginLogGapWriteTracking 重置；LogAppend 失败时置位。
+	// 补录结束时据此决定是否保留 pending 并退避，避免“没写进去”被当成
+	// “补全完成”而永久丢掉这段缺口。
+	logGapWriteFailed atomic.Bool `json:"-" yaml:"-"`
+	// logGapNotifyOnComplete 表示 .bot on/off 已经向用户承诺“补录完成后
+	// 会再通知日志状态”。即使补录结果为 0 条，任务收尾时也必须发一条通知，
+	// 否则会出现“承诺了不通知”的自相矛盾。运行时字段。
+	logGapNotifyOnComplete atomic.Bool `json:"-" yaml:"-"`
+	// logOffReconcileAt 是 off 状态日志主动对账的最近尝试时间(unix)。
+	// 启动/重连会对 off 日志扫一遍历史，找离线期间的 .log on；限频避免
+	// 端点反复重连时对大量 off 群重复请求。
+	logOffReconcileAt atomic.Int64 `json:"-" yaml:"-"`
+	// logSeqCalibrated 表示本进程内是否已用数据库 MAX(seq) 校准过 seq 基线。
+	logSeqCalibrated bool `json:"-" yaml:"-"`
+	// logSeqCalibrationRetryAt 是校准失败后的下次重试时间(unix)。
+	// 数据库持续异常时不能每条消息都查一次库。
+	logSeqCalibrationRetryAt int64 `json:"-" yaml:"-"`
+
+	// logEpoch 在每次重建 seq 基线（.log on/new、.bot on 恢复、日志重建）时 +1。
+	// 补全任务携带 epoch：epoch 变了就取消在途任务、替换 pending，
+	// 避免把 off/静默期间的消息合并进旧任务补进日志。
+	logEpoch atomic.Uint64 `json:"-" yaml:"-"`
+
+	// logOffRequestedSeq 记录用户在 live 日志已关闭时再次发送 .log off 的 seq。
+	// 此时 logOffForUserAtSeq 不会改变任何日志字段，但必须在途的 off 状态
+	// 历史发现任务知道“用户明确要求保持关闭”，不能在任务结束时把日志重新
+	// 打开。运行时字段；.log on/.bot on/end/halt 时清除。
+	logOffRequestedSeq atomic.Int64 `json:"-" yaml:"-"`
+
+	// logAutoResumedAt 记录 off 发现任务最近一次自动恢复日志的时间(unix)。
+	// 实时 .log on 与异步任务竞态时，若任务先恢复，命令处理器看到日志
+	// 已经开启：30 秒内消费此标记，回复“已恢复”而不是“已有记录”误报。
+	logAutoResumedAt atomic.Int64 `json:"-" yaml:"-"`
+
+	// logOffGapAuth 在 .log off/.bot off 真正关闭日志时，授权“off 前窗口”
+	// 的补全任务继续完成；只在任务窗口完全位于 offSeq 之前时生效。
+	// 运行时字段，不参与序列化。
+	logOffGapAuth atomic.Pointer[logOffGapAuth] `json:"-" yaml:"-"`
+
+	// logSeqRegressCount 连续“明显回退”的 seq 计数，用于平台 seq 重置自愈。
+	// 由 logSeqMu 保护；连续 3 次且回退超过阈值才重建基线，避免误伤乱序消息。
+	logSeqRegressCount int
+
+	// LogSeqBaseline 是日志开启/恢复时的持久seq基线。
+	// logLastSeq 只在内存中，重启后会归零；若没有这个字段，启动时会回退到
+	// 数据库 MAX(seq)（停在 log off 之前），把暂停期间的聊天重新补进日志。
+	LogSeqBaseline int64 `json:"logSeqBaseline,omitempty" yaml:"logSeqBaseline,omitempty"`
+	// LogSeqBaselineMsgID 与 LogSeqBaseline 配套，用于断层通知的引用回复。
+	LogSeqBaselineMsgID string `json:"logSeqBaselineMsgID,omitempty" yaml:"logSeqBaselineMsgID,omitempty"`
+	// LogGapPendingFrom/To 持久化“尚未完成的补全区间”（seq 开区间）。
+	// 进程在补全完成前重启时，启动校准会把基线推到触发消息的 DB MAX；
+	// 用这段区间在下次收到消息时把内存基线压回起点，重新触发补全。
+	LogGapPendingFrom int64 `json:"logGapPendingFrom,omitempty" yaml:"logGapPendingFrom,omitempty"`
+	LogGapPendingTo   int64 `json:"logGapPendingTo,omitempty"   yaml:"logGapPendingTo,omitempty"`
+	// LogGapPendingOffDiscovery 表示上面的 pending 区间来自“off 状态历史发现”，
+	// 起点状态是 off，不能按 on 状态做 pending floor。进程重启后仍保留，
+	// 下一条消息会据此重建 log-only 历史补录任务。
+	LogGapPendingOffDiscovery bool `json:"logGapPendingOffDiscovery,omitempty" yaml:"logGapPendingOffDiscovery,omitempty"`
+	// LogSeenSeq 是“live 日志关闭期间核心最后看到的群消息 seq”。
+	// 用于 off 状态断层检测：核心离线后第一条消息的 seq 会跳过这段时间，
+	// 从 LogSeenSeq 开始拉历史，以 off 为起点扫描 .log on/.log off。
+	// 进程重启后仍能知道离线前看到了哪里；0 表示尚未建立。
+	LogSeenSeq int64 `json:"logSeenSeq,omitempty" yaml:"logSeenSeq,omitempty"`
+}
+
+// groupLogPhase 是从 LogOn/LogCurName/LogPausedByBotOff 推导出的日志生命周期阶段。
+// 1120: 这些字段是同一状态机的不同投影，不能再让各调用点各自解释。
+// 新增代码应优先用 logPhase() 判断，而不是直接拼 LogOn/PausedByBotOff。
+type groupLogPhase uint8
+
+const (
+	groupLogPhaseOff groupLogPhase = iota
+	groupLogPhaseRecording
+	groupLogPhasePausedByBotOff
+)
+
+// logPhase 返回当前日志生命周期阶段。只读取状态字段，不改变状态。
+func (g *GroupInfo) logPhase() groupLogPhase {
+	if g == nil {
+		return groupLogPhaseOff
+	}
+	g.logStateMu.RLock()
+	defer g.logStateMu.RUnlock()
+	switch {
+	case g.LogOn && g.LogCurName != "":
+		return groupLogPhaseRecording
+	case !g.LogOn && g.LogPausedByBotOff && g.LogCurName != "":
+		return groupLogPhasePausedByBotOff
+	default:
+		return groupLogPhaseOff
+	}
+}
+
+// logPhaseValid 检查 LogOn/LogCurName/LogPausedByBotOff 是否处于合法组合。
+// 只用于测试/诊断；生产路径不应因状态不合法而中断用户操作。
+func (g *GroupInfo) logPhaseValid() bool {
+	if g == nil {
+		return false
+	}
+	g.logStateMu.RLock()
+	defer g.logStateMu.RUnlock()
+	if g.LogOn && g.LogCurName == "" {
+		return false
+	}
+	if g.LogPausedByBotOff && g.LogOn {
+		return false
+	}
+	if g.LogPausedByBotOff && g.LogCurName == "" {
+		return false
+	}
+	return true
 }
 
 // noteLogSelfSent 记录一条骰子自身的群内发言。
@@ -180,6 +369,707 @@ func (g *GroupInfo) updateLogSeq(seq int64, rawID interface{}) (lastSeq int64, l
 		g.logSelfSent = 0
 	}
 	return lastSeq, lastMsgID, selfSent
+}
+
+// advanceLogSeq 在加载群数据时用 DB MAX(seq) 校准持久基线，避免重启后
+// 把已记录的消息再次算进断层（会放大 gap，导致本应静默重放的指令变成通知）。
+func (g *GroupInfo) advanceLogSeq(seq int64, rawID interface{}) {
+	if seq <= 0 {
+		return
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	if seq > g.logLastSeq {
+		g.logLastSeq = seq
+		g.logLastMsgID = rawID
+		g.logSelfSent = 0
+	}
+}
+
+// logSeenSeqSnapshot 读取 live 日志关闭期间最后看到的群消息 seq。
+func (g *GroupInfo) logSeenSeqSnapshot() int64 {
+	if g == nil {
+		return 0
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	return g.LogSeenSeq
+}
+
+// setLogSeenSeq 只在前进时更新已见 seq；调用方负责 MarkDirty。
+func (g *GroupInfo) setLogSeenSeq(seq int64) bool {
+	if g == nil || seq <= 0 {
+		return false
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	if seq <= g.LogSeenSeq {
+		return false
+	}
+	g.LogSeenSeq = seq
+	return true
+}
+
+// advanceLogSeenSeq 更新已见 seq 并持久化脏标记。
+func (g *GroupInfo) advanceLogSeenSeq(d *Dice, seq int64) {
+	if g == nil || seq <= 0 {
+		return
+	}
+	if g.setLogSeenSeq(seq) && d != nil {
+		g.MarkDirty(d)
+	}
+}
+
+// clearLogSeenSeq 清除已见 seq。日志重新开启/切换/结束时不再需要。
+func (g *GroupInfo) clearLogSeenSeq() {
+	if g == nil {
+		return
+	}
+	g.logSeqMu.Lock()
+	g.LogSeenSeq = 0
+	g.logSeqMu.Unlock()
+}
+
+// logLastSeqSnapshot 读取内存中的上条已记录/已处理 seq。
+func (g *GroupInfo) logLastSeqSnapshot() int64 {
+	if g == nil {
+		return 0
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	return g.logLastSeq
+}
+
+// setLogGapPendingRange 记录尚未完成的补全区间（seq 开区间）。
+// 多次 merge 时保留更早的起点和更晚的终点。
+func (g *GroupInfo) setLogGapPendingRange(fromSeq, toSeq int64) {
+	g.setLogGapPendingRangeMode(fromSeq, toSeq, false)
+}
+
+// setLogGapPendingRangeMode 记录 pending 区间，并标记它是否来自 off 状态
+// 历史发现。off 起点任务不能在 on 状态做 pending floor，否则会被当成
+// “从 on 开始的缺口”，把 off 段补进日志。
+func (g *GroupInfo) setLogGapPendingRangeMode(fromSeq, toSeq int64, offDiscovery bool) {
+	if g == nil || fromSeq <= 0 || toSeq <= fromSeq {
+		return
+	}
+	g.logSeqMu.Lock()
+	if g.LogGapPendingFrom == 0 || fromSeq < g.LogGapPendingFrom {
+		g.LogGapPendingFrom = fromSeq
+	}
+	if toSeq > g.LogGapPendingTo {
+		g.LogGapPendingTo = toSeq
+	}
+	// 1118: 这里必须双向赋值。原先只在 offDiscovery=true 时置位，
+	// 正常的 setLogGapPendingRange(false) 无法清掉旧的 off 标记，
+	// 会让 pending floor / off 发现重建按错误状态处理。
+	g.LogGapPendingOffDiscovery = offDiscovery
+	g.logSeqMu.Unlock()
+}
+
+// mergeLogGapPendingRangeMode 只扩大 pending 区间，不缩短；用于失败重试
+// 和运行中任务合并。offDiscovery 只置位不清除，避免把混合窗口误当成纯
+// on 窗口做 pending floor。
+func (g *GroupInfo) mergeLogGapPendingRangeMode(fromSeq, toSeq int64, offDiscovery bool) {
+	if g == nil || fromSeq <= 0 || toSeq <= fromSeq {
+		return
+	}
+	g.logSeqMu.Lock()
+	if g.LogGapPendingFrom == 0 || fromSeq < g.LogGapPendingFrom {
+		g.LogGapPendingFrom = fromSeq
+	}
+	if toSeq > g.LogGapPendingTo {
+		g.LogGapPendingTo = toSeq
+	}
+	if offDiscovery {
+		g.LogGapPendingOffDiscovery = true
+	}
+	g.logSeqMu.Unlock()
+}
+
+// replaceLogGapPendingRange 在任务被替换（日志/epoch/模式变化）时重置
+// pending 区间，避免旧模式的区间和新任务混在一起。
+func (g *GroupInfo) replaceLogGapPendingRange(fromSeq, toSeq int64, offDiscovery bool) {
+	if g == nil {
+		return
+	}
+	g.logSeqMu.Lock()
+	g.LogGapPendingFrom, g.LogGapPendingTo = 0, 0
+	g.LogGapPendingOffDiscovery = offDiscovery
+	if fromSeq > 0 && toSeq > fromSeq {
+		g.LogGapPendingFrom, g.LogGapPendingTo = fromSeq, toSeq
+	}
+	g.logSeqMu.Unlock()
+}
+
+// pendingLogGapRangeSnapshot 读取 pending 区间及它是否来自 off 发现。
+func (g *GroupInfo) pendingLogGapRangeSnapshot() (fromSeq, toSeq int64, offDiscovery bool) {
+	if g == nil {
+		return 0, 0, false
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	return g.LogGapPendingFrom, g.LogGapPendingTo, g.LogGapPendingOffDiscovery
+}
+
+// hasOffDiscoveryContext 报告当前是否有 off 状态历史发现任务在排队/运行，
+// 或留有可重试的 off 发现 pending 区间。用于 .log on/.log off 与异步任务
+// 的交接，避免实时命令覆盖离线补录、或任务把用户明确关闭的日志重新打开。
+func (g *GroupInfo) hasOffDiscoveryContext() bool {
+	if g == nil {
+		return false
+	}
+	g.logGapQueueMu.Lock()
+	pending := g.logGapPending != nil && g.logGapPending.discoverFromOff
+	active := g.logGapRunningOffDiscovery.Load()
+	g.logGapQueueMu.Unlock()
+	if pending || active {
+		return true
+	}
+	fromSeq, toSeq, offDiscovery := g.pendingLogGapRangeSnapshot()
+	return offDiscovery && fromSeq > 0 && toSeq > fromSeq
+}
+
+// hasAnyLogGapTask 报告当前是否有排队或运行中的补全任务。
+func (g *GroupInfo) hasAnyLogGapTask() bool {
+	if g == nil {
+		return false
+	}
+	g.logGapQueueMu.Lock()
+	defer g.logGapQueueMu.Unlock()
+	return g.logGapWorkerRunning || g.logGapPending != nil || g.logGapRunningTask != nil
+}
+
+// requestLogGapNotifyOnComplete 记录“已经向用户承诺补录完成后通知”。
+// 补录任务收尾时即使 0 条可补，也要按这个标记发一条完成提示。
+func (g *GroupInfo) requestLogGapNotifyOnComplete() {
+	if g == nil {
+		return
+	}
+	g.logGapNotifyOnComplete.Store(true)
+}
+
+// logGapNotifyOnCompleteRequested 报告当前是否有未兑现的补录完成通知承诺。
+func (g *GroupInfo) logGapNotifyOnCompleteRequested() bool {
+	if g == nil {
+		return false
+	}
+	return g.logGapNotifyOnComplete.Load()
+}
+
+// clearLogGapNotifyOnComplete 在完成提示已经发出、或用户重置日志后清除承诺。
+func (g *GroupInfo) clearLogGapNotifyOnComplete() {
+	if g == nil {
+		return
+	}
+	g.logGapNotifyOnComplete.Store(false)
+}
+
+// authorizedPreOffGapRange 返回“off 前窗口”授权对应的任务区间。
+// 1118: .log off 之后如果又来了 off 状态消息，不能立刻用 off 发现任务把
+// 这个已授权的 on 任务替换掉；先等它补完 off 前窗口，再由后续消息重建
+// off 发现任务（LogSeenSeq 保持不动，窗口不会丢）。
+//
+// 任务字段必须在 logGapQueueMu 内拷贝后再读：mergeLogGapTask 会在同一把锁
+// 内改写 pending/running 的窗口，锁外读字段是数据竞争，也可能误判“没有
+// 已授权任务”，从而让 off 发现任务覆盖掉 off 前窗口。
+func (g *GroupInfo) authorizedPreOffGapRange() (fromSeq, toSeq int64, ok bool) {
+	if g == nil {
+		return 0, 0, false
+	}
+	auth := g.logOffGapAuthSnapshot()
+	if auth == nil {
+		// 进程重启后内存授权丢失，但“暂停位置 + 持久化 pending”仍能证明
+		// 这段 pending 完全位于 .bot off 之前：继续把它当作 off 前窗口补完，
+		// 避免重启后 .bot on 直接清掉本应补录的记录。
+		g.logStateMu.RLock()
+		paused := g.LogPausedByBotOff
+		pausedAtSeq := g.LogPausedAtSeq
+		logName := g.LogCurName
+		g.logStateMu.RUnlock()
+		if !paused || pausedAtSeq <= 0 || logName == "" {
+			return 0, 0, false
+		}
+		fromSeq, toSeq, offDiscovery := g.pendingLogGapRangeSnapshot()
+		if offDiscovery || fromSeq <= 0 || toSeq <= fromSeq || toSeq > pausedAtSeq {
+			return 0, 0, false
+		}
+		return fromSeq, toSeq, true
+	}
+	g.logGapQueueMu.Lock()
+	tasks := make([]logGapFillTask, 0, 2)
+	if g.logGapPending != nil {
+		tasks = append(tasks, *g.logGapPending)
+	}
+	if g.logGapRunningTask != nil {
+		tasks = append(tasks, *g.logGapRunningTask)
+	}
+	g.logGapQueueMu.Unlock()
+
+	for _, task := range tasks {
+		if task.discoverFromOff || task.toSeq <= 0 {
+			continue
+		}
+		if auth.logID == task.logID && auth.logName == task.logName &&
+			auth.epoch == task.epoch && task.toSeq <= auth.offSeq {
+			return task.fromSeq, task.toSeq, true
+		}
+	}
+	return 0, 0, false
+}
+
+// hasAuthorizedPreOffGapTask 报告是否存在“off 前窗口”授权的在途/排队任务。
+func (g *GroupInfo) hasAuthorizedPreOffGapTask() bool {
+	_, _, ok := g.authorizedPreOffGapRange()
+	return ok
+}
+
+// logOffRequestedSeqSnapshot 读取用户明确关闭日志的 seq；0 表示没有。
+func (g *GroupInfo) logOffRequestedSeqSnapshot() int64 {
+	if g == nil {
+		return 0
+	}
+	return g.logOffRequestedSeq.Load()
+}
+
+// markLogSeqUncalibrated 让下一次补录重新用 DB MAX(seq) 校准基线。
+// 身份迁移换了日志 ID 时必须调用；否则会拿旧日志的 seq 基线去算新日志缺口。
+func (g *GroupInfo) markLogSeqUncalibrated() {
+	if g == nil {
+		return
+	}
+	g.logSeqMu.Lock()
+	g.logSeqCalibrated = false
+	g.logSeqCalibrationRetryAt = 0
+	g.logSeqMu.Unlock()
+}
+
+// markLogOffRequested 记录用户明确要求关闭日志。即使 live 日志已经是
+// 关闭状态（logOffForUserAtSeq 不会改字段），在途的 off 发现任务也必须
+// 在 adopt 前看到这个标记，不能把日志重新打开。
+func (g *GroupInfo) markLogOffRequested(seq int64) {
+	if g == nil {
+		return
+	}
+	if seq <= 0 {
+		seq = 1
+	}
+	if seq > g.logOffRequestedSeq.Load() {
+		g.logOffRequestedSeq.Store(seq)
+	}
+}
+
+// logOffRequested 报告用户是否明确要求过关闭日志。
+func (g *GroupInfo) logOffRequested() bool {
+	if g == nil {
+		return false
+	}
+	return g.logOffRequestedSeq.Load() > 0
+}
+
+// clearLogOffRequested 在 .log on/.bot on/end/halt 后清除关闭请求标记。
+func (g *GroupInfo) clearLogOffRequested() {
+	if g == nil {
+		return
+	}
+	g.logOffRequestedSeq.Store(0)
+}
+
+// armLogOffGapAuth 在 .log off/.bot off 关闭日志前，为“窗口完全位于指令
+// seq 之前”的在途补全任务建立运行时授权。要求任务确实存在，避免给没有任务的
+// 陈旧 pending 授权。
+//
+// 不要求 pending.To == offSeq：off 指令本身可能没有缺口（gap=0），但更早
+// 触发的任务仍在拉取/写入，它的窗口同样属于 off 前、应被补完。只要
+// pending.To <= offSeq，任务窗口就不可能包含 off 指令或之后的消息。
+//
+// 锁序：logGapQueueMu -> logSeqMu，与 mergeLogGapTask/clearLogGapPendingIfIdle
+// 保持一致；不要反过来。
+func (g *GroupInfo) armLogOffGapAuth(logID uint64, logName string, epoch uint64, offSeq int64) bool {
+	if g == nil || logID == 0 || logName == "" || offSeq <= 0 {
+		return false
+	}
+	g.logGapQueueMu.Lock()
+	active := g.logGapWorkerRunning || g.logGapPending != nil
+	g.logSeqMu.Lock()
+	fromSeq, toSeq := g.LogGapPendingFrom, g.LogGapPendingTo
+	g.logSeqMu.Unlock()
+	g.logGapQueueMu.Unlock()
+	if !active || fromSeq <= 0 || toSeq <= fromSeq || toSeq > offSeq {
+		return false
+	}
+	g.logOffGapAuth.Store(&logOffGapAuth{
+		logID:   logID,
+		logName: logName,
+		epoch:   epoch,
+		offSeq:  offSeq,
+	})
+	return true
+}
+
+// clearLogOffGapAuth 清除 off 前窗口的补全授权。
+func (g *GroupInfo) clearLogOffGapAuth() {
+	if g == nil {
+		return
+	}
+	g.logOffGapAuth.Store(nil)
+}
+
+// logOffGapAuthSnapshot 读取当前 off 授权；nil 表示没有授权。
+func (g *GroupInfo) logOffGapAuthSnapshot() *logOffGapAuth {
+	if g == nil {
+		return nil
+	}
+	return g.logOffGapAuth.Load()
+}
+
+// clearLogGapPendingRange 清除尚未完成的补全区间；返回是否发生变化。
+func (g *GroupInfo) clearLogGapPendingRange() bool {
+	if g == nil {
+		return false
+	}
+	g.logSeqMu.Lock()
+	changed := g.LogGapPendingFrom != 0 || g.LogGapPendingTo != 0 || g.LogGapPendingOffDiscovery
+	g.LogGapPendingFrom, g.LogGapPendingTo = 0, 0
+	g.LogGapPendingOffDiscovery = false
+	g.logGapRetryAt.Store(0)
+	g.logSeqMu.Unlock()
+	if changed {
+		g.clearLogOffGapAuth()
+	}
+	return changed
+}
+
+// hasPendingLogGapTask 报告队列里是否已有合并进来的后续任务。
+// off 状态历史发现任务据此决定：先让 worker 继续处理更大窗口，暂不推进
+// LogSeenSeq/恢复 live，避免后续缺口被 live 恢复后的 epoch 变化吞掉。
+func (g *GroupInfo) hasPendingLogGapTask() bool {
+	if g == nil {
+		return false
+	}
+	g.logGapQueueMu.Lock()
+	defer g.logGapQueueMu.Unlock()
+	return g.logGapPending != nil
+}
+
+// clearLogGapPendingIfIdle 在一个任务结束时清除持久化的补全区间。
+// 调用方是 worker 里的 run()，此时 logGapWorkerRunning 必为 true，不能拿它
+// 判断“空闲”；只要没有新合并进来的 pending 任务，就清除已完成/已取消的区间。
+// 先持 logGapQueueMu 再清区间，避免和 mergeLogGapTask 的新区间交错。
+func (g *GroupInfo) clearLogGapPendingIfIdle(d *Dice) {
+	if g == nil {
+		return
+	}
+	g.logGapQueueMu.Lock()
+	if g.logGapPending != nil {
+		g.logGapQueueMu.Unlock()
+		return
+	}
+	changed := g.clearLogGapPendingRange()
+	// 没有新 pending 了，off 前窗口授权也不再需要。
+	g.clearLogOffGapAuth()
+	g.logGapQueueMu.Unlock()
+	if changed && d != nil {
+		g.MarkDirty(d)
+	}
+}
+
+// cancelLogGapFill 清除未完成的补全区间并推进 epoch，取消在途/排队的补全任务。
+// 用于 .bot off / .bot on 的边界：暂停与恢复之间的消息不属于要补的断层，
+// 不能在恢复后靠 pending 区间重新补录。
+// 调用方不得持有 logStateMu：本函数会取 logSeqMu，而 MarshalJSON 的加锁顺序
+// 是 logSeqMu -> logStateMu，反过来会死锁。
+func (g *GroupInfo) cancelLogGapFill() {
+	if g == nil {
+		return
+	}
+	g.clearLogGapPendingRange()
+	g.clearLogOffGapAuth()
+	g.clearLogSeenSeq()
+	g.clearLogGapNotifyOnComplete()
+	g.logEpoch.Add(1)
+}
+
+// clearPendingLogGapTask 清除内存里尚未被 worker 取走的补全任务。
+// 调用方必须确保当前不允许补全，否则任务会被直接丢弃。
+func (g *GroupInfo) clearPendingLogGapTask() {
+	if g == nil {
+		return
+	}
+	g.logGapQueueMu.Lock()
+	g.logGapPending = nil
+	g.logGapQueueMu.Unlock()
+}
+
+// deferLogGapRetry 在补全拉取失败后设置退避，避免每条新消息都重新发起一次
+// 最长 60s 的历史拉取。退避只影响 pending floor，已合并的任务仍会继续执行。
+func (g *GroupInfo) deferLogGapRetry(delay time.Duration) {
+	if g == nil || delay <= 0 {
+		return
+	}
+	g.logGapRetryAt.Store(time.Now().Add(delay).Unix())
+}
+
+// beginLogGapWriteTracking 在补录开始前重置“本次补录写入失败”标记。
+// 补录期间任何 LogAppend 失败（包括 replaySilently 里 ExecuteNew 内部的
+// 日志写入）都会置位，任务结束时据此决定是否保留 pending。
+func (g *GroupInfo) beginLogGapWriteTracking() {
+	if g == nil {
+		return
+	}
+	g.logGapWriteFailed.Store(false)
+}
+
+// markLogGapWriteFailure 记录本次补录期间至少有一次日志写入失败。
+func (g *GroupInfo) markLogGapWriteFailure() {
+	if g == nil {
+		return
+	}
+	g.logGapWriteFailed.Store(true)
+}
+
+// logGapWritesOK 报告本次补录是否全部写入成功；nil group 视为成功。
+func (g *GroupInfo) logGapWritesOK() bool {
+	return g == nil || !g.logGapWriteFailed.Load()
+}
+
+// applyLogGapPendingFloor 在没有排队/在途任务时，把内存基线压回未完成区间的
+// 起点，让下一条消息重新计算这段缺口。只在重启后（worker/pending 均为空）
+// 生效，正常补全过程中不会把已经推进的基线反复拉回。
+func (g *GroupInfo) applyLogGapPendingFloor() {
+	if g == nil {
+		return
+	}
+	// 拉取失败后的退避期内不要反复把基线压回起点，否则每条新消息都会
+	// 重新触发一次完整历史拉取。
+	if time.Now().Unix() < g.logGapRetryAt.Load() {
+		return
+	}
+	g.logGapQueueMu.Lock()
+	defer g.logGapQueueMu.Unlock()
+	if g.logGapWorkerRunning || g.logGapPending != nil {
+		return
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	if g.LogGapPendingFrom <= 0 || g.LogGapPendingTo <= g.LogGapPendingFrom {
+		return
+	}
+	if g.LogGapPendingOffDiscovery {
+		// off 起点窗口不能压回 on 基线：否则后续会按 on 状态重算缺口，
+		// 把 off 段补进日志。off 发现任务由 OnMessageReceived 单独重建。
+		return
+	}
+	if g.LogGapPendingFrom < g.logLastSeq {
+		g.logLastSeq = g.LogGapPendingFrom
+		g.logLastMsgID = nil
+		g.logSelfSent = 0
+	}
+}
+
+const (
+	// logSeqRegressThreshold 是判定“平台 seq 重置”的最小回退幅度。
+	// 取 1000 是为了避免把重连后的少量乱序/补发误判成重置。
+	logSeqRegressThreshold int64 = 1000
+	// logSeqRegressLimit 是连续回退多少条后触发重建基线。
+	logSeqRegressLimit = 3
+)
+
+// noteLogSeqRegression 记录一次 seq 回退，连续多次且幅度明显时返回 true。
+// 普通前进/小幅乱序都会清零计数，避免正常消息把基线误重置。
+func (g *GroupInfo) noteLogSeqRegression(msgSeq, lastSeq int64) bool {
+	if g == nil {
+		return false
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	if msgSeq <= 0 || lastSeq <= 0 || msgSeq >= lastSeq || lastSeq-msgSeq < logSeqRegressThreshold {
+		g.logSeqRegressCount = 0
+		return false
+	}
+	g.logSeqRegressCount++
+	if g.logSeqRegressCount < logSeqRegressLimit {
+		return false
+	}
+	g.logSeqRegressCount = 0
+	return true
+}
+
+// resetLogSeq 在日志开启/恢复时把seq基线重置到当前消息。
+// 日志关闭期间 updateLogSeq 不会被调用，基线停在关闭前；若不重置，
+// 恢复后第一条消息会被误判为断层，补全任务会把 log off 期间的消息也补进日志。
+// 同时写入持久字段：logLastSeq 是运行时字段，进程重启后会归零。
+func (g *GroupInfo) resetLogSeq(seq int64, rawID interface{}) {
+	if seq <= 0 {
+		return
+	}
+	msgID := ""
+	if rawID != nil {
+		msgID = fmt.Sprintf("%v", rawID)
+	}
+	g.logSeqMu.Lock()
+	g.logLastSeq = seq
+	g.logLastMsgID = rawID
+	g.logSelfSent = 0
+	g.LogSeqBaseline = seq
+	g.LogSeqBaselineMsgID = msgID
+	g.LogGapPendingFrom, g.LogGapPendingTo = 0, 0
+	g.LogGapPendingOffDiscovery = false
+	g.logSeqRegressCount = 0
+	g.logGapRetryAt.Store(0)
+	g.logEpoch.Add(1)
+	g.logSeqMu.Unlock()
+	g.clearLogOffGapAuth()
+	g.clearLogSeenSeq()
+	g.clearLogOffRequested()
+	g.logAutoResumedAt.Store(0)
+}
+
+// initLogSeqFromPersisted 在群数据加载完成后恢复持久基线。
+// 旧版本没有该字段时保持 0，OnMessageReceived 会继续回退到 DB MAX(seq)。
+func (g *GroupInfo) initLogSeqFromPersisted() {
+	if g == nil {
+		return
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	if g.LogSeqBaseline <= 0 {
+		return
+	}
+	g.logLastSeq = g.LogSeqBaseline
+	if g.LogSeqBaselineMsgID != "" {
+		g.logLastMsgID = g.LogSeqBaselineMsgID
+	}
+}
+
+// logSeqBaselineSnapshot 读取持久基线，避免与 resetLogSeq 的写入形成数据竞争。
+func (g *GroupInfo) logSeqBaselineSnapshot() (int64, string) {
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	return g.LogSeqBaseline, g.LogSeqBaselineMsgID
+}
+
+// needLogSeqCalibration 报告本进程是否还需要用数据库 MAX(seq) 校准一次基线。
+// logLastSeq 是运行时字段，重启后只来自持久基线——而持久基线记录的是
+// .log on / .log new 那一刻的序号，可能远旧于数据库里实际记录到的最后一条。
+// 不校准的话，重启后首条消息会算出巨大的假缺口：既会去拉早已记录的历史，
+// 又会让真正的离线缺口因为 logLastSeq 被直接推到最新而永久漏补。
+func (g *GroupInfo) needLogSeqCalibration() bool {
+	if g == nil {
+		return false
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	if g.logSeqCalibrated {
+		return false
+	}
+	return g.logSeqCalibrationRetryAt <= time.Now().Unix()
+}
+
+// isLogSeqCalibrated 报告本进程是否已成功校准（或确认无需校准）。
+// 未校准时不能用持久基线直接算缺口：持久基线可能停在很久以前的 .log on，
+// 会把已经落库的历史当成断层重复补录。
+func (g *GroupInfo) isLogSeqCalibrated() bool {
+	if g == nil {
+		return false
+	}
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	return g.logSeqCalibrated
+}
+
+// markLogSeqCalibrated 记录本进程已完成校准，避免每条消息都查数据库。
+// config.go 加载群信息时已经用 DB MAX(seq) 校准过，也调用这里跳过重复查询。
+func (g *GroupInfo) markLogSeqCalibrated() {
+	if g == nil {
+		return
+	}
+	g.logSeqMu.Lock()
+	g.logSeqCalibrated = true
+	g.logSeqCalibrationRetryAt = 0
+	g.logSeqMu.Unlock()
+}
+
+// deferLogSeqCalibration 记录校准失败后的退避时间，避免 DB 异常时每条消息都查库。
+func (g *GroupInfo) deferLogSeqCalibration(delay time.Duration) {
+	if g == nil {
+		return
+	}
+	if delay <= 0 {
+		delay = time.Minute
+	}
+	g.logSeqMu.Lock()
+	g.logSeqCalibrationRetryAt = time.Now().Add(delay).Unix()
+	g.logSeqMu.Unlock()
+}
+
+// recordLogSeqCalibrationFailure 在读取 DB MAX(seq) 校准失败时，把校准前的
+// 基线记录成占位 pending 区间 (floor, floor+1)。校准失败/退避期间消息仍会
+// 正常写入；等校准恢复或进程重启后，applyLogGapPendingFloor 会把内存基线
+// 压回 floor，重新计算这段真实断层，而不是让新的 DB MAX 把它吞掉。
+//
+// 复用 pending 而不是新增持久字段：pending 已有持久化、floor、清理以及
+// .log on/new、.bot off/on、日志重建时的重置路径。
+func (g *GroupInfo) recordLogSeqCalibrationFailure(d *Dice) {
+	if g == nil {
+		return
+	}
+	g.logSeqMu.Lock()
+	floor := g.logLastSeq
+	if floor <= 0 {
+		floor = g.LogSeqBaseline
+	}
+	g.logSeqMu.Unlock()
+	if floor <= 0 {
+		return
+	}
+	g.setLogGapPendingRange(floor, floor+1)
+	if d != nil {
+		g.MarkDirty(d)
+	}
+}
+
+// resetLogSeqBaseline 清除持久基线。日志 ID 变化/被重建后旧基线不再有效：
+// 新日志的 seq 锚点只能来自新日志自己的 DB MAX(seq)，不能沿用旧日志的序号。
+func (g *GroupInfo) resetLogSeqBaseline() {
+	if g == nil {
+		return
+	}
+	g.logSeqMu.Lock()
+	g.LogSeqBaseline = 0
+	g.LogSeqBaselineMsgID = ""
+	g.LogGapPendingFrom, g.LogGapPendingTo = 0, 0
+	g.LogGapPendingOffDiscovery = false
+	g.logSeqRegressCount = 0
+	g.logGapRetryAt.Store(0)
+	g.logEpoch.Add(1)
+	g.logSeqMu.Unlock()
+	g.clearLogOffGapAuth()
+	g.clearLogSeenSeq()
+	g.clearLogOffRequested()
+	g.logAutoResumedAt.Store(0)
+}
+
+// beginLogGapFillWindow 进入静默重放：窗口内的消息在日志里标记为补录。
+// 返回的函数用于结束窗口，必须 defer 调用。
+func (g *GroupInfo) beginLogGapFillWindow(fromSeq, toSeq int64) func() {
+	g.logGapFillFrom.Store(fromSeq)
+	g.logGapFillTo.Store(toSeq)
+	g.logGapFilling.Store(true)
+	return func() {
+		g.logGapFilling.Store(false)
+		g.logGapFillFrom.Store(0)
+		g.logGapFillTo.Store(0)
+	}
+}
+
+// isLogGapFillSeq 判断一条消息是否属于正在重放的补录区间。
+// 重放期间实时到达的新消息 seq 在窗口之外，不会被误标为补录。
+func (g *GroupInfo) isLogGapFillSeq(seq int64) bool {
+	if g == nil || !g.logGapFilling.Load() || seq <= 0 {
+		return false
+	}
+	return seq > g.logGapFillFrom.Load() && seq < g.logGapFillTo.Load()
 }
 
 // GetActivatedExtList 获取激活的扩展列表，自动处理延迟初始化
@@ -321,9 +1211,37 @@ type extNameRefsJSON struct {
 	} `json:"activatedExtList"`
 }
 
+// IsActiveRaw 返回群组启用标志本身。
+func (g *GroupInfo) IsActiveRaw() bool {
+	if g == nil {
+		return false
+	}
+	g.activeMu.RLock()
+	defer g.activeMu.RUnlock()
+	return g.Active
+}
+
+// IsGroupInfoJS 仅供 JS 绑定层识别 GroupInfo 对象。
+// Active 字段不再直接暴露给 goja，getter/setter 通过 IsActiveRaw/SetActiveRaw 加锁。
+func (g *GroupInfo) IsGroupInfoJS() bool {
+	return g != nil
+}
+
+// SetActiveRaw 更新群组启用标志。Active 会被消息处理与保存/通知协程并发访问。
+func (g *GroupInfo) SetActiveRaw(active bool) {
+	if g == nil {
+		return
+	}
+	g.activeMu.Lock()
+	g.Active = active
+	g.activeMu.Unlock()
+}
+
 // MarshalJSON 自定义序列化，处理私有字段 activatedExtList。
 // 已删除 wrapper 的名字同样保留：群开启状态不因插件删除而丢失。
 func (g *GroupInfo) MarshalJSON() ([]byte, error) {
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
 	g.extInitMu.Lock()
 	// 过滤掉已删除的 wrapper
 	var filteredList []*ExtInfo
@@ -334,6 +1252,12 @@ func (g *GroupInfo) MarshalJSON() ([]byte, error) {
 	}
 	g.extInitMu.Unlock()
 
+	g.activeMu.RLock()
+	defer g.activeMu.RUnlock()
+	// 日志状态会被消息协程与保存协程并发修改；不在锁内序列化会写出
+	// “新 logCurId + 旧 logCurName”这种撕裂状态（重启后触发误自愈/改名）。
+	g.logStateMu.RLock()
+	defer g.logStateMu.RUnlock()
 	return json.Marshal(&groupInfoJSON{
 		groupInfoAlias:   (*groupInfoAlias)(g),
 		ActivatedExtList: filteredList,
@@ -342,6 +1266,10 @@ func (g *GroupInfo) MarshalJSON() ([]byte, error) {
 
 // UnmarshalJSON 自定义反序列化，处理私有字段 activatedExtList
 func (g *GroupInfo) UnmarshalJSON(data []byte) error {
+	g.logSeqMu.Lock()
+	defer g.logSeqMu.Unlock()
+	g.activeMu.Lock()
+	defer g.activeMu.Unlock()
 	if err := sonic.Unmarshal(data, &groupInfoDecodeJSON{groupInfoAlias: (*groupInfoAlias)(g)}); err != nil {
 		return err
 	}
@@ -349,6 +1277,10 @@ func (g *GroupInfo) UnmarshalJSON(data []byte) error {
 	if err := sonic.Unmarshal(data, &refs); err != nil {
 		return err
 	}
+	// 旧数据只有 InactivatedExtSet，无法区分“手动关闭”和“未自动启用”；
+	// 保守地把旧集合全部视为手动关闭，避免升级后迁移合并把用户关闭的扩展重新打开。
+	// UserInactivatedExtSet 非 nil（即使是空集合）表示新格式数据，不做回填。
+	g.backfillUserInactivatedExtSet()
 
 	var list []*ExtInfo
 	for _, ref := range refs.ActivatedExtList {
@@ -386,17 +1318,9 @@ type GroupLogState struct {
 	On   bool
 }
 
-func (g *GroupInfo) ensureLogStateMu() *sync.RWMutex {
-	if g.logStateMu == nil {
-		g.logStateMu = &sync.RWMutex{}
-	}
-	return g.logStateMu
-}
-
 func (g *GroupInfo) GetLogState() GroupLogState {
-	mu := g.ensureLogStateMu()
-	mu.RLock()
-	defer mu.RUnlock()
+	g.logStateMu.RLock()
+	defer g.logStateMu.RUnlock()
 	return GroupLogState{
 		ID:   g.LogCurID,
 		Name: g.LogCurName,
@@ -404,36 +1328,137 @@ func (g *GroupInfo) GetLogState() GroupLogState {
 	}
 }
 
+// withLogStateRead 在持有“补录写入/日志切换”读锁时执行 fn；只有日志仍是
+// 同一本且开启才执行。它持的是 logWriteMu，不是 logStateMu：fn 里的
+// LogAppend 可能走 healLogAppendByID，而 heal 会调用 SetLogState
+// （logStateMu.Lock）。若这里持 logStateMu.RLock，同一 goroutine 会死锁。
+// fn 内不得调用需要 logWriteMu 写锁的方法（.log on/new/off/end/halt、.bot off/on）。
+func (g *GroupInfo) withLogStateRead(logID uint64, logName string, fn func()) bool {
+	if g == nil || fn == nil {
+		return false
+	}
+	g.logWriteMu.RLock()
+	defer g.logWriteMu.RUnlock()
+	g.logStateMu.RLock()
+	ok := g.LogOn && g.LogCurID == logID && g.LogCurName == logName
+	g.logStateMu.RUnlock()
+	if !ok {
+		return false
+	}
+	fn()
+	return true
+}
+
+// withLogGapFillWrite 是 withLogStateRead 的补录专用变体：
+// 日志开启时与旧函数一致；日志已由 .log off/.bot off 关闭时，只有任务持有
+// 有效的 off 前窗口授权才允许写入。仍然持 logWriteMu.RLock，保证写完之前
+// .log on/new/off/end/halt、.bot off/on 不能完成切换。
+func (g *GroupInfo) withLogGapFillWrite(t logGapFillTask, fn func()) bool {
+	if g == nil || fn == nil {
+		return false
+	}
+	g.logWriteMu.RLock()
+	defer g.logWriteMu.RUnlock()
+	g.logStateMu.RLock()
+	sameLog := g.LogCurID == t.logID && g.LogCurName == t.logName
+	on := g.LogOn
+	g.logStateMu.RUnlock()
+	if !sameLog {
+		return false
+	}
+	if !on && !t.logOffGapFillAllowed() && !t.logHistoricalDiscoveryAllowed() {
+		return false
+	}
+	fn()
+	return true
+}
+
 func (g *GroupInfo) SetLogState(logID uint64, logName string, logOn bool) {
-	mu := g.ensureLogStateMu()
-	mu.Lock()
+	g.logStateMu.Lock()
 	g.LogCurID = logID
 	g.LogCurName = logName
 	g.LogOn = logOn
-	mu.Unlock()
+	// 1120: 维持生命周期不变量：记录中不可能同时“由 bot off 暂停”；
+	// 没有日志名时也不允许保留暂停/跳过标记。
+	if logOn || logName == "" {
+		g.LogPausedByBotOff = false
+		g.LogPausedAtSeq = 0
+	}
+	if logName == "" {
+		g.LogResumeSkipGap = false
+	}
+	g.logStateMu.Unlock()
+}
+
+// setLogCurNameLocked 只改日志名，供身份迁移在并发修改 GroupInfo 时使用。
+func (g *GroupInfo) setLogCurNameLocked(name string) {
+	g.logStateMu.Lock()
+	g.LogCurName = name
+	g.logStateMu.Unlock()
+}
+
+// setMergedLogState 在身份迁移合并日志状态时使用：
+//   - 持 logWriteMu，避免和在途日志写入/.log 切换并发；
+//   - 成对设置 ID/名称/开关，避免拼出“新群日志名 + 旧群日志 ID”；
+//   - 重置 seq 基线和校准标记，之后用新 log 的 DB MAX(seq) 重新校准。
+func (g *GroupInfo) setMergedLogState(logID uint64, logName string, logOn bool) {
+	if g == nil {
+		return
+	}
+	g.logWriteMu.Lock()
+	g.SetLogState(logID, logName, logOn)
+	g.resetLogSeqBaseline()
+	g.markLogSeqUncalibrated()
+	g.logWriteMu.Unlock()
 }
 
 func (g *GroupInfo) SetLogOn(logOn bool) {
-	mu := g.ensureLogStateMu()
-	mu.Lock()
+	g.logWriteMu.Lock()
+	defer g.logWriteMu.Unlock()
+	g.logStateMu.Lock()
 	g.LogOn = logOn
-	mu.Unlock()
+	g.logStateMu.Unlock()
+}
+
+// MarkDiceDeparted 记录某个骰子已明确退群/被踢。只有这种明确事件，
+// 才允许 .bot off 时把它从激活态里清掉；单凭 ExistsMap 缺失不能。
+func (g *GroupInfo) MarkDiceDeparted(userID string) {
+	if g == nil || userID == "" {
+		return
+	}
+	if g.DiceIDDepartedMap == nil {
+		g.DiceIDDepartedMap = new(SyncMap[string, bool])
+	}
+	g.DiceIDDepartedMap.Store(userID, true)
 }
 
 func (g *GroupInfo) ClearLogState() {
-	mu := g.ensureLogStateMu()
-	mu.Lock()
+	g.logWriteMu.Lock()
+	defer g.logWriteMu.Unlock()
+	g.logStateMu.Lock()
 	g.LogCurID = 0
 	g.LogCurName = ""
 	g.LogOn = false
-	mu.Unlock()
+	// 1120: ClearLogState 必须把日志生命周期标记一并清掉，否则会留下
+	// “没有日志名但仍标记为 bot off 暂停”的非法阶段。
+	g.LogPausedByBotOff = false
+	g.LogPausedAtSeq = 0
+	g.LogResumeSkipGap = false
+	g.logStateMu.Unlock()
+	g.clearLogOffGapAuth()
+	g.clearLogSeenSeq()
+	g.clearLogOffRequested()
+	g.logAutoResumedAt.Store(0)
+	g.clearLogGapPendingRange()
+	g.clearLogGapNotifyOnComplete()
+	g.cancelLogGapWorker()
 }
 
 func (group *GroupInfo) IsActive(ctx *MsgContext) bool {
 	if strings.HasPrefix(group.GroupID, "UI-Group:") {
 		return true
 	}
-	firstCheck := group.Active && group.DiceIDActiveMap.Len() >= 1
+	firstCheck := group.IsActiveRaw() && group.DiceIDActiveMap.Len() >= 1
 	if firstCheck {
 		v, _ := group.DiceIDActiveMap.Load(ctx.EndPoint.UserID)
 		return v
@@ -750,8 +1775,11 @@ type IMSession struct {
 	PendingQuits *SyncMap[string, *PendingQuitInfo] `json:"-" yaml:"-"`
 
 	endPointsSnapshot      atomic.Pointer[[]*EndPointInfo]
+	endpointsMu            sync.RWMutex
 	groupMemberWelcomeMu   sync.Mutex
 	lastGroupMemberWelcome *LastWelcomeInfo
+	// LogGapLastReconcileAt 是最近一次启动/重连日志缺口对账的发起时间(unix)。
+	LogGapLastReconcileAt atomic.Int64 `json:"-" yaml:"-"`
 }
 
 // EndPointDisplaySnapshot 是托盘菜单所需的端点展示值快照。
@@ -767,8 +1795,48 @@ func (s *IMSession) RefreshEndPointsSnapshot() {
 	if s == nil {
 		return
 	}
+	s.endpointsMu.RLock()
 	snapshot := append([]*EndPointInfo(nil), s.EndPoints...)
+	s.endpointsMu.RUnlock()
 	s.endPointsSnapshot.Store(&snapshot)
+}
+
+// EndPointsRawSnapshot 返回端点指针列表的浅拷贝，供并发读取使用。
+// 增删端点必须走 AddEndPoint/RemoveEndPointByID，保证与快照一致。
+func (s *IMSession) EndPointsRawSnapshot() []*EndPointInfo {
+	if s == nil {
+		return nil
+	}
+	s.endpointsMu.RLock()
+	defer s.endpointsMu.RUnlock()
+	return append([]*EndPointInfo(nil), s.EndPoints...)
+}
+
+// AddEndPoint 并发安全地追加端点。
+func (s *IMSession) AddEndPoint(ep *EndPointInfo) {
+	if s == nil || ep == nil {
+		return
+	}
+	s.endpointsMu.Lock()
+	s.EndPoints = append(s.EndPoints, ep)
+	s.endpointsMu.Unlock()
+}
+
+// RemoveEndPointByID 并发安全地按 ID 删除端点，返回被删除的端点。
+func (s *IMSession) RemoveEndPointByID(id string) (*EndPointInfo, bool) {
+	if s == nil {
+		return nil, false
+	}
+	s.endpointsMu.Lock()
+	defer s.endpointsMu.Unlock()
+	for i, ep := range s.EndPoints {
+		if ep != nil && ep.ID == id {
+			removed := ep
+			s.EndPoints = append(s.EndPoints[:i], s.EndPoints[i+1:]...)
+			return removed, true
+		}
+	}
+	return nil, false
 }
 
 // EndPointsSnapshot 返回最近发布列表中各端点展示字段的单次采样。
@@ -897,6 +1965,13 @@ type MsgContext struct {
 
 	IsCompatibilityTest bool // 是否为兼容性测试环境，用于跳过不必要的数据库查询
 
+	// SuppressLogSizeNotice 供日志断层补录使用：批量写入历史消息时既不往群里发
+	// “记录条数提醒”，也跳过逐条的条数统计查询（2000 条补录会因此少 2000 次查库）。
+	SuppressLogSizeNotice bool
+	// SuppressLogAppendFailureNotice 供 off 前窗口补录使用：日志关闭后补写
+	// 历史行时，写入失败只保留 pending/退避，不再往群里发“日志写入失败”提示。
+	SuppressLogAppendFailureNotice bool
+
 	EndPoint        *EndPointInfo `jsbind:"endPoint"` // 对应的Endpoint
 	Session         *IMSession    // 对应的IMSession
 	Dice            *Dice         // 对应的 Dice
@@ -912,6 +1987,9 @@ type MsgContext struct {
 	DelegateText    string      `jsbind:"delegateText"`  // 代骰附加文本
 	AliasPrefixText string      `json:"aliasPrefixText"` // 快捷指令回复前缀文本
 	CommandReplied  bool        `json:"-"`               // 当前命令是否已通过统一回复路径发出消息
+
+	// officialQQNameCardLine 是本条发送中仅用于展示的名片前缀，日志等记录场景需要将其去掉。
+	officialQQNameCardLine string
 
 	commandRepliedMu  sync.RWMutex
 	deckDepth         int                                         // 抽牌递归深度
@@ -1102,11 +2180,11 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 		if !ok && msg.GroupID != "" {
 			// 注意: 此处必须开启，不然下面mctx.player取不到
 			autoOn := true
-			if msg.Platform == "QQ-CH" {
+			if isQQChannelPlatform(msg.Platform) {
 				autoOn = d.Config.QQChannelAutoOn
 			}
 			groupInfo = SetBotOnAtGroup(mctx, msg.GroupID)
-			groupInfo.Active = autoOn
+			groupInfo.SetActiveRaw(autoOn)
 			groupInfo.DiceIDExistsMap.Store(ep.UserID, true)
 			if msg.GroupName != "" {
 				groupInfo.GroupName = msg.GroupName
@@ -1157,6 +2235,10 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 			if _, exists := groupInfo.DiceIDExistsMap.Load(ep.UserID); !exists {
 				groupInfo.DiceIDExistsMap.Store(ep.UserID, true)
 				groupInfo.MarkDirty(d)
+			}
+			// 能收到消息说明它已回到本群，清除此前的退群标记。
+			if groupInfo.DiceIDDepartedMap != nil {
+				groupInfo.DiceIDDepartedMap.Delete(ep.UserID)
 			}
 		}
 
@@ -1236,6 +2318,7 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 		platformPrefix := msg.Platform
 		cmdArgs := CommandParse(msg.Message, cmdLst, d.CommandPrefix, platformPrefix, false)
 		if cmdArgs != nil {
+			cmdArgs.applyMentionedInfo(msg)
 			mctx.CommandID = getNextCommandID()
 
 			var tmpUID string
@@ -1271,7 +2354,7 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 				}
 				if doLog {
 					// 检查QQ频道的独立选项
-					if msg.Platform == "QQ-CH" && (!d.Config.QQChannelLogMessage) {
+					if isQQChannelPlatform(msg.Platform) && (!d.Config.QQChannelLogMessage) {
 						doLog = false
 					}
 				}
@@ -1487,11 +2570,11 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 	if !ok && msg.GroupID != "" {
 		// 注意: 此处必须开启，不然下面mctx.player取不到
 		autoOn := true
-		if msg.Platform == "QQ-CH" {
+		if isQQChannelPlatform(msg.Platform) {
 			autoOn = d.Config.QQChannelAutoOn
 		}
 		groupInfo = SetBotOnAtGroup(mctx, msg.GroupID)
-		groupInfo.Active = autoOn
+		groupInfo.SetActiveRaw(autoOn)
 		groupInfo.DiceIDExistsMap.Store(ep.UserID, true)
 		if msg.GroupName != "" {
 			groupInfo.GroupName = msg.GroupName
@@ -1546,6 +2629,9 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 		if _, exists := groupInfo.DiceIDExistsMap.Load(ep.UserID); !exists {
 			groupInfo.DiceIDExistsMap.Store(ep.UserID, true)
 			groupInfo.MarkDirty(mctx.Dice)
+		}
+		if groupInfo.DiceIDDepartedMap != nil {
+			groupInfo.DiceIDDepartedMap.Delete(ep.UserID)
 		}
 	}
 
@@ -1620,7 +2706,7 @@ func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
 			}
 			if doLog {
 				// 检查QQ频道的独立选项
-				if msg.Platform == "QQ-CH" && (!d.Config.QQChannelLogMessage) {
+				if isQQChannelPlatform(msg.Platform) && (!d.Config.QQChannelLogMessage) {
 					doLog = false
 				}
 			}
@@ -1913,6 +2999,9 @@ func (s *IMSession) OnGroupJoined(ctx *MsgContext, msg *Message) {
 	}
 	time.Sleep(2 * time.Second)
 	groupName := dm.TryGetGroupName(msg.GroupID)
+	// ctx 与随后的通知、扩展钩子共享，不能在致辞协程里修改 Player，
+	// 否则通知路径读取名片时会与之竞争。致辞语义仍使用空玩家。
+	ctx.Player = &GroupPlayerInfo{}
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -1923,7 +3012,6 @@ func (s *IMSession) OnGroupJoined(ctx *MsgContext, msg *Message) {
 		// 稍作等待后发送入群致词
 		time.Sleep(2 * time.Second)
 
-		ctx.Player = &GroupPlayerInfo{}
 		log.Infof("发送入群致辞，群: <%s>(%s)", groupName, msg.GroupID)
 		text := DiceFormatTmpl(ctx, "核心:骰子进群")
 		// forward() 的边界必须先由统一回复规划器解析；提前按 SPLIT
@@ -2161,6 +3249,12 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 				Sender:      SenderBase{UserID: ep.UserID},
 				GroupID:     grp.GroupID,
 			})
+			// 自动退群前确认骰子账号不是群主，避免退群直接解散群聊。
+			if !canAutoQuitGroup(msgCtx, grp.GroupID) {
+				s.Parent.Logger.Infof("自动退群已取消: 当前账号是群主或身份检查未通过，避免解散群聊。group=%s endpoint=%s", grp.GroupID, ep.UserID)
+				cancelled++
+				continue
+			}
 			// 发送退群消息
 			msgText := DiceFormatTmpl(msgCtx, "核心:骰子自动退群告别语")
 			ep.Adapter.SendToGroup(msgCtx, grp.GroupID, msgText, "")
@@ -2168,6 +3262,12 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 			time.Sleep(2 * time.Second)
 			if !isAutoQuitEndpointReady(grp, ep, "QQ", "quit") {
 				s.Parent.Logger.Infof("自动退群已取消: 当前账号状态发生变化，本次不再继续退群。group=%s endpoint=%s", grp.GroupID, ep.UserID)
+				cancelled++
+				continue
+			}
+			// 告别消息发出后身份可能变化，退群前再核对一次。
+			if !canAutoQuitGroup(msgCtx, grp.GroupID) {
+				s.Parent.Logger.Infof("自动退群已取消: 当前账号身份发生变化，避免解散群聊。group=%s endpoint=%s", grp.GroupID, ep.UserID)
 				cancelled++
 				continue
 			}
@@ -2213,7 +3313,7 @@ func FormatBlacklistReasons(v *BanListInfoItem) string {
 	return reasontext
 }
 
-func checkBanBlacklistedUser(ctx *MsgContext, msg *Message, isWhiteGroup bool, banQuitGroup func()) bool {
+func checkBanBlacklistedUser(ctx *MsgContext, msg *Message, isWhiteGroup bool, banQuitGroup func(func(*MsgContext))) bool {
 	d := ctx.Dice
 	log := d.Logger
 	groupLevel := ctx.GroupRoleLevel
@@ -2226,13 +3326,14 @@ func checkBanBlacklistedUser(ctx *MsgContext, msg *Message, isWhiteGroup bool, b
 			if isWhiteGroup {
 				log.Infof("收到群(%s)内邀请者以上权限黑名单用户<%s>(%s)的消息，但在信任群所以不尝试退群", groupID, msg.Sender.Nickname, msg.Sender.UserID)
 			} else {
-				text := fmt.Sprintf("警告: <%s>(%s)是黑名单用户，将对骰主进行通知并退群。", msg.Sender.Nickname, msg.Sender.UserID)
-				ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
+				banQuitGroup(func(ctx *MsgContext) {
+					text := fmt.Sprintf("警告: <%s>(%s)是黑名单用户，将对骰主进行通知并退群。", msg.Sender.Nickname, msg.Sender.UserID)
+					ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
 
-				noticeMsg := fmt.Sprintf("检测到群(%s)内黑名单用户<%s>(%s)，因是管理以上权限，执行通告后自动退群\n%s", groupID, msg.Sender.Nickname, msg.Sender.UserID, reasontext)
-				log.Info(noticeMsg)
-				ctx.Notice(noticeMsg, NoticeTypeBan)
-				banQuitGroup()
+					noticeMsg := fmt.Sprintf("检测到群(%s)内黑名单用户<%s>(%s)，因是管理以上权限，执行通告后自动退群\n%s", groupID, msg.Sender.Nickname, msg.Sender.UserID, reasontext)
+					log.Info(noticeMsg)
+					ctx.Notice(noticeMsg, NoticeTypeBan)
+				})
 			}
 			return true
 		}
@@ -2263,7 +3364,7 @@ func checkBanBlacklistedUser(ctx *MsgContext, msg *Message, isWhiteGroup bool, b
 		if isWhiteGroup {
 			log.Infof("收到群(%s)内黑名单用户<%s>(%s)的消息，但在信任群所以不尝试退群", groupID, msg.Sender.Nickname, msg.Sender.UserID)
 		} else {
-			banQuitGroup()
+			banQuitGroup(nil)
 		}
 		return true
 	}
@@ -2293,20 +3394,21 @@ func checkBan(ctx *MsgContext, msg *Message) (notReply bool) {
 		}
 	}
 
-	banQuitGroup := func() {
+	banQuitGroup := func(beforeQuit func(*MsgContext)) {
 		banListInfoItem, _ := ctx.Dice.Config.BanList.GetByID(msg.Sender.UserID)
 		reasontext := FormatBlacklistReasons(banListInfoItem)
 		groupID := msg.GroupID
 		noticeMsg := fmt.Sprintf("检测到群(%s)内黑名单用户<%s>(%s)，自动退群\n%s", groupID, msg.Sender.Nickname, msg.Sender.UserID, reasontext)
-		log.Info(noticeMsg)
-
 		text := fmt.Sprintf("因<%s>(%s)是黑名单用户，将自动退群。", msg.Sender.Nickname, msg.Sender.UserID)
-		ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
-
-		ctx.Notice(noticeMsg, NoticeTypeBan)
-
-		time.Sleep(1 * time.Second)
-		ctx.EndPoint.Adapter.QuitGroup(ctx, groupID)
+		autoQuitGroupAsync(ctx, groupID, func(ctx *MsgContext) {
+			if beforeQuit != nil {
+				beforeQuit(ctx)
+			}
+			log.Info(noticeMsg)
+			ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
+			ctx.Notice(noticeMsg, NoticeTypeBan)
+			time.Sleep(1 * time.Second)
+		})
 	}
 
 	if ctx.PrivilegeLevel == -30 {
@@ -2324,14 +3426,15 @@ func checkBan(ctx *MsgContext, msg *Message) (notReply bool) {
 				log.Infof("群(%s)处于黑名单中，但在信任群所以不尝试退群", groupID)
 			} else {
 				noticeMsg := fmt.Sprintf("群(%s)处于黑名单中，自动退群\n%s", groupID, reasontext)
-				log.Info(noticeMsg)
+				autoQuitGroupAsync(ctx, groupID, func(ctx *MsgContext) {
+					log.Info(noticeMsg)
 
-				ReplyGroupRaw(ctx, &Message{GroupID: groupID}, "因本群处于黑名单中，将自动退群。", "")
+					ReplyGroupRaw(ctx, &Message{GroupID: groupID}, "因本群处于黑名单中，将自动退群。", "")
 
-				ctx.Notice(noticeMsg, NoticeTypeBan)
+					ctx.Notice(noticeMsg, NoticeTypeBan)
 
-				time.Sleep(1 * time.Second)
-				ctx.EndPoint.Adapter.QuitGroup(ctx, groupID)
+					time.Sleep(1 * time.Second)
+				})
 			}
 		} else if d.Config.BanList.BanBehaviorRefuseReply {
 			notReply = true
@@ -3074,15 +4177,8 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 			// 允许代骰时，发一句话
 			cur := -1
 			for index, i := range cmdArgs.At {
-				if i.UserID == ctx.EndPoint.UserID {
+				if cmdArgs.isBotSelfMention(ctx, i.UserID) {
 					continue
-				} else if strings.HasPrefix(ctx.EndPoint.UserID, "OpenQQ:") {
-					// 特殊处理 OpenQQ频道
-					uid := strings.TrimPrefix(i.UserID, "OpenQQCH:")
-					diceId := strings.TrimPrefix(ctx.EndPoint.UserID, "OpenQQ:")
-					if uid == diceId {
-						continue
-					}
 				}
 				cur = index
 			}
@@ -3222,7 +4318,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 		candidates = append(candidates, commandSolveCandidate{Ext: nil, Item: item})
 	}
 
-	if group != nil && (group.Active || ctx.IsCurGroupBotOn) {
+	if group != nil && (group.IsActiveRaw() || ctx.IsCurGroupBotOn) {
 		for _, wrapper := range group.GetActivatedExtList(ctx.Dice) {
 			cmdMap := wrapper.GetCmdMap()
 			item = cmdMap[cmdArgs.Command]
@@ -3306,7 +4402,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 		}
 	}
 
-	if group != nil && (group.Active || ctx.IsCurGroupBotOn) {
+	if group != nil && (group.IsActiveRaw() || ctx.IsCurGroupBotOn) {
 		for _, wrapper := range group.GetActivatedExtList(ctx.Dice) {
 			ext := wrapper.GetRealExt()
 			if ext == nil {
@@ -3470,7 +4566,7 @@ func (s *IMSession) OnMessageEdit(ctx *MsgContext, msg *Message) {
 	}
 
 	group := ctx.Group
-	if group.Active || ctx.IsCurGroupBotOn {
+	if group.IsActiveRaw() || ctx.IsCurGroupBotOn {
 		for _, wrapper := range group.GetActivatedExtList(ctx.Dice) {
 			ext := wrapper.GetRealExt()
 			if ext == nil {

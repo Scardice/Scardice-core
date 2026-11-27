@@ -3,6 +3,7 @@ package schema
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"gorm.io/gorm"
 
@@ -50,6 +51,33 @@ func EnsureLogSchema(db *gorm.DB, engineType string) error {
 		if err := db.Migrator().AddColumn(itemModel, "Seq"); err != nil {
 			return fmt.Errorf("ensure log schema seq column: %w", err)
 		}
+	}
+	// 1119: MySQL 的 idx_log_items_log_seq 不再写在 model tag 上（AutoMigrate
+	// 并发首启可能重复建索引并让迁移失败），由这里显式补建；重复索引错误忽略。
+	if engineType == constant.MYSQL {
+		if err := ensureMySQLLogSeqIndex(db); err != nil {
+			return fmt.Errorf("ensure log schema seq index: %w", err)
+		}
+	}
+	return nil
+}
+
+// ensureMySQLLogSeqIndex 幂等创建 log_items(log_id, seq) 索引。
+// 两个实例同时首启时后一个会收到 duplicate key name，忽略即可。
+func ensureMySQLLogSeqIndex(db *gorm.DB) error {
+	if db == nil || !db.Migrator().HasTable("log_items") {
+		return nil
+	}
+	if db.Migrator().HasIndex("log_items", "idx_log_items_log_seq") {
+		return nil
+	}
+	err := db.Exec("CREATE INDEX idx_log_items_log_seq ON log_items(log_id, seq)").Error
+	if err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "duplicate key name") || strings.Contains(msg, "already exists") {
+			return nil
+		}
+		return err
 	}
 	return nil
 }

@@ -205,12 +205,9 @@ func TestLogSendToBackendAcceptsAliasKey(t *testing.T) {
 		EndPoint: &EndPointInfo{EndPointInfoBase: EndPointInfoBase{UserID: "UI:1000"}},
 	}
 
-	unofficial, url, notice, err := LogSendToBackend(ctx, groupID, alias)
+	url, notice, err := LogSendToBackend(ctx, groupID, alias)
 	if err != nil {
 		t.Fatalf("LogSendToBackend: %v", err)
-	}
-	if unofficial {
-		t.Fatal("expected official backend path")
 	}
 	if notice != "" {
 		t.Fatalf("unexpected notice %q", notice)

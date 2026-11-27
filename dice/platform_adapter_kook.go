@@ -2,15 +2,23 @@ package dice
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
+	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lonelyevil/kook"
 	"github.com/lonelyevil/kook/log_adapter/plog"
@@ -29,6 +37,28 @@ type ConsoleWriterShutUp struct {
 
 func (c *ConsoleWriterShutUp) Close() (err error)                       { return nil }
 func (c *ConsoleWriterShutUp) WriteEntry(_ *kooklog.Entry) (int, error) { return 0, nil }
+
+// kookOpTimeout 限制一次「启用/重登」操作的最长等待。SDK 的握手已有
+// 15s Dial + 6s hello 超时，但会话锁/建连锁被后台重连占用时，适配器层
+// 仍可能长时间卡住；超时后强制丢弃会话，下次启用会新建连接。
+const kookOpTimeout = 30 * time.Second
+
+// kookZapWriter 把 KOOK SDK 的 error 日志转发到余烬日志。SDK 原先被
+// ConsoleWriterShutUp 完全静默，连接失败时日志里只剩「正在启用」。
+type kookZapWriter struct {
+	log *zap.SugaredLogger
+}
+
+func (w kookZapWriter) Write(p []byte) (int, error) {
+	if w.log != nil {
+		line := strings.TrimSpace(string(p))
+		line = kookLogTokenRe.ReplaceAllString(line, "$1$2***")
+		w.log.Errorf("[KOOK SDK] %s", line)
+	}
+	return len(p), nil
+}
+
+var kookLogTokenRe = regexp.MustCompile(`(?i)((?:access_)?token|authorization)(["']?\s*[:=]\s*["']?)([^,"'\s&}]+)`)
 
 // kook go的鉴权目前并不好用，这里重写一遍
 const (
@@ -126,22 +156,723 @@ type CardMessageModuleFile struct {
 	// Size  string `json:"size"`
 }
 
+const (
+	// 管理员/服务器信息缓存用于避免每条 KOOK 消息都同步调用 UserView/GuildView。
+	// 权限变更最多延迟一个 TTL，换取回复路径不再被 REST 往返阻塞。
+	kookAdminCacheTTL        = 2 * time.Minute
+	kookGuildCacheTTL        = 5 * time.Minute
+	kookAdminErrorCacheTTL   = 15 * time.Second
+	kookGuildErrorCacheTTL   = 15 * time.Second
+	kookAdminCacheMaxEntries = 4096
+	kookGuildCacheMaxEntries = 1024
+)
+
+type kookAdminCacheEntry struct {
+	admin     bool
+	expiresAt time.Time
+}
+
+type kookGuildCacheEntry struct {
+	guild     *kook.Guild
+	expiresAt time.Time
+}
+
 // PlatformAdapterKook 与 PlatformAdapterDiscord 基本相同的实现，因此不详细写注释了，可以去参考隔壁的实现
 type PlatformAdapterKook struct {
 	Token         string        `json:"-"     yaml:"token"`
 	EndPoint      *EndPointInfo `json:"-"     yaml:"-"`
 	IntentSession *kook.Session `json:"-"     yaml:"-"`
+
+	sessionMu sync.Mutex
+	// serving 防止并发 Serve 启动两套连接；会话被清空/禁用时复位。
+	serving bool
+	// serveToken 每次 Serve/禁用/重登递增。Serve 的每个阶段都要用自己
+	// 捕获的 token 校验所有权，避免启动期被禁用后旧协程又把端点拉起来。
+	serveToken uint64
+
+	adminCacheMu sync.Mutex
+	adminCache   map[string]kookAdminCacheEntry
+	guildCacheMu sync.Mutex
+	guildCache   map[string]kookGuildCacheEntry
+
+	// resumeStateMu 串行化 resume 文件的写入/删除，避免用户禁用后
+	// 后台定时保存又把旧状态写回去。
+	resumeStateMu sync.Mutex
+
+	// handlerMu 跨 Session 串行化 handler。禁用后立即启用会创建新 Session，
+	// 仅靠 Session 内部的锁无法阻止旧会话的迟到命令并发修改数据。
+	handlerMu sync.Mutex
+
+	// kookRetryMu 保护自动重连循环；kookRetryCancel 非空表示循环正在运行。
+	kookRetryMu      sync.Mutex
+	kookRetryCancel  chan struct{}
+	kookRetryAttempt int
+}
+
+// getSession 返回当前会话快照。会话可能在发送/重连过程中被启用、禁用或替换，
+// 所有访问都必须经过这里，避免读到半更新的指针。
+func (pa *PlatformAdapterKook) getSession() *kook.Session {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	return pa.IntentSession
+}
+
+// closeKookSessionAsync 不等待 SDK 的会话锁；卡住的 Close 不能阻塞适配器恢复。
+func (pa *PlatformAdapterKook) closeKookSessionAsync(session *kook.Session) {
+	if session == nil {
+		return
+	}
+	go func() {
+		defer func() { _ = recover() }()
+		_ = session.Close()
+	}()
+}
+
+// forceDropKookSession 丢弃当前会话引用并异步关闭底层连接，让下一次启用
+// 可以新建会话，而不是继续等一把可能永远拿不到的锁。
+func (pa *PlatformAdapterKook) forceDropKookSession() {
+	session := pa.getSession()
+	if session != nil {
+		pa.clearSessionIf(session)
+		pa.closeKookSessionAsync(session)
+	}
+	// 用户在超时前已经点过禁用：不要复活端点，也不要启动自动重连。
+	if pa.EndPoint != nil && !pa.EndPoint.Enable {
+		pa.saveState()
+		return
+	}
+	pa.setEndpointStateIfIdle(true, StateConnectionFailed)
+	pa.saveState()
+	// 会话卡死被丢弃后交给后台自动重连，避免必须重启进程或人工点启用。
+	pa.startKookAutoReconnect("会话卡住已丢弃")
+}
+
+// kookRetryDelay 返回第 attempt 次自动重连前的等待时间。
+// 30 秒起步、10 分钟封顶，断网期间不会无限刷日志或频繁重建连接。
+func kookRetryDelay(attempt int) time.Duration {
+	switch {
+	case attempt <= 0:
+		return 30 * time.Second
+	case attempt == 1:
+		return time.Minute
+	case attempt == 2:
+		return 2 * time.Minute
+	case attempt == 3:
+		return 5 * time.Minute
+	default:
+		return 10 * time.Minute
+	}
+}
+
+// startKookAutoReconnect 启动后台自动重连；已有循环时不重复启动。
+func (pa *PlatformAdapterKook) startKookAutoReconnect(reason string) {
+	pa.kookRetryMu.Lock()
+	if pa.kookRetryCancel != nil {
+		pa.kookRetryMu.Unlock()
+		return
+	}
+	if pa.EndPoint == nil || !pa.EndPoint.Enable {
+		pa.kookRetryMu.Unlock()
+		return
+	}
+	cancel := make(chan struct{})
+	pa.kookRetryCancel = cancel
+	pa.kookRetryAttempt = 0
+	pa.kookRetryMu.Unlock()
+
+	go pa.kookAutoReconnectLoop(cancel, reason)
+}
+
+func (pa *PlatformAdapterKook) kookAutoReconnectLoop(cancel chan struct{}, reason string) {
+	log := zap.S().Named(logger.LogKeyAdapter)
+	defer func() {
+		pa.kookRetryMu.Lock()
+		if pa.kookRetryCancel == cancel {
+			pa.kookRetryCancel = nil
+		}
+		pa.kookRetryMu.Unlock()
+	}()
+	for {
+		pa.kookRetryMu.Lock()
+		attempt := pa.kookRetryAttempt
+		pa.kookRetryAttempt++
+		pa.kookRetryMu.Unlock()
+
+		wait := kookRetryDelay(attempt)
+		log.Warnf("KOOK 自动重连将在 %v 后尝试（第%d次）: %s", wait, attempt+1, reason)
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-cancel:
+			timer.Stop()
+			return
+		}
+		if pa.EndPoint == nil || !pa.EndPoint.Enable {
+			return
+		}
+		if pa.hasActiveKookSession() {
+			log.Infof("KOOK 自动重连停止：会话已恢复")
+			return
+		}
+		log.Infof("KOOK 自动重连尝试（第%d次）", attempt+1)
+		pa.runKookOpWithTimeout("自动重连", func() { pa.setEnableInternal(true) })
+		if pa.hasActiveKookSession() {
+			log.Infof("KOOK 自动重连成功")
+			return
+		}
+	}
+}
+
+// stopKookAutoReconnect 停止后台自动重连；连接成功、用户禁用或销毁时调用。
+func (pa *PlatformAdapterKook) stopKookAutoReconnect() {
+	pa.kookRetryMu.Lock()
+	defer pa.kookRetryMu.Unlock()
+	if pa.kookRetryCancel != nil {
+		close(pa.kookRetryCancel)
+		pa.kookRetryCancel = nil
+	}
+}
+
+func (pa *PlatformAdapterKook) hasActiveKookSession() bool {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	return pa.IntentSession != nil && pa.EndPoint != nil && pa.EndPoint.State == StateConnected
+}
+
+// runKookOpWithTimeout 给启用/重登这类可能卡在 SDK 锁上的操作加兜底超时。
+// 返回 false 表示已超时并丢弃了会话。
+func (pa *PlatformAdapterKook) runKookOpWithTimeout(name string, op func()) bool {
+	log := zap.S().Named(logger.LogKeyAdapter)
+	done := make(chan struct{})
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Errorf("KOOK %s操作异常: %v 堆栈: %v", name, r, string(debug.Stack()))
+			}
+			close(done)
+		}()
+		op()
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(kookOpTimeout):
+		log.Errorf("KOOK %s操作超时（%v），丢弃当前会话，可重新启用", name, kookOpTimeout)
+		pa.forceDropKookSession()
+		return false
+	}
+}
+
+// endpointSnapshot 在同一把锁内读取发送所需的端点状态/身份，
+// 避免禁用、重登时读到半更新的 Enable/State/Nickname/UserID。
+func (pa *PlatformAdapterKook) endpointSnapshot() (bool, EndpointState, string, string) {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	if pa.EndPoint == nil {
+		return false, StateDisconnected, "", ""
+	}
+	return pa.EndPoint.Enable, pa.EndPoint.State, pa.EndPoint.UserID, pa.EndPoint.Nickname
+}
+
+func (pa *PlatformAdapterKook) setSession(session *kook.Session) {
+	pa.sessionMu.Lock()
+	pa.IntentSession = session
+	pa.sessionMu.Unlock()
+	pa.clearPermissionCaches()
+}
+
+func (pa *PlatformAdapterKook) clearPermissionCaches() {
+	pa.adminCacheMu.Lock()
+	pa.adminCache = nil
+	pa.adminCacheMu.Unlock()
+	pa.guildCacheMu.Lock()
+	pa.guildCache = nil
+	pa.guildCacheMu.Unlock()
+}
+
+const kookResumeStateFileName = "kook_resume.json"
+
+type kookResumeFile struct {
+	Gateway   string `json:"gateway"`
+	SessionID string `json:"session_id"`
+	SN        int64  `json:"sn"`
+	TokenHash string `json:"token_hash"`
+	SavedAt   int64  `json:"saved_at"`
+}
+
+func (pa *PlatformAdapterKook) kookTokenHash() string {
+	// 与 kook.New 写入 Identify.Token 的格式保持一致。
+	sum := sha256.Sum256([]byte("Bot " + pa.Token))
+	return hex.EncodeToString(sum[:])
+}
+
+func kookSessionTokenHash(session *kook.Session) string {
+	if session == nil {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(session.Identify.Token))
+	return hex.EncodeToString(sum[:])
+}
+
+func (pa *PlatformAdapterKook) resumeStatePath() string {
+	if pa.EndPoint == nil || strings.TrimSpace(pa.EndPoint.RelWorkDir) == "" {
+		return ""
+	}
+	return filepath.Join(pa.EndPoint.RelWorkDir, kookResumeStateFileName)
+}
+
+// restoreKookResumeState 在首次 Open 前恢复上次进程留下的 session/sn。
+// 网关/session 过期时 resume 会失败，SDK 会自动转新 session。
+func (pa *PlatformAdapterKook) restoreKookResumeState(session *kook.Session) {
+	pa.resumeStateMu.Lock()
+	defer pa.resumeStateMu.Unlock()
+	path := pa.resumeStatePath()
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var state kookResumeFile
+	if err := json.Unmarshal(data, &state); err != nil {
+		return
+	}
+	// token 变化后旧 gateway/session 可能属于另一个机器人，不能恢复。
+	if state.TokenHash == "" || state.TokenHash != pa.kookTokenHash() {
+		return
+	}
+	session.RestoreResumeState(kook.ResumeState{
+		// 不恢复文件里的旧网关地址：可能已过期，且旧格式文件可能带 token。
+		// Open 会通过 REST 重新获取当前 gateway，再附加 resume 参数。
+		Gateway:   "",
+		SessionID: strings.TrimSpace(state.SessionID),
+		SN:        state.SN,
+	})
+}
+
+// sanitizeKookGatewayURL 去掉 gateway URL 中的查询参数。KOOK 返回的 gateway
+// 地址带 token=，直接写入 resume 文件会泄露凭据；这里只保留 scheme/host/path，
+// 恢复时再通过 REST 重新获取带 token 的新地址。
+func sanitizeKookGatewayURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	u.User = nil
+	return u.String()
+}
+
+// writeKookResumeFileNoSync 原子替换 resume 文件，但不做 fsync。
+// 这个快照在每个 sn 前进后同步写入，逐事件刷盘会明显拖慢事件处理；
+// 进程崩溃时页缓存仍在，最坏情况只是断电时回退几秒进度，
+// 重复事件由 resume 重放承担。
+func writeKookResumeFileNoSync(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	tmp, err := os.CreateTemp(dir, "."+base+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+
+	_ = tmp.Chmod(0o600)
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (pa *PlatformAdapterKook) saveKookResumeState(session *kook.Session) {
+	if session == nil {
+		return
+	}
+	pa.resumeStateMu.Lock()
+	defer pa.resumeStateMu.Unlock()
+	if !pa.isCurrentSession(session) || session.IsClosed() {
+		return
+	}
+	state := session.ResumeState()
+	if state.SessionID == "" {
+		return
+	}
+	path := pa.resumeStatePath()
+	if path == "" {
+		return
+	}
+	payload, err := json.Marshal(kookResumeFile{
+		// gateway 只保存去掉查询参数的主机/路径，恢复时重新获取带 token 的地址。
+		Gateway:   sanitizeKookGatewayURL(state.Gateway),
+		SessionID: state.SessionID,
+		SN:        state.SN,
+		TokenHash: kookSessionTokenHash(session),
+		SavedAt:   time.Now().Unix(),
+	})
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return
+	}
+	_ = writeKookResumeFileNoSync(path, payload)
+}
+
+func (pa *PlatformAdapterKook) clearKookResumeState() {
+	// 与 saveKookResumeState 共用 resumeStateMu，且保持同样的锁序：
+	// resumeStateMu -> sessionMu。否则 save 在检查完归属后、rename 之前，
+	// clear 可以删掉文件，save 又把它写回来。
+	pa.resumeStateMu.Lock()
+	defer pa.resumeStateMu.Unlock()
+	pa.sessionMu.Lock()
+	hasSession := pa.IntentSession != nil
+	pa.sessionMu.Unlock()
+	// 已有新会话接管时，旧 Serve/DoRelogin 的迟到清理不能删掉新会话刚写入的
+	// resume 快照；只有当前没有会话时才允许删除。
+	if hasSession {
+		return
+	}
+	path := pa.resumeStatePath()
+	if path != "" {
+		_ = os.Remove(path)
+	}
+}
+
+// removeKookResumeStateForSession 删除属于指定 session 的 resume 快照。
+// 只在快照的 token hash 与 session 匹配、且没有新会话接管时删除，避免
+// 旧协程/旧 session 的迟到清理误删新会话刚写入的文件。
+func (pa *PlatformAdapterKook) removeKookResumeStateForSession(session *kook.Session) {
+	if pa == nil || session == nil {
+		return
+	}
+	tokenHash := kookSessionTokenHash(session)
+	if tokenHash == "" {
+		return
+	}
+	pa.resumeStateMu.Lock()
+	defer pa.resumeStateMu.Unlock()
+	pa.sessionMu.Lock()
+	newer := pa.IntentSession != nil && pa.IntentSession != session
+	pa.sessionMu.Unlock()
+	if newer {
+		return
+	}
+	path := pa.resumeStatePath()
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var state kookResumeFile
+	if err := json.Unmarshal(data, &state); err != nil {
+		return
+	}
+	if state.TokenHash != tokenHash {
+		return
+	}
+	_ = os.Remove(path)
+}
+
+// persistKookResumeState 定期保存 sn；进程异常退出时最多丢 5 秒的进度，
+// 重启后 resume 会从较早的 sn 开始补发，重复事件由 sn 去重吸收。
+func (pa *PlatformAdapterKook) persistKookResumeState(session *kook.Session) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !pa.isCurrentSession(session) || session.IsClosed() {
+			return
+		}
+		pa.saveKookResumeState(session)
+	}
+}
+
+// clearSessionIf 只在当前会话仍是 session 时清空，返回是否由本次调用清空。
+// 这是防止旧 Serve/DoRelogin 协程误清掉新会话的关键。
+func (pa *PlatformAdapterKook) clearSessionIf(session *kook.Session) bool {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	if pa.IntentSession != session {
+		return false
+	}
+	pa.IntentSession = nil
+	pa.serving = false
+	// 使旧 Serve 的 defer/后续阶段失效，不能让它再改端点状态。
+	pa.serveToken++
+	return true
+}
+
+// abortServeSession 清理一次未成功接管的 Serve：只在仍是当前会话时清空
+// IntentSession/serving，然后关闭旧连接。新会话已接管时 clearSessionIf
+// 会 no-op，只关闭旧连接，不会影响新会话。
+func (pa *PlatformAdapterKook) abortServeSession(session *kook.Session) {
+	if session == nil {
+		return
+	}
+	pa.clearSessionIf(session)
+	pa.closeKookSessionAsync(session)
+}
+
+func (pa *PlatformAdapterKook) isCurrentSession(session *kook.Session) bool {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	return session != nil && pa.IntentSession == session
+}
+
+// isServingSession 同时确认会话仍是当前会话且没有被禁用/重登取消。
+func (pa *PlatformAdapterKook) isServingSession(session *kook.Session) bool {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	return session != nil && pa.serving && pa.IntentSession == session
+}
+
+// isServingSessionToken 在 isServingSession 基础上校验 Serve 启动代次。
+// 禁用/重登会递增 serveToken；旧 Serve 即使还没走到 setSession，也会在
+// 后续阶段失败并清理自己，不能把端点重新写成 Connected。
+func (pa *PlatformAdapterKook) isServingSessionToken(session *kook.Session, token uint64) bool {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	return session != nil && pa.serving && pa.IntentSession == session && pa.serveToken == token
+}
+
+// setSessionStateIfCurrent 把“确认仍是当前会话”和“写端点状态”放在同一把锁里，
+// 避免旧 Serve/fatal 协程在新会话接管后把状态改回离线/失败。
+func (pa *PlatformAdapterKook) setSessionStateIfCurrent(session *kook.Session, enable bool, state EndpointState) bool {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	if session == nil || pa.IntentSession != session {
+		return false
+	}
+	if pa.EndPoint != nil {
+		pa.EndPoint.Enable = enable
+		pa.EndPoint.State = state
+	}
+	return true
+}
+
+func (pa *PlatformAdapterKook) setEndpointStateIfIdle(enable bool, state EndpointState) bool {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	if pa.IntentSession != nil {
+		return false
+	}
+	if pa.EndPoint != nil {
+		pa.EndPoint.Enable = enable
+		pa.EndPoint.State = state
+	}
+	return true
+}
+
+// clearSessionAndSetState 原子地清空当前会话并写入最终状态，返回是否由本次调用完成。
+func (pa *PlatformAdapterKook) clearSessionAndSetState(session *kook.Session, enable bool, state EndpointState) bool {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	if session == nil || pa.IntentSession != session {
+		return false
+	}
+	pa.IntentSession = nil
+	pa.serving = false
+	pa.serveToken++
+	if pa.EndPoint != nil {
+		pa.EndPoint.Enable = enable
+		pa.EndPoint.State = state
+	}
+	pa.clearPermissionCaches()
+	return true
+}
+
+// applyIdentityIfCurrent 防止旧会话在 UserMe 返回后覆盖新会话的身份字段。
+func (pa *PlatformAdapterKook) applyIdentityIfCurrent(session *kook.Session, self *kook.User) bool {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	if session == nil || pa.IntentSession != session || self == nil || pa.EndPoint == nil {
+		return false
+	}
+	pa.EndPoint.Nickname = self.Nickname
+	pa.EndPoint.UserID = FormatDiceIDKook(self.ID)
+	return true
+}
+
+func (pa *PlatformAdapterKook) saveState() {
+	if pa.EndPoint == nil || pa.EndPoint.Session == nil || pa.EndPoint.Session.Parent == nil {
+		return
+	}
+	d := pa.EndPoint.Session.Parent
+	d.LastUpdatedTime = time.Now().Unix()
+	d.Save(false)
+}
+
+const kookUserMeMaxAttempts = 3
+
+// fetchKookSelf 对 UserMe 做有限重试：REST 短暂抖动不应该直接禁用端点。
+// 每次重试前后都检查会话所有权，用户禁用/重登时立即退出。
+func (pa *PlatformAdapterKook) fetchKookSelf(s *kook.Session, log *zap.SugaredLogger) (*kook.User, error) {
+	var lastErr error
+	for attempt := range kookUserMeMaxAttempts {
+		if !pa.isCurrentSession(s) {
+			return nil, errors.New("KOOK 会话已被替换")
+		}
+		self, err := s.UserMe()
+		if err == nil && self != nil {
+			return self, nil
+		}
+		lastErr = err
+		if lastErr == nil {
+			lastErr = errors.New("UserMe 返回空账号")
+		}
+		if attempt+1 < kookUserMeMaxAttempts {
+			log.Warnf("获取KOOK账号信息失败，准备重试(%d/%d): %v", attempt+1, kookUserMeMaxAttempts, lastErr)
+			time.Sleep(time.Second)
+		}
+	}
+	return nil, lastErr
+}
+
+// refreshKookIdentity 在 UserMe 瞬时失败时后台补齐身份。
+// 只影响 EndPoint 的 UserID/Nickname（发送记录、自我识别），不阻塞 WebSocket；
+// 会话被禁用/替换或出现鉴权错误时退出。
+func (pa *PlatformAdapterKook) refreshKookIdentity(s *kook.Session, log *zap.SugaredLogger) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !pa.isCurrentSession(s) || s.IsClosed() {
+			return
+		}
+		self, err := s.UserMe()
+		if err == nil && self != nil && self.ID != "" {
+			if pa.applyIdentityIfCurrent(s, self) {
+				log.Infof("KOOK 机器人身份补齐成功，账号<%s>(%s)", self.Nickname, FormatDiceIDKook(self.ID))
+				pa.saveState()
+			}
+			return
+		}
+		if err != nil && kook.IsPermanentAuthError(err) {
+			log.Errorf("KOOK 机器人身份补齐失败（鉴权错误）: %v", err)
+			return
+		}
+	}
+}
+
+func (pa *PlatformAdapterKook) cachedGuildAdmin(key string) (bool, bool) {
+	pa.adminCacheMu.Lock()
+	defer pa.adminCacheMu.Unlock()
+	entry, ok := pa.adminCache[key]
+	if !ok || time.Now().After(entry.expiresAt) {
+		if ok {
+			delete(pa.adminCache, key)
+		}
+		return false, false
+	}
+	return entry.admin, true
+}
+
+func (pa *PlatformAdapterKook) storeGuildAdmin(key string, admin bool) {
+	pa.storeGuildAdminTTL(key, admin, kookAdminCacheTTL)
+}
+
+func (pa *PlatformAdapterKook) storeGuildAdminTTL(key string, admin bool, ttl time.Duration) {
+	pa.adminCacheMu.Lock()
+	defer pa.adminCacheMu.Unlock()
+	if pa.adminCache == nil {
+		pa.adminCache = make(map[string]kookAdminCacheEntry, kookAdminCacheMaxEntries)
+	}
+	if len(pa.adminCache) >= kookAdminCacheMaxEntries {
+		now := time.Now()
+		for cacheKey, entry := range pa.adminCache {
+			if now.After(entry.expiresAt) {
+				delete(pa.adminCache, cacheKey)
+			}
+		}
+		if len(pa.adminCache) >= kookAdminCacheMaxEntries {
+			// 仍然满员说明活跃用户极多；整体重置比每条消息做 LRU 更简单。
+			pa.adminCache = make(map[string]kookAdminCacheEntry, kookAdminCacheMaxEntries)
+		}
+	}
+	pa.adminCache[key] = kookAdminCacheEntry{
+		admin:     admin,
+		expiresAt: time.Now().Add(ttl),
+	}
+}
+
+func (pa *PlatformAdapterKook) cachedGuild(session *kook.Session, guildID string) *kook.Guild {
+	now := time.Now()
+	pa.guildCacheMu.Lock()
+	entry, ok := pa.guildCache[guildID]
+	pa.guildCacheMu.Unlock()
+	if ok && now.Before(entry.expiresAt) {
+		// guild == nil 表示 15 秒内的负缓存，避免 REST 故障时每条消息重复请求。
+		return entry.guild
+	}
+	guild, err := session.GuildView(guildID)
+	pa.guildCacheMu.Lock()
+	if pa.guildCache == nil {
+		pa.guildCache = make(map[string]kookGuildCacheEntry, kookGuildCacheMaxEntries)
+	}
+	if len(pa.guildCache) >= kookGuildCacheMaxEntries {
+		for cacheKey, cacheEntry := range pa.guildCache {
+			if now.After(cacheEntry.expiresAt) {
+				delete(pa.guildCache, cacheKey)
+			}
+		}
+		if len(pa.guildCache) >= kookGuildCacheMaxEntries {
+			pa.guildCache = make(map[string]kookGuildCacheEntry, kookGuildCacheMaxEntries)
+		}
+	}
+	if err != nil || guild == nil {
+		pa.guildCache[guildID] = kookGuildCacheEntry{expiresAt: now.Add(kookGuildErrorCacheTTL)}
+		pa.guildCacheMu.Unlock()
+		return nil
+	}
+	pa.guildCache[guildID] = kookGuildCacheEntry{guild: guild, expiresAt: now.Add(kookGuildCacheTTL)}
+	pa.guildCacheMu.Unlock()
+	return guild
+}
+
+// handleKookFatal 由 SDK 在后台重连遇到不可恢复的认证错误时调用。
+func (pa *PlatformAdapterKook) handleKookFatal(session *kook.Session, err error) {
+	log := zap.S().Named(logger.LogKeyAdapter)
+	log.Errorf("KOOK 连接不可恢复，已停止自动重连: %v", err)
+	if !pa.clearSessionAndSetState(session, false, StateConnectionFailed) {
+		// 会话已被新连接替换；旧 session 仍需关闭，避免残留连接。
+		pa.closeKookSessionAsync(session)
+		return
+	}
+	pa.saveState()
+	pa.closeKookSessionAsync(session)
+	pa.clearKookResumeState()
+}
+
+// recoverKookEvent 隔离事件处理中的 panic，避免 SDK 回调协程把整个进程带崩。
+func (pa *PlatformAdapterKook) recoverKookEvent(log *zap.SugaredLogger, eventName string) {
+	if r := recover(); r != nil {
+		log.Errorf("KOOK %s 事件处理异常: %v 堆栈: %v", eventName, r, string(debug.Stack()))
+	}
 }
 
 func (pa *PlatformAdapterKook) GetGroupInfoAsync(groupID string) {
 	// 极罕见情况下，未连接成功或被禁用的Endpoint也会去call GetGroupInfoAsync，并且由于IntentSession并未被实例化而抛出nil错误，因此这里做一个检查
-	if pa.IntentSession == nil {
+	session := pa.getSession()
+	if session == nil {
 		return
 	}
 	logger := pa.EndPoint.Session.Parent.Logger
 	dm := pa.EndPoint.Session.Parent.Parent
 	go pa.updateChannelNum()
-	channel, err := pa.IntentSession.ChannelView(ExtractKookChannelID(groupID))
+	channel, err := session.ChannelView(ExtractKookChannelID(groupID))
 	if err != nil {
 		logger.Errorf("获取Kook频道信息#%s时出错:%s", groupID, err.Error())
 		return
@@ -160,8 +891,12 @@ func (pa *PlatformAdapterKook) GetGroupInfoAsync(groupID string) {
 }
 
 func (pa *PlatformAdapterKook) updateChannelNum() {
+	session := pa.getSession()
+	if session == nil {
+		return
+	}
 	page := new(kook.PageSetting)
-	guilds, _, _ := pa.IntentSession.GuildList(page)
+	guilds, _, _ := session.GuildList(page)
 	groupNum := 0
 	// guilds是bot加入的服务器list，channels是每个服务器里的频道（有权限访问的）
 	for _, guild := range guilds {
@@ -172,38 +907,122 @@ func (pa *PlatformAdapterKook) updateChannelNum() {
 
 func (pa *PlatformAdapterKook) updateGameStatus() {
 	logger := pa.EndPoint.Session.Parent.Logger
+	session := pa.getSession()
+	if session == nil {
+		return
+	}
 	// 注释掉的部分是遗留代码，用于在kook中注册一个叫做Scardice的GameStatus，只需要执行一次因此注释掉
 	// gameupdate := new(kook.GameUpdate)
 	// gameupdate.ID = int64(768222)
 	// gameupdate.Icon = "https://img.kookapp.cn/assets/2022-12/DfYli1buyO0e80c0.png"
 	// gameupdate.Name = "Scardice"
 	// _, _ = pa.IntentSession.GameUpdate(gameupdate)
-	err := pa.IntentSession.GameActivity(int64(768222))
+	err := session.GameActivity(int64(768222))
 	if err != nil {
 		logger.Errorf("更新游戏状态时出错:%s", err.Error())
 		return
 	}
 }
 
-func (pa *PlatformAdapterKook) Serve() int {
+// abortServeAfterPanic 清理一次 panic 的 Serve 留下的会话与状态。
+// token 是本次 Serve 启动时捕获的代次：如果已有更新的 Serve/禁用接管，
+// 什么都不做，避免旧协程把新连接标记为失败。
+func (pa *PlatformAdapterKook) abortServeAfterPanic(token uint64, session *kook.Session) {
+	pa.sessionMu.Lock()
+	if pa.serveToken != token {
+		pa.sessionMu.Unlock()
+		return
+	}
+	// Serve 在创建/安装 session 之前 panic 时也要清 serving；
+	// 不能只按 IntentSession 判断，否则 serving 会永久卡在 true，
+	// 下一次 Serve 被 “already running” 挡住。
+	if pa.IntentSession != nil && pa.IntentSession != session {
+		pa.sessionMu.Unlock()
+		return
+	}
+	if session == nil && pa.EndPoint != nil && !pa.EndPoint.Enable && pa.EndPoint.State == StateDisconnected {
+		pa.serving = false
+		pa.sessionMu.Unlock()
+		return
+	}
+	pa.IntentSession = nil
+	pa.serving = false
+	pa.serveToken++
+	if pa.EndPoint != nil && pa.EndPoint.Enable {
+		pa.EndPoint.Enable = false
+		pa.EndPoint.State = StateConnectionFailed
+	}
+	pa.adminCacheMu.Lock()
+	pa.adminCache = nil
+	pa.adminCacheMu.Unlock()
+	pa.guildCacheMu.Lock()
+	pa.guildCache = nil
+	pa.guildCacheMu.Unlock()
+	pa.sessionMu.Unlock()
+	pa.closeKookSessionAsync(session)
+}
+
+func (pa *PlatformAdapterKook) Serve() (ret int) {
 	log := zap.S().Named(logger.LogKeyAdapter)
+	// 本次 Serve 自己创建的 session。panic 清理必须用它，不能用 pa.getSession()：
+	// 用户快速“禁用→启用”后，旧 Serve 的 defer 会取到新会话并把它误杀。
+	var serveSession *kook.Session
+	// serveToken 是本次 Serve 的启动代次；禁用/重登/新 Serve 会递增它。
+	var serveToken uint64
+	// SetEnable/DoRelogin 会直接调用 Serve，不经过 ServeKook 的 recover。
+	// 未预期的 panic 只能终止本次连接，不能让进程退出或让端点永久停在“连接中”。
+	defer func() {
+		if r := recover(); r != nil {
+			// 未命名返回值时 panic 会返回 0，调用方会当成“连接成功”
+			// （DoRelogin 返回 true、ServeKook 不写失败态）。
+			ret = 1
+			log.Errorf("KOOK 连接协程异常: %v 堆栈: %v", r, string(debug.Stack()))
+			pa.abortServeAfterPanic(serveToken, serveSession)
+			pa.saveState()
+		}
+	}()
+
+	pa.sessionMu.Lock()
+	if pa.serving || pa.IntentSession != nil {
+		pa.sessionMu.Unlock()
+		log.Info("KOOK serve already running, skip duplicate Serve")
+		return 0
+	}
+	pa.serveToken++
+	serveToken = pa.serveToken
+	pa.serving = true
+	pa.sessionMu.Unlock()
 
 	// 不喜欢太安静的控制台可以把ConsoleWriterShutUp换成kooklog.ConsoleWriter
+	// 不再完全静默 SDK 日志：只放开 error 及以上，并脱敏 token/authorization。
 	l := kooklog.Logger{
-		Level:  kooklog.TraceLevel,
-		Writer: &ConsoleWriterShutUp{},
+		Level:  kooklog.ErrorLevel,
+		Writer: kooklog.IOWriter{Writer: kookZapWriter{log: log}},
 	}
 	s := kook.New(pa.Token, plog.NewLogger(&l))
+	serveSession = s
+	// 与当前/旧 Session 共用一把 handler 锁，禁用→启用期间旧命令不会和新命令并发。
+	s.SetHandlerLock(&pa.handlerMu)
+	pa.restoreKookResumeState(s)
 	s.AddHandler(func(ctx *kook.KmarkdownMessageContext) {
+		defer pa.recoverKookEvent(log, "KMarkdown")
 		if ctx.Extra.Author.Bot {
 			return
 		}
 		if ctx.Common.Type == kook.MessageTypeKMarkdown || ctx.Common.Type == kook.MessageTypeImage {
-			pa.EndPoint.Session.Execute(pa.EndPoint, pa.toStdMessage(ctx), false)
+			msg := pa.toStdMessage(ctx)
+			if msg == nil {
+				return
+			}
+			pa.EndPoint.Session.Execute(pa.EndPoint, msg, false)
 			return
 		}
 	})
 	s.AddHandler(func(ctx *kook.ImageMessageContext) {
+		defer pa.recoverKookEvent(log, "Image")
+		if ctx.Extra.Author.Bot {
+			return
+		}
 		msg := new(Message)
 		msg.Time = ctx.Common.MsgTimestamp
 		msg.RawID = ctx.Common.MsgID
@@ -225,7 +1044,54 @@ func (pa *PlatformAdapterKook) Serve() int {
 		msg.Sender = *send
 		pa.EndPoint.Session.Execute(pa.EndPoint, msg, false)
 	})
+	// KOOK 客户端通常发 KMarkdown，但脚本、其他机器人或旧客户端会发纯文本(1)；
+	// 文件/语音/视频(4/8/3) 和卡片(10) 的 Content 是 URL 或 JSON。
+	// 没有这些 handler 时 SDK 解析后静默丢弃，表现为“发文件给骰子没反应”。
+	executePlain := func(common *kook.EventHandlerCommonContext, author kook.User, guildID, content string) {
+		if author.Bot || content == "" {
+			return
+		}
+		if msg := pa.kookPlainMessage(common, author, guildID, content); msg != nil {
+			pa.EndPoint.Session.Execute(pa.EndPoint, msg, false)
+		}
+	}
+	s.AddHandler(func(ctx *kook.TextMessageContext) {
+		defer pa.recoverKookEvent(log, "Text")
+		if ctx.Common == nil {
+			return
+		}
+		executePlain(ctx.EventHandlerCommonContext, ctx.Extra.Author, ctx.Extra.GuildID, ctx.Common.Content)
+	})
+	s.AddHandler(func(ctx *kook.VideoMessageContext) {
+		defer pa.recoverKookEvent(log, "Video")
+		if ctx.Common == nil {
+			return
+		}
+		executePlain(ctx.EventHandlerCommonContext, ctx.Extra.Author, ctx.Extra.GuildID, kookMediaCQCode("video", ctx.Common.Content))
+	})
+	s.AddHandler(func(ctx *kook.FileMessageContext) {
+		defer pa.recoverKookEvent(log, "File")
+		if ctx.Common == nil {
+			return
+		}
+		executePlain(ctx.EventHandlerCommonContext, ctx.Extra.Author, ctx.Extra.GuildID, kookMediaCQCode("file", ctx.Common.Content))
+	})
+	s.AddHandler(func(ctx *kook.AudioMessageContext) {
+		defer pa.recoverKookEvent(log, "Audio")
+		if ctx.Common == nil {
+			return
+		}
+		executePlain(ctx.EventHandlerCommonContext, ctx.Extra.Author, ctx.Extra.GuildID, kookMediaCQCode("record", ctx.Common.Content))
+	})
+	s.AddHandler(func(ctx *kook.EventCardMessageContext) {
+		defer pa.recoverKookEvent(log, "Card")
+		if ctx.Common == nil {
+			return
+		}
+		executePlain(ctx.EventHandlerCommonContext, ctx.Extra.Author, ctx.Extra.GuildID, ctx.Common.Content)
+	})
 	s.AddHandler(func(ctx *kook.MessageDeleteContext) {
+		defer pa.recoverKookEvent(log, "MessageDelete")
 		msg := new(Message)
 		msg.Time = ctx.Common.MsgTimestamp
 		msg.RawID = ctx.Extra.MsgID
@@ -243,6 +1109,7 @@ func (pa *PlatformAdapterKook) Serve() int {
 	})
 
 	s.AddHandler(func(ctx *kook.BotJoinContext) {
+		defer pa.recoverKookEvent(log, "BotJoin")
 		msg := new(Message)
 		msg.Time = ctx.Common.MsgTimestamp
 		msg.RawID = ctx.Common.MsgID
@@ -300,8 +1167,9 @@ func (pa *PlatformAdapterKook) Serve() int {
 		ok := mctx.Session.ServiceAtNew.Exists(msg.GroupID)
 		if !ok {
 			channel := SetBotOnAtGroup(mctx, msg.GroupID)
-			channel.Active = true
-			channel.DiceIDExistsMap.Store(pa.EndPoint.UserID, true)
+			channel.SetActiveRaw(true)
+			_, _, selfID, _ := pa.endpointSnapshot()
+			channel.DiceIDExistsMap.Store(selfID, true)
 			now := time.Now().Unix()
 			channel.UpdatedAtTime = now
 			channel.EnteredTime = now
@@ -319,6 +1187,7 @@ func (pa *PlatformAdapterKook) Serve() int {
 	})
 
 	s.AddHandler(func(ctx *kook.MessageUpdateContext) {
+		defer pa.recoverKookEvent(log, "MessageUpdate")
 		msg := new(Message)
 		msg.Time = ctx.Extra.UpdatedAt.ToTime().Unix() // secs
 		msg.RawID = ctx.Extra.MsgID
@@ -342,68 +1211,276 @@ func (pa *PlatformAdapterKook) Serve() int {
 		pa.EndPoint.Session.OnMessageEdit(mctx, msg)
 	})
 
-	err := s.Open()
-	if err != nil {
-		log.Errorf("与KOOK服务建立连接时出错:%s", err.Error())
-		return 1
+	// 先取账号身份，再 Open。KOOK 的 REST UserMe 不依赖 WebSocket；
+	// 这样 Open 刚开始推送事件时，EndPoint.UserID 已经是可用的，
+	// 不会出现“能回复但自我 @ 识别使用空 UserID”的窗口。
+	pa.setSession(s)
+	if enabled, _, _, _ := pa.endpointSnapshot(); !enabled || !pa.isServingSessionToken(s, serveToken) {
+		// 启动期间被禁用/重登：不要继续拉连接或覆盖端点状态。
+		pa.abortServeSession(s)
+		return 0
 	}
-	pa.IntentSession = s
+	go pa.persistKookResumeState(s)
+	// 每处理完一个 sn 就同步保存 resume 快照，避免进程退出后从旧快照
+	// 重放已经执行过的命令。5 秒 ticker 仍保留作为兜底。
+	s.SetSnPersistHandler(func() {
+		pa.saveKookResumeState(s)
+	})
+	s.SetFatalHandler(func(fatalErr error) {
+		pa.handleKookFatal(s, fatalErr)
+	})
+	// resume/session 状态被丢弃时同步删除磁盘快照，避免下次启动先用
+	// 已失效的 session 走一轮 8/16 秒 resume 失败。
+	s.SetResumeResetHandler(func() {
+		pa.removeKookResumeStateForSession(s)
+	})
+	s.SetReconnectHandler(func() {
+		if pa.setSessionStateIfCurrent(s, true, StateConnected) {
+			pa.saveKookResumeState(s)
+			pa.saveState()
+		}
+	})
+	// 断线进入后台重连时立即把端点从“已连接”回置为“连接中”，
+	// 避免网络中断的几十秒/几分钟里 UI 仍显示在线、发送守卫误判可发。
+	s.SetReconnectStartHandler(func() {
+		if pa.setSessionStateIfCurrent(s, true, StateConnecting) {
+			pa.saveState()
+		}
+	})
+	self, err := pa.fetchKookSelf(s, log)
+	if err != nil || self == nil {
+		if err == nil {
+			err = errors.New("UserMe 返回空账号")
+		}
+		// 只有真正的凭据错误才让端点离线。REST 抖动/超时不影响 WebSocket，
+		// 先连接，身份由后台协程补齐（否则一次瞬时 5xx 就会把端点永久停用，
+		// 下次启动也不会再尝试连接）。
+		if kook.IsPermanentAuthError(err) {
+			log.Errorf("获取KOOK账号信息失败（鉴权错误）:%v", err)
+			if !pa.clearSessionAndSetState(s, false, StateConnectionFailed) {
+				// 用户已禁用，或新的 Serve 已经接管；旧协程不能覆盖新状态。
+				pa.abortServeSession(s)
+				return 0
+			}
+			// clearSessionAndSetState 已把 IntentSession 置空；此时删除
+			// 快照才不会被“仍有当前会话”的守卫拦成 no-op。
+			pa.clearKookResumeState()
+			pa.saveState()
+			_ = s.Close()
+			return 1
+		}
+		log.Warnf("获取KOOK账号信息失败，先建立连接并在后台补齐身份: %v", err)
+		go pa.refreshKookIdentity(s, log)
+	} else if !pa.applyIdentityIfCurrent(s, self) {
+		// UserMe 期间用户禁用/重登，旧会话直接退出。
+		pa.abortServeSession(s)
+		return 0
+	}
+
+	// 身份就绪后再置为已连接，避免 Open() 刚启动时服务端推送的首条事件
+	// 因发送守卫看到 State/Enable 未就绪而被静默丢弃。
+	if !pa.setSessionStateIfCurrent(s, true, StateConnected) {
+		pa.abortServeSession(s)
+		return 0
+	}
+	if !pa.isServingSessionToken(s, serveToken) {
+		pa.abortServeSession(s)
+		return 0
+	}
+	err = s.Open()
+	if err != nil && !errors.Is(err, kook.ErrWSAlreadyOpen) {
+		if errors.Is(err, kook.ErrSessionClosed) || s.IsClosed() {
+			// 用户禁用/新会话接管，不能覆盖新状态，也不要复活旧连接。
+			pa.abortServeSession(s)
+			return 0
+		}
+		if kook.IsPermanentAuthError(err) {
+			log.Errorf("与KOOK服务建立连接时出错:%s", err.Error())
+			if !pa.clearSessionAndSetState(s, false, StateConnectionFailed) {
+				pa.abortServeSession(s)
+				return 0
+			}
+			pa.clearKookResumeState()
+			pa.saveState()
+			_ = s.Close()
+			return 1
+		}
+		// 网络抖动等瞬时错误：保留 session_id/sn，交给 SDK 后台 resume，
+		// 不能在这里 Close 掉刚由 Open 保留下来的恢复状态。
+		log.Warnf("与KOOK服务连接遇到瞬时错误，保留会话并后台重连: %v", err)
+		if !pa.isServingSessionToken(s, serveToken) {
+			pa.abortServeSession(s)
+			return 0
+		}
+		pa.setSessionStateIfCurrent(s, true, StateConnecting)
+		if s.IsOpen() {
+			// 后台 resume 可能在 Open 返回错误后已经成功，避免把状态降回连接中。
+			pa.setSessionStateIfCurrent(s, true, StateConnected)
+		}
+		pa.saveKookResumeState(s)
+		s.ReconnectAsync()
+		pa.saveState()
+		return 0
+	}
+	pa.saveKookResumeState(s)
+	if !pa.setSessionStateIfCurrent(s, true, StateConnected) {
+		// 连接建立期间被禁用/替换，避免旧协程继续改状态。
+		pa.abortServeSession(s)
+		return 0
+	}
 	go pa.updateGameStatus()
-	pa.EndPoint.State = 1
-	pa.EndPoint.Enable = true
-	self, _ := s.UserMe()
-	pa.EndPoint.Nickname = self.Nickname
-	pa.EndPoint.UserID = FormatDiceIDKook(self.ID)
-	log.Infof("KOOK 连接成功，账号<%s>(%s)", pa.EndPoint.Nickname, pa.EndPoint.UserID)
-	d := pa.EndPoint.Session.Parent
-	d.LastUpdatedTime = time.Now().Unix()
-	d.Save(false)
+	_, _, selfID, selfName := pa.endpointSnapshot()
+	log.Infof("KOOK 连接成功，账号<%s>(%s)", selfName, selfID)
+	pa.stopKookAutoReconnect()
+	pa.saveState()
 	return 0
 }
 
 func (pa *PlatformAdapterKook) DoRelogin() bool {
 	log := zap.S().Named(logger.LogKeyAdapter)
 	log.Infof("正在重新登录KOOK服务……")
-	pa.EndPoint.State = 0
-	pa.EndPoint.Enable = false
-	if pa.IntentSession != nil {
-		_ = pa.IntentSession.Close()
+	ok := false
+	finished := pa.runKookOpWithTimeout("重新登录", func() { ok = pa.doReloginInternal() })
+	return finished && ok
+}
+
+func (pa *PlatformAdapterKook) doReloginInternal() bool {
+	session := pa.getSession()
+	if session != nil {
+		// 重登的语义是保持端点启用；这里不能写 false，否则后面的 Serve
+		// 会被启动期禁用守卫静默拦下，重连永远拉不起来。
+		if !pa.clearSessionAndSetState(session, true, StateConnecting) {
+			// 新会话已经接管；不要覆盖它的状态，也不要再启动第三个会话。
+			pa.closeKookSessionAsync(session)
+			return false
+		}
+		pa.closeKookSessionAsync(session)
+		pa.clearKookResumeState()
+	} else {
+		if !pa.setEndpointStateIfIdle(true, StateConnecting) {
+			// 检查期间已有新会话启动，本次重登不应覆盖它。
+			pa.saveState()
+			return false
+		}
+		pa.sessionMu.Lock()
+		pa.serving = false
+		// 让任何尚未 setSession 的旧 Serve 失效，重登只能有一个新代次。
+		pa.serveToken++
+		pa.sessionMu.Unlock()
+		pa.clearKookResumeState()
 	}
-	pa.IntentSession = nil
+	pa.saveState()
 	return pa.Serve() == 0
 }
 
 func (pa *PlatformAdapterKook) SetEnable(enable bool) {
+	if enable {
+		pa.runKookOpWithTimeout("启用", func() { pa.setEnableInternal(true) })
+		return
+	}
+	pa.setEnableInternal(false)
+}
+
+func (pa *PlatformAdapterKook) setEnableInternal(enable bool) {
 	log := zap.S().Named(logger.LogKeyAdapter)
 	if enable {
 		log.Infof("正在启用KOOK服务……")
-		if pa.IntentSession == nil {
+		session := pa.getSession()
+		if session == nil {
+			// Serve 要求端点已启用，否则会被启动期禁用守卫静默拦下
+			// （只留一条“正在启用”日志，实际不连接）。这里先置启用再启动。
+			if !pa.setEndpointStateIfIdle(true, StateConnecting) {
+				return
+			}
+			pa.saveState()
 			pa.Serve()
 			return
 		}
-		err := pa.IntentSession.Open()
-		if err != nil {
-			log.Errorf("与KOOK服务进行连接时出错:%s", err)
-			pa.EndPoint.State = 0
-			pa.EndPoint.Enable = false
+		if session.IsClosed() || !pa.isServingSession(session) {
+			// 启动期禁用可能留下“已关闭但仍挂在 IntentSession 上”的会话。
+			// 不能先把它写成 Connected 再发现 !serving 就返回；先清掉旧会话，
+			// 再按无会话路径重建，UI 才不会显示“已连接但收不到事件”。
+			pa.clearSessionIf(session)
+			pa.closeKookSessionAsync(session)
+			pa.setEndpointStateIfIdle(true, StateConnecting)
+			pa.saveState()
+			pa.Serve()
+			return
+		}
+		// 与 Serve 相同：先置已连接状态，避免 Open 启动期的首条事件回复被丢弃。
+		if !pa.setSessionStateIfCurrent(session, true, StateConnected) {
+			pa.abortServeSession(session)
+			return
+		}
+		if !pa.isServingSession(session) {
+			pa.abortServeSession(session)
+			return
+		}
+		err := session.Open()
+		if err != nil && !errors.Is(err, kook.ErrWSAlreadyOpen) {
+			if errors.Is(err, kook.ErrSessionClosed) || session.IsClosed() {
+				return
+			}
+			if kook.IsPermanentAuthError(err) {
+				log.Errorf("与KOOK服务进行连接时出错:%s", err)
+				if pa.clearSessionAndSetState(session, false, StateConnectionFailed) {
+					pa.clearKookResumeState()
+					pa.saveState()
+				}
+				pa.closeKookSessionAsync(session)
+				return
+			}
+			log.Warnf("与KOOK服务连接遇到瞬时错误，保留会话并后台重连: %v", err)
+			if !pa.isServingSession(session) {
+				pa.abortServeSession(session)
+				return
+			}
+			pa.setSessionStateIfCurrent(session, true, StateConnecting)
+			if session.IsOpen() {
+				pa.setSessionStateIfCurrent(session, true, StateConnected)
+			}
+			pa.saveKookResumeState(session)
+			session.ReconnectAsync()
+			pa.saveState()
+			return
+		}
+		if !pa.setSessionStateIfCurrent(session, true, StateConnected) {
+			pa.abortServeSession(session)
 			return
 		}
 		pa.updateGameStatus()
-		pa.EndPoint.State = 1
-		pa.EndPoint.Enable = true
-		log.Infof("KOOK 连接成功，账号<%s>(%s)", pa.EndPoint.Nickname, pa.EndPoint.UserID)
+		_, _, selfID, selfName := pa.endpointSnapshot()
+		log.Infof("KOOK 连接成功，账号<%s>(%s)", selfName, selfID)
+		pa.stopKookAutoReconnect()
 	} else {
-		if pa.IntentSession == nil {
+		pa.stopKookAutoReconnect()
+		session := pa.getSession()
+		if session == nil {
+			if pa.setEndpointStateIfIdle(false, StateDisconnected) {
+				pa.sessionMu.Lock()
+				pa.serving = false
+				// 使尚未 setSession 的 Serve 失效，防止禁用后又被拉起来。
+				pa.serveToken++
+				pa.sessionMu.Unlock()
+				pa.clearKookResumeState()
+				pa.saveState()
+				return
+			}
+			// 检查期间有新会话启动，继续走正常停止流程。
+			session = pa.getSession()
+			if session == nil {
+				pa.saveState()
+				return
+			}
+		}
+		if !pa.clearSessionAndSetState(session, false, StateDisconnected) {
+			pa.closeKookSessionAsync(session)
 			return
 		}
-		pa.EndPoint.State = 0
-		pa.EndPoint.Enable = false
-		_ = pa.IntentSession.Close()
-		pa.IntentSession = nil
+		pa.closeKookSessionAsync(session)
+		pa.clearKookResumeState()
 	}
-	d := pa.EndPoint.Session.Parent
-	d.LastUpdatedTime = time.Now().Unix()
-	d.Save(false)
+	pa.saveState()
 }
 
 func (pa *PlatformAdapterKook) SendSegmentToGroup(ctx *MsgContext, groupID string, msg []message.IMessageElement, flag string) {
@@ -414,16 +1491,19 @@ func (pa *PlatformAdapterKook) SendSegmentToPerson(ctx *MsgContext, userID strin
 
 func (pa *PlatformAdapterKook) SendToPerson(ctx *MsgContext, userID string, text string, flag string) {
 	log := zap.S().Named(logger.LogKeyAdapter)
-	if !pa.EndPoint.Enable || pa.IntentSession == nil || pa.EndPoint.State != 1 {
+	session := pa.getSession()
+	enable, state, selfID, selfName := pa.endpointSnapshot()
+	if !enable || session == nil || state != StateConnected {
 		return
 	}
-	channel, err := pa.IntentSession.UserChatCreate(ExtractKookUserID(userID))
+	channel, err := session.UserChatCreate(ExtractKookUserID(userID))
 	if err != nil {
 		log.Errorf("创建Kook用户#%s的私聊频道时出错:%s", userID, err)
 		return
 	}
 	resp, err := pa.SendToChannelRaw(channel.Code, text, true)
 	if err != nil {
+		log.Errorf("Kook私聊消息发送失败: user=%s err=%v", userID, err)
 		return
 	}
 	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
@@ -431,19 +1511,22 @@ func (pa *PlatformAdapterKook) SendToPerson(ctx *MsgContext, userID string, text
 		MessageType: "private",
 		Message:     text,
 		Sender: SenderBase{
-			UserID:   pa.EndPoint.UserID,
-			Nickname: pa.EndPoint.Nickname,
+			UserID:   selfID,
+			Nickname: selfName,
 		},
 		RawID: resp.MsgID,
 	}, flag)
 }
 
 func (pa *PlatformAdapterKook) SendToGroup(ctx *MsgContext, groupID string, text string, flag string) {
-	if !pa.EndPoint.Enable || pa.IntentSession == nil || pa.EndPoint.State != 1 {
+	session := pa.getSession()
+	enable, state, selfID, selfName := pa.endpointSnapshot()
+	if !enable || session == nil || state != StateConnected {
 		return
 	}
 	resp, err := pa.SendToChannelRaw(ExtractKookChannelID(groupID), text, false)
 	if err != nil {
+		zap.S().Named(logger.LogKeyAdapter).Errorf("Kook群聊消息发送失败: group=%s err=%v", groupID, err)
 		return
 	}
 	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
@@ -452,8 +1535,8 @@ func (pa *PlatformAdapterKook) SendToGroup(ctx *MsgContext, groupID string, text
 		Message:     text,
 		GroupID:     groupID,
 		Sender: SenderBase{
-			UserID:   pa.EndPoint.UserID,
-			Nickname: pa.EndPoint.Nickname,
+			UserID:   selfID,
+			Nickname: selfName,
 		},
 		RawID: resp.MsgID,
 	}, flag)
@@ -461,10 +1544,12 @@ func (pa *PlatformAdapterKook) SendToGroup(ctx *MsgContext, groupID string, text
 
 func (pa *PlatformAdapterKook) SendFileToPerson(ctx *MsgContext, userID string, path string, flag string) {
 	log := zap.S().Named(logger.LogKeyAdapter)
-	if !pa.EndPoint.Enable || pa.IntentSession == nil || pa.EndPoint.State != 1 {
+	session := pa.getSession()
+	enable, state, selfID, selfName := pa.endpointSnapshot()
+	if !enable || session == nil || state != StateConnected {
 		return
 	}
-	channel, err := pa.IntentSession.UserChatCreate(ExtractKookUserID(userID))
+	channel, err := session.UserChatCreate(ExtractKookUserID(userID))
 	if err != nil {
 		log.Errorf("创建Kook用户#%s的私聊频道时出错:%s", userID, err)
 		return
@@ -482,15 +1567,17 @@ func (pa *PlatformAdapterKook) SendFileToPerson(ctx *MsgContext, userID string, 
 			},
 		},
 		Sender: SenderBase{
-			UserID:   pa.EndPoint.UserID,
-			Nickname: pa.EndPoint.Nickname,
+			UserID:   selfID,
+			Nickname: selfName,
 		},
 		RawID: resp.MsgID,
 	}, flag)
 }
 
 func (pa *PlatformAdapterKook) SendFileToGroup(ctx *MsgContext, groupID string, path string, flag string) {
-	if !pa.EndPoint.Enable || pa.IntentSession == nil || pa.EndPoint.State != 1 {
+	session := pa.getSession()
+	enable, state, selfID, selfName := pa.endpointSnapshot()
+	if !enable || session == nil || state != StateConnected {
 		return
 	}
 	resp, err := pa.SendFileToChannelRaw(ExtractKookChannelID(groupID), path, false)
@@ -507,8 +1594,8 @@ func (pa *PlatformAdapterKook) SendFileToGroup(ctx *MsgContext, groupID string, 
 		},
 		GroupID: groupID,
 		Sender: SenderBase{
-			UserID:   pa.EndPoint.UserID,
-			Nickname: pa.EndPoint.Nickname,
+			UserID:   selfID,
+			Nickname: selfName,
 		},
 		RawID: resp.MsgID,
 	}, flag)
@@ -520,28 +1607,37 @@ func (pa *PlatformAdapterKook) MemberKick(_ string, _ string) {}
 
 func (pa *PlatformAdapterKook) EditMessage(ctx *MsgContext, msgID, message string) {
 	log := zap.S().Named(logger.LogKeyAdapter)
+	session := pa.getSession()
+	if session == nil {
+		return
+	}
 	req := kook.MessageUpdate{
 		MessageUpdateBase: kook.MessageUpdateBase{
 			MsgID:   msgID,
 			Content: message,
 		},
 	}
-	if err := pa.IntentSession.MessageUpdate(&req); err != nil {
+	if err := session.MessageUpdate(&req); err != nil {
 		log.Errorf("更新KOOK消息失败: %v", err)
 	}
 }
 
 func (pa *PlatformAdapterKook) RecallMessage(ctx *MsgContext, msgID string) {
 	// TODO: not tested
-	if !pa.EndPoint.Enable || pa.IntentSession == nil || pa.EndPoint.State != 1 {
+	session := pa.getSession()
+	enable, state, _, _ := pa.endpointSnapshot()
+	if !enable || session == nil || state != StateConnected {
 		return
 	}
-	_ = pa.IntentSession.MessageDelete(msgID)
+	_ = session.MessageDelete(msgID)
 }
 
 func (pa *PlatformAdapterKook) SendFileToChannelRaw(id string, path string, private bool) (*kook.MessageResp, error) {
 	log := zap.S().Named(logger.LogKeyAdapter)
-	bot := pa.IntentSession
+	bot := pa.getSession()
+	if bot == nil {
+		return nil, errors.New("KOOK 会话未建立")
+	}
 	e, err := message.FilepathToFileElement(path)
 	if err != nil {
 		log.Errorf("向Kook频道#%s发送文件[path=%s]时出错:%s", id, path, err)
@@ -591,9 +1687,65 @@ func (pa *PlatformAdapterKook) SendFileToChannelRaw(id string, path string, priv
 	return resp, err
 }
 
+// maxKookSingleMessageRunes 是单条 KOOK 文本消息的保守长度上限。
+// 卡片整条超限时会直接发送失败，超长回复改走纯文本分段。
+const maxKookSingleMessageRunes = 4000
+
+// splitKookText 按 rune 上限切分文本，优先在换行处断开。
+func splitKookText(text string, maxRunes int) []string {
+	if maxRunes <= 0 {
+		return []string{text}
+	}
+	runes := []rune(text)
+	var chunks []string
+	for len(runes) > maxRunes {
+		cut := maxRunes
+		for i := maxRunes - 1; i > 0; i-- {
+			if runes[i] == '\n' {
+				cut = i + 1
+				break
+			}
+		}
+		chunks = append(chunks, string(runes[:cut]))
+		runes = runes[cut:]
+	}
+	if len(runes) > 0 {
+		chunks = append(chunks, string(runes))
+	}
+	return chunks
+}
+
+// sendKookTextChunks 把超长回复拆成多条纯文本消息，避免单张卡片超限整条丢失。
+func (pa *PlatformAdapterKook) sendKookTextChunks(id, text string, private bool) (*kook.MessageResp, error) {
+	log := zap.S().Named(logger.LogKeyAdapter)
+	var last *kook.MessageResp
+	for _, chunk := range splitKookText(text, maxKookSingleMessageRunes) {
+		if strings.TrimSpace(chunk) == "" {
+			continue
+		}
+		resp, err := pa.MessageCreateRaw(kook.MessageCreateBase{
+			Content: chunk,
+			Type:    kook.MessageTypeText,
+		}, id, private)
+		if err != nil {
+			log.Errorf("向Kook频道#%s分段发送失败:%s", id, err)
+			return last, err
+		}
+		last = resp
+	}
+	return last, nil
+}
+
 func (pa *PlatformAdapterKook) SendToChannelRaw(id string, text string, private bool) (*kook.MessageResp, error) {
 	log := zap.S().Named(logger.LogKeyAdapter)
-	bot := pa.IntentSession
+	bot := pa.getSession()
+	if bot == nil {
+		return nil, errors.New("KOOK 会话未建立")
+	}
+	// 超长回复不塞单张卡片，按纯文本分段发送。
+	if utf8.RuneCountInString(text) > maxKookSingleMessageRunes {
+		return pa.sendKookTextChunks(id, text, private)
+	}
 	elem := message.ConvertStringMessage(text)
 	// var err error
 	streamToByte := func(stream io.Reader) []byte {
@@ -680,6 +1832,15 @@ func (pa *PlatformAdapterKook) SendToChannelRaw(id string, text string, private 
 	resp, err := pa.MessageCreateRaw(msgb, id, private)
 	if err != nil {
 		log.Errorf("向Kook频道#%s发送消息时出错:%s", id, err)
+		// 卡片发送失败（过长/格式/服务端拒绝）时回退纯文本，避免整条丢失。
+		fallbackResp, fallbackErr := pa.MessageCreateRaw(kook.MessageCreateBase{
+			Content: text,
+			Type:    kook.MessageTypeText,
+		}, id, private)
+		if fallbackErr == nil {
+			return fallbackResp, nil
+		}
+		log.Errorf("向Kook频道#%s纯文本回退失败:%s", id, fallbackErr)
 	}
 	return resp, err
 }
@@ -717,7 +1878,10 @@ func antiMarkdownFormat(text string) string {
 }
 
 func (pa *PlatformAdapterKook) MessageCreateRaw(base kook.MessageCreateBase, id string, isPrivate bool) (*kook.MessageResp, error) {
-	bot := pa.IntentSession
+	bot := pa.getSession()
+	if bot == nil {
+		return nil, errors.New("KOOK 会话未建立")
+	}
 	if isPrivate {
 		resp, err := bot.DirectMessageCreate(&kook.DirectMessageCreate{ChatCode: id, MessageCreateBase: base})
 		return resp, err
@@ -763,12 +1927,16 @@ func ExtractKookGuildID(id string) string {
 
 func (pa *PlatformAdapterKook) QuitGroup(_ *MsgContext, groupID string) {
 	log := zap.S().Named(logger.LogKeyAdapter)
-	channel, err := pa.IntentSession.ChannelView(ExtractKookChannelID(groupID))
+	session := pa.getSession()
+	if session == nil {
+		return
+	}
+	channel, err := session.ChannelView(ExtractKookChannelID(groupID))
 	if err != nil {
 		log.Errorf("获取Kook频道信息#%s时出错:%s", groupID, err.Error())
 		return
 	}
-	err = pa.IntentSession.GuildLeave(channel.GuildID)
+	err = session.GuildLeave(channel.GuildID)
 	if err != nil {
 		log.Errorf("退出Kook服务器#%s时出错:%s", channel.GuildID, err.Error())
 		return
@@ -777,11 +1945,15 @@ func (pa *PlatformAdapterKook) QuitGroup(_ *MsgContext, groupID string) {
 
 func (pa *PlatformAdapterKook) SetGroupCardName(ctx *MsgContext, name string) {
 	log := zap.S().Named(logger.LogKeyAdapter)
+	session := pa.getSession()
+	if session == nil {
+		return
+	}
 	nick := &kook.GuildNickname{}
 	nick.GuildID = ExtractKookGuildID(ctx.Group.GuildID)
 	nick.Nickname = name
 	nick.UserID = ExtractKookUserID(ctx.Player.UserID)
-	err := pa.IntentSession.GuildNickname(nick)
+	err := session.GuildNickname(nick)
 	if err != nil {
 		log.Errorf("修改Kook用户#%s在服务器#%s(来源频道#%s)的昵称时出错:%s", ctx.Player.UserID, ctx.Group.GuildID, ctx.Group.GroupID, err.Error())
 		return
@@ -805,6 +1977,42 @@ func trimHTML(src string) string {
 	re = regexp.MustCompile(`\s{2,}`)
 	src = re.ReplaceAllString(src, "\n")
 	return strings.TrimSpace(src)
+}
+
+// kookPlainMessage builds the common envelope for message types that carry
+// their payload in Content (plain text and rich media).
+func (pa *PlatformAdapterKook) kookPlainMessage(common *kook.EventHandlerCommonContext, author kook.User, guildID, content string) *Message {
+	if common == nil || common.Common == nil {
+		return nil
+	}
+	msg := new(Message)
+	msg.Time = common.Common.MsgTimestamp
+	msg.RawID = common.Common.MsgID
+	msg.Platform = "KOOK"
+	msg.Message = content
+	send := new(SenderBase)
+	send.UserID = FormatDiceIDKook(common.Common.AuthorID)
+	send.Nickname = author.Nickname
+	send.IsRobot = author.Bot
+	if common.Common.ChannelType == "PERSON" {
+		msg.MessageType = "private"
+	} else {
+		msg.MessageType = "group"
+		msg.GroupID = FormatDiceIDKookChannel(common.Common.TargetID)
+		msg.GuildID = FormatDiceIDKookGuild(guildID)
+	}
+	msg.Sender = *send
+	return msg
+}
+
+// kookMediaCQCode renders an attachment URL as the CQ code the core and
+// extensions already understand for the matching media type.
+func kookMediaCQCode(kind, content string) string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return ""
+	}
+	return fmt.Sprintf("[CQ:%s,file=some%s,url=%s]", kind, kind, content)
 }
 
 func (pa *PlatformAdapterKook) toStdMessage(ctx *kook.KmarkdownMessageContext) *Message {
@@ -840,19 +2048,37 @@ func (pa *PlatformAdapterKook) toStdMessage(ctx *kook.KmarkdownMessageContext) *
 }
 
 func (pa *PlatformAdapterKook) checkIfGuildAdmin(ctx *kook.KmarkdownMessageContext) bool {
-	user, err := pa.IntentSession.UserView(ctx.Common.AuthorID, kook.UserViewWithGuildID(ctx.Extra.GuildID))
+	// 每条消息都做 UserView + GuildView 会让回复被两次 REST 往返拖慢。
+	// 管理员判断按 guild+user 做短 TTL 缓存，权限变化最多延迟 2 分钟生效。
+	cacheKey := ctx.Extra.GuildID + "\x00" + ctx.Common.AuthorID
+	if admin, ok := pa.cachedGuildAdmin(cacheKey); ok {
+		return admin
+	}
+	session := pa.getSession()
+	if session == nil {
+		return false
+	}
+	user, err := session.UserView(ctx.Common.AuthorID, kook.UserViewWithGuildID(ctx.Extra.GuildID))
 	if err != nil {
+		// 短负缓存：REST 故障时避免每条消息都同步重试并拖住事件队列。
+		pa.storeGuildAdminTTL(cacheKey, false, kookAdminErrorCacheTTL)
 		return false
 	}
 	perm := pa.memberPermissions(&ctx.Extra.GuildID, &ctx.Common.TargetID, ctx.Common.AuthorID, user.Roles)
-	return perm&int64(RolePermissionAdmin|RolePermissionBanUser|RolePermissionKickUser) > 0 || perm == int64(RolePermissionAll)
+	admin := perm&int64(RolePermissionAdmin|RolePermissionBanUser|RolePermissionKickUser) > 0 || perm == int64(RolePermissionAll)
+	pa.storeGuildAdmin(cacheKey, admin)
+	return admin
 }
 
 func (pa *PlatformAdapterKook) memberPermissions(guildID *string, _ *string, userID string, roles []int64) (apermissions int64) {
 	log := zap.S().Named(logger.LogKeyAdapter)
-	guild, err := pa.IntentSession.GuildView(*guildID)
-	if err != nil {
-		log.Errorf("Kook GuildView 错误:%s", err)
+	session := pa.getSession()
+	if session == nil {
+		return 0
+	}
+	guild := pa.cachedGuild(session, *guildID)
+	if guild == nil {
+		log.Errorf("Kook GuildView 错误: guild=%s", *guildID)
 		return 0
 	}
 	if userID == guild.MasterID {

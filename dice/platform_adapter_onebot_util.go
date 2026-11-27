@@ -245,6 +245,7 @@ func (p *PlatformAdapterOnebot) handleGroupDecreaseAction(req gjson.Result, _ *e
 			return nil
 		}
 		group.DiceIDExistsMap.Delete(p.EndPoint.UserID)
+		group.MarkDiceDeparted(p.EndPoint.UserID)
 		group.MarkDirty(session.Parent)
 		p.logger.Info(txt)
 		if pendingQuit == nil || pendingQuit.Origin != QuitOriginAutoInactive || !session.Parent.Config.QuitInactiveNoticeSummaryMode {
@@ -1240,7 +1241,10 @@ func (p *PlatformAdapterOnebot) resolveLocalAsset(rel string) (string, error) {
 	rel = strings.TrimPrefix(rel, "./")
 	rel = filepath.Clean(rel)
 	rel = filepath.FromSlash(rel)
-	if filepath.IsAbs(rel) {
+	// Windows 下 "/etc/passwd" 这类 root-relative 路径 filepath.IsAbs 可能为 false，
+	// 但同样不能当作相对 data/ 路径使用。
+	if filepath.IsAbs(rel) || filepath.VolumeName(rel) != "" ||
+		strings.HasPrefix(rel, "/") || strings.HasPrefix(rel, "\\") {
 		return "", fmt.Errorf("refuse absolute path: %s", rel)
 	}
 	// 防止裸 data/ 自身被当作文件访问
@@ -1352,6 +1356,8 @@ func (p *PlatformAdapterOnebot) convertSealMsgToMessageChain(msg []message.IMess
 			if fileVal == "" {
 				continue
 			}
+			// 海豹内部用 files:// 表示共享文件系统；OneBot 协议端只认 file://。
+			fileVal = normalizeOnebotFileValue(fileVal)
 			if !hasURLScheme(fileVal) {
 				if resolved, err := p.resolveLocalAsset(fileVal); err == nil {
 					fileVal = resolved
@@ -1564,4 +1570,14 @@ func (p *PlatformAdapterOnebot) makeCtx(req gjson.Result) *MsgContext {
 	}
 
 	return ctx
+}
+
+// normalizeOnebotFileValue 把海豹内部的 files:// 共享文件引用转成 OneBot
+// 协议端可识别的 file://；其它 URL 和普通路径原样返回。
+func normalizeOnebotFileValue(fileVal string) string {
+	const filesScheme = "files://"
+	if len(fileVal) >= len(filesScheme) && strings.EqualFold(fileVal[:len(filesScheme)], filesScheme) {
+		return "file://" + fileVal[len(filesScheme):]
+	}
+	return fileVal
 }

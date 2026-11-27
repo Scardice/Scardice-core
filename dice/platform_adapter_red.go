@@ -735,6 +735,7 @@ func (pa *PlatformAdapterRed) GetGroupInfoAsync(_ string) {
 						if _, exists := groupRecord.DiceIDExistsMap.Load(diceId); exists {
 							// 不在群里了，更新信息
 							groupRecord.DiceIDExistsMap.Delete(diceId)
+							groupRecord.MarkDiceDeparted(diceId)
 							groupRecord.MarkDirty(session.Parent)
 						}
 					} else if groupRecord.GroupName != group.GroupName {

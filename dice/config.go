@@ -2482,11 +2482,40 @@ func (d *Dice) loadGroups() {
 		if groupInfo.DiceIDExistsMap == nil {
 			groupInfo.DiceIDExistsMap = new(SyncMap[string, bool])
 		}
+		if groupInfo.DiceIDDepartedMap == nil {
+			groupInfo.DiceIDDepartedMap = new(SyncMap[string, bool])
+		}
 		if groupInfo.BotList == nil {
 			groupInfo.BotList = new(SyncMap[string, bool])
 		}
-		if groupInfo.InactivatedExtSet == nil {
-			groupInfo.InactivatedExtSet = StringSet{}
+		groupInfo.ensureInactivatedSet()
+		// 先校验持久化的 LogCurID 是否仍指向当前日志。Web UI 删除当前日志或
+		// 数据库恢复后，旧 ID 会让 LogAppendByID 永久失败，必须在这里按名字自愈。
+		repairPersistedLogState(d, &groupInfo)
+		// 恢复日志 seq 持久基线：否则重启后会回退到 DB MAX(seq)，
+		// 把 log off 期间的消息当成断层补录。
+		groupInfo.initLogSeqFromPersisted()
+		if groupInfo.LogOn && groupInfo.LogCurID > 0 {
+			// 重启前已经落库的消息比持久基线更新；用 DB MAX(seq) 校准，
+			// 否则会把已记录消息再次算入 gap。
+			if seq, err := service.LogGetLastSeq(d.DBOperator, groupInfo.LogCurID); err == nil {
+				if seq > 0 {
+					groupInfo.advanceLogSeq(seq, nil)
+				}
+				// 校准成功（包括空日志的 0）就无需在首条消息时再查一次库。
+				// 失败则保持未校准，由 ext_log 的 calibrateLogSeqBaseline 重试。
+				groupInfo.markLogSeqCalibrated()
+			}
+		} else if !groupInfo.LogOn && groupInfo.LogCurID > 0 && groupInfo.LogCurName != "" {
+			// 日志关闭但保留了日志名：同样用 DB MAX(seq) 校准“最后记录到哪”，
+			// 供 off 状态断层检测使用。LogSeenSeq 可能比 DB MAX 新（关闭期间
+			// 看到过消息），但那是运行时/持久化的已见游标，不覆盖它。
+			if seq, err := service.LogGetLastSeq(d.DBOperator, groupInfo.LogCurID); err == nil {
+				if seq > 0 {
+					groupInfo.advanceLogSeq(seq, nil)
+				}
+				groupInfo.markLogSeqCalibrated()
+			}
 		}
 
 		var toDelete []string
@@ -2704,8 +2733,11 @@ func (d *Dice) ApplyExtDefaultSettings() {
 				group.ensureInactivatedSet()
 				changed := false
 				for name := range autoActiveNames {
-					if _, exists := group.InactivatedExtSet[name]; exists {
+					_, inUnion := group.InactivatedExtSet[name]
+					_, inUser := group.UserInactivatedExtSet[name]
+					if inUnion || inUser {
 						delete(group.InactivatedExtSet, name)
+						delete(group.UserInactivatedExtSet, name)
 						changed = true
 					}
 				}

@@ -23,6 +23,9 @@ const (
 var DefaultSealLogger = NewGormLogger(zap.NewNop())
 
 func InitLogger(level zapcore.Level, ui *UIWriter) *zap.SugaredLogger {
+	if ui != nil {
+		ui.EnableHistory(filepath.Join("data", "ui.log"))
+	}
 	core := newLoggerCore(level, ui, zapcore.AddSync(os.Stdout), "data")
 	logger := zap.New(core, zap.AddCaller(), zap.AddStacktrace(zap.ErrorLevel))
 

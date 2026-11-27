@@ -9,8 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/samber/lo"
 	ds "github.com/sealdice/dicescript"
+
+	"Scardice-core/logger"
 )
 
 func aliasMapForCtx(ctx *MsgContext) map[string][]string {
@@ -37,8 +38,10 @@ func _VarSetValueV1(ctx *MsgContext, s string, v *VMValue) {
 }
 
 func VarSetValue(ctx *MsgContext, s string, v *ds.VMValue) {
+	if ctx == nil || ctx.Dice == nil || v == nil {
+		return
+	}
 	ctx.CreateVmIfNotExists()
-	am := ctx.Dice.AttrsManager
 	name := GetValueNameByAlias(s, aliasMapForCtx(ctx))
 	vClone := v.Clone()
 
@@ -57,56 +60,67 @@ func VarSetValue(ctx *MsgContext, s string, v *ds.VMValue) {
 	// 个人变量
 	if strings.HasPrefix(s, "$m") {
 		if ctx.Session != nil && ctx.Player != nil {
-			playerAttrs := lo.Must(am.LoadById(ctx.Player.UserID))
-			playerAttrs.Store(name, vClone)
+			if playerAttrs := varLoadAttrsById(ctx, ctx.Player.UserID); playerAttrs != nil {
+				playerAttrs.Store(name, vClone)
+			}
 		}
 		return
 	}
 
 	// 群变量
 	if ctx.Group != nil && strings.HasPrefix(s, "$g") {
-		groupAttrs := lo.Must(am.LoadById(ctx.Group.GroupID))
-		groupAttrs.Store(s, vClone)
+		if groupAttrs := varLoadAttrsById(ctx, ctx.Group.GroupID); groupAttrs != nil {
+			groupAttrs.Store(s, vClone)
+		}
 		return
 	}
 
 	// 个人属性
 	if ctx.Session != nil && ctx.Player != nil {
-		curAttrs := lo.Must(am.LoadByCtx(ctx))
-		curAttrs.Store(name, vClone)
+		if curAttrs := varLoadAttrsByCtx(ctx); curAttrs != nil {
+			curAttrs.Store(name, vClone)
+		}
 	}
 }
 
 func VarDelValue(ctx *MsgContext, s string) {
-	am := ctx.Dice.AttrsManager
+	if ctx == nil || ctx.Dice == nil {
+		return
+	}
 	name := GetValueNameByAlias(s, aliasMapForCtx(ctx))
 
 	// 临时变量
 	if strings.HasPrefix(s, "$t") {
-		ctx.Player.ValueMapTemp.Delete(s)
-		curAttrs := lo.Must(am.LoadByCtx(ctx))
-		curAttrs.Delete(name)
+		if ctx.Player != nil && ctx.Player.ValueMapTemp != nil {
+			ctx.Player.ValueMapTemp.Delete(s)
+		}
+		if curAttrs := varLoadAttrsByCtx(ctx); curAttrs != nil {
+			curAttrs.Delete(name)
+		}
 		return
 	}
 
 	// 个人变量
 	if strings.HasPrefix(s, "$m") {
 		if ctx.Session != nil && ctx.Player != nil {
-			playerAttrs := lo.Must(am.LoadById(ctx.Player.UserID))
-			playerAttrs.Delete(name)
+			if playerAttrs := varLoadAttrsById(ctx, ctx.Player.UserID); playerAttrs != nil {
+				playerAttrs.Delete(name)
+			}
 			return
 		}
 	}
 
 	// 群变量
 	if ctx.Group != nil && strings.HasPrefix(s, "$g") {
-		groupAttrs := lo.Must(am.LoadById(ctx.Group.GroupID))
-		groupAttrs.Delete(s)
+		if groupAttrs := varLoadAttrsById(ctx, ctx.Group.GroupID); groupAttrs != nil {
+			groupAttrs.Delete(s)
+		}
 		return
 	}
 
-	curAttrs := lo.Must(am.LoadByCtx(ctx))
-	curAttrs.Delete(name)
+	if curAttrs := varLoadAttrsByCtx(ctx); curAttrs != nil {
+		curAttrs.Delete(name)
+	}
 }
 
 func VarGetValueInt64(ctx *MsgContext, s string) (int64, bool) {
@@ -134,8 +148,10 @@ func VarGetValueComputed(ctx *MsgContext, s string) (string, bool) {
 }
 
 func VarGetValue(ctx *MsgContext, s string) (*ds.VMValue, bool) {
+	if ctx == nil || ctx.Dice == nil {
+		return nil, false
+	}
 	name := GetValueNameByAlias(s, aliasMapForCtx(ctx))
-	am := ctx.Dice.AttrsManager
 
 	// 临时变量
 	if strings.HasPrefix(s, "$t") {
@@ -146,6 +162,9 @@ func VarGetValue(ctx *MsgContext, s string) (*ds.VMValue, bool) {
 			}
 		}
 		// 跟入群致辞闪退的一个bug有关，当时是报 _v, exists := ctx.Player.ValueMapTemp.Get(s) 这一行 nil pointer
+		if ctx.Player == nil {
+			return nil, false
+		}
 		if ctx.Player.ValueMapTemp == nil {
 			ctx.Player.ValueMapTemp = &ds.ValueMap{}
 			return nil, false
@@ -158,24 +177,67 @@ func VarGetValue(ctx *MsgContext, s string) (*ds.VMValue, bool) {
 	// 个人全局变量
 	if strings.HasPrefix(s, "$m") {
 		if ctx.Session != nil && ctx.Player != nil {
-			playerAttrs := lo.Must(am.LoadById(ctx.Player.UserID))
-			return playerAttrs.LoadX(name)
+			if playerAttrs := varLoadAttrsById(ctx, ctx.Player.UserID); playerAttrs != nil {
+				return playerAttrs.LoadX(name)
+			}
+			return nil, false
 		}
 	}
 
 	// 群变量
 	if ctx.Group != nil && strings.HasPrefix(s, "$g") {
-		groupAttrs := lo.Must(am.LoadById(ctx.Group.GroupID))
-		return groupAttrs.LoadX(s)
+		if groupAttrs := varLoadAttrsById(ctx, ctx.Group.GroupID); groupAttrs != nil {
+			return groupAttrs.LoadX(s)
+		}
+		return nil, false
 	}
 
 	// 个人群变量
 	if ctx.Player != nil {
-		curAttrs := lo.Must(am.LoadByCtx(ctx))
-		return curAttrs.LoadX(name)
+		if curAttrs := varLoadAttrsByCtx(ctx); curAttrs != nil {
+			return curAttrs.LoadX(name)
+		}
 	}
 
 	return nil, false
+}
+
+// varLoadAttrsById 安全加载属性数据。
+// 读库失败只影响当前这次变量读写：记录错误并返回 nil，由调用方跳过，
+// 不能再用 lo.Must 把单条消息的数据库错误升级成整个进程的 panic。
+func varLoadAttrsById(ctx *MsgContext, id string) *AttributesItem {
+	if ctx == nil || ctx.Dice == nil || ctx.Dice.AttrsManager == nil || id == "" {
+		return nil
+	}
+	attrs, err := ctx.Dice.AttrsManager.LoadById(id)
+	if err != nil {
+		varLogAttrsLoadError(ctx, "LoadById", id, err)
+		return nil
+	}
+	return attrs
+}
+
+// varLoadAttrsByCtx 安全加载当前角色/群属性。
+// LoadByCtx 会先查角色绑定，再回落默认卡，任何一步读库失败都返回 nil。
+func varLoadAttrsByCtx(ctx *MsgContext) *AttributesItem {
+	if ctx == nil || ctx.Dice == nil || ctx.Dice.AttrsManager == nil ||
+		ctx.Group == nil || ctx.Player == nil {
+		return nil
+	}
+	attrs, err := ctx.Dice.AttrsManager.LoadByCtx(ctx)
+	if err != nil {
+		varLogAttrsLoadError(ctx, "LoadByCtx", ctx.Group.GroupID+"-"+ctx.Player.UserID, err)
+		return nil
+	}
+	return attrs
+}
+
+func varLogAttrsLoadError(ctx *MsgContext, op string, id string, err error) {
+	log := logger.M()
+	if ctx != nil && ctx.Dice != nil && ctx.Dice.Logger != nil {
+		log = ctx.Dice.Logger
+	}
+	log.Errorf("变量读取属性失败(%s id=%s): %v", op, id, err)
 }
 
 func _VarGetValueV1(ctx *MsgContext, s string) (*VMValue, bool) {

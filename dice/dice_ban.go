@@ -263,13 +263,15 @@ func (i *BanListInfo) NoticeCheck(uid string, place string, oldRank BanRankType,
 		}
 
 		if !isWhiteGroup {
-			// Quit group immediately before sending other notifications to avoid spam
-			ReplyGroupRaw(ctx,
-				&Message{GroupID: place},
-				DiceFormatTmpl(ctx, "核心:黑名单惩罚_退群"),
-				"")
-			time.Sleep(1 * time.Second)
-			ctx.EndPoint.Adapter.QuitGroup(ctx, place)
+			// Quit group immediately before sending other notifications to avoid spam.
+			// 自动退群先确认骰子账号不是群主，避免把群直接解散。
+			autoQuitGroupAsync(ctx, place, func(ctx *MsgContext) {
+				ReplyGroupRaw(ctx,
+					&Message{GroupID: place},
+					DiceFormatTmpl(ctx, "核心:黑名单惩罚_退群"),
+					"")
+				time.Sleep(1 * time.Second)
+			})
 			return 0
 		}
 		d.Logger.Infof("群<%s>触发\"退出事发群\"的拉黑惩罚，但该群是信任群所以未退群", place)

@@ -5,6 +5,7 @@ package main
 import (
 	"fmt"
 	"math/rand"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -233,6 +234,12 @@ func httpServe(e *echo.Echo, dm *dice.DiceManager, hideUI bool) {
 		// 同步托盘菜单使用的端口，确保自定义端口和自动换端口后链接正确。
 		setTrayPort(portStr)
 
+		log.Infof("[自检] WebUI 尝试监听端口 %s", portStr)
+		// 端口探测通过后写成功日志，UI 音频由日志监听统一触发。
+		if probe, probeErr := net.Listen("tcp", dm.ServeAddress); probeErr == nil {
+			_ = probe.Close()
+			log.Infof("[自检] WebUI 端口 %s 检查通过，开始监听", portStr)
+		}
 		err := e.Start(dm.ServeAddress)
 
 		if err != nil {

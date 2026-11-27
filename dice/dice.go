@@ -22,6 +22,7 @@ import (
 	"github.com/tidwall/buntdb"
 	"go.uber.org/zap"
 
+	"Scardice-core/bootsound"
 	"Scardice-core/dice/events"
 	"Scardice-core/logger"
 	"Scardice-core/utils/dboperator/engine"
@@ -234,6 +235,12 @@ type Dice struct {
 	AliveNoticeEntry cron.EntryID         `json:"-"             yaml:"-"`
 	JsPrinter        *PrinterFunc         `json:"-"             yaml:"-"`
 
+	DiskSpaceNoticeEntry          cron.EntryID `json:"-" yaml:"-"`
+	diskSpaceNoticeMu             sync.Mutex
+	diskSpaceNoticeLow            bool
+	diskSpaceNoticeLastAlert      time.Time
+	diskSpaceNoticeLastProbeErrAt time.Time
+
 	// JsLoop           *eventloop.EventLoop `yaml:"-" json:"-"`
 	ExtLoopManager   *JsLoopManager  `json:"-" yaml:"-"`
 	JsScriptList     []*JsScriptInfo `json:"-" yaml:"-"`
@@ -389,6 +396,12 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 	d.registerCoreCommands()
 	d.RegisterBuiltinExt()
 	d.loads()
+	// 配置（含 UI 音频开关）加载完成，立即入队核心启动与自检开始音频，
+	// 确保它们排在任何异步加载完成事件（插件/牌堆/账号）之前。
+	if d.Config.StartupSoundEnable {
+		bootsound.PlayEvent(bootsound.EventStartup)
+		bootsound.PlayEvent(bootsound.EventSelfTestStart)
+	}
 	if err := d.ActivateDiceRandomMode(); err != nil && d.Logger != nil {
 		d.Logger.Warnf("[随机源] 激活配置模式失败，已使用 PCG 回退: %v", err)
 	}
@@ -485,7 +498,7 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 					d.ImSession.ServiceAtNew.Range(func(key string, groupInfo *GroupInfo) bool {
 						// Pinenutn: ServiceAtNew重构
 						// TODO: 注意这里的Active可能不需要改
-						if !strings.HasPrefix(key, "PG-") && groupInfo.Active {
+						if !strings.HasPrefix(key, "PG-") && groupInfo.IsActiveRaw() {
 							diceID := i.UserID
 							now := time.Now().Unix()
 
@@ -506,6 +519,7 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 	go refreshGroupInfo()
 
 	d.ApplyAliveNotice()
+	d.ApplyDiskSpaceNotice()
 	if d.Config.JsEnable {
 		d.StartStartupJsLoad()
 	} else {
@@ -1108,6 +1122,37 @@ func (d *Dice) ResetQuitInactiveCron() {
 	}
 }
 
+func (d *Dice) publicDiceEndpoints() []*public_dice.Endpoint {
+	var endpointItems []*public_dice.Endpoint
+	for _, i := range d.ImSession.EndPoints {
+		if !i.IsPublic {
+			continue
+		}
+		endpointItems = append(endpointItems, &public_dice.Endpoint{
+			Platform: i.Platform,
+			UID:      i.UserID,
+			AppID:    publicDiceEndpointAppID(i),
+			IsOnline: i.State == 1,
+		})
+	}
+	return endpointItems
+}
+
+func (d *Dice) publicDiceTickEndpoints() []*public_dice.TickEndpoint {
+	var tickEndpointItems []*public_dice.TickEndpoint
+	for _, i := range d.ImSession.EndPoints {
+		if !i.IsPublic {
+			continue
+		}
+		tickEndpointItems = append(tickEndpointItems, &public_dice.TickEndpoint{
+			UID:      i.UserID,
+			AppID:    publicDiceEndpointAppID(i),
+			IsOnline: i.State == 1,
+		})
+	}
+	return tickEndpointItems
+}
+
 func (d *Dice) PublicDiceEndpointRefresh() {
 	cfg := &d.Config.PublicDiceConfig
 	if !cfg.Enable {
@@ -1118,20 +1163,9 @@ func (d *Dice) PublicDiceEndpointRefresh() {
 		return
 	}
 
-	var endpointItems []*public_dice.Endpoint
-	for _, i := range d.ImSession.EndPoints {
-		if !i.IsPublic {
-			continue
-		}
-		endpointItems = append(endpointItems, &public_dice.Endpoint{
-			Platform: i.Platform,
-			UID:      i.UserID,
-			IsOnline: i.State == 1,
-		})
-	}
 	req := &public_dice.EndpointUpdateRequest{
 		DiceID:    cfg.ID,
-		Endpoints: endpointItems,
+		Endpoints: d.publicDiceEndpoints(),
 	}
 
 	_, code, body := d.PublicDice.EndpointUpdate(req, GenerateVerificationKeyForPublicDice)
@@ -1200,19 +1234,9 @@ func (d *Dice) PublicDiceSetupTick() {
 			d.logPublicDiceStatus("心跳更新跳过：缺少公骰ID", 400)
 			return
 		}
-		var tickEndpointItems []*public_dice.TickEndpoint
-		for _, i := range d.ImSession.EndPoints {
-			if !i.IsPublic {
-				continue
-			}
-			tickEndpointItems = append(tickEndpointItems, &public_dice.TickEndpoint{
-				UID:      i.UserID,
-				IsOnline: i.State == 1,
-			})
-		}
 		req := &public_dice.TickUpdateRequest{
 			ID:        cfg.ID,
-			Endpoints: tickEndpointItems,
+			Endpoints: d.publicDiceTickEndpoints(),
 		}
 		_, code, body := d.PublicDice.TickUpdate(req, GenerateVerificationKeyForPublicDice)
 		if code != 200 {
@@ -1231,6 +1255,17 @@ func (d *Dice) PublicDiceSetupTick() {
 	}()
 
 	d.PublicDiceTimerId, _ = d.Cron.AddFunc("@every 3m", doTickUpdate)
+}
+
+func publicDiceEndpointAppID(endpoint *EndPointInfo) string {
+	if endpoint == nil || endpoint.Platform != "QQ" || endpoint.ProtocolType != "official" {
+		return ""
+	}
+	adapter, ok := endpoint.Adapter.(*PlatformAdapterOfficialQQ)
+	if !ok || adapter == nil {
+		return ""
+	}
+	return adapter.getAppID().String()
 }
 
 func (d *Dice) PublicDiceSetup() {

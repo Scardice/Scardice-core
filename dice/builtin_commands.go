@@ -35,8 +35,12 @@ const dismissConfirmTTL = 10 * time.Minute
 const dismissConfirmCleanupInterval = 30 * time.Minute
 
 const (
-	errGetGroupMemberInfoNil       = "get_group_member_info returned nil"
-	errGetGroupMemberInfoEmptyRole = "empty role from get_group_member_info"
+	errGetGroupMemberInfoNil         = "get_group_member_info returned nil"
+	errGetGroupMemberInfoEmptyRole   = "empty or unknown role from get_group_member_info"
+	errGroupRoleCheckUnsupported     = "adapter does not support group role check"
+	errGetGroupMemberInfoMismatch    = "get_group_member_info identity mismatch"
+	errGetGroupMemberInfoIncomplete  = "get_group_member_info returned incomplete membership data"
+	errCannotResolveBotGroupIdentity = "cannot resolve bot/group id"
 )
 
 func getDismissConfirmKeyForGroup(ctx *MsgContext, operatorID string, targetGroupID string) string {
@@ -96,7 +100,7 @@ func getOnebotBotQQID(ctx *MsgContext) (int64, bool) {
 
 	switch pa := ctx.EndPoint.Adapter.(type) {
 	case *PlatformAdapterOnebot:
-		if pa.sendEmitter == nil {
+		if pa == nil || pa.sendEmitter == nil || pa.ctx == nil {
 			return 0, false
 		}
 		info, err := pa.sendEmitter.GetLoginInfo(pa.ctx)
@@ -126,10 +130,12 @@ func normalizeQQGroupRole(role string) string {
 
 func parseQQGroupRole(role string) (string, bool) {
 	normalized := normalizeQQGroupRole(role)
-	if normalized == "" {
+	switch normalized {
+	case "owner", "admin", "member":
+		return normalized, true
+	default:
 		return "", false
 	}
-	return normalized, true
 }
 
 func checkBotGroupRole(ctx *MsgContext, groupID string) (string, bool) {
@@ -138,43 +144,67 @@ func checkBotGroupRole(ctx *MsgContext, groupID string) (string, bool) {
 	}
 	const bypassCache = true
 
+	botID := ExtractQQEmitterUserID(strings.TrimSpace(ctx.EndPoint.UserID))
+	groupQQID := ExtractQQEmitterGroupID(strings.TrimSpace(groupID))
+	if groupQQID <= 0 {
+		return "cannot resolve group id", false
+	}
+
 	switch pa := ctx.EndPoint.Adapter.(type) {
 	case *PlatformAdapterOnebot:
-		if pa.sendEmitter == nil {
+		if pa == nil || pa.sendEmitter == nil || pa.ctx == nil {
 			return "onebot emitter unavailable", false
 		}
-		botID, ok := getOnebotBotQQID(ctx)
-		if !ok {
+		var ok bool
+		botID, ok = getOnebotBotQQID(ctx)
+		if !ok || botID <= 0 {
 			return "cannot resolve bot qq id", false
 		}
-		memberInfo, err := pa.sendEmitter.GetGroupMemberInfo(pa.ctx, ExtractQQEmitterGroupID(groupID), botID, bypassCache)
+		memberInfo, err := pa.sendEmitter.GetGroupMemberInfo(pa.ctx, groupQQID, botID, bypassCache)
 		if err != nil || memberInfo == nil {
 			if err != nil {
 				return fmt.Sprintf("get_group_member_info failed: %v", err), false
 			}
 			return errGetGroupMemberInfoNil, false
 		}
+		if memberInfo.GroupId != groupQQID || memberInfo.UserId != botID {
+			return errGetGroupMemberInfoMismatch, false
+		}
 		role, ok := parseQQGroupRole(memberInfo.Role)
 		if !ok {
 			return errGetGroupMemberInfoEmptyRole, false
 		}
+		// SnowLuma 在真实查询失败时会返回合成成员记录：既没有昵称也没有入群时间，
+		// 这种记录不能作为“骰子仍在本群”的依据。
+		if role == "member" && memberInfo.Nickname == "" && memberInfo.JoinTime == 0 {
+			return errGetGroupMemberInfoIncomplete, false
+		}
 		return role, true
 	case *PlatformAdapterGocq:
-		botIDRaw := strings.TrimSpace(UserIDExtract(ctx.EndPoint.UserID))
-		groupIDRaw := strings.TrimSpace(UserIDExtract(groupID))
-		if botIDRaw == "" || groupIDRaw == "" {
-			return "cannot resolve bot/group id", false
+		if botID <= 0 {
+			return errCannotResolveBotGroupIdentity, false
 		}
+		botIDRaw := strconv.FormatInt(botID, 10)
+		groupIDRaw := strconv.FormatInt(groupQQID, 10)
 		memberInfo := pa.getGroupMemberInfo(groupIDRaw, botIDRaw, bypassCache)
 		if memberInfo == nil {
 			return errGetGroupMemberInfoNil, false
 		}
+		if memberInfo.GroupID != groupIDRaw || memberInfo.UserID != botIDRaw {
+			return errGetGroupMemberInfoMismatch, false
+		}
 		role, ok := parseQQGroupRole(memberInfo.Role)
 		if !ok {
 			return errGetGroupMemberInfoEmptyRole, false
 		}
+		if role == "member" && memberInfo.Nickname == "" && memberInfo.JoinTime == 0 {
+			return errGetGroupMemberInfoIncomplete, false
+		}
 		return role, true
 	case *PlatformAdapterMilky:
+		if botID <= 0 {
+			return errCannotResolveBotGroupIdentity, false
+		}
 		memberInfo, err := pa.getGroupMemberInfo(groupID, ctx.EndPoint.UserID, bypassCache)
 		if err != nil {
 			return fmt.Sprintf("get_group_member_info failed: %v", err), false
@@ -182,13 +212,36 @@ func checkBotGroupRole(ctx *MsgContext, groupID string) (string, bool) {
 		if memberInfo == nil {
 			return errGetGroupMemberInfoNil, false
 		}
+		if memberInfo.GroupId != groupQQID || memberInfo.UserId != botID {
+			return errGetGroupMemberInfoMismatch, false
+		}
 		role, ok := parseQQGroupRole(memberInfo.Role)
 		if !ok {
 			return errGetGroupMemberInfoEmptyRole, false
 		}
 		return role, true
+	case *PlatformAdapterWalleQ:
+		if botID <= 0 {
+			return errCannotResolveBotGroupIdentity, false
+		}
+		botIDRaw := strconv.FormatInt(botID, 10)
+		groupIDRaw := strconv.FormatInt(groupQQID, 10)
+		memberInfo := pa.GetGroupMemberInfo(groupIDRaw, botIDRaw)
+		if memberInfo == nil {
+			return errGetGroupMemberInfoNil, false
+		}
+		if memberInfo.GroupID != groupIDRaw || memberInfo.UserID != botIDRaw {
+			return errGetGroupMemberInfoMismatch, false
+		}
+		role, ok := parseQQGroupRole(memberInfo.Role)
+		if !ok {
+			// WalleQ 的 get_group_member_info 不一定返回 role。
+			// 没有角色信息时按“不支持校验”处理，保持原有自动退群行为。
+			return errGroupRoleCheckUnsupported, false
+		}
+		return role, true
 	default:
-		return "adapter does not support group role check", false
+		return errGroupRoleCheckUnsupported, false
 	}
 }
 
@@ -829,7 +882,7 @@ func (d *Dice) registerCoreCommands() {
 				}
 
 				if cmdArgs.IsArgEqual(1, "on") {
-					if msg.Platform != "QQ-CH" && !ctx.Dice.Config.BotExtFreeSwitch && ctx.PrivilegeLevel < 40 {
+					if !isQQChannelPlatform(msg.Platform) && !ctx.Dice.Config.BotExtFreeSwitch && ctx.PrivilegeLevel < 40 {
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:提示_无权限_非master/管理/邀请者"))
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
@@ -839,20 +892,79 @@ func (d *Dice) registerCoreCommands() {
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 
+					// off 前窗口任务仍在排队/运行时，.bot on 的 resume/reset 会
+					// 推进 epoch，旧任务必停。先记下窗口，恢复后重新挂一个
+					// 只补日志的任务，避免 off 之前的 on 段永久丢失。
+					var preOffFrom, preOffTo int64
+					var preOffOK bool
+					if ctx.Group != nil {
+						preOffFrom, preOffTo, preOffOK = ctx.Group.authorizedPreOffGapRange()
+					}
+
+					wasAutoOffLog := ctx.Group != nil && ctx.Group.isLogPausedByBotOff()
+					wasLogOn := ctx.Group != nil && ctx.Group.GetLogState().On
 					SetBotOnAtGroup(ctx, msg.GroupID)
 					// TODO：ServiceAtNew此处忽略是否合理？
 					ctx.Group, _ = ctx.Session.ServiceAtNew.Load(msg.GroupID)
 					ctx.IsCurGroupBotOn = true
 
+					// .bot off 时日志被自动关闭，这里按 .log on 的语义自动开启。
+					// 用 .bot on 指令消息的 seq 直接重建基线，替代“跳过下一条消息”的
+					// 布尔标记：恢复后一条消息都没来就再次掉线/重启时，布尔标记会把
+					// 真实的离线窗口吞掉。没有 seq 的平台仍保留原标记兜底。
+					// 只在“本次确实从 .bot off 自动关闭中恢复”时重建；普通 .bot on
+					// 是空操作，不能让 resetLogSeq 取消掉正在进行的合法补全。
+					// 1120: 如果日志在 SetBotOnAtGroup 之前已经是 on（别处已恢复），
+					// resume 实际不会执行；此时不能再 resetLogSeq 吞掉在途区间。
+					autoOnLog := !wasLogOn && wasAutoOffLog && ctx.Group != nil && ctx.Group.GetLogState().On
+					if autoOnLog && msg.Seq > 0 {
+						ctx.Group.resetLogSeq(msg.Seq, msg.RawID)
+						ctx.Group.clearLogResumeSkipGap()
+					}
+
+					preOffNotice := ""
+					if preOffOK && autoOnLog && ctx.Group != nil {
+						if !ctx.Dice.LogGapFillEnabled() {
+							ctx.Group.cancelLogGapFill()
+							preOffNotice = "\n自动补全已关闭，关闭前的遗漏记录未补录。"
+						} else if ctx.Group.enqueuePreOffBackfillAfterResume(ctx.Dice, ctx.EndPoint, preOffFrom, preOffTo) {
+							preOffNotice = "\n关闭前的遗漏记录正在补录，完成后会通知。"
+						}
+					}
+
 					text := DiceFormatTmpl(ctx, "核心:骰子开启")
-					if ctx.Group.GetLogState().On {
-						text += "\n请特别注意: 日志记录处于开启状态"
+					unsettled := logGapUnsettled(ctx.Group)
+					if autoOnLog {
+						// .bot off 时日志被自动关闭，这里刚自动开启；关闭段不补录。
+						text += "\n日志已随骰子自动开启（关闭期间的消息不会补录）"
+					} else if !ctx.Group.GetLogState().On {
+						if unsettled {
+							text += "\n日志当前处于关闭状态"
+						} else {
+							text += "\n日志记录处于关闭状态"
+						}
+					} else {
+						if unsettled {
+							text += "\n日志当前处于开启状态"
+						} else {
+							text += "\n请特别注意: 日志记录处于开启状态"
+						}
+					}
+					text += preOffNotice
+					// 有未完成补录时，当前状态可能被离线 .log on/.log off 改写；
+					// 明确告诉用户“完成后还会再通知”，避免把临时状态当最终结果。
+					if preOffNotice == "" {
+						if hint := logGapUserHint(ctx.Group); hint != "" {
+							text += hint
+							// 已经承诺过通知：即使补录 0 条，收尾也要发提示。
+							ctx.Group.requestLogGapNotifyOnComplete()
+						}
 					}
 					ReplyToSender(ctx, msg, text)
 
 					return CmdExecuteResult{Matched: true, Solved: true}
 				} else if cmdArgs.IsArgEqual(1, "off") {
-					if msg.Platform != "QQ-CH" && !ctx.Dice.Config.BotExtFreeSwitch && ctx.PrivilegeLevel < 40 {
+					if !isQQChannelPlatform(msg.Platform) && !ctx.Dice.Config.BotExtFreeSwitch && ctx.PrivilegeLevel < 40 {
 						ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:提示_无权限_非master/管理/邀请者"))
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
@@ -862,8 +974,25 @@ func (d *Dice) registerCoreCommands() {
 						return CmdExecuteResult{Matched: true, Solved: true}
 					}
 
-					SetBotOffAtGroup(ctx, ctx.Group.GroupID)
-					ReplyToSender(ctx, msg, DiceFormatTmpl(ctx, "核心:骰子关闭"))
+					wasLogPaused := ctx.Group.logPhase() == groupLogPhasePausedByBotOff
+					SetBotOffAtGroupAtSeq(ctx, ctx.Group.GroupID, msg.Seq)
+					text := DiceFormatTmpl(ctx, "核心:骰子关闭")
+					// 只有本次真的把日志自动关闭时才提示；用户本来就 .log off 的
+					// 群不应被谎报“会自动开启”。1119.fix1: 已经因 .bot off 暂停过
+					// 的日志，重复 .bot off 不再重复提示。
+					// 有未完成补录时，历史 .log off 可能让 .bot on 不再自动开启，
+					// 因此不承诺“会自动开启”，只说明状态稍后通知。
+					if !wasLogPaused && ctx.Group.logPhase() == groupLogPhasePausedByBotOff {
+						text += "\n日志记录已自动关闭（未结束）"
+						if logGapUnsettled(ctx.Group) {
+							text += "；补录完成后会再通知日志状态。"
+							// 已经承诺过通知：即使补录 0 条，收尾也要发提示。
+							ctx.Group.requestLogGapNotifyOnComplete()
+						} else {
+							text += "，.bot on 后自动开启。"
+						}
+					}
+					ReplyToSender(ctx, msg, text)
 					return CmdExecuteResult{Matched: true, Solved: true}
 				} else if cmdArgs.IsArgEqual(1, "bye", "exit", "quit") {
 					if ctx.IsPrivate {
@@ -1243,7 +1372,9 @@ func (d *Dice) registerCoreCommands() {
 				}
 
 				if kw = cmdArgs.GetKwarg("now"); kw != nil {
-					doRelogin()
+					// 在事件 handler 内同步 DoRelogin 会等待当前 handler 自己退出
+					// （KOOK/官方 QQ 都有 2 秒完成窗口），固定延迟并产生误导性告警。
+					go doRelogin()
 					return CmdExecuteResult{Matched: true, Solved: true}
 				}
 
@@ -1327,11 +1458,15 @@ func (d *Dice) registerCoreCommands() {
 					ctx.Dice.Config.UpgradeEndpointID = ctx.EndPoint.ID
 					ctx.Dice.Save(true)
 
-					bakFn, _ := ctx.Dice.Parent.Backup(BackupSelectionAll, false)
-					tmpPath := path.Join(os.TempDir(), bakFn)
-					_ = os.MkdirAll(tmpPath, 0755)
-					ctx.Dice.Logger.Infof("将备份文件复制到此路径: %s", tmpPath)
-					_ = cp.Copy(path.Join(BackupDir, bakFn), tmpPath)
+					bakFn, bakErr := ctx.Dice.Parent.Backup(BackupSelectionAll, false)
+					if bakErr != nil {
+						ctx.Dice.Logger.Errorf("升级前备份失败，跳过备份复制: %v", bakErr)
+					} else {
+						tmpPath := path.Join(os.TempDir(), bakFn)
+						_ = os.MkdirAll(path.Dir(tmpPath), 0o755)
+						ctx.Dice.Logger.Infof("将备份文件复制到此路径: %s", tmpPath)
+						_ = cp.Copy(bakFn, tmpPath)
+					}
 
 					if ret == "" {
 						ReplyToSender(ctx, msg, "准备开始升级，服务即将离线")

@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
-	"runtime"
 	"syscall"
 
 	"github.com/labstack/echo/v4"
@@ -50,15 +49,17 @@ func httpServe(e *echo.Echo, dm *dice.DiceManager, hideUI bool) {
 	ln, err := net.Listen("tcp", ":"+portStr)
 	if err != nil {
 		log.Errorf("端口已被占用，即将自动退出: %s", dm.ServeAddress)
-		runtime.Goexit()
+		exitAfterUIStartupFailure()
+		return
 	}
 	_ = ln.Close()
 
+	log.Infof("[自检] WebUI 端口 %s 检查通过，开始监听", portStr)
 	log.Infof("如果浏览器没有自动打开，请手动访问:\nhttp://localhost:%s", portStr)
 	err = e.Start(dm.ServeAddress)
 	if err != nil {
 		log.Errorf("端口已被占用，即将自动退出: %s", dm.ServeAddress)
-		return
+		exitAfterUIStartupFailure()
 	}
 }
 

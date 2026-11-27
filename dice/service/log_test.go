@@ -544,3 +544,67 @@ func TestLogModelCreatesCompositeRawMsgIDIndexOnSQLite(t *testing.T) {
 		t.Fatal("expected idx_log_delete_by_id to exist on log_items")
 	}
 }
+
+// TestLogDeleteAfterSeqTimeKeepsBoundaries_1123 锁定历史 .log off 清理边界：
+// 只删 seq 晚于 off 且时间不早于 off 的误记行；on 段、off 命令本身、
+// 以及 seq 更晚但时间更早的异常行都不能删。
+func TestLogDeleteAfterSeqTimeKeepsBoundaries_1123(t *testing.T) {
+	db := newLogInfoTestDB(t)
+	op := &logInfoTestOperator{db: db, dbType: constant.SQLITE}
+	groupID := "QQ-Group:1123-delete-after-off"
+	logID, err := service.LogGetOrCreate(op, groupID, "run-a")
+	if err != nil {
+		t.Fatalf("LogGetOrCreate(): %v", err)
+	}
+
+	seqPtr := func(v int64) *int64 { return &v }
+	rows := []struct {
+		seq  int64
+		ts   int64
+		text string
+	}{
+		{10, 1000, "on chat"},
+		{11, 1010, ".log off"},
+		{12, 1005, "seq later but time earlier"},
+		{13, 1011, "off live chat"},
+		{14, 1015, "off live chat 2"},
+	}
+	for _, row := range rows {
+		if !service.LogAppendByID(op, logID, groupID, &model.LogOneItem{
+			Nickname: "tester",
+			IMUserID: "10086",
+			Time:     row.ts,
+			Message:  row.text,
+			Seq:      seqPtr(row.seq),
+			RawMsgID: fmt.Sprintf("raw-%d", row.seq),
+		}) {
+			t.Fatalf("append seq=%d failed", row.seq)
+		}
+	}
+
+	removed, err := service.LogDeleteAfterSeqTime(op, logID, 11, 1010)
+	if err != nil {
+		t.Fatalf("LogDeleteAfterSeqTime(): %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("removed = %d, want 2", removed)
+	}
+	lines, err := service.LogGetAllLines(op, groupID, "run-a")
+	if err != nil {
+		t.Fatalf("LogGetAllLines(): %v", err)
+	}
+	if len(lines) != 3 {
+		t.Fatalf("remaining lines = %d, want 3", len(lines))
+	}
+	for _, line := range lines {
+		if line.Seq != nil && (*line.Seq == 13 || *line.Seq == 14) {
+			t.Fatalf("off live row seq=%d should be removed", *line.Seq)
+		}
+	}
+
+	// afterTime <= 0 表示平台无可信时间：必须跳过，不能只按 seq 猜删。
+	removed, err = service.LogDeleteAfterSeqTime(op, logID, 11, 0)
+	if err != nil || removed != 0 {
+		t.Fatalf("afterTime<=0 removed=%d err=%v, want 0/nil", removed, err)
+	}
+}

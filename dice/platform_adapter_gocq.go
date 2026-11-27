@@ -128,10 +128,12 @@ type OnebotUserInfo struct {
 	MaxMemberCount  int32  `json:"max_member_count"`
 	Card            string `json:"card"`
 	Role            string `json:"role"`
+	JoinTime        int64  `json:"join_time"`
 }
 
 type MessageQQBase struct {
 	MessageID     int64           `json:"message_id"`   // QQ信息此类型为int64，频道中为string
+	MessageSeq    int64           `json:"message_seq"`  // 群内消息序号，部分实现不提供；用于日志断层补全
 	MessageType   string          `json:"message_type"` // Group
 	Sender        *Sender         `json:"sender"`       // 发送者
 	RawMessage    string          `json:"raw_message"`
@@ -163,8 +165,9 @@ type MessageQQBase struct {
 		MaxMemberCount  int32           `json:"max_member_count"`
 
 		// 群成员信息
-		Card string `json:"card"`
-		Role string `json:"role"`
+		Card     string `json:"card"`
+		Role     string `json:"role"`
+		JoinTime int64  `json:"join_time"`
 	} `json:"data"`
 	Retcode int64 `json:"retcode"`
 	// Status string `json:"status"`
@@ -242,6 +245,7 @@ func (msgQQ *MessageQQ) toStdMessage() *Message {
 	msg.Message = strings.ReplaceAll(msg.Message, "&#93;", "]")
 	msg.Message = strings.ReplaceAll(msg.Message, "&amp;", "&")
 	msg.RawID = msgQQ.MessageID
+	msg.Seq = msgQQ.MessageSeq
 	msg.Platform = "QQ"
 
 	if msg.MessageType == "" {
@@ -455,6 +459,10 @@ func (pa *PlatformAdapterGocq) Serve() int {
 		pa.lagrangeRebootTimes = 0
 		//  {"data":{"nickname":"闃斧鐗岃�佽檸鏈�","user_id":1001},"retcode":0,"status":"ok"}
 		pa.GetLoginInfo()
+		// 1120: 重连后主动对账一次最新历史 seq，不依赖下一条群消息。
+		if pa.EndPoint != nil && pa.EndPoint.Session != nil && pa.EndPoint.Session.Parent != nil {
+			pa.EndPoint.Session.Parent.scheduleLogGapReconcile(3 * time.Second)
+		}
 	}
 
 	socket.OnConnectError = func(err error, socket gowebsocket.Socket) {
@@ -593,9 +601,10 @@ func (pa *PlatformAdapterGocq) Serve() int {
 							// 如果是被ban之后拉群，判定为强制拉群
 							if groupInfo.EnteredTime > 0 && groupInfo.EnteredTime > banInfo.BanTime {
 								text := fmt.Sprintf("本次入群为遭遇强制邀请，即将主动退群，因为邀请人%s正处于黑名单上。打扰各位还请见谅。感谢使用余烬核心。", groupInfo.InviteUserID)
-								ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
-								time.Sleep(1 * time.Second)
-								pa.QuitGroup(ctx, groupID)
+								autoQuitGroupAsync(ctx, groupID, func(ctx *MsgContext) {
+									ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
+									time.Sleep(1 * time.Second)
+								})
 							}
 							return
 						}
@@ -608,9 +617,10 @@ func (pa *PlatformAdapterGocq) Serve() int {
 							// 如果是被ban之后拉群，判定为强制拉群
 							if groupInfo.EnteredTime > 0 && groupInfo.EnteredTime > banInfo.BanTime {
 								text := fmt.Sprintf("被群已被拉黑，即将自动退出，解封请联系骰主。打扰各位还请见谅。感谢使用余烬核心:\n当前情况: %s", banInfo.toText(ctx.Dice))
-								ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
-								time.Sleep(1 * time.Second)
-								pa.QuitGroup(ctx, groupID)
+								autoQuitGroupAsync(ctx, groupID, func(ctx *MsgContext) {
+									ReplyGroupRaw(ctx, &Message{GroupID: groupID}, text, "")
+									time.Sleep(1 * time.Second)
+								})
 							}
 							return
 						}
@@ -999,6 +1009,7 @@ func (pa *PlatformAdapterGocq) Serve() int {
 			}
 			// TODO：存疑，根据DISMISS的代码复制而来
 			group.DiceIDExistsMap.Delete(ep.UserID)
+			group.MarkDiceDeparted(ep.UserID)
 			group.MarkDirty(ctx.Dice)
 			log.Info(txt)
 			if pendingQuit == nil || pendingQuit.Origin != QuitOriginAutoInactive || !session.Parent.Config.QuitInactiveNoticeSummaryMode {

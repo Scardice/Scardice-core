@@ -4,12 +4,15 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/labstack/echo/v4"
 
 	"Scardice-core/dice"
 	"Scardice-core/dice/service"
+	"Scardice-core/dice/storylog"
 	"Scardice-core/model"
 )
 
@@ -125,21 +128,48 @@ func storyDelLog(c echo.Context) error {
 	return c.JSON(http.StatusOK, true)
 }
 
+func storyDownloadLog(c echo.Context) error {
+	if !doAuth(c) {
+		return c.JSON(http.StatusForbidden, nil)
+	}
+	groupID := strings.TrimSpace(c.QueryParam("groupId"))
+	name := strings.TrimSpace(c.QueryParam("name"))
+	if groupID == "" || name == "" {
+		return Error(&c, "groupId 和 name 不能为空", Response{})
+	}
+	if group, ok := myDice.ImSession.ServiceAtNew.Load(groupID); ok && dice.LogGapIncompleteForUpload(group) {
+		return Error(&c, dice.LogGapUploadBlockText("下载日志"), Response{})
+	}
+
+	path, filename, err := storylog.ExportLocalZip(storylog.UploadEnv{
+		Db:      myDice.DBOperator,
+		Log:     myDice.Logger,
+		GroupID: groupID,
+		LogName: name,
+	})
+	if err != nil {
+		myDice.Logger.Warn("storyDownloadLog", err)
+		return Error(&c, "导出日志失败："+err.Error(), Response{})
+	}
+	defer func() { _ = os.RemoveAll(filepath.Dir(path)) }()
+	return c.Attachment(path, filename)
+}
+
 func storyUploadLog(c echo.Context) error {
 	if !doAuth(c) {
 		return c.JSON(http.StatusForbidden, nil)
 	}
 	v := &model.LogInfo{}
 	_ = c.Bind(&v)
-	unofficial, url, notice, err := logSendToBackend(v.GroupID, v.Name)
+	if group, ok := myDice.ImSession.ServiceAtNew.Load(v.GroupID); ok && dice.LogGapIncompleteForUpload(group) {
+		return Error(&c, dice.LogGapUploadBlockText("上传日志"), Response{})
+	}
+	url, notice, err := logSendToBackend(v.GroupID, v.Name)
 	if err != nil {
 		myDice.Logger.Error("storyUploadLog", err)
 		return c.JSON(http.StatusInternalServerError, err.Error())
 	}
 	ret := fmt.Sprintf("跑团日志已上传服务器，链接如下：<br/>%s", url)
-	if unofficial {
-		ret += "<br/>[注意：该链接非余烬官方染色器]"
-	}
 	if notice != "" {
 		ret += "<br/>" + notice
 	}
@@ -190,7 +220,7 @@ func storyBatchDeleteLogBackup(c echo.Context) error {
 	return Success(&c, Response{})
 }
 
-func logSendToBackend(groupID string, logName string) (bool, string, string, error) {
+func logSendToBackend(groupID string, logName string) (string, string, error) {
 	ctx := &dice.MsgContext{
 		Dice:     myDice,
 		EndPoint: myDice.UIEndpoint,

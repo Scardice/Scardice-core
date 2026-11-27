@@ -76,6 +76,9 @@ type DiceManager struct { //nolint:revive
 	BackupCleanCron      string              // 如果使用cron触发, 表达式
 	backupCleanCronID    cron.EntryID
 
+	backupLock     sync.Mutex
+	backupProgress backupProgressTracker
+
 	AppBootTime      int64
 	AppVersionCode   int64
 	AppVersionOnline *VersionInfo
@@ -172,8 +175,8 @@ func (dm *DiceManager) reloadHelp(closeCurrent bool) error {
 	return nil
 }
 
-// LoadDice 初始化函数
-func (dm *DiceManager) LoadDice() {
+// LoadDice 初始化函数。返回是否成功读取到 data/dice.yaml，以及非“文件不存在”的读取错误。
+func (dm *DiceManager) LoadDice() (bool, error) {
 	log := logger.M()
 	dm.AppVersionCode = VERSION_CODE
 	dm.AppBootTime = time.Now().Unix()
@@ -207,7 +210,10 @@ func (dm *DiceManager) LoadDice() {
 	data, err := os.ReadFile("./data/dice.yaml")
 	if err != nil {
 		// 注意！！！！ 这里会退出，所以下面的都可能不执行！
-		return
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
 	}
 
 	var dc Configs
@@ -254,6 +260,7 @@ func (dm *DiceManager) LoadDice() {
 		newDice.ContainerMode = dm.ContainerMode
 		dm.appendDice(newDice)
 	}
+	return true, nil
 }
 
 func (dm *DiceManager) Save() {
@@ -346,6 +353,15 @@ func (dm *DiceManager) InitDice(writer *logger.UIWriter) {
 		i.Parent = dm
 		i.Init(dm.Operator, writer)
 	}
+
+	// 1120: 端点连接/日志数据加载后主动对账一次离线缺口；不依赖新消息。
+	// 失败/未连接时跳过，下一条群消息仍按原路径触发。
+	go func() {
+		time.Sleep(10 * time.Second)
+		for _, d := range dm.Dice {
+			d.reconcileLogGapsOnStartup()
+		}
+	}()
 
 	go func() {
 		defer func() {
