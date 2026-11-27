@@ -376,6 +376,65 @@ func DiceConfigSet(c echo.Context) error {
 		myDice.ApplyAliveNotice()
 	}
 
+	diskSpaceNoticeMod := false
+	if val, ok := jsonMap["diskSpaceNoticeEnable"]; ok {
+		if v, ok := val.(bool); ok {
+			config.DiskSpaceNoticeEnable = v
+			diskSpaceNoticeMod = true
+		}
+	}
+	if val, ok := jsonMap["diskSpaceNoticeThresholdMB"]; ok {
+		threshold := int64(0)
+		switch v := val.(type) {
+		case float64:
+			threshold = int64(v)
+		case string:
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				threshold = n
+			}
+		}
+		if threshold <= 0 {
+			threshold = dice.DefaultConfig.DiskSpaceNoticeThresholdMB
+		}
+		if threshold > 1<<20 {
+			threshold = 1 << 20
+		}
+		config.DiskSpaceNoticeThresholdMB = threshold
+		diskSpaceNoticeMod = true
+	}
+	if val, ok := jsonMap["diskSpaceNoticeInterval"]; ok {
+		if v, ok := val.(string); ok {
+			v = strings.TrimSpace(v)
+			if v == "" {
+				v = dice.DefaultConfig.DiskSpaceNoticeInterval
+			}
+			config.DiskSpaceNoticeInterval = v
+			diskSpaceNoticeMod = true
+		}
+	}
+	if val, ok := jsonMap["diskSpaceNoticeCooldownMinutes"]; ok {
+		cooldown := 0
+		switch v := val.(type) {
+		case float64:
+			cooldown = int(v)
+		case string:
+			if n, err := strconv.Atoi(v); err == nil {
+				cooldown = n
+			}
+		}
+		if cooldown <= 0 {
+			cooldown = dice.DefaultConfig.DiskSpaceNoticeCooldownMinutes
+		}
+		if cooldown > 10080 {
+			cooldown = 10080
+		}
+		config.DiskSpaceNoticeCooldownMinutes = cooldown
+		diskSpaceNoticeMod = true
+	}
+	if diskSpaceNoticeMod {
+		myDice.ApplyDiskSpaceNotice()
+	}
+
 	if val, ok := jsonMap["UILogLimit"]; ok {
 		val, err := strconv.ParseInt(val.(string), 10, 64)
 		if err == nil {

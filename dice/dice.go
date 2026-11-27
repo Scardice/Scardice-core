@@ -235,6 +235,12 @@ type Dice struct {
 	AliveNoticeEntry cron.EntryID         `json:"-"             yaml:"-"`
 	JsPrinter        *PrinterFunc         `json:"-"             yaml:"-"`
 
+	DiskSpaceNoticeEntry          cron.EntryID `json:"-" yaml:"-"`
+	diskSpaceNoticeMu             sync.Mutex
+	diskSpaceNoticeLow            bool
+	diskSpaceNoticeLastAlert      time.Time
+	diskSpaceNoticeLastProbeErrAt time.Time
+
 	// JsLoop           *eventloop.EventLoop `yaml:"-" json:"-"`
 	ExtLoopManager   *JsLoopManager  `json:"-" yaml:"-"`
 	JsScriptList     []*JsScriptInfo `json:"-" yaml:"-"`
@@ -513,6 +519,7 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 	go refreshGroupInfo()
 
 	d.ApplyAliveNotice()
+	d.ApplyDiskSpaceNotice()
 	if d.Config.JsEnable {
 		d.StartStartupJsLoad()
 	} else {

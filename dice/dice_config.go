@@ -167,18 +167,24 @@ type BaseConfig struct {
 	UILogLimit                int64      `json:"-"                       yaml:"UILogLimit"`
 	FriendAddComment          string     `json:"friendAddComment"        yaml:"friendAddComment"` // 加好友验证信息
 	CustomReplyConfigEnable   bool       `json:"customReplyConfigEnable" yaml:"customReplyConfigEnable"`
-	AutoReloginEnable         bool       `json:"autoReloginEnable"       yaml:"autoReloginEnable"`    // 启用自动重新登录
-	RefuseGroupInvite         bool       `json:"refuseGroupInvite"       yaml:"refuseGroupInvite"`    // 拒绝加入新群
-	UpgradeWindowID           string     `json:"-"                       yaml:"upgradeWindowId"`      // 执行升级指令的窗口
-	UpgradeEndpointID         string     `json:"-"                       yaml:"upgradeEndpointId"`    // 执行升级指令的端点
-	BotExtFreeSwitch          bool       `json:"botExtFreeSwitch"        yaml:"botExtFreeSwitch"`     // 允许任意人员开关: 否则邀请者、群主、管理员、master有权限
-	BotExitWithoutAt          bool       `json:"botExitWithoutAt"        yaml:"botExitWithoutAt"`     // 不@骰娘即可执行退群指令
-	TrustOnlyMode             bool       `json:"trustOnlyMode"           yaml:"trustOnlyMode"`        // 只有信任的用户/master可以拉群和使用
-	AliveNoticeEnable         bool       `json:"aliveNoticeEnable"       yaml:"aliveNoticeEnable"`    // 定时通知
-	AliveNoticeValue          string     `json:"aliveNoticeValue"        yaml:"aliveNoticeValue"`     // 定时通知间隔
-	ReplyDebugMode            bool       `json:"replyDebugMode"          yaml:"replyDebugMode"`       // 回复调试
-	PlayerNameWrapEnable      bool       `json:"playerNameWrapEnable"    yaml:"playerNameWrapEnable"` // 启用玩家名称外框
-	DiceRandomMode            string     `json:"diceRandomMode"          yaml:"diceRandomMode"`       // 骰点随机模式
+	AutoReloginEnable         bool       `json:"autoReloginEnable"       yaml:"autoReloginEnable"` // 启用自动重新登录
+	RefuseGroupInvite         bool       `json:"refuseGroupInvite"       yaml:"refuseGroupInvite"` // 拒绝加入新群
+	UpgradeWindowID           string     `json:"-"                       yaml:"upgradeWindowId"`   // 执行升级指令的窗口
+	UpgradeEndpointID         string     `json:"-"                       yaml:"upgradeEndpointId"` // 执行升级指令的端点
+	BotExtFreeSwitch          bool       `json:"botExtFreeSwitch"        yaml:"botExtFreeSwitch"`  // 允许任意人员开关: 否则邀请者、群主、管理员、master有权限
+	BotExitWithoutAt          bool       `json:"botExitWithoutAt"        yaml:"botExitWithoutAt"`  // 不@骰娘即可执行退群指令
+	TrustOnlyMode             bool       `json:"trustOnlyMode"           yaml:"trustOnlyMode"`     // 只有信任的用户/master可以拉群和使用
+	AliveNoticeEnable         bool       `json:"aliveNoticeEnable"       yaml:"aliveNoticeEnable"` // 定时通知
+	AliveNoticeValue          string     `json:"aliveNoticeValue"        yaml:"aliveNoticeValue"`  // 定时通知间隔
+
+	DiskSpaceNoticeEnable          bool   `json:"diskSpaceNoticeEnable"   yaml:"diskSpaceNoticeEnable"`                 // 磁盘空间不足告警
+	DiskSpaceNoticeThresholdMB     int64  `json:"diskSpaceNoticeThresholdMB" yaml:"diskSpaceNoticeThresholdMB"`         // 磁盘空间告警阈值，单位 MiB
+	DiskSpaceNoticeInterval        string `json:"diskSpaceNoticeInterval" yaml:"diskSpaceNoticeInterval"`               // 磁盘空间检查间隔，cron 写法
+	DiskSpaceNoticeCooldownMinutes int    `json:"diskSpaceNoticeCooldownMinutes" yaml:"diskSpaceNoticeCooldownMinutes"` // 持续不足时重复提醒间隔，单位分钟
+
+	ReplyDebugMode       bool   `json:"replyDebugMode"          yaml:"replyDebugMode"`       // 回复调试
+	PlayerNameWrapEnable bool   `json:"playerNameWrapEnable"    yaml:"playerNameWrapEnable"` // 启用玩家名称外框
+	DiceRandomMode       string `json:"diceRandomMode"          yaml:"diceRandomMode"`       // 骰点随机模式
 
 	VMVersionForReply      string `json:"VMVersionForReply"      yaml:"VMVersionForReply"`      // 自定义回复使用的vm版本
 	VMVersionForDeck       string `json:"VMVersionForDeck"       yaml:"VMVersionForDeck"`       // 牌堆使用的vm版本
