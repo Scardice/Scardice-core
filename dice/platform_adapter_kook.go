@@ -38,6 +38,28 @@ type ConsoleWriterShutUp struct {
 func (c *ConsoleWriterShutUp) Close() (err error)                       { return nil }
 func (c *ConsoleWriterShutUp) WriteEntry(_ *kooklog.Entry) (int, error) { return 0, nil }
 
+// kookOpTimeout 限制一次「启用/重登」操作的最长等待。SDK 的握手已有
+// 15s Dial + 6s hello 超时，但会话锁/建连锁被后台重连占用时，适配器层
+// 仍可能长时间卡住；超时后强制丢弃会话，下次启用会新建连接。
+const kookOpTimeout = 30 * time.Second
+
+// kookZapWriter 把 KOOK SDK 的 error 日志转发到余烬日志。SDK 原先被
+// ConsoleWriterShutUp 完全静默，连接失败时日志里只剩「正在启用」。
+type kookZapWriter struct {
+	log *zap.SugaredLogger
+}
+
+func (w kookZapWriter) Write(p []byte) (int, error) {
+	if w.log != nil {
+		line := strings.TrimSpace(string(p))
+		line = kookLogTokenRe.ReplaceAllString(line, "$1$2***")
+		w.log.Errorf("[KOOK SDK] %s", line)
+	}
+	return len(p), nil
+}
+
+var kookLogTokenRe = regexp.MustCompile(`(?i)((?:access_)?token|authorization)(["']?\s*[:=]\s*["']?)([^,"'\s&}]+)`)
+
 // kook go的鉴权目前并不好用，这里重写一遍
 const (
 	RolePermissionAdmin                  kook.RolePermission = 1 << iota
@@ -180,6 +202,11 @@ type PlatformAdapterKook struct {
 	// handlerMu 跨 Session 串行化 handler。禁用后立即启用会创建新 Session，
 	// 仅靠 Session 内部的锁无法阻止旧会话的迟到命令并发修改数据。
 	handlerMu sync.Mutex
+
+	// kookRetryMu 保护自动重连循环；kookRetryCancel 非空表示循环正在运行。
+	kookRetryMu      sync.Mutex
+	kookRetryCancel  chan struct{}
+	kookRetryAttempt int
 }
 
 // getSession 返回当前会话快照。会话可能在发送/重连过程中被启用、禁用或替换，
@@ -188,6 +215,152 @@ func (pa *PlatformAdapterKook) getSession() *kook.Session {
 	pa.sessionMu.Lock()
 	defer pa.sessionMu.Unlock()
 	return pa.IntentSession
+}
+
+// closeKookSessionAsync 不等待 SDK 的会话锁；卡住的 Close 不能阻塞适配器恢复。
+func (pa *PlatformAdapterKook) closeKookSessionAsync(session *kook.Session) {
+	if session == nil {
+		return
+	}
+	go func() {
+		defer func() { _ = recover() }()
+		_ = session.Close()
+	}()
+}
+
+// forceDropKookSession 丢弃当前会话引用并异步关闭底层连接，让下一次启用
+// 可以新建会话，而不是继续等一把可能永远拿不到的锁。
+func (pa *PlatformAdapterKook) forceDropKookSession() {
+	session := pa.getSession()
+	if session != nil {
+		pa.clearSessionIf(session)
+		pa.closeKookSessionAsync(session)
+	}
+	// 用户在超时前已经点过禁用：不要复活端点，也不要启动自动重连。
+	if pa.EndPoint != nil && !pa.EndPoint.Enable {
+		pa.saveState()
+		return
+	}
+	pa.setEndpointStateIfIdle(true, StateConnectionFailed)
+	pa.saveState()
+	// 会话卡死被丢弃后交给后台自动重连，避免必须重启进程或人工点启用。
+	pa.startKookAutoReconnect("会话卡住已丢弃")
+}
+
+// kookRetryDelay 返回第 attempt 次自动重连前的等待时间。
+// 30 秒起步、10 分钟封顶，断网期间不会无限刷日志或频繁重建连接。
+func kookRetryDelay(attempt int) time.Duration {
+	switch {
+	case attempt <= 0:
+		return 30 * time.Second
+	case attempt == 1:
+		return time.Minute
+	case attempt == 2:
+		return 2 * time.Minute
+	case attempt == 3:
+		return 5 * time.Minute
+	default:
+		return 10 * time.Minute
+	}
+}
+
+// startKookAutoReconnect 启动后台自动重连；已有循环时不重复启动。
+func (pa *PlatformAdapterKook) startKookAutoReconnect(reason string) {
+	pa.kookRetryMu.Lock()
+	if pa.kookRetryCancel != nil {
+		pa.kookRetryMu.Unlock()
+		return
+	}
+	if pa.EndPoint == nil || !pa.EndPoint.Enable {
+		pa.kookRetryMu.Unlock()
+		return
+	}
+	cancel := make(chan struct{})
+	pa.kookRetryCancel = cancel
+	pa.kookRetryAttempt = 0
+	pa.kookRetryMu.Unlock()
+
+	go pa.kookAutoReconnectLoop(cancel, reason)
+}
+
+func (pa *PlatformAdapterKook) kookAutoReconnectLoop(cancel chan struct{}, reason string) {
+	log := zap.S().Named(logger.LogKeyAdapter)
+	defer func() {
+		pa.kookRetryMu.Lock()
+		if pa.kookRetryCancel == cancel {
+			pa.kookRetryCancel = nil
+		}
+		pa.kookRetryMu.Unlock()
+	}()
+	for {
+		pa.kookRetryMu.Lock()
+		attempt := pa.kookRetryAttempt
+		pa.kookRetryAttempt++
+		pa.kookRetryMu.Unlock()
+
+		wait := kookRetryDelay(attempt)
+		log.Warnf("KOOK 自动重连将在 %v 后尝试（第%d次）: %s", wait, attempt+1, reason)
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-cancel:
+			timer.Stop()
+			return
+		}
+		if pa.EndPoint == nil || !pa.EndPoint.Enable {
+			return
+		}
+		if pa.hasActiveKookSession() {
+			log.Infof("KOOK 自动重连停止：会话已恢复")
+			return
+		}
+		log.Infof("KOOK 自动重连尝试（第%d次）", attempt+1)
+		pa.runKookOpWithTimeout("自动重连", func() { pa.setEnableInternal(true) })
+		if pa.hasActiveKookSession() {
+			log.Infof("KOOK 自动重连成功")
+			return
+		}
+	}
+}
+
+// stopKookAutoReconnect 停止后台自动重连；连接成功、用户禁用或销毁时调用。
+func (pa *PlatformAdapterKook) stopKookAutoReconnect() {
+	pa.kookRetryMu.Lock()
+	defer pa.kookRetryMu.Unlock()
+	if pa.kookRetryCancel != nil {
+		close(pa.kookRetryCancel)
+		pa.kookRetryCancel = nil
+	}
+}
+
+func (pa *PlatformAdapterKook) hasActiveKookSession() bool {
+	pa.sessionMu.Lock()
+	defer pa.sessionMu.Unlock()
+	return pa.IntentSession != nil && pa.EndPoint != nil && pa.EndPoint.State == StateConnected
+}
+
+// runKookOpWithTimeout 给启用/重登这类可能卡在 SDK 锁上的操作加兜底超时。
+// 返回 false 表示已超时并丢弃了会话。
+func (pa *PlatformAdapterKook) runKookOpWithTimeout(name string, op func()) bool {
+	log := zap.S().Named(logger.LogKeyAdapter)
+	done := make(chan struct{})
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Errorf("KOOK %s操作异常: %v 堆栈: %v", name, r, string(debug.Stack()))
+			}
+			close(done)
+		}()
+		op()
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(kookOpTimeout):
+		log.Errorf("KOOK %s操作超时（%v），丢弃当前会话，可重新启用", name, kookOpTimeout)
+		pa.forceDropKookSession()
+		return false
+	}
 }
 
 // endpointSnapshot 在同一把锁内读取发送所需的端点状态/身份，
@@ -451,7 +624,7 @@ func (pa *PlatformAdapterKook) abortServeSession(session *kook.Session) {
 		return
 	}
 	pa.clearSessionIf(session)
-	_ = session.Close()
+	pa.closeKookSessionAsync(session)
 }
 
 func (pa *PlatformAdapterKook) isCurrentSession(session *kook.Session) bool {
@@ -675,13 +848,11 @@ func (pa *PlatformAdapterKook) handleKookFatal(session *kook.Session, err error)
 	log.Errorf("KOOK 连接不可恢复，已停止自动重连: %v", err)
 	if !pa.clearSessionAndSetState(session, false, StateConnectionFailed) {
 		// 会话已被新连接替换；旧 session 仍需关闭，避免残留连接。
-		if session != nil {
-			_ = session.Close()
-		}
+		pa.closeKookSessionAsync(session)
 		return
 	}
 	pa.saveState()
-	_ = session.Close()
+	pa.closeKookSessionAsync(session)
 	pa.clearKookResumeState()
 }
 
@@ -788,9 +959,7 @@ func (pa *PlatformAdapterKook) abortServeAfterPanic(token uint64, session *kook.
 	pa.guildCache = nil
 	pa.guildCacheMu.Unlock()
 	pa.sessionMu.Unlock()
-	if session != nil {
-		_ = session.Close()
-	}
+	pa.closeKookSessionAsync(session)
 }
 
 func (pa *PlatformAdapterKook) Serve() (ret int) {
@@ -825,9 +994,10 @@ func (pa *PlatformAdapterKook) Serve() (ret int) {
 	pa.sessionMu.Unlock()
 
 	// 不喜欢太安静的控制台可以把ConsoleWriterShutUp换成kooklog.ConsoleWriter
+	// 不再完全静默 SDK 日志：只放开 error 及以上，并脱敏 token/authorization。
 	l := kooklog.Logger{
-		Level:  kooklog.TraceLevel,
-		Writer: &ConsoleWriterShutUp{},
+		Level:  kooklog.ErrorLevel,
+		Writer: kooklog.IOWriter{Writer: kookZapWriter{log: log}},
 	}
 	s := kook.New(pa.Token, plog.NewLogger(&l))
 	serveSession = s
@@ -1161,6 +1331,7 @@ func (pa *PlatformAdapterKook) Serve() (ret int) {
 	go pa.updateGameStatus()
 	_, _, selfID, selfName := pa.endpointSnapshot()
 	log.Infof("KOOK 连接成功，账号<%s>(%s)", selfName, selfID)
+	pa.stopKookAutoReconnect()
 	pa.saveState()
 	return 0
 }
@@ -1168,16 +1339,22 @@ func (pa *PlatformAdapterKook) Serve() (ret int) {
 func (pa *PlatformAdapterKook) DoRelogin() bool {
 	log := zap.S().Named(logger.LogKeyAdapter)
 	log.Infof("正在重新登录KOOK服务……")
+	ok := false
+	finished := pa.runKookOpWithTimeout("重新登录", func() { ok = pa.doReloginInternal() })
+	return finished && ok
+}
+
+func (pa *PlatformAdapterKook) doReloginInternal() bool {
 	session := pa.getSession()
 	if session != nil {
 		// 重登的语义是保持端点启用；这里不能写 false，否则后面的 Serve
 		// 会被启动期禁用守卫静默拦下，重连永远拉不起来。
 		if !pa.clearSessionAndSetState(session, true, StateConnecting) {
 			// 新会话已经接管；不要覆盖它的状态，也不要再启动第三个会话。
-			_ = session.Close()
+			pa.closeKookSessionAsync(session)
 			return false
 		}
-		_ = session.Close()
+		pa.closeKookSessionAsync(session)
 		pa.clearKookResumeState()
 	} else {
 		if !pa.setEndpointStateIfIdle(true, StateConnecting) {
@@ -1197,6 +1374,14 @@ func (pa *PlatformAdapterKook) DoRelogin() bool {
 }
 
 func (pa *PlatformAdapterKook) SetEnable(enable bool) {
+	if enable {
+		pa.runKookOpWithTimeout("启用", func() { pa.setEnableInternal(true) })
+		return
+	}
+	pa.setEnableInternal(false)
+}
+
+func (pa *PlatformAdapterKook) setEnableInternal(enable bool) {
 	log := zap.S().Named(logger.LogKeyAdapter)
 	if enable {
 		log.Infof("正在启用KOOK服务……")
@@ -1216,7 +1401,7 @@ func (pa *PlatformAdapterKook) SetEnable(enable bool) {
 			// 不能先把它写成 Connected 再发现 !serving 就返回；先清掉旧会话，
 			// 再按无会话路径重建，UI 才不会显示“已连接但收不到事件”。
 			pa.clearSessionIf(session)
-			_ = session.Close()
+			pa.closeKookSessionAsync(session)
 			pa.setEndpointStateIfIdle(true, StateConnecting)
 			pa.saveState()
 			pa.Serve()
@@ -1242,7 +1427,7 @@ func (pa *PlatformAdapterKook) SetEnable(enable bool) {
 					pa.clearKookResumeState()
 					pa.saveState()
 				}
-				_ = session.Close()
+				pa.closeKookSessionAsync(session)
 				return
 			}
 			log.Warnf("与KOOK服务连接遇到瞬时错误，保留会话并后台重连: %v", err)
@@ -1266,7 +1451,9 @@ func (pa *PlatformAdapterKook) SetEnable(enable bool) {
 		pa.updateGameStatus()
 		_, _, selfID, selfName := pa.endpointSnapshot()
 		log.Infof("KOOK 连接成功，账号<%s>(%s)", selfName, selfID)
+		pa.stopKookAutoReconnect()
 	} else {
+		pa.stopKookAutoReconnect()
 		session := pa.getSession()
 		if session == nil {
 			if pa.setEndpointStateIfIdle(false, StateDisconnected) {
@@ -1287,10 +1474,10 @@ func (pa *PlatformAdapterKook) SetEnable(enable bool) {
 			}
 		}
 		if !pa.clearSessionAndSetState(session, false, StateDisconnected) {
-			_ = session.Close()
+			pa.closeKookSessionAsync(session)
 			return
 		}
-		_ = session.Close()
+		pa.closeKookSessionAsync(session)
 		pa.clearKookResumeState()
 	}
 	pa.saveState()
