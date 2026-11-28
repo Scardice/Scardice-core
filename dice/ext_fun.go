@@ -458,7 +458,7 @@ func RegisterBuiltinExtFun(self *Dice) {
 				text += cmdArgs.CleanArgs
 
 				for _, target := range filterNoticeTargets(ctx.Dice.Config.NoticeIDs, NoticeTypeSend) {
-					if !sendNoticeTargetCrossPlatform(ctx, target, text) {
+					if !sendNoticeTargetCrossPlatform(ctx, target, text, NoticeTypeSend) {
 						ctx.Dice.Logger.Errorf("未能向通知目标 %s 发送留言", target.ID)
 					}
 				}
@@ -1331,17 +1331,12 @@ func RegisterBuiltinExtFun(self *Dice) {
 				if event.IsPrivate {
 					messageType = "private"
 				}
-				for _, i := range ctx.SplitText(text) {
-					doSleepQQ(ctx)
-					ReplyToSender(ctx, &Message{
-						Platform:    ctx.EndPoint.Platform,
-						GroupID:     event.GroupID,
-						MessageType: messageType,
-						Sender: SenderBase{
-							UserID: event.SenderID,
-						},
-					}, i)
-				}
+				ReplyToSender(ctx, &Message{
+					Platform:    ctx.EndPoint.Platform,
+					GroupID:     event.GroupID,
+					MessageType: messageType,
+					Sender:      SenderBase{UserID: event.SenderID},
+				}, text)
 			}
 		},
 		GetDescText: GetExtensionDesc,

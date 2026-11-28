@@ -142,6 +142,10 @@ type MsgCheckResult struct {
 }
 
 func (d *Dice) CensorMsg(mctx *MsgContext, msg *Message, checkContent string, sendContent string) (hit bool, hitWords []string, needToTerminate bool, newContent string) {
+	return d.censorMsg(mctx, msg, checkContent, sendContent, nil)
+}
+
+func (d *Dice) censorMsg(mctx *MsgContext, msg *Message, checkContent, sendContent string, origin *sendOrigin) (hit bool, hitWords []string, needToTerminate bool, newContent string) {
 	log := d.Logger
 	checkResult, err := d.CensorManager.Check(mctx, msg, checkContent)
 	if err != nil {
@@ -262,12 +266,13 @@ func (d *Dice) CensorMsg(mctx *MsgContext, msg *Message, checkContent string, se
 				}
 				// 仅增加怒气值
 				if msg.MessageType == "group" {
-					(&d.Config).BanList.AddScoreByCensor(
+					(&d.Config).BanList.addScoreByCensor(
 						msg.Sender.UserID,
 						int64(score),
 						groupInfo.GroupID,
 						levelText,
 						mctx,
+						origin,
 					)
 				}
 			}

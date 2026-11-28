@@ -96,21 +96,22 @@ type ExtInfo struct {
 	OnCommandOverride    func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) bool `jsbind:"onCommandOverride"    json:"-"                      yaml:"-"` // 覆盖指令行为
 	// NOTE(lyjjl): 尚不清楚海豹开发组为什么禁用这个 API
 
-	OnCommandReceived   func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) `jsbind:"onCommandReceived"   json:"-" yaml:"-"`
-	OnMessagePreprocess func(ctx *MsgContext, msg *Message) goja.Value        `jsbind:"onMessagePreprocess" json:"-" yaml:"-"`
-	OnMessageReceived   func(ctx *MsgContext, msg *Message)                   `jsbind:"onMessageReceived"   json:"-" yaml:"-"`
-	OnMessageSend       func(ctx *MsgContext, msg *Message, flag string)      `jsbind:"onMessageSend"       json:"-" yaml:"-"`
-	OnMessageDeleted    func(ctx *MsgContext, msg *Message)                   `jsbind:"onMessageDeleted"    json:"-" yaml:"-"`
-	OnMessageEdit       func(ctx *MsgContext, msg *Message)                   `jsbind:"onMessageEdit"       json:"-" yaml:"-"`
-	OnGroupJoined       func(ctx *MsgContext, msg *Message)                   `jsbind:"onGroupJoined"       json:"-" yaml:"-"`
-	OnGroupMemberJoined func(ctx *MsgContext, msg *Message)                   `jsbind:"onGroupMemberJoined" json:"-" yaml:"-"`
-	OnGuildJoined       func(ctx *MsgContext, msg *Message)                   `jsbind:"onGuildJoined"       json:"-" yaml:"-"`
-	OnBecomeFriend      func(ctx *MsgContext, msg *Message)                   `jsbind:"onBecomeFriend"      json:"-" yaml:"-"`
-	OnPoke              func(ctx *MsgContext, event *events.PokeEvent)        `jsbind:"onPoke"              json:"-" yaml:"-"` // 戳一戳
-	OnGroupLeave        func(ctx *MsgContext, event *events.GroupLeaveEvent)  `jsbind:"onGroupLeave"        json:"-" yaml:"-"` // 群成员被踢出
-	GetDescText         func(i *ExtInfo) string                               `jsbind:"getDescText"         json:"-" yaml:"-"`
-	IsLoaded            bool                                                  `jsbind:"isLoaded"            json:"-" yaml:"-"`
-	OnLoad              func()                                                `jsbind:"onLoad"              json:"-" yaml:"-"`
+	OnCommandReceived   func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs)               `jsbind:"onCommandReceived"   json:"-" yaml:"-"`
+	OnMessagePreprocess func(ctx *MsgContext, msg *Message) goja.Value                      `jsbind:"onMessagePreprocess" json:"-" yaml:"-"`
+	OnBeforeMessageSend func(ctx *MsgContext, msg *OutgoingMessage, flag string) goja.Value `jsbind:"onBeforeMessageSend" json:"-" yaml:"-"`
+	OnMessageReceived   func(ctx *MsgContext, msg *Message)                                 `jsbind:"onMessageReceived"   json:"-" yaml:"-"`
+	OnMessageSend       func(ctx *MsgContext, msg *Message, flag string)                    `jsbind:"onMessageSend"       json:"-" yaml:"-"`
+	OnMessageDeleted    func(ctx *MsgContext, msg *Message)                                 `jsbind:"onMessageDeleted"    json:"-" yaml:"-"`
+	OnMessageEdit       func(ctx *MsgContext, msg *Message)                                 `jsbind:"onMessageEdit"       json:"-" yaml:"-"`
+	OnGroupJoined       func(ctx *MsgContext, msg *Message)                                 `jsbind:"onGroupJoined"       json:"-" yaml:"-"`
+	OnGroupMemberJoined func(ctx *MsgContext, msg *Message)                                 `jsbind:"onGroupMemberJoined" json:"-" yaml:"-"`
+	OnGuildJoined       func(ctx *MsgContext, msg *Message)                                 `jsbind:"onGuildJoined"       json:"-" yaml:"-"`
+	OnBecomeFriend      func(ctx *MsgContext, msg *Message)                                 `jsbind:"onBecomeFriend"      json:"-" yaml:"-"`
+	OnPoke              func(ctx *MsgContext, event *events.PokeEvent)                      `jsbind:"onPoke"              json:"-" yaml:"-"` // 戳一戳
+	OnGroupLeave        func(ctx *MsgContext, event *events.GroupLeaveEvent)                `jsbind:"onGroupLeave"        json:"-" yaml:"-"` // 群成员被踢出
+	GetDescText         func(i *ExtInfo) string                                             `jsbind:"getDescText"         json:"-" yaml:"-"`
+	IsLoaded            bool                                                                `jsbind:"isLoaded"            json:"-" yaml:"-"`
+	OnLoad              func()                                                              `jsbind:"onLoad"              json:"-" yaml:"-"`
 
 	// Wrapper 相关字段
 	IsWrapper  bool   `json:"-" yaml:"-"` // 是否为 Wrapper ExtInfo (代理对象)
@@ -135,9 +136,11 @@ type ExtDefaultSettingItem struct {
 type ExtDefaultSettingItemSlice []*ExtDefaultSettingItem
 
 type JsLoopManager struct {
-	loop     *eventloop.EventLoop
-	loopLock sync.RWMutex
-	version  int64
+	setLoopMu sync.Mutex
+	loop      *eventloop.EventLoop
+	loopLock  sync.RWMutex
+	version   int64
+	sendState *sendLoopState
 }
 
 func NewJsLoopManager() *JsLoopManager {
@@ -167,20 +170,43 @@ func (m *JsLoopManager) GetWebLoop() *eventloop.EventLoop {
 	return m.loop
 }
 
+func (m *JsLoopManager) getSendLoop(version int64) (*eventloop.EventLoop, *sendLoopState) {
+	m.loopLock.RLock()
+	defer m.loopLock.RUnlock()
+	if version != 0 && m.version != version {
+		return nil, nil
+	}
+	return m.loop, m.sendState
+}
+
 // SetLoop 写入新的 loop 并自动递增版本号
 func (m *JsLoopManager) SetLoop(newLoop *eventloop.EventLoop) int64 {
-	m.loopLock.Lock()
-	defer m.loopLock.Unlock()
+	m.setLoopMu.Lock()
+	defer m.setLoopMu.Unlock()
 
-	// 停止旧的 loop（如果存在）
-	if m.loop != nil {
-		m.loop.Terminate()
+	m.loopLock.Lock()
+	oldLoop := m.loop
+	if m.sendState != nil {
+		m.sendState.stopped.Store(true)
+	}
+	m.loop = nil
+	m.sendState = nil
+	m.version++
+	version := m.version
+	m.loopLock.Unlock()
+
+	// Terminate waits for callbacks, which may look up this manager.
+	if oldLoop != nil {
+		oldLoop.Terminate()
 	}
 
-	// 设置新的 loop 并递增版本号
+	m.loopLock.Lock()
 	m.loop = newLoop
-	m.version++
-	return m.version
+	if newLoop != nil {
+		m.sendState = &sendLoopState{version: version}
+	}
+	m.loopLock.Unlock()
+	return version
 }
 
 // 强制coc7排序在较前位置

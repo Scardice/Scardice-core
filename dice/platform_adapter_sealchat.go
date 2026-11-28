@@ -550,7 +550,7 @@ func ExtractSealChatUserID(id string) string {
 	return id
 }
 
-func (pa *PlatformAdapterSealChat) _sendTo(ctx *MsgContext, chId string, text string, flag string, msgType string) {
+func (pa *PlatformAdapterSealChat) _sendTo(ctx *MsgContext, chId string, text string, flag string, msgType string, origin *sendOrigin) {
 	// 使用 encodeMessage 转换消息格式（支持图片等）
 	encodedContent := pa.encodeMessage(text)
 
@@ -569,7 +569,7 @@ func (pa *PlatformAdapterSealChat) _sendTo(ctx *MsgContext, chId string, text st
 	text = strings.ReplaceAll(text, "&gt;", ">")
 	text = strings.ReplaceAll(text, "&amp;", "&")
 	text = strings.ReplaceAll(text, "&quot;", "\"")
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		Platform:    "SEALCHAT",
 		MessageType: msgType,
 		Message:     text,
@@ -628,19 +628,27 @@ func (pa *PlatformAdapterSealChat) SendSegmentToPerson(ctx *MsgContext, userID s
 }
 
 func (pa *PlatformAdapterSealChat) SendToPerson(ctx *MsgContext, uid string, text string, flag string) {
+	pa.sendToPerson(ctx, uid, text, flag, nil)
+}
+
+func (pa *PlatformAdapterSealChat) sendToPerson(ctx *MsgContext, uid string, text string, flag string, origin *sendOrigin) {
 	<-pa.sendAPI("channel.private.create", map[string]string{
 		"user_id": ExtractSealChatUserID(uid),
 	})
 
 	text = satori.ContentEscape(text)
 	gid := ExtractSealChatPrivateChatID(uid, pa.EndPoint.UserID)
-	pa._sendTo(ctx, gid, text, flag, "private")
+	pa._sendTo(ctx, gid, text, flag, "private", origin)
 }
 
 func (pa *PlatformAdapterSealChat) SendToGroup(ctx *MsgContext, uid string, text string, flag string) {
+	pa.sendToGroup(ctx, uid, text, flag, nil)
+}
+
+func (pa *PlatformAdapterSealChat) sendToGroup(ctx *MsgContext, uid string, text string, flag string, origin *sendOrigin) {
 	chId := ExtractSealChatUserID(uid)
 	text = satori.ContentEscape(text)
-	pa._sendTo(ctx, chId, text, flag, "group")
+	pa._sendTo(ctx, chId, text, flag, "group", origin)
 }
 
 func (pa *PlatformAdapterSealChat) SendFileToPerson(ctx *MsgContext, uid string, path string, flag string) {

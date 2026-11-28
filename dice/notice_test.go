@@ -115,7 +115,7 @@ func Test_sendNoticeTargetCrossPlatform_delivers_selected_target_without_metadat
 	if len(targets) != 1 {
 		t.Fatalf("selected targets = %#v, want one ban target", targets)
 	}
-	sent := sendNoticeTargetCrossPlatform(ctx, targets[0], "ban notice")
+	sent := sendNoticeTargetCrossPlatform(ctx, targets[0], "ban notice", NoticeTypeBan)
 
 	// Then
 	if !sent {

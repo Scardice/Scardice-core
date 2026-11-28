@@ -93,10 +93,14 @@ func (pa *PlatformAdapterGocq) QQChannelTrySolve(message string) {
 }
 
 func (pa *PlatformAdapterGocq) SendToChannelGroup(ctx *MsgContext, userID string, text string, flag string) {
+	pa.sendToChannelGroup(ctx, userID, text, flag, nil)
+}
+
+func (pa *PlatformAdapterGocq) sendToChannelGroup(ctx *MsgContext, userID string, text string, flag string, origin *sendOrigin) {
 	rawID, _ := pa.mustExtractChannelID(userID)
 	for _, i := range ctx.Dice.ExtList {
 		if i.OnMessageSend != nil {
-			i.callWithJsCheck(ctx.Dice, func() {
+			origin.callObserver(ctx.Dice, i, func() {
 				i.OnMessageSend(ctx, &Message{
 					MessageType: "group",
 					Message:     text,

@@ -389,9 +389,12 @@ func (pa *PlatformAdapterWalleQ) Serve() int {
 								VarSetValueStr(ctx, "$t帐号ID", stdID)
 								VarSetValueStr(ctx, "$t账号ID", stdID)
 								text := DiceFormat(ctx, groupInfo.GroupWelcomeMessage)
-								for _, i := range ctx.SplitText(text) {
-									doSleepQQ(ctx)
-									pa.SendToGroup(ctx, msg.GroupID, strings.TrimSpace(i), "")
+								text, ok := prepareOutboundText(ctx, pa.EndPoint, msg.GroupID, text, "", true, nil)
+								if ok {
+									for _, i := range ctx.SplitText(text) {
+										doSleepQQ(ctx)
+										pa.SendToGroup(ctx, msg.GroupID, strings.TrimSpace(i), "")
+									}
 								}
 							}()
 						}
@@ -802,6 +805,10 @@ func (pa *PlatformAdapterWalleQ) SendSegmentToPerson(ctx *MsgContext, userID str
 }
 
 func (pa *PlatformAdapterWalleQ) SendToPerson(ctx *MsgContext, userID string, text string, flag string) {
+	pa.sendToPerson(ctx, userID, text, flag, nil)
+}
+
+func (pa *PlatformAdapterWalleQ) sendToPerson(ctx *MsgContext, userID string, text string, flag string, origin *sendOrigin) {
 	rawID, idType := pa.mustExtractID(userID)
 	if idType != QQUidPerson {
 		return
@@ -809,7 +816,7 @@ func (pa *PlatformAdapterWalleQ) SendToPerson(ctx *MsgContext, userID string, te
 
 	for _, i := range ctx.Dice.ExtList {
 		if i.OnMessageSend != nil {
-			i.callWithJsCheck(ctx.Dice, func() {
+			origin.callObserver(ctx.Dice, i, func() {
 				i.OnMessageSend(ctx, &Message{
 					Platform:    "QQ",
 					Message:     text,
@@ -832,6 +839,10 @@ func (pa *PlatformAdapterWalleQ) SendToPerson(ctx *MsgContext, userID string, te
 }
 
 func (pa *PlatformAdapterWalleQ) SendToGroup(ctx *MsgContext, groupID string, text string, flag string) {
+	pa.sendToGroup(ctx, groupID, text, flag, nil)
+}
+
+func (pa *PlatformAdapterWalleQ) sendToGroup(ctx *MsgContext, groupID string, text string, flag string, origin *sendOrigin) {
 	if groupID == "" {
 		return
 	}
@@ -853,12 +864,7 @@ func (pa *PlatformAdapterWalleQ) SendToGroup(ctx *MsgContext, groupID string, te
 				Nickname: pa.EndPoint.Nickname,
 			},
 		}
-		groupInfo.TriggerExtHook(ctx.Dice, func(ext *ExtInfo) func() {
-			if ext.OnMessageSend == nil {
-				return nil
-			}
-			return func() { ext.OnMessageSend(ctx, msgToSend, flag) }
-		})
+		origin.notifyGroup(groupInfo, ctx, msgToSend, flag)
 	}
 
 	text = textAssetsConvert(text)

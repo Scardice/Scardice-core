@@ -955,6 +955,10 @@ func (pa *PlatformAdapterGocq) Serve() int {
 							VarSetValueStr(ctx, "$t帐号ID", stdID)
 							VarSetValueStr(ctx, "$t账号ID", stdID)
 							text := DiceFormat(ctx, group.GroupWelcomeMessage)
+							text, allowed := prepareOutboundText(ctx, ep, msg.GroupID, text, "", true, nil)
+							if !allowed {
+								return
+							}
 							for _, i := range ctx.SplitText(text) {
 								doSleepQQ(ctx)
 								pa.SendToGroup(ctx, msg.GroupID, strings.TrimSpace(i), "")

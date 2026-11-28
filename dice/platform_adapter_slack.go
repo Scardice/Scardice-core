@@ -217,8 +217,12 @@ func (pa *PlatformAdapterSlack) SendSegmentToPerson(ctx *MsgContext, userID stri
 }
 
 func (pa *PlatformAdapterSlack) SendToPerson(ctx *MsgContext, userID string, text string, flag string) {
+	pa.sendToPerson(ctx, userID, text, flag, nil)
+}
+
+func (pa *PlatformAdapterSlack) sendToPerson(ctx *MsgContext, userID string, text string, flag string, origin *sendOrigin) {
 	pa.send(ctx, ExtractSlackUserID(userID), text, flag)
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		MessageType: "private",
 		Platform:    "SLACK",
 		Message:     text,
@@ -230,8 +234,12 @@ func (pa *PlatformAdapterSlack) SendToPerson(ctx *MsgContext, userID string, tex
 }
 
 func (pa *PlatformAdapterSlack) SendToGroup(ctx *MsgContext, groupID string, text string, flag string) {
+	pa.sendToGroup(ctx, groupID, text, flag, nil)
+}
+
+func (pa *PlatformAdapterSlack) sendToGroup(ctx *MsgContext, groupID string, text string, flag string, origin *sendOrigin) {
 	pa.send(ctx, ExtractSlackChannelID(groupID), text, flag)
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		MessageType: "group",
 		Platform:    "SLACK",
 		Message:     text,

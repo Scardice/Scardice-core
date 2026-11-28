@@ -852,6 +852,10 @@ func ParseMessageToMilky(send []message.IMessageElement) []milky.IMessageElement
 }
 
 func (pa *PlatformAdapterMilky) SendToPerson(ctx *MsgContext, uid string, text string, flag string) {
+	pa.sendToPerson(ctx, uid, text, flag, nil)
+}
+
+func (pa *PlatformAdapterMilky) sendToPerson(ctx *MsgContext, uid string, text string, flag string, origin *sendOrigin) {
 	log := zap.S().Named(logger.LogKeyAdapter)
 	send := message.ConvertStringMessage(text)
 	elements := ParseMessageToMilky(send)
@@ -869,7 +873,7 @@ func (pa *PlatformAdapterMilky) SendToPerson(ctx *MsgContext, uid string, text s
 		log.Errorf("Failed to send private message to %s: %v", uid, err)
 		return
 	}
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		Platform:    "QQ",
 		MessageType: "private",
 		Message:     text,
@@ -882,6 +886,10 @@ func (pa *PlatformAdapterMilky) SendToPerson(ctx *MsgContext, uid string, text s
 }
 
 func (pa *PlatformAdapterMilky) SendToGroup(ctx *MsgContext, groupID string, text string, flag string) {
+	pa.sendToGroup(ctx, groupID, text, flag, nil)
+}
+
+func (pa *PlatformAdapterMilky) sendToGroup(ctx *MsgContext, groupID string, text string, flag string, origin *sendOrigin) {
 	log := zap.S().Named(logger.LogKeyAdapter)
 	send := message.ConvertStringMessage(text)
 	elements := ParseMessageToMilky(send)
@@ -924,7 +932,7 @@ func (pa *PlatformAdapterMilky) SendToGroup(ctx *MsgContext, groupID string, tex
 			doSleepQQ(ctx)
 		}
 	}(nudgeTargets)
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		Platform:    "QQ",
 		MessageType: "group",
 		Message:     text,

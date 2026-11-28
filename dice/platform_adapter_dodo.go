@@ -330,13 +330,17 @@ func (pa *PlatformAdapterDodo) SendSegmentToPerson(ctx *MsgContext, userID strin
 }
 
 func (pa *PlatformAdapterDodo) SendToPerson(ctx *MsgContext, uid string, text string, flag string) {
+	pa.sendToPerson(ctx, uid, text, flag, nil)
+}
+
+func (pa *PlatformAdapterDodo) sendToPerson(ctx *MsgContext, uid string, text string, flag string, origin *sendOrigin) {
 	// pa.EndPoint.Session.Parent.Logger.Infof("send to %s", ExtractDodoUserId(uid))
 	err := pa.SendToPersonRaw(ctx, uid, text, true)
 	if err != nil {
 		pa.EndPoint.Session.Parent.Logger.Errorf("DODO 发送私聊消息失败：%v\n", err)
 		return
 	}
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		MessageType: "private",
 		Platform:    "DODO",
 		Message:     text,
@@ -348,12 +352,16 @@ func (pa *PlatformAdapterDodo) SendToPerson(ctx *MsgContext, uid string, text st
 }
 
 func (pa *PlatformAdapterDodo) SendToGroup(ctx *MsgContext, uid string, text string, flag string) {
+	pa.sendToGroup(ctx, uid, text, flag, nil)
+}
+
+func (pa *PlatformAdapterDodo) sendToGroup(ctx *MsgContext, uid string, text string, flag string, origin *sendOrigin) {
 	err := pa.SendToChatRaw(ctx, uid, text, false)
 	if err != nil {
 		pa.EndPoint.Session.Parent.Logger.Errorf("DODO 发送消息失败：%v\n", err)
 		return
 	}
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		MessageType: "group",
 		Platform:    "DODO",
 		Message:     text,

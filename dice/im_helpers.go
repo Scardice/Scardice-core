@@ -152,11 +152,11 @@ func TryReplyToSenderMergedForward(ctx *MsgContext, msg *Message, title string, 
 
 	if ctx.Dice.Config.RateLimitEnabled && msg.Platform == "QQ" {
 		if msg.MessageType == "group" {
-			if !spamCheckPerson(ctx, msg) {
-				spamCheckGroup(ctx, msg)
+			if !(*sendOrigin)(nil).spamCheckPerson(ctx, msg) {
+				(*sendOrigin)(nil).spamCheckGroup(ctx, msg)
 			}
 		} else {
-			spamCheckPerson(ctx, msg)
+			(*sendOrigin)(nil).spamCheckPerson(ctx, msg)
 		}
 	}
 
@@ -196,6 +196,10 @@ func TryReplyToSenderMergedForward(ctx *MsgContext, msg *Message, title string, 
 // ReplyForward lets extensions resend received structured nodes or construct
 // their own. Missing sender identity is normalized to the current endpoint.
 func ReplyForward(ctx *MsgContext, msg *Message, nodes []message.ForwardNode) bool {
+	return (*sendOrigin)(nil).replyForward(ctx, msg, nodes)
+}
+
+func (origin *sendOrigin) replyForward(ctx *MsgContext, msg *Message, nodes []message.ForwardNode) bool {
 	if ctx == nil || msg == nil || ctx.EndPoint == nil || ctx.EndPoint.Adapter == nil || len(nodes) == 0 {
 		return false
 	}
@@ -220,20 +224,20 @@ func ReplyForward(ctx *MsgContext, msg *Message, nodes []message.ForwardNode) bo
 			return false
 		}
 		if msg.MessageType == "group" {
-			ctx.EndPoint.Adapter.SendToGroup(ctx, msg.GroupID, text, "")
+			origin.sendText(ctx.EndPoint.Adapter, ctx, msg.GroupID, text, "", true)
 			return true
 		}
 		if msg.MessageType == "private" {
-			ctx.EndPoint.Adapter.SendToPerson(ctx, msg.Sender.UserID, text, "")
+			origin.sendText(ctx.EndPoint.Adapter, ctx, msg.Sender.UserID, text, "", false)
 			return true
 		}
 		return false
 	}
 	if msg.MessageType == "group" {
-		return sender.SendGroupForwardMsg(ctx, msg.GroupID, nodes)
+		return origin.sendForward(sender, ctx, msg.GroupID, nodes, true)
 	}
 	if msg.MessageType == "private" {
-		return sender.SendPrivateForwardMsg(ctx, msg.Sender.UserID, nodes)
+		return origin.sendForward(sender, ctx, msg.Sender.UserID, nodes, false)
 	}
 	return false
 }
@@ -412,14 +416,6 @@ func ReplyToSenderRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 	}
 }
 
-func replyToSenderRawNoCheck(ctx *MsgContext, msg *Message, text string, flag string) {
-	inGroup := msg.MessageType == "group"
-	if inGroup {
-		replyGroupRawNoCheck(ctx, msg, text, flag)
-	} else {
-		replyPersonRawNoCheck(ctx, msg, text, flag)
-	}
-}
 func ReplyToSender(ctx *MsgContext, msg *Message, text string) {
 	if ctx == nil || msg == nil || ctx.Dice == nil {
 		logger.M().Errorf("ReplyToSender 被调用，但没有正确传递参数！请检查您的参数！: ctx=%v, msg=%v", ctx, msg)
@@ -436,76 +432,12 @@ func ReplyToSenderNoCheck(ctx *MsgContext, msg *Message, text string) {
 		return
 	}
 	panicHandler.Once(logger.M(), func() {
-		replyToSenderRawNoCheck(ctx, msg, text, "")
+		(*sendOrigin)(nil).replyNoCheck(ctx, replyTarget(ctx, msg, msg.MessageType == "group"), consumeReplyPrefixes(ctx, text), "")
 	})
 }
 
 func ReplyGroupRaw(ctx *MsgContext, msg *Message, text string, flag string) {
-	if ctx.AliasPrefixText != "" {
-		text = ctx.AliasPrefixText + text
-		ctx.AliasPrefixText = ""
-	}
-	if ctx.DelegateText != "" {
-		text = ctx.DelegateText + text
-		ctx.DelegateText = ""
-	}
-
-	if ctx.Dice.Config.RateLimitEnabled && msg.Platform == "QQ" {
-		if !spamCheckPerson(ctx, msg) {
-			spamCheckGroup(ctx, msg)
-		}
-	}
-
-	d := ctx.Dice
-	if d != nil {
-		visibleText := visibleReplyText(ctx, text)
-		d.Logger.Infof("发给(群%s): %s", msg.GroupID, visibleText)
-		// 敏感词拦截：回复（群）
-		if d.Config.EnableCensor && d.Config.CensorMode == OnlyOutputReply {
-			// 先拿掉余烬码和CQ码再检查敏感词
-			checkText := sealCodeRe.ReplaceAllString(visibleText, "")
-			checkText = cqCodeRe.ReplaceAllString(checkText, "")
-
-			hit, words, needToTerminate, _ := d.CensorMsg(ctx, msg, checkText, text)
-			if needToTerminate {
-				return
-			}
-			if hit {
-				d.Logger.Infof(
-					"拒绝回复命中敏感词「%s」的内容「%s」，原消息「%s」- 来自群(%s)内<%s>(%s)",
-					strings.Join(words, "|"),
-					text, msg.Message,
-					msg.GroupID,
-					msg.Sender.Nickname,
-					msg.Sender.UserID,
-				)
-				text = DiceFormatTmpl(ctx, "核心:拦截_完全拦截_发出的消息")
-			}
-		}
-	}
-	replyGroupRawNoCheck(ctx, msg, text, flag)
-}
-
-func replyGroupRawNoCheck(ctx *MsgContext, msg *Message, text string, flag string) {
-	if ctx != nil {
-		ctx.SetCommandReplied(true)
-	}
-	if ctx.AliasPrefixText != "" {
-		text = ctx.AliasPrefixText + text
-		ctx.AliasPrefixText = ""
-	}
-	if ctx.DelegateText != "" {
-		text = ctx.DelegateText + text
-		ctx.DelegateText = ""
-	}
-	if lenWithoutBase64(text) > 15000 {
-		text = "要发送的文本过长"
-	}
-	if ctx.Group != nil {
-		atomic.StoreInt64(&ctx.Group.RecentDiceSendTime, time.Now().Unix())
-		ctx.Group.MarkDirty(ctx.Dice)
-	}
-	deliverReplyPlan(ctx, msg, strings.TrimSpace(text), flag, true)
+	(*sendOrigin)(nil).replyRaw(ctx, msg, text, flag, true)
 }
 
 func ReplyGroup(ctx *MsgContext, msg *Message, text string) {
@@ -513,6 +445,24 @@ func ReplyGroup(ctx *MsgContext, msg *Message, text string) {
 }
 
 func ReplyPersonRaw(ctx *MsgContext, msg *Message, text string, flag string) {
+	(*sendOrigin)(nil).replyRaw(ctx, msg, text, flag, false)
+}
+
+type outboundTarget struct {
+	endpoint *EndPointInfo
+	id       string
+	group    bool
+}
+
+func replyTarget(ctx *MsgContext, msg *Message, group bool) outboundTarget {
+	id := msg.Sender.UserID
+	if group {
+		id = msg.GroupID
+	}
+	return outboundTarget{endpoint: ctx.EndPoint, id: id, group: group}
+}
+
+func consumeReplyPrefixes(ctx *MsgContext, text string) string {
 	if ctx.AliasPrefixText != "" {
 		text = ctx.AliasPrefixText + text
 		ctx.AliasPrefixText = ""
@@ -521,62 +471,76 @@ func ReplyPersonRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 		text = ctx.DelegateText + text
 		ctx.DelegateText = ""
 	}
+	return text
+}
 
-	if ctx.Dice.Config.RateLimitEnabled && msg.Platform == "QQ" {
-		spamCheckPerson(ctx, msg)
+func (origin *sendOrigin) replyRaw(ctx *MsgContext, msg *Message, text, flag string, group bool) {
+	origin.replyChecked(ctx, msg, text, flag, group, true)
+}
+
+func (origin *sendOrigin) replyChecked(ctx *MsgContext, msg *Message, text, flag string, group, filter bool) {
+	target := replyTarget(ctx, msg, group)
+	text = consumeReplyPrefixes(ctx, text)
+	if filter {
+		var allowed bool
+		text, allowed = prepareOutboundText(ctx, target.endpoint, target.id, text, flag, group, origin)
+		// The reply is already composed; a hook cannot add an unchecked prefix.
+		ctx.AliasPrefixText, ctx.DelegateText = "", ""
+		if !allowed {
+			ctx.SetCommandReplied(true)
+			return
+		}
 	}
 
 	d := ctx.Dice
-	if d != nil {
-		visibleText := visibleReplyText(ctx, text)
-		d.Logger.Infof("发给(帐号%s): %s", msg.Sender.UserID, visibleText)
-		// 敏感词拦截：回复（个人）
-		if d.Config.EnableCensor && d.Config.CensorMode == OnlyOutputReply {
-			// 先拿掉余烬码和CQ码再检查敏感词
-			checkText := sealCodeRe.ReplaceAllString(visibleText, "")
-			checkText = cqCodeRe.ReplaceAllString(checkText, "")
-
-			hit, words, needToTerminate, _ := d.CensorMsg(ctx, msg, checkText, text)
-			if needToTerminate {
-				return
-			}
-			if hit {
-				d.Logger.Infof("拒绝回复命中敏感词「%s」的内容「%s」，原消息「%s」- 来自<%s>(%s)",
-					strings.Join(words, "|"),
-					text,
-					msg.Message,
-					msg.Sender.Nickname,
-					msg.Sender.UserID,
-				)
-				text = DiceFormatTmpl(ctx, "核心:拦截_完全拦截_发出的消息")
-			}
+	if d.Config.RateLimitEnabled && msg.Platform == "QQ" {
+		if !origin.spamCheckPerson(ctx, msg) && group {
+			origin.spamCheckGroup(ctx, msg)
 		}
 	}
-	replyPersonRawNoCheck(ctx, msg, text, flag)
+	visibleText := visibleReplyText(ctx, text)
+	if group {
+		d.Logger.Infof("发给(群%s): %s", target.id, visibleText)
+	} else {
+		d.Logger.Infof("发给(帐号%s): %s", target.id, visibleText)
+	}
+	if d.Config.EnableCensor && d.Config.CensorMode == OnlyOutputReply {
+		checkText := cqCodeRe.ReplaceAllString(sealCodeRe.ReplaceAllString(visibleText, ""), "")
+		hit, words, needToTerminate, _ := d.censorMsg(ctx, msg, checkText, text, origin)
+		if needToTerminate {
+			return
+		}
+		if hit {
+			if group {
+				d.Logger.Infof("拒绝回复命中敏感词「%s」的内容「%s」，原消息「%s」- 来自群(%s)内<%s>(%s)",
+					strings.Join(words, "|"), text, msg.Message, target.id, msg.Sender.Nickname, msg.Sender.UserID)
+			} else {
+				d.Logger.Infof("拒绝回复命中敏感词「%s」的内容「%s」，原消息「%s」- 来自<%s>(%s)",
+					strings.Join(words, "|"), text, msg.Message, msg.Sender.Nickname, target.id)
+			}
+			text = DiceFormatTmpl(ctx, "核心:拦截_完全拦截_发出的消息")
+		}
+	}
+	origin.replyNoCheck(ctx, target, text, flag)
 }
 
-func replyPersonRawNoCheck(ctx *MsgContext, msg *Message, text string, flag string) {
-	if ctx != nil {
-		ctx.SetCommandReplied(true)
-	}
-	if ctx.AliasPrefixText != "" {
-		text = ctx.AliasPrefixText + text
-		ctx.AliasPrefixText = ""
-	}
-	if ctx.DelegateText != "" {
-		text = ctx.DelegateText + text
-		ctx.DelegateText = ""
-	}
+func (origin *sendOrigin) replyNoCheck(ctx *MsgContext, target outboundTarget, text, flag string) {
+	ctx.SetCommandReplied(true)
 	if lenWithoutBase64(text) > 15000 {
 		text = "要发送的文本过长"
 	}
-	deliverReplyPlan(ctx, msg, strings.TrimSpace(text), flag, false)
+	if target.group && ctx.Group != nil {
+		atomic.StoreInt64(&ctx.Group.RecentDiceSendTime, time.Now().Unix())
+		ctx.Group.MarkDirty(ctx.Dice)
+	}
+	origin.deliverReplyPlan(ctx, target, strings.TrimSpace(text), flag)
 }
 
-func deliverReplyPlan(ctx *MsgContext, msg *Message, text string, flag string, group bool) {
-	if ctx == nil || ctx.EndPoint == nil || ctx.EndPoint.Adapter == nil {
+func (origin *sendOrigin) deliverReplyPlan(ctx *MsgContext, target outboundTarget, text, flag string) {
+	if target.endpoint == nil || target.endpoint.Adapter == nil {
 		return
 	}
+	adapter := target.endpoint.Adapter
 	for _, item := range ctx.compileReplyPlan(text) {
 		if item.Forward {
 			parts := ctx.SplitText(item.Text)
@@ -589,43 +553,27 @@ func deliverReplyPlan(ctx *MsgContext, msg *Message, text string, flag string, g
 			if len(contents) == 0 {
 				continue
 			}
-			if sender, ok := ctx.EndPoint.Adapter.(forwardMsgSender); ok {
+			if sender, ok := adapter.(forwardMsgSender); ok {
 				nodes := BuildForwardNodesFromContext(ctx, "", contents)
-				if group {
-					sender.SendGroupForwardMsg(ctx, msg.GroupID, nodes)
-				} else {
-					sender.SendPrivateForwardMsg(ctx, msg.Sender.UserID, nodes)
-				}
+				origin.sendForward(sender, ctx, target.id, nodes, target.group)
 				continue
 			}
-			// Unsupported platforms receive the whole block as one ordinary
-			// message. SPLIT only controls forward nodes, so remove its marker
-			// without splitting the fallback message.
+			// On unsupported platforms the forward block stays one ordinary message.
 			fallbackText := strings.TrimSpace(stripForwardSplitMarkers(item.Text, ctx.getSplitKey()))
-			if fallbackText == "" {
-				continue
-			}
-			if group {
-				ctx.EndPoint.Adapter.SendToGroup(ctx, msg.GroupID, fallbackText, flag)
-			} else {
-				ctx.EndPoint.Adapter.SendToPerson(ctx, msg.Sender.UserID, fallbackText, flag)
+			if fallbackText != "" {
+				origin.sendText(adapter, ctx, target.id, fallbackText, flag, target.group)
 			}
 			continue
 		}
-		parts := ctx.SplitText(item.Text)
-		for _, part := range parts {
+		for _, part := range ctx.SplitText(item.Text) {
 			part = strings.TrimSpace(part)
 			if part == "" {
 				continue
 			}
-			if ctx.EndPoint.Platform == "QQ" {
+			if target.endpoint.Platform == "QQ" {
 				doSleepQQ(ctx)
 			}
-			if group {
-				ctx.EndPoint.Adapter.SendToGroup(ctx, msg.GroupID, part, flag)
-			} else {
-				ctx.EndPoint.Adapter.SendToPerson(ctx, msg.Sender.UserID, part, flag)
-			}
+			origin.sendText(adapter, ctx, target.id, part, flag, target.group)
 		}
 	}
 }
@@ -803,7 +751,7 @@ func applyRateLimiterPenalty(limiter *rate.Limiter, base rate.Limit, multiplier 
 	limiter.SetLimit(target)
 }
 
-func spamCheckPerson(ctx *MsgContext, msg *Message) bool {
+func (origin *sendOrigin) spamCheckPerson(ctx *MsgContext, msg *Message) bool {
 	if ctx.SpamCheckedPerson {
 		return false
 	}
@@ -858,12 +806,12 @@ func spamCheckPerson(ctx *MsgContext, msg *Message) bool {
 	}
 
 	if ctx.Player.RateLimitWarned {
-		ctx.Dice.Config.BanList.AddScoreByCommandSpam(ctx.Player.UserID, msg.GroupID, ctx)
+		ctx.Dice.Config.BanList.addScoreByCommandSpam(ctx.Player.UserID, msg.GroupID, ctx, origin)
 	} else {
 		ctx.Player.RateLimitWarned = true
-		replyToSenderRawNoCheck(
-			ctx, msg,
-			DiceFormatTmpl(ctx, "核心:刷屏_警告内容_个人"),
+		origin.replyNoCheck(
+			ctx, replyTarget(ctx, msg, msg.MessageType == "group"),
+			consumeReplyPrefixes(ctx, DiceFormatTmpl(ctx, "核心:刷屏_警告内容_个人")),
 			"",
 		)
 	}
@@ -871,7 +819,7 @@ func spamCheckPerson(ctx *MsgContext, msg *Message) bool {
 	return true
 }
 
-func spamCheckGroup(ctx *MsgContext, msg *Message) bool {
+func (origin *sendOrigin) spamCheckGroup(ctx *MsgContext, msg *Message) bool {
 	if ctx.SpamCheckedGroup {
 		return false
 	}
@@ -930,12 +878,12 @@ func spamCheckGroup(ctx *MsgContext, msg *Message) bool {
 
 	// If not allow
 	if ctx.Group.RateLimitWarned {
-		ctx.Dice.Config.BanList.AddScoreByCommandSpam(ctx.Group.GroupID, msg.GroupID, ctx)
+		ctx.Dice.Config.BanList.addScoreByCommandSpam(ctx.Group.GroupID, msg.GroupID, ctx, origin)
 	} else {
 		ctx.Group.RateLimitWarned = true
-		replyToSenderRawNoCheck(
-			ctx, msg,
-			DiceFormatTmpl(ctx, "核心:刷屏_警告内容_群组"),
+		origin.replyNoCheck(
+			ctx, replyTarget(ctx, msg, msg.MessageType == "group"),
+			consumeReplyPrefixes(ctx, DiceFormatTmpl(ctx, "核心:刷屏_警告内容_群组")),
 			"",
 		)
 	}

@@ -237,6 +237,10 @@ func (i *BanListInfo) NoticeCheckPrepare(uid string) BanRankType {
 }
 
 func (i *BanListInfo) NoticeCheck(uid string, place string, oldRank BanRankType, ctx *MsgContext) BanRankType {
+	return i.noticeCheck(uid, place, oldRank, ctx, nil)
+}
+
+func (i *BanListInfo) noticeCheck(uid, place string, oldRank BanRankType, ctx *MsgContext, origin *sendOrigin) BanRankType {
 	log := i.Parent.Logger
 	item, ok := i.GetByID(uid)
 	if !ok {
@@ -264,12 +268,16 @@ func (i *BanListInfo) NoticeCheck(uid string, place string, oldRank BanRankType,
 
 		if !isWhiteGroup {
 			// Quit group immediately before sending other notifications to avoid spam
-			ReplyGroupRaw(ctx,
+			origin.replyChecked(ctx,
 				&Message{GroupID: place},
 				DiceFormatTmpl(ctx, "核心:黑名单惩罚_退群"),
-				"")
+				"", true, false)
 			time.Sleep(1 * time.Second)
-			ctx.EndPoint.Adapter.QuitGroup(ctx, place)
+			if adapter, ok := ctx.EndPoint.Adapter.(*PlatformAdapterDingTalk); ok {
+				adapter.quitGroup(ctx, place, origin)
+			} else {
+				ctx.EndPoint.Adapter.QuitGroup(ctx, place)
+			}
 			return 0
 		}
 		d.Logger.Infof("群<%s>触发\"退出事发群\"的拉黑惩罚，但该群是信任群所以未退群", place)
@@ -286,17 +294,17 @@ func (i *BanListInfo) NoticeCheck(uid string, place string, oldRank BanRankType,
 		VarSetValueStr(ctx, "$t黑名单事件", txt)
 
 		// 发给当事人
-		ReplyPersonRaw(ctx,
+		origin.replyChecked(ctx,
 			&Message{Sender: SenderBase{UserID: uid}},
 			DiceFormatTmpl(ctx, "核心:黑名单触发_当事人"),
-			"")
+			"", false, false)
 
 		// 发给当事群
 		time.Sleep(1 * time.Second)
-		ReplyGroupRaw(ctx,
+		origin.replyChecked(ctx,
 			&Message{GroupID: place},
 			DiceFormatTmpl(ctx, "核心:黑名单触发_所在群"),
-			"")
+			"", true, false)
 
 		// 发给邀请者
 		time.Sleep(1 * time.Second)
@@ -305,7 +313,7 @@ func (i *BanListInfo) NoticeCheck(uid string, place string, oldRank BanRankType,
 			VarSetValueStr(ctx, "$t事发群名", groupInfo.GroupName)
 			VarSetValueStr(ctx, "$t事发群号", groupInfo.GroupID)
 			text := DiceFormatTmpl(ctx, "核心:黑名单触发_邀请人")
-			ReplyPersonRaw(ctx, &Message{Sender: SenderBase{UserID: groupInfo.InviteUserID}}, text, "")
+			origin.replyChecked(ctx, &Message{Sender: SenderBase{UserID: groupInfo.InviteUserID}}, text, "", false, false)
 		}
 	}
 
@@ -342,29 +350,37 @@ func (i *BanListInfo) AddScoreByGroupKicked(uid string, place string, ctx *MsgCo
 
 // AddScoreByCommandSpam 指令刷屏
 func (i *BanListInfo) AddScoreByCommandSpam(uid string, place string, ctx *MsgContext) {
+	i.addScoreByCommandSpam(uid, place, ctx, nil)
+}
+
+func (i *BanListInfo) addScoreByCommandSpam(uid, place string, ctx *MsgContext, origin *sendOrigin) {
 	rank := i.NoticeCheckPrepare(uid)
 
 	i.AddScoreBase(uid, i.ScoreTooManyCommand, place, "指令刷屏", ctx)
 	inviterID, inviterRank := i.addJointScore(uid, i.ScoreTooManyCommand, place, "连带责任:指令刷屏", ctx)
 
-	i.NoticeCheck(uid, place, rank, ctx)
+	i.noticeCheck(uid, place, rank, ctx, origin)
 	if inviterID != "" && inviterID != uid {
 		// 如果连带责任人与操作者不是同一人，进行单独计算
-		i.NoticeCheck(inviterID, place, inviterRank, ctx)
+		i.noticeCheck(inviterID, place, inviterRank, ctx, origin)
 	}
 }
 
 // AddScoreByCensor 敏感词审查
 func (i *BanListInfo) AddScoreByCensor(uid string, score int64, place string, level string, ctx *MsgContext) {
+	i.addScoreByCensor(uid, score, place, level, ctx, nil)
+}
+
+func (i *BanListInfo) addScoreByCensor(uid string, score int64, place, level string, ctx *MsgContext, origin *sendOrigin) {
 	rank := i.NoticeCheckPrepare(uid)
 
 	i.AddScoreBase(uid, score, place, "触发<"+level+">敏感词", ctx)
 	inviterID, inviterRank := i.addJointScore(uid, score, place, "连带责任:触发<"+level+">敏感词", ctx)
 
-	i.NoticeCheck(uid, place, rank, ctx)
+	i.noticeCheck(uid, place, rank, ctx, origin)
 	if inviterID != "" && inviterID != uid {
 		// 如果连带责任人与操作者不是同一人，进行单独计算
-		i.NoticeCheck(inviterID, place, inviterRank, ctx)
+		i.noticeCheck(inviterID, place, inviterRank, ctx, origin)
 	}
 }
 

@@ -51,7 +51,7 @@ func TestForwardMixedDeliveryUsesSelfIdentityAndInternalSplit(t *testing.T) {
 	ctx := &MsgContext{EndPoint: endpoint}
 	msg := &Message{MessageType: "group", GroupID: "QQ-Group:9000"}
 	inside := ctx.TranslateSplit("first#{SPLIT}second")
-	deliverReplyPlan(ctx, msg, "before\n"+ctx.wrapForward(inside)+"\nafter", "", true)
+	(*sendOrigin)(nil).deliverReplyPlan(ctx, replyTarget(ctx, msg, true), "before\n"+ctx.wrapForward(inside)+"\nafter", "")
 
 	adapter.mu.Lock()
 	ordinary := append([]string(nil), adapter.groupMsgs...)
@@ -384,7 +384,7 @@ func TestDiceScriptForwardFallbackIgnoresInternalSplit(t *testing.T) {
 	msg := &Message{MessageType: "group", GroupID: "KOOK-Channel:1"}
 	ctx.InitSplitKey()
 	inside := "first\n" + ctx.getSplitKey() + "\nsecond"
-	deliverReplyPlan(ctx, msg, ctx.wrapForward(inside), "", true)
+	(*sendOrigin)(nil).deliverReplyPlan(ctx, replyTarget(ctx, msg, true), ctx.wrapForward(inside), "")
 	adapter.mu.Lock()
 	defer adapter.mu.Unlock()
 	if len(adapter.groupMsgs) != 1 || adapter.groupMsgs[0] != "first\nsecond" {
@@ -414,7 +414,7 @@ func TestTextMapCompatibilityAcceptsMultilineForward(t *testing.T) {
 		EndPointInfoBase: EndPointInfoBase{Platform: "DISCORD"}, Adapter: adapter,
 	}}
 	fallbackCtx.SetSplitKey("###SPLIT-KEY###")
-	deliverReplyPlan(fallbackCtx, &Message{MessageType: "group", GroupID: "Discord-Channel:1"}, info.TextV2, "", true)
+	(*sendOrigin)(nil).deliverReplyPlan(fallbackCtx, outboundTarget{endpoint: fallbackCtx.EndPoint, id: "Discord-Channel:1", group: true}, info.TextV2, "")
 	adapter.mu.Lock()
 	defer adapter.mu.Unlock()
 	if len(adapter.groupMsgs) != 2 || adapter.groupMsgs[0] != "帮助:娱乐" || adapter.groupMsgs[1] != ".gugu // 一\n.jrrp // 二" {

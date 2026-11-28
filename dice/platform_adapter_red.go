@@ -538,6 +538,10 @@ func (pa *PlatformAdapterRed) SendSegmentToPerson(ctx *MsgContext, userID string
 }
 
 func (pa *PlatformAdapterRed) SendToPerson(ctx *MsgContext, uid string, text string, flag string) {
+	pa.sendToPerson(ctx, uid, text, flag, nil)
+}
+
+func (pa *PlatformAdapterRed) sendToPerson(ctx *MsgContext, uid string, text string, flag string, origin *sendOrigin) {
 	rowId, chatType := pa.mustExtractId(uid)
 	if chatType != PersonChat {
 		return
@@ -545,7 +549,7 @@ func (pa *PlatformAdapterRed) SendToPerson(ctx *MsgContext, uid string, text str
 
 	for _, i := range ctx.Dice.ExtList {
 		if i.OnMessageSend != nil {
-			i.callWithJsCheck(ctx.Dice, func() {
+			origin.callObserver(ctx.Dice, i, func() {
 				i.OnMessageSend(ctx, &Message{
 					Message:     text,
 					MessageType: "private",
@@ -574,6 +578,10 @@ func (pa *PlatformAdapterRed) SendToPerson(ctx *MsgContext, uid string, text str
 }
 
 func (pa *PlatformAdapterRed) SendToGroup(ctx *MsgContext, groupId string, text string, flag string) {
+	pa.sendToGroup(ctx, groupId, text, flag, nil)
+}
+
+func (pa *PlatformAdapterRed) sendToGroup(ctx *MsgContext, groupId string, text string, flag string, origin *sendOrigin) {
 	rowId, chatType := pa.mustExtractId(groupId)
 	if chatType != GroupChat {
 		return
@@ -590,12 +598,7 @@ func (pa *PlatformAdapterRed) SendToGroup(ctx *MsgContext, groupId string, text 
 				UserID:   pa.EndPoint.UserID,
 			},
 		}
-		groupInfo.TriggerExtHook(ctx.Dice, func(ext *ExtInfo) func() {
-			if ext.OnMessageSend == nil {
-				return nil
-			}
-			return func() { ext.OnMessageSend(ctx, msgToSend, flag) }
-		})
+		origin.notifyGroup(groupInfo, ctx, msgToSend, flag)
 	}
 
 	texts := textSplit(text)

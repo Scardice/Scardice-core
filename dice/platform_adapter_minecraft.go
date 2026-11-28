@@ -207,6 +207,10 @@ func (pa *PlatformAdapterMinecraft) SendSegmentToPerson(ctx *MsgContext, userID 
 }
 
 func (pa *PlatformAdapterMinecraft) SendToPerson(ctx *MsgContext, uid string, text string, flag string) {
+	pa.sendToPerson(ctx, uid, text, flag, nil)
+}
+
+func (pa *PlatformAdapterMinecraft) sendToPerson(ctx *MsgContext, uid string, text string, flag string, origin *sendOrigin) {
 	id := ExtractMCUserID(uid)
 	msg := new(SendMessageMinecraft)
 	msg.UUID = id
@@ -214,7 +218,7 @@ func (pa *PlatformAdapterMinecraft) SendToPerson(ctx *MsgContext, uid string, te
 	msg.MessageType = "private"
 	parse, _ := json.Marshal(msg)
 	pa.Socket.SendText(string(parse))
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		Platform:    "MC",
 		MessageType: "private",
 		Message:     text,
@@ -226,12 +230,16 @@ func (pa *PlatformAdapterMinecraft) SendToPerson(ctx *MsgContext, uid string, te
 }
 
 func (pa *PlatformAdapterMinecraft) SendToGroup(ctx *MsgContext, uid string, text string, flag string) {
+	pa.sendToGroup(ctx, uid, text, flag, nil)
+}
+
+func (pa *PlatformAdapterMinecraft) sendToGroup(ctx *MsgContext, uid string, text string, flag string, origin *sendOrigin) {
 	msg := new(SendMessageMinecraft)
 	msg.Content = text
 	msg.MessageType = "group"
 	parse, _ := json.Marshal(msg)
 	pa.Socket.SendText(string(parse))
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		Platform:    "MC",
 		MessageType: "group",
 		Message:     text,

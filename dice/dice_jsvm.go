@@ -356,6 +356,8 @@ func (d *Dice) JsInit() {
 		eventloop.WithDebugLog(true),
 		eventloop.WithLogger(d.Logger))
 	versionID := d.ExtLoopManager.SetLoop(loop)
+	_, sendState := d.ExtLoopManager.getSendLoop(versionID)
+	sendState.registry = d.JsExtRegistry
 	proxy := goproxy.NewProxyHttpServer()
 
 	printer := &PrinterFunc{d, false, []string{}}
@@ -380,6 +382,19 @@ func (d *Dice) JsInit() {
 	// 初始化
 	loop.Run(func(vm *goja.Runtime) {
 		vm.SetFieldNameMapper(goja.TagFieldNameMapper("jsbind", true))
+		boundary, err := vm.RunString(`(enter, leave) => fn => {
+			enter();
+			try { fn(); } finally { leave(); }
+		}`)
+		if err != nil {
+			panic(err)
+		}
+		makeBoundary, _ := goja.AssertFunction(boundary)
+		call, err := makeBoundary(goja.Undefined(), vm.ToValue(func() { sendState.filtering = true }), vm.ToValue(func() { sendState.filtering = false }))
+		if err != nil {
+			panic(err)
+		}
+		sendState.runFilter, _ = goja.AssertFunction(call)
 		// 直接绑定进程内唯一全局随机源，避免再包一层无意义的适配。
 		vm.SetRandSource(func() float64 {
 			return float64(globalRandSource.Uint64()>>11) / (1 << 53)
@@ -954,10 +969,26 @@ func (d *Dice) JsInit() {
 		})
 		_ = seal.Set("deck", deck)
 
-		_ = seal.Set("replyGroup", ReplyGroup)
-		_ = seal.Set("replyPerson", ReplyPerson)
-		_ = seal.Set("replyToSender", ReplyToSender)
-		_ = seal.Set("replyForward", ReplyForward)
+		send := &sendOrigin{dice: d, version: versionID, vm: vm, state: sendState}
+		_ = seal.Set("replyGroup", func(ctx *MsgContext, msg *Message, text string) {
+			send.requireCanSend()
+			send.replyRaw(ctx, msg, text, "", true)
+		})
+		_ = seal.Set("replyPerson", func(ctx *MsgContext, msg *Message, text string) {
+			send.requireCanSend()
+			send.replyRaw(ctx, msg, text, "", false)
+		})
+		_ = seal.Set("replyToSender", func(ctx *MsgContext, msg *Message, text string) {
+			send.requireCanSend()
+			if ctx != nil && msg != nil && ctx.Dice != nil {
+				ctx.SetCommandReplied(true)
+			}
+			ReplyToSender(ctx, msg, text)
+		})
+		_ = seal.Set("replyForward", func(ctx *MsgContext, msg *Message, nodes []message.ForwardNode) bool {
+			send.requireCanSend()
+			return send.replyForward(ctx, msg, nodes)
+		})
 		_ = seal.Set("newForwardNode", func(senderID string, senderName string, text string) *message.ForwardNode {
 			return &message.ForwardNode{SenderID: senderID, SenderName: senderName, Elements: message.ConvertStringMessage(text)}
 		})
@@ -1110,6 +1141,9 @@ func (d *Dice) jsClear() {
 	// 注意：不标记 wrapper 为 IsDeleted，否则重载期间消息到达会导致 wrapper 被移除
 	// IsDeleted 只在 JsDelete/ExtRemove（永久删除脚本）时设置
 	d.JsSealInstExposed = false
+	if d.ExtLoopManager != nil {
+		d.ExtLoopManager.SetLoop(nil)
+	}
 
 	// 清空/初始化 JsExtRegistry
 	if d.JsExtRegistry != nil {
@@ -1137,10 +1171,6 @@ func (d *Dice) jsClear() {
 	}
 	if d.StoreManager != nil {
 		d.StoreManager.InstalledPlugins = map[string]bool{}
-	}
-	// JsEnable=false 的启动状态下 ExtLoopManager 可能尚未初始化
-	if d.ExtLoopManager != nil {
-		d.ExtLoopManager.SetLoop(nil)
 	}
 }
 

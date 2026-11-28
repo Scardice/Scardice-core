@@ -2009,10 +2009,7 @@ func (s *IMSession) OnGroupMemberJoined(ctx *MsgContext, msg *Message) {
 		VarSetValueStr(ctx, "$t账号ID", stdID)
 		text := DiceFormat(ctx, groupInfo.GroupWelcomeMessage)
 		log.Infof("发送迎新消息: group_id=%s user_id=%s text=%q", msg.GroupID, msg.Sender.UserID, text)
-		for _, i := range ctx.SplitText(text) {
-			doSleepQQ(ctx)
-			ReplyGroup(ctx, msg, strings.TrimSpace(i))
-		}
+		ReplyGroup(ctx, msg, text)
 	}()
 }
 
@@ -2163,8 +2160,10 @@ func (s *IMSession) LongTimeQuitInactiveGroupReborn(threshold time.Time, groupsP
 			})
 			// 发送退群消息
 			msgText := DiceFormatTmpl(msgCtx, "核心:骰子自动退群告别语")
-			ep.Adapter.SendToGroup(msgCtx, grp.GroupID, msgText, "")
-			// 退群在退群消息延迟两秒后发送，确保消息发送完成
+			if text, allowed := prepareOutboundText(msgCtx, ep, grp.GroupID, msgText, "", true, nil); allowed {
+				ep.Adapter.SendToGroup(msgCtx, grp.GroupID, text, "")
+			}
+			// 保留告别发送及群状态复查的时间窗口。
 			time.Sleep(2 * time.Second)
 			if !isAutoQuitEndpointReady(grp, ep, "QQ", "quit") {
 				s.Parent.Logger.Infof("自动退群已取消: 当前账号状态发生变化，本次不再继续退群。group=%s endpoint=%s", grp.GroupID, ep.UserID)
@@ -3601,12 +3600,14 @@ func (ep *EndPointInfo) RefreshGroupNum() {
 	}
 }
 
-func sendNoticeToTarget(ctx *MsgContext, target NoticeTarget, txt string) {
-	if target.IsGroup() {
-		ReplyGroup(ctx, &Message{GroupID: target.ID}, txt)
-	} else {
-		ReplyPerson(ctx, &Message{Sender: SenderBase{UserID: target.ID}}, txt)
+func sendNoticeToTarget(ctx *MsgContext, target NoticeTarget, txt string, noticeType NoticeType) {
+	group := target.IsGroup()
+	msg := Message{Sender: SenderBase{UserID: target.ID}}
+	if group {
+		msg = Message{GroupID: target.ID}
 	}
+	filter := noticeType != NoticeTypeCensor && noticeType != NoticeTypeBan
+	(*sendOrigin)(nil).replyChecked(ctx, &msg, txt, "", group, filter)
 }
 
 func noticeTargetMatchesEndpoint(target NoticeTarget, ep *EndPointInfo) bool {
@@ -3638,12 +3639,12 @@ func findNoticeEndpoint(session *IMSession, target NoticeTarget) *EndPointInfo {
 	return nil
 }
 
-func sendNoticeTargetCrossPlatform(ctx *MsgContext, target NoticeTarget, txt string) bool {
+func sendNoticeTargetCrossPlatform(ctx *MsgContext, target NoticeTarget, txt string, noticeType NoticeType) bool {
 	if ctx == nil {
 		return false
 	}
 	if ctx.EndPoint != nil && ctx.EndPoint.Enable && noticeTargetMatchesEndpoint(target, ctx.EndPoint) {
-		sendNoticeToTarget(ctx, target, txt)
+		sendNoticeToTarget(ctx, target, txt, noticeType)
 		return true
 	}
 
@@ -3655,7 +3656,7 @@ func sendNoticeTargetCrossPlatform(ctx *MsgContext, target NoticeTarget, txt str
 	if ep == nil {
 		return false
 	}
-	sendNoticeToTarget(noticeTargetContext(session, ep, target), target, txt)
+	sendNoticeToTarget(noticeTargetContext(session, ep, target), target, txt, noticeType)
 	return true
 }
 
@@ -3686,7 +3687,7 @@ func (d *Dice) NoticeForEveryEndpoint(txt string, allowCrossPlatform bool, notic
 			targets := filterNoticeTargetsForEndpoint(d.Config.NoticeIDs, noticeType, ep)
 			for index, target := range targets {
 				ctx := noticeTargetContext(d.ImSession, ep, target)
-				sendNoticeToTarget(ctx, target, txt)
+				sendNoticeToTarget(ctx, target, txt, noticeType)
 				if index < len(targets)-1 {
 					time.Sleep(time.Second)
 				}
@@ -3718,7 +3719,7 @@ func (ctx *MsgContext) NoticeCrossPlatform(txt string, noticeTypes ...NoticeType
 		sent := false
 		targets := filterNoticeTargets(ctx.Dice.Config.NoticeIDs, noticeType)
 		for index, target := range targets {
-			if !sendNoticeTargetCrossPlatform(ctx, target, txt) {
+			if !sendNoticeTargetCrossPlatform(ctx, target, txt, noticeType) {
 				ctx.Dice.Logger.Errorf("尝试跨平台后仍未能向 %s 发送通知：%s", target.ID, txt)
 			} else {
 				sent = true
@@ -3762,7 +3763,7 @@ func (ctx *MsgContext) Notice(txt string, noticeTypes ...NoticeType) {
 		if ctx.EndPoint != nil && ctx.EndPoint.Enable {
 			targets := filterNoticeTargetsForEndpoint(ctx.Dice.Config.NoticeIDs, noticeType, ctx.EndPoint)
 			for index, target := range targets {
-				sendNoticeToTarget(ctx, target, txt)
+				sendNoticeToTarget(ctx, target, txt, noticeType)
 				sent = true
 				if index < len(targets)-1 {
 					time.Sleep(time.Second)

@@ -135,22 +135,30 @@ func (p *PlatformAdapterOnebot) QuitGroup(_ *MsgContext, id string) {
 
 // SendToPerson 这几个到时候直接调用SendSegment的方法来处理，为以后铺路
 func (p *PlatformAdapterOnebot) SendToPerson(ctx *MsgContext, userID string, text string, flag string) {
+	p.sendToPerson(ctx, userID, text, flag, nil)
+}
+
+func (p *PlatformAdapterOnebot) sendToPerson(ctx *MsgContext, userID string, text string, flag string, origin *sendOrigin) {
 	if p == nil {
 		zap.S().Named(logger.LogKeyAdapter).Warnf("向用户发送消息失败: 当前 OneBot 账号未正确初始化，消息未发出。user=%s flag=%s text=%q", userID, flag, text)
 		return
 	}
 	msgElement := message.ConvertStringMessage(text)
-	p.SendSegmentToPerson(ctx, userID, msgElement, flag)
+	p.sendSegmentToPerson(ctx, userID, msgElement, flag, origin)
 }
 
 // SendToGroup 这几个到时候直接调用SendSegment的方法来处理，为以后铺路
 func (p *PlatformAdapterOnebot) SendToGroup(ctx *MsgContext, groupID string, text string, flag string) {
+	p.sendToGroup(ctx, groupID, text, flag, nil)
+}
+
+func (p *PlatformAdapterOnebot) sendToGroup(ctx *MsgContext, groupID string, text string, flag string, origin *sendOrigin) {
 	if p == nil {
 		zap.S().Named(logger.LogKeyAdapter).Warnf("向群发送消息失败: 当前 OneBot 账号未正确初始化，消息未发出。group=%s flag=%s text=%q", groupID, flag, text)
 		return
 	}
 	msgElement := message.ConvertStringMessage(text)
-	p.SendSegmentToGroup(ctx, groupID, msgElement, flag)
+	p.sendSegmentToGroup(ctx, groupID, msgElement, flag, origin)
 }
 
 type onebotForwardNodeData struct {
@@ -186,6 +194,10 @@ func (p *PlatformAdapterOnebot) buildForwardNodes(nodes []message.ForwardNode) (
 }
 
 func (p *PlatformAdapterOnebot) SendGroupForwardMsg(ctx *MsgContext, groupID string, nodes []message.ForwardNode) bool {
+	return p.sendGroupForwardMsg(ctx, groupID, nodes, nil)
+}
+
+func (p *PlatformAdapterOnebot) sendGroupForwardMsg(ctx *MsgContext, groupID string, nodes []message.ForwardNode, origin *sendOrigin) bool {
 	if p == nil || p.sendEmitter == nil {
 		return false
 	}
@@ -217,7 +229,7 @@ func (p *PlatformAdapterOnebot) SendGroupForwardMsg(ctx *MsgContext, groupID str
 	session := p.EndPoint.Session
 	if err == nil && session != nil {
 		sendText := forwardNodesToText(nodes)
-		session.OnMessageSend(ctx, &Message{
+		origin.notify(session, ctx, &Message{
 			Platform:    "QQ",
 			MessageType: "group",
 			GroupID:     groupID,
@@ -232,6 +244,10 @@ func (p *PlatformAdapterOnebot) SendGroupForwardMsg(ctx *MsgContext, groupID str
 }
 
 func (p *PlatformAdapterOnebot) SendPrivateForwardMsg(ctx *MsgContext, userID string, nodes []message.ForwardNode) bool {
+	return p.sendPrivateForwardMsg(ctx, userID, nodes, nil)
+}
+
+func (p *PlatformAdapterOnebot) sendPrivateForwardMsg(ctx *MsgContext, userID string, nodes []message.ForwardNode, origin *sendOrigin) bool {
 	if p == nil || p.sendEmitter == nil {
 		return false
 	}
@@ -263,7 +279,7 @@ func (p *PlatformAdapterOnebot) SendPrivateForwardMsg(ctx *MsgContext, userID st
 	session := p.EndPoint.Session
 	if err == nil && session != nil {
 		sendText := forwardNodesToText(nodes)
-		session.OnMessageSend(ctx, &Message{
+		origin.notify(session, ctx, &Message{
 			Platform:    "QQ",
 			MessageType: "private",
 			Message:     sendText,
@@ -287,6 +303,10 @@ func (p *PlatformAdapterOnebot) SetGroupCardName(ctx *MsgContext, name string) {
 }
 
 func (p *PlatformAdapterOnebot) SendSegmentToGroup(ctx *MsgContext, groupID string, msg []message.IMessageElement, flag string) {
+	p.sendSegmentToGroup(ctx, groupID, msg, flag, nil)
+}
+
+func (p *PlatformAdapterOnebot) sendSegmentToGroup(ctx *MsgContext, groupID string, msg []message.IMessageElement, flag string, origin *sendOrigin) {
 	if p == nil || p.sendEmitter == nil {
 		log := zap.S().Named(logger.LogKeyAdapter)
 		if p != nil && p.logger != nil {
@@ -316,7 +336,7 @@ func (p *PlatformAdapterOnebot) SendSegmentToGroup(ctx *MsgContext, groupID stri
 			return
 		}
 		_, sentMsgText := p.convertSealMsgToMessageChain(sentSegments)
-		session.OnMessageSend(ctx, &Message{
+		origin.notify(session, ctx, &Message{
 			Platform:    "QQ",
 			MessageType: "group",
 			GroupID:     groupID,
@@ -404,6 +424,10 @@ func (p *PlatformAdapterOnebot) SendSegmentToGroup(ctx *MsgContext, groupID stri
 }
 
 func (p *PlatformAdapterOnebot) SendSegmentToPerson(ctx *MsgContext, userID string, msg []message.IMessageElement, flag string) {
+	p.sendSegmentToPerson(ctx, userID, msg, flag, nil)
+}
+
+func (p *PlatformAdapterOnebot) sendSegmentToPerson(ctx *MsgContext, userID string, msg []message.IMessageElement, flag string, origin *sendOrigin) {
 	if p == nil || p.sendEmitter == nil {
 		log := zap.S().Named(logger.LogKeyAdapter)
 		if p != nil && p.logger != nil {
@@ -432,7 +456,7 @@ func (p *PlatformAdapterOnebot) SendSegmentToPerson(ctx *MsgContext, userID stri
 			return
 		}
 		_, sentMsgText := p.convertSealMsgToMessageChain(sentSegments)
-		session.OnMessageSend(ctx, &Message{
+		origin.notify(session, ctx, &Message{
 			Platform:    "QQ",
 			MessageType: "private",
 			Segment:     sentSegments,

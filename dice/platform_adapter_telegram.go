@@ -197,6 +197,11 @@ func (pa *PlatformAdapterTelegram) groupNewMember(msg *Message, msgRaw *tgbotapi
 		VarSetValueStr(ctx, "$t账号ID", stdID)
 		groupName := msgRaw.Chat.Title
 		text := DiceFormat(ctx, groupInfo.GroupWelcomeMessage)
+		var prepared bool
+		text, prepared = prepareOutboundText(ctx, ep, msg.GroupID, text, "", true, nil)
+		if !prepared {
+			return
+		}
 		logger.Infof("发送欢迎致辞，群: <%s>(%d),新成员id:%d", groupName, msgRaw.Chat.ID, member.ID)
 		for _, i := range ctx.SplitText(text) {
 			pa.SendToGroup(ctx, msg.GroupID, strings.TrimSpace(i), "")
@@ -400,11 +405,15 @@ func (pa *PlatformAdapterTelegram) SendSegmentToPerson(ctx *MsgContext, userID s
 }
 
 func (pa *PlatformAdapterTelegram) SendToPerson(ctx *MsgContext, userID string, text string, flag string) {
+	pa.sendToPerson(ctx, userID, text, flag, nil)
+}
+
+func (pa *PlatformAdapterTelegram) sendToPerson(ctx *MsgContext, userID string, text string, flag string, origin *sendOrigin) {
 	resp, err := pa.SendToChatRaw(ExtractTelegramUserID(userID), text)
 	if err != nil {
 		return
 	}
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		Platform:    "TG",
 		MessageType: "private",
 		Message:     text,
@@ -417,11 +426,15 @@ func (pa *PlatformAdapterTelegram) SendToPerson(ctx *MsgContext, userID string, 
 }
 
 func (pa *PlatformAdapterTelegram) SendToGroup(ctx *MsgContext, uid string, text string, flag string) {
+	pa.sendToGroup(ctx, uid, text, flag, nil)
+}
+
+func (pa *PlatformAdapterTelegram) sendToGroup(ctx *MsgContext, uid string, text string, flag string, origin *sendOrigin) {
 	resp, err := pa.SendToChatRaw(ExtractTelegramGroupID(uid), text)
 	if err != nil {
 		return
 	}
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		Platform:    "TG",
 		MessageType: "group",
 		Message:     text,

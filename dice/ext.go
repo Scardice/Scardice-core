@@ -505,26 +505,20 @@ func (i *ExtInfo) CallOnGroupLeave(d *Dice, ctx *MsgContext, event *events.Group
 func (i *ExtInfo) callWithJsCheck(d *Dice, f func()) {
 	if i.IsJsExt {
 		if d.Config.JsEnable {
-			loop, err := d.ExtLoopManager.GetLoop(i.JSLoopVersion)
-			if err != nil {
-				i.dice.Logger.Errorf("扩展<%s>运行环境已经过期: %v", i.Name, err)
+			loop, state := d.ExtLoopManager.getSendLoop(i.JSLoopVersion)
+			if loop == nil {
+				d.Logger.Errorf("扩展<%s>运行环境已经过期", i.Name)
 				return
 			}
-			waitRun := make(chan int, 1)
-			loop.RunOnLoop(func(vm *goja.Runtime) {
-				prev := d.JsCurrentPlugin
-				d.JsCurrentPlugin = i
-				defer func() {
-					d.JsCurrentPlugin = prev
-					if r := recover(); r != nil {
-						d.Logger.Error("JS脚本异常:", r)
-					}
-					waitRun <- 1
-				}()
-
-				f()
-			})
-			<-waitRun
+			waitRun := make(chan struct{})
+			if loop.RunOnLoop(func(_ *goja.Runtime) {
+				defer close(waitRun)
+				if !state.stopped.Load() {
+					runSendJS(d, i, f)
+				}
+			}) {
+				<-waitRun
+			}
 		} else {
 			d.Logger.Infof("当前已关闭js扩展<%v>", i.Name)
 		}

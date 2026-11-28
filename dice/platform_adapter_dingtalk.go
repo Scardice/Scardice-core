@@ -62,7 +62,11 @@ func (pa *PlatformAdapterDingTalk) SetEnable(enable bool) {
 }
 
 func (pa *PlatformAdapterDingTalk) QuitGroup(ctx *MsgContext, id string) {
-	pa.SendToGroup(ctx, id, "不支持此功能, 请手动移除机器人", "")
+	pa.quitGroup(ctx, id, nil)
+}
+
+func (pa *PlatformAdapterDingTalk) quitGroup(ctx *MsgContext, id string, origin *sendOrigin) {
+	pa.sendToGroup(ctx, id, "不支持此功能, 请手动移除机器人", "", origin)
 }
 
 func (pa *PlatformAdapterDingTalk) SendSegmentToGroup(ctx *MsgContext, groupID string, msg []message.IMessageElement, flag string) {
@@ -72,6 +76,10 @@ func (pa *PlatformAdapterDingTalk) SendSegmentToPerson(ctx *MsgContext, userID s
 }
 
 func (pa *PlatformAdapterDingTalk) SendToPerson(ctx *MsgContext, uid string, text string, flag string) {
+	pa.sendToPerson(ctx, uid, text, flag, nil)
+}
+
+func (pa *PlatformAdapterDingTalk) sendToPerson(ctx *MsgContext, uid string, text string, flag string, origin *sendOrigin) {
 	msg := dingtalk.MessageSampleText{Content: text}
 	rawUserID := ExtractDingTalkUserID(uid)
 
@@ -88,7 +96,7 @@ func (pa *PlatformAdapterDingTalk) SendToPerson(ctx *MsgContext, uid string, tex
 		pa.EndPoint.Session.Parent.Logger.Error("Dingtalk SendToPerson Error: ", err)
 		return
 	}
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		Platform:    "DINGTALK",
 		MessageType: "private",
 		Message:     text,
@@ -101,6 +109,10 @@ func (pa *PlatformAdapterDingTalk) SendToPerson(ctx *MsgContext, uid string, tex
 }
 
 func (pa *PlatformAdapterDingTalk) SendToGroup(ctx *MsgContext, uid string, text string, flag string) {
+	pa.sendToGroup(ctx, uid, text, flag, nil)
+}
+
+func (pa *PlatformAdapterDingTalk) sendToGroup(ctx *MsgContext, uid string, text string, flag string, origin *sendOrigin) {
 	msg := dingtalk.MessageSampleText{Content: text}
 	rawGroupID := ExtractDingTalkGroupID(uid)
 
@@ -116,7 +128,7 @@ func (pa *PlatformAdapterDingTalk) SendToGroup(ctx *MsgContext, uid string, text
 		pa.EndPoint.Session.Parent.Logger.Error("Dingtalk SendToGroup Error: ", err)
 		return
 	}
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		Platform:    "DINGTALK",
 		MessageType: "group",
 		Message:     text,

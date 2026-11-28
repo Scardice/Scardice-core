@@ -169,6 +169,10 @@ func doSleepQQ(ctx *MsgContext) {
 }
 
 func (pa *PlatformAdapterGocq) SendToPerson(ctx *MsgContext, userID string, text string, flag string) {
+	pa.sendToPerson(ctx, userID, text, flag, nil)
+}
+
+func (pa *PlatformAdapterGocq) sendToPerson(ctx *MsgContext, userID string, text string, flag string, origin *sendOrigin) {
 	rawID, idType := pa.mustExtractID(userID)
 
 	if idType != QQUidPerson {
@@ -177,7 +181,7 @@ func (pa *PlatformAdapterGocq) SendToPerson(ctx *MsgContext, userID string, text
 
 	for _, i := range ctx.Dice.ExtList {
 		if i.OnMessageSend != nil {
-			i.callWithJsCheck(ctx.Dice, func() {
+			origin.callObserver(ctx.Dice, i, func() {
 				i.OnMessageSend(ctx, &Message{
 					Message:     text,
 					MessageType: "private",
@@ -261,12 +265,16 @@ func (pa *PlatformAdapterGocq) GroupPoke(ctx *MsgContext, userId string) {
 }
 
 func (pa *PlatformAdapterGocq) SendToGroup(ctx *MsgContext, groupID string, text string, flag string) {
+	pa.sendToGroup(ctx, groupID, text, flag, nil)
+}
+
+func (pa *PlatformAdapterGocq) sendToGroup(ctx *MsgContext, groupID string, text string, flag string, origin *sendOrigin) {
 	if groupID == "" {
 		return
 	}
 	rawID, idType := pa.mustExtractID(groupID)
 	if idType == 0 {
-		pa.SendToChannelGroup(ctx, groupID, text, flag)
+		pa.sendToChannelGroup(ctx, groupID, text, flag, origin)
 		return
 	}
 
@@ -281,12 +289,7 @@ func (pa *PlatformAdapterGocq) SendToGroup(ctx *MsgContext, groupID string, text
 				UserID:   pa.EndPoint.UserID,
 			},
 		}
-		groupInfo.TriggerExtHook(ctx.Dice, func(ext *ExtInfo) func() {
-			if ext.OnMessageSend == nil {
-				return nil
-			}
-			return func() { ext.OnMessageSend(ctx, msgToSend, flag) }
-		})
+		origin.notifyGroup(groupInfo, ctx, msgToSend, flag)
 	}
 
 	type GroupMessageParams struct {
@@ -427,6 +430,10 @@ func (pa *PlatformAdapterGocq) expandGocqForwards(msg *Message) {
 }
 
 func (pa *PlatformAdapterGocq) SendGroupForwardMsg(ctx *MsgContext, groupID string, nodes []message.ForwardNode) bool {
+	return pa.sendGroupForwardMsg(ctx, groupID, nodes, nil)
+}
+
+func (pa *PlatformAdapterGocq) sendGroupForwardMsg(ctx *MsgContext, groupID string, nodes []message.ForwardNode, origin *sendOrigin) bool {
 	if groupID == "" || len(nodes) == 0 {
 		return false
 	}
@@ -461,12 +468,7 @@ func (pa *PlatformAdapterGocq) SendGroupForwardMsg(ctx *MsgContext, groupID stri
 					UserID:   pa.EndPoint.UserID,
 				},
 			}
-			groupInfo.TriggerExtHook(ctx.Dice, func(ext *ExtInfo) func() {
-				if ext.OnMessageSend == nil {
-					return nil
-				}
-				return func() { ext.OnMessageSend(ctx, msgToSend, "") }
-			})
+			origin.notifyGroup(groupInfo, ctx, msgToSend, "")
 		}
 	}
 
@@ -485,6 +487,10 @@ func (pa *PlatformAdapterGocq) SendGroupForwardMsg(ctx *MsgContext, groupID stri
 }
 
 func (pa *PlatformAdapterGocq) SendPrivateForwardMsg(ctx *MsgContext, userID string, nodes []message.ForwardNode) bool {
+	return pa.sendPrivateForwardMsg(ctx, userID, nodes, nil)
+}
+
+func (pa *PlatformAdapterGocq) sendPrivateForwardMsg(ctx *MsgContext, userID string, nodes []message.ForwardNode, origin *sendOrigin) bool {
 	if userID == "" || len(nodes) == 0 {
 		return false
 	}
@@ -506,7 +512,7 @@ func (pa *PlatformAdapterGocq) SendPrivateForwardMsg(ctx *MsgContext, userID str
 	if ctx != nil && ctx.Dice != nil {
 		for _, i := range ctx.Dice.ExtList {
 			if i.OnMessageSend != nil {
-				i.callWithJsCheck(ctx.Dice, func() {
+				origin.callObserver(ctx.Dice, i, func() {
 					i.OnMessageSend(ctx, &Message{
 						Message:     sendText,
 						MessageType: "private",

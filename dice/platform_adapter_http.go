@@ -38,11 +38,15 @@ func (pa *PlatformAdapterHTTP) DoRelogin() bool {
 func (pa *PlatformAdapterHTTP) SetEnable(_ bool) {}
 
 func (pa *PlatformAdapterHTTP) SendToPerson(ctx *MsgContext, uid string, text string, flag string) {
+	pa.sendToPerson(ctx, uid, text, flag, nil)
+}
+
+func (pa *PlatformAdapterHTTP) sendToPerson(ctx *MsgContext, uid string, text string, flag string, origin *sendOrigin) {
 	sp := utils.SplitLongText(text, 300, utils.DefaultSplitPaginationHint)
 	for _, sub := range sp {
 		pa.RecentMessage = append(pa.RecentMessage, HTTPSimpleMessage{uid, sub, "private"})
 	}
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		MessageType: "private",
 		Platform:    "UI",
 		Message:     text,
@@ -54,11 +58,15 @@ func (pa *PlatformAdapterHTTP) SendToPerson(ctx *MsgContext, uid string, text st
 }
 
 func (pa *PlatformAdapterHTTP) SendToGroup(ctx *MsgContext, uid string, text string, flag string) {
+	pa.sendToGroup(ctx, uid, text, flag, nil)
+}
+
+func (pa *PlatformAdapterHTTP) sendToGroup(ctx *MsgContext, uid string, text string, flag string, origin *sendOrigin) {
 	sp := utils.SplitLongText(text, 300, utils.DefaultSplitPaginationHint)
 	for _, sub := range sp {
 		pa.RecentMessage = append(pa.RecentMessage, HTTPSimpleMessage{uid, sub, "group"})
 	}
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		MessageType: "group",
 		Platform:    "UI",
 		Message:     text,

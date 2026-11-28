@@ -324,6 +324,10 @@ func (pa *PlatformAdapterDiscord) SendSegmentToPerson(ctx *MsgContext, userID st
 
 // SendToPerson 这里发送的是私聊（dm）消息，私信对于discord来说也被视为一个频道
 func (pa *PlatformAdapterDiscord) SendToPerson(ctx *MsgContext, userID string, text string, flag string) {
+	pa.sendToPerson(ctx, userID, text, flag, nil)
+}
+
+func (pa *PlatformAdapterDiscord) sendToPerson(ctx *MsgContext, userID string, text string, flag string, origin *sendOrigin) {
 	is := pa.IntentSession
 	ch, err := is.UserChannelCreate(ExtractDiscordUserID(userID))
 	if err != nil {
@@ -334,7 +338,7 @@ func (pa *PlatformAdapterDiscord) SendToPerson(ctx *MsgContext, userID string, t
 	if err != nil {
 		return
 	}
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		Platform:    "DISCORD",
 		MessageType: "private",
 		Message:     text,
@@ -348,12 +352,16 @@ func (pa *PlatformAdapterDiscord) SendToPerson(ctx *MsgContext, userID string, t
 
 // SendToGroup 发送群聊（实际上是频道）消息
 func (pa *PlatformAdapterDiscord) SendToGroup(ctx *MsgContext, groupID string, text string, flag string) {
+	pa.sendToGroup(ctx, groupID, text, flag, nil)
+}
+
+func (pa *PlatformAdapterDiscord) sendToGroup(ctx *MsgContext, groupID string, text string, flag string, origin *sendOrigin) {
 	// _, err := pa.IntentSession.ChannelMessageSend(ExtractDiscordChannelId(groupId), text)
 	resp, err := pa.sendToChannelRaw(groupID, text)
 	if err != nil {
 		return
 	}
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		Platform:    "DISCORD",
 		MessageType: "group",
 		Message:     text,

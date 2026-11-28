@@ -87,7 +87,7 @@ func buildMilkyForwardElement(nodes []message.ForwardNode) (*milkyForwardElement
 	return &milkyForwardElement{Messages: messages}, nil
 }
 
-func (pa *PlatformAdapterMilky) recordForwardMessageSent(ctx *MsgContext, delivery milkyForwardDelivery) {
+func (pa *PlatformAdapterMilky) recordForwardMessageSent(ctx *MsgContext, delivery milkyForwardDelivery, origin *sendOrigin) {
 	if ctx == nil || pa == nil || pa.EndPoint == nil || pa.EndPoint.Session == nil {
 		return
 	}
@@ -105,10 +105,14 @@ func (pa *PlatformAdapterMilky) recordForwardMessageSent(ctx *MsgContext, delive
 	if delivery.MessageType == "group" {
 		msg.GroupID = delivery.TargetID
 	}
-	pa.EndPoint.Session.OnMessageSend(ctx, msg, "")
+	origin.notify(pa.EndPoint.Session, ctx, msg, "")
 }
 
 func (pa *PlatformAdapterMilky) SendGroupForwardMsg(ctx *MsgContext, groupID string, nodes []message.ForwardNode) bool {
+	return pa.sendGroupForwardMsg(ctx, groupID, nodes, nil)
+}
+
+func (pa *PlatformAdapterMilky) sendGroupForwardMsg(ctx *MsgContext, groupID string, nodes []message.ForwardNode, origin *sendOrigin) bool {
 	log := zap.S().Named(logger.LogKeyAdapter)
 	if pa == nil || pa.IntentSession == nil {
 		log.Error("Failed to send Milky group forward message: session unavailable")
@@ -141,11 +145,15 @@ func (pa *PlatformAdapterMilky) SendGroupForwardMsg(ctx *MsgContext, groupID str
 		TargetID:    groupID,
 		Nodes:       nodes,
 		MessageSeq:  ret.MessageSeq,
-	})
+	}, origin)
 	return true
 }
 
 func (pa *PlatformAdapterMilky) SendPrivateForwardMsg(ctx *MsgContext, userID string, nodes []message.ForwardNode) bool {
+	return pa.sendPrivateForwardMsg(ctx, userID, nodes, nil)
+}
+
+func (pa *PlatformAdapterMilky) sendPrivateForwardMsg(ctx *MsgContext, userID string, nodes []message.ForwardNode, origin *sendOrigin) bool {
 	log := zap.S().Named(logger.LogKeyAdapter)
 	if pa == nil || pa.IntentSession == nil {
 		log.Error("Failed to send Milky private forward message: session unavailable")
@@ -178,6 +186,6 @@ func (pa *PlatformAdapterMilky) SendPrivateForwardMsg(ctx *MsgContext, userID st
 		TargetID:    userID,
 		Nodes:       nodes,
 		MessageSeq:  ret.MessageSeq,
-	})
+	}, origin)
 	return true
 }

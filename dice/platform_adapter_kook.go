@@ -413,6 +413,10 @@ func (pa *PlatformAdapterKook) SendSegmentToPerson(ctx *MsgContext, userID strin
 }
 
 func (pa *PlatformAdapterKook) SendToPerson(ctx *MsgContext, userID string, text string, flag string) {
+	pa.sendToPerson(ctx, userID, text, flag, nil)
+}
+
+func (pa *PlatformAdapterKook) sendToPerson(ctx *MsgContext, userID string, text string, flag string, origin *sendOrigin) {
 	log := zap.S().Named(logger.LogKeyAdapter)
 	if !pa.EndPoint.Enable || pa.IntentSession == nil || pa.EndPoint.State != 1 {
 		return
@@ -426,7 +430,7 @@ func (pa *PlatformAdapterKook) SendToPerson(ctx *MsgContext, userID string, text
 	if err != nil {
 		return
 	}
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		Platform:    "KOOK",
 		MessageType: "private",
 		Message:     text,
@@ -439,6 +443,10 @@ func (pa *PlatformAdapterKook) SendToPerson(ctx *MsgContext, userID string, text
 }
 
 func (pa *PlatformAdapterKook) SendToGroup(ctx *MsgContext, groupID string, text string, flag string) {
+	pa.sendToGroup(ctx, groupID, text, flag, nil)
+}
+
+func (pa *PlatformAdapterKook) sendToGroup(ctx *MsgContext, groupID string, text string, flag string, origin *sendOrigin) {
 	if !pa.EndPoint.Enable || pa.IntentSession == nil || pa.EndPoint.State != 1 {
 		return
 	}
@@ -446,7 +454,7 @@ func (pa *PlatformAdapterKook) SendToGroup(ctx *MsgContext, groupID string, text
 	if err != nil {
 		return
 	}
-	pa.EndPoint.Session.OnMessageSend(ctx, &Message{
+	origin.notify(pa.EndPoint.Session, ctx, &Message{
 		Platform:    "KOOK",
 		MessageType: "group",
 		Message:     text,
